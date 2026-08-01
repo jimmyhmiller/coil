@@ -19,7 +19,7 @@ executables, or directly to WebAssembly modules.
 
 ## A small Coil program
 
-```coil
+```clojure
 (module example)
 (import "primitive.coil" :as primitive)
 
@@ -67,7 +67,7 @@ Coil provides:
 - Traits, generic trait implementations, specialization, and trait objects
 - Type inference for generic arguments and integer literals
 
-```coil
+```clojure
 (defsum Option [T]
   (None)
   (Some [(value T)]))
@@ -87,7 +87,7 @@ the corresponding traits.
 Pointers are ordinary, region-less machine pointers. Allocation is explicit and
 separate from pointer types:
 
-```coil
+```clojure
 (let [stack-value (alloc/stack i64)
       heap-value  (alloc/heap i64)]
   (primitive/store! stack-value 20)
@@ -124,7 +124,7 @@ There is no separate macro language. A macro is an ordinary Coil function whose
 inputs and output are `Code`. It can use normal functions, recursion, generics,
 collections, allocation, and foreign calls while producing syntax.
 
-```coil
+```clojure
 (defn unless [(condition Code) & (body Code)] (-> Code)
   `(if (not ~condition)
        (do ~@body)
