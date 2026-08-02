@@ -15,9 +15,9 @@ names), `f65ab9213` (trait methods + the undefined-reference check).
 
 ```lisp
 (module myproject.app)                    ; convention: project-prefixed namespace
-(import "src/stdlib/control.coil" :use *)        ; refer ALL of control's exported names
-(import "src/stdlib/slice.coil"   :use [slice-for push])  ; refer just these
-(import "src/stdlib/io.coil"      :as io)        ; qualified access only: (io/print …)
+(import "coil.control" :use *)        ; refer ALL of control's exported names
+(import "coil.slice"   :use [slice-for push])  ; refer just these
+(import "coil.io"      :as io)        ; qualified access only: (io/print …)
 (export foo Bar)                          ; what THIS module exposes (default: all public)
 ```
 
@@ -25,9 +25,11 @@ Module names are symbols and may be dotted. Project code conventionally owns a
 prefix and declares `myproject`, `myproject.http`, `myproject.db.user`, and so on;
 the compiler does not require this convention. A leading owner scope is supported,
 so `(module @myname.project.thing)` is also a valid module identity. Imports remain
-path-based and `:as` supplies the short name used at call sites.
+namespace-based and `:as` supplies the short name used at call sites. Coil indexes
+module declarations beneath project source roots and dependency roots; filenames and
+directory placement do not participate in identity.
 
-- `import` alone (`(import "x.coil")`) makes a module's names reachable **only**
+- `import` alone (`(import "myproject.x")`) makes a module's names reachable **only**
   qualified via an alias — it does **not** refer anything. This matches Clojure's
   `require` (vs `require … :refer`). It is a behavior change from the old global
   model, where importing a file dumped its macros into the global namespace.
@@ -158,11 +160,9 @@ ever needed to contain *more* metas, the two passes would become a fixpoint loop
 
 Covered by `tests/compiler/oracle`:
 
-- **`gate-cli.sh`** — end-to-end teeth, each written to FAIL on the pre-change seed:
-  sibling imports resolving against the importing file's directory, imports from an
-  arbitrary CWD, the bundled prelude reaching bundled `io` despite a same-named decoy
-  in the entry directory, and `(:use [name])` of a symbol a module does not export
-  being a located error that names the symbol and the module.
+- **`gate-cli.sh`** — end-to-end teeth: namespace lookup independent of file placement
+  and process CWD, rejection of relative paths, pre-typecheck autofix of legacy imports,
+  bundled namespace isolation, and located export errors.
 - **`python3 scripts/oracle.py gate resolved|expand`** — snapshot focused resolver and
   expander fixtures, so any drift in name resolution or macro hygiene
   (including the second-order cross-module case) shows up as a diff.

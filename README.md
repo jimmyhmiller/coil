@@ -21,7 +21,7 @@ executables, or directly to WebAssembly modules.
 
 ```clojure
 (module example)
-(import "primitive.coil" :as primitive)
+(import "coil.primitive" :as primitive)
 
 (defsum Shape
   (Circle [(radius f64)])

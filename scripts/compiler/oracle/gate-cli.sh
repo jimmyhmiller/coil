@@ -133,20 +133,20 @@ fi
 [ $? = 1 ] && ok "project bogus --target is rejected" || bad "project bogus --target" "want rc=1"
 
 echo "== Coil.toml dependencies and strict manifest errors =="
-# A dependency name becomes the first path component of an import. Path dependencies
-# resolve from their declared root; Git dependencies are checked out at an exact SHA.
+# Dependency roots participate in the namespace index; Git dependencies are checked
+# out at an exact SHA.
 mkdir -p "$T/dep-lib/src" "$T/path-dep/src" "$T/git-dep/src"
 printf '(module math)\n(defn answer [] (-> i64) 42)\n' > "$T/dep-lib/src/math.coil"
-printf '(module app)\n(import "math/src/math.coil" :use *)\n(defn main [] (-> i64) (answer))\n' > "$T/path-dep/src/main.coil"
+printf '(module app)\n(import "math" :use *)\n(defn main [] (-> i64) (answer))\n' > "$T/path-dep/src/main.coil"
 printf '[package]\nname = "path-dep"\nentry = "src/main.coil"\n\n[dependencies]\nmath = { path = "../dep-lib" }\n' > "$T/path-dep/Coil.toml"
 ( cd "$T/path-dep" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
-  && ok "path dependency imports through its manifest name" \
+  && ok "path dependency imports through its declared namespace" \
   || bad "path dependency" "want rc=42"
 
 ( cd "$T/dep-lib" && git init -q && git add src/math.coil \
     && git -c user.name=Coil -c user.email=coil@example.invalid commit -qm initial )
 dep_sha=$(git -C "$T/dep-lib" rev-parse HEAD)
-printf '(module app)\n(import "math/src/math.coil" :use *)\n(defn main [] (-> i64) (answer))\n' > "$T/git-dep/src/main.coil"
+printf '(module app)\n(import "math" :use *)\n(defn main [] (-> i64) (answer))\n' > "$T/git-dep/src/main.coil"
 printf '[package]\nname = "git-dep"\nentry = "src/main.coil"\n\n[dependencies]\nmath = { git = "%s", sha = "%s" }\n' "$T/dep-lib" "$dep_sha" > "$T/git-dep/Coil.toml"
 ( cd "$T/git-dep" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
   && ok "Git dependency imports at its pinned SHA" \
@@ -187,22 +187,28 @@ printf '[package]\nname  = "s"\nentry = "src/main.coil"\n' > "$T/strict/Coil.tom
 ( cd "$T/strict" && rm -f s && "$COIL" build >/dev/null 2>&1 )
 [ -x "$T/strict/s" ] && ok "a valid manifest still builds" || bad "strict valid manifest" "no ./s"
 
-echo "== tool-1: a relative import resolves against the IMPORTING FILE's directory, not the CWD =="
-# The layout `coil new` scaffolds (src/main.coil) must be able to import a sibling
-# (src/util.coil). Under the old CWD-relative rule this failed with
-# `import 'util.coil': not found` — a scaffolded project could not split into files.
-# FAILS on a pre-tool-1 compiler (import not found → build fails, rc≠42); PASSES here.
-mkdir -p "$T/sib/src"
+echo "== namespace index: file placement is irrelevant and paths are rejected =="
+mkdir -p "$T/sib/src/unrelated/place"
 printf '[package]\nname  = "sib"\nentry = "src/main.coil"\n'                             > "$T/sib/Coil.toml"
-printf '(module util)\n(defn forty-two [] (-> i64) 42)\n'                                > "$T/sib/src/util.coil"
-printf '(module app)\n(import "util.coil" :use *)\n(defn main [] (-> i64) (forty-two))\n' > "$T/sib/src/main.coil"
+printf '(module util)\n(defn forty-two [] (-> i64) 42)\n' > "$T/sib/src/unrelated/place/anything.coil"
+printf '(module app)\n(import "util" :use *)\n(defn main [] (-> i64) (forty-two))\n' > "$T/sib/src/main.coil"
 ( cd "$T/sib" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
-  && ok "project src/main.coil imports sibling src/util.coil" \
-  || bad "sibling import (project mode)" "want rc=42 (was: import 'util.coil' not found)"
-# The base is the FILE's directory, NOT the CWD: build the entry from an unrelated CWD.
+  && ok "project imports a namespace regardless of its file placement" \
+  || bad "namespace index (project mode)" "want rc=42"
+# Direct-file mode indexes both the process directory and the entry tree.
 ( cd "$T" && "$COIL" run "$T/sib/src/main.coil" >/dev/null 2>&1 ); [ $? = 42 ] \
-  && ok "sibling import resolves from ANY cwd (file-relative, not cwd-relative)" \
-  || bad "sibling import (arbitrary cwd)" "want rc=42"
+  && ok "namespace lookup works from an unrelated cwd" \
+  || bad "namespace index (arbitrary cwd)" "want rc=42"
+printf '(module bad)\n(import "unrelated/place/anything.coil" :use *)\n(defn main [] (-> i64) 0)\n' > "$T/sib/src/bad.coil"
+expect_out 'import paths are not supported' "relative path imports are rejected" \
+  "$COIL" check "$T/sib/src/bad.coil"
+# Preflight lint runs before loading/typechecking, so it can fix both the import and
+# leave a separate broken expression for the semantic phase to report afterward.
+printf '(module migrate)\n(import "unrelated/place/anything.coil" :use *)\n(defn main [] (-> i64) missing-name)\n' > "$T/sib/src/migrate.coil"
+"$COIL" lint "$T/sib/src/migrate.coil" --fix --allow-dirty >/dev/null 2>&1
+grep -q '(import "util" :use \*)' "$T/sib/src/migrate.coil" \
+  && ok "lint --fix migrates a path import before type checking broken code" \
+  || bad "preflight import migration" "legacy import was not rewritten"
 # The PRELUDE + bundled libs are self-contained: their imports resolve to the BUNDLED
 # stdlib, never to same-named decoys sitting in the entry file's directory. A naive
 # file-relative switch made the prelude's control.coil->print->io chain resolve to
@@ -224,12 +230,12 @@ echo "== diag-10: (:use [name]) naming a symbol the module does NOT export is a 
 # FAILS on the seed (which builds it clean, rc=0); PASSES here.
 mkdir -p "$T/use"
 printf '(module util)\n(export good)\n(defn good [] (-> i64) 42)\n(defn secret [] (-> i64) 99)\n' > "$T/use/util.coil"
-printf '(module app)\n(import "util.coil" :use [secret])\n(defn main [] (-> i64) 0)\n'              > "$T/use/nono.coil"
+printf '(module app)\n(import "util" :use [secret])\n(defn main [] (-> i64) 0)\n'              > "$T/use/nono.coil"
 expect_rc  1 "a non-exported :use name is rejected (was: silently accepted)" "$COIL" build "$T/use/nono.coil" -o "$T/use/x"
 expect_out "'secret', which module 'util' does not export" "…and the error names the symbol + module" \
   "$COIL" build "$T/use/nono.coil" -o "$T/use/x"
 # and the legitimate exported name still builds
-printf '(module app)\n(import "util.coil" :use [good])\n(defn main [] (-> i64) (good))\n' > "$T/use/yes.coil"
+printf '(module app)\n(import "util" :use [good])\n(defn main [] (-> i64) (good))\n' > "$T/use/yes.coil"
 expect_rc 42 "an exported :use name still resolves" "$COIL" run "$T/use/yes.coil"
 
 echo "== a compile that cannot finish must SAY SO, not hang or crash =="
@@ -251,7 +257,7 @@ echo "$out" | grep -q "never reaches a fixpoint" && ok "…and explains the grow
 # deep macro-generated nesting: `cond` expands to nested ifs, so 800 clauses — an
 # ordinary bytecode dispatch table — is 800 levels deep, and used to segfault.
 {
-  printf '(module dp)\n(import "control.coil" :use *)\n(defn f [(x i64)] (-> i64) (cond '
+  printf '(module dp)\n(import "coil.control" :use *)\n(defn f [(x i64)] (-> i64) (cond '
   i=0; while [ $i -lt 800 ]; do printf '(coil.primitive/icmp-eq x %d) %d ' $i $i; i=$((i+1)); done
   printf -- '-1))\n(defn main [] (-> i64) (f 5))\n'
 } > "$T/deep.coil"
@@ -496,9 +502,9 @@ echo "== parameterized traits are usable as bounds; extra params are associated 
 # Pop is (deftrait Pop [Self E] (pop! [(xs (mut Self))] (-> (Option E)))); E is return-only.
 cat > "$T/gen1pop.coil" <<'EOF'
 (module app)
-(import "arraylist.coil" :use *)
-(import "alloc.coil" :use *)
-(import "result.coil" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.alloc" :use *)
+(import "coil.result" :use *)
 (defn drain-count [(C Pop)] [(xs (mut C))] (-> i64)
   (let [(mut n) 0]
     (loop (match (pop! (mut xs)) (None [] (break)) (Some [v] (coil.primitive/store! n (+ (coil.primitive/load n) 1)))))
@@ -512,7 +518,7 @@ expect_rc 3 "Pop used as a bound drains a concrete ArrayList (was: 'aren't suppo
 # a user's own parameterized trait, two impls, associated element type read off each impl
 cat > "$T/gen1custom.coil" <<'EOF'
 (module app)
-(import "result.coil" :use *)
+(import "coil.result" :use *)
 (deftrait Container [Self Elem]
   (head [(c Self)] (-> (Option Elem)))
   (size [(c Self)] (-> i64)))
@@ -529,12 +535,12 @@ cat > "$T/gen1custom.coil" <<'EOF'
 EOF
 expect_rc 101 "a user parameterized trait as a bound dispatches per-impl (IntBox=101, Empty=0)" "$COIL" run "$T/gen1custom.coil"
 # calling a parameterized method on an UNBOUNDED type param is a located definition-time error
-printf '(module m)\n(import "result.coil" :use *)\n(deftrait Box2 [Self E] (peek [(c Self)] (-> (Option E))))\n(defn bad [T] [(x T)] (-> i64) (match (peek x) (Some [v] 1) (None [] 0)))\n(defn main [] (-> i64) 0)\n' > "$T/gen1unb.coil"
+printf '(module m)\n(import "coil.result" :use *)\n(deftrait Box2 [Self E] (peek [(c Self)] (-> (Option E))))\n(defn bad [T] [(x T)] (-> i64) (match (peek x) (Some [v] 1) (None [] 0)))\n(defn main [] (-> i64) 0)\n' > "$T/gen1unb.coil"
 expect_out "'T' is not bounded by 'm.Box2'" "an unbounded param calling a parameterized method is located" "$COIL" build "$T/gen1unb.coil" -o "$T/x"
 # an associated type in ARGUMENT position (a Get key, not return) renders readably in the
 # mismatch — `<C as Get>::K`, not the internal mangling. The seed can't reach this message
 # (it errors "aren't supported yet" first), so this is the teeth.
-printf '(module app)\n(import "arraylist.coil" :use *)\n(defn first-elem [(C Get)] [(xs C)] (-> i64) (get xs 0))\n(defn main [] (-> i64) 0)\n' > "$T/gen1assoc.coil"
+printf '(module app)\n(import "coil.arraylist" :use *)\n(defn first-elem [(C Get)] [(xs C)] (-> i64) (get xs 0))\n(defn main [] (-> i64) 0)\n' > "$T/gen1assoc.coil"
 expect_out "expected <C as Get>::K" "an associated type renders as <C as Trait>::Param in diagnostics" "$COIL" build "$T/gen1assoc.coil" -o "$T/x"
 
 echo "== one Iterator/Iterable protocol: (for x (iter coll)); (in map) fixed (gen-1 · std-11 · std-4) =="
@@ -546,8 +552,8 @@ echo "== one Iterator/Iterable protocol: (for x (iter coll)); (in map) fixed (ge
 # (for x (iter slice)) — the unified surface. FAILS on the seed (no protocol → rc≠20).
 cat > "$T/it-slice.coil" <<'EOF'
 (module app)
-(import "slice.coil" :use *)
-(import "control.coil" :use *)
+(import "coil.slice" :use *)
+(import "coil.control" :use *)
 (defn main [] (-> i64)
   (let [arr (coil.alloc/stack (array i64 4)) (mut s) 0]
     (coil.primitive/store! (coil.primitive/index arr 0) 2) (coil.primitive/store! (coil.primitive/index arr 1) 4) (coil.primitive/store! (coil.primitive/index arr 2) 6) (coil.primitive/store! (coil.primitive/index arr 3) 8)
@@ -559,9 +565,9 @@ expect_rc 20 "(for x (iter slice)) drives the Iterator protocol (was: no such pr
 # garbage → 'arithmetic on different types i64 vs (Option i64)' on the seed).
 cat > "$T/it-map.coil" <<'EOF'
 (module app)
-(import "hashmap.coil" :use *)
-(import "alloc.coil" :use *)
-(import "control.coil" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.alloc" :use *)
+(import "coil.control" :use *)
 (defn main [] (-> i64)
   (let [a (malloc-allocator) (mut hm) (hm-new-scalar [i64 i64] a) (mut ksum) 0]
     (hm-put! (mut hm) 40 1) (hm-put! (mut hm) 60 2)
@@ -573,9 +579,9 @@ expect_rc 100 "(in map) iterates the map's keys (std-4: was get-by-index garbage
 # associated-type bound (gen-1) composing with the protocol. FAILS on the seed (rc≠3).
 cat > "$T/it-generic.coil" <<'EOF'
 (module app)
-(import "arraylist.coil" :use *)
-(import "alloc.coil" :use *)
-(import "control.coil" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.alloc" :use *)
+(import "coil.control" :use *)
 (defn count-iter [(I Iterator)] [(it (mut I))] (-> i64)
   (let [(mut n) 0]
     (loop (match (next (mut it)) (None [] (break)) (Some [x] (coil.primitive/store! n (coil.primitive/iadd (coil.primitive/load n) 1)))))
@@ -590,9 +596,9 @@ expect_rc 3 "a generic (I Iterator) consumes any iterator via the protocol" "$CO
 # unified protocol (equivalent element iteration).
 cat > "$T/it-alfor.coil" <<'EOF'
 (module app)
-(import "arraylist.coil" :use *)
-(import "alloc.coil" :use *)
-(import "control.coil" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.alloc" :use *)
+(import "coil.control" :use *)
 (defn main [] (-> i64)
   (let [a (malloc-allocator) (mut xs) (al-new [i64] a) (mut s) 0]
     (al-push! (mut xs) 10) (al-push! (mut xs) 11) (al-push! (mut xs) 12)
@@ -710,10 +716,10 @@ echo "== std-3: string HashMap keys are OWNED by default (copied on insert/freed
 # the old borrow bug => 0*100+2*10+2 = 22 (alpha lost, two entries both "gamma").
 cat > "$T/std3.coil" <<'EOF'
 (module app)
-(import "src/stdlib/hashmap.coil" :use *) (import "src/stdlib/str.coil"    :use *)
-(import "src/stdlib/slice.coil"   :use *) (import "src/stdlib/mem.coil"    :use *)
-(import "src/stdlib/alloc.coil"   :use *) (import "src/stdlib/result.coil" :use *)
-(import "src/stdlib/control.coil" :use *)
+(import "coil.hashmap" :use *) (import "coil.str"    :use *)
+(import "coil.slice"   :use *) (import "coil.mem"    :use *)
+(import "coil.alloc"   :use *) (import "coil.result" :use *)
+(import "coil.control" :use *)
 (defn probe [(ops (ptr KeyOps))] (-> i64)
   (let [a (malloc-allocator) (mut m) (hm-new [(slice u8) i64] a ops)
         buf (coil.alloc/stack (array u8 8))]
@@ -740,7 +746,7 @@ echo "== --debug-checks: library bounds checks (mem-6), zero-cost when off =="
 # the check is emitted ONLY under --debug-checks and the off-path IR is byte-identical.
 cat > "$T/dbgget.coil" <<'EOF'
 (module m)
-(import "slice.coil" :use *)
+(import "coil.slice" :use *)
 (defn main [] (-> i64)
   (let [arr (coil.alloc/stack (array i64 3))]
     (coil.primitive/store! (coil.primitive/index arr 0) 10)
@@ -756,7 +762,7 @@ echo "$out" | grep -q "out of bounds" && bad "off: the bounds check must NOT fir
 # the mem-6 headline: subslice lo>hi used to yield a slice reporting length -2.
 cat > "$T/dbgsub.coil" <<'EOF'
 (module m)
-(import "slice.coil" :use *)
+(import "coil.slice" :use *)
 (defn main [] (-> i64)
   (let [arr (coil.alloc/stack (array i64 4))]
     (let [s (slice-new (coil.primitive/index arr 0) 4)] (slice-len (subslice s 3 1)))))
@@ -802,8 +808,8 @@ echo "== poison-on-free debug-allocator: detects double-free (mem-2) =="
 # (dbgalloc.coil is not bundled there, so the build fails and prints no such message).
 cat > "$T/df.coil" <<'EOF'
 (module m)
-(import "alloc.coil" :use *)
-(import "dbgalloc.coil" :use *)
+(import "coil.alloc" :use *)
+(import "coil.dbgalloc" :use *)
 (defn main [] (-> i64)
   (let [a (debug-allocator (malloc-allocator))
         p (unwrap-ptr [i64] (create [i64] a))]
@@ -822,8 +828,8 @@ expect_out "double free in debug-allocator" "--debug-checks detects a double fre
 # a use-after-free reads the 0xDE poison (222) rather than the freed value under the flag.
 cat > "$T/uaf.coil" <<'EOF'
 (module m)
-(import "alloc.coil" :use *)
-(import "dbgalloc.coil" :use *)
+(import "coil.alloc" :use *)
+(import "coil.dbgalloc" :use *)
 (defn main [] (-> i64)
   (let [a (debug-allocator (malloc-allocator))
         p (unwrap-ptr [i64] (create [i64] a))]
@@ -855,7 +861,7 @@ echo "$out" | grep -q "stack local" && bad "off: the lint must not run" "$out" \
 # no false positive: a function returning a HEAP pointer is fine under the flag.
 cat > "$T/heapret.coil" <<'EOF'
 (module m)
-(import "alloc.coil" :use *)
+(import "coil.alloc" :use *)
 (defn mk [(a (ptr Allocator))] (-> (ptr i64))
   (let [p (unwrap-ptr [i64] (create [i64] a))] (coil.primitive/store! p 9) p))
 (defn main [] (-> i64) (coil.primitive/load (mk (malloc-allocator))))
@@ -871,7 +877,7 @@ echo "== assert / assert-eq: located failures via the span machinery (tool-12) =
 # unknown ops.
 cat > "$T/assf.coil" <<'EOF'
 (module m)
-(import "assert.coil" :use *)
+(import "coil.assert" :use *)
 (defn main [] (-> i64)
   (assert (> 2 1))
   (assert (< 9 3))
@@ -882,7 +888,7 @@ expect_out "assertion failed: \(< 9 3\)" "assert prints the offending expression
 expect_out "assf\.coil:5"  "assert prints file:line (code-file/code-line)"  "$COIL" run "$T/assf.coil"
 cat > "$T/asseq.coil" <<'EOF'
 (module m)
-(import "assert.coil" :use *)
+(import "coil.assert" :use *)
 (defn main [] (-> i64) (assert-eq (+ 40 1) 99))
 EOF
 expect_out "assertion failed: \(\+ 40 1\) == 99" "assert-eq prints BOTH expressions" "$COIL" run "$T/asseq.coil"
@@ -893,7 +899,7 @@ echo "== deftest + the test transform: discovery, fork isolation, exit code (too
 # not bundled -> the import errors).
 cat > "$T/suite.coil" <<'EOF'
 (module m)
-(import "assert.coil" :use *)
+(import "coil.assert" :use *)
 (deftest passes (assert-eq (* 6 7) 42))
 (deftest fails  (assert-eq (+ 1 1) 3))
 (deftest tail   (assert (> 5 0)))
@@ -1052,7 +1058,7 @@ expect_rc 7 "aggregate comptime still folds (interp path, no regression)" "$COIL
 # error stands and `run` never yields the folded exit code.
 printf '(defstruct L [(sz i64) (al i64)])\n(defn main [] (-> i64) (let [s (comptime (let [p (coil.alloc/stack L)] (coil.primitive/store! (coil.primitive/field p sz) (coil.primitive/sizeof i64)) (coil.primitive/store! (coil.primitive/field p al) (coil.primitive/sizeof (ptr i8))) (coil.primitive/load p)))] (+ (coil.primitive/field s sz) (coil.primitive/field s al))))\n' > "$T/ct_agg_sizeof.coil"
 expect_rc 16 "aggregate (struct) comptime via sizeof reads back on the compiled engine (interp can't)" "$COIL" run "$T/ct_agg_sizeof.coil"
-printf '(module app)\n(import "slice.coil" :use *)\n(defn pick [T] [(s (slice u8))] (-> (slice u8)) s)\n(defn main [] (-> i64) (let [s (comptime (pick [i64] "hello"))] (+ (slice-len s) (coil.primitive/cast i64 (coil.primitive/load (coil.primitive/index (slice-data s) 0))))))\n' > "$T/ct_agg_str.coil"
+printf '(module app)\n(import "coil.slice" :use *)\n(defn pick [T] [(s (slice u8))] (-> (slice u8)) s)\n(defn main [] (-> i64) (let [s (comptime (pick [i64] "hello"))] (+ (slice-len s) (coil.primitive/cast i64 (coil.primitive/load (coil.primitive/index (slice-data s) 0))))))\n' > "$T/ct_agg_str.coil"
 expect_rc 109 "string comptime via a generic call reads back on the compiled engine (interp can't)" "$COIL" run "$T/ct_agg_str.coil"
 # interp deletion step 2: a SUM-returning comptime with a capability gap now reads back.
 # The reader takes the 4-byte tag at offset 0 (bytes 4..7 are padding the arm64 backend
@@ -1184,6 +1190,9 @@ cat > "$T/docs/m.coil" <<'EOF'
 (defn helper [] (-> i64) 0)
 EOF
 expect_rc  0 "doc: exits 0 on a documented module"          "$COIL" doc "$T/docs/m.coil"
+expect_out '^coil\.arraylist$' "namespaces: lists bundled namespaces" "$COIL" namespaces
+expect_out '^## helper ' "namespace: lists undocumented definitions too" "$COIL" namespace "$T/docs/m.coil"
+expect_out '^# coil\.arraylist' "namespace: resolves a bundled namespace globally" "$COIL" namespace coil.arraylist
 expect_out '^# shapes'          "doc: prints the module name"           "$COIL" doc "$T/docs/m.coil"
 expect_out 'Add two numbers together.' "doc: prints a fn doc"           "$COIL" doc "$T/docs/m.coil"
 expect_out 'Returns their sum.'        "doc: joins a multi-line doc"    "$COIL" doc "$T/docs/m.coil"
@@ -1245,7 +1254,6 @@ EOF
 expect_rc 14 "cond: :else is the fallback, and the flat trailing else still works" \
   "$COIL" run "$T/lint/cond.coil"
 
-cp src/examples/metaprogramming/condlint.coil src/examples/metaprogramming/condlint-on.coil "$T/lint/"
 cat > "$T/lint/target.coil" <<'EOF'
 (module app)
 (defn classify [(x i64)] (-> i64)
@@ -1277,20 +1285,20 @@ cp "$T/lint/target.coil" "$T/lint/target.orig"
 
 expect_rc 54 "lint: the target program runs before any fix"   "$COIL" run "$T/lint/target.coil"
 expect_out 'help: try: \(cond \(= x 1\) 100' "lint: reports the chain with a help line" \
-  "$COIL" lint "$T/lint/target.coil" --use condlint-on.coil
+  "$COIL" lint "$T/lint/target.coil" --use condlinton
 # The lint reports the 3-test chain and the commented one — but NOT the two-armed if,
 # and NOT the `cond` the author wrote (which is nested ifs by the time a checker sees it).
 expect_out '^2$' "lint: flags the two hand-written chains and nothing else" \
-  sh -c "\"$COIL\" lint \"$T/lint/target.coil\" --use condlint-on.coil 2>&1 | grep -c 'nested ifs'"
+  sh -c "\"$COIL\" lint \"$T/lint/target.coil\" --use condlinton 2>&1 | grep -c 'nested ifs'"
 cmp -s "$T/lint/target.coil" "$T/lint/target.orig" \
   && ok "lint: reporting writes nothing" || bad "lint: reporting writes nothing" "the file changed"
 
 expect_out '^\+  \(cond \(= x 1\) 100' "lint --diff: prints the patch" \
-  sh -c "\"$COIL\" lint \"$T/lint/target.coil\" --use condlint-on.coil --diff 2>/dev/null"
+  sh -c "\"$COIL\" lint \"$T/lint/target.coil\" --use condlinton --diff 2>/dev/null"
 cmp -s "$T/lint/target.coil" "$T/lint/target.orig" \
   && ok "lint --diff: writes nothing" || bad "lint --diff: writes nothing" "the file changed"
 
-"$COIL" lint "$T/lint/target.coil" --use condlint-on.coil --fix >/dev/null 2>&1
+"$COIL" lint "$T/lint/target.coil" --use condlinton --fix >/dev/null 2>&1
 expect_out 'cond \(= x 1\) 100 \(= x 2\) 200 \(= x 3\) 300 :else 999' \
   "lint --fix: rewrote the chain as a cond with :else" cat "$T/lint/target.coil"
 # The comment sits in the GAP between two nodes, the one thing no Code value records.
@@ -1302,7 +1310,7 @@ expect_out '; a comment between a test and its body' \
   "lint --fix: carried the comment across the rewrite" cat "$T/lint/target.coil"
 expect_rc 54 "lint --fix: the program still behaves identically" "$COIL" run "$T/lint/target.coil"
 cp "$T/lint/target.coil" "$T/lint/target.fixed"
-"$COIL" lint "$T/lint/target.coil" --use condlint-on.coil --fix >/dev/null 2>&1
+"$COIL" lint "$T/lint/target.coil" --use condlinton --fix >/dev/null 2>&1
 cmp -s "$T/lint/target.coil" "$T/lint/target.fixed" \
   && ok "lint --fix: idempotent" || bad "lint --fix: idempotent" "a second --fix changed the file"
 
@@ -1341,11 +1349,11 @@ cp "$T/lint/comments.coil" "$T/lint/comments.orig"
 expect_rc 32 "lint --fix (comments): the program runs before the fix" \
   "$COIL" run "$T/lint/comments.coil"
 expect_out '^0$' "lint --fix (comments): no fix is refused over a comment" \
-  sh -c "\"$COIL\" lint \"$T/lint/comments.coil\" --use condlint-on.coil --fix 2>&1 | grep -c 'drop a comment'"
+  sh -c "\"$COIL\" lint \"$T/lint/comments.coil\" --use condlinton --fix 2>&1 | grep -c 'drop a comment'"
 expect_rc 32 "lint --fix (comments): the program behaves identically after" \
   "$COIL" run "$T/lint/comments.coil"
 expect_out '^0$' "lint --fix (comments): no nested-if chain is left" \
-  sh -c "\"$COIL\" lint \"$T/lint/comments.coil\" --use condlint-on.coil 2>&1 | grep -c 'nested ifs'"
+  sh -c "\"$COIL\" lint \"$T/lint/comments.coil\" --use condlinton 2>&1 | grep -c 'nested ifs'"
 # Every comment the author wrote is still in the file, byte for byte.
 miss=0
 while IFS= read -r c; do
@@ -1366,7 +1374,7 @@ expect_out 'cond \(= x 1\) "a; b" \(= x 2\) "c; d" \(= x 3\) "e" :else "f"' \
   "lint --fix (comments): a ';' inside a string is not treated as a comment" \
   cat "$T/lint/comments.coil"
 cp "$T/lint/comments.coil" "$T/lint/comments.fixed"
-"$COIL" lint "$T/lint/comments.coil" --use condlint-on.coil --fix >/dev/null 2>&1
+"$COIL" lint "$T/lint/comments.coil" --use condlinton --fix >/dev/null 2>&1
 cmp -s "$T/lint/comments.coil" "$T/lint/comments.fixed" \
   && ok "lint --fix (comments): idempotent" \
   || bad "lint --fix (comments): idempotent" "a second --fix changed the file"
@@ -1404,7 +1412,7 @@ EOF
 printf '(module app)\n(defn main [] (-> i64)\n  (+ 40 2))\n' > "$T/lint/victim.coil"
 cp "$T/lint/victim.coil" "$T/lint/victim.orig"
 expect_rc 1 "lint --fix: a fix that does not compile fails the run" \
-  "$COIL" lint "$T/lint/victim.coil" --use badrule.coil --fix
+  "$COIL" lint "$T/lint/victim.coil" --use badrule --fix
 cmp -s "$T/lint/victim.coil" "$T/lint/victim.orig" \
   && ok "lint --fix: the reverted round left the file byte-identical" \
   || bad "lint --fix: the reverted round left the file byte-identical" "the file was left broken"

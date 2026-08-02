@@ -84,8 +84,8 @@ cc -c -O0 "$WORK/cabi.c" -o "$WORK/cabi.o" 2>"$WORK/cc.log" \
 # ---------------- the Coil side ----------------
 cat > "$WORK/cabi.coil" <<'KEOF'
 (module cabitest)
-(import "io.coil" :use *)
-(import "control.coil" :use *)
+(import "coil.io" :use *)
+(import "coil.control" :use *)
 
 (defstruct P2 [(a i64) (b i64)])
 (defstruct F2 [(x f64) (y f64)])

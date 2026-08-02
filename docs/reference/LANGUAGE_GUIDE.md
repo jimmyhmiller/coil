@@ -23,8 +23,10 @@ inside it, so `coil` and every `(import "…")` below work from any directory.
     coil build file.coil -lm             # link a library (-l<name>)
     coil repl                            # interactive session
     coil fmt   file.coil                 # print formatted source (--write / --check)
-    coil lint  file.coil --use rules.coil # run checkers (--diff / --fix applies them)
+    coil lint  file.coil --use my.rules   # run checkers (--diff / --fix applies them)
     coil doc   file.coil                 # markdown for the module's `;;`-documented surface
+    coil namespaces                      # bundled standard-library namespace names
+    coil namespace coil.arraylist        # every definition/signature, plus available docs
 
 `main`'s `i64` return is the process exit code. There is no JIT. A file that is
 imported must start with `(module NAME)`. `Coil.toml`:
@@ -73,13 +75,14 @@ Native objects and depfiles live under `.coil/build/native/`; sources and header
 are rebuilt only when their inputs or toolchain configuration change. Test runners
 use collision-free paths under `.coil/build/test/`.
 
-A dependency name is the first component of its import path: the examples above
-are imported as `"local_math/src/math.coil"` and
-`"remote_math/src/math.coil"`. `path` is relative to the project directory. A Git
-dependency requires a full 40- or 64-digit commit SHA; Coil checks out that exact
-commit under `.coil/deps/<name>-<sha>`. Git branches and tags are deliberately not
-accepted as pins. The string shorthand `local_math = "../local-math"` is equivalent
-to `{ path = "../local-math" }`.
+Dependency names are manifest-local handles, not import prefixes. Coil adds each
+dependency root to the namespace index, so consumers import the namespace declared
+by the dependency's source—for example `"local_math.numeric"`—regardless of where
+that source lives inside the dependency. `path` is relative to the project directory.
+A Git dependency requires a full 40- or 64-digit commit SHA; Coil checks out that
+exact commit under `.coil/deps/<name>-<sha>`. Git branches and tags are deliberately
+not accepted as pins. The string shorthand `local_math = "../local-math"` is
+equivalent to `{ path = "../local-math" }`.
 
 The Wasm target produces an instantiable module. The compiler performs the final
 Wasm-object conversion itself; this target does not invoke a linker process, and
@@ -113,26 +116,40 @@ module declares (the DOM calls you `extern`-declared), then call
 ## Modules & imports
 
     (module myproject.app)               ; conventional project-prefixed namespace
-    (import "other.coil" :use *)         ; bring all exported names in, unqualified
-    (import "other.coil" :use [a b])     ; specific names
-    (import "other.coil" :as x)          ; qualified: x/name
+    (import "coil.io" :use *)            ; bring all exported names in, unqualified
+    (import "coil.io" :use [a b])        ; specific names
+    (import "coil.io" :as io)            ; qualified: io/name
     (export foo bar)                     ; optional; omitted = everything visible
 
 Module names may contain dots. By convention, every project owns a prefix and uses
 it for all importable modules: `myproject`, `myproject.http`, `myproject.db.user`,
 and so on. This is a convention, not a compiler requirement; a one-part name remains
 valid. Public/package namespaces may also use a leading owner scope, for example
-`(module @myname.project.thing)`. The complete scoped name is the module identity;
-imports still use file paths, and callers normally choose a short local `:as` alias.
+`(module @myname.project.thing)`. The complete scoped name is the module identity.
 
 The bundled standard library follows the same rule under `coil.*`: `coil.core`,
-`coil.json`, `coil.http.client`, `coil.http.server`, `coil.slice`, etc. Bare import filenames such as
-`"json.coil"` remain unchanged.
+`coil.json`, `coil.http.client`, `coil.http.server`, `coil.slice`, etc. Import these
+using their public namespace, for example `(import "coil.time" :as time)`.
 
-Paths resolve relative to the **importing file's own directory**; bare stdlib
-names (`alloc.coil`, `str.coil`, …) resolve to the bundled library from anywhere.
-In project mode, an import beginning with a declared dependency name resolves from
-that dependency's root after ordinary file-relative lookup.
+Use `coil namespaces` to discover every standard-library namespace bundled into
+the installed compiler. `coil namespace NAME` then prints all definitions and
+signatures in one of those namespaces and includes each definition's `;;` docs
+when present. It also accepts a source path, so `coil namespace src/my_lib.coil`
+is the namespace inventory for project code. `coil doc FILE` remains the concise,
+documented-only view.
+
+Imports name namespaces, never files. Coil indexes every `.coil` source under the
+project's configured `source-roots` (the project directory for a direct-file build),
+each dependency root, and the bundled standard library. File placement beneath those
+roots is irrelevant: `(import "myproject.db.user" :as user)` resolves the file whose
+leading declaration is `(module myproject.db.user)`. A namespace declared by multiple
+files is an error. Relative paths, absolute paths, dependency-prefixed paths, and bare
+filenames such as `"time.coil"` are not valid imports.
+
+`coil lint --fix` has a syntax-preflight phase that runs before import loading or type
+checking. It migrates legacy path imports by opening the old target, reading its
+`(module …)` declaration, and replacing only the import string. This works even when
+the legacy import prevents the program from compiling.
 ⚠ `extern` declarations are NOT deduped across modules — declare each libc
 extern in ONE module and `:use *` it, or two importers colliding will fail to link.
 
@@ -333,7 +350,7 @@ fields and does not make new cases visible to the type checker.
 
 ## Pointers, memory, allocation
 
-Import the allocation API with `(import "alloc.coil" :as alloc)`. Its three
+Import the allocation API with `(import "coil.alloc" :as alloc)`. Its three
 allocation operations each yield `(ptr T)`:
 
 - `(alloc/stack T)` → `alloca`, this frame. ⚠ **NEVER call `alloc/stack` inside a
@@ -344,7 +361,7 @@ allocation operations each yield `(ptr T)`:
 - `(alloc/heap T)` → `malloc` (pair with `primitive/free`).
 
 Low-level compiler operations are definitions in `coil.primitive`, not ambient
-syntax. Import it explicitly with `(import "primitive.coil" :as primitive)` and
+syntax. Import it explicitly with `(import "coil.primitive" :as primitive)` and
 write `(primitive/load p)`, `(primitive/store! p v)`, `(primitive/iadd a b)`, etc.
 The old bare spellings such as `(load p)`, `(iadd a b)`, and `(alloc-stack T)` are
 ordinary unresolved function calls. `defprimitive` associates a definition with
@@ -521,9 +538,9 @@ rewrite, so collapsing a commented `if` chain keeps every comment. See
 `docs/archive/AUTOFIX.md`, and `src/examples/metaprogramming/condlint.coil` for a rule that turns a chain of
 three or more nested `if`s into a `cond`:
 
-    coil lint app.coil --use condlint-on.coil          # report + `help: try:` lines
-    coil lint app.coil --use condlint-on.coil --diff   # the patch; writes nothing
-    coil lint app.coil --use condlint-on.coil --fix    # apply it
+    coil lint app.coil --use myproject.condlint          # report + `help: try:` lines
+    coil lint app.coil --use myproject.condlint --diff   # the patch; writes nothing
+    coil lint app.coil --use myproject.condlint --fix    # apply it
 
 ⚠ Checkers see the program **after macro expansion**, so every `cond`/`when`/`case` in
 the file has already become nested `if`s. `(primitive/code-macro? NODE)` is true for a node the
@@ -555,7 +572,7 @@ so it can be the thing that makes the program valid — e.g. rewriting `(inc E)`
 registrations *is* a dialect; importing it applies the whole stack, in import order,
 transforms before checkers. To apply one without editing the source:
 
-    coil run app.coil --use lint.coil       # repeatable; works on run and build
+    coil run app.coil --use myproject.lint  # repeatable; works on run and build
 
 Metaprograms compile to native code — always. Macros, `(meta …)` generators,
 checkers, transforms, and `(comptime E)` / `(const …)` folding all run on the one
@@ -654,7 +671,7 @@ as a struct field name. When in doubt, prefix your name (`p-call`, `vm-call`).
 
 ## Bundled standard library
 
-These modules ship inside the compiler — `(import "NAME.coil" :use *)` works from
+These modules ship inside the compiler — `(import "coil.NAME" :use *)` works from
 anywhere, no path or install step:
 `coil.alloc` (allocators), `coil.arraylist`, `coil.hashmap`, `coil.slice`, `coil.str`,
 `coil.mem`, `coil.io`, `coil.fmt`, `coil.print`, `coil.fs` (files), `coil.result`

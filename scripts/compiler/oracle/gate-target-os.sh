@@ -28,7 +28,7 @@ fail=0
 # ---- a const selecting on (target-os) folds to the TARGET's literal ----
 cat > "$WORK/flags.coil" <<'EOF'
 (module flagtest)
-(import "io.coil" :use *)
+(import "coil.io" :use *)
 (defn pick [(l Code) (d Code)] (-> Code)
   (if (code-eq (target-os) `linux) l d))
 (defn gen [] (-> Code)

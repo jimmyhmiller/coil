@@ -158,10 +158,10 @@ def main():
 
     out=[]
     out.append('(module scheme)')
-    out.append('(import "../sval.coil" :use *)')
-    out.append('(import "../gcauto2.coil" :use *)   ; the GC metaprogram')
-    out.append('(import "io.coil" :use *)')
-    out.append('(import "fmt.coil" :use *)')
+    out.append('(import "sval" :use *)')
+    out.append('(import "gcauto2" :use *)   ; the GC metaprogram')
+    out.append('(import "coil.io" :use *)')
+    out.append('(import "coil.fmt" :use *)')
     out.append('')
     # monotonic-clock timer so each program reports its own COMPUTE time (the actual
     # evaluation), separate from process startup/teardown that a wall-clock also sees.

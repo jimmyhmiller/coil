@@ -60,6 +60,11 @@ function hostFree(ptr) {
   if (!bin) { bin = []; freeBins.set(k, bin); }
   bin.push(ptr);
 }
+let errnoPtr = 0n;
+function hostErrno() {
+  if (errnoPtr === 0n) errnoPtr = malloc(4n);
+  return errnoPtr;
+}
 function realloc(ptr, size) {
   ptr = BigInt(ptr); size = BigInt(size);
   if (ptr === 0n) return malloc(size);
@@ -266,7 +271,7 @@ const env = {
   fwrite:(ptr,sz,nm,f)=>{ const n=Number(sz)*Number(nm); doWrite(Number(f),ptr,BigInt(n)); return BigInt(nm); },
   opendir:(p)=>0n, closedir:(d)=>0,
   getcwd:(b,sz)=>{ const r=Buffer.from(process.cwd()+'\0'); writeBytes(b,r); return b; },
-  getenv:(n)=>0n, getpid:()=>Number(process.pid), realpath_stub:()=>0n,
+  getenv:(n)=>0n, getpid:()=>Number(process.pid), realpath_stub:()=>0n, __error:hostErrno,
   // string
   strlen:(p)=>{ const m=u8(); let e=Number(p); while(m[e]!==0)e++; return BigInt(e-Number(p)); },
   snprintf,

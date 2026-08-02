@@ -1,6 +1,7 @@
 (module coil.io)
-(import "primitive.coil" :as primitive)
-(import "alloc.coil" :as alloc)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.os" :as os)
 ; Zig-style IO: a capability is a VALUE (a vtable struct) threaded explicitly,
 ; exactly like the allocator. A `Writer` is `{ write-fn, ctx }`; a function that
 ; does output *takes* a Writer, so IO shows up in its type. There is no ambient
@@ -14,8 +15,8 @@
 ; `(Result :i64 IoError)` in from each function's return type (bidirectional
 ; checking), filling even the error type that `Ok` mentions in no field.
 
-(import "result.coil" :use *)
-(import "slice.coil"  :use *)   ; (slice u8) strings: slice-data / slice-len
+(import "coil.result" :use *)
+(import "coil.slice"  :use *)   ; (slice u8) strings: slice-data / slice-len
 
 (extern write  :cc c [i32 (ptr i8) isize] (-> isize))   ; ssize_t write(int fd, const void*, size_t)
 (extern read   :cc c [i32 (ptr i8) isize] (-> isize))   ; ssize_t read(int fd, void*, size_t)
@@ -24,7 +25,10 @@
 
 (defsum IoError
   (Eof)
-  (Errno [(code :i64)]))
+  (Errno [(code :i64)])
+  (LineTooLong)
+  (OutOfMemory)
+  (InvalidLimit))
 
 ; ============================ Writer ========================================
 (defstruct Writer
@@ -58,6 +62,15 @@
 (defn print-str [(w (ptr Writer)) (s (slice u8))] (-> (Result :i64 IoError))
   (write-all w (primitive/cast (ptr i8) (slice-data s)) (slice-len s)))
 
+;; Write a byte slice followed by one newline. The returned count includes the newline.
+(defn write-line [(w (ptr Writer)) (s (slice u8))] (-> (Result :i64 IoError))
+  (match (print-str w s)
+    (Err [e] (Err e))
+    (Ok [n]
+      (match (write-byte w (primitive/cast :u8 \newline))
+        (Err [e] (Err e))
+        (Ok [m] (Ok (primitive/iadd n m)))))))
+
 ;; Write a NUL-terminated C string (`c"…"` / a `(ptr i8)` from FFI).
 (defn print-cstr [(w (ptr Writer)) (s (ptr i8))] (-> (Result :i64 IoError))
   (write-all w s (primitive/cast :i64 (strlen s))))
@@ -73,7 +86,7 @@
 ;; fd-backed: the ctx pointer *is* the file descriptor (int<->ptr cast).
 (defn fd-write [(ctx (ptr i8)) (buf (ptr i8)) (len :i64)] (-> (Result :i64 IoError))
   (let [n (primitive/cast :i64 (write (primitive/cast i32 ctx) buf (primitive/cast isize len)))]
-    (if (primitive/icmp-lt n 0) (Err (Errno n)) (Ok n))))
+    (if (primitive/icmp-lt n 0) (Err (Errno (os/os-errno))) (Ok n))))
 ;; The caller owns the Writer cell. `alloc-static` gives ONE cell per CALL SITE, not per
 ;; call, so building the Writer in here handed every caller the SAME struct: two live
 ;; `fd-writer`s on different fds aliased, and the aliasing was already known to bite —
@@ -255,9 +268,119 @@
                       (do (primitive/store! (primitive/index buf (primitive/load i)) (primitive/cast i8 c))
                           (primitive/store! i (primitive/iadd (primitive/load i) 1))))))))))))
 
+;; An allocator-owned line whose capacity is retained so every allocator, including an
+;; arena, can release it with the exact size it received. The byte slice excludes the
+;; consumed newline. `owned-bytes-free` is idempotent for one object.
+(defstruct OwnedBytes
+  [(bytes (slice u8))
+   (capacity :i64)])
+
+(defn owned-bytes-make [(data (ptr i8)) (len :i64) (capacity :i64)] (-> OwnedBytes)
+  (let [out (alloc/stack OwnedBytes)]
+    (primitive/store! (primitive/field out bytes)
+                      (slice-new (primitive/cast (ptr u8) data) len))
+    (primitive/store! (primitive/field out capacity) capacity)
+    (primitive/load out)))
+
+;; Return the owned line's bytes as a slice view. The view remains valid until free.
+(defn owned-bytes-slice [(bytes OwnedBytes)] (-> (slice u8))
+  (primitive/load (primitive/field bytes bytes)))
+
+;; Release an OwnedBytes allocation. The caller must not use its slice afterward.
+(defn owned-bytes-free [(a (ptr alloc/Allocator)) (bytes (ptr OwnedBytes))] (-> :i64)
+  (let [capacity (primitive/load (primitive/field bytes capacity))]
+    (if (primitive/icmp-gt capacity 0)
+        (alloc/raw-free a
+                        (primitive/cast (ptr i8) (slice-data (primitive/load (primitive/field bytes bytes))))
+                        capacity
+                        1)
+        0)
+    (primitive/store! (primitive/field bytes bytes) (slice-new (primitive/cast (ptr u8) 0) 0))
+    (primitive/store! (primitive/field bytes capacity) 0)
+    0))
+
+;; Read one newline-terminated line into allocator-owned storage. The newline is
+;; consumed and omitted. A final unterminated line is returned once, then the next call
+;; returns Eof. `max-bytes` limits content bytes, not the newline.
+(defn read-line-alloc [(a (ptr alloc/Allocator))
+                       (r (ptr Reader))
+                       (max-bytes :i64)] (-> (Result OwnedBytes IoError))
+  (if (primitive/icmp-lt max-bytes 0)
+      (Err (InvalidLimit))
+      (let [(mut data) (primitive/cast (ptr i8) 0)
+            (mut len) 0
+            (mut capacity) 0
+            one (alloc/stack :i8)]
+        (block :done
+          (loop
+            (match (read-some r one 1)
+              (Err [e]
+                (do
+                  (if (primitive/icmp-gt (primitive/load capacity) 0)
+                      (alloc/raw-free a
+                                      (primitive/load data)
+                                      (primitive/load capacity)
+                                      1)
+                      0)
+                  (return-from :done (Err e))))
+              (Ok [n]
+                (if (primitive/icmp-le n 0)
+                    (return-from :done
+                      (if (primitive/icmp-eq (primitive/load len) 0)
+                          (Err (Eof))
+                          (Ok (owned-bytes-make (primitive/load data)
+                                                (primitive/load len)
+                                                (primitive/load capacity)))))
+                    (let [c (primitive/load one)]
+                      (if (primitive/icmp-eq (primitive/cast :i64 c) \newline)
+                          (return-from :done
+                            (Ok (owned-bytes-make (primitive/load data)
+                                                  (primitive/load len)
+                                                  (primitive/load capacity))))
+                          (if (primitive/icmp-ge (primitive/load len) max-bytes)
+                              (do
+                                (if (primitive/icmp-gt (primitive/load capacity) 0)
+                                    (alloc/raw-free a
+                                                    (primitive/load data)
+                                                    (primitive/load capacity)
+                                                    1)
+                                    0)
+                                (return-from :done (Err (LineTooLong))))
+                              (do
+                                (when (primitive/icmp-ge (primitive/load len) (primitive/load capacity))
+                                  (let [new-cap
+                                          (if (primitive/icmp-eq (primitive/load capacity) 0)
+                                              (if (primitive/icmp-lt max-bytes 64) max-bytes 64)
+                                              (if (primitive/icmp-gt (primitive/load capacity)
+                                                                     (primitive/idiv max-bytes 2))
+                                                  max-bytes
+                                                  (primitive/imul (primitive/load capacity) 2)))]
+                                    (match (if (primitive/icmp-eq (primitive/cast :i64 (primitive/load data)) 0)
+                                                (alloc/raw-alloc a new-cap 1)
+                                                (alloc/raw-resize a
+                                                                  (primitive/load data)
+                                                                  (primitive/load capacity)
+                                                                  new-cap
+                                                                  1))
+                                      (None []
+                                        (do
+                                          (if (primitive/icmp-gt (primitive/load capacity) 0)
+                                              (alloc/raw-free a
+                                                              (primitive/load data)
+                                                              (primitive/load capacity)
+                                                              1)
+                                              0)
+                                          (return-from :done (Err (OutOfMemory)))))
+                                      (Some [p]
+                                        (do
+                                          (primitive/store! data p)
+                                          (primitive/store! capacity new-cap))))))
+                                (primitive/store! (primitive/index (primitive/load data) (primitive/load len)) c)
+                                (primitive/store! len (primitive/iadd (primitive/load len) 1))))))))))))))
+
 (defn fd-read [(ctx (ptr i8)) (buf (ptr i8)) (len :i64)] (-> (Result :i64 IoError))
   (let [n (primitive/cast :i64 (read (primitive/cast i32 ctx) buf (primitive/cast isize len)))]
-    (if (primitive/icmp-lt n 0) (Err (Errno n)) (Ok n))))
+    (if (primitive/icmp-lt n 0) (Err (Errno (os/os-errno))) (Ok n))))
 ;; caller-owned, for the same reason as fd-writer.
 (defn fd-reader [(r (ptr Reader)) (fd :i64)] (-> (ptr Reader))
   (primitive/store! (primitive/field r read-fn) (primitive/fnptr-of fd-read))

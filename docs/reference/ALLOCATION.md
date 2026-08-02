@@ -438,7 +438,7 @@ identical when re-run.
 Two mechanical traps this work hit, both worth knowing before touching `src/stdlib/`:
 
 * **A new `src/stdlib/` function used by `src/compiler` breaks the bootstrap.** `stage0` is the
-  committed seed, and it resolves `(import "arraylist.coil")` to its own *embedded* copy,
+  committed seed, and it resolves `(import "coil.arraylist")` to its own *embedded* copy,
   not the one on disk — so the seed cannot compile a `loader.coil` that calls a function
   added to `src/stdlib/` in the same change. Build a bridge stage0 first
   (`COIL_STDLIB_DIR=$PWD build/bin/coil build src/compiler/main.coil -o /tmp/coil-bridge`, which

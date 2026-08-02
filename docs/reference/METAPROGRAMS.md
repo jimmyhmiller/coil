@@ -25,7 +25,7 @@ Distinguished only by *what they receive* and *what they return*.
   decides which modules to look at (e.g. skip the ones where `(primitive/code-from-user? (primitive/code-nth m 1))`
   is false). A **transformer** still gets the flat form list (it rewrites in place).
 - **Dialects** — *import* a module that contains those registrations: one
-  `(import "safe_dialect.coil")` applies its whole stack.
+  `(import "safe_dialect")` applies its whole stack.
 - **From the CLI, optionally** — `coil run app.coil --use lint.coil` imports a
   metaprogram module (which self-registers its `(checker …)`) **without editing the
   source**. Repeatable; works on `run` and `build`. This is how you run a linter on
