@@ -28,7 +28,6 @@ const PAGE  = 65536;
 // repeated fixed-size frame allocations reuse the same blocks, bounding memory to the
 // peak concurrent live set rather than the cumulative churn.
 let heap = 0n;                                    // next free offset (BigInt)
-const sizes = new Map();                          // live ptr -> rounded size
 const freeBins = new Map();                       // size(string) -> [ptr,…] reusable
 const alignUp = (v, a) => (v + (a - 1n)) & ~(a - 1n);
 function ensure(end) {                            // grow memory to cover byte `end`
@@ -42,19 +41,25 @@ function malloc(size) {
   if (size <= 0n) size = 1n;
   size = alignUp(size, 16n);                       // bin by 16-byte-rounded size
   const bin = freeBins.get(size.toString());
-  if (bin && bin.length) { const p = bin.pop(); sizes.set(p, size); return p; }
-  const p = alignUp(heap, 16n);
+  if (bin && bin.length) {
+    const p = bin.pop();
+    dv().setBigUint64(Number(p - 8n), size, true);
+    return p;
+  }
+  // Store allocation size immediately before the aligned user pointer. A JS Map
+  // entry per allocation exceeded V8's maximum while compiling the compiler itself.
+  const p = alignUp(heap, 16n) + 16n;
   heap = p + size;
   ensure(heap);
-  sizes.set(p, size);
+  dv().setBigUint64(Number(p - 8n), size, true);
   return p;                                       // BigInt (i64)
 }
 function hostFree(ptr) {
   ptr = BigInt(ptr);
-  if (ptr === 0n) return;
-  const s = sizes.get(ptr);
-  if (s === undefined) return;                     // unknown/double free: ignore
-  sizes.delete(ptr);
+  if (ptr < 16n || ptr >= heap) return;
+  const s = dv().getBigUint64(Number(ptr - 8n), true);
+  if (s === 0n || ptr + s > heap) return;           // unknown/double free: ignore
+  dv().setBigUint64(Number(ptr - 8n), 0n, true);
   const k = s.toString();
   let bin = freeBins.get(k);
   if (!bin) { bin = []; freeBins.set(k, bin); }
@@ -68,7 +73,7 @@ function hostErrno() {
 function realloc(ptr, size) {
   ptr = BigInt(ptr); size = BigInt(size);
   if (ptr === 0n) return malloc(size);
-  const old = sizes.get(ptr) ?? 0n;
+  const old = ptr >= 16n && ptr < heap ? dv().getBigUint64(Number(ptr - 8n), true) : 0n;
   if (old >= alignUp(size <= 0n ? 1n : size, 16n)) return ptr;   // fits in place
   const np = malloc(size);
   const n = Number(old < size ? old : size);
@@ -84,6 +89,31 @@ function cstr(ptr) {                              // read NUL-terminated string
   return Buffer.from(m.slice(Number(ptr), e)).toString('utf8');
 }
 function writeBytes(ptr, data) { u8().set(data, Number(ptr)); }
+
+// libc environment bridge. Keep returned strings alive for the process lifetime,
+// matching getenv's contract closely enough for the compiler's namespace setup.
+const hostEnv = new Map(Object.entries(process.env));
+const hostEnvPtrs = new Map();
+function hostGetenv(namePtr) {
+  const name = cstr(namePtr);
+  const value = hostEnv.get(name);
+  if (value === undefined) return 0n;
+  const cached = hostEnvPtrs.get(name);
+  if (cached !== undefined) return cached;
+  const bytes = Buffer.from(value + '\0');
+  const ptr = malloc(BigInt(bytes.length));
+  writeBytes(ptr, bytes);
+  hostEnvPtrs.set(name, ptr);
+  return ptr;
+}
+function hostSetenv(namePtr, valuePtr, overwrite) {
+  const name = cstr(namePtr);
+  if (!name || name.includes('=')) return -1;
+  if (!overwrite && hostEnv.has(name)) return 0;
+  hostEnv.set(name, cstr(valuePtr));
+  hostEnvPtrs.delete(name);
+  return 0;
+}
 
 // ---- file descriptors ------------------------------------------------------
 // Node fds are small ints; use them directly. 0/1/2 are std streams.
@@ -271,7 +301,8 @@ const env = {
   fwrite:(ptr,sz,nm,f)=>{ const n=Number(sz)*Number(nm); doWrite(Number(f),ptr,BigInt(n)); return BigInt(nm); },
   opendir:(p)=>0n, closedir:(d)=>0,
   getcwd:(b,sz)=>{ const r=Buffer.from(process.cwd()+'\0'); writeBytes(b,r); return b; },
-  getenv:(n)=>0n, getpid:()=>Number(process.pid), realpath_stub:()=>0n, __error:hostErrno,
+  getenv:hostGetenv, setenv:hostSetenv,
+  getpid:()=>Number(process.pid), realpath_stub:()=>0n, __error:hostErrno,
   // string
   strlen:(p)=>{ const m=u8(); let e=Number(p); while(m[e]!==0)e++; return BigInt(e-Number(p)); },
   snprintf,
