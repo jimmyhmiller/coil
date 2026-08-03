@@ -41,6 +41,31 @@ printf '(extern abort :cc c [] (-> i64))\n(defn main [] (-> i64) (abort))\n' > "
 printf '(defn a [] (-> i64)    1)\n'                     > "$T/messy1.coil"
 printf '(defn b [] (-> i64)    2)\n'                     > "$T/messy2.coil"
 
+echo "== executable-relative resources through PATH =="
+HTTP_NATIVE_TARGET=$([ "$HOST_OS" = Linux ] && echo x86_64-linux || echo arm64-macos)
+mkdir -p "$T/path-bin" "$T/real-bin/native/curl/$HTTP_NATIVE_TARGET"
+cp "$COIL" "$T/real-bin/coil-real"
+ln -s "$T/real-bin/coil-real" "$T/path-bin/coil"
+cp tests/http_client_compile.coil "$T/http.coil"
+cat > "$T/curl-stub.c" <<'EOF'
+void *curl_easy_init(void) { return 0; }
+void curl_easy_cleanup(void *p) {}
+int curl_easy_perform(void *p) { return 1; }
+int curl_easy_setopt(void *p, int option, ...) { return 0; }
+int curl_easy_getinfo(void *p, int info, ...) { return 0; }
+char *curl_easy_strerror(int code) { return "stub"; }
+void *curl_slist_append(void *list, const char *value) { return list; }
+void curl_slist_free_all(void *list) {}
+EOF
+cc -c "$T/curl-stub.c" -o "$T/curl-stub.o"
+ar rcs "$T/real-bin/native/curl/$HTTP_NATIVE_TARGET/libcurl.a" "$T/curl-stub.o"
+for archive in libmbedtls.a libmbedx509.a libmbedcrypto.a; do
+  ar rcs "$T/real-bin/native/curl/$HTTP_NATIVE_TARGET/$archive" "$T/curl-stub.o"
+done
+(cd "$T" && PATH="$T/path-bin:$PATH" coil build "$T/http.coil" -o "$T/http") >/dev/null 2>&1 \
+  && ok "bare argv[0] resolves bundled HTTP archives beside the executable" \
+  || bad "bare argv[0] resolves bundled HTTP archives beside the executable" "PATH invocation could not link coil.http.client"
+
 echo "== exit codes (a crash must not look like success) =="
 expect_rc 7   "run propagates a normal exit code"        "$COIL" run "$T/seven.coil"
 expect_rc 134 "run propagates SIGABRT as 128+signo"      "$COIL" run "$T/abort.coil"
