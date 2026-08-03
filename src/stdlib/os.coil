@@ -1,5 +1,8 @@
 (module coil.os)
 (import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use [slice-new slice-data slice-len])
+(import "coil.str" :as str)
 
 ; Small hosted OS facts shared by the standard library. Keep libc's platform-specific
 ; errno accessor in exactly one bundled module: Coil does not deduplicate extern
@@ -10,9 +13,175 @@
       `(do
          (extern __errno_location :cc c [] (-> (ptr i32)))
          (defn os-errno [] (-> i64)
-           (primitive/cast i64 (primitive/load (__errno_location)))))
+           (primitive/cast i64 (load (__errno_location)))))
       `(do
          (extern __error :cc c [] (-> (ptr i32)))
          (defn os-errno [] (-> i64)
-           (primitive/cast i64 (primitive/load (__error)))))))
+           (primitive/cast i64 (load (__error)))))))
 (meta (gen-os-platform))
+
+(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
+(extern setenv :cc c [(ptr i8) (ptr i8) i32] (-> i32))
+(extern unsetenv :cc c [(ptr i8)] (-> i32))
+(extern getcwd :cc c [(ptr i8) isize] (-> (ptr i8)))
+(extern chdir :cc c [(ptr i8)] (-> i32))
+(extern open :cc c [(ptr i8) i32 ...] (-> i32))
+(extern close :cc c [i32] (-> i32))
+(extern pipe :cc c [(ptr i32)] (-> i32))
+(extern dup2 :cc c [i32 i32] (-> i32))
+(extern fcntl :cc c [i32 i32 ...] (-> i32))
+(extern fork :cc c [] (-> i32))
+(extern execvp :cc c [(ptr i8) (ptr (ptr i8))] (-> i32))
+(extern waitpid :cc c [i32 (ptr i32) i32] (-> i32))
+(extern kill :cc c [i32 i32] (-> i32))
+(extern getpid :cc c [] (-> i32))
+(extern getppid :cc c [] (-> i32))
+(extern _exit :cc c [i32] (-> void))
+
+;; Errors from hosted operating-system queries. `code` is the positive errno captured
+;; immediately after the failing libc call; `OutOfMemory` is allocator failure.
+(defsum OsError
+  (Syscall [(code i64)])
+  (OutOfMemory)
+  (InvalidInput))
+
+;; Allocator-owned bytes returned by OS queries. The slice is not NUL-terminated.
+;; Release it with `owned-string-free` and the allocator passed to the query.
+(defstruct OwnedString
+  [(bytes (slice u8))
+   (capacity i64)])
+
+(defn owned-string-make [(p (ptr i8)) (len i64) (capacity i64)] (-> OwnedString)
+  (let [out (alloc/stack OwnedString)]
+    (store! (field out bytes) (slice-new (primitive/cast (ptr u8) p) len))
+    (store! (field out capacity) capacity)
+    (load out)))
+
+;; Borrow the owned value as an ordinary byte slice. Valid until `owned-string-free`.
+(defn owned-string-slice [(s OwnedString)] (-> (slice u8))
+  (load (field s bytes)))
+
+;; Release an owned OS string. Calling this twice on the same object is safe.
+(defn owned-string-free [(a (ptr alloc/Allocator)) (s (ptr OwnedString))] (-> i64)
+  (let [cap (load (field s capacity))]
+    (if (> cap 0)
+        (alloc/raw-free a
+                        (primitive/cast (ptr i8) (slice-data (load (field s bytes))))
+                        cap
+                        1)
+        0)
+    (store! (field s bytes) (slice-new (primitive/cast (ptr u8) 0) 0))
+    (store! (field s capacity) 0)
+    0))
+
+(defn copy-c-string [(a (ptr alloc/Allocator)) (p (ptr i8))] (-> (Result OwnedString OsError))
+  (let [len (str/cstr-len p)
+        cap (if (= len 0) 1 len)]
+    (match (alloc/raw-alloc a cap 1)
+      (None [] (Err (OutOfMemory)))
+      (Some [out]
+        (let [(mut i) 0]
+          (loop
+            (if (>= (load i) len)
+                (break)
+                (do
+                  (store! (primitive/index out (load i)) (load (primitive/index p (load i))))
+                  (store! i (+ (load i) 1)))))
+          (Ok (owned-string-make out len cap)))))))
+
+(defn slice-has-byte? [(s (slice u8)) (needle u8)] (-> bool)
+  (let [(mut i) 0]
+    (block :found
+      (loop
+        (if (>= (load i) (slice-len s))
+            (break)
+            (if (= (load (primitive/index (slice-data s) (load i))) needle)
+                (return-from :found true)
+                (store! i (+ (load i) 1)))))
+      false)))
+
+(defn env-name-valid? [(name (slice u8))] (-> bool)
+  (and (> (slice-len name) 0)
+       (and (not (slice-has-byte? name (primitive/cast u8 0)))
+            (not (slice-has-byte? name (primitive/cast u8 61))))))
+
+;; Return an allocator-owned copy of an environment variable, or `None` when absent.
+;; Unlike libc `getenv`, the result remains valid across later environment mutations.
+(defn env-get [(a (ptr alloc/Allocator)) (name (slice u8))]
+  (-> (Result (Option OwnedString) OsError))
+  (if (not (env-name-valid? name))
+      (Err (InvalidInput))
+      (let [cname (str/str->cstr a name)]
+        (if (= (primitive/cast i64 cname) 0)
+            (Err (OutOfMemory))
+            (let [value (getenv cname)]
+              (alloc/raw-free a cname (+ (slice-len name) 1) 1)
+              (if (= (primitive/cast i64 value) 0)
+                  (Ok (None))
+                  (match (copy-c-string a value)
+                    (Err [e] (Err e))
+                    (Ok [s] (Ok (Some s))))))))))
+
+;; Set an environment variable. Inputs are borrowed only for the duration of the call.
+;; Environment mutation is process-global and must be synchronized by the application.
+(defn env-set [(a (ptr alloc/Allocator)) (name (slice u8)) (value (slice u8)) (overwrite bool)]
+  (-> (Result i64 OsError))
+  (if (or (not (env-name-valid? name)) (slice-has-byte? value (primitive/cast u8 0)))
+      (Err (InvalidInput))
+      (let [cname (str/str->cstr a name)
+            cvalue (str/str->cstr a value)]
+        (if (or (= (primitive/cast i64 cname) 0) (= (primitive/cast i64 cvalue) 0))
+            (do
+              (if (!= (primitive/cast i64 cname) 0) (alloc/raw-free a cname (+ (slice-len name) 1) 1) 0)
+              (if (!= (primitive/cast i64 cvalue) 0) (alloc/raw-free a cvalue (+ (slice-len value) 1) 1) 0)
+              (Err (OutOfMemory)))
+            (let [rc (setenv cname cvalue (if overwrite 1 0))
+                  error (if (= rc 0) 0 (os-errno))]
+              (alloc/raw-free a cname (+ (slice-len name) 1) 1)
+              (alloc/raw-free a cvalue (+ (slice-len value) 1) 1)
+              (if (= rc 0) (Ok 0) (Err (Syscall error))))))))
+
+;; Remove an environment variable. Removing an absent name succeeds.
+(defn env-unset [(a (ptr alloc/Allocator)) (name (slice u8))] (-> (Result i64 OsError))
+  (if (not (env-name-valid? name))
+      (Err (InvalidInput))
+      (let [cname (str/str->cstr a name)]
+        (if (= (primitive/cast i64 cname) 0)
+            (Err (OutOfMemory))
+            (let [rc (unsetenv cname)
+                  error (if (= rc 0) 0 (os-errno))]
+              (alloc/raw-free a cname (+ (slice-len name) 1) 1)
+              (if (= rc 0) (Ok 0) (Err (Syscall error))))))))
+
+;; Return the current working directory in allocator-owned storage. The buffer grows
+;; until libc accepts it, so paths are not limited to a fixed PATH_MAX constant.
+(defn current-dir [(a (ptr alloc/Allocator))] (-> (Result OwnedString OsError))
+  (let [(mut cap) 256]
+    (block :done
+      (loop
+        (match (alloc/raw-alloc a (load cap) 1)
+          (None [] (return-from :done (Err (OutOfMemory))))
+          (Some [buf]
+            (let [result (getcwd buf (primitive/cast isize (load cap)))]
+              (if (!= (primitive/cast i64 result) 0)
+                  (return-from :done (Ok (owned-string-make buf (str/cstr-len buf) (load cap))))
+                  (let [error (os-errno)]
+                    (alloc/raw-free a buf (load cap) 1)
+                    (if (= error 34)
+                        (if (> (load cap) 1073741824)
+                            (return-from :done (Err (OutOfMemory)))
+                            (store! cap (* (load cap) 2)))
+                        (return-from :done (Err (Syscall error)))))))))))))
+
+;; Change the process current working directory. This process-global mutation is not
+;; synchronized by the library.
+(defn change-dir [(a (ptr alloc/Allocator)) (path (slice u8))] (-> (Result i64 OsError))
+  (if (slice-has-byte? path (primitive/cast u8 0))
+      (Err (InvalidInput))
+      (let [cpath (str/str->cstr a path)]
+    (if (= (primitive/cast i64 cpath) 0)
+        (Err (OutOfMemory))
+        (let [rc (chdir cpath)
+              error (if (= rc 0) 0 (os-errno))]
+          (alloc/raw-free a cpath (+ (slice-len path) 1) 1)
+          (if (= rc 0) (Ok 0) (Err (Syscall error))))))))

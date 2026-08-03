@@ -1,6 +1,9 @@
 # Hosted OS and network standard library — implementation plan
 
-**Status:** design, not yet complete.
+**Status:** Hosted-system P0 implemented and verified; see
+[`HOSTED_SYSTEM_LIBRARY.md`](../reference/HOSTED_SYSTEM_LIBRARY.md) for the delivered
+API. HTTP hardening and application-wide native-adapter removal remain separate later
+milestones and are not part of the hosted-system P0 claim.
 
 This plan turns the native-gap report into an implementation sequence for Coil's
 hosted standard library. It is written against the current checkout, which already
@@ -20,6 +23,24 @@ an application-owned C adapter:
 The first implementation target is macOS and Linux. Wasm and freestanding targets
 must continue to compile when these hosted modules are not imported.
 
+## Review record
+
+The namespace plan and hosted implementation were reviewed in two passes: first for
+Python-style organization and real-program coverage, then for ownership, lifecycle,
+error, and self-hosting constraints. The applied review decisions are:
+
+- keep environment/cwd and raw current-process facts in `coil.os`/`coil.process`;
+- keep child creation and monitoring canonically owned by `coil.subprocess`, while
+  allowing `coil.process` to serve as a qualified facade through real `:reexport`;
+- use `coil.selectors`, not an async runtime, for the simple one-fd synchronous case;
+- use allocator-owned results and immediate numeric errno capture across hosted APIs;
+- make deadlines monotonic and absolute internally so interruption cannot extend them;
+- make every successful spawn have an explicit reaping path and never kill on close;
+- retain the isolated `fork`/`execvp` backend with a documented multithread limitation
+  until an atomic portable `posix_spawn`/pipe backend is available;
+- keep macros/lints for Result-flow ergonomics in the language/tooling layer rather
+  than duplicating convenience variants throughout every system namespace.
+
 ## 1. Current baseline
 
 Already available:
@@ -36,15 +57,19 @@ Already available:
   kqueue readiness plus monotonic timers.
 - [`coil.thread`](../../src/stdlib/thread.coil): a minimal pthread spawn/join wrapper.
 
-Still absent or incomplete:
+Delivered by hosted-system P0:
 
-1. a process and pipe API;
-2. a simple synchronous readiness/deadline API;
-3. allocator-backed line reading;
-4. sleep and duration/deadline helpers;
-5. environment and current-directory helpers;
-6. accurate errno capture in `io` and `fs`;
-7. ergonomic constructors and cleanup for HTTP responses and OS handles.
+1. `coil.subprocess` process, pipe, stream, wait, signal, and cleanup APIs;
+2. `coil.selectors` synchronous readiness with relative and absolute deadlines;
+3. allocator-backed line reading in `coil.io`;
+4. typed duration, clock, deadline, and interruption-safe sleep APIs;
+5. owned environment and dynamic current-directory APIs, including explicit mutation;
+6. centralized immediate errno capture used by hosted I/O and filesystem operations;
+7. `coil.process` current-process operations and a qualified subprocess facade.
+
+Still staged: multi-fd selector registration, atomic multithread-safe spawning,
+child-specific environment/cwd configuration, Windows support, and the HTTP/application
+migration milestones below.
 
 This work does not require a compiler intrinsic. `extern`, C callbacks, variadic
 calls, target selection, opaque pointers, explicit allocation, and packed layouts
@@ -163,12 +188,14 @@ Add a small hosted OS module:
 The ordinary API should return allocator-owned bytes. The caller frees them with the
 allocator used to obtain them.
 
-Document that environment mutation is not synchronized by these helpers. Do not add
-environment mutation until there is a clear cross-platform ownership contract.
+Environment mutation is implemented as `env-set`/`env-unset`. Inputs are borrowed only
+for the libc call; mutation is process-global and deliberately not synchronized by the
+library.
 
 ## 4. Synchronous readiness
 
-Add a `coil.poll` module with a small facade such as:
+Add a Python-inspired `coil.selectors` module (the delivered name) with a small facade
+such as:
 
 ```coil
 (defsum WaitError
@@ -200,8 +227,9 @@ prerequisite for the process migration.
 
 ## 5. Child processes and pipes
 
-Create [`process.coil`](../../src/stdlib/process.coil) as the main missing P0 module.
-It should expose behavior rather than raw fork bookkeeping.
+Create [`subprocess.coil`](../../src/stdlib/subprocess.coil) as the child-lifecycle
+module and [`process.coil`](../../src/stdlib/process.coil) as the current-process plus
+qualified-facade module. They expose behavior rather than raw fork bookkeeping.
 
 ### 5.1 Public concepts
 
@@ -309,9 +337,11 @@ fields.
 
 ## 7. Test plan
 
-Every milestone gets a focused Coil test plus at least one integration test. Use the
-debug allocator and, where available, AddressSanitizer or leak detection for repeated
-operations.
+Every milestone gets a focused Coil test plus at least one integration test. The lists
+below are the complete staged matrix, not a claim that every future stress/platform case
+belongs to P0. Delivered P0 coverage lives in `tests/hosted_system_test.coil`,
+`tests/subprocess_test.coil`, `tests/io_hosted_test.coil`, and the compiler facade
+fixtures under `tests/compiler/features/`.
 
 ### I/O and time
 
@@ -421,7 +451,6 @@ This plan does not add:
 
 - a general async HTTP client before the blocking client is reliable;
 - shell execution as a convenience default;
-- environment mutation;
 - Windows support;
 - automatic destructors or a compiler ownership extension;
 - compiler intrinsics for ordinary POSIX or libcurl operations;
@@ -431,13 +460,24 @@ Those can be revisited after the hosted API has real users and platform tests.
 
 ## 10. Definition of done
 
-- `coil.process` launches commands without a shell and guarantees reaping.
+### Hosted-system P0 — achieved
+
+- `coil.subprocess` launches commands without a shell and guarantees reaping;
+  `coil.process` provides current-process operations and re-exports that child API.
 - Process streams compose with `coil.io.Reader` and `coil.io.Writer`.
 - Blocking reads and sleeps use monotonic deadlines.
 - `coil.time`, `coil.os`, and `coil.fs` expose owned, allocator-explicit results.
 - `coil.io` and `coil.fs` report actual errno values.
-- `coil.http.client` has checked setup/cleanup paths and documented TLS behavior.
-- Linux and macOS exercise the hosted APIs in CI.
-- The consuming application contains no authored native adapter.
-- The consuming application passes `coil verify` and its integration suite without
-  project-owned C or C headers.
+- focused tests cover owned environment mutation/lookup, cwd restoration, monotonic
+  sleep, selector readiness/timeout/hangup/invalid-fd ownership, exact argv including
+  spaces and empty arguments, missing executables, pipe round trips, timeout,
+  termination, cached wait, and idempotent close;
+- the compiler facade fixtures prove qualified and transitive `:reexport`, including
+  `process/Child`.
+
+### Later release/migration completion
+
+- `coil.http.client` has checked setup/cleanup paths and documented TLS behavior;
+- Linux and macOS exercise the hosted APIs in CI;
+- the consuming application contains no authored native adapter and passes `coil verify`
+  without project-owned C or C headers.

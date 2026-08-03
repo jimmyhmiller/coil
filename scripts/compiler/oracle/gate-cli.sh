@@ -202,13 +202,13 @@ printf '(module app)\n(import "util" :use *)\n(defn main [] (-> i64) (forty-two)
 printf '(module bad)\n(import "unrelated/place/anything.coil" :use *)\n(defn main [] (-> i64) 0)\n' > "$T/sib/src/bad.coil"
 expect_out 'import paths are not supported' "relative path imports are rejected" \
   "$COIL" check "$T/sib/src/bad.coil"
-# Preflight lint runs before loading/typechecking, so it can fix both the import and
-# leave a separate broken expression for the semantic phase to report afterward.
+# Preflight lint runs before loading/typechecking, but --fix is transactional: if a
+# separate semantic error remains, even the valid import migration is rolled back.
 printf '(module migrate)\n(import "unrelated/place/anything.coil" :use *)\n(defn main [] (-> i64) missing-name)\n' > "$T/sib/src/migrate.coil"
 "$COIL" lint "$T/sib/src/migrate.coil" --fix --allow-dirty >/dev/null 2>&1
-grep -q '(import "util" :use \*)' "$T/sib/src/migrate.coil" \
-  && ok "lint --fix migrates a path import before type checking broken code" \
-  || bad "preflight import migration" "legacy import was not rewritten"
+grep -q '(import "unrelated/place/anything.coil" :use \*)' "$T/sib/src/migrate.coil" \
+  && ok "lint --fix rolls back a preflight import migration when semantic checking fails" \
+  || bad "transactional preflight migration" "broken file was left partially rewritten"
 # The PRELUDE + bundled libs are self-contained: their imports resolve to the BUNDLED
 # stdlib, never to same-named decoys sitting in the entry file's directory. A naive
 # file-relative switch made the prelude's control.coil->print->io chain resolve to

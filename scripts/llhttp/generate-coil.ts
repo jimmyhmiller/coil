@@ -158,7 +158,12 @@ class CoilEmitter {
   private readonly externalIds = new Map<string, number>();
 
   public constructor(private readonly info: any,
-                      private readonly nodes: any[]) {
+                      private readonly nodes: any[],
+                      private readonly names: {
+                        errors: Record<string, number>;
+                        methods: Record<string, number>;
+                        statuses: Record<string, number>;
+                      }) {
     nodes.forEach((node, index) => this.ids.set(node, index));
   }
 
@@ -166,12 +171,12 @@ class CoilEmitter {
     const lines: string[] = [
       '; Generated from llhttp 9.4.3 by scripts/llhttp/generate-coil.ts.',
       '; DO NOT EDIT. Regenerate from the pinned upstream graph.',
-      '(module coil.llhttp.generated)',
-      '(import "coil.llhttp.types" :as ll)',
+      '(module coil.http.parser.generated)',
+      '(import "coil.http.parser.types" :as ll)',
       '(import "coil.primitive" :as primitive)',
       '(import "coil.slice" :as slice)',
       '',
-      '(export internal-init internal-execute)',
+      '(export internal-init internal-execute errno-name method-name status-name)',
       '',
       `(const ROOT_STATE ${this.id(this.info.root)})`,
       '',
@@ -195,7 +200,24 @@ class CoilEmitter {
     lines.push(...this.emitCodeDispatch());
     lines.push('');
     lines.push(...this.emitExecute());
+    lines.push('');
+    lines.push(...this.emitNameFunction('errno-name', this.names.errors,
+      (name) => `HPE_${name}`));
+    lines.push('');
+    lines.push(...this.emitNameFunction('method-name', this.names.methods));
+    lines.push('');
+    lines.push(...this.emitNameFunction('status-name', this.names.statuses));
     return lines.join('\n') + '\n';
+  }
+
+  private emitNameFunction(name: string, values: Record<string, number>,
+                           display: (key: string) => string = (key) => key): string[] {
+    const lines = [`(defn ${name} [(value i64)] (-> (slice u8))`, '  (case value'];
+    for (const [key, value] of Object.entries(values).sort((a, b) => a[1] - b[1])) {
+      lines.push(`    ${value} ${coilString(display(key))}`);
+    }
+    lines.push('    "UNKNOWN"))');
+    return lines;
   }
 
   private id(node: any): number {
@@ -494,7 +516,13 @@ async function main(): Promise<void> {
   }
 
   if (args.output !== undefined) {
-    const generated = new CoilEmitter(info, nodes).emit();
+    const requireUpstream = createRequire(resolve(args.upstream, 'package.json'));
+    const constants = requireUpstream('./lib/llhttp/constants.js');
+    const generated = new CoilEmitter(info, nodes, {
+      errors: constants.ERROR,
+      methods: constants.METHODS,
+      statuses: constants.STATUSES,
+    }).emit();
     writeFileSync(resolve(args.output), generated);
   }
 }

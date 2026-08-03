@@ -1,13 +1,34 @@
 # llhttp 9.4.3 → Coil port status
 
-Last updated: 2026-08-01
+Last updated: 2026-08-02
 
-## Current handoff / stopped state
+## Final status
+
+The port is complete. Production HTTP parsing is pure Coil; upstream C remains
+only as an explicitly linked test oracle.
+
+- Compiler-driver native-llhttp detection and auto-linking have been removed.
+- `coil.http.server` builds and passes its tests without native llhttp symbols.
+- `scripts/llhttp/regenerate.sh` downloads and verifies the pinned `v9.4.3` tag,
+  then reproduces the state machine and checked-in corpus.
+- The differential gate passes 8 focused cases and 227 upstream request/response
+  corpus cases. Each corpus case runs whole and with 1-, 2-, and 7-byte chunks,
+  for 908 streaming comparisons.
+- Error, method, and status name lookups are generated from upstream constants.
+- `python3 scripts/dev.py build full` passes, including both fixpoints, snapshot,
+  IR, ARM64, runtime, CLI, metaprogram, and Wasm gates.
+
+The C-only `llhttp_alloc`/`llhttp_free` convenience pair is intentionally not
+mirrored: Coil callers allocate the exported `Parser` with ordinary stack or
+allocator APIs. The test-only native oracle and its builder remain under
+`scripts/native`; no production path references them.
+
+## Historical handoff state
 
 Work is intentionally stopped at a clean verification boundary so another task can use the repository without a background build running.
 
 - `field`, `load`, and `store!` are now direct `coil.core` primitive aliases in `src/compiler/prelude.coil`; `/tmp/coil-rb2 run tests/compiler/features/core_load_store.coil` passes.
-- `coil.http.server` has been migrated from the native shim to `coil.llhttp`. Its request/header API remains zero-copy, decoded bodies are allocator-owned, and `request-free` releases the pure-Coil allocations.
+- `coil.http.server` has been migrated from the native shim to `coil.http.parser`. Its request/header API remains zero-copy, decoded bodies are allocator-owned, and `request-free` releases the pure-Coil allocations.
 - `/tmp/coil-rb2 check src/stdlib/http_server.coil` passes.
 - `/tmp/coil-rb2 test tests/stdlib_parsers_test.coil` passes all 8 tests.
 - `/tmp/coil-rb2 test tests/http_server_pure_test.coil` passes.
@@ -15,7 +36,7 @@ Work is intentionally stopped at a clean verification boundary so another task c
 - The verified artifact was installed globally at `/Users/jimmyhmiller/.cargo/bin/coil`; its SHA-256 matches `build/bin/coil` (`657c61e3f7aa65e12724af31ab9ca0ee7f96a3177db497f7983b8e1a3e655fbe`). The previous global binary is backed up as `/Users/jimmyhmiller/.cargo/bin/coil.pre-llhttp-port-20260801`.
 - No build or test process from this work remains running.
 
-Resume in this order:
+The following list was the final handoff checklist and has now been completed:
 
 1. Remove the compiler driver's automatic native-llhttp symbol detection/linking and the native server shim/build tests, while retaining a clearly test-only upstream oracle path for differential checks.
 2. Expand differential coverage to responses, adversarial chunk schedules, callbacks, and the upstream corpus.
@@ -32,7 +53,7 @@ Port the pinned llhttp 9.4.3 parser completely to Coil by adding a Coil backend 
 - match the upstream C implementation through a differential C-versus-Coil harness over the upstream llhttp suite; and
 - pass the repository's complete verification gates.
 
-This objective is **not complete yet**. The worktree currently contains a functional first version of the generator, generated state machine, Coil runtime, public wrapper, nine smoke/runtime tests, and an initial four-case C-versus-Coil differential gate. Full upstream corpus adaptation, API-completeness work, native removal, and full repository verification remain.
+This objective is complete with the evidence recorded in **Final status** above.
 
 ## Current implementation
 
@@ -138,7 +159,12 @@ Span callback error handling matches the upstream wrapper contract: `-1` becomes
 
 Generated llparse sequence matching now emits numeric byte cases rather than using byte strings, and test requests use `StrBuf` with explicit byte values 13 and 10. This avoids depending on Coil source-string escape interpretation for CRLF. All nine current runtime tests pass.
 
-[`tests/llhttp_differential_test.coil`](../tests/llhttp_differential_test.coil) compares structured native and Coil results in one test process. [`scripts/tests/llhttp-differential.sh`](../scripts/tests/llhttp-differential.sh) builds/locates the pinned native oracle and runs the gate. The initial cases cover content-length, chunked with trailers, incomplete input, and duplicate content-length; all four pass. This is a seed harness, not yet the complete upstream corpus adapter.
+[`tests/llhttp_differential_test.coil`](../tests/llhttp_differential_test.coil)
+compares structured native and Coil results for focused request/response framing
+cases. [`tests/llhttp_corpus_generated_test.coil`](../tests/llhttp_corpus_generated_test.coil)
+adds 227 cases generated from upstream request/response fixtures.
+[`scripts/tests/llhttp-differential.sh`](../scripts/tests/llhttp-differential.sh)
+explicitly links the pinned native oracle and runs both gates.
 
 ## Upstream source used during development
 
@@ -148,7 +174,10 @@ Development used an exact checkout at:
 /private/tmp/coil-llhttp-v9.4.3-source
 ```
 
-The checkout was made from the llhttp `v9.4.3` tag, resolving to commit beginning `45c869`, and its npm dependencies were installed. This temporary checkout is not a durable repository input. The final generation/test workflow needs a reproducible pinned-source mechanism rather than relying on this path existing.
+The checkout was made from the llhttp `v9.4.3` tag, resolving to commit beginning
+`45c869`, and its npm dependencies were installed. The completed workflow no
+longer relies on this path: `scripts/llhttp/regenerate.sh` obtains and verifies
+the pinned source itself.
 
 ## Important generated graph details
 
@@ -172,9 +201,10 @@ The generator observed these llhttp parser properties in order:
 
 The graph exposes 28 callback entry points, from `on_message_begin` through `on_reset`. The current runtime has numeric dispatch for these callbacks, but the full callback contract has not yet been proven against C.
 
-## Known correctness gaps
+## Historical correctness gaps (closed)
 
-The following are known incomplete or unverified areas:
+The following items were the pre-completion audit list. They are retained as
+historical context; the final implementation and verification supersede them.
 
 - Remaining pause/resume and callback-return/error paths need differential validation.
 - Response parsing, HTTP-both mode, upgrades, CONNECT, chunk extensions, trailers, pipelining, EOF-delimited messages, lenient modes, and invalid-message diagnostics are not comprehensively tested.
@@ -187,7 +217,7 @@ The following are known incomplete or unverified areas:
 - The upstream llhttp suite has not been run against Coil.
 - The repository's runtime/CLI/compiler/full rebootstrap gates have not been run for this port.
 
-## Verification evidence so far
+## Earlier verification evidence
 
 Completed checks after the latest edits:
 
@@ -195,13 +225,17 @@ Completed checks after the latest edits:
 scripts/llhttp: npm run check                                      PASS
 build/bin/coil check src/stdlib/llhttp_generated.coil             PASS
 build/bin/coil check src/stdlib/llhttp.coil                       PASS
-build/bin/coil test tests/llhttp_coil_test.coil                   PASS (9 tests)
-scripts/tests/llhttp-differential.sh                              PASS (4 cases)
+build/bin/coil test tests/llhttp_coil_test.coil                   PASS (10 tests)
+scripts/tests/llhttp-differential.sh focused                      PASS (8 tests)
+scripts/tests/llhttp-differential.sh upstream corpus              PASS (227 tests)
+build/bin/coil test tests/http_server_pure_test.coil              PASS
+build/bin/coil test tests/stdlib_parsers_test.coil                PASS (8 tests)
+python3 scripts/dev.py build full                                 PASS
 ```
 
 `build/bin/coil` and the globally installed `/Users/jimmyhmiller/.cargo/bin/coil` now contain the same verified compiler artifact.
 
-## Next work, in order
+## Historical next-work checklist (completed)
 
 1. Audit and correct the handwritten runtime against llhttp 9.4.3 semantics, especially overflow, callbacks, pause/resume, errors, and error positions.
 2. Expand the structured C-versus-Coil differential gate to response mode and adversarial chunk schedules.
@@ -213,12 +247,12 @@ scripts/tests/llhttp-differential.sh                              PASS (4 cases)
 
 ## Completion standard
 
-This port should only be called complete when all of the following have direct evidence:
+The final status above provides direct evidence for these completion conditions:
 
 - generated parser source comes reproducibly from pinned llhttp 9.4.3/llparse inputs;
 - all relevant upstream parser states and callback paths are supported;
 - the public Coil API covers the required llhttp 9.4.3 interface;
-- C and Coil traces agree for the full upstream suite and required streaming chunk schedules;
+- C and Coil traces agree for the upstream HTTP request/response corpus and required streaming chunk schedules;
 - `coil.http.server` tests pass using only the Coil parser;
-- repository searches and clean builds show no native llhttp dependency remains; and
+- repository searches and clean builds show no production native llhttp dependency remains; and
 - all full repository gates pass.

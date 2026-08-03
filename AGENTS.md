@@ -12,8 +12,15 @@ before writing Coil.
 - `coil guide` — print the language guide.
 - `coil doc file.coil` — markdown for that module's `;;`-documented definitions
   (a `;;` block directly above a definition is its doc; a single `;` is not).
-- The compiler is **self-hosted** (written in Coil, in `src/compiler/`). Rebuild +
-  verify it with `python3 scripts/dev.py build full` (fixpoint + gates).
+- The compiler is **self-hosted** (written in Coil, in `src/compiler/`). During
+  development, first run the bounded inner-loop gate:
+  Build one candidate after compiler-source edits, then repeatedly run
+  `python3 scripts/dev.py test modernize-fast --compiler <candidate>`.
+  The gate tests the supplied compiler and must finish within 30 seconds; it does
+  not rebuild the compiler on every iteration. **Do not run
+  `build full` while diagnosing or iterating.** Run
+  `python3 scripts/dev.py build full` only once for final release verification
+  after focused tests and the bounded gate are green.
 - The snapshot gates use small, stage-specific fixtures listed in
   `scripts/oracle.py::STAGE_INPUTS`, plus curated negative and diagnostic fixtures.
   Broad application and standard-library coverage belongs to the runtime and CLI gates.
@@ -22,6 +29,13 @@ before writing Coil.
   (`<stage>` is `read`, `full`, `ast`, `load`, `resolved`, `checked`, `expand`,
   `mono`, `ir`, `diag`, `x86`, or `all`). Rebootstrap runs all of them and also
   verifies the larger behavioral corpus.
+- **Never discover/re-bless cross-cutting snapshot changes one stage at a time.**
+  `gate all` audits every stage and reports the complete failing-stage set. For an
+  intentional compiler/prelude change that affects several stages, review the scope,
+  then run `python3 scripts/dev.py refresh-snapshots --compiler <new-compiler> --verbose`.
+  That command audits all stages without writes, refreshes every mismatched stage once,
+  and performs one final all-stage audit. Do not loop through `snapshot <stage>` plus
+  `gate all` to discover the next mismatch.
 
 ## Where things live
 

@@ -213,9 +213,16 @@ def gate_diag(compiler: Path, verbose: bool) -> int:
 
 def gate(compiler: Path, stage: str, verbose: bool) -> int:
     if stage == "all":
+        failed_stages: list[str] = []
         for item in STAGES:
             if gate(compiler, item, verbose):
-                return 1
+                failed_stages.append(item)
+        if failed_stages:
+            joined = " ".join(failed_stages)
+            print(f"gate all: failed stages: {joined}")
+            print(f"refresh once with: {sys.executable} scripts/oracle.py refresh --compiler {compiler}")
+            return 1
+        print("gate all: PASS")
         return 0
     if stage == "diag":
         return gate_diag(compiler, verbose)
@@ -236,6 +243,31 @@ def gate(compiler: Path, stage: str, verbose: bool) -> int:
             print(f"FAIL {stage}: {source}: {reason[0] if reason else 'output mismatch'}")
     print(f"gate {stage}: {passed} passed, {len(failures)} failed")
     return 1 if failures else 0
+
+
+def refresh_mismatched_snapshots(compiler: Path, verbose: bool) -> int:
+    """Refresh every currently mismatched stage in one deliberate transaction.
+
+    The initial audit always runs every stage. This prevents the slow and error-prone
+    pattern of discovering one mismatch, blessing it, rerunning from the beginning,
+    and repeating. Only failing stages are rewritten; a final all-stage audit proves
+    that the refreshed set is internally consistent.
+    """
+    failed_stages: list[str] = []
+    print("=== snapshot mismatch audit (all stages; no writes) ===")
+    for stage in STAGES:
+        if gate(compiler, stage, verbose):
+            failed_stages.append(stage)
+    if not failed_stages:
+        print("refresh: snapshots already match; wrote nothing")
+        return 0
+
+    print(f"=== refreshing mismatched stages once: {' '.join(failed_stages)} ===")
+    for stage in failed_stages:
+        snapshot(compiler, stage)
+
+    print("=== final snapshot audit (all stages) ===")
+    return gate(compiler, "all", verbose)
 
 
 def runtime(compiler: Path, action: str, platform: str, verbose: bool) -> int:
@@ -393,6 +425,11 @@ def interpreter(compiler: Path, live: bool, verbose: bool) -> int:
 
 
 def main() -> int:
+    # Long all-stage audits must show progress as each stage finishes. Without line
+    # buffering a non-interactive invocation appears hung until the entire transaction
+    # exits, which invites users and agents to interrupt it or start redundant runs.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
     for action in ("gate", "snapshot"):
@@ -401,6 +438,9 @@ def main() -> int:
         command.add_argument("--compiler", default=os.environ.get("COIL_REF_BIN", "build/bin/coil"))
         if action == "gate":
             command.add_argument("--verbose", action="store_true", default=os.environ.get("VERBOSE") == "1")
+    command = sub.add_parser("refresh", help="audit all stages, refresh every mismatch once, then re-audit")
+    command.add_argument("--compiler", default=os.environ.get("COIL_REF_BIN", "build/bin/coil"))
+    command.add_argument("--verbose", action="store_true", default=os.environ.get("VERBOSE") == "1")
     command = sub.add_parser("runtime")
     command.add_argument("operation", choices=("gate", "snapshot"))
     command.add_argument("platform", choices=("arm64", "x64", "linux"))
@@ -424,6 +464,8 @@ def main() -> int:
         compiler = ROOT / compiler
     if args.action == "snapshot":
         return snapshot(compiler, args.stage)
+    if args.action == "refresh":
+        return refresh_mismatched_snapshots(compiler, args.verbose)
     if args.action == "runtime":
         return runtime(compiler, args.operation, args.platform, args.verbose)
     if args.action == "linux-ir":

@@ -8,8 +8,11 @@ import hashlib
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -34,6 +37,66 @@ def build(args: argparse.Namespace) -> None:
     execute(*command)
 
 
+def install(args: argparse.Namespace) -> None:
+    """Install an already-built compiler into the user's command path.
+
+    Rebuilding the self-hosted compiler is intentionally opt-in: the normal
+    developer workflow is to build/check once, then make that artifact the
+    globally available `coil` command without paying for the bootstrap gates
+    again. `--build` delegates to the existing verified bootstrap scripts.
+    """
+    if args.build:
+        destination = install_destination(args.dest)
+        build_args = argparse.Namespace(variant=args.variant, output=str(destination))
+        build(build_args)
+        return
+
+    source = Path(args.source).expanduser()
+    if not source.is_absolute():
+        source = ROOT / source
+    if not source.is_file():
+        raise SystemExit(
+            f"install: compiler artifact not found: {source}\n"
+            "build it first, or use `python3 scripts/dev.py install --build`"
+        )
+
+    destination = install_destination(args.dest)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source.resolve() == destination.resolve():
+        print(f"already installed: {destination}")
+        return
+
+    shutil.copy2(source, destination)
+    destination.chmod(source.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    if sys.platform == "darwin":
+        subprocess.run(
+            ["codesign", "-s", "-", "--force", str(destination)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    print(f"installed {source} -> {destination}")
+
+
+def install_destination(explicit: str | None) -> Path:
+    if explicit:
+        destination = Path(explicit).expanduser()
+        return destination if destination.is_absolute() else ROOT / destination
+
+    # Prefer the command the user is already invoking when it lives in their
+    # home directory (for example ~/.cargo/bin/coil). Otherwise use the
+    # conventional user-local bin directory and avoid requiring sudo.
+    active = shutil.which("coil")
+    if active:
+        active_path = Path(active).expanduser()
+        try:
+            active_path.relative_to(Path.home())
+            return active_path
+        except ValueError:
+            pass
+    return Path.home() / ".local" / "bin" / "coil"
+
+
 def test(args: argparse.Namespace) -> None:
     compiler = args.compiler
     if args.suite == "all":
@@ -54,6 +117,115 @@ def test(args: argparse.Namespace) -> None:
     elif args.suite == "interpreter":
         execute(sys.executable, "scripts/oracle.py", "interpreter", "live", "--compiler", compiler,
                 *(["--verbose"] if args.verbose else []))
+    elif args.suite == "modernize-fast":
+        test_modernize_fast(compiler)
+
+
+def test_modernize_fast(compiler: str) -> None:
+    """Bounded focused tests for an already-built candidate compiler."""
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="coil-modernize-fast-") as raw_tmp:
+        tmp = Path(raw_tmp)
+        candidate = Path(compiler).resolve()
+        if not candidate.is_file():
+            raise SystemExit(f"fast modernization gate: compiler not found: {candidate}")
+
+        width_test = tmp / "integer-widths"
+        execute(str(candidate), "build", "tests/compiler/features/integer_ord_all_widths.coil",
+                "--backend", "arm64", "-o", str(width_test))
+        execute(str(width_test))
+
+        ambient_test = tmp / "ambient-core-ops"
+        execute(str(candidate), "build", "tests/compiler/features/ambient_core_ops.coil",
+                "--backend", "arm64", "-o", str(ambient_test))
+        execute(str(ambient_test))
+
+        # Namespace forwarding is compiler name-resolution work, so keep facade
+        # regressions in the bounded inner loop instead of discovering them in a
+        # full release rebootstrap.
+        reexport_test = tmp / "reexport-qualified"
+        execute(str(candidate), "build", "tests/compiler/features/reexport_qualified.coil",
+                "--backend", "arm64", "-o", str(reexport_test))
+        result = subprocess.run([str(reexport_test)], cwd=ROOT)
+        if result.returncode != 42:
+            raise SystemExit(f"fast modernization gate: re-export facade returned {result.returncode}, want 42")
+        private_result = subprocess.run(
+            [str(candidate), "check", "tests/compiler/features/reexport_private_rejected.coil"],
+            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if private_result.returncode == 0:
+            raise SystemExit("fast modernization gate: facade leaked a private re-export")
+
+        process_test = tmp / "process-facade"
+        execute(str(candidate), "build", "tests/compiler/features/process_facade.coil",
+                "--backend", "arm64", "-o", str(process_test))
+        execute(str(process_test))
+
+        hosted_test = tmp / "hosted-system"
+        execute(str(candidate), "build", "tests/hosted_system_test.coil",
+                "--backend", "arm64", "-o", str(hosted_test))
+        execute(str(hosted_test))
+
+        # Public comparisons in static-assert must remain constant expressions.
+        static_test = tmp / "static-assert"
+        execute(str(candidate), "build", "src/examples/bitfields.coil", "--backend", "arm64",
+                "-o", str(static_test))
+        result = subprocess.run([str(static_test)], cwd=ROOT)
+        if result.returncode != 42:
+            raise SystemExit(f"fast modernization gate: static-assert returned {result.returncode}, want 42")
+
+        probe = tmp / "probe.coil"
+        probe.write_text("""(module modernization-probe)
+(import "coil.primitive" :as primitive)
+(defn main [] (-> i64)
+  (let [(mut x) 0]
+    (primitive/store! x 2)
+    (if (primitive/icmp-ge (primitive/load x) 2) 0 1)))
+""")
+        execute(str(candidate), "lint", str(probe), "--fix", "--allow-dirty")
+        fixed = probe.read_text()
+        forbidden = ("primitive/load", "primitive/store!", "primitive/field", "primitive/icmp-")
+        if any(token in fixed for token in forbidden):
+            raise SystemExit("fast modernization gate: autofix left a legacy core operation")
+        before = hashlib.sha256(fixed.encode()).digest()
+        execute(str(candidate), "lint", str(probe), "--fix", "--allow-dirty")
+        if before != hashlib.sha256(probe.read_bytes()).digest():
+            raise SystemExit("fast modernization gate: lint --fix is not idempotent")
+
+        broken = tmp / "broken.coil"
+        broken.write_text("""(module broken-modernization-probe)
+(defn main [] (-> i64) (iadd missing 1))
+""")
+        before = hashlib.sha256(broken.read_bytes()).digest()
+        result = subprocess.run([str(candidate), "lint", str(broken), "--fix", "--allow-dirty"],
+                                cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode == 0 or before != hashlib.sha256(broken.read_bytes()).digest():
+            raise SystemExit("fast modernization gate: failed fix was not rolled back byte-for-byte")
+
+        broken_project = tmp / "broken-project"
+        (broken_project / "src").mkdir(parents=True)
+        (broken_project / "Coil.toml").write_text("""[package]
+name = "broken-project"
+entry = "src/main.coil"
+source-roots = ["src"]
+""")
+        project_main = broken_project / "src/main.coil"
+        project_main.write_text("""(module broken-project)
+(import "broken-dependency")
+(defn main [] (-> i64) (iadd 40 2))
+""")
+        (broken_project / "src/dependency.coil").write_text("""(module broken-dependency)
+(defn broken [] (-> i64) missing)
+""")
+        before = hashlib.sha256(project_main.read_bytes()).digest()
+        result = subprocess.run([str(candidate), "lint", "--fix", "--allow-dirty"], cwd=broken_project,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode == 0 or before != hashlib.sha256(project_main.read_bytes()).digest():
+            raise SystemExit("fast modernization gate: failed project fix was not rolled back atomically")
+
+    elapsed = time.monotonic() - started
+    if elapsed >= 30:
+        raise SystemExit(f"fast modernization gate exceeded its 30s budget: {elapsed:.2f}s")
+    print(f"fast modernization gate: PASS ({elapsed:.2f}s, compiler={candidate})")
 
 
 def test_meta(compiler: str) -> None:
@@ -96,6 +268,12 @@ def test_wasm(compiler: str) -> None:
 
 def snapshot(args: argparse.Namespace) -> None:
     execute(sys.executable, "scripts/oracle.py", "snapshot", args.stage, "--compiler", args.compiler)
+
+
+def refresh_snapshots(args: argparse.Namespace) -> None:
+    """Audit all stages, refresh every mismatch once, and run one final audit."""
+    execute(sys.executable, "scripts/oracle.py", "refresh", "--compiler", args.compiler,
+            *(["--verbose"] if args.verbose else []))
 
 
 def llvm_flags(mode: str) -> list[str]:
@@ -175,8 +353,19 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--output")
     command.set_defaults(func=build)
 
+    command = commands.add_parser(
+        "install",
+        help="install the existing compiler artifact globally (use --build to rebuild first)",
+    )
+    command.add_argument("--source", default="build/bin/coil", help="compiler artifact to install")
+    command.add_argument("--dest", help="exact destination path; defaults to the active user-level coil")
+    command.add_argument("--build", action="store_true", help="run the full bootstrap before installing")
+    command.add_argument("--variant", choices=("full", "nollvm", "linux", "nollvm-linux", "x64"),
+                         default="full", help="bootstrap variant used with --build")
+    command.set_defaults(func=install)
+
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "wasm", "meta", "interpreter", "metaprogramming"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "wasm", "meta", "interpreter", "metaprogramming", "modernize-fast"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.set_defaults(func=test)
@@ -185,6 +374,14 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("stage", choices=("all", *(__import__("oracle").STAGES)), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.set_defaults(func=snapshot)
+
+    command = commands.add_parser(
+        "refresh-snapshots",
+        help="refresh all currently mismatched snapshot stages in one audited pass",
+    )
+    command.add_argument("--compiler", default="build/bin/coil")
+    command.add_argument("--verbose", action="store_true")
+    command.set_defaults(func=refresh_snapshots)
 
     command = commands.add_parser("bootstrap", help="build the portable C bootstrap")
     command.add_argument("variant", choices=("c", "wasm32"), nargs="?", default="c")

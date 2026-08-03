@@ -1,0 +1,484 @@
+(module coil.subprocess)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.slice" :use [slice-data slice-len slice-get])
+(import "coil.os" :as os)
+(import "coil.io" :as io)
+(import "coil.time" :as time)
+
+(export Stdio
+        Inherit
+        Null
+        Pipe
+        MergeStdout
+        ExitStatus
+        Exited
+        Signaled
+        Child
+        SubprocessError
+        InvalidCommand
+        OutOfMemory
+        PipeFailed
+        SpawnFailed
+        WaitFailed
+        SignalFailed
+        Timeout
+        StillRunning
+        AlreadyClosed
+        inherit-stdio
+        null-stdio
+        pipe-stdio
+        merge-stderr
+        spawn
+        child-id
+        child-stdin-writer
+        child-stdout-reader
+        child-stderr-reader
+        child-close-stdin
+        child-try-wait
+        child-wait
+        child-wait-until
+        child-terminate
+        child-kill
+        child-kill-and-wait
+        child-close)
+
+;; Policy for one child standard stream. `MergeStdout` is valid only for stderr.
+(defsum Stdio (Inherit) (Null) (Pipe) (MergeStdout))
+(defsum ExitStatus (Exited [(code i64)]) (Signaled [(signal i64)]))
+(defsum SubprocessError
+  (InvalidCommand)
+  (OutOfMemory)
+  (PipeFailed [(code i64)])
+  (SpawnFailed [(code i64)])
+  (WaitFailed [(code i64)])
+  (SignalFailed [(code i64)])
+  (Timeout)
+  (StillRunning)
+  (AlreadyClosed))
+
+;; Caller-owned child state. Descriptors less than zero are absent or already closed.
+(defstruct Child
+  [(pid i32)
+   (stdin-fd i32)
+   (stdout-fd i32)
+   (stderr-fd i32)
+   (waited bool)
+   (closed bool)
+   (status-kind i32)
+   (status-code i64)])
+
+(defn inherit-stdio [] (-> Stdio)
+  (Inherit))
+(defn null-stdio [] (-> Stdio)
+  (Null))
+(defn pipe-stdio [] (-> Stdio)
+  (Pipe))
+(defn merge-stderr [] (-> Stdio)
+  (MergeStdout))
+
+(defn stdio-piped? [(policy Stdio)] (-> bool)
+  (match policy (Inherit [] false) (Null [] false) (Pipe [] true) (MergeStdout [] false)))
+
+(defn close-if-open [(fd i32)] (-> i64)
+  (if (>= fd 0) (primitive/cast i64 (os/close fd)) 0))
+
+(defn set-cloexec [(fd i32)] (-> i64)
+  (if (< (os/fcntl fd 2 1) 0) (os/os-errno) 0))
+
+(defn make-pipe [(fds (ptr (array i32 2)))] (-> i64)
+  (if (< (os/pipe (primitive/cast (ptr i32) fds)) 0)
+      (os/os-errno)
+      (let [a (set-cloexec (load (primitive/index fds 0)))
+            b (set-cloexec (load (primitive/index fds 1)))]
+        (if (!= a 0) a b))))
+
+(defn init-pair [(fds (ptr (array i32 2)))] (-> i64)
+  (store! (primitive/index fds 0) -1)
+  (store! (primitive/index fds 1) -1)
+  0)
+
+(defn alloc-c-string [(a (ptr alloc/Allocator)) (s (slice u8))] (-> (Result (ptr i8) SubprocessError))
+  (let [len (slice-len s)]
+    (if (os/slice-has-byte? s (primitive/cast u8 0))
+        (Err (InvalidCommand))
+        (match (alloc/raw-alloc a (+ len 1) 1)
+          (None [] (Err (OutOfMemory)))
+          (Some [p]
+                (let [(mut i) 0]
+                  (loop (if (>= (load i) len)
+                            (break)
+                            (do
+                              (store! (primitive/index p (load i))
+                                      (primitive/cast i8 (slice-get s (load i))))
+                              (store! i (+ (load i) 1)))))
+                  (store! (primitive/index p len) (primitive/cast i8 0))
+                  (Ok p)))))))
+
+(defn free-argv [(a (ptr alloc/Allocator))
+                 (argv (ptr (ptr i8)))
+                 (program (slice u8))
+                 (args (slice (slice u8)))
+                 (built i64)] (-> i64)
+  (if (> built 0)
+      (alloc/raw-free a (load argv) (+ (slice-len program) 1) 1)
+      0)
+  (let [(mut i) 1]
+    (loop (if (>= (load i) built)
+              (break)
+              (do
+                (alloc/raw-free a
+                                (load (primitive/index argv (load i)))
+                                (+ (slice-len (slice-get args (- (load i) 1))) 1)
+                                1)
+                (store! i (+ (load i) 1))))))
+  (alloc/raw-free a
+                  (primitive/cast (ptr i8) argv)
+                  (* (+ (slice-len args) 2) (sizeof (ptr i8)))
+                  (alignof (ptr i8)))
+  0)
+
+(defn build-argv-items [(a (ptr alloc/Allocator))
+                        (argv (ptr (ptr i8)))
+                        (args (slice (slice u8)))
+                        (index i64)
+                        (built (ptr i64))] (-> (Result i64 SubprocessError))
+  (if (>= index (slice-len args))
+      (do
+        (store! (primitive/index argv (+ index 1)) (primitive/cast (ptr i8) 0))
+        (Ok 0))
+      (match (alloc-c-string a (slice-get args index))
+        (Err [e] (Err e))
+        (Ok [arg]
+            (do
+              (store! (primitive/index argv (+ index 1)) arg)
+              (store! built (+ (load built) 1))
+              (build-argv-items a argv args (+ index 1) built))))))
+
+(defn build-argv [(a (ptr alloc/Allocator))
+                  (program (slice u8))
+                  (args (slice (slice u8)))
+                  (built (ptr i64))] (-> (Result (ptr (ptr i8)) SubprocessError))
+  (let [count (+ (slice-len args) 2)]
+    (match (alloc/raw-alloc a (* count (sizeof (ptr i8))) (alignof (ptr i8)))
+      (None [] (Err (OutOfMemory)))
+      (Some [raw]
+            (let [argv (primitive/cast (ptr (ptr i8)) raw)]
+              (store! built 0)
+              (match (alloc-c-string a program)
+                (Err [e]
+                     (do
+                       (alloc/raw-free a raw (* count (sizeof (ptr i8))) (alignof (ptr i8)))
+                       (Err e)))
+                (Ok [p]
+                    (do
+                      (store! argv p)
+                      (store! built 1)
+                      (match (build-argv-items a argv args 0 built)
+                        (Ok [_] (Ok argv))
+                        (Err [e]
+                             (do
+                               (free-argv a argv program args (load built))
+                               (Err e))))))))))))
+
+(defn child-report-error [(fd i32) (code i64)] (-> i64)
+  (let [slot (alloc/stack i32)]
+    (store! slot (primitive/cast i32 code))
+    (child-write-error fd (primitive/cast (ptr i8) slot) 4)
+    (os/_exit 127)
+    0))
+
+; The exec-error record is four bytes, below PIPE_BUF, but a signal may interrupt the
+; write before any byte is transferred. Stay within async-signal-safe libc calls.
+(defn child-write-error [(fd i32) (data (ptr i8)) (remaining i64)] (-> i64)
+  (if (<= remaining 0)
+      0
+      (let [n (primitive/cast i64 (io/write fd data (primitive/cast isize remaining)))]
+        (if (> n 0)
+            (child-write-error fd (primitive/index data n) (- remaining n))
+            (if (and (< n 0) (= (os/os-errno) 4))
+                (child-write-error fd data remaining)
+                0)))))
+
+; EOF means exec succeeded because the child-side descriptor is close-on-exec. A four
+; byte record means setup/exec failed. EINTR must not be mistaken for EOF.
+(defn read-exec-error [(fd i32) (slot (ptr i32))] (-> i64)
+  (let [n
+          (primitive/cast i64
+                          (io/read fd (primitive/cast (ptr i8) slot) (primitive/cast isize 4)))]
+    (if (and (< n 0) (= (os/os-errno) 4)) (read-exec-error fd slot) n)))
+
+(defn waitpid-retry [(pid i32) (status (ptr i32)) (flags i32)] (-> i32)
+  (let [rc (os/waitpid pid status flags)]
+    (if (and (< rc 0) (= (os/os-errno) 4)) (waitpid-retry pid status flags) rc)))
+
+(defn child-redirect [(policy Stdio)
+                      (pair (ptr (array i32 2)))
+                      (target i32)
+                      (input bool)
+                      (error-fd i32)] (-> i64)
+  (match policy
+    (Inherit [] 0)
+    (MergeStdout []
+                 (if (= target 2)
+                     (if (< (os/dup2 1 2) 0) (child-report-error error-fd (os/os-errno)) 0)
+                     (child-report-error error-fd 22)))
+    (Pipe []
+          (let [source (load (primitive/index pair (if input 0 1)))]
+            (if (< (os/dup2 source target) 0) (child-report-error error-fd (os/os-errno)) 0)))
+    (Null []
+          (let [fd (os/open c"/dev/null" (if input 0 1) 0)]
+            (if (< fd 0)
+                (child-report-error error-fd (os/os-errno))
+                (do
+                  (if (< (os/dup2 fd target) 0) (child-report-error error-fd (os/os-errno)) 0)
+                  (os/close fd)
+                  0))))))
+
+(defn close-pair [(pair (ptr (array i32 2)))] (-> i64)
+  (close-if-open (load (primitive/index pair 0)))
+  (close-if-open (load (primitive/index pair 1)))
+  0)
+
+(defn child-init [(child (ptr Child)) (pid i32) (stdin-fd i32) (stdout-fd i32) (stderr-fd i32)] (-> i64)
+  (store! (field child pid) pid)
+  (store! (field child stdin-fd) stdin-fd)
+  (store! (field child stdout-fd) stdout-fd)
+  (store! (field child stderr-fd) stderr-fd)
+  (store! (field child waited) false)
+  (store! (field child closed) false)
+  (store! (field child status-kind) 0)
+  (store! (field child status-code) 0)
+  0)
+
+;; Spawn `program` with exact argument bytes and no shell interpretation. `args` excludes
+;; argv[0], which is set to `program`. The executable is located with PATH like Python's
+;; subprocess default. Inputs are borrowed only until this call returns.
+(defn spawn [(a (ptr alloc/Allocator))
+             (child (ptr Child))
+             (program (slice u8))
+             (args (slice (slice u8)))
+             (stdin-policy Stdio)
+             (stdout-policy Stdio)
+             (stderr-policy Stdio)] (-> (Result (ptr Child) SubprocessError))
+  (if (= (slice-len program) 0)
+      (Err (InvalidCommand))
+      (let [stdin-pipe (alloc/stack (array i32 2))
+            stdout-pipe (alloc/stack (array i32 2))
+            stderr-pipe (alloc/stack (array i32 2))
+            error-pipe (alloc/stack (array i32 2))
+            built (alloc/stack i64)]
+        (init-pair stdin-pipe)
+        (init-pair stdout-pipe)
+        (init-pair stderr-pipe)
+        (init-pair error-pipe)
+        (block :done
+               (let [error (if (stdio-piped? stdin-policy) (make-pipe stdin-pipe) 0)]
+                 (if (!= error 0) (return-from :done (Err (PipeFailed error))) 0))
+               (let [error (if (stdio-piped? stdout-policy) (make-pipe stdout-pipe) 0)]
+                 (if (!= error 0)
+                     (do (close-pair stdin-pipe) (return-from :done (Err (PipeFailed error))))
+                     0))
+               (let [error (if (stdio-piped? stderr-policy) (make-pipe stderr-pipe) 0)]
+                 (if (!= error 0)
+                     (do
+                       (close-pair stdin-pipe)
+                       (close-pair stdout-pipe)
+                       (return-from :done (Err (PipeFailed error))))
+                     0))
+               (let [error (make-pipe error-pipe)]
+                 (if (!= error 0)
+                     (do
+                       (close-pair stdin-pipe)
+                       (close-pair stdout-pipe)
+                       (close-pair stderr-pipe)
+                       (return-from :done (Err (PipeFailed error))))
+                     0))
+               (match (build-argv a program args built)
+                 (Err [error]
+                      (do
+                        (close-pair stdin-pipe)
+                        (close-pair stdout-pipe)
+                        (close-pair stderr-pipe)
+                        (close-pair error-pipe)
+                        (return-from :done (Err error))))
+                 (Ok [argv]
+                     (let [pid (os/fork)]
+                       (if (< pid 0)
+                           (let [error (os/os-errno)]
+                             (free-argv a argv program args (load built))
+                             (close-pair stdin-pipe)
+                             (close-pair stdout-pipe)
+                             (close-pair stderr-pipe)
+                             (close-pair error-pipe)
+                             (return-from :done (Err (SpawnFailed error))))
+                           (if (= pid 0)
+                               (do
+                                 (os/close (load (primitive/index error-pipe 0)))
+                                 (child-redirect stdin-policy stdin-pipe 0 true (load (primitive/index error-pipe 1)))
+                                 (child-redirect stdout-policy
+                                                 stdout-pipe
+                                                 1
+                                                 false
+                                                 (load (primitive/index error-pipe 1)))
+                                 (child-redirect stderr-policy
+                                                 stderr-pipe
+                                                 2
+                                                 false
+                                                 (load (primitive/index error-pipe 1)))
+                                 (close-pair stdin-pipe)
+                                 (close-pair stdout-pipe)
+                                 (close-pair stderr-pipe)
+                                 (os/execvp (load argv) argv)
+                                 (child-report-error (load (primitive/index error-pipe 1)) (os/os-errno))
+                                 (Err [(ptr Child) SubprocessError] (SpawnFailed 0)))
+                               (do
+                                 (os/close (load (primitive/index error-pipe 1)))
+                                 (if (stdio-piped? stdin-policy) (os/close (load (primitive/index stdin-pipe 0))) 0)
+                                 (if (stdio-piped? stdout-policy) (os/close (load (primitive/index stdout-pipe 1))) 0)
+                                 (if (stdio-piped? stderr-policy) (os/close (load (primitive/index stderr-pipe 1))) 0)
+                                 (let [exec-error (alloc/stack i32)
+                                       n (read-exec-error (load (primitive/index error-pipe 0)) exec-error)]
+                                   (os/close (load (primitive/index error-pipe 0)))
+                                   (free-argv a argv program args (load built))
+                                   (if (> n 0)
+                                       (let [status (alloc/stack i32)]
+                                         (waitpid-retry pid status 0)
+                                         (if (stdio-piped? stdin-policy)
+                                             (os/close (load (primitive/index stdin-pipe 1)))
+                                             0)
+                                         (if (stdio-piped? stdout-policy)
+                                             (os/close (load (primitive/index stdout-pipe 0)))
+                                             0)
+                                         (if (stdio-piped? stderr-policy)
+                                             (os/close (load (primitive/index stderr-pipe 0)))
+                                             0)
+                                         (return-from :done (Err (SpawnFailed (primitive/cast i64 (load exec-error))))))
+                                       (do
+                                         (child-init child
+                                                     pid
+                                                     (if (stdio-piped? stdin-policy)
+                                                         (load (primitive/index stdin-pipe 1))
+                                                         -1)
+                                                     (if (stdio-piped? stdout-policy)
+                                                         (load (primitive/index stdout-pipe 0))
+                                                         -1)
+                                                     (if (stdio-piped? stderr-policy)
+                                                         (load (primitive/index stderr-pipe 0))
+                                                         -1))
+                                         (return-from :done (Ok child)))))))))))))))
+
+(defn child-id [(child (ptr Child))] (-> i64)
+  (primitive/cast i64 (load (field child pid))))
+
+(defn child-stdin-writer [(writer (ptr io/Writer)) (child (ptr Child))] (-> (Option (ptr io/Writer)))
+  (if (>= (load (field child stdin-fd)) 0)
+      (Some (io/fd-writer writer (primitive/cast i64 (load (field child stdin-fd)))))
+      (None)))
+(defn child-stdout-reader [(reader (ptr io/Reader)) (child (ptr Child))] (-> (Option (ptr io/Reader)))
+  (if (>= (load (field child stdout-fd)) 0)
+      (Some (io/fd-reader reader (primitive/cast i64 (load (field child stdout-fd)))))
+      (None)))
+(defn child-stderr-reader [(reader (ptr io/Reader)) (child (ptr Child))] (-> (Option (ptr io/Reader)))
+  (if (>= (load (field child stderr-fd)) 0)
+      (Some (io/fd-reader reader (primitive/cast i64 (load (field child stderr-fd)))))
+      (None)))
+
+;; Close the parent write end, delivering EOF to a child reading stdin. Idempotent.
+(defn child-close-stdin [(child (ptr Child))] (-> i64)
+  (close-if-open (load (field child stdin-fd)))
+  (store! (field child stdin-fd) -1)
+  0)
+
+(defn status-decode [(raw i32)] (-> ExitStatus)
+  (let [value (primitive/cast i64 raw)
+        signal (& value 127)]
+    (if (= signal 0) (Exited (& (>> value 8) 255)) (Signaled signal))))
+
+(defn cache-status [(child (ptr Child)) (status ExitStatus)] (-> ExitStatus)
+  (match status
+    (Exited [code]
+            (do (store! (field child status-kind) 1) (store! (field child status-code) code)))
+    (Signaled [signal]
+              (do (store! (field child status-kind) 2) (store! (field child status-code) signal))))
+  (store! (field child waited) true)
+  status)
+
+(defn cached-status [(child (ptr Child))] (-> ExitStatus)
+  (if (= (load (field child status-kind)) 1)
+      (Exited (load (field child status-code)))
+      (Signaled (load (field child status-code)))))
+
+;; Nonblocking status probe. `None` means the child is still running.
+(defn child-try-wait [(child (ptr Child))] (-> (Result (Option ExitStatus) SubprocessError))
+  (if (load (field child waited))
+      (Ok (Some (cached-status child)))
+      (let [raw (alloc/stack i32)
+            rc (waitpid-retry (load (field child pid)) raw 1)]
+        (if (= rc 0)
+            (Ok (None))
+            (if (< rc 0)
+                (let [error (os/os-errno)]
+                  (if (= error 4) (child-try-wait child) (Err (WaitFailed error))))
+                (Ok (Some (cache-status child (status-decode (load raw))))))))))
+
+;; Block until the child is reaped. Repeated waits return the cached status.
+(defn child-wait [(child (ptr Child))] (-> (Result ExitStatus SubprocessError))
+  (if (load (field child waited))
+      (Ok (cached-status child))
+      (let [raw (alloc/stack i32)
+            rc (waitpid-retry (load (field child pid)) raw 0)]
+        (if (< rc 0)
+            (let [error (os/os-errno)]
+              (if (= error 4) (child-wait child) (Err (WaitFailed error))))
+            (Ok (cache-status child (status-decode (load raw))))))))
+
+;; Wait until a monotonic deadline. Timeout leaves the child running and valid.
+(defn child-wait-until [(child (ptr Child)) (deadline time/Instant)] (-> (Result ExitStatus SubprocessError))
+  (block :done
+         (loop (match (child-try-wait child)
+                 (Err [e] (return-from :done (Err e)))
+                 (Ok [maybe]
+                     (match maybe
+                       (Some [status] (return-from :done (Ok status)))
+                       (None []
+                             (match (time/deadline-remaining deadline)
+                               (Err [e] (return-from :done (Err (WaitFailed (time/time-error-code e)))))
+                               (Ok [remaining]
+                                   (let [remainingp (alloc/stack time/Duration)]
+                                     (store! remainingp remaining)
+                                     (if (and (= (load (field remainingp sec)) 0) (= (load (field remainingp nsec)) 0))
+                                         (return-from :done (Err (Timeout)))
+                                         (match (time/duration-millis 10)
+                                           (Err [e] (return-from :done (Err (WaitFailed (time/time-error-code e)))))
+                                           (Ok [pause] (time/sleep pause))))))))))))))
+
+(defn child-signal [(child (ptr Child)) (signal i32)] (-> (Result i64 SubprocessError))
+  (if (load (field child waited))
+      (Err (AlreadyClosed))
+      (if (= (os/kill (load (field child pid)) signal) 0)
+          (Ok 0)
+          (Err (SignalFailed (os/os-errno))))))
+
+;; Request graceful termination (SIGTERM). The caller must still wait.
+(defn child-terminate [(child (ptr Child))] (-> (Result i64 SubprocessError))
+  (child-signal child 15))
+;; Force termination (SIGKILL). The caller must still wait.
+(defn child-kill [(child (ptr Child))] (-> (Result i64 SubprocessError))
+  (child-signal child 9))
+
+;; Force termination and reap, providing an explicit leak-free finalization path.
+(defn child-kill-and-wait [(child (ptr Child))] (-> (Result ExitStatus SubprocessError))
+  (match (child-kill child) (Err [e] (Err e)) (Ok [_] (child-wait child))))
+
+;; Close parent-owned streams. A live child is not silently detached: this returns
+;; `StillRunning`; call wait or kill-and-wait before final close. Idempotent once reaped.
+(defn child-close [(child (ptr Child))] (-> (Result i64 SubprocessError))
+  (child-close-stdin child)
+  (close-if-open (load (field child stdout-fd)))
+  (close-if-open (load (field child stderr-fd)))
+  (store! (field child stdout-fd) -1)
+  (store! (field child stderr-fd) -1)
+  (if (load (field child waited))
+      (do (store! (field child closed) true) (Ok 0))
+      (Err (StillRunning))))

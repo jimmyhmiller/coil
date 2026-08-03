@@ -10,6 +10,27 @@ compiler (and, for the LLVM backend, libLLVM) — in three flavors:
 | Full | `python3 scripts/dev.py build full` | `cc` + `libLLVM.dylib` | LLVM + arm64 backends |
 | Linux x86-64 | `python3 scripts/dev.py build linux` | `cc` + libLLVM 21 | LLVM backend, ELF ([LINUX_PORT.md](LINUX_PORT.md)) |
 
+## Fast inner loop
+
+Do not use a full rebootstrap to diagnose ordinary compiler-source or core-operation
+changes. Build one candidate after editing compiler sources, then run the bounded
+gate against that candidate as often as needed:
+
+```sh
+build/bin/coil build src/compiler/main.coil --backend arm64 -o /tmp/coil-candidate \
+  --link-flag -L/path/to/llvm/lib --link-flag -lLLVM
+python3 scripts/dev.py test modernize-fast --compiler /tmp/coil-candidate
+```
+
+It tests clean comparisons at every integer width and in `static-assert`, then verifies
+qualified/transitive namespace re-exports, the `coil.process` facade, and the
+legacy-operation autofixer and its idempotence. The gate has a hard 30-second
+budget (22.05 seconds on the development machine when introduced).
+
+Run `python3 scripts/dev.py build full` once, after the fast gate is green. The full
+gate remains authoritative for fixpoint reproduction, snapshots, the behavioral and
+CLI corpora, metaprogram-engine parity, and WebAssembly.
+
 ## LLVM-free: zero external dependencies
 
 ```sh
@@ -36,6 +57,21 @@ Uses the committed seed `bootstrap/seeds/native/coil-seed`. This is the complete
 the arm64 backend does the codegen — the compiler *embeds* an LLVM backend
 (`codegen.coil` FFIs into the LLVM-C API). **Requirements:** `libLLVM.dylib`
 (`brew install llvm`) + `cc`. Force a specific stage0 with `STAGE0=/path/to/coil`.
+
+## Install globally
+
+Once a compiler artifact exists at `build/bin/coil`, install it as the user-level
+`coil` command with:
+
+```sh
+python3 scripts/dev.py install
+```
+
+The command updates the existing user-level `coil` found on `PATH` (such as
+`~/.cargo/bin/coil`), or installs to `~/.local/bin/coil`. Use `--dest PATH` for an
+explicit location. Installation is intentionally fast and does not rerun the
+bootstrap gates; use `python3 scripts/dev.py install --build` when rebuilding and
+verification are part of the requested operation.
 
 ## How the two builds share one codebase
 

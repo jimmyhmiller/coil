@@ -14,4 +14,7 @@ esac
 archive="$repo_dir/build/bin/native/llhttp/$target/libllhttp.a"
 [ -f "$archive" ] || "$repo_dir/scripts/native/build-llhttp.sh"
 
-"$repo_dir/build/bin/coil" test "$repo_dir/tests/llhttp_differential_test.coil"
+"$repo_dir/build/bin/coil" test "$repo_dir/tests/llhttp_differential_test.coil" \
+  --link-flag "$archive"
+"$repo_dir/build/bin/coil" test "$repo_dir/tests/llhttp_corpus_generated_test.coil" \
+  --link-flag "$archive"

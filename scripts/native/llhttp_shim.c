@@ -1,5 +1,7 @@
 #include "llhttp.h"
 
+/* Test-only C oracle for the pure-Coil parser differential gate. */
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -138,7 +140,7 @@ static int on_message_complete(llhttp_t* parser) {
   return HPE_PAUSED;
 }
 
-void* coil_llhttp_parse_request(const unsigned char* data, size_t length) {
+void* coil_llhttp_parse(const unsigned char* data, size_t length, int parser_type) {
   coil_http_result* out = (coil_http_result*) calloc(1, sizeof(*out));
   llhttp_errno_t err;
   const char* pos;
@@ -155,10 +157,11 @@ void* coil_llhttp_parse_request(const unsigned char* data, size_t length) {
   out->settings.on_headers_complete = on_headers_complete;
   out->settings.on_body = on_body;
   out->settings.on_message_complete = on_message_complete;
-  llhttp_init(&out->parser, HTTP_REQUEST, &out->settings);
+  llhttp_init(&out->parser, (llhttp_type_t) parser_type, &out->settings);
   out->parser.data = out;
 
   err = llhttp_execute(&out->parser, (const char*) data, length);
+  if (err == HPE_OK) err = llhttp_finish(&out->parser);
   pos = llhttp_get_error_pos(&out->parser);
   if (pos != NULL && pos >= (const char*) data && pos <= (const char*) data + length) {
     out->error_offset = (size_t) (pos - (const char*) data);
@@ -177,6 +180,10 @@ void* coil_llhttp_parse_request(const unsigned char* data, size_t length) {
     if (out->error_code == 0) out->error_code = (int) err;
   }
   return out;
+}
+
+void* coil_llhttp_parse_request(const unsigned char* data, size_t length) {
+  return coil_llhttp_parse(data, length, HTTP_REQUEST);
 }
 
 void coil_llhttp_result_free(void* opaque) {

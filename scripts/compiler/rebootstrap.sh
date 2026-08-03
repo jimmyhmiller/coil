@@ -86,7 +86,11 @@ echo "  ok — byte-identical, the LLVM backend reproduces the compiler too"
 
 echo "=== GATES ==="
 python3 scripts/oracle.py gate all --compiler /tmp/coil-rb2 >/dev/null \
-  || { echo "compiler snapshot gates FAIL; run: python3 scripts/oracle.py gate all --compiler /tmp/coil-rb2 --verbose"; exit 1; }
+  || { echo "compiler snapshot gates FAIL"
+       echo "audit + refresh every mismatched stage once:"
+       echo "  python3 scripts/dev.py refresh-snapshots --compiler /tmp/coil-rb2 --verbose"
+       echo "Do not bless one stage and rerun gate-all repeatedly."
+       exit 1; }
 echo "  snapshot gates: PASS (read/ast/load/resolve/check/expand/mono/ir/diag/x86/full byte-exact)"
 # Compiler-free consistency check on the shared curated IR manifest: an entry blessed for
 # only one platform breaks the other platform's gate-full with a missing-file error,

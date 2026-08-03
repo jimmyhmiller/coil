@@ -1,10 +1,10 @@
 #!/bin/sh
 set -eu
 
-# Build the exact llhttp release used by coil.http.server. The release branch
-# contains generated C, so building it requires only a C compiler and ar.
+# Build the exact upstream llhttp release used only as the differential oracle.
+# Production Coil programs never link this archive.
 LLHTTP_VERSION=9.4.3
-LLHTTP_SHA256=50fe0797029e3cdf3230ae2510bfa12b4467ec3bc24243601f4b1d3ef42a9445
+LLHTTP_SHA256=d3897ec6263ba1eed13ecc37d54e9c42d6bb6f04c7852490bc8a7ef5326c53e1
 
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 machine=$(uname -m)
@@ -25,7 +25,7 @@ object_dir="$work_dir/objects"
 
 mkdir -p "$source_dir" "$object_dir" "$output_dir"
 curl -fsSL \
-  "https://github.com/nodejs/llhttp/archive/refs/heads/release/v$LLHTTP_VERSION.tar.gz" \
+  "https://github.com/nodejs/llhttp/archive/refs/tags/v$LLHTTP_VERSION.tar.gz" \
   -o "$archive"
 
 sha256() {
@@ -40,14 +40,13 @@ sha256() {
 }
 
 tar -xzf "$archive" -C "$source_dir" --strip-components=1
+(cd "$source_dir" && npm ci >/dev/null && npm run build >/dev/null)
 
 cflags="-std=c99 -Os -fvisibility=hidden -ffunction-sections -fdata-sections"
-cc $cflags -I"$source_dir/include" -c "$source_dir/src/llhttp.c" -o "$object_dir/llhttp.o"
-cc $cflags -I"$source_dir/include" -c "$source_dir/src/api.c" -o "$object_dir/api.o"
-cc $cflags -I"$source_dir/include" -c "$source_dir/src/http.c" -o "$object_dir/http.o"
-cc $cflags -I"$source_dir/include" -c "$repo_dir/scripts/native/llhttp_shim.c" -o "$object_dir/shim.o"
+cc $cflags -I"$source_dir/build" -c "$source_dir/build/c/llhttp.c" -o "$object_dir/llhttp.o"
+cc $cflags -I"$source_dir/build" -c "$repo_dir/scripts/native/llhttp_shim.c" -o "$object_dir/shim.o"
 ar rcs "$output_dir/libllhttp.a" \
-  "$object_dir/llhttp.o" "$object_dir/api.o" "$object_dir/http.o" "$object_dir/shim.o"
+  "$object_dir/llhttp.o" "$object_dir/shim.o"
 
 echo "built $output_dir/libllhttp.a"
 ls -lh "$output_dir/libllhttp.a"
