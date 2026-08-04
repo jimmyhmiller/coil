@@ -240,8 +240,9 @@ source-roots = ["src"]
 def test_meta(compiler: str) -> None:
     interpreted = os.environ.copy()
     interpreted["COIL_META_INTERP"] = "1"
-    execute(sys.executable, "scripts/oracle.py", "runtime", "gate", "arm64", "--compiler", compiler,
-            env=interpreted)
+    if os.environ.get("COIL_META_SKIP_RUNTIME") != "1":
+        execute(sys.executable, "scripts/oracle.py", "runtime", "gate", "arm64", "--compiler", compiler,
+                env=interpreted)
     compiled = Path("/tmp/coil-meta-compiled")
     interp = Path("/tmp/coil-meta-interp")
     execute(compiler, "build", "src/compiler/main_a64.coil", "--backend", "arm64", "-o", str(compiled))

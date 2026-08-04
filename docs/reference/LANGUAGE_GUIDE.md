@@ -303,6 +303,18 @@ import: `when unless cond case case-by while for and or not`.
 `(if c (do …effects… 0) 0)` so both sides are `i64`. `store!` yields unit (canonical
 `i64` 0), so `(if c (primitive/store! p ptr) 0)` type-checks directly — no wrapping `do` needed.
 
+**Binding from a place.** When the initializer is already a place — another `(mut …)`
+cell, or a `(mut T)`/`(ptr T)` parameter — a bare name binds its **value**, and an alias
+is spelled `(mut …)`, exactly as at a call site:
+
+    (let [(mut a) 10]
+      (let [(mut b) (load a)] …)   ; b is a FRESH cell holding 10
+      (let [(mut c) (mut a)]  …)   ; c IS a; a store through either shows in both
+      (let [(mut d) a]        …))  ; ⚠ compile error — say which one you meant
+
+Struct and array places are the exception: `(let [v s])` on one is a **view**, not a
+deep copy, so passing a big struct around never copies it behind your back.
+
 There is no `return`. Structure with `if`, or use `(block :b … (return-from :b v))`.
 Self-tail-recursion is constant-stack (guaranteed `musttail`).
 

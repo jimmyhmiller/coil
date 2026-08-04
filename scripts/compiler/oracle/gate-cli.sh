@@ -8,6 +8,14 @@
 #
 # Usage: scripts/compiler/oracle/gate-cli.sh [path-to-coil]      (default: build/bin/coil)
 set -uo pipefail
+
+# The sections below are independent test groups. Run them in isolated workers by
+# default; the coordinator preserves source order in its combined output. The
+# serial mode remains useful when debugging a failure.
+if [ "${COIL_GATE_CLI_SERIAL:-0}" != 1 ]; then
+  exec python3 "$(dirname "$0")/gate-cli-parallel.py" "$0" "${1:-build/bin/coil}"
+fi
+
 cd "$(dirname "$0")/../../.."
 COIL="${1:-build/bin/coil}"
 [ -x "$COIL" ] || { echo "no coil at $COIL"; exit 1; }

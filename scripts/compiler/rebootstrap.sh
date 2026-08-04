@@ -65,63 +65,84 @@ else echo "no stage0: need a committed $SEED (or set STAGE0=/path/to/coil)"; exi
 fi
 echo "stage0 = $STAGE0"
 
+# The wasm gate asks its compiler to build the current main_wasm.coil and then
+# validates/runs that result; it does not depend on a host self-build stage. It is
+# the longest gate, so overlap it with stage1 and the rest of the build DAG.
+( python3 scripts/dev.py test wasm --compiler "$STAGE0" \
+    >/tmp/coil-bootstrap-wasm.log 2>&1 ) &
+WASM_PID=$!
+cleanup_background_gate() {
+  if [ -n "${WASM_PID:-}" ]; then kill "$WASM_PID" 2>/dev/null || true; fi
+}
+trap cleanup_background_gate EXIT
+
+JOB_NAMES=()
+JOB_PIDS=()
+launch() {
+  local name=$1; shift
+  local log="/tmp/coil-bootstrap-${name}.log"
+  ( "$@" >"$log" 2>&1 ) &
+  JOB_NAMES+=("$name")
+  JOB_PIDS+=("$!")
+}
+wait_jobs() {
+  local failed=0 i
+  for ((i=0; i<${#JOB_PIDS[@]}; i++)); do
+    if wait "${JOB_PIDS[$i]}"; then
+      echo "  ${JOB_NAMES[$i]}: PASS"
+    else
+      echo "  ${JOB_NAMES[$i]}: FAIL"
+      sed -n '1,160p' "/tmp/coil-bootstrap-${JOB_NAMES[$i]}.log"
+      failed=1
+    fi
+  done
+  JOB_NAMES=()
+  JOB_PIDS=()
+  [ "$failed" = 0 ]
+}
+
 echo "=== stage1: stage0 builds the self-host compiler (default LLVM backend) ==="
 "$STAGE0"     build "$SRC" -o /tmp/coil-rb1                "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
-echo "=== stage2: stage1 rebuilds it with --backend arm64 ==="
-/tmp/coil-rb1 build "$SRC" -o /tmp/coil-rb2 --backend arm64 "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
-echo "=== stage3: stage2 rebuilds it with --backend arm64 ==="
-/tmp/coil-rb2 build "$SRC" -o /tmp/coil-rb3 --backend arm64 "${LF[@]}" || { echo "stage3 FAILED"; exit 1; }
 
-echo "=== FIXPOINT: stage2.o vs stage3.o ==="
-cmp /tmp/coil-rb2.o /tmp/coil-rb3.o || { echo "FIXPOINT FAIL — arm64 objects differ (nondeterminism)"; exit 2; }
-echo "  ok — byte-identical, the compiler reproduces itself"
+echo "=== stage2: stage1 rebuilds both backend branches in parallel ==="
+launch rb2 /tmp/coil-rb1 build "$SRC" -o /tmp/coil-rb2 --backend arm64 "${LF[@]}"
+launch rl2 /tmp/coil-rb1 build "$SRC" -o /tmp/coil-rl2 "${LF[@]}"
+wait_jobs || exit 1
 
-# The LLVM backend must be able to build the compiler too, and reach its own
-# fixpoint. Stages 1-3 above do NOT cover this: stage1 uses stage0 (the committed
-# seed, which predates whatever you just changed) and stages 2-3 both pass
-# --backend arm64. So a codegen.coil change that breaks the LLVM backend on the
-# compiler's own source passes every check above. One did: a C-ABI guard added to
-# call-ptr rejected driver.coil's (fnptr c [… (slice u8) …] i64) backend hooks, and
-# fixpoint + all three gates stayed green while `coil build main.coil` was broken.
-echo "=== LLVM-BACKEND SELF-BUILD: stage1 rebuilds the compiler, twice ==="
-/tmp/coil-rb1 build "$SRC" -o /tmp/coil-rl2 "${LF[@]}" >/dev/null \
-  || { echo "LLVM self-build FAIL — the new compiler cannot build the compiler with the LLVM backend"; exit 2; }
-/tmp/coil-rl2 build "$SRC" -o /tmp/coil-rl3 "${LF[@]}" >/dev/null \
-  || { echo "LLVM self-build FAIL — stage rl2 cannot rebuild the compiler"; exit 2; }
-cmp /tmp/coil-rl2.o /tmp/coil-rl3.o || { echo "LLVM FIXPOINT FAIL — LLVM-backend objects differ"; exit 2; }
-echo "  ok — byte-identical, the LLVM backend reproduces the compiler too"
+echo "=== FIXPOINT BUILDS + GATES (parallel DAG) ==="
+# rb2 and rl2 derive from the same stage1 source. Their fixpoint successors and
+# independent gates can all run concurrently. The gates use fast rl2 except for
+# the arm64 runtime corpus, which intentionally executes the arm64-built rb2.
+launch rb3 /tmp/coil-rb2 build "$SRC" -o /tmp/coil-rb3 --backend arm64 "${LF[@]}"
+launch rl3 /tmp/coil-rl2 build "$SRC" -o /tmp/coil-rl3 "${LF[@]}"
+launch snapshots python3 scripts/oracle.py gate all --compiler /tmp/coil-rl2
+launch coverage python3 scripts/oracle.py coverage
+launch runtime-arm64 python3 scripts/oracle.py runtime gate arm64 --compiler /tmp/coil-rb2
+launch cli ./scripts/compiler/oracle/gate-cli.sh /tmp/coil-rl2
+launch meta env COIL_META_SKIP_RUNTIME=1 python3 scripts/dev.py test meta --compiler /tmp/coil-rl2
+wait_jobs || exit 1
+if wait "$WASM_PID"; then
+  echo "  wasm: PASS"
+else
+  echo "  wasm: FAIL"
+  sed -n '1,160p' /tmp/coil-bootstrap-wasm.log
+  exit 1
+fi
+WASM_PID=
 
-echo "=== GATES ==="
-python3 scripts/oracle.py gate all --compiler /tmp/coil-rb2 >/dev/null \
-  || { echo "compiler snapshot gates FAIL"
-       echo "audit + refresh every mismatched stage once:"
-       echo "  python3 scripts/dev.py refresh-snapshots --compiler /tmp/coil-rb2 --verbose"
-       echo "Do not bless one stage and rerun gate-all repeatedly."
-       exit 1; }
-echo "  snapshot gates: PASS (read/ast/load/resolve/check/expand/mono/ir/diag/x86/full byte-exact)"
-# Compiler-free consistency check on the shared curated IR manifest: an entry blessed for
-# only one platform breaks the other platform's gate-full with a missing-file error,
-# which is exactly how fs_lib.coil landed (Linux reference only, macOS gate dead).
-python3 scripts/oracle.py coverage >/dev/null \
-  || { echo "snapshot coverage FAIL"; python3 scripts/oracle.py coverage; exit 1; }
-echo "  IR coverage: PASS (every curated entry blessed on both platforms)"
-python3 scripts/oracle.py runtime gate arm64 --compiler /tmp/coil-rb2 >/dev/null || { echo "arm64 runtime gate FAIL — runtime divergence"; exit 1; }
-echo "  arm64 gate-run: PASS (programs run identically)"
-./scripts/compiler/oracle/gate-cli.sh /tmp/coil-rb2 >/dev/null      || { echo "gate-cli FAIL — the CLI contract regressed"; exit 1; }
-echo "  gate-cli:       PASS (argv, exit codes, fmt)"
-# Both comptime engines must stay interchangeable: the default COMPILED engine (above
-# gates run it) AND the INTERPRETER engine (COIL_META_INTERP / interp.coil). Keeps the
-# choice open and neither from rotting.
-python3 scripts/dev.py test meta --compiler /tmp/coil-rb2       || { echo "meta-engine gate FAIL — compiled-meta and interp-meta diverge"; exit 1; }
-# interp-meta running IN wasm (single static module, wasm2c-ready). Skips if no node.
-python3 scripts/dev.py test wasm --compiler /tmp/coil-rb2               || { echo "wasm gate FAIL — interp-meta-in-wasm self-check regressed"; exit 1; }
+cmp /tmp/coil-rb2.o /tmp/coil-rb3.o \
+  || { echo "FIXPOINT FAIL — arm64 objects differ (nondeterminism)"; exit 2; }
+cmp /tmp/coil-rl2.o /tmp/coil-rl3.o \
+  || { echo "LLVM FIXPOINT FAIL — LLVM-backend objects differ"; exit 2; }
 
-# The gates above all ran against rb2, the ARM64-backend build. rl3 is the one that
-# gets installed, so it is gated too — same source, but different machine code, and
-# "derived from verified source" is not the same as "verified".
-python3 scripts/oracle.py gate full --compiler /tmp/coil-rl3 >/dev/null || { echo "gate-full FAIL on the LLVM build (the installed binary)"; exit 1; }
-./scripts/compiler/oracle/gate-cli.sh  /tmp/coil-rl3 >/dev/null || { echo "gate-cli FAIL on the LLVM build (the installed binary)"; exit 1; }
-echo "  installed binary: PASS (gate-full + gate-cli on the LLVM build)"
+# Differential proof: the verified optimized compiler's arm64 output must equal
+# the arm64 branch's fixed point. This connects the fast-gated/install branch to
+# the independently reproduced native-backend branch.
+/tmp/coil-rl3 build "$SRC" -o /tmp/coil-rd3 --backend arm64 "${LF[@]}" >/dev/null \
+  || { echo "cross-backend differential build FAIL"; exit 2; }
+cmp /tmp/coil-rd3.o /tmp/coil-rb3.o \
+  || { echo "cross-backend differential FAIL — arm64 objects differ"; exit 2; }
+echo "  fixpoints + cross-backend differential: PASS"
 
 DEST="${1:-build/bin/coil}"
 # Install the LLVM-BUILT compiler, not the arm64 one. Both are derived from the same

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import os
 import shlex
 import shutil
@@ -67,6 +68,16 @@ STAGE_INPUTS = {
         "tests/compiler/oracle/ir/fixtures/call.coil",
     ],
 }
+
+
+def jobs() -> int:
+    """Concurrency for the corpus gates. Each unit is a subprocess, so oversubscribing
+    the efficiency cores still pays; COIL_JOBS=1 restores serial execution when a
+    failure needs to be read without interleaving."""
+    override = os.environ.get("COIL_JOBS")
+    if override:
+        return max(1, int(override))
+    return max(1, os.cpu_count() or 1)
 
 
 def rel(path: Path) -> str:
@@ -270,56 +281,69 @@ def refresh_mismatched_snapshots(compiler: Path, verbose: bool) -> int:
     return gate(compiler, "all", verbose)
 
 
+def runtime_one(entry: str, compiler: Path, action: str, platform: str, verbose: bool,
+                reference: Path, excluded: set[str]) -> tuple[bool, list[str]]:
+    """Build and run one corpus entry. Returns (passed, lines to report)."""
+    parts = shlex.split(entry)
+    rust_reference = parts[0] == "R"
+    if rust_reference:
+        parts.pop(0)
+    source, *program_args = parts
+    identity = source.replace("/", "_").replace(".", "_")
+    fixed_prefix = "coil-arm64" if platform in ("arm64", "linux") else "coil-x64"
+    executable = Path("/tmp") / f"{fixed_prefix}-fixed-{identity}"
+    build = [str(compiler), "build", source, "-o", str(executable)]
+    if action == "gate" and platform != "linux":
+        build += ["--backend", platform]
+    elif action == "snapshot" and rust_reference and platform == "arm64":
+        build += ["--backend", "arm64"]
+    result = subprocess.run(build, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+    if platform == "linux" and source in excluded:
+        if result.returncode and b"not a general-purpose register on the target architecture" in result.stderr:
+            return True, []
+        return False, [f"FAIL architecture diagnostic: {source}"]
+    if result.returncode:
+        report = [f"FAIL build: {source}"]
+        if verbose:
+            report.append(str(result.stderr.decode(errors="replace").splitlines()[:3]))
+        return False, report
+    ran = subprocess.run([str(executable), *program_args], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+    stdout_file = reference / f"{identity}.stdout"
+    stderr_file = reference / f"{identity}.stderr"
+    exit_file = reference / f"{identity}.exit"
+    if action == "snapshot":
+        stdout_file.write_bytes(ran.stdout)
+        stderr_file.write_bytes(ran.stderr)
+        exit_file.write_text(f"{ran.returncode}\n")
+        return True, []
+    if stdout_file.is_file() and ran.stdout == stdout_file.read_bytes() and ran.returncode == int(exit_file.read_text()):
+        return True, []
+    return False, [f"FAIL run: {source} exit={ran.returncode}"]
+
+
 def runtime(compiler: Path, action: str, platform: str, verbose: bool) -> int:
+    """Corpus entries are independent — each builds to its own fixed path and only
+    reads stdin from /dev/null — so they run concurrently. Reporting stays in corpus
+    order regardless of completion order, which keeps failure output diffable."""
     source_platform = "arm64" if platform == "linux" else platform
     base = ORACLE / source_platform
     reference = base / "reference"
     excluded = set(read_list(ORACLE / "linux/arm64-only.txt")) if platform == "linux" else set()
+    entries = read_list(base / "corpus.txt")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs()) as pool:
+        results = list(pool.map(
+            lambda entry: runtime_one(entry, compiler, action, platform, verbose, reference, excluded),
+            entries))
     failures = 0
     passed = 0
-    for line in read_list(base / "corpus.txt"):
-        parts = shlex.split(line)
-        rust_reference = parts[0] == "R"
-        if rust_reference:
-            parts.pop(0)
-        source, *program_args = parts
-        identity = source.replace("/", "_").replace(".", "_")
-        fixed_prefix = "coil-arm64" if platform in ("arm64", "linux") else "coil-x64"
-        executable = Path("/tmp") / f"{fixed_prefix}-fixed-{identity}"
-        build = [str(compiler), "build", source, "-o", str(executable)]
-        if action == "gate" and platform != "linux":
-            build += ["--backend", platform]
-        elif action == "snapshot" and rust_reference and platform == "arm64":
-            build += ["--backend", "arm64"]
-        result = subprocess.run(build, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
-        if platform == "linux" and source in excluded:
-            if result.returncode and b"not a general-purpose register on the target architecture" in result.stderr:
-                passed += 1
-            else:
-                failures += 1
-                print(f"FAIL architecture diagnostic: {source}")
-            continue
-        if result.returncode:
-            failures += 1
-            print(f"FAIL build: {source}")
-            if verbose:
-                print(result.stderr.decode(errors="replace").splitlines()[:3])
-            continue
-        ran = subprocess.run([str(executable), *program_args], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-        stdout_file = reference / f"{identity}.stdout"
-        stderr_file = reference / f"{identity}.stderr"
-        exit_file = reference / f"{identity}.exit"
-        if action == "snapshot":
-            stdout_file.write_bytes(ran.stdout)
-            stderr_file.write_bytes(ran.stderr)
-            exit_file.write_text(f"{ran.returncode}\n")
-            passed += 1
-        elif stdout_file.is_file() and ran.stdout == stdout_file.read_bytes() and ran.returncode == int(exit_file.read_text()):
+    for ok, report in results:
+        for line in report:
+            print(line)
+        if ok:
             passed += 1
         else:
             failures += 1
-            print(f"FAIL run: {source} exit={ran.returncode}")
     print(f"runtime {action} {platform}: {passed} passed, {failures} failed")
     return 1 if failures else 0
 
