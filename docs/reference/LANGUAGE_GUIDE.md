@@ -161,7 +161,7 @@ extern in ONE module and `:use *` it, or two importers colliding will fail to li
 - **Clean prelude operators**: `+ - * / %`, `= != < <= > >=`, `& | ^ << >>`.
   Implemented on `i64` (all of them) and `bool` (`=` / `!=`). `f64` has `+ - * /`
   and `< <= > >=` but **deliberately no `Eq`** — like Rust, because `NaN != NaN`
-  breaks reflexivity; use `fcmp-eq` / `fcmp-ne` for float equality. **`(ptr T)` has
+  breaks reflexivity; use `primitive/fcmp-eq` / `primitive/fcmp-ne` for float equality. **`(ptr T)` has
   `= != < <= > >=` for any `T`, comparing ADDRESSES** (like Rust's `*const T`) — the
   metal `icmp-*` ops reject pointers, so these operators are the way to compare them.
   Every signed and unsigned integer width implements `Eq` and `Ord`, so use the
@@ -170,6 +170,10 @@ extern in ONE module and `:use *` it, or two importers colliding will fail to li
 
 These operators are not builtins — they are **trait methods** (see Traits & impls),
 so they work on your own types the moment you write an `impl`.
+
+`and` and `or` are variadic, short-circuiting syntax forms. Their zero-argument
+identities are `(and)` → `true` and `(or)` → `false`; a single argument is returned
+unchanged.
 
 ## Traits & impls
 
@@ -361,17 +365,17 @@ allocation operations each yield `(ptr T)`:
 - `(alloc/static T)` → one global cell per call site (see Globals).
 - `(alloc/heap T)` → `malloc` (pair with `primitive/free`).
 
-Everyday memory and layout operations are ambient core definitions: `load`, `store!`,
-`field`, `index`, `cast`, `sizeof`, `alignof`, `offsetof`, `zeroed`, `stack`, `static`,
-`heap`, `fnptr-of`, and `call-ptr`. They need no `coil.primitive` import. The lint migrates the
-old allocation spellings (`alloc-stack`, `alloc-static`, `alloc-heap`) to
-`stack`/`static`/`heap` and integer metal arithmetic/comparisons to clean operators.
+Everyday memory and layout operations are aliases in ambient `coil.core`: `load`,
+`store!`, `field`, `index`, `cast`, `sizeof`, `alignof`, `offsetof`, `zeroed`,
+`fnptr-of`, and `call-ptr`. Their primitive declarations live only in
+`coil.primitive`; core does not redeclare them.
 
-Operations without an honest clean equivalent remain ambient under their precise
-names, including unsigned `udiv`/`urem`, integer bit operations such as `ior` and
-`ishr`, and floating comparisons such as `fcmp-eq`. `coil.primitive` remains the
-implementation namespace used by the prelude and low-level libraries; ordinary
-application modules should not import it merely to access memory or layout.
+Allocation is owned by `coil.alloc`, so use `alloc/stack`, `alloc/static`, or
+`alloc/heap`. All other raw operations are available only through `coil.primitive`,
+including unsigned `primitive/udiv`/`primitive/urem`, integer bit operations such as
+`primitive/ior` and `primitive/ishr`, and floating comparisons such as
+`primitive/fcmp-eq`. The modernization lint qualifies code written during the brief
+period when those names were accidentally ambient.
 
 `(primitive/index p i)` → `(ptr T)` at element i (pointer arithmetic, scaled by `sizeof T`);
 `(primitive/index p -1)` is p−1. Null: `(primitive/cast (ptr T) 0)`; null test `(= (primitive/cast i64 p) 0)`.
@@ -435,14 +439,15 @@ They are plain `i64` literals — use with metal/clean ops after casting the byt
 
 **Function pointers** (native callbacks, dispatch tables):
 `(fnptr c [ArgTs…] Ret)` is the type (`c` = C convention); `(primitive/fnptr-of fn)` takes a
-function's address; `(primitive/call-ptr fp args…)` calls indirectly. A normal `defn` can be
-taken as a `(fnptr c …)` and called via `call-ptr`; aggregate (struct/sum) returns
+function's address; `(primitive/call-ptr fp args…)` calls indirectly. The ambient
+`fnptr-of` and `call-ptr` names are core aliases of those declarations. A normal `defn` can be
+taken as a `(fnptr c …)` and called indirectly; aggregate (struct/sum) returns
 cross the call correctly. Forward references within a file resolve (mutual
 recursion is fine) — define in any order.
 
 ## Global mutable state
 
-There is **no top-level mutable variable**. Use `alloc-static` inside a zero-arg
+There is **no top-level mutable variable**. Use `alloc/static` inside a zero-arg
 accessor — it returns the same global cell every call:
 
     (defn counter [] (-> (ptr i64)) (alloc/static i64))
@@ -498,7 +503,9 @@ top-level forms; later code may depend on what it generates.
 T)`/`(primitive/ptr? T)`/`(primitive/array? T)`, `(primitive/field-name T i)`, `(primitive/field-type-kind T i)`,
 `(primitive/field-type-name T i)`, `(primitive/field-index T "name")`. Inside a macro (where a type
 arrives as a Code symbol) use the `code-*` family: `code-field-count`/`-name`/`-kind`
-/`-type`, `code-variant-sum`/`-count`/`-name`/`-fields`, and trait reflection
+/`-type`, `code-variant-sum`/`-count`/`-name`/`-fields`,
+`code-variant-field-name`/`-type` (a variant's payload field by `(SUM VIDX FIDX)`;
+the type comes back structured and canonically qualified), and trait reflection
 `code-trait-method-count`/`-name`/`-arity`/`-param-type`/`-ret-type` (for generating
 vtables). Take Code apart with `code-count`/`code-nth`/`code-rest`/`code-sym`
 /`code-list?`/`code-sym?`/`code-int?`. This makes `derive` (`derive.coil`:
@@ -521,6 +528,20 @@ Macros you *call*; checkers and transforms you **register** at top level:
 
     (checker   my-lint)      ; run it over the whole program
     (transform my-lowering)  ; rewrite the whole program
+
+The unqualified forms run at the existing semantic phase, after macro expansion,
+resolution, and typechecking. A checker or transform that needs the author's surface
+syntax can opt into the syntax phase:
+
+    (checker raw-depth :phase before-expand)
+    (transform surface-lowering :phase before-expand)
+
+Before-expansion metaprograms receive the same module-shaped program, but semantic
+reflection is unavailable (`type-of` is `:unknown`, `code-decl` is `:unresolved`, and
+`binding-of` has no checked binding). Syntax transforms run to a fixpoint, then syntax
+checkers run once, and the resulting forms enter ordinary macro expansion. Registrations
+must occur literally at module top level; generated code cannot retroactively register a
+before-expansion pass.
 
 Both are handed the program as a list of modules — `((name form…) …)`, one record per
 module, head = module name — and see **everything**, including imported and bundled
@@ -547,10 +568,12 @@ three or more nested `if`s into a `cond`:
     coil lint app.coil --use myproject.condlint --diff   # the patch; writes nothing
     coil lint app.coil --use myproject.condlint --fix    # apply it
 
-⚠ Checkers see the program **after macro expansion**, so every `cond`/`when`/`case` in
-the file has already become nested `if`s. `(primitive/code-macro? NODE)` is true for a node the
-expander produced, which is how a rule about `if` tells the author's ifs from the
-ones a macro wrote.
+By default, checkers see the program **after macro expansion**, so every
+`cond`/`when`/`case` in the file has already become nested `if`s.
+`(primitive/code-macro? NODE)` is true for a node the expander produced, which is how
+a semantic rule about `if` tells the author's ifs from the ones a macro wrote. Use
+`:phase before-expand` when the rule instead needs to inspect the original macro calls
+or calculate properties such as raw syntactic nesting depth.
 
 **Checkers run after the program is resolved and typechecked**, so they read the
 compiler's authoritative output and layer *policy* on code that already typechecks:
@@ -682,7 +705,12 @@ anywhere, no path or install step:
 `coil.mem`, `coil.io`, `coil.fmt`, `coil.print`, `coil.fs` (files), `coil.result`
 (Option/Result), `coil.control` (case/while/for/…), `coil.match`, `coil.try`,
 `coil.thread`, `coil.atomic`, `coil.simd`, `coil.closure`, `coil.derive`, `coil.mmio`,
-`coil.sexp`, `coil.json` (zero-copy token-tape parser), `coil.http.parser`
+`coil.sexp`, `coil.json` (zero-copy token-tape parser), `coil.serde` +
+`coil.serde.derive`/`coil.serde.json`/`coil.serde.sexp`/`coil.serde.msgpack`/
+`coil.serde.value` (format-agnostic serialization: derive `Serialize`/
+`Deserialize` once — with `rename`/`default`/`skip`/`with`/`boxed`/`deny-unknown`
+field options — and pick the format at the call; `JVal` decodes documents of
+unknown shape — see `docs/design/SERDE.md`), `coil.http.parser`
 (streaming HTTP/1.x messages), `coil.http.server`
 (strict llhttp-backed HTTP/1.x requests), `coil.http.client` (blocking libcurl transport),
 `coil.assert` (assert/deftest), `coil.dbgalloc` and `coil.stacklint` (both used by

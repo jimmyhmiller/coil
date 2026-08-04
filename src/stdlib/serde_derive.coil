@@ -1,0 +1,568 @@
+; Derive Serialize/Deserialize impls as a LIBRARY — no compiler support, the
+; coil.derive pattern applied to serialization.
+;
+;   (import "coil.serde"        :use *)   ; REQUIRED alongside this module
+;   (import "coil.serde.derive" :use *)
+;
+;   (defstruct User [(name (slice u8)) (age u8)])
+;   (derive-serde User)                      ; both impls, by field reflection
+;
+;   (defsum-serde Shape                      ; defines the sum AND derives
+;     (Circle [(r f64)])
+;     (Point))
+;
+; OPTIONS — trailing forms on either macro (unknown names are a hard error):
+;
+;   (derive-serde Config
+;     (rename-all :camelCase)               ; also :kebab-case :snake_case
+;     (deny-unknown)                        ; OPT-IN: error on unknown input keys
+;     (field port    (default 8080))        ; absent on decode -> this expression
+;     (field retries (rename "maxRetries") (default 3))
+;     (field secret  (skip))                ; also (skip-serializing) / (skip-deserializing)
+;     (field at      (with ts-ser ts-de))   ; custom hooks, signatures:
+;                                           ;   ser: [(x FT) (s (dyn Serializer))] (-> (Result i64 SerError))
+;                                           ;   de:  [(out (ptr FT)) (d (dyn Deserializer))] (-> (Result i64 DeError))
+;     (field left    (boxed)))              ; (ptr T) field: heap recursion via de-alloc
+;
+; Decode semantics: unknown input fields are SKIPPED unless (deny-unknown);
+; absent fields take (default …) if given, None for (Option E), else a located
+; DE-E-MISSING-FIELD. A (skip)/(skip-deserializing) field is never sought — it
+; keeps its zeroed value unless it also has (default …).
+;
+; Structs derive post-hoc via code-field-* reflection; sums post-hoc via the
+; code-variant-field-name/-type ops (`(derive-serde-sum T opts…)`), or at the
+; definition with defsum-serde (defsum + both impls in one form). Generated
+; code needs only coil.serde's names (trait methods + helpers, emitted as
+; canonical dotted names where needed) and the ambient prelude.
+(module coil.serde.derive)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.control" :use *)
+(import "coil.serde" :use *)
+
+; ============================ option access =================================
+; `opts` is the trailing Code list of option forms. All helpers that RETURN
+; Code take only Code/i64 params (a non-Code arg would make the call surface
+; syntax); pure string helpers are ordinary functions the engine runs.
+
+;; a non-empty list? (the `() absent-sentinel IS a list, so count too)
+(defn sd--some? [(form Code)] (-> bool)
+  (if (primitive/code-list? form) (> (primitive/code-count form) (cast i64 0)) false))
+;; head symbol of a non-empty list form (or `() otherwise)
+(defn sd--head [(form Code)] (-> Code)
+  (if (sd--some? form) (primitive/code-nth form 0) `()))
+
+;; the `(field FNAME …)` form for FNAME, or `()`
+(defn sd--find-fopt [(opts Code) (fname Code)] (-> Code)
+  (let [n (primitive/code-count opts)
+        (mut i) 0
+        (mut out) `()]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (let [o (primitive/code-nth opts (load i))]
+            (if (and (primitive/code-eq (sd--head o) `field)
+                     (primitive/code-eq (primitive/code-nth o 1) fname))
+                (do (store! out o) (break))
+                (store! i (primitive/iadd (load i) 1))))))
+    (load out)))
+
+;; the `(NAME …)` sub-form inside a field-opt (entries 2..), or `()`
+(defn sd--fopt-get [(fopt Code) (name Code)] (-> Code)
+  (if (not (sd--some? fopt))
+      `()
+      (let [n (primitive/code-count fopt)
+            (mut i) 2
+            (mut out) `()]
+        (loop
+          (if (>= (load i) n)
+              (break)
+              (let [o (primitive/code-nth fopt (load i))]
+                (if (primitive/code-eq (sd--head o) name)
+                    (do (store! out o) (break))
+                    (store! i (primitive/iadd (load i) 1))))))
+        (load out))))
+(defn sd--fopt-has? [(fopt Code) (name Code)] (-> bool)
+  (sd--some? (sd--fopt-get fopt name)))
+
+;; a top-level option form `(NAME …)`, or `()`
+(defn sd--opt-get [(opts Code) (name Code)] (-> Code)
+  (let [n (primitive/code-count opts)
+        (mut i) 0
+        (mut out) `()]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (let [o (primitive/code-nth opts (load i))]
+            (if (primitive/code-eq (sd--head o) name)
+                (do (store! out o) (break))
+                (store! i (primitive/iadd (load i) 1))))))
+    (load out)))
+(defn sd--opt-has? [(opts Code) (name Code)] (-> bool)
+  (sd--some? (sd--opt-get opts name)))
+
+(defn sd--skip-ser? [(fopt Code)] (-> bool)
+  (or (sd--fopt-has? fopt `skip) (sd--fopt-has? fopt `skip-serializing)))
+(defn sd--skip-de? [(fopt Code)] (-> bool)
+  (or (sd--fopt-has? fopt `skip) (sd--fopt-has? fopt `skip-deserializing)))
+
+; ============================ key renaming ==================================
+(defn sd--lower? [(c i64)] (-> bool) (and (>= c (cast i64 97)) (<= c (cast i64 122))))
+(defn sd--sep? [(c i64)] (-> bool) (or (= c (cast i64 45)) (= c (cast i64 95))))   ; - _
+
+;; camelCase: drop separators, uppercase the letter after each
+(defn sd--camel [(name (slice u8))] (-> (slice u8))
+  (let [a (malloc-allocator)
+        (mut l) (al-new [u8] a)
+        n (slice-len name)
+        (mut up) false
+        (mut i) 0]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (let [c (primitive/cast i64 (slice-get name (load i)))]
+            (if (sd--sep? c)
+                (store! up true)
+                (do (al-push! (mut l)
+                              (primitive/cast u8 (if (and (load up) (sd--lower? c)) (primitive/isub c 32) c)))
+                    (store! up false)
+                    0))
+            (store! i (primitive/iadd (load i) 1)))))
+    (slice-new [u8] (load (field l data)) (al-len [u8] (load l)))))
+
+;; swap one separator byte for another
+(defn sd--swapsep [(name (slice u8)) (want i64)] (-> (slice u8))
+  (let [a (malloc-allocator)
+        (mut l) (al-new [u8] a)
+        n (slice-len name)
+        (mut i) 0]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (let [c (primitive/cast i64 (slice-get name (load i)))]
+            (al-push! (mut l) (primitive/cast u8 (if (sd--sep? c) want c)))
+            (store! i (primitive/iadd (load i) 1)))))
+    (slice-new [u8] (load (field l data)) (al-len [u8] (load l)))))
+
+;; the wire key for a field: (rename "…") wins, else rename-all style, else verbatim
+(defn sd--key [(opts Code) (fname Code)] (-> (slice u8))
+  (let [fopt (sd--find-fopt opts fname)
+        rn (sd--fopt-get fopt `rename)]
+    (if (sd--some? rn)
+        (primitive/code-str (primitive/code-nth rn 1) "")
+        (let [ra (sd--opt-get opts `rename-all)
+              raw (primitive/code-str fname "")]
+          (if (not (sd--some? ra))
+              raw
+              (let [style (primitive/code-nth ra 1)]
+                (cond (primitive/code-eq style `:camelCase) (sd--camel raw)
+                      (primitive/code-eq style `:snake_case) (sd--swapsep raw 95)
+                      (primitive/code-eq style `:kebab-case) (sd--swapsep raw 45)
+                      :else raw)))))))     ; unreachable after validation
+
+; ============================ validation ====================================
+(defn sd--err2 [(what (slice u8)) (name Code)] (-> Code)
+  (primitive/error (primitive/code-str name " — " what)))
+
+;; validate one field-opt's sub-forms
+(defn sd--check-fopt [(fopt Code)] (-> i64)
+  (let [n (primitive/code-count fopt)
+        (mut fi) 2]
+    (loop
+      (if (>= (load fi) n) (break) 0)
+      (let [o (primitive/code-nth fopt (load fi))
+            h (sd--head o)]
+        (cond (primitive/code-eq h `rename)
+                (if (= (primitive/code-count o) (cast i64 2)) 0
+                    (primitive/code-int (sd--err2 "rename takes exactly one string" (primitive/code-nth fopt 1))))
+              (primitive/code-eq h `default)
+                (if (= (primitive/code-count o) (cast i64 2)) 0
+                    (primitive/code-int (sd--err2 "default takes exactly one expression" (primitive/code-nth fopt 1))))
+              (primitive/code-eq h `with)
+                (if (= (primitive/code-count o) (cast i64 3)) 0
+                    (primitive/code-int (sd--err2 "with takes exactly ser-fn and de-fn" (primitive/code-nth fopt 1))))
+              (primitive/code-eq h `skip) 0
+              (primitive/code-eq h `skip-serializing) 0
+              (primitive/code-eq h `skip-deserializing) 0
+              (primitive/code-eq h `boxed) 0
+              :else (primitive/code-int (sd--err2 "unknown field option (use rename/default/skip/skip-serializing/skip-deserializing/with/boxed)" h)))
+        (store! fi (primitive/iadd (load fi) 1))))
+    0))
+
+;; validate top-level option forms; field-name existence is checked by `known?`:
+;; a Code list of every legal field-name symbol.
+(defn sd--known? [(names Code) (fname Code)] (-> bool)
+  (let [n (primitive/code-count names)
+        (mut i) 0
+        (mut hit) false]
+    (loop
+      (if (>= (load i) n)
+          (break)
+          (if (primitive/code-eq (primitive/code-nth names (load i)) fname)
+              (do (store! hit true) (break))
+              (store! i (primitive/iadd (load i) 1)))))
+    (load hit)))
+
+(defn sd--check-opts [(opts Code) (names Code)] (-> i64)
+  (let [n (primitive/code-count opts)
+        (mut oi) 0]
+    (loop
+      (if (>= (load oi) n) (break) 0)
+      (let [o (primitive/code-nth opts (load oi))
+            h (sd--head o)]
+        (cond (primitive/code-eq h `rename-all)
+                (let [s (primitive/code-nth o 1)]
+                  (if (or (primitive/code-eq s `:camelCase)
+                          (or (primitive/code-eq s `:snake_case) (primitive/code-eq s `:kebab-case)))
+                      0
+                      (primitive/code-int (sd--err2 "rename-all wants :camelCase, :snake_case, or :kebab-case" s))))
+              (primitive/code-eq h `deny-unknown) 0
+              (primitive/code-eq h `field)
+                (do (if (sd--known? names (primitive/code-nth o 1))
+                        0
+                        (primitive/code-int (sd--err2 "no such field on this type" (primitive/code-nth o 1))))
+                    (sd--check-fopt o))
+              :else (primitive/code-int (sd--err2 "unknown option (use rename-all/deny-unknown/(field …))" h)))
+        (store! oi (primitive/iadd (load oi) 1))))
+    0))
+
+;; every field name of a struct, as a Code list, via reflection
+(defn sd--struct-names [(T Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    `(~(primitive/code-field-name T i) ~@(sd--struct-names T (primitive/iadd i 1) n))))
+
+; ============================ shared emitters ===============================
+;; the symbol's name (or a computed key) as a string literal Code node
+(defn sd--str [(sym Code)] (-> Code)
+  `~(primitive/code-str sym ""))
+(defn sd--str2 [(a Code) (b Code)] (-> Code)
+  `~(primitive/code-str a "." b))
+(defn sd--keylit [(opts Code) (fname Code)] (-> Code)
+  `~(sd--key opts fname))
+
+;; is this field type an Option? (bare `Option` from reflection, `(Option E)`
+;; from sum-definition syntax)
+(defn sd--opt? [(ftype Code)] (-> bool)
+  (if (primitive/code-list? ftype)
+      (let [h (primitive/code-nth ftype 0)]
+        (or (primitive/code-eq h `Option) (primitive/code-eq h `coil.core.Option)))
+      (or (primitive/code-eq ftype `Option) (primitive/code-eq ftype `coil.core.Option))))
+
+;; one de step: seek `key`; run FOUND on hit, ABSENT on miss; then TAIL
+(defn sd--de-step [(key Code) (found Code) (absent Code) (tail Code)] (-> Code)
+  `(match (de-field d ~key)
+     (Err [e] (Err e))
+     (Ok [sd-found]
+       (match (if sd-found ~found ~absent)
+         (Err [e] (Err e))
+         (Ok [_] ~tail)))))
+
+;; the FOUND decode form for a field with options (place = where to store)
+(defn sd--found-form [(fopt Code) (place Code)] (-> Code)
+  (let [w (sd--fopt-get fopt `with)]
+    (if (sd--some? w)
+        `(~(primitive/code-nth w 2) ~place d)
+        (if (sd--fopt-has? fopt `boxed)
+            `(coil.serde.boxed-de! ~place d)
+            `(de ~place d)))))
+
+;; the ABSENT form: default expr > Option->None > missing-field error
+(defn sd--absent-form [(fopt Code) (place Code) (ftype Code) (ctx Code)] (-> Code)
+  (let [df (sd--fopt-get fopt `default)]
+    (if (sd--some? df)
+        `(do (store! ~place ~(primitive/code-nth df 1)) (Ok [i64 DeError] 0))
+        (if (sd--opt? ftype)
+            `(do (coil.serde.opt-none! ~place) (Ok [i64 DeError] 0))
+            `(Err [i64 DeError] (coil.serde.de-err 10 -1 ~ctx))))))   ; DE-E-MISSING-FIELD
+
+;; the (deny-unknown) input-key sweep: known = every wire key (Code string list)
+(defn sd--known-stores [(keys Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    `((store! (index sd-known ~i) ~(primitive/code-nth keys i))
+      ~@(sd--known-stores keys (primitive/iadd i 1) n))))
+(defn sd--deny-form [(keys Code)] (-> Code)
+  (let [n (primitive/code-count keys)]
+    `(let [sd-known (alloc/stack (array (slice u8) ~n))]
+       (do ~@(sd--known-stores keys 0 n)
+           (coil.serde.deny-unknown-check d sd-nin
+             (slice-new [(slice u8)] (cast (ptr (slice u8)) sd-known) ~n))))))
+
+;; wrap BODY in the deny-unknown pre-pass when requested
+(defn sd--deny-wrap [(opts Code) (keys Code) (body Code)] (-> Code)
+  (if (sd--opt-has? opts `deny-unknown)
+      `(match ~(sd--deny-form keys)
+         (Err [e] (Err e))
+         (Ok [_] ~body))
+      body))
+
+; ============================ structs: serialize ============================
+;; count of fields that actually serialize
+(defn sd--ser-count [(T Code) (opts Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n) 0
+    (primitive/iadd
+      (if (sd--skip-ser? (sd--find-fopt opts (primitive/code-field-name T i))) 0 1)
+      (sd--ser-count T opts (primitive/iadd i 1) n))))
+
+(defn sd--ser-sf [(T Code) (opts Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `(struct-end s)
+      (let [fn- (primitive/code-field-name T i)
+            fopt (sd--find-fopt opts fn-)]
+        (if (sd--skip-ser? fopt)
+            (sd--ser-sf T opts (primitive/iadd i 1) n)
+            (let [w (sd--fopt-get fopt `with)
+                  vform (if (sd--some? w)
+                            `(~(primitive/code-nth w 1) (load (field x ~fn-)) s)
+                            (if (sd--fopt-has? fopt `boxed)
+                                `(coil.serde.boxed-ser (load (field x ~fn-)) s)
+                                `(ser (load (field x ~fn-)) s)))]
+              `(match (field-key s ~(sd--keylit opts fn-))
+                 (Err [e] (Err e))
+                 (Ok [_]
+                   (match ~vform
+                     (Err [e] (Err e))
+                     (Ok [_] ~(sd--ser-sf T opts (primitive/iadd i 1) n))))))))))
+
+;; `(derive-serialize T opts…)` — an `(impl Serialize T …)` walking T's fields.
+(defn sd--ser-impl [(tname Code) (opts Code)] (-> Code)
+  (let [n (primitive/code-field-count tname)]
+    (sd--check-opts opts (sd--struct-names tname 0 n))
+    `(impl Serialize ~tname
+       (ser [(x ~tname) (s (dyn Serializer))] (-> (Result i64 SerError))
+         (match (struct-begin s ~(sd--str tname) ~(sd--ser-count tname opts 0 n))
+           (Err [e] (Err e))
+           (Ok [_] ~(sd--ser-sf tname opts 0 n)))))))
+
+; ============================ structs: deserialize ==========================
+(defn sd--de-sf [(T Code) (opts Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `(match (de-struct-end d) (Err [e] (Err e)) (Ok [_] (Ok 0)))
+      (let [fn- (primitive/code-field-name T i)
+            fopt (sd--find-fopt opts fn-)
+            place `(field out ~fn-)
+            tail (sd--de-sf T opts (primitive/iadd i 1) n)]
+        (if (sd--skip-de? fopt)
+            (let [df (sd--fopt-get fopt `default)]
+              (if (sd--some? df)
+                  `(do (store! ~place ~(primitive/code-nth df 1)) ~tail)
+                  tail))
+            (sd--de-step (sd--keylit opts fn-)
+                         (sd--found-form fopt place)
+                         (sd--absent-form fopt place (primitive/code-field-type T i) (sd--str2 T fn-))
+                         tail)))))
+
+;; every wire key of T (Code string list) — the deny-unknown known set
+(defn sd--struct-keys [(T Code) (opts Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    `(~(sd--keylit opts (primitive/code-field-name T i))
+      ~@(sd--struct-keys T opts (primitive/iadd i 1) n))))
+
+(defn sd--de-impl [(tname Code) (opts Code)] (-> Code)
+  (let [n (primitive/code-field-count tname)]
+    (sd--check-opts opts (sd--struct-names tname 0 n))
+    `(impl Deserialize ~tname
+       (de [(out (ptr ~tname)) (d (dyn Deserializer))] (-> (Result i64 DeError))
+         (match (de-struct-begin d ~(sd--str tname))
+           (Err [e] (Err e))
+           (Ok [sd-nin]
+             ~(sd--deny-wrap opts (sd--struct-keys tname opts 0 n)
+                             (sd--de-sf tname opts 0 n))))))))
+
+(defn derive-serialize [(tname Code) & (opts Code)] (-> Code)
+  (sd--ser-impl tname opts))
+(defn derive-deserialize [(tname Code) & (opts Code)] (-> Code)
+  (sd--de-impl tname opts))
+;; `(derive-serde T opts…)` — both impls.
+(defn derive-serde [(tname Code) & (opts Code)] (-> Code)
+  `(do ~(sd--ser-impl tname opts) ~(sd--de-impl tname opts)))
+
+; ============================ sums ==========================================
+;; defsum-serde's variadic tail mixes variant forms and option forms; an option
+;; form's head is `field`/`rename-all`/`deny-unknown` (reserved variant names).
+(defn sd--opt-form? [(form Code)] (-> bool)
+  (let [h (sd--head form)]
+    (or (primitive/code-eq h `field)
+        (or (primitive/code-eq h `rename-all) (primitive/code-eq h `deny-unknown)))))
+(defn sd--variants-of [(args Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [f (primitive/code-nth args i)]
+      (if (sd--opt-form? f)
+          (sd--variants-of args (primitive/iadd i 1) n)
+          `(~f ~@(sd--variants-of args (primitive/iadd i 1) n))))))
+(defn sd--sumopts-of [(args Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [f (primitive/code-nth args i)]
+      (if (sd--opt-form? f)
+          `(~f ~@(sd--sumopts-of args (primitive/iadd i 1) n))
+          (sd--sumopts-of args (primitive/iadd i 1) n)))))
+
+;; a variant form is (V), (V []), or (V [(f T) …])
+(defn sd--vfields [(v Code)] (-> Code)
+  (if (> (primitive/code-count v) (primitive/cast i64 1)) (primitive/code-nth v 1) `[]))
+(defn sd--vnames [(fields Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    `(~(primitive/code-nth (primitive/code-nth fields i) 0)
+      ~@(sd--vnames fields (primitive/iadd i 1) n))))
+;; the union of payload field names across every variant (for validation)
+(defn sd--sum-names [(variants Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [fields (sd--vfields (primitive/code-nth variants i))]
+      `(~@(sd--vnames fields 0 (primitive/code-count fields))
+        ~@(sd--sum-names variants (primitive/iadd i 1) n)))))
+
+; ---- sums: serialize --------------------------------------------------------
+(defn sd--ser-vcount [(fields Code) (opts Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n) 0
+    (primitive/iadd
+      (if (sd--skip-ser? (sd--find-fopt opts (primitive/code-nth (primitive/code-nth fields i) 0))) 0 1)
+      (sd--ser-vcount fields opts (primitive/iadd i 1) n))))
+
+;; payload fields, from the binders bound by the match arm (values, not places)
+(defn sd--ser-vf [(fields Code) (opts Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `(variant-end s)
+      (let [fld (primitive/code-nth fields i)
+            fn- (primitive/code-nth fld 0)
+            fty (primitive/code-nth fld 1)
+            fopt (sd--find-fopt opts fn-)]
+        (if (sd--skip-ser? fopt)
+            (sd--ser-vf fields opts (primitive/iadd i 1) n)
+            (let [w (sd--fopt-get fopt `with)
+                  vform (if (sd--some? w)
+                            `(~(primitive/code-nth w 1) ~fn- s)   ; ser hooks take the value
+                            (if (sd--fopt-has? fopt `boxed)
+                                `(coil.serde.boxed-ser ~fn- s)
+                                `(ser ~fn- s)))]
+              `(match (field-key s ~(sd--keylit opts fn-))
+                 (Err [e] (Err e))
+                 (Ok [_]
+                   (match ~vform
+                     (Err [e] (Err e))
+                     (Ok [_] ~(sd--ser-vf fields opts (primitive/iadd i 1) n))))))))))
+
+(defn sd--ser-arms [(T Code) (variants Code) (opts Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [v (primitive/code-nth variants i)
+          vn (primitive/code-nth v 0)
+          fields (sd--vfields v)
+          nf (primitive/code-count fields)
+          arm (if (= nf (primitive/cast i64 0))
+                  `(~vn [] (variant-unit s ~(sd--str T) ~(sd--str vn)))
+                  `(~vn [~@(sd--vnames fields 0 nf)]
+                    (match (variant-begin s ~(sd--str T) ~(sd--str vn) ~(sd--ser-vcount fields opts 0 nf))
+                      (Err [e] (Err e))
+                      (Ok [_] ~(sd--ser-vf fields opts 0 nf)))))]
+      `(~arm ~@(sd--ser-arms T variants opts (primitive/iadd i 1) n)))))
+
+(defn sd--sum-ser [(tname Code) (variants Code) (opts Code)] (-> Code)
+  `(impl Serialize ~tname
+     (ser [(x ~tname) (s (dyn Serializer))] (-> (Result i64 SerError))
+       (match x ~@(sd--ser-arms tname variants opts 0 (primitive/code-count variants))))))
+
+; ---- sums: deserialize ------------------------------------------------------
+(defn sd--vslots [(fields Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [fld (primitive/code-nth fields i)]
+      `(~(primitive/code-nth fld 0) (alloc/stack ~(primitive/code-nth fld 1))
+        ~@(sd--vslots fields (primitive/iadd i 1) n)))))
+(defn sd--vloads [(fields Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    `((load ~(primitive/code-nth (primitive/code-nth fields i) 0))
+      ~@(sd--vloads fields (primitive/iadd i 1) n))))
+;; the payload's wire keys (deny-unknown known set)
+(defn sd--vkeys [(fields Code) (opts Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    `(~(sd--keylit opts (primitive/code-nth (primitive/code-nth fields i) 0))
+      ~@(sd--vkeys fields opts (primitive/iadd i 1) n))))
+
+;; payload field steps ending in TAIL (places are the slot pointers; the slot
+;; starts zeroed, so a skipped field without default is already handled)
+(defn sd--de-vf [(vn Code) (fields Code) (opts Code) (i i64) (n i64) (tail Code)] (-> Code)
+  (if (>= i n)
+      tail
+      (let [fld (primitive/code-nth fields i)
+            fn- (primitive/code-nth fld 0)
+            fopt (sd--find-fopt opts fn-)
+            rest (sd--de-vf vn fields opts (primitive/iadd i 1) n tail)]
+        (if (sd--skip-de? fopt)
+            (let [df (sd--fopt-get fopt `default)]
+              (if (sd--some? df)
+                  `(do (store! ~fn- ~(primitive/code-nth df 1)) ~rest)
+                  rest))
+            (sd--de-step (sd--keylit opts fn-)
+                         (sd--found-form fopt fn-)
+                         (sd--absent-form fopt fn- (primitive/code-nth fld 1) (sd--str2 vn fn-))
+                         rest)))))
+
+(defn sd--de-arms [(T Code) (variants Code) (opts Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `(:else (Err [i64 DeError] (coil.serde.de-err 11 -1 ~(sd--str T))))   ; DE-E-UNKNOWN-VARIANT
+      (let [v (primitive/code-nth variants i)
+            vn (primitive/code-nth v 0)
+            fields (sd--vfields v)
+            nf (primitive/code-count fields)
+            arm (if (= nf (primitive/cast i64 0))
+                    `(match (de-variant-end d)
+                       (Err [e] (Err e))
+                       (Ok [_] (do (store! out (~vn)) (Ok 0))))
+                    `(let [~@(sd--vslots fields 0 nf)]
+                       (match (de-struct-begin d ~(sd--str vn))
+                         (Err [e] (Err e))
+                         (Ok [sd-nin]
+                           ~(sd--deny-wrap opts (sd--vkeys fields opts 0 nf)
+                             (sd--de-vf vn fields opts 0 nf
+                               `(match (de-struct-end d)
+                                  (Err [e] (Err e))
+                                  (Ok [_]
+                                    (match (de-variant-end d)
+                                      (Err [e] (Err e))
+                                      (Ok [_] (do (store! out (~vn ~@(sd--vloads fields 0 nf))) (Ok 0))))))))))))]
+        `((coil.str.str-eq tag ~(sd--str vn)) ~arm
+          ~@(sd--de-arms T variants opts (primitive/iadd i 1) n)))))
+
+(defn sd--sum-de [(tname Code) (variants Code) (opts Code)] (-> Code)
+  `(impl Deserialize ~tname
+     (de [(out (ptr ~tname)) (d (dyn Deserializer))] (-> (Result i64 DeError))
+       (match (de-variant d)
+         (Err [e] (Err e))
+         (Ok [tag] (cond ~@(sd--de-arms tname variants opts 0 (primitive/code-count variants))))))))
+
+;; `(defsum-serde T (V1 [(f T)…]) (V2) … opts…)` — define the sum AND derive
+;; both impls (externally tagged). Options follow the variants; `field`,
+;; `rename-all`, and `deny-unknown` are therefore reserved variant names.
+(defn defsum-serde [(tname Code) & (args Code)] (-> Code)
+  (let [n (primitive/code-count args)
+        variants (sd--variants-of args 0 n)
+        opts (sd--sumopts-of args 0 n)]
+    (sd--check-opts opts (sd--sum-names variants 0 (primitive/code-count variants)))
+    `(do (defsum ~tname ~@variants)
+         ~(sd--sum-ser tname variants opts)
+         ~(sd--sum-de tname variants opts))))
+
+; ---- sums, post-hoc: rebuild the variant syntax from reflection -------------
+; code-variant-field-name/-type give a variant's payload back field by field
+; (types come back STRUCTURED and canonically qualified, which is valid in
+; every type position), so an already-defined sum derives exactly like the
+; definition-site path — the generators above are reused on a reflected
+; variants list.
+(defn sd--refl-vfields [(T Code) (vi i64) (fi i64) (nf i64)] (-> Code)
+  (if (>= fi nf) `()
+    `((~(primitive/code-variant-field-name T vi fi) ~(primitive/code-variant-field-type T vi fi))
+      ~@(sd--refl-vfields T vi (primitive/iadd fi 1) nf))))
+(defn sd--refl-variants [(T Code) (vi i64) (nv i64)] (-> Code)
+  (if (>= vi nv) `()
+    (let [vn (primitive/code-variant-name T vi)
+          nf (primitive/code-variant-fields T vi)]
+      `((~vn [~@(sd--refl-vfields T vi 0 nf)])
+        ~@(sd--refl-variants T (primitive/iadd vi 1) nv)))))
+
+;; `(derive-serde-sum T opts…)` — both impls for an EXISTING defsum.
+(defn derive-serde-sum [(tname Code) & (opts Code)] (-> Code)
+  (let [variants (sd--refl-variants tname 0 (primitive/code-variant-count tname))]
+    (sd--check-opts opts (sd--sum-names variants 0 (primitive/code-count variants)))
+    `(do ~(sd--sum-ser tname variants opts)
+         ~(sd--sum-de tname variants opts))))

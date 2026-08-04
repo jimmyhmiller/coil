@@ -1,0 +1,507 @@
+; JSON backend for coil.serde — a Serializer over any io Writer and a
+; Deserializer over coil.json's zero-copy token tape.
+;
+;   (import "coil.serde"      :use *)
+;   (import "coil.serde.json" :use *)
+;   (to-json x (stdout))                       ; serialize to any Writer
+;   (to-json-str a x)                          ; -> (Result (slice u8) SerError)
+;   (from-json [T] a src)                      ; parse + decode -> (Result T DeError)
+;
+; Decoded strings are zero-copy views of `src` when escape-free, otherwise
+; unescaped into the decode allocator — either way they BORROW; an arena per
+; decode is the recommended pattern. Floats print with %.17g (round-trip exact);
+; NaN/inf are SER-E-UNSUPPORTED (JSON has no representation). `ser-bytes` /
+; `de-bytes` are unsupported in JSON — (slice u8) is a string here.
+;
+; This module declares `extern snprintf` and `extern strtod` (no stdlib module
+; owns them); don't redeclare them in a module linked with this one.
+(module coil.serde.json)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.json" :as json)
+(import "coil.serde" :use *)
+(import "coil.control" :use *)
+(import "coil.result" :use *)
+(import "coil.try" :use *)
+
+; ============================ serializer ====================================
+;; comma[d] = 1 -> the next element/key at nesting depth d needs a ',' first
+(defstruct JsonSer [(w (ptr Writer)) (depth i64) (comma (array u8 66))])
+
+(defn js-io [(r (Result i64 IoError))] (-> (Result i64 SerError))
+  (match r
+    (Err [_] (Err (ser-err SER-E-IO)))
+    (Ok [n] (Ok n))))
+(defn js-byte [(p (ptr JsonSer)) (b i64)] (-> (Result i64 SerError))
+  (js-io (write-byte (load (field p w)) (primitive/cast u8 b))))
+(defn js-str [(p (ptr JsonSer)) (s (slice u8))] (-> (Result i64 SerError))
+  (js-io (print-str (load (field p w)) s)))
+
+(defn js-open [(p (ptr JsonSer)) (ch i64)] (-> (Result i64 SerError))
+  (if (>= (load (field p depth)) (cast i64 64))
+      (Err (ser-err SER-E-DEPTH))
+      (try
+        (do (try! (js-byte p ch))
+            (store! (field p depth) (+ (load (field p depth)) 1))
+            (store! (primitive/index (field p comma) (load (field p depth))) (primitive/cast u8 0))
+            (Ok 0)))))
+(defn js-close [(p (ptr JsonSer)) (ch i64)] (-> (Result i64 SerError))
+  (try
+    (do (try! (js-byte p ch))
+        (store! (field p depth) (- (load (field p depth)) 1))
+        (Ok 0))))
+;; the comma before every element/key but the level's first
+(defn js-sep [(p (ptr JsonSer))] (-> (Result i64 SerError))
+  (let [slot (primitive/index (field p comma) (load (field p depth)))]
+    (if (= (primitive/cast i64 (load slot)) (cast i64 1))
+        (js-byte p \,)
+        (do (store! slot (primitive/cast u8 1)) (Ok 0)))))
+
+(defn js-hexdig [(n i64)] (-> i64)
+  (if (< n (cast i64 10)) (+ n 48) (+ n 87)))
+;; "s" with JSON escaping: " \ and control bytes (named escapes, else \u00XX)
+(defn js-esc [(p (ptr JsonSer)) (s (slice u8))] (-> (Result i64 SerError))
+  (try
+    (do (try! (js-byte p \"))
+        (let [n (slice-len s)]
+          (for [i 0 n]
+            (let [c (primitive/cast i64 (slice-get s i))]
+              (cond (= c (cast i64 34)) (do (try! (js-byte p \\)) (try! (js-byte p \")) 0)
+                    (= c (cast i64 92)) (do (try! (js-byte p \\)) (try! (js-byte p \\)) 0)
+                    (= c (cast i64 10)) (do (try! (js-byte p \\)) (try! (js-byte p \n)) 0)
+                    (= c (cast i64 9))  (do (try! (js-byte p \\)) (try! (js-byte p \t)) 0)
+                    (= c (cast i64 13)) (do (try! (js-byte p \\)) (try! (js-byte p \r)) 0)
+                    (= c (cast i64 8))  (do (try! (js-byte p \\)) (try! (js-byte p \b)) 0)
+                    (= c (cast i64 12)) (do (try! (js-byte p \\)) (try! (js-byte p \f)) 0)
+                    (< c (cast i64 32))
+                      (do (try! (js-str p "\\u00"))
+                          (try! (js-byte p (js-hexdig (primitive/ishr c 4))))
+                          (try! (js-byte p (js-hexdig (primitive/iand c 15))))
+                          0)
+                    :else (do (try! (js-byte p c)) 0)))))
+        (js-byte p \"))))
+
+(defn js-key [(p (ptr JsonSer)) (k (slice u8))] (-> (Result i64 SerError))
+  (try
+    (do (try! (js-sep p))
+        (try! (js-esc p k))
+        (js-byte p \:))))
+
+(defn js-finite? [(x f64)] (-> bool)
+  (if (primitive/fcmp-eq x 0.0)
+      true
+      (not (primitive/fcmp-eq (primitive/fdiv 1.0 x) 0.0))))
+
+(impl Serializer JsonSer
+  (ser-null [(s (ptr JsonSer))] (-> (Result i64 SerError)) (js-str s "null"))
+  (ser-bool [(s (ptr JsonSer)) (v bool)] (-> (Result i64 SerError))
+    (js-str s (if v "true" "false")))
+  (ser-i64 [(s (ptr JsonSer)) (v i64)] (-> (Result i64 SerError))
+    (js-io (print-i (load (field s w)) v)))
+  (ser-u64 [(s (ptr JsonSer)) (v i64)] (-> (Result i64 SerError))
+    (js-io (print-u (load (field s w)) v)))
+  (ser-f64 [(s (ptr JsonSer)) (v f64)] (-> (Result i64 SerError))
+    (if (not (primitive/fcmp-eq v v))
+        (Err (ser-err SER-E-UNSUPPORTED))          ; NaN
+        (if (not (js-finite? v))
+            (Err (ser-err SER-E-UNSUPPORTED))      ; +/- inf
+            (let [buf (alloc/stack (array i8 40))
+                  n (primitive/cast i64 (snprintf (primitive/cast (ptr i8) buf) 40 c"%.17g" v))]
+              (js-io (write-all (load (field s w)) (primitive/cast (ptr i8) buf) n))))))
+  (ser-str [(s (ptr JsonSer)) (v (slice u8))] (-> (Result i64 SerError)) (js-esc s v))
+  (ser-bytes [(s (ptr JsonSer)) (v (slice u8))] (-> (Result i64 SerError))
+    (Err (ser-err SER-E-UNSUPPORTED)))
+  (seq-begin [(s (ptr JsonSer)) (len i64)] (-> (Result i64 SerError)) (js-open s \[))
+  (seq-elem [(s (ptr JsonSer))] (-> (Result i64 SerError)) (js-sep s))
+  (seq-end [(s (ptr JsonSer))] (-> (Result i64 SerError)) (js-close s \]))
+  (map-begin [(s (ptr JsonSer)) (len i64)] (-> (Result i64 SerError)) (js-open s \{))
+  (map-key [(s (ptr JsonSer)) (k (slice u8))] (-> (Result i64 SerError)) (js-key s k))
+  (map-end [(s (ptr JsonSer))] (-> (Result i64 SerError)) (js-close s \}))
+  (struct-begin [(s (ptr JsonSer)) (name (slice u8)) (nfields i64)] (-> (Result i64 SerError))
+    (js-open s \{))
+  (field-key [(s (ptr JsonSer)) (name (slice u8))] (-> (Result i64 SerError)) (js-key s name))
+  (struct-end [(s (ptr JsonSer))] (-> (Result i64 SerError)) (js-close s \}))
+  (variant-unit [(s (ptr JsonSer)) (sum (slice u8)) (tag (slice u8))] (-> (Result i64 SerError))
+    (js-esc s tag))
+  (variant-begin [(s (ptr JsonSer)) (sum (slice u8)) (tag (slice u8)) (nfields i64)] (-> (Result i64 SerError))
+    (try
+      (do (try! (js-open s \{))
+          (try! (js-esc s tag))
+          (try! (js-byte s \:))
+          (js-open s \{))))
+  (variant-end [(s (ptr JsonSer))] (-> (Result i64 SerError))
+    (try
+      (do (try! (js-close s \}))
+          (js-close s \})))))
+
+; ============================ deserializer ==================================
+;; A cursor over the token tape. `at` indexes the CURRENT value token; every
+;; de-* consumes the value it decodes (advances past its whole subtree). `stk`
+;; holds enclosing container token indices for struct/map/variant framing.
+(defstruct JsonDe
+  [(doc json/Doc) (at i64) (alc (ptr Allocator)) (stk (array i64 64)) (sp i64)])
+
+(defn jd-tok [(p (ptr JsonDe))] (-> json/Token)
+  (json/token (load (field p doc)) (load (field p at))))
+(defn jd-off [(p (ptr JsonDe))] (-> i64)
+  (let [t (jd-tok p)] (load (field t start))))
+
+;; skip one token and its complete subtree (coil.json's preorder-tape walk,
+;; reimplemented over its exported surface)
+(defn jd-skip [(d json/Doc) (i i64)] (-> i64)
+  (let [t (json/token d i)
+        k (json/kind t)]
+    (if (or (= k (cast i64 4)) (= k (cast i64 5)))   ; JSON-ARRAY / JSON-OBJECT
+        (let [(mut at) (+ i 1)
+              total (if (= k (cast i64 5)) (* (json/child-count t) 2) (json/child-count t))]
+          (for [n 0 total]
+            (store! at (jd-skip d (load at))))
+          (load at))
+        (+ i 1))))
+(defn jd-adv! [(p (ptr JsonDe))] (-> i64)
+  (store! (field p at) (jd-skip (load (field p doc)) (load (field p at)))))
+
+(defn jd-push! [(p (ptr JsonDe)) (v i64)] (-> (Result i64 DeError))
+  (if (>= (load (field p sp)) (cast i64 64))
+      (Err (de-err DE-E-DEPTH (jd-off p) "nesting too deep"))
+      (do (store! (primitive/index (field p stk) (load (field p sp))) v)
+          (store! (field p sp) (+ (load (field p sp)) 1))
+          (Ok 0))))
+(defn jd-pop! [(p (ptr JsonDe))] (-> i64)
+  (store! (field p sp) (- (load (field p sp)) 1))
+  (load (primitive/index (field p stk) (load (field p sp)))))
+(defn jd-top [(p (ptr JsonDe))] (-> i64)
+  (load (primitive/index (field p stk) (- (load (field p sp)) 1))))
+
+; ---- string unescaping ------------------------------------------------------
+(defn jd-has-esc? [(s (slice u8))] (-> bool)
+  (let [n (slice-len s)
+        (mut found) false]
+    (for [i 0 n]
+      (when (= (primitive/cast i64 (slice-get s i)) (cast i64 92))
+        (store! found true)
+        0))
+    (load found)))
+(defn jd-hex1 [(c i64)] (-> i64)
+  (cond (and (>= c (cast i64 48)) (<= c (cast i64 57))) (- c 48)
+        (and (>= c (cast i64 97)) (<= c (cast i64 102))) (- c 87)
+        :else (- c 55)))
+(defn jd-hex4 [(s (slice u8)) (i i64)] (-> i64)
+  (+ (primitive/ishl (jd-hex1 (primitive/cast i64 (slice-get s i))) 12)
+     (+ (primitive/ishl (jd-hex1 (primitive/cast i64 (slice-get s (+ i 1)))) 8)
+        (+ (primitive/ishl (jd-hex1 (primitive/cast i64 (slice-get s (+ i 2)))) 4)
+           (jd-hex1 (primitive/cast i64 (slice-get s (+ i 3))))))))
+(defn jd-utf8-push! [(l (mut (ArrayList u8))) (cp i64)] (-> i64)
+  (cond (< cp (cast i64 128)) (al-push! (mut l) (primitive/cast u8 cp))
+        (< cp (cast i64 2048))
+          (do (al-push! (mut l) (primitive/cast u8 (+ 192 (primitive/ishr cp 6))))
+              (al-push! (mut l) (primitive/cast u8 (+ 128 (primitive/iand cp 63)))))
+        (< cp (cast i64 65536))
+          (do (al-push! (mut l) (primitive/cast u8 (+ 224 (primitive/ishr cp 12))))
+              (al-push! (mut l) (primitive/cast u8 (+ 128 (primitive/iand (primitive/ishr cp 6) 63))))
+              (al-push! (mut l) (primitive/cast u8 (+ 128 (primitive/iand cp 63)))))
+        :else
+          (do (al-push! (mut l) (primitive/cast u8 (+ 240 (primitive/ishr cp 18))))
+              (al-push! (mut l) (primitive/cast u8 (+ 128 (primitive/iand (primitive/ishr cp 12) 63))))
+              (al-push! (mut l) (primitive/cast u8 (+ 128 (primitive/iand (primitive/ishr cp 6) 63))))
+              (al-push! (mut l) (primitive/cast u8 (+ 128 (primitive/iand cp 63)))))))
+
+;; Decode the ENCODED string bytes `raw` (escapes validated by the parser):
+;; zero-copy when escape-free, else unescaped into `a`. Surrogate pairs combine;
+;; lone surrogates are DE-E-BAD-STRING.
+(defn jd-unescape [(a (ptr Allocator)) (raw (slice u8)) (off i64)] (-> (Result (slice u8) DeError))
+  (if (not (jd-has-esc? raw))
+      (Ok raw)
+      (try
+        (let [n (slice-len raw)
+              (mut l) (al-new [u8] a)
+              (mut i) 0]
+          (while (< (load i) n)
+            (let [c (primitive/cast i64 (slice-get raw (load i)))]
+              (if (!= c (cast i64 92))
+                  (do (al-push! (mut l) (slice-get raw (load i)))
+                      (store! i (+ (load i) 1)))
+                  (let [e (primitive/cast i64 (slice-get raw (+ (load i) 1)))]
+                    (cond (= e (cast i64 34)) (do (al-push! (mut l) (primitive/cast u8 34)) (store! i (+ (load i) 2)) 0)
+                          (= e (cast i64 92)) (do (al-push! (mut l) (primitive/cast u8 92)) (store! i (+ (load i) 2)) 0)
+                          (= e (cast i64 47)) (do (al-push! (mut l) (primitive/cast u8 47)) (store! i (+ (load i) 2)) 0)
+                          (= e (cast i64 98)) (do (al-push! (mut l) (primitive/cast u8 8)) (store! i (+ (load i) 2)) 0)
+                          (= e (cast i64 102)) (do (al-push! (mut l) (primitive/cast u8 12)) (store! i (+ (load i) 2)) 0)
+                          (= e (cast i64 110)) (do (al-push! (mut l) (primitive/cast u8 10)) (store! i (+ (load i) 2)) 0)
+                          (= e (cast i64 114)) (do (al-push! (mut l) (primitive/cast u8 13)) (store! i (+ (load i) 2)) 0)
+                          (= e (cast i64 116)) (do (al-push! (mut l) (primitive/cast u8 9)) (store! i (+ (load i) 2)) 0)
+                          :else   ; \uXXXX (the parser allows no other escape)
+                          (let [cp (jd-hex4 raw (+ (load i) 2))]
+                            (cond (and (>= cp (cast i64 55296)) (<= cp (cast i64 56319)))   ; high surrogate
+                                    (if (and (< (+ (load i) 11) n)
+                                             (and (= (primitive/cast i64 (slice-get raw (+ (load i) 6))) (cast i64 92))
+                                                  (= (primitive/cast i64 (slice-get raw (+ (load i) 7))) (cast i64 117))))
+                                        (let [lo (jd-hex4 raw (+ (load i) 8))]
+                                          (if (and (>= lo (cast i64 56320)) (<= lo (cast i64 57343)))
+                                              (do (jd-utf8-push! (mut l)
+                                                    (+ 65536 (+ (primitive/ishl (- cp 55296) 10) (- lo 56320))))
+                                                  (store! i (+ (load i) 12))
+                                                  0)
+                                              (return-from :try (Err (de-err DE-E-BAD-STRING off "lone high surrogate")))))
+                                        (return-from :try (Err (de-err DE-E-BAD-STRING off "lone high surrogate"))))
+                                  (and (>= cp (cast i64 56320)) (<= cp (cast i64 57343)))   ; lone low surrogate
+                                    (return-from :try (Err (de-err DE-E-BAD-STRING off "lone low surrogate")))
+                                  :else
+                                    (do (jd-utf8-push! (mut l) cp)
+                                        (store! i (+ (load i) 6))
+                                        0))))))))
+          (Ok (slice-new [u8] (load (field l data)) (al-len [u8] (load l))))))))
+
+;; unescape-aware key comparison (keys sit ENCODED in the tape)
+(defn jd-key-eq [(p (ptr JsonDe)) (keytok json/Token) (want (slice u8))] (-> (Result bool DeError))
+  (let [raw (json/string-text (load (field p doc)) keytok)]
+    (if (not (jd-has-esc? raw))
+        (Ok (str-eq raw want))
+        (try
+          (let [decoded (try! (jd-unescape (load (field p alc)) raw (load (field keytok start))))]
+            (Ok (str-eq decoded want)))))))
+
+; ---- number parsing ---------------------------------------------------------
+;; strict i64: an optional '-' and digits only ('.'/'e' -> not an integer);
+;; accumulates negative so i64 MIN parses; overflow -> DE-E-INT-RANGE.
+(defn jd-int [(text (slice u8)) (off i64)] (-> (Result i64 DeError))
+  (try
+    (let [n (slice-len text)
+          neg (= (primitive/cast i64 (slice-get text 0)) (cast i64 45))
+          (mut acc) 0
+          (mut i) (if (= (primitive/cast i64 (slice-get text 0)) (cast i64 45)) 1 0)]
+      (while (< (load i) n)
+        (let [c (primitive/cast i64 (slice-get text (load i)))]
+          (if (and (>= c (cast i64 48)) (<= c (cast i64 57)))
+              (let [d (- c 48)]
+                (if (< (load acc) (primitive/idiv (+ -9223372036854775808 d) 10))
+                    (return-from :try (Err (de-err DE-E-INT-RANGE off "integer overflows i64")))
+                    (do (store! acc (- (* (load acc) 10) d))
+                        (store! i (+ (load i) 1))
+                        0)))
+              (return-from :try (Err (de-err DE-E-EXPECTED-INT off "number is not an integer"))))))
+      (if neg
+          (Ok (load acc))
+          (if (= (load acc) -9223372036854775808)
+              (Err (de-err DE-E-INT-RANGE off "integer overflows i64"))
+              (Ok (- 0 (load acc))))))))
+
+;; strict u64 (result carried as i64 bits); '-' and non-digits rejected.
+(defn jd-uint [(text (slice u8)) (off i64)] (-> (Result i64 DeError))
+  (try
+    (let [n (slice-len text)
+          (mut acc) 0
+          (mut i) 0]
+      (when (= (primitive/cast i64 (slice-get text 0)) (cast i64 45))
+        (return-from :try (Err (de-err DE-E-INT-RANGE off "negative number for unsigned field"))))
+      (while (< (load i) n)
+        (let [c (primitive/cast i64 (slice-get text (load i)))]
+          (if (and (>= c (cast i64 48)) (<= c (cast i64 57)))
+              (let [d (- c 48)
+                    limit (primitive/udiv (primitive/isub -1 d) 10)]
+                (if (> (primitive/cast u64 (load acc)) (primitive/cast u64 limit))
+                    (return-from :try (Err (de-err DE-E-INT-RANGE off "integer overflows u64")))
+                    (do (store! acc (+ (* (load acc) 10) d))
+                        (store! i (+ (load i) 1))
+                        0)))
+              (return-from :try (Err (de-err DE-E-EXPECTED-INT off "number is not an integer"))))))
+      (Ok (load acc)))))
+
+(defn jd-float [(p (ptr JsonDe)) (text (slice u8))] (-> f64)
+  (let [n (slice-len text)
+        buf (unwrap-ptr [i8] (raw-alloc (load (field p alc)) (+ n 1) 1))]
+    (for [i 0 n]
+      (store! (primitive/index buf i) (primitive/cast i8 (slice-get text i))))
+    (store! (primitive/index buf n) (primitive/cast i8 0))
+    (strtod buf (primitive/cast (ptr (ptr i8)) 0))))
+
+; ---- the Deserializer impl --------------------------------------------------
+(defn jd-expect [(p (ptr JsonDe)) (k i64) (code i64) (what (slice u8))] (-> (Result json/Token DeError))
+  (let [t (jd-tok p)]
+    (if (= (json/kind t) k)
+        (Ok t)
+        (Err (de-err code (jd-off p) what)))))
+
+;; is this number token's text integral (no '.' / 'e')?
+(defn jd-int-text? [(s (slice u8))] (-> bool)
+  (let [n (slice-len s)
+        (mut isint) true]
+    (for [i 0 n]
+      (let [c (primitive/cast i64 (slice-get s i))]
+        (when (or (= c (cast i64 46)) (or (= c (cast i64 101)) (= c (cast i64 69))))
+          (store! isint false)
+          0)))
+    (load isint)))
+
+(impl Deserializer JsonDe
+  (de-kind [(d (ptr JsonDe))] (-> i64)
+    (let [t (jd-tok d)
+          k (json/kind t)]
+      (cond (= k (cast i64 0)) SD-K-NULL
+            (= k (cast i64 1)) SD-K-BOOL
+            (= k (cast i64 2)) (if (jd-int-text? (json/number-text (load (field d doc)) t))
+                                   SD-K-INT
+                                   SD-K-FLOAT)
+            (= k (cast i64 3)) SD-K-STR
+            (= k (cast i64 4)) SD-K-SEQ
+            (= k (cast i64 5)) SD-K-MAP
+            :else SD-K-OTHER)))
+  (de-null? [(d (ptr JsonDe))] (-> bool)
+    (if (json/is-null? (jd-tok d))
+        (do (jd-adv! d) true)
+        false))
+  (de-bool [(d (ptr JsonDe))] (-> (Result bool DeError))
+    (try
+      (let [t (try! (jd-expect d 1 DE-E-EXPECTED-BOOL "expected a boolean"))]
+        (jd-adv! d)
+        (Ok (json/bool t)))))
+  (de-i64 [(d (ptr JsonDe))] (-> (Result i64 DeError))
+    (try
+      (let [t (try! (jd-expect d 2 DE-E-EXPECTED-INT "expected a number"))
+            v (try! (jd-int (json/number-text (load (field d doc)) t) (load (field t start))))]
+        (jd-adv! d)
+        (Ok v))))
+  (de-u64 [(d (ptr JsonDe))] (-> (Result i64 DeError))
+    (try
+      (let [t (try! (jd-expect d 2 DE-E-EXPECTED-INT "expected a number"))
+            v (try! (jd-uint (json/number-text (load (field d doc)) t) (load (field t start))))]
+        (jd-adv! d)
+        (Ok v))))
+  (de-f64 [(d (ptr JsonDe))] (-> (Result f64 DeError))
+    (try
+      (let [t (try! (jd-expect d 2 DE-E-EXPECTED-FLOAT "expected a number"))
+            v (jd-float d (json/number-text (load (field d doc)) t))]
+        (jd-adv! d)
+        (Ok v))))
+  (de-str [(d (ptr JsonDe))] (-> (Result (slice u8) DeError))
+    (try
+      (let [t (try! (jd-expect d 3 DE-E-EXPECTED-STR "expected a string"))
+            s (try! (jd-unescape (load (field d alc))
+                                 (json/string-text (load (field d doc)) t)
+                                 (load (field t start))))]
+        (jd-adv! d)
+        (Ok s))))
+  (de-bytes [(d (ptr JsonDe))] (-> (Result (slice u8) DeError))
+    (Err (de-err DE-E-UNSUPPORTED (jd-off d) "JSON has no bytes type")))
+  (de-seq-begin [(d (ptr JsonDe))] (-> (Result i64 DeError))
+    (try
+      (let [t (try! (jd-expect d 4 DE-E-EXPECTED-SEQ "expected an array"))]
+        (store! (field d at) (+ (load (field d at)) 1))   ; first element (or past, if empty)
+        (Ok (json/child-count t)))))
+  (de-seq-end [(d (ptr JsonDe))] (-> (Result i64 DeError))
+    (Ok 0))   ; count-driven: decoding the last element already advanced past
+  (de-map-begin [(d (ptr JsonDe))] (-> (Result i64 DeError))
+    (try
+      (let [t (try! (jd-expect d 5 DE-E-EXPECTED-MAP "expected an object"))]
+        (try! (jd-push! d (load (field d at))))
+        (Ok (json/child-count t)))))
+  (de-map-key [(d (ptr JsonDe)) (n i64)] (-> (Result (slice u8) DeError))
+    (try
+      (let [ki (json/object-key (load (field d doc)) (jd-top d) n)
+            kt (json/token (load (field d doc)) ki)]
+        (jd-unescape (load (field d alc))
+                     (json/string-text (load (field d doc)) kt)
+                     (load (field kt start))))))
+  (de-map-value [(d (ptr JsonDe)) (n i64)] (-> (Result i64 DeError))
+    (do (store! (field d at) (json/object-value (load (field d doc)) (jd-top d) n))
+        (Ok 0)))
+  (de-map-end [(d (ptr JsonDe))] (-> (Result i64 DeError))
+    (do (store! (field d at) (jd-skip (load (field d doc)) (jd-pop! d)))
+        (Ok 0)))
+  (de-struct-begin [(d (ptr JsonDe)) (name (slice u8))] (-> (Result i64 DeError))
+    (try
+      (let [t (try! (jd-expect d 5 DE-E-EXPECTED-OBJECT name))]
+        (try! (jd-push! d (load (field d at))))
+        (Ok (json/child-count t)))))
+  (de-field [(d (ptr JsonDe)) (name (slice u8))] (-> (Result bool DeError))
+    (try
+      (let [doc (load (field d doc))
+            obj (jd-top d)
+            t (json/token doc obj)
+            n (json/child-count t)
+            (mut found) false]
+        (for [i 0 n]
+          (when (not (load found))
+            (let [ki (json/object-key doc obj i)]
+              (when (try! (jd-key-eq d (json/token doc ki) name))
+                (store! (field d at) (+ ki 1))
+                (store! found true)
+                0))
+            0))
+        (Ok (load found)))))
+  (de-struct-end [(d (ptr JsonDe))] (-> (Result i64 DeError))
+    (do (store! (field d at) (jd-skip (load (field d doc)) (jd-pop! d)))
+        (Ok 0)))
+  (de-variant [(d (ptr JsonDe))] (-> (Result (slice u8) DeError))
+    (let [t (jd-tok d)]
+      (cond (json/is-string? t)   ; unit variant: a bare tag string
+              (try
+                (let [tag (try! (jd-unescape (load (field d alc))
+                                             (json/string-text (load (field d doc)) t)
+                                             (load (field t start))))]
+                  (jd-adv! d)
+                  (try! (jd-push! d -1))
+                  (Ok tag)))
+            (json/is-object? t)   ; {"Tag": payload}
+              (if (!= (json/child-count t) (cast i64 1))
+                  (Err (de-err DE-E-EXPECTED-VARIANT (jd-off d) "expected exactly one variant tag"))
+                  (try
+                    (let [obj (load (field d at))
+                          ki (json/object-key (load (field d doc)) obj 0)
+                          kt (json/token (load (field d doc)) ki)
+                          tag (try! (jd-unescape (load (field d alc))
+                                                 (json/string-text (load (field d doc)) kt)
+                                                 (load (field kt start))))]
+                      (try! (jd-push! d obj))
+                      (store! (field d at) (+ ki 1))
+                      (Ok tag))))
+            :else (Err (de-err DE-E-EXPECTED-VARIANT (jd-off d) "expected a variant (string or 1-key object)")))))
+  (de-variant-end [(d (ptr JsonDe))] (-> (Result i64 DeError))
+    (let [v (jd-pop! d)]
+      (when (>= v (cast i64 0))
+        (store! (field d at) (jd-skip (load (field d doc)) v))
+        0)
+      (Ok 0)))
+  (de-alloc [(d (ptr JsonDe))] (-> (ptr Allocator))
+    (load (field d alc))))
+
+; ============================ conveniences ==================================
+;; Serialize `x` as JSON to any Writer.
+(defn to-json [(T Serialize)] [(x T) (w (ptr Writer))] (-> (Result i64 SerError))
+  (let [js (alloc/stack JsonSer)]
+    (store! js (primitive/zeroed JsonSer))
+    (store! (field js w) w)
+    (ser x (primitive/make-dyn Serializer js))))
+
+;; Serialize `x` to a string allocated from `a`.
+(defn to-json-str [(T Serialize)] [(a (ptr Allocator)) (x T)] (-> (Result (slice u8) SerError))
+  (let [g (alloc/stack GrowBuf)
+        w (alloc/stack Writer)
+        js (alloc/stack JsonSer)]
+    (grow-writer w g a)
+    (store! js (primitive/zeroed JsonSer))
+    (store! (field js w) w)
+    (match (ser x (primitive/make-dyn Serializer js))
+      (Err [e] (Err e))
+      (Ok [_] (Ok (grow-str g))))))
+
+;; Parse + decode one complete JSON document into a T.
+(defn from-json [(T Deserialize)] [(a (ptr Allocator)) (src (slice u8))] (-> (Result T DeError))
+  (match (json/parse a src)
+    (Err [pe] (Err (de-err DE-E-PARSE (json/error-offset pe) "invalid JSON")))
+    (Ok [doc]
+      (let [dd (alloc/stack JsonDe)
+            slot (alloc/stack T)]
+        (store! dd (primitive/zeroed JsonDe))
+        (store! (field dd doc) doc)
+        (store! (field dd at) 0)
+        (store! (field dd alc) a)
+        (match (de slot (primitive/make-dyn Deserializer dd))
+          (Err [e] (Err e))
+          (Ok [_] (Ok (load slot))))))))

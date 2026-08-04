@@ -50,8 +50,12 @@ Rust-like ownership dialect, a Scheme frontend).
 - **Bytes ↔ names:** `(primitive/int->str N)` → the integer's decimal as a `(slice u8)`, so a
   name minted from a counter/index is one call; `(primitive/str-bytes S)` → a Code list of a
   string's byte values; `(primitive/bytes->str LIST)` → the inverse (list of ints → string).
-- **Reflect on types:** `code-field-count/name/kind/type`, `code-variant-*`,
-  `code-trait-*` (and value-form `field-count`, `struct?`, `field-name`, …).
+- **Reflect on types:** `code-field-count/name/kind/type`, `code-variant-*`
+  (including `code-variant-field-name`/`-type`, which reflect a variant's
+  PAYLOAD fields by `(SUM VARIANT-INDEX FIELD-INDEX)` — the type comes back
+  structured, e.g. `(coil.core.Option (slice u8))`, so a derive over an existing
+  sum sees real field types), `code-trait-*` (and value-form `field-count`,
+  `struct?`, `field-name`, …).
   Kind tags: `0=int 1=float 2=bool 3=struct 4=sum 5=ptr 6=array 7=slice 8=other`.
 - **Compute:** the compiled engine runs arbitrary Coil — including generics,
   collections, allocation and FFI.
@@ -120,6 +124,13 @@ New API this project added (all shipped):
   tagged with that module, so a transform may EMIT new top-level defns (a GC dialect's
   per-type `trace-T`, a root table, a runtime import) or drop forms. Demo:
   `tests/metaprogramming/compile-and-run/addforms.coil` emits a whole new defn.
+- **Phase selection.** The two-item registrations keep their semantic behavior: they
+  run after expansion and have access to the checked model. Add `:phase before-expand`
+  to run on the loaded surface syntax instead: `(checker raw-depth :phase
+  before-expand)` or `(transform surface-pass :phase before-expand)`. Syntax transforms
+  reach a fixpoint before syntax checkers run; their output then undergoes normal macro
+  expansion. Semantic reflection is empty in this phase, and registrations must be
+  literal top-level forms rather than generated retroactively.
 - **`(primitive/binding-of NODE)` → the local-binding identity** a reference resolves to (an
   i64; 0 = a global const/function), recorded by the type-checker per reference.
   Two references with the same positive id name the SAME local, so a checker
