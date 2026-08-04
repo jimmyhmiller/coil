@@ -1,0 +1,150 @@
+(module coil.signals)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.atomic" :as atomic)
+(import "coil.os" :as os)
+(import "coil.io" :as io)
+(import "coil.slice" :use [slice-len slice-get])
+(import "coil.selectors" :as selectors)
+
+(export SignalSubscription
+        SignalError
+        AlreadySubscribed
+        InvalidSignal
+        PipeFailed
+        InstallFailed
+        RestoreFailed
+        ReadFailed
+        signal-subscribe
+        signal-watch
+        signal-read
+        signal-close!)
+
+(defsum SignalError
+  (AlreadySubscribed)
+  (InvalidSignal [(signal i64)])
+  (PipeFailed [(code i64)])
+  (InstallFailed [(signal i64)])
+  (RestoreFailed [(signal i64)])
+  (ReadFailed [(code i64)]))
+
+(defstruct SignalSubscription
+  [(read-fd i32)
+   (write-fd i32)
+   (count i64)
+   (signals (array i32 4))
+   (previous (array (fnptr c [i32] i64) 4))
+   (closed bool)])
+
+(extern signal :cc c [i32 (fnptr c [i32] i64)] (-> (fnptr c [i32] i64)))
+
+; One process-global handler owner is intentional: POSIX signal disposition is itself
+; process-global. The pointer is atomically published before handlers are installed.
+(defn active-subscription [] (-> (ptr (ptr SignalSubscription)))
+  (alloc/static (ptr SignalSubscription)))
+
+(defn signal-handler [(number i32)] (-> i64)
+  (let [subscription (atomic/atomic-load-ptr [SignalSubscription] (active-subscription))]
+    (if (= (primitive/cast i64 subscription) 0)
+        0
+        (let [slot (alloc/stack i32)]
+          (store! slot number)
+          ; write is async-signal-safe. The pipe is nonblocking, so a signal storm may
+          ; coalesce notifications rather than deadlock inside the handler.
+          (primitive/cast i64
+                          (io/write (load (field subscription write-fd))
+                                    (primitive/cast (ptr i8) slot)
+                                    4))))))
+
+(defn signal-number-valid? [(number i32)] (-> bool)
+  (or (= number (primitive/cast i32 1))
+      (or (= number (primitive/cast i32 2))
+          (or (= number (primitive/cast i32 15)) (= number (primitive/cast i32 10))))))
+
+(defn gen-signal-platform [] (-> Code)
+  (if (primitive/code-eq (primitive/target-os) `linux)
+      `(defn nonblocking-flag [] (-> i32)
+         2048)
+      `(defn nonblocking-flag [] (-> i32)
+         4)))
+(meta (gen-signal-platform))
+
+(defn close-pipe [(subscription (ptr SignalSubscription))] (-> i64)
+  (if (>= (load (field subscription read-fd)) 0) (os/close (load (field subscription read-fd))) 0)
+  (if (>= (load (field subscription write-fd)) 0) (os/close (load (field subscription write-fd))) 0)
+  (store! (field subscription read-fd) -1)
+  (store! (field subscription write-fd) -1)
+  0)
+
+(defn restore-installed [(subscription (ptr SignalSubscription)) (count i64)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) count)
+              (break)
+              (do
+                (signal (load (primitive/index (field subscription signals) (load i)))
+                        (load (primitive/index (field subscription previous) (load i))))
+                (store! i (+ (load i) 1)))))
+    0))
+
+;; Subscribe to 1-4 numeric POSIX signals. Supported portable supervision signals are
+;; SIGHUP(1), SIGINT(2), SIGUSR1(10), and SIGTERM(15). Only one live subscription may
+;; own process dispositions at a time.
+(defn signal-subscribe [(subscription (ptr SignalSubscription)) (numbers (slice i32))] (-> (Result (ptr SignalSubscription)
+                                                                                                   SignalError))
+  (let [count (slice-len numbers)]
+    (if (or (= count 0) (> count 4))
+        (Err (InvalidSignal 0))
+        (if (!= (primitive/cast i64 (atomic/atomic-load-ptr [SignalSubscription] (active-subscription))) 0)
+            (Err (AlreadySubscribed))
+            (let [fds (alloc/stack (array i32 2))]
+              (if (< (os/pipe (primitive/cast (ptr i32) fds)) 0)
+                  (Err (PipeFailed (os/os-errno)))
+                  (do
+                    (store! (field subscription read-fd) (load (primitive/index fds 0)))
+                    (store! (field subscription write-fd) (load (primitive/index fds 1)))
+                    (store! (field subscription count) count)
+                    (store! (field subscription closed) false)
+                    (os/fcntl (load (field subscription write-fd)) 4 (nonblocking-flag))
+                    (atomic/atomic-store-ptr [SignalSubscription] (active-subscription) subscription)
+                    (block :done
+                           (let [(mut i) 0]
+                             (loop (if (>= (load i) count)
+                                       (return-from :done (Ok subscription))
+                                       (let [number (slice-get numbers (load i))]
+                                         (if (not (signal-number-valid? number))
+                                             (do
+                                               (restore-installed subscription (load i))
+                                               (atomic/atomic-store-ptr [SignalSubscription]
+                                                                        (active-subscription)
+                                                                        (primitive/cast (ptr SignalSubscription) 0))
+                                               (close-pipe subscription)
+                                               (return-from :done (Err (InvalidSignal (primitive/cast i64 number)))))
+                                             (let [previous (signal number (primitive/fnptr-of signal-handler))]
+                                               (store! (primitive/index (field subscription signals) (load i)) number)
+                                               (store! (primitive/index (field subscription previous) (load i))
+                                                       previous)
+                                               (store! i (+ (load i) 1))))))))))))))))
+
+(defn signal-watch [(subscription (ptr SignalSubscription)) (tag i64)] (-> selectors/Watch)
+  (selectors/watch (load (field subscription read-fd)) (selectors/interest-readable) tag))
+
+(defn signal-read [(subscription (ptr SignalSubscription))] (-> (Result i64 SignalError))
+  (let [slot (alloc/stack i32)
+        n (primitive/cast i64 (io/read (load (field subscription read-fd)) (primitive/cast (ptr i8) slot) 4))]
+    (if (= n 4)
+        (Ok (primitive/cast i64 (load slot)))
+        (Err (ReadFailed (if (< n 0) (os/os-errno) 0))))))
+
+(defn signal-close! [(subscription (ptr SignalSubscription))] (-> (Result i64 SignalError))
+  (if (load (field subscription closed))
+      (Ok 0)
+      (do
+        ; Stop publishing the destination before closing descriptors. Restore after the
+        ; unpublish so an in-flight signal cannot write through a closed/reused fd.
+        (atomic/atomic-store-ptr [SignalSubscription]
+                                 (active-subscription)
+                                 (primitive/cast (ptr SignalSubscription) 0))
+        (restore-installed subscription (load (field subscription count)))
+        (close-pipe subscription)
+        (store! (field subscription closed) true)
+        (Ok 0))))

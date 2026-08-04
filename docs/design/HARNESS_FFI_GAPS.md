@@ -14,10 +14,19 @@ The foundational gaps identified here are now implemented in Coil:
   source.
 - `coil.region` supplies a thread-confined tracked allocator with exact-size and
   exact-alignment allocation, resize, individual free, and idempotent bulk close.
+- `coil.sync` supplies allocator-aware mutexes, conditions, retryable once execution,
+  and generation events. Pthread storage uses probed target size/alignment rather than
+  guessed layouts or private platform type names.
+- `coil.signals` converts the supported termination/user signals into a nonblocking,
+  selector-readable subscription with explicit process-global ownership and cleanup.
+- `coil.socket` owns IPv4 TCP listener/connection layouts, options, time-bounded accept,
+  selector watches, I/O, and idempotent descriptor cleanup.
+- `coil.subprocess/run` adds cwd, bounded concurrent stdout/stderr capture, deadlines,
+  cancellation, process-group termination, and guaranteed reaping.
 
-The synchronization, signal-subscription, typed-socket, and high-level captured
-subprocess APIs described below remain the intended hosted abstractions. They can now
-be implemented without guessed platform layouts or application-local wakeup shims.
+Focused executable regressions live under `tests/stdlib/*_test.coil`. The remaining
+architectural recommendation is to keep these facilities in Coil rather than recreating
+them in application-local C shims.
 
 ## Context
 
