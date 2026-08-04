@@ -28,6 +28,11 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 SRC=src/compiler/main.coil
 SEED=bootstrap/seeds/native/coil-seed
+# Scope the namespace scan: a seed that predates the loader's hidden-directory
+# prune would otherwise index stray tree copies (e.g. .claude/worktrees/*) and
+# report every namespace as declared twice. Roots must be relative to the repo
+# root; absent roots are fine (find's nonzero exit is already tolerated).
+export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts}"
 # ---- THE THREE BUILDS --------------------------------------------------------
 #
 #   flavour        script                            LLVM            links

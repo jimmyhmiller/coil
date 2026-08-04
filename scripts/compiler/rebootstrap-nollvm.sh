@@ -25,6 +25,10 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 SRC=src/compiler/main_a64.coil
 SEED=bootstrap/seeds/native/coil-seed-nollvm
+# Scope the namespace scan: a seed that predates the loader's hidden-directory
+# prune would otherwise index stray tree copies (e.g. .claude/worktrees/*) and
+# report every namespace as declared twice.
+export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts}"
 
 if   [ -n "${STAGE0:-}" ];        then :
 elif [ -x "$SEED" ];              then STAGE0="$SEED"
