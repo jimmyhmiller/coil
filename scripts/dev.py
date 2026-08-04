@@ -130,6 +130,22 @@ def test_modernize_fast(compiler: str) -> None:
         if not candidate.is_file():
             raise SystemExit(f"fast modernization gate: compiler not found: {candidate}")
 
+        # Header importing is compiler/load work. Exercise literal aliases,
+        # expressions, casts, fixed arrays, and opaque ABI fallback on every host.
+        bindings = tmp / "cimport-expressions.coil"
+        execute(str(candidate), "cimport", "tests/compiler/cimport/expressions.h",
+                "-o", str(bindings))
+        generated = bindings.read_text()
+        for expected in (
+                "(const COIL_ALIAS_OPTION 256)",
+                "(const COIL_OR_OPTION 260)",
+                "(const COIL_CAST_OPTION 512)",
+                "(array u8 37)",
+                "(defstruct coil_uninspectable :layout explicit"):
+            if expected not in generated:
+                raise SystemExit(f"fast modernization gate: cimport omitted {expected!r}")
+        execute(str(candidate), "check", str(bindings))
+
         width_test = tmp / "integer-widths"
         execute(str(candidate), "build", "tests/compiler/features/integer_ord_all_widths.coil",
                 "--backend", "arm64", "-o", str(width_test))

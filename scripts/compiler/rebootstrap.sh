@@ -119,6 +119,7 @@ launch snapshots python3 scripts/oracle.py gate all --compiler /tmp/coil-rl2
 launch coverage python3 scripts/oracle.py coverage
 launch runtime-arm64 python3 scripts/oracle.py runtime gate arm64 --compiler /tmp/coil-rb2
 launch cli ./scripts/compiler/oracle/gate-cli.sh /tmp/coil-rl2
+launch cimport ./scripts/compiler/oracle/gate-cimport.sh /tmp/coil-rl2
 launch meta env COIL_META_SKIP_RUNTIME=1 python3 scripts/dev.py test meta --compiler /tmp/coil-rl2
 wait_jobs || exit 1
 if wait "$WASM_PID"; then
