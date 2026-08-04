@@ -68,6 +68,11 @@ Project tools inherit the same package, native, target, and link configuration a
     roots = ["tests"]
     suffixes = ["_test.coil"]
 
+    [test.suites.integration]         ; a named suite; `default = false` keeps it
+    roots = ["tests/integration"]     ; out of a bare `coil test`
+    suffixes = ["_integration.coil"]
+    default = false
+
     [lint]
     rules = ["tools/project_rules.coil"]
 
@@ -661,15 +666,52 @@ every definition's doc, e.g. to enforce that exported functions are documented.
     coil test mytests.coil            ; exit 0 iff all pass
 
 Inside a project, `coil test FILE` inherits `Coil.toml`, including `[cc]`, `[link]`,
-dependencies, and the configured target. With no file, Coil discovers every suite
+dependencies, and the configured target. With no file, Coil discovers every test file
 under `[test].roots` whose name has a configured suffix (defaults: `tests/` and
 `_test.coil`):
 
-    coil test                         ; all suites
-    coil test provider                ; suites whose paths contain "provider"
-    coil test --list                  ; discovered suite paths
-    coil test --jobs 4                ; build/run four suite binaries concurrently
+    coil test                         ; every test file in the default suites
+    coil test provider                ; only paths containing "provider"
+    coil test --list                  ; what would run, grouped by suite
+    coil test --jobs 4                ; build/run four test binaries concurrently
     coil test --no-run                ; compile and link without executing
+
+### Named test suites
+
+Some tests should not run just because someone typed `coil test` — they hit a live
+service, they cost money, they take minutes. Declare those as a **named suite** and
+mark it `default = false`:
+
+    [test.suites.unit]
+    roots = ["tests"]
+    suffixes = ["_test.coil"]
+
+    [test.suites.integration]
+    roots = ["tests/integration"]
+    suffixes = ["_integration.coil"]
+    default = false
+
+Membership is **opt-out**: a suite runs unless it says `default = false`. So `coil test`
+keeps meaning "run the tests", and the expensive suite hides behind exactly one line.
+
+    coil test                         ; default suites only
+    coil test --suite integration     ; that suite (repeatable)
+    coil test --suite all             ; every suite, default or not
+    coil test --list --suite all      ; opt-in suites are marked [opt-in]
+
+`coil verify` and `coil check` run the default suites only, so an opt-in suite never
+gets pulled in by the everyday pipeline. Two things deliberately ignore suite
+membership: naming a file (`coil test tests/integration/live_integration.coil` always
+runs it), and `lint`, which treats every configured suffix as a test file whichever
+suite owns it. A filename selector applies *after* suite selection.
+
+A bare `[test]` section is still exactly what it was — it becomes the suite named
+`default`, so a manifest that never mentions suites behaves identically, down to the
+flat `--list` output. Both `all` and `default` are reserved as suite names.
+
+Suites are validated like the rest of the manifest: an unknown `--suite` name, a
+duplicate suite, a non-boolean `default`, or a declared `roots` entry that does not
+exist is a hard error rather than a run that quietly tests nothing.
 
 A failure prints the offending expression and its `file:line`, recovered at expansion
 time via `code-src`/`code-line`, then aborts.

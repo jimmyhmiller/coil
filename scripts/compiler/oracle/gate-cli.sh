@@ -1068,6 +1068,113 @@ find "$T/project/.coil/build/native" -name source.d -type f | grep -q . \
   && ok "native compilation records header depfiles under .coil/build" \
   || bad "native compilation records header depfiles under .coil/build" "no source.d found"
 
+echo "== named test suites: [test.suites.<name>] =="
+# The point of suites: a project can own tests that must NOT run on a bare `coil test`
+# — live integration tests, tests that cost money, tests that take minutes. Membership
+# is opt-OUT (`default = false`), and the ONLY way an opt-in suite runs is by name.
+# Every assertion below is about that boundary holding.
+mkdir -p "$T/suites/src" "$T/suites/tests/integration"
+cat > "$T/suites/Coil.toml" <<'EOF'
+[package]
+name = "suites"
+entry = "src/main.coil"
+source-roots = ["src", "tests"]
+
+[test.suites.unit]
+roots = ["tests"]
+suffixes = ["_test.coil"]
+
+[test.suites.integration]
+roots = ["tests/integration"]
+suffixes = ["_integration.coil"]
+default = false
+EOF
+printf '(module suites)\n(defn main [] (-> i64) 0)\n' > "$T/suites/src/main.coil"
+printf '(module unit_test)\n(deftest unit-arith (assert-eq (+ 2 2) 4))\n' > "$T/suites/tests/unit_test.coil"
+# The opt-in suite FAILS on purpose: any path that runs it without being asked turns red.
+printf '(module live_integration)\n(deftest live-must-not-run (assert-eq 0 1))\n' \
+  > "$T/suites/tests/integration/live_integration.coil"
+"$COIL" fmt --write "$T/suites/src/main.coil" "$T/suites/tests/unit_test.coil" \
+  "$T/suites/tests/integration/live_integration.coil" >/dev/null
+
+expect_rc 0 "a bare coil test runs only the default suites" \
+  bash -c 'cd "$1" && "$2" test' _ "$T/suites" "$COIL"
+expect_rc 0 "coil verify does not reach an opt-in suite" \
+  bash -c 'cd "$1" && "$2" verify' _ "$T/suites" "$COIL"
+expect_rc 0 "coil check does not reach an opt-in suite" \
+  bash -c 'cd "$1" && "$2" check' _ "$T/suites" "$COIL"
+expect_rc 1 "--suite names the opt-in suite and actually runs it" \
+  bash -c 'cd "$1" && "$2" test --suite integration' _ "$T/suites" "$COIL"
+expect_rc 1 "--suite all runs every suite regardless of default" \
+  bash -c 'cd "$1" && "$2" test --suite all' _ "$T/suites" "$COIL"
+expect_out "unit:" "--list groups discovered files under their suite" \
+  bash -c 'cd "$1" && "$2" test --list' _ "$T/suites" "$COIL"
+expect_out "integration \[opt-in\]:" "--list marks a suite that a bare run would skip" \
+  bash -c 'cd "$1" && "$2" test --list --suite all' _ "$T/suites" "$COIL"
+# A default --list that leaked the opt-in suite would mean a bare run reaches it too.
+(cd "$T/suites" && "$COIL" test --list 2>/dev/null) | grep -q integration \
+  && bad "a default --list omits the opt-in suite" "integration appeared" \
+  || ok "a default --list omits the opt-in suite"
+expect_rc 1 "an explicit file runs whichever suite claims it" \
+  bash -c 'cd "$1" && "$2" test tests/integration/live_integration.coil' _ "$T/suites" "$COIL"
+expect_out "unit_test" "--suite is repeatable" \
+  bash -c 'cd "$1" && "$2" test --list --suite unit --suite integration' _ "$T/suites" "$COIL"
+expect_out "live_integration" "a selector narrows what the suites already chose" \
+  bash -c 'cd "$1" && "$2" test --list --suite all live' _ "$T/suites" "$COIL"
+# A typo'd suite name must not select nothing and report success.
+expect_rc 2 "an unknown suite name is rejected, not silently empty" \
+  bash -c 'cd "$1" && "$2" test --suite nope' _ "$T/suites" "$COIL"
+expect_out "known: unit, integration" "the unknown-suite error lists the real suites" \
+  bash -c 'cd "$1" && "$2" test --suite nope' _ "$T/suites" "$COIL"
+expect_rc 2 "--suite without a name is rejected" \
+  bash -c 'cd "$1" && "$2" test --suite' _ "$T/suites" "$COIL"
+# Regression: discovery once sat INSIDE the argument loop, so every flag past the first
+# re-ran the whole thing — `test --list --jobs 2` listed everything twice.
+dups=$( (cd "$T/suites" && "$COIL" test --list --jobs 2 2>/dev/null) | sort | uniq -d )
+[ -z "$dups" ] && ok "a second flag does not re-run discovery" \
+  || bad "a second flag does not re-run discovery" "repeated lines: $dups"
+# lint must still recognize a non-default suite's files as test files.
+expect_rc 0 "lint understands test files in every suite, default or not" \
+  bash -c 'cd "$1" && "$2" lint' _ "$T/suites" "$COIL"
+
+# A bare [test] section keeps working untouched, and keeps its FLAT listing: a project
+# that never wrote [test.suites.…] should see no suite headers appear under it. ($T/project
+# above declares a plain [test] section.)
+(cd "$T/project" && "$COIL" test --list 2>/dev/null) | grep -qE '^[a-z-]+:$' \
+  && bad "a suite-less project keeps its flat --list" "a suite header appeared" \
+  || ok "a suite-less project keeps its flat --list"
+
+# Strict manifest validation extends to suites (tool-12): each of these is a typo that
+# would otherwise silently change WHICH tests run.
+suite_err() {
+  printf '[package]\nname="s"\nentry="src/main.coil"\n\n%b' "$2" > "$T/suites/Coil.bad"
+  expect_out "$1" "$3" bash -c 'cd "$1" && cp Coil.toml Coil.keep && cp Coil.bad Coil.toml
+    "$2" test --list; rc=$?; cp Coil.keep Coil.toml; exit $rc' _ "$T/suites" "$COIL"
+}
+suite_err "reserved for .coil test --suite all" '[test.suites.all]\nroots=["tests"]\n' \
+  "the suite name 'all' is reserved"
+suite_err "reserved for the bare \[test\] section" '[test.suites.default]\nroots=["tests"]\n' \
+  "the suite name 'default' is reserved"
+suite_err "duplicate test suite" '[test.suites.u]\nroots=["tests"]\n[test.suites.u]\nroots=["tests"]\n' \
+  "a duplicate suite is rejected"
+suite_err "invalid test suite name" '[test.suites.bad name]\nroots=["tests"]\n' \
+  "a suite name outside the identifier shape is rejected"
+suite_err "default must be true or false" '[test.suites.u]\ndefault = yes\n' \
+  "a non-boolean default is rejected"
+suite_err "unknown key 'bogus' in \[test.suites.u\]" '[test.suites.u]\nbogus=["x"]\n' \
+  "an unknown key inside a suite is rejected"
+# A root the manifest NAMED must exist — otherwise a typo discovers nothing and reports
+# a green run, which is the one failure mode a test runner must never have.
+# Located at the roots KEY (line 6), not the section header above it.
+suite_err "Coil.toml:6: test suite 'u': root 'tests/nope' does not exist" \
+  '[test.suites.u]\nroots=["tests/nope"]\n' \
+  "a declared root that does not exist is a located configuration error"
+# The bare [test] section locates the same way, via its own roots key.
+suite_err "Coil.toml:6: test suite 'default': root 'tests/nope' does not exist" \
+  '[test]\nroots=["tests/nope"]\n' \
+  "a legacy [test] root that does not exist is located at its roots key"
+rm -f "$T/suites/Coil.bad" "$T/suites/Coil.keep"
+
 mkdir -p "$T/bad-native/src" "$T/bad-native/native"
 printf '[package]\nname="bad"\nentry="src/main.coil"\n[cc]\nsources=["native/bad.c"]\n' > "$T/bad-native/Coil.toml"
 printf '(defn main [] (-> i64) 0)\n' > "$T/bad-native/src/main.coil"
