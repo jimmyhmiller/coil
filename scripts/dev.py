@@ -190,6 +190,22 @@ def test_modernize_fast(compiler: str) -> None:
                 "--backend", "arm64", "-o", str(hosted_test))
         execute(str(hosted_test))
 
+        # An implicit place for an aggregate-valued let inside a loop belongs to
+        # the function frame. It must not become a dynamic alloca at the binding
+        # site and consume stack on every backedge.
+        aggregate_source = "tests/compiler/features/aggregate_loop_stack.coil"
+        for opt in ("-O0", "-O3"):
+            aggregate_test = tmp / f"aggregate-loop-{opt[1:].lower()}"
+            execute(str(candidate), "build", aggregate_source, opt, "-o", str(aggregate_test))
+            execute(str(aggregate_test))
+        aggregate_ir = subprocess.run(
+            [str(candidate), "emit-ir", aggregate_source], cwd=ROOT,
+            stdout=subprocess.PIPE, text=True, check=True).stdout
+        main_ir = aggregate_ir.split("define i64 @main", 1)[1].split("\n}", 1)[0]
+        loop_ir = main_ir.split("loop.body:", 1)[1]
+        if "alloca " in loop_ir:
+            raise SystemExit("fast modernization gate: aggregate loop contains a dynamic alloca")
+
         # Public comparisons in static-assert must remain constant expressions.
         static_test = tmp / "static-assert"
         execute(str(candidate), "build", "src/examples/bitfields.coil", "--backend", "arm64",
