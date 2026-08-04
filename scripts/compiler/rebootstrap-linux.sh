@@ -20,6 +20,8 @@
 # bootstrap/seeds/native/linux-ir/NOTES.md.
 #
 # Usage: scripts/compiler/rebootstrap-linux.sh [install-dest]   (default dest: build/bin/coil)
+# A successful verification also installs the artifact as the user-level `coil`
+# selected by `scripts/dev.py install`. No install occurs until every gate passes.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 SRC=src/compiler/main.coil
@@ -93,3 +95,6 @@ DEST="${1:-build/bin/coil}"
 mkdir -p "$(dirname "$DEST")"
 cp /tmp/coil-lrb2 "$DEST"
 echo "=== VERIFIED self-host compiler installed -> $DEST ==="
+python3 scripts/dev.py install --source "$DEST" \
+  || { echo "global install FAILED"; exit 1; }
+echo "=== VERIFIED self-host compiler installed globally ==="

@@ -49,7 +49,7 @@ diagnostic instead of doing nothing.
 ## Full: LLVM + arm64 backends
 
 ```sh
-python3 scripts/dev.py build full          # builds + verifies + installs build/bin/coil
+python3 scripts/dev.py build full          # verifies, then installs locally and globally
 ```
 
 Uses the committed seed `bootstrap/seeds/native/coil-seed`. This is the complete compiler
@@ -57,11 +57,15 @@ Uses the committed seed `bootstrap/seeds/native/coil-seed`. This is the complete
 the arm64 backend does the codegen — the compiler *embeds* an LLVM backend
 (`codegen.coil` FFIs into the LLVM-C API). **Requirements:** `libLLVM.dylib`
 (`brew install llvm`) + `cc`. Force a specific stage0 with `STAGE0=/path/to/coil`.
+After every gate succeeds, the bootstrap installs the same verified artifact at
+`build/bin/coil` and as the user-level `coil` command. It updates an existing
+user-owned `coil` on `PATH` (for example `~/.cargo/bin/coil`), otherwise it uses
+`~/.local/bin/coil`. A failed bootstrap does not update either destination.
 
 ## Install globally
 
-Once a compiler artifact exists at `build/bin/coil`, install it as the user-level
-`coil` command with:
+To reinstall an existing compiler artifact without rerunning the full bootstrap,
+install `build/bin/coil` as the user-level `coil` command with:
 
 ```sh
 python3 scripts/dev.py install

@@ -140,6 +140,15 @@ def test_modernize_fast(compiler: str) -> None:
                 "--backend", "arm64", "-o", str(ambient_test))
         execute(str(ambient_test))
 
+        for rejected in (
+                "tests/compiler/features/nonambient_primitive_rejected.coil",
+                "tests/compiler/features/nonambient_alloc_rejected.coil"):
+            result = subprocess.run(
+                [str(candidate), "check", rejected], cwd=ROOT,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode == 0:
+                raise SystemExit(f"fast modernization gate: non-ambient operation compiled: {rejected}")
+
         # Namespace forwarding is compiler name-resolution work, so keep facade
         # regressions in the bounded inner loop instead of discovering them in a
         # full release rebootstrap.

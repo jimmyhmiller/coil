@@ -22,6 +22,8 @@
 #
 # Usage: scripts/compiler/rebootstrap.sh [install-dest]      (default dest: build/bin/coil)
 #        STAGE0=/path/to/coil scripts/compiler/rebootstrap.sh
+# A successful verification installs both install-dest and the user-level `coil`
+# selected by `scripts/dev.py install`. No install occurs until every gate passes.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 SRC=src/compiler/main.coil
@@ -131,3 +133,6 @@ cp /tmp/coil-rl3 "$DEST"
 # kernel SIGKILLs a mis-signed binary. Re-sign so the installed compiler runs.
 codesign -s - --force "$DEST" >/dev/null 2>&1 || true
 echo "=== VERIFIED self-host compiler installed -> $DEST ==="
+python3 scripts/dev.py install --source "$DEST" \
+  || { echo "global install FAILED"; exit 1; }
+echo "=== VERIFIED self-host compiler installed globally ==="

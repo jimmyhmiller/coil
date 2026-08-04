@@ -78,7 +78,22 @@ $COIL run $D/genrefl_test.coil >/dev/null 2>&1; rc=$?
 [ $rc -eq 111 ] || { echo "generic reflection FAILED (exit $rc, want 111)"; exit 1; }
 echo "generic-reflection: OK (substituted field types match; exit 111)"
 
-echo "=== 10. A GUI AT COMPILE TIME: the Mandelbrot viewer metaprogram ==="
+echo "=== 9b. VARIANT-PAYLOAD REFLECTION: code-variant-field-name/-type ==="
+$COIL run $D/variantrefl_test.coil >/dev/null 2>&1; rc=$?
+[ $rc -eq 42 ] || { echo "variant-payload reflection FAILED (exit $rc, want 42)"; exit 1; }
+echo "variant-reflection: OK (names + structured field types; exit 42)"
+
+echo "=== 10. BEFORE-EXPAND CHECKER: measure the author's raw syntax depth ==="
+$COIL run $D/before_expand_depth.coil > "$OUT/before-expand.txt" 2>&1; rc=$?
+[ $rc -eq 0 ] || { cat "$OUT/before-expand.txt"; echo "before-expand depth checker FAILED"; exit 1; }
+grep -q "before-expand observed raw depth 3" "$OUT/before-expand.txt" || {
+  cat "$OUT/before-expand.txt"
+  echo "before-expand checker did not observe the raw macro tree"
+  exit 1
+}
+echo "before-expand checker: OK (raw nested macro-call depth = 3)"
+
+echo "=== 11. A GUI AT COMPILE TIME: the Mandelbrot viewer metaprogram ==="
 echo "       a Cocoa window opens ON THE MAIN THREAD during expansion, renders the"
 echo "       set live, and the accepted view's coordinates become the program's"
 echo "       constants (COIL_MANDEL_AUTO=1 scripts the session; drop it to drive"
@@ -90,7 +105,7 @@ grep -q "COMPILE-TIME GUI" "$OUT/mandel.txt" || { echo "mandelbrot output missin
 head -6 "$OUT/mandel.txt"
 echo "compile-time GUI: OK"
 
-echo "=== 11. A BORROW CHECKER DIALECT: linear ownership, veto on misuse ==="
+echo "=== 12. A BORROW CHECKER DIALECT: linear ownership, veto on misuse ==="
 echo "       own_ok.coil (valid, incl. a shadowed resource) compiles + runs;"
 echo "       own_bad.coil is VETOED with located use-after-release + double-release"
 $COIL run $D/own_ok.coil >/dev/null 2>&1; rc=$?
@@ -101,11 +116,11 @@ ua=$(grep -c "error: use after release" "$OUT/own.txt"); dr=$(grep -c "error: do
 [ "$ua" -eq 1 ] && [ "$dr" -eq 1 ] || { cat "$OUT/own.txt"; echo "expected 1 use-after + 1 double-release, got $ua/$dr"; exit 1; }
 echo "borrow-checker dialect: OK (valid runs; bad vetoed with 2 located errors)"
 
-echo "=== 12. TRANSPARENT GC: normal code, ZERO annotations, transform inserts it all ==="
+echo "=== 13. TRANSPARENT GC: normal code, ZERO annotations, transform inserts it all ==="
 echo "       demo.coil writes cons-list code with no ptr, no alloc call, no roots;"
 echo "       gcauto.coil rewrites Pair->ptr, allocates, and AUTO-ROOTS across every"
 echo "       allocation. The collector reclaims: 100000 cells allocated, 50 peak live"
-( cd transparent-gc && "$ABSCOIL" run demo.coil > "$OUT/tgc.txt" 2>&1 ); rc=$?
+( cd src/experiments/transparent-gc && "$ABSCOIL" run demo.coil > "$OUT/tgc.txt" 2>&1 ); rc=$?
 grep -q "sum=2450000" "$OUT/tgc.txt" || { cat "$OUT/tgc.txt"; echo "transparent gc wrong result"; exit 1; }
 grep -q "peak_live=50 " "$OUT/tgc.txt" || { cat "$OUT/tgc.txt"; echo "transparent gc did not reclaim (peak should be 50)"; exit 1; }
 cat "$OUT/tgc.txt"

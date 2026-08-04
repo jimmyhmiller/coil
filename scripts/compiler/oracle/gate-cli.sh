@@ -234,6 +234,28 @@ printf '(module migrate)\n(import "unrelated/place/anything.coil" :use *)\n(defn
 grep -q '(import "unrelated/place/anything.coil" :use \*)' "$T/sib/src/migrate.coil" \
   && ok "lint --fix rolls back a preflight import migration when semantic checking fails" \
   || bad "transactional preflight migration" "broken file was left partially rewritten"
+# Namespace-owner migrations are one transaction too: add missing aliases alongside
+# the rewritten calls, otherwise the retry fails resolution and rolls everything back.
+printf '(module owner-migrate)\n(defn main [] (-> i64) (let [p (stack i64)] (store! p (ior 40 2)) (load p)))\n' \
+  > "$T/sib/src/owner-migrate.coil"
+"$COIL" lint "$T/sib/src/owner-migrate.coil" --fix --allow-dirty >/dev/null 2>&1
+grep -q '(import "coil.alloc" :as alloc)' "$T/sib/src/owner-migrate.coil" \
+  && grep -q '(import "coil.primitive" :as primitive)' "$T/sib/src/owner-migrate.coil" \
+  && grep -q '(alloc/stack i64)' "$T/sib/src/owner-migrate.coil" \
+  && grep -q '(primitive/ior 40 2)' "$T/sib/src/owner-migrate.coil" \
+  && ok "lint --fix adds missing owner imports with primitive/allocation rewrites" \
+  || bad "owner import migration" "missing import or qualified replacement"
+expect_rc 42 "owner-import migration still runs" "$COIL" run "$T/sib/src/owner-migrate.coil"
+
+printf '(module owner-alias-migrate)\n(import "coil.alloc" :as memory)\n(import "coil.primitive" :as metal)\n(defn main [] (-> i64) (let [p (stack i64)] (store! p (ior 40 2)) (load p)))\n' \
+  > "$T/sib/src/owner-alias-migrate.coil"
+"$COIL" lint "$T/sib/src/owner-alias-migrate.coil" --fix --allow-dirty >/dev/null 2>&1
+grep -q '(memory/stack i64)' "$T/sib/src/owner-alias-migrate.coil" \
+  && grep -q '(metal/ior 40 2)' "$T/sib/src/owner-alias-migrate.coil" \
+  && [ "$(grep -c 'coil.alloc' "$T/sib/src/owner-alias-migrate.coil")" = 1 ] \
+  && [ "$(grep -c 'coil.primitive' "$T/sib/src/owner-alias-migrate.coil")" = 1 ] \
+  && ok "lint --fix reuses existing owner aliases without duplicate imports" \
+  || bad "owner alias migration" "existing aliases were not reused"
 # The PRELUDE + bundled libs are self-contained: their imports resolve to the BUNDLED
 # stdlib, never to same-named decoys sitting in the entry file's directory. A naive
 # file-relative switch made the prelude's control.coil->print->io chain resolve to
@@ -952,6 +974,19 @@ EOF
 expect_rc 1  "coil test: a failing suite exits 1"                         "$COIL" test "$T/redf.coil"
 expect_out "0 passed; 1 failed" "coil test: reports the failure count"    "$COIL" test "$T/redf.coil"
 expect_out "discovers every \(deftest" "coil test --help documents itself" "$COIL" test --help
+mkdir -p "$T/test-cleanup"
+expect_rc 0 "coil test: a passing suite cleans its invocation-local runner" \
+  bash -c 'cd "$1" && "$2" test "$3" >/dev/null' _ "$T/test-cleanup" "$COIL" "$T/noimp.coil"
+[ ! -d "$T/test-cleanup/.coil/build/test" ] \
+  || [ -z "$(find "$T/test-cleanup/.coil/build/test" -mindepth 1 -print -quit)" ] \
+  && ok "coil test leaves no runner artifacts after execution" \
+  || bad "coil test leaves no runner artifacts after execution" "runner artifact remains"
+expect_rc 0 "coil test --no-run cleans its invocation-local runner" \
+  bash -c 'cd "$1" && "$2" test "$3" --no-run >/dev/null' _ "$T/test-cleanup" "$COIL" "$T/noimp.coil"
+[ ! -d "$T/test-cleanup/.coil/build/test" ] \
+  || [ -z "$(find "$T/test-cleanup/.coil/build/test" -mindepth 1 -print -quit)" ] \
+  && ok "coil test --no-run leaves no runner artifacts" \
+  || bad "coil test --no-run leaves no runner artifacts" "runner artifact remains"
 
 echo "== project workflows: test/check/fmt/lint/verify + native graph =="
 mkdir -p "$T/project/src" "$T/project/tests" "$T/project/native"
@@ -965,6 +1000,15 @@ source-roots = ["src", "tests"]
 sources = ["native/answer.c"]
 include-dirs = ["native"]
 flags = ["-std=c11", "-Wall", "-Werror"]
+
+[link]
+EOF
+if [ "$HOST_OS" = Darwin ]; then
+  printf 'flags = ["-Wl,-dead_strip"]\n' >> "$T/project/Coil.toml"
+else
+  printf 'flags = ["-Wl,--gc-sections"]\n' >> "$T/project/Coil.toml"
+fi
+cat >> "$T/project/Coil.toml" <<'EOF'
 
 [test]
 roots = ["tests"]
@@ -988,7 +1032,12 @@ cat > "$T/project/tests/native_test.coil" <<'EOF'
 EOF
 cat > "$T/project/tests/second_test.coil" <<'EOF'
 (module second_test)
-(deftest second-suite (assert-eq (+ 20 22) 42))
+(defn generate-second-suite [] (-> Code)
+  `(do
+     (const GENERATED_TEST_VALUE 42)
+     (defn generated-test-value [] (-> i64) GENERATED_TEST_VALUE)))
+(meta (generate-second-suite))
+(deftest second-suite (assert-eq (generated-test-value) 42))
 EOF
 "$COIL" fmt --write "$T/project/src/main.coil" "$T/project/tests/native_test.coil" \
   "$T/project/tests/second_test.coil" >/dev/null
@@ -1000,6 +1049,8 @@ expect_rc 0 "project test --jobs runs independent suites concurrently" \
   bash -c 'cd "$1" && "$2" test --jobs 2' _ "$T/project" "$COIL"
 expect_rc 0 "project test --no-run compiles and links every suite" \
   bash -c 'cd "$1" && "$2" test --no-run' _ "$T/project" "$COIL"
+expect_rc 0 "project build preserves commas inside a quoted link flag" \
+  bash -c 'cd "$1" && "$2" build >/dev/null' _ "$T/project" "$COIL"
 expect_rc 2 "coil test rejects a user-owned -o instead of running stale output" \
   bash -c 'cd "$1" && "$2" test tests/native_test.coil -o nope' _ "$T/project" "$COIL"
 expect_rc 0 "project check covers entry and test monomorphizations" \
