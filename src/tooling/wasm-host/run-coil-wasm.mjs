@@ -356,7 +356,7 @@ const env = {
   // the fs I/O this harness already provides. Run the command on the host and return
   // its exit status so `build` completes end to end.
   mmap: trap('mmap'), munmap: trap('munmap'), mprotect: trap('mprotect'),
-  dlopen: trap('dlopen'), dlsym: trap('dlsym'),
+  dlopen: trap('dlopen'), dlsym: trap('dlsym'), dlerror: trap('dlerror'),
   system: (cmdPtr) => {                              // returns i32 (a JS Number, not BigInt)
     const cmd = cstr(cmdPtr);
     try { execSync(cmd, { stdio: 'inherit' }); return 0; }

@@ -40,6 +40,10 @@
 
 (extern dlopen :cc c [(ptr i8) i64] (-> (ptr i8)))
 (extern dlsym :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+; The dylib links with `-undefined dynamic_lookup`, so a symbol that no `--link-flag`
+; supplied survives the LINK and only fails at dlopen. dlerror() is then the only place
+; the missing name appears — without it the user gets "dlopen failed" and nothing else.
+(extern dlerror :cc c [] (-> (ptr i8)))
 (extern system :cc c [(ptr i8)] (-> i32))
 (extern unlink :cc c [(ptr i8)] (-> i32))
 
@@ -475,7 +479,27 @@
 ; mono + build-obj + link + dlopen a self-contained comptime dylib. Unlike the macro
 ; engine's meta-build-dylib, a comptime program has NO code ops, so there is no metashim
 ; vtable handshake (coil_mp_init) — a plain dlopen suffices.
-(defn cte-build-dylib [(a (ptr Allocator)) (sub (ptr Program))] (-> (Result (ptr i8) Diag))
+; dlerror() as a slice, or "" when it has nothing to say.
+(defn cte-dlerror [(a (ptr Allocator))] (-> (slice u8))
+  (let [p (dlerror)]
+    (if (= (primitive/cast i64 p) (primitive/cast i64 0)) "" (cstr->str p))))
+
+; The message for a comptime expression whose native dependency could not be satisfied.
+; `want` is the symbol the in-memory loader tripped over, "" when we got here some other
+; way. This is the end of the line for the JIT -> dylib fallback, so it has to say what is
+; missing AND what to do about it: the fix is a linker flag, which is not something the
+; user would guess from "dlopen failed".
+(defn cte-native-dep-msg [(a (ptr Allocator)) (want (slice u8)) (why (slice u8))] (-> (slice u8))
+  (let [head
+          (if (> (slice-len [u8] want) (primitive/cast i64 0))
+              (sconcat3 a "comptime: this expression calls '" want "', which is not in the compiler process and was not supplied by a link flag")
+              "comptime: this expression needs a symbol that is not in the compiler process and was not supplied by a link flag")
+        hint " — pass the library that defines it with --link-flag (e.g. --link-flag -lfoo, or --link-flag -Wl,-force_load,/path/lib.a for a static archive); `coil test` and `coil run` forward these to the build"]
+    (if (> (slice-len [u8] why) (primitive/cast i64 0))
+        (sconcat a (sconcat3 a head ". Loader said: " why) hint)
+        (sconcat a head hint))))
+
+(defn cte-build-dylib [(a (ptr Allocator)) (sub (ptr Program)) (want (slice u8))] (-> (Result (ptr i8) Diag))
   (try (do
          (let [bb (meta-build-box)]
            (when (= (load (field bb isset)) (primitive/cast i64 0))
@@ -500,7 +524,7 @@
                        (unlink (slice->cstr a obj-s))
                        (let [h (dlopen (slice->cstr a tmp-s) 2)]
                          (if (= (primitive/cast i64 h) (primitive/cast i64 0))
-                             (Err [(ptr i8) Diag] (derr "comptime: dlopen of the compiled comptime dylib failed"))
+                             (Err [(ptr i8) Diag] (derr (cte-native-dep-msg a want (cte-dlerror a))))
                              ; the image stays mapped for the life of the process, so the file
                              ; itself is dead weight — drop it rather than litter /tmp with one
                              ; dylib per comptime site. (Unlike the METAPROGRAM dylibs, which are
@@ -526,6 +550,20 @@
 (defn mk-ct-entry [(t (ptr i8)) (s (ptr i8))] (-> CtEntry)
   (let [p (alloc/stack CtEntry)] (store! (field p thunk) t) (store! (field p status) s) (load p)))
 
+; The dylib route to the entry: a real `cc -dynamiclib` link — which means the program's
+; own `--link-flag`s apply — then dlopen + dlsym. Used when this compiler has no in-memory
+; object builder at all, AND as the retry when the in-memory image needs a symbol that
+; only a link can supply.
+(defn cte-entry-dylib [(a (ptr Allocator)) (sub (ptr Program)) (want (slice u8))] (-> (Result CtEntry Diag))
+  (match (cte-build-dylib a sub want)
+    (Err [d] (Err [CtEntry Diag] d))
+    (Ok [h]
+        (let [fp (dlsym h (slice->cstr a "coil_ct_thunk"))]
+          (if (= (primitive/cast i64 fp) (primitive/cast i64 0))
+              (Err [CtEntry Diag]
+                   (derr "comptime: compiled entry missing from the metaprogram dylib (compiler bug)"))
+              (Ok [CtEntry Diag] (mk-ct-entry fp (dlsym h (slice->cstr a "coil_ct_status")))))))))
+
 (defn cte-entry [(a (ptr Allocator)) (sub (ptr Program))] (-> (Result CtEntry Diag))
   (if (meta-mobj-available?)
       (try (do
@@ -533,7 +571,20 @@
                (sort-mono-program a mp)
                (let [(mut o) (primitive/call-ptr (load (field (meta-mobj-box) fp)) a mp)]
                  (match (jit-load a (mut o))
-                   (Err [m] (Err [CtEntry Diag] (derr m)))
+                   (Err [e0]
+                        ; The in-memory loader can only reach symbols already inside the
+                        ; compiler process. A comptime expression that calls into a native
+                        ; library the PROGRAM links has, by construction, symbols this
+                        ; process does not have — and dlopen cannot help, because the
+                        ; library is often a static archive. That is not a failure, it is
+                        ; "this one needs a real link": fall back to the dylib path, which
+                        ; already builds with the program's own `--link-flag`s. Every other
+                        ; jit-load failure is a compiler bug and stays fatal.
+                        (let [e (alloc/stack JitErr)]
+                          (store! e e0)
+                          (if (jit-err-undefined-external? e)
+                              (cte-entry-dylib a sub (load (field e undefined_external)))
+                              (Err [CtEntry Diag] (derr (load (field e msg)))))))
                    (Ok [img0]
                        (let [img (alloc/stack JitImage)]
                          (store! img img0)
@@ -542,14 +593,7 @@
                                (Err [CtEntry Diag]
                                     (derr "comptime: compiled entry missing from the in-memory image (compiler bug)"))
                                (Ok [CtEntry Diag] (mk-ct-entry fp (jit-lookup img "coil_ct_status"))))))))))))
-      (match (cte-build-dylib a sub)
-        (Err [d] (Err [CtEntry Diag] d))
-        (Ok [h]
-            (let [fp (dlsym h (slice->cstr a "coil_ct_thunk"))]
-              (if (= (primitive/cast i64 fp) (primitive/cast i64 0))
-                  (Err [CtEntry Diag]
-                       (derr "comptime: compiled entry missing from the metaprogram dylib (compiler bug)"))
-                  (Ok [CtEntry Diag] (mk-ct-entry fp (dlsym h (slice->cstr a "coil_ct_status"))))))))))
+      (cte-entry-dylib a sub "")))
 
 ; read AND CLEAR the guard cell after a run: 0 = clean, 1 = division by zero, 2 =
 ; remainder by zero. A missing symbol means the guard pass declined to instrument this
