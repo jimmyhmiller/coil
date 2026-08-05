@@ -33,6 +33,12 @@ SEED=bootstrap/seeds/native/coil-seed
 # report every namespace as declared twice. Roots must be relative to the repo
 # root; absent roots are fine (find's nonzero exit is already tolerated).
 export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts}"
+# In-repo, an import of a `coil.*` namespace that is missing from the bundled
+# stdlib manifest still resolves via the namespace scan above, so the build stays
+# green while the shipped compiler cannot serve it (this is how coil.socket,
+# coil.sync, coil.region, coil.signals and coil.cancellation went unreachable).
+# Strict mode makes that fallback a hard error for the whole build and its gates.
+export COIL_STRICT_BUNDLE="${COIL_STRICT_BUNDLE:-1}"
 # ---- THE THREE BUILDS --------------------------------------------------------
 #
 #   flavour        script                            LLVM            links

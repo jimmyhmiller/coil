@@ -398,6 +398,14 @@ that have nothing to do with the change.
 
 Pin the input with `COIL_STDLIB_DIR=$PWD` on **both** sides. Everything below does.
 
+> **The measurements on this page predate a fix to that override and should be
+> re-taken before being relied on.** `bundled-text` read `$COIL_STDLIB_DIR/lib`,
+> a directory that has never existed — the stdlib is `src/stdlib` — so setting the
+> variable silently changed nothing and both sides compiled their own embedded
+> copies. The prelude override used the correct path throughout, so only
+> `src/stdlib/` inputs were unpinned. The loader now rejects a root without
+> `src/stdlib` instead of falling back, so the failure cannot recur silently.
+
 This artifact produced two wrong conclusions before it was caught, both of which had been
 written into this document as findings:
 
