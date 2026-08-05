@@ -83,6 +83,19 @@ Options, roughly in order of payoff per effort: cache per-module expansion and I
 parallel codegen; use the arm64 backend as the fast debug path (it is already ~17× faster
 than LLVM on the compiler itself); then attack incremental mono.
 
+One cheap win sitting inside mono: `seed-concrete-funcs` (`mono.coil:1065`) seeds the
+worklist with *every* non-generic function in the program, so an empty `main` still
+monomorphizes and emits 214 LLVM functions that `globaldce` then deletes. Mono's worklist
+already is a precise, type-aware reachability analysis — seeding it from roots (`main`,
+`export-c` entries, `deftest`s, plus an explicit keep list for asm/linker-script
+references) would let it drop dead code before codegen instead of after. Two latent gaps
+have to close first, both harmless while everything is seeded: `EFnPtrOf` (`mono.coil:711`)
+never queues its target, and `EMakeDyn` (`mono.coil:733`) ignores its `methods` list, which
+is exactly the vtable contents. The wasm collector `wcollect-expr!`
+(`codegen_wasm.coil:492`) has the same `EMakeDyn` omission today, which is an independent
+wasm+`dyn` bug. Binary size would not change — only compile time. Expect a whole-corpus
+snapshot re-bless.
+
 ### 2.3 Windows
 
 macOS arm64 and Linux x86-64 only. Windows needs PE/COFF and the MS x64 ABI. This is the

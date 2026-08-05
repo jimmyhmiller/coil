@@ -165,6 +165,25 @@ def test_modernize_fast(compiler: str) -> None:
             if result.returncode == 0:
                 raise SystemExit(f"fast modernization gate: non-ambient operation compiled: {rejected}")
 
+        # Refer control (:exclude / :rename / explicit coil.core import). The refer rules
+        # live in one predicate but are consulted by four separate passes, so each surface
+        # gets its own fixture: a name hidden from the resolver while the trait method
+        # stayed callable would be worse than not having the feature.
+        refer_test = tmp / "refer-control"
+        execute(str(candidate), "build", "tests/compiler/features/refer_control.coil",
+                "--backend", "arm64", "-o", str(refer_test))
+        execute(str(refer_test))
+        for positive in ("refer_no_core", "refer_core_qualified"):
+            execute(str(candidate), "check", f"tests/compiler/features/{positive}.coil")
+        for surface in ("value", "macro", "method", "alias"):
+            rejected = f"tests/compiler/features/refer_exclude_{surface}_rejected.coil"
+            result = subprocess.run(
+                [str(candidate), "check", rejected], cwd=ROOT,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode == 0:
+                raise SystemExit(
+                    f"fast modernization gate: an excluded name survived on the {surface} surface: {rejected}")
+
         # Namespace forwarding is compiler name-resolution work, so keep facade
         # regressions in the bounded inner loop instead of discovering them in a
         # full release rebootstrap.

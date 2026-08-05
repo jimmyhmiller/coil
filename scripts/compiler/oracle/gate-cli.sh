@@ -1267,6 +1267,99 @@ expect_rc 3 "nullary-variant sum comptime reads back (tag is 4 bytes, not 8)" "$
 printf '(defstruct HasPtr [(p (ptr i8)) (n i64)])\n(defn main [] (-> i64) (let [h (comptime (let [q (coil.alloc/stack HasPtr)] (coil.primitive/store! (coil.primitive/field q n) (coil.primitive/sizeof i64)) (coil.primitive/load q)))] (coil.primitive/load (coil.primitive/field h n))))\n' > "$T/ct_agg_ptr.coil"
 expect_rc 1 "raw-pointer aggregate comptime declines cleanly (no silently-wrong fold)" "$COIL" run "$T/ct_agg_ptr.coil"
 
+echo "== comptime reaching a NATIVE library: the in-memory loader falls back to a real link =="
+# The in-memory JIT resolves undefined symbols with dlsym(RTLD_DEFAULT), so it can only
+# reach code already inside the compiler process. A comptime expression that calls into a
+# library the PROGRAM links therefore failed outright with
+#   jit: undefined symbol '_x' is not present in the compiler process
+# even though the very same code builds and runs as an executable. dlopen cannot rescue
+# it either, because the library is typically a STATIC ARCHIVE. The fix is to retry
+# through the dylib path, which already links with the program's own --link-flags.
+mkdir -p "$T/ffi"
+printf 'long gate_native_answer(void) { return 42; }\n' > "$T/ffi/lib.c"
+cc -c "$T/ffi/lib.c" -o "$T/ffi/lib.o" && ar rcs "$T/ffi/libgatenative.a" "$T/ffi/lib.o"
+cat > "$T/ffi/prog.coil" <<'EOF'
+(module ffiprog)
+(extern gate_native_answer :cc c [] (-> i64))
+(defn wrapped [] (-> i64) (gate_native_answer))
+(defn main [] (-> i64) (comptime (wrapped)))
+EOF
+cat > "$T/ffi/ffi_test.coil" <<'EOF'
+(module ffitest)
+(import "coil.assert" :use *)
+(extern gate_native_answer :cc c [] (-> i64))
+(defn wrapped [] (-> i64) (gate_native_answer))
+(defn folded [] (-> i64) (comptime (wrapped)))
+(deftest comptime-reaches-a-native-library (assert-eq (folded) 42))
+(deftest runtime-reaches-a-native-library (assert-eq (wrapped) 42))
+EOF
+if [ "$HOST_OS" = Darwin ]; then
+  # The reported shape end to end: `coil test`, a STATIC ARCHIVE force-loaded (which
+  # dlopen could never have served — hence a link, not a load), one deftest that folds at
+  # comptime and one that calls at runtime.
+  expect_out "2 passed; 0 failed" "coil test: a deftest reaches a native library at comptime AND at runtime" \
+    "$COIL" test "$T/ffi/ffi_test.coil" --link-flag "-Wl,-force_load,$T/ffi/libgatenative.a"
+  # Separate fix, separate place: only `build` forwarded --link-flag to the comptime
+  # link, so `check`/`emit-ir` accepted the flag and ignored it — failing on a program
+  # `build` compiles fine.
+  expect_rc 0 "coil check applies --link-flag to the comptime link" \
+    "$COIL" check "$T/ffi/prog.coil" --link-flag "-L$T/ffi" --link-flag -lgatenative
+else
+  ok "native-library comptime fallback (macOS/arm64 in-memory loader only) — skipped on $HOST_OS"
+fi
+
+echo "== a metaprogram's unquoted bytes are COPIED, not borrowed =="
+# `~<slice>` used to keep the METAPROGRAM's pointer inside the Sexp, and the compiler
+# read it at codegen — long after the generator returned. A slice over a string literal
+# survived (the metaprogram image stays mapped); a slice over a stack array in the
+# generator was a dead frame by then: `coil check` passed and `coil build` died with
+# SIGSEGV and no diagnostic. The quiet version of that is a miscompile.
+cat > "$T/unq_stack.coil" <<'EOF'
+(module unqstack)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(defn gen [] (-> Code)
+  (let [(mut s) (zeroed (array u8 4))]
+    (store! (index (mut s) 0) (cast u8 \a))
+    (store! (index (mut s) 1) (cast u8 \b))
+    (store! (index (mut s) 2) (cast u8 \c))
+    (store! (index (mut s) 3) (cast u8 \d))
+    `(defn lit [] (-> (slice u8)) ~(slice-new [u8] (index (mut s) 0) 4))))
+(meta (gen))
+(defn main [] (-> i64) (slice-len (lit)))
+EOF
+expect_rc 4 "a slice over the GENERATOR'S STACK unquotes correctly (was SIGSEGV)" \
+  "$COIL" run "$T/unq_stack.coil"
+cat > "$T/unq_static.coil" <<'EOF'
+(module unqstatic)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(defn gen [] (-> Code) `(defn lit [] (-> (slice u8)) ~(subslice "hello" 0 4)))
+(meta (gen))
+(defn main [] (-> i64) (slice-len (lit)))
+EOF
+expect_rc 4 "a slice over static bytes still unquotes (no regression)" \
+  "$COIL" run "$T/unq_static.coil"
+
+echo "== pipeline dumps resolve project namespaces, like check/build =="
+# `expand` (and the dump-* commands) build their LS in expander.coil, which never built
+# the namespace index the driver's own pipeline entries build — so an import that `check`
+# resolved fine was "not found in the project" under `expand`, the one command you most
+# want when debugging a code generator.
+mkdir -p "$T/nsproj/src"
+cat > "$T/nsproj/Coil.toml" <<'EOF'
+[package]
+name = "nsproj"
+entry = "src/main.coil"
+source-roots = ["src"]
+EOF
+printf '(module nsproj.lib)\n(defn tag [] (-> i64) 7)\n' > "$T/nsproj/src/lib.coil"
+printf '(module nsproj.app)\n(import "nsproj.lib" :use *)\n(defn main [] (-> i64) (tag))\n' > "$T/nsproj/src/app.coil"
+expect_rc 0 "coil expand resolves a project namespace from Coil.toml source-roots" \
+  bash -c 'cd "$1" && "$2" expand src/app.coil >/dev/null' _ "$T/nsproj" "$COIL"
+expect_rc 0 "coil check agrees (the two must not disagree about the same import)" \
+  bash -c 'cd "$1" && "$2" check src/app.coil' _ "$T/nsproj" "$COIL"
+
 echo "== C size types are target-width: the prelude's size_t/ssize_t are i32 on wasm32 =="
 # `usize`/`isize` (a C machine word: size_t/ssize_t/long) are i32 on wasm32 (ILP32) and
 # i64 on LP64. The prelude's write/read/malloc size args use `isize`, so on wasm32 they
@@ -1607,6 +1700,80 @@ expect_rc 1 "lint --fix: a fix that does not compile fails the run" \
 cmp -s "$T/lint/victim.coil" "$T/lint/victim.orig" \
   && ok "lint --fix: the reverted round left the file byte-identical" \
   || bad "lint --fix: the reverted round left the file byte-identical" "the file was left broken"
+
+echo "== bundled stdlib manifest =="
+# The manifest in src/compiler/embedded_stdlib.coil decides which namespaces a
+# compiler binary can serve when it runs OUTSIDE this repo. In-repo the loader
+# falls back to scanning the source tree, so an omission is completely invisible
+# here — coil.socket, coil.sync, coil.region, coil.signals and coil.cancellation
+# all shipped unreachable that way. Hence a gate rather than review.
+expect_rc 0 "manifest: generated tables match src/stdlib/" \
+  python3 scripts/compiler/gen-embedded-stdlib.py --check
+
+# The contract, tested the way a user meets it: from a directory that is not this
+# repo, with every source-tree override unset, each advertised namespace resolves.
+# coil.core is excluded — it lives in the prelude and is auto-referred, not imported.
+mkdir -p "$T/bundle"
+"$COIL" namespaces > "$T/bundle/ns.txt" 2>/dev/null
+# `--check` above compares the manifest SOURCE to src/stdlib/. This compares what
+# the compiler under test actually carries, which also catches gating a binary
+# built from older source. The reachability check below cannot cover this: it
+# derives its import list from the binary's own advertisement, so a namespace
+# missing from every table would leave it silently testing one namespace less.
+python3 scripts/compiler/gen-embedded-stdlib.py --print-namespaces > "$T/bundle/ns-want.txt"
+if diff -u "$T/bundle/ns-want.txt" "$T/bundle/ns.txt" > "$T/bundle/ns.diff" 2>&1; then
+  ok "manifest: the compiler advertises exactly the namespaces in src/stdlib/"
+else
+  bad "manifest: the compiler advertises exactly the namespaces in src/stdlib/" \
+      "$(head -20 "$T/bundle/ns.diff")"
+fi
+{
+  echo '(module allns)'
+  i=0
+  while read -r ns; do
+    [ -n "$ns" ] || continue
+    [ "$ns" = "coil.core" ] && continue
+    i=$((i + 1))
+    echo "(import \"$ns\" :as ns$i)"
+  done < "$T/bundle/ns.txt"
+  echo '(defn main [] (-> i64) 0)'
+} > "$T/bundle/allns.coil"
+NSN=$(grep -c '^(import' "$T/bundle/allns.coil")
+# A guard on the guard: if `coil namespaces` ever returns nothing, the import file
+# would be empty and would "pass" while testing nothing at all.
+[ "$NSN" -ge 40 ] \
+  && ok "manifest: coil namespaces advertises $NSN importable namespaces" \
+  || bad "manifest: coil namespaces advertises a plausible set" "got $NSN, expected >= 40"
+expect_rc 0 "manifest: every advertised namespace resolves outside the repo" \
+  bash -c 'cd "$1" && env -u COIL_STDLIB_DIR -u COIL_NAMESPACE_ROOTS "$2" check allns.coil' \
+  _ "$T/bundle" "$COIL"
+
+# COIL_STRICT_BUNDLE removes the in-repo asymmetry: a coil.* namespace served by
+# the source-tree scan is the exact bug shape above, so under the flag it is an
+# error at the import site instead of a success that only breaks for users.
+mkdir -p "$T/strict"
+printf '(module coil.gatetmp)\n(defn gt [] (-> i64) 0)\n' > "$T/strict/gatetmp.coil"
+printf '(module m)\n(import "coil.gatetmp" :as g)\n(defn main [] (-> i64) (g/gt))\n' > "$T/strict/m.coil"
+expect_rc 0 "strict-bundle: off, an unbundled coil.* still resolves from the tree" \
+  bash -c 'cd "$1" && env -u COIL_STDLIB_DIR -u COIL_STRICT_BUNDLE COIL_NAMESPACE_ROOTS=. "$2" check m.coil' \
+  _ "$T/strict" "$COIL"
+expect_rc 1 "strict-bundle: on, an unbundled coil.* is an error" \
+  bash -c 'cd "$1" && env -u COIL_STDLIB_DIR COIL_NAMESPACE_ROOTS=. COIL_STRICT_BUNDLE=1 "$2" check m.coil' \
+  _ "$T/strict" "$COIL"
+expect_out "missing from the bundled stdlib manifest" \
+  "strict-bundle: the error names the manifest, not the namespace lookup" \
+  bash -c 'cd "$1" && env -u COIL_STDLIB_DIR COIL_NAMESPACE_ROOTS=. COIL_STRICT_BUNDLE=1 "$2" check m.coil' \
+  _ "$T/strict" "$COIL"
+
+# COIL_STDLIB_DIR names a checkout ROOT. It used to be read as $DIR/lib, which
+# exists nowhere, so the override silently did nothing and every stdlib edit
+# appeared to have no effect.
+expect_rc 0 "COIL_STDLIB_DIR: a real checkout root is accepted" \
+  bash -c 'cd "$1" && env -u COIL_NAMESPACE_ROOTS COIL_STDLIB_DIR="$3" "$2" check allns.coil' \
+  _ "$T/bundle" "$COIL" "$PWD"
+expect_rc 1 "COIL_STDLIB_DIR: a root without src/stdlib is an error, not a silent no-op" \
+  bash -c 'cd "$1" && env -u COIL_NAMESPACE_ROOTS COIL_STDLIB_DIR="$1" "$2" check allns.coil' \
+  _ "$T/bundle" "$COIL"
 
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"

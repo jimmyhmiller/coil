@@ -18,6 +18,8 @@ names), `f65ab9213` (trait methods + the undefined-reference check).
 (import "coil.control" :use *)        ; refer ALL of control's exported names
 (import "coil.slice"   :use [slice-for push])  ; refer just these
 (import "coil.io"      :as io)        ; qualified access only: (io/print …)
+(import "coil.str"     :use * :exclude [len])       ; all but these
+(import "coil.str"     :use * :rename [[len str-len]])  ; refer under a local name
 (export foo Bar)                          ; what THIS module exposes (default: all public)
 ```
 
@@ -35,6 +37,11 @@ directory placement do not participate in identity.
   model, where importing a file dumped its macros into the global namespace.
 - `:use *` / `:use [names]` = Clojure's `:refer :all` / `:refer [names]`.
 - `:as alias` enables `alias/name`.
+- `:exclude [names]` subtracts from `:use *`. Pairing it with `:use [names]` is an error
+  (that is already a whitelist), reported at the import site.
+- `:rename [[from to] …]` refers the target's `from` under the local name `to`. Renaming
+  REPLACES: the bare `from` stops being referred. Pairs rather than a map literal because
+  the reader has no `{}` form.
 
 ## What is namespaced
 
@@ -60,9 +67,14 @@ In order:
 1. **M's own** definitions → `M.name`.
 2. A bare **extern** → left as-is (C symbol).
 3. A **`:use`d** module's *exported* name → `target.name`.
-4. **`coil.core`** (auto-referred) → `coil.core.name`.
+4. **`coil.core`** — the lowest-precedence tier, referred by every module implicitly →
+   `coil.core.name`.
 5. Otherwise: for a **call**, a hard "undefined function" error (see gating below);
    for other positions, left bare for a later pass.
+
+Steps 3 and 4 both go through one predicate, `use-refers` in `src/compiler/loader.coil`,
+which is where `:use`/`:exclude`/`:rename` are interpreted. Core sits at step 4 rather
+than step 3, so an explicitly `:use`d module still shadows core.
 
 `alias/name` skips straight to M's `:as` aliases (export-checked). A `.`-qualified
 head (`coil.control.for`) is hygiene-generated and trusted as already-resolved.
@@ -82,6 +94,62 @@ auto-loaded. It defines the operator traits (`Eq`/`Hash`/`Add`/`Sub`/`Mul`/`Div`
 any module with **no import** — exactly like `clojure.core`. The auto-refer is the
 last step of name resolution. Diagnostics strip the `coil.core.` prefix so errors read
 `Eq`, not `coil.core.Eq`.
+
+### Opting out of core
+
+Every module behaves as if it began with `(import "coil.core" :use *)`. Writing **any**
+explicit `(import "coil.core" …)` **replaces** that implicit line outright — no merging,
+no stacking. This is Clojure's `:refer-clojure` rule.
+
+```lisp
+(import "coil.core" :use * :exclude [len get])   ; everything but these two
+(import "coil.core" :use [Eq Ord Option Result]) ; a whitelist ( = `:refer-clojure :only`)
+(import "coil.core" :use [])                     ; no core at all
+(import "coil.core" :as core :use [])            ; nothing bare; `core/Option` still works
+```
+
+An `:exclude`/`:use` entry matches a **definition name**, a **trait name**, or a **method
+name**. Naming a trait affects all of its methods; naming a method affects only that one:
+
+```lisp
+(import "coil.core" :use * :exclude [Ord])   ; drops <, <=, >, >= together
+(import "coil.core" :use * :exclude [<])     ; drops only <
+```
+
+Parser-level forms are not names and are unaffected by any of this: `module` `import`
+`export` `defn` `def` `let` `if` `loop` `break` `continue` `block` `do` `defstruct`
+`defsum` `deftrait` `impl` `deftest` `meta` `comptime`. Same as Clojure, where
+`(:refer-clojure :only [])` still leaves you `def`/`if`/`let*`. So a module with
+`(import "coil.core" :use [])` still has the special forms, its own imports and
+`(import "coil.primitive" :as primitive)` — a usable freestanding dialect, and how
+`prelude.coil` itself is written.
+
+**This is a naming feature, not a size feature.** Tree shaking is unchanged and already
+works: `main` and `(export-c …)` targets get external linkage, everything else is
+`internal`, and LLVM `globaldce` + `-dead_strip`/`--gc-sections` drop whatever nothing
+calls. Core code you never call is already absent from your binary, excluded or not.
+
+### One rule, four surfaces
+
+`coil.core` used to be hardcoded as a last-resort branch in four separate passes. It now
+goes through the same `use-refers` predicate as every other import, consulted by:
+
+| Surface | Site |
+|---|---|
+| value / type / trait names | `resolve.coil` `resolve-uncached` |
+| ambient primitive aliases (`load`, `store!`, `field`, …) | `resolve.coil` `primitive-bind-one!` |
+| macros | `expander.coil` `macro-use-match` |
+| trait methods (the operators) | `check.coil` `method-suppressed?` |
+
+Four mirrors of one rule is what would make this a hack: an `:exclude [<]` that hid the
+name from the resolver but left the operator callable would be worse than no feature.
+Each surface has its own `tests/compiler/features/refer_exclude_*_rejected.coil` fixture
+in the bounded inner-loop gate for exactly that reason.
+
+Trait methods need one extra distinction. A method whose declaring trait is unique is
+callable today with **no import at all**, so the mere absence of an import cannot suppress
+it — only a deliberate statement can: an `:exclude`/`:rename` naming the trait or the
+method, or an explicit `(import "coil.core" …)`, which states core's refer set in full.
 
 ## Trait-method resolution (the per-module part)
 
