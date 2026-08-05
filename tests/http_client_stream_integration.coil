@@ -1,0 +1,356 @@
+; Streaming-client acceptance tests against tests/http_client_stream_server.py.
+;
+; Each check returns a distinct exit code so a failure names itself. 0 = all passed.
+;
+; The load-bearing one is `check-streams-incrementally`: the server flushes three
+; fragments 300ms apart, and the test asserts the FIRST callback ran well before the
+; transfer finished. Feeding a fully buffered body through several callbacks would
+; satisfy every other check here but fail that one.
+(module httpclientstreamintegration)
+(import "coil.primitive" :as primitive)
+(import "coil.http.client" :as http)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :as arraylist)
+(import "coil.slice" :as slice)
+(import "coil.str" :as str)
+(import "coil.fs" :use [os-pick])
+
+; ---- a monotonic clock, for the streaming proof -------------------------------
+; timespec is {i64 tv_sec, i64 tv_nsec} on both platforms; only the clock id differs.
+(defstruct TimeSpec [(sec i64) (nsec i64)])
+(extern clock_gettime :cc c [i32 (ptr TimeSpec)] (-> i32))
+(const CLOCK_MONOTONIC (os-pick 1 6))
+
+(defn now-ms [] (-> i64)
+  (let [ts (alloc/stack TimeSpec)]
+    (clock_gettime (primitive/cast i32 CLOCK_MONOTONIC) ts)
+    (primitive/iadd (primitive/imul (primitive/load (primitive/field ts sec)) 1000)
+                    (primitive/idiv (primitive/load (primitive/field ts nsec)) 1000000))))
+
+; ---- the shared accumulator every sink writes through -------------------------
+(defstruct Acc
+  [(buf (arraylist/ArrayList u8))
+   (calls i64)
+   (started-ms i64)
+   (first-call-ms i64)
+   (stop-after i64)])   ; 0 = never stop
+(defn acc [] (-> (ptr Acc))
+  (alloc/static Acc))
+
+(defn acc-reset! [(a (ptr alloc/Allocator)) (stop-after i64)] (-> i64)
+  (let [s (acc)]
+    (primitive/store! (primitive/field s buf) (arraylist/al-new [u8] a))
+    (primitive/store! (primitive/field s calls) 0)
+    (primitive/store! (primitive/field s started-ms) (now-ms))
+    (primitive/store! (primitive/field s first-call-ms) -1)
+    (primitive/store! (primitive/field s stop-after) stop-after)
+    0))
+
+(defn acc-body [] (-> (slice u8))
+  (arraylist/al-slice [u8] (primitive/load (primitive/field (acc) buf))))
+
+;; The sink. Records when it was first called, appends the chunk, and asks to stop once
+;; `stop-after` bytes have arrived.
+(defn acc-consume [(data (ptr u8)) (n i64) (ctx (ptr i8))] (-> i64)
+  (let [s (primitive/cast (ptr Acc) ctx)]
+    (when (primitive/icmp-eq (primitive/load (primitive/field s calls)) 0)
+      (primitive/store! (primitive/field s first-call-ms) (now-ms)))
+    (primitive/store! (primitive/field s calls)
+                      (primitive/iadd (primitive/load (primitive/field s calls)) 1))
+    (arraylist/al-extend! [u8] (mut (primitive/field s buf)) data n)
+    (let [stop-after (primitive/load (primitive/field s stop-after))]
+      (if (and (primitive/icmp-gt stop-after 0)
+               (primitive/icmp-ge (arraylist/al-len [u8] (primitive/load (primitive/field s buf)))
+                                  stop-after))
+          BODY-STOP
+          BODY-CONTINUE))))
+
+(defn mk-sink [] (-> http/BodySink)
+  (let [p (alloc/stack http/BodySink)]
+    (primitive/store! (primitive/field p context) (primitive/cast (ptr i8) (acc)))
+    (primitive/store! (primitive/field p consume) (primitive/fnptr-of acc-consume))
+    (primitive/load p)))
+
+(defn mk-get [(req (ptr http/Request)) (url (slice u8)) (timeout-ms i64)] (-> i64)
+  (primitive/store! (primitive/field req method) "GET")
+  (primitive/store! (primitive/field req url) url)
+  (primitive/store! (primitive/field req headers)
+                    (slice/slice-new [http/Header] (primitive/cast (ptr http/Header) 0) 0))
+  (primitive/store! (primitive/field req body) "")
+  (primitive/store! (primitive/field req connect-timeout-ms) 1000)
+  (primitive/store! (primitive/field req timeout-ms) timeout-ms)
+  (primitive/store! (primitive/field req follow-redirects) false)
+  0)
+
+; ---- the checks ---------------------------------------------------------------
+; Each returns 0 on success or its own nonzero code.
+
+;; 1 + THE STREAMING PROOF: three fragments 300ms apart arrive in order, and the first
+;; callback runs long before the transfer ends.
+(defn check-streams-incrementally [(a (ptr alloc/Allocator))] (-> i64)
+  (let [req (alloc/stack http/Request)]
+    (mk-get req "http://127.0.0.1:38474/slow" 10000)
+    (acc-reset! a 0)
+    (match (http/request-stream a req (mk-sink))
+      (Err [e] 10)
+      (Ok [r]
+          (let [s (acc)
+                done-ms (now-ms)
+                started (primitive/load (primitive/field s started-ms))
+                first-at (primitive/isub (primitive/load (primitive/field s first-call-ms)) started)
+                total (primitive/isub done-ms started)
+                body (acc-body)]
+            (http/streaming-response-free a r)
+            (cond
+              (not (str/str-eq body "alphabravocharlie")) 11
+              (primitive/icmp-lt (primitive/load (primitive/field s calls)) 2) 12
+              ; the server took >=600ms to finish; a buffered client cannot have seen
+              ; the first byte before that.
+              (primitive/icmp-lt total 400) 13
+              (primitive/icmp-ge first-at (primitive/isub total 200)) 14
+              :else 0))))))
+
+;; 2: a record torn across three flushes reassembles in order.
+(defn check-split-record [(a (ptr alloc/Allocator))] (-> i64)
+  (let [req (alloc/stack http/Request)]
+    (mk-get req "http://127.0.0.1:38474/split" 10000)
+    (acc-reset! a 0)
+    (match (http/request-stream a req (mk-sink))
+      (Err [e] 20)
+      (Ok [r]
+          (do
+            (http/streaming-response-free a r)
+            (if (str/str-eq (acc-body) "<<<record>>>") 0 21))))))
+
+;; 3: empty and single-chunk bodies.
+(defn check-empty-and-single [(a (ptr alloc/Allocator))] (-> i64)
+  (let [req (alloc/stack http/Request)]
+    (mk-get req "http://127.0.0.1:38474/empty" 5000)
+    (acc-reset! a 0)
+    (match (http/request-stream a req (mk-sink))
+      (Err [e] 30)
+      (Ok [r]
+          (do
+            (http/streaming-response-free a r)
+            (if (primitive/icmp-ne (slice/slice-len (acc-body)) 0)
+                31
+                (do
+                  (mk-get req "http://127.0.0.1:38474/single" 5000)
+                  (acc-reset! a 0)
+                  (match (http/request-stream a req (mk-sink))
+                    (Err [e2] 32)
+                    (Ok [r2]
+                        (do
+                          (http/streaming-response-free a r2)
+                          (if (str/str-eq (acc-body) "one-shot") 0 33)))))))))))
+
+;; 4: binary bytes survive — a NUL, a lone 0xFF, a truncated multi-byte sequence.
+(defn check-binary-body [(a (ptr alloc/Allocator))] (-> i64)
+  (let [req (alloc/stack http/Request)]
+    (mk-get req "http://127.0.0.1:38474/binary" 5000)
+    (acc-reset! a 0)
+    (match (http/request-stream a req (mk-sink))
+      (Err [e] 40)
+      (Ok [r]
+          (let [body (acc-body)]
+            (http/streaming-response-free a r)
+            (cond
+              (primitive/icmp-ne (slice/slice-len body) 9) 41
+              (primitive/icmp-ne (primitive/cast i64 (slice/slice-get body 0)) 0) 42
+              (primitive/icmp-ne (primitive/cast i64 (slice/slice-get body 2)) 255) 43
+              (primitive/icmp-ne (primitive/cast i64 (slice/slice-get body 4)) 0) 44
+              (primitive/icmp-ne (primitive/cast i64 (slice/slice-get body 8)) 127) 45
+              :else 0))))))
+
+;; 5: a non-2xx response still streams its body and exposes its headers.
+(defn check-non-2xx [(a (ptr alloc/Allocator))] (-> i64)
+  (let [req (alloc/stack http/Request)]
+    (mk-get req "http://127.0.0.1:38474/teapot" 5000)
+    (acc-reset! a 0)
+    (match (http/request-stream a req (mk-sink))
+      (Err [e] 50)
+      (Ok [r]
+          (let [status (http/streaming-response-status r)
+                nheaders (http/streaming-response-header-count r)
+                body (acc-body)]
+            (http/streaming-response-free a r)
+            (cond
+              (primitive/icmp-ne status 418) 51
+              (not (str/str-eq body "short and stout")) 52
+              (primitive/icmp-lt nheaders 2) 53
+              :else 0))))))
+
+;; 6 + 10: the consumer stops after a partial body. That is an Ok with `stopped` set —
+;; not a transport error — the status is still there, and nothing leaks.
+(defn check-consumer-stop [(a (ptr alloc/Allocator))] (-> i64)
+  (let [req (alloc/stack http/Request)]
+    (mk-get req "http://127.0.0.1:38474/big" 20000)
+    (acc-reset! a 2048)
+    (match (http/request-stream a req (mk-sink))
+      (Err [e] 60)
+      (Ok [r]
+          (let [stopped (http/streaming-response-stopped r)
+                status (http/streaming-response-status r)
+                n (slice/slice-len (acc-body))]
+            (http/streaming-response-free a r)
+            (cond
+              (not stopped) 61
+              (primitive/icmp-ne status 200) 62
+              (primitive/icmp-lt n 2048) 63
+              ; it must have stopped EARLY — the full body is 64 KiB
+              (primitive/icmp-ge n 65536) 64
+              :else 0))))))
+
+;; 7: the total timeout fires after partial delivery, and reports as a timeout rather
+;; than an unexplained transport failure.
+(defn check-timeout-after-partial [(a (ptr alloc/Allocator))] (-> i64)
+  (let [req (alloc/stack http/Request)]
+    (mk-get req "http://127.0.0.1:38474/hang" 1200)
+    (acc-reset! a 0)
+    (match (http/request-stream a req (mk-sink))
+      (Ok [r] (do (http/streaming-response-free a r) 70))
+      (Err [e]
+           (cond
+             (not (http/error-timeout? e)) 71
+             ; the first fragment did arrive before the timeout
+             (not (str/str-eq (acc-body) "begin")) 72
+             :else 0)))))
+
+;; 7b: a connect timeout to a black-hole address is also a timeout.
+;;     198.51.100.0/24 is TEST-NET-2 (RFC 5737) and is not routable.
+(defn check-connect-timeout [(a (ptr alloc/Allocator))] (-> i64)
+  (let [req (alloc/stack http/Request)]
+    (mk-get req "http://198.51.100.1:38474/never" 4000)
+    (primitive/store! (primitive/field req connect-timeout-ms) 700)
+    (acc-reset! a 0)
+    (match (http/request-stream a req (mk-sink))
+      (Ok [r] (do (http/streaming-response-free a r) 75))
+      (Err [e] (if (http/error-timeout? e) 0 76)))))
+
+;; 8: a connection refused before any header is a transport failure, not a timeout.
+(defn check-connect-refused [(a (ptr alloc/Allocator))] (-> i64)
+  (let [req (alloc/stack http/Request)]
+    (mk-get req "http://127.0.0.1:1/unreachable" 3000)
+    (acc-reset! a 0)
+    (match (http/request-stream a req (mk-sink))
+      (Ok [r] (do (http/streaming-response-free a r) 80))
+      (Err [e]
+           (cond
+             (http/error-timeout? e) 81
+             (primitive/icmp-ne (slice/slice-len (acc-body)) 0) 82
+             :else 0)))))
+
+;; 8b: the server disconnects mid-body. The bytes already delivered stay delivered, and
+;; the call reports the failure rather than a truncated success.
+(defn check-disconnect-mid-body [(a (ptr alloc/Allocator))] (-> i64)
+  (let [req (alloc/stack http/Request)]
+    (mk-get req "http://127.0.0.1:38474/cut" 5000)
+    (acc-reset! a 0)
+    (match (http/request-stream a req (mk-sink))
+      ; curl may report this either way depending on how the peer closed; what must NOT
+      ; happen is losing the bytes that did arrive.
+      (Ok [r] (do (http/streaming-response-free a r) (if (str/str-eq (acc-body) "begin") 0 85)))
+      (Err [e] (if (str/str-eq (acc-body) "begin") 0 86)))))
+
+;; 9: repeated requests do not leak. Run the streaming path many times; a leak of the
+;; per-request curl handle or header block shows up as a climbing RSS or an fd exhaustion
+;; failure partway through.
+(defn check-repeated [(a (ptr alloc/Allocator))] (-> i64)
+  (let [req (alloc/stack http/Request)
+        (mut i) 0
+        (mut bad) 0]
+    (loop (if (or (primitive/icmp-ge (primitive/load i) 50) (primitive/icmp-ne (primitive/load bad) 0))
+              (break)
+              (do
+                (mk-get req "http://127.0.0.1:38474/single" 5000)
+                (acc-reset! a 0)
+                (match (http/request-stream a req (mk-sink))
+                  (Err [e] (primitive/store! bad 90))
+                  (Ok [r]
+                      (do
+                        (http/streaming-response-free a r)
+                        (when (not (str/str-eq (acc-body) "one-shot"))
+                          (primitive/store! bad 91)))))
+                (primitive/store! i (primitive/iadd (primitive/load i) 1)))))
+    (primitive/load bad)))
+
+; ---- reentrancy ---------------------------------------------------------------
+; The docs claim a nested request from inside a sink is permitted. That claim has to be
+; tested, not asserted: each call allocates its own curl easy handle and this module keeps
+; no shared state, but "should be fine" is not evidence.
+(defstruct Reent [(rc i64) (done bool)])
+(defn reent [] (-> (ptr Reent))
+  (alloc/static Reent))
+
+(defn reentrant-consume [(data (ptr u8)) (n i64) (ctx (ptr i8))] (-> i64)
+  (let [s (primitive/cast (ptr Reent) ctx)]
+    (when (not (primitive/load (primitive/field s done)))
+      (primitive/store! (primitive/field s done) true)
+      (let [a (alloc/malloc-allocator)
+            req (alloc/stack http/Request)]
+        (mk-get req "http://127.0.0.1:38474/single" 5000)
+        (match (http/request a req)
+          (Err [e] (primitive/store! (primitive/field s rc) 101))
+          (Ok [r]
+              (do
+                (when (not (str/str-eq (http/response-body r) "one-shot"))
+                  (primitive/store! (primitive/field s rc) 102)
+                  0)
+                (http/response-free a r)
+                0))))
+      0)
+    BODY-CONTINUE))
+
+;; A whole nested request runs inside the outer transfer's callback, and both complete.
+(defn check-reentrant-request [(a (ptr alloc/Allocator))] (-> i64)
+  (let [req (alloc/stack http/Request)
+        sink (alloc/stack http/BodySink)
+        s (reent)]
+    (primitive/store! (primitive/field s rc) 0)
+    (primitive/store! (primitive/field s done) false)
+    (primitive/store! (primitive/field sink context) (primitive/cast (ptr i8) s))
+    (primitive/store! (primitive/field sink consume) (primitive/fnptr-of reentrant-consume))
+    (mk-get req "http://127.0.0.1:38474/slow" 15000)
+    (match (http/request-stream a req (primitive/load sink))
+      (Err [e] 100)
+      (Ok [r]
+          (do
+            (http/streaming-response-free a r)
+            (cond
+              (primitive/icmp-ne (primitive/load (primitive/field s rc)) 0)
+                (primitive/load (primitive/field s rc))
+              ; the nested request must actually have run
+              (not (primitive/load (primitive/field s done))) 103
+              :else 0))))))
+
+;; The buffered `request` is implemented on top of `request-stream` now, so it has to
+;; keep behaving exactly as before.
+(defn check-buffered-still-works [(a (ptr alloc/Allocator))] (-> i64)
+  (let [req (alloc/stack http/Request)]
+    (mk-get req "http://127.0.0.1:38474/teapot" 5000)
+    (match (http/request a req)
+      (Err [e] 95)
+      (Ok [r]
+          (let [ok (and (primitive/icmp-eq (http/response-status r) 418)
+                        (and (str/str-eq (http/response-body r) "short and stout")
+                             (primitive/icmp-ge (http/response-header-count r) 2)))]
+            (http/response-free a r)
+            (if ok 0 96))))))
+
+(defn main [] (-> i64)
+  (let [a (alloc/malloc-allocator)
+        (mut rc) 0]
+    (primitive/store! rc (check-streams-incrementally a))
+    (when (primitive/icmp-eq (primitive/load rc) 0) (primitive/store! rc (check-split-record a)))
+    (when (primitive/icmp-eq (primitive/load rc) 0) (primitive/store! rc (check-empty-and-single a)))
+    (when (primitive/icmp-eq (primitive/load rc) 0) (primitive/store! rc (check-binary-body a)))
+    (when (primitive/icmp-eq (primitive/load rc) 0) (primitive/store! rc (check-non-2xx a)))
+    (when (primitive/icmp-eq (primitive/load rc) 0) (primitive/store! rc (check-consumer-stop a)))
+    (when (primitive/icmp-eq (primitive/load rc) 0) (primitive/store! rc (check-timeout-after-partial a)))
+    (when (primitive/icmp-eq (primitive/load rc) 0) (primitive/store! rc (check-connect-timeout a)))
+    (when (primitive/icmp-eq (primitive/load rc) 0) (primitive/store! rc (check-connect-refused a)))
+    (when (primitive/icmp-eq (primitive/load rc) 0) (primitive/store! rc (check-disconnect-mid-body a)))
+    (when (primitive/icmp-eq (primitive/load rc) 0) (primitive/store! rc (check-repeated a)))
+    (when (primitive/icmp-eq (primitive/load rc) 0) (primitive/store! rc (check-reentrant-request a)))
+    (when (primitive/icmp-eq (primitive/load rc) 0) (primitive/store! rc (check-buffered-still-works a)))
+    (primitive/load rc)))

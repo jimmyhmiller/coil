@@ -108,6 +108,8 @@ def test(args: argparse.Namespace) -> None:
         execute("scripts/compiler/oracle/gate-cli.sh", compiler)
     elif args.suite == "runtime":
         execute(sys.executable, "scripts/oracle.py", "runtime", "gate", "arm64", "--compiler", compiler)
+    elif args.suite == "http":
+        test_http(compiler)
     elif args.suite == "wasm":
         test_wasm(compiler)
     elif args.suite == "meta":
@@ -305,6 +307,17 @@ def test_meta(compiler: str) -> None:
     print("metaprogram engines: PASS")
 
 
+def test_http(compiler: str) -> None:
+    """Both HTTP client gates: the buffered request, and the streaming one.
+
+    They need a local server and libcurl, so they are their own suite rather than part
+    of `build full` — a machine without the bundled curl archives can still run
+    everything else.
+    """
+    execute("sh", "scripts/tests/http-client.sh")
+    execute("sh", "scripts/tests/http-client-stream.sh", compiler)
+
+
 def test_wasm(compiler: str) -> None:
     if not shutil.which("node") or not shutil.which("wasm-tools"):
         print("wasm gate: SKIP (requires node and wasm-tools)")
@@ -426,7 +439,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "wasm", "meta", "interpreter", "metaprogramming", "modernize-fast"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "http", "wasm", "meta", "interpreter", "metaprogramming", "modernize-fast"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.set_defaults(func=test)

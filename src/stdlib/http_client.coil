@@ -10,6 +10,7 @@
 (import "coil.slice" :as slice)
 (import "coil.str" :as str)
 (import "coil.mem" :as mem)
+(import "coil.match" :use [match-else])
 
 (export Header
         Request
@@ -20,7 +21,16 @@
         response-status
         response-body
         response-header-count
-        response-header-at)
+        response-header-at
+        BodySink
+        StreamingResponse
+        request-stream
+        error-timeout?
+        streaming-response-status
+        streaming-response-stopped
+        streaming-response-header-count
+        streaming-response-header-at
+        streaming-response-free)
 
 (extern curl_easy_init :cc c [] (-> (ptr i8)))
 (extern curl_easy_cleanup :cc c [(ptr i8)] (-> void))
@@ -47,6 +57,13 @@
 (const CURLOPT_HEADERFUNCTION 20079)
 (const CURLOPT_HEADERDATA 10029)
 (const CURLINFO_RESPONSE_CODE 2097154)
+; CURLE_OPERATION_TIMEDOUT — both the connect and the total timeout surface as this
+; one code, which is what `error-timeout?` reads.
+(const CURLE_OPERATION_TIMEDOUT 28)
+
+;; What a body consumer asks the transfer to do next: keep delivering, or stop.
+(const BODY-CONTINUE 0)
+(const BODY-STOP 1)
 
 (defstruct Header [(name (slice u8)) (value (slice u8))])
 (defstruct Request
@@ -58,6 +75,32 @@
    (timeout-ms i64)
    (follow-redirects bool)])
 (defstruct Response [(status i64) (headers (slice Header)) (body (slice u8))])
+
+;; A typed consumer for response-body bytes. `consume` is called with each chunk as it
+;; arrives, in order, with arbitrary boundaries — a UTF-8 scalar or a protocol record may
+;; be split across two calls, so a consumer that needs whole records must buffer them
+;; itself. It returns BODY-CONTINUE or BODY-STOP.
+;;
+;; The bytes are TRANSPORT-OWNED and valid only for the duration of the call: copy
+;; anything you need to keep. They never become part of the returned response.
+;;
+;; `context` is yours; `request-stream` passes it through untouched and does not retain
+;; it after returning.
+(defstruct BodySink
+  [(context (ptr i8))
+   (consume (fnptr c [(ptr u8) i64 (ptr i8)] i64))])
+
+;; A streamed response: the status and headers, which are meaningful for every response
+;; including non-2xx, plus whether the consumer asked to stop early. The body is not here
+;; — it went to the sink.
+(defstruct StreamingResponse
+  [(status i64) (headers (slice Header)) (stopped bool)])
+
+;; The write-callback context. `stopped` is the discriminator that separates a deliberate
+;; consumer stop from a genuine transport failure: our trampoline is the only thing that
+;; ever short-counts, and it only does so after the sink said BODY-STOP.
+(defstruct StreamState [(sink BodySink) (stopped bool)])
+
 (defstruct HeaderCapture
   [(a (ptr alloc/Allocator)) (headers (arraylist/ArrayList Header))])
 (defsum HttpError
@@ -74,8 +117,8 @@
 (defn curl-set-write-fn [(easy (ptr i8))
                          (value (fnptr c [(ptr i8) isize isize (ptr i8)] isize))] (-> i32)
   (curl_easy_setopt easy CURLOPT_WRITEFUNCTION value))
-(defn curl-set-write-data [(easy (ptr i8)) (value (ptr (arraylist/ArrayList u8)))] (-> i32)
-  (curl_easy_setopt easy CURLOPT_WRITEDATA (primitive/cast (ptr i8) value)))
+(defn curl-set-write-data [(easy (ptr i8)) (value (ptr i8))] (-> i32)
+  (curl_easy_setopt easy CURLOPT_WRITEDATA value))
 (defn curl-set-header-fn [(easy (ptr i8))
                           (value (fnptr c [(ptr i8) isize isize (ptr i8)] isize))] (-> i32)
   (curl_easy_setopt easy CURLOPT_HEADERFUNCTION value))
@@ -93,11 +136,30 @@
 (defn curl-cstr-slice [(p (ptr i8))] (-> (slice u8))
   (slice/slice-new [u8] (primitive/cast (ptr u8) p) (curl-cstr-len p)))
 
-(defn curl-write-body [(data (ptr i8)) (size isize) (count isize) (ctx (ptr i8))] (-> isize)
+; curl's write callback: hand the chunk straight to the sink, no buffering.
+;
+; Returning a count other than the one curl offered is how a write callback aborts a
+; transfer; curl then fails the perform with CURLE_WRITE_ERROR. That is the only way to
+; stop a blocking transfer from inside the callback, so a consumer's BODY-STOP is
+; delivered as a short count and remembered in `stopped`, which lets the caller tell a
+; deliberate stop from a real write failure.
+(defn curl-stream-body [(data (ptr i8)) (size isize) (count isize) (ctx (ptr i8))] (-> isize)
   (let [n (primitive/imul (primitive/cast i64 size) (primitive/cast i64 count))
-        out (primitive/cast (ptr (arraylist/ArrayList u8)) ctx)]
-    (arraylist/al-extend! [u8] (mut out) (primitive/cast (ptr u8) data) n)
-    (primitive/cast isize n)))
+        st (primitive/cast (ptr StreamState) ctx)]
+    (if (or (load (field st stopped)) (= n (cast i64 0)))
+        ; nothing to deliver, or we are already unwinding a stop
+        (primitive/cast isize n)
+        (let [consume (load (field (field st sink) consume))
+              context (load (field (field st sink) context))]
+          (if (= (primitive/call-ptr consume (primitive/cast (ptr u8) data) n context) BODY-STOP)
+              (do (store! (field st stopped) true) (primitive/cast isize 0))
+              (primitive/cast isize n))))))
+
+; the sink `request` uses to rebuild its buffered body
+(defn collect-body-chunk [(data (ptr u8)) (n i64) (ctx (ptr i8))] (-> i64)
+  (let [out (primitive/cast (ptr (arraylist/ArrayList u8)) ctx)]
+    (arraylist/al-extend! [u8] (mut out) data n)
+    BODY-CONTINUE))
 
 (defn owned-copy [(a (ptr alloc/Allocator)) (s (slice u8))] (-> (slice u8))
   (let [n (slice/slice-len s)]
@@ -194,20 +256,49 @@
 (defn transport-error [(code i32)] (-> HttpError)
   (Transport (primitive/cast i64 code) (curl-cstr-slice (curl_easy_strerror code))))
 
-;; Perform one blocking request. The response body is allocator-owned and must be
-;; released with `response-free`. HTTP error statuses are successful responses;
-;; only request construction and transport failures produce `HttpError`.
-(defn request [(a (ptr alloc/Allocator)) (req (ptr Request))] (-> (Result Response HttpError))
+;; True when this error was a connect or total timeout rather than another transport
+;; failure. Both surface as one curl code, so the two timeouts are not distinguished from
+;; each other — the request's own `connect-timeout-ms`/`timeout-ms` say which applied.
+;;
+;; This is a predicate rather than a new `HttpError` variant on purpose: adding a variant
+;; would break every existing exhaustive `match` on `HttpError`.
+(defn error-timeout? [(e HttpError)] (-> bool)
+  (match-else e
+              (Transport [code message] (= code CURLE_OPERATION_TIMEDOUT))
+              (_ false)))
+
+;; Perform one blocking request, delivering response-body bytes to `sink` as they arrive
+;; instead of buffering them. The returned `StreamingResponse` carries the status and
+;; headers — meaningful for every response, including non-2xx — and must be released with
+;; `streaming-response-free`.
+;;
+;; SYNCHRONOUS: the transfer runs on the calling thread and `sink.consume` is called from
+;; it, so the sink needs no locking and `request-stream` has not returned while the sink
+;; runs. A nested `request` or `request-stream` from inside the sink is permitted — each
+;; call allocates its own curl easy handle and this module keeps no shared state — but it
+;; blocks the outer transfer for its whole duration.
+;;
+;; The four failure modes stay distinguishable:
+;;   * consumer stop      -> `(Ok r)` with `streaming-response-stopped` true
+;;   * timeout            -> `(Err e)` with `error-timeout?` true
+;;   * allocation failure -> `(Err (OutOfMemory))`
+;;   * transport failure  -> `(Err (Transport code message))`
+;; An HTTP error status is not a failure: it is an `Ok` with that status.
+(defn request-stream [(a (ptr alloc/Allocator))
+                      (req (ptr Request))
+                      (sink BodySink)] (-> (Result StreamingResponse HttpError))
   (let [easy (curl_easy_init)]
     (if (= (primitive/cast i64 easy) (cast i64 0))
         (Err (OutOfMemory))
-        (let [(mut bytes) (arraylist/al-new [u8] a)
+        (let [st (alloc/stack StreamState)
               capture (alloc/stack HeaderCapture)
               url (str/str->cstr a (load (field req url)))
               method (str/str->cstr a (load (field req method)))
               hs (build-headers a (load (field req headers)))
               body (load (field req body))
               (mut code) 0]
+          (store! (field st sink) sink)
+          (store! (field st stopped) false)
           (store! (field capture a) a)
           (store! (field capture headers) (arraylist/al-new [Header] a))
           (curl-set-ptr easy CURLOPT_URL url)
@@ -215,33 +306,65 @@
           (curl-set-ptr easy CURLOPT_HTTPHEADER hs)
           (curl-set-ptr easy CURLOPT_POSTFIELDS (primitive/cast (ptr i8) (slice/slice-data body)))
           (curl-set-i64 easy CURLOPT_POSTFIELDSIZE_LARGE (slice/slice-len body))
-          (curl-set-write-fn easy (primitive/fnptr-of curl-write-body))
-          (curl-set-write-data easy (mut bytes))
+          (curl-set-write-fn easy (primitive/fnptr-of curl-stream-body))
+          (curl-set-write-data easy (primitive/cast (ptr i8) st))
           (curl-set-header-fn easy (primitive/fnptr-of curl-header-line))
           (curl-set-header-data easy capture)
           (curl-set-i64 easy CURLOPT_NOSIGNAL 1)
           (curl-set-i64 easy CURLOPT_FOLLOWLOCATION (if (load (field req follow-redirects)) 1 0))
           (curl-set-i64 easy CURLOPT_CONNECTTIMEOUT_MS (load (field req connect-timeout-ms)))
           (curl-set-i64 easy CURLOPT_TIMEOUT_MS (load (field req timeout-ms)))
-          (let [performed (curl_easy_perform easy)]
+          (let [performed (curl_easy_perform easy)
+                stopped (load (field st stopped))]
             (alloc/raw-free a url (primitive/iadd (slice/slice-len (load (field req url))) 1) 1)
             (alloc/raw-free a method (primitive/iadd (slice/slice-len (load (field req method))) 1) 1)
-            (if (curl-ok? performed)
+            ; A stop aborts the transfer with CURLE_WRITE_ERROR, but the status line and
+            ; headers arrived before any body byte did, so they are still valid and the
+            ; caller asked for this. Report it as success with `stopped` set.
+            (if (or (curl-ok? performed) stopped)
                 (do
                   (curl-response-code easy (mut code))
-                  (let [p (alloc/stack Response)]
+                  (let [p (alloc/stack StreamingResponse)]
                     (store! (field p status) (load code))
                     (store! (field p headers) (arraylist/al-into-slice [Header] (mut (field capture headers))))
-                    (store! (field p body) (arraylist/al-into-slice [u8] (mut bytes)))
+                    (store! (field p stopped) stopped)
                     (curl_slist_free_all hs)
                     (curl_easy_cleanup easy)
                     (Ok (load p))))
                 (do
-                  (arraylist/al-free! [u8] (mut bytes))
                   (clear-captured-headers! capture)
+                  (arraylist/al-free! [Header] (mut (field capture headers)))
                   (curl_slist_free_all hs)
                   (curl_easy_cleanup easy)
                   (Err (transport-error performed)))))))))
+
+;; Perform one blocking request. The response body is allocator-owned and must be
+;; released with `response-free`. HTTP error statuses are successful responses;
+;; only request construction and transport failures produce `HttpError`.
+;;
+;; Buffering is the only difference from `request-stream`: this collects the same chunks
+;; into an allocator-owned body. Sharing one implementation keeps the two from drifting
+;; in timeout, TLS, redirect or cleanup behavior.
+(defn request [(a (ptr alloc/Allocator)) (req (ptr Request))] (-> (Result Response HttpError))
+  (let [bytes (alloc/stack (arraylist/ArrayList u8))
+        sink (alloc/stack BodySink)]
+    (store! bytes (arraylist/al-new [u8] a))
+    (store! (field sink context) (primitive/cast (ptr i8) bytes))
+    (store! (field sink consume) (primitive/fnptr-of collect-body-chunk))
+    (match (request-stream a req (load sink))
+      (Err [e]
+           (do
+             (arraylist/al-free! [u8] bytes)
+             (Err [Response HttpError] e)))
+      (Ok [sr]
+          ; a match binding is a value; spill it so `field` has a place to work from
+          (let [srp (alloc/stack StreamingResponse)
+                p (alloc/stack Response)]
+            (store! srp sr)
+            (store! (field p status) (load (field srp status)))
+            (store! (field p headers) (load (field srp headers)))
+            (store! (field p body) (arraylist/al-into-slice [u8] bytes))
+            (Ok [Response HttpError] (load p)))))))
 
 (defn response-status [(response Response)] (-> i64)
   (load (field response status)))
@@ -255,10 +378,27 @@
 (defn response-header-at [(response Response) (index i64)] (-> Header)
   (slice/slice-get (load (field response headers)) index))
 
-(defn response-free [(a (ptr alloc/Allocator)) (response Response)] (-> i64)
-  (let [body (load (field response body))
-        hs (load (field response headers))
-        (mut i) 0]
+(defn streaming-response-status [(response StreamingResponse)] (-> i64)
+  (load (field response status)))
+
+;; True when the consumer asked to stop before the body was fully delivered. The status
+;; and headers are still valid; the transfer was simply cut short on purpose.
+(defn streaming-response-stopped [(response StreamingResponse)] (-> bool)
+  (load (field response stopped)))
+
+(defn streaming-response-header-count [(response StreamingResponse)] (-> i64)
+  (slice/slice-len (load (field response headers))))
+
+(defn streaming-response-header-at [(response StreamingResponse) (index i64)] (-> Header)
+  (slice/slice-get (load (field response headers)) index))
+
+;; Release the allocator-owned headers. There is no body to free — those bytes were
+;; transport-owned and never became part of the response.
+(defn streaming-response-free [(a (ptr alloc/Allocator)) (response StreamingResponse)] (-> i64)
+  (free-headers! a (load (field response headers))))
+
+(defn free-headers! [(a (ptr alloc/Allocator)) (hs (slice Header))] (-> i64)
+  (let [(mut i) 0]
     (loop (if (>= (load i) (slice/slice-len hs))
               (break)
               (do
@@ -269,7 +409,11 @@
                         (primitive/cast (ptr i8) (slice/slice-data hs))
                         (primitive/imul (slice/slice-len hs) (primitive/sizeof Header))
                         (primitive/alignof Header))
-        0)
+        0)))
+
+(defn response-free [(a (ptr alloc/Allocator)) (response Response)] (-> i64)
+  (let [body (load (field response body))]
+    (free-headers! a (load (field response headers)))
     (alloc/raw-free a
                     (primitive/cast (ptr i8) (slice/slice-data body))
                     (slice/slice-len body)
