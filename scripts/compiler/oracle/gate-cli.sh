@@ -43,6 +43,19 @@ expect_out() {
   local out; out=$("$@" 2>&1)
   echo "$out" | grep -qE "$want" && ok "$name" || bad "$name" "want /$want/, got: $out"
 }
+# expect_crash_out <regex> <name> <cmd...>
+# Runtime-safety tests must prove that a program was built and then trapped. A
+# compiler diagnostic can contain the expected string by quoting source, which
+# previously allowed a broken test fixture to look green.
+expect_crash_out() {
+  local want=$1 name=$2; shift 2
+  local out; out=$("$@" 2>&1); local rc=$?
+  if [ "$rc" -ge 128 ] && echo "$out" | grep -qE "$want"; then
+    ok "$name"
+  else
+    bad "$name" "want runtime signal and /$want/, got rc=$rc: $out"
+  fi
+}
 
 printf '(defn main [] (-> i64) 7)\n'                     > "$T/seven.coil"
 printf '(extern abort :cc c [] (-> i64))\n(defn main [] (-> i64) (abort))\n' > "$T/abort.coil"
@@ -112,6 +125,17 @@ expect_out "undefined function 'bad-fn'" "check names the located error"      "$
 # check emits NO object: the .o path must not appear.
 "$COIL" check "$T/seven.coil" >/dev/null 2>&1
 
+echo "== checked/mono dumps run the expanded frontend and propagate failure =="
+expect_rc 0 "dump-checked expands bundled block labels" "$COIL" dump-checked "$T/seven.coil"
+expect_rc 0 "dump-mono expands bundled block labels"    "$COIL" dump-mono "$T/seven.coil"
+printf '(defn main [] (-> i64) (bad-fn 3))\n' > "$T/broken.coil"
+expect_out "undefined function 'bad-fn'" "dump-checked reports the real diagnostic" \
+  "$COIL" dump-checked "$T/broken.coil"
+printf '(defn main [] (-> i64) (bad-fn 3))\n' > "$T/broken.coil"
+expect_rc 1 "dump-checked returns failure for invalid input" "$COIL" dump-checked "$T/broken.coil"
+printf '(defn main [] (-> i64) (bad-fn 3))\n' > "$T/broken.coil"
+expect_rc 1 "dump-mono returns failure for invalid input"    "$COIL" dump-mono "$T/broken.coil"
+
 echo "== metaprogram closure scope and reachability regressions =="
 for f in bug-nested-dispatch.coil bug-direct-dispatch.coil bug-derived-fn-invisible.coil; do
   "$COIL" check "tests/repro/impl-body-scope/$f" >/dev/null 2>&1 \
@@ -127,6 +151,34 @@ if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
     || bad "an unreachable singleton cycle is not pulled into the macro engine (arm64)" "arm64 build failed or crashed"
 fi
 [ ! -e "$T/seven.o" ] && ok "check writes no object file" || bad "check writes no object" "$T/seven.o exists"
+
+echo "== malformed LLVM modules fail cleanly and preserve output =="
+cat > "$T/invalid-module.coil" <<'EOF'
+(module invalid.module)
+(import "coil.primitive" :as primitive)
+(defn bad [] (-> i64)
+  (primitive/llvm-ir i64 [] "br i1 true, label %a, label %b
+a:
+  %x = add i64 1, 2
+  br label %merge
+b:
+  br label %merge
+merge:
+  ret i64 %x"))
+EOF
+printf sentinel > "$T/invalid-module.o"
+expect_rc 1 "LLVM verifier failure exits 1" \
+  "$COIL" emit-obj "$T/invalid-module.coil" -o "$T/invalid-module.o"
+expect_out "LLVM module verification failed after lowering" \
+  "LLVM verifier failure has a readable diagnostic" \
+  "$COIL" emit-obj "$T/invalid-module.coil" -o "$T/invalid-module.o"
+[ "$(cat "$T/invalid-module.o")" = sentinel ] \
+  && ok "failed object emission preserves an existing destination" \
+  || bad "failed object emission preserves an existing destination" "destination was replaced or truncated"
+[ ! -e "$T/invalid-module.o.tmp" ] \
+  && ok "failed object emission leaves no temporary artifact" \
+  || bad "failed object emission leaves no temporary artifact" "$T/invalid-module.o.tmp exists"
+
 # A genuinely non-writable -o is a CLEAR error + exit 1, not a SIGABRT.
 expect_rc 1 "build -o into a read-only location is a clear error, not SIGABRT" \
   "$COIL" build "$T/seven.coil" -o /System/nope
@@ -830,6 +882,34 @@ EOF
 expect_out "subslice out of range or lo>hi" "--debug-checks rejects a lo>hi subslice (mem-6)" \
   "$COIL" run "$T/dbgsub.coil" --debug-checks
 
+# ArrayList carries a pointer/len/cap/allocator header. A corrupted tagged aggregate
+# used to turn those words into an arbitrary later pointer fault. Debug builds should
+# stop at the first collection operation and name the broken invariant.
+cat > "$T/dbgal.coil" <<'EOF'
+(module m)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(defn main [] (-> i64)
+  (let [(mut xs) (al-new [i64] (malloc-allocator))]
+    (store! (field xs len) 4)
+    (store! (field xs cap) 2)
+    (al-len [i64] (load xs))))
+EOF
+expect_out "ArrayList header corrupt" "--debug-checks diagnoses an invalid ArrayList header" \
+  "$COIL" run "$T/dbgal.coil" --debug-checks
+
+cat > "$T/dbgalget.coil" <<'EOF'
+(module m)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(defn main [] (-> i64)
+  (let [(mut xs) (al-new [i64] (malloc-allocator))]
+    (al-push! [i64] (mut xs) 7)
+    (al-get [i64] (load xs) 3)))
+EOF
+expect_out "ArrayList index out of bounds in al-get" "--debug-checks catches ArrayList al-get OOB" \
+  "$COIL" run "$T/dbgalget.coil" --debug-checks
+
 echo "== --sanitize=address + a sanitizer --link-flag no longer aborts the compiler (mem-7) =="
 # was: a program's --link-flag reached the metaprogram dylib, which is dlopen'd into the
 # compiler — an ASan-instrumented dylib loaded that late ABORTED the compiler
@@ -838,14 +918,42 @@ echo "== --sanitize=address + a sanitizer --link-flag no longer aborts the compi
 "$COIL" build "$T/seven.coil" -o "$T/san1" --link-flag -fsanitize=address >/dev/null 2>&1
 [ $? = 0 ] && ok "--link-flag -fsanitize=address does not abort the compiler" \
            || bad "--link-flag -fsanitize=address" "the compiler aborted (mem-7)"
-# --sanitize=address runs LLVM's AddressSanitizer pass: the object gains __asan symbols.
-# --lib keeps it off the exe link (whose ASan runtime version is a toolchain concern).
+# Use an explicit heap store: ASan global-registration symbols alone do not prove
+# that ordinary program memory accesses were instrumented.
+cat > "$T/asanstore.coil" <<'EOF'
+(module m)
+(import "coil.alloc" :use *)
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        p (unwrap-ptr [i8] (create [i8] a))]
+    (destroy [i8] a p)
+    ; Deliberate UAF keeps the store observable to ASan instead of letting the
+    ; optimizer discard an otherwise dead allocate/store/free sequence.
+    (coil.primitive/store! p (coil.primitive/cast i8 7))
+    0))
+EOF
+# --sanitize=address runs LLVM's AddressSanitizer pass: the object gains a report
+# call for the store, not merely the module-level ASan constructor.
 # FAILS on the seed ('unknown flag --sanitize=address').
 rm -f "$T/sanobj.o"
-"$COIL" build "$T/seven.coil" --lib --sanitize=address -o "$T/sanobj.a" >/dev/null 2>&1
-nm "$T/sanobj.o" 2>/dev/null | grep -q asan \
-  && ok "--sanitize=address runs the ASan pass (object is instrumented)" \
-  || bad "--sanitize=address" "no __asan symbols in the emitted object"
+"$COIL" build "$T/asanstore.coil" --lib --sanitize=address -O0 -o "$T/sanobj.a" >/dev/null 2>&1
+nm "$T/sanobj.o" 2>/dev/null | grep -qE '__asan_report_store[0-9]+' \
+  && ok "--sanitize=address instruments ordinary stores" \
+  || bad "--sanitize=address store instrumentation" "no __asan_report_store* symbol in the emitted object"
+# Prove the host runtime initializes and observes that instrumentation too. This
+# catches toolchain/runtime regressions that an object-symbol check cannot, such as
+# Homebrew LLVM 21's macOS 26 hang in FindDynamicShadowStart.
+rm -f "$T/sanrun"
+if "$COIL" build "$T/asanstore.coil" --sanitize=address -O0 -o "$T/sanrun" >/dev/null 2>&1; then
+  sanout=$("$T/sanrun" 2>&1); sanrc=$?
+  if [ "$sanrc" != 0 ] && echo "$sanout" | grep -qE 'AddressSanitizer: heap-use-after-free|SUMMARY: AddressSanitizer'; then
+    ok "--sanitize=address runtime diagnoses a deliberate use-after-free"
+  else
+    bad "--sanitize=address runtime" "want a nonzero ASan use-after-free report, got rc=$sanrc: $sanout"
+  fi
+else
+  bad "--sanitize=address runtime link" "could not link the instrumented executable"
+fi
 # and WITHOUT the flag the SAME object has no ASan — proving the flag is what adds it.
 rm -f "$T/plainobj.o"
 "$COIL" build "$T/seven.coil" --lib -o "$T/plainobj.a" >/dev/null 2>&1
@@ -856,6 +964,298 @@ nm "$T/plainobj.o" 2>/dev/null | grep -q asan \
 # uninstrumented binary. FAILS on the seed ('unknown flag').
 expect_out "requires the LLVM backend" "--sanitize=address --backend arm64 is rejected" \
   "$COIL" build "$T/seven.coil" -o "$T/san2" --sanitize=address --backend arm64
+
+cat > "$T/tsan-race.coil" <<'EOF'
+(module tsan_race)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.thread" :use *)
+(defn worker [(arg (ptr i8))] (-> (ptr i8))
+  (let [p (primitive/cast (ptr i64) arg)]
+    (store! p (primitive/iadd (load p) 1)))
+  (primitive/cast (ptr i8) 0))
+(defn main [] (-> i64)
+  (let [counter (alloc/stack i64)
+        threads (alloc/stack (array Thread 2))]
+    (store! counter 0)
+    (thread-spawn (primitive/index threads 0) (primitive/fnptr-of worker) (primitive/cast (ptr i8) counter))
+    (thread-spawn (primitive/index threads 1) (primitive/fnptr-of worker) (primitive/cast (ptr i8) counter))
+    (thread-join (primitive/index threads 0))
+    (thread-join (primitive/index threads 1))
+    0))
+EOF
+if "$COIL" build "$T/tsan-race.coil" --sanitize=thread -O1 -o "$T/tsan-race" >/dev/null 2>&1; then
+  tsanout=$(TSAN_OPTIONS=halt_on_error=1 "$T/tsan-race" 2>&1); tsanrc=$?
+  if [ "$tsanrc" != 0 ] && echo "$tsanout" | grep -qE 'ThreadSanitizer: data race|SUMMARY: ThreadSanitizer'; then
+    ok "--sanitize=thread diagnoses a deliberate data race"
+  else
+    bad "--sanitize=thread runtime" "want a nonzero TSan data-race report, got rc=$tsanrc: $tsanout"
+  fi
+else
+  bad "--sanitize=thread runtime link" "could not link the instrumented executable"
+fi
+
+cat > "$T/ubsan-overflow.coil" <<'EOF'
+(module ubsan_overflow)
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (coil.primitive/iadd 9223372036854775807 (coil.primitive/cast i64 argc)))
+EOF
+expect_out "undefined behavior: signed integer overflow" "--sanitize=undefined catches signed overflow" \
+  sh -c "'$COIL' build '$T/ubsan-overflow.coil' --sanitize=undefined -O1 -o '$T/ubsan-overflow' >/dev/null && '$T/ubsan-overflow'"
+
+cat > "$T/ubsan-divzero.coil" <<'EOF'
+(module ubsan_divzero)
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (coil.primitive/idiv 7 (coil.primitive/isub (coil.primitive/cast i64 argc) 1)))
+EOF
+expect_out "undefined behavior: integer division or remainder by zero" "--sanitize=undefined catches division by zero" \
+  sh -c "'$COIL' build '$T/ubsan-divzero.coil' --sanitize=undefined -O1 -o '$T/ubsan-divzero' >/dev/null && '$T/ubsan-divzero'"
+
+cat > "$T/ubsan-shift.coil" <<'EOF'
+(module ubsan_shift)
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (coil.primitive/ishl 1 (coil.primitive/iadd 63 (coil.primitive/cast i64 argc))))
+EOF
+expect_out "undefined behavior: shift exponent is negative or too large" "--sanitize=undefined catches an invalid shift" \
+  sh -c "'$COIL' build '$T/ubsan-shift.coil' --sanitize=undefined -O1 -o '$T/ubsan-shift' >/dev/null && '$T/ubsan-shift'"
+
+expect_out "sanitizer modes cannot be combined" "incompatible sanitizer modes are rejected" \
+  "$COIL" build "$T/seven.coil" --sanitize=address --sanitize=thread -o "$T/multi-san"
+
+if [ "$HOST_OS" = Darwin ]; then
+  expect_out "supported only on Linux" "--sanitize=memory explains its Darwin limitation" \
+    "$COIL" build "$T/seven.coil" --sanitize=memory -o "$T/msan"
+else
+  cat > "$T/msan-uninit.coil" <<'EOF'
+(module msan_uninit)
+(import "coil.alloc" :as alloc)
+(defn main [] (-> i64)
+  (let [p (alloc/stack i64)] (coil.primitive/load p)))
+EOF
+  if "$COIL" build "$T/msan-uninit.coil" --sanitize=memory -O1 -o "$T/msan-uninit" >/dev/null 2>&1; then
+    msanout=$(MSAN_OPTIONS=halt_on_error=1 "$T/msan-uninit" 2>&1); msanrc=$?
+    if [ "$msanrc" != 0 ] && echo "$msanout" | grep -qE 'MemorySanitizer: use-of-uninitialized-value|SUMMARY: MemorySanitizer'; then
+      ok "--sanitize=memory diagnoses an uninitialized read"
+    else
+      bad "--sanitize=memory runtime" "want a nonzero MSan report, got rc=$msanrc: $msanout"
+    fi
+  else
+    bad "--sanitize=memory runtime link" "could not link the instrumented executable"
+  fi
+fi
+
+# A vulnerable local array gives sspstrong a concrete frame to protect. Check the
+# object-level runtime references because normalized emit-ir intentionally omits
+# attribute-group details.
+cat > "$T/stack-smash.coil" <<'EOF'
+(module m)
+(defn guarded [(p (ptr i8))] (-> i64)
+  (let [buf (coil.alloc/stack (array i8 64))]
+    (coil.primitive/store! (coil.primitive/index buf 0) (coil.primitive/load p))
+    0))
+(defn main [] (-> i64) 0)
+EOF
+rm -f "$T/debug-runtime.o"
+"$COIL" build "$T/stack-smash.coil" --lib --debug-runtime -O0 -o "$T/debug-runtime.a" >/dev/null 2>&1
+# Do not use grep -q under pipefail here: the heavily instrumented object has
+# enough symbols that grep's early exit gives nm SIGPIPE and falsely fails the gate.
+nm "$T/debug-runtime.o" 2>/dev/null | grep '__stack_chk_fail' >/dev/null \
+  && ok "--debug-runtime enables strong stack-canary checks" \
+  || bad "--debug-runtime stack protector" "no __stack_chk_fail reference in a vulnerable function"
+nm "$T/debug-runtime.o" 2>/dev/null | grep -E '__asan_report_store[0-9]+' >/dev/null \
+  && ok "--debug-runtime enables ASan store instrumentation" \
+  || bad "--debug-runtime ASan" "no __asan_report_store* symbol in the emitted object"
+nm "$T/debug-runtime.o" 2>/dev/null | grep 'coil.crash.crash-handler' >/dev/null \
+  && ok "--debug-runtime automatically installs the crash runtime" \
+  || bad "--debug-runtime crash installation" "crash handler was not linked into an unmodified program"
+
+# A dyn receiver's data pointer names an ordinary stack/heap object, not an
+# indirect control-flow target. Only the method loaded from its vtable should
+# receive dladdr-based target validation.
+cat > "$T/debug-runtime-dyn.coil" <<'EOF'
+(module debug_runtime_dyn)
+(import "coil.alloc" :as alloc)
+(deftrait Read [Self]
+  (read [(self (ptr Self))] (-> i64)))
+(defstruct Cell [(value i64)])
+(impl Read Cell
+  (read [(self (ptr Cell))] (-> i64)
+    (load (field self value))))
+(defn main [] (-> i64)
+  (let [cell (alloc/stack Cell)
+        receiver (: cell (dyn Read))]
+    (store! (field cell value) 42)
+    (if (= (read receiver) 42) 0 1)))
+EOF
+if "$COIL" run "$T/debug-runtime-dyn.coil" --debug-runtime >/dev/null 2>&1; then
+  ok "--debug-runtime accepts stack-backed dyn receivers"
+else
+  bad "--debug-runtime dyn dispatch" "valid stack-backed dyn receiver was rejected"
+fi
+
+cat > "$T/stack-smash-runtime.coil" <<'EOF'
+(module m)
+(extern __stack_chk_fail :cc c [] (-> i64))
+(defn main [] (-> i64) (__stack_chk_fail))
+EOF
+out=$("$COIL" run "$T/stack-smash-runtime.coil" --debug-checks -O0 2>&1); rc=$?
+[ "$rc" = 134 ] \
+  && ok "strong stack canary terminates a deliberate stack smash" \
+  || bad "stack-canary runtime" "want SIGABRT/134, got rc=$rc: $out"
+
+echo "== crash diagnostics preserve fatal-signal semantics =="
+cat > "$T/crash.coil" <<'EOF'
+(module m)
+(import "coil.crash" :use *)
+(extern raise :cc c [i32] (-> i32))
+(defn main [] (-> i64)
+  (crash-install!)
+  (crash-event! "before deliberate abort")
+  (raise 6)
+  0)
+EOF
+out=$("$COIL" run "$T/crash.coil" 2>&1); rc=$?
+[ "$rc" = 134 ] \
+  && ok "crash diagnostics preserve SIGABRT exit semantics" \
+  || bad "crash signal semantics" "want rc=134 got rc=$rc: $out"
+echo "$out" | grep -q "coil crash: signal=" \
+  && ok "fatal handler prints signal, address, thread, and context" \
+  || bad "crash diagnostic header" "$out"
+echo "$out" | grep -q "before deliberate abort" \
+  && ok "fatal handler includes the recent-event ring" \
+  || bad "crash recent events" "$out"
+echo "$out" | grep -q "stack trace:" \
+  && ok "fatal handler emits a bounded stack trace" \
+  || bad "crash stack trace" "$out"
+COIL_CRASH_REPORT="$T/crash-report.txt" "$COIL" run "$T/crash.coil" >/dev/null 2>&1
+grep -q "profile=debug-runtime" "$T/crash-report.txt" \
+  && grep -q "before deliberate abort" "$T/crash-report.txt" \
+  && ok "crash artifact contains build/process metadata and recent events" \
+  || bad "crash artifact" "$(cat "$T/crash-report.txt" 2>/dev/null)"
+
+cat > "$T/guard-uaf.coil" <<'EOF'
+(module m)
+(import "coil.alloc" :use *)
+(import "coil.guardalloc" :use *)
+(import "coil.crash" :use *)
+(defn main [] (-> i64)
+  (crash-install!)
+  (let [a (guard-allocator (malloc-allocator))
+        p (unwrap-ptr [i64] (create [i64] a))]
+    (store! p 7)
+    (destroy [i64] a p)
+    (load p)))
+EOF
+out=$("$COIL" run "$T/guard-uaf.coil" --debug-checks 2>&1); rc=$?
+[ "$rc" = 138 ] || [ "$rc" = 139 ] \
+  && ok "guard allocator protects quarantined payload pages" \
+  || bad "guard allocator UAF" "want SIGBUS/SIGSEGV, got rc=$rc: $out"
+
+cat > "$T/ffi-out.coil" <<'EOF'
+(module m)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.checked-ffi" :use *)
+(defn bad-out [(p (ptr i64))] (-> i64)
+  (store! (primitive/index (primitive/cast (ptr i8) p) 8) (primitive/cast i8 1))
+  0)
+(defn main [] (-> i64)
+  (with-checked-out (malloc-allocator) 8 8 out
+    (bad-out (primitive/cast (ptr i64) out))))
+EOF
+expect_out "foreign call wrote past its checked out-parameter" "checked FFI output validates canaries immediately" \
+  "$COIL" run "$T/ffi-out.coil"
+
+cat > "$T/null-callptr.coil" <<'EOF'
+(module m)
+(import "coil.primitive" :as primitive)
+(defn main [] (-> i64)
+  (let [fp (primitive/cast (fnptr c [] i64) (primitive/cast (ptr i8) 0))]
+    (primitive/call-ptr fp)))
+EOF
+expect_out "invalid indirect target in callptr" "debug checks validate call-ptr before control transfer" \
+  "$COIL" run "$T/null-callptr.coil" --debug-checks
+out=$("$COIL" emit-ir "$T/null-callptr.coil" 2>&1)
+echo "$out" | grep -q "indirect.invalid" \
+  && bad "off: indirect validation must be zero-cost" "debug branch appears without the flag" \
+  || ok "off: indirect validation emits no branch"
+
+cat > "$T/null-dyn.coil" <<'EOF'
+(module m)
+(import "coil.primitive" :as primitive)
+(deftrait Runnable [Self] (run [(self (ptr Self))] (-> i64)))
+(defstruct Worker [(value i64)])
+(impl Runnable Worker
+  (run [(self (ptr Worker))] (-> i64) (load (field self value))))
+(defn main [] (-> i64)
+  (let [worker (primitive/make-dyn Runnable (primitive/cast (ptr Worker) 0))]
+    (run worker)))
+EOF
+expect_out "invalid indirect target in dyn.data" "debug checks validate dynamic-trait data" \
+  "$COIL" run "$T/null-dyn.coil" --debug-checks
+
+cat > "$T/bad-allocator.coil" <<'EOF'
+(module m)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(defn main [] (-> i64)
+  (match (raw-alloc (primitive/cast (ptr Allocator) 0) 8 8)
+    (None [] 0)
+    (Some [p] (primitive/cast i64 p))))
+EOF
+expect_crash_out "invalid allocator vtable" "debug checks reject a null allocator vtable before dereference" \
+  "$COIL" run "$T/bad-allocator.coil" --debug-checks
+
+cat > "$T/bad-slice-header.coil" <<'EOF'
+(module m)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(defn main [] (-> i64)
+  (slice-get [i64] (slice-new (primitive/cast (ptr i64) 0) 1) 0))
+EOF
+expect_out "invalid slice header" "debug checks reject a nonempty null slice" \
+  "$COIL" run "$T/bad-slice-header.coil" --debug-checks
+
+cat > "$T/bad-hashmap-header.coil" <<'EOF'
+(module m)
+(import "coil.alloc" :use *)
+(import "coil.hashmap" :use *)
+(defn main [] (-> i64)
+  (let [(mut map) (hm-new-scalar [i64 i64] (malloc-allocator))]
+    (store! (field map cap) 3)
+    (hm-len [i64 i64] (load map))))
+EOF
+expect_out "HashMap header corrupt" "debug checks reject a corrupt HashMap header" \
+  "$COIL" run "$T/bad-hashmap-header.coil" --debug-checks
+
+cat > "$T/bad-arraylist-set.coil" <<'EOF'
+(module m)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(defn main [] (-> i64)
+  (let [(mut xs) (al-new [i64] (malloc-allocator))]
+    (al-push! [i64] (mut xs) 1)
+    (al-set! [i64] (mut xs) 1 2)))
+EOF
+expect_crash_out "ArrayList index out of bounds in al-set!" "debug checks validate ArrayList writes" \
+  "$COIL" run "$T/bad-arraylist-set.coil" --debug-checks
+
+cat > "$T/thread-config.coil" <<'EOF'
+(module m)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.thread" :use *)
+(defn worker [(arg (ptr i8))] (-> (ptr i8)) arg)
+(defn main [] (-> i64)
+  (let [thread (alloc/stack Thread)
+        status (thread-spawn-configured thread
+                                        (primitive/fnptr-of worker)
+                                        (primitive/cast (ptr i8) 0)
+                                        (thread-config 1048576 65536))]
+    (if (= status 0) (primitive/cast i64 (thread-join thread)) (primitive/cast i64 status))))
+EOF
+expect_rc 0 "thread config applies explicit stack and guard sizes" \
+  "$COIL" run "$T/thread-config.coil"
 
 echo "== poison-on-free debug-allocator: detects double-free (mem-2) =="
 # (debug-allocator a) from dbgalloc.coil — under --debug-checks it detects a double-free
@@ -893,6 +1293,121 @@ EOF
 expect_rc 222 "--debug-checks poisons freed memory (use-after-free reads 0xDE)" \
   "$COIL" run "$T/uaf.coil" --debug-checks
 
+cat > "$T/dbgalloc-misuse.coil" <<'EOF'
+(module m)
+(import "coil.alloc" :use *)
+(import "coil.dbgalloc" :use *)
+(defn main [] (-> i64)
+  (let [a (debug-allocator (malloc-allocator))
+        p (unwrap-ptr [i64] (create [i64] a))]
+    (coil.primitive/store! (coil.primitive/index (coil.primitive/cast (ptr i8) p) -32)
+                           (coil.primitive/cast i8 0))
+    (destroy [i64] a p)
+    0))
+EOF
+expect_out "buffer underrun in debug-allocator" "debug-allocator detects a prefix underrun" \
+  "$COIL" run "$T/dbgalloc-misuse.coil" --debug-checks
+
+sed 's/-32)/8)/' "$T/dbgalloc-misuse.coil" > "$T/dbgalloc-overflow.coil"
+expect_out "buffer overflow in debug-allocator" "debug-allocator detects a suffix overflow" \
+  "$COIL" run "$T/dbgalloc-overflow.coil" --debug-checks
+
+cat > "$T/dbgalloc-size.coil" <<'EOF'
+(module m)
+(import "coil.alloc" :use *)
+(import "coil.dbgalloc" :use *)
+(defn main [] (-> i64)
+  (let [a (debug-allocator (malloc-allocator))]
+    (match (raw-alloc a 8 8)
+      (None [] 1)
+      (Some [p] (raw-free a p 7 8)))))
+EOF
+expect_out "allocation size mismatch in debug-allocator" "debug-allocator detects a free-size mismatch" \
+  "$COIL" run "$T/dbgalloc-size.coil" --debug-checks
+
+cat > "$T/dbgalloc-stateful.coil" <<'EOF'
+(module m)
+(import "coil.alloc" :use *)
+(import "coil.dbgalloc" :use *)
+(defn use-allocator [(a (ptr Allocator))] (-> i64)
+  (let [p (unwrap-ptr [i64] (create [i64] a))]
+    (store! p 42)
+    (let [value (load p)]
+      (destroy [i64] a p)
+      value)))
+(defn main [] (-> i64)
+  (let [debug (debug-allocator-init (malloc-allocator))
+        value (use-allocator (debug-allocator-view debug))
+        leaks (debug-allocator-deinit! debug)]
+    (if (and (= value 42) (= leaks 0)) 0 1)))
+EOF
+expect_rc 0 "stateful debug allocator exposes a passable Allocator view" \
+  "$COIL" run "$T/dbgalloc-stateful.coil"
+for opt in -O0 -O1 -O3; do
+  expect_rc 0 "stateful debug allocator works at $opt" \
+    "$COIL" run "$T/dbgalloc-stateful.coil" "$opt"
+done
+
+cat > "$T/dbgalloc-leak.coil" <<'EOF'
+(module m)
+(import "coil.alloc" :use *)
+(import "coil.dbgalloc" :use *)
+(defn main [] (-> i64)
+  (let [debug (debug-allocator-init (malloc-allocator))
+        a (debug-allocator-view debug)
+        p (unwrap-ptr [i64] (create [i64] a))]
+    (store! p 7)
+    (debug-allocator-deinit! debug)))
+EOF
+expect_out "debug-allocator leaked 1 allocation" "debug allocator reports live allocations at deinit" \
+  "$COIL" run "$T/dbgalloc-leak.coil"
+expect_rc 1 "debug allocator deinit returns the live leak count" \
+  "$COIL" run "$T/dbgalloc-leak.coil"
+
+cat > "$T/dbgalloc-invalid-free.coil" <<'EOF'
+(module m)
+(import "coil.alloc" :use *)
+(import "coil.dbgalloc" :use *)
+(defn main [] (-> i64)
+  (let [debug (debug-allocator-init (malloc-allocator))
+        a (debug-allocator-view debug)]
+    (raw-free a (coil.primitive/cast (ptr i8) 4096) 8 8)))
+EOF
+expect_out "invalid free in debug-allocator" "debug allocator rejects an unowned pointer without dereferencing it" \
+  "$COIL" run "$T/dbgalloc-invalid-free.coil"
+
+cat > "$T/dbgalloc-interior-free.coil" <<'EOF'
+(module m)
+(import "coil.alloc" :use *)
+(import "coil.dbgalloc" :use *)
+(defn main [] (-> i64)
+  (let [debug (debug-allocator-init (malloc-allocator))
+        a (debug-allocator-view debug)]
+    (match (raw-alloc a 16 8)
+      (None [] 1)
+      (Some [p] (raw-free a (coil.primitive/index p 1) 15 8)))))
+EOF
+expect_out "interior pointer passed to debug-allocator free" "debug allocator diagnoses an interior-pointer free" \
+  "$COIL" run "$T/dbgalloc-interior-free.coil"
+
+cat > "$T/dbgalloc-alignment.coil" <<'EOF'
+(module m)
+(import "coil.alloc" :use *)
+(import "coil.dbgalloc" :use *)
+(defn main [] (-> i64)
+  (let [debug (debug-allocator-init (malloc-allocator))
+        a (debug-allocator-view debug)]
+    (match (raw-alloc a 17 256)
+      (None [] 1)
+      (Some [p]
+            (let [aligned (= (coil.primitive/irem (coil.primitive/cast i64 p) 256) 0)]
+              (raw-free a p 17 256)
+              (let [leaks (debug-allocator-deinit! debug)]
+                (if (and aligned (= leaks 0)) 0 1)))))))
+EOF
+expect_rc 0 "debug allocator honors over-aligned requests independently of its backing allocator" \
+  "$COIL" run "$T/dbgalloc-alignment.coil"
+
 echo "== stack-return lint under --debug-checks (mem-8) =="
 # A bundled (checker …) the driver auto-applies under --debug-checks warns when a
 # function returns a pointer to a stack local (clang warns on the identical C; Coil was
@@ -912,7 +1427,8 @@ expect_out "returns a pointer to a stack local" "--debug-checks warns on a stack
 # OFF (default): the checker is not even loaded — silent, zero cost.
 out=$("$COIL" build "$T/dangle.coil" -o "$T/dl3" 2>&1)
 echo "$out" | grep -q "stack local" && bad "off: the lint must not run" "$out" \
-                                    || ok "off: the stack-return lint is not loaded (zero cost)"
+                                      || ok "off: the stack-return lint is not loaded (zero cost)"
+
 # no false positive: a function returning a HEAP pointer is fine under the flag.
 cat > "$T/heapret.coil" <<'EOF'
 (module m)

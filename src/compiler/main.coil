@@ -31,8 +31,9 @@
 (import "codegen" :use *)
 (import "normalize" :use *)
 (import "diag" :use *)
+(import "trace" :as tr)
 (import "comptime" :use *)
-(import "metaengine" :use *)
+(import "metaengine" :as me :use *)
 (import "expander" :use *)
 (import "comptime_eval" :use *)  ; compiled comptime/const fold (interp deletion step 1)
 (import "cga64" :use *)
@@ -48,26 +49,57 @@
         w (buffered-output-writer bout (stdout))
         (mut sp0) (al-new [(slice u8)] a)
         (mut st0) (al-new [(slice u8)] a)
-        result (match (run-pipeline a src cwd w path (mut sp0) (mut st0))
-                 (Some [mp] (do (emit-ir-normalized a w mp triple) 1))
-                 (None [] 0))]
+        result
+          (match (run-pipeline a src cwd w path (mut sp0) (mut st0))
+            (Some [mp] (do (emit-ir-normalized a w mp triple (sanitize-mode) (debug-checks?)) 1))
+            (None [] 0))]
     (buffered-output-flush bout)
     result))
 
-; The `default<On>` pipeline string for level `n`, with asan appended when
-; --sanitize=address asked for it. Spelled out rather than built because
-; LLVMRunPasses takes a C string and these are the only four.
-(defn opt-pipeline [(sanitize bool) (n i64)] (-> (ptr i8))
+; Optimization plus the selected sanitizer pass. UBSan checks are emitted during
+; lowering because LLVM has no general UBSan IR pass (Clang normally inserts them
+; in its language frontend).
+(defn opt-pipeline [(sanitize i64) (n i64)] (-> (ptr i8))
   (do
-    (cond sanitize
+    (cond (= sanitize (primitive/cast i64 1))
             (cond (= n (primitive/cast i64 0)) c"default<O0>,asan"
                   (= n (primitive/cast i64 1)) c"default<O1>,asan"
                   (= n (primitive/cast i64 2)) c"default<O2>,asan"
                   :else c"default<O3>,asan")
+          (= sanitize (primitive/cast i64 2))
+            (cond (= n (primitive/cast i64 0)) c"default<O0>,tsan-module,tsan"
+                  (= n (primitive/cast i64 1)) c"default<O1>,tsan-module,tsan"
+                  (= n (primitive/cast i64 2)) c"default<O2>,tsan-module,tsan"
+                  :else c"default<O3>,tsan-module,tsan")
+          (= sanitize (primitive/cast i64 3))
+            (cond (= n (primitive/cast i64 0)) c"default<O0>,msan"
+                  (= n (primitive/cast i64 1)) c"default<O1>,msan"
+                  (= n (primitive/cast i64 2)) c"default<O2>,msan"
+                  :else c"default<O3>,msan")
           (= n (primitive/cast i64 0)) c"default<O0>"
           (= n (primitive/cast i64 1)) c"default<O1>"
           (= n (primitive/cast i64 2)) c"default<O2>"
           :else c"default<O3>")))
+
+; Reject malformed modules before they enter LLVM's optimizer or target emitter.
+; LLVMReturnStatusAction = 2 makes the verifier return its message instead of
+; printing or aborting, so an internal codegen bug is a deterministic CLI error.
+(defn verify-module! [(m (ptr i8)) (phase (slice u8))] (-> i64)
+  (let [message (alloc/stack (ptr i8))]
+    (store! message (primitive/cast (ptr i8) 0))
+    (when (!= (LLVMVerifyModule m 2 message) (primitive/cast i32 0))
+      (let [w (stderr)
+            msg (load message)]
+        (ps w "error: LLVM module verification failed ")
+        (ps w phase)
+        (ps w ":\n")
+        (when (!= (primitive/cast i64 msg) (primitive/cast i64 0))
+          (ps w (cstr->slice msg))
+          (LLVMDisposeMessage msg)
+          0)
+        (exit 1)
+        0))
+    0))
 ; mono'd Program -> native object file. Mirrors
 ; (the release/`src_path = None` path): build the module (codegen-module already
 ; sets target + datalayout), create a host target machine (cpu "generic", no
@@ -79,12 +111,18 @@
                     (mp (ptr Program))
                     (obj-cstr (ptr i8))
                     (triple-override (ptr i8))
-                    (sanitize bool)
+                    (sanitize i64)
                     (optlvl i64)] (-> i64)
-  (let [m (codegen-module a mp triple-override)
-        triple (if (!= (primitive/cast i64 triple-override) (primitive/cast i64 0)) triple-override (LLVMGetDefaultTargetTriple))
+  (let [lower-span (tr/span-begin "backend.llvm-lower")
+        m (codegen-module a mp triple-override sanitize (debug-checks?))
+        _lower-end (tr/span-end lower-span)
+        triple
+          (if (!= (primitive/cast i64 triple-override) (primitive/cast i64 0))
+              triple-override
+              (LLVMGetDefaultTargetTriple))
         targetout (alloc/stack (ptr i8))
         errout (alloc/stack (ptr i8))]
+    (verify-module! m "after lowering")
     ; AsmPrinter init (targets themselves were initialized inside codegen-module).
     (LLVMInitializeAArch64AsmPrinter)
     (LLVMInitializeX86AsmPrinter)
@@ -95,14 +133,14 @@
     (LLVMInitializeX86AsmParser)
     ; see codegen-module: the status and errout are load-bearing, not decoration.
     (when (!= (LLVMGetTargetFromTriple triple targetout errout) (primitive/cast i32 0))
-          (let [w (stderr)]
-            (ps w "error: unsupported --target '")
-            (ps w (cstr->slice triple))
-            (ps w "': ")
-            (ps w (cstr->slice (load errout)))
-            (wb w 10)
-            (exit 1)
-            0))
+      (let [w (stderr)]
+        (ps w "error: unsupported --target '")
+        (ps w (cstr->slice triple))
+        (ps w "': ")
+        (ps w (cstr->slice (load errout)))
+        (wb w 10)
+        (exit 1)
+        0))
     (let [tm
             (LLVMCreateTargetMachine (load targetout)
                                      triple
@@ -116,31 +154,50 @@
           ; the O3 pipeline so the emitted object is instrumented. Only the PROGRAM
           ; object takes this path — the metaprogram dylib passes sanitize=false, so
           ; the compiler never dlopen's an ASan-instrumented object.
-          rp (LLVMRunPasses m (opt-pipeline sanitize optlvl) tm pbo)]
+          optimize-span (tr/span-begin "backend.llvm-optimize")
+          rp (LLVMRunPasses m (opt-pipeline sanitize optlvl) tm pbo)
+          _optimize-end (tr/span-end optimize-span)]
       (when (not (= (primitive/cast i64 rp) (primitive/cast i64 0)))
-            (ps (stderr) "codegen: LLVMRunPasses failed: ")
-            (ps (stderr) (cstr->slice (LLVMGetErrorMessage rp)))
-            (wb (stderr) 10)
-            (abort)
-            0)
+        (ps (stderr) "codegen: LLVMRunPasses failed: ")
+        (ps (stderr) (cstr->slice (LLVMGetErrorMessage rp)))
+        (wb (stderr) 10)
+        (abort)
+        0)
+      (verify-module! m "after optimization")
       (let [emiterr (alloc/stack (ptr i8))
-            rc (LLVMTargetMachineEmitToFile tm m obj-cstr 1 emiterr)]
-        ; A non-writable object destination (e.g. a read-only dir, or `-o /dev/null`
-        ; whose `.o` lands in unwritable `/dev`) used to SIGABRT here with a bare
-        ; `Operation not permitted`, naming neither the path nor a remedy. Report a clear
-        ; located error and exit 1 — a usage mistake, not a compiler panic. `-o /dev/null`
-        ; itself is intercepted earlier and routed to `check` (diag-12).
-        (when (!= rc (primitive/cast i32 0))
-              (let [w (stderr)]
-                (ps w "error: could not write object file '")
-                (ps w (cstr->slice obj-cstr))
-                (ps w "': ")
-                (ps w (cstr->slice (load emiterr)))
-                (wb w 10)
-                (ps w
-                    "  the output path is not writable — give `-o` a writable path, or use `coil check <file>` to typecheck without emitting an object\n")
-                (exit 1)
-                0)))
+            tmp-s (sconcat a (cstr->slice obj-cstr) ".tmp")
+            tmp-cstr (slice->cstr a tmp-s)]
+        ; LLVM opens with truncation, so never point it at the user's final path.
+        ; A stale temp from an interrupted prior invocation is safe to discard.
+        (me/unlink tmp-cstr)
+        (let [emit-span (tr/span-begin "backend.object-emit")
+              rc (LLVMTargetMachineEmitToFile tm m tmp-cstr 1 emiterr)
+              _emit-end (tr/span-end emit-span)]
+          ; A non-writable object destination (e.g. a read-only dir, or `-o /dev/null`
+          ; whose `.o` lands in unwritable `/dev`) used to SIGABRT here with a bare
+          ; `Operation not permitted`, naming neither the path nor a remedy. Report a clear
+          ; located error and exit 1 — a usage mistake, not a compiler panic. `-o /dev/null`
+          ; itself is intercepted earlier and routed to `check` (diag-12).
+          (when (!= rc (primitive/cast i32 0))
+            (let [w (stderr)]
+              (ps w "error: could not write object file '")
+              (ps w (cstr->slice obj-cstr))
+              (ps w "': ")
+              (ps w (cstr->slice (load emiterr)))
+              (wb w 10)
+              (ps w
+                  "  the output path is not writable — give `-o` a writable path, or use `coil check <file>` to typecheck without emitting an object\n")
+              (me/unlink tmp-cstr)
+              (exit 1)
+              0))
+          (when (!= (me/rename tmp-cstr obj-cstr) (primitive/cast i32 0))
+            (let [w (stderr)]
+              (ps w "error: could not finalize object file '")
+              (ps w (cstr->slice obj-cstr))
+              (ps w "'\n")
+              (me/unlink tmp-cstr)
+              (exit 1)
+              0))))
       0)))
 
 ; Returns 1 if the pipeline succeeded (object emitted), 0 if a diagnostic was
@@ -156,7 +213,7 @@
         (mut sp0) (al-new [(slice u8)] a)
         (mut st0) (al-new [(slice u8)] a)]
     (match (run-pipeline a src cwd w path (mut sp0) (mut st0))
-      (Some [mp] (do (build-object a mp obj-cstr triple (sanitize-address?) (opt-level)) 1))
+      (Some [mp] (do (build-object a mp obj-cstr triple (sanitize-mode) (opt-level)) 1))
       (None [] 0))))
 
 ; `__normalize` debug subcommand: print normalized textual LLVM IR of `src`.
@@ -174,7 +231,7 @@
 (defn meta-build-obj-llvm [(a (ptr Allocator)) (mp (ptr Program)) (obj (ptr i8))] (-> i64)
   ; NEVER sanitize the metaprogram dylib: it is dlopen'd into the compiler, and an
   ; ASan-instrumented dylib loaded that late aborts the process (mem-7).
-  (build-object a mp obj (primitive/cast (ptr i8) 0) false (meta-opt-level)))
+  (build-object a mp obj (primitive/cast (ptr i8) 0) 0 (meta-opt-level)))
 
 ; The comptime object, handed back IN MEMORY so comptime_eval can load it straight
 ; into executable pages (jit.coil) instead of forking `cc -dynamiclib` per site.

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import os
 import shlex
@@ -123,7 +124,7 @@ def test(args: argparse.Namespace) -> None:
         test_modernize_fast(compiler)
 
 
-def test_modernize_fast(compiler: str) -> None:
+def _test_modernize_fast_serial(compiler: str) -> None:
     """Bounded focused tests for an already-built candidate compiler."""
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="coil-modernize-fast-") as raw_tmp:
@@ -283,6 +284,148 @@ source-roots = ["src"]
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if result.returncode == 0 or before != hashlib.sha256(project_main.read_bytes()).digest():
             raise SystemExit("fast modernization gate: failed project fix was not rolled back atomically")
+
+    elapsed = time.monotonic() - started
+    if elapsed >= 30:
+        raise SystemExit(f"fast modernization gate exceeded its 30s budget: {elapsed:.2f}s")
+    print(f"fast modernization gate: PASS ({elapsed:.2f}s, compiler={candidate})")
+
+
+def test_modernize_fast(compiler: str) -> None:
+    """Run the independent focused fixtures concurrently, within the 30s gate."""
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="coil-modernize-fast-") as raw_tmp:
+        tmp = Path(raw_tmp)
+        candidate = Path(compiler).resolve()
+        if not candidate.is_file():
+            raise SystemExit(f"fast modernization gate: compiler not found: {candidate}")
+        coil = str(candidate)
+
+        def expect_rejected(path: str, message: str) -> None:
+            result = subprocess.run([coil, "check", path], cwd=ROOT,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode == 0:
+                raise RuntimeError(message)
+
+        def cimport_task() -> None:
+            bindings = tmp / "cimport-expressions.coil"
+            execute(coil, "cimport", "tests/compiler/cimport/expressions.h", "-o", str(bindings))
+            generated = bindings.read_text()
+            for expected in ("(const COIL_ALIAS_OPTION 256)", "(const COIL_OR_OPTION 260)",
+                             "(const COIL_CAST_OPTION 512)", "(array u8 37)",
+                             "(defstruct coil_uninspectable :layout explicit"):
+                if expected not in generated:
+                    raise RuntimeError(f"fast modernization gate: cimport omitted {expected!r}")
+            execute(coil, "check", str(bindings))
+
+        def build_run(source: str, name: str, *flags: str, want: int = 0) -> None:
+            output = tmp / name
+            execute(coil, "build", source, *flags, "-o", str(output))
+            result = subprocess.run([str(output)], cwd=ROOT)
+            if result.returncode != want:
+                raise RuntimeError(f"fast modernization gate: {name} returned {result.returncode}, want {want}")
+
+        def aggregate_ir_task() -> None:
+            source = "tests/compiler/features/aggregate_loop_stack.coil"
+            ir = subprocess.run([coil, "emit-ir", source], cwd=ROOT,
+                                stdout=subprocess.PIPE, text=True, check=True).stdout
+            main_ir = ir.split("define i64 @main", 1)[1].split("\n}", 1)[0]
+            if "alloca " in main_ir.split("loop.body:", 1)[1]:
+                raise RuntimeError("fast modernization gate: aggregate loop contains a dynamic alloca")
+
+        def reexport_task() -> None:
+            build_run("tests/compiler/features/reexport_qualified.coil", "reexport-qualified",
+                      "--backend", "arm64", want=42)
+            expect_rejected("tests/compiler/features/reexport_private_rejected.coil",
+                            "fast modernization gate: facade leaked a private re-export")
+
+        def lint_task() -> None:
+            probe = tmp / "probe.coil"
+            probe.write_text("""(module modernization-probe)
+(import "coil.primitive" :as primitive)
+(defn main [] (-> i64)
+  (let [(mut x) 0]
+    (primitive/store! x 2)
+    (if (primitive/icmp-ge (primitive/load x) 2) 0 1)))
+""")
+            execute(coil, "lint", str(probe), "--fix", "--allow-dirty")
+            fixed = probe.read_text()
+            if any(token in fixed for token in
+                   ("primitive/load", "primitive/store!", "primitive/field", "primitive/icmp-")):
+                raise RuntimeError("fast modernization gate: autofix left a legacy core operation")
+            before = hashlib.sha256(fixed.encode()).digest()
+            execute(coil, "lint", str(probe), "--fix", "--allow-dirty")
+            if before != hashlib.sha256(probe.read_bytes()).digest():
+                raise RuntimeError("fast modernization gate: lint --fix is not idempotent")
+
+        def broken_lint_task() -> None:
+            broken = tmp / "broken.coil"
+            broken.write_text("""(module broken-modernization-probe)
+(defn main [] (-> i64) (iadd missing 1))
+""")
+            before = hashlib.sha256(broken.read_bytes()).digest()
+            result = subprocess.run([coil, "lint", str(broken), "--fix", "--allow-dirty"],
+                                    cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode == 0 or before != hashlib.sha256(broken.read_bytes()).digest():
+                raise RuntimeError("fast modernization gate: failed fix was not rolled back byte-for-byte")
+
+        def broken_project_task() -> None:
+            project = tmp / "broken-project"
+            (project / "src").mkdir(parents=True)
+            (project / "Coil.toml").write_text("""[package]
+name = "broken-project"
+entry = "src/main.coil"
+source-roots = ["src"]
+""")
+            main = project / "src/main.coil"
+            main.write_text("""(module broken-project)
+(import "broken-dependency")
+(defn main [] (-> i64) (iadd 40 2))
+""")
+            (project / "src/dependency.coil").write_text("""(module broken-dependency)
+(defn broken [] (-> i64) missing)
+""")
+            before = hashlib.sha256(main.read_bytes()).digest()
+            result = subprocess.run([coil, "lint", "--fix", "--allow-dirty"], cwd=project,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode == 0 or before != hashlib.sha256(main.read_bytes()).digest():
+                raise RuntimeError("fast modernization gate: failed project fix was not rolled back atomically")
+
+        tasks = [
+            cimport_task,
+            lambda: build_run("tests/compiler/features/integer_ord_all_widths.coil", "integer-widths",
+                              "--backend", "arm64"),
+            lambda: build_run("tests/compiler/features/ambient_core_ops.coil", "ambient-core-ops",
+                              "--backend", "arm64"),
+            lambda: expect_rejected("tests/compiler/features/nonambient_primitive_rejected.coil",
+                                    "fast modernization gate: non-ambient primitive compiled"),
+            lambda: expect_rejected("tests/compiler/features/nonambient_alloc_rejected.coil",
+                                    "fast modernization gate: non-ambient allocation compiled"),
+            lambda: build_run("tests/compiler/features/refer_control.coil", "refer-control",
+                              "--backend", "arm64"),
+            lambda: execute(coil, "check", "tests/compiler/features/refer_no_core.coil"),
+            lambda: execute(coil, "check", "tests/compiler/features/refer_core_qualified.coil"),
+            reexport_task,
+            lambda: build_run("tests/compiler/features/process_facade.coil", "process-facade",
+                              "--backend", "arm64"),
+            lambda: build_run("tests/hosted_system_test.coil", "hosted-system", "--backend", "arm64"),
+            lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o0", "-O0"),
+            lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o3", "-O3"),
+            aggregate_ir_task,
+            lambda: build_run("src/examples/bitfields.coil", "static-assert", "--backend", "arm64", want=42),
+            lint_task,
+            broken_lint_task,
+            broken_project_task,
+        ]
+        for surface in ("value", "macro", "method", "alias"):
+            path = f"tests/compiler/features/refer_exclude_{surface}_rejected.coil"
+            tasks.append(lambda path=path, surface=surface: expect_rejected(
+                path, f"fast modernization gate: excluded {surface} survived"))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(tasks))) as pool:
+            futures = [pool.submit(task) for task in tasks]
+            for future in futures:
+                future.result()
 
     elapsed = time.monotonic() - started
     if elapsed >= 30:

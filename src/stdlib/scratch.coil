@@ -1,0 +1,169 @@
+(module coil.scratch)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+
+;; An owned segmented bump allocator for request/turn/compiler-pass scratch memory.
+;; Individual free is deliberately a no-op; reset/close release whole segments.
+(defstruct ScratchSegment
+  [(previous (ptr ScratchSegment))
+   (data (ptr i8))
+   (cap i64)
+   (off i64)])
+
+(defstruct ScratchArena
+  [(parent (ptr alloc/Allocator))
+   (current (ptr ScratchSegment))
+   (initial-cap i64)
+   (allocator alloc/Allocator)
+   (closed bool)])
+
+(defstruct ScratchMark
+  [(segment (ptr ScratchSegment))
+   (off i64)])
+
+(defn scratch-align-up [(x i64) (align i64)] (-> i64)
+  (primitive/imul (primitive/idiv (primitive/iadd x (primitive/isub align 1)) align) align))
+
+(defn scratch-new-segment! [(arena (ptr ScratchArena)) (minimum i64)] (-> (Option (ptr ScratchSegment)))
+  (let [current (load (field arena current))
+        prior-cap
+          (if (= (primitive/cast i64 current) 0)
+              0
+              (load (field current cap)))
+        grown
+          (if (= prior-cap 0)
+              (load (field arena initial-cap))
+              (primitive/imul prior-cap 2))
+        cap (if (> minimum grown) minimum grown)
+        parent (load (field arena parent))]
+    (match (alloc/create [ScratchSegment] parent)
+      (None [] (None))
+      (Some [segment]
+            (match (alloc/raw-alloc parent cap 16)
+              (None [] (do (alloc/destroy parent segment) (None)))
+              (Some [data]
+                    (do
+                      (store! (field segment previous) current)
+                      (store! (field segment data) data)
+                      (store! (field segment cap) cap)
+                      (store! (field segment off) 0)
+                      (store! (field arena current) segment)
+                      (Some segment))))))))
+
+(defn scratch-alloc-hook [(ctx (ptr i8)) (size i64) (align i64)] (-> (Option (ptr i8)))
+  (let [arena (primitive/cast (ptr ScratchArena) ctx)]
+    (if (load (field arena closed))
+        (None)
+        (let [current (load (field arena current))]
+          (if (= (primitive/cast i64 current) 0)
+              (match (scratch-new-segment! arena (primitive/iadd size align))
+                (None [] (None))
+                (Some [_] (scratch-alloc-hook ctx size align)))
+              (let [off (scratch-align-up (load (field current off)) align)
+                    end (primitive/iadd off size)]
+                (if (<= end (load (field current cap)))
+                    (do
+                      (store! (field current off) end)
+                      (Some (primitive/index (load (field current data)) off)))
+                    (match (scratch-new-segment! arena (primitive/iadd size align))
+                      (None [] (None))
+                      (Some [_] (scratch-alloc-hook ctx size align))))))))))
+
+(defn scratch-resize-hook [(ctx (ptr i8))
+                           (data (ptr i8))
+                           (old i64)
+                           (new i64)
+                           (align i64)] (-> (Option (ptr i8)))
+  (let [arena (primitive/cast (ptr ScratchArena) ctx)]
+    (if (or (load (field arena closed))
+            (or (= old 0) (= data (primitive/cast (ptr i8) 0))))
+        (if (load (field arena closed)) (None) (scratch-alloc-hook ctx new align))
+        (let [current (load (field arena current))]
+          (if (= (primitive/cast i64 current) 0)
+              (None)
+              (let [base (load (field current data))
+                    start (primitive/isub (primitive/cast i64 data) (primitive/cast i64 base))]
+                (if (and (>= start 0)
+                         (and (= (primitive/iadd start old) (load (field current off)))
+                              (<= (primitive/iadd start new) (load (field current cap)))))
+                    (do
+                      (store! (field current off) (primitive/iadd start new))
+                      (Some data))
+                    (None))))))))
+
+(defn scratch-free-hook [(ctx (ptr i8))
+                         (data (ptr i8))
+                         (size i64)
+                         (align i64)] (-> i64)
+  0)
+
+;; Initialize caller-owned state. `initial-cap` is clamped to 256 bytes so a zero or
+;; accidental tiny hint cannot create one backing allocation per small object.
+(defn scratch-init-with-cap [(arena (ptr ScratchArena))
+                             (parent (ptr alloc/Allocator))
+                             (initial-cap i64)] (-> (ptr ScratchArena))
+  (store! (field arena parent) parent)
+  (store! (field arena current) (primitive/cast (ptr ScratchSegment) 0))
+  (store! (field arena initial-cap) (if (< initial-cap 256) 256 initial-cap))
+  (store! (field arena closed) false)
+  (store! (field (field arena allocator) alloc) (primitive/fnptr-of scratch-alloc-hook))
+  (store! (field (field arena allocator) resize) (primitive/fnptr-of scratch-resize-hook))
+  (store! (field (field arena allocator) free) (primitive/fnptr-of scratch-free-hook))
+  (store! (field (field arena allocator) ctx) (primitive/cast (ptr i8) arena))
+  arena)
+
+(defn scratch-init [(arena (ptr ScratchArena))
+                    (parent (ptr alloc/Allocator))] (-> (ptr ScratchArena))
+  (scratch-init-with-cap arena parent 4096))
+
+(defn scratch-allocator [(arena (ptr ScratchArena))] (-> (ptr alloc/Allocator))
+  (field arena allocator))
+
+(defn scratch-mark [(arena (ptr ScratchArena))] (-> ScratchMark)
+  (let [mark (alloc/stack ScratchMark)
+        segment (load (field arena current))]
+    (store! (field mark segment) segment)
+    (store! (field mark off)
+            (if (= (primitive/cast i64 segment) 0) 0 (load (field segment off))))
+    (load mark)))
+
+(defn scratch-release-current! [(arena (ptr ScratchArena))] (-> i64)
+  (let [segment (load (field arena current))]
+    (when (!= (primitive/cast i64 segment) 0)
+      (store! (field arena current) (load (field segment previous)))
+      (alloc/raw-free (load (field arena parent))
+                      (load (field segment data))
+                      (load (field segment cap))
+                      16)
+      (alloc/destroy (load (field arena parent)) segment))
+    0))
+
+;; Release everything allocated after `mark`. Marks are arena-specific and become
+;; invalid when their segment is released by an earlier reset.
+(defn scratch-reset-to! [(arena (ptr ScratchArena)) (mark ScratchMark)] (-> i64)
+  (unless (load (field arena closed))
+    (let [target (load (field mark segment))]
+      (loop (if (= (load (field arena current)) target)
+                (break)
+                (if (= (primitive/cast i64 (load (field arena current))) 0)
+                    (break)
+                    (scratch-release-current! arena))))
+      (when (!= (primitive/cast i64 target) 0)
+        (store! (field target off) (load (field mark off))))))
+  0)
+
+(defn scratch-reset! [(arena (ptr ScratchArena))] (-> i64)
+  (unless (load (field arena closed))
+    (loop (if (= (primitive/cast i64 (load (field arena current))) 0)
+              (break)
+              (scratch-release-current! arena))))
+  0)
+
+(defn scratch-close! [(arena (ptr ScratchArena))] (-> i64)
+  (unless (load (field arena closed))
+    (scratch-reset! arena)
+    (store! (field arena closed) true))
+  0)
+
+(defn scratch-closed? [(arena (ptr ScratchArena))] (-> bool)
+  (load (field arena closed)))

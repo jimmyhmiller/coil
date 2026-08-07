@@ -113,7 +113,8 @@ def reset(directory: Path) -> None:
 
 
 def snapshot_simple(compiler: Path, stage: str, inputs: list[str], *, command: str | None = None,
-                    extra: tuple[str, ...] = (), suffix: str = ".dump", allow_fail: bool = False) -> list[str]:
+                    extra: tuple[str, ...] = (), suffix: str = ".dump", allow_fail: bool = False,
+                    expected_failures: set[str] | None = None) -> list[str]:
     base = ORACLE if stage == "read" else ORACLE / stage
     reference = base / "reference"
     corpus = base / "corpus.txt"
@@ -125,7 +126,7 @@ def snapshot_simple(compiler: Path, stage: str, inputs: list[str], *, command: s
             first = result.stderr.decode(errors="replace").splitlines()[:1]
             print(f"SKIP {source}: {first[0] if first else 'compiler failed'}")
             continue
-        if result.returncode:
+        if result.returncode and source not in (expected_failures or set()):
             sys.stderr.buffer.write(result.stderr)
             raise SystemExit(f"snapshot {stage} failed: {source}")
         (reference / f"{mangle(source)}{suffix}").write_bytes(result.stdout)
@@ -177,9 +178,11 @@ def snapshot(compiler: Path, stage: str) -> int:
         accepted = snapshot_simple(compiler, stage, inputs)
     elif stage in ("load", "resolved", "checked", "expand", "mono", "ir"):
         inputs = list(STAGE_INPUTS[stage])
+        expected_failures: set[str] = set()
         if stage == "checked":
-            inputs += [rel(path) for path in sorted((ORACLE / "checked/fixtures").glob("*.coil"))]
-        accepted = snapshot_simple(compiler, stage, inputs)
+            expected_failures = {rel(path) for path in sorted((ORACLE / "checked/fixtures").glob("*.coil"))}
+            inputs += sorted(expected_failures)
+        accepted = snapshot_simple(compiler, stage, inputs, expected_failures=expected_failures)
     elif stage == "full":
         accepted = snapshot_simple(compiler, stage, STAGE_INPUTS[stage],
                                    command=os.environ.get("COIL_IR_CMD", "emit-ir"))
@@ -245,7 +248,8 @@ def gate(compiler: Path, stage: str, verbose: bool) -> int:
     for source in read_list(base / "corpus.txt"):
         result = run(compiler, COMMAND[stage], source, *extra)
         reference = base / "reference" / f"{mangle(source)}{suffix}"
-        if result.returncode == 0 and reference.is_file() and result.stdout.rstrip(b"\n") == reference.read_bytes().rstrip(b"\n"):
+        expected_code = 1 if stage == "checked" and source.startswith("tests/compiler/oracle/checked/fixtures/") else 0
+        if result.returncode == expected_code and reference.is_file() and result.stdout.rstrip(b"\n") == reference.read_bytes().rstrip(b"\n"):
             passed += 1
             continue
         failures.append(source)

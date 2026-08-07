@@ -6,60 +6,193 @@
 ;   (import "coil.dbgalloc" :use *)
 ;   (let [a (debug-allocator (malloc-allocator))] …)   ; wrap ANY allocator
 ;
-; `(debug-allocator inner)` is a MACRO: with --debug-checks OFF it is EXACTLY `inner`
-; (no wrapper, zero cost); ON it returns a wrapping allocator that, per block, prepends
-; a `{magic,size}` header and:
-;   * free() checks the magic — a SECOND free (or a corrupt header) is a located
-;     "double free or heap corruption" abort instead of a bare signal or silent reuse;
-;   * free() then POISONS the payload to 0xDE, so a use-after-free reads an obvious
-;     sentinel (0xDEDEDEDE…) instead of live-looking data, and the real block is freed.
+; The explicit init/view/deinit API is a Zig-style stateful allocator: wrap any backing
+; allocator, pass its ordinary Allocator view through existing APIs, then deinit to
+; reclaim quarantine and obtain a live-leak count. `(debug-allocator inner)` is the
+; zero-cost convenience macro: with --debug-checks OFF it is exactly `inner`; ON it
+; creates the same registry-backed wrapper without requiring explicit teardown.
 ; It lives in its OWN module (not src/stdlib/alloc.coil) so the always-loaded core allocator
 ; stays byte-for-byte unchanged in release builds — the debug hooks are concrete C-ABI
 ; functions that mono cannot dead-strip, so bundling them into alloc.coil would emit
 ; them into every allocating program. This module is loaded only when imported.
-(export debug-allocator)
+(export DebugAllocator
+        debug-allocator-init
+        debug-allocator-view
+        debug-allocator-deinit!
+        debug-allocator)
 
-(import "coil.alloc" :use *)   ; Allocator, raw-alloc/raw-free, create, unwrap-ptr, abort
-(import "coil.slice" :use *)   ; slice-data / slice-len for the diagnostic message
+(import "coil.alloc" :use *)  ; Allocator, raw-alloc/raw-free, create, unwrap-ptr, abort
+(import "coil.atomic" :use [atomic-cas atomic-store])
+(import "coil.slice" :use *)  ; slice-data / slice-len for the diagnostic message
 
 ;; write(2) for the diagnostic. Kept module-private (only `debug-allocator` is exported)
 ;; so it never collides with io.coil's `write` through a `:use *` re-export.
-(extern write :cc c [i32 (ptr i8) isize] (-> isize))   ; ssize_t write(int fd, const void*, size_t)
+(extern write :cc c [i32 (ptr i8) isize] (-> isize))  ; ssize_t write(int fd, const void*, size_t)
 
 ;; A live block's header magic (0xDEADBEEF) and a freed block's (0xDEADDEAD). Chosen to be
 ;; wildly improbable as real leading payload words, and to make a freed block obvious.
-(defn dbg-magic-live [] (-> i64) 3735928559)   ; 0xDEADBEEF
-(defn dbg-magic-dead [] (-> i64) 3735936685)   ; 0xDEADFDED
+(defn dbg-magic-live [] (-> i64)
+  3735928559)  ; 0xDEADBEEF
+(defn dbg-magic-dead [] (-> i64)
+  3735936685)  ; 0xDEADFDED
 
-;; Header carried in front of every user block; the payload begins `dbg-hdr-bytes` after.
-(defstruct DbgHdr [(magic i64) (size i64)])
-(defn dbg-hdr-bytes [] (-> i64) 16)            ; sizeof DbgHdr (two i64)
+;; Metadata is kept separately from user storage. Free first finds the exact
+;; payload in this allocator-owned registry, so an arbitrary or interior pointer
+;; is diagnosed without dereferencing memory derived from that pointer.
+(defstruct DbgRecord
+  [(next (ptr DbgRecord))
+   (base (ptr i8))
+   (payload (ptr i8))
+   (total i64)
+   (size i64)
+   (alignment i64)
+   (magic i64)])
+
+(defstruct DebugAllocator
+  [(allocator Allocator)
+   (inner (ptr Allocator))
+   (head (ptr DbgRecord))
+   (lock i64)
+   (live-allocations i64)
+   (quarantined-bytes i64)])
+
+(defn dbg-prefix-bytes [] (-> i64)
+  32)
+(defn dbg-tail-bytes [] (-> i64)
+  16)
+(defn dbg-front-byte [] (-> i8)
+  (primitive/cast i8 205))  ; 0xCD
+(defn dbg-tail-byte [] (-> i8)
+  (primitive/cast i8 171))  ; 0xAB
 
 (defn dbg-report! [(msg (slice u8))] (-> i64)
   (write 2 (primitive/cast (ptr i8) (slice-data msg)) (primitive/cast isize (slice-len msg)))
-  (abort) 0)
+  (abort)
+  0)
 
 ;; Overwrite n payload bytes with 0xDE (a manual loop — no memset extern to collide).
 (defn dbg-poison! [(p (ptr i8)) (n i64)] (-> i64)
   (let [(mut i) 0]
-    (loop (if (>= (load i) n) (break)
-      (do (store! (primitive/index p (load i)) (primitive/cast i8 222))    ; 0xDE
-          (store! i (primitive/iadd (load i) 1))))))
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (store! (primitive/index p (load i)) (primitive/cast i8 222))  ; 0xDE
+                (store! i (primitive/iadd (load i) 1))))))
   0)
 
-; ---- the wrapping vtable hooks (C-ABI; ctx = the inner (ptr Allocator)) -------------
-(defn dbg-alloc [(ctx (ptr i8)) (size :i64) (align :i64)] (-> (Option (ptr i8)))
-  (let [inner (primitive/cast (ptr Allocator) ctx)]
-    (match (raw-alloc inner (primitive/iadd size (dbg-hdr-bytes)) align)
-      (None []  (None))
-      (Some [p] (let [h (primitive/cast (ptr DbgHdr) p)]
-                  (store! (field h magic) (dbg-magic-live))
-                  (store! (field h size) size)
-                  (Some (primitive/index p (dbg-hdr-bytes))))))))    ; payload = block + header
+(defn dbg-fill! [(p (ptr i8)) (n i64) (value i8)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (store! (primitive/index p (load i)) value)
+                (store! i (primitive/iadd (load i) 1))))))
+  0)
 
-(defn dbg-resize [(ctx (ptr i8)) (p (ptr i8)) (old :i64) (new :i64) (align :i64)]
-    (-> (Option (ptr i8)))
-  (None))   ; no in-place resize: the caller alloc-copy-frees, which re-checks the header
+(defn dbg-align-up [(address i64) (alignment i64)] (-> i64)
+  (primitive/imul (primitive/udiv (primitive/iadd address (primitive/isub alignment 1)) alignment)
+                  alignment))
+
+(defn dbg-lock! [(state (ptr DebugAllocator))] (-> i64)
+  (loop (if (= (atomic-cas (field state lock) 0 1) 0)
+            (break)
+            0))
+  0)
+
+(defn dbg-unlock! [(state (ptr DebugAllocator))] (-> i64)
+  (atomic-store (field state lock) 0))
+
+(defn dbg-find-record [(state (ptr DebugAllocator)) (payload (ptr i8))] (-> (ptr DbgRecord))
+  (let [(mut current) (load (field state head))
+        (mut found) (primitive/cast (ptr DbgRecord) 0)]
+    (loop (if (= (primitive/cast i64 (load current)) 0)
+              (break)
+              (if (= (primitive/cast i64 (load (field (load current) payload)))
+                     (primitive/cast i64 payload))
+                  (do (store! found (load current)) (break))
+                  (store! current (load (field (load current) next))))))
+    (load found)))
+
+(defn dbg-find-containing-record [(state (ptr DebugAllocator)) (payload (ptr i8))] (-> (ptr DbgRecord))
+  (let [(mut current) (load (field state head))
+        address (primitive/cast i64 payload)
+        (mut found) (primitive/cast (ptr DbgRecord) 0)]
+    (loop (if (= (primitive/cast i64 (load current)) 0)
+              (break)
+              (let [start (primitive/cast i64 (load (field (load current) payload)))
+                    finish (primitive/iadd start (load (field (load current) size)))]
+                (if (and (> address start) (< address finish))
+                    (do (store! found (load current)) (break))
+                    (store! current (load (field (load current) next)))))))
+    (load found)))
+
+(defn dbg-prefix-valid? [(record (ptr DbgRecord))] (-> bool)
+  (let [base (load (field record base))
+        n
+          (primitive/isub (primitive/cast i64 (load (field record payload)))
+                          (primitive/cast i64 base))
+        (mut i) 0
+        (mut valid) true]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (when (!= (load (primitive/index base (load i))) (dbg-front-byte))
+                  (store! valid false)
+                  (break))
+                (store! i (primitive/iadd (load i) 1)))))
+    (load valid)))
+
+(defn dbg-tail-valid? [(payload (ptr i8)) (size i64)] (-> bool)
+  (let [(mut i) 0
+        (mut valid) true]
+    (loop (if (>= (load i) (dbg-tail-bytes))
+              (break)
+              (do
+                (when (!= (load (primitive/index payload (primitive/iadd size (load i))))
+                          (dbg-tail-byte))
+                  (store! valid false)
+                  (break))
+                (store! i (primitive/iadd (load i) 1)))))
+    (load valid)))
+
+; ---- the wrapping vtable hooks (C-ABI; ctx = a DebugAllocator registry) -------------
+(defn dbg-alloc [(ctx (ptr i8)) (size :i64) (align :i64)] (-> (Option (ptr i8)))
+  (let [state (primitive/cast (ptr DebugAllocator) ctx)
+        inner (load (field state inner))
+        total
+          (primitive/iadd (primitive/iadd size (dbg-prefix-bytes))
+                          (primitive/iadd (dbg-tail-bytes) (primitive/isub align 1)))]
+    (match (raw-alloc inner total 8)
+      (None [] (None))
+      (Some [base]
+            (match (create [DbgRecord] inner)
+              (None [] (do (raw-free inner base total 8) (None)))
+              (Some [record]
+                    (let [payload
+                            (primitive/cast (ptr i8)
+                                            (dbg-align-up (primitive/iadd (primitive/cast i64 base) (dbg-prefix-bytes))
+                                                          align))
+                          prefix
+                            (primitive/isub (primitive/cast i64 payload)
+                                            (primitive/cast i64 base))]
+                      (dbg-fill! base prefix (dbg-front-byte))
+                      (dbg-fill! (primitive/index payload size) (dbg-tail-bytes) (dbg-tail-byte))
+                      (store! (field record base) base)
+                      (store! (field record payload) payload)
+                      (store! (field record total) total)
+                      (store! (field record size) size)
+                      (store! (field record alignment) align)
+                      (store! (field record magic) (dbg-magic-live))
+                      (dbg-lock! state)
+                      (store! (field record next) (load (field state head)))
+                      (store! (field state head) record)
+                      (store! (field state live-allocations)
+                              (primitive/iadd (load (field state live-allocations)) 1))
+                      (dbg-unlock! state)
+                      (Some payload))))))))
+
+(defn dbg-resize [(ctx (ptr i8)) (p (ptr i8)) (old :i64) (new :i64) (align :i64)] (-> (Option (ptr i8)))
+  (None))  ; no in-place resize: the caller alloc-copy-frees, which re-checks the header
 
 ;; free() QUARANTINES the block — it marks the header dead, poisons the payload, and
 ;; does NOT return the memory to the inner allocator. That is what makes detection
@@ -69,26 +202,94 @@
 ;; block keeps the DEAD magic and the 0xDE poison intact — a debug allocator trades
 ;; memory for detection (like ASan's quarantine). This is a DEBUG build only.
 (defn dbg-free [(ctx (ptr i8)) (payload (ptr i8)) (size :i64) (align :i64)] (-> :i64)
-  (let [p (primitive/index payload (primitive/isub 0 (dbg-hdr-bytes)))       ; back up to the header
-        h (primitive/cast (ptr DbgHdr) p)]
-    (if (= (load (field h magic)) (dbg-magic-dead))
-        (dbg-report! "coil: double free in debug-allocator (--debug-checks)\n")
-      (if (!= (load (field h magic)) (dbg-magic-live))
-          (dbg-report! "coil: invalid free (bad header) in debug-allocator (--debug-checks)\n")
-        0))
-    (store! (field h magic) (dbg-magic-dead))            ; mark freed — a later free trips above
-    (dbg-poison! payload (load (field h size)))          ; make use-after-free read 0xDE
-    0))                                                  ; quarantined: never returned to inner
+  (let [state (primitive/cast (ptr DebugAllocator) ctx)]
+    (dbg-lock! state)
+    (let [record (dbg-find-record state payload)]
+      (when (= (primitive/cast i64 record) 0)
+        (let [containing (dbg-find-containing-record state payload)]
+          (if (!= (primitive/cast i64 containing) 0)
+              (dbg-report! "coil: interior pointer passed to debug-allocator free (--debug-checks)\n")
+              (dbg-report! "coil: invalid free in debug-allocator (--debug-checks)\n")))
+        0)
+      (if (= (load (field record magic)) (dbg-magic-dead))
+          (dbg-report! "coil: double free in debug-allocator (--debug-checks)\n")
+          (if (!= (load (field record magic)) (dbg-magic-live))
+              (dbg-report! "coil: corrupt allocation record in debug-allocator (--debug-checks)\n")
+              0))
+      (when (!= size (load (field record size)))
+        (dbg-report! "coil: allocation size mismatch in debug-allocator (--debug-runtime)\n")
+        0)
+      (when (!= align (load (field record alignment)))
+        (dbg-report! "coil: allocation alignment mismatch in debug-allocator (--debug-runtime)\n")
+        0)
+      (when (not (dbg-prefix-valid? record))
+        (dbg-report! "coil: buffer underrun in debug-allocator (--debug-runtime)\n")
+        0)
+      (when (not (dbg-tail-valid? payload (load (field record size))))
+        (dbg-report! "coil: buffer overflow in debug-allocator (--debug-runtime)\n")
+        0)
+      (store! (field record magic) (dbg-magic-dead))
+      (dbg-poison! payload (load (field record size)))
+      (store! (field state live-allocations)
+              (primitive/isub (load (field state live-allocations)) 1))
+      (store! (field state quarantined-bytes)
+              (primitive/iadd (load (field state quarantined-bytes))
+                              (load (field record total))))
+      (dbg-unlock! state)
+      0)))  ; quarantined: never returned to inner
 
-;; Build the wrapping allocator over `inner`. The wrapper's own cell is carved from
-;; `inner` (untracked — it is not user data), and `inner` is stored as the ctx.
+;; Construct a stateful debug allocator over any backing allocator. The returned
+;; object owns the tracking registry; pass `(debug-allocator-view debug)` anywhere
+;; an ordinary `(ptr Allocator)` is expected.
+(defn debug-allocator-init [(inner (ptr Allocator))] (-> (ptr DebugAllocator))
+  (match (create [DebugAllocator] inner)
+    (None []
+          (do
+            (oom-at c"debug-allocator-init" (primitive/sizeof DebugAllocator))
+            (primitive/cast (ptr DebugAllocator) 0)))
+    (Some [state]
+          (do
+            (store! (field state inner) inner)
+            (store! (field state head) (primitive/cast (ptr DbgRecord) 0))
+            (store! (field state lock) 0)
+            (store! (field state live-allocations) 0)
+            (store! (field state quarantined-bytes) 0)
+            (store! (field (field state allocator) alloc) (primitive/fnptr-of dbg-alloc))
+            (store! (field (field state allocator) resize) (primitive/fnptr-of dbg-resize))
+            (store! (field (field state allocator) free) (primitive/fnptr-of dbg-free))
+            (store! (field (field state allocator) ctx) (primitive/cast (ptr i8) state))
+            state))))
+
+(defn debug-allocator-view [(state (ptr DebugAllocator))] (-> (ptr Allocator))
+  (field state allocator))
+
+;; Release registry metadata and every still-quarantined/live backing block.
+;; Returns the number of allocations that were still live, matching Zig's
+;; deinit leak check. Call only after all threads have stopped using the view.
+(defn debug-allocator-deinit! [(state (ptr DebugAllocator))] (-> i64)
+  (let [inner (load (field state inner))
+        leaks (load (field state live-allocations))
+        (mut current) (load (field state head))]
+    (loop (if (= (primitive/cast i64 (load current)) 0)
+              (break)
+              (let [record (load current)
+                    next (load (field record next))]
+                (raw-free inner
+                          (load (field record base))
+                          (load (field record total))
+                          8)
+                (destroy [DbgRecord] inner record)
+                (store! current next))))
+    (when (> leaks 0)
+      (oom-puts c"coil: debug-allocator leaked ")
+      (oom-putd leaks)
+      (oom-puts c" allocation(s)\n")
+      0)
+    (destroy [DebugAllocator] inner state)
+    leaks))
+
 (defn debug-allocator-on [(inner (ptr Allocator))] (-> (ptr Allocator))
-  (let [a (unwrap-ptr [Allocator] (create [Allocator] inner))]
-    (store! (field a alloc) (primitive/fnptr-of dbg-alloc))
-    (store! (field a resize) (primitive/fnptr-of dbg-resize))
-    (store! (field a free) (primitive/fnptr-of dbg-free))
-    (store! (field a ctx) (primitive/cast (ptr i8) inner))
-    a))
+  (debug-allocator-view (debug-allocator-init inner)))
 
 ;; `(debug-allocator inner)` — the surface. A macro so `(primitive/debug-checks?)` decides at
 ;; expansion time: OFF it is just `inner` (byte-identical, zero cost); ON it wraps.

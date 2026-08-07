@@ -434,6 +434,59 @@ operators are how you compare them. Ordering makes range checks direct — e.g.
     (raw-free a p size align)
     ; idiom: (let [p (unwrap-ptr [T] (create [T] a))] (primitive/store! p …) p)
 
+`coil.region` is a tracking allocator: it validates exact ownership and supports
+individual free/resize, while `region-close!` releases every remaining allocation.
+Ownership lookup and removal are expected O(1), backed by a pointer registry, so a
+Region may safely use another Region as its parent without quadratic teardown. Such
+nesting still doubles tracking work and metadata; `coil lint --use coil.lint.allocator`
+warns about it, and `--debug-checks` enables that lint plus a runtime warning.
+
+For high-churn temporary memory, prefer the owned segmented allocator in
+`coil.scratch`. It allocates in amortized O(1), treats individual free as a no-op,
+and releases backing segments on reset or close:
+
+    (import "coil.scratch" :as scratch)
+    (let [scope (alloc/stack scratch/ScratchArena)]
+      (scratch/scratch-init scope (malloc-allocator))
+      (let [a (scratch/scratch-allocator scope)
+            mark (scratch/scratch-mark scope)]
+        (temporary-work a)
+        (scratch/scratch-reset-to! scope mark)
+        (more-temporary-work a))
+      (scratch/scratch-close! scope))
+
+`scratch-reset!` releases every segment while keeping the arena usable;
+`scratch-close!` is idempotent and prevents later allocation. A mark belongs to one
+arena and becomes invalid if an earlier reset has already released its segment.
+Pointers allocated after a mark must not be used after `scratch-reset-to!`.
+
+For Zig-style development allocation, `coil.dbgalloc` provides a stateful allocator
+that wraps any backing allocator while exposing the same ordinary `(ptr Allocator)`
+interface:
+
+    (import "coil.dbgalloc" :use *)
+    (let [debug (debug-allocator-init (malloc-allocator))
+          a (debug-allocator-view debug)]
+      (some-library-that-allocates a)
+      (let [leaks (debug-allocator-deinit! debug)]
+        …))
+
+The view can be stored and passed anywhere another allocator can. It tracks exact
+allocation ownership in allocator-owned metadata, checks prefix/suffix red zones,
+rejects arbitrary and interior-pointer frees without dereferencing the suspect
+pointer, checks free size and alignment, detects double frees, and poisons and
+quarantines freed payloads. `debug-allocator-deinit!` releases the registry and all
+backing blocks, prints a diagnostic when live allocations remain, and returns the
+live allocation count (`0` means leak-free). It must run only after all threads have
+stopped using the allocator view.
+
+The convenience macro `(debug-allocator inner)` returns a wrapped allocator under
+`--debug-checks` and exactly `inner` otherwise, for zero-cost conditional checking.
+Use the explicit init/view/deinit API when leak checking or deterministic teardown is
+required regardless of compiler flags. `coil.guardalloc` is the heavier alternative:
+it places allocations next to inaccessible pages and protects quarantined payload
+pages so stale accesses fault immediately.
+
 ## Collections (bundled)
 
 **ArrayList** (`arraylist.coil`): `(al-new [T] a)`, `(al-len [T] l)`,
@@ -656,6 +709,21 @@ value with the real C ABI. To call a Coil fn from C (e.g. `qsort` comparator) pa
 `(print-str w s)`, `(fmt w "n={d} s={s} f={f}\n" a b c)`. ⚠ `{f}` is a fixed
 6-digit display, NOT C `%g`; for exact float formatting call libc `snprintf` with
 `c"%g"`. `coil cimport header.h` auto-generates bindings from a real C header.
+In source, `(cimport "sys/ioctl.h" :use [ioctl])` asks Clang to emit only the
+named declarations and macros, so using a large platform header does not expose
+its whole API. The generated declaration preserves details such as C variadics.
+
+To migrate or audit a handwritten declaration, associate it with its authoritative
+header and run `coil lint`:
+
+    (extern ioctl :cc c [i32 u64 (ptr TerminalWindowSize)] (-> i32)
+            :header "sys/ioctl.h")
+
+If Clang can selectively import `ioctl`, lint reports the handwritten declaration;
+`coil lint FILE --fix` replaces it with
+`(cimport "sys/ioctl.h" :use [ioctl])`. The replacement imports only `ioctl`, not
+the header's neighboring declarations. `:header` is a lint migration annotation,
+not part of the resulting FFI declaration.
 
 ## Doc comments (`;;`)
 
@@ -751,17 +819,59 @@ check lives behind a macro branched on `(primitive/debug-checks?)` at expansion 
 off-path expansion is byte-identical to the unchecked form):
 
 - `slice-get`/`slice-set!`/`subslice` bounds-check (and `subslice` rejects `lo > hi`);
-- `(debug-allocator inner)` (`dbgalloc.coil`) wraps an allocator to detect double-free
-  and poison freed payloads to `0xDE`;
+- slice/string headers reject negative lengths and nonempty null data pointers;
+- `ArrayList` reads, writes, growth, clearing, freeing, and ownership transfer validate
+  `0 <= len <= cap`; indexed `al-get`/`al-set!` operations also bounds-check, turning
+  corrupt collection headers into named diagnostics before pointer traversal;
+- `HashMap` validates its capacity/counts, storage, allocator, and `KeyOps` vtable;
+- allocator calls validate the allocator and its three function slots;
+- `debug-allocator-init`/`debug-allocator-view` (`dbgalloc.coil`) create a passable,
+  registry-backed allocator that detects invalid/interior/double frees, size and
+  alignment mismatches, checks prefix/suffix red zones, quarantines blocks, poisons
+  freed payloads to `0xDE`, and reports live leaks from `debug-allocator-deinit!`;
+- `(guard-allocator inner)` (`guardalloc.coil`) uses inaccessible pages around mappings
+  and changes freed payload pages to `PROT_NONE` while quarantined;
 - a bundled checker warns when a function returns a pointer to a stack local.
 
 ⚠ `--debug-checks` auto-loads that checker as a metaprogram, so — exactly like
 `coil test` — the file must declare `(module NAME)`.
 
-`--sanitize=address` runs LLVM's AddressSanitizer over the program object. ⚠ The final
-link uses the system `cc`, which must supply a matching ASan runtime; where it doesn't
-(macOS with Homebrew LLVM and Apple clang) the link fails and `--debug-checks` is the
-portable option.
+`--sanitize=address` marks generated functions for LLVM AddressSanitizer and runs the
+ASan pass over the program object. Sanitized executable links use the Clang beside
+`llvm-config`, keeping instrumentation and runtime versions matched.
+
+Three additional, mutually exclusive modes cover different failure classes:
+
+- `--sanitize=thread` applies LLVM ThreadSanitizer and diagnoses unsynchronized
+  memory accesses with their participating thread stacks;
+- `--sanitize=memory` applies LLVM MemorySanitizer to find reads of uninitialized
+  values. It is Linux-only because LLVM ships no Darwin MSan runtime, and useful
+  results require native dependencies to be instrumented or intercepted too;
+- `--sanitize=undefined` inserts Coil's language-level checks for signed add/subtract/
+  multiply overflow, integer division/remainder by zero, signed division overflow,
+  and negative or oversized shift exponents. These checks are emitted in Coil codegen
+  because LLVM has no general UBSan IR pass—Clang normally inserts them in its frontend.
+
+Select only one `--sanitize=…` mode per artifact. ASan, TSan, and MSan have
+incompatible process-wide runtimes, and Coil rejects combinations rather than
+silently producing a partially instrumented executable. Metaprogram dylibs remain
+unsanitized because they are loaded into the already-running compiler process.
+
+`--debug-runtime` is the development profile: it enables `--debug-checks`, ASan,
+LLVM strong stack canaries, indirect-call/dynamic-dispatch validation, and automatic
+fatal-signal diagnostics. The crash handler reports the signal, fault address, thread,
+context pointer, recent events, and a bounded stack trace, then restores and re-raises
+the original signal. Set `COIL_CRASH_REPORT=/path/to/report` to pre-open a crash artifact;
+it includes compiler/profile/target/process metadata plus the crash report. Applications
+can add context with `debug-runtime-event!` and bound the ring with
+`debug-runtime-set-event-capacity!` from `coil.debug-runtime`.
+
+For foreign APIs that fill caller storage, `coil.checked-ffi` provides
+`with-checked-out`: it allocates the supplied probed `sizeof(T)`/`alignof(T)` range,
+surrounds the output with canaries, evaluates the foreign call, and validates the
+canaries before returning. `coil.thread/thread-spawn-configured` accepts explicit stack and guard
+sizes using a probed opaque `pthread_attr_t`. Compiler worker defaults can be overridden
+with `COIL_WORKER_STACK_SIZE` and `COIL_WORKER_GUARD_SIZE` (decimal bytes).
 
 ## Reserved-name gotchas ⚠
 
@@ -787,8 +897,9 @@ unknown shape — see `docs/design/SERDE.md`), `coil.http.parser`
 (strict llhttp-backed HTTP/1.x requests), `coil.http.client` (blocking libcurl transport —
 `request` buffers the body, `request-stream` delivers it to a `BodySink` as it arrives, for
 SSE and other long responses),
-`coil.assert` (assert/deftest), `coil.dbgalloc` and `coil.stacklint` (both used by
-`--debug-checks`), plus `coil.os`, `coil.time`, `coil.selectors`, `coil.subprocess`,
+`coil.assert` (assert/deftest), `coil.dbgalloc`, `coil.guardalloc`, `coil.crash`,
+`coil.debug-runtime`, `coil.checked-ffi`, and `coil.stacklint`, plus `coil.os`,
+`coil.time`, `coil.selectors`, `coil.subprocess`,
 `coil.process`, and `coil.lint.result-flow` for hosted system programming and Result
 flow migration. The common ones are summarized above; import a module and call
 its functions directly.

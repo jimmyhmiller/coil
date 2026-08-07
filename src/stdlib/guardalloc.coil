@@ -1,0 +1,167 @@
+(module coil.guardalloc)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.slice" :use [slice-data slice-len])
+
+(cimport "sys/mman.h"
+         :probe-only
+         :probe
+         [(GUARD_PROT_NONE "PROT_NONE")
+          (GUARD_PROT_RW "PROT_READ | PROT_WRITE")
+          (GUARD_MAP_PRIVATE "MAP_PRIVATE")
+          (GUARD_MAP_ANON "MAP_ANONYMOUS")])
+
+(export guard-allocator)
+
+(extern mmap :cc c [(ptr i8) i64 i32 i32 i32 i64] (-> (ptr i8)))
+(extern mprotect :cc c [(ptr i8) i64 i32] (-> i32))
+(extern munmap :cc c [(ptr i8) i64] (-> i32))
+(extern getpagesize :cc c [] (-> i32))
+(extern write :cc c [i32 (ptr i8) i64] (-> i64))
+(extern abort :cc c [] (-> i64))
+
+(defstruct GuardRecord
+  [(mapping (ptr i8))
+   (payload (ptr i8))
+   (data-bytes i64)
+   (total-bytes i64)
+   (size i64)
+   (alignment i64)
+   (live bool)])
+
+(defn guard-records [] (-> (ptr (array GuardRecord 128)))
+  (alloc/static (array GuardRecord 128)))
+
+(defn guard-fail [(message (slice u8))] (-> i64)
+  (write 2 (primitive/cast (ptr i8) (slice-data message)) (slice-len message))
+  (abort)
+  0)
+
+(defn guard-round-up [(n i64) (alignment i64)] (-> i64)
+  (* (primitive/udiv (+ n (- alignment 1)) alignment) alignment))
+
+(defn guard-free-record [] (-> (ptr GuardRecord))
+  (let [(mut i) 0
+        (mut found) (primitive/cast (ptr GuardRecord) 0)
+        (mut quarantined) (primitive/cast (ptr GuardRecord) 0)]
+    (loop (if (>= (load i) 128)
+              (break)
+              (let [record (primitive/index (guard-records) (load i))]
+                (when (= (primitive/cast i64 (load (field record mapping))) 0)
+                  (store! found record)
+                  (break))
+                (when (and (= (primitive/cast i64 (load quarantined)) 0)
+                           (not (load (field record live))))
+                  (store! quarantined record)
+                  0)
+                (store! i (+ (load i) 1)))))
+    ; Keep at most 128 protected mappings. Once the table fills, recycle the
+    ; oldest available quarantined slot rather than turning a diagnostic
+    ; allocator into a permanent allocation-count limit.
+    (if (!= (primitive/cast i64 (load found)) 0)
+        (load found)
+        (let [record (load quarantined)]
+          (when (!= (primitive/cast i64 record) 0)
+            (munmap (load (field record mapping)) (load (field record total-bytes)))
+            (store! (field record mapping) (primitive/cast (ptr i8) 0))
+            0)
+          record))))
+
+(defn guard-find-record [(payload (ptr i8))] (-> (ptr GuardRecord))
+  (let [(mut i) 0
+        (mut found) (primitive/cast (ptr GuardRecord) 0)]
+    (loop (if (>= (load i) 128)
+              (break)
+              (let [record (primitive/index (guard-records) (load i))]
+                (when (= (primitive/cast i64 (load (field record payload)))
+                         (primitive/cast i64 payload))
+                  (store! found record)
+                  (break))
+                (store! i (+ (load i) 1)))))
+    (load found)))
+
+(defn guard-alloc [(ctx (ptr i8)) (size i64) (alignment i64)] (-> (Option (ptr i8)))
+  (let [page (primitive/cast i64 (getpagesize))]
+    (if (or (<= size 0)
+            (or (<= alignment 0)
+                (or (> alignment page)
+                    (!= (primitive/iand alignment (- alignment 1)) 0))))
+        (None)
+        (let [record (guard-free-record)]
+          (if (= (primitive/cast i64 record) 0)
+              (None)
+              (let [data-bytes (guard-round-up size page)
+                    total (+ data-bytes (* page 2))
+                    mapping
+                      (mmap (primitive/cast (ptr i8) 0)
+                            total
+                            (primitive/cast i32 GUARD_PROT_RW)
+                            (primitive/cast i32 (+ GUARD_MAP_PRIVATE GUARD_MAP_ANON))
+                            -1
+                            0)]
+                (if (= (primitive/cast i64 mapping) -1)
+                    (None)
+                    (let [data (primitive/index mapping page)
+                          tail (primitive/index data data-bytes)
+                          ; Right-align the allocation against the trailing guard
+                          ; page. The alignment-sized slack is the only space an
+                          ; overflow can cross before faulting.
+                          payload
+                            (primitive/index tail
+                                             (primitive/isub 0 (guard-round-up size alignment)))]
+                      (if (or (!= (mprotect mapping page (primitive/cast i32 GUARD_PROT_NONE))
+                                  (primitive/cast i32 0))
+                              (!= (mprotect tail page (primitive/cast i32 GUARD_PROT_NONE))
+                                  (primitive/cast i32 0)))
+                          (do (munmap mapping total) (None))
+                          (do
+                            (store! (field record mapping) mapping)
+                            (store! (field record payload) payload)
+                            (store! (field record data-bytes) data-bytes)
+                            (store! (field record total-bytes) total)
+                            (store! (field record size) size)
+                            (store! (field record alignment) alignment)
+                            (store! (field record live) true)
+                            (Some payload)))))))))))
+
+(defn guard-resize [(ctx (ptr i8))
+                    (payload (ptr i8))
+                    (old i64)
+                    (new i64)
+                    (alignment i64)] (-> (Option (ptr i8)))
+  (None))
+
+(defn guard-free [(ctx (ptr i8)) (payload (ptr i8)) (size i64) (alignment i64)] (-> i64)
+  (let [record (guard-find-record payload)]
+    (when (= (primitive/cast i64 record) 0)
+      (guard-fail "coil: invalid free in guard-allocator (--debug-runtime)\n")
+      0)
+    (when (not (load (field record live)))
+      (guard-fail "coil: double free in guard-allocator (--debug-runtime)\n")
+      0)
+    (when (!= size (load (field record size)))
+      (guard-fail "coil: allocation size mismatch in guard-allocator (--debug-runtime)\n")
+      0)
+    (when (!= alignment (load (field record alignment)))
+      (guard-fail "coil: allocation alignment mismatch in guard-allocator (--debug-runtime)\n")
+      0)
+    ; Quarantine the entire payload span. Stale reads and writes now fault at the
+    ; access rather than after the mapping is recycled by malloc.
+    (mprotect (primitive/index (load (field record mapping)) (primitive/cast i64 (getpagesize)))
+              (load (field record data-bytes))
+              (primitive/cast i32 GUARD_PROT_NONE))
+    (store! (field record live) false)
+    0))
+
+(defn guard-allocator-on [] (-> (ptr Allocator))
+  (let [allocator (unwrap-ptr [Allocator] (create [Allocator] (malloc-allocator)))]
+    (store! (field allocator alloc) (primitive/fnptr-of guard-alloc))
+    (store! (field allocator resize) (primitive/fnptr-of guard-resize))
+    (store! (field allocator free) (primitive/fnptr-of guard-free))
+    (store! (field allocator ctx) (primitive/cast (ptr i8) 0))
+    allocator))
+
+;; Page-guarded debug allocator. Disabled builds return the supplied allocator
+;; unchanged; debug builds reserve guard pages and quarantine freed payload pages.
+(defn guard-allocator [(inner Code)] (-> Code)
+  (if (primitive/debug-checks?) `(guard-allocator-on) inner))

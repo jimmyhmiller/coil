@@ -1,5 +1,5 @@
 // Host harness to RUN the wasm64 Coil compiler (coilc.wasm) in Node.
-// Provides the 44 env.* imports: bump allocator over the module's own linear
+// Provides the compiler's env.* imports: bump allocator over the module's own linear
 // memory (starting at exported __heap_base), real-filesystem I/O, and LOUD TRAPS
 // for the Wall-1 comptime imports (mmap/dlopen/... ) so a comptime-needing compile
 // fails with a clear message instead of silent garbage.
@@ -303,6 +303,14 @@ const env = {
   getcwd:(b,sz)=>{ const r=Buffer.from(process.cwd()+'\0'); writeBytes(b,r); return b; },
   getenv:hostGetenv, setenv:hostSetenv,
   getpid:()=>Number(process.pid), realpath_stub:()=>0n, __error:hostErrno,
+  // Coil's wasm64 Timespec uses two i64 fields. Date.now is wall-clock rather than
+  // monotonic, but it preserves the libc ABI and is sufficient for compiler timing.
+  clock_gettime:(_clockId,out)=>{
+    const ms=Date.now(), sec=Math.floor(ms/1000), nsec=(ms%1000)*1000000;
+    dv().setBigInt64(Number(out),BigInt(sec),true);
+    dv().setBigInt64(Number(out)+8,BigInt(nsec),true);
+    return 0;
+  },
   // string
   strlen:(p)=>{ const m=u8(); let e=Number(p); while(m[e]!==0)e++; return BigInt(e-Number(p)); },
   snprintf,
@@ -338,7 +346,8 @@ const env = {
   // threads — init/lock are noops (single-threaded); create spawns → WALL1
   pthread_mutex_init:()=>0, pthread_mutex_lock:()=>0, pthread_mutex_unlock:()=>0,
   pthread_cond_init:()=>0, pthread_cond_signal:()=>0, pthread_cond_wait:()=>0,
-  pthread_attr_init:()=>0, pthread_attr_setstacksize:()=>0, pthread_join:()=>0,
+  pthread_attr_init:()=>0, pthread_attr_destroy:()=>0,
+  pthread_attr_setstacksize:()=>0, pthread_attr_setguardsize:()=>0, pthread_join:()=>0,
   // metahost's mh-halt records the metaprogram diagnostic in the compiler's
   // MetaHostBox and then calls pthread_exit to end the (native) metaprogram thread.
   // In the sandbox there is no thread; THROW instead so the exception unwinds out of
