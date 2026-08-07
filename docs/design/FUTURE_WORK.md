@@ -119,6 +119,20 @@ These are real, reproduced, and each has a clear repro:
   TCO'd on the comptime-thunk path, so around 10M frames it dies with a bus error
   instead of erroring. Core `loop` at comptime is fine, and the same function at runtime
   is fine. The tree-walking interpreter had a fuel budget; nothing replaced it.
+
+  Re-measured: `coil check` on `(comptime (spin 100000000))` exits **138** (SIGBUS)
+  with **zero output** — no diagnostic, no location, nothing naming comptime. Silent is
+  the worst part; the failure is indistinguishable from a compiler bug.
+
+  Why the obvious fix does not apply: the pipeline already runs on a 512 MiB pthread
+  stack with a guard page (`run-on-big-stack`), and the comptime thunk runs on that same
+  thread, so this IS the guard page firing — raising the ceiling only moves the cliff.
+  A fuel budget cannot simply be restored either: the thunk is JIT-compiled native code,
+  so a counter means instrumenting generated code. The contained option is to catch the
+  fault — `sigaltstack` plus a SIGBUS/SIGSEGV handler on the worker thread that
+  recognises a fault near its guard page and reports "comptime evaluation exhausted the
+  stack; it may not terminate" — which converts a silent crash into a diagnostic without
+  making runaway comptime terminate.
 - **An aggregate-typed `const` is not supported** — but it is now REFUSED CLEANLY,
   with a located error naming the const and its type and pointing at the zero-argument
   function workaround, instead of aborting with `UNIMPLEMENTED: codegen: unknown static
@@ -134,9 +148,18 @@ These are real, reproduced, and each has a clear repro:
   its own; the compiler synthesizes one when the file declares none and something
   imports (`prepend-uses`). A file with no module and no imports is untouched, so only
   previously-rejected programs changed behaviour. Covered by four `gate-cli` cases.
-- **`--sanitize=address` cannot link** where the system `cc`'s ASan runtime does not match
-  the instrumenting LLVM (macOS with Homebrew LLVM + Apple clang). The instrumentation is
-  correct; the link is not, and the driver hardcodes `cc` with no override.
+- ~~**`--sanitize=address` cannot link**~~ — STALE, already fixed in code. The driver
+  does not hardcode `cc` for a sanitized link: it uses `"$(llvm-config --bindir)/clang"`
+  (`driver.coil`, the libmode branch), so the instrumenting LLVM and the ASan runtime
+  are the same toolchain by construction. Verified end to end on macOS with Homebrew
+  LLVM: the binary links `libclang_rt.asan_osx_dynamic.dylib` and reports both
+  `heap-use-after-free` READ and WRITE.
+
+  ⚠ One real trap while testing this, worth knowing before filing a "sanitizer does not
+  work" bug: at the default `-O3` a store whose value is never read is dead-store
+  eliminated, so a write-only use-after-free is optimized away BEFORE it can be
+  reported and the program looks clean. Reads are caught at any level. Use `-O0` when
+  probing writes.
 
 ## 4. Robustness
 
