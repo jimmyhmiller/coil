@@ -1,18 +1,45 @@
-; src/compiler/reader.coil — self-host Coil compiler, reader module.
-(module reader)
+; THE s-expression reader — one implementation, used by the Coil compiler itself
+; and available to any program. `read-all` turns `(slice u8)` source into a tree of
+; `Sexp`; that is the same call, and the same tree, the compiler's own front end
+; reads your file with.
+;
+;   (import "coil.reader" :use *)
+;   (match (read-all a "(define x 10) (+ x 1)" 0)   ; -> (ptr (ArrayList Sexp))
+;     (Ok [forms] …)
+;     (Err [d] …))                                  ; Diag carries the span
+;
+; It handles what a Lisp reader is expected to handle, because the compiler needs
+; all of it: `;`-to-end-of-line comments, `[` `]` as real delimiters distinct from
+; `(` `)`, string literals with escapes (`\n \t \r \0 \xHH \" \\`, unknown escapes
+; rejected), c-strings, character literals, keywords, integers and floats, and the
+; `'`/`` ` ``/`~`/`~@` prefixes. Every node carries a source span (`lo`/`hi`/`source`)
+; and a unique `nid`, so a consumer can report errors that point at real source.
+;
+; This module replaced `coil.sexp`, which re-derived a weaker set of rules — no
+; strings, no brackets, no comments — and got all three wrong. (`coil.serde.sexp`
+; also tokenizes s-expressions but is NOT a Coil reader: it is a wire format with
+; its own escape set and `#"…"` byte literals. See its header.)
+(module coil.reader)
 (import "coil.primitive" :as primitive)
 
 (import "coil.alloc" :as alloc :use *)
 (import "coil.result" :use *)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
+(import "coil.mem" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.io" :use *)
 (import "coil.control" :use *)
 (import "coil.try" :use *)
 (import "coil.match" :use *)
-(import "ffi" :use *)
-(import "ast" :use *)
+; No compiler-module imports: the reader is STANDALONE. It used to import `ast`
+; for constructors of its OWN types (which made the two modules import each other)
+; and `ffi` for the one extern below. `ast` imports the reader, not the reverse.
+
+; Float literals. Declared here rather than imported so the reader depends on no
+; compiler module; coil.serde and coil.serde.json declare the same signature the
+; same way (an identical redeclaration is fine — only a CONFLICTING one is an error).
+(extern strtod :cc c [(ptr i8) (ptr (ptr i8))] (-> f64))
 
 (defsum SexpKind
   (KInt [(v i64)])
@@ -43,12 +70,77 @@
 (defstruct Parser [(toks (ptr (ArrayList Tok))) (pos i64)])
 (defstruct StrRead [(s (slice u8)) (end i64)])
 
-; ============================ AST representation =============================
-; Mirrors. Recursion goes through (ptr Expr) / (ptr Type) (single
-; box) and (ptr (ArrayList X)) (a sequence), like reader.coil/Sexp. Spans live as
-; raw i64 lo/hi (dummy = -1), exactly as the reader stores them.
+; A parse/read diagnostic; dummy span = -1.
+(defstruct Diag [(lo i64) (hi i64) (msg (slice u8)) (source i64) (ctxt i64)])
 
-; Type — 14 constructable variants.
+; ============================ small constructors =============================
+; Monotonic node-id counter. Every Sexp gets a unique nid at construction (starting at
+; 1; 0 means "no id"). Deterministic — the same source produces the same nids in the
+; same order, so the rebootstrap fixpoint holds.
+(defstruct NidCell [(n i64)])
+(defn nid-cell [] (-> (ptr NidCell))
+  (alloc/static NidCell))
+(defn next-nid [] (-> i64)
+  (let [c (nid-cell)
+        v (primitive/iadd (load (field c n)) 1)]
+    (store! (field c n) v)
+    v))
+
+(defn mk-sexp [(kind SexpKind) (lo i64) (hi i64)] (-> Sexp)
+  (let [p (alloc/stack Sexp)]
+    (store! (field p kind) kind)
+    (store! (field p lo) lo)
+    (store! (field p hi) hi)
+    (store! (field p source) (if (< lo (primitive/cast i64 0)) (do -1) 0))
+    (store! (field p ctxt) 0)
+    (store! (field p nid) (next-nid))
+    (load p)))
+(defn mk-sexp-src [(kind SexpKind) (orig (ptr Sexp))] (-> Sexp)
+  (let [p (alloc/stack Sexp)]
+    (store! (field p kind) kind)
+    (store! (field p lo) (load (field orig lo)))
+    (store! (field p hi) (load (field orig hi)))
+    (store! (field p source) (load (field orig source)))
+    (store! (field p ctxt) (load (field orig ctxt)))
+    (store! (field p nid) (next-nid))
+    (load p)))
+(defn mk-tok [(kind TokKind) (lo i64) (hi i64)] (-> Tok)
+  (let [p (alloc/stack Tok)]
+    (store! (field p kind) kind)
+    (store! (field p lo) lo)
+    (store! (field p hi) hi)
+    (load p)))
+; source = -1 means "not yet attributed to a file"; the span is file-relative, so
+; it is meaningless until a caller stamps the source that `lo`/`hi` are offsets
+; into (dwspan / diag-with-source). Defaulting to 0 instead would silently claim
+; every diagnostic came from the entry file, rendering the right offsets against
+; the wrong source text.
+(defn mk-diag [(lo i64) (hi i64) (msg (slice u8))] (-> Diag)
+  (let [p (alloc/stack Diag)]
+    (store! (field p lo) lo)
+    (store! (field p hi) hi)
+    (store! (field p msg) msg)
+    (store! (field p source) -1)
+    (store! (field p ctxt) 0)
+    (load p)))
+(defn mk-diag-src [(source i64) (lo i64) (hi i64) (msg (slice u8))] (-> Diag)
+  (let [p (alloc/stack Diag)]
+    (store! p (mk-diag lo hi msg))
+    (store! (field p source) source)
+    (load p)))
+(defn mk-strread [(s (slice u8)) (end i64)] (-> StrRead)
+  (let [p (alloc/stack StrRead)]
+    (store! (field p s) s)
+    (store! (field p end) end)
+    (load p)))
+
+(defn box-items [(a (ptr Allocator)) (items (ArrayList Sexp))] (-> (ptr (ArrayList Sexp)))
+  (let [p (unwrap-ptr [(ArrayList Sexp)] (create [(ArrayList Sexp)] a))]
+    (store! p items)
+    p))
+(defn box-sexp [(a (ptr Allocator)) (s Sexp)] (-> (ptr Sexp))
+  (let [p (unwrap-ptr [Sexp] (create [Sexp] a))] (store! p s) p))
+
 (defn looks-numeric [(s (slice u8))] (-> bool)
   (let [n (slice-len s)]
     (if (= n (primitive/cast i64 0))
@@ -176,7 +268,7 @@
                                 (Some (if (load neg2) (primitive/isub 0 (load mag)) (load mag))))))))))))))
 
 ; Takes the caller's allocator rather than grabbing `malloc-allocator` itself: the
-; `slice->cstr` below is a per-token scratch C string for `strtod`, so it belongs to
+; `str->cstr` below is a per-token scratch C string for `strtod`, so it belongs to
 ; whatever allocator the compile is running on. Grabbing the global one here put it on
 ; malloc no matter what the pipeline was threading.
 (defn atom [(a (ptr Allocator)) (s (slice u8))] (-> SexpKind)
@@ -201,7 +293,7 @@
                                                  0))
                                          (store! j (primitive/iadd (load j) 1)))))
                              (load f))))
-                    (let [buf (slice->cstr a s)
+                    (let [buf (str->cstr a s)
                           ep (alloc/stack (ptr i8))
                           x (strtod buf ep)
                           consumed (primitive/isub (primitive/cast i64 (load ep)) (primitive/cast i64 buf))]
@@ -612,6 +704,74 @@
           (if (load failed)
               (Err (diag-with-source (load err) source))
               (let [forms (box-items a (load out))] (stamp-source-list forms source) (Ok forms)))))))
+
+; ============================ accessors =====================================
+;; An extractor was called on the wrong variant. That is a CALLER bug, so it
+;; aborts loudly rather than returning a sentinel — `coil.sexp`'s accessors
+;; returned 0 / "" here, which reads as a valid number or an empty symbol and
+;; turns a type confusion into wrong output somewhere far away.
+(defn sexp-wrong-variant [T] [(site (ptr i8))] (-> T)
+  (oom-puts c"coil.reader: ")
+  (oom-puts site)
+  (oom-puts c"\n")
+  (abort)
+  (primitive/zeroed T))
+
+; So a consumer never has to `match` on `SexpKind` for the ordinary questions.
+; The compiler matches directly (it cares about all eight variants); everyone else
+; wants these. A `?`-predicate is false for the wrong variant rather than an error,
+; but the EXTRACTORS take `(ptr Sexp)` you have already tested — asking for the
+; symbol of a number is a caller bug, so they hard-error instead of returning a
+; sentinel that would silently read as valid data (an empty string, a 0).
+
+(defn sexp-int? [(x (ptr Sexp))] (-> bool)
+  (match-else (load (field x kind)) (KInt [_] true) (_ false)))
+(defn sexp-float? [(x (ptr Sexp))] (-> bool)
+  (match-else (load (field x kind)) (KFloat [_] true) (_ false)))
+(defn sexp-sym? [(x (ptr Sexp))] (-> bool)
+  (match-else (load (field x kind)) (KSym [_] true) (_ false)))
+(defn sexp-kw? [(x (ptr Sexp))] (-> bool)
+  (match-else (load (field x kind)) (KKw [_] true) (_ false)))
+(defn sexp-str? [(x (ptr Sexp))] (-> bool)
+  (match-else (load (field x kind)) (KStr [_] true) (_ false)))
+(defn sexp-list? [(x (ptr Sexp))] (-> bool)
+  (match-else (load (field x kind)) (KList [_] true) (_ false)))
+(defn sexp-vec? [(x (ptr Sexp))] (-> bool)
+  (match-else (load (field x kind)) (KVec [_] true) (_ false)))
+
+(defn sexp-int [(x (ptr Sexp))] (-> i64)
+  (match-else (load (field x kind))
+              (KInt [v] v)
+              (_ (sexp-wrong-variant c"sexp-int: not an integer (test with sexp-int? first)"))))
+(defn sexp-sym [(x (ptr Sexp))] (-> (slice u8))
+  (match-else (load (field x kind))
+              (KSym [s] s)
+              (_ (sexp-wrong-variant c"sexp-sym: not a symbol (test with sexp-sym? first)"))))
+(defn sexp-str [(x (ptr Sexp))] (-> (slice u8))
+  (match-else (load (field x kind))
+              (KStr [s] s)
+              (_ (sexp-wrong-variant c"sexp-str: not a string (test with sexp-str? first)"))))
+(defn sexp-kw [(x (ptr Sexp))] (-> (slice u8))
+  (match-else (load (field x kind))
+              (KKw [s] s)
+              (_ (sexp-wrong-variant c"sexp-kw: not a keyword (test with sexp-kw? first)"))))
+
+;; The children of a list OR a vector — `(f x)` and `[f x]` both have two.
+(defn sexp-items [(x (ptr Sexp))] (-> (ptr (ArrayList Sexp)))
+  (match-else (load (field x kind))
+              (KList [items] items)
+              (KVec [items] items)
+              (_ (sexp-wrong-variant c"sexp-items: not a list or vector"))))
+;; Number of children; 0 for an atom, so it is safe to call on anything.
+(defn sexp-count [(x (ptr Sexp))] (-> i64)
+  (if (or (sexp-list? x) (sexp-vec? x)) (al-len [Sexp] (load (sexp-items x))) 0))
+;; Child i as a pointer INTO the list — valid while the list is unmodified.
+(defn sexp-nth [(x (ptr Sexp)) (i i64)] (-> (ptr Sexp))
+  (al-elem [Sexp] (sexp-items x) i))
+
+;; The common dispatch test: this node is the symbol `lit`.
+(defn sexp-sym-is [(x (ptr Sexp)) (lit (slice u8))] (-> bool)
+  (and (sexp-sym? x) (= (sexp-sym x) lit)))
 
 ; ============================ canonical dump entry ==========================
 ; Emits the `(error@source:lo:hi:ctxt "msg")` shape on a read/parse error.

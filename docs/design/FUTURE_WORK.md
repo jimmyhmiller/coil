@@ -107,6 +107,14 @@ single biggest reach gap for desktop users.
 
 These are real, reproduced, and each has a clear repro:
 
+- **A local does not shadow a macro in head position.** `(let [when 5] when)` is `5` but
+  `(let [when 5] (when 1 2))` is `2` — the same name means the local in argument position
+  and the macro in head position. The same root cause makes a *binder* named after a macro
+  fail with a diagnostic about a form the author never wrote: `(defn f [(scope i64)] …)`,
+  `(defstruct S [(scope …)])`, `(defsum V (Case [(scope …)]))`, `(deftrait T (m [(scope …)] …))`.
+  Coil is a Lisp-1, so Clojure's tiering is the target (special forms win, then locals beat
+  macros, then vars). Full analysis, repros and the fix sketch:
+  [BINDING_AND_SHADOWING.md](BINDING_AND_SHADOWING.md).
 - **Runaway comptime crashes the compiler.** A self-tail-recursive `(comptime …)` is not
   TCO'd on the comptime-thunk path, so around 10M frames it dies with a bus error
   instead of erroring. Core `loop` at comptime is fine, and the same function at runtime
