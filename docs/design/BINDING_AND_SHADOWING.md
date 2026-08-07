@@ -1,8 +1,17 @@
 # Binding and Shadowing — Coil is a Lisp-1 that behaves like a Lisp-2 in head position
 
-> **Status: OPEN.** The inconsistency below is real and reproducible on today's
-> compiler. This document records what it is, why it happens, what the other Lisps do,
-> and the decided target. No fix has landed.
+> **Status: HALF FIXED.** The **binder** case below is fixed — a macro name is now
+> usable as a field, payload or parameter name, because `expand-calls` no longer treats
+> a binder vector as a call (`expand-def-list` in `src/compiler/expander.coil`). That
+> was the commonly-hit half, and it needed no syntactic environment: a parameter list
+> *establishes* names rather than referencing them, so nothing in it is ever a macro
+> call, whatever is in scope.
+>
+> The **head-position** case is still OPEN: `(let [when 5] (when 1 2))` is still `2`,
+> because a local binding still does not shadow a macro. That is tier 2 of the Clojure
+> tiering below and it does need the environment threaded through the walk — items 1
+> and 3 of "What the fix requires". Everything below is unchanged and still describes
+> the target.
 
 ## The inconsistency
 
@@ -114,6 +123,14 @@ locally bound name is not a macro reference.
 Item 2 also fixes the binder case, and for the same reason Scheme and Clojure never hit
 it: a parameter list *establishes* names rather than referencing them, so nothing in it
 is ever a macro call.
+
+**Item 2 has landed on its own.** It did not have to wait for 1 and 3: knowing which
+subforms are binders is enough to stop expanding inside them, even with no environment
+to record what they bind. `expand-def-list` walks `defn`/`defstruct`/`defsum`/
+`deftrait`/`impl`, copies every binder vector through untouched, and recurses one level
+for `defsum` variants and trait/impl methods, whose vectors sit one deeper. Macro
+expansion is unchanged everywhere else — this is not "skip expansion in certain
+positions", it is "a binder list was never a call in the first place".
 
 ## Related, independent: narrow the prelude re-export
 
