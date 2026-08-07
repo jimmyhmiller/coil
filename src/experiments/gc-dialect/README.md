@@ -13,9 +13,10 @@ cd src/experiments/gc-dialect
 ../.build/bin/coil run demo.coil       # implicit allocation (arena), no Allocator threaded
 ../.build/bin/coil run gcdemo.coil     # mark-sweep GC, flat objects, bounded memory
 ../.build/bin/coil run gctree.coil     # mark-sweep GC, a linked list traced through 1 root
-# same source, both dialects:
-cp arena.coil DIALECT.coil && ../.build/bin/coil run unified.coil   # never frees
-cp gc.coil    DIALECT.coil && ../.build/bin/coil run unified.coil   # bounded; rm DIALECT.coil
+# same source, both dialects — edit ONE line in unified.coil:
+#   (import "arena" :use *)   -> never frees
+#   (import "gc"    :use *)   -> bounded
+coil run unified.coil
 ```
 
 ## Result
