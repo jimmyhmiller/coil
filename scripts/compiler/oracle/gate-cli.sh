@@ -2291,6 +2291,35 @@ expect_rc 1 "COIL_STDLIB_DIR: a root without src/stdlib is an error, not a silen
   bash -c 'cd "$1" && env -u COIL_NAMESPACE_ROOTS COIL_STDLIB_DIR="$1" "$2" check allns.coil' \
   _ "$T/bundle" "$COIL"
 
+echo "== entry file needs no (module ...) =="
+# An ENTRY file is named on the command line and imported by nobody, so it needs no
+# namespace of its own. It used to be refused the moment it imported anything, and
+# `coil test` / `--debug-checks` inject imports themselves — so the diagnostic pointed
+# at `<cli-use>`, a file the user never wrote.
+mkdir -p "$T/entrymod"
+cat > "$T/entrymod/bare.coil" <<'EOF'
+(import "coil.io" :use *)
+(defn main [] (-> i64) (println "ok") 0)
+EOF
+cat > "$T/entrymod/bare_test.coil" <<'EOF'
+(deftest arithmetic (assert-eq (+ 2 2) 4))
+EOF
+cat > "$T/entrymod/nomodnoimp.coil" <<'EOF'
+(defn main [] (-> i64) 0)
+EOF
+expect_rc 0 "entry: imports with no (module ...) compile" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check bare.coil' \
+  _ "$T/entrymod" "$COIL"
+expect_rc 0 "entry: --debug-checks injects metaprograms without needing (module ...)" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build bare.coil --debug-checks -o out' \
+  _ "$T/entrymod" "$COIL"
+expect_rc 0 "entry: coil test on a module-less file runs" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" test bare_test.coil' \
+  _ "$T/entrymod" "$COIL"
+expect_rc 0 "entry: no module and no imports still compiles" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check nomodnoimp.coil' \
+  _ "$T/entrymod" "$COIL"
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL

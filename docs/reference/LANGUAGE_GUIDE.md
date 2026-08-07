@@ -780,11 +780,10 @@ every definition's doc, e.g. to enforce that exported functions are documented.
 `coil test FILE` loads it for you, discovers every `(deftest …)`, and runs each in a
 **forked child** — so a failing assertion aborts only its own test and still prints.
 
-    (module mytests)                  ; ⚠ REQUIRED — `coil test` imports assert.coil
-    (deftest arithmetic               ;   for you, and a file that imports must
-      (assert-eq (+ 2 2) 4)           ;   declare a module
-      (assert (< 1 2))
-      (assert-ne 1 2))
+    (deftest arithmetic               ; no (module …) needed — an entry file gets
+      (assert-eq (+ 2 2) 4)           ; one synthesized when it has none and
+      (assert (< 1 2))                ; something imports (here, assert.coil,
+      (assert-ne 1 2))                ; which `coil test` loads for you)
 
     coil test mytests.coil            ; exit 0 iff all pass
 
@@ -858,8 +857,9 @@ off-path expansion is byte-identical to the unchecked form):
   and changes freed payload pages to `PROT_NONE` while quarantined;
 - a bundled checker warns when a function returns a pointer to a stack local.
 
-⚠ `--debug-checks` auto-loads that checker as a metaprogram, so — exactly like
-`coil test` — the file must declare `(module NAME)`.
+`--debug-checks` auto-loads that checker as a metaprogram. Like `coil test`, that
+injects an import into your file, and — like `coil test` — it no longer requires the
+file to declare `(module NAME)`.
 
 `--sanitize=address` marks generated functions for LLVM AddressSanitizer and runs the
 ASan pass over the program object. Sanitized executable links use the Clang beside

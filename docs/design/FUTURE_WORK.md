@@ -124,9 +124,11 @@ These are real, reproduced, and each has a clear repro:
 - **A comptime result cannot be a generic-instance aggregate** — `(Option i64)`,
   `(Pair i64 i64)` report "cannot be materialized". Plain structs, plain sums and arrays
   work.
-- **`--use` requires the target file to declare `(module …)`**, which surprises through
-  `coil test` and `--debug-checks`: a bare single-file program is refused with an error
-  whose span points at `<cli-use>`, a file the user never wrote.
+- ~~**`--use` requires the target file to declare `(module …)`**~~ — FIXED. An entry
+  file is named on the command line and imported by nobody, so it needs no namespace of
+  its own; the compiler synthesizes one when the file declares none and something
+  imports (`prepend-uses`). A file with no module and no imports is untouched, so only
+  previously-rejected programs changed behaviour. Covered by four `gate-cli` cases.
 - **`--sanitize=address` cannot link** where the system `cc`'s ASan runtime does not match
   the instrumenting LLVM (macOS with Homebrew LLVM + Apple clang). The instrumentation is
   correct; the link is not, and the driver hardcodes `cc` with no override.
