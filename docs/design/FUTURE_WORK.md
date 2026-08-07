@@ -119,8 +119,13 @@ These are real, reproduced, and each has a clear repro:
   TCO'd on the comptime-thunk path, so around 10M frames it dies with a bus error
   instead of erroring. Core `loop` at comptime is fine, and the same function at runtime
   is fine. The tree-walking interpreter had a fuel budget; nothing replaced it.
-- **A sum-typed `const` aborts the build** with `UNIMPLEMENTED: codegen: unknown static
-  const <name>` rather than being supported or refused cleanly.
+- **An aggregate-typed `const` is not supported** — but it is now REFUSED CLEANLY,
+  with a located error naming the const and its type and pointing at the zero-argument
+  function workaround, instead of aborting with `UNIMPLEMENTED: codegen: unknown static
+  const <name>`. Still missing to actually support it: the checker classifies these as
+  statics and elaborates references to `EStaticRef`, but none of the four backends ever
+  pushes to `cg.statics`, so all of them would need constant-initialized globals
+  carrying each aggregate's exact layout.
 - **A comptime result cannot be a generic-instance aggregate** — `(Option i64)`,
   `(Pair i64 i64)` report "cannot be materialized". Plain structs, plain sums and arrays
   work.
