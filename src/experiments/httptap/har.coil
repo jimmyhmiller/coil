@@ -1,0 +1,205 @@
+; ── httptap sink: HAR 1.2 ─────────────────────────────────────────────────
+; A HAR archive of every request, written at exit.
+;
+;   COIL_HTTP_TAP=har:///tmp/session.har ./app
+;   # then: Chrome DevTools ▸ Network ▸ drag session.har onto the request list
+;
+; HAR is the interchange format the Network panel already reads, so this gets a
+; native waterfall, header inspection and body preview out of a program that has
+; nothing to do with a browser. Each entry also carries a `_coil` block naming
+; the module, function, file and line that issued the request — a custom field,
+; which HAR permits and viewers preserve.
+;
+; Entries are serialized to JSON as they finish and the text is accumulated, so
+; the sink holds one growing buffer rather than a deep copy of every borrowed
+; slice. The file is written once, at `on-close`.
+(module httptap.har)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.io" :as io :use *)
+(import "coil.fmt" :use *)
+(import "coil.fs" :as fs)
+(import "httptap.rt" :as rt :use *)
+
+(defstruct HarSink
+  [(a (ptr alloc/Allocator))
+   (path (slice u8))
+   (entries StrBuf)
+   (count i64)])
+
+; ---- dates ------------------------------------------------------------------
+; HAR wants an ISO-8601 `startedDateTime`. The civil-from-days conversion is
+; Howard Hinnant's; doing it here rather than through `gmtime_r` keeps the sink
+; free of a struct-tm layout that differs between platforms.
+(defn pad-int! [(sb (ptr StrBuf)) (v i64) (width i64)] (-> i64)
+  (let [(mut d) 1 (mut k) 1]
+    (loop (if (>= (load k) width) (break) (do (store! d (* (load d) 10)) (store! k (+ (load k) 1)))))
+    (loop
+      (if (<= (load d) 0)
+          (break)
+        (do (sb-push-byte! sb (primitive/cast u8 (+ 48 (% (/ v (load d)) 10))))
+            (store! d (/ (load d) 10)))))
+    0))
+
+(defstruct Civil [(y i64) (m i64) (d i64)])
+
+(defn civil-from-days [(out (ptr Civil)) (days i64)] (-> i64)
+  (let [z (+ days 719468)
+        era (/ (if (>= z 0) z (- z 146096)) 146097)
+        doe (- z (* era 146097))
+        yoe (/ (- (+ (- doe (/ doe 1460)) (/ doe 36524)) (/ doe 146096)) 365)
+        y0 (+ yoe (* era 400))
+        doy (- doe (+ (- (* 365 yoe) (/ yoe 100)) (/ yoe 4)))
+        mp (/ (+ (* 5 doy) 2) 153)
+        d (+ (- doy (/ (+ (* 153 mp) 2) 5)) 1)
+        m (if (< mp 10) (+ mp 3) (- mp 9))]
+    (store! (field out y) (if (<= m 2) (+ y0 1) y0))
+    (store! (field out m) m)
+    (store! (field out d) d)
+    0))
+
+(defn iso-time! [(sb (ptr StrBuf)) (epoch-ms i64)] (-> i64)
+  (let [ms (if (< epoch-ms 0) 0 epoch-ms)
+        days (/ ms 86400000)
+        rem (% ms 86400000)
+        c (alloc/stack Civil)]
+    (civil-from-days c days)
+    (sb-push-str! sb "\"")
+    (pad-int! sb (load (field c y)) 4)
+    (sb-push-str! sb "-")
+    (pad-int! sb (load (field c m)) 2)
+    (sb-push-str! sb "-")
+    (pad-int! sb (load (field c d)) 2)
+    (sb-push-str! sb "T")
+    (pad-int! sb (/ rem 3600000) 2)
+    (sb-push-str! sb ":")
+    (pad-int! sb (% (/ rem 60000) 60) 2)
+    (sb-push-str! sb ":")
+    (pad-int! sb (% (/ rem 1000) 60) 2)
+    (sb-push-str! sb ".")
+    (pad-int! sb (% rem 1000) 3)
+    (sb-push-str! sb "Z\"")
+    0))
+
+; ---- entries ----------------------------------------------------------------
+(defn har-start [(ctx (ptr i8)) (ev (ptr rt/TapEvent))] (-> i64) 0)
+
+;; A body as HAR content: `text` when it is valid UTF-8, base64 otherwise.
+;; Guessing wrong here is what produces a HAR that DevTools refuses to open.
+(defn body-content! [(sb (ptr StrBuf)) (body (slice u8)) (full-len i64) (mime (slice u8))] (-> i64)
+  (do (sb-push-str! sb "{")
+      (json-kv-int! sb "size" full-len)
+      (sb-push-str! sb ",")
+      (json-kv-str! sb "mimeType" mime)
+      (sb-push-str! sb ",")
+      (if (utf8-ok? body)
+          (json-kv-str! sb "text" body)
+        (do (json-str! sb "text")
+            (sb-push-str! sb ":\"")
+            (b64-into! sb body)
+            (sb-push-str! sb "\",")
+            (json-kv-str! sb "encoding" "base64")))
+      (sb-push-str! sb "}")
+      0))
+
+(defn har-finish [(ctx (ptr i8)) (ev (ptr rt/TapEvent))] (-> i64)
+  (let [s (primitive/cast (ptr HarSink) ctx)
+        sb (field s entries)
+        elapsed (- (load (field ev end-mono-ns)) (load (field ev start-mono-ns)))
+        req-body (tap-capped (load (field ev req-body)))]
+    (if (> (load (field s count)) 0) (sb-push-str! sb ",") 0)
+    (store! (field s count) (+ (load (field s count)) 1))
+    (sb-push-str! sb "{\"startedDateTime\":")
+    (iso-time! sb (load (field ev start-wall-ms)))
+    (sb-push-str! sb ",\"time\":")
+    (json-ms! sb elapsed)
+    ; ---- request
+    (sb-push-str! sb ",\"request\":{")
+    (json-kv-str! sb "method" (load (field ev method)))
+    (sb-push-str! sb ",")
+    (json-kv-str! sb "url" (load (field ev url)))
+    ; The client does not report the negotiated version, and inventing
+    ; "HTTP/1.1" would be a claim this tool cannot support. HAR allows "".
+    (sb-push-str! sb ",\"httpVersion\":\"\",\"cookies\":[],\"queryString\":[],\"headers\":")
+    (json-headers! sb (load (field ev req-headers)))
+    (if (> (slice-len req-body) 0)
+        (do (sb-push-str! sb ",\"postData\":{")
+            (json-kv-str! sb "mimeType" (header-value (load (field ev req-headers)) "content-type"))
+            (sb-push-str! sb ",")
+            (json-kv-str! sb "text" req-body)
+            (sb-push-str! sb "}"))
+      0)
+    (sb-push-str! sb ",\"headersSize\":-1,")
+    (json-kv-int! sb "bodySize" (slice-len (load (field ev req-body))))
+    (sb-push-str! sb "}")
+    ; ---- response
+    (sb-push-str! sb ",\"response\":{")
+    (json-kv-int! sb "status" (load (field ev status)))
+    (sb-push-str! sb ",")
+    (json-kv-str! sb "statusText" (if (load (field ev failed)) (load (field ev error)) ""))
+    (sb-push-str! sb ",\"httpVersion\":\"\",\"cookies\":[],\"headers\":")
+    (json-headers! sb (load (field ev resp-headers)))
+    (sb-push-str! sb ",\"content\":")
+    (body-content! sb (load (field ev resp-body)) (load (field ev body-len))
+                   (header-value (load (field ev resp-headers)) "content-type"))
+    (sb-push-str! sb ",\"redirectURL\":\"\",\"headersSize\":-1,")
+    (json-kv-int! sb "bodySize" (load (field ev body-len)))
+    (sb-push-str! sb "}")
+    ; ---- timings: the tap measures one span, so it is all `wait`. Claiming a
+    ; send/receive breakdown it never measured would draw a fictional waterfall.
+    (sb-push-str! sb ",\"cache\":{},\"timings\":{\"send\":0,\"wait\":")
+    (json-ms! sb elapsed)
+    (sb-push-str! sb ",\"receive\":0}")
+    ; ---- the part only a metaprogram can fill in
+    (sb-push-str! sb ",\"_coil\":{\"site\":")
+    (json-site! sb (field ev site))
+    (sb-push-str! sb ",")
+    (json-kv-bool! sb "streamed" (load (field ev streamed)))
+    (sb-push-str! sb ",")
+    (json-kv-bool! sb "truncated" (load (field ev truncated)))
+    (sb-push-str! sb ",")
+    (json-kv-bool! sb "consumerStopped" (load (field ev stopped)))
+    (sb-push-str! sb ",")
+    (json-kv-bool! sb "failed" (load (field ev failed)))
+    (sb-push-str! sb ",")
+    (json-kv-str! sb "error" (load (field ev error)))
+    (sb-push-str! sb ",")
+    (json-kv-int! sb "errorCode" (load (field ev error-code)))
+    (sb-push-str! sb "}}")
+    0))
+
+(defn har-close [(ctx (ptr i8))] (-> i64)
+  (let [s (primitive/cast (ptr HarSink) ctx)
+        a (load (field s a))
+        out (alloc/stack StrBuf)]
+    (store! out (sb-new a))
+    (sb-push-str! out "{\"log\":{\"version\":\"1.2\",\"creator\":{\"name\":\"coil-httptap\",\"version\":\"1\"},\"pages\":[],\"entries\":[")
+    (sb-push-str! out (sb-str (load (field s entries))))
+    (sb-push-str! out "]}}\n")
+    (match (fs/write-file a (load (field s path)) (sb-str (load out)))
+      (Err [e] (do (fmt (stderr) "httptap: could not write HAR to {s}\n" (load (field s path))) 0))
+      (Ok [n] (do (fmt (stderr) "httptap: wrote {d} request(s) to {s}\n"
+                       (load (field s count)) (load (field s path)))
+                  0)))
+    (sb-free! out)
+    0))
+
+;; Install the HAR sink. `path` is not opened until exit, so a bad path is not
+;; discovered here; what IS checked is that a path was given at all.
+(defn har-install! [(a (ptr alloc/Allocator)) (path (slice u8))] (-> bool)
+  (if (= (slice-len path) 0)
+      false
+    (let [s (alloc/static HarSink)
+          sink (alloc/stack rt/TapSink)]
+      (store! (field s a) a)
+      (store! (field s path) path)
+      (store! (field s entries) (sb-new a))
+      (store! (field s count) 0)
+      (store! (field sink context) (primitive/cast (ptr i8) s))
+      (store! (field sink on-start) (primitive/fnptr-of har-start))
+      (store! (field sink on-finish) (primitive/fnptr-of har-finish))
+      (store! (field sink on-close) (primitive/fnptr-of har-close))
+      (rt/tap-set-sink! (load sink))
+      true)))
