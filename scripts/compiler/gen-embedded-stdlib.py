@@ -112,7 +112,7 @@ def render(entries: list[tuple[str, str]]) -> str:
     add("")
     add("; Public namespace -> the bundled filename that declares it.")
     add("(defn embedded-file-for-namespace [(name (slice u8))] (-> (slice u8))")
-    body = [f'(str-eq name "{ns}") "{fn}"' for ns, fn in entries]
+    body = [f'(= name "{ns}") "{fn}"' for ns, fn in entries]
     add("  (cond " + "\n        ".join(body))
     add('        ""))')
     add("")
@@ -122,7 +122,7 @@ def render(entries: list[tuple[str, str]]) -> str:
     add("; bytes are baked into the compiler binary and cannot drift from the sources.")
     add("(defn embedded-lib [(name (slice u8))] (-> (slice u8))")
     body = [
-        f'(str-eq name "{fn}") (include-str "../stdlib/{fn}")'
+        f'(= name "{fn}") (include-str "../stdlib/{fn}")'
         for fn in sorted(fn for _, fn in entries)
     ]
     add("  (cond " + "\n        ".join(body))

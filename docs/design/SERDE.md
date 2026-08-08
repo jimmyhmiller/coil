@@ -500,7 +500,7 @@ field count (feeds `deny-unknown`). Tests: `tests/serde_options_test.coil`,
 
 (defn version-of [(a (ptr Allocator)) (src (slice u8))] (-> i64)
   (match (from-json [JVal] a src)          ; any valid JSON decodes
-    (Ok [v] (match-else (jv-get v "version") (JNum [n] n) (_ -1)))
+    (Ok [v] (match (jv-get v "version") (JNum [n] n) (_ -1)))
     (Err [_] -1)))
 ```
 

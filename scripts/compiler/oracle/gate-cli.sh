@@ -2523,17 +2523,16 @@ expect_out "which is not imported here" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check unimported.coil 2>&1' \
   _ "$T/ver" "$COIL"
 
-echo "== match arms accept any spelling of a variant =="
+echo "== match arms accept any spelling of a variant, and \`_\` covers the rest =="
 # The sum is known from the scrutinee, so a variant name inside an arm is unambiguous
-# however it is written. `match-else` GENERATES arms using the bare name, so under an
-# alias import its expansion named variants the checker then rejected.
+# however it is written. `(_ …)` covers whatever the explicit arms left out; it names
+# no variant, so no spelling question arises for it at all.
 mkdir -p "$T/variant"
 cat > "$T/variant/v.coil" <<'EOF'
 (module vmatch)
-(import "coil.match" :use *)
 (import "coil.socket" :as socket)
 (defn code [(e socket/SocketError)] (-> i64)
-  (match-else e (socket/Closed [] 1) (socket/InvalidAddress [] 2) (_ 0)))
+  (match e (socket/Closed [] 1) (socket/InvalidAddress [] 2) (_ 0)))
 (defn main [] (-> i64)
   (if (= (code (socket/Closed)) 1)
       (if (= (code (socket/InvalidAddress)) 2)
@@ -2543,20 +2542,70 @@ cat > "$T/variant/v.coil" <<'EOF'
 EOF
 cat > "$T/variant/bare.coil" <<'EOF'
 (module vbare)
-(import "coil.match" :use *)
 (import "coil.socket" :as socket)
-(defn code [(e socket/SocketError)] (-> i64) (match-else e (Closed [] 1) (_ 0)))
+(defn code [(e socket/SocketError)] (-> i64) (match e (Closed [] 1) (_ 0)))
 (defn main [] (-> i64) (code (socket/Closed)))
 EOF
-expect_rc 0 "match-else: alias-qualified variants expand and RUN correctly" \
+expect_rc 0 "match: alias-qualified variants plus a `_` arm RUN correctly" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build v.coil -o v && ./v' \
   _ "$T/variant" "$COIL"
-expect_rc 0 "match-else: same on the arm64 backend" \
+expect_rc 0 "match: same on the arm64 backend" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build v.coil --backend arm64 -o v2 && ./v2' \
   _ "$T/variant" "$COIL"
-expect_rc 1 "match-else: a bare variant under an :as import also resolves" \
+expect_rc 1 "match: a bare variant under an :as import also resolves" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build bare.coil -o b && ./b' \
   _ "$T/variant" "$COIL"
+
+# `_` is what makes a partial match legal, so the arm has to be positioned where it
+# can actually run, and an omitted variant with no `_` is still an error.
+cat > "$T/variant/notlast.coil" <<'EOF'
+(module vnotlast)
+(defsum S (A []) (B []) (C []))
+(defn code [(s S)] (-> i64) (match s (A [] 1) (_ 0) (B [] 2)))
+(defn main [] (-> i64) (code (A)))
+EOF
+cat > "$T/variant/missing.coil" <<'EOF'
+(module vmissing)
+(defsum S (A []) (B []) (C []))
+(defn code [(s S)] (-> i64) (match s (A [] 1)))
+(defn main [] (-> i64) (code (A)))
+EOF
+expect_out "the \`_\` arm must come last" \
+  "match: arms after \`_\` are rejected" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check notlast.coil 2>&1' \
+  _ "$T/variant" "$COIL"
+expect_out "non-exhaustive match" \
+  "match: a missing variant with no \`_\` is still an error" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check missing.coil 2>&1' \
+  _ "$T/variant" "$COIL"
+
+echo "== lint: match-else migrates to a \`_\` arm =="
+# `match-else` was the library macro that faked a catch-all before `match` had one.
+# The rule is a head swap, so the arms — and any comments between them — come through
+# untouched, and the result has to still run.
+mkdir -p "$T/melint"
+cat > "$T/melint/m.coil" <<'EOF'
+(module melint)
+(import "coil.match" :use *)
+(defsum S (A [(x i64)]) (B []) (C []))
+(defn code [(s S)] (-> i64)
+  (match-else s
+              (A [x] x)
+              ; a comment inside an untouched arm
+              (_ 7)))
+(defn main [] (-> i64) (+ (code (A 5)) (code (C))))
+EOF
+expect_rc 0 "lint --fix rewrites match-else to match" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" lint m.coil --use coil.lint.match-else --fix --allow-dirty' \
+  _ "$T/melint" "$COIL"
+expect_out "\(match s" "lint: the rewritten form is a plain match" \
+  cat "$T/melint/m.coil"
+expect_out "a comment inside an untouched arm" \
+  "lint: comments between arms survive the rewrite" \
+  cat "$T/melint/m.coil"
+expect_rc 12 "lint: the rewritten program still runs" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build m.coil -o m && ./m' \
+  _ "$T/melint" "$COIL"
 
 echo "== generated code must not depend on the CALLER's imports =="
 # Reflection strips qualification, which is right for display and wrong for code

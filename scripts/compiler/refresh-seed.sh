@@ -20,13 +20,30 @@ WHICH="${1:-both}"
 mkdir -p bootstrap/seeds/native
 updated=()
 
+# What the seed was actually built FROM. A seed is built from the working tree, not
+# from a commit, so recording a bare `git rev-parse HEAD` is a claim the file cannot
+# back up: refreshed with uncommitted changes it names a commit that does not contain
+# the source the binary was derived from, and the next reader has no way to tell.
+# Say so instead. Refresh AFTER committing the source and this reduces to the hash.
+# The seed artifacts are excluded from the dirty check on purpose: this function runs
+# AFTER the new binary has been copied into bootstrap/seeds/, so they are always dirty
+# here. The question is only whether the SOURCE the binary came from is committed.
+seed_source_stamp() {
+  local head; head=$(git rev-parse HEAD)
+  if [ -n "$(git status --porcelain -- ':!bootstrap/seeds')" ]; then
+    echo "commit: $head + UNCOMMITTED working-tree changes (re-run after committing)"
+  else
+    echo "commit: $head"
+  fi
+}
+
 if [ "$WHICH" = both ] || [ "$WHICH" = full ]; then
   echo "=== [full] verifying before touching the seed ==="
   ./scripts/compiler/rebootstrap.sh /tmp/coil-newseed || { echo "[full] VERIFY FAILED — seed NOT updated"; exit 1; }
   cp /tmp/coil-newseed bootstrap/seeds/native/coil-seed
   chmod +x bootstrap/seeds/native/coil-seed
   {
-    echo "commit: $(git rev-parse HEAD)"
+    seed_source_stamp
     echo "built:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "source: src/compiler/main.coil (LLVM + arm64)"
     echo "proof:  arm64 fixpoint (stage2.o==stage3.o) + gate-full + arm64 gate-run"
@@ -40,7 +57,7 @@ if [ "$WHICH" = both ] || [ "$WHICH" = nollvm ]; then
   cp /tmp/coil-newseed-nollvm bootstrap/seeds/native/coil-seed-nollvm
   chmod +x bootstrap/seeds/native/coil-seed-nollvm
   {
-    echo "commit: $(git rev-parse HEAD)"
+    seed_source_stamp
     echo "built:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "source: src/compiler/main_a64.coil (LLVM-free)"
     echo "proof:  no-libLLVM + arm64 fixpoint (stage2.o==stage3.o) + arm64 gate-run"
