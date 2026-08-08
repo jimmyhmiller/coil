@@ -146,13 +146,16 @@ These are real, reproduced, and each has a clear repro:
   recognises a fault near its guard page and reports "comptime evaluation exhausted the
   stack; it may not terminate" — which converts a silent crash into a diagnostic without
   making runaway comptime terminate.
-- **An aggregate-typed `const` is not supported** — but it is now REFUSED CLEANLY,
-  with a located error naming the const and its type and pointing at the zero-argument
-  function workaround, instead of aborting with `UNIMPLEMENTED: codegen: unknown static
-  const <name>`. Still missing to actually support it: the checker classifies these as
-  statics and elaborates references to `EStaticRef`, but none of the four backends ever
-  pushes to `cg.statics`, so all of them would need constant-initialized globals
-  carrying each aggregate's exact layout.
+- ~~**An aggregate-typed `const` is not supported**~~ — FIXED, by deletion. The
+  checker classified these as STATICS and elaborated references to `EStaticRef`, which
+  no backend can lower because not one of the four ever pushes to `cg.statics` —
+  statics were a half-built representation with no consumer. Dropping the
+  classification lets an aggregate const take the path a non-literal const already
+  took: `EComptime` of its value, materialized by the comptime engine at each use.
+  Struct, sum, payload-carrying sum and array consts all work, on both backends. The
+  trade is materialization per use rather than one shared global, and the const is now
+  a VALUE rather than a place — `(field CONST x)` needs a `let` first, which the
+  field-on-value diagnostic now tells you.
 - **A comptime result cannot be a generic-instance aggregate** — `(Option i64)`,
   `(Pair i64 i64)` report "cannot be materialized". Plain structs, plain sums and arrays
   work.

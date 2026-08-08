@@ -2393,6 +2393,37 @@ expect_rc 0 "tco: runaway comptime now terminates instead of SIGBUS" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check ct.coil' \
   _ "$T/tco" "$COIL"
 
+echo "== aggregate-typed const =="
+# A const of struct/sum/array type used to be classified as a STATIC, and no backend
+# could lower the resulting EStaticRef. It now takes the same path a non-literal const
+# already took — EComptime of its value, materialized at each use.
+mkdir -p "$T/aggconst"
+cat > "$T/aggconst/a.coil" <<'EOF'
+(module aggc)
+(import "coil.primitive" :as primitive)
+(defsum Color (Red []) (Green []) (Blue []))
+(defsum Tagged (Num [(v i64)]) (Nothing []))
+(defstruct P [(x i64) (y i64)])
+(defn mkp [] (-> P)
+  (let [(mut p) (primitive/zeroed P)]
+    (store! (field (mut p) x) 3) (store! (field (mut p) y) 4) (load (mut p))))
+(const FAVOURITE (Blue []))
+(const ANSWER    (Num 42))
+(const ORIGIN    (mkp))
+(defn main [] (-> i64)
+  (let [(mut o) ORIGIN]
+    (primitive/iadd (match FAVOURITE (Red [] 1) (Green [] 2) (Blue [] 3))
+                    (primitive/iadd (match ANSWER (Num [v] v) (Nothing [] 0))
+                                    (primitive/iadd (load (field (mut o) x))
+                                                    (load (field (mut o) y)))))))
+EOF
+expect_rc 52 "const: sum, payload sum and struct consts all materialize (3+42+3+4)" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build a.coil -o a && ./a' \
+  _ "$T/aggconst" "$COIL"
+expect_rc 52 "const: same on the arm64 backend" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build a.coil --backend arm64 -o a2 && ./a2' \
+  _ "$T/aggconst" "$COIL"
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL
