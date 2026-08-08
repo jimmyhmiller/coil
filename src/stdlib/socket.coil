@@ -2,7 +2,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (import "coil.str" :as str)
-(import "coil.slice" :use [slice-len])
+(import "coil.slice" :use [slice-len slice-get])
 (import "coil.os" :as os)
 (import "coil.io" :as io)
 (import "coil.selectors" :as selectors)
@@ -42,6 +42,32 @@
 (static-assert (= (primitive/sizeof sockaddr) 16) "sockaddr ABI size")
 (static-assert (= (primitive/sizeof sockaddr_in) 16) "sockaddr_in ABI size")
 
+;; AF_UNIX is 1 on both platforms, but sockaddr_un differs: Linux leads with a
+;; 2-byte family and allows a 108-byte path, while the BSD layout macOS inherits
+;; leads with a length byte and allows 104. Both are proved by size below.
+(defn gen-unix-abi [] (-> Code)
+  (if (primitive/code-eq (primitive/target-os) `linux)
+      `(do
+         (const AF_UNIX 1)
+         (const SUN_PATH_CAPACITY 108)
+         (defstruct sockaddr_un
+           [(sun_family u16)
+            (sun_path (array u8 108))]))
+      `(do
+         (const AF_UNIX 1)
+         (const SUN_PATH_CAPACITY 104)
+         (defstruct sockaddr_un
+           [(sun_len u8)
+            (sun_family u8)
+            (sun_path (array u8 104))]))))
+(meta (gen-unix-abi))
+
+(defn gen-sockaddr-un-size-assert [] (-> Code)
+  (if (primitive/code-eq (primitive/target-os) `linux)
+      `(static-assert (= (primitive/sizeof sockaddr_un) 110) "sockaddr_un ABI size")
+      `(static-assert (= (primitive/sizeof sockaddr_un) 106) "sockaddr_un ABI size")))
+(meta (gen-sockaddr-un-size-assert))
+
 (export TcpListener
         TcpConnection
         SocketError
@@ -65,7 +91,20 @@
         tcp-read
         tcp-write
         tcp-listener-close!
-        tcp-connection-close!)
+        tcp-connection-close!
+        UnixListener
+        UnixConnection
+        SUN_PATH_CAPACITY
+        unix-listen
+        unix-listener-watch
+        unix-accept
+        unix-accept-for
+        unix-connect
+        unix-connection-watch
+        unix-read
+        unix-write
+        unix-listener-close!
+        unix-connection-close!)
 
 (defsum SocketError
   (InvalidAddress)
@@ -80,6 +119,8 @@
 
 (defstruct TcpListener [(fd i32) (closed bool)])
 (defstruct TcpConnection [(fd i32) (closed bool)])
+(defstruct UnixListener [(fd i32) (closed bool)])
+(defstruct UnixConnection [(fd i32) (closed bool)])
 
 (defn socket-error-code [(error SocketError)] (-> i64)
   (match error
@@ -245,6 +286,159 @@
   0)
 
 (defn tcp-connection-close! [(connection (ptr TcpConnection))] (-> i64)
+  (unless (load (field connection closed))
+    (os/close (load (field connection fd)))
+    (store! (field connection fd) -1)
+    (store! (field connection closed) true))
+  0)
+
+;; ---------------------------------------------------------------------------
+;; AF_UNIX stream sockets
+;;
+;; Same syscalls as the TCP path; only the address family and the address
+;; struct differ. A unix socket is addressed by a filesystem path, so the path
+;; carries the permissions -- there is no port to bind and no token to present.
+;;
+;; The socket file's lifecycle belongs to the caller. `bind` fails with EADDRINUSE
+;; if the path already exists, including when a previous process died without
+;; cleaning up, so a server that wants to rebind must remove the stale path
+;; itself. This module deliberately does not unlink on the caller's behalf: it
+;; cannot tell a stale socket from one a live server is serving.
+;; ---------------------------------------------------------------------------
+
+(defn gen-sockaddr-un-platform [] (-> Code)
+  (if (primitive/code-eq (primitive/target-os) `linux)
+      `(defn sockaddr-unix-init [(address (ptr sockaddr_un))] (-> i64)
+         (store! (field address sun_family) (primitive/cast u16 AF_UNIX))
+         0)
+      `(defn sockaddr-unix-init [(address (ptr sockaddr_un))] (-> i64)
+         (store! (field address sun_len) (primitive/cast u8 (sizeof sockaddr_un)))
+         (store! (field address sun_family) (primitive/cast u8 AF_UNIX))
+         0)))
+(meta (gen-sockaddr-un-platform))
+
+;; Fill `address` from `path`. The path must leave room for a NUL terminator,
+;; so the usable length is one less than SUN_PATH_CAPACITY.
+(defn sockaddr-unix [(path (slice u8)) (address (ptr sockaddr_un))] (-> (Result i64 SocketError))
+  (let [n (slice-len path)]
+    (if (or (= n 0) (>= n (- SUN_PATH_CAPACITY 1)))
+        (Err (InvalidAddress))
+        (do
+          (sockaddr-unix-init address)
+          (let [destination (primitive/cast (ptr u8) (field address sun_path))
+                (mut i) 0]
+            (loop (if (>= (load i) n)
+                      (break)
+                      (do
+                        (store! (primitive/index destination (load i)) (slice-get path (load i)))
+                        (store! i (+ (load i) 1)))))
+            (store! (primitive/index destination n) (primitive/cast u8 0)))
+          (Ok 0)))))
+
+(defn unix-open [] (-> (Result i32 SocketError))
+  (let [fd (socket AF_UNIX SOCK_STREAM 0)]
+    (if (< fd 0) (Err (OpenFailed (os/os-errno))) (Ok fd))))
+
+(defn unix-listen [(listener (ptr UnixListener))
+                   (path (slice u8))
+                   (backlog i64)] (-> (Result (ptr UnixListener) SocketError))
+  (match (unix-open)
+    (Err [e] (Err e))
+    (Ok [fd]
+        (block :done
+               (let [address (alloc/stack sockaddr_un)]
+                 (match (sockaddr-unix path address)
+                   (Err [e] (do (os/close fd) (return-from :done (Err e))))
+                   (Ok [_] 0))
+                 (if (< (bind fd
+                              (primitive/cast (ptr sockaddr) address)
+                              (primitive/cast u32 (sizeof sockaddr_un)))
+                        0)
+                     (do (os/close fd) (return-from :done (Err (BindFailed (os/os-errno)))))
+                     0))
+               (if (< (listen fd (primitive/cast i32 backlog)) 0)
+                   (do (os/close fd) (return-from :done (Err (ListenFailed (os/os-errno)))))
+                   (do
+                     (store! (field listener fd) fd)
+                     (store! (field listener closed) false)
+                     (Ok listener)))))))
+
+(defn unix-listener-watch [(listener (ptr UnixListener)) (tag i64)] (-> selectors/Watch)
+  (selectors/watch (load (field listener fd)) (selectors/interest-readable) tag))
+
+(defn unix-accept [(listener (ptr UnixListener))
+                   (connection (ptr UnixConnection))] (-> (Result (ptr UnixConnection) SocketError))
+  (if (load (field listener closed))
+      (Err (Closed))
+      (block :done
+             (loop (let [fd
+                           (accept (load (field listener fd))
+                                   (primitive/cast (ptr sockaddr) 0)
+                                   (primitive/cast (ptr u32) 0))]
+                     (if (>= fd 0)
+                         (do
+                           (store! (field connection fd) fd)
+                           (store! (field connection closed) false)
+                           (return-from :done (Ok connection)))
+                         (let [error (os/os-errno)]
+                           ;; EINTR: the accept was interrupted, not failed.
+                           (if (= error 4) 0 (return-from :done (Err (AcceptFailed error)))))))))))
+
+(defn unix-accept-for [(listener (ptr UnixListener))
+                       (connection (ptr UnixConnection))
+                       (duration time/Duration)] (-> (Result (ptr UnixConnection) SocketError))
+  (match (selectors/wait-fd-for (load (field listener fd)) (selectors/interest-readable) duration)
+    (Err [e]
+         (match e
+           (selectors/Timeout [] (Err (AcceptFailed 110)))
+           (selectors/InvalidFd [] (Err (Closed)))
+           (selectors/Syscall [code] (Err (AcceptFailed code)))))
+    (Ok [_] (unix-accept listener connection))))
+
+(defn unix-connect [(connection (ptr UnixConnection))
+                    (path (slice u8))] (-> (Result (ptr UnixConnection) SocketError))
+  (match (unix-open)
+    (Err [e] (Err e))
+    (Ok [fd]
+        (let [address (alloc/stack sockaddr_un)]
+          (match (sockaddr-unix path address)
+            (Err [e] (do (os/close fd) (Err e)))
+            (Ok [_]
+                (if (< (connect fd
+                                (primitive/cast (ptr sockaddr) address)
+                                (primitive/cast u32 (sizeof sockaddr_un)))
+                       0)
+                    (let [error (os/os-errno)] (os/close fd) (Err (ConnectFailed error)))
+                    (do
+                      (store! (field connection fd) fd)
+                      (store! (field connection closed) false)
+                      (Ok connection)))))))))
+
+(defn unix-connection-watch [(connection (ptr UnixConnection))
+                             (interest selectors/Interest)
+                             (tag i64)] (-> selectors/Watch)
+  (selectors/watch (load (field connection fd)) interest tag))
+
+(defn unix-read [(connection (ptr UnixConnection)) (buffer (ptr i8)) (length i64)] (-> (Result i64 SocketError))
+  (if (load (field connection closed))
+      (Err (Closed))
+      (let [n (primitive/cast i64 (io/read (load (field connection fd)) buffer (primitive/cast isize length)))]
+        (if (< n 0) (Err (IoFailed (os/os-errno))) (Ok n)))))
+
+(defn unix-write [(connection (ptr UnixConnection)) (buffer (ptr i8)) (length i64)] (-> (Result i64 SocketError))
+  (if (load (field connection closed))
+      (Err (Closed))
+      (let [n (primitive/cast i64 (io/write (load (field connection fd)) buffer (primitive/cast isize length)))]
+        (if (< n 0) (Err (IoFailed (os/os-errno))) (Ok n)))))
+
+(defn unix-listener-close! [(listener (ptr UnixListener))] (-> i64)
+  (unless (load (field listener closed))
+    (os/close (load (field listener fd)))
+    (store! (field listener fd) -1)
+    (store! (field listener closed) true))
+  0)
+
+(defn unix-connection-close! [(connection (ptr UnixConnection))] (-> i64)
   (unless (load (field connection closed))
     (os/close (load (field connection fd)))
     (store! (field connection fd) -1)
