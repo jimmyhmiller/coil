@@ -89,6 +89,12 @@
    (epilabel i64)
    (outbytes i64)  ; max outgoing stack-arg bytes of any call
    (fnstart i64)  ; text offset of current function start
+   ; ---- self-tail-call state (see emit-tail-self-call!) ----
+   (selfname (slice u8))  ; name of the function being emitted
+   (tailslots (ptr (ArrayList i64)))  ; its parameter slots, in order
+   (tailtys (ptr (ArrayList Type)))  ; and their types
+   (entrylabel i64)  ; label bound after parameter intake
+   (tailok bool)  ; the expression being emitted is in TAIL position
    ; ---- DWARF collection ----
    (dwtys (ArrayList DwTy))
    (dwfns (ArrayList DwFn))
@@ -595,6 +601,24 @@
 ; copy `size` bytes from a slot to memory addressed by x-reg `dstreg`, and the
 ; reverse. Byte loops via register-offset addressing (x10 idx, x9 data).
 ; NOTE: the data register is x14 — callers pass the ADDRESS in x9.
+; slot -> slot, both x28-relative. 8-byte chunks then a byte tail, so an odd size
+; (a packed struct) is copied correctly rather than rounded.
+(defn emit-copy-slot! [(g (ptr Cga)) (dst i64) (src i64) (size i64)] (-> i64)
+  (let [(mut k) 0]
+    (loop (if (> (primitive/iadd (load k) 8) size)
+              (break)
+              (do
+                (emit-load-int! g 14 28 (primitive/iadd src (load k)) 8 false)
+                (emit-store-int! g 14 28 (primitive/iadd dst (load k)) 8)
+                (store! k (primitive/iadd (load k) 8)))))
+    (loop (if (>= (load k) size)
+              (break)
+              (do
+                (emit-load-int! g 14 28 (primitive/iadd src (load k)) 1 false)
+                (emit-store-int! g 14 28 (primitive/iadd dst (load k)) 1)
+                (store! k (primitive/iadd (load k) 1)))))
+    0))
+
 (defn emit-copy-to-mem! [(g (ptr Cga)) (dstreg i64) (src i64) (size i64)] (-> i64)
   (let [s (field g asm)]
     (if (<= size (primitive/cast i64 64))
@@ -1183,6 +1207,22 @@
                 (store! i (primitive/iadd (load i) 1)))))
     (load last)))
 
+; The function body: identical to emit-body except the LAST expression is emitted in
+; TAIL position. Only the function body may start a tail chain — a `do` in argument
+; position ends in a value that its caller still consumes.
+(defn emit-body-tail [(g (ptr Cga)) (body (ptr (ArrayList Expr)))] (-> AVal)
+  (let [n (al-len [Expr] (load body))
+        (mut i) 0
+        (mut last) (mk-aval 0 0 (TInt 64 true))]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (when (load (field g terminated)) (break))
+                (when (= (load i) (primitive/isub n 1)) (store! (field g tailok) true) 0)
+                (store! last (emit-expr g (al-at [Expr] body (load i))))
+                (store! i (primitive/iadd (load i) 1)))))
+    (load last)))
+
 (defn emit-binds [(g (ptr Cga)) (binds (ptr (ArrayList Bind)))] (-> i64)
   (let [n (al-len [Bind] (load binds))
         (mut i) 0
@@ -1262,8 +1302,24 @@
               (when (< (load r) (primitive/cast i64 0)) (cga-fail2 "no such loop label: " want))
               (load r))))))
 
+; TAIL POSITION is CONSUMED here. Every entry to emit-expr clears the flag into a
+; local, so a construct that does not explicitly re-arm it cannot leak tail-ness to
+; its children — the failure that would matter (compiling a NON-tail call as a jump)
+; is structurally impossible rather than a thing to remember. `if` re-arms it for its
+; two branches, which is the only propagation the reported case needs.
 (defn emit-expr [(g (ptr Cga)) (e (ptr Expr))] (-> AVal)
   (dw-note-span! g e)
+  (let [am-tail (load (field g tailok))]
+    (store! (field g tailok) false)
+    (match-else (load (field e kind))
+                (EIf [cnd thn els] (emit-if-tail g cnd thn els am-tail))
+                (ECall [func targs args]
+                       (if (and am-tail (tail-self-callable? g func args))
+                           (emit-tail-self-call! g args)
+                           (emit-call-named g func args)))
+                (_ (emit-expr-rest g e)))))
+
+(defn emit-expr-rest [(g (ptr Cga)) (e (ptr Expr))] (-> AVal)
   (match (load (field e kind))
     (EInt [v] (mk-aval 0 v (TInt 64 true)))
     (EFloat [bits] (mk-aval 2 bits (TFloat 64)))
@@ -1699,6 +1755,100 @@
             (mk-aval 1 slot (TBool)))))))
 
 ; ---- control flow -----------------------------------------------------------
+; ---- self-tail-call optimization ------------------------------------------
+; Without this the arm64 backend turns every self-recursive tail call into a real
+; BL, so a tail-recursive function consumes a frame per iteration and dies of stack
+; exhaustion where the LLVM backend — which does this — runs it in constant space.
+; That is a plain miscompile-by-omission at RUNTIME (`coil build --backend arm64`
+; segfaults on a program LLVM runs fine), and comptime inherits it because the
+; comptime thunk is built by THIS backend: the reported "runaway comptime crashes
+; the compiler" was this, not a comptime defect.
+;
+; Eligible when the callee is the function being emitted, the arity matches its
+; recorded parameter slots, and every parameter was spilled to a slot (the ordinary
+; case — recorded during intake). Anything else falls back to a normal call, so the
+; optimization can only ever be skipped, never misapplied.
+(defn tail-self-callable? [(g (ptr Cga)) (func (slice u8)) (args (ptr (ArrayList Expr)))] (-> bool)
+  (and (> (slice-len [u8] (load (field g selfname))) (primitive/cast i64 0))
+       (and (str-eq func (load (field g selfname)))
+            (= (al-len [Expr] (load args))
+               (al-len [i64] (load (load (field g tailslots))))))))
+
+; Evaluate the arguments into FRESH slots first, then copy those into the parameter
+; slots, then jump. The two phases are not an optimization detail: `(f b a)` swapping
+; its arguments would otherwise overwrite the first parameter before the second
+; argument had read it.
+(defn emit-tail-self-call! [(g (ptr Cga)) (args (ptr (ArrayList Expr)))] (-> AVal)
+  (let [n (al-len [Expr] (load args))
+        tmps (unwrap-ptr [(ArrayList i64)] (create [(ArrayList i64)] (load (field g a))))
+        (mut i) 0]
+    (store! tmps (al-new [i64] (load (field g a))))
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [av (emit-expr g (al-at [Expr] args (load i)))
+                      t (alloc/stack Type)]
+                  (store! t (al-get [Type] (load (load (field g tailtys))) (load i)))
+                  (let [ts (slot-for-ty! g t)]
+                    (emit-store-av! g av ts)
+                    (al-push! tmps ts)))
+                (store! i (primitive/iadd (load i) 1)))))
+    (store! i 0)
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [t (alloc/stack Type)]
+                  (store! t (al-get [Type] (load (load (field g tailtys))) (load i)))
+                  (let [dst (al-get [i64] (load (load (field g tailslots))) (load i))
+                        src (al-get [i64] (load tmps) (load i))
+                        sz (ty-size g t)]
+                    (emit-copy-slot! g dst src sz)))
+                (store! i (primitive/iadd (load i) 1)))))
+    (a64-b-label! (mut (field g asm)) (load (field g entrylabel)))
+    ; the jump never falls through, so the surrounding `if`/body treats this arm as
+    ; terminated and emits no result store — the same path `break` already used.
+    (store! (field g terminated) true)
+    (mk-aval 0 0 (TInt 64 true))))
+
+; `if` is the one construct that propagates tail position: both branches of a tail
+; `if` are themselves in tail position; the CONDITION never is.
+(defn emit-if-tail [(g (ptr Cga)) (cnd (ptr Expr)) (thn (ptr Expr)) (els (ptr Expr)) (am-tail bool)] (-> AVal)
+  (let [cav (emit-expr g cnd)
+        s (field g asm)
+        lelse (a64-new-label (mut (field g asm)))
+        lend (a64-new-label (mut (field g asm)))]
+    (av-to-x! g cav 9)
+    (a64-cbz-label! (mut (field g asm)) 9 lelse)
+    (store! (field g tailok) am-tail)
+    (let [thnav (emit-expr g thn)
+          thnterm (load (field g terminated))
+          (mut rslot) -1
+          (mut rty) (TInt 64 true)]
+      (unless thnterm
+              (let [tt (alloc/stack Type)]
+                (store! tt (av-ty thnav))
+                (store! rslot (slot-for-ty! g tt))
+                (store! rty (av-ty thnav))
+                (emit-store-av! g thnav (load rslot)))
+              (a64-b-label! (mut (field g asm)) lend)
+              0)
+      (store! (field g terminated) false)
+      (a64-bind-label! (mut (field g asm)) lelse)
+      (store! (field g tailok) am-tail)
+      (let [elsav (emit-expr g els)
+            elsterm (load (field g terminated))]
+        (unless elsterm
+                (let [et (alloc/stack Type)]
+                  (store! et (av-ty elsav))
+                  (when (< (load rslot) (primitive/cast i64 0)) (store! rslot (slot-for-ty! g et)) (store! rty (av-ty elsav)) 0)
+                  (emit-store-av! g elsav (load rslot)))
+                0)
+        (a64-bind-label! (mut (field g asm)) lend)
+        (store! (field g terminated) (and thnterm elsterm))
+        (if (>= (load rslot) (primitive/cast i64 0))
+            (mk-aval 1 (load rslot) (load rty))
+            (mk-aval 0 0 (TInt 64 true)))))))
+
 (defn emit-if [(g (ptr Cga)) (cnd (ptr Expr)) (thn (ptr Expr)) (els (ptr Expr))] (-> AVal)
   (let [cav (emit-expr g cnd)
         s (field g asm)
@@ -2942,6 +3092,18 @@
   (store! (field g retty) (load (field fd ret)))
   (store! (field g sretslot) -1)
   (store! (field g outbytes) 0)
+  ; self-tail-call state, fresh per function
+  (store! (field g selfname) (load (field fd name)))
+  (store! (field g tailok) false)
+  (store! (field g tailslots)
+          (let [gg (unwrap-ptr [(ArrayList i64)] (create [(ArrayList i64)] (load (field g a))))]
+            (store! gg (al-new [i64] (load (field g a))))
+            gg))
+  (store! (field g tailtys)
+          (let [gg (unwrap-ptr [(ArrayList Type)] (create [(ArrayList Type)] (load (field g a))))]
+            (store! gg (al-new [Type] (load (field g a))))
+            gg))
+  (store! (field g entrylabel) (a64-new-label (mut (field g asm))))
   (let [s (field g asm)
         a (load (field g a))
         si (g-sig-idx g (load (field fd name)))]
@@ -3008,7 +3170,11 @@
                                 info (g-abi-info g t)
                                 cls (abi-cls info)
                                 slot (slot-for-ty! g t)
-                                sz (ty-size g t)]
+                                sz (ty-size g t)
+                                _tailrec (do
+                                           (al-push! (load (field g tailslots)) slot)
+                                           (al-push! (load (field g tailtys)) (load t))
+                                           0)]
                             (cond (= cls (primitive/cast i64 0))
                                     (if (< (load gp) (primitive/cast i64 8))
                                         (do
@@ -3139,8 +3305,11 @@
                     (store! (field ev pe) true)
                     (al-push! (mut (field g dwevs)) (load ev))
                     0))
-            ; ---- body
-            (let [bav (emit-body g (load (field fd body)))]
+            ; ---- body. The entry label sits AFTER parameter intake, so a self-tail
+            ; call jumps here: the frame, the incoming-argument registers and the
+            ; spill code are all already done, and re-running them would be wrong.
+            (a64-bind-label! (mut (field g asm)) (load (field g entrylabel)))
+            (let [bav (emit-body-tail g (load (field fd body)))]
               (unless (load (field g terminated))
                       (unless ; ---- return value per ABI class
                               retvoid

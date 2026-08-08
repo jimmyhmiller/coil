@@ -2355,6 +2355,44 @@ expect_rc 7 "shadow: an unshadowed macro still expands normally" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" run macro-still-expands.coil' \
   _ "$T/shadow" "$COIL"
 
+echo "== arm64 self-tail-call optimization =="
+# Without TCO the arm64 backend spent a frame per iteration, so a tail-recursive
+# function died of stack exhaustion where LLVM ran it in constant space — a runtime
+# miscompile-by-omission that comptime inherited (its thunk is built by this backend).
+mkdir -p "$T/tco"
+cat > "$T/tco/deep.coil" <<'EOF'
+(module tcodeep)
+(import "coil.primitive" :as primitive)
+(defn spin [(n i64)] (-> i64) (if (= n 0) 0 (spin (primitive/isub n 1))))
+(defn main [] (-> i64) (spin 100000000))
+EOF
+cat > "$T/tco/swap.coil" <<'EOF'
+(module tcoswap)
+(import "coil.primitive" :as primitive)
+; arguments SWAP: writing parameters in place would clobber a before b reads it
+(defn sw [(n i64) (a i64) (b i64)] (-> i64)
+  (if (= n 0) a (sw (primitive/isub n 1) b a)))
+(defn main [] (-> i64) (sw 11 3 4))
+EOF
+cat > "$T/tco/ct.coil" <<'EOF'
+(module tcoct)
+(import "coil.primitive" :as primitive)
+(defn spin [(n i64)] (-> i64) (if (= n 0) 0 (spin (primitive/isub n 1))))
+(defn main [] (-> i64) (comptime (spin 100000000)))
+EOF
+expect_rc 0 "tco: deep tail recursion runs in constant space on the arm64 backend" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build deep.coil --backend arm64 -o d && ./d' \
+  _ "$T/tco" "$COIL"
+expect_rc 4 "tco: a tail call that swaps its arguments is still correct (arm64)" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build swap.coil --backend arm64 -o s && ./s' \
+  _ "$T/tco" "$COIL"
+expect_rc 4 "tco: same answer from the LLVM backend" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build swap.coil -o s2 && ./s2' \
+  _ "$T/tco" "$COIL"
+expect_rc 0 "tco: runaway comptime now terminates instead of SIGBUS" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check ct.coil' \
+  _ "$T/tco" "$COIL"
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL
