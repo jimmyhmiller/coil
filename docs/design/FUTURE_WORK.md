@@ -22,7 +22,7 @@ to use it.
 
 ## 1. Nobody else can adopt it yet
 
-### 1.1 Dependency story: mostly LANDED; no lockfile
+### 1.1 Dependency story: LANDED
 
 Largely stale. `Coil.toml` has `[dependencies]`, and it works:
 
@@ -40,16 +40,13 @@ Verified end to end with a path dependency, including a library shipping a metap
 that the consumer enables with one `[metaprograms] use` line; the git path is
 implemented (`m-prepare-deps`) but has not been exercised against a real remote here.
 
-**Still genuinely missing: a lockfile.** A `path` dependency floats with whatever is on
-disk, and while a `git` dependency is pinned by its own SHA, nothing records the
-resolved set for a whole tree, so transitive resolution is not reproducible from the
-manifest alone.
-
 ### 1.2 No release or versioning story
 
-`coil --version` does not exist — it prints `coil: unknown command '--version'`
-followed by the usage text and exits 1. There is no release artifact, no install path,
-no channel — the compiler is a binary committed to a repo.
+`coil --version` works (`--version`, `-V` and `version` all print `coil 0.1.0`). The
+string is static and bumped by hand: baking the git commit in would put version.coil in
+main.coil's import closure, churning the `full` snapshot every commit, and a stamp from
+a dirty tree lies about what the binary holds. What is still missing is the rest — there
+is no release artifact, no install path, no channel — the compiler is a binary committed to a repo.
 Anyone adopting Coil needs to answer "which Coil?" and today there is no answer.
 
 ### 1.3 Diagnostics stop at the first error

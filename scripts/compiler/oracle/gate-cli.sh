@@ -2502,6 +2502,27 @@ expect_rc 21 "comptime: same on the arm64 backend" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build nested.coil --backend arm64 -o n2 && ./n2' \
   _ "$T/rest" "$COIL"
 
+echo "== --version, and the shadowed-macro diagnostic =="
+mkdir -p "$T/ver"
+cat > "$T/ver/sh.coil" <<'EOF'
+(module vsh)
+(defn main [] (-> i64) (let [when 5] (when 1 2)))
+EOF
+cat > "$T/ver/unimported.coil" <<'EOF'
+(module vun)
+(defn main [] (-> i64) (str-eq "a" "a"))
+EOF
+expect_rc 0 "version: --version prints and exits 0" bash -c '"$1" --version' _ "$COIL"
+expect_out "coil 0" "version: names the compiler and a version" bash -c '"$1" --version' _ "$COIL"
+expect_out "is a local binding here" \
+  "shadow: a shadowed macro is reported as a local, not as a missing import" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check sh.coil 2>&1' \
+  _ "$T/ver" "$COIL"
+expect_out "which is not imported here" \
+  "shadow: a genuinely unimported name still gets the import hint" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check unimported.coil 2>&1' \
+  _ "$T/ver" "$COIL"
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL
