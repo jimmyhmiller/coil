@@ -2523,6 +2523,41 @@ expect_out "which is not imported here" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check unimported.coil 2>&1' \
   _ "$T/ver" "$COIL"
 
+echo "== match arms accept any spelling of a variant =="
+# The sum is known from the scrutinee, so a variant name inside an arm is unambiguous
+# however it is written. `match-else` GENERATES arms using the bare name, so under an
+# alias import its expansion named variants the checker then rejected.
+mkdir -p "$T/variant"
+cat > "$T/variant/v.coil" <<'EOF'
+(module vmatch)
+(import "coil.match" :use *)
+(import "coil.socket" :as socket)
+(defn code [(e socket/SocketError)] (-> i64)
+  (match-else e (socket/Closed [] 1) (socket/InvalidAddress [] 2) (_ 0)))
+(defn main [] (-> i64)
+  (if (= (code (socket/Closed)) 1)
+      (if (= (code (socket/InvalidAddress)) 2)
+          (if (= (code (socket/IoFailed 5)) 0) 0 3)
+          2)
+      1))
+EOF
+cat > "$T/variant/bare.coil" <<'EOF'
+(module vbare)
+(import "coil.match" :use *)
+(import "coil.socket" :as socket)
+(defn code [(e socket/SocketError)] (-> i64) (match-else e (Closed [] 1) (_ 0)))
+(defn main [] (-> i64) (code (socket/Closed)))
+EOF
+expect_rc 0 "match-else: alias-qualified variants expand and RUN correctly" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build v.coil -o v && ./v' \
+  _ "$T/variant" "$COIL"
+expect_rc 0 "match-else: same on the arm64 backend" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build v.coil --backend arm64 -o v2 && ./v2' \
+  _ "$T/variant" "$COIL"
+expect_rc 1 "match-else: a bare variant under an :as import also resolves" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build bare.coil -o b && ./b' \
+  _ "$T/variant" "$COIL"
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL
