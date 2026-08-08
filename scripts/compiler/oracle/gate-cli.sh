@@ -2453,6 +2453,55 @@ expect_rc 44 "comptime: same on the arm64 backend" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build g.coil --backend arm64 -o g2 && ./g2' \
   _ "$T/ctgen" "$COIL"
 
+echo "== match arm binds scope, nested generics instantiate =="
+mkdir -p "$T/rest"
+cat > "$T/rest/marm.coil" <<'EOF'
+(module marm)
+(defsum Box (Wrap [(v i64)]) (Empty []))
+(defn get [(b Box)] (-> i64) (match b (Wrap [when] (when 1 2)) (Empty [] 0)))
+(defn main [] (-> i64) (get (Wrap 5)))
+EOF
+cat > "$T/rest/marm-ok.coil" <<'EOF'
+(module marmok)
+(defsum Box (Wrap [(v i64)]) (Empty []))
+; an UNSHADOWED macro inside an arm body must still expand
+(defn get [(b Box)] (-> i64) (match b (Wrap [v] (when (= v 5) 7)) (Empty [] 0)))
+(defn main [] (-> i64) (get (Wrap 5)))
+EOF
+cat > "$T/rest/nested.coil" <<'EOF'
+(module nested)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use *)
+(defstruct Pair [T U] [(a T) (b U)])
+(defsum Wrap [T] (Only [(v T)]) (Nada []))
+(defn deep [] (-> (Pair (Option i64) i64))
+  (let [(mut p) (primitive/zeroed (Pair (Option i64) i64))]
+    (store! (field (mut p) a) (Some [i64] 8))
+    (store! (field (mut p) b) 3) (load (mut p))))
+(defn deeper [] (-> (Wrap (Option i64))) (Only [(Option i64)] (Some [i64] 4)))
+(defn arr [] (-> (array (Option i64) 2))
+  (let [(mut z) (primitive/zeroed (array (Option i64) 2))]
+    (store! (primitive/index (mut z) 0) (Some [i64] 6)) (load (mut z))))
+(defn main [] (-> i64)
+  (let [(mut p) (comptime (deep)) (mut z) (comptime (arr))]
+    (primitive/iadd (match (load (field (mut p) a)) (Some [v] v) (None [] 0))
+      (primitive/iadd (load (field (mut p) b))
+        (primitive/iadd (match (comptime (deeper)) (Only [o] (match o (Some [v] v) (None [] 0))) (Nada [] 0))
+                        (match (load (primitive/index (mut z) 0)) (Some [v] v) (None [] 0)))))))
+EOF
+expect_rc 1 "shadow: a MATCH ARM bind wins over a macro in head position" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check marm.coil' \
+  _ "$T/rest" "$COIL"
+expect_rc 7 "shadow: an unshadowed macro still expands inside an arm body" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build marm-ok.coil -o m && ./m' \
+  _ "$T/rest" "$COIL"
+expect_rc 21 "comptime: generics NESTED in a struct, a generic sum and an array (8+3+4+6)" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build nested.coil -o n && ./n' \
+  _ "$T/rest" "$COIL"
+expect_rc 21 "comptime: same on the arm64 backend" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build nested.coil --backend arm64 -o n2 && ./n2' \
+  _ "$T/rest" "$COIL"
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL

@@ -7,10 +7,11 @@
 > rows of the table below now match Clojure.
 >
 > Implementation: `ExpEnv` carries a `bound` stack; a scope records its length on entry
-> and truncates on exit. `expand-calls` consults it BEFORE the macro table, `let` binds
+> and truncates on exit. `expand-calls` consults it BEFORE the macro table; `let` binds
 > its vector after walking the initialisers (so an initialiser still sees the outer
-> meaning), and `expand-def-list` binds parameter/field vectors for the definition body
-> and pops them at its end. Everything below is kept as the rationale.
+> meaning); `expand-def-list` binds parameter/field vectors for the definition body and
+> pops at its end; and `expand-match-form` binds each arm's vector over that arm's body
+> only. Everything below is kept as the rationale.
 
 ## The inconsistency
 
@@ -119,12 +120,13 @@ locally bound name is not a macro reference.
 3. ✅ Consult that environment before the macro table: if the head symbol is bound, it
    is not a macro here.
 
-Scope coverage as landed: `let` binder vectors, and `defn`/`defstruct`/`defsum`/
-`deftrait`/`impl` parameter, field and payload vectors. NOT yet contributing binders:
-`match` arm binds and `for`/`for-in` bindings — those still expand a same-named macro in
-head position inside their bodies. The gap is conservative in the safe direction: it
-UNDER-binds, so it can only leave a macro winning where a local should have, never
-suppress a macro that should have expanded.
+Scope coverage as landed: `let` binder vectors; `defn`/`defstruct`/`defsum`/
+`deftrait`/`impl` parameter, field and payload vectors; and `match` arm binds, which
+scope over that arm's body only. `for`/`for-in` need nothing of their own — they are
+MACROS, so their expansion's `let` is what the walk sees, and it already binds. (An arm
+HEAD is left unexpanded for the same reason a parameter list is: `(Wrap [v] …)` names a
+variant, so a variant sharing a macro's name cannot be rewritten out from under the
+author.)
 
 Item 2 also fixes the binder case, and for the same reason Scheme and Clojure never hit
 it: a parameter list *establishes* names rather than referencing them, so nothing in it

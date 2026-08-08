@@ -164,8 +164,9 @@ These are real, reproduced, and each has a clear repro:
   as `(ECall variant [] args)` / `(EAlloc (TStruct Base))` — dropping the
   instantiation — so mono rejected the sum ("needs type arguments") and codegen aborted
   on the struct (`unknown nominal type`, a SIGABRT). Both are repaired from the known
-  result type. Only the OUTERMOST construction is repaired: a generic aggregate nested
-  inside another still comes back uninstantiated, which is the pre-existing behaviour.
+  result type, walked RECURSIVELY against it — so a generic aggregate nested inside
+  another is instantiated too: a generic inside a generic struct, a generic sum whose
+  payload is a generic sum, and an array of generics all fold.
 - ~~**`--use` requires the target file to declare `(module …)`**~~ — FIXED. An entry
   file is named on the command line and imported by nobody, so it needs no namespace of
   its own; the compiler synthesizes one when the file declares none and something
