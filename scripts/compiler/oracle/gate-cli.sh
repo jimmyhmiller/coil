@@ -2558,6 +2558,53 @@ expect_rc 1 "match-else: a bare variant under an :as import also resolves" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build bare.coil -o b && ./b' \
   _ "$T/variant" "$COIL"
 
+echo "== generated code must not depend on the CALLER's imports =="
+# Reflection strips qualification, which is right for display and wrong for code
+# generation: a macro emitting a bare name produces code that only resolves where the
+# type happens to be imported unqualified. Each case below FAILS on the previous
+# compiler under an `:as` import.
+mkdir -p "$T/qual/src"
+cat > "$T/qual/src/qlib.coil" <<'EOF'
+(module qlib)
+(import "coil.derive" :use *)
+(import "coil.primitive" :as primitive)
+(defstruct Inner [(x i64)])
+(derive-eq Inner)
+(derive-hash Inner)
+EOF
+cat > "$T/qual/src/qlib2.coil" <<'EOF'
+(module qlib2)
+(defsum Shape (Dot []) (Line [(n i64)]))
+EOF
+cat > "$T/qual/src/deq.coil" <<'EOF'
+(module qdeq)
+(import "coil.derive" :use *)
+(import "coil.primitive" :as primitive)
+(import "qlib" :as l)
+(defstruct Outer [(inner l/Inner) (y i64)])
+(derive-eq Outer)
+(derive-hash Outer)
+(defn main [] (-> i64) 0)
+EOF
+cat > "$T/qual/src/dserde.coil" <<'EOF'
+(module qserde)
+(import "coil.serde" :use *)
+(import "coil.serde.derive" :use *)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.str" :use *)
+(import "coil.result" :use *)
+(import "qlib2" :as s)
+(derive-serde-sum s/Shape)
+(defn main [] (-> i64) 0)
+EOF
+expect_rc 0 "qual: derive-eq/-hash over a field typed through an :as import" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=src "$2" check src/deq.coil' \
+  _ "$T/qual" "$COIL"
+expect_rc 0 "qual: derive-serde-sum on a sum reached through an :as import" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=src "$2" check src/dserde.coil' \
+  _ "$T/qual" "$COIL"
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL
