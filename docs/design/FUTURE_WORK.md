@@ -22,21 +22,34 @@ to use it.
 
 ## 1. Nobody else can adopt it yet
 
-### 1.1 No dependency story
+### 1.1 Dependency story: mostly LANDED; no lockfile
 
-`Coil.toml` understands `[package] name/entry`, `[build]`, `[link]`, `[cc]` and `[run]`.
-There is no way to depend on someone else's code: no `[dependencies]`, no fetch, no
-version pinning, no lockfile, no library search path. Everything must be vendored by
-hand or reached with a relative import.
+Largely stale. `Coil.toml` has `[dependencies]`, and it works:
 
-Needed: a dependency section, a fetch-and-pin mechanism with a lockfile, content
-addressing, and a resolution rule that composes with the existing file-relative import
-semantics and the bundled-stdlib `<bundled>` sentinel.
+    [dependencies]
+    local_math  = { path = "../local-math" }          # or the shorthand "../local-math"
+    remote_math = { git = "https://…", sha = "0123…" }
+
+Each dependency root joins the namespace index, so a consumer imports the namespace the
+dependency's source DECLARES (`local_math.numeric`) regardless of where it sits inside
+that dependency. Git dependencies are fetched and checked out detached under
+`.coil/deps/<name>-<sha>`; a full 40- or 64-digit commit SHA is required and branches
+and tags are deliberately refused, so pinning is content-addressed by construction.
+`[link] search-paths` covers the library search path this section also claimed missing.
+Verified end to end with a path dependency, including a library shipping a metaprogram
+that the consumer enables with one `[metaprograms] use` line; the git path is
+implemented (`m-prepare-deps`) but has not been exercised against a real remote here.
+
+**Still genuinely missing: a lockfile.** A `path` dependency floats with whatever is on
+disk, and while a `git` dependency is pinned by its own SHA, nothing records the
+resolved set for a whole tree, so transitive resolution is not reproducible from the
+manifest alone.
 
 ### 1.2 No release or versioning story
 
-`coil --version` does not exist (it prints usage and exits 1). There is no release
-artifact, no install path, no channel — the compiler is a binary committed to a repo.
+`coil --version` does not exist — it prints `coil: unknown command '--version'`
+followed by the usage text and exits 1. There is no release artifact, no install path,
+no channel — the compiler is a binary committed to a repo.
 Anyone adopting Coil needs to answer "which Coil?" and today there is no answer.
 
 ### 1.3 Diagnostics stop at the first error
