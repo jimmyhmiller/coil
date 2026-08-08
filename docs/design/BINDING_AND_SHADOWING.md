@@ -1,17 +1,16 @@
 # Binding and Shadowing — Coil is a Lisp-1 that behaves like a Lisp-2 in head position
 
-> **Status: HALF FIXED.** The **binder** case below is fixed — a macro name is now
-> usable as a field, payload or parameter name, because `expand-calls` no longer treats
-> a binder vector as a call (`expand-def-list` in `src/compiler/expander.coil`). That
-> was the commonly-hit half, and it needed no syntactic environment: a parameter list
-> *establishes* names rather than referencing them, so nothing in it is ever a macro
-> call, whatever is in scope.
+> **Status: FIXED.** Both halves. A local now shadows a macro in head position —
+> `(let [when 5] (when 1 2))` no longer expands the macro, it tries to call the local,
+> which is the error Scheme and Clojure both give. And a macro name is usable as a
+> field, payload or parameter name. Special forms remain unshadowable, so all three
+> rows of the table below now match Clojure.
 >
-> The **head-position** case is still OPEN: `(let [when 5] (when 1 2))` is still `2`,
-> because a local binding still does not shadow a macro. That is tier 2 of the Clojure
-> tiering below and it does need the environment threaded through the walk — items 1
-> and 3 of "What the fix requires". Everything below is unchanged and still describes
-> the target.
+> Implementation: `ExpEnv` carries a `bound` stack; a scope records its length on entry
+> and truncates on exit. `expand-calls` consults it BEFORE the macro table, `let` binds
+> its vector after walking the initialisers (so an initialiser still sees the outer
+> meaning), and `expand-def-list` binds parameter/field vectors for the definition body
+> and pops them at its end. Everything below is kept as the rationale.
 
 ## The inconsistency
 
@@ -100,25 +99,32 @@ shadow macros" only makes sense when there is a second namespace to fall back on
 
 Coil already matches Clojure on two of the three rows:
 
-| position | Clojure | Coil today |
+| position | Clojure | Coil |
 | --- | --- | --- |
 | special form in head position | not shadowable | ✅ not shadowable |
-| macro in head position | **shadowed by locals** | ❌ **not shadowed** |
+| macro in head position | **shadowed by locals** | ✅ shadowed (fixed) |
 | bare symbol reference | shadowed by locals | ✅ shadowed |
 
-The single divergence is tier 2. **Macro expansion must still happen everywhere** — the
+The single divergence WAS tier 2. **Macro expansion must still happen everywhere** — the
 fix is emphatically *not* "skip expansion in certain positions." The fix is that a
 locally bound name is not a macro reference.
 
 ## What the fix requires
 
-1. Thread a **syntactic environment** (the set of names bound at this point) through
-   `expand-calls` / `expand-top-form`.
+1. ✅ Thread a **syntactic environment** (the set of names bound at this point) through
+   `expand-calls` / `expand-top-form`. — `ExpEnv.bound`, used as a stack.
 2. Teach the walker the binding forms, so it knows which subforms **establish** binders:
    `defn` parameter vectors, `defstruct`/`defsum` field vectors, `deftrait`/`impl` method
    signatures, `let` bindings, `match` arm binds, `for`/`for-in` bindings.
-3. Consult that environment before the macro table: if the head symbol is bound, it is
-   not a macro here.
+3. ✅ Consult that environment before the macro table: if the head symbol is bound, it
+   is not a macro here.
+
+Scope coverage as landed: `let` binder vectors, and `defn`/`defstruct`/`defsum`/
+`deftrait`/`impl` parameter, field and payload vectors. NOT yet contributing binders:
+`match` arm binds and `for`/`for-in` bindings — those still expand a same-named macro in
+head position inside their bodies. The gap is conservative in the safe direction: it
+UNDER-binds, so it can only leave a macro winning where a local should have, never
+suppress a macro that should have expanded.
 
 Item 2 also fixes the binder case, and for the same reason Scheme and Clojure never hit
 it: a parameter list *establishes* names rather than referencing them, so nothing in it

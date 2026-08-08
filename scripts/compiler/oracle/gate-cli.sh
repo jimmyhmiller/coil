@@ -2320,6 +2320,41 @@ expect_rc 0 "entry: no module and no imports still compiles" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check nomodnoimp.coil' \
   _ "$T/entrymod" "$COIL"
 
+echo "== a local shadows a macro in head position =="
+# Coil is a Lisp-1: one namespace, so a local binding must win over a macro in HEAD
+# position too, not only in argument position. Clojure/Scheme tiering — special forms
+# are still unshadowable. Asserted by BEHAVIOUR, not message text.
+mkdir -p "$T/shadow"
+cat > "$T/shadow/arg.coil" <<'EOF'
+(module sarg)
+(defn main [] (-> i64) (let [when 5] when))
+EOF
+cat > "$T/shadow/head.coil" <<'EOF'
+(module shead)
+(defn main [] (-> i64) (let [when 5] (when 1 2)))
+EOF
+cat > "$T/shadow/special.coil" <<'EOF'
+(module sspec)
+(defn main [] (-> i64) (let [if 5] (if (= 1 1) 0 9)))
+EOF
+cat > "$T/shadow/macro-still-expands.coil" <<'EOF'
+(module sstill)
+(import "coil.primitive" :as primitive)
+(defn main [] (-> i64) (let [(mut n) 0] (when (= 0 0) (store! n 7) 0) (load n)))
+EOF
+expect_rc 5 "shadow: a local wins in ARGUMENT position (unchanged)" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" run arg.coil' \
+  _ "$T/shadow" "$COIL"
+expect_rc 1 "shadow: a local wins in HEAD position — the macro no longer expands" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check head.coil' \
+  _ "$T/shadow" "$COIL"
+expect_rc 0 "shadow: a SPECIAL FORM is still unshadowable in head position" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check special.coil' \
+  _ "$T/shadow" "$COIL"
+expect_rc 7 "shadow: an unshadowed macro still expands normally" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" run macro-still-expands.coil' \
+  _ "$T/shadow" "$COIL"
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL
