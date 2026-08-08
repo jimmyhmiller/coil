@@ -2424,6 +2424,35 @@ expect_rc 52 "const: same on the arm64 backend" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build a.coil --backend arm64 -o a2 && ./a2' \
   _ "$T/aggconst" "$COIL"
 
+echo "== comptime generic-instance aggregates =="
+# `(Option i64)` / `(Pair i64 i64)` reported "cannot be materialized"; plain structs,
+# sums and arrays worked. Two independent causes: the readback did not understand TApp,
+# and the materializer rebuilt the literal without the instantiation.
+mkdir -p "$T/ctgen"
+cat > "$T/ctgen/g.coil" <<'EOF'
+(module ctgen)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use *)
+(defstruct Pair [T U] [(a T) (b U)])
+(defsum Maybe [T] (Nope []) (Yep [(v T)]))
+(defn mkpair [] (-> (Pair i64 i64))
+  (let [(mut p) (primitive/zeroed (Pair i64 i64))]
+    (store! (field (mut p) a) 11) (store! (field (mut p) b) 22) (load (mut p))))
+(defn nothing [] (-> (Option i64)) (None [i64]))
+(defn main [] (-> i64)
+  (let [(mut p) (comptime (mkpair))]
+    (primitive/iadd (match (comptime (Some [i64] 7)) (Some [v] v) (None [] 0))
+      (primitive/iadd (match (comptime (nothing)) (Some [v] v) (None [] 1))
+        (primitive/iadd (match (comptime (Yep [i64] 3)) (Yep [v] v) (Nope [] 0))
+          (primitive/iadd (load (field (mut p) a)) (load (field (mut p) b))))))))
+EOF
+expect_rc 44 "comptime: generic sum, user generic sum and generic struct all fold (7+1+3+11+22)" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build g.coil -o g && ./g' \
+  _ "$T/ctgen" "$COIL"
+expect_rc 44 "comptime: same on the arm64 backend" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build g.coil --backend arm64 -o g2 && ./g2' \
+  _ "$T/ctgen" "$COIL"
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL

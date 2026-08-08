@@ -156,9 +156,16 @@ These are real, reproduced, and each has a clear repro:
   trade is materialization per use rather than one shared global, and the const is now
   a VALUE rather than a place — `(field CONST x)` needs a `let` first, which the
   field-on-value diagnostic now tells you.
-- **A comptime result cannot be a generic-instance aggregate** — `(Option i64)`,
-  `(Pair i64 i64)` report "cannot be materialized". Plain structs, plain sums and arrays
-  work.
+- ~~**A comptime result cannot be a generic-instance aggregate**~~ — FIXED. Two
+  independent causes, either of which alone produced "cannot be materialized". The
+  readback's type walks matched `TStruct` by name and fell through `_` for `TApp`, so a
+  generic instance was rejected before anything ran; they now instantiate the generic
+  definition by substituting its type parameters. And the materializer rebuilt the value
+  as `(ECall variant [] args)` / `(EAlloc (TStruct Base))` — dropping the
+  instantiation — so mono rejected the sum ("needs type arguments") and codegen aborted
+  on the struct (`unknown nominal type`, a SIGABRT). Both are repaired from the known
+  result type. Only the OUTERMOST construction is repaired: a generic aggregate nested
+  inside another still comes back uninstantiated, which is the pre-existing behaviour.
 - ~~**`--use` requires the target file to declare `(module …)`**~~ — FIXED. An entry
   file is named on the command line and imported by nobody, so it needs no namespace of
   its own; the compiler synthesizes one when the file declares none and something
