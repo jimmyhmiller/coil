@@ -1,0 +1,401 @@
+(module coil.scheme.derived2)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.control" :use *)
+(import "coil.scheme.value" :use *)
+(import "coil.scheme.heap" :use *)
+(import "coil.scheme.symbol" :use *)
+
+;; The second half of R5RS §7.3: the binding and iteration forms whose semantics
+;; are not a straight shape translation, plus quasiquote.
+;;
+;; `derived.coil` holds the forms that map onto Coil's own — `let` is a `let`,
+;; `cond` is nested `if`. The four here do not map, and each fails in a specific
+;; way if you write the obvious expansion:
+;;
+;;   letrec  every name must be in scope for every init, not just the earlier ones
+;;   do      all steps are evaluated BEFORE any variable is rebound
+;;   case    dispatches with eqv?, never equal?
+;;   force   memoizes, so a promise with a side effect runs exactly once
+;;
+;; Quasiquote is separate: it is a recursive walk over the Code tree that tracks a
+;; nesting LEVEL, and the level is the whole algorithm.
+
+; ---- letrec -----------------------------------------------------------------
+;; R5RS 4.2.2: letrec binds all its variables before evaluating ANY init, so an
+;; init may refer to a variable bound by the same letrec — which is what makes
+;; mutual recursion expressible without a forward declaration.
+;;
+;; Coil's `let` is sequential (a later binding sees the earlier ones, like
+;; `let*`), so a direct translation gives `let*` semantics and mutual recursion
+;; fails: the first init would reference a name that does not exist yet.
+;;
+;; The fix is the one R5RS itself describes — bind every name first to an
+;; unspecified value, then assign. `mut` cells make the two phases separable:
+;; phase one creates all the cells, phase two stores the inits, and by then every
+;; name is in scope. `s-undefined` is the hole, reserved in value.coil for exactly
+;; this; a program that reads a letrec variable before its init has run sees it,
+;; which is why `letrec-hole?` exists rather than letting it propagate silently.
+;; As in `do`, the cells are gensyms rather than the user's names: binding a cell
+;; as `a` and then a snapshot as `a` in the same scope makes `(mut a)` name the
+;; snapshot, which is not a place. The user's name appears only as the immutable
+;; binding the body sees.
+(defn d2--rec-cells [(cells Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `[]
+    `[(mut ~(primitive/code-nth cells i)) (s-undefined)
+      ~@(d2--rec-cells cells (+ i 1) n)]))
+
+;; Phase two: every init is stored, and each is evaluated in a scope where all
+;; the names already exist. Each init is wrapped in the reads accumulated so far
+;; PLUS every remaining name, so an init may refer to any variable of the letrec —
+;; a later one simply still holds the hole.
+(defn d2--rec-inits [(bs Code) (cells Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [b (primitive/code-nth bs i)]
+      `((primitive/store! (mut ~(primitive/code-nth cells i))
+                          ~(d2--rec-reads bs cells 0 n `(~(primitive/code-nth b 1))))
+        ~@(d2--rec-inits bs cells (+ i 1) n)))))
+
+;; The body reads variables through the cells, so each reference is a load. That
+;; is the cost of backpatching, and it is why `let` is not built this way.
+(defn d2--rec-reads [(bs Code) (cells Code) (i i64) (n i64) (body Code)] (-> Code)
+  (if (>= i n) `(do ~@body)
+    (let [nm (primitive/code-nth (primitive/code-nth bs i) 0)]
+      `(let [~nm (primitive/load (mut ~(primitive/code-nth cells i)))]
+         ~(d2--rec-reads bs cells (+ i 1) n body)))))
+
+(defn letrec [(bs Code) & (body Code)] (-> Code)
+  (let [n (primitive/code-count bs)
+        cells (d2--gensyms 0 n)]
+    `(let ~(d2--rec-cells cells 0 n)
+       ~@(d2--rec-inits bs cells 0 n)
+       ~(d2--rec-reads bs cells 0 n body))))
+
+;; `letrec*` differs from `letrec` only in that its inits are guaranteed to run
+;; left to right. This expansion already does that, so the two coincide here.
+(defn letrec* [(bs Code) & (body Code)] (-> Code)
+  `(letrec ~bs ~@body))
+
+;; The hole must never reach a program. R5RS makes it an error to evaluate a
+;; letrec variable before its init completes; this is the predicate that says so.
+(defn letrec-hole? [(v i64)] (-> bool) (undefined? v))
+
+; ---- do ---------------------------------------------------------------------
+;; R5RS 4.2.4:
+;;
+;;     (do ((var init step) …) (test result …) command …)
+;;
+;; The trap is in one sentence of the report: the step expressions are ALL
+;; evaluated, and only then are the variables bound to the results. A naive
+;; sequential update — store i, then compute acc from the new i — reads a variable
+;; that has already advanced, and
+;;
+;;     (do ((i 0 (+ i 1)) (acc '() (cons i acc))) ((= i 5) (reverse acc)))
+;;
+;; is precisely the shape that catches it: `acc`'s step mentions `i`, so a
+;; sequential update conses the NEXT i and the result is off by one throughout.
+;;
+;; So each iteration evaluates every step into a fresh temporary first, and stores
+;; only after all of them are computed. That is the parallel rebinding R5RS
+;; specifies, expressed with the temporaries the report's own expansion uses.
+;;
+;; A variable with no step keeps its value — `(var init)` is a two-element spec.
+;; The cells are gensyms, NOT the user's variable names. Each iteration binds the
+;; user's name as an ordinary immutable local holding a snapshot of its cell, so
+;; the step expressions read a plain value — and a step that mentions `i` gets the
+;; `i` from the top of the iteration, which is the whole point. Naming the cell
+;; `i` too would shadow that snapshot, and `(mut i)` would then refer to a
+;; non-place: the compiler rejects it outright.
+(defn d2--do-cells [(ss Code) (cells Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `[]
+    (let [s (primitive/code-nth ss i)]
+      `[(mut ~(primitive/code-nth cells i)) ~(primitive/code-nth s 1)
+        ~@(d2--do-cells ss cells (+ i 1) n)])))
+
+;; Read every loop variable into an ordinary name for the duration of one
+;; iteration, so the test, the body and the steps all see the same snapshot.
+(defn d2--do-reads [(ss Code) (cells Code) (i i64) (n i64) (inner Code)] (-> Code)
+  (if (>= i n) inner
+    (let [nm (primitive/code-nth (primitive/code-nth ss i) 0)]
+      `(let [~nm (primitive/load (mut ~(primitive/code-nth cells i)))]
+         ~(d2--do-reads ss cells (+ i 1) n inner)))))
+
+;; Phase one of the rebinding: every step into its own temporary. `tmps` is a
+;; parallel Code list of the gensyms, built by the caller so both phases agree.
+(defn d2--do-steps [(ss Code) (tmps Code) (i i64) (n i64) (rest Code)] (-> Code)
+  (if (>= i n) rest
+    (let [s (primitive/code-nth ss i)]
+      ; no step expression: the variable keeps its current value
+      `(let [~(primitive/code-nth tmps i)
+             ~(if (>= (primitive/code-count s) 3)
+                  (primitive/code-nth s 2)
+                (primitive/code-nth s 0))]
+         ~(d2--do-steps ss tmps (+ i 1) n rest)))))
+
+;; Phase two: now that every step has been evaluated, commit them all.
+(defn d2--do-stores [(cells Code) (tmps Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    `((primitive/store! (mut ~(primitive/code-nth cells i))
+                        ~(primitive/code-nth tmps i))
+      ~@(d2--do-stores cells tmps (+ i 1) n))))
+
+(defn d2--gensyms [(i i64) (n i64)] (-> Code)
+  (if (>= i n) `() `(~(primitive/gensym) ~@(d2--gensyms (+ i 1) n))))
+
+;; The result clause may be empty — `(do (…) ((= i 5)) body …)` — in which case
+;; the value is unspecified rather than the test's value.
+(defn scm-do [(ss Code) (term Code) & (body Code)] (-> Code)
+  (let [n (primitive/code-count ss)
+        cells (d2--gensyms 0 n)
+        tmps (d2--gensyms 0 n)
+        res (primitive/gensym)]
+    `(let [~@(d2--do-cells ss cells 0 n) (mut ~res) (s-unspecified)]
+       (loop
+         ~(d2--do-reads ss cells 0 n
+            `(if (truthy? ~(primitive/code-nth term 0))
+                 (do
+                   (primitive/store! (mut ~res)
+                                     ~(if (>= (primitive/code-count term) 2)
+                                          `(do ~@(d2--rest term 1 (primitive/code-count term)))
+                                        `(s-unspecified)))
+                   (break))
+               (do
+                 ~@body
+                 ~(d2--do-steps ss tmps 0 n `(do ~@(d2--do-stores cells tmps 0 n) 0))
+                 0))))
+       (primitive/load (mut ~res)))))
+
+;; Tail of a Code list as a list — the same helper `derived.coil` needs, kept
+;; private here because a module cannot import a name it also has to not clash
+;; with.
+(defn d2--rest [(e Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `() `(~(primitive/code-nth e i) ~@(d2--rest e (+ i 1) n))))
+
+; ---- case -------------------------------------------------------------------
+;; R5RS 4.2.1: `case` compares with **eqv?**, and that choice is observable. A
+;; string literal must NOT match a string key, because two strings that look alike
+;; are not eqv?. The cases README records that Chez disagrees with Guile and Chibi
+;; here, so the conformance case only uses fixnums — but the implementation still
+;; has to be right, and using equal? would make the wrong thing pass.
+;;
+;; The key is evaluated once and held in a temporary; every datum is compared
+;; against it. Datums are literal data, not expressions, so they go through
+;; `d2--datum` rather than being evaluated.
+(defn d2--case-tests [(ds Code) (i i64) (n i64) (k Code)] (-> Code)
+  (if (>= i n) `false
+    `(or (val-eq? ~k ~(d2--datum (primitive/code-nth ds i)))
+         ~(d2--case-tests ds (+ i 1) n k))))
+
+(defn d2--case [(cs Code) (i i64) (n i64) (k Code)] (-> Code)
+  (if (>= i n) `(s-unspecified)
+    (let [c (primitive/code-nth cs i)
+          ds (primitive/code-nth c 0)]
+      (if (primitive/code-eq ds `else)
+          `(do ~@(d2--rest c 1 (primitive/code-count c)))
+        `(if ~(d2--case-tests ds 0 (primitive/code-count ds) k)
+             (do ~@(d2--rest c 1 (primitive/code-count c)))
+           ~(d2--case cs (+ i 1) n k))))))
+
+(defn scm-case [(key Code) & (cs Code)] (-> Code)
+  (let [k (primitive/gensym)]
+    `(let [~k ~key]
+       ~(d2--case cs 0 (primitive/code-count cs) k))))
+
+; ---- delay / force ----------------------------------------------------------
+;; R5RS 4.2.5 + 6.4. A promise is a heap object (tag-promise, reserved in
+;; value.coil and unused until now): `a` holds the thunk or, after forcing, the
+;; value; `b` is the forced flag.
+;;
+;; Memoization is not an optimization, it is the specification: `(force p)` twice
+;; must run the delayed expression once. The conformance case asserts exactly that
+;; by delaying a `begin` with a side effect and printing `(42 42)` from one
+;; evaluation.
+;;
+;; Without a `lambda` that can be applied (the closure chunk), the thunk cannot be
+;; a Scheme procedure. It is instead a native function pointer taking no
+;; arguments, which `delay` synthesizes — the memoization protocol is identical
+;; either way, and swapping the representation later does not change `force`.
+;;
+;; The `a` slot is an i64, so the pointer round-trips through one. `cast` refuses
+;; to go from a fnptr straight to an integer, hence the `(ptr u8)` hop; the value
+;; is an address either way. Note this makes `a` a NON-Val while unforced — the
+;; collector traces it as if it were a value, which is safe only because a code
+;; address is never a live heap object and its low bits mark it heap-shaped but
+;; out of any slab. `promise-set!` replaces it with a real Val on first force.
+(defn thunk-of [(n i64)] (-> (fnptr c [] i64))
+  (primitive/cast (fnptr c [] i64) (primitive/cast (ptr u8) n)))
+(defn thunk-addr [(f (fnptr c [] i64))] (-> i64)
+  (primitive/cast i64 (primitive/cast (ptr u8) f)))
+
+(defn make-promise [(thunk i64)] (-> i64)
+  (allocate (tag-promise) thunk (s-false) 0))
+(defn promise? [(v i64)] (-> bool) (has-tag? v (tag-promise)))
+(defn promise-slot [(v i64)] (-> i64) (primitive/load (primitive/field (obj-of v) a)))
+(defn promise-forced? [(v i64)] (-> bool)
+  (val-eq? (primitive/load (primitive/field (obj-of v) b)) (s-true)))
+
+;; The memoizing half, split out so it is testable without a macro: given an
+;; already-computed value, record it and never recompute. `force` below is what
+;; calls the thunk.
+(defn promise-set! [(p i64) (v i64)] (-> i64)
+  (primitive/store! (primitive/field (obj-of p) a) v)
+  (primitive/store! (primitive/field (obj-of p) b) (s-true))
+  v)
+
+;; R5RS 6.4: forcing a non-promise is an error, but implementations that return
+;; the value are common and it keeps `force` total. The thunk is called through
+;; its function pointer exactly once; the flag is what guarantees "once".
+(defn force [(p i64)] (-> i64)
+  (if (not (promise? p)) p
+    (if (promise-forced? p) (promise-slot p)
+      (promise-set! p (primitive/call-ptr (thunk-of (promise-slot p)))))))
+
+;; `(define-promise name expr)` — `delay` as far as this chunk can take it.
+;;
+;; R5RS spells this `(delay expr)` in expression position, and that spelling is
+;; NOT available yet. `delay` has to turn its expression into a thunk, and the
+;; only thunk Coil has today is a `defn` — which is a top-level definition the
+;; compiler rejects inside an expression:
+;;
+;;     error: 'defn $g12' is a top-level definition, but it appears inside an
+;;     expression
+;;
+;; A per-call-site `alloc/static` memo cell was the obvious alternative and is
+;; wrong: it memoizes per SITE, so two `(force p)` calls on the same promise from
+;; different sites each evaluate, and passing a promise to a procedure that forces
+;; it would re-run the expression. Memoization has to hang off the promise VALUE.
+;;
+;; So the thunk is hoisted to top level where a `defn` is legal, and the promise
+;; is named. That keeps the semantics that actually matter — the expression is not
+;; evaluated at definition time, and `force` runs it exactly once no matter how
+;; many times or from where it is called. Expression-position `delay` needs
+;; `lambda` (the closure chunk) and is deliberately not faked here.
+(defn define-promise [(name Code) (e Code)] (-> Code)
+  (let [f (primitive/code-symbol name "--thunk")]
+    `(do
+       (defn ~f [] (-> i64) ~e)
+       (defn ~name [] (-> i64)
+         (let [c (alloc/static i64)]
+           ; one promise object per NAME, created on first reference
+           (if (= (primitive/load c) 0)
+               (primitive/store! c (make-promise (thunk-addr (primitive/fnptr-of ~f))))
+             0)
+           (primitive/load c))))))
+
+; ---- quasiquote -------------------------------------------------------------
+;; R5RS 4.2.6. The expansion is a recursive walk that carries a LEVEL:
+;;
+;;   level 1     is the outermost quasiquote; `,x` at level 1 evaluates x
+;;   quasiquote  raises the level, and at level > 1 an unquote is DATA
+;;   unquote     lowers it, and only reaches 0 — meaning "evaluate" — at level 1
+;;
+;; Nesting is the part that is wrong in most hand-written implementations, and it
+;; is wrong in a specific way: an inner ``(b ,(c ,n))`` must keep its own
+;; `quasiquote` and the inner `unquote` as literal symbols in the output, while
+;; the `,n` that has descended back to level 1 still evaluates. The conformance
+;; case pins that down by comparing against an explicit list containing the
+;; symbols `quasiquote` and `unquote`.
+;;
+;; Everything is built with `cons` onto `(s-nil)`, because a quasiquote's result
+;; is ordinary runtime list structure — not a Code literal.
+
+;; Literal data becomes a runtime Val. Symbols intern, integers become fixnums.
+;; This is what a quoted datum inside a quasiquote (and every `case` key) becomes.
+(defn d2--datum [(e Code)] (-> Code)
+  (if (primitive/code-int? e) `(mk-fixnum ~e)
+    (if (primitive/code-sym? e)
+        ; `#t`/`#f`/`()` read as symbols, so the literals are recognized here
+        ; rather than needing reader support — same trick core.coil uses.
+        (if (primitive/code-eq e `#t) `(s-true)
+          (if (primitive/code-eq e `#f) `(s-false)
+            `(intern ~(primitive/code-str e))))
+      (if (primitive/code-list? e)
+          (if (= (primitive/code-count e) 0) `(s-nil)
+            (d2--datum-list e 0 (primitive/code-count e)))
+        `(s-unspecified)))))
+
+(defn d2--datum-list [(e Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `(s-nil)
+    `(cons ~(d2--datum (primitive/code-nth e i)) ~(d2--datum-list e (+ i 1) n))))
+
+(defn d2--unquote? [(e Code)] (-> bool)
+  (and (primitive/code-list? e)
+       (and (= (primitive/code-count e) 2)
+            (primitive/code-eq (primitive/code-nth e 0) `unquote))))
+
+(defn d2--splice? [(e Code)] (-> bool)
+  (and (primitive/code-list? e)
+       (and (= (primitive/code-count e) 2)
+            (primitive/code-eq (primitive/code-nth e 0) `unquote-splicing))))
+
+(defn d2--quasi? [(e Code)] (-> bool)
+  (and (primitive/code-list? e)
+       (and (= (primitive/code-count e) 2)
+            (primitive/code-eq (primitive/code-nth e 0) `quasiquote))))
+
+;; A dotted tail. The reader gives `(a . b)` as the three elements `a`, `.`, `b`,
+;; so a dot is found by scanning — the same way core.coil finds a rest parameter.
+(defn d2--dot-at [(e Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n) -1
+    (if (primitive/code-eq (primitive/code-nth e i) `.) i
+      (d2--dot-at e (+ i 1) n))))
+
+;; The walk. `lvl` is the nesting level; the caller starts it at 1.
+(defn d2--qq [(e Code) (lvl i64)] (-> Code)
+  (if (primitive/code-list? e)
+      (if (= (primitive/code-count e) 0) `(s-nil)
+        (if (d2--unquote? e)
+            (if (= lvl 1)
+                ; level 1: this is the escape to evaluation
+                (primitive/code-nth e 1)
+              ; deeper: rebuild `(unquote …)` as DATA, one level shallower
+              `(cons (intern "unquote")
+                     (cons ~(d2--qq (primitive/code-nth e 1) (- lvl 1)) (s-nil))))
+          (if (d2--quasi? e)
+              ; a nested quasiquote is data, and raises the level for its contents
+              `(cons (intern "quasiquote")
+                     (cons ~(d2--qq (primitive/code-nth e 1) (+ lvl 1)) (s-nil)))
+            (d2--qq-list e 0 (primitive/code-count e) lvl))))
+    ; an atom at any level is just its datum
+    (d2--datum e)))
+
+;; Build a list, element by element, honoring splices and the dotted tail.
+;;
+;; The dotted case is the one with a real trap: `` `(,@(list 1 2) . 3) `` must
+;; print `(1 2 . 3)`, so the last splice has to APPEND ONTO THE TAIL rather than
+;; terminate with nil. Threading the tail through as the accumulator is what makes
+;; that fall out — the tail is whatever comes after, and for a proper list it is
+;; nil.
+(defn d2--qq-list [(e Code) (i i64) (n i64) (lvl i64)] (-> Code)
+  (let [dot (d2--dot-at e 0 n)]
+    (if (and (>= dot 0) (>= i dot))
+        ; at (or past) the dot: everything left is the tail, and there is exactly
+        ; one element after it in a well-formed dotted list
+        (if (= i dot) (d2--qq (primitive/code-nth e (+ dot 1)) lvl) `(s-nil))
+      (if (>= i n) `(s-nil)
+        (let [x (primitive/code-nth e i)
+              tail (d2--qq-list e (+ i 1) n lvl)]
+          (if (and (d2--splice? x) (= lvl 1))
+              ; splice: append the evaluated list onto whatever follows
+              `(d2-append ~(primitive/code-nth x 1) ~tail)
+            (if (d2--splice? x)
+                ; deeper than level 1, a splice is data like any other form
+                `(cons (cons (intern "unquote-splicing")
+                             (cons ~(d2--qq (primitive/code-nth x 1) (- lvl 1)) (s-nil)))
+                       ~tail)
+              `(cons ~(d2--qq x lvl) ~tail))))))))
+
+;; Non-destructive append — a splice must not mutate the list it was given, since
+;; `` `(,@xs) `` with a literal xs would otherwise corrupt it. R5RS's own
+;; expansion is in terms of `append`, and this is that append; it lives here
+;; rather than in the list chunk because quasiquote's expansion emits calls to it.
+(defn d2-append [(xs i64) (tail i64)] (-> i64)
+  (if (null? xs) tail
+    (cons (car xs) (d2-append (cdr xs) tail))))
+
+;; NOT named `quasiquote`: that is a built-in form — Coil's own backtick reads to
+;; it — and the compiler refuses to let a defn shadow it. The brief lists six
+;; unshadowable names; this is a seventh, and it is the same situation as `do`,
+;; so it gets the same treatment: a `scm-` name that the dialect transform routes
+;; Scheme's backtick to.
+(defn scm-quasiquote [(e Code)] (-> Code) (d2--qq e 1))

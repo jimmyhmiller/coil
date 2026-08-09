@@ -1,0 +1,309 @@
+(module coil.scheme.forms)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.str" :use *)
+(import "coil.scheme.value" :use *)
+(import "coil.scheme.heap" :use *)
+(import "coil.scheme.symbol" :use *)
+(import "coil.scheme.core" :use *)
+(import "coil.scheme.lambda" :use *)
+
+;; The irreducible core: `quote` as runtime data, the R5RS-spelled arithmetic,
+;; the literals, and the surface lowering that makes them reachable — everything
+;; in R5RS §4.1 that `core.coil` did not already carry.
+;;
+;; ⚠ THIS MODULE BINDS `+ - * < > =` AS MACROS, WHICH SHADOWS COIL'S OPERATORS
+;; INSIDE THIS FILE. Every internal arithmetic and comparison is therefore
+;; written as an explicit `primitive/iadd` / `primitive/icmp-ge` / … call. That
+;; is not a style choice — a bare `(+ i 1)` here resolves to the Scheme `+` macro
+;; and fails to compile with an arity error from inside the metaprogram engine.
+;; Any new helper in this file must follow the same discipline.
+;;
+;; Two facts about the host shape the rest, and both are load-bearing:
+;;
+;; 1. `defn` has no runtime rest parameter — `&` exists only for macros. So a
+;;    variadic Scheme procedure cannot be one function that inspects its argument
+;;    count; the collection has to happen at the CALL SITE.
+;;
+;; 2. `defn` is a top-level form and the compiler rejects one in expression
+;;    position. Anything that needs a new top-level definition therefore cannot
+;;    be an ordinary expression macro — it needs a whole-module pass.
+
+; ---- literals ---------------------------------------------------------------
+;; `#t`, `#f` and `#\c` all read as SYMBOLS — the reader hands them through as
+;; names whose text begins with `#`, and there is no `code-char?` predicate. So
+;; classification is a text test on `code-str`, and it is the same test `quote`
+;; uses to materialize that syntax as data.
+
+(defn lit--true? [(e Code)] (-> bool)
+  (and (primitive/code-sym? e) (str-eq (primitive/code-str e) "#t")))
+(defn lit--false? [(e Code)] (-> bool)
+  (and (primitive/code-sym? e) (str-eq (primitive/code-str e) "#f")))
+;; `#\a`, `#\space`, `#\newline` — a char literal is any `#\`-prefixed name.
+(defn lit--char? [(e Code)] (-> bool)
+  (and (primitive/code-sym? e) (starts-with (primitive/code-str e) "#\\")))
+
+;; The code point a `#\…` literal denotes. R5RS names `space` and `newline`;
+;; everything else is the single character after the prefix. Multi-byte UTF-8 is
+;; NOT decoded — the reader hands over bytes, not code points, so a non-ASCII
+;; char literal would yield its first byte. ASCII-only, and honest about it.
+(defn lit--char-code [(s (slice u8))] (-> i64)
+  (if (str-eq s "#\\space") 32
+    (if (str-eq s "#\\newline") 10
+      (if (str-eq s "#\\tab") 9
+        (if (str-eq s "#\\return") 13
+          (if (str-eq s "#\\nul") 0
+            (primitive/cast i64 (char-at s 2))))))))
+
+;; `#t` / `#f` as expressions. Macros, not functions, so they cost nothing at
+;; runtime and so `quote` and the expression reader agree on spelling.
+(defn scm-true [] (-> Code) `(s-true))
+(defn scm-false [] (-> Code) `(s-false))
+
+;; `'()` bottoms out here; `nil` is the same value under a name needing no quote.
+(defn nil [] (-> Code) `(s-nil))
+
+; ---- quote ------------------------------------------------------------------
+;; `quote` turns a compile-time Code tree into a RUNTIME Val.
+;;
+;; This is the form that most repays care. `dialect.coil` already shields a
+;; quoted form from the dialect rewrite, but shielding only stops the syntax
+;; being read as code — it does not make the data exist. `(display '(a b c))`
+;; needs three interned symbols spine-linked by two conses, built by code this
+;; macro emits, because nothing at runtime otherwise knows the shape.
+;;
+;; Interning is what makes `(eq? 'a 'a)` true: both sites emit `(intern "a")`,
+;; and the symbol table returns the identical object for the identical name.
+(defn quo--data [(e Code)] (-> Code)
+  (if (primitive/code-int? e) `(mk-fixnum ~e)
+    (if (primitive/code-list? e)
+        (quo--list e 0 (primitive/code-count e))
+      ; the literals that read as symbols, `#`-prefixed spellings before names
+      (if (lit--true? e) `(s-true)
+        (if (lit--false? e) `(s-false)
+          (if (lit--char? e) `(mk-char ~(lit--char-code (primitive/code-str e)))
+            (if (primitive/code-sym? e) `(intern ~(primitive/code-str e))
+              ; strings have no Val yet — string.coil is a later chunk
+              `(s-unspecified))))))))
+
+;; A quoted list becomes a right-nested chain of conses ending in nil — the
+;; proper-list spine. Recursion builds it back-to-front, so `'()` falls out as
+;; the base case rather than needing a branch of its own.
+;;
+;; A dotted `(a . b)` is NOT handled: the reader keeps the `.` as an ordinary
+;; symbol, so it would intern as one. Quoted improper lists are unsupported.
+(defn quo--list [(e Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `(s-nil)
+    `(cons ~(quo--data (primitive/code-nth e i))
+           ~(quo--list e (primitive/iadd i 1) n))))
+
+(defn quote-data [(e Code)] (-> Code) (quo--data e))
+
+; ---- arithmetic and comparison ----------------------------------------------
+;; R5RS spells these `+ - * < > =` and they are VARIADIC. `core.coil` has the
+;; binary core; these fold onto it left-associatively, which is what `-` requires
+;; (`(- 10 1 2)` is 7, not 11) and what makes comparisons chain.
+;;
+;; Nothing was bound under these names before, so every conformance case failed
+;; on its first line without them.
+
+(defn arith--fold [(op Code) (es Code) (i i64) (n i64) (acc Code)] (-> Code)
+  (if (primitive/icmp-ge i n) acc
+    (arith--fold op es (primitive/iadd i 1) n
+                 `(~op ~acc ~(primitive/code-nth es i)))))
+
+;; `(+)` is 0 and `(*)` is 1 — R5RS gives both an identity, and a fold over no
+;; arguments has to produce it.
+(defn + [& (es Code)] (-> Code)
+  (if (primitive/icmp-eq (primitive/code-count es) 0) `(mk-fixnum 0)
+    (arith--fold `scm-add es 1 (primitive/code-count es)
+                 (primitive/code-nth es 0))))
+
+(defn * [& (es Code)] (-> Code)
+  (if (primitive/icmp-eq (primitive/code-count es) 0) `(mk-fixnum 1)
+    (arith--fold `scm-mul es 1 (primitive/code-count es)
+                 (primitive/code-nth es 0))))
+
+;; `-` is the asymmetric one: with ONE argument it negates rather than folds.
+;; `(- 5)` is -5, not 5.
+(defn - [& (es Code)] (-> Code)
+  (if (primitive/icmp-eq (primitive/code-count es) 1)
+      `(scm-sub (mk-fixnum 0) ~(primitive/code-nth es 0))
+    (arith--fold `scm-sub es 1 (primitive/code-count es)
+                 (primitive/code-nth es 0))))
+
+;; A chained comparison must evaluate each operand ONCE — `(< a b c)` means
+;; `(and (< a b) (< b c))`, in which `b` appears twice, so every operand is bound
+;; to a temporary first. Getting this wrong stays invisible until an operand has
+;; a side effect.
+(defn cmp--chain [(op Code) (tmps Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i (primitive/isub n 1)) `(s-true)
+    (if (primitive/icmp-eq i (primitive/isub n 2))
+        `(~op ~(primitive/code-nth tmps i)
+              ~(primitive/code-nth tmps (primitive/iadd i 1)))
+      `(if (truthy? (~op ~(primitive/code-nth tmps i)
+                        ~(primitive/code-nth tmps (primitive/iadd i 1))))
+           ~(cmp--chain op tmps (primitive/iadd i 1) n)
+         (s-false)))))
+
+(defn cmp--tmps [(n i64) (i i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `()
+    `(~(primitive/gensym) ~@(cmp--tmps n (primitive/iadd i 1)))))
+
+(defn cmp--binds [(tmps Code) (es Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `[]
+    `[~(primitive/code-nth tmps i) ~(primitive/code-nth es i)
+      ~@(cmp--binds tmps es (primitive/iadd i 1) n)]))
+
+(defn cmp--build [(op Code) (es Code)] (-> Code)
+  (let [n (primitive/code-count es)]
+    ; R5RS requires at least two arguments; fewer is vacuously true
+    (if (primitive/icmp-lt n 2) `(s-true)
+      (let [tmps (cmp--tmps n 0)]
+        `(let ~(cmp--binds tmps es 0 n) ~(cmp--chain op tmps 0 n))))))
+
+(defn < [& (es Code)] (-> Code) (cmp--build `scm-lt es))
+(defn > [& (es Code)] (-> Code) (cmp--build `scm-gt es))
+(defn = [& (es Code)] (-> Code) (cmp--build `scm-num-eq es))
+
+; ---- list -------------------------------------------------------------------
+;; `(list a b c)` — folded right so the spine ends in nil.
+(defn list--build [(es Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `(s-nil)
+    `(cons ~(primitive/code-nth es i)
+           ~(list--build es (primitive/iadd i 1) n))))
+(defn list [& (es Code)] (-> Code)
+  (list--build es 0 (primitive/code-count es)))
+
+; ---- output under the R5RS names --------------------------------------------
+;; `core.coil` has the implementations; these are the names R5RS uses.
+(defn display [(v Code)] (-> Code) `(scm-display ~v))
+(defn newline [] (-> Code) `(scm-newline))
+
+; ---- the surface lowering ----------------------------------------------------
+;; A second `before-expand` transform, composing with the dialect's. It exists
+;; because two things in this chunk CANNOT be macros:
+;;
+;;   `quote`   is a reserved name — `(quote X)` evaluates to a `Code` value and
+;;             `defn quote` is rejected outright, so the only way to reach it is
+;;             to rewrite the call into `(quote-data X)` before expansion.
+;;
+;;   literals  a bare `42` in Scheme source is a Scheme NUMBER, but in Coil it is
+;;             a raw i64 — passing it to `display` prints `#<object>`, because
+;;             the low tag bits of 42 say "heap pointer" and the printer believes
+;;             them. Every integer literal in an expression must become
+;;             `(mk-fixnum 42)`, and only a pass that sees the whole tree finds
+;;             them all.
+;;
+;; The same opt-in rule as the dialect: a module is Scheme iff it imports
+;; `coil.scheme`, and this module's own runtime is ordinary Coil and is skipped.
+
+(defn fm--rewrite-all [(e Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `()
+    `(~(fm--rewrite (primitive/code-nth e i))
+      ~@(fm--rewrite-all e (primitive/iadd i 1) n))))
+
+;; Binder forms whose parameter vector and return type must not be touched — the
+;; same list `dialect.coil` keeps, for the same reason: a `(x i64)` parameter is
+;; not a call, and the `i64` in a return type is not a value literal. Rewriting
+;; either would turn a type into `(mk-fixnum …)`.
+(defn fm--binder-form? [(h Code)] (-> bool)
+  (or (primitive/code-eq h `defn)
+      (or (primitive/code-eq h `defstruct)
+          (or (primitive/code-eq h `defsum)
+              (or (primitive/code-eq h `deftrait)
+                  (or (primitive/code-eq h `impl)
+                      (primitive/code-eq h `defcc)))))))
+
+(defn fm--body-start [(h Code)] (-> i64)
+  (if (primitive/code-eq h `defn) 4 3))
+
+(defn fm--verbatim [(e Code) (i i64) (stop i64) (n i64)] (-> Code)
+  (if (or (primitive/icmp-ge i stop) (primitive/icmp-ge i n)) `()
+    `(~(primitive/code-nth e i)
+      ~@(fm--verbatim e (primitive/iadd i 1) stop n))))
+
+;; A Scheme `let` binding list, after the dialect has turned it into `scm-let`:
+;; `((n init) …)`. The name is a binder; only the init is code.
+(defn fm--rewrite-bindings [(bs Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `()
+    (let [b (primitive/code-nth bs i)]
+      `(~`(~(primitive/code-nth b 0) ~(fm--rewrite (primitive/code-nth b 1)))
+        ~@(fm--rewrite-bindings bs (primitive/iadd i 1) n)))))
+
+(defn fm--rewrite [(e Code)] (-> Code)
+  ; an integer literal in expression position IS a Scheme number
+  (if (primitive/code-int? e) `(mk-fixnum ~e)
+    (if (lit--true? e) `(s-true)
+      (if (lit--false? e) `(s-false)
+        (if (lit--char? e) `(mk-char ~(lit--char-code (primitive/code-str e)))
+          (if (not (primitive/code-list? e)) e
+            (if (primitive/icmp-eq (primitive/code-count e) 0) e
+              (let [h (primitive/code-nth e 0)]
+                ; ALREADY LOWERED. This is what makes the pass idempotent, and
+                ; idempotence is not optional: a before-expand transform must
+                ; reach a FIXPOINT, and the compiler aborts with "did not reach a
+                ; fixpoint after 16 rounds" otherwise. Rewriting `1` to
+                ; `(mk-fixnum 1)` re-presents the literal `1` on the next round,
+                ; so without this guard the pass rewrites its own output forever
+                ; — and the observable symptom is not an error but SILENCE: the
+                ; rewrite is discarded and raw i64s reach `scm-add`, which shifts
+                ; them into garbage. Stop at the constructors' arguments.
+                (if (or (primitive/code-eq h `mk-fixnum)
+                        (or (primitive/code-eq h `mk-char)
+                            (primitive/code-eq h `quote-data)))
+                    e
+                ; `quote` shields its argument from every rewrite below and
+                ; becomes the data constructor instead
+                (if (primitive/code-eq h `quote)
+                    `(quote-data ~(primitive/code-nth e 1))
+                  (if (fm--binder-form? h)
+                      `(~h ~@(fm--verbatim e 1 (fm--body-start h)
+                                           (primitive/code-count e))
+                           ~@(fm--rewrite-all e (fm--body-start h)
+                                              (primitive/code-count e)))
+                    ; `scm-let`'s bindings are (name init) pairs, not calls
+                    (if (primitive/code-eq h `scm-let)
+                        `(~h ~(fm--rewrite-bindings (primitive/code-nth e 1) 0
+                                (primitive/code-count (primitive/code-nth e 1)))
+                             ~@(fm--rewrite-all e 2 (primitive/code-count e)))
+                      ; Coil's `let [x 7]`: the binding vector is rebuilt as a
+                      ; list by quasiquote, so copy it verbatim
+                      (if (primitive/code-eq h `let)
+                          `(~h ~(primitive/code-nth e 1)
+                               ~@(fm--rewrite-all e 2 (primitive/code-count e)))
+                        `(~h ~@(fm--rewrite-all e 1
+                                                (primitive/code-count e))))))))))))))))
+
+(defn fm--imports-scheme? [(m Code) (i i64) (n i64)] (-> bool)
+  (if (primitive/icmp-ge i n) false
+    (let [f (primitive/code-nth m i)]
+      (if (and (primitive/code-list? f)
+               (and (primitive/icmp-ge (primitive/code-count f) 2)
+                    (and (primitive/code-eq (primitive/code-nth f 0) `import)
+                         (str-eq (primitive/code-str (primitive/code-nth f 1))
+                                 "coil.scheme"))))
+          true
+        (fm--imports-scheme? m (primitive/iadd i 1) n)))))
+
+(defn fm--self? [(m Code)] (-> bool)
+  (starts-with (primitive/code-str (primitive/code-nth m 0)) "coil.scheme"))
+
+(defn fm--rewritable? [(m Code)] (-> bool)
+  (and (primitive/icmp-gt (primitive/code-count m) 1)
+       (and (not (fm--self? m))
+            (fm--imports-scheme? m 1 (primitive/code-count m)))))
+
+(defn fm--mods [(ms Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `()
+    (let [m (primitive/code-nth ms i)]
+      `(~(if (fm--rewritable? m)
+             `(~(primitive/code-nth m 0)
+               ~@(fm--rewrite-all m 1 (primitive/code-count m)))
+           m)
+        ~@(fm--mods ms (primitive/iadd i 1) n)))))
+
+(defn scheme-forms [(prog Code)] (-> Code)
+  `(do ~@(fm--mods prog 0 (primitive/code-count prog))))
+
+(transform scheme-forms :phase before-expand)
