@@ -877,6 +877,15 @@ other list keeps the generic impl:
 friends into every property file), so add `(import "coil.io" :as io)` and write
 `(w (ptr io/Writer))`.
 
+**Coverage-guided fuzzing.** `scripts/tests/prop-fuzz.sh FILE.coil [iterations]`
+rebuilds a property file with edge instrumentation (`coil emit-ir` piped through
+clang's `-fsanitize-coverage`; the callbacks are ordinary Coil functions in
+`coil.prop.cov`, so an ordinary build is unaffected) and mutates a corpus of
+tapes, keeping whatever reaches a basic block nothing has reached yet. Because
+the corpus holds *choices* rather than bytes, every mutant is a well-formed value
+of the argument types. A bug behind a four-byte magic value — unreachable by
+sampling — is found in tens of thousands of cases.
+
 A property that **crashes or hangs** is minimized too, not just one that returns
 false: generation runs in a forked child, the runner bisects to the case that
 killed it, and shrinks with each candidate in its own child. Knobs, all optional:
