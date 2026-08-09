@@ -65,6 +65,17 @@ python3 scripts/oracle.py linux-ir gate --compiler /tmp/coil-lrb2 >/dev/null || 
 echo "  linux gate-full: PASS (IR byte-exact vs the Linux snapshot)"
 python3 scripts/oracle.py runtime gate linux --compiler /tmp/coil-lrb2 >/dev/null  || { echo "linux runtime gate FAIL"; exit 1; }
 echo "  linux gate-run:  PASS (programs run identically)"
+# Do the checkers still fire at all? `modernize-fast` covers this too, but it
+# builds with --backend arm64 and so is red on Linux for an unrelated reason
+# (Mach-O that GNU ld cannot link). When a loader change silently disabled every
+# checker for any module with an `import` — `lint --fix` reporting success and
+# changing nothing — the new failure had nowhere to show: on Linux it hid behind
+# that known red, and on macOS nobody had run the gate since. A gate that cannot
+# distinguish its own failure modes detected the bug and made the signal
+# unreadable. This asks one question, on the host backend, and can fail for one
+# reason.
+python3 scripts/tests/lint_fires.py --coil /tmp/coil-lrb2 >/dev/null   || { echo "gate-lint-fires FAIL — lint --fix does nothing"; exit 1; }
+echo "  gate-lint-fires: PASS (checkers fire; lint --fix rewrites)"
 ./scripts/compiler/oracle/gate-cli.sh /tmp/coil-lrb2 >/dev/null        || { echo "gate-cli FAIL"; exit 1; }
 echo "  gate-cli:        PASS (argv, exit codes, fmt)"
 ./scripts/compiler/oracle/gate-target-os.sh /tmp/coil-lrb2 >/dev/null 2>&1 || { echo "gate-target-os FAIL"; exit 1; }
