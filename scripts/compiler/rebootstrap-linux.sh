@@ -44,6 +44,11 @@ elif [ -x "$SEED" ];              then STAGE0="$SEED"
 else echo "no stage0: need a committed $SEED (or set STAGE0=/path/to/coil)"; exit 1; fi
 echo "stage0 = $STAGE0   (libLLVM: $libdir)"
 
+# Probe before building: a stage0 too old for this tree otherwise fails deep in
+# stage1 with an error that reads like a compiler bug. See stage0-check.sh.
+. "$(dirname "$0")/stage0-check.sh"
+stage0_check "$STAGE0" "$SEED" "$SRC" "${LF[@]}" || exit 1
+
 echo "=== stage1: stage0 builds the self-host compiler ==="
 "$STAGE0"        build "$SRC" -o /tmp/coil-lrb1 "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it ==="

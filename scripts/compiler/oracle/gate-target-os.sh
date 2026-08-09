@@ -25,6 +25,14 @@ BIN=${1:?usage: gate-target-os.sh <coil-binary>}
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 fail=0
 
+# The "host" checks below assert what a native build folds to, so they must
+# follow the machine running the gate. Hardcoding either pair makes the gate
+# assert the other platform's constants and fail on a healthy tree.
+case "$(uname -s)" in
+  Darwin) HOST_FLAGS="512 1024" ;;
+  *)      HOST_FLAGS="64 512"   ;;
+esac
+
 # ---- a const selecting on (target-os) folds to the TARGET's literal ----
 cat > "$WORK/flags.coil" <<'EOF'
 (module flagtest)
@@ -53,7 +61,7 @@ check() {  # check <label> <got> <want>
   else echo "  FAIL — $1: got '$(printf '%s' "$2" | xargs)', want '$3'"; fail=$((fail+1)); fi
 }
 
-check "no --target folds to the host's flags"      "$(folded '')"                            "64 512"
+check "no --target folds to the host's flags"      "$(folded '')"                            "$HOST_FLAGS"
 check "--target linux folds to the Linux flags"    "$(folded x86_64-pc-linux-gnu)"           "64 512"
 check "--target darwin folds to the darwin flags"  "$(folded aarch64-apple-darwin24.0.0)"    "512 1024"
 check "--target macos is darwin too"               "$(folded x86_64-apple-macosx14.0.0)"     "512 1024"
@@ -61,10 +69,26 @@ check "--target macos is darwin too"               "$(folded x86_64-apple-macosx
 # ---- the folded program must carry NO runtime OS probe --------------------
 # The whole point of folding at comptime is that the branch disappears. If a
 # /proc/self/maps probe survives into the IR, the constant is not a constant.
-if "$BIN" emit-ir "$WORK/flags.coil" 2>/dev/null | grep -q "proc/self/maps"; then
-  echo "  FAIL — a runtime OS probe survived into the emitted IR"; fail=$((fail+1))
+#
+# This is an ABSENCE test, so it must first prove there is a haystack. Two traps,
+# both of which made it report `ok` while everything around it failed:
+#   * `coil emit-ir` writes diagnostics to STDOUT and exits non-zero, so a failed
+#     run yields a few hundred bytes of error text that trivially lack the probe
+#     string — the check passes on a build that produced no IR at all.
+#   * `grep -q` quenches its input; under `set -o pipefail` the upstream write
+#     can take SIGPIPE and the pipeline reports failure on a healthy tree. Match
+#     with `case` instead of a pipe.
+probe_ir=$("$BIN" emit-ir "$WORK/flags.coil" 2>/dev/null)
+if [ $? -ne 0 ] || case "$probe_ir" in *"target datalayout"*) false ;; *) true ;; esac; then
+  echo "  FAIL — emit-ir produced no IR, so the probe check would be vacuous"
+  fail=$((fail+1))
 else
-  echo "  ok   — no runtime OS probe in the emitted IR"
+  case "$probe_ir" in
+    *proc/self/maps*)
+      echo "  FAIL — a runtime OS probe survived into the emitted IR"; fail=$((fail+1)) ;;
+    *)
+      echo "  ok   — no runtime OS probe in the emitted IR" ;;
+  esac
 fi
 
 # ---- and the same must hold for the real user of this: src/stdlib/fs.coil --------
@@ -79,7 +103,7 @@ fsflags() {
     | grep -o 'coil\.core\.BitOr\$i64\$|"(i64 [0-9]*, i64 [0-9]*' | head -1 \
     | sed 's/.*(i64 \([0-9]*\), i64 \([0-9]*\)/\1 \2/'
 }
-check "src/stdlib/fs.coil flags follow the host"    "$(fsflags '')"                         "64 512"
+check "src/stdlib/fs.coil flags follow the host"    "$(fsflags '')"                         "$HOST_FLAGS"
 check "src/stdlib/fs.coil flags follow --target"    "$(fsflags aarch64-apple-darwin24.0.0)" "512 1024"
 
 echo
