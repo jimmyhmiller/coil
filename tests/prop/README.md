@@ -45,7 +45,7 @@ COIL_STDLIB_DIR=. coil test --sanitize=address tests/prop/stdlib_props_test.coil
 ```
 
 `coil test` has no per-property selector for a named file; narrow by editing
-`COIL_PBT_CASES` down and reading the output instead.
+`--cases` down and reading the output instead.
 
 ### Turning the search up
 
@@ -53,16 +53,16 @@ Every knob is an environment variable; none of them change the properties.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `COIL_PBT_CASES` | 200 | cases per property |
-| `COIL_PBT_SIZE` | 60 | maximum size budget a case may reach (list lengths, string lengths) |
-| `COIL_PBT_SEED` | derived from the property's name | the seed; a failure report prints the one to reuse |
-| `COIL_PBT_SHRINK` | 20000 | shrink call budget |
-| `COIL_PBT_VERBOSE` | 0 | print per-property case counts on success |
+| `--cases` | 200 | cases per property |
+| `--size` | 60 | maximum size budget a case may reach (list lengths, string lengths) |
+| `--seed` | derived from the property's name | the seed; a failure report prints the one to reuse |
+| `--shrink` | 20000 | shrink call budget |
+| `--verbose` | 0 | print per-property case counts on success |
 
 The default run is the fast one for CI. A real hunt looks like:
 
 ```
-COIL_PBT_CASES=5000 COIL_PBT_SIZE=120 COIL_STDLIB_DIR=. coil test tests/prop/stdlib_props_test.coil
+--cases=5000 --size=120 COIL_STDLIB_DIR=. coil test tests/prop/stdlib_props_test.coil
 ```
 
 The suite has been run green at 5000 cases / size 120, at 3000 cases / size 200,
@@ -223,7 +223,7 @@ scalar too — that is the version whose counterexample you can read.
   `src/` somewhere, introduce the bug you think the property catches, and run
   with `COIL_STDLIB_DIR` pointed at the copy. If the suite stays green, the
   property does not test what its name says. Do this across several
-  `COIL_PBT_SEED`s, not one: a property that catches the bug on half the seeds
+  `--seed`s, not one: a property that catches the bug on half the seeds
   is a property that will let it through.
 - **Never weaken a law to make the suite green.** Work out whether the law or
   the library is wrong. If it is the library, write it up in `FOUND_BUGS.md`,

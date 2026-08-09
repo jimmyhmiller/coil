@@ -557,7 +557,7 @@ originally carried:
    same signal*, not merely "died". A reducer that accepts any crash cheerfully
    minimizes one bug into a different one; requiring the signal to match is the
    cheapest guard against that slippage.
-5. **A hang is a crash.** The child arms `alarm(COIL_PBT_TIMEOUT)` (60s by
+5. **A hang is a crash.** The child arms `alarm(--timeout)` (60s by
    default), so an infinite loop arrives as SIGALRM and flows through the same
    bisect-and-minimize path. Reported as "the property NEVER FINISHED on this
    input", because printing "signal 14" makes the reader look up something the
@@ -569,7 +569,7 @@ originally carried:
 
 Verified end to end: a property that segfaults above 10 minimizes to `a = 10`; a
 property that loops forever above 10 minimizes to `a = 12` within its watchdog
-budget. `COIL_PBT_NOFORK=1` opts out for debugger sessions, trading crash
+budget. `--no-fork=1` opts out for debugger sessions, trading crash
 minimization for a live backtrace.
 
 ### 5.6 User-controlled shrinking (the override story)
@@ -977,7 +977,7 @@ this system automates.
    discovers it with no change. Confirm a macro can expand to a `defn` whose name
    is built with `code-symbol` *and* be seen by a later `(transform …)`.
 5. **Seed plumbing.** The synthesized `main` in `assert.coil` takes no argv.
-   Seeds/settings arrive via environment (`COIL_PBT_SEED`, `COIL_PBT_CASES`,
+   Seeds/settings arrive via environment (`--seed`, `--cases`,
    `COIL_PBT_DB`) using `coil.os/getenv`, with `coil test` flags setting them —
    or the transform is extended to synthesize an argv-taking `main`.
 6. **Float shrinking.** `f64` deliberately has no `Eq` in Coil; the shrinker

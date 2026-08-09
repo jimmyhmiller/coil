@@ -851,7 +851,7 @@ generator's invariants survive shrinking by construction:
       counterexample:
         xs = (0 0 0)
 
-      reproduce:  COIL_PBT_SEED=1903151487994059799 COIL_PBT_CASES=200 coil test …
+      reproduce:  --seed=1903151487994059799 --cases=200 coil test …
 
 Inside a body: `(assume COND)` discards a case that misses a precondition,
 `(classify "label" COND)` and `(collect "label" EXPR)` report the input
@@ -890,9 +890,9 @@ sampling — is found in tens of thousands of cases.
 A property that **crashes or hangs** is minimized too, not just one that returns
 false: generation runs in a forked child, the runner bisects to the case that
 killed it, and shrinks with each candidate in its own child. Knobs, all optional:
-`COIL_PBT_CASES` (200), `COIL_PBT_SEED` (derived from the property name, so runs
-are reproducible), `COIL_PBT_SIZE`, `COIL_PBT_SHRINK`, `COIL_PBT_TIMEOUT` (60s),
-`COIL_PBT_TARGET`, `COIL_PBT_VERBOSE`, `COIL_PBT_NOFORK`. Design and prior art:
+`--cases` (200), `--seed` (derived from the property name, so runs
+are reproducible), `--size`, `--shrink`, `--timeout` (60s),
+`--target-steps`, `--verbose`, `--no-fork`. Design and prior art:
 `docs/design/PROPERTY_TESTING.md`; worked example:
 `src/examples/property-testing.coil`.
 
