@@ -1,0 +1,223 @@
+(module coil.prop.runner)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.str" :as str)
+(import "coil.os" :as os)
+(import "coil.prop.rng" :use *)
+(import "coil.prop.source" :use *)
+(import "coil.prop.shrink" :use *)
+; THE RUNNER — what `(defprop …)` expands into a call to.
+;
+; The loop is deliberately boring: generate a case, run the property, and if it
+; fails, stop generating and start shrinking. Everything interesting is in the
+; phases around it.
+;
+;   PHASE 1  replay — re-run the counterexample this property failed on last time,
+;            first, before spending any budget on new cases. A bug you have
+;            already found should fail in the first millisecond, not the last.
+;   PHASE 2  generate — random cases, with the size budget ramping from tiny to
+;            full over the run, so shallow bugs surface early and deep ones still
+;            get their chance.
+;   PHASE 3  shrink — greedy fixpoint over the tape (coil.prop.shrink).
+;   PHASE 4  report — the minimal counterexample, the seed, and the exact command
+;            to reproduce it.
+;
+; A property that fails ABORTS, because that is what `coil test`'s forked child
+; runner counts as a failure. The report is written to stdout first, and io's
+; Writer is unbuffered, so the message is on the terminal before the abort.
+
+(defstruct PropConfig
+  [(cases i64)
+   (seed i64)
+   (max-size i64)
+   (shrink-budget i64)
+   (max-rejects i64)
+   (arena-bytes i64)
+   (verbose i64)])
+
+(defstruct PropStats
+  [(cases i64)
+   (rejected i64)
+   (shrink-calls i64)
+   (shrinks i64)])
+
+;; The property under test: fill the arguments from the Source, run the body, and
+;; (when `show`) print the arguments as a counterexample. One function rather than
+;; two so the values printed are provably the values tested — regenerated from the
+;; same tape by the same code.
+(defstruct RunCtx
+  [(src (ptr Source))
+   (prop (fnptr c [(ptr Source) bool] bool))
+   (size i64)])
+
+;; Read an integer setting from the environment, or fall back.
+(defn env-int [(name (slice u8)) (dflt i64)] (-> i64)
+  (let [a (malloc-allocator)]
+    (match (os/env-get a name)
+      (Err [_] dflt)
+      (Ok [o]
+          (match o
+            (None [] dflt)
+            (Some [s]
+                  (match (str/str-parse-int (os/owned-string-slice s))
+                    (None [] dflt)
+                    (Some [v] v))))))))
+
+;; Defaults are chosen so that `coil test` stays fast and REPRODUCIBLE: the seed
+;; is derived from the property's name, so every property explores a different
+;; stream, the same run happens on every machine, and a green suite is not green
+;; by luck. Override any of it from the environment:
+;;
+;;   COIL_PBT_CASES=100000   how many cases per property
+;;   COIL_PBT_SEED=12345     the seed (a failure report tells you which to use)
+;;   COIL_PBT_SIZE=200       the maximum size budget a case may reach
+;;   COIL_PBT_SHRINK=20000   shrink call budget
+(defn prop-config [(name (slice u8))] (-> PropConfig)
+  (let [c (primitive/alloc-stack PropConfig)]
+    (store! (field c cases) (env-int "COIL_PBT_CASES" 200))
+    (store! (field c seed) (env-int "COIL_PBT_SEED" (primitive/ior (str/str-hash name) 1)))
+    (store! (field c max-size) (env-int "COIL_PBT_SIZE" 60))
+    (store! (field c shrink-budget) (env-int "COIL_PBT_SHRINK" 20000))
+    (store! (field c max-rejects) (env-int "COIL_PBT_MAX_REJECTS" 0))
+    (store! (field c arena-bytes) (env-int "COIL_PBT_ARENA" 8388608))
+    (store! (field c verbose) (env-int "COIL_PBT_VERBOSE" 0))
+    (load c)))
+
+;; The size budget for case i of n: a ramp from 1 to `max`, so the first cases are
+;; tiny (fast, and they catch the shallow bugs) and the last are full size.
+(defn size-for [(i i64) (n i64) (max i64)] (-> i64)
+  (if (<= n 1)
+      max
+      (let [s (primitive/iadd 1 (primitive/udiv (primitive/imul i max) n))]
+        (if (> s max) max s))))
+
+;; Replay one candidate tape and report whether the property STILL fails on it.
+;; A rejected case (an `assume` that did not hold) is not a failure — treating it
+;; as one would let the shrinker "minimize" into inputs the property never claimed
+;; anything about, which is the classic way a shrinker produces a lie.
+(defn run-candidate [(ctx (ptr i8)) (tape (ptr (ArrayList Choice)))] (-> bool)
+  (let [rc (primitive/cast (ptr RunCtx) ctx)
+        s (load (field rc src))]
+    (source-begin-replay! s tape (load (field rc size)))
+    (let [held (primitive/call-ptr (load (field rc prop)) s false)]
+      (if (= (src-status s) ST-REJECTED)
+          false
+          (not held)))))
+
+;; One shared Source per process: the tape, the span table and the arena are all
+;; reused across cases, so a run of a million cases performs a handful of
+;; allocations in total rather than a handful per case.
+(defn prop-source [(bytes i64)] (-> (ptr Source))
+  (let [cell (primitive/alloc-static (ptr Source))]
+    (if (= (primitive/cast i64 (load cell)) 0)
+        (store! cell (source-new (malloc-allocator) bytes 1))
+        0)
+    (load cell)))
+
+;; Run one property to completion. Returns 0; a failure prints its report and
+;; aborts (which is how the forked test runner records a failure).
+(defn prop-run [(name (slice u8))
+                (file (slice u8))
+                (line i64)
+                (prop (fnptr c [(ptr Source) bool] bool))] (-> i64)
+  (let [cfg (prop-config name)
+        s (prop-source (load (field cfg arena-bytes)))
+        w (stdout)
+        st (primitive/alloc-stack PropStats)
+        (mut failed) false
+        (mut i) 0]
+    (store! (field st cases) 0)
+    (store! (field st rejected) 0)
+    (store! (field st shrink-calls) 0)
+    (store! (field st shrinks) 0)
+    (source-seed! s (load (field cfg seed)))
+    (loop (if (or (load failed) (>= (load i) (load (field cfg cases))))
+              (break)
+              (let [size (size-for (load i) (load (field cfg cases)) (load (field cfg max-size)))]
+                (source-begin-generate! s size)
+                ; each case gets its own swarm mask: a random SUBSET of the
+                ; alternatives a generator offers. Feature-omission diversity
+                ; finds bugs that "every feature, every case" never reaches.
+                (source-swarm! s (case-swarm-mask s (load i)))
+                (let [held (primitive/call-ptr prop s false)]
+                  (if (= (src-status s) ST-REJECTED)
+                      (store! (field st rejected) (primitive/iadd (load (field st rejected)) 1))
+                      (do (store! (field st cases) (primitive/iadd (load (field st cases)) 1))
+                          (if held 0 (store! failed true))
+                          0)))
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    (if (load failed)
+        (report-failure w name file line prop s cfg st)
+        (report-success w name cfg st))
+    0))
+
+;; Swarm masks: the all-ones mask for every eighth case (so no alternative is ever
+;; unreachable), random subsets otherwise. Groce et al. found omission diversity
+;; beats uniform generation because features compete for room inside one case.
+;;
+;; The mask is drawn from the case's own RNG — so it replays with the seed — but
+;; is deliberately NOT recorded on the tape: it is a property of the SEARCH, not
+;; of the value, and recording it would make every shrink candidate change shape.
+(defn case-swarm-mask [(s (ptr Source)) (i i64)] (-> i64)
+  (if (= (primitive/irem i 8) 0)
+      -1
+      (primitive/ior (primitive/cast i64 (rng-next! (mut (field s rng)))) 1)))
+
+(defn report-success [(w (ptr Writer)) (name (slice u8)) (cfg PropConfig) (st (ptr PropStats))] (-> i64)
+  (if (> (load (field cfg verbose)) 0)
+      (do (fmt w "  {s}: {d} cases passed ({d} rejected)\n"
+               name (load (field st cases)) (load (field st rejected)))
+          0)
+      0)
+  ; A property whose preconditions reject most of what is generated is not
+  ; testing what its author thinks. Say so loudly rather than reporting a green
+  ; run that examined a handful of inputs.
+  (if (and (> (load (field st rejected)) 0)
+           (> (load (field st rejected)) (primitive/imul (load (field st cases)) 4)))
+      (do (fmt w "\nWARNING: {s} rejected {d} of {d} generated cases.\n"
+               name
+               (load (field st rejected))
+               (primitive/iadd (load (field st cases)) (load (field st rejected))))
+          (print-str w "  The precondition is too sparse — generate valid inputs directly instead of filtering.\n")
+          0)
+      0)
+  0)
+
+(defn report-failure [(w (ptr Writer))
+                      (name (slice u8))
+                      (file (slice u8))
+                      (line i64)
+                      (prop (fnptr c [(ptr Source) bool] bool))
+                      (s (ptr Source))
+                      (cfg PropConfig)
+                      (st (ptr PropStats))] (-> i64)
+  (let [mem (malloc-allocator)
+        rc (unwrap-ptr [RunCtx] (create [RunCtx] mem))
+        (mut failing) (tape-clone mem (src-tape s))
+        (mut failing-spans) (spans-clone mem (src-spans s))]
+    (store! (field rc src) s)
+    (store! (field rc prop) prop)
+    (store! (field rc size) (src-size s))
+    (let [sc (shrink-ctx-new mem s (primitive/fnptr-of run-candidate) (primitive/cast (ptr i8) rc)
+                             (load (field cfg shrink-budget)))]
+      (sc-seed-best! sc (mut failing) (mut failing-spans))
+      (shrink-run! sc)
+      (store! (field st shrink-calls) (sc-calls sc))
+      (store! (field st shrinks) (sc-accepted sc))
+      ; Re-run the minimal tape one last time with `show` on, so the values
+      ; printed are regenerated by the same code path that failed.
+      (fmt w "\nFAILED after {d} cases ({d} shrinks, {d} shrink calls)\n"
+           (load (field st cases)) (sc-accepted sc) (sc-calls sc))
+      (print-str w "\n  counterexample:\n")
+      (source-begin-replay! s (sc-best sc) (load (field rc size)))
+      (primitive/call-ptr prop s true)
+      (fmt w "\n  property {s}\n       at {s}:{d}\n" name file line)
+      (fmt w "\n  reproduce:  COIL_PBT_SEED={d} COIL_PBT_CASES={d} coil test {s}\n\n"
+           (load (field cfg seed)) (load (field cfg cases)) file)
+      (abort)
+      1)))

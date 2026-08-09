@@ -1,0 +1,460 @@
+(module coil.prop.shrink)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.slice" :use *)
+(import "coil.prop.source" :use *)
+; THE SHRINKER — a greedy fixpoint of reduction passes over the tape.
+;
+; The user never writes a shrinker. A failing case is a tape; a simpler failing
+; case is a simpler tape; so shrinking is: edit the tape, re-run the generator and
+; the property, and keep the edit if the property still fails. Because the value
+; is always rebuilt BY THE GENERATOR, every invariant the generator establishes
+; survives shrinking — the single biggest failure mode of QuickCheck-style
+; hand-written shrinkers (shrink a sorted list, get an unsorted one).
+;
+; ORDER. Candidates are compared shortlex (`tape-compare`): fewer choices first,
+; ties broken by total distance from each choice's origin. That is a well-order,
+; so the greedy loop cannot cycle and always terminates.
+;
+; STRUCTURE. Passes come in two families:
+;   * structural, keyed off the SPAN TREE the generators record — delete a list
+;     element, delete a run of them, hoist a subterm out of a recursive node.
+;     These do the heavy lifting: they collapse a 500-element counterexample to 2.
+;   * numeric, keyed off each choice's recorded constraints — binary-search a
+;     value toward its origin, lower duplicated values together, move mass
+;     between adjacent numbers. These make the surviving values readable.
+;
+; COST. Every candidate is hashed and remembered, so a pass never re-runs a tape
+; the loop has already tried; without that, the duplicate rate between passes is
+; most of the work. Progress restarts the round (greedy), and the whole loop is
+; bounded by a call budget so a pathological property cannot hang a test run.
+
+;; What the shrinker needs from its caller: run this tape, and say whether the
+;; property still fails on it. Returning `false` for a REJECTED (assume-failed)
+;; or crashed candidate is the caller's job.
+(defstruct ShrinkCtx
+  [(src (ptr Source))
+   (run (fnptr c [(ptr i8) (ptr (ArrayList Choice))] bool))
+   (ctx (ptr i8))
+   (mem (ptr Allocator))
+   (best (ArrayList Choice))
+   (best-spans (ArrayList Span))
+   (seen (HashMap i64 i64))
+   (calls i64)
+   (budget i64)
+   (accepted i64)])
+
+(defn shrink-ctx-new [(mem (ptr Allocator))
+                      (src (ptr Source))
+                      (run (fnptr c [(ptr i8) (ptr (ArrayList Choice))] bool))
+                      (ctx (ptr i8))
+                      (budget i64)] (-> (ptr ShrinkCtx))
+  (let [c (unwrap-ptr [ShrinkCtx] (create [ShrinkCtx] mem))]
+    (store! (field c src) src)
+    (store! (field c run) run)
+    (store! (field c ctx) ctx)
+    (store! (field c mem) mem)
+    (store! (field c best) (al-new [Choice] mem))
+    (store! (field c best-spans) (al-new [Span] mem))
+    (store! (field c seen) (hm-new-scalar [i64 i64] mem))
+    (store! (field c calls) 0)
+    (store! (field c budget) budget)
+    (store! (field c accepted) 0)
+    c))
+
+(defn sc-calls [(c (ptr ShrinkCtx))] (-> i64) (load (field c calls)))
+(defn sc-accepted [(c (ptr ShrinkCtx))] (-> i64) (load (field c accepted)))
+(defn sc-best [(c (ptr ShrinkCtx))] (-> (ptr (ArrayList Choice))) (field c best))
+
+;; Install the first known-failing tape (and the spans that produced it).
+(defn sc-seed-best! [(c (ptr ShrinkCtx)) (tape (ptr (ArrayList Choice))) (spans (ptr (ArrayList Span)))] (-> i64)
+  (store! (field c best) (tape-clone (load (field c mem)) tape))
+  (store! (field c best-spans) (spans-clone (load (field c mem)) spans))
+  0)
+
+(defn spans-clone [(a (ptr Allocator)) (src (ptr (ArrayList Span)))] (-> (ArrayList Span))
+  (let [(mut out) (al-new [Span] a)
+        n (al-len [Span] (load src))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (al-push! [Span] (mut out) (al-get [Span] (load src) (load i)))
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load out)))
+
+;; Try one candidate tape. Returns true if it became the new best.
+;;
+;; Three gates before the property is even called: the call budget, the
+;; already-tried set, and shortlex order (a candidate that is not smaller than the
+;; current best cannot improve it, so running it is pure waste).
+(defn sc-try! [(c (ptr ShrinkCtx)) (cand (ptr (ArrayList Choice)))] (-> bool)
+  (if (>= (load (field c calls)) (load (field c budget)))
+      false
+      (if (>= (tape-compare cand (field c best)) 0)
+          false
+          (let [h (tape-hash cand)]
+            (match (hm-get [i64 i64] (load (field c seen)) h)
+              (Some [_] false)
+              (None []
+                (do
+                  (hm-put! [i64 i64] (mut (field c seen)) h 1)
+                  (store! (field c calls) (primitive/iadd (load (field c calls)) 1))
+                  (let [still-fails (primitive/call-ptr (load (field c run)) (load (field c ctx)) cand)]
+                    (if still-fails
+                        ; Keep the tape the RUN produced, not the candidate we
+                        ; proposed: replay clamps out-of-range values and fills
+                        ; overruns with minima, so the canonical tape is often
+                        ; strictly smaller than what we asked for.
+                        (let [s (load (field c src))
+                              canon (src-tape s)]
+                          (if (< (tape-compare canon (field c best)) 0)
+                              (do (store! (field c best) (tape-clone (load (field c mem)) canon))
+                                  (store! (field c best-spans) (spans-clone (load (field c mem)) (src-spans s)))
+                                  (store! (field c accepted) (primitive/iadd (load (field c accepted)) 1))
+                                  true)
+                              false))
+                        false)))))))))
+
+; ------------------------------------------------------------ tape surgery
+
+;; The best tape with choices [from, to) removed.
+(defn tape-without [(a (ptr Allocator)) (t (ptr (ArrayList Choice))) (from i64) (to i64)] (-> (ArrayList Choice))
+  (let [(mut out) (al-new [Choice] a)
+        n (al-len [Choice] (load t))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (if (and (>= (load i) from) (< (load i) to))
+                      0
+                      (al-push! [Choice] (mut out) (al-get [Choice] (load t) (load i))))
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load out)))
+
+;; The best tape with choice `idx` set to `v`.
+(defn tape-with [(a (ptr Allocator)) (t (ptr (ArrayList Choice))) (idx i64) (v i64)] (-> (ArrayList Choice))
+  (let [(mut out) (tape-clone a t)]
+    (if (and (>= idx 0) (< idx (al-len [Choice] (load out))))
+        (store! (field (al-elem [Choice] (mut out) idx) value) v)
+        0)
+    (load out)))
+
+;; The best tape truncated to `n` choices.
+(defn tape-prefix [(a (ptr Allocator)) (t (ptr (ArrayList Choice))) (n i64)] (-> (ArrayList Choice))
+  (let [(mut out) (al-new [Choice] a)
+        (mut i) 0]
+    (loop (if (or (>= (load i) n) (>= (load i) (al-len [Choice] (load t))))
+              (break)
+              (do (al-push! [Choice] (mut out) (al-get [Choice] (load t) (load i)))
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load out)))
+
+; ----------------------------------------------------------------- the passes
+
+;; PASS: adaptive span deletion.
+;;
+;; Try removing each span's choices. On success, try removing that span PLUS the
+;; next k spans, doubling k while it keeps working. The doubling is what makes a
+;; long list collapse in O(log n) property calls instead of O(n) — the single
+;; most valuable pass in the set, and the reason spans exist at all.
+(defn pass-delete-spans [(c (ptr ShrinkCtx))] (-> bool)
+  (let [(mut progress) false
+        (mut i) 0]
+    (loop (if (>= (load i) (al-len [Span] (load (field c best-spans))))
+              (break)
+              (let [(mut k) 1
+                    (mut going) true]
+                (loop (if (not (load going))
+                          (break)
+                          (let [spans (field c best-spans)
+                                nspans (al-len [Span] (load spans))]
+                            (if (>= (load i) nspans)
+                                (do (store! going false) 0)
+                                (let [first-span (al-get [Span] (load spans) (load i))
+                                      last-idx (let [j (primitive/isub (primitive/iadd (load i) (load k)) 1)]
+                                                 (if (>= j nspans) (primitive/isub nspans 1) j))
+                                      last-span (al-get [Span] (load spans) last-idx)
+                                      from (load (field first-span start))
+                                      to (let [e (load (field last-span end))]
+                                           (if (< e 0) (al-len [Choice] (load (field c best))) e))]
+                                  (if (or (< to from) (= to from))
+                                      (do (store! going false) 0)
+                                      (let [(mut cand) (tape-without (load (field c mem)) (field c best) from to)]
+                                        (if (sc-try! c (mut cand))
+                                            (do (store! progress true)
+                                                (store! k (primitive/imul (load k) 2))
+                                                0)
+                                            (do (store! going false) 0)))))))))
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    (load progress)))
+
+;; PASS: binary-search every choice toward its origin.
+;;
+;; Not a linear walk down: a value of 10^9 would cost a billion property calls.
+;; The search is the standard "try the midpoint, keep the half that still fails",
+;; which costs ~64 calls per choice in the worst case and usually 2 or 3 — most
+;; interesting values are small or are the origin already.
+(defn pass-minimize-choices [(c (ptr ShrinkCtx))] (-> bool)
+  (let [(mut progress) false
+        (mut i) 0]
+    (loop (if (>= (load i) (al-len [Choice] (load (field c best))))
+              (break)
+              (do (if (minimize-one c (load i)) (store! progress true) 0)
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load progress)))
+
+(defn minimize-one [(c (ptr ShrinkCtx)) (idx i64)] (-> bool)
+  (let [t (field c best)]
+    (if (>= idx (al-len [Choice] (load t)))
+        false
+        (let [ch (al-get [Choice] (load t) idx)
+              origin (load (field ch origin))
+              cur (load (field ch value))]
+          (if (= cur origin)
+              false
+              (let [(mut lo) origin      ; known-good target we are pulling toward
+                    (mut hi) cur         ; current (failing) value
+                    (mut improved) false
+                    (mut steps) 0]
+                ; first, the whole jump: values are usually already minimal or
+                ; collapse straight to the origin.
+                (let [(mut cand) (tape-with (load (field c mem)) t idx origin)]
+                  (if (sc-try! c (mut cand))
+                      (do (store! improved true) (store! hi origin) 0)
+                      0))
+                (loop (if (or (load improved)
+                              (or (>= (load steps) 70)
+                                  (<= (dist (load hi) (load lo)) 1)))
+                          (break)
+                          (let [mid (midpoint (load lo) (load hi))]
+                            (store! steps (primitive/iadd (load steps) 1))
+                            (if (or (= mid (load lo)) (= mid (load hi)))
+                                (break)
+                                (let [(mut cand) (tape-with (load (field c mem)) (field c best) idx mid)]
+                                  (if (sc-try! c (mut cand))
+                                      (do (store! improved true) (store! hi mid) 0)
+                                      (do (store! lo mid) 0)))))))
+                (load improved)))))))
+
+;; Distance as an unsigned magnitude, saturating: `hi - lo` on two extremes
+;; overflows, and a negative "distance" would end the search at the wrong place.
+(defn dist [(a i64) (b i64)] (-> i64)
+  (let [d (if (>= a b) (primitive/isub a b) (primitive/isub b a))]
+    (if (< d 0) 9223372036854775807 d)))
+
+;; The midpoint, computed without overflowing on far-apart values.
+(defn midpoint [(a i64) (b i64)] (-> i64)
+  (primitive/iadd (if (< a b) a b)
+                  (primitive/udiv (dist a b) 2)))
+
+;; PASS: truncate the tail.
+;;
+;; A tape whose tail is unused (because an earlier length shrank) can simply end.
+;; Replay is total, so anything the generator still asks for comes back minimal.
+(defn pass-truncate [(c (ptr ShrinkCtx))] (-> bool)
+  (let [(mut progress) true
+        (mut any) false]
+    (loop (if (not (load progress))
+              (break)
+              (do (store! progress false)
+                  (let [n (al-len [Choice] (load (field c best)))
+                        (mut k) (primitive/udiv n 2)]
+                    (loop (if (or (>= (load k) n) (= n 0))
+                              (break)
+                              (let [(mut cand) (tape-prefix (load (field c mem)) (field c best) (load k))]
+                                (if (sc-try! c (mut cand))
+                                    (do (store! progress true) (store! any true) (break))
+                                    (store! k (primitive/iadd (load k)
+                                                              (primitive/iadd (primitive/udiv (primitive/isub n (load k)) 2) 1))))))))
+                  0)))
+    (load any)))
+
+;; PASS: lower duplicated values together.
+;;
+;; Two choices that hold the same value are usually the same quantity mentioned
+;; twice (an index and a length, two elements a property compares). Lowering them
+;; independently walks into a plateau where neither move alone reproduces the
+;; failure; lowering them together steps off it.
+(defn pass-lower-together [(c (ptr ShrinkCtx))] (-> bool)
+  (let [(mut progress) false
+        n (al-len [Choice] (load (field c best)))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [t (field c best)]
+                (if (>= (load i) (al-len [Choice] (load t)))
+                    (break)
+                    (let [ch (al-get [Choice] (load t) (load i))
+                          v (load (field ch value))
+                          o (load (field ch origin))]
+                      (if (= v o)
+                          0
+                          (let [target (midpoint o v)
+                                (mut cand) (tape-clone (load (field c mem)) t)
+                                (mut j) 0]
+                            (loop (if (>= (load j) (al-len [Choice] (load cand)))
+                                      (break)
+                                      (do (let [e (al-elem [Choice] (mut cand) (load j))]
+                                            (if (= (load (field e value)) v)
+                                                (store! (field e value) target)
+                                                0))
+                                          (store! j (primitive/iadd (load j) 1)))))
+                            (if (sc-try! c (mut cand)) (store! progress true) 0)
+                            0))
+                      (store! i (primitive/iadd (load i) 1))
+                      0))
+                0)))
+    (load progress)))
+
+;; PASS: redistribute value between adjacent numeric choices.
+;;
+;; For a pair (a, b) whose SUM is what the property cares about, neither can move
+;; alone. Moving mass from the first into the second — and, decisively, trying to
+;; zero the first outright — is what turns `(7, 3)` into `(0, 10)`, which reads
+;; as a much clearer counterexample.
+(defn pass-redistribute [(c (ptr ShrinkCtx))] (-> bool)
+  (let [(mut progress) false
+        (mut i) 0]
+    (loop (if (>= (primitive/iadd (load i) 1) (al-len [Choice] (load (field c best))))
+              (break)
+              (do (if (redistribute-pair c (load i)) (store! progress true) 0)
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load progress)))
+
+(defn redistribute-pair [(c (ptr ShrinkCtx)) (i i64)] (-> bool)
+  (let [t (field c best)
+        j (primitive/iadd i 1)]
+    (if (>= j (al-len [Choice] (load t)))
+        false
+        (let [a (al-get [Choice] (load t) i)
+              b (al-get [Choice] (load t) j)
+              av (load (field a value))
+              ao (load (field a origin))
+              bv (load (field b value))]
+          (if (or (= av ao) (!= (load (field a kind)) (load (field b kind))))
+              false
+              (let [delta (primitive/isub av ao)
+                    (mut cand) (tape-clone (load (field c mem)) t)]
+                (store! (field (al-elem [Choice] (mut cand) i) value) ao)
+                (store! (field (al-elem [Choice] (mut cand) j) value)
+                        (clamp-to (al-get [Choice] (load cand) j) (primitive/iadd bv delta)))
+                (sc-try! c (mut cand))))))))
+
+(defn clamp-to [(c Choice) (v i64)] (-> i64)
+  (choice-minimal (load (field c lo)) (load (field c hi)) v))
+
+;; PASS: hoist a descendant span over its ancestor.
+;;
+;; The pass that makes recursive data shrink properly: replace a node's whole
+;; choice range with the range of one of its OWN children, so `Add(Mul(x, Add(y,
+;; z)), w)` reduces to `Add(y, z)` in one step. Without it, a deep tree can only
+;; be whittled from the leaves and usually stalls on a big but irrelevant shape.
+(defn pass-hoist [(c (ptr ShrinkCtx))] (-> bool)
+  (let [(mut progress) false
+        (mut i) 0]
+    (loop (if (>= (load i) (al-len [Span] (load (field c best-spans))))
+              (break)
+              (do (if (hoist-one c (load i)) (store! progress true) 0)
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load progress)))
+
+(defn hoist-one [(c (ptr ShrinkCtx)) (i i64)] (-> bool)
+  (let [spans (field c best-spans)
+        nspans (al-len [Span] (load spans))]
+    (if (>= i nspans)
+        false
+        (let [outer (al-get [Span] (load spans) i)
+              o-start (load (field outer start))
+              o-end (load (field outer end))
+              (mut done) false
+              (mut j) (primitive/iadd i 1)]
+          (if (or (< o-end 0) (= (load (field outer kind)) SPAN-ATOMIC))
+              false
+              (do
+                (loop (if (or (load done) (>= (load j) nspans))
+                          (break)
+                          (let [inner (al-get [Span] (load spans) (load j))
+                                i-start (load (field inner start))
+                                i-end (load (field inner end))]
+                            ; a strict descendant with the same shape, and
+                            ; strictly smaller: replacing the outer range with the
+                            ; inner one is a real reduction.
+                            (if (and (>= i-start o-start)
+                                     (and (>= i-end 0)
+                                          (and (<= i-end o-end)
+                                               (and (> (primitive/isub o-end o-start)
+                                                       (primitive/isub i-end i-start))
+                                                    (slice-eq-name (load (field inner name)) (load (field outer name)))))))
+                                (let [(mut cand) (splice (load (field c mem)) (field c best) o-start o-end i-start i-end)]
+                                  (if (sc-try! c (mut cand)) (store! done true) 0)
+                                  0)
+                                0)
+                            (store! j (primitive/iadd (load j) 1))
+                            0)))
+                (load done)))))))
+
+;; Byte equality on two span labels. Labels are static string literals, so this is
+;; a short compare on short strings.
+(defn slice-eq-name [(a (slice u8)) (b (slice u8))] (-> bool)
+  (if (!= (slice-len [u8] a) (slice-len [u8] b))
+      false
+      (let [(mut i) 0
+            (mut ok) true]
+        (loop (if (or (>= (load i) (slice-len [u8] a)) (not (load ok)))
+                  (break)
+                  (do (if (= (slice-get [u8] a (load i)) (slice-get [u8] b (load i)))
+                          0
+                          (store! ok false))
+                      (store! i (primitive/iadd (load i) 1)))))
+        (load ok))))
+
+;; `t` with [outer-from, outer-to) replaced by [inner-from, inner-to).
+(defn splice [(a (ptr Allocator))
+              (t (ptr (ArrayList Choice)))
+              (of i64) (ot i64) (if- i64) (it i64)] (-> (ArrayList Choice))
+  (let [(mut out) (al-new [Choice] a)
+        n (al-len [Choice] (load t))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (if (= (load i) of)
+                      ; at the outer span's start, emit the inner span instead,
+                      ; then skip the rest of the outer range.
+                      (let [(mut k) if-]
+                        (loop (if (>= (load k) it)
+                                  (break)
+                                  (do (al-push! [Choice] (mut out) (al-get [Choice] (load t) (load k)))
+                                      (store! k (primitive/iadd (load k) 1)))))
+                        0)
+                      0)
+                  (if (and (>= (load i) of) (< (load i) ot))
+                      0
+                      (al-push! [Choice] (mut out) (al-get [Choice] (load t) (load i))))
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load out)))
+
+; ------------------------------------------------------------------ the loop
+
+;; Run passes to a fixpoint. Any pass that improves the best restarts the round,
+;; so later passes always see the smallest tape found so far — greedy, which is
+;; what makes the result independent of which pass got lucky first.
+(defn shrink-run! [(c (ptr ShrinkCtx))] (-> i64)
+  (let [(mut rounds) 0
+        (mut going) true]
+    (loop (if (or (not (load going))
+                  (or (>= (load rounds) 200)
+                      (>= (load (field c calls)) (load (field c budget)))))
+              (break)
+              (do (store! rounds (primitive/iadd (load rounds) 1))
+                  (let [a (pass-delete-spans c)
+                        b (pass-hoist c)
+                        d (pass-truncate c)
+                        e (pass-minimize-choices c)
+                        f (pass-lower-together c)
+                        g (pass-redistribute c)]
+                    (store! going (or a (or b (or d (or e (or f g))))))
+                    0)
+                  0)))
+    (load rounds)))
