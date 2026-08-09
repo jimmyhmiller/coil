@@ -76,6 +76,23 @@ echo "  linux gate-run:  PASS (programs run identically)"
 # reason.
 python3 scripts/tests/lint_fires.py --coil /tmp/coil-lrb2 >/dev/null   || { echo "gate-lint-fires FAIL — lint --fix does nothing"; exit 1; }
 echo "  gate-lint-fires: PASS (checkers fire; lint --fix rewrites)"
+
+# Does the compiler still BUILD for wasm? This battery had no wasm line at all,
+# which is how two independent wasm regressions reached main: a `musttail` that
+# needs the unenabled `+tail-call` feature (fails here, at build), and externs
+# that become required host imports (fails on macOS, at instantiate). Each was
+# invisible to the platform the other failed on.
+#
+# Deliberately only a BUILD, not validate/instantiate: those need wasm-tools and
+# node, and `dev.py test wasm` already SKIPs silently without them — a skip that
+# reads like a pass is the failure mode this whole merge kept turning up. A build
+# needs nothing extra and cannot skip, so it is a gate rather than a maybe.
+/tmp/coil-lrb2 build src/compiler/main_wasm.coil --target wasm64-unknown-unknown \
+  -o /tmp/gate-wasm-linux.wasm >/dev/null 2>&1 \
+  || { echo "  gate-wasm-build FAIL — the compiler no longer builds for wasm"
+       /tmp/coil-lrb2 build src/compiler/main_wasm.coil --target wasm64-unknown-unknown \
+         -o /tmp/gate-wasm-linux.wasm 2>&1 | tail -3; exit 1; }
+echo "  gate-wasm-build: PASS (compiler builds for wasm64)"
 ./scripts/compiler/oracle/gate-cli.sh /tmp/coil-lrb2 >/dev/null        || { echo "gate-cli FAIL"; exit 1; }
 echo "  gate-cli:        PASS (argv, exit codes, fmt)"
 ./scripts/compiler/oracle/gate-target-os.sh /tmp/coil-lrb2 >/dev/null 2>&1 || { echo "gate-target-os FAIL"; exit 1; }
