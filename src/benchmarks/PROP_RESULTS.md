@@ -10,8 +10,8 @@ small end.
 From the worktree root:
 
 ```sh
-COIL_STDLIB_DIR=. coil build src/benchmarks/prop_bench.coil -o .scratch/prop_bench
-./.scratch/prop_bench
+COIL_STDLIB_DIR=. coil build src/benchmarks/prop_bench.coil -o /tmp/prop_bench
+/tmp/prop_bench
 ```
 
 `coil build` is `-O3` (the default; the only other tier is `-g`). No flags beyond
@@ -198,14 +198,16 @@ already uses for the tape) would remove most of it. I have not made that change 
 
 # The defect this benchmark found
 
-Not a performance finding. `source-new` (`src/stdlib/prop_source.coil`) is unsound.
-**I do not own that file and have not changed it.**
+**FIXED.** `source-new` now allocates the arena its own `Allocator` cell, so the
+Source's long-lived buffers and its per-case arena are genuinely separate; the
+verification is in `.scratch/arena_check.coil`, which asserts that the tape and
+span buffers lie outside the arena block and that the arena is actually used.
+The analysis below is kept because it is the case for why that one line matters
+and the numbers above were taken before it landed — the steady-state table in §5
+in particular was measuring malloc, not the arena.
 
-Another agent reached the same conclusion independently — `.scratch/source_arena_bug.coil`
-is a standalone repro with the same diagnosis and the same fix. What follows is
-the same defect seen from the benchmark's side, which adds three failure modes
-that repro does not cover (consequences 2, 3 and 4 below) and the measurement
-that shows the overlap in a healthy-looking run.
+Two agents reached this diagnosis independently, from different symptoms. What
+follows is the benchmark's side of it.
 
 ### What happens
 
