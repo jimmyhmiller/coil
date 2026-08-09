@@ -1,7 +1,16 @@
 # Trait methods escape macro hygiene
 
-**Status:** diagnosed, root cause located, **fix attempted and reverted**. The
-remaining obstacle is identified and reproduced. Not fixed.
+**Status: FIXED.** Parts 1–3 of the reverted attempt (`78e599e`) are reinstated,
+and the binder obstacle of §5 is closed by **re-baring binder heads at the
+expansion boundary** (§10). All ten reproductions in `tests/compiler/hygiene/`
+pass, the Linux gates (linux-ir 8/8, gate-run 58/58, gate-cli, gate-target-os,
+all eight stage gates, coverage) are green, and the bootstrap fixpoint holds.
+The Scheme dialect's 125 tests pass **as real assertions** — a probe module that
+binds the dialect's `=` and asserts `(assert-eq 1 999)` now fails, where it
+passed vacuously before.
+
+Sections 1–9 are the original analysis, kept as history. §10 describes the fix
+that landed and the two adjacent bugs it surfaced.
 
 A symbol written in a macro template is supposed to resolve in the *macro's*
 namespace. For ordinary functions it does. **For trait methods — `=`, `<`, `+`,
@@ -288,3 +297,75 @@ a language with operator traits should ask of its users.
 wrong-answer bug into a hard compile error for every `derive` user. That is worse
 than the bug: `(assert-eq 1 999)` passing is bad, but a language whose `derive`
 does not work is unusable.
+
+---
+
+## 10. The fix that landed
+
+Parts 1–3 reinstated verbatim (`git revert` of `624cc29`), plus a fourth part
+answering §5.2's requirement — with a different placement than §5.2 guessed.
+
+### 10.1 Binders are re-bared at the expansion boundary
+
+§5.2 asked quasiquote expansion to carry positional context. It cannot, cheaply:
+templates build **bottom-up** — `mh-qualify-head!` fires as each list closes,
+before the enclosing `impl` exists — and a method form built by a *helper*
+template and spliced in with `~@` qualifies in a different template than the
+`impl` that receives it, so no template-local rule can ever see the binder
+position (`user7` is that case).
+
+The place that CAN see it is the **expansion boundary**: every macro- or
+transform-produced form arrives there fully assembled, exactly once, before
+anything consumes a method name. `expander.coil` now walks each spliced
+expansion output (`rebare-binders-walk!`, called next to `hygienize-expansion!`
+in both `expand-calls` and `tower-expand-call`, and over transform output in
+`run-transformers`): for `(impl …)` and `(deftrait …)` forms — recursing through
+`do` only, not into quoted data — any method-form head that is a dotted symbol
+is restored to its last segment. Positions mirror `parse-impl`/`parse-deftrait`
+(including the inherent-impl discrimination via `impl-method-form?`), so the
+walker and the parsers cannot disagree about what is a binder. Method names
+cannot contain dots, so the last segment is exactly the pre-hygiene spelling.
+Method **bodies** are grandchildren and are never touched — their qualified
+references are the point of the whole exercise.
+
+This also fixed a bug **older than the trait-method work**: ordinary defn heads
+always qualified, so a macro-generated `deftrait` whose method name matched any
+defn in the macro's module has been broken all along (`user9`).
+
+### 10.2 Two adjacent bugs the gates caught
+
+**A qualified head is not always a hygiene artifact** (`check.coil`). Part 3
+read any dotted head with a method-name tail as a hygiene-qualified trait
+method. But the *resolver* also writes dotted heads: inside `coil.io`, the call
+to the POSIX extern `read` resolves to `coil.io.read` — and a user program
+declaring a trait with a method named `read` made part 3 hijack that extern
+call into the trait (`'read' expects 1 args, got 3`, from bundled io.coil).
+The guard: a dotted head that `sig-find` resolves to a real function or extern
+stays a function reference; only a dotted head that names nothing can be a
+hygiene-qualified method. The two never collide — a trait method has no Sig
+under its module-qualified spelling. Repro: `user10`; also gate-cli's
+`--debug-runtime dyn dispatch` check, which is how it was found.
+
+**Suggestion layout must measure what it prints** (`comptime.coil`). Hygiene
+rewrites a template symbol's *sval* while its span still points at the template
+source, and `sug-emit!` prints a node's **verbatim source bytes** when it has
+them. So `condlint`'s suggested `(cond …)` printed `cond` but laid out
+continuation lines under `coil.core.cond` — 10 columns of drift — and clause
+pairing (`sug-clause-style?`) stopped matching. `sug-head-display` now measures
+the verbatim spelling emission will actually produce. Caught by gate-cli's
+"lint --fix result is fmt-clean" check.
+
+### 10.3 Verification
+
+- `tests/compiler/hygiene/` — ten pairs, see its README. `user6` (derive binder),
+  `user7` (spliced binder + body-reference control), `user8` (library trait,
+  competing local trait), `user9` (generated deftrait), `user10` (extern-name
+  collision) discriminate the fix in both directions.
+- Linux gates: linux-ir 8/8, gate-run 58/58, gate-cli PASS, gate-target-os PASS,
+  stage gates read/ast/load/resolved/checked/expand/mono/x86 all byte-exact
+  (no re-blessing needed beyond what `78e599e` had already blessed), coverage
+  PASS. Fixpoint: stage2.o ≡ stage3.o.
+- The §8 sweep: all eight Scheme-dialect test modules (125 tests) pass under the
+  fixed compiler, now as genuine assertions. Oracle case01 output matches
+  byte-for-byte. The stdlib bare-head-match audit found only `for-in`'s `iter`,
+  already dual-spelling-matched since `78e599e`.
