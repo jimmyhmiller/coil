@@ -1,0 +1,1136 @@
+; src/compiler/formatter/balance.coil — delimiter repair for Coil source.
+;
+; `coil balance` takes source whose ()/[] do not pair up and produces source that
+; does. It exists because agents edit Coil as TEXT — a string patch can straddle a
+; delimiter in a way a form-addressed edit never can (see `coil edit`) — and a file
+; that will not read is a file no other tool can help with.
+;
+; The design is a reaction to what Parinfer-style whole-file passes get wrong. Such
+; a pass re-derives structure from indentation EVERYWHERE, so one missing `)` early
+; in a file shifts its notion of depth and it then "corrects" forms downstream that
+; were never broken. `tests/repro/paredit-balance-coil` is exactly that failure:
+; a repair to one function silently moved two `)` out of the NEXT function.
+;
+; Two properties make that class of damage impossible here rather than unlikely:
+;
+;   1. REGION SCOPING. The file is cut into top-level regions at column-0 opening
+;      delimiters, and each region's delimiters are balanced independently. A region
+;      that is already balanced is copied out byte-for-byte — it is never analysed,
+;      so it can never be "fixed".
+;
+;   2. INSERT-ONLY OR DELETE-ONLY, NEVER A MOVE. A region short of closers gets
+;      closers INSERTED and nothing removed; a region with a stray closer gets that
+;      one byte REMOVED and nothing inserted. A region needing both is refused. So
+;      the output always contains every original byte in its original order (or the
+;      input does, for a deletion) — "my parens got rearranged" is unrepresentable.
+;
+; Where a missing closer goes is decided by indentation, which is the one genuine
+; insight in Parinfer: in Lisp written by anyone, a line indented at or left of an
+; open form's column is not inside that form. Scoped to a single damaged region and
+; restricted to insertion, that rule is safe.
+;
+; Anything the rules do not determine — a mismatched `)` against `[`, an unterminated
+; string, a region wanting both an insert and a delete, a repair that disagrees with
+; the surrounding indentation — is REFUSED with a located message. Guessing wrong
+; here produces a file that reads but means something else, which is far worse than
+; a file that does not read.
+(module balance)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+
+; ---- scanned source --------------------------------------------------------
+
+; One ()/[] occurrence in code — i.e. not inside a string, comment, or character
+; literal. `col` is a 0-based column, `line` a 0-based line index.
+(defstruct Delim [(byte i64) (ch i64) (line i64) (col i64)])
+
+; One physical line. `indent` is the column of its first code byte, or -1 when the
+; line has no code (blank, or comment-only). `code-end` is the offset just past its
+; last code byte — where a closer gets inserted, so a trailing comment stays last on
+; its line — or -1 when there is none. `opaque` marks a line that BEGINS inside a
+; multi-line string literal; its indentation means nothing and the indent rule skips
+; it. `semi` marks a comment-only line, likewise skipped. `rparen` marks a line whose
+; first code byte is a CLOSING delimiter — such a line is expected to sit at or left
+; of the column of the form it closes, so the indent rule must skip it too or every
+; hand-written trailing-paren style reads as a defect.
+(defstruct Line
+  [(start i64) (indent i64) (code-end i64) (opaque bool) (semi bool) (rparen bool)])
+
+; Every token, in source order, as a byte range. `balance` itself needs only the
+; delimiters, but `coil edit` has to know the text of a form's leading items in order
+; to address it, and the one thing that must not happen is a second tokenizer: two
+; lexers that disagree about where a token ends would let `edit` splice at a boundary
+; the compiler reads differently. So the scan emits both and they cannot drift.
+;
+;   TK-ATOM covers symbols, numbers, keywords, "strings", c"strings" and \char
+;   literals — anything captured verbatim. TK-PREFIX is a reader-macro glyph, which
+;   is not an item of its own: it glues to the token after it.
+(const TK-ATOM 0)
+(const TK-OPEN 1)
+(const TK-CLOSE 2)
+(const TK-PREFIX 3)
+
+(defstruct Tok [(kind i64) (start i64) (end i64)])
+
+(defstruct Scan
+  [(delims (ArrayList Delim))
+   (toks (ArrayList Tok))
+   (lines (ArrayList Line))
+   ; 1-based line of an unterminated string literal, else -1. Indentation below an
+   ; unterminated string is meaningless, so this is fatal rather than repairable.
+   (bad-string i64)])
+
+(defn opener? [(c i64)] (-> bool)
+  (or (= c \() (= c \[)))
+(defn closer? [(c i64)] (-> bool)
+  (or (= c \)) (= c \])))
+(defn close-of [(c i64)] (-> i64)
+  (if (= c \() \) \]))
+
+(defn sbyte [(s (slice u8)) (i i64)] (-> i64)
+  (if (or (< i (primitive/cast i64 0)) (>= i (slice-len s)))
+      -1
+      (primitive/cast i64 (slice-get s i))))
+
+(defn ws? [(c i64)] (-> bool)
+  (or (= c \space)
+      (or (= c \tab) (or (= c \newline) (or (= c \return) (or (= c \u0B) (= c \formfeed)))))))
+
+; A byte that ends an atom run. INVARIANT: this must agree with `cst.coil`'s
+; `is-atom-delim` and with `coil.reader`'s tokenizer about where a token ENDS. If
+; the three ever disagree, `balance` will count a delimiter the compiler does not
+; (or miss one it does) and repair source into something that reads differently.
+(defn atom-end? [(c i64)] (-> bool)
+  (if (or (= c (primitive/cast i64 -1)) (ws? c))
+      true
+      (or (= c \()
+          (or (= c \))
+              (or (= c \[)
+                  (or (= c \])
+                      (or (= c \;)
+                          (or (= c \")
+                              (or (= c \') (or (= c \u60) (= c \u7E)))))))))))
+
+(defn cl-alpha? [(c i64)] (-> bool)
+  (or (and (>= c \a) (<= c \z)) (and (>= c \A) (<= c \Z))))
+(defn cl-alnum? [(c i64)] (-> bool)
+  (or (cl-alpha? c) (and (>= c \0) (<= c \9))))
+
+(defn mk-line [(lp (ptr Line)) (start i64) (indent i64) (code-end i64) (opaque bool) (semi bool) (rparen bool)] (-> i64)
+  (store! (field lp start) start)
+  (store! (field lp indent) indent)
+  (store! (field lp code-end) code-end)
+  (store! (field lp opaque) opaque)
+  (store! (field lp semi) semi)
+  (store! (field lp rparen) rparen)
+  0)
+
+(defn push-tok! [(sc (ptr Scan)) (slot (ptr Tok)) (kind i64) (start i64) (end i64)] (-> i64)
+  (store! (field slot kind) kind)
+  (store! (field slot start) start)
+  (store! (field slot end) end)
+  (al-push! (mut (field sc toks)) (load slot))
+  0)
+
+; A line the indent rule may judge: it has code, that code is not a continuation of
+; a multi-line string, it is not a bare comment, and it does not begin with a closer.
+(defn judgeable? [(lp (ptr Line))] (-> bool)
+  (and (>= (load (field lp indent)) (primitive/cast i64 0))
+       (and (not (load (field lp opaque)))
+            (and (not (load (field lp semi))) (not (load (field lp rparen)))))))
+
+(defn scan [(a (ptr Allocator)) (src (slice u8)) (sc (ptr Scan))] (-> i64)
+  (scan-opt a src sc false))
+
+; Walk the source once, recording every code delimiter and a record per line.
+;
+; The loop is a small state machine (normal / in-string / in-comment) rather than a
+; recursive reader, because it must survive source that does not parse — that is the
+; entire point — and because newlines inside a string literal have to end a line just
+; like any other newline while contributing no indentation.
+(defn scan-opt [(a (ptr Allocator)) (src (slice u8)) (sc (ptr Scan)) (reuse bool)] (-> i64)
+  (let [n (slice-len src)
+        dslot (alloc/stack Delim)
+        lslot (alloc/stack Line)
+        tslot (alloc/stack Tok)
+        (mut tokstart) 0
+        (mut pos) 0
+        (mut state) 0  ; 0 normal, 1 string, 2 comment
+        (mut line) 0
+        (mut lstart) 0
+        (mut indent) -1
+        (mut cend) -1
+        (mut opaque) false
+        (mut semi) false
+        (mut rparen) false]
+    ; `reuse` refills an already-initialised Scan instead of allocating three fresh
+    ; lists. Candidate generation scans once per attempted edit — thousands of times on
+    ; a real file — and allocating there put a gigabyte through an allocator that never
+    ; frees. Reusing the buffers holds it to one scan's worth.
+    (if reuse
+        (do
+          (al-clear! [Delim] (mut (field sc delims)))
+          (al-clear! [Tok] (mut (field sc toks)))
+          (al-clear! [Line] (mut (field sc lines)))
+          0)
+        (do
+          (store! (field sc delims) (al-new [Delim] a))
+          (store! (field sc toks) (al-new [Tok] a))
+          (store! (field sc lines) (al-new [Line] a))
+          0))
+    (store! (field sc bad-string) -1)
+    (loop (if (>= (load pos) n)
+              (break)
+              (let [c (sbyte src (load pos))]
+                (cond ; ---- inside a string literal ----
+                      (= (load state) 1)
+                        (cond (= c \\)
+                                (do
+                                  (store! pos (primitive/iadd (load pos) 2))
+                                  (store! cend (if (> (load pos) n) n (load pos)))
+                                  0)
+                              (= c \")
+                                (do
+                                  (store! pos (primitive/iadd (load pos) 1))
+                                  (store! state 0)
+                                  (store! cend (load pos))
+                                  ; the whole literal is one token, `c` prefix included
+                                  (push-tok! sc tslot TK-ATOM (load tokstart) (load pos))
+                                  0)
+                              (= c \newline)
+                                (do
+                                  (mk-line lslot
+                                           (load lstart)
+                                           (load indent)
+                                           (load cend)
+                                           (load opaque)
+                                           (load semi)
+                                           (load rparen))
+                                  (al-push! (mut (field sc lines)) (load lslot))
+                                  (store! pos (primitive/iadd (load pos) 1))
+                                  (store! line (primitive/iadd (load line) 1))
+                                  (store! lstart (load pos))
+                                  (store! indent -1)
+                                  (store! cend -1)
+                                  (store! semi false)
+                                  (store! rparen false)
+                                  (store! opaque true)
+                                  0)
+                              :else (do (store! pos (primitive/iadd (load pos) 1)) (store! cend (load pos)) 0))
+                      ; ---- inside a line comment ----
+                      (= (load state) 2)
+                        (if (= c \newline)
+                            (do
+                              (mk-line lslot
+                                       (load lstart)
+                                       (load indent)
+                                       (load cend)
+                                       (load opaque)
+                                       (load semi)
+                                       (load rparen))
+                              (al-push! (mut (field sc lines)) (load lslot))
+                              (store! pos (primitive/iadd (load pos) 1))
+                              (store! line (primitive/iadd (load line) 1))
+                              (store! lstart (load pos))
+                              (store! indent -1)
+                              (store! cend -1)
+                              (store! semi false)
+                              (store! rparen false)
+                              (store! opaque false)
+                              (store! state 0)
+                              0)
+                            (do (store! pos (primitive/iadd (load pos) 1)) 0))
+                      ; ---- ordinary code ----
+                      (= c \newline)
+                        (do
+                          (mk-line lslot
+                                   (load lstart)
+                                   (load indent)
+                                   (load cend)
+                                   (load opaque)
+                                   (load semi)
+                                   (load rparen))
+                          (al-push! (mut (field sc lines)) (load lslot))
+                          (store! pos (primitive/iadd (load pos) 1))
+                          (store! line (primitive/iadd (load line) 1))
+                          (store! lstart (load pos))
+                          (store! indent -1)
+                          (store! cend -1)
+                          (store! semi false)
+                          (store! rparen false)
+                          (store! opaque false)
+                          0)
+                      (ws? c) (do (store! pos (primitive/iadd (load pos) 1)) 0)
+                      :else
+                        (do
+                          ; first code byte on this line fixes its indentation
+                          (when (< (load indent) (primitive/cast i64 0))
+                            (store! indent (primitive/isub (load pos) (load lstart)))
+                            (when (= c \;) (store! semi true) 0)
+                            (when (closer? c) (store! rparen true) 0)
+                            0)
+                          (cond (= c \;) (do (store! state 2) (store! pos (primitive/iadd (load pos) 1)) 0)
+                                (= c \")
+                                  (do
+                                    (store! state 1)
+                                    (store! tokstart (load pos))
+                                    (store! pos (primitive/iadd (load pos) 1))
+                                    (store! cend (load pos))
+                                    0)
+                                ; a character literal: backslash, one char, then a name run when
+                                ; that char is a letter (\newline, \space, …). Captured whole so
+                                ; that `\(` is never counted as an open delimiter.
+                                (= c \\)
+                                  (do
+                                    (store! tokstart (load pos))
+                                    (store! pos (primitive/iadd (load pos) 1))
+                                    (when (< (load pos) n)
+                                      (let [f (sbyte src (load pos))]
+                                        (store! pos (primitive/iadd (load pos) 1))
+                                        (when (cl-alpha? f)
+                                          (loop (if (and (< (load pos) n) (cl-alnum? (sbyte src (load pos))))
+                                                    (store! pos (primitive/iadd (load pos) 1))
+                                                    (break)))
+                                          0)
+                                        0))
+                                    (store! cend (load pos))
+                                    (push-tok! sc tslot TK-ATOM (load tokstart) (load pos))
+                                    0)
+                                (or (opener? c) (closer? c))
+                                  (do
+                                    (push-tok! sc
+                                               tslot
+                                               (if (opener? c) TK-OPEN TK-CLOSE)
+                                               (load pos)
+                                               (primitive/iadd (load pos) 1))
+                                    (store! (field dslot byte) (load pos))
+                                    (store! (field dslot ch) c)
+                                    (store! (field dslot line) (load line))
+                                    (store! (field dslot col) (primitive/isub (load pos) (load lstart)))
+                                    (al-push! (mut (field sc delims)) (load dslot))
+                                    (store! pos (primitive/iadd (load pos) 1))
+                                    (store! cend (load pos))
+                                    0)
+                                ; reader-macro glyphs are their own token and never nest
+                                (or (= c \') (or (= c \u60) (= c \u7E)))
+                                  (do
+                                    (push-tok! sc tslot TK-PREFIX (load pos) (primitive/iadd (load pos) 1))
+                                    (store! pos (primitive/iadd (load pos) 1))
+                                    (store! cend (load pos))
+                                    0)
+                                :else
+                                ; an atom run; `c` immediately before a quote folds into c"…"
+                                (let [start (load pos)]
+                                  (loop (if (and (< (load pos) n) (not (atom-end? (sbyte src (load pos)))))
+                                            (store! pos (primitive/iadd (load pos) 1))
+                                            (break)))
+                                  (if (and (= (primitive/isub (load pos) start) (primitive/cast i64 1))
+                                           (and (= (sbyte src start) \c) (= (sbyte src (load pos)) \")))
+                                      ; a lone `c` before a quote is the head of c"…" — the
+                                      ; token is not finished, so the string branch emits it
+                                      (do
+                                        (store! state 1)
+                                        (store! tokstart start)
+                                        (store! pos (primitive/iadd (load pos) 1))
+                                        0)
+                                      (push-tok! sc tslot TK-ATOM start (load pos)))
+                                  (store! cend (load pos))
+                                  0)))))))
+    ; the final line (no trailing newline, or trailing bytes after the last one)
+    (mk-line lslot (load lstart) (load indent) (load cend) (load opaque) (load semi) (load rparen))
+    (al-push! (mut (field sc lines)) (load lslot))
+    (when (= (load state) 1) (store! (field sc bad-string) (primitive/iadd (load line) 1)) 0)
+    0))
+
+; ---- accessors -------------------------------------------------------------
+
+(defn dlm [(sc (ptr Scan)) (i i64)] (-> (ptr Delim))
+  (al-elem [Delim] (field sc delims) i))
+(defn lin [(sc (ptr Scan)) (i i64)] (-> (ptr Line))
+  (al-elem [Line] (field sc lines) i))
+(defn n-delims [(sc (ptr Scan))] (-> i64)
+  (al-len [Delim] (load (field sc delims))))
+(defn n-lines [(sc (ptr Scan))] (-> i64)
+  (al-len [Line] (load (field sc lines))))
+
+; ---- the edit plan ---------------------------------------------------------
+; Insertions and deletions are byte offsets into the ORIGINAL source, applied in one
+; pass at the end. Both lists come out in increasing offset order because regions,
+; and lines within a region, are visited in order.
+(defstruct Plan [(ins-at (ArrayList i64)) (ins-ch (ArrayList i64)) (del-at (ArrayList i64))])
+
+; Why we declined to repair, and where. Every refusal names a source position: a bare
+; "balance failed" is exactly what makes a broken file hard to fix by hand.
+; `code` is a stable slug for counting; `why` is the sentence a human reads. They are
+; separate so the sentence can be improved without silently resetting every statistic
+; that was keyed on it.
+(defstruct Refusal [(code (slice u8)) (why (slice u8)) (line i64) (col i64)])
+
+; Closers whose position indentation did NOT determine — see `plan-inserts`. These
+; are still placed, because refusing them costs far more correct repairs than it
+; prevents wrong ones (measured on the mutation corpus: refusing every one of them
+; declines 111 exact restorations to avoid 45 mis-nestings). They are counted and
+; the first line is reported instead, so the result says which repair to look at
+; rather than pretending every closer was derived.
+(defstruct Guesses [(count i64) (first-line i64)])
+
+(defn note-guess! [(gs (ptr Guesses)) (line i64)] (-> i64)
+  (when (= (load (field gs count)) (primitive/cast i64 0)) (store! (field gs first-line) line) 0)
+  (store! (field gs count) (primitive/iadd (load (field gs count)) 1))
+  0)
+
+(defn refuse! [(rf (ptr Refusal)) (code (slice u8)) (why (slice u8)) (line i64) (col i64)] (-> bool)
+  (store! (field rf code) code)
+  (store! (field rf why) why)
+  (store! (field rf line) line)
+  (store! (field rf col) col)
+  false)
+
+; ---- per-region delimiter analysis -----------------------------------------
+; `deficit` counts openers that never close; `extra` counts closers with nothing open.
+; A `mismatch` is a closer of the wrong KIND for what is open — `)` against `[` —
+; which neither an insertion nor a deletion can honestly fix, because either the
+; opener or the closer is the typo and only the author knows which.
+(defstruct Diag [(deficit i64) (extra i64) (first-extra i64) (mismatch i64)])
+
+(defn analyse [(a (ptr Allocator)) (sc (ptr Scan)) (dlo i64) (dhi i64) (dg (ptr Diag))] (-> i64)
+  (let [(mut stack) (al-new [i64] a)
+        (mut i) dlo]
+    (store! (field dg deficit) 0)
+    (store! (field dg extra) 0)
+    (store! (field dg first-extra) -1)
+    (store! (field dg mismatch) -1)
+    (loop (if (>= (load i) dhi)
+              (break)
+              (let [d (dlm sc (load i))
+                    c (load (field d ch))]
+                (if (opener? c)
+                    (al-push! (mut stack) (load i))
+                    (let [n (al-len [i64] (load stack))]
+                      (if (= n (primitive/cast i64 0))
+                          (do
+                            (store! (field dg extra) (primitive/iadd (load (field dg extra)) 1))
+                            (when (< (load (field dg first-extra)) (primitive/cast i64 0))
+                              (store! (field dg first-extra) (load i))
+                              0)
+                            0)
+                          (let [top (al-get [i64] (load stack) (primitive/isub n 1))
+                                od (dlm sc top)]
+                            (if (= c (close-of (load (field od ch))))
+                                (do (al-pop! [i64] (mut stack)) 0)
+                                (do
+                                  (when (< (load (field dg mismatch)) (primitive/cast i64 0))
+                                    (store! (field dg mismatch) (load i))
+                                    0)
+                                  ; stop at the first mismatch — everything after it is
+                                  ; measured against a structure already known to be wrong
+                                  (store! i dhi)
+                                  0))))))
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    (store! (field dg deficit) (al-len [i64] (load stack)))
+    0))
+
+; ---- placing the missing closers -------------------------------------------
+; Walk the region's lines in order carrying the stack of open delimiters. Before a
+; line's own delimiters are processed, its indentation is compared against the stack:
+; an open form whose column is at or right of this line's indent cannot still contain
+; it, so its closer belongs at the end of the last line that had code.
+;
+; This is the one heuristic in the command, and it is deliberately hemmed in. It runs
+; only inside a region already measured to be short of closers, it may only INSERT,
+; and it must account for exactly that deficit — no more, no fewer. A walk that wants
+; more insertions than the deficit, or that runs a closer against an empty stack (the
+; signature of an insertion made too early), is a refusal rather than a guess.
+(defn plan-inserts [(a (ptr Allocator))
+                    (sc (ptr Scan))
+                    (dlo i64)
+                    (dhi i64)
+                    (llo i64)
+                    (lhi i64)
+                    (deficit i64)
+                    (strict bool)
+                    (pl (ptr Plan))
+                    (gs (ptr Guesses))
+                    (rf (ptr Refusal))] (-> bool)
+  (let [(mut stack) (al-new [i64] a)
+        (mut di) dlo
+        (mut li) llo
+        (mut lastend) -1
+        (mut lastline) -1
+        (mut made) 0
+        (mut ok) true]
+    (loop (if (or (>= (load li) lhi) (not (load ok)))
+              (break)
+              (let [lp (lin sc (load li))]
+                ; (1) does this line's indentation close anything still open?
+                (when (judgeable? lp)
+                  (loop (let [n (al-len [i64] (load stack))]
+                          (if (= n (primitive/cast i64 0))
+                              (break)
+                              (let [top (al-get [i64] (load stack) (primitive/isub n 1))
+                                    od (dlm sc top)]
+                                (if (and (< (load (field od line)) (load li))
+                                         (<= (load (field lp indent)) (load (field od col))))
+                                    (cond (or (< (load lastend) (primitive/cast i64 0))
+                                              (<= (load lastend) (load (field od byte))))
+                                            (do
+                                              (store! ok
+                                                      (refuse! rf
+                                                               "no-place"
+                                                               "nowhere to close this form: no line with code follows it"
+                                                               (primitive/iadd (load (field od line)) 1)
+                                                               (primitive/iadd (load (field od col)) 1)))
+                                              (break))
+                                          ; The closer would land on the very line that opened the
+                                          ; form. Indentation narrowed it to a line and no further,
+                                          ; and within one line every position balances — so this
+                                          ; placement is a guess. `--strict` declines it; otherwise
+                                          ; it is made and counted, and the caller reports the line
+                                          ; so a reader knows which repair to check.
+                                          (and strict (= (load lastline) (load (field od line))))
+                                            (do
+                                              (store! ok
+                                                      (refuse! rf
+                                                               "inside-line"
+                                                               "the missing closer belongs somewhere inside this line, and indentation cannot say where"
+                                                               (primitive/iadd (load (field od line)) 1)
+                                                               (primitive/iadd (load (field od col)) 1)))
+                                              (break))
+                                          :else
+                                            (do
+                                              (when (= (load lastline) (load (field od line)))
+                                                (note-guess! gs (primitive/iadd (load (field od line)) 1))
+                                                0)
+                                              (al-push! (mut (field pl ins-at)) (load lastend))
+                                              (al-push! (mut (field pl ins-ch)) (close-of (load (field od ch))))
+                                              (al-pop! [i64] (mut stack))
+                                              (store! made (primitive/iadd (load made) 1))
+                                              (if (> (load made) deficit)
+                                                  (do
+                                                    (store! ok
+                                                            (refuse! rf
+                                                                     "over-fire"
+                                                                     "indentation implies more missing closers than the form is short of"
+                                                                     (primitive/iadd (load li) 1)
+                                                                     (primitive/iadd (load (field lp indent)) 1)))
+                                                    (break))
+                                                  0)))
+                                    (break))))))
+                  0)
+                ; (2) this line's own delimiters
+                (loop (if (or (>= (load di) dhi) (not (load ok)))
+                          (break)
+                          (let [d (dlm sc (load di))]
+                            (if (> (load (field d line)) (load li))
+                                (break)
+                                (do
+                                  (if (opener? (load (field d ch)))
+                                      (al-push! (mut stack) (load di))
+                                      (let [n (al-len [i64] (load stack))]
+                                        (if (= n (primitive/cast i64 0))
+                                            (store! ok
+                                                    (refuse! rf
+                                                             "underflow"
+                                                             "repair would leave this closer with nothing to close"
+                                                             (primitive/iadd (load (field d line)) 1)
+                                                             (primitive/iadd (load (field d col)) 1)))
+                                            (do (al-pop! [i64] (mut stack)) 0))))
+                                  (store! di (primitive/iadd (load di) 1))
+                                  0)))))
+                (when (>= (load (field lp code-end)) (primitive/cast i64 0))
+                  (store! lastend (load (field lp code-end)))
+                  (store! lastline (load li))
+                  0)
+                (store! li (primitive/iadd (load li) 1))
+                0)))
+    ; (3) anything still open ran to the end of the region — close it there, innermost
+    ; first, which is the order the stack already holds.
+    (loop (if (not (load ok))
+              (break)
+              (let [n (al-len [i64] (load stack))]
+                (if (= n (primitive/cast i64 0))
+                    (break)
+                    (let [top (al-get [i64] (load stack) (primitive/isub n 1))
+                          od (dlm sc top)]
+                      (cond (or (< (load lastend) (primitive/cast i64 0))
+                                (<= (load lastend) (load (field od byte))))
+                              (do
+                                (store! ok
+                                        (refuse! rf
+                                                 "no-place"
+                                                 "nowhere to close this form: no line with code follows it"
+                                                 (primitive/iadd (load (field od line)) 1)
+                                                 (primitive/iadd (load (field od col)) 1)))
+                                (break))
+                            ; Same guess as above: the form opened and ran out on one line, so
+                            ; appending at the end is only one of several balancing answers.
+                            (and strict (= (load lastline) (load (field od line))))
+                              (do
+                                (store! ok
+                                        (refuse! rf
+                                                 "inside-line"
+                                                 "the missing closer belongs somewhere inside this line, and indentation cannot say where"
+                                                 (primitive/iadd (load (field od line)) 1)
+                                                 (primitive/iadd (load (field od col)) 1)))
+                                (break))
+                            :else
+                              (do
+                                (when (= (load lastline) (load (field od line)))
+                                  (note-guess! gs (primitive/iadd (load (field od line)) 1))
+                                  0)
+                                (al-push! (mut (field pl ins-at)) (load lastend))
+                                (al-push! (mut (field pl ins-ch)) (close-of (load (field od ch))))
+                                (al-pop! [i64] (mut stack))
+                                (store! made (primitive/iadd (load made) 1))
+                                0)))))))
+    (if (not (load ok))
+        false
+        (if (!= (load made) deficit)
+            (refuse! rf "internal" "internal: planned closer count does not match the measured deficit" 0 0)
+            true))))
+
+; The same walk with nothing to insert: used on the RESULT to confirm that every
+; delimiter now closes where the file's own indentation says it should. Balance alone
+; is not correctness — a repair can pair every bracket and still nest the code wrongly
+; — so this is the check that a repaired form still means what it looks like.
+(defn indent-consistent? [(a (ptr Allocator))
+                          (sc (ptr Scan))
+                          (dlo i64)
+                          (dhi i64)
+                          (llo i64)
+                          (lhi i64)
+                          (rf (ptr Refusal))] (-> bool)
+  (let [(mut stack) (al-new [i64] a)
+        (mut di) dlo
+        (mut li) llo
+        (mut ok) true]
+    (loop (if (or (>= (load li) lhi) (not (load ok)))
+              (break)
+              (let [lp (lin sc (load li))]
+                (when (judgeable? lp)
+                  (let [n (al-len [i64] (load stack))]
+                    (when (> n (primitive/cast i64 0))
+                      (let [top (al-get [i64] (load stack) (primitive/isub n 1))
+                            od (dlm sc top)]
+                        (when (and (< (load (field od line)) (load li))
+                                   (<= (load (field lp indent)) (load (field od col))))
+                          (store! ok
+                                  (refuse! rf
+                                           "indent-disagree"
+                                           "repair disagrees with the indentation here: this line sits at or left of a form still open above it"
+                                           (primitive/iadd (load li) 1)
+                                           (primitive/iadd (load (field lp indent)) 1)))
+                          0)
+                        0))
+                    0))
+                (loop (if (>= (load di) dhi)
+                          (break)
+                          (let [d (dlm sc (load di))]
+                            (if (> (load (field d line)) (load li))
+                                (break)
+                                (do
+                                  (if (opener? (load (field d ch)))
+                                      (al-push! (mut stack) (load di))
+                                      (let [n (al-len [i64] (load stack))]
+                                        (when (> n (primitive/cast i64 0)) (al-pop! [i64] (mut stack)) 0)))
+                                  (store! di (primitive/iadd (load di) 1))
+                                  0)))))
+                (store! li (primitive/iadd (load li) 1))
+                0)))
+    (load ok)))
+
+; ---- regions ---------------------------------------------------------------
+; A top-level region begins at an opening delimiter in COLUMN 0. Nothing else in
+; formatted Coil starts there, which makes column 0 a resynchronisation anchor that
+; still holds when the running depth is wrong — exactly the situation `balance` is
+; called in, and exactly what a whole-file indentation pass has no way to recover
+; from once an early defect has shifted its idea of the current depth.
+(defn anchor? [(sc (ptr Scan)) (i i64)] (-> bool)
+  (let [d (dlm sc i)]
+    (and (= (load (field d col)) (primitive/cast i64 0))
+         (and (opener? (load (field d ch)))
+              (not (load (field (lin sc (load (field d line))) opaque)))))))
+
+; Delimiter index at which each region starts.
+(defn region-starts [(a (ptr Allocator)) (sc (ptr Scan))] (-> (ArrayList i64))
+  (let [n (n-delims sc)
+        (mut starts) (al-new [i64] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (when (or (= (load i) (primitive/cast i64 0)) (anchor? sc (load i)))
+                  (al-push! (mut starts) (load i))
+                  0)
+                (store! i (primitive/iadd (load i) 1)))))
+    (load starts)))
+
+; The delete-only repair, and the narrowest rule in the file.
+;
+; A stray closer and a MISSING OPENER produce byte-identical damage, and so does a
+; closer that merely landed one form too early. Indentation cannot tell them apart:
+; when an extra `)` closes a form ahead of time, every line after it is still
+; indented deeper than whatever remains open, so nothing looks wrong. Deleting the
+; wrong closer therefore re-nests working code silently — the failure this command
+; is built to prevent — and the fuzz corpus confirms a depth-based rule picks wrong
+; often enough to matter.
+;
+; One case is not ambiguous: a closer in COLUMN 0. Coil never puts one there —
+; closers hug the end of the last line of their form — and across the whole tree the
+; only column-0 closer is in a fixture deliberately written to be invalid. So a
+; column-0 closer with nothing open is a stray with no other reading, and only that
+; is deleted. Every other surplus closer is reported and left alone.
+(defn plan-deletes [(a (ptr Allocator)) (sc (ptr Scan)) (dlo i64) (dhi i64) (pl (ptr Plan)) (rf (ptr Refusal))] (-> bool)
+  (let [(mut depth) 0
+        (mut i) dlo
+        (mut ok) true]
+    (loop (if (or (>= (load i) dhi) (not (load ok)))
+              (break)
+              (let [d (dlm sc (load i))]
+                (if (opener? (load (field d ch)))
+                    (store! depth (primitive/iadd (load depth) 1))
+                    (if (= (load depth) (primitive/cast i64 0))
+                        (if (= (load (field d col)) (primitive/cast i64 0))
+                            (al-push! (mut (field pl del-at)) (load (field d byte)))
+                            (store! ok
+                                    (refuse! rf
+                                             "surplus-ambiguous"
+                                             "more closing than opening delimiters here; a stray closer and a missing opener are indistinguishable, so balance will not choose between them"
+                                             (primitive/iadd (load (field d line)) 1)
+                                             (primitive/iadd (load (field d col)) 1))))
+                        (store! depth (primitive/isub (load depth) 1))))
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    (load ok)))
+
+; ---- applying the plan -----------------------------------------------------
+; One pass over the original bytes. Insertions land before the byte at their offset;
+; deleted offsets are skipped. Nothing is reordered and nothing else is rewritten, so
+; the output contains every surviving original byte in its original order.
+(defn apply-plan [(a (ptr Allocator)) (src (slice u8)) (pl (ptr Plan))] (-> (slice u8))
+  (let [n (slice-len src)
+        nins (al-len [i64] (load (field pl ins-at)))
+        ndel (al-len [i64] (load (field pl del-at)))
+        (mut sb) (sb-new a)
+        (mut ii) 0
+        (mut dd) 0
+        (mut i) 0]
+    (loop (do
+            (loop (if (and (< (load ii) nins)
+                           (= (al-get [i64] (load (field pl ins-at)) (load ii)) (load i)))
+                      (do
+                        (sb-push-byte! (mut sb)
+                                       (primitive/cast u8 (al-get [i64] (load (field pl ins-ch)) (load ii))))
+                        (store! ii (primitive/iadd (load ii) 1))
+                        0)
+                      (break)))
+            (if (>= (load i) n)
+                (break)
+                (do
+                  (if (and (< (load dd) ndel)
+                           (= (al-get [i64] (load (field pl del-at)) (load dd)) (load i)))
+                      (store! dd (primitive/iadd (load dd) 1))
+                      (sb-push-byte! (mut sb) (slice-get src (load i))))
+                  (store! i (primitive/iadd (load i) 1))
+                  0))))
+    (sb-str (load sb))))
+
+; ---- entry point -----------------------------------------------------------
+
+;; The result of balancing one file's source. `guessed` counts closers whose position
+;; indentation did not determine, and `guess-line` is the first such line — zero and
+;; zero when every closer was placed by the indent rule. A caller that reports those
+;; numbers is telling the truth about which parts of the repair are derived and which
+;; are merely plausible.
+(defsum Outcome
+  (BClean)
+  (BFixed [(text (slice u8)) (ins i64) (del i64) (guessed i64) (guess-line i64)])
+  (BRefused [(code (slice u8)) (why (slice u8)) (line i64) (col i64)]))
+
+(defn has? [(l (ArrayList i64)) (v i64)] (-> bool)
+  (let [n (al-len [i64] l)
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (>= (load i) n) (load found))
+              (break)
+              (do
+                (when (= (al-get [i64] l (load i)) v) (store! found true) 0)
+                (store! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
+(defn region-dhi [(starts (ArrayList i64)) (k i64) (nreg i64) (nd i64)] (-> i64)
+  (if (< (primitive/iadd k 1) nreg) (al-get [i64] starts (primitive/iadd k 1)) nd))
+
+; Re-derive everything from the produced text and confirm it. `analyse` proving every
+; region balanced is the essential gate; `indent-consistent?` on the regions we
+; actually touched is the one that catches a repair that balances but nests wrongly.
+; Regions we did not touch are exempt from the indentation check on purpose: source
+; that was already indented unusually is not this command's business to judge.
+(defn verify [(a (ptr Allocator)) (out (slice u8)) (repaired (ArrayList i64)) (rf (ptr Refusal))] (-> bool)
+  (let [sc (alloc/stack Scan)
+        dg (alloc/stack Diag)]
+    (scan a out sc)
+    (if (>= (load (field sc bad-string)) (primitive/cast i64 0))
+        (refuse! rf
+                 "internal"
+                 "internal: repair produced an unterminated string literal"
+                 (load (field sc bad-string))
+                 1)
+        (let [starts (region-starts a sc)
+              nreg (al-len [i64] starts)
+              nd (n-delims sc)
+              nl (n-lines sc)
+              (mut ok) true
+              (mut k) 0]
+          (loop (if (or (>= (load k) nreg) (not (load ok)))
+                    (break)
+                    (let [dlo (al-get [i64] starts (load k))
+                          dhi (region-dhi starts (load k) nreg nd)
+                          llo (load (field (dlm sc dlo) line))
+                          lhi (if (< dhi nd) (load (field (dlm sc dhi) line)) nl)]
+                      (analyse a sc dlo dhi dg)
+                      (if (or (> (load (field dg deficit)) (primitive/cast i64 0))
+                              (or (> (load (field dg extra)) (primitive/cast i64 0))
+                                  (>= (load (field dg mismatch)) (primitive/cast i64 0))))
+                          (store! ok
+                                  (refuse! rf
+                                           "internal"
+                                           "internal: repair did not balance this form"
+                                           (primitive/iadd llo 1)
+                                           1))
+                          (when (has? repaired (load k))
+                            (store! ok (indent-consistent? a sc dlo dhi llo lhi rf))
+                            0))
+                      (store! k (primitive/iadd (load k) 1))
+                      0)))
+          (load ok)))))
+
+;; Byte offsets of every ()/[] in `src` that is real structure — not one inside a
+;; string, a comment, or a character literal. Exposed so the mutation harness can
+;; damage only delimiters that matter, and so the scanner's agreement with the
+;; reader is directly testable rather than inferred.
+(defn code-delims [(a (ptr Allocator)) (src (slice u8))] (-> (ArrayList i64))
+  (let [sc (alloc/stack Scan)
+        (mut out) (al-new [i64] a)
+        (mut i) 0]
+    (scan a src sc)
+    (let [n (n-delims sc)]
+      (loop (if (>= (load i) n)
+                (break)
+                (do
+                  (al-push! (mut out) (load (field (dlm sc (load i)) byte)))
+                  (store! i (primitive/iadd (load i) 1))))))
+    (load out)))
+
+; ---- candidate repairs -----------------------------------------------------
+; Indentation runs out of things to say when a closer belongs somewhere INSIDE a line:
+; every position on that line balances, and the file reads either way. It also cannot
+; tell a stray closer from a missing opener, because those are the same bytes.
+;
+; But `balance` ships inside a compiler, and a mis-nested repair changes an arity, a
+; binding position, or a body — which the front end rejects. So rather than guess, the
+; command can enumerate the delimiter-only repairs that BALANCE and let the type
+; checker say which one is Coil. On the fuzz corpus, every mis-nested repair tested
+; this way failed to check, and the correct one passed.
+;
+; This file stays free of the compiler: it produces the candidates, and the caller
+; that has a front end (the driver) adjudicates. The standalone CLI simply takes the
+; first, which is exactly what `balance-src` would have returned.
+
+;; True when every region's delimiters pair up — the filter that keeps a candidate
+;; honest, since inserting a closer in the wrong place usually fails to balance at all.
+(defn fully-balanced? [(a (ptr Allocator)) (src (slice u8))] (-> bool)
+  (let [sc (alloc/stack Scan)
+        dg (alloc/stack Diag)]
+    (scan a src sc)
+    (if (>= (load (field sc bad-string)) (primitive/cast i64 0))
+        false
+        (let [starts (region-starts a sc)
+              nreg (al-len [i64] starts)
+              nd (n-delims sc)
+              (mut ok) true
+              (mut k) 0]
+          (loop (if (or (>= (load k) nreg) (not (load ok)))
+                    (break)
+                    (do
+                      (analyse a sc (al-get [i64] starts (load k)) (region-dhi starts (load k) nreg nd) dg)
+                      (when (or (> (load (field dg deficit)) (primitive/cast i64 0))
+                                (or (> (load (field dg extra)) (primitive/cast i64 0))
+                                    (>= (load (field dg mismatch)) (primitive/cast i64 0))))
+                        (store! ok false)
+                        0)
+                      (store! k (primitive/iadd (load k) 1)))))
+          (load ok)))))
+
+(defn insert-at [(a (ptr Allocator)) (src (slice u8)) (at i64) (ch i64)] (-> (slice u8))
+  (let [(mut sb) (sb-new a)]
+    (sb-push-str! (mut sb) (subslice src 0 at))
+    (sb-push-byte! (mut sb) (primitive/cast u8 ch))
+    (sb-push-str! (mut sb) (subslice src at (slice-len src)))
+    (sb-str (load sb))))
+
+(defn delete-at [(a (ptr Allocator)) (src (slice u8)) (at i64)] (-> (slice u8))
+  (let [(mut sb) (sb-new a)]
+    (sb-push-str! (mut sb) (subslice src 0 at))
+    (sb-push-str! (mut sb) (subslice src (primitive/iadd at 1) (slice-len src)))
+    (sb-str (load sb))))
+
+;; Every delimiter-only repair of `src` that balances, capped at `cap`, with the
+;; indentation-derived answer FIRST — so a caller that tries only one tries the same
+;; answer `balance-src` gives, and a caller that tries more is strictly better off.
+;;
+;; Two shapes are enumerated, both single-character edits: one closer inserted after
+;; some token, or one surplus closer removed. Anything needing more than one character
+;; is left to `balance-src`, which either derives it from indentation or refuses.
+; `capped` means enumeration stopped early, so the set is INCOMPLETE and uniqueness
+; cannot be established from it. A caller that requires a unique answer must treat a
+; capped set as "don't know" rather than as "one match": a second, unseen candidate
+; might compile too, and picking the one we happened to enumerate is the divergence
+; this whole arrangement exists to prevent.
+; `guessed` is how many closers indentation could not place within their line. It
+; travels with the candidates because it decides how much verification the answer
+; needs: zero means indentation derived the placement and one confirming compile is
+; enough, non-zero means the reading has to be the only well-typed one.
+(defstruct Cands [(texts (ArrayList (slice u8))) (capped bool) (guessed i64)])
+
+; Balanced? — over a Scan whose buffers are REUSED, and with no allocation of its own.
+;
+; Equivalent to checking every region independently: walking all delimiters, the stack
+; must be empty at each top-level anchor and at the end, with no underflow and no kind
+; mismatch. Written this way so the hot filter needs neither a region list nor a fresh
+; scan; generation attempts this thousands of times per file.
+(defn scan-balanced? [(sc (ptr Scan)) (st (mut (ArrayList i64)))] (-> bool)
+  (al-clear! [i64] (mut st))
+  (let [n (n-delims sc)
+        (mut i) 0
+        (mut ok) true]
+    (loop (if (or (>= (load i) n) (not (load ok)))
+              (break)
+              (let [d (dlm sc (load i))
+                    c (load (field d ch))]
+                ; a column-0 opener begins a new top-level region, so everything before it
+                ; must already have closed
+                (when (and (= (load (field d col)) (primitive/cast i64 0))
+                           (and (opener? c) (not (load (field (lin sc (load (field d line))) opaque)))))
+                  (when (> (al-len [i64] (load st)) (primitive/cast i64 0)) (store! ok false) 0)
+                  0)
+                (if (opener? c)
+                    (al-push! (mut st) c)
+                    (let [k (al-len [i64] (load st))]
+                      (if (= k (primitive/cast i64 0))
+                          (store! ok false)
+                          (if (= c (close-of (al-get [i64] (load st) (primitive/isub k 1))))
+                              (do (al-pop! [i64] (mut st)) 0)
+                              (store! ok false)))))
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    (and (load ok) (= (al-len [i64] (load st)) (primitive/cast i64 0)))))
+
+(defn try-cand! [(a (ptr Allocator)) (cs (ptr Cands)) (cand (slice u8)) (sc (ptr Scan)) (st (mut (ArrayList i64)))] (-> i64)
+  (scan-opt a cand sc true)
+  (when (and (< (load (field sc bad-string)) (primitive/cast i64 0))
+             (and (scan-balanced? sc (mut st)) (not (has-text? (load (field cs texts)) cand))))
+    (al-push! (mut (field cs texts)) cand)
+    0)
+  0)
+
+;; Does any region have MORE closers than openers? Only then can a missing opener be
+;; the explanation, and only then is it worth enumerating opener insertions — which
+;; would otherwise multiply the candidate set for every file, spending the caller's
+;; budget (and, when the caller compiles candidates, real time) on repairs that cannot
+;; apply to the damage in front of it.
+(defn has-surplus? [(a (ptr Allocator)) (src (slice u8))] (-> bool)
+  (let [sc (alloc/stack Scan)
+        dg (alloc/stack Diag)
+        (mut yes) false]
+    (scan a src sc)
+    (let [starts (region-starts a sc)
+          nreg (al-len [i64] starts)
+          nd (n-delims sc)
+          (mut k) 0]
+      (loop (if (or (>= (load k) nreg) (load yes))
+                (break)
+                (do
+                  (analyse a sc (al-get [i64] starts (load k)) (region-dhi starts (load k) nreg nd) dg)
+                  (when (> (load (field dg extra)) (primitive/cast i64 0)) (store! yes true) 0)
+                  (store! k (primitive/iadd (load k) 1))))))
+    (load yes)))
+
+(defn balance-candidates [(a (ptr Allocator)) (src (slice u8)) (cap i64) (cs (ptr Cands))] (-> i64)
+  (let [sc (alloc/stack Scan)
+        ; one scan buffer and one stack, reused for every attempted edit
+        tsc (alloc/stack Scan)
+        (mut tst) (al-new [i64] a)
+        openers? (has-surplus? a src)
+        ; -1 = enumerate the whole file; otherwise the single line the contest is on
+        (mut focus) -1
+        (mut lcur) 0
+        (mut i) 0]
+    (scan a src tsc)
+    (store! (field cs texts) (al-new [(slice u8)] a))
+    (store! (field cs capped) false)
+    (store! (field cs guessed) 0)
+    ; the indentation-derived answer leads, when there is one
+    (match (balance-src a src false)
+      (BFixed [text _ _ guessed guess-line]
+              (al-push! (mut (field cs texts)) text)
+              (store! (field cs guessed) guessed)
+              ; When indentation settled WHICH LINE the closer belongs on and was
+              ; unsure only where inside it, the contest is confined to that line.
+              ; Enumerating the rest of the file then adds candidates that answer a
+              ; question nobody asked, and on a real file there are enough of them to
+              ; exhaust any budget — which is how a 15 KB source came to report "too
+              ; many possible balancings" for a defect indentation had already located
+              ; to a single line.
+              (when (> guessed (primitive/cast i64 0))
+                (store! focus (primitive/isub guess-line 1))
+                0)
+              0)
+      (BClean [] 0)
+      (BRefused [_ _ _ _] 0))
+    (scan a src sc)
+    (if (>= (load (field sc bad-string)) (primitive/cast i64 0))
+        0
+        (let [nt (al-len [Tok] (load (field sc toks)))
+              nl (n-lines sc)]
+          (loop (if (>= (load i) nt)
+                    (break)
+                    (if (>= (al-len [(slice u8)] (load (field cs texts))) cap)
+                        (do (store! (field cs capped) true) (break))
+                        (let [tk (al-elem [Tok] (field sc toks) (load i))
+                              kind (load (field tk kind))]
+                          ; advance the line cursor to the line holding this token
+                          (loop (if (and (< (primitive/iadd (load lcur) 1) nl)
+                                         (<= (load (field (lin sc (primitive/iadd (load lcur) 1)) start))
+                                             (load (field tk start))))
+                                    (store! lcur (primitive/iadd (load lcur) 1))
+                                    (break)))
+                          (if (and (>= (load focus) (primitive/cast i64 0)) (!= (load lcur) (load focus)))
+                              (store! i (primitive/iadd (load i) 1))
+                              (do
+                                ; a closer inserted after this token...
+                                (when (!= kind TK-PREFIX)
+                                  (try-cand! a cs (insert-at a src (load (field tk end)) \)) tsc (mut tst))
+                                  (try-cand! a cs (insert-at a src (load (field tk end)) \]) tsc (mut tst))
+                                  0)
+                                ; ...this closer removed...
+                                (when (= kind TK-CLOSE)
+                                  (try-cand! a cs (delete-at a src (load (field tk start))) tsc (mut tst))
+                                  0)
+                                ; ...or an OPENER restored before this token. A deleted `(` and a
+                                ; stray `)` are the same damage seen from two sides, so a search
+                                ; that only ever removes closers can never put back an opener —
+                                ; which was every unrepairable case in the corpus. Adjudication
+                                ; keeps this honest: an opener guessed into the wrong place has to
+                                ; be the ONLY placement that compiles before it is written.
+                                (when (and openers? (!= kind TK-CLOSE))
+                                  (try-cand! a cs (insert-at a src (load (field tk start)) \() tsc (mut tst))
+                                  (try-cand! a cs (insert-at a src (load (field tk start)) \[) tsc (mut tst))
+                                  0)
+                                (store! i (primitive/iadd (load i) 1))
+                                0))))))
+          0))))
+
+(defn has-text? [(l (ArrayList (slice u8))) (v (slice u8))] (-> bool)
+  (let [n (al-len [(slice u8)] l)
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (>= (load i) n) (load found))
+              (break)
+              (do
+                (when (= (al-get [(slice u8)] l (load i)) v) (store! found true) 0)
+                (store! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
+;; Repair the delimiters in `src`. Returns `(BClean)` when nothing needed doing,
+;; `(BFixed …)` with the repaired source, or `(BRefused why line col)` when the defect
+;; is not one a delimiter-only edit can honestly resolve.
+;;
+;; Under `strict`, a closer whose position indentation did not determine is refused
+;; rather than guessed. That is the right setting when nothing downstream will catch
+;; a mis-nesting; the default suits an ordinary `coil build` following the repair,
+;; which turns a wrong nesting into a loud type error.
+(defn balance-src [(a (ptr Allocator)) (src (slice u8)) (strict bool)] (-> Outcome)
+  (let [sc (alloc/stack Scan)
+        pl (alloc/stack Plan)
+        dg (alloc/stack Diag)
+        gs (alloc/stack Guesses)
+        rf (alloc/stack Refusal)]
+    (store! (field gs count) 0)
+    (store! (field gs first-line) 0)
+    (scan a src sc)
+    (if (>= (load (field sc bad-string)) (primitive/cast i64 0))
+        (BRefused "unterminated-string"
+                  "unterminated string literal: the indentation below it cannot be trusted"
+                  (load (field sc bad-string))
+                  1)
+        (let [starts (region-starts a sc)
+              nreg (al-len [i64] starts)
+              nd (n-delims sc)
+              nl (n-lines sc)
+              (mut repaired) (al-new [i64] a)
+              (mut ok) true
+              (mut k) 0]
+          (store! (field pl ins-at) (al-new [i64] a))
+          (store! (field pl ins-ch) (al-new [i64] a))
+          (store! (field pl del-at) (al-new [i64] a))
+          (loop (if (or (>= (load k) nreg) (not (load ok)))
+                    (break)
+                    (let [dlo (al-get [i64] starts (load k))
+                          dhi (region-dhi starts (load k) nreg nd)
+                          llo (load (field (dlm sc dlo) line))
+                          lhi (if (< dhi nd) (load (field (dlm sc dhi) line)) nl)]
+                      (analyse a sc dlo dhi dg)
+                      (let [def (load (field dg deficit))
+                            ext (load (field dg extra))
+                            mis (load (field dg mismatch))]
+                        (cond (>= mis (primitive/cast i64 0))
+                                (let [d (dlm sc mis)]
+                                  (store! ok
+                                          (refuse! rf
+                                                   "mismatch"
+                                                   "closing delimiter does not match the form it closes; the typo could be either one, so balance will not choose"
+                                                   (primitive/iadd (load (field d line)) 1)
+                                                   (primitive/iadd (load (field d col)) 1)))
+                                  0)
+                              ; Repairing this needs a delimiter MOVED, and moving delimiters
+                              ; is the failure mode this command exists to avoid.
+                              (and (> def (primitive/cast i64 0)) (> ext (primitive/cast i64 0)))
+                                (let [d (dlm sc (load (field dg first-extra)))]
+                                  (store! ok
+                                          (refuse! rf
+                                                   "move-required"
+                                                   "this form is both missing a closer and carrying a stray one; repairing it would mean moving a delimiter"
+                                                   (primitive/iadd (load (field d line)) 1)
+                                                   (primitive/iadd (load (field d col)) 1)))
+                                  0)
+                              (> def (primitive/cast i64 0))
+                                (do
+                                  (store! ok (plan-inserts a sc dlo dhi llo lhi def strict pl gs rf))
+                                  (when (load ok) (al-push! (mut repaired) (load k)) 0)
+                                  0)
+                              (> ext (primitive/cast i64 0))
+                                (do
+                                  (store! ok (plan-deletes a sc dlo dhi pl rf))
+                                  (when (load ok) (al-push! (mut repaired) (load k)) 0)
+                                  0)
+                              :else 0))
+                      (store! k (primitive/iadd (load k) 1))
+                      0)))
+          (if (not (load ok))
+              (BRefused (load (field rf code)) (load (field rf why)) (load (field rf line)) (load (field rf col)))
+              (let [nins (al-len [i64] (load (field pl ins-at)))
+                    ndel (al-len [i64] (load (field pl del-at)))]
+                (if (and (= nins (primitive/cast i64 0)) (= ndel (primitive/cast i64 0)))
+                    (BClean)
+                    (let [out (apply-plan a src pl)]
+                      (if (verify a out (load repaired) rf)
+                          (BFixed out nins ndel (load (field gs count)) (load (field gs first-line)))
+                          (BRefused (load (field rf code))
+                                    (load (field rf why))
+                                    (load (field rf line))
+                                    (load (field rf col))))))))))))

@@ -1,0 +1,451 @@
+; src/compiler/formatter/formedit.coil — addressing and replacing whole forms.
+;
+; `coil balance` repairs source an agent has already broken. This is the other half:
+; a way to edit Coil that cannot break it in the first place.
+;
+; A text patch can straddle a delimiter, so applying one can turn a readable file into
+; an unreadable one. A form-addressed edit cannot: the caller names a FORM and supplies
+; a REPLACEMENT FORM, the replacement is read and rejected unless it is complete and
+; balanced, and the splice happens at the form's own byte boundaries. There is no
+; intermediate state in which the delimiters are wrong, so the class of damage does not
+; arise. This is the design every Clojure agent harness converged on, and the reason
+; they did is that it removes the failure instead of detecting it.
+;
+; ADDRESSING. A form is named by its leading items: `defn parse-args`, `defstruct
+; Point`, `impl Show Point`, `impl [T] Show (Box T)`. The address is itself read as
+; Coil, then compared item-by-item against the form's items — so `(Box T)` is one item
+; and whitespace inside it does not matter. Matching is a PREFIX: `defn` alone names
+; every `defn` in the file, which is reported as an ambiguity listing all of them, and
+; is the cheapest way to find out what a file contains.
+;
+; Nesting is a separate flag rather than a path separator, because `/` is an ordinary
+; character in Coil symbols (`primitive/load`) and `Point/show` is genuinely ambiguous:
+;
+;     coil edit f.coil --in 'impl Show Point' --form 'show' --replace
+;
+; A miss never silently does nothing. Not-found lists the forms that do exist;
+; ambiguous lists the ones that matched. Both are how a caller discovers the right
+; address on the second try instead of resorting to a text patch.
+(module formedit)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "balance" :use *)
+
+; ---- the form tree ---------------------------------------------------------
+; A flat array with child/sibling links rather than boxed nodes: the tree is built
+; once, walked a handful of times, and never mutated.
+;
+; `start` includes any reader-macro prefix glyph, so replacing `'(a b)` replaces the
+; quote too. `tok-lo`/`tok-hi` bound the node's tokens, which is what item comparison
+; uses — comparing tokens rather than raw bytes makes matching insensitive to how the
+; form happens to be laid out.
+(defstruct FNode
+  [(start i64)
+   (end i64)
+   (listp bool)
+   (tok-lo i64)
+   (tok-hi i64)
+   (first-child i64)
+   (last-child i64)
+   (next i64)])
+
+(defstruct Tree [(nodes (ArrayList FNode)) (toks (ArrayList Tok)) (src (slice u8)) (ok bool)])
+
+(defn fnode [(t (ptr Tree)) (i i64)] (-> (ptr FNode))
+  (al-elem [FNode] (field t nodes) i))
+
+(defn new-node [(t (ptr Tree)) (start i64) (listp bool) (tok-lo i64)] (-> i64)
+  (let [slot (alloc/stack FNode)
+        idx (al-len [FNode] (load (field t nodes)))]
+    (store! (field slot start) start)
+    (store! (field slot end) -1)
+    (store! (field slot listp) listp)
+    (store! (field slot tok-lo) tok-lo)
+    (store! (field slot tok-hi) -1)
+    (store! (field slot first-child) -1)
+    (store! (field slot last-child) -1)
+    (store! (field slot next) -1)
+    (al-push! (mut (field t nodes)) (load slot))
+    idx))
+
+(defn attach! [(t (ptr Tree)) (parent i64) (child i64)] (-> i64)
+  (let [p (fnode t parent)]
+    (if (< (load (field p last-child)) (primitive/cast i64 0))
+        (store! (field p first-child) child)
+        (store! (field (fnode t (load (field p last-child))) next) child))
+    (store! (field p last-child) child)
+    0))
+
+;; Read `src` into a tree of forms. Node 0 is the whole file; its children are the
+;; top-level forms. `ok` is false when the delimiters do not balance — an address
+;; cannot be resolved against a file whose structure is unknown, so callers must run
+;; `coil balance` first rather than get an answer derived from a guess.
+(defn build-tree [(a (ptr Allocator)) (src (slice u8)) (t (ptr Tree))] (-> i64)
+  (let [sc (alloc/stack Scan)
+        (mut stack) (al-new [i64] a)
+        (mut prefix) -1
+        (mut i) 0
+        (mut ok) true]
+    (store! (field t nodes) (al-new [FNode] a))
+    (store! (field t src) src)
+    (scan a src sc)
+    (new-node t 0 true 0)
+    (al-push! (mut stack) 0)
+    (let [n (al-len [Tok] (load (field sc toks)))]
+      (loop (if (or (>= (load i) n) (not (load ok)))
+                (break)
+                (let [tk (al-elem [Tok] (field sc toks) (load i))
+                      kind (load (field tk kind))
+                      start
+                        (if (>= (load prefix) (primitive/cast i64 0))
+                            (load prefix)
+                            (load (field tk start)))
+                      depth (al-len [i64] (load stack))
+                      parent (al-get [i64] (load stack) (primitive/isub depth 1))]
+                  (cond (= kind TK-PREFIX)
+                          (when (< (load prefix) (primitive/cast i64 0))
+                            (store! prefix (load (field tk start)))
+                            0)
+                        (= kind TK-ATOM)
+                          (let [idx (new-node t start false (load i))]
+                            (store! (field (fnode t idx) end) (load (field tk end)))
+                            (store! (field (fnode t idx) tok-hi) (primitive/iadd (load i) 1))
+                            (attach! t parent idx)
+                            (store! prefix -1)
+                            0)
+                        (= kind TK-OPEN)
+                          (let [idx (new-node t start true (load i))]
+                            (attach! t parent idx)
+                            (al-push! (mut stack) idx)
+                            (store! prefix -1)
+                            0)
+                        :else
+                        ; a close with nothing open means `build-tree` was handed source
+                        ; whose delimiters do not balance
+                        (if (<= depth (primitive/cast i64 1))
+                            (store! ok false)
+                            (let [idx (al-get [i64] (load stack) (primitive/isub depth 1))]
+                              (store! (field (fnode t idx) end) (load (field tk end)))
+                              (store! (field (fnode t idx) tok-hi) (primitive/iadd (load i) 1))
+                              (al-pop! [i64] (mut stack))
+                              0)))
+                  (store! i (primitive/iadd (load i) 1))
+                  0))))
+    ; anything still open is an unterminated form
+    (when (> (al-len [i64] (load stack)) (primitive/cast i64 1)) (store! ok false) 0)
+    ; an unterminated string emits no token at all, so its text would vanish silently
+    (when (>= (load (field sc bad-string)) (primitive/cast i64 0)) (store! ok false) 0)
+    (store! (field t toks) (load (field sc toks)))
+    (store! (field t ok) (load ok))
+    (store! (field (fnode t 0) end) (slice-len src))
+    (store! (field (fnode t 0) tok-hi) (al-len [Tok] (load (field sc toks))))
+    0))
+
+(defn node-text [(t (ptr Tree)) (i i64)] (-> (slice u8))
+  (let [p (fnode t i)]
+    (subslice (load (field t src)) (load (field p start)) (load (field p end)))))
+
+(defn tok-text [(t (ptr Tree)) (i i64)] (-> (slice u8))
+  (let [tk (al-elem [Tok] (field t toks) i)]
+    (subslice (load (field t src)) (load (field tk start)) (load (field tk end)))))
+
+; ---- matching --------------------------------------------------------------
+; Two nodes are the same item when their TOKEN sequences match. Comparing tokens
+; rather than bytes is what makes `(Box T)` and `(Box  T)` the same address, and it
+; costs nothing: both trees already hold their tokens.
+(defn node-eq [(ta (ptr Tree)) (ia i64) (tb (ptr Tree)) (ib i64)] (-> bool)
+  (let [pa (fnode ta ia)
+        pb (fnode tb ib)
+        na (primitive/isub (load (field pa tok-hi)) (load (field pa tok-lo)))
+        nb (primitive/isub (load (field pb tok-hi)) (load (field pb tok-lo)))
+        (mut same) (= na nb)
+        (mut j) 0]
+    (loop (if (or (>= (load j) na) (not (load same)))
+              (break)
+              (do
+                (unless (= (tok-text ta (primitive/iadd (load (field pa tok-lo)) (load j)))
+                           (tok-text tb (primitive/iadd (load (field pb tok-lo)) (load j))))
+                  (store! same false)
+                  0)
+                (store! j (primitive/iadd (load j) 1)))))
+    (load same)))
+
+(defn child-at [(t (ptr Tree)) (parent i64) (k i64)] (-> i64)
+  (let [(mut cur) (load (field (fnode t parent) first-child))
+        (mut i) 0]
+    (loop (if (or (< (load cur) (primitive/cast i64 0)) (>= (load i) k))
+              (break)
+              (do
+                (store! cur (load (field (fnode t (load cur)) next)))
+                (store! i (primitive/iadd (load i) 1)))))
+    (load cur)))
+
+(defn count-children [(t (ptr Tree)) (parent i64)] (-> i64)
+  (let [(mut cur) (load (field (fnode t parent) first-child))
+        (mut n) 0]
+    (loop (if (< (load cur) (primitive/cast i64 0))
+              (break)
+              (do
+                (store! n (primitive/iadd (load n) 1))
+                (store! cur (load (field (fnode t (load cur)) next))))))
+    (load n)))
+
+; Does form `cand` begin with the address's items? A PREFIX match, so `defn` matches
+; every defn and `defn parse-args` matches one — the short address is how a caller
+; asks what is in the file.
+(defn form-matches? [(t (ptr Tree)) (cand i64) (at (ptr Tree)) (nitems i64)] (-> bool)
+  (if (not (load (field (fnode t cand) listp)))
+      false
+      (if (< (count-children t cand) nitems)
+          false
+          (let [(mut ok) true
+                (mut j) 0]
+            (loop (if (or (>= (load j) nitems) (not (load ok)))
+                      (break)
+                      (do
+                        (unless (node-eq t (child-at t cand (load j)) at (child-at at 0 (load j)))
+                          (store! ok false)
+                          0)
+                        (store! j (primitive/iadd (load j) 1)))))
+            (load ok)))))
+
+;; Every child of `parent` matching the address, appended to `out` as node indices.
+(defn find-forms [(a (ptr Allocator)) (t (ptr Tree)) (parent i64) (at (ptr Tree)) (out (mut (ArrayList i64)))] (-> i64)
+  (let [nitems (count-children at 0)
+        (mut cur) (load (field (fnode t parent) first-child))]
+    (loop (if (< (load cur) (primitive/cast i64 0))
+              (break)
+              (do
+                (when (form-matches? t (load cur) at nitems) (al-push! (mut out) (load cur)) 0)
+                (store! cur (load (field (fnode t (load cur)) next))))))
+    0))
+
+; ---- reporting -------------------------------------------------------------
+; A miss must say what IS there. An agent that gets "not found" and a list of real
+; addresses fixes its call; one that gets "not found" falls back to a text patch,
+; which is the thing this tool exists to make unnecessary.
+(defn describe-form [(t (ptr Tree)) (i i64)] (-> (slice u8))
+  (let [p (fnode t i)]
+    (if (not (load (field p listp)))
+        (node-text t i)
+        (let [h (load (field p first-child))]
+          (if (< h (primitive/cast i64 0))
+              "()"
+              (let [second (load (field (fnode t h) next))]
+                (if (< second (primitive/cast i64 0))
+                    (node-text t h)
+                    (subslice (load (field t src))
+                              (load (field (fnode t h) start))
+                              (load (field (fnode t second) end))))))))))
+
+;; One `  kind name` line per candidate node index.
+(defn render-list [(a (ptr Allocator)) (t (ptr Tree)) (idxs (ArrayList i64))] (-> (slice u8))
+  (let [n (al-len [i64] idxs)
+        (mut sb) (sb-new a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (sb-push-str! (mut sb) "  ")
+                (sb-push-str! (mut sb) (describe-form t (al-get [i64] idxs (load i))))
+                (sb-push-byte! (mut sb) (primitive/cast u8 10))
+                (store! i (primitive/iadd (load i) 1)))))
+    (sb-str (load sb))))
+
+;; Every list child of `parent`, for the not-found listing.
+(defn all-forms [(a (ptr Allocator)) (t (ptr Tree)) (parent i64)] (-> (ArrayList i64))
+  (let [(mut out) (al-new [i64] a)
+        (mut cur) (load (field (fnode t parent) first-child))]
+    (loop (if (< (load cur) (primitive/cast i64 0))
+              (break)
+              (do
+                (when (load (field (fnode t (load cur)) listp)) (al-push! (mut out) (load cur)) 0)
+                (store! cur (load (field (fnode t (load cur)) next))))))
+    (load out)))
+
+; ---- operations ------------------------------------------------------------
+(const OP-REPLACE 0)
+(const OP-BEFORE 1)
+(const OP-AFTER 2)
+(const OP-DELETE 3)
+(const OP-SHOW 4)
+; `--list` needs no address at all: it answers "what is in this file, and what may I
+; say to name it" in one call, which is what a caller otherwise learns by guessing
+; wrong once and reading the not-found listing.
+(const OP-LIST 5)
+
+;; What one `coil edit` invocation did, or why it did nothing.
+(defsum EditOutcome
+  (EText [(text (slice u8))])  ; the new file, or the form under --show
+  (ENotFound [(listing (slice u8))])
+  (EAmbiguous [(listing (slice u8)) (n i64)])
+  (EBadInput [(why (slice u8))]))
+
+; The replacement must read as one or more COMPLETE, BALANCED forms. This is the gate
+; that makes the whole command safe: nothing is ever spliced that could leave the file
+; unreadable, so the caller's mistake stays their mistake instead of becoming a broken
+; file that some other tool has to repair.
+(defn check-replacement [(a (ptr Allocator)) (text (slice u8)) (rt (ptr Tree))] (-> (slice u8))
+  (build-tree a text rt)
+  (if (not (load (field rt ok)))
+      "replacement does not read as complete forms: its delimiters do not balance"
+      (if (= (count-children rt 0) (primitive/cast i64 0))
+          "replacement is empty; use --delete to remove a form"
+          "")))
+
+; Splice `text` in place of bytes [lo, hi) of `src`.
+(defn splice [(a (ptr Allocator)) (src (slice u8)) (lo i64) (hi i64) (text (slice u8))] (-> (slice u8))
+  (let [(mut sb) (sb-new a)]
+    (sb-push-str! (mut sb) (subslice src 0 lo))
+    (sb-push-str! (mut sb) text)
+    (sb-push-str! (mut sb) (subslice src hi (slice-len src)))
+    (sb-str (load sb))))
+
+; Extend past trailing spaces and one newline, so deleting a form takes the line it
+; sat on rather than leaving an empty one behind.
+(defn extend-over-eol [(src (slice u8)) (hi i64)] (-> i64)
+  (let [n (slice-len src)
+        (mut i) hi]
+    (loop (if (and (< (load i) n)
+                   (or (= (primitive/cast i64 (slice-get src (load i))) \space)
+                       (= (primitive/cast i64 (slice-get src (load i))) \tab)))
+              (store! i (primitive/iadd (load i) 1))
+              (break)))
+    (if (and (< (load i) n) (= (primitive/cast i64 (slice-get src (load i))) \newline))
+        (primitive/iadd (load i) 1)
+        hi)))
+
+; Is the line starting at `i` blank (only whitespace before its newline)?
+(defn blank-line-at? [(src (slice u8)) (i i64)] (-> bool)
+  (let [n (slice-len src)
+        (mut j) i]
+    (loop (if (and (< (load j) n)
+                   (or (= (primitive/cast i64 (slice-get src (load j))) \space)
+                       (= (primitive/cast i64 (slice-get src (load j))) \tab)))
+              (store! j (primitive/iadd (load j) 1))
+              (break)))
+    (and (< (load j) n) (= (primitive/cast i64 (slice-get src (load j))) \newline))))
+
+(defn skip-line [(src (slice u8)) (i i64)] (-> i64)
+  (let [n (slice-len src)
+        (mut j) i]
+    (loop (if (and (< (load j) n) (!= (primitive/cast i64 (slice-get src (load j))) \newline))
+              (store! j (primitive/iadd (load j) 1))
+              (break)))
+    (if (< (load j) n) (primitive/iadd (load j) 1) (load j))))
+
+; Does a blank line sit immediately above the form starting at `lo`?
+(defn blank-line-before? [(src (slice u8)) (lo i64)] (-> bool)
+  (and (>= lo (primitive/cast i64 2))
+       (and (= (primitive/cast i64 (slice-get src (primitive/isub lo 1))) \newline)
+            (= (primitive/cast i64 (slice-get src (primitive/isub lo 2))) \newline))))
+
+; How much to remove for a delete. Taking only the form and its newline leaves the
+; blank lines on BOTH sides of it, so a file spaced one-blank-line-per-form comes back
+; with two at the seam. When a blank line already sits above the form, the blank lines
+; below it come out too, and the seam is left exactly as the file had it elsewhere.
+(defn delete-end [(src (slice u8)) (lo i64) (hi i64)] (-> i64)
+  (let [(mut e) (extend-over-eol src hi)]
+    (when (blank-line-before? src lo)
+      (loop (if (blank-line-at? src (load e))
+                (store! e (skip-line src (load e)))
+                (break)))
+      0)
+    (load e)))
+
+;; Resolve `addr` (optionally inside the enclosing forms named by `ins`) and apply `op`.
+;; `content` is ignored by --delete and --show.
+(defn edit-src [(a (ptr Allocator))
+                (src (slice u8))
+                (ins (ArrayList (slice u8)))
+                (addr (slice u8))
+                (op i64)
+                (content (slice u8))] (-> EditOutcome)
+  (let [t (alloc/stack Tree)
+        at (alloc/stack Tree)
+        rt (alloc/stack Tree)
+        (mut parent) 0
+        (mut i) 0
+        (mut failed) false
+        (mut outcome) (EBadInput "")]
+    (build-tree a src t)
+    (if (not (load (field t ok)))
+        (EBadInput "this file's delimiters do not balance; run `coil balance` on it first")
+        (do
+          ; descend through each --in, so a member is addressed inside its own form
+          (loop (if (or (>= (load i) (al-len [(slice u8)] ins)) (load failed))
+                    (break)
+                    (let [seg (al-get [(slice u8)] ins (load i))
+                          (mut hits) (al-new [i64] a)]
+                      (build-tree a seg at)
+                      (find-forms a t (load parent) at (mut hits))
+                      (let [n (al-len [i64] (load hits))]
+                        (cond (= n (primitive/cast i64 0))
+                                (do
+                                  (store! outcome (ENotFound (render-list a t (all-forms a t (load parent)))))
+                                  (store! failed true)
+                                  0)
+                              (> n (primitive/cast i64 1))
+                                (do
+                                  (store! outcome (EAmbiguous (render-list a t (load hits)) n))
+                                  (store! failed true)
+                                  0)
+                              :else (store! parent (al-get [i64] (load hits) 0))))
+                      (store! i (primitive/iadd (load i) 1))
+                      0)))
+          (if (load failed)
+              (load outcome)
+              (if (= op OP-LIST)
+                  (EText (render-list a t (all-forms a t (load parent))))
+                  (let [(mut hits) (al-new [i64] a)]
+                    (build-tree a addr at)
+                    (find-forms a t (load parent) at (mut hits))
+                    (let [n (al-len [i64] (load hits))]
+                      (cond (= n (primitive/cast i64 0)) (ENotFound (render-list a t (all-forms a t (load parent))))
+                            (> n (primitive/cast i64 1)) (EAmbiguous (render-list a t (load hits)) n)
+                            :else
+                              (let [target (al-get [i64] (load hits) 0)
+                                    p (fnode t target)
+                                    lo (load (field p start))
+                                    hi (load (field p end))]
+                                (cond (= op OP-SHOW) (EText (node-text t target))
+                                      (= op OP-DELETE) (EText (splice a src lo (delete-end src lo hi) ""))
+                                      :else
+                                        (let [why (check-replacement a content rt)]
+                                          (if (!= why "")
+                                              (EBadInput why)
+                                              (if (= op OP-REPLACE)
+                                                  (EText (splice a src lo hi content))
+                                                  (insert-form a src lo hi op content)))))))))))))))
+
+; Column of the byte at `lo`, by scanning back to the previous newline.
+(defn col-of [(src (slice u8)) (lo i64)] (-> i64)
+  (let [(mut i) lo]
+    (loop (if (and (> (load i) (primitive/cast i64 0))
+                   (!= (primitive/cast i64 (slice-get src (primitive/isub (load i) 1))) \newline))
+              (store! i (primitive/isub (load i) 1))
+              (break)))
+    (primitive/isub lo (load i))))
+
+; Insert a new form before or after a TOP-LEVEL one, separated by a blank line.
+;
+; Only top level, because inserting deeper means choosing the new form's indentation,
+; and a wrong choice there is precisely what makes `balance` have to guess later. The
+; caller who wants a nested insert should `--replace` the enclosing form, where the
+; layout is theirs to write and is spliced verbatim.
+(defn insert-form [(a (ptr Allocator)) (src (slice u8)) (lo i64) (hi i64) (op i64) (content (slice u8))] (-> EditOutcome)
+  (if (!= (col-of src lo) (primitive/cast i64 0))
+      (EBadInput "--insert-before/--insert-after only apply to top-level forms; to add a nested form, --replace the form that contains it")
+      (let [(mut sb) (sb-new a)]
+        (if (= op OP-BEFORE)
+            (do
+              (sb-push-str! (mut sb) content)
+              (sb-push-str! (mut sb) "\n\n")
+              (EText (splice a src lo lo (sb-str (load sb)))))
+            (do
+              (sb-push-str! (mut sb) "\n\n")
+              (sb-push-str! (mut sb) content)
+              (EText (splice a src hi hi (sb-str (load sb)))))))))
