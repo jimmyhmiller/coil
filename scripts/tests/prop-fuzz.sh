@@ -19,6 +19,13 @@
 # a forgotten ignorelist costs coverage rather than the run — but do not rely on
 # the belt when the suspenders are one line.)
 #
+# Two instrumentation kinds. `trace-pc-guard` answers "did this input reach
+# somewhere new" — the keep-or-discard signal. `trace-cmp` answers "what value was
+# the program looking for" — every integer comparison reports both operands, so a
+# failed `byte == 'F'` hands the mutator the 70 it needed instead of making it
+# guess. Edge coverage alone climbs a magic value one byte per round; with the
+# comparison dictionary the byte is simply known.
+#
 # -O1, not -O3: at higher optimization more branches collapse into branchless
 # selects, and a branch with no basic block of its own has no edge to discover.
 # Coverage-guided fuzzing wants the control flow left intact.
@@ -38,11 +45,19 @@ IR="$OUT/$BASE.ll"
 BIN="$OUT/$BASE"
 IGNORE="$OUT/sancov-ignore.txt"
 
-# Everything in coil.prop.cov, plus the allocator underneath it: instrumenting
-# either one puts an instrumented call inside the coverage callback's own path.
+# The WHOLE engine is excluded, not just the callbacks.
+#
+# The callbacks must be, or `cov-guard` calls `cov-guard`. The rest of `coil.prop`
+# is excluded for signal: the generators and the runner execute far more branches
+# and comparisons than the code under test, so instrumenting them fills the edge
+# map with the engine's own control flow and floods the comparison dictionary with
+# loop counters. `[*]` rather than a per-kind section so this holds for every
+# instrumentation kind, present and future.
 cat > "$IGNORE" <<'EOF'
-[trace-pc-guard]
-fun:coil.prop.cov.*
+[*]
+fun:coil.prop.*
+fun:coil.arraylist.*
+fun:coil.alloc.*
 EOF
 
 printf 'emitting IR    ... '
@@ -50,7 +65,7 @@ COIL_STDLIB_DIR=. $COIL emit-ir "$SRC" > "$IR"
 printf '%s (%s lines)\n' "$IR" "$(wc -l < "$IR" | tr -d ' ')"
 
 printf 'instrumenting  ... '
-"$CLANG" -fsanitize-coverage=trace-pc-guard \
+"$CLANG" -fsanitize-coverage=trace-pc-guard,trace-cmp \
          -fsanitize-coverage-ignorelist="$IGNORE" \
          -O1 -Wno-override-module \
          "$IR" -o "$BIN"

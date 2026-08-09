@@ -714,9 +714,20 @@ the crash isolation and the database all apply unchanged — a fuzz finding is j
 a failing tape, so it minimizes and replays like any other.
 
 **Measured**, on `tests/prop/demos/fuzz_demo.coil`: a four-byte magic value
-(`"FUZZ"`) behind four nested comparisons. Blind sampling needs ~95^4 ≈ 10^8
-cases by construction and finds nothing at 20 000. Coverage-guided finds it on
-5 seeds out of 5, in 6k–85k cases, and shrinks it to exactly `s = "FUZZ"`.
+(`"FUZZ"`) behind four nested comparisons, five seeds, cases until the bug is
+found. Blind sampling needs ~95^4 ≈ 10^8 cases by construction and finds nothing
+at 20 000; every guided run shrinks its finding to exactly `s = "FUZZ"`.
+
+| feedback | seeds solved | cases to failure | median |
+|---|---|---|---:|
+| blind (no feedback) | 0 of 5 | — | ~10^8 by construction |
+| edges, uniform corpus | 2 of 5 | none, 124k, 184k, none, 74k | — |
+| edges, frontier-biased corpus | 5 of 5 | 85k, 71k, 84k, 33k, 6k | 71k |
+| **+ comparison feedback** | **5 of 5** | 2.1k, 11.6k, 10.6k, 5.4k, 6.8k | **6.8k** |
+
+Ten times better again, and the mechanism is the one that scales: edge coverage
+climbs a magic value one byte per round, so the cost grows with its length, while
+a comparison that reports its operands makes each byte known rather than guessed.
 
 Three things had to be right, and each was wrong first:
 
@@ -737,10 +748,35 @@ Three things had to be right, and each was wrong first:
    with. Real parsers do work as they consume, which is what makes them
    fuzzable; the demo had to do the same.
 
-The remaining step is `trace-cmp` feedback, which is how libFuzzer solves a magic
-value in one step rather than one byte at a time — and the typed tape is
-unusually well placed for it, since a failed comparison can be fed straight back
-into the choice that produced the operand.
+### Comparison feedback
+
+`-fsanitize-coverage=trace-cmp` reports both operands of every integer
+comparison. The naive use is a dictionary of "values that were interesting
+somewhere", and it did not help — measured slightly WORSE than edges alone
+(median 100k against 71k), because the mutator still has to guess which of the
+input's choices should take the magic value, and because the runtime side of
+every comparison pours into the same table as noise.
+
+What works is storing the **pair**: "where you see 97, the program wanted 70".
+The mutator then asks for the counterpart of the value a choice already holds, so
+the input's own contents pick out which choice to change. That is Redqueen's
+input-to-state substitution, and on a tape it is unusually direct — a byte-level
+fuzzer has to locate the value's offset in the input, while here the mutator has
+already selected a `Choice` and that choice carries the range the substitution
+must fall within, so an out-of-range counterpart is dropped rather than clamped
+into a value that only looks like progress.
+
+Two details that cost measurements to find:
+
+- **Only failed comparisons are recorded.** An equality that already holds is not
+  something the search needs help reaching, and recording it evicts entries that
+  are.
+- **Recording is gated to the property call.** Every integer comparison in the
+  process reaches the callback — overwhelmingly the engine's own loop counters —
+  so the runner switches recording on around the property and off again.
+  Instrumentation ignorelists (`fun:coil.prop.*`) help but cannot finish the job:
+  sancov runs after inlining, so engine code inlined into the property's own
+  function is instrumented regardless of the list. Some noise is inherent.
 
 ---
 
