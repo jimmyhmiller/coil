@@ -5,17 +5,18 @@ it under Chez, Guile and Chibi, and under our implementation, and compares.
 
 Cases are numbered by the implementation phase that should make them pass:
 
-| case | phase | what it pins down |
-|---|---|---|
-| 01-core-eval | 1 | quote/if/lambda/define/set!/begin, varargs |
-| 02-tail-calls | 1 | R5RS 3.5 — unbounded tail calls in every tail position |
-| 03-callcc | 1 | full re-entrant call/cc (escape-only is NOT conformant) |
-| 04-dynamic-wind | 1 | wind/unwind, including escape via a continuation |
-| 05-derived-forms | 2 | let/let*/letrec/do/cond-=>/case/and/or/delay |
-| 06-quasiquote | 2 | splicing, vectors, nesting |
-| 07-syntax-rules | 4 | hygiene, nested ellipsis, trailing patterns |
-| 08-numbers | 5 | bignums, exact rationals, rounding |
-| 09-lists-strings | 3 | the standard-procedure surface |
+| case | what it pins down |
+|---|---|
+| 01-core-eval | quote/if/lambda/define/set!/begin, varargs |
+| 05-derived-forms | let/let*/letrec/do/cond-=>/case/and/or/delay |
+| 06-quasiquote | splicing, vectors, nesting |
+| 07-syntax-rules | hygiene, nested ellipsis, trailing patterns |
+| 08-numbers | bignums, exact rationals, rounding |
+| 09-lists-strings | the standard-procedure surface |
+
+Tail calls, `call/cc` and `dynamic-wind` are deliberately out of scope; their
+cases live in `../out-of-scope/` with the reasoning. Numbering is left with gaps
+so the two sets never collide.
 
 ## Writing a case
 

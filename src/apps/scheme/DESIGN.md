@@ -59,19 +59,32 @@ a cached object and compare by id.
 `case`, `and`/`or`, `do`, quasiquote: all ordinary macros over forms Coil already
 has. The standard procedures are ordinary functions over the runtime.
 
-**Hard, and worth being honest about up front:**
+**Out of scope, by decision** — the two R5RS mandates whose cost falls on *every*
+function the dialect emits, in exchange for features most programs never use:
 
-- **`call/cc`.** Full re-entrant continuations against a native stack is the one
-  R5RS mandate that has no cheap answer. Escape-only (`setjmp`-style) covers most
-  real use and is *not* conformant. This needs a decision, not a default.
-- **Proper tail calls (§3.5).** Coil guarantees *self*-tail calls; R5RS requires
-  unbounded tail calls in every tail position, including mutual recursion.
+- **Proper tail calls (§3.5).** Coil guarantees self-tail calls; R5RS wants
+  unbounded tail calls including mutual recursion. Programs here recurse on the
+  native stack and are bounded by it, like C.
+- **`call/cc` (§6.4) and `dynamic-wind`.** Re-entrant continuations against a
+  native stack means copying the stack or never returning. Not attempted.
+
+Both keep their conformance cases under `tests/scheme/out-of-scope/`, so the gap
+stays visible and measured rather than quietly forgotten. Escape-only
+continuations remain a possible *separate* feature; they are not a partial
+`call/cc`.
+
+Removing these two is what makes the dialect model cheap. Everything left is
+macros over forms Coil already has, plus a runtime.
+
+**Still hard:**
+
 - **`syntax-rules`.** Hygienic macros with nested ellipsis, and R5RS's literal
   rule (a rebound `else` must stop being the `else` keyword). Coil's macro system
-  is hygienic, so the question is how much of that hygiene we inherit versus
+  is already hygienic, so the open question is how much we inherit versus
   reimplement.
 - **The numeric tower.** R5RS requires exact integers of unbounded size, so
   fixnum overflow must promote to a bignum rather than wrap.
+- **GC rooting.** The one pillar that is genuinely unavoidable — see above.
 
 ## Testing
 
