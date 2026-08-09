@@ -1,120 +1,86 @@
-# A full R5RS Scheme in Coil
+# R5RS Scheme as a Coil dialect
 
-The goal: `(import "coil.scheme")` and you are writing Scheme. Not a toy subset —
-the real report, including the three things toy Schemes skip because each one
-dictates the architecture.
+    (import "coil.scheme")
 
-Built out of three Coil facilities, all of which already exist:
+    (define (fib n)
+      (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
 
-| pillar | what it does here |
+That is the whole idea. One import, and Scheme works — compiled to native code
+through Coil's ordinary pipeline.
+
+## There is no compiler and no interpreter
+
+**Scheme syntax is already Coil syntax.** Both are s-expressions read by the same
+reader; `(define (fib n) …)` parses today, unmodified. What is missing is not a
+frontend — it is the *bindings*:
+
+    $ coil check fib.coil
+    error: unknown top-level form 'define'
+
+So `define` is a macro. It expands to `defn`. `lambda` expands to a closure,
+`let` to a `let`, `cond` to nested `if`. Scheme's forms become Coil's forms at
+expansion time, and what reaches codegen is an ordinary Coil program.
+
+This is not a transpiler emitting text, and not an evaluator walking a tree. It
+is the language's existing macro system with an R5RS surface bound to it. Proven
+in ~6 lines: a `define` macro over `defn` compiles `(fib 32)` to native code that
+runs in **7 ms**, against Chez's 54 ms — because it *is* native code.
+
+## The three pillars
+
+| pillar | what it does |
 |---|---|
-| **libraries** | the Scheme runtime and the numeric tower are ordinary Coil modules under a `coil.scheme.*` namespace |
-| **metaprograms** | the Scheme *frontend* is a Coil transform: it reads `.scm`, and rewrites it into Coil. No Python. |
-| **garbage collection** | the transparent-GC transform inserts rooting; the collector traces continuations and environments |
+| **libraries** | the R5RS surface — `define`, `lambda`, `let`, `cond`, `car`/`cdr`, the standard procedures — as ordinary Coil macros and functions under `coil.scheme.*` |
+| **metaprograms** | make it a dialect: importing one module brings the whole surface into scope, and a transform lowers Scheme-shaped code to the GC'd form |
+| **GC** | Scheme values are heap-allocated and never explicitly freed, so a transform inserts the rooting and the collector reclaims |
 
-## Why the existing mini-scheme is not the starting point
+The lowering is **Scheme-shaped Coil → GC-managed Coil**. Not source → target.
 
-`src/apps/mini-scheme/` is good work and its numbers are real (~1.0–1.15× Chez on
-fib(30)). But it scores **0 of 9** on `tests/scheme/`, and not because of missing
-library procedures. Three R5RS mandates are architectural:
+## Why GC is the hard pillar
 
-1. **R5RS §3.5 requires unbounded tail calls.** All four existing variants are
-   recursive tree-walkers over the host stack. `(let loop () (loop))` must run
-   forever in constant space; theirs cannot.
-2. **R5RS §6.4 requires full re-entrant `call/cc`.** Not escape-only. A
-   continuation must be invocable many times, after its capture has returned.
-   With frames on the host stack this is not implementable.
-3. **`syntax-rules` requires hygiene**, which means identifiers cannot be bare
-   symbols — they carry scope. Every binding form depends on that representation.
+A Coil program frees explicitly. A Scheme program never frees anything, and its
+values outlive the frames that made them — a closure captures its environment, a
+list survives the function that consed it. So the dialect has to supply:
 
-Each is a rewrite, not an extension, and the fib(30) benchmark that vindicates
-the current design exercises none of them: no tail calls, no continuations, no
-macros. It is a good *performance* baseline and a misleading *architectural* one.
+- a heap and a collector (`heap.coil` — slab allocator, precise mark-sweep)
+- a value representation the collector can trace (`value.coil` — tagged words,
+  immediates for fixnums/booleans/nil/chars so they are never traced at all)
+- **rooting**, inserted automatically. This is what `gcauto2.coil` already does
+  for the old mini-scheme: rewrite the managed type, frame each function, root
+  managed parameters and let-bindings, and A-normalize call arguments so a value
+  from one allocation survives the next. The author writes none of it.
 
-## Architecture
+`symbol.coil` sits alongside: `eq?` on symbols must be O(1), so symbols intern to
+a cached object and compare by id.
 
-### Execution: a CEK-style explicit-continuation machine
+## What is genuinely hard, and what is not
 
-State is `(control, environment, kontinuation)` in a flat loop. Continuation
-frames are heap values.
+**Not hard** — most of R5RS. `define`, `lambda`, `let`/`let*`/`letrec`, `cond`,
+`case`, `and`/`or`, `do`, quasiquote: all ordinary macros over forms Coil already
+has. The standard procedures are ordinary functions over the runtime.
 
-This is chosen for one reason: **tail calls and call/cc both fall out by
-construction.** A tail call pushes no frame. `call/cc` reifies the current `k`,
-which is already a first-class heap value. `dynamic-wind` is a wind-list field on
-the continuation, so the least-common-ancestor unwind/rewind has somewhere to live
-from day one.
+**Hard, and worth being honest about up front:**
 
-Cost: every frame is an allocation, so expect 2–5× a naive tree-walker before
-frame reuse. That is the price of conformance and it is worth paying. The
-migration path if we want the performance back — CEK → bytecode VM → native
-closures with a heap continuation chain — preserves the continuation
-representation at every step, so nothing here has to be rebuilt.
-
-### Values: tagged immediates + boxed heap objects
-
-Keep what `sval.coil` converged on, which the repo's own measurements already
-vindicate: low bit 1 = immediate, `...01` fixnum, `...11` special. Immediates for
-fixnum, `'()`, `#t`/`#f`, char, EOF, the unspecified value, and the letrec hole.
-Heap objects carry a header tag: pair, symbol, string, vector, closure, primitive,
-port, promise, **continuation**, bignum, ratnum, flonum, environment.
-
-Making nil and booleans immediate took the existing implementation from 233M to
-21.5M allocations. That result carries over unchanged.
-
-### Numbers: a sum type with exactness, from the start
-
-R5RS §6.2.3 requires exact integers and rationals of "practically unlimited size
-and precision" — bignums are not optional, and `r4rstest.scm` detects their
-absence. Retrofitting exactness onto an `i64`/`f64` pair means touching every
-arithmetic dispatch, so the tower is a sum type from the first commit even while
-only the fixnum arm is implemented.
-
-### Identifiers are not symbols
-
-The single most important up-front commitment. An identifier carries scope
-information — initially it may wrap nothing but a symbol, but the type is opaque
-from day one. Hygiene and lexical addressing both need "who binds what," so the
-expander and the resolver are **one pass**, not two.
-
-### Environments: lexical addressing, with names retained
-
-Compile references to `(depth, index)` over frame vectors; keep a parallel vector
-of symbol names so `eval` and `interaction-environment` stay possible. Assignment
-conversion boxes only `set!`-ed variables, so closures can be flat.
-
-### Hygiene: explicit renaming
-
-`syntax-rules` implemented over an explicit-renaming substrate (`rename` /
-`compare`). Roughly 300 lines of machinery instead of psyntax's thousands, and
-`compare` gives R5RS's literal-matching rule directly — the rule that says a
-rebound `else` must stop acting like the `else` keyword, and the one nearly every
-naive implementation gets wrong by comparing symbol names.
-
-## Phases
-
-Each phase is independently testable against `tests/scheme/`.
-
-| phase | contents | gated by |
-|---|---|---|
-| 0 | reader, printer, data types | — |
-| **1** | **CEK core: tail calls, call/cc, dynamic-wind** | 01, 02, 03, 04 |
-| 2 | derived forms, hand-desugared | 05, 06 |
-| 3 | standard procedures, list/string/char/vector | 09 |
-| **4** | **`syntax-rules`**, then re-derive phase 2 from R5RS §7.3 | 07 |
-| 5 | numeric tower: bignums, rationals, exactness | 08 |
-| 6 | ports, `eval`, environments | — |
-| 7 | conformance grind against `r4rstest.scm` | all |
-
-Phase 4's acid test: delete the hand-written desugarings and re-derive `let`,
-`cond`, `case`, `do` and `quasiquote` from the report's own `syntax-rules`
-definitions. If those work, the expander is right.
+- **`call/cc`.** Full re-entrant continuations against a native stack is the one
+  R5RS mandate that has no cheap answer. Escape-only (`setjmp`-style) covers most
+  real use and is *not* conformant. This needs a decision, not a default.
+- **Proper tail calls (§3.5).** Coil guarantees *self*-tail calls; R5RS requires
+  unbounded tail calls in every tail position, including mutual recursion.
+- **`syntax-rules`.** Hygienic macros with nested ellipsis, and R5RS's literal
+  rule (a rebound `else` must stop being the `else` keyword). Coil's macro system
+  is hygienic, so the question is how much of that hygiene we inherit versus
+  reimplement.
+- **The numeric tower.** R5RS requires exact integers of unbounded size, so
+  fixnum overflow must promote to a bignum rather than wrap.
 
 ## Testing
 
-`tests/scheme/run.py` — see `tests/scheme/cases/README.md`. Every case is voted
-three ways across Chez, Guile and Chibi; a case only counts when all three agree,
-because where they disagree R5RS left the corner open. `r4rstest.scm` (~677
-assertions) is the north star, fetched rather than vendored.
+`tests/scheme/run.py` — each case runs under Chez, Guile and Chibi and under our
+build, three-way voted; a case counts only where all three agree. `r4rstest.scm`
+(~677 assertions) is the north star. See `tests/scheme/cases/README.md` for the
+R5RS corners where conforming implementations legitimately differ.
 
-Tail-call and call/cc cases must run under a bounded stack (`ulimit -s`), or
-"constant space" is only ever "didn't crash on this machine."
+## Status
+
+Runtime pieces, tested: `value.coil` (6), `heap.coil` (5), `symbol.coil` (5).
+Next: bind the R5RS surface as macros and get the conformance cases moving.
