@@ -955,9 +955,15 @@ EOF
 # FAILS on the seed ('unknown flag --sanitize=address').
 rm -f "$T/sanobj.o"
 "$COIL" build "$T/asanstore.coil" --lib --sanitize=address -O0 -o "$T/sanobj.a" >/dev/null 2>&1
-nm "$T/sanobj.o" 2>/dev/null | grep -qE '__asan_report_store[0-9]+' \
-  && ok "--sanitize=address instruments ordinary stores" \
-  || bad "--sanitize=address store instrumentation" "no __asan_report_store* symbol in the emitted object"
+# ⚠ Capture, then match — never `nm … | grep -q`. `grep -q` exits at its first hit
+# and closes the pipe, `nm` takes SIGPIPE, and under `set -o pipefail` the pipeline
+# reports 141 even though the symbol was found. That made this check fail on a
+# healthy tree with the instrumentation plainly present in the object.
+sansyms=$(nm "$T/sanobj.o" 2>/dev/null)
+case "$sansyms" in
+  *__asan_report_store*) ok "--sanitize=address instruments ordinary stores" ;;
+  *) bad "--sanitize=address store instrumentation" "no __asan_report_store* symbol in the emitted object" ;;
+esac
 # Prove the host runtime initializes and observes that instrumentation too. This
 # catches toolchain/runtime regressions that an object-symbol check cannot, such as
 # Homebrew LLVM 21's macOS 26 hang in FindDynamicShadowStart.
@@ -975,9 +981,14 @@ fi
 # and WITHOUT the flag the SAME object has no ASan — proving the flag is what adds it.
 rm -f "$T/plainobj.o"
 "$COIL" build "$T/seven.coil" --lib -o "$T/plainobj.a" >/dev/null 2>&1
-nm "$T/plainobj.o" 2>/dev/null | grep -q asan \
-  && bad "a plain build must not be instrumented" "found __asan without --sanitize" \
-  || ok "no ASan symbols without --sanitize=address"
+# Same SIGPIPE hazard, and here it is worse: this is a NEGATIVE check, so a
+# pipeline that dies early would report "no ASan symbols" and pass while the
+# object was in fact instrumented.
+plainsyms=$(nm "$T/plainobj.o" 2>/dev/null)
+case "$plainsyms" in
+  *asan*) bad "a plain build must not be instrumented" "found __asan without --sanitize" ;;
+  *) ok "no ASan symbols without --sanitize=address" ;;
+esac
 # ASan needs the LLVM backend — the native arm64 backend is a clear error, never a silent
 # uninstrumented binary. FAILS on the seed ('unknown flag').
 expect_out "requires the LLVM backend" "--sanitize=address --backend arm64 is rejected" \
