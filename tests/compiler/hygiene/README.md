@@ -22,6 +22,7 @@ the expansion boundary, where the assembled form makes the distinction visible.
 | `user10.coil` | user trait named after a stdlib extern (`read`) | `5` |
 | `lib11.coil` / `user11.coil` | template pattern head collides with a defn name | `7 111` |
 | `user12.coil` | arity-directed fallback: bare `(read c)` under a `:use *` extern shadow | `5` |
+| `user13.coil` | explicit `(coil.io.read c)` — fallback must NOT apply | must FAIL to compile |
 
 The controls are as important as the failures: they show hygiene works without
 breaking the positions where a name is being defined rather than used.
@@ -73,4 +74,6 @@ ambiguous.
 Any other output is a real interaction regression. It must not be resolved by
 weakening the probe.
 
-Run: `coil run <user>.coil`, except `user4.coil` which is `coil test user4.coil`.
+Run: `coil run <user>.coil`, except `user4.coil` which is `coil test user4.coil`,
+and `user13.coil` which must FAIL to compile (the error must name both the
+extern and the trait).

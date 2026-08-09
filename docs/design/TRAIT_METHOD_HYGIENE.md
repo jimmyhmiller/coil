@@ -374,6 +374,16 @@ the exact property the tiering rules exist to prevent. Arity is syntactic,
 catches the whole POSIX-name collision class (extern and method arities almost
 never tie), and where they do tie the explicit spelling is one `::` away.
 
+The fallback applies **only to spellings the resolver qualified**. The
+resolver records, per call node id, whether the head was written bare (no
+module dot, no alias slash, no `Trait::` — resolve.coil's
+implicit-qualification map, same append-only latest-wins shape as comptime's
+res-map); the checker consults it before falling back. So `(read c)` may mean
+the method, while a hand-written `(coil.io.read c)` or `(io/read c)` named the
+function explicitly and stays a hard error (`user13`). Code that never passed
+the resolver's rewrite has no entry and defaults to explicit — fallback off,
+the conservative pre-fallback behavior.
+
 Also pinned while investigating (`user11`): match-arm pattern heads need NO
 binder repair — the checker strips qualifiers when matching variant names and
 selects by the matched value's type, so a hygiene-qualified pattern head
