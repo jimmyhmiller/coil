@@ -10,6 +10,13 @@ before writing Coil.
 
 - `coil build file.coil -o out` / `coil run file.coil` — single file.
 - `coil guide` — print the language guide.
+- ⚠ **The compiler finds its C driver through `llvm-config --bindir`, not `PATH`,
+  and `CC=` does not override it.** If a second `llvm-config` shadows the one you
+  expect (a hand-built `/usr/local/bin/llvm-config` beats apt's), builds link
+  against a *different* clang's runtime. It surfaces only in `gate-cli`'s
+  sanitizer checks, as `cannot find …/libclang_rt.asan.a` under a path naming an
+  LLVM version you never chose — which points nowhere near the cause. Check with
+  `llvm-config --bindir`, and put the right `bin` first on `PATH`.
 - `coil doc file.coil` — markdown for that module's `;;`-documented definitions
   (a `;;` block directly above a definition is its doc; a single `;` is not).
 - The compiler is **self-hosted** (written in Coil, in `src/compiler/`). During
