@@ -107,6 +107,11 @@ wait_jobs() {
   [ "$failed" = 0 ]
 }
 
+# Probe before building: a stage0 too old for this tree otherwise fails deep in
+# stage1 with an error that reads like a compiler bug. See stage0-check.sh.
+. "$(dirname "$0")/stage0-check.sh"
+stage0_check "$STAGE0" "$SEED" "$SRC" "${LF[@]}" || exit 1
+
 echo "=== stage1: stage0 builds the self-host compiler (default LLVM backend) ==="
 "$STAGE0"     build "$SRC" -o /tmp/coil-rb1                "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
 
@@ -126,6 +131,9 @@ launch coverage python3 scripts/oracle.py coverage
 launch runtime-arm64 python3 scripts/oracle.py runtime gate arm64 --compiler /tmp/coil-rb2
 launch cli ./scripts/compiler/oracle/gate-cli.sh /tmp/coil-rl2
 launch cimport ./scripts/compiler/oracle/gate-cimport.sh /tmp/coil-rl2
+# rebootstrap-linux.sh was this gate's ONLY caller, so on macOS it never ran at
+# all — which is how its fixture went stale for months without failing anything.
+launch target-os ./scripts/compiler/oracle/gate-target-os.sh /tmp/coil-rl2
 launch meta env COIL_META_SKIP_RUNTIME=1 python3 scripts/dev.py test meta --compiler /tmp/coil-rl2
 wait_jobs || exit 1
 if wait "$WASM_PID"; then

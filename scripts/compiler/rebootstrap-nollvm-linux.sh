@@ -51,6 +51,11 @@ if ldd "$STAGE0" 2>/dev/null | grep -qi llvm; then
            --link-flag -lstdc++ --link-flag -lm --link-flag -lpthread --link-flag -ldl)
 fi
 
+# Probe before building: a stage0 too old for this tree otherwise fails deep in
+# stage1 with an error that reads like a compiler bug. See stage0-check.sh.
+. "$(dirname "$0")/stage0-check.sh"
+stage0_check "$STAGE0" "$SEED" "$SRC" "${S1FLAGS[@]}" || exit 1
+
 echo "=== stage1: stage0 builds the LLVM-free compiler ==="
 "$STAGE0"     build "$SRC" -o /tmp/coil-nlx1 "${S1FLAGS[@]}"  || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it with the x64 backend ==="

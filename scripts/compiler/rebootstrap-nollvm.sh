@@ -42,6 +42,11 @@ else echo "no stage0: need a committed $SEED (or set STAGE0=/path/to/coil)"; exi
 fi
 echo "stage0 = $STAGE0"
 
+# Probe before building: a stage0 too old for this tree otherwise fails deep in
+# stage1 with an error that reads like a compiler bug. See stage0-check.sh.
+. "$(dirname "$0")/stage0-check.sh"
+stage0_check "$STAGE0" "$SEED" "$SRC" || exit 1
+
 echo "=== stage1: stage0 builds the LLVM-free compiler ==="
 "$STAGE0"     build "$SRC" -o /tmp/coil-nl1                 || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it with --backend arm64 ==="
