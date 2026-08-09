@@ -28,6 +28,20 @@ before writing Coil.
   `build full` while diagnosing or iterating.** Run
   `python3 scripts/dev.py build full` only once for final release verification
   after focused tests and the bounded gate are green.
+- ⚠ **Two ways a shell gate reports a result it never established.** Both were
+  found live in `gate-cli.sh`/`gate-target-os.sh`, in checks that had been green
+  or red for months without meaning anything:
+  - **`grep -q` in a pipeline.** `grep -q` exits at its first match and closes the
+    pipe; a producer still writing (`nm`, `find`, `objdump`) takes SIGPIPE, and
+    under `set -o pipefail` the pipeline reports 141. Capture into a variable and
+    match with `case`. The failure is loud in a positive check (`… && ok || bad`)
+    and **silent in a negative one** (`… && bad || ok`), where "the pipe died"
+    reads identically to "the thing is absent" — such a check can never fail.
+  - **Absence tests with no haystack.** Before concluding a string is missing,
+    prove the output exists: `coil emit-ir` writes diagnostics to **stdout** and
+    exits non-zero, so a failed build yields a few hundred bytes that trivially
+    lack whatever you grepped for. Check the exit status, and sniff for something
+    that must be present (e.g. `target datalayout`).
 - The snapshot gates use small, stage-specific fixtures listed in
   `scripts/oracle.py::STAGE_INPUTS`, plus curated negative and diagnostic fixtures.
   Broad application and standard-library coverage belongs to the runtime and CLI gates.
