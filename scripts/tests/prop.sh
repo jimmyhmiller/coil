@@ -1,15 +1,19 @@
 #!/bin/sh
 # Run the whole property-testing suite against the stdlib IN THIS CHECKOUT.
 #
-# `coil` serves its own embedded standard library unless COIL_STDLIB_DIR points
-# at a checkout root, so without it these tests would silently exercise the
-# INSTALLED coil.prop and report green on a broken edit. That is the single
-# easiest way to waste an afternoon here, hence this script.
+# `coil` serves its own embedded standard library unless COIL_STDLIB_DIR points at
+# a checkout root, so without it these tests exercise the INSTALLED coil.prop and
+# report green on a broken edit. That is the easiest way to waste an afternoon
+# here, hence this script. (After `dev.py build full` the two are the same thing;
+# in between edits they are not.)
 #
 #   scripts/tests/prop.sh              # everything
 #   scripts/tests/prop.sh -q           # only the summary lines
 #
 # Exit status is the number of failing files (0 = all green).
+#
+# Deliberate failures live in tests/prop/demos/ and are NOT run here — see that
+# directory's README for what each one demonstrates and how to run it.
 
 set -u
 cd "$(dirname "$0")/../.." || exit 1
