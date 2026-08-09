@@ -122,6 +122,8 @@ def test(args: argparse.Namespace) -> None:
                 *(["--verbose"] if args.verbose else []))
     elif args.suite == "modernize-fast":
         test_modernize_fast(compiler)
+    elif args.suite == "structural":
+        test_structural(compiler)
 
 
 def _test_modernize_fast_serial(compiler: str) -> None:
@@ -461,6 +463,31 @@ def test_http(compiler: str) -> None:
     execute("sh", "scripts/tests/http-client-stream.sh", compiler)
 
 
+def test_structural(compiler: str) -> None:
+    """`coil balance` and `coil edit` — the structural editing tools.
+
+    These had no entry here at all, so `dev.py build full` verified a merge without
+    ever exercising either command. That was caught by someone reading the gate list
+    and noticing an absence, which is not a mechanism anyone should rely on twice.
+
+    `balance_fuzz` gets a wall-clock ceiling because each mutant may compile several
+    candidate repairs in child processes; an unbounded run once took a machine to
+    tens of gigabytes. The bound is the gate's, not the caller's, so it holds however
+    the gate is invoked.
+    """
+    execute(sys.executable, "scripts/tests/balance_cases.py", "--balance", compiler)
+    execute(sys.executable, "scripts/tests/edit_cases.py", "--edit", compiler)
+    execute(sys.executable, "scripts/tests/edit_roundtrip.py", "--edit", compiler, "--files", "30")
+    print("+ balance_fuzz (bounded)", flush=True)
+    fuzz = subprocess.run(
+        [sys.executable, "scripts/tests/balance_fuzz.py", "--balance", compiler,
+         "--files", "10", "--per-file", "10"],
+        cwd=ROOT, timeout=1800,
+    )
+    if fuzz.returncode != 0:
+        raise SystemExit("structural gate: balance_fuzz reported a divergence or a broken repair")
+
+
 def test_wasm(compiler: str) -> None:
     if not shutil.which("node") or not shutil.which("wasm-tools"):
         print("wasm gate: SKIP (requires node and wasm-tools)")
@@ -582,7 +609,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "http", "wasm", "meta", "interpreter", "metaprogramming", "modernize-fast"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "http", "wasm", "meta", "interpreter", "metaprogramming", "modernize-fast", "structural"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.set_defaults(func=test)
