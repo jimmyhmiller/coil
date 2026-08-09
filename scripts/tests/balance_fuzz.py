@@ -288,7 +288,14 @@ def main() -> int:
         f" {r[True]}/{r[True] + r[False]} correct repairs also carried one (false alarms)"
     )
 
-    return 1 if tally["balance"]["broken"] else 0
+    # Both buckets fail the gate. `broken` is obvious. `diverged` was informational
+    # when this was written, because indentation alone genuinely cannot always choose
+    # and a second reading could be defensible — but the tool no longer decides that
+    # way: when more than one balancing compiles it refuses. So a divergence now means
+    # the correct repair was missing from the candidate set, which is a bug every time.
+    # Leaving it advisory let a real one (a deleted `[` reported as a mismatch rather
+    # than a surplus, so opener insertion was never generated) pass as a green run.
+    return 1 if tally["balance"]["broken"] or tally["balance"]["diverged"] else 0
 
 
 def _diff(want: bytes, got: bytes) -> str:
