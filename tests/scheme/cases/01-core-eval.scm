@@ -1,0 +1,12 @@
+; Phase 1: the irreducible core — quote, if, lambda, define, set!, begin.
+(define x 41)
+(set! x (+ x 1))
+(display x) (newline)
+(display (if #f #f 'unspecified-is-not-compared)) (newline)
+(display ((lambda (a b) (* a b)) 6 7)) (newline)
+(define (f . rest) rest)
+(display (f 1 2 3)) (newline)
+(define (g a . rest) (list a rest))
+(display (g 1 2 3)) (newline)
+(display (quote (a b c))) (newline)
+(begin (display "seq") (newline))
