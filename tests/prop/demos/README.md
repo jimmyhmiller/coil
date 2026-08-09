@@ -17,6 +17,7 @@ COIL_STDLIB_DIR=. coil test tests/prop/demos/shrink_demo.coil
 | `crash_demo.coil` | a property that **dies from a signal** is still minimized: the run forks, bisects to the case that killed the child, and shrinks with each candidate in its own child | `a = 10`, "the property CRASHED on this input (signal 11)" |
 | `hang_demo.coil` | a property that **never finishes** is minimized the same way, via the watchdog | `a = 10`…`12`, "the property NEVER FINISHED on this input" — run with `COIL_PBT_TIMEOUT=3 COIL_PBT_CANDIDATE_TIMEOUT=1`, and expect it to take a minute: each candidate costs its whole timeout |
 | `target_demo.coil` | `prop-target!` reaching an input uniform sampling never would (a byte list summing past 12000) | a long list of large bytes, found in ~3 000 cases |
+| `memory_bug_demo.coil` | a real off-by-one read, found by generated inputs and minimized. **Needs `COIL_PBT_ALLOC=1 coil test --sanitize=address …`** — the arena hides small overflows from the sanitizer, and without the sanitizer the read is harmless | `heap-buffer-overflow … 0 bytes after 1-byte region`, `s = "a"` |
 | `sparse_precondition_demo.coil` | the runner refusing to be quietly useless when `assume` rejects almost everything | `WARNING: … rejected 192 of 200 generated cases (96%)`, and the property still passes |
 
 Two of these depend on defeating the optimizer, and both say so in a comment. An
