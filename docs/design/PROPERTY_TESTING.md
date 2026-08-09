@@ -710,6 +710,34 @@ whole system's steady-state footprint is a few hundred KB per worker plus the
 arena high-water mark — versus rose trees, which allocate shrink structure for
 every value on every passing case.
 
+### Measured
+
+`src/benchmarks/prop_bench.coil`, `-O3`, Apple M2 Max. Full write-up, including
+the reproduction commands and the variance discussion, in the benchmark file's
+own report.
+
+| what | cost | rate |
+|---|---:|---:|
+| `rng-next!` (xoshiro256++) | 1.16 ns | 862 M/s |
+| `rng-below!` (Lemire, bound 1000) | 1.33 ns | 748 M/s |
+| `draw-int!` — a draw **including tape recording** | 6.18 ns | 162 M/s |
+| a full property, two `i64` arguments | 13.96 ns | **71.6 M cases/s** |
+| a full property, `(ArrayList i64)` at the stock distribution | 70.3 ns | 14.2 M cases/s |
+| a full property, `(ArrayList i64)` of exactly 32 elements | 339 ns | 2.95 M cases/s |
+
+The design target was 10⁶ cases/s; the floor is seventy times that, and the
+default 200-case property costs ~3 µs of engine time. Recording is ~5 ns of the
+6.18 ns draw — the tape is not free, but it is the cheapest part of the system
+that anyone would notice. List generation spends ~10.3 ns per element, of which
+roughly 45% is the two span records; that is the price of being able to delete an
+element during shrinking, paid on every passing case, and it is the one number
+worth revisiting if generation ever becomes the bottleneck.
+
+Steady state was verified directly rather than assumed: over 1 000 000 cases the
+tape, span-table and replay-buffer capacities are identical at case 1 000 and at
+case 1 000 000, and the arena returns to zero between cases. A million cases
+perform no allocation for any of them.
+
 ---
 
 ## 8. What it looks like to use

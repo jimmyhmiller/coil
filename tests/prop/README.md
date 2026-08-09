@@ -9,15 +9,17 @@ The suite is also the acceptance test for `coil.prop` itself. It is written the
 way a user writes a property suite — `(import "coil.prop" :use *)` plus the
 library under test, no generator registration, no shrinker — so anything that
 needed a workaround here is a defect in the system rather than in the test. Two
-did, and both are still open:
+did; one is fixed and one is a documented cost:
 
-- The hand-written `PropShow` impl for `Rec` mentions `Writer`, which
-  `coil.prop` does not reexport, so this file also has to
-  `(import "coil.io" :use *)`. A user writing their first `PropShow` impl will
-  hit that and have no way to guess the fix.
-- `coil.prop.derive` is not reachable through `coil.prop`, so the `Arbitrary`
-  impl for `Rec` is written out by hand. That is worth having as an
-  override-path test regardless, but it should not have been the only option.
+- `coil.prop.derive` was not reachable through `coil.prop`, so the `Arbitrary`
+  impl for `Rec` is written out by hand. `coil.prop` reexports it now, and
+  `(derive-arbitrary Rec)` would do; the hand-written impl stays because the
+  override path is worth testing.
+- A hand-written `PropShow` impl mentions `Writer`, which lives in `coil.io`, so
+  such a file needs `(import "coil.io" :as io)` and an `(io/Writer)` in the
+  signature. `coil.prop` deliberately does not reexport `coil.io`: it would put
+  `print-str`, `stdout` and a dozen other everyday names into every property
+  file's scope and collide with anyone who imports `coil.io` themselves.
 
 The other files in this directory test `coil.prop`'s own machinery (the tape,
 the shrink passes, the combinators, the example database). This README covers

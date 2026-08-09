@@ -860,12 +860,22 @@ asks the runner to hill-climb toward a number instead of sampling uniformly, and
 `draw-len!`, `arb-string`, …) when a type's default distribution is wrong for one
 property.
 
-Override generation per type with a trait impl — the most specific one wins, so
-`(impl Arbitrary (ArrayList u8))` can produce realistic payloads while every other
-list keeps the generic impl:
+Derive both halves for your own types — `(derive-arbitrary T)` / `(derive-show T)`
+for a struct, `(derive-arbitrary-sum T)` / `(derive-show-sum T)` for a sum
+(recursive sums terminate on a fuel budget and shrink toward the first-declared
+variant, so declare the base case first).
+
+Or override generation per type with a trait impl — the most specific one wins,
+so `(impl Arbitrary (ArrayList u8))` can produce realistic payloads while every
+other list keeps the generic impl:
 
     (impl Arbitrary Email
       (arbitrary [(out (mut Email)) (s (ptr Source))] (-> i64) …))
+
+⚠ A hand-written `PropShow` impl names `Writer`, which lives in `coil.io` —
+`coil.prop` does not reexport that module (it would put `print-str`, `stdout` and
+friends into every property file), so add `(import "coil.io" :as io)` and write
+`(w (ptr io/Writer))`.
 
 A property that **crashes or hangs** is minimized too, not just one that returns
 false: generation runs in a forked child, the runner bisects to the case that
