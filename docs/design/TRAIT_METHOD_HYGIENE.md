@@ -355,12 +355,37 @@ pairing (`sug-clause-style?`) stopped matching. `sug-head-display` now measures
 the verbatim spelling emission will actually produce. Caught by gate-cli's
 "lint --fix result is fmt-clean" check.
 
-### 10.3 Verification
+### 10.3 The arity-directed fallback (follow-up to 10.2)
 
-- `tests/compiler/hygiene/` — ten pairs, see its README. `user6` (derive binder),
-  `user7` (spliced binder + body-reference control), `user8` (library trait,
-  competing local trait), `user9` (generated deftrait), `user10` (extern-name
-  collision) discriminate the fix in both directions.
+The extern-hijack guard left a usability gap in the other direction: with
+`:use *` of coil.io in scope, a module's own `(read c)` resolver-qualified to
+the 3-arg extern and hard-errored, even though the module's trait declares a
+1-arg `read` that obviously fits — and `Read::read` was the only way out.
+
+Resolution now arbitrates by ARITY, deliberately not by type. The function
+still wins whenever its arity fits, so no compiling program changes meaning;
+only calls that were hard arity errors fall back to the method reading, and
+which trait (and whether it is really in scope) is judged by the ordinary
+method-resolution path. When NEITHER arity fits, the error names both
+candidates and suggests the `Trait::method` spelling. Full type-directed
+selection was considered and rejected: it couples name resolution to type
+checking and reintroduces "what a name means depends on what you pass it" —
+the exact property the tiering rules exist to prevent. Arity is syntactic,
+catches the whole POSIX-name collision class (extern and method arities almost
+never tie), and where they do tie the explicit spelling is one `::` away.
+
+Also pinned while investigating (`user11`): match-arm pattern heads need NO
+binder repair — the checker strips qualifiers when matching variant names and
+selects by the matched value's type, so a hygiene-qualified pattern head
+behaves exactly like a bare one.
+
+### 10.4 Verification
+
+- `tests/compiler/hygiene/` — twelve pairs, see its README. `user6` (derive
+  binder), `user7` (spliced binder + body-reference control), `user8` (library
+  trait, competing local trait), `user9` (generated deftrait), `user10`
+  (extern-name collision), `user11` (pattern-head tolerance), `user12`
+  (arity-directed fallback) discriminate the fix in both directions.
 - Linux gates: linux-ir 8/8, gate-run 58/58, gate-cli PASS, gate-target-os PASS,
   stage gates read/ast/load/resolved/checked/expand/mono/x86 all byte-exact
   (no re-blessing needed beyond what `78e599e` had already blessed), coverage

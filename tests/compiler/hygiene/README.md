@@ -21,6 +21,7 @@ the expansion boundary, where the assembled form makes the distinction visible.
 | `lib9.coil` / `user9.coil` | macro-GENERATED deftrait binder | `21` |
 | `user10.coil` | user trait named after a stdlib extern (`read`) | `5` |
 | `lib11.coil` / `user11.coil` | template pattern head collides with a defn name | `7 111` |
+| `user12.coil` | arity-directed fallback: bare `(read c)` under a `:use *` extern shadow | `5` |
 
 The controls are as important as the failures: they show hygiene works without
 breaking the positions where a name is being defined rather than used.
