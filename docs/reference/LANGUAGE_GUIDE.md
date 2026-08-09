@@ -17,6 +17,7 @@ inside it, so `coil` and every `(import "…")` below work from any directory.
     coil build file.coil --target wasm32-unknown-unknown -o out.wasm
     coil run                             # build+run the ./Coil.toml project
     coil test                            # discover and run project test suites
+    coil fuzz  file.coil -n 100000       # run its properties under coverage guidance
     coil check                           # check every project target graph
     coil verify                          # fmt + lint + check + native build + test
     coil run -- arg1 arg2                # forward args to the program
@@ -877,7 +878,7 @@ other list keeps the generic impl:
 friends into every property file), so add `(import "coil.io" :as io)` and write
 `(w (ptr io/Writer))`.
 
-**Coverage-guided fuzzing.** `scripts/tests/prop-fuzz.sh FILE.coil [iterations]`
+**Coverage-guided fuzzing.** `coil fuzz FILE.coil [-n N]`
 rebuilds a property file with edge instrumentation (`coil emit-ir` piped through
 clang's `-fsanitize-coverage`; the callbacks are ordinary Coil functions in
 `coil.prop.cov`, so an ordinary build is unaffected) and mutates a corpus of

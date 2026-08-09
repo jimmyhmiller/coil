@@ -684,7 +684,7 @@ mutant is a well-formed value of the type — no wasted executions on inputs tha
 fail to parse. Same properties, same generators, no new user-facing concepts.
 
 **Built** — `coil.prop.cov` plus a fuzz phase in the runner, reached with
-`scripts/tests/prop-fuzz.sh FILE.coil [iterations]`. It was originally scoped as
+`coil fuzz FILE.coil [-n N]`. It was originally scoped as
 a compiler-side change — teaching the driver to pass `-fsanitize-coverage` — and
 it turns out not to need one, because two pieces already exist:
 
