@@ -80,7 +80,11 @@ def main() -> int:
 
         if driver.is_file():
             exe = BENCH / f".{case.stem}.bin"
-            build = subprocess.run([str(COIL), "build", str(driver), "-o", str(exe)],
+            # -lm: the Linux link line (scripts/compiler/llvm-link-flags.sh) does
+            # not include libm, so anything reaching `floor` fails to link. Inert
+            # on macOS, where libm is part of libSystem.
+            build = subprocess.run([str(COIL), "build", str(driver), "-o", str(exe),
+                                    "--link-flag", "-lm"],
                                    capture_output=True, text=True, timeout=600)
             results["coil"] = time_run([str(exe)], args.repeat) if build.returncode == 0 else None
         else:

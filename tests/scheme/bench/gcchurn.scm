@@ -19,34 +19,38 @@
 ; reachable, the fold reads a freed cell and the total comes out wrong (or the
 ; program does not finish) rather than merely slow.
 ;
-; ⚠⚠ THERE IS DELIBERATELY NO gcchurn.coil, AND THAT ABSENCE IS THE RESULT.
+; ── HISTORY: THIS CASE ONCE HAD NO .coil DRIVER, AND THE ABSENCE WAS THE RESULT
 ;
-; We cannot run this case at all. Our collector frees values that are still
-; reachable, because the shadow stack it traces is never populated: heap.coil
-; documents a "GC transform" that emits `gc-root` around managed values, but no
-; such transform is registered for `coil.scheme` — the only registered transform
-; is the dialect rewriter, and it emits no roots. `mark-roots` therefore walks an
-; empty root set and the sweep reclaims the entire live heap.
-;
-; Reduced to the smallest demonstration, in ordinary Coil against heap.coil
-; directly — build 1000 pairs, hold them in a live local, collect, re-sum:
+; It could not be run at all. The collector freed values that were still
+; reachable, because the shadow stack it traces was never populated: heap.coil
+; documented a "GC transform" emitting `gc-root` around managed values, and no
+; such transform existed. `mark-roots` walked an empty root set and the sweep
+; reclaimed the entire live heap. Reduced to its smallest form — build 1000
+; pairs, hold them in a live local, collect, re-sum:
 ;
 ;     before collect: 1000
 ;     after  collect: 16058419951059495
 ;     gc-live=0 gc-collections=1
 ;
-; `gc-live=0` is the whole story: the collector found nothing live while a local
-; variable still referenced all 1000 pairs. In this benchmark the corrupted cells
-; chain back through the free list, so the fold does not merely return a wrong
-; total — it does not terminate. A 200 x 12,000 run was killed at 120 s having
-; produced nothing.
+; `gc-live=0` was the whole story: nothing live, while a local still referenced
+; all 1000 pairs. Here the corrupted cells chained through the free list, so the
+; fold did not merely return a wrong total — it did not terminate. A 200 x 12,000
+; run was killed at 120 s having produced nothing.
 ;
-; So the honest report for this row is a dash, not a number. The other three
-; cases are sized to stay under the 500,000-object threshold precisely so they
-; never collect, which is what makes THEIR numbers meaningful — and also what
-; makes them an allocation benchmark rather than a GC benchmark. Comparing our
-; mark-sweep against Chez's generational collector is the measurement this suite
-; cannot yet make, and printing a fabricated number here would hide that.
+; FIXED by src/apps/scheme/rooting.coil, which frames every Scheme procedure and
+; roots what must survive an allocation. gcchurn.coil now exists and agrees with
+; Chez (14401200000). The dash in the benchmark table was a real finding about the
+; collector rather than a property of this program — it is kept here because the
+; failure it describes is the one this whole case was built to expose.
+;
+; This remains the case the other three cannot make. They are sized so the live
+; set never crosses the 500,000-object threshold, which is what makes THEIR
+; numbers an allocation measurement rather than a GC one. Here the live set is a
+; single round's list, so nearly everything is garbage when a collection runs —
+; the shape most favourable to Chez's generational collector, whose minor
+; collection copies only survivors and does work proportional to what LIVES,
+; and least favourable to our mark-sweep, which walks every slab to rebuild the
+; free list and does work proportional to the HEAP.
 (define (build n acc)
   (if (< n 1) acc (build (- n 1) (cons n acc))))
 
