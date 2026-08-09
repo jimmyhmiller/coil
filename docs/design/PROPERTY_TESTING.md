@@ -906,6 +906,9 @@ standard library). Example: `src/examples/property-testing.coil`. Benchmarks:
 - **Coverage-guided fuzzing (§6.7) is not built.** It needs `-fsanitize-coverage`
   plumbing through the build, which is a compiler-side change, not a library one.
   The `Mutate` path the tape would need already exists in the targeted search.
+- **Parallelism is at the test-file level**, via `coil test --jobs N`, not
+  in-process across cases (§7). The splittable RNG that in-process workers would
+  need is built and tested (`rng-split!`); the worker pool is not.
 - **Normalization (§5.3 pass 10) is not built.** It costs ~30× for ~45% smaller
   counterexamples; the pass set that is built reaches the true minimum on every
   benchmark in `tests/prop/shrink_test.coil`.
