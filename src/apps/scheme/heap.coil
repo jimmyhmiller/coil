@@ -1,0 +1,174 @@
+(module coil.scheme.heap)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.scheme.value" :use *)
+
+;; The Scheme heap: fixed-size objects, bump-allocated out of big slabs, with a
+;; free list rebuilt by a linear sweep.
+;;
+;; Every object is the same size (an `Obj`), which is what makes this simple: no
+;; size classes, no fragmentation, and a sweep that walks a slab linearly instead
+;; of chasing a per-object list. The predecessor measured that linear sweep as the
+;; single biggest collector win — it removed both malloc/free from the hot path and
+;; the live-list threading that came with it.
+;;
+;; Collection is precise, not conservative: roots come from the shadow stack the
+;; GC transform maintains, so the tracer never guesses whether a word is a pointer.
+;; Immediates are skipped outright (see value.coil) — an immediate has a non-zero
+;; low tag and is never dereferenced.
+;;
+;; NOTE ON CONTINUATIONS. A CEK machine allocates a continuation frame per non-tail
+;; call, so unlike a tree-walker the collector is on the hot path and the frames it
+;; traces form a chain that many live values may share. `call/cc` makes that
+;; sharing explicit: a captured continuation keeps its whole chain reachable, and
+;; re-entering one revives it. The tracer must therefore treat a continuation as an
+;; ordinary object with three slots and follow them — which it does, because every
+;; object shape goes through the same three-slot trace.
+
+(extern malloc :cc c [i64] (-> (ptr u8)))
+
+;; Object size and slab size. 40 bytes = 5 i64 fields (tag, mark, a, b, c).
+(defn obj-size [] (-> i64) 40)
+;; 1M objects per slab. Big enough that slab allocation is rare, small enough that
+;; a program with a tiny live set does not commit hundreds of MB up front.
+(defn slab-bytes [] (-> i64) 41943040)
+
+; --- collector state --------------------------------------------------------
+(defn g-slabs [] (-> (ptr (array i64 4096))) (alloc/static (array i64 4096)))
+(defn g-nslabs [] (-> (ptr i64)) (alloc/static i64))
+(defn g-free [] (-> (ptr i64)) (alloc/static i64))    ; free-list head, 0 = empty
+(defn g-cur [] (-> (ptr i64)) (alloc/static i64))     ; bump cursor into the newest slab
+(defn g-end [] (-> (ptr i64)) (alloc/static i64))     ; end of the newest slab
+(defn g-live [] (-> (ptr i64)) (alloc/static i64))
+(defn g-peak [] (-> (ptr i64)) (alloc/static i64))
+(defn g-collections [] (-> (ptr i64)) (alloc/static i64))
+(defn g-total [] (-> (ptr i64)) (alloc/static i64))
+
+;; The shadow stack. The GC transform emits `gc-root`/`gc-sp`/`gc-sp-set!` around
+;; managed values so collection points always see a consistent root set — which is
+;; why no safepoint machinery is needed: a collection can only happen inside
+;; `allocate`, and the roots are correct there by construction.
+(defn g-roots [] (-> (ptr (array i64 1048576))) (alloc/static (array i64 1048576)))
+(defn g-rtop [] (-> (ptr i64)) (alloc/static i64))
+
+(defn gc-sp [] (-> i64) (primitive/load (g-rtop)))
+(defn gc-sp-set! [(n i64)] (-> i64) (primitive/store! (g-rtop) n) 0)
+(defn gc-root [(v i64)] (-> i64)
+  (let [t (primitive/load (g-rtop))]
+    (primitive/store! (primitive/index (g-roots) t) v)
+    (primitive/store! (g-rtop) (+ t 1))
+    0))
+
+;; Permanent roots: the global environment and the symbol table live for the whole
+;; program, so they are traced from a fixed cell rather than the shadow stack.
+(defn g-globals [] (-> (ptr i64)) (alloc/static i64))
+(defn set-globals! [(v i64)] (-> i64) (primitive/store! (g-globals) v) 0)
+(defn globals [] (-> i64) (primitive/load (g-globals)))
+
+; --- mark -------------------------------------------------------------------
+;; Trace one object. Every shape has the same three slots, so a pair, a closure and
+;; a continuation frame all trace through this one path — which is what keeps the
+;; collector honest as new object kinds are added.
+(defn mark [(v i64)] (-> i64)
+  (if (not (heap? v)) 0                      ; immediates are never traced
+    (if (= v 0) 0                            ; null
+      (let [o (obj-of v)]
+        (if (= (primitive/load (primitive/field o mark)) 1) 0   ; already seen: stop, cycles are fine
+          (do
+            (primitive/store! (primitive/field o mark) 1)
+            (mark (primitive/load (primitive/field o a)))
+            (mark (primitive/load (primitive/field o b)))
+            (mark (primitive/load (primitive/field o c)))
+            0))))))
+
+(defn mark-roots [] (-> i64)
+  (mark (globals))
+  (let [top (primitive/load (g-rtop))]
+    (for [i 0 top]
+      (mark (primitive/load (primitive/index (g-roots) i)))))
+  0)
+
+; --- sweep ------------------------------------------------------------------
+;; Walk one slab linearly: unmark what survived, and thread everything else onto
+;; the free list. Linear because the objects are uniform — no list to chase, and
+;; the access pattern is cache-friendly.
+(defn sweep-slab [(base i64) (limit i64)] (-> i64)
+  (let [(mut p) base]
+    (loop
+      (if (>= (primitive/load p) limit) (break)
+        (let [o (primitive/cast (ptr Obj) (primitive/load p))]
+          (if (= (primitive/load (primitive/field o mark)) 1)
+              (do (primitive/store! (primitive/field o mark) 0)
+                  (primitive/store! (g-live) (+ (primitive/load (g-live)) 1)) 0)
+            ; free: reuse the `a` slot as the free-list link
+            (do (primitive/store! (primitive/field o a) (primitive/load (g-free)))
+                (primitive/store! (g-free) (primitive/cast i64 o)) 0))
+          (primitive/store! p (+ (primitive/load p) 40)))))
+    0))
+
+(defn collect [] (-> i64)
+  ; peak is sampled before the sweep, when the live set is at its largest
+  (if (> (primitive/load (g-live)) (primitive/load (g-peak)))
+      (primitive/store! (g-peak) (primitive/load (g-live))) 0)
+  (mark-roots)
+  (primitive/store! (g-free) 0)     ; the free list is rebuilt entirely by the sweep
+  (primitive/store! (g-live) 0)     ; and live is recounted by it
+  (let [n (primitive/load (g-nslabs)) cur (primitive/load (g-cur))]
+    (for [i 0 n]
+      (let [base (primitive/load (primitive/index (g-slabs) i))]
+        ; the newest slab is only filled up to the bump cursor; the rest are full
+        (sweep-slab base (if (= i (- n 1)) cur (+ base 41943040))))))
+  (primitive/store! (g-collections) (+ (primitive/load (g-collections)) 1))
+  0)
+
+; --- allocate ---------------------------------------------------------------
+;; Collect when the live set crosses the threshold. Sized so a program with a small
+;; working set never collects at all, and a heavy allocator collects rarely enough
+;; that mark cost stays a small share of runtime.
+(defn gc-threshold [] (-> i64) 500000)
+
+(defn new-slab [] (-> i64)
+  (let [s (primitive/cast i64 (malloc 41943040))
+        n (primitive/load (g-nslabs))]
+    (primitive/store! (primitive/index (g-slabs) n) s)
+    (primitive/store! (g-nslabs) (+ n 1))
+    (primitive/store! (g-cur) (+ s 40))
+    (primitive/store! (g-end) (+ s 41943040))
+    s))
+
+;; The only place a collection can be triggered. Everything the transform roots is
+;; rooted precisely because of this: an allocation is the one point where the
+;; machine can lose a value it still needs.
+(defn allocate [(tag i64) (a i64) (b i64) (c i64)] (-> i64)
+  (if (>= (primitive/load (g-live)) 500000) (collect) 0)
+  (let [fl (primitive/load (g-free))
+        addr (if (not (= fl 0))
+                 (do (primitive/store! (g-free)
+                                       (primitive/load (primitive/field (primitive/cast (ptr Obj) fl) a)))
+                     fl)
+               (let [cur (primitive/load (g-cur))]
+                 (if (< cur (primitive/load (g-end)))
+                     (do (primitive/store! (g-cur) (+ cur 40)) cur)
+                   (new-slab))))
+        o (primitive/cast (ptr Obj) addr)]
+    (primitive/store! (primitive/field o tag) tag)
+    (primitive/store! (primitive/field o mark) 0)
+    (primitive/store! (primitive/field o a) a)
+    (primitive/store! (primitive/field o b) b)
+    (primitive/store! (primitive/field o c) c)
+    (primitive/store! (g-total) (+ (primitive/load (g-total)) 1))
+    (primitive/store! (g-live) (+ (primitive/load (g-live)) 1))
+    addr))
+
+; --- constructors -----------------------------------------------------------
+(defn cons [(a i64) (d i64)] (-> i64) (allocate (tag-pair) a d 0))
+(defn car [(v i64)] (-> i64) (primitive/load (primitive/field (obj-of v) a)))
+(defn cdr [(v i64)] (-> i64) (primitive/load (primitive/field (obj-of v) b)))
+(defn set-car! [(v i64) (x i64)] (-> i64) (primitive/store! (primitive/field (obj-of v) a) x) 0)
+(defn set-cdr! [(v i64) (x i64)] (-> i64) (primitive/store! (primitive/field (obj-of v) b) x) 0)
+
+; --- statistics -------------------------------------------------------------
+(defn gc-live [] (-> i64) (primitive/load (g-live)))
+(defn gc-peak [] (-> i64) (primitive/load (g-peak)))
+(defn gc-collections [] (-> i64) (primitive/load (g-collections)))
+(defn gc-total [] (-> i64) (primitive/load (g-total)))
