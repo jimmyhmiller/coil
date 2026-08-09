@@ -16,6 +16,32 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ORACLE = ROOT / "tests/compiler/oracle"
 TARGET_X86 = "x86_64-apple-macosx11.0.0"
+
+# Stages whose output is host-sensitive, and the triple they are pinned to.
+#
+# These dumps are meant to be target-INDEPENDENT — they compare frontend output,
+# not machine code — but they are not, because src/stdlib/os.coil selects the
+# errno accessor (`__error` on darwin, `__errno_location` elsewhere) with an
+# expression macro on `target-os`, and io.coil's staged printers pull os-errno
+# into every program. Emitted natively, the snapshot records whichever host ran
+# it last: the macOS-blessed references differ from a Linux run in exactly that
+# one region, out of 23,121 tokens.
+#
+# Pinning a triple makes the independence real rather than aspirational — both
+# hosts then produce identical bytes from one shared reference, with no
+# per-platform duplication. Linux, because that is the platform that had no
+# representation at all. Requires the compiler to apply --target in these dumps.
+TARGET_PINNED = "x86_64-pc-linux-gnu"
+PINNED_STAGES = ("checked", "expand", "mono", "resolved")
+
+
+def stage_extra(stage: str) -> list[str]:
+    """The --target arguments a stage's dump must be invoked with."""
+    if stage == "x86":
+        return ["--target", TARGET_X86]
+    if stage in PINNED_STAGES:
+        return ["--target", TARGET_PINNED]
+    return shlex.split(os.environ.get("COIL_SELF_ARGS", ""))
 STAGES = ("read", "ast", "load", "resolved", "checked", "expand", "mono", "ir", "diag", "x86", "full")
 COMMAND = {
     "read": "dump-read", "ast": "dump-ast", "load": "dump-load",
@@ -182,7 +208,9 @@ def snapshot(compiler: Path, stage: str) -> int:
         if stage == "checked":
             expected_failures = {rel(path) for path in sorted((ORACLE / "checked/fixtures").glob("*.coil"))}
             inputs += sorted(expected_failures)
-        accepted = snapshot_simple(compiler, stage, inputs, expected_failures=expected_failures)
+        # Same --target as the gate, or blessing and gating disagree by construction.
+        accepted = snapshot_simple(compiler, stage, inputs, expected_failures=expected_failures,
+                                   extra=tuple(stage_extra(stage)))
     elif stage == "full":
         accepted = snapshot_simple(compiler, stage, STAGE_INPUTS[stage],
                                    command=os.environ.get("COIL_IR_CMD", "emit-ir"))
@@ -242,7 +270,7 @@ def gate(compiler: Path, stage: str, verbose: bool) -> int:
         return gate_diag(compiler, verbose)
     base = ORACLE if stage == "read" else ORACLE / stage
     suffix = ".dump"
-    extra = ["--target", TARGET_X86] if stage == "x86" else shlex.split(os.environ.get("COIL_SELF_ARGS", ""))
+    extra = stage_extra(stage)
     failures: list[str] = []
     passed = 0
     for source in read_list(base / "corpus.txt"):
