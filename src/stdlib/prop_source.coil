@@ -1,0 +1,575 @@
+(module coil.prop.source)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.region" :use *)
+(import "coil.prop.rng" :use *)
+; THE TAPE — the one data structure the whole property-testing system is built on.
+;
+; A generator never sees randomness directly. It asks a `Source` for a *choice*
+; (an integer in a range, a boolean, a float), and the Source both answers and
+; RECORDS the answer on a flat tape. A value is therefore a pure function of the
+; tape, which is what makes everything else possible:
+;
+;   * shrinking = edit the tape, re-run the generator, keep the edit if the
+;     property still fails. Invariants the generator establishes survive by
+;     construction, because the only way to make a value is to run the generator.
+;   * replay    = keep the tape (or just the seed) and re-run.
+;   * fuzzing   = mutate the tape; every mutant is a well-formed value.
+;   * corpora   = a tape is a portable, comparable artifact.
+;
+; This is Hypothesis's "internal shrinking" over its *typed* choice sequence
+; (choices carry their constraints, so shrinking is a numeric move rather than
+; byte surgery), with the span tree that makes structural passes possible.
+;
+; Two things every draw guarantees, and the shrinker relies on both:
+;   1. THE MINIMAL TAPE IS ALWAYS VALID. An empty tape generates the minimal value
+;      of every type: shrinking always has a floor it can reach.
+;   2. REPLAY IS TOTAL. If a shrunk tape is too short, or a choice no longer fits
+;      its constraints, the draw synthesizes the minimal legal value instead of
+;      failing. Every edit is therefore a legal candidate, never a crash.
+
+; ---------------------------------------------------------------- choice kinds
+(const CK-INT 0)
+(const CK-BOOL 1)
+(const CK-FLOAT 2)
+(const CK-TAG 3)  ; a sum-type variant index — shrinks toward variant 0
+(const CK-LEN 4)  ; a collection length — deletion passes key off these
+
+; span kinds (what a structural shrink pass may do with the span)
+(const SPAN-PLAIN 0)
+(const SPAN-ELEM 1)  ; one element of a collection: deletable
+(const SPAN-NODE 2)  ; a node of a recursive structure: hoistable
+(const SPAN-ATOMIC 3)  ; user-marked: never delete, never hoist
+
+; source status
+(const ST-OK 0)
+(const ST-OVERRUN 1)  ; the tape ran out / a choice no longer fit; minima were used
+(const ST-REJECTED 2)  ; an `assume` failed: this case is not a test, it is a miss
+(const ST-EXHAUSTED 3)  ; the choice budget was hit: the generator is unbounded
+
+;; One recorded decision. Flat POD: a tape is an array, cloning it is a copy, and
+;; comparing two tapes is a loop. The constraints (`lo`/`hi`/`origin`) travel WITH
+;; the choice so a shrink pass can move a value without knowing what it means —
+;; that is the whole point of a *typed* choice sequence.
+(defstruct Choice
+  [(kind i64)
+   (flags i64)
+   (span i64)  ; index into the span table (-1 = none)
+   (lo i64)
+   (hi i64)
+   (origin i64)  ; the value this choice shrinks TOWARD (not necessarily 0)
+   (value i64)])
+
+;; A structural region of the tape: everything one generator drew.
+(defstruct Span
+  [(name (slice u8))
+   (start i64)  ; first choice index
+   (end i64)  ; one past the last (-1 while open)
+   (parent i64)
+   (depth i64)
+   (kind i64)])
+
+(defstruct Source
+  [(rng Rng)
+   (mode i64)  ; 0 = generate, 1 = replay
+   (tape (ArrayList Choice))  ; what this run actually used — the canonical tape
+   (replay (ArrayList Choice))  ; the tape being replayed (mode 1)
+   (spans (ArrayList Span))
+   (cursor i64)
+   (cur-span i64)
+   (fuel i64)  ; size budget; recursive generators spend it
+   (size i64)  ; the case's size parameter (ramps over a run)
+   (status i64)
+   (mem (ptr Allocator))  ; long-lived: tape + spans
+   (arena (ptr Allocator))  ; per-case: everything the generators allocate
+   (arena-state (ptr Arena))
+   (alloc-mode i64)  ; 0 = arena (fast), 1 = tracked (one real allocation per value)
+   (region (ptr Region))  ; the tracker, in mode 1
+   (max-choices i64)
+   (edge-bias i64)  ; 1 in N draws comes from the edge-case pool (0 = off)
+   (swarm i64)  ; feature mask for this case (swarm testing)
+   (target f64)  ; the targeted-PBT objective for this case
+   (targeted bool)])
+
+; ------------------------------------------------------------------ lifecycle
+
+;; Create a Source. `arena-cap` bytes back the per-case arena; generated values
+;; live there and are reclaimed by a pointer rewind between cases, so generation
+;; does no malloc in steady state.
+;;
+;; ⚠ THE ARENA GETS ITS OWN `Allocator` CELL, and that is not a detail.
+;; `arena-over-buffer` writes the arena's vtable INTO the `Allocator` struct it is
+;; handed. The first version of this passed `mem` — which is `(malloc-allocator)`,
+;; a per-call-site STATIC — so the arena and the process-wide malloc allocator
+;; became the same three words of memory. Two failures follow, and both are the
+;; kind that survive a green test run:
+;;
+;;   * the tape, the replay buffer and the span table are allocated from `mem`,
+;;     which by then IS the arena, so `source-reset!`'s rewind hands the tape's
+;;     own bytes back out as the next case's generated values. A `Choice.hi`
+;;     reappears as a `Span.parent` and `span-open!` indexes the span table with
+;;     garbage.
+;;   * `malloc-allocator` re-initializes its static on EVERY call, so any later
+;;     call anywhere in the program silently converts the Source's arena back into
+;;     malloc — after which generated values are malloc'd and never freed, the
+;;     arena sits unused, and the leak looks exactly like steady state.
+;;
+;; Allocate the Arena, its Allocator and the backing buffer from `mem` FIRST,
+;; while `mem` is still `mem`, then build the arena into the private cell.
+(defn source-new [(mem (ptr Allocator)) (arena-cap i64) (seed i64)] (-> (ptr Source))
+  (let [s (unwrap-ptr [Source] (create [Source] mem))
+        ar (unwrap-ptr [Arena] (create [Arena] mem))
+        acell (unwrap-ptr [Allocator] (create [Allocator] mem))
+        buf (unwrap-ptr [i8] (alloc-slice [i8] mem arena-cap))
+        a (arena-over-buffer ar acell buf arena-cap)]
+    (store! (field s rng) (rng-seed seed))
+    (store! (field s mode) 0)
+    (store! (field s tape) (al-new [Choice] mem))
+    (store! (field s replay) (al-new [Choice] mem))
+    (store! (field s spans) (al-new [Span] mem))
+    (store! (field s cursor) 0)
+    (store! (field s cur-span) -1)
+    (store! (field s fuel) 30)
+    (store! (field s size) 30)
+    (store! (field s status) ST-OK)
+    (store! (field s mem) mem)
+    (store! (field s arena) a)
+    (store! (field s arena-state) ar)
+    (store! (field s alloc-mode) 0)
+    (store! (field s region) (primitive/cast (ptr Region) 0))
+    (store! (field s max-choices) 100000)
+    (store! (field s edge-bias) 8)
+    (store! (field s swarm) -1)
+    (store! (field s target) 0.0)
+    (store! (field s targeted) false)
+    s))
+
+;; The allocator generated values must use. Reset between cases — never hold a
+;; pointer into it across `source-begin-*`.
+(defn src-alloc [(s (ptr Source))] (-> (ptr Allocator))
+  (if (= (load (field s alloc-mode)) 0)
+      (load (field s arena))
+      (region-allocator (load (field s region)))))
+
+; --------------------------------------------------------- allocation modes
+;
+; ⚠ THE ARENA HIDES MEMORY BUGS FROM SANITIZERS, and that is the cost of its
+; speed. Every generated value in a case comes out of one big block, so a read or
+; write one byte past a generated string lands on the next value in the arena
+; rather than on unmapped memory. AddressSanitizer sees one large allocation and
+; nothing wrong inside it, so a property that would otherwise expose an
+; off-by-one passes.
+;
+; That matters because generated inputs plus a sanitizer is the single most
+; productive way to find memory bugs, and the arena is exactly what makes the
+; engine fast. So both are available:
+;
+;   mode 0, ARENA (default) — a bump pointer, rewound between cases. ~5 ns per
+;   value, no syscalls, and 70 M cases/sec. Use it for the search.
+;
+;   mode 1, TRACKED — every value is a separate allocation from a parent
+;   allocator, and a `Region` frees them all at the end of the case. Orders of
+;   magnitude slower, and worth it under `--sanitize=address`: now each generated
+;   string really is n bytes with a redzone after it, and the off-by-one faults on
+;   the shortest input that reaches it.
+;
+; The parent allocator is the caller's choice, which is the point: pass
+; `(malloc-allocator)` for ASan, or `coil.guardalloc`'s `guard-allocator-on` to
+; put an unmapped guard page after every generated value and catch the overflow
+; with no sanitizer at all. `coil.prop.source` deliberately does not import
+; guardalloc — that would drag `mmap` into every program that runs a property,
+; including the ones targeting wasm.
+(defn source-alloc-mode! [(s (ptr Source)) (mode i64) (parent (ptr Allocator))] (-> i64)
+  (store! (field s alloc-mode) mode)
+  (if (= mode 0)
+      0
+      (let [r (unwrap-ptr [Region] (create [Region] (load (field s mem))))]
+        (region-init r parent)
+        (store! (field s region) r)
+        0)))
+
+(defn src-status [(s (ptr Source))] (-> i64)
+  (load (field s status)))
+(defn src-fuel [(s (ptr Source))] (-> i64)
+  (load (field s fuel)))
+(defn src-size [(s (ptr Source))] (-> i64)
+  (load (field s size)))
+(defn src-tape [(s (ptr Source))] (-> (ptr (ArrayList Choice)))
+  (field s tape))
+(defn src-spans [(s (ptr Source))] (-> (ptr (ArrayList Span)))
+  (field s spans))
+(defn src-target [(s (ptr Source))] (-> f64)
+  (load (field s target)))
+(defn src-targeted? [(s (ptr Source))] (-> bool)
+  (load (field s targeted)))
+
+;; How deeply spans are currently nested — which, for a generator that opens one
+;; span per node, IS the recursion depth.
+;;
+;; Fuel alone bounds how many recursive nodes a value HAS, not how deep they go: a
+;; linear chain of N nodes spends N fuel and recurses N frames, and a generator
+;; called with a large size budget will overflow the C stack long before it runs
+;; out of fuel. A recursive generator should therefore treat "too deep" exactly as
+;; it treats "out of fuel" and fall back to a base case.
+(defn src-depth [(s (ptr Source))] (-> i64)
+  (let [cur (load (field s cur-span))]
+    (if (< cur 0) 0 (load (field (al-elem [Span] (field s spans) cur) depth)))))
+
+;; The depth at which a recursive generator must stop. Deliberately well under any
+;; real stack limit: a generated value 64 levels deep is already far past what any
+;; counterexample should be, and the shrinker will flatten it anyway.
+(defn src-max-depth [] (-> i64)
+  64)
+
+;; Reset every per-case scratch: the tape, the spans, and the arena (a pointer
+;; rewind — no frees, no bookkeeping, which is why a case costs ~nothing).
+(defn source-reset! [(s (ptr Source)) (size i64)] (-> i64)
+  (store! (field (field s tape) len) 0)
+  (store! (field (field s spans) len) 0)
+  ; reclaim the previous case's values: a pointer rewind in arena mode, a real
+  ; free of every tracked block in tracked mode (which is what lets a sanitizer
+  ; see a use-after-free in a property, too).
+  (if (= (load (field s alloc-mode)) 0)
+      (store! (field (load (field s arena-state)) off) 0)
+      (let [r (load (field s region))]
+        (region-close! r)
+        (region-init r (load (field r parent)))
+        0))
+  (store! (field s cursor) 0)
+  (store! (field s cur-span) -1)
+  (store! (field s size) size)
+  (store! (field s fuel) size)
+  (store! (field s status) ST-OK)
+  (store! (field s target) 0.0)
+  (store! (field s targeted) false)
+  0)
+
+;; Begin a fresh, randomly generated case.
+(defn source-begin-generate! [(s (ptr Source)) (size i64)] (-> i64)
+  (source-reset! s size)
+  (store! (field s mode) 0)
+  0)
+
+;; Begin a case that replays `tape` (the shrinker's inner loop, and `--pbt-replay`).
+;; Choices past the end of `tape`, or that no longer fit their constraints, become
+;; minima: a shrunk tape is ALWAYS runnable.
+(defn source-begin-replay! [(s (ptr Source)) (tape (ptr (ArrayList Choice))) (size i64)] (-> i64)
+  (source-reset! s size)
+  (store! (field s mode) 1)
+  (store! (field (field s replay) len) 0)
+  (let [(mut i) 0
+        n (al-len [Choice] (load tape))]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (al-push! [Choice] (mut (field s replay)) (al-get [Choice] (load tape) (load i)))
+                (store! i (primitive/iadd (load i) 1))))))
+  0)
+
+;; Re-seed the generator (a run is `(seed, size-ramp)` and nothing else).
+(defn source-seed! [(s (ptr Source)) (seed i64)] (-> i64)
+  (store! (field s rng) (rng-seed seed))
+  0)
+
+;; The swarm-testing feature mask for this case: `gen/one-of` drops alternatives
+;; whose bit is clear, so a case exercises a random SUBSET of the features.
+;; Feature omission diversity finds bugs plain uniform choice does not (Groce et
+;; al., "Swarm Testing", ISSTA 2012) because features compete for room in a
+;; bounded test case.
+(defn source-swarm! [(s (ptr Source)) (mask i64)] (-> i64)
+  (store! (field s swarm) mask)
+  0)
+(defn src-swarm-allows? [(s (ptr Source)) (bit i64)] (-> bool)
+  (!= (primitive/iand (load (field s swarm))
+                      (primitive/ishl 1 (primitive/irem bit 64)))
+      0))
+
+; --------------------------------------------------------------------- spans
+
+;; Open a structural region. Every generator should wrap its draws in one: spans
+;; are what let the shrinker delete a list element, hoist a subterm out of a
+;; recursive node, or leave a checksum-bearing header alone.
+(defn span-open! [(s (ptr Source)) (name (slice u8)) (kind i64)] (-> i64)
+  (let [id (al-len [Span] (load (field s spans)))
+        sp (primitive/alloc-stack Span)
+        parent (load (field s cur-span))]
+    (store! (field sp name) name)
+    (store! (field sp start) (al-len [Choice] (load (field s tape))))
+    (store! (field sp end) -1)
+    (store! (field sp parent) parent)
+    (store! (field sp depth)
+            (if (< parent 0) 0 (primitive/iadd (load (field (al-elem [Span] (field s spans) parent) depth)) 1)))
+    (store! (field sp kind) kind)
+    (al-push! [Span] (mut (field s spans)) (load sp))
+    (store! (field s cur-span) id)
+    id))
+
+(defn span-close! [(s (ptr Source)) (id i64)] (-> i64)
+  (if (or (< id 0) (>= id (al-len [Span] (load (field s spans)))))
+      0
+      (let [sp (al-elem [Span] (field s spans) id)]
+        (store! (field sp end) (al-len [Choice] (load (field s tape))))
+        (store! (field s cur-span) (load (field sp parent)))
+        0)))
+
+; ---------------------------------------------------------------------- draws
+
+;; The value in [lo, hi] closest to `origin` — a choice's minimum, and what an
+;; overrun synthesizes. `hi < lo` is a caller bug; we clamp rather than invent.
+(defn choice-minimal [(lo i64) (hi i64) (origin i64)] (-> i64)
+  (if (< origin lo) lo (if (> origin hi) hi origin)))
+
+;; How far a value is from where it wants to shrink to. The shrinker's ordering.
+;; Saturating: the difference of two extremes overflows, and an overflowed
+;; distance would read as "already minimal" and stop the shrinker dead.
+(defn choice-distance [(c Choice)] (-> i64)
+  (let [v (load (field c value))
+        o (load (field c origin))
+        d (if (>= v o) (primitive/isub v o) (primitive/isub o v))]
+    (if (< d 0) 9223372036854775807 d)))
+
+;; Interesting values for an integer range: boundaries, the origin, zero, ±1, and
+;; the powers of two that break naive arithmetic. Drawn deliberately rather than
+;; left to chance — uniform sampling of a 64-bit range essentially never produces
+;; 0, 1, or MAX, and those are where the bugs are.
+(defn edge-candidate [(k i64) (lo i64) (hi i64) (origin i64)] (-> i64)
+  (choice-minimal lo
+                  hi
+                  (case k 0
+                        origin 1
+                        lo 2
+                        hi 3
+                        0 4
+                        1 5
+                        -1 6
+                        (primitive/iadd origin 1) 7
+                        (primitive/isub origin 1) 8
+                        255 9
+                        256 10
+                        65536 11
+                        2147483647 12
+                        -2147483648 13
+                        9223372036854775807 -9223372036854775808)))
+(const EDGE-COUNT 15)
+
+;; Record a choice and return its value. The single funnel every draw goes
+;; through: in generate mode it appends what the RNG produced, in replay mode it
+;; appends what the tape said (clamped), and either way the tape that comes out
+;; is a faithful, re-runnable record of the case.
+(defn record! [(s (ptr Source)) (kind i64) (lo i64) (hi i64) (origin i64) (proposed i64)] (-> i64)
+  (let [c (primitive/alloc-stack Choice)
+        n (al-len [Choice] (load (field s tape)))]
+    (if (>= n (load (field s max-choices)))
+        (do
+          (store! (field s status) ST-EXHAUSTED)
+          (choice-minimal lo hi origin))
+        (let [v
+                (if (= (load (field s mode)) 1)
+                    ; replay: take the recorded value if there is one and it is
+                    ; the same kind of decision; otherwise synthesize the minimum.
+                    (let [cur (load (field s cursor))]
+                      (if (>= cur (al-len [Choice] (load (field s replay))))
+                          (do
+                            (store! (field s status) ST-OVERRUN)
+                            (choice-minimal lo hi origin))
+                          (let [rc (al-get [Choice] (load (field s replay)) cur)]
+                            (store! (field s cursor) (primitive/iadd cur 1))
+                            (if (= (load (field rc kind)) kind)
+                                (choice-minimal lo hi (load (field rc value)))
+                                (do
+                                  (store! (field s status) ST-OVERRUN)
+                                  (choice-minimal lo hi origin))))))
+                    (choice-minimal lo hi proposed))]
+          (store! (field c kind) kind)
+          (store! (field c flags) 0)
+          (store! (field c span) (load (field s cur-span)))
+          (store! (field c lo) lo)
+          (store! (field c hi) hi)
+          (store! (field c origin) origin)
+          (store! (field c value) v)
+          (al-push! [Choice] (mut (field s tape)) (load c))
+          v))))
+
+;; Draw an integer in [lo, hi], shrinking toward `origin`.
+(defn draw-int-origin! [(s (ptr Source)) (lo i64) (hi i64) (origin i64)] (-> i64)
+  (if (>= lo hi)
+      (record! s CK-INT lo lo lo lo)
+      (let [eb (load (field s edge-bias))
+            use-edge (if (<= eb 0) false (= (rng-below! (mut (field s rng)) eb) 0))
+            proposed
+              (if use-edge
+                  (edge-candidate (rng-below! (mut (field s rng)) EDGE-COUNT) lo hi origin)
+                  (rng-range! (mut (field s rng)) lo hi))]
+        (record! s CK-INT lo hi origin proposed))))
+
+;; Draw an integer in [lo, hi], shrinking toward whichever endpoint is nearest
+;; zero — the sensible default when the caller expresses no preference.
+(defn draw-int! [(s (ptr Source)) (lo i64) (hi i64)] (-> i64)
+  (draw-int-origin! s lo hi (choice-minimal lo hi 0)))
+
+;; Draw an unconstrained 64-bit integer. Separate from `draw-int!` because the
+;; full range's width (2^64) does not fit in the i64 the bounded path computes
+;; with — an overflowed span is exactly how "random" generators quietly stop
+;; being random.
+(defn draw-int-any! [(s (ptr Source))] (-> i64)
+  (let [eb (load (field s edge-bias))
+        use-edge (if (<= eb 0) false (= (rng-below! (mut (field s rng)) eb) 0))
+        proposed
+          (if use-edge
+              (edge-candidate (rng-below! (mut (field s rng)) EDGE-COUNT)
+                              -9223372036854775808
+                              9223372036854775807
+                              0)
+              (primitive/cast i64 (rng-next! (mut (field s rng)))))]
+    (record! s CK-INT -9223372036854775808 9223372036854775807 0 proposed)))
+
+;; Draw a collection length in [lo, hi]. Recorded as its own kind so the deletion
+;; passes can find it, and biased small: most bugs live in short inputs, and a
+;; long input costs the same to shrink either way.
+(defn draw-len! [(s (ptr Source)) (lo i64) (hi i64)] (-> i64)
+  (if (>= lo hi)
+      (record! s CK-LEN lo lo lo lo)
+      (let [span (primitive/isub hi lo)
+            ; a geometric-ish taper: half the draws land in the first eighth of
+            ; the range, so lists are usually short but occasionally long.
+            r (rng-below! (mut (field s rng)) 8)
+            width
+              (if (= r 0)
+                  span
+                  (if (< r 3)
+                      (primitive/iadd (primitive/udiv span 2) 1)
+                      (primitive/iadd (primitive/udiv span 8) 1)))
+            proposed (primitive/iadd lo (rng-below! (mut (field s rng)) (primitive/iadd width 1)))]
+        (record! s CK-LEN lo hi lo proposed))))
+
+;; Draw a sum-type variant index. Shrinks toward 0, so DECLARE THE BASE CASE
+;; FIRST and recursive structures collapse toward their leaves.
+(defn draw-tag! [(s (ptr Source)) (n i64)] (-> i64)
+  (if (<= n 1)
+      (record! s CK-TAG 0 0 0 0)
+      (record! s CK-TAG 0 (primitive/isub n 1) 0 (rng-below! (mut (field s rng)) n))))
+
+;; Draw a boolean that is true with probability num/den. Shrinks toward false.
+(defn draw-bool-p! [(s (ptr Source)) (num i64) (den i64)] (-> bool)
+  (= (record! s CK-BOOL 0 1 0 (if (rng-chance! (mut (field s rng)) num den) 1 0)) 1))
+
+(defn draw-bool! [(s (ptr Source))] (-> bool)
+  (draw-bool-p! s 1 2))
+
+;; Draw a float. The bit pattern is the choice, so shrinking moves it toward the
+;; bits of the origin — which for IEEE-754 positive doubles is monotone in the
+;; value, so "smaller tape" really does mean "simpler number". The special values
+;; are drawn deliberately: NaN, ±0.0 and ±inf are where float code breaks.
+(defn draw-float! [(s (ptr Source))] (-> f64)
+  (let [k (rng-below! (mut (field s rng)) 16)
+        bits
+          (if (< k 10)
+              (primitive/cast i64 (rng-next! (mut (field s rng))))
+              (float-special-bits (primitive/isub k 10)))
+        v (record! s CK-FLOAT -9223372036854775808 9223372036854775807 0 bits)]
+    (bits->f64 v)))
+
+(defn float-special-bits [(k i64)] (-> i64)
+  (case k 0
+        0  ; +0.0
+          1
+        -9223372036854775808  ; -0.0
+          2
+        9218868437227405312  ; +inf
+          3
+        -4503599627370496  ; -inf
+          4
+        9221120237041090560  ; NaN
+          4607182418800017408))  ; 1.0
+
+;; f64 <-> i64 BIT reinterpretation. `cast` between them is a numeric conversion,
+;; so the bits have to travel through memory; LLVM folds this to a register move.
+(defn bits->f64 [(b i64)] (-> f64)
+  (let [p (primitive/alloc-stack i64)]
+    (store! p b)
+    (load (primitive/cast (ptr f64) p))))
+(defn f64->bits [(x f64)] (-> i64)
+  (let [p (primitive/alloc-stack f64)]
+    (store! p x)
+    (load (primitive/cast (ptr i64) p))))
+
+; ------------------------------------------------------------ fuel & feedback
+
+;; Spend one unit of size budget; recursive generators call this before recursing
+;; and stop when it runs out. Termination is therefore STRUCTURAL — no per-type
+;; recursion counters, no depth heuristics that a deep-but-narrow value defeats.
+(defn src-spend-fuel! [(s (ptr Source)) (n i64)] (-> i64)
+  (let [f (primitive/isub (load (field s fuel)) n)]
+    (store! (field s fuel) (if (< f 0) 0 f))
+    (load (field s fuel))))
+(defn src-restore-fuel! [(s (ptr Source)) (n i64)] (-> i64)
+  (store! (field s fuel) n)
+  n)
+
+;; Reject this case: the generated input did not satisfy a precondition. NOT a
+;; failure — the runner counts rejections separately and errors out if too many
+;; accumulate, because a suite that silently discards 99% of its cases is testing
+;; almost nothing.
+(defn src-reject! [(s (ptr Source))] (-> i64)
+  (store! (field s status) ST-REJECTED)
+  0)
+
+;; Targeted property-based testing (Löscher & Sagonas): report a number the search
+;; should MAXIMIZE. The runner hill-climbs the tape toward it, which finds
+;; counterexamples that pure random search needs orders of magnitude more cases
+;; to reach.
+(defn src-target! [(s (ptr Source)) (v f64)] (-> i64)
+  (store! (field s target) v)
+  (store! (field s targeted) true)
+  0)
+
+; ------------------------------------------------------------- tape utilities
+
+;; Copy a tape (the shrinker works on candidates, never on the live tape).
+(defn tape-clone [(a (ptr Allocator)) (src (ptr (ArrayList Choice)))] (-> (ArrayList Choice))
+  (let [(mut out) (al-new [Choice] a)
+        n (al-len [Choice] (load src))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (al-push! [Choice] (mut out) (al-get [Choice] (load src) (load i)))
+                (store! i (primitive/iadd (load i) 1)))))
+    (load out)))
+
+;; Shortlex: fewer choices first, ties broken by total distance-from-origin, then
+;; lexicographically. A well-order, so the greedy shrink loop always terminates —
+;; and it matches the intuition that a shorter, blander tape is a simpler input.
+;; Returns <0, 0, >0.
+(defn tape-compare [(a (ptr (ArrayList Choice))) (b (ptr (ArrayList Choice)))] (-> i64)
+  (let [na (al-len [Choice] (load a))
+        nb (al-len [Choice] (load b))]
+    (if (!= na nb)
+        (if (< na nb) -1 1)
+        (let [(mut i) 0
+              (mut r) 0]
+          (loop (if (or (>= (load i) na) (!= (load r) 0))
+                    (break)
+                    (let [da (choice-distance (al-get [Choice] (load a) (load i)))
+                          db (choice-distance (al-get [Choice] (load b) (load i)))]
+                      (if (< da db) (store! r -1) (if (> da db) (store! r 1) 0))
+                      (store! i (primitive/iadd (load i) 1))
+                      0)))
+          (load r)))))
+
+;; A cheap content hash, so the shrinker never re-runs a candidate it has already
+;; tried. Shrinking is dominated by duplicate candidates without this.
+(defn tape-hash [(t (ptr (ArrayList Choice)))] (-> i64)
+  (let [(mut h) -3750763034362895579
+        n (al-len [Choice] (load t))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (al-get [Choice] (load t) (load i))]
+                (store! h (primitive/imul (primitive/ixor (load h) (load (field c value))) 1099511628211))
+                (store! h (primitive/imul (primitive/ixor (load h) (load (field c kind))) 1099511628211))
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    (load h)))

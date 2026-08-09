@@ -1,0 +1,1121 @@
+(module coil.prop.runner)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.str" :as str)
+(import "coil.os" :as os)
+(import "coil.args" :use *)
+(import "coil.prop.rng" :use *)
+(import "coil.prop.source" :use *)
+(import "coil.prop.shrink" :use *)
+(import "coil.prop.db" :use *)
+(import "coil.prop.cov" :use *)
+; THE RUNNER — what `(defprop …)` expands into a call to.
+;
+; The loop is deliberately boring: generate a case, run the property, and if it
+; fails, stop generating and start shrinking. Everything interesting is in the
+; phases around it.
+;
+;   PHASE 1  replay — re-run the counterexample this property failed on last time,
+;            first, before spending any budget on new cases. A bug you have
+;            already found should fail in the first millisecond, not the last.
+;   PHASE 2  generate — random cases, with the size budget ramping from tiny to
+;            full over the run, so shallow bugs surface early and deep ones still
+;            get their chance.
+;   PHASE 3  shrink — greedy fixpoint over the tape (coil.prop.shrink).
+;   PHASE 4  report — the minimal counterexample, the seed, and the exact command
+;            to reproduce it.
+;
+; A property that fails ABORTS, because that is what `coil test`'s forked child
+; runner counts as a failure. The report is written to stdout first, and io's
+; Writer is unbuffered, so the message is on the terminal before the abort.
+
+(defstruct PropConfig
+  [(cases i64)
+   (seed i64)
+   (max-size i64)
+   (shrink-budget i64)
+   (max-rejects i64)
+   (arena-bytes i64)
+   (verbose i64)])
+
+(defstruct PropStats
+  [(cases i64)
+   (rejected i64)
+   (shrink-calls i64)
+   (shrinks i64)])
+
+; What `defprop` compiles a property to, and what the second argument means.
+; One function rather than three so that the values PRINTED are provably the
+; values TESTED — regenerated from the same tape by the same code path.
+(const PROP-MODE-RUN 0)  ; draw the arguments, evaluate the body
+(const PROP-MODE-SHOW 1)  ; draw, print the arguments, evaluate the body
+(const PROP-MODE-DRAW 2)  ; draw only — never touch the body (used to rebuild
+; the input of a case that crashed, where running
+; the body is exactly what must not happen)
+(const PROP-MODE-DRAW-SHOW 3)  ; draw and print, still without the body: how a
+; crashing counterexample gets reported at all
+
+(defstruct RunCtx
+  [(src (ptr Source))
+   (prop (fnptr c [(ptr Source) i64] bool))
+   (size i64)
+   (crash-code i64)  ; 128+signal when shrinking a crash, -1 otherwise
+   (cand-timeout i64)])  ; seconds allowed to one forked shrink candidate
+
+(defn prop-config [(name (slice u8))] (-> PropConfig)
+  (let [c (primitive/alloc-stack PropConfig)]
+    (store! (field c cases) (args-int "--cases" 200))
+    (store! (field c seed) (args-int "--seed" (primitive/ior (str/str-hash name) 1)))
+    (store! (field c max-size) (args-int "--size" 60))
+    (store! (field c shrink-budget) (args-int "--shrink" 20000))
+    ; Ten rejections per case is already a suite in trouble; past that, keep
+    ; generating and the run is just burning time on inputs it throws away.
+    (store! (field c max-rejects) (args-int "--max-rejects" (primitive/imul (args-int "--cases" 200) 10)))
+    (store! (field c arena-bytes) (args-int "--arena" 8388608))
+    (store! (field c verbose) (args-level "--verbose" 0))
+    (load c)))
+
+; ------------------------------------------------------------------ statistics
+;
+; The most common way a property suite lies is by generating the same trivial
+; input ten thousand times and reporting ten thousand passes. `classify` and
+; `collect` make the distribution visible, and the runner refuses to stay quiet
+; when one bucket swallows the run.
+
+(const STAT-FLAG 0)  ; a boolean classification: how often did this hold?
+(const STAT-VALUE 1)  ; a numeric observation: min / mean / max
+
+(defstruct StatEntry
+  [(name (slice u8))
+   (kind i64)
+   (hits i64)
+   (total i64)
+   (lo i64)
+   (hi i64)])
+
+(defn stat-table [] (-> (ptr (ArrayList StatEntry)))
+  (let [cell (primitive/alloc-static (ArrayList StatEntry))
+        init (primitive/alloc-static bool)]
+    (if (load init)
+        0
+        (do
+          (store! cell (al-new [StatEntry] (malloc-allocator)))
+          (store! init true)
+          0))
+    cell))
+
+;; Statistics are gathered during GENERATION only. Counting shrink candidates
+;; would report the distribution of the search, not of the test suite — and the
+;; search deliberately concentrates on one failing input.
+(defn stat-collecting [] (-> (ptr bool))
+  (primitive/alloc-static bool))
+
+(defn stat-reset! [] (-> i64)
+  (store! (field (stat-table) len) 0)
+  0)
+
+(defn stat-find [(name (slice u8))] (-> i64)
+  (let [t (stat-table)
+        n (al-len [StatEntry] (load t))
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0))
+              (break)
+              (do
+                (if (str/str-eq (load (field (al-elem [StatEntry] t (load i)) name)) name)
+                    (store! found (load i))
+                    0)
+                (store! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
+(defn stat-entry! [(name (slice u8)) (kind i64)] (-> i64)
+  (let [existing (stat-find name)]
+    (if (>= existing 0)
+        existing
+        (let [t (stat-table)
+              e (primitive/alloc-stack StatEntry)]
+          (store! (field e name) name)
+          (store! (field e kind) kind)
+          (store! (field e hits) 0)
+          (store! (field e total) 0)
+          (store! (field e lo) 9223372036854775807)
+          (store! (field e hi) -9223372036854775808)
+          (al-push! [StatEntry] (mut t) (load e))
+          (primitive/isub (al-len [StatEntry] (load t)) 1)))))
+
+;; `(classify "label" COND)` — record how often a condition held. Returns the
+;; condition, so it composes inside a property body.
+(defn prop-classify! [(name (slice u8)) (c bool)] (-> bool)
+  (if (load (stat-collecting))
+      (let [i (stat-entry! name STAT-FLAG)
+            e (al-elem [StatEntry] (stat-table) i)]
+        (store! (field e total) (primitive/iadd (load (field e total)) 1))
+        (if c (store! (field e hits) (primitive/iadd (load (field e hits)) 1)) 0)
+        0)
+      0)
+  c)
+
+;; `(collect "label" EXPR)` — record a number's range and mean across the run.
+;; Returns the value, so it wraps an expression in place.
+(defn prop-collect! [(name (slice u8)) (v i64)] (-> i64)
+  (if (load (stat-collecting))
+      (let [i (stat-entry! name STAT-VALUE)
+            e (al-elem [StatEntry] (stat-table) i)]
+        (store! (field e total) (primitive/iadd (load (field e total)) 1))
+        (store! (field e hits) (primitive/iadd (load (field e hits)) v))
+        (if (< v (load (field e lo))) (store! (field e lo) v) 0)
+        (if (> v (load (field e hi))) (store! (field e hi) v) 0)
+        0)
+      0)
+  v)
+
+;; Print the distribution, and — the part that matters — WARN when one
+;; classification covers almost every case. A property whose input is 97% "empty
+;; list" has not been tested on non-empty lists, however green it looks.
+(defn stat-report [(w (ptr Writer)) (verbose i64)] (-> i64)
+  (let [t (stat-table)
+        n (al-len [StatEntry] (load t))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [e (al-elem [StatEntry] t (load i))
+                    total (load (field e total))
+                    hits (load (field e hits))]
+                (if (= (load (field e kind)) STAT-FLAG)
+                    (let [pct (if (> total 0) (primitive/udiv (primitive/imul hits 100) total) 0)]
+                      (if (> verbose 0)
+                          (do (fmt w "    {s}: {d}% ({d}/{d})\n" (load (field e name)) pct hits total) 0)
+                          0)
+                      (if (and (>= pct 90) (> total 20))
+                          (do
+                            (fmt w
+                                 "\nWARNING: '{s}' held in {d}% of cases — the generator is barely exploring the other branch.\n"
+                                 (load (field e name))
+                                 pct)
+                            0)
+                          0)
+                      0)
+                    (if (> verbose 0)
+                        (do
+                          (fmt w
+                               "    {s}: min {d}, mean {d}, max {d} (n={d})\n"
+                               (load (field e name))
+                               (load (field e lo))
+                               (if (> total 0) (primitive/idiv hits total) 0)
+                               (load (field e hi))
+                               total)
+                          0)
+                        0))
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    0))
+
+;; The size budget for case i of n: a ramp from 1 to `max`, so the first cases are
+;; tiny (fast, and they catch the shallow bugs) and the last are full size.
+(defn size-for [(i i64) (n i64) (max i64)] (-> i64)
+  (if (<= n 1)
+      max
+      (let [s (primitive/iadd 1 (primitive/udiv (primitive/imul i max) n))]
+        (if (> s max) max s))))
+
+;; Replay one candidate tape and report whether the property STILL fails on it.
+;; A rejected case (an `assume` that did not hold) is not a failure — treating it
+;; as one would let the shrinker "minimize" into inputs the property never claimed
+;; anything about, which is the classic way a shrinker produces a lie.
+(defn run-candidate [(ctx (ptr i8)) (tape (ptr (ArrayList Choice)))] (-> bool)
+  (let [rc (primitive/cast (ptr RunCtx) ctx)
+        s (load (field rc src))]
+    (source-begin-replay! s tape (load (field rc size)))
+    (let [held (primitive/call-ptr (load (field rc prop)) s PROP-MODE-RUN)]
+      (if (= (src-status s) ST-REJECTED)
+          false
+          (not held)))))
+
+;; One shared Source per process: the tape, the span table and the arena are all
+;; reused across cases, so a run of a million cases performs a handful of
+;; allocations in total rather than a handful per case.
+(defn prop-source [(bytes i64)] (-> (ptr Source))
+  (let [cell (primitive/alloc-static (ptr Source))]
+    (if (= (primitive/cast i64 (load cell)) 0)
+        (let [s (source-new (malloc-allocator) bytes 1)]
+          ; `--alloc-tracked` gives every generated value its own real
+          ; allocation instead of a slice of the arena. Much slower, and the only
+          ; way a sanitizer can see a one-byte overrun on generated data — inside
+          ; the arena that read lands on the next value and nothing complains.
+          (if (= (if (args-has? "--alloc-tracked") 1 0) 0)
+              0
+              (source-alloc-mode! s 1 (malloc-allocator)))
+          (store! cell s)
+          0)
+        0)
+    (load cell)))
+
+; ------------------------------------------------------------- the generate loop
+
+;; Run cases [0, limit) and return the index of the first one that FAILED, or -1.
+;;
+;; Always from case 0: the RNG advances case by case, so a case's input is a
+;; function of (seed, index) only when the whole prefix has been drawn. That is
+;; what makes the bisection below sound.
+(defn run-cases [(s (ptr Source))
+                 (prop (fnptr c [(ptr Source) i64] bool))
+                 (cfg PropConfig)
+                 (st (ptr PropStats))
+                 (limit i64)] (-> i64)
+  (let [mem (malloc-allocator)
+        (mut i) 0
+        (mut bad) -1
+        (mut targeted) false
+        (mut best-score) 0.0
+        (mut best-tape) (al-new [Choice] mem)
+        (mut best-size) (load (field cfg max-size))
+        fuzzing (> (args-int "--fuzz" 0) 0)
+        (mut corpus) (corpus-new mem)]
+    (source-seed! s (load (field cfg seed)))
+    (loop (if (or (>= (load bad) 0)
+                  (or (>= (load i) limit)
+                      ; Give up rather than spin: a precondition that rejects
+                      ; everything is a broken test, and it should say so at the
+                      ; end of a bounded run instead of burning the budget.
+                      (> (load (field st rejected)) (load (field cfg max-rejects)))))
+              (break)
+              (let [size (size-for (load i) (load (field cfg cases)) (load (field cfg max-size)))]
+                (source-begin-generate! s size)
+                ; each case gets its own swarm mask: a random SUBSET of the
+                ; alternatives a generator offers. Feature-omission diversity
+                ; finds bugs that "every feature, every case" never reaches.
+                (source-swarm! s (case-swarm-mask s (load i)))
+                (let [held (primitive/call-ptr prop s PROP-MODE-RUN)]
+                  (if (= (src-status s) ST-REJECTED)
+                      (store! (field st rejected) (primitive/iadd (load (field st rejected)) 1))
+                      (do
+                        (store! (field st cases) (primitive/iadd (load (field st cases)) 1))
+                        (if held 0 (store! bad (load i)))
+                        ; a randomly generated case that reached somewhere new is
+                        ; the seed corpus the fuzz phase mutates from. Asking for
+                        ; the fresh-edge count also RESETS it, so this has to
+                        ; happen once per case and only when fuzzing.
+                        (if fuzzing
+                            (do (corpus-offer! (mut corpus) mem (src-tape s) size) 0)
+                            0)
+                        ; remember the highest-scoring case seen, to start the
+                        ; targeted search from something better than random.
+                        (if (src-targeted? s)
+                            (do
+                              (if (or (not (load targeted))
+                                      (primitive/fcmp-gt (src-target s) (load best-score)))
+                                  (do
+                                    (store! targeted true)
+                                    (store! best-score (src-target s))
+                                    (store! best-tape (tape-clone mem (src-tape s)))
+                                    (store! best-size size)
+                                    0)
+                                  0)
+                              0)
+                            0)
+                        0)))
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    ; A property that reported a target has asked to be SEARCHED, not sampled.
+    ; The extra budget is spent only for those properties, and only when plain
+    ; generation found nothing.
+    (if (and (load targeted) (< (load bad) 0))
+        ; Twenty steps per case of ordinary budget. Search needs ITERATIONS —
+        ; Löscher & Sagonas measure the benefit in thousands of steps — and a
+        ; step is a replay plus a property call, i.e. microseconds. Only
+        ; properties that opted in by calling `prop-target!` pay it.
+        (if (target-phase s
+                          prop
+                          cfg
+                          st
+                          (mut best-tape)
+                          (load best-score)
+                          (load best-size)
+                          (args-int "--target-steps" (primitive/imul (load (field cfg cases)) 20)))
+            (store! bad (load (field cfg cases)))
+            0)
+        0)
+    ; COVERAGE-GUIDED PHASE. Same shape as the targeted phase — mutate, run, keep
+    ; what improves — with "improves" meaning "reached a basic block nothing has
+    ; reached yet" instead of "scored higher".
+    (if (and fuzzing (< (load bad) 0))
+        (if (fuzz-phase s prop cfg st (mut corpus) (args-int "--fuzz" 0))
+            (store! bad (load (field cfg cases)))
+            0)
+        0)
+    (load bad)))
+
+; ------------------------------------------------------ coverage-guided fuzzing
+;
+; Random generation is blind: it learns nothing from what an input did. A
+; coverage-guided search watches which basic blocks each input reached and keeps
+; the ones that reached somewhere new, so a bug behind three nested conditions is
+; found by three lucky guesses in sequence rather than one impossible one
+; (Lampropoulos et al., "Coverage Guided, Property Based Testing", OOPSLA 2019).
+;
+; What makes this cheap here is that the corpus is made of TAPES. A mutation is an
+; edit to a few recorded choices, so every mutant is by construction a well-formed
+; value of the property's argument types — no executions wasted on inputs that
+; fail to parse, which is most of what a byte-level fuzzer does on structured
+; input. It is Zest's "parametric" fuzzing, falling out of a representation that
+; was already there for shrinking.
+;
+; Coverage arrives through `coil.prop.cov`, whose callbacks are only ever called
+; in an instrumented build (`coil fuzz`). In an ordinary build
+; every case reports zero new edges, so the loop below would keep nothing and
+; degenerate to a slower random search — which is why it refuses to run and says
+; why instead.
+
+(defstruct CorpusEntry
+  [(tape (ArrayList Choice))
+   (size i64)])
+
+;; The inputs worth keeping: one per distinct piece of new coverage.
+(defn corpus-new [(mem (ptr Allocator))] (-> (ArrayList CorpusEntry))
+  (al-new [CorpusEntry] mem))
+
+;; Keep this tape if the case that produced it reached new ground.
+;;
+;; ⚠ `cov-take-fresh` RESETS the counter, so it must be called exactly once per
+;; executed case. Calling it twice attributes one case's discovery to the next.
+(defn corpus-offer! [(c (mut (ArrayList CorpusEntry)))
+                     (mem (ptr Allocator))
+                     (tape (ptr (ArrayList Choice)))
+                     (size i64)] (-> bool)
+  (if (<= (cov-take-fresh) 0)
+      false
+      (let [e (primitive/alloc-stack CorpusEntry)]
+        (store! (field e tape) (tape-clone mem tape))
+        (store! (field e size) size)
+        (al-push! [CorpusEntry] (mut c) (load e))
+        true)))
+
+;; Mutate corpus entries for `budget` iterations, keeping whatever reaches new
+;; coverage. Returns true if the property failed on one of them.
+(defn fuzz-phase [(s (ptr Source))
+                  (prop (fnptr c [(ptr Source) i64] bool))
+                  (cfg PropConfig)
+                  (st (ptr PropStats))
+                  (corpus (mut (ArrayList CorpusEntry)))
+                  (budget i64)] (-> bool)
+  (let [mem (malloc-allocator)
+        w (stdout)]
+    (if (not (cov-instrumented?))
+        ; Saying nothing here would be the worst outcome: the run would look like
+        ; a fuzzing run, cost the extra budget, and be a slower random search.
+        (do
+          (print-str w "\n--fuzz was given but this binary has no coverage instrumentation.\n")
+          (print-str w
+                     "  Build it with coil fuzz — a plain `coil test` binary has no edges to guide anything.\n")
+          false)
+        (let [(mut failed) false
+              (mut i) 0]
+          ; An empty corpus means no generated case reached anything new, which
+          ; only happens when the property never runs. Seed it with the minimal
+          ; input so the loop has something to mutate.
+          (if (= (al-len [CorpusEntry] (load corpus)) 0)
+              (do
+                (source-begin-generate! s (load (field cfg max-size)))
+                (primitive/call-ptr prop s PROP-MODE-RUN)
+                (cov-take-fresh)
+                (corpus-offer-forced! (mut corpus) mem (src-tape s) (load (field cfg max-size)))
+                0)
+              0)
+          (loop (if (or (load failed) (>= (load i) budget))
+                    (break)
+                    (let [n (al-len [CorpusEntry] (load corpus))
+                          pick (al-get [CorpusEntry] (load corpus) (corpus-pick s n))
+                          ; Replay at the FULL budget, not the size the entry was
+                          ; recorded at. The ramp means the corpus is mostly early,
+                          ; tiny-size cases — they are the ones that discovered the
+                          ; most coverage — and replaying them at their own size
+                          ; caps the search at inputs too small to reach anything.
+                          size (load (field cfg max-size))
+                          (mut base) (load (field pick tape))
+                          (mut cand) (mutate-tape-sized mem (field s rng) (mut base) size)]
+                      (source-begin-replay! s (mut cand) size)
+                      ; Record comparisons only while the property runs. The
+                      ; dictionary is meant to describe the code under test, and
+                      ; the loop around it compares indices and counters far more
+                      ; often than the test compares anything interesting.
+                      (cov-cmp-record! true)
+                      (let [held (primitive/call-ptr prop s PROP-MODE-RUN)]
+                        (cov-cmp-record! false)
+                        (if (= (src-status s) ST-REJECTED)
+                            (do
+                              (store! (field st rejected) (primitive/iadd (load (field st rejected)) 1))
+                              (cov-take-fresh)
+                              0)
+                            (do
+                              (store! (field st cases) (primitive/iadd (load (field st cases)) 1))
+                              (if held
+                                  (do (corpus-offer! (mut corpus) mem (src-tape s) size) 0)
+                                  (store! failed true))
+                              0)))
+                      (store! i (primitive/iadd (load i) 1))
+                      0)))
+          ; only in the child that did the searching — the parent re-runs the whole
+          ; phase to reach the failing case, and a second identical line reads as
+          ; two runs rather than one.
+          (if (and (> (load (field cfg verbose)) 0) (load (stat-collecting)))
+              (do
+                (fmt w
+                     "  fuzzing: {d} iterations, corpus {d}, {d} of {d} edges, {d} comparison pairs\n"
+                     (load i)
+                     (al-len [CorpusEntry] (load corpus))
+                     (cov-total)
+                     (cov-guards)
+                     (cov-dict-count))
+                
+                0)
+              0)
+          (load failed)))))
+
+;; Which corpus entry to mutate next — the fuzzer's energy assignment, and the
+;; difference between climbing a ladder and wandering.
+;;
+;; Uniform selection sounds fair and is not. An input that JUST found new coverage
+;; is on the frontier: it is the only one that has reached the branch whose far
+;; side is still unexplored, and the next rung can only be climbed from it. Under
+;; uniform selection its share of the budget falls as 1/n while the corpus grows,
+;; so a four-condition ladder needs the budget to grow with the product of the
+;; rungs — which is the cost coverage guidance exists to avoid paying.
+;;
+;; Half the iterations go to the last four entries, half uniformly to everything,
+;; so the frontier gets attention that does not decay while older inputs keep
+;; enough budget to explore branches the frontier walked past.
+;;
+;; Measured on `tests/prop/demos/fuzz_demo.coil` (a four-byte magic-value ladder),
+;; five seeds, 200 000-iteration budget — cases until the bug is found:
+;;
+;;   uniform     none, 124k, 184k, none, 74k    (2 of 5 never found it)
+;;   frontier    85k,  71k,  84k,  33k,   6k    (5 of 5)
+;;
+;; Same corpus, same mutations, same budget; only which entry gets mutated next.
+;; For reference, blind sampling needs about 95^4 ≈ 10^8 cases by construction —
+;; it is not a slower search, it is a different one.
+(defn corpus-pick [(s (ptr Source)) (n i64)] (-> i64)
+  (if (<= n 1)
+      0
+      (if (= (rng-below! (mut (field s rng)) 2) 0)
+          (let [window (if (< n 4) n 4)]
+            (primitive/isub n (primitive/iadd (rng-below! (mut (field s rng)) window) 1)))
+          (rng-below! (mut (field s rng)) n))))
+
+;; Seed entry: kept regardless of coverage, because a corpus of nothing cannot be
+;; mutated into anything.
+(defn corpus-offer-forced! [(c (mut (ArrayList CorpusEntry)))
+                            (mem (ptr Allocator))
+                            (tape (ptr (ArrayList Choice)))
+                            (size i64)] (-> i64)
+  (let [e (primitive/alloc-stack CorpusEntry)]
+    (store! (field e tape) (tape-clone mem tape))
+    (store! (field e size) size)
+    (al-push! [CorpusEntry] (mut c) (load e))
+    0))
+
+; ---------------------------------------------------------- targeted search
+;
+; TARGETED PROPERTY-BASED TESTING (Löscher & Sagonas, ISSTA'17). When a property
+; calls `prop-target!` with a number — queue depth, tree height, bytes allocated,
+; distance from a boundary — the runner stops sampling uniformly and starts
+; SEARCHING for inputs that maximize it. Their result: counterexamples that
+; uniform random generation needs orders of magnitude more cases to reach.
+;
+; The neighbourhood function is the part that is usually hard to write, and on a
+; tape it is free: a neighbour is the same tape with a few choices perturbed.
+; That is the payoff of representing an input as its choices rather than as a
+; value — the search operates on every generator ever written, with no per-type
+; mutation code and no risk of producing a value the generator could not.
+;
+; The acceptance rule is THRESHOLD ACCEPTING (Dueck & Scheuer, 1990): take any
+; neighbour that is not worse than (best - threshold), with the threshold
+; decreasing to zero over the run. It is simulated annealing's deterministic
+; cousin, chosen here because it needs no exponential — the standard Metropolis
+; rule would drag libm into the standard library's test path for nothing.
+
+;; A neighbour of `src`: the same tape with a few choices moved. Perturbing one
+;; to three choices keeps a step local (a mutation that rewrites everything is a
+;; restart, not a step) while still letting a length choice change the shape.
+;; What the code under test wanted where this choice's current value was found.
+;;
+;; This is the substitution that makes comparison feedback worth having: the
+;; choice holds some byte, the program was seen comparing that byte against 70 and
+;; failing, so the mutation is "70" and not "some value that was interesting
+;; somewhere". No guessing about WHICH choice should take the magic value — the
+;; input's own contents pick it out.
+;;
+;; Out-of-range counterparts are dropped rather than clamped. Clamping 12345 into a
+;; byte's 32..126 gives 126, which is not a magic value and is already the endpoint
+;; mutation — it would turn a precise signal into noise that looks like progress.
+(defn dict-mutation [(rng (ptr Rng)) (lo i64) (hi i64) (current i64)] (-> i64)
+  (let [v (cov-dict-counterpart current)]
+    (if (and (!= v current) (and (>= v lo) (<= v hi)))
+        v
+        (rng-range! (mut rng) lo hi))))
+
+(defn mutate-tape [(a (ptr Allocator))
+                   (rng (ptr Rng))
+                   (src (ptr (ArrayList Choice)))] (-> (ArrayList Choice))
+  (mutate-tape-sized a rng src 0))
+
+;; The same, but allowed to GROW a collection past the length it was recorded with.
+;;
+;; ⚠ WITHOUT THIS A CORPUS CANNOT GROW ITS INPUTS, and the failure is silent. A
+;; choice carries the constraints of the case that produced it, and the size
+;; budget RAMPS over a run — so the early cases, which are exactly the ones that
+;; discover the most coverage and therefore dominate the corpus, recorded lengths
+;; bounded by a size of one or two. Clamping a mutation to that recorded bound
+;; means every mutant of them is just as short, forever: a fuzzer that cannot
+;; reach a four-byte input no matter how long it runs. Measured: with the clamp,
+;; 20 000 iterations on the magic-bytes demo grew the corpus by zero.
+;;
+;; `size-hint` is the budget the candidate will actually be REPLAYED at, so a
+;; length choice may be proposed anywhere up to it. Proposing out of range is
+;; safe in general — `record!` clamps every replayed value against the live
+;; constraints — so the only thing this widens is what the search can imagine.
+(defn mutate-tape-sized [(a (ptr Allocator))
+                         (rng (ptr Rng))
+                         (src (ptr (ArrayList Choice)))
+                         (size-hint i64)] (-> (ArrayList Choice))
+  (let [(mut out) (tape-clone a src)
+        n (al-len [Choice] (load out))]
+    (if (= n 0)
+        (load out)
+        (let [k (primitive/iadd 1 (rng-below! (mut rng) 3))
+              (mut m) 0]
+          (loop (if (>= (load m) k)
+                    (break)
+                    (let [idx (rng-below! (mut rng) n)
+                          e (al-elem [Choice] (mut out) idx)
+                          lo (load (field e lo))
+                          hi
+                            (if (and (= (load (field e kind)) CK-LEN) (> size-hint (load (field e hi))))
+                                size-hint
+                                (load (field e hi)))]
+                      ; Four kinds of step, because one is never enough. A uniform
+                      ; jump escapes a local optimum; a small nudge walks a
+                      ; gradient the jump steps over; a snap to an endpoint crosses
+                      ; the whole range in one move, which is what a monotone
+                      ; objective (a sum, a length, a depth) actually needs — a
+                      ; random walk of ±1 gets there far too slowly to matter
+                      ; inside a test run.
+                      ;
+                      ; The fourth changes the complexity class rather than the
+                      ; constant: a value the code under test was just seen
+                      ; comparing against and FAILING, straight from
+                      ; `coil.prop.cov`'s dictionary. Guessing a magic byte is 1 in
+                      ; 95 and a four-byte magic value is four such guesses in the
+                      ; right order; using the byte the comparison asked for is 1
+                      ; in (dictionary size), and the dictionary is small because
+                      ; only failed comparisons in the code under test reach it.
+                      (case (rng-below! (mut rng) 5) 0
+                            (store! (field e value) (rng-range! (mut rng) lo hi)) 1
+                            (store! (field e value)
+                                    (choice-minimal lo
+                                                    hi
+                                                    (primitive/iadd (load (field e value))
+                                                                    (primitive/isub (rng-below! (mut rng) 17) 8))))
+                              2
+                            (store! (field e value) hi) 3
+                            (store! (field e value) lo)
+                              (store! (field e value) (dict-mutation rng lo hi (load (field e value)))))
+                      (store! m (primitive/iadd (load m) 1))
+                      0)))
+          (load out)))))
+
+;; Hill-climb the target for `budget` iterations. Returns true if the property
+;; failed on some neighbour — a targeted run that finds a counterexample has done
+;; its job and stops immediately.
+(defn target-phase [(s (ptr Source))
+                    (prop (fnptr c [(ptr Source) i64] bool))
+                    (cfg PropConfig)
+                    (st (ptr PropStats))
+                    (seed-tape (ptr (ArrayList Choice)))
+                    (seed-score f64)
+                    (size i64)
+                    (budget i64)] (-> bool)
+  (let [mem (malloc-allocator)
+        (mut best) (tape-clone mem seed-tape)
+        (mut best-score) seed-score
+        (mut failed) false
+        (mut i) 0]
+    (loop (if (or (load failed) (>= (load i) budget))
+              (break)
+              (let [(mut cand) (mutate-tape mem (field s rng) (mut best))]
+                (source-begin-replay! s (mut cand) size)
+                (let [held (primitive/call-ptr prop s PROP-MODE-RUN)]
+                  (if (= (src-status s) ST-REJECTED)
+                      (store! (field st rejected) (primitive/iadd (load (field st rejected)) 1))
+                      (do
+                        (store! (field st cases) (primitive/iadd (load (field st cases)) 1))
+                        (if held
+                            ; the threshold starts at a tenth of the current best
+                            ; and closes linearly, so early steps may go downhill
+                            ; and late ones may not.
+                            (let [score (src-target s)
+                                  slack
+                                    (primitive/fmul (target-threshold (load best-score))
+                                                    (primitive/cast f64 (primitive/isub budget (load i))))
+                                  bar
+                                    (primitive/fsub (load best-score)
+                                                    (primitive/fdiv slack (primitive/cast f64 budget)))]
+                              (if (primitive/fcmp-ge score bar)
+                                  (do
+                                    (store! best (tape-clone mem (src-tape s)))
+                                    (if (primitive/fcmp-gt score (load best-score))
+                                        (store! best-score score)
+                                        0)
+                                    0)
+                                  0)
+                              0)
+                            (store! failed true))
+                        0)))
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    (load failed)))
+
+;; The initial downhill tolerance: a tenth of the score's own magnitude, so the
+;; schedule works whether the objective is measured in bytes or in tree levels.
+;; A fixed absolute threshold would be either a free-for-all or a no-op depending
+;; on nothing but the unit the user happened to report in.
+(defn target-threshold [(best f64)] (-> f64)
+  (let [m (if (primitive/fcmp-ge best 0.0) best (primitive/fsub 0.0 best))]
+    (if (primitive/fcmp-gt m 0.0) (primitive/fmul m 0.1) 1.0)))
+
+;; Regenerate case `k`'s tape WITHOUT running the property body on it. Cases
+;; before `k` are run normally (they passed once, so they are safe to repeat);
+;; case `k` is drawn in DRAW-ONLY mode. This is how the parent recovers the input
+;; of a case that killed its child: generation is pure, only the body crashes.
+(defn regenerate-case [(s (ptr Source))
+                       (prop (fnptr c [(ptr Source) i64] bool))
+                       (cfg PropConfig)
+                       (k i64)] (-> i64)
+  (let [(mut i) 0]
+    (source-seed! s (load (field cfg seed)))
+    (loop (if (> (load i) k)
+              (break)
+              (let [size (size-for (load i) (load (field cfg cases)) (load (field cfg max-size)))]
+                (source-begin-generate! s size)
+                (source-swarm! s (case-swarm-mask s (load i)))
+                (primitive/call-ptr prop s (if (= (load i) k) PROP-MODE-DRAW PROP-MODE-RUN))
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    0))
+
+; --------------------------------------------------------------- child running
+;
+; Every property runs its generation phase in a FORKED CHILD. One fork per
+; property is nothing (~100µs), and it buys the thing no in-process property
+; testing library has: when a case does not merely return false but SEGFAULTS,
+; the run survives to minimize it. In a systems language that is not an exotic
+; case — it is the most valuable class of bug the tool can find.
+;
+; The child reports through its exit status alone:
+;   0        every case passed
+;   2        some case returned false (an ordinary counterexample)
+;   killed   a case crashed; the signal is the diagnosis
+
+(const CHILD-OK 0)
+(const CHILD-FAILED 2)
+
+;; A watchdog for the child. An infinite loop in a property is a bug the tool
+;; should REPORT, not a reason for `coil test` to hang until someone notices;
+;; SIGALRM turns it into an ordinary crash, which the machinery below already
+;; knows how to bisect and minimize. Pass `--timeout 0` to disable, or
+;; higher for a genuinely long run.
+;;
+;; `alarm` is declared here and nowhere else in the standard library — externs
+;; are not deduplicated across modules, so a second declaration anywhere would
+;; break linking.
+(extern alarm :cc c [u32] (-> u32))
+
+;; Decode a waitpid status the way the rest of this repo does: a terminating
+;; signal in the low 7 bits, else the exit code in the high byte.
+(defn wait-code [(status i64)] (-> i64)
+  (let [sig (primitive/iand status 127)]
+    (if (!= sig 0) (primitive/iadd 128 sig) (primitive/iand (primitive/udiv status 256) 255))))
+
+;; Run cases [0, limit) in a forked child and return the child's wait code
+;; (0 / 2 / 128+signal). -1 means the fork itself failed.
+(defn fork-run-cases [(s (ptr Source))
+                      (prop (fnptr c [(ptr Source) i64] bool))
+                      (cfg PropConfig)
+                      (st (ptr PropStats))
+                      (name (slice u8))
+                      (limit i64)
+                      (report-stats bool)] (-> i64)
+  (let [pid (primitive/cast i64 (os/fork))]
+    (if (< pid 0)
+        -1
+        (if (= pid 0)
+            (let [_alarm (alarm (primitive/cast u32 (args-int "--timeout" 60)))
+                  bad (run-cases s prop cfg st limit)]
+              ; `_exit`, not `exit`: no atexit handlers, no flushing of a stream
+              ; the parent also holds. Both branches end the process, so nothing
+              ; below this runs.
+              (if (>= bad 0)
+                  (do (os/_exit (primitive/cast i32 CHILD-FAILED)) 0)
+                  ; The success report is written HERE, in the child, because the
+                  ; child is where the cases ran and therefore where the counts
+                  ; and the distribution live. The parent's copy of them was
+                  ; forked away before the first case.
+                  (do
+                    (if report-stats (report-success (stdout) name cfg st) 0)
+                    (os/_exit (primitive/cast i32 CHILD-OK))
+                    0))
+              0)
+            (let [stp (primitive/alloc-stack i32)]
+              (store! stp 0)
+              (os/waitpid (primitive/cast i32 pid) stp 0)
+              (wait-code (primitive/cast i64 (load stp))))))))
+
+;; The index of the first case that CRASHES, found by bisection over the case
+;; count: each probe runs a prefix in a child and asks whether that prefix
+;; survives. log2(cases) forks — eight for a default run — and, decisively, zero
+;; cost on the happy path, where nothing crashes and nothing is bisected.
+(defn find-crashing-case [(s (ptr Source))
+                          (prop (fnptr c [(ptr Source) i64] bool))
+                          (cfg PropConfig)
+                          (st (ptr PropStats))
+                          (name (slice u8))
+                          (cases i64)] (-> i64)
+  (let [(mut lo) 0  ; a prefix length known to survive
+        (mut hi) cases]  ; a prefix length known to die
+    (loop (if (<= (primitive/isub (load hi) (load lo)) 1)
+              (break)
+              (let [mid (primitive/iadd (load lo) (primitive/udiv (primitive/isub (load hi) (load lo)) 2))
+                    code (fork-run-cases s prop cfg st name mid false)]
+                (if (> code 128)
+                    (store! hi mid)
+                    (store! lo mid))
+                0)))
+    ; prefix `hi` dies and prefix `lo` = hi-1 does not, so case hi-1 is the one.
+    (primitive/isub (load hi) 1)))
+
+;; Replay one candidate tape IN A CHILD, for shrinking a crash. "Still failing"
+;; means the child died from the same signal as the original crash — not merely
+;; that it died. A reducer that accepts any crash happily minimizes one bug into
+;; a different one and reports the wrong counterexample; requiring the signal to
+;; match is the cheapest guard against that slippage.
+(defn run-candidate-forked [(ctx (ptr i8)) (tape (ptr (ArrayList Choice)))] (-> bool)
+  (let [rc (primitive/cast (ptr RunCtx) ctx)
+        s (load (field rc src))
+        pid (primitive/cast i64 (os/fork))]
+    (if (< pid 0)
+        false
+        (if (= pid 0)
+            ; a short watchdog: a shrink candidate that hangs must not stall the
+            ; whole reduction. `fork` clears the parent's alarm, so this is the
+            ; only timer running here.
+            (do
+              (alarm (primitive/cast u32 (load (field rc cand-timeout))))
+              (source-begin-replay! s tape (load (field rc size)))
+              (primitive/call-ptr (load (field rc prop)) s PROP-MODE-RUN)
+              (os/_exit 0)
+              false)
+            (let [stp (primitive/alloc-stack i32)]
+              (store! stp 0)
+              (os/waitpid (primitive/cast i32 pid) stp 0)
+              (let [code (wait-code (primitive/cast i64 (load stp)))]
+                ; the tape must also be REPLAYED in the parent, so the shrinker
+                ; can read the canonical tape the run produced. Generation never
+                ; crashes — only the body does — so drawing here is safe.
+                (source-begin-replay! s tape (load (field rc size)))
+                (primitive/call-ptr (load (field rc prop)) s PROP-MODE-DRAW)
+                (= code (load (field rc crash-code)))))))))
+
+; ------------------------------------------------------------- the reuse phase
+;
+; A property that failed yesterday must fail in the first millisecond today, not
+; after another two hundred random cases have been generated in the hope of
+; stumbling onto the same input. The minimal counterexample is saved to
+; `.coil/pbt/<property>/failing` and replayed FIRST on the next run — Hypothesis's
+; "reuse" phase, and the single feature that makes a property suite feel like a
+; regression suite.
+;
+; The replay gets its own forked child, because the saved input is by definition
+; one that broke something, and a saved SEGFAULT must not take down the process
+; that was about to minimize it.
+
+;; Replay a saved tape in a child. Returns the child's wait code, or CHILD-OK if
+;; there is nothing saved (and prints why, if the file exists but is unusable —
+;; a silently ignored corrupt database is indistinguishable from a healthy one).
+(defn try-saved-failure [(s (ptr Source))
+                         (prop (fnptr c [(ptr Source) i64] bool))
+                         (cfg PropConfig)
+                         (name (slice u8))
+                         (w (ptr Writer))
+                         (out (ptr (ArrayList Choice)))] (-> i64)
+  (let [a (malloc-allocator)]
+    (match (db-load-failure a name)
+      (Err [e] (report-bad-db w e))
+      (Ok [o]
+          (match o
+            (None [] CHILD-OK)
+            (Some [t]
+                  (let [(mut tape) t]
+                    (store! out (tape-clone a (mut tape)))
+                    (fork-replay s prop cfg out))))))))
+
+;; A database file that exists but cannot be read is worth one line of output: a
+;; silently skipped reuse phase looks exactly like a healthy first run, so the
+;; feature would quietly stop working and nobody would know.
+(defn report-bad-db [(w (ptr Writer)) (e TapeError)] (-> i64)
+  (print-str w "  note: saved counterexample unusable — ")
+  (tape-error-print w e)
+  (print-str w "\n")
+  CHILD-OK)
+
+;; Replay `tape` in a forked child and report its wait code.
+(defn fork-replay [(s (ptr Source))
+                   (prop (fnptr c [(ptr Source) i64] bool))
+                   (cfg PropConfig)
+                   (tape (ptr (ArrayList Choice)))] (-> i64)
+  (let [pid (primitive/cast i64 (os/fork))]
+    (if (< pid 0)
+        CHILD-OK
+        (if (= pid 0)
+            (do
+              (alarm (primitive/cast u32 (args-int "--timeout" 60)))
+              (source-begin-replay! s tape (load (field cfg max-size)))
+              (let [held (primitive/call-ptr prop s PROP-MODE-RUN)]
+                ; `_exit` returns void, so each branch needs a value of its own
+                ; for the `if` to have a type — nothing after them runs.
+                (if (or held (= (src-status s) ST-REJECTED))
+                    (do (os/_exit (primitive/cast i32 CHILD-OK)) 0)
+                    (do (os/_exit (primitive/cast i32 CHILD-FAILED)) 0))
+                0)
+              0)
+            (let [stp (primitive/alloc-stack i32)]
+              (store! stp 0)
+              (os/waitpid (primitive/cast i32 pid) stp 0)
+              (wait-code (primitive/cast i64 (load stp))))))))
+
+;; Run one property to completion. Returns 0; a failure prints its report and
+;; aborts, which is what `coil test`'s forked runner records as a failure.
+(defn prop-run [(name (slice u8))
+                (file (slice u8))
+                (line i64)
+                (prop (fnptr c [(ptr Source) i64] bool))] (-> i64)
+  (let [cfg (prop-config name)
+        s (prop-source (load (field cfg arena-bytes)))
+        w (stdout)
+        st (primitive/alloc-stack PropStats)]
+    (store! (field st cases) 0)
+    (store! (field st rejected) 0)
+    (store! (field st shrink-calls) 0)
+    (store! (field st shrinks) 0)
+    (stat-reset!)
+    (store! (stat-collecting) true)
+    ; PHASE 1 — reuse. Nothing below runs if yesterday's counterexample still
+    ; fails: it is minimized already, so the fastest possible red is the right
+    ; answer. A saved input that now PASSES is deleted, which is how a property
+    ; stops carrying a fixed bug's corpse around forever.
+    (let [(mut saved) (al-new [Choice] (malloc-allocator))
+          reuse (try-saved-failure s prop cfg name w (mut saved))]
+      (if (= reuse CHILD-OK)
+          (do
+            (if (> (al-len [Choice] (load saved)) 0)
+                (do (db-clear (malloc-allocator) name) 0)
+                0)
+            0)
+          (do
+            (store! (stat-collecting) false)
+            (print-str w "\n(replaying the saved counterexample)\n")
+            (source-begin-replay! s (mut saved) (load (field cfg max-size)))
+            (primitive/call-ptr prop s (if (> reuse 128) PROP-MODE-DRAW PROP-MODE-RUN))
+            (report-failure w
+                            name
+                            file
+                            line
+                            prop
+                            s
+                            cfg
+                            st
+                            (if (> reuse 128) reuse -1))
+            0)))
+    (let [nofork (> (if (args-has? "--no-fork") 1 0) 0)
+          code
+            (if nofork
+                ; opting out: run in this process, where a debugger can see
+                ; the crash. Trades crash minimization for a usable backtrace.
+                (if (>= (run-cases s prop cfg st (load (field cfg cases))) 0) CHILD-FAILED CHILD-OK)
+                (fork-run-cases s prop cfg st name (load (field cfg cases)) true))]
+      (if (= code CHILD-OK)
+          ; when we forked, the child already printed the counts it owns; only
+          ; the no-fork path still has to report from here.
+          (if nofork (report-success w name cfg st) 0)
+          (if (or (= code CHILD-FAILED) (< code 0))
+              ; An ordinary counterexample (or a fork that failed, in which case
+              ; we simply do the work here). Re-run to the failing case in this
+              ; process — generation is deterministic — and shrink in-process,
+              ; which is far faster than forking per candidate.
+              (do
+                (store! (stat-collecting) false)
+                (run-cases s prop cfg st (load (field cfg cases)))
+                (report-failure w name file line prop s cfg st -1))
+              (if (> code 128)
+                  ; A crash. Find which case did it, rebuild its input without
+                  ; running the body, then shrink with every candidate in its own
+                  ; child so a crashing candidate cannot take the shrinker down.
+                  (do
+                    (store! (stat-collecting) false)
+                    (let [k (find-crashing-case s prop cfg st name (load (field cfg cases)))]
+                      (regenerate-case s prop cfg k)
+                      ; the bisection re-ran prefixes, so the case counter is
+                      ; whatever the last probe left behind; the number that
+                      ; means anything is which case crashed.
+                      (store! (field st cases) k)
+                      (fmt w
+                           "\n{s} (signal {d}) on case {d}\n"
+                           (failure-kind code)
+                           (primitive/isub code 128)
+                           k)
+                      (report-failure w name file line prop s cfg st code)))
+                  ; The property called exit() or otherwise ended the process.
+                  (do
+                    (fmt w "\nFAILED: the property's process exited with code {d}\n" code)
+                    (abort)
+                    0)))))
+    0))
+
+;; Swarm masks: the all-ones mask for every eighth case (so no alternative is ever
+;; unreachable), random subsets otherwise. Groce et al. found omission diversity
+;; beats uniform generation because features compete for room inside one case.
+;;
+;; The mask is drawn from the case's own RNG — so it replays with the seed — but
+;; is deliberately NOT recorded on the tape: it is a property of the SEARCH, not
+;; of the value, and recording it would make every shrink candidate change shape.
+(defn case-swarm-mask [(s (ptr Source)) (i i64)] (-> i64)
+  (if (= (primitive/irem i 8) 0)
+      -1
+      (primitive/ior (primitive/cast i64 (rng-next! (mut (field s rng)))) 1)))
+
+(defn report-success [(w (ptr Writer)) (name (slice u8)) (cfg PropConfig) (st (ptr PropStats))] (-> i64)
+  (if (> (load (field cfg verbose)) 0)
+      (do
+        (fmt w
+             "  {s}: {d} cases passed ({d} rejected)\n"
+             name
+             (load (field st cases))
+             (load (field st rejected)))
+        0)
+      0)
+  ; A property that throws away MOST of what it generates is not testing what its
+  ; author thinks it is. Say so rather than reporting a green run that examined a
+  ; handful of inputs — an unnoticed `assume` that rejects almost everything is
+  ; the quietest way for a property suite to stop working.
+  ;
+  ; The bar is "more discarded than kept", not something tighter: a precondition
+  ; that halves the input space is ordinary and useful, and a warning that fires
+  ; on ordinary code is a warning people learn to skip past.
+  (let [rej (load (field st rejected))
+        total (primitive/iadd (load (field st cases)) rej)]
+    (if (and (> rej 0) (> rej (load (field st cases))))
+        (do
+          (fmt w
+               "\nWARNING: {s} rejected {d} of {d} generated cases ({d}%).\n"
+               name
+               rej
+               total
+               (primitive/udiv (primitive/imul rej 100) total))
+          (print-str w "  The precondition is too sparse — generate valid inputs directly instead of filtering.\n")
+          0)
+        0))
+  0)
+
+;; How many candidates the shrinker may run, given how expensive one is here.
+;;
+;; In-process a candidate costs ~100ns, so twenty thousand of them are free. A
+;; forked candidate costs ~100us — a thousand is a tenth of a second. A candidate
+;; that has to be TIMED OUT costs whole seconds, so the budget collapses to a few
+;; dozen: with a hang, the shrinker's job is to produce a small input quickly,
+;; not the smallest input eventually.
+(defn shrink-budget-for [(cfg PropConfig) (crash-code i64)] (-> i64)
+  (if (= crash-code 142)
+      64
+      (if (> crash-code 128)
+          (primitive/udiv (load (field cfg shrink-budget)) 20)
+          (load (field cfg shrink-budget)))))
+
+;; SIGALRM means the watchdog fired: the property did not crash, it never
+;; finished. Saying "signal 14" instead makes the reader look up a signal number
+;; to learn something the runner already knew.
+(defn failure-kind [(crash-code i64)] (-> (slice u8))
+  (if (= crash-code 142) "TIMED OUT" "CRASHED"))
+
+;; Shrink the tape the Source is currently holding, then print it and abort.
+;; `crash-code` is 128+signal when the failure was a crash (in which case every
+;; candidate is evaluated in its own child) and -1 for an ordinary counterexample.
+(defn report-failure [(w (ptr Writer))
+                      (name (slice u8))
+                      (file (slice u8))
+                      (line i64)
+                      (prop (fnptr c [(ptr Source) i64] bool))
+                      (s (ptr Source))
+                      (cfg PropConfig)
+                      (st (ptr PropStats))
+                      (crash-code i64)] (-> i64)
+  (let [mem (malloc-allocator)
+        rc (unwrap-ptr [RunCtx] (create [RunCtx] mem))
+        (mut failing) (tape-clone mem (src-tape s))
+        (mut failing-spans) (spans-clone mem (src-spans s))]
+    (store! (field rc src) s)
+    (store! (field rc prop) prop)
+    (store! (field rc size) (src-size s))
+    (store! (field rc crash-code) crash-code)
+    (store! (field rc cand-timeout) (args-int "--candidate-timeout" 5))
+    (let [runner
+            (if (> crash-code 128)
+                (primitive/fnptr-of run-candidate-forked)
+                (primitive/fnptr-of run-candidate))
+          sc
+            (shrink-ctx-new mem
+                            s
+                            runner
+                            (primitive/cast (ptr i8) rc)
+                            (shrink-budget-for cfg crash-code))]
+      (sc-seed-best! sc (mut failing) (mut failing-spans))
+      (shrink-run! sc)
+      (store! (field st shrink-calls) (sc-calls sc))
+      (store! (field st shrinks) (sc-accepted sc))
+      ; Save the MINIMIZED tape, not the one that happened to fail: tomorrow's
+      ; reuse phase should replay the small input, and it should not have to
+      ; re-derive it. A database that cannot be written (read-only checkout, no
+      ; permission) is not a test failure and is deliberately silent.
+      (db-save-failure mem name (sc-best sc))
+      (fmt w
+           "\nFAILED after {d} cases ({d} shrinks, {d} shrink calls)\n"
+           (load (field st cases))
+           (sc-accepted sc)
+           (sc-calls sc))
+      (print-str w "\n  counterexample:\n")
+      ; Re-run the minimal tape with printing on. For a CRASH the body must NOT
+      ; run here: printing the input is the whole point, and the body would end
+      ; the process before the values reached the terminal.
+      (source-begin-replay! s (sc-best sc) (load (field rc size)))
+      (primitive/call-ptr prop s (if (> crash-code 128) PROP-MODE-DRAW-SHOW PROP-MODE-SHOW))
+      (if (> crash-code 128)
+          (do
+            (if (= crash-code 142)
+                (fmt w
+                     "\n  the property NEVER FINISHED on this input (watchdog fired after {d}s).\n"
+                     (args-int "--timeout" 60))
+                (fmt w
+                     "\n  the property CRASHED on this input (signal {d}).\n"
+                     (primitive/isub crash-code 128)))
+            0)
+          0)
+      (fmt w "\n  property {s}\n       at {s}:{d}\n" name file line)
+      (fmt w
+           "\n  reproduce:  coil test {s} --seed {d} --cases {d}\n\n"
+           file
+           (load (field cfg seed))
+           (load (field cfg cases)))
+      (abort)
+      1)))

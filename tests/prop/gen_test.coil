@@ -1,0 +1,533 @@
+(module prop-gen-test)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.assert" :use *)
+(import "coil.prop" :use *)
+(import "coil.prop.shrink" :use *)
+; Tests for `coil.prop.gen` — first-class generator VALUES.
+;
+; Two things are being checked throughout, and they are not the same thing:
+;   * the distribution — draws land where the generator says they land;
+;   * the TAPE — the empty tape yields each generator's minimum, and the tape a
+;     draw produces replays to the same value. Everything downstream (shrinking,
+;     replay, the corpus) is only as true as those two.
+;
+; A generator's environment lives in the case arena, so every test rebuilds its
+; generators AFTER `source-begin-*`. Be honest about what that demonstrates: it is
+; the discipline the module asks of its users, followed here — not tested here. The
+; workaround below leaves `src-alloc` handing out malloc, so the arena's offset
+; never leaves 0 and a test that violated the discipline would still pass. Once the
+; `source-new` fix lands, this file is the first thing that exercises the real
+; rewind, and a lifetime bug in a combinator surfaces here rather than in a user's
+; property.
+
+;; ⚠ The second `malloc-allocator` call is a WORKAROUND for a bug in
+;; `prop_source.coil`, not a ritual. `source-new` builds the case arena with
+;; `(arena-over-buffer ar mem buf cap)` — and `arena-over-buffer` overwrites the
+;; `Allocator` STRUCT it is handed, in place. It is handed `mem`, so after
+;; `source-new` returns, the caller's allocator IS the arena; the tape, the replay
+;; tape and the span table were all created with that same pointer, so they
+;; allocate out of the case arena and the per-case rewind hands their storage to
+;; the next generator that asks for memory. A second replay of the same tape then
+;; reads a Choice that a generator environment has overwritten, the kind no longer
+;; matches, and the draw silently degrades to ST-OVERRUN. `.scratch/source_arena_bug.coil`
+;; is the repro, with no generator value involved; the same corruption is what makes
+;; `shrink-run!` segfault a few dozen candidates in (its `seen` HashMap lands in the
+;; arena too).
+;;
+;; `malloc-allocator` re-initialises its (single, global) cell on every call, so
+;; calling it again puts malloc back and the Source's own lists behave. It also
+;; un-arenas the arena: `src-alloc` returns that same cell, so under this workaround
+;; every generated value is malloc'd and nothing is ever reclaimed. That is a fine
+;; trade for a test binary and a bad one to mistake for coverage — see the note at
+;; the top of the file. The real fix is one line in `source-new` — give the arena
+;; its own Allocator:
+;;   aa (unwrap-ptr [Allocator] (create [Allocator] mem))
+;;   a  (arena-over-buffer ar aa buf arena-cap)
+;; That file belongs to another agent; when it lands, delete the second call here.
+(defn test-source [] (-> (ptr Source))
+  (let [s (source-new (malloc-allocator) 262144 20260809)]
+    (malloc-allocator)
+    s))
+
+;; An empty tape: every draw overruns, so every generator must synthesize its
+;; minimum. This is the floor the shrinker is guaranteed to be able to reach.
+(defn empty-tape [] (-> (ArrayList Choice))
+  (al-new [Choice] (malloc-allocator)))
+
+(defn even-p [(x (ptr i64))] (-> bool)
+  (= (primitive/irem (load x) 2) 0))
+
+(defn over-90-p [(x (ptr i64))] (-> bool)
+  (> (load x) 90))
+
+;; One draw in ten satisfies this, so a filter over `(gen-int s 0 1000)` almost
+;; always has to resample. `over-90-p` passes nine times in ten and leaves the
+;; retry path — the only path `gen-rewind!` is on — mostly unexecuted.
+(defn ends-in-7-p [(x (ptr i64))] (-> bool)
+  (= (primitive/irem (load x) 10) 7))
+
+(defn double-it [(x (ptr i64))] (-> i64)
+  (primitive/imul (load x) 2))
+
+;; Insertion sort over a copy — the "sorted list" generator's mapping function.
+(defn sort-list [(xs (ptr (ArrayList i64)))] (-> (ArrayList i64))
+  (let [n (al-len [i64] (load xs))
+        (mut out) (al-new [i64] (load (field xs alc)))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (al-push! [i64] (mut out) (al-get [i64] (load xs) (load i)))
+                (store! i (primitive/iadd (load i) 1)))))
+    (let [(mut a) 1]
+      (loop (if (>= (load a) n)
+                (break)
+                (let [v (al-get [i64] (load out) (load a))
+                      (mut b) (primitive/isub (load a) 1)]
+                  (loop (if (or (< (load b) 0) (<= (al-get [i64] (load out) (load b)) v))
+                            (break)
+                            (do
+                              (al-set! [i64]
+                                       (mut out)
+                                       (primitive/iadd (load b) 1)
+                                       (al-get [i64] (load out) (load b)))
+                              (store! b (primitive/isub (load b) 1)))))
+                  (al-set! [i64] (mut out) (primitive/iadd (load b) 1) v)
+                  (store! a (primitive/iadd (load a) 1))
+                  0))))
+    (load out)))
+
+(defn list-sorted? [(xs (ArrayList i64))] (-> bool)
+  (let [n (al-len [i64] xs)
+        (mut ok) true
+        (mut i) 1]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (if (< (al-get [i64] xs (load i)) (al-get [i64] xs (primitive/isub (load i) 1)))
+                    (store! ok false)
+                    0)
+                (store! i (primitive/iadd (load i) 1)))))
+    (load ok)))
+
+; ------------------------------------------------------------------- integers
+
+(deftest gen-int-lands-in-range
+         (let [s (test-source)
+               (mut lo-seen) false
+               (mut hi-seen) false
+               (mut distinct) 0
+               (mut i) 0]
+           (loop (if (>= (load i) 400)
+                     (break)
+                     (do
+                       (source-begin-generate! s 30)
+                       (let [v (gen-draw (gen-int s 3 9) s)]
+                         (assert (>= v 3))
+                         (assert (<= v 9))
+                         (if (= v 3) (store! lo-seen true) 0)
+                         (if (= v 9) (store! hi-seen true) 0)
+                         (if (= v 7) (store! distinct (primitive/iadd (load distinct) 1)) 0))
+                       (store! i (primitive/iadd (load i) 1)))))
+           ; both endpoints and an interior value in 400 draws: the range is really being
+           ; sampled, not clamped to one end (the failure mode a range bug produces).
+           (assert (= (load lo-seen) true))
+           (assert (= (load hi-seen) true))
+           (assert (> (load distinct) 0))))
+
+(deftest gen-int-minimal-tape
+         (let [s (test-source)
+               (mut t) (empty-tape)]
+           (source-begin-replay! s (mut t) 30)
+           ; the endpoint nearest zero, which for 3..9 is 3 and for -9..-3 is -3
+           (assert-eq (gen-draw (gen-int s 3 9) s) 3)
+           (assert-eq (gen-draw (gen-int s -9 -3) s) -3)
+           (assert-eq (gen-draw (gen-int s -4 4) s) 0)
+           ; …and the explicit origin when the caller gives one
+           (assert-eq (gen-draw (gen-int-toward s 1 1000 80) s) 80)))
+
+(deftest gen-int-toward-biases-shrink-target
+         (let [s (test-source)
+               (mut n-at-origin) 0
+               (mut i) 0]
+           (loop (if (>= (load i) 2000)
+                     (break)
+                     (do
+                       (source-begin-generate! s 30)
+                       (let [v (gen-draw (gen-int-toward s 1 1000 80) s)]
+                         (assert (>= v 1))
+                         (assert (<= v 1000))
+                         (if (= v 80) (store! n-at-origin (primitive/iadd (load n-at-origin) 1)) 0))
+                       (store! i (primitive/iadd (load i) 1)))))
+           ; the origin is in the edge-case pool (one draw in eight is an edge, and the
+           ; origin is one of fifteen edges), so it lands far more often than the two
+           ; times in 2000 a uniform draw over 1..1000 would give it
+           (assert (> (load n-at-origin) 4))))
+
+; ------------------------------------------------------------------- booleans
+
+(deftest gen-bool-p-honours-its-odds
+         (let [s (test-source)
+               (mut trues) 0
+               (mut i) 0]
+           (loop (if (>= (load i) 300)
+                     (break)
+                     (do
+                       (source-begin-generate! s 30)
+                       (if (gen-draw (gen-bool-p s 1 1) s) 0 (assert false))
+                       (if (gen-draw (gen-bool-p s 0 1) s) (assert false) 0)
+                       (if (gen-draw (gen-bool-p s 1 4) s)
+                           (store! trues (primitive/iadd (load trues) 1))
+                           0)
+                       (store! i (primitive/iadd (load i) 1)))))
+           (assert (> (load trues) 20))
+           (assert (< (load trues) 160))))
+
+(deftest gen-bool-minimal-tape-is-false
+         (let [s (test-source)
+               (mut t) (empty-tape)]
+           (source-begin-replay! s (mut t) 30)
+           (if (gen-draw (gen-bool-p s 3 4) s) (assert false) 0)
+           (if (gen-draw (gen-bool s) s) (assert false) 0)))
+
+; ------------------------------------------------------ constants and sampling
+
+(deftest gen-const-records-no-choice
+         (let [s (test-source)]
+           (source-begin-generate! s 30)
+           (let [g (gen-const s 42)
+                 before (al-len [Choice] (load (src-tape s)))
+                 v (gen-draw g s)
+                 after (al-len [Choice] (load (src-tape s)))]
+             (assert-eq v 42)
+             ; a constant that recorded a choice would give the shrinker a knob that
+             ; cannot change the value — every candidate it proposed there is wasted work
+             (assert-eq before after))))
+
+(deftest gen-elem-of-samples-the-set
+         (let [s (test-source)
+               a (malloc-allocator)
+               buf (unwrap-ptr [i64] (alloc-slice [i64] a 4))]
+           (store! (primitive/index buf 0) 11)
+           (store! (primitive/index buf 1) 22)
+           (store! (primitive/index buf 2) 33)
+           (store! (primitive/index buf 3) 44)
+           (let [xs (slice-new [i64] buf 4)
+                 (mut seen-last) false
+                 (mut i) 0]
+             (loop (if (>= (load i) 200)
+                       (break)
+                       (do
+                         (source-begin-generate! s 30)
+                         (let [v (gen-draw (gen-elem-of s xs) s)]
+                           (assert (or (or (= v 11) (= v 22)) (or (= v 33) (= v 44))))
+                           (if (= v 44) (store! seen-last true) 0))
+                         (store! i (primitive/iadd (load i) 1)))))
+             (assert (= (load seen-last) true))
+             ; the INDEX is the choice, so the minimum is the first element — which is
+             ; why the API says to put the boring one first
+             (let [(mut t) (empty-tape)]
+               (source-begin-replay! s (mut t) 30)
+               (assert-eq (gen-draw (gen-elem-of s xs) s) 11)))))
+
+; --------------------------------------------------------------------- map
+
+(deftest gen-map-applies-and-stays-shrinkable
+         (let [s (test-source)]
+           (source-begin-generate! s 30)
+           (let [before (al-len [Choice] (load (src-tape s)))
+                 v (gen-draw (gen-map s (gen-int s 3 9) (fnptr-of double-it)) s)
+                 after (al-len [Choice] (load (src-tape s)))]
+             (assert (>= v 6))
+             (assert (<= v 18))
+             (assert-eq (primitive/irem v 2) 0)
+             ; map itself records nothing: the tape belongs to the inner generator, which
+             ; is exactly why shrinking a mapped generator needs no inverse of the function
+             (assert-eq (primitive/isub after before) 1))
+           (let [(mut t) (empty-tape)]
+             (source-begin-replay! s (mut t) 30)
+             (assert-eq (gen-draw (gen-map s (gen-int s 3 9) (fnptr-of double-it)) s) 6))))
+
+(deftest gen-list-map-sorts
+         (let [s (test-source)
+               (mut i) 0]
+           (loop (if (>= (load i) 100)
+                     (break)
+                     (do
+                       (source-begin-generate! s 30)
+                       (let [g
+                               (gen-list-map s
+                                             (gen-list-of s (gen-int s 1 100) 1 8)
+                                             (fnptr-of sort-list))
+                             xs (gen-draw g s)]
+                         (assert (= (list-sorted? xs) true))
+                         (assert (>= (al-len [i64] xs) 1))
+                         (assert (<= (al-len [i64] xs) 8)))
+                       (store! i (primitive/iadd (load i) 1)))))))
+
+; ------------------------------------------------------------------- filter
+
+(deftest gen-filter-yields-only-satisfying-values
+         (let [s (test-source)
+               (mut i) 0]
+           (loop (if (>= (load i) 300)
+                     (break)
+                     (do
+                       (source-begin-generate! s 30)
+                       (let [v (gen-draw (gen-filter s (gen-int s 0 1000) (fnptr-of even-p) 25) s)]
+                         ; a rejected case is the honest failure mode; 25 tries at a
+                         ; 1-in-2 predicate makes it astronomically unlikely
+                         (assert-eq (src-status s) ST-OK)
+                         (assert-eq (primitive/irem v 2) 0))
+                       (store! i (primitive/iadd (load i) 1)))))))
+
+;; Replaying what a filtered draw produced reproduces it, in exactly the choices it
+;; recorded. Note what this does NOT pin down: a filter that left its rejected
+;; attempts on the tape would replay those too, miss the predicate in the same
+;; order, and land on the same value — this test passes either way. Canonicality is
+;; `gen-filter-leaves-only-the-accepted-attempt` below.
+(deftest gen-filter-replays-to-the-same-value
+         (let [s (test-source)
+               a (malloc-allocator)
+               (mut i) 0]
+           (loop (if (>= (load i) 100)
+                     (break)
+                     (do
+                       (source-begin-generate! s 30)
+                       (let [v (gen-draw (gen-filter s (gen-int s 0 1000) (fnptr-of over-90-p) 60) s)
+                             (mut tape) (tape-clone a (src-tape s))
+                             len-generated (al-len [Choice] (load (src-tape s)))]
+                         (assert (> v 90))
+                         (source-begin-replay! s (mut tape) 30)
+                         (let [w (gen-draw (gen-filter s (gen-int s 0 1000) (fnptr-of over-90-p) 60) s)]
+                           (assert-eq w v)
+                           (assert-eq (src-status s) ST-OK)
+                           ; and it replays in exactly the choices it recorded — no
+                           ; leftover attempt is re-consumed
+                           (assert-eq (al-len [Choice] (load (src-tape s))) len-generated)))
+                       (store! i (primitive/iadd (load i) 1)))))))
+
+;; What makes span-local resampling correct rather than merely cheap: the rejected
+;; attempts are GONE from the tape. The inner generator records exactly ONE choice
+;; per attempt, so the tape length after the draw counts the attempts that survived
+;; — one, or `gen-rewind!` is not doing its job. Everything downstream rests on that
+;; number: the shrinker's cost is proportional to tape length, and a candidate that
+;; edits a choice belonging to a rejected attempt is editing a value the property
+;; never saw.
+(deftest gen-filter-leaves-only-the-accepted-attempt
+         (let [s (test-source)
+               (mut i) 0]
+           (loop (if (>= (load i) 200)
+                     (break)
+                     (do
+                       (source-begin-generate! s 30)
+                       (let [v (gen-draw (gen-filter s (gen-int s 0 1000) (fnptr-of ends-in-7-p) 200) s)]
+                         (assert-eq (src-status s) ST-OK)
+                         (assert-eq (primitive/irem v 10) 7)
+                         (assert-eq (al-len [Choice] (load (src-tape s))) 1))
+                       (store! i (primitive/iadd (load i) 1)))))))
+
+;; An unsatisfiable filter must reject the case — loudly, through the same channel
+;; `assume` uses — rather than loop, hang, or hand back a value the predicate
+;; never approved.
+(deftest gen-filter-exhaustion-rejects
+         (let [s (test-source)]
+           (source-begin-generate! s 30)
+           (gen-draw (gen-filter s (gen-int s 0 10) (fnptr-of over-90-p) 8) s)
+           (assert-eq (src-status s) ST-REJECTED)))
+
+; ------------------------------------------------------------------- one-of
+
+(deftest gen-one-of-respects-weights
+         (let [s (test-source)
+               (mut heavy) 0
+               (mut light) 0
+               (mut i) 0]
+           (loop (if (>= (load i) 600)
+                     (break)
+                     (do
+                       (source-begin-generate! s 30)
+                       (source-swarm! s -1)
+                       (let [as (gen-alts [i64] s 2)]
+                         (gen-alt! [i64] as 0 9 (gen-const s 100))
+                         (gen-alt! [i64] as 1 1 (gen-const s 200))
+                         (let [v (gen-draw (gen-one-of s as) s)]
+                           (if (= v 100)
+                               (store! heavy (primitive/iadd (load heavy) 1))
+                               (do
+                                 (assert-eq v 200)
+                                 (store! light (primitive/iadd (load light) 1))))))
+                       (store! i (primitive/iadd (load i) 1)))))
+           (assert (> (load light) 0))
+           (assert (> (load heavy) (primitive/imul (load light) 3)))))
+
+(deftest gen-one-of-honours-the-swarm-mask
+         (let [s (test-source)
+               (mut i) 0]
+           (loop (if (>= (load i) 200)
+                     (break)
+                     (do
+                       (source-begin-generate! s 30)
+                       ; only alternative 0 is in this case's feature set
+                       (source-swarm! s 1)
+                       (let [as (gen-alts [i64] s 3)]
+                         (gen-alt! [i64] as 0 1 (gen-const s 100))
+                         (gen-alt! [i64] as 1 8 (gen-const s 200))
+                         (gen-alt! [i64] as 2 8 (gen-const s 300))
+                         (assert-eq (gen-draw (gen-one-of s as) s) 100))
+                       (store! i (primitive/iadd (load i) 1)))))
+           ; and with alternative 1 masked in, the heavy alternative comes back
+           (let [(mut found) false
+                 (mut j) 0]
+             (loop (if (or (load found) (>= (load j) 200))
+                       (break)
+                       (do
+                         (source-begin-generate! s 30)
+                         (source-swarm! s 2)
+                         (let [as (gen-alts [i64] s 2)]
+                           (gen-alt! [i64] as 0 1 (gen-const s 100))
+                           (gen-alt! [i64] as 1 1 (gen-const s 200))
+                           (if (= (gen-draw (gen-one-of s as) s) 200) (store! found true) 0))
+                         (store! j (primitive/iadd (load j) 1)))))
+             (assert (= (load found) true)))))
+
+(deftest gen-one-of-minimal-tape-is-alternative-zero
+         (let [s (test-source)
+               (mut t) (empty-tape)]
+           (source-begin-replay! s (mut t) 30)
+           (source-swarm! s -1)
+           (let [as (gen-alts [i64] s 2)]
+             (gen-alt! [i64] as 0 1 (gen-int s 5 9))
+             (gen-alt! [i64] as 1 50 (gen-const s 200))
+             ; alternative 0, at ITS minimum — declaration order is shrink order all the
+             ; way down, not just at the top level
+             (assert-eq (gen-draw (gen-one-of s as) s) 5))))
+
+; -------------------------------------------------------------------- lists
+
+(deftest gen-list-of-length-and-elements
+         (let [s (test-source)
+               (mut saw-max) false
+               (mut i) 0]
+           (loop (if (>= (load i) 300)
+                     (break)
+                     (do
+                       (source-begin-generate! s 30)
+                       (let [xs (gen-draw (gen-list-of s (gen-int s 3 9) 2 5) s)
+                             n (al-len [i64] xs)
+                             (mut k) 0]
+                         (assert (>= n 2))
+                         (assert (<= n 5))
+                         (if (= n 5) (store! saw-max true) 0)
+                         (loop (if (>= (load k) n)
+                                   (break)
+                                   (do
+                                     (assert (>= (al-get [i64] xs (load k)) 3))
+                                     (assert (<= (al-get [i64] xs (load k)) 9))
+                                     (store! k (primitive/iadd (load k) 1))))))
+                       (store! i (primitive/iadd (load i) 1)))))
+           (assert (= (load saw-max) true))))
+
+(deftest gen-list-of-minimal-tape
+         (let [s (test-source)
+               (mut t) (empty-tape)]
+           (source-begin-replay! s (mut t) 30)
+           (let [xs (gen-draw (gen-list-of s (gen-int s 3 9) 2 5) s)]
+             ; the shortest legal list of the smallest legal elements
+             (assert-eq (al-len [i64] xs) 2)
+             (assert-eq (al-get [i64] xs 0) 3)
+             (assert-eq (al-get [i64] xs 1) 3))))
+
+; ------------------------------------------------------------------ shrinking
+
+;; The claim generator values have to earn: a hand-built generator shrinks without
+;; anyone writing a shrinker for it, because the value is a function of the tape and
+;; shrinking is an edit to the tape. This drives the REAL shrinker — the same
+;; `shrink-run!` the runner drives — over a property whose input comes entirely from
+;; generator values, and demands the exact minimal counterexample.
+;;
+;; It cannot be a failing `defprop`: a failing property aborts the process, which is
+;; how `coil test` records a failure. So the property body and the candidate hook are
+;; spelled out here exactly as `defprop` and `prop_runner.coil` expand them.
+;;
+;; The property: no list drawn from `(gen-list-of … 0 8)` over ints in 0..1000 sums to
+;; 50 or more. False, and the minimal counterexample is the one-element list [50] —
+;; one element because the length choice shrinks toward 0, and 50 because a smaller
+;; element makes the property hold.
+
+(defstruct GenShrinkCtx [(src (ptr Source))])
+
+(defn shrink-prop [(s (ptr Source))] (-> bool)
+  (let [xs (gen-draw (gen-list-of s (gen-int s 0 1000) 0 8) s)
+        n (al-len [i64] xs)
+        (mut sum) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (store! sum (primitive/iadd (load sum) (al-get [i64] xs (load i))))
+                (store! i (primitive/iadd (load i) 1)))))
+    (< (load sum) 50)))
+
+;; Replay a candidate tape and report whether the property STILL fails on it. A
+;; rejected case is not a failure — counting it as one is how a shrinker ends up
+;; "minimizing" into inputs the property never claimed anything about.
+(defn shrink-candidate [(ctx (ptr i8)) (tape (ptr (ArrayList Choice)))] (-> bool)
+  (let [c (primitive/cast (ptr GenShrinkCtx) ctx)
+        s (load (field c src))]
+    (source-begin-replay! s tape 30)
+    (let [held (shrink-prop s)]
+      (if (= (src-status s) ST-REJECTED) false (not held)))))
+
+(deftest hand-built-generator-shrinks-to-the-minimum
+         (let [mem (malloc-allocator)
+               s (test-source)
+               ctx (unwrap-ptr [GenShrinkCtx] (create [GenShrinkCtx] mem))
+               (mut found) false
+               (mut i) 0]
+           (store! (field ctx src) s)
+           (loop (if (or (load found) (>= (load i) 2000))
+                     (break)
+                     (do
+                       (source-begin-generate! s 30)
+                       (source-swarm! s -1)
+                       (if (shrink-prop s) 0 (store! found true))
+                       (store! i (primitive/iadd (load i) 1)))))
+           (assert (= (load found) true))
+           (let [(mut failing) (tape-clone mem (src-tape s))
+                 (mut failing-spans) (spans-clone mem (src-spans s))
+                 sc
+                   (shrink-ctx-new mem
+                                   s
+                                   (primitive/fnptr-of shrink-candidate)
+                                   (primitive/cast (ptr i8) ctx)
+                                   20000)]
+             (sc-seed-best! sc (mut failing) (mut failing-spans))
+             (shrink-run! sc)
+             ; the shrinker keeps the tape each accepted RUN produced, so replaying its
+             ; best tape through the same generator is what the counterexample report does
+             (source-begin-replay! s (sc-best sc) 30)
+             (let [xs (gen-draw (gen-list-of s (gen-int s 0 1000) 0 8) s)]
+               (assert-eq (al-len [i64] xs) 1)
+               (assert-eq (al-get [i64] xs 0) 50)))))
+
+; -------------------------------------------------------------- with defprop
+
+;; The integration check: generator values inside a real `defprop`, drawing from
+;; the property's own Source via `(prop-src)`. Everything here holds for every
+;; case, so the property passes — the shrinking of a FAILING one is the test above.
+(defprop generator-values-compose
+         []
+         (let [s (prop-src)
+               small (gen-int s 1 100)
+               evens (gen-filter s small (fnptr-of even-p) 30)
+               sorted (gen-list-map s (gen-list-of s small 1 8) (fnptr-of sort-list))
+               xs (gen-draw sorted s)
+               k (gen-draw evens s)]
+           (and (list-sorted? xs)
+                (and (= (primitive/irem k 2) 0)
+                     (and (>= (al-len [i64] xs) 1)
+                          (<= (al-len [i64] xs) 8))))))

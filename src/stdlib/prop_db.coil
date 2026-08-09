@@ -1,0 +1,550 @@
+(module coil.prop.db)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use *)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.str" :as str)
+(import "coil.os" :as os)
+(import "coil.args" :as args)
+(import "coil.fs" :as fs)
+(import "coil.prop.source" :use *)
+; THE FAILURE DATABASE — a bug you found yesterday must fail in the first
+; millisecond today, not after the two hundredth random case.
+;
+; A random search is a lottery: the seed that found the bug is gone as soon as
+; someone edits the property, bumps the case count, or runs on a machine whose
+; environment differs. So the run loop's FIRST phase replays the last known
+; counterexample from disk (Hypothesis's "reuse" phase; jqwik's database), and
+; only then spends budget on new cases. The artifact that makes this possible is
+; the tape: a value is a pure function of its choices, so persisting the choices
+; persists the value — across recompiles, across machines, across a generator
+; that has since grown a new draw (a stale tape then replays as an overrun and
+; simply fails to reproduce, which is the honest outcome).
+;
+; Two rules govern the I/O, and they are NOT symmetric:
+;
+;   WRITING may fail silently. A read-only checkout, a sandbox with no $HOME, a
+;   full disk — none of those are test failures, and a test suite that turns red
+;   because it could not write a cache file is a broken test suite.
+;
+;   READING may NOT fail silently. If `failing` exists but is not a tape, the
+;   only safe report is an error. Quietly ignoring it hides the fact that the
+;   reuse phase is dead, and quietly decoding half of it is worse: a truncated
+;   tape is a DIFFERENT input, so it would "reproduce" a different bug (or none)
+;   under the name of the one that was saved. Hence a length-exact, checksummed
+;   format and a decoder with no partial-success path.
+
+; ------------------------------------------------------------------- format
+;
+; A tape file is fixed-width and self-describing:
+;
+;   off  size  field
+;     0     4  magic  "CPBT"
+;     4     1  version (currently 1)
+;     5     3  reserved, MUST be zero (room for flags without a version bump)
+;     8     8  choice count, little-endian i64, >= 0
+;    16    56  choice 0: kind, flags, span, lo, hi, origin, value
+;               — seven little-endian i64s, in Choice declaration order
+;   ...          choice 1 … choice n-1
+;   16+56n  8  FNV-1a hash of bytes [0, 16+56n), little-endian i64
+;
+; so a file is exactly `16 + 56n + 8` bytes and nothing else is accepted.
+;
+; Little-endian regardless of host: the tape is a portable artifact (checked into
+; a repro, mailed with a bug report), and "whatever this machine's byte order is"
+; is not a format. The 3 reserved bytes exist so the choice array starts 8-byte
+; aligned, which keeps a future zero-copy decoder possible.
+;
+; Spans are deliberately NOT persisted. They are rebuilt by re-running the
+; generator during replay, so storing them would be storing a derived value that
+; can disagree with the tape — and disagreement in a reproduction artifact is the
+; one thing worse than not having it.
+
+(const TAPE-MAGIC-0 67)  ; 'C'
+(const TAPE-MAGIC-1 80)  ; 'P'
+(const TAPE-MAGIC-2 66)  ; 'B'
+(const TAPE-MAGIC-3 84)  ; 'T'
+(const TAPE-VERSION 1)
+(const TAPE-HEADER 16)
+(const TAPE-CHOICE-BYTES 56)
+(const TAPE-TRAILER 8)
+(const TAPE-MIN-BYTES 24)  ; TAPE-HEADER + TAPE-TRAILER
+
+;; Why a buffer is not a tape. Every rejection carries the numbers a human needs
+;; to tell "someone truncated my file" from "this is a v2 tape and I am v1" —
+;; a bare `(None)` here would make a dead reuse phase indistinguishable from a
+;; first run, which is exactly the failure this module exists to prevent.
+(defsum TapeError
+  (TapeTruncated [(need i64) (got i64)])
+  (TapeBadMagic)
+  (TapeBadVersion [(found i64)])
+  (TapeBadReserved)
+  (TapeBadCount [(count i64)])
+  (TapeBadLength [(want i64) (got i64)])
+  (TapeBadChecksum [(want i64) (got i64)])
+  (TapeBadChoice [(index i64)])
+  (TapeIo [(errno i64)]))
+
+;; Report why a saved counterexample could not be used. The runner prints this
+;; and keeps going: a corrupt database costs you the reuse phase, not the run.
+(defn tape-error-print [(w (ptr Writer)) (e TapeError)] (-> i64)
+  (match e
+    (TapeTruncated [need got] (do (fmt w "truncated: need at least {d} bytes, got {d}\n" need got) 0))
+    (TapeBadMagic [] (do (print-str w "not a Coil tape file (bad magic)\n") 0))
+    (TapeBadVersion [found] (do (fmt w "unsupported tape version {d} (this build writes {d})\n" found TAPE-VERSION) 0))
+    (TapeBadReserved [] (do (print-str w "reserved header bytes are not zero\n") 0))
+    (TapeBadCount [count] (do (fmt w "impossible choice count {d}\n" count) 0))
+    (TapeBadLength [want got] (do (fmt w "length mismatch: header describes {d} bytes, file is {d}\n" want got) 0))
+    (TapeBadChecksum [want got] (do (fmt w "checksum mismatch: want {x}, got {x}\n" want got) 0))
+    (TapeBadChoice [index] (do (fmt w "choice {d} violates its own constraints\n" index) 0))
+    ; errno 0 is not an errno: `fs/read-file` uses it for "I never got as far as
+    ; a syscall" (it could not even allocate the C path). Printing "errno 0" sends
+    ; the reader to a man page that says the call succeeded.
+    (TapeIo [errno]
+            (if (= errno 0)
+                (do (print-str w "could not be read (out of memory)\n") 0)
+                (do (fmt w "I/O error (errno {d})\n" errno) 0)))))
+
+; ------------------------------------------------------------ byte plumbing
+
+;; FNV-1a over `[lo, hi)`. Not a security hash — its job is to catch the file
+;; that was half-written when the machine died, or that a merge tool "helpfully"
+;; line-ending-converted. Both produce a plausible length and a wrong tape.
+(defn tape-checksum [(b (slice u8)) (lo i64) (hi i64)] (-> i64)
+  (let [(mut h) -3750763034362895579  ; 14695981039346656037 as i64 bits
+        (mut i) lo]
+    (loop (if (>= (load i) hi)
+              (break)
+              (do
+                (store! h
+                        (primitive/imul (primitive/ixor (load h) (primitive/cast i64 (slice-get b (load i))))
+                                        1099511628211))
+                (store! i (primitive/iadd (load i) 1)))))
+    (load h)))
+
+;; Append `v` little-endian.
+;;
+;; TWO things keep a negative `v` from encoding as eight 0xFF bytes, and only one
+;; of them is obvious. `primitive/ishr` is ARITHMETIC on a signed operand, so it
+;; smears the sign bit downward; the `u64` cast makes it logical. But the `& 255`
+;; is what actually saves this loop — with `k <= 7` the byte that survives the
+;; mask is bits [8k, 8k+8), which an arithmetic and a logical shift agree on. So
+;; the cast is currently belt-and-braces, and the MASK is load-bearing: anyone
+;; widening this to 16-bit chunks, or dropping the mask because "the u8 cast
+;; truncates anyway", reintroduces the bug that the cast alone would not catch.
+;; `tape-roundtrip-extremes` encodes i64 MIN, and it does NOT fail if you change
+;; the cast back to i64 — verified, not assumed.
+(defn tape--push-i64! [(b (ptr (ArrayList u8))) (v i64)] (-> i64)
+  (let [(mut k) 0]
+    (loop (if (>= (load k) 8)
+              (break)
+              (do
+                (al-push! [u8]
+                          b
+                          (primitive/cast u8
+                                          (primitive/iand (primitive/cast i64
+                                                                          (primitive/ishr (primitive/cast u64 v)
+                                                                                          (primitive/cast u64
+                                                                                                          (primitive/imul (load k)
+                                                                                                                          8))))
+                                                          255)))
+                (store! k (primitive/iadd (load k) 1)))))
+    0))
+
+;; Read a little-endian i64 at `off`. The caller has already proved `off + 8` is
+;; in bounds — this is the inner loop of decoding, so the length check lives once
+;; at the top of `tape-decode` rather than eight times per choice.
+(defn tape--get-i64 [(b (slice u8)) (off i64)] (-> i64)
+  (let [(mut v) 0
+        (mut k) 0]
+    (loop (if (>= (load k) 8)
+              (break)
+              (do
+                (store! v
+                        (primitive/ior (load v)
+                                       (primitive/cast i64
+                                                       (primitive/ishl (primitive/cast u64
+                                                                                       (primitive/cast i64
+                                                                                                       (slice-get b
+                                                                                                                  (primitive/iadd off
+                                                                                                                                  (load k)))))
+                                                                       (primitive/cast u64 (primitive/imul (load k) 8))))))
+                (store! k (primitive/iadd (load k) 1)))))
+    (load v)))
+
+; ------------------------------------------------------------ encode/decode
+
+;; Serialize a tape. Returns an OWNING `(slice u8)` allocated from `a`; free it
+;; with `(raw-free a (cast (ptr i8) (slice-data s)) (slice-len s) 1)`.
+(defn tape-encode [(a (ptr Allocator)) (t (ptr (ArrayList Choice)))] (-> (slice u8))
+  (let [(mut b) (al-new [u8] a)
+        n (al-len [Choice] (load t))]
+    (al-push! [u8] (mut b) (primitive/cast u8 TAPE-MAGIC-0))
+    (al-push! [u8] (mut b) (primitive/cast u8 TAPE-MAGIC-1))
+    (al-push! [u8] (mut b) (primitive/cast u8 TAPE-MAGIC-2))
+    (al-push! [u8] (mut b) (primitive/cast u8 TAPE-MAGIC-3))
+    (al-push! [u8] (mut b) (primitive/cast u8 TAPE-VERSION))
+    (al-push! [u8] (mut b) (primitive/cast u8 0))
+    (al-push! [u8] (mut b) (primitive/cast u8 0))
+    (al-push! [u8] (mut b) (primitive/cast u8 0))
+    (tape--push-i64! (mut b) n)
+    (let [(mut i) 0]
+      (loop (if (>= (load i) n)
+                (break)
+                (let [c (al-elem [Choice] t (load i))]
+                  (tape--push-i64! (mut b) (load (field c kind)))
+                  (tape--push-i64! (mut b) (load (field c flags)))
+                  (tape--push-i64! (mut b) (load (field c span)))
+                  (tape--push-i64! (mut b) (load (field c lo)))
+                  (tape--push-i64! (mut b) (load (field c hi)))
+                  (tape--push-i64! (mut b) (load (field c origin)))
+                  (tape--push-i64! (mut b) (load (field c value)))
+                  (store! i (primitive/iadd (load i) 1))
+                  0))))
+    ; the checksum covers everything written so far, so it has to be computed
+    ; over the list's own bytes before the trailer is appended.
+    (let [payload (al-slice [u8] (load b))
+          sum (tape-checksum payload 0 (slice-len payload))]
+      (tape--push-i64! (mut b) sum))
+    (al-into-slice [u8] (mut b))))
+
+;; Coil has no positional constructors, so a struct is `zeroed` + a `store!` per
+;; field. Doing that inline in the decode loop would put seven stores between the
+;; reads and the push, which is exactly where a field gets transposed and a tape
+;; silently decodes with `lo` and `hi` swapped.
+(defn tape--mk-choice [(kind i64) (flags i64) (span i64) (lo i64) (hi i64) (origin i64) (value i64)] (-> Choice)
+  (let [c (primitive/alloc-stack Choice)]
+    (store! (field c kind) kind)
+    (store! (field c flags) flags)
+    (store! (field c span) span)
+    (store! (field c lo) lo)
+    (store! (field c hi) hi)
+    (store! (field c origin) origin)
+    (store! (field c value) value)
+    (load c)))
+
+;; Everything `record!` guarantees about a choice it wrote, checked on the way
+;; back in. A tape that violates these was not produced by this system, and
+;; feeding it to the shrinker would break the invariant every pass relies on
+;; (`value` inside `[lo, hi]`) rather than producing a wrong answer loudly.
+(defn tape--choice-valid? [(kind i64) (lo i64) (hi i64) (value i64)] (-> bool)
+  (and (and (>= kind CK-INT) (<= kind CK-LEN))
+       (and (<= lo hi) (and (>= value lo) (<= value hi)))))
+
+;; Parse a tape. Either you get the WHOLE tape or you get an error — there is no
+;; path in here that returns a short list, because a short tape is a different
+;; test case wearing the name of the one that was saved.
+(defn tape-decode [(a (ptr Allocator)) (b (slice u8))] (-> (Result (ArrayList Choice) TapeError))
+  (block :d
+         (let [n (slice-len b)]
+           (if (< n TAPE-MIN-BYTES)
+               (return-from :d (Err [(ArrayList Choice) TapeError] (TapeTruncated TAPE-MIN-BYTES n)))
+               0)
+           (if (and (and (= (primitive/cast i64 (slice-get b 0)) TAPE-MAGIC-0)
+                         (= (primitive/cast i64 (slice-get b 1)) TAPE-MAGIC-1))
+                    (and (= (primitive/cast i64 (slice-get b 2)) TAPE-MAGIC-2)
+                         (= (primitive/cast i64 (slice-get b 3)) TAPE-MAGIC-3)))
+               0
+               (return-from :d (Err [(ArrayList Choice) TapeError] (TapeBadMagic))))
+           (let [ver (primitive/cast i64 (slice-get b 4))]
+             (if (= ver TAPE-VERSION)
+                 0
+                 (return-from :d (Err [(ArrayList Choice) TapeError] (TapeBadVersion ver)))))
+           (if (and (= (primitive/cast i64 (slice-get b 5)) 0)
+                    (and (= (primitive/cast i64 (slice-get b 6)) 0)
+                         (= (primitive/cast i64 (slice-get b 7)) 0)))
+               0
+               (return-from :d (Err [(ArrayList Choice) TapeError] (TapeBadReserved))))
+           (let [count (tape--get-i64 b 8)]
+             ; a negative or absurd count must be rejected BEFORE it is used in
+             ; the size arithmetic below, where it would overflow into a length
+             ; that accidentally matches.
+             (if (or (< count 0) (> count 268435456))
+                 (return-from :d (Err [(ArrayList Choice) TapeError] (TapeBadCount count)))
+                 0)
+             (let [want
+                     (primitive/iadd (primitive/iadd TAPE-HEADER (primitive/imul count TAPE-CHOICE-BYTES))
+                                     TAPE-TRAILER)]
+               (if (= want n)
+                   0
+                   (return-from :d (Err [(ArrayList Choice) TapeError] (TapeBadLength want n))))
+               (let [end (primitive/isub n TAPE-TRAILER)
+                     have (tape--get-i64 b end)
+                     sum (tape-checksum b 0 end)]
+                 (if (= have sum)
+                     0
+                     (return-from :d (Err [(ArrayList Choice) TapeError] (TapeBadChecksum sum have)))))
+               (let [(mut out) (al-new [Choice] a)
+                     (mut i) 0]
+                 (loop (if (>= (load i) count)
+                           (break)
+                           (let [off (primitive/iadd TAPE-HEADER (primitive/imul (load i) TAPE-CHOICE-BYTES))
+                                 kind (tape--get-i64 b off)
+                                 flags (tape--get-i64 b (primitive/iadd off 8))
+                                 span (tape--get-i64 b (primitive/iadd off 16))
+                                 lo (tape--get-i64 b (primitive/iadd off 24))
+                                 hi (tape--get-i64 b (primitive/iadd off 32))
+                                 origin (tape--get-i64 b (primitive/iadd off 40))
+                                 value (tape--get-i64 b (primitive/iadd off 48))]
+                             (if (tape--choice-valid? kind lo hi value)
+                                 0
+                                 (do
+                                   (al-free! [Choice] (mut out))
+                                   (return-from :d (Err [(ArrayList Choice) TapeError] (TapeBadChoice (load i))))))
+                             (al-push! [Choice] (mut out) (tape--mk-choice kind flags span lo hi origin value))
+                             (store! i (primitive/iadd (load i) 1))
+                             0)))
+                 (Ok [(ArrayList Choice) TapeError] (load out))))))))
+
+; ------------------------------------------------------------------ the store
+;
+; LAYOUT:  <root>/<sanitised-property-name>/failing
+;
+; `root` is `.coil/pbt` under the current directory, overridable with
+; `COIL_PBT_DB` (a read-only checkout can point it at a scratch dir; a CI job can
+; point it at a cache that survives between builds; the tests point it at a temp
+; dir). The per-property DIRECTORY, rather than a single file per property, is
+; deliberate: the design keeps room for `corpus/` and pinned examples beside
+; `failing`, and a directory is the one namespace the filesystem gives for free.
+;
+; SANITISING. A property name is a Coil symbol, and Coil symbols routinely
+; contain `/`, `?`, `!`, `*`, `<`, `>` — a name like `list/rev-rev?` would
+; otherwise create a nested directory, and `..` would escape the database
+; entirely. The mapping is percent-encoding over a deliberately tiny safe set:
+;
+;   [A-Za-z0-9_-]  kept verbatim
+;   anything else  %XX, uppercase hex of the byte
+;   the empty name %
+;
+; `.` is NOT in the safe set, which is the whole point: `..` encodes to `%2E%2E`
+; and cannot traverse. The mapping is injective (a literal `%` encodes to `%25`,
+; so a bare `%` can only have come from the empty name), so two properties never
+; collide on one file — collision would mean one property replaying the other's
+; counterexample, which reads as a spontaneously-failing test.
+
+(const DB-SLASH 47)  ; '/'
+(const DB-PERCENT 37)  ; '%'
+(const DB-DIR-MODE 493)  ; 0o755
+
+;; `coil.fs` wraps open/close/read/write but nothing that creates or removes a
+;; path, so these two are declared here — and ONLY here, because Coil does not
+;; dedup extern declarations across modules. If `coil.fs` ever grows `mkdir`/
+;; `unlink` wrappers, delete these and call those; keeping both would break any
+;; program that imports the filesystem and the property database together.
+;; `mode_t` is u16 on Darwin and u32 on Linux; i32 passes correctly under both
+;; C ABIs, and the callee reads only the bits it has.
+(extern mkdir :cc c [(ptr i8) i32] (-> i32))
+(extern unlink :cc c [(ptr i8)] (-> i32))
+
+;; Uppercase hex, because a case-insensitive filesystem must not fold `%2f` and
+;; `%2F` — two distinct property names — onto one file.
+(defn db--hex-digit [(v i64)] (-> u8)
+  (primitive/cast u8 (if (< v 10) (primitive/iadd 48 v) (primitive/iadd 55 v))))
+
+;; The safe set, kept small on purpose: everything outside it is escaped, so
+;; growing this set later would change existing names' filenames (a one-time
+;; loss of saved counterexamples), while shrinking it never can.
+(defn db--safe-byte? [(b i64)] (-> bool)
+  (or (or (and (>= b 97) (<= b 122))  ; a-z
+          (and (>= b 65) (<= b 90)))  ; A-Z
+      (or (and (>= b 48) (<= b 57))  ; 0-9
+          (or (= b 95) (= b 45)))))  ; _ -
+
+;; The filename a property name maps to. Returns an OWNING slice from `a`.
+(defn db-sanitize-name [(a (ptr Allocator)) (name (slice u8))] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)
+        n (slice-len name)]
+    (if (= n 0)
+        (str/sb-push-byte! (mut sb) (primitive/cast u8 DB-PERCENT))
+        0)
+    (let [(mut i) 0]
+      (loop (if (>= (load i) n)
+                (break)
+                (let [c (primitive/cast i64 (slice-get name (load i)))]
+                  (if (db--safe-byte? c)
+                      (str/sb-push-byte! (mut sb) (primitive/cast u8 c))
+                      (do
+                        (str/sb-push-byte! (mut sb) (primitive/cast u8 DB-PERCENT))
+                        (str/sb-push-byte! (mut sb) (db--hex-digit (primitive/udiv c 16)))
+                        (str/sb-push-byte! (mut sb) (db--hex-digit (primitive/irem c 16)))))
+                  (store! i (primitive/iadd (load i) 1))
+                  0))))
+    (str/sb-finish! (mut sb))))
+
+;; Free a slice this module handed out. One place, so the size/align arithmetic
+;; `al-into-slice` and `sb-finish!` require is not copy-pasted at every call site.
+(defn db-free-bytes [(a (ptr Allocator)) (s (slice u8))] (-> i64)
+  (if (= (primitive/cast i64 (slice-data s)) 0)
+      0
+      (raw-free a (primitive/cast (ptr i8) (slice-data s)) (slice-len s) 1)))
+
+;; Where the database lives. `--db PATH` wins, then `COIL_PBT_DB`; the default is
+;; project-local so a counterexample travels with the checkout it belongs to.
+;;
+;; This one keeps its environment variable, unlike the run knobs (`--cases`,
+;; `--seed`, …), which became flags outright. A database LOCATION is the kind of
+;; thing a CI job sets once for every invocation in the pipeline, the same way
+;; `COIL_STDLIB_DIR` is set — a flag alone would have to be threaded onto every
+;; command. The flag exists for the one-off case; the variable for the standing
+;; one, and the flag wins so a one-off can always override the standing setting.
+;;
+;; ALWAYS owning, including for the default — returning the literal unowned and
+;; the env-var string owned would make "must I free this?" depend on the
+;; environment the process happened to start in, which is the shape of bug that
+;; only ever reproduces on someone else's machine. The extra copy costs one
+;; nine-byte allocation per property.
+;;
+;; An EMPTY `COIL_PBT_DB` is treated as unset, not as the filesystem root: `env
+;; COIL_PBT_DB= coil test` is how a shell passes "I did not set this", and
+;; honouring it literally would try to mkdir `/<property-name>`.
+(defn db-root [(a (ptr Allocator))] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)
+        flag (args/args-value "--db")]
+    (if (> (slice-len flag) 0)
+        (do (str/sb-push-str! (mut sb) flag) (str/sb-finish! (mut sb)))
+        (db-root-from-env a (mut sb)))))
+
+;; The environment half, split out so `db-root`'s flag check reads as one line.
+(defn db-root-from-env [(a (ptr Allocator)) (sb (mut str/StrBuf))] (-> (slice u8))
+  (let []
+    (match (os/env-get a "COIL_PBT_DB")
+      (Err [e] (str/sb-push-str! (mut sb) ".coil/pbt"))
+      (Ok [o]
+          (match o
+            (None [] (str/sb-push-str! (mut sb) ".coil/pbt"))
+            (Some [s]
+                  (let [(mut owned) s
+                        v (os/owned-string-slice s)
+                        r
+                          (if (= (slice-len v) 0)
+                              (str/sb-push-str! (mut sb) ".coil/pbt")
+                              (str/sb-push-str! (mut sb) v))]
+                    (os/owned-string-free a (mut owned))
+                    r)))))
+    (str/sb-finish! (mut sb))))
+
+;; `<dir>/<leaf>`, owning.
+(defn db-join [(a (ptr Allocator)) (dir (slice u8)) (leaf (slice u8))] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) dir)
+    (str/sb-push-byte! (mut sb) (primitive/cast u8 DB-SLASH))
+    (str/sb-push-str! (mut sb) leaf)
+    (str/sb-finish! (mut sb))))
+
+;; The directory holding one property's artifacts. Owning.
+(defn db-dir [(a (ptr Allocator)) (name (slice u8))] (-> (slice u8))
+  (let [root (db-root a)
+        safe (db-sanitize-name a name)
+        d (db-join a root safe)]
+    (db-free-bytes a safe)
+    (db-free-bytes a root)
+    d))
+
+;; The file a property's minimal counterexample lives in. Owning.
+(defn db-path [(a (ptr Allocator)) (name (slice u8))] (-> (slice u8))
+  (let [d (db-dir a name)
+        p (db-join a d "failing")]
+    (db-free-bytes a d)
+    p))
+
+;; One `mkdir`, errors and all discarded — see `db-mkdir-p`.
+(defn db--mkdir-one [(a (ptr Allocator)) (path (slice u8))] (-> i64)
+  (let [cp (str/str->cstr a path)]
+    (if (= (primitive/cast i64 cp) 0)
+        0
+        (do
+          (mkdir cp (primitive/cast i32 DB-DIR-MODE))
+          (raw-free a (primitive/cast (ptr i8) cp) (primitive/iadd (slice-len path) 1) 1)))))
+
+;; `mkdir -p`. Every return value is ignored on purpose: EEXIST is the common
+;; case, and a genuine failure (no permission, read-only mount) shows up as the
+;; write failing, which is already the non-fatal path. Checking here would only
+;; add a way to be wrong about it.
+(defn db-mkdir-p [(a (ptr Allocator)) (path (slice u8))] (-> i64)
+  (let [n (slice-len path)
+        (mut i) 1]
+    (loop (if (> (load i) n)
+              (break)
+              (do
+                (if (or (= (load i) n)
+                        (= (primitive/cast i64 (slice-get path (load i))) DB-SLASH))
+                    (db--mkdir-one a (subslice path 0 (load i)))
+                    0)
+                (store! i (primitive/iadd (load i) 1)))))
+    0))
+
+;; Persist the minimal counterexample for `name`. Returns whether it landed.
+;;
+;; A false return is INFORMATION, not a failure: callers must not turn it into a
+;; failed test. There is no filesystem on which a property is less true.
+(defn db-save-failure [(a (ptr Allocator)) (name (slice u8)) (t (ptr (ArrayList Choice)))] (-> bool)
+  (let [dir (db-dir a name)
+        path (db-join a dir "failing")
+        bytes (tape-encode a t)]
+    (db-mkdir-p a dir)
+    (let [ok
+            (match (fs/write-file a path bytes)
+              (Ok [k] true)
+              (Err [e] false))]
+      (db-free-bytes a bytes)
+      (db-free-bytes a path)
+      (db-free-bytes a dir)
+      ok)))
+
+;; Load the counterexample `name` last failed on.
+;;
+;;   (Ok (None))     no entry — a first run, or a property that has never failed.
+;;   (Ok (Some t))   replay `t` before generating anything.
+;;   (Err e)         the entry exists and is not a tape. REPORT IT. Swallowing
+;;                   this is how a reuse phase dies without anyone noticing.
+(defn db-load-failure [(a (ptr Allocator)) (name (slice u8))] (-> (Result (Option (ArrayList Choice)) TapeError))
+  (let [path (db-path a name)
+        r
+          (match (fs/read-file a path)
+            (Err [e]
+                 (match e
+                   ; ENOENT (2) and ENOTDIR (20) are the same value on Linux and
+                   ; macOS and mean the same thing here: nothing has been saved
+                   ; under this name — a missing file, a missing property dir, a
+                   ; missing root, or a root that is not a directory at all.
+                   ; That is a first run, not a broken database. Every OTHER
+                   ; errno (EACCES, EIO, …) is a real read failure and is
+                   ; reported, because it means the reuse phase is silently dead.
+                   (Errno [code]
+                          (if (or (= code 2) (= code 20))
+                              (Ok [(Option (ArrayList Choice)) TapeError] (None [(ArrayList Choice)]))
+                              (Err [(Option (ArrayList Choice)) TapeError] (TapeIo code))))
+                   (Eof [] (Err [(Option (ArrayList Choice)) TapeError] (TapeTruncated TAPE-MIN-BYTES 0)))
+                   (LineTooLong [] (Err [(Option (ArrayList Choice)) TapeError] (TapeIo 0)))
+                   (OutOfMemory [] (Err [(Option (ArrayList Choice)) TapeError] (TapeIo 0)))
+                   (InvalidLimit [] (Err [(Option (ArrayList Choice)) TapeError] (TapeIo 0)))))
+            (Ok [bytes]
+                (let [d
+                        (match (tape-decode a bytes)
+                          (Ok [t] (Ok [(Option (ArrayList Choice)) TapeError] (Some [(ArrayList Choice)] t)))
+                          (Err [e] (Err [(Option (ArrayList Choice)) TapeError] e)))]
+                  (db-free-bytes a bytes)
+                  d)))]
+    (db-free-bytes a path)
+    r))
+
+;; Forget `name`'s counterexample. Returns whether an entry was removed, so a
+;; caller can tell "this property just went green" from "it was already green".
+;;
+;; Deleting on success is not housekeeping, it is correctness: a stale `failing`
+;; makes every subsequent run pay for a replay that can no longer reproduce
+;; anything, and it makes the database lie about what is broken.
+(defn db-clear [(a (ptr Allocator)) (name (slice u8))] (-> bool)
+  (let [path (db-path a name)
+        cp (str/str->cstr a path)
+        removed
+          (if (= (primitive/cast i64 cp) 0)
+              false
+              (let [r (primitive/cast i64 (unlink cp))]
+                (raw-free a (primitive/cast (ptr i8) cp) (primitive/iadd (slice-len path) 1) 1)
+                (= r 0)))]
+    (db-free-bytes a path)
+    removed))
