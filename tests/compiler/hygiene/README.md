@@ -20,6 +20,7 @@ the expansion boundary, where the assembled form makes the distinction visible.
 | `lib8.coil` / `user8.coil` | library-trait binder + reference, competing local trait | `42` |
 | `lib9.coil` / `user9.coil` | macro-GENERATED deftrait binder | `21` |
 | `user10.coil` | user trait named after a stdlib extern (`read`) | `5` |
+| `lib11.coil` / `user11.coil` | template pattern head collides with a defn name | `7 111` |
 
 The controls are as important as the failures: they show hygiene works without
 breaking the positions where a name is being defined rather than used.
@@ -36,6 +37,12 @@ boundary sees the assembled form.
 `user9.coil` predates the trait-method work entirely: ordinary defn heads always
 qualified, so a generated `deftrait` whose method name matched any defn in the
 macro's module has been broken all along. Same binder repair fixes it.
+
+`user11.coil` pins down why match-arm pattern heads need NO binder repair: the
+checker strips qualifiers when matching variant names and selects by the matched
+value's type, so a hygiene-qualified pattern head behaves exactly like a bare
+one. Verified both ways — an explicitly qualified `(hyglib11.Ready [] …)`
+pattern also matches.
 
 ## `arith_widths.coil` — a cross-branch interaction probe, not a hygiene repro
 
