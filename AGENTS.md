@@ -15,8 +15,11 @@ before writing Coil.
   expect (a hand-built `/usr/local/bin/llvm-config` beats apt's), builds link
   against a *different* clang's runtime. It surfaces only in `gate-cli`'s
   sanitizer checks, as `cannot find …/libclang_rt.asan.a` under a path naming an
-  LLVM version you never chose — which points nowhere near the cause. Check with
-  `llvm-config --bindir`, and put the right `bin` first on `PATH`.
+  LLVM version you never chose — which points nowhere near the cause. Diagnose
+  with `llvm-config --bindir`: if that is not the LLVM you meant, the shadowing
+  binary is the bug. Prefer fixing which `llvm-config` wins (rename the shadow, or
+  `update-alternatives --set llvm-config`) over prepending to `PATH` in each
+  command, since the latter has to be remembered at every call site.
 - `coil doc file.coil` — markdown for that module's `;;`-documented definitions
   (a `;;` block directly above a definition is its doc; a single `;` is not).
 - The compiler is **self-hosted** (written in Coil, in `src/compiler/`). During
