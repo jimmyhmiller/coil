@@ -1,0 +1,526 @@
+(module coil.prop.gen)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.prop.rng" :use *)
+(import "coil.prop.source" :use *)
+; GENERATOR VALUES — the per-call-site half of the generation API.
+;
+; `Arbitrary` gives a TYPE one generator. That is the right default and the wrong
+; only option: a property usually needs a different distribution at one call site
+; — "an int in 1..100", "a list of one to eight elements, sorted" — and the trait
+; has nowhere to put that. The alternative the trait forces is a newtype per
+; distribution, which is how QuickCheck suites end up with `NonEmpty`, `Small`,
+; `Sorted`, `SortedNonEmptySmall`. proptest's per-value strategies exist for
+; exactly this reason; so does this file.
+;
+;   (defprop insert-keeps-it-sorted []
+;     (let [s  (prop-src)
+;           g  (gen-int s 1 100)                   ; ints in 1..100, not "any i64"
+;           xs (gen-draw (gen-list-of s g 1 8) s)  ; one to eight of them
+;           k  (gen-draw g s)]
+;       (sorted? (insert (sort xs) k))))
+;
+; A generator is a VALUE: build it, pass it to a combinator, draw from it as often
+; as you like. It is not a type, not a macro, and not registered anywhere.
+;
+;   (gen-int s lo hi)              (gen-int-toward s lo hi origin)
+;   (gen-bool-p s num den)         (gen-const s v)
+;   (gen-elem-of s xs)             (gen-map s g f)
+;   (gen-filter s g pred tries)    (gen-one-of s alts)
+;   (gen-list-of s elem lo hi)     (gen-draw g s)
+;
+; Everything here draws through the same `Source`, so generator values shrink and
+; replay exactly like `Arbitrary` impls do — there is no second mechanism, just a
+; second way to spell which draws happen.
+;
+; ⚠ LIFETIME. A generator's environment is allocated from the CASE ARENA, which is
+; rewound between cases. A `Gen` is therefore a per-case value: build it inside the
+; property body (that is why every constructor takes the `Source`), never in a
+; static or across `source-begin-*`.
+;
+; ⚠ WHY CALLBACKS TAKE `(ptr A)`. A `defn` whose parameter is a struct compiles to
+; a by-reference parameter, so `(fnptr-of f)` for `(f [(xs (ArrayList i64))] …)`
+; has type `(fnptr c [(ref (ArrayList i64))] …)` and does not match
+; `(fnptr c [(ArrayList i64)] …)`, while a scalar parameter matches by value. One
+; spelling matches for every A: take the argument as `(ptr A)` and `load` it.
+;
+; ⚠ WHY THE `defgen-*` MACROS EXIST. Coil cannot take a function pointer to a
+; generic function ("cannot take a function pointer to generic function") — and a
+; `Gen` is a function pointer. So a combinator cannot be a generic FUNCTION: the
+; code it points at has to be monomorphic. All the logic still lives in one
+; generic engine per combinator; what the macro mints is the two-line monomorphic
+; shim that engine is reached through, plus a constructor with your names on it.
+; The instances below (`gen-map` and friends, at `i64`) are minted the same way.
+;
+;   (defgen-map      gen-pair-map (Pair i64 i64) (Pair i64 i64))
+;   (defgen-list-of  gen-pairs    (Pair i64 i64))
+
+; ------------------------------------------------------------ representation
+
+;; A generator: code plus an environment, the shape `closure.coil` uses, except
+;; that the environment lives in the case arena rather than the heap (a generator
+;; is created and thrown away thousands of times a second; malloc is not welcome
+;; on that path) and there is no `-free`, because the arena rewind is the free.
+;;
+;; `env` is erased to `(ptr i8)`. It has to be: two generators of `i64` with
+;; different environments must have the SAME type, or no combinator could hold a
+;; list of alternatives, and `gen-map` could not return something with the same
+;; type as its argument.
+(defstruct Gen [T]
+  [(run (fnptr c [(ptr Source) (ptr i8)] T))
+   (env (ptr i8))])
+
+;; Build a generator from a monomorphic run function and an environment pointer —
+;; the escape hatch for a hand-written generator that no combinator expresses.
+(defn mk-gen [T] [(run (fnptr c [(ptr Source) (ptr i8)] T)) (env (ptr i8))] (-> (Gen T))
+  (let [(mut g) (zeroed (Gen T))]
+    (store! (field (mut g) run) run)
+    (store! (field (mut g) env) env)
+    (load g)))
+
+;; Run a generator against a Source. This is the only way to get a value out of
+;; one, and it is an indirect call the optimizer usually turns into a direct one.
+(defn gen-draw [T] [(g (Gen T)) (s (ptr Source))] (-> T)
+  (primitive/call-ptr (load (field g run)) s (load (field g env))))
+
+;; Allocate a combinator environment in the case arena. Every constructor goes
+;; through this, so "environments never outlive their case" is one function's
+;; property rather than a rule each combinator has to remember.
+(defn gen-env [E] [(s (ptr Source))] (-> (ptr E))
+  (unwrap-ptr [E] (create [E] (src-alloc s))))
+
+;; Where the tape and the span table stood before an attempt. `gen-filter` is the
+;; only caller today, but "try some draws, undo them" is the general move.
+(defstruct GenMark [(choices i64) (spans i64) (cur i64)])
+
+(defn gen-mark [(s (ptr Source))] (-> GenMark)
+  (let [(mut m) (zeroed GenMark)]
+    (store! (field (mut m) choices) (al-len [Choice] (load (src-tape s))))
+    (store! (field (mut m) spans) (al-len [Span] (load (src-spans s))))
+    (store! (field (mut m) cur) (load (field s cur-span)))
+    (load m)))
+
+;; Undo every choice and span recorded since the mark. Truncation, not deletion:
+;; the tape is an ArrayList, so this is one store, and the choices it drops were
+;; the last ones appended — nothing else can point into them.
+(defn gen-rewind! [(s (ptr Source)) (m GenMark)] (-> i64)
+  (store! (field (src-tape s) len) (load (field m choices)))
+  (store! (field (src-spans s) len) (load (field m spans)))
+  (store! (field s cur-span) (load (field m cur)))
+  0)
+
+; ------------------------------------------------------------------- integers
+
+(defstruct GenIntEnv [(lo i64) (hi i64) (origin i64)])
+
+(defn gen--int-run [(s (ptr Source)) (env (ptr i8))] (-> i64)
+  (let [e (primitive/cast (ptr GenIntEnv) env)]
+    (draw-int-origin! s (load (field e lo)) (load (field e hi)) (load (field e origin)))))
+
+;; Integers in [lo, hi], shrinking toward whichever endpoint is nearest zero.
+;;
+;; No span: a scalar generator records exactly one choice, and a span around a
+;; single choice gives the structural shrink passes nothing they cannot already do
+;; while costing an entry in the span table on every draw.
+(defn gen-int [(s (ptr Source)) (lo i64) (hi i64)] (-> (Gen i64))
+  (gen-int-toward s lo hi (choice-minimal lo hi 0)))
+
+;; Integers in [lo, hi] with an explicit shrink target: "simplest" is not always
+;; "smallest". A port shrinks best toward 80, a year toward 1970, an index into a
+;; buffer toward the middle if that is where the interesting boundary is.
+(defn gen-int-toward [(s (ptr Source)) (lo i64) (hi i64) (origin i64)] (-> (Gen i64))
+  (let [e (gen-env [GenIntEnv] s)]
+    (store! (field e lo) lo)
+    (store! (field e hi) hi)
+    (store! (field e origin) origin)
+    (mk-gen [i64] (fnptr-of gen--int-run) (primitive/cast (ptr i8) e))))
+
+; ------------------------------------------------------------------- booleans
+
+(defstruct GenBoolEnv [(num i64) (den i64)])
+
+(defn gen--bool-run [(s (ptr Source)) (env (ptr i8))] (-> bool)
+  (let [e (primitive/cast (ptr GenBoolEnv) env)]
+    (draw-bool-p! s (load (field e num)) (load (field e den)))))
+
+;; True with probability num/den, shrinking toward false. A biased coin is worth a
+;; combinator because the interesting bugs live at the skewed end: a flag that is
+;; true one time in fifty is never exercised by a fair coin inside a short case.
+(defn gen-bool-p [(s (ptr Source)) (num i64) (den i64)] (-> (Gen bool))
+  (let [e (gen-env [GenBoolEnv] s)]
+    (store! (field e num) num)
+    (store! (field e den) den)
+    (mk-gen [bool] (fnptr-of gen--bool-run) (primitive/cast (ptr i8) e))))
+
+;; A fair coin.
+(defn gen-bool [(s (ptr Source))] (-> (Gen bool))
+  (gen-bool-p s 1 2))
+
+; ------------------------------------------------------------------ constants
+
+(defstruct GenConstEnv [T] [(v T)])
+
+;; Draws NOTHING. A constant that recorded a choice would hand the shrinker a knob
+;; that cannot change the value — every candidate it proposed there would be a
+;; wasted property run, and the tape would be longer than the value justifies.
+(defn gen--const-run [T] [(s (ptr Source)) (env (ptr i8))] (-> T)
+  (load (field (primitive/cast (ptr (GenConstEnv T)) env) v)))
+
+(defn gen--const-make [T] [(s (ptr Source)) (v T)
+                           (run (fnptr c [(ptr Source) (ptr i8)] T))] (-> (Gen T))
+  (let [e (gen-env [(GenConstEnv T)] s)]
+    (store! (field e v) v)
+    (mk-gen [T] run (primitive/cast (ptr i8) e))))
+
+;; `(defgen-const NAME T)` — mint `(NAME s v) -> (Gen T)`, a generator that always
+;; yields `v`. The base case of most recursive generators, and the way to pin one
+;; alternative of a `gen-one-of` to a fixed value.
+(defn defgen-const [(name Code) (T Code)] (-> Code)
+  (let [runname (primitive/code-symbol name "--run")]
+    `(do
+       (defn ~runname [(s (ptr Source)) (env (ptr i8))] (-> ~T)
+         (gen--const-run [~T] s env))
+       (defn ~name [(s (ptr Source)) (v ~T)] (-> (Gen ~T))
+         (gen--const-make [~T] s v (fnptr-of ~runname))))))
+
+(defgen-const gen-const i64)
+
+; -------------------------------------------------------------- sampling a set
+
+(defstruct GenElemEnv [T] [(xs (slice T))])
+
+;; The INDEX is the choice, so shrinking walks toward `xs[0]` — put the boring
+;; element first. Sampling is not the same as `gen-one-of` over constants: one
+;; choice instead of one choice per alternative, and no swarm mask, because the
+;; elements of a set are data rather than features of the generator.
+(defn gen--elem-run [T] [(s (ptr Source)) (env (ptr i8))] (-> T)
+  (let [e (primitive/cast (ptr (GenElemEnv T)) env)
+        xs (load (field e xs))
+        n (slice-len [T] xs)]
+    (if (<= n 0)
+        ; No value of T exists to return, and inventing one (a zeroed T) would put
+        ; a value in the property that the caller's set never contained.
+        (do (println "coil.prop.gen: gen-elem-of on an empty slice")
+            (abort)
+            (slice-get [T] xs 0))
+        (slice-get [T] xs (draw-int! s 0 (primitive/isub n 1))))))
+
+(defn gen--elem-make [T] [(s (ptr Source)) (xs (slice T))
+                          (run (fnptr c [(ptr Source) (ptr i8)] T))] (-> (Gen T))
+  (let [e (gen-env [(GenElemEnv T)] s)]
+    (store! (field e xs) xs)
+    (mk-gen [T] run (primitive/cast (ptr i8) e))))
+
+;; `(defgen-elem-of NAME T)` — mint `(NAME s xs) -> (Gen T)`, picking one element
+;; of the slice `xs`. The slice is borrowed, so it must outlive the case: a static
+;; table or something in the arena, not a stack array of the constructing frame.
+(defn defgen-elem-of [(name Code) (T Code)] (-> Code)
+  (let [runname (primitive/code-symbol name "--run")]
+    `(do
+       (defn ~runname [(s (ptr Source)) (env (ptr i8))] (-> ~T)
+         (gen--elem-run [~T] s env))
+       (defn ~name [(s (ptr Source)) (xs (slice ~T))] (-> (Gen ~T))
+         (gen--elem-make [~T] s xs (fnptr-of ~runname))))))
+
+(defgen-elem-of gen-elem-of i64)
+
+; ------------------------------------------------------------------ mapping
+
+(defstruct GenMapEnv [A B] [(inner (Gen A)) (f (fnptr c [(ptr A)] B))])
+
+;; `map` records no choices of its own, which is the whole reason integrated
+;; shrinking beats QuickCheck's: shrinking happens on the choices the INNER
+;; generator made, and `f` is re-applied to the smaller draw. Nothing has to invert
+;; `f`, and whatever invariant `f` establishes holds for every shrink candidate by
+;; construction.
+(defn gen--map-run [A B] [(s (ptr Source)) (env (ptr i8))] (-> B)
+  (let [e (primitive/cast (ptr (GenMapEnv A B)) env)
+        slot (primitive/alloc-stack A)]
+    (store! slot (gen-draw [A] (load (field e inner)) s))
+    (primitive/call-ptr (load (field e f)) slot)))
+
+(defn gen--map-make [A B] [(s (ptr Source)) (inner (Gen A)) (f (fnptr c [(ptr A)] B))
+                           (run (fnptr c [(ptr Source) (ptr i8)] B))] (-> (Gen B))
+  (let [e (gen-env [(GenMapEnv A B)] s)]
+    (store! (field e inner) inner)
+    (store! (field e f) f)
+    (mk-gen [B] run (primitive/cast (ptr i8) e))))
+
+;; `(defgen-map NAME A B)` — mint `(NAME s g f) -> (Gen B)` from `(Gen A)` and
+;; `(fnptr c [(ptr A)] B)`. Prefer this over `gen-filter` whenever the constraint
+;; can be met by construction: `(gen-map s (gen-int s 0 49) even)` never resamples,
+;; and its tape is half the length of the filtered version's.
+(defn defgen-map [(name Code) (A Code) (B Code)] (-> Code)
+  (let [runname (primitive/code-symbol name "--run")]
+    `(do
+       (defn ~runname [(s (ptr Source)) (env (ptr i8))] (-> ~B)
+         (gen--map-run [~A ~B] s env))
+       (defn ~name [(s (ptr Source)) (inner (Gen ~A)) (f (fnptr c [(ptr ~A)] ~B))] (-> (Gen ~B))
+         (gen--map-make [~A ~B] s inner f (fnptr-of ~runname))))))
+
+(defgen-map gen-map i64 i64)
+(defgen-map gen-list-map (ArrayList i64) (ArrayList i64))
+
+; ----------------------------------------------------------------- filtering
+
+(defstruct GenFilterEnv [T]
+  [(inner (Gen T)) (pred (fnptr c [(ptr T)] bool)) (tries i64)])
+
+;; Resample WITHIN THIS GENERATOR'S OWN SPAN until the predicate holds, and only
+;; give up — as a case rejection — after `tries` attempts.
+;;
+;; The obvious implementation is `if (pred v) v else (src-reject!)`, and it is a
+;; trap for three separate reasons:
+;;
+;;   1. It throws away the whole case. Every other argument the property already
+;;      generated — lists, trees, whatever they cost — is discarded because ONE
+;;      sub-draw missed. A predicate that passes half the time turns into a case
+;;      that survives 2^-n of the time in a property with n filtered draws.
+;;   2. It lies to the runner. Rejections are how `assume` reports "this input was
+;;      not a test", and the runner aborts a run whose rejection rate says the
+;;      precondition is too sparse. A filter that rejects at the case level makes
+;;      that diagnostic fire on a property whose preconditions are fine.
+;;   3. It poisons shrinking. The shrinker only keeps candidates that still FAIL,
+;;      and a rejected candidate counts as "does not fail", so every candidate that
+;;      happens to miss the predicate is thrown away — the shrinker stalls in
+;;      exactly the region it is trying to explore.
+;;
+;; Rewinding to the mark instead keeps the cost proportional to the span: one
+;; failed attempt costs one element's worth of draws, not a whole case. It also
+;; leaves the tape CANONICAL — only the accepted attempt's choices survive — so a
+;; replay of that tape satisfies the predicate on its first attempt, and the
+;; shrinker never re-runs the rejected ones. This is Hedgehog's `filter` pathology
+;; (hedgehog#281) fixed by construction rather than by a bigger retry count.
+;;
+;; The span is PLAIN, not ATOMIC: the shrinker is welcome to shrink the choices
+;; inside it, because replay re-checks the predicate and a candidate that no longer
+;; satisfies it resamples or rejects. Filtering constrains the value, not the
+;; shrinker.
+(defn gen--filter-run [T] [(s (ptr Source)) (env (ptr i8))] (-> T)
+  (let [e (primitive/cast (ptr (GenFilterEnv T)) env)
+        tries (load (field e tries))
+        slot (primitive/alloc-stack T)
+        (mut k) 0]
+    (block :out
+      (loop
+        (let [m (gen-mark s)
+              sp (span-open! s "filter" SPAN-PLAIN)]
+          (store! slot (gen-draw [T] (load (field e inner)) s))
+          (span-close! s sp)
+          (store! k (primitive/iadd (load k) 1))
+          (if (primitive/call-ptr (load (field e pred)) slot)
+              (return-from :out (load slot))
+              0)
+          ; Out of attempts, or the tape ran out underneath us — a replay past the
+          ; end of the tape re-derives the same minimum every time, so retrying is
+          ; not sampling, it is spinning. Keep the last attempt's choices (the tape
+          ; must still explain the value we return) and report the miss.
+          (if (or (>= (load k) tries) (!= (src-status s) ST-OK))
+              (do (src-reject! s)
+                  (return-from :out (load slot)))
+              0)
+          (gen-rewind! s m)
+          0)))))
+
+(defn gen--filter-make [T] [(s (ptr Source)) (inner (Gen T))
+                            (pred (fnptr c [(ptr T)] bool)) (tries i64)
+                            (run (fnptr c [(ptr Source) (ptr i8)] T))] (-> (Gen T))
+  (let [e (gen-env [(GenFilterEnv T)] s)]
+    (store! (field e inner) inner)
+    (store! (field e pred) pred)
+    (store! (field e tries) (if (< tries 1) 1 tries))
+    (mk-gen [T] run (primitive/cast (ptr i8) e))))
+
+;; `(defgen-filter NAME T)` — mint `(NAME s g pred tries) -> (Gen T)`.
+;;
+;; `tries` is a budget, not a guarantee: a predicate the inner generator satisfies
+;; one time in a thousand still deserves a different generator. What `tries` buys
+;; is that "usually true" costs nothing and "never true" fails as a rejection with
+;; a warning rather than as a hang.
+(defn defgen-filter [(name Code) (T Code)] (-> Code)
+  (let [runname (primitive/code-symbol name "--run")]
+    `(do
+       (defn ~runname [(s (ptr Source)) (env (ptr i8))] (-> ~T)
+         (gen--filter-run [~T] s env))
+       (defn ~name [(s (ptr Source)) (inner (Gen ~T))
+                    (pred (fnptr c [(ptr ~T)] bool)) (tries i64)] (-> (Gen ~T))
+         (gen--filter-make [~T] s inner pred tries (fnptr-of ~runname))))))
+
+(defgen-filter gen-filter i64)
+(defgen-filter gen-list-filter (ArrayList i64))
+
+; ------------------------------------------------------------ weighted choice
+
+;; One alternative of a `gen-one-of`. Weight 0 disables it — which is what an
+;; unset entry of a `gen-alts` array is, so a half-filled table is inert rather
+;; than a call through a null function pointer.
+(defstruct GenAlt [T] [(weight i64) (gen (Gen T))])
+
+(defstruct GenOneOfEnv [T] [(alts (slice (GenAlt T)))])
+
+;; A pointer to alternative `i`. `slice-get` returns a copy, and `field` needs a
+;; place, so reading a `weight` out of one would otherwise cost a named local per
+;; access; every index here is already bounded by the loop that produced it.
+(defn gen--alt-at [T] [(xs (slice (GenAlt T))) (i i64)] (-> (ptr (GenAlt T)))
+  (primitive/index (slice-data [(GenAlt T)] xs) i))
+
+;; An arena array of alternatives, all disabled, to be filled with `gen-alt!`.
+(defn gen-alts [T] [(s (ptr Source)) (n i64)] (-> (slice (GenAlt T)))
+  (let [buf (unwrap-ptr [(GenAlt T)] (alloc-slice [(GenAlt T)] (src-alloc s) (if (> n 0) n 1)))
+        xs (slice-new [(GenAlt T)] buf (if (> n 0) n 0))
+        (mut i) 0]
+    (loop (if (>= (load i) (slice-len [(GenAlt T)] xs))
+              (break)
+              (do (slice-set! [(GenAlt T)] xs (load i) (zeroed (GenAlt T)))
+                  (store! i (primitive/iadd (load i) 1)))))
+    xs))
+
+;; Install alternative `i`. Declaration order is shrink order — alternative 0 is
+;; what a failing case collapses toward — so put the base case first.
+(defn gen-alt! [T] [(xs (slice (GenAlt T))) (i i64) (weight i64) (g (Gen T))] (-> i64)
+  (let [(mut a) (zeroed (GenAlt T))]
+    (store! (field (mut a) weight) weight)
+    (store! (field (mut a) gen) g)
+    (slice-set! [(GenAlt T)] xs i (load a))
+    0))
+
+;; Pick an alternative by weight, then run it.
+;;
+;; The recorded choice is the point in [0, total-weight) that was hit, not the
+;; alternative index: weights are then a property of the TAPE, so the shrinker
+;; walking that number toward 0 walks the value toward alternative 0 without
+;; knowing anything about weights, and a heavier alternative occupies more of the
+;; range it can land in.
+;;
+;; Swarm mask: an alternative whose bit is clear is skipped (`src-swarm-allows?`).
+;; Each case therefore offers a random SUBSET of the alternatives, which finds bugs
+;; that uniform choice does not — features compete for room inside a bounded case,
+;; so a case that CAN use every feature usually uses each one shallowly (Groce et
+;; al., "Swarm Testing", ISSTA 2012). The skip walks the index rather than
+;; redrawing, so the mask never changes the shape of the tape.
+(defn gen--one-of-run [T] [(s (ptr Source)) (env (ptr i8))] (-> T)
+  (let [e (primitive/cast (ptr (GenOneOfEnv T)) env)
+        xs (load (field e alts))
+        n (slice-len [(GenAlt T)] xs)
+        (mut total) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [w (load (field (gen--alt-at [T] xs (load i)) weight))]
+                (if (> w 0) (store! total (primitive/iadd (load total) w)) 0)
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    (if (<= (load total) 0)
+        ; Every alternative disabled: there is no value to produce and no honest
+        ; default. A zeroed T here would be a counterexample nobody generated.
+        (do (println "coil.prop.gen: gen-one-of with no enabled alternative")
+            (abort)
+            (gen-draw [T] (load (field (gen--alt-at [T] xs 0) gen)) s))
+        (let [hit (record! s CK-TAG 0 (primitive/isub (load total) 1) 0
+                           (rng-below! (mut (field s rng)) (load total)))
+              (mut acc) 0
+              (mut k) 0
+              (mut j) 0]
+          ; walk the cumulative weights to the alternative `hit` landed in
+          (loop (if (>= (load j) n)
+                    (break)
+                    (let [w (load (field (gen--alt-at [T] xs (load j)) weight))]
+                      (if (> w 0)
+                          (do (store! acc (primitive/iadd (load acc) w))
+                              (if (< hit (load acc))
+                                  (do (store! k (load j)) (break))
+                                  0)
+                              0)
+                          0)
+                      (store! j (primitive/iadd (load j) 1))
+                      0)))
+          ; swarm: step to the next enabled-and-allowed alternative, wrapping
+          (let [(mut tries) 0]
+            (loop (if (or (and (src-swarm-allows? s (load k))
+                               (> (load (field (gen--alt-at [T] xs (load k)) weight)) 0))
+                          (>= (load tries) n))
+                      (break)
+                      (do (store! k (primitive/irem (primitive/iadd (load k) 1) n))
+                          (store! tries (primitive/iadd (load tries) 1))
+                          0))))
+          (let [sp (span-open! s "one-of" SPAN-PLAIN)
+                v (gen-draw [T] (load (field (gen--alt-at [T] xs (load k)) gen)) s)]
+            (span-close! s sp)
+            v)))))
+
+(defn gen--one-of-make [T] [(s (ptr Source)) (alts (slice (GenAlt T)))
+                            (run (fnptr c [(ptr Source) (ptr i8)] T))] (-> (Gen T))
+  (let [e (gen-env [(GenOneOfEnv T)] s)]
+    (store! (field e alts) alts)
+    (mk-gen [T] run (primitive/cast (ptr i8) e))))
+
+;; `(defgen-one-of NAME T)` — mint `(NAME s alts) -> (Gen T)` over a weighted table
+;; built with `gen-alts`/`gen-alt!`:
+;;
+;;   (let [as (gen-alts [i64] s 2)]
+;;     (gen-alt! [i64] as 0 3 (gen-const s 0))     ; three times as likely
+;;     (gen-alt! [i64] as 1 1 (gen-int s 1 100))
+;;     (gen-one-of s as))
+;;
+;; Only the chosen alternative draws, so alternatives cost nothing until taken —
+;; which is what makes this safe as the branch point of a recursive generator.
+(defn defgen-one-of [(name Code) (T Code)] (-> Code)
+  (let [runname (primitive/code-symbol name "--run")]
+    `(do
+       (defn ~runname [(s (ptr Source)) (env (ptr i8))] (-> ~T)
+         (gen--one-of-run [~T] s env))
+       (defn ~name [(s (ptr Source)) (alts (slice (GenAlt ~T)))] (-> (Gen ~T))
+         (gen--one-of-make [~T] s alts (fnptr-of ~runname))))))
+
+(defgen-one-of gen-one-of i64)
+
+; ---------------------------------------------------------------------- lists
+
+(defstruct GenListEnv [T] [(elem (Gen T)) (lo i64) (hi i64)])
+
+;; Length first as a CK-LEN choice, then one SPAN-ELEM span per element — the two
+;; things the structural shrink passes look for. That is what lets a failing
+;; 40-element list collapse to the two elements that matter, deleting runs
+;; adaptively rather than one at a time.
+;;
+;; The list is arena-allocated and dies with the case, like every generated value.
+(defn gen--list-run [T] [(s (ptr Source)) (env (ptr i8))] (-> (ArrayList T))
+  (let [e (primitive/cast (ptr (GenListEnv T)) env)
+        sp (span-open! s "list" SPAN-PLAIN)
+        n (draw-len! s (load (field e lo)) (load (field e hi)))
+        (mut l) (al-new [T] (src-alloc s))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [esp (span-open! s "elem" SPAN-ELEM)]
+                (al-push! [T] (mut l) (gen-draw [T] (load (field e elem)) s))
+                (span-close! s esp)
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    (span-close! s sp)
+    (load l)))
+
+(defn gen--list-make [T] [(s (ptr Source)) (elem (Gen T)) (lo i64) (hi i64)
+                          (run (fnptr c [(ptr Source) (ptr i8)] (ArrayList T)))] (-> (Gen (ArrayList T)))
+  (let [e (gen-env [(GenListEnv T)] s)]
+    (store! (field e elem) elem)
+    (store! (field e lo) lo)
+    (store! (field e hi) hi)
+    (mk-gen [(ArrayList T)] run (primitive/cast (ptr i8) e))))
+
+;; `(defgen-list-of NAME T)` — mint `(NAME s elem lo hi) -> (Gen (ArrayList T))`.
+;;
+;; The length range is EXPLICIT, unlike the `Arbitrary` impl for `ArrayList`, which
+;; draws from the case's size budget: "one to eight" is a property of this call
+;; site and there is no newtype in the way of saying so.
+(defn defgen-list-of [(name Code) (T Code)] (-> Code)
+  (let [runname (primitive/code-symbol name "--run")]
+    `(do
+       (defn ~runname [(s (ptr Source)) (env (ptr i8))] (-> (ArrayList ~T))
+         (gen--list-run [~T] s env))
+       (defn ~name [(s (ptr Source)) (elem (Gen ~T)) (lo i64) (hi i64)] (-> (Gen (ArrayList ~T)))
+         (gen--list-make [~T] s elem lo hi (fnptr-of ~runname))))))
+
+(defgen-list-of gen-list-of i64)

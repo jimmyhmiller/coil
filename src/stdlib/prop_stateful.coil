@@ -1,0 +1,526 @@
+(module coil.prop.stateful)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.prop.source" :use *)
+(import "coil.prop.shrink" :use *)
+(import "coil.prop.runner" :use *)
+; MODEL-BASED (STATEFUL) PROPERTY TESTING — Erlang QuickCheck's state machines,
+; Hypothesis's RuleBasedStateMachine, on top of the same tape.
+;
+; A stateful property does not test one value. It generates a SEQUENCE of
+; commands, runs each one against both the real system and a deliberately stupid
+; MODEL of it, and checks after every step that the two still agree. The model is
+; the specification: it is allowed to be slow, allocate freely, and be obviously
+; correct, because nobody ships it. The system is the thing that is fast and
+; therefore wrong.
+;
+;   command i:   pre(model)?  →  result = run(system)  →  post(model, result)?
+;                            →  model = next(model, result)  →  inv(model, system)?
+;
+; `post` sees the model BEFORE the step (it is a claim about what the system just
+; returned, given where the model was), `inv` sees it after. That split is what
+; separates "pop returned the wrong element" from "the lengths drifted apart".
+;
+; ── WHY THIS COSTS ALMOST NOTHING TO BUILD ────────────────────────────────────
+;
+; Shrinking a command sequence is the hard part of every other implementation of
+; this idea, and here there is none of it. Each generated command is wrapped in
+; its own SPAN (coil.prop.source), so the passes that already exist do the work:
+;
+;   * `pass-delete-spans` removes a command outright — and adaptively removes runs
+;     of them, doubling the window while deletion keeps failing — which is what
+;     turns a 40-command counterexample into 5. Deleting a whole span is safe
+;     because replay is positional: every later command re-draws its tag from the
+;     next choice, so the sequence stays aligned after the hole closes.
+;   * `pass-minimize-choices` binary-searches each command's ARGUMENTS toward
+;     their origins, so the surviving commands read `(push 0)`, not `(push
+;     -7382910)`.
+;   * `pass-hoist` replaces a command's argument with one of its own subterms,
+;     which matters as soon as a command carries recursive data.
+;   * the length choice is a `CK-LEN`, so truncation gets tried too.
+;
+; That is the design's payoff: the whole of model-based testing is a driver loop
+; and a struct of function pointers. No shrinker, no re-generation strategy, no
+; "shrink the list of commands then re-check every precondition" — the tape edit
+; IS the sequence edit, and the sequence is rebuilt by the generator, so whatever
+; the generator guaranteed still holds.
+;
+; ── THE SURFACE ───────────────────────────────────────────────────────────────
+;
+; Coil has no closures, so a state machine is a struct of function pointers over
+; four types you choose: the command C, the model M, the system S, and the result
+; R that `run` observes. `defprop-stateful` builds it for you from named hooks:
+;
+;   (defprop-stateful stack-matches-model [Cmd Model Stack Res]
+;     :init stack-init  :gen stack-gen  :pre stack-pre
+;     :run  stack-run   :post stack-post :next stack-next
+;     :inv  stack-inv   :show stack-show)
+;
+; Every hook is an ordinary `defn` taking POINTERS (a struct-typed parameter
+; compiles to a `(ref T)`, which does not match a `(fnptr c [T] …)` slot — pointer
+; parameters match exactly). See tests/prop/stateful_test.coil for a worked one.
+
+; ------------------------------------------------------------------- constants
+
+; What went wrong in the last drive, for the report.
+(const SM-OK 0)
+(const SM-POST 1)   ; a postcondition rejected what the system returned
+(const SM-INV 2)    ; the invariant failed after a step
+
+;; A machine built by `sm-new` carries this in `built`. There is no way to test a
+;; function pointer for null in Coil (`cast` refuses fnptr→i64), so this is how a
+;; `(zeroed StateMachine)` gets caught by an error message instead of by jumping
+;; to address zero.
+(const SM-BUILT 1213485134)
+
+;; The span label every command gets. `sm-commands-in-last-run` counts these, and
+;; the shrinker's deletion pass keys off them without knowing what they mean.
+(defn sm-cmd-label [] (-> (slice u8)) "cmd")
+
+; --------------------------------------------------------------- the machine
+
+;; A state machine, as data. The `C M S R` parameters are your command type, your
+;; model type, your system type, and the type of whatever `run` observes.
+;;
+;; The hooks, in the order `sm-new` takes them:
+;;
+;;   init  (model, system, source) — build both from scratch for this case.
+;;         Allocate out of `(src-alloc s)`: the arena is rewound between cases,
+;;         so a model that grows without bound still costs nothing.
+;;   gen   (cmd, model, source)    — draw the next command. The driver has already
+;;         opened its span; draw a tag with `draw-tag!` FIRST (variant 0 is what a
+;;         shrunk sequence collapses toward, so put the boring command there),
+;;         then that command's arguments. May look at the model to bias the draw,
+;;         but must not require it — see `pre`.
+;;   pre   (model, cmd)            — is this command applicable in this state?
+;;         A command whose precondition fails is SKIPPED, not rejected: after the
+;;         shrinker deletes an earlier command a later one can become
+;;         inapplicable, and a skip keeps that candidate a legal test instead of
+;;         throwing the whole sequence away.
+;;   run   (system, cmd, result)   — do it for real, write what came back.
+;;   post  (model, cmd, result)    — does the result agree with the model AS IT
+;;         WAS BEFORE the step? This is where wrong ANSWERS are caught.
+;;   next  (model, cmd, result)    — advance the model. Runs only for commands
+;;         that actually ran, so model and system stay in lockstep.
+;;   inv   (model, system)         — checked after every step. This is where drift
+;;         in the STATE is caught (lengths, contents, ordering).
+;;   show  (cmd, writer)           — print the command. A minimal counterexample
+;;         you cannot read is a bug report you cannot act on.
+;;
+;; The last four fields are outputs: the driver fills them in so a caller can
+;; report on the run it just did.
+(defstruct StateMachine [C M S R]
+  [(name (slice u8))
+   (min-cmds i64)
+   (max-cmds i64)
+   (init (fnptr c [(ptr M) (ptr S) (ptr Source)] i64))
+   (gen (fnptr c [(ptr C) (ptr M) (ptr Source)] i64))
+   (pre (fnptr c [(ptr M) (ptr C)] bool))
+   (run (fnptr c [(ptr S) (ptr C) (ptr R)] i64))
+   (post (fnptr c [(ptr M) (ptr C) (ptr R)] bool))
+   (next (fnptr c [(ptr M) (ptr C) (ptr R)] i64))
+   (inv (fnptr c [(ptr M) (ptr S)] bool))
+   (show (fnptr c [(ptr C) (ptr Writer)] i64))
+   (built i64)
+   (generated i64)   ; out: commands drawn in the last drive
+   (executed i64)    ; out: of those, how many passed their precondition
+   (failed-at i64)   ; out: index of the offending command (-1 when it held)
+   (failure i64)])   ; out: SM-OK / SM-POST / SM-INV
+
+;; Build one. Every hook is required, which is the point: a state machine missing
+;; its postcondition or its invariant compiles fine and tests nothing, and that is
+;; a much more expensive mistake than typing a two-line `always-true` hook.
+;;
+;; `max-cmds` is usually `(src-size s)` — the case's size budget — so sequences
+;; ramp from tiny to long over a run exactly like generated lists do.
+(defn sm-new [C M S R]
+  [(name (slice u8))
+   (min-cmds i64)
+   (max-cmds i64)
+   (init (fnptr c [(ptr M) (ptr S) (ptr Source)] i64))
+   (gen (fnptr c [(ptr C) (ptr M) (ptr Source)] i64))
+   (pre (fnptr c [(ptr M) (ptr C)] bool))
+   (run (fnptr c [(ptr S) (ptr C) (ptr R)] i64))
+   (post (fnptr c [(ptr M) (ptr C) (ptr R)] bool))
+   (next (fnptr c [(ptr M) (ptr C) (ptr R)] i64))
+   (inv (fnptr c [(ptr M) (ptr S)] bool))
+   (show (fnptr c [(ptr C) (ptr Writer)] i64))] (-> (StateMachine C M S R))
+  (let [(mut m) (zeroed (StateMachine C M S R))]
+    (store! (field (mut m) name) name)
+    (store! (field (mut m) min-cmds) min-cmds)
+    (store! (field (mut m) max-cmds) max-cmds)
+    (store! (field (mut m) init) init)
+    (store! (field (mut m) gen) gen)
+    (store! (field (mut m) pre) pre)
+    (store! (field (mut m) run) run)
+    (store! (field (mut m) post) post)
+    (store! (field (mut m) next) next)
+    (store! (field (mut m) inv) inv)
+    (store! (field (mut m) show) show)
+    (store! (field (mut m) built) SM-BUILT)
+    (store! (field (mut m) generated) 0)
+    (store! (field (mut m) executed) 0)
+    (store! (field (mut m) failed-at) -1)
+    (store! (field (mut m) failure) SM-OK)
+    (load m)))
+
+(defn sm-generated [C M S R] [(m (ptr (StateMachine C M S R)))] (-> i64) (load (field m generated)))
+(defn sm-executed [C M S R] [(m (ptr (StateMachine C M S R)))] (-> i64) (load (field m executed)))
+(defn sm-failed-at [C M S R] [(m (ptr (StateMachine C M S R)))] (-> i64) (load (field m failed-at)))
+(defn sm-failure [C M S R] [(m (ptr (StateMachine C M S R)))] (-> i64) (load (field m failure)))
+
+; ---------------------------------------------------------------- the driver
+
+;; Generate and execute one command sequence. Returns true if every postcondition
+;; and every invariant held — i.e. it IS the property, and plugs straight into
+;; `defprop`'s body.
+;;
+;; `mode` is the runner's `PROP-MODE-*` (coil.prop.runner), and it means the same
+;; thing here as it does for a `defprop` argument list:
+;;   RUN        drive the sequence, silently
+;;   SHOW       drive it and print each command as it goes — the counterexample
+;;   DRAW       draw the sequence and print NOTHING, touching neither the system
+;;              nor the model's checks
+;;   DRAW-SHOW  draw and print, still without touching the system: the only way a
+;;              sequence that CRASHES the system can be reported at all, since the
+;;              reporter would die re-running it.
+;;
+;; ⚠ In the two draw-only modes the preconditions are not evaluated, because the
+;; model cannot be advanced without running the system, and a precondition asked
+;; about a stale model would lie. The sequence printed is therefore everything
+;; that was DRAWN, including commands a real run would have skipped. That is the
+;; honest reading of "here is the input that killed the process".
+;;
+;; This is faithful to the tape either way, and that is the one thing that
+;; matters: `pre` never draws, so a command's choices are the same whether or not
+;; it ends up running. (A `gen` that reads the model to bias its draws must still
+;; draw the same SHAPE regardless of what it reads — same tag, same argument
+;; count — or replay stops reconstructing the sequence it recorded.)
+;;
+;; The four slots are hoisted out of the loop deliberately. `alloc/stack` is not
+;; released until the function returns, so taking them per command would grow the
+;; C stack by `sizeof(C)+sizeof(R)` per step and blow it on a long sequence.
+(defn sm-run! [C M S R] [(m (ptr (StateMachine C M S R))) (s (ptr Source)) (mode i64)] (-> bool)
+  (if (!= (load (field m built)) SM-BUILT)
+      (sm-not-built)
+      0)
+  (let [w (stdout)
+        show (or (= mode PROP-MODE-SHOW) (= mode PROP-MODE-DRAW-SHOW))
+        execute (< mode PROP-MODE-DRAW)
+        model (primitive/alloc-stack M)
+        system (primitive/alloc-stack S)
+        cmd (primitive/alloc-stack C)
+        res (primitive/alloc-stack R)
+        sp (span-open! s "cmds" SPAN-PLAIN)
+        n (draw-len! s (load (field m min-cmds)) (load (field m max-cmds)))
+        (mut ok) true
+        (mut i) 0
+        (mut executed) 0]
+    (store! (field m failure) SM-OK)
+    (store! (field m failed-at) -1)
+    (primitive/call-ptr (load (field m init)) model system s)
+    (loop
+      (if (or (not (load ok)) (>= (load i) n))
+          (break)
+          (let [csp (span-open! s "cmd" SPAN-ELEM)]
+            (primitive/call-ptr (load (field m gen)) cmd model s)
+            (if execute
+                (do
+                  (if (primitive/call-ptr (load (field m pre)) model cmd)
+                      (do
+                        (primitive/call-ptr (load (field m run)) system cmd res)
+                        ; postcondition first, against the PRE-state model, then
+                        ; step the model, then the invariant against the
+                        ; post-state. Stepping before checking would hide every
+                        ; wrong-answer bug.
+                        (if (primitive/call-ptr (load (field m post)) model cmd res)
+                            (do (primitive/call-ptr (load (field m next)) model cmd res)
+                                (if (primitive/call-ptr (load (field m inv)) model system)
+                                    0
+                                    (do (store! ok false)
+                                        (store! (field m failure) SM-INV)
+                                        (store! (field m failed-at) (load i))
+                                        0)))
+                            (do (store! ok false)
+                                (store! (field m failure) SM-POST)
+                                (store! (field m failed-at) (load i))
+                                0))
+                        (store! executed (primitive/iadd (load executed) 1))
+                        (if show (sm-print-cmd m w (load i) cmd (load ok) (load (field m failure))) 0)
+                        0)
+                      ; inapplicable here: skipped, not rejected. Its choices stay
+                      ; on the tape, and the shrinker deletes them because a
+                      ; shorter tape that still fails always wins.
+                      (if show (sm-print-skip m w (load i) cmd) 0))
+                  0)
+                (if show (sm-print-cmd m w (load i) cmd true SM-OK) 0))
+            (span-close! s csp)
+            (store! i (primitive/iadd (load i) 1))
+            0)))
+    (span-close! s sp)
+    (store! (field m generated) n)
+    (store! (field m executed) (load executed))
+    (if (and show (not (load ok))) (sm-print-verdict w (load (field m failure))) 0)
+    (load ok)))
+
+;; One printed command line: `[3] (push 0)`, with the failing step called out.
+(defn sm-print-cmd [C M S R]
+  [(m (ptr (StateMachine C M S R))) (w (ptr Writer)) (i i64) (cmd (ptr C)) (ok bool) (why i64)] (-> i64)
+  (fmt w "    [{d}] " i)
+  (primitive/call-ptr (load (field m show)) cmd w)
+  (if ok
+      0
+      (do (print-str w (if (= why SM-POST) "   <-- wrong result" "   <-- invariant broken")) 0))
+  (print-str w "\n")
+  0)
+
+(defn sm-print-skip [C M S R]
+  [(m (ptr (StateMachine C M S R))) (w (ptr Writer)) (i i64) (cmd (ptr C))] (-> i64)
+  (fmt w "    [{d}] " i)
+  (primitive/call-ptr (load (field m show)) cmd w)
+  (print-str w "   (skipped: precondition)\n")
+  0)
+
+(defn sm-print-verdict [(w (ptr Writer)) (why i64)] (-> i64)
+  (print-str w (if (= why SM-POST)
+                   "    the system's answer disagreed with the model\n"
+                   "    the invariant relating model and system was violated\n"))
+  0)
+
+;; A `(zeroed StateMachine)` would call a null pointer. Say what actually happened.
+(defn sm-not-built [] (-> i64)
+  (print-str (stdout) "\ncoil.prop.stateful: StateMachine was not built by sm-new (its hooks are null).\n")
+  (abort)
+  0)
+
+; ------------------------------------------------------- inspecting a sequence
+
+;; How many commands a span table describes. Counted from the SPANS rather than
+;; from a counter kept by the driver, so it works on a span table you were handed
+;; — `sc-best-spans`, say — without still having the machine that produced it.
+(defn sm-count-cmd-spans [(spans (ptr (ArrayList Span)))] (-> i64)
+  (let [n (al-len [Span] (load spans))
+        label (sm-cmd-label)
+        (mut i) 0
+        (mut c) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (if (slice-eq-name (load (field (al-elem [Span] spans (load i)) name)) label)
+                      (store! c (primitive/iadd (load c) 1))
+                      0)
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load c)))
+
+;; The same count for the sequence the Source most recently generated or replayed.
+(defn sm-commands-in-last-run [(s (ptr Source))] (-> i64)
+  (sm-count-cmd-spans (src-spans s)))
+
+; ------------------------------------------------------------------ the search
+
+;; What a non-aborting search found.
+(defstruct SmSearch
+  [(found bool)
+   (cases i64)         ; cases run before the failure (or in total, if none)
+   (shrink-calls i64)
+   (shrinks i64)
+   (commands i64)      ; commands in the MINIMAL counterexample
+   (choices i64)       ; choices left on the minimal tape
+   (tape (ArrayList Choice))])
+
+(defn sms-found? [(r (ptr SmSearch))] (-> bool) (load (field r found)))
+(defn sms-cases [(r (ptr SmSearch))] (-> i64) (load (field r cases)))
+(defn sms-commands [(r (ptr SmSearch))] (-> i64) (load (field r commands)))
+(defn sms-choices [(r (ptr SmSearch))] (-> i64) (load (field r choices)))
+(defn sms-shrinks [(r (ptr SmSearch))] (-> i64) (load (field r shrinks)))
+(defn sms-tape [(r (ptr SmSearch))] (-> (ptr (ArrayList Choice))) (field r tape))
+
+;; Search for a counterexample and shrink it, WITHOUT aborting — `prop-run` is the
+;; right entry point for a property you expect to hold, and this is the right one
+;; for a property you expect to break.
+;;
+;; That distinction is not academic. The only honest way to test a testing
+;; framework is to point it at a system you have deliberately broken and assert
+;; both that it noticed AND that what it handed back is small; `prop-run` cannot
+;; do that, because its answer to a failure is to print and die. This also gives
+;; you a shrunk tape as a value, for a corpus or a regression fixture.
+;;
+;; `prop` is the same shape `defprop` produces: `prop$NAME`, or any
+;; `(fnptr c [(ptr Source) i64] bool)` that drives a state machine.
+;;
+;; Everything here is deliberately in-process. `prop-run` forks each batch of
+;; cases so that a SEGFAULT is a reportable outcome; a search that expects the
+;; property to fail wants the answer back in this process, and a state machine
+;; whose system can crash the process should be run through `prop-run`.
+(defn sm-search [(prop (fnptr c [(ptr Source) i64] bool))
+                 (cases i64)
+                 (max-size i64)
+                 (seed i64)
+                 (budget i64)] (-> SmSearch)
+  (let [s (prop-source 8388608)
+        mem (sm-workspace)
+        (mut r) (zeroed SmSearch)
+        (mut failed) false
+        (mut i) 0]
+    (store! (field (mut r) found) false)
+    (source-seed! s seed)
+    (loop
+      (if (or (load failed) (>= (load i) cases))
+          (break)
+          (let [size (size-for (load i) cases max-size)]
+            (source-begin-generate! s size)
+            (source-swarm! s (case-swarm-mask s (load i)))
+            (let [held (primitive/call-ptr prop s PROP-MODE-RUN)]
+              (if (= (src-status s) ST-REJECTED)
+                  0
+                  (do (store! (field (mut r) cases)
+                              (primitive/iadd (load (field (mut r) cases)) 1))
+                      (if held 0 (store! failed true))
+                      0)))
+            (store! i (primitive/iadd (load i) 1))
+            0)))
+    (if (load failed)
+        (sm-shrink-into (mut r) mem s prop budget)
+        0)
+    (load r)))
+
+;; What the shrinker calls back into: replay a candidate tape and say whether the
+;; property STILL fails on it. A REJECTED case (an `assume` that did not hold) is
+;; not a failure — counting it as one is how a shrinker ends up "minimizing" into
+;; an input the property never claimed anything about.
+(defstruct SmRunCtx
+  [(src (ptr Source))
+   (prop (fnptr c [(ptr Source) i64] bool))
+   (size i64)])
+
+(defn sm-run-candidate [(ctx (ptr i8)) (tape (ptr (ArrayList Choice)))] (-> bool)
+  (let [rc (primitive/cast (ptr SmRunCtx) ctx)
+        s (load (field rc src))]
+    (source-begin-replay! s tape (load (field rc size)))
+    (let [held (primitive/call-ptr (load (field rc prop)) s PROP-MODE-RUN)]
+      (if (= (src-status s) ST-REJECTED)
+          false
+          (not held)))))
+
+;; The shrink half of `sm-search`, split out only because the search loop was
+;; already long.
+;;
+;; It carries its own `SmRunCtx` rather than borrowing `coil.prop.runner`'s
+;; `RunCtx`, whose extra fields exist for the forked crash-shrinking path this
+;; search deliberately does not use. Four lines of duplication buys independence
+;; from a struct whose shape is driven by a different set of requirements.
+(defn sm-shrink-into [(r (ptr SmSearch))
+                      (mem (ptr Allocator))
+                      (s (ptr Source))
+                      (prop (fnptr c [(ptr Source) i64] bool))
+                      (budget i64)] (-> i64)
+  (let [size (src-size s)
+        rc (primitive/alloc-stack SmRunCtx)
+        (mut failing) (tape-clone mem (src-tape s))
+        (mut failing-spans) (spans-clone mem (src-spans s))]
+    (store! (field rc src) s)
+    (store! (field rc prop) prop)
+    (store! (field rc size) size)
+    (let [sc (shrink-ctx-new mem s (primitive/fnptr-of sm-run-candidate)
+                             (primitive/cast (ptr i8) rc) budget)]
+      (sc-seed-best! sc (mut failing) (mut failing-spans))
+      (shrink-run! sc)
+      (store! (field r found) true)
+      (store! (field r shrink-calls) (sc-calls sc))
+      (store! (field r shrinks) (sc-accepted sc))
+      ; Replay the winner one last time, so the Source's span table describes
+      ; the MINIMAL sequence rather than whatever candidate happened to be tried
+      ; last. That count is the whole claim this module makes.
+      (source-begin-replay! s (sc-best sc) size)
+      (primitive/call-ptr prop s PROP-MODE-RUN)
+      (store! (field r commands) (sm-commands-in-last-run s))
+      (store! (field r choices) (al-len [Choice] (load (sc-best sc))))
+      (store! (field r tape) (tape-clone mem (sc-best sc)))
+      0)))
+
+; ------------------------------------------------------------------ the macro
+
+;; `(defprop-stateful NAME [C M S R] :hook fn …)` — a `defprop` whose body is a
+;; command sequence.
+;;
+;; Options, all naming a plain `defn` (the macro takes its address for you):
+;;   :init :gen :pre :run :post :next :inv :show   — required, see `sm-new`
+;;   :min-cmds  (default 0)
+;;   :max-cmds  (default `(src-size __src)`, the case's ramping size budget)
+;;
+;; Named rather than positional because eight function pointers in a row is a
+;; transposition waiting to happen: `post` and `next` have almost the same type
+;; and opposite meanings.
+;;
+;; This deliberately does NOT take an inline command table (`:commands [(push …
+;; :run … :next …)]`, as sketched in docs/design/PROPERTY_TESTING.md). Synthesizing
+;; the command sum type and five `match` dispatchers from a table is possible, but
+;; it hides the four types the whole thing is parameterized on and makes every
+;; hook a fragment that only exists inside a macro expansion — worse to read and
+;; far worse to debug than eight named functions.
+(defn defprop-stateful [(name Code) (types Code) & (opts Code)] (-> Code)
+  (if (!= (primitive/code-count types) 4)
+      (primitive/error "defprop-stateful: expected 4 type arguments [Cmd Model System Result]")
+      0)
+  (if (= (primitive/irem (primitive/code-count opts) 2) 0)
+      0
+      (primitive/error "defprop-stateful: options must be :key value pairs"))
+  (sps--check-keys opts 0)
+  `(defprop ~name []
+     (let [(mut __sm)
+           (sm-new ~types
+                   ~(primitive/code-str name)
+                   ~(sps--opt opts `:min-cmds `0)
+                   ~(sps--opt opts `:max-cmds `(src-size __src))
+                   (fnptr-of ~(sps--need opts `:init "defprop-stateful: missing :init"))
+                   (fnptr-of ~(sps--need opts `:gen "defprop-stateful: missing :gen"))
+                   (fnptr-of ~(sps--need opts `:pre "defprop-stateful: missing :pre"))
+                   (fnptr-of ~(sps--need opts `:run "defprop-stateful: missing :run"))
+                   (fnptr-of ~(sps--need opts `:post "defprop-stateful: missing :post"))
+                   (fnptr-of ~(sps--need opts `:next "defprop-stateful: missing :next"))
+                   (fnptr-of ~(sps--need opts `:inv "defprop-stateful: missing :inv"))
+                   (fnptr-of ~(sps--need opts `:show "defprop-stateful: missing :show")))]
+       (sm-run! ~types (mut __sm) __src __mode))))
+
+;; Is `key` present in the option list?
+(defn sps--has? [(opts Code) (key Code) (i i64)] (-> bool)
+  (if (>= (primitive/iadd i 1) (primitive/code-count opts))
+      false
+      (if (primitive/code-eq (primitive/code-nth opts i) key)
+          true
+          (sps--has? opts key (primitive/iadd i 2)))))
+
+(defn sps--get [(opts Code) (key Code) (i i64)] (-> Code)
+  (if (>= (primitive/iadd i 1) (primitive/code-count opts))
+      (primitive/error "defprop-stateful: option lookup fell off the end")
+      (if (primitive/code-eq (primitive/code-nth opts i) key)
+          (primitive/code-nth opts (primitive/iadd i 1))
+          (sps--get opts key (primitive/iadd i 2)))))
+
+(defn sps--opt [(opts Code) (key Code) (dflt Code)] (-> Code)
+  (if (sps--has? opts key 0) (sps--get opts key 0) dflt))
+
+(defn sps--need [(opts Code) (key Code) (msg (slice u8))] (-> Code)
+  (if (sps--has? opts key 0) (sps--get opts key 0) (primitive/error msg)))
+
+;; Reject unknown option keys. A typo'd `:inv` would otherwise be silently
+;; dropped and the property would test half of what its author wrote.
+(defn sps--check-keys [(opts Code) (i i64)] (-> i64)
+  (if (>= i (primitive/code-count opts))
+      0
+      (let [k (primitive/code-nth opts i)]
+        (if (or (primitive/code-eq k `:init)
+                (or (primitive/code-eq k `:gen)
+                    (or (primitive/code-eq k `:pre)
+                        (or (primitive/code-eq k `:run)
+                            (or (primitive/code-eq k `:post)
+                                (or (primitive/code-eq k `:next)
+                                    (or (primitive/code-eq k `:inv)
+                                        (or (primitive/code-eq k `:show)
+                                            (or (primitive/code-eq k `:min-cmds)
+                                                (primitive/code-eq k `:max-cmds))))))))))
+            (sps--check-keys opts (primitive/iadd i 2))
+            (primitive/error "defprop-stateful: unknown option (expected :init :gen :pre :run :post :next :inv :show :min-cmds :max-cmds)")))))

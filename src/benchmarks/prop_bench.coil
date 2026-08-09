@@ -1,0 +1,470 @@
+(module benchmark.propbench)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.time" :use *)
+(import "coil.prop" :use *)
+; The other benchmarks in this directory answer "does Coil's generated code keep
+; up with C". This one answers a different question: what does one property-based
+; test CASE cost, and does a long run stay in steady state?
+;
+; It is self-timing rather than hyperfine-driven, because the interesting numbers
+; are per-case costs three orders of magnitude apart (a 1.5 ns RNG draw and a
+; multi-millisecond shrink) and process startup would drown the small end.
+;
+; The layered structure is deliberate: each benchmark adds exactly one layer to
+; the one above it, so the difference between two lines IS the cost of that layer.
+;
+;   rng-next!            the PRNG alone
+;   draw-int!            + record! (a Choice appended to the tape)
+;   trivial property     + source-begin-generate!, the swarm mask, the indirect call
+;   list property        + draw-len!, a span per element, arena allocation
+;   shrink               the whole greedy fixpoint on a known-failing tape
+;
+; `coil.prop.rng` and `coil.prop.shrink` are imported QUALIFIED. `coil.prop`
+; re-exports source/arbitrary/show/runner but not those two, and importing them
+; unqualified alongside `coil.prop` is exactly the ambiguity the prop docs warn
+; about.
+(import "coil.prop.rng" :as rng)
+(import "coil.prop.shrink" :as shrink)
+
+; ------------------------------------------------------------------- timing
+
+;; Monotonic nanoseconds. Wall time is wrong for this by construction: a clock
+;; adjustment mid-run would silently rewrite a benchmark result rather than fail.
+;; A clock that cannot be read is not something to paper over with 0, so it aborts.
+(defn now-ns [] (-> i64)
+  (let [slot (primitive/alloc-stack Instant)]
+    (match (monotonic-now)
+      (Err [_]
+           (do (print-str (stdout) "prop_bench: monotonic clock unavailable\n")
+               (abort)
+               0))
+      (Ok [i]
+          (do (store! slot i)
+              (primitive/iadd (primitive/imul (load (field slot sec)) 1000000000)
+                              (load (field slot nsec))))))))
+
+;; Rates are integer-only on purpose: `{f}` is a fixed 6-decimal display and these
+;; span 1e0..1e9, so picoseconds-per-op is reported instead of a rounded ns that
+;; would print the RNG as "1 ns" and the tape draw as "5 ns" — hiding the very
+;; difference the layering is there to expose.
+(defn ps-per-op [(n i64) (ns i64)] (-> i64)
+  (if (<= n 0) 0 (primitive/idiv (primitive/imul ns 1000) n)))
+
+(defn ops-per-sec [(n i64) (ns i64)] (-> i64)
+  (if (<= ns 0) 0 (primitive/idiv (primitive/imul n 1000000000) ns)))
+
+(defn report [(w (ptr Writer)) (label (slice u8)) (unit (slice u8)) (n i64) (ns i64)] (-> i64)
+  (fmt w "  {s}\n      {d} {s} in {d} ms | {d} ps/{s} | {d} {s}/s\n"
+       label n unit (primitive/idiv ns 1000000) (ps-per-op n ns) unit (ops-per-sec n ns) unit)
+  0)
+
+; ------------------------------------------------- reading the Source's memory
+
+;; The Source's internal high-water marks, read straight off the struct.
+;;
+;; These live here and not in prop_source.coil deliberately: nothing but a
+;; benchmark has any business reading a bump pointer or a capacity, and adding
+;; accessors for them would advertise them as part of the tape's API. `off`
+;; returns to zero on every `source-reset!`, so the number that matters is its
+;; PEAK across cases — sampled at end-of-case, which is where each case peaks
+;; because an arena only ever bumps forward within a case.
+(defn src-arena-used [(s (ptr Source))] (-> i64)
+  (load (field (load (field s arena-state)) off)))
+(defn src-arena-cap [(s (ptr Source))] (-> i64)
+  (load (field (load (field s arena-state)) cap)))
+(defn src-tape-cap [(s (ptr Source))] (-> i64)
+  (load (field (field s tape) cap)))
+(defn src-spans-cap [(s (ptr Source))] (-> i64)
+  (load (field (field s spans) cap)))
+(defn src-replay-cap [(s (ptr Source))] (-> i64)
+  (load (field (field s replay) cap)))
+
+; ------------------------------------------------------------- 1. the raw RNG
+
+;; The accumulator is not decoration. `rng-next!` is pure apart from its state, so
+;; without a consumer LLVM deletes the whole chain and the benchmark times an empty
+;; loop; xor-folding and printing the result forces every draw to happen.
+(defn bench-rng-next [(r (ptr rng/Rng)) (n i64)] (-> u64)
+  (let [(mut acc) (primitive/cast u64 0)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (store! acc (primitive/ixor (load acc) (rng/rng-next! (mut r))))
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load acc)))
+
+;; `rng-below!` on top of `rng-next!`: one 64x64 multiply-high (four 32-bit limb
+;; multiplies, since Coil has no u128) plus a rejection test that never fires for
+;; a bound this small. The gap to `bench-rng-next` is the price of uniformity.
+(defn bench-rng-below [(r (ptr rng/Rng)) (n i64) (bound i64)] (-> i64)
+  (let [(mut acc) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (store! acc (primitive/iadd (load acc) (rng/rng-below! (mut r) bound)))
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load acc)))
+
+; ------------------------------------------------- 2. one draw through a Source
+
+;; `draw-int!` = one or two RNG draws (the edge-case coin flip is a draw of its
+;; own) plus `record!` appending a 56-byte Choice to the tape.
+;;
+;; The draws are batched between resets rather than run as one unbroken stream
+;; because `max-choices` caps a tape at 100k entries — past that `record!` flips
+;; the Source to ST-EXHAUSTED and returns minima, which would time a different
+;; function entirely. `source-begin-generate!` is O(1) (three length stores and a
+;; pointer rewind), so at 1024 draws per batch it is below the noise floor.
+(defn bench-draw-int [(s (ptr Source)) (batches i64) (per i64)] (-> i64)
+  (let [(mut acc) 0
+        (mut b) 0]
+    (loop (if (>= (load b) batches)
+              (break)
+              (do (source-begin-generate! s 60)
+                  (let [(mut j) 0]
+                    (loop (if (>= (load j) per)
+                              (break)
+                              (do (store! acc (primitive/iadd (load acc) (draw-int! s 0 1000000)))
+                                  (store! j (primitive/iadd (load j) 1))))))
+                  (store! b (primitive/iadd (load b) 1)))))
+    (load acc)))
+
+; --------------------------------------------------------- the mini test runner
+
+;; `prop-run`'s inner loop with the environment parsing and the failure report
+;; removed, and nothing else: the same `source-begin-generate!`, the same swarm
+;; mask drawn the same way, the same indirect `call-ptr` through a `fnptr`. A
+;; number measured here is what a case costs inside `coil test`.
+;;
+;; The property is called through a function POINTER, exactly as `defprop` wires
+;; it, so its body cannot be inlined into this loop — which is the honest shape,
+;; and also why the trivial property's tautological body does not vanish.
+(defn bench-cases [(s (ptr Source))
+                   (p (fnptr c [(ptr Source) i64] bool))
+                   (n i64)
+                   (max-size i64)] (-> i64)
+  (let [(mut held) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (source-begin-generate! s (size-for (load i) n max-size))
+                  (source-swarm! s (case-swarm-mask s (load i)))
+                  (if (primitive/call-ptr p s PROP-MODE-RUN)
+                      (store! held (primitive/iadd (load held) 1))
+                      0)
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load held)))
+
+; ------------------------------------------------------ 3. a trivial property
+
+(defn bench-max [(a i64) (b i64)] (-> i64) (if (>= a b) a b))
+(defn bench-min [(a i64) (b i64)] (-> i64) (if (<= a b) a b))
+
+;; The two mode tests `defprop` emits inline, named so the hand-written properties
+;; below can have the macro's exact shape. That shape is the thing being measured:
+;; a property that skipped the mode branches would be a cheaper function than any
+;; property a user can actually write.
+(defn prop-mode-show? [(mode i64)] (-> bool)
+  (or (= mode PROP-MODE-SHOW) (= mode PROP-MODE-DRAW-SHOW)))
+(defn prop-mode-draw-only? [(mode i64)] (-> bool)
+  (>= mode PROP-MODE-DRAW))
+
+;; Two i64 arguments and one comparison — the cheapest property anyone would
+;; actually write, so this line is the FLOOR of the engine: everything it measures
+;; is harness, not user code.
+;;
+;; The body is a tautology and LLVM folds it to `true`; that is fine and even
+;; desirable here. The two `arbitrary` calls write to the tape, so they survive,
+;; and what is left is precisely the per-case overhead we want to price.
+(defn prop-two-ints [(s (ptr Source)) (mode i64)] (-> bool)
+  (let [(mut slot$a) (zeroed i64)
+        (mut slot$b) (zeroed i64)]
+    (arbitrary (mut slot$a) s)
+    (arbitrary (mut slot$b) s)
+    ; `defprop` emits this same guarded print, and it is kept so the measured
+    ; function has the shape the macro actually generates.
+    (if (prop-mode-show? mode)
+        (do (prop-show-arg "a" (load slot$a))
+            (prop-show-arg "b" (load slot$b))
+            0)
+        0)
+    (if (prop-mode-draw-only? mode)
+        true
+        (let [a (load slot$a)
+              b (load slot$b)]
+          (>= (bench-max a b) (bench-min a b))))))
+
+; ---------------------------------------------------------- 4. a list property
+
+;; A fixed 32-element `(ArrayList i64)`: 32 element spans, 32 full-range integer
+;; draws, and one arena-backed list. `arb-list-n` rather than the `Arbitrary` impl
+;; for `(ArrayList T)` because the impl's length draw is deliberately tapered
+;; toward short lists, so "~32 elements" would in fact be a handful — the natural
+;; distribution is measured separately below.
+(defn prop-list-32 [(s (ptr Source)) (mode i64)] (-> bool)
+  (let [(mut slot$xs) (zeroed (ArrayList i64))]
+    (store! slot$xs (arb-list-n [i64] s 32))
+    (if (prop-mode-show? mode) (do (prop-show-arg "xs" (load slot$xs)) 0) 0)
+    (if (prop-mode-draw-only? mode)
+        true
+        (let [xs (load slot$xs)
+              n (al-len [i64] xs)
+              (mut hi) -9223372036854775808
+              (mut i) 0]
+          (loop (if (>= (load i) n)
+                    (break)
+                    (do (store! hi (bench-max (load hi) (al-get [i64] xs (load i))))
+                        (store! i (primitive/iadd (load i) 1)))))
+          ; a real one-pass claim about the elements, not a claim about the length:
+          ; an empty list has no maximum, so the property is vacuously true there.
+          (or (= n 0) (>= (load hi) (al-get [i64] xs 0)))))))
+
+;; The same property over the stock `(ArrayList i64)` generator, whose length comes
+;; from `draw-len!`. Reported alongside the fixed-32 line because the tapered
+;; length is what a user's list property actually pays, and it is much cheaper.
+(defn prop-list-natural [(s (ptr Source)) (mode i64)] (-> bool)
+  (let [(mut slot$xs) (zeroed (ArrayList i64))]
+    (arbitrary (mut slot$xs) s)
+    (if (prop-mode-show? mode) (do (prop-show-arg "xs" (load slot$xs)) 0) 0)
+    (if (prop-mode-draw-only? mode)
+        true
+        (let [xs (load slot$xs)
+              n (al-len [i64] xs)
+              (mut hi) -9223372036854775808
+              (mut i) 0]
+          (loop (if (>= (load i) n)
+                    (break)
+                    (do (store! hi (bench-max (load hi) (al-get [i64] xs (load i))))
+                        (store! i (primitive/iadd (load i) 1)))))
+          (or (= n 0) (>= (load hi) (al-get [i64] xs 0)))))))
+
+;; The mean generated length, measured OUTSIDE the timed loop so the counter does
+;; not land in the number being reported. Without it the natural-list line is
+;; uninterpretable: a list benchmark with no stated length says nothing.
+(defn sample-mean-len-x100 [(s (ptr Source)) (n i64) (max-size i64)] (-> i64)
+  (let [(mut total) 0
+        (mut i) 0
+        (mut slot) (zeroed (ArrayList i64))]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (source-begin-generate! s (size-for (load i) n max-size))
+                  (source-swarm! s -1)
+                  (arbitrary (mut slot) s)
+                  (store! total (primitive/iadd (load total) (al-len [i64] (load slot))))
+                  (store! i (primitive/iadd (load i) 1)))))
+    (primitive/idiv (primitive/imul (load total) 100) n)))
+
+; --------------------------------------------------------------- 5. shrinking
+
+;; The known-failing cases. Both are FALSE for anything but a tiny input, so a
+;; random case fails almost immediately and the whole measured cost is the greedy
+;; fixpoint rather than the search that found the failure.
+;;
+;; Flat: "the list is shorter than 32". The minimum is a 32-element list of zeros,
+;; which forces `pass-delete-spans` to walk down to an exact boundary and then
+;; `pass-minimize-choices` to zero every survivor — the two passes that dominate.
+(defn prop-fail-flat [(s (ptr Source)) (mode i64)] (-> bool)
+  (let [(mut slot$xs) (zeroed (ArrayList i64))]
+    (arbitrary (mut slot$xs) s)
+    (if (prop-mode-show? mode) (do (prop-show-arg "xs" (load slot$xs)) 0) 0)
+    (if (prop-mode-draw-only? mode)
+        true
+        (< (al-len [i64] (load slot$xs)) 32))))
+
+;; Nested: "no sublist has 8 or more elements", over a list of lists. This is the
+;; deep case — the span tree has two levels, so `pass-hoist` and the adaptive
+;; run-deletion both have something to bite on, and the minimum (one sublist of
+;; exactly 8 zeros, with everything around it deleted) is far from the input.
+(defn prop-fail-deep [(s (ptr Source)) (mode i64)] (-> bool)
+  (let [(mut slot$xss) (zeroed (ArrayList (ArrayList i64)))]
+    (arbitrary (mut slot$xss) s)
+    (if (prop-mode-show? mode) (do (prop-show-arg "xss" (load slot$xss)) 0) 0)
+    (if (prop-mode-draw-only? mode)
+        true
+        (let [xss (load slot$xss)
+              n (al-len [(ArrayList i64)] xss)
+              (mut ok) true
+              (mut i) 0]
+          (loop (if (>= (load i) n)
+                    (break)
+                    (do (if (>= (al-len [i64] (al-get [(ArrayList i64)] xss (load i))) 8)
+                            (store! ok false)
+                            0)
+                        (store! i (primitive/iadd (load i) 1)))))
+          (load ok)))))
+
+;; Generate until the property fails, then time `shrink-run!` on that tape.
+;;
+;; This is `report-failure` with the printing removed: the same `RunCtx`, the same
+;; `run-candidate` callback, the same budget. Sharing the runner's own callback
+;; matters — a hand-rolled replay loop here would quietly measure a different
+;; (probably cheaper) thing than what `coil test` runs.
+(defn bench-shrink [(w (ptr Writer))
+                    (label (slice u8))
+                    (p (fnptr c [(ptr Source) i64] bool))
+                    (max-size i64)
+                    (seed i64)] (-> i64)
+  (let [mem (malloc-allocator)
+        s (source-new mem 8388608 seed)
+        rc (unwrap-ptr [RunCtx] (create [RunCtx] mem))
+        (mut found) false
+        (mut i) 0]
+    (loop (if (or (load found) (>= (load i) 100000))
+              (break)
+              (do (source-begin-generate! s max-size)
+                  (source-swarm! s (case-swarm-mask s (load i)))
+                  (if (primitive/call-ptr p s PROP-MODE-RUN) 0 (store! found true))
+                  (store! i (primitive/iadd (load i) 1)))))
+    (if (load found)
+        0
+        (do (print-str w "prop_bench: shrink benchmark never found a failing case\n")
+            (abort)
+            0))
+    (let [(mut failing) (tape-clone mem (src-tape s))
+          (mut fspans) (shrink/spans-clone mem (src-spans s))
+          before (al-len [Choice] (load (src-tape s)))]
+      (store! (field rc src) s)
+      (store! (field rc prop) p)
+      (store! (field rc size) (src-size s))
+      ; -1 = "this failure is a returned false, not a crash". The forked
+      ; crash-shrinking path keys off this field; the benchmark deliberately
+      ; measures the in-process path.
+      (store! (field rc crash-code) -1)
+      (let [sc (shrink/shrink-ctx-new mem s (primitive/fnptr-of run-candidate)
+                                      (primitive/cast (ptr i8) rc) 20000)]
+        (shrink/sc-seed-best! sc (mut failing) (mut fspans))
+        (let [t0 (now-ns)
+              rounds (shrink/shrink-run! sc)
+              t1 (now-ns)
+              ns (primitive/isub t1 t0)]
+          (fmt w "  {s}\n      found after {d} cases | tape {d} -> {d} choices | {d} rounds, {d} calls, {d} accepted\n      {d} us to minimize | {d} ns per shrink call\n"
+               label (load i) before (al-len [Choice] (load (shrink/sc-best sc)))
+               rounds (shrink/sc-calls sc) (shrink/sc-accepted sc)
+               (primitive/idiv ns 1000)
+               (if (> (shrink/sc-calls sc) 0) (primitive/idiv ns (shrink/sc-calls sc)) 0))
+          ; Re-run the minimal tape with `show` on, the way the real report does,
+          ; so the printed counterexample is proof the shrink actually happened
+          ; rather than a call count with nothing behind it.
+          (print-str w "      counterexample: ")
+          (source-begin-replay! s (shrink/sc-best sc) (src-size s))
+          (primitive/call-ptr p s PROP-MODE-SHOW)
+          (print-str w "\n")
+          0)))))
+
+; ------------------------------------------------------- 6. steady-state memory
+
+;; The claim in prop_source.coil is that a run of a million cases performs a
+;; handful of allocations in total. This checks it the only way that counts: run a
+;; million cases and watch the three things that could grow — the arena's peak
+;; bump offset, and the capacities of the tape and span ArrayLists.
+;;
+;; Capacities, not lengths: `source-reset!` sets the lengths to zero, so a length
+;; proves nothing. A capacity only ever moves when the backing buffer is
+;; reallocated, which is exactly the event "steady state" means the absence of.
+(defn bench-memory [(w (ptr Writer))
+                    (s (ptr Source))
+                    (p (fnptr c [(ptr Source) i64] bool))
+                    (n i64)
+                    (max-size i64)] (-> i64)
+  (let [(mut peak) 0
+        (mut mark) 1000
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (source-begin-generate! s (size-for (load i) n max-size))
+                  (source-swarm! s (case-swarm-mask s (load i)))
+                  (primitive/call-ptr p s PROP-MODE-RUN)
+                  (let [used (src-arena-used s)]
+                    (if (> used (load peak)) (store! peak used) 0))
+                  (store! i (primitive/iadd (load i) 1))
+                  (if (= (load i) (load mark))
+                      (do (fmt w "      after {d} cases: arena peak {d} B of {d} | tape cap {d} | spans cap {d} | replay cap {d}\n"
+                               (load i) (load peak) (src-arena-cap s)
+                               (src-tape-cap s) (src-spans-cap s) (src-replay-cap s))
+                          (store! mark (primitive/imul (load mark) 10))
+                          0)
+                      0)
+                  0)))
+    (fmt w "      final: arena in use between cases {d} B (reset to 0 by source-reset!)\n"
+         (src-arena-used s))
+    0))
+
+; ------------------------------------------------------------------------ main
+
+;; Warm-up before every timed loop: the first pass through a fresh arena takes the
+;; page faults and the first tape growth, and folding that into a throughput number
+;; would report the cost of `mmap` as the cost of a draw.
+(defn main [] (-> i64)
+  (let [w (stdout)
+        mem (malloc-allocator)
+        s (source-new mem 8388608 20260808)
+        r (primitive/alloc-stack rng/Rng)]
+    (store! r (rng/rng-seed 20260808))
+    (print-str w "coil.prop throughput (monotonic clock, one process, -O3)\n\n")
+
+    (print-str w "1. raw RNG\n")
+    (bench-rng-next (mut r) 10000000)
+    (let [n 200000000
+          t0 (now-ns)
+          acc (bench-rng-next (mut r) n)
+          t1 (now-ns)]
+      (report w "rng-next!  (xoshiro256++)" "draw" n (primitive/isub t1 t0))
+      ; consume the accumulator so the loop cannot be optimized away
+      (fmt w "      (checksum {d})\n" (primitive/cast i64 acc)))
+    (bench-rng-below (mut r) 10000000 1000)
+    (let [n 200000000
+          t0 (now-ns)
+          acc (bench-rng-below (mut r) n 1000)
+          t1 (now-ns)]
+      (report w "rng-below! (Lemire, bound 1000)" "draw" n (primitive/isub t1 t0))
+      (fmt w "      (checksum {d})\n" acc))
+
+    (print-str w "\n2. one draw through a Source (tape recording included)\n")
+    (bench-draw-int s 1000 1024)
+    (let [batches 100000
+          per 1024
+          t0 (now-ns)
+          acc (bench-draw-int s batches per)
+          t1 (now-ns)]
+      (report w "draw-int! [0, 1e6]" "draw" (primitive/imul batches per) (primitive/isub t1 t0))
+      (fmt w "      (checksum {d})\n" acc))
+
+    (print-str w "\n3. a trivial property: two i64 arguments, one comparison\n")
+    (bench-cases s (primitive/fnptr-of prop-two-ints) 100000 60)
+    (let [n 5000000
+          t0 (now-ns)
+          held (bench-cases s (primitive/fnptr-of prop-two-ints) n 60)
+          t1 (now-ns)]
+      (report w "two i64s + a comparison" "case" n (primitive/isub t1 t0))
+      (fmt w "      ({d} of {d} held)\n" held n))
+
+    (print-str w "\n4. a list property\n")
+    (bench-cases s (primitive/fnptr-of prop-list-32) 20000 60)
+    (let [n 500000
+          t0 (now-ns)
+          held (bench-cases s (primitive/fnptr-of prop-list-32) n 60)
+          t1 (now-ns)]
+      (report w "(ArrayList i64), exactly 32 elements" "case" n (primitive/isub t1 t0))
+      (fmt w "      ({d} of {d} held)\n" held n))
+    (let [mean100 (sample-mean-len-x100 s 100000 60)
+          n 500000
+          _ (bench-cases s (primitive/fnptr-of prop-list-natural) 20000 60)
+          t0 (now-ns)
+          held (bench-cases s (primitive/fnptr-of prop-list-natural) n 60)
+          t1 (now-ns)]
+      (report w "(ArrayList i64), stock generator" "case" n (primitive/isub t1 t0))
+      (fmt w "      ({d} of {d} held; mean length {d}.{d} elements at max size 60)\n"
+           held n (primitive/idiv mean100 100) (primitive/irem mean100 100)))
+
+    (print-str w "\n5. shrinking a known-failing case\n")
+    (bench-shrink w "flat: (ArrayList i64), len < 32" (primitive/fnptr-of prop-fail-flat) 200 7)
+    (bench-shrink w "deep: (ArrayList (ArrayList i64)), no sublist >= 8" (primitive/fnptr-of prop-fail-deep) 120 11)
+
+    (print-str w "\n6. steady state over 1,000,000 cases (stock list property)\n")
+    (bench-memory w s (primitive/fnptr-of prop-list-natural) 1000000 60)
+    0))

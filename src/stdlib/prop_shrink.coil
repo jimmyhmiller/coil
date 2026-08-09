@@ -31,6 +31,47 @@
 ; most of the work. Progress restarts the round (greedy), and the whole loop is
 ; bounded by a call budget so a pathological property cannot hang a test run.
 
+; ------------------------------------------------------------- pass identity
+;
+; Each pass has a small dense id. The fixpoint stamps the id of the pass that is
+; currently proposing candidates onto the context, and `sc-try!` credits it with
+; every accepted improvement — which is how the runner can say "12 shrinks: 7
+; delete-spans, 3 minimize, 2 redistribute" instead of just "12 shrinks".
+;
+; That attribution is not decoration. A pass that never lands on real properties
+; is pure budget, and a pass that lands on everything is a hint that the ones
+; before it are leaving work on the table; there is no way to see either without
+; per-pass counts. Ids are integers and the counters are one flat array, so the
+; bookkeeping costs one increment on a path that runs tens of thousands of times.
+
+(const PASS-DELETE-SPANS 0)
+(const PASS-HOIST 1)
+(const PASS-DEDUPE-SPANS 2)
+(const PASS-SORT-SPANS 3)
+(const PASS-TRUNCATE 4)
+(const PASS-SHIFT-TAIL 5)
+(const PASS-ZERO-SPANS 6)
+(const PASS-MINIMIZE 7)
+(const PASS-LOWER-TOGETHER 8)
+(const PASS-REDISTRIBUTE 9)
+(const PASS-COUNT 10)
+
+;; The pass's name, for a report. Ids are an implementation detail; nobody reading
+;; a failure wants to decode "pass 5 landed 3 times".
+(defn shrink-pass-name [(id i64)] (-> (slice u8))
+  (case id
+    PASS-DELETE-SPANS   "delete-spans"
+    PASS-HOIST          "hoist"
+    PASS-DEDUPE-SPANS   "dedupe-spans"
+    PASS-SORT-SPANS     "sort-spans"
+    PASS-TRUNCATE       "truncate"
+    PASS-SHIFT-TAIL     "shift-tail"
+    PASS-ZERO-SPANS     "zero-spans"
+    PASS-MINIMIZE       "minimize"
+    PASS-LOWER-TOGETHER "lower-together"
+    PASS-REDISTRIBUTE   "redistribute"
+    "?"))
+
 ;; What the shrinker needs from its caller: run this tape, and say whether the
 ;; property still fails on it. Returning `false` for a REJECTED (assume-failed)
 ;; or crashed candidate is the caller's job.
@@ -44,7 +85,9 @@
    (seen (HashMap i64 i64))
    (calls i64)
    (budget i64)
-   (accepted i64)])
+   (accepted i64)
+   (cur-pass i64)          ; who is proposing right now
+   (pass-hits (ArrayList i64))])  ; accepted improvements, indexed by pass id
 
 (defn shrink-ctx-new [(mem (ptr Allocator))
                       (src (ptr Source))
@@ -62,11 +105,36 @@
     (store! (field c calls) 0)
     (store! (field c budget) budget)
     (store! (field c accepted) 0)
+    (store! (field c cur-pass) PASS-DELETE-SPANS)
+    (store! (field c pass-hits) (al-new [i64] mem))
+    ; a fixed-length counter array, filled once: `sc-try!` indexes it directly, so
+    ; it must be long enough before the first candidate is ever proposed.
+    (let [(mut i) 0]
+      (loop (if (>= (load i) PASS-COUNT)
+                (break)
+                (do (al-push! [i64] (mut (field c pass-hits)) 0)
+                    (store! i (primitive/iadd (load i) 1))))))
     c))
 
 (defn sc-calls [(c (ptr ShrinkCtx))] (-> i64) (load (field c calls)))
 (defn sc-accepted [(c (ptr ShrinkCtx))] (-> i64) (load (field c accepted)))
 (defn sc-best [(c (ptr ShrinkCtx))] (-> (ptr (ArrayList Choice))) (field c best))
+(defn sc-best-spans [(c (ptr ShrinkCtx))] (-> (ptr (ArrayList Span))) (field c best-spans))
+
+;; How many accepted improvements pass `id` is responsible for. The runner's shrink
+;; statistics, and the only honest way for a test to prove that a particular pass —
+;; not a lucky binary search — is what produced the counterexample.
+(defn sc-pass-accepts [(c (ptr ShrinkCtx)) (id i64)] (-> i64)
+  (if (or (< id 0) (>= id PASS-COUNT))
+      0
+      (al-get [i64] (load (field c pass-hits)) id)))
+
+;; Announce which pass is proposing. Every pass calls this on entry; forgetting to
+;; misattributes its accepts to whoever ran last, which is why it is the first line
+;; of each pass rather than something the fixpoint does around the call.
+(defn sc-pass! [(c (ptr ShrinkCtx)) (id i64)] (-> i64)
+  (store! (field c cur-pass) id)
+  0)
 
 ;; Install the first known-failing tape (and the spans that produced it).
 (defn sc-seed-best! [(c (ptr ShrinkCtx)) (tape (ptr (ArrayList Choice))) (spans (ptr (ArrayList Span)))] (-> i64)
@@ -113,6 +181,8 @@
                               (do (store! (field c best) (tape-clone (load (field c mem)) canon))
                                   (store! (field c best-spans) (spans-clone (load (field c mem)) (src-spans s)))
                                   (store! (field c accepted) (primitive/iadd (load (field c accepted)) 1))
+                                  (let [e (al-elem [i64] (field c pass-hits) (load (field c cur-pass)))]
+                                    (store! e (primitive/iadd (load e) 1)))
                                   true)
                               false))
                         false)))))))))
@@ -140,6 +210,47 @@
         0)
     (load out)))
 
+;; Append `t[from, to)` to `out`, clipped to the tape. The clipping is the point:
+;; every caller here is working from span bounds recorded against an EARLIER tape,
+;; and a stale bound must produce a short copy rather than a wild read.
+(defn copy-range! [(out (ptr (ArrayList Choice))) (t (ptr (ArrayList Choice))) (from i64) (to i64)] (-> i64)
+  (let [n (al-len [Choice] (load t))
+        (mut i) (if (< from 0) 0 from)]
+    (loop (if (or (>= (load i) to) (>= (load i) n))
+              (break)
+              (do (al-push! [Choice] out (al-get [Choice] (load t) (load i)))
+                  (store! i (primitive/iadd (load i) 1)))))
+    0))
+
+;; `t` with the ranges [af, at) and [bf, bt) exchanged. Requires `at <= bf`;
+;; whatever sits between them keeps its position, so this is a swap of two blocks
+;; and not a rotation of the tail.
+(defn swap-ranges [(a (ptr Allocator))
+                   (t (ptr (ArrayList Choice)))
+                   (af i64) (at i64) (bf i64) (bt i64)] (-> (ArrayList Choice))
+  (let [(mut out) (al-new [Choice] a)]
+    (copy-range! (mut out) t 0 af)
+    (copy-range! (mut out) t bf bt)
+    (copy-range! (mut out) t at bf)
+    (copy-range! (mut out) t af at)
+    (copy-range! (mut out) t bt (al-len [Choice] (load t)))
+    (load out)))
+
+;; `t` with every choice in [from, to) replaced by its own minimum. Each choice
+;; carries its constraints, so "minimum" is per-choice and legal by construction —
+;; no clamping happens on replay and the tape stays exactly this length.
+(defn tape-zero-range [(a (ptr Allocator)) (t (ptr (ArrayList Choice))) (from i64) (to i64)] (-> (ArrayList Choice))
+  (let [(mut out) (tape-clone a t)
+        n (al-len [Choice] (load out))
+        (mut i) (if (< from 0) 0 from)]
+    (loop (if (or (>= (load i) to) (>= (load i) n))
+              (break)
+              (do (let [e (al-elem [Choice] (mut out) (load i))]
+                    (store! (field e value)
+                            (choice-minimal (load (field e lo)) (load (field e hi)) (load (field e origin)))))
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load out)))
+
 ;; The best tape truncated to `n` choices.
 (defn tape-prefix [(a (ptr Allocator)) (t (ptr (ArrayList Choice))) (n i64)] (-> (ArrayList Choice))
   (let [(mut out) (al-new [Choice] a)
@@ -159,6 +270,7 @@
 ;; long list collapse in O(log n) property calls instead of O(n) — the single
 ;; most valuable pass in the set, and the reason spans exist at all.
 (defn pass-delete-spans [(c (ptr ShrinkCtx))] (-> bool)
+  (sc-pass! c PASS-DELETE-SPANS)
   (let [(mut progress) false
         (mut i) 0]
     (loop (if (>= (load i) (al-len [Span] (load (field c best-spans))))
@@ -197,6 +309,7 @@
 ;; which costs ~64 calls per choice in the worst case and usually 2 or 3 — most
 ;; interesting values are small or are the origin already.
 (defn pass-minimize-choices [(c (ptr ShrinkCtx))] (-> bool)
+  (sc-pass! c PASS-MINIMIZE)
   (let [(mut progress) false
         (mut i) 0]
     (loop (if (>= (load i) (al-len [Choice] (load (field c best))))
@@ -254,6 +367,7 @@
 ;; A tape whose tail is unused (because an earlier length shrank) can simply end.
 ;; Replay is total, so anything the generator still asks for comes back minimal.
 (defn pass-truncate [(c (ptr ShrinkCtx))] (-> bool)
+  (sc-pass! c PASS-TRUNCATE)
   (let [(mut progress) true
         (mut any) false]
     (loop (if (not (load progress))
@@ -278,6 +392,7 @@
 ;; independently walks into a plateau where neither move alone reproduces the
 ;; failure; lowering them together steps off it.
 (defn pass-lower-together [(c (ptr ShrinkCtx))] (-> bool)
+  (sc-pass! c PASS-LOWER-TOGETHER)
   (let [(mut progress) false
         n (al-len [Choice] (load (field c best)))
         (mut i) 0]
@@ -315,6 +430,7 @@
 ;; zero the first outright — is what turns `(7, 3)` into `(0, 10)`, which reads
 ;; as a much clearer counterexample.
 (defn pass-redistribute [(c (ptr ShrinkCtx))] (-> bool)
+  (sc-pass! c PASS-REDISTRIBUTE)
   (let [(mut progress) false
         (mut i) 0]
     (loop (if (>= (primitive/iadd (load i) 1) (al-len [Choice] (load (field c best))))
@@ -352,6 +468,7 @@
 ;; z)), w)` reduces to `Add(y, z)` in one step. Without it, a deep tree can only
 ;; be whittled from the leaves and usually stalls on a big but irrelevant shape.
 (defn pass-hoist [(c (ptr ShrinkCtx))] (-> bool)
+  (sc-pass! c PASS-HOIST)
   (let [(mut progress) false
         (mut i) 0]
     (loop (if (>= (load i) (al-len [Span] (load (field c best-spans))))
@@ -435,11 +552,239 @@
                   (store! i (primitive/iadd (load i) 1)))))
     (load out)))
 
+;; A span's end, with the open-span sentinel resolved to the end of the tape. A
+;; span is left open when the generator aborted partway through it (an overrun, an
+;; `assume`), and the passes below still want to reason about the region it covers.
+(defn span-end-of [(c (ptr ShrinkCtx)) (sp Span)] (-> i64)
+  (let [e (load (field sp end))]
+    (if (< e 0) (al-len [Choice] (load (field c best))) e)))
+
+;; How far back `pass-dedupe-spans` looks for a span to copy from. Quadratic in the
+;; span count without a bound, and the payoff is front-loaded: the first few spans
+;; with a given label are the small, already-minimized ones worth copying.
+(const DEDUPE-SCAN 32)
+
+;; PASS: make one value do the work of several.
+;;
+;; If a later span was drawn by the same generator as an earlier one — same label,
+;; so the same sequence of decisions — then replaying the earlier span's choices in
+;; the later one's place is legal by construction, and the generator rebuilds a
+;; valid value from it. When the earlier span is the smaller of the two the tape
+;; shrinks outright; when they are the same size the tape still gets blander,
+;; because one value now appears where two used to.
+;;
+;; That second case is the one worth having. `[k, 91, 17]` where any repeated pair
+;; reproduces the bug is a puzzle; `[0, 0, 17]` is an explanation. Shrinking values
+;; one at a time can never find it — each of the three is already minimal given the
+;; other two.
+(defn pass-dedupe-spans [(c (ptr ShrinkCtx))] (-> bool)
+  (sc-pass! c PASS-DEDUPE-SPANS)
+  (let [(mut progress) false
+        (mut j) 1]
+    (loop (if (>= (load j) (al-len [Span] (load (field c best-spans))))
+              (break)
+              (do (if (dedupe-one c (load j)) (store! progress true) 0)
+                  (store! j (primitive/iadd (load j) 1)))))
+    (load progress)))
+
+(defn dedupe-one [(c (ptr ShrinkCtx)) (j i64)] (-> bool)
+  (let [spans (field c best-spans)
+        nspans (al-len [Span] (load spans))]
+    (if (>= j nspans)
+        false
+        (let [later (al-get [Span] (load spans) j)
+              j-start (load (field later start))
+              j-end (span-end-of c later)
+              (mut done) false
+              (mut tried) 0
+              (mut i) 0]
+          (if (<= j-end j-start)
+              false
+              (do
+                (loop (if (or (load done)
+                              (or (>= (load i) j) (>= (load tried) DEDUPE-SCAN)))
+                          (break)
+                          (let [earlier (al-get [Span] (load spans) (load i))
+                                i-start (load (field earlier start))
+                                i-end (load (field earlier end))]
+                            ; DISJOINT, and strictly earlier. A span that contains
+                            ; `later` is its ancestor, not a repeat of it, and
+                            ; splicing an ancestor into its own descendant would
+                            ; duplicate the surrounding structure rather than
+                            ; deduplicate anything.
+                            (if (and (>= i-end 0)
+                                     (and (<= i-end j-start)
+                                          (and (<= (primitive/isub i-end i-start)
+                                                   (primitive/isub j-end j-start))
+                                               (slice-eq-name (load (field earlier name))
+                                                              (load (field later name))))))
+                                (do (store! tried (primitive/iadd (load tried) 1))
+                                    (let [(mut cand) (splice (load (field c mem)) (field c best)
+                                                             j-start j-end i-start i-end)]
+                                      (if (sc-try! c (mut cand)) (store! done true) 0))
+                                    0)
+                                0)
+                            (store! i (primitive/iadd (load i) 1))
+                            0)))
+                (load done)))))))
+
+;; PASS: canonicalise the order of interchangeable siblings.
+;;
+;; Half the properties worth writing are order-insensitive — a set, a sum, "some
+;; element is bad" — and for those the shrinker's answer is currently whichever
+;; permutation the RNG happened to hand it. Two runs that find the SAME bug then
+;; print different counterexamples, which makes a failure impossible to diff
+;; against the last one and impossible to recognise as already-known.
+;;
+;; Sorting adjacent same-label siblings by their leading choice fixes that for the
+;; cost of one candidate per pair. Shortlex does the deciding: a swap that does not
+;; genuinely simplify the tape is rejected by `sc-try!` before the property is
+;; called at all, so an order the property DOES care about costs nothing to try and
+;; is never imposed.
+(defn pass-sort-spans [(c (ptr ShrinkCtx))] (-> bool)
+  (sc-pass! c PASS-SORT-SPANS)
+  (let [(mut progress) false
+        (mut i) 0]
+    (loop (if (>= (load i) (al-len [Span] (load (field c best-spans))))
+              (break)
+              (do (if (sort-one c (load i)) (store! progress true) 0)
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load progress)))
+
+;; The next span with the same parent as span `i` — its next sibling. A scan and
+;; not `i + 1`, because `i`'s own descendants were opened after it and sit between
+;; the two siblings in creation order.
+(defn next-sibling [(spans (ptr (ArrayList Span))) (i i64)] (-> i64)
+  (let [n (al-len [Span] (load spans))
+        me (al-get [Span] (load spans) i)
+        p (load (field me parent))
+        (mut j) (primitive/iadd i 1)
+        (mut found) -1]
+    (loop (if (or (>= (load j) n) (>= (load found) 0))
+              (break)
+              (let [sj (al-get [Span] (load spans) (load j))]
+                (if (= (load (field sj parent)) p) (store! found (load j)) 0)
+                (store! j (primitive/iadd (load j) 1))
+                0)))
+    (load found)))
+
+(defn sort-one [(c (ptr ShrinkCtx)) (i i64)] (-> bool)
+  (let [spans (field c best-spans)
+        nspans (al-len [Span] (load spans))]
+    (if (>= (primitive/iadd i 1) nspans)
+        false
+        (let [k (next-sibling spans i)]
+          (if (< k 0)
+              false
+              (let [a (al-get [Span] (load spans) i)
+                    b (al-get [Span] (load spans) k)
+                    af (load (field a start))
+                    at (load (field a end))
+                    bf (load (field b start))
+                    bt (load (field b end))
+                    t (field c best)
+                    n (al-len [Choice] (load t))]
+                ; Both closed, both non-empty, ADJACENT (nothing was drawn between
+                ; them, so exchanging the two blocks leaves every other choice at
+                ; the index the generator will ask for it at), and in range of the
+                ; tape the spans were recorded against.
+                (if (or (< at 0)
+                        (or (< bt 0)
+                            (or (!= at bf)
+                                (or (>= af at) (or (>= bf bt) (> bt n))))))
+                    false
+                    (if (not (slice-eq-name (load (field a name)) (load (field b name))))
+                        false
+                        (let [ca (al-get [Choice] (load t) af)
+                              cb (al-get [Choice] (load t) bf)]
+                          (if (<= (load (field ca value)) (load (field cb value)))
+                              false
+                              (let [(mut cand) (swap-ranges (load (field c mem)) t af at bf bt)]
+                                (sc-try! c (mut cand)))))))))))))
+
+;; PASS: collapse a whole span to its minima in one move.
+;;
+;; `pass-minimize-choices` reaches the same tape eventually, but it pays a binary
+;; search PER CHOICE: a 40-node subtree that turns out to be irrelevant to the
+;; failure costs a hundred property calls to flatten one value at a time, and one
+;; call this way. The asymmetry is the whole argument for the pass — it is a cheap
+;; guess that a whole structural region does not matter, and structural regions
+;; that do not matter are the common case in a randomly generated counterexample.
+;;
+;; Being wrong is cheap too: a span that is already minimal produces a candidate
+;; shortlex rejects without running the property.
+(defn pass-zero-spans [(c (ptr ShrinkCtx))] (-> bool)
+  (sc-pass! c PASS-ZERO-SPANS)
+  (let [(mut progress) false
+        (mut i) 0]
+    (loop (if (>= (load i) (al-len [Span] (load (field c best-spans))))
+              (break)
+              (do (if (zero-one c (load i)) (store! progress true) 0)
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load progress)))
+
+(defn zero-one [(c (ptr ShrinkCtx)) (i i64)] (-> bool)
+  (let [spans (field c best-spans)]
+    (if (>= i (al-len [Span] (load spans)))
+        false
+        (let [sp (al-get [Span] (load spans) i)
+              from (load (field sp start))
+              to (span-end-of c sp)]
+          (if (<= to from)
+              false
+              (let [(mut cand) (tape-zero-range (load (field c mem)) (field c best) from to)]
+                (sc-try! c (mut cand))))))))
+
+;; PASS: delete a single choice, shifting everything after it.
+;;
+;; Every deletion above is span-shaped, which is right exactly when the tape lines
+;; up with the span tree — and it stops being right the moment an earlier edit
+;; changes what the generator asks for. Then the tape carries a one-choice sliver
+;; that no span boundary covers: a discriminant drawn outside any span, a length
+;; whose elements are gone, the residue of a hoist. Nothing above can express
+;; "drop that one and slide the rest up", and until something does, every later
+;; choice is misaligned with the draw that will consume it.
+;;
+;; It costs a property call per choice, since a shorter tape always beats the
+;; current best on shortlex and so always gets run. That is why it goes last among
+;; the structural passes: by the time it runs, the coarse passes have taken the
+;; tape from hundreds of choices to a handful, and a call per choice is nothing.
+(defn pass-shift-tail [(c (ptr ShrinkCtx))] (-> bool)
+  (sc-pass! c PASS-SHIFT-TAIL)
+  (let [(mut progress) false
+        (mut i) 0]
+    (loop (if (>= (load i) (al-len [Choice] (load (field c best))))
+              (break)
+              (let [(mut cand) (tape-without (load (field c mem)) (field c best)
+                                             (load i) (primitive/iadd (load i) 1))]
+                ; On success the tail slid down by one, so index `i` now names a
+                ; DIFFERENT choice and deserves its own attempt; only a failure
+                ; advances. Termination comes from shortlex, not from the counter:
+                ; each accept strictly lowers the best in a well-order.
+                (if (sc-try! c (mut cand))
+                    (store! progress true)
+                    (store! i (primitive/iadd (load i) 1)))
+                0)))
+    (load progress)))
+
 ; ------------------------------------------------------------------ the loop
 
 ;; Run passes to a fixpoint. Any pass that improves the best restarts the round,
 ;; so later passes always see the smallest tape found so far — greedy, which is
 ;; what makes the result independent of which pass got lucky first.
+;;
+;; ORDER MATTERS, and it is: cheap structure, then expensive structure, then
+;; numbers. Every structural pass makes the tape shorter, and every numeric pass
+;; costs work proportional to the tape's length — binary-searching the values of a
+;; 500-choice tape that `pass-delete-spans` is about to reduce to 3 is the single
+;; easiest way to burn a shrink budget. Within the structural group the same
+;; argument orders them again: the span-shaped deletions collapse whole subtrees in
+;; one call each, `pass-shift-tail` pays a call per surviving choice, so it runs
+;; once the others have nothing left to give.
+;;
+;; `pass-zero-spans` sits on the seam. It is keyed off the span tree but it edits
+;; values, and it belongs before `pass-minimize-choices` for exactly the reason
+;; above: one call to flatten a subtree, versus a binary search per choice in it.
 (defn shrink-run! [(c (ptr ShrinkCtx))] (-> i64)
   (let [(mut rounds) 0
         (mut going) true]
@@ -450,11 +795,15 @@
               (do (store! rounds (primitive/iadd (load rounds) 1))
                   (let [a (pass-delete-spans c)
                         b (pass-hoist c)
+                        h (pass-dedupe-spans c)
+                        i (pass-sort-spans c)
                         d (pass-truncate c)
+                        j (pass-shift-tail c)
+                        k (pass-zero-spans c)
                         e (pass-minimize-choices c)
                         f (pass-lower-together c)
                         g (pass-redistribute c)]
-                    (store! going (or a (or b (or d (or e (or f g))))))
+                    (store! going (or a (or b (or h (or i (or d (or j (or k (or e (or f g))))))))))
                     0)
                   0)))
     (load rounds)))

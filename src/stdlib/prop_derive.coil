@@ -1,0 +1,451 @@
+(module coil.prop.derive)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.prop.source" :use *)
+; TYPE-DIRECTED GENERATION — `Arbitrary` and `PropShow` written by the compiler
+; from a type's own shape, in the `coil.derive` style: no compiler support, just
+; macros over the comptime reflection builtins.
+;
+;   (import "coil.prop"        :use *)
+;   (import "coil.prop.derive" :use *)
+;
+;   (defstruct Point [(x i64) (y i64)])
+;   (derive-arbitrary Point) (derive-show Point)
+;
+;   (defsum Tree (Leaf [(v i64)]) (Node [(l (ptr Tree)) (r (ptr Tree))]))
+;   (derive-arbitrary-sum Tree) (derive-show-sum Tree)
+;
+; ⚠ STRUCTS AND SUMS HAVE SEPARATE MACRO NAMES, and it is not a style choice: a
+; macro is a `[Code…] (-> Code)` function, so every argument arrives as syntax,
+; and there is no comptime op that asks "is this symbol a struct or a sum?" —
+; `code-field-*` hard-errors on a sum and `code-variant-*` hard-errors on a
+; struct, so one macro cannot probe for the answer without failing on half its
+; inputs. (`primitive/sum?` would answer, but it is a TYPE query: a macro taking
+; a non-`Code` parameter is not a macro at all, and the call stops being surface
+; syntax.) `coil.serde.derive` split `derive-serde` / `derive-serde-sum` for this
+; exact reason; these follow it.
+;
+; WHAT IS DERIVABLE. Everything the fields resolve to through the trait —
+; integers, floats, bools, strings, nested structs and sums, `(ArrayList T)`,
+; `(Option T)`, and `(ptr T)` children of a recursive sum. Anything else (a raw
+; pointer field of a struct, an array, a function pointer) is a COMPTIME ERROR
+; naming the field, never a silently-zeroed value: a generator that quietly
+; produces zeros looks like it works and tests nothing.
+;
+; RECURSION. A sum whose payload mentions itself is decided recursive AT
+; COMPTIME, by walking the reflected payload types. Such a type — and ONLY such a
+; type — gets fuel logic: when the Source's size budget runs out the tag draw is
+; restricted to the variants that cannot recurse, so generation always bottoms
+; out. A type that cannot recurse gets no fuel check at all, which is the whole
+; reason to decide this at comptime rather than counting depth at runtime.
+
+; ------------------------------------------------------- runtime support ----
+
+;; Where a recursive sum's children come from. The case ARENA, not the heap: it
+;; is rewound wholesale between cases (`source-reset!`), so a million-case run
+;; allocating a tree per case still frees nothing and calls malloc never.
+;;
+;; It is a plain generic — no `Arbitrary` bound — so the generated code can call
+;; it and then call `arbitrary` on the result: a bounded generic calling another
+;; bounded generic with the same bound does not typecheck (see `prop-show-arg`),
+;; and keeping the bound off this side of the split avoids the whole question.
+(defn prop-child [T] [(s (ptr Source))] (-> (ptr T))
+  (unwrap-ptr [T] (create [T] (src-alloc s))))
+
+; ---------------------------------------------- comptime: name comparison ---
+; Reflection hands types back CANONICALLY QUALIFIED (`mymod.Tree`) while the
+; macro was invoked on whatever the user wrote (`Tree`, or `t/Tree` under an
+; alias import). Recursion detection compares the two, so it compares the last
+; segment of each rather than the whole string — `code-eq` on the raw symbols
+; answers "not recursive" for every recursive type there is.
+
+;; Offset just past the last '.' or '/' in a symbol's bytes.
+(defn pd--seg-start [(bs Code) (i i64) (n i64) (at i64)] (-> i64)
+  (if (>= i n)
+      at
+      (let [b (primitive/code-int (primitive/code-nth bs i))]
+        (pd--seg-start bs
+                       (primitive/iadd i 1)
+                       n
+                       (if (or (= b 46) (= b 47)) (primitive/iadd i 1) at)))))
+
+(defn pd--bytes-eq [(a Code) (ai i64) (b Code) (bi i64)] (-> bool)
+  (if (>= ai (primitive/code-count a))
+      (>= bi (primitive/code-count b))
+      (if (>= bi (primitive/code-count b))
+          false
+          (if (= (primitive/code-int (primitive/code-nth a ai))
+                 (primitive/code-int (primitive/code-nth b bi)))
+              (pd--bytes-eq a (primitive/iadd ai 1) b (primitive/iadd bi 1))
+              false))))
+
+;; Do two type symbols name the same type, ignoring how each is qualified?
+(defn pd--same-name? [(a Code) (b Code)] (-> bool)
+  (if (and (primitive/code-sym? a) (primitive/code-sym? b))
+      (let [ab (primitive/str-bytes (primitive/code-str a))
+            bb (primitive/str-bytes (primitive/code-str b))]
+        (pd--bytes-eq ab
+                      (pd--seg-start ab 0 (primitive/code-count ab) 0)
+                      bb
+                      (pd--seg-start bb 0 (primitive/code-count bb) 0)))
+      false))
+
+;; Does this (structured) type mention T anywhere — as itself, or nested inside
+;; `(ptr T)`, `(ArrayList T)`, `(Option (ptr T))`? Anything that puts T inside
+;; the payload can recur, so the walk is over the whole type form, heads
+;; included: `ptr` and `ArrayList` are symbols that simply never match T.
+(defn pd--mentions? [(ty Code) (tname Code)] (-> bool)
+  (if (primitive/code-list? ty)
+      (pd--any-mentions? ty 0 (primitive/code-count ty) tname)
+      (pd--same-name? ty tname)))
+(defn pd--any-mentions? [(ty Code) (i i64) (n i64) (tname Code)] (-> bool)
+  (if (>= i n)
+      false
+      (if (pd--mentions? (primitive/code-nth ty i) tname)
+          true
+          (pd--any-mentions? ty (primitive/iadd i 1) n tname))))
+
+;; A variant is recursive when any of its payload fields mentions the sum.
+(defn pd--variant-rec? [(T Code) (vi i64) (fi i64) (nf i64)] (-> bool)
+  (if (>= fi nf)
+      false
+      (if (pd--mentions? (primitive/code-variant-field-type T vi fi) T)
+          true
+          (pd--variant-rec? T vi (primitive/iadd fi 1) nf))))
+(defn pd--rec-variant? [(T Code) (vi i64)] (-> bool)
+  (pd--variant-rec? T vi 0 (primitive/code-variant-fields T vi)))
+
+;; How many variants can NOT recur — the size of the pool the tag draw falls back
+;; to once fuel is gone. Zero of them means the type has no base case and no
+;; generator for it can terminate; that is a bug in the type, reported as one.
+(defn pd--nonrec-count [(T Code) (vi i64) (nv i64)] (-> i64)
+  (if (>= vi nv)
+      0
+      (primitive/iadd (if (pd--rec-variant? T vi) 0 1)
+                      (pd--nonrec-count T (primitive/iadd vi 1) nv))))
+(defn pd--rec-sum? [(T Code) (vi i64) (nv i64)] (-> bool)
+  (if (>= vi nv)
+      false
+      (if (pd--rec-variant? T vi) true (pd--rec-sum? T (primitive/iadd vi 1) nv))))
+
+; ------------------------------------------- comptime: payload classification
+
+;; `(ptr X)` with a named X — the shape a recursive sum's children take, and the
+;; only pointer this file knows how to fill (it allocates an X and recurses).
+(defn pd--ptr-node? [(ty Code)] (-> bool)
+  (if (primitive/code-list? ty)
+      (if (= (primitive/code-count ty) (cast i64 2))
+          (and (primitive/code-eq (primitive/code-nth ty 0) `ptr)
+               (and (primitive/code-sym? (primitive/code-nth ty 1))
+                    (not (pd--scalar? (primitive/code-nth ty 1)))))
+          false)
+      false))
+
+;; The built-in scalar type names. `(ptr i8)` is a C string or a buffer far more
+;; often than it is "a pointer to one generated byte", so pointing at one is an
+;; error rather than a guess.
+(defn pd--scalar? [(ty Code)] (-> bool)
+  (or (primitive/code-eq ty `i8)
+      (or (primitive/code-eq ty `i16)
+          (or (primitive/code-eq ty `i32)
+              (or (primitive/code-eq ty `i64)
+                  (or (primitive/code-eq ty `u8)
+                      (or (primitive/code-eq ty `u16)
+                          (or (primitive/code-eq ty `u32)
+                              (or (primitive/code-eq ty `u64)
+                                  (or (primitive/code-eq ty `f32)
+                                      (or (primitive/code-eq ty `f64)
+                                          (primitive/code-eq ty `bool))))))))))))
+
+;; `(slice u8)` is the one slice with an `Arbitrary`/`PropShow` impl; any other
+;; element type would resolve to a missing impl with a mangled name, so it is
+;; rejected here where the message can name the field.
+(defn pd--bad-slice? [(ty Code)] (-> bool)
+  (if (primitive/code-list? ty)
+      (and (primitive/code-eq (primitive/code-nth ty 0) `slice)
+           (not (and (= (primitive/code-count ty) (cast i64 2))
+                     (primitive/code-eq (primitive/code-nth ty 1) `u8))))
+      false))
+
+(defn pd--bad-head? [(ty Code) (head Code)] (-> bool)
+  (if (primitive/code-list? ty)
+      (if (> (primitive/code-count ty) (cast i64 0))
+          (primitive/code-eq (primitive/code-nth ty 0) head)
+          false)
+      false))
+
+;; Reject a payload shape this file cannot fill, naming the variant and the
+;; field. Returns `()` so the caller can splice it into the expansion and pay
+;; nothing when the type is fine.
+(defn pd--check-payload [(T Code) (vi i64) (fi i64)] (-> Code)
+  (let [ty (primitive/code-variant-field-type T vi fi)
+        where (primitive/code-str "derive-arbitrary-sum: "
+                                  T
+                                  "."
+                                  (primitive/code-variant-name T vi)
+                                  " field '"
+                                  (primitive/code-variant-field-name T vi fi)
+                                  "' ")]
+    (cond (pd--bad-slice? ty)
+            (primitive/error (primitive/code-str where
+                                                 "is a slice of something other than u8; write the impl by hand"))
+          (pd--bad-head? ty `array)
+            (primitive/error (primitive/code-str where "is an array; write the impl by hand"))
+          (pd--bad-head? ty `fnptr)
+            (primitive/error (primitive/code-str where "is a function pointer; write the impl by hand"))
+          (and (pd--bad-head? ty `ptr) (not (pd--ptr-node? ty)))
+            (primitive/error (primitive/code-str where
+                                                 "is a raw pointer to a scalar — derive would fill one element, which is almost never what the pointer means; write the impl by hand"))
+          :else `())))
+
+(defn pd--check-variant [(T Code) (vi i64) (fi i64) (nf i64)] (-> Code)
+  (if (>= fi nf)
+      `()
+      `(~@(pd--check-payload T vi fi) ~@(pd--check-variant T vi (primitive/iadd fi 1) nf))))
+(defn pd--check-sum [(T Code) (vi i64) (nv i64)] (-> Code)
+  (if (>= vi nv)
+      (if (= (pd--nonrec-count T 0 nv) (cast i64 0))
+          (primitive/error (primitive/code-str "derive-arbitrary-sum: "
+                                               T
+                                               " has no non-recursive variant, so generation can never terminate; give it a base case"))
+          `())
+      `(~@(pd--check-variant T vi 0 (primitive/code-variant-fields T vi))
+        ~@(pd--check-sum T (primitive/iadd vi 1) nv))))
+
+;; Struct fields carry only a KIND tag (0 int, 1 float, 2 bool, 3 struct, 4 sum,
+;; 5 ptr, 6 array, 7 slice, 8 other) — `code-field-type` collapses `(ptr Node)`
+;; and `(slice u8)` to the bare heads `ptr` and `slice`, so the element/pointee
+;; is simply not visible here the way it is for a variant payload. Hence: a ptr
+;; field is rejected outright (there is nothing to recurse into), and a slice
+;; field is allowed through to the trait, where a non-u8 element surfaces as a
+;; missing-impl error instead of a derive error.
+(defn pd--check-field [(T Code) (i i64)] (-> Code)
+  (let [k (primitive/code-field-kind T i)
+        where (primitive/code-str "derive: " T " field '" (primitive/code-field-name T i) "' ")]
+    (cond (= k (cast i64 5))
+            (primitive/error (primitive/code-str where
+                                                 "is a pointer; field reflection cannot see the pointee, so there is nothing to recurse into — write the impl by hand"))
+          (= k (cast i64 6))
+            (primitive/error (primitive/code-str where "is an array; write the impl by hand"))
+          (= k (cast i64 8))
+            (primitive/error (primitive/code-str where
+                                                 "has a shape derive cannot generate (function pointer, dyn object, …); write the impl by hand"))
+          :else `())))
+(defn pd--check-struct [(T Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      `(~@(pd--check-field T i) ~@(pd--check-struct T (primitive/iadd i 1) n))))
+
+; ============================== derive-arbitrary =============================
+
+;; Every supported field goes through the TRAIT rather than through a
+;; kind-specific draw. `(arbitrary (field out f) s)` already resolves to
+;; `draw-int-any!` for an i64, `draw-float!` for an f64, the string generator for
+;; a `(slice u8)`, and the user's own impl for a nested type — so emitting the
+;; scalar draws here would duplicate `prop_arbitrary.coil`'s width table in a
+;; second place that can drift, and would force every file using the macro to
+;; import `coil.primitive` for the casts. The kind tag is used for what only it
+;; can do: rejecting the shapes that have no impl.
+(defn pd--field-fill [(T Code) (out Code) (s Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      `((arbitrary (mut (field ~out ~(primitive/code-field-name T i))) ~s)
+        ~@(pd--field-fill T out s (primitive/iadd i 1) n))))
+
+;; `(derive-arbitrary T)` — `(impl Arbitrary T …)` for a STRUCT.
+;;
+;; The whole struct is one span, so a structural shrink pass can reason about it
+;; as a unit; the fields land inside it in declaration order, which is the order
+;; their choices sit on the tape. An empty tape therefore yields the all-minimal
+;; struct, which is the floor the shrinker is guaranteed to be able to reach.
+(defn derive-arbitrary [(tname Code)] (-> Code)
+  (let [n (primitive/code-field-count tname)]
+    `(do
+       ~@(pd--check-struct tname 0 n)
+       (impl Arbitrary ~tname
+         (arbitrary [(out (mut ~tname)) (s (ptr Source))]
+                    (-> i64)
+                    (let [sp (span-open! s ~(primitive/code-str tname) SPAN-PLAIN)]
+                      ~@(pd--field-fill tname `out `s 0 n)
+                      (span-close! s sp)
+                      0))))))
+
+; ---- sums ------------------------------------------------------------------
+
+;; One `let` binding per payload field: a mutable slot for a value field, an
+;; arena-allocated child for a `(ptr X)` field. Named `arb$FIELD` so they cannot
+;; collide with anything the surrounding expansion introduces.
+(defn pd--arm-binds [(T Code) (s Code) (vi i64) (fi i64) (nf i64)] (-> Code)
+  (if (>= fi nf)
+      `()
+      (let [ty (primitive/code-variant-field-type T vi fi)
+            nm (primitive/code-symbol "arb$" (primitive/code-variant-field-name T vi fi))
+            rest (pd--arm-binds T s vi (primitive/iadd fi 1) nf)]
+        (if (pd--ptr-node? ty)
+            `(~nm (prop-child [~(primitive/code-nth ty 1)] ~s) ~@rest)
+            `((mut ~nm) (zeroed ~ty) ~@rest)))))
+
+(defn pd--arm-draws [(T Code) (s Code) (vi i64) (fi i64) (nf i64)] (-> Code)
+  (if (>= fi nf)
+      `()
+      (let [ty (primitive/code-variant-field-type T vi fi)
+            nm (primitive/code-symbol "arb$" (primitive/code-variant-field-name T vi fi))
+            rest (pd--arm-draws T s vi (primitive/iadd fi 1) nf)]
+        (if (pd--ptr-node? ty)
+            `((arbitrary ~nm ~s) ~@rest)
+            `((arbitrary (mut ~nm) ~s) ~@rest)))))
+
+;; Constructor arguments: a child pointer is passed as-is, a value slot is loaded.
+(defn pd--arm-args [(T Code) (vi i64) (fi i64) (nf i64)] (-> Code)
+  (if (>= fi nf)
+      `()
+      (let [ty (primitive/code-variant-field-type T vi fi)
+            nm (primitive/code-symbol "arb$" (primitive/code-variant-field-name T vi fi))
+            rest (pd--arm-args T vi (primitive/iadd fi 1) nf)]
+        (if (pd--ptr-node? ty) `(~nm ~@rest) `((load ~nm) ~@rest)))))
+
+;; One `case` arm: fill the payload, then construct. A RECURSIVE variant spends a
+;; unit of the Source's fuel first — that spend is what makes the tag draw in the
+;; children fall back to the base cases, and it is why termination is structural
+;; (a wide-and-shallow value and a deep-and-narrow one are both bounded by the
+;; same budget) rather than a depth heuristic.
+(defn pd--sum-arm [(T Code) (out Code) (s Code) (vi i64)] (-> Code)
+  (let [nf (primitive/code-variant-fields T vi)
+        vq (primitive/code-variant-qname T vi)
+        build (if (= nf (cast i64 0))
+                  `(do (store! ~out (~vq)) 0)
+                  `(let [~@(pd--arm-binds T s vi 0 nf)]
+                     ~@(pd--arm-draws T s vi 0 nf)
+                     (store! ~out (~vq ~@(pd--arm-args T vi 0 nf)))
+                     0))]
+    (if (pd--rec-variant? T vi)
+        `(do (src-spend-fuel! ~s 1) ~build)
+        build)))
+
+;; `(case tag 0 arm0 1 arm1 … armLast)` — the last variant is the default arm, so
+;; the dispatch is total by construction and needs no unreachable branch.
+(defn pd--sum-cases [(T Code) (out Code) (s Code) (vi i64) (nv i64)] (-> Code)
+  (if (= vi (primitive/isub nv 1))
+      `(~(pd--sum-arm T out s vi))
+      `(~vi ~(pd--sum-arm T out s vi) ~@(pd--sum-cases T out s (primitive/iadd vi 1) nv))))
+
+;; The `k`-th non-recursive variant's index, as the pairs of the fallback `case`.
+(defn pd--nonrec-pairs [(T Code) (vi i64) (nv i64) (k i64) (last i64)] (-> Code)
+  (if (>= vi nv)
+      `()
+      (if (pd--rec-variant? T vi)
+          (pd--nonrec-pairs T (primitive/iadd vi 1) nv k last)
+          (if (= k last)
+              `(~vi)
+              `(~k ~vi ~@(pd--nonrec-pairs T (primitive/iadd vi 1) nv (primitive/iadd k 1) last))))))
+
+;; The tag draw. For a type that cannot recur this is just `(draw-tag! s NV)` and
+;; no fuel is ever consulted — the point of deciding recursiveness at comptime.
+;;
+;; For one that can: out of fuel, draw from the non-recursive variants only and
+;; map that index back. The fallback draw is STILL one CK-TAG choice, so the tape
+;; has the same shape either way and a replay stays aligned with it — a shrink
+;; that changed the number of choices depending on remaining fuel would make
+;; every candidate a different value than the one that failed.
+(defn pd--tag-expr [(T Code) (s Code) (nv i64)] (-> Code)
+  (if (not (pd--rec-sum? T 0 nv))
+      `(draw-tag! ~s ~nv)
+      (let [m (pd--nonrec-count T 0 nv)]
+        `(if (> (src-fuel ~s) 0)
+             (draw-tag! ~s ~nv)
+             ~(if (= m (cast i64 1))
+                  `(do (draw-tag! ~s 1) ~@(pd--nonrec-pairs T 0 nv 0 0))
+                  `(case (draw-tag! ~s ~m) ~@(pd--nonrec-pairs T 0 nv 0 (primitive/isub m 1))))))))
+
+;; `(derive-arbitrary-sum T)` — `(impl Arbitrary T …)` for a SUM.
+;;
+;; The span is a SPAN-NODE: a recursive structure's nodes are what the hoisting
+;; shrink pass replaces with one of their own children, which is how a deep tree
+;; collapses to the subtree that actually breaks the property.
+(defn derive-arbitrary-sum [(tname Code)] (-> Code)
+  (let [nv (primitive/code-variant-count tname)]
+    `(do
+       ~@(pd--check-sum tname 0 nv)
+       (impl Arbitrary ~tname
+         (arbitrary [(out (mut ~tname)) (s (ptr Source))]
+                    (-> i64)
+                    (let [sp (span-open! s ~(primitive/code-str tname) SPAN-NODE)
+                          tag ~(pd--tag-expr tname `s nv)]
+                      (case tag ~@(pd--sum-cases tname `out `s 0 nv))
+                      (span-close! s sp)
+                      0))))))
+
+; ================================ derive-show ================================
+; The printers are emitted as canonical dotted names (`coil.io.print-str`) so a
+; file that derives a Show needs no `coil.io` import of its own — the same reason
+; `fmt` qualifies its printers.
+
+(defn pd--show-fields [(T Code) (x Code) (w Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      `((coil.io.print-str ~w ~(primitive/code-str " " (primitive/code-field-name T i) "="))
+        (prop-show (load (field ~x ~(primitive/code-field-name T i))) ~w)
+        ~@(pd--show-fields T x w (primitive/iadd i 1) n))))
+
+;; `(derive-show T)` — `(impl PropShow T …)` for a STRUCT, printing `(Type f=v …)`.
+;;
+;; Nested values recurse through `PropShow`, so a counterexample prints with the
+;; same escaping and the same shape at every depth — the point being that the
+;; first thing anyone does with a counterexample is paste it into a regression
+;; test, and a report that elides a level is a report you cannot paste.
+(defn derive-show [(tname Code)] (-> Code)
+  (let [n (primitive/code-field-count tname)]
+    `(do
+       ~@(pd--check-struct tname 0 n)
+       (impl PropShow ~tname
+         (prop-show [(x ~tname) (w (ptr coil.io.Writer))]
+                    (-> i64)
+                    (coil.io.print-str w ~(primitive/code-str "(" tname))
+                    ~@(pd--show-fields tname `x `w 0 n)
+                    (coil.io.print-str w ")")
+                    0)))))
+
+; ---- sums ------------------------------------------------------------------
+
+;; Match-arm binders, `sh$FIELD` so a payload named `x` or `w` cannot shadow the
+;; value being printed or the writer it is printed to.
+(defn pd--show-binds [(T Code) (vi i64) (fi i64) (nf i64)] (-> Code)
+  (if (>= fi nf)
+      `()
+      `(~(primitive/code-symbol "sh$" (primitive/code-variant-field-name T vi fi))
+        ~@(pd--show-binds T vi (primitive/iadd fi 1) nf))))
+
+;; A `(ptr X)` child is dereferenced before printing: `PropShow` is implemented
+;; for X, not for a pointer to one, and printing the address would be useless in
+;; a counterexample anyway.
+(defn pd--show-payload [(T Code) (w Code) (vi i64) (fi i64) (nf i64)] (-> Code)
+  (if (>= fi nf)
+      `()
+      (let [ty (primitive/code-variant-field-type T vi fi)
+            nm (primitive/code-symbol "sh$" (primitive/code-variant-field-name T vi fi))]
+        `((coil.io.print-str ~w " ")
+          (prop-show ~(if (pd--ptr-node? ty) `(load ~nm) nm) ~w)
+          ~@(pd--show-payload T w vi (primitive/iadd fi 1) nf)))))
+
+(defn pd--show-arms [(T Code) (w Code) (vi i64) (nv i64)] (-> Code)
+  (if (>= vi nv)
+      `()
+      (let [nf (primitive/code-variant-fields T vi)]
+        `((~(primitive/code-variant-qname T vi) [~@(pd--show-binds T vi 0 nf)]
+           (do (coil.io.print-str ~w ~(primitive/code-str "(" (primitive/code-variant-name T vi)))
+               ~@(pd--show-payload T w vi 0 nf)
+               (coil.io.print-str ~w ")")
+               0))
+          ~@(pd--show-arms T w (primitive/iadd vi 1) nv)))))
+
+;; `(derive-show-sum T)` — `(impl PropShow T …)` for a SUM, printing `(Variant p…)`.
+;; The variant name is printed UNQUALIFIED (`code-variant-name`) while the match
+;; arm matches on the qualified one: the report is for a human, the arm is code.
+(defn derive-show-sum [(tname Code)] (-> Code)
+  (let [nv (primitive/code-variant-count tname)]
+    `(do
+       ~@(pd--check-sum tname 0 nv)
+       (impl PropShow ~tname
+         (prop-show [(x ~tname) (w (ptr coil.io.Writer))]
+                    (-> i64)
+                    (match x ~@(pd--show-arms tname `w 0 nv)))))))

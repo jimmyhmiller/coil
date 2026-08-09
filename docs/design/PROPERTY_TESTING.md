@@ -1,6 +1,8 @@
-# Property-based testing for Coil — design proposal
+# Property-based testing for Coil — design and implementation
 
-Status: proposal. Nothing here is implemented yet.
+Status: **implemented** in `src/stdlib/prop*.coil`. §12 maps every claim below to
+the file that carries it and records what was built differently from this design
+(and why), plus what is deliberately not built.
 Scope: a first-class PBT system in the standard library (`coil.prop`), integrated
 with `coil test`, with shrinking that users never have to write, overridable
 through traits, and fast enough that the natural setting is 10⁵–10⁷ cases rather
@@ -516,24 +518,59 @@ scheme proves too surprising in practice, `Span` already gives us the tree
 structure needed to switch the *replay* strategy to a split-tree walk without
 changing a single generator.
 
+**What was actually built (and the honest gap).** Replay is *linear* — a cursor
+walking the tape, exactly as Hypothesis does it — not span-indexed. The span tree
+is recorded and drives every structural pass, but a deletion still shifts what
+later generators read. Two things make that far less painful than it sounds:
+replay is total (a shifted generator gets a clamped or minimal value rather than
+failing), and the shrinker keeps the tape the run *actually produced* rather than
+the one it proposed, so a candidate that shifts into nonsense simply fails to
+improve the shortlex order and is dropped. Span-indexed replay — seeking to the
+recorded span whose label matches, so a shortened sibling cannot slide it — is
+the one piece of §5.4 that remains future work, and the `Span` records already
+carry the parent/label/depth it needs.
+
 ### 5.5 Shrinking crashes
 
 A Coil property can segfault, hit UB, or hang. That is not an exceptional case in
 a systems language; it is one of the most valuable things a PBT tool can find,
 and it is exactly what in-process tools cannot minimize.
 
-Design: run every case **in-process** (fast path). If a case dies from a signal or
-exceeds the deadline, the runner *switches that property into forked mode* for the
-shrink phase: each shrink candidate runs in a `fork()`ed child (the machinery
-`assert.coil` already uses), with the tape written to a scratch file first. The
-parent classifies the child by wait status, so "same signal, same faulting
-instruction pointer" becomes the shrink predicate — avoiding the classic reducer
-mistake of shrinking one crash into a *different* crash. Slippage detection is
-part of the design, not an afterthought: the final report names the signal and,
-when available, the fault address.
+**As built**, and it is simpler and stronger than the sketch this paragraph
+originally carried:
 
-Cost model: fork is ~100µs; a crash shrink is a few thousand candidates, so
-seconds. Passing runs pay zero.
+1. **Every property's generation phase runs in one forked child.** One fork per
+   property (~100µs) — not per case — so the happy path is untouched. The child
+   reports through its exit status alone: `0` all passed, `2` an ordinary
+   counterexample, *killed* a crash.
+2. **A crash is located by bisection.** The parent binary-searches the case count,
+   running prefix `[0, k)` in a fresh child per probe and asking whether that
+   prefix survives — `log₂(cases)` forks, eight for a default run. No per-case
+   bookkeeping, no shared memory, no syscall in the inner loop. This works
+   because a case's input is a function of `(seed, index)` once the whole prefix
+   has been drawn, which is exactly what the tape guarantees.
+3. **The input is rebuilt without running the body.** A property compiles to a
+   function with a mode argument, and `PROP-MODE-DRAW` draws the arguments and
+   stops. Generation is pure; only the body crashes. So the parent can hold the
+   crashing input in its own memory without ever being at risk from it.
+4. **Shrinking forks per candidate**, and "still failing" means *died from the
+   same signal*, not merely "died". A reducer that accepts any crash cheerfully
+   minimizes one bug into a different one; requiring the signal to match is the
+   cheapest guard against that slippage.
+5. **A hang is a crash.** The child arms `alarm(COIL_PBT_TIMEOUT)` (60s by
+   default), so an infinite loop arrives as SIGALRM and flows through the same
+   bisect-and-minimize path. Reported as "the property NEVER FINISHED on this
+   input", because printing "signal 14" makes the reader look up something the
+   runner already knew.
+6. **The budget scales with what a candidate costs.** In-process ~100ns, so
+   20 000 candidates are free; forked ~100µs, so a thousand; timed-out *seconds*,
+   so sixty-four. With a hang, a small input quickly beats the smallest input
+   eventually.
+
+Verified end to end: a property that segfaults above 10 minimizes to `a = 10`; a
+property that loops forever above 10 minimizes to `a = 12` within its watchdog
+budget. `COIL_PBT_NOFORK=1` opts out for debugger sessions, trading crash
+minimization for a live backtrace.
 
 ### 5.6 User-controlled shrinking (the override story)
 
@@ -616,12 +653,25 @@ exceeds 20%.
 (prop/target! src (cast f64 (queue-depth q)))    ; maximize
 ```
 
-When a property calls `target!`, the runner enters the **target phase** after
-plain generation: simulated annealing over tape mutations, accepting a mutated
-tape with probability `exp(-Δ/T)`. Löscher & Sagonas report large reductions in
-cases-to-failure, and the [automation paper][tpbt2] shows the neighborhood
-function can be derived from the generator alone — which, on a tape, is trivially
-true: a neighbor is a tape with a few choices perturbed.
+When a property calls `prop-target!`, the runner enters the **target phase**
+after plain generation and hill-climbs the tape. Löscher & Sagonas report large
+reductions in cases-to-failure, and the [automation paper][tpbt2] shows the
+neighbourhood function can be derived from the generator alone — which, on a
+tape, is trivially true: a neighbour is a tape with a few choices perturbed.
+
+**As built:** acceptance is **threshold accepting** (Dueck & Scheuer, 1990) — take
+any neighbour no worse than `best − threshold`, with the threshold decaying
+linearly to zero — rather than the Metropolis rule, because `exp(-Δ/T)` would
+drag libm into the standard library's test path to no benefit. The threshold
+starts at a tenth of the objective's own magnitude, so the schedule behaves the
+same whether the number reported is bytes or tree levels. A neighbour perturbs
+one to three choices, and the step is a uniform jump, a ±8 nudge, or a snap to an
+endpoint — the last of those is what actually matters for monotone objectives, a
+±1 random walk being far too slow to cross a range inside a test run.
+
+Measured: "the sum of ≤60 bytes never exceeds 12000" is unreachable for uniform
+sampling (it needs a mean element above 200 across a full-length list) and the
+targeted phase finds it in ~3 000 cases, under a second, at default settings.
 
 ### 6.7 Coverage-guided mode (phase 2)
 
