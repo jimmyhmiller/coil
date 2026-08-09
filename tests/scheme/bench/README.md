@@ -17,10 +17,12 @@ Chez's optimizing native compiler is the line that matters.
 
 | case | coil | chez | petite | vs chez |
 |---|---|---|---|---|
-| fib(30) | 3.8 ms | 42.5 ms | 45.6 ms | **0.09×** |
+| fib(30) | 3.9 ms | 42.7 ms | 58.6 ms | **0.09×** |
 
-Now measured on plain Scheme — bare integer literals, no runtime spellings — so
-the number reflects the surface a user actually writes.
+The `.coil` body is IDENTICAL to the `.scm` — `<`, `+`, `-`, `display`, `newline`,
+bare integer literals. Actual R5RS names, not Coil spellings of them. Only the
+module header and the `main` wrapper differ, which is the whole claim: the same
+source compiles.
 
 ⚠ `main`'s value is the process exit code, and inside a dialect module the
 whole-tree pass lowers a bare `0` to `(mk-fixnum 0)`, whose tagged word is 1. A
