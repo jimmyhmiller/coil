@@ -26,7 +26,12 @@
 ;;  => (defn f [(a i64) (b i64)] (-> i64)
 ;;       (let [$sp (gc-sp)]                 ; remember the frame base
 ;;         (gc-root a) (gc-root b)          ; params can outlive an inner alloc
-;;         (let [$r BODY'] (gc-sp-set! $sp) $r)))   ; pop on the way out
+;;         BODY'))                          ; every EXIT in BODY' pops $sp itself
+;;
+;; The epilogue lands on the exits rather than wrapping the body, because a
+;; wrapping `let` puts every tail call out of tail position and costs TCO. A
+;; returning exit becomes `(let [$r V] (gc-sp-set! $sp) $r)` and a tail call
+;; becomes `(do (gc-sp-set! $sp) (g …))` — pop, then jump.
 ;;
 ;; and an allocating call's arguments are A-normalized into rooted temporaries:
 ;;
@@ -61,15 +66,23 @@
 ;; FIXED, by the tail-call reset in `rt--tail` below. Before it, `listrev` (300
 ;; rounds at depth 8000) and `bintree` (300 rounds at depth 14) did not terminate:
 ;; every frame's roots stayed live for the whole recursion, so each collection
-;; walked a shadow stack in the hundreds of thousands. With the reset, a
-;; self-tail-call drops its own frame's roots before recursing and the stack stays
-;; bounded by real nesting depth rather than by iteration count.
+;; walked a shadow stack in the hundreds of thousands. ANY call in tail position —
+;; self or mutual — now drops its frame's roots before jumping, so the shadow
+;; stack is bounded by real nesting depth rather than by iteration count.
 ;;
-;; What remains is a genuine limit rather than a bug: a NON-self tail call, and
-;; deep NON-tail recursion, still hold their roots for the duration. Both are
-;; correct — just not free. `gc-root` also still has no bounds check past 1048576
-;; entries (heap.coil), which a program with a million simultaneously live roots
-;; would run off the end of.
+;; ⚠ THE SAME SHAPE ALSO DECIDES WHETHER TCO HAPPENS AT ALL, which is the part
+;; that is easy to get wrong. The epilogue must sit on the EXITS, not wrap the
+;; body — see the note above `rt--tail`. A wrapping frame is correct for rooting
+;; and silently turns every tail call into a stack-consuming one.
+;;
+;; MEASURED, in Scheme, at depths no stack could hold:
+;;   self-recursive   (count 50000000 0)        -> 50000000, constant stack
+;;   mutual           (my-even? 50000000)       -> 1,         constant stack
+;;
+;; What remains is a genuine limit rather than a bug: deep NON-tail recursion
+;; still holds its roots for the duration, which is correct but not free.
+;; `gc-root` also has no bounds check past 1048576 entries (heap.coil), which a
+;; program with a million simultaneously live roots would run off the end of.
 ;;
 ;; ── WHY OVER-APPROXIMATION IS SAFE, AND UNDER- IS NOT ───────────────────────
 ;;
@@ -96,6 +109,28 @@
   (if (primitive/icmp-ge i (primitive/code-count l)) false
     (if (primitive/code-eq h (primitive/code-nth l i)) true
       (rt--member? h l (primitive/iadd i 1)))))
+
+;; Heads whose result is a RAW `bool`, not a Val.
+;;
+;; ⚠ These must not have their arguments A-normalized. The rewrite turns a call
+;; into `(let [$g ARG] (gc-root $g) (head $g))`, and that `let`'s value is then
+;; the head's result — so for a bool-returning head the `let` has type `bool`
+;; where the surrounding code expects an `i64` Val, and the checker rejects it:
+;;
+;;     error: in 'f.count': let body has type bool but expected i64
+;;
+;; `truthy?` is the one that matters, because `forms.coil` lowers EVERY Scheme
+;; `if` test to `(truthy? …)` — so any `if` whose test allocates hits this. That
+;; is most of them: `(if (< n 1) …)` allocates, since `<` builds a Val.
+;;
+;; Leaving the argument un-normalized is safe here precisely BECAUSE the result
+;; is a bool: a bool is not a heap value, nothing downstream can hold it, and the
+;; argument is consumed immediately by a non-allocating predicate. There is no
+;; window in which a collection could run between the two.
+(defn rt--bool-head? [(h Code)] (-> bool)
+  (rt--member? h `(truthy? is-null val-eq? is-heap is-fixnum is-char is-pair
+                   is-symbol is-string is-procedure is-singleton is-vector
+                   undefined? symbol-eq? str-eq) 0))
 
 ;; Forms that are syntax rather than calls: rewriting their heads or descending
 ;; into their binders would corrupt them.
@@ -152,12 +187,12 @@
 ;; Rewrite a body: every form but the last as an ordinary expression, the last in
 ;; TAIL position. Declared here, defined after `rt--tail` — the file is one
 ;; mutually recursive group and Coil resolves forward references at module scope.
-(defn rt--body-tail [(self Code) (sp Code) (e Code) (i i64) (n i64)] (-> Code)
+(defn rt--body-tail [(sp Code) (e Code) (i i64) (n i64)] (-> Code)
   (if (primitive/icmp-ge i n) `()
     (if (primitive/icmp-eq i (primitive/isub n 1))
-        `(~(rt--tail (primitive/code-nth e i) self sp))
+        `(~(rt--tail (primitive/code-nth e i) sp))
       `(~(rt--expr (primitive/code-nth e i))
-        ~@(rt--body-tail self sp e (primitive/iadd i 1) n)))))
+        ~@(rt--body-tail sp e (primitive/iadd i 1) n)))))
 
 ;; `let` bindings whose init allocates are rooted too — an evaluator binds many
 ;; intermediates that must survive later allocations, and a binding is exactly the
@@ -183,22 +218,37 @@
                    ~@(rt--all e 2 (primitive/code-count e)))
             (if (rt--syntax? h)
                 `(~h ~@(rt--all e 1 (primitive/code-count e)))
-              ; an ordinary call: A-normalize the arguments
-              (rt--args h e 1 (primitive/code-count e) `()))))))))
+              ; a bool-returning predicate: rewrite the arguments but do NOT lift
+              ; them into a rooted `let`, or the call's type escapes as a bool
+              ; where a Val is required (see rt--bool-head?)
+              (if (rt--bool-head? h)
+                  `(~h ~@(rt--all e 1 (primitive/code-count e)))
+                ; an ordinary call: A-normalize the arguments
+                (rt--args h e 1 (primitive/code-count e) `())))))))))
 
-;; ── TAIL POSITION: RESET THE SHADOW STACK BEFORE A SELF-CALL ────────────────
+;; ── TAIL POSITION: RESET THE SHADOW STACK BEFORE THE CALL ───────────────────
 ;;
-;; A Scheme tail call is compiled as an ordinary native call here, so without this
-;; the caller's frame — and every root it pushed — stays live for the entire
-;; recursion. At depth 8000 that is 8000 frames of roots held at once, which is
-;; what makes `mark-roots` walk a shadow stack in the hundreds of thousands on
-;; every collection and the program appear to hang.
+;; A Scheme tail call is compiled as a native call, so without this the caller's
+;; frame — and every root it pushed — stays live for the entire recursion. At
+;; depth 8000 that is 8000 frames of roots held at once, which makes `mark-roots`
+;; walk a shadow stack in the hundreds of thousands on every collection and the
+;; program appear to hang.
 ;;
-;; The reset is sound for a SELF-call in TAIL position, and the argument is
-;; specific to that case: the callee's result is returned directly to OUR caller,
-;; so control never comes back to a point that could read our roots. Nothing after
-;; the call can observe them, so they are dead the moment the arguments are
-;; evaluated.
+;; The reset is sound for ANY call in TAIL position, and the argument does not
+;; depend on which procedure is called: the callee's result is returned directly
+;; to OUR caller, so control never comes back to a point that could read our
+;; roots. Nothing after the call can observe them, so they are dead the moment
+;; the arguments are evaluated.
+;;
+;; ⚠ AN EARLIER VERSION RESTRICTED THIS TO SELF-CALLS, on the grounds that "a call
+;; to another procedure may return here". That is wrong, and it is worth being
+;; precise about why: a call in tail position does NOT return here by definition —
+;; its value IS this function's value. The self/non-self distinction matters for
+;; whether the BACKEND can reuse the frame (see `tail-call-ok` in codegen.coil),
+;; not for whether these roots are dead. Keeping the restriction meant every
+;; mutual tail call kept `(gc-sp-set! …)` AFTER the call, which both leaked roots
+;; and — because the call was then not syntactically last — silently cost the
+;; `musttail` that makes mutual recursion constant-space at all.
 ;;
 ;; ⚠ ORDER IS THE WHOLE CORRECTNESS ARGUMENT. The arguments must be evaluated and
 ;; rooted FIRST — evaluating them can allocate and therefore collect — and only
@@ -213,12 +263,7 @@
 ;;
 ;; The arguments survive the pop because they are passed in registers, and the
 ;; callee's own prologue re-roots them.
-;;
-;; Restricted to SELF-calls: a call to another procedure may return here, and a
-;; general tail-call analysis would have to prove otherwise. Self-recursion is
-;; both the shape that actually grows without bound and the one where the
-;; reasoning is local and checkable.
-(defn rt--tail-call [(e Code) (self Code) (sp Code)] (-> Code)
+(defn rt--tail-call [(e Code) (sp Code)] (-> Code)
   (rt--tail-args (primitive/code-nth e 0) e 1 (primitive/code-count e) `() sp))
 
 (defn rt--tail-args [(head Code) (e Code) (i i64) (n i64) (placed Code) (sp Code)] (-> Code)
@@ -234,31 +279,77 @@
                ~(rt--tail-args head e (primitive/iadd i 1) n `(~@placed ~g) sp)))
         (rt--tail-args head e (primitive/iadd i 1) n `(~@placed ~arg) sp)))))
 
-;; Is `e` a call to `self`? Compared by name — this runs before expansion, so the
-;; head is still the source spelling the author wrote.
-(defn rt--self-call? [(e Code) (self Code)] (-> bool)
-  (and (primitive/code-list? e)
-       (and (primitive/icmp-gt (primitive/code-count e) 0)
-            (and (primitive/code-sym? (primitive/code-nth e 0))
-                 (primitive/code-eq (primitive/code-nth e 0) self)))))
+;; ⚠ THE EPILOGUE GOES ON THE EXITS, NOT AROUND THE BODY. This is the whole
+;; reason `rt--tail` exists in this shape, and getting it wrong silently costs
+;; tail-call elimination.
+;;
+;; The obvious frame wraps the body and pops once on the way out:
+;;
+;;     (let [$r (do BODY)] (gc-sp-set! $sp) $r)      ; ← DO NOT DO THIS
+;;
+;; It is correct, and it defeats TCO completely. The pop has to run AFTER the
+;; call returns, so the call is no longer the last thing the function does —
+;; `musttail` cannot apply and codegen emits an ordinary call. Coil GUARANTEES
+;; constant stack for self-recursion (codegen.coil emits `musttail`), and this
+;; shape throws that guarantee away for every Scheme procedure.
+;;
+;; MEASURED: `(count 50000000 0)` — 50M-deep self tail recursion — returns
+;; 50000000 in plain Coil and SIGSEGVs under the wrapping frame. Verified against
+;; a hand-written Coil function in the wrapping shape, so it is the SHAPE and not
+;; anything about the dialect. The benchmarks did not catch it because they
+;; recurse 8000-12000 deep, which fits in an 8MB stack.
+;;
+;; So every exit carries its own epilogue instead:
+;;
+;;   returning a value   (let [$r VALUE] (gc-sp-set! $sp) $r)   pop, then return
+;;   self tail call      (do (gc-sp-set! $sp) (f ARGS…))        pop, then JUMP
+;;
+;; The tail call is syntactically last in its branch, so `musttail` applies and
+;; the frame is reused. Roots are popped BEFORE the jump, which is sound for the
+;; reason given at `rt--tail-call`: the callee returns to OUR caller, so nothing
+;; can read our roots again.
 
 ;; Rewrite `e` in TAIL position. Only the forms that PROPAGATE tail position are
-;; descended into as tail — `if`'s branches (not its test) and the last form of a
-;; `do`/`let` body. Everything else is an ordinary expression.
-(defn rt--tail [(e Code) (self Code) (sp Code)] (-> Code)
-  (if (not (primitive/code-list? e)) (rt--expr e)
-    (if (primitive/icmp-eq (primitive/code-count e) 0) e
+;; descended into as tail — `if`'s branches (not its test), and the last form of
+;; a `do`. Everything else is an ordinary expression that must pop before it
+;; returns its value.
+(defn rt--tail [(e Code) (sp Code)] (-> Code)
+  (if (not (primitive/code-list? e)) (rt--return e sp)
+    (if (primitive/icmp-eq (primitive/code-count e) 0) (rt--return e sp)
       (let [h (primitive/code-nth e 0)]
-        (if (rt--self-call? e self) (rt--tail-call e self sp)
-          ; `if`: the TEST is not in tail position, both BRANCHES are
-          (if (and (primitive/code-eq h `if) (primitive/icmp-ge (primitive/code-count e) 3))
-              (if (primitive/icmp-ge (primitive/code-count e) 4)
-                  `(if ~(rt--expr (primitive/code-nth e 1))
-                       ~(rt--tail (primitive/code-nth e 2) self sp)
-                     ~(rt--tail (primitive/code-nth e 3) self sp))
+        ; `if`: the TEST is not in tail position, both BRANCHES are
+        (if (and (primitive/code-eq h `if) (primitive/icmp-ge (primitive/code-count e) 3))
+            (if (primitive/icmp-ge (primitive/code-count e) 4)
                 `(if ~(rt--expr (primitive/code-nth e 1))
-                     ~(rt--tail (primitive/code-nth e 2) self sp)))
-            (rt--expr e)))))))
+                     ~(rt--tail (primitive/code-nth e 2) sp)
+                   ~(rt--tail (primitive/code-nth e 3) sp))
+              ;; A one-armed `if` in tail position: the implicit false branch
+              ;; yields the unspecified value and must ALSO pop, or that path
+              ;; leaks the frame's roots for the rest of the program.
+              `(if ~(rt--expr (primitive/code-nth e 1))
+                   ~(rt--tail (primitive/code-nth e 2) sp)
+                 ~(rt--return `(s-unspecified) sp)))
+          ;; `do` in tail position: only its LAST form is tail.
+          (if (and (primitive/code-eq h `do) (primitive/icmp-ge (primitive/code-count e) 2))
+              `(do ~@(rt--body-tail sp e 1 (primitive/code-count e)))
+            ;; ANY ordinary call in tail position — self or not — pops before it
+            ;; jumps. Syntax forms and bool-returning predicates are excluded:
+            ;; the former are not calls, and the latter yield a raw `bool` that
+            ;; is not this function's Val result.
+            (if (and (primitive/code-sym? h)
+                     (and (not (rt--syntax? h))
+                          (and (not (rt--bool-head? h))
+                               (not (primitive/code-eq h `quote)))))
+                (rt--tail-call e sp)
+              (rt--return e sp))))))))
+
+;; A non-tail-call exit: evaluate the value, pop the frame, return the value.
+;; The binding is required — `(do VALUE (gc-sp-set! $sp))` would return the pop's
+;; result instead of the function's, and popping before evaluating would free
+;; roots the evaluation still needs.
+(defn rt--return [(e Code) (sp Code)] (-> Code)
+  (let [r (primitive/gensym)]
+    `(let [~r ~(rt--expr e)] (gc-sp-set! ~sp) ~r)))
 
 ;; Wrap one `defn` in a frame: root the parameters on entry, pop on the way out.
 ;;
@@ -303,14 +394,14 @@
         ps (primitive/code-nth f 2)
         ret (primitive/code-nth f 3)
         sp (primitive/gensym)
-        r (primitive/gensym)
-        body (rt--all f 4 (primitive/code-count f))]
+        ;; Same exit-carried epilogue as `rt--define`, and for the same reason: a
+        ;; wrapping `let` would put every self-call out of tail position and cost
+        ;; the `musttail` guarantee. `defn`'s name is element 1.
+        body (rt--body-tail sp f 4 (primitive/code-count f))]
     `(defn ~name ~ps ~ret
        (let [~sp (gc-sp)]
          ~@(rt--params ps 0 (primitive/code-count ps))
-         (let [~r (do ~@body)]
-           (gc-sp-set! ~sp)
-           ~r)))))
+         ~@body))))
 
 ;; ── WHY `define` IS HANDLED SEPARATELY, AND NOT VIA `defn` ──────────────────
 ;;
@@ -332,20 +423,23 @@
 (defn rt--define [(f Code)] (-> Code)
   (let [sig (primitive/code-nth f 1)
         sp (primitive/gensym)
-        r (primitive/gensym)
         ;; The LAST body form is in tail position, so a self-call there can drop
         ;; this frame's roots before recursing (see rt--tail). Earlier forms are
         ;; ordinary expressions: their values are discarded, but anything they
         ;; allocate must stay rooted for the forms that follow.
-        body (rt--body-tail (primitive/code-nth sig 0) sp f 2 (primitive/code-count f))]
+        body (rt--body-tail sp f 2 (primitive/code-count f))]
     ;; Parameters come from the SIGNATURE's tail: `(f a b)` -> a, b. Element 0 is
     ;; the procedure name and must not be rooted — it is a binder, not a value.
+    ;;
+    ;; ⚠ NO EPILOGUE HERE. `rt--body-tail` has already placed a `gc-sp-set!` on
+    ;; every exit, which is what keeps a tail call syntactically last so codegen
+    ;; can emit `musttail`. Wrapping the body in `(let [$r (do …)] (gc-sp-set! …)
+    ;; $r)` — the obvious shape — is correct but destroys TCO for every Scheme
+    ;; procedure; see the note above `rt--tail`.
     `(define ~sig
        (let [~sp (gc-sp)]
          ~@(rt--sig-params sig 1 (primitive/code-count sig))
-         (let [~r (do ~@body)]
-           (gc-sp-set! ~sp)
-           ~r)))))
+         ~@body))))
 
 ;; A `define` signature holds BARE NAMES, not `(name type)` pairs — so this is not
 ;; `rt--params`. The dotted rest marker is skipped: `.` is punctuation, and the
