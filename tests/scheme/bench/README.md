@@ -17,7 +17,15 @@ Chez's optimizing native compiler is the line that matters.
 
 | case | coil | chez | petite | vs chez |
 |---|---|---|---|---|
-| fib(30) | 4.1 ms | 44.6 ms | 63.2 ms | **0.09×** |
+| fib(30) | 3.8 ms | 42.5 ms | 45.6 ms | **0.09×** |
+
+Now measured on plain Scheme — bare integer literals, no runtime spellings — so
+the number reflects the surface a user actually writes.
+
+⚠ `main`'s value is the process exit code, and inside a dialect module the
+whole-tree pass lowers a bare `0` to `(mk-fixnum 0)`, whose tagged word is 1. A
+Scheme module's `main` therefore cannot end in a bare literal. The harness treats
+a nonzero exit as a failed run, which is how this surfaced at all.
 
 fib is tree recursion with no allocation, so it measures call overhead and
 arithmetic — where compiling to native should win outright, and does. Expect
