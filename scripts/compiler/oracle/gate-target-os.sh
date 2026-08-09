@@ -29,8 +29,9 @@ fail=0
 cat > "$WORK/flags.coil" <<'EOF'
 (module flagtest)
 (import "coil.io" :use *)
+(import "coil.primitive" :as primitive)
 (defn pick [(l Code) (d Code)] (-> Code)
-  (if (code-eq (target-os) `linux) l d))
+  (if (primitive/code-eq (primitive/target-os) `linux) l d))
 (defn gen [] (-> Code)
   `(do (const O_CREAT ~(pick `64 `512))
        (const O_TRUNC ~(pick `512 `1024))))
@@ -74,8 +75,8 @@ fi
 fsflags() {
   if [ -z "$1" ]; then "$BIN" emit-ir src/stdlib/fs.coil 2>/dev/null
   else "$BIN" emit-ir src/stdlib/fs.coil --target "$1" 2>/dev/null; fi \
-    | awk '/define .*@fs.write-file/,/^}/' \
-    | grep -o 'BitOr\$i64\$|"(i64 [0-9]*, i64 [0-9]*' | head -1 \
+    | awk '/define .*@coil\.fs\.write-file/,/^}/' \
+    | grep -o 'coil\.core\.BitOr\$i64\$|"(i64 [0-9]*, i64 [0-9]*' | head -1 \
     | sed 's/.*(i64 \([0-9]*\), i64 \([0-9]*\)/\1 \2/'
 }
 check "src/stdlib/fs.coil flags follow the host"    "$(fsflags '')"                         "64 512"
