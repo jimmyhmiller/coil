@@ -2,21 +2,21 @@
 
 Real defects in the standard library, found by the property suite. Each entry
 names the property that found it, the shrunk counterexample, and a
-copy-pasteable repro. Nothing here is a wrong law; where a property had to be
-narrowed to keep the suite green, that is stated and the full-strength property
-is left in the file, disabled.
+copy-pasteable repro. Nothing here is a wrong law.
 
 ---
 
 ## 1. `to-sexp-str` / `to-json-str` silently corrupt `i64::MIN`
 
-**Status:** open. Not fixed here — `src/stdlib/fmt.coil` is not this agent's file.
+**Status:** FIXED in `src/stdlib/fmt.coil` (`print-i` now prints the magnitude
+through the unsigned path). `sexp-i64-roundtrips-every-value` is live again at
+full strength and is the regression test.
 
 **Severity:** silent data loss in both wire formats. No error, no truncation, no
 diagnostic — a different number simply comes out the other side.
 
-**Found by:** `sexp-i64-roundtrips-every-value` (now disabled at
-`tests/prop/stdlib_props_test.coil`), after 31 cases and 6 shrinks. The shrunk
+**Found by:** `sexp-i64-roundtrips-every-value` in
+`tests/prop/stdlib_props_test.coil`, after 31 cases and 6 shrinks. The shrunk
 counterexample was `n = i64::MIN`, which is the whole of the bug: every other
 i64 round-trips.
 
@@ -130,11 +130,9 @@ unsigned, which is precisely the magnitude wanted. Worth a `deftest` pinning
 COIL_STDLIB_DIR=. coil test repro.coil
 ```
 
-### What the suite does in the meantime
+### Aftermath
 
-`sexp-i64-roundtrips-every-value` is commented out with a pointer to this file.
-The two derived-struct round-trips stay live, but map `i64::MIN` to `i64::MIN+1`
-before encoding (`rec-encodable`) so that the rest of the codec — string
-escaping, `Option`, empty and nested containers, `bool` — keeps being tested
-instead of going dark behind one broken value. Delete `rec-encodable` and
-un-comment the disabled property when `print-i` is fixed.
+The fix is the `print-u` version sketched above. `sexp-i64-roundtrips-every-value`
+is live at full strength, the `rec-encodable` narrowing that kept the
+derived-struct round-trips useful while the bug was open is gone, and the
+boundary values (`MIN`, `MIN+1`, `-1`, `0`, `MAX`) round-trip.

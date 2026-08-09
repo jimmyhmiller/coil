@@ -7,9 +7,17 @@ failure arrives already shrunk: the smallest list, the shortest string, the
 
 The suite is also the acceptance test for `coil.prop` itself. It is written the
 way a user writes a property suite — `(import "coil.prop" :use *)` plus the
-library under test, no generator registration, no shrinker — so if something
-here had needed a workaround, that would have been a defect in the system rather
-than in the test. Nothing did.
+library under test, no generator registration, no shrinker — so anything that
+needed a workaround here is a defect in the system rather than in the test. Two
+did, and both are still open:
+
+- The hand-written `PropShow` impl for `Rec` mentions `Writer`, which
+  `coil.prop` does not reexport, so this file also has to
+  `(import "coil.io" :use *)`. A user writing their first `PropShow` impl will
+  hit that and have no way to guess the fix.
+- `coil.prop.derive` is not reachable through `coil.prop`, so the `Arbitrary`
+  impl for `Rec` is written out by hand. That is worth having as an
+  override-path test regardless, but it should not have been the only option.
 
 The other files in this directory test `coil.prop`'s own machinery (the tape,
 the shrink passes, the combinators, the example database). This README covers
@@ -111,6 +119,7 @@ multiset half is there.
 | `str-trim-is-idempotent-and-tight` | trimming is idempotent, never grows, and leaves no whitespace at either end |
 | `str-parse-int-roundtrips-every-i64` | render then `str-parse-int` is the identity over the **whole** i64 range, `i64::MIN` included |
 | `str-parse-int-agrees-with-hand-parser` | `str-parse-int` accepts exactly `-?[0-9]+` and agrees with a hand-rolled parser on the value |
+| `str-parse-int-grammar-over-numeric-alphabet` | the same law, over strings drawn from `-0123456789x`, so the sign rules are actually reached |
 | `str-split-then-join-roundtrips` | splitting on a separator and rejoining with it reconstructs the original, empty pieces included |
 
 Two of these are deliberately built so the interesting branch actually happens.
@@ -123,6 +132,14 @@ never finds anything proves nothing.
 digits or fewer: `coil.str` documents itself as having no overflow check, so
 past that the two parsers agree only on the wrap, which is not a law worth
 pinning. The accept/reject judgement is claimed for every input.
+
+The two `str-parse-int` grammar properties state the same law and differ only in
+where their strings come from, which is the point. Measured with a mutant that
+makes a lone `"-"` parse as `0`: the random-`(slice u8)` property catches it on
+6 seeds out of 12, and the alphabet-shaped one on 12 out of 12. A law is only as
+strong as the inputs that reach it, and "the generator will get there eventually"
+is how a suite ends up green against a bug it nominally covers. When a property
+depends on a specific narrow shape, generate that shape.
 
 ### `coil.hashmap`
 
@@ -157,6 +174,7 @@ user-facing override path, exercised here rather than described.
 
 | Property | Claim |
 |---|---|
+| `sexp-i64-roundtrips-every-value` | `from-sexp ∘ to-sexp-str = id` over the **whole** i64 range, `i64::MIN` included |
 | `sexp-encode-then-decode-is-identity` | `from-sexp ∘ to-sexp-str = id` |
 | `json-encode-then-decode-is-identity` | `from-json ∘ to-json-str = id` |
 | `sexp-encoding-is-deterministic` | equal values encode to equal bytes |
@@ -169,13 +187,20 @@ empty list, `None`.
 not: a codec can round-trip correctly while its encoder leaks uninitialized
 padding, which is exactly what makes a wire format irreproducible.
 
-**One property in this section is disabled.** `sexp-i64-roundtrips-every-value`
-fails, and it fails because the library is wrong: `i64::MIN` encodes as `-0` in
-both formats and decodes back as `0`. See [`FOUND_BUGS.md`](FOUND_BUGS.md) #1.
-The two live round-trips map `i64::MIN` to `i64::MIN + 1` before encoding, so
-the rest of the codec stays under test rather than going dark behind one broken
-value; that narrowing is marked in the source and is meant to be deleted when
-the bug is fixed.
+**`sexp-i64-roundtrips-every-value` is why this suite exists.** It failed when it
+was written, and it failed because the library was wrong: `coil.fmt/print-i`
+negated before printing, so `i64::MIN` encoded as the two bytes `-0` in both
+formats and decoded back as `0` — silent data loss, no error anywhere. Fixed in
+`src/stdlib/fmt.coil` (commit `7698159`); write-up in
+[`FOUND_BUGS.md`](FOUND_BUGS.md) #1. The property stays as the regression test,
+and the two struct round-trips — which had been narrowed to dodge `i64::MIN`
+while the bug was open — are back at full strength.
+
+Note what the shrinker bought here. The struct round-trips hit the bug first,
+but the smallest `Rec` they could produce still had five fields; the scalar
+property shrinks to `n = i64::MIN` and nothing else, which is the entire bug in
+one value. When a law holds for a container and a scalar both, state it for the
+scalar too — that is the version whose counterexample you can read.
 
 ## Notes for adding a property here
 
@@ -192,6 +217,12 @@ the bug is fixed.
   obviously correct.
 - **Allocate from the case arena**, `(src-alloc (prop-src))`. The runner rewinds
   it between cases, so nothing in this file frees anything and nothing leaks.
+- **Prove the property can fail, by breaking the library on purpose.** Copy
+  `src/` somewhere, introduce the bug you think the property catches, and run
+  with `COIL_STDLIB_DIR` pointed at the copy. If the suite stays green, the
+  property does not test what its name says. Do this across several
+  `COIL_PBT_SEED`s, not one: a property that catches the bug on half the seeds
+  is a property that will let it through.
 - **Never weaken a law to make the suite green.** Work out whether the law or
   the library is wrong. If it is the library, write it up in `FOUND_BUGS.md`,
   disable that one property with a comment pointing at the entry, and leave the

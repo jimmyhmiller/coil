@@ -24,6 +24,12 @@
 ;   list property        + draw-len!, a span per element, arena allocation
 ;   shrink               the whole greedy fixpoint on a known-failing tape
 ;
+; The shrink benchmark runs on a Source of its own (`shrink-source`) rather than
+; the one the throughput sections share. That is not tidiness: a Source whose
+; allocator is a live arena shrinks nothing at all. See the `private-allocator`
+; comment — the reason is a defect in prop_source.coil, and it is the single most
+; important thing this benchmark found.
+;
 ; `coil.prop.rng` and `coil.prop.shrink` are imported QUALIFIED. `coil.prop`
 ; re-exports source/arbitrary/show/runner but not those two, and importing them
 ; unqualified alongside `coil.prop` is exactly the ambiguity the prop docs warn
@@ -52,16 +58,72 @@
 ;; span 1e0..1e9, so picoseconds-per-op is reported instead of a rounded ns that
 ;; would print the RNG as "1 ns" and the tape draw as "5 ns" — hiding the very
 ;; difference the layering is there to expose.
+;;
+;; A zero or negative elapsed time is not a small number, it is a broken
+;; measurement: the loops below run for hundreds of milliseconds, so `ns <= 0`
+;; means the clock stood still or went backwards. Dividing by it would print
+;; "0 ps/op | 0 op/s", which reads as a result rather than as a failure.
+(defn check-elapsed [(n i64) (ns i64)] (-> i64)
+  (if (and (> n 0) (> ns 0))
+      0
+      (do (print-str (stdout) "prop_bench: nonsensical measurement (zero ops, or a clock that did not advance)\n")
+          (abort)
+          0)))
+
 (defn ps-per-op [(n i64) (ns i64)] (-> i64)
-  (if (<= n 0) 0 (primitive/idiv (primitive/imul ns 1000) n)))
+  (do (check-elapsed n ns)
+      (primitive/idiv (primitive/imul ns 1000) n)))
 
 (defn ops-per-sec [(n i64) (ns i64)] (-> i64)
-  (if (<= ns 0) 0 (primitive/idiv (primitive/imul n 1000000000) ns)))
+  (do (check-elapsed n ns)
+      (primitive/idiv (primitive/imul n 1000000000) ns)))
 
 (defn report [(w (ptr Writer)) (label (slice u8)) (unit (slice u8)) (n i64) (ns i64)] (-> i64)
   (fmt w "  {s}\n      {d} {s} in {d} ms | {d} ps/{s} | {d} {s}/s\n"
        label n unit (primitive/idiv ns 1000000) (ps-per-op n ns) unit (ops-per-sec n ns) unit)
   0)
+
+; --------------------------------------------------------------- allocators
+
+;; A private `Allocator` cell, and a Source that owns it.
+;;
+;; This exists to work around a defect, and the defect is worth stating precisely.
+;; `source-new` hands its allocator to `arena-over-buffer`, which REWRITES that
+;; `Allocator` struct in place into the per-case arena and returns the same
+;; pointer — so `s.mem`, `s.arena` and the allocator the caller passed in are one
+;; struct. `malloc-allocator`'s `alloc/static` cell lives inside that function, so
+;; the whole program shares exactly ONE of them, and `malloc-allocator` re-stores
+;; the malloc vtable on every call. The consequences compound:
+;;
+;;   * the tape, the spans and the replay buffer are allocated from `s.mem`, which
+;;     IS the arena — `source-reset!` rewinds it under them every case (section 5
+;;     measures this directly);
+;;   * any later `malloc-allocator` call flips that same struct back to malloc, so
+;;     the NEXT growth of the tape calls `realloc()` on an arena pointer, and
+;;     libmalloc aborts the process.
+;;
+;; A separate `alloc/static` occurrence is a separate cell, so this function owns
+;; one nothing else can reach. Calling it a second time re-stores the malloc
+;; vtable into that same cell — which is exactly what is wanted here: the Source
+;; comes out malloc-backed end to end, which is the state the shipping runner
+;; reaches by accident (`report-failure` calls `malloc-allocator` before it
+;; shrinks) and the only state in which shrinking is correct.
+;;
+;; Both defects belong to prop_source.coil, which this file does not own.
+(defn private-allocator [] (-> (ptr Allocator))
+  (let [a (primitive/alloc-static Allocator)]
+    (store! (field a alloc) (primitive/fnptr-of ma-alloc))
+    (store! (field a resize) (primitive/fnptr-of ma-resize))
+    (store! (field a free) (primitive/fnptr-of ma-free))
+    (store! (field a ctx) (primitive/cast (ptr i8) a))
+    a))
+
+;; A Source for the shrink benchmarks, on its own allocator so that measuring
+;; shrinking does not disturb the arena the throughput sections are measuring.
+(defn shrink-source [(bytes i64) (seed i64)] (-> (ptr Source))
+  (let [s (source-new (private-allocator) bytes seed)]
+    (private-allocator)
+    s))
 
 ; ------------------------------------------------- reading the Source's memory
 
@@ -83,6 +145,39 @@
   (load (field (field s spans) cap)))
 (defn src-replay-cap [(s (ptr Source))] (-> i64)
   (load (field (field s replay) cap)))
+
+;; Does a pointer lie inside the per-case arena?
+;;
+;; Asked of the TAPE's own buffer, this is the sharpest question in the file. The
+;; tape is documented as long-lived and allocated from `s.mem`; the arena is
+;; per-case and rewound to offset 0 by every `source-reset!`. A "yes" therefore
+;; means the tape's backing store is handed back out to the next case's generated
+;; values — the two are writing the same bytes.
+(defn in-arena? [(s (ptr Source)) (p (ptr i8))] (-> bool)
+  (let [ar (load (field s arena-state))
+        base (load (field ar base))]
+    (and (>= p base) (< p (primitive/index base (load (field ar cap)))))))
+
+;; Is `s.arena` still an arena at all?
+;;
+;; `arena-over-buffer` is the only thing that points an `Allocator`'s `ctx` at an
+;; `Arena`; `malloc-allocator` points `ctx` back at the `Allocator` itself. Since
+;; both are the SAME struct for a Source built over `malloc-allocator` (see
+;; `private-allocator`), any later `(malloc-allocator)` call anywhere in the
+;; program silently converts this Source's per-case arena into malloc.
+;;
+;; Section 5 cannot survive that quietly: with the arena disabled the bump offset
+;; never moves, so the steady-state table reads `arena peak 0 B` at every case
+;; count — a flawless-looking result that measures nothing. Running §6 before §5
+;; produces exactly that, which is what makes this check worth its lines.
+(defn arena-live? [(s (ptr Source))] (-> bool)
+  (= (load (field (load (field s arena)) ctx))
+     (primitive/cast (ptr i8) (load (field s arena-state)))))
+
+(defn src-tape-data [(s (ptr Source))] (-> (ptr i8))
+  (primitive/cast (ptr i8) (load (field (field s tape) data))))
+(defn src-spans-data [(s (ptr Source))] (-> (ptr i8))
+  (primitive/cast (ptr i8) (load (field (field s spans) data))))
 
 ; ------------------------------------------------------------- 1. the raw RNG
 
@@ -259,7 +354,7 @@
                   (store! i (primitive/iadd (load i) 1)))))
     (primitive/idiv (primitive/imul (load total) 100) n)))
 
-; --------------------------------------------------------------- 5. shrinking
+; --------------------------------------------------------------- 6. shrinking
 
 ;; The known-failing cases. Both are FALSE for anything but a tiny input, so a
 ;; random case fails almost immediately and the whole measured cost is the greedy
@@ -298,21 +393,57 @@
                         (store! i (primitive/iadd (load i) 1)))))
           (load ok)))))
 
+;; Why a shrink call costs what it does, measured rather than guessed.
+;;
+;; Every candidate a pass proposes is a whole new tape — `tape-clone`,
+;; `tape-without` and `tape-with` all build one with `al-new` plus one `al-push!`
+;; per choice, so each proposal is a malloc and ~log2(n) reallocs before the
+;; property is even considered. And `sc-calls` counts only the candidates that got
+;; past the budget gate, the already-seen set and the shortlex gate, so it
+;; undercounts proposals badly: the microseconds live in the tapes that were built
+;; and thrown away, not in the property.
+;;
+;; The clone slot is hoisted out of the loop — an `alloc/stack` inside one is not
+;; released until the function returns.
+(defn bench-tape-clone [(mem (ptr Allocator)) (t (ptr (ArrayList Choice))) (n i64)] (-> i64)
+  (let [(mut c) (zeroed (ArrayList Choice))
+        (mut acc) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do (store! c (tape-clone mem t))
+                  (store! acc (primitive/iadd (load acc) (al-len [Choice] (load c))))
+                  (store! i (primitive/iadd (load i) 1)))))
+    (load acc)))
+
 ;; Generate until the property fails, then time `shrink-run!` on that tape.
 ;;
 ;; This is `report-failure` with the printing removed: the same `RunCtx`, the same
 ;; `run-candidate` callback, the same budget. Sharing the runner's own callback
 ;; matters — a hand-rolled replay loop here would quietly measure a different
 ;; (probably cheaper) thing than what `coil test` runs.
+;;
+;; The Source is the caller's, and it must be a `shrink-source` (malloc-backed),
+;; not the arena-backed one the throughput sections use. On an arena-backed Source
+;; the replay tape is allocated at offset 0 right after `source-reset!` and then
+;; overwritten by the values the case generates, every candidate replays as
+;; minima, the property holds, and the shrinker accepts ZERO candidates while
+;; reporting thousands of calls — a benchmark that looks like a slow shrinker
+;; rather than a broken one.
+;;
+;; It also calls `(malloc-allocator)` for its own scratch, which re-stores the
+;; malloc vtable into the one shared `Allocator` struct — the struct that IS the
+;; `prop-source` arena. That is why §6 has to run after §5; `arena-live?` makes
+;; the consequence loud instead of leaving it to this comment.
 (defn bench-shrink [(w (ptr Writer))
                     (label (slice u8))
+                    (s (ptr Source))
                     (p (fnptr c [(ptr Source) i64] bool))
                     (max-size i64)
                     (seed i64)] (-> i64)
   (let [mem (malloc-allocator)
-        s (source-new mem 8388608 seed)
         rc (unwrap-ptr [RunCtx] (create [RunCtx] mem))
-        (mut found) false
+        (mut found) (do (source-seed! s seed) false)
         (mut i) 0]
     (loop (if (or (load found) (>= (load i) 100000))
               (break)
@@ -350,13 +481,19 @@
           ; Re-run the minimal tape with `show` on, the way the real report does,
           ; so the printed counterexample is proof the shrink actually happened
           ; rather than a call count with nothing behind it.
+          (let [reps 5000
+                c0 (now-ns)
+                seen (bench-tape-clone mem (mut failing) reps)
+                c1 (now-ns)]
+            (fmt w "      tape-clone of the {d}-choice failing tape: {d} ns each ({d} cloned)\n"
+                 before (primitive/idiv (primitive/isub c1 c0) reps) seen))
           (print-str w "      counterexample: ")
           (source-begin-replay! s (shrink/sc-best sc) (src-size s))
           (primitive/call-ptr p s PROP-MODE-SHOW)
           (print-str w "\n")
           0)))))
 
-; ------------------------------------------------------- 6. steady-state memory
+; ------------------------------------------------------- 5. steady-state memory
 
 ;; The claim in prop_source.coil is that a run of a million cases performs a
 ;; handful of allocations in total. This checks it the only way that counts: run a
@@ -374,6 +511,13 @@
   (let [(mut peak) 0
         (mut mark) 1000
         (mut i) 0]
+    (if (arena-live? s)
+        0
+        (do (print-str w "prop_bench: this Source's arena has been reverted to malloc, so every\n")
+            (print-str w "            number below would read 0 B and mean nothing. Something called\n")
+            (print-str w "            (malloc-allocator) after source-new — run section 5 before 6.\n")
+            (abort)
+            0))
     (loop (if (>= (load i) n)
               (break)
               (do (source-begin-generate! s (size-for (load i) n max-size))
@@ -392,6 +536,11 @@
                   0)))
     (fmt w "      final: arena in use between cases {d} B (reset to 0 by source-reset!)\n"
          (src-arena-used s))
+    ; The steady state is only half the story. Where the tape LIVES decides
+    ; whether the numbers above mean what they look like.
+    (fmt w "      tape buffer inside the per-case arena? {d}   spans buffer? {d}   (1 = yes)\n"
+         (if (in-arena? s (src-tape-data s)) 1 0)
+         (if (in-arena? s (src-spans-data s)) 1 0))
     0))
 
 ; ------------------------------------------------------------------------ main
@@ -401,10 +550,10 @@
 ;; would report the cost of `mmap` as the cost of a draw.
 (defn main [] (-> i64)
   (let [w (stdout)
-        mem (malloc-allocator)
-        s (source-new mem 8388608 20260808)
+        s (prop-source 8388608)
         r (primitive/alloc-stack rng/Rng)]
     (store! r (rng/rng-seed 20260808))
+    (source-seed! s 20260808)
     (print-str w "coil.prop throughput (monotonic clock, one process, -O3)\n\n")
 
     (print-str w "1. raw RNG\n")
@@ -461,10 +610,14 @@
       (fmt w "      ({d} of {d} held; mean length {d}.{d} elements at max size 60)\n"
            held n (primitive/idiv mean100 100) (primitive/irem mean100 100)))
 
-    (print-str w "\n5. shrinking a known-failing case\n")
-    (bench-shrink w "flat: (ArrayList i64), len < 32" (primitive/fnptr-of prop-fail-flat) 200 7)
-    (bench-shrink w "deep: (ArrayList (ArrayList i64)), no sublist >= 8" (primitive/fnptr-of prop-fail-deep) 120 11)
-
-    (print-str w "\n6. steady state over 1,000,000 cases (stock list property)\n")
+    (print-str w "\n5. steady state over 1,000,000 cases (stock list property)\n")
     (bench-memory w s (primitive/fnptr-of prop-list-natural) 1000000 60)
+
+    ; LAST, because `bench-shrink` calls `(malloc-allocator)` and that overwrites
+    ; the very struct serving as `s`'s arena. `bench-memory`'s `arena-live?` check
+    ; aborts if this ever gets reordered.
+    (print-str w "\n6. shrinking a known-failing case\n")
+    (let [s2 (shrink-source 8388608 7)]
+      (bench-shrink w "flat: (ArrayList i64), len < 32" s2 (primitive/fnptr-of prop-fail-flat) 200 7)
+      (bench-shrink w "deep: (ArrayList (ArrayList i64)), no sublist >= 8" s2 (primitive/fnptr-of prop-fail-deep) 120 11))
     0))
