@@ -1,0 +1,362 @@
+(module coil.scheme.rooting)
+(import "coil.primitive" :as primitive)
+(import "coil.str" :use *)
+
+;; THE GC PILLAR: automatic rooting.
+;;
+;; A Scheme value lives on the heap and the collector is PRECISE — it traces from
+;; a root set, not by scanning the machine stack. So a value held only in a Coil
+;; function's frame is invisible to it. `(cons (make-tree …) (make-tree …))` builds
+;; the left subtree, holds it in a frame slot, and then allocates the right one:
+;; if that allocation collects, the left subtree has no root and is swept out from
+;; under the program.
+;;
+;; That is not hypothetical. It is what made `bintree` SIGSEGV on its SECOND
+;; collection — the first collection happens while little is live, the second
+;; while a partially-built tree is. `heap.coil` has always documented a shadow
+;; stack and said "the GC transform emits gc-root/gc-sp/gc-sp-set!"; this is that
+;; transform, which had not been written.
+;;
+;; ── WHAT IT EMITS ───────────────────────────────────────────────────────────
+;;
+;; Each Scheme `define` gets a frame, and every value that must survive a later
+;; allocation is pushed onto the shadow stack:
+;;
+;;     (define (f a b) BODY)
+;;  => (defn f [(a i64) (b i64)] (-> i64)
+;;       (let [$sp (gc-sp)]                 ; remember the frame base
+;;         (gc-root a) (gc-root b)          ; params can outlive an inner alloc
+;;         (let [$r BODY'] (gc-sp-set! $sp) $r)))   ; pop on the way out
+;;
+;; and an allocating call's arguments are A-normalized into rooted temporaries:
+;;
+;;     (cons (f x) (g y))
+;;  => (let [$1 (f x)] (gc-root $1)
+;;        (let [$2 (g y)] (gc-root $2) (cons $1 $2)))
+;;
+;; The second binding is the whole point: without it, `(g y)` can collect while
+;; `$1` is reachable only from a machine register.
+;;
+;; ── KNOWN LIMITATION: DEEP RECURSION GROWS THE SHADOW STACK ─────────────────
+;;
+;; ⚠ THIS IS A REAL, MEASURED LIMIT, NOT A THEORETICAL ONE. Read before assuming
+;; an allocating benchmark that hangs is slow rather than broken.
+;;
+;; An earlier version of this comment argued that no tail-call handling was needed
+;; because "unbounded tail calls are out of scope, so roots pop with the native
+;; stack". That reasoning is WRONG, and the benchmarks disprove it. A Scheme
+;; tail call is still a native CALL here, so the caller's frame — and its roots —
+;; stay live for the whole recursion. `(rev l acc)` at depth 8000 holds 8000
+;; frames' worth of roots simultaneously.
+;;
+;; Two consequences, both observed:
+;;
+;;   1. `gc-root` has NO BOUNDS CHECK (heap.coil). Past 1048576 live roots it
+;;      writes off the end of the array and keeps incrementing the counter.
+;;   2. `mark-roots` traces [0, top) on EVERY collection. A shadow stack in the
+;;      hundreds of thousands makes each collection walk all of it, and each entry
+;;      roots a long list — so collection cost grows with depth and the program
+;;      appears to hang rather than fail.
+;;
+;; MEASURED: a single tail-recursive pass is fine to at least depth 100000
+;; (verified: tests/scheme/probe/rtdepth.coil returns the right answer). What
+;; breaks is REPEATED rounds — `listrev` runs 300 rounds at depth 8000 and does
+;; not finish, where before this pass it completed (unsoundly, with no roots at
+;; all). `bintree` likewise stops SIGSEGVing and starts not-terminating.
+;;
+;; So this pass makes the collector SOUND — nothing is swept while reachable —
+;; but not yet PRACTICAL for deeply recursive allocating programs. The fix is the
+;; tail-call root discipline the predecessor had: reset the shadow stack to the
+;; frame base before a self-tail-call, since the callee cannot return to a point
+;; that needs the caller's roots. That is the next piece of work, and it is what
+;; the "no tail-call special case" note above wrongly dismissed.
+;;
+;; ── WHY OVER-APPROXIMATION IS SAFE, AND UNDER- IS NOT ───────────────────────
+;;
+;; Rooting something that did not need it costs one shadow-stack slot. FAILING to
+;; root something that did is a use-after-free that shows up as corrupted data
+;; much later, in an unrelated part of the program. So every judgement here is
+;; biased toward rooting, and the analysis below treats an unknown call as
+;; allocating.
+
+;; A call that can trigger a collection. Only `allocate` collects, so only its
+;; callers matter — but a Scheme program's calls are mostly to other Scheme
+;; functions, whose bodies allocate. Treating any non-obviously-pure call as
+;; allocating is the safe direction.
+;;
+;; The immediates are the exception worth making, and they are the common case in
+;; a loop: `mk-fixnum`, `mk-bool`, `mk-char`, the singletons and the accessors all
+;; touch no heap, so a program doing arithmetic pays nothing.
+(defn rt--non-allocating? [(h Code)] (-> bool)
+  (rt--member? h `(mk-fixnum mk-char mk-bool s-nil s-true s-false s-unspecified s-eof s-undefined fixnum-value char-value car cdr truthy? is-null val-eq?) 0))
+
+;; Linear membership over a quoted name list — clearer than a 16-deep `or`, and
+;; the list is the documentation: these are the operations that touch no heap.
+(defn rt--member? [(h Code) (l Code) (i i64)] (-> bool)
+  (if (primitive/icmp-ge i (primitive/code-count l)) false
+    (if (primitive/code-eq h (primitive/code-nth l i)) true
+      (rt--member? h l (primitive/iadd i 1)))))
+
+;; Forms that are syntax rather than calls: rewriting their heads or descending
+;; into their binders would corrupt them.
+(defn rt--syntax? [(h Code)] (-> bool)
+  (or (primitive/code-eq h `if)
+      (or (primitive/code-eq h `do)
+          (or (primitive/code-eq h `let)
+              (or (primitive/code-eq h `scm-let)
+                  (or (primitive/code-eq h `quote)
+                      (or (primitive/code-eq h `loop)
+                          (or (primitive/code-eq h `break)
+                              (primitive/code-eq h `continue)))))))))
+
+;; Does evaluating `e` reach an allocation? Over-approximates: any call whose head
+;; is not on the immediate list counts, and so does any subexpression containing
+;; one. A false "yes" costs a shadow-stack slot; a false "no" is a dangling value.
+(defn rt--allocates? [(e Code)] (-> bool)
+  (if (not (primitive/code-list? e)) false
+    (if (primitive/icmp-eq (primitive/code-count e) 0) false
+      (let [h (primitive/code-nth e 0)]
+        (if (primitive/code-eq h `quote) false
+          (if (and (primitive/code-sym? h)
+                   (and (not (rt--syntax? h)) (not (rt--non-allocating? h))))
+              true
+            (rt--any-allocates? e 1 (primitive/code-count e))))))))
+
+(defn rt--any-allocates? [(e Code) (i i64) (n i64)] (-> bool)
+  (if (primitive/icmp-ge i n) false
+    (if (rt--allocates? (primitive/code-nth e i)) true
+      (rt--any-allocates? e (primitive/iadd i 1) n))))
+
+;; A-normalize a call's arguments, rooting each one that allocated.
+;;
+;; ⚠ The test is on the ORIGINAL argument, not the rewritten one: rewriting may
+;; have wrapped an allocating call in a `let`, which would hide its allocating-ness
+;; from a naive check — and its result still has to survive the NEXT argument's
+;; allocation. Getting this backwards is silent and rare, which is the worst
+;; combination.
+(defn rt--args [(head Code) (e Code) (i i64) (n i64) (placed Code)] (-> Code)
+  (if (primitive/icmp-ge i n) `(~head ~@placed)
+    (let [orig (primitive/code-nth e i)
+          arg (rt--expr orig)]
+      (if (rt--allocates? orig)
+          (let [g (primitive/gensym)]
+            `(let [~g ~arg]
+               (gc-root ~g)
+               ~(rt--args head e (primitive/iadd i 1) n `(~@placed ~g))))
+        (rt--args head e (primitive/iadd i 1) n `(~@placed ~arg))))))
+
+(defn rt--all [(e Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `()
+    `(~(rt--expr (primitive/code-nth e i)) ~@(rt--all e (primitive/iadd i 1) n))))
+
+;; `let` bindings whose init allocates are rooted too — an evaluator binds many
+;; intermediates that must survive later allocations, and a binding is exactly the
+;; construct that keeps a value alive across them.
+(defn rt--binds [(bs Code) (i i64) (n i64) (body Code)] (-> Code)
+  (if (primitive/icmp-ge i n) `(do ~@body)
+    (let [b (primitive/code-nth bs i)
+          nm (primitive/code-nth b 0)
+          init (primitive/code-nth b 1)
+          rest (rt--binds bs (primitive/iadd i 2) n body)]
+      (if (rt--allocates? init)
+          `(let [~nm ~(rt--expr init)] (gc-root ~nm) ~rest)
+        `(let [~nm ~(rt--expr init)] ~rest)))))
+
+(defn rt--expr [(e Code)] (-> Code)
+  (if (not (primitive/code-list? e)) e
+    (if (primitive/icmp-eq (primitive/code-count e) 0) e
+      (let [h (primitive/code-nth e 0)]
+        (if (primitive/code-eq h `quote) e
+          ; syntax: rewrite the subexpressions, never the head or a binder
+          (if (primitive/code-eq h `let)
+              `(~h ~(primitive/code-nth e 1)
+                   ~@(rt--all e 2 (primitive/code-count e)))
+            (if (rt--syntax? h)
+                `(~h ~@(rt--all e 1 (primitive/code-count e)))
+              ; an ordinary call: A-normalize the arguments
+              (rt--args h e 1 (primitive/code-count e) `()))))))))
+
+;; Wrap one `defn` in a frame: root the parameters on entry, pop on the way out.
+;;
+;; Popping needs the body's value bound FIRST — `(do body (gc-sp-set! sp))` would
+;; return the pop's value instead of the function's, and `(gc-sp-set! sp)` after
+;; the value is computed is exactly when the value is still needed.
+(defn rt--params [(ps Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `()
+    (let [p (primitive/code-nth ps i)]
+      ; ⚠ A parameter vector is not uniformly `(name type)` pairs: a variadic
+      ; `defn` writes a bare `&` before its rest parameter, and reading element 0
+      ; of that symbol is a comptime crash with no source location. Root only the
+      ; well-formed pairs and skip anything else.
+      (if (and (primitive/code-list? p) (primitive/icmp-gt (primitive/code-count p) 0))
+          `((gc-root ~(primitive/code-nth p 0))
+            ~@(rt--params ps (primitive/iadd i 1) n))
+        (rt--params ps (primitive/iadd i 1) n)))))
+
+;; Already framed? A before-expand pass is re-run on its own output until nothing
+;; changes, so `rt--defn` must be a fixed point of itself: without this it wraps
+;; each round in another `(let [$sp (gc-sp)] …)` and never converges, which the
+;; compiler reports as "did not reach a fixpoint after 16 rounds".
+;;
+;; The marker is the body's own shape — a `let` whose first init is `(gc-sp)` is
+;; one this pass emitted, and nothing else produces it.
+(defn rt--framed? [(f Code)] (-> bool)
+  (and (primitive/icmp-eq (primitive/code-count f) 5)
+       (let [b (primitive/code-nth f 4)]
+         (and (primitive/code-list? b)
+              (and (primitive/icmp-ge (primitive/code-count b) 2)
+                   (and (primitive/code-eq (primitive/code-nth b 0) `let)
+                        (let [bs (primitive/code-nth b 1)]
+                          (and (primitive/code-list? bs)
+                               (and (primitive/icmp-ge (primitive/code-count bs) 2)
+                                    (let [v (primitive/code-nth bs 1)]
+                                      (and (primitive/code-list? v)
+                                           (and (primitive/icmp-gt (primitive/code-count v) 0)
+                                                (primitive/code-eq (primitive/code-nth v 0) `gc-sp)))))))))))))
+
+(defn rt--defn [(f Code)] (-> Code)
+  (let [name (primitive/code-nth f 1)
+        ps (primitive/code-nth f 2)
+        ret (primitive/code-nth f 3)
+        sp (primitive/gensym)
+        r (primitive/gensym)
+        body (rt--all f 4 (primitive/code-count f))]
+    `(defn ~name ~ps ~ret
+       (let [~sp (gc-sp)]
+         ~@(rt--params ps 0 (primitive/code-count ps))
+         (let [~r (do ~@body)]
+           (gc-sp-set! ~sp)
+           ~r)))))
+
+;; ── WHY `define` IS HANDLED SEPARATELY, AND NOT VIA `defn` ──────────────────
+;;
+;; `define` is an ordinary MACRO (core.coil) that expands to `defn`. Macros run in
+;; the expansion phase; this pass is `:phase before-expand`, so it runs STRICTLY
+;; EARLIER — every Scheme procedure is still a `define` form when it gets here, and
+;; a pass that matches only `defn` frames none of them.
+;;
+;; That is not a hypothetical ordering concern: it is what made this pass emit
+;; nothing useful. `(defn main …)` — hand-written Coil — was framed correctly,
+;; while every `(define (f …) …)` was passed straight through, so the benchmark's
+;; `make-tree` kept its raw `(cons (make-tree …) (make-tree …))` and the second
+;; collection swept the half-built tree. The frames that DID appear made it look
+;; like the pass was working.
+;;
+;; Framing the `define` in place — rather than expanding it here — keeps the macro
+;; the single owner of the `define` -> `defn` translation, including the variadic
+;; and the `(define x e)` global-cell shapes this pass has no business duplicating.
+(defn rt--define [(f Code)] (-> Code)
+  (let [sig (primitive/code-nth f 1)
+        sp (primitive/gensym)
+        r (primitive/gensym)
+        body (rt--all f 2 (primitive/code-count f))]
+    ;; Parameters come from the SIGNATURE's tail: `(f a b)` -> a, b. Element 0 is
+    ;; the procedure name and must not be rooted — it is a binder, not a value.
+    `(define ~sig
+       (let [~sp (gc-sp)]
+         ~@(rt--sig-params sig 1 (primitive/code-count sig))
+         (let [~r (do ~@body)]
+           (gc-sp-set! ~sp)
+           ~r)))))
+
+;; A `define` signature holds BARE NAMES, not `(name type)` pairs — so this is not
+;; `rt--params`. The dotted rest marker is skipped: `.` is punctuation, and the
+;; rest parameter after it is a fresh list the callee owns.
+(defn rt--sig-params [(sig Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `()
+    (let [p (primitive/code-nth sig i)]
+      (if (and (primitive/code-sym? p) (not (primitive/code-eq p `.)))
+          `((gc-root ~p) ~@(rt--sig-params sig (primitive/iadd i 1) n))
+        (rt--sig-params sig (primitive/iadd i 1) n)))))
+
+;; Already framed, for the `define` shape: same fixpoint requirement as
+;; `rt--framed?`, keyed on the body rather than element 4.
+(defn rt--define-framed? [(f Code)] (-> bool)
+  (and (primitive/icmp-eq (primitive/code-count f) 3)
+       (let [b (primitive/code-nth f 2)]
+         (and (primitive/code-list? b)
+              (and (primitive/icmp-ge (primitive/code-count b) 2)
+                   (and (primitive/code-eq (primitive/code-nth b 0) `let)
+                        (let [bs (primitive/code-nth b 1)]
+                          (and (primitive/code-list? bs)
+                               (and (primitive/icmp-ge (primitive/code-count bs) 2)
+                                    (let [v (primitive/code-nth bs 1)]
+                                      (and (primitive/code-list? v)
+                                           (and (primitive/icmp-gt (primitive/code-count v) 0)
+                                                (primitive/code-eq (primitive/code-nth v 0) `gc-sp)))))))))))))
+
+;; A procedure `define`: `(define (f a…) body…)`. The VARIABLE form
+;; `(define x e)` has a symbol head and is left alone — it lowers to a global cell
+;; the collector already traces as a permanent root, so it needs no frame.
+(defn rt--define-proc? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (and (primitive/icmp-ge (primitive/code-count f) 3)
+            (and (primitive/code-sym? (primitive/code-nth f 0))
+                 (and (primitive/code-eq (primitive/code-nth f 0) `define)
+                      (and (primitive/code-list? (primitive/code-nth f 1))
+                           (primitive/icmp-gt
+                             (primitive/code-count (primitive/code-nth f 1)) 0)))))))
+
+;; Both function shapes are framed: `define` for Scheme source, and `defn` for the
+;; hand-written Coil (a `main`, a helper) that a dialect module may also contain
+;; and which holds Scheme values across the same allocations.
+(defn rt--form [(f Code)] (-> Code)
+  (if (rt--define-proc? f)
+      (if (rt--define-framed? f) f (rt--define f))
+    (if (and (primitive/code-list? f)
+             (and (primitive/icmp-ge (primitive/code-count f) 5)
+                  (and (primitive/code-sym? (primitive/code-nth f 0))
+                       (primitive/code-eq (primitive/code-nth f 0) `defn))))
+        (if (rt--framed? f) f (rt--defn f))
+      f)))
+
+(defn rt--forms [(m Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `()
+    `(~(rt--form (primitive/code-nth m i)) ~@(rt--forms m (primitive/iadd i 1) n))))
+
+;; The pass over a module list, for `coil.scheme.dialect` to compose. Like the
+;; other passes it takes and returns the BARE list — only the outermost transform
+;; result carries the `do` wrapper.
+;; Entry point: takes the module list and computes its OWN length. Passing a
+;; caller-supplied count invites the composition bug where the count belongs to a
+;; different list than the one being walked — the earlier passes may add or drop
+;; forms.
+;; Same opt-in as the other passes: a module is Scheme iff it imports
+;; `coil.scheme`, and the dialect's own modules are excluded by name.
+(defn rt--imports-scheme? [(m Code) (i i64) (n i64)] (-> bool)
+  (if (primitive/icmp-ge i n) false
+    (let [f (primitive/code-nth m i)]
+      (if (and (primitive/code-list? f)
+               (and (primitive/icmp-ge (primitive/code-count f) 2)
+                    (and (primitive/code-eq (primitive/code-nth f 0) `import)
+                         (str-eq (primitive/code-str (primitive/code-nth f 1))
+                                 "coil.scheme"))))
+          true
+        (rt--imports-scheme? m (primitive/iadd i 1) n)))))
+
+(defn rt--rewritable? [(m Code)] (-> bool)
+  (and (primitive/code-list? m)
+       (and (primitive/icmp-gt (primitive/code-count m) 1)
+            (and (not (starts-with (primitive/code-str (primitive/code-nth m 0))
+                                   "coil.scheme"))
+                 (rt--imports-scheme? m 1 (primitive/code-count m))))))
+
+(defn rooting-mods [(ms Code)] (-> Code)
+  (rooting--go ms 0 (primitive/code-count ms)))
+
+(defn rooting--go [(ms Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `()
+    (let [m (primitive/code-nth ms i)]
+      ; A module record is `(name form…)`. Anything else is passed through: this
+      ; pass runs third, and being defensive about the shape the earlier passes
+      ; hand over is cheaper than a comptime crash with no location.
+      ;
+      ; ⚠ Scoped exactly like the other two passes: only a module that imported
+      ; `coil.scheme`, and never `coil.scheme.*` itself. The dialect's own runtime
+      ; is ordinary Coil — framing heap.coil's functions would push roots around
+      ; the collector itself.
+      `(~(if (and (rt--rewritable? m)
+                  (and (primitive/code-list? m) (primitive/icmp-gt (primitive/code-count m) 0)))
+             `(~(primitive/code-nth m 0) ~@(rt--forms m 1 (primitive/code-count m)))
+           m)
+        ~@(rooting--go ms (primitive/iadd i 1) n)))))
