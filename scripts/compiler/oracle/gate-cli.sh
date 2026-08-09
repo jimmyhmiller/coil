@@ -2234,11 +2234,18 @@ cat > "$T/lint/badrule.coil" <<'EOF'
   (if (coil.primitive/icmp-ge i n) `0 (do (br-walk (coil.primitive/code-nth f i)) (br-kids f (coil.primitive/iadd i 1) n))))
 (defn br-forms [(m Code) (i i64) (n i64)] (-> Code)
   (if (coil.primitive/icmp-ge i n) `0 (do (br-walk (coil.primitive/code-nth m i)) (br-forms m (coil.primitive/iadd i 1) n))))
+; Ask "did the user write this?" of EVERY form, not just the first. A module
+; record also carries its (import …) forms, which come from the import machinery
+; and answer false — so sampling form 1 skips any module that opens with an
+; import, silently.
+(defn br-any-user? [(m Code) (i i64) (n i64)] (-> bool)
+  (if (coil.primitive/icmp-ge i n) false
+      (if (coil.primitive/code-from-user? (coil.primitive/code-nth m i)) true
+          (br-any-user? m (coil.primitive/iadd i 1) n))))
 (defn br-mods [(ms Code) (i i64) (n i64)] (-> Code)
   (if (coil.primitive/icmp-ge i n) `0
       (do (let [m (coil.primitive/code-nth ms i)]
-            (if (coil.primitive/icmp-gt (coil.primitive/code-count m) 1)
-                (if (coil.primitive/code-from-user? (coil.primitive/code-nth m 1)) (br-forms m 1 (coil.primitive/code-count m)) `0) `0))
+            (if (br-any-user? m 1 (coil.primitive/code-count m)) (br-forms m 1 (coil.primitive/code-count m)) `0))
           (br-mods ms (coil.primitive/iadd i 1) n))))
 (defn lint-bad [(modules Code)] (-> Code) (br-mods modules 0 (coil.primitive/code-count modules)))
 (checker lint-bad)
