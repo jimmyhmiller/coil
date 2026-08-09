@@ -912,10 +912,14 @@ Every module lives in `src/stdlib/`; a user imports exactly one namespace,
 | `prop_stateful.coil` | `coil.prop.stateful` | model-based command-sequence testing |
 | `prop.coil` | `coil.prop` | `defprop`, `assume`, `classify`, `collect`, `prop-target!` |
 
-Tests: `tests/prop/` (engine regressions, shrink-quality assertions with known
-minima, derive, generators, stateful, database, and a property suite over the
-standard library). Example: `src/examples/property-testing.coil`. Benchmarks:
-`src/benchmarks/prop_bench.coil`.
+Tests: `tests/prop/` — 111 of them across seven files: engine regressions,
+shrink-quality assertions against known minima, derive, generators, stateful,
+the database, and a 30-property suite over the standard library itself.
+`tests/prop/demos/` holds the properties that fail ON PURPOSE (crash, hang,
+targeted search, sparse precondition), named so `coil test` never collects them.
+Example: `src/examples/property-testing.coil`. Benchmarks:
+`src/benchmarks/prop_bench.coil`, results in `src/benchmarks/PROP_RESULTS.md`.
+`scripts/tests/prop.sh` runs the whole thing against this checkout's stdlib.
 
 ### Where the implementation departs from this design
 
@@ -928,6 +932,18 @@ standard library). Example: `src/examples/property-testing.coil`. Benchmarks:
   `Deserialize/de` takes an out-pointer for the same reason. It also means the
   caller allocates one slot per argument instead of one per generated value.
 - **Targeted search is threshold accepting**, not Metropolis annealing (§6.6).
+- **Derivation is four macros, not two** — `derive-arbitrary` / `derive-show` for
+  structs, `derive-arbitrary-sum` / `derive-show-sum` for sums. A Coil macro is a
+  function every one of whose parameters is `Code`, so it cannot take a flag, and
+  there is no `code-struct?`/`code-sum?` reflection op to branch on: `code-field-*`
+  hard-errors on a sum and `code-variant-*` hard-errors on a struct, so a single
+  macro cannot even probe which it was handed. `coil.serde.derive` split
+  `derive-serde`/`derive-serde-sum` for exactly this reason.
+- **Recursive generators bound depth as well as fuel.** Fuel bounds how many
+  recursive nodes a value has; a linear chain of N nodes spends N fuel and
+  recurses N native frames, so a large size budget overflows the C stack long
+  before it runs out of fuel. `src-depth` exists so a generator can treat "too
+  deep" as "out of fuel".
 - **The `Deserialize`→`Arbitrary` bridge (§4.4) is not built.** The reflection
   path covers the derive case; the bridge's real payoff was corpus interop, which
   the database (`prop_db.coil`) delivers directly in the tape's own format.
@@ -951,13 +967,27 @@ fixing in the checker; it makes bounded generics non-composable.
 
 ### What this found
 
-`coil.fmt/print-i` printed `i64::MIN` as `-0`, because it emitted `'-'` and then
-negated — and negating `i64::MIN` wraps back to itself. Both serde text backends
-encode integers through it, so any structure containing `i64::MIN` serialized to
-`-0` and decoded back as `0`: silent data loss, no error anywhere. Found by
-`tests/prop/stdlib_props_test.coil` on a round-trip property, shrunk to exactly
-`n = i64::MIN`, and fixed by printing the magnitude through the unsigned path.
-That is the whole argument for this system in one bug.
+**In the standard library.** `coil.fmt/print-i` printed `i64::MIN` as `-0`,
+because it emitted `'-'` and then negated — and negating `i64::MIN` wraps back to
+itself. Both serde text backends encode integers through it, so any structure
+containing `i64::MIN` serialized to `-0` and decoded back as `0`: silent data
+loss, no error anywhere. Found by `tests/prop/stdlib_props_test.coil` on a
+round-trip property, shrunk to exactly `n = i64::MIN`, and fixed by printing the
+magnitude through the unsigned path. That is the whole argument for this system
+in one bug. Write-up: `tests/prop/FOUND_BUGS.md`.
+
+**In this system itself.** `source-new` handed its caller's `Allocator` to
+`arena-over-buffer`, which rewrites the struct it is given rather than building a
+new one — so the Source's per-case arena and the process-wide malloc allocator
+were the same three words. The tape, replay buffer and span table were then
+allocated out of the arena that gets rewound between cases, and `malloc-allocator`
+re-initializing its static on every call meant any later call anywhere silently
+turned the arena back into malloc, leaking every generated value while looking
+like a healthy steady state. Every test passed with this bug live; it was found
+by a benchmark asking where the tape's storage actually was, and independently by
+a generator deep enough to reset the arena while its own span table was in use.
+The regression test is `tape-and-spans-live-outside-the-case-arena`, which asserts
+the structural fact rather than waiting for a symptom.
 
 ## Bibliography
 

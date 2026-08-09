@@ -200,8 +200,9 @@ already uses for the tape) would remove most of it. I have not made that change 
 
 **FIXED.** `source-new` now allocates the arena its own `Allocator` cell, so the
 Source's long-lived buffers and its per-case arena are genuinely separate; the
-verification is in `.scratch/arena_check.coil`, which asserts that the tape and
-span buffers lie outside the arena block and that the arena is actually used.
+regression test is `tape-and-spans-live-outside-the-case-arena` in
+`tests/prop/core_test.coil`, which asserts that the tape and span buffers lie
+outside the arena block and that the arena is actually used.
 The analysis below is kept because it is the case for why that one line matters
 and the numbers above were taken before it landed — the steady-state table in §5
 in particular was measuring malloc, not the arena.
