@@ -60,7 +60,8 @@
   [(src (ptr Source))
    (prop (fnptr c [(ptr Source) i64] bool))
    (size i64)
-   (crash-code i64)])  ; 128+signal when shrinking a crash, -1 otherwise
+   (crash-code i64)     ; 128+signal when shrinking a crash, -1 otherwise
+   (cand-timeout i64)]) ; seconds allowed to one forked shrink candidate
 
 ;; Read an integer setting from the environment, or fall back.
 (defn env-int [(name (slice u8)) (dflt i64)] (-> i64)
@@ -84,6 +85,10 @@
 ;;   COIL_PBT_SEED=12345     the seed (a failure report tells you which to use)
 ;;   COIL_PBT_SIZE=200       the maximum size budget a case may reach
 ;;   COIL_PBT_SHRINK=20000   shrink call budget
+;;   COIL_PBT_TIMEOUT=60     seconds before a property's run is killed (0 = none)
+;;   COIL_PBT_TARGET=n       hill-climbing steps for a property that calls prop-target!
+;;   COIL_PBT_NOFORK=1       run in-process (a debugger can see the crash; no
+;;                           crash minimization)
 (defn prop-config [(name (slice u8))] (-> PropConfig)
   (let [c (primitive/alloc-stack PropConfig)]
     (store! (field c cases) (env-int "COIL_PBT_CASES" 200))
@@ -467,6 +472,17 @@
 (const CHILD-OK 0)
 (const CHILD-FAILED 2)
 
+;; A watchdog for the child. An infinite loop in a property is a bug the tool
+;; should REPORT, not a reason for `coil test` to hang until someone notices;
+;; SIGALRM turns it into an ordinary crash, which the machinery below already
+;; knows how to bisect and minimize. Set `COIL_PBT_TIMEOUT=0` to disable, or
+;; higher for a genuinely long run.
+;;
+;; `alarm` is declared here and nowhere else in the standard library — externs
+;; are not deduplicated across modules, so a second declaration anywhere would
+;; break linking.
+(extern alarm :cc c [u32] (-> u32))
+
 ;; Decode a waitpid status the way the rest of this repo does: a terminating
 ;; signal in the low 7 bits, else the exit code in the high byte.
 (defn wait-code [(status i64)] (-> i64)
@@ -486,7 +502,8 @@
     (if (< pid 0)
         -1
         (if (= pid 0)
-            (let [bad (run-cases s prop cfg st limit)]
+            (let [_alarm (alarm (primitive/cast u32 (env-int "COIL_PBT_TIMEOUT" 60)))
+                  bad (run-cases s prop cfg st limit)]
               ; `_exit`, not `exit`: no atexit handlers, no flushing of a stream
               ; the parent also holds. Both branches end the process, so nothing
               ; below this runs.
@@ -540,7 +557,11 @@
     (if (< pid 0)
         false
         (if (= pid 0)
-            (do (source-begin-replay! s tape (load (field rc size)))
+            ; a short watchdog: a shrink candidate that hangs must not stall the
+            ; whole reduction. `fork` clears the parent's alarm, so this is the
+            ; only timer running here.
+            (do (alarm (primitive/cast u32 (load (field rc cand-timeout))))
+                (source-begin-replay! s tape (load (field rc size)))
                 (primitive/call-ptr (load (field rc prop)) s PROP-MODE-RUN)
                 (os/_exit 0)
                 false)
@@ -600,7 +621,8 @@
                         ; whatever the last probe left behind; the number that
                         ; means anything is which case crashed.
                         (store! (field st cases) k)
-                        (fmt w "\nCRASHED (signal {d}) on case {d}\n" (primitive/isub code 128) k)
+                        (fmt w "\n{s} (signal {d}) on case {d}\n"
+                             (failure-kind code) (primitive/isub code 128) k)
                         (report-failure w name file line prop s cfg st code)))
                   ; The property called exit() or otherwise ended the process.
                   (do (fmt w "\nFAILED: the property's process exited with code {d}\n" code)
@@ -640,6 +662,26 @@
       0)
   0)
 
+;; How many candidates the shrinker may run, given how expensive one is here.
+;;
+;; In-process a candidate costs ~100ns, so twenty thousand of them are free. A
+;; forked candidate costs ~100us — a thousand is a tenth of a second. A candidate
+;; that has to be TIMED OUT costs whole seconds, so the budget collapses to a few
+;; dozen: with a hang, the shrinker's job is to produce a small input quickly,
+;; not the smallest input eventually.
+(defn shrink-budget-for [(cfg PropConfig) (crash-code i64)] (-> i64)
+  (if (= crash-code 142)
+      64
+      (if (> crash-code 128)
+          (primitive/udiv (load (field cfg shrink-budget)) 20)
+          (load (field cfg shrink-budget)))))
+
+;; SIGALRM means the watchdog fired: the property did not crash, it never
+;; finished. Saying "signal 14" instead makes the reader look up a signal number
+;; to learn something the runner already knew.
+(defn failure-kind [(crash-code i64)] (-> (slice u8))
+  (if (= crash-code 142) "TIMED OUT" "CRASHED"))
+
 ;; Shrink the tape the Source is currently holding, then print it and abort.
 ;; `crash-code` is 128+signal when the failure was a crash (in which case every
 ;; candidate is evaluated in its own child) and -1 for an ordinary counterexample.
@@ -660,16 +702,12 @@
     (store! (field rc prop) prop)
     (store! (field rc size) (src-size s))
     (store! (field rc crash-code) crash-code)
+    (store! (field rc cand-timeout) (env-int "COIL_PBT_CANDIDATE_TIMEOUT" 5))
     (let [runner (if (> crash-code 128)
                      (primitive/fnptr-of run-candidate-forked)
                      (primitive/fnptr-of run-candidate))
           sc (shrink-ctx-new mem s runner (primitive/cast (ptr i8) rc)
-                             (if (> crash-code 128)
-                                 ; a forked candidate costs ~100us instead of
-                                 ; ~100ns, so the budget has to shrink with it or
-                                 ; minimizing a crash would take minutes.
-                                 (primitive/udiv (load (field cfg shrink-budget)) 20)
-                                 (load (field cfg shrink-budget))))]
+                             (shrink-budget-for cfg crash-code))]
       (sc-seed-best! sc (mut failing) (mut failing-spans))
       (shrink-run! sc)
       (store! (field st shrink-calls) (sc-calls sc))
@@ -683,8 +721,11 @@
       (source-begin-replay! s (sc-best sc) (load (field rc size)))
       (primitive/call-ptr prop s (if (> crash-code 128) PROP-MODE-DRAW-SHOW PROP-MODE-SHOW))
       (if (> crash-code 128)
-          (do (fmt w "\n  the property CRASHED on this input (signal {d}).\n"
-                   (primitive/isub crash-code 128))
+          (do (if (= crash-code 142)
+                  (fmt w "\n  the property NEVER FINISHED on this input (watchdog fired after {d}s).\n"
+                       (env-int "COIL_PBT_TIMEOUT" 60))
+                  (fmt w "\n  the property CRASHED on this input (signal {d}).\n"
+                       (primitive/isub crash-code 128)))
               0)
           0)
       (fmt w "\n  property {s}\n       at {s}:{d}\n" name file line)
