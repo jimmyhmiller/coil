@@ -683,9 +683,10 @@ because the mutation operates on the **typed** tape rather than raw bytes, every
 mutant is a well-formed value of the type — no wasted executions on inputs that
 fail to parse. Same properties, same generators, no new user-facing concepts.
 
-**The mechanism is proven end to end.** It was originally scoped as a
-compiler-side change — teaching the driver to pass `-fsanitize-coverage` — and it
-turns out not to need one, because two pieces already exist:
+**Built** — `coil.prop.cov` plus a fuzz phase in the runner, reached with
+`scripts/tests/prop-fuzz.sh FILE.coil [iterations]`. It was originally scoped as
+a compiler-side change — teaching the driver to pass `-fsanitize-coverage` — and
+it turns out not to need one, because two pieces already exist:
 
 1. **`coil emit-ir` produces complete, linkable LLVM IR for a whole program.** So
    the instrumented build is `coil emit-ir prop_test.coil | clang
@@ -708,10 +709,38 @@ magic-value comparisons (`a + b == 500`) need `trace-cmp` feedback rather than
 edge coverage to solve — which is exactly what libFuzzer's `trace-cmp` provides
 and what the tape's typed choices are unusually well placed to exploit.
 
-What remains is the loop itself: a corpus of tapes, mutate-and-keep-if-new-edges
-(the mutation function already exists — the targeted search uses it), and a
-driver script. The shrinker, the crash isolation and the database all apply
-unchanged, because a fuzz finding is just a failing tape.
+The loop is a corpus of tapes, mutate-and-keep-if-new-edges, and the shrinker,
+the crash isolation and the database all apply unchanged — a fuzz finding is just
+a failing tape, so it minimizes and replays like any other.
+
+**Measured**, on `tests/prop/demos/fuzz_demo.coil`: a four-byte magic value
+(`"FUZZ"`) behind four nested comparisons. Blind sampling needs ~95^4 ≈ 10^8
+cases by construction and finds nothing at 20 000. Coverage-guided finds it on
+5 seeds out of 5, in 6k–85k cases, and shrinks it to exactly `s = "FUZZ"`.
+
+Three things had to be right, and each was wrong first:
+
+1. **The corpus must be biased toward the frontier.** An input that just found
+   new coverage is the only one that has reached the branch whose far side is
+   unexplored; under uniform selection its share of the budget decays as 1/n and
+   the ladder stops being climbable. Uniform found the bug on 2 seeds of 5;
+   biased, 5 of 5 (§`corpus-pick`).
+2. **Mutation must be allowed to GROW an input.** A choice carries the
+   constraints of the case that recorded it, and the size budget ramps — so the
+   early cases that dominate the corpus recorded lengths bounded by a size of one
+   or two, and clamping mutations to those bounds capped the search at inputs too
+   short to reach a four-byte check. With the clamp, 20 000 iterations grew the
+   corpus by zero.
+3. **The target must have branches to discover.** A chain of `if` that only
+   yields `true`/`false` is a pure boolean expression and compiles to
+   `and`/`select` with no branches at all — no blocks, no edges, nothing to guide
+   with. Real parsers do work as they consume, which is what makes them
+   fuzzable; the demo had to do the same.
+
+The remaining step is `trace-cmp` feedback, which is how libFuzzer solves a magic
+value in one step rather than one byte at a time — and the typed tape is
+unusually well placed for it, since a failed comparison can be fed straight back
+into the choice that produced the operand.
 
 ---
 

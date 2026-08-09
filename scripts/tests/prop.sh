@@ -27,6 +27,7 @@ tests/prop/derive_test.coil
 tests/prop/gen_test.coil
 tests/prop/stateful_test.coil
 tests/prop/db_test.coil
+tests/prop/cov_test.coil
 tests/prop/stdlib_props_test.coil
 src/examples/property-testing.coil"
 
