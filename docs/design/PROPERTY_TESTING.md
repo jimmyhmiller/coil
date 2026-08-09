@@ -683,6 +683,36 @@ because the mutation operates on the **typed** tape rather than raw bytes, every
 mutant is a well-formed value of the type — no wasted executions on inputs that
 fail to parse. Same properties, same generators, no new user-facing concepts.
 
+**The mechanism is proven end to end.** It was originally scoped as a
+compiler-side change — teaching the driver to pass `-fsanitize-coverage` — and it
+turns out not to need one, because two pieces already exist:
+
+1. **`coil emit-ir` produces complete, linkable LLVM IR for a whole program.** So
+   the instrumented build is `coil emit-ir prop_test.coil | clang
+   -fsanitize-coverage=trace-pc-guard -O1 - -o fuzz-bin`, entirely outside the
+   compiler. Verified: instrumented, linked, ran.
+2. **The SanitizerCoverage callbacks can be written in Coil.** `(export-c
+   [cov-guard :as "__sanitizer_cov_trace_pc_guard"])` and its `_init` sibling are
+   ordinary Coil functions over an `alloc/static` bitmap. That means an ORDINARY
+   build still links — the symbols exist, nothing calls them, coverage queries
+   return zero — and only the instrumented build has real edges. No C file, no
+   weak symbols, no conditional compilation. Exclude them from instrumentation
+   with `-fsanitize-coverage-ignorelist` or they call themselves.
+
+Measured on a branchy function with opaque inputs: 7 new edges on the first call,
+3 on a repeat (still-warming library paths), then 0 for an input on the same
+path and 1 each for inputs that reach new branches. Two caveats the experiment
+surfaced, both worth knowing before building on it: at `-O1` some source-level
+branches compile to branchless selects and produce no edge at all, and
+magic-value comparisons (`a + b == 500`) need `trace-cmp` feedback rather than
+edge coverage to solve — which is exactly what libFuzzer's `trace-cmp` provides
+and what the tape's typed choices are unusually well placed to exploit.
+
+What remains is the loop itself: a corpus of tapes, mutate-and-keep-if-new-edges
+(the mutation function already exists — the targeted search uses it), and a
+driver script. The shrinker, the crash isolation and the database all apply
+unchanged, because a fuzz finding is just a failing tape.
+
 ---
 
 ## 7. Performance
@@ -947,9 +977,8 @@ Example: `src/examples/property-testing.coil`. Benchmarks:
 - **The `Deserialize`→`Arbitrary` bridge (§4.4) is not built.** The reflection
   path covers the derive case; the bridge's real payoff was corpus interop, which
   the database (`prop_db.coil`) delivers directly in the tape's own format.
-- **Coverage-guided fuzzing (§6.7) is not built.** It needs `-fsanitize-coverage`
-  plumbing through the build, which is a compiler-side change, not a library one.
-  The `Mutate` path the tape would need already exists in the targeted search.
+- **Coverage-guided fuzzing (§6.7) is not built — but the mechanism is proven,
+  and it needs no compiler change.** See §6.7 for the working pipeline.
 - **Parallelism is at the test-file level**, via `coil test --jobs N`, not
   in-process across cases (§7). The splittable RNG that in-process workers would
   need is built and tested (`rng-split!`); the worker pool is not.
