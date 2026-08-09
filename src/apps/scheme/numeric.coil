@@ -296,3 +296,251 @@
 (defn string->number [(v Code) & (rest Code)] (-> Code)
   (if (= (primitive/code-count rest) 0) `(scm-string->number1 ~v)
     `(scm-string->number2 ~v ~(primitive/code-nth rest 0))))
+
+; ============================================================================
+; syntax-rules
+; ============================================================================
+;; The pattern language of R5RS 4.3.2: a matcher over `Code`, a binding table, and
+;; a template instantiator.
+;;
+;; HYGIENE IS INHERITED, NOT REIMPLEMENTED. Coil's quasiquote already renames the
+;; identifiers a template introduces, so a template that binds `tmp` does not
+;; capture a caller's `tmp`. That was measured before this was written, not
+;; assumed — see the hygiene tests. It is the single largest thing this does not
+;; have to build: the renaming, the marks, and identifier comparison modulo
+;; renaming all belong to the host macro system, and templates inherit them by
+;; going through its quasiquote.
+;;
+;; ⚠ EVERY helper below reads list slots with `code-nth` directly instead of
+;; through accessor functions. A `defn` whose return type is `Code` IS a macro
+;; here, so an accessor like `(bind-name b)` would be a macro call nested inside a
+;; macro body — which the stager prunes, and the helper then fails to resolve.
+;; These helpers all call each other, so none of them can afford an accessor.
+
+;; A binding is the 3-element list `(name depth value)`. Depth 0 is an ordinary
+;; variable; depth 1 means the value is a LIST of matches gathered by an ellipsis,
+;; which is the distinction a template needs to know whether `x` is one form or a
+;; sequence of them.
+(defn sr--lookup [(bs Code) (name Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (if (primitive/code-eq (primitive/code-nth (primitive/code-nth bs i) 0) name)
+        (primitive/code-nth bs i)
+      (sr--lookup bs name (+ i 1) n))))
+
+;; Is `s` in the literals list? R5RS's literal rule is why this exists: a literal
+;; matches only the SAME identifier in the input, while every other symbol in a
+;; pattern is a variable that matches anything. `else` in a `cond`-like macro is a
+;; literal — and a user who rebinds `else` makes it stop being the keyword, which
+;; is the corner the rule is written for.
+(defn sr--literal? [(s Code) (lits Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n) false
+    (if (primitive/code-eq (primitive/code-nth lits i) s) true
+      (sr--literal? s lits (+ i 1) n))))
+
+;; `...` is an ordinary symbol until a pattern gives it meaning, so it is compared
+;; by name rather than carrying any reader support.
+(defn sr--ellipsis? [(s Code)] (-> bool) (primitive/code-eq s `...))
+
+(defn sr--followed-by-ellipsis? [(p Code) (i i64) (n i64)] (-> bool)
+  (and (< (+ i 1) n) (sr--ellipsis? (primitive/code-nth p (+ i 1)))))
+
+;; The pattern variables of a (sub)pattern. An ellipsis needs this to know which
+;; names it gathers — including when it matches ZERO times and those names must
+;; still bind, to the empty sequence.
+(defn sr--vars [(p Code) (acc Code) (lits Code)] (-> Code)
+  (if (primitive/code-sym? p)
+      (if (or (sr--ellipsis? p)
+              (or (primitive/code-eq p `_)
+                  (sr--literal? p lits 0 (primitive/code-count lits))))
+          acc
+        `(~@acc ~p))
+    (if (primitive/code-list? p) (sr--vars-list p 0 (primitive/code-count p) acc lits)
+      acc)))
+
+(defn sr--vars-list [(p Code) (i i64) (n i64) (acc Code) (lits Code)] (-> Code)
+  (if (>= i n) acc
+    (sr--vars-list p (+ i 1) n (sr--vars (primitive/code-nth p i) acc lits) lits)))
+
+; ---- the matcher ------------------------------------------------------------
+;; Failure is the sentinel symbol `sr-no-match` rather than an option type:
+;; everything here is already Code, so a distinguished symbol costs nothing and
+;; keeps every helper returning one type.
+
+(defn sr--ellipsis-pos [(p Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n) -1
+    (if (sr--ellipsis? (primitive/code-nth p i)) i
+      (sr--ellipsis-pos p (+ i 1) n))))
+
+(defn sr--match-fixed [(p Code) (pi i64) (pend i64) (f Code) (fi i64) (fend i64)
+                       (bs Code) (lits Code)] (-> Code)
+  (if (>= pi pend) bs
+    (if (>= fi fend) `sr-no-match
+      (let [r (sr--match (primitive/code-nth p pi) (primitive/code-nth f fi) bs lits)]
+        (if (primitive/code-eq r `sr-no-match) `sr-no-match
+          (sr--match-fixed p (+ pi 1) pend f (+ fi 1) fend r lits))))))
+
+;; Match the repeated sub-pattern against each input element, keeping one binding
+;; list per repetition. Those per-repetition lists are transposed below into one
+;; binding per variable whose value is the whole column.
+(defn sr--match-rep [(sub Code) (f Code) (fi i64) (fend i64) (lits Code)] (-> Code)
+  (if (>= fi fend) `()
+    (let [r (sr--match sub (primitive/code-nth f fi) `() lits)]
+      (if (primitive/code-eq r `sr-no-match) `sr-no-match
+        (let [more (sr--match-rep sub f (+ fi 1) fend lits)]
+          (if (primitive/code-eq more `sr-no-match) `sr-no-match
+            `(~r ~@more)))))))
+
+;; The values one variable took across every repetition.
+(defn sr--column [(reps Code) (i i64) (n i64) (name Code)] (-> Code)
+  (if (>= i n) `()
+    (let [b (sr--lookup (primitive/code-nth reps i) name 0
+                        (primitive/code-count (primitive/code-nth reps i)))]
+      (if (= (primitive/code-count b) 0) (sr--column reps (+ i 1) n name)
+        `(~(primitive/code-nth b 2) ~@(sr--column reps (+ i 1) n name))))))
+
+;; Depth-1 bindings, one per variable of the sub-pattern. Driven by the
+;; sub-pattern's VARIABLE LIST rather than by what happened to match, so zero
+;; repetitions still bind every variable — which is what `(x ...)` against `()`
+;; must produce.
+(defn sr--transpose [(vars Code) (vi i64) (vn i64) (reps Code) (bs Code)] (-> Code)
+  (if (>= vi vn) bs
+    (let [name (primitive/code-nth vars vi)]
+      (sr--transpose vars (+ vi 1) vn reps
+                     `(~@bs (~name 1 ~(sr--column reps 0 (primitive/code-count reps) name)))))))
+
+;; `_` matches anything and binds nothing; any other symbol is a pattern variable;
+;; a list matches structurally; anything else must be equal.
+;;
+;; A pattern list containing an ellipsis splits three ways:
+;;
+;;     (p0 … pk   sub ...   q1 … qm)
+;;      ^fixed     ^rep      ^tail
+;;
+;; R5RS allows that FIXED TAIL after the ellipsis, and it is what forces care: the
+;; ellipsis cannot simply eat the rest of the input. The tail's length is known
+;; from the pattern, so it is reserved from the END first and the ellipsis takes
+;; exactly what remains in the middle. `(_ a ... last)` against `(1 2 3)` therefore
+;; binds `a` to (1 2) and `last` to 3, where a greedy ellipsis would swallow all
+;; three and leave `last` with nothing.
+(defn sr--match [(p Code) (f Code) (bs Code) (lits Code)] (-> Code)
+  (if (primitive/code-sym? p)
+      (if (primitive/code-eq p `_) bs
+        ; R5RS 4.3.2: a symbol in the literals list is a KEYWORD, not a variable —
+        ; it matches only the same identifier and binds nothing. Without this an
+        ; `else` pattern would match any symbol and a rebound `else` could never
+        ; stop acting as the keyword.
+        (if (sr--literal? p lits 0 (primitive/code-count lits))
+            (if (primitive/code-eq p f) bs `sr-no-match)
+          `(~@bs (~p 0 ~f))))
+    (if (primitive/code-list? p)
+        (if (not (primitive/code-list? f)) `sr-no-match
+          (let [pn (primitive/code-count p)
+                fcount (primitive/code-count f)
+                epos (sr--ellipsis-pos p 0 pn)]
+            (if (< epos 0)
+                (if (not (= pn fcount)) `sr-no-match
+                  (sr--match-fixed p 0 pn f 0 fcount bs lits))
+              (let [nfixed (- epos 1)
+                    ntail (- pn (+ epos 1))
+                    nrep (- (- fcount nfixed) ntail)]
+                (if (< nrep 0) `sr-no-match
+                  (let [r1 (sr--match-fixed p 0 nfixed f 0 nfixed bs lits)]
+                    (if (primitive/code-eq r1 `sr-no-match) `sr-no-match
+                      (let [sub (primitive/code-nth p (- epos 1))
+                            reps (sr--match-rep sub f nfixed (+ nfixed nrep) lits)]
+                        (if (primitive/code-eq reps `sr-no-match) `sr-no-match
+                          (let [vars (sr--vars sub `() lits)
+                                r2 (sr--transpose vars 0 (primitive/code-count vars) reps r1)]
+                            ; the fixed tail, matched against the END of the input
+                            (sr--match-fixed p (+ epos 1) pn f (+ nfixed nrep) fcount r2 lits)))))))))))
+      (if (primitive/code-eq p f) bs `sr-no-match))))
+
+; ---- the template instantiator ----------------------------------------------
+;; A symbol bound at depth 0 is replaced by its match. A symbol that is NOT bound
+;; is a template-introduced identifier and is left exactly as written — that is
+;; where hygiene happens, because the quasiquote around the finished template
+;; renames it and it cannot capture at the use site.
+
+;; How many repetitions a sub-template calls for: the length of the first depth-1
+;; column among its variables. They were gathered together, so they agree.
+(defn sr--rep-count [(vars Code) (i i64) (n i64) (bs Code)] (-> i64)
+  (if (>= i n) 0
+    (let [b (sr--lookup bs (primitive/code-nth vars i) 0 (primitive/code-count bs))]
+      ; an unbound name yields the EMPTY list, so its count must be checked before
+      ; any slot of it is read
+      (if (and (= (primitive/code-count b) 3)
+               (= (primitive/code-int (primitive/code-nth b 1)) 1))
+          (primitive/code-count (primitive/code-nth b 2))
+        (sr--rep-count vars (+ i 1) n bs)))))
+
+;; The bindings for ONE repetition: each depth-1 variable narrows to its k-th
+;; element and becomes depth 0, while depth-0 variables pass through unchanged so
+;; a fixed variable may be referenced inside an ellipsis.
+(defn sr--slice [(bs Code) (i i64) (n i64) (k i64)] (-> Code)
+  (if (>= i n) `()
+    (let [b (primitive/code-nth bs i)]
+      `(~(if (and (= (primitive/code-int (primitive/code-nth b 1)) 1)
+                  (> (primitive/code-count (primitive/code-nth b 2)) k))
+             `(~(primitive/code-nth b 0) 0 ~(primitive/code-nth (primitive/code-nth b 2) k))
+           b)
+        ~@(sr--slice bs (+ i 1) n k)))))
+
+(defn sr--expand-reps [(sub Code) (bs Code) (k i64) (n i64)] (-> Code)
+  (if (>= k n) `()
+    `(~(sr--expand sub (sr--slice bs 0 (primitive/code-count bs) k))
+      ~@(sr--expand-reps sub bs (+ k 1) n))))
+
+;; Walk a template list, splicing `sub ...` in place and expanding the rest
+;; pointwise. Nested `((n v) ...)` works because the sub-template is instantiated
+;; once per repetition against that repetition's slice of every column.
+(defn sr--expand-list [(t Code) (i i64) (n i64) (bs Code)] (-> Code)
+  (if (>= i n) `()
+    (if (sr--followed-by-ellipsis? t i n)
+        (let [sub (primitive/code-nth t i)
+              vars (sr--vars sub `() `())]
+          `(~@(sr--expand-reps sub bs 0
+                               (sr--rep-count vars 0 (primitive/code-count vars) bs))
+            ; continue AFTER the ellipsis token
+            ~@(sr--expand-list t (+ i 2) n bs)))
+      `(~(sr--expand (primitive/code-nth t i) bs)
+        ~@(sr--expand-list t (+ i 1) n bs)))))
+
+(defn sr--expand [(t Code) (bs Code)] (-> Code)
+  (if (primitive/code-sym? t)
+      (let [b (sr--lookup bs t 0 (primitive/code-count bs))]
+        (if (= (primitive/code-count b) 3) (primitive/code-nth b 2) t))
+    (if (primitive/code-list? t)
+        (sr--expand-list t 0 (primitive/code-count t) bs)
+      t)))
+
+; ---- rule selection ---------------------------------------------------------
+;; Rules are tried in order and the first whose pattern matches wins — R5RS's
+;; order, which is what makes `((_) …)` then `((_ e) …)` then `((_ e r ...) …)`
+;; behave as written.
+;;
+;; The pattern's FIRST position is ignored per R5RS 4.3.2: it names the macro
+;; itself (or is `_`), so matching starts at index 1 against the argument list.
+(defn sr--try-rules [(rules Code) (i i64) (n i64) (args Code) (lits Code)] (-> Code)
+  (if (>= i n) (primitive/error "syntax-rules: no matching rule")
+    (let [rule (primitive/code-nth rules i)
+          pat (primitive/code-nth rule 0)
+          tmpl (primitive/code-nth rule 1)
+          prest `(~@(num--rest pat 1 (primitive/code-count pat)))
+          bs (sr--match prest args `() lits)]
+      (if (primitive/code-eq bs `sr-no-match)
+          (sr--try-rules rules (+ i 1) n args lits)
+        (sr--expand tmpl bs)))))
+
+;; The entry point: given a `(syntax-rules (literals…) rules…)` form and the
+;; actual arguments, produce the expansion.
+;;
+;; ⚠ This is called BY a macro rather than being `define-syntax` itself. Coil
+;; collects its macro names from the source text before any macro or transform
+;; runs, so a `defn … (-> Code)` that a metaprogram GENERATES is never treated as
+;; a macro at its call sites — verified directly, including from a before-expand
+;; transform. A `define-syntax` that installs a new keyword therefore cannot be
+;; built on the current expander; what a user writes instead is a one-line macro
+;; that forwards its arguments here, which keeps the whole pattern language.
+(defn syntax-rules-expand [(spec Code) (args Code)] (-> Code)
+  (let [lits (primitive/code-nth spec 1)]
+    (sr--try-rules spec 2 (primitive/code-count spec) args lits)))
