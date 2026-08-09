@@ -865,6 +865,69 @@ this system automates.
 
 ---
 
+## 12. Implementation status
+
+Every module lives in `src/stdlib/`; a user imports exactly one namespace,
+`coil.prop`, which `:reexport`s the rest.
+
+| File | Namespace | What it carries |
+|---|---|---|
+| `prop_rng.coil` | `coil.prop.rng` | xoshiro256++ over splitmix64; splittable; Lemire bounded draw |
+| `prop_source.coil` | `coil.prop.source` | **the tape** — typed choices, spans, replay, fuel, per-case arena |
+| `prop_arbitrary.coil` | `coil.prop.arbitrary` | the `Arbitrary` trait, scalar/collection/string impls |
+| `prop_show.coil` | `coil.prop.show` | `PropShow` — how a counterexample prints |
+| `prop_shrink.coil` | `coil.prop.shrink` | the shrink passes and the greedy fixpoint |
+| `prop_runner.coil` | `coil.prop.runner` | phases, fork isolation, crash/timeout minimization, statistics, targeted search |
+| `prop_db.coil` | `coil.prop.db` | the failure database: versioned tape encoding, `.coil/pbt/` |
+| `prop_derive.coil` | `coil.prop.derive` | `(derive-arbitrary T)` / `(derive-show T)` by comptime reflection |
+| `prop_gen.coil` | `coil.prop.gen` | first-class generator values and combinators |
+| `prop_stateful.coil` | `coil.prop.stateful` | model-based command-sequence testing |
+| `prop.coil` | `coil.prop` | `defprop`, `assume`, `classify`, `collect`, `prop-target!` |
+
+Tests: `tests/prop/` (engine regressions, shrink-quality assertions with known
+minima, derive, generators, stateful, database, and a property suite over the
+standard library). Example: `src/examples/property-testing.coil`. Benchmarks:
+`src/benchmarks/prop_bench.coil`.
+
+### Where the implementation departs from this design
+
+- **Replay is linear, not span-indexed** (§5.4). The span tree is recorded and
+  drives every structural pass, but the shrinker's locality guarantee is
+  Hypothesis's, not falsify's. Documented above with the upgrade path.
+- **`Arbitrary` fills an out-parameter** — `(arbitrary [(out (mut Self)) (s (ptr
+  Source))] (-> i64))` — rather than returning `Self`. A trait method with `Self`
+  only in its return type has no argument to dispatch on; `coil.serde`'s
+  `Deserialize/de` takes an out-pointer for the same reason. It also means the
+  caller allocates one slot per argument instead of one per generated value.
+- **Targeted search is threshold accepting**, not Metropolis annealing (§6.6).
+- **The `Deserialize`→`Arbitrary` bridge (§4.4) is not built.** The reflection
+  path covers the derive case; the bridge's real payoff was corpus interop, which
+  the database (`prop_db.coil`) delivers directly in the tape's own format.
+- **Coverage-guided fuzzing (§6.7) is not built.** It needs `-fsanitize-coverage`
+  plumbing through the build, which is a compiler-side change, not a library one.
+  The `Mutate` path the tape would need already exists in the targeted search.
+- **Normalization (§5.3 pass 10) is not built.** It costs ~30× for ~45% smaller
+  counterexamples; the pass set that is built reaches the true minimum on every
+  benchmark in `tests/prop/shrink_test.coil`.
+
+### A compiler limitation worth recording
+
+A bounded generic cannot call another bounded generic with the same bound —
+`(defn f [(T Tr)] …)` calling `(defn g [(T Tr)] …)` is rejected with "'T' does not
+implement 'Tr'". A direct trait-method call on a bounded parameter is fine. The
+workaround is to inline the callee (see `prop-show-arg` in `prop_show.coil`). Worth
+fixing in the checker; it makes bounded generics non-composable.
+
+### What this found
+
+`coil.fmt/print-i` printed `i64::MIN` as `-0`, because it emitted `'-'` and then
+negated — and negating `i64::MIN` wraps back to itself. Both serde text backends
+encode integers through it, so any structure containing `i64::MIN` serialized to
+`-0` and decoded back as `0`: silent data loss, no error anywhere. Found by
+`tests/prop/stdlib_props_test.coil` on a round-trip property, shrunk to exactly
+`n = i64::MIN`, and fixed by printing the magnitude through the unsigned path.
+That is the whole argument for this system in one bug.
+
 ## Bibliography
 
 - Claessen & Hughes. *QuickCheck: A Lightweight Tool for Random Testing of Haskell Programs.* ICFP 2000.
