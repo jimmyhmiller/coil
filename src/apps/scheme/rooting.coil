@@ -58,18 +58,18 @@
 ;;      roots a long list — so collection cost grows with depth and the program
 ;;      appears to hang rather than fail.
 ;;
-;; MEASURED: a single tail-recursive pass is fine to at least depth 100000
-;; (verified: tests/scheme/probe/rtdepth.coil returns the right answer). What
-;; breaks is REPEATED rounds — `listrev` runs 300 rounds at depth 8000 and does
-;; not finish, where before this pass it completed (unsoundly, with no roots at
-;; all). `bintree` likewise stops SIGSEGVing and starts not-terminating.
+;; FIXED, by the tail-call reset in `rt--tail` below. Before it, `listrev` (300
+;; rounds at depth 8000) and `bintree` (300 rounds at depth 14) did not terminate:
+;; every frame's roots stayed live for the whole recursion, so each collection
+;; walked a shadow stack in the hundreds of thousands. With the reset, a
+;; self-tail-call drops its own frame's roots before recursing and the stack stays
+;; bounded by real nesting depth rather than by iteration count.
 ;;
-;; So this pass makes the collector SOUND — nothing is swept while reachable —
-;; but not yet PRACTICAL for deeply recursive allocating programs. The fix is the
-;; tail-call root discipline the predecessor had: reset the shadow stack to the
-;; frame base before a self-tail-call, since the callee cannot return to a point
-;; that needs the caller's roots. That is the next piece of work, and it is what
-;; the "no tail-call special case" note above wrongly dismissed.
+;; What remains is a genuine limit rather than a bug: a NON-self tail call, and
+;; deep NON-tail recursion, still hold their roots for the duration. Both are
+;; correct — just not free. `gc-root` also still has no bounds check past 1048576
+;; entries (heap.coil), which a program with a million simultaneously live roots
+;; would run off the end of.
 ;;
 ;; ── WHY OVER-APPROXIMATION IS SAFE, AND UNDER- IS NOT ───────────────────────
 ;;
@@ -149,6 +149,16 @@
   (if (primitive/icmp-ge i n) `()
     `(~(rt--expr (primitive/code-nth e i)) ~@(rt--all e (primitive/iadd i 1) n))))
 
+;; Rewrite a body: every form but the last as an ordinary expression, the last in
+;; TAIL position. Declared here, defined after `rt--tail` — the file is one
+;; mutually recursive group and Coil resolves forward references at module scope.
+(defn rt--body-tail [(self Code) (sp Code) (e Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `()
+    (if (primitive/icmp-eq i (primitive/isub n 1))
+        `(~(rt--tail (primitive/code-nth e i) self sp))
+      `(~(rt--expr (primitive/code-nth e i))
+        ~@(rt--body-tail self sp e (primitive/iadd i 1) n)))))
+
 ;; `let` bindings whose init allocates are rooted too — an evaluator binds many
 ;; intermediates that must survive later allocations, and a binding is exactly the
 ;; construct that keeps a value alive across them.
@@ -175,6 +185,80 @@
                 `(~h ~@(rt--all e 1 (primitive/code-count e)))
               ; an ordinary call: A-normalize the arguments
               (rt--args h e 1 (primitive/code-count e) `()))))))))
+
+;; ── TAIL POSITION: RESET THE SHADOW STACK BEFORE A SELF-CALL ────────────────
+;;
+;; A Scheme tail call is compiled as an ordinary native call here, so without this
+;; the caller's frame — and every root it pushed — stays live for the entire
+;; recursion. At depth 8000 that is 8000 frames of roots held at once, which is
+;; what makes `mark-roots` walk a shadow stack in the hundreds of thousands on
+;; every collection and the program appear to hang.
+;;
+;; The reset is sound for a SELF-call in TAIL position, and the argument is
+;; specific to that case: the callee's result is returned directly to OUR caller,
+;; so control never comes back to a point that could read our roots. Nothing after
+;; the call can observe them, so they are dead the moment the arguments are
+;; evaluated.
+;;
+;; ⚠ ORDER IS THE WHOLE CORRECTNESS ARGUMENT. The arguments must be evaluated and
+;; rooted FIRST — evaluating them can allocate and therefore collect — and only
+;; then does the stack reset, immediately before the call. Resetting first would
+;; drop roots while argument evaluation still needs them, which is precisely the
+;; use-after-free this pass exists to prevent. So the emitted shape binds every
+;; argument to a rooted temporary, then pops, then calls:
+;;
+;;     (let [$a ARG1] (gc-root $a)
+;;       (let [$b ARG2] (gc-root $b)
+;;         (do (gc-sp-set! $sp) (f $a $b))))
+;;
+;; The arguments survive the pop because they are passed in registers, and the
+;; callee's own prologue re-roots them.
+;;
+;; Restricted to SELF-calls: a call to another procedure may return here, and a
+;; general tail-call analysis would have to prove otherwise. Self-recursion is
+;; both the shape that actually grows without bound and the one where the
+;; reasoning is local and checkable.
+(defn rt--tail-call [(e Code) (self Code) (sp Code)] (-> Code)
+  (rt--tail-args (primitive/code-nth e 0) e 1 (primitive/code-count e) `() sp))
+
+(defn rt--tail-args [(head Code) (e Code) (i i64) (n i64) (placed Code) (sp Code)] (-> Code)
+  (if (primitive/icmp-ge i n)
+      ; every argument is evaluated and rooted: NOW the frame's roots are dead
+      `(do (gc-sp-set! ~sp) (~head ~@placed))
+    (let [orig (primitive/code-nth e i)
+          arg (rt--expr orig)]
+      (if (rt--allocates? orig)
+          (let [g (primitive/gensym)]
+            `(let [~g ~arg]
+               (gc-root ~g)
+               ~(rt--tail-args head e (primitive/iadd i 1) n `(~@placed ~g) sp)))
+        (rt--tail-args head e (primitive/iadd i 1) n `(~@placed ~arg) sp)))))
+
+;; Is `e` a call to `self`? Compared by name — this runs before expansion, so the
+;; head is still the source spelling the author wrote.
+(defn rt--self-call? [(e Code) (self Code)] (-> bool)
+  (and (primitive/code-list? e)
+       (and (primitive/icmp-gt (primitive/code-count e) 0)
+            (and (primitive/code-sym? (primitive/code-nth e 0))
+                 (primitive/code-eq (primitive/code-nth e 0) self)))))
+
+;; Rewrite `e` in TAIL position. Only the forms that PROPAGATE tail position are
+;; descended into as tail — `if`'s branches (not its test) and the last form of a
+;; `do`/`let` body. Everything else is an ordinary expression.
+(defn rt--tail [(e Code) (self Code) (sp Code)] (-> Code)
+  (if (not (primitive/code-list? e)) (rt--expr e)
+    (if (primitive/icmp-eq (primitive/code-count e) 0) e
+      (let [h (primitive/code-nth e 0)]
+        (if (rt--self-call? e self) (rt--tail-call e self sp)
+          ; `if`: the TEST is not in tail position, both BRANCHES are
+          (if (and (primitive/code-eq h `if) (primitive/icmp-ge (primitive/code-count e) 3))
+              (if (primitive/icmp-ge (primitive/code-count e) 4)
+                  `(if ~(rt--expr (primitive/code-nth e 1))
+                       ~(rt--tail (primitive/code-nth e 2) self sp)
+                     ~(rt--tail (primitive/code-nth e 3) self sp))
+                `(if ~(rt--expr (primitive/code-nth e 1))
+                     ~(rt--tail (primitive/code-nth e 2) self sp)))
+            (rt--expr e)))))))
 
 ;; Wrap one `defn` in a frame: root the parameters on entry, pop on the way out.
 ;;
@@ -249,7 +333,11 @@
   (let [sig (primitive/code-nth f 1)
         sp (primitive/gensym)
         r (primitive/gensym)
-        body (rt--all f 2 (primitive/code-count f))]
+        ;; The LAST body form is in tail position, so a self-call there can drop
+        ;; this frame's roots before recursing (see rt--tail). Earlier forms are
+        ;; ordinary expressions: their values are discarded, but anything they
+        ;; allocate must stay rooted for the forms that follow.
+        body (rt--body-tail (primitive/code-nth sig 0) sp f 2 (primitive/code-count f))]
     ;; Parameters come from the SIGNATURE's tail: `(f a b)` -> a, b. Element 0 is
     ;; the procedure name and must not be rooted — it is a binder, not a value.
     `(define ~sig
