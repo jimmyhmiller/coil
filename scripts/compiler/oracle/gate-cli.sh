@@ -1617,7 +1617,12 @@ expect_rc 0 "coil verify runs the structured project verification pipeline" \
 [ ! -e "$T/project/native/answer.c.o" ] \
   && ok "native objects do not dirty the source directory" \
   || bad "native objects do not dirty the source directory" "native/answer.c.o exists"
-find "$T/project/.coil/build/native" -name source.d -type f | grep -q . \
+# Capture, then test — `find … | grep -q .` quits at the first path, and a `find`
+# still walking the tree takes SIGPIPE, so under `set -o pipefail` the pipeline
+# returns 141 and this reports "no source.d found" while the file exists. Same
+# hazard as the ASan checks above.
+depfiles=$(find "$T/project/.coil/build/native" -name source.d -type f)
+[ -n "$depfiles" ] \
   && ok "native compilation records header depfiles under .coil/build" \
   || bad "native compilation records header depfiles under .coil/build" "no source.d found"
 
