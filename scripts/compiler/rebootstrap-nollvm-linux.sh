@@ -46,7 +46,13 @@ if ldd "$STAGE0" 2>/dev/null | grep -qi llvm; then
       { [ -e "$d/libLLVM.so" ] || [ -e "$d/libLLVM-21.so" ]; } && { libdir="$d"; break; }
     done
   fi
-  [ -n "$libdir" ] || { echo "stage0 needs libLLVM but none found (set COIL_LLVM_LIBDIR)"; exit 1; }
+  [ -n "$libdir" ] || {
+    echo "stage0 needs libLLVM but none found (set COIL_LLVM_LIBDIR)"
+    echo "note: the compiler this script BUILDS is LLVM-free, but the stage0 that"
+    echo "      builds it is not — an LLVM-linked coil has to compile main_x64.coil"
+    echo "      first. So this is a dependency of stage0, not of the result."
+    echo "      e.g. STAGE0=build/bin/coil COIL_LLVM_LIBDIR=/usr/lib/llvm-21/lib $0"
+    exit 1; }
   S1FLAGS=(--link-flag "-L$libdir" --link-flag "-Wl,-rpath,$libdir" --link-flag -lLLVM
            --link-flag -lstdc++ --link-flag -lm --link-flag -lpthread --link-flag -ldl)
 fi
