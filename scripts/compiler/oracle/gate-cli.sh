@@ -37,6 +37,24 @@ expect_rc() {
   local out; out=$("$@" 2>&1); local rc=$?
   [ "$rc" = "$want" ] && ok "$name" || bad "$name" "want rc=$want got rc=$rc: $out"
 }
+# expect_rc_arm64 <code> <name> <cmd...>
+# For checks that BUILD AND RUN a `--backend arm64` executable. That backend emits
+# Mach-O, so off the macOS arm64 host the link fails with `file format not
+# recognized` -- a toolchain fact, not a defect, and it accounted for 6 of the 8
+# gate-cli failures on the first Linux run.
+#
+# Deliberately prints a SKIP LINE rather than staying silent: a check that vanishes
+# without a trace is indistinguishable from one that passed, which is the same
+# vacuum that let gate-target-os rot unnoticed. And the guard is narrow on purpose
+# -- widen it and it stops covering the one host that CAN run this, which is the
+# only host that ever exercises the arm64 backend end to end.
+expect_rc_arm64() {
+  if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
+    expect_rc "$@"
+  else
+    echo "  (skip: $2 — building and running a --backend arm64 Mach-O needs the macOS arm64 host)"
+  fi
+}
 # expect_out <regex> <name> <cmd...>
 expect_out() {
   local want=$1 name=$2; shift 2
@@ -2380,10 +2398,10 @@ cat > "$T/tco/ct.coil" <<'EOF'
 (defn spin [(n i64)] (-> i64) (if (= n 0) 0 (spin (primitive/isub n 1))))
 (defn main [] (-> i64) (comptime (spin 100000000)))
 EOF
-expect_rc 0 "tco: deep tail recursion runs in constant space on the arm64 backend" \
+expect_rc_arm64 0 "tco: deep tail recursion runs in constant space on the arm64 backend" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build deep.coil --backend arm64 -o d && ./d' \
   _ "$T/tco" "$COIL"
-expect_rc 4 "tco: a tail call that swaps its arguments is still correct (arm64)" \
+expect_rc_arm64 4 "tco: a tail call that swaps its arguments is still correct (arm64)" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build swap.coil --backend arm64 -o s && ./s' \
   _ "$T/tco" "$COIL"
 expect_rc 4 "tco: same answer from the LLVM backend" \
@@ -2420,7 +2438,7 @@ EOF
 expect_rc 52 "const: sum, payload sum and struct consts all materialize (3+42+3+4)" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build a.coil -o a && ./a' \
   _ "$T/aggconst" "$COIL"
-expect_rc 52 "const: same on the arm64 backend" \
+expect_rc_arm64 52 "const: same on the arm64 backend" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build a.coil --backend arm64 -o a2 && ./a2' \
   _ "$T/aggconst" "$COIL"
 
@@ -2449,7 +2467,7 @@ EOF
 expect_rc 44 "comptime: generic sum, user generic sum and generic struct all fold (7+1+3+11+22)" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build g.coil -o g && ./g' \
   _ "$T/ctgen" "$COIL"
-expect_rc 44 "comptime: same on the arm64 backend" \
+expect_rc_arm64 44 "comptime: same on the arm64 backend" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build g.coil --backend arm64 -o g2 && ./g2' \
   _ "$T/ctgen" "$COIL"
 
@@ -2498,7 +2516,7 @@ expect_rc 7 "shadow: an unshadowed macro still expands inside an arm body" \
 expect_rc 21 "comptime: generics NESTED in a struct, a generic sum and an array (8+3+4+6)" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build nested.coil -o n && ./n' \
   _ "$T/rest" "$COIL"
-expect_rc 21 "comptime: same on the arm64 backend" \
+expect_rc_arm64 21 "comptime: same on the arm64 backend" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build nested.coil --backend arm64 -o n2 && ./n2' \
   _ "$T/rest" "$COIL"
 
@@ -2549,7 +2567,7 @@ EOF
 expect_rc 0 "match: alias-qualified variants plus a `_` arm RUN correctly" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build v.coil -o v && ./v' \
   _ "$T/variant" "$COIL"
-expect_rc 0 "match: same on the arm64 backend" \
+expect_rc_arm64 0 "match: same on the arm64 backend" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build v.coil --backend arm64 -o v2 && ./v2' \
   _ "$T/variant" "$COIL"
 expect_rc 1 "match: a bare variant under an :as import also resolves" \
