@@ -13,7 +13,7 @@ did; one is fixed and one is a documented cost:
 
 - `coil.prop.derive` was not reachable through `coil.prop`, so the `Arbitrary`
   impl for `Rec` is written out by hand. `coil.prop` reexports it now, and
-  `(derive-arbitrary Rec)` would do; the hand-written impl stays because the
+  `(derive Arbitrary Rec)` would do; the hand-written impl stays because the
   override path is worth testing.
 - A hand-written `PropShow` impl mentions `Writer`, which lives in `coil.io`, so
   such a file needs `(import "coil.io" :as io)` and an `(io/Writer)` in the

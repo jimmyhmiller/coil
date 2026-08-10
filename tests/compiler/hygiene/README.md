@@ -15,7 +15,7 @@ the expansion boundary, where the assembled form makes the distinction visible.
 | `lib3.coil` / `user3.coil` | primitive spelling (control) | `0` |
 | `user4.coil` | `(assert-eq 1 999)` | must FAIL |
 | `lib5.coil` / `user5.coil` | two modules declare `mine` | `7` (the macro's) |
-| `lib6.coil` / `user6.coil` | `derive-eq`'s method binder | compiles, `0` |
+| `lib6.coil` / `user6.coil` | derived `Eq` method binder | compiles, `0` |
 | `lib7.coil` / `user7.coil` | `~@`-spliced method binder; body refs stay qualified | `1` |
 | `lib8.coil` / `user8.coil` | library-trait binder + reference, competing local trait | `42` |
 | `lib9.coil` / `user9.coil` | macro-GENERATED deftrait binder | `21` |
@@ -28,7 +28,7 @@ The controls are as important as the failures: they show hygiene works without
 breaking the positions where a name is being defined rather than used.
 
 `user6.coil` is the guard rail that sank the first attempt (`78e599e`): it
-qualified the `=` that `derive-eq` emits as a method BINDER, so the impl declared
+qualified the `=` that `(derive Eq …)` emits as a method BINDER, so the impl declared
 `coil.core.=` while the trait declares `=`.
 
 `user7.coil` is the case that rules out any template-local fix: the method form

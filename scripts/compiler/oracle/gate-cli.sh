@@ -2659,8 +2659,7 @@ cat > "$T/qual/src/qlib.coil" <<'EOF'
 (import "coil.derive" :use *)
 (import "coil.primitive" :as primitive)
 (defstruct Inner [(x i64)])
-(derive-eq Inner)
-(derive-hash Inner)
+(derive Eq Hash Inner)
 EOF
 cat > "$T/qual/src/qlib2.coil" <<'EOF'
 (module qlib2)
@@ -2672,8 +2671,7 @@ cat > "$T/qual/src/deq.coil" <<'EOF'
 (import "coil.primitive" :as primitive)
 (import "qlib" :as l)
 (defstruct Outer [(inner l/Inner) (y i64)])
-(derive-eq Outer)
-(derive-hash Outer)
+(derive Eq Hash Outer)
 (defn main [] (-> i64) 0)
 EOF
 cat > "$T/qual/src/dserde.coil" <<'EOF'
@@ -2685,13 +2683,13 @@ cat > "$T/qual/src/dserde.coil" <<'EOF'
 (import "coil.str" :use *)
 (import "coil.result" :use *)
 (import "qlib2" :as s)
-(derive-serde-sum s/Shape)
+(derive Serialize Deserialize s/Shape)
 (defn main [] (-> i64) 0)
 EOF
-expect_rc 0 "qual: derive-eq/-hash over a field typed through an :as import" \
+expect_rc 0 "qual: Eq/Hash derive over a field typed through an :as import" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=src "$2" check src/deq.coil' \
   _ "$T/qual" "$COIL"
-expect_rc 0 "qual: derive-serde-sum on a sum reached through an :as import" \
+expect_rc 0 "qual: Serialize/Deserialize derive on a sum reached through an :as import" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=src "$2" check src/dserde.coil' \
   _ "$T/qual" "$COIL"
 
