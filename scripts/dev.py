@@ -358,6 +358,20 @@ def test_modernize_fast(compiler: str) -> None:
             if before != hashlib.sha256(probe.read_bytes()).digest():
                 raise RuntimeError("fast modernization gate: lint --fix is not idempotent")
 
+        def named_constructor_task() -> None:
+            probe = tmp / "named-constructor.coil"
+            probe.write_text((ROOT / "tests/metaprogramming/named_constructor_lint_input.coil").read_text())
+            execute(coil, "lint", str(probe), "--use", "coil.lint.named-constructor",
+                    "--fix", "--allow-dirty")
+            fixed = probe.read_text()
+            if "(Moved :x 1 :y 2 :at 3)" not in fixed or "(Sized :width" in fixed:
+                raise RuntimeError("fast modernization gate: named-constructor fix changed the wrong constructor")
+            execute(coil, "fmt", "--write", str(probe))
+            formatted = probe.read_text()
+            if not all(part in formatted for part in ("(Moved\n", ":x 1\n", ":y 2\n", ":at 3)")):
+                raise RuntimeError("fast modernization gate: named constructor was not formatted by field")
+            execute(coil, "check", str(probe))
+
         def broken_lint_task() -> None:
             broken = tmp / "broken.coil"
             broken.write_text("""(module broken-modernization-probe)
@@ -414,6 +428,7 @@ source-roots = ["src"]
             aggregate_ir_task,
             lambda: build_run("src/examples/bitfields.coil", "static-assert", "--backend", "arm64", want=42),
             lint_task,
+            named_constructor_task,
             broken_lint_task,
             broken_project_task,
         ]

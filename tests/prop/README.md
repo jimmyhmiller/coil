@@ -15,7 +15,7 @@ did; one is fixed and one is a documented cost:
   impl for `Rec` is written out by hand. `coil.prop` reexports it now, and
   `(derive Arbitrary Rec)` would do; the hand-written impl stays because the
   override path is worth testing.
-- A hand-written `PropShow` impl mentions `Writer`, which lives in `coil.io`, so
+- A hand-written `Debug` impl mentions `Writer`, which lives in `coil.io`, so
   such a file needs `(import "coil.io" :as io)` and an `(io/Writer)` in the
   signature. `coil.prop` deliberately does not reexport `coil.io`: it would put
   `print-str`, `stdout` and a dozen other everyday names into every property
@@ -171,7 +171,7 @@ after inserting them. A borrowing keyops would fail; the owning one must not.
 
 `Rec` is a struct with one field of each shape the derive has to handle — a
 scalar, a string that needs escaping, a bool, an `Option`, and a nested list —
-carrying a hand-written `Arbitrary` and `PropShow` impl. Those two impls are the
+carrying a hand-written `Arbitrary` and `Debug` impl. Those two impls are the
 user-facing override path, exercised here rather than described.
 
 | Property | Claim |

@@ -382,6 +382,13 @@ Self-tail-recursion is constant-stack (guaranteed `musttail`).
 
     (defstruct Point [(x i64) (y i64)])
     (defstruct Rect  [(lo Point) (hi Point) (data (ptr u8)) (buf (array u8 64))])
+    (Point :x 10 :y 20)                    ; named construction
+    (Point :y 20 :x 10)                    ; field order is irrelevant
+
+Struct values are constructed with `:field value` pairs. Every declared field is
+required exactly once; missing, repeated, and unknown fields are compile errors.
+Arguments are initialized in the struct's declaration order. Sum variants accept the
+same named syntax for their payload fields: `(Rect :width 10 :height 20)`.
 
 - `(primitive/field p name)` → a `(ptr FieldType)` (a place); then `load`/`store!`.
   Requires `p : (ptr Struct)`. Nested: `(primitive/field (primitive/field s lo) x)`. Array field
@@ -734,7 +741,8 @@ or calculate properties such as raw syntactic nesting depth.
 **Checkers run after the program is resolved and typechecked**, so they read the
 compiler's authoritative output and layer *policy* on code that already typechecks:
 
-- `(primitive/code-decl NODE)` → `(decl MODULE fn [PARAM-TYPE…] RET)` for a function, or
+- `(primitive/code-decl NODE)` → `(decl MODULE fn [PARAM-TYPE…] RET)` for a function,
+  `(decl MODULE sum QUALIFIED-VARIANT)` for a sum-variant construction, or
   `(decl MODULE KIND)` for a struct/sum/trait/const/extern; `:unresolved`/`:ambiguous`
   otherwise. Pass the **reference node** (a call, `fnptr-of`, variant construction, or
   type reference) and it resolves to the exact entity the checker picked — correct even
@@ -777,6 +785,16 @@ value with the real C ABI. To call a Coil fn from C (e.g. `qsort` comparator) pa
 `(print-str w s)`, `(fmt w "n={d} s={s} f={f}\n" a b c)`. ⚠ `{f}` is a fixed
 6-digit display, NOT C `%g`; for exact float formatting call libc `snprintf` with
 `c"%g"`. `coil cimport header.h` auto-generates bindings from a real C header.
+
+`coil.debug` provides the derivable `Debug` trait plus `debug` and `debugln`:
+
+    (import "coil.debug" :use *)
+    (derive Debug Point)
+    (debugln (Point :x 10 :y 20))   ; prints: (Point :x 10 :y 20)
+
+Derived struct and sum output uses valid named-constructor syntax, recursively, so a
+value whose component `Debug` implementations emit source can be pasted back into a
+program.
 In source, `(cimport "sys/ioctl.h" :use [ioctl])` asks Clang to emit only the
 named declarations and macros, so using a large platform header does not expose
 its whole API. The generated declaration preserves details such as C variadics.
@@ -892,7 +910,7 @@ asks the runner to hill-climb toward a number instead of sampling uniformly, and
 property.
 
 Derive both halves for your own structs and sums with
-`(derive Arbitrary PropShow T)`
+`(derive Arbitrary Debug T)`
 (recursive sums terminate on a fuel budget and shrink toward the first-declared
 variant, so declare the base case first).
 
@@ -903,7 +921,7 @@ other list keeps the generic impl:
     (impl Arbitrary Email
       (arbitrary [(out (mut Email)) (s (ptr Source))] (-> i64) …))
 
-⚠ A hand-written `PropShow` impl names `Writer`, which lives in `coil.io` —
+⚠ A hand-written `Debug` impl names `Writer`, which lives in `coil.io` —
 `coil.prop` does not reexport that module (it would put `print-str`, `stdout` and
 friends into every property file), so add `(import "coil.io" :as io)` and write
 `(w (ptr io/Writer))`.
