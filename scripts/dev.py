@@ -358,14 +358,16 @@ def test_modernize_fast(compiler: str) -> None:
             if before != hashlib.sha256(probe.read_bytes()).digest():
                 raise RuntimeError("fast modernization gate: lint --fix is not idempotent")
 
-        def named_constructor_task() -> None:
-            probe = tmp / "named-constructor.coil"
-            probe.write_text((ROOT / "tests/metaprogramming/named_constructor_lint_input.coil").read_text())
-            execute(coil, "lint", str(probe), "--use", "coil.lint.named-constructor",
-                    "--fix", "--allow-dirty")
+        def default_lint_task() -> None:
+            probe = tmp / "default-lint.coil"
+            probe.write_text((ROOT / "tests/metaprogramming/default_lint_input.coil").read_text())
+            execute(coil, "lint", str(probe), "--fix", "--allow-dirty")
             fixed = probe.read_text()
-            if "(Moved :x 1 :y 2 :at 3)" not in fixed or "(Sized :width" in fixed:
-                raise RuntimeError("fast modernization gate: named-constructor fix changed the wrong constructor")
+            for legacy in ("primitive/icmp-ge", "match-else (", "(Moved 1 2 3)", "(match value"):
+                if legacy in fixed:
+                    raise RuntimeError(f"fast modernization gate: default lint left {legacy!r}")
+            if "(Moved :x 1 :y 2 :at 3)" not in fixed or "try-or!" not in fixed:
+                raise RuntimeError("fast modernization gate: default lint profile did not run every safe fixer")
             execute(coil, "fmt", "--write", str(probe))
             formatted = probe.read_text()
             if not all(part in formatted for part in ("(Moved\n", ":x 1\n", ":y 2\n", ":at 3)")):
@@ -428,7 +430,7 @@ source-roots = ["src"]
             aggregate_ir_task,
             lambda: build_run("src/examples/bitfields.coil", "static-assert", "--backend", "arm64", want=42),
             lint_task,
-            named_constructor_task,
+            default_lint_task,
             broken_lint_task,
             broken_project_task,
         ]

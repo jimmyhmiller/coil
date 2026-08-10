@@ -24,7 +24,8 @@ inside it, so `coil` and every `(import "…")` below work from any directory.
     coil build file.coil -lm             # link a library (-l<name>)
     coil repl                            # interactive session
     coil fmt   file.coil                 # print formatted source (--write / --check)
-    coil lint  file.coil --use my.rules   # run checkers (--diff / --fix applies them)
+    coil lint  file.coil --fix            # apply the standard safe fixes
+    coil lint  file.coil --use my.rules   # add project/policy checkers
     coil doc   file.coil                 # markdown for the module's `;;`-documented surface
     coil namespaces                      # bundled standard-library namespace names
     coil namespace coil.arraylist        # every definition/signature, plus available docs
@@ -1039,8 +1040,8 @@ anywhere, no path or install step:
 `coil.alloc` (allocators), `coil.arraylist`, `coil.hashmap`, `coil.slice`, `coil.str`,
 `coil.mem`, `coil.io`, `coil.fmt`, `coil.print`, `coil.fs` (files), `coil.result`
 (Option/Result), `coil.control` (case/while/for/…), `coil.match` (deprecated: its
-`match-else` is now just `match` with a `_` arm — `coil lint --use coil.lint.match-else
---fix` rewrites calls), `coil.try`,
+`match-else` is now just `match` with a `_` arm — plain `coil lint --fix` rewrites
+calls), `coil.try`,
 `coil.thread`, `coil.atomic`, `coil.simd`, `coil.closure`, `coil.derive`, `coil.mmio`,
 `coil.reader` (THE s-expression reader — the one the compiler itself uses), `coil.json` (zero-copy token-tape parser), `coil.serde` +
 `coil.serde.derive`/`coil.serde.json`/`coil.serde.sexp`/`coil.serde.msgpack`/
@@ -1056,6 +1057,9 @@ SSE and other long responses),
 the `Arbitrary` trait, tape-based shrinking — see above), `coil.dbgalloc`, `coil.guardalloc`, `coil.crash`,
 `coil.debug-runtime`, `coil.checked-ffi`, and `coil.stacklint`, plus `coil.os`,
 `coil.time`, `coil.selectors`, `coil.subprocess`,
-`coil.process`, and `coil.lint.result-flow` for hosted system programming and Result
-flow migration. The common ones are summarized above; import a module and call
+`coil.process`, and the standard `coil.lint.default` safe-fix profile. Plain
+`coil lint` automatically loads `coil.modernize`, `coil.lint.match-else`,
+`coil.lint.result-flow`, and `coil.lint.named-constructor` through that profile;
+allocator-composition and stack checks remain opt-in policy/debug checks. The common
+ones are summarized above; import a module and call
 its functions directly.

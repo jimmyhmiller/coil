@@ -33,11 +33,11 @@ They keep system code linear:
       0)))
 ```
 
-For existing code, importing `coil.lint.result-flow` enables a checker and safe fix:
+For existing code, the standard lint profile includes the Result-flow checker and safe fix:
 
 ```text
-coil lint app.coil --use coil.lint.result-flow --diff
-coil lint app.coil --use coil.lint.result-flow --fix
+coil lint app.coil --diff
+coil lint app.coil --fix
 ```
 
 It rewrites only `Result` matches whose ignored `Err` arm is a plain fallback. If the
