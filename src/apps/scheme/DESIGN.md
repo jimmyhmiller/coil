@@ -8,7 +8,7 @@
 That is the whole idea. One import, and Scheme works — compiled to native code
 through Coil's ordinary pipeline.
 
-## There is no compiler and no interpreter
+## Native by default; an explicit machine only where control is captured
 
 **Scheme syntax is already Coil syntax.** Both are s-expressions read by the same
 reader; `(define (fib n) …)` parses today, unmodified. What is missing is not a
@@ -21,10 +21,13 @@ So `define` is a macro. It expands to `defn`. `lambda` expands to a closure,
 `let` to a `let`, `cond` to nested `if`. Scheme's forms become Coil's forms at
 expansion time, and what reaches codegen is an ordinary Coil program.
 
-This is not a transpiler emitting text, and not an evaluator walking a tree. It
-is the language's existing macro system with an R5RS surface bound to it. Proven
-in ~6 lines: a `define` macro over `defn` compiles `(fib 32)` to native code that
-runs in **7 ms**, against Chez's 54 ms — because it *is* native code.
+This is not a transpiler emitting text. Continuation-free programs use the
+language's existing macro system with an R5RS surface bound to it and compile as
+ordinary native Coil. A plain `.scm` entry that uses `call/cc`, `dynamic-wind`,
+`eval`, or `load` is instead materialized as Scheme data and executed by the
+portable CEK machine in `eval.coil`. That selective route is necessary because a
+native return address cannot provide unlimited, multi-shot extent. It does not
+tax the ordinary compiled fast path.
 
 ## The three pillars
 
@@ -90,15 +93,14 @@ compiled path remains the default for programs that do not capture control.
 
 - **Proper tail calls (§3.5)** are implemented for direct, cross-arity, computed,
   first-class, `apply`, and `call-with-values` tail calls.
-- **`call/cc` (§6.4) and `dynamic-wind`** are being implemented with immutable,
-  GC-traced heap frames. The continuation-aware evaluator already proves
-  post-return multi-shot re-entry without copying the native stack; public
-  compiled-source routing and dynamic-wind transitions remain incomplete.
+- **`call/cc` (§6.4) and `dynamic-wind`** use immutable, GC-traced heap frames.
+  The machine supports unlimited post-return multi-shot re-entry, computes
+  shared dynamic extents for correctly ordered `before`/`after` transitions,
+  and keeps `eval`, derived syntax, promises, `load`, and ambient file ports in
+  the same continuation protocol.
 
-Continuation conformance cases remain under `tests/scheme/out-of-scope/`, so the gap
-stays visible and measured rather than quietly forgotten. Escape-only
-continuations remain a possible *separate* feature; they are not a partial
-`call/cc`.
+The former continuation conformance cases are now public bounded-gate cases:
+`03-callcc.scm`, `03-callcc-tail.scm`, and `04-dynamic-wind.scm`.
 
 **Still hard:**
 
@@ -130,5 +132,8 @@ The live feature-by-feature ledger and application acceptance target are in
 
 ## Status
 
-Runtime pieces, tested: `value.coil` (6), `heap.coil` (5), `symbol.coil` (5).
-Next: bind the R5RS surface as macros and get the conformance cases moving.
+The bounded Scheme gate covers 11 implementation suites, 22 public oracle
+programs, all 201 first-class report procedures with no deferred entries, 39
+negative cases, and two larger Scheme applications. The detailed current ledger
+is the linked `R5RS_STATUS.md`; do not infer current status from historical test
+counts in old commits.

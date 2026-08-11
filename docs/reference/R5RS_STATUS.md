@@ -4,10 +4,9 @@ This is the working definition of “done” for Coil's native Scheme dialect.  
 feature is **verified** only when it passes through a module importing
 `coil.scheme`; implementation-unit coverage alone is not enough.
 
-The deliberate deferrals are `call-with-current-continuation` / `call/cc` and
-full `dynamic-wind`.  Everything else in R5RS remains in scope.  Historical
-deferral cases live in `tests/scheme/out-of-scope/` so they cannot quietly
-disappear; proper tail recursion has now graduated into the bounded gate.
+There are no deliberately deferred R5RS procedures. Continuations and proper
+tail recursion have graduated into the bounded gate; the old tail-call case in
+`tests/scheme/out-of-scope/` remains only as implementation-history provenance.
 
 ## Continuously runnable gates
 
@@ -25,8 +24,8 @@ native dialect programs that use only the public Scheme surface, compared
 byte-for-byte with oracle-blessed R5RS output. Cases 01, 05, 06, 07, and 09 plus the
 focused closure/recursion, exact-integer/rational, and mixed-flonum programs are gated now; none has an
 `scm-*` runtime escape hatch. The same gate also builds and runs the larger
-metacircular evaluator and Lox interpreter applications. As of 2026-08-10 this is
-10 implementation suites (173 tests), 22 public oracle programs, 39 negative
+metacircular evaluator and Lox interpreter applications. As of 2026-08-11 this is
+11 implementation suites (191 tests), 22 public oracle programs, 39 negative
 cases (module visibility; malformed ordinary and peculiar identifier tokens, bare-dot, dotted-vector, and
 incomplete-abbreviation reader diagnostics; unmatched runtime syntax; and
 general/integer zero-divisor diagnostics; malformed, duplicate-variable, and
@@ -37,8 +36,10 @@ malformed exactness combinations), and 2
 applications.
 `--corpus` additionally downloads the pinned, GPL-licensed Jaffer
 R4RS/R5RS suite into a temporary directory and drives all 644 top-level forms
-through Coil's runtime reader and evaluator. The current audit passes with six
-continuation-dependent forms skipped. It explicitly removes the suite's
+through Coil's runtime reader and continuation evaluator. The current audit no
+longer excludes continuation forms and explicitly invokes the upstream
+multi-shot leaf-generator, delay/force, and Scheme-4 groups. Three forms using
+the suite-local `list-length` extension are skipped. It explicitly removes the suite's
 nonstandard `ash` checks and deep tail-recursive floating-printer stress test;
 ordinary inexact arithmetic, exact bignums, mixed exact/inexact comparisons,
 ports, reader behavior, and report procedures remain covered. The corpus is an
@@ -59,20 +60,19 @@ explicitly deferred:
 the `clock` native function, IEEE-754 NaN-producing zero division, five
 bytecode-VM resource limits that do not apply to this tree walker, and an
 explicit recursion-depth guard. No fixture is unclassified.
-The gate also generates an executable section-6 inventory: all 198 implemented
-R5RS procedures must be exported and usable in first-class position. Its only
-excluded procedures are the explicitly deferred continuation/dynamic-wind set;
-there are currently no unclassified in-scope procedure omissions.
+The gate also generates an executable section-6 inventory: all 201 R5RS
+procedures must be exported and usable in first-class position. The deferred and
+unclassified procedure sets are both empty.
 `--bench` compares native programs with Chez and Petite. `--lox-bench` runs the
 same portable Scheme Lox interpreter and five allocation/compute workloads on
 Coil and Chez, rejecting output mismatches before reporting timings. `--all`
 additionally runs the compiler's bounded
 `modernize-fast` gate; it does not perform the final `build full` release step.
 
-Latest min-of-5 benchmark check (2026-08-10, identical answers): Coil/Chez was
-1.25x for the compute-dominant exact-bignum `bigfact` workload,
-0.98x for `bintree`, 0.25x for `fib`, 0.48x for `gcchurn`, 0.72x for `listrev`,
-and 0.65x for `listsum` (lower is faster). The arithmetic surface emits its
+Latest min-of-5 benchmark check (2026-08-11, identical answers): Coil/Chez was
+1.18x for the compute-dominant exact-bignum `bigfact` workload,
+0.97x for `bintree`, 0.23x for `fib`, 0.38x for `gcchurn`, 0.49x for `listrev`,
+and 0.68x for `listsum` (lower is faster). The arithmetic surface emits its
 guarded fixnum path at the call site and retains the complete numeric tower as a
 cold fallback; this moved the previously lagging bintree case ahead of Chez.
 `bigfact` exposed a mixed bignum×fixnum path that copied every growing limb list
@@ -90,7 +90,7 @@ portable performance claims; rerun them on the target machine before quoting.
 | R5RS area | status | evidence / remaining work |
 |---|---|---|
 | literals, variables, quote | verified core | dialect tests include recursively materialized quoted strings/lists, decimal flonums, radix/exactness-prefixed and complex numbers, source `#(...)` vectors, case-insensitive identifiers (including exports and calls across Scheme modules), booleans, and named ASCII characters; runtime `read` case-folds identifiers and multi-character character names while preserving the case of single-character literals such as `#\A`, gates every R5RS special-initial and special-subsequent character plus all three peculiar identifiers, and rejects malformed numeric-looking and peculiar-prefixed tokens; a generated matrix gates deterministic diagnostics for malformed lists/dotted lists, strings/escapes, characters, booleans, prefixed numbers, sharp syntax, and datum abbreviations; a forced-threshold test proves partial reader structures survive collection |
-| procedure calls and evaluation | verified core | native calls; fixed and variadic top-level Scheme procedures—including exported procedures imported with `:use *`—reified in value position while direct calls retain the typed fast path; a negative oracle proves private imported definitions remain inaccessible; lexical shadowing of user and standard procedure names; variadic call-site lowering; fixed-arity primitive values including zero-argument procedures; variadic `+`/`*` reducers; and general argument-list procedure values for arithmetic/comparisons, collections, higher-order operations, optional constructors/conversions, `atan`, and optional-port I/O; direct, first-class, and eval comparison arity agree, calls of non-procedure values fail deterministically instead of dereferencing tagged data, and zero-argument `max`/`min` are rejected rather than returning unspecified; the generated 198-procedure first-class inventory is complete and continuously gated |
+| procedure calls and evaluation | verified core | native calls; fixed and variadic top-level Scheme procedures—including exported procedures imported with `:use *`—reified in value position while direct calls retain the typed fast path; a negative oracle proves private imported definitions remain inaccessible; lexical shadowing of user and standard procedure names; variadic call-site lowering; fixed-arity primitive values including zero-argument procedures; variadic `+`/`*` reducers; and general argument-list procedure values for arithmetic/comparisons, collections, higher-order operations, optional constructors/conversions, `atan`, optional-port I/O, and continuations; direct, first-class, and eval comparison arity agree, calls of non-procedure values fail deterministically instead of dereferencing tagged data, and zero-argument `max`/`min` are rejected rather than returning unspecified; the generated 201-procedure first-class inventory is complete and continuously gated |
 | `eval` and environments | broad R5RS surface verified | fresh R5RS report/null environments and a persistent interaction environment are public-oracle gated and forced-collection tested; runtime evaluation covers core syntax, lexical/variadic closures, recursion, mutation, `and`, `or`, `let`, named `let`, `let*`, `letrec`, `cond` including `=>`, `case`, `do`, `delay`/`force`, nested/splicing/vector quasiquote, and hygienic datum-level `define-syntax`, `let-syntax`, and mutually recursive `letrec-syntax`; runtime `syntax-rules` gates ordered rules, literals with use-site shadowing, `_`, ellipsis, vectors, introduced-binder hygiene, and definition-site free identifiers; its report environment exposes the major numeric, list, higher-order, string, vector, character, conversion, and port procedure families, including `char-ready?`; `load` sequentially evaluates definitions and syntax definitions in one persistent environment |
 | `lambda` and lexical closures | arbitrary fixed and variadic formals verified | dotted and symbol-only formals, mutable/shared captures, recursive `letrec`, direct and computed calls, internal definition regions, and arbitrary-length `apply`; arities 0–6 retain typed fast dispatch while higher fixed arities use the GC-safe argument-list ABI; immediately applied simple lambdas remain allocation-free while literals whose bodies introduce closures take the full closure path |
 | `if`, `begin`, `define`, `set!` | verified core | globals; R5RS internal variable and procedure definitions lowered to one letrec scope, including mutual recursion, lexical shadowing, and immediate-lambda bodies; ordinary lexical mutation, mutable parameters, and shared mutation of captured bindings across sibling closures are gated; only bindings proven mutable are cell-boxed, leaving immutable `let` allocation-free |
@@ -102,7 +102,7 @@ portable performance claims; rerun them on the target machine before quoting.
 | quasiquote | verified syntax and semantics | public oracle uses R5RS backquote, comma, `,@`, and `#(...)` directly and covers nesting, splicing, dotted tails, and vector results |
 | `define-syntax` / `syntax-rules`, `let-syntax`, `letrec-syntax` | implemented in compiled and runtime-evaluated Scheme with lexical keyword shadowing and recursive local groups | compiled and runtime paths gate rule order, literals, `_`, list and vector patterns/templates, arbitrary cumulative ellipsis depth, repeated binding templates, fixed tails, recursion, binder-capture hygiene, and definition-site free references; compiled literal matching compares definition/use binding identities across `let`, lambda, and local-syntax scopes rather than names; declarations reject structurally malformed rules and duplicate pattern variables, while template expansion rejects ellipses without a repeated pattern variable; runtime eval/load additionally gates mutually recursive local syntax |
 | proper tail recursion | verified across the compiled procedure surface | direct mutual calls with differing arities run 10 million steps through the native `swifttailcc` ABI; computed/first-class closures run 10 million steps through a traced request trampoline whose loop is native `musttail`; focused public oracles additionally cover tail calls through `apply`, `call-with-values`, fixed and variadic closures, conditionals, and sequencing. The historical `02-tail-calls.scm` deferral is retained as provenance, not current status |
-| continuations | implementation in progress | immutable traced continuation frames and a portable continuation-aware evaluator now pass escape, post-return multi-shot re-entry, repeated invocation, and forced-GC retention tests; the public compiled Scheme surface remains deferred until the continuation machine covers every core evaluation context and the dialect can route continuation-using regions through it; explicit end-to-end cases remain `03-callcc.scm` and `04-dynamic-wind.scm` |
+| continuations and `dynamic-wind` | verified on the public `.scm` path | immutable traced heap frames provide unlimited-extent, multi-shot `call/cc`; public cases cover escape, post-return repeated re-entry, generators, higher-order callbacks, 200,000 tail steps across collection thresholds, and first-class aliases. `dynamic-wind` compares shared frame suffixes and runs exits inner-to-outer and entries outer-to-inner, including continuations invoked by `after` and escapes from `before`. Continuation-aware `eval`, runtime `syntax-rules`, derived forms, quasiquote, promises, `load`, and file-port dynamic extents are focused-unit gated. Continuation-free files retain the direct native lowering path. |
 
 ## Procedure status
 
@@ -132,8 +132,9 @@ Verified or substantially covered today:
   proper/improper lists, vectors, symbols, arbitrary exact integers/rationals,
   decimal inexact numbers, numeric radix/exactness prefixes, and quote prefixes
 - file combinators: `call-with-input-file`, `call-with-output-file`,
-  `with-input-from-file`, `with-output-to-file` (ordinary-return restoration;
-  non-local restoration awaits the deferred continuation work)
+  `with-input-from-file`, `with-output-to-file`; ambient ports restore on
+  non-local exit, reopen with stable Scheme-object identity on re-entry, and
+  restore/close on ordinary completion
 - system interface: `load` reads and evaluates every datum in a shared explicit
   environment or, by default, the persistent interaction environment; direct,
   rebound first-class, and `apply` invocation are public-oracle gated
@@ -264,8 +265,7 @@ wrong call arity, calls of non-callable values, invalid operand types, division
 by zero, property
 access on non-instances, and missing properties. Evaluation stops safely after
 the first runtime diagnostic, while parser and resolver recovery can retain
-independent static errors, without depending on the deferred continuation
-surface.
+independent static errors, without using continuations as an exception system.
 
 Overall pinned corpus coverage is 238/246, with all eight remaining cases
 explicitly classified rather than unknown. The useful non-bytecode follow-ups

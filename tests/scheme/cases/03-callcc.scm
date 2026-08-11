@@ -1,4 +1,4 @@
-; Phase 1: full re-entrant call/cc. An escape-only (one-shot, downward)
+; Full re-entrant call/cc. An escape-only (one-shot, downward)
 ; implementation passes the first two forms and fails everything after them —
 ; which is exactly the point: escape-only is NOT R5RS-conformant.
 
@@ -46,3 +46,14 @@
 ; so the test measures the generator, not the host's argument order.
 (let* ((a (g)) (b (g)) (c (g)) (d (g)))
   (display (list a b c d)) (newline))
+
+; The report bindings are ordinary first-class procedures, and higher-order
+; callbacks stay inside the continuation machine.
+(define cc call/cc)
+(display (procedure? cc)) (newline)
+(display (cc (lambda (escape) (escape 7)))) (newline)
+(display
+  (call/cc
+    (lambda (escape)
+      (map (lambda (x) (if (= x 2) (escape 'map-escaped) x)) '(1 2 3)))))
+(newline)
