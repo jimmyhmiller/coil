@@ -25,7 +25,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 BENCH = Path(__file__).resolve().parent
-COIL = ROOT / "build/bin/coil"
+DEFAULT_COIL = ROOT / "build/bin/coil"
 
 # Reference implementations. Chez is the target; Petite is Chez's *interpreter*,
 # included because beating an interpreter proves nothing — the meaningful line is
@@ -59,14 +59,17 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--filter", default="", help="substring match on case name")
     ap.add_argument("--repeat", type=int, default=5, help="min-of-N (default 5)")
+    ap.add_argument("--compiler", default=str(DEFAULT_COIL),
+                    help="Coil compiler candidate (default: build/bin/coil)")
     args = ap.parse_args()
+    coil = Path(args.compiler).expanduser().resolve()
 
     cases = sorted(p for p in BENCH.glob("*.scm") if args.filter in p.name)
     if not cases:
         print("no cases under tests/scheme/bench/", file=sys.stderr)
         return 1
-    if not COIL.is_file():
-        print(f"compiler not built: {COIL}", file=sys.stderr)
+    if not coil.is_file():
+        print(f"compiler not built: {coil}", file=sys.stderr)
         return 1
 
     print(f"{'case':<18}{'coil':>10}{'chez':>10}{'petite':>10}   {'vs chez':>9}  answer")
@@ -83,7 +86,7 @@ def main() -> int:
             # -lm: the Linux link line (scripts/compiler/llvm-link-flags.sh) does
             # not include libm, so anything reaching `floor` fails to link. Inert
             # on macOS, where libm is part of libSystem.
-            build = subprocess.run([str(COIL), "build", str(driver), "-o", str(exe),
+            build = subprocess.run([str(coil), "build", str(driver), "-o", str(exe),
                                     "--link-flag", "-lm"],
                                    capture_output=True, text=True, timeout=600)
             results["coil"] = time_run([str(exe)], args.repeat) if build.returncode == 0 else None
@@ -97,8 +100,9 @@ def main() -> int:
             r = results.get(key)
             return f"{r[0] * 1000:9.1f}ms" if r else "        —"
 
-        coil, chez = results.get("coil"), results.get("chez")
-        ratio = f"{coil[0] / chez[0]:8.2f}x" if coil and chez and chez[0] > 0 else "        —"
+        coil_result, chez_result = results.get("coil"), results.get("chez")
+        ratio = (f"{coil_result[0] / chez_result[0]:8.2f}x"
+                 if coil_result and chez_result and chez_result[0] > 0 else "        —")
 
         # A speed comparison between programs computing different things is
         # meaningless, so disagreement is reported instead of timed.

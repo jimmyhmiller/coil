@@ -101,7 +101,11 @@
 ;; a loop: `mk-fixnum`, `mk-bool`, `mk-char`, the singletons and the accessors all
 ;; touch no heap, so a program doing arithmetic pays nothing.
 (defn rt--non-allocating? [(h Code)] (-> bool)
-  (rt--member? h `(mk-fixnum mk-char mk-bool s-nil s-true s-false s-unspecified s-eof s-undefined fixnum-value char-value car cdr truthy? is-null val-eq?) 0))
+  ;; `scm-collected` is also syntax-significant: the variadic-call pass must see
+  ;; it directly in the final argument position.  Treating the identity marker
+  ;; as allocating A-normalizes it into a temporary and makes that pass collect
+  ;; an already-collected rest list a second time.
+  (rt--member? h `(mk-fixnum mk-char mk-bool s-nil s-true s-false s-unspecified s-eof s-undefined fixnum-value char-value car cdr truthy? is-null val-eq? scm-collected) 0))
 
 ;; Linear membership over a quoted name list — clearer than a 16-deep `or`, and
 ;; the list is the documentation: these are the operations that touch no heap.
@@ -159,14 +163,15 @@
 ;; into their binders would corrupt them.
 (defn rt--syntax? [(h Code)] (-> bool)
   (or (rt--binder-list-form? h)
-      (or (primitive/code-eq h `if)
+          (or (primitive/code-eq h `if)
           (or (primitive/code-eq h `do)
               (or (primitive/code-eq h `scm-case)
-                  (or (primitive/code-eq h `cond)
+                      (or (primitive/code-eq h `cond)
+                      (or (primitive/code-eq h `scm-quasiquote)
                       (or (primitive/code-eq h `quote)
                           (or (primitive/code-eq h `loop)
                               (or (primitive/code-eq h `break)
-                                  (primitive/code-eq h `continue))))))))))
+                                  (primitive/code-eq h `continue)))))))))))
 
 ;; Does evaluating `e` reach an allocation? Over-approximates: any call whose head
 ;; is not on the immediate list counts, and so does any subexpression containing
@@ -214,34 +219,78 @@
   (if (primitive/icmp-ge i n) `()
     `(~(rt--expr (primitive/code-nth e i)) ~@(rt--all e (primitive/iadd i 1) n))))
 
+;; Preserve a case clause's datum head while rooting its body. The dialect has
+;; already lowered Scheme binders by this point, so these bodies are ordinary
+;; executable forms and must not remain opaque to the collector transform.
+(defn rt--case-clauses [(e Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `()
+    (let [clause (primitive/code-nth e i)]
+      `((~(primitive/code-nth clause 0)
+         ~@(rt--all clause 1 (primitive/code-count clause)))
+        ~@(rt--case-clauses e (primitive/iadd i 1) n)))))
+
 ;; Rewrite a body: every form but the last as an ordinary expression, the last in
 ;; TAIL position. Declared here, defined after `rt--tail` — the file is one
 ;; mutually recursive group and Coil resolves forward references at module scope.
-(defn rt--body-tail [(sp Code) (e Code) (i i64) (n i64)] (-> Code)
+(defn rt--body-tail-mode [(sp Code) (e Code) (i i64) (n i64) (requests bool)] (-> Code)
   (if (primitive/icmp-ge i n) `()
     (if (primitive/icmp-eq i (primitive/isub n 1))
-        `(~(rt--tail (primitive/code-nth e i) sp))
+        `(~(rt--tail-mode (primitive/code-nth e i) sp requests))
       `(~(rt--expr (primitive/code-nth e i))
-        ~@(rt--body-tail sp e (primitive/iadd i 1) n)))))
+        ~@(rt--body-tail-mode sp e (primitive/iadd i 1) n requests)))))
+(defn rt--body-tail [(sp Code) (e Code) (i i64) (n i64)] (-> Code)
+  (rt--body-tail-mode sp e i n false))
 
 ;; `let` bindings whose init allocates are rooted too — an evaluator binds many
 ;; intermediates that must survive later allocations, and a binding is exactly the
 ;; construct that keeps a value alive across them.
-(defn rt--binds [(bs Code) (i i64) (n i64) (body Code)] (-> Code)
-  (if (primitive/icmp-ge i n) `(do ~@body)
+(defn rt--binds [(head Code) (bs Code) (i i64) (n i64) (placed Code)
+                 (body Code)] (-> Code)
+  (if (primitive/icmp-ge i n)
+      `(~head (~@placed) ~@(rt--all body 0 (primitive/code-count body)))
     (let [b (primitive/code-nth bs i)
           nm (primitive/code-nth b 0)
           init (primitive/code-nth b 1)
-          rest (rt--binds bs (primitive/iadd i 2) n body)]
-      (if (rt--allocates? init)
-          `(let [~nm ~(rt--expr init)] (gc-root ~nm) ~rest)
-        `(let [~nm ~(rt--expr init)] ~rest)))))
+          g (primitive/gensym)]
+      ;; Lift each initializer into a fresh host binding. This preserves Scheme
+      ;; `let`'s simultaneous scope (no user binder is visible to a later init),
+      ;; while making every completed value a root before the next init runs.
+      `(let [~g ~(rt--expr init)]
+         (gc-root ~g)
+         ~(rt--binds head bs (primitive/iadd i 1) n
+                     `(~@placed (~nm ~g)) body)))))
+
+;; `let*` is sequential, so the actual Scheme binder must become visible after
+;; each initializer. A chain of one-binding host lets has exactly those semantics
+;; and gives us a point to root each value before evaluating the next initializer.
+(defn rt--binds-sequential [(bs Code) (i i64) (n i64) (body Code)] (-> Code)
+  (if (primitive/icmp-ge i n) `(do ~@(rt--all body 0 (primitive/code-count body)))
+    (let [b (primitive/code-nth bs i)
+          nm (primitive/code-nth b 0)
+          init (primitive/code-nth b 1)]
+      `(let [~nm ~(rt--expr init)]
+         (gc-root ~nm)
+         ~(rt--binds-sequential bs (primitive/iadd i 1) n body)))))
+
+;; Surface Scheme binders are a list of two-element binding lists. Forms already
+;; lowered to Coil use a flat vector instead; indexing one of its symbols as a
+;; pair is a metaprogram crash, so distinguish the representations explicitly.
+(defn rt--binding-pairs? [(bs Code) (i i64) (n i64)] (-> bool)
+  (if (primitive/icmp-ge i n) true
+    (let [b (primitive/code-nth bs i)]
+      (and (primitive/code-list? b)
+           (and (primitive/icmp-ge (primitive/code-count b) 2)
+                (rt--binding-pairs? bs (primitive/iadd i 1) n))))))
 
 (defn rt--expr [(e Code)] (-> Code)
   (if (not (primitive/code-list? e)) e
     (if (primitive/icmp-eq (primitive/code-count e) 0) e
       (let [h (primitive/code-nth e 0)]
-        (if (primitive/code-eq h `quote) e
+        ;; `quote-data` is forms.coil's lowered quote. Its argument is still raw
+        ;; datum syntax until the ordinary macro expander materializes it, so it
+        ;; must be shielded exactly like surface `quote`. Descending here turned
+        ;; `(quote (a b c))` into a call to an undefined procedure `a`.
+        (if (or (primitive/code-eq h `quote) (primitive/code-eq h `quote-data)) e
           ; syntax: rewrite the subexpressions, never the head or a binder
           ;
           ; ⚠ `scm-let` BELONGS HERE TOO, AND LEAVING IT OUT SILENTLY DELETED
@@ -271,9 +320,45 @@
           ;; which is the next piece of work here.
           (if (and (primitive/code-eq h `scm-case) (primitive/icmp-ge (primitive/code-count e) 2))
               `(~h ~(rt--expr (primitive/code-nth e 1))
-                   ~@(rt--verbatim e 2 (primitive/code-count e)))
+                   ~@(rt--case-clauses e 2 (primitive/code-count e)))
           (if (and (primitive/code-eq h `cond) (primitive/icmp-ge (primitive/code-count e) 1))
               `(~h ~@(rt--verbatim e 1 (primitive/code-count e)))
+          ;; Procedure constructors carry raw function-pointer expressions and
+          ;; arity metadata. Neither is a Scheme Val that may be pushed onto the
+          ;; GC shadow stack; the constructed procedure is rooted by its caller.
+          (if (or (primitive/code-eq h `make-procedure)
+                  (or (primitive/code-eq h `make-reducer)
+                      (primitive/code-eq h `make-list-procedure)))
+              e
+          (if (and (primitive/code-eq h `scm-quasiquote)
+                   (= (primitive/code-count e) 2))
+              e
+          ;; `scm-do`'s termination clause is a LIST OF EXPRESSIONS, not one
+          ;; application. Preserve that container while rooting each test/result
+          ;; independently; treating it as a call makes the lowered test's `let`
+          ;; become a callee and eventually emits a vector in expression position.
+          (if (and (primitive/code-eq h `scm-do) (primitive/icmp-ge (primitive/code-count e) 3))
+              `(~h ~(primitive/code-nth e 1)
+                   (~@(rt--all (primitive/code-nth e 2) 0
+                               (primitive/code-count (primitive/code-nth e 2))))
+                   ~@(rt--all e 3 (primitive/code-count e)))
+          (if (and (or (primitive/code-eq h `let)
+                       (primitive/code-eq h `scm-let))
+                   (primitive/icmp-ge (primitive/code-count e) 2))
+              (let [bs (primitive/code-nth e 1)
+                    bn (primitive/code-count bs)]
+                (if (rt--binding-pairs? bs 0 bn)
+                    (rt--binds h bs 0 bn `()
+                               (rt--verbatim e 2 (primitive/code-count e)))
+                  `(~h ~bs ~@(rt--all e 2 (primitive/code-count e)))))
+          (if (and (primitive/code-eq h `let*)
+                   (primitive/icmp-ge (primitive/code-count e) 2))
+              (let [bs (primitive/code-nth e 1)
+                    bn (primitive/code-count bs)]
+                (if (rt--binding-pairs? bs 0 bn)
+                    (rt--binds-sequential
+                      bs 0 bn (rt--verbatim e 2 (primitive/code-count e)))
+                  `(~h ~bs ~@(rt--all e 2 (primitive/code-count e)))))
           (if (and (rt--binder-list-form? h) (primitive/icmp-ge (primitive/code-count e) 2))
               `(~h ~(primitive/code-nth e 1)
                    ~@(rt--all e 2 (primitive/code-count e)))
@@ -285,7 +370,7 @@
               (if (rt--bool-head? h)
                   `(~h ~@(rt--all e 1 (primitive/code-count e)))
                 ; an ordinary call: A-normalize the arguments
-                (rt--args h e 1 (primitive/code-count e) `())))))))))))
+                (rt--args h e 1 (primitive/code-count e) `()))))))))))))))))
 
 ;; ── TAIL POSITION: RESET THE SHADOW STACK BEFORE THE CALL ───────────────────
 ;;
@@ -370,29 +455,78 @@
 ;; reason given at `rt--tail-call`: the callee returns to OUR caller, so nothing
 ;; can read our roots again.
 
+(defn rt--dynamic-call-name? [(name (slice u8)) (bare (slice u8))
+                              (qualified (slice u8))] (-> bool)
+  (or (str-eq name bare) (str-eq name qualified)))
+
+(defn rt--dynamic-tail? [(h Code)] (-> bool)
+  ;; Lambda lifting introduces these heads hygienically, so their stored name is
+  ;; normally the canonical stdproc identity rather than the source spelling.
+  ;; `code-eq` against a rooting-module literal therefore misses exactly the
+  ;; generated closure calls this predicate exists to trampoline.
+  (if (not (primitive/code-sym? h)) false
+    (let [name (primitive/code-str h)]
+      (or (rt--dynamic-call-name? name "call--0" "coil.scheme.stdproc.call--0")
+          (or (rt--dynamic-call-name? name "call--1" "coil.scheme.stdproc.call--1")
+              (or (rt--dynamic-call-name? name "call--2" "coil.scheme.stdproc.call--2")
+                  (or (rt--dynamic-call-name? name "call--3" "coil.scheme.stdproc.call--3")
+                      (or (rt--dynamic-call-name? name "call--4" "coil.scheme.stdproc.call--4")
+                          (or (rt--dynamic-call-name? name "call--5" "coil.scheme.stdproc.call--5")
+                              (rt--dynamic-call-name? name "call--6"
+                                                      "coil.scheme.stdproc.call--6"))))))))))
+(defn rt--tail-arg-list [(e Code) (i i64) (n i64)] (-> Code)
+  (if (primitive/icmp-ge i n) `(s-nil)
+    `(cons ~(primitive/code-nth e i)
+           ~(rt--tail-arg-list e (primitive/iadd i 1) n))))
+(defn rt--dynamic-request [(e Code) (sp Code)] (-> Code)
+  ;; `(call--N proc arg...)` -> a traced `(proc . args)` request. Feed the new
+  ;; call back through rt--tail-call so allocation in the argument list is
+  ;; A-normalized/rooted before this frame is dropped.
+  (rt--tail-call
+    `(scm-tail-request-list ~(primitive/code-nth e 1)
+                        ~(rt--tail-arg-list e 2 (primitive/code-count e)))
+    sp))
+
 ;; Rewrite `e` in TAIL position. Only the forms that PROPAGATE tail position are
 ;; descended into as tail — `if`'s branches (not its test), and the last form of
-;; a `do`. Everything else is an ordinary expression that must pop before it
-;; returns its value.
-(defn rt--tail [(e Code) (sp Code)] (-> Code)
+;; a `do`. Surface `scm-let` is deliberately excluded: at this phase a locally
+;; bound call has not yet been lowered to dynamic dispatch, so treating its head
+;; as a statically known tail callee changes variadic argument packaging.
+(defn rt--tail-mode [(e Code) (sp Code) (requests bool)] (-> Code)
   (if (not (primitive/code-list? e)) (rt--return e sp)
     (if (primitive/icmp-eq (primitive/code-count e) 0) (rt--return e sp)
       (let [h (primitive/code-nth e 0)]
         ; `if`: the TEST is not in tail position, both BRANCHES are
+        (if (and requests (rt--dynamic-tail? h)) (rt--dynamic-request e sp)
+        (if (and requests (primitive/code-eq h `scm-apply-args))
+            (rt--tail-call `(scm-tail-request-apply-args ~(primitive/code-nth e 1)) sp)
+        (if (and requests (primitive/code-eq h `call-with-values))
+            (rt--tail-call
+              `(scm-tail-call-with-values ~(primitive/code-nth e 1)
+                                          ~(primitive/code-nth e 2)) sp)
+        ;; Lambda lifting uses host-vector lets for variadic/rest bindings and
+        ;; captured-environment setup. Their final body expression is still a
+        ;; Scheme tail context; preserving the vector verbatim avoids treating
+        ;; `(name init)` metadata as calls.
+        (if (and (primitive/code-eq h `let)
+                 (and (primitive/icmp-ge (primitive/code-count e) 3)
+                      (primitive/code-vector? (primitive/code-nth e 1))))
+            `(let ~(primitive/code-nth e 1)
+               ~@(rt--body-tail-mode sp e 2 (primitive/code-count e) requests))
         (if (and (primitive/code-eq h `if) (primitive/icmp-ge (primitive/code-count e) 3))
             (if (primitive/icmp-ge (primitive/code-count e) 4)
                 `(if ~(rt--expr (primitive/code-nth e 1))
-                     ~(rt--tail (primitive/code-nth e 2) sp)
-                   ~(rt--tail (primitive/code-nth e 3) sp))
+                     ~(rt--tail-mode (primitive/code-nth e 2) sp requests)
+                   ~(rt--tail-mode (primitive/code-nth e 3) sp requests))
               ;; A one-armed `if` in tail position: the implicit false branch
               ;; yields the unspecified value and must ALSO pop, or that path
               ;; leaks the frame's roots for the rest of the program.
               `(if ~(rt--expr (primitive/code-nth e 1))
-                   ~(rt--tail (primitive/code-nth e 2) sp)
+                   ~(rt--tail-mode (primitive/code-nth e 2) sp requests)
                  ~(rt--return `(s-unspecified) sp)))
           ;; `do` in tail position: only its LAST form is tail.
           (if (and (primitive/code-eq h `do) (primitive/icmp-ge (primitive/code-count e) 2))
-              `(do ~@(rt--body-tail sp e 1 (primitive/code-count e)))
+              `(do ~@(rt--body-tail-mode sp e 1 (primitive/code-count e) requests))
             ;; ANY ordinary call in tail position — self or not — pops before it
             ;; jumps. Syntax forms and bool-returning predicates are excluded:
             ;; the former are not calls, and the latter yield a raw `bool` that
@@ -400,9 +534,13 @@
             (if (and (primitive/code-sym? h)
                      (and (not (rt--syntax? h))
                           (and (not (rt--bool-head? h))
-                               (not (primitive/code-eq h `quote)))))
+                               (and (not (primitive/code-eq h `quote))
+                                    (not (primitive/code-eq h `quote-data))))))
                 (rt--tail-call e sp)
-              (rt--return e sp))))))))
+              (rt--return e sp))))))))))))
+
+(defn rt--tail [(e Code) (sp Code)] (-> Code)
+  (rt--tail-mode e sp false))
 
 ;; A non-tail-call exit: evaluate the value, pop the frame, return the value.
 ;; The binding is required — `(do VALUE (gc-sp-set! $sp))` would return the pop's
@@ -436,9 +574,16 @@
 ;;
 ;; The marker is the body's own shape — a `let` whose first init is `(gc-sp)` is
 ;; one this pass emitted, and nothing else produces it.
+(defn rt--defn-cc? [(f Code)] (-> bool)
+  (and (primitive/icmp-ge (primitive/code-count f) 4)
+       (primitive/code-eq (primitive/code-nth f 2) `:cc)))
+(defn rt--defn-params-at [(f Code)] (-> i64) (if (rt--defn-cc? f) 4 2))
+(defn rt--defn-body-at [(f Code)] (-> i64) (if (rt--defn-cc? f) 6 4))
+
 (defn rt--framed? [(f Code)] (-> bool)
-  (and (primitive/icmp-eq (primitive/code-count f) 5)
-       (let [b (primitive/code-nth f 4)]
+  (let [bi (rt--defn-body-at f)]
+  (and (primitive/icmp-eq (primitive/code-count f) (primitive/iadd bi 1))
+       (let [b (primitive/code-nth f bi)]
          (and (primitive/code-list? b)
               (and (primitive/icmp-ge (primitive/code-count b) 2)
                    (and (primitive/code-eq (primitive/code-nth b 0) `let)
@@ -448,21 +593,35 @@
                                     (let [v (primitive/code-nth bs 1)]
                                       (and (primitive/code-list? v)
                                            (and (primitive/icmp-gt (primitive/code-count v) 0)
-                                                (primitive/code-eq (primitive/code-nth v 0) `gc-sp)))))))))))))
+                                                (primitive/code-eq (primitive/code-nth v 0) `gc-sp))))))))))))))
 
 (defn rt--defn [(f Code)] (-> Code)
   (let [name (primitive/code-nth f 1)
-        ps (primitive/code-nth f 2)
-        ret (primitive/code-nth f 3)
+        pi (rt--defn-params-at f)
+        bi (rt--defn-body-at f)
+        ps (primitive/code-nth f pi)
+        ret (primitive/code-nth f (primitive/isub bi 1))
         sp (primitive/gensym)
+        marked (primitive/code-nth f bi)
+        closure-body?
+          (and (primitive/code-list? marked)
+               (and (primitive/icmp-gt (primitive/code-count marked) 0)
+                    (primitive/code-eq (primitive/code-nth marked 0) `scm-closure-body)))
         ;; Same exit-carried epilogue as `rt--define`, and for the same reason: a
         ;; wrapping `let` would put every self-call out of tail position and cost
         ;; the `musttail` guarantee. `defn`'s name is element 1.
-        body (rt--body-tail sp f 4 (primitive/code-count f))]
-    `(defn ~name ~ps ~ret
-       (let [~sp (gc-sp)]
-         ~@(rt--params ps 0 (primitive/code-count ps))
-         ~@body))))
+        body (if closure-body?
+                 (rt--body-tail-mode sp marked 1 (primitive/code-count marked) true)
+               (rt--body-tail sp f bi (primitive/code-count f)))]
+    (if (rt--defn-cc? f)
+        `(defn ~name :cc ~(primitive/code-nth f 3) ~ps ~ret
+           (let [~sp (gc-sp)]
+             ~@(rt--params ps 0 (primitive/code-count ps))
+             ~@body))
+      `(defn ~name ~ps ~ret
+         (let [~sp (gc-sp)]
+           ~@(rt--params ps 0 (primitive/code-count ps))
+           ~@body)))))
 
 ;; ── WHY `define` IS HANDLED SEPARATELY, AND NOT VIA `defn` ──────────────────
 ;;

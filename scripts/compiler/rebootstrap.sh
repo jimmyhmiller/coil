@@ -135,6 +135,7 @@ launch cimport ./scripts/compiler/oracle/gate-cimport.sh /tmp/coil-rl2
 # all — which is how its fixture went stale for months without failing anything.
 launch target-os ./scripts/compiler/oracle/gate-target-os.sh /tmp/coil-rl2
 launch meta env COIL_META_SKIP_RUNTIME=1 python3 scripts/dev.py test meta --compiler /tmp/coil-rl2
+launch scheme python3 scripts/dev.py test scheme --compiler /tmp/coil-rl2
 wait_jobs || exit 1
 if wait "$WASM_PID"; then
   echo "  wasm: PASS"

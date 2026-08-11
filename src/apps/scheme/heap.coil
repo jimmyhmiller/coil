@@ -62,27 +62,65 @@
 ;; Permanent roots: the global environment and the symbol table live for the whole
 ;; program, so they are traced from a fixed cell rather than the shadow stack.
 (defn g-globals [] (-> (ptr i64)) (alloc/static i64))
+(defn g-permanent-roots [] (-> (ptr (array i64 1048576)))
+  (alloc/static (array i64 1048576)))
+(defn g-permanent-top [] (-> (ptr i64)) (alloc/static i64))
+(defn gc-root-permanent [(v i64)] (-> i64)
+  (let [t (primitive/load (g-permanent-top))]
+    (primitive/store! (primitive/index (g-permanent-roots) t) v)
+    (primitive/store! (g-permanent-top) (+ t 1))
+    0))
 (defn set-globals! [(v i64)] (-> i64) (primitive/store! (g-globals) v) 0)
 (defn globals [] (-> i64) (primitive/load (g-globals)))
 
 ; --- mark -------------------------------------------------------------------
-;; Trace one object. Every shape has the same three slots, so a pair, a closure and
-;; a continuation frame all trace through this one path — which is what keeps the
-;; collector honest as new object kinds are added.
+;; Low tag bits alone cannot prove that an i64 is one of our objects: aligned raw
+;; values such as native function pointers have the same 000 suffix. Generated
+;; code can conservatively place such values in a root slot, so validate the
+;; address against the allocator-owned slabs before dereferencing it.
+(defn managed-address? [(v i64)] (-> bool)
+  (let [n (primitive/load (g-nslabs))
+        cur (primitive/load (g-cur))
+        (mut found) false]
+    (for [i 0 n]
+      (let [base (primitive/load (primitive/index (g-slabs) i))
+            limit (if (= i (- n 1)) cur (+ base 41943040))]
+        (if (and (>= v base) (< v limit))
+            (primitive/store! (mut found) true)
+          0)))
+    (primitive/load (mut found))))
+
+;; Trace one object. Most shapes contain Vals in all three payload slots. The two
+;; atomic/raw exceptions must be dispatched by tag: a flonum's `a` is IEEE bits,
+;; and a symbol's `a` is its raw intern-table index (while a fresh hygienic
+;; symbol's `b` still points at its source symbol).
 (defn mark [(v i64)] (-> i64)
   (if (not (is-heap v)) 0                      ; immediates are never traced
     (if (= v 0) 0                            ; null
+      (if (not (managed-address? v)) 0        ; aligned raw values are not objects
       (let [o (obj-of v)]
         (if (= (primitive/load (primitive/field o mark)) 1) 0   ; already seen: stop, cycles are fine
           (do
             (primitive/store! (primitive/field o mark) 1)
-            (mark (primitive/load (primitive/field o a)))
-            (mark (primitive/load (primitive/field o b)))
-            (mark (primitive/load (primitive/field o c)))
-            0))))))
+            ; Flonum `a` is raw IEEE-754 bits, not a Val.
+            (if (= (primitive/load (primitive/field o tag)) (tag-flonum)) 0
+              ; Symbol `a` is a raw intern id. ID 64 exposed this: the generic
+              ; marker treated 0x40 as a heap pointer and crashed on the first
+              ; collection in the Scheme-hosted Lox interpreter.
+              (if (= (primitive/load (primitive/field o tag)) (tag-symbol))
+                  (do (mark (primitive/load (primitive/field o b))) 0)
+                (do
+                  (mark (primitive/load (primitive/field o a)))
+                  (mark (primitive/load (primitive/field o b)))
+                  (mark (primitive/load (primitive/field o c)))
+                  0)))
+            0)))))))
 
 (defn mark-roots [] (-> i64)
   (mark (globals))
+  (let [top (primitive/load (g-permanent-top))]
+    (for [i 0 top]
+      (mark (primitive/load (primitive/index (g-permanent-roots) i)))))
   (let [top (primitive/load (g-rtop))]
     (for [i 0 top]
       (mark (primitive/load (primitive/index (g-roots) i)))))
@@ -140,7 +178,16 @@
 ;; rooted precisely because of this: an allocation is the one point where the
 ;; machine can lose a value it still needs.
 (defn allocate [(tag i64) (a i64) (b i64) (c i64)] (-> i64)
-  (if (>= (primitive/load (g-live)) 500000) (collect) 0)
+  ;; Collection happens before the payload is installed, so the payload
+  ;; arguments themselves are the allocator's responsibility. Relying on a
+  ;; caller frame worked accidentally until a legitimate tail-call reset popped
+  ;; that frame; a collection during `cons` then swept an argument before it was
+  ;; stored. Root only Val-bearing slots: flonum bits and symbol ids are raw.
+  (let [sp (gc-sp)]
+  (if (= tag (tag-flonum)) 0
+    (if (= tag (tag-symbol)) (gc-root b)
+      (do (gc-root a) (gc-root b) (gc-root c) 0)))
+  (if (>= (primitive/load (g-live)) (gc-threshold)) (collect) 0)
   (let [fl (primitive/load (g-free))
         addr (if (not (= fl 0))
                  (do (primitive/store! (g-free)
@@ -158,7 +205,79 @@
     (primitive/store! (primitive/field o c) c)
     (primitive/store! (g-total) (+ (primitive/load (g-total)) 1))
     (primitive/store! (g-live) (+ (primitive/load (g-live)) 1))
-    addr))
+    (gc-sp-set! sp)
+    addr)))
+
+;; Specialized one-pass chain construction for base-10^9 exact-integer limbs.
+;; The caller roots SRC before entering. Collection happens once up front; each
+;; cell is then allocated, filled, and linked exactly once, with aggregate
+;; accounting after the loop. Keeping this beside the allocator avoids exposing
+;; unchecked allocation state to the rest of the Scheme runtime.
+(defn allocate-limb-product [(src i64) (n i64) (digit i64) (initial-carry i64)
+                             (out-count (ptr i64))] (-> i64)
+  (if (>= (+ (primitive/load (g-live)) (+ n 1)) (gc-threshold)) (collect) 0)
+  (let [(mut input) src (mut carry) initial-carry
+        (mut head) (s-nil) (mut tail) (s-nil) (mut count) 0]
+    (loop
+      (if (is-null (primitive/load (mut input))) (break)
+        (let [p (+ (* (fixnum-value (car (primitive/load (mut input)))) digit)
+                   (primitive/load (mut carry)))
+              fl (primitive/load (g-free))
+              addr (if (not (= fl 0))
+                       (do (primitive/store!
+                             (g-free)
+                             (primitive/load
+                               (primitive/field (primitive/cast (ptr Obj) fl) a)))
+                           fl)
+                     (let [cur (primitive/load (g-cur))]
+                       (if (< cur (primitive/load (g-end)))
+                           (do (primitive/store! (g-cur) (+ cur 40)) cur)
+                         (new-slab))))
+              o (primitive/cast (ptr Obj) addr)]
+          (primitive/store! (primitive/field o tag) (tag-pair))
+          (primitive/store! (primitive/field o mark) 0)
+          (primitive/store! (primitive/field o a) (mk-fixnum (% p 1000000000)))
+          (primitive/store! (primitive/field o b) (s-nil))
+          (primitive/store! (primitive/field o c) 0)
+          (if (is-null (primitive/load (mut head)))
+              (primitive/store! (mut head) addr)
+            (primitive/store!
+              (primitive/field (obj-of (primitive/load (mut tail))) b) addr))
+          (primitive/store! (mut tail) addr)
+          (primitive/store! (mut carry) (/ p 1000000000))
+          (primitive/store! (mut input) (cdr (primitive/load (mut input))))
+          (primitive/store! (mut count) (+ (primitive/load (mut count)) 1)))))
+    (if (not (= (primitive/load (mut carry)) 0))
+        (let [fl (primitive/load (g-free))
+              addr (if (not (= fl 0))
+                       (do (primitive/store!
+                             (g-free)
+                             (primitive/load
+                               (primitive/field (primitive/cast (ptr Obj) fl) a)))
+                           fl)
+                     (let [cur (primitive/load (g-cur))]
+                       (if (< cur (primitive/load (g-end)))
+                           (do (primitive/store! (g-cur) (+ cur 40)) cur)
+                         (new-slab))))
+              o (primitive/cast (ptr Obj) addr)]
+          (primitive/store! (primitive/field o tag) (tag-pair))
+          (primitive/store! (primitive/field o mark) 0)
+          (primitive/store! (primitive/field o a)
+                            (mk-fixnum (primitive/load (mut carry))))
+          (primitive/store! (primitive/field o b) (s-nil))
+          (primitive/store! (primitive/field o c) 0)
+          (if (is-null (primitive/load (mut head)))
+              (primitive/store! (mut head) addr)
+            (primitive/store!
+              (primitive/field (obj-of (primitive/load (mut tail))) b) addr))
+          (primitive/store! (mut count) (+ (primitive/load (mut count)) 1)))
+      0)
+    (primitive/store! (g-total) (+ (primitive/load (g-total))
+                                   (primitive/load (mut count))))
+    (primitive/store! (g-live) (+ (primitive/load (g-live))
+                                  (primitive/load (mut count))))
+    (primitive/store! out-count (primitive/load (mut count)))
+    (primitive/load (mut head))))
 
 ; --- constructors -----------------------------------------------------------
 (defn cons [(a i64) (d i64)] (-> i64) (allocate (tag-pair) a d 0))
@@ -166,6 +285,62 @@
 (defn cdr [(v i64)] (-> i64) (primitive/load (primitive/field (obj-of v) b)))
 (defn set-car! [(v i64) (x i64)] (-> i64) (primitive/store! (primitive/field (obj-of v) a) x) 0)
 (defn set-cdr! [(v i64) (x i64)] (-> i64) (primitive/store! (primitive/field (obj-of v) b) x) 0)
+
+; --- complex numbers -------------------------------------------------------
+;; Rectangular components are ordinary numeric Vals, so exactness is retained
+;; independently and the generic marker traces both slots.
+(defn make-complex [(real i64) (imag i64)] (-> i64)
+  (allocate (tag-complex) real imag 0))
+(defn complex-real [(v i64)] (-> i64)
+  (primitive/load (primitive/field (obj-of v) a)))
+(defn complex-imag [(v i64)] (-> i64)
+  (primitive/load (primitive/field (obj-of v) b)))
+
+; --- flonums ---------------------------------------------------------------
+;; Store the exact IEEE bits in an atomic object. The tag-aware marker above is
+;; what makes arbitrary bit patterns safe here.
+(defn f64->raw-bits [(x f64)] (-> i64)
+  (primitive/llvm-ir i64 [x] "%r = bitcast double $0 to i64\nret i64 %r"))
+(defn raw-bits->f64 [(bits i64)] (-> f64)
+  (primitive/llvm-ir f64 [bits] "%r = bitcast i64 $0 to double\nret double %r"))
+(defn mk-flonum-bits [(bits i64)] (-> i64)
+  (allocate (tag-flonum) bits 0 0))
+(defn mk-flonum [(x f64)] (-> i64) (mk-flonum-bits (f64->raw-bits x)))
+(defn flonum-value [(v i64)] (-> f64)
+  (raw-bits->f64 (primitive/load (primitive/field (obj-of v) a))))
+(defn number->f64 [(v i64)] (-> f64)
+  (if (is-fixnum v) (primitive/cast f64 (fixnum-value v))
+    (if (is-ratnum v)
+        (primitive/fdiv (primitive/cast f64 (ratnum-numerator v))
+                        (primitive/cast f64 (ratnum-denominator v)))
+      (flonum-value v))))
+
+; --- exact rationals -------------------------------------------------------
+;; Normalized numerator/denominator fixnums. Their payloads are ordinary Vals,
+;; so the generic collector traces them safely without another atomic-tag case.
+(defn rat-gcd [(a i64) (b i64)] (-> i64)
+  (if (= b 0) a (rat-gcd b (% a b))))
+(defn rat-abs [(x i64)] (-> i64) (if (< x 0) (- 0 x) x))
+(defn mk-ratnum [(num i64) (den i64)] (-> i64)
+  (let [sn (if (< den 0) (- 0 num) num)
+        sd (if (< den 0) (- 0 den) den)
+        g (rat-gcd (rat-abs sn) sd)
+        n (/ sn g)
+        d (/ sd g)]
+    (if (= d 1) (mk-fixnum n)
+      (allocate (tag-ratnum) (mk-fixnum n) (mk-fixnum d) 0))))
+(defn ratnum-numerator [(v i64)] (-> i64)
+  (fixnum-value (ratnum-numerator-val v)))
+(defn ratnum-denominator [(v i64)] (-> i64)
+  (fixnum-value (ratnum-denominator-val v)))
+(defn ratnum-numerator-val [(v i64)] (-> i64)
+  (primitive/load (primitive/field (obj-of v) a)))
+(defn ratnum-denominator-val [(v i64)] (-> i64)
+  (primitive/load (primitive/field (obj-of v) b)))
+(defn exact-numerator [(v i64)] (-> i64)
+  (if (is-fixnum v) (fixnum-value v) (ratnum-numerator v)))
+(defn exact-denominator [(v i64)] (-> i64)
+  (if (is-fixnum v) 1 (ratnum-denominator v)))
 
 ; --- statistics -------------------------------------------------------------
 (defn gc-live [] (-> i64) (primitive/load (g-live)))

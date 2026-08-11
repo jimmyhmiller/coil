@@ -1,12 +1,19 @@
 (module coil.scheme.dialect)
 (import "coil.primitive" :as primitive)
 (import "coil.str" :use *)
+(import "coil.slice" :use [slice-len subslice])
 ; Qualified, NOT `:use *`: forms.coil exports the Scheme `>` `<` `=` family, and
 ; referring those unqualified would shadow Coil's own operators inside this file —
 ; which is a rewriter written in ordinary Coil and needs them to mean what they say.
 (import "coil.scheme.forms" :as fm)
 (import "coil.scheme.lint" :as lint)
+(import "coil.scheme.numeric" :as num)
+(import "coil.scheme.lambda" :as lam)
 (import "coil.scheme.rooting" :as rt)
+;; A synthesized `.scm` main is hygienically introduced by THIS module. Closure
+;; lowering inside that main therefore resolves its dynamic-call helpers at this
+;; definition site, just like names in any macro template.
+(import "coil.scheme.stdproc" :use [call--0 call--1 call--2 call--3 call--4 call--5 call--6])
 
 ;; The dialect seam: a `:phase before-expand` transform that rewrites the Scheme
 ;; spellings of forms Coil reserves.
@@ -39,17 +46,28 @@
 ;; function's return type into a `let`. The nesting check is what actually
 ;; discriminates, and it never fires on a well-formed Coil binding vector.
 ;;
-;; The cost is that Scheme's `(let () body)` is not recognized. That form is rare,
-;; means "no bindings", and `(begin body)` says the same thing — a smaller price
-;; than misreading every `[]` in the file.
+;; `code-vector?` is the decisive empty-case discriminator: `()` is Scheme's
+;; empty binding list while `[]` is a host Coil binder vector.
 (defn scheme-bindings? [(e Code)] (-> bool)
   (and (primitive/code-list? e)
-       (and (> (primitive/code-count e) 0)
-            (primitive/code-list? (primitive/code-nth e 0)))))
+       (and (not (primitive/code-vector? e))
+            (or (= (primitive/code-count e) 0)
+                (primitive/code-list? (primitive/code-nth e 0))))))
 
 (defn dia--rewrite-all [(e Code) (i i64) (n i64)] (-> Code)
   (if (>= i n) `()
     `(~(dia--rewrite (primitive/code-nth e i)) ~@(dia--rewrite-all e (+ i 1) n))))
+
+;; A case clause's first element is datum syntax, but every remaining element is
+;; an ordinary Scheme body form. Preserve the former and recursively lower the
+;; latter. Copying the entire clause left Scheme-shaped `let` forms inside case
+;; arms, which did not fail until the host parser saw them after expansion.
+(defn dia--rewrite-case-clauses [(e Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [clause (primitive/code-nth e i)]
+      `((~(primitive/code-nth clause 0)
+         ~@(dia--rewrite-all clause 1 (primitive/code-count clause)))
+        ~@(dia--rewrite-case-clauses e (+ i 1) n)))))
 
 ;; A Scheme binding list is `((n init) …)`: the NAME is a binder, only the INIT is
 ;; code. Rewriting the list as if it were code descends into `(n init)` and treats
@@ -61,7 +79,15 @@
 (defn dia--rewrite-bindings [(bs Code) (i i64) (n i64)] (-> Code)
   (if (>= i n) `()
     (let [b (primitive/code-nth bs i)]
-      `(~`(~(primitive/code-nth b 0) ~(dia--rewrite (primitive/code-nth b 1)))
+      `(~`(~(primitive/code-nth b 0)
+            ~(let [init (primitive/code-nth b 1)]
+               ; `load` is a reserved host form, so the general first-class
+               ; procedure pass cannot reify this one spelling. In a parallel
+               ; Scheme let initializer it necessarily denotes the outer R5RS
+               ; binding, never the binder being introduced.
+               (if (primitive/code-eq init `load)
+                   `(lambda args (scm-load-args args))
+                 (dia--rewrite init))))
         ~@(dia--rewrite-bindings bs (+ i 1) n)))))
 
 ;; Forms whose second element is a BINDER, not an expression. `defn`'s parameter
@@ -75,8 +101,12 @@
 ;; How many leading elements of a binder form are NOT body. `defn` is
 ;; `(defn name params ret body…)` so its body starts at 3; the others are
 ;; `(kw name binder)` with no body to rewrite at all.
-(defn dia--body-start [(h Code)] (-> i64)
-  (if (primitive/code-eq h `defn) 4 3))
+(defn dia--body-start [(e Code)] (-> i64)
+  (let [h (primitive/code-nth e 0)]
+    (if (primitive/code-eq h `defn)
+        (if (and (>= (primitive/code-count e) 4)
+                 (primitive/code-eq (primitive/code-nth e 2) `:cc)) 6 4)
+      3)))
 
 ;; Copy elements [i, stop) verbatim — no rewriting inside a binder or a type.
 (defn dia--verbatim [(e Code) (i i64) (stop i64) (n i64)] (-> Code)
@@ -91,14 +121,42 @@
                   (or (primitive/code-eq h `impl)
                       (primitive/code-eq h `defcc)))))))
 
+(defn dia--module-decl-head? [(h Code)] (-> bool)
+  (if (not (primitive/code-sym? h)) false
+    (let [s (primitive/code-str h)]
+      (or (str-eq s "import")
+          (or (str-eq s "export")
+              (or (str-eq s "coil.core.import") (str-eq s "coil.core.export")))))))
+
 ;; Rewrite one node, bottom-up. Anything not recognized passes through untouched,
 ;; which is what lets a file mix Scheme and ordinary Coil.
 (defn dia--rewrite [(e Code)] (-> Code)
+  (if (primitive/code-vector? e) e
   (if (not (primitive/code-list? e)) e
     (if (= (primitive/code-count e) 0) e
       (let [h (primitive/code-nth e 0)]
-        ; `quote` shields its argument: (quote (let ((a 1)))) is data, not code
-        (if (primitive/code-eq h `quote) e
+        ; Module declarations are metadata, not Scheme expression trees.
+        (if (dia--module-decl-head? h) e
+        ; Quoted templates are data, not calls or binding forms. Quasiquote is
+        ; routed to its Scheme macro while the untouched template is still whole.
+        ;; Syntax-rules can place a use-site expression into a template-owned
+        ;; position (notably `cond`'s generated `if` test). Such a subtree is
+        ;; deliberately opaque to the host expander, so handing `quote` to the
+        ;; later generic forms walk can leave its datum typed as compile-time
+        ;; Code. Lower it at this dialect seam while it is still recognizable;
+        ;; `quote-data` is an idempotent marker understood by lambda/rooting and
+        ;; materializes the datum after host expansion.
+        (if (primitive/code-eq h `quote-data) e
+        (if (primitive/code-eq h `quote)
+            `(quote-data ~(primitive/code-nth e 1))
+        (if (and (primitive/code-eq h `quasiquote)
+                 (= (primitive/code-count e) 2))
+            (if (primitive/code-vector? (primitive/code-nth e 1))
+                (let [v (primitive/code-nth e 1)]
+                  `(scm-quasiquote-vector
+                     (quote ~(dia--verbatim v 0 (primitive/code-count v)
+                                              (primitive/code-count v)))))
+              `(scm-quasiquote ~(primitive/code-nth e 1)))
           ; A binder form: copy the name, the binder and the return type verbatim,
           ; and rewrite only the body after them.
           ;
@@ -108,8 +166,8 @@
           ; branch, which descended into `(-> i64)` and read it as a `let` — so
           ; every zero-argument function in the file broke.
           (if (dia--binder-form? h)
-              `(~h ~@(dia--verbatim e 1 (dia--body-start h) (primitive/code-count e))
-                   ~@(dia--rewrite-all e (dia--body-start h) (primitive/code-count e)))
+              `(~h ~@(dia--verbatim e 1 (dia--body-start e) (primitive/code-count e))
+                   ~@(dia--rewrite-all e (dia--body-start e) (primitive/code-count e)))
             (if (and (primitive/code-eq h `let)
                      (and (>= (primitive/code-count e) 2)
                           (scheme-bindings? (primitive/code-nth e 1))))
@@ -125,35 +183,172 @@
               (if (primitive/code-eq h `let)
                   `(~h ~(primitive/code-nth e 1)
                        ~@(dia--rewrite-all e 2 (primitive/code-count e)))
-                ;; ── THE OTHER RESERVED SPELLINGS ────────────────────────────
-                ;;
-                ;; `do` and `case` are Coil built-ins exactly as `let` is, so a
-                ;; Scheme program writing them reaches COIL's form, not the
-                ;; dialect's. `let` was routed to `scm-let` here and these two
-                ;; were not, so `(do ((i 0 (+ i 1))) …)` was parsed as Coil's
-                ;; `do` — a statement sequence — and its binding list was read
-                ;; as an expression.
-                ;;
-                ;; The binder list is copied VERBATIM and only the body is
-                ;; rewritten, for the same reason the `let` branch does it: a
-                ;; quasiquote rebuilds a sequence as a list, and `do`'s binder
-                ;; is `(var init step)` triples whose shape only `scm-do` knows.
-                (if (and (primitive/code-eq h `do)
-                         (and (>= (primitive/code-count e) 3)
-                              (scheme-bindings? (primitive/code-nth e 1))))
-                    `(scm-do ~(primitive/code-nth e 1)
-                             ~(primitive/code-nth e 2)
-                             ~@(dia--rewrite-all e 3 (primitive/code-count e)))
-                  ;; `case`'s clauses are `((datum …) body …)` — element 1 is the
+                ;; `case`'s clauses are `((datum …) body …)` — element 1 is the
                   ;; KEY expression and gets rewritten; the clauses after it are
                   ;; copied whole, because their heads are datum lists rather
                   ;; than calls.
+                  ; `not` is also a reserved host boolean operator. Route it to
+                  ; the Scheme procedure so its result is the Scheme #t/#f Val.
+                  (if (and (primitive/code-eq h `not)
+                           (= (primitive/code-count e) 2))
+                      `(scm-not ~(dia--rewrite (primitive/code-nth e 1)))
                   (if (and (primitive/code-eq h `case)
                            (>= (primitive/code-count e) 2))
                       `(scm-case ~(dia--rewrite (primitive/code-nth e 1))
-                                 ~@(dia--verbatim e 2 (primitive/code-count e)
-                                                  (primitive/code-count e)))
-                    `(~h ~@(dia--rewrite-all e 1 (primitive/code-count e)))))))))))))
+                                 ~@(dia--rewrite-case-clauses
+                                     e 2 (primitive/code-count e)))
+                    ; `load` is also a reserved Coil form. Scheme's procedure is
+                    ; routed to its runtime argument-list entry point here.
+                    (if (primitive/code-eq h `load)
+                        `(scm-load-args
+                           (list ~@(dia--rewrite-all e 1 (primitive/code-count e))))
+                      `(~h ~@(dia--rewrite-all e 1 (primitive/code-count e))))))))))))))))))
+
+;; `load` is a host-reserved spelling, unlike every ordinary R5RS procedure.
+;; Reify it only in Scheme binding initializers before lambda lifting; the full
+;; dialect rewrite must retain its established later position because derived
+;; syntax still presents Scheme-shaped binders to the lambda pass.
+(defn dia--load-value-all [(e Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    `(~(dia--load-value (primitive/code-nth e i))
+      ~@(dia--load-value-all e (+ i 1) n))))
+(defn dia--load-value-bindings [(bs Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [b (primitive/code-nth bs i)
+          init (primitive/code-nth b 1)]
+      `((~(primitive/code-nth b 0)
+         ~(if (primitive/code-eq init `load)
+              `(lambda args (scm-load-args args))
+            (dia--load-value init)))
+        ~@(dia--load-value-bindings bs (+ i 1) n)))))
+(defn dia--load-value [(e Code)] (-> Code)
+  (if (primitive/code-vector? e) e
+  (if (not (primitive/code-list? e)) e
+    (if (= (primitive/code-count e) 0) e
+      (let [h (primitive/code-nth e 0)]
+        (if (primitive/code-eq h `quote) e
+          (if (dia--binder-form? h)
+              `(~h ~@(dia--verbatim e 1 (dia--body-start e) (primitive/code-count e))
+                   ~@(dia--load-value-all e (dia--body-start e) (primitive/code-count e)))
+            (if (and (or (primitive/code-eq h `let)
+                         (primitive/code-eq h `scm-let))
+                     (and (>= (primitive/code-count e) 3)
+                          (scheme-bindings? (primitive/code-nth e 1))))
+                `(~h ~(dia--load-value-bindings
+                        (primitive/code-nth e 1) 0
+                        (primitive/code-count (primitive/code-nth e 1)))
+                     ~@(dia--load-value-all e 2 (primitive/code-count e)))
+              ; Preserve a host Coil let's vector. Rebuilding it through a
+              ; quasiquote turns the vector into a list on the next transform
+              ; round and makes the parser reject its own generated closure.
+              (if (and (primitive/code-eq h `let)
+                       (>= (primitive/code-count e) 2))
+                  `(~h ~(primitive/code-nth e 1)
+                       ~@(dia--load-value-all e 2 (primitive/code-count e)))
+                `(~h ~@(dia--load-value-all e 1 (primitive/code-count e))))))))))))
+(defn dia--load-value-mods [(ms Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [m (primitive/code-nth ms i)]
+      `(~(if (dia--rewritable? m)
+             `(~(primitive/code-nth m 0)
+               ~@(dia--load-value-all m 1 (primitive/code-count m)))
+           m)
+        ~@(dia--load-value-mods ms (+ i 1) n)))))
+
+;; R5RS internal definitions are equivalent to a letrec surrounding the rest of
+;; the body. Lower the contiguous leading definition region before closure
+;; conversion so every later pass sees the one recursive-binding shape it
+;; already understands.
+(defn dia--internal-define? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (and (>= (primitive/code-count f) 3)
+            (primitive/code-eq (primitive/code-nth f 0) `define))))
+(defn dia--internal-prefix [(e Code) (i i64) (n i64)] (-> i64)
+  (if (and (< i n) (dia--internal-define? (primitive/code-nth e i)))
+      (dia--internal-prefix e (+ i 1) n)
+    i))
+(defn dia--internal-binding [(f Code)] (-> Code)
+  (let [target (primitive/code-nth f 1)]
+    (if (primitive/code-list? target)
+        (let [name (primitive/code-nth target 0)
+              params (primitive/code-rest target)]
+          `(~name (lambda ~params
+                    ~@(dia--internal-body f 2 (primitive/code-count f)))))
+      `(~target ~(dia--internal (primitive/code-nth f 2))))))
+(defn dia--internal-bindings [(e Code) (i i64) (stop i64)] (-> Code)
+  (if (>= i stop) `()
+    `(~(dia--internal-binding (primitive/code-nth e i))
+      ~@(dia--internal-bindings e (+ i 1) stop))))
+(defn dia--internal-all [(e Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    `(~(dia--internal (primitive/code-nth e i))
+      ~@(dia--internal-all e (+ i 1) n))))
+(defn dia--internal-let-bindings [(bs Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [b (primitive/code-nth bs i)]
+      `((~(primitive/code-nth b 0) ~(dia--internal (primitive/code-nth b 1)))
+        ~@(dia--internal-let-bindings bs (+ i 1) n)))))
+(defn dia--internal-body [(e Code) (start i64) (n i64)] (-> Code)
+  (let [stop (dia--internal-prefix e start n)]
+    (if (= stop start)
+        (dia--internal-all e start n)
+      `((letrec (~@(dia--internal-bindings e start stop))
+          ~@(dia--internal-all e stop n))))))
+(defn dia--internal [(e Code)] (-> Code)
+  (if (primitive/code-vector? e) e
+  (if (not (primitive/code-list? e)) e
+    (if (= (primitive/code-count e) 0) e
+      (let [h (primitive/code-nth e 0)]
+        (if (primitive/code-eq h `quote) e
+          (if (and (primitive/code-eq h `lambda)
+                   (>= (primitive/code-count e) 3))
+              `(lambda ~(primitive/code-nth e 1)
+                 ~@(dia--internal-body e 2 (primitive/code-count e)))
+            (if (and (or (primitive/code-eq h `let)
+                         (or (primitive/code-eq h `scm-let)
+                             (or (primitive/code-eq h `let*)
+                                 (primitive/code-eq h `letrec))))
+                     (and (>= (primitive/code-count e) 3)
+                          (scheme-bindings? (primitive/code-nth e 1))))
+                `(~h ~(dia--internal-let-bindings
+                        (primitive/code-nth e 1) 0
+                        (primitive/code-count (primitive/code-nth e 1)))
+                     ~@(dia--internal-all e 2 (primitive/code-count e)))
+              (if (and (primitive/code-eq h `let)
+                       (>= (primitive/code-count e) 2))
+                  `(~h ~(primitive/code-nth e 1)
+                       ~@(dia--internal-all e 2 (primitive/code-count e)))
+                `(~(if (primitive/code-list? h) (dia--internal h) h)
+                  ~@(dia--internal-all e 1 (primitive/code-count e))))))))))))
+(defn dia--internal-form [(f Code)] (-> Code)
+  (if (and (dia--internal-define? f)
+           (primitive/code-list? (primitive/code-nth f 1)))
+      `(define ~(primitive/code-nth f 1)
+         ~@(dia--internal-body f 2 (primitive/code-count f)))
+    (if (and (primitive/code-list? f)
+             (and (>= (primitive/code-count f) 5)
+                  (primitive/code-eq (primitive/code-nth f 0) `defn)))
+        (let [bi (dia--body-start f)]
+          (if (= bi 6)
+              `(defn ~(primitive/code-nth f 1) :cc ~(primitive/code-nth f 3)
+                 ~(primitive/code-nth f 4) ~(primitive/code-nth f 5)
+                 ~@(dia--internal-body f bi (primitive/code-count f)))
+            `(defn ~(primitive/code-nth f 1) ~(primitive/code-nth f 2)
+               ~(primitive/code-nth f 3)
+               ~@(dia--internal-body f bi (primitive/code-count f)))))
+      (dia--internal f))))
+(defn dia--internal-forms [(m Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    `(~(dia--internal-form (primitive/code-nth m i))
+      ~@(dia--internal-forms m (+ i 1) n))))
+(defn dia--internal-mods [(ms Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [m (primitive/code-nth ms i)]
+      `(~(if (dia--rewritable? m)
+             `(~(primitive/code-nth m 0)
+               ~@(dia--internal-forms m 1 (primitive/code-count m)))
+           m)
+        ~@(dia--internal-mods ms (+ i 1) n)))))
 
 ;; Opt-in, by the module's own declaration: a module is Scheme iff it imports
 ;; `coil.scheme`. That is a marker the author writes and a reader can see, and it
@@ -176,6 +371,110 @@
           true
         (dia--imports-scheme? m (+ i 1) n)))))
 
+;; `coil run program.scm --use coil.scheme` is the zero-wrapper entry path.  The
+;; driver has already loaded/re-exported `coil.scheme` and synthesized a module,
+;; but CLI imports live in their own synthetic source and are deliberately not
+;; attributed to the author's forms.  The extension is therefore the durable,
+;; unambiguous language marker available to this source transform.
+(defn dia--scm-file? [(f Code)] (-> bool)
+  (let [path (primitive/code-file f) n (slice-len path)]
+    (and (>= n 4) (= (subslice path (- n 4) n) ".scm"))))
+
+(defn dia--module-has-scm-source? [(m Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n) false
+    (if (dia--scm-file? (primitive/code-nth m i)) true
+      (dia--module-has-scm-source? m (+ i 1) n))))
+
+(defn dia--native-main-form? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (and (>= (primitive/code-count f) 2)
+            (and (primitive/code-eq (primitive/code-nth f 0) `defn)
+                 (primitive/code-eq (primitive/code-nth f 1) `main)))))
+
+(defn dia--module-has-native-main? [(m Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n) false
+    (if (dia--native-main-form? (primitive/code-nth m i)) true
+      (dia--module-has-native-main? m (+ i 1) n))))
+
+(defn dia--file-entry-marker? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (and (= (primitive/code-count f) 1)
+            (primitive/code-eq (primitive/code-nth f 0) `scheme-file-entry-marker))))
+
+(defn dia--module-has-file-marker? [(m Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n) false
+    (if (dia--file-entry-marker? (primitive/code-nth m i)) true
+      (dia--module-has-file-marker? m (+ i 1) n))))
+
+;; Mark a CLI-loaded .scm module before the ordinary Scheme passes inspect it.
+;; The driver normally supplies this import already; keeping this fallback makes
+;; the transform self-contained for other metaprogram hosts.
+(defn dia--mark-scm-module [(m Code)] (-> Code)
+  (if (or (dia--module-has-native-main? m 1 (primitive/code-count m))
+          (or (dia--module-has-file-marker? m 1 (primitive/code-count m))
+              (not (dia--module-has-scm-source? m 1 (primitive/code-count m)))))
+      m
+    `(~(primitive/code-nth m 0)
+      ~@(if (dia--imports-scheme? m 1 (primitive/code-count m)) `()
+          `((import "coil.scheme" :use *)))
+      (scheme-file-entry-marker)
+      ~@(primitive/code-rest m))))
+
+(defn dia--mark-scm-mods [(ms Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    `(~(dia--mark-scm-module (primitive/code-nth ms i))
+      ~@(dia--mark-scm-mods ms (+ i 1) n))))
+
+;; These remain module declarations. Every other top-level Scheme form is an
+;; executable form and belongs in the synthesized native entry point.
+(defn dia--top-declaration? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (and (> (primitive/code-count f) 0)
+            (let [h (primitive/code-nth f 0)]
+              (or (primitive/code-eq h `import)
+                  (or (primitive/code-eq h `define)
+                      (or (primitive/code-eq h `define-syntax)
+                          (or (primitive/code-eq h `defn)
+                              (or (primitive/code-eq h `defstruct)
+                                  (or (primitive/code-eq h `defsum)
+                                      (primitive/code-eq h `extern)))))))))))
+
+;; Return `(declarations expressions)`, retaining source order within each side.
+(defn dia--split-top [(m Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `(() ())
+    (let [f (primitive/code-nth m i)
+          rest (dia--split-top m (+ i 1) n)
+          ds (primitive/code-nth rest 0)
+          es (primitive/code-nth rest 1)]
+      (if (dia--file-entry-marker? f)
+          `((~@ds) (~@es))
+      (if (dia--top-declaration? f)
+          `((~f ~@ds) (~@es))
+        `((~@ds) (~f ~@es)))))))
+
+;; Make a plain .scm entry into the same shape authors previously had to write
+;; by hand. Idempotence is keyed by the native main we add. The CLI import may
+;; already be visible here, so it cannot distinguish wrapped from unwrapped.
+(defn dia--scaffold-module [(m Code)] (-> Code)
+  (if (or (dia--module-has-native-main? m 1 (primitive/code-count m))
+          (not (dia--module-has-file-marker? m 1 (primitive/code-count m))))
+      m
+    (let [parts (dia--split-top m 1 (primitive/code-count m))
+          ds (primitive/code-nth parts 0)
+          es (primitive/code-nth parts 1)]
+      `(~(primitive/code-nth m 0)
+        ~@(if (dia--imports-scheme? m 1 (primitive/code-count m)) `()
+            `((import "coil.scheme" :use *)))
+        ~@ds
+        (defn main [] (-> i64)
+          ~@es
+          (fixnum-value (mk-fixnum 0)))))))
+
+(defn dia--scaffold-mods [(ms Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    `(~(dia--scaffold-module (primitive/code-nth ms i))
+      ~@(dia--scaffold-mods ms (+ i 1) n))))
+
 ;; The dialect's own runtime is written in ordinary Coil, not Scheme, so it must
 ;; never be rewritten even though it lives under the same prefix.
 (defn dia--self? [(m Code)] (-> bool)
@@ -186,13 +485,509 @@
        (and (not (dia--self? m))
             (dia--imports-scheme? m 1 (primitive/code-count m)))))
 
+;; `define-syntax` cannot lower to a generated Coil macro declaration: Coil's
+;; macro-name index is intentionally built before before-expand transforms run.
+;; Scheme does not need to change that global rule.  Its dialect pass already
+;; owns the raw source, so it collects top-level syntax bindings and expands
+;; their uses before handing the result to Coil's ordinary expander.
+;;
+;; A syntax binding is `(name spec)`, where SPEC is the original
+;; `(syntax-rules ...)` form.  The list is deliberately tiny and linear: a Scheme
+;; module normally defines tens of derived forms, not thousands, and expansion
+;; itself dominates this lookup.
+(defn dia--report-keyword? [(defined (slice u8)) (used (slice u8))
+                            (plain (slice u8)) (canonical (slice u8))] (-> bool)
+  (and (or (str-eq defined plain)
+           (or (str-eq defined canonical)
+               (and (str-eq plain "cond")
+                    (str-eq defined "coil.core.cond"))))
+       (or (str-eq used plain)
+           (or (str-eq used canonical)
+               (and (str-eq plain "cond") (str-eq used "coil.core.cond"))))))
+
+(defn dia--same-report-keyword? [(defined Code) (used Code)] (-> bool)
+  (let [d (primitive/code-str defined) u (primitive/code-str used)]
+    (or (dia--report-keyword? d u "let" "coil.scheme.dialect.let")
+        (or (dia--report-keyword? d u "and" "coil.scheme.dialect.and")
+            (or (dia--report-keyword? d u "or" "coil.scheme.dialect.or")
+                (or (dia--report-keyword? d u "let*" "coil.scheme.dialect.let*")
+                    (or (dia--report-keyword? d u "letrec" "coil.scheme.dialect.letrec")
+                        (or (dia--report-keyword? d u "cond" "coil.scheme.dialect.cond")
+                            (or (dia--report-keyword? d u "case" "coil.scheme.dialect.case")
+                                (dia--report-keyword? d u "do" "coil.scheme.dialect.do"))))))))))
+
+(defn dia--syntax-find [(defs Code) (name Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [d (primitive/code-nth defs i)]
+      ;; Report keywords are installed by this transform and intentionally bind
+      ;; by their Scheme spelling. A module synthesized around a plain `.scm`
+      ;; file did not exist when its source identifiers were read, so those
+      ;; identifiers cannot share the transform definition's hygiene token.
+      ;; User/local syntax entries carry additional metadata and retain exact
+      ;; identifier equality.
+      (if (or (primitive/code-eq (primitive/code-nth d 0) name)
+              (and (= (primitive/code-count d) 2)
+                   (dia--same-report-keyword? (primitive/code-nth d 0) name))) d
+        (dia--syntax-find defs name (+ i 1) n)))))
+
+(defn dia--lex-bound? [(env Code) (name Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n) false
+    (let [b (primitive/code-nth env i)]
+      (if (primitive/code-eq (primitive/code-nth b 0) name) true
+        (dia--lex-bound? env name (+ i 1) n)))))
+
+(defn dia--local-syntax-defs [(bs Code) (i i64) (n i64)
+                               (marker Code) (definition-site? bool)
+                               (lexenv Code)] (-> Code)
+  (if (>= i n) `()
+    (let [b (primitive/code-nth bs i)]
+      (if (not (and (primitive/code-list? b)
+                    (and (= (primitive/code-count b) 2)
+                         (and (primitive/code-sym? (primitive/code-nth b 0))
+                              (dia--syntax-rules-spec? (primitive/code-nth b 1))))))
+          (do (primitive/report b
+                "local syntax binding expects (keyword (syntax-rules ...))")
+              (dia--local-syntax-defs bs (+ i 1) n marker definition-site? lexenv))
+        (if (not (num/syntax-rules-patterns-unique? (primitive/code-nth b 1)))
+            (do (primitive/report b
+                  "syntax-rules: pattern variable appears more than once")
+                (dia--local-syntax-defs bs (+ i 1) n marker definition-site? lexenv))
+          (let [name (primitive/code-nth b 0)
+                spec (dia--hyg-spec (primitive/code-nth b 1))]
+            (if definition-site?
+                `((~name ~spec ~marker ~lexenv)
+                  ~@(dia--local-syntax-defs bs (+ i 1) n marker definition-site? lexenv))
+              `((~name ~spec () ~lexenv)
+                ~@(dia--local-syntax-defs bs (+ i 1) n marker definition-site? lexenv)))))))))
+
+(defn dia--defs-from [(defs Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    `(~(primitive/code-nth defs i) ~@(dia--defs-from defs (+ i 1) n))))
+(defn dia--defs-after-marker [(defs Code) (marker Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [d (primitive/code-nth defs i)]
+      (if (and (= (primitive/code-count d) 1)
+               (primitive/code-eq (primitive/code-nth d 0) marker))
+          (dia--defs-from defs (+ i 1) n)
+        (dia--defs-after-marker defs marker (+ i 1) n)))))
+
+;; Hygiene at the dialect boundary.  A direct Coil macro expansion carries the
+;; host expander's lexical marks, but a Code tree returned by this outer
+;; transform cannot carry those marks a second time.  Preserve the distinction
+;; explicitly: template-introduced binders become gensyms when the syntax
+;; definition is registered, while pattern variables remain caller-provided
+;; syntax and are substituted normally by `syntax-rules-expand`.
+(defn dia--pattern-var? [(p Code) (name Code)] (-> bool)
+  (if (primitive/code-sym? p) (primitive/code-eq p name)
+    (if (primitive/code-list? p)
+        (dia--pattern-var-list? p name 0 (primitive/code-count p))
+      false)))
+
+(defn dia--pattern-var-list? [(p Code) (name Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n) false
+    (if (dia--pattern-var? (primitive/code-nth p i) name) true
+      (dia--pattern-var-list? p name (+ i 1) n))))
+
+;; Rename environments are lists of `(source gensym)` pairs.  New bindings are
+;; prepended, so lookup naturally implements lexical shadowing.
+(defn dia--hyg-name [(env Code) (name Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) name
+    (let [r (primitive/code-nth env i)]
+      (if (primitive/code-eq (primitive/code-nth r 0) name)
+          (primitive/code-nth r 1)
+        (dia--hyg-name env name (+ i 1) n)))))
+
+(defn dia--hyg-let-env [(bs Code) (pat Code) (i i64) (n i64) (env Code)] (-> Code)
+  (if (>= i n) env
+    (let [b (primitive/code-nth bs i)]
+      ; In a syntax-rules template the ellipsis following a repeated binding is
+      ; an element of the binding-list Code tree, not itself a binding pair.
+      (if (primitive/code-sym? b)
+          (dia--hyg-let-env bs pat (+ i 1) n env)
+        (let [name (primitive/code-nth b 0)]
+          (dia--hyg-let-env bs pat (+ i 1) n
+            (if (dia--pattern-var? pat name) env
+              `((~name ~(primitive/gensym)) ~@env))))))))
+
+(defn dia--hyg-let-bindings [(bs Code) (i i64) (n i64)
+                              (outer Code) (inner Code) (pat Code)] (-> Code)
+  (if (>= i n) `()
+    (let [b (primitive/code-nth bs i)]
+      (if (primitive/code-sym? b)
+          `(~b ~@(dia--hyg-let-bindings bs (+ i 1) n outer inner pat))
+        (let [name (primitive/code-nth b 0)]
+          `((~(if (dia--pattern-var? pat name) name
+                 (dia--hyg-name inner name 0 (primitive/code-count inner)))
+             ~(dia--hyg-expr (primitive/code-nth b 1) outer pat))
+            ~@(dia--hyg-let-bindings bs (+ i 1) n outer inner pat)))))))
+
+(defn dia--hyg-params-env [(ps Code) (pat Code) (i i64) (n i64) (env Code)] (-> Code)
+  (if (>= i n) env
+    (let [name (primitive/code-nth ps i)]
+      (dia--hyg-params-env ps pat (+ i 1) n
+        (if (dia--pattern-var? pat name) env
+          `((~name ~(primitive/gensym)) ~@env))))))
+
+(defn dia--hyg-params [(ps Code) (pat Code) (env Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [name (primitive/code-nth ps i)]
+      `(~(if (dia--pattern-var? pat name) name
+           (dia--hyg-name env name 0 (primitive/code-count env)))
+        ~@(dia--hyg-params ps pat env (+ i 1) n)))))
+
+(defn dia--hyg-all [(e Code) (i i64) (n i64) (env Code) (pat Code)] (-> Code)
+  (if (>= i n) `()
+    `(~(dia--hyg-expr (primitive/code-nth e i) env pat)
+      ~@(dia--hyg-all e (+ i 1) n env pat))))
+
+(defn dia--hyg-expr [(e Code) (env Code) (pat Code)] (-> Code)
+  (if (primitive/code-sym? e)
+      (dia--hyg-name env e 0 (primitive/code-count env))
+    (if (primitive/code-vector? e)
+        `#(~@(dia--hyg-all e 0 (primitive/code-count e) env pat))
+    (if (not (primitive/code-list? e)) e
+      (if (= (primitive/code-count e) 0) e
+        (let [h (primitive/code-nth e 0)]
+          (if (primitive/code-eq h `quote) e
+            (if (and (primitive/code-eq h `let)
+                     (and (>= (primitive/code-count e) 2)
+                          (scheme-bindings? (primitive/code-nth e 1))))
+                (let [bs (primitive/code-nth e 1)
+                      inner (dia--hyg-let-env bs pat 0 (primitive/code-count bs) env)]
+                  `(let ~(dia--hyg-let-bindings bs 0 (primitive/code-count bs) env inner pat)
+                     ~@(dia--hyg-all e 2 (primitive/code-count e) inner pat)))
+              (if (and (primitive/code-eq h `lambda)
+                       (and (>= (primitive/code-count e) 2)
+                            (primitive/code-list? (primitive/code-nth e 1))))
+                  (let [ps (primitive/code-nth e 1)
+                        inner (dia--hyg-params-env ps pat 0 (primitive/code-count ps) env)]
+                    `(lambda ~(dia--hyg-params ps pat inner 0 (primitive/code-count ps))
+                       ~@(dia--hyg-all e 2 (primitive/code-count e) inner pat)))
+                `(~@(dia--hyg-all e 0 (primitive/code-count e) env pat)))))))))))
+
+(defn dia--hyg-rules [(spec Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [rule (primitive/code-nth spec i)
+          pat (primitive/code-nth rule 0)]
+      `((~pat ~(dia--hyg-expr (primitive/code-nth rule 1) `() pat))
+        ~@(dia--hyg-rules spec (+ i 1) n)))))
+
+(defn dia--syntax-rules-well-formed? [(spec Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n) true
+    (let [rule (primitive/code-nth spec i)]
+      (and (primitive/code-list? rule)
+           (and (= (primitive/code-count rule) 2)
+                (let [pat (primitive/code-nth rule 0)]
+                  (and (primitive/code-list? pat)
+                       (and (> (primitive/code-count pat) 0)
+                            (dia--syntax-rules-well-formed? spec (+ i 1) n)))))))))
+
+(defn dia--syntax-rules-spec? [(spec Code)] (-> bool)
+  (and (primitive/code-list? spec)
+       (and (>= (primitive/code-count spec) 3)
+            (and (primitive/code-eq (primitive/code-nth spec 0) `syntax-rules)
+                 (and (primitive/code-list? (primitive/code-nth spec 1))
+                      (dia--syntax-rules-well-formed?
+                        spec 2 (primitive/code-count spec)))))))
+
+(defn dia--hyg-spec [(spec Code)] (-> Code)
+  `(syntax-rules ~(primitive/code-nth spec 1)
+     ~@(dia--hyg-rules spec 2 (primitive/code-count spec))))
+
+;; The first R5RS §7.3 library slice.  These are Scheme definitions, not bespoke
+;; Coil walkers: they enter the same syntax environment as user `define-syntax`
+;; declarations and disappear before forms/rooting inspect the program.  Keep
+;; growing this table as each report definition passes its conformance cases.
+(defn dia--r5rs-syntax [] (-> Code)
+  `((let ~(dia--hyg-spec
+            `(syntax-rules ()
+               ((_ tag ((name val) ...) body1 body2 ...)
+                ((lambda (proc) (apply proc proc (list val ...)))
+                 (lambda (self name ...)
+                   (let ((tag (lambda (name ...)
+                                (apply self self (list name ...)))))
+                     body1 body2 ...)))))))
+    (and ~(dia--hyg-spec
+            `(syntax-rules ()
+               ((_) #t)
+               ((_ test) test)
+               ((_ test1 test2 ...) (if test1 (and test2 ...) #f)))))
+    (or ~(dia--hyg-spec
+           `(syntax-rules ()
+              ((_) #f)
+              ((_ test) test)
+              ((_ test1 test2 ...)
+               (let ((x test1)) (if x x (or test2 ...)))))))
+    (let* ~(dia--hyg-spec
+             `(syntax-rules ()
+                ((_ () body1 body2 ...) (begin body1 body2 ...))
+                ((_ ((name1 val1) (name2 val2) ...) body1 body2 ...)
+                 (let ((name1 val1))
+                   (let* ((name2 val2) ...) body1 body2 ...))))))
+    (cond ~(dia--hyg-spec
+             `(syntax-rules (else =>)
+                ((_) (s-unspecified))
+                ((_ (else result1 result2 ...))
+                 (begin result1 result2 ...))
+                ((_ (test => result))
+                 (let ((temp test))
+                   (if temp (result temp) (s-unspecified))))
+                ((_ (test => result) clause1 clause2 ...)
+                 (let ((temp test))
+                   (if temp (result temp) (cond clause1 clause2 ...))))
+                ((_ (test)) test)
+                ((_ (test) clause1 clause2 ...)
+                 (let ((temp test))
+                   (if temp temp (cond clause1 clause2 ...))))
+                ((_ (test result1 result2 ...))
+                 (if test (begin result1 result2 ...) (s-unspecified)))
+                ((_ (test result1 result2 ...) clause1 clause2 ...)
+                 (if test
+                     (begin result1 result2 ...)
+                     (cond clause1 clause2 ...))))))
+    (case ~(dia--hyg-spec
+             `(syntax-rules (else)
+                ((_ key) (let ((temp key)) (s-unspecified)))
+                ((_ key (else result1 result2 ...))
+                 (begin result1 result2 ...))
+                ((_ key ((atoms ...) result1 result2 ...))
+                 (let ((temp key))
+                   (if (memv temp (quote (atoms ...)))
+                       (begin result1 result2 ...)
+                       (s-unspecified))))
+                ((_ key ((atoms ...) result1 result2 ...) clause1 clause2 ...)
+                 (let ((temp key))
+                   (if (memv temp (quote (atoms ...)))
+                       (begin result1 result2 ...)
+                       (case temp clause1 clause2 ...)))))))
+    (do ~(dia--hyg-spec
+           `(syntax-rules ()
+              ((_ 0 ()
+                  (variable ...) (init ...) (step ...)
+                  (test expression ...) command ...)
+               (let loop ((variable init) ...)
+                 (if test
+                     (begin (s-unspecified) expression ...)
+                     (begin command ...
+                            (loop step ...)))))
+              ((_ 0 ((variable init) binding ...)
+                  (saved-variable ...) (saved-init ...) (saved-step ...)
+                  termination command ...)
+               (do 0 (binding ...)
+                   (saved-variable ... variable)
+                   (saved-init ... init)
+                   (saved-step ... variable)
+                   termination command ...))
+              ((_ 0 ((variable init next) binding ...)
+                  (saved-variable ...) (saved-init ...) (saved-step ...)
+                  termination command ...)
+               (do 0 (binding ...)
+                   (saved-variable ... variable)
+                   (saved-init ... init)
+                   (saved-step ... next)
+                   termination command ...))
+              ((_ (binding ...) termination command ...)
+               (do 0 (binding ...) () () () termination command ...)))))))
+
+(defn dia--syntax-tail [(e Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    `(~(primitive/code-nth e i) ~@(dia--syntax-tail e (+ i 1) n))))
+
+;; Lexical environments used by syntax-rules contain `(source binding-token)`.
+;; They are metadata only: runtime names remain unchanged, but literal identifiers
+;; can distinguish an unbound report keyword from a same-spelled local variable.
+(defn dia--lex-bindings [(bs Code) (i i64) (n i64) (env Code)] (-> Code)
+  (if (>= i n) env
+    (let [b (primitive/code-nth bs i)]
+      (if (and (primitive/code-list? b) (> (primitive/code-count b) 0))
+          (dia--lex-bindings bs (+ i 1) n
+            `((~(primitive/code-nth b 0) ~(primitive/gensym)) ~@env))
+        (dia--lex-bindings bs (+ i 1) n env)))))
+(defn dia--lex-params [(ps Code) (i i64) (n i64) (env Code)] (-> Code)
+  (if (>= i n) env
+    (let [p (primitive/code-nth ps i)]
+      (dia--lex-params ps (+ i 1) n
+        (if (primitive/code-sym? p) `((~p ~(primitive/gensym)) ~@env) env)))))
+
+(defn dia--syntax-let-bindings [(bs Code) (i i64) (n i64)
+                                 (defs Code) (fuel i64) (lexenv Code)] (-> Code)
+  (if (>= i n) `()
+    (let [b (primitive/code-nth bs i)]
+      `((~(primitive/code-nth b 0)
+         ~(dia--syntax-expr (primitive/code-nth b 1) defs fuel lexenv))
+        ~@(dia--syntax-let-bindings bs (+ i 1) n defs fuel lexenv)))))
+
+(defn dia--syntax-all [(e Code) (i i64) (n i64) (defs Code) (fuel i64)
+                       (lexenv Code)] (-> Code)
+  (if (>= i n) `()
+    `(~(dia--syntax-expr (primitive/code-nth e i) defs fuel lexenv)
+      ~@(dia--syntax-all e (+ i 1) n defs fuel lexenv))))
+
+(defn dia--syntax-case-clauses [(e Code) (i i64) (n i64) (defs Code)
+                                (fuel i64) (lexenv Code)] (-> Code)
+  (if (>= i n) `()
+    (let [clause (primitive/code-nth e i)]
+      `((~(primitive/code-nth clause 0)
+         ~@(dia--syntax-all clause 1 (primitive/code-count clause)
+                            defs fuel lexenv))
+        ~@(dia--syntax-case-clauses e (+ i 1) n defs fuel lexenv)))))
+
+;; Expand a use, then walk the result again so syntax-rules macros may be
+;; recursive (R5RS's `or` example is).  Fuel turns an accidentally self-producing
+;; rule into a located compiler error instead of an unbounded metaprogram.
+(defn dia--syntax-expr [(e Code) (defs Code) (fuel i64) (lexenv Code)] (-> Code)
+  ; A source/template vector is data. `code-list?` deliberately includes KVec,
+  ; so test it first or its first element is mistaken for a call head.
+  (if (primitive/code-vector? e) e
+  (if (not (primitive/code-list? e)) e
+    (if (= (primitive/code-count e) 0) e
+      (let [h (primitive/code-nth e 0)]
+        ; Do not expand syntax-rules inside data. Preserving quasiquote verbatim
+        ; also retains a KVec template until the Scheme quasiquote pass sees it.
+        (if (primitive/code-eq h `quote)
+            `(quote-data ~(primitive/code-nth e 1))
+        (if (or (primitive/code-eq h `quote-data)
+                (primitive/code-eq h `quasiquote)) e
+          ;; Preserve Coil binders and binding vectors exactly.  The Scheme test
+          ;; modules legitimately contain `deftest`/`defn` forms supplied by the
+          ;; host, and rebuilding a vector through quasiquote turns it into a
+          ;; list.  Scheme-shaped lets remain walkable because their binding
+          ;; pairs are lists by definition.
+          (if (dia--binder-form? h)
+              `(~h ~@(dia--verbatim e 1 (dia--body-start e) (primitive/code-count e))
+                   ~@(dia--syntax-all e (dia--body-start e) (primitive/code-count e)
+                                      defs fuel lexenv))
+            (if (and (or (primitive/code-eq h `let-syntax)
+                         (primitive/code-eq h `letrec-syntax))
+                     (>= (primitive/code-count e) 3))
+                (let [bs (primitive/code-nth e 1)
+                      marker (primitive/gensym)
+                      locals (dia--local-syntax-defs
+                               bs 0 (primitive/code-count bs)
+                               marker
+                               (primitive/code-eq h `let-syntax)
+                               lexenv)
+                      inner (if (primitive/code-eq h `let-syntax)
+                                `(~@locals (~marker) ~@defs)
+                              `(~@locals ~@defs))]
+                  `(begin ~@(dia--syntax-all e 2 (primitive/code-count e) inner fuel lexenv)))
+            ; `do` is also a host sequencing form. Only the R5RS shape has a
+            ; binding list followed by a termination clause; preserve every host
+            ; `do` so installing the Scheme keyword cannot capture compiler forms.
+            (if (and (primitive/code-eq h `do)
+                     (not (or (and (>= (primitive/code-count e) 3)
+                                   (scheme-bindings? (primitive/code-nth e 1)))
+                              (and (>= (primitive/code-count e) 2)
+                                   (and (primitive/code-int? (primitive/code-nth e 1))
+                                        (= (primitive/code-int (primitive/code-nth e 1)) 0))))))
+                `(~h ~@(dia--syntax-all e 1 (primitive/code-count e) defs fuel lexenv))
+            (if (and (primitive/code-eq h `lambda)
+                     (and (>= (primitive/code-count e) 3)
+                          (primitive/code-list? (primitive/code-nth e 1))))
+                (let [ps (primitive/code-nth e 1)
+                      inner-lex (dia--lex-params ps 0 (primitive/code-count ps) lexenv)]
+                  `(lambda ~ps
+                     ~@(dia--syntax-all e 2 (primitive/code-count e) defs fuel inner-lex)))
+            (if (and (primitive/code-eq h `let)
+                     (and (>= (primitive/code-count e) 2)
+                          (primitive/code-vector? (primitive/code-nth e 1))))
+                `(~h ~(primitive/code-nth e 1)
+                     ~@(dia--syntax-all e 2 (primitive/code-count e)
+                                        defs fuel lexenv))
+            (if (and (primitive/code-eq h `let)
+                     (and (>= (primitive/code-count e) 2)
+                          (scheme-bindings? (primitive/code-nth e 1))))
+                (let [bs (primitive/code-nth e 1)
+                      inner-lex (dia--lex-bindings bs 0 (primitive/code-count bs) lexenv)]
+                  `(~h ~(dia--syntax-let-bindings bs 0 (primitive/code-count bs)
+                                                   defs fuel lexenv)
+                       ~@(dia--syntax-all e 2 (primitive/code-count e)
+                                          defs fuel inner-lex)))
+              (let [d (if (and (primitive/code-sym? h)
+                                (not (dia--lex-bound? lexenv h 0
+                                                     (primitive/code-count lexenv))))
+                           (dia--syntax-find defs h 0 (primitive/code-count defs))
+                         `())]
+                (if (> (primitive/code-count d) 0)
+                    (if (<= fuel 0)
+                        (do (primitive/report e "syntax-rules expansion exceeded 128 recursive steps") e)
+                      (dia--syntax-expr
+                        (num/syntax-rules-expand-context
+                          (primitive/code-nth d 1)
+                          (dia--syntax-tail e 1 (primitive/code-count e))
+                          (if (>= (primitive/code-count d) 4)
+                              (primitive/code-nth d 3) `())
+                          lexenv)
+                        (if (and (>= (primitive/code-count d) 4)
+                                 (not (primitive/code-list? (primitive/code-nth d 2))))
+                            (dia--defs-after-marker defs (primitive/code-nth d 2)
+                                                    0 (primitive/code-count defs))
+                          defs)
+                        (- fuel 1)
+                        lexenv))
+                  `(~(if (primitive/code-sym? h) h
+                         (dia--syntax-expr h defs fuel lexenv))
+                    ~@(dia--syntax-all e 1 (primitive/code-count e)
+                                      defs fuel lexenv)))))))))))))))))
+
+;; Process forms in source order.  A definition is visible to following forms,
+;; as R5RS top-level sequencing requires, and is removed from the Coil program:
+;; it is a compile-time binding, not a runtime declaration.
+(defn dia--syntax-forms [(m Code) (i i64) (n i64) (defs Code) (lexenv Code)] (-> Code)
+  (if (>= i n) `()
+    (let [f (primitive/code-nth m i)]
+      (if (and (primitive/code-list? f)
+               (and (= (primitive/code-count f) 3)
+                    (primitive/code-eq (primitive/code-nth f 0) `define-syntax)))
+          (let [name (primitive/code-nth f 1)
+                spec (primitive/code-nth f 2)]
+            (if (not (and (primitive/code-sym? name) (dia--syntax-rules-spec? spec)))
+                (do (primitive/report f
+                      "syntax-rules: each rule must be (nonempty-pattern template)")
+                    (dia--syntax-forms m (+ i 1) n defs lexenv))
+              (if (not (num/syntax-rules-patterns-unique? spec))
+                  (do (primitive/report f
+                        "syntax-rules: pattern variable appears more than once")
+                      (dia--syntax-forms m (+ i 1) n defs lexenv))
+                (dia--syntax-forms m (+ i 1) n
+                                   `((~name ~(dia--hyg-spec spec) () ~lexenv) ~@defs)
+                                   lexenv))))
+        `(~(dia--syntax-expr f defs 128 lexenv)
+          ~@(dia--syntax-forms m (+ i 1) n defs lexenv))))))
+
+(defn dia--syntax-mods [(ms Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [m (primitive/code-nth ms i)]
+      `(~(if (dia--rewritable? m)
+             `(~(primitive/code-nth m 0)
+               ~@(dia--syntax-forms m 1 (primitive/code-count m)
+                                    (dia--r5rs-syntax) `()))
+           m)
+        ~@(dia--syntax-mods ms (+ i 1) n)))))
+
 (defn dia--mods [(ms Code) (i i64) (n i64)] (-> Code)
   (if (>= i n) `()
     (let [m (primitive/code-nth ms i)]
       `(~(if (dia--rewritable? m)
-             `(~(primitive/code-nth m 0) ~@(dia--rewrite-all m 1 (primitive/code-count m)))
+             `(~(primitive/code-nth m 0)
+               ~@(dia--rewrite-all m 1 (primitive/code-count m)))
            m)
         ~@(dia--mods ms (+ i 1) n)))))
+
+(defn dia--lambda-mods [(ms Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [m (primitive/code-nth ms i)]
+      `(~(if (and (dia--rewritable? m)
+                  (not (str-eq (primitive/code-str (primitive/code-nth m 0))
+                               "scheme-dialect-test")))
+             (lam/lambda-lift-module-visible m ms) m)
+        ~@(dia--lambda-mods ms (+ i 1) n)))))
+
+(defn dia--module-named? [(ms Code) (name (slice u8)) (i i64) (n i64)] (-> bool)
+  (if (>= i n) false
+    (let [m (primitive/code-nth ms i)]
+      (if (str-eq (primitive/code-str (primitive/code-nth m 0)) name) true
+        (dia--module-named? ms name (+ i 1) n)))))
 
 ;; ONE registration for the whole dialect, running its passes in a defined order.
 ;;
@@ -209,17 +1004,37 @@
 ;; `do`-wrapped program to the second pass makes it read `do` as a module record
 ;; and fail with "code-count expects a list/vector".
 (defn scheme-dialect [(prog Code)] (-> Code)
+  (let [prepared (dia--mark-scm-mods prog 0 (primitive/code-count prog))]
   ;; Police the surface BEFORE rewriting it: an `scm-` name written by hand is an
   ;; error, while the same name introduced by a macro expansion below is fine.
   ;; Running the check first is what keeps those two cases apart.
-  (lint/lint-scheme-source prog)
+  (lint/lint-scheme-source prepared)
   ;; Order matters and is not arbitrary:
-  ;;   1. dia--mods      Scheme `let` -> scm-let, `set!` -> scm-set!
-  ;;   2. scheme-forms   literals -> Vals, `if` -> truthy?, variadic operators
-  ;;   3. rooting        frames and gc-root, LAST — it must see the calls the
+  ;;   1. user and report syntax-rules expand
+  ;;   2. internal definitions lower to a recursive binding, then a second syntax
+  ;;      pass expands that generated letrec through the same report definition
+  ;;   3. load-value prepass reifies the one procedure name reserved by Coil
+  ;;   4. lambda lifting handles source and prepass-introduced closures
+  ;;   5. dia--mods      Scheme `let` -> scm-let, `set!` -> scm-set!
+  ;;   6. scheme-forms   literals -> Vals, `if` -> truthy?, variadic operators
+  ;;   7. rooting        frames and gc-root, LAST — it must see the calls the
   ;;                     earlier passes emit, or the values they allocate go
   ;;                     unrooted, which is a use-after-free rather than an error.
   `(do ~@(rt/rooting-mods
-           (fm/scheme-forms-mods (dia--mods prog 0 (primitive/code-count prog))))))
+           (fm/scheme-forms-mods
+             (let [syn (dia--syntax-mods prepared 0 (primitive/code-count prepared))]
+               (let [internal (dia--internal-mods syn 0 (primitive/code-count syn))]
+               (let [derived (dia--syntax-mods internal 0 (primitive/code-count internal))]
+               (let [pre (dia--load-value-mods derived 0 (primitive/code-count derived))]
+                 (if (dia--module-named? derived "scheme-dialect-test" 0
+                                                 (primitive/code-count derived))
+                     (dia--mods pre 0 (primitive/code-count pre))
+                   (let [scaffolded
+                           (dia--scaffold-mods pre 0 (primitive/code-count pre))]
+                     (let [lifted
+                             (dia--lambda-mods scaffolded 0
+                                               (primitive/code-count scaffolded))]
+                       (dia--mods lifted 0
+                                  (primitive/code-count lifted))))))))))))))
 
 (transform scheme-dialect :phase before-expand)

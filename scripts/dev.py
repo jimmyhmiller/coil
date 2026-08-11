@@ -122,6 +122,8 @@ def test(args: argparse.Namespace) -> None:
                 *(["--verbose"] if args.verbose else []))
     elif args.suite == "modernize-fast":
         test_modernize_fast(compiler)
+    elif args.suite == "scheme":
+        execute(sys.executable, "scripts/scheme-progress.py", "--compiler", compiler)
 
 
 def _test_modernize_fast_serial(compiler: str) -> None:
@@ -582,7 +584,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "http", "wasm", "meta", "interpreter", "metaprogramming", "modernize-fast"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "http", "wasm", "meta", "interpreter", "metaprogramming", "modernize-fast", "scheme"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.set_defaults(func=test)

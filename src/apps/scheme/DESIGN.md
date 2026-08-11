@@ -36,6 +36,32 @@ runs in **7 ms**, against Chez's 54 ms — because it *is* native code.
 
 The lowering is **Scheme-shaped Coil → GC-managed Coil**. Not source → target.
 
+## Plain `.scm` entry files
+
+The public entry path is the ordinary `--use` mechanism, not a Scheme-specific
+driver command:
+
+    coil run program.scm --use coil.scheme
+
+The driver performs only its general `--use` duties: it supplies an import and,
+when the entry has none, a valid module name. The `coil.scheme` before-expand
+transform supplies the language-specific part. It leaves definitions and syntax
+definitions at module scope, gathers executable top-level forms into a native
+`defn main`, and supplies a zero exit status. Existing module/import declarations
+and an existing native `main` remain authoritative, so mixed Coil/Scheme entry
+files are not double-wrapped.
+
+This uses the normal transform fixed point. No second loader, textual rewrite,
+runtime `load`, filename-triggered language mode, or Scheme branch in codegen is
+involved. The generated entry is ordinary Coil syntax before expansion and then
+passes through the same syntax-rules, closure, value, rooting, and tail-call
+lowering as an authored wrapper.
+
+`scripts/scheme-progress.py` builds untouched entry files with exactly this
+command. Its direct-entry coverage includes a numeric-leading filename, syntax
+rules, quasiquote, numbers, mutable data, recursive closures, and preservation of
+an authored native main.
+
 ## Why GC is the hard pillar
 
 A Coil program frees explicitly. A Scheme program never frees anything, and its
@@ -86,12 +112,24 @@ macros over forms Coil already has, plus a runtime.
   fixnum overflow must promote to a bignum rather than wrap.
 - **GC rooting.** The one pillar that is genuinely unavoidable — see above.
 
+The bounded development loop is:
+
+    python3 scripts/scheme-progress.py
+
+Use `--bench` after a semantic or allocation change.  `--all` additionally runs
+the compiler's bounded `modernize-fast` gate with the selected `--compiler`.
+This deliberately does not run `build full`; the repository's final-release
+rule still applies.
+
 ## Testing
 
 `tests/scheme/run.py` — each case runs under Chez, Guile and Chibi and under our
 build, three-way voted; a case counts only where all three agree. `r4rstest.scm`
 (~677 assertions) is the north star. See `tests/scheme/cases/README.md` for the
 R5RS corners where conforming implementations legitimately differ.
+
+The live feature-by-feature ledger and application acceptance target are in
+[`../../../docs/reference/R5RS_STATUS.md`](../../../docs/reference/R5RS_STATUS.md).
 
 ## Status
 

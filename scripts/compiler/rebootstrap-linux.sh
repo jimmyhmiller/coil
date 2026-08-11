@@ -97,6 +97,8 @@ echo "  gate-wasm-build: PASS (compiler builds for wasm64)"
 echo "  gate-cli:        PASS (argv, exit codes, fmt)"
 ./scripts/compiler/oracle/gate-target-os.sh /tmp/coil-lrb2 >/dev/null 2>&1 || { echo "gate-target-os FAIL"; exit 1; }
 echo "  gate-target-os:  PASS ((target-os) follows --target, consts fold per target)"
+python3 scripts/dev.py test scheme --compiler /tmp/coil-lrb2 >/dev/null || { echo "gate-scheme FAIL"; exit 1; }
+echo "  gate-scheme:     PASS (R5RS surface, oracles, negatives, applications)"
 
 # The PER-STAGE gates. These are target-INDEPENDENT (they compare frontend stage
 # output, not machine code), so the same references serve both platforms — but only
