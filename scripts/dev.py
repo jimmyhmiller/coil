@@ -358,6 +358,33 @@ def test_modernize_fast(compiler: str) -> None:
             if before != hashlib.sha256(probe.read_bytes()).digest():
                 raise RuntimeError("fast modernization gate: lint --fix is not idempotent")
 
+            serde_probe = tmp / "serde-derive-probe.coil"
+            serde_probe.write_text("""(module serde-derive-modernization-probe)
+(import "coil.serde" :use *)
+(import "coil.serde.derive" :use *)
+(defsum Event (Ready []))
+(derive-serde-sum Event)
+(defstruct User [(display_name (slice u8))])
+(derive-serde User (rename-all :camelCase))
+(defstruct Outbound [(value i64)])
+(derive-serialize Outbound)
+(defstruct Inbound [(value i64)])
+(derive-deserialize Inbound)
+(defn main [] (-> i64) 0)
+""")
+            execute(coil, "lint", str(serde_probe), "--fix", "--allow-dirty")
+            serde_fixed = serde_probe.read_text()
+            for legacy in ("derive-serde-sum", "derive-serde", "derive-serialize", "derive-deserialize"):
+                if legacy in serde_fixed:
+                    raise RuntimeError(f"fast modernization gate: autofix left legacy {legacy}")
+            for replacement in ("(derive Serialize Deserialize Event)",
+                                "(derive Serialize Outbound)", "(derive Deserialize Inbound)"):
+                if replacement not in serde_fixed:
+                    raise RuntimeError(f"fast modernization gate: missing serde derive rewrite {replacement!r}")
+            if serde_fixed.count("(rename-all :camelCase)") != 2:
+                raise RuntimeError("fast modernization gate: serde options were not copied to both traits")
+            execute(coil, "check", str(serde_probe))
+
         def default_lint_task() -> None:
             probe = tmp / "default-lint.coil"
             probe.write_text((ROOT / "tests/metaprogramming/default_lint_input.coil").read_text())
