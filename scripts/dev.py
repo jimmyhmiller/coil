@@ -360,6 +360,49 @@ def test_modernize_fast(compiler: str) -> None:
             if before != hashlib.sha256(probe.read_bytes()).digest():
                 raise RuntimeError("fast modernization gate: lint --fix is not idempotent")
 
+            serde_probe = tmp / "serde-derive-probe.coil"
+            serde_probe.write_text("""(module serde-derive-modernization-probe)
+(import "coil.serde" :use *)
+(import "coil.serde.derive" :use *)
+(defsum Event (Ready []))
+(derive-serde-sum Event)
+(defstruct User [(display_name (slice u8))])
+(derive-serde User (rename-all :camelCase))
+(defstruct Outbound [(value i64)])
+(derive-serialize Outbound)
+(defstruct Inbound [(value i64)])
+(derive-deserialize Inbound)
+(defn main [] (-> i64) 0)
+""")
+            execute(coil, "lint", str(serde_probe), "--fix", "--allow-dirty")
+            serde_fixed = serde_probe.read_text()
+            for legacy in ("derive-serde-sum", "derive-serde", "derive-serialize", "derive-deserialize"):
+                if legacy in serde_fixed:
+                    raise RuntimeError(f"fast modernization gate: autofix left legacy {legacy}")
+            for replacement in ("(derive Serialize Deserialize Event)",
+                                "(derive Serialize Outbound)", "(derive Deserialize Inbound)"):
+                if replacement not in serde_fixed:
+                    raise RuntimeError(f"fast modernization gate: missing serde derive rewrite {replacement!r}")
+            if serde_fixed.count("(rename-all :camelCase)") != 2:
+                raise RuntimeError("fast modernization gate: serde options were not copied to both traits")
+            execute(coil, "check", str(serde_probe))
+
+        def default_lint_task() -> None:
+            probe = tmp / "default-lint.coil"
+            probe.write_text((ROOT / "tests/metaprogramming/default_lint_input.coil").read_text())
+            execute(coil, "lint", str(probe), "--fix", "--allow-dirty")
+            fixed = probe.read_text()
+            for legacy in ("primitive/icmp-ge", "match-else (", "(Moved 1 2 3)", "(match value"):
+                if legacy in fixed:
+                    raise RuntimeError(f"fast modernization gate: default lint left {legacy!r}")
+            if "(Moved :x 1 :y 2 :at 3)" not in fixed or "try-or!" not in fixed:
+                raise RuntimeError("fast modernization gate: default lint profile did not run every safe fixer")
+            execute(coil, "fmt", "--write", str(probe))
+            formatted = probe.read_text()
+            if not all(part in formatted for part in ("(Moved\n", ":x 1\n", ":y 2\n", ":at 3)")):
+                raise RuntimeError("fast modernization gate: named constructor was not formatted by field")
+            execute(coil, "check", str(probe))
+
         def broken_lint_task() -> None:
             broken = tmp / "broken.coil"
             broken.write_text("""(module broken-modernization-probe)
@@ -416,6 +459,7 @@ source-roots = ["src"]
             aggregate_ir_task,
             lambda: build_run("src/examples/bitfields.coil", "static-assert", "--backend", "arm64", want=42),
             lint_task,
+            default_lint_task,
             broken_lint_task,
             broken_project_task,
         ]

@@ -24,7 +24,8 @@ inside it, so `coil` and every `(import "…")` below work from any directory.
     coil build file.coil -lm             # link a library (-l<name>)
     coil repl                            # interactive session
     coil fmt   file.coil                 # print formatted source (--write / --check)
-    coil lint  file.coil --use my.rules   # run checkers (--diff / --fix applies them)
+    coil lint  file.coil --fix            # apply the standard safe fixes
+    coil lint  file.coil --use my.rules   # add project/policy checkers
     coil doc   file.coil                 # markdown for the module's `;;`-documented surface
     coil namespaces                      # bundled standard-library namespace names
     coil namespace coil.arraylist        # every definition/signature, plus available docs
@@ -300,6 +301,36 @@ must take `(self (ptr Self))`; later parameters and the return type may not ment
 `Self`. Copying the dynamic value does not copy or preserve the concrete object: its
 `data` pointer follows the same validity rules as any other Coil pointer.
 
+### Deriving trait implementations
+
+`coil.derive` provides the registry-backed generic form `(derive Trait... Type)`.
+A deriver is registered explicitly; its function name has no special meaning.
+Libraries and applications can define their own with one or both type-shape arms:
+
+    (import "coil.derive" :use *)
+
+    (deftrait Tag [Self] (tag [(x Self)] (-> i64)))
+    (defderive Tag
+      (struct [T] `(impl Tag ~T (tag [(x ~T)] (-> i64) 1)))
+      (sum [T] `(impl Tag ~T (tag [(x ~T)] (-> i64) 2))))
+
+    (defstruct Point [(x i64)])
+    (derive Eq Hash Tag Point)
+
+An option-bearing trait is written as a list. Options belong to that trait, so
+two configured derives spell the options twice rather than hiding which impl
+consumes them:
+
+    (derive (Serialize (rename-all :camelCase))
+            (Deserialize (rename-all :camelCase))
+            User)
+
+Either `struct` or `sum` may be omitted. Deriving that trait for the omitted
+shape is a direct error at the `derive` call. Duplicate registrations for one
+trait are errors rather than load-order-dependent overrides. `register-derive`
+is the lower-level spelling used by `defderive`; use it only when the deriver
+functions must be declared separately.
+
 ## Numbers, bool, casts
 
 Int types `i8 i16 i32 i64 u8 u32 u64 …` (arbitrary width, real signedness).
@@ -352,6 +383,13 @@ Self-tail-recursion is constant-stack (guaranteed `musttail`).
 
     (defstruct Point [(x i64) (y i64)])
     (defstruct Rect  [(lo Point) (hi Point) (data (ptr u8)) (buf (array u8 64))])
+    (Point :x 10 :y 20)                    ; named construction
+    (Point :y 20 :x 10)                    ; field order is irrelevant
+
+Struct values are constructed with `:field value` pairs. Every declared field is
+required exactly once; missing, repeated, and unknown fields are compile errors.
+Arguments are initialized in the struct's declaration order. Sum variants accept the
+same named syntax for their payload fields: `(Rect :width 10 :height 20)`.
 
 - `(primitive/field p name)` → a `(ptr FieldType)` (a place); then `load`/`store!`.
   Requires `p : (ptr Struct)`. Nested: `(primitive/field (primitive/field s lo) x)`. Array field
@@ -694,6 +732,18 @@ three or more nested `if`s into a `cond`:
     coil lint app.coil --use myproject.condlint --diff   # the patch; writes nothing
     coil lint app.coil --use myproject.condlint --fix    # apply it
 
+Checker rules can accept string parameters from the lint CLI. Qualify keys with the
+rule namespace so independently loaded rules do not collide, and provide the default
+at the read site:
+
+    (let [limit (primitive/lint-param "myproject.depth.maximum" "24")] ...)
+    coil lint app.coil --use myproject.depth \
+      --lint-param myproject.depth.maximum=40
+
+`--lint-param KEY=VALUE` is repeatable; the last value for a key wins. The checker
+owns parsing and validation because parameter schemas are rule-specific. Parameters
+apply only to `coil lint`, not ordinary build/run/check commands.
+
 By default, checkers see the program **after macro expansion**, so every
 `cond`/`when`/`case` in the file has already become nested `if`s.
 `(primitive/code-macro? NODE)` is true for a node the expander produced, which is how
@@ -704,7 +754,8 @@ or calculate properties such as raw syntactic nesting depth.
 **Checkers run after the program is resolved and typechecked**, so they read the
 compiler's authoritative output and layer *policy* on code that already typechecks:
 
-- `(primitive/code-decl NODE)` → `(decl MODULE fn [PARAM-TYPE…] RET)` for a function, or
+- `(primitive/code-decl NODE)` → `(decl MODULE fn [PARAM-TYPE…] RET)` for a function,
+  `(decl MODULE sum QUALIFIED-VARIANT)` for a sum-variant construction, or
   `(decl MODULE KIND)` for a struct/sum/trait/const/extern; `:unresolved`/`:ambiguous`
   otherwise. Pass the **reference node** (a call, `fnptr-of`, variant construction, or
   type reference) and it resolves to the exact entity the checker picked — correct even
@@ -747,6 +798,16 @@ value with the real C ABI. To call a Coil fn from C (e.g. `qsort` comparator) pa
 `(print-str w s)`, `(fmt w "n={d} s={s} f={f}\n" a b c)`. ⚠ `{f}` is a fixed
 6-digit display, NOT C `%g`; for exact float formatting call libc `snprintf` with
 `c"%g"`. `coil cimport header.h` auto-generates bindings from a real C header.
+
+`coil.debug` provides the derivable `Debug` trait plus `debug` and `debugln`:
+
+    (import "coil.debug" :use *)
+    (derive Debug Point)
+    (debugln (Point :x 10 :y 20))   ; prints: (Point :x 10 :y 20)
+
+Derived struct and sum output uses valid named-constructor syntax, recursively, so a
+value whose component `Debug` implementations emit source can be pasted back into a
+program.
 In source, `(cimport "sys/ioctl.h" :use [ioctl])` asks Clang to emit only the
 named declarations and macros, so using a large platform header does not expose
 its whole API. The generated declaration preserves details such as C variadics.
@@ -841,7 +902,7 @@ failure reports the **smallest** input that breaks it. It is a library too, and
       (list-eq (reverse (reverse xs)) xs))     ; the body yields bool
 
 Arguments are generated by each type's `Arbitrary` impl — scalars, `(slice u8)`,
-`(ArrayList T)`, `(Option T)` and anything you `(derive-arbitrary T)` — so there is
+`(ArrayList T)`, `(Option T)` and anything you `(derive Arbitrary T)` — so there is
 nothing to wire up. **Nobody writes a shrinker.** Every random decision is recorded
 on a *tape*, and minimization edits the tape and re-runs the generator, so a
 generator's invariants survive shrinking by construction:
@@ -861,8 +922,8 @@ asks the runner to hill-climb toward a number instead of sampling uniformly, and
 `draw-len!`, `arb-string`, …) when a type's default distribution is wrong for one
 property.
 
-Derive both halves for your own types — `(derive-arbitrary T)` / `(derive-show T)`
-for a struct, `(derive-arbitrary-sum T)` / `(derive-show-sum T)` for a sum
+Derive both halves for your own structs and sums with
+`(derive Arbitrary Debug T)`
 (recursive sums terminate on a fuel budget and shrink toward the first-declared
 variant, so declare the base case first).
 
@@ -873,7 +934,7 @@ other list keeps the generic impl:
     (impl Arbitrary Email
       (arbitrary [(out (mut Email)) (s (ptr Source))] (-> i64) …))
 
-⚠ A hand-written `PropShow` impl names `Writer`, which lives in `coil.io` —
+⚠ A hand-written `Debug` impl names `Writer`, which lives in `coil.io` —
 `coil.prop` does not reexport that module (it would put `print-str`, `stdout` and
 friends into every property file), so add `(import "coil.io" :as io)` and write
 `(w (ptr io/Writer))`.
@@ -991,8 +1052,8 @@ anywhere, no path or install step:
 `coil.alloc` (allocators), `coil.arraylist`, `coil.hashmap`, `coil.slice`, `coil.str`,
 `coil.mem`, `coil.io`, `coil.fmt`, `coil.print`, `coil.fs` (files), `coil.result`
 (Option/Result), `coil.control` (case/while/for/…), `coil.match` (deprecated: its
-`match-else` is now just `match` with a `_` arm — `coil lint --use coil.lint.match-else
---fix` rewrites calls), `coil.try`,
+`match-else` is now just `match` with a `_` arm — plain `coil lint --fix` rewrites
+calls), `coil.try`,
 `coil.thread`, `coil.atomic`, `coil.simd`, `coil.closure`, `coil.derive`, `coil.mmio`,
 `coil.reader` (THE s-expression reader — the one the compiler itself uses), `coil.json` (zero-copy token-tape parser), `coil.serde` +
 `coil.serde.derive`/`coil.serde.json`/`coil.serde.sexp`/`coil.serde.msgpack`/
@@ -1008,6 +1069,9 @@ SSE and other long responses),
 the `Arbitrary` trait, tape-based shrinking — see above), `coil.dbgalloc`, `coil.guardalloc`, `coil.crash`,
 `coil.debug-runtime`, `coil.checked-ffi`, and `coil.stacklint`, plus `coil.os`,
 `coil.time`, `coil.selectors`, `coil.subprocess`,
-`coil.process`, and `coil.lint.result-flow` for hosted system programming and Result
-flow migration. The common ones are summarized above; import a module and call
+`coil.process`, and the standard `coil.lint.default` safe-fix profile. Plain
+`coil lint` automatically loads `coil.modernize`, `coil.lint.match-else`,
+`coil.lint.result-flow`, and `coil.lint.named-constructor` through that profile;
+allocator-composition and stack checks remain opt-in policy/debug checks. The common
+ones are summarized above; import a module and call
 its functions directly.

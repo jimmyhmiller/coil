@@ -363,6 +363,67 @@ expect_out "'secret', which module 'util' does not export" "…and the error nam
 printf '(module app)\n(import "util" :use [good])\n(defn main [] (-> i64) (good))\n' > "$T/use/yes.coil"
 expect_rc 42 "an exported :use name still resolves" "$COIL" run "$T/use/yes.coil"
 
+echo "== constants have module-qualified identity =="
+mkdir -p "$T/const-ns/src"
+cat > "$T/const-ns/src/tcp.coil" <<'EOF'
+(module constns.tcp)
+(export SOCKET_ERROR_CLOSED own)
+(const SOCKET_ERROR_CLOSED 20)
+(defn own [] (-> i64) SOCKET_ERROR_CLOSED)
+EOF
+cat > "$T/const-ns/src/unix.coil" <<'EOF'
+(module constns.unix)
+(export SOCKET_ERROR_CLOSED own)
+(const SOCKET_ERROR_CLOSED 22)
+(defn own [] (-> i64) SOCKET_ERROR_CLOSED)
+EOF
+cat > "$T/const-ns/src/main.coil" <<'EOF'
+(module constns.main)
+(import "constns.tcp" :as tcp)
+(import "constns.unix" :as unix)
+(defn main [] (-> i64) (+ tcp/SOCKET_ERROR_CLOSED unix/SOCKET_ERROR_CLOSED))
+EOF
+expect_rc 42 "same-named constants in unrelated modules coexist and resolve qualified" \
+  "$COIL" run "$T/const-ns/src/main.coil"
+
+cat > "$T/const-ns/src/own-main.coil" <<'EOF'
+(module constns.own-main)
+(import "constns.tcp" :as tcp :use [own])
+(import "constns.unix" :as unix)
+(defn main [] (-> i64) (+ (own) (unix/own)))
+EOF
+expect_rc 42 "each defining module resolves its own same-named constant" \
+  "$COIL" run "$T/const-ns/src/own-main.coil"
+
+cat > "$T/const-ns/src/ambiguous.coil" <<'EOF'
+(module constns.ambiguous)
+(import "constns.tcp" :use *)
+(import "constns.unix" :use *)
+(defn main [] (-> i64) SOCKET_ERROR_CLOSED)
+EOF
+expect_out "'SOCKET_ERROR_CLOSED' is ambiguous" "same-named :use'd constants are ambiguous at the reference" \
+  "$COIL" build "$T/const-ns/src/ambiguous.coil" -o "$T/const-ns/x"
+
+cat > "$T/const-ns/src/duplicate.coil" <<'EOF'
+(module constns.duplicate)
+(const VALUE 1)
+(const VALUE 2)
+(defn main [] (-> i64) VALUE)
+EOF
+expect_out "const 'constns.duplicate.VALUE' defined more than once" "duplicate constants in one module still fail" \
+  "$COIL" build "$T/const-ns/src/duplicate.coil" -o "$T/const-ns/x"
+
+cat > "$T/const-ns/Coil.toml" <<'EOF'
+[package]
+name = "const-ns"
+entry = "src/main.coil"
+source-roots = ["src"]
+exclude = ["src/ambiguous.coil", "src/duplicate.coil"]
+EOF
+( cd "$T/const-ns" && "$COIL" lint >/dev/null 2>&1 ) \
+  && ok "project lint accepts unrelated modules with same-named constants" \
+  || bad "project lint constant namespaces" "lint rejected the aggregate module graph"
+
 echo "== a compile that cannot finish must SAY SO, not hang or crash =="
 # These all used to die with zero output: no message, no location, nothing naming the
 # construct — the worst possible failure for a mistake a typo can cause.
@@ -2659,8 +2720,7 @@ cat > "$T/qual/src/qlib.coil" <<'EOF'
 (import "coil.derive" :use *)
 (import "coil.primitive" :as primitive)
 (defstruct Inner [(x i64)])
-(derive-eq Inner)
-(derive-hash Inner)
+(derive Eq Hash Inner)
 EOF
 cat > "$T/qual/src/qlib2.coil" <<'EOF'
 (module qlib2)
@@ -2672,8 +2732,7 @@ cat > "$T/qual/src/deq.coil" <<'EOF'
 (import "coil.primitive" :as primitive)
 (import "qlib" :as l)
 (defstruct Outer [(inner l/Inner) (y i64)])
-(derive-eq Outer)
-(derive-hash Outer)
+(derive Eq Hash Outer)
 (defn main [] (-> i64) 0)
 EOF
 cat > "$T/qual/src/dserde.coil" <<'EOF'
@@ -2685,13 +2744,13 @@ cat > "$T/qual/src/dserde.coil" <<'EOF'
 (import "coil.str" :use *)
 (import "coil.result" :use *)
 (import "qlib2" :as s)
-(derive-serde-sum s/Shape)
+(derive Serialize Deserialize s/Shape)
 (defn main [] (-> i64) 0)
 EOF
-expect_rc 0 "qual: derive-eq/-hash over a field typed through an :as import" \
+expect_rc 0 "qual: Eq/Hash derive over a field typed through an :as import" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=src "$2" check src/deq.coil' \
   _ "$T/qual" "$COIL"
-expect_rc 0 "qual: derive-serde-sum on a sum reached through an :as import" \
+expect_rc 0 "qual: Serialize/Deserialize derive on a sum reached through an :as import" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=src "$2" check src/dserde.coil' \
   _ "$T/qual" "$COIL"
 

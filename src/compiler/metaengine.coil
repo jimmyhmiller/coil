@@ -37,6 +37,7 @@
 (import "metahost" :use *)
 (import "ffi" :use *)
 (import "macho" :use *)  ; MObj — the in-memory object handed to jit.coil
+(import "jit" :use *)
 
 (extern dlopen :cc c [(ptr i8) i64] (-> (ptr i8)))
 (extern dlsym :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
@@ -371,6 +372,15 @@
 (defn meta-interp-active? [] (-> bool)
   (!= (load (field (meta-interp-box) isset)) (primitive/cast i64 0)))
 
+; Compile metaprograms with the ordinary arm64 backend and load the resulting
+; object directly into executable memory. Unlike the interpreter this preserves
+; native recursive-walk performance; unlike the dylib path it does not fork cc or
+; touch the filesystem. Opt-in keeps existing engine selection byte-for-byte stable.
+(defn meta-jit-active? [] (-> bool)
+  (let [v (getenv c"COIL_META_JIT")]
+    (and (!= (primitive/cast i64 v) 0)
+         (and (= (cstr->slice v) "1") (meta-mobj-available?)))))
+
 ; ---- wasm-sandbox flag: no pthread. Set by the wasm-hosted entry (main_wasm); makes
 ; run-on-big-stack run the pipeline inline (the sandbox is single-threaded and the
 ; shadow stack is the whole reserved stack). Distinct from meta-interp-active?, which
@@ -612,8 +622,8 @@
          (let [bb (meta-build-box)]
            (when (= (load (field bb isset)) (primitive/cast i64 0))
              (break :try
-                    (Err [(ptr i8) Diag]
-                         (derr "metaengine: this compiler build has no backend object builder registered, so it cannot compile metaprograms (compiler bug)"))))
+                      (Err [(ptr i8) Diag]
+                           (derr "metaengine: this compiler build has no backend object builder registered, so it cannot compile metaprograms (compiler bug)"))))
            (let [mp (try! (monomorphize a lowered))]
              (sort-mono-program a mp)
              (let [cdir (if (me-cache-on?) (me-cache-dir a) (None [(slice u8)]))
@@ -752,14 +762,60 @@
                          (store! i (primitive/iadd (load i) 1)))))
              (Ok [(ptr (ArrayList MEEntry)) Diag] (box-al [MEEntry] a (load out))))))))
 
+(defn me-setup-jit [(a (ptr Allocator)) (mo (ptr MLOut))] (-> (Result (ptr (ArrayList MEEntry)) Diag))
+  (try (do
+         (let [mp (try! (monomorphize a (load (field mo prog))))]
+           (sort-mono-program a mp)
+           (let [(mut obj) (primitive/call-ptr (load (field (meta-mobj-box) fp)) a mp)]
+             (match (jit-load a (mut obj))
+               (Err [e0]
+                    (let [e (alloc/stack JitErr)]
+                      (store! e e0)
+                      (Err [(ptr (ArrayList MEEntry)) Diag] (derr (load (field e msg))))))
+               (Ok [img0]
+                   (let [img (unwrap-ptr [JitImage] (create [JitImage] a))
+                         es (load (field mo entries))
+                         n (al-len [MLEntry] (load es))
+                         (mut out) (al-new [MEEntry] a)
+                         (mut i) 0]
+                     (store! img img0)
+                     (let [init (jit-lookup img "coil_mp_init")]
+                       (when (= (primitive/cast i64 init) 0)
+                         (return-from :try
+                                        (Err [(ptr (ArrayList MEEntry)) Diag]
+                                             (derr "metaengine: JIT image is missing coil_mp_init"))))
+                       (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8)] i64) init)
+                                           (meta-vtable)))
+                     (loop (if (>= (load i) n)
+                               (break)
+                               (do
+                                 (let [ep (al-elem [MLEntry] es (load i))
+                                       me (alloc/stack MEEntry)
+                                       fp (jit-lookup img (load (field ep symbol)))]
+                                   (when (= (primitive/cast i64 fp) 0)
+                                     (return-from :try
+                                                    (Err [(ptr (ArrayList MEEntry)) Diag]
+                                                         (derr "metaengine: JIT image is missing a metaprogram entry"))))
+                                   (store! (field me name) (load (field ep name)))
+                                   (store! (field me fp) fp)
+                                   (store! (field me registry) (load (field mo registry)))
+                                   (store! (field me symbol) (load (field ep symbol)))
+                                   (store! (field me modbytes) "")
+                                   (store! (field me interpcx) (primitive/cast (ptr i8) 0))
+                                   (al-push! (mut out) (load me)))
+                                 (store! i (primitive/iadd (load i) 1)))))
+                     (Ok [(ptr (ArrayList MEEntry)) Diag] (box-al [MEEntry] a (load out)))))))))))
+
 ; ---- one-time engine setup (from expand-stage3, after check-program) ----------------
 (defn meta-engine-setup [(a (ptr Allocator)) (checked (ptr Program)) (quals (ptr (ArrayList (slice u8))))] (-> (Option Diag))
   (match (metalower-program a checked quals)
     (Err [d] (Some d))
     (Ok [mo]
-        (match (if (meta-interp-active?)
-                   (me-setup-interp a mo)
-                   (if (meta-wasm-active?) (me-setup-wasm a mo) (me-setup-native a mo)))
+        (match (if (meta-jit-active?)
+                   (me-setup-jit a mo)
+                   (if (meta-interp-active?)
+                       (me-setup-interp a mo)
+                       (if (meta-wasm-active?) (me-setup-wasm a mo) (me-setup-native a mo))))
           (Err [d] (Some d))
           (Ok [outl]
               (let [out (load outl)]
@@ -903,6 +959,67 @@
                                                                 (load (field c a6))
                                                                 (load (field c a7))))))))))))
     (primitive/cast (ptr i8) 0)))
+
+; One native metaprogram runs at a time, so a process-wide worker can reuse both
+; its pthread and its reserved deep stack. The old path created/joined a 256 MiB
+; worker for every macro/checker invocation. A metaprogram error still exits only
+; this worker: mh-halt wakes the caller through the abort hook, and the next call
+; lazily starts a replacement.
+(defstruct MEWorker
+  [(ready i64)
+   (alive i64)
+   (request (ptr i8))
+   (done (ptr i8))
+   (tid (ptr i8))
+   (call (ptr MPCall))])
+(defn me-worker [] (-> (ptr MEWorker))
+  (alloc/static MEWorker))
+(defn me-worker-abort-wake [(ctx (ptr i8))] (-> i64)
+  (me-sem-signal (load (field (primitive/cast (ptr MEWorker) ctx) done))))
+(defn me-worker-entry [(arg (ptr i8))] (-> (ptr i8))
+  (let [w (primitive/cast (ptr MEWorker) arg)]
+    (loop (do
+            (me-sem-wait (load (field w request)) -1)
+            (me-tramp (primitive/cast (ptr i8) (load (field w call))))
+            (me-sem-signal (load (field w done))))))
+  (primitive/cast (ptr i8) 0))
+(defn me-worker-start! [(w (ptr MEWorker))] (-> i64)
+  (when (= (load (field w ready)) (primitive/cast i64 0))
+    (store! (field w request) (me-sem-create 0))
+    (store! (field w done) (me-sem-create 0))
+    (store! (field w ready) 1)
+    0)
+  (let [attr (alloc/stack (array i8 64))
+        tid (alloc/stack (ptr i8))]
+    (pthread_attr_init (primitive/cast (ptr i8) attr))
+    (pthread_attr_setstacksize (primitive/cast (ptr i8) attr) (worker-stack-size))
+    (pthread_attr_setguardsize (primitive/cast (ptr i8) attr) (worker-guard-size))
+    (pthread_create (primitive/cast (ptr i8) tid)
+                    (primitive/cast (ptr i8) attr)
+                    (primitive/fnptr-of me-worker-entry)
+                    (primitive/cast (ptr i8) w))
+    (pthread_attr_destroy (primitive/cast (ptr i8) attr))
+    (store! (field w tid) (load tid))
+    (store! (field w alive) 1)
+    0))
+(defn me-worker-call [(c (ptr MPCall))] (-> bool)
+  (let [w (me-worker)]
+    (when (= (load (field w alive)) (primitive/cast i64 0)) (me-worker-start! w) 0)
+    (store! (field w call) c)
+    (meta-host-abort-hook! (primitive/cast (ptr i8) (primitive/fnptr-of me-worker-abort-wake))
+                           (primitive/cast (ptr i8) w))
+    (me-sem-signal (load (field w request)))
+    (me-sem-wait (load (field w done)) -1)
+    (meta-host-abort-hook! (primitive/cast (ptr i8) 0) (primitive/cast (ptr i8) 0))
+    (match (meta-host-err)
+      (Some [_]
+            (do
+              ; mh-halt exited the worker. Reap its stack now; the next call starts
+              ; a clean replacement instead of reusing corrupted control state.
+              (pthread_join (load (field w tid)) (primitive/cast (ptr i8) 0))
+              (store! (field w alive) 0)
+              true))
+      (None [] false))))
 
 (defn me-box-arg [(a (ptr Allocator)) (s Sexp)] (-> (ptr i8))
   (let [p (unwrap-ptr [Sexp] (create [Sexp] a))] (store! p s) (primitive/cast (ptr i8) p)))
@@ -1068,19 +1185,7 @@
                       ; COIL_META_MAIN=1: run on the process MAIN thread (AppKit
                       ; metaprograms); an (primitive/error ...) there prints and exits.
                       (do (meta-host-onmain! 1) (main-svc-run (primitive/cast (ptr i8) c)) false)
-                      (let [attr (alloc/stack (array i8 64))
-                            tid (alloc/stack (ptr i8))
-                            rv (alloc/stack (ptr i8))]
-                        (pthread_attr_init (primitive/cast (ptr i8) attr))
-                        (pthread_attr_setstacksize (primitive/cast (ptr i8) attr) (worker-stack-size))
-                        (pthread_attr_setguardsize (primitive/cast (ptr i8) attr) (worker-guard-size))
-                        (pthread_create (primitive/cast (ptr i8) tid)
-                                        (primitive/cast (ptr i8) attr)
-                                        (primitive/fnptr-of me-tramp)
-                                        (primitive/cast (ptr i8) c))
-                        (pthread_attr_destroy (primitive/cast (ptr i8) attr))
-                        (pthread_join (load tid) (primitive/cast (ptr i8) rv))
-                        (!= (primitive/cast i64 (load rv)) (primitive/cast i64 0))))]
+                      (me-worker-call c))]
             (if failed
                 (match (meta-host-err)
                   (Some [d] (Err [Sexp Diag] d))
@@ -1108,7 +1213,8 @@
                   (if (is-ccode v) (do (al-push! (mut argv) (ccode-of v)) 0) (do (store! bad true) (break))))
                 (store! i (primitive/iadd (load i) 1)))))
     (cond (load bad) (Err [Sexp Diag] (derr "metaengine: non-Code value in a metaprogram argument env (compiler bug)"))
-          (meta-interp-active?)  ; the interpreter looks the entry up by its coil FUNCTION name (the qual
+          (!= (primitive/cast i64 (load (field e interpcx))) 0)
+          ; the interpreter looks the entry up by its coil FUNCTION name (the qual
           ; name), not the export-c symbol (coil_mp_<k>) the compiled backends emit.
           (meta-engine-invoke-interp a
                                      (load (field e name))
@@ -1116,7 +1222,7 @@
                                      (load (field e registry))
                                      cx
                                      (box-al [Sexp] a (load argv)))
-            (meta-wasm-active?)
+            (> (slice-len [u8] (load (field e modbytes))) 0)
           (meta-engine-invoke-wasm a
                                    (load (field e symbol))
                                    (load (field e modbytes))
