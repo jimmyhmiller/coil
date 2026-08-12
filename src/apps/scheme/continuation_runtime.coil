@@ -1,0 +1,149 @@
+(module coil.scheme.continuation-runtime)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.scheme.value" :use *)
+(import "coil.scheme.heap" :use *)
+
+;; Native, multi-shot continuations for the optional continuation compilation
+;; mode.  A capture owns a copy of the native stack from the capture point to the
+;; entry boundary established by the dialect pass.  Invoking it restores that
+;; copy and jumps back through the saved libc context.  No expression evaluator
+;; participates: resumed code is the same compiled machine code that ran first.
+;;
+;; This first backend is deliberately native-only.  Wasm needs a separate
+;; stack-switching implementation rather than pretending libc setjmp exists.
+(extern malloc :cc c [i64] (-> (ptr u8)))
+(extern memcpy :cc c [(ptr u8) (ptr u8) i64] (-> (ptr u8)))
+(extern __sigsetjmp :cc c [(ptr i8) i32] (-> i32))
+(extern siglongjmp :cc c [(ptr i8) i32] (-> void))
+
+(defstruct NativeContinuation
+  [(jump (array i64 32))
+   (stack (ptr u8))
+   (low i64)
+   (size i64)])
+
+(defn continuation-stack-base-cell [] (-> (ptr i64)) (alloc/static i64))
+(defn continuation-resume-value-cell [] (-> (ptr i64)) (alloc/static i64))
+(defn continuation-resuming-cell [] (-> (ptr i64)) (alloc/static i64))
+(defn continuation-wind-cell [] (-> (ptr i64)) (alloc/static i64))
+
+(defn continuation-frame-address [] (-> i64)
+  (primitive/llvm-ir i64 []
+    "%p = call ptr @llvm.frameaddress.p0(i32 0)\n%r = ptrtoint ptr %p to i64\nret i64 %r"))
+
+;; Inserted once in native main by the opt-in dialect pass.
+(defn continuation-stack-enter [] (-> i64)
+  (primitive/store! (continuation-stack-base-cell) (continuation-frame-address))
+  0)
+
+(defn continuation-jump-buffer [(s (ptr NativeContinuation))] (-> (ptr i8))
+  (primitive/cast (ptr i8) (primitive/field s jump)))
+
+(defn continuation-state [(k i64)] (-> (ptr NativeContinuation))
+  (primitive/cast (ptr NativeContinuation)
+    (primitive/load (primitive/field (obj-of k) a))))
+
+;; The shadow root stack is static storage rather than part of the native stack.
+;; Preserve its live prefix as a Scheme list in the continuation object, so the
+;; ordinary precise marker traces every captured value while the continuation is
+;; dormant.
+(defn continuation-save-roots [(i i64) (top i64)] (-> i64)
+  (if (>= i top) (s-nil)
+    (cons (primitive/load (primitive/index (g-roots) i))
+          (continuation-save-roots (+ i 1) top))))
+
+(defn continuation-restore-roots [(roots i64)] (-> i64)
+  (gc-sp-set! 0)
+  (let [(mut xs) roots]
+    (loop
+      (if (is-null (primitive/load (mut xs))) (break)
+        (do (gc-root (car (primitive/load (mut xs))))
+            (primitive/store! (mut xs) (cdr (primitive/load (mut xs))))))))
+  0)
+
+(defn continuation-capture [] (-> i64)
+  (let [raw (malloc (primitive/sizeof NativeContinuation))
+        s (primitive/cast (ptr NativeContinuation) raw)
+        jumped (__sigsetjmp (continuation-jump-buffer s) 0)]
+    (if (= jumped 0)
+        (let [low (continuation-frame-address)
+              high (primitive/load (continuation-stack-base-cell))
+              size (- high low)
+              copy (malloc size)
+              roots (continuation-save-roots 0 (gc-sp))]
+          (memcpy copy (primitive/cast (ptr u8) low) size)
+          (primitive/store! (primitive/field s stack) copy)
+          (primitive/store! (primitive/field s low) low)
+          (primitive/store! (primitive/field s size) size)
+          ;; A raw state pointer is safe in slot a: the marker validates all
+          ;; aligned words against its managed slabs before dereferencing them.
+          (allocate (tag-continuation) (primitive/cast i64 s) roots
+                    (continuation-current-winds)))
+      (primitive/load (continuation-resume-value-cell)))))
+
+(defn continuation-current-winds [] (-> i64)
+  (let [w (primitive/load (continuation-wind-cell))]
+    (if (= w 0) (s-nil) w)))
+
+;; A wind frame is (before after . parent).  It is ordinary traced Scheme data,
+;; so captured continuations keep both thunks and the parent chain alive.
+(defn continuation-wind-push [(before i64) (after i64)] (-> i64)
+  (let [sp (gc-sp) parent (continuation-current-winds)]
+    (gc-root before) (gc-root after) (gc-root parent)
+    (let [tail (cons after parent)]
+      (gc-root tail)
+      (let [frame (cons before tail)]
+        (gc-root-permanent frame)
+        (primitive/store! (continuation-wind-cell) frame)
+        (gc-sp-set! sp)
+        frame))))
+
+(defn continuation-wind-before [(w i64)] (-> i64) (car w))
+(defn continuation-wind-after [(w i64)] (-> i64) (car (cdr w)))
+(defn continuation-wind-parent [(w i64)] (-> i64) (cdr (cdr w)))
+(defn continuation-wind-set-current! [(w i64)] (-> i64)
+  (primitive/store! (continuation-wind-cell) w)
+  0)
+(defn continuation-target-winds [(k i64)] (-> i64)
+  (primitive/load (primitive/field (obj-of k) c)))
+
+(defn continuation-resuming? [] (-> bool)
+  (= (primitive/load (continuation-resuming-cell)) 1))
+
+(defn continuation-take-resume-value [] (-> i64)
+  (primitive/store! (continuation-resuming-cell) 0)
+  (primitive/load (continuation-resume-value-cell)))
+
+;; Grow downward until this helper's active frame cannot be overwritten by the
+;; saved range, then restore and transfer.  The stack scratch prevents tail-call
+;; elimination from collapsing the recursion that creates the safe gap.
+(defn continuation-restore-and-jump [(k i64)] (-> i64)
+  (let [s (continuation-state k)
+        here (continuation-frame-address)
+        low (primitive/load (primitive/field s low))]
+    (if (< here low)
+        (do
+          (continuation-restore-roots
+            (primitive/load (primitive/field (obj-of k) b)))
+          (memcpy (primitive/cast (ptr u8) low)
+                  (primitive/load (primitive/field s stack))
+                  (primitive/load (primitive/field s size)))
+          (siglongjmp (continuation-jump-buffer s) 1)
+          0)
+      (let [scratch (primitive/alloc-stack (array u8 4096))]
+        (primitive/store! (primitive/index scratch 0) 1)
+        (+ (continuation-restore-and-jump k)
+           (primitive/cast i64 (primitive/load (primitive/index scratch 0))))))))
+
+(defn continuation-invoke [(k i64) (value i64)] (-> i64)
+  (primitive/store! (continuation-resume-value-cell) value)
+  (primitive/store! (continuation-resuming-cell) 1)
+  (continuation-restore-and-jump k))
+
+(export continuation-stack-enter continuation-capture continuation-resuming?
+        continuation-take-resume-value continuation-invoke
+        continuation-current-winds continuation-wind-push
+        continuation-wind-before continuation-wind-after
+        continuation-wind-parent continuation-wind-set-current!
+        continuation-target-winds)

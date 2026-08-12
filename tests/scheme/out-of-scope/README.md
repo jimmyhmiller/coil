@@ -32,31 +32,6 @@ Consequences worth knowing:
 This is a real conformance gap, not a bug to be filed. If it ever moves back in
 scope, this case is the arbiter.
 
-## 03-callcc
-
-R5RS §6.4 requires `call-with-current-continuation` with unlimited extent: the
-continuation may be invoked any number of times, from any dynamic extent, and
-*after the capture already returned*. That is what makes generators, coroutines
-and `amb` work.
-
-Deliberately not attempted. Capturing a native stack so it can be resumed more
-than once means copying it (Chicken-style) or never returning at all — decisions
-that shape every function the dialect emits, in exchange for a feature most
-Scheme programs never use.
-
-Escape-only continuations — downward, one-shot, `setjmp`-shaped — are a separate
-and much cheaper thing, and would cover early return and exception-like control.
-If that turns out to be wanted, it is a different feature with a different case;
-it is **not** a partial `call/cc`, and calling it one would be the kind of quiet
-half-conformance this directory exists to prevent.
-
-## 04-dynamic-wind
-
-Goes with `call/cc` rather than being an independent decision. `dynamic-wind`'s
-`before`/`after` thunks exist to run when a continuation enters or leaves an
-extent; with no continuations to escape to, it degenerates to
-`(begin (before) (thunk) (after))`.
-
-That degenerate form may still be worth providing — it is what most uses of
-`dynamic-wind` actually rely on — but it would not be the R5RS semantics, so the
-conformance case stays here.
+Continuations moved into the optional compiler setup and are now tested under
+`tests/scheme/continuations/`. This directory retains only requirements still
+deferred by the implementation.

@@ -85,19 +85,20 @@ a cached object and compare by id.
 `case`, `and`/`or`, `do`, quasiquote: all ordinary macros over forms Coil already
 has. The standard procedures are ordinary functions over the runtime.
 
-**Out of scope, by decision** — the two R5RS mandates whose cost falls on *every*
-function the dialect emits, in exchange for features most programs never use:
+**Optional or deferred** — the R5RS mandates whose implementation strategy
+should not impose a cost on ordinary Scheme builds:
 
 - **Proper tail calls (§3.5).** Coil guarantees self-tail calls; R5RS wants
   unbounded tail calls including mutual recursion. Programs here recurse on the
   native stack and are bounded by it, like C.
-- **`call/cc` (§6.4) and `dynamic-wind`.** Re-entrant continuations against a
-  native stack means copying the stack or never returning. Not attempted.
+- **`call/cc` (§6.4) and `dynamic-wind`.** Enable native, unlimited-extent,
+  multi-shot continuations for the whole build with
+  `--use coil.scheme.continuations`. The composed dialect pass establishes a
+  stack boundary; captures snapshot compiled native frames plus the precise GC
+  root prefix, and transfers perform the required dynamic-wind exits/entries.
 
-Both keep their conformance cases under `tests/scheme/out-of-scope/`, so the gap
-stays visible and measured rather than quietly forgotten. Escape-only
-continuations remain a possible *separate* feature; they are not a partial
-`call/cc`.
+Continuation conformance cases live under `tests/scheme/continuations/` and run
+only in that compiler setup. The default pipeline remains unchanged.
 
 Removing these two is what makes the dialect model cheap. Everything left is
 macros over forms Coil already has, plus a runtime.

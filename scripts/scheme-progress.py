@@ -59,6 +59,12 @@ APPLICATION_CASES = {
     "lox_acceptance.coil": "lox.txt",
 }
 
+CONTINUATION_CASES = {
+    "03-callcc.scm": "42\n3\n2\n3\n4\n(reentered 3)\n",
+    "04-dynamic-wind.scm":
+        "(before during after)\n(in out)\n(enter body exit enter exit)\n",
+}
+
 NEGATIVE_CASES = {
     "private_import_rejected.coil": "unbound variable 'hidden-proc'",
     "comparison_arity.coil": "comparison expects at least two arguments",
@@ -188,6 +194,24 @@ def run_dialect_cases(compiler: str) -> None:
                     f"expected:\n{expected}got:\n{proc.stdout}"
                 )
             print(f"PASS plain {source_name} == {expected_name}", flush=True)
+
+        for source_name, expected in CONTINUATION_CASES.items():
+            source = ROOT / "tests/scheme/continuations" / source_name
+            binary = Path(tmp) / ("continuations-" + source.stem)
+            run([compiler, "build", str(source), "-o", str(binary),
+                 "--use", "coil.scheme.continuations", "--quiet"])
+            proc = subprocess.run([str(binary)], cwd=ROOT, capture_output=True,
+                                  text=True, check=False)
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, [str(binary)],
+                                                    output=proc.stdout,
+                                                    stderr=proc.stderr)
+            if proc.stdout != expected:
+                raise RuntimeError(
+                    f"{source_name}: continuation output differs\n"
+                    f"expected:\n{expected}got:\n{proc.stdout}"
+                )
+            print(f"PASS {source_name} (optional continuations)", flush=True)
 
 
 def run_application_cases(compiler: str) -> None:
