@@ -13,7 +13,7 @@ printf 'reader metaprogram\n' |
 5 because its closing bracket has no matching opener.
 
 `coil.brainfuck` declares `coil.brainfuck.reader/read-brainfuck` as its read
-provider. The provider receives the raw file as `Code` and returns a complete Coil
-module importing `coil.brainfuck.runtime`. From there the ordinary loader, checker,
-native compiler, and linker take over. No evaluator or preprocessing adapter is
-involved.
+provider. The provider parses the raw file at compile time and emits a complete
+Coil module containing direct tape operations and native loops. From there the
+ordinary loader, checker, native compiler, and linker take over. The executable
+contains no Brainfuck opcode interpreter, evaluator, or preprocessing adapter.
