@@ -2,9 +2,8 @@
 """Run the classic Jaffer R4RS/R5RS corpus through Coil's runtime evaluator.
 
 The GPL corpus is fetched into a temporary directory and is never vendored.
-This audit excludes only the suite helper that depends on an unprovided
-``list-length`` extension, its nonstandard ``ash`` extension, and its deep
-tail-recursive float-printer stress test. The
+This audit excludes only continuation-dependent forms, the suite's nonstandard
+``ash`` extension, and its deep tail-recursive float-printer stress test. The
 ordinary inexact, exact-bignum, port, reader, and report-procedure tests remain.
 """
 
@@ -30,7 +29,9 @@ PROBE = r'''(module scheme-r4rs-audit)
 (define skipped-forms 0)
 (define (contains-deferred? datum)
   (if (symbol? datum)
-      (eq? datum 'list-length)
+      (or (eq? datum 'call-with-current-continuation)
+          (or (eq? datum 'call/cc)
+              (or (eq? datum 'dynamic-wind) (eq? datum 'list-length))))
       (if (pair? datum)
           (or (contains-deferred? (car datum))
               (contains-deferred? (cdr datum)))
@@ -44,19 +45,13 @@ PROBE = r'''(module scheme-r4rs-audit)
           (set! audited-forms (+ audited-forms 1))
           (if (contains-deferred? datum)
               (set! skipped-forms (+ skipped-forms 1))
-              (continuation-eval datum audit-environment))
+              (eval datum audit-environment))
           (audit-port port)))))
 
 (defn main [] (-> i64)
   (call-with-input-file "r4rstest.scm" audit-port)
-  ;; The upstream file deliberately defines these optional/deeper groups but
-  ;; leaves invocation to the runner. Exercise the full multi-shot generator,
-  ;; promises, and Scheme-4 compatibility groups explicitly.
-  (continuation-eval '(test-cont) audit-environment)
-  (continuation-eval '(test-delay) audit-environment)
-  (continuation-eval '(test-sc4) audit-environment)
   (display "COIL-R4RS-AUDIT forms=") (display audited-forms)
-  (display " skipped-extension=") (display skipped-forms) (newline)
+  (display " skipped-deferred=") (display skipped-forms) (newline)
   (fixnum-value (mk-fixnum 0)))
 '''
 
@@ -120,7 +115,7 @@ def main() -> int:
         if marker is None:
             raise RuntimeError(f"corpus did not reach its audit marker\n{proc.stdout}")
         print(f"PASS classic R4RS/R5RS corpus: {marker.removeprefix('COIL-R4RS-AUDIT ')}")
-        print("exclusions: list-length extension; nonstandard ash; deep tail-recursive float printer")
+        print("exclusions: continuations/list-length; nonstandard ash; deep tail-recursive float printer")
     return 0
 
 

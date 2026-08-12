@@ -45,11 +45,6 @@ DIALECT_CASES = {
 # the public invocation contract `coil build FILE.scm --use coil.scheme`.
 PLAIN_ENTRY_CASES = {
     "cases/01-core-eval.scm": "01-core-eval.txt",
-    "cases/03-callcc-core.scm": "03-callcc-core.txt",
-    "cases/03-callcc-eval.scm": "03-callcc-eval.txt",
-    "cases/03-callcc.scm": "03-callcc.txt",
-    "cases/03-callcc-tail.scm": "03-callcc-tail.txt",
-    "cases/04-dynamic-wind.scm": "04-dynamic-wind.txt",
     "cases/05-derived-forms.scm": "plain-05-derived-forms.txt",
     "cases/06-quasiquote.scm": "plain-06-quasiquote.txt",
     "cases/07-syntax-rules.scm": "plain-07-syntax-rules.txt",
@@ -136,15 +131,16 @@ string=? string<? string>? string<=? string>=? string-ci=? string-ci<?
 string-ci>? string-ci<=? string-ci>=? substring string-append string->list
 list->string string-copy string-fill! vector? make-vector vector vector-length
 vector-ref vector-set! vector->list list->vector vector-fill! procedure? apply
-map for-each force values call-with-values call-with-current-continuation call/cc
-dynamic-wind eval scheme-report-environment
+map for-each force values call-with-values eval scheme-report-environment
 null-environment interaction-environment input-port? output-port?
 current-input-port current-output-port call-with-input-file call-with-output-file
 with-input-from-file with-output-to-file open-input-file open-output-file
 close-input-port close-output-port read read-char peek-char eof-object?
 char-ready? write display newline write-char load transcript-on transcript-off
 """.split())
-R5RS_DEFERRED_PROCEDURES: set[str] = set()
+R5RS_DEFERRED_PROCEDURES = {
+    "call-with-current-continuation", "call/cc", "dynamic-wind",
+}
 R5RS_TODO_PROCEDURES: set[str] = set()
 
 
@@ -286,19 +282,20 @@ def run_surface_inventory(compiler: str) -> None:
         raise RuntimeError("R5RS procedure inventory contains a duplicate")
     chunks = [R5RS_PROCEDURES[i:i + 20]
               for i in range(0, len(R5RS_PROCEDURES), 20)]
-    lines: list[str] = []
+    lines = ["(module r5rs-surface-inventory)",
+             '(import "coil.scheme" :use *)',
+             "(defn main [] (-> i64)"]
     for chunk in chunks:
         checks = " ".join(
             f"(let ((p {name})) (procedure? p))" for name in chunk
         )
-        lines.extend([f"(write (list {checks}))", "(newline)"])
-    lines.append("")
+        lines.extend([f"  (write (list {checks}))", "  (newline)"])
+    lines.extend(["  (fixnum-value (mk-fixnum 0)))", ""])
     with tempfile.TemporaryDirectory(prefix="coil-scheme-surface-") as tmp:
-        source = Path(tmp) / "r5rs_surface_inventory.scm"
+        source = Path(tmp) / "r5rs_surface_inventory.coil"
         binary = Path(tmp) / "r5rs_surface_inventory"
         source.write_text("\n".join(lines))
-        run([compiler, "build", str(source), "--use", "coil.scheme",
-             "-o", str(binary), "--quiet"])
+        run([compiler, "build", str(source), "-o", str(binary), "--quiet"])
         proc = subprocess.run([str(binary)], cwd=ROOT, capture_output=True,
                               text=True, check=True)
     results = proc.stdout.replace("(", " ").replace(")", " ").split()

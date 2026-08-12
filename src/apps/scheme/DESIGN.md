@@ -8,7 +8,7 @@
 That is the whole idea. One import, and Scheme works — compiled to native code
 through Coil's ordinary pipeline.
 
-## Native by default; an explicit machine only where control is captured
+## There is no compiler and no interpreter
 
 **Scheme syntax is already Coil syntax.** Both are s-expressions read by the same
 reader; `(define (fib n) …)` parses today, unmodified. What is missing is not a
@@ -21,13 +21,10 @@ So `define` is a macro. It expands to `defn`. `lambda` expands to a closure,
 `let` to a `let`, `cond` to nested `if`. Scheme's forms become Coil's forms at
 expansion time, and what reaches codegen is an ordinary Coil program.
 
-This is not a transpiler emitting text. Continuation-free programs use the
-language's existing macro system with an R5RS surface bound to it and compile as
-ordinary native Coil. A plain `.scm` entry that uses `call/cc`, `dynamic-wind`,
-`eval`, or `load` is instead materialized as Scheme data and executed by the
-portable CEK machine in `eval.coil`. That selective route is necessary because a
-native return address cannot provide unlimited, multi-shot extent. It does not
-tax the ordinary compiled fast path.
+This is not a transpiler emitting text, and not an evaluator walking a tree. It
+is the language's existing macro system with an R5RS surface bound to it. Proven
+in ~6 lines: a `define` macro over `defn` compiles `(fib 32)` to native code that
+runs in **7 ms**, against Chez's 54 ms — because it *is* native code.
 
 ## The three pillars
 
@@ -88,27 +85,31 @@ a cached object and compare by id.
 `case`, `and`/`or`, `do`, quasiquote: all ordinary macros over forms Coil already
 has. The standard procedures are ordinary functions over the runtime.
 
-**Continuation work is isolated from the ordinary fast path.** The native
-compiled path remains the default for programs that do not capture control.
+**Out of scope, by decision** — the two R5RS mandates whose cost falls on *every*
+function the dialect emits, in exchange for features most programs never use:
 
-- **Proper tail calls (§3.5)** are implemented for direct, cross-arity, computed,
-  first-class, `apply`, and `call-with-values` tail calls.
-- **`call/cc` (§6.4) and `dynamic-wind`** use immutable, GC-traced heap frames.
-  The machine supports unlimited post-return multi-shot re-entry, computes
-  shared dynamic extents for correctly ordered `before`/`after` transitions,
-  and keeps `eval`, derived syntax, promises, `load`, and ambient file ports in
-  the same continuation protocol.
+- **Proper tail calls (§3.5).** Coil guarantees self-tail calls; R5RS wants
+  unbounded tail calls including mutual recursion. Programs here recurse on the
+  native stack and are bounded by it, like C.
+- **`call/cc` (§6.4) and `dynamic-wind`.** Re-entrant continuations against a
+  native stack means copying the stack or never returning. Not attempted.
 
-The former continuation conformance cases are now public bounded-gate cases:
-`03-callcc.scm`, `03-callcc-tail.scm`, and `04-dynamic-wind.scm`.
+Both keep their conformance cases under `tests/scheme/out-of-scope/`, so the gap
+stays visible and measured rather than quietly forgotten. Escape-only
+continuations remain a possible *separate* feature; they are not a partial
+`call/cc`.
+
+Removing these two is what makes the dialect model cheap. Everything left is
+macros over forms Coil already has, plus a runtime.
 
 **Still hard:**
 
-- **`syntax-rules`.** Implemented for compiled Scheme and runtime `eval`, but its
-  binding-identity and nested-ellipsis invariants remain regression-sensitive.
-- **The numeric tower.** Implemented through arbitrary exact integers/rationals,
-  inexact reals, and complex numbers; branch cuts and fast bignum algorithms
-  remain active hardening/performance work.
+- **`syntax-rules`.** Hygienic macros with nested ellipsis, and R5RS's literal
+  rule (a rebound `else` must stop being the `else` keyword). Coil's macro system
+  is already hygienic, so the open question is how much we inherit versus
+  reimplement.
+- **The numeric tower.** R5RS requires exact integers of unbounded size, so
+  fixnum overflow must promote to a bignum rather than wrap.
 - **GC rooting.** The one pillar that is genuinely unavoidable — see above.
 
 The bounded development loop is:
@@ -132,8 +133,5 @@ The live feature-by-feature ledger and application acceptance target are in
 
 ## Status
 
-The bounded Scheme gate covers 11 implementation suites, 22 public oracle
-programs, all 201 first-class report procedures with no deferred entries, 39
-negative cases, and two larger Scheme applications. The detailed current ledger
-is the linked `R5RS_STATUS.md`; do not infer current status from historical test
-counts in old commits.
+Runtime pieces, tested: `value.coil` (6), `heap.coil` (5), `symbol.coil` (5).
+Next: bind the R5RS surface as macros and get the conformance cases moving.
