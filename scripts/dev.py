@@ -346,7 +346,10 @@ def test_modernize_fast(compiler: str) -> None:
             hex_probe.write_text(r'''(module legacy-hex-escape)
 ; A comment containing "\x42" is not source syntax.
 (defn main [] (-> i64)
-  (let [text "\x41face"
+  (let [legacy \a
+        delimiter \]
+        canonical #\space
+        text "\x41face"
         bytes c"\x00Z"
         current "\x3bb;"]
     0))
@@ -357,6 +360,10 @@ def test_modernize_fast(compiler: str) -> None:
                 raise RuntimeError("fast modernization gate: legacy hex escapes were not terminated")
             if '; A comment containing "\\x42"' not in hex_fixed or '"\\x3bb;"' not in hex_fixed:
                 raise RuntimeError("fast modernization gate: hex escape preflight edited non-legacy text")
+            if "legacy #\\a" not in hex_fixed or "delimiter #\\]" not in hex_fixed:
+                raise RuntimeError("fast modernization gate: legacy character literals were not migrated")
+            if "canonical #\\space" not in hex_fixed:
+                raise RuntimeError("fast modernization gate: canonical character literal was changed")
             execute(coil, "check", str(hex_probe))
             before_hex = hashlib.sha256(hex_probe.read_bytes()).digest()
             execute(coil, "lint", str(hex_probe), "--fix", "--allow-dirty")

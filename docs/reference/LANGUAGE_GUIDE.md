@@ -185,8 +185,9 @@ filenames such as `"time.coil"` are not valid imports.
 `coil lint --fix` has a syntax-preflight phase that runs before import loading or type
 checking. It migrates legacy path imports by opening the old target, reading its
 `(module …)` declaration, and replacing only the import string. It also migrates old
-two-digit `\xHH` string and C-string escapes to `\xHH;`. These fixes work even when
-the legacy syntax prevents the program from compiling.
+two-digit `\xHH` string and C-string escapes to `\xHH;`, and legacy `\c` character
+literals to canonical `#\c`. These fixes work even when the legacy syntax prevents
+the program from compiling.
 ⚠ `extern` declarations are NOT deduped across modules — declare each libc
 extern in ONE module and `:use *` it, or two importers colliding will fail to link.
 
@@ -580,11 +581,12 @@ surrogate value, or a value above `0x10ffff` is a reader error.
 
 ## Character literals
 
-`\a` `\Z` `\0` are that byte's value (an integer literal). Delimiters/quotes work:
-`\(` `\)` `\{` `\}` `\"` `\;` `\.` `\,` `\*`. Named: `\space`=32 `\newline`=10
-`\tab`=9 `\return`=13 `\nul`=0 `\backspace`=8 `\formfeed`=12. Hex: `\u41`=65.
+`#\a` `#\Z` `#\0` are that byte's value (an integer literal). Delimiters/quotes work:
+`#\(` `#\)` `#\[` `#\]` `#\"` `#\;`. Named: `#\space`=32 `#\newline`=10,
+`#\tab`=9 `#\return`=13 `#\nul`=0 `#\backspace`=8, and `#\formfeed`/Chez `#\page`=12.
+Hex: `#\u41`=65; Chez-compatible `#\x41` is also accepted.
 They are plain `i64` literals — use with metal/clean ops after casting the byte:
-`(= (primitive/cast i64 (primitive/load p)) \a)`.
+`(= (primitive/cast i64 (primitive/load p)) #\a)`.
 
 ## Functions & function pointers
 
