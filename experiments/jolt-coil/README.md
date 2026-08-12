@@ -25,7 +25,7 @@ single-threaded expression kernel:
     `conj`, and `disj`;
 12. a directly compiled Clojure sequence pipeline composes `range`, `filter`,
     `map`, an anonymous function, and `reduce`, returning `165`;
-13. the first 111 checked-in Jolt prelude seed forms load as native Coil code,
+13. the first 392 checked-in Jolt prelude seed forms load as native Coil code,
     install real `clojure.core` vars and macros through `fn`, and invoke seeded
     `zero?`, `destructure`, `defn`, `subvec`, `max-key`, `split-at`, and
     `distinct?` successfully.
@@ -55,7 +55,7 @@ builds a temporary module under `.coil/jolt-coil/generated/`, and runs it with
 Coil. The `m20-sequence-pipeline.clj` case exercises the directly compiled
 collection pipeline.
 
-`run-seed-smoke.sh 111` adapts a prefix of Jolt's checked-in compiler prelude,
+`run-seed-smoke.sh 392` adapts a prefix of Jolt's checked-in compiler prelude,
 strips only the host bootstrap's per-definition recovery guards, compiles the
 real seed forms, and invokes a loaded var. The complete Chez seed is about
 1.5 MB across 1,163 guarded definitions. Its two seed files reference 156 distinct
@@ -63,9 +63,10 @@ real seed forms, and invokes a loaded var. The complete Chez seed is about
 seed load is not yet claimed. Callable maps, Clojure's two-argument `reduce`,
 map-entry access, `merge`, `merge-with`, first-class variadic `list`, `pop`, and
 variadic `concat` have prototype implementations. They are no longer used to
-claim a native seed frontier: form 112 is the first `dynamic-wind`, which is
-explicitly unsupported rather than routed through an evaluator or rewritten to
-weaker semantics.
+claim the full native seed frontier. Form 112's `dynamic-wind` now compiles with
+the optional continuation dialect and the seed advances through form 392. Form
+393 currently exposes a lost forwarded capture (`tref`) in a deeply nested
+closure produced by Jolt's `extend-type` macro generator.
 
 The Jolt checkout is kept under `.coil/jolt-coil/`, which is already build
 state rather than vendored source. `JOLT_DIR=/path/to/jolt` can select an
@@ -99,7 +100,7 @@ sources.
 - **M2 — value kernel:** Jolt nil, symbols, keywords, persistent lists,
   vectors, maps, records, and `hasheq` on Coil.
 - **M3 — compiler seed:** load the cross-minted Jolt compiler seed and compile
-  forms from inside the Coil-hosted process. The first 111 real prelude forms now
+  forms from inside the Coil-hosted process. The first 392 real prelude forms now
   load and expose callable vars; full prelude and compiler-image loading remain.
 - **M4 — single-threaded Jolt:** namespaces, vars, dynamic bindings, exceptions,
   loading, REPL, and the host-neutral conformance corpus. FFI, images, native

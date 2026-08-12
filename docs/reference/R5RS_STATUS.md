@@ -4,8 +4,8 @@ This is the working definition of “done” for Coil's native Scheme dialect.  
 feature is **verified** only when it passes through a module importing
 `coil.scheme`; implementation-unit coverage alone is not enough.
 
-The deliberate deferrals are `call-with-current-continuation` / `call/cc` and
-full `dynamic-wind`.  Everything else in R5RS remains in scope.  Historical
+Continuations and full `dynamic-wind` are available through the optional
+whole-build `coil.scheme.continuations` setup. Everything else in R5RS remains in scope. Historical
 deferral cases live in `tests/scheme/out-of-scope/` so they cannot quietly
 disappear; proper tail recursion has now graduated into the bounded gate.
 
@@ -102,7 +102,7 @@ portable performance claims; rerun them on the target machine before quoting.
 | quasiquote | verified syntax and semantics | public oracle uses R5RS backquote, comma, `,@`, and `#(...)` directly and covers nesting, splicing, dotted tails, and vector results |
 | `define-syntax` / `syntax-rules`, `let-syntax`, `letrec-syntax` | implemented in compiled and runtime-evaluated Scheme with lexical keyword shadowing and recursive local groups | compiled and runtime paths gate rule order, literals, `_`, list and vector patterns/templates, arbitrary cumulative ellipsis depth, repeated binding templates, fixed tails, recursion, binder-capture hygiene, and definition-site free references; compiled literal matching compares definition/use binding identities across `let`, lambda, and local-syntax scopes rather than names; declarations reject structurally malformed rules and duplicate pattern variables, while template expansion rejects ellipses without a repeated pattern variable; runtime eval/load additionally gates mutually recursive local syntax |
 | proper tail recursion | verified across the compiled procedure surface | direct mutual calls with differing arities run 10 million steps through the native `swifttailcc` ABI; computed/first-class closures run 10 million steps through a traced request trampoline whose loop is native `musttail`; focused public oracles additionally cover tail calls through `apply`, `call-with-values`, fixed and variadic closures, conditionals, and sequencing. The historical `02-tail-calls.scm` deferral is retained as provenance, not current status |
-| continuations | deferred | explicit cases `03-callcc.scm`, `04-dynamic-wind.scm` |
+| continuations | verified optional native setup on glibc | `03-callcc.scm`, `04-dynamic-wind.scm`; unlimited-extent multi-shot captures and `dynamic-wind` transfers through `--use coil.scheme.continuations` |
 
 ## Procedure status
 

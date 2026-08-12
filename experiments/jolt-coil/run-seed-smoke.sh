@@ -32,7 +32,7 @@ fi
 
 {
   printf '%s\n' '(module jolt-coil-seed-prefix)'
-  printf '%s\n' '(import "coil.scheme" :use *)'
+  printf '%s\n' '(import "coil.scheme.continuations" :use *)'
   printf '%s\n' '(import "jolt.coil.expression-runtime" :use *)'
   printf '%s\n' '(import "jolt.coil.core-runtime" :use *)'
   printf '%s\n' '(import "coil.scheme.stdproc" :as stdproc)'
