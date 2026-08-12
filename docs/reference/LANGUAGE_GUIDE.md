@@ -567,6 +567,11 @@ Type args `[T]` come right after the name; usually inferable, so often omittable
 `(ptr i8)` (NUL-terminated C string, for FFI/`printf`). ⚠ Don't pass `"…"` to a
 `(ptr i8)` param or `c"…"` to a `(slice u8)` param.
 
+Hexadecimal escapes denote Unicode scalar values and require an explicit
+semicolon terminator: `"\x0;"` is NUL, `"\x3bb;"` is λ, and `"\x1f603;"` is 😃.
+The scalar is encoded as UTF-8 bytes. An empty escape, a missing semicolon, a
+surrogate value, or a value above `0x10ffff` is a reader error.
+
 `(slice T)` is a fat pointer `{data, len}`. `(slice-data s)`, `(slice-len s)`,
 `(slice-get s i)`, `(subslice s lo hi)`, `(slice-new [T] ptr n)`. String helpers
 (`str.coil`): `(str-len s)`, `(char-at s i)`, `(str-eq a b)`, `(str-hash s)`,
