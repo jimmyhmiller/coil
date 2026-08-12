@@ -342,6 +342,27 @@ def test_modernize_fast(compiler: str) -> None:
                             "fast modernization gate: facade leaked a private re-export")
 
         def lint_task() -> None:
+            hex_probe = tmp / "legacy-hex-escape.coil"
+            hex_probe.write_text(r'''(module legacy-hex-escape)
+; A comment containing "\x42" is not source syntax.
+(defn main [] (-> i64)
+  (let [text "\x41face"
+        bytes c"\x00Z"
+        current "\x3bb;"]
+    0))
+''')
+            execute(coil, "lint", str(hex_probe), "--fix", "--allow-dirty")
+            hex_fixed = hex_probe.read_text()
+            if '"\\x41;face"' not in hex_fixed or 'c"\\x00;Z"' not in hex_fixed:
+                raise RuntimeError("fast modernization gate: legacy hex escapes were not terminated")
+            if '; A comment containing "\\x42"' not in hex_fixed or '"\\x3bb;"' not in hex_fixed:
+                raise RuntimeError("fast modernization gate: hex escape preflight edited non-legacy text")
+            execute(coil, "check", str(hex_probe))
+            before_hex = hashlib.sha256(hex_probe.read_bytes()).digest()
+            execute(coil, "lint", str(hex_probe), "--fix", "--allow-dirty")
+            if before_hex != hashlib.sha256(hex_probe.read_bytes()).digest():
+                raise RuntimeError("fast modernization gate: hex escape fix is not idempotent")
+
             probe = tmp / "probe.coil"
             probe.write_text("""(module modernization-probe)
 (import "coil.primitive" :as primitive)

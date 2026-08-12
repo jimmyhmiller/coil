@@ -184,8 +184,9 @@ filenames such as `"time.coil"` are not valid imports.
 
 `coil lint --fix` has a syntax-preflight phase that runs before import loading or type
 checking. It migrates legacy path imports by opening the old target, reading its
-`(module …)` declaration, and replacing only the import string. This works even when
-the legacy import prevents the program from compiling.
+`(module …)` declaration, and replacing only the import string. It also migrates old
+two-digit `\xHH` string and C-string escapes to `\xHH;`. These fixes work even when
+the legacy syntax prevents the program from compiling.
 ⚠ `extern` declarations are NOT deduped across modules — declare each libc
 extern in ONE module and `:use *` it, or two importers colliding will fail to link.
 
