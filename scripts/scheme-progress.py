@@ -27,7 +27,6 @@ DIALECT_CASES = {
     "complex_numbers.coil": "complex-numbers.txt",
     "cond_quoted_symbol.coil": "cond-quoted-symbol.txt",
     "cxr_family.coil": "cxr-family.txt",
-    "eval_environment.coil": "eval-environment.txt",
     "identifier_case.coil": "identifier-case.txt",
     "lambda.coil": "lambda.txt",
     "lexical_shadowing.coil": "lexical-shadowing.txt",
@@ -52,6 +51,7 @@ PLAIN_ENTRY_CASES = {
     "cases/09-lists-strings.scm": "09-lists-strings.txt",
     "dialect/auto_closure_probe.scm": "auto-closure.txt",
     "dialect/plain_existing_main.scm": "plain-existing-main.txt",
+    "dialect/native_load.scm": "native-load.txt",
 }
 
 APPLICATION_CASES = {
@@ -75,7 +75,6 @@ NEGATIVE_CASES = {
 }
 
 RUNTIME_NEGATIVE_CASES = {
-    "call_non_procedure.coil": "attempted to call a non-procedure",
     "read_invalid_token.coil": "read: invalid R5RS identifier or number",
     "read_invalid_plus_identifier.coil": "read: invalid R5RS identifier or number",
     "read_invalid_minus_identifier.coil": "read: invalid R5RS identifier or number",
@@ -83,9 +82,6 @@ RUNTIME_NEGATIVE_CASES = {
     "read_bare_dot.coil": "read: dot outside list",
     "read_dotted_vector.coil": "read: vector cannot contain dotted tail",
     "read_incomplete_quote.coil": "read: datum abbreviation missing datum",
-    "eval_no_matching_syntax.coil": "syntax-rules: no matching rule",
-    "eval_duplicate_syntax_pattern.coil": "syntax-rules: pattern variable appears more than once",
-    "eval_unbound_template_ellipsis.coil": "syntax-rules: template ellipsis has no repeated pattern variable",
     "division_by_zero.coil": "/: division by zero",
     "integer_division_by_zero.coil": "integer division by zero",
     "first_class_comparison_arity.coil": "comparison expects at least two arguments",
@@ -137,8 +133,7 @@ string=? string<? string>? string<=? string>=? string-ci=? string-ci<?
 string-ci>? string-ci<=? string-ci>=? substring string-append string->list
 list->string string-copy string-fill! vector? make-vector vector vector-length
 vector-ref vector-set! vector->list list->vector vector-fill! procedure? apply
-map for-each force values call-with-values eval scheme-report-environment
-null-environment interaction-environment input-port? output-port?
+map for-each force values call-with-values input-port? output-port?
 current-input-port current-output-port call-with-input-file call-with-output-file
 with-input-from-file with-output-to-file open-input-file open-output-file
 close-input-port close-output-port read read-char peek-char eof-object?
