@@ -124,7 +124,8 @@ expect_rc 7 "build: flags BEFORE the file"               "$COIL" run "$T/seven.c
 [ "$rc" = 7 ] && ok "build -o <out> <file> (Unix order)" || bad "build -o <out> <file>" "rc=$rc"
 expect_rc 1 "unknown flag is rejected"                   "$COIL" build "$T/seven.coil" -o "$T/b" --frobnicate
 expect_out "unknown flag" "unknown flag is named"        "$COIL" build "$T/seven.coil" -o "$T/b" --frobnicate
-expect_rc 1 "missing -o exits 1 (not SIGABRT)"           "$COIL" build "$T/seven.coil"
+expect_rc 7 "build without -o writes runnable build/<stem>" \
+  bash -c 'cd "$1" && "$2" build seven.coil >/dev/null && test -x build/seven && build/seven' _ "$T" "$COIL"
 expect_rc 1 "bogus --target is rejected"                 "$COIL" build "$T/seven.coil" -o "$T/c" --target not-a-real-triple
 
 echo "== check mode: typecheck/compile with no object (diag-12) =="
