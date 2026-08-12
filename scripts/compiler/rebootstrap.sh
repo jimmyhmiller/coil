@@ -135,7 +135,10 @@ launch cimport ./scripts/compiler/oracle/gate-cimport.sh /tmp/coil-rl2
 # all — which is how its fixture went stale for months without failing anything.
 launch target-os ./scripts/compiler/oracle/gate-target-os.sh /tmp/coil-rl2
 launch meta env COIL_META_SKIP_RUNTIME=1 python3 scripts/dev.py test meta --compiler /tmp/coil-rl2
-launch scheme python3 scripts/dev.py test scheme --compiler /tmp/coil-rl2
+# coil.scheme.* is an application namespace rooted in src/apps/scheme, not bundled
+# stdlib. Strict-bundle mode is still exercised by every compiler build and other gate;
+# disable it only while running this source-tree application suite.
+launch scheme env COIL_STRICT_BUNDLE=0 python3 scripts/dev.py test scheme --compiler /tmp/coil-rl2
 wait_jobs || exit 1
 if wait "$WASM_PID"; then
   echo "  wasm: PASS"

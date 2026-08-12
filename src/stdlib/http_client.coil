@@ -6,6 +6,7 @@
 
 (import "coil.alloc" :as alloc)
 (import "coil.arraylist" :as arraylist)
+(import "coil.cancellation" :as cancellation)
 (import "coil.result" :use *)
 (import "coil.slice" :as slice)
 (import "coil.str" :as str)
@@ -30,6 +31,7 @@
         BodySink
         StreamingResponse
         request-stream
+        request-stream-cancellable
         error-timeout?
         streaming-response-status
         streaming-response-stopped
@@ -47,6 +49,13 @@
 (extern curl_easy_strerror :cc c [i32] (-> (ptr i8)))
 (extern curl_slist_append :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
 (extern curl_slist_free_all :cc c [(ptr i8)] (-> void))
+(extern curl_multi_init :cc c [] (-> (ptr i8)))
+(extern curl_multi_add_handle :cc c [(ptr i8) (ptr i8)] (-> i32))
+(extern curl_multi_remove_handle :cc c [(ptr i8) (ptr i8)] (-> i32))
+(extern curl_multi_perform :cc c [(ptr i8) (ptr i32)] (-> i32))
+(extern curl_multi_poll :cc c [(ptr i8) (ptr i8) i32 i32 (ptr i32)] (-> i32))
+(extern curl_multi_info_read :cc c [(ptr i8) (ptr i32)] (-> (ptr i8)))
+(extern curl_multi_cleanup :cc c [(ptr i8)] (-> i32))
 
 ; Stable values from curl/curl.h. They are part of libcurl's public ABI. Keeping them
 ; here (behind typed helpers) prevents application code from depending on them.
@@ -63,6 +72,13 @@
 (const CURLOPT_CONNECTTIMEOUT_MS 156)
 (const CURLOPT_HEADERFUNCTION 20079)
 (const CURLOPT_HEADERDATA 10029)
+(const CURLOPT_NOPROGRESS 43)
+(const CURLOPT_XFERINFODATA 10057)
+(const CURLOPT_XFERINFOFUNCTION 20219)
+(const CURLE_ABORTED_BY_CALLBACK 42)
+(const CURLM_OK 0)
+(const CURLMSG_DONE 1)
+(const CURL_WAIT_POLLIN 1)
 (const CURLINFO_RESPONSE_CODE 2097154)
 ; CURLE_OPERATION_TIMEDOUT — both the connect and the total timeout surface as this
 ; one code, which is what `error-timeout?` reads.
@@ -107,6 +123,8 @@
 ;; consumer stop from a genuine transport failure: our trampoline is the only thing that
 ;; ever short-counts, and it only does so after the sink said BODY-STOP.
 (defstruct StreamState [(sink BodySink) (stopped bool)])
+(defstruct CurlWaitFd [(fd i32) (events i16) (revents i16)])
+(defstruct CurlMessage [(kind i32) (easy (ptr i8)) (result i32)])
 
 (defstruct HeaderCapture
   [(a (ptr alloc/Allocator)) (headers (arraylist/ArrayList Header))])
@@ -131,6 +149,52 @@
   (curl_easy_setopt easy CURLOPT_HEADERFUNCTION value))
 (defn curl-set-header-data [(easy (ptr i8)) (value (ptr HeaderCapture))] (-> i32)
   (curl_easy_setopt easy CURLOPT_HEADERDATA (primitive/cast (ptr i8) value)))
+
+(defn curl-cancellation-progress [(context (ptr i8))
+                                  (download-total i64)
+                                  (download-now i64)
+                                  (upload-total i64)
+                                  (upload-now i64)] (-> i32)
+  (if (cancellation/cancellation-requested? (primitive/cast (ptr cancellation/Cancellation) context))
+      1
+      0))
+
+;; Drive a cancellable easy handle through curl's poll-based multi interface.
+;; The cancellation pipe is an extra poll fd, so requesting cancellation wakes
+;; a transfer even when the network peer is completely silent.
+(defn curl-perform-cancellable [(easy (ptr i8))
+                                (cancel (ptr cancellation/Cancellation))] (-> i32)
+  (let [multi (curl_multi_init)]
+    (if (= (primitive/cast i64 multi) (cast i64 0))
+        (cast i32 CURLE_ABORTED_BY_CALLBACK)
+        (let [(mut running) (cast i32 0)
+              (mut messages) (cast i32 0)
+              (mut result) (cast i32 CURLE_ABORTED_BY_CALLBACK)
+              wait-fd (alloc/stack CurlWaitFd)
+              (mut ready) (cast i32 0)]
+          (store! (field wait-fd fd) (load (field cancel read-fd)))
+          (store! (field wait-fd events) (cast i16 CURL_WAIT_POLLIN))
+          (store! (field wait-fd revents) (cast i16 0))
+          (if (!= (curl_multi_add_handle multi easy) (cast i32 CURLM_OK))
+              (store! running 0)
+              (do
+                (curl_multi_perform multi (mut running))
+                (loop (when (> (load running) 0)
+                        (curl_multi_poll multi (primitive/cast (ptr i8) wait-fd) 1 1000 (mut ready))
+                        (if (cancellation/cancellation-requested? cancel)
+                            (break)
+                            (curl_multi_perform multi (mut running)))))))
+          (when (= (load running) 0)
+            (let [message (primitive/cast (ptr CurlMessage)
+                                          (curl_multi_info_read multi (mut messages)))]
+              (when (and (!= (primitive/cast i64 message) (cast i64 0))
+                         (= (load (field message kind)) (cast i32 CURLMSG_DONE)))
+                (store! result (load (field message result)))
+                0))
+            0)
+          (curl_multi_remove_handle multi easy)
+          (curl_multi_cleanup multi)
+          (load result)))))
 (defn curl-response-code [(easy (ptr i8)) (value (ptr i64))] (-> i32)
   (curl_easy_getinfo easy CURLINFO_RESPONSE_CODE value))
 
@@ -289,9 +353,10 @@
 ;;   * allocation failure -> `(Err (OutOfMemory))`
 ;;   * transport failure  -> `(Err (Transport code message))`
 ;; An HTTP error status is not a failure: it is an `Ok` with that status.
-(defn request-stream [(a (ptr alloc/Allocator))
-                      (req (ptr Request))
-                      (sink BodySink)] (-> (Result StreamingResponse HttpError))
+(defn request-stream-cancellable [(a (ptr alloc/Allocator))
+                                  (req (ptr Request))
+                                  (sink BodySink)
+                                  (cancel (ptr cancellation/Cancellation))] (-> (Result StreamingResponse HttpError))
   (let [easy (curl_easy_init)]
     (if (= (primitive/cast i64 easy) (cast i64 0))
         (Err (OutOfMemory))
@@ -315,11 +380,20 @@
           (curl-set-write-data easy (primitive/cast (ptr i8) st))
           (curl-set-header-fn easy (primitive/fnptr-of curl-header-line))
           (curl-set-header-data easy capture)
+          (when (!= cancel (primitive/cast (ptr cancellation/Cancellation) 0))
+            (curl-set-i64 easy CURLOPT_NOPROGRESS 0)
+            (curl-set-ptr easy CURLOPT_XFERINFODATA (primitive/cast (ptr i8) cancel))
+            (curl_easy_setopt easy
+                              CURLOPT_XFERINFOFUNCTION
+                              (primitive/fnptr-of curl-cancellation-progress))
+            0)
           (curl-set-i64 easy CURLOPT_NOSIGNAL 1)
           (curl-set-i64 easy CURLOPT_FOLLOWLOCATION (if (load (field req follow-redirects)) 1 0))
           (curl-set-i64 easy CURLOPT_CONNECTTIMEOUT_MS (load (field req connect-timeout-ms)))
           (curl-set-i64 easy CURLOPT_TIMEOUT_MS (load (field req timeout-ms)))
-          (let [performed (curl_easy_perform easy)
+          (let [performed (if (= cancel (primitive/cast (ptr cancellation/Cancellation) 0))
+                              (curl_easy_perform easy)
+                              (curl-perform-cancellable easy cancel))
                 stopped (load (field st stopped))]
             (alloc/raw-free a url (primitive/iadd (slice/slice-len (load (field req url))) 1) 1)
             (alloc/raw-free a method (primitive/iadd (slice/slice-len (load (field req method))) 1) 1)
@@ -342,6 +416,14 @@
                   (curl_slist_free_all hs)
                   (curl_easy_cleanup easy)
                   (Err (transport-error performed)))))))))
+
+(defn request-stream [(a (ptr alloc/Allocator))
+                      (req (ptr Request))
+                      (sink BodySink)] (-> (Result StreamingResponse HttpError))
+  (request-stream-cancellable a
+                              req
+                              sink
+                              (primitive/cast (ptr cancellation/Cancellation) 0)))
 
 ;; Perform one blocking request. The response body is allocator-owned and must be
 ;; released with `response-free`. HTTP error statuses are successful responses;

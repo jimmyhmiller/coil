@@ -95,6 +95,14 @@ int curl_easy_getinfo(void *p, int info, ...) { return 0; }
 char *curl_easy_strerror(int code) { return "stub"; }
 void *curl_slist_append(void *list, const char *value) { return list; }
 void curl_slist_free_all(void *list) {}
+void *curl_multi_init(void) { return 0; }
+int curl_multi_add_handle(void *multi, void *easy) { return 0; }
+int curl_multi_remove_handle(void *multi, void *easy) { return 0; }
+int curl_multi_perform(void *multi, int *running) { *running = 0; return 0; }
+int curl_multi_poll(void *multi, void *extra, unsigned int count, int timeout_ms,
+                    int *ready) { *ready = 0; return 0; }
+void *curl_multi_info_read(void *multi, int *remaining) { *remaining = 0; return 0; }
+int curl_multi_cleanup(void *multi) { return 0; }
 EOF
 cc -c "$T/curl-stub.c" -o "$T/curl-stub.o"
 ar rcs "$T/real-bin/native/curl/$HTTP_NATIVE_TARGET/libcurl.a" "$T/curl-stub.o"
@@ -1365,11 +1373,21 @@ cat > "$T/df.coil" <<'EOF'
 EOF
 expect_out "double free in debug-allocator" "--debug-checks detects a double free (mem-2)" \
   "$COIL" run "$T/df.coil" --debug-checks
-# OFF (default): (debug-allocator a) is exactly `a` — no wrapper, the double free is not
-# detected and the program exits 0 (zero-cost, behavior unchanged).
-"$COIL" run "$T/df.coil" >/dev/null 2>&1
-[ $? = 0 ] && ok "off: debug-allocator is a passthrough (no detection, zero cost)" \
-           || bad "off: debug-allocator passthrough" "want rc=0"
+# OFF (default): (debug-allocator a) is exactly `a` — no wrapper and zero cost.
+# Do not use a double-free to prove this: double-free is undefined behavior, and
+# current platform malloc implementations may abort even without our detector.
+cat > "$T/dbg-off.coil" <<'EOF'
+(module m)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.dbgalloc" :use *)
+(defn main [] (-> i64)
+  (let [inner (malloc-allocator)
+        wrapped (debug-allocator inner)]
+    (if (= (primitive/cast i64 inner) (primitive/cast i64 wrapped)) 0 1)))
+EOF
+expect_rc 0 "off: debug-allocator is a passthrough (no detection, zero cost)" \
+  "$COIL" run "$T/dbg-off.coil"
 # a use-after-free reads the 0xDE poison (222) rather than the freed value under the flag.
 cat > "$T/uaf.coil" <<'EOF'
 (module m)

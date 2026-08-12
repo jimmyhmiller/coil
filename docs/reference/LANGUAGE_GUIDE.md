@@ -1063,8 +1063,9 @@ field options — and pick the format at the call; `JVal` decodes documents of
 unknown shape — see `docs/design/SERDE.md`), `coil.http.parser`
 (streaming HTTP/1.x messages), `coil.http.server`
 (strict llhttp-backed HTTP/1.x requests), `coil.http.client` (blocking libcurl transport —
-`request` buffers the body, `request-stream` delivers it to a `BodySink` as it arrives, for
-SSE and other long responses),
+`request` buffers the body, `request-stream` delivers it to a `BodySink` as it arrives, and
+`request-stream-cancellable` accepts a `coil.cancellation/Cancellation` token whose pipe
+wakes an otherwise idle transfer),
 `coil.assert` (assert/deftest), `coil.prop` (property-based testing: `defprop`,
 the `Arbitrary` trait, tape-based shrinking — see above), `coil.dbgalloc`, `coil.guardalloc`, `coil.crash`,
 `coil.debug-runtime`, `coil.checked-ffi`, and `coil.stacklint`, plus `coil.os`,
