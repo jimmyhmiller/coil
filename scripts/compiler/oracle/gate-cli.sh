@@ -522,6 +522,50 @@ expect_out "unknown trait 'NoSuchTrait' in bound" "impl trait resolves through t
 printf '(module m)\n(defn Helper [] (-> i64) 0)\n(impl Helper i64 (go [(x i64)] (-> i64) 1))\n(defn main [] (-> i64) 0)\n' > "$T/implnonfn.coil"
 expect_out "unknown trait 'Helper' in bound" "impl over a non-trait name errors identically" "$COIL" build "$T/implnonfn.coil" -o "$T/x"
 
+echo "== Callable values use typed, static impl dispatch =="
+cat > "$T/callable.coil" <<'EOF'
+(module m)
+(defstruct Vec3 [(x i64) (y i64) (z i64)])
+(defn get [(v Vec3) (i i64)] (-> i64)
+  (if (= i 0) (load (field v x)) (if (= i 1) (load (field v y)) (load (field v z)))))
+(impl Callable Vec3
+  (call [(self Vec3) (i i64)] (-> i64) (get self i)))
+(defstruct Box [T] [(value T)])
+(impl [T] Callable (Box T)
+  (call [(self (Box T))] (-> T) (load (field self value))))
+(defn main [] (-> i64)
+  (let [v (Vec3 :x 10 :y 20 :z 30) b (Box :value 12)] (- (v 2) (b))))
+EOF
+expect_rc 18 "concrete and generic Callable values run with their declared arities" "$COIL" run "$T/callable.coil"
+
+cat > "$T/callable-arity.coil" <<'EOF'
+(module m)
+(defstruct F [(unused i64)])
+(impl Callable F (call [(self F) (x i64)] (-> i64) x))
+(defn main [] (-> i64) (let [f (F :unused 0)] (f)))
+EOF
+expect_out "expects 2 args, got 1" "Callable arity includes the statically supplied receiver" "$COIL" check "$T/callable-arity.coil"
+
+cat > "$T/not-callable.coil" <<'EOF'
+(module m)
+(defstruct Plain [(x i64)])
+(defn main [] (-> i64) (let [p (Plain :x 1)] (p 2)))
+EOF
+expect_out "is not callable" "calling a value without a call implementation is rejected" "$COIL" check "$T/not-callable.coil"
+
+cat > "$T/bad-callable-impl.coil" <<'EOF'
+(module m)
+(defstruct F [(unused i64)])
+(impl Callable F (call [(not-self i64)] (-> i64) not-self))
+(defn main [] (-> i64) 0)
+EOF
+expect_out "'call' first parameter must be the implementing type" "Callable validates its receiver parameter" "$COIL" check "$T/bad-callable-impl.coil"
+
+expect_rc 23 "closure values are callable and a typed code-pointer update changes later calls" \
+  "$COIL" run tests/compiler/features/callable_closure_reload.coil
+expect_rc 0 "Var forwards typed calls of several arities and observes code-pointer updates" \
+  "$COIL" run tests/compiler/features/callable_var_reload.coil
+
 echo "== store! yields unit (std-12): effect-only stores type-check without a wrapping do =="
 # was: `store!` took the STORED VALUE's type, so `(if c (coil.primitive/store! p ptr) 0)` was a type error
 # (then=(ptr i64) vs else=i64) and every non-i64 effect-only store needed `(do (coil.primitive/store! …) 0)`.
