@@ -84,6 +84,11 @@ $COIL run $D/cross_module_stage_test.coil >/dev/null 2>&1; rc=$?
 [ $rc -eq 42 ] || { echo "cross-module stage FAILED (exit $rc, want 42)"; exit 1; }
 echo "cross-module-stage: OK (explicit marker routed a native phase request across modules)"
 
+echo "=== 7f. SCHEME SYNTAX OBJECT: native phase values retain exact Code ==="
+$COIL run $D/scheme_syntax_object.coil >/dev/null 2>&1; rc=$?
+[ $rc -eq 42 ] || { echo "Scheme syntax-object boundary FAILED (exit $rc, want 42)"; exit 1; }
+echo "scheme-syntax-object: OK (Code -> Scheme syntax value -> identical Code)"
+
 $COIL check $D/duplicate_stage_test.coil > "$OUT/duplicate-stage.txt" 2>&1; rc=$?
 [ $rc -ne 0 ] || { echo "duplicate stage was silently accepted"; exit 1; }
 case "$(cat "$OUT/duplicate-stage.txt")" in
@@ -92,7 +97,7 @@ case "$(cat "$OUT/duplicate-stage.txt")" in
 esac
 echo "duplicate-stage: OK (phase binding redefinition rejected)"
 
-echo "=== 7f. RESUMED LANGUAGE LOWERING: staged syntax returns to its dialect ==="
+echo "=== 7g. RESUMED LANGUAGE LOWERING: staged syntax returns to its dialect ==="
 scheme_out=$($COIL run tests/scheme/dialect/procedural_syntax_literal.scm \
   --use coil.scheme --meta-opt=0 2>/dev/null); rc=$?
 [ $rc -eq 0 ] || { echo "procedural Scheme syntax FAILED (exit $rc)"; exit 1; }
