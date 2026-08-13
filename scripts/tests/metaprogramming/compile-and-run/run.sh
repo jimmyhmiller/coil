@@ -82,7 +82,7 @@ echo "multi-round-stage: OK (two native stages compiled in successive rounds)"
 $COIL check $D/duplicate_stage_test.coil > "$OUT/duplicate-stage.txt" 2>&1; rc=$?
 [ $rc -ne 0 ] || { echo "duplicate stage was silently accepted"; exit 1; }
 case "$(cat "$OUT/duplicate-stage.txt")" in
-  *"stage: phase-1 entry 'duplicate_stage_test.first-stage' conflicts with an existing callable"*) ;;
+  *"stage: definition 'duplicate_stage_test.first-stage' was introduced more than once"*) ;;
   *) cat "$OUT/duplicate-stage.txt"; echo "duplicate-stage diagnostic missing"; exit 1;;
 esac
 echo "duplicate-stage: OK (phase binding redefinition rejected)"
