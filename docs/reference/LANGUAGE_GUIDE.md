@@ -18,7 +18,7 @@ inside it, so `coil` and every `(import "…")` below work from any directory.
     coil run                             # build+run the ./Coil.toml project
     coil test                            # discover and run project test suites
     coil fuzz  file.coil -n 100000       # run its properties under coverage guidance
-    coil check                           # check every project target graph
+    coil check                           # typecheck every project target graph (no codegen, no link)
     coil verify                          # fmt + lint + check + native build + test
     coil run -- arg1 arg2                # forward args to the program
     coil build file.coil -lm             # link a library (-l<name>)
@@ -986,8 +986,8 @@ are reproducible), `--size`, `--shrink`, `--timeout` (60s),
     coil test --suite all             ; every suite, default or not
     coil test --list --suite all      ; opt-in suites are marked [opt-in]
 
-`coil verify` and `coil check` run the default suites only, so an opt-in suite never
-gets pulled in by the everyday pipeline. Two things deliberately ignore suite
+`coil verify` runs the default suites only, and `coil check` typechecks exactly those
+files, so an opt-in suite never gets pulled in by the everyday pipeline. Two things deliberately ignore suite
 membership: naming a file (`coil test tests/integration/live_integration.coil` always
 runs it), and `lint`, which treats every configured suffix as a test file whichever
 suite owns it. A filename selector applies *after* suite selection.
