@@ -79,6 +79,19 @@ echo "  linux gate-run:  PASS (programs run identically)"
 python3 scripts/tests/lint_fires.py --coil /tmp/coil-lrb2 >/dev/null   || { echo "gate-lint-fires FAIL — lint --fix does nothing"; exit 1; }
 echo "  gate-lint-fires: PASS (checkers fire; lint --fix rewrites)"
 
+# `coil.lint.unused` is the one bundled rule that DELETES source, so both of its
+# failure directions need a gate: deleting too little is noise, deleting too much
+# destroys work that the --fix loop's compile check cannot always catch.
+python3 scripts/tests/unused_lint.py --coil /tmp/coil-lrb2 >/dev/null   || { echo "gate-unused-lint FAIL — dead-code deletion is wrong in one direction or the other"; exit 1; }
+echo "  gate-unused-lint: PASS (deletes exactly the unreachable set)"
+
+# `--no-fork` has to reach the REUSE phase, not just generation. While a saved
+# counterexample exists the reuse phase is the only one that runs, so a flag that
+# gated generation alone was inert exactly when someone reached for it — and read
+# as bugs in --seed and in the debugger story instead of as its own.
+python3 scripts/tests/prop_nofork.py --coil /tmp/coil-lrb2 >/dev/null   || { echo "gate-prop-nofork FAIL — --no-fork does not reach the property reuse phase"; exit 1; }
+echo "  gate-prop-nofork: PASS (--no-fork governs replay as well as generation)"
+
 # Does the compiler still BUILD for wasm? This battery had no wasm line at all,
 # which is how two independent wasm regressions reached main: a `musttail` that
 # needs the unenabled `+tail-call` feature (fails here, at build), and externs

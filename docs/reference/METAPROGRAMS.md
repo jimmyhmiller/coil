@@ -105,6 +105,19 @@ New API this project added (all shipped):
   carried across the rewrite too, so a commented chain is fixed like any other. Demo:
   `src/examples/metaprogramming/condlint.coil` rewrites a chain of 3+ nested `if`s as a `cond` with
   `:else`. Full design + what changed on contact with reality: `docs/archive/AUTOFIX.md`.
+- **`(primitive/delete NODE MSG)`** — a `warn` that proposes REMOVING the node. Deletion is a
+  separate op rather than a `suggest` with an empty replacement for two reasons: no
+  `Code` value renders as nothing, and a deletion legitimately covers source the
+  node's own span does not — the comment block written directly above it, which
+  documents the thing being removed. `coil lint --fix` takes that block, the form,
+  any trailing `; …` on its line, and the line itself; it stops the backward scan at
+  a section banner (a run of six or more punctuation characters, i.e. `; ==== … ====`),
+  which introduces everything below it rather than the one definition underneath.
+  `suggest`'s refusal to drop a comment is waived here, because dropping it is the
+  point. The bundled user: **`coil.lint.unused`** (`src/stdlib/unused_lint.coil`),
+  whole-program dead-code elimination for source — reachability over a name graph,
+  deleting to a fixpoint. It is deliberately NOT in `coil.lint.default`; run it with
+  `coil lint FILE --use coil.lint.unused --fix`.
 - **`(primitive/code-macro? NODE)` → bool** — true for a node the expander produced. Checkers run
   on the EXPANDED program, so every `cond`/`when`/`case` the author wrote is already
   nested `if`s by the time a rule sees it; this is how a rule about `if` tells the two

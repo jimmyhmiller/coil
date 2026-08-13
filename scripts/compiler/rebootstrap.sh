@@ -133,6 +133,14 @@ launch coverage python3 scripts/oracle.py coverage
 launch runtime-arm64 python3 scripts/oracle.py runtime gate arm64 --compiler /tmp/coil-rb2
 launch cli ./scripts/compiler/oracle/gate-cli.sh /tmp/coil-rl2
 launch cimport ./scripts/compiler/oracle/gate-cimport.sh /tmp/coil-rl2
+# The one bundled lint that DELETES source. Gated on both directions — too little
+# is noise, too much destroys work — and kept out of `modernize-fast`, whose 30s
+# budget cannot absorb a cold metaprogram build for another rule.
+launch unused-lint python3 scripts/tests/unused_lint.py --coil /tmp/coil-rl2
+# `--no-fork` has to reach the REUSE phase, not just generation. While a saved
+# counterexample exists the reuse phase is the only one that runs, so a flag that
+# gated generation alone was inert exactly when someone reached for it.
+launch prop-nofork python3 scripts/tests/prop_nofork.py --coil /tmp/coil-rl2
 # rebootstrap-linux.sh was this gate's ONLY caller, so on macOS it never ran at
 # all — which is how its fixture went stale for months without failing anything.
 launch target-os ./scripts/compiler/oracle/gate-target-os.sh /tmp/coil-rl2

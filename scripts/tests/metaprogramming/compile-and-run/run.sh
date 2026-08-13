@@ -98,12 +98,28 @@ echo "       a Cocoa window opens ON THE MAIN THREAD during expansion, renders t
 echo "       set live, and the accepted view's coordinates become the program's"
 echo "       constants (COIL_MANDEL_AUTO=1 scripts the session; drop it to drive"
 echo "       the viewer yourself: WASD pan, Z/X zoom, I/O iters, Q/RETURN accept)"
+# This is the ONLY step that needs something the machine may not have — AppKit and
+# a window server. Every other step here is headless. So it records its failure and
+# lets the script continue, rather than aborting it: when `check`'s setup was not
+# idempotent this step failed for a reason that had nothing to do with GUIs, took
+# the script down with it, and steps 12 and 13 — the borrow-checker dialect and the
+# transparent GC — did not run AT ALL for as long as that lasted. A demo nobody runs
+# is a demo nobody knows is broken, and the first failing step must not decide which
+# of the others get to speak.
+GUI_FAILED=0
 COIL_META_MAIN=1 COIL_MANDEL_AUTO=1 $COIL run $D/mandel_test.coil \
-  --link-flag -framework --link-flag AppKit --link-flag -lobjc > "$OUT/mandel.txt" 2>/dev/null; rc=$?
-[ $rc -eq 0 ] || { echo "mandelbrot GUI metaprogram FAILED (exit $rc)"; exit 1; }
-grep -q "COMPILE-TIME GUI" "$OUT/mandel.txt" || { echo "mandelbrot output missing"; exit 1; }
-head -6 "$OUT/mandel.txt"
-echo "compile-time GUI: OK"
+  --link-flag -framework --link-flag AppKit --link-flag -lobjc > "$OUT/mandel.txt" 2>"$OUT/mandel.err"; rc=$?
+if [ $rc -ne 0 ]; then
+  echo "mandelbrot GUI metaprogram FAILED (exit $rc) — continuing so the headless steps still run"
+  sed -n '1,5p' "$OUT/mandel.err"
+  GUI_FAILED=1
+elif ! grep -q "COMPILE-TIME GUI" "$OUT/mandel.txt"; then
+  echo "mandelbrot output missing"
+  GUI_FAILED=1
+else
+  head -6 "$OUT/mandel.txt"
+  echo "compile-time GUI: OK"
+fi
 
 echo "=== 12. A BORROW CHECKER DIALECT: linear ownership, veto on misuse ==="
 echo "       own_ok.coil (valid, incl. a shadowed resource) compiles + runs;"
@@ -127,4 +143,5 @@ cat "$OUT/tgc.txt"
 echo "transparent GC: OK (zero annotations; 100000 allocated, 50 peak live, reclaimed)"
 
 rm -rf "$OUT"
+[ "$GUI_FAILED" -eq 0 ] || { echo "=== FAILED: the compile-time GUI step (11) ==="; exit 1; }
 echo "=== all mechanisms verified ==="
