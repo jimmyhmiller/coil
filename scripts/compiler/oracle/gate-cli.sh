@@ -1753,6 +1753,22 @@ depfiles=$(find "$T/project/.coil/build/native" -name source.d -type f)
   && ok "native compilation records header depfiles under .coil/build" \
   || bad "native compilation records header depfiles under .coil/build" "no source.d found"
 
+# `coil fuzz` is the one command that drives the linker ITSELF (clang, over the
+# program's IR) instead of shelling out to a `coil build` child, so the manifest's
+# link inputs have to arrive as plain linker arguments. It used to hand clang
+# coil's own `--link-flag <tok>` spelling, which clang rejects outright, and left
+# [cc] objects off the line entirely — every project with a [link] or [cc] section
+# could build and test but never fuzz. The property below is that this project's
+# native symbol resolves in the instrumented build too.
+cat > "$T/project/tests/prop_test.coil" <<'EOF'
+(module prop_test)
+(import "coil.prop" :use *)
+(extern project_answer :cc c [] (-> i64))
+(defprop native-answer-is-constant [(n i64)] (= (project_answer) 42))
+EOF
+expect_out "1 passed" "coil fuzz links the manifest's [link] flags and [cc] objects" \
+  bash -c 'cd "$1" && "$2" fuzz tests/prop_test.coil -n 200' _ "$T/project" "$COIL"
+
 echo "== named test suites: [test.suites.<name>] =="
 # The point of suites: a project can own tests that must NOT run on a bare `coil test`
 # — live integration tests, tests that cost money, tests that take minutes. Membership
