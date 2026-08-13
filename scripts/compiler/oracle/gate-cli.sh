@@ -1681,9 +1681,9 @@ expect_out "native_test.coil" "project test --list discovers configured suffixes
   bash -c 'cd "$1" && "$2" test --list' _ "$T/project" "$COIL"
 expect_out "1 passed; 0 failed" "project test selector builds with inherited native inputs" \
   bash -c 'cd "$1" && "$2" test native' _ "$T/project" "$COIL"
-expect_rc 0 "project test --jobs runs independent suites concurrently" \
+expect_out "running 2 tests" "project test compiles all selected files into one suite runner" \
   bash -c 'cd "$1" && "$2" test --jobs 2' _ "$T/project" "$COIL"
-expect_rc 0 "project test --no-run compiles and links every suite" \
+expect_rc 0 "project test --no-run compiles and links the combined suite" \
   bash -c 'cd "$1" && "$2" test --no-run' _ "$T/project" "$COIL"
 expect_rc 0 "project build preserves commas inside a quoted link flag" \
   bash -c 'cd "$1" && "$2" build >/dev/null' _ "$T/project" "$COIL"
