@@ -25,6 +25,10 @@ Four questions, in order of how much damage getting them wrong would do:
      the time a checker runs), a sum reached only through a variant constructor,
      a section banner comment above a deleted form, and a `let` binding whose
      initializer is a call.
+  4b. SUM VARIANTS, where matching is not using: `match` survives expansion, so a
+     variant handled by an arm is NAMED by the very code that exists only to
+     handle it. A variant nothing constructs goes, and its arms go with it; the
+     last variant of a sum always stays.
   5. STRUCT FIELDS, the one tier the compile check cannot vouch for, stay behind
      `--lint-param unused-fields=on` — and even then leave alone any struct whose
      layout crosses to C or is reached through a pointer cast.
@@ -56,6 +60,9 @@ PROGRAM = """(module unused-probe)
 (defstruct Header [(tag i64)])
 (defstruct Derived [(header Header) (payload i64)])
 
+;; `Red` is constructed; `Green` is only ever MATCHED, which is not a use — the arm
+;; exists to handle it and cannot run if nothing makes one. Both the variant and its
+;; arm go. `Red` is the last one standing and stays regardless.
 (defsum Color (Red) (Green [(n i64)]))
 (defsum NeverUsed (Only [(z i64)]))
 
@@ -89,6 +96,9 @@ PROGRAM = """(module unused-probe)
 
 (defn exported-api [] (-> i64) 1)
 
+(defn describe [(c Color)] (-> i64)
+  (match c (Red [] 1) (Green [n] n)))
+
 ;; `let` bindings. The first is read by the third, which the body reads, so the whole
 ;; chain is live. The second is read by nothing and binds a literal. The fourth binds
 ;; a call, which has to keep happening whether or not anyone wanted the value.
@@ -107,8 +117,9 @@ PROGRAM = """(module unused-probe)
     (store! (field l stored) 1)
     (crosses a)
     (twice (labs (primitive/iadd (helper l)
-                                 (primitive/iadd (bindings)
-                                                 (tag-of (primitive/alloc-stack Derived))))))))
+                                 (primitive/iadd (describe c)
+                                                 (primitive/iadd (bindings)
+                                                                 (tag-of (primitive/alloc-stack Derived)))))))))
 """
 
 # Reachable from `main`, from an export, or through a variant constructor.
@@ -117,7 +128,7 @@ MUST_STAY = ["(defstruct Live", "(defsum Color", "(const LIVE-K", "(extern labs"
              "; ============================ types ===",
              '(import "coil.primitive"',
              "read-later", "chained", "effectful (labs 6)",
-             "(defn tag-of"]
+             "(defn tag-of", "(Red)", "(Red [] 1)"]
 # Struct fields are their own opt-in tier (`--lint-param unused-fields=on`), so they
 # are checked separately, against a compiler run that asked for them.
 FIELDS_MUST_STAY = ["(x i64)", "(stored i64)",        # read, and written
@@ -129,7 +140,8 @@ MUST_GO_DEFS = ["(defstruct Orphan", "(defsum NeverUsed", "(const DEAD-K", "(ext
                 "(defn dead-loop", "(defn ping", "(defn pong", "(defn only-from-dead"]
 # Module-local dead weight, which that reading does not bear on: an import and a
 # `let` binding are unused or not within one file either way.
-MUST_GO_LOCAL = ['(import "coil.time"', "dead-binding"]
+MUST_GO_LOCAL = ['(import "coil.time"', "dead-binding",
+                 "(Green [(n i64)])", "(Green [n] n)"]
 MUST_GO = MUST_GO_DEFS + MUST_GO_LOCAL
 
 
