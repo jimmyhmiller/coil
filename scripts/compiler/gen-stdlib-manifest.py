@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""Regenerate the bundled-stdlib manifest tables in src/compiler/embedded_stdlib.coil.
+"""Regenerate the stdlib manifest tables in src/compiler/stdlib_manifest.coil.
 
-The three tables (`embedded-namespaces`, `embedded-file-for-namespace`,
-`embedded-lib`) are three views of ONE fact: which files under src/stdlib/ ship
-inside a standalone compiler. Maintaining them by hand meant a new stdlib file
-had to be registered in three places, and forgetting was invisible in-repo --
-the loader silently falls back to scanning the source tree, so only a compiler
-binary run OUTSIDE the repo would report the namespace as missing. That is
-exactly how coil.socket/sync/region/signals/cancellation went unreachable.
+The three tables (`stdlib-namespaces`, `stdlib-file-for-namespace`,
+`stdlib-manifest-file?`) are three views of ONE fact: which files under
+src/stdlib/ make up the standard library. Maintaining them by hand meant a new
+stdlib file had to be registered in three places, and forgetting was invisible
+in-repo -- the loader silently falls back to scanning the source tree, so only
+an installed compiler would report the namespace as missing. That is exactly how
+coil.socket/sync/region/signals/cancellation went unreachable.
 
 So the tables are derived here from the directory itself, and a gate runs this
-with --check. Note this generates only the TABLES; `include-str` still embeds
-the bytes at compile time, so the shipped text can never go stale relative to
-the sources -- only the list of which files exist is generated.
+with --check. Only the manifest is generated; the library TEXT is not in the
+compiler at all -- it is installed as files beside the binary and read from
+there (loader.coil), which is what keeps compiler and library one version.
 
 This mirrors scripts/docs/gen-guide.py, which generates src/compiler/guide.coil
 from the language reference the same way.
 
 Usage:
-    gen-embedded-stdlib.py                     # rewrite the generated region in place
-    gen-embedded-stdlib.py --check             # exit 1 if the region is out of date
-    gen-embedded-stdlib.py --print-namespaces  # the list `coil namespaces` should print
+    gen-stdlib-manifest.py                     # rewrite the generated region in place
+    gen-stdlib-manifest.py --check             # exit 1 if the region is out of date
+    gen-stdlib-manifest.py --print-namespaces  # the list `coil namespaces` should print
 """
 
 from __future__ import annotations
@@ -33,15 +33,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 STDLIB = ROOT / "src" / "stdlib"
 PRELUDE = ROOT / "src" / "compiler" / "prelude.coil"
-TARGET = ROOT / "src" / "compiler" / "embedded_stdlib.coil"
+TARGET = ROOT / "src" / "compiler" / "stdlib_manifest.coil"
 
-BEGIN = ";; BEGIN GENERATED -- regenerate with scripts/compiler/gen-embedded-stdlib.py"
+BEGIN = ";; BEGIN GENERATED -- regenerate with scripts/compiler/gen-stdlib-manifest.py"
 END = ";; END GENERATED"
 
-# Namespaces that are bundled and importable but deliberately NOT advertised by
-# `coil namespaces`: implementation detail modules of a public namespace. They
-# still get an embedded-lib entry and a file mapping; they are just absent from
-# the discovery list. This is the ONLY hand-maintained knob in the manifest --
+# Namespaces that are part of the library and importable but deliberately NOT
+# advertised by `coil namespaces`: implementation detail modules of a public
+# namespace. They still get a file-set entry and a file mapping; they are just
+# absent from the discovery list. This is the ONLY hand-maintained knob in the manifest --
 # everything else follows from src/stdlib/.
 INTERNAL_NAMESPACES = {
     "coil.http.parser.types",
@@ -78,7 +78,7 @@ def declared_module(text: str) -> str | None:
 
 
 def collect() -> list[tuple[str, str]]:
-    """(namespace, filename) for every bundled stdlib file, sorted by namespace."""
+    """(namespace, filename) for every stdlib module, sorted by namespace."""
     out: dict[str, str] = {}
     for path in sorted(STDLIB.glob("*.coil")):
         name = declared_module(path.read_text())
@@ -93,9 +93,9 @@ def collect() -> list[tuple[str, str]]:
 def public_namespaces(entries: list[tuple[str, str]]) -> list[str]:
     """What `coil namespaces` should print.
 
-    `coil.core` lives in the prelude, not src/stdlib, and is embedded by
-    `embedded-prelude`; it is advertised but has no file mapping of its own (and
-    is auto-referred, so it is never explicitly imported).
+    `coil.core` lives in the prelude (src/compiler/prelude.coil), not src/stdlib;
+    it is advertised but has no file mapping of its own (and is auto-referred, so
+    it is never explicitly imported).
     """
     core = declared_module(PRELUDE.read_text())
     if core is None:
@@ -110,29 +110,25 @@ def render(entries: list[tuple[str, str]]) -> str:
 
     add(BEGIN)
     add("")
-    add("; Public namespace discovery for the bundled library: what `coil namespaces`")
+    add("; Public namespace discovery for the library: what `coil namespaces`")
     add("; prints. Internal implementation-detail namespaces are importable but omitted")
     add("; here on purpose (see INTERNAL_NAMESPACES in the generator).")
-    add("(defn embedded-namespaces [] (-> (slice u8))")
+    add("(defn stdlib-namespaces [] (-> (slice u8))")
     add('  "' + "".join(ns + "\\n" for ns in public) + '")')
     add("")
-    add("; Public namespace -> the bundled filename that declares it.")
-    add("(defn embedded-file-for-namespace [(name (slice u8))] (-> (slice u8))")
+    add("; Namespace -> the library filename that declares it.")
+    add("(defn stdlib-file-for-namespace [(name (slice u8))] (-> (slice u8))")
     body = [f'(= name "{ns}") "{fn}"' for ns, fn in entries]
     add("  (cond " + "\n        ".join(body))
     add('        ""))')
     add("")
-    add("; Text of a bundled stdlib module by filename, or an empty slice if not")
-    add("; bundled. `bundled?` in loader.coil derives from this: a name is bundled iff")
-    add("; we carry its text. `include-str` reads the file at COMPILE time, so these")
-    add("; bytes are baked into the compiler binary and cannot drift from the sources.")
-    add("(defn embedded-lib [(name (slice u8))] (-> (slice u8))")
-    body = [
-        f'(= name "{fn}") (include-str "../stdlib/{fn}")'
-        for fn in sorted(fn for _, fn in entries)
-    ]
+    add("; Is this filename a module of the standard library? `bundled?` in loader.coil")
+    add("; is this question: it decides whether a name is resolved from the installed")
+    add("; library or from the project being compiled.")
+    add("(defn stdlib-manifest-file? [(name (slice u8))] (-> bool)")
+    body = [f'(= name "{fn}") true' for fn in sorted(fn for _, fn in entries)]
     add("  (cond " + "\n        ".join(body))
-    add('        ""))')
+    add("        false))")
     add("")
     add(END)
     return "\n".join(lines)
@@ -178,10 +174,10 @@ def main() -> int:
         print(f"error: {rel} is out of date with src/stdlib/", file=sys.stderr)
         print(
             "  a stdlib file was added, removed, or renamed without regenerating the manifest.\n"
-            "  Left unfixed, the namespace is unreachable from a compiler binary run outside\n"
-            "  this repo (in-repo it still resolves via the source-tree scan, which is why\n"
-            "  this needs a gate). Fix with:\n"
-            "      python3 scripts/compiler/gen-embedded-stdlib.py",
+            "  Left unfixed, the namespace is unreachable from an installed compiler (in-repo\n"
+            "  it still resolves via the source-tree scan, which is why this needs a gate).\n"
+            "  Fix with:\n"
+            "      python3 scripts/compiler/gen-stdlib-manifest.py",
             file=sys.stderr,
         )
         return 1

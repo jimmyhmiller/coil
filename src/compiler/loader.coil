@@ -11,7 +11,7 @@
 (import "coil.control" :use *)
 (import "coil.try" :use *)
 (import "ffi" :use *)
-(import "embedded_stdlib" :use *)  ; embedded prelude + bundled libs -> runs outside the repo
+(import "stdlib_manifest" :use *)  ; which modules the standard library consists of
 (import "ast" :use *)
 (import "parser" :use *)
 (import "coil.reader" :use *)
@@ -51,7 +51,7 @@
 
 ; Like `read-file`, but distinguishes "could not open" (None) from an empty file
 ; (Some ""). `read-file` returns an empty slice for both, which is fine for the
-; loader's disk-first / embedded-fallback probing but WRONG for `include-str`,
+; loader's "is there a module at this path" probing but WRONG for `include-str`,
 ; where a missing file at compile time is a hard build error, not an empty embed.
 (defn read-file-opt [(a (ptr Allocator)) (path (ptr i8))] (-> (Option (slice u8)))
   (let [fd (open path 0)]
@@ -447,12 +447,11 @@
                 (store! i (primitive/iadd (load i) 1)))))
     (if (< (load idx) (primitive/cast i64 0)) p (subslice p (primitive/iadd (load idx) 1) n))))
 
-; The embedded table IS the single manifest of bundled modules: a name is bundled
-; iff we carry its text (embedded-lib returns "" for anything not bundled). This is
-; the one source of truth — the old hand-maintained duplicate list is gone, and the
+; The generated manifest IS the single source of truth for which modules are the
+; standard library's — the old hand-maintained duplicate list is gone, and the
 ; snapshot corpus derives its lib set from `src/stdlib/*.coil` directly.
 (defn bundled? [(name (slice u8))] (-> bool)
-  (> (slice-len (embedded-lib name)) (primitive/cast i64 0)))
+  (stdlib-manifest-file? name))
 
 ; The import base for bundled stdlib files and the prelude. It marks compiler-owned
 ; embedded text, keeping the bundle self-contained and enabling narrowly scoped
@@ -466,50 +465,243 @@
         false
         (do (close fd) true))))
 
-; The explicit stdlib source root (`COIL_STDLIB_DIR`), or None. When set, the loader
-; prefers live source files under it over the embedded copies — for developing the
-; compiler (edit a lib, rebuild a program, no compiler rebuild). When UNSET the
-; embedded copies are authoritative and NO disk path is consulted, so a portable
-; binary can never be shadowed by a stray src/stdlib/*.coil in whatever directory it runs
-; in. (The self-build stays correct either way: each stage's embedded copies equal
-; the disk sources it was built from.)
+; ── finding the standard library ─────────────────────────────────────────────
+; The compiler and the standard library are ONE toolchain with ONE version. The
+; library is a directory of files, installed together with the binary and never
+; separately, and found the way python finds its prefix and rustc finds its sysroot:
+; walk up from the location of the compiler that is running, looking for a landmark.
+; Two layouts count as a hit.
 ;
-; The value is a CHECKOUT ROOT — the directory holding src/stdlib and
-; src/compiler — so `COIL_STDLIB_DIR=$PWD` from the repo root is the intended
-; spelling. A root without src/stdlib is a hard error rather than a silent
-; fallback to the embedded copies: an override that quietly does nothing turns
-; every "I edited the lib and nothing changed" into a debugging session, and made
-; the A/B measurement procedure in docs/reference/ALLOCATION.md a no-op.
-(defn stdlib-dir [(a (ptr Allocator))] (-> (Option (slice u8)))
-  (let [p (getenv (str->cstr a "COIL_STDLIB_DIR"))]
-    (if (= (primitive/cast i64 p) (primitive/cast i64 0))
-        (None [(slice u8)])
-        (let [dir (cstr->slice p)
-              libs (path-join a dir "src/stdlib")]
-          (if (path-readable? a libs)
-              (Some dir)
-              (let [w (stderr)]
-                (ps w "error: COIL_STDLIB_DIR is set to '")
-                (ps w dir)
-                (ps w "' but '")
-                (ps w libs)
-                (ps w "' does not exist\n")
-                (ps w "note: it must name a checkout root (the directory containing src/stdlib),\n")
-                (ps w "      not the stdlib directory itself; unset it to use the embedded copies\n")
-                (exit 1)
-                (None [(slice u8)])))))))
+;   INSTALLED  <prefix>/bin/coil      ->  <prefix>/lib/coil/stdlib/*.coil
+;                                         <prefix>/lib/coil/prelude.coil
+;   CHECKOUT   <root>/build/bin/coil  ->  <root>/src/stdlib/*.coil
+;                                         <root>/src/compiler/prelude.coil
+;
+; A compiler built inside a checkout finds that checkout — which is what keeps two
+; checkouts, or two worktrees, on their own library instead of shadowing each other —
+; and `dev.py install` copies binary and library into a prefix as one act.
+;
+; What this replaced: the library used to be `include-str`'d into the binary, so an
+; installed compiler served whatever the library was on the day it was built. That is
+; a compiler and a library at two different versions, and the only way to see the
+; difference was to notice that an edit had no effect. The workaround was
+; COIL_STDLIB_DIR, an override that had to be remembered on every invocation and
+; failed silently when it wasn't. Both are gone: there is one library on disk, the
+; command you ran decides which, and `coil --version` prints it.
+;
+; A compiler that finds no library cannot compile: it says so and exits, naming both
+; places it looked (`stdlib-not-found`), the way rustc does when its sysroot is
+; missing. The search falls back to the working directory because the bootstrap builds
+; stage compilers into /tmp and runs them from the checkout, which is a toolchain root
+; even though the binary is not inside it.
 
-; Text of a bundled lib: the file under $COIL_STDLIB_DIR/src/stdlib if that
-; override is set and the file exists, otherwise the embedded copy. A per-file
-; miss still falls back (a root may predate a newly added lib); an unusable root
-; is rejected up front by `stdlib-dir`.
+(defstruct SelfCommandBox [(known i64) (path (slice u8))])
+(defn self-command-box [] (-> (ptr SelfCommandBox))
+  (alloc/static SelfCommandBox))
+
+;; Publish argv[0] — the command the user actually ran. `driver-main` calls this
+;; before anything can load a library; until it does, only the working-directory
+;; anchor of the search below is available.
+(defn set-self-command! [(p (slice u8))] (-> i64)
+  (let [b (self-command-box)]
+    (store! (field b known) 1)
+    (store! (field b path) p))
+  0)
+
+(defn self-command [] (-> (slice u8))
+  (let [b (self-command-box)]
+    (if (= (load (field b known)) (primitive/cast i64 0)) "" (load (field b path)))))
+
+;; Scan PATH for `name`, the way the shell just did. "" when no entry holds it.
+(defn path-in-search-path [(a (ptr Allocator)) (name (slice u8))] (-> (slice u8))
+  (let [p (getenv (str->cstr a "PATH"))]
+    (if (= (primitive/cast i64 p) (primitive/cast i64 0))
+        ""
+
+        (let [path (cstr->slice p)
+              n (slice-len path)
+              (mut start) 0
+              (mut i) 0
+              (mut found) ""]
+          (loop (let [at-end (>= (load i) n)
+                      sep
+                        (if at-end
+                            true
+                            (= (primitive/cast i64 (slice-get path (load i))) (primitive/cast i64 58)))]
+                  (if sep
+                      ; An empty PATH entry means the working directory, as in the shell.
+                      (let [entry (subslice path (load start) (load i))
+                            dir (if (= (slice-len entry) (primitive/cast i64 0)) "." entry)
+                            cand (path-join a dir name)]
+                        (if (path-readable? a cand)
+                            (do (store! found cand) (break))
+                            (if at-end
+                                (break)
+                                (do
+                                  (store! start (primitive/iadd (load i) 1))
+                                  (store! i (primitive/iadd (load i) 1))
+                                  0))))
+                      (do (store! i (primitive/iadd (load i) 1)) 0))))
+          (load found)))))
+
+(defn realpath-opt [(a (ptr Allocator)) (path (slice u8))] (-> (Option (slice u8)))
+  (let [buf (unwrap-ptr [i8] (raw-alloc a 4096 1))
+        r (realpath (str->cstr a path) buf)]
+    (if (= (primitive/cast i64 r) (primitive/cast i64 0))
+        (None [(slice u8)])
+        (Some (cstr->slice buf)))))
+
+;; A command name as the filesystem path of the thing it runs.
+;;
+;; A shell may keep the bare command name in argv[0] after finding the executable
+;; through PATH, so a compiler that wants to locate anything relative to ITSELF —
+;; its standard library, the native archives beside it — has to redo that lookup.
+;; realpath first (which covers absolute and cwd-relative names, and follows a
+;; symlinked `coil` to the toolchain it really belongs to), then PATH. Unresolvable
+;; names come back unchanged, so a caller never has to special-case failure.
+;;
+;; `driver.coil`'s resource paths resolve through this same function: two subtly
+;; different answers to "where am I" is how a compiler ends up finding its archives
+;; and its library in different places.
+(defn resolve-command-path [(a (ptr Allocator)) (name (slice u8))] (-> (slice u8))
+  (if (= (slice-len name) (primitive/cast i64 0))
+      name
+      (match (realpath-opt a name)
+        (Some [p] p)
+        (None []
+              (match (str-find name "/")
+                (Some [i0] name)
+                (None []
+                      (let [found (path-in-search-path a name)]
+                        (if (= (slice-len found) (primitive/cast i64 0))
+                            name
+                            (match (realpath-opt a found) (Some [p] p) (None [] found))))))))))
+
+(defn self-command-path [(a (ptr Allocator))] (-> (slice u8))
+  (resolve-command-path a (self-command)))
+
+; Where the library was found. STDLIB-MISSING means nowhere, which is fatal at the
+; first module load — there is nothing else to serve.
+(const STDLIB-MISSING 0)
+(const STDLIB-INSTALLED 1)
+(const STDLIB-CHECKOUT 2)
+
+; `libs` is the directory holding the library files; `prelude` the full path of
+; prelude.coil, which sits in a different place in each layout.
+(defstruct StdlibLayout [(resolved i64) (kind i64) (libs (slice u8)) (prelude (slice u8))])
+
+;; Does `dir` hold either layout? Directories are the landmarks, not any particular
+;; file: a library that gains or loses a module must not change how it is found.
+(defn stdlib-layout-at! [(a (ptr Allocator)) (dir (slice u8)) (out (ptr StdlibLayout))] (-> bool)
+  (let [installed (path-join a dir "lib/coil/stdlib")]
+    (if (path-readable? a installed)
+        (do
+          (store! (field out kind) STDLIB-INSTALLED)
+          (store! (field out libs) installed)
+          (store! (field out prelude) (path-join a dir "lib/coil/prelude.coil"))
+          true)
+        ; Both halves of a checkout are required. `src/stdlib` alone could be any
+        ; project that happens to use that name; only this one also has src/compiler.
+        (let [libs (path-join a dir "src/stdlib")]
+          (if (and (path-readable? a libs) (path-readable? a (path-join a dir "src/compiler")))
+              (do
+                (store! (field out kind) STDLIB-CHECKOUT)
+                (store! (field out libs) libs)
+                (store! (field out prelude) (path-join a dir "src/compiler/prelude.coil"))
+                true)
+              false)))))
+
+;; Walk `start` and its ancestors, stopping at the first directory holding a layout.
+(defn stdlib-layout-upward! [(a (ptr Allocator)) (start (slice u8)) (out (ptr StdlibLayout))] (-> bool)
+  (if (= (slice-len start) (primitive/cast i64 0))
+      false
+      (let [(mut dir) start
+            (mut hit) false]
+        (loop (if (stdlib-layout-at! a (load dir) out)
+                  (do (store! hit true) (break))
+                  ; dirname bottoms out at "" (from "/x") or "." (from a bare name);
+                  ; either way the parent stops changing, which ends the walk.
+                  (let [up (dirname (load dir))]
+                    (if (or (= up (load dir)) (<= (slice-len (load dir)) (primitive/cast i64 1)))
+                        (break)
+                        (do (store! dir up) 0)))))
+        (load hit))))
+
+(defn find-stdlib-layout! [(a (ptr Allocator)) (out (ptr StdlibLayout))] (-> i64)
+  (store! (field out kind) STDLIB-MISSING)
+  (store! (field out libs) "")
+  (store! (field out prelude) "")
+  ; The compiler's own location first — that is the toolchain it belongs to. The
+  ; working directory second, which is how a stage compiler in /tmp finds the checkout
+  ; it is building.
+  (unless (stdlib-layout-upward! a (dirname (self-command-path a)) out)
+    (stdlib-layout-upward! a (cwd-slice a) out)
+    0)
+  0)
+
+; Resolved once per process: every library file consults it, and the walk costs a
+; handful of directory probes that would otherwise be repeated seventy times.
+(defn stdlib-layout-box [] (-> (ptr StdlibLayout))
+  (alloc/static StdlibLayout))
+
+(defn stdlib-layout [(a (ptr Allocator))] (-> (ptr StdlibLayout))
+  (let [b (stdlib-layout-box)]
+    (when (= (load (field b resolved)) (primitive/cast i64 0))
+      (find-stdlib-layout! a b)
+      (store! (field b resolved) 1)
+      0)
+    b))
+
+;; How `coil --version` describes the answer. The layout is named as well as located,
+;; because "which library am I compiling against" is the question this whole mechanism
+;; exists to make answerable by asking rather than by experiment.
+(defn stdlib-source-text [(a (ptr Allocator))] (-> (slice u8))
+  (let [l (stdlib-layout a)
+        kind (load (field l kind))]
+    (if (= kind STDLIB-MISSING)
+        "NOT FOUND"
+        (let [label (if (= kind STDLIB-INSTALLED) "installed: " "checkout: ")]
+          (match (str-concat a label (load (field l libs))) (Some [v] v) (None [] label))))))
+
+;; No library, no compiler. Report both places that were searched and how to install,
+;; rather than failing later as a pile of unresolved `coil.*` imports.
+(defn stdlib-not-found [(a (ptr Allocator)) (want (slice u8))] (-> i64)
+  (let [w (stderr)]
+    (ps w "error: cannot find the coil standard library (looking for '")
+    (ps w want)
+    (ps w "')\n")
+    (ps w "  searched upward from the compiler at: ")
+    (ps w (self-command-path a))
+    (wb w 10)
+    (ps w "  and upward from the working directory: ")
+    (ps w (cwd-slice a))
+    (wb w 10)
+    (ps w "note: a coil installation is <prefix>/bin/coil next to <prefix>/lib/coil/stdlib,\n")
+    (ps w "      and a checkout is a directory holding src/stdlib and src/compiler.\n")
+    (ps w "      The library ships WITH the compiler: install both with\n")
+    (ps w "          python3 scripts/dev.py install\n")
+    (exit 1)
+    0))
+
+; Text of one library module, read from the layout that was found. A missing file is
+; fatal for the same reason a missing layout is: the alternative is a compiler that
+; half-has a standard library and reports the shortfall as the user's type error.
 (defn bundled-text [(a (ptr Allocator)) (bn (slice u8))] (-> (slice u8))
-  (match (stdlib-dir a)
-    (None [] (embedded-lib bn))
-    (Some [dir]
-          (let [lc (str->cstr a (path-join a (path-join a dir "src/stdlib") bn))
-                d (read-file a lc)]
-            (if (= (slice-len d) (primitive/cast i64 0)) (embedded-lib bn) d)))))
+  (let [l (stdlib-layout a)]
+    (when (= (load (field l kind)) STDLIB-MISSING) (stdlib-not-found a bn) 0)
+    (let [p (path-join a (load (field l libs)) bn)
+          d (read-file a (str->cstr a p))]
+      (when (= (slice-len d) (primitive/cast i64 0)) (stdlib-not-found a p) 0)
+      d)))
+
+;; The prelude is a library file too, in its own place in each layout.
+(defn stdlib-prelude-text [(a (ptr Allocator))] (-> (slice u8))
+  (let [l (stdlib-layout a)]
+    (when (= (load (field l kind)) STDLIB-MISSING) (stdlib-not-found a "prelude.coil") 0)
+    (let [p (load (field l prelude))
+          d (read-file a (str->cstr a p))]
+      (when (= (slice-len d) (primitive/cast i64 0)) (stdlib-not-found a p) 0)
+      d)))
 
 ; A `coil.*` namespace that resolves from the source tree instead of the bundle is
 ; a manifest bug: it works in this repo and fails for every compiler run outside
@@ -775,7 +967,7 @@
         legacy
           (or (>= (dep-slash name) (primitive/cast i64 0))
               (and (>= nn (primitive/cast i64 5)) (= (subslice name (primitive/isub nn 5) nn) ".coil")))
-        mapped (embedded-file-for-namespace name)
+        mapped (stdlib-file-for-namespace name)
         ; Transitional compatibility is confined to compiler-owned embedded text.
         ; User source never has the <bundled> base and therefore cannot import a
         ; filename, relative or otherwise.
@@ -804,7 +996,7 @@
                                                      (sconcat3 a
                                                                "namespace '"
                                                                name
-                                                               "' is missing from the bundled stdlib manifest — it resolved only from the source tree, so a compiler run outside this repo could not import it; regenerate with scripts/compiler/gen-embedded-stdlib.py")))
+                                                               "' is missing from the bundled stdlib manifest — it resolved only from the source tree, so an installed compiler could not import it; regenerate with scripts/compiler/gen-stdlib-manifest.py")))
                           (primitive/zeroed Resolved))
                         (let [buf (unwrap-ptr [i8] (raw-alloc a 4096 1))
                               r (realpath (str->cstr a path) buf)
@@ -922,72 +1114,81 @@
                            (match (load (field (sexp-nth f 1) kind))
                              (KStr [s] (= s "coil.scheme"))
                              (_ false)))))
-            (store! found true) 0)))
+            (store! found true)
+            0)))
     (load found)))
 
 (defn loader-ascii-casefold! [(a (ptr Allocator)) (x (ptr Sexp))] (-> i64)
   (match (load (field x kind))
     (KSym [s]
-      (let [n (slice-len [u8] s)]
-        (if (and (= n 3)
-                 (and (= (primitive/cast i64 (slice-get [u8] s 0)) 35)
-                      (= (primitive/cast i64 (slice-get [u8] s 1)) 92))) 0
-          ;; Keep the original slice identity as well as the syntax-node
-          ;; identity: loader indexes may already retain views into this source
-          ;; buffer. The source storage is owned and mutable for the compilation.
-          (for [i 0 n]
-            (let [c (primitive/cast i64 (slice-get [u8] s i))]
-              (if (and (>= c 65) (<= c 90))
-                  (slice-set! [u8] s i (primitive/cast u8 (+ c 32)))
-                0))))))
+          (let [n (slice-len [u8] s)]
+            (if (and (= n 3)
+                     (and (= (primitive/cast i64 (slice-get [u8] s 0)) 35)
+                          (= (primitive/cast i64 (slice-get [u8] s 1)) 92)))
+                0
+                ;; Keep the original slice identity as well as the syntax-node
+                ;; identity: loader indexes may already retain views into this source
+                ;; buffer. The source storage is owned and mutable for the compilation.
+                (for [i 0 n]
+                  (let [c (primitive/cast i64 (slice-get [u8] s i))]
+                    (if (and (>= c 65) (<= c 90))
+                        (slice-set! [u8] s i (primitive/cast u8 (+ c 32)))
+                        0))))))
     (KList [items]
-      (let [n (al-len [Sexp] (load items))]
-        (for [i 0 n] (loader-ascii-casefold! a (al-elem [Sexp] items i)))))
+           (let [n (al-len [Sexp] (load items))]
+             (for [i 0 n] (loader-ascii-casefold! a (al-elem [Sexp] items i)))))
     (KVec [items]
-      (let [n (al-len [Sexp] (load items))]
-        (for [i 0 n] (loader-ascii-casefold! a (al-elem [Sexp] items i)))))
+          (let [n (al-len [Sexp] (load items))]
+            (for [i 0 n] (loader-ascii-casefold! a (al-elem [Sexp] items i)))))
     (_ 0)))
 
 (defn loader-fold-source-node! [(src (slice u8)) (x (ptr Sexp))] (-> i64)
   (match (load (field x kind))
     (KSym [s]
-      (let [lo (load (field x lo)) hi (load (field x hi))]
-        (if (and (= (- hi lo) 3)
-                 (and (= (primitive/cast i64 (slice-get [u8] src lo)) 35)
-                      (= (primitive/cast i64 (slice-get [u8] src (+ lo 1))) 92))) 0
-          (for [i lo hi]
-            (let [c (primitive/cast i64 (slice-get [u8] src i))]
-              (if (and (>= c 65) (<= c 90))
-                  (slice-set! [u8] src i (primitive/cast u8 (+ c 32))) 0))))))
+          (let [lo (load (field x lo))
+                hi (load (field x hi))]
+            (if (and (= (- hi lo) 3)
+                     (and (= (primitive/cast i64 (slice-get [u8] src lo)) 35)
+                          (= (primitive/cast i64 (slice-get [u8] src (+ lo 1))) 92)))
+                0
+                (for [i lo hi]
+                  (let [c (primitive/cast i64 (slice-get [u8] src i))]
+                    (if (and (>= c 65) (<= c 90))
+                        (slice-set! [u8] src i (primitive/cast u8 (+ c 32)))
+                        0))))))
     (KList [items]
-      (let [n (al-len [Sexp] (load items))]
-        (for [i 0 n] (loader-fold-source-node! src (al-elem [Sexp] items i)))))
+           (let [n (al-len [Sexp] (load items))]
+             (for [i 0 n] (loader-fold-source-node! src (al-elem [Sexp] items i)))))
     (KVec [items]
-      (let [n (al-len [Sexp] (load items))]
-        (for [i 0 n] (loader-fold-source-node! src (al-elem [Sexp] items i)))))
+          (let [n (al-len [Sexp] (load items))]
+            (for [i 0 n] (loader-fold-source-node! src (al-elem [Sexp] items i)))))
     (_ 0)))
 
 (defn loader-casefold-source! [(src (slice u8)) (forms (ptr (ArrayList Sexp)))] (-> i64)
-  (if (not (loader-scheme-source? forms)) 0
-    (let [n (al-len [Sexp] (load forms))]
-      (for [i 0 n]
-        (let [f (al-elem [Sexp] forms i)]
-          (if (and (sexp-list? f)
-                   (and (> (sexp-count f) 0)
-                        (sexp-sym-is (sexp-nth f 0) "module"))) 0
-            (loader-fold-source-node! src f)))))))
+  (if (not (loader-scheme-source? forms))
+      0
+      (let [n (al-len [Sexp] (load forms))]
+        (for [i 0 n]
+          (let [f (al-elem [Sexp] forms i)]
+            (if (and (sexp-list? f)
+                     (and (> (sexp-count f) 0)
+                          (sexp-sym-is (sexp-nth f 0) "module")))
+                0
+                (loader-fold-source-node! src f)))))))
 
 (defn loader-casefold-scheme! [(a (ptr Allocator)) (forms (ptr (ArrayList Sexp)))] (-> i64)
-  (if (not (loader-scheme-source? forms)) 0
-    (let [n (al-len [Sexp] (load forms))]
-      (for [i 0 n]
-        (let [f (al-elem [Sexp] forms i)]
-          ;; Preserve the namespace spelling in `(module NAME)`; it belongs to
-          ;; Coil's module system, while all Scheme program identifiers fold.
-          (if (and (sexp-list? f)
-                   (and (>= (sexp-count f) 1)
-                        (sexp-sym-is (sexp-nth f 0) "module"))) 0
-            (loader-ascii-casefold! a f)))))))
+  (if (not (loader-scheme-source? forms))
+      0
+      (let [n (al-len [Sexp] (load forms))]
+        (for [i 0 n]
+          (let [f (al-elem [Sexp] forms i)]
+            ;; Preserve the namespace spelling in `(module NAME)`; it belongs to
+            ;; Coil's module system, while all Scheme program identifiers fold.
+            (if (and (sexp-list? f)
+                     (and (>= (sexp-count f) 1)
+                          (sexp-sym-is (sexp-nth f 0) "module")))
+                0
+                (loader-ascii-casefold! a f)))))))
 
 (defn collect-syms [(a (ptr Allocator)) (items (ptr (ArrayList Sexp)))] (-> (ptr (ArrayList (slice u8))))
   (let [n (al-len [Sexp] (load items))
@@ -1475,7 +1676,7 @@
                                           (match (read-all a text inc-id)
                                             (Ok [fresh] fresh)
                                             (Err [_] inc0)))
-                                      inc0)
+                                        inc0)
                                   modname
                                     (match (declared-module inc-forms)
                                       (Some [m] m)
@@ -1992,15 +2193,9 @@
 
 (defn load-program [(s (mut LS)) (forms (ptr (ArrayList Sexp))) (base (slice u8))] (-> i64)
   (let [a (load (field s a))
-        ; $COIL_STDLIB_DIR/src/compiler/prelude.coil if that override is set and the
-        ; file exists (so dev edits take effect without a compiler rebuild), else the
-        ; embedded copy. Unset => embedded only, never an ambient disk read.
-        prelude-text
-          (match (stdlib-dir a)
-            (None [] (embedded-prelude))
-            (Some [dir]
-                  (let [d (read-file a (str->cstr a (path-join a dir "src/compiler/prelude.coil")))]
-                    (if (= (slice-len d) (primitive/cast i64 0)) (embedded-prelude) d))))
+        ; The prelude comes from the same layout as every other library module (see
+        ; find-stdlib-layout!), so it is always the same version as they are.
+        prelude-text (stdlib-prelude-text a)
         prelude-id (load (field s srccount))
         _ignore (store! (field s srccount) (primitive/iadd prelude-id 1))
         _reg (register-source! (mut s) "<prelude>" prelude-text)]

@@ -31,7 +31,7 @@ Stdlib edits are invisible to the installed compiler unless you point it at this
 checkout, so every command starts the same way:
 
 ```
-COIL_STDLIB_DIR=. coil test tests/prop/stdlib_props_test.coil
+coil test tests/prop/stdlib_props_test.coil
 ```
 
 Typecheck without running, or turn the library's own runtime checks on — bounds
@@ -39,9 +39,9 @@ checks, header validation, and a memory sanitizer are worth far more against
 generated inputs than against hand-written ones:
 
 ```
-COIL_STDLIB_DIR=. coil check tests/prop/stdlib_props_test.coil
-COIL_STDLIB_DIR=. coil test --debug-checks tests/prop/stdlib_props_test.coil
-COIL_STDLIB_DIR=. coil test --sanitize=address tests/prop/stdlib_props_test.coil
+coil check tests/prop/stdlib_props_test.coil
+coil test --debug-checks tests/prop/stdlib_props_test.coil
+coil test --sanitize=address tests/prop/stdlib_props_test.coil
 ```
 
 `coil test` has no per-property selector for a named file; narrow by editing
@@ -62,7 +62,7 @@ Every knob is an environment variable; none of them change the properties.
 The default run is the fast one for CI. A real hunt looks like:
 
 ```
---cases=5000 --size=120 COIL_STDLIB_DIR=. coil test tests/prop/stdlib_props_test.coil
+--cases=5000 --size=120 coil test tests/prop/stdlib_props_test.coil
 ```
 
 The suite has been run green at 5000 cases / size 120, at 3000 cases / size 200,
@@ -221,7 +221,7 @@ scalar too — that is the version whose counterexample you can read.
   it between cases, so nothing in this file frees anything and nothing leaks.
 - **Prove the property can fail, by breaking the library on purpose.** Copy
   `src/` somewhere, introduce the bug you think the property catches, and run
-  with `COIL_STDLIB_DIR` pointed at the copy. If the suite stays green, the
+  and running the suite there. If the suite stays green, the
   property does not test what its name says. Do this across several
   `--seed`s, not one: a property that catches the bug on half the seeds
   is a property that will let it through.

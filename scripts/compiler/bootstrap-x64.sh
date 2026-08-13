@@ -24,6 +24,8 @@
 #        STAGE0=/path/to/coil scripts/compiler/bootstrap-x64.sh
 set -uo pipefail
 cd "$(dirname "$0")/../.."
+# Stage compilers land in /tmp; give /tmp the toolchain library they resolve against.
+. scripts/compiler/stage-lib.sh
 SRC=src/compiler/main.coil
 
 STAGE0="${STAGE0:-build/bin/coil}"

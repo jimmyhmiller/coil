@@ -12,9 +12,10 @@ server_pid=$!
 trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT HUP INT TERM
 sleep 1
 
-# COIL_STDLIB_DIR so an in-tree stdlib edit is what gets tested, not the copy embedded in
-# whatever compiler binary happens to be on hand.
-COIL_STDLIB_DIR="$repo_dir" "$coil" build \
+# Run from the checkout, so the library under test is this tree's (loader.coil finds
+# the toolchain root by walking up from the compiler, then from here).
+cd "$repo_dir"
+"$coil" build \
   "$repo_dir/tests/http_client_stream_integration.coil" \
   -o /tmp/coil-http-stream-test
 

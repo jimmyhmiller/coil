@@ -10,12 +10,12 @@ small end.
 From the worktree root:
 
 ```sh
-COIL_STDLIB_DIR=. coil build src/benchmarks/prop_bench.coil -o /tmp/prop_bench
+coil build src/benchmarks/prop_bench.coil -o /tmp/prop_bench
 /tmp/prop_bench
 ```
 
 `coil build` is `-O3` (the default; the only other tier is `-g`). No flags beyond
-`-o`. `COIL_STDLIB_DIR=.` is required or the installed compiler serves its
+`-o`. Run it from the checkout root, or the compiler resolves its
 embedded stdlib and the numbers describe a different `coil.prop`.
 
 Host: `Darwin 25.5.0 arm64`, Apple M2 Max, `coil 0.1.0`.

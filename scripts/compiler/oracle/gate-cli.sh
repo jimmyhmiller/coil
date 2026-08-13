@@ -82,8 +82,12 @@ printf '(defn b [] (-> i64)    2)\n'                     > "$T/messy2.coil"
 
 echo "== executable-relative resources through PATH =="
 HTTP_NATIVE_TARGET=$([ "$HOST_OS" = Linux ] && echo x86_64-linux || echo arm64-macos)
-mkdir -p "$T/path-bin" "$T/real-bin/native/curl/$HTTP_NATIVE_TARGET"
+mkdir -p "$T/path-bin" "$T/real-bin/native/curl/$HTTP_NATIVE_TARGET" "$T/lib/coil"
 cp "$COIL" "$T/real-bin/coil-real"
+# A compiler carries no library, so a copy of one needs a prefix to sit in: for a
+# binary in $T/real-bin that is $T/lib/coil (loader.coil walks up from the executable).
+ln -sfn "$PWD/src/stdlib" "$T/lib/coil/stdlib"
+ln -sfn "$PWD/src/compiler/prelude.coil" "$T/lib/coil/prelude.coil"
 ln -s "$T/real-bin/coil-real" "$T/path-bin/coil"
 cp tests/http_client_compile.coil "$T/http.coil"
 cat > "$T/curl-stub.c" <<'EOF'
@@ -2344,19 +2348,32 @@ echo "== bundled stdlib manifest =="
 # here — coil.socket, coil.sync, coil.region, coil.signals and coil.cancellation
 # all shipped unreachable that way. Hence a gate rather than review.
 expect_rc 0 "manifest: generated tables match src/stdlib/" \
-  python3 scripts/compiler/gen-embedded-stdlib.py --check
+  python3 scripts/compiler/gen-stdlib-manifest.py --check
 
-# The contract, tested the way a user meets it: from a directory that is not this
-# repo, with every source-tree override unset, each advertised namespace resolves.
-# coil.core is excluded — it lives in the prelude and is auto-referred, not imported.
+# The contract, tested the way a user meets it: through a real INSTALL, from a
+# directory that is not this repo. `dev.py install` puts the compiler and its
+# standard library in one prefix, which is also the only way either of them ships,
+# so this exercises the shipping layout rather than a repo-only shortcut.
 mkdir -p "$T/bundle"
+expect_rc 0 "install: dev.py install lays down a compiler and its library together" \
+  python3 scripts/dev.py install --source "$COIL" --dest "$T/prefix/bin/coil"
+INSTALLED="$T/prefix/bin/coil"
+[ -d "$T/prefix/lib/coil/stdlib" ] && [ -f "$T/prefix/lib/coil/prelude.coil" ] \
+  && ok "install: the prefix holds lib/coil/stdlib and lib/coil/prelude.coil" \
+  || bad "install: the prefix holds lib/coil/stdlib and lib/coil/prelude.coil" "missing"
+expect_out "installed:" \
+  "install: --version says the library came from an install" \
+  bash -c 'cd / && "$1" --version' _ "$INSTALLED"
+expect_out "lib/coil/stdlib" \
+  "install: --version names the installed library's path" \
+  bash -c 'cd / && "$1" --version' _ "$INSTALLED"
 "$COIL" namespaces > "$T/bundle/ns.txt" 2>/dev/null
 # `--check` above compares the manifest SOURCE to src/stdlib/. This compares what
 # the compiler under test actually carries, which also catches gating a binary
 # built from older source. The reachability check below cannot cover this: it
 # derives its import list from the binary's own advertisement, so a namespace
 # missing from every table would leave it silently testing one namespace less.
-python3 scripts/compiler/gen-embedded-stdlib.py --print-namespaces > "$T/bundle/ns-want.txt"
+python3 scripts/compiler/gen-stdlib-manifest.py --print-namespaces > "$T/bundle/ns-want.txt"
 if diff -u "$T/bundle/ns-want.txt" "$T/bundle/ns.txt" > "$T/bundle/ns.diff" 2>&1; then
   ok "manifest: the compiler advertises exactly the namespaces in src/stdlib/"
 else
@@ -2380,9 +2397,9 @@ NSN=$(grep -c '^(import' "$T/bundle/allns.coil")
 [ "$NSN" -ge 40 ] \
   && ok "manifest: coil namespaces advertises $NSN importable namespaces" \
   || bad "manifest: coil namespaces advertises a plausible set" "got $NSN, expected >= 40"
-expect_rc 0 "manifest: every advertised namespace resolves outside the repo" \
-  bash -c 'cd "$1" && env -u COIL_STDLIB_DIR -u COIL_NAMESPACE_ROOTS "$2" check allns.coil' \
-  _ "$T/bundle" "$COIL"
+expect_rc 0 "manifest: every advertised namespace resolves from an install, outside the repo" \
+  bash -c 'cd "$1" && env -u COIL_NAMESPACE_ROOTS "$2" check allns.coil' \
+  _ "$T/bundle" "$INSTALLED"
 
 # COIL_STRICT_BUNDLE removes the in-repo asymmetry: a coil.* namespace served by
 # the source-tree scan is the exact bug shape above, so under the flag it is an
@@ -2391,25 +2408,42 @@ mkdir -p "$T/strict"
 printf '(module coil.gatetmp)\n(defn gt [] (-> i64) 0)\n' > "$T/strict/gatetmp.coil"
 printf '(module m)\n(import "coil.gatetmp" :as g)\n(defn main [] (-> i64) (g/gt))\n' > "$T/strict/m.coil"
 expect_rc 0 "strict-bundle: off, an unbundled coil.* still resolves from the tree" \
-  bash -c 'cd "$1" && env -u COIL_STDLIB_DIR -u COIL_STRICT_BUNDLE COIL_NAMESPACE_ROOTS=. "$2" check m.coil' \
-  _ "$T/strict" "$COIL"
+  bash -c 'cd "$1" && env -u COIL_STRICT_BUNDLE COIL_NAMESPACE_ROOTS=. "$2" check m.coil' \
+  _ "$T/strict" "$INSTALLED"
 expect_rc 1 "strict-bundle: on, an unbundled coil.* is an error" \
-  bash -c 'cd "$1" && env -u COIL_STDLIB_DIR COIL_NAMESPACE_ROOTS=. COIL_STRICT_BUNDLE=1 "$2" check m.coil' \
-  _ "$T/strict" "$COIL"
+  bash -c 'cd "$1" && env COIL_NAMESPACE_ROOTS=. COIL_STRICT_BUNDLE=1 "$2" check m.coil' \
+  _ "$T/strict" "$INSTALLED"
 expect_out "missing from the bundled stdlib manifest" \
   "strict-bundle: the error names the manifest, not the namespace lookup" \
-  bash -c 'cd "$1" && env -u COIL_STDLIB_DIR COIL_NAMESPACE_ROOTS=. COIL_STRICT_BUNDLE=1 "$2" check m.coil' \
-  _ "$T/strict" "$COIL"
+  bash -c 'cd "$1" && env COIL_NAMESPACE_ROOTS=. COIL_STRICT_BUNDLE=1 "$2" check m.coil' \
+  _ "$T/strict" "$INSTALLED"
 
-# COIL_STDLIB_DIR names a checkout ROOT. It used to be read as $DIR/lib, which
-# exists nowhere, so the override silently did nothing and every stdlib edit
-# appeared to have no effect.
-expect_rc 0 "COIL_STDLIB_DIR: a real checkout root is accepted" \
-  bash -c 'cd "$1" && env -u COIL_NAMESPACE_ROOTS COIL_STDLIB_DIR="$3" "$2" check allns.coil' \
-  _ "$T/bundle" "$COIL" "$PWD"
-expect_rc 1 "COIL_STDLIB_DIR: a root without src/stdlib is an error, not a silent no-op" \
-  bash -c 'cd "$1" && env -u COIL_NAMESPACE_ROOTS COIL_STDLIB_DIR="$1" "$2" check allns.coil' \
-  _ "$T/bundle" "$COIL"
+# A compiler carries no copy of the library, so one that has been separated from it
+# must say so. Silence here is the whole bug class this layout replaced: the compiler
+# used to answer with a library from whenever it was built, and the only symptom was
+# that editing src/stdlib changed nothing. There is no environment variable to
+# redirect the search, so these are the only two outcomes.
+mkdir -p "$T/lonely"
+cp "$COIL" "$T/lonely/coil"
+expect_rc 1 "layout: a compiler with no library beside it fails instead of guessing" \
+  bash -c 'cd "$1" && "$1/coil" check ../bundle/allns.coil' _ "$T/lonely"
+expect_out "cannot find the coil standard library" \
+  "layout: the error says the library is missing, and where it looked" \
+  bash -c 'cd "$1" && "$1/coil" check ../bundle/allns.coil 2>&1' _ "$T/lonely"
+# The other layout, built explicitly rather than assumed of $COIL: a compiler under a
+# directory that holds src/stdlib and src/compiler belongs to that checkout. (The
+# bootstrap runs its stages out of /tmp, so $COIL itself is not always in one.)
+mkdir -p "$T/fakeroot/build/bin"
+mkdir -p "$T/fakeroot/src"
+ln -sfn "$PWD/src/stdlib" "$T/fakeroot/src/stdlib"
+ln -sfn "$PWD/src/compiler" "$T/fakeroot/src/compiler"
+cp "$COIL" "$T/fakeroot/build/bin/coil"
+codesign -s - --force "$T/fakeroot/build/bin/coil" >/dev/null 2>&1 || true
+expect_out "checkout:" \
+  "layout: a compiler under a checkout uses that checkout's library" \
+  bash -c 'cd / && "$1" --version' _ "$T/fakeroot/build/bin/coil"
+expect_rc 0 "layout: and compiles with it" \
+  bash -c 'cd "$2" && "$1" check ../bundle/allns.coil' _ "$T/fakeroot/build/bin/coil" "$T/fakeroot"
 
 echo "== entry file needs no (module ...) =="
 # An ENTRY file is named on the command line and imported by nobody, so it needs no

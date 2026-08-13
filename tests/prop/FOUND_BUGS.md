@@ -127,7 +127,7 @@ unsigned, which is precisely the magnitude wanted. Worth a `deftest` pinning
 ```
 
 ```
-COIL_STDLIB_DIR=. coil test repro.coil
+coil test repro.coil
 ```
 
 ### Aftermath

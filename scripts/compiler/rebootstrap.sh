@@ -39,6 +39,8 @@ export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts}"
 # coil.sync, coil.region, coil.signals and coil.cancellation went unreachable).
 # Strict mode makes that fallback a hard error for the whole build and its gates.
 export COIL_STRICT_BUNDLE="${COIL_STRICT_BUNDLE:-1}"
+# Stage compilers land in /tmp; give /tmp the toolchain library they resolve against.
+. scripts/compiler/stage-lib.sh
 # ---- THE THREE BUILDS --------------------------------------------------------
 #
 #   flavour        script                            LLVM            links

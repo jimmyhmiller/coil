@@ -16,6 +16,8 @@
 # Usage: scripts/compiler/refresh-seed.sh [full|nollvm|both]     (default: both)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
+# Stage compilers land in /tmp; give /tmp the toolchain library they resolve against.
+. scripts/compiler/stage-lib.sh
 WHICH="${1:-both}"
 mkdir -p bootstrap/seeds/native
 updated=()

@@ -1045,10 +1045,15 @@ with `COIL_WORKER_STACK_SIZE` and `COIL_WORKER_GUARD_SIZE` (decimal bytes).
 (you'll get "call target: expected symbol" / "macro arity mismatch"). Avoid `type`
 as a struct field name. When in doubt, prefix your name (`p-call`, `vm-call`).
 
-## Bundled standard library
+## The standard library
 
-These modules ship inside the compiler — `(import "coil.NAME" :use *)` works from
-anywhere, no path or install step:
+The library ships WITH the compiler as one toolchain: `<prefix>/bin/coil` beside
+`<prefix>/lib/coil/stdlib`, installed together by `python3 scripts/dev.py install`. A
+compiler locates it by walking up from its own executable (then from the working
+directory, so a checkout works as-is), which is how the compiler and the library can
+never be two different versions. `coil --version` prints which library it found; if
+there is none, the compiler says so instead of guessing. Given a toolchain,
+`(import "coil.NAME" :use *)` works from anywhere with no path setup:
 `coil.alloc` (allocators), `coil.arraylist`, `coil.hashmap`, `coil.slice`, `coil.str`,
 `coil.mem`, `coil.io`, `coil.fmt`, `coil.print`, `coil.fs` (files), `coil.result`
 (Option/Result), `coil.control` (case/while/for/…), `coil.match` (deprecated: its

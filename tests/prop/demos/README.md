@@ -8,7 +8,7 @@ They are named `*_demo.coil`, not `*_test.coil`, so `coil test` with no argument
 never picks them up. Run them by hand and read the output.
 
 ```sh
-COIL_STDLIB_DIR=. coil test tests/prop/demos/shrink_demo.coil
+coil test tests/prop/demos/shrink_demo.coil
 ```
 
 | File | What it shows | Expected output |

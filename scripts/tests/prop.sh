@@ -1,11 +1,9 @@
 #!/bin/sh
 # Run the whole property-testing suite against the stdlib IN THIS CHECKOUT.
 #
-# `coil` serves its own embedded standard library unless COIL_STDLIB_DIR points at
-# a checkout root, so without it these tests exercise the INSTALLED coil.prop and
-# report green on a broken edit. That is the easiest way to waste an afternoon
-# here, hence this script. (After `dev.py build full` the two are the same thing;
-# in between edits they are not.)
+# Run from the checkout root: a compiler resolves the standard library by walking up
+# from itself and then from the working directory (loader.coil), so from here the
+# library under test is this tree's src/stdlib and an edit to it is what runs.
 #
 #   scripts/tests/prop.sh              # everything
 #   scripts/tests/prop.sh -q           # only the summary lines
@@ -34,7 +32,7 @@ src/examples/property-testing.coil"
 failed=0
 for f in $FILES; do
   [ -f "$f" ] || { printf '%-40s SKIP (absent)\n' "$f"; continue; }
-  out=$(COIL_STDLIB_DIR=. $COIL test "$f" 2>&1)
+  out=$($COIL test "$f" 2>&1)
   summary=$(printf '%s\n' "$out" | grep 'test result:' | tail -1)
   case "$summary" in
     *"ok."*) printf '%-40s %s\n' "$f" "$summary" ;;

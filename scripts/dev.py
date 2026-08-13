@@ -38,33 +38,70 @@ def build(args: argparse.Namespace) -> None:
     execute(*command)
 
 
+def install_library(prefix: Path) -> Path:
+    """Install the standard library into <prefix>/lib/coil, replacing what is there.
+
+    The compiler finds this directory by walking up from its own location, so the
+    library and the binary that reads it are one toolchain with one version. They
+    are therefore installed together, always, by this one function -- there is no
+    way to install a compiler without its library or to leave a module behind from
+    an older one (the directory is replaced, not merged, so a deleted module
+    disappears instead of lingering as a phantom).
+    """
+    libdir = prefix / "lib" / "coil"
+    libdir.mkdir(parents=True, exist_ok=True)
+
+    staged = libdir / "stdlib.incoming"
+    shutil.rmtree(staged, ignore_errors=True)
+    shutil.copytree(ROOT / "src" / "stdlib", staged)
+
+    live = libdir / "stdlib"
+    previous = libdir / "stdlib.previous"
+    shutil.rmtree(previous, ignore_errors=True)
+    if live.exists():
+        live.rename(previous)
+    staged.rename(live)
+    shutil.rmtree(previous, ignore_errors=True)
+
+    shutil.copy2(ROOT / "src" / "compiler" / "prelude.coil", libdir / "prelude.coil")
+    return libdir
+
+
 def install(args: argparse.Namespace) -> None:
-    """Install an already-built compiler into the user's command path.
+    """Install a compiler AND its standard library into the user's command path.
 
     Rebuilding the self-hosted compiler is intentionally opt-in: the normal
     developer workflow is to build/check once, then make that artifact the
     globally available `coil` command without paying for the bootstrap gates
     again. `--build` delegates to the existing verified bootstrap scripts.
-    """
-    if args.build:
-        destination = install_destination(args.dest)
-        build_args = argparse.Namespace(variant=args.variant, output=str(destination))
-        build(build_args)
-        return
 
-    source = Path(args.source).expanduser()
-    if not source.is_absolute():
-        source = ROOT / source
+    The library goes in before the binary, so the last step is the one that makes
+    the new compiler current -- and `coil --version` is run at the end to print
+    which library the installed command actually found.
+    """
+    destination = install_destination(args.dest)
+    if args.build:
+        built = ROOT / "build" / "bin" / "coil"
+        build(argparse.Namespace(variant=args.variant, output=str(built)))
+        source = built
+    else:
+        source = Path(args.source).expanduser()
+        if not source.is_absolute():
+            source = ROOT / source
     if not source.is_file():
         raise SystemExit(
             f"install: compiler artifact not found: {source}\n"
             "build it first, or use `python3 scripts/dev.py install --build`"
         )
 
-    destination = install_destination(args.dest)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    # <prefix>/bin/coil -> <prefix>/lib/coil, the layout loader.coil searches for.
+    libdir = install_library(destination.parent.parent)
+    print(f"installed library -> {libdir}")
+
     if source.resolve() == destination.resolve():
         print(f"already installed: {destination}")
+        report_installed(destination)
         return
 
     shutil.copy2(source, destination)
@@ -77,6 +114,24 @@ def install(args: argparse.Namespace) -> None:
             check=False,
         )
     print(f"installed {source} -> {destination}")
+    report_installed(destination)
+
+
+def report_installed(destination: Path) -> None:
+    """Print what the installed command reports about itself.
+
+    `coil --version` names the library it found, so this turns "did the install
+    actually take, and against which standard library" into something the install
+    itself answers.
+    """
+    done = subprocess.run([str(destination), "--version"], capture_output=True, text=True)
+    for line in (done.stdout or done.stderr).splitlines():
+        print(f"  {line}")
+    if "NOT FOUND" in done.stdout:
+        raise SystemExit(
+            "install: the installed compiler cannot find its standard library.\n"
+            f"  expected {destination.parent.parent / 'lib' / 'coil' / 'stdlib'}"
+        )
 
 
 def install_destination(explicit: str | None) -> Path:

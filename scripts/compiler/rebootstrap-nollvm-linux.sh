@@ -25,6 +25,8 @@
 #        STAGE0=/path/to/coil scripts/compiler/rebootstrap-nollvm-linux.sh
 set -uo pipefail
 cd "$(dirname "$0")/../.."
+# Stage compilers land in /tmp; give /tmp the toolchain library they resolve against.
+. scripts/compiler/stage-lib.sh
 SRC=src/compiler/main_x64.coil
 SEED=bootstrap/seeds/native/coil-seed-nollvm-linux-x86_64
 

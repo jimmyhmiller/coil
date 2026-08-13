@@ -30,7 +30,7 @@ binary, so treat it as a bootstrap of last resort, smoke-test the toolchain firs
 use it only to drive a real `rebootstrap-linux.sh` whose fixpoint and gates are what
 actually vouch for the seed you commit.
 
-    COIL_STDLIB_DIR=$PWD coil emit-ir src/compiler/main.coil \
+    coil emit-ir src/compiler/main.coil \
         --target x86_64-unknown-linux-gnu > coil-linux.ll
 
 Emitted at commit `596c66f` ("Stop a closed peer from killing the process on socket

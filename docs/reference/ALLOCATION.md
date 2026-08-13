@@ -186,9 +186,9 @@ threads `a` nearly everywhere, and `a` was `malloc-allocator` only because
 whole AST on a bump allocator. Steps 3 and 5 are cleanup of the sites that *bypass* the
 threaded `a`; step 4 is the change.
 
-`build src/compiler/main.coil -o /dev/null`, 15 paired runs alternating binaries, input
-pinned with `COIL_STDLIB_DIR` (see [How to measure this
-honestly](#how-to-measure-this-honestly) — without it these numbers are wrong):
+`build src/compiler/main.coil -o /dev/null`, 15 paired runs alternating binaries, both
+sides compiling the same library (see [How to measure this
+honestly](#how-to-measure-this-honestly) — otherwise these numbers are wrong):
 
 | | median | paired vs malloc root | faster |
 | --- | --- | --- | --- |
@@ -202,7 +202,7 @@ malloc's `free` was reclaiming almost nothing, so dropping it costs no memory an
 per-block bookkeeping is what goes away.
 
 Region size was chosen by measurement. Comparing the capacities against each other (these
-binaries share an embedded stdlib, so they are directly comparable):
+binaries were built from one tree and read one library, so they are directly comparable):
 
 | region | median | note |
 | --- | --- | --- |
@@ -396,10 +396,14 @@ whose only change is 60 added lines in `src/stdlib/alloc.coil` is compiling 60 m
 the binary you are comparing it against — and it looks slower and hungrier for reasons
 that have nothing to do with the change.
 
-Pin the input with `COIL_STDLIB_DIR=$PWD` on **both** sides. Everything below does.
+Make sure both sides compile the same library. This is now structural: the library is
+one directory on disk (`src/stdlib`), found by walking up from the compiler and then
+from the working directory, so two binaries run from this checkout are reading the same
+files. Run both from the checkout root and check `coil --version` agrees on the path.
 
-> **The measurements on this page predate a fix to that override and should be
-> re-taken before being relied on.** `bundled-text` read `$COIL_STDLIB_DIR/lib`,
+> **The measurements on this page were taken when each binary embedded its own copy of
+> the library, and predate a fix to the override that was supposed to pin it; they
+> should be re-taken before being relied on.** `bundled-text` read `$COIL_STDLIB_DIR/lib`,
 > a directory that has never existed — the stdlib is `src/stdlib` — so setting the
 > variable silently changed nothing and both sides compiled their own embedded
 > copies. The prelude override used the correct path throughout, so only
@@ -445,17 +449,17 @@ identical when re-run.
 
 Two mechanical traps this work hit, both worth knowing before touching `src/stdlib/`:
 
-* **A new `src/stdlib/` function used by `src/compiler` breaks the bootstrap.** `stage0` is the
-  committed seed, and it resolves `(import "coil.arraylist")` to its own *embedded* copy,
-  not the one on disk — so the seed cannot compile a `loader.coil` that calls a function
-  added to `src/stdlib/` in the same change. Build a bridge stage0 first
-  (`COIL_STDLIB_DIR=$PWD build/bin/coil build src/compiler/main.coil -o /tmp/coil-bridge`, which
-  bakes the new `src/stdlib/` in via `include-str`), run `STAGE0=/tmp/coil-bridge
-  python3 scripts/dev.py build full`, then `STAGE0=build/bin/coil scripts/compiler/refresh-seed.sh both` so a plain
-  rebootstrap works again. Verify by running `python3 scripts/dev.py build full` with no overrides.
-* **`COIL_STDLIB_DIR=$PWD` is what makes a `src/stdlib/` edit visible** to an already-built
-  compiler. Without it you are testing the embedded stdlib and your edit does nothing —
-  silently.
+* **A new `src/stdlib/` function used by `src/compiler` can break the bootstrap.** `stage0`
+  is the committed seed, and a seed old enough to carry its own *embedded* copy of the
+  library resolves `(import "coil.arraylist")` to that copy rather than the one on disk —
+  so it cannot compile a `loader.coil` that calls a function added to `src/stdlib/` in the
+  same change. Build a bridge stage0 first (`build/bin/coil build src/compiler/main.coil -o
+  /tmp/coil-bridge`), run `STAGE0=/tmp/coil-bridge python3 scripts/dev.py build full`, then
+  `STAGE0=build/bin/coil scripts/compiler/refresh-seed.sh both` so a plain rebootstrap
+  works again. Verify by running `python3 scripts/dev.py build full` with no overrides.
+* **A `src/stdlib/` edit is visible to an already-built compiler immediately**, with no
+  rebuild and nothing to remember: the compiler reads the library from disk. Check
+  `coil --version` if you are unsure which one it found.
 
 And check which backend built the binary you are timing. `rebootstrap.sh` used to install
 the arm64-backend build, which is ~11x slower than the LLVM one; a long stretch of

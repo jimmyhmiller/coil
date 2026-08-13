@@ -24,6 +24,8 @@
 # selected by `scripts/dev.py install`. No install occurs until every gate passes.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
+# Stage compilers land in /tmp; give /tmp the toolchain library they resolve against.
+. scripts/compiler/stage-lib.sh
 SRC=src/compiler/main.coil
 SEED=bootstrap/seeds/native/coil-seed-linux-x86_64
 

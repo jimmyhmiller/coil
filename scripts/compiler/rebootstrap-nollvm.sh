@@ -23,6 +23,8 @@
 #        STAGE0=/path/to/coil scripts/compiler/rebootstrap-nollvm.sh
 set -uo pipefail
 cd "$(dirname "$0")/../.."
+# Stage compilers land in /tmp; give /tmp the toolchain library they resolve against.
+. scripts/compiler/stage-lib.sh
 SRC=src/compiler/main_a64.coil
 SEED=bootstrap/seeds/native/coil-seed-nollvm
 # Scope the namespace scan: a seed that predates the loader's hidden-directory
