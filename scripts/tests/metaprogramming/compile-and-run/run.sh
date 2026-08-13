@@ -69,6 +69,11 @@ $COIL run $D/generated_stage_test.coil >/dev/null 2>&1; rc=$?
 [ $rc -eq 42 ] || { echo "generated-stage transform FAILED (exit $rc, want 42)"; exit 1; }
 echo "generated-stage: OK (transform emitted native phase-1 code; exit 42)"
 
+echo "=== 7c. ISOLATED STAGE: phase-1 forms never enter the runtime graph ==="
+$COIL run $D/isolated_stage_test.coil >/dev/null 2>&1; rc=$?
+[ $rc -eq 42 ] || { echo "isolated-stage transform FAILED (exit $rc, want 42)"; exit 1; }
+echo "isolated-stage: OK (private phase program compiled and invoked; exit 42)"
+
 echo "=== 8. THE BINDING ORACLE: a use-after-free checker keyed on binding identity ==="
 echo "       (binding-of NODE) distinguishes a SHADOWED local from its namesake —"
 echo "       exactly 2 real errors in bad(), none in ok()'s shadow (name-matching fails)"
