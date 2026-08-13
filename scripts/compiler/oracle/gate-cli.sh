@@ -522,7 +522,7 @@ expect_out "unknown trait 'NoSuchTrait' in bound" "impl trait resolves through t
 printf '(module m)\n(defn Helper [] (-> i64) 0)\n(impl Helper i64 (go [(x i64)] (-> i64) 1))\n(defn main [] (-> i64) 0)\n' > "$T/implnonfn.coil"
 expect_out "unknown trait 'Helper' in bound" "impl over a non-trait name errors identically" "$COIL" build "$T/implnonfn.coil" -o "$T/x"
 
-echo "== Callable values use static impl dispatch with implementation-defined signatures =="
+echo "== Callable values use typed, static impl dispatch =="
 cat > "$T/callable.coil" <<'EOF'
 (module m)
 (defstruct Vec3 [(x i64) (y i64) (z i64)])
@@ -560,6 +560,11 @@ cat > "$T/bad-callable-impl.coil" <<'EOF'
 (defn main [] (-> i64) 0)
 EOF
 expect_out "'call' first parameter must be the implementing type" "Callable validates its receiver parameter" "$COIL" check "$T/bad-callable-impl.coil"
+
+expect_rc 23 "closure values are callable and a typed code-pointer update changes later calls" \
+  "$COIL" run tests/compiler/features/callable_closure_reload.coil
+expect_rc 0 "Var forwards typed calls of several arities and observes code-pointer updates" \
+  "$COIL" run tests/compiler/features/callable_var_reload.coil
 
 echo "== store! yields unit (std-12): effect-only stores type-check without a wrapping do =="
 # was: `store!` took the STORED VALUE's type, so `(if c (coil.primitive/store! p ptr) 0)` was a type error
