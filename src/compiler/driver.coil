@@ -44,6 +44,8 @@
 (import "metaengine" :use *)
 (import "expander" :use *)
 (import "cga64" :use *)
+(import "jit" :use *)
+(import "repl_reload")  ; registers the replsession-only defn lowering
 (import "interp" :use *)  ; `coil interp` — additive bytecode interpreter (guarded; never in the compile path)
 (import "wasm" :use *)
 (import "cgwasm" :use *)  ; native wasm64 (memory64) backend, no LLVM
@@ -7791,9 +7793,44 @@
                       (sb-push-byte! (mut out) (primitive/cast u8 (load buf))))))))
     (if (load got) (Some (sb-str (load out))) (None [(slice u8)]))))
 
+; Read one complete Coil form. The shared balance scanner ignores delimiters in
+; strings/comments and understands reader syntax, so multiline input follows the
+; language rather than a second, approximate parenthesis counter.
+(defn repl-read-form [(a (ptr Allocator)) (buf (ptr i8))] (-> (Option (slice u8)))
+  (match (repl-read-line a buf)
+    (None [] (None [(slice u8)]))
+    (Some [first]
+          (let [(mut text) (sb-new a)]
+            (sb-push-str! (mut text) first)
+            (loop (if (bal/fully-balanced? a (sb-str (load text)))
+                      (break)
+                      (do
+                        (ps (stdout) "....> ")
+                        (match (repl-read-line a buf)
+                          (None [] (break))
+                          (Some [line]
+                                (if (= (m-trim line) ":cancel")
+                                    (do (store! text (sb-new a)) (break))
+                                    (do
+                                      (sb-push-byte! (mut text) (primitive/cast u8 10))
+                                      (sb-push-str! (mut text) line)
+                                      0)))))))
+            (Some (sb-str (load text)))))))
+
 ; The front-end preamble every REPL probe/run program shares.
 (defn repl-preamble [] (-> (slice u8))
-  "(module replsession)\n(extern printf :cc c [(ptr i8) ...] (-> i32))\n")
+  "(module replsession)\n(import \"coil.primitive\" :as primitive)\n(import \"coil.var\")\n(import \"repl_reload\")\n(extern printf :cc c [(ptr i8) ...] (-> i32))\n")
+
+(defn repl-jit-image [] (-> (ptr JitImage))
+  (primitive/alloc-static JitImage))
+
+(defn repl-jit-reset! [] (-> i64)
+  (let [img (repl-jit-image)]
+    ; Old images intentionally remain mapped: a frozen fnptr may still reference
+    ; one. Clearing the reuse root starts a fresh state lineage.
+    (store! (field img base) (primitive/cast (ptr i8) 0))
+    (store! (field img size) 0)
+    0))
 
 ; Local fat-pointer accessors so the string printer needs no stdlib import (the
 ; run program is otherwise self-contained). Byte-identical to src/stdlib/slice.coil's
@@ -7991,8 +8028,9 @@
              (and (= (t-int-bits el) (primitive/cast i64 8)) (not (t-int-signed el)))))
       false))
 
-; Write `<preamble><helpers><defs>(defn main [] (-> i64) <body>)`, run it via
-; `self run`, then REMOVE the temp file (the old REPL leaked it every call).
+; Compile `<preamble><helpers><defs>(defn main …)` through the real front end and
+; execute its exported entry directly from an in-memory ARM64 image. Definitions
+; have already been lowered by repl_reload into typed Var cells.
 (defn repl-emit-run [(a (ptr Allocator))
                      (self (slice u8))
                      (defs (slice u8))
@@ -8003,11 +8041,53 @@
                    (repl-preamble)
                    (sconcat a
                             helpers
-                            (sconcat a defs (sconcat a "(defn main [] (-> i64) " (sconcat a body ")\n")))))]
-    (d-write-file a "/tmp/coil-repl-eval.coil" prog)
-    (system (str->cstr a (cat3-d a self " run /tmp/coil-repl-eval.coil")))
-    (unlink (str->cstr a "/tmp/coil-repl-eval.coil"))
-    0))
+                            (sconcat a
+                                     defs
+                                     (sconcat a
+                                              "(defn main [] (-> i64) "
+                                              (sconcat a body ")\n(export-c [main :as \"coil_repl_entry\"])\n")))))
+        (mut paths) (al-new [(slice u8)] a)
+        (mut texts) (al-new [(slice u8)] a)]
+    (match (run-pipeline a
+                         prog
+                         (cwd-slice a)
+                         (stderr)
+                         "<repl>"
+                         (mut paths)
+                         (mut texts))
+      (None [] 1)
+      (Some [mp]
+            (let [(mut obj) (cga64-build-mobj a
+                                              mp
+                                              "<repl>"
+                                              (cwd-slice a)
+                                              (box-al [(slice u8)] a (load paths))
+                                              (box-al [(slice u8)] a (load texts))
+                                              false)]
+              (let [prior (repl-jit-image)]
+              (match (jit-load-reusing a
+                                       (mut obj)
+                                       (if (= (primitive/cast i64 (load (field prior base))) 0)
+                                           (primitive/cast (ptr JitImage) 0)
+                                           prior))
+                (Err [e0]
+                     (let [e (alloc/stack JitErr)
+                           w (stderr)]
+                       (store! e e0)
+                       (ps w "error: REPL JIT: ")
+                       (ps w (load (field e msg)))
+                       (wb w 10)
+                       1))
+                (Ok [img0]
+                    (let [img (alloc/stack JitImage)]
+                      (store! img img0)
+                      (let [raw (jit-lookup img "coil_repl_entry")]
+                        (if (= (primitive/cast i64 raw) 0)
+                            (do (ps (stderr) "error: REPL JIT entry is missing\n") 1)
+                            (let [rc (primitive/call-ptr
+                                       (primitive/cast (fnptr c [] i64) raw))]
+                              (store! prior img0)
+                              rc))))))))))))
 
 (defn repl-unsupported [(a (ptr Allocator)) (tp (ptr Type))] (-> i64)
   (let [w (stderr)]
@@ -8090,10 +8170,87 @@
   "commands:
   :help, :h          this message
   :type EXPR         print the inferred type of EXPR (does not run it)
+  :load NAMESPACE    import a module into the session with :use *
+  :defs              print the accumulated session source
+  :reset             clear every definition in this session
+  :cancel            abandon an unfinished multiline form
   :quit, :q          exit (Ctrl-D also works)
 define with (defn …)/(def …)/(defstruct …)/(import …); they persist. Any other
 line is a value expression: it is type-checked and its result is printed.
 ")
+
+(defn repl-def-source [(a (ptr Allocator)) (t (slice u8))] (-> (slice u8))
+  (if (repl-head? t "(def ")
+      (sconcat a "(const " (subslice [u8] t 5 (slice-len [u8] t)))
+      t))
+
+(defn repl-defn-name [(t (slice u8))] (-> (slice u8))
+  (if (not (repl-head? t "(defn "))
+      ""
+      (let [n (slice-len t)
+            (mut i) 6]
+        (loop (if (>= (load i) n)
+                  (break)
+                  (let [c (primitive/cast i64 (slice-get t (load i)))]
+                    (if (or (= c 32) (or (= c 9) (or (= c 10) (= c 91))))
+                        (break)
+                        (store! i (primitive/iadd (load i) 1))))))
+        (subslice [u8] t 6 (load i)))))
+
+(defn repl-form-signature [(a (ptr Allocator)) (form (slice u8))] (-> (slice u8))
+  (match (read-all a form 0)
+    (Err [_] "")
+    (Ok [forms]
+        (if (= (al-len [Sexp] (load forms)) (primitive/cast i64 0))
+            ""
+            (let [f (al-get [Sexp] (load forms) 0)]
+              (if (!= (sx-tag f) (primitive/cast i64 6))
+                  ""
+                  (let [xs (sx-items f)]
+                    (if (< (sx-len xs) (primitive/cast i64 4))
+                        ""
+                        (sconcat a
+                                 (sexp-display a (sx-at xs 2))
+                                 (sexp-display a (sx-at xs 3)))))))))))
+
+(defn repl-existing-signature [(a (ptr Allocator))
+                               (defs (slice u8))
+                               (name (slice u8))] (-> (slice u8))
+  (match (read-all a defs 0)
+    (Err [_] "")
+    (Ok [forms]
+        (let [n (al-len [Sexp] (load forms))
+              (mut i) 0
+              (mut found) ""]
+          (loop (if (or (>= (load i) n) (!= (load found) ""))
+                    (break)
+                    (let [f (al-get [Sexp] (load forms) (load i))]
+                      (when (= (sx-tag f) (primitive/cast i64 6))
+                        (let [xs (sx-items f)]
+                          (when (and (>= (sx-len xs) (primitive/cast i64 4))
+                                     (and (= (sx-tag (sx-at xs 0)) (primitive/cast i64 2))
+                                          (and (= (sx-sval (sx-at xs 0)) "defn")
+                                               (and (= (sx-tag (sx-at xs 1)) (primitive/cast i64 2))
+                                                    (= (sx-sval (sx-at xs 1)) name)))))
+                            (store! found
+                                    (sconcat a
+                                             (sexp-display a (sx-at xs 2))
+                                             (sexp-display a (sx-at xs 3)))))))
+                      (store! i (primitive/iadd (load i) 1)))))
+          (load found)))))
+
+(defn repl-signature-compatible? [(a (ptr Allocator))
+                                  (defs (slice u8))
+                                  (form (slice u8))] (-> bool)
+  (let [name (repl-defn-name form)]
+    (if (= name "")
+        true
+        (let [old (repl-existing-signature a defs name)]
+          (if (or (= old "") (= old (repl-form-signature a form)))
+              true
+              (do
+                (ps (stderr) "error: cannot redefine a REPL function with a different signature\n")
+                false))))))
 
 (defn repl-cmd [(a (ptr Allocator)) (argv (ptr (ptr i8)))] (-> i64)
   (let [self (cstr->slice (load (primitive/index argv 0)))
@@ -8102,29 +8259,55 @@ line is a value expression: it is type-checked and its result is printed.
     (ps (stdout)
         "coil repl — evaluate an expr (printed by type), or (defn …)/(def …) to define. :help, Ctrl-D to exit.\n")
     (loop (ps (stdout) "coil> ")
-      (match (repl-read-line a buf)
+      (match (repl-read-form a buf)
         (None [] (break))
         (Some [line]
               (let [t (m-trim line)]
                 (cond (= (slice-len [u8] t) (primitive/cast i64 0)) 0
                       (or (= t ":quit") (= t ":q")) (break)
                       (or (= t ":help") (= t ":h")) (do (ps (stdout) (repl-help-text)) 0)
+                      (= t ":defs")
+                        (do (ps (stdout) (sb-str (load defs))) 0)
+                      (repl-head? t ":load ")
+                        (let [name (m-trim (subslice [u8] t 6 (slice-len [u8] t)))
+                              form (sconcat a "(import \"" (sconcat a name "\" :use *)"))
+                              candidate (sconcat a (sb-str (load defs)) (sconcat a form "\n"))]
+                          (if (= (repl-emit-run a self candidate "" "0") (primitive/cast i64 0))
+                              (do
+                                (sb-push-str! (mut defs) form)
+                                (sb-push-byte! (mut defs) (primitive/cast u8 10))
+                                (ps (stdout) "; loaded\n")
+                                0)
+                              0))
+                      (= t ":reset")
+                        (do
+                          (store! defs (sb-new a))
+                          (repl-jit-reset!)
+                          (ps (stdout) "; session cleared\n")
+                          0)
                       (repl-head? t ":type ")
                         (repl-type-cmd a
                                        (sb-str (load defs))
                                        (m-trim (subslice [u8] t 6 (slice-len [u8] t))))
                       (repl-head? t ":") (do (ps (stderr) "; unknown command; :help for help\n") 0)
                       (and (repl-is-def? t) (not (repl-head? t "(module")))
-                        (do
-                          (if (repl-head? t "(def ")  ; (def name v) is repl sugar for a coil (const …)
+                        (let [form (repl-def-source a t)
+                              candidate (sconcat a
+                                                 (sb-str (load defs))
+                                                 (sconcat a form "\n"))]
+                          ; Compile before committing the text. A bad redefinition
+                          ; therefore leaves every previous binding usable.
+                          (if (and (repl-signature-compatible? a
+                                                               (sb-str (load defs))
+                                                               form)
+                                   (= (repl-emit-run a self candidate "" "0")
+                                      (primitive/cast i64 0)))
                               (do
-                                (sb-push-str! (mut defs) "(const ")
-                                (sb-push-str! (mut defs) (subslice [u8] t 5 (slice-len [u8] t)))
+                                (sb-push-str! (mut defs) form)
+                                (sb-push-byte! (mut defs) (primitive/cast u8 10))
+                                (ps (stdout) "; ok\n")
                                 0)
-                              (sb-push-str! (mut defs) t))
-                          (sb-push-byte! (mut defs) (primitive/cast u8 10))
-                          (ps (stdout) "; ok\n")
-                          0)
+                              0))
                       :else (repl-eval a self (sb-str (load defs)) t))))))
     (ps (stdout) "\n")
     0))

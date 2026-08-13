@@ -2980,6 +2980,35 @@ expect_rc 0 "qual: Serialize/Deserialize derive on a sum reached through an :as 
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=src "$2" check src/dserde.coil' \
   _ "$T/qual" "$COIL"
 
+if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
+  echo "== repl: multiline, reload, persistent state, and transactions =="
+  repl_out=$(printf '%s\n' \
+    '(defn next [] (-> i64)' \
+    '  (let [p (primitive/alloc-static i64)' \
+    '        n (+ (load p) 1)]' \
+    '    (store! p n)' \
+    '    n))' \
+    '(defn twice [(x i64)] (-> i64) (* x 2))' \
+    '(defn four-times [(x i64)] (-> i64) (twice (twice x)))' \
+    '(next)' \
+    '(four-times 10)' \
+    '(defn twice [(x i64)] (-> i64) (* x 3))' \
+    '(next)' \
+    '(four-times 10)' \
+    '(defn twice [(x f64)] (-> f64) (* x 4.0))' \
+    '(next)' \
+    '(four-times 10)' \
+    ':q' | "$COIL" repl 2>&1)
+  case "$repl_out" in
+    *$'1\n40\n2\n90\n3\n90'*) ok "repl preserves state, reloads dependent calls, and rejects incompatible replacement" ;;
+    *) bad "repl preserves state, reloads dependent calls, and rejects incompatible replacement" "$repl_out" ;;
+  esac
+  case "$repl_out" in
+    *"cannot redefine a REPL function with a different signature"*) ok "repl reports the incompatible redefinition" ;;
+    *) bad "repl reports the incompatible redefinition" "$repl_out" ;;
+  esac
+fi
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL
