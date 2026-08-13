@@ -74,6 +74,15 @@ $COIL run $D/isolated_stage_test.coil >/dev/null 2>&1; rc=$?
 [ $rc -eq 42 ] || { echo "isolated-stage transform FAILED (exit $rc, want 42)"; exit 1; }
 echo "isolated-stage: OK (private phase program compiled and invoked; exit 42)"
 
+echo "=== 7d. RESUMED LANGUAGE LOWERING: staged syntax returns to its dialect ==="
+scheme_out=$($COIL run tests/scheme/dialect/procedural_syntax_literal.scm \
+  --use coil.scheme --meta-opt=0 2>/dev/null); rc=$?
+[ $rc -eq 0 ] || { echo "procedural Scheme syntax FAILED (exit $rc)"; exit 1; }
+[ "$scheme_out" = "42" ] || {
+  echo "procedural Scheme syntax returned '$scheme_out' (want 42)"; exit 1;
+}
+echo "resumed-language-lowering: OK (native phase-1 result lowered by Scheme)"
+
 echo "=== 8. THE BINDING ORACLE: a use-after-free checker keyed on binding identity ==="
 echo "       (binding-of NODE) distinguishes a SHADOWED local from its namesake —"
 echo "       exactly 2 real errors in bad(), none in ok()'s shadow (name-matching fails)"
