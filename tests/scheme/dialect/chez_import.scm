@@ -1,3 +1,6 @@
 (import (chezscheme))
+(load "tests/scheme/fixtures/load.scm")
 (unless #f (display (+ 20 22)))
+(newline)
+(display (loaded-add loaded-base))
 (newline)
