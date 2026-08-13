@@ -4,6 +4,17 @@
     (even? 10)))
 (newline)
 
+;; Reader/metaprogram lowerings may introduce Coil-native binding vectors before
+;; Scheme closure lifting. They are executable syntax, not Scheme vector data.
+(display
+  ((lambda (x)
+     (let* ((forwarded x)
+            (emit (lambda ()
+                    (let [result forwarded] result))))
+       (emit)))
+   42))
+(newline)
+
 ;; Sequential bindings must be visible to a closure declared by a later let*
 ;; binding, including when the use is inside another closure in its body. Jolt's
 ;; extend-type macro generator has exactly this shape.
@@ -11,7 +22,7 @@
   ((lambda (x)
      (let* ((forwarded x)
             (emit (lambda ()
-                    (let ((inner (lambda () forwarded)))
+                    (let* ((inner (lambda () forwarded)))
                       (inner)))))
        (emit)))
    42))
