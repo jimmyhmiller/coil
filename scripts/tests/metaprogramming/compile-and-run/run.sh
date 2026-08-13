@@ -63,6 +63,12 @@ $COIL run $D/addforms_test.coil >/dev/null 2>&1; rc=$?
 [ $rc -eq 42 ] || { echo "add-forms transform FAILED (exit $rc, want 42)"; exit 1; }
 echo "add-top-level-forms: OK (transform emitted a real defn; exit 42)"
 
+echo "=== 7b. GENERATED STAGE: a syntax transform emits a new staged callable ==="
+echo "        the later phase discovers it, compiles it natively, and invokes it"
+$COIL run $D/generated_stage_test.coil >/dev/null 2>&1; rc=$?
+[ $rc -eq 42 ] || { echo "generated-stage transform FAILED (exit $rc, want 42)"; exit 1; }
+echo "generated-stage: OK (transform emitted native phase-1 code; exit 42)"
+
 echo "=== 8. THE BINDING ORACLE: a use-after-free checker keyed on binding identity ==="
 echo "       (binding-of NODE) distinguishes a SHADOWED local from its namesake —"
 echo "       exactly 2 real errors in bad(), none in ok()'s shadow (name-matching fails)"
