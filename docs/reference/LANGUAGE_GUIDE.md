@@ -301,6 +301,26 @@ must take `(self (ptr Self))`; later parameters and the return type may not ment
 `Self`. Copying the dynamic value does not copy or preserve the concrete object: its
 `data` pointer follows the same validity rules as any other Coil pointer.
 
+**Callable values.** `Callable` is the conventional core marker for static call
+implementations. It is an ordinary namespaced trait, and `call` is an ordinary impl
+member rather than a reserved method. A `call` method's signature defines that type's
+arity, argument types, and result type. A local value in call-head position dispatches
+through the matching ordinary trait impl:
+
+    (defstruct Vec3 [(x i64) (y i64) (z i64)])
+    (defn get [(v Vec3) (i i64)] (-> i64) …)
+    (impl Callable Vec3
+      (call [(self Vec3) (i i64)] (-> i64) (get self i)))
+    (let [v (Vec3 :x 10 :y 20 :z 30)]
+      (v 2))                              ; statically dispatches to call, yields 30
+
+There is no boxed argument list, tuple value, vtable, or runtime trait lookup. The
+checker selects the impl from the head value's concrete type and lowers the expression
+to its ordinary monomorphized `call` function, which is eligible for normal LLVM
+inlining. Defining `call` in any other namespaced trait works identically. More than one
+matching `call` implementation for a type is ambiguous; use a distinct wrapper type
+when the same underlying state needs a different signature.
+
 ### Deriving trait implementations
 
 `coil.derive` provides the registry-backed generic form `(derive Trait... Type)`.
@@ -1066,7 +1086,8 @@ with `COIL_WORKER_STACK_SIZE` and `COIL_WORKER_GUARD_SIZE` (decimal bytes).
 ## Reserved-name gotchas ⚠
 
 `call` and `block` are builtins/macros — don't name a `defn` `call` or `block`
-(you'll get "call target: expected symbol" / "macro arity mismatch"). Avoid `type`
+(the one exception is the method inside an `impl Callable`). You'll otherwise get
+"call target: expected symbol" / "macro arity mismatch". Avoid `type`
 as a struct field name. When in doubt, prefix your name (`p-call`, `vm-call`).
 
 ## The standard library
