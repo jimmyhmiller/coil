@@ -79,6 +79,11 @@ $COIL run $D/multiround_stage_test.coil >/dev/null 2>&1; rc=$?
 [ $rc -eq 42 ] || { echo "multi-round stage FAILED (exit $rc, want 42)"; exit 1; }
 echo "multi-round-stage: OK (two native stages compiled in successive rounds)"
 
+echo "=== 7e. CROSS-MODULE STAGE: declaration and marked request are independent ==="
+$COIL run $D/cross_module_stage_test.coil >/dev/null 2>&1; rc=$?
+[ $rc -eq 42 ] || { echo "cross-module stage FAILED (exit $rc, want 42)"; exit 1; }
+echo "cross-module-stage: OK (explicit marker routed a native phase request across modules)"
+
 $COIL check $D/duplicate_stage_test.coil > "$OUT/duplicate-stage.txt" 2>&1; rc=$?
 [ $rc -ne 0 ] || { echo "duplicate stage was silently accepted"; exit 1; }
 case "$(cat "$OUT/duplicate-stage.txt")" in
@@ -87,7 +92,7 @@ case "$(cat "$OUT/duplicate-stage.txt")" in
 esac
 echo "duplicate-stage: OK (phase binding redefinition rejected)"
 
-echo "=== 7e. RESUMED LANGUAGE LOWERING: staged syntax returns to its dialect ==="
+echo "=== 7f. RESUMED LANGUAGE LOWERING: staged syntax returns to its dialect ==="
 scheme_out=$($COIL run tests/scheme/dialect/procedural_syntax_literal.scm \
   --use coil.scheme --meta-opt=0 2>/dev/null); rc=$?
 [ $rc -eq 0 ] || { echo "procedural Scheme syntax FAILED (exit $rc)"; exit 1; }
