@@ -74,12 +74,31 @@ $COIL run $D/isolated_stage_test.coil >/dev/null 2>&1; rc=$?
 [ $rc -eq 42 ] || { echo "isolated-stage transform FAILED (exit $rc, want 42)"; exit 1; }
 echo "isolated-stage: OK (private phase program compiled and invoked; exit 42)"
 
-echo "=== 7d. RESUMED LANGUAGE LOWERING: staged syntax returns to its dialect ==="
+echo "=== 7d. MULTI-ROUND STAGES: a later round introduces a newly visible entry ==="
+$COIL run $D/multiround_stage_test.coil >/dev/null 2>&1; rc=$?
+[ $rc -eq 42 ] || { echo "multi-round stage FAILED (exit $rc, want 42)"; exit 1; }
+echo "multi-round-stage: OK (two native stages compiled in successive rounds)"
+
+$COIL check $D/duplicate_stage_test.coil > "$OUT/duplicate-stage.txt" 2>&1; rc=$?
+[ $rc -ne 0 ] || { echo "duplicate stage was silently accepted"; exit 1; }
+case "$(cat "$OUT/duplicate-stage.txt")" in
+  *"stage: phase-1 entry 'duplicate_stage_test.first-stage' conflicts with an existing callable"*) ;;
+  *) cat "$OUT/duplicate-stage.txt"; echo "duplicate-stage diagnostic missing"; exit 1;;
+esac
+echo "duplicate-stage: OK (phase binding redefinition rejected)"
+
+echo "=== 7e. RESUMED LANGUAGE LOWERING: staged syntax returns to its dialect ==="
 scheme_out=$($COIL run tests/scheme/dialect/procedural_syntax_literal.scm \
   --use coil.scheme --meta-opt=0 2>/dev/null); rc=$?
 [ $rc -eq 0 ] || { echo "procedural Scheme syntax FAILED (exit $rc)"; exit 1; }
 [ "$scheme_out" = "42" ] || {
   echo "procedural Scheme syntax returned '$scheme_out' (want 42)"; exit 1;
+}
+quote_out=$($COIL run tests/scheme/dialect/procedural_syntax_quote.scm \
+  --use coil.scheme --meta-opt=0 2>/dev/null); rc=$?
+[ $rc -eq 0 ] || { echo "quoted procedural Scheme syntax FAILED (exit $rc)"; exit 1; }
+[ "$quote_out" = "#t" ] || {
+  echo "quoted procedural Scheme syntax returned '$quote_out' (want #t)"; exit 1;
 }
 echo "resumed-language-lowering: OK (native phase-1 result lowered by Scheme)"
 

@@ -727,6 +727,52 @@ checkers run once, and the resulting forms enter ordinary macro expansion. Regis
 must occur literally at module top level; generated code cannot retroactively register a
 before-expansion pass.
 
+### Staging work between syntax-transform rounds
+
+A syntax transform sometimes needs to compile a helper before it can finish lowering
+the source language. It can return an internal stage declaration alongside the still-raw
+program:
+
+    (stage
+      (defn expand-language-form [(form Code)] (-> Code)
+        ...))
+
+`stage` is a transform-result protocol, not a runtime form. The compiler removes the
+declaration from the program, resolves and typechecks its children as an isolated
+compile-time program, and compiles every `[Code ...] -> Code` entry to native code. The
+transform explicitly requests an invocation with `(stage-call ENTRY ARG...)`, where
+`ENTRY` is a symbol or string naming the phase entry (a fully-qualified string is the
+unambiguous form). That marker is replaced by the entry's returned `Code`, and the result starts the **next
+syntax-transform round**. It does not jump ahead to ordinary Coil expansion.
+
+The explicit marker is important. The compiler does not treat every list whose head
+matches an entry as a call: only the language metaprogram knows whether such a list is
+code, quoted data, shadowed syntax, or not an s-expression language at all. Nor does the
+stage boundary apply Coil's macro hygiene to the returned tree. Recognition, scope,
+quotation, and hygiene remain properties of the transform; staging supplies native
+execution and phase sequencing. That separation lets a language metaprogram compile its
+own macro system while ensuring returned syntax still passes through that language's
+lowering rules.
+
+Stage calls are examined only in a module that has emitted a `stage` declaration during
+the current compilation. This makes the staged module the unit of phase progress and
+prevents marker-shaped data in the transform implementation or an unrelated module from
+executing. Definitions and the module's ability to request them remain available in
+later rounds.
+
+Stage state is additive within one compilation: later rounds may introduce new entry
+names, and explicit calls to them become available in that round. An entry name may be introduced
+only once; redefining it is an error rather than silently retaining an older native
+body. Stage definitions and signatures are phase-local: they are absent from the
+runtime program and from syntax-checker semantic state. Ordinary macros are also absent
+from the intermediate stage-only expansion environment; they run after the syntax
+transform reaches its fixpoint.
+
+A transform should emit a stage only while the source construct that requires it is
+still present. Once the staged call expands, the next transform round must stop emitting
+that declaration. As with every syntax transform, failure to converge within 16 rounds
+is diagnosed.
+
 Both are handed the program as a list of modules — `((name form…) …)`, one record per
 module, head = module name — and see **everything**, including imported and bundled
 code. Scope yourself with `(primitive/code-from-user? NODE)` (false for bundled stdlib) or
