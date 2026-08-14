@@ -278,6 +278,46 @@ def main() -> int:
               "deleted an import of a module declaring a trait impl; the impl is in "
               "scope through that import and no mention records it")
 
+        # 7. PROJECT MODE, and the trap it exposes. A bare `coil lint` lints the whole
+        #    project, tests included — and a test is an ENTRY POINT: `coil test` finds
+        #    `coil-test$…` by prefix the way the runtime finds `main`. Nothing in the
+        #    program CALLS one. Without rooting them, a project-wide --fix proposes
+        #    deleting a function AND the test covering it in the same round, which
+        #    compiles cleanly precisely because both halves went — so the --fix loop's
+        #    revert-on-broken cannot catch it. This is the worst failure this tool has.
+        wp = tmp / "wholeproj"
+        (wp / "src").mkdir(parents=True)
+        (wp / "tests").mkdir()
+        (wp / "Coil.toml").write_text("""[package]
+name = "wholeproj"
+entry = "src/main.coil"
+source-roots = ["src", "tests"]
+""")
+        (wp / "src/main.coil").write_text("""(module wholeproj)
+(import "coil.primitive" :as primitive)
+(defn only-a-test-calls-me [(n i64)] (-> i64) (primitive/imul n 2))
+(defn truly-dead [] (-> i64) 3)
+(defn main [] (-> i64) 0)
+""")
+        (wp / "tests/a-test.coil").write_text("""(module wholeproj.a-test)
+(import "coil.assert" :use *)
+(import "wholeproj" :as w)
+(deftest doubles (assert-eq (w/only-a-test-calls-me 21) 42))
+""")
+        run(coil, "lint", "--use", "coil.lint.unused", "--fix", "--allow-dirty", cwd=wp)
+        src = (wp / "src/main.coil").read_text()
+        check("only-a-test-calls-me" in src,
+              "project mode deleted a function whose only caller is a test — and would "
+              f"have deleted the test with it, so nothing would have failed:\n{src}")
+        check("deftest doubles" in (wp / "tests/a-test.coil").read_text(),
+              "project mode deleted a test suite")
+        check("truly-dead" not in src,
+              "project mode changed NOTHING. Most likely the round proposed deleting "
+              "the test forms too, the re-check then failed on a file whose `deftest` "
+              "had been removed, and the whole round was reverted — which is how "
+              "unrooted tests made the tool silently inert on any project that has "
+              f"them, rather than merely wrong:\n{src}")
+
     print("unused-lint gate: PASS")
     return 0
 
