@@ -109,6 +109,11 @@ New API this project added (all shipped):
 - **Metaprograms are fed the WHOLE program, including all imports** (their own modules
   and bundled stdlib). A checker sees imported code too — `tests/metaprogramming/imports_test.coil`
   shows the linter flag an `icmp` in an imported user module.
+- **Checkers also see source `import` and `export` declarations.** The loader keeps
+  these out of the checked runtime program but adds their original, source-spanned
+  forms to the checker-facing module records. That makes syntax-policy rules and
+  surgical suggestions possible; `coil.lint.no-star-imports` is the bundled opt-in
+  example.
 - **Checkers run AFTER resolve + typecheck** (the *semantic* layer; see
   `docs/design/SEMANTIC_METAPROGRAMS.md`). A checker is registered at `expand-stage3` but
   executed later, once the whole program is checked, so it reads the compiler's
