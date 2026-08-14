@@ -1,0 +1,10 @@
+(define (sre-repeater? sre)
+  (and (pair? sre)
+       (or (memq (car sre) '(* +))
+           (and (memq (car sre) '($ submatch => submatch-named seq :))
+                (pair? (cdr sre))
+                (null? (cddr sre))
+                (sre-repeater? (cadr sre))))))
+
+(display (sre-repeater? '(* x)))
+(newline)

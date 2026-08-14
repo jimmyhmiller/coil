@@ -19,7 +19,9 @@
 (import "coil.alloc" :as alloc :use *)
 (import "coil.slice" :use *)
 (import "coil.str" :use *)
+(import "coil.mem" :use *)
 (import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
 (import "coil.result" :use *)
 (import "coil.control" :use *)
 (import "coil.try" :use *)
@@ -38,8 +40,10 @@
 (import "ffi" :use *)
 (import "macho" :use *)  ; MObj — the in-memory object handed to jit.coil
 (import "jit" :use *)
+(import "coil.scratch" :as scratch)
 
 (extern dlopen :cc c [(ptr i8) i64] (-> (ptr i8)))
+(extern dlclose :cc c [(ptr i8)] (-> i64))
 (extern dlsym :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
 (extern access :cc c [(ptr i8) i64] (-> i32))  ; F_OK=0: does the path exist
 (extern rename :cc c [(ptr i8) (ptr i8)] (-> i32))
@@ -94,7 +98,11 @@
 (defn me-dylib-ext [] (-> (slice u8))
   (if (me-host-linux?) ".so" ".dylib"))
 (defn me-dylib-link-cmd [] (-> (slice u8))
-  (if (me-host-linux?) "cc -shared " "cc -dynamiclib "))
+  ;; The native phase program may take a pointer to one of its own exported
+  ;; entry functions. Bind such references within the ELF DSO so the x64
+  ;; backend's RIP-relative function address remains position-independent;
+  ;; dlsym still sees the exported entry normally.
+  (if (me-host-linux?) "cc -shared -Wl,-Bsymbolic " "cc -dynamiclib "))
 ; ELF `-shared` allows undefined symbols by default; Mach-O needs the explicit opt-in.
 (defn me-dylib-undef-flag [] (-> (slice u8))
   (if (me-host-linux?) "" " -Wl,-undefined,dynamic_lookup"))
@@ -118,6 +126,12 @@
 (defstruct MEEntry
   [(name (slice u8))
    (fp (ptr i8))
+   ;; Native image owning `fp`. Zero for JIT/wasm/interpreter entries.
+   (handle (ptr i8))
+   ;; Non-native engines retain their generated image/context in this arena.
+   ;; Native entries need only the dylib and a copied quote registry, so their
+   ;; owner is zero and the compiler generation is released after dlopen.
+   (owner (ptr scratch/ScratchArena))
    (registry (ptr (ArrayList (ptr Sexp))))
    (symbol (slice u8))
    (modbytes (slice u8))
@@ -433,6 +447,118 @@
                        x))
         (load x))))
 
+; An owning copy for values crossing a temporary metaprogram invocation boundary.
+; Unlike meta-copy-sexp above, atom bytes are copied too. Copy the struct first so
+; source spans, hygiene context, and node identity remain exactly unchanged.
+(defn me-copy-bytes [(a (ptr Allocator)) (s (slice u8))] (-> (slice u8))
+  (let [n (slice-len [u8] s)
+        p (unwrap-ptr [u8] (alloc-slice [u8] a (if (> n 0) n 1)))]
+    (when (> n 0) (mem-copy [u8] p (slice-data [u8] s) n) 0)
+    (slice-new [u8] p n)))
+
+(defstruct MECopyCtx
+  [(a (ptr Allocator))
+   (arena (ptr scratch/ScratchArena))
+   (seen (HashMap i64 (ptr (ArrayList Sexp))))])
+
+(defn me-copy-result [(copycx (ptr MECopyCtx))
+                      (x (ptr Sexp))] (-> Sexp)
+  (let [(mut out) (load x)
+        a (load (field copycx a))
+        arena (load (field copycx arena))]
+    (match (load (field x kind))
+      (KSym [s] (when (scratch/scratch-owns? arena (primitive/cast (ptr i8) (slice-data [u8] s)))
+                  (store! (field out kind) (KSym (me-copy-bytes a s)))))
+      (KKw [s] (when (scratch/scratch-owns? arena (primitive/cast (ptr i8) (slice-data [u8] s)))
+                 (store! (field out kind) (KKw (me-copy-bytes a s)))))
+      (KStr [s] (when (scratch/scratch-owns? arena (primitive/cast (ptr i8) (slice-data [u8] s)))
+                  (store! (field out kind) (KStr (me-copy-bytes a s)))))
+      (KCStr [s] (when (scratch/scratch-owns? arena (primitive/cast (ptr i8) (slice-data [u8] s)))
+                   (store! (field out kind) (KCStr (me-copy-bytes a s)))))
+      (KList [items]
+             (when (or (scratch/scratch-owns? arena (primitive/cast (ptr i8) items))
+                       (scratch/scratch-owns? arena (primitive/cast (ptr i8) (load (field items data)))))
+               (let [key (primitive/cast i64 items)]
+                 (match (hm-get [i64 (ptr (ArrayList Sexp))] (load (field copycx seen)) key)
+                   (Some [prior] (store! (field out kind) (KList prior)))
+                   (None []
+                         (let [copied (box-al [Sexp] a (al-new [Sexp] a))
+                               n (al-len [Sexp] (load items))
+                               (mut i) 0]
+                           (hm-put! [i64 (ptr (ArrayList Sexp))]
+                                    (mut (field copycx seen)) key copied)
+                           (store! (field out kind) (KList copied))
+                           (loop (if (>= (load i) n)
+                                     (break)
+                                     (do
+                                       (al-push! copied
+                                                 (me-copy-result copycx (al-elem [Sexp] items (load i))))
+                                       (store! i (primitive/iadd (load i) 1)))))))))))
+      (KVec [items]
+            (when (or (scratch/scratch-owns? arena (primitive/cast (ptr i8) items))
+                      (scratch/scratch-owns? arena (primitive/cast (ptr i8) (load (field items data)))))
+              (let [key (primitive/cast i64 items)]
+                (match (hm-get [i64 (ptr (ArrayList Sexp))] (load (field copycx seen)) key)
+                  (Some [prior] (store! (field out kind) (KVec prior)))
+                  (None []
+                        (let [copied (box-al [Sexp] a (al-new [Sexp] a))
+                              n (al-len [Sexp] (load items))
+                              (mut i) 0]
+                          (hm-put! [i64 (ptr (ArrayList Sexp))]
+                                   (mut (field copycx seen)) key copied)
+                          (store! (field out kind) (KVec copied))
+                          (loop (if (>= (load i) n)
+                                    (break)
+                                    (do
+                                      (al-push! copied
+                                                (me-copy-result copycx (al-elem [Sexp] items (load i))))
+                                      (store! i (primitive/iadd (load i) 1)))))))))))
+      (_ 0))
+    (load out)))
+
+(defstruct MEVerifyCtx
+  [(arena (ptr scratch/ScratchArena)) (seen (HashMap i64 bool))])
+(defn me-result-escapes-arena? [(verifycx (ptr MEVerifyCtx)) (x (ptr Sexp))] (-> bool)
+  (let [arena (load (field verifycx arena))]
+  (match (load (field x kind))
+    (KSym [s] (scratch/scratch-owns? arena (primitive/cast (ptr i8) (slice-data [u8] s))))
+    (KKw [s] (scratch/scratch-owns? arena (primitive/cast (ptr i8) (slice-data [u8] s))))
+    (KStr [s] (scratch/scratch-owns? arena (primitive/cast (ptr i8) (slice-data [u8] s))))
+    (KCStr [s] (scratch/scratch-owns? arena (primitive/cast (ptr i8) (slice-data [u8] s))))
+    (KList [items]
+           (if (or (scratch/scratch-owns? arena (primitive/cast (ptr i8) items))
+                   (scratch/scratch-owns? arena (primitive/cast (ptr i8) (load (field items data)))))
+               true
+               (let [key (primitive/cast i64 items)
+                     n (al-len [Sexp] (load items)) (mut i) 0 (mut bad) false]
+                 (match (hm-get [i64 bool] (load (field verifycx seen)) key)
+                   (Some [_] (store! i n))
+                   (None [] (hm-put! [i64 bool] (mut (field verifycx seen)) key true)))
+                 (loop (if (or (load bad) (>= (load i) n))
+                           (break)
+                           (do
+                             (when (me-result-escapes-arena? verifycx (al-elem [Sexp] items (load i)))
+                               (store! bad true))
+                             (store! i (primitive/iadd (load i) 1)))))
+                 (load bad))))
+    (KVec [items]
+          (if (or (scratch/scratch-owns? arena (primitive/cast (ptr i8) items))
+                  (scratch/scratch-owns? arena (primitive/cast (ptr i8) (load (field items data)))))
+              true
+              (let [key (primitive/cast i64 items)
+                    n (al-len [Sexp] (load items)) (mut i) 0 (mut bad) false]
+                (match (hm-get [i64 bool] (load (field verifycx seen)) key)
+                  (Some [_] (store! i n))
+                  (None [] (hm-put! [i64 bool] (mut (field verifycx seen)) key true)))
+                (loop (if (or (load bad) (>= (load i) n))
+                          (break)
+                          (do
+                            (when (me-result-escapes-arena? verifycx (al-elem [Sexp] items (load i)))
+                              (store! bad true))
+                            (store! i (primitive/iadd (load i) 1)))))
+                (load bad))))
+    (_ false))))
+
 (defn meta-sub-forms [(a (ptr Allocator)) (s (mut LS)) (base (ptr (ArrayList TaggedForm)))] (-> (Result (ptr (ArrayList TaggedForm))
                                                                                                         Diag))
   (let [(mut out) (al-new [TaggedForm] a)
@@ -702,6 +828,7 @@
                             (let [me (alloc/stack MEEntry)]
                               (store! (field me name) (load (field ep name)))
                               (store! (field me fp) fp)
+                              (store! (field me handle) h)
                               (store! (field me registry) (load (field mo registry)))
                               (store! (field me symbol) (load (field ep symbol)))
                               (store! (field me modbytes) "")
@@ -733,6 +860,7 @@
                                me (alloc/stack MEEntry)]
                            (store! (field me name) (load (field ep name)))
                            (store! (field me fp) (primitive/cast (ptr i8) 0))
+                           (store! (field me handle) (primitive/cast (ptr i8) 0))
                            (store! (field me registry) (load (field mo registry)))
                            (store! (field me symbol) (load (field ep symbol)))
                            (store! (field me modbytes) bytes)
@@ -761,6 +889,7 @@
                                me (alloc/stack MEEntry)]
                            (store! (field me name) (load (field ep name)))
                            (store! (field me fp) (primitive/cast (ptr i8) 0))
+                           (store! (field me handle) (primitive/cast (ptr i8) 0))
                            (store! (field me registry) (load (field mo registry)))
                            (store! (field me symbol) (load (field ep symbol)))
                            (store! (field me modbytes) "")
@@ -805,6 +934,7 @@
                                                          (derr "metaengine: JIT image is missing a metaprogram entry"))))
                                    (store! (field me name) (load (field ep name)))
                                    (store! (field me fp) fp)
+                                   (store! (field me handle) (primitive/cast (ptr i8) 0))
                                    (store! (field me registry) (load (field mo registry)))
                                    (store! (field me symbol) (load (field ep symbol)))
                                    (store! (field me modbytes) "")
@@ -813,22 +943,88 @@
                                  (store! i (primitive/iadd (load i) 1)))))
                      (Ok [(ptr (ArrayList MEEntry)) Diag] (box-al [MEEntry] a (load out)))))))))))
 
-; ---- one-time engine setup (from expand-stage3, after check-program) ----------------
+;; Is a native image still referenced by any installed entry? An image may
+;; export a whole batch, so it is unloadable only after its final entry has been
+;; superseded.
+(defn me-handle-live? [(entries (ptr (ArrayList MEEntry))) (handle (ptr i8))] (-> bool)
+  (if (= (primitive/cast i64 handle) 0) false
+    (let [n (al-len [MEEntry] (load entries))
+          (mut i) 0
+          (mut live) false]
+      (loop (if (or (load live) (>= (load i) n))
+                (break)
+                (do
+                  (when (= (primitive/cast i64
+                              (load (field (al-elem [MEEntry] entries (load i)) handle)))
+                           (primitive/cast i64 handle))
+                    (store! live true)
+                    0)
+                  (store! i (primitive/iadd (load i) 1)))))
+      (load live))))
+
+(defn me-owner-live? [(entries (ptr (ArrayList MEEntry)))
+                       (owner (ptr scratch/ScratchArena))] (-> bool)
+  (if (= (primitive/cast i64 owner) 0) false
+    (let [n (al-len [MEEntry] (load entries))
+          (mut i) 0
+          (mut live) false]
+      (loop (if (or (load live) (>= (load i) n))
+                (break)
+                (do
+                  (when (= (primitive/cast i64
+                              (load (field (al-elem [MEEntry] entries (load i)) owner)))
+                           (primitive/cast i64 owner))
+                    (store! live true)
+                    0)
+                  (store! i (primitive/iadd (load i) 1)))))
+      (load live))))
+
+; ---- engine setup (from expand-stage3, after check-program) ----------------
 (defn meta-engine-setup [(a (ptr Allocator)) (checked (ptr Program)) (quals (ptr (ArrayList (slice u8))))] (-> (Option Diag))
-  (match (metalower-program a checked quals)
+  (let [owner (unwrap-ptr [scratch/ScratchArena]
+                          (create [scratch/ScratchArena] (malloc-allocator)))
+        _owner-init (scratch/scratch-init-with-cap owner (malloc-allocator) 1048576)
+        ea (scratch/scratch-allocator owner)
+        retain-owner (or (meta-jit-active?)
+                         (or (meta-interp-active?) (meta-wasm-active?)))]
+  (match (metalower-program ea checked quals)
     (Err [d] (Some d))
     (Ok [mo]
         (match (if (meta-jit-active?)
-                   (me-setup-jit a mo)
+                   (me-setup-jit ea mo)
                    (if (meta-interp-active?)
-                       (me-setup-interp a mo)
-                       (if (meta-wasm-active?) (me-setup-wasm a mo) (me-setup-native a mo))))
+                       (me-setup-interp ea mo)
+                       (if (meta-wasm-active?) (me-setup-wasm ea mo) (me-setup-native ea mo))))
           (Err [d] (Some d))
           (Ok [outl]
-              (let [out (load outl)]
-                ; ADDITIVE: append entries whose name isn't served yet (staged
-                ; per-qual builds land first; the batch build fills in the rest).
-                ; An existing entry wins — it is the same macro, already compiled.
+              (let [out (load outl)
+                    src-reg (load (field mo registry))
+                    (mut stable-reg) (al-new [(ptr Sexp)] a)
+                    nr (al-len [(ptr Sexp)] (load src-reg))
+                    (mut ri) 0]
+                ;; Registry elements point into the checked program, whose
+                ;; allocator outlives the engine. Only the ArrayList storage was
+                ;; generation-owned, so copy that small pointer table.
+                (loop (if (>= (load ri) nr)
+                          (break)
+                          (do
+                            (al-push! (mut stable-reg)
+                                      (al-get [(ptr Sexp)] (load src-reg) (load ri)))
+                            (store! ri (primitive/iadd (load ri) 1)))))
+                (let [stable-regp (box-al [(ptr Sexp)] a (load stable-reg))]
+                (let [no (al-len [MEEntry] out)
+                      (mut oi) 0]
+                  (loop (if (>= (load oi) no)
+                            (break)
+                            (do
+                              (store! (field (al-elem [MEEntry] outl (load oi)) registry) stable-regp)
+                              (store! (field (al-elem [MEEntry] outl (load oi)) owner)
+                                      (if retain-owner owner (primitive/cast (ptr scratch/ScratchArena) 0)))
+                              (store! oi (primitive/iadd (load oi) 1))))))
+                ;; Add new names, but replace a prior implementation of the same
+                ;; name. Lazy per-qual staging lands first; a later batch carries
+                ;; the same entry in a more complete image. Keeping the old entry
+                ;; forever also kept every one-off dylib mapped forever.
                 (let [b (meta-engine)]
                   (when (= (primitive/cast i64 (load (field b entries))) (primitive/cast i64 0))
                     (store! (field b entries) (box-al [MEEntry] a (al-new [MEEntry] a)))
@@ -841,15 +1037,32 @@
                                 (let [mev (al-get [MEEntry] out (load k))
                                       mep (alloc/stack MEEntry)]
                                   (store! mep mev)
-                                  (when (= (primitive/cast i64
-                                                           (meta-engine-entry (load (field mep
-                                                                                           name))))
-                                           (primitive/cast i64 0))
-                                    (al-push! (mut (load (field b entries))) (load mep))
-                                    0))
+                                  (let [old (meta-engine-entry (load (field mep name)))]
+                                    (if (= (primitive/cast i64 old) 0)
+                                        (al-push! (mut (load (field b entries))) (load mep))
+                                      (let [old-h (load (field old handle))
+                                            old-owner (load (field old owner))]
+                                        (store! old (load mep))
+                                        (when (and (!= (primitive/cast i64 old-h) 0)
+                                                   (not (me-handle-live?
+                                                          (load (field b entries)) old-h)))
+                                          (dlclose old-h)
+                                          0)
+                                        (when (and (!= (primitive/cast i64 old-owner) 0)
+                                                   (not (me-owner-live?
+                                                          (load (field b entries)) old-owner)))
+                                          (scratch/scratch-close! old-owner)
+                                          (destroy [scratch/ScratchArena]
+                                                   (malloc-allocator) old-owner)
+                                          0))))
+                                  0)
                                 (store! k (primitive/iadd (load k) 1))))))
+                  (unless retain-owner
+                    (scratch/scratch-close! owner)
+                    (destroy [scratch/ScratchArena] (malloc-allocator) owner)
+                    0)
                   (store! (field b active) 1)
-                  (None [Diag]))))))))
+                  (None [Diag]))))))))))
 
 ; ---- invoking an entry ---------------------------------------------------------------
 ; The call runs on its own 32 MiB pthread (mirroring run-on-big-stack): metaprograms
@@ -1142,7 +1355,37 @@
                              (derr "metaengine: wasm metaprogram returned a null Code handle (compiler bug)"))))
                 (Ok [Sexp Diag] (load (primitive/cast (ptr Sexp) rp)))))))))
 
+(defn me-invoke-trace? [] (-> bool)
+  (!= (primitive/cast i64 (getenv c"COIL_META_ALLOC_TRACE")) 0))
+(defn me-invoke-trace-entry? [(name (slice u8))] (-> bool)
+  (let [p (getenv c"COIL_META_ALLOC_ENTRY")]
+    (or (= (primitive/cast i64 p) 0)
+        (str-eq (cstr->str p) name))))
+(defn me-trace-invoke [(name (slice u8)) (arena (ptr scratch/ScratchArena))] (-> i64)
+  (when (and (me-invoke-trace?) (me-invoke-trace-entry? name))
+    (let [w (stderr)]
+      (print-str w "meta-alloc  entry=")
+      (print-str w name)
+      (print-str w "  callbacks=")
+      (print-int w (meta-host-callbacks))
+      (print-str w "  boxes=")
+      (print-int w (meta-host-boxed-sexps))
+      (print-str w "  qq-pushes=")
+      (print-int w (meta-host-qq-pushes))
+      (print-str w "  allocations=")
+      (print-int w (scratch/scratch-alloc-count arena))
+      (print-str w "  bytes=")
+      (print-int w (scratch/scratch-alloc-bytes arena))
+      (print-str w "  segments=")
+      (print-int w (scratch/scratch-segment-count arena))
+      (print-str w "  peak-reserved=")
+      (print-int w (scratch/scratch-peak-reserved-bytes arena))
+      (write-byte w (primitive/cast u8 10))
+      0))
+  0)
+
 (defn meta-engine-invoke [(a (ptr Allocator))
+                          (name (slice u8))
                           (fp (ptr i8))
                           (reg (ptr (ArrayList (ptr Sexp))))
                           (cx (ptr CtCtx))
@@ -1150,42 +1393,47 @@
   (let [n (al-len [Sexp] (load argv))]
     (if (> n (primitive/cast i64 8))
         (Err [Sexp Diag] (derr "metaengine: metaprogram entries with more than 8 parameters are not supported yet"))
-        (let [c (alloc/stack MPCall)]
-          (meta-host-set! cx reg)
+        (let [c (alloc/stack MPCall)
+              arena (alloc/stack scratch/ScratchArena)
+              _arena-init (scratch/scratch-init-with-cap arena a 65536)
+              (mut callcx) (load cx)
+              ia (scratch/scratch-allocator arena)]
+          (store! (field callcx a) ia)
+          (meta-host-set! (mut callcx) reg)
           (store! (field c fp) fp)
           (store! (field c argc) n)
           (store! (field c ret) (primitive/cast (ptr i8) 0))
           (store! (field c a0)
                   (if (> n (primitive/cast i64 0))
-                      (me-box-arg a (al-get [Sexp] (load argv) 0))
+                      (me-box-arg ia (al-get [Sexp] (load argv) 0))
                       (primitive/cast (ptr i8) 0)))
           (store! (field c a1)
                   (if (> n (primitive/cast i64 1))
-                      (me-box-arg a (al-get [Sexp] (load argv) 1))
+                      (me-box-arg ia (al-get [Sexp] (load argv) 1))
                       (primitive/cast (ptr i8) 0)))
           (store! (field c a2)
                   (if (> n (primitive/cast i64 2))
-                      (me-box-arg a (al-get [Sexp] (load argv) 2))
+                      (me-box-arg ia (al-get [Sexp] (load argv) 2))
                       (primitive/cast (ptr i8) 0)))
           (store! (field c a3)
                   (if (> n (primitive/cast i64 3))
-                      (me-box-arg a (al-get [Sexp] (load argv) 3))
+                      (me-box-arg ia (al-get [Sexp] (load argv) 3))
                       (primitive/cast (ptr i8) 0)))
           (store! (field c a4)
                   (if (> n (primitive/cast i64 4))
-                      (me-box-arg a (al-get [Sexp] (load argv) 4))
+                      (me-box-arg ia (al-get [Sexp] (load argv) 4))
                       (primitive/cast (ptr i8) 0)))
           (store! (field c a5)
                   (if (> n (primitive/cast i64 5))
-                      (me-box-arg a (al-get [Sexp] (load argv) 5))
+                      (me-box-arg ia (al-get [Sexp] (load argv) 5))
                       (primitive/cast (ptr i8) 0)))
           (store! (field c a6)
                   (if (> n (primitive/cast i64 6))
-                      (me-box-arg a (al-get [Sexp] (load argv) 6))
+                      (me-box-arg ia (al-get [Sexp] (load argv) 6))
                       (primitive/cast (ptr i8) 0)))
           (store! (field c a7)
                   (if (> n (primitive/cast i64 7))
-                      (me-box-arg a (al-get [Sexp] (load argv) 7))
+                      (me-box-arg ia (al-get [Sexp] (load argv) 7))
                       (primitive/cast (ptr i8) 0)))
           (let [failed
                   (if (meta-main?)
@@ -1195,14 +1443,36 @@
                       (me-worker-call c))]
             (if failed
                 (match (meta-host-err)
-                  (Some [d] (Err [Sexp Diag] d))
+                  ; Diagnostics may currently contain slices allocated by code-op.
+                  ; Keep the arena alive on this rare error path until Diag gains
+                  ; an owning copy operation; successful calls are fully bounded.
+                  (Some [d] (do (me-trace-invoke name arena) (Err [Sexp Diag] d)))
                   (None []
                         (Err [Sexp Diag]
                              (derr "metaengine: metaprogram thread failed without recording a diagnostic (compiler bug)"))))
                 (let [ret (load (field c ret))]
                   (if (= (primitive/cast i64 ret) (primitive/cast i64 0))
                       (Err [Sexp Diag] (derr "metaengine: metaprogram returned a null Code handle (compiler bug)"))
-                      (Ok [Sexp Diag] (load (primitive/cast (ptr Sexp) ret)))))))))))
+                      (let [copycx (alloc/stack MECopyCtx)
+                            _copy-a (store! (field copycx a) a)
+                            _copy-arena (store! (field copycx arena) arena)
+                            _copy-seen (store! (field copycx seen)
+                                               (hm-new [i64 (ptr (ArrayList Sexp))]
+                                                       ia
+                                                       (scalar-keyops [i64])))
+                            (mut copied) (me-copy-result copycx (primitive/cast (ptr Sexp) ret))
+                            verifycx (alloc/stack MEVerifyCtx)
+                            _verify-arena (store! (field verifycx arena) arena)
+                            _verify-seen (store! (field verifycx seen)
+                                                (hm-new [i64 bool] ia (scalar-keyops [i64])))
+                            escaped (me-result-escapes-arena? verifycx (mut copied))]
+                        (me-trace-invoke name arena)
+                        (if escaped
+                            (Err [Sexp Diag]
+                                 (derr "metaengine: copied metaprogram result still references invocation memory (compiler bug)"))
+                            (do
+                              (scratch/scratch-close! arena)
+                              (Ok [Sexp Diag] (load copied)))))))))))))
 
 ; ---- the finish-macro fast path -------------------------------------------------------
 ; The interpreter's env (param -> CCode arg, variadic already packed) IS the packed
@@ -1237,4 +1507,9 @@
                                    cx
                                    (box-al [Sexp] a (load argv)))
             :else
-          (meta-engine-invoke a (load (field e fp)) (load (field e registry)) cx (box-al [Sexp] a (load argv))))))
+          (meta-engine-invoke a
+                              (load (field e name))
+                              (load (field e fp))
+                              (load (field e registry))
+                              cx
+                              (box-al [Sexp] a (load argv))))))

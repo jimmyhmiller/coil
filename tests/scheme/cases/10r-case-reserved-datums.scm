@@ -1,0 +1,6 @@
+(display (case 'if ((if) 11) (else 0)))
+(newline)
+(display (case '/ ((/) 22) (else 0)))
+(newline)
+(display (case #f (#f 33) (else 0)))
+(newline)
