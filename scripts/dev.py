@@ -660,6 +660,83 @@ def example(args: argparse.Namespace) -> None:
         execute("ld.lld", "--gc-sections", "-T", "src/examples/freestanding/virt.ld", str(boot), str(obj), "-o", str(elf))
         if not args.build_only:
             execute("qemu-system-aarch64", "-M", "virt", "-cpu", "cortex-a57", "-nographic", "-kernel", str(elf))
+    elif args.name == "freestanding-riscv32":
+        build_dir = ROOT / "build/examples/freestanding-riscv32"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        llvm_bindir = Path(subprocess.run(["llvm-config", "--bindir"], cwd=ROOT,
+                                         text=True, stdout=subprocess.PIPE, check=True).stdout.strip())
+        source = ROOT / "src/examples/freestanding/riscv32/answer.coil"
+        start = ROOT / "src/examples/freestanding/riscv32/start.s"
+        linker = ROOT / "src/examples/freestanding/riscv32/virt.ld"
+        obj, boot, elf = (build_dir / f"answer.{suffix}" for suffix in ("o", "boot.o", "elf"))
+        execute(args.compiler, "emit-obj", str(source), "-o", str(obj),
+                "--target", "riscv32-unknown-none-elf")
+        execute(str(llvm_bindir / "clang"), "--target=riscv32-unknown-elf", "-march=rv32imc", "-mabi=ilp32",
+                "-c", str(start), "-o", str(boot))
+        lld = llvm_bindir / "ld.lld"
+        if not lld.is_file():
+            found_lld = shutil.which("ld.lld")
+            if not found_lld:
+                raise SystemExit("freestanding-riscv32 requires ld.lld")
+            lld = Path(found_lld)
+        execute(str(lld), "-m", "elf32lriscv", "--gc-sections", "-T", str(linker),
+                str(boot), str(obj), "-o", str(elf))
+        execute(str(llvm_bindir / "llvm-readelf"), "-h", "-A", str(elf))
+        if not args.build_only:
+            execute("qemu-system-riscv32", "-M", "virt", "-bios", "none", "-nographic",
+                    "-kernel", str(elf))
+    elif args.name == "esp32c3":
+        build_dir = ROOT / "build/examples/esp32c3"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        llvm_bindir = Path(subprocess.run(["llvm-config", "--bindir"], cwd=ROOT,
+                                         text=True, stdout=subprocess.PIPE, check=True).stdout.strip())
+        source = ROOT / "src/examples/freestanding/esp32c3/firmware.coil"
+        linker = ROOT / "src/examples/freestanding/esp32c3/esp32c3.ld"
+        obj, elf, flash = (build_dir / name for name in
+                           ("firmware.o", "firmware.elf", "flash.bin"))
+        execute(args.compiler, "emit-obj", str(source), "-o", str(obj),
+                "--target", "riscv32-unknown-none-elf")
+        lld = llvm_bindir / "ld.lld"
+        if not lld.is_file():
+            found_lld = shutil.which("ld.lld")
+            if not found_lld:
+                raise SystemExit("esp32c3 example requires ld.lld")
+            lld = Path(found_lld)
+        execute(str(lld), "-m", "elf32lriscv", "--gc-sections", "-T", str(linker),
+                str(obj), "-o", str(elf))
+        execute(str(llvm_bindir / "llvm-objcopy"), "-O", "binary", "--gap-fill=0xff",
+                "--pad-to=0x400000", str(elf), str(flash))
+        execute(str(llvm_bindir / "llvm-readelf"), "-h", "-l", "-A", str(elf))
+        if not args.build_only:
+            qemu = os.environ.get("ESP32C3_QEMU")
+            if not qemu:
+                local_qemu = ROOT / "build/toolchains/qemu-esp32c3/qemu/bin/qemu-system-riscv32"
+                if local_qemu.is_file():
+                    qemu = str(local_qemu)
+            if not qemu:
+                candidate = shutil.which("qemu-system-riscv32")
+                if candidate:
+                    machines = subprocess.run([candidate, "-machine", "help"], cwd=ROOT,
+                                              text=True, stdout=subprocess.PIPE,
+                                              stderr=subprocess.STDOUT, check=True).stdout
+                    if "esp32c3" in machines:
+                        qemu = candidate
+            if not qemu:
+                raise SystemExit(
+                    "Espressif QEMU is required; set ESP32C3_QEMU to its qemu-system-riscv32 binary")
+            command = [qemu, "-nographic", "-icount", "3", "-machine", "esp32c3",
+                       "-drive", f"file={flash},if=mtd,format=raw"]
+            print("+", shlex.join(command), flush=True)
+            process = subprocess.Popen(command, cwd=ROOT, text=True, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT)
+            try:
+                output, _ = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                output, _ = process.communicate()
+            print(output, end="")
+            if "coil esp32-c3: ok" not in output:
+                raise SystemExit("ESP32-C3 emulator did not reach the Coil success sentinel")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -712,7 +789,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=benchmark)
 
     command = commands.add_parser("example", help="build an example application")
-    command.add_argument("name", choices=("mini-scheme", "freestanding"))
+    command.add_argument("name", choices=("mini-scheme", "freestanding", "freestanding-riscv32", "esp32c3"))
     command.add_argument("program", nargs="?", default="hello")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--build-only", action="store_true")

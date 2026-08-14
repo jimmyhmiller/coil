@@ -124,7 +124,8 @@
    (llvm_seq i64)
    (loops (ArrayList CgLoop))
    (csigs (ArrayList CSigEntry))  ; only struct-by-value callables
-   (arch i64)  ; 0 = x86_64, 1 = aarch64, 2 = wasm32 (from the triple)
+   (reset_func (ptr i8))
+   (arch i64)  ; 0 = x86_64, 1 = aarch64, 2 = wasm32, 3 = riscv32
    (mach_o bool)  ; Mach-O (Apple) => asm symbols carry a leading `_`
    (sanitizer i64)  ; 0=off, 1=ASan, 2=TSan, 3=MSan, 4=UBSan checks
    (debug_checks bool)
@@ -271,6 +272,8 @@
   (sum-words (field cg layouts) (load (field sp variants))))
 (defn cg-sum-words-def [(cg (ptr Cg)) (sd (ptr SumDef))] (-> i64)
   (sum-words (field cg layouts) (load (field sd variants))))
+(defn cg-sum-word-ty [(cg (ptr Cg))] (-> (ptr i8))
+  (if (= (load (field cg arch)) (primitive/cast i64 3)) (cg-i32t cg) (cg-i64t cg)))
 ; Keep LLVM authoritative for target-dependent scalar/view types (notably
 ; wasm32 pointers). Declared struct layouts, and arrays of them, are Coil's
 ; contract and come from the shared database.
@@ -488,7 +491,10 @@
         :else (do (unimplemented "codegen: unknown native calling-convention code") 0)))
 ; LLVM call-conv id for a native convention; -1 for a :shim (no native id).
 (defn conv-native-id [(c (ptr Convention))] (-> i64)
-  (match (load (field c lowering)) (LNative [cc] (native-cc-llvm-id cc)) (LShim [] -1)))
+  (match (load (field c lowering))
+    (LNative [cc] (native-cc-llvm-id cc))
+    (LShim [] -1)
+    (LReset [] 0)))
 
 ; ---- shim registry ----
 (defn cg-add-shim [(cg (ptr Cg))
@@ -1840,24 +1846,26 @@
 ; Only the `c` convention is lowered. A non-`c` fnptr keeps the plain call it has
 ; always had — its convention is Coil-internal, not an ABI boundary.
 (defn cg-indirect-cc-id [(cg (ptr Cg)) (name (slice u8))] (-> i64)
-  (if (= name "c") 0
-    (let [n (al-len [CgSig] (load (field cg sigs)))
-          (mut i) 0
-          (mut out) -1]
-      ;; A fnptr type retains the source convention name, while LLVM retains only
-      ;; its numeric id. Find any declared function using that convention and use
-      ;; its already-established id. This also fixes fastcc pointers; hard-coding
-      ;; Scheme's qualified convention spelling would be both brittle and wrong.
-      (loop (if (>= (load i) n) (break)
-              (let [s (al-elem [CgSig] (field cg sigs) (load i))]
-                (if (= (load (field s cc)) name)
-                    (let [f (cg-func cg (load (field s name)))]
-                      (when (!= (primitive/cast i64 f) 0)
-                        (store! out (primitive/cast i64 (LLVMGetFunctionCallConv f)))
-                        (break)))
-                  0)
-                (store! i (primitive/iadd (load i) 1)))))
-      (load out))))
+  (if (= name "c")
+      0
+      (let [n (al-len [CgSig] (load (field cg sigs)))
+            (mut i) 0
+            (mut out) -1]
+        ;; A fnptr type retains the source convention name, while LLVM retains only
+        ;; its numeric id. Find any declared function using that convention and use
+        ;; its already-established id. This also fixes fastcc pointers; hard-coding
+        ;; Scheme's qualified convention spelling would be both brittle and wrong.
+        (loop (if (>= (load i) n)
+                  (break)
+                  (let [s (al-elem [CgSig] (field cg sigs) (load i))]
+                    (if (= (load (field s cc)) name)
+                        (let [f (cg-func cg (load (field s name)))]
+                          (when (!= (primitive/cast i64 f) 0)
+                            (store! out (primitive/cast i64 (LLVMGetFunctionCallConv f)))
+                            (break)))
+                        0)
+                    (store! i (primitive/iadd (load i) 1)))))
+        (load out))))
 
 (defn emit-callptr [(cg (ptr Cg)) (fp (ptr Expr)) (args (ptr (ArrayList Expr))) (scp (ptr Scope))] (-> Tv)
   (let [a (load (field cg a))
@@ -1924,118 +1932,326 @@
 (defn fnsig-cc [(s FnSig)] (-> (slice u8))
   (let [x (alloc/stack FnSig)] (store! x s) (load (field x cc))))
 
-(defn emit-llvm-ir [(cg (ptr Cg)) (result (ptr Type)) (args (ptr (ArrayList Expr))) (body (slice u8)) (scp (ptr Scope))] (-> Tv)
+(defn rv32-csr-number [(name (slice u8))] (-> i64)
+  (cond (str-eq name "mstatus") 768
+        (str-eq name "misa") 769
+        (str-eq name "mie") 772
+        (str-eq name "mtvec") 773
+        (str-eq name "mscratch") 832
+        (str-eq name "mepc") 833
+        (str-eq name "mcause") 834
+        (str-eq name "mtval") 835
+        (str-eq name "mip") 836
+        (str-eq name "cycle") 3072
+        (str-eq name "time") 3073
+        (str-eq name "instret") 3074
+        (str-eq name "mhartid") 3860
+        :else -1))
+
+; Emit one directly encoded RV32 instruction followed by `ret`. This is a tiny
+; native system-instruction backend, not inline assembly: LLVM only carries the
+; finished bytes in an executable section and emits calls to their address.
+(defn cg-rv32-helper [(cg (ptr Cg)) (name (slice u8)) (instruction i64) (trailer i64)] (-> (ptr i8))
   (let [a (load (field cg a))
-        b (cg-bld cg)
-        argtv (emit-arg-tvs cg args scp)
-        nargs (al-len [Tv] (load argtv))
-        ret-str (cstr->slice (LLVMPrintTypeToString (basic-ty cg result)))
-        ; substitute placeholders, highest index first.
-        (mut text) body
-        (mut i) (primitive/isub nargs 1)]
-    (loop (if (< (load i) (primitive/cast i64 0))
-              (break)
-              (do
-                (let [argstr
-                        (cstr->slice (LLVMPrintTypeToString (basic-ty cg
-                                                                      (box-type a
-                                                                                (tv-ty (al-get [Tv]
-                                                                                               (load argtv)
-                                                                                               (load i)))))))]
-                  (store! text (str-replace-all a (load text) (sconcat a "$t" (i64->str a (load i))) argstr))
-                  (store! text
-                          (str-replace-all a
-                                           (load text)
-                                           (sconcat a "$" (i64->str a (load i)))
-                                           (sconcat a "%" (i64->str a (load i))))))
-                (store! i (primitive/isub (load i) 1)))))
-    (store! text (str-replace-all a (load text) "$ret" ret-str))
-    ; hoist `declare` lines; build the helper module text.
-    (let [lines (nz-split-lines a (load text))
-          nl (al-len [(slice u8)] lines)
-          (mut decls) (sb-new a)
-          (mut fnbody) (sb-new a)
-          (mut j) 0]
-      (loop (if (>= (load j) nl)
-                (break)
-                (do
-                  (let [ln (al-get [(slice u8)] lines (load j))]
-                    (if (starts-with (str-ltrim ln) "declare")
-                        (do (sb-push-str! (mut decls) ln) (sb-push-byte! (mut decls) 10))
-                        (do (sb-push-str! (mut fnbody) ln) (sb-push-byte! (mut fnbody) 10))))
-                  (store! j (primitive/iadd (load j) 1)))))
-      (let [seq (load (field cg llvm_seq))]
-        (store! (field cg llvm_seq) (primitive/iadd seq 1))
-        (let [name (sconcat a "__coil_llvm_ir_" (i64->str a seq))
-              (mut params) (sb-new a)
-              (mut k) 0]
-          (loop (if (>= (load k) nargs)
+        ctx (cg-ctx cg)
+        module (load (field cg module))
+        prior (LLVMGetNamedGlobal module (str->cstr a name))]
+    (if (!= (primitive/cast i64 prior) (primitive/cast i64 0))
+        prior
+        (let [i8t (LLVMInt8TypeInContext ctx)
+              (mut bytes) (al-new [(ptr i8)] a)
+              (mut i) 0]
+          (loop (if (>= (load i) (primitive/cast i64 4))
                     (break)
                     (do
-                      (when (> (load k) (primitive/cast i64 0)) (sb-push-str! (mut params) ", "))
-                      (let [argstr
-                              (cstr->slice (LLVMPrintTypeToString (basic-ty cg
-                                                                            (box-type a
-                                                                                      (tv-ty (al-get [Tv]
-                                                                                                     (load argtv)
-                                                                                                     (load k)))))))]
-                        (sb-push-str! (mut params) argstr)
-                        (sb-push-str! (mut params) " %")
-                        (sb-push-str! (mut params) (i64->str a (load k))))
-                      (store! k (primitive/iadd (load k) 1)))))
-          (let [(mut mt) (sb-new a)]
-            (sb-push-str! (mut mt) (sb-str (load decls)))
-            (sb-push-str! (mut mt) "define ")
-            (sb-push-str! (mut mt) ret-str)
-            (sb-push-str! (mut mt) " @")
-            (sb-push-str! (mut mt) name)
-            (sb-push-str! (mut mt) "(")
-            (sb-push-str! (mut mt) (sb-str (load params)))
-            (sb-push-str! (mut mt) ") alwaysinline {\n")
-            (sb-push-str! (mut mt) (sb-str (load fnbody)))
-            (sb-push-str! (mut mt) "}\n")
-            (let [mtext (sb-str (load mt))
-                  membuf
-                    (LLVMCreateMemoryBufferWithMemoryRangeCopy (primitive/cast (ptr i8) (slice-data [u8] mtext))
-                                                               (slice-len mtext)
-                                                               (cg-bl cg "coil_llvm_ir"))
-                  modout (alloc/stack (ptr i8))
-                  errout (alloc/stack (ptr i8))]
-              (if (!= (LLVMParseIRInContext (cg-ctx cg) membuf modout errout) (primitive/cast i32 0))
-                  ; Parse failure: the message is LLVM's own, which is
-                  ; itself `{:?}` (Debug) over its `Deref::Target = CStr` — so the LLVM
-                  ; error message (read from the `errout` char** out-param) is CStr-Debug-
-                  ; escaped (quoted, `\n`, `\'`, `\xHH` …) via cstr-dbg-escape; the
-                  ; `--- generated module ---` section is the module text we just built
-                  ; (mtext). cg-fail renders it as `error: <body>` + exit 1.
-                  (do
-                    (cg-fail (sconcat a
-                                      (sconcat3 a
-                                                "llvm-ir: could not parse IR: "
-                                                (sconcat3 a "\"" (cstr-dbg-escape a (cstr->slice (load errout))) "\"")
-                                                "\n--- generated module ---\n")
-                                      mtext))
-                    (mk-tv (primitive/cast (ptr i8) 0) (load result)))
-                  (let [helper (load modout)]
-                    (LLVMSetTarget helper (LLVMGetTarget (load (field cg module))))
-                    (LLVMSetDataLayout helper (LLVMGetDataLayoutStr (load (field cg module))))
-                    (LLVMLinkModules2 (load (field cg module)) helper)
-                    (let [callee (LLVMGetNamedFunction (load (field cg module)) (str->cstr a name))]
-                      (LLVMSetLinkage callee 8)
-                      (let [(mut vs) (al-new [(ptr i8)] a)
-                            (mut q) 0]
-                        (loop (if (>= (load q) nargs)
-                                  (break)
-                                  (do
-                                    (al-push! (mut vs) (tv-val (al-get [Tv] (load argtv) (load q))))
-                                    (store! q (primitive/iadd (load q) 1)))))
-                        (mk-tv (LLVMBuildCall2 b
-                                               (LLVMGlobalGetValueType callee)
-                                               callee
-                                               (carr a (load vs))
-                                               (primitive/cast i32 nargs)
-                                               (cg-bl cg "llvmir"))
-                               (load result)))))))))))))
+                      (al-push! (mut bytes)
+                                (LLVMConstInt i8t
+                                              (primitive/iand (primitive/ishr instruction
+                                                                              (primitive/imul (load i) 8))
+                                                              255)
+                                              0))
+                      (store! i (primitive/iadd (load i) 1)))))
+          (store! i 0)
+          (loop (if (>= (load i) (primitive/cast i64 4))
+                    (break)
+                    (do
+                      (al-push! (mut bytes)
+                                (LLVMConstInt i8t
+                                              (primitive/iand (primitive/ishr trailer
+                                                                              (primitive/imul (load i) 8))
+                                                              255)
+                                              0))
+                      (store! i (primitive/iadd (load i) 1)))))
+          (let [aty (LLVMArrayType2 i8t 8)
+                g (LLVMAddGlobal module aty (str->cstr a name))]
+            (LLVMSetInitializer g (LLVMConstArray2 i8t (carr a (load bytes)) 8))
+            (LLVMSetGlobalConstant g 1)
+            (LLVMSetAlignment g 4)
+            (LLVMSetSection g c".text.coil.riscv.system")
+            (LLVMSetLinkage g 8)
+            g)))))
+
+(defn emit-arch-primitive [(cg (ptr Cg))
+                           (result (ptr Type))
+                           (args (ptr (ArrayList Expr)))
+                           (body (slice u8))
+                           (scp (ptr Scope))] (-> Tv)
+  (let [a (load (field cg a))
+        ctx (cg-ctx cg)
+        module (load (field cg module))]
+    (unless (= (load (field cg arch)) (primitive/cast i64 3))
+      (cg-fail "architecture primitive requires a riscv32 target"))
+    (cond (starts-with body "coil.arch.linker-address:")
+            (let [name (subslice body 25 (slice-len body))
+                  prior (LLVMGetNamedGlobal module (str->cstr a name))
+                  global
+                    (if (!= (primitive/cast i64 prior) (primitive/cast i64 0))
+                        prior
+                        (LLVMAddGlobal module (LLVMInt8TypeInContext ctx) (str->cstr a name)))]
+              (mk-tv global (load result)))
+          (starts-with body "coil.arch.write-register:")
+            (let [name (subslice body 25 (slice-len body))]
+              (unless (or (str-eq name "sp") (str-eq name "gp"))
+                (cg-fail "write-register!: riscv32 reset code may write only sp or gp"))
+              (let [vals (emit-arg-tvs cg args scp)]
+                (unless (= (al-len [Tv] (load vals)) (primitive/cast i64 1))
+                  (cg-fail "write-register!: compiler operand mismatch"))
+                (let [value (tv-val (al-get [Tv] (load vals) 0))
+                      i32t (cg-i32t cg)
+                      word (LLVMBuildPtrToInt (cg-bld cg) value i32t (cg-bl cg "reg.addr"))
+                      (mut ptys) (al-new [(ptr i8)] a)]
+                  (al-push! (mut ptys) (LLVMMetadataTypeInContext ctx))
+                  (al-push! (mut ptys) i32t)
+                  (let [fnty (LLVMFunctionType (LLVMVoidTypeInContext ctx) (carr a (load ptys)) 2 0)
+                        prior (LLVMGetNamedFunction module c"llvm.write_register.i32")
+                        fn
+                          (if (!= (primitive/cast i64 prior) (primitive/cast i64 0))
+                              prior
+                              (LLVMAddFunction module c"llvm.write_register.i32" fnty))
+                        md
+                          (LLVMMDStringInContext2 ctx
+                                                  (primitive/cast (ptr i8) (slice-data [u8] name))
+                                                  (slice-len name))
+                        (mut mdparts) (al-new [(ptr i8)] a)
+                        (mut argv) (al-new [(ptr i8)] a)]
+                    (al-push! (mut mdparts) md)
+                    (let [mdnode (LLVMMDNodeInContext2 ctx (carr a (load mdparts)) 1)]
+                      (al-push! (mut argv) (LLVMMetadataAsValue ctx mdnode)))
+                    (al-push! (mut argv) word)
+                    (LLVMBuildCall2 (cg-bld cg) fnty fn (carr a (load argv)) 2 (cg-bl cg ""))
+                    (mk-tv (cg-zero-i64 cg) (load result))))))
+          (starts-with body "coil.arch.csr-read:")
+            (let [name (subslice body 19 (slice-len body))
+                  csr (rv32-csr-number name)]
+              (when (< csr (primitive/cast i64 0))
+                (cg-fail (sconcat a "csr-read: unsupported CSR " name)))
+              ; csrrs a0, csr, x0
+              (let [instruction
+                      (primitive/ior (primitive/ishl csr 20)
+                                     (primitive/ior (primitive/ishl 2 12)
+                                                    (primitive/ior (primitive/ishl 10 7) 115)))
+                    helper (cg-rv32-helper cg (sconcat a "__coil_csr_read_" name) instruction 32871)
+                    (mut ptys) (al-new [(ptr i8)] a)
+                    fnty (LLVMFunctionType (cg-i32t cg) (carr a (load ptys)) 0 0)
+                    (mut argv) (al-new [(ptr i8)] a)
+                    call (LLVMBuildCall2 (cg-bld cg) fnty helper (carr a (load argv)) 0 (cg-bl cg "csr"))]
+                (mk-tv call (load result))))
+          (starts-with body "coil.arch.csr-write:")
+            (let [name (subslice body 20 (slice-len body))
+                  csr (rv32-csr-number name)
+                  vals (emit-arg-tvs cg args scp)]
+              (when (< csr (primitive/cast i64 0))
+                (cg-fail (sconcat a "csr-write!: unsupported CSR " name)))
+              (unless (= (al-len [Tv] (load vals)) (primitive/cast i64 1))
+                (cg-fail "csr-write!: compiler operand mismatch"))
+              ; csrrw x0, csr, a0
+              (let [instruction
+                      (primitive/ior (primitive/ishl csr 20)
+                                     (primitive/ior (primitive/ishl 10 15)
+                                                    (primitive/ior (primitive/ishl 1 12) 115)))
+                    helper (cg-rv32-helper cg (sconcat a "__coil_csr_write_" name) instruction 32871)
+                    (mut ptys) (al-new [(ptr i8)] a)
+                    (mut argv) (al-new [(ptr i8)] a)]
+                (al-push! (mut ptys) (cg-i32t cg))
+                (al-push! (mut argv) (tv-val (al-get [Tv] (load vals) 0)))
+                (let [fnty (LLVMFunctionType (LLVMVoidTypeInContext ctx) (carr a (load ptys)) 1 0)]
+                  (LLVMBuildCall2 (cg-bld cg) fnty helper (carr a (load argv)) 1 (cg-bl cg ""))
+                  (mk-tv (cg-zero-i64 cg) (load result)))))
+          (str-eq body "coil.arch.wfi")
+            (let [helper (cg-rv32-helper cg "__coil_wfi" 273678451 32871)
+                  (mut ptys) (al-new [(ptr i8)] a)
+                  fnty (LLVMFunctionType (LLVMVoidTypeInContext ctx) (carr a (load ptys)) 0 0)
+                  (mut argv) (al-new [(ptr i8)] a)]
+              (LLVMBuildCall2 (cg-bld cg) fnty helper (carr a (load argv)) 0 (cg-bl cg ""))
+              (mk-tv (cg-zero-i64 cg) (load result)))
+          (str-eq body "coil.arch.mret")
+            (let [helper (cg-rv32-helper cg "__coil_mret" 807403635 0)
+                  (mut ptys) (al-new [(ptr i8)] a)
+                  fnty (LLVMFunctionType (LLVMVoidTypeInContext ctx) (carr a (load ptys)) 0 0)
+                  (mut argv) (al-new [(ptr i8)] a)]
+              (LLVMBuildCall2 (cg-bld cg) fnty helper (carr a (load argv)) 0 (cg-bl cg ""))
+              (mk-tv (cg-zero-i64 cg) (load result)))
+          :else
+            (do
+              (cg-fail "unknown architecture primitive")
+              (mk-tv (primitive/cast (ptr i8) 0) (load result))))))
+
+(defn emit-memory-primitive [(cg (ptr Cg))
+                             (result (ptr Type))
+                             (args (ptr (ArrayList Expr)))
+                             (body (slice u8))
+                             (scp (ptr Scope))] (-> Tv)
+  (let [vals (emit-arg-tvs cg args scp)
+        b (cg-bld cg)]
+    (cond (str-eq body "coil.mem.volatile-load")
+            (do
+              (unless (= (al-len [Tv] (load vals)) (primitive/cast i64 1))
+                (cg-fail "volatile-load: compiler operand mismatch"))
+              (let [inst
+                      (LLVMBuildLoad2 b
+                                      (basic-ty cg result)
+                                      (tv-val (al-get [Tv] (load vals) 0))
+                                      (cg-bl cg "volatile.load"))]
+                (LLVMSetVolatile inst 1)
+                (mk-tv inst (load result))))
+          (str-eq body "coil.mem.volatile-store")
+            (do
+              (unless (= (al-len [Tv] (load vals)) (primitive/cast i64 2))
+                (cg-fail "volatile-store!: compiler operand mismatch"))
+              (let [inst
+                      (LLVMBuildStore b
+                                      (tv-val (al-get [Tv] (load vals) 1))
+                                      (tv-val (al-get [Tv] (load vals) 0)))]
+                (LLVMSetVolatile inst 1)
+                (mk-tv (cg-zero-i64 cg) (load result))))
+          (str-eq body "coil.mem.fence")
+            (do
+              (LLVMBuildFence b 7 0 (cg-bl cg "fence"))
+              (mk-tv (cg-zero-i64 cg) (load result)))
+          :else
+            (do
+              (cg-fail "unknown memory primitive")
+              (mk-tv (primitive/cast (ptr i8) 0) (load result))))))
+
+(defn emit-llvm-ir [(cg (ptr Cg)) (result (ptr Type)) (args (ptr (ArrayList Expr))) (body (slice u8)) (scp (ptr Scope))] (-> Tv)
+  (if (starts-with body "coil.arch.")
+      (emit-arch-primitive cg result args body scp)
+      (if (starts-with body "coil.mem.")
+          (emit-memory-primitive cg result args body scp)
+          (let [a (load (field cg a))
+                b (cg-bld cg)
+                argtv (emit-arg-tvs cg args scp)
+                nargs (al-len [Tv] (load argtv))
+                ret-str (cstr->slice (LLVMPrintTypeToString (basic-ty cg result)))
+                ; substitute placeholders, highest index first.
+                (mut text) body
+                (mut i) (primitive/isub nargs 1)]
+            (loop (if (< (load i) (primitive/cast i64 0))
+                      (break)
+                      (do
+                        (let [argstr
+                                (cstr->slice (LLVMPrintTypeToString (basic-ty cg
+                                                                              (box-type a
+                                                                                        (tv-ty (al-get [Tv]
+                                                                                                       (load argtv)
+                                                                                                       (load i)))))))]
+                          (store! text (str-replace-all a (load text) (sconcat a "$t" (i64->str a (load i))) argstr))
+                          (store! text
+                                  (str-replace-all a
+                                                   (load text)
+                                                   (sconcat a "$" (i64->str a (load i)))
+                                                   (sconcat a "%" (i64->str a (load i))))))
+                        (store! i (primitive/isub (load i) 1)))))
+            (store! text (str-replace-all a (load text) "$ret" ret-str))
+            ; hoist `declare` lines; build the helper module text.
+            (let [lines (nz-split-lines a (load text))
+                  nl (al-len [(slice u8)] lines)
+                  (mut decls) (sb-new a)
+                  (mut fnbody) (sb-new a)
+                  (mut j) 0]
+              (loop (if (>= (load j) nl)
+                        (break)
+                        (do
+                          (let [ln (al-get [(slice u8)] lines (load j))]
+                            (if (starts-with (str-ltrim ln) "declare")
+                                (do (sb-push-str! (mut decls) ln) (sb-push-byte! (mut decls) 10))
+                                (do (sb-push-str! (mut fnbody) ln) (sb-push-byte! (mut fnbody) 10))))
+                          (store! j (primitive/iadd (load j) 1)))))
+              (let [seq (load (field cg llvm_seq))]
+                (store! (field cg llvm_seq) (primitive/iadd seq 1))
+                (let [name (sconcat a "__coil_llvm_ir_" (i64->str a seq))
+                      (mut params) (sb-new a)
+                      (mut k) 0]
+                  (loop (if (>= (load k) nargs)
+                            (break)
+                            (do
+                              (when (> (load k) (primitive/cast i64 0)) (sb-push-str! (mut params) ", "))
+                              (let [argstr
+                                      (cstr->slice (LLVMPrintTypeToString (basic-ty cg
+                                                                                    (box-type a
+                                                                                              (tv-ty (al-get [Tv]
+                                                                                                             (load argtv)
+                                                                                                             (load k)))))))]
+                                (sb-push-str! (mut params) argstr)
+                                (sb-push-str! (mut params) " %")
+                                (sb-push-str! (mut params) (i64->str a (load k))))
+                              (store! k (primitive/iadd (load k) 1)))))
+                  (let [(mut mt) (sb-new a)]
+                    (sb-push-str! (mut mt) (sb-str (load decls)))
+                    (sb-push-str! (mut mt) "define ")
+                    (sb-push-str! (mut mt) ret-str)
+                    (sb-push-str! (mut mt) " @")
+                    (sb-push-str! (mut mt) name)
+                    (sb-push-str! (mut mt) "(")
+                    (sb-push-str! (mut mt) (sb-str (load params)))
+                    (sb-push-str! (mut mt) ") alwaysinline {\n")
+                    (sb-push-str! (mut mt) (sb-str (load fnbody)))
+                    (sb-push-str! (mut mt) "}\n")
+                    (let [mtext (sb-str (load mt))
+                          membuf
+                            (LLVMCreateMemoryBufferWithMemoryRangeCopy (primitive/cast (ptr i8) (slice-data [u8] mtext))
+                                                                       (slice-len mtext)
+                                                                       (cg-bl cg "coil_llvm_ir"))
+                          modout (alloc/stack (ptr i8))
+                          errout (alloc/stack (ptr i8))]
+                      (if (!= (LLVMParseIRInContext (cg-ctx cg) membuf modout errout) (primitive/cast i32 0))
+                          ; Parse failure: the message is LLVM's own, which is
+                          ; itself `{:?}` (Debug) over its `Deref::Target = CStr` — so the LLVM
+                          ; error message (read from the `errout` char** out-param) is CStr-Debug-
+                          ; escaped (quoted, `\n`, `\'`, `\xHH` …) via cstr-dbg-escape; the
+                          ; `--- generated module ---` section is the module text we just built
+                          ; (mtext). cg-fail renders it as `error: <body>` + exit 1.
+                          (do
+                            (cg-fail (sconcat a
+                                              (sconcat3 a
+                                                        "llvm-ir: could not parse IR: "
+                                                        (sconcat3 a
+                                                                  "\""
+                                                                  (cstr-dbg-escape a (cstr->slice (load errout)))
+                                                                  "\"")
+                                                        "\n--- generated module ---\n")
+                                              mtext))
+                            (mk-tv (primitive/cast (ptr i8) 0) (load result)))
+                          (let [helper (load modout)]
+                            (LLVMSetTarget helper (LLVMGetTarget (load (field cg module))))
+                            (LLVMSetDataLayout helper (LLVMGetDataLayoutStr (load (field cg module))))
+                            (LLVMLinkModules2 (load (field cg module)) helper)
+                            (let [callee (LLVMGetNamedFunction (load (field cg module)) (str->cstr a name))]
+                              (LLVMSetLinkage callee 8)
+                              (let [(mut vs) (al-new [(ptr i8)] a)
+                                    (mut q) 0]
+                                (loop (if (>= (load q) nargs)
+                                          (break)
+                                          (do
+                                            (al-push! (mut vs) (tv-val (al-get [Tv] (load argtv) (load q))))
+                                            (store! q (primitive/iadd (load q) 1)))))
+                                (mk-tv (LLVMBuildCall2 b
+                                                       (LLVMGlobalGetValueType callee)
+                                                       callee
+                                                       (carr a (load vs))
+                                                       (primitive/cast i32 nargs)
+                                                       (cg-bl cg "llvmir"))
+                                       (load result)))))))))))))))
 (defn emit-arg-tvs [(cg (ptr Cg)) (es (ptr (ArrayList Expr))) (scp (ptr Scope))] (-> (ArrayList Tv))
   (let [n (al-len [Expr] (load es))
         (mut out) (al-new [Tv] (load (field cg a)))
@@ -2110,39 +2326,43 @@
 ;; ABI adaptation (sret pointers, aggregate coercion) that a tail call cannot
 ;; carry.
 (defn tail-call-ok [(cg (ptr Cg)) (func (slice u8)) (function (ptr i8))] (-> bool)
-  (if (or (cg-has-csig cg func) (cg-inline-func? cg func)) false
-    (let [callee (cg-func cg func)]
-      (if (= (primitive/cast i64 callee) (primitive/cast i64 0)) false
-        (if (= (primitive/cast i64 callee) (primitive/cast i64 function)) true
-                  ; ⚠ NOT ON WASM. LLVM lowers `musttail` to a `return_call`,
-                  ; which needs the Wasm 3.0 `+tail-call` feature — and
-                  ; `llvm-cpu-features` still returns an empty string with a
-                  ; TODO, so that feature is NOT enabled. Emitting musttail here
-                  ; fails the whole build:
-                  ;
-                  ;   error: in function mh_fail i64 (i64):
-                  ;          WebAssembly 'tail-call' feature not enabled
-                  ;
-                  ; This did not bite before mutual tail calls were allowed
-                  ; because self-recursion alone never reached the affected
-                  ; functions. Restricting to self-calls on wasm restores the
-                  ; previous behaviour exactly; when `+tail-call` is turned on,
-                  ; delete this clause (see issue #1).
-          (if (= (load (field cg arch)) (primitive/cast i64 2)) false
-            (let [cty (LLVMGlobalGetValueType callee)
-                  fty (LLVMGlobalGetValueType function)
-                  cc (primitive/cast i64 (LLVMGetFunctionCallConv function))]
-              ; A DIFFERENT function must use the same convention and
-              ; scalar-only ABI. Ordinary conventions additionally need
-              ; identical prototypes. LLVM tailcc deliberately relaxes that
-              ; last rule, which is what permits Scheme f/1 to tail call g/2.
-              (and (= (primitive/cast i64 (LLVMGetFunctionCallConv callee)) cc)
-                   (and (cg-fnty-all-scalar? fty)
-                        (and (cg-fnty-all-scalar? cty)
-                             (or (= (primitive/cast i64 cty) (primitive/cast i64 fty))
-                                 (and (or (= cc 18) (= cc 20))
-                                      (= (primitive/cast i64 (LLVMGetReturnType cty))
-                                         (primitive/cast i64 (LLVMGetReturnType fty)))))))))))))))
+  (if (or (cg-has-csig cg func) (cg-inline-func? cg func))
+      false
+      (let [callee (cg-func cg func)]
+        (if (= (primitive/cast i64 callee) (primitive/cast i64 0))
+            false
+            (if (= (primitive/cast i64 callee) (primitive/cast i64 function))
+                true
+                ; ⚠ NOT ON WASM. LLVM lowers `musttail` to a `return_call`,
+                ; which needs the Wasm 3.0 `+tail-call` feature — and
+                ; `llvm-cpu-features` still returns an empty string with a
+                ; TODO, so that feature is NOT enabled. Emitting musttail here
+                ; fails the whole build:
+                ;
+                ;   error: in function mh_fail i64 (i64):
+                ;          WebAssembly 'tail-call' feature not enabled
+                ;
+                ; This did not bite before mutual tail calls were allowed
+                ; because self-recursion alone never reached the affected
+                ; functions. Restricting to self-calls on wasm restores the
+                ; previous behaviour exactly; when `+tail-call` is turned on,
+                ; delete this clause (see issue #1).
+                (if (= (load (field cg arch)) (primitive/cast i64 2))
+                    false
+                    (let [cty (LLVMGlobalGetValueType callee)
+                          fty (LLVMGlobalGetValueType function)
+                          cc (primitive/cast i64 (LLVMGetFunctionCallConv function))]
+                      ; A DIFFERENT function must use the same convention and
+                      ; scalar-only ABI. Ordinary conventions additionally need
+                      ; identical prototypes. LLVM tailcc deliberately relaxes that
+                      ; last rule, which is what permits Scheme f/1 to tail call g/2.
+                      (and (= (primitive/cast i64 (LLVMGetFunctionCallConv callee)) cc)
+                           (and (cg-fnty-all-scalar? fty)
+                                (and (cg-fnty-all-scalar? cty)
+                                     (or (= (primitive/cast i64 cty) (primitive/cast i64 fty))
+                                         (and (or (= cc 18) (= cc 20))
+                                              (= (primitive/cast i64 (LLVMGetReturnType cty))
+                                                 (primitive/cast i64 (LLVMGetReturnType fty)))))))))))))))
 
 ;; Every parameter and the return are first-class scalars (no pointers, structs
 ;; or arrays), so a tail call needs no ABI adaptation and carries no parameter
@@ -2215,7 +2435,9 @@
              (cg-pos cg else-bb)
              (emit-tail cg els function sig ret scp)))
       (ECall [func targs args]
-             (if (tail-call-ok cg func function)
+             (if (or (tail-call-ok cg func function)
+                     (= (primitive/cast i64 function)
+                        (primitive/cast i64 (load (field cg reset_func)))))
                  (let [vals (emit-vals cg args scp)
                        callee (cg-func cg func)
                        cs
@@ -2245,19 +2467,19 @@
                    (if (ty-is-void ret) (do (LLVMBuildRetVoid b) 0) (do (LLVMBuildRet b cs) 0)))
                  (let [v (emit-expr cg e scp)] (when (not (cg-terminated cg)) (emit-c-return cg sig ret v)))))
       (ECallPtr [fp args]
-        (let [v (emit-callptr cg fp args scp)]
-          (if (and (let [cc (primitive/cast i64 (LLVMGetFunctionCallConv function))]
-                     (or (= cc 18) (= cc 20)))
-                   (= (primitive/cast i64 (LLVMGetInstructionCallConv (tv-val v)))
-                      (primitive/cast i64 (LLVMGetFunctionCallConv function))))
-              (do
-                ;; tailcc permits the pointer's argument list to differ from the
-                ;; caller's. The checker has already proved the pointer call's
-                ;; own argument types, and both Scheme sides return i64.
-                (LLVMSetTailCallKind (tv-val v) 2)
-                (LLVMBuildRet b (tv-val v))
-                0)
-            (when (not (cg-terminated cg)) (emit-c-return cg sig ret v)))))
+                (let [v (emit-callptr cg fp args scp)]
+                  (if (and (let [cc (primitive/cast i64 (LLVMGetFunctionCallConv function))]
+                             (or (= cc 18) (= cc 20)))
+                           (= (primitive/cast i64 (LLVMGetInstructionCallConv (tv-val v)))
+                              (primitive/cast i64 (LLVMGetFunctionCallConv function))))
+                      (do
+                        ;; tailcc permits the pointer's argument list to differ from the
+                        ;; caller's. The checker has already proved the pointer call's
+                        ;; own argument types, and both Scheme sides return i64.
+                        (LLVMSetTailCallKind (tv-val v) 2)
+                        (LLVMBuildRet b (tv-val v))
+                        0)
+                      (when (not (cg-terminated cg)) (emit-c-return cg sig ret v)))))
       (EMatch [scrut arms] (emit-tail-match cg scrut arms function sig ret scp))
       (_ (let [v (emit-expr cg e scp)] (when (not (cg-terminated cg)) (emit-c-return cg sig ret v)))))))
 (defn emit-tail-match [(cg (ptr Cg))
@@ -2480,6 +2702,9 @@
     (LLVMInitializeX86TargetInfo)
     (LLVMInitializeX86Target)
     (LLVMInitializeX86TargetMC)
+    (LLVMInitializeRISCVTargetInfo)
+    (LLVMInitializeRISCVTarget)
+    (LLVMInitializeRISCVTargetMC)
     (LLVMInitializeWebAssemblyTargetInfo)
     (LLVMInitializeWebAssemblyTarget)
     (LLVMInitializeWebAssemblyTargetMC)
@@ -2502,7 +2727,14 @@
           (wb w 10)
           (exit 1)
           0))
-      (let [tm (LLVMCreateTargetMachine (load targetout) triple c"generic" (llvm-cpu-features triple) 2 2 0)
+      (let [tm
+              (LLVMCreateTargetMachine (load targetout)
+                                       triple
+                                       (llvm-cpu triple)
+                                       (llvm-cpu-features triple)
+                                       2
+                                       (llvm-reloc-model triple)
+                                       0)
             td (LLVMCreateTargetDataLayout tm)
             dl (LLVMCopyStringRepOfTargetData td)
             module (LLVMModuleCreateWithNameInContext c"coil" ctx)
@@ -2526,12 +2758,14 @@
         (store! (field cgp llvm_seq) 0)
         (store! (field cgp loops) (al-new [CgLoop] a))
         (store! (field cgp csigs) (al-new [CSigEntry] a))
+        (store! (field cgp reset_func) (primitive/cast (ptr i8) 0))
         (store! (field cgp arch) (arch-from-triple (cstr->slice triple)))
         (store! (field cgp mach_o) (triple-mach-o (cstr->slice triple)))
         (store! (field cgp sanitizer) sanitizer)
         (store! (field cgp debug_checks) debug-checks)
         (store! (field cgp a) a)
-        (store! (field cgp layouts) (LayoutDb::new a p "codegen"))
+        (store! (field cgp layouts)
+                (LayoutDb::new a p "codegen" (if (= (load (field cgp arch)) (primitive/cast i64 3)) 4 8)))
         (let [fs (load (field p funcs))
               fn (al-len [Func] (load fs))
               (mut fi) 0]
@@ -2602,7 +2836,7 @@
               (do
                 (let [sd (al-elem [SumDef] us (load i))
                       words (cg-sum-words-def cg sd)
-                      payload (LLVMArrayType2 (cg-i64t cg) words)
+                      payload (LLVMArrayType2 (cg-sum-word-ty cg) words)
                       ty
                         (load (field (al-elem [CgSum]
                                               (field cg sums)
@@ -2945,6 +3179,7 @@
       (cond (or (= a0 "x86_64") (= a0 "amd64")) 0
             (or (= a0 "aarch64") (or (= a0 "arm64") (= a0 "arm64e"))) 1
             (or (= a0 "wasm32") (= a0 "wasm64")) 2
+            (= a0 "riscv32") 3
             :else  ; wasm ABI class is width-agnostic; word width comes from the triple's datalayout
               (do (unimplemented "abi: unsupported target architecture") -1)))))
 
@@ -2953,8 +3188,17 @@
 ; triple's datalayout (there is no `+memory64` subtarget feature in LLVM), so the only
 ; wasm feature we opt into is `+tail-call` (Wasm 3.0 tail calls — LLVM lowers `musttail`
 ; to `return_call`). Everything else takes LLVM's defaults (empty features).
+(defn llvm-cpu [(triple (ptr i8))] (-> (ptr i8))
+  (let [s (cstr->slice triple)]
+    (if (match (str-find s "riscv32") (Some [_] true) (None [] false)) c"generic-rv32" c"generic")))
+
 (defn llvm-cpu-features [(triple (ptr i8))] (-> (ptr i8))
-  c"")  ; TODO(wasm 3.0): +tail-call once memory64 lands + verified
+  (let [s (cstr->slice triple)]
+    (if (match (str-find s "riscv32") (Some [_] true) (None [] false)) c"+m,+c" c"")))
+
+(defn llvm-reloc-model [(triple (ptr i8))] (-> i32)
+  (let [s (cstr->slice triple)]
+    (if (match (str-find s "riscv32") (Some [_] true) (None [] false)) 1 2)))
 
 ; smallest power-of-two-byte int width (bits) covering `bytes` data bytes.
 (defn abi-int-bits-for-bytes [(bytes i64)] (-> i64)
@@ -3261,9 +3505,27 @@
         le (struct-at (field cg layouts) si)
         size (load (field le size))
         align (primitive/cast i32 (load (field le align)))]
-    (if (= (load (field cg arch)) (primitive/cast i64 1))
-        (abi-classify-aapcs64 cg (load (field sp fields)) sty size align)
-        (abi-classify-sysv cg si sty size align))))
+    (cond (= (load (field cg arch)) (primitive/cast i64 1))
+            (abi-classify-aapcs64 cg (load (field sp fields)) sty size align)
+          (= (load (field cg arch)) (primitive/cast i64 3)) (abi-classify-rv32 cg sty size align)
+          :else (abi-classify-sysv cg si sty size align))))
+
+(defn abi-classify-rv32 [(cg (ptr Cg)) (sty (ptr i8)) (size i64) (align i32)] (-> (ptr StructAbi))
+  (let [a (load (field cg a))
+        p (unwrap-ptr [StructAbi] (create [StructAbi] a))
+        i32t (cg-i32t cg)]
+    (store! (field p llvm_ty) sty)
+    (store! (field p size) size)
+    (store! (field p align) align)
+    (if (> size (primitive/cast i64 8))
+        (do (store! (field p arg) (ACIndirect align)) (store! (field p ret) (ACIndirect align)))
+        (let [slots
+                (if (<= size (primitive/cast i64 4))
+                    (abi-slots1 cg i32t)
+                    (abi-slots1 cg (LLVMArrayType2 i32t 2)))]
+          (store! (field p arg) (ACDirect slots))
+          (store! (field p ret) (ACDirect slots))))
+    p))
 (defn abi-classify-aapcs64 [(cg (ptr Cg)) (fields (ptr (ArrayList Field))) (sty (ptr i8)) (size i64) (align i32)] (-> (ptr StructAbi))
   (let [a (load (field cg a))
         ctx (cg-ctx cg)
@@ -3642,6 +3904,11 @@
   0)
 (defn cg-add-function [(cg (ptr Cg)) (name (ptr i8)) (fnty (ptr i8))] (-> (ptr i8))
   (let [f (LLVMAddFunction (load (field cg module)) name fnty)]
+    (when (= (load (field cg arch)) (primitive/cast i64 3))
+      (LLVMSetSection f
+                      (str->cstr (load (field cg a))
+                                 (sconcat (load (field cg a)) ".text." (cstr->slice name))))
+      0)
     (let [san (load (field cg sanitizer))]
       (when (= san (primitive/cast i64 1))
         (LLVMAddAttributeAtIndex f (primitive/cast i32 -1) (cg-enum-attr cg "sanitize_address" 0))
@@ -4159,6 +4426,8 @@
               (do
                 (let [fp (al-elem [Func] fs (load i))
                       fname (load (field fp name))
+                      conv (cg-prog-conv p (load (field fp cc)))
+                      reset-cc (and (!= (primitive/cast i64 conv) (primitive/cast i64 0)) (conv-is-reset conv))
                       fparams (cg-param-types cg (load (field fp params)))
                       ret (load (field fp ret))
                       exp (cg-export-find p fname)
@@ -4168,11 +4437,11 @@
                         (if (and (!= (primitive/cast i64 exp) (primitive/cast i64 0)) (not (cg-export-needs-thunk exp)))
                             (load (field exp symbol))
                             (None [(slice u8)]))
-                      llvm-name (match direct-sym (Some [sm] sm) (None [] fname))
+                      llvm-name (if reset-cc "_start" (match direct-sym (Some [sm] sm) (None [] fname)))
                       external
-                        (or (= fname "main")
-                            (or (match direct-sym (Some [sm2] true) (None [] false)) (not anchor)))
-                      conv (cg-prog-conv p (load (field fp cc)))]
+                        (or reset-cc
+                            (or (= fname "main")
+                                (or (match direct-sym (Some [sm2] true) (None [] false)) (not anchor))))]
                   (cg-record-callable cg fname (load (field fp cc)) fparams ret)
                   (if (and (!= (primitive/cast i64 conv) (primitive/cast i64 0)) (conv-is-shim conv))
                       ; :shim lowering -> a `ccc` __impl carrying the body + a `naked` void
@@ -4210,6 +4479,11 @@
                                                      (str->cstr a llvm-name)
                                                      (load (field sig fn_ty)))]
                               (LLVMSetFunctionCallConv fv (primitive/cast i32 cc-id))
+                              (when reset-cc
+                                (LLVMSetSection fv c".text.entry")
+                                (store! (field cg reset_func) fv)
+                                (LLVMAddAttributeAtIndex fv (primitive/cast i32 -1) (cg-enum-attr cg "noinline" 0))
+                                0)
                               (cg-apply-csig-attrs cg sig fv false)
                               (cg-add-csig cg fname sig)
                               (when (not external) (LLVMSetLinkage fv 8) 0)
@@ -4217,6 +4491,11 @@
                             (let [fnty (cg-fn-type cg fparams (box-type a ret))
                                   fv (cg-add-function cg (str->cstr a llvm-name) fnty)]
                               (LLVMSetFunctionCallConv fv (primitive/cast i32 cc-id))
+                              (when reset-cc
+                                (LLVMSetSection fv c".text.entry")
+                                (store! (field cg reset_func) fv)
+                                (LLVMAddAttributeAtIndex fv (primitive/cast i32 -1) (cg-enum-attr cg "noinline" 0))
+                                0)
                               (when (not external) (LLVMSetLinkage fv 8) 0)
                               (cg-add-func cg fname fv))))))
                 (store! i (primitive/iadd (load i) 1)))))
