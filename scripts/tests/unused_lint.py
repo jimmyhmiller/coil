@@ -166,7 +166,7 @@ def main() -> int:
         # 1. OPT-IN. The default profile must leave every dead definition alone.
         default = tmp / "default.coil"
         default.write_text(PROGRAM)
-        run(coil, "lint", str(default), "--fix", "--allow-dirty")
+        run(coil, "lint", str(default), "--fix")
         for gone in MUST_GO:
             check(gone in default.read_text(),
                   f"the DEFAULT lint profile deleted {gone!r}; this rule must stay opt-in")
@@ -178,7 +178,7 @@ def main() -> int:
         lib.write_text(PROGRAM.replace("(export exported-api)\n", "")
                               .replace("(defn main [] (-> i64)", "(defn entry [] (-> i64)"))
         before = lib.read_text()
-        run(coil, "lint", str(lib), "--use", "coil.lint.unused", "--fix", "--allow-dirty")
+        run(coil, "lint", str(lib), "--use", "coil.lint.unused", "--fix")
         after_lib = lib.read_text()
         for kept in MUST_GO_DEFS:
             check(kept in after_lib,
@@ -189,7 +189,7 @@ def main() -> int:
         forced = tmp / "forced.coil"
         forced.write_text(before)
         run(coil, "lint", str(forced), "--use", "coil.lint.unused",
-            "--lint-param", "unused-roots=exports", "--fix", "--allow-dirty")
+            "--lint-param", "unused-roots=exports", "--fix")
         check("(defn only-from-dead" not in forced.read_text(),
               "--lint-param unused-roots=exports did not force the executable reading")
 
@@ -197,7 +197,7 @@ def main() -> int:
         probe = tmp / "probe.coil"
         probe.write_text(PROGRAM)
         result = run(coil, "lint", str(probe), "--use", "coil.lint.unused",
-                     "--fix", "--allow-dirty")
+                     "--fix")
         fixed = probe.read_text()
         for gone in MUST_GO:
             check(gone not in fixed, f"left dead code behind: {gone!r}\n{result.stderr}")
@@ -232,7 +232,7 @@ def main() -> int:
         fields = tmp / "fields.coil"
         fields.write_text(PROGRAM)
         run(coil, "lint", str(fields), "--use", "coil.lint.unused",
-            "--lint-param", "unused-fields=on", "--fix", "--allow-dirty")
+            "--lint-param", "unused-fields=on", "--fix")
         after_fields = fields.read_text()
         for gone in FIELDS_MUST_GO:
             check(gone not in after_fields, f"--lint-param unused-fields=on left {gone!r}")
@@ -265,7 +265,7 @@ def main() -> int:
 """)
         env = {**os.environ, "COIL_NAMESPACE_ROOTS": "src"}
         run(coil, "lint", "src/app.coil", "--use", "coil.lint.unused", "--fix",
-            "--allow-dirty", cwd=proj, env=env)
+            cwd=proj, env=env)
         after = app.read_text()
         check('(import "uprobe.plain" :as plain)' in after,
               "deleted an import whose alias is used as a qualifier")
@@ -304,7 +304,7 @@ source-roots = ["src", "tests"]
 (import "wholeproj" :as w)
 (deftest doubles (assert-eq (w/only-a-test-calls-me 21) 42))
 """)
-        run(coil, "lint", "--use", "coil.lint.unused", "--fix", "--allow-dirty", cwd=wp)
+        run(coil, "lint", "--use", "coil.lint.unused", "--fix", cwd=wp)
         src = (wp / "src/main.coil").read_text()
         check("only-a-test-calls-me" in src,
               "project mode deleted a function whose only caller is a test — and would "

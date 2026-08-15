@@ -1,0 +1,453 @@
+(module coil.test-runner)
+(import "coil.primitive" :as primitive)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.os" :as os)
+(import "coil.args" :as coil.args)
+
+; ============================ the test runner ===============================
+; A `[(prog Code)] -> Code` TRANSFORM. It receives the whole program as modules
+; ((name form…) …) and, for the FIRST module that defines ≥1 `coil-test$…` and has no
+; `main`, APPENDS a `main` that runs each test in a forked child. Registering this
+; transform (by importing this module) is what turns a file of `deftest`s into a
+; runnable test binary — `coil test` just builds+runs it.
+
+;; the name symbol of a `(defn coil-test$… …)` form, else `() (an empty list).
+(defn tr-test-name [(f Code)] (-> Code)
+  (if (and (primitive/code-list? f)
+           (and (>= (primitive/code-count f) (cast i64 2))
+                (and (primitive/code-eq (primitive/code-nth f 0) `defn)
+                     (and (primitive/code-sym? (primitive/code-nth f 1)) (tr-is-test-sym? (primitive/code-nth f 1))))))
+      (primitive/code-nth f 1)
+      `()))
+(defn tr-is-test-sym? [(s Code)] (-> bool)
+  (starts-with (primitive/code-str s) "coil-test$"))
+
+;; count the test defns in a module (its forms are m[1..])
+(defn tr-count [(m Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n)
+      0
+      (primitive/iadd (if (primitive/code-list? (tr-test-name (primitive/code-nth m i))) 0 1)
+                      (tr-count m (primitive/iadd i 1) n))))
+
+;; does the module already define a `main`? (idempotence + respect a user's own main)
+(defn tr-has-main? [(m Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n)
+      false
+      (let [f (primitive/code-nth m i)]
+        (if (and (primitive/code-list? f)
+                 (and (>= (primitive/code-count f) (cast i64 2))
+                      (and (primitive/code-eq (primitive/code-nth f 0) `defn)
+                           (primitive/code-eq (primitive/code-nth f 1) `main))))
+            true
+            (tr-has-main? m (primitive/iadd i 1) n)))))
+
+;; Count tests across every module in a combined project test build.
+(defn tr-all-count [(ms Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n)
+      0
+      (let [m (primitive/code-nth ms i)]
+        (+ (tr-count m 1 (primitive/code-count m))
+           (tr-all-count ms (primitive/iadd i 1) n)))))
+
+;; Calls for one module, using qualified names so a single harness can invoke tests
+;; that retain the imports and private helper definitions of their source module.
+(defn tr-qualified-calls [(m Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      (let [nm (tr-test-name (primitive/code-nth m i))]
+        (if (primitive/code-list? nm)
+            (tr-qualified-calls m (primitive/iadd i 1) n)
+            (let [full (primitive/code-str nm)
+                  disp (subslice [u8] full 10 (slice-len [u8] full))
+                  qname
+                    (primitive/code-symbol (primitive/code-str (primitive/code-nth m 0))
+                                           "."
+                                           (primitive/code-str nm))]
+              `((test-run-one ~disp (coil.primitive/fnptr-of ~qname)) ~@(tr-qualified-calls m (primitive/iadd i 1) n)))))))
+
+(defn tr-all-calls [(ms Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      (let [m (primitive/code-nth ms i)]
+        `(~@(tr-qualified-calls m 1 (primitive/code-count m)) ~@(tr-all-calls ms (primitive/iadd i 1) n)))))
+
+(defn tr-local-calls [(m Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      (let [nm (tr-test-name (primitive/code-nth m i))]
+        (if (primitive/code-list? nm)
+            (tr-local-calls m (primitive/iadd i 1) n)
+            (let [full (primitive/code-str nm)
+                  disp (subslice [u8] full 10 (slice-len [u8] full))]
+              `((test-run-one ~disp (coil.primitive/fnptr-of ~nm)) ~@(tr-local-calls m (primitive/iadd i 1) n)))))))
+
+;; append the synthesized main to a module
+;;
+;; It takes argc/argv and hands them to `coil.args` before running anything. That
+;; is what makes a test binary configurable from its own command line — without
+;; it, `main` is the only place the arguments exist and a library like
+;; `coil.prop` has no way to see them, which is why its knobs used to be
+;; environment variables. Nothing here reads the arguments; it only publishes
+;; them.
+;;
+;; `envp` is main's third C argument. Every test runs in a spawned process
+;; (test-run-one), and posix_spawn wants the child environment explicitly, so the
+;; runner has to keep the one it was started with. Taking it from the C runtime is
+;; portable; reaching for `environ` is a per-platform special case.
+(defn tr-emit-local-main [(m Code)] (-> Code)
+  `(~@m (defn main [(argc i32) (argv (ptr (ptr i8))) (envp (ptr (ptr i8)))] (-> i64)
+          (test-publish-args! argc argv)
+          (test-publish-env! envp)
+          (test-run-begin ~(tr-count m 1 (primitive/code-count m)))
+          ~@(tr-local-calls m 1 (primitive/code-count m))
+          (test-run-end))))
+
+(defn tr-project-harness-module? [(m Code)] (-> bool)
+  (primitive/code-eq (primitive/code-nth m 0) `coil_project_test_harness))
+(defn tr-has-project-harness? [(ms Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n)
+      false
+      (or (tr-project-harness-module? (primitive/code-nth ms i))
+          (tr-has-project-harness? ms (primitive/iadd i 1) n))))
+
+(defn tr-project-mods [(ms Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      (let [m (primitive/code-nth ms i)]
+        (if (tr-project-harness-module? m)
+            `((~@m (defn main [(argc i32) (argv (ptr (ptr i8))) (envp (ptr (ptr i8)))] (-> i64)
+                     (test-publish-args! argc argv)
+                     (test-publish-env! envp)
+                     (test-run-begin ~(tr-all-count ms 0 n))
+                     ~@(tr-all-calls ms 0 n)
+                     (test-run-end))) ~@(tr-project-mods ms (primitive/iadd i 1) n))
+            `(~m ~@(tr-project-mods ms (primitive/iadd i 1) n))))))
+
+;; walk the modules; emit main into the first eligible one (threaded `emitted` flag, so
+;; exactly one main is ever added even if several modules define tests).
+(defn tr-mods [(ms Code) (i i64) (n i64) (emitted bool)] (-> Code)
+  (if (>= i n)
+      `()
+      (let [m (primitive/code-nth ms i)
+            wants
+              (and (not emitted)
+                   (and (> (tr-count m 1 (primitive/code-count m)) (cast i64 0))
+                        (not (tr-has-main? m 1 (primitive/code-count m)))))]
+        (if wants
+            `(~(tr-emit-local-main m) ~@(tr-mods ms (primitive/iadd i 1) n true))
+            `(~m ~@(tr-mods ms (primitive/iadd i 1) n emitted))))))
+
+;; Idempotence is a whole-program property. Looking only at the current candidate
+;; module makes the second fixpoint round skip the module that received `main`, then
+;; add another `main` to the next test module. That never settles when a program
+;; imports several test modules (as project lint's shared graph does).
+(defn tr-any-main? [(ms Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n)
+      false
+      (let [m (primitive/code-nth ms i)]
+        (or (tr-has-main? m 1 (primitive/code-count m))
+            (tr-any-main? ms (primitive/iadd i 1) n)))))
+
+(defn tr-run [(modules Code)] (-> Code)
+  (if (tr-any-main? modules 0 (primitive/code-count modules))
+      `(do ~@modules)
+      (if (tr-has-project-harness? modules 0 (primitive/code-count modules))
+          `(do ~@(tr-project-mods modules 0 (primitive/code-count modules)))
+          `(do ~@(tr-mods modules 0 (primitive/code-count modules) false)))))
+(transform tr-run)
+
+; ============================ runtime (linked into the test binary) =========
+;; Publish the runner's own command line for any library that wants to read it.
+;;
+;; A one-line wrapper rather than a direct `coil.args/args-set!` in the expansion,
+;; because a macro expansion lands in the CALLER's scope: the caller `:use *`s
+;; coil.assert (that is what `coil test` arranges) and knows nothing about
+;; coil.args, so a qualified name there does not resolve.
+(defn test-publish-args! [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (coil.args/args-set! argc argv))
+
+; `next` is the index of the test whose turn it is: the synthesized main calls
+; test-run-one once per test in source order, so the counter names them for the
+; `--coil-test-only` handoff without the transform having to number anything.
+(const TEST-JOBS-CAP 256)
+(defstruct TestJob [(pid i32) (name (slice u8))])
+(defstruct TestState [(total i64) (passed i64) (failed i64) (next i64) (jobs i64) (active i64)])
+(defn test-state [] (-> (ptr TestState))
+  (alloc/static TestState))
+(defn test-jobs [] (-> (ptr (array TestJob 256)))
+  (alloc/static (array TestJob 256)))
+
+(defn test-run-begin [(n i64)] (-> i64)
+  (let [s (test-state)]
+    (store! (field s total) n)
+    (store! (field s passed) 0)
+    (store! (field s failed) 0)
+    (store! (field s next) 0)
+    (store! (field s active) 0)
+    (let [jobs (coil.args/args-int "--jobs" 1)]
+      (when (<= jobs (cast i64 0))
+        (let [w (stderr)] (fmt w "coil test: --jobs needs a positive count\n"))
+        (os/_exit 2)
+        0)
+      (when (> jobs TEST-JOBS-CAP)
+        (let [w (stderr)] (fmt w "coil test: --jobs {d} exceeds this runner's limit of {d}\n" jobs TEST-JOBS-CAP))
+        (os/_exit 2)
+        0)
+      (store! (field s jobs) jobs)))
+  ; A child prints nothing of its own: its whole output is whatever its one test says,
+  ; so the parent's transcript reads as one run rather than N nested ones.
+  (unless (test-child?)
+    (let [w (stdout)] (fmt w "\nrunning {d} test{s}\n" n (if (= n (cast i64 1)) "" "s")))
+    0)
+  0)
+
+;; decode a waitpid status (same encoding driver.coil::wait-code decodes): a terminating
+;; signal in the low 7 bits, else the exit code in the high byte. 0 iff the child ran the
+;; test and exited 0 — any nonzero (a failed assert's SIGABRT, a segfault, a nonzero exit)
+;; is a failure.
+(defn test-wait-code [(st i64)] (-> i64)
+  (let [sig (primitive/iand st 127)]
+    (if (!= sig (cast i64 0)) (primitive/iadd 128 sig) (primitive/iand (primitive/udiv st 256) 255))))
+
+;; ── one process per test, via posix_spawn ────────────────────────────────────
+;; Each test runs in its OWN process so that a failed assert (SIGABRT) or a genuine
+;; crash reports as one failing test instead of ending the run. Threads cannot do this:
+;; both signals are process-wide, so the first failure would take every remaining test
+;; with it, and tests that deliberately abuse memory would corrupt their neighbours.
+;;
+;; The process comes from posix_spawn — the runner RE-EXECS ITSELF with
+;; `--coil-test-only N` — and specifically NOT from fork(). fork() in a process with
+;; more than one thread hands the child an address space whose locks are held by
+;; threads that do not exist in it, and libSystem's own atfork child handler is the
+;; first thing to walk into that:
+;;
+;;   fork -> libSystem_atfork_child -> _notify_fork_child -> _os_alloc_once -> _os_once
+;;        -> _os_once_gate_wait -> _os_once_gate_corruption_abort   (SIGKILL)
+;;   "BUG IN CLIENT OF LIBPLATFORM: os_once_t is corrupt"
+;;
+;; That killed roughly one child per few hundred tests in a project whose test binaries
+;; link a Go c-archive and CoreFoundation — a test binary is multithreaded far more
+;; often than it looks, and none of it is under this runner's control. Retrying such a
+;; child would have papered over it while leaving the other half of the same hazard in
+;; place: a child that inherits a HELD lock deadlocks inside the test instead of dying.
+;; posix_spawn has neither problem, because it builds a fresh process image and runs no
+;; atfork handlers at all.
+;;
+;; The cost is an exec per test rather than a fork: ~2ms for an ordinary test binary,
+;; ~12ms for a fat one that initialises a Go runtime at startup. `coil test --jobs N`
+;; keeps up to N of these isolated child processes active from one compiled runner.
+(extern posix_spawnp :cc c [(ptr i32) (ptr i8) (ptr i8) (ptr i8) (ptr (ptr i8)) (ptr (ptr i8))] (-> i32))
+
+;; Returned instead of a wait code when the spawn itself failed. Negative, so it can
+;; never collide with a real child status (0..255, or 128+signal).
+(const TEST-SPAWN-FAILED -1)
+
+;; The flag that turns this binary into "run exactly one test and exit".
+(const TEST-ONLY-FLAG "--coil-test-only")
+
+;; The environment, captured from `main`'s third argument. posix_spawn takes the child
+;; environment explicitly, and a test that reads an environment knob (coil.prop's, or
+;; anything a CI job sets) must see the one this process was started with. `main` gets
+;; it portably from the C runtime, which beats a per-platform reach for `environ`.
+(defstruct TestEnvBox [(envp (ptr (ptr i8)))])
+(defn test-env-box [] (-> (ptr TestEnvBox))
+  (alloc/static TestEnvBox))
+(defn test-publish-env! [(envp (ptr (ptr i8)))] (-> i64)
+  (store! (field (test-env-box) envp) envp)
+  0)
+
+;; -1 in the parent; the index of the one test to run in a spawned child.
+(defn test-only-index [] (-> i64)
+  (coil.args/args-int TEST-ONLY-FLAG -1))
+(defn test-child? [] (-> bool)
+  (>= (test-only-index) (cast i64 0)))
+
+;; Room for the runner's own arguments plus the two this adds and the NULL terminator.
+;; A test runner's command line is a handful of diagnostic flags; a program that manages
+;; to exceed this is doing something this code should refuse to guess about.
+(const TEST-ARGV-CAP 64)
+(defn test-child-argv [] (-> (ptr (array (ptr i8) 64)))
+  (alloc/static (array (ptr i8) 64)))
+(defn test-index-digits [] (-> (ptr (array u8 24)))
+  (alloc/static (array u8 24)))
+
+;; `n` as a NUL-terminated decimal string in a static buffer. Only ever called with a
+;; test index, so it need not handle negatives.
+(defn test-index-cstr [(n i64)] (-> (ptr i8))
+  (let [buf (primitive/cast (ptr u8) (test-index-digits))
+        (mut v) n
+        (mut len) 0]
+    (loop (do
+            (store! (primitive/index buf (load len))
+                    (primitive/cast u8 (primitive/iadd 48 (primitive/urem (load v) 10))))
+            (store! len (primitive/iadd (load len) 1))
+            (store! v (primitive/udiv (load v) 10))
+            (if (= (load v) (cast i64 0)) (break) 0)))
+    (store! (primitive/index buf (load len)) (primitive/cast u8 0))
+    ; digits came out least-significant first; reverse them in place.
+    (let [(mut i) 0
+          (mut j) (primitive/isub (load len) 1)]
+      (loop (if (>= (load i) (load j))
+                (break)
+                (let [t (load (primitive/index buf (load i)))]
+                  (store! (primitive/index buf (load i)) (load (primitive/index buf (load j))))
+                  (store! (primitive/index buf (load j)) t)
+                  (store! i (primitive/iadd (load i) 1))
+                  (store! j (primitive/isub (load j) 1))))))
+    (primitive/cast (ptr i8) buf)))
+
+;; This binary's own argv, plus `--coil-test-only INDEX`. The child needs the whole
+;; original command line: `coil test` forwards runner flags (`--cases`, `--seed`, …) and
+;; a property test in the child reads them from its own argv.
+;;
+;; The strings are the ones this process was started with. `args-nth` slices point into
+;; that argv block, where each entry is already NUL-terminated, so they are handed
+;; straight to the child with nothing copied.
+(defn test-build-child-argv! [(index i64)] (-> (ptr (ptr i8)))
+  (let [av (primitive/cast (ptr (ptr i8)) (test-child-argv))
+        n (coil.args/args-count)]
+    (when (> (primitive/iadd n 3) TEST-ARGV-CAP)
+      (let [w (stderr)]
+        (fmt w
+             "coil test: cannot spawn a test process: {d} arguments exceeds the {d} this runner carries\n"
+             n
+             TEST-ARGV-CAP))
+      (abort)
+      0)
+    (let [(mut i) 0]
+      (loop (if (>= (load i) n)
+                (break)
+                (do
+                  (store! (primitive/index av (load i))
+                          (primitive/cast (ptr i8) (slice-data [u8] (coil.args/args-nth (load i)))))
+                  (store! i (primitive/iadd (load i) 1)))))
+      (store! (primitive/index av n) (test-literal-cstr TEST-ONLY-FLAG))
+      (store! (primitive/index av (primitive/iadd n 1)) (test-index-cstr index))
+      (store! (primitive/index av (primitive/iadd n 2)) (primitive/cast (ptr i8) 0)))
+    av))
+
+;; `--coil-test-only` as a C string. The literal is already NUL-terminated in the
+;; binary's constant data, so this hands over its bytes without an allocator. Named
+;; test-* like everything else here: `coil test` arranges `:use *` of this module into
+;; the file under test, so a general-sounding name would collide with the user's own.
+(defn test-literal-cstr [(s (slice u8))] (-> (ptr i8))
+  (primitive/cast (ptr i8) (slice-data [u8] s)))
+
+;; Spawn this binary to run test `index`; return its pid, or -1 when spawning fails.
+(defn test-spawn-start [(index i64)] (-> i64)
+  (let [pidp (alloc/stack i32)
+        av (test-build-child-argv! index)
+        rc
+          (posix_spawnp pidp
+                        (load (primitive/index av 0))
+                        (primitive/cast (ptr i8) 0)
+                        (primitive/cast (ptr i8) 0)
+                        av
+                        (load (field (test-env-box) envp)))]
+    (if (!= rc (primitive/cast i32 0))
+        TEST-SPAWN-FAILED
+        (primitive/cast i64 (load pidp)))))
+
+;; Record one finished test and print its verdict.
+(defn test-report! [(name (slice u8)) (code i64)] (-> i64)
+  (let [s (test-state)
+        w (stdout)]
+    (fmt w "test {s} ... " name)
+    (if (= code (cast i64 0))
+        (do (store! (field s passed) (primitive/iadd (load (field s passed)) 1)) (fmt w "ok\n") 0)
+        (do
+          (store! (field s failed) (primitive/iadd (load (field s failed)) 1))
+          (if (= code TEST-SPAWN-FAILED)
+              (fmt w "FAILED (could not start a test process)\n")
+              (if (> code (cast i64 128))
+                  (fmt w "FAILED (signal {d})\n" (primitive/isub code 128))
+                  (fmt w "FAILED\n")))
+          0))))
+
+;; Wait for whichever active child finishes first, report it, and remove its slot.
+;; Waiting for a specific/oldest pid would leave CPUs idle whenever that test is slow
+;; and later children have already completed.
+(defn test-wait-any! [] (-> i64)
+  (let [s (test-state)
+        stp (alloc/stack i32)]
+    (if (= (load (field s active)) (cast i64 0))
+        0
+        (do
+          (store! stp 0)
+          (let [pid (os/waitpid -1 stp 0)
+                n (load (field s active))
+                jobs (primitive/cast (ptr TestJob) (test-jobs))
+                (mut found) -1
+                (mut i) 0]
+            (loop (if (>= (load i) n)
+                      (break)
+                      (do
+                        (when (= (load (field (primitive/index jobs (load i)) pid)) pid)
+                          (store! found (load i))
+                          (break))
+                        (store! i (primitive/iadd (load i) 1)))))
+            (if (< (load found) (cast i64 0))
+                (do
+                  (test-report! "<unknown child>" TEST-SPAWN-FAILED)
+                  (store! (field s active) 0)
+                  0)
+                (do
+                  (let [slot (primitive/index jobs (load found))]
+                    (test-report! (load (field slot name)) (test-wait-code (primitive/cast i64 (load stp)))))
+                  (let [(mut j) (load found)]
+                    (loop (if (>= (primitive/iadd (load j) 1) n)
+                              (break)
+                              (do
+                                (store! (primitive/index jobs (load j))
+                                        (load (primitive/index jobs (primitive/iadd (load j) 1))))
+                                (store! j (primitive/iadd (load j) 1))))))
+                  (store! (field s active) (primitive/isub n 1))
+                  0)))))))
+
+(defn test-enqueue! [(name (slice u8)) (index i64)] (-> i64)
+  (let [s (test-state)]
+    (when (>= (load (field s active)) (load (field s jobs))) (test-wait-any!) 0)
+    (let [pid (test-spawn-start index)]
+      (if (= pid TEST-SPAWN-FAILED)
+          (test-report! name TEST-SPAWN-FAILED)
+          (let [slot (primitive/index (primitive/cast (ptr TestJob) (test-jobs)) (load (field s active)))]
+            (store! (field slot pid) (primitive/cast i32 pid))
+            (store! (field slot name) name)
+            (store! (field s active) (primitive/iadd (load (field s active)) 1)))))
+    0))
+
+;; One call per test, in source order, from the synthesized `main`. In the parent that
+;; means "spawn a process for test i"; in a child it means "run test i if it is mine".
+(defn test-run-one [(name (slice u8)) (fp (fnptr c [] i64))] (-> i64)
+  (let [s (test-state)
+        index (load (field s next))]
+    (store! (field s next) (primitive/iadd index 1))
+    (if (test-child?)
+        ; THE CHILD: run the one test this process exists for, then leave. A failed
+        ; assert aborts before the exit; a crash dies with its own signal. Either way
+        ; the parent reads the outcome from the exit status.
+        (if (= index (test-only-index))
+            (do (primitive/call-ptr fp) (os/_exit 0) 0)
+            0)
+        (test-enqueue! name index))))
+
+(defn test-run-end [] (-> i64)
+  ; Reaching here as a child means `--coil-test-only` named a test that does not exist:
+  ; the child would otherwise exit 0 and be recorded as a test that passed without
+  ; running. Say which index, since that is the whole content of the mistake.
+  (when (test-child?)
+    (let [w (stderr)]
+      (fmt w "coil test: no test with index {d} in this binary\n" (test-only-index)))
+    (os/_exit 2)
+    0)
+  (loop (if (= (load (field (test-state) active)) (cast i64 0)) (break) (test-wait-any!)))
+  (let [s (test-state)
+        w (stdout)
+        p (load (field s passed))
+        f (load (field s failed))]
+    (fmt w "\ntest result: {s}. {d} passed; {d} failed\n" (if (= f (cast i64 0)) "ok" "FAILED") p f)
+    (if (> f (cast i64 0)) 1 0)))

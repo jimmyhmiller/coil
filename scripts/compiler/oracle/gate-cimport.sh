@@ -36,7 +36,7 @@ if "$compiler" lint "$tmp/extern-lint.coil" >"$tmp/lint.out" 2>"$tmp/lint.err"; 
   exit 1
 fi
 grep -qF 'handwritten extern duplicates a C header declaration' "$tmp/lint.err"
-"$compiler" lint "$tmp/extern-lint.coil" --fix --allow-dirty
+"$compiler" lint "$tmp/extern-lint.coil" --fix
 grep -qF '(cimport "tests/compiler/cimport/selective.h" :use [coil_selected_call])' "$tmp/extern-lint.coil"
 "$compiler" dump-load "$tmp/extern-lint.coil" >"$tmp/extern-lint.full"
 grep -Eq '"extern".*"coil_selected_call".*"i32".*"\.\.\."' "$tmp/extern-lint.full"
@@ -50,7 +50,7 @@ if [[ $(uname -s) == Darwin ]]; then
         :header "sys/ioctl.h")
 (defn main [] (-> i64) 0)
 EOF
-  "$compiler" lint "$tmp/ioctl-lint.coil" --fix --allow-dirty
+  "$compiler" lint "$tmp/ioctl-lint.coil" --fix
   grep -qF '(cimport "sys/ioctl.h" :use [ioctl])' "$tmp/ioctl-lint.coil"
   "$compiler" dump-load "$tmp/ioctl-lint.coil" >"$tmp/ioctl-lint.full"
   grep -Eq '"extern".*"ioctl".*"i32".*"u64".*"\.\.\."' "$tmp/ioctl-lint.full"

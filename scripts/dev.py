@@ -301,13 +301,13 @@ def _test_modernize_fast_serial(compiler: str) -> None:
     (primitive/store! x 2)
     (if (primitive/icmp-ge (primitive/load x) 2) 0 1)))
 """)
-        execute(str(candidate), "lint", str(probe), "--fix", "--allow-dirty")
+        execute(str(candidate), "lint", str(probe), "--fix")
         fixed = probe.read_text()
         forbidden = ("primitive/load", "primitive/store!", "primitive/field", "primitive/icmp-")
         if any(token in fixed for token in forbidden):
             raise SystemExit("fast modernization gate: autofix left a legacy core operation")
         before = hashlib.sha256(fixed.encode()).digest()
-        execute(str(candidate), "lint", str(probe), "--fix", "--allow-dirty")
+        execute(str(candidate), "lint", str(probe), "--fix")
         if before != hashlib.sha256(probe.read_bytes()).digest():
             raise SystemExit("fast modernization gate: lint --fix is not idempotent")
 
@@ -316,7 +316,7 @@ def _test_modernize_fast_serial(compiler: str) -> None:
 (defn main [] (-> i64) (iadd missing 1))
 """)
         before = hashlib.sha256(broken.read_bytes()).digest()
-        result = subprocess.run([str(candidate), "lint", str(broken), "--fix", "--allow-dirty"],
+        result = subprocess.run([str(candidate), "lint", str(broken), "--fix"],
                                 cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if result.returncode == 0 or before != hashlib.sha256(broken.read_bytes()).digest():
             raise SystemExit("fast modernization gate: failed fix was not rolled back byte-for-byte")
@@ -337,7 +337,7 @@ source-roots = ["src"]
 (defn broken [] (-> i64) missing)
 """)
         before = hashlib.sha256(project_main.read_bytes()).digest()
-        result = subprocess.run([str(candidate), "lint", "--fix", "--allow-dirty"], cwd=broken_project,
+        result = subprocess.run([str(candidate), "lint", "--fix"], cwd=broken_project,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if result.returncode == 0 or before != hashlib.sha256(project_main.read_bytes()).digest():
             raise SystemExit("fast modernization gate: failed project fix was not rolled back atomically")
@@ -405,13 +405,13 @@ def test_modernize_fast(compiler: str) -> None:
     (primitive/store! x 2)
     (if (primitive/icmp-ge (primitive/load x) 2) 0 1)))
 """)
-            execute(coil, "lint", str(probe), "--fix", "--allow-dirty")
+            execute(coil, "lint", str(probe), "--fix")
             fixed = probe.read_text()
             if any(token in fixed for token in
                    ("primitive/load", "primitive/store!", "primitive/field", "primitive/icmp-")):
                 raise RuntimeError("fast modernization gate: autofix left a legacy core operation")
             before = hashlib.sha256(fixed.encode()).digest()
-            execute(coil, "lint", str(probe), "--fix", "--allow-dirty")
+            execute(coil, "lint", str(probe), "--fix")
             if before != hashlib.sha256(probe.read_bytes()).digest():
                 raise RuntimeError("fast modernization gate: lint --fix is not idempotent")
 
@@ -429,7 +429,7 @@ def test_modernize_fast(compiler: str) -> None:
 (derive-deserialize Inbound)
 (defn main [] (-> i64) 0)
 """)
-            execute(coil, "lint", str(serde_probe), "--fix", "--allow-dirty")
+            execute(coil, "lint", str(serde_probe), "--fix")
             serde_fixed = serde_probe.read_text()
             for legacy in ("derive-serde-sum", "derive-serde", "derive-serialize", "derive-deserialize"):
                 if legacy in serde_fixed:
@@ -445,7 +445,7 @@ def test_modernize_fast(compiler: str) -> None:
         def default_lint_task() -> None:
             probe = tmp / "default-lint.coil"
             probe.write_text((ROOT / "tests/metaprogramming/default_lint_input.coil").read_text())
-            execute(coil, "lint", str(probe), "--fix", "--allow-dirty")
+            execute(coil, "lint", str(probe), "--fix")
             fixed = probe.read_text()
             for legacy in ("primitive/icmp-ge", "match-else (", "(Moved 1 2 3)", "(match value"):
                 if legacy in fixed:
@@ -464,7 +464,7 @@ def test_modernize_fast(compiler: str) -> None:
 (defn main [] (-> i64) (iadd missing 1))
 """)
             before = hashlib.sha256(broken.read_bytes()).digest()
-            result = subprocess.run([coil, "lint", str(broken), "--fix", "--allow-dirty"],
+            result = subprocess.run([coil, "lint", str(broken), "--fix"],
                                     cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if result.returncode == 0 or before != hashlib.sha256(broken.read_bytes()).digest():
                 raise RuntimeError("fast modernization gate: failed fix was not rolled back byte-for-byte")
@@ -486,7 +486,7 @@ source-roots = ["src"]
 (defn broken [] (-> i64) missing)
 """)
             before = hashlib.sha256(main.read_bytes()).digest()
-            result = subprocess.run([coil, "lint", "--fix", "--allow-dirty"], cwd=project,
+            result = subprocess.run([coil, "lint", "--fix"], cwd=project,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if result.returncode == 0 or before != hashlib.sha256(main.read_bytes()).digest():
                 raise RuntimeError("fast modernization gate: failed project fix was not rolled back atomically")

@@ -38,6 +38,18 @@ export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts}"
 export COIL_STRICT_BUNDLE="${COIL_STRICT_BUNDLE:-1}"
 # Stage compilers land in /tmp; give /tmp the toolchain library they resolve against.
 . scripts/compiler/stage-lib.sh
+
+# Each invocation owns its stage artifacts, so overlapping bootstraps cannot
+# replace a compiler while another invocation is executing it.
+RUN_DIR=$(mktemp -d /tmp/coil-rebootstrap.XXXXXX) \
+  || { echo "cannot create bootstrap stage directory"; exit 1; }
+RB1="$RUN_DIR/coil-rb1"
+RL2="$RUN_DIR/coil-rl2"
+RL3="$RUN_DIR/coil-rl3"
+cleanup_run_dir() {
+  rm -rf "$RUN_DIR"
+}
+trap cleanup_run_dir EXIT
 # ---- THE THREE BUILDS --------------------------------------------------------
 #
 #   flavour        script                            LLVM            links
@@ -76,22 +88,22 @@ echo "stage0 = $STAGE0"
 stage0_check "$STAGE0" "$SEED" "$SRC" "${LF[@]}" || exit 1
 
 echo "=== stage1: stage0 builds the self-host compiler (default LLVM backend) ==="
-"$STAGE0"     build "$SRC" -o /tmp/coil-rb1                "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
+"$STAGE0" build "$SRC" -o "$RB1" "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
 
 echo "=== stage2: stage1 rebuilds the compiler ==="
-/tmp/coil-rb1 build "$SRC" -o /tmp/coil-rl2 "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
+"$RB1" build "$SRC" -o "$RL2" "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
 
 echo "=== stage3: stage2 rebuilds the compiler ==="
-/tmp/coil-rl2 build "$SRC" -o /tmp/coil-rl3 "${LF[@]}" || { echo "stage3 FAILED"; exit 1; }
+"$RL2" build "$SRC" -o "$RL3" "${LF[@]}" || { echo "stage3 FAILED"; exit 1; }
 
-cmp /tmp/coil-rl2.o /tmp/coil-rl3.o \
+cmp "$RL2.o" "$RL3.o" \
   || { echo "LLVM FIXPOINT FAIL — LLVM-backend objects differ"; exit 2; }
 echo "  LLVM fixed point: PASS"
 
 DEST="${1:-build/bin/coil}"
 # Install the stage-3 compiler that reproduced stage 2 byte-for-byte.
 mkdir -p "$(dirname "$DEST")"
-cp /tmp/coil-rl3 "$DEST"
+cp "$RL3" "$DEST"
 # Re-sign after copy: macOS invalidates a Mach-O's ad-hoc signature on cp, and the
 # kernel SIGKILLs a mis-signed binary. Re-sign so the installed compiler runs.
 codesign -s - --force "$DEST" >/dev/null 2>&1 || true

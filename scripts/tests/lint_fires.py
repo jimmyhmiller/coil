@@ -38,7 +38,7 @@ def main() -> int:
         probe = pathlib.Path(td) / "probe.coil"
         probe.write_text(PROBE)
         proc = subprocess.run(
-            [args.coil, "lint", str(probe), "--fix", "--allow-dirty"],
+            [args.coil, "lint", str(probe), "--fix"],
             capture_output=True, text=True, timeout=300)
         after = probe.read_text()
 

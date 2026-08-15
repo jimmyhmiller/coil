@@ -930,14 +930,16 @@ every definition's doc, e.g. to enforce that exported functions are documented.
 
 ## Tests, assertions, debug checks
 
-`deftest` and `assert` are a library (`assert.coil`), not compiler features.
-`coil test FILE` loads it for you, discovers every `(deftest …)`, and runs each in a
+`deftest`, `assert`, `assert-eq`, and `assert-ne` are ambient `coil.core` names.
+`deftest` expands to a conventionally named function; the assertions and runner remain
+in the ordinary library module `coil.assert`, not compiler syntax. Its transform
+discovers every `(deftest …)` and runs each in a
 **forked child** — so a failing assertion aborts only its own test and still prints.
 
-    (deftest arithmetic               ; no (module …) needed — an entry file gets
-      (assert-eq (+ 2 2) 4)           ; one synthesized when it has none and
-      (assert (< 1 2))                ; something imports (here, assert.coil,
-      (assert-ne 1 2))                ; which `coil test` loads for you)
+    (deftest arithmetic               ; no import needed
+      (assert-eq (+ 2 2) 4)
+      (assert (< 1 2))
+      (assert-ne 1 2))
 
     coil test mytests.coil            ; exit 0 iff all pass
 
@@ -1083,9 +1085,8 @@ off-path expansion is byte-identical to the unchecked form):
   and changes freed payload pages to `PROT_NONE` while quarantined;
 - a bundled checker warns when a function returns a pointer to a stack local.
 
-`--debug-checks` auto-loads that checker as a metaprogram. Like `coil test`, that
-injects an import into your file, and — like `coil test` — it no longer requires the
-file to declare `(module NAME)`.
+`--debug-checks` auto-loads that checker as a metaprogram by injecting an import into
+your file. The entry file need not declare `(module NAME)`.
 
 `--sanitize=address` marks generated functions for LLVM AddressSanitizer and runs the
 ASan pass over the program object. Sanitized executable links use the Clang beside

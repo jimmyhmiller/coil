@@ -290,9 +290,8 @@ coil lint app.coil --use lint.coil --fix --risky    # also apply `maybe` fixes (
 
 `lint` is a thin sibling of `fmt-cmd` (`driver.coil:1024`); `--use` already exists
 (`driver.coil:570`) and already means "import this metaprogram module without editing
-the source". `--fix` refuses to write to a dirty git tree unless `--allow-dirty`
-(clippy's rule, and a good one: the undo button for an autofix is `git checkout`, so
-insist the button exists).
+the source". `--fix` operates transactionally on the source exactly as it exists when
+invoked; a failed fix round restores those exact starting contents.
 
 ---
 
