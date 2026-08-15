@@ -86,6 +86,8 @@ cat > "$WORK/cabi.coil" <<'KEOF'
 (module cabitest)
 (import "coil.io" :use *)
 (import "coil.control" :use *)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
 
 (defstruct P2 [(a i64) (b i64)])
 (defstruct F2 [(x f64) (y f64)])
@@ -112,7 +114,7 @@ cat > "$WORK/cabi.coil" <<'KEOF'
 (extern c_mix_over   :cc c [f64 f64 f64 f64 f64 f64 f64 i64 i64 i64 i64 i64 i64 MIX] (-> i64))
 
 (defn note! [(fb (ptr i64)) (n i64) (got i64) (want i64)] (-> i64)
-  (unless (icmp-eq got want)
+  (unless (= got want)
           (print-str (stderr) "cabi: check ")
           (print-int (stderr) n)
           (print-str (stderr) " got ")
@@ -120,31 +122,31 @@ cat > "$WORK/cabi.coil" <<'KEOF'
           (print-str (stderr) " want ")
           (print-int (stderr) want)
           (print-str (stderr) "\n")
-          (when (icmp-eq (load fb) 0) (store! fb n) 0)
+          (when (= (load fb) 0) (store! fb n) 0)
           0)
   0)
 
 (defn main [] (-> i64)
   (let [w (stdout)
-        fb (alloc-stack i64)
-        p (alloc-stack P2)
-        q (alloc-stack F2)
-        m (alloc-stack MIX)
-        k (alloc-stack PACK)]
+        fb (alloc/stack i64)
+        p (alloc/stack P2)
+        q (alloc/stack F2)
+        m (alloc/stack MIX)
+        k (alloc/stack PACK)]
     (store! fb 0)
     (store! (field p a) 100) (store! (field p b) 200)
     (store! (field q x) 3.0) (store! (field q y) 5.0)
     (store! (field m x) 2.0) (store! (field m n) 5)
-    (store! (field k a) (cast f32 1.0)) (store! (field k b) (cast f32 2.0)) (store! (field k n) 4)
+    (store! (field k a) (primitive/cast f32 1.0)) (store! (field k b) (primitive/cast f32 2.0)) (store! (field k n) 4)
 
     ; 100 + 200*7 + 7*31 = 100 + 1400 + 217 = 1717
     (note! fb 1 (c_pair_regs (load p) 7) 1717)
     ; 1+4+9+20+35+66 = 135; 100*13 + 200*17 + 7*19 = 1300+3400+133 = 4833 -> 4968
     (note! fb 2 (c_pair_spill 1 2 3 4 5 6 (load p) 7) 4968)
     ; 3 + 5*7 + 2*31 = 3 + 35 + 62 = 100
-    (note! fb 3 (cast i64 (c_f2_regs (load q) 2.0)) 100)
+    (note! fb 3 (primitive/cast i64 (c_f2_regs (load q) 2.0)) 100)
     ; 1+4+9+20+35+66+91 = 226; 3*17 + 5*19 + 2*23 = 51+95+46 = 192 -> 418
-    (note! fb 4 (cast i64 (c_f2_spill 1.0 2.0 3.0 4.0 5.0 6.0 7.0 (load q) 2)) 418)
+    (note! fb 4 (primitive/cast i64 (c_f2_spill 1.0 2.0 3.0 4.0 5.0 6.0 7.0 (load q) 2)) 418)
     ; 2 + 5*7 + 3*31 = 2 + 35 + 93 = 130
     (note! fb 5 (c_mix (load m) 3) 130)
     ; 1 + 2*7 + 4*31 + 2*97 = 1 + 14 + 124 + 194 = 333
@@ -155,11 +157,11 @@ cat > "$WORK/cabi.coil" <<'KEOF'
     (let [r1 (c_p1_ret 5)]
       (note! fb 8 (load (field r1 a)) 15))
     (let [r (c_p2_ret 9)]
-      (note! fb 9 (iadd (load (field r a)) (imul (load (field r b)) 7)) 135))
+      (note! fb 9 (primitive/iadd (load (field r a)) (primitive/imul (load (field r b)) 7)) 135))
     (let [r (c_f2_ret 1.5)]
-      (note! fb 10 (cast i64 (fadd (load (field r x)) (fmul (load (field r y)) 7.0))) 22))
+      (note! fb 10 (primitive/cast i64 (primitive/fadd (load (field r x)) (primitive/fmul (load (field r y)) 7.0))) 22))
     (let [r (c_mix_ret 4.0 6)]
-      (note! fb 11 (iadd (cast i64 (load (field r x))) (imul (load (field r n)) 7)) 46))
+      (note! fb 11 (primitive/iadd (primitive/cast i64 (load (field r x))) (primitive/imul (load (field r n)) 7)) 46))
     ; ---- the register-exhaustion boundary, both sides of it ----
     ; 4 ints leave rdi..rcx used, so P2 fits EXACTLY in r8:r9 -> stays in regs.
     ; 1+4+9+20 = 34; 100*7 + 200*11 = 700+2200 = 2900 -> 2934
@@ -169,12 +171,12 @@ cat > "$WORK/cabi.coil" <<'KEOF'
     (note! fb 14 (c_p2_over 1 2 3 4 5 (load p)) 3769)
     ; 6 doubles leave xmm6:xmm7 free, so F2 fits EXACTLY -> stays in regs.
     ; 1+4+9+20+35+66 = 135; 3*13 + 5*17 = 39+85 = 124 -> 259
-    (note! fb 15 (cast i64 (c_f2_fits 1.0 2.0 3.0 4.0 5.0 6.0 (load q))) 259)
+    (note! fb 15 (primitive/cast i64 (c_f2_fits 1.0 2.0 3.0 4.0 5.0 6.0 (load q))) 259)
     ; 7 doubles + 6 ints: one xmm free, no GPR free -> MIX must go byval.
     ; 2*3 + 5*5 = 6 + 25 = 31
     (note! fb 16 (c_mix_over 1.0 2.0 3.0 4.0 5.0 6.0 7.0 1 2 3 4 5 6 (load m)) 31)
 
-    (if (icmp-eq (load fb) 0)
+    (if (= (load fb) 0)
         (do (print-str w "cabi: all checks passed\n") 0)
         (load fb))))
 KEOF

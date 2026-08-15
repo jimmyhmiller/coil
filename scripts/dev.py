@@ -431,6 +431,12 @@ def test_modernize_fast(compiler: str) -> None:
                     raise RuntimeError(f"fast modernization gate: default lint left {legacy!r}")
             if "(Moved :x 1 :y 2 :at 3)" not in fixed or "try-or!" not in fixed:
                 raise RuntimeError("fast modernization gate: default lint profile did not run every safe fixer")
+            if "(primitive/code-car (primitive/code-cdr xs))" not in fixed:
+                raise RuntimeError("fast modernization gate: safe Code spine rewrites did not run")
+            if "(primitive/code-nth xs 0)" not in fixed:
+                raise RuntimeError("fast modernization gate: vector-compatible positional access was rewritten")
+            if "(primitive/code-null? xs)" not in fixed or "(primitive/code-pair? xs)" not in fixed:
+                raise RuntimeError("fast modernization gate: Code list predicates were not simplified")
             execute(coil, "fmt", "--write", str(probe))
             formatted = probe.read_text()
             if not all(part in formatted for part in ("(Moved\n", ":x 1\n", ":y 2\n", ":at 3)")):

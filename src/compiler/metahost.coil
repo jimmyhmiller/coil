@@ -214,18 +214,26 @@
 ; EVERY code op. After the first few ops each depth's list has capacity and the whole
 ; arg-passing path is allocation-free. `al-clear!` keeps that capacity.
 ;
-; Depths beyond the pool fall back to a fresh list, so nesting deeper than POOL just
-; loses the optimization rather than misbehaving.
-(defstruct ArgPool [(depth i64) (slots (array (ptr (ArrayList CtVal)) 64))])
+; The syntax expander deliberately permits 4096 nested rewrite levels. A 64-slot
+; pool made every callback below that boundary allocate a fresh malloc-backed list,
+; while pop merely decremented depth; realistic generated syntax therefore leaked
+; millions of tiny lists during one invocation. Keep a bounded margin above the
+; language limit so all valid nesting reuses its per-depth list.
+(defstruct ArgPool [(depth i64) (slots (array (ptr (ArrayList CtVal)) 65536))])
 (defn arg-pool [] (-> (ptr ArgPool))
   (alloc/static ArgPool))
 (defn mh-arg-new [] (-> (ptr i8))
   (let [p (arg-pool)
         d (load (field p depth))]
-    (if (>= d (primitive/cast i64 64))
-        (do
+    (if (>= d (primitive/cast i64 65536))
+        (let [cx (load (field (meta-host-box) cx))
+              a (load (field cx a))]
+          ; The exceptional depth remains bounded by the current invocation.
+          ; Pop cannot individually recover these lists, so allocating them from
+          ; malloc would leak until process exit; the invocation arena releases
+          ; them all together when the metaprogram returns.
           (store! (field p depth) (primitive/iadd d 1))
-          (primitive/cast (ptr i8) (box-al [CtVal] (malloc-allocator) (al-new [CtVal] (malloc-allocator)))))
+          (primitive/cast (ptr i8) (box-al [CtVal] a (al-new [CtVal] a))))
         (let [sp (primitive/index (field p slots) d)]
           (if (= (primitive/cast i64 (load sp)) (primitive/cast i64 0))
               (store! sp (box-al [CtVal] (malloc-allocator) (al-new [CtVal] (malloc-allocator))))
@@ -289,30 +297,54 @@
             (do (mh-bug "quote registry index out of range") (primitive/cast (ptr i8) 0))
             (primitive/cast (ptr i8) (al-get [(ptr Sexp)] (load reg) k))))))
 
-; ---- quasiquote builder (a boxed ArrayList Sexp) --------------------------------
+; ---- quasiquote builder -----------------------------------------------------------
+; Keep the final splice as a persistent tail. The overwhelmingly common recursive
+; list builder is `(~head ~@tail)`; copying `tail` here made every such walker O(n²)
+; even after Code itself gained pairs.
+(defstruct MhQQ
+  [(items (ptr (ArrayList Sexp)))
+   (tail (ptr Sexp))
+   (has-tail bool)])
 (defn mh-qq-new [] (-> (ptr i8))
   (mh-count!)
-  (let [a (mh-allocator)] (primitive/cast (ptr i8) (box-al [Sexp] a (al-new [Sexp] a)))))
+  (let [a (mh-allocator)
+        q (unwrap-ptr [MhQQ] (create [MhQQ] a))]
+    (store! (field q items) (box-al [Sexp] a (al-new [Sexp] a)))
+    (store! (field q tail) (primitive/zeroed (ptr Sexp)))
+    (store! (field q has-tail) false)
+    (primitive/cast (ptr i8) q)))
+(defn mh-qq-append-code! [(q (ptr MhQQ)) (s Sexp)] (-> i64)
+  (let [items (sx-items s) n (sx-len items) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+            (do (al-push! [Sexp] (load (field q items)) (sx-at items (load i)))
+                (store! i (primitive/iadd (load i) 1))))))
+  0)
+(defn mh-qq-flush-tail! [(q (ptr MhQQ))] (-> i64)
+  (when (load (field q has-tail))
+    (mh-qq-append-code! q (load (load (field q tail))))
+    (store! (field q tail) (primitive/zeroed (ptr Sexp)))
+    (store! (field q has-tail) false)
+    0)
+  0)
 (defn mh-qq-push [(b (ptr i8)) (c (ptr i8))] (-> (ptr i8))
   (mh-count!)
-  (let [count (field (meta-host-box) qq-pushes)]
+  (let [count (field (meta-host-box) qq-pushes)
+        q (primitive/cast (ptr MhQQ) b)]
     (store! count (primitive/iadd (load count) 1))
-    (al-push! [Sexp] (primitive/cast (ptr (ArrayList Sexp)) b) (mh-handle-sexp c))
+    (mh-qq-flush-tail! q)
+    (al-push! [Sexp] (load (field q items)) (mh-handle-sexp c))
     b))
 (defn mh-qq-splice [(b (ptr i8)) (c (ptr i8))] (-> (ptr i8))
   (mh-count!)
   (let [s (mh-handle-sexp c)
-        tg (sx-tag s)]
+        tg (sx-tag s)
+        q (primitive/cast (ptr MhQQ) b)]
     (if (not (or (= tg (primitive/cast i64 6)) (= tg (primitive/cast i64 7))))
         (do (mh-halt (derr "comptime: ~@ splice expects a Code list")) b)
-        (let [items (sx-items s)
-              n (sx-len items)
-              (mut i) 0]
-          (loop (if (>= (load i) n)
-                    (break)
-                    (do
-                      (al-push! [Sexp] (primitive/cast (ptr (ArrayList Sexp)) b) (sx-at items (load i)))
-                      (store! i (primitive/iadd (load i) 1)))))
+        (do
+          (mh-qq-flush-tail! q)
+          (store! (field q tail) (primitive/cast (ptr Sexp) c))
+          (store! (field q has-tail) true)
           b))))
 ; The head-qualification half of the interpreter's qualify-head. The "head is a
 ; LITERAL symbol in the template" guard is decided at LOWER time (metalower emits
@@ -333,13 +365,39 @@
                           (None [] 0)
                           (Some [q] (do (store! (field hp kind) (KSym q)) 0)))))))))))))
 (defn mh-qq-list [(b (ptr i8))] (-> (ptr i8))
-  (mh-box-sexp (sx-mklist (primitive/cast (ptr (ArrayList Sexp)) b))))
+  (let [q (primitive/cast (ptr MhQQ) b)
+        a (mh-allocator)
+        items (load (field q items))
+        n (al-len [Sexp] (load items))
+        (mut out) (if (load (field q has-tail))
+                      (load (load (field q tail)))
+                      (mk-sexp (KNil) -1 -1))
+        (mut i) (primitive/isub n 1)]
+    ; A vector splice cannot be the cdr of a list; materialize it exactly as the
+    ; old builder did. A list splice remains the exact shared tail.
+    (when (and (load (field q has-tail))
+               (= (sx-tag (load out)) (primitive/cast i64 7)))
+      (mh-qq-flush-tail! q)
+      (store! out (mk-sexp (KNil) -1 -1))
+      (store! i (primitive/isub (al-len [Sexp] (load items)) 1))
+      0)
+    (loop (if (< (load i) 0) (break)
+            (let [pair (unwrap-ptr [SexpPair] (create [SexpPair] a))]
+              (store! (field pair head) (al-get [Sexp] (load items) (load i)))
+              (store! (field pair tail) (load out))
+              (store! (field pair owner) a)
+              (store! (field pair flat) (primitive/zeroed (ptr (ArrayList Sexp))))
+              (store! out (mk-sexp (KPair pair) -1 -1))
+              (store! i (primitive/isub (load i) 1)))))
+    (mh-box-sexp (load out))))
 (defn mh-qq-listq [(b (ptr i8))] (-> (ptr i8))
   (do
-    (mh-qualify-head! (primitive/cast (ptr (ArrayList Sexp)) b))
-    (mh-box-sexp (sx-mklist (primitive/cast (ptr (ArrayList Sexp)) b)))))
+    (mh-qualify-head! (load (field (primitive/cast (ptr MhQQ) b) items)))
+    (mh-qq-list b)))
 (defn mh-qq-vec [(b (ptr i8))] (-> (ptr i8))
-  (mh-box-sexp (mk-sexp (KVec (primitive/cast (ptr (ArrayList Sexp)) b)) -1 -1)))
+  (let [q (primitive/cast (ptr MhQQ) b)]
+    (mh-qq-flush-tail! q)
+    (mh-box-sexp (mk-sexp (KVec (load (field q items))) -1 -1))))
 
 ; ---- unquote conversions: EXACTLY ctval->sexp's scalar arms ---------------------
 (defn mh-unq-int [(v i64)] (-> (ptr i8))
