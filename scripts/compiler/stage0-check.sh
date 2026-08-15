@@ -18,7 +18,11 @@
 stage0_check() {
   local stage0="$1" seed="$2" src="$3"; shift 3
   local out
-  out=$("$stage0" check "$src" "$@" 2>&1)
+  # Stage 0 necessarily carries yesterday's bundled-module manifest. Let this
+  # one compatibility probe discover newly added source-tree namespaces; the
+  # compiler it produces embeds today's manifest and all later stages run with
+  # strict bundle checking again.
+  out=$(COIL_STRICT_BUNDLE=0 "$stage0" check "$src" "$@" 2>&1)
   [ $? -eq 0 ] && return 0
 
   echo "stage0 cannot compile the current source tree." >&2

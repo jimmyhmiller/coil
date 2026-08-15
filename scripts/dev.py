@@ -64,6 +64,18 @@ def install_library(prefix: Path) -> Path:
     shutil.rmtree(previous, ignore_errors=True)
 
     shutil.copy2(ROOT / "src" / "compiler" / "prelude.coil", libdir / "prelude.coil")
+    # `coil.jit` is an optional source-linked compiler SDK. Keep its implementation
+    # out of stdlib/ so ordinary programs never discover or link compiler modules.
+    sdk_staged = libdir / "compiler.incoming"
+    shutil.rmtree(sdk_staged, ignore_errors=True)
+    shutil.copytree(ROOT / "src" / "compiler", sdk_staged)
+    sdk_live = libdir / "compiler"
+    sdk_previous = libdir / "compiler.previous"
+    shutil.rmtree(sdk_previous, ignore_errors=True)
+    if sdk_live.exists():
+        sdk_live.rename(sdk_previous)
+    sdk_staged.rename(sdk_live)
+    shutil.rmtree(sdk_previous, ignore_errors=True)
     return libdir
 
 

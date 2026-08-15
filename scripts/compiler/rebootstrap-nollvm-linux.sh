@@ -65,7 +65,7 @@ fi
 stage0_check "$STAGE0" "$SEED" "$SRC" "${S1FLAGS[@]}" || exit 1
 
 echo "=== stage1: stage0 builds the LLVM-free compiler ==="
-"$STAGE0"     build "$SRC" -o /tmp/coil-nlx1 "${S1FLAGS[@]}"  || { echo "stage1 FAILED"; exit 1; }
+COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o /tmp/coil-nlx1 "${S1FLAGS[@]}" || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it with the x64 backend ==="
 /tmp/coil-nlx1 build "$SRC" -o /tmp/coil-nlx2                 || { echo "stage2 FAILED"; exit 1; }
 echo "=== stage3: stage2 rebuilds it with the x64 backend ==="

@@ -58,11 +58,20 @@ def main() -> int:
     if not os.access(compiler, os.X_OK):
         raise SystemExit(f"no coil at {compiler}")
     preamble, sections = split_sections(script.read_text())
+    # The coil.jit contract compiles the entire source-linked compiler SDK into a
+    # user application. Running that memory-heavy proof beside every other CLI
+    # worker can make unrelated project builds fail under host memory pressure.
+    # It remains a normal gate section, but runs after the parallel lightweight set.
+    heavy = [s for s in sections if s.startswith('echo "== coil.jit:')]
+    parallel = [s for s in sections if not s.startswith('echo "== coil.jit:')]
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs()) as pool:
         results = list(pool.map(
             lambda item: run_one(item[0], preamble, item[1], compiler, root),
-            enumerate(sections),
+            enumerate(parallel),
         ))
+    base = len(results)
+    results.extend(run_one(base + i, preamble, section, compiler, root)
+                   for i, section in enumerate(heavy))
     failed = False
     for _, returncode, output in sorted(results):
         sys.stdout.buffer.write(output)

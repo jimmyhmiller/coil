@@ -88,7 +88,7 @@ echo "stage0 = $STAGE0"
 stage0_check "$STAGE0" "$SEED" "$SRC" "${LF[@]}" || exit 1
 
 echo "=== stage1: stage0 builds the self-host compiler (default LLVM backend) ==="
-"$STAGE0" build "$SRC" -o "$RB1" "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
+COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o "$RB1" "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
 
 echo "=== stage2: stage1 rebuilds the compiler ==="
 "$RB1" build "$SRC" -o "$RL2" "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }

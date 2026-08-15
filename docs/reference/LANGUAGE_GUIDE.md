@@ -50,6 +50,30 @@ commands are `:type EXPR`, `:load NAMESPACE`, `:defs`, `:reset`, `:cancel`,
 `:help`, and `:quit`. Definitions and failed evaluations are transactional;
 successful `alloc-static` storage survives later evaluations and reloads.
 
+The same engine is available to applications through the optional `coil.jit`
+standard-library module. It is an in-process, source-linked compiler SDK—there is
+no subprocess protocol. Importing it pulls the compiler into that program's
+reachable module graph; programs that do not import it link none of the SDK.
+
+    (import "coil.alloc" :use [malloc-allocator])
+    (import "coil.jit" :use *)
+
+    (let [(mut session) (jit-session-new (malloc-allocator))]
+      (jit-submit! (mut session) "(defn twice [(x i64)] (-> i64) (* x 2))")
+      (jit-submit! (mut session) "(twice 10)"))
+
+`jit-session-new` locates the matching installed toolchain through `coil` on
+`PATH`; `jit-session-new-with-toolchain` accepts an explicit compiler command.
+`jit-submit!` returns zero after a successful transactional submission and one
+after rendering a diagnostic. `jit-source` exposes accumulated successful
+definitions and `jit-reset!` starts a fresh state lineage. `coil.jit.reload` is
+the public metaprogram implementing stable typed function bindings.
+
+Currently the execution backend is `arm64-macho`: native ARM64 code emitted by
+Coil's non-LLVM backend and loaded directly on macOS. The SDK does not use LLVM.
+The metaprogram and public session API are backend-neutral, but other hosts need
+their corresponding in-memory object loader before `coil.jit` can execute there.
+
     [package]
     name  = "app"
     entry = "main.coil"      # default src/main.coil
@@ -1188,7 +1212,8 @@ unknown shape — see `docs/design/SERDE.md`), `coil.http.parser`
 `request` buffers the body, `request-stream` delivers it to a `BodySink` as it arrives, and
 `request-stream-cancellable` accepts a `coil.cancellation/Cancellation` token whose pipe
 wakes an otherwise idle transfer),
-`coil.assert` (assert/deftest), `coil.prop` (property-based testing: `defprop`,
+`coil.jit` (optional source-linked in-process compiler/JIT), `coil.assert`
+(assert/deftest), `coil.prop` (property-based testing: `defprop`,
 the `Arbitrary` trait, tape-based shrinking — see above), `coil.dbgalloc`, `coil.guardalloc`, `coil.crash`,
 `coil.debug-runtime`, `coil.checked-ffi`, and `coil.stacklint`, plus `coil.os`,
 `coil.time`, `coil.selectors`, `coil.subprocess`,

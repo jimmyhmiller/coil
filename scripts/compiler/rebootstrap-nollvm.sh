@@ -50,7 +50,7 @@ echo "stage0 = $STAGE0"
 stage0_check "$STAGE0" "$SEED" "$SRC" || exit 1
 
 echo "=== stage1: stage0 builds the LLVM-free compiler ==="
-"$STAGE0"     build "$SRC" -o /tmp/coil-nl1                 || { echo "stage1 FAILED"; exit 1; }
+COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o /tmp/coil-nl1 || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it with --backend arm64 ==="
 /tmp/coil-nl1 build "$SRC" -o /tmp/coil-nl2 --backend arm64 || { echo "stage2 FAILED"; exit 1; }
 echo "=== stage3: stage2 rebuilds it with --backend arm64 ==="

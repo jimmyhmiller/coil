@@ -52,7 +52,7 @@ echo "stage0 = $STAGE0   (libLLVM: $libdir)"
 stage0_check "$STAGE0" "$SEED" "$SRC" "${LF[@]}" || exit 1
 
 echo "=== stage1: stage0 builds the self-host compiler ==="
-"$STAGE0"        build "$SRC" -o /tmp/coil-lrb1 "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
+COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o /tmp/coil-lrb1 "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it ==="
 /tmp/coil-lrb1   build "$SRC" -o /tmp/coil-lrb2 "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
 echo "=== stage3: stage2 rebuilds it ==="

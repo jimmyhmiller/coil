@@ -87,6 +87,7 @@ cp "$COIL" "$T/real-bin/coil-real"
 # A compiler carries no library, so a copy of one needs a prefix to sit in: for a
 # binary in $T/real-bin that is $T/lib/coil (loader.coil walks up from the executable).
 ln -sfn "$PWD/src/stdlib" "$T/lib/coil/stdlib"
+ln -sfn "$PWD/src/compiler" "$T/lib/coil/compiler"
 ln -sfn "$PWD/src/compiler/prelude.coil" "$T/lib/coil/prelude.coil"
 ln -s "$T/real-bin/coil-real" "$T/path-bin/coil"
 cp tests/http_client_compile.coil "$T/http.coil"
@@ -2532,9 +2533,9 @@ mkdir -p "$T/bundle"
 expect_rc 0 "install: dev.py install lays down a compiler and its library together" \
   python3 scripts/dev.py install --source "$COIL" --dest "$T/prefix/bin/coil"
 INSTALLED="$T/prefix/bin/coil"
-[ -d "$T/prefix/lib/coil/stdlib" ] && [ -f "$T/prefix/lib/coil/prelude.coil" ] \
-  && ok "install: the prefix holds lib/coil/stdlib and lib/coil/prelude.coil" \
-  || bad "install: the prefix holds lib/coil/stdlib and lib/coil/prelude.coil" "missing"
+[ -d "$T/prefix/lib/coil/stdlib" ] && [ -d "$T/prefix/lib/coil/compiler" ] && [ -f "$T/prefix/lib/coil/prelude.coil" ] \
+  && ok "install: the prefix holds stdlib, opt-in compiler SDK, and prelude" \
+  || bad "install: the prefix holds stdlib, opt-in compiler SDK, and prelude" "missing"
 expect_out "installed:" \
   "install: --version says the library came from an install" \
   bash -c 'cd / && "$1" --version' _ "$INSTALLED"
@@ -2560,6 +2561,11 @@ fi
   while read -r ns; do
     [ -n "$ns" ] || continue
     [ "$ns" = "coil.core" ] && continue
+    # coil.jit is deliberately source-linked compiler SDK and has its own
+    # installed-toolchain execution gate below. Pulling it into this aggregate
+    # namespace smoke would compile the entire compiler twice in parallel.
+    [ "$ns" = "coil.jit" ] && continue
+    [ "$ns" = "coil.jit.reload" ] && continue
     i=$((i + 1))
     echo "(import \"$ns\" :as ns$i)"
   done < "$T/bundle/ns.txt"
@@ -2597,13 +2603,15 @@ expect_out "missing from the bundled stdlib manifest" \
 # used to answer with a library from whenever it was built, and the only symptom was
 # that editing src/stdlib changed nothing. There is no environment variable to
 # redirect the search, so these are the only two outcomes.
-mkdir -p "$T/lonely"
-cp "$COIL" "$T/lonely/coil"
+LONELY=$(mktemp -d)
+cp "$COIL" "$LONELY/coil"
+cp "$T/bundle/allns.coil" "$LONELY/allns.coil"
 expect_rc 1 "layout: a compiler with no library beside it fails instead of guessing" \
-  bash -c 'cd "$1" && "$1/coil" check ../bundle/allns.coil' _ "$T/lonely"
+  bash -c 'cd "$1" && "$1/coil" check allns.coil' _ "$LONELY"
 expect_out "cannot find the coil standard library" \
   "layout: the error says the library is missing, and where it looked" \
-  bash -c 'cd "$1" && "$1/coil" check ../bundle/allns.coil 2>&1' _ "$T/lonely"
+  bash -c 'cd "$1" && "$1/coil" check allns.coil 2>&1' _ "$LONELY"
+rm -rf "$LONELY"
 # The other layout, built explicitly rather than assumed of $COIL: a compiler under a
 # directory that holds src/stdlib and src/compiler belongs to that checkout. (The
 # bootstrap runs its stages out of /tmp, so $COIL itself is not always in one.)
@@ -2981,7 +2989,36 @@ expect_rc 0 "qual: Serialize/Deserialize derive on a sum reached through an :as 
   _ "$T/qual" "$COIL"
 
 if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
+  echo "== coil.jit: installed, source-linked userland SDK =="
+  mkdir -p "$T/jit-sdk"
+  python3 scripts/dev.py install --source "$COIL" --dest "$T/jit-prefix/bin/coil" >/dev/null 2>&1
+  INSTALLED="$T/jit-prefix/bin/coil"
+  cp src/examples/jit_sdk.coil "$T/jit-sdk/main.coil"
+  if (cd "$T/jit-sdk" && "$INSTALLED" build main.coil --backend arm64 -o app >/dev/null 2>&1); then
+    sdk_out=$(cd "$T/jit-sdk" && PATH="$T/jit-prefix/bin:$PATH" ./app 2>&1)
+    case "$sdk_out" in
+      *$'20\n30'*) ok "coil.jit embeds an installed compiler and hot reloads from userland" ;;
+      *) bad "coil.jit embeds an installed compiler and hot reloads from userland" "$sdk_out" ;;
+    esac
+    sdk_syms=$(nm "$T/jit-sdk/app" 2>/dev/null)
+    case "$sdk_syms" in
+      *repl-session-new*) ok "coil.jit import links the compiler SDK" ;;
+      *) bad "coil.jit import links the compiler SDK" "missing SDK symbol" ;;
+    esac
+  else
+    bad "coil.jit userland application builds from the installed toolchain" "build failed"
+  fi
+  printf '(module plain)\n(defn main [] (-> i64) 0)\n' > "$T/jit-sdk/plain.coil"
+  (cd "$T/jit-sdk" && "$INSTALLED" emit-obj plain.coil --backend arm64 -o plain.o >/dev/null 2>&1)
+  plain_syms=$(nm "$T/jit-sdk/plain.o" 2>/dev/null)
+  case "$plain_syms" in
+    *repl-session-new*) bad "ordinary programs do not link the compiler SDK" "unexpected SDK symbol" ;;
+    *) ok "ordinary programs do not link the compiler SDK" ;;
+  esac
+
   echo "== repl: multiline, reload, persistent state, and transactions =="
+  python3 scripts/dev.py install --source "$COIL" --dest "$T/repl-prefix/bin/coil" >/dev/null 2>&1
+  REPL_COIL="$T/repl-prefix/bin/coil"
   repl_out=$(printf '%s\n' \
     '(defn next [] (-> i64)' \
     '  (let [p (primitive/alloc-static i64)' \
@@ -2998,7 +3035,7 @@ if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
     '(defn twice [(x f64)] (-> f64) (* x 4.0))' \
     '(next)' \
     '(four-times 10)' \
-    ':q' | "$COIL" repl 2>&1)
+    ':q' | "$REPL_COIL" repl 2>&1)
   case "$repl_out" in
     *$'1\n40\n2\n90\n3\n90'*) ok "repl preserves state, reloads dependent calls, and rejects incompatible replacement" ;;
     *) bad "repl preserves state, reloads dependent calls, and rejects incompatible replacement" "$repl_out" ;;

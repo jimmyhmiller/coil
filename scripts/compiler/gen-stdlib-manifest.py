@@ -32,6 +32,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 STDLIB = ROOT / "src" / "stdlib"
+SDK = ROOT / "src" / "compiler"
 PRELUDE = ROOT / "src" / "compiler" / "prelude.coil"
 TARGET = ROOT / "src" / "compiler" / "stdlib_manifest.coil"
 
@@ -90,6 +91,24 @@ def collect() -> list[tuple[str, str]]:
     return sorted(out.items())
 
 
+def collect_sdk() -> list[tuple[str, str]]:
+    """Compiler implementation modules shipped for opt-in source linking."""
+    out: dict[str, str] = {}
+    for path in sorted(SDK.rglob("*.coil")):
+        # Host-specific replacement with the same logical namespace.
+        if path.name == "metashim_wasm.coil":
+            continue
+        name = declared_module(path.read_text())
+        if name is None:
+            continue
+        # Standalone compiler utilities occasionally reuse a generic module name
+        # such as `app`; they are shipped as include assets but are not imported by
+        # the SDK facade. Keep the first namespace mapping deterministically.
+        if name not in out:
+            out[name] = path.relative_to(SDK).as_posix()
+    return sorted(out.items())
+
+
 def public_namespaces(entries: list[tuple[str, str]]) -> list[str]:
     """What `coil namespaces` should print.
 
@@ -103,7 +122,7 @@ def public_namespaces(entries: list[tuple[str, str]]) -> list[str]:
     return sorted([core] + [ns for ns, _ in entries if ns not in INTERNAL_NAMESPACES])
 
 
-def render(entries: list[tuple[str, str]]) -> str:
+def render(entries: list[tuple[str, str]], sdk_entries: list[tuple[str, str]]) -> str:
     public = public_namespaces(entries)
     lines: list[str] = []
     add = lines.append
@@ -127,6 +146,21 @@ def render(entries: list[tuple[str, str]]) -> str:
     add("; library or from the project being compiled.")
     add("(defn stdlib-manifest-file? [(name (slice u8))] (-> bool)")
     body = [f'(= name "{fn}") true' for fn in sorted(fn for _, fn in entries)]
+    add("  (cond " + "\n        ".join(body))
+    add("        false))")
+    add("")
+    add("; Compiler SDK modules live beside, but not inside, the ordinary stdlib.")
+    add("; They enter a program's module graph only through an explicit coil.jit import.")
+    add("(defn sdk-file-for-namespace [(name (slice u8))] (-> (slice u8))")
+    body = [f'(= name "{ns}") "compiler/{fn}"' for ns, fn in sdk_entries]
+    add("  (cond " + "\n        ".join(body))
+    add('        ""))')
+    add("")
+    add("(defn sdk-manifest-file? [(name (slice u8))] (-> bool)")
+    sdk_files = sorted(
+        p.relative_to(SDK).as_posix() for p in SDK.rglob("*.coil")
+    )
+    body = [f'(= name "compiler/{fn}") true' for fn in sdk_files]
     add("  (cond " + "\n        ".join(body))
     add("        false))")
     add("")
@@ -162,7 +196,7 @@ def main() -> int:
         return 0
 
     current = TARGET.read_text()
-    updated = splice(current, render(collect()))
+    updated = splice(current, render(collect(), collect_sdk()))
 
     if current == updated:
         if args.check:
