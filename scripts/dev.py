@@ -512,6 +512,7 @@ source-roots = ["src"]
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o0", "-O0"),
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o3", "-O3"),
             aggregate_ir_task,
+            lambda: build_run("tests/compiler/features/void_if_discarded.coil", "void-if-discarded"),
             lambda: build_run("src/examples/bitfields.coil", "static-assert", "--backend", "arm64", want=42),
             lint_task,
             default_lint_task,

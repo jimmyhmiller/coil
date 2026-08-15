@@ -223,7 +223,7 @@ n=$(echo "$out" | grep -c "not formatted")
 expect_rc 2 "fmt on a directory is an error"             "$COIL" fmt "$T"
 
 echo "== per-subcommand help =="
-for c in build run fmt new emit-ir; do
+for c in build run install fmt new emit-ir; do
   expect_out "usage: coil $c" "$c --help"                "$COIL" "$c" --help
 done
 
@@ -246,6 +246,24 @@ fi
 [ -x "$T/proj/elsewhere" ] && ok "project -o is honored" || bad "project -o" "not written"
 ( cd "$T/proj" && "$COIL" build --target not-a-real-triple >/dev/null 2>&1 )
 [ $? = 1 ] && ok "project bogus --target is rejected" || bad "project bogus --target" "want rc=1"
+
+mkdir -p "$T/install-root"
+out=$( cd "$T/proj" && "$COIL" install --root "$T/install-root" 2>&1 ); rc=$?
+[ "$rc" = 0 ] && [ -x "$T/install-root/bin/proj" ] \
+  && ok "install builds the package into the requested user-wide root" \
+  || bad "install --root" "rc=$rc output=$out"
+"$T/install-root/bin/proj" >/dev/null 2>&1; [ $? = 3 ] \
+  && ok "the installed package executable runs" \
+  || bad "installed executable" "want rc=3"
+case "$out" in
+  *"installed proj -> $T/install-root/bin/proj"*) ok "install reports the installed command path" ;;
+  *) bad "install report" "got: $out" ;;
+esac
+rm -rf "$T/install-root"
+( cd "$T/proj" && COIL_INSTALL_ROOT="$T/install-root" "$COIL" install >/dev/null 2>&1 )
+[ -x "$T/install-root/bin/proj" ] \
+  && ok "COIL_INSTALL_ROOT selects the install prefix" \
+  || bad "COIL_INSTALL_ROOT" "missing $T/install-root/bin/proj"
 
 echo "== Coil.toml dependencies and strict manifest errors =="
 # Dependency roots participate in the namespace index; Git dependencies are checked
@@ -1672,6 +1690,32 @@ cat > "$T/noimp.coil" <<'EOF'
 EOF
 expect_rc 0  "coil test: an all-passing suite (no import needed) exits 0" "$COIL" test "$T/noimp.coil"
 expect_out "2 passed; 0 failed" "coil test: reports the pass count"       "$COIL" test "$T/noimp.coil"
+expect_out "running 1 test" "coil test --filter: selects by test-name substring" \
+  "$COIL" test "$T/noimp.coil" --filter '^not-a-pattern$' --filter a
+expect_out "1 passed; 0 failed" "coil test --filter: repeated filters combine by OR without counting omissions" \
+  "$COIL" test "$T/noimp.coil" --filter no-match --filter b
+filtered_list=$("$COIL" test "$T/noimp.coil" --list --filter b 2>&1); filtered_list_rc=$?
+filtered_names=$(printf '%s\n' "$filtered_list" | sed '/^ld: warning:/d')
+case "$filtered_names" in
+  b) [ "$filtered_list_rc" = 0 ] \
+       && ok "coil test --list --filter: lists the selected test names only" \
+       || bad "coil test --list --filter" "want rc=0 got rc=$filtered_list_rc" ;;
+  *) bad "coil test --list --filter" "want exactly b, got: $filtered_names" ;;
+esac
+expect_rc 1 "coil test --filter: an empty selected set is not green" \
+  "$COIL" test "$T/noimp.coil" --filter no-such-test
+expect_out "0 tests matched" "coil test --filter: an empty selected set is clear" \
+  "$COIL" test "$T/noimp.coil" --filter no-such-test
+expect_rc 2 "coil test --filter: a missing substring is rejected" \
+  "$COIL" test "$T/noimp.coil" --filter
+cat > "$T/filter-prop.coil" <<'EOF'
+(module filter_prop)
+(import "coil.prop" :use *)
+(deftest example-smoke 0)
+(defprop property-smoke [(x i64)] (= x x))
+EOF
+expect_out '^property-smoke$' "coil test --filter: defprop names participate in the same discovery filter" \
+  "$COIL" test "$T/filter-prop.coil" --list --filter property
 cat > "$T/redf.coil" <<'EOF'
 (module m)
 (deftest willfail (assert-eq (+ 2 2) 5))
@@ -2172,6 +2216,42 @@ else
   echo "  (skip: no /usr/bin/time for the gen-10 perf probe)"
 fi
 
+echo "== focused guide lookup =="
+expect_out '^  tests[[:space:]]+deftest' "guide: no argument prints the compact topic index" "$COIL" guide
+expect_out '^## Tests, assertions, debug checks' "guide: canonical topic prints only its section" "$COIL" guide tests
+expect_out 'defstruct Point' "guide: a topic alias resolves to its canonical section" "$COIL" guide struct
+expect_out 'primitive/zeroed T' "guide: search returns a contextual excerpt" "$COIL" guide --search zeroed
+expect_out 'primitive/cast i64 f' "guide: multiword search tolerates ordinary word endings" "$COIL" guide --search "f64 conversion"
+expect_out '^  structs —' "guide: broad concept search ranks the focused structs topic first" \
+  "$COIL" guide --search "array struct field match"
+expect_out '^  test-suites —' "guide: project-test vocabulary routes to test-suites" \
+  "$COIL" guide --search "test roots suffixes import project module"
+expect_out '^  match —' "guide: enum/variant vocabulary routes to match" \
+  "$COIL" guide --search "defsum match enum"
+expect_out '^  memory —' "guide: mutability vocabulary routes to memory" \
+  "$COIL" guide --search "mutable parameter mut function"
+expect_out '^## Structs' "guide: multiple direct topics print the first requested section" \
+  "$COIL" guide structs match
+expect_out '^## Sum types' "guide: multiple direct topics print subsequent sections" \
+  "$COIL" guide structs match
+combined_float=$("$COIL" guide types floats 2>&1)
+combined_number_headings=$(printf '%s\n' "$combined_float" | awk '/^## Numbers, bool, casts$/ { n++ } END { print n+0 }')
+[ "$combined_number_headings" = 1 ] \
+  && ok "guide: combined topics deduplicate shared source fragments" \
+  || bad "guide: combined topics deduplicate shared source fragments" "Numbers section appeared $combined_number_headings times"
+expect_rc 1 "guide: at most three direct topics are accepted" "$COIL" guide tests modules structs match
+guide_all=$("$COIL" guide --all 2>&1); guide_all_rc=$?
+case "$guide_all" in
+  '# The Coil Language'*)
+    [ "$guide_all_rc" = 0 ] \
+      && ok "guide: --all preserves the complete reference" \
+      || bad "guide: --all preserves the complete reference" "want rc=0 got rc=$guide_all_rc" ;;
+  *) bad "guide: --all preserves the complete reference" "output did not begin with the guide title" ;;
+esac
+expect_rc 1 "guide: an unknown topic is rejected instead of ignored" "$COIL" guide testt
+expect_out 'Closest topics:' "guide: an unknown topic suggests alternatives" "$COIL" guide testt
+expect_rc 1 "guide: --search requires a query" "$COIL" guide --search
+
 echo "== doc comments (;;): coil doc + the code-doc comptime op =="
 # A `;;` block DIRECTLY above a definition is its documentation; a single `;` is an
 # ordinary comment and must NOT become docs. Both the `doc` subcommand and the
@@ -2195,6 +2275,15 @@ expect_rc  0 "doc: exits 0 on a documented module"          "$COIL" doc "$T/docs
 expect_out '^coil\.arraylist$' "namespaces: lists bundled namespaces" "$COIL" namespaces
 expect_out '^## helper ' "namespace: lists undocumented definitions too" "$COIL" namespace "$T/docs/m.coil"
 expect_out '^# coil\.arraylist' "namespace: resolves a bundled namespace globally" "$COIL" namespace coil.arraylist
+expect_out '^## fadd ' "namespace: --name returns one exact definition" "$COIL" namespace coil.primitive --name fadd
+expect_out '^## fadd ' "namespace: --search filters definitions" "$COIL" namespace coil.primitive --search fadd
+namespace_broad=$("$COIL" namespace coil.primitive --search defprimitive 2>&1)
+namespace_broad_count=$(printf '%s\n' "$namespace_broad" | awk '/^## / { n++ } END { print n+0 }')
+[ "$namespace_broad_count" = 10 ] \
+  && ok "namespace: broad search is bounded to ten definitions" \
+  || bad "namespace: broad search is bounded to ten definitions" "want 10 results, got $namespace_broad_count"
+expect_rc 1 "namespace: --name rejects a missing definition" "$COIL" namespace coil.primitive --name no-such-primitive
+expect_rc 1 "namespace: malformed filters are rejected" "$COIL" namespace coil.primitive --search
 expect_out '^# shapes'          "doc: prints the module name"           "$COIL" doc "$T/docs/m.coil"
 expect_out 'Add two numbers together.' "doc: prints a fn doc"           "$COIL" doc "$T/docs/m.coil"
 expect_out 'Returns their sum.'        "doc: joins a multi-line doc"    "$COIL" doc "$T/docs/m.coil"

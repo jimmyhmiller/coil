@@ -14,6 +14,8 @@ inside it, so `coil` and every `(import "…")` below work from any directory.
 
     coil run   file.coil                 # build + run a single file
     coil build file.coil -o out          # build a native executable
+    coil install                         # install this package to ~/.local/bin
+    coil install --root DIR              # install to DIR/bin instead
     coil build file.coil --target wasm32-unknown-unknown -o out.wasm
     coil run                             # build+run the ./Coil.toml project
     coil test                            # discover and run project test suites
@@ -944,6 +946,17 @@ gives a forked child locks whose owning threads do not exist in it.
       (assert-ne 1 2))
 
     coil test mytests.coil            ; exit 0 iff all pass
+    coil test mytests.coil --filter arithmetic
+                                       ; run names containing "arithmetic"
+    coil test mytests.coil --filter fast --filter smoke
+                                       ; repeatable filters combine by OR
+    coil test mytests.coil --list --filter arithmetic
+                                       ; list that same selected set, run nothing
+
+Name filters apply after `deftest` and `defprop` discovery and before test processes
+are spawned. A filtered-out test is neither run nor counted as passing; an invocation
+whose filters match no tests reports `0 tests matched` and exits nonzero. The positional
+selector remains exclusively a project path/suite selector.
 
 Inside a project, `coil test FILE` inherits `Coil.toml`, including `[cc]`, `[link]`,
 dependencies, and the configured target. With no file, Coil discovers every test file
