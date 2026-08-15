@@ -1634,22 +1634,33 @@ cat > "$T/asseq.coil" <<'EOF'
 EOF
 expect_out "assertion failed: \(\+ 40 1\) == 99" "assert-eq prints BOTH expressions" "$COIL" run "$T/asseq.coil"
 
-echo "== deftest + the test transform: discovery, fork isolation, exit code (tool-12) =="
-# A file of (deftest …) with NO main: importing assert.coil registers a (transform …) that
-# DISCOVERS every coil-test$… and synthesizes a forking main. FAILS on the seed (assert.coil
-# not bundled -> the import errors).
+echo "== deftest + the test transform: discovery, process isolation, exit code (tool-12) =="
+# A file of (deftest …) with NO main. `coil test` loads coil.test-runner, whose
+# (transform …) DISCOVERS every coil-test$… and synthesizes a main that runs each in
+# its own process. FAILS on the seed ('unknown command test').
+#
+# These drove `coil run` until the runner moved out of assert.coil: the fixture
+# imported coil.assert, and importing it used to register the transform. It no longer
+# does — deliberately, see prelude.coil — so `coil run` on a test file has no entry
+# point at all, which is the LAST check in this block rather than the first four.
+# (The old spelling also had a check that could not fail: `expect_rc 1 "a suite with a
+# failing test exits 1"` stayed green off the BUILD's exit 1 after the transform was
+# gone, reporting a suite result for a suite that never ran.)
 cat > "$T/suite.coil" <<'EOF'
 (module m)
-(import "coil.assert" :use *)
 (deftest passes (assert-eq (* 6 7) 42))
 (deftest fails  (assert-eq (+ 1 1) 3))
 (deftest tail   (assert (> 5 0)))
 EOF
-expect_out "running 3 tests"       "the transform discovers every test"                    "$COIL" run "$T/suite.coil"
-expect_out "test passes \.\.\. ok" "a passing test reports ok"                             "$COIL" run "$T/suite.coil"
-expect_out "test tail \.\.\. ok"   "the suite continues past a failing test (fork isolation)" "$COIL" run "$T/suite.coil"
-expect_out "1 failed"              "the summary counts the failure"                        "$COIL" run "$T/suite.coil"
-expect_rc 1  "a suite with a failing test exits 1"                                         "$COIL" run "$T/suite.coil"
+expect_out "running 3 tests"       "the transform discovers every test"                       "$COIL" test "$T/suite.coil"
+expect_out "test passes \.\.\. ok" "a passing test reports ok"                                "$COIL" test "$T/suite.coil"
+expect_out "test tail \.\.\. ok"   "the suite continues past a failing test (process isolation)" "$COIL" test "$T/suite.coil"
+expect_out "1 failed"              "the summary counts the failure"                           "$COIL" test "$T/suite.coil"
+expect_rc 1  "a suite with a failing test exits 1"                                            "$COIL" test "$T/suite.coil"
+# The runner is opt-in, so `coil run` on this file cannot link — and an undefined
+# `_main` names neither the file, the tests in it, nor the command that runs them.
+expect_out "defines 3 test\(s\) and no .main." "building a test file says so, not the linker" "$COIL" run "$T/suite.coil"
+expect_out "coil test .*suite.coil"          "…and names the command that runs them"          "$COIL" run "$T/suite.coil"
 
 echo "== coil test: the project test runner (tool-12) =="
 # `coil test FILE` auto-loads assert.coil (--use), so a test file needs NO import at all,
