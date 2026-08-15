@@ -933,8 +933,10 @@ every definition's doc, e.g. to enforce that exported functions are documented.
 `deftest`, `assert`, `assert-eq`, and `assert-ne` are ambient `coil.core` names.
 `deftest` expands to a conventionally named function; the assertions and runner remain
 in the ordinary library module `coil.assert`, not compiler syntax. Its transform
-discovers every `(deftest …)` and runs each in a
-**forked child** — so a failing assertion aborts only its own test and still prints.
+discovers every `(deftest …)` and runs each in its **own process** — so a failing
+assertion aborts only its own test and still prints. The process is spawned, not
+forked: a test binary that links a threaded runtime (a Go c-archive, CoreFoundation)
+gives a forked child locks whose owning threads do not exist in it.
 
     (deftest arithmetic               ; no import needed
       (assert-eq (+ 2 2) 4)
@@ -1031,8 +1033,8 @@ of the argument types. A bug behind a four-byte magic value — unreachable by
 sampling — is found in tens of thousands of cases.
 
 A property that **crashes or hangs** is minimized too, not just one that returns
-false: generation runs in a forked child, the runner bisects to the case that
-killed it, and shrinks with each candidate in its own child. Knobs, all optional:
+false: generation runs in a spawned worker process, the runner bisects to the case
+that killed it, and shrinks with each candidate in its own process. Knobs, all optional:
 `--cases` (200), `--seed` (derived from the property name, so runs
 are reproducible), `--size`, `--shrink`, `--timeout` (60s),
 `--target-steps`, `--verbose`, `--no-fork`. Design and prior art:

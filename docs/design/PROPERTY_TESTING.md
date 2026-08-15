@@ -34,7 +34,8 @@ The proposal, in one line:
 
 > **A typed choice tape with a span tree, driven by monomorphized `Arbitrary`
 > impls, shrunk by a greedy shortlex fixpoint over spans, with the property body
-> run in-process at ~10⁶ cases/sec and forked only when a case crashes.**
+> run in-process at ~10⁶ cases/sec and moved to its own process only when a case
+> crashes.**
 
 ---
 
@@ -222,7 +223,7 @@ most of what users perceive as "quality".
 | Generation API | **Both** a monomorphized `Arbitrary` trait *and* first-class `Gen` values | Trait = zero-boilerplate defaults + user override; `Gen` = per-value control (proptest's lesson) |
 | Shrinking API | Internal by default; `Shrink` trait as an opt-in *polish* pass | Answers falsify's "no user control" critique without making shrinkers mandatory |
 | Derivation | Comptime reflection (`code-field-*`, `code-variant-*`), plus a bridge from `coil.serde/Deserialize` | `derive.coil` already proves the pattern; serde gives us corpus interop for free |
-| Execution | In-process, arena-per-case; **fork only when a case dies from a signal** | ~10⁶ cases/sec; still shrinks segfaults, which no in-process tool can |
+| Execution | In-process, arena-per-case; **a spawned worker only when a case dies from a signal** | ~10⁶ cases/sec; still shrinks segfaults, which no in-process tool can |
 | Integration | `defprop` expands to the same `coil-test$…` shape `assert.coil` already discovers | Zero new tooling; `coil test` just works |
 
 ---
@@ -539,13 +540,14 @@ and it is exactly what in-process tools cannot minimize.
 **As built**, and it is simpler and stronger than the sketch this paragraph
 originally carried:
 
-1. **Every property's generation phase runs in one forked child.** One fork per
-   property (~100µs) — not per case — so the happy path is untouched. The child
+1. **Every property's generation phase runs in one worker process.** One process
+   per property — not per case — so the happy path is untouched. The worker
    reports through its exit status alone: `0` all passed, `2` an ordinary
-   counterexample, *killed* a crash.
+   counterexample, `3` the worker could not do what it was asked, *killed* a
+   crash.
 2. **A crash is located by bisection.** The parent binary-searches the case count,
-   running prefix `[0, k)` in a fresh child per probe and asking whether that
-   prefix survives — `log₂(cases)` forks, eight for a default run. No per-case
+   running prefix `[0, k)` in a fresh worker per probe and asking whether that
+   prefix survives — `log₂(cases)` spawns, eight for a default run. No per-case
    bookkeeping, no shared memory, no syscall in the inner loop. This works
    because a case's input is a function of `(seed, index)` once the whole prefix
    has been drawn, which is exactly what the tape guarantees.
@@ -553,24 +555,50 @@ originally carried:
    function with a mode argument, and `PROP-MODE-DRAW` draws the arguments and
    stops. Generation is pure; only the body crashes. So the parent can hold the
    crashing input in its own memory without ever being at risk from it.
-4. **Shrinking forks per candidate**, and "still failing" means *died from the
+4. **Shrinking spawns per candidate**, and "still failing" means *died from the
    same signal*, not merely "died". A reducer that accepts any crash cheerfully
    minimizes one bug into a different one; requiring the signal to match is the
    cheapest guard against that slippage.
-5. **A hang is a crash.** The child arms `alarm(--timeout)` (60s by
+5. **A hang is a crash.** The worker arms `alarm(--timeout)` (60s by
    default), so an infinite loop arrives as SIGALRM and flows through the same
    bisect-and-minimize path. Reported as "the property NEVER FINISHED on this
    input", because printing "signal 14" makes the reader look up something the
    runner already knew.
 6. **The budget scales with what a candidate costs.** In-process ~100ns, so
-   20 000 candidates are free; forked ~100µs, so a thousand; timed-out *seconds*,
-   so sixty-four. With a hang, a small input quickly beats the smallest input
-   eventually.
+   20 000 candidates are free; a candidate that needs its own process costs an
+   exec (~2ms, more for a binary that starts a language runtime), so two hundred;
+   timed-out *seconds*, so sixty-four. With a hang, a small input quickly beats
+   the smallest input eventually.
 
 Verified end to end: a property that segfaults above 10 minimizes to `a = 10`; a
 property that loops forever above 10 minimizes to `a = 12` within its watchdog
-budget. `--no-fork=1` opts out for debugger sessions, trading crash
+budget. `--no-fork` opts out for debugger sessions, trading crash
 minimization for a live backtrace.
+
+**Every one of those processes is EXEC'd, not forked** (`scripts/tests/prop_spawn.py`
+is the gate). A worker is the runner's own binary started again with hidden flags —
+`--coil-prop-child NAME` plus `--coil-prop-cases N` or `--coil-prop-replay PATH` —
+carrying the parent's whole command line so both processes read the same `--seed`,
+`--cases` and `--db`, and so `coil test`'s own `--coil-test-only N` still selects the
+one test the worker exists for.
+
+The reason is nesting. `coil test` already runs each test in its own process, so a
+property's children are the children of a process that is not the runner and whose
+threads are not under the runner's control: a linked Go c-archive, CoreFoundation, a
+sanitizer runtime. `fork` hands such a child an address space whose locks are held by
+threads that do not exist in it, and the child deadlocks on its first call into the
+runtime that owns one (or, on macOS, is SIGKILLed by libSystem's atfork handler
+before it gets that far). The watchdog then turns that deadlock into
+`TIMED OUT ... on case 0` — the tool inventing a bug in a property that is perfectly
+true, with a "reproduction" that reproduces nothing.
+
+What an exec costs is shared memory: a worker inherits no Source, no tape, no
+statistics, so everything it needs is on its command line or in the tape database.
+That is affordable precisely because of point 2 — generation is deterministic in
+`(seed, index)`, so "run cases `[0, N)`" fully describes a phase, and a shrink
+candidate is a tape, so it travels as a file (`.coil/pbt/<property>/candidate-<pid>`).
+The measured cost against the fork it replaced is ~0.2ms per property on an ordinary
+test binary.
 
 ### 5.6 User-controlled shrinking (the override story)
 
@@ -794,7 +822,7 @@ Where the time goes, and what we do about it:
 | Dynamic dispatch | None. `Arbitrary` is monomorphized to direct calls; `Gen` combinators inline at -O3. No vtables on the hot path (`dyn` only in the reporting layer). |
 | Allocation | One **arena per case**, reset (pointer rewind) between cases, never freed piecemeal. `alloc.coil`'s `arena-allocator` already exists. A generated `ArrayList` costs a bump, not a `malloc`. |
 | Tape growth | `ArrayList<Choice>` grown once to the high-water mark of the previous case and reused; steady state does zero allocation. |
-| Process overhead | Zero forks on the happy path (contrast: proptest's `fork` feature, one process per case). Fork only for crash shrinking (§5.5). |
+| Process overhead | One spawned worker per property, not per case (contrast: proptest's `fork` feature, one process per case). A process per candidate only for crash shrinking (§5.5). |
 | Spans | Two `u32` writes per span open/close; span table reused across cases. Recording spans on *passing* cases is the only tax the shrinker imposes, and it is ~2ns. |
 | Shrinking | The expensive phase, but it runs at most once per failing property. Candidate cache (hash-set of tape hashes) prevents re-execution; adaptive deletion keeps the pass count logarithmic in structure size. |
 | Parallelism | Splittable RNG (`splitmix64` seed → per-worker streams) means N workers explore disjoint, reproducible streams. Each worker owns its `Source`, arena, and tape — no shared mutable state, no locks. `thread.coil` exists. |
@@ -921,7 +949,7 @@ phase ordering, edge-case pools, `assume` with exhaustion reporting, `classify`/
 resampling.
 
 **Phase 3 — the differentiators.**
-Crash shrinking via fork, swarm testing, `Shrink` polish trait, the
+Crash shrinking in a separate process, swarm testing, `Shrink` polish trait, the
 `Deserialize`→`Arbitrary` bridge and corpus import/export, stateful/model-based
 properties, parallel workers.
 
@@ -984,7 +1012,7 @@ this system automates.
    compares float choices by their *bit* distance from origin, which needs the
    documented memory round-trip bitcast idiom rather than `cast`.
 7. **Deadlines/hangs.** Detecting a hung case in-process needs `SIGALRM` +
-   `signals.coil`; confirm the interaction with the forked-child model.
+   `signals.coil`; confirm the interaction with the worker-process model.
 
 ---
 
@@ -1000,7 +1028,7 @@ Every module lives in `src/stdlib/`; a user imports exactly one namespace,
 | `prop_arbitrary.coil` | `coil.prop.arbitrary` | the `Arbitrary` trait, scalar/collection/string impls |
 | `prop_show.coil` | `coil.prop.show` | `PropShow` — how a counterexample prints |
 | `prop_shrink.coil` | `coil.prop.shrink` | the shrink passes and the greedy fixpoint |
-| `prop_runner.coil` | `coil.prop.runner` | phases, fork isolation, crash/timeout minimization, statistics, targeted search |
+| `prop_runner.coil` | `coil.prop.runner` | phases, process isolation, crash/timeout minimization, statistics, targeted search |
 | `prop_db.coil` | `coil.prop.db` | the failure database: versioned tape encoding, `.coil/pbt/` |
 | `prop_derive.coil` | `coil.prop.derive` | `(derive-arbitrary T)` / `(derive-show T)` by comptime reflection |
 | `prop_gen.coil` | `coil.prop.gen` | first-class generator values and combinators |

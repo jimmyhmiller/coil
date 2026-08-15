@@ -64,7 +64,9 @@
    (prop (fnptr c [(ptr Source) i64] bool))
    (size i64)
    (crash-code i64)  ; 128+signal when shrinking a crash, -1 otherwise
-   (cand-timeout i64)])  ; seconds allowed to one forked shrink candidate
+   (cand-timeout i64)  ; seconds allowed to one spawned shrink candidate
+   (name (slice u8))  ; the property, to select it in a spawned worker
+   (cand-path (slice u8))])  ; where a candidate tape is handed over, "" if unused
 
 (defn prop-config [(name (slice u8))] (-> PropConfig)
   (let [c (primitive/alloc-stack PropConfig)]
@@ -470,7 +472,7 @@
                      (cov-total)
                      (cov-guards)
                      (cov-dict-count))
-                
+
                 0)
               0)
           (load failed)))))
@@ -707,21 +709,59 @@
                 0)))
     0))
 
-; --------------------------------------------------------------- child running
+; -------------------------------------------------------------- worker running
 ;
-; Every property runs its generation phase in a FORKED CHILD. One fork per
-; property is nothing (~100µs), and it buys the thing no in-process property
-; testing library has: when a case does not merely return false but SEGFAULTS,
-; the run survives to minimize it. In a systems language that is not an exotic
-; case — it is the most valuable class of bug the tool can find.
+; Every property phase that runs the property BODY outside this process runs it in
+; a process that was EXEC'D, not forked: the runner starts its own binary again
+; with hidden flags saying which property to run and what to do with it. That is
+; what buys the thing no in-process property testing library has — when a case does
+; not merely return false but SEGFAULTS, the run survives to minimize it — and in a
+; systems language that is not an exotic case, it is the most valuable class of bug
+; the tool can find.
 ;
-; The child reports through its exit status alone:
+; It used to fork, which is far cheaper (~100µs against ~2-12ms) and wrong. `fork`
+; in a process that has THREADS hands the child an address space whose locks are
+; held by threads that do not exist in it; the child then deadlocks on its first
+; call into whatever owns one — a linked Go c-archive, CoreFoundation, a sanitizer
+; runtime, anything the program under test started — or is SIGKILLed outright by
+; libSystem's atfork handler on macOS. The failure is especially cruel HERE, because
+; the watchdog below turns that deadlock into a `TIMED OUT on case 0` report against
+; a property that is perfectly true: the tool invents a bug in the user's code out
+; of its own process handling. `coil test` hit the same hazard first and now spawns
+; a process per test (coil.os::spawn); a property is the NESTED case — a fork inside
+; a test process — and needs the same answer for the same reason.
+;
+; What an exec costs is shared memory: a worker inherits no Source, no tape, no
+; statistics. Everything it needs is therefore either on its command line or in the
+; tape database, which is what the flags below are for. Generation is deterministic
+; in (seed, case index), so "run cases [0, N)" fully describes a generation phase; a
+; shrink candidate is a tape, so it travels as a file.
+;
+; The worker reports through its exit status alone:
 ;   0        every case passed
 ;   2        some case returned false (an ordinary counterexample)
+;   3        the worker could not do what it was asked (see CHILD-BROKEN)
 ;   killed   a case crashed; the signal is the diagnosis
 
 (const CHILD-OK 0)
 (const CHILD-FAILED 2)
+;; The worker ran nothing — it could not read the tape it was pointed at. Distinct
+;; from CHILD-FAILED because the property said NOTHING: a broken hand-off must not
+;; be read as a case that held, nor as one that failed.
+(const CHILD-BROKEN 3)
+;; Returned instead of a wait code when the spawn itself failed. Negative, so it can
+;; never collide with a real status (0..255, or 128+signal).
+(const CHILD-SPAWN-FAILED -1)
+
+; The hidden flags that select a worker. Deliberately absent from `coil test
+; --help`: they are a protocol between a runner and its own children, not a user
+; interface, and every one of them is meaningless without the others.
+(const PROP-CHILD-FLAG "--coil-prop-child")  ; the property this process is for
+(const PROP-CASES-FLAG "--coil-prop-cases")  ; run cases [0, N)
+(const PROP-REPLAY-FLAG "--coil-prop-replay")  ; replay the tape at this path
+(const PROP-SIZE-FLAG "--coil-prop-size")  ; the size to replay at
+(const PROP-ALARM-FLAG "--coil-prop-alarm")  ; watchdog seconds; 0 disables it
+(const PROP-REPORT-FLAG "--coil-prop-report")  ; print the success report
 
 ;; A watchdog for the child. An infinite loop in a property is a bug the tool
 ;; should REPORT, not a reason for `coil test` to hang until someone notices;
@@ -740,56 +780,224 @@
   (let [sig (primitive/iand status 127)]
     (if (!= sig 0) (primitive/iadd 128 sig) (primitive/iand (primitive/udiv status 256) 255))))
 
-;; Run cases [0, limit) in a forked child and return the child's wait code
-;; (0 / 2 / 128+signal). -1 means the fork itself failed.
-(defn fork-run-cases [(s (ptr Source))
-                      (prop (fnptr c [(ptr Source) i64] bool))
-                      (cfg PropConfig)
-                      (st (ptr PropStats))
-                      (name (slice u8))
-                      (limit i64)
-                      (report-stats bool)] (-> i64)
-  (let [pid (primitive/cast i64 (os/fork))]
+; ── the worker command line ──────────────────────────────────────────────────
+;
+; A worker's argv is THIS process's argv plus the flags that say what it is for.
+; Carrying the whole original command line is not tidiness: `--cases`, `--seed`,
+; `--size`, `--db` and the rest are read from argv by parent and worker alike, and
+; a worker that regenerated cases under different settings would be bisecting a
+; different run. It also carries `coil test`'s own `--coil-test-only N`, which is
+; what makes the new process run THIS test and no other.
+;
+; The storage is static and rebuilt per spawn: an argv must stay alive across the
+; spawn call, spawns never overlap (the runner waits for each worker), and a
+; property that is already reporting a crash is the last place to want an allocator.
+
+(const PROP-ARGV-CAP 64)  ; argv entries, including argv[0] and the NULL
+(const PROP-ARGV-BYTES 1024)  ; scratch for the flags this adds
+
+(defstruct PropArgv [(n i64) (used i64)])
+(defn prop-argv-state [] (-> (ptr PropArgv))
+  (primitive/alloc-static PropArgv))
+(defn prop-argv-slots [] (-> (ptr (array (ptr i8) 64)))
+  (primitive/alloc-static (array (ptr i8) 64)))
+(defn prop-argv-scratch [] (-> (ptr (array u8 1024)))
+  (primitive/alloc-static (array u8 1024)))
+
+;; Refusing to spawn beats spawning a TRUNCATED command line: a worker missing its
+;; `--coil-prop-cases` would run the whole property again and report a nonsense
+;; verdict to a parent that is in the middle of bisecting a crash.
+(defn prop-argv-overflow [(what (slice u8)) (limit i64)] (-> i64)
+  (let [w (stderr)]
+    (fmt w "coil prop: cannot spawn a worker: more than {d} {s} on this command line\n" limit what))
+  (abort)
+  0)
+
+;; Append one already-NUL-terminated argument.
+(defn prop-argv-push! [(p (ptr i8))] (-> i64)
+  (let [st (prop-argv-state)
+        av (primitive/cast (ptr (ptr i8)) (prop-argv-slots))
+        n (load (field st n))]
+    (if (>= n PROP-ARGV-CAP) (prop-argv-overflow "arguments" PROP-ARGV-CAP) 0)
+    (store! (primitive/index av n) p)
+    (store! (field st n) (primitive/iadd n 1))
+    0))
+
+;; Copy `s` into the scratch as a C string. The strings that come from argv are
+;; already NUL-terminated in place and are handed over uncopied; these are the ones
+;; this runner builds (a property name, a path, a number).
+(defn prop-argv-cstr [(s (slice u8))] (-> (ptr i8))
+  (let [st (prop-argv-state)
+        buf (primitive/cast (ptr u8) (prop-argv-scratch))
+        at (load (field st used))
+        n (slice-len [u8] s)]
+    (if (> (primitive/iadd (primitive/iadd at n) 1) PROP-ARGV-BYTES)
+        (prop-argv-overflow "argument bytes" PROP-ARGV-BYTES)
+        0)
+    (let [(mut i) 0]
+      (loop (if (>= (load i) n)
+                (break)
+                (do
+                  (store! (primitive/index buf (primitive/iadd at (load i))) (slice-get [u8] s (load i)))
+                  (store! i (primitive/iadd (load i) 1))))))
+    (store! (primitive/index buf (primitive/iadd at n)) (primitive/cast u8 0))
+    (store! (field st used) (primitive/iadd (primitive/iadd at n) 1))
+    (primitive/cast (ptr i8) (primitive/index buf at))))
+
+;; Start a fresh worker command line: this process's own argv, and nothing yet.
+(defn prop-argv-begin! [] (-> i64)
+  (let [st (prop-argv-state)
+        n (args-count)
+        (mut i) 0]
+    (store! (field st n) 0)
+    (store! (field st used) 0)
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (prop-argv-push! (primitive/cast (ptr i8) (slice-data [u8] (args-nth (load i)))))
+                (store! i (primitive/iadd (load i) 1)))))
+    0))
+
+(defn prop-argv-flag! [(flag (slice u8)) (value (slice u8))] (-> i64)
+  (prop-argv-push! (prop-argv-cstr flag))
+  (prop-argv-push! (prop-argv-cstr value)))
+
+(defn prop-argv-int! [(flag (slice u8)) (v i64)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut sb) (str/sb-new a)]
+    (str/sb-push-i64! (mut sb) v)
+    (let [s (str/sb-finish! (mut sb))]
+      (prop-argv-flag! flag s)
+      (db-free-bytes a s)
+      0)))
+
+;; Terminate the command line and hand it back for `os/spawn`.
+(defn prop-argv-finish! [] (-> (ptr (ptr i8)))
+  (prop-argv-push! (primitive/cast (ptr i8) 0))
+  (primitive/cast (ptr (ptr i8)) (prop-argv-slots)))
+
+;; Start a worker and wait for it; return its wait code (0 / 2 / 3 / 128+signal), or
+;; CHILD-SPAWN-FAILED. argv[0] is the name this process was started as, so a runner
+;; re-execs itself the same way `coil test` does.
+(defn prop-spawn-wait [(av (ptr (ptr i8)))] (-> i64)
+  (let [pid (os/spawn (load (primitive/index av 0)) av (os/spawn-envp))]
     (if (< pid 0)
-        -1
-        (if (= pid 0)
-            (let [_alarm (alarm (primitive/cast u32 (args-int "--timeout" 60)))
-                  bad (run-cases s prop cfg st limit)]
-              ; `_exit`, not `exit`: no atexit handlers, no flushing of a stream
-              ; the parent also holds. Both branches end the process, so nothing
-              ; below this runs.
-              (if (>= bad 0)
-                  (do (os/_exit (primitive/cast i32 CHILD-FAILED)) 0)
-                  ; The success report is written HERE, in the child, because the
-                  ; child is where the cases ran and therefore where the counts
-                  ; and the distribution live. The parent's copy of them was
-                  ; forked away before the first case.
-                  (do
-                    (if report-stats (report-success (stdout) name cfg st) 0)
-                    (os/_exit (primitive/cast i32 CHILD-OK))
-                    0))
-              0)
-            (let [stp (primitive/alloc-stack i32)]
-              (store! stp 0)
-              (os/waitpid (primitive/cast i32 pid) stp 0)
-              (wait-code (primitive/cast i64 (load stp))))))))
+        CHILD-SPAWN-FAILED
+        (let [stp (primitive/alloc-stack i32)]
+          (store! stp 0)
+          (os/waitpid (primitive/cast i32 pid) stp 0)
+          (wait-code (primitive/cast i64 (load stp)))))))
+
+;; Run cases [0, limit) in a worker and return its wait code. `report` asks the
+;; worker to print the success report, which only the phase that ran the WHOLE
+;; property wants — a bisection probe re-runs a prefix and must stay silent.
+(defn spawn-run-cases [(name (slice u8)) (limit i64) (report bool)] (-> i64)
+  (prop-argv-begin!)
+  (prop-argv-flag! PROP-CHILD-FLAG name)
+  (prop-argv-int! PROP-CASES-FLAG limit)
+  (prop-argv-int! PROP-ALARM-FLAG (args-int "--timeout" 60))
+  (if report (prop-argv-push! (prop-argv-cstr PROP-REPORT-FLAG)) 0)
+  (prop-spawn-wait (prop-argv-finish!)))
+
+;; Replay the tape stored at `path` in a worker, under a `secs` watchdog.
+(defn spawn-replay [(name (slice u8)) (path (slice u8)) (size i64) (secs i64)] (-> i64)
+  (prop-argv-begin!)
+  (prop-argv-flag! PROP-CHILD-FLAG name)
+  (prop-argv-flag! PROP-REPLAY-FLAG path)
+  (prop-argv-int! PROP-SIZE-FLAG size)
+  (prop-argv-int! PROP-ALARM-FLAG secs)
+  (prop-spawn-wait (prop-argv-finish!)))
+
+; ── the worker side ──────────────────────────────────────────────────────────
+
+;; Is this process a worker spawned for property `name`? A binary holding several
+;; properties runs every one of them in a worker too, so the name — not merely the
+;; presence of the flags — is what selects.
+(defn prop-child? [(name (slice u8))] (-> bool)
+  (str/str-eq (args-value PROP-CHILD-FLAG) name))
+
+;; A worker's whole life: do the one thing its flags asked for, then leave. Never
+;; returns. `_exit`, not `exit`: no atexit handlers, no flushing of a stream the
+;; parent also holds.
+(defn prop-child-run [(name (slice u8)) (prop (fnptr c [(ptr Source) i64] bool))] (-> i64)
+  (let [cfg (prop-config name)
+        s (prop-source (load (field cfg arena-bytes)))
+        st (primitive/alloc-stack PropStats)
+        secs (args-int PROP-ALARM-FLAG 0)
+        limit (args-int PROP-CASES-FLAG -1)]
+    (store! (field st cases) 0)
+    (store! (field st rejected) 0)
+    (store! (field st shrink-calls) 0)
+    (store! (field st shrinks) 0)
+    (stat-reset!)
+    (store! (stat-collecting) true)
+    ; The watchdog (see `alarm` above). Armed HERE and only here: it exists to keep
+    ; a hung property from stalling the run, and a parent that armed one would kill
+    ; the process that is supposed to report the hang.
+    (if (> secs 0) (do (alarm (primitive/cast u32 secs)) 0) 0)
+    (if (>= limit 0)
+        (prop-child-cases s prop cfg st name limit)
+        (prop-child-replay s prop cfg))
+    0))
+
+(defn prop-child-cases [(s (ptr Source))
+                        (prop (fnptr c [(ptr Source) i64] bool))
+                        (cfg PropConfig)
+                        (st (ptr PropStats))
+                        (name (slice u8))
+                        (limit i64)] (-> i64)
+  (let [bad (run-cases s prop cfg st limit)]
+    (if (>= bad 0)
+        (do (os/_exit (primitive/cast i32 CHILD-FAILED)) 0)
+        ; The success report is written HERE, in the worker, because this is where
+        ; the cases ran and therefore where the counts and the distribution live.
+        ; The parent has never seen a case of this run.
+        (do
+          (if (args-has? PROP-REPORT-FLAG) (report-success (stdout) name cfg st) 0)
+          (os/_exit (primitive/cast i32 CHILD-OK))
+          0))))
+
+(defn prop-child-replay [(s (ptr Source))
+                         (prop (fnptr c [(ptr Source) i64] bool))
+                         (cfg PropConfig)] (-> i64)
+  (let [a (malloc-allocator)
+        path (args-value PROP-REPLAY-FLAG)
+        size (args-int PROP-SIZE-FLAG (load (field cfg max-size)))]
+    (match (db-load-tape a path)
+      (Err [e] (prop-child-broken path))
+      (Ok [o]
+          (match o
+            (None [] (prop-child-broken path))
+            (Some [t]
+                  ; through `replay-here`, the same code `--no-fork` runs, so a
+                  ; verdict cannot depend on which side of the spawn it came from.
+                  (let [(mut tape) t
+                        code (replay-here-at s prop (mut tape) size)]
+                    (os/_exit (primitive/cast i32 code))
+                    0)))))))
+
+;; A worker pointed at a tape it cannot read has to SAY SO and exit with a code that
+;; is not a verdict. Exiting 0 would report the input as passing — which is how a
+;; shrinker quietly stops shrinking, and how a reuse phase quietly stops reusing.
+(defn prop-child-broken [(path (slice u8))] (-> i64)
+  (let [w (stderr)]
+    (fmt w "coil prop: worker could not read the tape at {s}\n" path))
+  (os/_exit (primitive/cast i32 CHILD-BROKEN))
+  0)
+
+; ── the phases that use them ─────────────────────────────────────────────────
 
 ;; The index of the first case that CRASHES, found by bisection over the case
-;; count: each probe runs a prefix in a child and asks whether that prefix
-;; survives. log2(cases) forks — eight for a default run — and, decisively, zero
+;; count: each probe runs a prefix in a worker and asks whether that prefix
+;; survives. log2(cases) spawns — eight for a default run — and, decisively, zero
 ;; cost on the happy path, where nothing crashes and nothing is bisected.
-(defn find-crashing-case [(s (ptr Source))
-                          (prop (fnptr c [(ptr Source) i64] bool))
-                          (cfg PropConfig)
-                          (st (ptr PropStats))
-                          (name (slice u8))
-                          (cases i64)] (-> i64)
+(defn find-crashing-case [(name (slice u8)) (cases i64)] (-> i64)
   (let [(mut lo) 0  ; a prefix length known to survive
         (mut hi) cases]  ; a prefix length known to die
     (loop (if (<= (primitive/isub (load hi) (load lo)) 1)
               (break)
               (let [mid (primitive/iadd (load lo) (primitive/udiv (primitive/isub (load hi) (load lo)) 2))
-                    code (fork-run-cases s prop cfg st name mid false)]
+                    code (spawn-run-cases name mid false)]
                 (if (> code 128)
                     (store! hi mid)
                     (store! lo mid))
@@ -797,37 +1005,27 @@
     ; prefix `hi` dies and prefix `lo` = hi-1 does not, so case hi-1 is the one.
     (primitive/isub (load hi) 1)))
 
-;; Replay one candidate tape IN A CHILD, for shrinking a crash. "Still failing"
-;; means the child died from the same signal as the original crash — not merely
+;; Replay one candidate tape IN A WORKER, for shrinking a crash. "Still failing"
+;; means the worker died from the same signal as the original crash — not merely
 ;; that it died. A reducer that accepts any crash happily minimizes one bug into
 ;; a different one and reports the wrong counterexample; requiring the signal to
-;; match is the cheapest guard against that slippage.
-(defn run-candidate-forked [(ctx (ptr i8)) (tape (ptr (ArrayList Choice)))] (-> bool)
+;; match is the cheapest guard against that slippage. (CHILD-BROKEN is not a signal
+;; and so can never match, which is what a failed hand-off should mean.)
+(defn run-candidate-spawned [(ctx (ptr i8)) (tape (ptr (ArrayList Choice)))] (-> bool)
   (let [rc (primitive/cast (ptr RunCtx) ctx)
         s (load (field rc src))
-        pid (primitive/cast i64 (os/fork))]
-    (if (< pid 0)
-        false
-        (if (= pid 0)
-            ; a short watchdog: a shrink candidate that hangs must not stall the
-            ; whole reduction. `fork` clears the parent's alarm, so this is the
-            ; only timer running here.
-            (do
-              (alarm (primitive/cast u32 (load (field rc cand-timeout))))
-              (source-begin-replay! s tape (load (field rc size)))
-              (primitive/call-ptr (load (field rc prop)) s PROP-MODE-RUN)
-              (os/_exit 0)
-              false)
-            (let [stp (primitive/alloc-stack i32)]
-              (store! stp 0)
-              (os/waitpid (primitive/cast i32 pid) stp 0)
-              (let [code (wait-code (primitive/cast i64 (load stp)))]
-                ; the tape must also be REPLAYED in the parent, so the shrinker
-                ; can read the canonical tape the run produced. Generation never
-                ; crashes — only the body does — so drawing here is safe.
-                (source-begin-replay! s tape (load (field rc size)))
-                (primitive/call-ptr (load (field rc prop)) s PROP-MODE-DRAW)
-                (= code (load (field rc crash-code)))))))))
+        mem (malloc-allocator)
+        path (load (field rc cand-path))
+        code
+          (if (db-save-tape mem path tape)
+              (spawn-replay (load (field rc name)) path (load (field rc size)) (load (field rc cand-timeout)))
+              CHILD-BROKEN)]
+    ; the tape must also be REPLAYED in the parent, so the shrinker can read the
+    ; canonical tape the run produced. Generation never crashes — only the body
+    ; does — so drawing here is safe.
+    (source-begin-replay! s tape (load (field rc size)))
+    (primitive/call-ptr (load (field rc prop)) s PROP-MODE-DRAW)
+    (= code (load (field rc crash-code)))))
 
 ; ------------------------------------------------------------- the reuse phase
 ;
@@ -838,9 +1036,11 @@
 ; "reuse" phase, and the single feature that makes a property suite feel like a
 ; regression suite.
 ;
-; The replay gets its own forked child, because the saved input is by definition
+; The replay gets its own worker process, because the saved input is by definition
 ; one that broke something, and a saved SEGFAULT must not take down the process
-; that was about to minimize it.
+; that was about to minimize it. The worker reads the tape from the database file
+; directly — the parent decodes the same bytes for its own report, but there is no
+; need to hand across what is already on disk under a name both processes derive.
 ;
 ; ⚠ UNLESS `--no-fork`. This phase runs BEFORE the generation loop, so while a
 ; saved counterexample exists it is the only phase that runs at all — and it used
@@ -874,19 +1074,44 @@
                     (store! out (tape-clone a (mut tape)))
                     (if nofork
                         (replay-here s prop cfg out)
-                        (fork-replay s prop cfg out)))))))))
+                        (let [path (db-path a name)
+                              code (spawn-replay name path (load (field cfg max-size)) (args-int "--timeout" 60))]
+                          (db-free-bytes a path)
+                          ; A worker that could not read the tape established NOTHING —
+                          ; not that the property fails, and not that it holds. Say so
+                          ; and leave the phase where it was: `out` goes back to empty,
+                          ; which is what "there was nothing to reuse" looks like
+                          ; everywhere else, so the saved entry is neither reported as
+                          ; a failure nor deleted as fixed.
+                          (if (= code CHILD-BROKEN)
+                              (do
+                                (print-str w
+                                           "  note: the saved counterexample could not be replayed — keeping it, and generating.\n")
+                                (store! out (al-new [Choice] a))
+                                CHILD-OK)
+                              code))))))))))
 
-;; The in-process half of the replay. No `alarm` here, deliberately: the watchdog
-;; in `fork-replay` protects the parent from a hung child, and there is no child
-;; to be separate from — arming it would have SIGALRM kill the very process the
-;; caller asked to keep. The no-fork generation path declines it for the same
-;; reason. A saved input that crashes now takes this process down, which is the
-;; whole point of asking for no fork.
+;; The in-process half of the replay. No `alarm` here, deliberately: the watchdog a
+;; worker arms protects the parent from a hung child, and there is no child to be
+;; separate from — arming it would have SIGALRM kill the very process the caller
+;; asked to keep. The no-fork generation path declines it for the same reason. A
+;; saved input that crashes now takes this process down, which is the whole point of
+;; asking for no fork.
 (defn replay-here [(s (ptr Source))
                    (prop (fnptr c [(ptr Source) i64] bool))
                    (cfg PropConfig)
                    (tape (ptr (ArrayList Choice)))] (-> i64)
-  (source-begin-replay! s tape (load (field cfg max-size)))
+  (replay-here-at s prop tape (load (field cfg max-size))))
+
+;; The same replay at an explicit size, which is what a spawned worker has: it is
+;; told the size on its command line rather than deriving it from a config the
+;; parent may have shrunk against. One function so that no verdict can depend on
+;; which side of a spawn produced it.
+(defn replay-here-at [(s (ptr Source))
+                      (prop (fnptr c [(ptr Source) i64] bool))
+                      (tape (ptr (ArrayList Choice)))
+                      (size i64)] (-> i64)
+  (source-begin-replay! s tape size)
   (let [held (primitive/call-ptr prop s PROP-MODE-RUN)]
     (if (or held (= (src-status s) ST-REJECTED)) CHILD-OK CHILD-FAILED)))
 
@@ -899,37 +1124,17 @@
   (print-str w "\n")
   CHILD-OK)
 
-;; Replay `tape` in a forked child and report its wait code.
-(defn fork-replay [(s (ptr Source))
-                   (prop (fnptr c [(ptr Source) i64] bool))
-                   (cfg PropConfig)
-                   (tape (ptr (ArrayList Choice)))] (-> i64)
-  (let [pid (primitive/cast i64 (os/fork))]
-    (if (< pid 0)
-        CHILD-OK
-        (if (= pid 0)
-            (do
-              (alarm (primitive/cast u32 (args-int "--timeout" 60)))
-              (source-begin-replay! s tape (load (field cfg max-size)))
-              (let [held (primitive/call-ptr prop s PROP-MODE-RUN)]
-                ; `_exit` returns void, so each branch needs a value of its own
-                ; for the `if` to have a type — nothing after them runs.
-                (if (or held (= (src-status s) ST-REJECTED))
-                    (do (os/_exit (primitive/cast i32 CHILD-OK)) 0)
-                    (do (os/_exit (primitive/cast i32 CHILD-FAILED)) 0))
-                0)
-              0)
-            (let [stp (primitive/alloc-stack i32)]
-              (store! stp 0)
-              (os/waitpid (primitive/cast i32 pid) stp 0)
-              (wait-code (primitive/cast i64 (load stp))))))))
-
 ;; Run one property to completion. Returns 0; a failure prints its report and
-;; aborts, which is what `coil test`'s forked runner records as a failure.
+;; aborts, which is what `coil test`'s runner records as a failure.
 (defn prop-run [(name (slice u8))
                 (file (slice u8))
                 (line i64)
                 (prop (fnptr c [(ptr Source) i64] bool))] (-> i64)
+  ; A WORKER never reaches the phases below: it does the one thing its flags asked
+  ; for and exits inside this call. It has to be the first thing tested, because a
+  ; worker that fell through to the reuse phase would replay a saved counterexample
+  ; its parent is in the middle of minimizing.
+  (if (prop-child? name) (prop-child-run name prop) 0)
   ; read ONCE, for the whole run. It used to be read inside the generation phase
   ; and nowhere else, which is how the reuse phase came to ignore it.
   (let [nofork (args-has? "--no-fork")
@@ -971,25 +1176,25 @@
                             (if (> reuse 128) reuse -1))
             0)))
     ; PHASE 2 — generation. The crash branches below (`find-crashing-case`, and
-    ; `run-candidate-forked` inside `report-failure`) fork unconditionally, and do
+    ; `run-candidate-spawned` inside `report-failure`) spawn unconditionally, and do
     ; not need to consult `nofork`: under it, `code` is only ever CHILD-OK or
     ; CHILD-FAILED, because a crashing case took this process with it rather than
-    ; returning a signal from a child. They are unreachable, not ungated.
+    ; returning a signal from a worker. They are unreachable, not ungated.
     (let [code
             (if nofork
                 ; opting out: run in this process, where a debugger can see
                 ; the crash. Trades crash minimization for a usable backtrace.
                 (if (>= (run-cases s prop cfg st (load (field cfg cases))) 0) CHILD-FAILED CHILD-OK)
-                (fork-run-cases s prop cfg st name (load (field cfg cases)) true))]
+                (spawn-run-cases name (load (field cfg cases)) true))]
       (if (= code CHILD-OK)
-          ; when we forked, the child already printed the counts it owns; only
+          ; when we spawned, the worker already printed the counts it owns; only
           ; the no-fork path still has to report from here.
           (if nofork (report-success w name cfg st) 0)
           (if (or (= code CHILD-FAILED) (< code 0))
-              ; An ordinary counterexample (or a fork that failed, in which case
+              ; An ordinary counterexample (or a spawn that failed, in which case
               ; we simply do the work here). Re-run to the failing case in this
               ; process — generation is deterministic — and shrink in-process,
-              ; which is far faster than forking per candidate.
+              ; which is far faster than a process per candidate.
               (do
                 (store! (stat-collecting) false)
                 (run-cases s prop cfg st (load (field cfg cases)))
@@ -997,10 +1202,10 @@
               (if (> code 128)
                   ; A crash. Find which case did it, rebuild its input without
                   ; running the body, then shrink with every candidate in its own
-                  ; child so a crashing candidate cannot take the shrinker down.
+                  ; process so a crashing candidate cannot take the shrinker down.
                   (do
                     (store! (stat-collecting) false)
-                    (let [k (find-crashing-case s prop cfg st name (load (field cfg cases)))]
+                    (let [k (find-crashing-case name (load (field cfg cases)))]
                       (regenerate-case s prop cfg k)
                       ; the bisection re-ran prefixes, so the case counter is
                       ; whatever the last probe left behind; the number that
@@ -1067,16 +1272,37 @@
 ;; How many candidates the shrinker may run, given how expensive one is here.
 ;;
 ;; In-process a candidate costs ~100ns, so twenty thousand of them are free. A
-;; forked candidate costs ~100us — a thousand is a tenth of a second. A candidate
-;; that has to be TIMED OUT costs whole seconds, so the budget collapses to a few
-;; dozen: with a hang, the shrinker's job is to produce a small input quickly,
-;; not the smallest input eventually.
+;; candidate that needs its own PROCESS costs an exec — a few milliseconds for an
+;; ordinary test binary, over ten for one that initialises a language runtime at
+;; startup — so the crash budget is two orders of magnitude smaller: two hundred
+;; candidates is well under a second, and past that the shrinker is spending more
+;; time than the last few bytes of the input are worth. (It was a twentieth back
+;; when a candidate was a ~100µs fork; the exec is what moved it.) A candidate that
+;; has to be TIMED OUT costs whole seconds, so that budget collapses to a few dozen:
+;; with a hang, the shrinker's job is to produce a small input quickly, not the
+;; smallest input eventually.
 (defn shrink-budget-for [(cfg PropConfig) (crash-code i64)] (-> i64)
   (if (= crash-code 142)
       64
       (if (> crash-code 128)
-          (primitive/udiv (load (field cfg shrink-budget)) 20)
+          (primitive/udiv (load (field cfg shrink-budget)) 100)
           (load (field cfg shrink-budget)))))
+
+;; The budget for shrinking a CRASH, once it is known that a candidate can actually
+;; be handed to a worker: every candidate travels as a FILE, so a database that
+;; cannot be written means not one candidate can be evaluated. Say so once and
+;; report the input as it was found, rather than burning the budget on candidates
+;; that are all rejected for a reason that has nothing to do with the property.
+(defn crash-shrink-budget [(w (ptr Writer))
+                           (a (ptr Allocator))
+                           (path (slice u8))
+                           (tape (ptr (ArrayList Choice)))
+                           (budget i64)] (-> i64)
+  (if (db-save-tape a path tape)
+      budget
+      (do
+        (fmt w "\n  note: cannot write shrink candidates to {s} — reporting this input unminimized.\n" path)
+        0)))
 
 ;; SIGALRM means the watchdog fired: the property did not crash, it never
 ;; finished. Saying "signal 14" instead makes the reader look up a signal number
@@ -1086,7 +1312,7 @@
 
 ;; Shrink the tape the Source is currently holding, then print it and abort.
 ;; `crash-code` is 128+signal when the failure was a crash (in which case every
-;; candidate is evaluated in its own child) and -1 for an ordinary counterexample.
+;; candidate is evaluated in its own process) and -1 for an ordinary counterexample.
 (defn report-failure [(w (ptr Writer))
                       (name (slice u8))
                       (file (slice u8))
@@ -1105,18 +1331,33 @@
     (store! (field rc size) (src-size s))
     (store! (field rc crash-code) crash-code)
     (store! (field rc cand-timeout) (args-int "--candidate-timeout" 5))
+    (store! (field rc name) name)
+    (store! (field rc cand-path) "")
+    ; Only a crash hands candidates to workers, and only then is there a directory
+    ; to prepare: an ordinary counterexample is shrunk entirely in this process.
+    (if (> crash-code 128)
+        (let [dir (db-dir mem name)]
+          (db-mkdir-p mem dir)
+          (db-free-bytes mem dir)
+          (store! (field rc cand-path) (db-candidate-path mem name))
+          0)
+        0)
     (let [runner
             (if (> crash-code 128)
-                (primitive/fnptr-of run-candidate-forked)
+                (primitive/fnptr-of run-candidate-spawned)
                 (primitive/fnptr-of run-candidate))
-          sc
-            (shrink-ctx-new mem
-                            s
-                            runner
-                            (primitive/cast (ptr i8) rc)
-                            (shrink-budget-for cfg crash-code))]
+          budget
+            (if (> crash-code 128)
+                (crash-shrink-budget w
+                                     mem
+                                     (load (field rc cand-path))
+                                     (mut failing)
+                                     (shrink-budget-for cfg crash-code))
+                (shrink-budget-for cfg crash-code))
+          sc (shrink-ctx-new mem s runner (primitive/cast (ptr i8) rc) budget)]
       (sc-seed-best! sc (mut failing) (mut failing-spans))
       (shrink-run! sc)
+      (if (> crash-code 128) (db-remove-tape mem (load (field rc cand-path))) 0)
       (store! (field st shrink-calls) (sc-calls sc))
       (store! (field st shrinks) (sc-accepted sc))
       ; Save the MINIMIZED tape, not the one that happened to fail: tomorrow's

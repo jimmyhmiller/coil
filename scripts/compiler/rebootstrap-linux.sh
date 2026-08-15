@@ -92,6 +92,16 @@ echo "  gate-unused-lint: PASS (deletes exactly the unreachable set)"
 python3 scripts/tests/prop_nofork.py --coil /tmp/coil-lrb2 >/dev/null   || { echo "gate-prop-nofork FAIL — --no-fork does not reach the property reuse phase"; exit 1; }
 echo "  gate-prop-nofork: PASS (--no-fork governs replay as well as generation)"
 
+# A property inside a test binary that has THREADS. `coil test` gives each test its
+# own process and a `defprop` runs its cases in a process again; while that inner
+# one was a fork, a linked threaded runtime (a Go c-archive, CoreFoundation) left
+# the child holding locks whose owner threads did not exist — so the watchdog
+# reported `TIMED OUT on case 0` against a property that is true, and `--no-fork`
+# "fixed" it. This links a tiny threaded C runtime and asserts both directions:
+# a true property passes, and a crashing one still minimizes.
+python3 scripts/tests/prop_spawn.py --coil /tmp/coil-lrb2 >/dev/null   || { echo "gate-prop-spawn FAIL — property isolation forks instead of spawning; a threaded test binary deadlocks"; exit 1; }
+echo "  gate-prop-spawn: PASS (property workers survive a threaded test binary)"
+
 # Does the compiler still BUILD for wasm? This battery had no wasm line at all,
 # which is how two independent wasm regressions reached main: a `musttail` that
 # needs the unenabled `+tail-call` feature (fails here, at build), and externs
