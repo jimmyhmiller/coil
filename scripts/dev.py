@@ -514,6 +514,19 @@ def test_modernize_fast(compiler: str) -> None:
         def default_lint_task() -> None:
             probe = tmp / "default-lint.coil"
             probe.write_text((ROOT / "tests/metaprogramming/default_lint_input.coil").read_text())
+            before = probe.read_bytes()
+            preview = subprocess.run([coil, "lint", str(probe), "--diff"], cwd=ROOT,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     text=True, check=True)
+            if probe.read_bytes() != before:
+                raise RuntimeError("fast modernization gate: lint --diff changed its input")
+            for final_rewrite in ("(set! (.value box)", "(.value box)",
+                                  "(Moved :x 1 :y 2 :at 3)", "try-or!"):
+                if final_rewrite not in preview.stdout:
+                    raise RuntimeError(
+                        f"fast modernization gate: lint --diff stopped before fixpoint {final_rewrite!r}")
+            if "fixed " in preview.stderr:
+                raise RuntimeError("fast modernization gate: lint --diff claimed it wrote a file")
             execute(coil, "lint", str(probe), "--fix")
             fixed = probe.read_text()
             for legacy in ("primitive/icmp-ge", "match-else (", "(Moved 1 2 3)", "(match value"):
