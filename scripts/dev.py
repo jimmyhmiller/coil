@@ -484,6 +484,43 @@ def test_modernize_fast(compiler: str) -> None:
             if before != hashlib.sha256(probe.read_bytes()).digest():
                 raise RuntimeError("fast modernization gate: lint --fix is not idempotent")
 
+            preflight = tmp / "legacy-preflight.coil"
+            preflight.write_text("""(module legacy-preflight)
+(import "coil.alloc" :as alloc)
+(extern free :cc c [(ptr i8)] (-> void))
+(defn owner [(a (ptr alloc.Allocator))] (-> (ptr i64))
+  (alloc.box a i64 1))
+(defn arch? [(wanted Code)] (-> bool)
+  (code-eq (target-arch) wanted))
+(defn release-or [(p (ptr i8)) (release bool)] (-> i64)
+  (if release (do (free p)) 7))
+""")
+            execute(coil, "lint", str(preflight), "--fix")
+            migrated = preflight.read_text()
+            for expected in ("(ptr alloc/Allocator)", "(alloc/box a i64 1)",
+                             ":use [unwrap-ptr create]", "(primitive/code-eq",
+                             "(primitive/target-arch)", "(do (free p) 0)"):
+                if expected not in migrated:
+                    raise RuntimeError(
+                        f"fast modernization gate: preflight omitted {expected!r}")
+            execute(coil, "check", str(preflight))
+
+            use_only = tmp / "legacy-use-only.coil"
+            use_only.write_text("""(module legacy-use-only)
+(import "coil.alloc" :use *)
+(import "coil.primitive" :use *)
+(defn cell [] (-> (ptr i64)) (static i64))
+(defn bits [(x i64) (y i64)] (-> i64) (iand x y))
+""")
+            execute(coil, "lint", str(use_only), "--fix")
+            use_migrated = use_only.read_text()
+            for expected in (":use * :as alloc", ":use * :as primitive",
+                             "(alloc/static i64)", "(primitive/iand x y)"):
+                if expected not in use_migrated:
+                    raise RuntimeError(
+                        f"fast modernization gate: use-only import omitted {expected!r}")
+            execute(coil, "check", str(use_only))
+
             serde_probe = tmp / "serde-derive-probe.coil"
             serde_probe.write_text("""(module serde-derive-modernization-probe)
 (import "coil.serde" :use *)
@@ -521,7 +558,8 @@ def test_modernize_fast(compiler: str) -> None:
             if probe.read_bytes() != before:
                 raise RuntimeError("fast modernization gate: lint --diff changed its input")
             for final_rewrite in ("(set! (.value box)", "(.value box)",
-                                  "(Moved :x 1 :y 2 :at 3)", "try-or!"):
+                                  "(Moved :x 1 :y 2 :at 3)", "try-or!",
+                                  "(let [heap (alloc/static Box)] heap)"):
                 if final_rewrite not in preview.stdout:
                     raise RuntimeError(
                         f"fast modernization gate: lint --diff stopped before fixpoint {final_rewrite!r}")
@@ -532,7 +570,9 @@ def test_modernize_fast(compiler: str) -> None:
             for legacy in ("primitive/icmp-ge", "match-else (", "(Moved 1 2 3)", "(match value"):
                 if legacy in fixed:
                     raise RuntimeError(f"fast modernization gate: default lint left {legacy!r}")
-            if "(Moved :x 1 :y 2 :at 3)" not in fixed or "try-or!" not in fixed:
+            if ("(Moved :x 1 :y 2 :at 3)" not in fixed or "try-or!" not in fixed
+                    or "(set! (.value box)" not in fixed or "(.value box)" not in fixed
+                    or "(let [heap (alloc/static Box)] heap)" not in fixed):
                 raise RuntimeError("fast modernization gate: default lint profile did not run every safe fixer")
             if "(Counts :ok 3 :failed 2)" not in fixed or "(mut result)" in fixed:
                 raise RuntimeError("fast modernization gate: complete zeroed struct init was not replaced")
