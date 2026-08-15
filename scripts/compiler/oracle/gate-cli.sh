@@ -320,7 +320,7 @@ expect_out 'import paths are not supported' "relative path imports are rejected"
 # Preflight lint runs before loading/typechecking, but --fix is transactional: if a
 # separate semantic error remains, even the valid import migration is rolled back.
 printf '(module migrate)\n(import "unrelated/place/anything.coil" :use *)\n(defn main [] (-> i64) missing-name)\n' > "$T/sib/src/migrate.coil"
-"$COIL" lint "$T/sib/src/migrate.coil" --fix --allow-dirty >/dev/null 2>&1
+"$COIL" lint "$T/sib/src/migrate.coil" --fix >/dev/null 2>&1
 grep -q '(import "unrelated/place/anything.coil" :use \*)' "$T/sib/src/migrate.coil" \
   && ok "lint --fix rolls back a preflight import migration when semantic checking fails" \
   || bad "transactional preflight migration" "broken file was left partially rewritten"
@@ -328,7 +328,7 @@ grep -q '(import "unrelated/place/anything.coil" :use \*)' "$T/sib/src/migrate.c
 # the rewritten calls, otherwise the retry fails resolution and rolls everything back.
 printf '(module owner-migrate)\n(defn main [] (-> i64) (let [p (stack i64)] (store! p (ior 40 2)) (load p)))\n' \
   > "$T/sib/src/owner-migrate.coil"
-"$COIL" lint "$T/sib/src/owner-migrate.coil" --fix --allow-dirty >/dev/null 2>&1
+"$COIL" lint "$T/sib/src/owner-migrate.coil" --fix >/dev/null 2>&1
 grep -q '(import "coil.alloc" :as alloc)' "$T/sib/src/owner-migrate.coil" \
   && grep -q '(import "coil.primitive" :as primitive)' "$T/sib/src/owner-migrate.coil" \
   && grep -q '(alloc/stack i64)' "$T/sib/src/owner-migrate.coil" \
@@ -337,9 +337,23 @@ grep -q '(import "coil.alloc" :as alloc)' "$T/sib/src/owner-migrate.coil" \
   || bad "owner import migration" "missing import or qualified replacement"
 expect_rc 42 "owner-import migration still runs" "$COIL" run "$T/sib/src/owner-migrate.coil"
 
+# A macro closure must carry only the extern declarations its reachable bodies use.
+# Keeping every project extern made the in-memory metaprogram object advertise unrelated
+# undefined symbols, so merely declaring an FFI function could make the bundled
+# dbg-slice-get macro fail during project lint's post-fix validation.
+mkdir -p "$T/lint-extern-closure/src"
+printf '[package]\nname = "lint-extern-closure"\nentry = "src/main.coil"\n' \
+  > "$T/lint-extern-closure/Coil.toml"
+printf '(module lint-extern-closure.main)\n(extern unreachable_native_symbol :cc c [] (-> i64))\n(defn main [] (-> i64) (ior 40 2))\n' \
+  > "$T/lint-extern-closure/src/main.coil"
+( cd "$T/lint-extern-closure" && "$COIL" lint --fix >/dev/null 2>&1 ) \
+  && grep -q '(primitive/ior 40 2)' "$T/lint-extern-closure/src/main.coil" \
+  && ok "project lint excludes unreachable externs from macro-engine closures" \
+  || bad "project lint extern closure" "an unrelated native declaration poisoned post-fix validation"
+
 printf '(module owner-alias-migrate)\n(import "coil.alloc" :as memory)\n(import "coil.primitive" :as metal)\n(defn main [] (-> i64) (let [p (stack i64)] (store! p (ior 40 2)) (load p)))\n' \
   > "$T/sib/src/owner-alias-migrate.coil"
-"$COIL" lint "$T/sib/src/owner-alias-migrate.coil" --fix --allow-dirty >/dev/null 2>&1
+"$COIL" lint "$T/sib/src/owner-alias-migrate.coil" --fix >/dev/null 2>&1
 grep -q '(memory/stack i64)' "$T/sib/src/owner-alias-migrate.coil" \
   && grep -q '(metal/ior 40 2)' "$T/sib/src/owner-alias-migrate.coil" \
   && [ "$(grep -c 'coil.alloc' "$T/sib/src/owner-alias-migrate.coil")" = 1 ] \
@@ -2810,7 +2824,7 @@ cat > "$T/melint/m.coil" <<'EOF'
 (defn main [] (-> i64) (+ (code (A 5)) (code (C))))
 EOF
 expect_rc 0 "lint --fix rewrites match-else to match" \
-  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" lint m.coil --use coil.lint.match-else --fix --allow-dirty' \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" lint m.coil --use coil.lint.match-else --fix' \
   _ "$T/melint" "$COIL"
 expect_out "\(match s" "lint: the rewritten form is a plain match" \
   cat "$T/melint/m.coil"
