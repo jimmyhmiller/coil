@@ -370,11 +370,17 @@ six gated phases (docs/design/META_MEMORY.md has the full record):
    `CodeBuilder` is its own type — build with `code-list-push!`, freeze with
    `code-list-done`, and the checker rejects mutation of finished Code and
    reads of unfrozen builders;
-3. failures are attributable: a 64 MiB default expansion budget (raisable
-   only by a source-level `(meta-budget NAME MIB)` declaration) kills a
-   runaway in milliseconds with an error naming the metaprogram, the bytes,
-   and the fix; `COIL_MTRACE=mem` attributes allocation per metaprogram; the
-   standard-profile lint `coil.lint.meta` flags the quadratic idioms.
+3. failures are attributable: `COIL_MTRACE=mem` attributes allocation per
+   metaprogram, and the standard-profile lint `coil.lint.meta` flags the
+   quadratic idioms.
+
+An expansion BUDGET (a 64 MiB default cap raisable by a source-level
+`(meta-budget NAME MIB)` declaration) shipped with phase 6 and was REMOVED at
+Jimmy's direction the same day: a hard cap on legitimate work added ceremony
+(three innocent metaprograms — the brainfuck reader, the unused-code checker,
+the Scheme dialect — immediately needed declarations just for scaling with
+their input), and the arena already bounds an expansion's damage while
+COIL_MTRACE=mem makes it visible. No `meta-budget` form exists.
 
 WHY: a 20,000-op Brainfuck reader compile peaked at 27.1 GiB, and every byte
 traced to two innocent-looking stdlib idioms (`code-rest` cdr-recursion and

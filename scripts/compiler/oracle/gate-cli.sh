@@ -139,15 +139,6 @@ echo "== code-rest is a view (META_MEMORY phase 5) =="
   && ok "20k-step code-rest recursion typechecks under a 2 GiB cap" \
   || bad "code-rest view teeth" "cdr-recursion blew the 2 GiB cap — code-rest is copying tails again (docs/design/META_MEMORY.md)"
 
-echo "== the expansion budget (META_MEMORY phase 6) =="
-# A metaprogram that allocates without bound dies at the 64 MiB default with an
-# error naming the metaprogram, the bytes, and the fix — in milliseconds, not
-# after the OOM killer. A top-level (meta-budget NAME MIB) declaration raises it.
-printf '(module hog)\n(import "coil.primitive" :as primitive)\n(defn hog-list [(n i64)] (-> Code)\n  (let [out (primitive/code-list-new)\n        (mut i) 0]\n    (loop (if (>= (load i) n)\n              (break)\n              (do (primitive/code-list-push! out `0)\n                  (store! i (primitive/iadd (load i) 1)))))\n    (primitive/code-list-done out)))\n(defn hog [] (-> Code) (do (hog-list 500000) `0))\n(defn main [] (-> i64) (hog))\n' > "$T/hog.coil"
-expect_out "exceeded its 64 MiB expansion budget" "a runaway expansion dies at the default budget, naming itself" "$COIL" check "$T/hog.coil"
-printf '(module hog2)\n(import "coil.primitive" :as primitive)\n(meta-budget hog 512)\n(defn hog-list [(n i64)] (-> Code)\n  (let [out (primitive/code-list-new)\n        (mut i) 0]\n    (loop (if (>= (load i) n)\n              (break)\n              (do (primitive/code-list-push! out `0)\n                  (store! i (primitive/iadd (load i) 1)))))\n    (primitive/code-list-done out)))\n(defn hog [] (-> Code) (do (hog-list 500000) `0))\n(defn main [] (-> i64) (hog))\n' > "$T/hog2.coil"
-expect_rc 0 "a declared (meta-budget …) raise is honored" "$COIL" check "$T/hog2.coil"
-
 echo "== executable-relative resources through PATH =="
 HTTP_NATIVE_TARGET=$([ "$HOST_OS" = Linux ] && echo x86_64-linux || echo arm64-macos)
 mkdir -p "$T/path-bin" "$T/real-bin/native/curl/$HTTP_NATIVE_TARGET" "$T/lib/coil"
