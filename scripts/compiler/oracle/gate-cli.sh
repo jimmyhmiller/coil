@@ -85,6 +85,27 @@ scripts/tests/reader-metaprograms.sh "$COIL" \
   && ok "generic readers cover check/build/run, ambiguity, parity, and strict installed layout" \
   || bad "generic reader metaprograms" "focused reader gate failed"
 
+echo "== metaprogram memory stays linear (META_MEMORY teeth) =="
+# An 8,000-form (scope …) body compiled through the macro engine. The quadratic
+# code-rest / `(~@acc ~f) idioms this cap exists to keep out peaked ~5 GiB RSS
+# here (27 GiB at 20k forms) before commit 7ec494e; the linear implementation
+# measures 2.3 GiB VmPeak (LLVM mappings included), so a 4 GiB address-space
+# cap separates the two with margin on both sides. See docs/design/META_MEMORY.md.
+awk 'BEGIN{
+  print "(module memteeth)";
+  print "(import \"coil.primitive\" :as primitive)";
+  print "(import \"coil.control\" :use [scope return-from])";
+  print "(defn main [] (-> i64)";
+  print "  (let [(mut x) 0]";
+  print "    (scope :s";
+  for (i=0;i<8000;i++) print "      (store! x (primitive/iadd (load x) 1))";
+  print "      0)";
+  print "    (load x)))"
+}' > "$T/memteeth.coil"
+( ulimit -v 4194304; "$COIL" check "$T/memteeth.coil" >/dev/null 2>&1 ) \
+  && ok "an 8k-form scope body typechecks under a 4 GiB address-space cap" \
+  || bad "metaprogram memory teeth" "coil check blew the 4 GiB cap — a quadratic expansion idiom is back (docs/design/META_MEMORY.md)"
+
 echo "== executable-relative resources through PATH =="
 HTTP_NATIVE_TARGET=$([ "$HOST_OS" = Linux ] && echo x86_64-linux || echo arm64-macos)
 mkdir -p "$T/path-bin" "$T/real-bin/native/curl/$HTTP_NATIVE_TARGET" "$T/lib/coil"
