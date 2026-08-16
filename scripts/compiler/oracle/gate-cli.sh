@@ -137,7 +137,12 @@ expect_rc 7 "build: flags BEFORE the file"               "$COIL" run "$T/seven.c
 [ "$rc" = 7 ] && ok "build -o <out> <file> (Unix order)" || bad "build -o <out> <file>" "rc=$rc"
 expect_rc 1 "unknown flag is rejected"                   "$COIL" build "$T/seven.coil" -o "$T/b" --frobnicate
 expect_out "unknown flag" "unknown flag is named"        "$COIL" build "$T/seven.coil" -o "$T/b" --frobnicate
-expect_rc 1 "missing -o exits 1 (not SIGABRT)"           "$COIL" build "$T/seven.coil"
+rm -rf "$T/default-build"
+mkdir -p "$T/default-build"
+( cd "$T/default-build" && "$COIL" build "$T/seven.coil" >/dev/null 2>&1 )
+[ -x "$T/default-build/builds/seven" ] && "$T/default-build/builds/seven"; rc=$?
+[ "$rc" = 7 ] && ok "build defaults to builds/<source-stem>" \
+              || bad "default build output" "missing or returned rc=$rc"
 expect_rc 1 "bogus --target is rejected"                 "$COIL" build "$T/seven.coil" -o "$T/c" --target not-a-real-triple
 
 echo "== check mode: typecheck/compile with no object (diag-12) =="
@@ -233,15 +238,16 @@ mkdir -p "$T/proj/src"
 printf '[package]\nname  = "proj"\nentry = "src/main.coil"\n' > "$T/proj/Coil.toml"
 printf '(module app)\n(defn main [] (-> i64) 3)\n'            > "$T/proj/src/main.coil"
 ( cd "$T/proj" && "$COIL" build >/dev/null 2>&1 )
-[ -x "$T/proj/proj" ] && ok "project build" || bad "project build" "no ./proj"
+[ -x "$T/proj/builds/proj" ] && ok "project build defaults to builds/<package>" \
+                               || bad "project build" "no ./builds/proj"
 ( cd "$T/proj" && "$COIL" run >/dev/null 2>&1 ); [ $? = 3 ] && ok "project run propagates exit code" \
                                                             || bad "project run" "want 3"
 # the headline case: --target wasm32 used to print `wrote proj`, exit 0, and emit a Mach-O
-( cd "$T/proj" && rm -f proj && "$COIL" build --target wasm32-unknown-unknown >/dev/null 2>&1 )
-if file "$T/proj/proj" 2>/dev/null | grep -q WebAssembly; then
+( cd "$T/proj" && rm -f builds/proj && "$COIL" build --target wasm32-unknown-unknown >/dev/null 2>&1 )
+if file "$T/proj/builds/proj" 2>/dev/null | grep -q WebAssembly; then
   ok "project --target wasm32 emits WebAssembly"
 else
-  bad "project --target wasm32" "got: $(file "$T/proj/proj" 2>/dev/null | sed 's/.*: //')"
+  bad "project --target wasm32" "got: $(file "$T/proj/builds/proj" 2>/dev/null | sed 's/.*: //')"
 fi
 ( cd "$T/proj" && rm -f proj && "$COIL" build -o "$T/proj/elsewhere" >/dev/null 2>&1 )
 [ -x "$T/proj/elsewhere" ] && ok "project -o is honored" || bad "project -o" "not written"
@@ -919,6 +925,22 @@ echo "== object emission on the DEFAULT (LLVM) backend =="
 # language's headline calling-convention-as-a-type feature — silently could not build on
 # the default backend at all (LLVM aborts without an AsmParser). A committed example
 # (src/examples/shim.coil) failed to build and no gate noticed.
+if [ "$HOST_OS" = Darwin ]; then
+  # The parallel O3 backend combines its partition objects with a relocatable
+  # clang -r link. That combine must not pull in SDK/runtime libraries: dylibs are
+  # invalid inputs to ld -r and belong only to the final executable link.
+  parallel_link_out=$("$COIL" emit-obj "$T/seven.coil" -o "$T/seven-parallel.o" 2>&1); rc=$?
+  case "$parallel_link_out" in
+    *"unexpected dylib text stub file"*)
+      bad "parallel O3 combines objects without SDK dylibs" "$parallel_link_out" ;;
+    *)
+      if [ "$rc" = 0 ] && [ -s "$T/seven-parallel.o" ]; then
+        ok "parallel O3 combines objects without SDK dylibs"
+      else
+        bad "parallel O3 relocatable link" "rc=$rc: $parallel_link_out"
+      fi ;;
+  esac
+fi
 for e in src/examples/shim.coil src/examples/everything.coil; do
   out=$("$COIL" run "$e" 2>&1); rc=$?
   if [ "$HOST_ARCH" = arm64 ] || [ "$HOST_ARCH" = aarch64 ]; then
@@ -2995,7 +3017,14 @@ if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
   INSTALLED="$T/jit-prefix/bin/coil"
   cp src/examples/jit_sdk.coil "$T/jit-sdk/main.coil"
   if (cd "$T/jit-sdk" && "$INSTALLED" build main.coil --backend arm64 -o app >/dev/null 2>&1); then
-    sdk_out=$(cd "$T/jit-sdk" && PATH="$T/jit-prefix/bin:$PATH" ./app 2>&1)
+    mkdir -p "$T/no-cc"
+    cat > "$T/no-cc/cc" <<'EOF'
+#!/bin/sh
+echo "FAIL: an in-process JIT session invoked cc: $*" >&2
+exit 97
+EOF
+    chmod +x "$T/no-cc/cc"
+    sdk_out=$(cd "$T/jit-sdk" && PATH="$T/no-cc:$T/jit-prefix/bin:$PATH" ./app 2>&1)
     case "$sdk_out" in
       *$'20\n30'*) ok "coil.jit embeds an installed compiler and hot reloads from userland" ;;
       *) bad "coil.jit embeds an installed compiler and hot reloads from userland" "$sdk_out" ;;
@@ -3035,7 +3064,7 @@ if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
     '(defn twice [(x f64)] (-> f64) (* x 4.0))' \
     '(next)' \
     '(four-times 10)' \
-    ':q' | "$REPL_COIL" repl 2>&1)
+    ':q' | PATH="$T/no-cc:$PATH" "$REPL_COIL" repl 2>&1)
   case "$repl_out" in
     *$'1\n40\n2\n90\n3\n90'*) ok "repl preserves state, reloads dependent calls, and rejects incompatible replacement" ;;
     *) bad "repl preserves state, reloads dependent calls, and rejects incompatible replacement" "$repl_out" ;;

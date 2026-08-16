@@ -13,7 +13,8 @@ inside it, so `coil` and every `(import "…")` below work from any directory.
 ## Build & run
 
     coil run   file.coil                 # build + run a single file
-    coil build file.coil -o out          # build a native executable
+    coil build file.coil                 # build builds/file
+    coil build file.coil -o out          # override the output path
     coil install                         # install this package to ~/.local/bin
     coil install --root DIR              # install to DIR/bin instead
     coil build file.coil --target wasm32-unknown-unknown -o out.wasm
@@ -88,9 +89,11 @@ Project tools inherit the same package, native, target, and link configuration a
 configuration**: `coil build src/main.coil`, `coil run src/main.coil` and
 `coil check src/main.coil` resolve the same dependencies and apply the same
 `[cc]`, `[link]` and `[metaprograms]` as the bare command, so an
-`(import "somedep.lib")` that works one way works the other. (`-o` is still
-required when you name the file; `[build] out` names the *package* artifact.)
+`(import "somedep.lib")` that works one way works the other. Build artifacts default
+to `builds/<source-stem>` for a named file and `builds/<package-name>` for a package;
+`-o` overrides either path, and `[build] out` overrides the package artifact name.
 Outside a project — no `Coil.toml` — a file is compiled on its own, as always.
+`coil new` adds both `/builds` and `/.coil` to the new package's `.gitignore`.
 
 A fuller project can declare:
 
@@ -485,8 +488,9 @@ Self-tail-recursion is constant-stack (guaranteed `musttail`).
 
 Struct values are constructed with `:field value` pairs. Every declared field is
 required exactly once; missing, repeated, and unknown fields are compile errors.
-Arguments are initialized in the struct's declaration order. Sum variants accept the
-same named syntax for their payload fields: `(Rect :width 10 :height 20)`.
+Argument expressions are evaluated from left to right in source order, then fields
+are initialized in declaration order. Sum variants accept the same named syntax for
+their payload fields: `(Rect :width 10 :height 20)`.
 
 - `(primitive/field p name)` → a `(ptr FieldType)` (a place); then `load`/`store!`.
   Requires `p : (ptr Struct)`. Nested: `(primitive/field (primitive/field s lo) x)`. Array field
@@ -684,6 +688,18 @@ They are plain `i64` literals — use with metal/clean ops after casting the byt
     (defn hot-add :inline (Always) [(a i64) (b i64)] (-> i64) (+ a b))
     (defn f [(p (mut Rect))] (-> i64) …)      ; mutable-ref param
     (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64) …)   ; CLI entry
+
+Ordinary Coil functions may be called with `:parameter value` pairs in any order:
+
+    (defn move [(point Point) (dx i64) (dy i64)] (-> Point) …)
+    (move :dy 20 :point p :dx 10)
+
+Every parameter is required exactly once; missing, repeated, and unknown parameters
+are compile errors. A call is either entirely positional or entirely named. Named
+argument expressions are evaluated from left to right in source order, while values
+are passed to the function in declaration order. Extern, variadic, function-pointer,
+and callable-value calls remain positional. To pass a keyword as the first positional
+argument, group it with a type ascription: `(takes-keyword (: :hot Keyword))`.
 
 **Function pointers** (native callbacks, dispatch tables):
 `(fnptr c [ArgTs…] Ret)` is the type (`c` = C convention); `(primitive/fnptr-of fn)` takes a

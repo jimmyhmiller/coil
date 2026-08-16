@@ -228,6 +228,11 @@ def _test_modernize_fast_serial(compiler: str) -> None:
                 "--backend", "arm64", "-o", str(ambient_test))
         execute(str(ambient_test))
 
+        named_call_test = tmp / "named-call-source-order"
+        execute(str(candidate), "build", "tests/compiler/features/named_call_source_order.coil",
+                "--backend", "arm64", "-o", str(named_call_test))
+        execute(str(named_call_test))
+
         for rejected in (
                 "tests/compiler/features/nonambient_primitive_rejected.coil",
                 "tests/compiler/features/nonambient_alloc_rejected.coil"):
@@ -464,6 +469,14 @@ def test_modernize_fast(compiler: str) -> None:
                     raise RuntimeError(f"fast modernization gate: default lint left {legacy!r}")
             if "(Moved :x 1 :y 2 :at 3)" not in fixed or "try-or!" not in fixed:
                 raise RuntimeError("fast modernization gate: default lint profile did not run every safe fixer")
+            if "(Counts :ok 3 :failed 2)" not in fixed or "(mut result)" in fixed:
+                raise RuntimeError("fast modernization gate: complete zeroed struct init was not replaced")
+            if "(mut reversed)" not in fixed or "(mut dependent)" not in fixed:
+                raise RuntimeError("fast modernization gate: unsafe zeroed struct init was rewritten")
+            if "(box a Counts (Counts :ok 8 :failed 1))" not in fixed or "(let [p (unwrap-ptr" not in fixed:
+                raise RuntimeError("fast modernization gate: manual-box fix or its negative guard failed")
+            if "(alloc/box a Counts (Counts :ok 6 :failed 3))" not in fixed:
+                raise RuntimeError("fast modernization gate: qualified manual-box fix failed")
             execute(coil, "fmt", "--write", str(probe))
             formatted = probe.read_text()
             if not all(part in formatted for part in ("(Moved\n", ":x 1\n", ":y 2\n", ":at 3)")):
@@ -509,6 +522,8 @@ source-roots = ["src"]
                               "--backend", "arm64"),
             lambda: build_run("tests/compiler/features/ambient_core_ops.coil", "ambient-core-ops",
                               "--backend", "arm64"),
+            lambda: build_run("tests/compiler/features/named_call_source_order.coil",
+                              "named-call-source-order", "--backend", "arm64"),
             lambda: expect_rejected("tests/compiler/features/nonambient_primitive_rejected.coil",
                                     "fast modernization gate: non-ambient primitive compiled"),
             lambda: expect_rejected("tests/compiler/features/nonambient_alloc_rejected.coil",
