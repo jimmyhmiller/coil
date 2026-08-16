@@ -324,8 +324,8 @@ out=$( cd "$T/strict" && "$COIL" build 2>&1 ); rc=$?
   || bad "Git dependency without SHA" "got rc=$rc: $out"
 # a valid manifest still builds
 printf '[package]\nname  = "s"\nentry = "src/main.coil"\n' > "$T/strict/Coil.toml"
-( cd "$T/strict" && rm -f s && "$COIL" build >/dev/null 2>&1 )
-[ -x "$T/strict/s" ] && ok "a valid manifest still builds" || bad "strict valid manifest" "no ./s"
+( cd "$T/strict" && rm -f builds/s && "$COIL" build >/dev/null 2>&1 )
+[ -x "$T/strict/builds/s" ] && ok "a valid manifest still builds" || bad "strict valid manifest" "no ./builds/s"
 
 echo "== namespace index: file placement is irrelevant and paths are rejected =="
 mkdir -p "$T/sib/src/unrelated/place"
