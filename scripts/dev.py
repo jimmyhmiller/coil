@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import os
+import platform
 import shlex
 import shutil
 import stat
@@ -368,12 +369,20 @@ source-roots = ["src"]
 def test_modernize_fast(compiler: str) -> None:
     """Run the independent focused fixtures concurrently, within the 30s gate."""
     started = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="coil-modernize-fast-") as raw_tmp:
+    # Project-mode subprocesses run from their fixture directory. Keep that
+    # directory below the checkout so a stage compiler in /tmp can still find
+    # this checkout's standard library by walking upward from the working tree.
+    with tempfile.TemporaryDirectory(prefix=".coil-modernize-fast-", dir=ROOT) as raw_tmp:
         tmp = Path(raw_tmp)
         candidate = Path(compiler).resolve()
         if not candidate.is_file():
             raise SystemExit(f"fast modernization gate: compiler not found: {candidate}")
         coil = str(candidate)
+        # The native backend emits Mach-O/AArch64 objects. Only select it when
+        # this host can link and execute them; elsewhere these fixtures use LLVM.
+        backend_flags = (("--backend", "arm64")
+                         if sys.platform == "darwin" and platform.machine() == "arm64"
+                         else ())
 
         def expect_rejected(path: str, message: str) -> None:
             result = subprocess.run([coil, "check", path], cwd=ROOT,
@@ -409,7 +418,7 @@ def test_modernize_fast(compiler: str) -> None:
 
         def reexport_task() -> None:
             build_run("tests/compiler/features/reexport_qualified.coil", "reexport-qualified",
-                      "--backend", "arm64", want=42)
+                      *backend_flags, want=42)
             expect_rejected("tests/compiler/features/reexport_private_rejected.coil",
                             "fast modernization gate: facade leaked a private re-export")
 
@@ -519,28 +528,28 @@ source-roots = ["src"]
         tasks = [
             cimport_task,
             lambda: build_run("tests/compiler/features/integer_ord_all_widths.coil", "integer-widths",
-                              "--backend", "arm64"),
+                              *backend_flags),
             lambda: build_run("tests/compiler/features/ambient_core_ops.coil", "ambient-core-ops",
-                              "--backend", "arm64"),
+                              *backend_flags),
             lambda: build_run("tests/compiler/features/named_call_source_order.coil",
-                              "named-call-source-order", "--backend", "arm64"),
+                              "named-call-source-order", *backend_flags),
             lambda: expect_rejected("tests/compiler/features/nonambient_primitive_rejected.coil",
                                     "fast modernization gate: non-ambient primitive compiled"),
             lambda: expect_rejected("tests/compiler/features/nonambient_alloc_rejected.coil",
                                     "fast modernization gate: non-ambient allocation compiled"),
             lambda: build_run("tests/compiler/features/refer_control.coil", "refer-control",
-                              "--backend", "arm64"),
+                              *backend_flags),
             lambda: execute(coil, "check", "tests/compiler/features/refer_no_core.coil"),
             lambda: execute(coil, "check", "tests/compiler/features/refer_core_qualified.coil"),
             reexport_task,
             lambda: build_run("tests/compiler/features/process_facade.coil", "process-facade",
-                              "--backend", "arm64"),
-            lambda: build_run("tests/hosted_system_test.coil", "hosted-system", "--backend", "arm64"),
+                              *backend_flags),
+            lambda: build_run("tests/hosted_system_test.coil", "hosted-system", *backend_flags),
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o0", "-O0"),
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o3", "-O3"),
             aggregate_ir_task,
             lambda: build_run("tests/compiler/features/void_if_discarded.coil", "void-if-discarded"),
-            lambda: build_run("src/examples/bitfields.coil", "static-assert", "--backend", "arm64", want=42),
+            lambda: build_run("src/examples/bitfields.coil", "static-assert", *backend_flags, want=42),
             lint_task,
             default_lint_task,
             broken_lint_task,
