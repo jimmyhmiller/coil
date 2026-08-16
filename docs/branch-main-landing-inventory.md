@@ -36,9 +36,9 @@ running a clean candidate and the repository gates on an extraction branch.
 | L5 | Default file build outputs under the build directory | Land independently | Medium/high | Narrow driver/docs change in `24afddb`; verify CLI compatibility and explicit `-o` behavior. |
 | L6 | Explicit generated and isolated compile-time stages | Land independently as a series | Medium/high | Commits `15b5f52` through `2884010`. Split protocol, isolation, resumption, multi-round state, explicit markers, and cross-module routing into reviewable steps. Avoid making Scheme procedural macros a prerequisite for the generic stage mechanism. |
 | L7 | Imported phase programs compiled through normal expansion | Land after L6 | Medium | `b929f97`; needs a non-Scheme fixture proving imported phase code uses the ordinary compiler and retains the same language semantics. |
-| L8 | Directly running metaprograms with `coil run --meta` | Land after core engine ownership is settled | Medium; valuable | Generic CLI and engine work in `4ab6105`. Preserve the uniform in-process compiler/JIT rule. Extract without Chez/Jolt compatibility, allocation instrumentation, or Sprout being mandatory dependencies. |
-| L9 | In-memory x86-64 object JIT / uniform metaprogram entry invocation | Land before or with L8 | Medium | `src/compiler/jit_x64.coil` and engine/driver changes are cross-cutting. Needs a precise engine lifetime contract and parity tests against the interpreter; no dylib, callback protocol, or process fallback. |
-| L10 | Runtime metaprogram examples and Sprout | Land after L6 and L8 | Medium/high as demonstrations | `src/examples/sprout*.coil`, `tests/metaprogramming/sprout_lowered.coil`, and docs. Separate the simple `--meta` example from staged Sprout so each proves one mechanism. |
+| L8 | Directly running metaprograms with `coil run --meta` | Research branch — do not port | Incomplete experiment | The branch runs a useful fixed-arity `Code... -> Code` subset, but not arbitrary macros, readers, checkers, transforms, staged entries, signatures, and contexts. Preserve the desired UX and lessons; design the universal full-compiler runner afresh. |
+| L9 | In-memory x86-64 object JIT / uniform metaprogram entry invocation | Research branch — do not port as this feature | Incomplete/entangled | `src/compiler/jit_x64.coil` and engine lifetime changes enabled the partial runner but were developed inside the broad checkpoint. They require independent motivation, ownership design, and parity testing before any future main proposal. |
+| L10 | Runtime metaprogram examples and Sprout | Research branch | Mixed demonstrations | `src/examples/sprout*.coil` remains useful staging evidence, but the direct-run examples prove only the partial L8 experiment. Do not port them as proof that arbitrary metaprograms run as programs. |
 | L11 | Persistent linked `Code` lists and proper/improper-list API | Research branch | Unproven as the preferred representation | Design in `6bf3a29`, implementation mostly in `214b405`. It demonstrated structural construction and improper pairs, but no recorded before/after benchmark establishes that the universal representation change is the right main-bound solution. Dotted syntax was driven primarily by Scheme/Chez. Keep the ideas and evidence; do not put this on the current landing path. |
 | L12 | Explicit destructive `Code` consumption/editing | Land after L11 | Medium | `code-set-car!`, `code-set-nth!`, `code-prepend!`, and `code-consume!` need a standalone ownership contract, alias-invalidating documentation, and focused positive/negative tests. Do not bundle allocation tracing merely because it is the first large user. |
 | L13 | Metaprogram invocation arenas, result evacuation, and stage-compilation arenas | Land after L8/L9, informed by L11/L12 | Research-grade implementation with measured promise | Separate invocation scratch, result ownership, rotating program generations, stage compiler scratch, engine image ownership, and diagnostic retention. Each boundary needs an escape check and peak-memory regression. Current Jolt peak proves the full problem is not solved. |
@@ -124,21 +124,18 @@ ready now.
 4. L4 host-aware modernization gate.
 5. L6 staged metaprogram protocol, split into its internal milestones.
 6. L7 imported phase programs.
-7. L9 uniform in-process compiled engine ownership and L8 `coil run --meta`,
-   developed as separate review steps over one engine contract.
-8. L10 Sprout examples, with simple and staged proofs separated.
-9. L15 memory telemetry and recursive-splice lint.
-10. L12 destructive consumption API, if still desired independently of linked
+7. L15 memory telemetry and recursive-splice lint.
+8. L12 destructive consumption API, if still desired independently of linked
     syntax.
-11. L14 allocation observer, then allocation instrumentation.
-12. L13 explicit arena/generation boundaries, one lifetime boundary per change.
-13. L5 build-output default, if still desired after independent CLI review.
-14. Individual L19 Scheme correctness fixes as soon as each is isolated; they
+9. L14 allocation observer, then allocation instrumentation.
+10. L13 explicit arena/generation boundaries, one lifetime boundary per change.
+11. L5 build-output default, if still desired after independent CLI review.
+12. Individual L19 Scheme correctness fixes as soon as each is isolated; they
     need not wait for the metaprogram sequence when they have no dependency.
-15. L16-L18 Scheme architecture/features in independently scoped series.
-16. Selected implemented portions of L20 only after placeholder audit.
-17. L21 full Jolt integration only after functional and memory acceptance.
-18. L23-L24 seeds, CI, and snapshots alongside the exact feature they validate.
+13. L16-L18 Scheme architecture/features in independently scoped series.
+14. Selected implemented portions of L20 only after placeholder audit.
+15. L21 full Jolt integration only after functional and memory acceptance.
+16. L23-L24 seeds, CI, and snapshots alongside the exact feature they validate.
 
 Detailed porting dossiers for the selected priorities live under `docs/landing/`:
 
@@ -147,7 +144,8 @@ Detailed porting dossiers for the selected priorities live under `docs/landing/`
 - `03-brainfuck-reader-proof.md`;
 - `04-host-aware-modernize-gate.md`;
 - `06-staged-metaprograms.md`;
-- `07-run-metaprograms-as-programs.md`.
+- `07-run-metaprograms-as-programs.md` is retained as an **incomplete experiment
+  report**, not a porting dossier or landing recommendation.
 
 ## Items that must not be conflated
 

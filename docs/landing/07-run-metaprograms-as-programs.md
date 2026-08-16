@@ -1,4 +1,23 @@
-# Porting dossier: run metaprograms as ordinary programs
+# Experiment report: running metaprograms as ordinary programs
+
+## Status: incomplete experiment — do not port
+
+This branch did **not** achieve the intended feature: running any existing
+metaprogram faithfully as a normal program with the full compiler available.
+
+It contains two different partial experiments:
+
+1. `coil run --meta` invokes a useful subset of compiler-hosted entries, limited
+   primarily to fixed-arity `Code... -> Code` functions and a partially specified
+   `--program` input mode.
+2. `coil.meta.runtime` lets selected syntax-only examples compile as standalone
+   applications by duplicating part of the `Code` API, but lacks the full compiler
+   context and cannot run arbitrary existing metaprograms faithfully.
+
+Neither is a completed implementation of the goal. Neither should be ported to
+`main`. Preserve them as evidence about the desired UX, engine reuse, and the
+failure modes of a reduced runtime. A future implementation should begin from a
+fresh design using the full compiler and one authoritative metaprogram context.
 
 ## Goal
 
@@ -25,7 +44,7 @@ runtime, or Jolt-specific path.
 
 ## Branch provenance
 
-The coherent implementation was checkpointed in `4ab6105`, primarily across:
+Both experiments were checkpointed together in `4ab6105`, primarily across:
 
 - `src/compiler/driver.coil`;
 - `src/compiler/metaengine.coil`;
@@ -37,7 +56,24 @@ The coherent implementation was checkpointed in `4ab6105`, primarily across:
 - `scripts/compiler/oracle/gate-runtime-metaprograms.sh`;
 - `tests/metaprogramming/run_meta_*.coil`.
 
-Because this is inside a broad checkpoint, provenance is not a cherry-pick plan.
+Because this is inside a broad checkpoint, provenance is not a cherry-pick plan,
+and the combined file list must not be mistaken for one coherent implementation.
+
+## What was and was not demonstrated
+
+| Capability | `coil run --meta` experiment | `coil.meta.runtime` experiment |
+|---|---|---|
+| Compiled Coil execution | Yes, through selected compiler engine entries | Yes, as an ordinary application |
+| Full compiler `CtCtx` | Intended and present on focused engine calls | No |
+| Existing fixed `Code... -> Code` entry | Focused examples work | Only if rewritten against the duplicate runtime subset |
+| Arbitrary macro | Not established | Not established |
+| Whole-program transform | Partial `--program` experiment only | Not faithful to compiler context |
+| Checker diagnostics/veto semantics | Not established | Not faithful to compiler context |
+| Reader provider/raw-source context | Not established | Not established |
+| Staged entry/phase state | Not established | Not established |
+| Reflection/source/target parity | Not comprehensively established | Incomplete by design |
+| Arbitrary signatures and return values | No | No general invocation contract |
+| Universal “any metaprogram” claim | **No** | **No** |
 
 ## User-visible semantics
 
@@ -129,9 +165,9 @@ runtime that risks semantic drift, and it is **not required by `coil run
 --meta`**. Do not port it as part of this feature. The desired runner uses the
 full compiler's authoritative operation table and real `CtCtx`.
 
-## Extraction strategy
+## What a future implementation would need
 
-This undertaking should be split without compromising the uniform design:
+The following is design guidance, not an extraction strategy for the branch code:
 
 1. Define and test a public engine-level `run Code... -> Code` operation over an
    already-installed `MEEntry`.
@@ -145,11 +181,11 @@ This undertaking should be split without compromising the uniform design:
    hardening change.
 9. Add memory tracing and Sprout examples after the basic runner is stable.
 
-Do not port Scheme/Jolt compatibility, linked `Code` lists, destructive Code
-editing, allocation instrumentation, `coil.meta.runtime`, its monomorphizer
-redirections, or staged metaprograms merely to make the first runner work.
-Staging and direct running should converge on the same engine API, but either
-public feature should be testable independently.
+Do not transplant the existing driver/JIT/runtime bundle and attempt to complete
+it incrementally on `main`. In particular, do not port `coil.meta.runtime`, its
+monomorphizer redirections, the partial CLI contract, or its checkpoint engine
+ownership as an allegedly finished foundation. Any future work may reuse ideas
+after independent review, but starts as a new feature.
 
 ## Known gaps and risks
 
@@ -194,7 +230,7 @@ This feature is valuable precisely because ordinary tools become applicable:
 
 These are user-facing capabilities, not temporary Jolt diagnostics.
 
-## Acceptance
+## Acceptance criteria for a future, new implementation
 
 - Identity and structured-Code examples print parseable, expected source.
 - Missing/wrong arguments and unsupported signatures diagnose cleanly.
