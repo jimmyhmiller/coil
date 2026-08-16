@@ -119,6 +119,26 @@ expect_out "body has type codebuilder but the declared return type is code" "ret
 printf '(module bb4)\n(import "coil.primitive" :as primitive)\n(defn ok-done [] (-> Code)\n  (let [b (primitive/code-list-new)]\n    (do (primitive/code-list-push! b `1) (primitive/code-list-done b))))\n(defn main [] (-> i64) 0)\n' > "$T/bb4.coil"
 expect_rc 0 "build + done + return typechecks" "$COIL" check "$T/bb4.coil"
 
+echo "== code-rest is a view (META_MEMORY phase 5) =="
+# cdr-recursion over a 20,000-element Code list. When code-rest copied the
+# tail this shape allocated n²/2 ≈ 2×10⁸ nodes (~13 GiB); as an O(1) view it
+# runs at the compiler's baseline (~0.5 GiB measured). The 2 GiB cap fails the
+# copying implementation with an order of magnitude to spare.
+{
+  printf '(module bigcdr)\n(import "coil.primitive" :as primitive)\n'
+  printf '(defn sum-ints [(xs Code)] (-> i64)\n'
+  printf '  (if (primitive/icmp-eq (primitive/code-count xs) 0)\n      0\n'
+  printf '      (primitive/iadd (primitive/code-int (primitive/code-nth xs 0))\n'
+  printf '                      (sum-ints (primitive/code-rest xs)))))\n'
+  printf '(defn total [& (body Code)] (-> Code) `~(sum-ints body))\n'
+  printf '(defn main [] (-> i64)\n  (- (total'
+  awk 'BEGIN { for (i=0;i<20000;i++) printf " 1" }'
+  printf ') 20000))\n'
+} > "$T/bigcdr.coil"
+( ulimit -v 2097152; "$COIL" check "$T/bigcdr.coil" >/dev/null 2>&1 ) \
+  && ok "20k-step code-rest recursion typechecks under a 2 GiB cap" \
+  || bad "code-rest view teeth" "cdr-recursion blew the 2 GiB cap — code-rest is copying tails again (docs/design/META_MEMORY.md)"
+
 echo "== executable-relative resources through PATH =="
 HTTP_NATIVE_TARGET=$([ "$HOST_OS" = Linux ] && echo x86_64-linux || echo arm64-macos)
 mkdir -p "$T/path-bin" "$T/real-bin/native/curl/$HTTP_NATIVE_TARGET" "$T/lib/coil"
