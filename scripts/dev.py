@@ -384,7 +384,10 @@ source-roots = ["src"]
 def test_modernize_fast(compiler: str) -> None:
     """Run the independent focused fixtures concurrently, within the 30s gate."""
     started = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="coil-modernize-fast-") as raw_tmp:
+    # Project-mode subprocesses run from their fixture directory. Keep that
+    # directory below the checkout so a stage compiler in /tmp can still find
+    # this checkout's standard library by walking upward from the working tree.
+    with tempfile.TemporaryDirectory(prefix=".coil-modernize-fast-", dir=ROOT) as raw_tmp:
         tmp = Path(raw_tmp)
         candidate = Path(compiler).resolve()
         if not candidate.is_file():
