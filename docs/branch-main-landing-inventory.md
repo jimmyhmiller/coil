@@ -147,6 +147,10 @@ Detailed porting dossiers for the selected priorities live under `docs/landing/`
 - `07-run-metaprograms-as-programs.md` is retained as an **incomplete experiment
   report**, not a porting dossier or landing recommendation.
 
+Copy-ready prompts for fresh main-based implementation sessions are indexed in
+`docs/session-prompts/README.md`. The staged work is deliberately divided into
+five dependency-ordered sessions; the universal-runner prompt is design-only.
+
 ## Items that must not be conflated
 
 - Running a metaprogram directly is not the same feature as staging it during
