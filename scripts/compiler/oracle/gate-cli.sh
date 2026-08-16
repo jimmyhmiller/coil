@@ -106,6 +106,19 @@ awk 'BEGIN{
   && ok "an 8k-form scope body typechecks under a 4 GiB address-space cap" \
   || bad "metaprogram memory teeth" "coil check blew the 4 GiB cap — a quadratic expansion idiom is back (docs/design/META_MEMORY.md)"
 
+echo "== CodeBuilder discipline (META_MEMORY phase 4) =="
+# The builder/Code type split: a finished list cannot be pushed onto, a list
+# still being built cannot be read, and a builder cannot pose as Code without
+# (primitive/code-list-done b). Each misuse is a LOCATED error naming the fix.
+printf '(module bb1)\n(import "coil.primitive" :as primitive)\n(defn f [(c Code)] (-> Code) (do (primitive/code-list-push! c `1) c))\n(defn main [] (-> i64) 0)\n' > "$T/bb1.coil"
+expect_out "expect a builder from .primitive/code-list-new." "pushing onto finished Code is a located error" "$COIL" check "$T/bb1.coil"
+printf '(module bb2)\n(import "coil.primitive" :as primitive)\n(defn f [] (-> i64) (let [b (primitive/code-list-new)] (primitive/code-count b)))\n(defn main [] (-> i64) 0)\n' > "$T/bb2.coil"
+expect_out "freeze the builder first with .primitive/code-list-done b." "reading an unfrozen builder is a located error" "$COIL" check "$T/bb2.coil"
+printf '(module bb3)\n(import "coil.primitive" :as primitive)\n(defn f [] (-> Code) (primitive/code-list-new))\n(defn main [] (-> i64) 0)\n' > "$T/bb3.coil"
+expect_out "body has type codebuilder but the declared return type is code" "returning a builder as Code is a type error" "$COIL" check "$T/bb3.coil"
+printf '(module bb4)\n(import "coil.primitive" :as primitive)\n(defn ok-done [] (-> Code)\n  (let [b (primitive/code-list-new)]\n    (do (primitive/code-list-push! b `1) (primitive/code-list-done b))))\n(defn main [] (-> i64) 0)\n' > "$T/bb4.coil"
+expect_rc 0 "build + done + return typechecks" "$COIL" check "$T/bb4.coil"
+
 echo "== executable-relative resources through PATH =="
 HTTP_NATIVE_TARGET=$([ "$HOST_OS" = Linux ] && echo x86_64-linux || echo arm64-macos)
 mkdir -p "$T/path-bin" "$T/real-bin/native/curl/$HTTP_NATIVE_TARGET" "$T/lib/coil"
