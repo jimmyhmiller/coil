@@ -41,10 +41,9 @@ fi
 LF=(--link-flag "-L$libdir" --link-flag "-Wl,-rpath,$libdir" --link-flag -lLLVM
     --link-flag -lstdc++ --link-flag -lm --link-flag -lpthread --link-flag -ldl)
 
-if   [ -n "${STAGE0:-}" ];        then :
-elif [ -x "$SEED" ];              then STAGE0="$SEED"
-else echo "no stage0: need a committed $SEED (or set STAGE0=/path/to/coil)"; exit 1; fi
-echo "stage0 = $STAGE0   (libLLVM: $libdir)"
+. scripts/compiler/select-stage0.sh
+select_stage0 "$SEED" "$SRC" x64 "${LF[@]}" || exit 1
+echo "stage0 = $STAGE0 ($STAGE0_SOURCE; libLLVM: $libdir)"
 
 # Probe before building: a stage0 too old for this tree otherwise fails deep in
 # stage1 with an error that reads like a compiler bug. See stage0-check.sh.
@@ -52,7 +51,7 @@ echo "stage0 = $STAGE0   (libLLVM: $libdir)"
 stage0_check "$STAGE0" "$SEED" "$SRC" "${LF[@]}" || exit 1
 
 echo "=== stage1: stage0 builds the self-host compiler ==="
-COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o /tmp/coil-lrb1 "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
+COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o /tmp/coil-lrb1 "${STAGE0_BUILD_FLAGS[@]}" "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it ==="
 /tmp/coil-lrb1   build "$SRC" -o /tmp/coil-lrb2 "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
 echo "=== stage3: stage2 rebuilds it ==="
@@ -67,15 +66,9 @@ python3 scripts/oracle.py linux-ir gate --compiler /tmp/coil-lrb2 >/dev/null || 
 echo "  linux gate-full: PASS (IR byte-exact vs the Linux snapshot)"
 python3 scripts/oracle.py runtime gate linux --compiler /tmp/coil-lrb2 >/dev/null  || { echo "linux runtime gate FAIL"; exit 1; }
 echo "  linux gate-run:  PASS (programs run identically)"
-# Do the checkers still fire at all? `modernize-fast` covers this too, but it
-# builds with --backend arm64 and so is red on Linux for an unrelated reason
-# (Mach-O that GNU ld cannot link). When a loader change silently disabled every
-# checker for any module with an `import` — `lint --fix` reporting success and
-# changing nothing — the new failure had nowhere to show: on Linux it hid behind
-# that known red, and on macOS nobody had run the gate since. A gate that cannot
-# distinguish its own failure modes detected the bug and made the signal
-# unreadable. This asks one question, on the host backend, and can fail for one
-# reason.
+# Keep a direct checker assertion in the bootstrap gate in addition to the
+# host-aware bounded modernize gate. This asks one question and has one failure
+# mode: lint --fix must actually rewrite source.
 python3 scripts/tests/lint_fires.py --coil /tmp/coil-lrb2 >/dev/null   || { echo "gate-lint-fires FAIL — lint --fix does nothing"; exit 1; }
 echo "  gate-lint-fires: PASS (checkers fire; lint --fix rewrites)"
 
@@ -150,6 +143,8 @@ echo "  stage gates:     PASS (read/ast/load/resolve/check/expand/mono/x86 byte-
 python3 scripts/oracle.py coverage >/dev/null \
   || { echo "snapshot coverage FAIL"; python3 scripts/oracle.py coverage; exit 1; }
 echo "  corpus coverage: PASS (every corpus entry blessed on both platforms)"
+
+stage_lib_cleanup
 
 DEST="${1:-build/bin/coil}"
 mkdir -p "$(dirname "$DEST")"

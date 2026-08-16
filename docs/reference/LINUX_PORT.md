@@ -9,8 +9,10 @@ LLVM 21 (apt.llvm.org) and a C compiler:
 
 `build/bin/coil` and `build/bin/coil-nollvm` are ignored build outputs. The Linux
 compiler installs under ignored `build/bin/`, and its seed is
-`bootstrap/seeds/native/coil-seed-linux-x86_64` (ELF, dynamic libLLVM 21). If your libLLVM
-doesn't match, bootstrap a stage0 from the shipped IR — `bootstrap/seeds/native/linux-ir/NOTES.md`.
+`bootstrap/seeds/native/coil-seed-linux-x86_64` (ELF, dynamic libLLVM 21). If it is
+missing, stale, or unusable with the installed libLLVM, bootstrap selection
+automatically translates the portable seed in `bootstrap/seeds/wasm/coilc.wasm`
+to a host executable. `COIL_FORCE_WASM_STAGE0=1` exercises that recovery path.
 
 ## How the port went in (July 2026)
 

@@ -6,9 +6,20 @@ compiler (and, for the LLVM backend, libLLVM) — in three flavors:
 
 | Path | Command | Needs | Compiler it builds |
 |------|---------|-------|--------------------|
-| **LLVM-free** (recommended) | `python3 scripts/dev.py build nollvm` | just `cc` | arm64 backend only |
-| Full | `python3 scripts/dev.py build full` | `cc` + `libLLVM.dylib` | LLVM + arm64 backends |
-| Linux x86-64 | `python3 scripts/dev.py build linux` | `cc` + libLLVM 21 | LLVM backend, ELF ([LINUX_PORT.md](LINUX_PORT.md)) |
+| **LLVM-free** | `python3 scripts/dev.py build nollvm` | just `cc` | Native backend for the host |
+| Full | `python3 scripts/dev.py build full` | `cc` + LLVM 21 | LLVM + native backends |
+
+Both commands select the host implementation automatically: macOS/ARM64 uses the
+Mach-O bootstrap and Linux/x86-64 uses the ELF bootstrap. The explicit `linux` and
+`nollvm-linux` variants remain available for automation but are not required for
+ordinary use.
+
+Stage zero is selected in one order everywhere: an explicit `STAGE0`, then the
+matching committed native seed, then the portable WASM seed translated with
+`wasm2c` and the host C compiler. Native seeds are the fast path; WASM is the
+portable recovery path when a native seed is absent, for the wrong platform, or
+too old to compile the checkout. Set `COIL_FORCE_WASM_STAGE0=1` to exercise that
+fallback deliberately.
 
 ## Fast inner loop
 
@@ -52,7 +63,8 @@ diagnostic instead of doing nothing.
 python3 scripts/dev.py build full          # verifies, then installs locally and globally
 ```
 
-Uses the committed seed `bootstrap/seeds/native/coil-seed`. This is the complete compiler
+On macOS this prefers `bootstrap/seeds/native/coil-seed`; on Linux it prefers
+`bootstrap/seeds/native/coil-seed-linux-x86_64`. This is the complete compiler
 (both backends, plus `emit-ir`/`dump-ir`), so its binary links `libLLVM` even when
 the arm64 backend does the codegen — the compiler *embeds* an LLVM backend
 (`codegen.coil` FFIs into the LLVM-C API). **Requirements:** `libLLVM.dylib`
@@ -95,12 +107,18 @@ top files so the snapshot oracle keeps them from drifting apart.
 
 ## The seeds
 
-Two prebuilt, committed self-host compilers:
+The repository carries optimized native seeds for both supported hosts plus one
+portable fallback:
 
 - `bootstrap/seeds/native/coil-seed` — full (LLVM + arm64), ~2.4 MB, links libLLVM.
   Provenance in `bootstrap/seeds/native/SEED_VERSION`.
 - `bootstrap/seeds/native/coil-seed-nollvm` — LLVM-free (arm64 only), ~2.1 MB, links only
   libSystem. Provenance in `bootstrap/seeds/native/SEED_VERSION_NOLLVM`.
+- `bootstrap/seeds/native/coil-seed-linux-x86_64` — full Linux/x86-64 compiler.
+- `bootstrap/seeds/native/coil-seed-nollvm-linux-x86_64` — LLVM-free Linux/x86-64 compiler.
+- `bootstrap/seeds/wasm/coilc.wasm` — portable wasm64 compiler containing both native
+  object backends. It is translated to a host executable only when the matching
+  native seed cannot be used. Provenance is in `bootstrap/seeds/wasm/SEED_VERSION`.
 
 Neither seed is **trusted blindly.** Each rebootstrap re-derives the compiler from
 source on every run and proves the result faithful independently, so a stale or
@@ -136,12 +154,10 @@ git add bootstrap/seeds/native/ && git commit -m 'refresh self-host seeds'
 `refresh-seed.sh` refuses to update a seed unless its fixpoint + gates pass, so a
 broken seed can never be committed.
 
-⚠ **If you forget, the LLVM-free seed is the one that strands** — it is its own only
-stage0, so a language change it cannot parse means it can never build its own
-replacement (this really happened: `isize`/`usize` landed in the compiler source and
-`rebootstrap-nollvm.sh` died at stage1 with `unknown type 'isize'` while the full
-build stayed green). The escape hatch is to **bridge with the other compiler**, not to
-re-seed from anything external:
+If a native seed predates a language or standard-library change, selection now falls
+back to the WASM seed instead of stranding the bootstrap. Language changes must still
+refresh the native seeds and the WASM seed together so ordinary builds retain the fast
+path and the portable recovery path remains current.
 
 ```sh
 build/bin/coil build src/compiler/main_a64.coil -o /tmp/nl --backend arm64

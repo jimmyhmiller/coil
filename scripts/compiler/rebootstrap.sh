@@ -76,11 +76,9 @@ trap cleanup_run_dir EXIT
 LF=($(./scripts/compiler/llvm-link-flags.sh "${COIL_LLVM_LINK:-dynamic}")) \
   || { echo "cannot compute LLVM link flags"; exit 1; }
 
-if   [ -n "${STAGE0:-}" ];        then :
-elif [ -x "$SEED" ];              then STAGE0="$SEED"
-else echo "no stage0: need a committed $SEED (or set STAGE0=/path/to/coil)"; exit 1
-fi
-echo "stage0 = $STAGE0"
+. scripts/compiler/select-stage0.sh
+select_stage0 "$SEED" "$SRC" arm64 "${LF[@]}" || exit 1
+echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
 
 # Probe before building: a stage0 too old for this tree otherwise fails deep in
 # stage1 with an error that reads like a compiler bug. See stage0-check.sh.
@@ -88,7 +86,7 @@ echo "stage0 = $STAGE0"
 stage0_check "$STAGE0" "$SEED" "$SRC" "${LF[@]}" || exit 1
 
 echo "=== stage1: stage0 builds the self-host compiler (default LLVM backend) ==="
-COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o "$RB1" "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
+COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o "$RB1" "${STAGE0_BUILD_FLAGS[@]}" "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
 
 echo "=== stage2: stage1 rebuilds the compiler ==="
 "$RB1" build "$SRC" -o "$RL2" "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
@@ -99,6 +97,8 @@ echo "=== stage3: stage2 rebuilds the compiler ==="
 cmp "$RL2.o" "$RL3.o" \
   || { echo "LLVM FIXPOINT FAIL — LLVM-backend objects differ"; exit 2; }
 echo "  LLVM fixed point: PASS"
+
+stage_lib_cleanup
 
 DEST="${1:-build/bin/coil}"
 # Install the stage-3 compiler that reproduced stage 2 byte-for-byte.

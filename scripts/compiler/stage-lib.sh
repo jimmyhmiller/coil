@@ -14,3 +14,14 @@
 mkdir -p /tmp/lib/coil
 ln -sfn "$PWD/src/stdlib" /tmp/lib/coil/stdlib
 ln -sfn "$PWD/src/compiler/prelude.coil" /tmp/lib/coil/prelude.coil
+
+# Remove only the links this checkout installed. Leaving them behind makes a later
+# CLI layout test accidentally discover this checkout through /tmp and report a
+# missing-library case as success.
+stage_lib_cleanup() {
+  [ "$(readlink /tmp/lib/coil/stdlib 2>/dev/null)" = "$PWD/src/stdlib" ] \
+    && rm /tmp/lib/coil/stdlib
+  [ "$(readlink /tmp/lib/coil/prelude.coil 2>/dev/null)" = "$PWD/src/compiler/prelude.coil" ] \
+    && rm /tmp/lib/coil/prelude.coil
+  rmdir /tmp/lib/coil /tmp/lib 2>/dev/null || true
+}

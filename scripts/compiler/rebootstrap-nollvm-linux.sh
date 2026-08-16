@@ -30,12 +30,9 @@ cd "$(dirname "$0")/../.."
 SRC=src/compiler/main_x64.coil
 SEED=bootstrap/seeds/native/coil-seed-nollvm-linux-x86_64
 
-if   [ -n "${STAGE0:-}" ];   then :
-elif [ -x "$SEED" ];         then STAGE0="$SEED"
-elif [ -x build/bin/coil ];          then STAGE0=build/bin/coil
-else echo "no stage0: need $SEED or build/bin/coil (or set STAGE0=/path/to/coil)"; exit 1
-fi
-echo "stage0 = $STAGE0"
+. scripts/compiler/select-stage0.sh
+select_stage0 "$SEED" "$SRC" x64 || exit 1
+echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
 
 # stage1 may come from the LLVM-backed compiler, whose own `build` defaults to the
 # LLVM backend and therefore needs the libLLVM link line. Once stage1 exists it is
@@ -65,7 +62,7 @@ fi
 stage0_check "$STAGE0" "$SEED" "$SRC" "${S1FLAGS[@]}" || exit 1
 
 echo "=== stage1: stage0 builds the LLVM-free compiler ==="
-COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o /tmp/coil-nlx1 "${S1FLAGS[@]}" || { echo "stage1 FAILED"; exit 1; }
+COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o /tmp/coil-nlx1 "${STAGE0_BUILD_FLAGS[@]}" "${S1FLAGS[@]}" || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it with the x64 backend ==="
 /tmp/coil-nlx1 build "$SRC" -o /tmp/coil-nlx2                 || { echo "stage2 FAILED"; exit 1; }
 echo "=== stage3: stage2 rebuilds it with the x64 backend ==="
@@ -85,6 +82,8 @@ echo "=== GATE: x64 behavioral gate-run ==="
 python3 scripts/oracle.py runtime gate x64 --compiler /tmp/coil-nlx2 >/dev/null 2>&1 \
   || { echo "x64 gate-run FAIL (run it directly to see which programs)"; exit 1; }
 echo "  x64 gate-run: PASS (programs run identically to the LLVM reference)"
+
+stage_lib_cleanup
 
 DEST="${1:-build/bin/coil-nollvm}"
 mkdir -p "$(dirname "$DEST")"

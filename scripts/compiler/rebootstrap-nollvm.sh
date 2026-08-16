@@ -38,11 +38,9 @@ export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts}"
 # Strict mode makes that fallback a hard error for the whole build and its gates.
 export COIL_STRICT_BUNDLE="${COIL_STRICT_BUNDLE:-1}"
 
-if   [ -n "${STAGE0:-}" ];        then :
-elif [ -x "$SEED" ];              then STAGE0="$SEED"
-else echo "no stage0: need a committed $SEED (or set STAGE0=/path/to/coil)"; exit 1
-fi
-echo "stage0 = $STAGE0"
+. scripts/compiler/select-stage0.sh
+select_stage0 "$SEED" "$SRC" arm64 || exit 1
+echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
 
 # Probe before building: a stage0 too old for this tree otherwise fails deep in
 # stage1 with an error that reads like a compiler bug. See stage0-check.sh.
@@ -50,7 +48,7 @@ echo "stage0 = $STAGE0"
 stage0_check "$STAGE0" "$SEED" "$SRC" || exit 1
 
 echo "=== stage1: stage0 builds the LLVM-free compiler ==="
-COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o /tmp/coil-nl1 || { echo "stage1 FAILED"; exit 1; }
+COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o /tmp/coil-nl1 "${STAGE0_BUILD_FLAGS[@]}" || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it with --backend arm64 ==="
 /tmp/coil-nl1 build "$SRC" -o /tmp/coil-nl2 --backend arm64 || { echo "stage2 FAILED"; exit 1; }
 echo "=== stage3: stage2 rebuilds it with --backend arm64 ==="
@@ -69,6 +67,8 @@ echo "  ok — byte-identical, the compiler reproduces itself"
 echo "=== GATE: arm64 behavioral gate-run ==="
 python3 scripts/oracle.py runtime gate arm64 --compiler /tmp/coil-nl2 >/dev/null 2>&1 || { echo "arm64 runtime gate FAIL"; exit 1; }
 echo "  arm64 gate-run: PASS (programs run identically to the LLVM reference)"
+
+stage_lib_cleanup
 
 DEST="${1:-build/bin/coil-nollvm}"
 mkdir -p "$(dirname "$DEST")"

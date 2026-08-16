@@ -26,6 +26,7 @@
 #include <string.h>
 #include <math.h>
 #include <fcntl.h>
+#include <time.h>
 #include <unistd.h>
 
 // ---- module interface (defined in the generated coilc.c) -------------------
@@ -238,7 +239,21 @@ uint64_t env_getcwd(uint64_t buf, uint64_t size) {
 // getenv: the reference JS host returns NULL for every variable and still
 // produces a byte-identical self-build, so mirror that exactly.
 uint64_t env_getenv(uint64_t name) { (void)name; return 0; }
+uint32_t env_setenv(uint64_t name, uint64_t value, uint32_t overwrite) {
+    return (uint32_t)setenv(hoststr(name), hoststr(value), (int)overwrite);
+}
 uint32_t env_getpid(void) { return (uint32_t)getpid(); }
+uint32_t env_clock_gettime(uint32_t clock_id, uint64_t out) {
+    struct timespec ts;
+    int rc = clock_gettime((clockid_t)clock_id, &ts);
+    if (rc == 0) {
+        int64_t sec = (int64_t)ts.tv_sec;
+        int64_t nsec = (int64_t)ts.tv_nsec;
+        memcpy(MEM + out, &sec, 8);
+        memcpy(MEM + out + 8, &nsec, 8);
+    }
+    return (uint32_t)rc;
+}
 
 // stdio FILE* is modeled as the underlying fd (opaque handle round-trips).
 uint64_t env_fopen(uint64_t path, uint64_t mode) {
@@ -328,6 +343,8 @@ uint32_t env_pthread_cond_signal(uint64_t a) { (void)a; return 0; }
 uint32_t env_pthread_cond_wait(uint64_t a, uint64_t b) { (void)a; (void)b; return 0; }
 uint32_t env_pthread_attr_init(uint64_t a) { (void)a; return 0; }
 uint32_t env_pthread_attr_setstacksize(uint64_t a, uint64_t b) { (void)a; (void)b; return 0; }
+uint32_t env_pthread_attr_setguardsize(uint64_t a, uint64_t b) { (void)a; (void)b; return 0; }
+uint32_t env_pthread_attr_destroy(uint64_t a) { (void)a; return 0; }
 
 // ---- DEAD imports: comptime is pure interpretation, so real threads, native
 // JIT/dylib and raw mmap are never reached. Abort LOUDLY (not a silent no-op)
@@ -340,6 +357,7 @@ uint32_t env_munmap(uint64_t a, uint64_t b) { (void)a;(void)b; die("unreachable:
 uint32_t env_mprotect(uint64_t a, uint64_t b, uint32_t c) { (void)a;(void)b;(void)c; die("unreachable: env.mprotect"); return 0; }
 uint64_t env_dlopen(uint64_t a, uint64_t b) { (void)a;(void)b; die("unreachable: env.dlopen"); return 0; }
 uint64_t env_dlsym(uint64_t a, uint64_t b) { (void)a;(void)b; die("unreachable: env.dlsym"); return 0; }
+uint64_t env_dlerror(void) { die("unreachable: env.dlerror"); return 0; }
 
 // ===========================================================================
 // driver
