@@ -16,6 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ORACLE = ROOT / "tests/compiler/oracle"
 TARGET_X86 = "x86_64-apple-macosx11.0.0"
+TARGET_FULL = "arm64-apple-darwin25.5.0"
 
 # Stages whose output is host-sensitive, and the triple they are pinned to.
 #
@@ -39,6 +40,8 @@ def stage_extra(stage: str) -> list[str]:
     """The --target arguments a stage's dump must be invoked with."""
     if stage == "x86":
         return ["--target", TARGET_X86]
+    if stage == "full":
+        return ["--target", TARGET_FULL]
     if stage in PINNED_STAGES:
         return ["--target", TARGET_PINNED]
     return shlex.split(os.environ.get("COIL_SELF_ARGS", ""))
@@ -177,9 +180,11 @@ def snapshot_diag(compiler: Path) -> int:
         temp_path = Path(temp)
         for source in build_inputs:
             output = temp_path / Path(source).stem
-            result = subprocess.run([str(compiler), "build", source, "-o", str(output)], cwd=ROOT,
+            target = ["--target", TARGET_FULL] if source.endswith("14-shim-bad-gpr.coil") else []
+            result = subprocess.run([str(compiler), "build", source, "-o", str(output), *target], cwd=ROOT,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            normalized = result.stdout.replace(root_prefix, b"").replace(f"{temp}/".encode(), b"")
+            normalized = normalize_build_diag(
+                result.stdout.replace(root_prefix, b"").replace(f"{temp}/".encode(), b""))
             stem = reference / f"{mangle(source)}"
             Path(f"{stem}.diag").write_bytes(normalized)
             Path(f"{stem}.exit").write_text(f"{result.returncode}\n")
@@ -213,7 +218,8 @@ def snapshot(compiler: Path, stage: str) -> int:
                                    extra=tuple(stage_extra(stage)))
     elif stage == "full":
         accepted = snapshot_simple(compiler, stage, STAGE_INPUTS[stage],
-                                   command=os.environ.get("COIL_IR_CMD", "emit-ir"))
+                                   command=os.environ.get("COIL_IR_CMD", "emit-ir"),
+                                   extra=tuple(stage_extra(stage)))
     elif stage == "x86":
         inputs = [rel(path) for path in sorted((ORACLE / "features").glob("*x86*.coil"))]
         accepted = snapshot_simple(compiler, stage, inputs, extra=("--target", TARGET_X86))
@@ -221,6 +227,13 @@ def snapshot(compiler: Path, stage: str) -> int:
         raise SystemExit(f"unknown snapshot stage: {stage}")
     print(f"snapshot {stage}: {len(accepted)} files")
     return 0
+
+
+def normalize_build_diag(output: bytes) -> bytes:
+    """Discard platform linker prose while retaining Coil's stable diagnostic."""
+    marker = b"error: linker/ar failed with exit status:"
+    at = output.find(marker)
+    return output[at:] if at >= 0 else output
 
 
 def gate_diag(compiler: Path, verbose: bool) -> int:
@@ -239,11 +252,13 @@ def gate_diag(compiler: Path, verbose: bool) -> int:
     with tempfile.TemporaryDirectory() as temp:
         for source in read_list(base / "build-corpus.txt"):
             output = Path(temp) / Path(source).stem
-            result = subprocess.run([str(compiler), "build", source, "-o", str(output)], cwd=ROOT,
+            target = ["--target", TARGET_FULL] if source.endswith("14-shim-bad-gpr.coil") else []
+            result = subprocess.run([str(compiler), "build", source, "-o", str(output), *target], cwd=ROOT,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            got = result.stdout.replace(root_prefix, b"").replace(f"{temp}/".encode(), b"")
+            got = normalize_build_diag(
+                result.stdout.replace(root_prefix, b"").replace(f"{temp}/".encode(), b""))
             stem = reference / mangle(source)
-            want = Path(f"{stem}.diag").read_bytes()
+            want = normalize_build_diag(Path(f"{stem}.diag").read_bytes())
             want_code = int(Path(f"{stem}.exit").read_text())
             if got != want or result.returncode != want_code:
                 failures.append(source)

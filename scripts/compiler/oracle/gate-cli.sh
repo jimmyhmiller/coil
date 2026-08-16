@@ -2625,7 +2625,10 @@ expect_out "missing from the bundled stdlib manifest" \
 # used to answer with a library from whenever it was built, and the only symptom was
 # that editing src/stdlib changed nothing. There is no environment variable to
 # redirect the search, so these are the only two outcomes.
-LONELY=$(mktemp -d)
+# Keep this outside both the checkout and /tmp: bootstrap stage compilers use
+# /tmp/lib/coil while they are being verified, and a "lonely" compiler beneath
+# /tmp would otherwise discover that stage library by walking upward.
+LONELY=$(mktemp -d /var/tmp/coil-lonely.XXXXXX)
 cp "$COIL" "$LONELY/coil"
 cp "$T/bundle/allns.coil" "$LONELY/allns.coil"
 expect_rc 1 "layout: a compiler with no library beside it fails instead of guessing" \

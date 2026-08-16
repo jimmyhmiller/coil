@@ -43,7 +43,9 @@ emit() { for f in "$@"; do printf -- '--link-flag %s ' "$f"; done; }
 
 case "$MODE" in
   dynamic)
-    emit "-L$("$LLVM_CONFIG" --libdir)" -lLLVM
+    # Coil's interpreter uses libm directly (`floor`, `fmod`, ...). macOS folds
+    # those symbols into libSystem, while ELF linkers require an explicit -lm.
+    emit "-L$("$LLVM_CONFIG" --libdir)" -lLLVM -lm
     ;;
   static)
     emit "-L$("$LLVM_CONFIG" --libdir)"
