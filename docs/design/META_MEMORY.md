@@ -1,6 +1,52 @@
 # Metaprogram memory: the expansion-arena contract
 
-Status: DESIGN — phase 0 landed (commit `7ec494e`), phases 1–6 below are the plan.
+Status: **SHIPPED** — all six phases are landed (2026-08-16); this document is
+now the record of the design plus what each phase turned out to be. Phase
+commits: `7ec494e` (phase 0, the scope fix), `f9cf84f` (metering), `0e69c3d`
+(lint + sweep), `ef7c512` (arena), `6502bca` (builder split), `c0150b2`
+(views), and the phase-6 commit this note ships in (defaults + budget).
+
+Deviations from the plan below, and why:
+
+- **The lint is warn-only** rather than shipping `--diff` assisted fixes: the
+  linear rewrite changes a helper's signature or restructures its whole body,
+  which a per-form suggest cannot express honestly. The sweep was done as
+  code changes instead (every finding in stdlib and examples, with
+  emit-ir-verified byte-identical expansion output), and the lint keeps the
+  idioms out.
+- **Metering needed no counting shim**: the scratch arena grew a monotonic
+  `total` counter, so phase 1 was a subtraction and phase 6 had nothing to
+  delete.
+- **`code-list-done` (op 62)** joined the builder API: freezing by unquote
+  alone couldn't serve helpers whose results are *read* (walked with
+  `code-nth`) before splicing. Identity at runtime; the type is the point.
+- **Views keep `sx-info` blind**: a `KView` reports NULL items through the
+  compiler-plane accessor funnel, so any view leaking past the promotion
+  boundary fails loudly instead of silently reading the parent list at the
+  wrong offset. Only the code-op layer (interpreter ops, metahost callbacks,
+  `sexp-eq`, splice, codelib mirrors) reads views, through `code-node-*`.
+- **One accepted sharp edge**: pushing onto a builder after freezing it can
+  reallocate the parent items array out from under views taken of the frozen
+  list — within one expansion only (the arena bounds it), and
+  `COIL_META_ARENA=poison` makes it loud. A truly affine builder would need
+  linear types.
+- **The budget's granularity** is the two chokepoints every allocating
+  metaprogram passes through constantly (code-op dispatch and the native
+  `mh-a` allocator hook), not every raw allocation: a pure-Coil allocation
+  loop between code ops is caught at its next op. In practice a runaway dies
+  within milliseconds; measured, the 500k-push gate fixture is stopped ~200
+  bytes past the line.
+- **Bootstrap seeds**: op 62+ made the committed seeds stale (they predate
+  the ops the swept stdlib now uses); `scripts/compiler/refresh-seed.sh` on
+  each supported host is the standing fix, per that script's own discipline.
+
+Measured after phase 6 (Linux x86-64, 20,000-op Brainfuck through the reader):
+1.6 GB peak / 2.1 s — vs 27.1 GB / 6.4 s before phase 0 — with the reader
+running against a declared `(meta-budget read-brainfuck 1024)` and every other
+stdlib metaprogram under the 64 MiB default. A 20,000-step `code-rest`
+recursion runs at the compiler's ~0.5 GB baseline (was ~13 GB of tail copies).
+Whole-compiler `coil check` with the arena on: 1.23 GB / 1.15 s (from 1.35 GB
+/ 1.51 s).
 
 ## The problem, measured (2026-08-16, Linux x86-64)
 

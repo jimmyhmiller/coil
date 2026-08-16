@@ -353,3 +353,33 @@ arm64 gate-run + gate-cli + gate-diag) and the finding's own repro.
 - diag-9 is half done (body/return spanned; param/field/return needs spans on AST type nodes).
 - gen-10 (mono O(n^1.7)→O(n)) is a deferred workflow item worth reviving as focused work.
 - The debug-checks mode (#9) is the landing spot src/stdlib/slice.coil's own "Phase-2" comment promises.
+
+---
+
+## Post-questionnaire: metaprogram memory (META_MEMORY, 2026-08-16)
+
+**Decision:** metaprogram memory is the AUTHOR'S explicit responsibility,
+enforced by construction rather than papered over by a collector. Shipped in
+six gated phases (docs/design/META_MEMORY.md has the full record):
+
+1. every expansion runs in its own arena — one value survives, the returned
+   Code, copied out at the boundary (`COIL_META_ARENA=0` opts out, `=poison`
+   makes a leaked alias loud);
+2. costs are visible in the API: `code-rest`/`code-slice` are O(1) views,
+   `code-copy`/`code-concat` are the only unbounded copies and say so;
+   `CodeBuilder` is its own type — build with `code-list-push!`, freeze with
+   `code-list-done`, and the checker rejects mutation of finished Code and
+   reads of unfrozen builders;
+3. failures are attributable: a 64 MiB default expansion budget (raisable
+   only by a source-level `(meta-budget NAME MIB)` declaration) kills a
+   runaway in milliseconds with an error naming the metaprogram, the bytes,
+   and the fix; `COIL_MTRACE=mem` attributes allocation per metaprogram; the
+   standard-profile lint `coil.lint.meta` flags the quadratic idioms.
+
+WHY: a 20,000-op Brainfuck reader compile peaked at 27.1 GiB, and every byte
+traced to two innocent-looking stdlib idioms (`code-rest` cdr-recursion and
+`(~@acc ~x)` accumulation) plus a leak-everything allocation model that made
+peak equal history. The same input now compiles in 1.6 GB/2.1 s, and the
+failure mode that produced it is a compile error, a lint finding, and a gate
+(gate-cli: memteeth, bigcdr, CodeBuilder discipline, budget) — not a memory
+graph someone has to notice.
