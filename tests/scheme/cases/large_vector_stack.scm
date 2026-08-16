@@ -1,0 +1,5 @@
+(define v (make-vector 200000 7))
+(display (vector-length v))
+(newline)
+(display (vector-ref v 199999))
+(newline)

@@ -2,6 +2,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use *)
 (import "coil.scheme.value" :use *)
+(import "coil.sync" :as sync)
 
 ;; The Scheme heap: fixed-size objects, bump-allocated out of big slabs, with a
 ;; free list rebuilt by a linear sweep.
@@ -18,6 +19,7 @@
 ;; low tag and is never dereferenced.
 ;;
 (extern malloc :cc c [i64] (-> (ptr u8)))
+(extern free :cc c [(ptr u8)] (-> void))
 
 ;; Object size and slab size. 40 bytes = 5 i64 fields (tag, mark, a, b, c).
 (defn obj-size [] (-> i64) 40)
@@ -35,6 +37,7 @@
 (defn g-peak [] (-> (ptr i64)) (alloc/static i64))
 (defn g-collections [] (-> (ptr i64)) (alloc/static i64))
 (defn g-total [] (-> (ptr i64)) (alloc/static i64))
+(defn g-next-collection [] (-> (ptr i64)) (alloc/static i64))
 
 ;; The shadow stack. The GC transform emits `gc-root`/`gc-sp`/`gc-sp-set!` around
 ;; managed values so collection points always see a consistent root set — which is
@@ -86,39 +89,70 @@
 ;; atomic/raw exceptions must be dispatched by tag: a flonum's `a` is IEEE bits,
 ;; and a symbol's `a` is its raw intern-table index (while a fresh hygienic
 ;; symbol's `b` still points at its source symbol).
-(defn mark [(v i64)] (-> i64)
-  (if (not (is-heap v)) 0                      ; immediates are never traced
+(defn raw-payload-tag? [(tag i64)] (-> bool)
+  (or (= tag (tag-flonum))
+      (or (= tag (tag-syntax))
+          (or (= tag (tag-foreign-pointer))
+              (or (= tag (tag-bytevector))
+                  (or (= tag (tag-mutex)) (= tag (tag-condition))))))))
+(defn mark-enqueue [(v i64) (work (ptr i64)) (top (ptr i64))] (-> i64)
+  (if (not (is-heap v)) 0                    ; immediates are never traced
     (if (= v 0) 0                            ; null
-      (if (not (managed-address? v)) 0        ; aligned raw values are not objects
-      (let [o (obj-of v)]
-        (if (= (primitive/load (primitive/field o mark)) 1) 0   ; already seen: stop, cycles are fine
-          (do
-            (primitive/store! (primitive/field o mark) 1)
-            ; Flonum `a` is raw IEEE-754 bits and syntax-object `a` is an opaque
-            ; compiler handle. Neither is a Scheme Val to trace.
-            (if (or (= (primitive/load (primitive/field o tag)) (tag-flonum))
-                    (= (primitive/load (primitive/field o tag)) (tag-syntax))) 0
-              ; Symbol `a` is a raw intern id. ID 64 exposed this: the generic
-              ; marker treated 0x40 as a heap pointer and crashed on the first
-              ; collection in the Scheme-hosted Lox interpreter.
-              (if (= (primitive/load (primitive/field o tag)) (tag-symbol))
-                  (do (mark (primitive/load (primitive/field o b))) 0)
-                (do
-                  (mark (primitive/load (primitive/field o a)))
-                  (mark (primitive/load (primitive/field o b)))
-                  (mark (primitive/load (primitive/field o c)))
-                  0)))
-            0)))))))
+      (if (not (managed-address? v)) 0       ; aligned raw values are not objects
+        (let [o (obj-of v)]
+          (if (= (primitive/load (primitive/field o mark)) 1) 0
+            (let [i (primitive/load top)]
+              ;; Mark on enqueue, not dequeue. Cycles and multiply-referenced
+              ;; objects therefore occupy exactly one worklist slot.
+              (primitive/store! (primitive/field o mark) 1)
+              (primitive/store! (primitive/index work i) v)
+              (primitive/store! top (+ i 1))
+              0)))))))
 
 (defn mark-roots [] (-> i64)
-  (mark (globals))
-  (let [top (primitive/load (g-permanent-top))]
-    (for [i 0 top]
-      (mark (primitive/load (primitive/index (g-permanent-roots) i)))))
-  (let [top (primitive/load (g-rtop))]
-    (for [i 0 top]
-      (mark (primitive/load (primitive/index (g-roots) i)))))
-  0)
+  ;; Recursive marking makes the native stack proportional to Scheme graph
+  ;; depth. A saved continuation root list (and ordinary long lists) can be
+  ;; thousands of pairs deep, so use a bounded explicit worklist instead. One
+  ;; slot per allocator-owned object is sufficient because mark-enqueue marks an
+  ;; object before pushing it.
+  (let [capacity (* (primitive/load (g-nslabs)) 1048576)
+        bytes (* (if (= capacity 0) 1 capacity) 8)
+        raw (malloc bytes)
+        work (primitive/cast (ptr i64) raw)
+        (mut top) 0]
+    (mark-enqueue (globals) work (mut top))
+    (let [n (primitive/load (g-permanent-top))]
+      (for [i 0 n]
+        (mark-enqueue (primitive/load (primitive/index (g-permanent-roots) i))
+                      work (mut top))))
+    (let [n (primitive/load (g-rtop))]
+      (for [i 0 n]
+        (mark-enqueue (primitive/load (primitive/index (g-roots) i))
+                      work (mut top))))
+    (loop
+      (if (= (primitive/load (mut top)) 0) (break)
+        (do
+          (primitive/store! (mut top) (- (primitive/load (mut top)) 1))
+          (let [v (primitive/load
+                    (primitive/index work (primitive/load (mut top))))
+                o (obj-of v)
+                tag (primitive/load (primitive/field o tag))]
+            ;; Flonum `a` is raw IEEE bits and syntax `a` is an opaque compiler
+            ;; handle. Symbol `a` is its raw intern-table index.
+            (if (raw-payload-tag? tag) 0
+              (if (= tag (tag-symbol))
+                  (mark-enqueue (primitive/load (primitive/field o b))
+                                work (mut top))
+                (do
+                  (mark-enqueue (primitive/load (primitive/field o a))
+                                work (mut top))
+                  (mark-enqueue (primitive/load (primitive/field o b))
+                                work (mut top))
+                  (mark-enqueue (primitive/load (primitive/field o c))
+                                work (mut top))
+                  0)))))))
+    (free raw)
+    0))
 
 ; --- sweep ------------------------------------------------------------------
 ;; Walk one slab linearly: unmark what survived, and thread everything else onto
@@ -132,8 +166,32 @@
           (if (= (primitive/load (primitive/field o mark)) 1)
               (do (primitive/store! (primitive/field o mark) 0)
                   (primitive/store! (g-live) (+ (primitive/load (g-live)) 1)) 0)
-            ; free: reuse the `a` slot as the free-list link
-            (do (primitive/store! (primitive/field o a) (primitive/load (g-free)))
+            ; Release native storage owned by an unreachable atomic wrapper,
+            ; then reuse the `a` slot as the free-list link. Explicit release
+            ; clears the ownership slot, so sweep cannot double-free it.
+            (do
+                (if (and (= (primitive/load (primitive/field o tag)) (tag-foreign-pointer))
+                         (= (primitive/load (primitive/field o b)) 1))
+                    (do (free (primitive/cast (ptr u8) (primitive/load (primitive/field o a)))) 0)
+                  (if (and (= (primitive/load (primitive/field o tag)) (tag-bytevector))
+                           (= (primitive/load (primitive/field o c)) 1))
+                      (do (free (primitive/cast (ptr u8) (primitive/load (primitive/field o a)))) 0)
+                    (if (= (primitive/load (primitive/field o tag)) (tag-mutex))
+                        (do
+                          (sync/mutex-destroy!
+                            (primitive/cast (ptr sync/Mutex)
+                              (primitive/load (primitive/field o a))))
+                          (free (primitive/cast (ptr u8) (primitive/load (primitive/field o a))))
+                          0)
+                      (if (= (primitive/load (primitive/field o tag)) (tag-condition))
+                          (do
+                            (sync/condition-destroy!
+                              (primitive/cast (ptr sync/Condition)
+                                (primitive/load (primitive/field o a))))
+                            (free (primitive/cast (ptr u8) (primitive/load (primitive/field o a))))
+                            0)
+                        0))))
+                (primitive/store! (primitive/field o a) (primitive/load (g-free)))
                 (primitive/store! (g-free) (primitive/cast i64 o)) 0))
           (primitive/store! p (+ (primitive/load p) 40)))))
     0))
@@ -150,6 +208,12 @@
       (let [base (primitive/load (primitive/index (g-slabs) i))]
         ; the newest slab is only filled up to the bump cursor; the rest are full
         (sweep-slab base (if (= i (- n 1)) cur (+ base 41943040))))))
+  ;; A fixed threshold becomes a collection-on-every-allocation trap whenever
+  ;; the genuine live set itself exceeds that threshold. Give the surviving
+  ;; graph one live-set worth of headroom (with the original 500k floor).
+  (let [live (primitive/load (g-live))]
+    (primitive/store! (g-next-collection)
+      (if (< (* live 2) 500000) 500000 (* live 2))))
   (primitive/store! (g-collections) (+ (primitive/load (g-collections)) 1))
   0)
 
@@ -157,7 +221,9 @@
 ;; Collect when the live set crosses the threshold. Sized so a program with a small
 ;; working set never collects at all, and a heavy allocator collects rarely enough
 ;; that mark cost stays a small share of runtime.
-(defn gc-threshold [] (-> i64) 500000)
+(defn gc-threshold [] (-> i64)
+  (let [n (primitive/load (g-next-collection))]
+    (if (= n 0) 500000 n)))
 
 (defn new-slab [] (-> i64)
   (let [s (primitive/cast i64 (malloc 41943040))
@@ -178,7 +244,7 @@
   ;; that frame; a collection during `cons` then swept an argument before it was
   ;; stored. Root only Val-bearing slots: flonum bits and symbol ids are raw.
   (let [sp (gc-sp)]
-  (if (or (= tag (tag-flonum)) (= tag (tag-syntax))) 0
+  (if (raw-payload-tag? tag) 0
     (if (= tag (tag-symbol)) (gc-root b)
       (do (gc-root a) (gc-root b) (gc-root c) 0)))
   (if (>= (primitive/load (g-live)) (gc-threshold)) (collect) 0)
@@ -341,3 +407,19 @@
 (defn gc-peak [] (-> i64) (primitive/load (g-peak)))
 (defn gc-collections [] (-> i64) (primitive/load (g-collections)))
 (defn gc-total [] (-> i64) (primitive/load (g-total)))
+
+;; Chez-compatible collector observations. Coil's Scheme collector is a single
+;; generation of fixed-size cells, so generation zero is both the minimum and
+;; maximum and its byte counts are exact multiples of obj-bytes.
+(defn collect-maximum-generation [] (-> i64) (mk-fixnum 0))
+(defn bytes-allocated [] (-> i64) (mk-fixnum (* (gc-live) (obj-size))))
+(defn current-memory-bytes [] (-> i64) (mk-fixnum (slab-bytes)))
+(defn maximum-memory-bytes [] (-> i64) (mk-fixnum 1152921504606846975))
+(defn collect-trip-bytes [(n i64)] (-> i64)
+  ;; The current collector's threshold is cell-based and static. This remains a
+  ;; tuning hint, as it is in Chez, while ordinary collection stays active.
+  (let [ignored n] (s-unspecified)))
+(defn weak-cons [(a i64) (b i64)] (-> i64)
+  ;; Weak edges are not encoded by the precise collector yet; retain strongly.
+  ;; This is the documented compatibility degradation used by weak hash tables.
+  (cons a b))

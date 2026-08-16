@@ -1,0 +1,12 @@
+(define error #| outer #| nested |# source marker |#
+  (eval 'error (scheme-environment)))
+(define %chez-error error)
+(define (error . args)
+  (if (pair? args)
+      (apply %chez-error args)
+      #f))
+(suppress-greeting #t)
+(display (exact (truncate 1.4142135623730951)))
+(newline)
+(display "ok")
+(newline)

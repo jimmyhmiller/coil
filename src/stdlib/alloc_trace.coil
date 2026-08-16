@@ -1,0 +1,202 @@
+(module coil.alloc_trace)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.atomic" :use [atomic-cas atomic-store])
+(import "coil.io" :as io)
+(import "coil.slice" :use [slice-len slice-get])
+
+;; Allocation attribution is an observer, not an allocator. It sees every
+;; request passing through `raw-alloc`, including requests served by arenas and
+;; custom allocators, without changing their ownership or reclamation policy.
+;; The instrumentation metaprogram supplies the semantic type and source site.
+(export allocation-trace-init!
+        allocation-trace-close!
+        allocation-trace-enter!
+        allocation-trace-leave!
+        allocation-trace-snapshot!)
+
+(extern pthread_self :cc c [] (-> i64))
+
+(defstruct AllocationTraceSite
+  [(typ (slice u8))
+   (file (slice u8))
+   (line i64)
+   (col i64)
+   (allocations i64)
+   (requested-bytes i64)
+   (resize-events i64)
+   (freed-bytes i64)])
+
+(defstruct AllocationTraceThread [(tid i64) (site i64)])
+
+;; Fixed metadata is intentional: the observer cannot allocate while handling
+;; an allocation event. Site 0 is the unannotated fallback. Overflow is counted
+;; and attributed there rather than recursively growing the tracer itself.
+(defstruct AllocationTraceState
+  [(initialized i64)
+   (lock i64)
+   (site-count i64)
+   (dropped-sites i64)
+   (sites (array AllocationTraceSite 4096))
+   (threads (array AllocationTraceThread 64))])
+
+(defn allocation-trace-state [] (-> (ptr AllocationTraceState))
+  (primitive/alloc-static AllocationTraceState))
+
+(defn at-lock! [(s (ptr AllocationTraceState))] (-> i64)
+  (loop (if (= (atomic-cas (field s lock) 0 1) 0) (break) 0))
+  0)
+(defn at-unlock! [(s (ptr AllocationTraceState))] (-> i64)
+  (atomic-store (field s lock) 0))
+
+(defn at-slice-eq? [(a (slice u8)) (b (slice u8))] (-> bool)
+  (let [na (slice-len [u8] a) nb (slice-len [u8] b) (mut i) 0 (mut same) (= na nb)]
+    (loop (if (or (not (load same)) (>= (load i) na)) (break)
+              (do
+                (when (!= (slice-get [u8] a (load i)) (slice-get [u8] b (load i)))
+                  (store! same false) 0)
+                (store! i (+ (load i) 1)))))
+    (load same)))
+
+(defn at-thread-slot! [(s (ptr AllocationTraceState))] (-> (ptr AllocationTraceThread))
+  (let [tid (pthread_self) (mut i) 0 (mut empty) -1
+        (mut result) (primitive/cast (ptr AllocationTraceThread) 0)]
+    (loop (if (or (!= (primitive/cast i64 (load result)) 0) (>= (load i) 64)) (break)
+              (let [slot (primitive/index (field s threads) (load i)) id (load (field slot tid))]
+                (do
+                  (if (= id tid) (store! result slot)
+                      (when (and (= id 0) (< (load empty) 0)) (store! empty (load i)) 0))
+                  (store! i (+ (load i) 1))))))
+    (when (and (= (primitive/cast i64 (load result)) 0) (>= (load empty) 0))
+      (let [slot (primitive/index (field s threads) (load empty))]
+        (store! (field slot tid) tid)
+        (store! (field slot site) 0)
+        (store! result slot)) 0)
+    (load result)))
+
+(defn at-current-site [(s (ptr AllocationTraceState))] (-> i64)
+  (let [slot (at-thread-slot! s)]
+    (if (= (primitive/cast i64 slot) 0) 0 (load (field slot site)))))
+
+(defn at-find-site [(s (ptr AllocationTraceState))
+                     (typ (slice u8)) (file (slice u8)) (line i64) (col i64)] (-> i64)
+  (let [n (load (field s site-count)) (mut i) 1 (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0)) (break)
+              (let [site (primitive/index (field s sites) (load i))]
+                (do
+                  (when (and (= (load (field site line)) line)
+                             (and (= (load (field site col)) col)
+                                  (and (at-slice-eq? (load (field site typ)) typ)
+                                       (at-slice-eq? (load (field site file)) file))))
+                    (store! found (load i)) 0)
+                  (store! i (+ (load i) 1))))))
+    (load found)))
+
+;; Returns the prior site token. Pair this with allocation-trace-leave!; nested
+;; instrumented calls then restore their caller's attribution correctly.
+(defn allocation-trace-enter! [(typ (slice u8)) (file (slice u8)) (line i64) (col i64)] (-> i64)
+  (let [s (allocation-trace-state)]
+    (when (= (load (field s initialized)) 0) (allocation-trace-init!) 0)
+    (at-lock! s)
+    (let [slot (at-thread-slot! s) prior (if (= (primitive/cast i64 slot) 0) 0 (load (field slot site)))
+          (mut site) (at-find-site s typ file line col)]
+      (when (< (load site) 0)
+        (let [n (load (field s site-count))]
+          (if (< n 4096)
+              (let [dst (primitive/index (field s sites) n)]
+                (store! (field dst typ) typ) (store! (field dst file) file)
+                (store! (field dst line) line) (store! (field dst col) col)
+                (store! site n) (store! (field s site-count) (+ n 1)) 0)
+              (do (store! (field s dropped-sites) (+ (load (field s dropped-sites)) 1))
+                  (store! site 0) 0))) 0)
+      (when (!= (primitive/cast i64 slot) 0) (store! (field slot site) (load site)) 0)
+      (at-unlock! s)
+      prior)))
+
+(defn allocation-trace-leave! [(prior i64)] (-> i64)
+  (let [s (allocation-trace-state)]
+    (at-lock! s)
+    (let [slot (at-thread-slot! s)]
+      (when (!= (primitive/cast i64 slot) 0) (store! (field slot site) prior) 0))
+    (at-unlock! s)
+    0))
+
+(defn at-on-alloc [(ctx (ptr i8)) (a (ptr Allocator)) (p (ptr i8))
+                    (size i64) (align i64)] (-> i64)
+  (let [s (primitive/cast (ptr AllocationTraceState) ctx)]
+    (at-lock! s)
+    (let [site (primitive/index (field s sites) (at-current-site s))]
+      (store! (field site allocations) (+ (load (field site allocations)) 1))
+      (store! (field site requested-bytes) (+ (load (field site requested-bytes)) size)))
+    (at-unlock! s)
+    0))
+(defn at-on-resize [(ctx (ptr i8)) (a (ptr Allocator)) (oldp (ptr i8)) (newp (ptr i8))
+                     (old i64) (new i64) (align i64)] (-> i64)
+  (let [s (primitive/cast (ptr AllocationTraceState) ctx)]
+    (at-lock! s)
+    (let [site (primitive/index (field s sites) (at-current-site s))]
+      (store! (field site resize-events) (+ (load (field site resize-events)) 1))
+      (when (> new old)
+        (store! (field site requested-bytes) (+ (load (field site requested-bytes)) (- new old))) 0)
+      (when (< new old)
+        (store! (field site freed-bytes) (+ (load (field site freed-bytes)) (- old new))) 0))
+    (at-unlock! s)
+    0))
+(defn at-on-free [(ctx (ptr i8)) (a (ptr Allocator)) (p (ptr i8))
+                   (size i64) (align i64)] (-> i64)
+  (let [s (primitive/cast (ptr AllocationTraceState) ctx)]
+    (at-lock! s)
+    (let [site (primitive/index (field s sites) (at-current-site s))]
+      (store! (field site freed-bytes) (+ (load (field site freed-bytes)) size)))
+    (at-unlock! s)
+    0))
+
+(defn at-install-observer! [(s (ptr AllocationTraceState))] (-> i64)
+  (let [o (alloc/stack AllocationObserver)]
+    (store! (field o enabled) 1)
+    (store! (field o ctx) (primitive/cast (ptr i8) s))
+    (store! (field o on-alloc) (primitive/fnptr-of at-on-alloc))
+    (store! (field o on-resize) (primitive/fnptr-of at-on-resize))
+    (store! (field o on-free) (primitive/fnptr-of at-on-free))
+    (allocation-observer-install! (load o))))
+
+(defn allocation-trace-init! [] (-> i64)
+  (let [s (allocation-trace-state)]
+    (unless (!= (load (field s initialized)) 0)
+      (store! s (primitive/zeroed AllocationTraceState))
+      (store! (field s site-count) 1)
+      (let [unknown (primitive/index (field s sites) 0)]
+        (store! (field unknown typ) "(unattributed)")
+        (store! (field unknown file) ""))
+      (at-install-observer! s)
+      (store! (field s initialized) 1)
+      0)
+    0))
+
+(defn allocation-trace-close! [] (-> i64)
+  (do (allocation-observer-clear!) (store! (field (allocation-trace-state) initialized) 0) 0))
+
+;; Stable TSV is useful both interactively and in regression gates. It reports
+;; cumulative logical requests; arena ownership snapshots separately explain
+;; which backing segments remain physically live.
+(defn allocation-trace-snapshot! [(label (slice u8))] (-> i64)
+  (let [s (allocation-trace-state) w (io/stderr) n (load (field s site-count)) (mut i) 0]
+    (allocation-observer-clear!)
+    (io/print-str w "alloc-trace-begin\t") (io/print-str w label) (io/write-byte w 10)
+    (io/print-str w "bytes\tallocations\tresizes\tfreed\ttype\tfile\tline\tcol\n")
+    (loop (if (>= (load i) n) (break)
+              (let [site (primitive/index (field s sites) (load i))]
+                (do
+                  (when (> (load (field site requested-bytes)) 0)
+                    (io/print-int w (load (field site requested-bytes))) (io/write-byte w 9)
+                    (io/print-int w (load (field site allocations))) (io/write-byte w 9)
+                    (io/print-int w (load (field site resize-events))) (io/write-byte w 9)
+                    (io/print-int w (load (field site freed-bytes))) (io/write-byte w 9)
+                    (io/print-str w (load (field site typ))) (io/write-byte w 9)
+                    (io/print-str w (load (field site file))) (io/write-byte w 9)
+                    (io/print-int w (load (field site line))) (io/write-byte w 9)
+                    (io/print-int w (load (field site col))) (io/write-byte w 10) 0)
+                  (store! i (+ (load i) 1))))))
+    (io/print-str w "alloc-trace-end\t") (io/print-str w label) (io/write-byte w 10)
+    (at-install-observer! s)
+    0))

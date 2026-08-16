@@ -37,10 +37,37 @@ vs whole-program) and **power** (produce vs reject vs rewrite). An ordered stack
 checkers/transformers is what we mean by a **dialect** (e.g. the GC dialect, a
 Rust-like ownership dialect, a Scheme frontend).
 
+## Running an entry directly
+
+Use the full compiler as the metaprogram runner:
+
+```text
+coil run definitions.coil --meta module.function -- 'code argument' ...
+```
+
+Use `--program` to supply the loaded whole-program Code value as the first
+argument instead of spelling it on the command line:
+
+```text
+coil run input.coil --meta module.transform --program
+```
+
+Each argument after `--` is one Code form; returned Code prints as parseable
+source. For explicit arguments the definitions take the normal compiler
+pipeline. With `--program`, the entry module remains loaded `Code` while its
+imported metaprogram implementation is compiled in the same invocation. The
+compiler then invokes its installed or lazily staged entry in-process with the
+real checked-program context. It does not build a metaprogram executable or use
+a process protocol. See [`../runtime-metaprograms.md`](../runtime-metaprograms.md)
+for the invocation and arena boundaries.
+
 ## The API (the vocabulary), all shipped
 
 - **Take Code apart:** `code-count`, `code-nth`, `code-rest`, `code-sym`,
-  `code-list?`, `code-sym?`, `code-int?`, `code-keyword?`, `code-str`, `code-eq`.
+  `code-list?`, `code-pair?`, `code-car`, `code-cdr`, `code-sym?`, `code-int?`,
+  `code-keyword?`, `code-str`, `code-eq`. `code-list?` proves a proper list and
+  makes `code-count` safe; `code-pair?` includes improper/dotted pairs, which
+  must be traversed structurally with `code-car` and `code-cdr`.
 - **Build Code:** quote `` ` ``, unquote `~`, splice `~@`, `code-symbol` (make a
   name from a symbol/string base plus suffix parts — an int part becomes its decimal
   digits, and a **generic instantiation** base `(Gen A B)`, the same shape

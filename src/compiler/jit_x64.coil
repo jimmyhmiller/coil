@@ -1,0 +1,208 @@
+; In-process loader for the native x86-64 backend's EObj. This is deliberately
+; the ELF analogue of jit.coil, but consumes the object model before serialization.
+(module jit_x64)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.control" :use *)
+(import "x64" :use *)
+(import "elf" :use *)
+(import "metahost" :as mh)
+
+(extern mmap :cc c [(ptr i8) i64 i32 i32 i32 i64] (-> (ptr i8)))
+(extern munmap :cc c [(ptr i8) i64] (-> i32))
+(extern mprotect :cc c [(ptr i8) i64 i32] (-> i32))
+(extern dlsym :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(defstruct XJitSym [(name (slice u8)) (addr (ptr i8))])
+(defstruct XJitImage [(base (ptr i8)) (size i64) (syms (ArrayList XJitSym))])
+
+(defn xj-align [(n i64) (a i64)] (-> i64)
+  (if (<= a (primitive/cast i64 1)) n
+      (primitive/imul (primitive/idiv (primitive/iadd n (primitive/isub a 1)) a) a)))
+(defn xj-page [] (-> i64) 4096)
+(defn xj-cat [(a (ptr Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
+  (match (str-concat a x y) (Some [s] s) (None [] x)))
+(defn xj-loadable? [(s (ptr ESect))] (-> bool)
+  (!= (primitive/iand (load (field s flags)) (shf-alloc)) (primitive/cast i64 0)))
+(defn xj-exec? [(s (ptr ESect))] (-> bool)
+  (!= (primitive/iand (load (field s flags)) (shf-execinstr)) (primitive/cast i64 0)))
+(defn xj-cstr [(a (ptr Allocator)) (s (slice u8))] (-> (ptr i8))
+  (let [n (slice-len s) p (unwrap-ptr [u8] (alloc-slice [u8] a (primitive/iadd n 1))) (mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (store! (primitive/index p (load i)) (slice-get s (load i)))
+                  (store! i (primitive/iadd (load i) 1)))))
+    (store! (primitive/index p n) (primitive/cast u8 0))
+    (primitive/cast (ptr i8) p)))
+
+(defn xj-st32! [(p (ptr u8)) (v i64)] (-> i64)
+  (store! (primitive/index p 0) (primitive/cast u8 v))
+  (store! (primitive/index p 1) (primitive/cast u8 (primitive/ishr v 8)))
+  (store! (primitive/index p 2) (primitive/cast u8 (primitive/ishr v 16)))
+  (store! (primitive/index p 3) (primitive/cast u8 (primitive/ishr v 24))) 0)
+(defn xj-st64! [(p (ptr u8)) (v i64)] (-> i64)
+  (xj-st32! p v) (xj-st32! (primitive/index p 4) (primitive/ishr v 32)) 0)
+(defn xj-copy! [(dst (ptr u8)) (src (ptr u8)) (n i64)] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) n) (break)
+              (do (store! (primitive/index dst (load i)) (load (primitive/index src (load i))))
+                  (store! i (primitive/iadd (load i) 1))))) 0))
+
+; movabs rax, target; jmp rax. Undefined PLT32 calls target this local stub so
+; their rel32 remains in range regardless of where libc/the compiler was mapped.
+(defn xj-trampoline! [(p (ptr u8)) (target i64)] (-> i64)
+  (store! (primitive/index p 0) (primitive/cast u8 72))
+  (store! (primitive/index p 1) (primitive/cast u8 184))
+  (xj-st64! (primitive/index p 2) target)
+  (store! (primitive/index p 10) (primitive/cast u8 255))
+  (store! (primitive/index p 11) (primitive/cast u8 224)) 0)
+
+; Errors after mmap must release the image immediately. Successful images transfer
+; this mapping to XJitImage and are released by xjit-free! when their last engine
+; entry is superseded.
+(defn xj-mapped-error [(base (ptr i8)) (size i64) (msg (slice u8))] (-> (Result XJitImage (slice u8)))
+  (munmap base size)
+  (Err [XJitImage (slice u8)] msg))
+
+(defn xjit-load [(a (ptr Allocator)) (o (mut EObj))] (-> (Result XJitImage (slice u8)))
+  (block :load
+    (let [nsect (al-len [ESect] (load (field o sects)))
+          nsym (al-len [ESym] (load (field o syms)))
+          nrel (al-len [EReloc] (load (field o relocs)))
+          offs (unwrap-ptr [i64] (alloc-slice [i64] a (if (> nsect 0) nsect 1)))
+          addrs (unwrap-ptr [(ptr i8)] (alloc-slice [(ptr i8)] a (if (> nsym 0) nsym 1)))
+          tramps (unwrap-ptr [i64] (alloc-slice [i64] a (if (> nsym 0) nsym 1)))
+          (mut i) 0 (mut cur) 0 (mut nt) 0]
+      (loop (if (>= (load i) nsect) (break)
+                (do (store! (primitive/index offs (load i)) -1)
+                    (store! i (primitive/iadd (load i) 1)))))
+      (store! i 0)
+      (loop (if (>= (load i) nsym) (break)
+                (do (store! (primitive/index tramps (load i)) -1)
+                    (store! i (primitive/iadd (load i) 1)))))
+      ; One trampoline for each undefined PLT32 target.
+      (store! i 0)
+      (loop (if (>= (load i) nrel) (break)
+                (do (let [r (xal-at [EReloc] (field o relocs) (load i)) si (load (field r sym))]
+                      (when (and (= (load (field r rtype)) (r-x86-64-plt32))
+                                 (and (>= si 0) (< si nsym)))
+                        (let [s (xal-at [ESym] (field o syms) si)]
+                          (when (and (= (load (field s sect)) 0) (< (load (primitive/index tramps si)) 0))
+                            (store! (primitive/index tramps si) (load nt))
+                            (store! nt (primitive/iadd (load nt) 1))))))
+                    (store! i (primitive/iadd (load i) 1)))))
+      ; Executable sections first.
+      (store! i 0)
+      (loop (if (>= (load i) nsect) (break)
+                (do (let [s (xal-at [ESect] (field o sects) (load i))]
+                      (when (and (xj-loadable? s) (xj-exec? s))
+                        (store! cur (xj-align (load cur) (load (field s align))))
+                        (store! (primitive/index offs (load i)) (load cur))
+                        (store! cur (primitive/iadd (load cur) (al-len [u8] (load (field s buf)))))))
+                    (store! i (primitive/iadd (load i) 1)))))
+      (store! cur (xj-align (load cur) 16))
+      (let [trampbase (load cur)]
+        (store! cur (primitive/iadd (load cur) (primitive/imul (load nt) 12)))
+        (let [textsz (xj-align (load cur) (xj-page))]
+          (store! cur textsz)
+          ; Read-only/data sections after a page boundary (kept RW for globals).
+          (store! i 0)
+          (loop (if (>= (load i) nsect) (break)
+                    (do (let [s (xal-at [ESect] (field o sects) (load i))]
+                          (when (and (xj-loadable? s) (not (xj-exec? s)))
+                            (store! cur (xj-align (load cur) (load (field s align))))
+                            (store! (primitive/index offs (load i)) (load cur))
+                            (store! cur (primitive/iadd (load cur) (al-len [u8] (load (field s buf)))))))
+                        (store! i (primitive/iadd (load i) 1)))))
+          (let [total (xj-align (if (> (load cur) 0) (load cur) 1) (xj-page))
+                base (mmap (primitive/cast (ptr i8) 0) total 3 34 -1 0)]
+            (when (or (= (primitive/cast i64 base) 0) (= (primitive/cast i64 base) -1))
+              (break :load (Err [XJitImage (slice u8)] "xjit: mmap failed")))
+            (store! i 0)
+            (loop (if (>= (load i) nsect) (break)
+                      (do (let [off (load (primitive/index offs (load i)))]
+                            (when (>= off 0)
+                              (let [s (xal-at [ESect] (field o sects) (load i))]
+                                (xj-copy! (primitive/cast (ptr u8) (primitive/index base off))
+                                          (slice-data (al-slice [u8] (load (field s buf))))
+                                          (al-len [u8] (load (field s buf)))))))
+                          (store! i (primitive/iadd (load i) 1)))))
+            ; Resolve symbols.
+            (store! i 0)
+            (loop (if (>= (load i) nsym) (break)
+                      (do (let [s (xal-at [ESym] (field o syms) (load i)) sect (load (field s sect))]
+                            (if (> sect 0)
+                                (let [off (load (primitive/index offs (primitive/isub sect 1)))]
+                                  (when (< off 0) (break :load (xj-mapped-error base total "xjit: symbol references unloaded section")))
+                                  (store! (primitive/index addrs (load i))
+                                          (primitive/index base (primitive/iadd off (load (field s off))))))
+                                (let [direct (mh/meta-host-callback-symbol (load (field s name)))
+                                      p (if (= (primitive/cast i64 direct) 0)
+                                            (dlsym (primitive/cast (ptr i8) 0) (xj-cstr a (load (field s name))))
+                                            direct)]
+                                  (when (= (primitive/cast i64 p) 0)
+                                    (break :load (xj-mapped-error base total
+                                                      (xj-cat a "xjit: undefined symbol " (load (field s name))))))
+                                  (store! (primitive/index addrs (load i)) p))))
+                          (store! i (primitive/iadd (load i) 1)))))
+            ; Emit local trampolines.
+            (store! i 0)
+            (loop (if (>= (load i) nsym) (break)
+                      (do (let [ti (load (primitive/index tramps (load i)))]
+                            (when (>= ti 0)
+                              (xj-trampoline! (primitive/cast (ptr u8)
+                                  (primitive/index base (primitive/iadd trampbase (primitive/imul ti 12))))
+                                (primitive/cast i64 (load (primitive/index addrs (load i)))))))
+                          (store! i (primitive/iadd (load i) 1)))))
+            ; Apply ELF RELA fixups.
+            (store! i 0)
+            (loop (if (>= (load i) nrel) (break)
+                      (do (let [r (xal-at [EReloc] (field o relocs) (load i))
+                                si (load (field r sym))
+                                soff (load (primitive/index offs (primitive/isub (load (field r sect)) 1)))
+                                loc (primitive/cast (ptr u8) (primitive/index base (primitive/iadd soff (load (field r off)))))
+                                rt (load (field r rtype))
+                                target (if (and (= rt (r-x86-64-plt32)) (>= (load (primitive/index tramps si)) 0))
+                                           (primitive/iadd (primitive/cast i64 base)
+                                             (primitive/iadd trampbase (primitive/imul (load (primitive/index tramps si)) 12)))
+                                           (primitive/cast i64 (load (primitive/index addrs si))))
+                                value (primitive/iadd target (load (field r addend)))]
+                            (cond (= rt (r-x86-64-64)) (xj-st64! loc value)
+                                  (or (= rt (r-x86-64-pc32)) (= rt (r-x86-64-plt32)))
+                                    (let [delta (primitive/isub value (primitive/cast i64 loc))]
+                                      (when (or (< delta -2147483648) (> delta 2147483647))
+                                        (break :load (xj-mapped-error base total "xjit: PC-relative relocation out of range")))
+                                      (xj-st32! loc delta))
+                                  (= rt (r-x86-64-32)) (xj-st32! loc value)
+                                  (= rt (r-x86-64-32s)) (xj-st32! loc value)
+                                  :else (break :load (xj-mapped-error base total "xjit: unsupported relocation"))))
+                          (store! i (primitive/iadd (load i) 1)))))
+            (when (!= (mprotect base textsz (primitive/cast i32 5)) (primitive/cast i32 0))
+              (break :load (xj-mapped-error base total "xjit: mprotect RX failed")))
+            (let [(mut syms) (al-new [XJitSym] a) (mut j) 0]
+              (loop (if (>= (load j) nsym) (break)
+                        (do (let [s (xal-at [ESym] (field o syms) (load j)) x (alloc/stack XJitSym)]
+                              (when (> (load (field s sect)) 0)
+                                (store! (field x name) (load (field s name)))
+                                (store! (field x addr) (load (primitive/index addrs (load j))))
+                                (al-push! (mut syms) (load x))))
+                            (store! j (primitive/iadd (load j) 1)))))
+              (let [img (alloc/stack XJitImage)]
+                (store! (field img base) base) (store! (field img size) total)
+                (store! (field img syms) (load syms))
+                (Ok [XJitImage (slice u8)] (load img))))))))))
+
+(defn xjit-lookup [(img (ptr XJitImage)) (name (slice u8))] (-> (ptr i8))
+  (let [n (al-len [XJitSym] (load (field img syms))) (mut i) 0 (mut out) (primitive/cast (ptr i8) 0)]
+    (loop (if (>= (load i) n) (break)
+              (do (let [s (xal-at [XJitSym] (field img syms) (load i))]
+                    (when (= (load (field s name)) name) (store! out (load (field s addr))) (break)))
+                  (store! i (primitive/iadd (load i) 1))))) (load out)))
+
+(defn xjit-free! [(img (ptr XJitImage))] (-> i64)
+  (when (!= (primitive/cast i64 (load (field img base))) 0)
+    (munmap (load (field img base)) (load (field img size)))
+    (store! (field img base) (primitive/cast (ptr i8) 0)) 0) 0)

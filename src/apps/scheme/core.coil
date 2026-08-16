@@ -4,6 +4,7 @@
 (import "coil.slice" :use *)
 (import "coil.io" :use *)
 (import "coil.fmt" :use *)
+(import "coil.hashmap" :use *)
 (import "coil.scheme.value" :use *)
 (import "coil.scheme.heap" :use *)
 
@@ -46,6 +47,15 @@
           `[(~(primitive/code-nth sig (+ i 1)) i64)]
         `[(~p i64) ~@(scm--params sig (+ i 1) n)]))))
 
+;; Native symbol used for a Scheme variable's zero-argument lazy initializer.
+;; It must not be the Scheme binding name itself: `(define error imported)`
+;; followed by `(define (error . xs) ...)` is a normal top-level redefinition,
+;; and using `error` for both the getter and procedure creates two incompatible
+;; native functions. References are routed through the same helper in forms.coil.
+(defn scm--global-getter-name [(name Code)] (-> Code)
+  (primitive/code-symbol-context
+    name (primitive/code-str "$scm-global$get$" name)))
+
 ;; True when the signature has a dotted rest parameter.
 (defn scm--variadic? [(sig Code) (i i64) (n i64)] (-> bool)
   (if (>= i n) false
@@ -75,15 +85,36 @@
 ;; would NOT have done, since the tracer never scans .bss. That last point makes
 ;; this the more correct design regardless of the constraints.
 ;;
-;; The environment is an association list of (symbol . value) pairs, living in
-;; heap.coil's `globals` cell — the permanent root `mark-roots` traces before the
-;; shadow stack, reserved there for exactly this. Globals are few and looked up
-;; once per reference, so a list is the right shape; a hash table would be more
-;; machinery for no measurable gain at this size.
+;; The environment's OWNED representation is an association list of
+;; (symbol . value) pairs, living in heap.coil's `globals` cell. `mark-roots`
+;; traces that list, so the collector has one unambiguous owner/reachability
+;; source. Full programs do not, however, have "few" globals: Jolt has thousands
+;; and reads hot predicates such as `htable?` during every expansion. A linear
+;; assq there makes loading effectively quadratic.
+;;
+;; `scm--global-index` is therefore a non-owning native index from the interned
+;; symbol Val to its owned alist entry. It never affects liveness and contains no
+;; separately allocated Scheme objects; the alist remains the source of truth.
+;; Scheme objects do not move, so entry addresses remain valid across collection.
 (defn scm--assq [(s i64) (l i64)] (-> i64)
   (if (is-null l) (s-nil)
     (if (val-eq? (car (car l)) s) (car l)
       (scm--assq s (cdr l)))))
+
+(defstruct ScmGlobalIndex
+  [(init i64)
+   (entries (HashMap i64 i64))])
+(defn scm--global-index [] (-> (ptr ScmGlobalIndex))
+  (alloc/static ScmGlobalIndex))
+(defn scm--global-index-init! [] (-> i64)
+  (let [idx (scm--global-index)]
+    (if (= (primitive/load (primitive/field idx init)) 0)
+        (do
+          (primitive/store! (primitive/field idx entries)
+                            (hm-new-scalar [i64 i64] (malloc-allocator)))
+          (primitive/store! (primitive/field idx init) 1)
+          0)
+      0)))
 
 ;; ⚠ The `globals` cell starts as a ZERO WORD (.bss), and nil is 23 — so the raw
 ;; cell is NOT the empty list. Reading it directly made `scm--assq` fail its
@@ -94,8 +125,16 @@
   (let [g (globals)]
     (if (= g 0) (s-nil) g)))
 
-;; Find the (symbol . value) pair for `s`, or nil.
-(defn scm--genv-find [(s i64)] (-> i64) (scm--assq s (scm--genv)))
+;; Find the owned (symbol . value) pair for `s`, or nil. The native table is only
+;; an index: the returned pair remains owned and traced through `globals`.
+(defn scm--genv-find [(s i64)] (-> i64)
+  (scm--global-index-init!)
+  (match (hm-get [i64 i64]
+                 (primitive/load
+                   (primitive/field (scm--global-index) entries))
+                 s)
+    (None [] (s-nil))
+    (Some [p] p)))
 
 ;; Install a value that has just been initialized. Keep the old environment and
 ;; both new fields live across the two pair allocations.
@@ -106,6 +145,10 @@
       (gc-root entry)
       (let [next (cons entry old)]
         (set-globals! next)
+        (scm--global-index-init!)
+        (hm-put! [i64 i64]
+                 (mut (primitive/field (scm--global-index) entries))
+                 s entry)
         (gc-sp-set! sp)
         v))))
 
@@ -118,16 +161,20 @@
 (defn scm--global-read [(s i64) (init i64)] (-> i64)
   (let [p (scm--genv-find s)]
     (if (is-null p)
-        (do (set-globals! (cons (cons s init) (scm--genv)))
-            init)
+        (scm--global-install s init)
       (cdr p))))
+
+;; Fixed-point marker for a variable getter call. forms.coil leaves the marked
+;; argument opaque on later transform rounds, preventing a generated `(x)` from
+;; becoming "load x, then call its value" while retaining lazy initialization.
+(defn scm--global-value [(v i64)] (-> i64) v)
 
 ;; `set!` on an existing binding mutates the pair in place, so every reference
 ;; sees the new value. R5RS returns an unspecified value.
 (defn scm--global-write [(s i64) (v i64)] (-> i64)
   (let [p (scm--genv-find s)]
     (if (is-null p)
-        (set-globals! (cons (cons s v) (scm--genv)))
+        (scm--global-install s v)
       (set-cdr! p v))
     (s-unspecified)))
 
@@ -148,7 +195,7 @@
     ; `scm--global-install`, `intern-literal` — is
     ; exported by this module and reaches the user through `:use *`, which is what
     ; keeps the macro from leaking its own namespace.
-    `(defn ~head [] (-> i64)
+    `(defn ~(scm--global-getter-name head) [] (-> i64)
        (let [s (intern-literal ~(primitive/code-str head))]
          (let [p (scm--genv-find s)]
            (if (is-null p)
@@ -482,7 +529,21 @@
                 (gc-sp-set! sp) (gc-root out) out))))))))
 (defn exact-cmp [(a i64) (b i64)] (-> i64)
   (if (and (integer-object? a) (integer-object? b)) (integer-cmp a b)
-    (integer-cmp (exact-cross-left a b) (exact-cross-right a b))))
+    ;; Both cross-products may allocate.  Coil does not implicitly keep the
+    ;; result of the first argument alive while evaluating the second one, so
+    ;; spelling this as `(integer-cmp (cross-left ...) (cross-right ...))`
+    ;; lets a GC during the right product reclaim the left product.  Large
+    ;; mixed exact/flonum comparisons in Jolt's checked casts exposed this as
+    ;; the absurd result `1.414 > 9223372036854775807`.
+    (let [sp (gc-sp)]
+      (gc-root a) (gc-root b)
+      (let [left (exact-cross-left a b)]
+        (gc-root left)
+        (let [right (exact-cross-right a b)]
+          (gc-root right)
+          (let [result (integer-cmp left right)]
+            (gc-sp-set! sp)
+            result))))))
 (defn mixed-flonum-cmp [(exact i64) (inexact i64)] (-> i64)
   (let [sp (gc-sp)]
     (gc-root exact) (gc-root inexact)
@@ -635,9 +696,9 @@
         scm--assq
         scm--false
         scm--genv
-        scm--genv-find
+        scm--genv-find scm--global-getter-name
         scm--global-install
-        scm--global-read
+        scm--global-read scm--global-value
         scm--global-write
         scm--params
         scm--true
