@@ -42,6 +42,32 @@ esac
 "$COIL" check tests/compiler/features/named_call_source_order.coil \
   || fail "ordinary Coil check parity"
 
+BF="$PWD/tests/read_metaprogram"
+hello=$("$COIL" run "$BF/hello.bf" --use coil.brainfuck) \
+  || fail "Brainfuck hello run"
+[ "$hello" = "Hello World!" ] || fail "Brainfuck hello output: $hello"
+echoed=$(printf 'reader metaprogram\n' | "$COIL" run "$BF/echo.bf" --use coil.brainfuck) \
+  || fail "Brainfuck echo run"
+[ "$echoed" = "reader metaprogram" ] || fail "Brainfuck echo output: $echoed"
+"$COIL" run "$BF/pointer_underflow.bf" --use coil.brainfuck >/dev/null 2>&1
+[ $? = 3 ] || fail "Brainfuck pointer underflow exit status"
+"$COIL" run "$BF/pointer_overflow.bf" --use coil.brainfuck >/dev/null 2>&1
+[ $? = 2 ] || fail "Brainfuck pointer overflow exit status"
+for side in open close; do
+  diag=$("$COIL" check "$BF/unmatched_${side}.bf" --use coil.brainfuck 2>&1)
+  [ $? = 1 ] || fail "Brainfuck unmatched $side exit status"
+  case "$diag" in
+    *"brainfuck reader: unmatched"*) ;;
+    *) fail "Brainfuck unmatched $side diagnostic: $diag" ;;
+  esac
+done
+
+# Four thousand flat operations is enough to expose the historical quadratic
+# quasiquote suffix-splicing implementation while keeping the generated module
+# itself reasonable for the bounded gate.
+"$COIL" check "$BF/flat.bf" --use coil.brainfuck \
+  || fail "large flat Brainfuck source"
+
 mkdir -p "$T/prefix/bin" "$T/prefix/lib/coil" "$T/out"
 cp "$COIL" "$T/prefix/bin/coil"
 cp -R src/stdlib "$T/prefix/lib/coil/stdlib"
@@ -51,5 +77,8 @@ cp "$FIX/raw_provider.coil" "$T/out/provider.coil"
 cp "$FIX/raw.answer" "$T/out/program.answer"
 (cd "$T/out" && COIL_STRICT_BUNDLE=1 "$T/prefix/bin/coil" check program.answer --use reader.fixture.raw) \
   || fail "strict installed bundle from outside the repository"
+cp "$BF/hello.bf" "$T/out/hello.bf"
+(cd "$T/out" && COIL_STRICT_BUNDLE=1 "$T/prefix/bin/coil" check hello.bf --use coil.brainfuck) \
+  || fail "Brainfuck provider in strict installed bundle from outside repository"
 
 echo "reader metaprograms: PASS"
