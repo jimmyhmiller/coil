@@ -211,6 +211,25 @@ The bundled standard library follows the same rule under `coil.*`: `coil.core`,
 `coil.json`, `coil.http.client`, `coil.http.server`, `coil.slice`, etc. Import these
 using their public namespace, for example `(import "coil.time" :as time)`.
 
+Compiler setup modules selected with `--use` may replace the entry file's initial
+read by declaring `(reader-provider "provider.namespace" function)`. The provider
+is ordinary compiled Coil with signature `[(context Code)] -> Code`; its argument
+is `(read-context PATH SOURCE entry)`, where `SOURCE` is the complete raw target.
+It returns either one form or `(do FORM...)`, after which normal loading,
+expansion, checking, compilation, and linking continue. Provider imports always
+bootstrap with Coil's default reader. Zero providers preserves the ordinary
+reader, and more than one selected provider is an error.
+
+A provider can delegate to the built-in configurable s-expression reader:
+
+```coil
+(primitive/code-read source
+  `(reader-config :unquote #\, :splice #\@))
+```
+
+The current context kind is only `entry`; textual imports retain Coil's default
+reader and do not automatically inherit the entry reader.
+
 Use `coil namespaces` to discover every standard-library namespace bundled into
 the installed compiler. `coil namespace NAME` then prints all definitions and
 signatures in one of those namespaces and includes each definition's `;;` docs

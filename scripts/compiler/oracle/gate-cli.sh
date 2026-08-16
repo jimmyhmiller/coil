@@ -80,6 +80,11 @@ printf '(extern abort :cc c [] (-> i64))\n(defn main [] (-> i64) (abort))\n' > "
 printf '(defn a [] (-> i64)    1)\n'                     > "$T/messy1.coil"
 printf '(defn b [] (-> i64)    2)\n'                     > "$T/messy2.coil"
 
+echo "== compile-time reader metaprograms =="
+scripts/tests/reader-metaprograms.sh "$COIL" \
+  && ok "generic readers cover check/build/run, ambiguity, parity, and strict installed layout" \
+  || bad "generic reader metaprograms" "focused reader gate failed"
+
 echo "== executable-relative resources through PATH =="
 HTTP_NATIVE_TARGET=$([ "$HOST_OS" = Linux ] && echo x86_64-linux || echo arm64-macos)
 mkdir -p "$T/path-bin" "$T/real-bin/native/curl/$HTTP_NATIVE_TARGET" "$T/lib/coil"
