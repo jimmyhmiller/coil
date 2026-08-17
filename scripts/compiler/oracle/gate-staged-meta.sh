@@ -45,6 +45,19 @@ for mode in native interp poison; do
   [ "$rc" = 1 ] || { echo "GATE FAIL: staged_dup ($mode) exited $rc, want 1"; fail=1; }
   grep -q "introduced more than once" "$WORK/dup.err" \
     || { echo "GATE FAIL: staged_dup ($mode) missing redefinition diagnostic"; fail=1; }
+  # The Scheme phase-runtime bridge: a staged entry computing through the GC'd
+  # Scheme heap (pairs, fixnums, syntax objects) at expansion time.
+  env "${env[@]}" "$BIN" run "$D/staged_scheme_bridge_test.coil" >/dev/null 2>"$WORK/err"
+  rc=$?
+  [ "$rc" = 42 ] || { echo "GATE FAIL: staged_scheme_bridge ($mode) exited $rc, want 42 ($(head -1 "$WORK/err"))"; fail=1; }
+  # Procedural Scheme define-syntax end-to-end: datum transformers, a
+  # transformer whose result uses another procedural macro, self-recursion.
+  env "${env[@]}" "$BIN" run tests/scheme/dialect/proc_syntax_basic.scm --use coil.scheme \
+    >"$WORK/proc.out" 2>"$WORK/proc.err"
+  rc=$?
+  [ "$rc" = 0 ] || { echo "GATE FAIL: proc_syntax_basic ($mode) exited $rc ($(head -1 "$WORK/proc.err"))"; fail=1; }
+  cmp -s "$WORK/proc.out" tests/scheme/dialect/proc_syntax_basic.expected \
+    || { echo "GATE FAIL: proc_syntax_basic ($mode) output mismatch"; fail=1; }
 done
 
 # Isolation is a property of the BUILT artifact: the staged entry's name must

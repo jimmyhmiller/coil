@@ -1324,6 +1324,199 @@
             true
         (dia--module-named? ms name (+ i 1) n)))))
 
+;; ---- procedural define-syntax (staged metacompilation) -----------------------
+;;
+;; `(define-syntax NAME (lambda (FORM) BODY...))` is a PROCEDURAL transformer:
+;; BODY is arbitrary Scheme that must RUN at expansion time. The dialect lowers
+;; the transformer through its own passes, emits it inside a `(stage MARKER ...)`
+;; declaration behind a generated `[Code...] -> Code` wrapper entry, and rewrites
+;; uses into `(MARKER ENTRY MARKER REGISTRY FORM)` requests.
+;;
+;; A round that finds procedural definitions SUSPENDS all other lowering: the
+;; requests must expand (between transform rounds, natively) while use sites are
+;; still RAW Scheme — a transformer must see `(f 17)`, never the literal-lifted
+;; `(f (mk-fixnum 17))`. Results are raw Scheme too and re-enter this transform
+;; on the next round (language resumption); only when no procedural work remains
+;; does the normal pipeline run.
+;;
+;; v1 limits, documented in docs/design/STAGED_METACOMPILATION.md: a transformer
+;; body may use the phase library and R5RS syntax-rules forms, not other
+;; procedural macros or the module's runtime defines; use recognition is by head
+;; symbol with quote/quote-data/quasiquote as data (the same skip set as the
+;; syntax-rules walker), without lexical-shadowing tracking.
+
+(defn dia-p--proc-form? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (and (= (primitive/code-count f) 3)
+            (and (primitive/code-eq (primitive/code-nth f 0) `define-syntax)
+                 (and (primitive/code-sym? (primitive/code-nth f 1))
+                      (let [spec (primitive/code-nth f 2)]
+                        (and (primitive/code-list? spec)
+                             (and (>= (primitive/code-count spec) 3)
+                                  (primitive/code-eq (primitive/code-nth spec 0) `lambda)))))))))
+
+(defn dia-p--proc-arg [(f Code)] (-> Code)
+  ;; The transformer's one parameter; `dia-p--proc-ok?` has already vetted shape.
+  (primitive/code-nth (primitive/code-nth (primitive/code-nth f 2) 1) 0))
+
+(defn dia-p--proc-ok? [(f Code)] (-> bool)
+  (let [params (primitive/code-nth (primitive/code-nth f 2) 1)]
+    (and (primitive/code-list? params)
+         (and (= (primitive/code-count params) 1)
+              (primitive/code-sym? (primitive/code-nth params 0))))))
+
+(defn dia-p--module-pending? [(m Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n) false
+    (if (dia-p--proc-form? (primitive/code-nth m i))
+        true
+      (dia-p--module-pending? m (+ i 1) n))))
+
+(defn dia-p--any-pending? [(ms Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n) false
+    (let [m (primitive/code-nth ms i)]
+      (if (and (dia--rewritable? m)
+               (dia-p--module-pending? m 1 (primitive/code-count m)))
+          true
+        (dia-p--any-pending? ms (+ i 1) n)))))
+
+;; Collected transformer records: (NAME ARG WRAPPER IMPL BODY...), with WRAPPER
+;; and IMPL freshly gensym'd — entry names are implementation details; requests
+;; carry the source span for diagnostics.
+(defn dia-p--collect [(m Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [f (primitive/code-nth m i)]
+      (if (not (dia-p--proc-form? f))
+          (dia-p--collect m (+ i 1) n)
+        (if (not (dia-p--proc-ok? f))
+            (do
+              (primitive/report f
+                "define-syntax: a procedural transformer must be (lambda (form) body...)")
+              (dia-p--collect m (+ i 1) n))
+          (let [spec (primitive/code-nth f 2)]
+            `((~(primitive/code-nth f 1)
+               ~(dia-p--proc-arg f)
+               ~(primitive/gensym)
+               ~(primitive/gensym)
+               ~@(primitive/code-rest (primitive/code-rest spec)))
+              ~@(dia-p--collect m (+ i 1) n))))))))
+
+(defn dia-p--strip [(m Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [f (primitive/code-nth m i)]
+      (if (dia-p--proc-form? f)
+          (dia-p--strip m (+ i 1) n)
+        `(~f ~@(dia-p--strip m (+ i 1) n))))))
+
+(defn dia-p--registry [(defs Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [d (primitive/code-nth defs i)]
+      `((~(primitive/code-nth d 0) ~(primitive/code-nth d 2))
+        ~@(dia-p--registry defs (+ i 1) n)))))
+
+(defn dia-p--impl-defines [(defs Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [d (primitive/code-nth defs i)]
+      `((define (~(primitive/code-nth d 3) ~(primitive/code-nth d 1))
+          ~@(primitive/code-rest (primitive/code-rest (primitive/code-rest (primitive/code-rest d)))))
+        ~@(dia-p--impl-defines defs (+ i 1) n)))))
+
+(defn dia-p--wrappers [(defs Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [d (primitive/code-nth defs i)]
+      `((defn ~(primitive/code-nth d 2) [(mk Code) (reg Code) (form Code)] (-> Code)
+          (stx-finish (~(primitive/code-nth d 3) (syntax-object-from-code form)) form mk reg))
+        ~@(dia-p--wrappers defs (+ i 1) n)))))
+
+;; Lower the transformer bodies through the dialect's own passes, exactly as a
+;; runtime module would be, in a synthetic module named like the real one (so
+;; the stage program's names qualify identically). The synthetic import of
+;; coil.scheme exists to satisfy the passes' opt-in gates and is dropped from
+;; the emitted forms — the stage declaration imports coil.scheme.phase instead.
+(defn dia-p--sans-import [(m Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [f (primitive/code-nth m i)]
+      (if (and (primitive/code-list? f)
+               (and (> (primitive/code-count f) 0)
+                    (primitive/code-eq (primitive/code-nth f 0) `import)))
+          (dia-p--sans-import m (+ i 1) n)
+        `(~f ~@(dia-p--sans-import m (+ i 1) n))))))
+
+(defn dia-p--lower-impls [(modname Code) (impls Code)] (-> Code)
+  (let [mini `((~modname (import "coil.scheme" :use *) ~@impls))
+        syn (dia--syntax-mods mini 0 1)
+        internal (dia--internal-mods syn 0 1)
+        derived (dia--syntax-mods internal 0 1)
+        lifted (dia--lambda-mods derived 0 1)
+        letted (dia--mods lifted 0 1)
+        formed (fm/scheme-forms-mods letted)
+        rooted (rt/rooting-mods formed)
+        outm (primitive/code-nth rooted 0)]
+    (dia-p--sans-import outm 1 (primitive/code-count outm))))
+
+;; Rewrite uses in the module's remaining RAW forms. A matched use is not
+;; descended into: its arguments reach the transformer verbatim, and recursive
+;; results are re-wrapped by the entry itself (stx-finish).
+(defn dia-p--wrap-items [(x Code) (i i64) (n i64) (reg Code) (marker Code)] (-> Code)
+  (if (>= i n) `()
+    `(~(dia-p--wrap (primitive/code-nth x i) reg marker)
+      ~@(dia-p--wrap-items x (+ i 1) n reg marker))))
+
+(defn dia-p--reg-entry [(head Code) (reg Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `dia-p-no-entry
+    (let [p (primitive/code-nth reg i)]
+      (if (primitive/code-eq head (primitive/code-nth p 0))
+          (primitive/code-nth p 1)
+        (dia-p--reg-entry head reg (+ i 1) n)))))
+
+(defn dia-p--wrap [(x Code) (reg Code) (marker Code)] (-> Code)
+  (if (primitive/code-vector? x)
+      `#(~@(dia-p--wrap-items x 0 (primitive/code-count x) reg marker))
+    (if (not (primitive/code-list? x)) x
+      (if (= (primitive/code-count x) 0) x
+        (let [head (primitive/code-nth x 0)]
+          (if (or (primitive/code-eq head `quote)
+                  (or (primitive/code-eq head `quote-data)
+                      (primitive/code-eq head `quasiquote)))
+              x
+            (let [entry (dia-p--reg-entry head reg 0 (primitive/code-count reg))]
+              (if (primitive/code-eq entry `dia-p-no-entry)
+                  `(~@(dia-p--wrap-items x 0 (primitive/code-count x) reg marker))
+                `(~marker ~entry ~marker ~reg ~x)))))))))
+
+(defn dia-p--wrap-forms [(fs Code) (i i64) (n i64) (reg Code) (marker Code)] (-> Code)
+  (if (>= i n) `()
+    `(~(dia-p--wrap (primitive/code-nth fs i) reg marker)
+      ~@(dia-p--wrap-forms fs (+ i 1) n reg marker))))
+
+(defn dia-p--module [(m Code)] (-> Code)
+  (let [n (primitive/code-count m)
+        defs (dia-p--collect m 1 n)]
+    (if (= (primitive/code-count defs) 0)
+        m
+      (let [marker (primitive/gensym)
+            nd (primitive/code-count defs)
+            reg (dia-p--registry defs 0 nd)
+            stripped (dia-p--strip m 1 n)
+            wrapped (dia-p--wrap-forms stripped 0 (primitive/code-count stripped) reg marker)
+            lowered (dia-p--lower-impls (primitive/code-nth m 0)
+                                        (dia-p--impl-defines defs 0 nd))]
+        `(~(primitive/code-nth m 0)
+          ~@wrapped
+          (stage ~marker
+            (import "coil.primitive" :as primitive)
+            (import "coil.scheme.phase" :use *)
+            ~@lowered
+            ~@(dia-p--wrappers defs 0 nd)))))))
+
+(defn dia-p--mods [(ms Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `()
+    (let [m (primitive/code-nth ms i)]
+      `(~(if (and (dia--rewritable? m)
+                  (dia-p--module-pending? m 1 (primitive/code-count m)))
+             (dia-p--module m)
+             m)
+        ~@(dia-p--mods ms (+ i 1) n)))))
+
 ;; ONE registration for the whole dialect, running its passes in a defined order.
 ;;
 ;; Two `before-expand` transforms that both rewrite the same code cannot converge:
@@ -1344,6 +1537,11 @@
   ;; error, while the same name introduced by a macro expansion below is fine.
   ;; Running the check first is what keeps those two cases apart.
   (lint/lint-scheme-source prepared)
+  ;; Procedural define-syntax suspends this round (see the dia-p section): the
+  ;; staged requests must run against RAW Scheme use sites, so no other pass may
+  ;; lower anything until the compiler has expanded them between rounds.
+  (if (dia-p--any-pending? prepared 0 (primitive/code-count prepared))
+      `(do ~@(dia-p--mods prepared 0 (primitive/code-count prepared)))
   ;; Order matters and is not arbitrary:
   ;;   1. user and report syntax-rules expand
   ;;   2. internal definitions lower to a recursive binding, then a second syntax
@@ -1385,6 +1583,6 @@
                                                (primitive/code-count scaffolded))]
                                                                   (dia--mods lifted
                                                                              0
-                                                                             (primitive/code-count lifted)))))))))))))))
+                                                                             (primitive/code-count lifted))))))))))))))))
 
 (transform scheme-dialect :phase before-expand)
