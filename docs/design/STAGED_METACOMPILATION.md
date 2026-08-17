@@ -1,6 +1,21 @@
 # Staged metacompilation
 
-Status: plan (2026-08-17). Nothing here is implemented on main.
+Status: IMPLEMENTED on branch `staged-metacompilation` (2026-08-17), M1–M5.
+The generic `(stage MARKER …)` protocol, the code-opaque/syntax-object bridge,
+procedural `define-syntax` (datum-level, recursive, macro-defining-macros), and
+`syntax-case`/`#'`/`with-syntax` (fixed patterns; ellipsis and fenders report
+clean errors) are all landed and gated by
+`scripts/compiler/oracle/gate-staged-meta.sh` under the native engine,
+`COIL_META_INTERP=1`, and `COIL_META_ARENA=poison`, with the self-host
+fixpoint byte-identical. Deviations from this plan discovered during
+implementation are recorded in the commit messages on that branch — most
+notably: the per-increment disposable compile arena is deferred (the engine
+image shares mono/interp structure with the checked graph — the branch's
+"premature freeing created dangling registries" trap, reproduced and then
+avoided by allocating stage compilation from the durable allocator);
+`ml-quoted` now deep-copies the quote registry as root-cause hardening; and
+engine setup runs inside the `SemMapsSnap` window because a stage program's
+nodes are fresh, unlike `stage-one-macro!`'s shared closure bodies.
 
 The goal: a transform can define code that **runs at expansion time**, in-process,
 during the same compilation — the mechanism that makes procedural Scheme macros
