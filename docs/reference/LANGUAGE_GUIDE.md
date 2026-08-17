@@ -527,10 +527,25 @@ The backing array is a function-frame place, so the slice is suitable for a call
 another value that does not outlive the frame. Literals do not allocate. Empty array
 literals are currently rejected because Coil has no zero-length array type.
 
-- `(primitive/field p name)` → a `(ptr FieldType)` (a place); then `load`/`store!`.
-  Requires `p : (ptr Struct)`. Nested: `(primitive/field (primitive/field s lo) x)`. Array field
-  element: `(primitive/index (primitive/field s buf) i)`.
-- `(primitive/load place)` reads, `(primitive/store! place v)` writes.
+- `(.name p)` reads a field value. It requires `p` to be a pointer/reference to a
+  struct. Accessors compose like ordinary Lisp calls: `(.x (.origin rect))`.
+- `(.. rect origin x)` is a core macro expanding to `(.x (.origin rect))`.
+- The same accessor denotes a place where surrounding syntax requires one:
+  `(mut (.name p))` borrows the field mutably and `(set! (.name p) value)` writes it.
+  Two-argument `set!` writes any place, including a mutable local or raw pointer;
+  three-argument `(set! collection key value)` remains the `Set` trait method.
+  Symbols beginning with `.` (except `..`) are reserved accessor heads. A
+  two-parameter function named `set!` is rejected because it could never be called.
+- `field`, `load`, and `store!` remain available as explicit low-level place operations.
+  `(field p name)` returns a pointer/reference rather than reading it. Array field
+  element: `(index (field s buf) i)`. Prefer `.field` and two-argument `set!` in
+  ordinary code; `coil lint --fix` performs mechanically safe migrations.
+- Before an interactive project `build`, Coil quickly scans the project's readable
+  source forms for catalogued obsolete syntax such as `primitive/load`,
+  `primitive/store!`, and `primitive/field`. If it finds any, it offers to run the
+  transactional `coil lint --fix` migration before continuing. This is based on the
+  syntax actually present, not a project or compiler version. Non-interactive builds
+  never prompt or write; they print the migration command and continue.
 - `(primitive/zeroed T)` = a zero value; `(primitive/sizeof T)`, `(primitive/alignof T)`, `(primitive/offsetof S f)` are
   compile-time.
 - Passing: `(p Point)` = **immutable ref** (a `store!` through it won't type-check);
