@@ -92,6 +92,31 @@ def install_library(prefix: Path) -> Path:
     return libdir
 
 
+def install_native_archives(source: Path, destination: Path) -> Path | None:
+    """Install optional native archives beside the compiler binary.
+
+    Hosted stdlib modules resolve these archives relative to the executable, so
+    copying only the compiler and Coil sources produces a toolchain that works
+    until an HTTP/llhttp program reaches the native link step. Keep the directory
+    replacement atomic for the same reason as the stdlib replacement above.
+    """
+    source_dir = source.parent / "native"
+    if not source_dir.is_dir():
+        return None
+
+    live = destination.parent / "native"
+    staged = destination.parent / "native.incoming"
+    previous = destination.parent / "native.previous"
+    shutil.rmtree(staged, ignore_errors=True)
+    shutil.copytree(source_dir, staged)
+    shutil.rmtree(previous, ignore_errors=True)
+    if live.exists():
+        live.rename(previous)
+    staged.rename(live)
+    shutil.rmtree(previous, ignore_errors=True)
+    return live
+
+
 def install(args: argparse.Namespace) -> None:
     """Install a compiler AND its standard library into the user's command path.
 
@@ -123,6 +148,10 @@ def install(args: argparse.Namespace) -> None:
     # <prefix>/bin/coil -> <prefix>/lib/coil, the layout loader.coil searches for.
     libdir = install_library(destination.parent.parent)
     print(f"installed library -> {libdir}")
+
+    native_dir = install_native_archives(source, destination)
+    if native_dir is not None:
+        print(f"installed native archives -> {native_dir}")
 
     if source.resolve() == destination.resolve():
         print(f"already installed: {destination}")
@@ -440,6 +469,7 @@ def test_modernize_fast(compiler: str) -> None:
         def lint_task() -> None:
             hex_probe = tmp / "legacy-hex-escape.coil"
             hex_probe.write_text(r'''(module legacy-hex-escape)
+(import "coil.primitive" :as primitive)
 ; A comment containing "\x42" is not source syntax.
 (defn main [] (-> i64)
   (let [legacy \a
@@ -447,6 +477,9 @@ def test_modernize_fast(compiler: str) -> None:
         canonical #\space
         text "\x41face"
         bytes c"\x00Z"
+        slash-cstr c"\\u00"
+        quoted-cstr c"\\\""
+        adjacent-op (primitive/idiv 4 2)
         current "\x3bb;"]
     0))
 ''')
@@ -460,6 +493,8 @@ def test_modernize_fast(compiler: str) -> None:
                 raise RuntimeError("fast modernization gate: legacy character literals were not migrated")
             if "canonical #\\space" not in hex_fixed:
                 raise RuntimeError("fast modernization gate: canonical character literal was changed")
+            if 'c"\\\\u00"' not in hex_fixed or 'c"\\\\\\\""' not in hex_fixed:
+                raise RuntimeError("fast modernization gate: semantic rewrite corrupted C-string backslashes")
             execute(coil, "check", str(hex_probe))
             before_hex = hashlib.sha256(hex_probe.read_bytes()).digest()
             execute(coil, "lint", str(hex_probe), "--fix")
@@ -621,6 +656,41 @@ source-roots = ["src"]
             if result.returncode == 0 or before != hashlib.sha256(main.read_bytes()).digest():
                 raise RuntimeError("fast modernization gate: failed project fix was not rolled back atomically")
 
+        def breaking_scan_task() -> None:
+            project = tmp / "breaking-scan"
+            (project / "src").mkdir(parents=True)
+            (project / "Coil.toml").write_text("""[package]
+name = "breaking-scan"
+entry = "src/main.coil"
+source-roots = ["src"]
+""")
+            main = project / "src/main.coil"
+            main.write_text("""(module breaking-scan)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(defn main [] (-> i64)
+  (let [p (alloc/stack i64)]
+    (primitive/store! p 0)
+    (primitive/load p)))
+""")
+            clean = subprocess.run(
+                [coil, "build", "--backend", "arm64", "-o", str(project / "clean")],
+                cwd=project, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if clean.returncode != 0:
+                raise RuntimeError("fast modernization gate: low-level detector probe did not build")
+            if "obsolete Coil syntax" in clean.stderr:
+                raise RuntimeError("fast modernization gate: valid low-level primitives triggered migration offer")
+
+            main.write_text("""(module breaking-scan)
+(defn main [] (-> i64)
+  (let [p (alloc-stack i64)] 0))
+""")
+            legacy = subprocess.run(
+                [coil, "build", "--backend", "arm64", "-o", str(project / "legacy")],
+                cwd=project, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if "obsolete Coil syntax" not in legacy.stderr:
+                raise RuntimeError("fast modernization gate: obsolete alloc spelling did not trigger migration offer")
+
         tasks = [
             cimport_task,
             lambda: build_run("tests/compiler/features/integer_ord_all_widths.coil", "integer-widths",
@@ -650,6 +720,7 @@ source-roots = ["src"]
             default_lint_task,
             broken_lint_task,
             broken_project_task,
+            breaking_scan_task,
         ]
         for surface in ("value", "macro", "method", "alias"):
             path = f"tests/compiler/features/refer_exclude_{surface}_rejected.coil"
