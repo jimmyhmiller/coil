@@ -58,6 +58,13 @@ for mode in native interp poison; do
   [ "$rc" = 0 ] || { echo "GATE FAIL: proc_syntax_basic ($mode) exited $rc ($(head -1 "$WORK/proc.err"))"; fail=1; }
   cmp -s "$WORK/proc.out" tests/scheme/dialect/proc_syntax_basic.expected \
     || { echo "GATE FAIL: proc_syntax_basic ($mode) output mismatch"; fail=1; }
+  # syntax-case v1: fixed patterns, literals, nesting, with-syntax, #' templates.
+  env "${env[@]}" "$BIN" run tests/scheme/dialect/proc_syntax_case.scm --use coil.scheme \
+    >"$WORK/sc.out" 2>"$WORK/sc.err"
+  rc=$?
+  [ "$rc" = 0 ] || { echo "GATE FAIL: proc_syntax_case ($mode) exited $rc ($(head -1 "$WORK/sc.err"))"; fail=1; }
+  cmp -s "$WORK/sc.out" tests/scheme/dialect/proc_syntax_case.expected \
+    || { echo "GATE FAIL: proc_syntax_case ($mode) output mismatch"; fail=1; }
 done
 
 # Isolation is a property of the BUILT artifact: the staged entry's name must
