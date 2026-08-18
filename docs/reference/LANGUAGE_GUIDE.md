@@ -846,15 +846,37 @@ compiler rather than erroring; write comptime loops with `loop`, which is unaffe
 
 **Macros are ordinary functions** `[Code…] (-> Code)` — detected by type, no
 `defmacro`. `Code` is a first-class value: quote a form with `` `FORM ``, splice a
-value in with `~E`, splice a list's elements with `~@E`. `(primitive/gensym)` gives a fresh
-symbol so macro temporaries don't capture. `&` before the last param makes it
+value in with `~E`, splice a list's elements with `~@E`. Template identifiers keep
+their definition context; unquoted syntax keeps its original context. Equal printed
+spelling never establishes a binding across independently built fragments.
+
+Create a readable local identifier once with
+`(primitive/fresh-identifier "temporary")`, pass that `Code` value through helpers,
+and unquote the same value at every binding/reference site. `primitive/gensym`
+remains shorthand for an anonymously named fresh identifier. Plain `'name` is
+metaprogram-authored syntax too, with the same identity rule as a template
+literal: create it once and reuse the value if two fragments must share it. The explicit context
+operations are `(primitive/datum->syntax prototype "name")` (intentional capture),
+`syntax->datum`, `free-identifier=?`, and `bound-identifier=?`; context introduction
+must not be hidden behind `code-symbol`. `&` before the last param makes a macro
 variadic (soaks up the rest as one Code list). Calls expand inline, outside-in:
+
+Use `coil dump-hygiene file.coil` when auditing generated code. It prints the
+expanded program with canonical `scope`, definition `module`, syntax `origin`,
+and transport `flags` metadata while ordinary dumps and diagnostics continue to
+show readable source names. An unscoped `code-symbol` used as a lexical identifier
+is a hard error; it is suitable only for syntax data such as fields and keywords.
 
     (defn when [(c Code) (body Code)] (-> Code) `(if ~c (do ~@body) 0))
     (when (< x 10) (println "small"))     ; → (if (< x 10) (do (println …)) 0)
 
 **`(meta (gen …))`** runs a generator at compile time and splices its result as new
-top-level forms; later code may depend on what it generates.
+top-level forms; later code may depend on what it generates. A name in the
+generator's template carries the generator's own definition context, so a
+declaration the surrounding program refers to by hand is published with the
+explicit context removal — `` `(const ~(primitive/syntax->datum `O_CREAT) 512) ``
+(`src/stdlib/fs.coil` is the worked example). A name only the generated forms use
+needs no such thing; `primitive/fresh-identifier` gives it its own identity.
 
 **Reflection** — introspect a type by name at comptime (fold to literals):
 `(primitive/field-count T)`, `(primitive/variant-count T)`, `(primitive/struct? T)`/`(primitive/sum? T)`/`(primitive/int? T)`/`(primitive/float?

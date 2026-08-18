@@ -60,10 +60,12 @@ It has no grammar knowledge, so it cannot tell a parameter list from a call; and
 `resolve-macro` takes `(head, module, macros, impb, expb, allocator)` — there is no
 environment parameter, so there is nowhere to record "`when` is bound here."
 
-The asymmetry worth noticing: Coil already has real hygiene machinery
-(`hygienize-expansion!`, `HygBox`/`HygEnt`, gensyms) for names a *macro* introduces.
-What is missing is any notion of names the *user* binds. Hygiene without a syntactic
-environment.
+This was the historical asymmetry. Coil now represents lexical identity on
+syntax objects and lowers every parser-known binder/reference position to the
+same scope-aware resolver keys. The old `hygienize-expansion!`/`HygBox` repair
+pass is gone; user syntax and introduced syntax participate in one syntactic
+environment. The remaining macro-keyword-shadowing question described here is
+about expansion order and namespaces, not identifier hygiene.
 
 ## What the other Lisps do
 

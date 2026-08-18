@@ -114,6 +114,13 @@ function hostSetenv(namePtr, valuePtr, overwrite) {
   hostEnvPtrs.delete(name);
   return 0;
 }
+function hostUnsetenv(namePtr) {
+  const name = cstr(namePtr);
+  if (!name || name.includes('=')) return -1;
+  hostEnv.delete(name);
+  hostEnvPtrs.delete(name);
+  return 0;
+}
 
 // ---- file descriptors ------------------------------------------------------
 // Node fds are small ints; use them directly. 0/1/2 are std streams.
@@ -301,7 +308,9 @@ const env = {
   fwrite:(ptr,sz,nm,f)=>{ const n=Number(sz)*Number(nm); doWrite(Number(f),ptr,BigInt(n)); return BigInt(nm); },
   opendir:(p)=>0n, closedir:(d)=>0,
   getcwd:(b,sz)=>{ const r=Buffer.from(process.cwd()+'\0'); writeBytes(b,r); return b; },
-  getenv:hostGetenv, setenv:hostSetenv,
+  getenv:hostGetenv, setenv:hostSetenv, unsetenv:hostUnsetenv,
+  isatty:()=>0,
+  atexit:()=>0,
   getpid:()=>Number(process.pid), realpath_stub:()=>0n, __error:hostErrno,
   // Coil's wasm64 Timespec uses two i64 fields. Date.now is wall-clock rather than
   // monotonic, but it preserves the libc ABI and is sufficient for compiler timing.
@@ -382,7 +391,11 @@ compilerExports = instance.exports;                          // meta_run_wasm br
 heap = BigInt(instance.exports.__heap_base.value);          // start allocating after static+stack
 
 // ---- set up argv = ["coil", ...coilArgs] -----------------------------------
-const argvStrings = ['coil', ...coilArgs];
+// Preserve the compiler image's actual location. Using the bare name `coil`
+// lets realpath resolve an unrelated installed compiler from PATH; stdlib
+// discovery then prefers that installation over this checkout and self-checks
+// against stale sources.
+const argvStrings = [wasmPath, ...coilArgs];
 const ptrs = argvStrings.map(s => { const b = Buffer.from(s + '\0'); const p = malloc(BigInt(b.length)); writeBytes(p, b); return p; });
 const argvPtr = malloc(BigInt(ptrs.length * 8));
 for (let i = 0; i < ptrs.length; i++) dv().setBigUint64(Number(argvPtr) + i * 8, ptrs[i], true);

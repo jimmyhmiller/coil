@@ -1863,10 +1863,14 @@ cat > "$T/project/tests/native_test.coil" <<'EOF'
 EOF
 cat > "$T/project/tests/second_test.coil" <<'EOF'
 (module second_test)
+(import "coil.primitive" :as primitive)
 (defn generate-second-suite [] (-> Code)
-  `(do
-     (const GENERATED_TEST_VALUE 42)
-     (defn generated-test-value [] (-> i64) GENERATED_TEST_VALUE)))
+  ; hygiene: these declarations intentionally enter the test module's public namespace.
+  (let [constant (primitive/syntax->datum `GENERATED_TEST_VALUE)
+        function (primitive/syntax->datum `generated-test-value)]
+    `(do
+       (const ~constant 42)
+       (defn ~function [] (-> i64) GENERATED_TEST_VALUE))))
 (meta (generate-second-suite))
 (deftest second-suite (assert-eq (generated-test-value) 42))
 EOF
@@ -2168,7 +2172,8 @@ cat > "$T/unq_stack.coil" <<'EOF'
     (store! (index (mut s) 1) (cast u8 \b))
     (store! (index (mut s) 2) (cast u8 \c))
     (store! (index (mut s) 3) (cast u8 \d))
-    `(defn lit [] (-> (slice u8)) ~(slice-new [u8] (index (mut s) 0) 4))))
+    ; hygiene: lit is a caller-visible generated declaration used by main below.
+    `(defn ~(primitive/syntax->datum `lit) [] (-> (slice u8)) ~(slice-new [u8] (index (mut s) 0) 4))))
 (meta (gen))
 (defn main [] (-> i64) (slice-len (lit)))
 EOF
@@ -2178,7 +2183,9 @@ cat > "$T/unq_static.coil" <<'EOF'
 (module unqstatic)
 (import "coil.primitive" :as primitive)
 (import "coil.slice" :use *)
-(defn gen [] (-> Code) `(defn lit [] (-> (slice u8)) ~(subslice "hello" 0 4)))
+(defn gen [] (-> Code)
+  ; hygiene: lit is a caller-visible generated declaration used by main below.
+  `(defn ~(primitive/syntax->datum `lit) [] (-> (slice u8)) ~(subslice "hello" 0 4)))
 (meta (gen))
 (defn main [] (-> i64) (slice-len (lit)))
 EOF
@@ -2827,7 +2834,7 @@ cat > "$T/aggconst/a.coil" <<'EOF'
 (defn mkp [] (-> P)
   (let [(mut p) (primitive/zeroed P)]
     (store! (field (mut p) x) 3) (store! (field (mut p) y) 4) (load (mut p))))
-(const FAVOURITE (Blue []))
+(const FAVOURITE (Blue))
 (const ANSWER    (Num 42))
 (const ORIGIN    (mkp))
 (defn main [] (-> i64)

@@ -1,12 +1,37 @@
 # Full syntax hygiene migration
 
-**Status: PLANNED — must land atomically.**
+**Status: IMPLEMENTATION IN PROGRESS — the semantic migration, the boundary
+matrix, and the full release gate are green; the seeds need one re-bless from a
+committed tree.**
 
-Coil's current metaprogramming model is only partially hygienic. Quasiquote
+Scope identity is distinct from diagnostic expansion context; dynamic quasiquote
+allocates one scope and preserves unquoted syntax; locals, parameters, match
+payloads, and type variables lower to scope-aware resolver keys; definition-module
+identity is recorded independently of source IDs; and the public identifier API is
+available. The span-based alpha-renamer, call-head qualification, and trait-binder
+re-baring walker are deleted. Compiler, standard library, Brainfuck reader,
+Scheme dialect, applications, experiments, and test metaprograms have all been
+migrated. The tracked audit reports zero unclassified sites, every snapshot stage
+passes, and the self-hosted compiler reaches an LLVM object fixpoint.
+
+Every boundary in the inventory below now has both-direction coverage, run on
+both metaprogram engines, and no diagnostic prints an internal resolver key.
+
+Both native seeds have been rebuilt (`scripts/compiler/refresh-seed.sh both`),
+because the committed ones predated `primitive/fresh-identifier` and could not
+compile this tree at all — `python3 scripts/dev.py test all` reaches the LLVM
+fixpoint from the committed seed again, with no `STAGE0`. What is left is
+bookkeeping the gate is right to insist on: the seeds were blessed from an
+uncommitted tree, so their `SEED_VERSION` stamps name a commit that does not
+contain the source they were built from and `gate-seed-provenance.sh` rejects
+them. Re-run the refresh once this work is committed and that resolves to a bare
+hash.
+
+Before this migration, Coil's metaprogramming model was only partially hygienic. Quasiquote
 qualifies resolvable call heads, and a post-expansion pass alpha-renames some
-macro-introduced `let` binders. Other relationships are still established by
-equal symbol spelling. Reader providers, generators, transforms, helper-built
-fragments, non-`let` binders, and programmatically constructed symbols do not all
+macro-introduced `let` binders. Other relationships were established by equal
+symbol spelling. Reader providers, generators, transforms, helper-built fragments,
+non-`let` binders, and programmatically constructed symbols did not all
 share one lexical-identity rule.
 
 The Brainfuck reader makes the problem concrete: `read-brainfuck` emits bindings
@@ -124,6 +149,12 @@ The audit and resolver changes must cover at least:
   syntax;
 - every binder introduced by a macro-defined surface form after that form expands.
 
+Loop/control labels are deliberately outside this inventory's lexical-identifier
+set: Coil spells them as keywords (`:label`) and `split-label` carries them as
+protocol data. They are compared in the loop stack, never resolved as symbols.
+The Brainfuck reader's `:program` label follows that same explicit keyword-data
+protocol.
+
 The parser and resolver already know the grammar of these positions. The final
 implementation must establish hygiene there rather than extending
 `hygienize-expansion!` with more syntax-shape guesses.
@@ -139,6 +170,8 @@ Every boundary below must preserve syntax identity and receive focused tests:
 - `(meta ...)` top-level generation;
 - before-expand transforms and checkers;
 - semantic transforms and checker replacements/suggestions;
+  (a suggestion is the only boundary whose output becomes source TEXT — see
+  "Flattening syntax back to text" below);
 - reader providers returning an entry program;
 - `primitive/code-read` and configurable readers;
 - `CodeBuilder`, `code-list-push!`, `code-list-done`, slices, copies, and concat;
@@ -313,6 +346,223 @@ For each subsystem:
   intentional changes together.
 - Run `python3 scripts/dev.py build full` once for final release verification.
 - Rebootstrap and require the fixpoint.
+
+## Migrating existing metaprograms
+
+Almost nothing needs migrating, because almost everything the new rule changed
+only WIDENS what resolves — a bare type name, a trait in a bound, a supertrait,
+an alias-qualified name — each of which used to be a compile error. Code that
+compiled before still compiles.
+
+Exactly one pattern can go the other way: a template naming a module through an
+alias its own file never declares. That used to borrow the caller's alias table
+and worked whenever every caller happened to pick the same nickname for the same
+module. Now it resolves where it was written, so the file has to import what it
+names. The repair is one line, and `scripts/hygiene-alias-scan.py` finds every
+occurrence.
+
+Scanned at migration time: `src` and `tests` report one site, and it is a false
+positive of a kind the scanner cannot detect — `modernize.coil`'s
+`mz-ambient-replacement` builds a `primitive/suggest` replacement, which becomes
+TEXT in the reader's file, so its `alloc/` is deliberately the reader's alias and
+is never resolved in `coil.lint.modernize` at all. Six Coil projects outside this
+repository (`jim-backend`, `TheCount`, `coil-conventions`, `coil-mlir`, an agent
+harness, and a design sketch) report zero.
+
+The two standard-library modules that DID have the problem — `coil.prop.derive`
+and `coil.prop.stateful`, above — are the only real instances the migration
+turned up, and both were one import each.
+
+## Every spelling a template can use now resolves the same way
+
+`.claude/worktrees/swift-interop/experiments/macro-hygiene` reported that of the
+four ways a template can name something, only two worked. A bare function name
+resolved in the defining module (real referential transparency, module-private
+names included). A bare TYPE name did not resolve at all, and an ALIAS-qualified
+name was re-resolved against the CALL site — where a file-local nickname means
+nothing, or, worse, means something else.
+
+The report was right, and its proposed fix — resolve alias-qualified symbols
+through the defining module's alias table, matching what the bare case already
+does — is what scope-aware resolution does. All four spellings now behave
+identically:
+
+| in a template | before | now |
+|---|---|---|
+| bare function name | resolves in the defining module | same |
+| bare type name | **no** | resolves in the defining module |
+| alias-qualified (either) | **re-resolved at the call site** | resolves in the defining module |
+| fully qualified (either) | resolves | same |
+
+`definition_site_alias.coil` and `definition_site_type.coil` pin all three of the
+repaired spellings adversarially: the caller binds the same alias to a different
+module exporting the same function, keeps a competing `Box` in bare scope, and
+rebinds the provider's own `tg` alias to a decoy `Tag`. That distinguishes "it
+worked" from "it worked for the right reason" — on the pre-migration compiler the
+alias fixture exits 12, having silently called the caller's decoy rather than
+erroring, and the bare type reports `unknown type 'Box'`.
+
+Both fixtures also check that their decoys are live, since an adversarial test
+whose adversary has fallen out of scope is a tautology. The alias fixture's
+answer is `5 + (999 - 962)`, so the provider's `st/str-len` and the caller's must
+both resolve as intended; the type fixture writes the decoys' `other` field,
+which exists on neither real type.
+
+The everyday consequence is that `primitive/…` in a template — an alias-qualified
+reference, in nearly every macro in the tree — is load-bearing rather than
+lucky.
+
+## Positions that took the spelling instead of the identifier
+
+Three positions were never migrated off `sx-sval`, so they matched by display
+text while everything around them matched by identity. Each was found by running
+a fixture that existed and that no gate ran.
+
+- **`impl`'s trait name** (`parse-impl` used `sym-of`). A `deftrait` emitted by a
+  template was invisible to the `impl` emitted beside it.
+- **A trait's type parameters, `Self` included** (`parse-deftrait` used
+  `sym-of`), while the method signatures that refer to them keep their identity —
+  so the two sides could not match: `method 'm': needs a Self (Self) parameter`.
+- **A generated declaration's home module.** A template in module A can generate
+  a declaration that lands in module B: the resolver key names A, the
+  declaration is indexed under B. `resolve-scoped-source` looked only in A.
+
+`lexical-sym-of` is `sym-of` for a position that names a binding rather than a
+piece of data. `tests/compiler/hygiene/lib9.coil` / `user9.coil` is the case that
+exercises all three at once, and it is now gated.
+
+## Templates must import what they name
+
+Two standard-library modules named things their own module could not see, and
+got away with it only while resolution fell back to the use site:
+`coil.prop.derive` names `Arbitrary`/`arbitrary` without importing
+`coil.prop.arbitrary`, and `coil.prop.stateful` expands into `(defprop …)`
+without importing `coil.prop`. A free identifier in a template resolves at its
+DEFINITION site, so both now import what they name. `coil.prop` is imported as
+`:use [defprop]` rather than `:use *`, because it re-exports a `Source` that
+`coil.prop.stateful` already has from `coil.prop.source`.
+
+`__mode` joined `__src` as a published property-body protocol name for the same
+reason: `defprop` binds it and `defprop-stateful` reads it, and those are two
+templates in two modules, so they connect only through an explicit
+`syntax->datum` / `datum->syntax` pair.
+
+## `quote` is syntax, not a spelling
+
+`'name` is metaprogram-authored syntax exactly as a quasiquote literal is, and
+carries the same lexical identity: one fresh introduction per evaluation, stamped
+with the metaprogram's definition module.
+
+It did not, and that was the migration's last spelling-based back door. Plain
+quote aliased its registry node, leaving the identifier in the SOURCE scope
+(`hyg` 0) where it bound by spelling — so a template writing `~'tmp` around
+caller syntax captured the caller's `tmp`, and two independently evaluated
+`'name`s connected to each other. The source audit could not see it, because `'`
+is not one of the identifier-producing primitives it tracks; nothing in the tree
+used it that way, so nothing failed.
+
+Quoted DATA is unaffected. `sexp-eq` (and so `code-eq`) compares tag and spelling
+and never lexical identity, so `(code-eq node 'inc)` answers exactly as before;
+only the binding graph changed. The stamp is a copy, never a mutation of the
+shared registry node.
+
+Pinned by `tests/compiler/hygiene/quote_identity.coil` (one quoted identifier
+reused, caller left alone, exits 42) and `quote_capture.coil` (two independent
+evaluations must not connect), on both engines.
+
+## `name#` was not needed
+
+The plan proposed `name#` as sugar for a fresh identifier local to one template.
+It is not implemented, and full hygiene is why: a template identifier already
+gets a fresh scope per expansion, so `tmp#` and `tmp` behave identically and the
+sugar would only add a second way to spell the default. Nothing in the contract
+depends on it.
+
+## Flattening syntax back to text
+
+Every other boundary preserves identity because the syntax objects survive it.
+A checker `suggest`ion does not: `coil lint --fix` writes the replacement into
+the author's file, and a file has spellings, not scopes. A rule that wraps the
+author's code in its own `(let [tmp 1] …)` therefore captured their `tmp`, and
+the rewritten file still compiled — the failure mode a source-rewriting tool
+must not have. Using `primitive/fresh-identifier` did not help, because the
+renderer emitted the base spelling either way.
+
+The renderer now disambiguates. Which collisions can actually capture anything
+is answered from the type-checker's binding map rather than from binder shapes:
+only an identifier transported out of the author's program that the checker
+resolved to a LOCAL is capturable, so only a spelling shared with one of those
+is renamed. The author's syntax always keeps its text; each rule-introduced
+identity, keyed by its scope, becomes `name__N` in first-appearance order.
+Heads, globals and qualified names collide harmlessly and keep their spelling,
+which is what leaves `cond`-shaped rewrites byte-identical.
+
+The capturable spellings are collected at `suggest` time, before the replacement
+is copied out of the metaprogram's arena: owning a tree renumbers its nodes, and
+the binding map is keyed by node id.
+
+## What the audit could not tell you
+
+Two blind spots, both found the hard way:
+
+- **The audit tracks identifier PRODUCERS, not consumers.** It enumerates
+  `fresh-identifier`/`datum->syntax`/`syntax->datum`/`code-symbol`/`gensym` call
+  sites and can say every one is classified. It cannot see a parser position that
+  drops identity on the floor, and it never looked at `'` at all. Every real
+  defect found in this migration was invisible to it.
+- **A fixture that no gate runs is not a test.** 28 of the hygiene fixtures --
+  including the whole trait-method matrix, whose expected results are written
+  down in the directory's README -- were run by nothing, and one of them had been
+  silently failing. They are all gated now, and the gate checks their printed
+  output, not just an exit code.
+
+`scripts/tests/prop.sh` had a third version of the same problem: it read its
+compiler from `$COIL` and ignored a path argument, so `prop.sh <candidate>`
+reported on whatever `coil` was installed. It now takes the argument.
+
+## Known limits of the audit tooling
+
+`coil dump-hygiene` parses its input as ordinary Coil, so it cannot audit syntax
+produced by a `--use` reader provider — pointed at a `.bf` file it reports a
+parse error rather than the reader's output. The runtime enforcement is
+unaffected (a real build of that file resolves under the same rules), and the
+Brainfuck acceptance probe below covers the property behaviourally, but the
+machine-readable audit has a blind spot at that one boundary.
+
+## Diagnostics never print a resolver key
+
+The parser lowers binders and references to `$scope<N>@<module>$<name>`. Those
+numbers are deterministic within one compilation and meaningless outside it, and
+they reached messages embedded in longer names — a generated function reported
+as `mymod.$scope7@mymod$helper`, a generic parameter as `$scope93@mymod$T`.
+`diag-display-msg` normalizes the rendered text at the single place every
+diagnostic is written, so a new message cannot forget to do it. Gated over the
+fixtures that produce generated declarations.
+
+## Not a boundary: a `meta`-generated macro
+
+`(meta …)` can emit a `defn` with a `Code` signature, but a call to it resolves
+as an ordinary function call and is never staged as a macro: the macro-name set
+is collected from the loaded surface forms before any generator runs. This
+predates the migration — the committed seed rejects the same program — so it is
+recorded here rather than fixed as part of it. The supported half, a macro whose
+expansion expands another macro, is covered by
+`tests/compiler/hygiene/nested_macro_expansion_identity.coil`.
+
+## Brainfuck acceptance, checked
+
+The reader creates `cells` and `dp` once with `primitive/fresh-identifier` and
+threads them through `bf-command`/`bf-compile-seq`; `putchar`, `getchar` and
+`main` are `datum->syntax context` because they belong to the target module.
+
+The acceptance property the section below asks for is now a test rather than a
+claim. `tests/compiler/reader_metaprograms/bf_collide.coil` is a before-expand
+transform that injects `(const cells 111)`, `(const dp 222)` and `(const cell
+333)` into the very module the reader emitted; `hello.bf` still prints
+`Hello World!` under it. `bf_collide_live.coil` runs first and exits 42 only if
+those consts really landed, so a probe that silently stopped injecting cannot
+make the acceptance check pass vacuously. Both are in
+`scripts/tests/reader-metaprograms.sh`.
 
 ## Brainfuck acceptance example
 

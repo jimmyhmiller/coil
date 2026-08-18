@@ -300,7 +300,13 @@ does not work is unusable.
 
 ---
 
-## 10. The fix that landed
+## 10. Historical fix (superseded by full syntax hygiene)
+
+This section records the former call-head qualification and binder re-baring
+implementation. It is not the current architecture. The full hygiene migration
+deleted both walkers: syntax carries definition-module/scope identity and the
+parser/resolver handles binder and reference positions directly. See
+`FULL_HYGIENE_MIGRATION.md`.
 
 Parts 1–3 reinstated verbatim (`git revert` of `624cc29`), plus a fourth part
 answering §5.2's requirement — with a different placement than §5.2 guessed.
@@ -314,9 +320,9 @@ template and spliced in with `~@` qualifies in a different template than the
 `impl` that receives it, so no template-local rule can ever see the binder
 position (`user7` is that case).
 
-The place that CAN see it is the **expansion boundary**: every macro- or
-transform-produced form arrives there fully assembled, exactly once, before
-anything consumes a method name. `expander.coil` now walks each spliced
+The former implementation used the **expansion boundary**: every macro- or
+transform-produced form arrived there fully assembled, exactly once, before
+anything consumed a method name. `expander.coil` walked each spliced
 expansion output (`rebare-binders-walk!`, called next to `hygienize-expansion!`
 in both `expand-calls` and `tower-expand-call`, and over transform output in
 `run-transformers`): for `(impl …)` and `(deftrait …)` forms — recursing through

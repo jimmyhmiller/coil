@@ -77,9 +77,15 @@ and `O_TRUNC` on Linux), and it selects them with
 ```coil
 (defn os-pick [(linux Code) (darwin Code)] (-> Code)
   (if (primitive/code-eq (primitive/target-os) `linux) linux darwin))
+;; A generated const the surrounding PROGRAM refers to is a published name, not a
+;; template binder. A bare `O_CREAT` in the template would carry this module's
+;; definition context and the program's own reference could not see it, so the
+;; name is declared through the explicit context removal.
+(defn fs--explicit-public-name [(name Code)] (-> Code)
+  (primitive/syntax->datum name))
 (defn gen-open-flags [] (-> Code)
-  `(do (const O_CREAT ~(os-pick `64 `512))
-       (const O_TRUNC ~(os-pick `512 `1024))))
+  `(do (const ~(fs--explicit-public-name `O_CREAT) ~(os-pick `64 `512))
+       (const ~(fs--explicit-public-name `O_TRUNC) ~(os-pick `512 `1024))))
 (meta (gen-open-flags))
 ```
 
@@ -105,6 +111,19 @@ New API this project added (all shipped):
   carried across the rewrite too, so a commented chain is fixed like any other. Demo:
   `src/examples/metaprogramming/condlint.coil` rewrites a chain of 3+ nested `if`s as a `cond` with
   `:else`. Full design + what changed on contact with reality: `docs/archive/AUTOFIX.md`.
+
+  A replacement is the one metaprogram output that becomes **source text**, and text
+  carries no lexical scope. An identifier the rule introduced and one transported out
+  of the author's program are distinct syntax objects even when they print the same,
+  so the renderer **disambiguates** before writing: whether a collision can capture
+  anything is decided from the type-checker's binding map (only a transported
+  reference bound to a LOCAL is capturable), the author's syntax always keeps its
+  text, and each rule-introduced identity becomes `name__N`. Heads, globals and
+  qualified names collide harmlessly and are untouched, which is why a `cond`-shaped
+  rewrite still reads exactly as written. So a rule may bind around the author's code
+  — `(let [tmp 1] (primitive/imul ~their-node tmp))` — without silently rebinding
+  their `tmp`; it is rendered `(let [tmp__1 1] (primitive/imul tmp tmp__1))`. Pinned by
+  `tests/compiler/hygiene/suggestion_capture_rule.coil` in `gate-run-meta.sh`.
 - **`(primitive/delete NODE MSG)`** — a `warn` that proposes REMOVING the node. Deletion is a
   separate op rather than a `suggest` with an empty replacement for two reasons: no
   `Code` value renders as nothing, and a deletion legitimately covers source the
@@ -133,10 +152,17 @@ New API this project added (all shipped):
   typechecks.
 - **Transforms are MODULE-SHAPED and may ADD/REMOVE top-level forms.** `(transform
   FN)` hands FN the program as `((name form…) …)` (one record per module, like a
-  checker) and FN returns the same shape; every form in a returned module record is
-  tagged with that module, so a transform may EMIT new top-level defns (a GC dialect's
-  per-type `trace-T`, a root table, a runtime import) or drop forms. Demo:
+  checker) and FN returns those records **`do`-wrapped**: `` `(do ~@records) ``. Every
+  form in a returned module record is tagged with that module, so a transform may EMIT
+  new top-level defns (a GC dialect's per-type `trace-T`, a root table, a runtime
+  import) or drop forms. Demo:
   `tests/metaprogramming/compile-and-run/addforms.coil` emits a whole new defn.
+
+  The `do` is not optional padding, and it is the easiest thing to get wrong: a
+  return value that is not a `do` bundle is read as ONE module record, so handing
+  back the argument unchanged — the identity transform — fails with *"a module
+  record's head must be its name symbol"*. `tests/metaprogramming/safe_dialect.coil`
+  shows the shape.
 - **Phase selection.** The two-item registrations keep their semantic behavior: they
   run after expansion and have access to the checked model. Add `:phase before-expand`
   to run on the loaded surface syntax instead: `(checker raw-depth :phase

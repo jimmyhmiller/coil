@@ -23,6 +23,10 @@ BIN=${1:?usage: gate-run-meta.sh <coil-binary>}
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 fail=0
 
+# The source inventory is part of the hygiene contract: every explicit syntax
+# producer must remain classified, and reviewed locations may not drift.
+python3 scripts/hygiene-audit.py --check || fail=1
+
 expect_out() { # name command... : compare stdout to $EXPECT exactly
   local name=$1; shift
   local got
@@ -97,6 +101,253 @@ grep -q 'expects 2 Code inputs, got 1' "$WORK/arity.err" || { echo "GATE FAIL: a
 EXPECT='(((hello 42)))'
 expect_out pipe-compose sh -c "echo '(hello 42)' | '$BIN' run tests/metaprogramming/run_code_main_id.coil | '$BIN' run tests/metaprogramming/run_code_main_id.coil"
 
+# ---- syntax identity across independently evaluated templates --------------
+# Equal display spelling is not a binding relationship. The implicit generator
+# and reader-provider cases must fail; explicitly reusing one gensym must work.
+"$BIN" check tests/compiler/hygiene/implicit_cross_template_capture.coil >"$WORK/hyg-implicit.out" 2>"$WORK/hyg-implicit.err"
+rc=$?
+[ "$rc" = 1 ] || { echo "GATE FAIL: implicit cross-template capture exited $rc, want 1"; fail=1; }
+grep -q "unbound variable 'state'" "$WORK/hyg-implicit.err" \
+  || { echo "GATE FAIL: implicit cross-template capture diagnostic missing"; fail=1; }
+
+"$BIN" run tests/compiler/hygiene/explicit_cross_template_identity.coil >/dev/null 2>&1
+rc=$?
+[ "$rc" = 42 ] || { echo "GATE FAIL: explicit cross-template identity exited $rc, want 42"; fail=1; }
+
+"$BIN" run tests/compiler/hygiene/identity_transport.coil >/dev/null 2>&1
+rc=$?
+[ "$rc" = 42 ] || { echo "GATE FAIL: syntax identity transport exited $rc, want 42"; fail=1; }
+
+for fixture in implicit_parameter_capture implicit_match_capture implicit_mut_capture implicit_sequential_initializer_capture; do
+  "$BIN" check "tests/compiler/hygiene/$fixture.coil" >"$WORK/hyg-$fixture.out" 2>"$WORK/hyg-$fixture.err"
+  rc=$?
+  [ "$rc" = 1 ] || { echo "GATE FAIL: $fixture exited $rc, want 1"; fail=1; }
+  grep -q "unbound variable" "$WORK/hyg-$fixture.err" \
+    || { echo "GATE FAIL: $fixture diagnostic missing"; fail=1; }
+done
+
+for fixture in explicit_parameter_identity explicit_match_identity explicit_mut_identity explicit_sequential_initializer_identity explicit_type_parameter_identity; do
+  "$BIN" run "tests/compiler/hygiene/$fixture.coil" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" = 42 ] || { echo "GATE FAIL: $fixture exited $rc, want 42"; fail=1; }
+done
+
+"$BIN" check tests/compiler/hygiene/implicit_type_parameter_capture.coil \
+  >"$WORK/hyg-type-param.out" 2>"$WORK/hyg-type-param.err"
+rc=$?
+[ "$rc" = 1 ] || { echo "GATE FAIL: implicit type-parameter capture exited $rc, want 1"; fail=1; }
+grep -q "unknown type" "$WORK/hyg-type-param.err" \
+  || { echo "GATE FAIL: implicit type-parameter capture diagnostic missing"; fail=1; }
+
+for fixture in identifier_api free_identifier_equality explicit_capture_api; do
+  "$BIN" run "tests/compiler/hygiene/$fixture.coil" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" = 42 ] || { echo "GATE FAIL: $fixture exited $rc, want 42"; fail=1; }
+done
+
+"$BIN" check tests/compiler/hygiene/use_site_binder_cannot_capture.coil \
+  >"$WORK/hyg-use-site.out" 2>"$WORK/hyg-use-site.err"
+rc=$?
+[ "$rc" = 1 ] || { echo "GATE FAIL: use-site binder capture exited $rc, want 1"; fail=1; }
+grep -q "unbound variable" "$WORK/hyg-use-site.err" \
+  || { echo "GATE FAIL: use-site binder capture diagnostic missing"; fail=1; }
+
+"$BIN" check tests/compiler/hygiene/code_symbol_is_not_identifier.coil \
+  >"$WORK/hyg-code-symbol.out" 2>"$WORK/hyg-code-symbol.err"
+rc=$?
+[ "$rc" = 1 ] || { echo "GATE FAIL: code-symbol identifier misuse exited $rc, want 1"; fail=1; }
+grep -q "unscoped generated identifier 'temporary'" "$WORK/hyg-code-symbol.err" \
+  || { echo "GATE FAIL: code-symbol identifier misuse diagnostic missing"; fail=1; }
+
+# The machine-readable syntax audit runs the authoritative resolver/checker and
+# must fail closed too; it may not emit a successful scoped dump for unknown
+# provenance in an identifier position.
+"$BIN" dump-hygiene tests/compiler/hygiene/code_symbol_is_not_identifier.coil \
+  >"$WORK/hyg-dump.out" 2>"$WORK/hyg-dump.err"
+rc=$?
+[ "$rc" = 1 ] || { echo "GATE FAIL: dump-hygiene unknown provenance exited $rc, want 1"; fail=1; }
+grep -q "unscoped generated identifier 'temporary'" "$WORK/hyg-dump.out" \
+  || { echo "GATE FAIL: dump-hygiene did not fail closed"; fail=1; }
+grep -q '^(forms' "$WORK/hyg-dump.out" \
+  && { echo "GATE FAIL: dump-hygiene emitted a successful audit after failure"; fail=1; }
+
+"$BIN" run tests/compiler/hygiene/definition_site_value.coil >/dev/null 2>&1
+rc=$?
+[ "$rc" = 42 ] || { echo "GATE FAIL: definition-site value exited $rc, want 42"; fail=1; }
+
+"$BIN" check tests/compiler/hygiene/definition_site_import.coil >/dev/null 2>&1
+rc=$?
+[ "$rc" = 0 ] || { echo "GATE FAIL: definition-site imported value exited $rc, want 0"; fail=1; }
+
+"$BIN" check tests/compiler/hygiene/moduleless_ambient_definition_site.coil >/dev/null 2>&1
+rc=$?
+[ "$rc" = 0 ] || { echo "GATE FAIL: module-less ambient definition-site reference exited $rc, want 0"; fail=1; }
+
+"$BIN" run tests/compiler/hygiene/moduleless_local_trait_resolution.coil >/dev/null 2>&1
+rc=$?
+[ "$rc" = 111 ] || { echo "GATE FAIL: module-less local trait resolution exited $rc, want 111"; fail=1; }
+
+"$BIN" check tests/compiler/hygiene/reader_implicit_capture.coil \
+  --use hygiene.reader-implicit-capture >"$WORK/hyg-reader.out" 2>"$WORK/hyg-reader.err"
+rc=$?
+[ "$rc" = 1 ] || { echo "GATE FAIL: reader implicit capture exited $rc, want 1"; fail=1; }
+grep -q "unbound variable 'state'" "$WORK/hyg-reader.err" \
+  || { echo "GATE FAIL: reader implicit capture diagnostic missing"; fail=1; }
+
+
+# ---- the remaining metaprogram boundaries -----------------------------------
+# Variadic arguments and `~@` splicing, a macro whose expansion expands another
+# macro, and both transform phases. Each positive fixture is arranged so that a
+# capture in EITHER direction changes the answer, not just fails to compile.
+for fixture in explicit_variadic_splice_identity nested_macro_expansion_identity \
+               before_expand_transform_identity semantic_transform_identity; do
+  "$BIN" run "tests/compiler/hygiene/$fixture.coil" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" = 42 ] || { echo "GATE FAIL: $fixture exited $rc, want 42"; fail=1; }
+done
+
+for fixture in implicit_variadic_splice_capture before_expand_transform_capture \
+               semantic_transform_capture; do
+  "$BIN" check "tests/compiler/hygiene/$fixture.coil" >"$WORK/hyg-$fixture.out" 2>"$WORK/hyg-$fixture.err"
+  rc=$?
+  [ "$rc" = 1 ] || { echo "GATE FAIL: $fixture exited $rc, want 1"; fail=1; }
+  grep -q "unbound variable" "$WORK/hyg-$fixture.err" \
+    || { echo "GATE FAIL: $fixture diagnostic missing"; fail=1; }
+done
+
+# ---- what spelling a template may use for a definition-site name ------------
+# A bare function name in a template already resolved where the template was
+# WRITTEN. The other two spellings did not, and the asymmetry is what
+# .../experiments/macro-hygiene reported: an alias-qualified name was re-resolved
+# against the CALL site (where a file-local nickname means nothing, or worse,
+# something else), and a bare TYPE name did not resolve at all.
+#
+# Both fixtures are adversarial on purpose. The caller binds the same alias to a
+# different module that exports the same function, and has a competing `Box` in
+# bare scope -- so "it happened to work" and "it resolved correctly" give
+# different answers. On the pre-migration compiler the alias case exits 12: it
+# silently called the caller's decoy.
+"$BIN" run tests/compiler/hygiene/definition_site_alias.coil >/dev/null 2>&1
+rc=$?
+[ "$rc" = 42 ] || { echo "GATE FAIL: alias-qualified template reference exited $rc, want 42 (12 = resolved at the call site)"; fail=1; }
+
+"$BIN" run tests/compiler/hygiene/definition_site_type.coil >/dev/null 2>&1
+rc=$?
+[ "$rc" = 42 ] || { echo "GATE FAIL: bare type name in a template exited $rc, want 42"; fail=1; }
+
+# The same family, one level further in: a trait named in a generic BOUND. The
+# provider does not export it, so nothing but definition-site resolution can find
+# it. This one never worked, on either compiler.
+"$BIN" run tests/compiler/hygiene/definition_site_bound.coil >/dev/null 2>&1
+rc=$?
+[ "$rc" = 42 ] || { echo "GATE FAIL: definition-site trait in a bound exited $rc, want 42"; fail=1; }
+
+# ---- the trait-method hygiene pairs -----------------------------------------
+# tests/compiler/hygiene/README.md documents an expected result for each of these
+# and nothing ran them, so a regression in one sat in the tree unnoticed: a
+# template-generated `deftrait` had become invisible to the `impl` generated
+# beside it (user9). They print their answer, so the OUTPUT is what is checked.
+check_out() { # name file expected-output
+  local got
+  got=$("$BIN" run "tests/compiler/hygiene/$2.coil" 2>&1 | tr '\n' ' ' | sed 's/ *$//')
+  [ "$got" = "$3" ] || { echo "GATE FAIL: $1 ($2): got [$got], want [$3]"; fail=1; }
+}
+check_out "trait method captured"          user   "0"
+check_out "ordinary fn control"            user2  "42"
+check_out "primitive spelling control"     user3  "0"
+check_out "two modules declare mine"       user5  "7"
+check_out "derived Eq method binder"       user6  "0"
+check_out "spliced method binder"          user7  "1"
+check_out "library binder + local trait"   user8  "42"
+check_out "macro-GENERATED deftrait"       user9  "21"
+check_out "user trait named like extern"   user10 "5"
+check_out "pattern head vs defn name"      user11 "7 111"
+check_out "arity-directed fallback"        user12 "5"
+check_out "arith width interaction probe"  arith_widths "3 3 10"
+
+"$BIN" test tests/compiler/hygiene/user4.coil >/dev/null 2>&1
+[ $? != 0 ] || { echo "GATE FAIL: user4 must FAIL under coil test"; fail=1; }
+
+"$BIN" check tests/compiler/hygiene/user13.coil >"$WORK/u13.out" 2>"$WORK/u13.err"
+rc=$?
+[ "$rc" = 1 ] || { echo "GATE FAIL: user13 exited $rc, want 1 (explicit qualification must not fall back)"; fail=1; }
+
+"$BIN" run tests/compiler/hygiene/definition_site_trait_method.coil >/dev/null 2>&1
+rc=$?
+[ "$rc" = 42 ] || { echo "GATE FAIL: definition_site_trait_method exited $rc, want 42"; fail=1; }
+
+# ---- plain `quote` is syntax, not a spelling ---------------------------------
+# `'name` is metaprogram-authored syntax exactly as a quasiquote literal is. It
+# used to alias the AST node in the SOURCE scope, so it bound by spelling: a
+# template binding `~'tmp` around caller syntax captured the caller's `tmp`, and
+# two independently evaluated `'name`s connected to each other. Neither is
+# reachable through the source audit, because `'` is not a producer primitive.
+"$BIN" run tests/compiler/hygiene/quote_identity.coil >/dev/null 2>&1
+rc=$?
+[ "$rc" = 42 ] || { echo "GATE FAIL: quote_identity exited $rc, want 42 (0 = the template captured the caller)"; fail=1; }
+
+"$BIN" check tests/compiler/hygiene/quote_capture.coil >"$WORK/quote.out" 2>"$WORK/quote.err"
+rc=$?
+[ "$rc" = 1 ] || { echo "GATE FAIL: quote_capture exited $rc, want 1"; fail=1; }
+grep -q "unbound variable 'hidden'" "$WORK/quote.err" \
+  || { echo "GATE FAIL: quote_capture diagnostic missing"; fail=1; }
+
+# ---- checker suggestions: the boundary whose output is SOURCE TEXT ----------
+# A replacement is flattened into the author's file, where lexical scope no
+# longer exists, so the renderer has to disambiguate the rule's identifier from
+# the author's. The rule deliberately writes a bare template binder: the fix must
+# be correct for the naive rule, not only for one that remembered to call
+# `fresh-identifier`. Verified end to end — the rewritten file still returns 42.
+cp tests/compiler/hygiene/suggestion_capture_target.coil "$WORK/sug-target.coil"
+"$BIN" lint "$WORK/sug-target.coil" --use hygiene.suggestion-capture-rule \
+  >"$WORK/sug.out" 2>"$WORK/sug.err"
+grep -q "help: try: (let \[tmp__1 1\] (primitive/imul tmp tmp__1))" "$WORK/sug.err" \
+  || { echo "GATE FAIL: suggestion did not disambiguate the rule's binder"; \
+       grep 'help: try:' "$WORK/sug.err"; fail=1; }
+"$BIN" lint "$WORK/sug-target.coil" --use hygiene.suggestion-capture-rule --fix >/dev/null 2>&1
+grep -q "tmp__1" "$WORK/sug-target.coil" \
+  || { echo "GATE FAIL: --fix did not write the disambiguated binder"; fail=1; }
+"$BIN" run "$WORK/sug-target.coil" >/dev/null 2>&1
+rc=$?
+[ "$rc" = 42 ] || { echo "GATE FAIL: fixed program exited $rc, want 42 (the fix captured)"; fail=1; }
+
+# ---- scoped resolver keys are internal --------------------------------------
+# The parser lowers binders/references to `$scope<N>@<module>$<name>` keys. Those
+# numbers are compilation-internal and name nothing the author can find, so no
+# diagnostic may print one — including embedded in a generated function's name.
+for fixture in implicit_parameter_capture implicit_type_parameter_capture \
+               implicit_match_capture use_site_binder_cannot_capture; do
+  "$BIN" check "tests/compiler/hygiene/$fixture.coil" >"$WORK/key.out" 2>"$WORK/key.err"
+  if grep -q '[$]scope\|[$]datum' "$WORK/key.err" "$WORK/key.out"; then
+    echo "GATE FAIL: $fixture leaked an internal scope key into a diagnostic"
+    grep -o '[^ ]*[$]\(scope\|datum\)[^ ]*' "$WORK/key.err" | sort -u | head -2
+    fail=1
+  fi
+done
+
+# ---- the OTHER metaprogram engine ------------------------------------------
+# Identity has to be a property of the syntax objects, not of the engine that
+# produced them: COIL_META_INTERP=1 runs the same matrix on the bytecode
+# interpreter (what a wasm sandbox uses) instead of the native metaprogram image.
+for fixture in identity_transport explicit_cross_template_identity identifier_api \
+               free_identifier_equality explicit_capture_api quote_identity \
+               explicit_variadic_splice_identity nested_macro_expansion_identity \
+               before_expand_transform_identity semantic_transform_identity; do
+  COIL_META_INTERP=1 "$BIN" run "tests/compiler/hygiene/$fixture.coil" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" = 42 ] || { echo "GATE FAIL: interpreter engine: $fixture exited $rc, want 42"; fail=1; }
+done
+
+for fixture in implicit_cross_template_capture implicit_variadic_splice_capture \
+               use_site_binder_cannot_capture before_expand_transform_capture \
+               semantic_transform_capture quote_capture; do
+  COIL_META_INTERP=1 "$BIN" check "tests/compiler/hygiene/$fixture.coil" \
+    >"$WORK/interp.out" 2>"$WORK/interp.err"
+  rc=$?
+  [ "$rc" = 1 ] || { echo "GATE FAIL: interpreter engine: $fixture exited $rc, want 1"; fail=1; }
+  grep -q "unbound variable" "$WORK/interp.err" \
+    || { echo "GATE FAIL: interpreter engine: $fixture diagnostic missing"; fail=1; }
+done
 
 # ---- registrations ARE the entry: point run at a metaprogram file directly --
 # safe_dialect.coil has (transform desugar-inc) and no main; running the FILE

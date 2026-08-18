@@ -218,11 +218,12 @@ the result, so the command composes with pipes.
 
 ### What the printed value is
 
-The metaprogram's promoted return value — before the call-site integration
-steps `expand-calls` performs on a real expansion (`hygienize-expansion!`,
-binder re-baring, `stamp-expansion`). Those rewrite an expansion *into its
-surrounding tree*; there is no surrounding tree here, and the debugger-truth
-is what the function returned.
+The metaprogram's promoted return value, with its syntax-object scopes,
+definition modules, origins, and source provenance intact. Normal integration
+adds expansion provenance when the value enters a surrounding tree; it does not
+run a spelling-based qualification or binder-repair pass. There is no
+surrounding tree here, so the debugger-truth is the scoped syntax value the
+function returned.
 
 Printing follows the language's own generator convention (`splice-do-into!`,
 the same splice `(meta …)` results get): **a `(do …)` result is a program —

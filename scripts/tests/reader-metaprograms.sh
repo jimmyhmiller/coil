@@ -16,6 +16,18 @@ fail() { echo "reader metaprograms: FAIL — $1"; exit 1; }
 "$COIL" run "$FIX/config.sexpr" --use reader.fixture.config >/dev/null
 [ $? = 42 ] || fail "configured s-expression run"
 
+"$COIL" run "$FIX/hygiene_binder.sexpr" --use reader.fixture.config >/dev/null
+[ $? = 42 ] || fail "code-read template binder captured use-site syntax"
+
+code_read_hygiene=$(
+  "$COIL" check "$FIX/hygiene_reference.sexpr" --use reader.fixture.config 2>&1
+)
+[ $? = 1 ] || fail "code-read use-site binder captured template reference"
+case "$code_read_hygiene" in
+  *"unbound variable 'x'"*) ;;
+  *) fail "code-read reference hygiene diagnostic: $code_read_hygiene" ;;
+esac
+
 ambiguous=$("$COIL" check "$FIX/raw.answer" \
   --use reader.fixture.raw --use reader.fixture.second 2>&1)
 ambiguous_rc=$?
@@ -61,6 +73,20 @@ for side in open close; do
     *) fail "Brainfuck unmatched $side diagnostic: $diag" ;;
   esac
 done
+
+# ---- the Brainfuck acceptance probe (docs/design/FULL_HYGIENE_MIGRATION.md) --
+# "another generated `dp`, `cells`, `cell` … with the same printed spelling
+# cannot alter the reader output's binding graph". `reader.fixture.bf-collide`
+# injects consts with exactly those spellings into the module the reader emitted.
+# The liveness case runs first: if the probe silently stopped injecting, the
+# Brainfuck result below would prove nothing.
+"$COIL" run "$FIX/bf_collide_live.coil" --use reader.fixture.bf-collide >/dev/null 2>&1
+[ $? = 42 ] || fail "collision probe is not injecting — the acceptance check would be vacuous"
+
+collided=$("$COIL" run "$BF/hello.bf" --use coil.brainfuck --use reader.fixture.bf-collide) \
+  || fail "Brainfuck run under colliding spellings"
+[ "$collided" = "Hello World!" ] \
+  || fail "colliding cells/dp/cell changed the reader's binding graph: $collided"
 
 # Four thousand flat operations is enough to expose the historical quadratic
 # quasiquote suffix-splicing implementation while keeping the generated module

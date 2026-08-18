@@ -7,6 +7,12 @@
 #
 #   scripts/tests/prop.sh              # everything
 #   scripts/tests/prop.sh -q           # only the summary lines
+#   scripts/tests/prop.sh build/bin/coil   # a specific compiler
+#
+# A compiler PATH as the first argument selects that compiler; `COIL=` still
+# works. This used to accept only `COIL=`, and an argument was silently ignored
+# -- so `prop.sh <candidate>` reported on whatever `coil` was installed, which is
+# a control that looks valid and is not.
 #
 # Exit status is the number of failing files (0 = all green).
 #
@@ -15,9 +21,13 @@
 
 set -u
 cd "$(dirname "$0")/../.." || exit 1
-COIL=${COIL:-coil}
 QUIET=0
-[ "${1:-}" = "-q" ] && QUIET=1
+if [ "${1:-}" = "-q" ]; then
+  QUIET=1
+elif [ -n "${1:-}" ]; then
+  COIL=$1
+fi
+COIL=${COIL:-coil}
 
 FILES="tests/prop/core_test.coil
 tests/prop/shrink_test.coil

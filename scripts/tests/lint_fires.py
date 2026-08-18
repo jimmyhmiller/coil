@@ -50,7 +50,11 @@ def main() -> int:
 
     # It changed something — confirm it changed the RIGHT things, so a fix that
     # merely perturbs the file cannot pass.
-    missing = [s for s in ("(store! x 2)", "(load x)") if s not in after]
+    # `set!`, not `store!`: modernize rewrites `primitive/store!` to the bare
+    # `store!`, and field_syntax_lint then rewrites that to the generalized
+    # `set!` ("use generalized `set!` instead of the low-level store primitive").
+    # Both rounds have to land, which is what makes this a useful check.
+    missing = [s for s in ("(set! x 2)", "(load x)") if s not in after]
     if "primitive/icmp-ge" in after or missing:
         print("gate-lint-fires: FAIL — rewrote, but not into the expected modern spellings")
         print(f"  missing={missing}")

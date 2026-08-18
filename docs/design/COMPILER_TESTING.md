@@ -77,8 +77,8 @@ So compiler tests come in three flavors, cheapest first:
 - **Unit** — import a compiler module, call the function.
   Every bug from the hygiene saga maps to one:
   `(deftest sug-layout (assert-eq (sug-head-display qualified-cond-node) "cond"))`,
-  `resolve-in-module` finding `coil.core.=`, the `rebare-binders-walk!`
-  positions, `sig-arity-ok?` on variadics.
+  scope-to-definition-module resolution finding `coil.core.=`, scoped binder
+  lowering, `sig-arity-ok?` on variadics.
 - **Library-level integration** — feed source *strings* through parse →
   expand → check in-process and assert on the result or the diagnostics.
   Needs the testkit (§4). This is where most of `gate-cli`'s "this bad
@@ -158,7 +158,7 @@ phase).
   aggregate-test-binary layout under `tests/compiler/unit/`; runner skeleton
   in `dev.py`; the two canary files.
 - **Phase 1 — seed unit tests from the hygiene saga.** `sug-head-display`,
-  `resolve-in-module` (+ core tier), `rebare-binders-walk!` positions
+  definition-module resolution (+ core tier), scoped binder positions
   (impl/deftrait/inherent/`:requires`), `sig-arity-ok?`,
   `method-arity-matches?`, `head-was-implicit?` defaults, `after-last-dot` /
   `find-coloncolon` edge cases. These prove the ergonomics and pin last

@@ -40,9 +40,14 @@ cat > "$WORK/flags.coil" <<'EOF'
 (import "coil.primitive" :as primitive)
 (defn pick [(l Code) (d Code)] (-> Code)
   (if (primitive/code-eq (primitive/target-os) `linux) l d))
+; A generated const the PROGRAM refers to is a published name, not a template
+; binder, so it is declared with the explicit context removal — the same shape
+; src/stdlib/fs.coil uses (docs/design/FULL_HYGIENE_MIGRATION.md).
+(defn public-name [(name Code)] (-> Code)
+  (primitive/syntax->datum name))
 (defn gen [] (-> Code)
-  `(do (const O_CREAT ~(pick `64 `512))
-       (const O_TRUNC ~(pick `512 `1024))))
+  `(do (const ~(public-name `O_CREAT) ~(pick `64 `512))
+       (const ~(public-name `O_TRUNC) ~(pick `512 `1024))))
 (meta (gen))
 (defn main [] (-> i64)
   (print-int (stdout) O_CREAT) (print-int (stdout) O_TRUNC) 0)
