@@ -6,6 +6,8 @@
                   (o? (lambda (n) (if (= n 0) #f (e? (- n 1))))))
            (e? 88))) (newline)
 (display (do ((i 0 (+ i 1)) (acc '() (cons i acc))) ((= i 5) (reverse acc)))) (newline)
+; A missing step retains that variable while other variables advance.
+(display (do ((i 0 (+ i 1)) (held 7)) ((= i 3) (list i held)))) (newline)
 (display (cond ((assv 1 '((1 a) (2 b))) => cadr) (else 'none))) (newline)
 (display (cond (#f 'no) (else 'yes))) (newline)
 ; NOTE: `(case "a" (("a") ...))` is deliberately NOT tested here — R5RS says case
@@ -15,3 +17,20 @@
 (display (list (and) (or) (and 1 2) (or #f 2) (and #f 1))) (newline)
 (define p (delay (begin 'forced 42)))
 (display (list (force p) (force p))) (newline)
+(display (let () 42)) (newline)
+; Internal definitions: a body-scoped shadow and mutually recursive helpers.
+(define internal-offset 100)
+(define (internal-defined n)
+  (define internal-offset 2)
+  (define (even? x) (if (= x 0) #t (odd? (- x 1))))
+  (define (odd? x) (if (= x 0) #f (even? (- x 1))))
+  (list (+ n internal-offset) (even? n) (odd? n)))
+(display (internal-defined 10)) (newline)
+(display
+  ((lambda (n)
+     (define internal-offset 3)
+     (define (even? x) (if (= x 0) #t (odd? (- x 1))))
+     (define (odd? x) (if (= x 0) #f (even? (- x 1))))
+     (list (+ n internal-offset) (even? n) (odd? n)))
+   5))
+(newline)
