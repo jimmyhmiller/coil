@@ -12,6 +12,13 @@
   (lambda (form)
     (datum->syntax form (cons '+ (cdr (syntax->datum form))))))
 
+; An internal define INSIDE a transformer body: the phase program goes through
+; the same internal-definition lowering as any Scheme.
+(define-syntax add-list-helper
+  (lambda (form)
+    (define (rebuild d) (cons '+ (cdr d)))
+    (datum->syntax form (rebuild (syntax->datum form)))))
+
 (define-syntax double
   (lambda (form)
     (let ((d (syntax->datum form)))
@@ -28,6 +35,7 @@
 
 (display (answer)) (newline)
 (display (add-list 1 2 3)) (newline)
+(display (add-list-helper 10 20 30)) (newline)
 (display (double 20)) (newline)
 (display (square (answer))) (newline)
 (display (count-args a b c d e)) (newline)
