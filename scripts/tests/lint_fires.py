@@ -49,9 +49,10 @@ def main() -> int:
         return 1
 
     # It changed something — confirm it changed the RIGHT things, so a fix that
-    # merely perturbs the file cannot pass.
-    missing = [s for s in ("(store! x 2)", "(load x)") if s not in after]
-    if "primitive/icmp-ge" in after or missing:
+    # merely perturbs the file cannot pass. Since the place-syntax transition
+    # (aa550b5) the modern spelling of a store is `set!`, not `store!`.
+    missing = [s for s in ("(set! x 2)", "(load x)") if s not in after]
+    if "primitive/icmp-ge" in after or "primitive/store!" in after or missing:
         print("gate-lint-fires: FAIL — rewrote, but not into the expected modern spellings")
         print(f"  missing={missing}")
         print(after)

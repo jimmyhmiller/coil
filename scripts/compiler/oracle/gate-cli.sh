@@ -2827,7 +2827,7 @@ cat > "$T/aggconst/a.coil" <<'EOF'
 (defn mkp [] (-> P)
   (let [(mut p) (primitive/zeroed P)]
     (store! (field (mut p) x) 3) (store! (field (mut p) y) 4) (load (mut p))))
-(const FAVOURITE (Blue []))
+(const FAVOURITE (Blue))
 (const ANSWER    (Num 42))
 (const ORIGIN    (mkp))
 (defn main [] (-> i64)
