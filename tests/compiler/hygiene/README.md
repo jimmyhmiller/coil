@@ -77,3 +77,18 @@ weakening the probe.
 Run: `coil run <user>.coil`, except `user4.coil` which is `coil test user4.coil`,
 and `user13.coil` which must FAIL to compile (the error must name both the
 extern and the trait).
+
+## Full syntax-object migration fixtures
+
+These pin the distinction between automatic hygiene and explicit identity shared
+across independently constructed templates:
+
+| fixture | expected after full migration |
+|---|---|
+| `implicit_cross_template_capture.coil` | must FAIL: independent `state` syntax cannot bind by spelling |
+| `explicit_cross_template_identity.coil` | runs with exit status 42: one fresh identifier is reused explicitly |
+| `reader_implicit_capture.coil` with `--use hygiene.reader-implicit-capture` | must FAIL for the same reason at the reader-provider boundary |
+
+The first and third intentionally compile before the migration and are therefore
+not added to a green gate until the scope-aware resolver lands. They are semantic
+red tests, not malformed fixtures.
