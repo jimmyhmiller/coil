@@ -242,6 +242,12 @@ uint64_t env_getenv(uint64_t name) { (void)name; return 0; }
 uint32_t env_setenv(uint64_t name, uint64_t value, uint32_t overwrite) {
     return (uint32_t)setenv(hoststr(name), hoststr(value), (int)overwrite);
 }
+uint32_t env_unsetenv(uint64_t name) { return (uint32_t)unsetenv(hoststr(name)); }
+// Always "not a terminal". The seed's job is to build stage1 from a script or a
+// CI runner, never to draw a progress bar, and answering 1 here would turn on
+// interactive rendering with no terminal underneath. run-coil-wasm.mjs answers
+// the same (`isatty:()=>0`).
+uint32_t env_isatty(uint32_t fd) { (void)fd; return 0; }
 uint32_t env_getpid(void) { return (uint32_t)getpid(); }
 uint32_t env_clock_gettime(uint32_t clock_id, uint64_t out) {
     struct timespec ts;
@@ -330,6 +336,14 @@ float  env_fmodf(float x, float y) { return fmodf(x, y); }
 // ---- process ----
 uint64_t env_abort(void) { die("env.abort() called"); return 0; }
 uint64_t env_exit(uint32_t code) { exit((int)(code & 0xff)); }
+// atexit takes a WASM function pointer (a table index), and this runtime has no
+// indirect-call bridge back into the module -- it provides flat env.* imports and
+// nothing else. The sole registrant is mtrace's memory report, a diagnostic that
+// only prints under tracing, so accepting the registration and never running the
+// handler costs the bootstrap nothing. run-coil-wasm.mjs makes the same choice
+// (`atexit:()=>0`), and the two hosts must agree or a seed that works under one
+// fails under the other.
+uint32_t env_atexit(uint64_t fn) { (void)fn; return 0; }
 // system runs the host toolchain (the final `cc` link) — a build service, the
 // same role the FS imports play. Real wait()-style status is returned.
 uint32_t env_system(uint64_t cmd) { return (uint32_t)system(hoststr(cmd)); }
