@@ -111,7 +111,13 @@ echo "  gate-prop-spawn: PASS (property workers survive a threaded test binary)"
        /tmp/coil-lrb2 build src/compiler/main_wasm.coil --target wasm64-unknown-unknown \
          -o /tmp/gate-wasm-linux.wasm 2>&1 | tail -3; exit 1; }
 echo "  gate-wasm-build: PASS (compiler builds for wasm64)"
-./scripts/compiler/oracle/gate-cli.sh /tmp/coil-lrb2 >/dev/null        || { echo "gate-cli FAIL"; exit 1; }
+# Output is captured rather than discarded so a FAILURE is readable. Sent to
+# /dev/null, a Linux-only gate-cli break reported four words and a Python
+# traceback from dev.py, and the one machine that reproduces it is the CI runner
+# -- so the log has to carry the reason or nobody can act on it.
+./scripts/compiler/oracle/gate-cli.sh /tmp/coil-lrb2 >/tmp/coil-gate-cli.log 2>&1 \
+  || { echo "gate-cli FAIL"; sed -n '/GATE FAIL\|FAIL /,$p' /tmp/coil-gate-cli.log | head -40; \
+       echo "--- tail ---"; tail -25 /tmp/coil-gate-cli.log; exit 1; }
 echo "  gate-cli:        PASS (argv, exit codes, fmt)"
 ./scripts/compiler/oracle/gate-target-os.sh /tmp/coil-lrb2 >/dev/null 2>&1 || { echo "gate-target-os FAIL"; exit 1; }
 echo "  gate-target-os:  PASS ((target-os) follows --target, consts fold per target)"
