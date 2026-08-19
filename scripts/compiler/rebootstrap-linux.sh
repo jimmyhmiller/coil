@@ -74,6 +74,13 @@ echo "  ok — byte-identical, the compiler reproduces itself"
 # They are all still runnable by hand against the compiler this script installs;
 # `scripts/oracle.py coverage` and the linux-ir references in particular now have
 # nothing running them on a schedule.
+#
+# The staged-metacompilation branch proposed putting the whole battery back here,
+# plus gate-run-meta and gate-staged-meta. The battery stays out -- 58b6e68 took
+# it out on purpose and this job proves the fixpoint -- but the two metaprogram
+# gates were a real gap, since nothing ran either of them anywhere. They are
+# wired into the macOS `full` CI job and `dev.py test staged` instead, which is
+# where the already-built compiler is.
 
 stage_lib_cleanup
 

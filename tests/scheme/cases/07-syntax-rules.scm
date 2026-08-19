@@ -14,3 +14,26 @@
 (define-syntax tail-pattern
   (syntax-rules () ((_ a ... last) (list 'last last))))
 (display (tail-pattern 1 2 3)) (newline)  ; ellipsis with trailing fixed pattern
+(define-syntax vector-copy-list
+  (syntax-rules () ((_ #(x ...)) (vector->list #(x ...)))))
+(display (vector-copy-list #(4 5 6))) (newline)   ; vector patterns and templates
+(define-syntax nested-copy
+  (syntax-rules () ((_ ((x ...) ...)) (list (list x ...) ...))))
+(display (nested-copy ((1 2) (3)))) (newline)     ; doubly nested ellipsis
+(define-syntax literal-choice
+  (syntax-rules (else) ((_ else value) value) ((_ other value) 0)))
+(display (list (literal-choice else 7)            ; literal matches by BINDING, not name:
+               (let ((else #t)) (literal-choice else 7))          ; shadowed -> no match
+               ((lambda (else) (literal-choice else 7)) #t)       ; shadowed -> no match
+               (let ((marker #t))
+                 (let-syntax
+                   ((same-marker
+                      (syntax-rules (marker)
+                        ((_ marker) 1)
+                        ((_ other) 0))))
+                   (same-marker marker))))) (newline)
+(define definition-helper (lambda (value) (+ value 1)))
+(define-syntax call-definition-helper
+  (syntax-rules () ((_ value) (definition-helper value))))
+(display (let ((definition-helper (lambda (ignored) 999)))
+           (call-definition-helper 41))) (newline) ; free template refs bind at DEFINITION site

@@ -1,0 +1,200 @@
+(module coil.scheme.syntax)
+(import "coil.primitive" :as primitive)
+(import "coil.scheme.value" :use *)
+(import "coil.scheme.heap" :use [cons car cdr])
+(import "coil.scheme.symbol" :use [intern symbol-name])
+(import "coil.scheme.stdproc" :use [string-from-slice scm-list->vector scm-vector->list])
+(import "coil.scheme.numeric" :as num :use [string-slice])
+(extern malloc :cc c [i64] (-> (ptr u8)))
+
+;; Native phase-1 syntax objects (docs/design/STAGED_METACOMPILATION.md). The
+;; Scheme-visible value is a normal tagged Val whose payload retains the exact
+;; compiler Code node — source location and hygiene identity included. This is
+;; the boundary compiled procedural transformers cross in both directions.
+;;
+;; PHASE-ONLY MODULE: these signatures mix Code with runtime values, which only
+;; compiles inside a metaprogram (metalower rewrites Code away). Import it from
+;; coil.scheme.phase, never from the runtime library.
+;;
+;; Lifetime: a syntax object is malloc'd OUTSIDE the runtime Scheme heap (the
+;; collector's managed-address? test skips it) and points into compiler-owned
+;; Code. Both are valid for the duration of ONE metaprogram invocation — the
+;; expansion-arena borrow contract. Never store a syntax object in phase static
+;; state across invocations; COIL_META_ARENA=poison makes that mistake loud.
+(defn syntax-object-from-code [(form Code)] (-> i64)
+  (let [mem (malloc 40)
+        raw (primitive/cast i64 mem)
+        stx (obj-of raw)]
+    (primitive/store! (primitive/field stx tag) (tag-syntax))
+    (primitive/store! (primitive/field stx mark) 0)
+    (primitive/store! (primitive/field stx a) (primitive/code-opaque form))
+    (primitive/store! (primitive/field stx b) 0)
+    (primitive/store! (primitive/field stx c) 0)
+    raw))
+
+(defn syntax-object-code [(stx i64)] (-> Code)
+  (if (not (is-syntax stx))
+      (primitive/error "expected a syntax object")
+    (primitive/code-from-opaque
+      (primitive/load (primitive/field (obj-of stx) a)))))
+
+(defn syntax-object? [(v i64)] (-> i64)
+  (mk-bool (is-syntax v)))
+
+(defn syntax-list-items [(form Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n) (s-nil)
+    (cons (syntax-object-from-code (primitive/code-nth form i))
+          (syntax-list-items form (+ i 1) n))))
+
+;; Chez returns #f when STX does not contain a proper list. Coil's reader Code
+;; represents only proper lists, so list shape is sufficient here.
+(defn syntax->list [(stx i64)] (-> i64)
+  (let [form (syntax-object-code stx)]
+    (if (or (not (primitive/code-list? form))
+            (primitive/code-vector? form))
+        (s-false)
+      (syntax-list-items form 0 (primitive/code-count form)))))
+
+(defn syntax-datum-list [(form Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n) (s-nil)
+    (cons (syntax-code->datum (primitive/code-nth form i))
+          (syntax-datum-list form (+ i 1) n))))
+
+(defn syntax-code->datum [(form Code)] (-> i64)
+  (if (primitive/code-int? form) (mk-fixnum (primitive/code-int form))
+    (if (primitive/code-sym? form) (intern (primitive/code-str form))
+      (if (primitive/code-string? form) (string-from-slice (primitive/code-str form))
+        (if (primitive/code-vector? form)
+            (scm-list->vector
+              (syntax-datum-list form 0 (primitive/code-count form)))
+          (if (primitive/code-list? form)
+              (syntax-datum-list form 0 (primitive/code-count form))
+            (primitive/error "syntax->datum: unsupported syntax datum")))))))
+
+(defn syntax->datum [(stx i64)] (-> i64)
+  (syntax-code->datum (syntax-object-code stx)))
+
+(defn datum-code-items [(datum i64) (proto Code)] (-> Code)
+  (if (is-null datum) `()
+    `(~(datum-code (car datum) proto)
+      ~@(datum-code-items (cdr datum) proto))))
+
+(defn datum-code [(datum i64) (proto Code)] (-> Code)
+  (if (is-syntax datum) (syntax-object-code datum)
+    (if (is-fixnum datum) `~(fixnum-value datum)
+      (if (is-symbol datum)
+          ;; R6RS `datum->syntax` means exactly this -- the created identifier takes
+          ;; PROTO's context -- and main's `primitive/datum->syntax` IS the
+          ;; context-carrying constructor an earlier note here recorded as missing.
+          ;; Without it every identifier a procedural transformer built reached the
+          ;; guest unscoped, and scope-bearing syntax (4d58e5d) rejects that:
+          ;; "unscoped generated identifier 't'; use fresh-identifier or an
+          ;; explicit datum->syntax/syntax->datum operation".
+          ;; hygiene: explicit context introduction at a documented capture/protocol boundary
+          (primitive/datum->syntax proto (primitive/code-symbol (symbol-name datum)))
+        (if (is-string datum) `~(num/string-slice datum)
+          (if (is-pair datum) `(~@(datum-code-items datum proto))
+            (if (is-vector datum)
+                `#(~@(datum-code-items (scm-vector->list datum) proto))
+                (if (val-eq? datum (s-nil)) `()
+                  (if (val-eq? datum (s-true)) `#t
+                    (if (val-eq? datum (s-false)) `#f
+                    (primitive/error "datum->syntax: unsupported datum")))))))))))
+
+(defn datum->syntax [(context i64) (datum i64)] (-> i64)
+  (if (not (is-syntax context))
+      (primitive/error "datum->syntax: expected syntax-object context")
+    (syntax-object-from-code (datum-code datum (syntax-object-code context)))))
+
+(defn syntax? [(v i64)] (-> i64) (syntax-object? v))
+
+(defn syntax-object-from-handle [(handle i64)] (-> i64)
+  (syntax-object-from-code (primitive/code-from-opaque handle)))
+
+;; ---- procedural-transformer result integration -------------------------------
+;; A transformer's result may itself use procedural macros (the recursive-macro
+;; case). The dialect cannot see the result — it returns to the compiler's
+;; request re-walk — so the WRAPPER rewrites known uses into fresh
+;; `(MARKER ENTRY MARKER REGISTRY FORM)` requests before returning, and the
+;; compiler's re-walk expands them in the same round. REGISTRY is
+;; `((name entry) ...)`; both it and MARKER arrive as ordinary Code arguments.
+;; Quote/quote-data/quasiquote are data, matching the syntax-rules walker.
+
+(defn stx-reg-lookup [(head Code) (reg Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n) `stx-no-entry
+    (let [p (primitive/code-nth reg i)]
+      (if (primitive/code-eq head (primitive/code-nth p 0))
+          (primitive/code-nth p 1)
+        (stx-reg-lookup head reg (+ i 1) n)))))
+
+(defn stx-wrap-items [(x Code) (i i64) (n i64) (reg Code) (mk Code)] (-> Code)
+  (if (>= i n) `()
+    `(~(stx-wrap-uses (primitive/code-nth x i) reg mk)
+      ~@(stx-wrap-items x (+ i 1) n reg mk))))
+
+(defn stx-wrap-uses [(x Code) (reg Code) (mk Code)] (-> Code)
+  (if (primitive/code-vector? x)
+      `#(~@(stx-wrap-items x 0 (primitive/code-count x) reg mk))
+    (if (not (primitive/code-list? x)) x
+      (if (= (primitive/code-count x) 0) x
+        (let [head (primitive/code-nth x 0)]
+          (if (or (primitive/code-eq head `quote)
+                  (or (primitive/code-eq head `quote-data)
+                      (primitive/code-eq head `quasiquote)))
+              x
+            (let [entry (stx-reg-lookup head reg 0 (primitive/code-count reg))]
+              (if (primitive/code-eq entry `stx-no-entry)
+                  `(~@(stx-wrap-items x 0 (primitive/code-count x) reg mk))
+                `(~mk ~entry ~mk ~reg ~x)))))))))
+
+;; The whole wrapper tail, shared by every generated `$stx` entry: apply the
+;; compiled transformer, reify its result (syntax object or plain datum, with
+;; the use form as datum context), then re-wrap recursive uses.
+(defn stx-finish [(result i64) (form Code) (mk Code) (reg Code)] (-> Code)
+  (let [out (if (is-syntax result)
+                (syntax-object-code result)
+              (syntax-object-code (datum->syntax (syntax-object-from-code form) result)))]
+    (stx-wrap-uses out reg mk)))
+
+;; ---- syntax-case runtime support --------------------------------------------
+;; The dialect compiles `syntax-case` clauses into ordinary Scheme tests over
+;; `syntax->list` and templates into these constructors; only the pieces a
+;; template cannot express in datum space live here.
+
+;; A Scheme list of syntax objects -> one syntax object of the list.
+(defn stx-list-code [(l i64)] (-> Code)
+  (if (is-null l) `()
+    `(~(syntax-object-code (car l)) ~@(stx-list-code (cdr l)))))
+
+(defn stx-list [(l i64)] (-> i64)
+  (syntax-object-from-code (stx-list-code l)))
+
+(defn stx-case-fail [] (-> i64)
+  (primitive/error "syntax-case: no matching clause"))
+
+;; The middle segment of a matched ellipsis: drop PRE elements, keep all but
+;; the last POST. Arguments arrive as Scheme fixnums (generated code has been
+;; literal-lifted by the dialect before this program compiles).
+(defn stx-take-middle-h [(l i64) (keep i64)] (-> i64)
+  (if (<= keep 0) (s-nil)
+    (cons (car l) (stx-take-middle-h (cdr l) (- keep 1)))))
+
+(defn stx-take-middle [(l i64) (pre i64) (post i64)] (-> i64)
+  (let [p (fixnum-value pre)
+        q (fixnum-value post)
+        (mut cur) l
+        (mut n) 0]
+    (loop (if (is-pair (load cur))
+              (do (set! n (+ (load n) 1)) (set! cur (cdr (load cur))) 0)
+              (break)))
+    (let [(mut skip) p
+          (mut r) l]
+      (loop (if (<= (load skip) 0)
+                (break)
+                (do (set! r (cdr (load r))) (set! skip (- (load skip) 1)) 0)))
+      (stx-take-middle-h (load r) (- (load n) (+ p q))))))
+
+(export syntax-object-from-code syntax-object-code syntax-object?
+        syntax? syntax->list syntax->datum datum->syntax
+        syntax-object-from-handle stx-wrap-uses stx-finish
+        stx-list stx-case-fail stx-take-middle)

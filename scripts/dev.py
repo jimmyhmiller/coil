@@ -226,6 +226,16 @@ def test(args: argparse.Namespace) -> None:
         test_meta(compiler)
     elif args.suite == "metaprogramming":
         execute("scripts/tests/metaprogramming/compile-and-run/run.sh", compiler)
+    elif args.suite == "meta-entries":
+        # The metaprogram-entry gates, host-independent. Neither ran anywhere
+        # for a while -- gate-staged-meta was not invoked by anything at all,
+        # and a release-build segfault on `coil run <typo>` outlived a green
+        # manual gate-run-meta run because nothing re-ran it. Neither bootstrap
+        # runs them (both prove the fixpoint and nothing else), so this suite is
+        # the only caller, and the CI `full` job runs it against the compiler
+        # that job just built.
+        execute("scripts/compiler/oracle/gate-run-meta.sh", compiler)
+        execute("scripts/compiler/oracle/gate-staged-meta.sh", compiler)
     elif args.suite == "interpreter":
         execute(sys.executable, "scripts/oracle.py", "interpreter", "live", "--compiler", compiler,
                 *(["--verbose"] if args.verbose else []))
@@ -964,7 +974,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "http", "wasm", "meta", "interpreter", "metaprogramming", "modernize-fast", "scheme"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "http", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "modernize-fast", "scheme"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.set_defaults(func=test)

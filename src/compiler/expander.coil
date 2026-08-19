@@ -3316,6 +3316,627 @@
           (match (load errf)
             (Some [d] (Err [(ptr (ArrayList TaggedForm)) Diag] d))
             (None [] (Ok [(ptr (ArrayList TaggedForm)) Diag] (load cur))))))))
+; ═══════════ Staged metacompilation (docs/design/STAGED_METACOMPILATION.md) ═══════════
+;
+; A before-expand transform may return, among its output forms:
+;
+;   (stage MARKER FORM…)     a phase-program increment: FORM… compile as an
+;                            ISOLATED program (they never enter the runtime
+;                            program) whose [Code…] -> Code entries install
+;                            additively into the metaprogram engine;
+;   (MARKER ENTRY ARG…)      a request: run staged ENTRY on ARG… during this
+;                            expansion; the promoted result splices in place and
+;                            re-enters the transform fixpoint (language
+;                            resumption).
+;
+; MARKER is an opaque symbol the transform mints (a gensym): requests are
+; recognized by declared-marker lookup, never by name inference, so quoted
+; syntax and same-spelled runtime data stay data. Stage state is CUMULATIVE
+; (increment N compiles with increments 1..N-1; redefinition across increments
+; is a hard error) and compilation-scoped (markers route across modules).
+(defn stage-declaration? [(f (ptr Sexp))] (-> bool)
+  (match (l-list-head f)
+    (Some [h] (= h "stage"))
+    (None [] false)))
+
+; An owning copy of `s` in `a` — stage compilation works in a disposable arena,
+; so anything that outlives it (signatures, diagnostics) copies its bytes out.
+(defn stage-own-str [(a (ptr Allocator)) (s (slice u8))] (-> (slice u8))
+  (sconcat a s ""))
+
+(defn stage-name-local-start [(name (slice u8)) (i i64)] (-> i64)
+  (if (>= i (slice-len name)) 0
+    (let [rest (stage-name-local-start name (+ i 1))]
+      (if (= (subslice name i (+ i 1)) ".") (+ i 1) rest))))
+
+(defn stage-name-local [(name (slice u8))] (-> (slice u8))
+  (subslice name (stage-name-local-start name 0) (slice-len name)))
+
+(defn stage-local-name-declared? [(name (slice u8))
+                                  (declared (ptr (ArrayList (slice u8))))
+                                  (i i64) (n i64)] (-> bool)
+  (if (>= i n) false
+    (if (= (stage-name-local name)
+           (stage-name-local (al-get [(slice u8)] (load declared) i)))
+        true
+      (stage-local-name-declared? name declared (+ i 1) n))))
+
+;; Entry points are the functions the stage increments themselves declared, not
+;; "every Code-signed function the resolved phase program can see" (the ambient
+;; core macros are in that program too, and are not stage entries).
+(defn stage-declared-names [(names (ptr (ArrayList (slice u8))))
+                            (declared (ptr (ArrayList (slice u8))))
+                            (a (ptr Allocator))] (-> (ptr (ArrayList (slice u8))))
+  (let [(mut out) (al-new [(slice u8)] a)
+        n (al-len [(slice u8)] (load names))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [name (al-get [(slice u8)] (load names) (load i))]
+                  (when (stage-local-name-declared? name declared 0
+                          (al-len [(slice u8)] (load declared)))
+                    (al-push! (mut out) name)
+                    0))
+                (set! i (+ (load i) 1)))))
+    (box-al [(slice u8)] a (load out))))
+
+;; "Cumulative" must not mean accidental shadowing: a name a later increment
+;; introduces again is a hard error, not a silent redefinition.
+(defn stage-form-name-conflict [(forms (ptr (ArrayList TaggedForm)))
+                                (defined (ptr (ArrayList (slice u8))))
+                                (a (ptr Allocator))] (-> (Option (slice u8)))
+  (let [n (al-len [TaggedForm] (load forms))
+        (mut i) 0
+        (mut found) (None [(slice u8)])]
+    (loop (if (or (not (opt-str-none? (load found))) (>= (load i) n))
+              (break)
+              (do
+                (let [tf (al-elem [TaggedForm] forms (load i))]
+                  (match (defn-name-of (field tf form))
+                    (None [] 0)
+                    (Some [name]
+                      (let [qual (qualify-name a name (.module tf))]
+                        (when (set-contains defined qual)
+                          (set! found (Some qual))
+                          0)))))
+                (set! i (+ (load i) 1)))))
+    (load found)))
+
+(defn stage-record-form-names! [(forms (ptr (ArrayList TaggedForm)))
+                                (defined (mut (ArrayList (slice u8))))
+                                (a (ptr Allocator))] (-> i64)
+  (let [n (al-len [TaggedForm] (load forms))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [tf (al-elem [TaggedForm] forms (load i))]
+                  (match (defn-name-of (field tf form))
+                    (None [] 0)
+                    (Some [name]
+                      (al-push! (mut defined)
+                                (qualify-name a name (.module tf))))))
+                (set! i (+ (load i) 1)))))
+    0))
+
+;; A `(stage MARKER FORM...)` body is a SEPARATE compilation unit -- it carries
+;; its own imports and its entry names are a protocol that request sites name by
+;; string -- not a template splice. Referential hygiene would otherwise resolve
+;; every symbol in it against the TRANSFORM's module, which is wrong in both
+;; directions: `(defn pick-entry ...)` was registered as
+;; `staged_pick_test.$scope47@staged_pick$pick-entry`, so it matched no request
+;; and the stage looked like it declared no entry at all; and a call to one of
+;; the stage's OWN imports (`syntax-object-from-code` from coil.scheme.phase)
+;; resolved against the transform module, which never imported it, and failed as
+;; undefined. Strip the context over the whole body -- exactly what
+;; `syntax->datum` does for a single identifier (hyg 0, no module, origin 5, the
+;; sanctioned "explicit context removal" state that unscoped-datum linkage
+;; checking accepts).
+(defn stage-datum-sexp [(a (ptr Allocator)) (s Sexp)] (-> Sexp)
+  (let [tg (sx-tag s)]
+    (if (or (= tg (primitive/cast i64 6))
+            (or (= tg (primitive/cast i64 7)) (= tg (primitive/cast i64 8))))
+        (let [n (code-node-len s)
+              (mut out) (al-new [Sexp] a)
+              (mut i) 0]
+          (loop (if (>= (load i) n)
+                    (break)
+                    (do
+                      (al-push! (mut out) (stage-datum-sexp a (code-node-at s (load i))))
+                      (set! i (primitive/iadd (load i) 1)))))
+          ;; A KView is FLATTENED to a KList, for the same reason sexp-own-into
+          ;; flattens one: the view borrows a backing list this copy does not own.
+          (let [p (alloc/stack Sexp)]
+            (set! p s)
+            (set! (.kind p) (if (= tg (primitive/cast i64 7))
+                                (KVec (box-al [Sexp] a (load out)))
+                                (KList (box-al [Sexp] a (load out)))))
+            (set! (.nid p) (next-nid))
+            (load p)))
+      (if (= tg (primitive/cast i64 2))
+          (let [p (alloc/stack Sexp)]
+            (set! p s)
+            (set! (.hyg p) 0)
+            (set! (.hmod p) "")
+            (set! (.horigin p) 5)
+            (set! (.nid p) (next-nid))
+            (load p))
+        s))))
+
+;; Split transform output into runtime forms and isolated stage forms. Stage
+;; children retain the declaration's module tag. The declaration's MARKER (its
+;; first child) is recorded; only lists headed by a declared marker are ever
+;; treated as phase requests.
+(defn split-stage-declarations! [(a (ptr Allocator))
+                                 (forms (ptr (ArrayList TaggedForm)))
+                                 (runtime (mut (ArrayList TaggedForm)))
+                                 (staged (mut (ArrayList TaggedForm)))
+                                 (markers (mut (ArrayList (slice u8))))]
+                                (-> (Option Diag))
+  (let [n (al-len [TaggedForm] (load forms))
+        (mut i) 0
+        (mut errf) (None [Diag])]
+    (loop (if (or (diag-some? (load errf)) (>= (load i) n))
+              (break)
+              (let [tf (al-elem [TaggedForm] forms (load i))
+                    f (field tf form)]
+                (if (stage-declaration? f)
+                    (let [items (sx-items (load f))
+                          m (sx-len items)
+                          (mut j) 2]
+                      (if (or (< m (primitive/cast i64 2))
+                              (!= (sx-tag (sx-at items 1)) (primitive/cast i64 2)))
+                          (set! errf
+                                (Some (stamp-call-site
+                                        (derr "stage: expected (stage MARKER FORM...), with a symbol marker")
+                                        (load f))))
+                          (do
+                            (let [marker (sx-sval (sx-at items 1))]
+                              (unless (set-contains (mut markers) marker)
+                                (al-push! (mut markers) marker)
+                                0))
+                            (loop (if (>= (load j) m)
+                                      (break)
+                                      (let [out (alloc/stack TaggedForm)]
+                                        (set! (.form out) (stage-datum-sexp a (sx-at items (load j))))
+                                        (set! (.module out) (.module tf))
+                                        (al-push! (mut staged) (load out))
+                                        (set! j (+ (load j) 1))))))))
+                    (al-push! (mut runtime) (load tf)))
+                (set! i (+ (load i) 1)))))
+    (load errf)))
+
+;; The expansion context a staged request runs against: the checked metaprogram
+;; program plus the installed stage entry signatures. An independent funcs array
+;; keeps that augmentation out of the baseline program used by transforms,
+;; checkers, and the runtime resolve.
+(defn stage-expansion-context [(base (ptr Program)) (a (ptr Allocator))] (-> (ptr Program))
+  (let [out (unwrap-ptr [Program] (create [Program] a))
+        src (load (field base funcs))
+        n (al-len [Func] (load src))
+        (mut funcs) (al-new [Func] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (al-push! (mut funcs) (al-get [Func] (load src) (load i)))
+                (set! i (+ (load i) 1)))))
+    (set! (.annotation_defs out) (.annotation_defs base))
+    (set! (.conventions out) (.conventions base))
+    (set! (.structs out) (.structs base))
+    (set! (.sums out) (.sums base))
+    (set! (.externs out) (.externs base))
+    (set! (.funcs out) (box-al [Func] a (load funcs)))
+    (set! (.asserts out) (.asserts base))
+    (set! (.consts out) (.consts base))
+    (set! (.traits out) (.traits base))
+    (set! (.impls out) (.impls base))
+    (set! (.metas out) (.metas base))
+    (set! (.exports out) (.exports base))
+    out))
+
+;; The native engine owns the executable body; expansion retains only this
+;; callable interface. Stage entries admitted by code-sig-funcs are [Code…] ->
+;; Code, so reconstructing that type avoids retaining any pointer-bearing
+;; resolved Type representation from the disposable stage-work arena.
+(defn stable-stage-signature [(a (ptr Allocator)) (src (ptr Func))] (-> Func)
+  (let [out (alloc/stack Func)
+        ps (load (field src params))
+        n (al-len [Param] (load ps))
+        (mut stable-ps) (al-new [Param] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [p (al-elem [Param] ps (load i))
+                      q (alloc/stack Param)]
+                  (set! (.name q) (stage-own-str a (.name p)))
+                  (set! (.ty q) (TCode))
+                  (al-push! (mut stable-ps) (load q)))
+                (set! i (+ (load i) 1)))))
+    (set! (.name out) (stage-own-str a (.name src)))
+    (set! (.type_params out) (box-al [(slice u8)] a (al-new [(slice u8)] a)))
+    (set! (.bounds out) (box-al [Bound] a (al-new [Bound] a)))
+    (set! (.cc out) (stage-own-str a (.cc src)))
+    (set! (.annotations out) (box-al [Annotation] a (al-new [Annotation] a)))
+    (set! (.params out) (box-al [Param] a (load stable-ps)))
+    (set! (.ret out) (TCode))
+    (set! (.body out) (box-al [Expr] a (al-new [Expr] a)))
+    (set! (.macro_variadic out) (.macro_variadic src))
+    (set! (.lo out) (.lo src))
+    (set! (.hi out) (.hi src))
+    (set! (.source out) (.source src))
+    (set! (.ctxt out) (.ctxt src))
+    (load out)))
+
+;; A stage-compilation diagnostic crosses the same lifetime boundary as a
+;; successful signature: its message must not point into the closed arena.
+(defn stable-stage-diag [(a (ptr Allocator)) (d Diag)] (-> Diag)
+  (let [out (alloc/stack Diag)]
+    (store! out d)
+    (set! (.msg out) (stage-own-str a (.msg out)))
+    (load out)))
+
+(defn install-stage-signatures! [(dst (ptr Program)) (stage (ptr Program))
+                                 (installed (ptr (ArrayList (slice u8))))
+                                 (declared (ptr (ArrayList (slice u8))))
+                                 (a (ptr Allocator))] (-> (ptr (ArrayList (slice u8))))
+  (let [quals (stage-declared-names (code-sig-funcs stage a) declared a)
+        n (al-len [(slice u8)] (load quals))
+        (mut added) (al-new [(slice u8)] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [name (al-get [(slice u8)] (load quals) (load i))]
+                  (unless (set-contains installed name)
+                    (let [f (prog-fn-find stage name)]
+                      (when (!= (primitive/cast i64 f) (primitive/cast i64 0))
+                        (let [stable (stable-stage-signature a f)]
+                          (al-push! (mut (load (field dst funcs))) stable)
+                          (al-push! (mut added) (.name (prog-fn-find dst name))))
+                        0))))
+                (set! i (+ (load i) 1)))))
+    (box-al [(slice u8)] a (load added))))
+
+;; Compile the CUMULATIVE stage program (every increment declared so far) as an
+;; isolated program, and install its declared entries additively into the
+;; metaprogram engine. `stable-a` owns everything that outlives the call (engine
+;; entries, quote registry — meta-engine-setup allocates from it); `a` is the
+;; disposable stage-work arena. The stage program gets fresh loader tables: its
+;; declarations may have been generated by a transform after the entry program's
+;; loader ran, so it must not rely on (or mutate) the entry program's tables.
+(defn compile-stage-declarations [(stable-a (ptr Allocator))
+                                  (a (ptr Allocator))
+                                  (s (mut LS))
+                                  (forms (ptr (ArrayList TaggedForm)))
+                                  (declared (ptr (ArrayList (slice u8))))]
+                                 (-> (Result (ptr Program) Diag))
+  (let [stage-ls (alloc/stack LS)]
+    (ls-init! (mut stage-ls) a)
+    (set! (.imports stage-ls) (al-new [ImpEntry] a))
+    (set! (.exports stage-ls) (al-new [ExpEntry] a))
+    (set! (.primitive_defs stage-ls) (al-new [PrimitiveDef] a))
+    (set! (.primitive_aliases stage-ls) (al-new [PrimitiveAlias] a))
+    (let [npd (al-len [PrimitiveDef] (.primitive_defs s))
+          (mut pdi) 0]
+      (loop (if (>= (load pdi) npd)
+                (break)
+                (do
+                  (al-push! (mut (field stage-ls primitive_defs))
+                            (al-get [PrimitiveDef] (.primitive_defs s) (load pdi)))
+                  (set! pdi (+ (load pdi) 1))))))
+    (let [npa (al-len [PrimitiveAlias] (.primitive_aliases s))
+          (mut pai) 0]
+      (loop (if (>= (load pai) npa)
+                (break)
+                (do
+                  (al-push! (mut (field stage-ls primitive_aliases))
+                            (al-get [PrimitiveAlias] (.primitive_aliases s) (load pai)))
+                  (set! pai (+ (load pai) 1))))))
+    (set! (.srccount stage-ls) (.srccount s))
+    (set! (.sources stage-ls) (.sources s))
+    (set! (.expansions stage-ls) (.expansions s))
+    (set! (.namespace_names stage-ls) (.namespace_names s))
+    (set! (.namespace_paths stage-ls) (.namespace_paths s))
+    ;; Imported libraries depend on the ambient core program: copy its forms
+    ;; into the isolated source set. Core's own Code-signed macros never become
+    ;; stage entries (stage-declared-names filters to declared names), but they
+    ;; stay available while the stage program's code goes through ordinary
+    ;; expansion.
+    (let [parent-forms (box-al [TaggedForm] a (load (field s out)))
+          np (al-len [TaggedForm] (load parent-forms))
+          (mut pi) 0]
+      (loop (if (>= (load pi) np)
+                (break)
+                (do
+                  (let [tf (al-elem [TaggedForm] parent-forms (load pi))]
+                    (match (.module tf)
+                      (Some [m]
+                        (when (= m "coil.core")
+                          (al-push! (mut (field stage-ls out)) (load tf))
+                          0))
+                      (None [] 0)))
+                  (set! pi (+ (load pi) 1))))))
+    (let [nf (al-len [TaggedForm] (load forms))
+          (mut fi) 0]
+      (loop (if (>= (load fi) nf)
+                (break)
+                (do
+                  (al-push! (mut (field stage-ls out))
+                            (al-get [TaggedForm] (load forms) (load fi)))
+                  (set! fi (+ (load fi) 1))))))
+    ;; A stage may import ordinary libraries whose implementations use macros.
+    ;; Run the normal definition-time expansion tower before extracting the
+    ;; closure; otherwise those calls reach checking as raw Code-macro calls.
+    (let [initial-source (box-al [TaggedForm] a (load (field stage-ls out)))]
+      (rebuild-transformed-declarations! (mut stage-ls) initial-source))
+    (match (expand-stage3 (mut stage-ls))
+      (Err [d] (Err [(ptr Program) Diag] d))
+      (Ok [_]
+        (do
+          ;; Import loading appends newly loaded library modules through
+          ;; stage-ls.out; rebuild so THEIR import declarations are processed.
+          ;; This must happen BEFORE the metashim joins: rebuild resets the
+          ;; importer records, and the shim's imports are registered directly by
+          ;; meta-sub-forms rather than through forms it returns.
+          (rebuild-transformed-declarations!
+            (mut stage-ls)
+            (box-al [TaggedForm] a (load (field stage-ls out))))
+          (imp-entry (mut stage-ls) "metashim")
+          (let [stage-source (box-al [TaggedForm] a (load (field stage-ls out)))]
+            (match (meta-sub-forms a (mut stage-ls) stage-source)
+              (Err [d] (Err [(ptr Program) Diag] d))
+              (Ok [subforms]
+                (do
+                  (set! (.out stage-ls) (load subforms))
+                  (match (resolve-program a (mut stage-ls) false true)
+                    (Err [d] (Err [(ptr Program) Diag] d))
+                    (Ok [ctx]
+                      (let [quals (stage-declared-names (code-sig-funcs ctx a) declared a)]
+                        (if (= (al-len [(slice u8)] (load quals)) (primitive/cast i64 0))
+                            ;; A poisoned entry has no callable signature, but the
+                            ;; resolver already recorded the concrete reason; do
+                            ;; not hide it behind the generic symptom.
+                            (let [rds (load (field stage-ls resolve_diags))]
+                              (if (and (!= (primitive/cast i64 rds) (primitive/cast i64 0))
+                                       (> (al-len [Diag] (load rds)) (primitive/cast i64 0)))
+                                  (Err [(ptr Program) Diag] (al-get [Diag] (load rds) 0))
+                                  (Err [(ptr Program) Diag]
+                                       (derr "stage: expected a declared [Code ...] -> Code entry; no stage entry resolved"))))
+                            (let [seeds (meta-shim-seeds a ctx quals)
+                                  wanted (closure-funcs ctx seeds a)
+                                  sub (closure-subprogram ctx wanted a)
+                                  checkls (alloc/stack LS)]
+                              (set! (.a checkls) a)
+                              (set! (.out checkls) (al-new [TaggedForm] a))
+                              (set! (.loaded checkls) (al-new [(slice u8)] a))
+                              (set! (.readpaths checkls) (al-new [(slice u8)] a))
+                              (set! (.readmods checkls) (al-new [(slice u8)] a))
+                              (set! (.imports checkls) (al-new [ImpEntry] a))
+                              (set! (.exports checkls) (al-new [ExpEntry] a))
+                              (set! (.primitive_defs checkls) (al-new [PrimitiveDef] a))
+                              (set! (.primitive_aliases checkls) (al-new [PrimitiveAlias] a))
+                              (set! (.check_diags checkls) (box-al [Diag] a (al-new [Diag] a)))
+                              (set! (.resolve_diags checkls) (primitive/cast (ptr (ArrayList Diag)) 0))
+                              (set! (.resolve_poisoned checkls) (primitive/cast (ptr (ArrayList (slice u8))) 0))
+                              ;; The stage check is a SCRATCH pass over a private
+                              ;; LS; snapshot the S0-S3 maps around it, exactly as
+                              ;; stage-one-macro! does (check-program resets them
+                              ;; at entry, and the semantic model may still be
+                              ;; serving an outer invocation).
+                              ;; Unlike stage-one-macro!'s closure — whose Expr
+                              ;; bodies are SHARED with the authoritative program,
+                              ;; so restored maps still cover them — the stage
+                              ;; program's nodes are fresh, and metalower's
+                              ;; ml-node-type reads the type map. Engine setup
+                              ;; therefore runs INSIDE the snapshot window, on the
+                              ;; maps this check just populated.
+                              (let [snap (alloc/stack SemMapsSnap)]
+                                (sem-maps-save snap)
+                                (match (check-program a sub (mut checkls))
+                                  (Err [d]
+                                    (do (sem-maps-restore snap)
+                                        (Err [(ptr Program) Diag] d)))
+                                  (Ok [checked]
+                                    (let [setup (meta-engine-setup stable-a checked quals)]
+                                      (sem-maps-restore snap)
+                                      (match setup
+                                        (Some [d] (Err [(ptr Program) Diag] d))
+                                        (None [] (Ok [(ptr Program) Diag] ctx)))))))))))))))))))))
+
+;; Stage markers denote executable syntax. A declaration's name, parameter
+;; vector, cc metadata, and return type are syntax/type data, not expression
+;; positions; walking them as arbitrary calls would let an unrelated marker
+;; named `path` reinterpret `(path (slice u8))` in a defn signature as a staged
+;; invocation. Preserve the declaration prefix; begin discovery at the body.
+(defn stage-marker-body-start [(items (ptr (ArrayList Sexp)))] (-> i64)
+  (if (or (= (sx-len items) 0)
+          (!= (sx-tag (sx-at items 0)) (primitive/cast i64 2)))
+      0
+      (let [h (sx-sval (sx-at items 0))]
+        (if (= h "defn")
+            (if (and (> (sx-len items) 3)
+                     (and (= (sx-tag (sx-at items 2)) (primitive/cast i64 3))
+                          (= (sx-sval (sx-at items 2)) "cc")))
+                6
+                4)
+            0))))
+
+(defn stage-entry-find [(raw (slice u8))
+                        (module (Option (slice u8)))
+                        (quals (ptr (ArrayList (slice u8))))
+                        (a (ptr Allocator))] (-> (Option (slice u8)))
+  (let [name (if (has-dot raw) raw (qualify-name a raw module))]
+    (if (set-contains quals name) (Some name) (None [(slice u8)]))))
+
+(defn expand-stage-marker-items [(a (ptr Allocator))
+                                 (items (ptr (ArrayList Sexp)))
+                                 (module (Option (slice u8)))
+                                 (phasectx (ptr Program))
+                                 (quals (ptr (ArrayList (slice u8))))
+                                 (markers (ptr (ArrayList (slice u8))))
+                                 (impb (ptr (ArrayList ImpEntry)))
+                                 (expb (ptr (ArrayList ExpEntry)))
+                                 (allfns (ptr SBox))
+                                 (gs (ptr SBoxStruct))
+                                 (gu (ptr SBoxSum))
+                                 (depth (mut i64))]
+                                (-> (Result (ptr (ArrayList Sexp)) Diag))
+  (let [n (sx-len items)
+        start (stage-marker-body-start items)
+        (mut out) (al-new [Sexp] a)
+        (mut i) 0
+        (mut errf) (None [Diag])]
+    (loop (if (>= (load i) start)
+              (break)
+              (do (al-push! (mut out) (sx-at items (load i)))
+                  (set! i (+ (load i) 1)))))
+    (loop (if (or (diag-some? (load errf)) (>= (load i) n))
+              (break)
+              (do
+                (match (expand-stage-markers a (al-elem [Sexp] items (load i))
+                                             module phasectx quals markers impb expb
+                                             allfns gs gu (mut depth))
+                  (Err [d] (set! errf (Some d)))
+                  (Ok [item] (al-push! (mut out) item)))
+                (set! i (+ (load i) 1)))))
+    (match (load errf)
+      (Some [d] (Err [(ptr (ArrayList Sexp)) Diag] d))
+      (None [] (Ok [(ptr (ArrayList Sexp)) Diag] (box-al [Sexp] a (load out)))))))
+
+;; Walk arbitrary transform output looking ONLY for lists headed by a declared
+;; marker. Everything else is copied structurally: the compiler does not guess
+;; which list heads are calls, quoted data, binders, or a guest language's
+;; different syntax — the transform owns those decisions, and therefore also
+;; owns guest-language scope and hygiene.
+(defn expand-stage-markers [(a (ptr Allocator))
+                            (form (ptr Sexp))
+                            (module (Option (slice u8)))
+                            (phasectx (ptr Program))
+                            (quals (ptr (ArrayList (slice u8))))
+                            (markers (ptr (ArrayList (slice u8))))
+                            (impb (ptr (ArrayList ImpEntry)))
+                            (expb (ptr (ArrayList ExpEntry)))
+                            (allfns (ptr SBox))
+                            (gs (ptr SBoxStruct))
+                            (gu (ptr SBoxSum))
+                            (depth (mut i64))] (-> (Result Sexp Diag))
+  (let [tag (sx-tag (load form))]
+    (if (or (= tag (primitive/cast i64 6)) (= tag (primitive/cast i64 7)))
+        (let [items (sx-items (load form))
+              quoted
+                (and (= tag (primitive/cast i64 6))
+                     (and (> (sx-len items) (primitive/cast i64 0))
+                          (and (= (sx-tag (sx-at items 0)) (primitive/cast i64 2))
+                               (= (sx-sval (sx-at items 0)) "quote"))))
+              marker
+                (and (= tag (primitive/cast i64 6))
+                     (and (> (sx-len items) (primitive/cast i64 0))
+                          (and (= (sx-tag (sx-at items 0)) (primitive/cast i64 2))
+                               (set-contains markers (sx-sval (sx-at items 0))))))]
+          ;; A stage marker inside quoted syntax is data, not an invocation:
+          ;; transforms use quoted values as persistent state between fixpoint
+          ;; rounds, and descending into either violates the generic rule.
+          (if quoted
+              (Ok [Sexp Diag] (load form))
+              (if marker
+                  (if (< (sx-len items) (primitive/cast i64 2))
+                      (Err [Sexp Diag]
+                           (stamp-call-site
+                             (derr "stage invocation: expected (MARKER ENTRY ARG...)")
+                             (load form)))
+                      (if (not (or (= (sx-tag (sx-at items 1)) (primitive/cast i64 2))
+                                   (= (sx-tag (sx-at items 1)) (primitive/cast i64 4))))
+                          (Err [Sexp Diag]
+                               (stamp-call-site
+                                 (derr "stage invocation: ENTRY must be a symbol or string")
+                                 (load form)))
+                          (let [raw (sx-sval (sx-at items 1))]
+                            (match (stage-entry-find raw module quals a)
+                              (None []
+                                (Err [Sexp Diag]
+                                     (stamp-call-site
+                                       (derr (sconcat3 a "stage invocation: entry '" raw
+                                                       "' is not available in this phase"))
+                                       (load form))))
+                              (Some [entry]
+                                (do
+                                  (set! depth (+ (load depth) 1))
+                                  (if (> (load depth) (primitive/cast i64 100000))
+                                      (Err [Sexp Diag]
+                                           (stamp-call-site
+                                             (derr "stage invocation expansion did not terminate")
+                                             (load form)))
+                                      (match (expand-macro phasectx entry (rest-from a items 2)
+                                                           (field allfns items)
+                                                           (field gs items)
+                                                           (field gu items)
+                                                           impb expb a)
+                                        (Err [d]
+                                          (Err [Sexp Diag] (stamp-call-site d (load form))))
+                                        (Ok [out]
+                                          ;; A stage may explicitly request another
+                                          ;; staged computation in its result.
+                                          ;; Re-enter only for a declared marker,
+                                          ;; never for an ordinary list head.
+                                          (expand-stage-markers a (box-sexp a out)
+                                                                module phasectx quals markers
+                                                                impb expb allfns gs gu
+                                                                (mut depth)))))))))))
+                  (match (expand-stage-marker-items a items module phasectx quals markers
+                                                    impb expb allfns gs gu (mut depth))
+                    (Err [d] (Err [Sexp Diag] d))
+                    (Ok [out]
+                      (Ok [Sexp Diag]
+                          (if (= tag (primitive/cast i64 7))
+                              (mk-sexp-src (KVec out) form)
+                              (mk-sexp-src (KList out) form))))))))
+        (Ok [Sexp Diag] (load form)))))
+
+;; Execute only explicit phase requests, then return their raw Code to the
+;; syntax-transform fixpoint. Ordinary Coil expansion and Coil hygienization do
+;; not run at this boundary: a Scheme transformer's output may be Scheme syntax,
+;; which must re-enter Scheme lowering on the next round (language resumption).
+(defn expand-staged-calls [(a (ptr Allocator))
+                           (forms (ptr (ArrayList TaggedForm)))
+                           (phasectx (ptr Program))
+                           (quals (ptr (ArrayList (slice u8))))
+                           (markers (ptr (ArrayList (slice u8))))
+                           (impb (ptr (ArrayList ImpEntry)))
+                           (expb (ptr (ArrayList ExpEntry)))]
+                          (-> (Result (ptr (ArrayList TaggedForm)) Diag))
+  (let [allfns (all-defn-names forms a)
+        gs (unwrap-ptr [SBoxStruct] (create [SBoxStruct] a))
+        gu (unwrap-ptr [SBoxSum] (create [SBoxSum] a))
+        result (unwrap-ptr [SBoxTF] (create [SBoxTF] a))
+        (mut depthv) 0
+        (mut errf) (None [Diag])
+        (mut i) 0
+        n (al-len [TaggedForm] (load forms))]
+    (set! (.items gs) (al-new [StructDef] a))
+    (set! (.items gu) (al-new [SumDef] a))
+    (set! (.items result) (al-new [TaggedForm] a))
+    (loop (if (or (diag-some? (load errf)) (>= (load i) n))
+              (break)
+              (do
+                (let [tf (al-elem [TaggedForm] forms (load i))
+                      module (.module tf)]
+                  (match (expand-stage-markers a (field tf form) module
+                                               phasectx quals markers impb expb
+                                               allfns gs gu
+                                               (mut depthv))
+                    (Err [d] (set! errf (Some d)))
+                    (Ok [outf]
+                        (do-produced (box-sexp a outf) module result gs gu
+                                     allfns a (mut errf)))))
+                (set! i (+ (load i) 1)))))
+    (match (load errf)
+      (Some [d] (Err [(ptr (ArrayList TaggedForm)) Diag] d))
+      (None [] (Ok [(ptr (ArrayList TaggedForm)) Diag]
+                   (field result items))))))
+
 ; print all collected `(primitive/warn …)` diagnostics (located, non-fatal) to stderr, each
 ; followed by the `help: try: …` line of any `(primitive/suggest …)` that produced it.
 (defn drain-warnings [(s (mut LS))] (-> i64)
@@ -3345,9 +3966,15 @@
                          (gu (ptr SBoxSum))
                          (impb (ptr (ArrayList ImpEntry)))
                          (expb (ptr (ArrayList ExpEntry)))
+                         (s (mut LS))
                          (a (ptr Allocator))] (-> (Result (ptr (ArrayList TaggedForm)) Diag))
   (clear-sem-model)
   (let [(mut cur) forms
+        phasectx (stage-expansion-context checked a)
+        (mut stage-quals) (al-new [(slice u8)] a)
+        (mut stage-markers) (al-new [(slice u8)] a)
+        (mut staged-forms) (al-new [TaggedForm] a)
+        (mut staged-defs) (al-new [(slice u8)] a)
         (mut iters) 0
         (mut done) false
         (mut errf) (None [Diag])]
@@ -3356,15 +3983,110 @@
               (match (run-transformers transformers checked (load cur) allfns gs gu impb expb a)
                 (Err [d] (do (set! errf (Some d)) 0))
                 (Ok [next]
-                    (if (forms-equal (load cur) next)
-                        (set! done true)
-                        (if (>= (load iters) (primitive/cast i64 16))
-                            (set! errf
-                                  (Some (derr "before-expand transform: did not reach a fixpoint after 16 rounds")))
-                            (do
-                              (set! cur next)
-                              (set! iters (primitive/iadd (load iters) 1))
-                              0)))))))
+                  (let [(mut runtime) (al-new [TaggedForm] a)
+                        (mut staged) (al-new [TaggedForm] a)
+                        (mut round) next
+                        (mut stage-progress) false]
+                    (match (split-stage-declarations! a next (mut runtime) (mut staged)
+                                                      (mut stage-markers))
+                      (Some [d] (set! errf (Some d)))
+                      (None []
+                        (do
+                          (when (> (al-len [TaggedForm] (load staged)) (primitive/cast i64 0))
+                            (set! stage-progress true)
+                            (match (stage-form-name-conflict
+                                     (box-al [TaggedForm] a (load staged))
+                                     (box-al [(slice u8)] a (load staged-defs)) a)
+                              (Some [name]
+                                (set! errf
+                                      (Some (derr (sconcat3 a "stage: definition '" name
+                                                            "' was introduced more than once")))))
+                              (None []
+                                (do
+                                  ;; Stage declarations join the CUMULATIVE phase
+                                  ;; program: later increments and later rounds
+                                  ;; may call the entries earlier ones installed.
+                                  (stage-record-form-names!
+                                    (box-al [TaggedForm] a (load staged))
+                                    (mut staged-defs) a)
+                                  (let [ns (al-len [TaggedForm] (load staged))
+                                        (mut si) 0]
+                                    (loop (if (>= (load si) ns)
+                                              (break)
+                                              (do
+                                                (al-push! (mut staged-forms)
+                                                          (al-get [TaggedForm] (load staged) (load si)))
+                                                (set! si (+ (load si) 1))))))
+                                  ;; The stage compilation allocates from the
+                                  ;; durable allocator for now: a disposable
+                                  ;; per-increment arena needs a completed
+                                  ;; ownership audit first (the engine image
+                                  ;; shares mono/interp structure with the
+                                  ;; checked graph — the branch's "premature
+                                  ;; freeing created dangling registries" trap).
+                                  ;; Mainline stage3 makes the same trade on its
+                                  ;; success round.
+                                  (match (compile-stage-declarations
+                                           a a (mut s)
+                                           (box-al [TaggedForm] a (load staged-forms))
+                                           (box-al [(slice u8)] a (load staged-defs)))
+                                    (Err [d]
+                                      (do
+                                        (set! errf (Some (stable-stage-diag a d)))
+                                        0))
+                                    (Ok [stagectx]
+                                      (let [new-quals (install-stage-signatures!
+                                                        phasectx stagectx
+                                                        (box-al [(slice u8)] a (load stage-quals))
+                                                        (box-al [(slice u8)] a (load staged-defs))
+                                                        a)
+                                            nq (al-len [(slice u8)] (load new-quals))
+                                            (mut qi) 0]
+                                        (loop (if (>= (load qi) nq)
+                                                  (break)
+                                                  (do
+                                                    (al-push! (mut stage-quals)
+                                                              (al-get [(slice u8)] (load new-quals) (load qi)))
+                                                    (set! qi (+ (load qi) 1)))))
+                                        0)))
+                                  0)))
+                            0)
+                          (unless (diag-some? (load errf))
+                            (if (= (al-len [(slice u8)] (load stage-quals)) (primitive/cast i64 0))
+                                (set! round (box-al [TaggedForm] a (load runtime)))
+                                (match (expand-staged-calls
+                                         a
+                                         (box-al [TaggedForm] a (load runtime))
+                                         phasectx
+                                         (box-al [(slice u8)] a (load stage-quals))
+                                         (box-al [(slice u8)] a (load stage-markers))
+                                         impb expb)
+                                  (Err [d] (set! errf (Some d)))
+                                  (Ok [expanded] (set! round expanded)))))
+                          0)))
+                    (unless (diag-some? (load errf))
+                      (if (forms-equal (load cur) (load round))
+                          (set! done true)
+                          ;; A round that declared a stage may legitimately need
+                          ;; further rounds (macro-defining-macros consume one
+                          ;; round per dependency layer); those count against a
+                          ;; wider cap than plain transform non-convergence.
+                          (if (and (>= (load iters) (primitive/cast i64 16))
+                                   (not (load stage-progress)))
+                              (set! errf
+                                    (Some (derr "before-expand transform: did not reach a fixpoint after 16 rounds")))
+                              (if (>= (load iters) (primitive/cast i64 64))
+                                  (set! errf
+                                        (Some (derr "before-expand staging: did not reach a fixpoint after 64 rounds")))
+                                  (do
+                                    (set! cur (load round))
+                                    ;; Staged results may add defns; the hygiene
+                                    ;; name index must see them.
+                                    (let [fresh (all-defn-names (load cur) a)]
+                                      (set! (.items allfns) (.items fresh)))
+                                    (set! iters (primitive/iadd (load iters) 1))
+                                    0)))))
+                    0)))))
     (match (load errf)
       (Some [d] (Err [(ptr (ArrayList TaggedForm)) Diag] d))
       (None []
@@ -3517,6 +4239,7 @@
                                       gu
                                       impb
                                       expb
+                                      (mut s)
                                       a)
               (Err [d] (do (drain-warnings (mut s)) (Err [i64 Diag] d)))
               (Ok [raw]

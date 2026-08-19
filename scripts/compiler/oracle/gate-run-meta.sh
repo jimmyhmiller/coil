@@ -369,6 +369,58 @@ COILEOF
 rc=$?
 [ "$rc" = 42 ] || { echo "GATE FAIL: desugared program exited $rc, want 42"; fail=1; }
 
+# ---- a reader-provider registration IS the entry: raw bytes in, code out ----
+# src/stdlib/brainfuck.coil declares only (reader-provider …) and no main;
+# running the FILE feeds each input's RAW bytes through the provider (the same
+# (read-context PATH SRC entry) contract --use hands it) and prints the
+# emitted module, which compiles and runs — the loop closes on foreign syntax.
+"$BIN" run src/stdlib/brainfuck.coil tests/read_metaprogram/hello.bf > "$WORK/bf_hello.coil" 2>"$WORK/bf.err" \
+  || { echo "GATE FAIL: reader-entry run failed ($(head -1 "$WORK/bf.err"))"; fail=1; }
+out=$("$BIN" run "$WORK/bf_hello.coil" 2>/dev/null)
+[ "$out" = "Hello World!" ] || { echo "GATE FAIL: reader-entry round trip printed '$out'"; fail=1; }
+
+# ---- a module NAME as the run target (no wrapper, no path) -------------------
+got=$("$BIN" run coil.brainfuck tests/read_metaprogram/hello.bf 2>"$WORK/bfname.err") \
+  || { echo "GATE FAIL: module-name target failed ($(head -1 "$WORK/bfname.err"))"; fail=1; }
+[ "$got" = "$(cat "$WORK/bf_hello.coil")" ] \
+  || { echo "GATE FAIL: module-name target output differs from the file target's"; fail=1; }
+
+# ---- reader entry over stdin; a reader diagnostic fails the run cleanly ------
+printf '++++++++[>++++++++<-]>+.' | "$BIN" run coil.brainfuck > "$WORK/bf_a.coil" 2>/dev/null \
+  || { echo "GATE FAIL: reader-entry stdin run failed"; fail=1; }
+out=$("$BIN" run "$WORK/bf_a.coil" 2>/dev/null)
+[ "$out" = "A" ] || { echo "GATE FAIL: reader-entry stdin round trip printed '$out'"; fail=1; }
+printf '+++[+.' | "$BIN" run coil.brainfuck >"$WORK/bfbad.out" 2>"$WORK/bfbad.err"
+rc=$?
+[ "$rc" = 1 ] || { echo "GATE FAIL: reader diagnostic exited $rc, want 1"; fail=1; }
+grep -q "unmatched '\['" "$WORK/bfbad.err" || { echo "GATE FAIL: reader diagnostic text missing"; fail=1; }
+[ -s "$WORK/bfbad.out" ] && { echo "GATE FAIL: reader failure printed to stdout"; fail=1; }
+
+# ---- an unresolvable target is a clean diagnostic, never a crash ------------
+# A bare name that is neither a readable file nor a resolvable namespace is the
+# ordinary typo case (`coil run hello`). It must fail the way a missing path
+# fails; resolving the target must not crash on the way there.
+for bad in hello nosuchthing coil.nosuch; do
+  "$BIN" run "$bad" >"$WORK/bad.out" 2>"$WORK/bad.err"
+  rc=$?
+  [ "$rc" = 1 ] || { echo "GATE FAIL: 'coil run $bad' exited $rc, want 1"; fail=1; }
+  grep -q "no such file" "$WORK/bad.err" || { echo "GATE FAIL: 'coil run $bad' missing the missing-file diagnostic"; fail=1; }
+done
+
+# ---- two reader providers in one entry file is an error, not last-wins ------
+cat > "$WORK/dup_reader.coil" <<'COILEOF'
+(module duprdr)
+(import "coil.primitive" :as primitive)
+(import "coil.brainfuck.reader" :use [read-brainfuck])
+(reader-provider "coil.brainfuck.reader" read-brainfuck)
+(reader-provider "coil.brainfuck.reader" read-brainfuck)
+COILEOF
+printf '+.' | "$BIN" run "$WORK/dup_reader.coil" >"$WORK/dup.out" 2>"$WORK/dup.err"
+rc=$?
+[ "$rc" = 1 ] || { echo "GATE FAIL: duplicate reader-provider exited $rc, want 1"; fail=1; }
+grep -q "more than one reader provider" "$WORK/dup.err" \
+  || { echo "GATE FAIL: duplicate reader-provider diagnostic missing"; fail=1; }
+
 # ---- a normal program is untouched ------------------------------------------
 EXPECT='n=-42 hex=ff ok=true'
 expect_out normal-run "$BIN" run src/examples/fmt.coil

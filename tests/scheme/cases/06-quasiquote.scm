@@ -4,5 +4,6 @@
 (display `(a ,@(list 1 2) b)) (newline)
 (display `(1 ,@'() 2)) (newline)
 (display `#(a ,n)) (newline)
+(display '#(1 a)) (newline)
 (display (equal? `(a `(b ,(c ,n))) (list 'a (list 'quasiquote (list 'b (list 'unquote (list 'c n))))))) (newline)
 (display `(,@(list 1 2) . 3)) (newline)

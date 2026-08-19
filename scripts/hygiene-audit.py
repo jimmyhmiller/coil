@@ -74,6 +74,16 @@ def justification(path: str, op: str, line: str) -> str:
         return "explicit context removal for a stable caller-visible declaration/protocol name"
     if op == "gensym" and path.startswith("src/apps/scheme/"):
         return "Scheme-language identifier datum; the Scheme compiler owns its separate rename environment"
+    # Staged metacompilation fixtures. The gensym is bound to `marker`: an opaque
+    # token that keys a `(stage MARKER ...)` declaration against the `(MARKER
+    # ENTRY ARG...)` requests the same transform rewrites into the guest. It is
+    # matched by identity, never bound and never resolved, so it is data. Keyed on
+    # the binding spelling rather than the file alone, so a gensym used any other
+    # way in these files still has to be classified.
+    if (op == "gensym"
+            and path.startswith("tests/metaprogramming/compile-and-run/staged_")
+            and "[marker (primitive/gensym)" in line):
+        return "staged metacompilation marker: an opaque token keying a (stage MARKER ...) declaration and its request sites; never bound, never resolved"
     if op == "code-symbol":
         if "fresh-identifier" in line:
             return "display spelling input to fresh-identifier; not itself used lexically"
@@ -87,6 +97,8 @@ def justification(path: str, op: str, line: str) -> str:
             return "field/qualified selector datum inspected or emitted as syntax data"
         if path.endswith("code_symbol_is_not_identifier.coil"):
             return "negative fixture proving unscoped datum cannot establish lexical identity"
+        if path.startswith("tests/metaprogramming/compile-and-run/staged_"):
+            return "guest syntax datum a stage entry returns, matched structurally by the next transform round rather than resolved"
     return ""
 
 
@@ -96,7 +108,7 @@ def classify(path: str, op: str, line: str) -> tuple[str, str, str]:
         return "fresh-local", "binding-or-reference", why
     if op in {"datum->syntax", "syntax->datum"}:
         return "explicit-intentional-capture", "binding-or-reference", why
-    if op == "gensym" and path.startswith("src/apps/scheme/"):
+    if op == "gensym" and why:
         return "non-identifier-data", "data", why
     if op == "code-symbol" and why:
         return "non-identifier-data", "data", why

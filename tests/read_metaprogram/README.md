@@ -8,6 +8,17 @@ printf 'reader metaprogram\n' |
   coil run tests/read_metaprogram/echo.bf --use coil.brainfuck
 ```
 
+The reader is also directly runnable as a code→code program — point `coil
+run` at the module itself (a reader-provider registration is an entry, and a
+module name resolves as a target) and the compiled Coil program prints to
+stdout instead of executing:
+
+```sh
+coil run coil.brainfuck tests/read_metaprogram/hello.bf   # prints the program
+coil run coil.brainfuck tests/read_metaprogram/hello.bf > hello.coil
+coil run hello.coil                                       # Hello World!
+```
+
 The provider parses the raw bytes at compile time and emits a complete Coil
 module with direct tape operations and native loops. There is no runtime opcode
 interpreter, evaluator, preprocessing adapter, or `.bf` driver special case.
