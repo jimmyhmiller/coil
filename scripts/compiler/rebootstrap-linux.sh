@@ -117,6 +117,13 @@ echo "  gate-cli:        PASS (argv, exit codes, fmt)"
 echo "  gate-target-os:  PASS ((target-os) follows --target, consts fold per target)"
 python3 scripts/dev.py test scheme --compiler /tmp/coil-lrb2 >/dev/null || { echo "gate-scheme FAIL"; exit 1; }
 echo "  gate-scheme:     PASS (R5RS surface, oracles, negatives, applications)"
+# The metaprogram-entry gates. Both were manual-only for a while, and a
+# release-build segfault on `coil run <typo>` lived through a green manual run
+# of gate-run-meta because nothing re-ran it. They belong in the battery.
+./scripts/compiler/oracle/gate-run-meta.sh /tmp/coil-lrb2 >/dev/null || { echo "gate-run-meta FAIL"; exit 1; }
+echo "  gate-run-meta:   PASS (code->code entries, reader entries, module targets)"
+./scripts/compiler/oracle/gate-staged-meta.sh /tmp/coil-lrb2 >/dev/null || { echo "gate-staged-meta FAIL"; exit 1; }
+echo "  gate-staged-meta: PASS (stage protocol, procedural define-syntax, syntax-case)"
 
 # The PER-STAGE gates. These are target-INDEPENDENT (they compare frontend stage
 # output, not machine code), so the same references serve both platforms — but only

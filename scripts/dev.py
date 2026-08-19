@@ -226,6 +226,13 @@ def test(args: argparse.Namespace) -> None:
         test_meta(compiler)
     elif args.suite == "metaprogramming":
         execute("scripts/tests/metaprogramming/compile-and-run/run.sh", compiler)
+    elif args.suite == "meta-entries":
+        # The metaprogram-entry gates, host-independent. rebootstrap-linux.sh
+        # runs these too; this is the way to run them against an arbitrary
+        # compiler (and the only way on macOS, whose rebootstrap only does
+        # the fixpoint).
+        execute("scripts/compiler/oracle/gate-run-meta.sh", compiler)
+        execute("scripts/compiler/oracle/gate-staged-meta.sh", compiler)
     elif args.suite == "interpreter":
         execute(sys.executable, "scripts/oracle.py", "interpreter", "live", "--compiler", compiler,
                 *(["--verbose"] if args.verbose else []))
@@ -964,7 +971,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "http", "wasm", "meta", "interpreter", "metaprogramming", "modernize-fast", "scheme"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "http", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "modernize-fast", "scheme"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.set_defaults(func=test)
