@@ -201,6 +201,16 @@ forms (`defn`, `let`, `if`, `match`, …) are not names and are never affected. 
 controls *which names you may write*; it does not change what reaches your binary — dead
 code is already stripped whether or not you exclude anything.
 
+Wildcard imports are allowed. To audit or replace them on demand, use the bundled
+opt-in checker (it is not enabled by ordinary builds or lint runs):
+
+    coil lint app.coil --use coil.lint.no-star-imports
+    coil lint app.coil --use coil.lint.no-star-imports --diff
+    coil lint app.coil --use coil.lint.no-star-imports --fix
+
+The fix changes `:use *` to an explicit list of the target module's exported names
+and preserves other clauses such as `:as` and `:reexport`.
+
 Module names may contain dots. By convention, every project owns a prefix and uses
 it for all importable modules: `myproject`, `myproject.http`, `myproject.db.user`,
 and so on. This is a convention, not a compiler requirement; a one-part name remains

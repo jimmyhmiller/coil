@@ -2421,6 +2421,31 @@ expect_rc 3 "code-doc: the program still builds and runs"  "$COIL" run "$T/docs/
 # of thing that has to be gated: a fix must preserve behaviour, be idempotent, never
 # delete a comment, and revert itself if it produces code that does not compile.
 mkdir -p "$T/lint"
+cat > "$T/lint/star-provider.coil" <<'EOF'
+(module star-provider)
+(export foo bar)
+(defn foo [] (-> i64) 42)
+(defn bar [] (-> i64) 7)
+(defn hidden [] (-> i64) 99)
+EOF
+cat > "$T/lint/star-target.coil" <<'EOF'
+(module star-target)
+(import "star-provider" :as provider :use *)
+(defn main [] (-> i64) (foo))
+EOF
+expect_out '^0$' "no-star-imports: not enforced by default" \
+  sh -c "\"$COIL\" lint \"$T/lint/star-target.coil\" 2>&1 | grep -c 'wildcard import'"
+expect_out '^1$' "no-star-imports: opt-in checker reports wildcard imports" \
+  sh -c "\"$COIL\" lint \"$T/lint/star-target.coil\" --use coil.lint.no-star-imports 2>&1 | grep -c 'wildcard import'"
+"$COIL" lint "$T/lint/star-target.coil" --use coil.lint.no-star-imports --fix >/dev/null 2>&1
+expect_out ':as provider :use \[foo bar\]' \
+  "no-star-imports: fix preserves other clauses and uses explicit exports" cat "$T/lint/star-target.coil"
+expect_rc 42 "no-star-imports: fixed program behaves identically" "$COIL" run "$T/lint/star-target.coil"
+cp "$T/lint/star-target.coil" "$T/lint/star-target.fixed"
+"$COIL" lint "$T/lint/star-target.coil" --use coil.lint.no-star-imports --fix >/dev/null 2>&1
+cmp -s "$T/lint/star-target.coil" "$T/lint/star-target.fixed" \
+  && ok "no-star-imports: fix is idempotent" || bad "no-star-imports: fix is idempotent" "the file changed"
+
 cat > "$T/lint/cond.coil" <<'EOF'
 (defn pick [(x i64)] (-> i64)
   (cond (= x 1) 10

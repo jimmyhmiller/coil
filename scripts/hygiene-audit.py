@@ -99,6 +99,8 @@ def justification(path: str, op: str, line: str) -> str:
             return "negative fixture proving unscoped datum cannot establish lexical identity"
         if path.startswith("tests/metaprogramming/compile-and-run/staged_"):
             return "guest syntax datum a stage entry returns, matched structurally by the next transform round rather than resolved"
+        if path.endswith("no_star_imports.coil"):
+            return "module-name datum read out of an import declaration for comparison and for the rewritten :use list; never a lexical identifier"
     return ""
 
 
