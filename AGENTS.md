@@ -87,3 +87,31 @@ before writing Coil.
   what stops them from being mistaken for the API surface. `src/examples/*.coil`
   is the exception: those are feature demos the language guide points at.
 - `src/compiler/*.coil` — the compiler itself (`reader.coil` = lexer/parser).
+
+## Workspaces
+
+A repository with several packages declares a `[workspace]` root instead of a
+`[package]`:
+
+```toml
+[workspace]
+name    = "experiments"
+members = ["src/apps/*", "src/experiments/*"]
+```
+
+Each member directory has its own `Coil.toml` with a `[package] name`, and the
+member's namespace is the workspace name plus the package name. **Every module in
+a package is the package name plus at least one more segment** — package `scheme`
+in workspace `experiments` owns `experiments.scheme.eval`, and a module named
+exactly `experiments.scheme` is an error. The rule is checked as the namespace
+index is built, so a stray module is reported by path.
+
+Members compile together and refer to each other with no dependency declaration
+between them; the member directories are the source roots. A workspace-level
+`tests/` directory is also on the roots and is not a package. `check` and `build`
+at the root fan out over members that declare an `entry`; a member without one is
+a library and is compiled through whoever imports it.
+
+`[package] casefold = "<module>"` marks one module whose import ASCII-folds the
+importing file's identifiers, for case-insensitive guest languages. This replaced
+a hardcoded `coil.scheme` test in `loader.coil`.

@@ -3446,7 +3446,8 @@
 ; and a fixed key set per non-dependency section. A typo'd section/key is a
 ; LOCATED hard error, not a silent no-op.
 (defn m-known-section? [(s (slice u8))] (-> bool)
-  (or (= s "package")
+  (or (= s "workspace")
+      (or (= s "package")
       (or (= s "dependencies")
           (or (= s "build")
               (or (= s "link")
@@ -3454,7 +3455,7 @@
                       (or (= s "run")
                           (or (= s "test")
                               (or (= s "lint")
-                                  (or (= s "metaprograms") (= s "native-dependencies")))))))))))
+                                  (or (= s "metaprograms") (= s "native-dependencies"))))))))))))
 ; `[test.suites.<name>]` is the one nested section the reader understands. The header
 ; text arrives verbatim, so the suite name is whatever follows the prefix.
 (defn m-suite-section? [(s (slice u8))] (-> bool)
@@ -3756,7 +3757,17 @@
    ; it on with one manifest line.
    (metaprograms (ptr (ArrayList (slice u8))))
    (native-deps (ptr (ArrayList ManifestNativeDep)))
-   (deps (ptr (ArrayList ManifestDep)))])
+   (deps (ptr (ArrayList ManifestDep)))
+   ; `[workspace]` — a root that owns member packages and no code of its own.
+   ; `ws-name` is the first segment of every member's namespace; `ws-members`
+   ; are directory globs, each naming a directory with its own Coil.toml.
+   (ws-name (slice u8))
+   (ws-members (ptr (ArrayList (slice u8))))
+   ; `[package] casefold` — files that IMPORT this package get their identifiers
+   ; ASCII case-folded before any index or hygiene context sees them. Declared by
+   ; the package that defines a case-insensitive language, so the loader no longer
+   ; needs a namespace spelling compiled into it.
+   (casefold (slice u8))])
 
 (defn parse-manifest [(a (ptr Allocator)) (text (slice u8))] (-> (ptr Manifest))
   (let [m (box a Manifest (primitive/zeroed Manifest))]
@@ -3787,6 +3798,10 @@
     (set! (.include-dirs m)
           (box a (ArrayList (slice u8)) (al-new [(slice u8)] a)))
     (set! (.ccflags m)
+          (box a (ArrayList (slice u8)) (al-new [(slice u8)] a)))
+    (set! (.ws-name m) "")
+    (set! (.casefold m) "")
+    (set! (.ws-members m)
           (box a (ArrayList (slice u8)) (al-new [(slice u8)] a)))
     (set! (.test-roots m)
           (box a (ArrayList (slice u8)) (al-new [(slice u8)] a)))
@@ -3858,7 +3873,22 @@
                             (let [key (m-trim (subslice [u8] line 0 eq))
                                   val (m-trim (subslice [u8] line (primitive/iadd eq 1) (slice-len [u8] line)))
                                   ln (primitive/iadd (load i) 1)]
-                              (cond (= (load section) "package")
+                              (cond (= (load section) "workspace")
+                                      (cond (= key "name")
+                                              (do (store! (field m ws-name) (m-unquote val)) 0)
+                                            (= key "members")
+                                              (do (m-parse-array a val (load (field m ws-members))) 0)
+                                            :else (m-bad-key a ln (load section) key))
+                                    (= (load section) "package")
+                                      (if (= key "casefold")
+                                       (do
+                                         ; The value is the module whose IMPORT turns ASCII
+                                         ; identifier folding on for the importing file --
+                                         ; the package's public entry, not the package as a
+                                         ; whole. Package-wide would fold the dialect's own
+                                         ; implementation, whose files import each other.
+                                         (store! (field m casefold) (m-unquote val))
+                                         0)
                                       (if (= key "name")
                                           (do (store! (field m name) (m-unquote val)) 0)
                                           (if (= key "entry")
@@ -3875,7 +3905,7 @@
                                                                        val
                                                                        (load (field m exclude)))
                                                         0)
-                                                      (m-bad-key a ln (load section) key)))))
+                                                      (m-bad-key a ln (load section) key))))))
                                     (= (load section) "dependencies") (m-parse-dep a (load (field m deps)) key val ln)
                                     (= (load section) "native-dependencies")
                                       (m-parse-native-dep a (load (field m native-deps)) key val ln)
@@ -4058,6 +4088,149 @@
                   (set! i (primitive/iadd (load i) 1)))))
     (load r)))
 
+; ============================ workspace members ============================
+; A `[workspace] members` entry is a directory GLOB, so it cannot be shell-quoted
+; the way every other manifest value is -- quoting would defeat the expansion that
+; is the point. It is validated instead: letters, digits and `/ - _ . *` only. A
+; member path with anything else in it is refused rather than reaching a shell.
+(defn m-member-glob-ok? [(s (slice u8))] (-> bool)
+  (let [n (slice-len [u8] s)
+        (mut ok) (> n (primitive/cast i64 0))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (primitive/cast i64 (slice-get [u8] s (load i)))]
+                (unless (or (and (>= c 97) (<= c 122))
+                            (or (and (>= c 65) (<= c 90))
+                                (or (and (>= c 48) (<= c 57))
+                                    (or (= c 47) (or (= c 45) (or (= c 95) (or (= c 46) (= c 42))))))))
+                  (store! ok false)
+                  (break))
+                (set! i (primitive/iadd (load i) 1)))))
+    (load ok)))
+
+; Expand the member globs to real directories, one per line. `ls -d` rather than
+; `find`, so the globs mean what they mean in the manifest and a pattern matching
+; nothing simply contributes nothing.
+(defn m-member-dirs [(a (ptr Allocator)) (m (ptr Manifest))] (-> (slice u8))
+  (let [globs (load (field m ws-members))
+        n (al-len [(slice u8)] (load globs))
+        tmp (sconcat a "/tmp/coil-ws-members-" (i64->str a (primitive/cast i64 (getpid))))
+        (mut cmd) (sb-new a)
+        (mut i) 0]
+    (if (= n (primitive/cast i64 0))
+        ""
+        (do
+          (sb-push-str! (mut cmd) "ls -d")
+          (loop (if (>= (load i) n)
+                    (break)
+                    (let [g (al-get [(slice u8)] (load globs) (load i))]
+                      (unless (m-member-glob-ok? g)
+                        (m-err a 0 "[workspace] members: a member path may contain only letters, digits and / - _ . *"))
+                      (sb-push-str! (mut cmd) " ")
+                      (sb-push-str! (mut cmd) g)
+                      (set! i (primitive/iadd (load i) 1)))))
+          (sb-push-str! (mut cmd) " 2>/dev/null > ")
+          (sb-push-str! (mut cmd) tmp)
+          (system (str->cstr a (sb-str (load cmd))))
+          (let [out (read-file a (str->cstr a tmp))]
+            (unlink (str->cstr a tmp))
+            out)))))
+
+; "<prefix>=<dir>" per member, newline separated: the workspace name, the member's
+; own `[package] name`, and where it lives. This is the whole workspace contract --
+; every module in that directory must be named `<prefix>.something`, and the loader
+; resolves and validates from it. A member directory without a Coil.toml, or whose
+; package has no name, is a configuration error rather than a silent skip.
+(defn m-workspace-packages [(a (ptr Allocator)) (m (ptr Manifest))] (-> (slice u8))
+  (let [dirs (m-member-dirs a m)
+        n (slice-len [u8] dirs)
+        (mut out) (sb-new a)
+        (mut lo) 0
+        (mut i) 0]
+    (loop (if (> (load i) n)
+              (break)
+              (if (or (= (load i) n)
+                      (= (primitive/cast i64 (slice-get [u8] dirs (load i))) (primitive/cast i64 10)))
+                  (do
+                    (when (> (load i) (load lo))
+                      (let [dir (subslice [u8] dirs (load lo) (load i))
+                            mtext (if (dir? (str->cstr a dir))
+                                      (read-file a (str->cstr a (sconcat a dir "/Coil.toml")))
+                                      "")]
+                        ; A glob like `src/apps/*` sweeps up plain files too -- a README
+                        ; beside the packages is not a mis-declared member, so skip
+                        ; anything that is not a directory. A DIRECTORY without a
+                        ; Coil.toml is still an error: that one is a real mistake.
+                        (if (and (dir? (str->cstr a dir)) (= (slice-len [u8] mtext) (primitive/cast i64 0)))
+                            (m-err a 0 (cat3-d a "[workspace] members: '" (cat3-d a dir "' is a directory with no Coil.toml")))
+                            (when (> (slice-len [u8] mtext) (primitive/cast i64 0))
+                            (let [mm (parse-manifest a mtext)]
+                              (if (= (slice-len [u8] (.name mm)) (primitive/cast i64 0))
+                                  (m-err a 0 (cat3-d a "[workspace] members: '" (cat3-d a dir "' has no [package] name")))
+                                  (do
+                                    (sb-push-str! (mut out) (.ws-name m))
+                                    (sb-push-byte! (mut out) (primitive/cast u8 46))
+                                    (sb-push-str! (mut out) (.name mm))
+                                    ; The fully-qualified module whose import folds its
+                                    ; importer, when the package declares one. The loader
+                                    ; compares against this exactly, so no namespace
+                                    ; spelling of its own is ever needed.
+                                    (when (> (slice-len [u8] (.casefold mm)) (primitive/cast i64 0))
+                                      (sb-push-byte! (mut out) (primitive/cast u8 33))
+                                      (sb-push-str! (mut out) (.ws-name m))
+                                      (sb-push-byte! (mut out) (primitive/cast u8 46))
+                                      (sb-push-str! (mut out) (.name mm))
+                                      (sb-push-byte! (mut out) (primitive/cast u8 46))
+                                      (sb-push-str! (mut out) (.casefold mm))
+                                      0)
+                                    (sb-push-byte! (mut out) (primitive/cast u8 61))
+                                    (match (m-realpath a dir)
+                                      (Some [rp] (sb-push-str! (mut out) rp))
+                                      (None [] (sb-push-str! (mut out) dir)))
+                                    (sb-push-byte! (mut out) (primitive/cast u8 10))
+                                    0)))))))
+                    (store! lo (primitive/iadd (load i) 1))
+                    (set! i (primitive/iadd (load i) 1))
+                    0)
+                  (set! i (primitive/iadd (load i) 1)))))
+    (sb-str (load out))))
+
+; The member directories as a roots list, for m-namespace-roots. Parsed back out of
+; the same "<prefix>=<dir>" text the loader is given, so the two can never disagree
+; about which directories the workspace consists of.
+(defn m-workspace-member-roots [(a (ptr Allocator)) (m (ptr Manifest))] (-> (ptr (ArrayList (slice u8))))
+  (let [text (m-workspace-packages a m)
+        n (slice-len [u8] text)
+        g (unwrap-ptr [(ArrayList (slice u8))] (create [(ArrayList (slice u8))] a))
+        (mut lo) 0
+        (mut i) 0]
+    (set! g (al-new [(slice u8)] a))
+    ; The workspace's own `tests` directory, when it has one. It is NOT a package --
+    ; nothing there is validated against a prefix -- but test programs have to be able
+    ; to import the members they exercise, and member directories alone would leave
+    ; the whole directory unreachable.
+    (when (dir? (str->cstr a "tests")) (al-push! g "tests") 0)
+    (loop (if (> (load i) n)
+              (break)
+              (if (or (= (load i) n)
+                      (= (primitive/cast i64 (slice-get [u8] text (load i))) (primitive/cast i64 10)))
+                  (do
+                    (when (> (load i) (load lo))
+                      (let [line (subslice [u8] text (load lo) (load i))
+                            eq (m-index line (primitive/cast u8 61))]
+                        (when (>= eq (primitive/cast i64 0))
+                          (al-push! g (subslice [u8] line (primitive/iadd eq 1) (slice-len [u8] line)))
+                          0)))
+                    (store! lo (primitive/iadd (load i) 1))
+                    (set! i (primitive/iadd (load i) 1))
+                    0)
+                  (set! i (primitive/iadd (load i) 1)))))
+    g))
+
+(defn m-workspace? [(m (ptr Manifest))] (-> bool)
+  (> (slice-len [u8] (.ws-name m)) (primitive/cast i64 0)))
+
 (defn m-shell-quoted! [(b (mut StrBuf)) (s (slice u8))] (-> i64)
   (sb-push-str! (mut b) "'")
   (sb-push-str! (mut b) s)
@@ -4151,7 +4324,13 @@
 (defn m-namespace-roots [(a (ptr Allocator)) (m (ptr Manifest))] (-> (slice u8))
   (let [deps (load (field m deps))
         n (al-len [ManifestDep] (load deps))
-        configured (m-effective-roots a m)
+        ; A workspace root holds no code; its members do. Their directories ARE the
+        ; source roots, which is what lets one member refer to another with no
+        ; dependency declaration between them -- the workspace compiles as one
+        ; program, the way `src` and `tests` already do for a single package.
+        configured (if (m-workspace? m)
+                       (m-workspace-member-roots a m)
+                       (m-effective-roots a m))
         (mut roots) (sb-new a)
         (mut emitted) 0
         (mut i) 0]
@@ -4181,8 +4360,31 @@
         n (al-len [ManifestDep] (load deps))
         (mut i) 0]
     (sb-push-str! (mut b) "env ")
-    (m-shell-quoted! (mut b) (cat3-d a "COIL_NAMESPACE_ROOTS=" (m-namespace-roots a m)))
+    ; An INHERITED COIL_NAMESPACE_ROOTS means a parent already configured this
+    ; compile -- the same signal apply-project-manifest! uses to make itself a no-op.
+    ; A workspace member must not replace it with its own directory, or the member
+    ; would resolve against itself alone and every cross-member import would fail
+    ; while the identical `check <file>` succeeded.
+    (let [inherited (getenv (str->cstr a "COIL_NAMESPACE_ROOTS"))]
+      (m-shell-quoted! (mut b)
+                       (cat3-d a
+                               "COIL_NAMESPACE_ROOTS="
+                               (if (= (primitive/cast i64 inherited) (primitive/cast i64 0))
+                                   (m-namespace-roots a m)
+                                   (cstr->slice inherited)))))
     (sb-push-str! (mut b) " ")
+    ; Same for the workspace description: pass through what we were given, or
+    ; compute it when we ARE the workspace root.
+    (let [wsp (getenv (str->cstr a "COIL_WORKSPACE_PACKAGES"))]
+      (when (or (!= (primitive/cast i64 wsp) (primitive/cast i64 0)) (m-workspace? m))
+        (m-shell-quoted! (mut b)
+                         (cat3-d a
+                                 "COIL_WORKSPACE_PACKAGES="
+                                 (if (= (primitive/cast i64 wsp) (primitive/cast i64 0))
+                                     (m-workspace-packages a m)
+                                     (cstr->slice wsp))))
+        (sb-push-str! (mut b) " ")
+        0))
     (set! i 0)
     (loop (if (>= (load i) n)
               (break)
@@ -4353,6 +4555,11 @@
             ; Resolve dependencies BEFORE reading their roots — m-namespace-roots
             ; reads each dep's `resolved` path, which m-prepare-deps is what fills in.
             (m-prepare-deps a m)
+            (when (m-workspace? m)
+              (setenv (str->cstr a "COIL_WORKSPACE_PACKAGES")
+                      (str->cstr a (m-workspace-packages a m))
+                      1)
+              0)
             (setenv key (str->cstr a (m-namespace-roots a m)) 1)
             ; Commands that compile IN THIS PROCESS (`check <file>`, the dump
             ; stages) get the declared metaprograms here; the ones that re-exec a
@@ -4574,7 +4781,84 @@
 ; and `coil build` compile under the same dependencies, link inputs and metaprograms.
 ; With an explicit entry the manifest's `[build] out` is not applied: the source stem
 ; names the artifact unless the user supplies `-o`.
+; `<cmd>` at a workspace root, with no file named: run it once per member, in the
+; member's own directory, where its Coil.toml applies exactly as it would if you had
+; cd'd there yourself. Members run in listed order and every one runs even after a
+; failure -- one broken member should not hide the state of the rest. The exit code
+; is the count of members that failed, so 0 still means "all good".
+(defn workspace-fanout [(a (ptr Allocator)) (sub (slice u8)) (self (slice u8)) (m (ptr Manifest))] (-> i64)
+  (let [text (m-workspace-packages a m)
+        n (slice-len [u8] text)
+        w (stderr)
+        (mut failed) 0
+        (mut total) 0
+        (mut lo) 0
+        (mut i) 0]
+    (loop (if (> (load i) n)
+              (break)
+              (if (or (= (load i) n)
+                      (= (primitive/cast i64 (slice-get [u8] text (load i))) (primitive/cast i64 10)))
+                  (do
+                    (when (> (load i) (load lo))
+                      (let [line (subslice [u8] text (load lo) (load i))
+                            eq (m-index line (primitive/cast u8 61))]
+                        (when (>= eq (primitive/cast i64 0))
+                          (let [dir (subslice [u8] line (primitive/iadd eq 1) (slice-len [u8] line))
+                                mm (parse-manifest a (read-file a (str->cstr a (sconcat a dir "/Coil.toml"))))
+                                (mut c) (sb-new a)]
+                            ; A member with no `entry` is a library: there is no program
+                            ; to build or check on its own, and its code is compiled by
+                            ; whichever member imports it. Skipping is the honest answer,
+                            ; but say so rather than reporting a member that never ran.
+                            (if (= (slice-len [u8] (.entry mm)) (primitive/cast i64 0))
+                                (do
+                                  (ps w "-- ")
+                                  (ps w dir)
+                                  (ps w " (library: no [package] entry, compiled through its importers)\n")
+                                  0)
+                                (do
+                                  (set! total (primitive/iadd (load total) 1))
+                                  (ps w "== ")
+                                  (ps w sub)
+                                  (ps w " ")
+                                  (ps w dir)
+                                  (wb w 10)
+                                  (sb-push-str! (mut c) "cd ")
+                                  (m-shell-quoted! (mut c) dir)
+                                  (sb-push-str! (mut c) " && env ")
+                                  ; The member's own Coil.toml declares no workspace, so
+                                  ; without these the child would resolve against its own
+                                  ; directory alone and every cross-member import would
+                                  ; fail. Passing them is what makes a member compile
+                                  ; inside the workspace rather than beside it.
+                                  (m-shell-quoted! (mut c) (cat3-d a "COIL_NAMESPACE_ROOTS=" (m-namespace-roots a m)))
+                                  (sb-push-str! (mut c) " ")
+                                  (m-shell-quoted! (mut c) (cat3-d a "COIL_WORKSPACE_PACKAGES=" (m-workspace-packages a m)))
+                                  (sb-push-str! (mut c) " ")
+                                  (m-shell-quoted! (mut c) self)
+                                  (sb-push-str! (mut c) " ")
+                                  (sb-push-str! (mut c) sub)
+                                  (when (!= (wait-code (primitive/cast i64 (system (str->cstr a (sb-str (load c))))))
+                                            (primitive/cast i64 0))
+                                    (set! failed (primitive/iadd (load failed) 1))
+                                    0)
+                                  0))
+                            0))))
+                    (store! lo (primitive/iadd (load i) 1))
+                    (set! i (primitive/iadd (load i) 1))
+                    0)
+                  (set! i (primitive/iadd (load i) 1)))))
+    (ps w "workspace ")
+    (ps w sub)
+    (ps w ": ")
+    (ps w (i64->str a (primitive/isub (load total) (load failed))))
+    (ps w "/")
+    (ps w (i64->str a (load total)))
+    (ps w " members ok\n")
+    (load failed)))
+
 (defn manifest-cmd [(a (ptr Allocator)) (sub (slice u8)) (argc i32) (argv (ptr (ptr i8))) (fidx i64)] (-> i64)
+  (scope :manifest-cmd
   (let [self (cstr->slice (load (primitive/index argv 0)))
         text (read-file a (str->cstr a "Coil.toml"))]
     (if (= (slice-len [u8] text) (primitive/cast i64 0))
@@ -4592,6 +4876,9 @@
                     (.out m)
                     (.name m))
               (mut b) (sb-new a)]
+          (when (and (m-workspace? m) (not explicit))
+            (return-from :manifest-cmd (workspace-fanout a sub self m))
+            0)
           (when (= sub "build")
             (offer-breaking-change-fix a m self)
             0)
@@ -4655,7 +4942,7 @@
                               (store! k (primitive/iadd (load k) 1)))))))))
           (let [rc (primitive/cast i64 (system (str->cstr a (sb-str (load b)))))]
             (wait-report rc "program")
-            (wait-code rc))))))
+            (wait-code rc)))))))
 
 ; manifest mode = `build`/`run` with no file ANYWHERE in argv — not merely "argv[2]
 ; starts with a dash", which made `coil build -o out in.coil` look like a project build.
