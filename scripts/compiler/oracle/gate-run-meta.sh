@@ -370,27 +370,27 @@ rc=$?
 [ "$rc" = 42 ] || { echo "GATE FAIL: desugared program exited $rc, want 42"; fail=1; }
 
 # ---- a reader-provider registration IS the entry: raw bytes in, code out ----
-# src/stdlib/brainfuck.coil declares only (reader-provider …) and no main;
+# tests/compiler/reader_metaprograms/brainfuck.coil declares only (reader-provider …) and no main;
 # running the FILE feeds each input's RAW bytes through the provider (the same
 # (read-context PATH SRC entry) contract --use hands it) and prints the
 # emitted module, which compiles and runs — the loop closes on foreign syntax.
-"$BIN" run src/stdlib/brainfuck.coil tests/read_metaprogram/hello.bf > "$WORK/bf_hello.coil" 2>"$WORK/bf.err" \
+"$BIN" run tests/compiler/reader_metaprograms/brainfuck.coil tests/read_metaprogram/hello.bf > "$WORK/bf_hello.coil" 2>"$WORK/bf.err" \
   || { echo "GATE FAIL: reader-entry run failed ($(head -1 "$WORK/bf.err"))"; fail=1; }
 out=$("$BIN" run "$WORK/bf_hello.coil" 2>/dev/null)
 [ "$out" = "Hello World!" ] || { echo "GATE FAIL: reader-entry round trip printed '$out'"; fail=1; }
 
 # ---- a module NAME as the run target (no wrapper, no path) -------------------
-got=$("$BIN" run coil.brainfuck tests/read_metaprogram/hello.bf 2>"$WORK/bfname.err") \
+got=$("$BIN" run reader.fixture.brainfuck tests/read_metaprogram/hello.bf 2>"$WORK/bfname.err") \
   || { echo "GATE FAIL: module-name target failed ($(head -1 "$WORK/bfname.err"))"; fail=1; }
 [ "$got" = "$(cat "$WORK/bf_hello.coil")" ] \
   || { echo "GATE FAIL: module-name target output differs from the file target's"; fail=1; }
 
 # ---- reader entry over stdin; a reader diagnostic fails the run cleanly ------
-printf '++++++++[>++++++++<-]>+.' | "$BIN" run coil.brainfuck > "$WORK/bf_a.coil" 2>/dev/null \
+printf '++++++++[>++++++++<-]>+.' | "$BIN" run reader.fixture.brainfuck > "$WORK/bf_a.coil" 2>/dev/null \
   || { echo "GATE FAIL: reader-entry stdin run failed"; fail=1; }
 out=$("$BIN" run "$WORK/bf_a.coil" 2>/dev/null)
 [ "$out" = "A" ] || { echo "GATE FAIL: reader-entry stdin round trip printed '$out'"; fail=1; }
-printf '+++[+.' | "$BIN" run coil.brainfuck >"$WORK/bfbad.out" 2>"$WORK/bfbad.err"
+printf '+++[+.' | "$BIN" run reader.fixture.brainfuck >"$WORK/bfbad.out" 2>"$WORK/bfbad.err"
 rc=$?
 [ "$rc" = 1 ] || { echo "GATE FAIL: reader diagnostic exited $rc, want 1"; fail=1; }
 grep -q "unmatched '\['" "$WORK/bfbad.err" || { echo "GATE FAIL: reader diagnostic text missing"; fail=1; }
@@ -411,9 +411,9 @@ done
 cat > "$WORK/dup_reader.coil" <<'COILEOF'
 (module duprdr)
 (import "coil.primitive" :as primitive)
-(import "coil.brainfuck.reader" :use [read-brainfuck])
-(reader-provider "coil.brainfuck.reader" read-brainfuck)
-(reader-provider "coil.brainfuck.reader" read-brainfuck)
+(import "reader.fixture.brainfuck.reader" :use [read-brainfuck])
+(reader-provider "reader.fixture.brainfuck.reader" read-brainfuck)
+(reader-provider "reader.fixture.brainfuck.reader" read-brainfuck)
 COILEOF
 printf '+.' | "$BIN" run "$WORK/dup_reader.coil" >"$WORK/dup.out" 2>"$WORK/dup.err"
 rc=$?

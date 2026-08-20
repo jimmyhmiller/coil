@@ -54,7 +54,7 @@ tail copies). Whole-compiler `coil check` with the arena on: 1.23 GB / 1.15 s
 ## The problem, measured (2026-08-16, Linux x86-64)
 
 Compiling raw Brainfuck through the reader metaprogram (`coil check prog.bf
---use coil.brainfuck`) with n flat `+`/`-` operations:
+--use reader.fixture.brainfuck`) with n flat `+`/`-` operations:
 
 | n ops  | peak RSS before | after `7ec494e` |
 |-------:|----------------:|----------------:|

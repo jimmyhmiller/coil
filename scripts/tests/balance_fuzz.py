@@ -161,7 +161,7 @@ def corpus(paths: list[str]) -> list[pathlib.Path]:
     if paths:
         return [pathlib.Path(p) for p in paths]
     picks: list[pathlib.Path] = []
-    for sub in ("src/stdlib", "src/examples", "src/compiler", "src/apps", "tests"):
+    for sub in ("src/stdlib", "src/examples", "src/compiler", "tests"):
         picks += sorted((REPO / sub).rglob("*.coil"))
     return picks
 

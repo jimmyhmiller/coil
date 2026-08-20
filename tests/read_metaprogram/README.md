@@ -1,11 +1,11 @@
 # Brainfuck read-metaprogram proof
 
-These are raw Brainfuck files, compiled by selecting the bundled reader:
+These are raw Brainfuck files, compiled by selecting the reader fixture in tests/compiler/reader_metaprograms/:
 
 ```sh
-coil run tests/read_metaprogram/hello.bf --use coil.brainfuck
+coil run tests/read_metaprogram/hello.bf --use reader.fixture.brainfuck
 printf 'reader metaprogram\n' |
-  coil run tests/read_metaprogram/echo.bf --use coil.brainfuck
+  coil run tests/read_metaprogram/echo.bf --use reader.fixture.brainfuck
 ```
 
 The reader is also directly runnable as a code→code program — point `coil
@@ -14,8 +14,8 @@ module name resolves as a target) and the compiled Coil program prints to
 stdout instead of executing:
 
 ```sh
-coil run coil.brainfuck tests/read_metaprogram/hello.bf   # prints the program
-coil run coil.brainfuck tests/read_metaprogram/hello.bf > hello.coil
+coil run reader.fixture.brainfuck tests/read_metaprogram/hello.bf   # prints the program
+coil run reader.fixture.brainfuck tests/read_metaprogram/hello.bf > hello.coil
 coil run hello.coil                                       # Hello World!
 ```
 

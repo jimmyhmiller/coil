@@ -40,7 +40,7 @@ def corpus(paths: list[str], limit: int) -> list[pathlib.Path]:
     if paths:
         return [pathlib.Path(p) for p in paths]
     found: list[pathlib.Path] = []
-    for sub in ("src/stdlib", "src/examples", "src/compiler", "src/apps", "tests"):
+    for sub in ("src/stdlib", "src/examples", "src/compiler", "tests"):
         found += sorted((REPO / sub).rglob("*.coil"))
     return found[:limit]
 

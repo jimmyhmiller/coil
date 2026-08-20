@@ -50,35 +50,14 @@ for mode in native interp poison; do
   [ "$rc" = 1 ] || { echo "GATE FAIL: staged_dup ($mode) exited $rc, want 1"; fail=1; }
   grep -q "introduced more than once" "$WORK/dup.err" \
     || { echo "GATE FAIL: staged_dup ($mode) missing redefinition diagnostic"; fail=1; }
-  # The Scheme phase-runtime bridge: a staged entry computing through the GC'd
-  # Scheme heap (pairs, fixnums, syntax objects) at expansion time.
-  env ${env[@]+"${env[@]}"} "$BIN" run "$D/staged_scheme_bridge_test.coil" >/dev/null 2>"$WORK/err"
-  rc=$?
-  [ "$rc" = 42 ] || { echo "GATE FAIL: staged_scheme_bridge ($mode) exited $rc, want 42 ($(head -1 "$WORK/err"))"; fail=1; }
-  # Procedural Scheme define-syntax end-to-end: datum transformers, a
-  # transformer whose result uses another procedural macro, self-recursion.
-  env ${env[@]+"${env[@]}"} "$BIN" run tests/scheme/dialect/proc_syntax_basic.scm --use coil.scheme \
-    >"$WORK/proc.out" 2>"$WORK/proc.err"
-  rc=$?
-  [ "$rc" = 0 ] || { echo "GATE FAIL: proc_syntax_basic ($mode) exited $rc ($(head -1 "$WORK/proc.err"))"; fail=1; }
-  cmp -s "$WORK/proc.out" tests/scheme/dialect/proc_syntax_basic.expected \
-    || { echo "GATE FAIL: proc_syntax_basic ($mode) output mismatch"; fail=1; }
-  # syntax-case v1: fixed patterns, literals, nesting, with-syntax, #' templates.
-  env ${env[@]+"${env[@]}"} "$BIN" run tests/scheme/dialect/proc_syntax_case.scm --use coil.scheme \
-    >"$WORK/sc.out" 2>"$WORK/sc.err"
-  rc=$?
-  [ "$rc" = 0 ] || { echo "GATE FAIL: proc_syntax_case ($mode) exited $rc ($(head -1 "$WORK/sc.err"))"; fail=1; }
-  cmp -s "$WORK/sc.out" tests/scheme/dialect/proc_syntax_case.expected \
-    || { echo "GATE FAIL: proc_syntax_case ($mode) output mismatch"; fail=1; }
-  # Ellipsis patterns/templates (nested columns, prefix/segment/tail, recursion)
-  # and fenders.
-  env ${env[@]+"${env[@]}"} "$BIN" run tests/scheme/dialect/proc_syntax_ellipsis.scm --use coil.scheme \
-    >"$WORK/el.out" 2>"$WORK/el.err"
-  rc=$?
-  [ "$rc" = 0 ] || { echo "GATE FAIL: proc_syntax_ellipsis ($mode) exited $rc ($(head -1 "$WORK/el.err"))"; fail=1; }
-  cmp -s "$WORK/el.out" tests/scheme/dialect/proc_syntax_ellipsis.expected \
-    || { echo "GATE FAIL: proc_syntax_ellipsis ($mode) output mismatch"; fail=1; }
 done
+
+# The Scheme-dialect cases that used to run here -- the phase-runtime bridge
+# (a staged entry computing through the GC'd Scheme heap at expansion time) and
+# the procedural define-syntax/syntax-case/ellipsis end-to-end checks -- moved
+# with the dialect to the coil-experiments repository. Staged metacompilation
+# keeps native/interp/poison coverage through staged_pick/chain/xmod/dup above,
+# but no longer has a large guest language exercising it in this repo.
 
 # Isolation is a property of the BUILT artifact: the staged entry's name must
 # not appear anywhere in the runtime binary.

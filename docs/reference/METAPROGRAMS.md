@@ -292,10 +292,13 @@ bounds-checking on unmodified Coil.
 ### Richer reflection
 Function-signature reflection, for auto-coercion at dialect boundaries.
 
-## Related work in the repo
+## Related work
+These live in the **coil-experiments** repository, not here:
 - `src/experiments/gc-dialect/` — a precise mark-sweep GC built entirely as macros + a runtime
   library (implicit allocation + reclamation, reflection-generated tracers).
 - `src/experiments/transparent-gc/` — the same idea with rooting made transparent by a transform, so
   no explicit `gc-let`/`gctype` is needed.
+- `src/apps/scheme/` — an R5RS dialect as a whole-program transform; the largest
+  metaprogram written in Coil.
 - Jai comparison: it confirms codegen only sees post-comptime concrete code and keeps
   generics duck-typed, and leaves the comptime↔instantiation cycle undocumented.

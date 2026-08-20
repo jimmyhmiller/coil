@@ -72,8 +72,6 @@ def justification(path: str, op: str, line: str) -> str:
         return "explicit context introduction at a documented capture/protocol boundary"
     if op == "syntax->datum":
         return "explicit context removal for a stable caller-visible declaration/protocol name"
-    if op == "gensym" and path.startswith("src/apps/scheme/"):
-        return "Scheme-language identifier datum; the Scheme compiler owns its separate rename environment"
     # Staged metacompilation fixtures. The gensym is bound to `marker`: an opaque
     # token that keys a `(stage MARKER ...)` declaration against the `(MARKER
     # ENTRY ARG...)` requests the same transform rewrites into the guest. It is
@@ -89,8 +87,6 @@ def justification(path: str, op: str, line: str) -> str:
             return "display spelling input to fresh-identifier; not itself used lexically"
         if "syntax->datum" in line:
             return "display spelling input to explicit context removal"
-        if path.startswith("src/apps/scheme/"):
-            return "Scheme-language/compiler datum, not a Coil lexical identifier"
         if path.endswith("named_constructor_lint.coil"):
             return "keyword datum assembled for named-constructor syntax"
         if path.endswith("field_syntax_lint.coil") or path.endswith("prelude.coil"):

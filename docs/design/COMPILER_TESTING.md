@@ -32,7 +32,6 @@ bound `=`. So some layer must not depend on the compiler being correct:
 | stage snapshot gates (`oracle.py gate`) | no unreviewed drift in any stage | no — byte compare vs blessed refs |
 | runtime corpus gate (58 programs, stdout+exit) | compiled code behaves; shared refs make LLVM and native backends agree | no — output compare |
 | **canaries** (new, see §2) | the assert machinery itself can fail | no — checked from outside |
-| Scheme differential harness (`tests/scheme/run.py`) | conformance vs Chez/Guile/Chibi consensus | no — external oracles |
 | a thin process harness (§5) | exit codes, filesystem effects, linking | no — observed from outside |
 
 Everything NOT in this table should eventually be a deftest.
@@ -119,7 +118,6 @@ suite into the runner without rewriting it.
 - `rebootstrap*.sh` — unchanged, per decision.
 - `oracle.py` snapshot gates + coverage — byte-exact golden files are the
   point; deftest adds nothing.
-- `tests/scheme/run.py` — external oracles, python stays.
 - A **thin** process harness (the shrunken `gate-cli.sh`): builds the
   candidate, runs the canaries, and keeps only checks that cannot observe
   themselves from inside a test process (sanitizer symbol presence via `nm`,

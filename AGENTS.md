@@ -80,5 +80,10 @@ before writing Coil.
   `COIL_STRICT_BUNDLE=1` so the in-repo fallback is a hard error instead of a silent
   success.
 - `src/examples/*.coil` — one idea each (`sums`, `hashmap`, `references`, `lisp`, …).
-- `src/apps/*` — larger programs (e.g. `src/apps/clox` — a full bytecode VM, ~parity with `-O2` C).
+- Dialects (Scheme, Brainfuck), applications (clox, CHIP-8, Space Invaders, Wasm),
+  and research transforms (GC dialects, httptap) live in the separate
+  **coil-experiments** repository, not here. Anything that is a program written
+  *in* Coil rather than part of the language belongs there — keeping them out is
+  what stops them from being mistaken for the API surface. `src/examples/*.coil`
+  is the exception: those are feature demos the language guide points at.
 - `src/compiler/*.coil` — the compiler itself (`reader.coil` = lexer/parser).

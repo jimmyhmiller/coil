@@ -54,7 +54,7 @@ PROGRAM = """(module unused-probe)
 (defstruct Abi [(fd i32) (opaque i64)])
 (extern crosses :cc c [(ptr Abi)] (-> i64))
 
-;; C-style struct inheritance, the shape `src/apps/clox` is built on: the header is
+;; C-style struct inheritance, the shape a bytecode VM's object model is built on: the header is
 ;; reached by casting the pointer, never by naming the field. `header` is mentioned
 ;; nowhere and must survive anyway — deleting it compiles and breaks the program.
 (defstruct Header [(tag i64)])

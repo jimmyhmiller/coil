@@ -125,13 +125,6 @@ def write_list(path: Path, entries: list[str]) -> None:
     path.write_text("".join(f"{entry}\n" for entry in sorted(entries)))
 
 
-def real_sources() -> list[str]:
-    files: list[Path] = []
-    for directory in (ROOT / "src/examples", ROOT / "src/stdlib", ROOT / "src/apps"):
-        files.extend(directory.rglob("*.coil"))
-    return sorted(rel(path) for path in files)
-
-
 def run(compiler: Path, command: str, source: str, *extra: str) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run([str(compiler), command, source, *extra], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 

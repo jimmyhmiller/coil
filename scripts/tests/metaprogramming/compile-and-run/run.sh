@@ -132,15 +132,10 @@ ua=$(grep -c "error: use after release" "$OUT/own.txt"); dr=$(grep -c "error: do
 [ "$ua" -eq 1 ] && [ "$dr" -eq 1 ] || { cat "$OUT/own.txt"; echo "expected 1 use-after + 1 double-release, got $ua/$dr"; exit 1; }
 echo "borrow-checker dialect: OK (valid runs; bad vetoed with 2 located errors)"
 
-echo "=== 13. TRANSPARENT GC: normal code, ZERO annotations, transform inserts it all ==="
-echo "       demo.coil writes cons-list code with no ptr, no alloc call, no roots;"
-echo "       gcauto.coil rewrites Pair->ptr, allocates, and AUTO-ROOTS across every"
-echo "       allocation. The collector reclaims: 100000 cells allocated, 50 peak live"
-( cd src/experiments/transparent-gc && "$ABSCOIL" run demo.coil > "$OUT/tgc.txt" 2>&1 ); rc=$?
-grep -q "sum=2450000" "$OUT/tgc.txt" || { cat "$OUT/tgc.txt"; echo "transparent gc wrong result"; exit 1; }
-grep -q "peak_live=50 " "$OUT/tgc.txt" || { cat "$OUT/tgc.txt"; echo "transparent gc did not reclaim (peak should be 50)"; exit 1; }
-cat "$OUT/tgc.txt"
-echo "transparent GC: OK (zero annotations; 100000 allocated, 50 peak live, reclaimed)"
+# Step 13 was the transparent-GC demo (normal code, zero annotations, a transform
+# inserting heap/alloc/roots). It moved with src/experiments to the
+# coil-experiments repository; the dialect steps above (borrow checker, tower,
+# compile-time GUI) still cover whole-program transforms here.
 
 rm -rf "$OUT"
 [ "$GUI_FAILED" -eq 0 ] || { echo "=== FAILED: the compile-time GUI step (11) ==="; exit 1; }

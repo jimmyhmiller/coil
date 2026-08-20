@@ -241,8 +241,6 @@ def test(args: argparse.Namespace) -> None:
                 *(["--verbose"] if args.verbose else []))
     elif args.suite == "modernize-fast":
         test_modernize_fast(compiler)
-    elif args.suite == "scheme":
-        execute(sys.executable, "scripts/scheme-progress.py", "--compiler", compiler)
 
 
 def _test_modernize_fast_serial(compiler: str) -> None:
@@ -858,12 +856,7 @@ def benchmark(args: argparse.Namespace) -> None:
 
 
 def example(args: argparse.Namespace) -> None:
-    if args.name == "mini-scheme":
-        output = ROOT / "build/examples/mini-scheme"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        execute(args.compiler, "build", "src/apps/mini-scheme/scheme.coil", "-o", str(output))
-        print(f"built {output}")
-    elif args.name == "freestanding":
+    if args.name == "freestanding":
         program = args.program
         build_dir = ROOT / "build/examples/freestanding"
         build_dir.mkdir(parents=True, exist_ok=True)
@@ -974,7 +967,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "http", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "modernize-fast", "scheme"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "http", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "modernize-fast"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.set_defaults(func=test)
@@ -1003,7 +996,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=benchmark)
 
     command = commands.add_parser("example", help="build an example application")
-    command.add_argument("name", choices=("mini-scheme", "freestanding", "freestanding-riscv32", "esp32c3"))
+    command.add_argument("name", choices=("freestanding", "freestanding-riscv32", "esp32c3"))
     command.add_argument("program", nargs="?", default="hello")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--build-only", action="store_true")

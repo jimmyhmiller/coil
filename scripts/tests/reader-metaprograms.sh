@@ -55,18 +55,18 @@ esac
   || fail "ordinary Coil check parity"
 
 BF="$PWD/tests/read_metaprogram"
-hello=$("$COIL" run "$BF/hello.bf" --use coil.brainfuck) \
+hello=$("$COIL" run "$BF/hello.bf" --use reader.fixture.brainfuck) \
   || fail "Brainfuck hello run"
 [ "$hello" = "Hello World!" ] || fail "Brainfuck hello output: $hello"
-echoed=$(printf 'reader metaprogram\n' | "$COIL" run "$BF/echo.bf" --use coil.brainfuck) \
+echoed=$(printf 'reader metaprogram\n' | "$COIL" run "$BF/echo.bf" --use reader.fixture.brainfuck) \
   || fail "Brainfuck echo run"
 [ "$echoed" = "reader metaprogram" ] || fail "Brainfuck echo output: $echoed"
-"$COIL" run "$BF/pointer_underflow.bf" --use coil.brainfuck >/dev/null 2>&1
+"$COIL" run "$BF/pointer_underflow.bf" --use reader.fixture.brainfuck >/dev/null 2>&1
 [ $? = 3 ] || fail "Brainfuck pointer underflow exit status"
-"$COIL" run "$BF/pointer_overflow.bf" --use coil.brainfuck >/dev/null 2>&1
+"$COIL" run "$BF/pointer_overflow.bf" --use reader.fixture.brainfuck >/dev/null 2>&1
 [ $? = 2 ] || fail "Brainfuck pointer overflow exit status"
 for side in open close; do
-  diag=$("$COIL" check "$BF/unmatched_${side}.bf" --use coil.brainfuck 2>&1)
+  diag=$("$COIL" check "$BF/unmatched_${side}.bf" --use reader.fixture.brainfuck 2>&1)
   [ $? = 1 ] || fail "Brainfuck unmatched $side exit status"
   case "$diag" in
     *"brainfuck reader: unmatched"*) ;;
@@ -83,7 +83,7 @@ done
 "$COIL" run "$FIX/bf_collide_live.coil" --use reader.fixture.bf-collide >/dev/null 2>&1
 [ $? = 42 ] || fail "collision probe is not injecting — the acceptance check would be vacuous"
 
-collided=$("$COIL" run "$BF/hello.bf" --use coil.brainfuck --use reader.fixture.bf-collide) \
+collided=$("$COIL" run "$BF/hello.bf" --use reader.fixture.brainfuck --use reader.fixture.bf-collide) \
   || fail "Brainfuck run under colliding spellings"
 [ "$collided" = "Hello World!" ] \
   || fail "colliding cells/dp/cell changed the reader's binding graph: $collided"
@@ -91,7 +91,7 @@ collided=$("$COIL" run "$BF/hello.bf" --use coil.brainfuck --use reader.fixture.
 # Four thousand flat operations is enough to expose the historical quadratic
 # quasiquote suffix-splicing implementation while keeping the generated module
 # itself reasonable for the bounded gate.
-"$COIL" check "$BF/flat.bf" --use coil.brainfuck \
+"$COIL" check "$BF/flat.bf" --use reader.fixture.brainfuck \
   || fail "large flat Brainfuck source"
 
 mkdir -p "$T/prefix/bin" "$T/prefix/lib/coil" "$T/out"
@@ -103,8 +103,4 @@ cp "$FIX/raw_provider.coil" "$T/out/provider.coil"
 cp "$FIX/raw.answer" "$T/out/program.answer"
 (cd "$T/out" && COIL_STRICT_BUNDLE=1 "$T/prefix/bin/coil" check program.answer --use reader.fixture.raw) \
   || fail "strict installed bundle from outside the repository"
-cp "$BF/hello.bf" "$T/out/hello.bf"
-(cd "$T/out" && COIL_STRICT_BUNDLE=1 "$T/prefix/bin/coil" check hello.bf --use coil.brainfuck) \
-  || fail "Brainfuck provider in strict installed bundle from outside repository"
-
 echo "reader metaprograms: PASS"
