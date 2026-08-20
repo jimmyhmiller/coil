@@ -1,5 +1,10 @@
 # Staged metacompilation
 
+> The Scheme dialect this document uses as its guest language — every
+> `src/apps/scheme/…`, `coil.scheme.…`, and `tests/scheme/…` path below —
+> now lives in the **coil-experiments** repository. The `(stage MARKER …)`
+> protocol it describes is a Coil feature and is still here.
+
 Status: IMPLEMENTED on branch `staged-metacompilation` (2026-08-17), M1–M5.
 The generic `(stage MARKER …)` protocol, the code-opaque/syntax-object bridge,
 procedural `define-syntax` (datum-level, recursive, macro-defining-macros), and
