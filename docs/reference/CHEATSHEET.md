@@ -87,15 +87,16 @@ Clean operators are trait methods. `f64` deliberately has no `=` or `!=`; use
 
     (let [p (Point :x 10 :y 20)]
       (load (field p x)))                 ; field returns a place
-    (let [slot (alloc/stack Point)]
+    (let [(mut slot) (Point :x 0 :y 0)]
       (store! slot (Point :x 1 :y 2)))
     (let [item (Some 42)]
       (match item (Some [x] x) (None [] 0)))
 
 `(p Point)` parameters are immutable references, `(p (mut Point))` are mutable
 references, and `(p (ptr Point))` are raw pointers. Pass a mutable place as
-`(mut place)`. Allocation is explicit: `alloc/stack`, `alloc/heap`, and
-`alloc/static`; pair heap allocation with `primitive/free`.
+`(mut place)`. Use initialized mutable locals for frame storage and `alloc/box` or
+`alloc/box!` for initialized allocator-owned values. Explicit low-level static
+storage is `(primitive/alloc-static T)`.
 
 ## Modules, traits, tests, and FFI
 
@@ -118,7 +119,8 @@ references, and `(p (ptr Point))` are raw pointers. Pass a mutable place as
 
 - Imported files start with `(module name)`; imports name modules, not paths.
 - `main` returns an `i64` process exit code.
-- Never put `alloc/stack` in a long-running loop; allocation lasts to function exit.
+- Reserve `primitive/alloc-stack` for genuinely unsafe/uninitialized storage; it lasts
+  to function exit and must never be placed in a long-running loop.
 - `field` and `index` return places; read with `load`, write with `store!`.
 - Struct constructors require every named field exactly once.
 - `match` is exhaustive, and every `if` branch must have the same type.

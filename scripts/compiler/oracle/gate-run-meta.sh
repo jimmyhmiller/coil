@@ -311,6 +311,21 @@ grep -q "tmp__1" "$WORK/sug-target.coil" \
 rc=$?
 [ "$rc" = 42 ] || { echo "GATE FAIL: fixed program exited $rc, want 42 (the fix captured)"; fail=1; }
 
+# A semantic transform gives generated syntax a representative user span so
+# diagnostics and code-from-user? still work. That span is not editable source:
+# modernize may recognize the generated primitive form, but --fix must not replace
+# the transform call site with a rewrite of code that was never present there.
+cp tests/compiler/features/transform_generated_fix_target.coil "$WORK/generated-fix.coil"
+generated_before=$(cat "$WORK/generated-fix.coil")
+"$BIN" lint "$WORK/generated-fix.coil" --fix >"$WORK/generated-fix.out" 2>"$WORK/generated-fix.err"
+rc=$?
+[ "$rc" = 0 ] || { echo "GATE FAIL: generated-provenance lint exited $rc"; cat "$WORK/generated-fix.err"; fail=1; }
+generated_after=$(cat "$WORK/generated-fix.coil")
+[ "$generated_after" = "$generated_before" ] \
+  || { echo "GATE FAIL: --fix edited a transform-generated node's representative source span"; fail=1; }
+"$BIN" check "$WORK/generated-fix.coil" >/dev/null 2>&1 \
+  || { echo "GATE FAIL: generated-provenance target no longer checks after lint --fix"; fail=1; }
+
 # ---- scoped resolver keys are internal --------------------------------------
 # The parser lowers binders/references to `$scope<N>@<module>$<name>` keys. Those
 # numbers are compilation-internal and name nothing the author can find, so no

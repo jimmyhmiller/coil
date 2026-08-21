@@ -328,9 +328,9 @@ Coil is unsafe by design — legitimate. The finding is that the design's own es
 - [x] **mem-2** — ✅ DONE. `(debug-allocator inner)` (bundled src/stdlib/dbgalloc.coil) — a macro that is
       `inner` when off; on, it detects double-free (located abort) and poisons freed memory to 0xDE
       (quarantine so detection is reliable). See DECISIONS.md #9.
-- [x] **mem-8 / diag-11** — ✅ DONE. A bundled `(checker …)` (src/stdlib/stacklint.coil) the driver
-      auto-applies under `--debug-checks` warns (like clang, non-fatal) when a user function returns
-      a pointer to a stack local. No false positives on heap/param returns. See DECISIONS.md #9.
+- [x] **mem-8 / diag-11** — ✅ SUPERSEDED. The public stack allocator and its dedicated checker were
+      removed by the allocator/storage redesign. The default modernization fixer now converts safe
+      initialized cases to mutable locals and marks genuinely low-level storage with the primitive API.
 - [x] Introduce the debug-checks build mode these all depend on. — ✅ DONE: `(debug-checks?)`, a
       comptime code op set from the driver, gating each library check inside a macro (zero-cost off).
 

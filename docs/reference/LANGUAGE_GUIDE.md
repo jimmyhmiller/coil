@@ -417,7 +417,7 @@ same concrete signature as if every parameter had been written by hand.
 implements `Callable` with the same pack:
 
     (import "coil.var" :use [Var var-new var-set!])
-    (let [slot (alloc/stack (Var (fnptr c [i64] i64)))]
+    (let [(mut slot) (Var (fnptr c [i64] i64))]
       (store! slot (var-new (primitive/fnptr-of old-code)))
       (let [v (load slot)] (v 10))
       (var-set! slot (primitive/fnptr-of new-code))
@@ -472,7 +472,7 @@ context; hex `0x1F`, binary `0b1010`, octal `0o17`, underscores `1_000`.
 converts int→float, `(primitive/cast (ptr T) x)` reinterprets pointers, `(primitive/cast i64 p)` is a
 pointer's address. ⚠ `cast` between f64 and i64 is a **numeric conversion, not a
 bit reinterpret**. For a bitcast (e.g. NaN-boxing) round-trip through memory:
-`(let [p (alloc/stack i64)] (primitive/store! p bits) (primitive/load (primitive/cast (ptr f64) p)))` — LLVM at
+`(let [(mut bits-place) bits] (primitive/load (primitive/cast (ptr f64) (mut bits-place))))` — LLVM at
 -O3 folds this to a register move.
 
 ## Control flow
@@ -616,23 +616,20 @@ fields and does not make new cases visible to the type checker.
 
 ## Pointers, memory, allocation
 
-Import the allocation API with `(import "coil.alloc" :as alloc)`. Its three
-allocation operations each yield `(ptr T)`:
-
-- `(alloc/stack T)` → `alloca`, this frame. ⚠ **NEVER call `alloc/stack` inside a
-  loop that runs many times** — alloca isn't freed until the function returns, so
-  it leaks the C stack per iteration and eventually segfaults. Hoist it into a
-  `let` outside the loop and reuse the slot.
-- `(alloc/static T)` → one global cell per call site (see Globals).
-- `(alloc/heap T)` → `malloc` (pair with `primitive/free`).
+Import the allocation API with `(import "coil.alloc" :as alloc)`. Use an initialized
+`(mut name)` local for ordinary frame storage. Use `alloc/box` (recoverable `Option`)
+or `alloc/box!` (diagnostic abort on exhaustion) for one initialized allocator-owned
+value. Raw `(primitive/alloc-stack T)` is only for genuinely uninitialized/unsafe
+storage such as an FFI output buffer. Low-level global cells may use
+`primitive/alloc-static`; hide them behind an accessor.
 
 Everyday memory and layout operations are aliases in ambient `coil.core`: `load`,
 `store!`, `field`, `index`, `cast`, `sizeof`, `alignof`, `offsetof`, `zeroed`,
 `fnptr-of`, and `call-ptr`. Their primitive declarations live only in
 `coil.primitive`; core does not redeclare them.
 
-Allocation is owned by `coil.alloc`, so use `alloc/stack`, `alloc/static`, or
-`alloc/heap`. All other raw operations are available only through `coil.primitive`,
+Allocator-owned storage is managed by `coil.alloc`. Raw storage operations are
+available only through `coil.primitive`,
 including unsigned `primitive/udiv`/`primitive/urem`, integer bit operations such as
 `primitive/ior` and `primitive/ishr`, and floating comparisons such as
 `primitive/fcmp-eq`. The modernization lint qualifies code written during the brief
@@ -647,18 +644,27 @@ period when those names were accidentally ambient.
 operators are how you compare them. Ordering makes range checks direct — e.g.
 `(and (>= p lo) (< p hi))` to test that `p` points inside a buffer.
 
-**Allocator API** (`alloc.coil`, thread a `(ptr Allocator)`):
+**Allocator API** (`alloc.coil`, thread a `(dyn Allocator)`):
 
     (malloc-allocator)                 ; stable global libc allocator
     (arena-allocator cap)              ; bump allocator
-    (create [T] a)                     ; -> (Option (ptr T))
-    (alloc-slice [T] a n)              ; -> (Option (ptr T)) array of n
-    (destroy [T] a p)                  ; free one T
-    (unwrap-ptr [T] optbox)            ; (Option (ptr T)) -> (ptr T), null on OOM
-    (raw-alloc a size align)           ; -> (Option (ptr i8))
-    (raw-resize a p oldsz newsz align) ; realloc
-    (raw-free a p size align)
-    ; idiom: (let [p (unwrap-ptr [T] (create [T] a))] (primitive/store! p …) p)
+    (alloc [T] a n)                    ; -> (Option (slice T))
+    (free [T] a memory)
+    (resize [T] a memory n)            ; fixed address only
+    (remap [T] a memory n)             ; may move; no copy fallback
+    (reallocate [T] a memory n)        ; remap or allocate/copy/free
+    (box a T value) / (box! a T value) ; initialized one-value storage
+    (destroy [T] a p)
+
+`Allocator` is object-safe: its raw methods mention the concrete `Self` only in the
+receiver, so implementations pass as borrowed, copyable `(dyn Allocator)` trait objects.
+They do not own or extend the implementation's lifetime. Every raw call carries an
+`AllocRequest` with `type-id`, logical `count`, actual `bytes`, and `align`. A TypeId is
+represented by that `i64` field: `type-id [T]` produces a process-local nonzero identity
+token (including for typed `u8`); only
+`bytes-request`/`alloc-bytes` use ID 0 for intentionally untyped bytes. IDs are policy
+and diagnostic data, not serializable values. Prefer the typed APIs, which construct and
+validate requests and preserve the request across free and growth.
 
 `coil.region` is a tracking allocator: it validates exact ownership and supports
 individual free/resize, while `region-close!` releases every remaining allocation.
@@ -672,14 +678,14 @@ For high-churn temporary memory, prefer the owned segmented allocator in
 and releases backing segments on reset or close:
 
     (import "coil.scratch" :as scratch)
-    (let [scope (alloc/stack scratch/ScratchArena)]
-      (scratch/scratch-init scope (malloc-allocator))
-      (let [a (scratch/scratch-allocator scope)
-            mark (scratch/scratch-mark scope)]
+    (let [(mut scope) (primitive/zeroed scratch/ScratchArena)]
+      (scratch/scratch-init (mut scope) (malloc-allocator))
+      (let [a (scratch/scratch-allocator (mut scope))
+            mark (scratch/scratch-mark (mut scope))]
         (temporary-work a)
-        (scratch/scratch-reset-to! scope mark)
+        (scratch/scratch-reset-to! (mut scope) mark)
         (more-temporary-work a))
-      (scratch/scratch-close! scope))
+      (scratch/scratch-close! (mut scope)))
 
 `scratch-reset!` releases every segment while keeping the arena usable;
 `scratch-close!` is idempotent and prevents later allocation. A mark belongs to one
@@ -687,7 +693,7 @@ arena and becomes invalid if an earlier reset has already released its segment.
 Pointers allocated after a mark must not be used after `scratch-reset-to!`.
 
 For Zig-style development allocation, `coil.dbgalloc` provides a stateful allocator
-that wraps any backing allocator while exposing the same ordinary `(ptr Allocator)`
+that wraps any backing allocator while exposing the same ordinary `(dyn Allocator)`
 interface:
 
     (import "coil.dbgalloc" :use *)
@@ -815,14 +821,15 @@ form, such as `:else` or an annotation key, retain their syntactic role.
 
 ## Global mutable state
 
-There is **no top-level mutable variable**. Use `alloc/static` inside a zero-arg
+There is **no top-level mutable variable**. Use explicit low-level
+`primitive/alloc-static` inside a zero-arg
 accessor — it returns the same global cell every call:
 
-    (defn counter [] (-> (ptr i64)) (alloc/static i64))
+    (defn counter [] (-> (ptr i64)) (primitive/alloc-static i64))
     (primitive/store! (counter) (+ (primitive/load (counter)) 1))
     ; for a global struct singleton (like a VM):
     (defstruct VM [(x i64) …])
-    (defn vm [] (-> (ptr VM)) (alloc/static VM))   ; (primitive/load (primitive/field (vm) x)) …
+    (defn vm [] (-> (ptr VM)) (primitive/alloc-static VM))   ; (primitive/load (primitive/field (vm) x)) …
 
 `(const NAME VALUE)` / `(const NAME TYPE VALUE)` — compile-time immutable bindings.
 The value is ANY expression, run at compile time: `(const OP_RETURN 0)`, `(const
@@ -1359,11 +1366,11 @@ wakes an otherwise idle transfer),
 `coil.jit` (optional source-linked in-process compiler/JIT), `coil.assert`
 (assert/deftest), `coil.prop` (property-based testing: `defprop`,
 the `Arbitrary` trait, tape-based shrinking — see above), `coil.dbgalloc`, `coil.guardalloc`, `coil.crash`,
-`coil.debug-runtime`, `coil.checked-ffi`, and `coil.stacklint`, plus `coil.os`,
+`coil.debug-runtime` and `coil.checked-ffi`, plus `coil.os`,
 `coil.time`, `coil.selectors`, `coil.subprocess`,
 `coil.process`, and the standard `coil.lint.default` safe-fix profile. Plain
 `coil lint` automatically loads `coil.modernize`, `coil.lint.match-else`,
 `coil.lint.result-flow`, and `coil.lint.named-constructor` through that profile;
-allocator-composition and stack checks remain opt-in policy/debug checks. The common
+allocator-composition checks remain opt-in policy/debug checks. The common
 ones are summarized above; import a module and call
 its functions directly.

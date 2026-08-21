@@ -1,6 +1,7 @@
 (module coil.region)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
+(import "coil.slice" :use [slice-data slice-new])
 
 (export Region
         RegionError
@@ -21,11 +22,10 @@
   [(next (ptr RegionNode))
    (previous (ptr RegionNode))
    (data (ptr i8))
-   (size i64)
-   (align i64)])
+   (request alloc/AllocRequest)])
 
 (defstruct Region
-  [(parent (ptr alloc/Allocator))
+  [(parent (dyn alloc/Allocator))
    (head (ptr RegionNode))
    ;; Open-addressing registry: exact user pointer -> RegionNode. Empty slots are
    ;; null. Removal uses backward-shift deletion, so lookup remains valid without
@@ -34,8 +34,13 @@
    (registry-cap i64)
    (registry-len i64)
    (ownership-probes i64)
-   (allocator alloc/Allocator)
    (closed bool)])
+
+(defn region-request-eq [(a alloc/AllocRequest) (b alloc/AllocRequest)] (-> bool)
+  (and (= (load (field a type-id)) (load (field b type-id)))
+       (and (= (load (field a count)) (load (field b count)))
+            (and (= (load (field a bytes)) (load (field b bytes)))
+                 (= (load (field a align)) (load (field b align)))))))
 
 (defn region-hash [(data (ptr i8))] (-> i64)
   ;; Allocation alignment leaves the low bits uninteresting. Mix the address before
@@ -97,26 +102,35 @@
              (< (primitive/imul (primitive/iadd (load (field region registry-len)) 1) 4)
                 (primitive/imul oldcap 3)))
         true
-        (match (alloc/alloc-slice [(ptr RegionNode)] (load (field region parent)) wanted)
+        (match (alloc/alloc-bytes (load (field region parent))
+                                  (primitive/imul wanted (primitive/sizeof (ptr RegionNode)))
+                                  (primitive/alignof (ptr RegionNode)))
           (None [] false)
-          (Some [slots]
+          (Some [storage]
                 (do
-                  (let [(mut i) 0]
-                    (loop (if (>= (load i) wanted)
-                              (break)
-                              (do
-                                (store! (primitive/index slots (load i))
-                                        (primitive/cast (ptr RegionNode) 0))
-                                (store! i (primitive/iadd (load i) 1))))))
-                  (region-registry-rehash! region slots wanted)
-                  (when (!= oldcap 0)
-                    (alloc/raw-free (load (field region parent))
-                                    (primitive/cast (ptr i8) (load (field region registry)))
-                                    (primitive/imul oldcap (primitive/sizeof (ptr RegionNode)))
-                                    (primitive/alignof (ptr RegionNode))))
-                  (store! (field region registry) slots)
-                  (store! (field region registry-cap) wanted)
-                  true))))))
+                  (let [slots
+                          (primitive/cast (ptr (ptr RegionNode))
+                                          (slice-data storage))]
+                    (do
+                      (let [(mut i) 0]
+                        (loop (if (>= (load i) wanted)
+                                  (break)
+                                  (do
+                                    (store! (primitive/index slots (load i))
+                                            (primitive/cast (ptr RegionNode) 0))
+                                    (store! i (primitive/iadd (load i) 1))))))
+                      (region-registry-rehash! region slots wanted)
+                      (when (!= oldcap 0)
+                        (alloc/raw-free (load (field region parent))
+                                        (primitive/cast (ptr i8) (load (field region registry)))
+                                        (alloc/AllocRequest
+                                          :type-id 0
+                                          :count (primitive/imul oldcap (primitive/sizeof (ptr RegionNode)))
+                                          :bytes (primitive/imul oldcap (primitive/sizeof (ptr RegionNode)))
+                                          :align (primitive/alignof (ptr RegionNode))))))
+                    (store! (field region registry) slots)
+                    (store! (field region registry-cap) wanted)
+                    true)))))))
 
 (defn region-registry-insert! [(region (ptr Region)) (node (ptr RegionNode))] (-> i64)
   (region-registry-insert-raw! (load (field region registry))
@@ -148,80 +162,80 @@
             (primitive/isub (load (field region registry-len)) 1))
     0))
 
-(defn dbg-region-parent-check [(parent Code)] (-> Code)
-  (if (primitive/debug-checks?)
-      `(if (= (primitive/cast i64
-                              (primitive/cast (ptr i8) (load (field ~parent free))))
-              (primitive/cast i64
-                              (primitive/cast (ptr i8) (primitive/fnptr-of region-free-hook))))
-           (do
-             (alloc/oom-puts c"coil: Region is backed by another Region allocator; use a root allocator or coil.scratch marks (--debug-checks)\n")
-             0)
-           0)
-      `0))
-
-(defn region-alloc-hook [(ctx (ptr i8)) (size i64) (align i64)] (-> (Option (ptr i8)))
-  (let [region (primitive/cast (ptr Region) ctx)]
-    (if (load (field region closed))
-        (None)
-        (if (not (region-registry-reserve-one! region))
-            (None)
-            (match (alloc/raw-alloc (load (field region parent)) size align)
-              (None [] (None))
-              (Some [data]
-                    (match (alloc/create [RegionNode] (load (field region parent)))
-                      (None []
-                            (do
-                              (alloc/raw-free (load (field region parent)) data size align)
-                              (None)))
-                      (Some [node]
-                            (do
-                              (store! (field node next) (load (field region head)))
-                              (store! (field node previous) (primitive/cast (ptr RegionNode) 0))
-                              (when (!= (primitive/cast i64 (load (field region head))) 0)
-                                (store! (field (load (field region head)) previous) node))
-                              (store! (field node data) data)
-                              (store! (field node size) size)
-                              (store! (field node align) align)
-                              (store! (field region head) node)
-                              (region-registry-insert! region node)
-                              (Some data))))))))))
-
-(defn region-resize-hook [(ctx (ptr i8))
-                          (data (ptr i8))
-                          (old i64)
-                          (new i64)
-                          (align i64)] (-> (Option (ptr i8)))
-  (let [region (primitive/cast (ptr Region) ctx)]
-    (if (load (field region closed))
-        (None)
-        ;; Allocator clients conventionally express their first allocation as a
-        ;; zero-size resize of null. There cannot be an owned node to find in that
-        ;; case, and scanning the region would make repeated collection creation
-        ;; quadratic in the number of live allocations.
-        (if (or (= old 0) (= data (primitive/cast (ptr i8) 0)))
-            (region-alloc-hook ctx new align)
-            (let [node (region-find region data)]
-              (if (= (primitive/cast i64 node) 0)
-                  (None)
-                  (if (or (!= old (load (field node size))) (!= align (load (field node align))))
-                      (None)
-                      (match (alloc/raw-resize (load (field region parent)) data old new align)
-                        (None [] (None))
-                        (Some [resized]
+(defn region-allocate [(region (ptr Region)) (request alloc/AllocRequest)] (-> (Option (ptr i8)))
+  (if (load (field region closed))
+      (None)
+      (if (not (region-registry-reserve-one! region))
+          (None)
+          (match (alloc/raw-alloc (load (field region parent)) request)
+            (None [] (None))
+            (Some [data]
+                  (match (alloc/alloc-bytes (load (field region parent))
+                                            (primitive/sizeof RegionNode)
+                                            (primitive/alignof RegionNode))
+                    (None []
+                          (do
+                            (alloc/raw-free (load (field region parent)) data request)
+                            (None)))
+                    (Some [node-storage]
+                          (do
+                            (let [node
+                                    (primitive/cast (ptr RegionNode)
+                                                    (slice-data node-storage))]
                               (do
-                                (when (!= resized data)
-                                  (region-registry-remove! region data))
-                                (store! (field node data) resized)
-                                (store! (field node size) new)
-                                (when (!= resized data)
-                                  (region-registry-insert! region node))
-                                (Some resized)))))))))))
+                                (store! (field node next) (load (field region head)))
+                                (store! (field node previous) (primitive/cast (ptr RegionNode) 0))
+                                (when (!= (primitive/cast i64 (load (field region head))) 0)
+                                  (store! (field (load (field region head)) previous) node))
+                                (store! (field node data) data)
+                                (store! (field node request) request)
+                                (store! (field region head) node)
+                                (region-registry-insert! region node)
+                                (Some data)))))))))))
 
-(defn region-free-hook [(ctx (ptr i8)) (data (ptr i8)) (size i64) (align i64)] (-> i64)
-  (let [region (primitive/cast (ptr Region) ctx)
-        node (region-find region data)]
-    (when (!= (primitive/cast i64 node) 0)
+(defn region-resize [(region (ptr Region))
+                     (data (ptr i8))
+                     (old alloc/AllocRequest)
+                     (new alloc/AllocRequest)] (-> bool)
+  (if (load (field region closed))
+      false
+      ;; Allocator clients conventionally express their first allocation as a
+      ;; zero-size resize of null. There cannot be an owned node to find in that
+      ;; case, and scanning the region would make repeated collection creation
+      ;; quadratic in the number of live allocations.
+      (let [node (region-find region data)]
+        (if (= (primitive/cast i64 node) 0)
+            false
+            (if (and (region-request-eq old (load (field node request)))
+                     (alloc/raw-resize (load (field region parent)) data old new))
+                (do (store! (field node request) new) true)
+                false)))))
+
+(defn region-remap [(region (ptr Region))
+                    (data (ptr i8))
+                    (old alloc/AllocRequest)
+                    (new alloc/AllocRequest)] (-> (Option (ptr i8)))
+  (if (load (field region closed))
+      (None)
+      (let [node (region-find region data)]
+        (if (= (primitive/cast i64 node) 0)
+            (None)
+            (if (not (region-request-eq old (load (field node request))))
+                (None)
+                (match (alloc/raw-remap (load (field region parent)) data old new)
+                  (None [] (None))
+                  (Some [resized]
+                        (do
+                          (when (!= resized data) (region-registry-remove! region data))
+                          (store! (field node data) resized)
+                          (store! (field node request) new)
+                          (when (!= resized data) (region-registry-insert! region node))
+                          (Some resized)))))))))
+
+(defn region-free [(region (ptr Region)) (data (ptr i8)) (request alloc/AllocRequest)] (-> i64)
+  (let [node (region-find region data)]
+    (when (and (!= (primitive/cast i64 node) 0)
+               (region-request-eq request (load (field node request))))
       (let [previous (load (field node previous))
             next (load (field node next))]
         (if (= (primitive/cast i64 previous) 0)
@@ -232,14 +246,30 @@
         (region-registry-remove! region data)
         (alloc/raw-free (load (field region parent))
                         data
-                        (load (field node size))
-                        (load (field node align)))
-        (alloc/destroy (load (field region parent)) node)))
+                        (load (field node request)))
+        (alloc/free-bytes (load (field region parent))
+                          (slice-new [u8]
+                                     (primitive/cast (ptr u8) node)
+                                     (primitive/sizeof RegionNode))
+                          (primitive/alignof RegionNode))))
     0))
 
+(impl alloc/Allocator Region
+  (allocate [(self (ptr Region)) (request (ref alloc/AllocRequest))]
+            (-> (Option (ptr i8)))
+            (region-allocate self request))
+  (resize [(self (ptr Region)) (memory (ptr i8)) (old (ref alloc/AllocRequest)) (new (ref alloc/AllocRequest))]
+          (-> bool)
+          (region-resize self memory old new))
+  (remap [(self (ptr Region)) (memory (ptr i8)) (old (ref alloc/AllocRequest)) (new (ref alloc/AllocRequest))]
+         (-> (Option (ptr i8)))
+         (region-remap self memory old new))
+  (deallocate [(self (ptr Region)) (memory (ptr i8)) (request (ref alloc/AllocRequest))]
+              (-> i64)
+              (region-free self memory request)))
+
 ;; Initialize caller-owned region storage.
-(defn region-init [(region (ptr Region)) (parent (ptr alloc/Allocator))] (-> (ptr Region))
-  (dbg-region-parent-check parent)
+(defn region-init [(region (ptr Region)) (parent (dyn alloc/Allocator))] (-> (ptr Region))
   (store! (field region parent) parent)
   (store! (field region head) (primitive/cast (ptr RegionNode) 0))
   (store! (field region registry) (primitive/cast (ptr (ptr RegionNode)) 0))
@@ -247,20 +277,16 @@
   (store! (field region registry-len) 0)
   (store! (field region ownership-probes) 0)
   (store! (field region closed) false)
-  (store! (field (field region allocator) alloc) (primitive/fnptr-of region-alloc-hook))
-  (store! (field (field region allocator) resize) (primitive/fnptr-of region-resize-hook))
-  (store! (field (field region allocator) free) (primitive/fnptr-of region-free-hook))
-  (store! (field (field region allocator) ctx) (primitive/cast (ptr i8) region))
   region)
 
 ;; Allocate the Region object from `parent`; its allocations still require close.
-(defn region-new [(parent (ptr alloc/Allocator))] (-> (Option (ptr Region)))
-  (match (alloc/create [Region] parent)
+(defn region-new [(parent (dyn alloc/Allocator))] (-> (Option (ptr Region)))
+  (match (alloc/alloc-bytes parent (primitive/sizeof Region) (primitive/alignof Region))
     (None [] (None))
-    (Some [region] (Some (region-init region parent)))))
+    (Some [storage] (Some (region-init (primitive/cast (ptr Region) (slice-data storage)) parent)))))
 
-(defn region-allocator [(region (ptr Region))] (-> (ptr alloc/Allocator))
-  (field region allocator))
+(defn region-allocator [(region (ptr Region))] (-> (dyn alloc/Allocator))
+  (primitive/make-dyn alloc/Allocator region))
 
 (defn region-closed? [(region (ptr Region))] (-> bool)
   (load (field region closed)))
@@ -280,17 +306,22 @@
                 (let [next (load (field (load node) next))]
                   (alloc/raw-free (load (field region parent))
                                   (load (field (load node) data))
-                                  (load (field (load node) size))
-                                  (load (field (load node) align)))
-                  (alloc/destroy (load (field region parent)) (load node))
+                                  (load (field (load node) request)))
+                  (alloc/free-bytes (load (field region parent))
+                                    (slice-new [u8]
+                                               (primitive/cast (ptr u8) (load node))
+                                               (primitive/sizeof RegionNode))
+                                    (primitive/alignof RegionNode))
                   (store! node next))))
       (store! (field region head) (primitive/cast (ptr RegionNode) 0))
       (when (!= (load (field region registry-cap)) 0)
         (alloc/raw-free (load (field region parent))
                         (primitive/cast (ptr i8) (load (field region registry)))
-                        (primitive/imul (load (field region registry-cap))
-                                        (primitive/sizeof (ptr RegionNode)))
-                        (primitive/alignof (ptr RegionNode))))
+                        (alloc/AllocRequest
+                          :type-id 0
+                          :count (primitive/imul (load (field region registry-cap)) (primitive/sizeof (ptr RegionNode)))
+                          :bytes (primitive/imul (load (field region registry-cap)) (primitive/sizeof (ptr RegionNode)))
+                          :align (primitive/alignof (ptr RegionNode)))))
       (store! (field region registry) (primitive/cast (ptr (ptr RegionNode)) 0))
       (store! (field region registry-cap) 0)
       (store! (field region registry-len) 0)

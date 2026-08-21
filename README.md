@@ -88,20 +88,20 @@ Pointers are ordinary, region-less machine pointers. Allocation is explicit and
 separate from pointer types:
 
 ```clojure
-(let [stack-value (alloc/stack i64)
-      heap-value  (alloc/heap i64)]
-  (primitive/store! stack-value 20)
-  (primitive/store! heap-value 22)
-  (let [answer (+ (primitive/load stack-value)
-                  (primitive/load heap-value))]
-    (primitive/free heap-value)
+(let [(mut stack-value) 20
+      allocator (alloc/malloc-allocator)
+      heap-value (alloc/box! allocator i64 22)]
+  (let [answer (+ (load stack-value) (load heap-value))]
+    (alloc/destroy [i64] allocator heap-value)
     answer))
 ```
 
 Memory can come from the stack, static storage, the heap, or an allocator passed
-as a value. The standard library includes malloc-backed and arena allocators.
-Allocator interfaces are explicit, alignment-aware, and report allocation
-failure with sum types.
+as a `(dyn alloc/Allocator)` value. Initialized mutable locals are normal frame
+storage; `alloc/box`/`alloc/box!` provide initialized allocator-owned storage. The
+standard library includes malloc-backed and arena allocators. Requests carry a
+type identity, element count, byte size, and alignment, and allocation failure is
+reported with sum types.
 
 Coil also has lightweight immutable and mutable references for const-correct APIs.
 They control whether a handle may write, but do not impose ownership, lifetime,

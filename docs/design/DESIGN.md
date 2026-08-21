@@ -339,7 +339,7 @@ Design decisions (chosen, not defaulted):
   `resize(ptr,old,new,align)`, `free(ptr,len,align)` — enough for bump/pool
   allocators to align and reclaim precisely.
 - **Typed generic layer over the byte vtable** (using monomorphization +
-  inference): `(create [T] a)`, `(alloc-slice [T] a n)`, `(destroy a p)` (with
+  inference): `(box a T value)`, `(alloc [T] a n)`, `(destroy [T] a p)` (with
   `T` inferred from the pointer), each sizing/aligning itself via
   `sizeof`/`alignof`.
 - **Capabilities compose.** The same `Writer` formats to a file descriptor, a

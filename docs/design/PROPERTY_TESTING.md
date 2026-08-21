@@ -722,7 +722,7 @@ it turns out not to need one, because two pieces already exist:
    compiler. Verified: instrumented, linked, ran.
 2. **The SanitizerCoverage callbacks can be written in Coil.** `(export-c
    [cov-guard :as "__sanitizer_cov_trace_pc_guard"])` and its `_init` sibling are
-   ordinary Coil functions over an `alloc/static` bitmap. That means an ORDINARY
+   ordinary Coil functions over a `primitive/alloc-static` bitmap. That means an ORDINARY
    build still links — the symbols exist, nothing calls them, coverage queries
    return zero — and only the instrumented build has real edges. No C file, no
    weak symbols, no conditional compilation. Exclude them from instrumentation

@@ -118,7 +118,7 @@ An explicit form would also be sufficient:
   :align (c-alignof "pthread_mutex_t"))
 ```
 
-The important property is that `(alloc/stack pthread_mutex_t)` and allocator-backed
+The important property is that an unsafe `(primitive/alloc-stack pthread_mutex_t)` and allocator-backed
 storage become target-correct without a guessed byte count.
 
 ## System constants and record layouts

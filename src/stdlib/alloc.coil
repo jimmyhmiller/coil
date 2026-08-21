@@ -1,28 +1,15 @@
 (module coil.alloc)
 (import "coil.primitive" :as primitive)
 
-; Public allocation operations retain the primitive definitions' identity. These are
-; aliases, not wrapper functions; stack allocation therefore occurs in the caller.
-(def stack primitive/alloc-stack)
-(def static primitive/alloc-static)
-(def heap primitive/alloc-heap)
-
-; Zig-style allocators: an allocator is a VALUE (a vtable struct) threaded
-; explicitly. There is no ambient heap -- a function that allocates *takes* an
-; Allocator, so allocation is visible in its type. Built entirely in Coil; the
-; compiler has no allocator concept.
-;
-; The vtable is alignment-aware and carries the size+alignment back to `free`
-; (so bump/pool allocators can reclaim precisely), mirroring Zig's interface:
-;   alloc  (ctx, len, align)            -> (Option bytes)   None = out of memory
-;   resize (ctx, ptr, old, new, align)  -> (Option bytes)   None = couldn't grow
-;   free   (ctx, ptr, len, align)       -> _
-; Failure is a sum type (Option), never a null sentinel.
+; Allocators are ordinary trait objects. `(dyn Allocator)` is a borrowed, copyable
+; pair of pointers (implementation + compiler-generated vtable); it does not own or
+; extend the lifetime of the implementation. Allocation failure is always explicit.
 
 (import "coil.result" :use *)  ; Option/Result/Some/None/Ok/Err, brought in bare
 
 (extern malloc :cc c [isize] (-> (ptr i8)))  ; void* malloc(size_t)
 (extern realloc :cc c [(ptr i8) isize] (-> (ptr i8)))  ; void* realloc(void*, size_t)
+(extern posix_memalign :cc c [(ptr (ptr i8)) isize isize] (-> i32))
 (extern abort :cc c [] (-> :i64))  ; void abort() — unrecoverable hard-fail
 
 ; ---- reporting an unrecoverable allocation failure -------------------------
@@ -94,229 +81,323 @@
 (defn oom [] (-> :i64)
   (oom-at c"an allocation" -1))
 
-(defstruct Allocator
-  [(alloc (fnptr c [(ptr i8) :i64 :i64] (Option (ptr i8))))
-   (resize (fnptr c [(ptr i8) (ptr i8) :i64 :i64 :i64] (Option (ptr i8))))
-   (free (fnptr c [(ptr i8) (ptr i8) :i64 :i64] :i64))
-   (ctx (ptr i8))])
+(defstruct AllocRequest
+  [(type-id i64)   ; 0 is intentionally untyped bytes
+   (count i64)     ; logical element count
+   (bytes i64)     ; actual storage size
+   (align i64)])
 
-;; Validate the part of an allocator vtable that can be inspected portably before
-;; dereferencing it. Function slots are validated by `call-ptr` itself in debug
-;; builds, so this guard catches a null/misaligned vtable and malformed request
-;; metadata without relying on LLVM-only pointer instructions.
-(defn dbg-allocator-check [(a Code) (size Code) (align Code) (site Code)] (-> Code)
-  (if (primitive/debug-checks?)
-      `(let [addr (primitive/cast i64 ~a)]
-         (if (or (= addr 0)
-                 (or (!= (primitive/iand addr 7) 0)
-                     (or (< ~size 0)
-                         (or (<= ~align 0)
-                             (!= (primitive/iand ~align (primitive/isub ~align 1)) 0)))))
-             (do (debug-fail-at ~site) 0)
-             0))
-      `0))
+;; The raw contract is deliberately object-safe: only the receiver mentions `Self`.
+;; `resize` may change the size only when the address stays fixed; `remap` may move it.
+(deftrait Allocator [Self]
+  ; Aggregate arguments are references so the concrete impl function and erased
+  ; vtable function have the same ABI. Callers still pass AllocRequest values.
+  (allocate [(self (ptr Self)) (request (ref AllocRequest))] (-> (Option (ptr i8))))
+  (resize [(self (ptr Self)) (memory (ptr i8)) (old (ref AllocRequest)) (new (ref AllocRequest))] (-> bool))
+  (remap [(self (ptr Self)) (memory (ptr i8)) (old (ref AllocRequest)) (new (ref AllocRequest))] (-> (Option (ptr i8))))
+  (deallocate [(self (ptr Self)) (memory (ptr i8)) (request (ref AllocRequest))] (-> i64)))
 
-; ---- raw, byte-level interface --------------------------------------------
-(defn raw-alloc [(a (ptr Allocator)) (size :i64) (align :i64)] (-> (Option (ptr i8)))
-  (dbg-allocator-check a size align c"invalid allocator vtable or allocation request in raw-alloc")
-  (primitive/call-ptr (load (field a alloc)) (load (field a ctx)) size align))
-(defn raw-resize [(a (ptr Allocator)) (p (ptr i8)) (old :i64) (new :i64) (align :i64)] (-> (Option (ptr i8)))
-  (dbg-allocator-check a old align c"invalid allocator vtable or allocation request in raw-resize")
-  (dbg-allocator-check a new align c"invalid allocator vtable or allocation request in raw-resize")
-  (primitive/call-ptr (load (field a resize))
-                      (load (field a ctx))
-                      p
-                      old
-                      new
-                      align))
-(defn raw-free [(a (ptr Allocator)) (p (ptr i8)) (size :i64) (align :i64)] (-> :i64)
-  (dbg-allocator-check a size align c"invalid allocator vtable or allocation request in raw-free")
-  (primitive/call-ptr (load (field a free)) (load (field a ctx)) p size align))
+(defn valid-request? [(r AllocRequest)] (-> bool)
+  ; Type IDs are process-local pointer tokens represented as i64, so the sign bit
+  ; is not a validity condition. Zero is valid and deliberately means raw bytes.
+  (and (> (load (field r count)) 0)
+       (and (> (load (field r bytes)) 0)
+            (and (> (load (field r align)) 0)
+                 (= (primitive/iand (load (field r align))
+                                    (primitive/isub (load (field r align)) 1))
+                    0)))))
 
-; ---- typed interface (generic; sizes/aligns itself with sizeof/alignof) ----
-;; `create` and `alloc-slice` take T explicitly (it appears only in the result);
-;; `destroy` infers T from its pointer argument.
-(defn create [T] [(a (ptr Allocator))] (-> (Option (ptr T)))
-  (match (raw-alloc a (primitive/sizeof T) (primitive/alignof T))
-    (None [] (None))
-    (Some [p] (Some (primitive/cast (ptr T) p)))))
+(defn raw-alloc [(a (dyn Allocator)) (request AllocRequest)] (-> (Option (ptr i8)))
+  (if (valid-request? request) (allocate a request) (None)))
+(defn raw-resize [(a (dyn Allocator)) (memory (ptr i8)) (old AllocRequest) (new AllocRequest)] (-> bool)
+  (if (and (valid-request? old) (valid-request? new))
+      (resize a memory old new)
+      false))
+(defn raw-remap [(a (dyn Allocator)) (memory (ptr i8)) (old AllocRequest) (new AllocRequest)] (-> (Option (ptr i8)))
+  (if (and (valid-request? old) (valid-request? new))
+      (remap a memory old new)
+      (None)))
+(defn raw-free [(a (dyn Allocator)) (memory (ptr i8)) (request AllocRequest)] (-> i64)
+  (if (valid-request? request) (deallocate a memory request) 0))
 
-(defn alloc-slice [T] [(a (ptr Allocator)) (n :i64)] (-> (Option (ptr T)))
-  (match (raw-alloc a (primitive/imul n (primitive/sizeof T)) (primitive/alignof T))
-    (None [] (None))
-    (Some [p] (Some (primitive/cast (ptr T) p)))))
+;; Each `request` specialization owns one static byte. Its address is stable and
+;; unique for the life of the process, making it a process-local identity for T.
+;; IDs are for diagnostics and allocator policy only; they must never be serialized.
+(defn request [T] [(count i64)] (-> (Option AllocRequest))
+  (let [size (primitive/sizeof T)]
+    (if (or (<= count 0)
+            (or (<= size 0) (> count (primitive/idiv 9223372036854775807 size))))
+        (None)
+        (Some (AllocRequest :type-id (primitive/cast i64 (primitive/alloc-static i8))
+                            :count count
+                            :bytes (primitive/imul count size)
+                            :align (primitive/alignof T))))))
 
-(defn destroy [T] [(a (ptr Allocator)) (p (ptr T))] (-> :i64)
-  (raw-free a (primitive/cast (ptr i8) p) (primitive/sizeof T) (primitive/alignof T)))
+(defn type-id [T] [] (-> i64)
+  ; Ask the canonical request specialization rather than minting a second token.
+  (match (request [T] 1)
+    (Some [r]
+      (let [(mut request) r]
+        (.type-id request)))
+    ; Zero-sized types never produce an allocation request, but they still have a
+    ; useful nonzero identity for reflection and diagnostics.
+    (None [] (primitive/cast i64 (primitive/alloc-static i8)))))
 
-;; `.?`-style escape hatch: take the pointer, or null on failure (Coil doesn't
-;; promise memory safety, so this is a legitimate, Zig-like convenience).
-(defn unwrap-ptr [T] [(o (Option (ptr T)))] (-> (ptr T))
-  (match o (None [] (primitive/cast (ptr T) 0)) (Some [p] p)))
-
-;; `(box A T VAL)` — heap-allocate a T from allocator A, store VAL into it, and
-;; yield the `(ptr T)`. Removes the create + unwrap-ptr + store! dance for the
-;; common "put one value on the heap" case (e.g. a recursive sum's child node).
-;; Returns a null pointer on OOM (via unwrap-ptr — descriptive, not safe).
-(defn box [(a Code) (ty Code) (val Code)] (-> Code)
-  (let [bp (primitive/fresh-identifier "temporary")]
-    `(let [~bp (unwrap-ptr [~ty] (create [~ty] ~a))]
-       (store! ~bp ~val)
-       ~bp)))
-
-; ---- a malloc-backed general-purpose allocator ----
-;; malloc/realloc guarantee alignment up to max_align_t (16 on x86-64), which
-;; covers every scalar and pointer; over-aligned requests aren't honored here.
-(defn ma-alloc [(ctx (ptr i8)) (size :i64) (align :i64)] (-> (Option (ptr i8)))
-  (let [p (malloc (primitive/cast isize size))]
-    (if (= (primitive/cast :i64 p) (cast i64 0)) (None) (Some p))))
-(defn ma-resize [(ctx (ptr i8)) (p (ptr i8)) (old :i64) (new :i64) (align :i64)] (-> (Option (ptr i8)))
-  (let [q (realloc p (primitive/cast isize new))]
-    (if (= (primitive/cast :i64 q) (cast i64 0)) (None) (Some q))))
-(defn ma-free [(ctx (ptr i8)) (p (ptr i8)) (size :i64) (align :i64)] (-> :i64)
-  (primitive/free p))
-(defn malloc-allocator [] (-> (ptr Allocator))
-  (let [a (primitive/alloc-static Allocator)]
-    (store! (field a alloc) (primitive/fnptr-of ma-alloc))
-    (store! (field a resize) (primitive/fnptr-of ma-resize))
-    (store! (field a free) (primitive/fnptr-of ma-free))
-    (store! (field a ctx) (primitive/cast (ptr i8) a))
-    a))
-
-; ---- an arena (bump) allocator: alloc bumps a pointer (rounded up to the
-;;      requested alignment), per-alloc free is a no-op, everything is reclaimed
-;;      at once by freeing the backing block ----
-(defstruct Arena [(base (ptr i8)) (off :i64) (cap :i64)])
-(defn align-up [(x :i64) (a :i64)] (-> :i64)
-  (primitive/imul (primitive/idiv (primitive/iadd x (primitive/isub a 1)) a) a))
-(defn ar-alloc [(ctx (ptr i8)) (size :i64) (align :i64)] (-> (Option (ptr i8)))
-  (let [ar (primitive/cast (ptr Arena) ctx)
-        o (align-up (load (field ar off)) align)]
-    (if (> (primitive/iadd o size) (load (field ar cap)))
-        (None)  ; arena exhausted
-        (do
-          (store! (field ar off) (primitive/iadd o size))
-          (Some (primitive/index (load (field ar base)) o))))))  ; base + o
-;; The standard bump-allocator in-place path: a block whose end is exactly the bump
-;; pointer is the MOST RECENT allocation, so it can grow (or shrink) by moving `off` and
-;; nothing else. Any other block has live allocations stacked on top of it and genuinely
-;; cannot grow — `(None)`, and the caller copies.
-;;
-;; This is not an optimisation, it is what makes growable collections usable on an arena
-;; at all. Without it `al-reserve!` always takes its allocate-new-and-copy fallback and
-;; `ar-free` is a no-op, so an ArrayList doubling to n strands 4+8+16+…+n ≈ 2n bytes it
-;; can never reuse: append-heavy growth is quadratic in SPACE. With it, a list that is
-;; the arena's top allocation grows by pure pointer bump.
-(defn ar-resize [(ctx (ptr i8)) (p (ptr i8)) (old :i64) (new :i64) (align :i64)] (-> (Option (ptr i8)))
-  (let [ar (primitive/cast (ptr Arena) ctx)
-        start (primitive/isub (primitive/cast :i64 p) (primitive/cast :i64 (load (field ar base))))]
-    ; `p` must be one of OUR blocks before its address is interpreted as an offset. A
-    ; strict arena only ever hands out its own, but `p` is also NULL for a collection
-    ; that has not allocated yet, and the overflow flavour below passes malloc blocks
-    ; through here — both must miss, not land on a bogus `start`.
-    (if (and (>= start (cast i64 0)) (< start (load (field ar cap))))
-        (if (= (primitive/iadd start old) (load (field ar off)))
-            (if (> (primitive/iadd start new) (load (field ar cap)))
-                (None)  ; would run past the end of the arena
-                (do
-                  (store! (field ar off) (primitive/iadd start new))
-                  (Some p)))
-            (None))  ; not the top block — cannot grow
-        (None))))  ; not ours at all
-(defn ar-free [(ctx (ptr i8)) (p (ptr i8)) (size :i64) (align :i64)] (-> :i64)
-  0)  ; bulk-freed
-
-; ---- an arena that OVERFLOWS to malloc instead of failing --------------------
-;; A bump allocator is the right shape for a compiler's root allocator — nearly nothing
-;; is individually freed — but a FIXED region is the wrong contract for one: a capacity
-;; cliff turns "this input is bigger than I guessed" into a hard abort. Measured on the
-;; REPL, which reuses one allocator across every evaluation and retains ~17 MiB per eval
-;; (that retention is not new — the malloc-backed build grows identically): a 4 GiB
-;; strict arena aborts at roughly 240 evaluations, where malloc simply keeps going.
-;;
-;; So this flavour bumps while the region lasts and falls back to malloc afterwards. It
-;; is strictly better than either half: the fast path stays a pointer increment, and the
-;; worst case degrades to exactly the malloc behaviour it replaced rather than dying.
-;;
-;; It is a SEPARATE vtable rather than a flag on `Arena` deliberately. `arena-over-buffer`
-;; must stay reachable from freestanding code, and a branch to `malloc` on the live path
-;; keeps the symbol referenced even when it can never be taken — `--gc-sections` can only
-;; drop what nothing mentions. Distinct hooks keep the bare-metal arena genuinely libc-free.
-(defn ar-in-block? [(ctx (ptr i8)) (p (ptr i8))] (-> bool)
-  (let [ar (primitive/cast (ptr Arena) ctx)
-        d (primitive/isub (primitive/cast :i64 p) (primitive/cast :i64 (load (field ar base))))]
-    (and (>= d (cast i64 0)) (< d (load (field ar cap))))))
-
-(defn aro-alloc [(ctx (ptr i8)) (size :i64) (align :i64)] (-> (Option (ptr i8)))
-  (match (ar-alloc ctx size align)
-    (Some [p] (Some p))
-    (None [] (ma-alloc ctx size align))))  ; region full — malloc it (ctx unused)
-
-(defn aro-resize [(ctx (ptr i8)) (p (ptr i8)) (old :i64) (new :i64) (align :i64)] (-> (Option (ptr i8)))
-  ; A null `p` is a collection's first growth, not a block to resize. Answering it with
-  ; `realloc(NULL, n)` would silently route EVERY list's initial buffer to malloc and
-  ; leave the arena unused for exactly the allocations it exists to serve; `(None)` sends
-  ; the caller to `alloc-slice`, which bumps.
-  (if (= (primitive/cast :i64 p) (cast i64 0))
+(defn bytes-request [(count i64) (align i64)] (-> (Option AllocRequest))
+  (if (or (<= count 0)
+          (or (<= align 0) (!= (primitive/iand align (primitive/isub align 1)) 0)))
       (None)
-      (if (ar-in-block? ctx p)
-          (ar-resize ctx p old new align)
-          (ma-resize ctx p old new align))))
+      (Some (AllocRequest :type-id 0 :count count :bytes count :align align))))
 
-(defn aro-free [(ctx (ptr i8)) (p (ptr i8)) (size :i64) (align :i64)] (-> :i64)
-  (if (ar-in-block? ctx p) 0 (ma-free ctx p size align)))  ; overflow blocks are real
-;; Build an arena over a caller-provided buffer — no malloc, so it works
-;; FREESTANDING (the buffer can be an `alloc-static` array in .bss). The malloc-backed
-;; `arena-allocator` below is the convenience wrapper; this is the primitive.
-;; The caller owns the Arena and Allocator cells. This used to build both with
-;; `alloc-static`, which gives ONE cell per CALL SITE — not per call — so every arena in
-;; the program shared one Arena: a second `arena-allocator` silently reset the first and
-;; orphaned its buffer, and a scratch arena inside a helper stomped its caller's. Instance
-;; state can never come from a static. (`alloc-static` at the CALLER's own site is the
-;; correct use: one static per arena the caller actually writes. `malloc-allocator` below
-;; keeps its static legitimately — it is a genuine singleton.)
-(defn arena-over-buffer [(ar (ptr Arena)) (a (ptr Allocator)) (buf (ptr i8)) (cap :i64)] (-> (ptr Allocator))
+; `coil.slice` imports this module, so these private constructors avoid an import cycle.
+(defn alloc-slice-new [T] [(data (ptr T)) (len i64)] (-> (slice T))
+  (primitive/llvm-ir (slice T) [data len]
+                     "%s0 = insertvalue $ret undef, $t0 $0, 0\n%s1 = insertvalue $ret %s0, $t1 $1, 1\nret $ret %s1"))
+(defn alloc-slice-data [T] [(s (slice T))] (-> (ptr T))
+  (primitive/llvm-ir (ptr T) [s] "%d = extractvalue $t0 $0, 0\nret $ret %d"))
+(defn alloc-slice-len [T] [(s (slice T))] (-> i64)
+  (primitive/llvm-ir i64 [s] "%l = extractvalue $t0 $0, 1\nret $ret %l"))
+
+;; Typed allocation is the default API. Even `[u8]` has a real type ID; only the
+;; explicitly byte-oriented API below sends ID 0.
+(defn alloc [T] [(a (dyn Allocator)) (count i64)] (-> (Option (slice T)))
+  (if (= count 0)
+      (Some (alloc-slice-new (primitive/cast (ptr T) 0) 0))
+      (match (request [T] count)
+        (None [] (None))
+        (Some [r]
+          (match (raw-alloc a r)
+            (None [] (None))
+            (Some [p] (Some (alloc-slice-new (primitive/cast (ptr T) p) count))))))))
+
+(defn alloc-bytes [(a (dyn Allocator)) (count i64) (align i64)] (-> (Option (slice u8)))
+  (if (= count 0)
+      (Some (alloc-slice-new (primitive/cast (ptr u8) 0) 0))
+      (match (bytes-request count align)
+        (None [] (None))
+        (Some [r]
+          (match (raw-alloc a r)
+            (None [] (None))
+            (Some [p] (Some (alloc-slice-new (primitive/cast (ptr u8) p) count))))))))
+
+; Migration-only compatibility for the old create + unwrap-ptr spelling. Keeping
+; these two tiny adapters lets `coil lint --fix` type-check legacy source and replace
+; the full allocate/store sequence with `box!`; new code should use `alloc` or `box`.
+(defn create [T] [(a (dyn Allocator))] (-> (Option (ptr T)))
+  (match (alloc [T] a 1)
+    (None [] (None [(ptr T)]))
+    (Some [memory] (Some (alloc-slice-data memory)))))
+
+(defn unwrap-ptr [T] [(value (Option (ptr T)))] (-> (ptr T))
+  (match value
+    (None [] (primitive/cast (ptr T) 0))
+    (Some [p] p)))
+
+(defn free [T] [(a (dyn Allocator)) (memory (slice T))] (-> i64)
+  (let [n (alloc-slice-len memory)]
+    (if (= n 0)
+        0
+        (match (request [T] n)
+          (None [] 0)
+          (Some [r] (raw-free a (primitive/cast (ptr i8) (alloc-slice-data memory)) r))))))
+
+(defn free-bytes [(a (dyn Allocator)) (memory (slice u8)) (align i64)] (-> i64)
+  (let [n (alloc-slice-len memory)]
+    (if (= n 0)
+        0
+        (match (bytes-request n align)
+          (None [] 0)
+          (Some [r] (raw-free a (primitive/cast (ptr i8) (alloc-slice-data memory)) r))))))
+
+(defn resize [T] [(a (dyn Allocator)) (memory (slice T)) (new-count i64)] (-> (Option (slice T)))
+  (let [old-count (alloc-slice-len memory)]
+    (if (= new-count 0)
+        (do (free [T] a memory) (Some (alloc-slice-new (primitive/cast (ptr T) 0) 0)))
+        (if (= old-count 0)
+            (alloc [T] a new-count)
+            (match (request [T] old-count)
+              (None [] (None))
+              (Some [old]
+                (match (request [T] new-count)
+                  (None [] (None))
+                  (Some [new]
+                    (if (raw-resize a (primitive/cast (ptr i8) (alloc-slice-data memory)) old new)
+                        (Some (alloc-slice-new (alloc-slice-data memory) new-count))
+                        (None))))))))))
+
+(defn remap [T] [(a (dyn Allocator)) (memory (slice T)) (new-count i64)] (-> (Option (slice T)))
+  (let [old-count (alloc-slice-len memory)]
+    (if (= new-count 0)
+        (do (free [T] a memory) (Some (alloc-slice-new (primitive/cast (ptr T) 0) 0)))
+        (if (= old-count 0)
+            (alloc [T] a new-count)
+            (match (request [T] old-count)
+              (None [] (None))
+              (Some [old]
+                (match (request [T] new-count)
+                  (None [] (None))
+                  (Some [new]
+                    (match (raw-remap a (primitive/cast (ptr i8) (alloc-slice-data memory)) old new)
+                      (None [] (None))
+                      (Some [p] (Some (alloc-slice-new (primitive/cast (ptr T) p) new-count))))))))))))
+
+;; Guaranteed-growth convenience: remap when possible, otherwise allocate, copy, free.
+(defn reallocate [T] [(a (dyn Allocator)) (memory (slice T)) (new-count i64)] (-> (Option (slice T)))
+  (match (remap [T] a memory new-count)
+    (Some [m] (Some m))
+    (None []
+      (match (alloc [T] a new-count)
+        (None [] (None))
+        (Some [next]
+          (do
+            (let [(mut i) 0
+                  n (if (< (alloc-slice-len memory) new-count)
+                        (alloc-slice-len memory)
+                        new-count)]
+              (loop (if (>= (load i) n)
+                        (break)
+                        (do (store! (primitive/index (alloc-slice-data next) (load i))
+                                    (load (primitive/index (alloc-slice-data memory) (load i))))
+                            (store! i (primitive/iadd (load i) 1))))))
+            (free [T] a memory)
+            (Some next)))))))
+
+;; Allocate and initialize one value. `box!` is the intentional hard-fail spelling
+;; used by code paths that cannot recover from OOM.
+(defn box [(a Code) (ty Code) (value Code)] (-> Code)
+  (let [memory (primitive/fresh-identifier "memory")
+        pointer (primitive/fresh-identifier "pointer")]
+    `(match (alloc [~ty] ~a 1)
+       (None [] (None [(ptr ~ty)]))
+       (Some [~memory]
+         (let [~pointer (alloc-slice-data ~memory)]
+           (store! ~pointer ~value)
+           (Some ~pointer))))))
+
+(defn box-oom [T] [] (-> (ptr T))
+  (oom-at c"box!" (primitive/sizeof T))
+  (primitive/cast (ptr T) 0))
+
+(defn box! [(a Code) (ty Code) (value Code)] (-> Code)
+  (let [result (primitive/fresh-identifier "result")]
+    `(match (box ~a ~ty ~value)
+       (None [] (box-oom [~ty]))
+       (Some [~result] ~result))))
+
+(defn destroy [T] [(a (dyn Allocator)) (p (ptr T))] (-> i64)
+  (free [T] a (alloc-slice-new p 1)))
+
+; ---- malloc-backed general-purpose allocator ------------------------------
+(defstruct MallocAllocator [(marker i8)])
+
+(defn malloc-allocate [(request AllocRequest)] (-> (Option (ptr i8)))
+  (let [align (load (field request align))
+        bytes (load (field request bytes))]
+    (if (<= align 16)
+        (let [p (malloc (primitive/cast isize bytes))]
+          (if (= (primitive/cast i64 p) 0) (None) (Some p)))
+        (let [(mut p) (primitive/cast (ptr i8) 0)]
+          (if (= (posix_memalign (mut p) (primitive/cast isize align) (primitive/cast isize bytes)) 0)
+              (Some (load p))
+              (None))))))
+
+(impl Allocator MallocAllocator
+  (allocate [(self (ptr MallocAllocator)) (request (ref AllocRequest))] (-> (Option (ptr i8)))
+    (malloc-allocate request))
+  (resize [(self (ptr MallocAllocator)) (memory (ptr i8)) (old (ref AllocRequest)) (new (ref AllocRequest))] (-> bool)
+    false)
+  (remap [(self (ptr MallocAllocator)) (memory (ptr i8)) (old (ref AllocRequest)) (new (ref AllocRequest))] (-> (Option (ptr i8)))
+    (if (> (load (field new align)) 16)
+        (None)
+        (let [p (realloc memory (primitive/cast isize (load (field new bytes))))]
+          (if (= (primitive/cast i64 p) 0) (None) (Some p)))))
+  (deallocate [(self (ptr MallocAllocator)) (memory (ptr i8)) (request (ref AllocRequest))] (-> i64)
+    (primitive/free memory)))
+
+(defn malloc-allocator [] (-> (dyn Allocator))
+  (let [a (primitive/alloc-static MallocAllocator)]
+    (primitive/make-dyn Allocator a)))
+
+; ---- strict bump arena -----------------------------------------------------
+(defstruct Arena [(base (ptr i8)) (off i64) (cap i64)])
+(defn align-up [(x i64) (a i64)] (-> i64)
+  (primitive/imul (primitive/idiv (primitive/iadd x (primitive/isub a 1)) a) a))
+(defn arena-allocate [(ar (ptr Arena)) (request AllocRequest)] (-> (Option (ptr i8)))
+  (let [o (align-up (load (field ar off)) (load (field request align)))
+        n (load (field request bytes))]
+    (if (or (> o (load (field ar cap))) (> n (primitive/isub (load (field ar cap)) o)))
+        (None)
+        (do (store! (field ar off) (primitive/iadd o n))
+            (Some (primitive/index (load (field ar base)) o))))))
+(defn arena-resize [(ar (ptr Arena)) (memory (ptr i8)) (old AllocRequest) (new AllocRequest)] (-> bool)
+  (let [start (primitive/isub (primitive/cast i64 memory)
+                              (primitive/cast i64 (load (field ar base))))
+        old-bytes (load (field old bytes))
+        new-bytes (load (field new bytes))]
+    (if (and (>= start 0)
+             (and (< start (load (field ar cap)))
+                  (= (primitive/iadd start old-bytes) (load (field ar off)))))
+        (if (> new-bytes (primitive/isub (load (field ar cap)) start))
+            false
+            (do (store! (field ar off) (primitive/iadd start new-bytes)) true))
+        false)))
+
+(impl Allocator Arena
+  (allocate [(self (ptr Arena)) (request (ref AllocRequest))] (-> (Option (ptr i8)))
+    (arena-allocate self request))
+  (resize [(self (ptr Arena)) (memory (ptr i8)) (old (ref AllocRequest)) (new (ref AllocRequest))] (-> bool)
+    (arena-resize self memory old new))
+  (remap [(self (ptr Arena)) (memory (ptr i8)) (old (ref AllocRequest)) (new (ref AllocRequest))] (-> (Option (ptr i8)))
+    (if (arena-resize self memory old new) (Some memory) (None)))
+  (deallocate [(self (ptr Arena)) (memory (ptr i8)) (request (ref AllocRequest))] (-> i64) 0))
+
+(defn arena-over-buffer [(ar (ptr Arena)) (buf (ptr i8)) (cap i64)] (-> (dyn Allocator))
   (store! (field ar base) buf)
   (store! (field ar off) 0)
   (store! (field ar cap) cap)
-  (store! (field a alloc) (primitive/fnptr-of ar-alloc))
-  (store! (field a resize) (primitive/fnptr-of ar-resize))
-  (store! (field a free) (primitive/fnptr-of ar-free))
-  (store! (field a ctx) (primitive/cast (ptr i8) ar))
-  a)
-; A poison-on-free DEBUG allocator (mem-2) lives in the sibling module dbgalloc.coil,
-; NOT here: its hooks are concrete C-ABI functions mono cannot dead-strip, so bundling
-; them into this always-loaded core would emit them into every allocating program. Wrap
-; any allocator with `(debug-allocator a)` from `(import "coil.dbgalloc")` — under
-; --debug-checks it detects double-free and poisons freed memory; off, it is just `a`.
+  (primitive/make-dyn Allocator ar))
 
-;; convenience: malloc the backing buffer AND the arena's own state, so each call yields
-;; an independent arena rather than a fresh view onto one shared static.
-(defn arena-allocator [(cap :i64)] (-> (ptr Allocator))
-  (arena-over-buffer (primitive/cast (ptr Arena) (malloc (primitive/cast isize (primitive/sizeof Arena))))
-                     (primitive/cast (ptr Allocator) (malloc (primitive/cast isize (primitive/sizeof Allocator))))
-                     (malloc (primitive/cast isize cap))
-                     cap))
+(defn arena-allocator [(cap i64)] (-> (dyn Allocator))
+  (let [ar (primitive/cast (ptr Arena) (malloc (primitive/cast isize (primitive/sizeof Arena))))]
+    (arena-over-buffer ar (malloc (primitive/cast isize cap)) cap)))
 
-;; The overflow flavour (see `aro-alloc`): bump through a `cap`-byte region, then fall
-;; back to malloc. Suitable as a program's ROOT allocator, which the strict arena is not.
-;;
-;; If the region itself cannot be allocated this returns a plain `malloc-allocator`
-;; rather than an arena over a null base — a zero base with a nonzero cap would hand out
-;; addresses counted from NULL, which is not a failure you want to debug. Asking for a
-;; large region and getting the ordinary allocator is a graceful outcome; the caller sees
-;; a working `(ptr Allocator)` either way.
-(defn overflow-arena-allocator [(cap :i64)] (-> (ptr Allocator))
+; ---- bump arena with malloc overflow --------------------------------------
+;; A distinct concrete type is required: a trait has exactly one implementation per
+;; type, and keeping this separate also lets freestanding strict arenas dead-strip libc.
+(defstruct OverflowArena [(base (ptr i8)) (off i64) (cap i64)])
+(defn overflow-in-block? [(ar (ptr OverflowArena)) (memory (ptr i8))] (-> bool)
+  (let [d (primitive/isub (primitive/cast i64 memory)
+                          (primitive/cast i64 (load (field ar base))))]
+    (and (>= d 0) (< d (load (field ar cap))))))
+(defn overflow-as-arena [(ar (ptr OverflowArena))] (-> (ptr Arena))
+  (primitive/cast (ptr Arena) ar))
+
+(impl Allocator OverflowArena
+  (allocate [(self (ptr OverflowArena)) (request (ref AllocRequest))] (-> (Option (ptr i8)))
+    (match (arena-allocate (overflow-as-arena self) request)
+      (Some [p] (Some p))
+      (None [] (malloc-allocate request))))
+  (resize [(self (ptr OverflowArena)) (memory (ptr i8)) (old (ref AllocRequest)) (new (ref AllocRequest))] (-> bool)
+    (if (overflow-in-block? self memory)
+        (arena-resize (overflow-as-arena self) memory old new)
+        false))
+  (remap [(self (ptr OverflowArena)) (memory (ptr i8)) (old (ref AllocRequest)) (new (ref AllocRequest))] (-> (Option (ptr i8)))
+    (if (overflow-in-block? self memory)
+        (if (arena-resize (overflow-as-arena self) memory old new) (Some memory) (None))
+        (if (> (load (field new align)) 16)
+            (None)
+            (let [p (realloc memory (primitive/cast isize (load (field new bytes))))]
+              (if (= (primitive/cast i64 p) 0) (None) (Some p))))))
+  (deallocate [(self (ptr OverflowArena)) (memory (ptr i8)) (request (ref AllocRequest))] (-> i64)
+    (if (overflow-in-block? self memory) 0 (primitive/free memory))))
+
+(defn overflow-arena-allocator [(cap i64)] (-> (dyn Allocator))
   (let [buf (malloc (primitive/cast isize cap))]
-    (if (= (primitive/cast :i64 buf) (cast i64 0))
+    (if (= (primitive/cast i64 buf) 0)
         (malloc-allocator)
-        (let [ar (primitive/cast (ptr Arena) (malloc (primitive/cast isize (primitive/sizeof Arena))))
-              a (primitive/cast (ptr Allocator) (malloc (primitive/cast isize (primitive/sizeof Allocator))))]
+        (let [ar (primitive/cast (ptr OverflowArena)
+                                 (malloc (primitive/cast isize (primitive/sizeof OverflowArena))))]
           (store! (field ar base) buf)
           (store! (field ar off) 0)
           (store! (field ar cap) cap)
-          (store! (field a alloc) (primitive/fnptr-of aro-alloc))
-          (store! (field a resize) (primitive/fnptr-of aro-resize))
-          (store! (field a free) (primitive/fnptr-of aro-free))
-          (store! (field a ctx) (primitive/cast (ptr i8) ar))
-          a))))
+          (primitive/make-dyn Allocator ar)))))

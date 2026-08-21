@@ -188,7 +188,7 @@ Coil-module visibility — orthogonal to this, which controls the C ABI surface)
 (defstruct Point :c [(x :i64) (y :i64)])     ; :c layout — required for an exported sig
 
 (defn make-point [(x :i64) (y :i64)] (-> Point)
-  (let [p (alloc/stack Point)] (primitive/store! (primitive/field p x) x) (primitive/store! (primitive/field p y) y) (primitive/load p)))
+  (let [(mut p) (Point :x x :y y)] (load p)))
 
 (defn point-eq [(a Point) (b Point)] (-> bool) …)
 

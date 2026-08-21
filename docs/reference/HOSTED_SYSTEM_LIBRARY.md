@@ -26,7 +26,7 @@ They keep system code linear:
   (try
     (let [a (alloc/malloc-allocator)
           cwd (try-or! (os/current-dir a) 1)
-          cwdp (alloc/stack os/OwnedString)]
+          (mut cwdp) (primitive/zeroed os/OwnedString)]
       (store! cwdp cwd)
       (println (os/owned-string-slice cwd))
       (os/owned-string-free a cwdp)

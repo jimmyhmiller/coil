@@ -83,7 +83,7 @@ impossible to land**. Follow it exactly. The reader pass is the worked example:
   Bitwise-and is `iand` NOT `and`. Shifts are `ishl`/`ishr` (`lshr`/`shr` are
   LLVM-IR-only, not Coil ops).
 - Memory: `(alloc-stack T)`, `(field p name)`, `(index ptr i)`, `(load place)`,
-  `(store! place val)`, `(cast T expr)`. Allocator threaded as `(ptr Allocator)`;
+  `(store! place val)`, `(cast T expr)`. Allocator threaded as `(dyn Allocator)`;
   `(malloc-allocator)` is a static singleton.
 - Recursion in sums goes through `(ptr (ArrayList X))` (see json.coil/Json,
   reader.coil/Sexp). Heap-box: `(unwrap-ptr [T] (create [T] a))` then `store!`.

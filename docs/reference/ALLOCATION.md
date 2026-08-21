@@ -73,7 +73,7 @@ all or one bulk reset.
 ## The catch that had to be handled first — DONE
 
 `ar-resize` used to return `(None)` unconditionally. Look at what `al-reserve!` does with
-that (`src/stdlib/arraylist.coil`): it falls back to `alloc-slice` + element-by-element copy, and
+that (`src/stdlib/arraylist.coil`): it falls back to typed `alloc` + element-by-element copy, and
 **never frees the old block on an arena** (`ar-free` is a no-op). So an `ArrayList` that
 grew by doubling on an arena consumed `4 + 8 + 16 + … + n ≈ 2n` and stranded all of it.
 Growable lists on an arena were quadratic in *space*.
@@ -102,7 +102,7 @@ choice rather than a workaround.
 
 ## Exhaustion is diagnosable — DONE
 
-`ar-alloc` returns `(None)` when full, `alloc-slice` propagates it, and `al-reserve!`
+`arena-allocate` returns `(None)` when full, typed `alloc` propagates it, and `al-reserve!`
 finished with `(oom)` — which was `(defn oom [] (abort) 0)`, a **silent** `abort()`. A
 compiler that ran out of arena died with exit 134 and no message.
 
@@ -129,7 +129,7 @@ investigation is recorded in [wasm64-reserve-abort.md](../archive/wasm64-reserve
 
 ## Threading
 
-The pipeline already passes `a (ptr Allocator)` nearly everywhere; the sites that bypass
+The pipeline already passes `a (dyn Allocator)` nearly everywhere; the sites that bypass
 it call `malloc-allocator` directly:
 
 ```
@@ -244,7 +244,7 @@ Two traps that cost real time and are guarded by tests in `src/examples/arena-gr
 * **`resize` with a null pointer.** A collection's first growth calls `resize(NULL, 0, n)`.
   Answering it with `realloc(NULL, n)` is correct C and completely wrong here: it routes
   *every* list's initial buffer to malloc and leaves the arena serving nothing. It must
-  return `(None)` so the caller reaches `alloc-slice`, which bumps.
+  return `(None)` so the caller reaches typed `alloc`, which bumps.
 * **Interpreting a foreign pointer as an offset.** `ar-resize` computes `p - base`; with
   overflow blocks in play, `p` may not be the arena's at all. It now range-checks before
   treating the difference as an offset.

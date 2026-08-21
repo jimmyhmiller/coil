@@ -81,7 +81,7 @@ are already sufficient.
 
 Hosted APIs take the capabilities they use:
 
-- allocation is a `(ptr Allocator)` argument;
+- allocation is a `(dyn Allocator)` argument;
 - byte input and output use `Reader` and `Writer`;
 - asynchronous operations use `Task`, `Context`, and `Parker`;
 - no hidden global allocator, executor, or stdout handle is introduced.

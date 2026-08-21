@@ -255,7 +255,7 @@ arm64 gate-run + gate-cli + gate-diag) and the finding's own repro.
 8. **String HashMap keys own by default (std-3).** ✅ DONE. String-keyed maps copy keys into the
    map's allocator on insert and free on remove; borrowing becomes the opt-in/unsafe path.
    OUTCOME: ownership is a capability on the `KeyOps` vtable, not a compiler concept. `KeyOps` gained
-   three fields — `copy`/`free` (both `(ptr Allocator) (ptr i8) -> i64`, acting IN PLACE on the key
+   three fields — `copy`/`free` (both `(dyn Allocator) (ptr i8) -> i64`, acting IN PLACE on the key
    slot) and an `owns` flag. When `owns=1` the map deep-copies each genuinely-inserted key into its
    own allocator and frees it on remove/clear/free, so a `(slice u8)` key never aliases caller
    storage (the footgun: two keys built over one reused buffer both read its latest bytes). The
@@ -301,10 +301,10 @@ arm64 gate-run + gate-cli + gate-diag) and the finding's own repro.
      when off, and when on wraps with a `{magic,size}`-header allocator that detects double-free
      (located abort) and poisons freed payloads to 0xDE (quarantining blocks so detection is
      reliable). Zero effect on existing dumps.
-   • **mem-8**: a bundled `(checker …)` (src/stdlib/stacklint.coil) the driver auto-`--use`s under
-     --debug-checks; it WARNS (like clang, non-fatal) when a user function returns a pointer to a
-     stack local (direct or let-bound alloc-stack). No false positives on heap/param returns or the
-     corpus. LESSON: the checker-dylib closure walk skips a user call nested in an expanded and/or.
+   • **mem-8** originally added a stack-return checker. The allocator/storage redesign removed the
+     public stack-allocation API and its dedicated checker; `coil lint --fix` now migrates initialized
+     slots to mutable locals and preserves unresolved low-level cases explicitly as
+     `primitive/alloc-stack`.
    • **mem-7**: `--sanitize=address` runs LLVM's AddressSanitizer pass (`default<O3>,asan`) on the
      PROGRAM object only (`build-object` sanitize flag; false for the metaprogram dylib). Sanitizer
      flags are filtered off the metaprogram-dylib link (`filter-meta-link-flags`), so a bare

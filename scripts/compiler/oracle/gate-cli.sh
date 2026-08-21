@@ -413,9 +413,8 @@ grep -q '(import "unrelated/place/anything.coil" :use \*)' "$T/sib/src/migrate.c
 printf '(module owner-migrate)\n(defn main [] (-> i64) (let [p (stack i64)] (store! p (ior 40 2)) (load p)))\n' \
   > "$T/sib/src/owner-migrate.coil"
 "$COIL" lint "$T/sib/src/owner-migrate.coil" --fix >/dev/null 2>&1
-grep -q '(import "coil.alloc" :as alloc)' "$T/sib/src/owner-migrate.coil" \
-  && grep -q '(import "coil.primitive" :as primitive)' "$T/sib/src/owner-migrate.coil" \
-  && grep -q '(alloc/stack i64)' "$T/sib/src/owner-migrate.coil" \
+grep -q '(import "coil.primitive" :as primitive)' "$T/sib/src/owner-migrate.coil" \
+  && grep -q '(primitive/alloc-stack i64)' "$T/sib/src/owner-migrate.coil" \
   && grep -q '(primitive/ior 40 2)' "$T/sib/src/owner-migrate.coil" \
   && ok "lint --fix adds missing owner imports with primitive/allocation rewrites" \
   || bad "owner import migration" "missing import or qualified replacement"
@@ -435,10 +434,22 @@ printf '(module lint-extern-closure.main)\n(extern unreachable_native_symbol :cc
   && ok "project lint excludes unreachable externs from macro-engine closures" \
   || bad "project lint extern closure" "an unrelated native declaration poisoned post-fix validation"
 
+# A package entry may live beside Coil.toml rather than under conventional src/.
+# It is still project-owned source and bare `coil lint` must not silently skip it.
+mkdir -p "$T/lint-root-entry"
+printf '[package]\nname = "lint-root-entry"\nentry = "main.coil"\n' \
+  > "$T/lint-root-entry/Coil.toml"
+printf '(module lint-root-entry)\n(defn main [] (-> i64) (ior 40 2))\n' \
+  > "$T/lint-root-entry/main.coil"
+( cd "$T/lint-root-entry" && "$COIL" lint --fix >/dev/null 2>&1 ) \
+  && grep -q '(primitive/ior 40 2)' "$T/lint-root-entry/main.coil" \
+  && ok "project lint includes a package entry outside source roots" \
+  || bad "project lint root entry" "entry = main.coil was silently skipped"
+
 printf '(module owner-alias-migrate)\n(import "coil.alloc" :as memory)\n(import "coil.primitive" :as metal)\n(defn main [] (-> i64) (let [p (stack i64)] (store! p (ior 40 2)) (load p)))\n' \
   > "$T/sib/src/owner-alias-migrate.coil"
 "$COIL" lint "$T/sib/src/owner-alias-migrate.coil" --fix >/dev/null 2>&1
-grep -q '(memory/stack i64)' "$T/sib/src/owner-alias-migrate.coil" \
+grep -q '(metal/alloc-stack i64)' "$T/sib/src/owner-alias-migrate.coil" \
   && grep -q '(metal/ior 40 2)' "$T/sib/src/owner-alias-migrate.coil" \
   && [ "$(grep -c 'coil.alloc' "$T/sib/src/owner-alias-migrate.coil")" = 1 ] \
   && [ "$(grep -c 'coil.primitive' "$T/sib/src/owner-alias-migrate.coil")" = 1 ] \

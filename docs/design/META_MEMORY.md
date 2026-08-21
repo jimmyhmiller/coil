@@ -135,7 +135,7 @@ whose top-block `ar-resize` path makes builder growth a pointer bump).
   deep-copies it — structure *and* string payloads — into the caller's
   allocator, then resets the arena. Everything else is gone.
 
-Cross-invocation state remains possible but explicit: `alloc/static` (or
+Cross-invocation state remains possible but explicit: `primitive/alloc-static` (or
 malloc) inside the metaprogram is the author's own memory, visible in their
 source, untouched by the arena. That is the whole escape hatch; there is no
 implicit way for scratch to outlive an expansion.

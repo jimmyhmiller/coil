@@ -86,7 +86,7 @@ minimal (emit an object); freestanding composes on top.
    constructor over a caller-provided buffer (no malloc — the buffer can be an
    `alloc-static` array in .bss); `arena-allocator` now wraps it with `malloc`.
    — CLOSED: a program that IMPORTS src/stdlib/alloc and RUNS its arena (`arena-over-buffer`
-   + `create`) now genuinely executes bare-metal (`arena.coil` → "stdlib arena on bare
+   + `box!`) now genuinely executes bare-metal (`arena.coil` → "stdlib arena on bare
    metal: 42"). Getting there meant fixing the bare-metal startup, triaged with `qemu
    -d int` in three layers — all in the recipe/build, NO core change:
    (1) **No stack pointer.** The entry prologue spilled to `SP≈0` → Data Abort (FAR

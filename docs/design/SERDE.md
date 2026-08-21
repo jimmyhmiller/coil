@@ -53,7 +53,7 @@ flagged inline below with ⚠.
 - **IO** — `Writer` capability (`coil.io`): fd, buffered, null, and `FixBuf`
   sinks; `coil.fmt` printers; `StrBuf` in `coil.str`.
 - **Errors** — `Result`/`Option` in the prelude, `try!`/`try` macros (`coil.try`).
-- **Allocation** — the `(ptr Allocator)` threading convention.
+- **Allocation** — the `(dyn Allocator)` threading convention.
 
 ## Architecture: three parties, N + M
 
@@ -434,7 +434,7 @@ field count (feeds `deny-unknown`). Tests: `tests/serde_options_test.coil`,
 ; (Rect 2.0 3.0) -> {"Rect":{"w":2.0,"h":3.0}}
 ; (Point)        -> "Point"
 
-(defn describe [(src (slice u8)) (a (ptr Allocator))] (-> i64)
+(defn describe [(src (slice u8)) (a (dyn Allocator))] (-> i64)
   (match (from-json [Shape] a src)
     (Ok [s] (match s
               (Circle [r] 1)
@@ -506,7 +506,7 @@ field count (feeds `deny-unknown`). Tests: `tests/serde_options_test.coil`,
 ```coil
 (import "coil.serde.json" :use *)   ; JVal = the promoted Json sum, itself Serialize/Deserialize
 
-(defn version-of [(a (ptr Allocator)) (src (slice u8))] (-> i64)
+(defn version-of [(a (dyn Allocator)) (src (slice u8))] (-> i64)
   (match (from-json [JVal] a src)          ; any valid JSON decodes
     (Ok [v] (match (jv-get v "version") (JNum [n] n) (_ -1)))
     (Err [_] -1)))

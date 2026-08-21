@@ -52,7 +52,7 @@ is the same impl the runtime uses — literally the same `=`.
 **Aggregate results:** a `comptime` form may return any aggregate — a
 **struct** (incl. nested), a **sum**, or an **array**. The value-builder
 synthesizes the elaborated expression that reconstructs it: a struct/array becomes
-`(let [t (alloc/stack T)] (primitive/store! (field/index t …) v)… (primitive/load t))` (an immutable
+`(let [(mut t) (primitive/zeroed T)] (primitive/store! (field/index (mut t) …) v)… (primitive/load t))` (an immutable
 `t` holding a real `(ptr T)`); a sum becomes a variant call. The classic use — a
 **compile-time lookup table** — works: build an array with a loop in `comptime`,
 index it at runtime.

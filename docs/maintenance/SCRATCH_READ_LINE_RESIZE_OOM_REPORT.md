@@ -33,7 +33,7 @@ The affected runner revision initializes a turn scratch arena and passes its ord
 allocator view to the provider:
 
 ```coil
-(let [turn-scratch (alloc/stack scratch/ScratchArena)]
+(let [(mut turn-scratch) (primitive/zeroed scratch/ScratchArena)]
   (scratch/scratch-init turn-scratch (malloc-allocator))
   (let [turn-result
           (execute-model provider

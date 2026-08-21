@@ -527,12 +527,40 @@ def test_modernize_fast(compiler: str) -> None:
             if before != hashlib.sha256(probe.read_bytes()).digest():
                 raise RuntimeError("fast modernization gate: lint --fix is not idempotent")
 
+            stack_probe = tmp / "legacy-stack.coil"
+            stack_probe.write_text("""(module legacy-stack)
+(import "coil.alloc" :as alloc)
+(import "coil.primitive" :as primitive)
+(defn read-cell [(p (ptr i64))] (-> i64) (primitive/load p))
+(defn safe [] (-> i64)
+  (let [p (alloc/stack i64)]
+    (primitive/store! p 20)
+    (+ (primitive/load p) 22)))
+(defn address-sensitive [] (-> i64)
+  (let [p (alloc/stack i64)]
+    (read-cell p)))
+(defn initialized-address-sensitive [] (-> i64)
+  (let [p (alloc/stack i64)]
+    (primitive/store! p 7)
+    (read-cell p)))
+""")
+            execute(coil, "lint", str(stack_probe), "--fix")
+            stack_fixed = stack_probe.read_text()
+            if "(let [(mut p) 20]" not in stack_fixed:
+                raise RuntimeError("fast modernization gate: initialized stack cell did not become a mutable local")
+            if stack_fixed.count("(primitive/alloc-stack i64)") != 2:
+                raise RuntimeError("fast modernization gate: address-sensitive stack cell was not preserved explicitly")
+            if "alloc/stack" in stack_fixed:
+                raise RuntimeError("fast modernization gate: public stack allocation survived autofix")
+            execute(coil, "check", str(stack_probe))
+
             preflight = tmp / "legacy-preflight.coil"
             preflight.write_text("""(module legacy-preflight)
 (import "coil.alloc" :as alloc)
 (extern free :cc c [(ptr i8)] (-> void))
-(defn owner [(a (ptr alloc.Allocator))] (-> (ptr i64))
-  (alloc.box a i64 1))
+(defstruct Holder [(allocator (ptr alloc/Allocator))])
+(defn owner [(a (dyn alloc/Allocator))] (-> (ptr i64))
+  (alloc.box! a i64 1))
 (defn arch? [(wanted Code)] (-> bool)
   (code-eq (target-arch) wanted))
 (defn release-or [(p (ptr i8)) (release bool)] (-> i64)
@@ -540,12 +568,15 @@ def test_modernize_fast(compiler: str) -> None:
 """)
             execute(coil, "lint", str(preflight), "--fix")
             migrated = preflight.read_text()
-            for expected in ("(ptr alloc/Allocator)", "(alloc/box a i64 1)",
-                             ":use [unwrap-ptr create]", "(primitive/code-eq",
+            for expected in ("(dyn alloc/Allocator)", "(alloc/box! a i64 1)",
+                             "(primitive/code-eq",
                              "(primitive/target-arch)", "(do (free p) 0)"):
                 if expected not in migrated:
                     raise RuntimeError(
                         f"fast modernization gate: preflight omitted {expected!r}")
+            if "(defstruct Holder [(allocator (dyn alloc/Allocator))])" not in migrated:
+                raise RuntimeError(
+                    "fast modernization gate: allocator field type was not migrated")
             execute(coil, "check", str(preflight))
 
             use_only = tmp / "legacy-use-only.coil"
@@ -557,8 +588,8 @@ def test_modernize_fast(compiler: str) -> None:
 """)
             execute(coil, "lint", str(use_only), "--fix")
             use_migrated = use_only.read_text()
-            for expected in (":use * :as alloc", ":use * :as primitive",
-                             "(alloc/static i64)", "(primitive/iand x y)"):
+            for expected in (":use * :as primitive",
+                             "(primitive/alloc-static i64)", "(primitive/iand x y)"):
                 if expected not in use_migrated:
                     raise RuntimeError(
                         f"fast modernization gate: use-only import omitted {expected!r}")
@@ -602,7 +633,7 @@ def test_modernize_fast(compiler: str) -> None:
                 raise RuntimeError("fast modernization gate: lint --diff changed its input")
             for final_rewrite in ("(set! (.value box)", "(.value box)",
                                   "(Moved :x 1 :y 2 :at 3)", "try-or!",
-                                  "(let [heap (alloc/static Box)] heap)"):
+                                  "(let [heap (primitive/alloc-static Box)] heap)"):
                 if final_rewrite not in preview.stdout:
                     raise RuntimeError(
                         f"fast modernization gate: lint --diff stopped before fixpoint {final_rewrite!r}")
@@ -615,16 +646,18 @@ def test_modernize_fast(compiler: str) -> None:
                     raise RuntimeError(f"fast modernization gate: default lint left {legacy!r}")
             if ("(Moved :x 1 :y 2 :at 3)" not in fixed or "try-or!" not in fixed
                     or "(set! (.value box)" not in fixed or "(.value box)" not in fixed
-                    or "(let [heap (alloc/static Box)] heap)" not in fixed):
+                    or "(let [heap (primitive/alloc-static Box)] heap)" not in fixed):
                 raise RuntimeError("fast modernization gate: default lint profile did not run every safe fixer")
             if "(Counts :ok 3 :failed 2)" not in fixed or "(mut result)" in fixed:
                 raise RuntimeError("fast modernization gate: complete zeroed struct init was not replaced")
             if "(mut reversed)" not in fixed or "(mut dependent)" not in fixed:
                 raise RuntimeError("fast modernization gate: unsafe zeroed struct init was rewritten")
-            if "(box a Counts (Counts :ok 8 :failed 1))" not in fixed or "(let [p (unwrap-ptr" not in fixed:
-                raise RuntimeError("fast modernization gate: manual-box fix or its negative guard failed")
-            if "(alloc/box a Counts (Counts :ok 6 :failed 3))" not in fixed:
+            if "(box! a Counts (Counts :ok 8 :failed 1))" not in fixed or "(unwrap-ptr" in fixed:
+                raise RuntimeError("fast modernization gate: manual-box fix left the legacy allocation sequence")
+            if "(alloc/box! a Counts (Counts :ok 6 :failed 3))" not in fixed:
                 raise RuntimeError("fast modernization gate: qualified manual-box fix failed")
+            if "(let [p (box! a Counts (Counts :ok 5 :failed 4))]" not in fixed:
+                raise RuntimeError("fast modernization gate: manual-box fix lost an address-sensitive result wrapper")
             execute(coil, "fmt", "--write", str(probe))
             formatted = probe.read_text()
             if not all(part in formatted for part in ("(Moved\n", ":x 1\n", ":y 2\n", ":at 3)")):
@@ -677,15 +710,15 @@ source-roots = ["src"]
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
 (defn main [] (-> i64)
-  (let [p (alloc/stack i64)]
+  (let [p (primitive/alloc-stack i64)]
     (primitive/store! p 0)
     (primitive/load p)))
 """)
             clean = subprocess.run(
-                [coil, "build", "--backend", "arm64", "-o", str(project / "clean")],
+                [coil, "check"],
                 cwd=project, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if clean.returncode != 0:
-                raise RuntimeError("fast modernization gate: low-level detector probe did not build")
+                raise RuntimeError("fast modernization gate: low-level detector probe did not check")
             if "obsolete Coil syntax" in clean.stderr:
                 raise RuntimeError("fast modernization gate: valid low-level primitives triggered migration offer")
 
