@@ -1,0 +1,209 @@
+; Linux/x86-64 in-process JIT backed by LLVM MCJIT.
+;
+; Each submission owns a fresh execution engine because the REPL recompiles its
+; complete accepted source transactionally. Engines intentionally live for the
+; allocator lifetime: captured function pointers may still enter old code. Before
+; an engine is finalized, alloc-static globals are mapped onto the addresses from
+; the prior generation so reload cells retain both identity and contents.
+(module jit_llvm)
+
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [Allocator create unwrap-ptr])
+(import "coil.arraylist" :use [ArrayList al-elem al-len al-new al-push!])
+(import "coil.slice" :use [slice-len])
+(import "coil.str" :use [starts-with])
+(import "coil.io" :use [stderr print-str write-byte])
+(import "ast" :use [Program])
+(import "codegen" :use [codegen-module llvm-cpu llvm-cpu-features llvm-reloc-model])
+(import "ffi" :use *)
+(import "loader" :use [cstr->slice])
+
+(defstruct LLVMJitSym [(name (slice u8)) (addr (ptr i8))])
+(defstruct LLVMJitState
+  [(engines (ArrayList (ptr i8)))
+   (syms (ArrayList LLVMJitSym))])
+
+(defn llvm-jit-state [(a (ptr Allocator)) (slot (ptr (ptr i8)))] (-> (ptr LLVMJitState))
+  (if (= (primitive/cast i64 (load slot)) (primitive/cast i64 0))
+      (let [s (unwrap-ptr [LLVMJitState] (create [LLVMJitState] a))]
+        (set! (.engines s) (al-new [(ptr i8)] a))
+        (set! (.syms s) (al-new [LLVMJitSym] a))
+        (store! slot (primitive/cast (ptr i8) s))
+        s)
+      (primitive/cast (ptr LLVMJitState) (load slot))))
+
+(defn llvm-jit-sym-lookup [(s (ptr LLVMJitState)) (name (slice u8))] (-> (ptr i8))
+  (let [n (al-len [LLVMJitSym] (load (field s syms)))
+        (mut i) 0
+        (mut result) (primitive/cast (ptr i8) 0)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [sym (al-elem [LLVMJitSym] (field s syms) (load i))]
+                  (when (= (load (field sym name)) name)
+                    (store! result (load (field sym addr)))
+                    (break)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (load result)))
+
+(defn llvm-jit-map-prior! [(module (ptr i8))
+                           (engine (ptr i8))
+                           (state (ptr LLVMJitState))] (-> i64)
+  (let [(mut global) (LLVMGetFirstGlobal module)]
+    (loop (if (= (primitive/cast i64 (load global)) (primitive/cast i64 0))
+              (break)
+              (do
+                (let [name (cstr->slice (LLVMGetValueName (load global)))]
+                  (when (starts-with name "repl_static.")
+                    (let [prior (llvm-jit-sym-lookup state name)]
+                      (unless (= (primitive/cast i64 prior) (primitive/cast i64 0))
+                        (LLVMAddGlobalMapping engine (load global) prior)
+                        0))))
+                (store! global (LLVMGetNextGlobal (load global))))))
+    0))
+
+; A prior alloc-static is storage owned by the previous engine. Turn this module's
+; duplicate definition into a declaration before MCJIT sees it; the subsequent
+; global mapping then supplies the declaration's stable address.
+(defn llvm-jit-externalize-prior! [(module (ptr i8))
+                                   (state (ptr LLVMJitState))] (-> i64)
+  (let [(mut global) (LLVMGetFirstGlobal module)]
+    (loop (if (= (primitive/cast i64 (load global)) (primitive/cast i64 0))
+              (break)
+              (do
+                (let [name (cstr->slice (LLVMGetValueName (load global)))]
+                  (when (and (starts-with name "repl_static.")
+                             (!= (primitive/cast i64 (llvm-jit-sym-lookup state name))
+                                 (primitive/cast i64 0)))
+                    (LLVMSetInitializer (load global) (primitive/cast (ptr i8) 0))
+                    0))
+                (store! global (LLVMGetNextGlobal (load global))))))
+    0))
+
+(defn llvm-jit-record-statics! [(module (ptr i8))
+                                (engine (ptr i8))
+                                (state (ptr LLVMJitState))] (-> i64)
+  (let [(mut global) (LLVMGetFirstGlobal module)]
+    (loop (if (= (primitive/cast i64 (load global)) (primitive/cast i64 0))
+              (break)
+              (do
+                (let [namec (LLVMGetValueName (load global))
+                      name (cstr->slice namec)]
+                  (when (and (starts-with name "repl_static.")
+                             (= (primitive/cast i64 (llvm-jit-sym-lookup state name))
+                                (primitive/cast i64 0)))
+                    (let [addr (LLVMGetGlobalValueAddress engine namec)]
+                      (unless (= addr (primitive/cast i64 0))
+                        (let [sym (primitive/alloc-stack LLVMJitSym)]
+                          (set! (.name sym) name)
+                          (set! (.addr sym) (primitive/cast (ptr i8) addr))
+                          (al-push! [LLVMJitSym] (mut (field state syms)) (load sym)))))))
+                (store! global (LLVMGetNextGlobal (load global))))))
+    0))
+
+(defn llvm-jit-verify [(module (ptr i8))] (-> bool)
+  (let [message (primitive/alloc-stack (ptr i8))]
+    (store! message (primitive/cast (ptr i8) 0))
+    (if (= (LLVMVerifyModule module 2 message) (primitive/cast i32 0))
+        true
+        (do
+          (print-str (stderr) "error: REPL JIT produced an invalid LLVM module: ")
+          (unless (= (primitive/cast i64 (load message)) (primitive/cast i64 0))
+            (print-str (stderr) (cstr->slice (load message)))
+            (LLVMDisposeMessage (load message))
+            0)
+          (write-byte (stderr) (primitive/cast u8 10))
+          false))))
+
+;; Driver runner: compile one checked Program, reuse prior static cells, invoke
+;; coil_repl_entry, and retain the engine for frozen function pointers.
+(defn jit-llvm-run [(a (ptr Allocator))
+                    (mp (ptr Program))
+                    (paths (ptr (ArrayList (slice u8))))
+                    (texts (ptr (ArrayList (slice u8))))
+                    (state-slot (ptr (ptr i8)))] (-> i64)
+  (do
+    ; Source tables are already consumed by the front end; LLVM debug emission is
+    ; deliberately disabled for short-lived REPL generations.
+    (primitive/cast i64 paths)
+    (primitive/cast i64 texts)
+    (let [module (codegen-module a mp (primitive/cast (ptr i8) 0) 0 false)]
+      (if (not (llvm-jit-verify module))
+          (do (LLVMDisposeModule module) 1)
+          (do
+            (LLVMLinkInMCJIT)
+            (LLVMInitializeX86AsmPrinter)
+            (LLVMInitializeX86AsmParser)
+            (let [engine-out (primitive/alloc-stack (ptr i8))
+                  error-out (primitive/alloc-stack (ptr i8))
+                  state (llvm-jit-state a state-slot)]
+              (store! engine-out (primitive/cast (ptr i8) 0))
+              (store! error-out (primitive/cast (ptr i8) 0))
+              (llvm-jit-externalize-prior! module state)
+              (if (!= (LLVMCreateMCJITCompilerForModule engine-out
+                                                        module
+                                                        (primitive/cast (ptr i8) 0)
+                                                        0
+                                                        error-out)
+                      (primitive/cast i32 0))
+                  (do
+                    (print-str (stderr) "error: REPL LLVM JIT initialization failed: ")
+                    (unless (= (primitive/cast i64 (load error-out)) (primitive/cast i64 0))
+                      (print-str (stderr) (cstr->slice (load error-out)))
+                      (LLVMDisposeMessage (load error-out))
+                      0)
+                    (write-byte (stderr) (primitive/cast u8 10))
+                    (LLVMDisposeModule module)
+                    1)
+                  (let [engine (load engine-out)]
+                    (llvm-jit-map-prior! module engine state)
+                    (let [entry (LLVMGetFunctionAddress engine c"coil_repl_entry")]
+                      (if (= entry (primitive/cast i64 0))
+                          (do
+                            (print-str (stderr) "error: REPL LLVM JIT entry is missing\n")
+                            (LLVMDisposeExecutionEngine engine)
+                            1)
+                          (do
+                            (llvm-jit-record-statics! module engine state)
+                            (al-push! [(ptr i8)] (mut (field state engines)) engine)
+                            (primitive/call-ptr (primitive/cast (fnptr c [] i64)
+                                                                (primitive/cast (ptr i8) entry))))))))))))))
+
+;; Metaprogram object builder used by coil.jit on LLVM hosts. This keeps macro and
+;; transform compilation compatible with Linux ELF while runtime submissions stay
+;; entirely in-process through jit-llvm-run.
+(defn jit-llvm-build-object [(a (ptr Allocator))
+                             (mp (ptr Program))
+                             (out (ptr i8))] (-> i64)
+  (let [module (codegen-module a mp (primitive/cast (ptr i8) 0) 0 false)
+        triple (LLVMGetDefaultTargetTriple)
+        target-out (primitive/alloc-stack (ptr i8))
+        error-out (primitive/alloc-stack (ptr i8))]
+    (LLVMInitializeX86AsmPrinter)
+    (LLVMInitializeX86AsmParser)
+    (store! error-out (primitive/cast (ptr i8) 0))
+    (if (!= (LLVMGetTargetFromTriple triple target-out error-out) (primitive/cast i32 0))
+        (do
+          (print-str (stderr) "error: REPL LLVM target initialization failed\n")
+          (LLVMDisposeModule module)
+          1)
+        (let [machine
+                (LLVMCreateTargetMachine (load target-out)
+                                         triple
+                                         (llvm-cpu triple)
+                                         (llvm-cpu-features triple)
+                                         0
+                                         (llvm-reloc-model triple)
+                                         0)
+              emit-error (primitive/alloc-stack (ptr i8))
+              rc (LLVMTargetMachineEmitToFile machine module out 1 emit-error)]
+          (when (!= rc (primitive/cast i32 0))
+            (print-str (stderr) "error: REPL metaprogram object emission failed: ")
+            (unless (= (primitive/cast i64 (load emit-error)) (primitive/cast i64 0))
+              (print-str (stderr) (cstr->slice (load emit-error)))
+              (LLVMDisposeMessage (load emit-error))
+              0)
+            (write-byte (stderr) (primitive/cast u8 10))
+            0)
+          (LLVMDisposeModule module)
+          (primitive/cast i64 rc)))))

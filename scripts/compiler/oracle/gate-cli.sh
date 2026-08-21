@@ -3104,13 +3104,20 @@ expect_rc 0 "qual: Serialize/Deserialize derive on a sum reached through an :as 
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=src "$2" check src/dserde.coil' \
   _ "$T/qual" "$COIL"
 
-if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
+if { [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; } \
+   || { [ "$HOST_OS" = Linux ] && [ "$HOST_ARCH" = x86_64 ]; }; then
   echo "== coil.jit: installed, source-linked userland SDK =="
   mkdir -p "$T/jit-sdk"
   python3 scripts/dev.py install --source "$COIL" --dest "$T/jit-prefix/bin/coil" >/dev/null 2>&1
   INSTALLED="$T/jit-prefix/bin/coil"
   cp src/examples/jit_sdk.coil "$T/jit-sdk/main.coil"
-  if (cd "$T/jit-sdk" && "$INSTALLED" build main.coil --backend arm64 -o app >/dev/null 2>&1); then
+  if [ "$HOST_OS" = Darwin ]; then
+    JIT_BUILD_ARGS=(--backend arm64)
+  else
+    LLVM_CONFIG=${LLVM_CONFIG:-llvm-config}
+    JIT_BUILD_ARGS=(--link-flag "-L$("$LLVM_CONFIG" --libdir)" --link-flag -lLLVM --link-flag -lm)
+  fi
+  if (cd "$T/jit-sdk" && "$INSTALLED" build main.coil "${JIT_BUILD_ARGS[@]}" -o app >/dev/null 2>&1); then
     mkdir -p "$T/no-cc"
     cat > "$T/no-cc/cc" <<'EOF'
 #!/bin/sh
@@ -3118,7 +3125,11 @@ echo "FAIL: an in-process JIT session invoked cc: $*" >&2
 exit 97
 EOF
     chmod +x "$T/no-cc/cc"
-    sdk_out=$(cd "$T/jit-sdk" && PATH="$T/no-cc:$T/jit-prefix/bin:$PATH" ./app 2>&1)
+    if [ "$HOST_OS" = Darwin ]; then
+      sdk_out=$(cd "$T/jit-sdk" && PATH="$T/no-cc:$T/jit-prefix/bin:$PATH" ./app 2>&1)
+    else
+      sdk_out=$(cd "$T/jit-sdk" && PATH="$T/jit-prefix/bin:$PATH" ./app 2>&1)
+    fi
     case "$sdk_out" in
       *$'20\n30'*) ok "coil.jit embeds an installed compiler and hot reloads from userland" ;;
       *) bad "coil.jit embeds an installed compiler and hot reloads from userland" "$sdk_out" ;;
@@ -3132,7 +3143,11 @@ EOF
     bad "coil.jit userland application builds from the installed toolchain" "build failed"
   fi
   printf '(module plain)\n(defn main [] (-> i64) 0)\n' > "$T/jit-sdk/plain.coil"
-  (cd "$T/jit-sdk" && "$INSTALLED" emit-obj plain.coil --backend arm64 -o plain.o >/dev/null 2>&1)
+  if [ "$HOST_OS" = Darwin ]; then
+    (cd "$T/jit-sdk" && "$INSTALLED" emit-obj plain.coil --backend arm64 -o plain.o >/dev/null 2>&1)
+  else
+    (cd "$T/jit-sdk" && "$INSTALLED" emit-obj plain.coil -o plain.o >/dev/null 2>&1)
+  fi
   plain_syms=$(nm "$T/jit-sdk/plain.o" 2>/dev/null)
   case "$plain_syms" in
     *repl-session-new*) bad "ordinary programs do not link the compiler SDK" "unexpected SDK symbol" ;;
@@ -3158,7 +3173,7 @@ EOF
     '(defn twice [(x f64)] (-> f64) (* x 4.0))' \
     '(next)' \
     '(four-times 10)' \
-    ':q' | PATH="$T/no-cc:$PATH" "$REPL_COIL" repl 2>&1)
+    ':q' | if [ "$HOST_OS" = Darwin ]; then PATH="$T/no-cc:$PATH" "$REPL_COIL" repl 2>&1; else "$REPL_COIL" repl 2>&1; fi)
   case "$repl_out" in
     *$'1\n40\n2\n90\n3\n90'*) ok "repl preserves state, reloads dependent calls, and rejects incompatible replacement" ;;
     *) bad "repl preserves state, reloads dependent calls, and rejects incompatible replacement" "$repl_out" ;;
