@@ -9977,17 +9977,16 @@
 
 ; ============================ repl ==========================================
 ; An in-process, hot-reloading JIT REPL. Top-level definitions accumulate as
-; source and successful submissions replace the session's ARM64 image; a value
+; source and successful submissions replace the session's backend image; a value
 ; expression is TYPE-CHECKED in-process (a throwaway `(defn __repl_probe [] (-> i64)
 ; (do EXPR 0))` probe reusing the real front-end pipeline) so the printer is dispatched on the
 ; expression's actual inferred type — %ld/%lu for an int, %g for a float,
 ; true/false for a bool, the raw bytes for a (slice u8), an address for a
 ; pointer — instead of the old blanket `(primitive/cast i64 EXPR)`, which silently
 ; TRUNCATED floats (`(/ 1.0 2.0)` printed 0) and could not print bools or
-; strings at all. A well-typed expression is emitted to an in-memory Mach-O
-; object, loaded by jit.coil, and called directly—no temporary executable, `cc`,
-; or `ld`. A type error is rendered against the user's OWN input line via the same
-; span renderer the compiler uses. `:help`,
+; strings at all. A well-typed expression is emitted through the session's host
+; runner and called directly. A type error is rendered against the user's OWN input
+; line via the same span renderer the compiler uses. `:help`,
 ; `:type EXPR`, and `:quit` meta-commands are handled ahead of the reader.
 
 (defn repl-head? [(s (slice u8)) (h (slice u8))] (-> bool)
@@ -10052,30 +10051,35 @@
 (defstruct ReplSession
   [(a (dyn Allocator))
    (defs StrBuf)
-   (image JitImage)])
+   (runner (fnptr c [(ref (dyn Allocator))
+                     (ptr Program)
+                     (ptr (ArrayList (slice u8)))
+                     (ptr (ArrayList (slice u8)))
+                     (ptr (ptr i8))] i64))
+   (state (ptr i8))])
 
 ; Compiler-SDK entry: the returned pointer is intentionally erased by coil.jit.
-(defn repl-session-new [(a (dyn Allocator))] (-> (ptr i8))
+(defn repl-session-new-with-runner [(a (dyn Allocator))
+                                    (runner (fnptr c [(ref (dyn Allocator))
+                                                      (ptr Program)
+                                                      (ptr (ArrayList (slice u8)))
+                                                      (ptr (ArrayList (slice u8)))
+                                                      (ptr (ptr i8))] i64))] (-> (ptr i8))
   (let [s (box! a ReplSession (primitive/zeroed ReplSession))]
     (set! (.a s) a)
     (set! (.defs s) (sb-new a))
-    (set! (.base (.image s)) (primitive/cast (ptr i8) 0))
-    (set! (.size (.image s)) 0)
+    (set! (.runner s) runner)
+    (set! (.state s) (primitive/cast (ptr i8) 0))
     (primitive/cast (ptr i8) s)))
 
 (defn repl-session [(raw (ptr i8))] (-> (ptr ReplSession))
   (primitive/cast (ptr ReplSession) raw))
 
-(defn repl-jit-image [(s (ptr ReplSession))] (-> (ptr JitImage))
-  (field s image))
-
 (defn repl-jit-reset! [(s (ptr ReplSession))] (-> i64)
-  (let [img (repl-jit-image s)]
-    ; Old images intentionally remain mapped: a frozen fnptr may still reference
-    ; one. Clearing the reuse root starts a fresh state lineage.
-    (set! (.base img) (primitive/cast (ptr i8) 0))
-    (set! (.size img) 0)
-    0))
+  ; Old backend state intentionally remains alive: a frozen fnptr may still reference
+  ; one. Clearing the reuse root starts a fresh persistent-static lineage.
+  (set! (.state s) (primitive/cast (ptr i8) 0))
+  0)
 
 ; Local fat-pointer accessors so the string printer needs no stdlib import (the
 ; run program is otherwise self-contained). Byte-identical to src/stdlib/slice.coil's
@@ -10275,9 +10279,41 @@
              (and (= (t-int-bits el) (primitive/cast i64 8)) (not (t-int-signed el)))))
       false))
 
+; The original native ARM64/Mach-O runner. It remains the default for the LLVM-free
+; macOS compiler and is also selected by coil.jit on that host.
+(defn repl-arm64-runner [(a (dyn Allocator))
+                         (mp (ptr Program))
+                         (paths (ptr (ArrayList (slice u8))))
+                         (texts (ptr (ArrayList (slice u8))))
+                         (state (ptr (ptr i8)))] (-> i64)
+  (let [(mut obj) (cga64-build-mobj a mp "<repl>" (cwd-slice a) paths texts false)
+        prior (primitive/cast (ptr JitImage) (load state))]
+    (match (jit-load-reusing a (mut obj) prior)
+      (Err [e0]
+           (let [e (primitive/alloc-stack JitErr)
+                 w (stderr)]
+             (set! e e0)
+             (ps w "error: REPL JIT: ")
+             (ps w (.msg e))
+             (wb w 10)
+             1))
+      (Ok [img0]
+          (let [img (box! a JitImage (primitive/zeroed JitImage))]
+            (set! img img0)
+            (let [raw (jit-lookup img "coil_repl_entry")]
+              (if (= (primitive/cast i64 raw) 0)
+                  (do (ps (stderr) "error: REPL JIT entry is missing\n") 1)
+                  (let [rc (primitive/call-ptr (primitive/cast (fnptr c [] i64) raw))]
+                    (store! state (primitive/cast (ptr i8) img))
+                    rc))))))))
+
+; Compatibility constructor used by the LLVM-free ARM64 entrypoint.
+(defn repl-session-new [(a (dyn Allocator))] (-> (ptr i8))
+  (repl-session-new-with-runner a (primitive/fnptr-of repl-arm64-runner)))
+
 ; Compile `<preamble><helpers><defs>(defn main …)` through the real front end and
-; execute its exported entry directly from an in-memory ARM64 image. Definitions
-; have already been lowered by coil.jit.reload into typed Var cells.
+; execute its exported entry through the session's host backend. Definitions have
+; already been lowered by coil.jit.reload into typed Var cells.
 (defn repl-emit-run [(a (dyn Allocator))
                      (session (ptr ReplSession))
                      (self (slice u8))
@@ -10305,37 +10341,12 @@
                          (mut texts))
       (None [] 1)
       (Some [mp]
-            (let [(mut obj)
-                    (cga64-build-mobj a
-                                      mp
-                                      "<repl>"
-                                      (cwd-slice a)
-                                      (box-al [(slice u8)] a (load paths))
-                                      (box-al [(slice u8)] a (load texts))
-                                      false)]
-              (let [prior (repl-jit-image session)]
-                (match (jit-load-reusing a
-                                         (mut obj)
-                                         (if (= (primitive/cast i64 (load (field prior base))) 0)
-                                             (primitive/cast (ptr JitImage) 0)
-                                             prior))
-                  (Err [e0]
-                       (let [e (primitive/alloc-stack JitErr)
-                             w (stderr)]
-                         (set! e e0)
-                         (ps w "error: REPL JIT: ")
-                         (ps w (.msg e))
-                         (wb w 10)
-                         1))
-                  (Ok [img0]
-                      (let [img (primitive/alloc-stack JitImage)]
-                        (set! img img0)
-                        (let [raw (jit-lookup img "coil_repl_entry")]
-                          (if (= (primitive/cast i64 raw) 0)
-                              (do (ps (stderr) "error: REPL JIT entry is missing\n") 1)
-                              (let [rc (primitive/call-ptr (primitive/cast (fnptr c [] i64) raw))]
-                                (set! prior img0)
-                                rc))))))))))))
+            (primitive/call-ptr (load (field session runner))
+                                a
+                                mp
+                                (box-al [(slice u8)] a (load paths))
+                                (box-al [(slice u8)] a (load texts))
+                                (field session state))))))
 
 (defn repl-unsupported [(a (dyn Allocator)) (tp (ptr Type))] (-> i64)
   (let [w (stderr)]

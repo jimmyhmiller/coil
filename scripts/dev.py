@@ -715,10 +715,10 @@ source-roots = ["src"]
     (primitive/load p)))
 """)
             clean = subprocess.run(
-                [coil, "check"],
+                [coil, "build", *backend_flags, "-o", str(project / "clean")],
                 cwd=project, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if clean.returncode != 0:
-                raise RuntimeError("fast modernization gate: low-level detector probe did not check")
+                raise RuntimeError("fast modernization gate: low-level detector probe did not build")
             if "obsolete Coil syntax" in clean.stderr:
                 raise RuntimeError("fast modernization gate: valid low-level primitives triggered migration offer")
 
@@ -727,7 +727,7 @@ source-roots = ["src"]
   (let [p (alloc-stack i64)] 0))
 """)
             legacy = subprocess.run(
-                [coil, "build", "--backend", "arm64", "-o", str(project / "legacy")],
+                [coil, "build", *backend_flags, "-o", str(project / "legacy")],
                 cwd=project, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if "obsolete Coil syntax" not in legacy.stderr:
                 raise RuntimeError("fast modernization gate: obsolete alloc spelling did not trigger migration offer")

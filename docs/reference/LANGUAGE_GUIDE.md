@@ -70,10 +70,13 @@ after rendering a diagnostic. `jit-source` exposes accumulated successful
 definitions and `jit-reset!` starts a fresh state lineage. `coil.jit.reload` is
 the public metaprogram implementing stable typed function bindings.
 
-Currently the execution backend is `arm64-macho`: native ARM64 code emitted by
-Coil's non-LLVM backend and loaded directly on macOS. The SDK does not use LLVM.
-The metaprogram and public session API are backend-neutral, but other hosts need
-their corresponding in-memory object loader before `coil.jit` can execute there.
+The execution backend is selected by host: `arm64-macho` uses Coil's native
+backend on macOS, while `llvm-mcjit-x86_64-linux` lowers each generation through
+LLVM on Linux. Both retain old code for captured function pointers and map each
+new generation's `alloc-static` declarations onto its prior stable addresses.
+An application embedding `coil.jit` on Linux must link LLVM, for example with
+`--link-flag "-L$(llvm-config --libdir)" --link-flag -lLLVM`; the stock
+`coil repl` binary is already LLVM-linked.
 
     [package]
     name  = "app"

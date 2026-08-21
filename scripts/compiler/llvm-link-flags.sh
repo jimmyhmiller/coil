@@ -37,7 +37,7 @@ command -v "$LLVM_CONFIG" >/dev/null 2>&1 || {
 
 # the components the Coil backend actually calls into (see src/compiler/ffi.coil):
 # IR construction + the three targets it can emit for + the O3 pass pipeline.
-COMPONENTS="core target analysis passes aarch64 x86 webassembly"
+COMPONENTS="core target analysis passes executionengine mcjit aarch64 x86 webassembly"
 
 emit() { for f in "$@"; do printf -- '--link-flag %s ' "$f"; done; }
 
