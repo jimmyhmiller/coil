@@ -468,6 +468,19 @@ def test_modernize_fast(compiler: str) -> None:
             if "alloca " in main_ir.split("loop.body:", 1)[1]:
                 raise RuntimeError("fast modernization gate: aggregate loop contains a dynamic alloca")
 
+        def alias_memory_task() -> None:
+            source = "tests/compiler/features/alias_memory.coil"
+            ir = subprocess.run([coil, "emit-ir", source], cwd=ROOT,
+                                stdout=subprocess.PIPE, text=True, check=True).stdout
+            for expected in ('!"Coil explicit type aliasing"',
+                             '!"omnipotent char"', '!"integer32"'):
+                if expected not in ir:
+                    raise RuntimeError(
+                        f"fast modernization gate: alias metadata omitted {expected}")
+            if ir.count("!tbaa") < 2:
+                raise RuntimeError("fast modernization gate: alias load/store omitted TBAA tags")
+            build_run(source, "alias-memory", *backend_flags)
+
         def reexport_task() -> None:
             build_run("tests/compiler/features/reexport_qualified.coil", "reexport-qualified",
                       *backend_flags, want=42)
@@ -755,6 +768,9 @@ source-roots = ["src"]
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o0", "-O0"),
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o3", "-O3"),
             aggregate_ir_task,
+            alias_memory_task,
+            lambda: build_run("tests/compiler/features/linker_address_native.coil",
+                              "linker-address-native"),
             lambda: build_run("tests/compiler/features/void_if_discarded.coil", "void-if-discarded"),
             lambda: build_run("src/examples/bitfields.coil", "static-assert", *backend_flags, want=42),
             lint_task,

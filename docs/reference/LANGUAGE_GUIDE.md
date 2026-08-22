@@ -631,6 +631,14 @@ Everyday memory and layout operations are aliases in ambient `coil.core`: `load`
 `fnptr-of`, and `call-ptr`. Their primitive declarations live only in
 `coil.primitive`; core does not redeclare them.
 
+`(primitive/alias-load T p)` and `(primitive/alias-store! p value)` are unsafe,
+explicitly opt-in versions of scalar load/store. They promise that accesses through
+incompatible scalar types do not alias, allowing the LLVM backend to attach TBAA
+metadata. Use them only when implementing a source language with strict aliasing;
+ordinary Coil pointer casts remain permissive, so ordinary `load`/`store!` deliberately
+make no such promise. Signed and unsigned integers of the same width may alias, all
+pointer types may alias, and 8-bit integer accesses may alias any type.
+
 Allocator-owned storage is managed by `coil.alloc`. Raw storage operations are
 available only through `coil.primitive`,
 including unsigned `primitive/udiv`/`primitive/urem`, integer bit operations such as
