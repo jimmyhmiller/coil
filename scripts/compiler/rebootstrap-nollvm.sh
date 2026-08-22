@@ -65,7 +65,8 @@ cmp /tmp/coil-nl2.o /tmp/coil-nl3.o || { echo "FIXPOINT FAIL — arm64 objects d
 echo "  ok — byte-identical, the compiler reproduces itself"
 
 echo "=== GATE: arm64 behavioral gate-run ==="
-python3 scripts/oracle.py runtime gate arm64 --compiler /tmp/coil-nl2 >/dev/null 2>&1 || { echo "arm64 runtime gate FAIL"; exit 1; }
+python3 scripts/oracle.py runtime gate arm64 --compiler /tmp/coil-nl2 --verbose \
+  || { echo "arm64 runtime gate FAIL"; exit 1; }
 echo "  arm64 gate-run: PASS (programs run identically to the LLVM reference)"
 
 stage_lib_cleanup

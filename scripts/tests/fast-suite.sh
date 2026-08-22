@@ -45,7 +45,7 @@ step() { # step <label> <command...>
     printf '  %-22s FAIL  %ss\n' "$label" "$((t1 - t0))"
     # The log is the point: a fast gate that fails without saying why just moves
     # the work to whoever reruns it locally.
-    tail -25 /tmp/fast-suite.log
+    tail -100 /tmp/fast-suite.log
     fail=1
   fi
 }
