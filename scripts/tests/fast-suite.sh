@@ -52,7 +52,7 @@ step() { # step <label> <command...>
 
 step "oracle coverage"   python3 scripts/oracle.py coverage
 step "hygiene audit"     python3 scripts/hygiene-audit.py --check
-step "oracle snapshots"  python3 scripts/dev.py test snapshots --compiler "$COIL"
+step "oracle snapshots"  python3 scripts/dev.py test snapshots --compiler "$COIL" --verbose
 step "metaprogram+hygiene" scripts/compiler/oracle/gate-run-meta.sh "$COIL"
 step "reader metaprograms" scripts/tests/reader-metaprograms.sh "$COIL"
 step "lint fires"        python3 scripts/tests/lint_fires.py --coil "$COIL"

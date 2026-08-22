@@ -292,6 +292,17 @@ def gate(compiler: Path, stage: str, verbose: bool) -> int:
         if verbose:
             reason = result.stderr.decode(errors="replace").splitlines()[:1]
             print(f"FAIL {stage}: {source}: {reason[0] if reason else 'output mismatch'}")
+            if not reason and reference.is_file():
+                got_lines = result.stdout.decode(errors="replace").splitlines()
+                want_lines = reference.read_text(errors="replace").splitlines()
+                for line_no, (want, got) in enumerate(zip(want_lines, got_lines), 1):
+                    if want != got:
+                        print(f"  first difference at line {line_no}")
+                        print(f"  expected: {want}")
+                        print(f"       got: {got}")
+                        break
+                else:
+                    print(f"  line counts: expected {len(want_lines)}, got {len(got_lines)}")
     print(f"gate {stage}: {passed} passed, {len(failures)} failed")
     return 1 if failures else 0
 
