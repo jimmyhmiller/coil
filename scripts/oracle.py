@@ -33,7 +33,7 @@ TARGET_FULL = "arm64-apple-darwin25.5.0"
 # per-platform duplication. Linux, because that is the platform that had no
 # representation at all. Requires the compiler to apply --target in these dumps.
 TARGET_PINNED = "x86_64-pc-linux-gnu"
-PINNED_STAGES = ("checked", "expand", "mono", "resolved")
+PINNED_STAGES = ("checked", "expand", "ir", "mono", "resolved")
 
 
 def stage_extra(stage: str) -> list[str]:
