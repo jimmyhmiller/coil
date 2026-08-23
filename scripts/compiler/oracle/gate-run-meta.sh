@@ -118,6 +118,10 @@ rc=$?
 rc=$?
 [ "$rc" = 42 ] || { echo "GATE FAIL: syntax identity transport exited $rc, want 42"; fail=1; }
 
+"$BIN" run tests/compiler/features/code_collections.coil >/dev/null 2>&1
+rc=$?
+[ "$rc" = 0 ] || { echo "GATE FAIL: Code collection traits exited $rc, want 0"; fail=1; }
+
 for fixture in implicit_parameter_capture implicit_match_capture implicit_mut_capture implicit_sequential_initializer_capture; do
   "$BIN" check "tests/compiler/hygiene/$fixture.coil" >"$WORK/hyg-$fixture.out" 2>"$WORK/hyg-$fixture.err"
   rc=$?
@@ -352,6 +356,10 @@ for fixture in identity_transport explicit_cross_template_identity identifier_ap
   rc=$?
   [ "$rc" = 42 ] || { echo "GATE FAIL: interpreter engine: $fixture exited $rc, want 42"; fail=1; }
 done
+
+COIL_META_INTERP=1 "$BIN" run tests/compiler/features/code_collections.coil >/dev/null 2>&1
+rc=$?
+[ "$rc" = 0 ] || { echo "GATE FAIL: interpreter engine: Code collection traits exited $rc, want 0"; fail=1; }
 
 for fixture in implicit_cross_template_capture implicit_variadic_splice_capture \
                use_site_binder_cannot_capture before_expand_transform_capture \

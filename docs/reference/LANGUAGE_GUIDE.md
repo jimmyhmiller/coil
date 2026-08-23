@@ -732,6 +732,12 @@ pages so stale accesses fault immediately.
 
 ## Collections (bundled)
 
+The ambient capability traits are the common vocabulary across collections:
+`Len`/`len`, `Get`/`get`, `Set`/three-argument `set!`, `Push`/`push!`,
+`Pop`/`pop!`, and `Iterable`/`iter` plus `Iterator`/`next`. A collection implements
+only the operations its representation can support. `(empty? xs)` works for any
+`Len`; `(for x (iter xs) ...)` works for any `Iterable`.
+
 **ArrayList** (`arraylist.coil`): `(al-new [T] a)`, `(al-len [T] l)`,
 `(al-get [T] l i)`, `(al-set! [T] (mut l) i v)`, `(al-push! [T] (mut l) v)`,
 `(al-pop! [T] (mut l))`, `(al-free! [T] (mut l))`. Mutators take `(mut …)`.
@@ -935,6 +941,19 @@ compile errors. Writing `` `(~@acc ~x) `` to append — which copies the whole
 accumulator per element — is flagged by the standard-profile lint
 `coil.lint.meta`, along with `code-rest` fed to its own recursion and splicing
 a recursive result per level.
+
+Finished `Code` is also an ordinary immutable collection of child `Code` values:
+`(len form)`, `(get form i)`, and `(for child (iter form) ...)` delegate to the
+O(1) code accessors and preserve syntax identity, hygiene, source provenance, and
+views. Non-list syntax has collection length zero (`code-count` itself remains a
+strict list/vector primitive). `CodeBuilder`
+implements `Push` but deliberately not `Len`, `Get`, or `Iterable`; use a mutable
+binding and `(push! (mut builder) child)`, then
+freeze with `(primitive/code-list-done (load builder))`. More commonly,
+`(code-extend! builder form)` appends every child and returns the builder, while
+`(code-collect form)` returns a new finished list. This lets metaprograms use the
+same iterator and push vocabulary as ordinary collection code without weakening
+the arena lifetime or allowing finished syntax to mutate.
 
 Each metaprogram invocation runs in its **own arena**: everything it allocates
 is released when it returns, and exactly one value survives — the returned
