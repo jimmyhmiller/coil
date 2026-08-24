@@ -84,6 +84,7 @@ cc -c -O0 "$WORK/cabi.c" -o "$WORK/cabi.o" 2>"$WORK/cc.log" \
 # ---------------- the Coil side ----------------
 cat > "$WORK/cabi.coil" <<'KEOF'
 (module cabitest)
+(import "coil.primitive" :as primitive)
 (import "coil.io" :use *)
 (import "coil.control" :use *)
 
@@ -112,7 +113,7 @@ cat > "$WORK/cabi.coil" <<'KEOF'
 (extern c_mix_over   :cc c [f64 f64 f64 f64 f64 f64 f64 i64 i64 i64 i64 i64 i64 MIX] (-> i64))
 
 (defn note! [(fb (ptr i64)) (n i64) (got i64) (want i64)] (-> i64)
-  (unless (icmp-eq got want)
+  (unless (= got want)
           (print-str (stderr) "cabi: check ")
           (print-int (stderr) n)
           (print-str (stderr) " got ")
@@ -120,17 +121,17 @@ cat > "$WORK/cabi.coil" <<'KEOF'
           (print-str (stderr) " want ")
           (print-int (stderr) want)
           (print-str (stderr) "\n")
-          (when (icmp-eq (load fb) 0) (store! fb n) 0)
+          (when (= (load fb) 0) (store! fb n) 0)
           0)
   0)
 
 (defn main [] (-> i64)
   (let [w (stdout)
-        fb (alloc-stack i64)
-        p (alloc-stack P2)
-        q (alloc-stack F2)
-        m (alloc-stack MIX)
-        k (alloc-stack PACK)]
+        fb (primitive/alloc-stack i64)
+        p (primitive/alloc-stack P2)
+        q (primitive/alloc-stack F2)
+        m (primitive/alloc-stack MIX)
+        k (primitive/alloc-stack PACK)]
     (store! fb 0)
     (store! (field p a) 100) (store! (field p b) 200)
     (store! (field q x) 3.0) (store! (field q y) 5.0)
@@ -155,11 +156,11 @@ cat > "$WORK/cabi.coil" <<'KEOF'
     (let [r1 (c_p1_ret 5)]
       (note! fb 8 (load (field r1 a)) 15))
     (let [r (c_p2_ret 9)]
-      (note! fb 9 (iadd (load (field r a)) (imul (load (field r b)) 7)) 135))
+      (note! fb 9 (+ (load (field r a)) (* (load (field r b)) 7)) 135))
     (let [r (c_f2_ret 1.5)]
-      (note! fb 10 (cast i64 (fadd (load (field r x)) (fmul (load (field r y)) 7.0))) 22))
+      (note! fb 10 (cast i64 (+ (load (field r x)) (* (load (field r y)) 7.0))) 22))
     (let [r (c_mix_ret 4.0 6)]
-      (note! fb 11 (iadd (cast i64 (load (field r x))) (imul (load (field r n)) 7)) 46))
+      (note! fb 11 (+ (cast i64 (load (field r x))) (* (load (field r n)) 7)) 46))
     ; ---- the register-exhaustion boundary, both sides of it ----
     ; 4 ints leave rdi..rcx used, so P2 fits EXACTLY in r8:r9 -> stays in regs.
     ; 1+4+9+20 = 34; 100*7 + 200*11 = 700+2200 = 2900 -> 2934
@@ -174,7 +175,7 @@ cat > "$WORK/cabi.coil" <<'KEOF'
     ; 2*3 + 5*5 = 6 + 25 = 31
     (note! fb 16 (c_mix_over 1.0 2.0 3.0 4.0 5.0 6.0 7.0 1 2 3 4 5 6 (load m)) 31)
 
-    (if (icmp-eq (load fb) 0)
+    (if (= (load fb) 0)
         (do (print-str w "cabi: all checks passed\n") 0)
         (load fb))))
 KEOF
