@@ -242,16 +242,31 @@ mkdir -p "$T/default-build"
   && ok "--debug selects builds/debug/<source-stem>" \
   || bad "--debug output profile" "no builds/debug/seven"
 # Both the ordinary return path and the linker-failure path must remove the
-# private object directory. Compare names rather than asserting global emptiness:
-# another compiler may legitimately be linking concurrently on this machine.
+# private object directory.
+#
+# The sections of this gate run CONCURRENTLY (gate-cli-parallel.py), so a snapshot
+# of the global glob races: another section's in-flight link legitimately appears
+# between the two `find`s and looks like a leak. Wait for the set to come back to
+# what our own builds left -- a real leak never drains, a concurrent link does.
+printf '(defn helper [] (-> i64) 1)\n' > "$T/no-main.coil"
 find /tmp -maxdepth 1 -name 'coil-link-*' -print 2>/dev/null | sort > "$T/link-tmp-before"
 "$COIL" build "$T/seven.coil" -o "$T/link-clean-success" >/dev/null 2>&1
-printf '(defn helper [] (-> i64) 1)\n' > "$T/no-main.coil"
 "$COIL" build "$T/no-main.coil" -o "$T/no-main" >/dev/null 2>&1 || true
-find /tmp -maxdepth 1 -name 'coil-link-*' -print 2>/dev/null | sort > "$T/link-tmp-after"
-cmp "$T/link-tmp-before" "$T/link-tmp-after" >/dev/null 2>&1 \
+# The window has to outlast a concurrent COMPILER build, not just a link: the
+# heaviest sections here compile whole programs, and their link directory is live
+# for as long as that takes. 60s is far past any of them and still far short of
+# hanging the gate on a genuine leak.
+link_leak=1
+for _ in $(seq 60); do
+  find /tmp -maxdepth 1 -name 'coil-link-*' -print 2>/dev/null | sort > "$T/link-tmp-after"
+  # Only directories that are NEW since the snapshot count; anything that was
+  # already there belongs to someone else.
+  if [ -z "$(comm -13 "$T/link-tmp-before" "$T/link-tmp-after")" ]; then link_leak=0; break; fi
+  sleep 1
+done
+[ "$link_leak" = 0 ] \
   && ok "successful and failed links leave no temporary object directory" \
-  || bad "link temporary cleanup" "new /tmp/coil-link-* directory remains"
+  || bad "link temporary cleanup" "new /tmp/coil-link-* directory remains: $(comm -13 "$T/link-tmp-before" "$T/link-tmp-after" | tr '\n' ' ')"
 expect_rc 1 "bogus --target is rejected"                 "$COIL" build "$T/seven.coil" -o "$T/c" --target not-a-real-triple
 
 echo "== check mode: typecheck/compile with no object (diag-12) =="
@@ -325,10 +340,17 @@ expect_out "LLVM module verification failed after lowering" \
   || bad "failed object emission leaves no temporary artifact" "$T/invalid-module.o.tmp exists"
 
 # A genuinely non-writable -o is a CLEAR error + exit 1, not a SIGABRT.
+# The read-only directory has to exist on THIS host: /System is macOS's, and on
+# Linux there is no /System at all, so the old spelling exercised nothing here.
+UNWRITABLE=$([ "$HOST_OS" = Linux ] && echo /proc/nope || echo /System/nope)
 expect_rc 1 "build -o into a read-only location is a clear error, not SIGABRT" \
-  "$COIL" build "$T/seven.coil" -o /System/nope
+  "$COIL" build "$T/seven.coil" -o "$UNWRITABLE"
+# ...and the object writer's own message, from the subcommand that actually writes
+# one where you point it. `build` stages its object in a temp directory and only
+# copies out at the end, so an unwritable -o fails there in the LINK; `emit-obj`
+# writes the object straight to the path, which is what this diagnostic is for.
 expect_out "could not write object file" "non-writable -o names the path + a remedy" \
-  "$COIL" build "$T/seven.coil" -o /System/nope
+  "$COIL" emit-obj "$T/seven.coil" -o "$UNWRITABLE.o"
 expect_out "usage: coil check" "check --help documents itself"                "$COIL" check --help
 
 echo "== fmt formats EVERY file it is given =="
@@ -1247,13 +1269,16 @@ EOF
 # --sanitize=address runs LLVM's AddressSanitizer pass: the object gains a report
 # call for the store, not merely the module-level ASan constructor.
 # FAILS on the seed ('unknown flag --sanitize=address').
-rm -f "$T/sanobj.o"
+rm -f "$T/sanobj.a"
 "$COIL" build "$T/asanstore.coil" --lib --sanitize=address -O0 -o "$T/sanobj.a" >/dev/null 2>&1
 # ⚠ Capture, then match — never `nm … | grep -q`. `grep -q` exits at its first hit
 # and closes the pipe, `nm` takes SIGPIPE, and under `set -o pipefail` the pipeline
 # reports 141 even though the symbol was found. That made this check fail on a
 # healthy tree with the instrumentation plainly present in the object.
-sansyms=$(nm "$T/sanobj.o" 2>/dev/null)
+# --lib produces the ARCHIVE named by -o and no stray .o beside it; this used to
+# read sanobj.o, a file that is never written, so it could not pass however well
+# the pass had instrumented anything.
+sansyms=$(nm "$T/sanobj.a" 2>/dev/null)
 case "$sansyms" in
   *__asan_report_store*) ok "--sanitize=address instruments ordinary stores" ;;
   *) bad "--sanitize=address store instrumentation" "no __asan_report_store* symbol in the emitted object" ;;
@@ -1603,10 +1628,17 @@ cat > "$T/dbg-off.coil" <<'EOF'
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use *)
 (import "coil.dbgalloc" :use *)
+; With checks OFF the `debug-allocator` macro expands to its argument verbatim, so
+; the wrapper cannot be observed: allocating through it just works, and nothing from
+; coil.dbgalloc is linked. (This used to compare the two allocators by casting each
+; to i64. A `(dyn Allocator)` is a fat trait-object VALUE, not a pointer, so that is
+; not a legal cast any more -- and identity of a copied fat value was never what the
+; passthrough property meant.)
 (defn main [] (-> i64)
-  (let [inner (malloc-allocator)
-        wrapped (debug-allocator inner)]
-    (if (= (primitive/cast i64 inner) (primitive/cast i64 wrapped)) 0 1)))
+  (let [wrapped (debug-allocator (malloc-allocator))]
+    (match (alloc-bytes wrapped 32 8)
+      (None [] 1)
+      (Some [m] (do (free-bytes wrapped m 8) 0)))))
 EOF
 expect_rc 0 "off: debug-allocator is a passthrough (no detection, zero cost)" \
   "$COIL" run "$T/dbg-off.coil"
@@ -1707,7 +1739,9 @@ cat > "$T/dbgalloc-invalid-free.coil" <<'EOF'
 (defn main [] (-> i64)
   (let [debug (debug-allocator-init (malloc-allocator))
         a (debug-allocator-view debug)]
-    (raw-free a (coil.primitive/cast (ptr i8) 4096) 8 8)))
+    (match (bytes-request 8 8)
+      (None [] 1)
+      (Some [rq] (raw-free a (coil.primitive/cast (ptr i8) 4096) rq)))))
 EOF
 expect_out "invalid free in debug-allocator" "debug allocator rejects an unowned pointer without dereferencing it" \
   "$COIL" run "$T/dbgalloc-invalid-free.coil"
