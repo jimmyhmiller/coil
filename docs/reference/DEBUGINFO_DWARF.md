@@ -32,9 +32,9 @@ C:
 
 ## Relocations (the part that makes `dsymutil` work)
 
-On Mach-O the DWARF stays in the `.o` and the linker records a debug map pointing at
-it, so a `-g` build runs **`dsymutil`** to gather `<exe>.dSYM` next to the executable
-and keeps the `.o`.
+On Mach-O the linker records a debug map pointing at the temporary `.o`, so a `-g`
+build runs **`dsymutil`** to gather `<exe>.dSYM` next to the executable before that
+temporary object is removed.
 
 For that to work every DWARF address must carry a relocation — the CU's and each
 subprogram's `low_pc`, and the line program's `set_address`. Each is an 8-byte

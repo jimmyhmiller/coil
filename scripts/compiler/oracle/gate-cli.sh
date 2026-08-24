@@ -194,14 +194,33 @@ echo "== flags are position-independent, unknown ones are errors =="
 expect_rc 7 "build: flags BEFORE the file"               "$COIL" run "$T/seven.coil"
 "$COIL" build -o "$T/a" "$T/seven.coil" >/dev/null 2>&1 && "$T/a"; rc=$?
 [ "$rc" = 7 ] && ok "build -o <out> <file> (Unix order)" || bad "build -o <out> <file>" "rc=$rc"
+[ ! -e "$T/a.o" ] && ok "build leaves only the requested executable" \
+                    || bad "build leaves no adjacent object" "$T/a.o exists"
 expect_rc 1 "unknown flag is rejected"                   "$COIL" build "$T/seven.coil" -o "$T/b" --frobnicate
 expect_out "unknown flag" "unknown flag is named"        "$COIL" build "$T/seven.coil" -o "$T/b" --frobnicate
 rm -rf "$T/default-build"
 mkdir -p "$T/default-build"
 ( cd "$T/default-build" && "$COIL" build "$T/seven.coil" >/dev/null 2>&1 )
-[ -x "$T/default-build/builds/seven" ] && "$T/default-build/builds/seven"; rc=$?
-[ "$rc" = 7 ] && ok "build defaults to builds/<source-stem>" \
+[ -x "$T/default-build/builds/release/seven" ] && "$T/default-build/builds/release/seven"; rc=$?
+[ "$rc" = 7 ] && ok "build defaults to builds/release/<source-stem>" \
               || bad "default build output" "missing or returned rc=$rc"
+[ ! -e "$T/default-build/builds/release/seven.o" ] && ok "default build leaves no object artifact" \
+  || bad "default build leaves no object artifact" "builds/release/seven.o exists"
+( cd "$T/default-build" && "$COIL" build "$T/seven.coil" --debug >/dev/null 2>&1 )
+[ -x "$T/default-build/builds/debug/seven" ] \
+  && ok "--debug selects builds/debug/<source-stem>" \
+  || bad "--debug output profile" "no builds/debug/seven"
+# Both the ordinary return path and the linker-failure path must remove the
+# private object directory. Compare names rather than asserting global emptiness:
+# another compiler may legitimately be linking concurrently on this machine.
+find /tmp -maxdepth 1 -name 'coil-link-*' -print 2>/dev/null | sort > "$T/link-tmp-before"
+"$COIL" build "$T/seven.coil" -o "$T/link-clean-success" >/dev/null 2>&1
+printf '(defn helper [] (-> i64) 1)\n' > "$T/no-main.coil"
+"$COIL" build "$T/no-main.coil" -o "$T/no-main" >/dev/null 2>&1 || true
+find /tmp -maxdepth 1 -name 'coil-link-*' -print 2>/dev/null | sort > "$T/link-tmp-after"
+cmp "$T/link-tmp-before" "$T/link-tmp-after" >/dev/null 2>&1 \
+  && ok "successful and failed links leave no temporary object directory" \
+  || bad "link temporary cleanup" "new /tmp/coil-link-* directory remains"
 expect_rc 1 "bogus --target is rejected"                 "$COIL" build "$T/seven.coil" -o "$T/c" --target not-a-real-triple
 
 echo "== check mode: typecheck/compile with no object (diag-12) =="
@@ -297,17 +316,20 @@ mkdir -p "$T/proj/src"
 printf '[package]\nname  = "proj"\nentry = "src/main.coil"\n' > "$T/proj/Coil.toml"
 printf '(module app)\n(defn main [] (-> i64) 3)\n'            > "$T/proj/src/main.coil"
 ( cd "$T/proj" && "$COIL" build >/dev/null 2>&1 )
-[ -x "$T/proj/builds/proj" ] && ok "project build defaults to builds/<package>" \
-                               || bad "project build" "no ./builds/proj"
+[ -x "$T/proj/builds/release/proj" ] && ok "project build defaults to builds/release/<package>" \
+                                       || bad "project build" "no ./builds/release/proj"
 ( cd "$T/proj" && "$COIL" run >/dev/null 2>&1 ); [ $? = 3 ] && ok "project run propagates exit code" \
                                                             || bad "project run" "want 3"
 # the headline case: --target wasm32 used to print `wrote proj`, exit 0, and emit a Mach-O
-( cd "$T/proj" && rm -f builds/proj && "$COIL" build --target wasm32-unknown-unknown >/dev/null 2>&1 )
-if file "$T/proj/builds/proj" 2>/dev/null | grep -q WebAssembly; then
+( cd "$T/proj" && rm -f builds/release/proj && "$COIL" build --target wasm32-unknown-unknown >/dev/null 2>&1 )
+if file "$T/proj/builds/release/proj" 2>/dev/null | grep -q WebAssembly; then
   ok "project --target wasm32 emits WebAssembly"
 else
-  bad "project --target wasm32" "got: $(file "$T/proj/builds/proj" 2>/dev/null | sed 's/.*: //')"
+  bad "project --target wasm32" "got: $(file "$T/proj/builds/release/proj" 2>/dev/null | sed 's/.*: //')"
 fi
+( cd "$T/proj" && "$COIL" build --debug >/dev/null 2>&1 )
+[ -x "$T/proj/builds/debug/proj" ] && ok "project --debug selects builds/debug" \
+  || bad "project --debug profile" "no ./builds/debug/proj"
 ( cd "$T/proj" && rm -f proj && "$COIL" build -o "$T/proj/elsewhere" >/dev/null 2>&1 )
 [ -x "$T/proj/elsewhere" ] && ok "project -o is honored" || bad "project -o" "not written"
 ( cd "$T/proj" && "$COIL" build --target not-a-real-triple >/dev/null 2>&1 )
@@ -383,8 +405,8 @@ out=$( cd "$T/strict" && "$COIL" build 2>&1 ); rc=$?
   || bad "Git dependency without SHA" "got rc=$rc: $out"
 # a valid manifest still builds
 printf '[package]\nname  = "s"\nentry = "src/main.coil"\n' > "$T/strict/Coil.toml"
-( cd "$T/strict" && rm -f builds/s && "$COIL" build >/dev/null 2>&1 )
-[ -x "$T/strict/builds/s" ] && ok "a valid manifest still builds" || bad "strict valid manifest" "no ./builds/s"
+( cd "$T/strict" && rm -f builds/release/s && "$COIL" build >/dev/null 2>&1 )
+[ -x "$T/strict/builds/release/s" ] && ok "a valid manifest still builds" || bad "strict valid manifest" "no ./builds/release/s"
 
 echo "== namespace index: file placement is irrelevant and paths are rejected =="
 mkdir -p "$T/sib/src/unrelated/place"
@@ -1327,7 +1349,7 @@ cat > "$T/stack-smash.coil" <<'EOF'
 (defn main [] (-> i64) 0)
 EOF
 rm -f "$T/debug-runtime.o"
-"$COIL" build "$T/stack-smash.coil" --lib --debug-runtime -O0 -o "$T/debug-runtime.a" >/dev/null 2>&1
+"$COIL" emit-obj "$T/stack-smash.coil" --debug-runtime -O0 -o "$T/debug-runtime.o" >/dev/null 2>&1
 # Do not use grep -q under pipefail here: the heavily instrumented object has
 # enough symbols that grep's early exit gives nm SIGPIPE and falsely fails the gate.
 nm "$T/debug-runtime.o" 2>/dev/null | grep '__stack_chk_fail' >/dev/null \
@@ -2049,7 +2071,7 @@ printf 'this is not C;\n' > "$T/bad-native/native/bad.c"
 expect_rc 1 "a failed C compiler stops the project build immediately" \
   bash -c 'cd "$1" && "$2" build' _ "$T/bad-native" "$COIL"
 
-echo "== -g: dsymutil runs, the .o is kept, lldb maps source (tool-11) =="
+echo "== -g: dsymutil gathers symbols before temp cleanup; lldb maps source (tool-11) =="
 # The arm64 backend now stamps __text-relative RELOCATIONS on every DWARF address (CU +
 # subprogram low_pc, the line program's set_address). WITHOUT them dsymutil printed "No
 # valid relocations found. Skipping." and produced an EMPTY dSYM — 0 line rows, "No source
@@ -2064,16 +2086,15 @@ EOF
   "$COIL" build "$T/dbg.coil" -g -o "$T/dbgx" >/dev/null 2>&1
   [ -d "$T/dbgx.dSYM" ] && ok "coil build -g gathers a .dSYM" \
                         || bad "coil build -g gathers a .dSYM" "no .dSYM (dsymutil skipped or not run)"
-  [ -e "$T/dbgx.o" ]    && ok "coil build -g keeps the .o (dsymutil reads it)" \
-                        || bad "coil build -g keeps the .o" "the .o was removed"
+  [ ! -e "$T/dbgx.o" ]  && ok "coil build -g leaves no adjacent object" \
+                         || bad "coil build -g object cleanup" "an adjacent .o remains"
   if command -v dwarfdump >/dev/null 2>&1; then
     n=$(dwarfdump --debug-line "$T/dbgx.dSYM/Contents/Resources/DWARF/dbgx" 2>/dev/null | grep -cE '^0x[0-9a-f]+ +[0-9]')
     [ "${n:-0}" -gt 0 ] && ok "the .dSYM line table has rows (was 0 = 'No source available')" \
                         || bad ".dSYM line rows" "0 rows — dsymutil skipped the object (no relocations)"
   fi
-  # REMOVE the .o so lldb MUST use the .dSYM (the portable artifact) — the scenario the
-  # finding describes. On the seed there is no .dSYM and now no .o -> lldb has nothing.
-  rm -f "$T/dbgx.o"
+  # The temporary object is already gone, so lldb MUST use the .dSYM (the portable
+  # artifact). On the seed there is no .dSYM, so lldb has nothing.
   if command -v lldb >/dev/null 2>&1; then
     bp=$(lldb "$T/dbgx" -o "breakpoint set --file dbg.coil --line 3" -o quit 2>&1)
     echo "$bp" | grep -qE 'Breakpoint 1: where = .*dbg\.coil:3' \

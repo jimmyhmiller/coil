@@ -18,6 +18,15 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 # Stage compilers land in /tmp; give /tmp the toolchain library they resolve against.
 . scripts/compiler/stage-lib.sh
+RUN_DIR=$(mktemp -d /tmp/coil-refresh-seed.XXXXXX) \
+  || { echo "cannot create seed-refresh directory"; exit 1; }
+NEWSEED="$RUN_DIR/coil-newseed"
+NEWSEED_NOLLVM="$RUN_DIR/coil-newseed-nollvm"
+cleanup_seed_temps() {
+  stage_lib_cleanup
+  rm -rf "$RUN_DIR"
+}
+trap cleanup_seed_temps EXIT
 WHICH="${1:-both}"
 mkdir -p bootstrap/seeds/native
 updated=()
@@ -72,8 +81,8 @@ seed_source_stamp() {
 
 if [ "$WHICH" = both ] || [ "$WHICH" = full ]; then
   echo "=== [full] verifying before touching the seed ==="
-  "$full_script" /tmp/coil-newseed || { echo "[full] VERIFY FAILED — seed NOT updated"; exit 1; }
-  cp /tmp/coil-newseed "$full_seed"
+  "$full_script" "$NEWSEED" || { echo "[full] VERIFY FAILED — seed NOT updated"; exit 1; }
+  cp "$NEWSEED" "$full_seed"
   chmod +x "$full_seed"
   {
     seed_source_stamp
@@ -86,8 +95,8 @@ fi
 
 if [ "$WHICH" = both ] || [ "$WHICH" = nollvm ]; then
   echo "=== [nollvm] verifying before touching the seed ==="
-  "$nollvm_script" /tmp/coil-newseed-nollvm || { echo "[nollvm] VERIFY FAILED — seed NOT updated"; exit 1; }
-  cp /tmp/coil-newseed-nollvm "$nollvm_seed"
+  "$nollvm_script" "$NEWSEED_NOLLVM" || { echo "[nollvm] VERIFY FAILED — seed NOT updated"; exit 1; }
+  cp "$NEWSEED_NOLLVM" "$nollvm_seed"
   chmod +x "$nollvm_seed"
   {
     seed_source_stamp

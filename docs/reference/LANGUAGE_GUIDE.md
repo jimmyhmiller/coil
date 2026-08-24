@@ -13,7 +13,8 @@ inside it, so `coil` and every `(import "…")` below work from any directory.
 ## Build & run
 
     coil run   file.coil                 # build + run a single file
-    coil build file.coil                 # build builds/file
+    coil build file.coil                 # release build: builds/release/file
+    coil build file.coil --debug         # DWARF debug build: builds/debug/file
     coil build file.coil -o out          # override the output path
     coil install                         # install this package to ~/.local/bin
     coil install --root DIR              # install to DIR/bin instead
@@ -36,6 +37,11 @@ inside it, so `coil` and every `(import "…")` below work from any directory.
 `main`'s `i64` return is the process exit code. Normal builds are ahead of time;
 the interactive `coil repl` uses the native in-process JIT. A file that is
 imported must start with `(module NAME)`. `Coil.toml`:
+
+Native `build` writes its intermediate object in a private temporary directory,
+spawns the linker driver directly with an argument vector (never through a shell),
+and removes the object after linking. Only the requested executable remains.
+Set `COIL_CC` to select a compatible linker driver; the default is `cc`.
 
 ### Interactive development
 
@@ -93,8 +99,10 @@ configuration**: `coil build src/main.coil`, `coil run src/main.coil` and
 `coil check src/main.coil` resolve the same dependencies and apply the same
 `[cc]`, `[link]` and `[metaprograms]` as the bare command, so an
 `(import "somedep.lib")` that works one way works the other. Build artifacts default
-to `builds/<source-stem>` for a named file and `builds/<package-name>` for a package;
-`-o` overrides either path, and `[build] out` overrides the package artifact name.
+to `builds/release/<source-stem>` for a named file and `builds/release/<package-name>`
+for a package. `-g` or `--debug` emits DWARF symbols and selects the corresponding
+`builds/debug/` directory. `-o` overrides the complete path, and `[build] out`
+overrides the package artifact name.
 Outside a project — no `Coil.toml` — a file is compiled on its own, as always.
 `coil new` adds both `/builds` and `/.coil` to the new package's `.gitignore`.
 
@@ -775,6 +783,54 @@ UTF-8. An empty escape, a missing semicolon, a surrogate, or a value above
 `(slice-get s i)`, `(subslice s lo hi)`, `(slice-new [T] ptr n)`. String helpers
 (`str.coil`): `(str-len s)`, `(char-at s i)`, `(str-eq a b)`, `(str-hash s)`,
 `(substr s lo hi)`, `(str-concat a x y)`.
+
+`coil.str` also provides validated text types alongside the compatible byte-slice
+API. `StringView` is a borrowed immutable view of valid UTF-8; `String` is an owned,
+growable UTF-8 buffer that stores its allocator and is released explicitly:
+
+    (let [view (string-view-unchecked "hello") ; trusted literal -> StringView
+          (mut text) (string-from-view allocator view)]
+      (string-push-view! (mut text) (string-view-unchecked " world"))
+      (print-str writer (string-view-bytes (string-as-view (load text))))
+      (string-free! (mut text)))
+
+Use `(string-view-from-utf8 bytes)` for untrusted bytes; it returns
+`(Result StringView Utf8Error)`. `(string-view-bytes view)` borrows the underlying
+bytes. `(string-clone allocator text)` makes an independent owner. As with
+`al-slice`, a `StringView` into a `String` is invalidated by mutation or free.
+`(string-from-utf8 allocator bytes)` validates and copies into an owner.
+`(string-take! (mut text))` transfers ownership and resets the source;
+`(string-into-bytes! (mut text))` transfers the allocation as a byte slice.
+
+`Rune` represents a Unicode scalar value. `(rune-new value)` validates it, and
+iteration over `StringView` or `String` currently yields `Rune` values. Text has no
+integer `Get`/`Set`; `(string-index-at-byte view offset)` accepts only UTF-8 scalar
+boundaries and returns an opaque `StringIndex`. Search returns the same index type:
+`string-view-find`, `string-view-contains?`, `string-view-starts-with?`, and
+`string-view-ends-with?`. `String` implements `TextWrite`, whose `write-view!` and
+`write-rune!` methods append validated text without exposing byte mutation.
+`string-view-trim-ascii` and `string-view-split` return borrowed views; splitting is
+an allocation-free `StringSplitIter` driven with `next`.
+
+`(sv "literal")` is the concise, zero-validation spelling for a literal
+`StringView`; it rejects non-literal arguments at expansion time. Ordinary string
+literals remain `(slice u8)` during migration, so byte-oriented code does not change
+meaning implicitly.
+
+Import `coil.unicode.grapheme` for Unicode extended grapheme clusters. `(chars
+view)` returns an iterable whose items are borrowed `Char` views. Its generated
+Unicode 17 tables implement UAX #29 GB3–GB13, including combining sequences, Hangul,
+emoji ZWJ sequences, regional indicators, and Indic conjuncts. Scalar iteration in
+`coil.str` remains available without pulling the Unicode tables into the reachable
+program.
+
+For migration inventory, mark a declaration with `;; string` and run:
+
+    coil lint file.coil --use coil.lint.string
+
+The checker classifies marked `(slice u8)` declarations as propagation-required,
+byte-mutation-ambiguous, or stale-marker. It is report-only: it does not apply a
+local signature rewrite that would leave callers ill-typed.
 
 ## Character literals
 

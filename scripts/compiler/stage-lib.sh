@@ -14,6 +14,11 @@
 mkdir -p /tmp/lib/coil
 ln -sfn "$PWD/src/stdlib" /tmp/lib/coil/stdlib
 ln -sfn "$PWD/src/compiler/prelude.coil" /tmp/lib/coil/prelude.coil
+# Native archives are resolved beside the compiler executable. Stage compilers live
+# directly in /tmp, so mirror the installed <prefix>/bin/native layout there too.
+if [ -d "$PWD/build/bin/native" ]; then
+  ln -sfn "$PWD/build/bin/native" /tmp/native
+fi
 
 # Remove only the links this checkout installed. Leaving them behind makes a later
 # CLI layout test accidentally discover this checkout through /tmp and report a
@@ -23,5 +28,7 @@ stage_lib_cleanup() {
     && rm /tmp/lib/coil/stdlib
   [ "$(readlink /tmp/lib/coil/prelude.coil 2>/dev/null)" = "$PWD/src/compiler/prelude.coil" ] \
     && rm /tmp/lib/coil/prelude.coil
+  [ "$(readlink /tmp/native 2>/dev/null)" = "$PWD/build/bin/native" ] \
+    && rm /tmp/native
   rmdir /tmp/lib/coil /tmp/lib 2>/dev/null || true
 }

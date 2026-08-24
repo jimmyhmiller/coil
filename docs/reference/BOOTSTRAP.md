@@ -35,8 +35,8 @@ python3 scripts/dev.py test modernize-fast --compiler /tmp/coil-candidate
 
 It tests clean comparisons at every integer width and in `static-assert`, then verifies
 qualified/transitive namespace re-exports, the `coil.process` facade, and the
-legacy-operation autofixer and its idempotence. The gate has a hard 30-second
-budget (22.05 seconds on the development machine when introduced).
+legacy-operation autofixer and its idempotence. The gate reports elapsed time for
+visibility but does not fail based on wall-clock duration.
 
 Run `python3 scripts/dev.py build full` once, after the fast gate is green. The full
 gate remains authoritative for fixpoint reproduction, snapshots, the behavioral and

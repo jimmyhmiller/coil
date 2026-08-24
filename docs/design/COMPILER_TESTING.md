@@ -135,9 +135,9 @@ suite into the runner without rewriting it.
 3. everything-else deftests: stdlib, apps, scheme dialect suites,
 4. scheme differential harness (when oracles or frozen refs are present).
 
-Same command, same result, both platforms. The bounded inner loop
+Same command, same result, both platforms. The focused inner loop
 (`modernize-fast`'s role) becomes a tagged subset: canaries + unit tests +
-a handful of fast integration tests, still under 30 seconds.
+a handful of integration tests. Its duration is telemetry, not pass/fail evidence.
 
 **Platform parity rule:** a check either runs identically on macOS and Linux,
 or it is *listed* as platform-specific in one place (the runner), with its

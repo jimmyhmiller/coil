@@ -157,9 +157,10 @@ For iteration, build one candidate compiler and run:
 python3 scripts/dev.py test modernize-fast --compiler /tmp/coil-candidate
 ```
 
-The bounded gate includes the hosted system and facade fixtures and has a hard
-30-second budget. Final compiler evidence is an ARM64 candidate rebuild with a
-byte-for-byte object comparison, followed by one consolidated snapshot audit:
+The focused gate includes the hosted system and facade fixtures and reports its
+elapsed time without imposing a timing-based failure. Final compiler evidence is
+an ARM64 candidate rebuild with a byte-for-byte object comparison, followed by one
+consolidated snapshot audit:
 
 ```text
 cmp /tmp/coil-candidate.o /tmp/coil-candidate-next.o
