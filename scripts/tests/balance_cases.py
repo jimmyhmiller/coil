@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 CASES = REPO / "tests/balance/cases"
@@ -49,6 +52,41 @@ EXPECTED = {
     # Two damaged forms; the balanced form between them must survive untouched.
     "two-damaged-forms": ("repair", None, ["--no-typecheck"]),
 }
+
+
+def check_timeout_and_interrupt(cmd: list[str]) -> bool:
+    src = CASES / "typecheck-timeout.coil"
+    # Keep this directly in /tmp. A nested directory is treated as a source root and
+    # its namespace validation rejects the candidate before reaching comptime.
+    with tempfile.NamedTemporaryFile(prefix="coil-balance-timeout-", suffix=".coil", dir="/tmp") as f:
+        target = pathlib.Path(f.name)
+        # The final empty line leaves an insertion point after the comptime form;
+        # without it all generated readings fail before evaluating that form.
+        original = src.read_bytes() + b"\n"
+        target.write_bytes(original)
+        started = time.monotonic()
+        p = subprocess.run(cmd + ["--write", str(target)], capture_output=True, timeout=15)
+        elapsed = time.monotonic() - started
+        workaround = f"coil balance --no-typecheck --strict --write {target}".encode()
+        if p.returncode != 2 or b"timed out" not in p.stderr or workaround not in p.stderr:
+            print(f"FAIL typecheck-timeout: exit {p.returncode} after {elapsed:.1f}s\n{p.stderr.decode()}")
+            return False
+        if target.read_bytes() != original:
+            print("FAIL typecheck-timeout: refusal modified the source")
+            return False
+
+        # Send SIGINT only to the parent and ensure the command relinquishes its
+        # inherited output pipes promptly instead of keeping the caller wedged.
+        proc = subprocess.Popen(cmd + ["--write", str(target)], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, start_new_session=True)
+        time.sleep(0.5)
+        interrupted = time.monotonic()
+        proc.send_signal(signal.SIGINT)
+        proc.communicate(timeout=3)
+        if proc.returncode not in (-signal.SIGINT, 130) or time.monotonic() - interrupted >= 2:
+            print(f"FAIL typecheck-interrupt: exit {proc.returncode} was not prompt")
+            return False
+    return True
 
 
 def balance_cmd(binary: str) -> list[str]:
@@ -138,6 +176,11 @@ def main() -> int:
         else:
             mode = " --no-typecheck" if flags else ""
             print(f"  ok   — {name} ({outcome}{mode})")
+
+    if check_timeout_and_interrupt(cmd):
+        print("  ok   — typecheck timeout is bounded and SIGINT is prompt")
+    else:
+        ok = False
 
     # The regression that started all this: repairing one form must not move a single
     # delimiter in the balanced form that follows it.

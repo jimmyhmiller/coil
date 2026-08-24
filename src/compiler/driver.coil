@@ -7579,7 +7579,7 @@
 ;; `coil balance` on a wasm-hosted compiler degrades to the indentation-only answer,
 ;; which is exactly what `--no-typecheck` gives.
 (defn if-can-fork [(body Code)] (-> Code)
-  (native-only body `false))
+  (native-only body `0))
 
 ;; `body` on a native target, `alt` on wasm — the general form of the rule above.
 ;;
@@ -7589,13 +7589,36 @@
 ;; is irrelevant; a runtime guard does not help. Every embedder of the wasm compiler
 ;; then has to supply the capability, so a name referenced here is a line in a contract
 ;; with people who will never call it.
-(defn candidate-checks? [(a (dyn Allocator)) (src (slice u8)) (path (slice u8))] (-> bool)
+(defn balance-pause [] (-> i64)
+  (match (time/duration-millis 10)
+    (Err [_] 0)
+    (Ok [d] (do (time/sleep d) 0))))
+
+(defn balance-kill-reap! [(pid i32) (stp (ptr i32))] (-> i64)
+  (os/kill pid 9)
+  (let [(mut done) false]
+    (loop (if (load done)
+              (break)
+              (let [rc (os/waitpid pid stp 0)]
+                (if (or (= rc pid) (and (< rc 0) (!= (os/os-errno) 4)))
+                    (store! done true)
+                    0)))))
+  0)
+
+; 1 = checks, 0 = rejected/fork failure, -1 = timed out. A candidate is isolated
+; in a child both for memory reclamation and so an unbounded comptime evaluation
+; can be killed without compromising the compiler doing the repair.
+(defn candidate-checks? [(a (dyn Allocator))
+                         (src (slice u8))
+                         (path (slice u8))
+                         (budget (mut i64))
+                         (progress (mut bool))] (-> i64)
   (if-can-fork (let [stp (primitive/alloc-stack i32)
                      pid (os/fork)]
                  (cond ; Fork failed. Report "cannot verify" rather than falling back to an in-process
                        ; run: the fallback is exactly the unbounded path this exists to avoid, and an
                        ; unverified candidate must never be written.
-                       (< pid (primitive/cast i32 0)) false
+                       (< pid (primitive/cast i32 0)) 0
                        (= pid (primitive/cast i32 0))
                          (do
                            (sug-reset)
@@ -7610,11 +7633,46 @@
                                                             1)
                                                          0
                                                          1)))
-                           false)
+                           0)
                        :else
-                         (do
-                           (os/waitpid pid stp 0)
-                           (= (wait-code (primitive/cast i64 (load stp))) (primitive/cast i64 0)))))))
+                         (let [(mut ticks) 0]
+                           (block :wait
+                             (loop
+                               (let [rc (os/waitpid pid stp 1)] ; WNOHANG
+                                 (cond (= rc pid)
+                                         (let [status (primitive/cast i64 (load stp))]
+                                           ; Ctrl-C reaches the foreground child too. Do not
+                                           ; reinterpret that as a rejected candidate and move
+                                           ; on to the next one: terminate the parent immediately.
+                                           (when (= (wait-signal status) (primitive/cast i64 2))
+                                             (os/_exit (primitive/cast i32 130)) 0)
+                                           (return-from :wait
+                                             (if (= (wait-code status) (primitive/cast i64 0)) 1 0)))
+                                       (< rc (primitive/cast i32 0))
+                                         (if (= (os/os-errno) (primitive/cast i64 4))
+                                             (do
+                                               (balance-kill-reap! pid stp)
+                                               (os/_exit (primitive/cast i32 130))
+                                               0)
+                                             (do (balance-kill-reap! pid stp) (return-from :wait 0)))
+                                       (or (>= (load ticks) (primitive/cast i64 500))
+                                           (<= (load budget) (primitive/cast i64 0)))
+                                         (do
+                                           (balance-kill-reap! pid stp)
+                                           (return-from :wait -1))
+                                       :else
+                                         (do
+                                           (when (and (not (load progress))
+                                                      (<= (load budget) (primitive/cast i64 300)))
+                                             (let [w (stderr)]
+                                               (ps w "note: typechecking a possible delimiter repair for ")
+                                               (ps w path)
+                                               (ps w " is taking longer than expected\n"))
+                                             (store! progress true)
+                                             0)
+                                           (balance-pause)
+                                           (set! budget (primitive/isub (load budget) 1))
+                                           (set! ticks (primitive/iadd (load ticks) 1))))))))))))
 
 ; Ask the type checker which balancing is Coil.
 ;
@@ -7645,11 +7703,15 @@
 ; Counting stops at 2, since ambiguity is proven by the second match and nothing after
 ; it changes the answer.
 (defstruct Adjudged
-  [(text (slice u8)) (tried i64) (matches i64) (capped bool) (has-primary bool) (primary-ok bool)])
+  [(text (slice u8)) (tried i64) (matches i64) (capped bool) (timed-out bool) (has-primary bool) (primary-ok bool)])
 
 (defn adjudicate [(a (dyn Allocator)) (src (slice u8)) (path (slice u8)) (adj (ptr Adjudged))] (-> i64)
   (let [cs (primitive/alloc-stack bal/Cands)
-        (mut i) 0]
+        (mut i) 0
+        ; Five seconds across the WHOLE search, not five seconds per candidate.
+        ; A succession of merely-slow failures was the original multi-minute hang.
+        (mut budget) 500
+        (mut progress) false]
     (bal/balance-candidates a src 24 cs)
     (let [cands (.texts cs)
           n (al-len [(slice u8)] cands)]
@@ -7657,6 +7719,7 @@
       (set! (.tried adj) 0)
       (set! (.matches adj) 0)
       (set! (.capped adj) (.capped cs))
+      (set! (.timed-out adj) false)
       (set! (.has-primary adj) false)
       (set! (.primary-ok adj) false)
       ; Candidate 0 is the indentation answer when `balance-src` produced one; it is
@@ -7669,7 +7732,16 @@
                 (break)
                 (do
                   (set! (.tried adj) (primitive/iadd (.tried adj) 1))
-                  (when (candidate-checks? a (al-get [(slice u8)] cands (load i)) path)
+                  (let [checked (candidate-checks? a
+                                                   (al-get [(slice u8)] cands (load i))
+                                                   path
+                                                   (mut budget)
+                                                   (mut progress))]
+                    (when (< checked (primitive/cast i64 0))
+                      (set! (.timed-out adj) true)
+                      (set! i n)
+                      0)
+                  (when (= checked (primitive/cast i64 1))
                     (when (= (load (field adj matches)) (primitive/cast i64 0))
                       (store! (field adj text) (al-get [(slice u8)] cands (load i)))
                       0)
@@ -7677,7 +7749,7 @@
                       (store! (field adj primary-ok) true)
                       0)
                     (store! (field adj matches) (primitive/iadd (load (field adj matches)) 1))
-                    0)
+                    0))
                   (set! i (primitive/iadd (load i) 1))
                   ; A DERIVED answer that compiles needs no alternatives: indentation
                   ; placed every closer at a boundary the layout forced, and semantics
@@ -7773,6 +7845,14 @@
                 0)
               (stats-log! a path "repaired" "derived" tried m guessed false)
               (balance-emit a path (load (field adj text)) write))
+          (load (field adj timed-out))
+            (do
+              (stats-log! a path "refused" "typecheck-timeout" tried m guessed false)
+              (ps w "error: typechecking a possible delimiter repair timed out; no repair was written\n")
+              (ps w "try: coil balance --no-typecheck --strict --write ")
+              (ps w path)
+              (wb w 10)
+              2)
           ; BEFORE the uniqueness test, not after: a capped enumeration is INCOMPLETE, so
           ; "exactly one of the candidates compiled" says nothing about the ones never
           ; generated. Testing uniqueness first let a truncated set look decisive, which is

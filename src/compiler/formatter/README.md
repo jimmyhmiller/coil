@@ -142,6 +142,16 @@ Diagnostics from rejected candidates go to a null writer, not stderr. `set-diag-
 alone is not enough: the pipeline also writes located errors to the writer it's handed,
 and a rejected hypothesis printing over your terminal reads as though `balance` failed.
 
+Candidate typechecking has a five-second budget for the whole search. After two seconds
+`balance` reports that it is still checking; on expiry it kills the checker, writes
+nothing, and prints the exact indentation-only fallback command:
+
+```
+coil balance --no-typecheck --strict --write FILE
+```
+
+SIGINT terminates the search immediately and does not leave a checker child behind.
+
 **What nothing can settle**, always reported with a location: a `)` against a `[`
 (either could be the typo); an unterminated string; a defect needing a delimiter
 *moved*.
