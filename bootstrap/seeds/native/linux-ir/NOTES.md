@@ -24,24 +24,41 @@ able to tell a broken emission from a broken clang.
 
 ## Provenance
 
-**This revision was cross-emitted from macOS (arm64) and has never been run.** It is an
-UNVERIFIED stage0 by construction: nothing on the emitting host can execute an ELF
-binary, so treat it as a bootstrap of last resort, smoke-test the toolchain first, and
-use it only to drive a real `rebootstrap-linux.sh` whose fixpoint and gates are what
-actually vouch for the seed you commit.
+**This revision was cross-emitted from macOS (arm64) and has never been RUN.** It is an
+UNVERIFIED stage0 in the only sense that matters — nothing on the emitting host can
+execute an ELF binary — so treat it as a bootstrap of last resort, smoke-test the
+toolchain first, and use it only to drive a real `rebootstrap-linux.sh` whose fixpoint
+and gates are what actually vouch for the seed you commit.
 
     coil emit-ir src/compiler/main.coil \
         --target x86_64-unknown-linux-gnu > coil-linux.ll
 
-Emitted at commit `596c66f` ("Stop a closed peer from killing the process on socket
-write"), from a clean tree, by a compiler built from that same source. Note that
-`emit-ir --help` does not advertise `--target`, but it honours it — the help text is
-wrong, not the flag.
+Emitted at commit `62680c6` ("Give the linker child this process's environment") from a
+clean tree, by a compiler built from that same source (3-stage self-host, LLVM fixpoint
+stage2.o == stage3.o). Note that `emit-ir --help` does not advertise `--target`, but it
+honours it — the help text is wrong, not the flag.
 
-That commit is on the `socket-nosigpipe` branch rather than `main`, chosen on purpose:
-it is the first revision where `match` has native `(_ …)` catch-all arms, so a stage0
-built from it can compile source both before and after that syntax lands. A stage0 taken
-from `main` would have to be re-blessed again the moment those branches merge.
+Unlike previous revisions this one was checked as far as macOS permits, which is
+further than "emitted and hoped":
+
+  - `llvm-as` parses it (24.9 MB of IR -> 6.5 MB bitcode, 8118 defines);
+  - `llc -mtriple=x86_64-unknown-linux-gnu -filetype=obj` produces a real
+    `ELF 64-bit LSB relocatable, x86-64` object, so codegen does not hit an
+    unimplemented ABI path;
+  - the undefined-symbol scan finds **176** distinct `LLVMxxx` C-API symbols, newest
+    `LLVMArrayType2` / `LLVMConstArray2` (LLVM 17), so LLVM 20/21/22 all satisfy it.
+
+What that does NOT establish is that the binary works. Only running it does, and only a
+Linux host can. Emitted from `main` rather than a side branch this time: the `(_ …)`
+catch-all syntax that motivated pinning `596c66f` has long since landed, so there is no
+longer a reason to prefer an older revision.
+
+Why this revision exists: the committed ELF seed `coil-seed-linux-x86_64` went
+internally inconsistent — its own embedded stdlib calls
+`coil.primitive.fresh-identifier`, which its compiler does not have, so it cannot
+compile anything and no checkout-side change can fix it. The portable WASM seed is
+stale too. That leaves no viable stage0 on a Linux box, which is exactly the
+circularity these files exist to break.
 
 An earlier revision of these files was emitted natively on Linux, after the port fixes
 landed in `src/compiler` (portable pthread semaphores replacing Darwin GCD, dlsym'd
