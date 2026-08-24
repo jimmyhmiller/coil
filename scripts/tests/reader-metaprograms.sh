@@ -16,6 +16,30 @@ fail() { echo "reader metaprograms: FAIL — $1"; exit 1; }
 "$COIL" run "$FIX/config.sexpr" --use reader.fixture.config >/dev/null
 [ $? = 42 ] || fail "configured s-expression run"
 
+"$COIL" check "$FIX/raw.answer" --use reader.fixture.fs \
+  || fail "ordinary filesystem read/write from reader"
+cmp -s "$FIX/raw.answer" /tmp/coil-reader-fs-provider.txt \
+  || fail "reader filesystem write contents"
+rm -f /tmp/coil-reader-fs-provider.txt
+
+counter="$T/reader-count"
+"$COIL" check "$FIX/raw.answer" --use reader.fixture.once -- "$counter" \
+  || fail "single-invocation reader check"
+[ "$(cat "$counter")" = x ] || fail "reader was invoked more than once"
+
+"$COIL" run "$FIX/raw.answer" --use reader.fixture.computed >/dev/null
+[ $? = 10 ] || fail "computed runtime string passed to code-read"
+"$COIL" run "$FIX/raw.answer" "$FIX/config.sexpr" \
+  --use reader.fixture.computed -- -I inc -DNAME=7 -include forced.h >/dev/null
+[ $? = 25 ] || fail "aggregate reader inputs/arguments"
+
+multi_plain=$("$COIL" check "$FIX/raw.answer" "$FIX/config.sexpr" 2>&1)
+[ $? = 1 ] || fail "multiple inputs without a reader provider exit status"
+case "$multi_plain" in
+  *"multiple input files require exactly one registered read provider"*) ;;
+  *) fail "multiple inputs without provider diagnostic: $multi_plain" ;;
+esac
+
 "$COIL" run "$FIX/hygiene_binder.sexpr" --use reader.fixture.config >/dev/null
 [ $? = 42 ] || fail "code-read template binder captured use-site syntax"
 
