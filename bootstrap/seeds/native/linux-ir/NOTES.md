@@ -22,6 +22,20 @@ exits 55 and the compiler IR then fails, the toolchain is exonerated and the fau
 the new IR. Refreshing all three together destroys that distinction — you would not be
 able to tell a broken emission from a broken clang.
 
+## Before you build: two things that bite on a fresh box
+
+**Use a clang that matches your libLLVM.** The IR contains `captures(none)`, which
+older clang front ends do not parse. Rather than editing the artifact, link with the
+clang beside the libLLVM you are linking against (`/usr/lib/llvm-21/bin/clang` on a
+Debian-ish box), which keeps parser and library on one version. A
+`-Woverride-module` warning on the `-c` step is expected and harmless.
+
+**Run `scripts/native/build-curl.sh` first.** stage1 otherwise stops with
+`http_client.coil needs Coil's bundled libcurl`. It builds `libcurl.a` + mbedtls into
+`build/bin/native/curl/<arch>/`. The error names its own fix, but it lands between
+"no stage0" and "build linux", which is exactly the stretch this file is walking you
+through.
+
 ## Provenance
 
 **This revision was cross-emitted from macOS (arm64) and has never been RUN.** It is an
