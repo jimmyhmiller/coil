@@ -466,6 +466,21 @@ def test_modernize_fast(compiler: str) -> None:
             if "alloca " in main_ir.split("loop.body:", 1)[1]:
                 raise RuntimeError("fast modernization gate: aggregate loop contains a dynamic alloca")
 
+        def alloc_static_initial_task() -> None:
+            source = "tests/compiler/features/alloc_static_initial.coil"
+            build_run(source, "alloc-static-initial")
+            ir = subprocess.run([coil, "emit-ir", source], cwd=ROOT,
+                                stdout=subprocess.PIPE, text=True, check=True).stdout
+            expected = (
+                "global %alloc-static-initial.Triple { i32 1, i32 2, i32 3 }",
+                "global %alloc-static-initial.Entry { i32 4, ptr @alloc-static-initial.answer, i32 5 }",
+            )
+            if any(fragment not in ir for fragment in expected):
+                raise RuntimeError("fast modernization gate: alloc-static initializer was not emitted as data")
+            if any("store" in line and "@repl_static.alloc-static-initial" in line
+                   for line in ir.splitlines()):
+                raise RuntimeError("fast modernization gate: alloc-static initializer emitted runtime stores")
+
         def alias_memory_task() -> None:
             source = "tests/compiler/features/alias_memory.coil"
             ir = subprocess.run([coil, "emit-ir", source], cwd=ROOT,
@@ -770,6 +785,7 @@ source-roots = ["src"]
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o0", "-O0"),
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o3", "-O3"),
             aggregate_ir_task,
+            alloc_static_initial_task,
             alias_memory_task,
             lambda: build_run("tests/compiler/features/linker_address_native.coil",
                               "linker-address-native"),

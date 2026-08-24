@@ -196,6 +196,10 @@ New API this project added (all shipped):
   both type-aware rewrites and syntactic desugarings. Demos: `tests/metaprogramming/retkind*.coil`
   (rewrites a marker by the wrapped call's real return type) and `dialect.coil`/`tx_test`
   (`inc`→`iadd`).
+- **`(transform-once FN)`** — the single-pass semantic variant. It receives the
+  same checked program and its output still receives the authoritative strict
+  resolve/typecheck, but Coil does not execute it a second time to prove a
+  fixpoint. Use it only when one traversal is the complete rewrite.
 - **`(primitive/code-decl NODE)` → a declaration record**, read from that authoritative checked
   program. `(decl MODULE fn [PARAM-TYPE…] RET)` for a function, `(decl MODULE KIND)` for
   a struct/sum/trait/const/extern, `:unresolved`, or `:ambiguous`. **Pass a resolved
