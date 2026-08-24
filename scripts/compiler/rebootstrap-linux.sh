@@ -28,6 +28,9 @@ cd "$(dirname "$0")/../.."
 . scripts/compiler/stage-lib.sh
 SRC=src/compiler/main.coil
 SEED=bootstrap/seeds/native/coil-seed-linux-x86_64
+RUN_DIR=$(mktemp -d /tmp/coil-rebootstrap-linux.XXXXXX) || exit 1
+trap 'stage_lib_cleanup; rm -rf "$RUN_DIR"' EXIT
+S1="$RUN_DIR/coil-lrb1"; S2="$RUN_DIR/coil-lrb2"; S3="$RUN_DIR/coil-lrb3"
 
 libdir="${COIL_LLVM_LIBDIR:-}"
 if [ -z "$libdir" ]; then
@@ -51,14 +54,16 @@ echo "stage0 = $STAGE0 ($STAGE0_SOURCE; libLLVM: $libdir)"
 stage0_check "$STAGE0" "$SEED" "$SRC" "${LF[@]}" || exit 1
 
 echo "=== stage1: stage0 builds the self-host compiler ==="
-COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o /tmp/coil-lrb1 ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
+COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o "$S1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it ==="
-/tmp/coil-lrb1   build "$SRC" -o /tmp/coil-lrb2 "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
+"$S1" build "$SRC" -o "$S2" "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
 echo "=== stage3: stage2 rebuilds it ==="
-/tmp/coil-lrb2   build "$SRC" -o /tmp/coil-lrb3 "${LF[@]}" || { echo "stage3 FAILED"; exit 1; }
+"$S2" build "$SRC" -o "$S3" "${LF[@]}" || { echo "stage3 FAILED"; exit 1; }
 
-echo "=== FIXPOINT: stage2.o vs stage3.o ==="
-cmp /tmp/coil-lrb2.o /tmp/coil-lrb3.o || { echo "FIXPOINT FAIL — objects differ (nondeterminism)"; exit 2; }
+echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="
+"$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" || { echo "stage2 object emission FAILED"; exit 1; }
+"$S2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" || { echo "stage3 object emission FAILED"; exit 1; }
+cmp "$RUN_DIR/stage2.o" "$RUN_DIR/stage3.o" || { echo "FIXPOINT FAIL — objects differ (nondeterminism)"; exit 2; }
 echo "  ok — byte-identical, the compiler reproduces itself"
 
 # This script proves ONE thing: the compiler reproduces itself on Linux x86-64.
@@ -86,7 +91,7 @@ stage_lib_cleanup
 
 DEST="${1:-build/bin/coil}"
 mkdir -p "$(dirname "$DEST")"
-cp /tmp/coil-lrb2 "$DEST"
+cp "$S2" "$DEST"
 echo "=== VERIFIED self-host compiler installed -> $DEST ==="
 python3 scripts/dev.py install --source "$DEST" \
   || { echo "global install FAILED"; exit 1; }

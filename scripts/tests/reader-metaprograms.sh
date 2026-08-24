@@ -90,7 +90,7 @@ collided=$("$COIL" run "$BF/hello.bf" --use reader.fixture.brainfuck --use reade
 
 # Four thousand flat operations is enough to expose the historical quadratic
 # quasiquote suffix-splicing implementation while keeping the generated module
-# itself reasonable for the bounded gate.
+# itself reasonable for the focused gate.
 "$COIL" check "$BF/flat.bf" --use reader.fixture.brainfuck \
   || fail "large flat Brainfuck source"
 

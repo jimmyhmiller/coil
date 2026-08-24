@@ -2217,7 +2217,9 @@
     (set! (.dump-fn ctx) dfn)
     (run-on-big-stack ctx)))
 
-; The intermediate object path for output `out`
+; The conventional object path for explicit `emit-obj` output and temporary
+; `run` cleanup. Normal `build` objects live in a private temporary directory;
+; they are linker inputs, not user-visible build artifacts.
 ; `out_path.with_extension("o")`: REPLACE the final path-component extension with
 ; `o` (`a.out` -> `a.o`, `foo.coil` -> `foo.o`), or APPEND `.o` when the basename
 ; has none (`foo` -> `foo.o`). A `.` in a parent directory doesn't count; a leading
@@ -2279,7 +2281,7 @@
   (read-src-rc a path 1))
 
 ; ---- child exit status ------------------------------------------------------
-; `system` returns a raw wait(2) status, NOT an exit code. The low 7 bits hold the
+; Child-process APIs return a raw wait(2) status, NOT an exit code. The low 7 bits hold the
 ; terminating signal (0 when the child exited normally); the exit code sits in the
 ; high byte. Reading only the high byte — (st/256)&255 — yields 0 for EVERY signal
 ; death, so a child that segfaulted reported success. These two are the one place
@@ -2289,7 +2291,7 @@
 
 (defn wait-code [(st i64)] (-> i64)
   (if (< st (primitive/cast i64 0))
-      127  ; system() itself failed (no shell / fork failed)
+      127  ; the spawn/wait itself failed
       (let [sig (wait-signal st)]
         (if (!= sig (primitive/cast i64 0))
             (primitive/iadd 128 sig)  ; killed by a signal: 128+signo, as a shell reports
@@ -2323,6 +2325,29 @@
         (wb w 10)
         0))))
 
+; Spawn one program with an already-separated argv and wait for it. Unlike
+; `system`, this never invokes a shell: spaces, quotes and metacharacters in paths
+; are ordinary argument bytes, and a link flag cannot become a shell program.
+(defn spawn-wait [(a (dyn Allocator)) (args (ArrayList (slice u8)))] (-> i64)
+  (let [n (al-len [(slice u8)] args)
+        (mut ptrs) (al-new [(ptr i8)] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (al-push! (mut ptrs) (str->cstr a (al-get [(slice u8)] args (load i))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (al-push! (mut ptrs) (primitive/cast (ptr i8) 0))
+    (let [av (load (field ptrs data))
+          pid (os/spawn (load av) av (os/spawn-envp))]
+      (if (< pid (primitive/cast i64 0))
+          -1
+          (let [stp (primitive/alloc-stack i32)]
+            (store! stp 0)
+            (if (< (os/waitpid (primitive/cast i32 pid) stp 0) (primitive/cast i32 0))
+                -1
+                (primitive/cast i64 (load stp))))))))
+
 ; ---- argv scanning ----------------------------------------------------------
 ; Every subcommand used to read the filename as literally argv[2], so
 ; `coil build -o out in.coil` — the universal Unix order — missed the file entirely,
@@ -2332,6 +2357,8 @@
 ; One table, one scanner: flags are position-independent and unknown ones are errors.
 (extern opendir :cc c [(ptr i8)] (-> (ptr i8)))
 (extern closedir :cc c [(ptr i8)] (-> i32))
+(extern remove :cc c [(ptr i8)] (-> i32))
+(extern atexit :cc c [(fnptr c [] i64)] (-> i32))
 (extern setenv :cc c [(ptr i8) (ptr i8) i32] (-> i32))
 (extern unsetenv :cc c [(ptr i8)] (-> i32))
 
@@ -2591,6 +2618,17 @@
   (and (>= (slice-len [u8] arg) (primitive/cast i64 1))
        (= (slice-get [u8] arg 0) (primitive/cast u8 45))))  ; '-'
 
+(defn argv-has-flag? [(argc i32) (argv (ptr (ptr i8))) (want (slice u8))] (-> bool)
+  (let [(mut i) 2
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) (primitive/cast i64 argc)))
+              (break)
+              (do
+                (when (= (cstr->slice (load (primitive/index argv (load i)))) want)
+                  (store! found true) 0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
 (defn dash-l? [(arg (slice u8))] (-> bool)  ; -l<lib>
   (and (>= (slice-len [u8] arg) (primitive/cast i64 2))
        (and (= (slice-get [u8] arg 0) (primitive/cast u8 45))
@@ -2623,6 +2661,7 @@
         (dash-l? arg) true
         (= arg "--lib") true
         (= arg "--shared") true
+        (= arg "--release") true
         (= arg "-g") true
         (= arg "--debug") true
         (= arg "--debug-checks") true
@@ -2809,42 +2848,54 @@
       (let [arch (triple-arch triple)]
         (not (or (= arch "arm64") (= arch "aarch64"))))))
 
-; `-g` packaging (Mach-O): the DWARF lives in the kept `<out>.o`; `ld` records a debug
+; `-g` packaging (Mach-O): the DWARF lives in the temporary object; `ld` records a debug
 ; map into the executable pointing at it. `dsymutil` gathers a `<out>.dSYM` next to the
-; exe from that map + the .o's DWARF, which is what lldb loads. Best-effort: a failure
-; (e.g. no dsymutil) is a warning — the DWARF is still in the .o. The arm64 backend now
+; exe from that map + the object's DWARF before cleanup, which is what lldb loads.
+; Best-effort: a failure (e.g. no dsymutil) is a warning. The arm64 backend now
 ; emits the __text-relative address RELOCATIONS dsymutil needs (without them it printed
 ; "No valid relocations found. Skipping." and produced an empty dSYM — tool-11).
 (defn run-dsymutil [(a (dyn Allocator)) (out (slice u8))] (-> i64)
   ; ELF has no debug map / dSYM: the DWARF is linked into the executable itself and
   ; debuggers read it directly, so on a Linux host there is nothing to gather.
   (unless (me-host-linux?)
-    (let [(mut db) (sb-new a)]
-      (sb-push-str! (mut db) "dsymutil ")
-      (sb-push-str! (mut db) out)
-      (let [drc (primitive/cast i64 (system (str->cstr a (sb-str (load db)))))]
+    (let [(mut args) (al-new [(slice u8)] a)]
+      (al-push! (mut args) "dsymutil")
+      (al-push! (mut args) out)
+      (let [drc (spawn-wait a (load args))]
         (when (!= drc (primitive/cast i64 0))
-          (ps (stderr) "warning: dsymutil failed; debug info stays in ")
+          (ps (stderr) "warning: dsymutil failed for ")
           (ps (stderr) out)
-          (ps (stderr) ".o\n")
+          (ps (stderr) "\n")
           0)))))
 
-; `build <file> -o <out> [--link-flag X]...` : emit `<out>.o` then link it into a
-; native executable with `cc <out>.o -o <out> <link-flags...>`. Mirrors the
-; `coil build` argv handling + link step.
+; `build <file> -o <out> [--link-flag X]...`: emit a private temporary object,
+; then invoke the linker driver directly (posix_spawnp, never a shell) and remove
+; the object. Only the requested final artifact remains.
 (defn object-needs-curl? [(a (dyn Allocator)) (obj (slice u8))] (-> bool)
-  (let [(mut cmd) (sb-new a)]
-    (sb-push-str! (mut cmd) "nm -u ")
-    (m-shell-quoted! (mut cmd) obj)
-    (sb-push-str! (mut cmd) " 2>/dev/null | grep -q curl_easy_init")
-    (= (wait-code (primitive/cast i64 (system (str->cstr a (sb-str (load cmd)))))) (primitive/cast i64 0))))
+  ; The undefined symbol name is present verbatim in both Mach-O and ELF string
+  ; tables. Looking for it directly avoids the former `nm | grep` shell pipeline.
+  (ref-contains-ci? (read-file a (str->cstr a obj)) "curl_easy_init"))
 
 (defn bundled-curl-archive [(a (dyn Allocator)) (self (slice u8))] (-> (slice u8))
-  (let [arch (if (me-host-linux?) "x86_64-linux" "arm64-macos")]
-    (cat3-d a (cat3-d a (dirname (m-resolve-self a self)) "/native/curl/") (cat3-d a arch "/libcurl.a"))))
+  (let [arch (if (me-host-linux?) "x86_64-linux" "arm64-macos")
+        suffix (cat3-d a "/native/curl/" (cat3-d a arch "/libcurl.a"))
+        installed (cat3-d a (dirname (m-resolve-self a self)) suffix)
+        checkout (cat3-d a "build/bin" suffix)]
+    (if (= (primitive/cast i64 (access (str->cstr a installed) 0)) (primitive/cast i64 0))
+        installed
+        checkout)))
+
+(defstruct LinkTempCleanup [(obj (ptr i8)) (dir (ptr i8)) (registered bool)])
+(defn link-temp-cleanup-cell [] (-> (ptr LinkTempCleanup))
+  (primitive/alloc-static LinkTempCleanup))
+(defn link-temp-cleanup-at-exit [] (-> i64)
+  (let [c (link-temp-cleanup-cell)]
+    (unless (= (primitive/cast i64 (.obj c)) (primitive/cast i64 0)) (unlink (.obj c)) 0)
+    (unless (= (primitive/cast i64 (.dir c)) (primitive/cast i64 0)) (remove (.dir c)) 0)
+    0))
 
 (defn append-bundled-curl! [(a (dyn Allocator))
-                            (cmd (mut StrBuf))
+                            (args (mut (ArrayList (slice u8))))
                             (self (slice u8))
                             (obj (slice u8))] (-> i64)
   (when (object-needs-curl? a obj)
@@ -2852,23 +2903,69 @@
           fd (open (str->cstr a archive) 0)]
       (when (< (primitive/cast i64 fd) (primitive/cast i64 0))
         (ps (stderr) "error: http_client.coil needs Coil's bundled libcurl; run scripts/native/build-curl.sh\n")
+        (cleanup-build-object! a obj)
         (exit 1)
         0)
       (close fd)
-      (sb-push-str! (mut cmd) " ")
-      (m-shell-quoted! (mut cmd) archive)
+      (al-push! (mut args) archive)
       (let [dir (dirname archive)]
-        (sb-push-str! (mut cmd) " ")
-        (m-shell-quoted! (mut cmd) (cat3-d a dir "/libmbedtls.a"))
-        (sb-push-str! (mut cmd) " ")
-        (m-shell-quoted! (mut cmd) (cat3-d a dir "/libmbedx509.a"))
-        (sb-push-str! (mut cmd) " ")
-        (m-shell-quoted! (mut cmd) (cat3-d a dir "/libmbedcrypto.a")))
+        (al-push! (mut args) (cat3-d a dir "/libmbedtls.a"))
+        (al-push! (mut args) (cat3-d a dir "/libmbedx509.a"))
+        (al-push! (mut args) (cat3-d a dir "/libmbedcrypto.a")))
       (if (me-host-linux?)
-          (sb-push-str! (mut cmd) " -lpthread -Wl,--gc-sections")
-          (sb-push-str! (mut cmd)
-                        " -framework CoreFoundation -framework SystemConfiguration -lz -Wl,-dead_strip"))))
+          (do (al-push! (mut args) "-lpthread") (al-push! (mut args) "-Wl,--gc-sections") 0)
+          (do
+            (al-push! (mut args) "-framework") (al-push! (mut args) "CoreFoundation")
+            (al-push! (mut args) "-framework") (al-push! (mut args) "SystemConfiguration")
+            (al-push! (mut args) "-lz") (al-push! (mut args) "-Wl,-dead_strip") 0))))
   0)
+
+(defn build-temp-object [(a (dyn Allocator))] (-> (slice u8))
+  (let [template (str->cstr a "/tmp/coil-link-XXXXXX")
+        dirp (mkdtemp template)]
+    (when (= (primitive/cast i64 dirp) (primitive/cast i64 0))
+      (ps (stderr) "error: could not create temporary link directory\n")
+      (exit 1)
+      0)
+    (let [obj (sconcat a (cstr->slice dirp) "/program.o")
+          c (link-temp-cleanup-cell)]
+      (unless (.registered c)
+        (atexit (primitive/fnptr-of link-temp-cleanup-at-exit))
+        (set! (.registered c) true) 0)
+      (set! (.obj c) (str->cstr a obj))
+      (set! (.dir c) (str->cstr a (cstr->slice dirp)))
+      obj)))
+
+(defn cleanup-build-object! [(a (dyn Allocator)) (obj (slice u8))] (-> i64)
+  (unlink (str->cstr a obj))
+  (remove (str->cstr a (dirname obj)))
+  (let [c (link-temp-cleanup-cell)]
+    (set! (.obj c) (primitive/cast (ptr i8) 0))
+    (set! (.dir c) (primitive/cast (ptr i8) 0)))
+  0)
+
+; The ordinary driver remains overridable for toolchains and cross builds. An
+; instrumented object must use the clang beside the LLVM that inserted the
+; sanitizer pass, otherwise the compiler and runtime versions can disagree.
+(defn native-link-driver [(a (dyn Allocator))] (-> (slice u8))
+  (let [override (getenv c"COIL_CC")]
+    (if (!= (primitive/cast i64 override) (primitive/cast i64 0))
+        (cstr->slice override)
+        (if (sanitizer?)
+            (let [cfgp (getenv c"LLVM_CONFIG")
+                  cfg (if (= (primitive/cast i64 cfgp) (primitive/cast i64 0))
+                          "/opt/homebrew/opt/llvm/bin/llvm-config"
+                          (cstr->slice cfgp))]
+              (if (>= (find-slash cfg) (primitive/cast i64 0))
+                  (sconcat a (dirname cfg) "/clang")
+                  "clang"))
+            "cc"))))
+
+; `body` on a native target, `alt` on wasm. Define this before build-cmd's first
+; use: staged macro resolution must not depend on a later definition when compiling
+; the self-host compiler with the previous stage.
+(defn native-only [(body Code) (alt Code)] (-> Code)
+  (if (primitive/code-eq (primitive/target-os) `wasm) alt body))
 
 (defn build-cmd [(a (dyn Allocator))
                  (argc i32)
@@ -2886,6 +2983,10 @@
         (mut libmode) 0  ; 0 = executable, 1 = --lib (.a), 2 = --shared (.dylib)
         (mut ehdr) (None [(slice u8)])
         (mut wantg) false  ; -g/--debug requested: gather a .dSYM after linking
+        ; Release is the default profile.  -g/--debug opts into DWARF and the
+        ; builds/debug output directory; --release can switch back explicitly.
+        (mut release) true
+        explicit-out (argv-has-flag? argc argv "-o")
         (mut default-out) false
         (mut i) 2]
     ; second pass: --lib / --shared / --emit-header <h> / -g (DWARF via the arm64
@@ -2897,7 +2998,9 @@
                   (let [arg (cstr->slice (load (primitive/index argv (load j))))]
                     (cond (= arg "--lib") (store! libmode 1)
                           (= arg "--shared") (store! libmode 2)
-                          (or (= arg "-g") (= arg "--debug")) (do (store! backend 2) (store! wantg true) 0)
+                          (= arg "--release") (store! release true)
+                          (or (= arg "-g") (= arg "--debug"))
+                            (do (store! backend 2) (store! wantg true) (store! release false) 0)
                           (= arg "--debug-checks") (enable-debug-checks!)
                           (= arg "--debug-runtime") (enable-debug-runtime!)
                           (= arg "--quiet") (set-quiet! true)
@@ -2979,7 +3082,7 @@
     ; Like Cargo, a build without an explicit destination keeps artifacts out of the
     ; source directory. The source basename is stable even when the file is elsewhere;
     ; trim the conventional .coil suffix but preserve other dotted names verbatim.
-    (when (= (primitive/cast i64 (load outp)) (primitive/cast i64 0))
+    (when (not explicit-out)
       (let [base (basename (cstr->slice file))
             n (slice-len [u8] base)
             stem
@@ -2987,7 +3090,8 @@
                        (= (subslice [u8] base (primitive/isub n 5) n) ".coil"))
                   (subslice [u8] base 0 (primitive/isub n 5))
                   base)
-            path (cat3-d a "builds/" stem)]
+            profile (if (load release) "release" "debug")
+            path (cat3-d a (cat3-d a "builds/" profile) (cat3-d a "/" stem))]
         (store! outp (str->cstr a path))
         (store! default-out true))
       0)
@@ -2997,7 +3101,14 @@
         (unless (dir? (str->cstr a "builds"))
           (ps (stderr) "error: could not create builds directory\n")
           (exit 1)
-          0)))
+          0))
+      (let [profile-dir (if (load release) "builds/release" "builds/debug")]
+        (unless (dir? (str->cstr a profile-dir))
+          (native-only (mkdir (str->cstr a profile-dir) (primitive/cast i32 493)) 0)
+          (unless (dir? (str->cstr a profile-dir))
+            (ps (stderr) "error: could not create build profile directory\n")
+            (exit 1)
+            0))))
     ; `-o /dev/null` is the classic "just tell me if it compiles" idiom. There is no
     ; writable object destination, and handing it to codegen abends with a bare
     ; `LLVMTargetMachineEmitToFile ... Operation not permitted` (SIGABRT). Route it to the
@@ -3036,10 +3147,12 @@
               0)
             (al-push! (mut flags) (sanitizer-link-flag)))))
     (let [out-slice (cstr->slice (load outp))
-          obj-slice (obj-path a out-slice)]
+          obj-slice (if (= (load backend) (primitive/cast i64 4))
+                        out-slice
+                        (build-temp-object a))]
       ; the native wasm backend emits a FINAL module (no link step), so it writes
-      ; straight to the -o path; every other backend writes an intermediate <out>.o.
-      (let [obj-cstr (str->cstr a (if (= (load backend) (primitive/cast i64 4)) out-slice obj-slice))
+      ; straight to the -o path; every other backend writes a private temporary object.
+      (let [obj-cstr (str->cstr a obj-slice)
             ctx (primitive/alloc-stack DumpCtx)]
         (set! (.a ctx) a)
         (set! (.src ctx) (read-src a file))
@@ -3061,32 +3174,29 @@
         ; return FAILURE (1) BEFORE the link step so no spurious `cc: no such
         ; file` / undefined-symbol junk is ever emitted.
         (if (= (run-on-big-stack ctx) (primitive/cast i64 0))
-            1
+            (do (unless (= (load backend) (primitive/cast i64 4))
+                  (cleanup-build-object! a obj-slice))
+                1)
             ; native wasm backend: the module written by build-wasm-program IS the final
             ; artifact — no cc/ar/finalizer step. Report and stop.
             (if (= (load backend) (primitive/cast i64 4))
                 (do (unless (quiet?) (let [w (stdout)] (ps w "wrote ") (ps w out-slice) (wb w 10)) 0) 0)
-                ; final step depends on libmode: exe = `cc obj -o out flags`,
-                ; static = `ar rcs out obj`, shared = `cc -dynamiclib obj -o out flags`.
-                (let [(mut cmdsb) (sb-new a)]
+                ; final step depends on libmode. Every argument is a distinct argv
+                ; element and the linker driver is spawned directly, without a shell.
+                (let [(mut linkargs) (al-new [(slice u8)] a)]
                   (if (= (load libmode) (primitive/cast i64 1))
                       (do
-                        (sb-push-str! (mut cmdsb) "ar rcs ")
-                        (sb-push-str! (mut cmdsb) out-slice)
-                        (sb-push-str! (mut cmdsb) " ")
-                        (sb-push-str! (mut cmdsb) obj-slice)
+                        (al-push! (mut linkargs) "ar")
+                        (al-push! (mut linkargs) "rcs")
+                        (al-push! (mut linkargs) out-slice)
+                        (al-push! (mut linkargs) obj-slice)
                         0)
                       (do
-                        (sb-push-str! (mut cmdsb)
-                                      (if (= (load libmode) (primitive/cast i64 2))
-                                          (me-dylib-link-cmd)
-                                          (if (sanitizer?)
-                                              ; LLVM's ASan pass and runtime must be the
-                                              ; same version. `cc` is Apple clang on macOS
-                                              ; even when Coil is linked to Homebrew LLVM.
-                                              ; llvm-config names the matching toolchain.
-                                              "c=\"${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}\"; command -v \"$c\" >/dev/null 2>&1 || c=llvm-config; \"$(\"$c\" --bindir)/clang\" "
-                                              "cc ")))
+                        (al-push! (mut linkargs) (native-link-driver a))
+                        (when (= (load libmode) (primitive/cast i64 2))
+                          (al-push! (mut linkargs) (if (me-host-linux?) "-shared" "-dynamiclib"))
+                          (unless (me-host-linux?)
+                            (al-push! (mut linkargs) "-Wl,-undefined,dynamic_lookup") 0))
                         ; cross-target: the object's arch differs from the host cc's default
                         ; (arm64), so pass `-arch <arch>` — otherwise ld dies with
                         ; `found architecture '<arch>', required arm64` (xcompile). wasm never
@@ -3094,25 +3204,23 @@
                         ; Mach-O-toolchain flag: on an ELF host it is not passed (cross-LINKING
                         ; there needs a cross toolchain the driver does not orchestrate).
                         (when (and (native-cross-target? (load trip)) (not (me-host-linux?)))
-                          (sb-push-str! (mut cmdsb) "-arch ")
-                          (sb-push-str! (mut cmdsb) (triple-arch (load trip)))
-                          (sb-push-str! (mut cmdsb) " ")
+                          (al-push! (mut linkargs) "-arch")
+                          (al-push! (mut linkargs) (triple-arch (load trip)))
                           0)
-                        (sb-push-str! (mut cmdsb) obj-slice)
-                        (sb-push-str! (mut cmdsb) " -o ")
-                        (sb-push-str! (mut cmdsb) out-slice)
+                        (al-push! (mut linkargs) obj-slice)
+                        (al-push! (mut linkargs) "-o")
+                        (al-push! (mut linkargs) out-slice)
                         (let [linkflags (dedupe-link-flags a (load flags))
                               (mut k) 0
                               nf (al-len [(slice u8)] (load linkflags))]
                           (loop (if (>= (load k) nf)
                                     (break)
                                     (do
-                                      (sb-push-str! (mut cmdsb) " ")
-                                      (sb-push-str! (mut cmdsb)
-                                                    (al-get [(slice u8)] (load linkflags) (load k)))
+                                      (al-push! (mut linkargs)
+                                                (al-get [(slice u8)] (load linkflags) (load k)))
                                       (set! k (primitive/iadd (load k) 1))))))
                         (append-bundled-curl! a
-                                              (mut cmdsb)
+                                              (mut linkargs)
                                               (cstr->slice (load (primitive/index argv 0)))
                                               obj-slice)
                         ; The x86-64 backend lowers `frem` to a libm fmod/fmodf call
@@ -3120,15 +3228,17 @@
                         ; expands frem itself). glibc keeps those in libm, which cc
                         ; does not link by default — so this build needs -lm. It is
                         ; harmless when nothing references it.
-                        (when (= (load backend) (primitive/cast i64 5)) (sb-push-str! (mut cmdsb) " -lm") 0)
+                        (when (= (load backend) (primitive/cast i64 5))
+                          (al-push! (mut linkargs) "-lm") 0)
                         0))
                   (let [rc
                           (if (wasm-target? (load trip))
                               (wasm-link-object a obj-cstr out-slice)
-                              (primitive/cast i64 (system (str->cstr a (sb-str (load cmdsb))))))]
+                              (spawn-wait a (load linkargs)))]
                     (if (!= rc (primitive/cast i64 0))
                         (let [w (stderr)
                               code (wait-code rc)]
+                          (cleanup-build-object! a obj-slice)
                           (wait-report rc "linker")
                           (ps w "error: linker/ar failed with exit status: ")
                           (dump-dec w code)
@@ -3163,11 +3273,13 @@
                           1)
                         (do
                           (unless (quiet?) (let [w (stdout)] (ps w "wrote ") (ps w out-slice) (wb w 10)) 0)
-                          ; -g on a native executable: gather the .dSYM (the .o is kept).
+                          ; Gather the dSYM before deleting the temporary object: the
+                          ; executable's debug map names that linker input.
                           (when (and (load wantg)
                                      (and (not (wasm-target? (load trip)))
                                           (= (load libmode) (primitive/cast i64 0))))
                             (run-dsymutil a out-slice))
+                          (cleanup-build-object! a obj-slice)
                           (match ehdr
                             (Some [h] (cheader-program a (read-src a file) (dirname (cstr->slice file)) (Some h)))
                             (None [] 0))))))))))))
@@ -4903,7 +5015,11 @@
 ; cd'd there yourself. Members run in listed order and every one runs even after a
 ; failure -- one broken member should not hide the state of the rest. The exit code
 ; is the count of members that failed, so 0 still means "all good".
-(defn workspace-fanout [(a (dyn Allocator)) (sub (slice u8)) (self (slice u8)) (m (ptr Manifest))] (-> i64)
+(defn workspace-fanout [(a (dyn Allocator))
+                        (sub (slice u8))
+                        (self (slice u8))
+                        (m (ptr Manifest))
+                        (debug bool)] (-> i64)
   (let [text (m-workspace-packages a m)
         n (slice-len [u8] text)
         w (stderr)
@@ -4955,6 +5071,7 @@
                                   (m-shell-quoted! (mut c) self)
                                   (sb-push-str! (mut c) " ")
                                   (sb-push-str! (mut c) sub)
+                                  (when debug (sb-push-str! (mut c) " --debug") 0)
                                   (when (!= (wait-code (primitive/cast i64 (system (str->cstr a (sb-str (load c))))))
                                             (primitive/cast i64 0))
                                     (set! failed (primitive/iadd (load failed) 1))
@@ -4991,6 +5108,11 @@
         (do (ps (stderr) "error: no Coil.toml in the current directory (pass a <file> to build directly)\n") 1)
         (let [m (parse-manifest a text)
               explicit (!= fidx (primitive/cast i64 0))
+              debug (and (not (argv-has-flag? argc argv "--release"))
+                         (or (load (field m debug))
+                             (or (argv-has-flag? argc argv "-g")
+                                 (argv-has-flag? argc argv "--debug"))))
+              profile (if debug "debug" "release")
               entry
                 (if explicit
                     (cstr->slice (load (primitive/index argv fidx)))
@@ -5003,7 +5125,7 @@
                     (.name m))
               (mut b) (sb-new a)]
           (when (and (m-workspace? m) (not explicit))
-            (return-from :manifest-cmd (workspace-fanout a sub self m))
+            (return-from :manifest-cmd (workspace-fanout a sub self m debug))
             0)
           (when (= sub "build")
             (offer-breaking-change-fix a m self)
@@ -5011,7 +5133,10 @@
           (m-prepare-deps a m)
           (m-prepare-native-deps a m)
           (m-emit-dep-env a (mut b) m)
-          (when (= sub "build") (sb-push-str! (mut b) "mkdir -p builds && ") 0)
+          (when (= sub "build")
+            (sb-push-str! (mut b) "mkdir -p builds/")
+            (sb-push-str! (mut b) profile)
+            (sb-push-str! (mut b) " && ") 0)
           (sb-push-str! (mut b) self)
           (sb-push-str! (mut b) " ")
           (sb-push-str! (mut b) sub)
@@ -5019,6 +5144,8 @@
           (m-shell-quoted! (mut b) entry)
           (when (and (= sub "build") (not explicit))
             (sb-push-str! (mut b) " -o builds/")
+            (sb-push-str! (mut b) profile)
+            (sb-push-str! (mut b) "/")
             (sb-push-str! (mut b) out)
             0)
           (m-emit-uses a (mut b) m)
@@ -7268,9 +7395,6 @@
 ;; is irrelevant; a runtime guard does not help. Every embedder of the wasm compiler
 ;; then has to supply the capability, so a name referenced here is a line in a contract
 ;; with people who will never call it.
-(defn native-only [(body Code) (alt Code)] (-> Code)
-  (if (primitive/code-eq (primitive/target-os) `wasm) alt body))
-
 (defn candidate-checks? [(a (dyn Allocator)) (src (slice u8)) (path (slice u8))] (-> bool)
   (if-can-fork (let [stp (primitive/alloc-stack i32)
                      pid (os/fork)]
@@ -10716,7 +10840,7 @@ usage: coil <command> [args]
 Build & run
   run   <file.coil> [flags] [-- args...]   build to a temp exe, run it, propagate its exit code
   run                                      build+run the ./Coil.toml project
-  build <file.coil> -o <out> [flags]       build a native executable
+  build <file.coil> [-o <out>] [flags]     build a native executable
   build                                    build the ./Coil.toml project
   install [--root DIR]                     install this package to a user-wide bin directory
   check <file.coil> [flags]                typecheck/compile only — no object, exit 0 if it compiles
@@ -10749,7 +10873,8 @@ Reference
   --help, -h                               this message
 
 Common flags (build / run / emit-obj)
-  -o <out>              output path (required by `build`)
+  -o <out>              exact output path (default: builds/release/<name>)
+  --release             select the default optimized, no-symbols profile
   -O0 / -O1 / -O2 / -O3 LLVM optimization level (default -O3; LLVM backend only)
   --meta-opt=<n>        -O level for METAPROGRAM objects only (default: follow -O)
                         -O0 builds ~6x faster and runs much slower — for iterating,
@@ -10757,7 +10882,7 @@ Common flags (build / run / emit-obj)
                         program almost nothing and still builds ~1.5x faster.
   --target <triple>     cross-compile (e.g. wasm32-unknown-unknown, x86_64-apple-macosx11.0.0)
   --backend arm64       use the native arm64 backend instead of LLVM
-  -g, --debug           emit DWARF debug info (implies the arm64 backend)
+  -g, --debug           emit DWARF and use builds/debug/ (implies arm64)
   --debug-checks        bounds, collection, allocator, and stack-return checks
   --sanitize=address    AddressSanitizer (invalid address/use-after-free)
   --sanitize=thread     ThreadSanitizer (data races)
@@ -10789,10 +10914,11 @@ Pipeline stage dumps (for debugging the compiler itself), each <file.coil>
 ; empty response reads as a broken binary.
 (defn common-flags-text [] (-> (slice u8))
   "Flags (may appear before or after <file.coil>)
-  -o <out>              output path (default: builds/<source-or-package-name>)
+  -o <out>              output path (default: builds/release/<source-or-package-name>)
+  --release             select the default optimized, no-symbols profile
   --target <triple>     cross-compile (e.g. wasm32-unknown-unknown)
   --backend arm64       use the native arm64 backend instead of LLVM
-  -g, --debug           emit DWARF debug info (implies the arm64 backend)
+  -g, --debug           emit DWARF and use builds/debug/ (implies arm64)
   --debug-checks        enable zero-cost-when-off runtime safety checks
   --sanitize=address    instrument with LLVM AddressSanitizer
   --sanitize=thread     instrument with LLVM ThreadSanitizer

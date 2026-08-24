@@ -19,7 +19,9 @@ LLVM backend end-to-end).
   relocs+DWARF. Mirrors `codegen.coil`'s `emit-expr` structure and semantics
   (the LLVM backend is the behavioral spec) but emits machine code.
 - `src/compiler/main.coil` — `build <file> -o out --backend arm64` plumbs the
-  same pipeline into the new backend; link step stays `cc <out>.o -o <out>`.
+  same pipeline into the new backend. The object is written under `/tmp`, passed
+  to the linker driver with a direct argv-based spawn, and removed after linking;
+  `coil build -o <out>` leaves only `<out>`.
 
 ## Code generation model (deliberately naive — it's a debug backend)
 - **Everything lives in fp-relative stack slots.** Each expression result is

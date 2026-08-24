@@ -23,14 +23,15 @@ before writing Coil.
 - `coil doc file.coil` — markdown for that module's `;;`-documented definitions
   (a `;;` block directly above a definition is its doc; a single `;` is not).
 - The compiler is **self-hosted** (written in Coil, in `src/compiler/`). During
-  development, first run the bounded inner-loop gate:
+  development, first run the focused inner-loop gate:
   Build one candidate after compiler-source edits, then repeatedly run
   `python3 scripts/dev.py test modernize-fast --compiler <candidate>`.
-  The gate tests the supplied compiler and must finish within 30 seconds; it does
-  not rebuild the compiler on every iteration. **Do not run
+  The gate tests the supplied compiler and does not rebuild the compiler on every
+  iteration. Its elapsed time is reported for visibility but is not a correctness
+  condition. **Do not run
   `build full` while diagnosing or iterating.** Run
   `python3 scripts/dev.py build full` only once for final release verification
-  after focused tests and the bounded gate are green.
+  after focused tests and the focused gate are green.
 - ⚠ **Two ways a shell gate reports a result it never established.** Both were
   found live in `gate-cli.sh`/`gate-target-os.sh`, in checks that had been green
   or red for months without meaning anything:
