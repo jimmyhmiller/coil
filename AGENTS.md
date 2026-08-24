@@ -10,16 +10,27 @@ before writing Coil.
 
 - `coil build file.coil -o out` / `coil run file.coil` — single file.
 - `coil guide` — print the language guide.
-- ⚠ **The compiler finds its C driver through `llvm-config --bindir`, not `PATH`,
-  and `CC=` does not override it.** If a second `llvm-config` shadows the one you
-  expect (a hand-built `/usr/local/bin/llvm-config` beats apt's), builds link
-  against a *different* clang's runtime. It surfaces only in `gate-cli`'s
-  sanitizer checks, as `cannot find …/libclang_rt.asan.a` under a path naming an
-  LLVM version you never chose — which points nowhere near the cause. Diagnose
-  with `llvm-config --bindir`: if that is not the LLVM you meant, the shadowing
-  binary is the bug. Prefer fixing which `llvm-config` wins (rename the shadow, or
-  `update-alternatives --set llvm-config`) over prepending to `PATH` in each
-  command, since the latter has to be remembered at every call site.
+- ⚠ **For a sanitizer build the compiler takes its C driver from `llvm-config
+  --bindir`, not `PATH`, and `CC=` does not override it. `COIL_CC` and
+  `LLVM_CONFIG` do.** `COIL_CC` replaces the driver outright; `LLVM_CONFIG` picks
+  which `llvm-config` names the bindir. Ordinary (non-sanitizer) builds just use
+  `cc`.
+  Two different things produce the same `cannot find …/libclang_rt.asan.a`:
+  - **A shadowing `llvm-config`** (a hand-built `/usr/local/bin/llvm-config` beats
+    apt's), so you link against a *different* clang's runtime, under a path naming
+    an LLVM version you never chose. Diagnose with `llvm-config --bindir`: if that
+    is not the LLVM you meant, the shadowing binary is the bug. Prefer fixing which
+    one wins (rename the shadow, or `update-alternatives --set llvm-config`) over
+    prepending to `PATH` at every call site.
+  - **A clang with no compiler-rt beside it at all** — common for a hand-built
+    clang, where the sibling apt/brew versions have runtimes and yours does not.
+    Nothing about the toolchain is shadowed; that clang simply cannot link a
+    sanitized binary. This is per-box and shows up only at sanitizer link time.
+    Point `LLVM_CONFIG` (or `COIL_CC`) at a version that has the runtimes, or
+    install compiler-rt for the one you built.
+  If the driver cannot be *executed* at all you get a different message naming it
+  — that used to be reported as `exit status: 127`, which read as a missing
+  library rather than a missing binary.
 - `coil doc file.coil` — markdown for that module's `;;`-documented definitions
   (a `;;` block directly above a definition is its doc; a single `;` is not).
 - The compiler is **self-hosted** (written in Coil, in `src/compiler/`). During
