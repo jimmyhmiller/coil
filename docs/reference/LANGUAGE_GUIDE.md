@@ -1288,7 +1288,12 @@ suite owns it. A filename selector applies *after* suite selection.
 Project testing compiles every selected test file into one harness executable. That
 executable then runs each `deftest` in an isolated child process, so shared imports
 are compiled once for the suite rather than once per test file. Naming one file
-explicitly remains a one-file test build.
+explicitly remains a one-file test build. `coil check` loads the same corpus the same
+way, and loads it alongside the entry graph: one front end over the whole project, not
+one per test file and not one per graph. Typechecking is not reachability-gated, so the
+tests are checked without the runner's generated `main`, and everything the two graphs
+share is read, expanded and checked once. That is why `check` stays a few seconds on a
+project with dozens of test files.
 
 A bare `[test]` section is still exactly what it was — it becomes the suite named
 `default`, so a manifest that never mentions suites behaves identically, down to the

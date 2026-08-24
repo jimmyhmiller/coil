@@ -1901,6 +1901,33 @@ expect_rc 2 "coil test rejects a user-owned -o instead of running stale output" 
   bash -c 'cd "$1" && "$2" test tests/native_test.coil -o nope' _ "$T/project" "$COIL"
 expect_rc 0 "project check covers entry and test monomorphizations" \
   bash -c 'cd "$1" && "$2" check' _ "$T/project" "$COIL"
+# `check` is ONE front end over the entry graph with the whole selected test corpus
+# loaded alongside it — not a pass per test file, and not a pass per graph. The failure
+# mode of that shape is silence: the roots load but nothing is checked, so a project
+# with a broken test file checks clean. Assert on a real type error in a test body, by
+# name, not merely on a nonzero status.
+cat > "$T/project/tests/broken_test.coil" <<'EOF'
+(module broken_test)
+(deftest broken-body (assert-eq (+ 1 1) "two"))
+EOF
+expect_rc 1 "project check fails on a type error inside a test body" \
+  bash -c 'cd "$1" && "$2" check' _ "$T/project" "$COIL"
+expect_out "broken_test.coil" "project check locates the failing test file" \
+  bash -c 'cd "$1" && "$2" check 2>&1' _ "$T/project" "$COIL"
+# --target tests drops the entry graph, so the corpus is compiled against a generated
+# stub entry instead. Its own path, and the only one that writes that stub.
+expect_rc 1 "project check --target tests still fails on a broken test body" \
+  bash -c 'cd "$1" && "$2" check --target tests' _ "$T/project" "$COIL"
+rm -f "$T/project/tests/broken_test.coil"
+expect_rc 0 "project check --target tests passes once the corpus is clean" \
+  bash -c 'cd "$1" && "$2" check --target tests' _ "$T/project" "$COIL"
+# The entry is checked in that same pass, so prove it is still reported. Loading the
+# test roots must not be able to displace the entry's own diagnostics.
+cp "$T/project/src/main.coil" "$T/project/src/main.coil.bak"
+printf '(module project)\n(defn main [] (-> i64) (bogus-fn 1))\n' > "$T/project/src/main.coil"
+expect_out "undefined function 'bogus-fn'" "project check still reports a broken entry" \
+  bash -c 'cd "$1" && "$2" check 2>&1' _ "$T/project" "$COIL"
+mv "$T/project/src/main.coil.bak" "$T/project/src/main.coil"
 expect_rc 0 "project fmt --check discovers owned sources" \
   bash -c 'cd "$1" && "$2" fmt --check' _ "$T/project" "$COIL"
 expect_rc 0 "project lint understands test graphs without explicit assert imports" \
