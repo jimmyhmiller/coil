@@ -120,98 +120,238 @@
         0))
     0))
 
-; LLVM's default pipeline is mostly function-local, but LLVMRunPasses and the
-; legacy object emitter drive it serially. Large generated programs therefore
-; leave every other core idle. Count definitions (declarations are included too,
-; which is harmless for this coarse threshold) and use LLVM's own module splitter
-; for large, unsanitized host O3 builds.
-(defn llvm-function-count [(m (ptr i8))] (-> i64)
-  (let [(mut f) (LLVMGetFirstFunction m)
-        (mut n) 0]
-    (loop (if (= (primitive/cast i64 (load f)) (primitive/cast i64 0))
+; One independently-owned LLVM partition. The coordinator reparses the complete
+; module into a fresh context and prunes it; concurrent workers therefore never
+; share an LLVMContext, Module, pass options, or TargetMachine.
+(defstruct LLVMPartitionJob
+  [(context (ptr i8))
+   (module (ptr i8))
+   (path (ptr i8))
+   (triple (ptr i8))
+   (cpu (ptr i8))
+   (features (ptr i8))
+   (optlvl i32)
+   (status i32)
+   (error (ptr i8))])
+
+(defn llvm-local-linkage? [(linkage i32)] (-> bool)
+  ; LLVMInternalLinkage=8, LLVMPrivateLinkage=9.  A local definition referenced
+  ; from another object must be promoted to one hidden program-private symbol.
+  (or (= linkage (primitive/cast i32 8)) (= linkage (primitive/cast i32 9))))
+
+(defn llvm-partition-index [(value (ptr i8))] (-> i64)
+  ; Eight is deliberately a power of two: FNV's low bits give a stable mapping
+  ; without signed-remainder behavior. LLVM-generated definitions are named.
+  (primitive/iand (str-hash (cstr->slice (LLVMGetValueName value))) 7))
+
+(defn llvm-promote-local! [(value (ptr i8))] (-> i64)
+  (when (llvm-local-linkage? (LLVMGetLinkage value))
+    (LLVMSetLinkage value (primitive/cast i32 0)) ; LLVMExternalLinkage
+    (LLVMSetVisibility value (primitive/cast i32 1)) ; LLVMHiddenVisibility
+    0)
+  0)
+
+(defn llvm-declare-function! [(fn (ptr i8))] (-> i64)
+  (let [(mut bb) (LLVMGetFirstBasicBlock fn)]
+    (loop (if (= (primitive/cast i64 (load bb)) 0)
               (break)
-              (do
-                (store! n (+ (load n) 1))
-                (store! f (LLVMGetNextFunction (load f))))))
-    (load n)))
+              (let [next (LLVMGetNextBasicBlock (load bb))]
+                (LLVMDeleteBasicBlock (load bb))
+                (store! bb next)))))
+  0)
 
-(defn parallel-o3-eligible? [(m (ptr i8))
-                             (triple-override (ptr i8))
-                             (sanitize i64)
-                             (optlvl i64)] (-> bool)
-  (and (= sanitize 0)
-       (and (= optlvl 3)
-            (and (= (primitive/cast i64 triple-override) 0)
-                 (>= (llvm-function-count m) 256)))))
-
-; Run heuristic (including mandatory) inlining once on the WHOLE module before
-; splitting: a partition boundary otherwise makes definitions unavailable to their
-; callers and regresses ordinary O3 inlining, not just `alwaysinline`. Then run the
-; remaining default<O3> pipelines independently and combine their PIC objects.
-; Remove a backend scratch directory. Every failure path below exits the process,
-; and each one used to exit BEFORE the cleanup at the bottom of the function ran --
-; so a backend error left its whole working directory behind (403 of them in /tmp).
-; The name comes from mkdtemp against a fixed template, so it carries no shell
-; metacharacters and no user-controlled component.
-(defn rm-scratch-dir! [(a (dyn Allocator)) (dir (slice u8))] (-> i64)
-  (let [(mut cleanup) (sb-new a)]
-    (sb-push-str! (mut cleanup) "rm -rf -- \"")
-    (sb-push-str! (mut cleanup) dir)
-    (sb-push-str! (mut cleanup) "\"")
-    (ffi/system (str->cstr a (sb-str (load cleanup))))
+(defn llvm-prune-partition! [(part (ptr i8)) (partition i64)] (-> i64)
+  (let [(mut fn) (LLVMGetFirstFunction part)]
+    (loop (if (= (primitive/cast i64 (load fn)) 0)
+              (break)
+              (let [next (LLVMGetNextFunction (load fn))]
+                (when (= (LLVMIsDeclaration (load fn)) (primitive/cast i32 0))
+                  (llvm-promote-local! (load fn))
+                  (when (!= (llvm-partition-index (load fn)) partition)
+                    (llvm-declare-function! (load fn))
+                    0))
+                (store! fn next))))
+    ; A global initializer is its definition. Exactly one partition retains it;
+    ; the other clones retain a declaration so references remain well-typed.
+    (let [(mut global) (LLVMGetFirstGlobal part)]
+      (loop (if (= (primitive/cast i64 (load global)) 0)
+                (break)
+                (let [next (LLVMGetNextGlobal (load global))
+                      initializer (LLVMGetInitializer (load global))]
+                  (when (!= (primitive/cast i64 initializer) 0)
+                    (llvm-promote-local! (load global))
+                    (when (!= (llvm-partition-index (load global)) partition)
+                      (LLVMSetInitializer (load global) (primitive/cast (ptr i8) 0))
+                      0))
+                  (store! global next)))))
     0))
 
-(defn emit-parallel-o3! [(a (dyn Allocator)) (m (ptr i8)) (obj-cstr (ptr i8))] (-> i64)
-  (let [dir-template (str->cstr a "/tmp/coil-llvm-XXXXXX")
-        dir-cstr (mkdtemp dir-template)]
-    (when (= (primitive/cast i64 dir-cstr) 0)
-      (ps (stderr) "error: could not create LLVM backend temporary directory\n")
+(defn llvm-partition-worker [(raw (ptr i8))] (-> (ptr i8))
+  (let [job (primitive/cast (ptr LLVMPartitionJob) raw)
+        context (.context job)
+        module (.module job)]
+    (let [
+              target-out (primitive/alloc-stack (ptr i8))
+              target-error (primitive/alloc-stack (ptr i8))]
+          (let [verify-error (primitive/alloc-stack (ptr i8))]
+            (store! verify-error (primitive/cast (ptr i8) 0))
+            (when (!= (LLVMVerifyModule module 2 verify-error) (primitive/cast i32 0))
+              (set! (.status job) 5)
+              (set! (.error job) (load verify-error))
+              0))
+          (if (!= (.status job) (primitive/cast i32 -1))
+              0
+              (if (!= (LLVMGetTargetFromTriple (.triple job) target-out target-error)
+                  (primitive/cast i32 0))
+              (do
+                (set! (.status job) 2)
+                (set! (.error job) (load target-error))
+                0)
+              (let [tm (LLVMCreateTargetMachine (load target-out)
+                                                (.triple job)
+                                                (.cpu job)
+                                                (.features job)
+                                                (.optlvl job)
+                                                2
+                                                0)
+                    pbo (LLVMCreatePassBuilderOptions)
+                    optimize-span (tr/span-begin "backend.parallel.worker.optimize")
+                    pass-error (LLVMRunPasses module c"default<O3>" tm pbo)
+                    _optimize-end (tr/span-end optimize-span)]
+                (LLVMDisposePassBuilderOptions pbo)
+                (if (!= (primitive/cast i64 pass-error) 0)
+                    (do
+                      (set! (.status job) 3)
+                      (set! (.error job) (LLVMGetErrorMessage pass-error)))
+                    (let [emit-error (primitive/alloc-stack (ptr i8))
+                          emit-span (tr/span-begin "backend.parallel.worker.emit")
+                          rc (LLVMTargetMachineEmitToFile tm module (.path job) 1 emit-error)
+                          _emit-end (tr/span-end emit-span)]
+                      (if (!= rc (primitive/cast i32 0))
+                          (do (set! (.status job) 4) (set! (.error job) (load emit-error)))
+                          (set! (.status job) 0))))
+                (LLVMDisposeTargetMachine tm)
+                0)))
+          (LLVMDisposeModule module)
+          (LLVMContextDispose context)
+          (primitive/cast (ptr i8) 0))))
+
+(defn llvm-partition-path [(a (dyn Allocator)) (prefix (ptr i8)) (partition i64)] (-> (ptr i8))
+  (str->cstr a (cat3-d a (cstr->slice prefix)
+                         (cat3-d a ".part-" (cat3-d a (i64->str a partition) ".o")))))
+
+(defn emit-parallel-o3! [(a (dyn Allocator))
+                         (m (ptr i8))
+                         (obj-prefix (ptr i8))
+                         (triple (ptr i8))
+                         (tm (ptr i8))] (-> i64)
+  (let [pbo (LLVMCreatePassBuilderOptions)
+        inline-span (tr/span-begin "backend.parallel.whole-module-inline")
+        inline-error (LLVMRunPasses m c"module-inline" tm pbo)
+        _inline-end (tr/span-end inline-span)]
+    (LLVMDisposePassBuilderOptions pbo)
+    (when (!= (primitive/cast i64 inline-error) 0)
+      (ps (stderr) "codegen: LLVM whole-module inline failed: ")
+      (ps (stderr) (cstr->slice (LLVMGetErrorMessage inline-error)))
+      (wb (stderr) 10)
       (exit 1)
       0)
-    (let [dir (cstr->slice dir-cstr)
-          bitcode (sconcat a dir "/all.bc")
-          combined (sconcat a dir "/all.o")
-          (mut cmd) (sb-new a)]
-      (when (!= (LLVMWriteBitcodeToFile m (str->cstr a bitcode)) (primitive/cast i32 0))
-        (ps (stderr) "error: could not serialize LLVM module for parallel optimization\n")
-        (rm-scratch-dir! a dir)
-        (exit 1)
-        0)
-      ; `llvm-config` is not necessarily ON PATH: Homebrew keeps LLVM keg-only, so
-      ; CI sets LLVM_CONFIG and a bare call here died with exit 127 under `set -e`
-      ; while every build script resolved it fine. Same order as
-      ; scripts/compiler/llvm-link-flags.sh.
-      (sb-push-str! (mut cmd) "set -eu; c=\"${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}\"; command -v \"$c\" >/dev/null 2>&1 || c=llvm-config; b=\"$(\"$c\" --bindir)\"; d=\"")
-      (sb-push-str! (mut cmd) dir)
-      (sb-push-str! (mut cmd)
-                    ; This is a RELOCATABLE object combine, not a program link.
-                    ; Without -nostdlib clang injects -lSystem + libclang_rt; ld -r
-                    ; cannot consume dylib text stubs and warns that it is ignoring
-                    ; the SDK's libSystem.tbd. The final executable link supplies
-                    ; those runtime inputs exactly once, where they belong.
-                    "\"; \"$b/opt\" -passes='module-inline' \"$d/all.bc\" -o \"$d/all.inlined.bc\"; \"$b/llvm-split\" -j 8 \"$d/all.inlined.bc\" -o \"$d/part.bc\"; for f in \"$d\"/part.bc*; do (\"$b/opt\" -passes='default<O3>' \"$f\" -o \"$f.opt\" && \"$b/llc\" -filetype=obj -O=3 -relocation-model=pic \"$f.opt\" -o \"$f.o\") & done; wait; \"$b/clang\" -r -nostdlib \"$d\"/part.bc*.o -o \"$d/all.o\"")
-      (let [span (tr/span-begin "backend.llvm-parallel-o3")
-            rc (wait-code (primitive/cast i64 (ffi/system (str->cstr a (sb-str (load cmd))))))
-            _span-end (tr/span-end span)]
-        (when (!= rc 0)
-          (ps (stderr) "error: parallel LLVM O3 backend failed (exit ")
-          (dump-dec (stderr) rc)
-          (ps (stderr) ")\n")
-          (rm-scratch-dir! a dir)
-          (exit 1)
-          0)
-        (when (!= (me/rename (str->cstr a combined) obj-cstr) (primitive/cast i32 0))
-          (let [w (stderr)]
-            (ps w "error: could not write object file '")
-            (ps w (cstr->slice obj-cstr))
-            (ps w "' while finalizing parallel LLVM output\n")
-            (ps w
-                "  the output path is not writable — give `-o` a writable path, or use `coil check <file>` to typecheck without emitting an object\n"))
-          (rm-scratch-dir! a dir)
-          (exit 1)
-          0)
-        (rm-scratch-dir! a dir)))
-    0))
+    (let [jobs (primitive/alloc-stack (array LLVMPartitionJob 8))
+          tids (primitive/alloc-stack (array (ptr i8) 8))
+          started (primitive/alloc-stack (array i32 8))
+          split-span (tr/span-begin "backend.parallel.partition")
+          complete-bitcode (LLVMWriteBitcodeToMemoryBuffer m)
+          (mut i) 0]
+      ; Parse and prune serially, but into a fresh context per partition. The
+      ; worker receives exclusive ownership of that context+module pair; no LLVM
+      ; object crosses between workers once optimization starts.
+      (loop (if (>= (load i) 8)
+                (break)
+                (let [job (primitive/index jobs (load i))
+                      context (LLVMContextCreate)
+                      module-out (primitive/alloc-stack (ptr i8))]
+                  (store! module-out (primitive/cast (ptr i8) 0))
+                  (when (!= (LLVMParseBitcodeInContext2 context complete-bitcode module-out)
+                            (primitive/cast i32 0))
+                    (ps (stderr) "codegen: could not parse LLVM partition bitcode\n")
+                    (exit 1)
+                    0)
+                  (llvm-prune-partition! (load module-out) (load i))
+                  (set! (.context job) context)
+                  (set! (.module job) (load module-out))
+                  (set! (.path job) (llvm-partition-path a obj-prefix (load i)))
+                  (set! (.triple job) triple)
+                  (set! (.cpu job) (llvm-cpu triple))
+                  (set! (.features job) (llvm-cpu-features triple))
+                  (set! (.optlvl job) (primitive/cast i32 3))
+                  (set! (.status job) -1)
+                  (set! (.error job) (primitive/cast (ptr i8) 0))
+                  (set! i (+ (load i) 1)))))
+      (LLVMDisposeMemoryBuffer complete-bitcode)
+      (tr/span-end split-span)
+      (let [workers-span (tr/span-begin "backend.parallel.workers")]
+        (set! i 0)
+        (loop (if (>= (load i) 8)
+                  (break)
+                  (let [rc (pthread_create (primitive/cast (ptr i8) (primitive/index tids (load i)))
+                                           (primitive/cast (ptr i8) 0)
+                                           (primitive/fnptr-of llvm-partition-worker)
+                                           (primitive/cast (ptr i8) (primitive/index jobs (load i))))]
+                    (store! (primitive/index started (load i)) rc)
+                    ; Resource exhaustion must not turn into a join of an
+                    ; uninitialized handle. Execute that partition inline.
+                    (when (!= rc (primitive/cast i32 0))
+                      (llvm-partition-worker (primitive/cast (ptr i8) (primitive/index jobs (load i))))
+                      0)
+                    (set! i (+ (load i) 1)))))
+        (set! i 0)
+        (loop (if (>= (load i) 8)
+                  (break)
+                  (do
+                    (when (= (load (primitive/index started (load i))) (primitive/cast i32 0))
+                      (pthread_join (load (primitive/index tids (load i))) (primitive/cast (ptr i8) 0))
+                      0)
+                    (set! i (+ (load i) 1)))))
+        (tr/span-end workers-span))
+      (set! i 0)
+      (loop (if (>= (load i) 8)
+                (break)
+                (let [job (primitive/index jobs (load i))]
+                  (when (!= (.status job) (primitive/cast i32 0))
+                    (ps (stderr) "codegen: LLVM partition ")
+                    (dump-dec (stderr) (load i))
+                    (ps (stderr) " failed")
+                    (when (!= (primitive/cast i64 (.error job)) 0)
+                      (ps (stderr) ": ")
+                      (ps (stderr) (cstr->slice (.error job)))
+                      (if (= (.status job) (primitive/cast i32 3))
+                          (LLVMDisposeErrorMessage (.error job))
+                          (LLVMDisposeMessage (.error job)))
+                      0)
+                    (wb (stderr) 10)
+                    (let [(mut cleanup-index) 0]
+                      (loop (if (>= (load cleanup-index) 8)
+                                (break)
+                                (do
+                                  (ffi/unlink (.path (primitive/index jobs (load cleanup-index))))
+                                  (set! cleanup-index (+ (load cleanup-index) 1))))))
+                    (exit 1)
+                    0)
+                  (set! i (+ (load i) 1)))))
+      8)))
+
+(defn llvm-function-count [(m (ptr i8))] (-> i64)
+  (let [(mut count) 0
+        (mut fn) (LLVMGetFirstFunction m)]
+    (loop (if (= (primitive/cast i64 (load fn)) 0)
+              (break)
+              (do
+                (when (= (LLVMIsDeclaration (load fn)) (primitive/cast i32 0))
+                  (set! count (+ (load count) 1))
+                  0)
+                (set! fn (LLVMGetNextFunction (load fn))))))
+    (load count)))
+
 ; mono'd Program -> native object file. Mirrors
 ; (the release/`src_path = None` path): build the module (codegen-module already
 ; sets target + datalayout), create a host target machine (cpu "generic", no
@@ -224,7 +364,8 @@
                     (obj-cstr (ptr i8))
                     (triple-override (ptr i8))
                     (sanitize i64)
-                    (optlvl i64)] (-> i64)
+                    (optlvl i64)
+                    (allow-multiple bool)] (-> i64)
   (let [lower-span (tr/span-begin "backend.llvm-lower")
         m (codegen-module a mp triple-override sanitize (debug-checks?))
         _lower-end (tr/span-end lower-span)
@@ -235,12 +376,7 @@
         targetout (primitive/alloc-stack (ptr i8))
         errout (primitive/alloc-stack (ptr i8))]
     (verify-module! m "after lowering")
-    (if (parallel-o3-eligible? m triple-override sanitize optlvl)
-        (do
-          (emit-parallel-o3! a m obj-cstr)
-          (LLVMDisposeModule m)
-          0)
-        (do
+    (do
           ; AsmPrinter init (targets themselves were initialized inside codegen-module).
           (LLVMInitializeAArch64AsmPrinter)
           (LLVMInitializeX86AsmPrinter)
@@ -269,13 +405,21 @@
                                            (primitive/cast i32 optlvl)
                                            (llvm-reloc-model triple)
                                            0)
+                parallel (and allow-multiple
+                              (and (= sanitize 0)
+                                   (and (= optlvl 3)
+                                        (and (= (primitive/cast i64 triple-override) 0)
+                                             (>= (llvm-function-count m)
+                                                 (ffi-decimal-env c"COIL_PARALLEL_CODEGEN_MIN_FUNCTIONS" 256))))))
                 pbo (LLVMCreatePassBuilderOptions)
                 ; --sanitize=address (mem-7): append LLVM's AddressSanitizer module pass to
                 ; the O3 pipeline so the emitted object is instrumented. Only the PROGRAM
                 ; object takes this path — the metaprogram dylib passes sanitize=false, so
                 ; the compiler never dlopen's an ASan-instrumented object.
                 optimize-span (tr/span-begin "backend.llvm-optimize")
-                rp (LLVMRunPasses m (opt-pipeline sanitize optlvl) tm pbo)
+                rp (if parallel
+                       (primitive/cast (ptr i8) 0)
+                       (LLVMRunPasses m (opt-pipeline sanitize optlvl) tm pbo))
                 _optimize-end (tr/span-end optimize-span)]
             (when (not (= (primitive/cast i64 rp) (primitive/cast i64 0)))
               (ps (stderr) "codegen: LLVMRunPasses failed: ")
@@ -284,7 +428,10 @@
               (abort)
               0)
             (verify-module! m "after optimization")
-            (let [emiterr (primitive/alloc-stack (ptr i8))
+            (if parallel
+                (emit-parallel-o3! a m obj-cstr triple tm)
+                (do
+                  (let [emiterr (primitive/alloc-stack (ptr i8))
                   tmp-s (sconcat a (cstr->slice obj-cstr) ".tmp")
                   tmp-cstr (str->cstr a tmp-s)]
               ; LLVM opens with truncation, so never point it at the user's final path.
@@ -318,7 +465,7 @@
                     (ffi/unlink tmp-cstr)
                     (exit 1)
                     0))))
-            0)))))
+                  1))))))
 
 ; Returns 1 if the pipeline succeeded (object emitted), 0 if a diagnostic was
 ; reported. build-cmd checks this and HALTS before linking on failure (mirroring
@@ -333,7 +480,7 @@
         (mut sp0) (al-new [(slice u8)] a)
         (mut st0) (al-new [(slice u8)] a)]
     (match (run-pipeline a src cwd w path (mut sp0) (mut st0))
-      (Some [mp] (do (build-object a mp obj-cstr triple (sanitize-mode) (opt-level)) 1))
+      (Some [mp] (build-object a mp obj-cstr triple (sanitize-mode) (opt-level) (parallel-codegen?)))
       (None [] 0))))
 
 ; `__normalize` debug subcommand: print normalized textual LLVM IR of `src`.
@@ -351,7 +498,7 @@
 (defn meta-build-obj-llvm [(a (dyn Allocator)) (mp (ptr Program)) (obj (ptr i8))] (-> i64)
   ; NEVER sanitize the metaprogram dylib: it is dlopen'd into the compiler, and an
   ; ASan-instrumented dylib loaded that late aborts the process (mem-7).
-  (build-object a mp obj (primitive/cast (ptr i8) 0) 0 (meta-opt-level)))
+  (do (build-object a mp obj (primitive/cast (ptr i8) 0) 0 (meta-opt-level) false) 0))
 
 ; The comptime object, handed back IN MEMORY so comptime_eval can load it straight
 ; into executable pages (jit.coil) instead of forking `cc -dynamiclib` per site.

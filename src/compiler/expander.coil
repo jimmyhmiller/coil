@@ -1755,6 +1755,40 @@
            (store! (field tc hit) (if (load any) 1 0))
            (Ok [i64 Diag] (load (field tc hit)))))))
 
+;; A failed sub-program check can report many independent macro-headed call
+;; sites. Expand all of them against this generation's resolved macro context
+;; before rebuilding that context. Previously stage3-round used only the first
+;; diagnostic and paid for a whole-program resolve once per call site.
+(defn tower-pass-diags [(s (mut LS))
+                        (sub-forms (ptr (ArrayList TaggedForm)))
+                        (macroctx (ptr Program))
+                        (quals (ptr (ArrayList (slice u8))))
+                        (diags (ptr (ArrayList Diag)))
+                        (a (dyn Allocator))] (-> (Result i64 Diag))
+  (try (do
+         (let [n (al-len [Diag] (load diags))
+               (mut i) 0
+               (mut any) false]
+           (loop (if (>= (load i) n)
+                     (break)
+                     (do
+                       (let [dp (al-elem [Diag] diags (load i))
+                             tc (mk-tower-cx (mut s)
+                                             sub-forms
+                                             macroctx
+                                             quals
+                                             a
+                                             (.lo dp)
+                                             (.hi dp)
+                                             (.source dp))
+                             hit (try! (tower-pass tc (mut s) sub-forms))
+                             hit2 (if (= hit (primitive/cast i64 0))
+                                      (try! (tower-recover-called tc (mut s) sub-forms macroctx))
+                                      hit)]
+                         (when (!= hit2 (primitive/cast i64 0)) (set! any true) 0))
+                       (set! i (primitive/iadd (load i) 1)))))
+           (Ok [i64 Diag] (if (load any) 1 0))))))
+
 ; ---- LAZY per-qual macro STAGING (interp deletion step 5, Phase B) ----------------
 ; The engine is grown ON DEMAND: stage3-round only RECORDS the round's sub-forms in
 ; a box (free), and the first time finish-macro misses a qual — which for almost
@@ -2029,25 +2063,35 @@
 (defn expand-stage3-except [(s (mut LS))
                             (excluded (ptr (ArrayList (slice u8))))] (-> (Result i64 Diag))
   (let [a (load (field s a))
-        (mut errf) (defderive-desugar! (mut s))]
+        desugar-span (tr/span-begin "frontend.expand.derive-desugar")
+        (mut errf) (defderive-desugar! (mut s))
+        _desugar-end (tr/span-end desugar-span)]
     (match (load errf)
       (Some [d] (Err [i64 Diag] d))
       (None []
             (let [out-forms (box-al [TaggedForm] a (.out s))
-                  original-metas (tower-meta-snapshot a out-forms)]
+                  snapshot-span (tr/span-begin "frontend.expand.meta-snapshot")
+                  original-metas (tower-meta-snapshot a out-forms)
+                  _snapshot-end (tr/span-end snapshot-span)
+                  subforms-span (tr/span-begin "frontend.expand.meta-subforms")
+                  subforms-result (meta-sub-forms a (mut s) out-forms)
+                  _subforms-end (tr/span-end subforms-span)]
               ; the macro context is the WHOLE program (tolerant resolve skips the
               ; not-yet-expanded top-level macro calls), in a FRESH form list: the shim and
               ; the tower replace sub-program entries; s.out must stay untouched.
-              (match (meta-sub-forms a (mut s) out-forms)
+              (match subforms-result
                 (Err [d] (Err [i64 Diag] d))
                 (Ok [sub-forms]
-                    (stage3-round (mut s)
-                                  sub-forms
-                                  a
-                                  0
-                                  (al-len [TaggedForm] (load out-forms))
-                                  original-metas
-                                  excluded))))))))
+                    (let [round-span (tr/span-begin "frontend.expand.stage3-rounds")
+                          result (stage3-round (mut s)
+                                               sub-forms
+                                               a
+                                               0
+                                               (al-len [TaggedForm] (load out-forms))
+                                               original-metas
+                                               excluded)
+                          _round-end (tr/span-end round-span)]
+                      result))))))))
 
 (defn expand-stage3 [(s (mut LS))] (-> (Result i64 Diag))
   (let [a (load (field s a))]
@@ -2189,113 +2233,117 @@
     (set! (.exports subls) (.exports s))
     (set! (.primitive_defs subls) (.primitive_defs s))
     (set! (.primitive_aliases subls) (.primitive_aliases s))
-    (match (resolve-program wa (mut subls) false true)
-      (Err [d] (Err [i64 Diag] d))
-      (Ok [macroctx]
-          (let [quals (code-sig-funcs-except macroctx excluded wa)]
-            ; record this round's forms for the LAZY stager: finish-macro stages a
-            ; qual on its first miss (see stage-one-macro!). Recording is free; the
-            ; per-round refresh keeps the convergence property (a qual unstageable in
-            ; round N often stages in round N+1, after the tower expanded a call in
-            ; one of its callees).
-            (when (meta-compiled?) (stage-box-set! (mut s) sub-forms excluded a))
-            (if (= (al-len [(slice u8)] (load quals)) (primitive/cast i64 0))
-                (Ok [i64 Diag] 0)
-                ; PARSE-level tower: a defn the tolerant resolve SKIPPED may contain a
-                ; macro call whose arguments are not expression syntax (objc `msg`
-                ; type vectors) — expand it and re-resolve before anything else.
-                (match (stage3-parse-recover (mut s) sub-forms macroctx quals a)
-                  (Err [d] (Err [i64 Diag] d))
-                  (Ok [phit]
-                      (if (!= phit (primitive/cast i64 0))
-                          (if (>= round (primitive/cast i64 64))
-                              (Err [i64 Diag]
-                                   (derr "metaprogram definition-time expansion did not reach a fixpoint after 64 rounds"))
-                              (let [_release (scratch/scratch-close! work)
-                                    rr (stage3-round (mut s) sub-forms a (primitive/iadd round 1) nmain original-metas excluded)]
-                                rr))
-                          ; the closure seeds gain the shim functions under the compiled engine:
-                          ; lowering creates calls to them AFTER this walk runs.
-                          (let [seeds (if (meta-compiled?) (meta-shim-seeds wa macroctx quals) quals)
-                                wanted (closure-funcs macroctx seeds wa)
-                                sub (closure-subprogram macroctx wanted wa)
-                                checkls (primitive/alloc-stack LS)]
-                            (set! (.a checkls) wa)
-                            (set! (.out checkls) (al-new [TaggedForm] wa))
-                            (set! (.loaded checkls) (al-new [(slice u8)] wa))
-                            (set! (.readpaths checkls) (al-new [(slice u8)] wa))
-                            (set! (.readmods checkls) (al-new [(slice u8)] wa))
-                            (set! (.imports checkls) (al-new [ImpEntry] wa))
-                            (set! (.exports checkls) (al-new [ExpEntry] wa))
-                            (set! (.primitive_defs checkls) (al-new [PrimitiveDef] wa))
-                            (set! (.primitive_aliases checkls) (al-new [PrimitiveAlias] wa))
-                            ; this LS checks a closure sub-program WITHOUT a resolve pass, so the
-                            ; poison list must be nulled or func-poisoned? reads garbage.
-                            (set! (.check_diags checkls) (box-al [Diag] wa (al-new [Diag] wa)))
-                            (set! (.resolve_diags checkls) (primitive/cast (ptr (ArrayList Diag)) 0))
-                            (set! (.resolve_poisoned checkls) (primitive/cast (ptr (ArrayList (slice u8))) 0))
-                            (match (check-program wa sub (mut checkls))
-                              (Ok [checked]
-                                  ; Snapshot only the successful generation. Taking
-                                  ; this full-program copy at function entry retained
-                                  ; one copy in every recursive tower frame (often
-                                  ; 15+ copies and several GiB) even though failures
-                                  ; immediately recurse and never consume it.
-                                  (let [tower-out (tower-snapshot a sub-forms nmain)]
-                                    ; compiled engine: lower + build + dlopen the metaprogram dylib
-                                    ; ONCE; finish-macro then routes every entry through it.
-                                    (match (if (meta-compiled?) (meta-engine-setup a checked quals) (None [Diag]))
-                                      (Some [d] (Err [i64 Diag] d))
-                                      (None []
-                                            (do
-                                              (when (> round (primitive/cast i64 0))
-                                                (tower-sync-out! (mut s) tower-out))
-                                              (match (run-expand (mut s) quals wanted checked a)
-                                                (Err [d] (Err [i64 Diag] d))
-                                                (Ok [_]
+    (let [resolve-span (tr/span-begin "frontend.expand.round.resolve")
+          resolve-result (resolve-program wa (mut subls) false true)
+          _resolve-end (tr/span-end resolve-span)]
+      (match resolve-result
+        (Err [d] (Err [i64 Diag] d))
+        (Ok [macroctx]
+            (let [quals (code-sig-funcs-except macroctx excluded wa)]
+              ; record this round's forms for the LAZY stager: finish-macro stages a
+              ; qual on its first miss (see stage-one-macro!). Recording is free; the
+              ; per-round refresh keeps the convergence property (a qual unstageable in
+              ; round N often stages in round N+1, after the tower expanded a call in
+              ; one of its callees).
+              (when (meta-compiled?) (stage-box-set! (mut s) sub-forms excluded a))
+              (if (= (al-len [(slice u8)] (load quals)) (primitive/cast i64 0))
+                  (Ok [i64 Diag] 0)
+                  ; PARSE-level tower: a defn the tolerant resolve SKIPPED may contain a
+                  ; macro call whose arguments are not expression syntax (objc `msg`
+                  ; type vectors) — expand it and re-resolve before anything else.
+                  (let [recover-span (tr/span-begin "frontend.expand.round.parse-recover")
+                        recover-result (stage3-parse-recover (mut s) sub-forms macroctx quals a)
+                        _recover-end (tr/span-end recover-span)]
+                    (match recover-result
+                      (Err [d] (Err [i64 Diag] d))
+                      (Ok [phit]
+                          (if (!= phit (primitive/cast i64 0))
+                              (if (>= round (primitive/cast i64 64))
+                                  (Err [i64 Diag]
+                                       (derr "metaprogram definition-time expansion did not reach a fixpoint after 64 rounds"))
+                                  (let [_release (scratch/scratch-close! work)
+                                        rr (stage3-round (mut s) sub-forms a (primitive/iadd round 1) nmain original-metas excluded)]
+                                    rr))
+                              ; the closure seeds gain the shim functions under the compiled engine:
+                              ; lowering creates calls to them AFTER this walk runs.
+                              (let [seeds (if (meta-compiled?) (meta-shim-seeds wa macroctx quals) quals)
+                                    wanted (closure-funcs macroctx seeds wa)
+                                    sub (closure-subprogram macroctx wanted wa)
+                                    checkls (primitive/alloc-stack LS)]
+                                (set! (.a checkls) wa)
+                                (set! (.out checkls) (al-new [TaggedForm] wa))
+                                (set! (.loaded checkls) (al-new [(slice u8)] wa))
+                                (set! (.readpaths checkls) (al-new [(slice u8)] wa))
+                                (set! (.readmods checkls) (al-new [(slice u8)] wa))
+                                (set! (.imports checkls) (al-new [ImpEntry] wa))
+                                (set! (.exports checkls) (al-new [ExpEntry] wa))
+                                (set! (.primitive_defs checkls) (al-new [PrimitiveDef] wa))
+                                (set! (.primitive_aliases checkls) (al-new [PrimitiveAlias] wa))
+                                ; this LS checks a closure sub-program WITHOUT a resolve pass, so the
+                                ; poison list must be nulled or func-poisoned? reads garbage.
+                                (set! (.check_diags checkls) (box-al [Diag] wa (al-new [Diag] wa)))
+                                (set! (.resolve_diags checkls) (primitive/cast (ptr (ArrayList Diag)) 0))
+                                (set! (.resolve_poisoned checkls) (primitive/cast (ptr (ArrayList (slice u8))) 0))
+                                (let [check-span (tr/span-begin "frontend.expand.round.typecheck")
+                                      check-result (check-program wa sub (mut checkls))
+                                      _check-end (tr/span-end check-span)]
+                                  (match check-result
+                                    (Ok [checked]
+                                        ; Snapshot only the successful generation. Taking
+                                        ; this full-program copy at function entry retained
+                                        ; one copy in every recursive tower frame (often
+                                        ; 15+ copies and several GiB) even though failures
+                                        ; immediately recurse and never consume it.
+                                        (let [tower-out (tower-snapshot a sub-forms nmain)]
+                                          ; compiled engine: lower + build + dlopen the metaprogram dylib
+                                          ; ONCE; finish-macro then routes every entry through it.
+                                          (let [setup-span (tr/span-begin "frontend.expand.round.engine-setup")
+                                                setup-result (if (meta-compiled?) (meta-engine-setup a checked quals) (None [Diag]))
+                                                _setup-end (tr/span-end setup-span)]
+                                            (match setup-result
+                                              (Some [d] (Err [i64 Diag] d))
+                                              (None []
                                                     (do
-                                                      (tower-restore-metas! (mut s) original-metas)
-                                                      (Ok [i64 Diag] 0)))))))))
-                              (Err [d]
-                                   ; the tower: if the check rejected the sub-program AT a
-                                   ; macro-headed call form, expand that call and go again; if it
-                                   ; rejected a call to a SKIPPED defn, recover that defn.
-                                   (if (>= round (primitive/cast i64 64))
-                                       (Err [i64 Diag]
-                                            (derr "metaprogram definition-time expansion did not reach a fixpoint after 64 rounds"))
-                                       (let [dp (primitive/alloc-stack Diag)]
-                                         (set! dp d)
-                                         (let [tc
-                                                 (mk-tower-cx (mut s)
-                                                              sub-forms
-                                                              macroctx
-                                                              quals
-                                                              a
-                                                              (.lo dp)
-                                                              (.hi dp)
-                                                              (.source dp))]
-                                           (match (tower-pass tc (mut s) sub-forms)
-                                             (Err [d2] (Err [i64 Diag] d2))
-                                             (Ok [hit]
-                                                 (match (if (= hit (primitive/cast i64 0))
-                                                            (tower-recover-called tc (mut s) sub-forms macroctx)
-                                                            (Ok [i64 Diag] hit))
-                                                   (Err [d3] (Err [i64 Diag] d3))
-                                                   (Ok [hit2]
-                                                       (if (= hit2 (primitive/cast i64 0))
-                                                           (Err [i64 Diag] d)  ; a real error — surface it untouched
-                                                           ; the let defeats self-tail-call elimination (musttail
-                                                           ; rejects this frame); depth is bounded by the 64-round cap
-                                                           (let [_release (scratch/scratch-close! work)
-                                                                 rr
-                                                                   (stage3-round (mut s)
-                                                                                 sub-forms
-                                                                                 a
-                                                                                 (primitive/iadd round 1)
-                                                                                 nmain
-                                                                                 original-metas
-                                                                                 excluded)]
-                                                             rr)))))))))))))))))))))
+                                                      (when (> round (primitive/cast i64 0))
+                                                        (tower-sync-out! (mut s) tower-out))
+                                                      (let [expand-span (tr/span-begin "frontend.expand.round.run-expand")
+                                                            expand-result (run-expand (mut s) quals wanted checked a)
+                                                            _expand-end (tr/span-end expand-span)]
+                                                        (match expand-result
+                                                          (Err [d] (Err [i64 Diag] d))
+                                                          (Ok [_]
+                                                              (do
+                                                                (tower-restore-metas! (mut s) original-metas)
+                                                                (Ok [i64 Diag] 0)))))))))))
+                                    (Err [d]
+                                         ; the tower: if the check rejected the sub-program AT a
+                                         ; macro-headed call form, expand that call and go again; if it
+                                         ; rejected a call to a SKIPPED defn, recover that defn.
+                                         (if (>= round (primitive/cast i64 64))
+                                             (Err [i64 Diag]
+                                                  (derr "metaprogram definition-time expansion did not reach a fixpoint after 64 rounds"))
+                                             (match (tower-pass-diags (mut s)
+                                                                      sub-forms
+                                                                      macroctx
+                                                                      quals
+                                                                      (load (field checkls check_diags))
+                                                                      a)
+                                               (Err [d2] (Err [i64 Diag] d2))
+                                               (Ok [hit]
+                                                   (if (= hit (primitive/cast i64 0))
+                                                       (Err [i64 Diag] d)  ; a real error — surface it untouched
+                                                       ; the let defeats self-tail-call elimination (musttail
+                                                       ; rejects this frame); depth is bounded by the 64-round cap
+                                                       (let [_release (scratch/scratch-close! work)
+                                                             rr
+                                                               (stage3-round (mut s)
+                                                                             sub-forms
+                                                                             a
+                                                                             (primitive/iadd round 1)
+                                                                             nmain
+                                                                             original-metas
+                                                                             excluded)]
+                                                         rr))))))))))))))))))))
 ; ── whole-program CHECKERS ───────────────────────────────────────────────────
 ; `(checker FN)` registers FN — a [(prog Code)] -> Code function — to be run once,
 ; after expansion, over the WHOLE program (all top-level forms as one Code list).
@@ -2728,6 +2776,7 @@
   [(active i64)
    (precheckers (ptr (ArrayList (slice u8))))
    (checkers (ptr (ArrayList (slice u8))))
+   (semtx-once (ptr (ArrayList (slice u8))))
    (semtx (ptr (ArrayList (slice u8))))
    (checked (ptr Program))
    (allfns (ptr SBox))
@@ -2738,6 +2787,7 @@
   (primitive/alloc-static CheckerRegBox))
 (defn register-checkers [(precheckers (ptr (ArrayList (slice u8))))
                          (checkers (ptr (ArrayList (slice u8))))
+                         (semtx-once (ptr (ArrayList (slice u8))))
                          (semtx (ptr (ArrayList (slice u8))))
                          (checked (ptr Program))
                          (allfns (ptr SBox))
@@ -2748,6 +2798,7 @@
     (set! (.active r) 1)
     (set! (.precheckers r) precheckers)
     (set! (.checkers r) checkers)
+    (set! (.semtx-once r) semtx-once)
     (set! (.semtx r) semtx)
     (set! (.checked r) checked)
     (set! (.allfns r) allfns)
@@ -3288,7 +3339,9 @@
 (defn check-strict-resolved [(a (dyn Allocator))
                              (s (mut LS))
                              (prog (ptr Program))] (-> (Result (ptr Program) Diag))
-  (let [cres (check-program a prog (mut s))
+  (let [check-span (tr/span-begin "frontend.check.typecheck")
+        cres (check-program a prog (mut s))
+        _check-end (tr/span-end check-span)
         nrd (al-len [Diag] (load (field s resolve_diags)))]
     (if (= nrd (primitive/cast i64 0))
         cres
@@ -3303,11 +3356,17 @@
   ; the whole program once before that merely to rediscover the metas the loader
   ; has already recorded.
   (if (ls-has-meta (mut s))
-      (elaborate-metas-compiled a (mut s))
-      (match (resolve-program a (mut s) true false)
-        ; a FATAL resolve error (parse / signature / struct / sum) aborts as before.
-        (Err [d] (Err [(ptr Program) Diag] d))
-        (Ok [prog] (check-strict-resolved a (mut s) prog)))))
+      (let [meta-span (tr/span-begin "frontend.check.meta-elaboration")
+            result (elaborate-metas-compiled a (mut s))
+            _meta-end (tr/span-end meta-span)]
+        result)
+      (let [resolve-span (tr/span-begin "frontend.check.resolve")
+            resolved (resolve-program a (mut s) true false)
+            _resolve-end (tr/span-end resolve-span)]
+        (match resolved
+          ; a FATAL resolve error (parse / signature / struct / sum) aborts as before.
+          (Err [d] (Err [(ptr Program) Diag] d))
+          (Ok [prog] (check-strict-resolved a (mut s) prog))))))
 ; Best-effort resolve+check for the model: swallow errors, returning None on failure.
 ; Reset the collected check diagnostics so a failed attempt never pollutes the final
 ; (authoritative) error report.
@@ -3322,41 +3381,83 @@
   (let [(mut iters) 0
         (mut out) (Ok [i64 Diag] 0)
         (mut done) false]
+    ;; Single-pass semantic transforms still receive the authoritative model,
+    ;; but they do not pay for a second invocation and speculative model merely
+    ;; to prove that their declared-complete output is a fixpoint.
+    (when (> (al-len [(slice u8)] (load (field r semtx-once))) 0)
+      (let [model-span (tr/span-begin "frontend.check.transform-once.model")
+            model (try-resolve-check a (mut s))
+            _model-end (tr/span-end model-span)]
+        (match model (Some [cp] (set-sem-model cp)) (None [] (clear-sem-model))))
+      (let [forms (box-al [TaggedForm] a (.out s))
+            impb (box! a (ArrayList ImpEntry) (primitive/zeroed (ArrayList ImpEntry)))
+            expb (box! a (ArrayList ExpEntry) (primitive/zeroed (ArrayList ExpEntry)))
+            transformer-span (tr/span-begin "frontend.check.transform-once.run")]
+        (set! impb (.imports s))
+        (set! expb (.exports s))
+        (let [transform-result (run-transformers (load (field r semtx-once))
+                                                 (load (field r checked))
+                                                 forms
+                                                 (load (field r allfns))
+                                                 (load (field r gs))
+                                                 (load (field r gu))
+                                                 impb
+                                                 expb
+                                                 a)
+              _transformer-end (tr/span-end transformer-span)]
+          (match transform-result
+            (Err [d] (do (set! out (Err [i64 Diag] d)) (set! done true) 0))
+            (Ok [newforms]
+                (do
+                  (set! (.out s) (load newforms))
+                  (when (= (al-len [(slice u8)] (load (field r semtx))) 0)
+                    (set! done true)
+                    0)
+                  0))))))
     (loop (if (load done)
               (break)
               (do
-                (match (try-resolve-check a (mut s)) (Some [cp] (set-sem-model cp)) (None [] (clear-sem-model)))
+                (let [model-span (tr/span-begin "frontend.check.transform.model")
+                      model (try-resolve-check a (mut s))
+                      _model-end (tr/span-end model-span)]
+                  (match model (Some [cp] (set-sem-model cp)) (None [] (clear-sem-model))))
                 (let [forms (box-al [TaggedForm] a (.out s))
                       impb (box! a (ArrayList ImpEntry) (primitive/zeroed (ArrayList ImpEntry)))
-                      expb (box! a (ArrayList ExpEntry) (primitive/zeroed (ArrayList ExpEntry)))]
+                      expb (box! a (ArrayList ExpEntry) (primitive/zeroed (ArrayList ExpEntry)))
+                      transformer-span (tr/span-begin "frontend.check.transform.run")]
                   (set! impb (.imports s))
                   (set! expb (.exports s))
-                  (match (run-transformers (load (field r semtx))
-                                           (load (field r checked))
-                                           forms
-                                           (load (field r allfns))
-                                           (load (field r gs))
-                                           (load (field r gu))
-                                           impb
-                                           expb
-                                           a)
-                    (Err [d] (do (set! out (Err [i64 Diag] d)) (set! done true) 0))
-                    (Ok [newforms]
-                        (if (forms-equal newforms forms)
-                            (do (mtrace-note "fixpoint reached — output stopped changing")
-                                (set! done true) 0)
-                            (if (>= (load iters) (primitive/cast i64 16))
-                                (do
-                                  (mtrace-note "ROUND LIMIT: a transform keeps rewriting its own output — it is not a fixed point")
-                                  (set! out
-                                        (Err [i64 Diag]
-                                             (derr "transform: did not reach a fixpoint after 16 rounds")))
-                                  (set! done true)
-                                  0)
-                                (do
-                                  (set! (.out s) (load newforms))
-                                  (set! iters (primitive/iadd (load iters) 1))
-                                  0)))))))))
+                  (let [transform-result (run-transformers (load (field r semtx))
+                                                           (load (field r checked))
+                                                           forms
+                                                           (load (field r allfns))
+                                                           (load (field r gs))
+                                                           (load (field r gu))
+                                                           impb
+                                                           expb
+                                                           a)
+                        _transformer-end (tr/span-end transformer-span)]
+                    (match transform-result
+                      (Err [d] (do (set! out (Err [i64 Diag] d)) (set! done true) 0))
+                      (Ok [newforms]
+                          (let [equal-span (tr/span-begin "frontend.check.transform.compare")
+                                equal (forms-equal newforms forms)
+                                _equal-end (tr/span-end equal-span)]
+                            (if equal
+                                (do (mtrace-note "fixpoint reached — output stopped changing")
+                                    (set! done true) 0)
+                                (if (>= (load iters) (primitive/cast i64 16))
+                                    (do
+                                      (mtrace-note "ROUND LIMIT: a transform keeps rewriting its own output — it is not a fixed point")
+                                      (set! out
+                                            (Err [i64 Diag]
+                                                 (derr "transform: did not reach a fixpoint after 16 rounds")))
+                                      (set! done true)
+                                      0)
+                                    (do
+                                      (set! (.out s) (load newforms))
+                                      (set! iters (primitive/iadd (load iters) 1))
+                                      0)))))))))))
     (load out)))
 ; Resolve + typecheck the program, running the transform fixpoint first if any
 ; transforms are registered. This is the pipeline's authoritative resolve+check.
@@ -3365,12 +3466,18 @@
         has-tx
           (if (= (.init b) (primitive/cast i64 0))
               false
-              (> (al-len [(slice u8)] (load (field (field b reg) semtx))) (primitive/cast i64 0)))]
+              (or (> (al-len [(slice u8)] (load (field (field b reg) semtx-once)))
+                     (primitive/cast i64 0))
+                  (> (al-len [(slice u8)] (load (field (field b reg) semtx)))
+                     (primitive/cast i64 0))))]
     (if (not has-tx)
         (strict-resolve-check a (mut s))
-        (match (run-transform-fixpoint a (mut s) (field b reg))
-          (Err [d] (Err [(ptr Program) Diag] d))
-          (Ok [_] (strict-resolve-check a (mut s)))))))
+        (let [transform-span (tr/span-begin "frontend.check.transform-fixpoint")
+              transformed (run-transform-fixpoint a (mut s) (field b reg))
+              _transform-end (tr/span-end transform-span)]
+          (match transformed
+            (Err [d] (Err [(ptr Program) Diag] d))
+            (Ok [_] (strict-resolve-check a (mut s))))))))
 ; ── whole-program TRANSFORMERS ───────────────────────────────────────────────
 ; `(transform FN)` registers FN — a [(prog Code)] -> Code function — run once after
 ; expansion over the WHOLE program; FN returns the rewritten program and it REPLACES
@@ -3493,7 +3600,12 @@
   (and (= (sx-tag (load f)) (primitive/cast i64 6))
        (let [it (sx-items (load f))]
          (and (or (= (sx-len it) (primitive/cast i64 2)) (= (sx-len it) (primitive/cast i64 4)))
-              (and (= (sx-tag (sx-at it 0)) (primitive/cast i64 2)) (= (sx-sval (sx-at it 0)) "transform"))))))
+              (and (= (sx-tag (sx-at it 0)) (primitive/cast i64 2))
+                   (or (= (sx-sval (sx-at it 0)) "transform")
+                       (= (sx-sval (sx-at it 0)) "transform-once")))))))
+(defn is-transform-once-form [(f (ptr Sexp))] (-> bool)
+  (and (is-transform-form f)
+       (= (sx-sval (sx-at (sx-items (load f)) 0)) "transform-once")))
 ; ── (register-derive Trait :struct FN :sum FN) ───────────────────────────────
 ; The explicit link from a trait to the functions that derive it. `defderive` is
 ; sugar that writes one of these; writing it yourself is supported and is the only
@@ -4495,6 +4607,7 @@
         gu (box! a SBoxSum (primitive/zeroed SBoxSum))
         result (box! a SBoxTF (primitive/zeroed SBoxTF))
         (mut checkers) (al-new [(slice u8)] a)
+        (mut once-transformers) (al-new [(slice u8)] a)
         (mut transformers) (al-new [(slice u8)] a)
         (mut pre-checkers) (al-new [(slice u8)] a)
         (mut pre-transformers) (al-new [(slice u8)] a)
@@ -4549,6 +4662,9 @@
                           (is-transform-form (field tf form))
                             (if (read-registration? (field tf form))
                                 0
+                                (if (and (is-transform-once-form (field tf form))
+                                         (!= (sx-len (sx-items (load (field tf form)))) (primitive/cast i64 2)))
+                                    (store! errf (Some (derr "transform-once: expected `(transform-once FN)`")))
                                 (if (and (= (sx-len (sx-items (load (field tf form)))) (primitive/cast i64 4))
                                          (not (before-expand-registration? (field tf form))))
                                 (store! errf (Some (derr "transform: expected `:phase before-expand`")))
@@ -4559,12 +4675,14 @@
                                                       expb
                                                       a)
                                   (Some [q]
+                                        (if (is-transform-once-form (field tf form))
+                                            (al-push! (mut once-transformers) q)
                                         (if (before-expand-registration? (field tf form))
                                             (al-push! (mut pre-transformers) q)
-                                            (al-push! (mut transformers) q)))
+                                            (al-push! (mut transformers) q))))
                                   (None []
                                         (store! errf
-                                                (Some (derr "transform: FN must be a [(prog Code)] -> Code function in scope")))))))
+                                                (Some (derr "transform: FN must be a [(prog Code)] -> Code function in scope"))))))))
                           :else 0)))
                 (set! i (primitive/iadd (load i) 1)))))
     (match (load errf)
@@ -4625,6 +4743,7 @@
                               (set! (.out s) (.items result))
                               (register-checkers (box-al [(slice u8)] a (load pre-checkers))
                                                  (box-al [(slice u8)] a (load checkers))
+                                                 (box-al [(slice u8)] a (load once-transformers))
                                                  (box-al [(slice u8)] a (load transformers))
                                                  checked
                                                  allfns

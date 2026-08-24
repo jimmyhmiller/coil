@@ -80,6 +80,37 @@ printf '(extern abort :cc c [] (-> i64))\n(defn main [] (-> i64) (abort))\n' > "
 printf '(defn a [] (-> i64)    1)\n'                     > "$T/messy1.coil"
 printf '(defn b [] (-> i64)    2)\n'                     > "$T/messy2.coil"
 
+echo "== ordinary build launches only its final linker =="
+# Compilation used to shell out to find, llvm-config, opt, llvm-split, eight llc
+# processes, an intermediate clang -r, and rm. Put fatal stand-ins first on PATH
+# and point LLVM_CONFIG there too: a normal source build must still succeed. The
+# one allowed child is the final linker driver, named explicitly with COIL_CC.
+mkdir -p "$T/no-build-tools"
+cat > "$T/no-build-tools/forbidden" <<'EOF'
+#!/bin/sh
+echo "unexpected compile-time process: $(basename "$0") $*" >&2
+exit 97
+EOF
+cat > "$T/no-build-tools/final-linker" <<'EOF'
+#!/bin/sh
+exec /usr/bin/cc "$@"
+EOF
+chmod +x "$T/no-build-tools/forbidden" "$T/no-build-tools/final-linker"
+for tool in find llvm-config opt llvm-split llc clang clang++ rm; do
+  ln -s forbidden "$T/no-build-tools/$tool"
+done
+if PATH="$T/no-build-tools:/usr/bin:/bin" \
+   LLVM_CONFIG="$T/no-build-tools/llvm-config" \
+   COIL_CC="$T/no-build-tools/final-linker" \
+   COIL_PARALLEL_CODEGEN_MIN_FUNCTIONS=1 \
+   "$COIL" build "$T/seven.coil" -o "$T/no-child-build" --quiet \
+   >"$T/no-child-build.stdout" 2>"$T/no-child-build.stderr"; then
+  ok "ordinary compilation invokes no tools before the final linker"
+else
+  bad "ordinary compilation invokes no tools before the final linker" \
+      "$(cat "$T/no-child-build.stderr")"
+fi
+
 echo "== compile-time reader metaprograms =="
 scripts/tests/reader-metaprograms.sh "$COIL" \
   && ok "generic readers cover check/build/run, ambiguity, parity, and strict installed layout" \
@@ -1018,18 +1049,17 @@ echo "== object emission on the DEFAULT (LLVM) backend =="
 # the default backend at all (LLVM aborts without an AsmParser). A committed example
 # (src/examples/shim.coil) failed to build and no gate noticed.
 if [ "$HOST_OS" = Darwin ]; then
-  # The parallel O3 backend combines its partition objects with a relocatable
-  # clang -r link. That combine must not pull in SDK/runtime libraries: dylibs are
-  # invalid inputs to ld -r and belong only to the final executable link.
+  # emit-obj promises one relocatable artifact, so it deliberately stays on the
+  # serial one-object path even when ordinary executable builds use partitions.
   parallel_link_out=$("$COIL" emit-obj "$T/seven.coil" -o "$T/seven-parallel.o" 2>&1); rc=$?
   case "$parallel_link_out" in
     *"unexpected dylib text stub file"*)
-      bad "parallel O3 combines objects without SDK dylibs" "$parallel_link_out" ;;
+      bad "emit-obj excludes SDK dylibs" "$parallel_link_out" ;;
     *)
       if [ "$rc" = 0 ] && [ -s "$T/seven-parallel.o" ]; then
-        ok "parallel O3 combines objects without SDK dylibs"
+        ok "emit-obj preserves its single relocatable-object contract"
       else
-        bad "parallel O3 relocatable link" "rc=$rc: $parallel_link_out"
+        bad "emit-obj relocatable artifact" "rc=$rc: $parallel_link_out"
       fi ;;
   esac
 fi
