@@ -38,10 +38,13 @@
 (import "ffi" :use *)
 (import "macho" :use *)  ; MObj — the in-memory object handed to jit.coil
 (import "jit" :use *)
+(import "elf" :use *)  ; EObj — the ELF-host in-memory object
+(import "jit_elf" :use *)  ; jit-elf-load — its loader
 
 (extern dlopen :cc c [(ptr i8) i64] (-> (ptr i8)))
 (extern dlsym :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
 (extern access :cc c [(ptr i8) i64] (-> i32))  ; F_OK=0: does the path exist
+(extern setenv :cc c [(ptr i8) (ptr i8) i32] (-> i32))
 (extern rename :cc c [(ptr i8) (ptr i8)] (-> i32))
 (extern setenv :cc c [(ptr i8) (ptr i8) i32] (-> i32))
 (extern malloc :cc c [isize] (-> (ptr i8)))
@@ -279,6 +282,20 @@
 (defn meta-mobj-available? [] (-> bool)
   (!= (.isset (meta-mobj-box)) (primitive/cast i64 0)))
 
+; The same seam for an ELF host. codegen_x64 builds an EObj (cgx64-build-eobj) the
+; way codegen_a64 builds an MObj, and jit_elf.coil maps it the way jit.coil maps
+; Mach-O; the two object types are near-isomorphic but not the same type, so this is
+; a second box rather than a widened first one. Exactly one of the two is ever
+; registered — an x86-64 host cannot execute the arm64 backend's output, and vice
+; versa — so `meta-jit-active?` accepts either and me-setup-jit picks the loader.
+(defstruct MetaEobjBox [(isset i64) (fp (fnptr c [(ref (dyn Allocator)) (ptr Program)] EObj))])
+(defn meta-eobj-box [] (-> (ptr MetaEobjBox))
+  (primitive/alloc-static MetaEobjBox))
+(defn set-meta-build-eobj! [(fp (fnptr c [(ref (dyn Allocator)) (ptr Program)] EObj))] (-> i64)
+  (let [b (meta-eobj-box)] (set! (.fp b) fp) (set! (.isset b) 1) 0))
+(defn meta-eobj-available? [] (-> bool)
+  (!= (.isset (meta-eobj-box)) (primitive/cast i64 0)))
+
 ; ---- WASM meta path: side-module builder + entry runner (registered by main_wasm) --
 ; When this compiler is itself hosted in a wasm sandbox it cannot dlopen a dylib or
 ; spawn a pthread. main_wasm.coil registers two hooks:
@@ -382,24 +399,26 @@
   (store! (field (meta-jit-box) on) (if on 1 0)))
 (defn meta-jit-active? [] (-> bool)
   (let [v (getenv c"COIL_META_JIT")]
-    (and (meta-mobj-available?)
+    (and (or (meta-mobj-available?) (meta-eobj-available?))
          (or (!= (.on (meta-jit-box)) (primitive/cast i64 0))
              (and (!= (primitive/cast i64 v) 0) (= (cstr->slice v) "1"))))))
 
 ; Make the in-memory path the DEFAULT on a host that has an object builder for it.
-; The entry point that registered one calls this (main.coil on an arm64 host,
-; main_a64.coil unconditionally); a host with no MObj builder never reaches it and
-; keeps the dylib route, which is why this is a call and not a constant.
+; The entry point that registered one calls this (main.coil on an arm64 or x86-64
+; host, main_a64.coil and main_x64.coil unconditionally); a host with neither
+; builder never reaches it and keeps the dylib route, which is why this is a call
+; and not a constant.
 ;
 ; Why the dylib route was the default, and why it should not be: running a macro
 ; means compiling one. The dylib route emits an object, forks `cc -dynamiclib` and
 ; dlopens the result — about eight times per compile, once per staging round — and
 ; the content-addressed cache below exists to skip that when the macros have not
-; changed. The in-memory route hands the same object straight to jit.coil, so there
-; is no fork, no file, and nothing to cache or evict. Measured on a 66-test project:
-; 6.7s uncached dylib, 4.8s warm-cached dylib, 3.8s in-memory — the route the cache
-; exists to accelerate is still the slowest of the three, and the cache it needs had
-; grown to 99 GB because nothing ever evicted from it.
+; changed. The in-memory route hands the same object straight to a loader (jit.coil
+; for Mach-O, jit_elf.coil for ELF), so there is no fork, no file, and nothing to
+; cache or evict. Measured on a 66-test project on arm64: 6.7s uncached dylib, 4.8s
+; warm-cached dylib, 3.8s in-memory — the route the cache exists to accelerate is
+; still the slowest of the three, and the cache it needs had grown to 99 GB because
+; nothing ever evicted from it.
 ;
 ; Spelled as the ENVIRONMENT variable rather than the process box on purpose:
 ; metalower.coil reads the same variable to choose its code-op lowering and cannot
@@ -803,49 +822,67 @@
                          (store! i (primitive/iadd (load i) 1)))))
              (Ok [(ptr (ArrayList MEEntry)) Diag] (box-al [MEEntry] a (load out))))))))
 
+; Everything after the image exists is format-agnostic: run coil_mp_init with the
+; host vtable, then resolve one entry per MLEntry. Both loaders land here.
+(defn me-jit-entries [(a (dyn Allocator))
+                      (mo (ptr MLOut))
+                      (img0 JitImage)] (-> (Result (ptr (ArrayList MEEntry)) Diag))
+  (try (let [img (box! a JitImage (primitive/zeroed JitImage))
+             es (load (field mo entries))
+             n (al-len [MLEntry] (load es))
+             (mut out) (al-new [MEEntry] a)
+             (mut i) 0]
+         (store! img img0)
+         (let [init (jit-lookup img "coil_mp_init")]
+           (when (= (primitive/cast i64 init) 0)
+             (return-from :try
+                            (Err [(ptr (ArrayList MEEntry)) Diag]
+                                 (derr "metaengine: JIT image is missing coil_mp_init"))))
+           (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8)] i64) init)
+                               (meta-vtable)))
+         (loop (if (>= (load i) n)
+                   (break)
+                   (do
+                     (let [ep (al-elem [MLEntry] es (load i))
+                           me (primitive/alloc-stack MEEntry)
+                           fp (jit-lookup img (load (field ep symbol)))]
+                       (when (= (primitive/cast i64 fp) 0)
+                         (return-from :try
+                                        (Err [(ptr (ArrayList MEEntry)) Diag]
+                                             (derr "metaengine: JIT image is missing a metaprogram entry"))))
+                       (store! (field me name) (load (field ep name)))
+                       (store! (field me fp) fp)
+                       (store! (field me registry) (load (field mo registry)))
+                       (store! (field me symbol) (load (field ep symbol)))
+                       (store! (field me modbytes) "")
+                       (store! (field me interpcx) (primitive/cast (ptr i8) 0))
+                       (al-push! (mut out) (load me)))
+                     (store! i (primitive/iadd (load i) 1)))))
+         (Ok [(ptr (ArrayList MEEntry)) Diag] (box-al [MEEntry] a (load out))))))
+
+; Build the metaprogram object with whichever in-memory backend this host
+; registered, load it, and hand the image to me-jit-entries. Exactly one of the two
+; boxes is ever set (see set-meta-build-eobj!), so the MObj arm is tried first and
+; the EObj arm is the ELF host.
 (defn me-setup-jit [(a (dyn Allocator)) (mo (ptr MLOut))] (-> (Result (ptr (ArrayList MEEntry)) Diag))
   (try (do
          (let [mp (try! (monomorphize a (load (field mo prog))))]
            (sort-mono-program a mp)
-           (let [(mut obj) (primitive/call-ptr (load (field (meta-mobj-box) fp)) a mp)]
-             (match (jit-load a (mut obj))
-               (Err [e0]
-                    (let [e (primitive/alloc-stack JitErr)]
-                      (store! e e0)
-                      (Err [(ptr (ArrayList MEEntry)) Diag] (derr (load (field e msg))))))
-               (Ok [img0]
-                   (let [img (box! a JitImage (primitive/zeroed JitImage))
-                         es (load (field mo entries))
-                         n (al-len [MLEntry] (load es))
-                         (mut out) (al-new [MEEntry] a)
-                         (mut i) 0]
-                     (store! img img0)
-                     (let [init (jit-lookup img "coil_mp_init")]
-                       (when (= (primitive/cast i64 init) 0)
-                         (return-from :try
-                                        (Err [(ptr (ArrayList MEEntry)) Diag]
-                                             (derr "metaengine: JIT image is missing coil_mp_init"))))
-                       (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8)] i64) init)
-                                           (meta-vtable)))
-                     (loop (if (>= (load i) n)
-                               (break)
-                               (do
-                                 (let [ep (al-elem [MLEntry] es (load i))
-                                       me (primitive/alloc-stack MEEntry)
-                                       fp (jit-lookup img (load (field ep symbol)))]
-                                   (when (= (primitive/cast i64 fp) 0)
-                                     (return-from :try
-                                                    (Err [(ptr (ArrayList MEEntry)) Diag]
-                                                         (derr "metaengine: JIT image is missing a metaprogram entry"))))
-                                   (store! (field me name) (load (field ep name)))
-                                   (store! (field me fp) fp)
-                                   (store! (field me registry) (load (field mo registry)))
-                                   (store! (field me symbol) (load (field ep symbol)))
-                                   (store! (field me modbytes) "")
-                                   (store! (field me interpcx) (primitive/cast (ptr i8) 0))
-                                   (al-push! (mut out) (load me)))
-                                 (store! i (primitive/iadd (load i) 1)))))
-                     (Ok [(ptr (ArrayList MEEntry)) Diag] (box-al [MEEntry] a (load out)))))))))))
+           (if (meta-mobj-available?)
+               (let [(mut obj) (primitive/call-ptr (load (field (meta-mobj-box) fp)) a mp)]
+                 (match (jit-load a (mut obj))
+                   (Err [e0]
+                        (let [e (primitive/alloc-stack JitErr)]
+                          (store! e e0)
+                          (Err [(ptr (ArrayList MEEntry)) Diag] (derr (load (field e msg))))))
+                   (Ok [img0] (me-jit-entries a mo img0))))
+               (let [(mut eobj) (primitive/call-ptr (load (field (meta-eobj-box) fp)) a mp)]
+                 (match (jit-elf-load a (mut eobj))
+                   (Err [e0]
+                        (let [e (primitive/alloc-stack JitErr)]
+                          (store! e e0)
+                          (Err [(ptr (ArrayList MEEntry)) Diag] (derr (load (field e msg))))))
+                   (Ok [img0] (me-jit-entries a mo img0)))))))))
 
 ; ---- one-time engine setup (from expand-stage3, after check-program) ----------------
 (defn meta-engine-setup [(a (dyn Allocator)) (checked (ptr Program)) (quals (ptr (ArrayList (slice u8))))] (-> (Option Diag))

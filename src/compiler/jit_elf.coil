@@ -1,0 +1,331 @@
+; src/compiler/jit_elf.coil — load an x86-64 EObj into executable memory, in-process.
+;
+; The ELF sibling of jit.coil. Same job, same shape: lay the object's sections into
+; one mmap'd region, resolve symbols (defined ones by section+offset, undefined ones
+; via dlsym against the compiler process itself), apply relocations, then flip the
+; text pages to R+X. It exists so an x86-64 host can run metaprograms and comptime
+; thunks in memory instead of serializing a .o, forking `cc -shared` and dlopen'ing
+; the result once per staging round.
+;
+; It reuses jit.coil's JitImage/JitSym/JitErr rather than defining parallel types,
+; so metaengine and comptime_eval need only pick a loader, not a whole vocabulary.
+;
+; LAYOUT: every executable section first, then a page boundary, then everything else
+; that is SHF_ALLOC. Only the text half becomes read-execute — .data stays writable,
+; because Coil globals (alloc-static) live there and comptime code may store through
+; them. One region rather than two keeps every PC32 displacement inside +/-2GB by
+; construction (the whole image is a few MB).
+;
+; NO VENEERS, unlike the arm64 loader. There, a bl reaches only +/-128MB, so every
+; branch to a dlsym'd address needed a trampoline. Here a call/jmp carries a signed
+; 32-bit displacement — +/-2GB — but a dlsym'd libc address can still be further than
+; that from our mapping, so the range check in jit-elf-patch! is a real guard and not
+; a formality. It fails loudly rather than truncating: silently wrapping a call
+; displacement produces a jump into nothing. If it ever fires the fix is a PLT-style
+; indirect stub, which is why the message says so.
+;
+; NO ICACHE FLUSH, also unlike arm64: x86 instruction caches are coherent with
+; stores, so writing code and then executing it needs no explicit invalidation.
+;
+; Debug sections are not loaded (nothing executes debug info). Their relocations are
+; skipped because the section they patch was never placed — note that ELF debug
+; relocations carry a REAL symbol index (codegen_x64 emits R_X86_64_64 against a
+; text-local symbol), unlike Mach-O's negative section ordinal, so the skip has to
+; key off the unplaced target section rather than off the symbol. The metaprogram
+; object builder passes emit-dwarf=false anyway.
+;
+; RELOCATIONS. codegen_x64 emits exactly three kinds; anything else is a hard error
+; rather than a silent no-op, because a skipped fixup produces code that jumps to a
+; wild address.
+;   R_X86_64_64     (1) 8-byte absolute   *loc = S + A
+;   R_X86_64_PC32   (2) 4-byte pcrel      *loc = S + A - P, range-checked
+;   R_X86_64_PLT32  (4) 4-byte pcrel      identical arithmetic once there is no PLT:
+;                                         we resolve L to S itself, which is what a
+;                                         static link does when it can reach.
+; ELF is RELA here, so the addend comes from the relocation record and the slot is
+; overwritten outright — it is NOT read-modify-write like the Mach-O UNSIGNED case.
+(module jit_elf)
+(import "coil.primitive" :as primitive)
+
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.control" :use *)
+(import "x64" :use *)  ; xal-at
+(import "elf" :use *)  ; EObj/ESect/ESym/EReloc, r-x86-64-*, shf-*
+(import "jit" :use *)  ; JitImage/JitSym/JitErr and their constructors
+
+(extern mmap :cc c [(ptr i8) i64 i32 i32 i32 i64] (-> (ptr i8)))
+(extern munmap :cc c [(ptr i8) i64] (-> i32))
+(extern mprotect :cc c [(ptr i8) i64 i32] (-> i32))
+(extern dlsym :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(defn ejit-prot-rw [] (-> i64)
+  3)  ; PROT_READ|PROT_WRITE
+(defn ejit-prot-rx [] (-> i64)
+  5)  ; PROT_READ|PROT_EXEC
+; MAP_PRIVATE|MAP_ANONYMOUS. 0x02|0x20 on Linux — NOT the 0x1000 Darwin spells
+; MAP_ANON with, which is what jit.coil's map-priv carries.
+(defn ejit-map-priv [] (-> i64)
+  34)
+(defn ejit-page-size [] (-> i64)
+  4096)  ; x86-64 Linux; this only ever rounds UP, so a larger-page host stays correct.
+; A call/jmp rel32 displacement is signed 32-bit.
+(defn ejit-pc32-max [] (-> i64)
+  2147483648)
+
+; dlsym(RTLD_DEFAULT, …) — search every image already loaded in this process, which
+; is how a comptime thunk reaches libc. RTLD_DEFAULT is NULL on Linux (it is
+; (void*)-2 on macOS, which is what jit.coil uses).
+;
+; Note this does NOT need the compiler linked -rdynamic. The metaprogram/host
+; boundary is a VTABLE handshake (metashim.coil), not dynamic symbols: the only
+; undefined symbols a metaprogram object actually carries are plain libc.
+(defn ejit-rtld-default [] (-> (ptr i8))
+  (primitive/cast (ptr i8) 0))
+
+; ESect.align is a BYTE COUNT here (the Mach-O side stores a log2 exponent instead).
+; ELF treats 0 and 1 alike as "no constraint"; taking 0 literally would divide by zero,
+; so it is normalized rather than trusted.
+(defn ejit-align-up [(v i64) (al0 i64)] (-> i64)
+  (let [al (if (> al0 (primitive/cast i64 0)) al0 1)]
+    (primitive/imul (primitive/idiv (primitive/iadd v (primitive/isub al 1)) al) al)))
+
+(defn ejit-cat [(a (dyn Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
+  (match (str-concat a x y) (Some [s] s) (None [] x)))
+
+; ---- little-endian byte access ------------------------------------------------
+; A byte at a time, in i64 throughout, so there is no width or alignment question
+; at the patch sites.
+(defn ejit-st32! [(p (ptr u8)) (v i64)] (-> i64)
+  (do
+    (set! (primitive/index p 0) (primitive/cast u8 (primitive/iand v 255)))
+    (set! (primitive/index p 1) (primitive/cast u8 (primitive/iand (primitive/ishr v 8) 255)))
+    (set! (primitive/index p 2) (primitive/cast u8 (primitive/iand (primitive/ishr v 16) 255)))
+    (set! (primitive/index p 3) (primitive/cast u8 (primitive/iand (primitive/ishr v 24) 255)))
+    0))
+
+(defn ejit-st64! [(p (ptr u8)) (v i64)] (-> i64)
+  (do
+    (ejit-st32! p (primitive/iand v 4294967295))
+    (ejit-st32! (primitive/index p 4) (primitive/ishr v 32))
+    0))
+
+; a section is loaded if the linker would give it memory; debug sections and the
+; empty .note.GNU-stack marker are not SHF_ALLOC and so are skipped.
+(defn ejit-loadable? [(s (ptr ESect))] (-> bool)
+  (!= (primitive/iand (.flags s) (shf-alloc)) (primitive/cast i64 0)))
+
+(defn ejit-is-text? [(s (ptr ESect))] (-> bool)
+  (!= (primitive/iand (.flags s) (shf-execinstr)) (primitive/cast i64 0)))
+
+; NUL-terminate a name for dlsym. ELF symbols carry no leading underscore (unlike
+; Mach-O), so the name passes through unchanged.
+(defn ejit-sym-cstr [(a (dyn Allocator)) (name (slice u8))] (-> (ptr i8))
+  (let [n (slice-len name)
+        buf (slice-data (match (alloc [u8] a (primitive/iadd n 1)) (Some [s] s) (None [] (do (oom-at c"compiler jit_elf" -1) (alloc/alloc-slice-new (primitive/cast (ptr u8) 0) 0)))))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (set! (primitive/index buf (load i)) (load (primitive/index (slice-data name) (load i))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (set! (primitive/index buf n) (primitive/cast u8 0))
+    (primitive/cast (ptr i8) buf)))
+
+; ---- apply one relocation ------------------------------------------------------
+; loc = the fixup address, tgt = the resolved target address S, addend = the RELA
+; addend A. RELA means the slot carries nothing to preserve: it is written outright.
+(defn jit-elf-patch! [(loc (ptr u8)) (tgt (ptr i8)) (rtype i64) (addend i64)] (-> (Result i64 (slice u8)))
+  (let [p (primitive/cast i64 loc)
+        s (primitive/cast i64 tgt)]
+    (cond (= rtype (r-x86-64-64))
+            (do
+              (ejit-st64! loc (primitive/iadd s addend))
+              (Ok [i64 (slice u8)] 0))
+          ; PC32 and PLT32 are the same arithmetic here. PLT32 means "L + A - P",
+          ; where L is the PLT entry for S; with no PLT in an in-memory image, L is
+          ; S, exactly as a static link resolves it when the target is in range.
+          (or (= rtype (r-x86-64-pc32)) (= rtype (r-x86-64-plt32)))
+            (let [delta (primitive/iadd (primitive/isub s p) addend)]
+              (if (or (>= delta (ejit-pc32-max))
+                      (< delta (primitive/isub 0 (ejit-pc32-max))))
+                  ; A dlsym'd address more than 2GB from our mapping. Truncating
+                  ; would jump into nothing, so fail loudly; the fix is an indirect
+                  ; stub (load the absolute address into a scratch register and jump
+                  ; through it), not a wider mask.
+                  (Err [i64 (slice u8)] "jit_elf: pc-relative target out of +/-2GB range for an in-memory symbol")
+                  (do
+                    (ejit-st32! loc delta)
+                    (Ok [i64 (slice u8)] 0))))
+          :else (Err [i64 (slice u8)] "jit_elf: unhandled x86-64 relocation type in the in-memory loader"))))
+
+; ---- the loader ----------------------------------------------------------------
+(defn jit-elf-load-reusing [(a (dyn Allocator)) (o (mut EObj)) (prior (ptr JitImage))] (-> (Result JitImage JitErr))
+  (block :ejit
+           (let [nsect (al-len [ESect] (load (field o sects)))
+                 nsym (al-len [ESym] (load (field o syms)))
+                 nrel (al-len [EReloc] (load (field o relocs)))
+                 offs (slice-data (match (alloc [i64] a (if (> nsect (primitive/cast i64 0)) nsect 1)) (Some [s] s) (None [] (do (oom-at c"compiler jit_elf" -1) (alloc/alloc-slice-new (primitive/cast (ptr i64) 0) 0)))))
+                 addrs (slice-data (match (alloc [(ptr i8)] a (if (> nsym (primitive/cast i64 0)) nsym 1)) (Some [s] s) (None [] (do (oom-at c"compiler jit_elf" -1) (alloc/alloc-slice-new (primitive/cast (ptr (ptr i8)) 0) 0)))))
+                 (mut cur) 0
+                 (mut i) 0]
+
+             ; nothing placed yet
+             (loop (if (>= (load i) nsect)
+                       (break)
+                       (do (store! (primitive/index offs (load i)) -1) (store! i (primitive/iadd (load i) 1)))))
+
+             ; pass 1 — executable sections, in order
+             (store! i 0)
+             (loop (if (>= (load i) nsect)
+                       (break)
+                       (do
+                         (let [s (xal-at [ESect] (field o sects) (load i))]
+                           (when (and (ejit-loadable? s) (ejit-is-text? s))
+                             (store! cur (ejit-align-up (load cur) (load (field s align))))
+                             (store! (primitive/index offs (load i)) (load cur))
+                             (store! cur (primitive/iadd (load cur) (al-len [u8] (load (field s buf)))))))
+                         (store! i (primitive/iadd (load i) 1)))))
+
+             ; the text/data boundary is a page boundary: mprotect works in whole
+             ; pages, and making a data page executable (or a text page writable)
+             ; defeats W^X.
+             (let [textsz (ejit-align-up (load cur) (ejit-page-size))]
+               (store! cur textsz)
+
+               ; pass 2 — everything else that is loadable
+               (store! i 0)
+               (loop (if (>= (load i) nsect)
+                         (break)
+                         (do
+                           (let [s (xal-at [ESect] (field o sects) (load i))]
+                             (when (and (ejit-loadable? s) (not (ejit-is-text? s)))
+                               (store! cur (ejit-align-up (load cur) (load (field s align))))
+                               (store! (primitive/index offs (load i)) (load cur))
+                               (store! cur (primitive/iadd (load cur) (al-len [u8] (load (field s buf)))))))
+                           (store! i (primitive/iadd (load i) 1)))))
+
+               (let [total (ejit-align-up (if (> (load cur) (primitive/cast i64 0)) (load cur) 1) (ejit-page-size))
+                     base
+                       (mmap (primitive/cast (ptr i8) 0)
+                             total
+                             (primitive/cast i32 (ejit-prot-rw))
+                             (primitive/cast i32 (ejit-map-priv))
+                             (primitive/cast i32 -1)
+                             0)]
+                 (when (or (= (primitive/cast i64 base) (primitive/cast i64 0))
+                           (= (primitive/cast i64 base) (primitive/cast i64 -1)))
+                   (break :ejit (Err [JitImage JitErr] (jit-err "jit_elf: mmap of the comptime image failed"))))
+
+                 ; copy each placed section in
+                 (store! i 0)
+                 (loop (if (>= (load i) nsect)
+                           (break)
+                           (do
+                             (let [off (load (primitive/index offs (load i)))]
+                               (when (>= off (primitive/cast i64 0))
+                                 (let [s (xal-at [ESect] (field o sects) (load i))
+                                       src (slice-data (al-slice [u8] (load (field s buf))))
+                                       n (al-len [u8] (load (field s buf)))
+                                       dst (primitive/cast (ptr u8) (primitive/index base off))
+                                       (mut k) 0]
+                                   (loop (if (>= (load k) n)
+                                             (break)
+                                             (do
+                                               (store! (primitive/index dst (load k))
+                                                       (load (primitive/index src (load k))))
+                                               (store! k (primitive/iadd (load k) 1))))))))
+                             (store! i (primitive/iadd (load i) 1)))))
+
+                 ; resolve every symbol to a final address
+                 (let [(mut syms) (al-new [JitSym] a)]
+                   (store! i 0)
+                   (loop (if (>= (load i) nsym)
+                             (break)
+                             (do
+                               (let [sy (xal-at [ESym] (field o syms) (load i))
+                                     sect (load (field sy sect))]
+                                 (if (= sect (primitive/cast i64 0))
+                                     ; undefined: it must already be somewhere in this process
+                                     (let [fp (dlsym (ejit-rtld-default) (ejit-sym-cstr a (load (field sy name))))]
+                                       (when (= (primitive/cast i64 fp) (primitive/cast i64 0))
+                                         (munmap base total)
+                                         (break :ejit (Err [JitImage JitErr] (jit-undef-err a (load (field sy name))))))
+                                       (store! (primitive/index addrs (load i)) fp))
+                                     (let [old
+                                             (if (and (!= (primitive/cast i64 prior) 0)
+                                                      (starts-with (load (field sy name)) "repl_static."))
+                                                 (jit-syms-lookup (field prior syms) (load (field sy name)))
+                                                 (primitive/cast (ptr i8) 0))
+                                           off (load (primitive/index offs (primitive/isub sect 1)))]
+                                       (when (< off (primitive/cast i64 0))
+                                         (munmap base total)
+                                         (break :ejit
+                                                  (Err [JitImage JitErr]
+                                                       (jit-err (ejit-cat a
+                                                                          (ejit-cat a
+                                                                                    "jit_elf: symbol '"
+                                                                                    (load (field sy name)))
+                                                                          "' lives in a section that was not loaded")))))
+                                       (let [ad
+                                               (if (!= (primitive/cast i64 old) 0)
+                                                   old
+                                                   (primitive/index base
+                                                                    (primitive/iadd off (load (field sy off)))))]
+                                         (store! (primitive/index addrs (load i)) ad)
+                                         (let [js (primitive/alloc-stack JitSym)]
+                                           (store! (field js name) (load (field sy name)))
+                                           (store! (field js addr) ad)
+                                           (al-push! [JitSym] (mut syms) (load js)))))))
+                               (store! i (primitive/iadd (load i) 1)))))
+
+                   ; apply relocations
+                   (store! i 0)
+                   (loop (if (>= (load i) nrel)
+                             (break)
+                             (do
+                               (let [r (xal-at [EReloc] (field o relocs) (load i))
+                                     rsect (load (field r sect))
+                                     sym (load (field r sym))]
+                                 (unless (or (< sym (primitive/cast i64 0)) (>= sym nsym))
+                                   (let [soff (load (primitive/index offs (primitive/isub rsect 1)))]
+                                     ; a fixup in a section that was never placed —
+                                     ; debug info — has nothing to patch. ELF debug
+                                     ; relocations name a real symbol, so this is the
+                                     ; only thing that filters them out.
+                                     (unless (< soff (primitive/cast i64 0))
+                                       (let [loc
+                                               (primitive/cast (ptr u8)
+                                                               (primitive/index base
+                                                                                (primitive/iadd soff
+                                                                                                (load (field r off)))))
+                                             tgt (load (primitive/index addrs sym))]
+                                         (match (jit-elf-patch! loc tgt (load (field r rtype)) (load (field r addend)))
+                                           (Err [m]
+                                                (do
+                                                  (munmap base total)
+                                                  (return-from :ejit (Err [JitImage JitErr] (jit-err m)))))
+                                           (Ok [_] 0)))))))
+                               (store! i (primitive/iadd (load i) 1)))))
+
+                   ; text becomes read-execute; data stays writable. No icache flush:
+                   ; x86 instruction caches are coherent with stores.
+                   (when (> textsz (primitive/cast i64 0))
+                     (when (!= (primitive/cast i64 (mprotect base textsz (primitive/cast i32 (ejit-prot-rx))))
+                               (primitive/cast i64 0))
+                       (munmap base total)
+                       (break :ejit
+                                (Err [JitImage JitErr]
+                                     (jit-err "jit_elf: mprotect of the comptime text pages failed")))))
+
+                   (let [img (primitive/alloc-stack JitImage)]
+                     (store! (field img base) base)
+                     (store! (field img size) total)
+                     (store! (field img syms) (load syms))
+                     (Ok [JitImage JitErr] (load img)))))))))
+
+(defn jit-elf-load [(a (dyn Allocator)) (o (mut EObj))] (-> (Result JitImage JitErr))
+  (jit-elf-load-reusing a (mut o) (primitive/cast (ptr JitImage) 0)))
