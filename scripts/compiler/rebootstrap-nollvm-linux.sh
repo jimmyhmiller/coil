@@ -29,6 +29,9 @@ cd "$(dirname "$0")/../.."
 . scripts/compiler/stage-lib.sh
 SRC=src/compiler/main_x64.coil
 SEED=bootstrap/seeds/native/coil-seed-nollvm-linux-x86_64
+RUN_DIR=$(mktemp -d /tmp/coil-rebootstrap-nollvm-linux.XXXXXX) || exit 1
+trap 'stage_lib_cleanup; rm -rf "$RUN_DIR"' EXIT
+S1="$RUN_DIR/coil-nlx1"; S2="$RUN_DIR/coil-nlx2"; S3="$RUN_DIR/coil-nlx3"
 
 . scripts/compiler/select-stage0.sh
 select_stage0 "$SEED" "$SRC" x64 || exit 1
@@ -62,24 +65,26 @@ fi
 stage0_check "$STAGE0" "$SEED" "$SRC" "${S1FLAGS[@]}" || exit 1
 
 echo "=== stage1: stage0 builds the LLVM-free compiler ==="
-COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o /tmp/coil-nlx1 ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} "${S1FLAGS[@]}" || { echo "stage1 FAILED"; exit 1; }
+COIL_STRICT_BUNDLE=0 "$STAGE0" build "$SRC" -o "$S1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} "${S1FLAGS[@]}" || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it with the x64 backend ==="
-/tmp/coil-nlx1 build "$SRC" -o /tmp/coil-nlx2                 || { echo "stage2 FAILED"; exit 1; }
+"$S1" build "$SRC" -o "$S2" || { echo "stage2 FAILED"; exit 1; }
 echo "=== stage3: stage2 rebuilds it with the x64 backend ==="
-/tmp/coil-nlx2 build "$SRC" -o /tmp/coil-nlx3                 || { echo "stage3 FAILED"; exit 1; }
+"$S2" build "$SRC" -o "$S3" || { echo "stage3 FAILED"; exit 1; }
 
 echo "=== NO-LLVM: stage2 must link no libLLVM ==="
-if ldd /tmp/coil-nlx2 | grep -qi LLVM; then
-  echo "  FAIL — libLLVM is linked:"; ldd /tmp/coil-nlx2 | grep -i LLVM; exit 3
+if ldd "$S2" | grep -qi LLVM; then
+  echo "  FAIL — libLLVM is linked:"; ldd "$S2" | grep -i LLVM; exit 3
 fi
-echo "  ok — links only:$(ldd /tmp/coil-nlx2 | awk '{printf " %s", $1}')"
+echo "  ok — links only:$(ldd "$S2" | awk '{printf " %s", $1}')"
 
-echo "=== FIXPOINT: stage2.o vs stage3.o ==="
-cmp /tmp/coil-nlx2.o /tmp/coil-nlx3.o || { echo "FIXPOINT FAIL — x64 objects differ"; exit 2; }
+echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="
+"$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" --backend x64 || { echo "stage2 object emission FAILED"; exit 1; }
+"$S2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" --backend x64 || { echo "stage3 object emission FAILED"; exit 1; }
+cmp "$RUN_DIR/stage2.o" "$RUN_DIR/stage3.o" || { echo "FIXPOINT FAIL — x64 objects differ"; exit 2; }
 echo "  ok — byte-identical, the compiler reproduces itself"
 
 echo "=== GATE: x64 behavioral gate-run ==="
-python3 scripts/oracle.py runtime gate x64 --compiler /tmp/coil-nlx2 >/dev/null 2>&1 \
+python3 scripts/oracle.py runtime gate x64 --compiler "$S2" >/dev/null 2>&1 \
   || { echo "x64 gate-run FAIL (run it directly to see which programs)"; exit 1; }
 echo "  x64 gate-run: PASS (programs run identically to the LLVM reference)"
 
@@ -87,5 +92,5 @@ stage_lib_cleanup
 
 DEST="${1:-build/bin/coil-nollvm}"
 mkdir -p "$(dirname "$DEST")"
-cp /tmp/coil-nlx2 "$DEST"
+cp "$S2" "$DEST"
 echo "=== VERIFIED LLVM-free compiler installed -> $DEST ==="

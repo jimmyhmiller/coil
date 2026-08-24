@@ -144,7 +144,7 @@ goes through the same `use-refers` predicate as every other import, consulted by
 Four mirrors of one rule is what would make this a hack: an `:exclude [<]` that hid the
 name from the resolver but left the operator callable would be worse than no feature.
 Each surface has its own `tests/compiler/features/refer_exclude_*_rejected.coil` fixture
-in the bounded inner-loop gate for exactly that reason.
+in the focused inner-loop gate for exactly that reason.
 
 Trait methods need one extra distinction. A method whose declaring trait is unique is
 callable today with **no import at all**, so the mere absence of an import cannot suppress

@@ -242,7 +242,7 @@ optimization, not a prerequisite for this feature. Noted in `FUTURE_WORK.md`.)
 
 ## 6. Gating
 
-In the bounded inner-loop gate (`scripts/dev.py test modernize-fast`), so a regression
+In the focused inner-loop gate (`scripts/dev.py test modernize-fast`), so a regression
 shows up in seconds rather than in a release rebootstrap:
 
 | Fixture | Asserts |

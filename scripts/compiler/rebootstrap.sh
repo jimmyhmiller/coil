@@ -94,7 +94,10 @@ echo "=== stage2: stage1 rebuilds the compiler ==="
 echo "=== stage3: stage2 rebuilds the compiler ==="
 "$RL2" build "$SRC" -o "$RL3" "${LF[@]}" || { echo "stage3 FAILED"; exit 1; }
 
-cmp "$RL2.o" "$RL3.o" \
+echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="
+"$RB1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" || { echo "stage2 object emission FAILED"; exit 1; }
+"$RL2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" || { echo "stage3 object emission FAILED"; exit 1; }
+cmp "$RUN_DIR/stage2.o" "$RUN_DIR/stage3.o" \
   || { echo "LLVM FIXPOINT FAIL — LLVM-backend objects differ"; exit 2; }
 echo "  LLVM fixed point: PASS"
 
