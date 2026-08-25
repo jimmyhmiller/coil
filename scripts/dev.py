@@ -595,7 +595,7 @@ def test_modernize_fast(compiler: str) -> None:
             execute(coil, "lint", str(preflight), "--fix")
             migrated = preflight.read_text()
             for expected in ("(dyn alloc/Allocator)", "(alloc/box! a i64 1)",
-                             "(primitive/code-eq",
+                             "(= (primitive/target-arch) wanted)",
                              "(primitive/target-arch)", "(do (free p) 0)"):
                 if expected not in migrated:
                     raise RuntimeError(
@@ -689,6 +689,55 @@ def test_modernize_fast(compiler: str) -> None:
             if not all(part in formatted for part in ("(Moved\n", ":x 1\n", ":y 2\n", ":at 3)")):
                 raise RuntimeError("fast modernization gate: named constructor was not formatted by field")
             execute(coil, "check", str(probe))
+
+            collection_probe = tmp / "legacy-collections.coil"
+            collection_probe.write_text("""(module legacy-collections)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :as arraylist)
+(import "coil.hashmap" :as hashmap)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :as slice)
+(defn inspect [(forms Code)] (-> Code)
+  (if (primitive/code-eq (primitive/code-nth forms 0) `ok)
+      (if (= (primitive/code-count forms) 1) `42 `0)
+      `0))
+(defn slice-first [(items (slice i64))] (-> i64)
+  (if (slice/slice-empty? items) 0
+      (+ (slice/slice-len items) (slice/slice-get items 0))))
+(defn map-value [(m (hashmap/HashMap i64 i64))] (-> (Option i64))
+  (if (= (hashmap/hm-len [i64 i64] m) 0) (None)
+      (hashmap/hm-get [i64 i64] m 1)))
+(defn map-put! [(m (mut (hashmap/HashMap i64 i64)))] (-> i64)
+  (hashmap/hm-put! [i64 i64] (mut m) 1 42))
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut xs) (arraylist/al-new [i64] a)
+        _push (arraylist/al-push! [i64] (mut xs) 42)
+        _set (arraylist/al-set! [i64] (mut xs) 0 42)
+        n (arraylist/al-len [i64] xs)
+        value (arraylist/al-get [i64] xs 0)]
+    (if (arraylist/al-empty? [i64] xs) 1
+        (if (= n 1) (- value 42) 2))))
+""")
+            execute(coil, "lint", str(collection_probe), "--fix")
+            collection_fixed = collection_probe.read_text()
+            for legacy in ("primitive/code-eq", "primitive/code-nth", "primitive/code-count",
+                           "arraylist/al-push!", "arraylist/al-len", "arraylist/al-get",
+                           "arraylist/al-set!", "arraylist/al-empty?", "slice/slice-empty?",
+                           "slice/slice-len", "slice/slice-get", "hashmap/hm-len",
+                           "hashmap/hm-get", "hashmap/hm-put!"):
+                if legacy in collection_fixed:
+                    raise RuntimeError(
+                        f"fast modernization gate: collection autofix left {legacy!r}")
+            for replacement in ("(= (get forms 0) `ok)", "(len forms)",
+                                "(push! (mut xs) 42)", "(len xs)", "(get xs 0)",
+                                "(set! (mut xs) 0 42)", "(empty? xs)",
+                                "(empty? items)", "(len items)", "(get items 0)",
+                                "(len m)", "(get m 1)", "(set! (mut m) 1 42)"):
+                if replacement not in collection_fixed:
+                    raise RuntimeError(
+                        f"fast modernization gate: missing collection rewrite {replacement!r}")
+            execute(coil, "check", str(collection_probe))
 
         def broken_lint_task() -> None:
             broken = tmp / "broken.coil"
