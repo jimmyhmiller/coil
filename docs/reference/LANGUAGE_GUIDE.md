@@ -1452,7 +1452,10 @@ For foreign APIs that fill caller storage, `coil.checked-ffi` provides
 surrounds the output with canaries, evaluates the foreign call, and validates the
 canaries before returning. `coil.thread/thread-spawn-configured` accepts explicit stack and guard
 sizes using a probed opaque `pthread_attr_t`. Compiler worker defaults can be overridden
-with `COIL_WORKER_STACK_SIZE` and `COIL_WORKER_GUARD_SIZE` (decimal bytes).
+with `COIL_WORKER_STACK_SIZE` and `COIL_WORKER_GUARD_SIZE` (decimal bytes). Parallel
+LLVM codegen workers have a separate 8 MiB default, overridden with
+`COIL_LLVM_WORKER_STACK_SIZE`, so changing their stack does not change the compiler
+pipeline's deep stack.
 
 ## Reserved-name gotchas ⚠
 
