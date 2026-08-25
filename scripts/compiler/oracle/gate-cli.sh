@@ -473,6 +473,20 @@ printf '(module app)\n(import "util" :use *)\n(defn main [] (-> i64) (forty-two)
 ( cd "$T" && "$COIL" run "$T/sib/src/main.coil" >/dev/null 2>&1 ); [ $? = 42 ] \
   && ok "namespace lookup works from an unrelated cwd" \
   || bad "namespace index (arbitrary cwd)" "want rc=42"
+# Once project mode supplies explicit roots, a temporary/synthetic entry does not
+# expand the namespace boundary to its containing directory. Besides preventing
+# accidental imports, this keeps lint's /tmp/coil-project-lint-root-*.coil from
+# recursively indexing all of /tmp and retaining tens of gigabytes of paths.
+mkdir -p "$T/configured-root" "$T/outside-entry"
+printf '(module leaked)\n(defn value [] (-> i64) 42)\n' > "$T/outside-entry/leaked.coil"
+printf '(module configured-boundary)\n(import "leaked" :use *)\n(defn main [] (-> i64) (value))\n' \
+  > "$T/outside-entry/main.coil"
+out=$(COIL_NAMESPACE_ROOTS="$T/configured-root" "$COIL" check "$T/outside-entry/main.coil" 2>&1)
+rc=$?
+case "$out" in *"namespace 'leaked' was not found"*) missing_leaked=1;; *) missing_leaked=0;; esac
+[ "$rc" = 1 ] && [ "$missing_leaked" = 1 ] \
+  && ok "configured namespace roots do not absorb a temporary entry directory" \
+  || bad "configured namespace boundary" "got rc=$rc: $out"
 printf '(module bad)\n(import "unrelated/place/anything.coil" :use *)\n(defn main [] (-> i64) 0)\n' > "$T/sib/src/bad.coil"
 expect_out 'import paths are not supported' "relative path imports are rejected" \
   "$COIL" check "$T/sib/src/bad.coil"
