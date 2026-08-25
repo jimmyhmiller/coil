@@ -94,14 +94,16 @@ compiler verifies and emits a realization that hits those bytes exactly.
 
 ```lisp
 (defstruct ControlReg :layout bits :backing i32
-  [(enable   :bits 1)      ; bit 0
-   (mode     :bits 3)      ; bits 1–3
+  [(enable   :bits 1)      ; bit 0; numeric widths are unsigned
+   (mode     :bits i3)     ; signed bits 1–3
    (channel  :bits 4)      ; bits 4–7
    (reserved :bits 24)])   ; bits 8–31
 ```
 
 - `:backing iN` (optional) — the integer the bits pack into; default = smallest
   covering int. `:bit-order lsb|msb` for total control.
+- A numeric width, `:bits N`, declares an unsigned `uN` field for compatibility.
+  Use `:bits iN` or `:bits uN` to state signedness; signed reads sign-extend.
 - Bits aren't addressable, so bitfields are accessed **by value**, not by
   pointer (see "Access semantics").
 
