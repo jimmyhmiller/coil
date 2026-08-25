@@ -44,13 +44,19 @@ EXPECTED = {
     "stray-close-column0": ("repair", None, ["--no-typecheck"]),
     # A surplus closer with more than one reading. Indentation must decline it...
     "stray-close-inline": ("refuse", "indistinguishable", ["--no-typecheck"]),
-    # ...and the type checker must settle it, because only one balancing is Coil.
-    "stray-close-inline+check": ("repair", None, []),
+    # ...and semantic checking must not search alternative delimiter placements.
+    "stray-close-inline+check": ("refuse", "indistinguishable", []),
     # Neither can help here: both readings would be well-typed if they compiled, and
     # the typo could be the opener or the closer.
     "mismatched-bracket": ("refuse", "does not match", []),
     # Two damaged forms; the balanced form between them must survive untouched.
     "two-damaged-forms": ("repair", None, ["--no-typecheck"]),
+    # Indentation identifies the damaged line; foo/bar arity and x/y types uniquely
+    # place the closer inside it.
+    "typed-inline": ("repair", None, []),
+    # Types are useful only when they prove one boundary. Variadic `do` admits more
+    # than one reading, so this must remain a refusal.
+    "typed-inline-ambiguous": ("refuse", "several delimiter placements", []),
 }
 
 
@@ -85,6 +91,26 @@ def check_timeout_and_interrupt(cmd: list[str]) -> bool:
         proc.communicate(timeout=3)
         if proc.returncode not in (-signal.SIGINT, 130) or time.monotonic() - interrupted >= 2:
             print(f"FAIL typecheck-interrupt: exit {proc.returncode} was not prompt")
+            return False
+    return True
+
+
+def check_large_layout_is_linear(cmd: list[str]) -> bool:
+    """A large mismatch must be handled by layout, never whole-file edit search."""
+    original = (REPO / "src/compiler/driver.coil").read_bytes()
+    damaged = original.replace(b"]", b")", 1)
+    with tempfile.NamedTemporaryFile(prefix="coil-balance-large-", suffix=".coil", dir="/tmp") as f:
+        f.write(damaged)
+        f.flush()
+        started = time.monotonic()
+        try:
+            subprocess.run(cmd + ["--write", f.name], capture_output=True, timeout=3)
+        except subprocess.TimeoutExpired:
+            print("FAIL large-layout: balance searched a large file instead of resolving/refusing from indentation")
+            return False
+        elapsed = time.monotonic() - started
+        if elapsed >= 2.5:
+            print(f"FAIL large-layout: took {elapsed:.1f}s; expected a single linear layout pass")
             return False
     return True
 
@@ -179,6 +205,11 @@ def main() -> int:
 
     if check_timeout_and_interrupt(cmd):
         print("  ok   — typecheck timeout is bounded and SIGINT is prompt")
+    else:
+        ok = False
+
+    if check_large_layout_is_linear(cmd):
+        print("  ok   — large-file layout repair/refusal is linear")
     else:
         ok = False
 

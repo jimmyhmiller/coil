@@ -101,29 +101,23 @@ Where a missing closer goes comes from indentation — the one real insight in P
 a line indented at or left of an open form's column is not inside it. Scoped to one
 damaged region and restricted to insertion, that rule is safe.
 
-## Where indentation runs out, the type checker decides
+## Types finish what indentation locates
 
 Indentation cannot separate two balancings of the same *line* — every position on it
 balances and the file reads either way. It also cannot tell a surplus closer from a
 *missing opener*, because those are the same bytes and want opposite repairs.
 
-But this ships inside a compiler, and a mis-nested repair changes an arity, a binding
-position, or a body. So `balance` enumerates the single-character repairs that balance
-(`balance-candidates`) and lets the front end say which one is Coil.
-
-**Nothing is written that the checker did not endorse**, at the strength its derivation
-needs:
+For a missing closer, indentation can still identify the damaged line. `balance` then
+checks the closer at each real item boundary on that line against the program's normal
+resolver and typechecker. That uses the types and arities of the enclosing call, nested
+call, and arguments to select the boundary. Exactly one reading must typecheck:
 
 | how the answer was reached | what it takes to write it |
 |---|---|
 | indentation **derived** it (every closer forced to a line boundary) | one confirming compile |
-| indentation **guessed** it (a closer belonging somewhere inside a line) | it must be the only well-typed reading in a **complete** candidate set |
-| candidate set was **capped** | refuse — an incomplete set cannot establish uniqueness |
-| **several** readings compile | refuse — nothing in the source says which you meant |
-| **nothing** compiles | refuse — ordinary for a file mid-edit; `--no-typecheck` gives the indentation answer |
-
-That is what makes zero divergence a property rather than a hope: measured on 90
-mutants across all three damage shapes, 47 restored, 43 refused, **0 diverged**.
+| indentation locates one line and types prove one item boundary | write that uniquely typed reading |
+| zero or several boundaries typecheck | refuse — types did not determine one reading |
+| the derived repair does not compile | refuse — fix the other errors first, or inspect the indentation-only result |
 
 Two details that are load-bearing rather than incidental:
 
@@ -132,11 +126,9 @@ Two details that are load-bearing rather than incidental:
   worker stack. Fine once, ruinous in a loop — checking a few dozen candidates in
   process grew one `coil balance` to gigabytes. Forking makes the OS the deallocator,
   so peak memory is one compile no matter how many are tried.
-- **When indentation settled which LINE a closer belongs on, only that line is
-  enumerated.** Candidates elsewhere answer a question nobody asked, and on a real
-  file there are enough of them to exhaust any budget — which is how a 15 KB source
-  came to report "too many possible balancings" for a defect already located to one
-  line.
+- **Only offsets are retained.** Candidate source text is constructed after the fork
+  and dies with that checker process. The parent keeps a linear list of boundaries and
+  constructs one full source only after a unique winner is known.
 
 Diagnostics from rejected candidates go to a null writer, not stderr. `set-diag-quiet`
 alone is not enough: the pipeline also writes located errors to the writer it's handed,
@@ -180,13 +172,13 @@ that all compile cleanly. The refusals that matter are the ones hit on a real
 half-edited file, and which cause dominates there decides what to fix next. Tuning
 against a synthetic population is how a tool ends up excellent at the wrong problem.
 
-`tried` is how many candidates were compiled — 1 when indentation derived the answer and
-the checker merely confirmed it, more when it had to adjudicate. Watching that number is
-the cheapest way to notice the search getting expensive.
+`tried` is the number of item boundaries checked on the one selected line, 1 for a
+fully indentation-derived answer, and 0 when no semantic check ran.
 
 Causes are stable slugs, separate from the human sentence, so improving the wording
-doesn't silently reset the statistics keyed on it: `derived`, `adjudicated`,
-`no-typecheck` for repairs; `none-compile`, `ambiguous-compile`, `capped`,
+doesn't silently reset the statistics keyed on it: `derived`, `typed-boundary`,
+`no-typecheck` for repairs; `no-typed-boundary`, `ambiguous-type-boundary`,
+`multiple-typed-boundaries`,
 `surplus-ambiguous`, `mismatch`, `move-required`, `inside-line`, `no-place`,
 `over-fire`, `underflow`, `indent-disagree`, `unterminated-string` for refusals.
 
