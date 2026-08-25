@@ -329,7 +329,7 @@ src/compiler/main.coil`, 5.8M allocations, 891 MiB:
 
 The two biggest line items are *first* blocks, and the capacity-8 blocks are rarer than
 the capacity-4 blocks by more than 20×. Almost nothing was outgrowing its first
-allocation — the first allocation was simply too big. `al-push!` started every list at 4
+allocation — the first allocation was simply too big. `push!` started every list at 4
 elements, which for a 168-byte `Expr` is 672 bytes handed to a list that usually holds one
 or two.
 

@@ -901,10 +901,10 @@ perform no allocation for any of them.
 (defprop-stateful queue-matches-model
   :model    (ArrayList i64)
   :system   Queue
-  :commands [(push [(v i64)] :run (q-push! sys v)      :next (al-push! (mut m) v))
+  :commands [(push [(v i64)] :run (q-push! sys v)      :next (push! (mut m) v))
              (pop  []        :run (q-pop! sys)         :next (al-shift! (mut m))
-                             :pre  (> (al-len m) 0))]
-  :invariant (= (q-len sys) (al-len m)))
+                             :pre  (> (len m) 0))]
+  :invariant (= (q-len sys) (len m)))
 ```
 
 Shrinking a command sequence needs no extra machinery: each command is a span, so

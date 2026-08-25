@@ -260,11 +260,12 @@ The current context kind is only `entry`; textual imports retain Coil's default
 reader and do not automatically inherit the entry reader.
 
 Use `coil namespaces` to discover every standard-library namespace bundled into
-the installed compiler. `coil namespace NAME` then prints all definitions and
-signatures in one of those namespaces and includes each definition's `;;` docs
-when present. It also accepts a source path, so `coil namespace src/my_lib.coil`
-is the namespace inventory for project code. `coil doc FILE` remains the concise,
-documented-only view.
+the installed compiler. `coil namespace NAME` prints the definitions, signatures,
+and available `;;` docs in one of those namespaces. It also accepts a source path,
+so `coil namespace src/my_lib.coil` is the namespace inventory for project code.
+When a namespace implements traits, its guide entry states those traits and their
+methods first; treat those methods as the public vocabulary. `coil doc FILE` remains
+the concise, documented-only view.
 
 Imports name namespaces, never files. Coil indexes every `.coil` source under the
 project's configured `source-roots` (the project directory for a direct-file build),
@@ -748,15 +749,25 @@ pages so stale accesses fault immediately.
 
 ## Collections (bundled)
 
-The ambient capability traits are the common vocabulary across collections:
+The ambient capability traits are the public vocabulary across collections:
 `Len`/`len`, `Get`/`get`, `Set`/three-argument `set!`, `Push`/`push!`,
 `Pop`/`pop!`, and `Iterable`/`iter` plus `Iterator`/`next`. A collection implements
 only the operations its representation can support. `(empty? xs)` works for any
-`Len`; `(for x (iter xs) ...)` works for any `Iterable`.
+`Len`; `(for x (iter xs) ...)` works for any `Iterable`. Prefer these methods in
+application code and examples: they state the capability being used and keep code
+generic over any type with the same trait. Namespace-specific functions are for
+construction, ownership, representation-specific operations, and implementing the
+traits; they are not alternate spellings to teach for a trait operation.
 
-**ArrayList** (`arraylist.coil`): `(al-new [T] a)`, `(al-len [T] l)`,
-`(al-get [T] l i)`, `(al-set! [T] (mut l) i v)`, `(al-push! [T] (mut l) v)`,
-`(al-pop! [T] (mut l))`, `(al-free! [T] (mut l))`. Mutators take `(mut …)`.
+| Namespace and type | Implemented traits and methods |
+|---|---|
+| `coil.slice`: `(slice T)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Iterable` (`iter`) |
+| `coil.arraylist`: `(ArrayList T)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Push` (`push!`), `Pop` (`pop!`), `Iterable` (`iter`) |
+| `coil.hashmap`: `(HashMap K V)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Iterable` (`iter`, over keys) |
+
+For an `ArrayList`, `get` returns an element by value and the mutating methods take
+`(mut …)`. Create one with `(al-new [T] a)` and release its backing storage with
+`(al-free! (mut xs))`.
 `coil.collect` provides allocator-explicit, trait-dispatched construction of owned
 collections from array literals or slices:
 
@@ -768,9 +779,11 @@ collections from array literals or slices:
 `collect` dispatches through the public `Collect` trait; collection modules can add
 implementations without compiler support. The allocator is deliberately explicit—
 the bracket literal itself is inline storage and never silently selects a heap.
-**HashMap** (`hashmap.coil`): `(hm-new [K V] a ops)`, `(hm-new-scalar [K V] a)`,
-`(hm-get [K V] m k)` → `(Option V)`, `(hm-put! [K V] (mut m) k v)`,
-`(hm-remove! [K V] (mut m) k)`. String keys: `(str-keyops)` from `str.coil` OWNS keys
+For a `HashMap`, `get` returns `(Option V)` and three-argument `set!` inserts or
+updates. Construct scalar-key maps with `(hm-new-scalar [K V] a)`
+or supply key operations to `(hm-new [K V] a ops)`. Removal and storage release
+are representation-specific: use `hm-remove!` and `hm-free!`. String keys:
+`(str-keyops)` from `str.coil` OWNS keys
 (each is copied into the map's allocator on insert and freed on remove/clear/free);
 `(str-keyops-borrowed)` opts into borrowing (the key bytes must outlive the map).
 Type args `[T]` come right after the name; usually inferable, so often omittable.
@@ -1210,7 +1223,7 @@ something is opt-in and an incidental note never becomes API docs.
 
     ;; Append v; grows (doubling, min 4) if full.
     ;; Returns the new length.
-    (defn al-push! [T] [(l (mut (ArrayList T))) (v T)] (-> i64) …)
+    (defn append-one! [T] [(l (mut (ArrayList T))) (v T)] (-> i64) …)
 
     ; internal note — NOT documentation
     (defn al-raw [] (-> i64) …)
@@ -1389,7 +1402,7 @@ off-path expansion is byte-identical to the unchecked form):
 - `slice-get`/`slice-set!`/`subslice` bounds-check (and `subslice` rejects `lo > hi`);
 - slice/string headers reject negative lengths and nonempty null data pointers;
 - `ArrayList` reads, writes, growth, clearing, freeing, and ownership transfer validate
-  `0 <= len <= cap`; indexed `al-get`/`al-set!` operations also bounds-check, turning
+  `0 <= len <= cap`; indexed `get`/`set!` operations also bounds-check, turning
   corrupt collection headers into named diagnostics before pointer traversal;
 - `HashMap` validates its capacity/counts, storage, allocator, and `KeyOps` vtable;
 - allocator calls validate the allocator and its three function slots;

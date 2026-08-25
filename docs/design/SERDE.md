@@ -174,7 +174,7 @@ fields is a tape-index hop, not a re-parse. The cost is no `serde_json::Value`-s
 (deftrait Serialize [Self]
   ; ⚠ as-built: BY-VALUE receiver (the show.coil Display pattern) — a struct
   ; param is an immutable ref under the hood, and by-value lets Option/ArrayList
-  ; impls recurse on match binders / al-get results directly.
+  ; impls recurse on match binders / get results directly.
   (ser [(x Self) (s (dyn Serializer))] (-> (Result i64 SerError))))
 
 (deftrait Deserialize [Self]

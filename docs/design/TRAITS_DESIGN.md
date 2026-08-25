@@ -24,9 +24,9 @@ import is needed. `Eq`'s method is `=`, so runtime equality is `(= a b)`.
 
 ; a bounded type parameter: `(T Eq)` = T must implement Eq (bare `T` = no bound)
 (defn all-eq [(T Eq)] [(xs (ptr (ArrayList T))) (x T)] (-> bool)
-  (let [(mut i) 0 (mut ok) true n (al-len [T] (load xs))]
+  (let [(mut i) 0 (mut ok) true n (len (load xs))]
     (loop (if (icmp-ge (load i) n) (break)
-            (do (if (= (al-get [T] (load xs) (load i)) x) 0 (store! ok false))
+            (do (if (= (get (load xs) (load i)) x) 0 (store! ok false))
                 (store! i (iadd (load i) 1)))))
     (load ok)))
 ```
@@ -107,4 +107,3 @@ exactly by-value semantics — so it's sound. Opaque pointers already unify, so 
 the aggregate-value → pointer direction needs the fixup. This makes by-value
 aggregate `Self` work uniformly across concrete and generic calls; scalar `Self`
 (e.g. `Ord` over `i64`) was always fine.
-
