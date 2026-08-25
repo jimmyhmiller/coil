@@ -63,7 +63,37 @@ def main() -> int:
         print(after)
         return 1
 
-    print("gate-lint-fires: PASS (checkers fire and rewrite to the modern spellings)")
+    # A source column is not an indentation budget. Generated/minified input can
+    # place a fixable form extremely far into one physical line; when that form
+    # wraps, continuation padding must stay bounded instead of repeating the source
+    # column for every new line. This used to turn the 4 MB Doom frontend output
+    # into 55 MB (52 MB of spaces) and drive lint into tens of gigabytes of memory.
+    with tempfile.TemporaryDirectory() as td:
+        deep = pathlib.Path(td) / "deep-column.coil"
+        deep_before = (
+            '(module lint-deep-column)\n'
+            '(import "coil.primitive" :as primitive)\n'
+            '(defn main [] (-> bool)\n'
+            + (' ' * 200_000)
+            + '(primitive/icmp-ne 1 2))\n'
+        )
+        deep.write_text(deep_before)
+        deep_proc = subprocess.run(
+            [args.coil, "lint", str(deep), "--fix"],
+            capture_output=True, text=True, timeout=300)
+        deep_after = deep.read_text()
+
+    if deep_proc.returncode != 0 or "primitive/icmp-ne" in deep_after:
+        print("gate-lint-fires: FAIL — deep-column fix did not complete")
+        print(f"  exit={deep_proc.returncode}")
+        print(deep_proc.stderr)
+        return 1
+    if len(deep_after) > len(deep_before) + 1024:
+        print("gate-lint-fires: FAIL — deep-column fix emitted unbounded continuation padding")
+        print(f"  before={len(deep_before)} bytes, after={len(deep_after)} bytes")
+        return 1
+
+    print("gate-lint-fires: PASS (checkers fire; deep-column layout stays bounded)")
     return 0
 
 if __name__ == "__main__":
