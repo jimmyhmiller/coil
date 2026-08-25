@@ -16,6 +16,11 @@ fail() { echo "reader metaprograms: FAIL — $1"; exit 1; }
 "$COIL" run "$FIX/config.sexpr" --use reader.fixture.config >/dev/null
 [ $? = 42 ] || fail "configured s-expression run"
 
+"$COIL" run "$FIX/raw.answer" --use reader.fixture.code-helper-get >/dev/null
+[ $? = 42 ] || fail "reader context remains Code across a typed helper boundary"
+"$COIL" run "$FIX/raw.answer" --use reader.fixture.code-helper-return >/dev/null
+[ $? = 42 ] || fail "helper-returned Code remains a value in a reader provider"
+
 "$COIL" check "$FIX/raw.answer" --use reader.fixture.fs \
   || fail "ordinary filesystem read/write from reader"
 cmp -s "$FIX/raw.answer" /tmp/coil-reader-fs-provider.txt \
