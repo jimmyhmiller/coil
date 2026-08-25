@@ -204,7 +204,8 @@ grep -q "unbound variable 'state'" "$WORK/hyg-reader.err" \
 # macro, and both transform phases. Each positive fixture is arranged so that a
 # capture in EITHER direction changes the answer, not just fails to compile.
 for fixture in explicit_variadic_splice_identity nested_macro_expansion_identity \
-               before_expand_transform_identity semantic_transform_identity; do
+               before_expand_transform_identity semantic_transform_identity \
+               semantic_transform_primitive; do
   "$BIN" run "tests/compiler/hygiene/$fixture.coil" >/dev/null 2>&1
   rc=$?
   [ "$rc" = 42 ] || { echo "GATE FAIL: $fixture exited $rc, want 42"; fail=1; }
@@ -351,7 +352,8 @@ done
 for fixture in identity_transport explicit_cross_template_identity identifier_api \
                free_identifier_equality explicit_capture_api quote_identity \
                explicit_variadic_splice_identity nested_macro_expansion_identity \
-               before_expand_transform_identity semantic_transform_identity; do
+               before_expand_transform_identity semantic_transform_identity \
+               semantic_transform_primitive; do
   COIL_META_INTERP=1 "$BIN" run "tests/compiler/hygiene/$fixture.coil" >/dev/null 2>&1
   rc=$?
   [ "$rc" = 42 ] || { echo "GATE FAIL: interpreter engine: $fixture exited $rc, want 42"; fail=1; }

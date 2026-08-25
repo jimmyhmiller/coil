@@ -113,6 +113,7 @@ across independently constructed templates:
 | `nested_macro_expansion_identity.coil` | three same-spelled `tmp`s — caller, outer template, inner template reached through a definition-site free reference — stay distinct; exits 42 |
 | `before_expand_transform_capture.coil` / `before_expand_transform_identity.coil` | the earliest producer in the pipeline gets no exemption; the explicit pair exits 42 |
 | `semantic_transform_capture.coil` / `semantic_transform_identity.coil` | same, for a `(transform …)` re-read on every fixpoint round |
+| `semantic_transform_primitive.coil` | a transform provider's alias-qualified primitive heads retain their definition module even though the target has no such alias; exits 42 |
 | `suggestion_capture_rule.coil` + `suggestion_capture_target.coil` | `coil lint --fix` flattens a replacement into source text; the rule's binder is disambiguated and the fixed program still exits 42 |
 | `quote_identity.coil` / `quote_capture.coil` | plain `quote` carries the same identity as a quasiquote literal: one reused quoted identifier binds to itself and leaves the caller alone (42); two independent evaluations must not connect |
 
