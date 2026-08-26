@@ -5,7 +5,7 @@ cd "$(dirname "$0")/../.."
 COIL="${1:-build/bin/coil}"
 COIL="$(cd "$(dirname "$COIL")" && pwd)/$(basename "$COIL")"
 FIX="$PWD/tests/compiler/reader_metaprograms"
-T=$(mktemp -d)
+T=$(mktemp -d "$PWD/.coil-reader-test.XXXXXX")
 trap 'rm -rf "$T"' EXIT
 
 fail() { echo "reader metaprograms: FAIL — $1"; exit 1; }
@@ -82,6 +82,43 @@ esac
 
 "$COIL" check tests/compiler/features/named_call_source_order.coil \
   || fail "ordinary Coil check parity"
+
+# A project may associate a suffix with a reader and give a guest file an
+# explicit namespace. JSON has no comments, so this deliberately exercises the
+# [modules] mapping rather than the optional first-line coil-module directive.
+# The same entry imports a .kv module handled by a second provider, proving that
+# one project dispatches recursive imports through a heterogeneous reader registry.
+(cd "$FIX/json_project" && "$COIL" run >/dev/null)
+[ $? = 48 ] || fail "manifest readers: multiple providers, explicit, path-derived, and coil-module imports"
+
+expect_project_failure() {
+  project="$1"
+  phrase="$2"
+  diagnostic=$(cd "$project" && "$COIL" check 2>&1)
+  [ $? = 1 ] || fail "manifest reader negative case exited successfully: $phrase"
+  case "$diagnostic" in
+    *"$phrase"*) ;;
+    *) fail "manifest reader diagnostic lacks '$phrase': $diagnostic" ;;
+  esac
+}
+
+cp -R "$FIX/json_project" "$T/duplicate-reader"
+printf '\n[readers]\n".json" = "reader.fixture.kv"\n' >> "$T/duplicate-reader/Coil.toml"
+expect_project_failure "$T/duplicate-reader" "duplicate key '.json' in [readers]"
+
+cp -R "$FIX/json_project" "$T/duplicate-module-path"
+printf '\n[modules]\n"json-import.people-again" = "src/data/people.json"\n' \
+  >> "$T/duplicate-module-path/Coil.toml"
+expect_project_failure "$T/duplicate-module-path" "mapped to more than one module"
+
+cp -R "$FIX/json_project" "$T/missing-provider"
+perl -pi -e 's/reader\.fixture\.kv/reader.fixture.not-a-provider/' "$T/missing-provider/Coil.toml"
+expect_project_failure "$T/missing-provider" "does not declare a reader-provider"
+
+cp -R "$FIX/json_project" "$T/wrong-namespace"
+perl -pi -e 's/\(const value 3\)/\(do \(module wrong.namespace\) \(const value 3\)\)/' \
+  "$T/wrong-namespace/src/kv_reader.coil"
+expect_project_failure "$T/wrong-namespace" "reader output declares namespace 'wrong.namespace'"
 
 BF="$PWD/tests/read_metaprogram"
 hello=$("$COIL" run "$BF/hello.bf" --use reader.fixture.brainfuck) \
