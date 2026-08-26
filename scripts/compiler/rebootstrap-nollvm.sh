@@ -58,10 +58,12 @@ echo "=== stage3: stage2 rebuilds it with --backend arm64 ==="
 "$S2" build "$SRC" -o "$S3" --backend arm64 || { echo "stage3 FAILED"; exit 1; }
 
 echo "=== NO-LLVM: stage2 must link no libLLVM ==="
-if otool -L "$S2" | grep -qi LLVM; then
-  echo "  FAIL — libLLVM is linked:"; otool -L "$S2" | grep -i LLVM; exit 3
-fi
-echo "  ok — links only:$(otool -L "$S2" | tail -n +2 | awk '{printf " %s", $1}')"
+otool_output=$(otool -L "$S2") || { echo "  FAIL — otool could not inspect stage2"; exit 3; }
+dependencies=$(printf '%s\n' "$otool_output" | tail -n +2)
+case "$dependencies" in
+  *libLLVM*) echo "  FAIL — libLLVM is linked:"; printf '%s\n' "$dependencies"; exit 3 ;;
+esac
+echo "  ok — links only:$(printf '%s\n' "$dependencies" | awk '{printf " %s", $1}')"
 
 echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="
 "$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" --backend arm64 || { echo "stage2 object emission FAILED"; exit 1; }
