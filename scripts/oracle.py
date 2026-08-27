@@ -161,7 +161,13 @@ def snapshot_diag(compiler: Path) -> int:
     base = ORACLE / "diag"
     reference = base / "reference"
     reset(reference)
-    inputs = [rel(path) for path in sorted((base / "inputs").glob("*.coil"))]
+    # Most diagnostics live beside this oracle, but the corpus can also point at
+    # feature fixtures whose source belongs with the feature it exercises.  Keep
+    # those explicit entries when regenerating instead of silently discarding
+    # them.
+    local_inputs = [rel(path) for path in sorted((base / "inputs").glob("*.coil"))]
+    listed_inputs = read_list(base / "corpus.txt") if (base / "corpus.txt").is_file() else []
+    inputs = sorted(set(local_inputs + [source for source in listed_inputs if (ROOT / source).is_file()]))
     write_list(base / "corpus.txt", inputs)
     root_prefix = f"{ROOT}/".encode()
     for source in inputs:
@@ -237,8 +243,8 @@ def gate_diag(compiler: Path, verbose: bool) -> int:
     for source in read_list(base / "corpus.txt"):
         result = run(compiler, "emit-ir", source)
         got = (result.stdout + result.stderr).replace(root_prefix, b"")
-        want = (reference / f"{mangle(source)}.diag").read_bytes()
-        if got != want:
+        golden = reference / f"{mangle(source)}.diag"
+        if not golden.is_file() or got != golden.read_bytes():
             failures.append(source)
             if verbose:
                 print(f"FAIL diag: {source}")
@@ -251,8 +257,15 @@ def gate_diag(compiler: Path, verbose: bool) -> int:
             got = normalize_build_diag(
                 result.stdout.replace(root_prefix, b"").replace(f"{temp}/".encode(), b""))
             stem = reference / mangle(source)
-            want = normalize_build_diag(Path(f"{stem}.diag").read_bytes())
-            want_code = int(Path(f"{stem}.exit").read_text())
+            diag_golden = Path(f"{stem}.diag")
+            exit_golden = Path(f"{stem}.exit")
+            if not diag_golden.is_file() or not exit_golden.is_file():
+                failures.append(source)
+                if verbose:
+                    print(f"FAIL build diagnostic: {source}: missing reference")
+                continue
+            want = normalize_build_diag(diag_golden.read_bytes())
+            want_code = int(exit_golden.read_text())
             if got != want or result.returncode != want_code:
                 failures.append(source)
                 if verbose:
@@ -358,7 +371,10 @@ def runtime_one(entry: str, compiler: Path, action: str, platform: str, verbose:
         if verbose:
             report.append(str(result.stderr.decode(errors="replace").splitlines()[:3]))
         return False, report
-    ran = subprocess.run([str(executable), *program_args], stdin=subprocess.DEVNULL,
+    # The user-visible program identity is the corpus source, not the oracle's
+    # temporary output path. `coil interp` exposes the same argv contract, and
+    # `executable=` lets the native reference run preserve it exactly.
+    ran = subprocess.run([source, *program_args], executable=str(executable), stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
     stdout_file = reference / f"{identity}.stdout"
     stderr_file = reference / f"{identity}.stderr"

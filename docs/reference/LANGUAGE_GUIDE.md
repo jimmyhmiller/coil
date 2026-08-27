@@ -745,6 +745,71 @@ and releases backing segments on reset or close:
 arena and becomes invalid if an earlier reset has already released its segment.
 Pointers allocated after a mark must not be used after `scratch-reset-to!`.
 
+## Opt-in ownership, deterministic drop, and reference counting
+
+Coil's existing raw/manual memory model remains the default. A type opts into
+automatic ownership only by implementing `Drop`, or by structurally containing a
+droppable value. The ambient ownership traits are ordinary, inspectable traits:
+
+    (deftrait Copy [Self])
+    (deftrait Clone [Self]
+      (clone [(self (ref Self))] (-> Self)))
+    (deftrait Drop [Self]
+      (drop [(self (mut Self))] (-> void)))
+
+An owning value is affine: binding, passing, returning, or storing it transfers
+ownership, and reusing the old binding is a compile error. `clone` is the explicit
+way to duplicate ownership. Raw pointers, references, slices, scalars, and legacy
+manual structs do not acquire a destructor or imply ownership of their pointees.
+`(derive Clone T)` generates fieldwise cloning; `(derive Copy T)` generates the
+marker only when the compiler can prove that no contained destructor would be
+skipped. Structs, active sum payloads, arrays, and generic instances receive
+recursive drop glue, in reverse field/element initialization order.
+
+Cleanup is deterministic on normal fallthrough, function exit, `break`,
+`continue`, labeled `return-from`, and replacement of an initialized mutable
+owner. It uses the same elaborated cleanup node in LLVM, arm64, x64, Wasm, and the
+interpreter. `Drop` and explicit `scope`/`defer` compose lexically: inner owning
+locals drop before an enclosing scope performs its LIFO defers.
+
+The deliberate escape hatches are:
+
+    (manually-drop owner)             ; suppress automatic destruction
+    (manually-drop-into-inner held)   ; consume wrapper, recover owner
+    (forget owner)                    ; consume without destruction
+    (take! [T] (mut owner))           ; move out, leave place uninitialized
+
+`coil.alloc.AllocatorLease` is an owned, cloneable allocator capability for values
+that can escape an allocator's lexical scope. It retains the allocator state and
+routes deallocation back to the allocator that created the storage. A borrowed
+`(dyn Allocator)` cannot be passed where a lease is required. Use
+`malloc-allocator-lease` for process-lifetime allocation or
+`coil.leased-region/leased-region-new` for a region that closes only after its last
+lease disappears. `unsafe-allocator-lease-new` is reserved for allocator
+implementations that can prove their borrowed dispatch object remains valid until
+the final lease release. Scratch/resettable allocators do not provide general
+escaping leases.
+
+`coil.rc` supplies thread-confined `Rc<T>`/`WeakRc<T>`; `coil.arc` supplies atomic
+`Arc<T>`/`Weak<T>`. Both store their allocator lease in the control block and
+support `new-in`, `clone`, borrow, count inspection, `downgrade`/`upgrade`, unique
+`get-mut`, `try-unwrap`/`into-inner`, and strong/weak destruction. The last strong
+owner drops `T` exactly once; the last weak owner moves the lease out, frees the
+control block through it, and only then drops the lease. Raw ownership transfers
+are explicit pairs such as `arc-into-raw`/`unsafe-arc-from-raw` and must be balanced
+exactly once. Strong cycles intentionally leak; use weak handles to break them.
+An `Arc` may cross threads only when the retained allocator lease and its callbacks
+are thread-safe; Coil does not yet express that requirement with a `Send`-like
+trait. Borrow accessors return non-owning pointers which must not outlive a strong
+owner—the affine checker is not a general pointer-lifetime checker.
+
+`coil.arc.auto` is the experimental whole-program transparent ARC transform. With
+the transform enabled, user modules keep ordinary structs, constructors,
+collections, bindings, calls, and closures; lowering supplies hidden ARC owners,
+retains, releases, and recursive destruction. Activation is compilation-unit
+configuration, not a lexical ownership scope. The definitive semantics and
+completion criteria are in `docs/design/TRANSPARENT_AUTOMATIC_ARC.md`.
+
 For Zig-style development allocation, `coil.dbgalloc` provides a stateful allocator
 that wraps any backing allocator while exposing the same ordinary `(dyn Allocator)`
 interface:
@@ -1026,7 +1091,8 @@ needs no such thing; `primitive/fresh-identifier` gives it its own identity.
 T)`/`(primitive/ptr? T)`/`(primitive/array? T)`, `(primitive/field-name T i)`, `(primitive/field-type-kind T i)`,
 `(primitive/field-type-name T i)`, `(primitive/field-index T "name")`. Inside a macro (where a type
 arrives as a Code symbol) use the `code-*` family: `code-field-count`/`-name`/`-kind`
-/`-type`, `code-variant-sum`/`-count`/`-name`/`-fields`,
+/`-type`, `code-type-shape` (safely returns `struct`, `sum`, or `unknown` without
+calling a shape-specific reflector), `code-variant-sum`/`-count`/`-name`/`-fields`,
 `code-variant-field-name`/`-type` (a variant's payload field by `(SUM VIDX FIDX)`;
 the type comes back structured and canonically qualified), and trait reflection
 `code-trait-method-count`/`-name`/`-arity`/`-param-type`/`-ret-type` (for generating

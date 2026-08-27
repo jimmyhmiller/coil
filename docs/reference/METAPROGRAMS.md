@@ -50,7 +50,8 @@ Rust-like ownership dialect, a Scheme frontend).
 - **Bytes ↔ names:** `(primitive/int->str N)` → the integer's decimal as a `(slice u8)`, so a
   name minted from a counter/index is one call; `(primitive/str-bytes S)` → a Code list of a
   string's byte values; `(primitive/bytes->str LIST)` → the inverse (list of ints → string).
-- **Reflect on types:** `code-field-count/name/kind/type`, `code-variant-*`
+- **Reflect on types:** `code-type-shape` safely classifies a type as `struct`,
+  `sum`, or `unknown`; `code-field-count/name/kind/type`, `code-variant-*`
   (including `code-variant-field-name`/`-type`, which reflect a variant's
   PAYLOAD fields by `(SUM VARIANT-INDEX FIELD-INDEX)` — the type comes back
   structured, e.g. `(coil.core.Option (slice u8))`, so a derive over an existing

@@ -270,6 +270,8 @@ def test(args: argparse.Namespace) -> None:
         execute(sys.executable, "scripts/oracle.py", "interpreter", "live", "--compiler", compiler,
                 *(["--verbose"] if args.verbose else []))
     elif args.suite == "modernize-fast":
+        execute(sys.executable, "tests/compiler/features/transparent_arc_source_guard.py")
+        execute(sys.executable, "tests/compiler/features/authored_gensym_source_guard.py")
         test_modernize_fast(compiler)
 
 

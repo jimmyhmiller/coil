@@ -1,0 +1,149 @@
+(module coil.rc)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc)
+(import "coil.result" :use *)
+
+; Thread-confined reference counting. The allocation retains the exact allocator
+; capability that created it; no release path consults a global allocator.
+(defstruct RcBlock [T]
+  [(strong i64)
+   (weak i64) ; includes one implicit weak reference while strong > 0
+   (lease alloc/AllocatorLease)
+   (value T)])
+
+(defstruct Rc [T] [(block (ptr (RcBlock T)))])
+(defstruct WeakRc [T] [(block (ptr (RcBlock T)))])
+
+(defn rc-new-in [T] [(lease alloc/AllocatorLease) (value T)] (-> (Option (Rc T)))
+  (match (alloc/lease-raw-alloc lease
+                               (alloc/AllocRequest
+                                 :type-id (alloc/type-id [(RcBlock T)])
+                                 :count 1
+                                 :bytes (primitive/sizeof (RcBlock T))
+                                 :align (primitive/alignof (RcBlock T))))
+    (None []
+      ; Consume both affine parameters on both control-flow arms. On failure the
+      ; locals fall out of scope normally; on success they move into the block.
+      (let [failed-lease lease
+            failed-value value]
+        (None [(Rc T)])))
+    (Some [raw]
+      (let [block (primitive/cast (ptr (RcBlock T)) raw)
+            block-lease lease
+            block-value value]
+        (store! (field block strong) 1)
+        (store! (field block weak) 1)
+        (store! (field block lease) block-lease)
+        (store! (field block value) block-value)
+        (Some (Rc :block block))))))
+
+(defn rc-new [T] [(value T)] (-> (Option (Rc T)))
+  (rc-new-in (alloc/malloc-allocator-lease) value))
+
+(defn rc-borrow [T] [(owner (ref (Rc T)))] (-> (ptr T))
+  (field (load (field owner block)) value))
+
+(defn rc-strong-count [T] [(owner (ref (Rc T)))] (-> i64)
+  (load (field (load (field owner block)) strong)))
+
+(defn rc-weak-count [T] [(owner (ref (Rc T)))] (-> i64)
+  ; Do not expose the implicit weak reference.
+  (primitive/isub (load (field (load (field owner block)) weak)) 1))
+
+; Mutable access is available only when no other strong or weak capability can
+; acquire access to the payload.
+(defn rc-get-mut [T] [(owner (mut (Rc T)))] (-> (Option (ptr T)))
+  (let [block (load (field owner block))]
+    (if (and (= (load (field block strong)) 1)
+             (= (load (field block weak)) 1))
+        (Some (field block value))
+        (None [(ptr T)]))))
+
+(defn rc-downgrade [T] [(owner (ref (Rc T)))] (-> (WeakRc T))
+  (let [block (load (field owner block))]
+    (store! (field block weak) (primitive/iadd (load (field block weak)) 1))
+    (WeakRc :block block)))
+
+(defn weak-rc-upgrade [T] [(owner (ref (WeakRc T)))] (-> (Option (Rc T)))
+  (let [block (load (field owner block))]
+    (if (= (load (field block strong)) 0)
+        (None [(Rc T)])
+        (do
+          (store! (field block strong) (primitive/iadd (load (field block strong)) 1))
+          (Some (Rc :block block))))))
+
+(defn rc-free-block [T] [(block (ptr (RcBlock T)))] (-> i64)
+  ; Move the capability into stack ownership before its containing storage is freed.
+  ; The local lease is dropped only after lease-raw-free returns.
+  (let [lease (take! [alloc/AllocatorLease] (field block lease))]
+    (alloc/lease-raw-free lease
+                          (primitive/cast (ptr i8) block)
+                          (alloc/AllocRequest
+                            :type-id (alloc/type-id [(RcBlock T)])
+                            :count 1
+                            :bytes (primitive/sizeof (RcBlock T))
+                            :align (primitive/alignof (RcBlock T))))))
+
+(defn rc-release-weak [T] [(block (ptr (RcBlock T)))] (-> i64)
+  (let [next (primitive/isub (load (field block weak)) 1)]
+    (store! (field block weak) next)
+    (if (= next 0) (rc-free-block block) 0)))
+
+; Consume one uniquely-owned handle and return its payload. On failure ownership
+; is returned to the caller unchanged.
+(defn rc-try-unwrap [T] [(owner (Rc T))] (-> (Result T (Rc T)))
+  (let [held (manually-drop owner)
+        block (load (field (field held value) block))]
+    (if (!= (load (field block strong)) 1)
+        (Err [T (Rc T)] (manually-drop-into-inner held))
+        (let [value (take! [T] (field block value))]
+          (store! (field block strong) 0)
+          (forget (rc-release-weak block))
+          (forget held)
+          (Ok [T (Rc T)] value)))))
+
+; Like Rust's into_inner: failure releases this strong handle and returns None.
+(defn rc-into-inner [T] [(owner (Rc T))] (-> (Option T))
+  (match (rc-try-unwrap owner)
+    (Ok [value] (Some value))
+    (Err [shared] (let [released shared] (None [T])))))
+
+; Raw conversion is an explicit ownership escape. The returned pointer carries
+; exactly one strong reference; `unsafe-rc-from-raw` must adopt it exactly once.
+(defn rc-into-raw [T] [(owner (Rc T))] (-> (ptr T))
+  (let [held (manually-drop owner)
+        value (field (load (field (field held value) block)) value)]
+    (forget held)
+    value))
+
+(defn unsafe-rc-from-raw [T] [(value (ptr T))] (-> (Rc T))
+  (Rc :block (primitive/cast (ptr (RcBlock T))
+                             (primitive/isub (primitive/cast i64 value)
+                                             (primitive/offsetof (RcBlock T) value)))))
+
+(impl [T] Clone (Rc T)
+  (clone [(self (ref (Rc T)))] (-> (Rc T))
+    (let [block (load (field self block))]
+      (store! (field block strong) (primitive/iadd (load (field block strong)) 1))
+      (Rc :block block))))
+
+(impl [T] Drop (Rc T)
+  (drop [(self (mut (Rc T)))] (-> void)
+    (let [block (load (field self block))
+          next (primitive/isub (load (field block strong)) 1)]
+      (store! (field block strong) next)
+      (when (= next 0)
+        ; Moving the payload into this nested scope invokes its generic drop glue
+        ; before the implicit weak reference can free the control block.
+        (let [value (take! [T] (field block value))] 0)
+        (forget (rc-release-weak block))))))
+
+(impl [T] Clone (WeakRc T)
+  (clone [(self (ref (WeakRc T)))] (-> (WeakRc T))
+    (let [block (load (field self block))]
+      (store! (field block weak) (primitive/iadd (load (field block weak)) 1))
+      (WeakRc :block block))))
+
+(impl [T] Drop (WeakRc T)
+  (drop [(self (mut (WeakRc T)))] (-> void)
+    (forget (rc-release-weak (load (field self block))))))

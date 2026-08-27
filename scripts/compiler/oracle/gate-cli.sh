@@ -2917,6 +2917,17 @@ expect_out "checkout:" \
 expect_rc 0 "layout: and compiles with it" \
   bash -c 'cd "$2" && "$1" check ../bundle/allns.coil' _ "$T/fakeroot/build/bin/coil" "$T/fakeroot"
 
+# A loose stage binary is not an installed compiler merely because an unrelated
+# `lib/coil` exists above it. It must fall through to the checkout at cwd; this is
+# the deterministic form of the `/tmp/coil-candidate` + stale `/tmp/lib/coil` bug.
+mkdir -p "$T/loose/lib/coil"
+ln -sfn "$T/bundle" "$T/loose/lib/coil/stdlib"
+cp "$COIL" "$T/loose/coil-candidate"
+codesign -s - --force "$T/loose/coil-candidate" >/dev/null 2>&1 || true
+expect_out "checkout: $T/fakeroot/src/stdlib" \
+  "layout: a loose candidate ignores an unrelated ancestor lib/coil" \
+  bash -c 'cd "$2" && "$1" --version' _ "$T/loose/coil-candidate" "$T/fakeroot"
+
 echo "== entry file needs no (module ...) =="
 # An ENTRY file is named on the command line and imported by nobody, so it needs no
 # namespace of its own. It used to be refused the moment it imported anything, and

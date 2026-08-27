@@ -18,6 +18,7 @@
 (import "comptime" :use *)
 (import "parser" :use *)
 (import "resolve" :use *)
+(import "loader" :use *)
 
 (defstruct Subst [(names (ptr (ArrayList (slice u8)))) (types (ptr (ArrayList Type)))])
 ; A pending instantiation request (template name + concrete type-args).
@@ -51,6 +52,9 @@
    (queued-structs (HashMap (slice u8) i64))
    (queued-sums (HashMap (slice u8) i64))
    (queued-funcs (HashMap (slice u8) i64))
+   ; Checked source-program environment used to run affine/drop elaboration on
+   ; each function only after its generic parameters have concrete types.
+   (ownership_cx (ptr Cx))
    ; the program's impls (for resolving a deferred TraitCall against a GENERIC
    ; impl), and the instantiation-origin map: mangled name -> (base, args), so
    ; a TraitCall receiver that resolved to a mangled struct recovers its base
@@ -68,7 +72,17 @@
 (defn mk-field [(name (slice u8)) (ty Type)] (-> Field)
   (let [p (primitive/alloc-stack Field)] (set! (.name p) name) (set! (.ty p) ty) (load p)))
 (defn mk-param [(name (slice u8)) (ty Type)] (-> Param)
-  (let [p (primitive/alloc-stack Param)] (set! (.name p) name) (set! (.ty p) ty) (load p)))
+  (let [p (primitive/alloc-stack Param)]
+    (set! (.name p) name)
+    (set! (.ty p) ty)
+    (set! (.bid p) 0)
+    (set! (.owned_type p) (primitive/cast (ptr Type) 0))
+    (load p)))
+(defn mk-param-bid [(name (slice u8)) (ty Type) (bid i64)] (-> Param)
+  (let [p (primitive/alloc-stack Param)]
+    (set! p (mk-param name ty))
+    (set! (.bid p) bid)
+    (load p)))
 (defn mk-variant [(name (slice u8)) (fields (ptr (ArrayList Field)))] (-> Variant)
   (let [p (primitive/alloc-stack Variant)] (set! (.name p) name) (set! (.fields p) fields) (load p)))
 (defn mk-arm [(variant (slice u8)) (binds (ptr (ArrayList (slice u8)))) (body Expr)] (-> Arm)
@@ -348,6 +362,45 @@
   (match (hm-get [(slice u8) i64] (.io-index m) mng)
     (Some [i] i)
     (None [] -1)))
+
+; Ownership elaboration needs the semantic generic shape, not only the concrete
+; ABI name produced by monomorphization.  The source checking context knows how
+; `(Arc T)` is dropped, but it deliberately has no declaration named
+; `Arc__Payload`; that name exists only in mono's output program.  Recovering the
+; recorded origin lets the shared ownership machinery select the generic Drop
+; impl and inspect generic fields before the final expression resolver lowers the
+; synthesized glue back to concrete ABI names.
+(defn ownership-semantic-type-list [(m (ptr MonoCtx))
+                                    (xs (ptr (ArrayList Type)))] (-> (ptr (ArrayList Type)))
+  (let [a (load (field m a))
+        n (al-len [Type] (load xs))
+        (mut out) (al-new [Type] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (al-push! (mut out) (ownership-semantic-type m (al-elem [Type] xs (load i))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (box-al [Type] a (load out))))
+
+(defn ownership-semantic-type [(m (ptr MonoCtx)) (t (ptr Type))] (-> Type)
+  (let [a (load (field m a))]
+    (match (load t)
+      (TStruct [name]
+        (let [idx (io-find m name)]
+          (if (< idx (primitive/cast i64 0))
+              (load t)
+              (let [origin (al-elem [PendInst] (field m io-origin) idx)]
+                (TApp (load (field origin name))
+                      (ownership-semantic-type-list m (load (field origin args))))))))
+      (TPtr [inner] (TPtr (box-type a (ownership-semantic-type m inner))))
+      (TRef [mu inner] (TRef mu (box-type a (ownership-semantic-type m inner))))
+      (TArray [inner count] (TArray (box-type a (ownership-semantic-type m inner)) count))
+      (TSlice [inner] (TSlice (box-type a (ownership-semantic-type m inner))))
+      (TVec [inner count] (TVec (box-type a (ownership-semantic-type m inner)) count))
+      (TApp [name args]
+        (TApp name (ownership-semantic-type-list m args)))
+      (_ (load t)))))
 ; ---- runaway instantiation guard --------------------------------------------
 ; A generic that recurses on a WRAPPED version of its own argument (T -> (Box T) ->
 ; (Box (Box T)) -> …) never reaches a fixpoint: every round mints a type the dedupe set
@@ -447,6 +500,11 @@
 (defn queue-func [(m (ptr MonoCtx)) (nm (slice u8)) (args (ptr (ArrayList Type)))] (-> i64)
   (let [a (load (field m a))
         mng (mangle a nm args)]
+    ; Keep the origin for the post-ownership resolve pass. Ownership elaboration
+    ; runs after the first generic substitution and may introduce EMovePlace at
+    ; an already-mangled call. Recovering the source generic signature here is
+    ; what lets that second pass choose value bits versus a pointer ABI correctly.
+    (io-record! m mng nm args)
     (unless (hm-contains? [(slice u8) i64] (load (field m queued-funcs)) mng)
       (hm-put! [(slice u8) i64] (mut (field m queued-funcs)) mng 0)
       (al-push! (mut (field m pending-funcs)) (mk-pend a nm args))
@@ -596,6 +654,26 @@
                     (Ok [t] (al-push! (mut out) (mk-field (.name fp) t)))))
                 (set! i (primitive/iadd (load i) 1)))))
     (if (load failed) (Err [(ptr (ArrayList Field)) Diag] (load err)) (Ok (box-al [Field] a (load out))))))
+(defn resolve-param-one [(m (ptr MonoCtx))
+                         (pp (ptr Param))
+                         (ty Type)
+                         (map (ptr Subst))] (-> (Result Param Diag))
+  (try (let [a (load (field m a))
+             np (primitive/alloc-stack Param)]
+         (set! np (mk-param-bid (.name pp) ty (.bid pp)))
+         (unless (= (primitive/cast i64 (.owned_type pp)) (primitive/cast i64 0))
+         ; `ty` is the already-substituted semantic parameter type. Using it
+           ; directly also avoids retaining a stale generic marker when the
+           ; checked body representation differed from the signature type.
+           (let [resolved-owner (try! (resolve-ty m (.owned_type pp) map))
+                 concrete (box-type a resolved-owner)
+                 rp (box-type a (ownership-semantic-type m concrete))]
+             (when (type-is-affine a (load (field m ownership_cx)) rp)
+               (set! (.owned_type np) rp)
+               0))
+           0)
+         (Ok [Param Diag] (load np)))))
+
 (defn resolve-params [(m (ptr MonoCtx)) (ps (ptr (ArrayList Param))) (map (ptr Subst))] (-> (Result (ptr (ArrayList Param))
                                                                                                     Diag))
   (let [a (load (field m a))
@@ -625,7 +703,9 @@
                                                                               (load j))
                                                                 (al-get [Type] (load xs) (load j))))
                                             (set! j (primitive/iadd (load j) 1))))))
-                              (al-push! (mut out) (mk-param (.name pp) t)))))))
+                              (match (resolve-param-one m pp t map)
+                                (Err [d] (do (set! err d) (set! failed true) (break)))
+                                (Ok [np] (al-push! (mut out) np))))))))
                 (set! i (primitive/iadd (load i) 1)))))
     (if (load failed) (Err [(ptr (ArrayList Param)) Diag] (load err)) (Ok (box-al [Param] a (load out))))))
 (defn resolve-sum [(m (ptr MonoCtx)) (s (ptr SumDef)) (map (ptr Subst)) (name (slice u8))] (-> (Result SumDef Diag))
@@ -653,6 +733,69 @@
           (set! (.variants ns) (box-al [Variant] a (load out)))
           (Ok (load ns))))))
 
+; A generic `T` parameter is checked with value ABI because its representation is
+; unknown. If substitution makes it an affine aggregate, preserve that external
+; ABI but immediately materialize it into the pointer-backed owning place expected
+; by drop elaboration and by the instantiated body.
+(defn materialize-generic-owner-params [(m (ptr MonoCtx))
+                                        (params (ptr (ArrayList Param)))
+                                        (body (ptr (ArrayList Expr)))] (-> (ptr (ArrayList Expr)))
+  (let [a (load (field m a))
+        n (al-len [Param] (load params))
+        (mut binds) (al-new [Bind] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [pp (al-elem [Param] params (load i))
+                      owner-type (.owned_type pp)]
+                  (when (and (!= (primitive/cast i64 owner-type) (primitive/cast i64 0))
+                             (match (.ty pp)
+                               (TStruct [_] true)
+                               (TApp [_ _] true)
+                               (TArray [_ _] true)
+                               (_ false)))
+                    (let [name (.name pp)
+                          raw-name (sconcat a "$owned.in." name)
+                          slot-name (sconcat a "$owned.slot." name)
+                          (mut init) (al-new [Expr] a)
+                          owner-bind (primitive/alloc-stack Bind)]
+                      (set! (.name pp) raw-name)
+                      (set! (.owned_type pp) (primitive/cast (ptr Type) 0))
+                      (al-push! (mut binds)
+                                (mk-bind slot-name
+                                         false
+                                         (mk-expr (EAlloc 3 (load owner-type) (primitive/cast (ptr Expr) 0))
+                                                  -1 -1 -1 0)))
+                      (al-push! (mut init)
+                                (mk-expr (EInitStore
+                                           (box-expr a (mk-expr (EVar slot-name) -1 -1 -1 0))
+                                           (box-expr a (mk-expr (EVar raw-name) -1 -1 -1 0)))
+                                         -1 -1 -1 0))
+                      (al-push! (mut init) (mk-expr (EVar slot-name) -1 -1 -1 0))
+                      (set! owner-bind
+                            (mk-bind name false (mk-expr (EDo (box-al [Expr] a (load init))) -1 -1 -1 0)))
+                      (set! (.bid owner-bind) (.bid pp))
+                      (set! (.owned_type owner-bind) owner-type)
+                      (al-push! (mut binds) (load owner-bind))
+                      0))
+                (set! i (primitive/iadd (load i) 1))))))
+    (if (= (al-len [Bind] (load binds)) (primitive/cast i64 0))
+        body
+        (let [(mut wrapped) (al-new [Expr] a)
+              (mut inner) (al-new [Expr] a)]
+          (if (= (al-len [Expr] (load body)) (primitive/cast i64 0))
+              (al-push! (mut inner)
+                        (mk-expr (EDo (box-al [Expr] a (al-new [Expr] a))) -1 -1 -1 0))
+              (for [j 0 (al-len [Expr] (load body))]
+                (al-push! (mut inner) (al-get [Expr] (load body) j))
+                0))
+          (al-push! (mut wrapped)
+                    (mk-expr (ELet (box-al [Bind] a (load binds))
+                                   (box-al [Expr] a (load inner)))
+                             -1 -1 -1 0))
+          (box-al [Expr] a (load wrapped))))))
+
 ; ---- resolve a function --------------------------
 (defn resolve-func [(m (ptr MonoCtx)) (f (ptr Func)) (map (ptr Subst)) (name (slice u8))] (-> (Result Func Diag))
   (let [a (load (field m a))]
@@ -673,7 +816,7 @@
                         (set! (.annotations nf) (load (field f annotations)))
                         (set! (.params nf) params)
                         (set! (.ret nf) ret)
-                        (set! (.body nf) body)
+                        (set! (.body nf) (materialize-generic-owner-params m params body))
                         (set! (.macro_variadic nf) false)
                         (set! (.lo nf) (.lo f))
                         (set! (.source nf) (.source f))
@@ -723,6 +866,59 @@
                          (Ok [e] (al-push! (mut out) e))))))
                 (set! i (primitive/iadd (load i) 1)))))
     (if (load failed) (Err [(ptr (ArrayList Expr)) Diag] (load err)) (Ok (box-al [Expr] a (load out))))))
+
+(defn take-owner-type-in-list [(items (ptr (ArrayList Expr))) (i i64) (n i64)] (-> (ptr Type))
+  (if (>= i n)
+      (primitive/cast (ptr Type) 0)
+      (let [found (take-owner-type-in-expr (al-elem [Expr] items i))]
+        (if (!= (primitive/cast i64 found) (primitive/cast i64 0))
+            found
+            (take-owner-type-in-list items (+ i 1) n)))))
+
+(defn take-owner-type-in-expr [(ep (ptr Expr))] (-> (ptr Type))
+  (match (.kind ep)
+    (ECall [func type-args _]
+      (if (and (or (= func "coil.core.take!")
+                   (starts-with func "coil.core.take!__"))
+               (> (al-len [Type] (load type-args)) (primitive/cast i64 0)))
+          (al-elem [Type] type-args 0)
+          (primitive/cast (ptr Type) 0)))
+    (EDo [items]
+      (take-owner-type-in-list items 0 (al-len [Expr] (load items))))
+    (EStore [_ value] (take-owner-type-in-expr value))
+    (EInitStore [_ value] (take-owner-type-in-expr value))
+    (ESpillRef [value] (take-owner-type-in-expr value))
+    (_ (primitive/cast (ptr Type) 0))))
+
+(defn resolve-bind [(m (ptr MonoCtx)) (bp (ptr Bind)) (map (ptr Subst))] (-> (Result Bind Diag))
+  (try (let [a (load (field m a))
+             ne (try! (resolve-expr m (field bp value) map))
+             nb (primitive/alloc-stack Bind)]
+         (set! nb (mk-bind (.name bp) (.mutable bp) ne))
+         (set! (.bid nb) (.bid bp))
+         (let [(mut source-owner) (.owned_type bp)
+               (mut recovered-take) false]
+           ; Generic checking cannot always prove that the result of `take!` is
+           ; affine before T is substituted. The intrinsic's explicit type
+           ; argument is authoritative, so recover it for concrete ownership
+           ; elaboration instead of losing the moved value's cleanup.
+           (when (= (primitive/cast i64 (load source-owner)) (primitive/cast i64 0))
+             (set! source-owner (take-owner-type-in-expr (field bp value)))
+             (when (!= (primitive/cast i64 (load source-owner)) (primitive/cast i64 0))
+               (set! recovered-take true)
+               0)
+             0)
+           (unless (= (primitive/cast i64 (load source-owner)) (primitive/cast i64 0))
+           (let [resolved (try! (resolve-ty m (load source-owner) map))
+                 concrete (box-type a resolved)
+                 rp (box-type a (ownership-semantic-type m concrete))]
+             (when (or (load recovered-take)
+                       (type-is-affine a (load (field m ownership_cx)) rp))
+               (set! (.owned_type nb) rp)
+               0))
+           0))
+         (Ok [Bind Diag] (load nb)))))
+
 (defn resolve-bind-list [(m (ptr MonoCtx)) (binds (ptr (ArrayList Bind))) (map (ptr Subst))] (-> (Result (ptr (ArrayList Bind))
                                                                                                          Diag))
   (let [a (load (field m a))
@@ -735,13 +931,9 @@
               (break)
               (do
                 (let [bp (al-elem [Bind] binds (load i))]
-                  (match (resolve-expr m (field bp value) map)
+                  (match (resolve-bind m bp map)
                     (Err [d] (do (set! err d) (set! failed true) (break)))
-                    (Ok [ne]
-                        (al-push! (mut out)
-                                  (mk-bind (.name bp)
-                                           (.mutable bp)
-                                           ne)))))
+                    (Ok [nb] (al-push! [Bind] (mut out) nb))))
                 (set! i (primitive/iadd (load i) 1)))))
     (if (load failed) (Err [(ptr (ArrayList Bind)) Diag] (load err)) (Ok (box-al [Bind] a (load out))))))
 (defn resolve-arm-list [(m (ptr MonoCtx)) (arms (ptr (ArrayList Arm))) (map (ptr Subst))] (-> (Result (ptr (ArrayList Arm))
@@ -767,6 +959,132 @@
                 (set! i (primitive/iadd (load i) 1)))))
     (if (load failed) (Err [(ptr (ArrayList Arm)) Diag] (load err)) (Ok (box-al [Arm] a (load out))))))
 ; The ECall arm: variant construction / generic-fn call / plain call.
+(defn move-args-to-values! [(a (dyn Allocator))
+                            (args (ptr (ArrayList Expr)))] (-> i64)
+  (for [i 0 (al-len [Expr] (load args))]
+    (let [arg (al-elem [Expr] args i)]
+      (match (.kind arg)
+        (EMovePlace [place] (set! (.kind arg) (ELoad place)))
+        ; Type checking uses the ordinary aggregate-call ABI while variants are
+        ; still represented as calls, so an aggregate rvalue is materialized as
+        ; `ESpillRef value`. EConstruct stores field VALUES, not pointers to those
+        ; temporary values; recover the expression that was spilled.
+        (ESpillRef [value] (set! (.kind arg) (.kind value)))
+        (_ 0)))
+    0)
+  0)
+
+(defn move-args-to-places! [(args (ptr (ArrayList Expr)))] (-> i64)
+  (for [i 0 (al-len [Expr] (load args))]
+    (let [arg (al-elem [Expr] args i)]
+      (match (.kind arg)
+        (EMovePlace [place] (set! (.kind arg) (.kind place)))
+        (_ 0)))
+    0)
+  0)
+
+(defn adjust-generic-call-abi! [(m (ptr MonoCtx))
+                                (gf (ptr Func))
+                                (rtargs (ptr (ArrayList Type)))
+                                (nargs (ptr (ArrayList Expr)))] (-> (Result i64 Diag))
+  (try (let [a (load (field m a))
+             smap (subst-map a (load (field gf type_params)) rtargs)
+             params (load (field gf params))
+             n (if (< (al-len [Param] (load params)) (al-len [Expr] (load nargs)))
+                   (al-len [Param] (load params))
+                   (al-len [Expr] (load nargs)))
+             (mut i) 0]
+         (loop (if (>= (load i) n)
+                   (break)
+                   (do
+                     (let [pp (al-elem [Param] params (load i))
+                           arg (al-elem [Expr] nargs (load i))
+                           owner-type (.owned_type pp)]
+                       (match (.kind arg)
+                         (EMovePlace [place]
+                           (if (match (load (field pp ty))
+                                 (TPtr [_] true)
+                                 (TRef [_ _] true)
+                                 (_ false))
+                               (set! (.kind arg) (.kind place))
+                               (set! (.kind arg) (ELoad place)))
+                           0)
+                         (_ 0))
+                       (when (and (!= (primitive/cast i64 owner-type) (primitive/cast i64 0))
+                                  (match (load (field pp ty))
+                                    (TPtr [_] true)
+                                    (TRef [_ _] true)
+                                    (_ false)))
+                         (match (.kind arg)
+                           (ELoad [place]
+                             (do
+                               (set! (.kind arg) (.kind place))
+                               0))
+                           ; Checked non-generic calls already spill aggregate
+                           ; rvalues when the callee ABI takes an owning place.
+                           ; Generic calls do not know that concrete ABI until
+                           ; substitution here, so materialize an rvalue now.
+                           (ESpillRef [_] 0)
+                           ; The ownership pass has already rewritten moved
+                           ; affine locals/parameters from `load place` to the
+                           ; place itself. Do not spill that pointer a second
+                           ; time when this call is later monomorphized.
+                           (EVar [_] 0)
+                           (EField [_ _] 0)
+                           (EIndex [_ _] 0)
+                           (_
+                             (let [saved (box-expr a (load arg))]
+                               (set! (.kind arg) (ESpillRef saved))
+                               0)))
+                         0))
+                     (set! i (primitive/iadd (load i) 1)))))
+         (Ok [i64 Diag] 0))))
+
+; Concrete ownership elaboration runs while the monomorphization worklist is
+; still being built. Register a semantic signature as soon as a generic call is
+; specialized, so a caller processed before its callee can still distinguish an
+; owning parameter from a borrow. The source Cx contains only the generic name;
+; looking up the mangled call there would otherwise silently treat every argument
+; as non-consuming.
+(defn register-monomorphized-call-sig! [(m (ptr MonoCtx))
+                                        (gf (ptr Func))
+                                        (rtargs (ptr (ArrayList Type)))
+                                        (mng (slice u8))] (-> (Result i64 Diag))
+  (try (let [cx (load (field m ownership_cx))]
+         (if (!= (primitive/cast i64 (sig-find cx mng)) (primitive/cast i64 0))
+             (Ok [i64 Diag] 0)
+             (let [a (load (field m a))
+                   smap (subst-map a (load (field gf type_params)) rtargs)
+                   ps (load (field gf params))
+                   n (al-len [Param] (load ps))
+                   (mut types) (al-new [Type] a)
+                   (mut names) (al-new [(slice u8)] a)
+                   (mut i) 0
+                   sg (primitive/alloc-stack Sig)]
+               (loop (if (>= (load i) n)
+                         (break)
+                         (let [pp (al-elem [Param] ps (load i))
+                               semantic (if (= (primitive/cast i64 (.owned_type pp))
+                                               (primitive/cast i64 0))
+                                            (field pp ty)
+                                            (.owned_type pp))]
+                           (al-push! (mut types) (try! (resolve-ty m semantic smap)))
+                           (al-push! (mut names) (.name pp))
+                           (set! i (primitive/iadd (load i) 1)))))
+               (set! (.name sg) mng)
+               (set! (.type_params sg) (box-al [(slice u8)] a (al-new [(slice u8)] a)))
+               (set! (.bounds sg) (box-al [Bound] a (al-new [Bound] a)))
+               (set! (.param_names sg) (box-al [(slice u8)] a (load names)))
+               (set! (.params sg) (box-al [Type] a (load types)))
+               (set! (.ret sg) (try! (resolve-ty m (field gf ret) smap)))
+               (set! (.is_extern sg) false)
+               (set! (.variadic sg) false)
+               (set! (.cc sg) (.cc gf))
+               (set! (.fnptr_ok sg) false)
+               (al-push! (mut (.sigs cx)) (load sg))
+               (sig-index-put! cx mng)
+               (Ok [i64 Diag] 0))))))
+
 (defn resolve-call-kind [(m (ptr MonoCtx))
                          (func (slice u8))
                          (type_args (ptr (ArrayList Type)))
@@ -776,6 +1094,7 @@
     (try (let [nargs (try! (resolve-expr-list m args map))]
            (match (variant-sum m func)
              (Some [sum-name]
+                   (move-args-to-values! a nargs)
                    (if (gsum-has m sum-name)
                        (do
                          (when (= (al-len [Type] (load type_args)) (primitive/cast i64 0))
@@ -831,15 +1150,36 @@
                                                             (gfunc-arity m func)
                                                             (al-len [Type] (load rtargs)))))))
                            (let [mng (mangle a func rtargs)]
+                             (let [gf (al-elem [Func]
+                                               (load (field m gfuncs))
+                                               (find-func-named (load (field m gfuncs)) func))]
+                               (try! (register-monomorphized-call-sig! m gf rtargs mng))
+                               (try! (adjust-generic-call-abi! m gf rtargs nargs))
+                               0)
                              (queue-func m func rtargs)
                              (Ok (ECall
                                    :func mng
                                    :type_args (box-items-type a)
                                    :args nargs)))))
-                       (Ok (ECall
-                             :func func
-                             :type_args (box-items-type a)
-                             :args nargs)))))))))
+                       (do
+                         ; This may be the second resolve pass over a concrete
+                         ; generic body. Such calls are already mangled, but the
+                         ; ownership pass has only now marked consumed arguments
+                         ; with EMovePlace. Use the recorded generic origin rather
+                         ; than treating the call as an ordinary pointer-ABI call.
+                         (let [ioi (io-find m func)]
+                           (if (>= ioi 0)
+                               (let [orig (al-elem [PendInst] (field m io-origin) ioi)
+                                     gf (al-elem [Func]
+                                                 (load (field m gfuncs))
+                                                 (find-func-named (load (field m gfuncs)) (.name orig)))]
+                                 (try! (adjust-generic-call-abi! m gf (.args orig) nargs))
+                                 0)
+                               (move-args-to-places! nargs)))
+                         (Ok (ECall
+                               :func func
+                               :type_args (box-items-type a)
+                               :args nargs))))))))))
 (defn resolve-expr-kind [(m (ptr MonoCtx)) (e (ptr Expr)) (map (ptr Subst))] (-> (Result ExprKind Diag))
   (let [a (load (field m a))]
     (try (match (load (field e kind))
@@ -852,6 +1192,7 @@
            (EZeroed [t] (let [tp (primitive/alloc-stack Type)] (store! tp t) (Ok (EZeroed (try! (resolve-ty m tp map))))))
            (EBorrow [mu place] (Ok (EBorrow mu (box-expr a (try! (resolve-expr m place map))))))
            (ESpillRef [inner] (Ok (ESpillRef (box-expr a (try! (resolve-expr m inner map))))))
+           (EMovePlace [place] (Ok (EMovePlace (box-expr a (try! (resolve-expr m place map))))))
            (ELet [binds body] (Ok (ELet (try! (resolve-bind-list m binds map)) (try! (resolve-expr-list m body map)))))
            (EBin [op lhs rhs]
                  (Ok (EBin
@@ -870,6 +1211,10 @@
                       :thn (box-expr a (try! (resolve-expr m thn map)))
                       :els (box-expr a (try! (resolve-expr m els map))))))
            (EDo [body] (Ok (EDo (try! (resolve-expr-list m body map)))))
+           (ECleanup [body cleanups]
+                     (Ok (ECleanup
+                           :body (box-expr a (try! (resolve-expr m body map)))
+                           :cleanups (try! (resolve-expr-list m cleanups map)))))
            (ECall [func type_args args] (resolve-call-kind m func type_args args map))
            (ENamedCall [_func _type_args _names _args]
                        (Err [ExprKind Diag] (derr "internal: named constructor call survived type checking")))
@@ -885,6 +1230,8 @@
            (ELoad [inner] (Ok (ELoad (box-expr a (try! (resolve-expr m inner map))))))
            (EStore [p val]
                    (Ok (EStore (box-expr a (try! (resolve-expr m p map))) (box-expr a (try! (resolve-expr m val map))))))
+           (EInitStore [p val]
+                   (Ok (EInitStore (box-expr a (try! (resolve-expr m p map))) (box-expr a (try! (resolve-expr m val map))))))
            (EIndex [p idx]
                    (Ok (EIndex (box-expr a (try! (resolve-expr m p map))) (box-expr a (try! (resolve-expr m idx map))))))
            (ECast [t inner]
@@ -928,12 +1275,12 @@
                       (Ok (ELlvmIr
                             :result
                               (match (resolve-ty m tp map)
-                                (Ok [$g389] $g389)
-                                (Err [$g390] (break :try (Err $g390))))
+                                (Ok [value] value)
+                                (Err [error] (break :try (Err error))))
                             :args
                               (match (resolve-expr-list m args map)
-                                (Ok [$g391] $g391)
-                                (Err [$g392] (break :try (Err $g392))))
+                                (Ok [value] value)
+                                (Err [error] (break :try (Err error))))
                             :body body))))
            (EConstruct [sum variant args]
                        (Ok (EConstruct
@@ -941,8 +1288,8 @@
                              :variant variant
                              :args
                                (match (resolve-expr-list m args map)
-                                 (Ok [$g393] $g393)
-                                 (Err [$g394] (break :try (Err $g394)))))))
+                                 (Ok [value] value)
+                                 (Err [error] (break :try (Err error)))))))
            (EMakeDyn [dyn_struct vtable_struct methods inner]
                      (Ok (EMakeDyn
                            :dyn_struct dyn_struct
@@ -959,17 +1306,17 @@
                                  :cc cc
                                  :params
                                    (match (resolve-ty-list m params map)
-                                     (Ok [$g397] $g397)
-                                     (Err [$g398] (break :try (Err $g398))))
+                                     (Ok [value] value)
+                                     (Err [error] (break :try (Err error))))
                                  :ret
                                    (match (resolve-ty m rp map)
-                                     (Ok [$g399] $g399)
-                                     (Err [$g400] (break :try (Err $g400))))
+                                     (Ok [value] value)
+                                     (Err [error] (break :try (Err error))))
                                  :recv (box-expr a (try! (resolve-expr m recv map)))
                                  :args
                                    (match (resolve-expr-list m args map)
-                                     (Ok [$g403] $g403)
-                                     (Err [$g404] (break :try (Err $g404))))))))
+                                     (Ok [value] value)
+                                     (Err [error] (break :try (Err error))))))))
            (EStaticRef [nm] (Ok (EStaticRef nm)))
            ; trait call: substitute Self -> concrete, call the implementing fn
            ; directly. A receiver that resolved to a MANGLED instantiation
@@ -982,8 +1329,8 @@
                          (let [styp (primitive/alloc-stack Type)]
                            (store! styp
                                    (match (resolve-ty m tp map)
-                                     (Ok [$g1564] $g1564)
-                                     (Err [$g1565] (break :try (Err $g1565)))))
+                                     (Ok [value] value)
+                                     (Err [error] (break :try (Err error)))))
                            (let [(mut base) ""
                                  (mut mty) (load styp)]
                              (if (= (type-tag styp) (primitive/cast i64 6))
@@ -1099,8 +1446,8 @@
                                          (box-expr a (try! (resolve-expr m data map)))
                                          :elem
                                          (match (resolve-ty m tp map)
-                                                (Ok [$g1118] $g1118)
-                                                (Err [$g1119] (break :try (Err $g1119))))
+                                                (Ok [value] value)
+                                                (Err [error] (break :try (Err error))))
                                          :len
                                          len))))
            (ETypeQuery [q t] (Err [ExprKind Diag] (derr "mono: unresolved type-query (compiler bug)")))
@@ -1122,11 +1469,15 @@
   (match (resolve-expr-kind m e map)
     (Err [d] (Err [Expr Diag] d))
     (Ok [k]
-        (Ok (mk-expr k
-                     (.lo e)
-                     (.hi e)
-                     (.source e)
-                     (.ctxt e))))))
+        (let [(mut out) (mk-expr k
+                                 (.lo e)
+                                 (.hi e)
+                                 (.source e)
+                                 (.ctxt e))]
+          ; Binding/type side maps are keyed by source node identity. Mono must
+          ; not erase that identity before generic ABI and ownership lowering.
+          (set! (.nid out) (.nid e))
+          (Ok (load out))))))
 
 ; ---- drain the worklist --------------------------------
 ; An append-only cursor sweep (same fixpoint, output order is
@@ -1238,12 +1589,90 @@
                                          (store! done
                                                  true)
                                          0))
-                                  (Ok [nf] (upsert-func m nf)))))
+                                  (Ok [nf]
+                                      (let [nfp (primitive/alloc-stack Func)]
+                                        (set! nfp nf)
+                                        (set! (.cur_bounds (load (field m ownership_cx)))
+                                              (al-new [Bound] a))
+                                        (match (ownership-check-func a
+                                                                     (load (field m ownership_cx))
+                                                                     nfp)
+                                          (Err [d]
+                                            (do
+                                              (store! err d)
+                                              (store! failed true)
+                                              (store! done true)
+                                              0))
+                                          (Ok [_]
+                                            ; Concrete ownership elaboration may
+                                            ; synthesize generic Drop calls for
+                                            ; fields such as Weak<Payload>. Those
+                                            ; calls did not exist during the first
+                                            ; resolve-expr walk, so specialize and
+                                            ; queue them before publishing `nf`.
+                                            (match (resolve-expr-list m
+                                                                      (load (field nfp body))
+                                                                      smap)
+                                              (Err [d]
+                                                (do
+                                                  (store! err d)
+                                                  (store! failed true)
+                                                  (store! done true)
+                                                  0))
+                                              (Ok [owned-body]
+                                                (do
+                                                  (set! (.body nfp) owned-body)
+                                                  (upsert-func m (load nfp))))))))))))
                           (store! fc (primitive/iadd (load fc) 1)))
                       :else (do (store! done true) 0)))))
     (if (load failed) (Err [i64 Diag] (load err)) (Ok [i64 Diag] 0))))
 
 ; ---- orchestration ------------------------------
+(defn mono-phase-only-type? [(t (ptr Type))] (-> bool)
+  (match (load t)
+    (TCode [] true)
+    (TCodeBuilder [] true)
+    (TPtr [inner] (mono-phase-only-type? inner))
+    (TRef [_ inner] (mono-phase-only-type? inner))
+    (TArray [inner _] (mono-phase-only-type? inner))
+    (TSlice [inner] (mono-phase-only-type? inner))
+    (TVec [inner _] (mono-phase-only-type? inner))
+    (TFn [_ params ret]
+      (or (mono-phase-only-types? params 0 (al-len [Type] (load params)))
+          (mono-phase-only-type? ret)))
+    (TApp [_ args] (mono-phase-only-types? args 0 (al-len [Type] (load args))))
+    (_ false)))
+
+(defn mono-phase-only-types? [(types (ptr (ArrayList Type))) (i i64) (n i64)] (-> bool)
+  (if (>= i n)
+      false
+      (or (mono-phase-only-type? (al-elem [Type] types i))
+          (mono-phase-only-types? types (primitive/iadd i 1) n))))
+
+(defn mono-phase-only-fields? [(fields (ptr (ArrayList Field)))] (-> bool)
+  (let [n (al-len [Field] (load fields))
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) n))
+              (break)
+              (do
+                (when (mono-phase-only-type? (field (al-elem [Field] fields (load i)) ty))
+                  (store! found true) 0)
+                (store! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
+(defn mono-phase-only-variants? [(variants (ptr (ArrayList Variant)))] (-> bool)
+  (let [n (al-len [Variant] (load variants))
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) n))
+              (break)
+              (do
+                (when (mono-phase-only-fields? (load (field (al-elem [Variant] variants (load i)) fields)))
+                  (store! found true) 0)
+                (store! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
 (defn collect-generic-structs [(a (dyn Allocator)) (p (ptr Program))] (-> (ptr (ArrayList StructDef)))
   (let [fs (load (field p structs))
         n (al-len [StructDef] (load fs))
@@ -1325,7 +1754,12 @@
               (break)
               (do
                 (let [sp (al-elem [StructDef] ss (load i))]
-                  (when (= (al-len [(slice u8)] (load (field sp type_params))) (primitive/cast i64 0))
+                  ; Code-bearing concrete aggregates belong exclusively to the
+                  ; metaprogram/checker closure. Metalower compiles a private copy
+                  ; with Code erased to an opaque host handle; the ordinary target
+                  ; must not seed the source declaration into runtime layout.
+                  (when (and (= (al-len [(slice u8)] (load (field sp type_params))) (primitive/cast i64 0))
+                             (not (mono-phase-only-fields? (load (field sp fields)))))
                     (match (resolve-fields m (load (field sp fields)) map)
                       (Err [d] (do (store! err d) (store! failed true) (break)))
                       (Ok [nfs]
@@ -1350,7 +1784,8 @@
               (break)
               (do
                 (let [sp (al-elem [SumDef] ss (load i))]
-                  (when (= (al-len [(slice u8)] (load (field sp type_params))) (primitive/cast i64 0))
+                  (when (and (= (al-len [(slice u8)] (load (field sp type_params))) (primitive/cast i64 0))
+                             (not (mono-phase-only-variants? (load (field sp variants)))))
                     (match (resolve-sum m sp map (load (field sp name)))
                       (Err [d] (do (store! err d) (store! failed true) (break)))
                       (Ok [ns] (upsert-sum m ns)))))
@@ -1459,8 +1894,16 @@
               (hm-put! [(slice u8) i64] (mut (.out-func-idx m)) nm idx)
               0)))))
 
+(defn mono-ownership-context [(a (dyn Allocator)) (p (ptr Program))] (-> (Result (ptr Cx) Diag))
+  (let [cx (box! a Cx (primitive/zeroed Cx))
+        imports (box-al [ImpEntry] a (al-new [ImpEntry] a))
+        exports (box-al [ExpEntry] a (al-new [ExpEntry] a))]
+    (match (setup a cx p imports exports)
+      (Err [d] (Err [(ptr Cx) Diag] d))
+      (Ok [_] (Ok [(ptr Cx) Diag] cx)))))
+
 (defn monomorphize [(a (dyn Allocator)) (p (ptr Program))] (-> (Result (ptr Program) Diag))
-  (let [m (box! a MonoCtx (primitive/zeroed MonoCtx))]
+  (try (let [m (box! a MonoCtx (primitive/zeroed MonoCtx))]
     (set! (.a m) a)
     (set! (.gfuncs m) (collect-generic-funcs a p))
     (set! (.gstructs m) (collect-generic-structs a p))
@@ -1479,6 +1922,7 @@
     (set! (.queued-structs m) (hm-new [(slice u8) i64] a (str-keyops)))
     (set! (.queued-sums m) (hm-new [(slice u8) i64] a (str-keyops)))
     (set! (.queued-funcs m) (hm-new [(slice u8) i64] a (str-keyops)))
+    (set! (.ownership_cx m) (try! (mono-ownership-context a p)))
     (set! (.impls m) (load (field p impls)))
     (set! (.trait_impl_idx m) (hm-new [(slice u8) (ptr ImplBucket)] a (str-keyops)))
     (let [is (load (field m impls))
@@ -1514,7 +1958,7 @@
                                 (Ok [asserts]
                                     (match (drain m)
                                       (Err [d] (Err [(ptr Program) Diag] d))
-                                      (Ok [_] (build-mono-program a m p asserts))))))))))))))))
+                                      (Ok [_] (build-mono-program a m p asserts)))))))))))))))))
 
 ; ---- post-check Code definition drop ----
 ; Comptime-only functions (a `Code`/`CodeBuilder` parameter or return — macros,
@@ -1636,6 +2080,7 @@
     (ECall [_ _ args] (expr-list-has-code-node? args))
     (EBorrow [_ place] (expr-has-code-node? place))
     (ESpillRef [x] (expr-has-code-node? x))
+    (EMovePlace [x] (expr-has-code-node? x))
     (ENot [x] (expr-has-code-node? x))
     (ELoad [x] (expr-has-code-node? x))
     (EFree [x] (expr-has-code-node? x))
@@ -1651,6 +2096,8 @@
          (or (expr-has-code-node? c)
              (or (expr-has-code-node? t) (expr-has-code-node? el))))
     (EDo [es] (expr-list-has-code-node? es))
+    (ECleanup [body cleanups]
+              (or (expr-has-code-node? body) (expr-list-has-code-node? cleanups)))
     (ELoop [_ es] (expr-list-has-code-node? es))
     (EBreak [_ v] (expr-opt-has-code-node? v))
     (ELet [bs body]
@@ -1658,6 +2105,7 @@
     (EField [p _] (expr-has-code-node? p))
     (EBitGet [p _] (expr-has-code-node? p))
     (EStore [p v] (or (expr-has-code-node? p) (expr-has-code-node? v)))
+    (EInitStore [p v] (or (expr-has-code-node? p) (expr-has-code-node? v)))
     (EIndex [p idx] (or (expr-has-code-node? p) (expr-has-code-node? idx)))
     (EBitSet [p _ v] (or (expr-has-code-node? p) (expr-has-code-node? v)))
     (EConstruct [_ _ args] (expr-list-has-code-node? args))
