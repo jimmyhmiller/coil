@@ -695,20 +695,26 @@ def test_modernize_fast(compiler: str) -> None:
                                      text=True, check=True)
             if probe.read_bytes() != before:
                 raise RuntimeError("fast modernization gate: lint --diff changed its input")
+            preview_added = "\n".join(
+                line[1:] for line in preview.stdout.splitlines()
+                if line.startswith("+") and not line.startswith("+++")
+            )
+            preview_compact = " ".join(preview_added.split())
             for final_rewrite in ("(set! (.value box)", "(.value box)",
                                   "(Moved :x 1 :y 2 :at 3)", "try-or!",
                                   "(let [heap (primitive/alloc-static Box)] heap)"):
-                if final_rewrite not in preview.stdout:
+                if final_rewrite not in preview_compact:
                     raise RuntimeError(
                         f"fast modernization gate: lint --diff stopped before fixpoint {final_rewrite!r}")
             if "fixed " in preview.stderr:
                 raise RuntimeError("fast modernization gate: lint --diff claimed it wrote a file")
             execute(coil, "lint", str(probe), "--fix")
             fixed = probe.read_text()
+            fixed_compact = " ".join(fixed.split())
             for legacy in ("primitive/icmp-ge", "match-else (", "(Moved 1 2 3)", "(match value"):
                 if legacy in fixed:
                     raise RuntimeError(f"fast modernization gate: default lint left {legacy!r}")
-            if ("(Moved :x 1 :y 2 :at 3)" not in fixed or "try-or!" not in fixed
+            if ("(Moved :x 1 :y 2 :at 3)" not in fixed_compact or "try-or!" not in fixed
                     or "(set! (.value box)" not in fixed or "(.value box)" not in fixed
                     or "(let [heap (primitive/alloc-static Box)] heap)" not in fixed):
                 raise RuntimeError("fast modernization gate: default lint profile did not run every safe fixer")
