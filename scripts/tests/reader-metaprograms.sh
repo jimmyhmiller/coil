@@ -23,6 +23,14 @@ fail() { echo "reader metaprograms: FAIL — $1"; exit 1; }
 
 "$COIL" check "$FIX/phase_closure_provider.coil" \
   || fail "ordinary-signature helper in reader comptime closure is dropped before mono"
+"$COIL" build "$FIX/raw.answer" --use reader.fixture.artifact --release -o "$T/artifact-pure" >/dev/null \
+  || fail "build artifact-boundary reader fixture"
+artifact_undef=$(nm -u "$T/artifact-pure") || fail "inspect artifact-boundary undefined symbols"
+case "$artifact_undef" in
+  *"_chdir"*|*"_getcwd"*|*"_getenv"*|*"_posix_spawnp"*|*"_read"*|*"_write"*|*"_setenv"*|*"_unsetenv"*|*"_dlsym"*)
+    fail "reader/compiler authority leaked into final artifact: $artifact_undef" ;;
+esac
+"$T/artifact-pure"; [ $? = 42 ] || fail "artifact-boundary reader result"
 
 "$COIL" check "$FIX/raw.answer" --use reader.fixture.fs \
   || fail "ordinary filesystem read/write from reader"
