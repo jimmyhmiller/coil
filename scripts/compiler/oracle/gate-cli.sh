@@ -2159,6 +2159,11 @@ expect_rc 2 "--suite without a name is rejected" \
 dups=$( (cd "$T/suites" && "$COIL" test --list --jobs 2 2>/dev/null) | sort | uniq -d )
 [ -z "$dups" ] && ok "a second flag does not re-run discovery" \
   || bad "a second flag does not re-run discovery" "repeated lines: $dups"
+# Suite discovery consumes its own flags, then forwards ordinary build flags to
+# the generated one-file harness. This used to reject --debug-checks even though
+# `coil test --help` advertises the shared build flags for test builds.
+expect_rc 0 "project suites forward build flags to the generated harness" \
+  bash -c 'cd "$1" && "$2" test --suite unit --debug-checks --no-run' _ "$T/suites" "$COIL"
 # lint must still recognize a non-default suite's files as test files.
 expect_rc 0 "lint understands test files in every suite, default or not" \
   bash -c 'cd "$1" && "$2" lint' _ "$T/suites" "$COIL"
