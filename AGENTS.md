@@ -6,6 +6,31 @@ flow, FFI, and the gotchas that trip agents up (f64 has no `Eq`; don't `alloc-st
 in a loop; `call`/`block` are reserved; `if` branches must share a type). Read it
 before writing Coil.
 
+## Bug reports
+
+Record every bug discovered while working in this repository in the `coil-bugs`
+pad. This section defines the required report format.
+Give each report its own descriptive Markdown title and put the report's supporting
+information inside an HTML `<details>` block. Include enough information to
+reproduce and investigate the problem: observed behavior, expected behavior,
+reproduction steps or command, relevant output, and affected files when known.
+Use this format:
+
+```markdown
+### Short, specific bug title
+
+<details>
+<summary>Details</summary>
+
+- **Observed:** What happened.
+- **Expected:** What should have happened.
+- **Reproduction:** The smallest reliable reproduction or command.
+- **Relevant output:** The exact diagnostic or other useful evidence.
+- **Affected files:** Known files or components, if any.
+
+</details>
+```
+
 ## Build & test
 
 - `coil build file.coil -o out` / `coil run file.coil` — single file.

@@ -21,6 +21,9 @@ fail() { echo "reader metaprograms: FAIL — $1"; exit 1; }
 "$COIL" run "$FIX/raw.answer" --use reader.fixture.code-helper-return >/dev/null
 [ $? = 42 ] || fail "helper-returned Code remains a value in a reader provider"
 
+"$COIL" check "$FIX/phase_closure_provider.coil" \
+  || fail "ordinary-signature helper in reader comptime closure is dropped before mono"
+
 "$COIL" check "$FIX/raw.answer" --use reader.fixture.fs \
   || fail "ordinary filesystem read/write from reader"
 cmp -s "$FIX/raw.answer" /tmp/coil-reader-fs-provider.txt \
