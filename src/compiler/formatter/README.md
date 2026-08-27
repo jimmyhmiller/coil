@@ -21,8 +21,9 @@ flat; a single-binding vector stays inline.
 
 ## What it preserves
 
-Formatting only ever changes whitespace and line breaks. Comments, blank lines
-(collapsed to at most one), and every atom/string/number are kept **verbatim**.
+Formatting only ever changes whitespace and line breaks. Comments and every
+atom/string/number are kept **verbatim**. Blank lines inside forms are preserved
+(collapsed to at most one); top-level spacing is canonicalized as described below.
 
 To check that over the tree: `coil fmt --check` on every `.coil` file must be clean
 after a `--write` pass (idempotence), and `coil dump-read` of a file must match
@@ -34,11 +35,15 @@ gates the `fmt` CLI contract itself: argv, exit codes, multi-file, `--check`/`--
 
 Width-driven like Prettier, but it respects two author signals:
 
-- **blank lines** between forms are kept (at most one);
+- **blank lines inside forms** are kept (at most one);
 - a form the **author already split across lines stays split** (its group is forced
   to break). A form the author wrote on one line is re-flowed by width.
 
 Indentation is always normalized.
+
+At the top level, forms are separated by one empty line, following the Clojure
+style guide. Coil's separate `module` and `import` forms are treated as one compact
+namespace header. A leading comment block stays attached to the form it documents.
 
 ## Layout conventions
 

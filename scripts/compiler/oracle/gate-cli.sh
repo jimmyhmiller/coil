@@ -359,6 +359,26 @@ n=$(echo "$out" | grep -c "not formatted")
 [ "$n" = 2 ] && ok "fmt --check reports both files" || bad "fmt --check multi-file" "named $n of 2: $out"
 expect_rc 2 "fmt on a directory is an error"             "$COIL" fmt "$T"
 
+"$COIL" fmt tests/compiler/formatter_vertical_spacing_input.coil > "$T/vertical-spacing.got"
+cmp -s tests/compiler/formatter_vertical_spacing_expected.coil "$T/vertical-spacing.got" \
+  && ok "fmt canonicalizes top-level spacing and keeps leading comments attached" \
+  || bad "fmt top-level vertical spacing" "$(diff -u tests/compiler/formatter_vertical_spacing_expected.coil "$T/vertical-spacing.got")"
+expect_rc 0 "standalone formatter entry typechecks" \
+  "$COIL" check src/compiler/formatter/fmt.coil
+
+mkdir -p "$T/stage0-bin"
+ln -s "$COIL" "$T/stage0-bin/coil"
+stage0_source=$(
+  unset STAGE0 STAGE0_SOURCE COIL_FORCE_WASM_STAGE0
+  PATH="$T/stage0-bin:/usr/bin:/bin"
+  . scripts/compiler/select-stage0.sh
+  select_stage0 "$T/no-native-seed" "$T/seven.coil" arm64
+  echo "$STAGE0_SOURCE"
+)
+[ "$stage0_source" = installed ] \
+  && ok "stage0 selection tries a compatible installed coil before WASM" \
+  || bad "installed stage0 fallback" "selected '$stage0_source' instead of installed"
+
 echo "== per-subcommand help =="
 for c in build run install fmt new emit-ir; do
   expect_out "usage: coil $c" "$c --help"                "$COIL" "$c" --help

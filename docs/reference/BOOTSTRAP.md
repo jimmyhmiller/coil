@@ -14,12 +14,12 @@ Mach-O bootstrap and Linux/x86-64 uses the ELF bootstrap. The explicit `linux` a
 `nollvm-linux` variants remain available for automation but are not required for
 ordinary use.
 
-Stage zero is selected in one order everywhere: an explicit `STAGE0`, then the
-matching committed native seed, then the portable WASM seed translated with
-`wasm2c` and the host C compiler. Native seeds are the fast path; WASM is the
-portable recovery path when a native seed is absent, for the wrong platform, or
-too old to compile the checkout. Set `COIL_FORCE_WASM_STAGE0=1` to exercise that
-fallback deliberately.
+Stage zero is selected in one order everywhere: an explicit `STAGE0`, the matching
+committed native seed, a compatible installed `coil`, then the portable WASM seed
+translated with `wasm2c` and the host C compiler. Native compilers are the fast
+path; WASM is the portable recovery path when none is available or new enough to
+compile the checkout. Set `COIL_FORCE_WASM_STAGE0=1` to exercise that fallback
+deliberately.
 
 ## Fast inner loop
 
@@ -28,10 +28,14 @@ changes. Build one candidate after editing compiler sources, then run the bounde
 gate against that candidate as often as needed:
 
 ```sh
-build/bin/coil build src/compiler/main.coil --backend arm64 -o /tmp/coil-candidate \
-  --link-flag -L/path/to/llvm/lib --link-flag -lLLVM
+python3 scripts/dev.py build candidate --output /tmp/coil-candidate
 python3 scripts/dev.py test modernize-fast --compiler /tmp/coil-candidate
 ```
+
+The candidate command stages the active compiler against this checkout's compiler
+modules, performs one build, and obtains the platform's LLVM link line from
+`scripts/compiler/llvm-link-flags.sh`. It does not run a fixpoint or install
+anything.
 
 It tests clean comparisons at every integer width and in `static-assert`, then verifies
 qualified/transitive namespace re-exports, the `coil.process` facade, and the

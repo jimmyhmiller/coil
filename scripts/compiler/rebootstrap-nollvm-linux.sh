@@ -72,9 +72,10 @@ echo "=== stage3: stage2 rebuilds it with the x64 backend ==="
 "$S2" build "$SRC" -o "$S3" || { echo "stage3 FAILED"; exit 1; }
 
 echo "=== NO-LLVM: stage2 must link no libLLVM ==="
-if ldd "$S2" | grep -qi LLVM; then
-  echo "  FAIL — libLLVM is linked:"; ldd "$S2" | grep -i LLVM; exit 3
-fi
+DEPS=$(ldd "$S2")
+case "$DEPS" in
+  *LLVM*|*llvm*) echo "  FAIL — libLLVM is linked:"; echo "$DEPS"; exit 3 ;;
+esac
 echo "  ok — links only:$(ldd "$S2" | awk '{printf " %s", $1}')"
 
 echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="

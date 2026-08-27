@@ -26,6 +26,36 @@ def execute(*command: str, env: dict[str, str] | None = None, cwd: Path = ROOT) 
 
 
 def build(args: argparse.Namespace) -> None:
+    if args.variant == "candidate":
+        compiler = shutil.which("coil")
+        if compiler is None:
+            raise SystemExit("candidate build needs an existing `coil` on PATH")
+        output = Path(args.output or "build/bin/coil-candidate")
+        output = output if output.is_absolute() else ROOT / output
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if Path(compiler).resolve() == output.resolve():
+            raise SystemExit("candidate output must not overwrite the stage0 compiler")
+        # A compiler normally loads compiler support modules beside its own
+        # executable. Stage the existing binary in a temporary toolchain layout
+        # pointing at this checkout, or an installed stage0 would quietly compile
+        # its installed copy of rules.coil/driver.coil instead of the edits here.
+        build_root = ROOT / "build"
+        build_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".coil-candidate-stage0-", dir=build_root) as raw:
+            prefix = Path(raw)
+            staged = prefix / "bin" / "coil"
+            staged.parent.mkdir(parents=True)
+            shutil.copy2(compiler, staged)
+            library = prefix / "lib" / "coil"
+            library.mkdir(parents=True)
+            (library / "stdlib").symlink_to(ROOT / "src" / "stdlib", target_is_directory=True)
+            (library / "compiler").symlink_to(ROOT / "src" / "compiler", target_is_directory=True)
+            (library / "prelude.coil").symlink_to(ROOT / "src" / "compiler" / "prelude.coil")
+            execute(str(staged), "build", "src/compiler/main.coil", "-o", str(output),
+                    *llvm_flags("dynamic"))
+        print(f"built compiler candidate -> {output}")
+        return
+
     host = (sys.platform, platform.machine().lower())
     variant = args.variant
     if variant == "full":
@@ -428,6 +458,14 @@ def test_modernize_fast(compiler: str) -> None:
         if not candidate.is_file():
             raise SystemExit(f"fast modernization gate: compiler not found: {candidate}")
         coil = str(candidate)
+        capability = subprocess.run(
+            [coil, "emit-ir", "tests/compiler/features/aggregate_loop_stack.coil"],
+            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        has_llvm = capability.returncode == 0
+        if not has_llvm and "built without the LLVM backend" not in capability.stderr:
+            raise SystemExit(
+                "fast modernization gate: compiler's emit-ir capability probe failed:\n"
+                + capability.stderr)
         # The native backend emits Mach-O/AArch64 objects. Only select it when
         # this host can link and execute them; elsewhere these fixtures use LLVM.
         backend_flags = (("--backend", "arm64")
@@ -833,11 +871,6 @@ source-roots = ["src"]
             lambda: build_run("tests/hosted_system_test.coil", "hosted-system", *backend_flags),
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o0", "-O0"),
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o3", "-O3"),
-            aggregate_ir_task,
-            alloc_static_initial_task,
-            alias_memory_task,
-            lambda: build_run("tests/compiler/features/linker_address_native.coil",
-                              "linker-address-native"),
             lambda: build_run("tests/compiler/features/void_if_discarded.coil", "void-if-discarded"),
             lambda: build_run("src/examples/bitfields.coil", "static-assert", *backend_flags, want=42),
             lint_task,
@@ -846,6 +879,12 @@ source-roots = ["src"]
             broken_project_task,
             breaking_scan_task,
         ]
+        if has_llvm:
+            tasks.extend((aggregate_ir_task, alloc_static_initial_task, alias_memory_task,
+                          lambda: build_run("tests/compiler/features/linker_address_native.coil",
+                                            "linker-address-native")))
+        else:
+            print("fast modernization gate: LLVM-free compiler; skipping 4 LLVM-IR-specific checks")
         for surface in ("value", "macro", "method", "alias"):
             path = f"tests/compiler/features/refer_exclude_{surface}_rejected.coil"
             tasks.append(lambda path=path, surface=surface: expect_rejected(
@@ -1064,8 +1103,8 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
 
-    command = commands.add_parser("build", help="rebuild and verify the compiler")
-    command.add_argument("variant", choices=("full", "nollvm", "linux", "nollvm-linux", "x64"), nargs="?", default="full")
+    command = commands.add_parser("build", help="build a compiler candidate or rebuild and verify the compiler")
+    command.add_argument("variant", choices=("candidate", "full", "nollvm", "linux", "nollvm-linux", "x64"), nargs="?", default="full")
     command.add_argument("--output")
     command.set_defaults(func=build)
 

@@ -6,7 +6,8 @@
 #
 # Sets STAGE0 and STAGE0_BUILD_FLAGS. An explicit STAGE0 is authoritative. Without
 # one, a matching native seed is used when it can compile this checkout; otherwise
-# the committed portable WASM seed is translated to a temporary host executable.
+# a compatible installed `coil` is reused, then the committed portable WASM seed
+# is translated to a temporary host executable.
 
 select_stage0() {
   local native_seed="$1" src="$2" fallback_backend="$3"; shift 3
@@ -22,6 +23,21 @@ select_stage0() {
      && COIL_STRICT_BUNDLE=0 "$native_seed" check "$src" "$@" >/dev/null 2>&1; then
     STAGE0="$native_seed"
     STAGE0_SOURCE=native
+    return 0
+  fi
+
+  # A developer may have a newer compiler installed than the committed seed. It
+  # is still only stage zero — stage1/2/3 rederive and verify the checkout — and
+  # trying it before the portable fallback avoids stranding a build when a stale
+  # WASM seed cannot yet parse the current compiler sources.
+  local installed
+  installed=$(command -v coil 2>/dev/null || true)
+  if [ "${COIL_FORCE_WASM_STAGE0:-0}" != 1 ] \
+     && [ -n "$installed" ] \
+     && [ "$installed" != "$native_seed" ] \
+     && COIL_STRICT_BUNDLE=0 "$installed" check "$src" "$@" >/dev/null 2>&1; then
+    STAGE0="$installed"
+    STAGE0_SOURCE=installed
     return 0
   fi
 
