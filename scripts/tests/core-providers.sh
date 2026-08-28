@@ -45,6 +45,11 @@ rc=$?
 [ "$rc" = 42 ] && ok "hermetic common core and trap-only assertions compile" \
   || bad "hermetic core" "wanted status 42, got $rc"
 
+(cd "$ROOT/hermetic_surface" && "$COIL" check >/dev/null 2>&1)
+rc=$?
+[ "$rc" = 0 ] && ok "audited deterministic protocol and intrinsic namespaces form a closed hermetic surface" \
+  || bad "hermetic namespace surface" "wanted successful check, got $rc"
+
 out=$(cd "$ROOT/hermetic_forbidden" && "$COIL" check 2>&1)
 rc=$?
 case "$out" in

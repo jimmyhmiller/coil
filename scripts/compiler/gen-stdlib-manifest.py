@@ -62,10 +62,16 @@ INTERNAL_NAMESPACES = {
 # been audited. `coil.core` is the separate prelude and has no file mapping here.
 HERMETIC_NAMESPACES = {
     "coil.assert.hermetic",
+    "coil.async",
+    "coil.atomic",
     "coil.control",
+    "coil.dyn",
+    "coil.match",
     "coil.primitive",
     "coil.result",
+    "coil.simd",
     "coil.try",
+    "coil.var",
 }
 
 
