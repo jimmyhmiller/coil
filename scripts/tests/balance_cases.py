@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import pathlib
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -33,85 +32,41 @@ REPRO = REPO / "tests/repro/paredit-balance-coil"
 
 # case name -> (outcome, phrase the diagnostic must contain, extra flags)
 #
-# Several cases appear twice, once with `--no-typecheck`. That pins the two contracts
-# separately: what indentation alone can settle, and what the type checker adds. Only
-# testing the combined behaviour would let a regression in either half hide behind the
-# other.
+# Balance is deliberately structural. A damaged program's unrelated resolver or type
+# errors never veto a plausible delimiter repair.
 EXPECTED = {
     # Parens inside strings, comments and character literals are text. Miscounting
     # any of them would put every other case's depth arithmetic on sand.
     "lexical-noise": ("clean", None, []),
     # The only surplus closer with a single reading from indentation alone.
-    "stray-close-column0": ("repair", None, ["--no-typecheck"]),
+    "stray-close-column0": ("repair", None, []),
     # A surplus closer with more than one reading. Indentation must decline it...
-    "stray-close-inline": ("refuse", "indistinguishable", ["--no-typecheck"]),
-    # ...and semantic checking must not search alternative delimiter placements.
-    "stray-close-inline+check": ("refuse", "indistinguishable", []),
+    "stray-close-inline": ("refuse", "indistinguishable", []),
     # Neither can help here: both readings would be well-typed if they compiled, and
     # the typo could be the opener or the closer.
     "mismatched-bracket": ("refuse", "does not match", []),
     # Two damaged forms; the balanced form between them must survive untouched.
-    "two-damaged-forms": ("repair", None, ["--no-typecheck"]),
-    # Indentation identifies the damaged line; foo/bar arity and x/y types uniquely
-    # place the closer inside it.
+    "two-damaged-forms": ("repair", None, []),
+    # Indentation identifies a plausible boundary; semantic validity is not part of
+    # delimiter repair and is handled by `coil check` afterwards.
     "typed-inline": ("repair", None, []),
-    # Types are useful only when they prove one boundary. Variadic `do` admits more
-    # than one reading, so this must remain a refusal.
-    "typed-inline-ambiguous": ("refuse", "several delimiter placements", []),
+    "typed-inline-ambiguous": ("repair", None, []),
 }
 
 
-def check_timeout_and_interrupt(cmd: list[str]) -> bool:
-    src = CASES / "typecheck-timeout.coil"
-    # Keep this directly in /tmp. A nested directory is treated as a source root and
-    # its namespace validation rejects the candidate before reaching comptime.
-    with tempfile.NamedTemporaryFile(prefix="coil-balance-timeout-", suffix=".coil", dir="/tmp") as f:
-        target = pathlib.Path(f.name)
-        # The final empty line leaves an insertion point after the comptime form;
-        # without it all generated readings fail before evaluating that form.
-        original = src.read_bytes() + b"\n"
-        target.write_bytes(original)
-        started = time.monotonic()
-        p = subprocess.run(cmd + ["--write", str(target)], capture_output=True, timeout=40)
-        elapsed = time.monotonic() - started
-        if p.returncode != 2 or b"repair was applied" not in p.stderr:
-            print(f"FAIL typecheck-timeout: exit {p.returncode} after {elapsed:.1f}s\n{p.stderr.decode()}")
-            return False
-        if target.read_bytes() == original:
-            print("FAIL typecheck-timeout: structurally settled repair was not written")
-            return False
-
-        # Send SIGINT only to the parent and ensure the command relinquishes its
-        # inherited output pipes promptly instead of keeping the caller wedged.
-        target.write_bytes(original)
-        proc = subprocess.Popen(cmd + ["--write", str(target)], stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, start_new_session=True)
-        time.sleep(0.5)
-        interrupted = time.monotonic()
-        proc.send_signal(signal.SIGINT)
-        proc.communicate(timeout=3)
-        if proc.returncode not in (-signal.SIGINT, 130) or time.monotonic() - interrupted >= 2:
-            print(f"FAIL typecheck-interrupt: exit {proc.returncode} was not prompt")
-            return False
-    return True
-
-
 def check_remaining_type_error_is_separate(cmd: list[str]) -> bool:
-    """A semantic error must not veto an unambiguous structural repair."""
+    """A semantic error is irrelevant to a structural repair."""
     src = CASES / "repair-with-type-error.coil"
     expected = CASES / "repair-with-type-error.expected"
     with tempfile.NamedTemporaryFile(prefix="coil-balance-type-error-", suffix=".coil", dir="/tmp") as f:
         target = pathlib.Path(f.name)
         shutil.copyfile(src, target)
         p = subprocess.run(cmd + ["--write", str(target)], capture_output=True, timeout=120)
-        if p.returncode != 2:
-            print(f"FAIL repair-with-type-error: expected diagnostic exit 2, got {p.returncode}")
+        if p.returncode != 0:
+            print(f"FAIL repair-with-type-error: expected repair exit 0, got {p.returncode}")
             return False
         if target.read_bytes() != expected.read_bytes():
             print("FAIL repair-with-type-error: semantic error vetoed or changed the structural repair")
-            return False
-        if b"type" not in p.stderr or b"separate compiler error" not in p.stderr:
-            print("FAIL repair-with-type-error: remaining compiler diagnostic was not reported separately")
             return False
     return True
 
@@ -221,16 +176,10 @@ def main() -> int:
         if not check(cmd + flags, name, outcome, phrase, args.bless):
             ok = False
         else:
-            mode = " --no-typecheck" if flags else ""
-            print(f"  ok   — {name} ({outcome}{mode})")
-
-    if check_timeout_and_interrupt(cmd):
-        print("  ok   — typecheck timeout is bounded and SIGINT is prompt")
-    else:
-        ok = False
+            print(f"  ok   — {name} ({outcome})")
 
     if check_remaining_type_error_is_separate(cmd):
-        print("  ok   — structurally certain repair survives an unrelated type error")
+        print("  ok   — structural repair ignores an unrelated type error")
     else:
         ok = False
 

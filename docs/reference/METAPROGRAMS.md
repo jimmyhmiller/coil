@@ -174,8 +174,12 @@ New API this project added (all shipped):
   to run on the loaded surface syntax instead: `(checker raw-depth :phase
   before-expand)` or `(transform surface-pass :phase before-expand)`. Syntax transforms
   reach a fixpoint before syntax checkers run; their output then undergoes normal macro
-  expansion. Semantic reflection is empty in this phase, and registrations must be
-  literal top-level forms rather than generated retroactively.
+  expansion. A transform may instead use `(transform lower :phase after-expand)` to
+  see the result of ordinary macro expansion exactly once, before resolution and
+  typechecking. Its output goes directly into the semantic pipeline and is not expanded
+  again, so it must not rely on newly emitted macro calls. Semantic reflection is empty
+  in both boundary phases, and registrations must be literal top-level forms rather
+  than generated retroactively.
 - **`(primitive/binding-of NODE)` → the local-binding identity** a reference resolves to (an
   i64; 0 = a global const/function), recorded by the type-checker per reference.
   Two references with the same positive id name the SAME local, so a checker

@@ -232,15 +232,15 @@ expect_out "unknown flag" "unknown flag is named"        "$COIL" build "$T/seven
 rm -rf "$T/default-build"
 mkdir -p "$T/default-build"
 ( cd "$T/default-build" && "$COIL" build "$T/seven.coil" >/dev/null 2>&1 )
-[ -x "$T/default-build/builds/release/seven" ] && "$T/default-build/builds/release/seven"; rc=$?
-[ "$rc" = 7 ] && ok "build defaults to builds/release/<source-stem>" \
+[ -x "$T/default-build/build/release/seven" ] && "$T/default-build/build/release/seven"; rc=$?
+[ "$rc" = 7 ] && ok "build defaults to build/release/<source-stem>" \
               || bad "default build output" "missing or returned rc=$rc"
-[ ! -e "$T/default-build/builds/release/seven.o" ] && ok "default build leaves no object artifact" \
-  || bad "default build leaves no object artifact" "builds/release/seven.o exists"
+[ ! -e "$T/default-build/build/release/seven.o" ] && ok "default build leaves no object artifact" \
+  || bad "default build leaves no object artifact" "build/release/seven.o exists"
 ( cd "$T/default-build" && "$COIL" build "$T/seven.coil" --debug >/dev/null 2>&1 )
-[ -x "$T/default-build/builds/debug/seven" ] \
-  && ok "--debug selects builds/debug/<source-stem>" \
-  || bad "--debug output profile" "no builds/debug/seven"
+[ -x "$T/default-build/build/debug/seven" ] \
+  && ok "--debug selects build/debug/<source-stem>" \
+  || bad "--debug output profile" "no build/debug/seven"
 # Both the ordinary return path and the linker-failure path must remove the
 # private object directory.
 #
@@ -389,20 +389,20 @@ mkdir -p "$T/proj/src"
 printf '[package]\nname  = "proj"\nentry = "src/main.coil"\n' > "$T/proj/Coil.toml"
 printf '(module app)\n(defn main [] (-> i64) 3)\n'            > "$T/proj/src/main.coil"
 ( cd "$T/proj" && "$COIL" build >/dev/null 2>&1 )
-[ -x "$T/proj/builds/release/proj" ] && ok "project build defaults to builds/release/<package>" \
-                                       || bad "project build" "no ./builds/release/proj"
+[ -x "$T/proj/build/release/proj" ] && ok "project build defaults to build/release/<package>" \
+                                       || bad "project build" "no ./build/release/proj"
 ( cd "$T/proj" && "$COIL" run >/dev/null 2>&1 ); [ $? = 3 ] && ok "project run propagates exit code" \
                                                             || bad "project run" "want 3"
 # the headline case: --target wasm32 used to print `wrote proj`, exit 0, and emit a Mach-O
-( cd "$T/proj" && rm -f builds/release/proj && "$COIL" build --target wasm32-unknown-unknown >/dev/null 2>&1 )
-if file "$T/proj/builds/release/proj" 2>/dev/null | grep -q WebAssembly; then
+( cd "$T/proj" && rm -f build/release/proj && "$COIL" build --target wasm32-unknown-unknown >/dev/null 2>&1 )
+if file "$T/proj/build/release/proj" 2>/dev/null | grep -q WebAssembly; then
   ok "project --target wasm32 emits WebAssembly"
 else
-  bad "project --target wasm32" "got: $(file "$T/proj/builds/release/proj" 2>/dev/null | sed 's/.*: //')"
+  bad "project --target wasm32" "got: $(file "$T/proj/build/release/proj" 2>/dev/null | sed 's/.*: //')"
 fi
 ( cd "$T/proj" && "$COIL" build --debug >/dev/null 2>&1 )
-[ -x "$T/proj/builds/debug/proj" ] && ok "project --debug selects builds/debug" \
-  || bad "project --debug profile" "no ./builds/debug/proj"
+[ -x "$T/proj/build/debug/proj" ] && ok "project --debug selects build/debug" \
+  || bad "project --debug profile" "no ./build/debug/proj"
 ( cd "$T/proj" && rm -f proj && "$COIL" build -o "$T/proj/elsewhere" >/dev/null 2>&1 )
 [ -x "$T/proj/elsewhere" ] && ok "project -o is honored" || bad "project -o" "not written"
 ( cd "$T/proj" && "$COIL" build --target not-a-real-triple >/dev/null 2>&1 )
@@ -436,6 +436,43 @@ printf '[package]\nname = "path-dep"\nentry = "src/main.coil"\n\n[dependencies]\
 ( cd "$T/path-dep" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
   && ok "path dependency imports through its declared namespace" \
   || bad "path dependency" "want rc=42"
+
+# The root manifest can replace the entire ambient library universe. The selected
+# prelude is an ordinary dependency module: it is indexed through the declared
+# dependency root, auto-referred in every loaded module, and gets no bundled-path
+# privilege of its own.
+mkdir -p "$T/platform/src" "$T/no-stdlib/src"
+printf '(module platform.prelude)\n(defn platform-answer [] (-> i64) 42)\n' > "$T/platform/src/prelude.coil"
+printf '(module app)\n(defn main [] (-> i64) (platform-answer))\n' > "$T/no-stdlib/src/main.coil"
+printf '[package]\nname = "no-stdlib"\nentry = "src/main.coil"\n\n[language]\nstdlib = false\nprelude = "platform.prelude"\n\n[dependencies]\nplatform = { path = "../platform" }\n' > "$T/no-stdlib/Coil.toml"
+( cd "$T/no-stdlib" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "stdlib=false auto-refers an ordinary dependency-module prelude" \
+  || bad "replacement prelude" "want rc=42"
+
+# A reachable dependency is loaded by the same LS and therefore cannot recover
+# the compiler bundle. This is the transitive-universe guarantee, not a spelling
+# ban: an explicitly supplied dependency would still be allowed to own that name.
+printf '(module platform.bad)\n(import "coil.os" :as os)\n(defn bad [] (-> i64) 0)\n' > "$T/platform/src/bad.coil"
+printf '(module app)\n(import "platform.bad" :use *)\n(defn main [] (-> i64) (bad))\n' > "$T/no-stdlib/src/main.coil"
+out=$( cd "$T/no-stdlib" && "$COIL" check 2>&1 ); rc=$?
+case "$out" in
+  *"namespace 'coil.os' was not found in the no-stdlib compilation universe"*) universe_diag=1 ;;
+  *) universe_diag=0 ;;
+esac
+[ "$rc" = 1 ] && [ "$universe_diag" = 1 ] \
+  && ok "a transitive dependency cannot recover a bundled stdlib namespace" \
+  || bad "sealed transitive universe" "want located no-stdlib lookup failure, got rc=$rc: $out"
+
+# Restore the positive entry before checking the manifest's two invalid states.
+printf '(module app)\n(defn main [] (-> i64) (platform-answer))\n' > "$T/no-stdlib/src/main.coil"
+printf '[package]\nname = "no-stdlib"\nentry = "src/main.coil"\n\n[language]\nstdlib = false\n' > "$T/no-stdlib/Coil.toml"
+expect_out "stdlib = false requires prelude" \
+  "stdlib=false requires an explicit replacement prelude" \
+  sh -c "cd '$T/no-stdlib' && '$COIL' check"
+printf '[package]\nname = "no-stdlib"\nentry = "src/main.coil"\n\n[language]\nprelude = "platform.prelude"\n' > "$T/no-stdlib/Coil.toml"
+expect_out "prelude requires stdlib = false" \
+  "a replacement prelude cannot coexist with the bundled universe" \
+  sh -c "cd '$T/no-stdlib' && '$COIL' check"
 
 ( cd "$T/dep-lib" && git init -q && git add src/math.coil \
     && git -c user.name=Coil -c user.email=coil@example.invalid commit -qm initial )
@@ -478,8 +515,8 @@ out=$( cd "$T/strict" && "$COIL" build 2>&1 ); rc=$?
   || bad "Git dependency without SHA" "got rc=$rc: $out"
 # a valid manifest still builds
 printf '[package]\nname  = "s"\nentry = "src/main.coil"\n' > "$T/strict/Coil.toml"
-( cd "$T/strict" && rm -f builds/release/s && "$COIL" build >/dev/null 2>&1 )
-[ -x "$T/strict/builds/release/s" ] && ok "a valid manifest still builds" || bad "strict valid manifest" "no ./builds/release/s"
+( cd "$T/strict" && rm -f build/release/s && "$COIL" build >/dev/null 2>&1 )
+[ -x "$T/strict/build/release/s" ] && ok "a valid manifest still builds" || bad "strict valid manifest" "no ./build/release/s"
 
 echo "== namespace index: file placement is irrelevant and paths are rejected =="
 mkdir -p "$T/sib/src/unrelated/place"

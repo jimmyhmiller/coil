@@ -174,7 +174,7 @@ def main() -> int:
         "--flag",
         action="append",
         default=[],
-        help="extra flag for the balance tool (repeatable), e.g. --flag --no-typecheck",
+        help="extra flag for the balance tool (repeatable), e.g. --flag --strict",
     )
     ap.add_argument("--per-file", type=int, default=40, help="max mutants per file (default 40)")
     ap.add_argument("--files", type=int, default=60, help="max source files (default 60)")

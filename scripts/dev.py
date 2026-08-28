@@ -237,8 +237,43 @@ def install_destination(explicit: str | None) -> Path:
     return Path.home() / ".local" / "bin" / "coil"
 
 
+def verified_test_compiler(raw: str) -> str:
+    """Resolve a compiler and prove its matching library works off-checkout.
+
+    Integration gates deliberately change working directory. A loose candidate can
+    appear healthy while invoked from this checkout, then turn every unrelated test
+    into "cannot find the coil standard library" once a worker enters /tmp. Fail once,
+    before the suite, with the actual toolchain-layout problem instead.
+    """
+    compiler = Path(raw).expanduser()
+    if not compiler.is_absolute():
+        compiler = ROOT / compiler
+    compiler = compiler.resolve()
+    if not os.access(compiler, os.X_OK):
+        raise SystemExit(f"test compiler is not executable: {compiler}")
+    with tempfile.TemporaryDirectory(prefix="coil-toolchain-preflight-") as cwd:
+        checked = subprocess.run(
+            [str(compiler), "--version"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+    output = checked.stdout + checked.stderr
+    if (checked.returncode != 0
+            or "stdlib:" not in output
+            or "stdlib: NOT FOUND" in output):
+        detail = output.strip() or f"exit status {checked.returncode} with no diagnostic"
+        raise SystemExit(
+            "test compiler cannot locate its matching standard library from an "
+            f"unrelated working directory:\n  {compiler}\n{detail}\n"
+            "Build the candidate under this checkout (the default is "
+            "build/bin/coil-candidate) or install the compiler and library together."
+        )
+    return str(compiler)
+
+
 def test(args: argparse.Namespace) -> None:
-    compiler = args.compiler
+    compiler = args.compiler if args.suite == "all" else verified_test_compiler(args.compiler)
     if args.suite == "all":
         execute("scripts/compiler/rebootstrap.sh")
     elif args.suite == "snapshots":

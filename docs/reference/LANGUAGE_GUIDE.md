@@ -7,14 +7,18 @@ a native object and links with the system `cc`; the `wasm32-unknown-unknown`
 target instead writes a WebAssembly module directly. Read this end to end before
 writing Coil; most mistakes come from the gotchas marked ⚠.
 
-The compiler is self-contained: the prelude and standard library are bundled
-inside it, so `coil` and every `(import "…")` below work from any directory.
+The compiler and its standard library form one installed toolchain. An installation
+places `coil` beside `lib/coil`, so the matching prelude and library work from any
+directory; a checkout compiler finds the checkout's `src/` tree the same way. A bare
+executable copied elsewhere is not a complete installation. A project may instead
+select a sealed, dependency-supplied library universe with the `[language]` manifest
+section described below.
 
 ## Build & run
 
     coil run   file.coil                 # build + run a single file
-    coil build file.coil                 # release build: builds/release/file
-    coil build file.coil --debug         # DWARF debug build: builds/debug/file
+    coil build file.coil                 # release build: build/release/file
+    coil build file.coil --debug         # DWARF debug build: build/debug/file
     coil build file.coil -o out          # override the output path
     coil install                         # install this package to ~/.local/bin
     coil install --root DIR              # install to DIR/bin instead
@@ -93,20 +97,39 @@ An application embedding `coil.jit` on Linux must link LLVM, for example with
     [link]
     libs = ["m"]             # -> -lm
 
+To compile without any ambient bundled library, select an ordinary module from an
+explicit dependency as the replacement prelude:
+
+    [language]
+    stdlib = false
+    prelude = "platform.prelude"
+
+    [dependencies]
+    platform = { path = "../platform" }
+
+`stdlib = false` removes both the bundled `coil.core` prelude and bundled namespace
+fallback. `platform.prelude` is loaded through the same namespace index as any other
+dependency module, and its public names become the implicit refer-all for every module.
+The root project's choice applies to the complete reachable module graph: a transitive
+dependency cannot silently restore `coil.os`, `coil.io`, or another bundled namespace.
+Language syntax, fundamental types, and compiler primitives remain available; every
+library-shaped API must come from the declared dependency universe. A replacement
+prelude is required when `stdlib` is false and is rejected when `stdlib` is true.
+
 Project tools inherit the same package, native, target, and link configuration as
 `coil build`. **Naming a file inside a project changes only the entry, not the
 configuration**: `coil build src/main.coil`, `coil run src/main.coil` and
 `coil check src/main.coil` resolve the same dependencies and apply the same
 `[cc]`, `[link]` and `[metaprograms]` as the bare command, so an
 `(import "somedep.lib")` that works one way works the other. Build artifacts default
-to `builds/release/<source-stem>` for a named file and `builds/release/<package-name>`
+to `build/release/<source-stem>` for a named file and `build/release/<package-name>`
 for a package. `-g` or `--debug` emits DWARF symbols and selects the corresponding
-`builds/debug/` directory. `-o` overrides the complete path, and `[build] out`
+`build/debug/` directory. `-o` overrides the complete path, and `[build] out`
 overrides the package artifact name. `[build] optimization = 0` (or `1`, `2`,
 `3`) supplies the default `-O` level for manifest builds; an explicit command-line
 `-O` flag takes precedence.
 Outside a project — no `Coil.toml` — a file is compiled on its own, as always.
-`coil new` adds both `/builds` and `/.coil` to the new package's `.gitignore`.
+`coil new` adds both `/build` and `/.coil` to the new package's `.gitignore`.
 
 A fuller project can declare:
 
@@ -1176,6 +1199,17 @@ syntax can opt into the syntax phase:
 
     (checker raw-depth :phase before-expand)
     (transform surface-lowering :phase before-expand)
+
+A transform that must see ordinary macro output but run before resolution and
+typechecking can select the post-expansion boundary:
+
+    (transform lower-expanded-markers :phase after-expand)
+
+This phase runs exactly once. Its output is the authoritative input to ordinary
+resolution and typechecking and does not enter a second macro-expansion pass. It may
+add or remove top-level forms and imports, but any executable macro syntax it emits is
+therefore unresolved output rather than a request to expand again. Semantic reflection
+is unavailable because no checked model exists yet.
 
 An idempotent semantic pass that completes its rewrite in one traversal can use
 `(transform-once FN)`. It receives the same checked whole-program model, but Coil

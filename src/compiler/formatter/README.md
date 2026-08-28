@@ -84,7 +84,6 @@ coil balance <file.coil>              # print the repaired source
 coil balance --check <file.coil>      # exit 1 if the delimiters don't balance
 coil balance --write <file.coil>      # repair in place
 coil balance --strict <file.coil>     # refuse anything indentation doesn't determine
-coil balance --no-typecheck <file>    # indentation alone; don't compile candidates
 ```
 
 Two properties, not heuristics, do the work:
@@ -106,56 +105,24 @@ Where a missing closer goes comes from indentation — the one real insight in P
 a line indented at or left of an open form's column is not inside it. Scoped to one
 damaged region and restricted to insertion, that rule is safe.
 
-## Types finish what indentation locates
+## Plausible structural placement
 
-Indentation cannot separate two balancings of the same *line* — every position on it
-balances and the file reads either way. It also cannot tell a surplus closer from a
-*missing opener*, because those are the same bytes and want opposite repairs.
+Indentation cannot prove the meaning of two balanced readings on the same physical
+line. `balance` does not pretend otherwise, and it also does not make a damaged file's
+unrelated resolver or type errors a prerequisite for repairing its delimiters.
 
-For a missing closer, indentation can still identify the damaged line. `balance` then
-checks the closer at each real item boundary on that line against the program's normal
-resolver and typechecker. That uses the types and arities of the enclosing call, nested
-call, and arguments to select the boundary. Exactly one reading must typecheck:
+The default chooses the line-local boundary derived by the indentation planner, reports
+when that placement was a guess, and emits it immediately. This keeps the tool useful on
+exactly the mid-edit files that cannot compile yet. Use `--strict` when a workflow prefers
+refusal over any within-line indentation guess.
 
-| how the answer was reached | what it takes to write it |
-|---|---|
-| indentation **derived** it (every closer forced to a line boundary) | one confirming compile |
-| indentation locates one line and types prove one item boundary | write that uniquely typed reading |
-| zero or several boundaries typecheck | refuse — types did not determine one reading |
-| the derived repair does not compile | refuse — fix the other errors first, or inspect the indentation-only result |
+The safety boundary remains structural: balanced top-level regions are byte-identical;
+a damaged region is insert-only or delete-only; delimiter kinds must agree; strings must
+terminate; and a repair may never move existing source.
 
-Two details that are load-bearing rather than incidental:
-
-- **Candidates are checked in a forked child.** A front-end run allocates its whole
-  world into the allocator it is handed and never frees it, and reserves a 512 MiB
-  worker stack. Fine once, ruinous in a loop — checking a few dozen candidates in
-  process grew one `coil balance` to gigabytes. Forking makes the OS the deallocator,
-  so peak memory is one compile no matter how many are tried.
-- **Only offsets are retained.** Candidate source text is constructed after the fork
-  and dies with that checker process. The parent keeps a linear list of boundaries and
-  constructs one full source only after a unique winner is known.
-
-Diagnostics from rejected candidates go to a null writer, not stderr. `set-diag-quiet`
-alone is not enough: the pipeline also writes located errors to the writer it's handed,
-and a rejected hypothesis printing over your terminal reads as though `balance` failed.
-
-Candidate typechecking has a five-second budget for the whole search. After two seconds
-`balance` reports that it is still checking; on expiry it kills the checker, writes
-nothing, and prints the exact indentation-only fallback command:
-
-```
-coil balance --no-typecheck --strict --write FILE
-```
-
-SIGINT terminates the search immediately and does not leave a checker child behind.
-
-**What nothing can settle**, always reported with a location: a `)` against a `[`
-(either could be the typo); an unterminated string; a defect needing a delimiter
-*moved*.
-
-`--no-typecheck` decides from indentation alone. It is faster and works on a file that
-does not compile, and it is **the one mode that can still diverge** — it says which
-closers it could not derive, and `--strict` refuses those instead.
+**What balance refuses**, always with a location: a `)` against a `[` (either could be
+the typo); an unterminated string; a defect requiring delimiter movement; or indentation
+that cannot identify even a plausible local boundary.
 
 ## ~/.coil/balance-log.jsonl
 
@@ -177,13 +144,13 @@ that all compile cleanly. The refusals that matter are the ones hit on a real
 half-edited file, and which cause dominates there decides what to fix next. Tuning
 against a synthetic population is how a tool ends up excellent at the wrong problem.
 
-`tried` is the number of item boundaries checked on the one selected line, 1 for a
-fully indentation-derived answer, and 0 when no semantic check ran.
+`guessed` records how many closer positions used the plausible within-line fallback.
+The legacy `tried` and `matches` counters remain in the log schema as zero so existing
+log readers do not break.
 
 Causes are stable slugs, separate from the human sentence, so improving the wording
-doesn't silently reset the statistics keyed on it: `derived`, `typed-boundary`,
-`no-typecheck` for repairs; `no-typed-boundary`, `ambiguous-type-boundary`,
-`multiple-typed-boundaries`,
+doesn't silently reset the statistics keyed on it: `derived` and `plausible` for new
+repairs (historical logs may contain `typed-boundary` and `no-typecheck`);
 `surplus-ambiguous`, `mismatch`, `move-required`, `inside-line`, `no-place`,
 `over-fire`, `underflow`, `indent-disagree`, `unterminated-string` for refusals.
 
