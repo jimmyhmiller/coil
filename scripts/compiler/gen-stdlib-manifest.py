@@ -45,6 +45,8 @@ END = ";; END GENERATED"
 # absent from the discovery list. This is the ONLY hand-maintained knob in the manifest --
 # everything else follows from src/stdlib/.
 INTERNAL_NAMESPACES = {
+    # Profile-selected implementation of the ambient assertion surface.
+    "coil.assert.hermetic",
     "coil.http.parser.types",
     "coil.http.parser.generated",
     # coil.prop's engine room. Importable, but `coil.prop` re-exports everything a
@@ -53,6 +55,17 @@ INTERNAL_NAMESPACES = {
     "coil.prop.rng",
     "coil.prop.runner",
     "coil.prop.shrink",
+}
+
+# The first transitively closed allocation/environment-free profile. Grow this
+# only after the admitted module's complete import/runtime capability closure has
+# been audited. `coil.core` is the separate prelude and has no file mapping here.
+HERMETIC_NAMESPACES = {
+    "coil.assert.hermetic",
+    "coil.control",
+    "coil.primitive",
+    "coil.result",
+    "coil.try",
 }
 
 
@@ -140,6 +153,12 @@ def render(entries: list[tuple[str, str]], sdk_entries: list[tuple[str, str]]) -
     body = [f'(= name "{ns}") "{fn}"' for ns, fn in entries]
     add("  (cond " + "\n        ".join(body))
     add('        ""))')
+    add("")
+    add("; Is this namespace admitted by the allocation/environment-free profile?")
+    add("(defn stdlib-hermetic-namespace? [(name (slice u8))] (-> bool)")
+    body = [f'(= name "{ns}") true' for ns in sorted(HERMETIC_NAMESPACES)]
+    add("  (cond " + "\n        ".join(body))
+    add("        false))")
     add("")
     add("; Is this filename a module of the standard library? `bundled?` in loader.coil")
     add("; is this question: it decides whether a name is resolved from the installed")

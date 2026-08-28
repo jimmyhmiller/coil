@@ -297,6 +297,8 @@ def test(args: argparse.Namespace) -> None:
         test_meta(compiler)
     elif args.suite == "metaprogramming":
         execute("scripts/tests/metaprogramming/compile-and-run/run.sh", compiler)
+    elif args.suite == "core-providers":
+        execute("scripts/tests/core-providers.sh", compiler)
     elif args.suite == "meta-entries":
         # The metaprogram-entry gates, host-independent. Neither ran anywhere
         # for a while -- gate-staged-meta was not invoked by anything at all,
@@ -1174,7 +1176,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "http", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "modernize-fast"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "http", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.set_defaults(func=test)
