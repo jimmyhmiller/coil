@@ -91,6 +91,10 @@ def justification(path: str, op: str, line: str) -> str:
             return "keyword datum assembled for named-constructor syntax"
         if path.endswith("field_syntax_lint.coil") or path.endswith("prelude.coil"):
             return "field/qualified selector datum inspected or emitted as syntax data"
+        if path.endswith("closure.coil"):
+            return "closure capture field selector or named-constructor keyword assembled as syntax data"
+        if path.endswith("derive.coil") or path.endswith("generated_named_constructor.coil"):
+            return "named-constructor keyword assembled as syntax data"
         if path.endswith("code_symbol_is_not_identifier.coil"):
             return "negative fixture proving unscoped datum cannot establish lexical identity"
         if path.startswith("tests/metaprogramming/compile-and-run/staged_"):
@@ -170,6 +174,7 @@ def rendered() -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--write", action="store_true")
     args = parser.parse_args()
     text = rendered()
     bad = [r for r in records() if r["state"] == "unclassified"]
@@ -190,6 +195,10 @@ def main() -> int:
             )
             return 1
         print(f"hygiene audit: {len(records())} classified, 0 unclassified")
+        return 0
+    if args.write:
+        MANIFEST.write_text(text)
+        print(f"wrote {MANIFEST.relative_to(ROOT)} ({len(records())} classified)")
         return 0
     sys.stdout.write(text)
     return 0
