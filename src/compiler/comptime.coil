@@ -12,6 +12,7 @@
 (import "coil.io" :use *)
 (import "coil.control" :use *)
 (import "coil.try" :use *)
+(import "coil.scratch" :as scratch)
 (import "mtrace" :use *)
 (import "ast" :use *)
 (import "ctval" :use *)  ; CtVal / EnvBind / CtCtx — the value model, now on its own
@@ -21,6 +22,116 @@
 (import "parser" :use *)
 (import "coil.reader" :use *)
 (import "resolve" :use *)
+
+; One immutable Code value retained by a compiler SDK session. Candidate state
+; lives in a separate arena until native publication succeeds; commit swaps the
+; arenas in O(1), while abort releases only candidate allocations.
+(defstruct CodeSessionState
+  [(accepted_arena scratch/ScratchArena)
+   (staged_arena scratch/ScratchArena)
+   (accepted Sexp)
+   (staged Sexp)
+   (accepted_monomorphs Sexp)
+   (staged_monomorphs Sexp)
+   (has_accepted bool)
+   (has_staged bool)
+   (has_accepted_monomorphs bool)
+   (has_staged_monomorphs bool)])
+
+(defn code-session-new [(a (dyn Allocator))] (-> (ptr CodeSessionState))
+  (let [state (box! a CodeSessionState (primitive/zeroed CodeSessionState))]
+    (scratch/scratch-init (field state accepted_arena) a)
+    (scratch/scratch-init (field state staged_arena) a)
+    state))
+
+(defn code-session-begin! [(state (ptr CodeSessionState))] (-> i64)
+  (scratch/scratch-reset! (field state staged_arena))
+  (set! (.has_staged state) false)
+  (set! (.has_staged_monomorphs state) false)
+  0)
+
+(defn code-session-abort! [(state (ptr CodeSessionState))] (-> i64)
+  (code-session-begin! state))
+
+(defn code-session-reset! [(state (ptr CodeSessionState))] (-> i64)
+  (scratch/scratch-reset! (field state accepted_arena))
+  (scratch/scratch-reset! (field state staged_arena))
+  (set! (.has_accepted state) false)
+  (set! (.has_staged state) false)
+  (set! (.has_accepted_monomorphs state) false)
+  (set! (.has_staged_monomorphs state) false)
+  0)
+
+(defn code-session-commit! [(state (ptr CodeSessionState))] (-> i64)
+  (if (not (.has_staged state))
+      0
+      (do
+        ; Reset before copying the reusable arena header. Copying first retains
+        ; the old segment pointer in the value copy; reset then frees that
+        ; segment, and installing the stale copy as `staged_arena` makes the
+        ; next transaction free it a second time.
+        (scratch/scratch-reset! (field state accepted_arena))
+        (let [old-accepted (load (field state accepted_arena))]
+        (set! (.accepted_arena state) (.staged_arena state))
+        (set! (.staged_arena state) old-accepted)
+        (set! (.accepted state) (.staged state))
+        (set! (.has_accepted state) true)
+        (if (.has_staged_monomorphs state)
+            (do
+              (set! (.accepted_monomorphs state) (.staged_monomorphs state))
+              (set! (.has_accepted_monomorphs state) true))
+            0)
+        (set! (.has_staged state) false)
+        (set! (.has_staged_monomorphs state) false)
+        0))))
+
+(defn cop-code-session-state [(op i64) (args (ptr (ArrayList CtVal)))
+                              (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (let [raw (load (field cx code_session_state))]
+    (if (= (primitive/cast i64 raw) 0)
+        (Err [CtVal Diag]
+             (derr "retained Code state is only available inside a compiler SDK session"))
+        (let [state (primitive/cast (ptr CodeSessionState) raw)]
+          (cond
+            (= op (primitive/cast i64 76))
+              (match (cv-get args 0)
+                (None [] (Err [CtVal Diag] (derr "code-session-state: expects one default Code value")))
+                (Some [fallback]
+                  (if (not (is-ccode fallback))
+                      (Err [CtVal Diag] (derr "code-session-state: default must be Code"))
+                      (if (.has_accepted state)
+                          (let [stored (primitive/alloc-stack Sexp)]
+                            (set! stored (.accepted state))
+                            (Ok [CtVal Diag]
+                                (CCode (sexp-own-into (load (field cx a)) stored))))
+                          (Ok [CtVal Diag] fallback)))))
+            (= op (primitive/cast i64 78))
+              (if (.has_accepted_monomorphs state)
+                  (let [stored (primitive/alloc-stack Sexp)]
+                    (set! stored (.accepted_monomorphs state))
+                    (Ok [CtVal Diag]
+                      (CCode (sexp-own-into (load (field cx a)) stored))))
+                  (let [(mut empty) (al-new [Sexp] (load (field cx a)))]
+                    (al-push! (mut empty) (sx-sym "monomorph-artifacts"))
+                    (Ok [CtVal Diag]
+                      (CCode (sx-mklist
+                        (box-al [Sexp] (load (field cx a)) (load empty)))))))
+            :else
+              (match (cv-get args 0)
+                (None [] (Err [CtVal Diag] (derr "code-session-stage!: expects one Code value")))
+                (Some [value]
+                  (if (not (is-ccode value))
+                      (Err [CtVal Diag] (derr "code-session-stage!: value must be Code"))
+                      (do
+                        (scratch/scratch-reset! (field state staged_arena))
+                        (let [source (primitive/alloc-stack Sexp)]
+                          (set! source (ccode-of value))
+                          (set! (.staged state)
+                                (sexp-own-into
+                                  (scratch/scratch-allocator (field state staged_arena))
+                                  source)))
+                        (set! (.has_staged state) true)
+                        (Ok [CtVal Diag] (CInt 0)))))))))))
 
 (defn is-aggregate [(c (ptr CtVal))] (-> bool)
   (match (load c)
@@ -2698,6 +2809,92 @@
                           (al-push! (mut xs) (type->code (al-elem [Type] ar (load j))))
                           (set! j (primitive/iadd (load j) 1)))))
               (sx-mklist (box-al [Sexp] a (load xs))))))))
+
+; Attach authoritative mono provenance to the same unpublished Code-state
+; transaction staged by a source metaprogram.  The next edit can therefore
+; invalidate concrete artifacts from the previously accepted program without
+; parsing a mangled spelling or asking the controller to mirror compiler state.
+(defn monomorph-report-push-unique! [(report (mut (ArrayList Sexp)))
+                                     (item Sexp)] (-> i64)
+  (let [(mut found) false]
+    ; Element zero is the `monomorph-artifacts` report tag.
+    (for [i 1 (al-len [Sexp] (load report))]
+      (if (sexp-eq (al-get [Sexp] (load report) i) item)
+          (set! found true)
+          0))
+    (if (load found)
+        0
+        (do
+          (al-push! [Sexp] (mut report) item)
+          0))))
+
+(defn code-session-stage-monomorphs! [(state (ptr CodeSessionState))
+                                      (program (ptr Program))] (-> i64)
+  (if (not (.has_staged state))
+      0
+      (let [a (scratch/scratch-allocator (field state staged_arena))
+            (mut report) (al-new [Sexp] a)
+            origins (load (field program mono_origins))]
+        (al-push! (mut report) (sx-sym "monomorph-artifacts"))
+        ; A retained JIT keeps every accepted native artifact loaded. Its
+        ; structural provenance must have the same lifetime: an unrelated later
+        ; submission must not erase the ownership of an earlier artifact.
+        (if (.has_accepted_monomorphs state)
+            (let [accepted (load (field state accepted_monomorphs))]
+              (for [i 1 (code-node-len accepted)]
+                (let [prior (primitive/alloc-stack Sexp)]
+                  (set! prior (code-node-at accepted i))
+                  (monomorph-report-push-unique! (mut report)
+                    (sexp-own-into a prior)))))
+            0)
+        (if (!= (primitive/cast i64 origins) 0)
+            (let [n (al-len [MonoOrigin] (load origins))]
+              (for [i 0 n]
+                (let [origin (al-elem [MonoOrigin] origins i)
+                      (mut args) (al-new [Sexp] a)
+                      concrete (load (field origin args))]
+                  (for [j 0 (al-len [Type] (load concrete))]
+                    (al-push! (mut args)
+                      (type->code (al-elem [Type] concrete j))))
+                  (let [(mut item) (al-new [Sexp] a)]
+                    (al-push! (mut item) (sx-sym "monomorph"))
+                    (al-push! (mut item) (sx-mkint (.kind origin)))
+                    ; The compiler performs qualification removal while it still
+                    ; owns declaration identity. Consumers compare this reported
+                    ; source artifact with their registry descriptor; they never
+                    ; parse a mangled or module-qualified spelling.
+                    (al-push! (mut item) (sx-mkstr (after-last-dot (.source origin))))
+                    (al-push! (mut item)
+                      (mk-sexp (KVec (box-al [Sexp] a (load args))) -1 -1))
+                    (al-push! (mut item) (sx-mkstr (after-last-dot (.generated origin))))
+                    (al-push! (mut item) (sx-mkstr (.trait_name origin)))
+                    (al-push! (mut item) (sx-mkstr (.impl_source origin)))
+                    (monomorph-report-push-unique! (mut report)
+                      (sx-mklist (box-al [Sexp] a (load item))))))))
+            0)
+        (let [uses (load (field program mono_trait_uses))]
+          (if (!= (primitive/cast i64 uses) 0)
+              (for [i 0 (al-len [MonoTraitUse] (load uses))]
+                (let [use (al-elem [MonoTraitUse] uses i)
+                      (mut item) (al-new [Sexp] a)]
+                  (al-push! (mut item) (sx-sym "trait-use"))
+                  (al-push! (mut item)
+                    (sx-mkstr (after-last-dot (.caller_source use))))
+                  (al-push! (mut item)
+                    (sx-mkstr (after-last-dot (.trait_name use))))
+                  (al-push! (mut item)
+                    (sx-mkstr (after-last-dot (.impl_source use))))
+                  (al-push! (mut item) (sx-mkstr (.method_name use)))
+                  (al-push! (mut item)
+                    (sx-mkstr (after-last-dot (.generated_artifact use))))
+                  (monomorph-report-push-unique! (mut report)
+                    (sx-mklist (box-al [Sexp] a (load item))))))
+              0))
+        (let [source (primitive/alloc-stack Sexp)]
+          (set! source (sx-mklist (box-al [Sexp] a (load report))))
+          (set! (.staged_monomorphs state) (load source)))
+        (set! (.has_staged_monomorphs state) true)
+        0)))
 (defn ty-is-named [(t Type)] (-> bool)
   (match t (TStruct [n] true) (TApp [n a] true) (_ false)))
 (defn ty-name-opt [(t Type)] (-> (slice u8))
@@ -3817,7 +4014,10 @@
                       (or (= op (primitive/cast i64 56)) (= op (primitive/cast i64 73)))))))
       (cop-codearg op args cx)
       (let [a (load (field cx a))]
-        (cond (= op (primitive/cast i64 60))
+        (cond (or (= op (primitive/cast i64 76))
+                  (or (= op (primitive/cast i64 77)) (= op (primitive/cast i64 78))))
+                (cop-code-session-state op args cx)
+              (= op (primitive/cast i64 60))
                 (if (= (al-len [CtVal] (load args)) (primitive/cast i64 0))
                     (Ok [CtVal Diag]
                         (CCode (sx-mklist (box-al [Sexp] a (al-new [Sexp] a)))))
@@ -4586,6 +4786,7 @@
     (set! (.impls pp) (box-al [ImplDef] a (al-new [ImplDef] a)))
     (set! (.metas pp) (box-al [Expr] a (al-new [Expr] a)))
     (set! (.exports pp) (box-al [ExportC] a (al-new [ExportC] a)))
+    (set! (.function_abis pp) (load (field p function_abis)))
     pp))
 
 (defn closure-subprogram [(p (ptr Program)) (wanted (ptr (ArrayList (slice u8)))) (a (dyn Allocator))] (-> (ptr Program))
@@ -4624,6 +4825,7 @@
     (set! (.impls pp) (box-al [ImplDef] a (load keepi)))
     (set! (.metas pp) (box-al [Expr] a (al-new [Expr] a)))
     (set! (.exports pp) (box-al [ExportC] a (al-new [ExportC] a)))
+    (set! (.function_abis pp) (load (field p function_abis)))
     pp))
 (defn is-meta-form [(f (ptr Sexp))] (-> bool)
   (and (= (sx-tag (load f)) (primitive/cast i64 6))

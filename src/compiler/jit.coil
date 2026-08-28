@@ -87,7 +87,12 @@
     (unless (= (primitive/cast i64 f) (primitive/cast i64 0))
       (primitive/call-ptr (primitive/cast (fnptr c [(ptr i8) i64] i64) f) base n))))
 
-(defstruct JitSym [(name (slice u8)) (addr (ptr i8))])
+(defstruct JitSym
+  [(name (slice u8))
+   (addr (ptr i8))
+   ; Base mapping which owns `addr`, or null for a process-wide dlsym. Imported
+   ; symbols retain their original owner across generation chains.
+   (owner (ptr i8))])
 (defstruct JitImage
   [(base (ptr i8))  ; start of the mapping
    (size i64)  ; total mapped bytes
@@ -113,6 +118,68 @@
                     (break)))
                 (set! i (primitive/iadd (load i) 1)))))
     (load r)))
+
+(defn jit-symbol-body [(name (slice u8))] (-> (slice u8))
+  (if (and (> (slice-len name) (primitive/cast i64 0))
+           (= (primitive/cast i64 (slice-get name 0)) (primitive/cast i64 #\_)))
+      (subslice name 1 (slice-len name))
+      name))
+
+(defn jit-symbol-leaf [(name (slice u8))] (-> (slice u8))
+  (let [body (jit-symbol-body name)
+        n (slice-len body)
+        (mut start) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (when (= (primitive/cast i64 (slice-get body (load i)))
+                         (primitive/cast i64 #\.))
+                  (store! start (primitive/iadd (load i) 1))
+                  0)
+                (store! i (primitive/iadd (load i) 1)))))
+    (subslice body (load start) n)))
+
+; An ordinary extern declaration carries a source-level leaf while JIT-defined
+; Coil functions retain their qualified module symbol. Resolve a leaf against a
+; prior image only when it identifies exactly one address. Process-wide dlsym is
+; tried first, so a real C symbol can never be shadowed by this fallback.
+(defn jit-syms-lookup-unique-leaf [(syms (ptr (ArrayList JitSym)))
+                                   (name (slice u8))] (-> (ptr i8))
+  (let [wanted (jit-symbol-leaf name)
+        n (al-len [JitSym] (load syms))
+        (mut i) 0
+        (mut result) (primitive/cast (ptr i8) 0)
+        (mut ambiguous) false]
+    (loop (if (or (load ambiguous) (>= (load i) n))
+              (break)
+              (do
+                (let [symbol (al-at [JitSym] syms (load i))]
+                  (when (= (jit-symbol-leaf (load (field symbol name))) wanted)
+                    (let [address (load (field symbol addr))]
+                      (if (= (primitive/cast i64 (load result)) 0)
+                          (store! result address)
+                          (when (!= (primitive/cast i64 (load result))
+                                    (primitive/cast i64 address))
+                            (store! ambiguous true)
+                            0)))
+                    0))
+                (store! i (primitive/iadd (load i) 1)))))
+    (if (load ambiguous) (primitive/cast (ptr i8) 0) (load result))))
+
+(defn jit-syms-owner-of-address [(syms (ptr (ArrayList JitSym)))
+                                  (address (ptr i8))] (-> (ptr i8))
+  (let [n (al-len [JitSym] (load syms))
+        (mut i) 0
+        (mut owner) (primitive/cast (ptr i8) 0)]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [symbol (al-at [JitSym] syms (load i))]
+                (if (= (primitive/cast i64 (load (field symbol addr)))
+                       (primitive/cast i64 address))
+                    (do (store! owner (load (field symbol owner))) (break))
+                    (store! i (primitive/iadd (load i) 1))))))
+    (load owner)))
 
 (defn jit-align-up [(v i64) (al i64)] (-> i64)
   (primitive/imul (primitive/idiv (primitive/iadd v (primitive/isub al 1)) al) al))
@@ -424,11 +491,33 @@
                                        sect (load (field sy sect))]
                                    (if (= sect (primitive/cast i64 0))
                                        ; undefined: it must already be somewhere in this process
-                                       (let [fp (dlsym (jit-rtld-default) (jit-sym-cstr a (load (field sy name))))]
+                                       (let [process-fp
+                                               (dlsym (jit-rtld-default)
+                                                      (jit-sym-cstr a (load (field sy name))))
+                                             fp
+                                               (if (or (!= (primitive/cast i64 process-fp) 0)
+                                                       (= (primitive/cast i64 prior) 0))
+                                                   process-fp
+                                                   (jit-syms-lookup-unique-leaf
+                                                     (field prior syms)
+                                                     (load (field sy name))))]
                                          (when (= (primitive/cast i64 fp) (primitive/cast i64 0))
                                            (munmap base total)
                                            (break :jit (Err [JitImage JitErr] (jit-undef-err a (load (field sy name))))))
-                                         (store! (primitive/index addrs (load i)) fp))
+                                         (store! (primitive/index addrs (load i)) fp)
+                                         ; Carry the resolved import into the new
+                                         ; image's namespace so the next small
+                                         ; generation can link through this one.
+                                         (let [js (primitive/alloc-stack JitSym)]
+                                           (store! (field js name) (load (field sy name)))
+                                           (store! (field js addr) fp)
+                                           (store! (field js owner)
+                                             (if (or (= (primitive/cast i64 prior) 0)
+                                                     (!= (primitive/cast i64 process-fp) 0))
+                                                 (primitive/cast (ptr i8) 0)
+                                                 (jit-syms-owner-of-address
+                                                   (field prior syms) fp)))
+                                           (al-push! [JitSym] (mut syms) (load js))))
                                        (let [old
                                                (if (and (!= (primitive/cast i64 prior) 0)
                                                         (jit-reload-static? (load (field sy name))))
@@ -453,6 +542,11 @@
                                            (let [js (primitive/alloc-stack JitSym)]
                                              (store! (field js name) (load (field sy name)))
                                              (store! (field js addr) ad)
+                                             (store! (field js owner)
+                                               (if (!= (primitive/cast i64 old) 0)
+                                                   (jit-syms-owner-of-address
+                                                     (field prior syms) old)
+                                                   base))
                                              (al-push! [JitSym] (mut syms) (load js)))))))
                                  (store! i (primitive/iadd (load i) 1)))))
 
