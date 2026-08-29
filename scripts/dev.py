@@ -78,7 +78,13 @@ def build(args: argparse.Namespace) -> None:
     command = [scripts[variant]]
     if args.output:
         command.append(args.output)
-    execute(*command)
+    env = None
+    if args.no_install:
+        if variant != "full":
+            raise SystemExit("--no-install is currently supported only by the full bootstrap")
+        env = os.environ.copy()
+        env["COIL_SKIP_INSTALL"] = "1"
+    execute(*command, env=env)
 
 
 def install_library(prefix: Path) -> Path:
@@ -162,7 +168,7 @@ def install(args: argparse.Namespace) -> None:
     destination = install_destination(args.dest)
     if args.build:
         built = ROOT / "build" / "bin" / "coil"
-        build(argparse.Namespace(variant=args.variant, output=str(built)))
+        build(argparse.Namespace(variant=args.variant, output=str(built), no_install=False))
         source = built
     else:
         source = Path(args.source).expanduser()
@@ -1149,6 +1155,11 @@ def parser() -> argparse.ArgumentParser:
     command = commands.add_parser("build", help="build a compiler candidate or rebuild and verify the compiler")
     command.add_argument("variant", choices=("candidate", "full", "nollvm", "linux", "nollvm-linux", "x64"), nargs="?", default="full")
     command.add_argument("--output")
+    command.add_argument(
+        "--no-install",
+        action="store_true",
+        help="leave the verified compiler in the repository without updating the user-level installation",
+    )
     command.set_defaults(func=build)
 
     command = commands.add_parser(

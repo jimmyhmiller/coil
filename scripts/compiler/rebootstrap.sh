@@ -20,7 +20,8 @@
 # Usage: scripts/compiler/rebootstrap.sh [install-dest]      (default dest: build/bin/coil)
 #        STAGE0=/path/to/coil scripts/compiler/rebootstrap.sh
 # A successful fixed-point build installs both install-dest and the user-level `coil`
-# selected by `scripts/dev.py install`.
+# selected by `scripts/dev.py install`. Set COIL_SKIP_INSTALL=1 to keep the verified
+# artifact local to the checkout and leave the user-level toolchain untouched.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 SRC=src/compiler/main.coil
@@ -111,6 +112,10 @@ cp "$RL3" "$DEST"
 # kernel SIGKILLs a mis-signed binary. Re-sign so the installed compiler runs.
 codesign -s - --force "$DEST" >/dev/null 2>&1 || true
 echo "=== VERIFIED self-host compiler installed -> $DEST ==="
-python3 scripts/dev.py install --source "$DEST" \
-  || { echo "global install FAILED"; exit 1; }
-echo "=== VERIFIED self-host compiler installed globally ==="
+if [ "${COIL_SKIP_INSTALL:-0}" = 1 ]; then
+  echo "=== user-level install skipped (COIL_SKIP_INSTALL=1) ==="
+else
+  python3 scripts/dev.py install --source "$DEST" \
+    || { echo "global install FAILED"; exit 1; }
+  echo "=== VERIFIED self-host compiler installed globally ==="
+fi
