@@ -172,14 +172,15 @@ echo "== code-rest is a view (META_MEMORY phase 5) =="
 
 echo "== executable-relative resources through PATH =="
 HTTP_NATIVE_TARGET=$([ "$HOST_OS" = Linux ] && echo x86_64-linux || echo arm64-macos)
-mkdir -p "$T/path-bin" "$T/real-bin/native/curl/$HTTP_NATIVE_TARGET" "$T/lib/coil"
-cp "$COIL" "$T/real-bin/coil-real"
-# A compiler carries no library, so a copy of one needs a prefix to sit in: for a
-# binary in $T/real-bin that is $T/lib/coil (loader.coil walks up from the executable).
-ln -sfn "$PWD/src/stdlib" "$T/lib/coil/stdlib"
-ln -sfn "$PWD/src/compiler" "$T/lib/coil/compiler"
-ln -sfn "$PWD/src/compiler/prelude.coil" "$T/lib/coil/prelude.coil"
-ln -s "$T/real-bin/coil-real" "$T/path-bin/coil"
+mkdir -p "$T/path-bin" "$T/prefix/bin/native/curl/$HTTP_NATIVE_TARGET" "$T/prefix/lib/coil"
+cp "$COIL" "$T/prefix/bin/coil-real"
+# A compiler carries no library, so the real executable must live in an actual
+# installed prefix: <prefix>/bin beside <prefix>/lib/coil. The PATH entry remains
+# an outside symlink so this still proves argv[0] is resolved to the executable.
+ln -sfn "$PWD/src/stdlib" "$T/prefix/lib/coil/stdlib"
+ln -sfn "$PWD/src/compiler" "$T/prefix/lib/coil/compiler"
+ln -sfn "$PWD/src/compiler/prelude.coil" "$T/prefix/lib/coil/prelude.coil"
+ln -s "$T/prefix/bin/coil-real" "$T/path-bin/coil"
 cp tests/http_client_compile.coil "$T/http.coil"
 cat > "$T/curl-stub.c" <<'EOF'
 void *curl_easy_init(void) { return 0; }
@@ -200,9 +201,9 @@ void *curl_multi_info_read(void *multi, int *remaining) { *remaining = 0; return
 int curl_multi_cleanup(void *multi) { return 0; }
 EOF
 cc -c "$T/curl-stub.c" -o "$T/curl-stub.o"
-ar rcs "$T/real-bin/native/curl/$HTTP_NATIVE_TARGET/libcurl.a" "$T/curl-stub.o"
+ar rcs "$T/prefix/bin/native/curl/$HTTP_NATIVE_TARGET/libcurl.a" "$T/curl-stub.o"
 for archive in libmbedtls.a libmbedx509.a libmbedcrypto.a; do
-  ar rcs "$T/real-bin/native/curl/$HTTP_NATIVE_TARGET/$archive" "$T/curl-stub.o"
+  ar rcs "$T/prefix/bin/native/curl/$HTTP_NATIVE_TARGET/$archive" "$T/curl-stub.o"
 done
 (cd "$T" && PATH="$T/path-bin:$PATH" coil build "$T/http.coil" -o "$T/http") >/dev/null 2>&1 \
   && ok "bare argv[0] resolves bundled HTTP archives beside the executable" \
@@ -2961,7 +2962,8 @@ mkdir -p "$T/loose/lib/coil"
 ln -sfn "$T/bundle" "$T/loose/lib/coil/stdlib"
 cp "$COIL" "$T/loose/coil-candidate"
 codesign -s - --force "$T/loose/coil-candidate" >/dev/null 2>&1 || true
-expect_out "checkout: $T/fakeroot/src/stdlib" \
+FAKEROOT_STDLIB="$(cd "$T/fakeroot" && pwd -P)/src/stdlib"
+expect_out "checkout: $FAKEROOT_STDLIB" \
   "layout: a loose candidate ignores an unrelated ancestor lib/coil" \
   bash -c 'cd "$2" && "$1" --version' _ "$T/loose/coil-candidate" "$T/fakeroot"
 
