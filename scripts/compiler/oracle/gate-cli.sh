@@ -2553,23 +2553,23 @@ expect_rc 1 "guide: an unknown topic is rejected instead of ignored" "$COIL" gui
 expect_out 'Closest topics:' "guide: an unknown topic suggests alternatives" "$COIL" guide testt
 expect_rc 1 "guide: --search requires a query" "$COIL" guide --search
 
-echo "== doc comments (;;): coil doc + the code-doc comptime op =="
-# A `;;` block DIRECTLY above a definition is its documentation; a single `;` is an
-# ordinary comment and must NOT become docs. Both the `doc` subcommand and the
+echo "== doc comments (;;;): coil doc + the code-doc comptime op =="
+# A `;;;` block DIRECTLY above a definition is its documentation; `;` and `;;` are
+# ordinary comments and must NOT become docs. Both the `doc` subcommand and the
 # `(coil.primitive/code-doc NODE)` code op read the same rule off the source text.
 # FAILS on the seed (no `doc` subcommand, `code-doc` is an undefined function).
 mkdir -p "$T/docs"
 cat > "$T/docs/m.coil" <<'EOF'
 (module shapes)
 
-;; A point in 2D space.
+;;; A point in 2D space.
 (defstruct Point [(x i64) (y i64)])
 
-;; Add two numbers together.
-;; Returns their sum.
+;;; Add two numbers together.
+;;; Returns their sum.
 (defn add [(a i64) (b i64)] (-> i64) (coil.primitive/iadd a b))
 
-; internal helper, deliberately NOT documentation
+;; internal helper, deliberately NOT documentation — two semicolons is not enough
 (defn helper [] (-> i64) 0)
 EOF
 expect_rc  0 "doc: exits 0 on a documented module"          "$COIL" doc "$T/docs/m.coil"
@@ -2592,21 +2592,21 @@ expect_out 'A point in 2D space.'      "doc: documents a defstruct too" "$COIL" 
 # the signature is the HEADER only — the body must not leak into the docs
 expect_out '\(defn add \[\(a i64\) \(b i64\)\] \(-> i64\)\)' "doc: shows the signature without the body" \
   "$COIL" doc "$T/docs/m.coil"
-# non-vacuous: the documented `add` MUST be listed while the `;`-commented `helper` must not
+# non-vacuous: the documented `add` MUST be listed while the `;;`-commented `helper` must not
 _dout=$("$COIL" doc "$T/docs/m.coil" 2>&1)
 if echo "$_dout" | grep -q '## add' && ! echo "$_dout" | grep -q 'helper'; then
-  ok "doc: a single-; comment is NOT a doc (add listed, helper not)"
+  ok "doc: a two-semicolon comment is NOT a doc (add listed, helper not)"
 else
-  bad "doc: a single-; comment is NOT a doc (add listed, helper not)" "got: $_dout"
+  bad "doc: a two-semicolon comment is NOT a doc (add listed, helper not)" "got: $_dout"
 fi
 # (coil.primitive/code-doc NODE) sees the same doc from a checker, and "" where there is none
 cat > "$T/docs/op.coil" <<'EOF'
 (module app)
 
-;; Documented on purpose.
+;;; Documented on purpose.
 (defn add [(a i64) (b i64)] (-> i64) (coil.primitive/iadd a b))
 
-; not a doc
+;; not a doc
 (defn plain [] (-> i64) 0)
 
 (defn doc-report [(prog Code)] (-> Code)

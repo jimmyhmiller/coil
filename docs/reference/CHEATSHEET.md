@@ -125,4 +125,4 @@ storage is `(primitive/alloc-static T)`.
 - Struct constructors require every named field exactly once.
 - `match` is exhaustive, and every `if` branch must have the same type.
 - `call` and `block` are reserved names.
-- Use `;;` directly above a definition for API documentation; `;` is a comment.
+- Use `;;;` directly above a definition for API documentation; `;` and `;;` are comments.

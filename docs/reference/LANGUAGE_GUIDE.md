@@ -34,7 +34,7 @@ section described below.
     coil fmt   file.coil                 # print formatted source (--write / --check)
     coil lint  file.coil --fix            # apply the standard safe fixes
     coil lint  file.coil --use my.rules   # add project/policy checkers
-    coil doc   file.coil                 # markdown for the module's `;;`-documented surface
+    coil doc   file.coil                 # markdown for the module's `;;;`-documented surface
     coil namespaces                      # bundled standard-library namespace names
     coil namespace coil.arraylist        # every definition/signature, plus available docs
 
@@ -352,7 +352,7 @@ reader and do not automatically inherit the entry reader.
 
 Use `coil namespaces` to discover every standard-library namespace bundled into
 the installed compiler. `coil namespace NAME` prints the definitions, signatures,
-and available `;;` docs in one of those namespaces. It also accepts a source path,
+and available `;;;` docs in one of those namespaces. It also accepts a source path,
 so `coil namespace src/my_lib.coil` is the namespace inventory for project code.
 When a namespace implements traits, its guide entry states those traits and their
 methods first; treat those methods as the public vocabulary. `coil doc FILE` remains
@@ -1415,17 +1415,17 @@ If Clang can selectively import `ioctl`, lint reports the handwritten declaratio
 the header's neighboring declarations. `:header` is a lint migration annotation,
 not part of the resulting FFI declaration.
 
-## Doc comments (`;;`)
+## Doc comments (`;;;`)
 
-A run of lines starting with `;;` **directly above a definition** is that
-definition's documentation. A single `;` stays an ordinary comment, so documenting
+A run of lines starting with `;;;` **directly above a definition** is that
+definition's documentation. `;` and `;;` stay ordinary comments, so documenting
 something is opt-in and an incidental note never becomes API docs.
 
-    ;; Append v; grows (doubling, min 4) if full.
-    ;; Returns the new length.
+    ;;; Append v; grows (doubling, min 4) if full.
+    ;;; Returns the new length.
     (defn append-one! [T] [(l (mut (ArrayList T))) (v T)] (-> i64) …)
 
-    ; internal note — NOT documentation
+    ;; internal note — NOT documentation
     (defn al-raw [] (-> i64) …)
 
     coil doc src/stdlib/arraylist.coil     ; markdown: name, signature, doc, per definition

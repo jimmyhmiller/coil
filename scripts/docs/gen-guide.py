@@ -52,7 +52,7 @@ TOPICS = [
     ("comptime", "compile-time evaluation, macros, and reflection", ["compile-time", "macro", "macros", "reflection"], "code generation expansion const meta", [("Compile-time: comptime, macros, reflection", None)]),
     ("metaprograms", "whole-program checkers, transforms, and dialects", ["metaprogram", "checker", "checkers", "transform", "transforms"], "dialect whole program lint rewrite", [("Metaprograms: whole-program checkers & transforms", None)]),
     ("ffi", "extern, primitive/native definitions, cimport, and the C ABI", ["extern", "native", "primitive", "cimport", "c-abi"], "foreign C ABI header printf raylib", [("I/O & FFI", None)]),
-    ("docs", ";; documentation comments and generated API docs", ["doc", "comments", "documentation"], "code-doc markdown reference", [("Doc comments (`;;`)", None)]),
+    ("docs", ";;; documentation comments and generated API docs", ["doc", "comments", "documentation"], "code-doc markdown reference", [("Doc comments (`;;;`)", None)]),
     ("tests", "deftest, assert, discovery, filtering, and debug checks", ["test", "testing", "assert", "assertions", "deftest", "discovery"], "runner filter no-run list failure project", [("Tests, assertions, debug checks", "Named test suites")]),
     ("test-suites", "named test suites and project test configuration", ["suite", "suites", "named-tests"], "test roots suffixes project configuration Coil.toml default opt-in", [("Named test suites", "Property-based testing (`coil.prop`)")]),
     ("properties", "property tests, generators, shrinking, and fuzzing", ["property", "property-tests", "prop", "fuzz", "fuzzing"], "generator arbitrary shrink cases seed coverage", [("Property-based testing (`coil.prop`)", "Reserved-name gotchas ⚠")]),

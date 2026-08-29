@@ -240,14 +240,14 @@ With NAME-GROUP, also match the name being defined as the second group."
 
 (defun coil-font-lock-syntactic-face (state)
   "Face for the string or comment described by STATE.
-Coil's convention is that `;;' introduces a doc comment that becomes API
-documentation while a single `;' is an ordinary remark, so the two get
+Coil's convention is that `;;;' introduces a doc comment that becomes API
+documentation while `;' and `;;' are ordinary remarks, so the two get
 different faces."
   (if (nth 3 state)
       font-lock-string-face
     (save-excursion
       (goto-char (nth 8 state))
-      (if (looking-at ";;\\(?:[^;]\\|$\\)")
+      (if (looking-at ";;;")
           font-lock-doc-face
         font-lock-comment-face))))
 
@@ -539,10 +539,9 @@ by scanning the form's own elements, which ignore comments."
 Differs from `lisp-indent-line' in one way, and it matters: a line that
 starts with a single `;' is indented as code rather than shoved out to
 `comment-column'.  Emacs Lisp's convention is that one semicolon means a
-margin comment and two mean a comment about the code; Coil's is the other
-way round — `;' is the ordinary comment and `;;' marks documentation — so
-the Lisp rule would push nearly every comment in a Coil file to column
-forty."
+margin comment; Coil has no margin-comment rung — `;' and `;;' are both
+ordinary comments and `;;;' marks documentation — so the Lisp rule would
+push nearly every comment in a Coil file to column forty."
   (let* ((position (- (point-max) (point)))
          (indent (progn (beginning-of-line)
                         (or indent (calculate-lisp-indent (coil--indent-state)))))
