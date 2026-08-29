@@ -1415,6 +1415,19 @@
    (hit i64)
    (depth i64)])
 
+; A parsed parent span encloses every parsed child span from the same source.
+; Diagnostic-directed tower recovery can therefore skip a disjoint subtree
+; without walking it. Generated parents with absent/cross-source spans remain
+; conservative and are traversed normally.
+(defn tower-disjoint-from-diag? [(tc (ptr TowerCx)) (node (ptr Sexp))] (-> bool)
+  (let [source (sx-source (load node))
+        lo (sx-lo (load node))
+        hi (sx-hi (load node))]
+    (and (= source (load (field tc dsrc)))
+         (and (>= lo (primitive/cast i64 0))
+              (or (< hi (load (field tc dlo)))
+                  (> lo (load (field tc dhi))))))))
+
 ; expand ONE macro call at `node` (already known macro-headed), mirroring
 ; expand-calls' invoke + expansion-record + span-stamp exactly
 (defn tower-expand-call [(tc (ptr TowerCx)) (s (mut LS)) (node (ptr Sexp)) (q (slice u8))] (-> (Result Sexp Diag))
@@ -1422,16 +1435,20 @@
         items (sx-items (load node))
         gs (box-al [StructDef] a (al-new [StructDef] a))
         gu (box-al [SumDef] a (al-new [SumDef] a))]
-    (match (expand-macro (load (field tc macroctx))
-                         q
-                         (rest-from a items 1)
-                         (load (field tc allfns))
-                         gs
-                         gu
-                         (load (field tc impb))
-                         (load (field tc expb))
-                         a
-                         (load (field s code_session_state)))
+    (let [expand-span (tr/span-begin q)
+          expand-result
+            (expand-macro (load (field tc macroctx))
+                          q
+                          (rest-from a items 1)
+                          (load (field tc allfns))
+                          gs
+                          gu
+                          (load (field tc impb))
+                          (load (field tc expb))
+                          a
+                          (load (field s code_session_state)))
+          _expand-end (tr/span-end expand-span)]
+      (match expand-result
       (Err [d] (Err [Sexp Diag] (stamp-call-site d (load node))))
       (Ok [outs]
           (let [op (box-sexp a outs)
@@ -1465,7 +1482,7 @@
             ; branch for another rejected macro call. A genuine outer-to-inner
             ; macro chain is diagnosed by the next checked generation.
             (set! (.hit tc) 1)
-            (Ok [Sexp Diag] (load op)))))))
+            (Ok [Sexp Diag] (load op))))))))
 
 ; Rewrite one call per nested branch, OUTERMOST first. A macro call that CONTAINS
 ; the diag span owns that syntax wholesale — `(when (not b) …)` must expand before
@@ -1478,7 +1495,9 @@
                tg (sx-tag (load node))]
            (if (not (or (= tg (primitive/cast i64 6)) (= tg (primitive/cast i64 7))))
                (Ok [Sexp Diag] (load node))
-               (let [items (sx-items (load node))
+               (if (tower-disjoint-from-diag? tc node)
+                   (Ok [Sexp Diag] (load node))
+                   (let [items (sx-items (load node))
                      n (sx-len items)
                      contains
                        (and (= (sx-source (load node)) (load (field tc dsrc)))
@@ -1523,7 +1542,7 @@
                                                       (KVec (box-al [Sexp] a (load xs)))
                                                       (KList (box-al [Sexp] a (load xs))))
                                                   node)))
-                               (Ok [Sexp Diag] (load node))))))))))))
+                               (Ok [Sexp Diag] (load node)))))))))))))
 
 ; ── the PARSE-LEVEL tower trigger ────────────────────────────────────────────
 ; A macro call whose arguments are not expression syntax at all — objc's
@@ -1837,6 +1856,102 @@
            (store! (field tc hit) (if (load any) 1 0))
            (Ok [i64 Diag] (load (field tc hit)))))))
 
+; Diagnostic recovery used to traverse every syntax node once per diagnostic.
+; Large generated modules make that O(nodes × diagnostics), even though a source
+; span can only occur in the handful of top-level forms that contain that source.
+; Build this small inverted index once per failed generation and restrict each
+; rewrite to the relevant forms. A form is indexed under every source present in
+; its tree, so mixed-source macro output remains correct.
+(defstruct TowerSourceForm [(source i64) (form-index i64)])
+
+(defn tower-source-form-add! [(entries (ptr (ArrayList TowerSourceForm)))
+                              (source i64)
+                              (form-index i64)] (-> i64)
+  (let [n (al-len [TowerSourceForm] (load entries))
+        (mut i) (primitive/isub n 1)
+        (mut found) false]
+    ; Entries are appended in form order. Only the current form's short suffix
+    ; can contain this pair; stop as soon as an older form is reached.
+    (loop (if (or (load found) (< (load i) (primitive/cast i64 0)))
+              (break)
+              (let [entry (al-elem [TowerSourceForm] entries (load i))]
+                (if (!= (load (field entry form-index)) form-index)
+                    (break)
+                    (if (= (load (field entry source)) source)
+                        (store! found true)
+                        (store! i (primitive/isub (load i) 1)))))))
+    (unless (load found)
+      (let [entry (primitive/alloc-stack TowerSourceForm)]
+        (store! (field entry source) source)
+        (store! (field entry form-index) form-index)
+        (al-push! entries (load entry)))
+      0)
+    0))
+
+(defn tower-index-node-sources! [(entries (ptr (ArrayList TowerSourceForm)))
+                                 (node (ptr Sexp))
+                                 (form-index i64)] (-> i64)
+  (tower-source-form-add! entries (sx-source (load node)) form-index)
+  (let [tag (sx-tag (load node))]
+    (when (or (= tag (primitive/cast i64 6)) (= tag (primitive/cast i64 7)))
+      (let [items (sx-items (load node))
+            n (sx-len items)
+            (mut i) 0]
+        (loop (if (>= (load i) n)
+                  (break)
+                  (do
+                    (tower-index-node-sources! entries (al-elem [Sexp] items (load i)) form-index)
+                    (store! i (primitive/iadd (load i) 1))))))
+      0)
+    0))
+
+(defn tower-source-index [(a (dyn Allocator))
+                          (sub-forms (ptr (ArrayList TaggedForm)))] (-> (ptr (ArrayList TowerSourceForm)))
+  (let [(mut entries) (al-new [TowerSourceForm] a)
+        n (al-len [TaggedForm] (load sub-forms))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (tower-index-node-sources! (mut entries)
+                                           (field (al-elem [TaggedForm] sub-forms (load i)) form)
+                                           (load i))
+                (store! i (primitive/iadd (load i) 1)))))
+    (box-al [TowerSourceForm] a (load entries))))
+
+(defn tower-pass-indexed [(tc (ptr TowerCx))
+                          (s (mut LS))
+                          (sub-forms (ptr (ArrayList TaggedForm)))
+                          (index (ptr (ArrayList TowerSourceForm)))] (-> (Result i64 Diag))
+  (try (do
+         (let [n (al-len [TowerSourceForm] (load index))
+               (mut i) 0
+               (mut any) false
+               (mut candidates) 0]
+           (loop (if (>= (load i) n)
+                     (break)
+                     (do
+                       (let [entry (al-elem [TowerSourceForm] index (load i))]
+                         (when (= (load (field entry source)) (load (field tc dsrc)))
+                           (let [tf (al-elem [TaggedForm]
+                                             sub-forms
+                                             (load (field entry form-index)))]
+                             (store! candidates (primitive/iadd (load candidates) 1))
+                             (store! (field tc module) (load (field tf module)))
+                             (store! (field tc hit) 0)
+                             (let [nf (try! (tower-rewrite tc (mut s) (field tf form)))]
+                               (when (!= (load (field tc hit)) (primitive/cast i64 0))
+                                 (store! any true)
+                                 (store! (field tf form) nf)
+                                 0)))
+                           0))
+                       (store! i (primitive/iadd (load i) 1)))))
+           (if (= (load candidates) (primitive/cast i64 0))
+               (tower-pass tc (mut s) sub-forms)
+               (do
+                 (store! (field tc hit) (if (load any) 1 0))
+                 (Ok [i64 Diag] (load (field tc hit)))))))))
+
 ;; A failed sub-program check can report many independent macro-headed call
 ;; sites. Expand all of them against this generation's resolved macro context
 ;; before rebuilding that context. Previously stage3-round used only the first
@@ -1849,12 +1964,14 @@
                         (a (dyn Allocator))] (-> (Result i64 Diag))
   (try (do
          (let [n (al-len [Diag] (load diags))
+               source-index (tower-source-index a sub-forms)
                (mut i) 0
                (mut any) false]
            (loop (if (>= (load i) n)
                      (break)
                      (do
                        (let [dp (al-elem [Diag] diags (load i))
+                             context-span (tr/span-begin "frontend.expand.recover.context")
                              tc
                                (mk-tower-cx (mut s)
                                             sub-forms
@@ -1864,11 +1981,16 @@
                                             (.lo dp)
                                             (.hi dp)
                                             (.source dp))
-                             hit (try! (tower-pass tc (mut s) sub-forms))
+                             _context-end (tr/span-end context-span)
+                             pass-span (tr/span-begin "frontend.expand.recover.pass")
+                             hit (try! (tower-pass-indexed tc (mut s) sub-forms source-index))
+                             _pass-end (tr/span-end pass-span)
+                             called-span (tr/span-begin "frontend.expand.recover.called")
                              hit2
                                (if (= hit (primitive/cast i64 0))
                                    (try! (tower-recover-called tc (mut s) sub-forms macroctx))
-                                   hit)]
+                                   hit)
+                             _called-end (tr/span-end called-span)]
                          (when (!= hit2 (primitive/cast i64 0)) (set! any true) 0))
                        (set! i (primitive/iadd (load i) 1)))))
            (Ok [i64 Diag] (if (load any) 1 0))))))
@@ -2347,7 +2469,9 @@
                     (excluded (ptr (ArrayList (slice u8))))
                     (exclude-closure bool)] (-> (Result i64
                                                         Diag))
-  (tower-capture-metas! a sub-forms original-metas)
+  (let [capture-span (tr/span-begin "frontend.expand.round.capture-metas")]
+    (tower-capture-metas! a sub-forms original-metas)
+    (tr/span-end capture-span))
   ; Each failed tower generation builds a complete tolerant Program and checked
   ; closure. Those are generation-local. Keeping them in the compiler's root arena
   ; retained every failed generation until process exit. A segmented scratch arena
@@ -2402,7 +2526,9 @@
                               (if (>= round (stage3-max-rounds sub-forms))
                                   (Err [i64 Diag]
                                        (derr "metaprogram definition-time expansion did not reach a fixpoint"))
-                                  (let [_release (scratch/scratch-close! work)
+                                  (let [release-span (tr/span-begin "frontend.expand.round.release")
+                                        _release (scratch/scratch-close! work)
+                                        _release-end (tr/span-end release-span)
                                         rr
                                           (stage3-round (mut s)
                                                         sub-forms
@@ -2415,9 +2541,11 @@
                                     rr))
                               ; the closure seeds gain the shim functions under the compiled engine:
                               ; lowering creates calls to them AFTER this walk runs.
-                              (let [seeds (if (meta-compiled?) (meta-shim-seeds wa macroctx quals) quals)
+                              (let [closure-span (tr/span-begin "frontend.expand.round.closure")
+                                    seeds (if (meta-compiled?) (meta-shim-seeds wa macroctx quals) quals)
                                     wanted (closure-funcs macroctx seeds wa)
                                     sub (closure-subprogram macroctx wanted wa)
+                                    _closure-end (tr/span-end closure-span)
                                     checkls (primitive/alloc-stack LS)]
                                 (set! (.a checkls) wa)
                                 (set! (.out checkls) (al-new [TaggedForm] wa))
@@ -2443,7 +2571,9 @@
                                         ; one copy in every recursive tower frame (often
                                         ; 15+ copies and several GiB) even though failures
                                         ; immediately recurse and never consume it.
-                                        (let [tower-out (tower-snapshot a sub-forms nmain)]
+                                        (let [snapshot-span (tr/span-begin "frontend.expand.round.snapshot")
+                                              tower-out (tower-snapshot a sub-forms nmain)
+                                              _snapshot-end (tr/span-end snapshot-span)]
                                           ; compiled engine: lower + build + dlopen the metaprogram dylib
                                           ; ONCE; finish-macro then routes every entry through it.
                                           (let [setup-span (tr/span-begin "frontend.expand.round.engine-setup")
@@ -2471,7 +2601,10 @@
                                                           (Err [d] (Err [i64 Diag] d))
                                                           (Ok [_]
                                                               (do
-                                                                (tower-restore-metas! (mut s) original-metas)
+                                                                (let [restore-span
+                                                                        (tr/span-begin "frontend.expand.round.restore-metas")]
+                                                                  (tower-restore-metas! (mut s) original-metas)
+                                                                  (tr/span-end restore-span))
                                                                 (Ok [i64 Diag] 0)))))))))))
                                     (Err [d]
                                          ; the tower: if the check rejected the sub-program AT a
@@ -2480,19 +2613,27 @@
                                          (if (>= round (stage3-max-rounds sub-forms))
                                              (Err [i64 Diag]
                                                   (derr "metaprogram definition-time expansion did not reach a fixpoint"))
-                                             (match (tower-pass-diags (mut s)
-                                                                      sub-forms
-                                                                      macroctx
-                                                                      quals
-                                                                      (load (field checkls check_diags))
-                                                                      a)
+                                             (let [recover-span
+                                                     (tr/span-begin "frontend.expand.round.recover")
+                                                   recover-result
+                                                     (tower-pass-diags (mut s)
+                                                                       sub-forms
+                                                                       macroctx
+                                                                       quals
+                                                                       (load (field checkls check_diags))
+                                                                       a)
+                                                   _recover-end (tr/span-end recover-span)]
+                                               (match recover-result
                                                (Err [d2] (Err [i64 Diag] d2))
                                                (Ok [hit]
                                                    (if (= hit (primitive/cast i64 0))
                                                        (Err [i64 Diag] d)  ; a real error — surface it untouched
                                                        ; the let defeats self-tail-call elimination (musttail
                                                        ; rejects this frame); depth is bounded by the 64-round cap
-                                                       (let [_release (scratch/scratch-close! work)
+                                                       (let [release-span
+                                                               (tr/span-begin "frontend.expand.round.release")
+                                                             _release (scratch/scratch-close! work)
+                                                             _release-end (tr/span-end release-span)
                                                              rr
                                                                (stage3-round (mut s)
                                                                              sub-forms
@@ -2502,7 +2643,7 @@
                                                                              original-metas
                                                                              excluded
                                                                              exclude-closure)]
-                                                         rr))))))))))))))))))))
+                                                         rr)))))))))))))))))))))
 
 ; ── whole-program CHECKERS ───────────────────────────────────────────────────
 ; `(checker FN)` registers FN — a [(prog Code)] -> Code function — to be run once,
