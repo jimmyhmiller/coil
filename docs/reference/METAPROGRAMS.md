@@ -209,7 +209,8 @@ New API this project added (all shipped):
   program. Every record begins `(decl MODULE KIND QUALIFIED-NAME)`. Functions continue
   with `[PARAM-TYPE…] RET`; structs, sums, traits, consts, and externs need no additional
   fields. The qualified name is the exact identity selected by resolution rather than
-  the spelling used at the call site. The other possible results are `:unresolved` and `:ambiguous`. **Pass a resolved
+  the spelling used at the call site, including through aliases and import renames. The
+  other possible results are `:unresolved` and `:ambiguous`. **Pass a resolved
   REFERENCE node and it resolves to the EXACT entity** the checker picked (via node
   identity), unambiguous even when the simple name lives in several modules. This covers
   every resolved reference: **function calls, function-pointer refs (`fnptr-of`), and

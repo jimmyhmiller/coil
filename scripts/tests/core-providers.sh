@@ -17,7 +17,7 @@ bad() { printf 'FAIL: %s\n%s\n' "$1" "$2"; failed=$((failed + 1)); }
 
 (cd "$ROOT/binding_identity" && "$COIL" check >/dev/null 2>&1)
 rc=$?
-[ "$rc" = 0 ] && ok "semantic reflection exposes canonical identity through a qualified import" \
+[ "$rc" = 0 ] && ok "semantic reflection preserves canonical identity through an import rename" \
   || bad "canonical binding reflection" "resolved function did not expose its fully qualified identity"
 
 (cd "$ROOT/app" && "$COIL" run >/dev/null 2>&1)
