@@ -334,8 +334,8 @@ rebootstrap fixpoint, in the established style.
   it returns a Code record read straight from the checked program:
 
   ```
-  (decl MODULE fn [PARAM-TYPE…] RET) ; function: real module + real signature, walkable Code
-  (decl MODULE KIND)                 ; struct / sum / trait / const / extern
+  (decl MODULE fn QUALIFIED-NAME [PARAM-TYPE…] RET) ; function identity + signature
+  (decl MODULE KIND QUALIFIED-NAME)                 ; struct / sum / trait / const / extern
   :unresolved                        ; no such top-level definition
   :ambiguous                         ; defined in >1 module, can't disambiguate
   ```

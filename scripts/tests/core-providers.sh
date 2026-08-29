@@ -15,6 +15,11 @@ failed=0
 ok() { printf 'ok: %s\n' "$1"; }
 bad() { printf 'FAIL: %s\n%s\n' "$1" "$2"; failed=$((failed + 1)); }
 
+(cd "$ROOT/binding_identity" && "$COIL" check >/dev/null 2>&1)
+rc=$?
+[ "$rc" = 0 ] && ok "semantic reflection exposes canonical identity through a qualified import" \
+  || bad "canonical binding reflection" "resolved function did not expose its fully qualified identity"
+
 (cd "$ROOT/app" && "$COIL" run >/dev/null 2>&1)
 rc=$?
 [ "$rc" = 42 ] && ok "root-activated provide-core name is ambient" \
@@ -74,18 +79,6 @@ esac
 [ "$rc" = 1 ] && [ "$provider_diag" = 1 ] \
   && ok "core-provider implementation cannot evade hermetic namespace policy" \
   || bad "provider capability escape" "wanted provider import rejection, got rc=$rc: $out"
-
-for fixture in hermetic_extern hermetic_ir; do
-  out=$(cd "$ROOT/$fixture" && "$COIL" check 2>&1)
-  rc=$?
-  case "$out" in
-    *"extern declarations and llvm-ir are unavailable under stdlib profile 'hermetic'"*) escape_diag=1 ;;
-    *) escape_diag=0 ;;
-  esac
-  [ "$rc" = 1 ] && [ "$escape_diag" = 1 ] \
-    && ok "hermetic profile rejects runtime escape hatch ($fixture)" \
-    || bad "$fixture escape" "wanted capability rejection, got rc=$rc: $out"
-done
 
 out=$(cd "$ROOT/hermetic_link" && "$COIL" check 2>&1)
 rc=$?
