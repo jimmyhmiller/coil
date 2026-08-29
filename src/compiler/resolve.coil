@@ -44,14 +44,36 @@
 ; build call and the compiler still resolves identically, only slower.
 (defstruct DefEntry [(module (slice u8)) (defs Defs) (idx (HashMap (slice u8) i64)) (built i64)])
 
-(defstruct ParsedForm [(prog (ptr Program)) (module (Option (slice u8)))])
-
 ; A form revision is semantic input identity, not an ArrayList position. `nid`
 ; identifies the authored/generated root and `shape` changes whenever expansion
 ; rewrites its syntax or hygiene metadata. The pair is retained for the lifetime
 ; of the compilation, making duplicate parsing measurable before it becomes a
 ; hard invariant.
-(defstruct FormRevision [(nid i64) (shape i64)])
+(defstruct FormRevision [(form_id i64) (revision i64) (shape i64)])
+(defstruct CachedImplQual [(nid i64) (bare i64)])
+
+(defstruct ResolvedRevision
+  [(revision FormRevision)
+   (module (Option (slice u8)))
+   (prog (ptr Program))
+   ; Raw declaration spellings captured before qualification mutates the AST.
+   (defs Defs)
+   ; Resolution annotations formerly lived only in process-global append-only
+   ; registries. Retain the entries produced by this form so reuse can replay
+   ; them and remain correct even when native metaprogram engines reuse numeric
+   ; node ids.
+   (impl_quals (ArrayList CachedImplQual))
+   (type_resolutions (ArrayList TypeResEntry))
+   (qualified bool)
+   (strict bool)])
+
+(defstruct ParsedForm
+  [(prog (ptr Program))
+   (module (Option (slice u8)))
+   (defs Defs)
+   (entry_index i64)
+   (fresh bool)
+   (source_index i64)])
 
 ; One semantic workspace is owned by a compilation and borrowed by every
 ; expansion view of that compilation. This starts as the explicit lifetime and
@@ -59,7 +81,11 @@
 ; added here rather than being hidden in phase-local statics.
 (defstruct SemanticWorkspace
   [(initialized bool)
-   (seen_revisions (ArrayList FormRevision))])
+   (seen_revisions (ArrayList FormRevision))
+   (resolved_revisions (ArrayList ResolvedRevision))
+   (declaration_table (ptr (ArrayList DefEntry)))
+   (has_declaration_table bool)
+   (next_form_id i64)])
 
 (defn semantic-hash-mix [(h i64) (v i64)] (-> i64)
   (primitive/imul (primitive/ixor h v) 1099511628211))
@@ -108,33 +134,96 @@
                        (primitive/zeroed SemanticWorkspace))]
           (store! (field ws seen_revisions)
                   (al-new [FormRevision] (load (field slot owner))))
+          (store! (field ws resolved_revisions)
+                  (al-new [ResolvedRevision] (load (field slot owner))))
+          (store! (field ws declaration_table)
+                  (primitive/cast (ptr (ArrayList DefEntry)) 0))
+          (store! (field ws has_declaration_table) false)
+          (store! (field ws next_form_id) -1)
           (store! (field slot value) (primitive/cast (ptr i8) ws))
           ws))))
 
-(defn semantic-revision-seen? [(ws (ptr SemanticWorkspace)) (nid i64) (shape i64)] (-> bool)
+(defn semantic-adopt-form! [(ws (ptr SemanticWorkspace)) (tf (ptr TaggedForm))] (-> i64)
+  ; Positive ids originate outside the workspace (loader or a native
+  ; metaprogram image). Negative ids are workspace-owned and survive snapshots.
+  (when (>= (load (field tf form_id)) 0)
+    (store! (field tf form_id) (load (field ws next_form_id)))
+    (store! (field ws next_form_id) (primitive/isub (load (field ws next_form_id)) 1))
+    0)
+  0)
+
+(defn semantic-revision-seen? [(ws (ptr SemanticWorkspace))
+                               (form-id i64)
+                               (revision i64)
+                               (shape i64)] (-> bool)
   (let [n (al-len [FormRevision] (load (field ws seen_revisions)))
         (mut i) 0
         (mut found) false]
     (loop (if (>= (load i) n)
               (break)
               (let [r (al-elem [FormRevision] (field ws seen_revisions) (load i))]
-                (if (and (= (.nid r) nid) (= (.shape r) shape))
+                (if (and (= (.form_id r) form-id)
+                         (and (= (.revision r) revision) (= (.shape r) shape)))
                     (do (store! found true) (break))
                     (store! i (primitive/iadd (load i) 1))))))
     (load found)))
 
-(defn semantic-audit-form-parse! [(s (mut LS)) (form (ptr Sexp))] (-> i64)
+(defn semantic-form-seen? [(ws (ptr SemanticWorkspace)) (form-id i64)] (-> bool)
+  (let [n (al-len [FormRevision] (load (field ws seen_revisions)))
+        (mut i) 0
+        (mut found) false]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [r (al-elem [FormRevision] (field ws seen_revisions) (load i))]
+                (if (= (.form_id r) form-id)
+                    (do (store! found true) (break))
+                    (store! i (primitive/iadd (load i) 1))))))
+    (load found)))
+
+(defn semantic-form-revision-seen? [(ws (ptr SemanticWorkspace))
+                                    (form-id i64)
+                                    (revision i64)] (-> bool)
+  (let [n (al-len [FormRevision] (load (field ws seen_revisions)))
+        (mut i) 0
+        (mut found) false]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [r (al-elem [FormRevision] (field ws seen_revisions) (load i))]
+                (if (and (= (.form_id r) form-id) (= (.revision r) revision))
+                    (do (store! found true) (break))
+                    (store! i (primitive/iadd (load i) 1))))))
+    (load found)))
+
+(defn semantic-freshen-nids! [(node (ptr Sexp))] (-> i64)
+  (store! (field node nid) (next-nid))
+  (let [sx (load node)
+        tag (sx-tag sx)]
+    (when (or (= tag (primitive/cast i64 6)) (= tag (primitive/cast i64 7)))
+      (let [items (sx-items sx)
+            n (sx-len items)
+            (mut i) 0]
+        (loop (if (>= (load i) n)
+                  (break)
+                  (do
+                    (semantic-freshen-nids! (al-elem [Sexp] items (load i)))
+                    (store! i (primitive/iadd (load i) 1))))))
+      0))
+  0)
+
+(defn semantic-audit-form-parse! [(s (mut LS)) (tf (ptr TaggedForm))] (-> i64)
   (let [audit (load (field s semantic_audit))
         ws (semantic-workspace (mut s))
-        nid (load (field form nid))
-        shape (semantic-sexp-shape form)]
+        form-id (load (field tf form_id))
+        revision (load (field tf revision))
+        shape (semantic-sexp-shape (field tf form))]
     (store! (field audit form_parse_attempts)
             (primitive/iadd (load (field audit form_parse_attempts)) 1))
-    (if (semantic-revision-seen? ws nid shape)
+    (if (semantic-revision-seen? ws form-id revision shape)
         (store! (field audit duplicate_form_parses)
                 (primitive/iadd (load (field audit duplicate_form_parses)) 1))
         (let [r (primitive/alloc-stack FormRevision)]
-          (store! (field r nid) nid)
+          (store! (field r form_id) form-id)
+          (store! (field r revision) revision)
           (store! (field r shape) shape)
           (al-push! (mut (field ws seen_revisions)) (load r))
           (store! (field audit unique_form_revisions)
@@ -2564,6 +2653,38 @@
                   (set! i (primitive/iadd (load i) 1))))))
     0))
 
+(defn append-def-names! [(dst (mut (ArrayList (slice u8))))
+                         (src (ptr (ArrayList (slice u8))))] (-> i64)
+  (let [n (al-len [(slice u8)] (load src))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (al-push! (mut dst) (al-get [(slice u8)] (load src) (load i)))
+                (store! i (primitive/iadd (load i) 1))))))
+  0)
+
+(defn merge-defs! [(dst (mut Defs)) (src (ptr Defs))] (-> i64)
+  (append-def-names! (mut (.callables dst)) (field src callables))
+  (append-def-names! (mut (.types dst)) (field src types))
+  (append-def-names! (mut (.traits dst)) (field src traits))
+  (append-def-names! (mut (.convs dst)) (field src convs))
+  (append-def-names! (mut (.externs dst)) (field src externs))
+  (append-def-names! (mut (.consts dst)) (field src consts))
+  (append-def-names! (mut (.methods dst)) (field src methods))
+  0)
+
+(defn program-raw-defs [(a (dyn Allocator))
+                        (module (Option (slice u8)))
+                        (prog (ptr Program))] (-> Defs)
+  (let [tb (box! a TBox (primitive/zeroed TBox))]
+    (set! (.items tb) (al-new [DefEntry] a))
+    (add-module-defs a
+                     tb
+                     (match module (Some [m] m) (None [] ""))
+                     prog)
+    (load (field (al-elem [DefEntry] (field tb items) 0) defs))))
+
 (defn build-deftable [(a (dyn Allocator)) (parsed (ptr (ArrayList ParsedForm)))] (-> (ptr (ArrayList DefEntry)))
   (let [tb (box! a TBox (primitive/zeroed TBox))
         n (al-len [ParsedForm] (load parsed))
@@ -2573,9 +2694,10 @@
               (break)
               (do
                 (let [pf (al-elem [ParsedForm] parsed (load i))]
-                  (match (.module pf)
-                    (Some [m] (add-module-defs a tb m (load (field pf prog))))
-                    (None [] (add-module-defs a tb "" (load (field pf prog))))))
+                  (let [de (table-getc a
+                                       tb
+                                       (match (.module pf) (Some [m] m) (None [] "")))]
+                    (merge-defs! (mut (.defs de)) (field pf defs))))
                 (set! i (primitive/iadd (load i) 1)))))
     ; every module is filled now, so the indexes can be built and can no longer go
     ; stale — nothing adds a definition after this point.
@@ -2587,6 +2709,50 @@
                   (defs-index-build! a (al-elem [DefEntry] (field tb items) (load k)))
                   (set! k (primitive/iadd (load k) 1))))))
     (field tb items)))
+
+(defn def-names-equal? [(a (ptr (ArrayList (slice u8))))
+                        (b (ptr (ArrayList (slice u8))))] (-> bool)
+  (let [n (al-len [(slice u8)] (load a))]
+    (if (!= n (al-len [(slice u8)] (load b)))
+        false
+        (let [(mut i) 0
+              (mut same) true]
+          (loop (if (or (not (load same)) (>= (load i) n))
+                    (break)
+                    (do
+                      (unless (= (al-get [(slice u8)] (load a) (load i))
+                                 (al-get [(slice u8)] (load b) (load i)))
+                        (store! same false)
+                        0)
+                      (store! i (primitive/iadd (load i) 1)))))
+          (load same)))))
+
+(defn defs-equal? [(a (ptr Defs)) (b (ptr Defs))] (-> bool)
+  (and (def-names-equal? (field a callables) (field b callables))
+       (and (def-names-equal? (field a types) (field b types))
+            (and (def-names-equal? (field a traits) (field b traits))
+                 (and (def-names-equal? (field a convs) (field b convs))
+                      (and (def-names-equal? (field a externs) (field b externs))
+                           (and (def-names-equal? (field a consts) (field b consts))
+                                (def-names-equal? (field a methods) (field b methods)))))))))
+
+(defn deftables-equal? [(a (ptr (ArrayList DefEntry)))
+                        (b (ptr (ArrayList DefEntry)))] (-> bool)
+  (let [n (al-len [DefEntry] (load a))]
+    (if (!= n (al-len [DefEntry] (load b)))
+        false
+        (let [(mut i) 0
+              (mut same) true]
+          (loop (if (or (not (load same)) (>= (load i) n))
+                    (break)
+                    (let [x (al-elem [DefEntry] a (load i))
+                          y (al-elem [DefEntry] b (load i))]
+                      (unless (and (= (.module x) (.module y))
+                                   (defs-equal? (field x defs) (field y defs)))
+                        (store! same false)
+                        0)
+                      (store! i (primitive/iadd (load i) 1)))))
+          (load same)))))
 
 (defn build-bareok [(a (dyn Allocator)) (parsed (ptr (ArrayList ParsedForm)))] (-> (ptr (ArrayList (slice u8))))
   (let [sb (box! a SBox (primitive/zeroed SBox))
@@ -3135,6 +3301,99 @@
     (None [] (match b (None [] true) (Some [_] false)))
     (Some [x] (match b (None [] false) (Some [y] (= x y))))))
 
+(defn semantic-revision-find [(ws (ptr SemanticWorkspace))
+                              (module (Option (slice u8)))
+                              (form-id i64)
+                              (revision i64)
+                              (shape i64)] (-> i64)
+  (let [n (al-len [ResolvedRevision] (load (field ws resolved_revisions)))
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [e (al-elem [ResolvedRevision] (field ws resolved_revisions) (load i))]
+                (if (and (= (load (field (field e revision) form_id)) form-id)
+                         (and (= (load (field (field e revision) revision)) revision)
+                              (and (= (load (field (field e revision) shape)) shape)
+                                   (primitive-module-eq? (load (field e module)) module))))
+                    (do (store! found (load i)) (break))
+                    (store! i (primitive/iadd (load i) 1))))))
+    (load found)))
+
+(defn semantic-revision-add! [(ws (ptr SemanticWorkspace))
+                              (module (Option (slice u8)))
+                              (form-id i64)
+                              (revision i64)
+                              (shape i64)
+                              (prog (ptr Program))
+                              (defs Defs)] (-> i64)
+  (let [e (primitive/alloc-stack ResolvedRevision)]
+    (store! (field (field e revision) form_id) form-id)
+    (store! (field (field e revision) revision) revision)
+    (store! (field (field e revision) shape) shape)
+    (store! (field e module) module)
+    (store! (field e prog) prog)
+    (store! (field e defs) defs)
+    (store! (field e impl_quals) (al-new [CachedImplQual] (malloc-allocator)))
+    (store! (field e type_resolutions) (al-new [TypeResEntry] (malloc-allocator)))
+    (store! (field e qualified) false)
+    (store! (field e strict) false)
+    (al-push! (mut (field ws resolved_revisions)) (load e))
+    (primitive/isub (al-len [ResolvedRevision]
+                            (load (field ws resolved_revisions)))
+                   1)))
+
+(defn semantic-capture-resolution! [(entry (ptr ResolvedRevision))
+                                    (impl-start i64)
+                                    (type-start i64)] (-> i64)
+  (store! (field entry impl_quals) (al-new [CachedImplQual] (malloc-allocator)))
+  (store! (field entry type_resolutions) (al-new [TypeResEntry] (malloc-allocator)))
+  (let [src (impl-qual-list)
+        n (al-len [ImplQualEntry] (load src))
+        (mut i) impl-start]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [x (al-elem [ImplQualEntry] src (load i))
+                      c (primitive/alloc-stack CachedImplQual)]
+                  (store! (field c nid) (load (field x nid)))
+                  (store! (field c bare) (load (field x bare)))
+                  (al-push! (mut (field entry impl_quals)) (load c)))
+                (store! i (primitive/iadd (load i) 1))))))
+  (let [src (type-res-list)
+        n (al-len [TypeResEntry] (load src))
+        (mut i) type-start]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (al-push! (mut (field entry type_resolutions))
+                          (al-get [TypeResEntry] (load src) (load i)))
+                (store! i (primitive/iadd (load i) 1))))))
+  0)
+
+(defn semantic-replay-resolution! [(entry (ptr ResolvedRevision))] (-> i64)
+  (let [src (field entry impl_quals)
+        n (al-len [CachedImplQual] (load src))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [x (al-elem [CachedImplQual] src (load i))
+                      out (primitive/alloc-stack ImplQualEntry)]
+                  (store! (field out nid) (load (field x nid)))
+                  (store! (field out bare) (load (field x bare)))
+                  (al-push! (impl-qual-list) (load out)))
+                (store! i (primitive/iadd (load i) 1))))))
+  (let [src (field entry type_resolutions)
+        n (al-len [TypeResEntry] (load src))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (al-push! (type-res-list) (al-get [TypeResEntry] (load src) (load i)))
+                (store! i (primitive/iadd (load i) 1))))))
+  0)
+
 ; Primitive visibility depends only on the current module and the loader's immutable
 ; import/export tables. A resolve pass used to rebuild the complete binding list for
 ; every top-level form—hundreds of times for a normal program—even though adjacent
@@ -3160,21 +3419,122 @@
           (al-push! [PrimitiveBindingsCacheEntry] (mut cache) (load entry))
           bindings))))
 
+; Correctness fallback while qualification annotations are being separated from
+; parsed syntax: if the declaration universe changes, a previously qualified AST
+; cannot safely be reused because a newly introduced declaration may shadow an
+; earlier lookup. Reparse that cached revision now; the audit records this as a
+; duplicate, and the final invariant will remove this path once bindings live in
+; workspace side tables.
+(defn semantic-reparse-pf! [(s (mut LS))
+                            (owner (dyn Allocator))
+                            (tf (ptr TaggedForm))
+                            (pf (ptr ParsedForm))
+                            (primitive-cache (mut (ArrayList PrimitiveBindingsCacheEntry)))] (-> (Result i64 Diag))
+  (semantic-audit-form-parse! (mut s) tf)
+  (let [bindings (primitive-bindings-cached (mut s) (mut primitive-cache) (.module tf))]
+    (primitive-add-hyg-scopes! (mut s) (field tf form) bindings)
+    (parser-set-primitive-bindings! bindings))
+  (let [single (box! owner (ArrayList Sexp) (primitive/zeroed (ArrayList Sexp)))
+        (mut sl) (al-new [Sexp] owner)]
+    (al-push! (mut sl) (.form tf))
+    (set! single (load sl))
+    (match (parse-program owner single)
+      (Err [d] (Err [i64 Diag] d))
+      (Ok [prog]
+          (let [pp (box! owner Program (primitive/zeroed Program))
+                ws (semantic-workspace (mut s))
+                entry (al-elem [ResolvedRevision]
+                               (field ws resolved_revisions)
+                               (load (field pf entry_index)))]
+            (set! pp prog)
+            (let [defs (program-raw-defs owner (.module tf) pp)]
+              (store! (field entry prog) pp)
+              (store! (field entry defs) defs)
+              (store! (field entry qualified) false)
+              (store! (field entry strict) false)
+              (store! (field pf prog) pp)
+              (store! (field pf defs) defs)
+              (store! (field pf fresh) true)
+              (Ok [i64 Diag] 0)))))))
+
+(defn semantic-prepare-table [(owner (dyn Allocator))
+                              (s (mut LS))
+                              (ws (ptr SemanticWorkspace))
+                              (parsed (ptr (ArrayList ParsedForm)))
+                              (out-forms (ptr (ArrayList TaggedForm)))
+                              (primitive-cache (mut (ArrayList PrimitiveBindingsCacheEntry)))] (-> (Result (ptr (ArrayList DefEntry)) Diag))
+  (let [candidate (build-deftable owner parsed)
+        same
+          (and (load (field ws has_declaration_table))
+               (deftables-equal? (load (field ws declaration_table)) candidate))
+        (mut failed) false
+        (mut err) (primitive/zeroed Diag)]
+    (tr/count "semantic.declaration-table-reused" (if same 1 0))
+    (unless same
+      ; Qualification side maps describe the declaration universe. Replace them
+      ; only when that universe changes; an unchanged incremental round extends
+      ; the existing maps for fresh revisions and leaves cached answers intact.
+      (type-res-reset)
+      (src-mod-reset)
+      (let [nf (al-len [TaggedForm] (load out-forms))
+            (mut fi) 0]
+        (loop (if (>= (load fi) nf)
+                  (break)
+                  (let [tf (al-elem [TaggedForm] out-forms (load fi))]
+                    (src-mod-record (sx-source (load (field tf form)))
+                                    (match (load (field tf module))
+                                      (Some [m] m)
+                                      (None [] "")))
+                    (store! fi (primitive/iadd (load fi) 1))))))
+      ; A changed declaration environment invalidates mutation-based qualified
+      ; ASTs. Fresh entries are already raw; rebuild only cached entries.
+      (when (load (field ws has_declaration_table))
+        (let [np (al-len [ParsedForm] (load parsed))
+              (mut i) 0]
+          (loop (if (or (load failed) (>= (load i) np))
+                    (break)
+                    (let [pf (al-elem [ParsedForm] parsed (load i))]
+                      (unless (load (field pf fresh))
+                        (let [tf (al-elem [TaggedForm]
+                                          out-forms
+                                          (load (field pf source_index)))]
+                          (match (semantic-reparse-pf! (mut s)
+                                                       owner
+                                                       tf
+                                                       pf
+                                                       (mut primitive-cache))
+                            (Err [d] (do (store! err d) (store! failed true) 0))
+                            (Ok [_] 0))))
+                      (store! i (primitive/iadd (load i) 1))))))))
+    (if (load failed)
+        (Err [(ptr (ArrayList DefEntry)) Diag] (load err))
+        (let [table
+                (if same
+                    candidate
+                    ; Cached entries may have been reparsed above; rebuild from
+                    ; their newly captured raw declaration summaries.
+                    (build-deftable owner parsed))]
+          (store! (field ws declaration_table) table)
+          (store! (field ws has_declaration_table) true)
+          (Ok [(ptr (ArrayList DefEntry)) Diag] table)))))
+
 (defn resolve-program [(a (dyn Allocator)) (s (mut LS)) (strict bool) (tolerant bool)] (-> (Result (ptr Program) Diag))
   (let [impb (box! a (ArrayList ImpEntry) (primitive/zeroed (ArrayList ImpEntry)))
         expb (box! a (ArrayList ExpEntry) (primitive/zeroed (ArrayList ExpEntry)))
         out-forms (field s out)
         nforms (al-len [TaggedForm] (load out-forms))
+        ws (semantic-workspace (mut s))
+        owner (load (field (load (field s semantic_workspace)) owner))
         pb (box! a PBox (primitive/zeroed PBox))
         parsed (field pb items)
         (mut perr) (primitive/zeroed Diag)
         (mut pfailed) false
         (mut fi) 0
+        (mut cache-hits) 0
         parse-span (tr/span-begin "frontend.resolve.parse")
         (mut primitive-cache) (al-new [PrimitiveBindingsCacheEntry] a)
         (mut dupd) (primitive/zeroed Diag)
         (mut dupfail) false]
-    (semantic-workspace (mut s))
     (semantic-audit-full-resolve! (mut s))
     (set! impb (.imports s))
     (set! expb (.exports s))
@@ -3187,39 +3547,101 @@
         (Err [d] (do (store! dupd d) (store! dupfail true) 0))
         (Ok [_] 0)))
     (set! (.items pb) (al-new [ParsedForm] a))
-    (type-res-reset)  ; fresh type-reference resolution registry for this pass
-    (src-mod-reset)  ; fresh source→module map
-    ; pass 0: parse each tagged form into its own Program
+    ; Pass 0: materialize one parsed entry per form revision. Exact revisions
+    ; already owned by this compilation reuse their Program and raw declaration
+    ; summary. Whether their qualification is reusable is decided only after the
+    ; complete declaration environment has been rebuilt below.
     (loop (if (>= (load fi) nforms)
               (break)
               (do
-                (let [tfp (primitive/alloc-stack TaggedForm)]
-                  (set! tfp (al-get [TaggedForm] (load out-forms) (load fi)))
-                  (semantic-audit-form-parse! (mut s) (field tfp form))
-                  (let [bindings
-                          (primitive-bindings-cached (mut s)
-                                                     (mut primitive-cache)
-                                                     (.module tfp))]
-                    (primitive-add-hyg-scopes! (mut s) (field tfp form) bindings)
-                    (parser-set-primitive-bindings! bindings))
+                (let [tfp (al-elem [TaggedForm] (field s out) (load fi))]
+                  (semantic-adopt-form! ws tfp)
                   ; record which module this source file belongs to (for type-node resolution)
                   (src-mod-record (sx-source (.form tfp))
                                   (match (.module tfp) (Some [m] m) (None [] "")))
-                  (let [single (box! a (ArrayList Sexp) (primitive/zeroed (ArrayList Sexp)))
-                        (mut sl) (al-new [Sexp] a)]
-                    (al-push! (mut sl) (.form tfp))
-                    (set! single (load sl))
-                    (match (parse-program a single)
-                      (Err [d] (unless tolerant (store! perr d) (store! pfailed true) (break)))
-                      (Ok [prog]
-                          (let [pp (box! a Program (primitive/zeroed Program))
-                                pf (primitive/alloc-stack ParsedForm)]
-                            (set! pp prog)
-                            (set! (.prog pf) pp)
-                            (set! (.module pf) (.module tfp))
-                            (al-push! (mut (.items pb)) (load pf)))))))
+                  (let [form-id (load (field tfp form_id))
+                        (mut revision) (load (field tfp revision))
+                        (mut shape) (semantic-sexp-shape (field tfp form))
+                        (mut cached)
+                          (semantic-revision-find ws
+                                                  (.module tfp)
+                                                  form-id
+                                                  (load revision)
+                                                  (load shape))]
+                    ; Rewriting any part creates a new top-level semantic
+                    ; revision. Freshen the complete tree so unchanged children
+                    ; cannot alias annotations retained by the old revision.
+                    (when (< (load cached) 0)
+                      ; A mutation site that did not explicitly advance the
+                      ; revision is repaired here and becomes visible to the
+                      ; invariant audit.
+                      (when (and (semantic-form-seen? ws form-id)
+                                 (semantic-form-revision-seen? ws form-id (load revision)))
+                        (store! revision (primitive/iadd (load revision) 1))
+                        (store! (field tfp revision) (load revision))
+                        0)
+                      ; Reader/metaprogram node counters live in separate native
+                      ; images and can collide. Only host-assigned ids enter the
+                      ; semantic model; exact cached revisions retain them.
+                      (semantic-freshen-nids! (field tfp form))
+                      (store! shape (semantic-sexp-shape (field tfp form)))
+                      0)
+                    (if (>= (load cached) 0)
+                        (let [pf (primitive/alloc-stack ParsedForm)
+                              entry (al-elem [ResolvedRevision]
+                                             (field ws resolved_revisions)
+                                             (load cached))]
+                          (store! cache-hits (primitive/iadd (load cache-hits) 1))
+                          (store! (field pf prog) (load (field entry prog)))
+                          (store! (field pf module) (.module tfp))
+                          (store! (field pf defs) (load (field entry defs)))
+                          (store! (field pf entry_index) (load cached))
+                          (store! (field pf fresh) false)
+                          (store! (field pf source_index) (load fi))
+                          (al-push! (mut (.items pb)) (load pf)))
+                        (do
+                          (semantic-audit-form-parse! (mut s) tfp)
+                          (let [bindings
+                                  (primitive-bindings-cached (mut s)
+                                                             (mut primitive-cache)
+                                                             (.module tfp))]
+                            (primitive-add-hyg-scopes! (mut s) (field tfp form) bindings)
+                            (parser-set-primitive-bindings! bindings))
+                          (let [single (box! owner
+                                             (ArrayList Sexp)
+                                             (primitive/zeroed (ArrayList Sexp)))
+                                (mut sl) (al-new [Sexp] owner)]
+                            (al-push! (mut sl) (.form tfp))
+                            (set! single (load sl))
+                            (match (parse-program owner single)
+                              (Err [d]
+                                   (unless tolerant
+                                     (store! perr d)
+                                     (store! pfailed true)
+                                     (break)))
+                              (Ok [prog]
+                                  (let [pp (box! owner Program (primitive/zeroed Program))
+                                        pf (primitive/alloc-stack ParsedForm)]
+                                    (set! pp prog)
+                                    (let [defs (program-raw-defs owner (.module tfp) pp)
+                                          entry
+                                            (semantic-revision-add! ws
+                                                                    (.module tfp)
+                                                                    form-id
+                                                                    (load revision)
+                                                                    (load shape)
+                                                                    pp
+                                                                    defs)]
+                                      (store! (field pf prog) pp)
+                                      (store! (field pf module) (.module tfp))
+                                      (store! (field pf defs) defs)
+                                      (store! (field pf entry_index) entry)
+                                      (store! (field pf fresh) true)
+                                      (store! (field pf source_index) (load fi))
+                                      (al-push! (mut (.items pb)) (load pf)))))))))))
                 (set! fi (primitive/iadd (load fi) 1)))))
     (tr/span-end parse-span)
+    (tr/count "semantic.form-cache-hits" (load cache-hits))
     (let [audit (load (field s semantic_audit))]
       (tr/count "semantic.full-resolves" (load (field audit full_resolves)))
       (tr/count "semantic.form-parse-attempts" (load (field audit form_parse_attempts)))
@@ -3229,58 +3651,78 @@
         (Err (load dupd))
         (if (load pfailed)
             (Err (load perr))
-            (let [qualify-span (tr/span-begin "frontend.resolve.qualify")
-                  table (build-deftable a parsed)
-                  bareok (build-bareok a parsed)
-                  o (primitive/alloc-stack Out)
-                  np (al-len [ParsedForm] (load parsed))
-                  ; the collect-and-continue sink, allocated once and shared across modules.
-                  rdiags (box! a (ArrayList Diag) (primitive/zeroed (ArrayList Diag)))
-                  rpoison (box! a (ArrayList (slice u8)) (primitive/zeroed (ArrayList (slice u8))))
-                  (mut qerr) (primitive/zeroed Diag)
-                  (mut qfailed) false
-                  (mut qi) 0]
-              (set! rdiags (al-new [Diag] a))
-              (set! rpoison (al-new [(slice u8)] a))
-              (set! (.resolve_diags s) rdiags)
-              (set! (.resolve_poisoned s) rpoison)
-              (init-out o a)
-              (loop (if (>= (load qi) np)
-                        (break)
-                        (do
-                          (let [pf (al-elem [ParsedForm] parsed (load qi))
-                                prog (load (field pf prog))]
-                            (match (.module pf)
-                              (Some [m]
-                                    (let [imp (imports-find impb m)
-                                          cx (primitive/alloc-stack Ctx)]
+            (match (semantic-prepare-table owner
+                                           (mut s)
+                                           ws
+                                           parsed
+                                           (box-al [TaggedForm] owner (load out-forms))
+                                           (mut primitive-cache))
+              (Err [d] (Err [(ptr Program) Diag] d))
+              (Ok [table]
+                  (let [qualify-span (tr/span-begin "frontend.resolve.qualify")
+                        bareok (build-bareok a parsed)
+                        o (primitive/alloc-stack Out)
+                        np (al-len [ParsedForm] (load parsed))
+                        rdiags (box! a (ArrayList Diag) (primitive/zeroed (ArrayList Diag)))
+                        rpoison (box! a (ArrayList (slice u8)) (primitive/zeroed (ArrayList (slice u8))))
+                        (mut qerr) (primitive/zeroed Diag)
+                        (mut qfailed) false
+                        (mut qi) 0]
+                    (set! rdiags (al-new [Diag] a))
+                    (set! rpoison (al-new [(slice u8)] a))
+                    (set! (.resolve_diags s) rdiags)
+                    (set! (.resolve_poisoned s) rpoison)
+                    (init-out o a)
+                    (loop (if (>= (load qi) np)
+                              (break)
+                              (do
+                                (let [pf (al-elem [ParsedForm] parsed (load qi))
+                                      prog (load (field pf prog))
+                                      entry (al-elem [ResolvedRevision]
+                                                     (field ws resolved_revisions)
+                                                     (load (field pf entry_index)))
+                                      needs
+                                        (or (load (field pf fresh))
+                                            (or (not (load (field entry qualified)))
+                                                (and strict (not (load (field entry strict))))))]
+                                  (when needs
+                                    (let [m (match (.module pf) (Some [name] name) (None [] ""))
+                                          imp (imports-find impb m)
+                                          cx (primitive/alloc-stack Ctx)
+                                          impl-start (al-len [ImplQualEntry] (load (impl-qual-list)))
+                                          type-start (al-len [TypeResEntry] (load (type-res-list)))]
                                       (init-ctx cx a m imp table expb bareok strict rdiags rpoison)
                                       (set! (.impb cx) impb)
                                       (match (qualify-program cx prog)
-                                        (Err [d] (do (set! qerr d) (set! qfailed true) (break)))
-                                        (Ok [_] 0))))
-                              (None []
-                                    ; Module-less entry files still need the full
-                                    ; qualification pass. In particular, syntax
-                                    ; introduced by an ambient/core macro carries
-                                    ; its definition module and must resolve there;
-                                    ; skipping this branch left scoped names for
-                                    ; the checker and made hygiene depend on adding
-                                    ; an otherwise-optional `(module ...)` form.
-                                    (let [imp (imports-find impb "")
-                                          cx (primitive/alloc-stack Ctx)]
-                                      (init-ctx cx a "" imp table expb bareok strict rdiags rpoison)
-                                      (set! (.impb cx) impb)
-                                      (match (qualify-program cx prog)
-                                        (Err [d] (do (set! qerr d) (set! qfailed true) (break)))
-                                        (Ok [_] 0)))))
-                            (unless (load qfailed)
-                              (match (merge-into (mut o) prog a)
-                                (Err [d] (do (store! qerr d) (store! qfailed true) (break)))
-                                (Ok [_] 0))))
-                          (set! qi (primitive/iadd (load qi) 1)))))
-              (tr/span-end qualify-span)
-              (if (load qfailed) (Err (load qerr)) (Ok (out->program o a))))))))
+                                        (Err [d]
+                                             (do
+                                               (set! qerr d)
+                                               (set! qfailed true)
+                                               (break)))
+                                        (Ok [_]
+                                            (do
+                                              (semantic-capture-resolution! entry impl-start type-start)
+                                              (store! (field entry qualified) true)
+                                              (when strict
+                                                (store! (field entry strict) true)
+                                                0)))))
+                                    0)
+                                  (unless needs
+                                    (semantic-replay-resolution! entry)
+                                    0)
+                                  (unless (load qfailed)
+                                    (match (merge-into (mut o) prog a)
+                                      (Err [d]
+                                           (do
+                                             (store! qerr d)
+                                             (store! qfailed true)
+                                             (break)))
+                                      (Ok [_] 0))))
+                                (set! qi (primitive/iadd (load qi) 1)))))
+                    (tr/span-end qualify-span)
+                    (if (load qfailed)
+                        (Err (load qerr))
+                        (Ok (out->program o a))))))))))
 
 ; ============================ tables (Cx) ==========================
 ; Sig/StructInfo/SumInfo/Cx. The HashMaps become
