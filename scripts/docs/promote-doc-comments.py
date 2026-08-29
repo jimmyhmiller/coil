@@ -72,6 +72,29 @@ def git(unit_path: Path, *args: str) -> str | None:
     return out.stdout.strip()
 
 
+def drop_ignored(tree: Path, files: list[Path]) -> list[Path]:
+    """Drop gitignored files -- generated `.coil` output is not ours to rewrite.
+
+    Some projects emit Coil (`out/…`, `.coil/build/…`); those files are
+    regenerated from their producer, so migrating them is both invisible (no VCS
+    to review it in) and pointless (the next build overwrites it).
+    """
+    if not files:
+        return files
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(tree), "check-ignore", "--stdin"],
+            input="\n".join(str(f) for f in files), capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return files
+    # rc 0 = some paths ignored, 1 = none ignored, 128 = not a git repo.
+    if proc.returncode not in (0, 1):
+        return files
+    ignored = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    return [f for f in files if str(f) not in ignored]
+
+
 @dataclass
 class Unit:
     """A project or one of its worktrees -- an independently committable tree."""
@@ -123,6 +146,7 @@ def discover(root: Path) -> list[Unit]:
                 if parent is None and "/.worktrees/" in s:
                     continue
                 unit.files.append(f)
+            unit.files = drop_ignored(path, unit.files)
             if not unit.files:
                 continue
 
