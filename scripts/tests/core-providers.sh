@@ -35,15 +35,25 @@ esac
   && ok "reachable provider remains dormant until root activation" \
   || bad "dormant provider" "wanted undefined ambient name, got rc=$rc: $out"
 
-out=$(cd "$ROOT/collision" && "$COIL" check 2>&1)
+(cd "$ROOT/provider_order" && "$COIL" run >/dev/null 2>&1)
 rc=$?
-case "$out" in
-  *"core contribution 'platform-answer' is provided by both"*) collision_diag=1 ;;
-  *) collision_diag=0 ;;
-esac
-[ "$rc" = 1 ] && [ "$collision_diag" = 1 ] \
-  && ok "duplicate core contributions are rejected without order precedence" \
-  || bad "provider collision" "wanted collision diagnostic, got rc=$rc: $out"
+[ "$rc" = 7 ] && ok "a later core provider overrides an earlier one" \
+  || bad "provider order" "wanted the last provider's 7, got $rc"
+
+(cd "$ROOT/override_builtin" && "$COIL" run >/dev/null 2>&1)
+rc=$?
+[ "$rc" = 5 ] && ok "a root provider overrides a built-in profile provider" \
+  || bad "builtin override" "wanted status 5, got $rc"
+
+(cd "$ROOT/override_prelude" && "$COIL" run >/dev/null 2>&1)
+rc=$?
+[ "$rc" = 77 ] && ok "a provider overrides an ambient macro reexported by the prelude" \
+  || bad "prelude macro override" "wanted status 77, got $rc"
+
+(cd "$ROOT/hermetic_assert" && "$COIL" run >/dev/null 2>&1)
+rc=$?
+[ "$rc" = 1 ] && ok "hermetic assertions are replaceable by a board-specific handler" \
+  || bad "hermetic assert override" "wanted status 1 with no trap, got $rc"
 
 (cd "$ROOT/hermetic" && "$COIL" run >/dev/null 2>&1)
 rc=$?

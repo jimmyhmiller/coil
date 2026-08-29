@@ -146,8 +146,18 @@ A module contributes selected declarations to the single ambient namespace
 
 Declaring `provide-core` does not activate the module. Only the root manifest's
 `core-providers` list does that; dependency manifests cannot add ambient names.
-Names not listed in the declaration stay ordinary qualified exports. Two active
-providers contributing the same name are an error, independent of list order.
+Names not listed in the declaration stay ordinary qualified exports.
+
+`core-providers` is **ordered, and a later entry overrides an earlier one**. The
+profile's own ambient providers are activated first, so a root provider outranks
+them: listing a module that provides `println` replaces `coil.print`'s, and under
+`stdlib = "hermetic"` a module providing `assert-eq` replaces the trap-only one
+from `coil.assert.hermetic` -- which is how a board supplies its own fault
+handler. A provider also outranks names the prelude merely reexports, such as
+`when`, so ambient macros are replaceable too, and a provider holding a plain
+function replaces an ambient macro of that name completely. An overridden
+definition is never reached ambiently; it remains available under its own
+module name.
 
 Project tools inherit the same package, native, target, and link configuration as
 `coil build`. **Naming a file inside a project changes only the entry, not the
