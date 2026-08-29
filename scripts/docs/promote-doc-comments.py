@@ -159,8 +159,8 @@ def print_status(units: list[Unit]) -> None:
         print(f"{u.label:{w}}  {branch[:30]:30} {u.dirty:5} {len(u.files):6} "
               f"{u.pending:8} {u.already:6}  {notes}")
     print("-" * (w + 78))
-    ok = [u for u in units if not u.blockers()]
-    blocked = [u for u in units if u.blockers()]
+    ok = [u for u in units if u.pending and not u.blockers()]
+    blocked = [u for u in units if u.pending and u.blockers()]
     print(f"{'TOTAL':{w}}  {'':30} "
           f"{sum(u.dirty for u in units):5} {sum(len(u.files) for u in units):6} "
           f"{sum(u.pending for u in units):8} {sum(u.already for u in units):6}")
@@ -216,6 +216,10 @@ def main() -> int:
     # never left spread across some trees and not others.
     blocked = []
     for u in units:
+        # A tree with nothing to migrate is never written to, so its state cannot
+        # cost anything -- it must not gate the run.
+        if not u.pending:
+            continue
         reasons = [r for r in u.blockers()
                    if not (args.allow_dirty and "uncommitted" in r)
                    and not (args.allow_non_git and "not a git repo" in r)
