@@ -65,6 +65,16 @@ esac
   && ok "provide-core naming an undefined declaration is a located error" \
   || bad "provide-core undefined name" "wanted a located diagnostic, got rc=$rc: $out"
 
+out=$(cd "$ROOT/unprovided_name" && "$COIL" check 2>&1)
+rc=$?
+case "$out" in
+  *"call to undefined function 'secret'"*) unprovided_diag=1 ;;
+  *) unprovided_diag=0 ;;
+esac
+[ "$rc" = 1 ] && [ "$unprovided_diag" = 1 ] \
+  && ok "a name a provider does not provide never becomes ambient" \
+  || bad "unprovided name leak" "wanted 'secret' to be undefined, got rc=$rc: $out"
+
 (cd "$ROOT/hermetic" && "$COIL" run >/dev/null 2>&1)
 rc=$?
 [ "$rc" = 42 ] && ok "hermetic common core and trap-only assertions compile" \
