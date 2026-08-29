@@ -55,6 +55,16 @@ rc=$?
 [ "$rc" = 1 ] && ok "hermetic assertions are replaceable by a board-specific handler" \
   || bad "hermetic assert override" "wanted status 1 with no trap, got $rc"
 
+out=$(cd "$ROOT/undefined_name" && "$COIL" check 2>&1)
+rc=$?
+case "$out" in
+  *"provide-core: 'imaginary' is not defined in module 'undefined.name.core'"*) undef_diag=1 ;;
+  *) undef_diag=0 ;;
+esac
+[ "$rc" = 1 ] && [ "$undef_diag" = 1 ] \
+  && ok "provide-core naming an undefined declaration is a located error" \
+  || bad "provide-core undefined name" "wanted a located diagnostic, got rc=$rc: $out"
+
 (cd "$ROOT/hermetic" && "$COIL" run >/dev/null 2>&1)
 rc=$?
 [ "$rc" = 42 ] && ok "hermetic common core and trap-only assertions compile" \
