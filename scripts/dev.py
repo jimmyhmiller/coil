@@ -798,6 +798,8 @@ def test_modernize_fast(compiler: str) -> None:
       (hashmap/hm-get [i64 i64] m 1)))
 (defn map-put! [(m (mut (hashmap/HashMap i64 i64)))] (-> i64)
   (hashmap/hm-put! [i64 i64] (mut m) 1 42))
+(defn push-none! [(items (mut (arraylist/ArrayList (Option i64))))] (-> i64)
+  (arraylist/al-push! [(Option i64)] (mut items) (None)))
 (defn main [] (-> i64)
   (let [a (malloc-allocator)
         (mut xs) (arraylist/al-new [i64] a)
@@ -819,13 +821,16 @@ def test_modernize_fast(compiler: str) -> None:
                     raise RuntimeError(
                         f"fast modernization gate: collection autofix left {legacy!r}")
             for replacement in ("(= (get forms 0) `ok)", "(len forms)",
-                                "(push! (mut xs) 42)", "(len xs)", "(get xs 0)",
+                                "(push! [i64] (mut xs) 42)", "(len xs)", "(get xs 0)",
                                 "(set! (mut xs) 0 42)", "(empty? xs)",
                                 "(empty? items)", "(len items)", "(get items 0)",
                                 "(len m)", "(get m 1)", "(set! (mut m) 1 42)"):
                 if replacement not in collection_fixed:
                     raise RuntimeError(
                         f"fast modernization gate: missing collection rewrite {replacement!r}")
+            if "(push! [(Option i64)] (mut items) (None))" not in collection_fixed:
+                raise RuntimeError(
+                    "fast modernization gate: collection rewrite dropped explicit type arguments")
             execute(coil, "check", str(collection_probe))
 
         def broken_lint_task() -> None:
@@ -860,6 +865,72 @@ source-roots = ["src"]
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if result.returncode == 0 or before != hashlib.sha256(main.read_bytes()).digest():
                 raise RuntimeError("fast modernization gate: failed project fix was not rolled back atomically")
+
+        def rollback_scale_task() -> None:
+            project = tmp / "rollback-scale"
+            source = project / "src"
+            source.mkdir(parents=True)
+            (project / "Coil.toml").write_text("""[package]
+name = "rollback"
+entry = "src/part0.coil"
+source-roots = ["src"]
+""")
+            (source / "badlint.coil").write_text("""(module rollback.badlint)
+(import "coil.primitive" :as primitive)
+(defn bad-head? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (and (> (primitive/code-count f) 0)
+            (primitive/code-eq (primitive/code-nth f 0) `rollback-trigger))))
+(defn bad-walk [(f Code)] (-> i64)
+  (if (primitive/code-list? f)
+      (if (bad-head? f)
+          (do (primitive/suggest f "transaction rollback probe" `missing) 0)
+          (bad-kids f 0 (primitive/code-count f)))
+      0))
+(defn bad-kids [(f Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n) 0
+      (do (bad-walk (primitive/code-nth f i))
+          (bad-kids f (primitive/iadd i 1) n))))
+(defn bad-modules [(ms Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n) 0
+      (do (bad-walk (primitive/code-nth ms i))
+          (bad-modules ms (primitive/iadd i 1) n))))
+(defn lint-bad [(modules Code)] (-> i64)
+  (bad-modules modules 0 (primitive/code-count modules)))
+(checker lint-bad)
+""")
+            for file_index in range(7):
+                forms = "\n".join(
+                    f"(defn legacy-{file_index}-{form_index} [] (-> bool) "
+                    f"(primitive/icmp-eq {form_index} {form_index}))"
+                    for form_index in range(17)
+                )
+                trigger = ("\n(defn rollback-trigger [] (-> i64) 0)\n"
+                           "(defn force-invalid-fix [] (-> i64) (rollback-trigger))\n"
+                           if file_index == 0 else "\n")
+                imports = ("".join(f'(import "rollback.part{i}")\n' for i in range(1, 7))
+                           if file_index == 0 else "")
+                (source / f"part{file_index}.coil").write_text(
+                    f"(module rollback.part{file_index})\n"
+                    f"{imports}"
+                    "(import \"coil.primitive\" :as primitive)\n"
+                    f"{forms}{trigger}")
+            files = sorted(source.glob("*.coil"))
+            before = {path: hashlib.sha256(path.read_bytes()).digest() for path in files}
+            execute(coil, "check", cwd=project)
+            result = subprocess.run([coil, "lint", "--fix", "--use", "rollback.badlint"],
+                                    cwd=project, text=True, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode == 0:
+                raise RuntimeError("fast modernization gate: invalid scale fix unexpectedly succeeded")
+            if "reverted" not in result.stderr:
+                raise RuntimeError("fast modernization gate: scale rollback did not report reversion")
+            changed = [path for path in files
+                       if hashlib.sha256(path.read_bytes()).digest() != before[path]]
+            if changed:
+                raise RuntimeError(
+                    f"fast modernization gate: scale rollback changed {len(changed)} file(s)")
+            execute(coil, "check", cwd=project)
 
         def breaking_scan_task() -> None:
             project = tmp / "breaking-scan"
@@ -928,6 +999,7 @@ source-roots = ["src"]
             default_lint_task,
             broken_lint_task,
             broken_project_task,
+            rollback_scale_task,
             breaking_scan_task,
         ]
         if has_llvm:
