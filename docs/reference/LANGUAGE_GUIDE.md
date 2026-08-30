@@ -999,17 +999,17 @@ same protocol. Adapter constructors accept any `Iterable`, mint its iterator onc
 and pull only when the result's `next` is called. Its public sequence operations
 are part of the ambient core vocabulary, so no import is required:
 
-    (let [xs (take
-               (filter
-                 (map (range 0 100) (primitive/fnptr-of double))
-                 (primitive/fnptr-of divisible-by-four?))
-               10)]
-      (fold xs 0 (primitive/fnptr-of add)))
+    (let [xs (take 10
+               (filter (primitive/fnptr-of divisible-by-four?)
+                 (map (primitive/fnptr-of double) (range 0 100))))]
+      (fold (primitive/fnptr-of add) 0 xs))
 
 `range` is half-open (`start` through `end - 1`) and itself implements both
 `Iterable` and `Iterator`. Lazy adapters are `map`, `filter`, `take`, `skip`,
 `enumerate`, `chain`, and `zip`. Consumers are `fold`, `count`, `find`, `any?`, and
-`all?`. Mapping and predicates use typed function pointers. No adapter allocates or
+`all?`. Following Clojure, callbacks and counts precede the collection: `map f coll`,
+`filter pred coll`, `take n coll`, `skip n coll`, and `fold f init coll`. Mapping and
+predicates use typed function pointers. No adapter allocates or
 materializes an intermediate collection; `take` therefore safely bounds a pipeline
 whose source iterator can otherwise be infinite.
 

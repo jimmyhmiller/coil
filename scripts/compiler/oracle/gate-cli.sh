@@ -1290,9 +1290,9 @@ cat > "$T/it-lazy.coil" <<'EOF'
 (defn even? [(x i64)] (-> bool) (= (% x 2) 0))
 (defn add [(a i64) (b i64)] (-> i64) (+ a b))
 (defn main [] (-> i64)
-  (fold (take (filter (range 0 100) (coil.primitive/fnptr-of even?)) 3)
+  (fold (coil.primitive/fnptr-of add)
         0
-        (coil.primitive/fnptr-of add)))
+        (take 3 (filter (coil.primitive/fnptr-of even?) (range 0 100)))))
 EOF
 expect_rc 6 "ambient range/filter/take/fold compose lazily through the iterator traits" "$COIL" run "$T/it-lazy.coil"
 
