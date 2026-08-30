@@ -483,9 +483,78 @@ printf '[package]\nname = "git-dep"\nentry = "src/main.coil"\n\n[dependencies]\n
 ( cd "$T/git-dep" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
   && ok "Git dependency imports at its pinned SHA" \
   || bad "Git dependency" "want rc=42"
-[ -d "$T/git-dep/.coil/deps/math-$dep_sha/.git" ] \
-  && ok "Git dependency is cached by name and SHA" \
+[ "$(find "$T/git-dep/.coil/deps" -mindepth 1 -maxdepth 1 -type d -name "*-$dep_sha" | wc -l | tr -d ' ')" = 1 ] \
+  && ok "Git dependency is cached by repository and SHA" \
   || bad "Git dependency cache" "missing pinned checkout"
+
+# A Git subdir is a package boundary: consume its Coil.toml roots, module map,
+# exclusions, transitive Coil dependency, and native flags. Two aliases selecting
+# different packages at one repository/SHA must still materialize one checkout.
+mkdir -p "$T/mono/packages/core/lib" "$T/mono/packages/core/mapped" \
+         "$T/mono/packages/extra/src" "$T/mono/packages/support/src" \
+         "$T/subdir-app/src"
+printf '(module mono.core)\n(defn core-answer [] (-> i64) 20)\n' > "$T/mono/packages/core/lib/core.coil"
+printf '(module mono.hidden)\n(defn hidden [] (-> i64) 99)\n' > "$T/mono/packages/core/lib/hidden.coil"
+printf '(module ignored.sibling)\n(defn sibling [] (-> i64) 99)\n' > "$T/mono/sibling.coil"
+printf '(module placeholder)\n(defn mapped-answer [] (-> i64) 1)\n' > "$T/mono/packages/core/mapped/value.coil"
+printf '(module mono.extra)\n(defn extra-answer [] (-> i64) 20)\n' > "$T/mono/packages/extra/src/extra.coil"
+printf '(module mono.support)\n(defn support-answer [] (-> i64) 1)\n' > "$T/mono/packages/support/src/support.coil"
+printf '#!/bin/sh\nprintf -- "-lm\\n"\n' > "$T/mono/packages/core/native-flags"
+chmod +x "$T/mono/packages/core/native-flags"
+cat > "$T/mono/packages/core/Coil.toml" <<'EOF'
+[package]
+name = "core"
+source-roots = ["lib"]
+exclude = ["lib/hidden.coil"]
+
+[dependencies]
+support = { path = "../support" }
+
+[native-dependencies]
+math = { flags-command = "./native-flags" }
+
+[modules]
+"mono.mapped" = "mapped/value.coil"
+EOF
+printf '[package]\nname = "extra"\nsource-roots = ["src"]\n' > "$T/mono/packages/extra/Coil.toml"
+printf '[package]\nname = "support"\nsource-roots = ["src"]\n' > "$T/mono/packages/support/Coil.toml"
+( cd "$T/mono" && git init -q && git add . \
+    && git -c user.name=Coil -c user.email=coil@example.invalid commit -qm initial )
+mono_sha=$(git -C "$T/mono" rev-parse HEAD)
+git -C "$T/mono" tag v1
+git -C "$T/mono" branch stable
+cat > "$T/subdir-app/src/main.coil" <<'EOF'
+(module app)
+(import "mono.core" :use *)
+(import "mono.extra" :use *)
+(import "mono.support" :use *)
+(import "mono.mapped" :use *)
+(defn main [] (-> i64)
+  (+ (core-answer) (+ (extra-answer) (+ (support-answer) (mapped-answer)))))
+EOF
+printf '[package]\nname = "subdir-app"\nentry = "src/main.coil"\n\n[dependencies]\ncore = { git = "%s", sha = "%s", subdir = "packages/core" }\nextra = { git = "%s", sha = "%s", subdir = "packages/extra" }\n' \
+  "$T/mono" "$mono_sha" "$T/mono" "$mono_sha" > "$T/subdir-app/Coil.toml"
+( cd "$T/subdir-app" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "Git subdirs consume package manifests and compose transitive/native requirements" \
+  || bad "Git subdir package" "want rc=42"
+[ "$(find "$T/subdir-app/.coil/deps" -mindepth 1 -maxdepth 1 -type d -name "*-$mono_sha" | wc -l | tr -d ' ')" = 1 ] \
+  && ok "different Git subdirs at one repository/SHA share a checkout" \
+  || bad "Git subdir shared cache" "wanted exactly one checkout"
+
+printf '[package]\nname = "subdir-app"\nentry = "src/main.coil"\n\n[dependencies]\ncore = { git = "%s", tag = "v1", subdir = "packages/core" }\nextra = { git = "%s", branch = "stable", subdir = "packages/extra" }\n' \
+  "$T/mono" "$T/mono" > "$T/subdir-app/Coil.toml"
+( cd "$T/subdir-app" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "Git dependency tags and branches resolve before selecting subdir packages" \
+  || bad "Git tag/branch dependency" "want rc=42"
+[ "$(find "$T/subdir-app/.coil/deps" -mindepth 1 -maxdepth 1 -type d -name "*-$mono_sha" | wc -l | tr -d ' ')" = 1 ] \
+  && ok "tag, branch, and SHA selectors resolving to one commit share a checkout" \
+  || bad "Git selector shared cache" "wanted exactly one checkout"
+
+printf '[package]\nname = "bad-subdir"\nentry = "src/main.coil"\n\n[dependencies]\nbad = { git = "%s", sha = "%s", subdir = "../escape" }\n' \
+  "$T/mono" "$mono_sha" > "$T/subdir-app/Coil.toml"
+expect_out "subdir must be a relative path that does not escape the checkout" \
+  "Git dependency subdir rejects checkout escape" \
+  sh -c "cd '$T/subdir-app' && '$COIL' check"
 
 # The reader remains strict: unknown sections/keys and malformed dependency specs
 # are located hard errors rather than silent no-ops.
@@ -511,8 +580,8 @@ echo "$out" | grep -qE "Coil.toml:3: unknown key 'entrypoint' in \[package\]" \
 # Git source without an immutable pin
 printf '[package]\nname = "s"\nentry = "src/main.coil"\n\n[dependencies]\nfoo = { git = "https://example.invalid/foo.git" }\n' > "$T/strict/Coil.toml"
 out=$( cd "$T/strict" && "$COIL" build 2>&1 ); rc=$?
-[ "$rc" = 1 ] && echo "$out" | grep -qE "Coil.toml:6: dependency must specify either path, or git together with sha" \
-  && ok "a Git dependency requires a SHA pin" \
+[ "$rc" = 1 ] && echo "$out" | grep -qE "Coil.toml:6: dependency must specify either path, or git together with exactly one of sha, tag, or branch" \
+  && ok "a Git dependency requires exactly one commit selector" \
   || bad "Git dependency without SHA" "got rc=$rc: $out"
 # a valid manifest still builds
 printf '[package]\nname  = "s"\nentry = "src/main.coil"\n' > "$T/strict/Coil.toml"

@@ -93,7 +93,7 @@ An application embedding `coil.jit` on Linux must link LLVM, for example with
     entry = "main.coil"      # default src/main.coil
     [dependencies]
     local_math = { path = "../local-math" }
-    remote_math = { git = "https://example.com/math.git", sha = "0123456789abcdef0123456789abcdef01234567" }
+    remote_math = { git = "https://example.com/math.git", sha = "0123456789abcdef0123456789abcdef01234567", subdir = "packages/math" }
     [link]
     libs = ["m"]             # -> -lm
 
@@ -237,10 +237,18 @@ Dependency names are manifest-local handles, not import prefixes. Coil adds each
 dependency root to the namespace index, so consumers import the namespace declared
 by the dependency's source—for example `"local_math.numeric"`—regardless of where
 that source lives inside the dependency. `path` is relative to the project directory.
-A Git dependency requires a full 40- or 64-digit commit SHA; Coil checks out that
-exact commit under `.coil/deps/<name>-<sha>`. Git branches and tags are deliberately
-not accepted as pins. The string shorthand `local_math = "../local-math"` is
-equivalent to `{ path = "../local-math" }`.
+A Git dependency selects exactly one of `sha`, `tag`, or `branch`; `sha` requires a
+full 40- or 64-digit commit ID. Tags and branches are resolved to a concrete commit
+at the start of each invocation, so they intentionally follow repository updates.
+An optional `subdir` selects a package inside the checkout. It must be
+repository-relative, may not contain an escaping `..`
+component, and must name a directory containing `Coil.toml`. Coil treats that manifest
+as the dependency boundary: its source roots, exclusions, module/reader mappings,
+transitive dependencies, native dependencies, C inputs, and link inputs compose into
+the root build. Repository-relative native paths remain relative to the selected
+package. Checkouts are cached by repository and SHA, so dependencies selecting several
+subpackages at the same pin share one checkout. The string shorthand
+`local_math = "../local-math"` is equivalent to `{ path = "../local-math" }`.
 
 ### Workspaces
 
