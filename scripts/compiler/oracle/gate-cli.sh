@@ -3428,6 +3428,19 @@ EOF
     *$'42\n42'*) ok "repl module form switches namespace and republishes definitions" ;;
     *) bad "repl module form switches namespace and republishes definitions" "$repl_module_out" ;;
   esac
+
+  repl_macro_out=$(printf '%s\n' \
+    '(defn stuff2 [(x Code)] (-> Code) x)' \
+    '(stuff2 (+ 1 2))' \
+    '(defn stuff2 [(x Code)] (-> Code) `(* ~x 2))' \
+    '(stuff2 21)' \
+    '(defn stuff2 [(x Code)] (-> Code) (+ x 1))' \
+    '(stuff2 21)' \
+    ':q' | "$REPL_COIL" repl 2>&1)
+  case "$repl_macro_out" in
+    *"'code' does not implement 'Add'"*$'3\n42\n42'*) ok "repl compiles, invokes, replaces, and transactionally rejects macros" ;;
+    *) bad "repl compiles, invokes, replaces, and transactionally rejects macros" "$repl_macro_out" ;;
+  esac
 fi
 
 echo
