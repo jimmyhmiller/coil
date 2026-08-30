@@ -820,6 +820,38 @@ EOF
   || bad "project lint constant namespaces" "lint rejected the aggregate module graph"
 
 echo "== a compile that cannot finish must SAY SO, not hang or crash =="
+# Macro nontermination must identify the invocation instead of forcing a binary
+# search over generated top-level forms.
+macro_cycle="$PWD/tests/compiler/features/macro_expansion_cycle.coil"
+out=$("$COIL" check "$macro_cycle" 2>&1); rc=$?
+case "$out" in
+  *"macro expansion cycle: \`macro-expansion-cycle.spin\` reproduced the identical invocation syntax"*) macro_cycle_msg=1 ;;
+  *) macro_cycle_msg=0 ;;
+esac
+case "$out" in
+  *"macro_expansion_cycle.coil:7:3"*) macro_cycle_loc=1 ;;
+  *) macro_cycle_loc=0 ;;
+esac
+[ "$macro_cycle_msg" = 1 ] && [ "$macro_cycle_loc" = 1 ] && macro_cycle_diag=1 || macro_cycle_diag=0
+[ "$rc" = 1 ] && [ "$macro_cycle_diag" = 1 ] \
+  && ok "an identical macro expansion cycle stops immediately with macro + call site" \
+  || bad "macro expansion cycle diagnostic" "rc=$rc: $out"
+out=$("$COIL" check "$macro_cycle" --macro-expansion-limit 52 2>&1); rc=$?
+case "$out" in
+  *"budget exhausted while expanding"*"total expansions=53"*"chain depth=1"*) macro_budget_diag=1 ;;
+  *) macro_budget_diag=0 ;;
+esac
+[ "$rc" = 1 ] && [ "$macro_budget_diag" = 1 ] \
+  && ok "macro expansion budget reports macro, total count, and chain depth" \
+  || bad "macro expansion budget diagnostic" "rc=$rc: $out"
+out=$("$COIL" check "$macro_cycle" --trace-macro macro-expansion-cycle.spin 2>&1); rc=$?
+case "$out" in
+  *"macro-expand"*"macro=macro-expansion-cycle.spin"*) macro_trace_diag=1 ;;
+  *) macro_trace_diag=0 ;;
+esac
+[ "$rc" = 1 ] && [ "$macro_trace_diag" = 1 ] \
+  && ok "--trace-macro filters invocation tracing by qualified macro name" \
+  || bad "targeted macro tracing" "rc=$rc: $out"
 # These all used to die with zero output: no message, no location, nothing naming the
 # construct — the worst possible failure for a mistake a typo can cause.
 cat > "$T/runaway.coil" <<'EOF'
