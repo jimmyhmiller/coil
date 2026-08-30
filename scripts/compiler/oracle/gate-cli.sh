@@ -3442,19 +3442,21 @@ EOF
     *) bad "repl compiles, invokes, replaces, and transactionally rejects macros" "$repl_macro_out" ;;
   esac
 
-  repl_unimported_macro_out=$(printf '%s\n' \
+  repl_ambient_derive_out=$(printf '%s\n' \
     '(defstruct Action [(value i64)])' \
+    '(derive Eq Action)' \
+    '(= (Action :value 1) (Action :value 1))' \
     '(derive Debug Action)' \
     ':q' | "$REPL_COIL" repl 2>&1)
-  case "$repl_unimported_macro_out" in
-    *"top-level macro 'derive' is not in scope here"*"| (derive Debug Action)"*)
-      ok "repl diagnoses an unimported top-level macro at the submitted form" ;;
-    *) bad "repl diagnoses an unimported top-level macro at the submitted form" "$repl_unimported_macro_out" ;;
+  case "$repl_ambient_derive_out" in
+    *"true"*"no deriver is registered for trait 'Debug'"*"| (derive Debug Action)"*)
+      ok "repl keeps derive ambient and diagnoses the missing trait module at the submitted form" ;;
+    *) bad "repl keeps derive ambient and diagnoses the missing trait module at the submitted form" "$repl_ambient_derive_out" ;;
   esac
-  case "$repl_unimported_macro_out" in
+  case "$repl_ambient_derive_out" in
     *"| (import \"coil.primitive\" :as primitive)"*)
-      bad "repl never attributes an unimported top-level macro to its synthetic preamble" "$repl_unimported_macro_out" ;;
-    *) ok "repl never attributes an unimported top-level macro to its synthetic preamble" ;;
+      bad "repl never attributes a derive failure to its synthetic preamble" "$repl_ambient_derive_out" ;;
+    *) ok "repl never attributes a derive failure to its synthetic preamble" ;;
   esac
 fi
 
