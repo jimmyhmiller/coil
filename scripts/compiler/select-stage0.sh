@@ -4,6 +4,25 @@
 # Usage after `cd` to the repository root:
 #   select_stage0 <native-seed> <compiler-source> <fallback-backend> [check flags...]
 #
+# Run an old compiler outside the checkout so it cannot mistake the new package
+# manifest for one it understands. Namespace roots carry the source graph explicitly.
+stage0_compat_run() {
+  local stage0="$1"; shift
+  local repo="$PWD"
+  case "$stage0" in
+    /*) ;;
+    *) stage0="$repo/$stage0" ;;
+  esac
+  local command="$1" source="$2"; shift 2
+  case "$source" in
+    /*) ;;
+    *) source="$repo/$source" ;;
+  esac
+  (cd /tmp && \
+    COIL_NAMESPACE_ROOTS="$(dirname "$source")" COIL_STRICT_BUNDLE=0 \
+      "$stage0" "$command" "$source" "$@")
+}
+
 # Sets STAGE0 and STAGE0_BUILD_FLAGS. An explicit STAGE0 is authoritative. Without
 # one, a matching native seed is used when it can compile this checkout; otherwise
 # a compatible installed `coil` is reused, then the committed portable WASM seed
@@ -20,7 +39,7 @@ select_stage0() {
 
   if [ "${COIL_FORCE_WASM_STAGE0:-0}" != 1 ] \
      && [ -x "$native_seed" ] \
-     && COIL_STRICT_BUNDLE=0 "$native_seed" check "$src" "$@" >/dev/null 2>&1; then
+     && stage0_compat_run "$native_seed" check "$src" "$@" >/dev/null 2>&1; then
     STAGE0="$native_seed"
     STAGE0_SOURCE=native
     return 0
@@ -35,7 +54,7 @@ select_stage0() {
   if [ "${COIL_FORCE_WASM_STAGE0:-0}" != 1 ] \
      && [ -n "$installed" ] \
      && [ "$installed" != "$native_seed" ] \
-     && COIL_STRICT_BUNDLE=0 "$installed" check "$src" "$@" >/dev/null 2>&1; then
+     && stage0_compat_run "$installed" check "$src" "$@" >/dev/null 2>&1; then
     STAGE0="$installed"
     STAGE0_SOURCE=installed
     return 0
@@ -47,6 +66,6 @@ select_stage0() {
   STAGE0="$PWD/build/bootstrap/c/coil-bootstrap"
   STAGE0_SOURCE=wasm
   STAGE0_BUILD_FLAGS=(--backend "$fallback_backend")
-  COIL_STRICT_BUNDLE=0 "$STAGE0" check "$src" "$@" >/dev/null 2>&1 \
+  stage0_compat_run "$STAGE0" check "$src" "$@" >/dev/null 2>&1 \
     || { echo "WASM stage0 cannot compile the current source tree" >&2; return 1; }
 }

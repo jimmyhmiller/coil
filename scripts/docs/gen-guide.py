@@ -152,7 +152,7 @@ for canonical, _, _, _, fragments in TOPICS:
 out = (
     "; src/compiler/guide.coil — GENERATED from docs/reference/*.md.\n"
     "; Do not edit by hand; regenerate with: python3 scripts/docs/gen-guide.py\n"
-    "(module guide)\n\n"
+    "(module coil.compiler.guide)\n\n"
     "(defn guide-text [] (-> (slice u8))\n  \"" + coil_escape(GUIDE) + "\")\n\n"
     "(defn guide-toc-text [] (-> (slice u8))\n  \"" + coil_escape(toc) + "\")\n\n"
     + cond_function("guide-canonical-topic", canonical_rows, "") + "\n\n"

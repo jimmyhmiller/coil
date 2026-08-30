@@ -199,6 +199,7 @@ A fuller project can declare:
 
     [native-dependencies]
     libcurl = { pkg-config = "libcurl" }
+    llvm = { flags-command = "llvm-config --ldflags --libs --system-libs" }
 
     [test]
     roots = ["tests"]
@@ -225,6 +226,13 @@ Native objects and depfiles live under `.coil/build/native/`; sources and header
 are rebuilt only when their inputs or toolchain configuration change. Test runners
 use collision-free paths under `.coil/build/test/`.
 
+A native dependency selects exactly one discovery provider. `pkg-config` names a
+package whose link flags Coil queries in the usual way. `flags-command` runs a
+project-owned configuration command and treats its whitespace-separated stdout as
+linker arguments; it is intended for libraries such as LLVM that ship a dedicated
+`*-config` tool but no pkg-config metadata. A nonzero provider exit stops the build
+before compilation.
+
 Dependency names are manifest-local handles, not import prefixes. Coil adds each
 dependency root to the namespace index, so consumers import the namespace declared
 by the dependency's source—for example `"local_math.numeric"`—regardless of where
@@ -233,6 +241,30 @@ A Git dependency requires a full 40- or 64-digit commit SHA; Coil checks out tha
 exact commit under `.coil/deps/<name>-<sha>`. Git branches and tags are deliberately
 not accepted as pins. The string shorthand `local_math = "../local-math"` is
 equivalent to `{ path = "../local-math" }`.
+
+### Workspaces
+
+A repository containing several packages uses a `[workspace]` root instead of a
+root `[package]`:
+
+    [workspace]
+    name = "tools"
+    members = ["src/apps/*", "src/libraries/*"]
+
+Each matched member directory contains its own `Coil.toml` with a `[package]`
+name. A member's namespace is `<workspace>.<package>` plus at least one module
+segment: package `parser` in workspace `tools` may declare
+`tools.parser.syntax`, but not exactly `tools.parser`. The namespace index reports
+an incorrectly owned module at its source path.
+
+Workspace members compile as one namespace graph and import each other without
+dependency declarations. `check`, `build`, `lint`, and `fmt` at the workspace
+root fan out over executable members; a member with no `entry` is a library and is
+compiled through the executable members that import it. Command-line flags are
+forwarded to each member. Package `source-roots` and `exclude` settings still own
+source discovery and namespace indexing, so excluded fixtures do not create
+duplicate or incorrectly owned modules. A workspace-level `tests/` directory is
+also indexed without becoming a package.
 
 `[readers]` associates a source suffix with an ordinary Coil module containing one
 `reader-provider`. Imported files with that suffix are read by the provider and

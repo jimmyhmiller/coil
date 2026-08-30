@@ -178,7 +178,7 @@ types at the call site. An extern not in the table is a **hard error** (never a
 silent no-op) — add it to the table to support it.
 
 This is self-contained (no `dlsym`): the libc symbols are declared as
-module-qualified `interp.*` externs (so the Coil scope name never collides while
+module-qualified `coil.compiler.interp.*` externs (so the Coil scope name never collides while
 the C symbol is the real one, e.g. `interp.write` -> `write`), with signatures
 matching the compiler's existing declarations of those symbols.
 

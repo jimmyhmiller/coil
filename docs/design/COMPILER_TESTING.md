@@ -63,7 +63,7 @@ Cheap, fast, and they convert "the suite is green" from a hope into evidence.
 Three enablers, all confirmed working in this tree:
 
 1. **Compiler modules are importable by name.** A test file anywhere (even
-   outside the repo) can `(import "resolve" :use *)` and call
+   outside the repo) can `(import "coil.compiler.resolve" :use *)` and call
    `find-coloncolon` directly — the namespace scan finds `src/compiler/`.
    Nothing to build.
 2. **`coil.subprocess`** has `spawn`, `run` with captured stdout/stderr,
@@ -88,10 +88,11 @@ So compiler tests come in three flavors, cheapest first:
   the checks that are genuinely about the process: `--fix` atomic rollback,
   "check writes no object file", crash-signal semantics.
 
-**Cost note:** importing `check` pulls a large dependency cone. Prefer a few
+**Cost note:** importing `coil.compiler.check` pulls a large dependency cone. Prefer a few
 aggregate test binaries (one `unit_test.coil` importing many small test
 modules) over per-file binaries, and keep the pure-unit tier importing narrow
-modules (`resolve`, `diag`, `parser`) where possible.
+modules (`coil.compiler.resolve`, `coil.compiler.diag`,
+`coil.compiler.parser`) where possible.
 
 ## 4. The testkit
 

@@ -101,7 +101,8 @@ points (`build` via LLVM, `emit-ir`) and `__normalize` are injected into
 `driver-main` as **function pointers**. The two top files differ only in what they
 inject:
 
-- `src/compiler/main.coil` imports `codegen.coil`/`normalize.coil` and injects the
+- `src/compiler/main.coil` imports `coil.compiler.codegen` and
+  `coil.compiler.normalize`, then injects the
   real LLVM entry points → full compiler, links libLLVM.
 - `src/compiler/main_a64.coil` imports neither and injects hard-error stubs → no
   reference to any LLVM symbol → links no libLLVM.

@@ -22,7 +22,7 @@ stage0_check() {
   # one compatibility probe discover newly added source-tree namespaces; the
   # compiler it produces embeds today's manifest and all later stages run with
   # strict bundle checking again.
-  out=$(COIL_STRICT_BUNDLE=0 "$stage0" check "$src" "$@" 2>&1)
+  out=$(stage0_compat_run "$stage0" check "$src" "$@" 2>&1)
   [ $? -eq 0 ] && return 0
 
   echo "stage0 cannot compile the current source tree." >&2

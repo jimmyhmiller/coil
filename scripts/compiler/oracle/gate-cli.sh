@@ -519,6 +519,64 @@ printf '[package]\nname  = "s"\nentry = "src/main.coil"\n' > "$T/strict/Coil.tom
 ( cd "$T/strict" && rm -f build/release/s && "$COIL" build >/dev/null 2>&1 )
 [ -x "$T/strict/build/release/s" ] && ok "a valid manifest still builds" || bad "strict valid manifest" "no ./build/release/s"
 
+# Native libraries that do not ship pkg-config metadata can expose their linker
+# argv through their own config tool. The command is manifest-owned and its stdout
+# is split into the same link tokens pkg-config would have supplied.
+mkdir -p "$T/native-flags-command/src"
+printf '(module app)\n(defn main [] (-> i64) 0)\n' > "$T/native-flags-command/src/main.coil"
+printf '#!/bin/sh\nprintf -- "-lm\\n"\n' > "$T/native-flags-command/native-flags"
+chmod +x "$T/native-flags-command/native-flags"
+printf '[package]\nname = "native-flags-command"\nentry = "src/main.coil"\n\n[native-dependencies]\nmath = { flags-command = "./native-flags" }\n' > "$T/native-flags-command/Coil.toml"
+( cd "$T/native-flags-command" && "$COIL" build >/dev/null 2>&1 )
+[ -x "$T/native-flags-command/build/release/native-flags-command" ] \
+  && ok "native dependency linker flags can come from a config command" \
+  || bad "native flags-command" "project did not build"
+
+printf '[package]\nname = "s"\nentry = "src/main.coil"\n\n[native-dependencies]\nbad = { pkg-config = "zlib", flags-command = "./flags" }\n' > "$T/strict/Coil.toml"
+expect_out "exactly one of pkg-config or flags-command" \
+  "native dependencies reject ambiguous providers" \
+  sh -c "cd '$T/strict' && '$COIL' build"
+
+echo "== workspace roots own package namespaces and forward commands =="
+mkdir -p "$T/workspace/members/app" "$T/workspace/members/util"
+cat > "$T/workspace/Coil.toml" <<'EOF'
+[workspace]
+name = "demo"
+members = ["members/*"]
+EOF
+cat > "$T/workspace/members/app/Coil.toml" <<'EOF'
+[package]
+name = "app"
+entry = "main.coil"
+EOF
+cat > "$T/workspace/members/app/main.coil" <<'EOF'
+(module demo.app.main)
+(import "demo.util.math" :use [answer])
+(defn main [] (-> i64)
+  (let [legacy \-]
+    (if (= legacy legacy) (answer) 0)))
+EOF
+cat > "$T/workspace/members/util/Coil.toml" <<'EOF'
+[package]
+name = "util"
+EOF
+cat > "$T/workspace/members/util/math.coil" <<'EOF'
+(module demo.util.math)
+(export answer)
+(defn answer [] (-> i64) 42)
+EOF
+( cd "$T/workspace" && "$COIL" lint --fix >/dev/null 2>&1 ) \
+  && grep -q '#\\-' "$T/workspace/members/app/main.coil" \
+  && ok "workspace lint forwards --fix to executable members" \
+  || bad "workspace lint --fix" "command failed or member source was not fixed"
+( cd "$T/workspace" && "$COIL" check >/dev/null 2>&1 ) \
+  && ok "workspace check resolves cross-member imports" \
+  || bad "workspace check" "cross-member package graph did not check"
+( cd "$T/workspace" && "$COIL" build >/dev/null 2>&1 ) \
+  && [ -x "$T/workspace/members/app/build/release/app" ] \
+  && ok "workspace build fans out over executable members" \
+  || bad "workspace build" "member executable was not produced"
+
 echo "== namespace index: file placement is irrelevant and paths are rejected =="
 mkdir -p "$T/sib/src/unrelated/place"
 printf '[package]\nname  = "sib"\nentry = "src/main.coil"\n'                             > "$T/sib/Coil.toml"

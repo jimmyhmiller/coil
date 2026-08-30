@@ -51,8 +51,14 @@ def build(args: argparse.Namespace) -> None:
             (library / "stdlib").symlink_to(ROOT / "src" / "stdlib", target_is_directory=True)
             (library / "compiler").symlink_to(ROOT / "src" / "compiler", target_is_directory=True)
             (library / "prelude.coil").symlink_to(ROOT / "src" / "compiler" / "prelude.coil")
+            bootstrap_env = os.environ.copy()
+            # Stage 0 predates package namespace exclusions and therefore cannot
+            # interpret this checkout's root workspace yet. Build the first
+            # candidate through the direct compiler source root; that candidate
+            # is what verifies the workspace configuration below.
+            bootstrap_env["COIL_NAMESPACE_ROOTS"] = str(ROOT / "src" / "compiler")
             execute(str(staged), "build", "src/compiler/main.coil", "-o", str(output),
-                    *llvm_flags("dynamic"))
+                    *llvm_flags("dynamic"), env=bootstrap_env)
         print(f"built compiler candidate -> {output}")
         return
 

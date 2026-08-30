@@ -58,8 +58,8 @@ data: `report`, `warn`, `type-of`, `code-decl`.
 ## 2. A metaprogram as a normal program — `meta.coil` + `mhost.coil`
 
 `meta.coil` has **no `Code` type, no `ECodeOp`, no special forms, no interpreter**.
-It imports the compiler's real `src/compiler/reader.coil` and `parser.coil` and
-walks a real `Sexp` that the host built with the real reader.
+It imports the compiler's real `coil.compiler.parser` module and walks a real
+`Sexp` that the host built with the real parser.
 
     ./mhost       # metaprogram walked (a b c d e) -> 5 children
 
