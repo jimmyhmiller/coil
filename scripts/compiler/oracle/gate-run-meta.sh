@@ -36,6 +36,22 @@ expect_out() { # name command... : compare stdout to $EXPECT exactly
   fi
 }
 
+# ---- per-call macro arenas start small --------------------------------------
+# Assert backing capacity through mtrace, not RSS: malloc may recycle released
+# segments and hide an oversized per-invocation reservation on some platforms.
+{
+  printf '(module macro_arena.repro)\n'
+  printf '(defn passthrough [(x Code)] (-> Code) x)\n'
+  awk 'BEGIN { for (i = 0; i < 100; i++) printf "(defn f%d [] (-> i64) (passthrough %d))\\n", i, i }'
+} > "$WORK/macro-arena.coil"
+COIL_MTRACE=mem "$BIN" expand "$WORK/macro-arena.coil" >/dev/null 2>"$WORK/macro-arena.err"
+rc=$?
+[ "$rc" = 0 ] || { echo "GATE FAIL: macro arena capacity fixture exited $rc"; fail=1; }
+arena_total=$(awk -F ' \\| ' '/macro_arena\.repro\.passthrough$/ { print $4 }' "$WORK/macro-arena.err")
+[ -n "$arena_total" ] || { echo "GATE FAIL: macro arena reservation metric missing"; fail=1; }
+[ "$arena_total" -le 1048576 ] 2>/dev/null \
+  || { echo "GATE FAIL: 100 trivial macros requested $arena_total backing bytes, want <= 1048576"; fail=1; }
+
 # ---- identity over stdin ----------------------------------------------------
 EXPECT='((hello 42))'
 expect_out identity-stdin sh -c "echo '(hello 42)' | '$BIN' run tests/metaprogramming/run_code_main_id.coil"
