@@ -3406,6 +3406,28 @@ EOF
     *"cannot redefine a REPL function with a different signature"*) ok "repl reports the incompatible redefinition" ;;
     *) bad "repl reports the incompatible redefinition" "$repl_out" ;;
   esac
+
+  repl_bound_out=$(printf '%s\n' \
+    '(deftrait Total [Self] (total [(value Self)] (-> i64)))' \
+    '(defn doubled-total [(T Total)] [(value T)] (-> i64) (* (total value) 2))' \
+    '(doubled-total 3)' \
+    ':q' | "$REPL_COIL" repl 2>&1)
+  case "$repl_bound_out" in
+    *"--> <repl>:1:1"*"1 | (doubled-total 3)"*) ok "repl trait-bound error points at the submitted expression" ;;
+    *) bad "repl trait-bound error points at the submitted expression" "$repl_bound_out" ;;
+  esac
+
+  repl_module_out=$(printf '%s\n' \
+    '(module app)' \
+    '(defn answer [] (-> i64) 42)' \
+    '(answer)' \
+    '(module app.tools)' \
+    '(answer)' \
+    ':q' | "$REPL_COIL" repl 2>&1)
+  case "$repl_module_out" in
+    *$'42\n42'*) ok "repl module form switches namespace and republishes definitions" ;;
+    *) bad "repl module form switches namespace and republishes definitions" "$repl_module_out" ;;
+  esac
 fi
 
 echo
