@@ -3441,6 +3441,21 @@ EOF
     *"'code' does not implement 'Add'"*$'3\n42\n42'*) ok "repl compiles, invokes, replaces, and transactionally rejects macros" ;;
     *) bad "repl compiles, invokes, replaces, and transactionally rejects macros" "$repl_macro_out" ;;
   esac
+
+  repl_unimported_macro_out=$(printf '%s\n' \
+    '(defstruct Action [(value i64)])' \
+    '(derive Debug Action)' \
+    ':q' | "$REPL_COIL" repl 2>&1)
+  case "$repl_unimported_macro_out" in
+    *"top-level macro 'derive' is not in scope here"*"| (derive Debug Action)"*)
+      ok "repl diagnoses an unimported top-level macro at the submitted form" ;;
+    *) bad "repl diagnoses an unimported top-level macro at the submitted form" "$repl_unimported_macro_out" ;;
+  esac
+  case "$repl_unimported_macro_out" in
+    *"| (import \"coil.primitive\" :as primitive)"*)
+      bad "repl never attributes an unimported top-level macro to its synthetic preamble" "$repl_unimported_macro_out" ;;
+    *) ok "repl never attributes an unimported top-level macro to its synthetic preamble" ;;
+  esac
 fi
 
 echo
