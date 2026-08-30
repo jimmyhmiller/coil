@@ -1199,6 +1199,26 @@ expect_out "'T' is not bounded by 'm.Box2'" "an unbounded param calling a parame
 # (it errors "aren't supported yet" first), so this is the teeth.
 printf '(module app)\n(import "coil.arraylist" :use *)\n(defn first-elem [(C Get)] [(xs C)] (-> i64) (get xs 0))\n(defn main [] (-> i64) 0)\n' > "$T/gen1assoc.coil"
 expect_out "expected <C as Get>::K" "an associated type renders as <C as Trait>::Param in diagnostics" "$COIL" build "$T/gen1assoc.coil" -o "$T/x"
+# Explicit associated-type constraints connect a generic's callback/value types to
+# the selected impl, participate in inference, and reject a different Item at use.
+cat > "$T/gen1explicit.coil" <<'EOF'
+(module app)
+(import "coil.iter" :as lazy)
+(defn first-i64 [(I (Iterator i64))] [(source I)] (-> i64)
+  (let [(mut it) source] (match (next (mut it)) (Some [v] v) (None [] 0))))
+(defn main [] (-> i64) (first-i64 (lazy/range 42 43)))
+EOF
+expect_rc 42 "an explicit Iterator<i64> associated bound dispatches and infers" "$COIL" run "$T/gen1explicit.coil"
+cat > "$T/gen1explicit-bad.coil" <<'EOF'
+(module app)
+(defstruct BoolIter [(value bool)])
+(impl Iterator BoolIter
+  (next [(it (mut BoolIter))] (-> (Option bool)) (Some (.value it))))
+(defn first-i64 [(I (Iterator i64))] [(source I)] (-> i64)
+  (let [(mut it) source] (match (next (mut it)) (Some [v] v) (None [] 0))))
+(defn main [] (-> i64) (first-i64 (BoolIter :value true)))
+EOF
+expect_out "associated type mismatch for 'Iterator': expected i64, got bool" "an explicit associated bound rejects a mismatched impl" "$COIL" check "$T/gen1explicit-bad.coil"
 
 echo "== one Iterator/Iterable protocol: (for x (iter coll)); (in map) fixed (gen-1 · std-11 · std-4) =="
 # was: iteration was four unrelated per-collection macros (slice-for/al-for/hm-for/for-in
@@ -1263,6 +1283,18 @@ cat > "$T/it-alfor.coil" <<'EOF'
     (coil.primitive/load s)))
 EOF
 expect_rc 33 "al-for still iterates (now a thin alias over the Iterator protocol)" "$COIL" run "$T/it-alfor.coil"
+# Lazy adapters consume every collection through Iterable/Iterator and allocate no
+# intermediate collection. Range is an ordinary lazy Iterable, not a for-macro case.
+cat > "$T/it-lazy.coil" <<'EOF'
+(module app)
+(defn even? [(x i64)] (-> bool) (= (% x 2) 0))
+(defn add [(a i64) (b i64)] (-> i64) (+ a b))
+(defn main [] (-> i64)
+  (fold (take (filter (range 0 100) (coil.primitive/fnptr-of even?)) 3)
+        0
+        (coil.primitive/fnptr-of add)))
+EOF
+expect_rc 6 "ambient range/filter/take/fold compose lazily through the iterator traits" "$COIL" run "$T/it-lazy.coil"
 
 echo "== (coil.primitive/target-arch) reflects --target, not a hardcoded host constant =="
 # was: the constant "aarch64" — so a macro branching on it baked the host branch into a
@@ -3529,7 +3561,7 @@ EOF
       sdk_out=$(cd "$T/jit-sdk" && PATH="$T/jit-prefix/bin:$PATH" ./app 2>&1)
     fi
     case "$sdk_out" in
-      *$'20\n30'*) ok "coil.jit embeds an installed compiler and hot reloads from userland" ;;
+      *$'20\n'*$'30\n'*) ok "coil.jit embeds an installed compiler and hot reloads from userland" ;;
       *) bad "coil.jit embeds an installed compiler and hot reloads from userland" "$sdk_out" ;;
     esac
     sdk_syms=$(nm "$T/jit-sdk/app" 2>/dev/null)
@@ -3573,7 +3605,7 @@ EOF
     '(four-times 10)' \
     ':q' | if [ "$HOST_OS" = Darwin ]; then PATH="$T/no-cc:$PATH" "$REPL_COIL" repl 2>&1; else "$REPL_COIL" repl 2>&1; fi)
   case "$repl_out" in
-    *$'1\n40\n2\n90\n3\n90'*) ok "repl preserves state, reloads dependent calls, and rejects incompatible replacement" ;;
+    *'coil> 1'*'coil> 40'*'coil> 2'*'coil> 90'*'coil> 3'*'coil> 90'*) ok "repl preserves state, reloads dependent calls, and rejects incompatible replacement" ;;
     *) bad "repl preserves state, reloads dependent calls, and rejects incompatible replacement" "$repl_out" ;;
   esac
   case "$repl_out" in
@@ -3599,7 +3631,7 @@ EOF
     '(answer)' \
     ':q' | "$REPL_COIL" repl 2>&1)
   case "$repl_module_out" in
-    *$'42\n42'*) ok "repl module form switches namespace and republishes definitions" ;;
+    *'coil> 42'*'coil> 42'*) ok "repl module form switches namespace and republishes definitions" ;;
     *) bad "repl module form switches namespace and republishes definitions" "$repl_module_out" ;;
   esac
 
@@ -3612,7 +3644,7 @@ EOF
     '(stuff2 21)' \
     ':q' | "$REPL_COIL" repl 2>&1)
   case "$repl_macro_out" in
-    *"'code' does not implement 'Add'"*$'3\n42\n42'*) ok "repl compiles, invokes, replaces, and transactionally rejects macros" ;;
+    *'coil> 3'*'coil> 42'*"'code' does not implement 'Add'"*'coil> 42'*) ok "repl compiles, invokes, replaces, and transactionally rejects macros" ;;
     *) bad "repl compiles, invokes, replaces, and transactionally rejects macros" "$repl_macro_out" ;;
   esac
 

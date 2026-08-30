@@ -476,6 +476,18 @@ write `(impl [(T Eq)] Eq (Box T) …)` when the body needs `T: Eq`. The bound is
 where the impl is used, so `(Box f64)` is rejected (`f64` has no `Eq`) at the call site
 rather than inside the impl.
 
+Parameterized traits may constrain their non-`Self` associated types in a bound.
+Write the trait and its associated arguments as a nested form:
+
+    (defn next-i64 [(I (Iterator i64))] [(source I)] (-> (Option i64))
+      (let [(mut it) source] (next (mut it))))
+
+Here `I` must implement `Iterator` with `Item = i64`. Associated arguments participate
+in inference as well as checking: if `I` is known, its selected impl can infer an
+otherwise-unmentioned item type. A mismatched impl is rejected at the generic call.
+The argument order is the trait's declared non-`Self` parameter order; for
+`(deftrait Pairing [Self Left Right] ...)`, the bound is `(T (Pairing L R))`.
+
 **Any type can carry an impl** — a struct, sum, scalar, generic instance, and the
 structural types `(ptr T)`, `(slice T)`, `(array T N)`, `(vec T N)`, `(fnptr c […] R)`.
 A generic impl's `[T …]` params are inferred from the receiver, and every declared
@@ -981,6 +993,25 @@ traits; they are not alternate spellings to teach for a trait operation.
 | `coil.slice`: `(slice T)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Iterable` (`iter`) |
 | `coil.arraylist`: `(ArrayList T)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Push` (`push!`), `Pop` (`pop!`), `Iterable` (`iter`) |
 | `coil.hashmap`: `(HashMap K V)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Iterable` (`iter`, over keys) |
+
+`coil.iter` provides allocation-free lazy ranges, adapters, and consumers over this
+same protocol. Adapter constructors accept any `Iterable`, mint its iterator once,
+and pull only when the result's `next` is called. Its public sequence operations
+are part of the ambient core vocabulary, so no import is required:
+
+    (let [xs (take
+               (filter
+                 (map (range 0 100) (primitive/fnptr-of double))
+                 (primitive/fnptr-of divisible-by-four?))
+               10)]
+      (fold xs 0 (primitive/fnptr-of add)))
+
+`range` is half-open (`start` through `end - 1`) and itself implements both
+`Iterable` and `Iterator`. Lazy adapters are `map`, `filter`, `take`, `skip`,
+`enumerate`, `chain`, and `zip`. Consumers are `fold`, `count`, `find`, `any?`, and
+`all?`. Mapping and predicates use typed function pointers. No adapter allocates or
+materializes an intermediate collection; `take` therefore safely bounds a pipeline
+whose source iterator can otherwise be infinite.
 
 For an `ArrayList`, `get` returns an element by value and the mutating methods take
 `(mut …)`. Create one with `(al-new [T] a)` and release its backing storage with
