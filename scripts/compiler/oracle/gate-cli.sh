@@ -2113,13 +2113,28 @@ cat > "$T/project/tests/second_test.coil" <<'EOF'
 (meta (generate-second-suite))
 (deftest second-suite (assert-eq (generated-test-value) 42))
 EOF
+cat > "$T/project/tests/generic_zeroed_test.coil" <<'EOF'
+(module generic_zeroed_test)
+(import "coil.primitive" :as primitive)
+
+(defstruct Wrapper [T] [(value T)])
+
+(defn make-wrapper [T] [(value T)] (-> (Wrapper T))
+  (let [(mut out) (primitive/zeroed (Wrapper T))]
+    (set! (.value (mut out)) value)
+    (load out)))
+
+(deftest generic-zeroed-struct
+  (let [wrapped (make-wrapper 42)]
+    (assert-eq (.value wrapped) 42)))
+EOF
 "$COIL" fmt --write "$T/project/src/main.coil" "$T/project/tests/native_test.coil" \
-  "$T/project/tests/second_test.coil" >/dev/null
+  "$T/project/tests/second_test.coil" "$T/project/tests/generic_zeroed_test.coil" >/dev/null
 expect_out "native_test.coil" "project test --list discovers configured suffixes" \
   bash -c 'cd "$1" && "$2" test --list' _ "$T/project" "$COIL"
 expect_out "1 passed; 0 failed" "project test selector builds with inherited native inputs" \
   bash -c 'cd "$1" && "$2" test native' _ "$T/project" "$COIL"
-expect_out "running 2 tests" "project test compiles all selected files into one suite runner" \
+expect_out "running 3 tests" "project test compiles all selected files into one suite runner" \
   bash -c 'cd "$1" && "$2" test --jobs 2' _ "$T/project" "$COIL"
 expect_rc 0 "project test --no-run compiles and links the combined suite" \
   bash -c 'cd "$1" && "$2" test --no-run' _ "$T/project" "$COIL"
@@ -3507,7 +3522,8 @@ EOF
     '(derive Debug Action)' \
     ':q' | "$REPL_COIL" repl 2>&1)
   case "$repl_ambient_derive_out" in
-    *"true"*"no deriver is registered for trait 'Debug'"*"| (derive Debug Action)"*)
+    *"true"*"no deriver is registered for trait 'Debug'"*"| (derive Debug Action)"*|\
+    *"no deriver is registered for trait 'Debug'"*"| (derive Debug Action)"*"true"*)
       ok "repl keeps derive ambient and diagnoses the missing trait module at the submitted form" ;;
     *) bad "repl keeps derive ambient and diagnoses the missing trait module at the submitted form" "$repl_ambient_derive_out" ;;
   esac
