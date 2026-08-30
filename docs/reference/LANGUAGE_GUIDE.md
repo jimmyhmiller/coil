@@ -393,6 +393,27 @@ extern in ONE module and `:use *` it, or two importers colliding will fail to li
 These operators are not builtins — they are **trait methods** (see Traits & impls),
 so they work on your own types the moment you write an `impl`.
 
+The integer metal tier also provides operations that cannot be expressed cheaply
+from those operators:
+
+- `primitive/clz`, `primitive/ctz`, and `primitive/popcount` return a count in the
+  operand's integer type. `clz` and `ctz` are defined on zero and return the type's
+  bit width.
+- `primitive/bswap` reverses the bytes of an integer (`u8` is unchanged; wider
+  operands must contain a whole, even number of bytes).
+- `primitive/rotl` and `primitive/rotr` rotate within the operand's declared bit
+  width; the count is reduced modulo that width.
+- `primitive/mulhi` returns the high half of the double-width product. Its meaning
+  is signed for `iN` and unsigned for `uN`; ordinary `imul` supplies the low half.
+- `primitive/iadd-overflow?`, `primitive/isub-overflow?`, and
+  `primitive/imul-overflow?` report overflow according to the operand type's
+  signedness. `coil.integer` supplies `overflowing-add`, `overflowing-sub`, and
+  `overflowing-mul`, which return `Overflow[T]` containing both the wrapped result
+  and the flag.
+
+All of these operations preserve the operand width. Both operands of a binary
+operation, including a rotate count, therefore have the same integer type.
+
 `and` and `or` are variadic, short-circuiting syntax forms. Their zero-argument
 identities are `(and)` → `true` and `(or)` → `false`; a single argument is returned
 unchanged.
