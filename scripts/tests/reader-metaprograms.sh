@@ -103,7 +103,12 @@ esac
 # The same entry imports a .kv module handled by a second provider, proving that
 # one project dispatches recursive imports through a heterogeneous reader registry.
 (cd "$FIX/json_project" && "$COIL" run >/dev/null)
-[ $? = 48 ] || fail "manifest readers: multiple providers, explicit, path-derived, and coil-module imports"
+[ $? = 48 ] || fail "manifest readers: multiple providers, explicit mappings, and coil-module imports"
+reader_namespaces=$(cd "$FIX/json_project" && "$COIL" namespaces)
+case "$reader_namespaces" in
+  *"json-import.data.not_a_module"*)
+    fail "an unmarked, unmapped guest file was derived into a module" ;;
+esac
 
 expect_project_failure() {
   project="$1"
