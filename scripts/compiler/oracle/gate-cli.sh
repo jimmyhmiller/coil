@@ -938,6 +938,25 @@ printf '(module m)\n(defn Helper [] (-> i64) 0)\n(impl Helper i64 (go [(x i64)] 
 expect_out "unknown trait 'Helper' in bound" "impl over a non-trait name errors identically" "$COIL" build "$T/implnonfn.coil" -o "$T/x"
 
 echo "== Callable values use typed, static impl dispatch =="
+cat > "$T/anonymous-fn.coil" <<'EOF'
+(module anonymous-fn)
+(defn main [] (-> i64)
+  (fold (fn [total value] (+ total value))
+        0
+        (map (fn [x] (+ x 2)) (range 0 10))))
+EOF
+expect_rc 65 "non-capturing anonymous fn infers through Callable bounds" "$COIL" run "$T/anonymous-fn.coil"
+
+cat > "$T/anonymous-fn-capture.coil" <<'EOF'
+(module anonymous-fn-capture)
+(defn main [] (-> i64)
+  (let [offset 2]
+    (count (map (fn [x] (+ x offset)) (range 0 10)))))
+EOF
+expect_out "anonymous fn cannot capture local 'offset'.*pass it as an explicit parameter or use coil.closure/defclosure" \
+  "anonymous fn rejects captures with an actionable diagnostic" \
+  "$COIL" check "$T/anonymous-fn-capture.coil"
+
 cat > "$T/callable.coil" <<'EOF'
 (module m)
 (defstruct Vec3 [(x i64) (y i64) (z i64)])

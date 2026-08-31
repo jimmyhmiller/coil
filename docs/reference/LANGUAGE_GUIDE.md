@@ -1118,6 +1118,21 @@ They are plain `i64` literals — use with metal/clean ops after casting the byt
     (defn f [(p (mut Rect))] (-> i64) …)      ; mutable-ref param
     (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64) …)   ; CLI entry
 
+Non-capturing anonymous functions use Clojure-shaped parameter lists. Their
+parameter types come from the expected function-pointer type or a `Callable`
+bound, and their return type is inferred from the body:
+
+    (map (fn [x] (+ x 2)) (range 0 10))
+    (fold (fn [total value] (+ total value)) 0 values)
+
+An anonymous `fn` lowers to an ordinary `c` function pointer, so it may refer to
+its parameters, constants, and global functions but cannot capture an enclosing
+runtime local. A capture is a compile error that names the local. Pass that value
+as an explicit parameter, or use `coil.closure/defclosure` when stored environment
+is required. When no call context supplies the signature, ascribe one explicitly:
+
+    (: (fn [x] (+ x 2)) (fnptr c [i64] i64))
+
 Ordinary Coil functions may be called with `:parameter value` pairs in any order:
 
     (defn move [(point Point) (dx i64) (dy i64)] (-> Point) …)
