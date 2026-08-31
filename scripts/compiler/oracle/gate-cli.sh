@@ -589,6 +589,19 @@ out=$( cd "$T/strict" && "$COIL" build 2>&1 )
 echo "$out" | grep -qE "Coil.toml:5: unknown section \[dependecies\]" \
   && ok "…and the error is located at the section line" \
   || bad "strict section location" "got: $out"
+# Libraries can claim a manifest namespace without teaching Coil the keys inside
+# it. Validation is deferred until the entire file has been read, so the provider
+# declaration may appear before or after the custom section.
+printf '[package]\nname = "s"\nentry = "src/main.coil"\n\n[c.raylib]\nsources = ["raylib.c"]\n\n[manifest.providers]\nc = "example.c-reader"\n' > "$T/strict/Coil.toml"
+( cd "$T/strict" && rm -f build/release/s && "$COIL" build >/dev/null 2>&1 )
+[ -x "$T/strict/build/release/s" ] \
+  && ok "a registered provider owns arbitrary sections beneath its namespace" \
+  || bad "custom manifest provider" "project did not build"
+printf '[package]\nname = "s"\nentry = "src/main.coil"\n\n[c.raylib]\nsources = ["raylib.c"]\n' > "$T/strict/Coil.toml"
+out=$( cd "$T/strict" && "$COIL" build 2>&1 ); rc=$?
+[ "$rc" = 1 ] && echo "$out" | grep -qE "Coil.toml:5: unknown section \[c.raylib\].*register its root under \[manifest.providers\]" \
+  && ok "an unclaimed custom manifest section remains a located error" \
+  || bad "unclaimed custom manifest section" "got rc=$rc: $out"
 # typo'd key `entrypoint`
 printf '[package]\nname  = "s"\nentrypoint = "src/main.coil"\n' > "$T/strict/Coil.toml"
 out=$( cd "$T/strict" && "$COIL" build 2>&1 ); rc=$?

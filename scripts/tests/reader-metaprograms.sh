@@ -21,6 +21,9 @@ fail() { echo "reader metaprograms: FAIL — $1"; exit 1; }
 "$COIL" run "$FIX/raw.answer" --use reader.fixture.code-helper-return >/dev/null
 [ $? = 42 ] || fail "helper-returned Code remains a value in a reader provider"
 
+"$COIL" run "$FIX/raw.answer" --use reader.fixture.transitive-helper >/dev/null
+[ $? = 42 ] || fail "reader image retains private helpers behind an imported library API"
+
 "$COIL" check "$FIX/phase_closure_provider.coil" \
   || fail "ordinary-signature helper in reader comptime closure is dropped before mono"
 "$COIL" build "$FIX/raw.answer" --use reader.fixture.artifact --release -o "$T/artifact-pure" >/dev/null \
