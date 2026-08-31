@@ -30,9 +30,9 @@ in while reprinting those branches as their **original bytes**.
 
 ```sh
 cd src/examples/metaprogramming
-../.build/bin/coil lint condlint_test.coil --use condlint-on.coil            # report + `help: try:`
-../.build/bin/coil lint condlint_test.coil --use condlint-on.coil --diff     # the patch, no writes
-../.build/bin/coil lint condlint_test.coil --use condlint-on.coil --fix      # apply it
+../.build/bin/coil lint condlint_test.coil --use condlint.coil            # report + `help: try:`
+../.build/bin/coil lint condlint_test.coil --use condlint.coil --diff     # the patch, no writes
+../.build/bin/coil lint condlint_test.coil --use condlint.coil --fix      # apply it
 ```
 
 `condlint_test.coil` covers the three cases that matter: a three-test staircase (fixed),

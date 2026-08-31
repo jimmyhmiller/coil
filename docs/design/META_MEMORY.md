@@ -255,7 +255,7 @@ the allocation path.
 
 ## Lint + fix
 
-New checker module `src/stdlib/meta_lint.coil`, registered as
+New checker module `src/stdlib/lints/meta.coil`, registered as
 `coil.lint.meta`, following the `ifcombine`/`match_lint` pattern (report +
 `record-fix`, comment-carrying forms downgrade to advice, runs under
 `coil lint` and `verify`):

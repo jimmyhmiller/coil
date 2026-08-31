@@ -17,7 +17,7 @@ compiles.
 
 KNOWN FALSE POSITIVE, and it is not detectable from syntax: a template built for
 `primitive/suggest` becomes TEXT in somebody else's file, so its aliases are
-meant to be the reader's, not the writer's. `src/stdlib/modernize.coil`'s
+meant to be the reader's, not the writer's. `src/stdlib/lints/modernize.coil`'s
 `mz-ambient-replacement` is the in-tree example -- it proposes `(alloc/stack T)`
 for the user to adopt and is never resolved in `coil.lint.modernize` at all.
 This is a review tool, not a gate, for exactly that reason.

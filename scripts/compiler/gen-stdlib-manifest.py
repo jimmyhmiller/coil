@@ -100,15 +100,16 @@ def declared_module(text: str) -> str | None:
 
 
 def collect() -> list[tuple[str, str]]:
-    """(namespace, filename) for every stdlib module, sorted by namespace."""
+    """(namespace, relative path) for every stdlib module, sorted by namespace."""
     out: dict[str, str] = {}
-    for path in sorted(STDLIB.glob("*.coil")):
+    for path in sorted(STDLIB.rglob("*.coil")):
+        relative = path.relative_to(STDLIB).as_posix()
         name = declared_module(path.read_text())
         if name is None:
             sys.exit(f"error: {path.relative_to(ROOT)} declares no (module ...) header")
         if name in out:
-            sys.exit(f"error: namespace '{name}' declared by both {out[name]} and {path.name}")
-        out[name] = path.name
+            sys.exit(f"error: namespace '{name}' declared by both {out[name]} and {relative}")
+        out[name] = relative
     return sorted(out.items())
 
 

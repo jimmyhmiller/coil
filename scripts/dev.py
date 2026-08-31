@@ -670,6 +670,41 @@ def test_modernize_fast(compiler: str) -> None:
                 raise RuntimeError("fast modernization gate: public stack allocation survived autofix")
             execute(coil, "check", str(stack_probe))
 
+            nested_or_probe = tmp / "nested-or.coil"
+            nested_or_probe.write_text("""(module nested-or)
+(defn choose [(a bool) (b bool) (c bool) (d bool) (e bool)] (-> bool)
+  (or (or a b) (or c (or d e))))
+(defn mixed [(a bool) (b bool) (c bool) (d bool) (e bool)] (-> bool)
+  (or a (or b c d) e))
+(defn is-icmp? [(h Code)] (-> bool)
+  (or (= h `icmp-lt)
+      (or (= h `icmp-gt)
+          (or (= h `icmp-le)
+              (or (= h `icmp-ge)
+                  (or (= h `icmp-eq)
+                      (= h `icmp-ne)))))))
+""")
+            execute(coil, "lint", str(nested_or_probe), "--fix")
+            nested_or_fixed = nested_or_probe.read_text()
+            if nested_or_fixed.count("(or a b c d e)") != 2:
+                raise RuntimeError(
+                    "fast modernization gate: nested `or` flattening left a nested form")
+            for quoted in ("`icmp-lt", "`icmp-gt", "`icmp-le",
+                           "`icmp-ge", "`icmp-eq", "`icmp-ne"):
+                if quoted not in nested_or_fixed:
+                    raise RuntimeError(
+                        "fast modernization gate: nested `or` flattening did not preserve "
+                        f"author spelling {quoted!r}")
+            if "(quasiquote " in nested_or_fixed:
+                raise RuntimeError(
+                    "fast modernization gate: nested `or` flattening expanded quote shorthand")
+            execute(coil, "check", str(nested_or_probe))
+            before_nested_or = hashlib.sha256(nested_or_probe.read_bytes()).digest()
+            execute(coil, "lint", str(nested_or_probe), "--fix")
+            if before_nested_or != hashlib.sha256(nested_or_probe.read_bytes()).digest():
+                raise RuntimeError(
+                    "fast modernization gate: nested `or` fix is not idempotent")
+
             preflight = tmp / "legacy-preflight.coil"
             preflight.write_text("""(module legacy-preflight)
 (import "coil.alloc" :as alloc)

@@ -362,7 +362,7 @@ names. The repair is one line, and `scripts/hygiene-alias-scan.py` finds every
 occurrence.
 
 Scanned at migration time: `src` and `tests` report one site, and it is a false
-positive of a kind the scanner cannot detect — `modernize.coil`'s
+positive of a kind the scanner cannot detect — `lints/modernize.coil`'s
 `mz-ambient-replacement` builds a `primitive/suggest` replacement, which becomes
 TEXT in the reader's file, so its `alloc/` is deliberately the reader's alias and
 is never resolved in `coil.lint.modernize` at all. Six Coil projects outside this

@@ -29,7 +29,7 @@ Distinguished only by *what they receive* and *what they return*.
 - **From the CLI, optionally** — `coil run app.coil --use lint.coil` imports a
   metaprogram module (which self-registers its `(checker …)`) **without editing the
   source**. Repeatable; works on `run` and `build`. This is how you run a linter on
-  demand: `coil run app.coil --use lint-on.coil`.
+  demand: `coil run app.coil --use lint.coil`.
 
 All four share one substrate: the `Code` value, the `code-*` operations, type
 reflection, and the compiled comptime engine. The difference is **scope** (my-call-site
@@ -134,7 +134,7 @@ New API this project added (all shipped):
   a section banner (a run of six or more punctuation characters, i.e. `; ==== … ====`),
   which introduces everything below it rather than the one definition underneath.
   `suggest`'s refusal to drop a comment is waived here, because dropping it is the
-  point. The bundled user: **`coil.lint.unused`** (`src/stdlib/unused_lint.coil`),
+  point. The bundled user: **`coil.lint.unused`** (`src/stdlib/lints/unused.coil`),
   whole-program dead-code elimination for source — reachability over a name graph,
   deleting to a fixpoint. It is deliberately NOT in `coil.lint.default`; run it with
   `coil lint FILE --use coil.lint.unused --fix`.

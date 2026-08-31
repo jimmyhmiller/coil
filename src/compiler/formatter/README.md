@@ -9,13 +9,15 @@ Coil, over the standard library.
 coil fmt <file.coil>            # print the formatted source
 coil fmt --check <file.coil>    # exit 1 if not already formatted
 coil fmt --write <file.coil>    # reformat the file in place
+coil fmt --width 90 <file.coil> # preview a different target width
 ```
 
 `fmt` is a built-in subcommand of the `coil` compiler (the formatter lives in
 `src/compiler/formatter/rules.coil` and is compiled into the binary; `src/compiler/driver.coil` wires it
 up). The standalone `coil run src/compiler/formatter/fmt.coil -- <file>` still works and is equivalent.
 
-Target width is 120 columns. `let`/`loop` binding vectors with two or more pairs
+Target width defaults to 120 columns and can be selected per invocation with
+`--width N`. `let`/`loop` binding vectors with two or more pairs
 always break to one pair per line (aligned in a column), even when they would fit
 flat; a single-binding vector stays inline.
 

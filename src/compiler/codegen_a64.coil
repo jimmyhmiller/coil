@@ -68,6 +68,8 @@
 
 (defstruct GStr [(s (slice u8)) (symidx i64)])  ; interned string literal
 
+(defstruct GStatic [(name (slice u8)) (ty Type) (symidx i64)])
+
 ; a lowered value: kind 0 = int/ptr immediate, 1 = slot (by-value), 2 = f64 imm bits
 (defstruct AVal [(kind i64) (v i64) (ty Type)])
 
@@ -77,6 +79,7 @@
 
 (defstruct Cga
   [(a (dyn Allocator))
+   (program (ptr Program))
    (layouts LayoutDb)
    (sigs (ArrayList GSig))  ; funcs + externs, keyed by name
    (sig_index (HashMap (slice u8) i64))
@@ -86,6 +89,7 @@
    (datasec i64)  ; section ordinals
    (asm Asm)
    (strs (ArrayList GStr))  ; interned EStr/ECStr globals
+   (statics (ArrayList GStatic))
    (nglob i64)  ; g.N counter
    (nstatic i64)  ; stable alloc-static ordinal within the current function
    ; ---- per-function state ----
@@ -185,6 +189,12 @@
 
 (defn g-field-idx [(g (ptr Cga)) (si i64) (name (slice u8))] (-> i64)
   (field-number (field g layouts) si name))
+
+(defn g-field-ty [(g (ptr Cga)) (si i64) (fi i64)] (-> (ptr Type))
+  (field (al-at [Field]
+                (load (field (al-at [StructDef] (load (field (.program g) structs)) si) fields))
+                fi)
+         ty))
 
 (defn g-type-bytes [(g (ptr Cga)) (t (ptr Type))] (-> i64)
   (type-bytes (field g layouts) t))
@@ -1279,6 +1289,118 @@
       (b-zeros! (mut buf) size)
       (mobj-add-sym! (mut (.obj g)) nm (.datasec g) off false))))
 
+(defn g-named-zero-global! [(g (ptr Cga)) (name (slice u8)) (size i64) (align i64)] (-> i64)
+  (let [buf (mobj-sect-buf (mut (.obj g)) (.datasec g))]
+    (b-align! (mut buf) (if (< align (primitive/cast i64 8)) 8 align))
+    (let [off (len (load buf))]
+      (b-zeros! (mut buf) size)
+      (mobj-add-sym! (mut (.obj g)) name (.datasec g) off false))))
+
+(defn g-static-idx [(g (ptr Cga)) (name (slice u8))] (-> i64)
+  (let [n (len (.statics g))
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0))
+              (break)
+              (do
+                (when (= (.name (al-at [GStatic] (field g statics) (load i))) name)
+                  (set! found (load i))
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
+(defn g-static-write! [(g (ptr Cga)) (t (ptr Type)) (e (ptr Expr)) (off i64)] (-> i64)
+  (let [buf (mobj-sect-buf (mut (.obj g)) (.datasec g))]
+    (match (.kind e)
+      (EInt [n]
+            (let [sz (ty-size g t)]
+              (cond (= sz 1) (set! (mut buf) off (primitive/cast u8 n))
+                    (= sz 2)
+                      (do
+                        (set! (mut buf) off (primitive/cast u8 n))
+                        (set! (mut buf) (primitive/iadd off 1) (primitive/cast u8 (primitive/ishr n 8)))
+                        0)
+                    (= sz 4) (b-patch-u32! (mut buf) off n)
+                    :else (b-patch-u64! (mut buf) off n))))
+      (EBool [v] (set! (mut buf) off (primitive/cast u8 (when v 1))))
+      (EZeroed [_] 0)
+      (EFnPtrOf [name]
+                (let [si (g-sig-idx g name)]
+                  (when (< si 0) (cga-fail2 "def initializer: unknown function " name))
+                  (mobj-add-reloc! (mut (.obj g))
+                                   (.datasec g)
+                                   off
+                                   (.symidx (al-at [GSig] (field g sigs) si))
+                                   (reloc-unsigned)
+                                   false
+                                   3)))
+      (EAlloc [storage ty init]
+              (if (!= storage 1)
+                  (cga-fail "def initializer: only alloc-static storage is a link-time constant")
+                  (let [tp (box-type (.a g) ty)
+                        sym (g-zero-global! g (ty-size g tp) (ty-align g tp))
+                        ms (al-at [MSym] (field (field g obj) syms) sym)]
+                    (when (!= (primitive/cast i64 init) 0)
+                      (g-static-write! g tp init (.off ms))
+                      0)
+                    (mobj-add-reloc! (mut (.obj g)) (.datasec g) off sym (reloc-unsigned) false 3))))
+      (ECast [_ inner] (g-static-write! g t inner off))
+      (ELoad [inner] (g-static-write! g t inner off))
+      (ELet [_ body]
+            (match (load t)
+              (TStruct [name]
+                       (let [si (g-struct-idx g name)]
+                         (when (< si 0) (cga-fail2 "def initializer: unknown struct " name))
+                         (for [i 0 (len (load body))]
+                           (match (.kind (al-at [Expr] body i))
+                             (EInitStore [place value]
+                                         (match (.kind place)
+                                           (EField [_ fname]
+                                                   (let [fi (g-field-idx g si fname)]
+                                                     (when (< fi 0)
+                                                       (cga-fail2 "def initializer: unknown field " fname))
+                                                     (g-static-write! g
+                                                                      (g-field-ty g si fi)
+                                                                      value
+                                                                      (primitive/iadd off (g-field-off g si fi)))))
+                                           (_ 0)))
+                             (_ 0)))
+                         0))
+              (_ (cga-fail "def initializer: materialized aggregate has the wrong type"))))
+      (_ (cga-fail "def initializer is not a link-time constant")))))
+
+(defn g-declare-statics! [(g (ptr Cga)) (p (ptr Program))] (-> i64)
+  (let [cs (load (field p consts))]
+    (for [i 0 (len (load cs))]
+      (let [cp (al-elem [Const] cs i)]
+        (when (.runtime cp)
+          (match (.ty cp)
+            (None [] (cga-fail "internal: checked def has no type"))
+            (Some [ty]
+                  (let [tp (box-type (.a g) ty)
+                        sym (g-named-zero-global! g
+                                                  (sconcat (.a g) "coil_def." (.name cp))
+                                                  (ty-size g tp)
+                                                  (ty-align g tp))
+                        st (primitive/alloc-stack GStatic)]
+                    (set! (.name st) (.name cp))
+                    (set! (.ty st) ty)
+                    (set! (.symidx st) sym)
+                    (push! (mut (.statics g)) (load st))
+                    (let [ms (al-at [MSym] (field (field g obj) syms) sym)]
+                      ; Include the concrete outer type in nested alloc-static
+                      ; identity. A full-source replacement may legally change a
+                      ; def's signature; its new Var must not reuse the old
+                      ; signature's cell merely because the public name matches.
+                      (set! (.selfname g)
+                            (match ty
+                              (TStruct [tn] (sconcat (.a g) (.name cp) (sconcat (.a g) "." tn)))
+                              (_ (.name cp))))
+                      (set! (.nstatic g) 0)
+                      (g-static-write! g tp (field cp value) (.off ms))))))
+          0)))
+    0))
+
 ; reg = address of symbol (adrp+add with PAGE21/PAGEOFF12 relocs)
 (defn emit-sym-addr! [(g (ptr Cga)) (reg i64) (symidx i64)] (-> i64)
   (let [s (field g asm)]
@@ -1737,9 +1859,16 @@
     (EMakeDyn [ds vt methods inner] (emit-make-dyn g ds vt methods inner))
     (EDynDispatch [ds vt mi cc params ret recv args] (emit-dyn-dispatch g ds vt mi cc params ret recv args))
     (EStaticRef [name]
-                (do
-                  (cga-fail2 "static-ref unsupported (statics are never populated): " name)
-                  (mk-aval 0 0 (TInt 64 true))))
+                (let [si (g-static-idx g name)]
+                  (if (< si 0)
+                      (do
+                        (cga-fail2 "static-ref references an unknown def: " name)
+                        (mk-aval 0 0 (TInt 64 true)))
+                      (let [st (al-at [GStatic] (field g statics) si)
+                            slot (slot-new! g 8 8)]
+                        (emit-sym-addr! g 9 (.symidx st))
+                        (emit-store-int! g 9 28 slot 8)
+                        (mk-aval 1 slot (TPtr (box-type (.a g) (.ty st))))))))
     (EErase [_t _i] (do (cga-fail "EErase reached codegen (checker bug)") (mk-aval 0 0 (TInt 64 true))))
     (ETraitCall [_a _b _c _d] (do (cga-fail "ETraitCall reached codegen (mono bug)") (mk-aval 0 0 (TInt 64 true))))
     (EComptime [_] (do (cga-fail "EComptime reached codegen") (mk-aval 0 0 (TInt 64 true))))
@@ -3891,11 +4020,13 @@
                         (emit-dwarf bool)] (-> MObj)
   (let [g (primitive/alloc-stack Cga)]
     (set! (.a g) a)
+    (set! (.program g) mp)
     (set! (.sigs g) (al-new [GSig] a))
     (set! (.sig_index g) (hm-new [(slice u8) i64] a (str-keyops)))
     (set! (.obj g) (mobj-new a))
     (set! (.asm g) (asm-new a))
     (set! (.strs g) (al-new [GStr] a))
+    (set! (.statics g) (al-new [GStatic] a))
     (set! (.nglob g) 0)
     (set! (.nstatic g) 0)
     (set! (.loops g) (al-new [GLoop] a))
@@ -3937,6 +4068,7 @@
     (g-register-types! g mp)
     (g-eval-asserts! g mp)
     (g-register-sigs! g mp)
+    (g-declare-statics! g mp)
     ; emit every function
     (let [fs (load (field mp funcs))
           n (len (load fs))

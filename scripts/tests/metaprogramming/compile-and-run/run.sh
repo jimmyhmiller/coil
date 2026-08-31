@@ -108,17 +108,21 @@ echo "       the viewer yourself: WASD pan, Z/X zoom, I/O iters, Q/RETURN accept
 # of the others get to speak.
 GUI_FAILED=0
 COIL_META_MAIN=1 COIL_MANDEL_AUTO=1 $COIL run $D/mandel_test.coil \
+  --use mandelbrot \
   --link-flag -framework --link-flag AppKit --link-flag -lobjc > "$OUT/mandel.txt" 2>"$OUT/mandel.err"; rc=$?
 if [ $rc -ne 0 ]; then
   echo "mandelbrot GUI metaprogram FAILED (exit $rc) — continuing so the headless steps still run"
   sed -n '1,5p' "$OUT/mandel.err"
   GUI_FAILED=1
-elif ! grep -q "COMPILE-TIME GUI" "$OUT/mandel.txt"; then
-  echo "mandelbrot output missing"
+elif ! grep -q "ordinary program ran unchanged" "$OUT/mandel.txt"; then
+  echo "ordinary program output missing after Mandelbrot checker"
+  GUI_FAILED=1
+elif ! grep -q "accepted view" "$OUT/mandel.err"; then
+  echo "Mandelbrot checker output missing"
   GUI_FAILED=1
 else
-  head -6 "$OUT/mandel.txt"
-  echo "compile-time GUI: OK"
+  cat "$OUT/mandel.txt"
+  echo "compile-time GUI checker: OK; ordinary program ran unchanged"
 fi
 
 echo "=== 12. A BORROW CHECKER DIALECT: linear ownership, veto on misuse ==="

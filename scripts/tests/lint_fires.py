@@ -45,7 +45,7 @@ def main() -> int:
     if after == PROBE:
         print("gate-lint-fires: FAIL — `lint --fix` left the file byte-identical")
         print(f"  exit={proc.returncode} (a silent success is the failure being tested for)")
-        print("  the checkers are not firing; see mz-user-module? in src/stdlib/modernize.coil")
+        print("  the checkers are not firing; see mz-user-module? in src/stdlib/lints/modernize.coil")
         return 1
 
     # It changed something — confirm it changed the RIGHT things, so a fix that

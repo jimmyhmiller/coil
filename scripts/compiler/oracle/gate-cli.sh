@@ -360,6 +360,26 @@ n=$(echo "$out" | grep -c "not formatted")
 [ "$n" = 2 ] && ok "fmt --check reports both files" || bad "fmt --check multi-file" "named $n of 2: $out"
 expect_rc 2 "fmt on a directory is an error"             "$COIL" fmt "$T"
 
+printf '(defn piped [] (-> i64)    1)\n' | "$COIL" fmt - > "$T/fmt-stdin.got"
+printf '(defn piped [] (-> i64)\n  1)\n' > "$T/fmt-stdin.want"
+cmp -s "$T/fmt-stdin.want" "$T/fmt-stdin.got" \
+  && ok "fmt reads piped standard input when no file is named" \
+  || bad "fmt reads piped standard input" "$(diff -u "$T/fmt-stdin.want" "$T/fmt-stdin.got")"
+printf '(defn check [] (-> i64)    1)\n' | "$COIL" fmt --check - >/dev/null 2>&1
+[ "$?" = 1 ] && ok "fmt --check reports unformatted standard input" \
+  || bad "fmt --check reports unformatted standard input" "wrong exit status"
+printf '(defn no-write [] (-> i64) 1)\n' | "$COIL" fmt --write - >/dev/null 2>&1
+[ "$?" = 2 ] && ok "fmt --write rejects standard input" \
+  || bad "fmt --write rejects standard input" "wrong exit status"
+
+printf '(defn width [] (-> bool) (or (= 1 1) (= 2 2) (= 3 3) (= 4 4) (= 5 5)))\n' \
+  | "$COIL" fmt --width 40 - > "$T/fmt-width.got"
+grep -q '^      (= 2 2)$' "$T/fmt-width.got" \
+  && ok "fmt --width controls stdin layout" \
+  || bad "fmt --width controls stdin layout" "$(cat "$T/fmt-width.got")"
+expect_rc 2 "fmt --width rejects zero" "$COIL" fmt --width 0 "$T/seven.coil"
+expect_rc 2 "fmt --width requires a value" "$COIL" fmt "$T/seven.coil" --width
+
 "$COIL" fmt tests/compiler/formatter_vertical_spacing_input.coil > "$T/vertical-spacing.got"
 cmp -s tests/compiler/formatter_vertical_spacing_expected.coil "$T/vertical-spacing.got" \
   && ok "fmt canonicalizes top-level spacing and keeps leading comments attached" \
@@ -2927,20 +2947,20 @@ cp "$T/lint/target.coil" "$T/lint/target.orig"
 
 expect_rc 54 "lint: the target program runs before any fix"   "$COIL" run "$T/lint/target.coil"
 expect_out 'help: try: \(cond \(= x 1\) 100' "lint: reports the chain with a help line" \
-  "$COIL" lint "$T/lint/target.coil" --use condlinton
+  "$COIL" lint "$T/lint/target.coil" --use condlint
 # The lint reports the 3-test chain and the commented one — but NOT the two-armed if,
 # and NOT the `cond` the author wrote (which is nested ifs by the time a checker sees it).
 expect_out '^2$' "lint: flags the two hand-written chains and nothing else" \
-  sh -c "\"$COIL\" lint \"$T/lint/target.coil\" --use condlinton 2>&1 | grep -c 'nested ifs'"
+  sh -c "\"$COIL\" lint \"$T/lint/target.coil\" --use condlint 2>&1 | grep -c 'nested ifs'"
 cmp -s "$T/lint/target.coil" "$T/lint/target.orig" \
   && ok "lint: reporting writes nothing" || bad "lint: reporting writes nothing" "the file changed"
 
 expect_out '^\+  \(cond \(= x 1\) 100' "lint --diff: prints the patch" \
-  sh -c "\"$COIL\" lint \"$T/lint/target.coil\" --use condlinton --diff 2>/dev/null"
+  sh -c "\"$COIL\" lint \"$T/lint/target.coil\" --use condlint --diff 2>/dev/null"
 cmp -s "$T/lint/target.coil" "$T/lint/target.orig" \
   && ok "lint --diff: writes nothing" || bad "lint --diff: writes nothing" "the file changed"
 
-"$COIL" lint "$T/lint/target.coil" --use condlinton --fix >/dev/null 2>&1
+"$COIL" lint "$T/lint/target.coil" --use condlint --fix >/dev/null 2>&1
 expect_out 'cond \(= x 1\) 100 \(= x 2\) 200 \(= x 3\) 300 :else 999' \
   "lint --fix: rewrote the chain as a cond with :else" cat "$T/lint/target.coil"
 # The comment sits in the GAP between two nodes, the one thing no Code value records.
@@ -2952,7 +2972,7 @@ expect_out '; a comment between a test and its body' \
   "lint --fix: carried the comment across the rewrite" cat "$T/lint/target.coil"
 expect_rc 54 "lint --fix: the program still behaves identically" "$COIL" run "$T/lint/target.coil"
 cp "$T/lint/target.coil" "$T/lint/target.fixed"
-"$COIL" lint "$T/lint/target.coil" --use condlinton --fix >/dev/null 2>&1
+"$COIL" lint "$T/lint/target.coil" --use condlint --fix >/dev/null 2>&1
 cmp -s "$T/lint/target.coil" "$T/lint/target.fixed" \
   && ok "lint --fix: idempotent" || bad "lint --fix: idempotent" "a second --fix changed the file"
 
@@ -2991,11 +3011,11 @@ cp "$T/lint/comments.coil" "$T/lint/comments.orig"
 expect_rc 32 "lint --fix (comments): the program runs before the fix" \
   "$COIL" run "$T/lint/comments.coil"
 expect_out '^0$' "lint --fix (comments): no fix is refused over a comment" \
-  sh -c "\"$COIL\" lint \"$T/lint/comments.coil\" --use condlinton --fix 2>&1 | grep -c 'drop a comment'"
+  sh -c "\"$COIL\" lint \"$T/lint/comments.coil\" --use condlint --fix 2>&1 | grep -c 'drop a comment'"
 expect_rc 32 "lint --fix (comments): the program behaves identically after" \
   "$COIL" run "$T/lint/comments.coil"
 expect_out '^0$' "lint --fix (comments): no nested-if chain is left" \
-  sh -c "\"$COIL\" lint \"$T/lint/comments.coil\" --use condlinton 2>&1 | grep -c 'nested ifs'"
+  sh -c "\"$COIL\" lint \"$T/lint/comments.coil\" --use condlint 2>&1 | grep -c 'nested ifs'"
 # Every comment the author wrote is still in the file, byte for byte.
 miss=0
 while IFS= read -r c; do
@@ -3016,7 +3036,7 @@ expect_out 'cond \(= x 1\) "a; b" \(= x 2\) "c; d" \(= x 3\) "e" :else "f"' \
   "lint --fix (comments): a ';' inside a string is not treated as a comment" \
   cat "$T/lint/comments.coil"
 cp "$T/lint/comments.coil" "$T/lint/comments.fixed"
-"$COIL" lint "$T/lint/comments.coil" --use condlinton --fix >/dev/null 2>&1
+"$COIL" lint "$T/lint/comments.coil" --use condlint --fix >/dev/null 2>&1
 cmp -s "$T/lint/comments.coil" "$T/lint/comments.fixed" \
   && ok "lint --fix (comments): idempotent" \
   || bad "lint --fix (comments): idempotent" "a second --fix changed the file"

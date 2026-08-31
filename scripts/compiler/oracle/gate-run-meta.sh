@@ -107,7 +107,7 @@ rc=$?
 [ "$rc" = 0 ] || { echo "GATE FAIL: loaded warn exited $rc, want 0"; fail=1; }
 [ "$out" = '(scanned)' ] || { echo "GATE FAIL: loaded warn stdout: $out"; fail=1; }
 grep -q 'target has a main' "$WORK/warn.err" || { echo "GATE FAIL: loaded warn text missing"; fail=1; }
-grep -q 'run_code_main_target_a.coil:8' "$WORK/warn.err" || { echo "GATE FAIL: loaded warn not located in the target file"; fail=1; }
+grep -q 'run_code_main_target_a.coil:14' "$WORK/warn.err" || { echo "GATE FAIL: loaded warn not located in the target file"; fail=1; }
 
 # ---- LOADED code base: an EXISTING SEMANTIC checker (nofloat) as a program --
 # type-of answers about the target because the base is checked in-pipeline;

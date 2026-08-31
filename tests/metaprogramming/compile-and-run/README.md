@@ -17,9 +17,10 @@ One definition, two phases, one behavior. Exit 0 says so:
 `coil run tests/metaprogramming/compile-and-run/samecode_test.coil`.
 
     COIL_META_MAIN=1 coil run tests/metaprogramming/compile-and-run/mandel_test.coil \
+      --use mandelbrot \
       --link-flag -framework --link-flag AppKit --link-flag -lobjc
     # a Cocoa window opens DURING THE BUILD: WASD pan, Z/X zoom, I/O iters,
-    # Q/RETURN accept — the program then renders the view you chose.
+    # Q/RETURN close — the original program then runs unchanged.
     # (COIL_MANDEL_AUTO=1 scripts the session for reproducible builds.)
 
 Historical PoC below; run.sh runs everything.

@@ -89,7 +89,8 @@ raylib input: GetMouseX/Y, IsKeyPressed(KEY_SPACE=32). `for`/`while` from contro
 render loops correct-by-construction.
 
 ```
-LIBRARY_PATH=/opt/homebrew/lib  coil build app.coil -o app --use memgui.coil -lraylib
+LIBRARY_PATH=/opt/homebrew/opt/raylib/lib \
+  coil build app.coil -o app --use memgui --link-flag -lraylib
 ./app     # window updates live as it allocates; close it to exit
 ```
 
