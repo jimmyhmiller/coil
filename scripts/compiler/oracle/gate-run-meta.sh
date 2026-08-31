@@ -52,6 +52,23 @@ arena_total=$(awk -F ' \\| ' '/macro_arena\.repro\.passthrough$/ { print $4 }' "
 [ "$arena_total" -le 1048576 ] 2>/dev/null \
   || { echo "GATE FAIL: 100 trivial macros requested $arena_total backing bytes, want <= 1048576"; fail=1; }
 
+# Nested macros transport an already-owned argument tree through each result.
+# Promotion must copy the invocation-owned shell, not recursively duplicate the
+# persistent argument at every level; the checker must likewise visit shared,
+# context-identical expression nodes once. Poison mode proves shared children do
+# not retain aliases into the recycled invocation arena.
+awk 'BEGIN {
+  x = "0"
+  for (i = 0; i < 1500; i++) x = "(wrap " x ")"
+  print "(module macro_arena.nested)"
+  print "(defn wrap [(x Code)] (-> Code) `(cast i64 ~x))"
+  print "(defn main [] (-> i64) " x ")"
+}' > "$WORK/macro-arena-nested.coil"
+COIL_META_ARENA=poison "$BIN" expand "$WORK/macro-arena-nested.coil" >/dev/null 2>"$WORK/macro-arena-nested.err"
+rc=$?
+[ "$rc" = 0 ] \
+  || { echo "GATE FAIL: nested macro ownership fixture exited $rc ($(head -1 "$WORK/macro-arena-nested.err"))"; fail=1; }
+
 # ---- identity over stdin ----------------------------------------------------
 EXPECT='((hello 42))'
 expect_out identity-stdin sh -c "echo '(hello 42)' | '$BIN' run tests/metaprogramming/run_code_main_id.coil"

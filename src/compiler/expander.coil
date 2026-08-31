@@ -280,7 +280,12 @@
       (Some [hit] (if (= (len hit) (primitive/cast i64 0)) (None [(slice u8)]) (Some hit)))
       (None []
             (let [r (resolve-macro-uncached head module macros impb expb a)]
-              (set! (mut (.m mm)) head (match r (Some [q] q) (None [] "")))
+              ; The memo outlives per-invocation and per-form scratch arenas.
+              ; Own both sides at this global sink instead of retaining slices
+              ; into whichever allocator happened to resolve the first hit.
+              (set! (mut (.m mm))
+                    (ct-own-str head)
+                    (match r (Some [q] (ct-own-str q)) (None [] "")))
               r)))))
 
 (defn resolve-macro-uncached [(head (slice u8))
@@ -583,6 +588,57 @@
                 (set! seg (load (field (load seg) previous))))))
     0))
 
+; Promote only storage owned by one invocation arena. Unquoted macro arguments
+; already belong to the surrounding expansion tree; deep-copying them on every
+; nested invocation turns a linear syntax chain into quadratic retained data.
+(defn promote-sexp-from-arena [(a (dyn Allocator))
+                               (ar (ptr scratch/ScratchArena))
+                               (x (ptr Sexp))] (-> Sexp)
+  (let [tg (sx-tag (load x))]
+    (if (or (= tg (primitive/cast i64 6)) (= tg (primitive/cast i64 7)))
+        (let [items (sx-items (load x))]
+          (if (not (scratch/scratch-owns-address? ar (primitive/cast (ptr i8) items)))
+              (load x)
+              (let [n (sx-len items)
+                    (mut out) (al-new [Sexp] a)
+                    (mut i) 0]
+                (loop (if (>= (load i) n)
+                          (break)
+                          (do
+                            (let [child (al-elem [Sexp] items (load i))]
+                              (push! (mut out) (promote-sexp-from-arena a ar child)))
+                            (store! i (primitive/iadd (load i) 1)))))
+                (mk-sexp-src (if (= tg (primitive/cast i64 7))
+                                 (KVec (box-al [Sexp] a (load out)))
+                                 (KList (box-al [Sexp] a (load out))))
+                             x))))
+        (if (= tg (primitive/cast i64 8))
+            (let [n (code-node-len (load x))
+                  (mut out) (al-new [Sexp] a)
+                  (mut i) 0]
+              (loop (if (>= (load i) n)
+                        (break)
+                        (do
+                          (let [child (primitive/alloc-stack Sexp)]
+                            (store! child (code-node-at (load x) (load i)))
+                            (push! (mut out) (promote-sexp-from-arena a ar child)))
+                          (store! i (primitive/iadd (load i) 1)))))
+              (mk-sexp-src (KList (box-al [Sexp] a (load out))) x))
+            (if (or (= tg (primitive/cast i64 2))
+                    (or (= tg (primitive/cast i64 3))
+                        (or (= tg (primitive/cast i64 4)) (= tg (primitive/cast i64 5)))))
+                (let [value (sx-sval (load x))]
+                  (if (scratch/scratch-owns-address? ar
+                                                    (primitive/cast (ptr i8) (slice-data value)))
+                      (let [owned (sexp-own-str-into a value)]
+                        (mk-sexp-src (cond (= tg (primitive/cast i64 2)) (KSym owned)
+                                           (= tg (primitive/cast i64 3)) (KKw owned)
+                                           (= tg (primitive/cast i64 4)) (KStr owned)
+                                           :else (KCStr owned))
+                                     x))
+                      (load x)))
+                (load x))))))
+
 ;;; Per-metaprogram memory attribution (COIL_MTRACE=mem): without the arena,
 ;;; difference the root arena's monotonic byte counter across the invocation —
 ;;; the delta includes nested expansions, the cost this metaprogram CAUSES. With
@@ -634,11 +690,15 @@
                 (Ok [sx]
                     (let [sp (primitive/alloc-stack Sexp)]
                       (set! sp sx)
-                      (Ok [Sexp Diag] (ct-own-sexp sp))))
+                      ; Own the result in the expansion walk's allocator. The walk
+                      ; may itself be disposable; promoting every invocation
+                      ; straight to malloc retains all intermediate syntax until
+                      ; process exit.
+                      (Ok [Sexp Diag] (promote-sexp-from-arena a ar sp))))
                 (Err [d]
                      (let [dp (primitive/alloc-stack Diag)]
                        (set! dp d)
-                       (set! (.msg dp) (ct-own-str (.msg dp)))
+                       (set! (.msg dp) (sexp-own-str-into a (.msg dp)))
                        (Err [Sexp Diag] (load dp)))))]
         (when (mtrace-mem?)
           (mtrace-mem-record! fn-name
@@ -5439,17 +5499,43 @@
                                             (or (is-transform-form (field tf form))
                                                 (is-register-derive-form (field tf form))))
                                         0
-                                        (match (expand-top-form (field tf form)
-                                                                module
-                                                                env
-                                                                (field allfns items)
-                                                                (field gs items)
-                                                                (field gu items)
-                                                                (mut depthv)
-                                                                (mut s))
-                                          (Err [d] (set! errf (Some d)))
-                                          (Ok [outf]
-                                              (do-produced (box-sexp a outf) module tf result gs gu allfns a (mut errf)))))))
+                                        (let [form-work (primitive/alloc-stack scratch/ScratchArena)
+                                              _form-init
+                                                (scratch/scratch-init-with-cap form-work (malloc-allocator) 262144)
+                                              form-a (scratch/scratch-allocator form-work)
+                                              form-env (primitive/alloc-stack ExpEnv)]
+                                          (store! form-env (load env))
+                                          (store! (field form-env a) form-a)
+                                          (match (expand-top-form (field tf form)
+                                                                  module
+                                                                  form-env
+                                                                  (field allfns items)
+                                                                  (field gs items)
+                                                                  (field gu items)
+                                                                  (mut depthv)
+                                                                  (mut s))
+                                            (Err [d]
+                                                 (let [dp (primitive/alloc-stack Diag)]
+                                                   (store! dp d)
+                                                   (store! (field dp msg)
+                                                           (sexp-own-str-into a (load (field dp msg))))
+                                                   (scratch/scratch-close! form-work)
+                                                   (store! errf (Some (load dp)))
+                                                   0))
+                                            (Ok [outf]
+                                                (let [sp (primitive/alloc-stack Sexp)]
+                                                  (store! sp outf)
+                                                  (let [owned (sexp-own-into a sp)]
+                                                    (scratch/scratch-close! form-work)
+                                                    (do-produced (box-sexp a owned)
+                                                                 module
+                                                                 tf
+                                                                 result
+                                                                 gs
+                                                                 gu
+                                                                 allfns
+                                                                 a
+                                                                 (mut errf))))))))))
                                 (set! i (primitive/iadd (load i) 1)))))
                     (match (load errf)
                       (Some [d] (Err [i64 Diag] d))
@@ -5482,7 +5568,6 @@
                                                        gs
                                                        gu)
                                     (Ok [i64 Diag] 0)))))))))))))
-
 (defn do-produced [(outf (ptr Sexp))
                    (module (Option (slice u8)))
                    (origin (ptr TaggedForm))
