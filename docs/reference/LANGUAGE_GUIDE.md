@@ -57,8 +57,11 @@ typed signature updates its stable `Var (fnptr c [Args...] R)`, so functions
 already compiled against that binding call the new implementation. A different
 signature is rejected transactionally, leaving the working definition intact.
 
-Expressions print integers, floats, booleans, strings, and pointers. Useful
-commands are `:type EXPR`, `:load NAMESPACE`, `:defs`, `:reset`, `:cancel`,
+Expression results use the same formatting traits as ordinary programs. The REPL
+prefers `Debug`, including derived structs and collections whose members implement
+`Debug`; if that is unavailable it tries `Display`. If neither trait is available,
+the expression remains valid and the REPL says that it cannot print the value yet.
+Useful commands are `:type EXPR`, `:load NAMESPACE`, `:defs`, `:reset`, `:cancel`,
 `:help`, and `:quit`. Definitions and failed evaluations are transactional;
 successful `alloc-static` storage survives later evaluations and reloads.
 
@@ -1505,30 +1508,36 @@ allocation. (The old tree-walking interpreter and its `COIL_META` flag are gone.
 value with the real C ABI. To call a Coil fn from C (e.g. `qsort` comparator) pass
 `(primitive/fnptr-of f)`. Ambient `print`/`println` (over stdout) need no import.
 `io.coil`/`fmt.coil` give a `(ptr Writer)` API: `(stdout)`, `(stderr)`,
-`(print-str w s)`, `(fmt w "n={d} s={s} f={f}\n" a b c)`. ⚠ `{f}` is a fixed
-6-digit display, NOT C `%g`; for exact float formatting call libc `snprintf` with
+`(print-str w s)`, `(fmt w "n={} s={} f={}\n" a b c)`. Formatting is
+type-directed: `{}` uses `Display`, `{:?}` uses compact `Debug`, `{:#?}` uses
+pretty `Debug`, and `{:x}`/`{:#x}` use lowercase hexadecimal formatting.
+Float `Display` uses fixed six-digit precision, not C `%g`; for exact formatting call libc `snprintf` with
 `c"%g"`. `coil cimport header.h` auto-generates bindings from a real C header.
 
-`coil.debug` provides the derivable `Debug` trait plus `debug` and `debugln`:
+`coil.fmt` provides `Display` and `Debug`; `coil.debug` adds standard collection
+implementations, deriving, and the `debug`/`debugln` compatibility helpers:
 
     (import "coil.debug" :use *)
     (derive Debug Point)
-    (debugln (Point :x 10 :y 20))
+    (println "{:?}" (Point :x 10 :y 20))
+    ; (Point :x 10 :y 20)
+    (println "{:#?}" (Point :x 10 :y 20))
     ; (Point
     ;   :x 10
     ;   :y 20
     ; )
 
-Derived structs and sums are pretty-printed by default with recursive indentation.
-Their output uses valid named-constructor syntax, so a value whose component `Debug`
-implementations emit source can be pasted back into a program.
+Derived structs and sums use compact Coil constructor syntax for `{:?}` and
+recursively indented constructor syntax for `{:#?}`. A value whose component
+`Debug` implementations emit source can be pasted back into a program. `ArrayList<T>`,
+`Option<T>`, and `HashMap<K,V>` implement `Debug` when their members do.
 
 An option-bearing `Debug` derive can omit sensitive, noisy, or non-debuggable struct
 fields:
 
     (defstruct Account [(name (slice u8)) (password_hash (slice u8)) (active bool)])
     (derive (Debug (field password_hash (skip))) Account)
-    (debugln (Account :name "Ada" :password_hash "secret" :active true))
+    (println "{:#?}" (Account :name "Ada" :password_hash "secret" :active true))
     ; (Account
     ;   :name "Ada"
     ;   :active true

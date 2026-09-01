@@ -3769,6 +3769,30 @@ EOF
       bad "repl never attributes a derive failure to its synthetic preamble" "$repl_ambient_derive_out" ;;
     *) ok "repl never attributes a derive failure to its synthetic preamble" ;;
   esac
+
+  repl_debug_out=$(printf '%s\n' \
+    '(defstruct Hidden [(x i64)])' \
+    '(Hidden :x 1)' \
+    '(import "coil.fmt" :as f)' \
+    '(defstruct Label [(x i64)])' \
+    '(impl f/Display Label (display-fmt [(v Label) (fm (ptr f/Formatter))] (-> i64) (f/formatter-write fm "display-only") 0))' \
+    '(Label :x 2)' \
+    '(import "coil.debug" :use *)' \
+    '(derive Debug Label)' \
+    '(Label :x 3)' \
+    '(defstruct Point [(x i64) (y i64)])' \
+    '(derive Debug Point)' \
+    '(Point :x 10 :y 20)' \
+    '(import "coil.arraylist" :use *)' \
+    '(import "coil.alloc" :use *)' \
+    '(defn nums [] (-> (ArrayList i64)) (let [(mut xs) (al-new [i64] (malloc-allocator))] (push! (mut xs) 1) (push! (mut xs) 2) (load xs)))' \
+    '(nums)' \
+    ':q' | "$REPL_COIL" repl 2>&1)
+  case "$repl_debug_out" in
+    *"implements neither Debug nor Display"*"display-only"*"(Label :x 3)"*"(Point :x 10 :y 20)"*"(1 2)"*)
+      ok "repl prefers Debug, falls back to Display, and explains unprintable values" ;;
+    *) bad "repl prefers Debug, falls back to Display, and explains unprintable values" "$repl_debug_out" ;;
+  esac
 fi
 
 echo

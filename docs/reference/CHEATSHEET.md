@@ -43,7 +43,7 @@ list of concepts.
 
     (defn main [] (-> i64)
       (let [p (Point :x 3 :y 4)]
-        (println "distance squared: {d}" (distance-squared p))
+        (println "distance squared: {}" (distance-squared p))
         0))
 
 ## Definitions and types
