@@ -214,6 +214,28 @@ expect_rc 7   "run propagates a normal exit code"        "$COIL" run "$T/seven.c
 expect_rc 134 "run propagates SIGABRT as 128+signo"      "$COIL" run "$T/abort.coil"
 expect_out "signal 6 \(SIGABRT\)" "a signal death names itself" "$COIL" run "$T/abort.coil"
 
+echo "== run keeps every argument after -- out of compiler option parsing =="
+cat > "$T/run-child-flags.coil" <<'EOF'
+(module run-child-flags)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :as slice)
+(extern strcmp :cc c [(ptr i8) (ptr i8)] (-> i32))
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (if (!= (cast i64 argc) 3)
+      10
+      (if (!= (cast i64 (strcmp (load (primitive/index argv 1))
+                                (slice/slice-data [u8] "-o")))
+              0)
+          11
+          (cast i64 (strcmp (load (primitive/index argv 2))
+                            (slice/slice-data [u8] "child-output"))))))
+EOF
+expect_rc 0 "child -o is passed verbatim after --" \
+  "$COIL" run "$T/run-child-flags.coil" -- -o child-output
+[ ! -e child-output ] \
+  && ok "child -o does not select Coil's build output" \
+  || bad "child -o does not select Coil's build output" "run leaked a post--- flag into build parsing"
+
 echo "== a file the user named must exist =="
 expect_rc 1 "build: missing file is an error"            "$COIL" build "$T/nope.coil" -o "$T/x"
 expect_out "no such file" "build: missing file is named" "$COIL" build "$T/nope.coil" -o "$T/x"
@@ -2542,6 +2564,36 @@ EOF
 else
   echo "  skip — dsymutil not on PATH (not a macOS toolchain host)"
 fi
+
+echo "== runtime-only manifest links stay out of metaprogram dylibs =="
+mkdir -p "$T/runtime-link-project"
+cat > "$T/runtime-link-project/Coil.toml" <<'EOF'
+[project]
+entry = "main.coil"
+
+[link]
+libs = ["coil_runtime_link_must_not_load"]
+EOF
+cat > "$T/runtime-link-project/main.coil" <<'EOF'
+(module runtime-link.main)
+(defn answer [] (-> Code) `42)
+(defn main [] (-> i64) (- (answer) 42))
+EOF
+expect_rc 0 "manifest [link] libraries are not loaded into the compiler" \
+  env COIL_META_JIT=0 "$COIL" check "$T/runtime-link-project/main.coil"
+
+echo "== curl auto-link detection reads undefined symbols, not string bytes =="
+cat > "$T/curl-name-string.coil" <<'EOF'
+(module curl-name-string)
+(import "coil.primitive" :use *)
+(import "coil.slice" :as slice)
+(extern puts :cc c [(ptr i8)] (-> i32))
+(defn main [] (-> i64)
+  (do (puts (slice/slice-data [u8] "curl_easy_init")) 0))
+EOF
+expect_rc 0 "a curl symbol name in ordinary data does not request bundled libcurl" \
+  "$COIL" build "$T/curl-name-string.coil" -o "$T/curl-name-string"
+expect_out '^curl_easy_init$' "the ordinary string program runs" "$T/curl-name-string"
 
 echo "== comptime/const route through the compiled engine (mac-8; interp deletion step 1) =="
 # The tree-walk interpreter is a strictly WEAKER sublanguage than a macro body: no
