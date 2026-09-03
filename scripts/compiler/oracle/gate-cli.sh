@@ -701,6 +701,53 @@ EOF
   && ok "workspace build fans out over executable members" \
   || bad "workspace build" "member executable was not produced"
 
+echo "== manifest secondary Coil artifacts =="
+mkdir -p "$T/secondary-artifact/src/runtime"
+cat > "$T/secondary-artifact/Coil.toml" <<'EOF'
+[package]
+name = "secondary-artifact"
+entry = "src/main.coil"
+
+[artifacts.runtime]
+kind = "object"
+entry = "src/runtime/runtime.coil"
+out = "build/release/runtime.o"
+EOF
+cat > "$T/secondary-artifact/src/main.coil" <<'EOF'
+(defn main [] (-> i64) 0)
+EOF
+cat > "$T/secondary-artifact/src/runtime/runtime.coil" <<'EOF'
+(module secondary.runtime)
+(export-c [runtime-answer :as "runtime_answer"])
+(defn runtime-answer [] (-> i64) 42)
+EOF
+secondary_symbols=""
+( cd "$T/secondary-artifact" && "$COIL" build >/dev/null 2>&1 ) \
+  && [ -x "$T/secondary-artifact/build/release/secondary-artifact" ] \
+  && [ -f "$T/secondary-artifact/build/release/runtime.o" ] \
+  && secondary_symbols=$(nm "$T/secondary-artifact/build/release/runtime.o")
+case "$secondary_symbols" in
+  *runtime_answer*) ok "bare project build emits declared Coil object artifacts" ;;
+  *) bad "secondary Coil artifact" "executable, object, or exported runtime symbol missing" ;;
+esac
+
+mkdir -p "$T/secondary-explicit/src/runtime"
+cp "$T/secondary-artifact/Coil.toml" "$T/secondary-explicit/Coil.toml"
+cp "$T/secondary-artifact/src/main.coil" "$T/secondary-explicit/src/main.coil"
+cp "$T/secondary-artifact/src/runtime/runtime.coil" "$T/secondary-explicit/src/runtime/runtime.coil"
+( cd "$T/secondary-explicit" && "$COIL" build src/main.coil -o explicit-main >/dev/null 2>&1 ) \
+  && [ -x "$T/secondary-explicit/explicit-main" ] \
+  && [ ! -e "$T/secondary-explicit/build/release/runtime.o" ] \
+  && ok "explicit-file build does not emit manifest secondary artifacts" \
+  || bad "explicit-file secondary artifact selection" "secondary object was emitted or main build failed"
+
+sed 's/kind = "object"/kind = "archive"/' "$T/secondary-artifact/Coil.toml" \
+  > "$T/secondary-artifact/Coil.bad.toml"
+mv "$T/secondary-artifact/Coil.toml" "$T/secondary-artifact/Coil.good.toml"
+mv "$T/secondary-artifact/Coil.bad.toml" "$T/secondary-artifact/Coil.toml"
+expect_out 'artifact kind must be "object"' "unsupported secondary artifact kinds are rejected" \
+  sh -c "cd '$T/secondary-artifact' && '$COIL' build"
+
 echo "== namespace index: file placement is irrelevant and paths are rejected =="
 mkdir -p "$T/sib/src/unrelated/place"
 printf '[package]\nname  = "sib"\nentry = "src/main.coil"\n'                             > "$T/sib/Coil.toml"

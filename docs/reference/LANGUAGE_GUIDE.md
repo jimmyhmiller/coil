@@ -189,6 +189,11 @@ A fuller project can declare:
     [build]
     optimization = 2
 
+    [artifacts.runtime]
+    kind = "object"
+    entry = "src/runtime.coil"
+    out = "build/release/runtime.o"
+
     [cc]
     sources = ["native/app.c"]
     include-dirs = ["native"]
@@ -236,6 +241,14 @@ A fuller project can declare:
 Native objects and depfiles live under `.coil/build/native/`; sources and headers
 are rebuilt only when their inputs or toolchain configuration change. Test runners
 use collision-free paths under `.coil/build/test/`.
+
+A package may declare additional Coil object outputs with `[artifacts.NAME]`.
+Each object has `kind = "object"`, a Coil `entry`, and an explicit `out` path.
+A bare `coil build` emits every declared object before building the package executable;
+the same manifest target, optimization, debug, sanitizer, backend, dependency, and
+metaprogram settings apply. `coil build FILE.coil` remains an explicit single-file
+build and does not emit secondary artifacts. Artifact output paths are relative to the
+package manifest, and Coil creates their parent directories.
 
 A native dependency selects exactly one discovery provider. `pkg-config` names a
 package whose link flags Coil queries in the usual way. `flags-command` runs a
