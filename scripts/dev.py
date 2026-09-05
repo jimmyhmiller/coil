@@ -571,6 +571,24 @@ def test_modernize_fast(compiler: str) -> None:
                    for line in ir.splitlines()):
                 raise RuntimeError("fast modernization gate: alloc-static initializer emitted runtime stores")
 
+        def mtrace_fatal_report_task() -> None:
+            if not backend_flags:
+                return
+            result = subprocess.run(
+                [coil, "build",
+                 "tests/compiler/oracle/diag/build-inputs/15-llvm-ir-parse-fail.coil",
+                 *backend_flags, "-o", str(tmp / "mtrace-fatal")],
+                cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env={**os.environ, "COIL_MTRACE": "mem"})
+            if result.returncode == 0:
+                raise RuntimeError("fast modernization gate: fatal mtrace probe unexpectedly built")
+            if result.stderr.count("mtrace  mem: per-metaprogram allocation") != 1:
+                raise RuntimeError(
+                    "fast modernization gate: fatal backend path did not print one memory report")
+            if "cga64: llvm-ir: unsupported line" not in result.stderr:
+                raise RuntimeError(
+                    "fast modernization gate: fatal mtrace probe lost its original diagnostic")
+
         def alias_memory_task() -> None:
             source = "tests/compiler/features/alias_memory.coil"
             ir = subprocess.run([coil, "emit-ir", source], cwd=ROOT,
@@ -1061,6 +1079,9 @@ source-roots = ["src"]
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o3", "-O3"),
             lambda: build_run("tests/compiler/features/void_if_discarded.coil", "void-if-discarded"),
             lambda: build_run("src/examples/bitfields.coil", "static-assert", *backend_flags, want=42),
+            lambda: build_run("tests/compiler/features/alloc_static_initial.coil",
+                              "alloc-static-initial-direct", *backend_flags),
+            mtrace_fatal_report_task,
             lint_task,
             default_lint_task,
             broken_lint_task,
