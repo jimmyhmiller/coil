@@ -49,6 +49,7 @@ INTERNAL_NAMESPACES = {
     "coil.assert.hermetic",
     "coil.http.parser.types",
     "coil.http.parser.generated",
+    "coil.meta-runtime",
     # coil.prop's engine room. Importable, but `coil.prop` re-exports everything a
     # user needs, so listing the internals would triple the size of what `coil
     # namespaces` prints for one feature.

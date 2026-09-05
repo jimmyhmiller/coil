@@ -48,6 +48,10 @@ counter="$T/reader-count"
 
 "$COIL" run "$FIX/raw.answer" --use reader.fixture.computed >/dev/null
 [ $? = 10 ] || fail "computed runtime string passed to code-read"
+COIL_META_ARENA=poison "$COIL" run "$FIX/raw.answer" --use reader.fixture.arena >/dev/null
+[ $? = 42 ] || fail "reader borrowed expansion allocator survives Code promotion"
+COIL_META_INTERP=1 COIL_META_ARENA=poison "$COIL" run "$FIX/raw.answer" --use reader.fixture.arena >/dev/null
+[ $? = 42 ] || fail "interpreted reader borrowed expansion allocator parity"
 "$COIL" run "$FIX/raw.answer" "$FIX/config.sexpr" \
   --use reader.fixture.computed -- -I inc -DNAME=7 -include forced.h >/dev/null
 [ $? = 25 ] || fail "aggregate reader inputs/arguments"

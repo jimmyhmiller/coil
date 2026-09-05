@@ -245,6 +245,9 @@ function instantiateSide(bytesPtr, len) {
 function meta_run_wasm(bytesPtr, len, symPtr, argc, ...args) {
   const sym = cstr(symPtr);
   const side = instantiateSide(bytesPtr, len);
+  const init = side.exports.coil_mp_init;
+  if (typeof init !== 'function') throw new Error('meta_run_wasm: side-module has no export coil_mp_init');
+  init(0n);
   const entry = side.exports[sym];
   if (typeof entry !== 'function') throw new Error(`meta_run_wasm: side-module has no export ${sym}`);
   const callArgs = args.slice(0, Number(argc)).map((x) => BigInt(x));
