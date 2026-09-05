@@ -145,6 +145,9 @@ $COIL check tests/compiler/features/regex_nonliteral_rejected.coil > "$OUT/regex
 $COIL check tests/compiler/features/regex_invalid_rejected.coil > "$OUT/regex-invalid.txt" 2>&1; rc=$?
 [ $rc -ne 0 ] && grep -q "unmatched '('" "$OUT/regex-invalid.txt" \
   || { cat "$OUT/regex-invalid.txt"; echo "AOT regex syntax diagnostic FAILED"; exit 1; }
+$COIL check tests/compiler/features/regex_unsupported_rejected.coil > "$OUT/regex-unsupported.txt" 2>&1; rc=$?
+[ $rc -ne 0 ] && grep -q "backreferences and Unicode properties are not yet supported" "$OUT/regex-unsupported.txt" \
+  || { cat "$OUT/regex-unsupported.txt"; echo "AOT regex unsupported-feature diagnostic FAILED"; exit 1; }
 echo "AOT regex: OK (semantics, single evaluation, and compile-time diagnostics)"
 
 # Step 13 was the transparent-GC demo (normal code, zero annotations, a transform

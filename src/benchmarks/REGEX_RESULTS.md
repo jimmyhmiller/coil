@@ -12,8 +12,8 @@ scripts/benchmarks/regex.sh
 
 | workload | Coil | Rust regex | result |
 |---|---:|---:|---:|
-| absent literal `Sherlock` in repeated `x` | 16.3 ms ± 0.7 ms | 19.0 ms ± 0.4 ms | Coil 1.16× faster |
-| absent `[A-Za-z]+Z` in repeated `a` | 3.2 ms ± 0.2 ms | 341.4 ms ± 3.1 ms | Coil 106.59× faster |
+| absent literal `Sherlock` in repeated `x` | 18.5 ms ± 0.8 ms | 23.3 ms ± 0.6 ms | Coil 1.26× faster |
+| absent `[A-Za-z]+Z` in repeated `a` | 3.9 ms ± 0.4 ms | 367.6 ms ± 6.5 ms | Coil 94.94× faster |
 
 The literal result uses the specialized `memchr` candidate scan added after the
 baseline measurement. Before that specialization, the same generated scalar
