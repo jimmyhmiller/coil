@@ -1,5 +1,26 @@
 # Hosted system library
 
+## Ahead-of-time byte regular expressions
+
+`coil.regex` provides the macro `(is-match? PATTERN HAYSTACK)`. `PATTERN` must be
+a string literal: the macro parses it during compilation and emits an
+allocation-free, bit-parallel Thompson state machine at the call site. The
+runtime binary contains neither a regex parser nor a compiled-regex object, and
+the haystack expression is evaluated exactly once.
+
+The initial byte-oriented syntax supports literals, `.`, grouping, alternation,
+`*`, `+`, `?`, byte classes and ranges (including negation), `\d`, `\w`, `\s`,
+and outer `^`/`$` anchors. Dot excludes newline. Accepted expressions are
+limited to 63 Thompson states so the active set always fits in one machine word;
+larger expressions fail at compile time instead of selecting a hidden slow
+path. Matching is linear in the haystack length and uses no runtime allocation.
+
+```coil
+(import "coil.regex" :as re)
+
+(re/is-match? "^[A-Za-z_][A-Za-z0-9_]*$" name)
+```
+
 Coil's hosted system APIs follow Python's separation of concerns while retaining
 Coil's typed errors, explicit allocation, and caller-owned resources. They target
 native Linux and macOS. Importing none of these namespaces keeps freestanding and

@@ -136,6 +136,17 @@ ua=$(grep -c "error: use after release" "$OUT/own.txt"); dr=$(grep -c "error: do
 [ "$ua" -eq 1 ] && [ "$dr" -eq 1 ] || { cat "$OUT/own.txt"; echo "expected 1 use-after + 1 double-release, got $ua/$dr"; exit 1; }
 echo "borrow-checker dialect: OK (valid runs; bad vetoed with 2 located errors)"
 
+echo "=== 12b. AOT REGEX MACRO: compile-time parser -> allocation-free state machine ==="
+$COIL run tests/regex_test.coil >/dev/null 2>&1; rc=$?
+[ $rc -eq 0 ] || { echo "AOT regex semantics FAILED (exit $rc)"; exit 1; }
+$COIL check tests/compiler/features/regex_nonliteral_rejected.coil > "$OUT/regex-nonliteral.txt" 2>&1; rc=$?
+[ $rc -ne 0 ] && grep -q "pattern must be a string literal" "$OUT/regex-nonliteral.txt" \
+  || { cat "$OUT/regex-nonliteral.txt"; echo "AOT regex non-literal diagnostic FAILED"; exit 1; }
+$COIL check tests/compiler/features/regex_invalid_rejected.coil > "$OUT/regex-invalid.txt" 2>&1; rc=$?
+[ $rc -ne 0 ] && grep -q "unmatched '('" "$OUT/regex-invalid.txt" \
+  || { cat "$OUT/regex-invalid.txt"; echo "AOT regex syntax diagnostic FAILED"; exit 1; }
+echo "AOT regex: OK (semantics, single evaluation, and compile-time diagnostics)"
+
 # Step 13 was the transparent-GC demo (normal code, zero annotations, a transform
 # inserting heap/alloc/roots). It moved with src/experiments to the
 # coil-experiments repository; the dialect steps above (borrow checker, tower,
