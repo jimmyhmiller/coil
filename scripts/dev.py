@@ -1110,6 +1110,11 @@ def test_wasm(compiler: str) -> None:
     if result.returncode or b"meta_run_wasm" in result.stderr or b"WALL1" in result.stderr:
         sys.stderr.buffer.write(result.stderr)
         raise SystemExit("wasm compiler self-check failed")
+    record_wasm = "/tmp/gate-wasm32-arraylist-record.wasm"
+    execute(compiler, "build", "tests/compiler/features/wasm32_arraylist_record.coil",
+            "--target", "wasm32-unknown-unknown", "-o", record_wasm)
+    execute("wasm-tools", "validate", record_wasm)
+    execute("node", "scripts/tests/wasm32-arraylist-record.mjs", record_wasm)
     print("wasm gate: PASS")
 
 

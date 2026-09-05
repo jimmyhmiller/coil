@@ -3612,6 +3612,33 @@ expect_out "non-exhaustive match" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check missing.coil 2>&1' \
   _ "$T/variant" "$COIL"
 
+echo "== lint: recursive Code walkers migrate to iterators =="
+mkdir -p "$T/meta-iter-lint"
+cat > "$T/meta-iter-lint/m.coil" <<'EOF'
+(module meta_iter_lint)
+(import "coil.primitive" :as primitive)
+(defn visit [(form Code)] (-> i64) (if (primitive/code-list? form) 1 0))
+(defn walk [(forms Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n)
+      0
+      (do
+        (visit (primitive/code-nth forms i))
+        (walk forms (+ i 1) n))))
+(defn main [] (-> i64) 0)
+EOF
+expect_rc 0 "meta lint fixes a canonical recursive Code walker" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" lint m.coil --use coil.lint.meta --fix' \
+  _ "$T/meta-iter-lint" "$COIL"
+expect_out "primitive/code-slice forms i n" \
+  "meta lint: fixed walker iterates an O(1) Code view" \
+  cat "$T/meta-iter-lint/m.coil"
+expect_rc 0 "meta lint: fixed walker has no self recursion" \
+  bash -c '! grep -F "(walk forms (+ i 1) n)" "$1"' \
+  _ "$T/meta-iter-lint/m.coil"
+expect_rc 0 "meta lint: fixed walker still compiles" \
+  bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check m.coil' \
+  _ "$T/meta-iter-lint" "$COIL"
+
 echo "== lint: match-else migrates to a \`_\` arm =="
 # `match-else` was the library macro that faked a catch-all before `match` had one.
 # The rule is a head swap, so the arms — and any comments between them — come through

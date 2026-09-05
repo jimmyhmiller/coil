@@ -22,8 +22,8 @@ Distinguished only by *what they receive* and *what they return*.
   `(transform desugar-inc)`. The compiler runs them during compilation. A **checker is
   handed the program as a list of modules** — `((name form…) …)`, one record per module
   (head = module name symbol, rest = its top-level forms). The checker owns the loop and
-  decides which modules to look at (e.g. skip the ones where `(primitive/code-from-user? (primitive/code-nth m 1))`
-  is false). A **transformer** still gets the flat form list (it rewrites in place).
+  decides which modules to look at. A **transformer** receives the same module-shaped
+  input and returns a `do` bundle of module records (see “Transforms” below).
 - **Dialects** — *import* a module that contains those registrations: one
   `(import "safe_dialect")` applies its whole stack.
 - **From the CLI, optionally** — `coil run app.coil --use lint.coil` imports a
@@ -36,6 +36,33 @@ reflection, and the compiled comptime engine. The difference is **scope** (my-ca
 vs whole-program) and **power** (produce vs reject vs rewrite). An ordered stack of
 checkers/transformers is what we mean by a **dialect** (e.g. the GC dialect, a
 Rust-like ownership dialect, a Scheme frontend).
+
+### Walking the whole program
+
+`Code` implements `Len`, `Get`, `Iterable`, and `Iterator`. Prefer the ordinary
+collection loop over hand-written `(modules i n)` recursion:
+
+```coil
+(defn walk-module [(module Code)] (-> Code)
+  (do
+    ; The record head is the module name; its O(1) rest view contains the forms.
+    (for form (iter (primitive/code-rest module))
+      (walk-form form))
+    `0))
+
+(defn check-program [(modules Code)] (-> Code)
+  (do
+    (for module (iter modules) (walk-module module))
+    `0))
+
+(checker check-program)
+```
+
+Iteration preserves syntax identity and source provenance. `iter` itself allocates no
+collection, and advancing a `Code` iterator replaces its remaining O(1) view, so the
+walk is linear and does not build intermediate lists. Use `primitive/code-nth` directly
+when an algorithm genuinely needs random access; use `CodeBuilder` plus `push!` when it
+needs to construct output.
 
 ## The API (the vocabulary), all shipped
 

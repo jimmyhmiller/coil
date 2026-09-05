@@ -10,12 +10,14 @@ the deviations).
 
 Deviations from the plan below, and why:
 
-- **The lint is warn-only** rather than shipping `--diff` assisted fixes: the
-  linear rewrite changes a helper's signature or restructures its whole body,
-  which a per-form suggest cannot express honestly. The sweep was done as
-  code changes instead (every finding in stdlib and examples, with
-  emit-ir-verified byte-identical expansion output), and the lint keeps the
-  idioms out.
+- **The builder/resplice rules remain warn-only.** Their linear rewrite changes
+  ownership and result construction across a whole helper, which a local
+  suggestion cannot express honestly. The canonical read-only `(Code, index,
+  count)` tail-recursive walker now has a safe autofix: it preserves the
+  signature and replaces the body with iteration over an O(1) `code-slice`
+  view. Less regular recursion still warns. The original sweep was done as code
+  changes (with emit-ir-verified byte-identical expansion output), and the lint
+  keeps the idioms out.
 - **Metering needed no counting shim**: the scratch arena grew a monotonic
   `total` counter, so phase 1 was a subtraction and phase 6 had nothing to
   delete.
