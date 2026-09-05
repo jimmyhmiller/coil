@@ -643,6 +643,27 @@ def test_modernize_fast(compiler: str) -> None:
             if before != hashlib.sha256(probe.read_bytes()).digest():
                 raise RuntimeError("fast modernization gate: lint --fix is not idempotent")
 
+            pointer_field_probe = tmp / "pointer-field-store.coil"
+            pointer_field_probe.write_text("""(module pointer-field-store)
+(import "coil.primitive" :as primitive)
+(defstruct Child [(value i64)])
+(defstruct Parent [(child (ptr Child))])
+(defn assign [(p (ptr Parent))] (-> void)
+  (primitive/store! (primitive/field (primitive/load (primitive/field p child)) value) 42))
+""")
+            execute(coil, "lint", str(pointer_field_probe), "--fix")
+            pointer_field_fixed = pointer_field_probe.read_text()
+            expected_pointer_store = "(set! (.value (.child p)) 42)"
+            if expected_pointer_store not in pointer_field_fixed:
+                raise RuntimeError(
+                    "fast modernization gate: pointer-valued nested field store lost its dereference")
+            execute(coil, "check", str(pointer_field_probe))
+            before_pointer_field = hashlib.sha256(pointer_field_probe.read_bytes()).digest()
+            execute(coil, "lint", str(pointer_field_probe), "--fix")
+            if before_pointer_field != hashlib.sha256(pointer_field_probe.read_bytes()).digest():
+                raise RuntimeError(
+                    "fast modernization gate: pointer-valued nested field fix is not idempotent")
+
             stack_probe = tmp / "legacy-stack.coil"
             stack_probe.write_text("""(module legacy-stack)
 (import "coil.alloc" :as alloc)
