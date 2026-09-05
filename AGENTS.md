@@ -1,5 +1,16 @@
 # Agent guide to this repo
 
+## Stopping points and delivery
+
+Whenever a problem is solved, or work reaches a stopping point with changes in
+this repository, install the resulting Coil toolchain globally, commit the
+changes, and push the commit. Do not leave completed or stopping-point work only
+in the working tree.
+
+If work is still incomplete when stopping, explicitly tell the user whether the
+current changes have been installed globally, committed, and pushed. Report each
+of those three states separately; never leave their status implicit.
+
 **Writing Coil? Run `coil guide`** (or read [`docs/reference/LANGUAGE_GUIDE.md`](docs/reference/LANGUAGE_GUIDE.md)).
 It's a dense, practical language reference — types, operators, memory, control
 flow, FFI, and the gotchas that trip agents up (f64 has no `Eq`; don't `alloc-stack`
