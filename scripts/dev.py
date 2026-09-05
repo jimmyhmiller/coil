@@ -598,7 +598,9 @@ def test_modernize_fast(compiler: str) -> None:
 (defn main [] (-> i64)
   (let [legacy \a
         delimiter \]
+        quote \"
         canonical #\space
+        json "{\\\"id\\\":"
         text "\x41face"
         bytes c"\x00Z"
         slash-cstr c"\\u00"
@@ -615,6 +617,8 @@ def test_modernize_fast(compiler: str) -> None:
                 raise RuntimeError("fast modernization gate: hex escape preflight edited non-legacy text")
             if "legacy #\\a" not in hex_fixed or "delimiter #\\]" not in hex_fixed:
                 raise RuntimeError("fast modernization gate: legacy character literals were not migrated")
+            if 'quote #\\"' not in hex_fixed or 'json "{\\\\\\"id\\\\\\":"' not in hex_fixed:
+                raise RuntimeError("fast modernization gate: character migration corrupted an escaped string")
             if "canonical #\\space" not in hex_fixed:
                 raise RuntimeError("fast modernization gate: canonical character literal was changed")
             if 'c"\\\\u00"' not in hex_fixed or 'c"\\\\\\\""' not in hex_fixed:

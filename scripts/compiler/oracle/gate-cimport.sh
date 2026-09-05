@@ -13,6 +13,12 @@ grep -qF '(const COIL_CAST_OPTION 512)' "$tmp/expressions.coil"
 grep -qF '(array u8 37)' "$tmp/expressions.coil"
 grep -qF '(defstruct coil_uninspectable :layout explicit' "$tmp/expressions.coil"
 
+"$compiler" cimport tests/compiler/cimport/opaque.h -o "$tmp/opaque.coil"
+"$compiler" check "$tmp/opaque.coil"
+grep -qF '(defstruct coil_opaque_session [])' "$tmp/opaque.coil"
+grep -qF '(extern coil_opaque_session_create :cc c [] (-> (ptr coil_opaque_session)))' "$tmp/opaque.coil"
+grep -qF '(extern coil_opaque_session_destroy :cc c [(ptr coil_opaque_session)] (-> void))' "$tmp/opaque.coil"
+
 "$compiler" dump-load tests/compiler/cimport/selective.coil >"$tmp/selective.full"
 grep -Eq '"extern".*"coil_selected_call".*"i32".*"\.\.\."' "$tmp/selective.full"
 grep -Eq '"const".*"COIL_SELECTED_VALUE".* 41' "$tmp/selective.full"
