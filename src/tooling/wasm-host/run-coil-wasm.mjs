@@ -54,6 +54,23 @@ function malloc(size) {
   dv().setBigUint64(Number(p - 8n), size, true);
   return p;                                       // BigInt (i64)
 }
+function hostPosixMemalign(out, alignment, size) {
+  alignment = BigInt(alignment); size = BigInt(size);
+  if (alignment < 8n || (alignment & (alignment - 1n)) !== 0n) return 22;
+  let p;
+  if (alignment <= 16n) {
+    p = malloc(size);
+  } else {
+    if (size <= 0n) size = 1n;
+    size = alignUp(size, 16n);
+    p = alignUp(heap + 16n, alignment);
+    heap = p + size;
+    ensure(heap);
+    dv().setBigUint64(Number(p - 8n), size, true);
+  }
+  dv().setBigUint64(Number(out), p, true);
+  return 0;
+}
 function hostFree(ptr) {
   ptr = BigInt(ptr);
   if (ptr < 16n || ptr >= heap) return;
@@ -89,6 +106,17 @@ function cstr(ptr) {                              // read NUL-terminated string
   return Buffer.from(m.slice(Number(ptr), e)).toString('utf8');
 }
 function writeBytes(ptr, data) { u8().set(data, Number(ptr)); }
+function hostMkdtemp(templatePtr) {
+  const template = cstr(templatePtr);
+  if (!template.endsWith('XXXXXX')) return 0n;
+  try {
+    const path = fs.mkdtempSync(template.slice(0, -6));
+    writeBytes(templatePtr, Buffer.from(path + '\0'));
+    return templatePtr;
+  } catch {
+    return 0n;
+  }
+}
 
 // libc environment bridge. Keep returned strings alive for the process lifetime,
 // matching getenv's contract closely enough for the compiler's namespace setup.
@@ -295,18 +323,21 @@ function fmtc(fmt, args) {
 const env = {
   // allocation
   malloc, realloc, free: (p)=>{ hostFree(p); return 0n; }, memset:(s,c,n)=>{u8().fill(Number(c)&0xff,Number(s),Number(s)+Number(n));return s;},
-  memcmp:(a,b,n)=>{const m=u8();a=Number(a);b=Number(b);n=Number(n);for(let i=0;i<n;i++){const d=m[a+i]-m[b+i];if(d)return BigInt(Math.sign(d));}return 0n;},
+  posix_memalign:hostPosixMemalign,
+  memcmp:(a,b,n)=>{const m=u8();a=Number(a);b=Number(b);n=Number(n);for(let i=0;i<n;i++){const d=m[a+i]-m[b+i];if(d)return Math.sign(d);}return 0;},
   // file io
   open: doOpen, read: doRead, write: doWrite, close:(fd)=>{ if(fd>2){try{fs.closeSync(fd);}catch{}} return 0; },
   creat:(p,mode)=>{ try{return BigInt(fs.openSync(cstr(p),'w'));}catch{return -1n;} },
   access:(p,m)=>{ try{fs.accessSync(cstr(p));return 0;}catch{return -1;} },
+  mkdtemp:hostMkdtemp,
   unlink:(p)=>{ try{fs.unlinkSync(cstr(p));return 0;}catch{return -1;} },
+  remove:(p)=>{ try{fs.rmSync(cstr(p));return 0;}catch{return -1;} },
   rename:(a,b)=>{ try{fs.renameSync(cstr(a),cstr(b));return 0;}catch{return -1;} },
   realpath:(p,out)=>{ try{const r=Buffer.from(fs.realpathSync(cstr(p))+'\0');writeBytes(out,r);return out;}catch{return 0n;} },
   fopen:(p,mode)=>{ try{return BigInt(fs.openSync(cstr(p), cstr(mode).includes('w')?'w':'r'));}catch{return 0n;} },
   fclose:(f)=>{ if(Number(f)>2){try{fs.closeSync(Number(f));}catch{}} return 0; },
   fwrite:(ptr,sz,nm,f)=>{ const n=Number(sz)*Number(nm); doWrite(Number(f),ptr,BigInt(n)); return BigInt(nm); },
-  opendir:(p)=>0n, closedir:(d)=>0,
+  opendir:(p)=>0n, readdir:()=>0n, closedir:(d)=>0,
   getcwd:(b,sz)=>{ const r=Buffer.from(process.cwd()+'\0'); writeBytes(b,r); return b; },
   getenv:hostGetenv, setenv:hostSetenv, unsetenv:hostUnsetenv,
   isatty:()=>0,
@@ -374,7 +405,8 @@ const env = {
   // the fs I/O this harness already provides. Run the command on the host and return
   // its exit status so `build` completes end to end.
   mmap: trap('mmap'), munmap: trap('munmap'), mprotect: trap('mprotect'),
-  dlopen: trap('dlopen'), dlsym: trap('dlsym'), dlerror: trap('dlerror'),
+  dlopen: trap('dlopen'), dlsym: trap('dlsym'), dlerror: trap('dlerror'), dladdr:()=>0,
+  posix_spawnp: trap('posix_spawnp'), waitpid: trap('waitpid'),
   system: (cmdPtr) => {                              // returns i32 (a JS Number, not BigInt)
     const cmd = cstr(cmdPtr);
     try { execSync(cmd, { stdio: 'inherit' }); return 0; }

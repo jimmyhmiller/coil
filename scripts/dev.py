@@ -1115,6 +1115,11 @@ def test_wasm(compiler: str) -> None:
             "--target", "wasm32-unknown-unknown", "-o", record_wasm)
     execute("wasm-tools", "validate", record_wasm)
     execute("node", "scripts/tests/wasm32-arraylist-record.mjs", record_wasm)
+    dyn_wasm = "/tmp/gate-wasm32-dyn-aggregate-return.wasm"
+    execute(compiler, "build", "tests/compiler/features/wasm32_dyn_aggregate_return.coil",
+            "--target", "wasm32-unknown-unknown", "-o", dyn_wasm)
+    execute("wasm-tools", "validate", dyn_wasm)
+    execute("node", "scripts/tests/wasm32-dyn-aggregate-return.mjs", dyn_wasm)
     print("wasm gate: PASS")
 
 
