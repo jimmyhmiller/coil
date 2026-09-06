@@ -2874,6 +2874,30 @@ else
   echo "  (skip: no /usr/bin/time for the gen-10 perf probe)"
 fi
 
+echo "== exported aggregate callbacks use their C ABI entries =="
+cc -c tests/compiler/features/c_aggregate_callback_export.c \
+  -o "$T/c-aggregate-callback-export.o"
+if "$COIL" build tests/compiler/features/c_aggregate_callback_export.coil \
+     -o "$T/c-aggregate-callback-export" \
+     --link-flag "$T/c-aggregate-callback-export.o" >/dev/null 2>&1 \
+   && "$T/c-aggregate-callback-export"; then
+  ok "fnptr-of exported callbacks passes every aggregate size class by the C ABI"
+else
+  bad "fnptr-of exported aggregate callback" "the C caller observed corrupt aggregate arguments"
+fi
+
+cat > "$T/export-extern-collision.coil" <<'EOF'
+(module export_extern_collision)
+(defstruct Pair [(a i64) (b i64)])
+(defn callback [(value Pair)] (-> i64) (.a value))
+(export-c [callback :as "callback_c"])
+(extern callback_c :cc c [Pair] (-> i64))
+(defn main [] (-> i64) 0)
+EOF
+expect_out "export-c defines C symbol 'callback_c'.*extern.*imports it.*remove the extern.*fnptr-of" \
+  "a same-unit extern/export collision explains the supported callback path" \
+  "$COIL" check "$T/export-extern-collision.coil"
+
 echo "== focused guide lookup =="
 expect_out '^  tests[[:space:]]+deftest' "guide: no argument prints the compact topic index" "$COIL" guide
 expect_out '^## Tests, assertions, debug checks' "guide: canonical topic prints only its section" "$COIL" guide tests
