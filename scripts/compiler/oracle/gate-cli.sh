@@ -3794,8 +3794,12 @@ EOF
       *) bad "coil.jit embeds an installed compiler and hot reloads from userland" "$sdk_out" ;;
     esac
     sdk_syms=$(nm "$T/jit-sdk/app" 2>/dev/null)
+    # The SDK is IN the program -- not dlopened, not shelled out to. Assert that on
+    # the API surface rather than on an implementation symbol: the toolchain ships
+    # this namespace as a sealed archive, and an optimized archive publishes its
+    # exports while its internals are free to be inlined out of existence.
     case "$sdk_syms" in
-      *repl-session-new*) ok "coil.jit import links the compiler SDK" ;;
+      *jit_api.jit-session-new*) ok "coil.jit import links the compiler SDK" ;;
       *) bad "coil.jit import links the compiler SDK" "missing SDK symbol" ;;
     esac
   else
