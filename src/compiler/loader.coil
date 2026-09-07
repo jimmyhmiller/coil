@@ -4,6 +4,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.compiler.unit_state" :use *)
 (import "coil.compiler.trace" :as tr)
+(import "coil.compiler.digest" :as digest)
 
 (defstruct LoaderUnitState
   [(reader SourceReaderHook) (cimport_policy DeferCimportBox)
@@ -580,6 +581,44 @@
     (unless (load present) (push! paths (sconcat a path "")) 0)
     0))
 
+;;; SHA-256 of a file's bytes, or "" when it cannot be read.
+(defn seal-file-digest [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
+  (match (read-file-opt a (str->cstr a path))
+    (None [] "")
+    (Some [bytes]
+      (let [state (primitive/alloc-stack digest/Sha256)]
+        (digest/sha256-init! state)
+        (if (digest/sha256-update! state bytes) (digest/sha256-hex a state) "")))))
+
+;;; `path` written relative to `dir`, so a seal keeps naming its sources after the
+;;; toolchain that holds both is moved or installed under a different prefix.
+;;; Falls back to the path as given when the two share no directory.
+(defn seal-relative-path [(a (dyn Allocator)) (dir (slice u8)) (path (slice u8))] (-> (slice u8))
+  (let [(mut shared) 0
+        (mut i) 0
+        n (if (< (len dir) (len path)) (len dir) (len path))]
+    ; The last '/' up to which both agree is the deepest common directory.
+    (loop (if (or (>= (load i) n) (!= (get dir (load i)) (get path (load i))))
+              (break)
+              (do
+                (when (= (primitive/cast i64 (get dir (load i))) 47) (set! shared (primitive/iadd (load i) 1)) 0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (if (= (load shared) 0)
+        path
+        (let [(mut out) (sb-new a)
+              (mut k) (load shared)]
+          ; one `..` per directory of `dir` below the common one
+          (loop (if (>= (load k) (len dir))
+                    (break)
+                    (do
+                      (when (= (primitive/cast i64 (get dir (load k))) 47)
+                        (sb-push-str! (mut out) "../")
+                        0)
+                      (set! k (primitive/iadd (load k) 1)))))
+          (sb-push-str! (mut out) "../")
+          (sb-push-str! (mut out) (subslice [u8] path (load shared) (len path)))
+          (sb-str (load out))))))
+
 ;;; The value of a `;;; KEY: VALUE` seal header line, or "" when absent.
 ;;;
 ;;; The header is `;;;` comment lines so that a seal is ordinary, readable Coil
@@ -647,7 +686,113 @@
 ;;; its source only under the toolchain that produced it: layout, the call ABI and
 ;;; the mangled names are all decided by the compiler and none of them is a stable
 ;;; format. The test is identity, not negotiation.
-(defn seal-policy-reason [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+;;; Is every source this seal was built from still byte-for-byte what it was?
+;;;
+;;; A seal records the toolchain that produced it, but a toolchain's library is real
+;;; files beside the binary and editing one is meant to be live -- that is why the
+;;; library stopped being string constants compiled into the compiler. A seal that
+;;; answered only "same toolchain" would silently shadow such an edit and make it
+;;; look like it did nothing, which is precisely the trap that change removed.
+;;;
+;;; Returns "" when the seal still matches its source, else the first file that
+;;; differs. A source that has gone missing counts as changed.
+(defn seal-sources-changed [(a (dyn Allocator)) (path (slice u8)) (text (slice u8))] (-> (slice u8))
+  (let [dir (dirname path)
+        n (len text)
+        (mut at) 0
+        (mut changed) ""
+        (mut done) false]
+    (loop
+      (if (or (load done) (>= (load at) n))
+          (break)
+          (let [(mut end) (load at)]
+            (loop (if (or (>= (load end) n) (= (primitive/cast i64 (get text (load end))) 10))
+                      (break)
+                      (set! end (primitive/iadd (load end) 1))))
+            (let [line (subslice [u8] text (load at) (load end))]
+              (if (starts-with line ";;; ")
+                  (let [rest (subslice [u8] line 4 (len line))]
+                    (when (starts-with rest "source: ")
+                      (let [body (subslice [u8] rest 8 (len rest))
+                            (mut cut) -1]
+                        (for [i 0 (len body)]
+                          (when (and (< (load cut) 0) (= (primitive/cast i64 (get body i)) 32))
+                            (set! cut i)
+                            0)
+                          0)
+                        (when (> (load cut) 0)
+                          (let [recorded (subslice [u8] body 0 (load cut))
+                                named (subslice [u8] body (primitive/iadd (load cut) 1) (len body))
+                                full (if (starts-with named "/") named (path-join a dir named))]
+                            ; A source that cannot be read is not an edit. It may
+                            ; simply be gone -- an installation that ships seals and
+                            ; no library, say -- and refusing the seal would leave
+                            ; nothing to compile in its place. Only a file that is
+                            ; there AND differs means the seal no longer describes it.
+                            (let [actual (seal-file-digest a full)]
+                              (when (and (> (len actual) 0) (!= actual recorded))
+                                (set! changed named)
+                                (set! done true)
+                                0)
+                              0)
+                            0))
+                        0)
+                      0))
+                  ; the header ends at the first line that is not a `;;;` comment
+                  (set! done true))
+              (set! at (primitive/iadd (load end) 1))))))
+    (load changed)))
+
+;;; Seals this PROCESS has already judged, and what it decided.
+;;;
+;;; A build resolves the same namespace once per compilation unit -- the program and
+;;; each metaprogram are separate units -- and re-reading a seal's whole source
+;;; closure for each of them would pay the same cost several times over and report
+;;; the same refusal several times over. The verdict is a property of the files on
+;;; disk, so one per process is enough.
+(defstruct SealVerdict [(path (slice u8)) (reason (slice u8))])
+(defstruct SealVerdictBox [(init i64) (seen (ptr (ArrayList SealVerdict)))])
+
+(defn seal-verdict-box [] (-> (ptr SealVerdictBox))
+  (primitive/alloc-static SealVerdictBox))
+
+(defn seal-verdicts [] (-> (ptr (ArrayList SealVerdict)))
+  (let [b (seal-verdict-box)]
+    (when (= (.init b) (primitive/cast i64 0))
+      (set! (.seen b)
+            (box-al [SealVerdict] (malloc-allocator) (al-new [SealVerdict] (malloc-allocator))))
+      (set! (.init b) 1)
+      0)
+    (.seen b)))
+
+;;; The remembered verdict for `path`: `(Some reason)` where "" means it was
+;;; accepted, or `None` when this process has not judged it yet.
+(defn seal-verdict [(path (slice u8))] (-> (Option (slice u8)))
+  (let [seen (seal-verdicts)
+        (mut found) (None [(slice u8)])]
+    (for [i 0 (len (load seen))]
+      (let [entry (al-elem [SealVerdict] seen i)]
+        (when (= (.path entry) path) (set! found (Some (.reason entry))) 0))
+      0)
+    (load found)))
+
+(defn seal-verdict-record! [(path (slice u8)) (reason (slice u8))] (-> i64)
+  (let [a (malloc-allocator)]
+    (push! (seal-verdicts)
+           (SealVerdict :path (sconcat a path "") :reason (sconcat a reason "")))
+    0))
+
+(defn seal-policy-reason [(a (dyn Allocator)) (path (slice u8)) (text (slice u8))] (-> (slice u8))
+  (match (seal-verdict path)
+    (Some [remembered] remembered)
+    (None [] (let [reason (seal-policy-judge a path text)]
+               (seal-verdict-record! path reason)
+               reason))))
+
+;;; Why this seal cannot describe this build at all -- a different toolchain, a
+;;; different target, a build mode whose code the archive does not contain. Distinct
+;;; from staleness: this seal would be wrong for this build however fresh it is.
+(defn seal-abi-reason [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
   (let [p (seal-policy)]
     (if (= (.set p) (primitive/cast i64 0))
         "no seal policy was established for this build"
@@ -666,6 +811,15 @@
                         (.target p)
                         "")
             :else "")))))
+
+(defn seal-policy-judge [(a (dyn Allocator)) (path (slice u8)) (text (slice u8))] (-> (slice u8))
+  (let [abi (seal-abi-reason a text)]
+    (if (> (len abi) 0)
+        abi
+        (let [changed (seal-sources-changed a path text)]
+          (if (= (len changed) 0)
+              ""
+              (sconcat3 a "seal is stale: " changed " has changed since it was built"))))))
 
 ;;; The seal the TOOLCHAIN ships for `ns`, or "" if there is none.
 ;;;
@@ -1262,17 +1416,39 @@
 ; Text of one library module, read from the layout that was found. A missing file is
 ; fatal for the same reason a missing layout is: the alternative is a compiler that
 ; half-has a standard library and reports the shortfall as the user's type error.
+;;; The file a bundled name resolves to in the current layout. A bundled source is
+;;; registered under `<bundled NAME>` for diagnostics, so this is how anything that
+;;; needs the FILE -- a seal recording what it was built from -- gets back to it.
+(defn bundled-file-path [(a (dyn Allocator)) (bn (slice u8))] (-> (slice u8))
+  (let [l (stdlib-layout a)
+        sdk? (starts-with bn "compiler/")]
+    (path-join a
+               (if sdk? (.sdk l) (.libs l))
+               (if sdk? (subslice bn 9 (len bn)) bn))))
+
 (defn bundled-text [(a (dyn Allocator)) (bn (slice u8))] (-> (slice u8))
   (let [l (stdlib-layout a)]
     (when (= (load (field l kind)) STDLIB-MISSING) (stdlib-not-found a bn) 0)
-    (let [sdk? (starts-with bn "compiler/")
-          p
-            (path-join a
-                       (if sdk? (.sdk l) (.libs l))
-                       (if sdk? (subslice bn 9 (len bn)) bn))
+    (let [p (bundled-file-path a bn)
           d (read-file a (str->cstr a p))]
       (when (= (len d) (primitive/cast i64 0)) (stdlib-not-found a p) 0)
       d)))
+
+;;; The real file behind a registered source name, or "" when it has none.
+;;; A source is registered either under its own path or, for a library module,
+;;; under `<bundled NAME>`; everything else is generated text with no file.
+(defn source-file-path [(a (dyn Allocator)) (base (slice u8)) (name (slice u8))] (-> (slice u8))
+  (cond (starts-with name "/") name
+        ; A pseudo-source is generated text with no file. Anything else is a path,
+        ; and a relative one is relative to the directory the build ran in.
+        (starts-with name "<")
+          (if (and (starts-with name "<bundled ")
+                   (and (> (len name) 10)
+                        (= (primitive/cast i64 (get name (primitive/isub (len name) 1))) 62)))
+              (bundled-file-path a (subslice [u8] name 9 (primitive/isub (len name) 1)))
+              "")
+        (> (len name) 0) (path-join a base name)
+        :else ""))
 
 ;;; The prelude is a library file too, in its own place in each layout.
 (defn stdlib-prelude-text [(a (dyn Allocator))] (-> (slice u8))
@@ -1984,13 +2160,31 @@
         (match (read-file-opt a (str->cstr a shipped))
           (None [] 0)
           (Some [text]
-            (when (= (len (seal-policy-reason a text)) 0)
-              (when (= (len (seal-register! a shipped)) 0)
-                (let [installed (virtual-source name)]
-                  (unless (= (primitive/cast i64 installed) 0)
-                    (return-from :resolve (load installed))))
-                0)
-              0)
+            ; Whether this process has judged this seal before decides whether the
+            ; refusal is news. The verdict itself is remembered either way.
+            (let [first-look (match (seal-verdict shipped) (Some [_] false) (None [] true))
+                  refused (seal-policy-reason a shipped text)]
+              (if (= (len refused) 0)
+                  (do
+                    (when (= (len (seal-register! a shipped)) 0)
+                      (let [installed (virtual-source name)]
+                        (unless (= (primitive/cast i64 installed) 0)
+                          (return-from :resolve (load installed))))
+                      0)
+                    0)
+                  ; Compiling this namespace instead of linking it is the difference
+                  ; between a second and half a minute, so say why rather than let
+                  ; the build mysteriously get slow again.
+                  (do
+                    (when first-look
+                      (let [w (stderr)]
+                        (ps w "note: ")
+                        (ps w name)
+                        (ps w ": ")
+                        (ps w refused)
+                        (ps w "; compiling it from source\n"))
+                      0)
+                    0)))
             0))
         0)))
   (let [nn (len name)

@@ -282,6 +282,14 @@ so a macro can call sealed code while the program around it is being compiled.
 A sealed export surface must be concrete: exported generics and macros need their
 source at every use site and cannot be declared away.
 
+A seal records a digest of every source the frontend read while building it, and a
+build checks them. Editing a library file beside the compiler is meant to be live —
+that is why the library is real files rather than constants compiled into the binary
+— so a seal that answered only "same toolchain" would silently shadow such an edit.
+A changed file means the namespace is compiled instead, and the build says which file
+changed. A source that is gone is not an edit: an installation may ship seals and no
+library, and there would be nothing to compile in its place.
+
 A seal only stands in for its source under the toolchain that produced it — layout,
 the call ABI and the mangled names are all the compiler's own, and none of them is a
 stable format — so it records the toolchain and target it was built with and is

@@ -3999,6 +3999,24 @@ if [ -x "$SEALDIR/nos" ]; then
 else
   bad "--no-seal compiles the namespace and agrees with the seal" "$nos_out"
 fi
+# A seal records a digest of every source it was built from, because a toolchain's
+# library is real files beside the binary and editing one is meant to be live. A
+# seal that answered only "same toolchain" would silently shadow such an edit.
+sed -i.bak 's/(+ (.x p) (.y p))/(+ (+ (.x p) (.y p)) 1)/' "$SEALDIR/shape.coil"
+stale_out=$(cd "$SEALDIR" && "$COIL" build app.coil -o stalapp --seal shape.seal 2>&1)
+if [ -x "$SEALDIR/stalapp" ]; then
+  ( cd "$SEALDIR" && ./stalapp ); rc=$?
+  [ "$rc" = 43 ] && ok "an edited source beats the seal built from it" \
+                 || bad "an edited source beats the seal built from it" "rc=$rc, want 43"
+else
+  bad "an edited source beats the seal built from it" "$stale_out"
+fi
+case "$stale_out" in
+  *"is stale"*"shape.coil"*) ok "a stale seal says which file changed" ;;
+  *) bad "a stale seal says which file changed" "$stale_out" ;;
+esac
+mv "$SEALDIR/shape.coil.bak" "$SEALDIR/shape.coil"
+
 # A metaprogram that imports a sealed namespace has to link the archive into its
 # own dylib: without it the dylib carries undefined references, and `-undefined
 # dynamic_lookup` turns those into a dlopen failure at expansion time rather than a

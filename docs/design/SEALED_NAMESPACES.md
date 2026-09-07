@@ -54,6 +54,34 @@ body-less definition remains the ordinary "body has type void" error everywhere 
 A sealed export surface must be concrete. Exported generics and macros need their
 source at every use site and cannot be declared away.
 
+## Staleness is a separate question from compatibility
+
+A seal also records a SHA-256 of every source the frontend read while building it,
+written relative to the seal so that moving or reinstalling the toolchain does not
+invalidate all of them. A build re-hashes them, and a file that differs means the
+namespace is compiled from source instead, naming the file that changed — compiling
+it costs half a minute rather than a second, so that is worth a line on stderr.
+
+This is not belt-and-braces on the toolchain check. A toolchain's library is real
+files beside the binary and editing one is meant to be live; that is why the library
+stopped being `include-str` constants. A seal that trusted only "same toolchain"
+silently shadowed such an edit and made it look like it did nothing, which is exactly
+the trap that change removed. The digest is what keeps the property.
+
+A source that cannot be read is not an edit — an installation may ship seals and no
+library, and refusing the seal would leave nothing to compile in its place. Only a
+file that is present and differs counts.
+
+Staleness and incompatibility get different answers. A seal for another toolchain is
+refused outright when a manifest named it, because that seal can never work here. A
+stale seal always falls back to compiling, even when named: the artifact that
+produces it may be about to run, and `check` in a package whose module was just
+edited has to check the edit.
+
+The verdict is remembered per process. A build resolves the same namespace once per
+compilation unit — the program and each metaprogram are separate units — and the
+files on disk do not change underneath it.
+
 ## Why identity, not compatibility
 
 A seal is machine code plus declarations describing it. Layout, the call ABI, the
@@ -125,4 +153,7 @@ A manifest's sealed artifact is rebuilt on every `coil build` of that package, a
 `kind = "object"` artifacts are; freshness is not tracked. Seal generation runs the
 frontend a second time, so producing one roughly doubles that module's build time —
 paid once per toolchain install, never by a consumer. Only the host target is
-sealed; a cross-build declines the seal and compiles from source.
+sealed; a cross-build declines the seal and compiles from source. Verifying the
+digests costs about 30ms per build that uses a seal; a memo keyed on file size and
+modification time would remove that, but the toolchain has no `stat` binding to key
+it on.
