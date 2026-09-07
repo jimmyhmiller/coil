@@ -3999,6 +3999,33 @@ if [ -x "$SEALDIR/nos" ]; then
 else
   bad "--no-seal compiles the namespace and agrees with the seal" "$nos_out"
 fi
+# A metaprogram that imports a sealed namespace has to link the archive into its
+# own dylib: without it the dylib carries undefined references, and `-undefined
+# dynamic_lookup` turns those into a dlopen failure at expansion time rather than a
+# link error. The macro below runs sealed code while the program is being compiled.
+cat > "$SEALDIR/mpm.coil" <<'SEAL_EOF'
+(module mpm)
+(import "coil.primitive" :as primitive)
+(import "shape" :use [add mk])
+(defn answer [] (-> Code)
+  (let [n (add (mk 40 2))]
+    `~n))
+SEAL_EOF
+cat > "$SEALDIR/mpapp.coil" <<'SEAL_EOF'
+(module mpapp)
+(import "mpm" :use [answer])
+(defn main [] (-> i64) (answer))
+SEAL_EOF
+mv "$SEALDIR/shape.coil" "$SEALDIR/shape.coil.away"
+mp_out=$(cd "$SEALDIR" && "$COIL" build mpapp.coil -o mpapp --seal shape.seal 2>&1)
+if [ -x "$SEALDIR/mpapp" ]; then
+  ( cd "$SEALDIR" && ./mpapp ); rc=$?
+  [ "$rc" = 42 ] && ok "a metaprogram calls into a sealed archive during expansion" \
+                 || bad "a metaprogram calls into a sealed archive during expansion" "rc=$rc, want 42"
+else
+  bad "a metaprogram calls into a sealed archive during expansion" "$mp_out"
+fi
+mv "$SEALDIR/shape.coil.away" "$SEALDIR/shape.coil"
 # Declaring the artifact is the whole configuration: the package that produces a
 # seal consumes it, with nothing else saying so.
 PROJ=$T/sealproj
