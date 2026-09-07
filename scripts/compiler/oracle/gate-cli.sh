@@ -3920,6 +3920,107 @@ EOF
   esac
 fi
 
+echo "== sealed namespaces"
+# A seal is one namespace's declarations plus the archive holding its code, and
+# importing it has to be indistinguishable from importing the source — including
+# for STATE: an alloc-static cell both the archive and the program reach is one
+# cell, which is what makes a sealed build equivalent to a source-linked one
+# rather than merely similar. The single number below covers all of it: an
+# aggregate passed by value (32), a slice passed by value (3, which cannot cross a
+# C extern at all), and the shared cell (7).
+SEALDIR=$T/sealed
+mkdir -p "$SEALDIR"
+cat > "$SEALDIR/shape.coil" <<'SEAL_EOF'
+(module shape)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(defstruct Pt [(x i64) (y i64)])
+(defn cell [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn add [(p Pt)] (-> i64) (+ (.x p) (.y p)))
+(defn label [(s (slice u8))] (-> i64) (len s))
+(defn mk [(x i64) (y i64)] (-> Pt) (Pt :x x :y y))
+(defn bump [] (-> i64) (store! (cell) (+ (load (cell)) 7)) (load (cell)))
+(export add label mk bump cell Pt)
+SEAL_EOF
+cat > "$SEALDIR/app.coil" <<'SEAL_EOF'
+(module sealapp)
+(import "shape" :use [add label mk bump cell Pt])
+(defn main [] (-> i64)
+  (bump)
+  (+ (add (mk 30 2)) (+ (label "abc") (load (cell)))))
+SEAL_EOF
+seal_build_out=$(cd "$SEALDIR" && "$COIL" build shape.coil --lib -o shape.a --emit-seal shape.seal 2>&1)
+if [ -f "$SEALDIR/shape.seal" ] && [ -f "$SEALDIR/shape.a" ]; then
+  ok "a sealed artifact writes both its archive and its seal"
+else
+  bad "a sealed artifact writes both its archive and its seal" "$seal_build_out"
+fi
+case $(cat "$SEALDIR/shape.seal" 2>/dev/null) in
+  *";;; namespace: shape"*";;; archive: shape.a"*";;; toolchain: "*"(defn add ["*)
+    ok "a seal names its namespace, its archive and the toolchain that produced it" ;;
+  *) bad "a seal names its namespace, its archive and the toolchain that produced it" \
+         "$(cat "$SEALDIR/shape.seal" 2>/dev/null)" ;;
+esac
+# With the source moved away, only the seal and its archive can satisfy the import.
+mv "$SEALDIR/shape.coil" "$SEALDIR/shape.coil.away"
+seal_link_out=$(cd "$SEALDIR" && "$COIL" build app.coil -o app --seal shape.seal 2>&1)
+if [ -x "$SEALDIR/app" ]; then
+  ok "a sealed namespace resolves with no source present"
+  ( cd "$SEALDIR" && ./app ); rc=$?
+  [ "$rc" = 42 ] && ok "a sealed call keeps the ABI and shares one static cell" \
+                 || bad "a sealed call keeps the ABI and shares one static cell" "rc=$rc, want 42"
+else
+  bad "a sealed namespace resolves with no source present" "$seal_link_out"
+fi
+case "$seal_link_out" in
+  *"duplicate symbol"*) bad "linking a seal reports no duplicate symbols" "$seal_link_out" ;;
+  *) ok "linking a seal reports no duplicate symbols" ;;
+esac
+# A seal stands in for its source only under the toolchain that produced it.
+sed 's/^;;; toolchain: .*/;;; toolchain: coil 0.0.0-not-this-one/' \
+  "$SEALDIR/shape.seal" > "$SEALDIR/stale.seal"
+stale_out=$(cd "$SEALDIR" && "$COIL" build app.coil -o stale --seal stale.seal 2>&1)
+case "$stale_out" in
+  *"seal was produced by 'coil 0.0.0-not-this-one'"*)
+    ok "a seal from another toolchain is refused, naming both versions" ;;
+  *) bad "a seal from another toolchain is refused, naming both versions" "$stale_out" ;;
+esac
+# --no-seal compiles the namespace instead, and must reach the same answer.
+mv "$SEALDIR/shape.coil.away" "$SEALDIR/shape.coil"
+nos_out=$(cd "$SEALDIR" && "$COIL" build app.coil -o nos --seal shape.seal --no-seal 2>&1)
+if [ -x "$SEALDIR/nos" ]; then
+  ( cd "$SEALDIR" && ./nos ); rc=$?
+  [ "$rc" = 42 ] && ok "--no-seal compiles the namespace and agrees with the seal" \
+                 || bad "--no-seal compiles the namespace and agrees with the seal" "rc=$rc, want 42"
+else
+  bad "--no-seal compiles the namespace and agrees with the seal" "$nos_out"
+fi
+# Declaring the artifact is the whole configuration: the package that produces a
+# seal consumes it, with nothing else saying so.
+PROJ=$T/sealproj
+mkdir -p "$PROJ/src"
+cat > "$PROJ/Coil.toml" <<'SEAL_EOF'
+[package]
+name = "sealpkg"
+entry = "src/main.coil"
+source-roots = ["src"]
+
+[artifacts.shape]
+kind  = "sealed"
+entry = "src/shape.coil"
+out   = "build/sealed/shape.a"
+SEAL_EOF
+cp "$SEALDIR/shape.coil" "$PROJ/src/shape.coil"
+sed 's/(module sealapp)/(module sealpkg.main)/' "$SEALDIR/app.coil" > "$PROJ/src/main.coil"
+proj_out=$(cd "$PROJ" && "$COIL" build 2>&1)
+if [ -f "$PROJ/build/sealed/shape.seal" ] && [ -x "$PROJ/build/release/sealpkg" ]; then
+  ok "[artifacts] kind = \"sealed\" builds the seal and links it into the package"
+  ( cd "$PROJ" && ./build/release/sealpkg ); rc=$?
+  [ "$rc" = 42 ] && ok "a manifest-sealed package runs" || bad "a manifest-sealed package runs" "rc=$rc, want 42"
+else
+  bad "[artifacts] kind = \"sealed\" builds the seal and links it into the package" "$proj_out"
+fi
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL

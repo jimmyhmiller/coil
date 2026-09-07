@@ -185,6 +185,12 @@ def install_seals(compiler: Path, libdir: Path) -> Path | None:
         "--lib", "-o", str(staged / f"{namespace}.a"),
         "--emit-seal", str(staged / f"{namespace}.seal"),
     ]
+    if sys.platform == "darwin":
+        # The archive is linked into programs built by either backend, and the arm64
+        # backend links directly with `-platform_version macos 11.0`. Building the
+        # archive for the host default instead makes every one of those links warn
+        # that it is older than the object it is consuming. Match it.
+        command += ["--target", "arm64-apple-macosx11.0.0"]
     print(f"sealing {namespace} (this is what makes `coil.jit` programs build in a second)")
     done = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
     if done.returncode != 0 or not (staged / f"{namespace}.seal").is_file():
