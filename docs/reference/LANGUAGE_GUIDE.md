@@ -276,6 +276,9 @@ that embeds the compiler builds in about a quarter of a second instead of the ~2
 it takes to compile the compiler into itself. Nothing declares this — it is what
 the toolchain installs.
 
+A metaprogram may import a sealed namespace too: its dylib links the same archive,
+so a macro can call sealed code while the program around it is being compiled.
+
 A sealed export surface must be concrete: exported generics and macros need their
 source at every use site and cannot be declared away.
 
