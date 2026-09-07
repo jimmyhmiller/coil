@@ -138,6 +138,38 @@ long native_named_increment(void) { return ++coil_named_data; }
         failed = run([COMPILER, "check", source], 1)
         assert phrase in failed.stdout + failed.stderr
 
+    for alias, expected in [("callback_c", 1), ("other_callback", 0)]:
+        source.write_text('(module alias.export-collision) '
+            '(defstruct Pair [(a i64) (b i64)]) '
+            '(defn callback [(value Pair)] (-> i64) (.a value)) '
+            '(export-c [callback :as "callback_c"]) '
+            f'(extern callback_c :as "{alias}" :cc c [Pair] (-> i64)) '
+            '(defn main [] (-> i64) 0)')
+        result = run([COMPILER, "check", source], expected)
+        if expected:
+            assert "extern in the same program imports it" in result.stdout + result.stderr
+    source.write_text(source.read_text().replace(':as "other_callback"', ':as "callback_c"')
+                      .replace('(extern callback_c ', '(extern renamed '))
+    result = run([COMPILER, "check", source], 1)
+    assert "extern in the same program imports it" in result.stdout + result.stderr
+
+    callback_obj = work / "callbacks.o"
+    run(["cc", "-c", ROOT / "tests/compiler/features/c_aggregate_callback_export.c", "-o", callback_obj])
+    callback_source = (ROOT / "tests/compiler/features/c_aggregate_callback_export.coil").read_text()
+    for location in ["local", "static"]:
+        text = callback_source
+        if location == "static":
+            for ty, fn in [("S4", "inspect-s4"), ("S8", "inspect-s8"),
+                           ("Target", "inspect-target"), ("S32", "inspect-s32")]:
+                text = text.replace(f'(primitive/fnptr-of {fn})', f'(primitive/load saved-{fn})')
+                text += f'\n(def saved-{fn} (primitive/alloc-static (fnptr c [{ty}] i64) (primitive/fnptr-of {fn})))\n'
+        source.write_text(text)
+        for opt in ["-O0", "-O2"]:
+            binary = work / "callback"
+            run([COMPILER, "build", source, "--backend", "llvm", opt,
+                 "--link-flag", callback_obj, "-o", binary])
+            run([binary])
+
     source.write_text('''(module alias.meta)
 (import "coil.primitive" :as p)
 (extern length :as "strlen" :cc c [(ptr i8)] (-> i64))
