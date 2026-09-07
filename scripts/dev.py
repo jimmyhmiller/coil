@@ -159,6 +159,53 @@ def install_native_archives(source: Path, destination: Path) -> Path | None:
     return live
 
 
+def install_seals(compiler: Path, libdir: Path) -> Path | None:
+    """Build the sealed compiler SDK the installed toolchain ships.
+
+    A program that imports `coil.jit` links the in-process compiler, and without a
+    seal it compiles the whole compiler into itself first -- about thirty seconds
+    on every build. The seal is that archive plus the declarations describing it,
+    so importing the namespace costs a parse instead.
+
+    It is built HERE, by the compiler that was just installed and from the sources
+    that were just installed, because a seal is only interchangeable with its
+    source under the toolchain that produced it. Building it anywhere else would
+    make that a claim rather than a fact.
+
+    A failure is reported and does not stop the install: the toolchain works
+    without a seal, it is only slower for programs that embed the compiler.
+    """
+    staged = libdir / "sealed.incoming"
+    shutil.rmtree(staged, ignore_errors=True)
+    staged.mkdir(parents=True)
+
+    namespace = "coil.compiler.jit_api"
+    command = [
+        str(compiler), "build", str(libdir / "compiler" / "jit_api.coil"),
+        "--lib", "-o", str(staged / f"{namespace}.a"),
+        "--emit-seal", str(staged / f"{namespace}.seal"),
+    ]
+    print(f"sealing {namespace} (this is what makes `coil.jit` programs build in a second)")
+    done = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    if done.returncode != 0 or not (staged / f"{namespace}.seal").is_file():
+        shutil.rmtree(staged, ignore_errors=True)
+        print(f"warning: could not seal {namespace}; programs importing coil.jit will")
+        print("         compile the compiler from source on every build.")
+        print(f"         {' '.join(command)}")
+        for line in (done.stderr or done.stdout).splitlines()[-5:]:
+            print(f"         {line}")
+        return None
+
+    live = libdir / "sealed"
+    previous = libdir / "sealed.previous"
+    shutil.rmtree(previous, ignore_errors=True)
+    if live.exists():
+        live.rename(previous)
+    staged.rename(live)
+    shutil.rmtree(previous, ignore_errors=True)
+    return live
+
+
 def install(args: argparse.Namespace) -> None:
     """Install a compiler AND its standard library into the user's command path.
 
@@ -197,6 +244,9 @@ def install(args: argparse.Namespace) -> None:
 
     if source.resolve() == destination.resolve():
         print(f"already installed: {destination}")
+        sealed = install_seals(destination, libdir)
+        if sealed is not None:
+            print(f"installed seals -> {sealed}")
         report_installed(destination)
         return
 
@@ -210,6 +260,9 @@ def install(args: argparse.Namespace) -> None:
             check=False,
         )
     print(f"installed {source} -> {destination}")
+    sealed = install_seals(destination, libdir)
+    if sealed is not None:
+        print(f"installed seals -> {sealed}")
     report_installed(destination)
 
 
