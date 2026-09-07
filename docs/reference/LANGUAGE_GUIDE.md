@@ -270,15 +270,26 @@ imports, macros and monomorphization never run in the consuming build. Declaring
 artifact is the whole configuration: the package that produces a seal also consumes
 it, and a seal names its own archive, so nothing else has to say link this.
 
-This is for a namespace whose implementation is large and whose API is small — the
-in-process compiler SDK behind `coil.jit` is the motivating case: a program that
-imports it compiles the whole compiler into itself, and sealing it turns a ~28s build
-into ~0.3s.
+An installed toolchain ships one: `lib/coil/sealed/` holds the seal for the
+in-process compiler SDK behind `coil.jit`. Importing it costs a parse, so a program
+that embeds the compiler builds in about a quarter of a second instead of the ~28s
+it takes to compile the compiler into itself. Nothing declares this — it is what
+the toolchain installs.
 
 A sealed export surface must be concrete: exported generics and macros need their
-source at every use site and cannot be declared away. A seal is only interchangeable
-with its source while both come from the same toolchain — it records the version and
-target it was built with.
+source at every use site and cannot be declared away.
+
+A seal only stands in for its source under the toolchain that produced it — layout,
+the call ABI and the mangled names are all the compiler's own, and none of them is a
+stable format — so it records the toolchain and target it was built with and is
+refused if either differs. `--sanitize` and `--debug-checks` want code the archive
+does not contain and decline seals for that reason. A seal named by a manifest that
+is refused is an error; one the compiler discovered for itself is passed over, and
+the namespace compiles from source as usual. `--no-seal` forces that everywhere.
+
+Discovery is confined to installed toolchains. In a checkout the compiler's own
+sources are the thing being edited, and a seal shadowing them would make an edit
+look like it did nothing.
 
 A native dependency selects exactly one discovery provider. `pkg-config` names a
 package whose link flags Coil queries in the usual way. `flags-command` runs a
