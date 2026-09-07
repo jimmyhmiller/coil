@@ -22,6 +22,8 @@ with no bodies:
 ;;; archive: coil.compiler.jit_api.a
 ;;; toolchain: coil 0.1.0
 ;;; target: aarch64-darwin
+;;; source: e1bc00ea…9b57 ../compiler/jit_api.coil
+;;; source: a058f07a…3ecd ../stdlib/alloc.coil
 (module coil.compiler.jit_api)
 (defstruct JitSession [(raw (ptr i8))])
 (defn jit-submit! [(p0 (ptr coil.compiler.jit_api.JitSession)) (p1 (slice u8))] (-> i64))
@@ -97,9 +99,10 @@ uses, and the archive carries neither, so those builds decline seals instead of
 linking an uninstrumented half of a program.
 
 Everything that fails a check falls back to compiling the namespace, because the
-source is always still there. A seal a manifest named by hand is the exception: it
-was asked for, so a mismatch is an error rather than a build that is thirty seconds
-slower for a reason nobody was told. `--no-seal` forces the source path everywhere.
+source is always still there. The exception is a seal a manifest named by hand whose
+TOOLCHAIN or target is wrong: that one was asked for by name and can never work here,
+so it is an error rather than a build that is thirty seconds slower for a reason
+nobody was told. `--no-seal` forces the source path everywhere.
 
 Discovery is confined to installed layouts. In a checkout the compiler's own sources
 are the thing being edited, and a seal shadowing them would make an edit look like it
