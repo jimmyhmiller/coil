@@ -16,10 +16,11 @@ coil fmt --width 90 <file.coil> # preview a different target width
 `src/compiler/formatter/rules.coil` and is compiled into the binary; `src/compiler/driver.coil` wires it
 up). The standalone `coil run src/compiler/formatter/fmt.coil -- <file>` still works and is equivalent.
 
-Target width defaults to 120 columns and can be selected per invocation with
-`--width N`. `let`/`loop` binding vectors with two or more pairs
-always break to one pair per line (aligned in a column), even when they would fit
-flat; a single-binding vector stays inline.
+Target width defaults to 80 columns (`fmt-default-width` in `rules.coil`, the one
+place that number lives) and can be selected per invocation with `--width N`.
+`let`/`loop` binding vectors with two or more pairs always break to one pair per
+line (aligned in a column), even when they would fit flat; a single-binding
+vector stays inline.
 
 ## What it preserves
 
