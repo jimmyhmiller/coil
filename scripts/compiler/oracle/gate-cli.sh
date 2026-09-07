@@ -4052,6 +4052,49 @@ else
   bad "[artifacts] kind = \"sealed\" builds the seal and links it into the package" "$proj_out"
 fi
 
+echo "== cheader"
+# `cheader` and `build --emit-header` render the same header from a CHECKED program.
+# Both used to run a second frontend of their own, which never grew the setup the
+# real one has: they stopped at the prelude's own declaration forms and failed on
+# EVERY input, with an unformatted diagnostic against a source they had not
+# registered. The header is checked by compiling C against it, because a header that
+# parses in this test but not in a C compiler is not a header.
+HDRDIR=$T/cheader
+mkdir -p "$HDRDIR"
+cat > "$HDRDIR/hdr.coil" <<'HDR_EOF'
+(module hdr)
+(defstruct Pair [(x i64) (y i64)])
+(defn add2 [(x i64)] (-> i64) (+ x 2))
+(defn sum [(p Pair)] (-> i64) (+ (.x p) (.y p)))
+(export-c [add2 :as "add2"] [sum :as "pair_sum"])
+HDR_EOF
+hdr_out=$(cd "$HDRDIR" && "$COIL" cheader hdr.coil 2>&1)
+case "$hdr_out" in
+  *"int64_t add2(int64_t);"*"int64_t pair_sum(Pair);"*)
+    ok "cheader prints prototypes, including a struct passed by value" ;;
+  *) bad "cheader prints prototypes, including a struct passed by value" "$hdr_out" ;;
+esac
+(cd "$HDRDIR" && "$COIL" build hdr.coil --lib -o hdr.a --emit-header hdr.h >/dev/null 2>&1)
+if [ -f "$HDRDIR/hdr.h" ] && [ -f "$HDRDIR/hdr.a" ]; then
+  ok "build --emit-header writes the header beside the library"
+  cat > "$HDRDIR/use.c" <<'HDR_EOF'
+#include "hdr.h"
+int main(void) {
+    Pair p = { .x = 40, .y = 2 };
+    return (int)(add2(40) == 42 && pair_sum(p) == 42 ? 0 : 1);
+}
+HDR_EOF
+  if (cd "$HDRDIR" && cc use.c hdr.a -o use >/dev/null 2>&1); then
+    ( cd "$HDRDIR" && ./use ); rc=$?
+    [ "$rc" = 0 ] && ok "a C program compiles against the header and calls into the library" \
+                  || bad "a C program compiles against the header and calls into the library" "rc=$rc"
+  else
+    bad "a C program compiles against the header and calls into the library" "cc rejected the generated header"
+  fi
+else
+  bad "build --emit-header writes the header beside the library" "no header or library produced"
+fi
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL
