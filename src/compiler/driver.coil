@@ -4504,6 +4504,7 @@
         (= arg "--use") true
         (= arg "--reader-artifact") true
         (= arg "--seal") true
+        (= arg "--emit-seal") true
         (= arg "--emit-header") true
         (= arg "--backend") true
         (= arg "--test-roots-file") true
@@ -5386,6 +5387,7 @@
         (mut trip) (primitive/cast (ptr i8) 0)
         (mut libmode) 0  ; 0 = executable, 1 = --lib (.a), 2 = --shared (.dylib)
         (mut ehdr) (None [(slice u8)])
+        (mut eseal) (None [(slice u8)])
         (mut wantg) false  ; -g/--debug requested: gather a .dSYM after linking
         ; Release is the default profile.  -g/--debug opts into DWARF and the
         ; build/debug output directory; --release can switch back explicitly.
@@ -5412,6 +5414,14 @@
                           (opt-flag? arg) (apply-opt-flag! arg)
                           (meta-opt-flag? arg) (apply-meta-opt-flag! arg)
                           (starts-with arg "--wasm-stack-size=") (apply-wasm-stack-flag! arg)
+                          (and (< (primitive/iadd (load j) 1) (primitive/cast i64 flag-argc))
+                               (= arg "--emit-seal"))
+                            (do
+                              (store! eseal
+                                      (Some (cstr->slice (load (primitive/index argv
+                                                                                (primitive/iadd (load j)
+                                                                                                1))))))
+                              0)
                           (and (< (primitive/iadd (load j) 1) (primitive/cast i64 flag-argc))
                                (= arg "--emit-header"))
                             (do
@@ -5814,6 +5824,15 @@
                             (cleanup-build-objects! a obj-slice object-count)
                             (match ehdr
                               (Some [h] (cheader-program a (read-src a file) (dirname (cstr->slice file)) (Some h)))
+                              (None [] 0))
+                            (match eseal
+                              (Some [sealout]
+                                (seal-program a
+                                              (read-src a file)
+                                              (dirname (cstr->slice file))
+                                              (cstr->slice file)
+                                              sealout
+                                              (basename out-slice)))
                               (None [] 0)))))))))))))
 
 ; ============================ cheader (export-c → C header) =================
@@ -6146,6 +6165,211 @@
                                             (d-write-file a o hdr)
                                             (let [w (stdout)] (ps w "wrote ") (ps w o) (wb w 10))
                                             0)))))))))))))))
+
+;; ============================ seal emission ==================================
+;; A seal is the checked declaration surface of one namespace, written as ordinary
+;; Coil source. Signature types are printed QUALIFIED, so the seal needs no imports
+;; of its own: a consumer resolving it pulls in nothing but the declarations, which
+;; is the whole point — the namespace's own imports are what cost the time the seal
+;; is there to avoid.
+(defn seal-in-namespace? [(a (dyn Allocator)) (name (slice u8)) (ns (slice u8))] (-> bool)
+  (starts-with name (sconcat a ns ".")))
+
+;; The leaf under `ns.`, i.e. the name as the module itself spells it.
+(defn seal-leaf [(name (slice u8)) (ns (slice u8))] (-> (slice u8))
+  (subslice [u8] name (primitive/iadd (len ns) 1) (len name)))
+
+;; Does this namespace export `leaf`? A seal declares exactly the module's public
+;; surface: sealing must not widen it, and a private helper has no reason to appear.
+(defn seal-exported? [(names (ptr (ArrayList (slice u8)))) (leaf (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (len (load names))]
+      (when (= (get (load names) i) leaf) (set! found true) 0)
+      0)
+    (load found)))
+
+;; The names a source's own `(export …)` forms list. Read from syntax rather than
+;; from loader state so that seal rendering can run over the program the ordinary
+;; pipeline returns, which is the only frontend entry that sets up the prelude.
+(defn seal-export-names [(a (dyn Allocator)) (forms (ptr (ArrayList Sexp)))] (-> (ptr (ArrayList (slice u8))))
+  (let [(mut out) (al-new [(slice u8)] a)]
+    (for [i 0 (len (load forms))]
+      (let [f (primitive/alloc-stack Sexp)]
+        (set! f (get (load forms) i))
+        (match (l-list-head f)
+          (Some [head]
+            (when (= head "export")
+              (let [items (sx-items (load f))]
+                (for [j 1 (len (load items))]
+                  (let [namef (primitive/alloc-stack Sexp)]
+                    (set! namef (sx-at items j))
+                    (match (l-sym-name namef)
+                      (Some [nm] (push! (mut out) nm))
+                      (None [] 0)))
+                  0))
+              0))
+          (None [] 0)))
+      0)
+    (box-al [(slice u8)] a (load out))))
+
+;; `function_abis` can list one name more than once (a redeclared surface); a seal
+;; must declare it exactly once or the consumer sees a duplicate definition.
+(defn seal-declared? [(declared (mut (ArrayList (slice u8)))) (leaf (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (len declared)]
+      (when (= (get declared i) leaf) (set! found true) 0)
+      0)
+    (load found)))
+
+(defn seal-write-fields! [(a (dyn Allocator))
+                          (out (mut StrBuf))
+                          (fields (ptr (ArrayList Field)))] (-> i64)
+  (sb-push-byte! (mut out) (primitive/cast u8 91))
+  (for [i 0 (len (load fields))]
+    (let [fld (al-elem [Field] fields i)]
+      (when (> i 0) (sb-push-byte! (mut out) (primitive/cast u8 32)) 0)
+      (sb-push-byte! (mut out) (primitive/cast u8 40))
+      (sb-push-str! (mut out) (.name fld))
+      (sb-push-byte! (mut out) (primitive/cast u8 32))
+      (sb-push-str! (mut out) (ty-str a (field fld ty)))
+      (sb-push-byte! (mut out) (primitive/cast u8 41)))
+    0)
+  (sb-push-byte! (mut out) (primitive/cast u8 93))
+  0)
+
+(defn seal-render [(a (dyn Allocator))
+                   (p (ptr Program))
+                   (exports (ptr (ArrayList (slice u8))))
+                   (ns (slice u8))
+                   (archive (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (let [(mut out) (sb-new a)
+        (mut exported) (al-new [(slice u8)] a)
+        (mut declared) (al-new [(slice u8)] a)
+        (mut err) (None [(slice u8)])]
+    (sb-push-str! (mut out) ";;; coil seal v1\n;;; namespace: ")
+    (sb-push-str! (mut out) ns)
+    (sb-push-str! (mut out) "\n;;; archive: ")
+    (sb-push-str! (mut out) archive)
+    (sb-push-str! (mut out) "\n;;; toolchain: ")
+    (sb-push-str! (mut out) (m-trim (version-text)))
+    (sb-push-str! (mut out) "\n;;; target: ")
+    (sb-push-str! (mut out) (target-arch-str))
+    (sb-push-str! (mut out) "-")
+    (sb-push-str! (mut out) (target-os-str))
+    (sb-push-str! (mut out) "\n(module ")
+    (sb-push-str! (mut out) ns)
+    (sb-push-str! (mut out) ")\n")
+    ; concrete records first: a signature below may name one of them.
+    (for [i 0 (len (load (field p structs)))]
+      (let [decl (al-elem [StructDef] (load (field p structs)) i)]
+        (when (and (seal-in-namespace? a (.name decl) ns)
+                   (and (= (len (load (field decl type_params))) 0)
+                        (seal-exported? exports (seal-leaf (.name decl) ns))))
+          (match (.layout decl)
+            (LC []
+                (do
+                  (sb-push-str! (mut out) "(defstruct ")
+                  (sb-push-str! (mut out) (seal-leaf (.name decl) ns))
+                  (sb-push-byte! (mut out) (primitive/cast u8 32))
+                  (seal-write-fields! a (mut out) (load (field decl fields)))
+                  (sb-push-str! (mut out) ")\n")
+                  (push! (mut exported) (seal-leaf (.name decl) ns))))
+            (_ (set! err (Some (sconcat a "cannot seal non-standard layout record " (.name decl))))))
+          0))
+      0)
+    (for [i 0 (len (load (field p sums)))]
+      (let [decl (al-elem [SumDef] (load (field p sums)) i)]
+        (when (and (seal-in-namespace? a (.name decl) ns)
+                   (and (= (len (load (field decl type_params))) 0)
+                        (seal-exported? exports (seal-leaf (.name decl) ns))))
+          (sb-push-str! (mut out) "(defsum ")
+          (sb-push-str! (mut out) (seal-leaf (.name decl) ns))
+          (for [j 0 (len (load (field decl variants)))]
+            (let [variant (al-elem [Variant] (load (field decl variants)) j)]
+              (sb-push-str! (mut out) " (")
+              (sb-push-str! (mut out) (last-component (.name variant)))
+              (when (> (len (load (field variant fields))) 0)
+                (sb-push-byte! (mut out) (primitive/cast u8 32))
+                (seal-write-fields! a (mut out) (load (field variant fields)))
+                0)
+              (sb-push-byte! (mut out) (primitive/cast u8 41)))
+            0)
+          (sb-push-str! (mut out) ")\n")
+          (push! (mut exported) (seal-leaf (.name decl) ns))
+          0))
+      0)
+    ; One body-less `defn` per exported function, rendered from the CHECKED
+    ; callable surface rather than from the monomorphized bodies: mono has already
+    ; lowered an aggregate parameter to a pointer, and a seal that said `(ptr T)`
+    ; would change the API its callers write against. `function_abis` keeps the
+    ; semantic call ABI (`ref` for a non-affine aggregate) and survives mono.
+    (for [i 0 (len (load (field p function_abis)))]
+      (let [surface (al-elem [Extern] (load (field p function_abis)) i)
+            leaf (if (seal-in-namespace? a (.name surface) ns) (seal-leaf (.name surface) ns) "")]
+        (when (and (seal-in-namespace? a (.name surface) ns)
+                   (and (seal-exported? exports leaf)
+                        (and (repl-runtime-surface? surface)
+                             (not (seal-declared? (mut declared) leaf)))))
+          (push! (mut declared) leaf)
+          (sb-push-str! (mut out) "(defn ")
+          (sb-push-str! (mut out) leaf)
+          (unless (= (.cc surface) "c")
+            (sb-push-str! (mut out) " :cc ")
+            (sb-push-str! (mut out) (.cc surface))
+            0)
+          (sb-push-str! (mut out) " [")
+          (for [j 0 (len (load (field surface params)))]
+            (do
+              (when (> j 0) (sb-push-byte! (mut out) (primitive/cast u8 32)) 0)
+              (sb-push-str! (mut out) "(p")
+              (sb-push-str! (mut out) (i64->str a j))
+              (sb-push-byte! (mut out) (primitive/cast u8 32))
+              (sb-push-str! (mut out) (ty-str a (al-elem [Type] (load (field surface params)) j)))
+              (sb-push-byte! (mut out) (primitive/cast u8 41)))
+            0)
+          (sb-push-str! (mut out) "] (-> ")
+          (sb-push-str! (mut out) (ty-str a (field surface ret)))
+          (sb-push-str! (mut out) "))\n")
+          (push! (mut exported) leaf)
+          0))
+      0)
+    (sb-push-str! (mut out) "(export")
+    (for [i 0 (len (load exported))]
+      (sb-push-byte! (mut out) (primitive/cast u8 32))
+      (sb-push-str! (mut out) (get (load exported) i))
+      0)
+    (sb-push-str! (mut out) ")\n")
+    (match (load err)
+      (Some [e] (Err [(slice u8) (slice u8)] e))
+      (None [] (Ok [(slice u8) (slice u8)] (sb-str (load out)))))))
+
+;; Run the frontend over `src` and write its namespace's seal to `out`.
+(defn seal-program [(a (dyn Allocator))
+                    (src (slice u8))
+                    (cwd (slice u8))
+                    (path (slice u8))
+                    (out (slice u8))
+                    (archive (slice u8))] (-> i64)
+  (match (read-all a src 0)
+    (Err [d] (let [dp (primitive/alloc-stack Diag)] (set! dp d) (dump-error (stderr) dp) 1))
+    (Ok [forms]
+        (match (declared-module forms)
+          (None [] (do (ps (stderr) "error: a sealed artifact's entry must declare a module\n") 1))
+          (Some [ns]
+            (let [exports (seal-export-names a forms)
+                  w (stderr)
+                  (mut sp0) (al-new [(slice u8)] a)
+                  (mut st0) (al-new [(slice u8)] a)]
+              (match (run-pipeline a src cwd w path (mut sp0) (mut st0))
+                (None [] 1)
+                (Some [mp]
+                  (match (seal-render a mp exports ns archive)
+                    (Err [e] (do (ps (stderr) "error: ") (ps (stderr) e) (wb (stderr) 10) 1))
+                    (Ok [text]
+                        (do
+                          (d-write-file a out text)
+                          (let [w2 (stdout)] (ps w2 "wrote ") (ps w2 out) (wb w2 10))
+                          0)))))))))))
 
 ; ============================ Coil.toml manifest ============================
 ; `coil build` / `coil run` with no source file read ./Coil.toml and expand it
@@ -7180,8 +7404,8 @@
         0)
       (for [i 0 (len (load (field m artifacts)))]
         (let [item (get (load (field m artifacts)) i)]
-          (unless (= (.kind item) "object")
-            (m-err a (.line item) "artifact kind must be \"object\""))
+          (unless (or (= (.kind item) "object") (= (.kind item) "sealed"))
+            (m-err a (.line item) "artifact kind must be \"object\" or \"sealed\""))
           (when (= (len (.entry item)) 0)
             (m-err a (.line item) "artifact entry is required"))
           (when (= (len (.out item)) 0)
@@ -8607,6 +8831,30 @@
 ; Only a bare manifest build reaches this helper; naming a source file keeps the
 ; established single-artifact behavior.  Compile-affecting command-line settings
 ; are copied explicitly, while the primary executable's `-o` is not.
+;; The seal that accompanies a sealed artifact's archive: `foo.a` -> `foo.seal`.
+;; One declaration in the manifest therefore names both halves, and a consumer only
+;; ever has to know about the seal — it names its own archive.
+(defn m-seal-path [(a (dyn Allocator)) (out (slice u8))] (-> (slice u8))
+  (let [n (len out)]
+    (if (and (>= n (primitive/cast i64 2)) (= (subslice [u8] out (primitive/isub n 2) n) ".a"))
+        (sconcat a (subslice [u8] out 0 (primitive/isub n 2)) ".seal")
+        (sconcat a out ".seal"))))
+
+;; Every sealed artifact the manifest declares is also OFFERED to this command.
+;; Declaring one is the whole configuration: the package that produces a seal
+;; consumes it too, so an import of that namespace links the archive instead of
+;; compiling the module, without a second setting saying so.
+(defn m-emit-seals [(a (dyn Allocator)) (b (mut StrBuf)) (m (ptr Manifest))] (-> i64)
+  (let [items (load (field m artifacts))]
+    (for [i 0 (len items)]
+      (let [item (get (load items) i)]
+        (when (= (.kind item) "sealed")
+          (sb-push-str! (mut b) " --seal ")
+          (m-shell-quoted! (mut b) (m-seal-path a (.out item)))
+          0))
+      0)
+    0))
+
 (defn m-build-artifacts! [(a (dyn Allocator))
                           (b (mut StrBuf))
                           (m (ptr Manifest))
@@ -8622,10 +8870,23 @@
         (sb-push-str! (mut b) " && ")
         (m-emit-dep-env a (mut b) m)
         (m-shell-quoted! (mut b) self)
-        (sb-push-str! (mut b) " emit-obj ")
-        (m-shell-quoted! (mut b) (.entry item))
-        (sb-push-str! (mut b) " -o ")
-        (m-shell-quoted! (mut b) (.out item))
+        (if (= (.kind item) "sealed")
+            (do
+              ; A sealed artifact is a library plus the declarations that let a
+              ; consumer link it without compiling it.
+              (sb-push-str! (mut b) " build ")
+              (m-shell-quoted! (mut b) (.entry item))
+              (sb-push-str! (mut b) " --lib -o ")
+              (m-shell-quoted! (mut b) (.out item))
+              (sb-push-str! (mut b) " --emit-seal ")
+              (m-shell-quoted! (mut b) (m-seal-path a (.out item)))
+              0)
+            (do
+              (sb-push-str! (mut b) " emit-obj ")
+              (m-shell-quoted! (mut b) (.entry item))
+              (sb-push-str! (mut b) " -o ")
+              (m-shell-quoted! (mut b) (.out item))
+              0))
         (m-emit-uses a (mut b) m)
         (when (load (field m has-target))
           (sb-push-str! (mut b) " --target ")
@@ -8736,6 +8997,7 @@
                      (sb-push-str! (mut b) out)
                      0)
                    (m-emit-uses a (mut b) m)
+                   (m-emit-seals a (mut b) m)
                    (m-emit-link a (mut b) m)
                    (m-cc-sources a (mut b) m)
                    (when (load (field m has-target))
