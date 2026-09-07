@@ -32,6 +32,13 @@ const imports = {
       return 0;
     },
     write: () => 0,
+    // wasm32 is a 32-bit address space, so pointers arrive as Numbers here.
+    strlen: (pointer) => {
+      const bytes = new Uint8Array(instance.exports.memory.buffer);
+      let end = Number(pointer);
+      while (bytes[end] !== 0) end++;
+      return end - Number(pointer);
+    },
     abort: () => { throw new Error("Coil wasm32 regression fixture aborted"); },
   },
 };

@@ -106,6 +106,28 @@ function cstr(ptr) {                              // read NUL-terminated string
   return Buffer.from(m.slice(Number(ptr), e)).toString('utf8');
 }
 function writeBytes(ptr, data) { u8().set(data, Number(ptr)); }
+// mkstemp(3): the template's trailing XXXXXX is replaced IN PLACE with the name that
+// was actually created, and the call returns an open fd for it. metaengine.coil uses
+// it to stage a dylib; under the sandbox the dlopen that follows traps, but the file
+// still has to be creatable for the call site to reach that point.
+function hostMkstemp(templatePtr) {
+  const template = cstr(templatePtr);
+  if (!template.endsWith('XXXXXX')) return -1;
+  const stem = template.slice(0, -6);
+  for (let attempt = 0; attempt < 64; attempt++) {
+    const path = stem + Math.random().toString(36).slice(2, 8).padEnd(6, '0');
+    try {
+      const fd = fs.openSync(path, 'wx+', 0o600);        // wx+: fail if it already exists
+      writeBytes(templatePtr, Buffer.from(path + '\0'));
+      return fd;
+    } catch (e) {
+      if (e && e.code === 'EEXIST') continue;
+      return -1;
+    }
+  }
+  return -1;
+}
+
 function hostMkdtemp(templatePtr) {
   const template = cstr(templatePtr);
   if (!template.endsWith('XXXXXX')) return 0n;
@@ -332,9 +354,13 @@ const env = {
   open: doOpen, read: doRead, write: doWrite, close:(fd)=>{ if(fd>2){try{fs.closeSync(fd);}catch{}} return 0; },
   creat:(p,mode)=>{ try{return BigInt(fs.openSync(cstr(p),'w'));}catch{return -1n;} },
   access:(p,m)=>{ try{fs.accessSync(cstr(p));return 0;}catch{return -1;} },
-  mkdtemp:hostMkdtemp,
+  mkdtemp:hostMkdtemp, mkstemp:hostMkstemp,
   unlink:(p)=>{ try{fs.unlinkSync(cstr(p));return 0;}catch{return -1;} },
   remove:(p)=>{ try{fs.rmSync(cstr(p));return 0;}catch{return -1;} },
+  // artifact_provider.coil removes its scratch directories; without this the module
+  // will not instantiate at all ("import requires a callable"), which is how the
+  // whole wasm gate went red on one added extern.
+  rmdir:(p)=>{ try{fs.rmdirSync(cstr(p));return 0;}catch{return -1;} },
   rename:(a,b)=>{ try{fs.renameSync(cstr(a),cstr(b));return 0;}catch{return -1;} },
   realpath:(p,out)=>{ try{const r=Buffer.from(fs.realpathSync(cstr(p))+'\0');writeBytes(out,r);return out;}catch{return 0n;} },
   fopen:(p,mode)=>{ try{return BigInt(fs.openSync(cstr(p), cstr(mode).includes('w')?'w':'r'));}catch{return 0n;} },
@@ -409,6 +435,7 @@ const env = {
   // its exit status so `build` completes end to end.
   mmap: trap('mmap'), munmap: trap('munmap'), mprotect: trap('mprotect'),
   dlopen: trap('dlopen'), dlsym: trap('dlsym'), dlerror: trap('dlerror'), dladdr:()=>0,
+  dlclose: trap('dlclose'),
   posix_spawnp: trap('posix_spawnp'), waitpid: trap('waitpid'),
   system: (cmdPtr) => {                              // returns i32 (a JS Number, not BigInt)
     const cmd = cstr(cmdPtr);
@@ -420,6 +447,19 @@ const env = {
 class ExitSignal extends Error { constructor(code){ super('exit'); this.code = code; } }
 class MetaHalt extends Error { constructor(){ super('meta-halt'); } }   // metaprogram (error …)
 
+// Name EVERY env import this shim does not provide, before instantiating. The raw
+// LinkError names one at a time, so a compiler that grew several new externs took as
+// many build-and-run rounds to diagnose; one added `rmdir` was enough to make the
+// whole wasm gate look broken for an unrelated reason.
+const wasmModule = new WebAssembly.Module(bytes);
+const absent = [...new Set(WebAssembly.Module.imports(wasmModule)
+  .filter(i => i.module === 'env' && i.kind === 'function' && typeof env[i.name] !== 'function')
+  .map(i => i.name))].sort();
+if (absent.length) {
+  console.error(`run-coil-wasm: the compiler imports env functions this host does not define:\n  ${absent.join('\n  ')}\n` +
+                `Add them to the \`env\` table in ${new URL(import.meta.url).pathname}.`);
+  process.exit(2);
+}
 const { instance: inst } = await WebAssembly.instantiate(bytes, { env });
 instance = inst;
 compilerExports = instance.exports;                          // meta_run_wasm bridges mh_* to these
