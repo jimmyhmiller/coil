@@ -9,7 +9,13 @@
   [(reader SourceReaderHook) (cimport_policy DeferCimportBox)
    (form_id i64) (prelude PreludeNameBox) (layout StdlibLayout)
    (workspace WsPkgBox) (virtual_sources (ptr (ArrayList VirtualSource)))
-   (artifact_inputs (ptr (ArrayList LoaderArtifactInput)))])
+   (artifact_inputs (ptr (ArrayList LoaderArtifactInput)))
+   ; Sealed namespaces: functions whose CHECKED SIGNATURE is loaded from a `.seal`
+   ; declaration source while their code comes from the archive beside it. Appended,
+   ; and both lists are created lazily, so a bound unit state that predates them
+   ; reads them as null rather than as garbage.
+   (sealed_functions (ptr (ArrayList (slice u8))))
+   (sealed_archives (ptr (ArrayList (slice u8))))])
 (defstruct LoaderArtifactInput [(path (slice u8)) (text (slice u8))])
 (defn loader-unit-state-cell [] (-> (ptr (ptr LoaderUnitState)))
   (primitive/alloc-static (ptr LoaderUnitState)))
@@ -456,6 +462,165 @@
           (when (= (.name entry) name) (set! found (field entry source)) 0)) 0)
       0)
     (load found)))
+
+; ---- sealed namespaces ---------------------------------------------------------
+; A sealed namespace's declarations are loaded as ordinary Coil source; its CODE is
+; not. Every function the seal declares is recorded here by qualified name, and the
+; three phases that would otherwise need a body consult this list: `check-func`
+; skips body checking, `cg-declare-funcs` gives the name external linkage, and
+; `cg-emit-bodies` emits no definition. The archive supplying those definitions is
+; recorded alongside and reaches the linker as an ordinary link input.
+;
+; A name is registered ONLY by loading a validated seal. Nothing a user can write
+; puts a name in this list, so a body-less definition remains the ordinary
+; "body has type void" error everywhere else.
+(defn sealed-function-list [(a (dyn Allocator))] (-> (ptr (ArrayList (slice u8))))
+  (let [state (loader-unit-state)]
+    (when (= (primitive/cast i64 (.sealed_functions state)) 0)
+      (set! (.sealed_functions state) (box-al [(slice u8)] a (al-new [(slice u8)] a)))
+      0)
+    (.sealed_functions state)))
+
+(defn sealed-archive-list [(a (dyn Allocator))] (-> (ptr (ArrayList (slice u8))))
+  (let [state (loader-unit-state)]
+    (when (= (primitive/cast i64 (.sealed_archives state)) 0)
+      (set! (.sealed_archives state) (box-al [(slice u8)] a (al-new [(slice u8)] a)))
+      0)
+    (.sealed_archives state)))
+
+(defn sealed-function-add! [(a (dyn Allocator)) (name (slice u8))] (-> i64)
+  (push! (sealed-function-list a) name)
+  0)
+
+(defn sealed-archive-add! [(a (dyn Allocator)) (path (slice u8))] (-> i64)
+  (let [archives (sealed-archive-list a)
+        (mut present) false]
+    (for [i 0 (len (load archives))]
+      (when (= (get (load archives) i) path) (set! present true) 0) 0)
+    (unless (load present) (push! archives path) 0)
+    0))
+
+;;; Is this qualified function name declared by a seal rather than defined here?
+(defn sealed-function? [(name (slice u8))] (-> bool)
+  (let [names (.sealed_functions (loader-unit-state))
+        (mut found) false]
+    (unless (= (primitive/cast i64 names) 0)
+      (for [i 0 (len (load names))]
+        (when (= (get (load names) i) name) (set! found true) 0) 0)
+      0)
+    (load found)))
+
+;;; Every archive that must reach the linker for the seals loaded by this unit.
+(defn sealed-archives [] (-> (ptr (ArrayList (slice u8))))
+  (.sealed_archives (loader-unit-state)))
+
+;;; The value of a `;;; KEY: VALUE` seal header line, or "" when absent.
+;;;
+;;; The header is `;;;` comment lines so that a seal is ordinary, readable Coil
+;;; source: once the header has been checked, the rest travels the same path as any
+;;; other module text, with no second reader and no binary metadata format to keep
+;;; in step with the language.
+(defn seal-header-value [(text (slice u8)) (key (slice u8))] (-> (slice u8))
+  (let [n (len text)
+        (mut at) 0
+        (mut out) ""
+        (mut done) false]
+    (loop
+      (if (or (load done) (>= (load at) n))
+          (break)
+          (let [(mut end) (load at)]
+            (loop (if (or (>= (load end) n) (= (primitive/cast i64 (get text (load end))) 10))
+                      (break)
+                      (set! end (primitive/iadd (load end) 1))))
+            (let [line (subslice [u8] text (load at) (load end))]
+              ; The header stops at the first line that is not a `;;;` comment, so a
+              ; declaration body can never be mistaken for a header field.
+              (if (starts-with line ";;; ")
+                  (let [rest (subslice [u8] line 4 (len line))]
+                    (when (starts-with rest key)
+                      (let [after (subslice [u8] rest (len key) (len rest))]
+                        (when (starts-with after ": ")
+                          (set! out (subslice [u8] after 2 (len after)))
+                          (set! done true)
+                          0)
+                        0)
+                      0))
+                  (set! done true))
+              (set! at (primitive/iadd (load end) 1))))))
+    (load out)))
+
+;;; Register the seal at `path` as the source of its declared namespace.
+;;;
+;;; The seal becomes a virtual source, so `resolve-source` finds it ahead of the
+;;; namespace index exactly like any other generated declaration source; every
+;;; `defn` it declares is recorded as sealed; and its archive is queued as a link
+;;; input. Returns "" on success or a message describing why the seal was refused —
+;;; the caller decides whether that is fatal or a fall back to building from source.
+;;; The archive path a seal names, resolved against the seal's own directory, or
+;;; "" when the seal cannot be read or names none. The LINK step needs this after
+;;; the compilation unit that registered the seal has already been torn down, so it
+;;; is derived from the seal file rather than from unit state.
+(defn seal-archive-path [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
+  (match (read-file-opt a (str->cstr a path))
+    (None [] "")
+    (Some [text]
+      (let [archive (seal-header-value text "archive")]
+        (if (= (len archive) 0)
+            ""
+            (if (starts-with archive "/") archive (path-join a (dirname path) archive)))))))
+
+(defn seal-register! [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
+  (match (read-file-opt a (str->cstr a path))
+    (None [] (sconcat a "cannot read seal: " path))
+    (Some [text]
+      (let [namespace (seal-header-value text "namespace")
+            archive (seal-header-value text "archive")]
+        (cond
+          (= (len namespace) 0) (sconcat a "seal has no `namespace` header: " path)
+          (= (len archive) 0) (sconcat a "seal has no `archive` header: " path)
+          :else
+            (let [dir (dirname path)
+                  archive-path (if (starts-with archive "/") archive (path-join a dir archive))]
+              (if (not (path-readable? a archive-path))
+                  (sconcat a "seal archive is missing: " archive-path)
+                  (match (read-all a text -1)
+                    (Err [d] (sconcat a "seal does not read as Coil source: " path))
+                    (Ok [forms]
+                      (do
+                        (for [i 0 (len (load forms))]
+                          (let [f (primitive/alloc-stack Sexp)]
+                            (set! f (get (load forms) i))
+                            (match (l-list-head f)
+                              (Some [head]
+                                (when (= head "defn")
+                                  (let [items (sx-items (load f))
+                                        namef (primitive/alloc-stack Sexp)]
+                                    (when (> (len (load items)) 1)
+                                      (set! namef (sx-at items 1))
+                                      (match (l-sym-name namef)
+                                        (Some [nm]
+                                          (sealed-function-add! a (sconcat3 a namespace "." nm)))
+                                        (None [] 0))
+                                      0))
+                                  0))
+                              (None [] 0))
+                            0)
+                          0)
+                        (sealed-archive-add! a archive-path)
+                        (let [state (loader-unit-state)]
+                          (when (= (primitive/cast i64 (.virtual_sources state)) 0)
+                            (set! (.virtual_sources state)
+                                  (box-al [VirtualSource] a (al-new [VirtualSource] a)))
+                            0)
+                          (let [entry (primitive/alloc-stack VirtualSource)
+                                rp (primitive/alloc-stack Resolved)]
+                            (set! (.text rp) text)
+                            (set! (.incdir rp) dir)
+                            (set! (.disp rp) path)
+                            (set! (.name entry) namespace)
+                            (set! (.source entry) (load rp))
+                            (push! (.virtual_sources state) (load entry))))
+                        ""))))))))))
 
 ;;; Initialize EVERY field of a fresh LS.
 ;;;
