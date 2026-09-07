@@ -76,7 +76,7 @@ expect_crash_out() {
 }
 
 printf '(defn main [] (-> i64) 7)\n'                     > "$T/seven.coil"
-printf '(extern abort :cc c [] (-> i64))\n(defn main [] (-> i64) (abort))\n' > "$T/abort.coil"
+printf '(extern abort :cc c [] (-> void))\n(defn main [] (-> i64) (abort) 0)\n' > "$T/abort.coil"
 printf '(defn a [] (-> i64)    1)\n'                     > "$T/messy1.coil"
 printf '(defn b [] (-> i64)    2)\n'                     > "$T/messy2.coil"
 
@@ -235,6 +235,14 @@ expect_rc 0 "child -o is passed verbatim after --" \
 [ ! -e child-output ] \
   && ok "child -o does not select Coil's build output" \
   || bad "child -o does not select Coil's build output" "run leaked a post--- flag into build parsing"
+
+cat > "$T/run-opaque-arguments.coil" <<'EOF'
+(defn main [] (-> i64) 0)
+EOF
+expect_rc 0 "reader/runtime options after -- cannot configure compilation" \
+  "$COIL" run "$T/run-opaque-arguments.coil" -- --macro-expansion-limit 0 \
+  --backend nonexistent --reader-artifact /nonexistent --use nonexistent \
+  --test-roots-file /nonexistent --emit-header /nonexistent/header.h --lib -g
 
 echo "== a file the user named must exist =="
 expect_rc 1 "build: missing file is an error"            "$COIL" build "$T/nope.coil" -o "$T/x"
@@ -1884,6 +1892,25 @@ out=$("$COIL" run "$T/guard-uaf.coil" --debug-checks 2>&1); rc=$?
 [ "$rc" = 138 ] || [ "$rc" = 139 ] \
   && ok "guard allocator protects quarantined payload pages" \
   || bad "guard allocator UAF" "want SIGBUS/SIGSEGV, got rc=$rc: $out"
+
+cat > "$T/byte-receiver.coil" <<'EOF'
+(module byte_receiver)
+(import "coil.primitive" :as p)
+(defstruct Byte [(value u8)])
+(deftrait ReadByte [Self] (read-byte [(self (ptr Self))] (-> i64)))
+(impl ReadByte Byte
+  (read-byte [(self (ptr Byte))] (-> i64) (p/cast i64 (.value self))))
+(defn main [] (-> i64)
+  (let [storage (p/alloc-static (array u8 2))
+        base (p/cast (ptr u8) storage)
+        odd (p/index base (if (= (p/iand (p/cast i64 base) 1) 0) 1 0))
+        receiver (p/cast (ptr Byte) odd)]
+    (store! (field receiver value) 42)
+    (let [object (p/make-dyn ReadByte receiver)]
+      (if (= (read-byte object) 42) 0 1))))
+EOF
+expect_rc 0 "debug checks accept a valid byte-aligned dyn receiver" \
+  "$COIL" run "$T/byte-receiver.coil" --debug-checks
 
 cat > "$T/ffi-out.coil" <<'EOF'
 (module m)
