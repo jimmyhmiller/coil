@@ -28,6 +28,10 @@
 #include <fcntl.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
+#include <dirent.h>
+#include <spawn.h>
+#include <sys/wait.h>
 
 // ---- module interface (defined in the generated coilc.c) -------------------
 extern uint8_t **const wasm_memory;          // &m0 : the linear-memory buffer
@@ -92,21 +96,37 @@ static void ensure(uint64_t end) {
     g_cap = ncap;
 }
 
-static uint64_t rt_malloc(uint64_t size) {
+static uint64_t rt_aligned_malloc(uint64_t size, uint64_t alignment) {
+    if (size > UINT64_MAX - ALIGN) die("bootstrap allocator: size overflow");
     uint64_t rounded = align_up(size == 0 ? 1 : size, ALIGN);
     uint64_t *slot = bin_slot(rounded);
-    if (*slot != 0) {                            // reuse a freed block
-        uint64_t h = *slot;
-        *slot = hdr_tag_get(h);                  // pop: head = next
-        hdr_tag_set(h, MAGIC);
-        return h + HDR;
+    uint64_t previous = 0;
+    for (uint64_t h = *slot; h != 0; h = hdr_tag_get(h)) {
+        if ((h + HDR) % alignment == 0) {
+            uint64_t next = hdr_tag_get(h);
+            if (previous) hdr_tag_set(previous, next); else *slot = next;
+            hdr_tag_set(h, MAGIC);
+            return h + HDR;
+        }
+        previous = h;
     }
-    uint64_t h = align_up(g_brk, ALIGN);
-    g_brk = h + HDR + rounded;
+    if (g_brk > UINT64_MAX - HDR - alignment) die("bootstrap allocator: alignment overflow");
+    uint64_t ptr = align_up(g_brk + HDR, alignment);
+    if (rounded > UINT64_MAX - ptr) die("bootstrap allocator: heap overflow");
+    g_brk = ptr + rounded;
     ensure(g_brk);
-    hdr_size_set(h, rounded);
-    hdr_tag_set(h, MAGIC);
-    return h + HDR;
+    hdr_size_set(ptr - HDR, rounded);
+    hdr_tag_set(ptr - HDR, MAGIC);
+    return ptr;
+}
+
+static uint64_t rt_malloc(uint64_t size) { return rt_aligned_malloc(size, ALIGN); }
+
+uint32_t env_posix_memalign(uint64_t out, uint64_t alignment, uint64_t size) {
+    if (alignment < 8 || (alignment & (alignment - 1))) return EINVAL;
+    uint64_t ptr = rt_aligned_malloc(size, alignment < ALIGN ? ALIGN : alignment);
+    memcpy(MEM + out, &ptr, 8);
+    return 0;
 }
 
 static void rt_free(uint64_t ptr) {
@@ -223,6 +243,10 @@ uint64_t env_write(uint32_t fd, uint64_t ptr, uint64_t len) {
 }
 uint32_t env_close(uint32_t fd) { if (fd > 2) close((int)fd); return 0; }
 uint32_t env_access(uint64_t path, uint64_t mode) { return (uint32_t)access(hoststr(path), (int)mode); }
+uint64_t env_mkdtemp(uint64_t path) { return mkdtemp(hoststr(path)) ? path : 0; }
+uint32_t env_mkstemp(uint64_t path) { return (uint32_t)mkstemp(hoststr(path)); }
+uint32_t env_remove(uint64_t path) { return (uint32_t)remove(hoststr(path)); }
+uint32_t env_rmdir(uint64_t path) { return (uint32_t)rmdir(hoststr(path)); }
 uint32_t env_unlink(uint64_t path) { return (uint32_t)unlink(hoststr(path)); }
 uint32_t env_rename(uint64_t a, uint64_t b) { return (uint32_t)rename(hoststr(a), hoststr(b)); }
 uint64_t env_realpath(uint64_t path, uint64_t out) {
@@ -236,9 +260,30 @@ uint64_t env_getcwd(uint64_t buf, uint64_t size) {
     if (getcwd((char *)(MEM + buf), (size_t)size) == NULL) return 0;
     return buf;
 }
-// getenv: the reference JS host returns NULL for every variable and still
-// produces a byte-identical self-build, so mirror that exactly.
-uint64_t env_getenv(uint64_t name) { (void)name; return 0; }
+// Cached guest copies survive memory relocation and are reused until a host
+// environment value changes. Host libc pointers never escape into the guest.
+typedef struct EnvCopy { char *name, *value; uint64_t offset; struct EnvCopy *next; } EnvCopy;
+static EnvCopy *env_copies;
+uint64_t env_getenv(uint64_t name) {
+    const char *key = hoststr(name), *value = getenv(key);
+    if (!value) return 0;
+    EnvCopy *entry = env_copies;
+    while (entry && strcmp(entry->name, key)) entry = entry->next;
+    if (entry && !strcmp(entry->value, value)) return entry->offset;
+    if (!entry) {
+        entry = calloc(1, sizeof(*entry));
+        if (!entry) die("bootstrap environment: out of memory");
+        entry->name = strdup(key);
+        if (!entry->name) die("bootstrap environment: out of memory");
+        entry->next = env_copies; env_copies = entry;
+    } else { rt_free(entry->offset); free(entry->value); }
+    entry->value = strdup(value);
+    if (!entry->value) die("bootstrap environment: out of memory");
+    size_t length = strlen(entry->value) + 1;
+    entry->offset = rt_malloc(length);
+    memcpy(MEM + entry->offset, entry->value, length);
+    return entry->offset;
+}
 uint32_t env_setenv(uint64_t name, uint64_t value, uint32_t overwrite) {
     return (uint32_t)setenv(hoststr(name), hoststr(value), (int)overwrite);
 }
@@ -275,8 +320,33 @@ uint64_t env_fwrite(uint64_t ptr, uint64_t sz, uint64_t nm, uint64_t f) {
     if (bytes) write((int)f, MEM + ptr, bytes);
     return nm;
 }
-uint64_t env_opendir(uint64_t path) { (void)path; return 0; }
-uint32_t env_closedir(uint64_t d) { (void)d; return 0; }
+typedef struct GuestDir { DIR *stream; uint64_t entry; } GuestDir;
+uint64_t env_opendir(uint64_t path) {
+    DIR *stream = opendir(hoststr(path));
+    if (!stream) return 0;
+    GuestDir *dir = calloc(1, sizeof(*dir));
+    if (!dir) { closedir(stream); return 0; }
+    dir->stream = stream;
+    return (uint64_t)(uintptr_t)dir;
+}
+uint64_t env_readdir(uint64_t handle) {
+    GuestDir *dir = (GuestDir *)(uintptr_t)handle;
+    struct dirent *entry = readdir(dir->stream);
+    if (!entry) return 0;
+    // wasm64's loader uses its Darwin-layout branch, independent of the host OS.
+    size_t length = strlen(entry->d_name) + 1;
+    dir->entry = rt_realloc(dir->entry, 21 + length);
+    memset(MEM + dir->entry, 0, 21);
+    MEM[dir->entry + 20] = entry->d_type;
+    memcpy(MEM + dir->entry + 21, entry->d_name, length);
+    return dir->entry;
+}
+uint32_t env_closedir(uint64_t handle) {
+    GuestDir *dir = (GuestDir *)(uintptr_t)handle;
+    int result = closedir(dir->stream);
+    rt_free(dir->entry); free(dir);
+    return (uint32_t)result;
+}
 
 // ---- string / number parsing (linear memory is host-addressable) ----
 uint32_t env_atoi(uint64_t p) { return (uint32_t)(int32_t)atoi(hoststr(p)); }
@@ -348,6 +418,35 @@ uint32_t env_atexit(uint64_t fn) { (void)fn; return 0; }
 // same role the FS imports play. Real wait()-style status is returned.
 uint32_t env_system(uint64_t cmd) { return (uint32_t)system(hoststr(cmd)); }
 
+// Marshal a NULL-terminated wasm64 string-pointer vector into host pointers.
+// No guest allocation occurs while these borrowed host pointers are in use.
+static char **host_vector(uint64_t offset) {
+    size_t count = 0;
+    if (offset) while (hdr_size_get(offset + count * 8)) ++count;
+    char **result = calloc(count + 1, sizeof(*result));
+    if (!result) return NULL;
+    for (size_t i = 0; i < count; ++i) result[i] = hoststr(hdr_size_get(offset + i * 8));
+    return result;
+}
+uint32_t env_posix_spawnp(uint64_t pid_out, uint64_t path, uint64_t actions,
+                         uint64_t attributes, uint64_t argv, uint64_t envp) {
+    // Opaque native spawn attributes cannot be represented as guest offsets.
+    if (actions || attributes) return ENOTSUP;
+    char **args = host_vector(argv), **environment = host_vector(envp);
+    if (!args || !environment) { free(args); free(environment); return ENOMEM; }
+    pid_t pid;
+    int result = posix_spawnp(&pid, hoststr(path), NULL, NULL, args, environment);
+    if (!result) { int32_t value = (int32_t)pid; memcpy(MEM + pid_out, &value, 4); }
+    free(args); free(environment);
+    return (uint32_t)result;
+}
+uint32_t env_waitpid(uint32_t pid, uint64_t status, uint32_t options) {
+    int value;
+    pid_t result = waitpid((pid_t)(int32_t)pid, status ? &value : NULL, (int)options);
+    if (result > 0 && status) { int32_t guest = value; memcpy(MEM + status, &guest, 4); }
+    return (uint32_t)result;
+}
+
 // ---- threads: single-threaded no-ops (called during metaengine setup) ----
 uint32_t env_pthread_mutex_init(uint64_t a, uint64_t b) { (void)a; (void)b; return 0; }
 uint32_t env_pthread_mutex_lock(uint64_t a) { (void)a; return 0; }
@@ -371,6 +470,9 @@ uint32_t env_munmap(uint64_t a, uint64_t b) { (void)a;(void)b; die("unreachable:
 uint32_t env_mprotect(uint64_t a, uint64_t b, uint32_t c) { (void)a;(void)b;(void)c; die("unreachable: env.mprotect"); return 0; }
 uint64_t env_dlopen(uint64_t a, uint64_t b) { (void)a;(void)b; die("unreachable: env.dlopen"); return 0; }
 uint64_t env_dlsym(uint64_t a, uint64_t b) { (void)a;(void)b; die("unreachable: env.dlsym"); return 0; }
+// Guest function pointers identify wasm table entries, never native images.
+uint32_t env_dladdr(uint64_t address, uint64_t info) { (void)address; (void)info; return 0; }
+uint32_t env_dlclose(uint64_t handle) { (void)handle; die("unreachable: env.dlclose"); return 0; }
 uint64_t env_dlerror(void) { die("unreachable: env.dlerror"); return 0; }
 
 // ===========================================================================
