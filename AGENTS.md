@@ -79,6 +79,11 @@ Use this format:
   `build full` while diagnosing or iterating.** Run
   `python3 scripts/dev.py build full` only once for final release verification
   after focused tests and the focused gate are green.
+- `python3 scripts/dev.py test generated --compiler <candidate>` exercises
+  generated-unit lifetime/ownership, native reader artifacts, incremental LLVM
+  sessions, sparse/named static storage, extern aliases and the supporting ABI
+  fixes. The full CI job runs it against its verified compiler. Run this gate
+  when changing those features; it includes actual-pipeline memory regressions.
 - ⚠ **Two ways a shell gate reports a result it never established.** Both were
   found live in `gate-cli.sh`/`gate-target-os.sh`, in checks that had been green
   or red for months without meaning anything:

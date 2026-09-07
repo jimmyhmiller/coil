@@ -18,9 +18,23 @@ stage0_compat_run() {
     /*) ;;
     *) source="$repo/$source" ;;
   esac
-  (cd /tmp && \
+  # Compiler imports resolve beside the executable before namespace roots. Using
+  # an installed stage zero directly mixes this main.coil with its old installed
+  # driver/AST/backend modules. Give every stage-zero operation a complete view
+  # of the checkout, just as `dev.py build candidate` does.
+  (
+    local stage_prefix
+    mkdir -p "$repo/build" || exit 1
+    stage_prefix=$(mktemp -d "$repo/build/.coil-stage0-XXXXXX") || exit 1
+    trap 'rm -rf "$stage_prefix"' EXIT
+    mkdir -p "$stage_prefix/bin" "$stage_prefix/lib/coil" || exit 1
+    cp "$stage0" "$stage_prefix/bin/coil" || exit 1
+    ln -s "$repo/src/stdlib" "$stage_prefix/lib/coil/stdlib" || exit 1
+    ln -s "$repo/src/compiler" "$stage_prefix/lib/coil/compiler" || exit 1
+    ln -s "$repo/src/compiler/prelude.coil" "$stage_prefix/lib/coil/prelude.coil" || exit 1
+    cd /tmp || exit 1
     COIL_NAMESPACE_ROOTS="$(dirname "$source")" COIL_STRICT_BUNDLE=0 \
-      "$stage0" "$command" "$source" "$@")
+      "$stage_prefix/bin/coil" "$command" "$source" "$@")
 }
 
 # Sets STAGE0 and STAGE0_BUILD_FLAGS. An explicit STAGE0 is authoritative. Without

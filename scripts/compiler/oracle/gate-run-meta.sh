@@ -337,12 +337,17 @@ grep -q "unbound variable 'hidden'" "$WORK/quote.err" \
 # be correct for the naive rule, not only for one that remembered to call
 # `fresh-identifier`. Verified end to end — the rewritten file still returns 42.
 cp tests/compiler/hygiene/suggestion_capture_target.coil "$WORK/sug-target.coil"
-"$BIN" lint "$WORK/sug-target.coil" --use hygiene.suggestion-capture-rule \
+sed 's/hygiene.suggestion-capture-rule/hygiene.suggestion-capture-gate/' \
+  tests/compiler/hygiene/suggestion_capture_rule.coil >"$WORK/sug-rule.coil"
+cp "$WORK/sug-rule.coil" "$WORK/sug-rule.before"
+"$BIN" lint "$WORK/sug-target.coil" --use hygiene.suggestion-capture-gate \
   >"$WORK/sug.out" 2>"$WORK/sug.err"
 grep -q "help: try: (let \[tmp__1 1\] (primitive/imul tmp tmp__1))" "$WORK/sug.err" \
   || { echo "GATE FAIL: suggestion did not disambiguate the rule's binder"; \
        grep 'help: try:' "$WORK/sug.err"; fail=1; }
-"$BIN" lint "$WORK/sug-target.coil" --use hygiene.suggestion-capture-rule --fix >/dev/null 2>&1
+"$BIN" lint "$WORK/sug-target.coil" --use hygiene.suggestion-capture-gate --fix >/dev/null 2>&1
+cmp -s "$WORK/sug-rule.before" "$WORK/sug-rule.coil" \
+  || { echo "GATE FAIL: --fix rewrote the active checker module"; fail=1; }
 grep -q "tmp__1" "$WORK/sug-target.coil" \
   || { echo "GATE FAIL: --fix did not write the disambiguated binder"; fail=1; }
 "$BIN" run "$WORK/sug-target.coil" >/dev/null 2>&1

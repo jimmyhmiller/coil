@@ -48,6 +48,7 @@ RB1="$RUN_DIR/coil-rb1"
 RL2="$RUN_DIR/coil-rl2"
 RL3="$RUN_DIR/coil-rl3"
 cleanup_run_dir() {
+  stage_lib_cleanup
   rm -rf "$RUN_DIR"
 }
 trap cleanup_run_dir EXIT

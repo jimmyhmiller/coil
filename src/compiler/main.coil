@@ -75,7 +75,10 @@
         (mut st0) (al-new [(slice u8)] a)
         result
           (match (run-pipeline a src cwd diagw path (mut sp0) (mut st0))
-            (Some [mp] (do (emit-ir-normalized a w mp triple (sanitize-mode) (debug-checks?)) 1))
+            (Some [mp]
+              (if (> (generated-unit-count) 0)
+                  (do (ps diagw "error: emit-ir requires one module; generated-module sessions have multiple independent IR artifacts; use check or emit-obj\n") 0)
+                  (do (emit-ir-normalized a w mp triple (sanitize-mode) (debug-checks?)) 1)))
             (None [] 0))]
     (buffered-output-flush bout)
     result))
@@ -111,19 +114,15 @@
 (defn verify-module! [(m (ptr i8)) (phase (slice u8))] (-> i64)
   (let [message (primitive/alloc-stack (ptr i8))]
     (set! message (primitive/cast (ptr i8) 0))
-    (when (!= (LLVMVerifyModule m 2 message) (primitive/cast i32 0))
-      (let [w (stderr)
-            msg (load message)]
-        (ps w "error: LLVM module verification failed ")
-        (ps w phase)
-        (ps w ":\n")
-        (when (!= (primitive/cast i64 msg) (primitive/cast i64 0))
-          (ps w (cstr->slice msg))
-          (LLVMDisposeMessage msg)
-          0)
-        (exit 1)
-        0))
-    0))
+    (let [failed (!= (LLVMVerifyModule m 2 message) (primitive/cast i32 0))
+          msg (load message)]
+      (when failed
+        (ps (stderr) "error: LLVM module verification failed ")
+        (ps (stderr) phase)
+        (ps (stderr) ":\n")
+        (unless (= (primitive/cast i64 msg) 0) (ps (stderr) (cstr->slice msg)) 0) 0)
+      (unless (= (primitive/cast i64 msg) 0) (LLVMDisposeMessage msg) 0)
+      (if failed 0 1))))
 
 ; One independently-owned LLVM partition. The coordinator reparses the complete
 ; module into a fresh context and prunes it; concurrent workers therefore never
@@ -386,6 +385,28 @@
                 (set! fn (LLVMGetNextFunction (load fn))))))
     (load count)))
 
+(defn profile-llvm-module [(m (ptr i8))] (-> i64)
+  (when (tr/trace-enabled?)
+    (let [(mut globals) 0 (mut instructions) 0
+          (mut g) (LLVMGetFirstGlobal m) (mut f) (LLVMGetFirstFunction m)]
+      (loop (if (= (primitive/cast i64 (load g)) 0) (break)
+        (do (set! globals (+ (load globals) 1)) (set! g (LLVMGetNextGlobal (load g))))))
+      (loop (if (= (primitive/cast i64 (load f)) 0) (break)
+        (do
+          (let [(mut b) (LLVMGetFirstBasicBlock (load f))]
+            (loop (if (= (primitive/cast i64 (load b)) 0) (break)
+              (do
+                (let [(mut inst) (LLVMGetFirstInstruction (load b))]
+                  (loop (if (= (primitive/cast i64 (load inst)) 0) (break)
+                    (do (set! instructions (+ (load instructions) 1))
+                        (set! inst (LLVMGetNextInstruction (load inst)))))))
+                (set! b (LLVMGetNextBasicBlock (load b)))))))
+          (set! f (LLVMGetNextFunction (load f))))))
+      (tr/count "llvm.functions" (llvm-function-count m))
+      (tr/count "llvm.globals" (load globals))
+      (tr/count "llvm.instructions" (load instructions))) 0)
+  0)
+
 ; mono'd Program -> native object file. Mirrors
 ; (the release/`src_path = None` path): build the module (codegen-module already
 ; sets target + datalayout), create a host target machine (cpu "generic", no
@@ -403,105 +424,89 @@
   (let [lower-span (tr/span-begin "backend.llvm-lower")
         m (codegen-module a mp triple-override sanitize (debug-checks?))
         _lower-end (tr/span-end lower-span)
-        triple
-          (if (!= (primitive/cast i64 triple-override) (primitive/cast i64 0))
-              triple-override
-              (LLVMGetDefaultTargetTriple))
+        _module-profile (profile-llvm-module m)
+        triple (if (= (primitive/cast i64 triple-override) 0)
+                   (LLVMGetDefaultTargetTriple) triple-override)
         targetout (primitive/alloc-stack (ptr i8))
-        errout (primitive/alloc-stack (ptr i8))]
-    (verify-module! m "after lowering")
-    (do
-      ; AsmPrinter init (targets themselves were initialized inside codegen-module).
-      (LLVMInitializeAArch64AsmPrinter)
-      (LLVMInitializeX86AsmPrinter)
-      (LLVMInitializeRISCVAsmPrinter)
-      (LLVMInitializeWebAssemblyAsmPrinter)
-      ; AsmParser init: `:lower shim` conventions emit inline asm, which LLVM cannot
-      ; stream without a parser for the target — it hard-errors and aborts the process.
-      (LLVMInitializeAArch64AsmParser)
-      (LLVMInitializeX86AsmParser)
-      (LLVMInitializeRISCVAsmParser)
-      ; see codegen-module: the status and errout are load-bearing, not decoration.
-      (when (!= (LLVMGetTargetFromTriple triple targetout errout) (primitive/cast i32 0))
-        (let [w (stderr)]
-          (ps w "error: unsupported --target '")
-          (ps w (cstr->slice triple))
-          (ps w "': ")
-          (ps w (cstr->slice (load errout)))
-          (wb w 10)
-          (exit 1)
-          0))
-      (let [tm
-              (LLVMCreateTargetMachine (load targetout)
-                                       triple
-                                       (llvm-cpu triple)
-                                       (llvm-cpu-features triple)
-                                       (primitive/cast i32 optlvl)
-                                       (llvm-reloc-model triple)
-                                       0)
-            parallel
-              (and allow-multiple
-                   (and (= sanitize 0)
-                        (and (= optlvl 3)
-                             (and (= (primitive/cast i64 triple-override) 0)
-                                  (>= (llvm-function-count m)
-                                      (ffi-decimal-env c"COIL_PARALLEL_CODEGEN_MIN_FUNCTIONS" 256))))))
-            pbo (LLVMCreatePassBuilderOptions)
-            ; --sanitize=address (mem-7): append LLVM's AddressSanitizer module pass to
-            ; the O3 pipeline so the emitted object is instrumented. Only the PROGRAM
-            ; object takes this path — the metaprogram dylib passes sanitize=false, so
-            ; the compiler never dlopen's an ASan-instrumented object.
-            optimize-span (tr/span-begin "backend.llvm-optimize")
-            rp
-              (if parallel
-                  (primitive/cast (ptr i8) 0)
-                  (LLVMRunPasses m (opt-pipeline sanitize optlvl) tm pbo))
-            _optimize-end (tr/span-end optimize-span)]
-        (when (not (= (primitive/cast i64 rp) (primitive/cast i64 0)))
-          (ps (stderr) "codegen: LLVMRunPasses failed: ")
-          (ps (stderr) (cstr->slice (LLVMGetErrorMessage rp)))
-          (wb (stderr) 10)
-          (abort)
-          0)
-        (verify-module! m "after optimization")
-        (if parallel
-            (emit-parallel-o3! a m obj-cstr triple tm)
-            (do
-              (let [emiterr (primitive/alloc-stack (ptr i8))
-                    tmp-s (sconcat a (cstr->slice obj-cstr) ".tmp")
-                    tmp-cstr (str->cstr a tmp-s)]
-                ; LLVM opens with truncation, so never point it at the user's final path.
-                ; A stale temp from an interrupted prior invocation is safe to discard.
-                (ffi/unlink tmp-cstr)
-                (let [emit-span (tr/span-begin "backend.object-emit")
-                      rc (LLVMTargetMachineEmitToFile tm m tmp-cstr 1 emiterr)
-                      _emit-end (tr/span-end emit-span)]
-                  ; A non-writable object destination (e.g. a read-only dir, or `-o /dev/null`
-                  ; whose `.o` lands in unwritable `/dev`) used to SIGABRT here with a bare
-                  ; `Operation not permitted`, naming neither the path nor a remedy. Report a clear
-                  ; located error and exit 1 — a usage mistake, not a compiler panic. `-o /dev/null`
-                  ; itself is intercepted earlier and routed to `check` (diag-12).
-                  (when (!= rc (primitive/cast i32 0))
-                    (let [w (stderr)]
-                      (ps w "error: could not write object file '")
-                      (ps w (cstr->slice obj-cstr))
-                      (ps w "': ")
-                      (ps w (cstr->slice (load emiterr)))
-                      (wb w 10)
-                      (ps w
-                          "  the output path is not writable — give `-o` a writable path, or use `coil check <file>` to typecheck without emitting an object\n")
-                      (ffi/unlink tmp-cstr)
-                      (exit 1)
-                      0))
-                  (when (!= (me/rename tmp-cstr obj-cstr) (primitive/cast i32 0))
-                    (let [w (stderr)]
-                      (ps w "error: could not finalize object file '")
-                      (ps w (cstr->slice obj-cstr))
-                      (ps w "'\n")
-                      (ffi/unlink tmp-cstr)
-                      (exit 1)
-                      0))))
-              1))))))
+        errout (primitive/alloc-stack (ptr i8))
+        result
+          (block :compile
+            (unless (= (verify-module! m "after lowering") 1) (return-from :compile 0))
+            (LLVMInitializeAArch64AsmPrinter)
+            (LLVMInitializeX86AsmPrinter)
+            (LLVMInitializeRISCVAsmPrinter)
+            (LLVMInitializeWebAssemblyAsmPrinter)
+            (LLVMInitializeAArch64AsmParser)
+            (LLVMInitializeX86AsmParser)
+            (LLVMInitializeRISCVAsmParser)
+            (when (!= (LLVMGetTargetFromTriple triple targetout errout) (primitive/cast i32 0))
+              (ps (stderr) "error: unsupported --target '")
+              (ps (stderr) (cstr->slice triple))
+              (ps (stderr) "': ")
+              (ps (stderr) (cstr->slice (load errout)))
+              (wb (stderr) 10)
+              (LLVMDisposeMessage (load errout))
+              (return-from :compile 0))
+            (let [tm (LLVMCreateTargetMachine (load targetout) triple
+                       (llvm-cpu triple) (llvm-cpu-features triple)
+                       (primitive/cast i32 optlvl) (llvm-reloc-model triple) 0)
+                  parallel (and allow-multiple
+                    (and (= sanitize 0) (and (= optlvl 3)
+                      (and (= (primitive/cast i64 triple-override) 0)
+                        (>= (llvm-function-count m)
+                            (ffi-decimal-env c"COIL_PARALLEL_CODEGEN_MIN_FUNCTIONS" 256))))))
+                  pbo (LLVMCreatePassBuilderOptions)
+                  emitted
+                    (block :emit
+                      (when (= (primitive/cast i64 tm) 0)
+                        (ps (stderr) "error: LLVM could not create target machine\n")
+                        (return-from :emit 0))
+                      (let [optimize-span (tr/span-begin "backend.llvm-optimize")
+                            rp (if parallel (primitive/cast (ptr i8) 0)
+                                   (LLVMRunPasses m (opt-pipeline sanitize optlvl) tm pbo))
+                            _optimize-end (tr/span-end optimize-span)]
+                        (unless (= (primitive/cast i64 rp) 0)
+                          (let [message (LLVMGetErrorMessage rp)]
+                            (ps (stderr) "codegen: LLVMRunPasses failed: ")
+                            (ps (stderr) (cstr->slice message))
+                            (wb (stderr) 10)
+                            (LLVMDisposeErrorMessage message))
+                          (return-from :emit 0)))
+                      (unless (= (verify-module! m "after optimization") 1)
+                        (return-from :emit 0))
+                      (when parallel
+                        (return-from :emit (emit-parallel-o3! a m obj-cstr triple tm)))
+                      (let [emiterr (primitive/alloc-stack (ptr i8))
+                            tmp-cstr (str->cstr a (sconcat a (cstr->slice obj-cstr) ".tmp"))]
+                        (set! emiterr (primitive/cast (ptr i8) 0))
+                        (ffi/unlink tmp-cstr)
+                        (let [emit-span (tr/span-begin "backend.object-emit")
+                              rc (LLVMTargetMachineEmitToFile tm m tmp-cstr 1 emiterr)
+                              _emit-end (tr/span-end emit-span)]
+                          (when (!= rc (primitive/cast i32 0))
+                            (ps (stderr) "error: could not write object file '")
+                            (ps (stderr) (cstr->slice obj-cstr))
+                            (ps (stderr) "': ")
+                            (unless (= (primitive/cast i64 (load emiterr)) 0)
+                              (ps (stderr) (cstr->slice (load emiterr)))
+                              (LLVMDisposeMessage (load emiterr)) 0)
+                            (wb (stderr) 10)
+                            (ps (stderr) "  the output path is not writable — give `-o` a writable path, or use `coil check <file>` to typecheck without emitting an object\n")
+                            (ffi/unlink tmp-cstr)
+                            (return-from :emit 0)))
+                        (when (!= (me/rename tmp-cstr obj-cstr) (primitive/cast i32 0))
+                          (ps (stderr) "error: could not finalize object file '")
+                          (ps (stderr) (cstr->slice obj-cstr))
+                          (ps (stderr) "'\n")
+                          (ffi/unlink tmp-cstr)
+                          (return-from :emit 0)))
+                      1)]
+              (LLVMDisposePassBuilderOptions pbo)
+              (unless (= (primitive/cast i64 tm) 0) (LLVMDisposeTargetMachine tm) 0)
+              emitted))]
+    (codegen-dispose-module! m)
+    (when (= (primitive/cast i64 triple-override) 0) (LLVMDisposeMessage triple) 0)
+    result))
 
 ; Returns 1 if the pipeline succeeded (object emitted), 0 if a diagnostic was
 ; reported. build-cmd checks this and HALTS before linking on failure (mirroring
@@ -516,7 +521,13 @@
         (mut sp0) (al-new [(slice u8)] a)
         (mut st0) (al-new [(slice u8)] a)]
     (match (run-pipeline a src cwd w path (mut sp0) (mut st0))
-      (Some [mp] (build-object a mp obj-cstr triple (sanitize-mode) (opt-level) (parallel-codegen?)))
+      (Some [mp] (build-object a
+                               mp
+                               obj-cstr
+                               triple
+                               (sanitize-mode)
+                               (opt-level)
+                               (and (parallel-codegen?) (= (generated-unit-count) 0))))
       (None [] 0))))
 
 ; `__normalize` debug subcommand: print normalized textual LLVM IR of `src`.

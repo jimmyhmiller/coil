@@ -48,6 +48,9 @@ counter="$T/reader-count"
 
 "$COIL" run "$FIX/raw.answer" --use reader.fixture.computed >/dev/null
 [ $? = 10 ] || fail "computed runtime string passed to code-read"
+"$COIL" build "$FIX/raw.answer" --use reader.fixture.generated-units -o "$T/generated-units" >/dev/null \
+  || fail "reader-streamed generated units build"
+"$T/generated-units"; [ $? = 42 ] || fail "reader-streamed generated units link across partitions"
 COIL_META_ARENA=poison "$COIL" run "$FIX/raw.answer" --use reader.fixture.arena >/dev/null
 [ $? = 42 ] || fail "reader borrowed expansion allocator survives Code promotion"
 COIL_META_INTERP=1 COIL_META_ARENA=poison "$COIL" run "$FIX/raw.answer" --use reader.fixture.arena >/dev/null

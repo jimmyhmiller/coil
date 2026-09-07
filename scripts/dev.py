@@ -293,6 +293,11 @@ def test(args: argparse.Namespace) -> None:
                 *(["--verbose"] if args.verbose else []))
     elif args.suite == "cli":
         execute("scripts/compiler/oracle/gate-cli.sh", compiler)
+    elif args.suite == "generated":
+        for name in ("digest", "artifact-wire", "codegen-session", "extern-aliases",
+                     "dynamic-stack", "union-hfa", "sparse-static", "oracle-corpus",
+                     "provider-artifacts", "generated-modules"):
+            execute(sys.executable, f"scripts/tests/{name}.py", compiler)
     elif args.suite == "runtime":
         execute(sys.executable, "scripts/oracle.py", "runtime", "gate", "arm64", "--compiler", compiler)
     elif args.suite == "http":
@@ -1345,7 +1350,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "runtime", "http", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.set_defaults(func=test)

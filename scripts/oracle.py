@@ -69,17 +69,25 @@ STAGE_INPUTS = {
         "tests/compiler/oracle/resolved/fixtures/helper2.coil",
         "tests/compiler/features/scoped_namespace.coil",
     ],
-    "checked": ["tests/compiler/oracle/stages/surface.coil"],
+    "checked": ["tests/compiler/oracle/stages/surface.coil", "tests/compiler/features/extern_alias.coil",
+                "tests/compiler/oracle/ir/fixtures/stack_bytes.coil",
+                "tests/compiler/oracle/ir/fixtures/static_elements.coil"],
     "expand": [
         "tests/compiler/oracle/features/meta_stage3.coil",
         "src/examples/metaprogramming/condlint.coil",
     ],
     "mono": [
+        "tests/compiler/oracle/ir/fixtures/static_elements.coil",
+        "tests/compiler/oracle/ir/fixtures/stack_bytes.coil",
+        "tests/compiler/features/extern_alias.coil",
         "src/examples/generics.coil",
         "src/examples/sums.coil",
         "src/examples/dyn_write.coil",
     ],
     "ir": [
+        "tests/compiler/oracle/ir/fixtures/static_elements.coil",
+        "tests/compiler/oracle/ir/fixtures/stack_bytes.coil",
+        "tests/compiler/features/extern_alias.coil",
         "tests/compiler/oracle/ir/fixtures/call.coil",
         "tests/compiler/oracle/ir/fixtures/iadd.coil",
         "tests/compiler/oracle/ir/fixtures/ret0.coil",
@@ -294,7 +302,14 @@ def gate(compiler: Path, stage: str, verbose: bool) -> int:
     extra = stage_extra(stage)
     failures: list[str] = []
     passed = 0
-    for source in read_list(base / "corpus.txt"):
+    corpus = read_list(base / "corpus.txt")
+    # A newly declared fixture must fail the audit before its first snapshot;
+    # auditing only the old corpus silently omitted newly added stage inputs.
+    missing = sorted(set(STAGE_INPUTS.get(stage, [])) - set(corpus))
+    for source in missing:
+        failures.append(source)
+        print(f"FAIL {stage}: declared input missing from snapshot corpus: {source}")
+    for source in corpus:
         result = run(compiler, COMMAND[stage], source, *extra)
         reference = base / "reference" / f"{mangle(source)}{suffix}"
         expected_code = 1 if stage == "checked" and source.startswith("tests/compiler/oracle/checked/fixtures/") else 0
