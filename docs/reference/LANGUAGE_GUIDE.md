@@ -194,6 +194,11 @@ A fuller project can declare:
     entry = "src/runtime.coil"
     out = "build/release/runtime.o"
 
+    [artifacts.engine]                ; a SEALED namespace: compiled once, linked after
+    kind = "sealed"
+    entry = "src/engine.coil"
+    out = "build/sealed/engine.a"
+
     [cc]
     sources = ["native/app.c"]
     include-dirs = ["native"]
@@ -249,6 +254,31 @@ the same manifest target, optimization, debug, sanitizer, backend, dependency, a
 metaprogram settings apply. `coil build FILE.coil` remains an explicit single-file
 build and does not emit secondary artifacts. Artifact output paths are relative to the
 package manifest, and Coil creates their parent directories.
+
+### Sealed namespaces
+
+`kind = "sealed"` builds its entry as a library and writes a **seal** beside the
+archive (`out = ".../engine.a"` also writes `.../engine.seal`). A seal is ordinary
+Coil source: a `;;;` header naming the namespace, its archive, and the toolchain that
+produced it, followed by that module's public declarations with no bodies. Every
+signature type in it is fully qualified, so a seal imports nothing.
+
+Importing a sealed namespace then costs a parse rather than a compile. The compiler
+reads the declarations, checks calls against them exactly as it would against the
+source, and links the archive instead of building the module — the module's own
+imports, macros and monomorphization never run in the consuming build. Declaring the
+artifact is the whole configuration: the package that produces a seal also consumes
+it, and a seal names its own archive, so nothing else has to say link this.
+
+This is for a namespace whose implementation is large and whose API is small — the
+in-process compiler SDK behind `coil.jit` is the motivating case: a program that
+imports it compiles the whole compiler into itself, and sealing it turns a ~28s build
+into ~0.3s.
+
+A sealed export surface must be concrete: exported generics and macros need their
+source at every use site and cannot be declared away. A seal is only interchangeable
+with its source while both come from the same toolchain — it records the version and
+target it was built with.
 
 A native dependency selects exactly one discovery provider. `pkg-config` names a
 package whose link flags Coil queries in the usual way. `flags-command` runs a
