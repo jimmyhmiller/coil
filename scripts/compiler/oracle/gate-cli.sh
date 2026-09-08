@@ -3999,6 +3999,23 @@ if [ -x "$SEALDIR/nos" ]; then
 else
   bad "--no-seal compiles the namespace and agrees with the seal" "$nos_out"
 fi
+# A namespace that exports something a seal cannot declare must be refused at seal
+# time. Emitting a narrower seal instead tells the CONSUMER that its own `:use`
+# names something the module does not export -- an error about the wrong file.
+cat > "$SEALDIR/generic.coil" <<'SEAL_EOF'
+(module generic)
+(defn twice [(x i64)] (-> i64) (* x 2))
+(defn pick [T] [(a T) (b T) (first bool)] (-> T) (if first a b))
+(export twice pick)
+SEAL_EOF
+gen_out=$(cd "$SEALDIR" && "$COIL" build generic.coil --lib -o generic.a --emit-seal generic.seal 2>&1)
+case "$gen_out" in
+  *"cannot seal 'generic'"*"'pick'"*) ok "sealing refuses a namespace whose export cannot be declared" ;;
+  *) bad "sealing refuses a namespace whose export cannot be declared" "$gen_out" ;;
+esac
+[ -f "$SEALDIR/generic.seal" ] && bad "a refused seal writes no seal file" "generic.seal exists" \
+                              || ok "a refused seal writes no seal file"
+
 # A seal records a digest of every source it was built from, because a toolchain's
 # library is real files beside the binary and editing one is meant to be live. A
 # seal that answered only "same toolchain" would silently shadow such an edit.
