@@ -3963,6 +3963,67 @@ else
   bad "build --emit-header writes the header beside the library" "no header or library produced"
 fi
 
+echo "== declare: a function defined in another unit's object (prebuilt units, M1) =="
+# `(declare NAME [params] (-> ret))` is the boundary between compilation units:
+# the signature is checked like a defn, calls use Coil's own ABI (a non-affine
+# aggregate arrives as a reference), and the backend emits a declaration the
+# linker resolves. The definition here is a C object under the Coil symbol, so
+# the check is independent of the unit builder that normally produces it.
+DECL="$T/declare"; mkdir -p "$DECL"
+cat > "$DECL/declared.coil" <<'DECL_EOF'
+(module t.declared)
+
+(defstruct Point [(x i64) (y i64)])
+
+(declare add [(x i64) (y i64)] (-> i64))
+
+(declare combine [(p Point)] (-> i64))
+
+(defn main [] (-> i64)
+  (if (and (= (add 40 2) 42) (= (combine (Point :x 40 :y 2)) 80)) 0 1))
+DECL_EOF
+if [ "$HOST_OS" = Darwin ]; then DECL_PFX=_; else DECL_PFX=; fi
+cat > "$DECL/impl.c" <<DECL_EOF
+long add(long x, long y) __asm__("${DECL_PFX}t.declared.add");
+long add(long x, long y) { return x + y; }
+struct P { long x; long y; };
+long combine(struct P *p) __asm__("${DECL_PFX}t.declared.combine");
+long combine(struct P *p) { return p->x * p->y; }
+DECL_EOF
+cc -c "$DECL/impl.c" -o "$DECL/impl.o"
+"$COIL" build "$DECL/declared.coil" -o "$DECL/llvm" --link-flag "$DECL/impl.o" >/dev/null 2>&1 \
+  && expect_rc 0 "a declared function links against another object and receives a struct by reference (LLVM)" "$DECL/llvm" \
+  || bad "a declared function links against another object (LLVM)" "build failed"
+"$COIL" build "$DECL/declared.coil" -o "$DECL/o0" -O0 --link-flag "$DECL/impl.o" >/dev/null 2>&1 \
+  && expect_rc 0 "a declared function links at -O0" "$DECL/o0" \
+  || bad "a declared function links at -O0" "build failed"
+if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
+  "$COIL" build "$DECL/declared.coil" -o "$DECL/a64" --backend arm64 --link-flag "$DECL/impl.o" >/dev/null 2>&1 \
+    && expect_rc 0 "a declared function links against another object (arm64 backend)" "$DECL/a64" \
+    || bad "a declared function links against another object (arm64 backend)" "build failed"
+else
+  echo "  (skip: declared function on --backend arm64 needs the macOS arm64 host)"
+fi
+# (grep without -q: an IR dump is big enough that -q's early exit would SIGPIPE the echo.)
+"$COIL" emit-ir "$DECL/declared.coil" > "$DECL/ir.ll" 2>&1
+grep -E '^declare i64 @t\.declared\.combine\(ptr\)' "$DECL/ir.ll" >/dev/null \
+  && ok "emit-ir declares a declared function, with the aggregate parameter as a reference" \
+  || bad "emit-ir declares a declared function" "no declaration for t.declared.combine(ptr) in the IR"
+grep -E '^define .*@t\.declared\.(add|combine)' "$DECL/ir.ll" >/dev/null \
+  && bad "emit-ir does not define a declared function" "found a define for a declared name" \
+  || ok "emit-ir does not define a declared function"
+printf '(declare pick [T] [(x T)] (-> T))\n(defn main [] (-> i64) 0)\n' > "$DECL/generic.coil"
+expect_out "declare 'pick': a declared function cannot be generic" "declare refuses a generic, naming it" \
+  "$COIL" check "$DECL/generic.coil"
+expect_rc 1 "declare of a generic exits 1" "$COIL" check "$DECL/generic.coil"
+printf '(declare f [(x i64)] (-> i64) (+ x 1))\n(defn main [] (-> i64) 0)\n' > "$DECL/body.coil"
+expect_out "declare 'f': a declaration has no body" "declare refuses a body, naming the function" \
+  "$COIL" check "$DECL/body.coil"
+printf '(declare f [(x i64)] (-> i64))\n(defn main [] (-> i64) (f 1))\n' > "$DECL/unlinked.coil"
+expect_rc 1 "a declared function with no object to link is a link error, not a silent empty body" \
+  "$COIL" build "$DECL/unlinked.coil" -o "$DECL/unlinked"
+expect_rc 0 "fmt accepts a declare form" "$COIL" fmt --check "$DECL/declared.coil"
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL

@@ -1600,6 +1600,23 @@ native signatures. This declares functions, not native data. For a native data
 address use `(primitive/linker-address "library.data$1")` and cast the resulting
 pointer to the known storage type; an identifier argument is also accepted.
 
+**Declaring a Coil function defined elsewhere.** `extern` describes a native
+symbol with a C signature. A function written in Coil but compiled in another
+compilation unit is declared with its Coil signature instead:
+
+    (declare combine [(p Point)] (-> i64))
+
+A `declare` reads like a `defn` head with no body: the parameters, return type,
+`:cc` and annotations are checked exactly as a definition's would be, callers
+pass arguments under Coil's own ABI (a non-affine aggregate such as `Point`
+arrives by reference, not by C value), and the backend emits a declaration for
+the linker to resolve from the object that holds the definition. A declaration
+cannot be generic, because a generic is instantiated wherever it is used and so
+has no single definition to link; and it cannot carry a body. It is the form a
+prebuilt unit's interface is written in, so an ordinary program rarely writes
+one by hand; when it does, the defining object must be linked, or the build is
+a link error rather than a function that silently returns nothing.
+
 `(printf c"%d\n" 42)`. Floats cross the C ABI correctly; structs pass/return by
 value with the real C ABI. To call a Coil fn from C (e.g. `qsort` comparator) pass
 `(primitive/fnptr-of f)`. Scalar-only callbacks need no export. A callback with a
