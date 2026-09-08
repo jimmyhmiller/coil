@@ -50,15 +50,42 @@ The corpus' inline-IR surface is finite and straight-line (no control flow, no
 phi). The backend contains a small IR-subset lowerer: after `$N/$tN/$ret`
 substitution it parses each line and lowers structurally:
 - `insertvalue`/`extractvalue` on `{ptr,i64}`-shaped aggregates (slices) and
-  cmpxchg results; `undef`; `ret`.
+  cmpxchg results; `undef`/`poison`; `ret`.
 - atomics (`atomicrmw add/sub/xchg`, `cmpxchg`, `load/store atomic seq_cst`) →
-  LSE (`ldaddal/swpal/casal/ldar/stlr`).
-- `inttoptr`, `trunc`, `load/store volatile`.
-- vector ops (`insertelement`, `shufflevector` splat, `fadd/fsub/fmul <4 x float>`,
-  `@llvm.fma.v4f32`, `@llvm.vector.reduce.fadd.v4f32`) → NEON.
+  LSE (`ldaddal/swpal/casal/ldar/stlr`); plain (non-atomic) `load`/`store` of
+  any size, chunked in ≤8-byte transfers for aggregates >8 bytes.
+- `bitcast` (same-size reinterpretation only), `inttoptr`, `sext`/`zext`/
+  `trunc` (the `sext i1`→0/-1 mask idiom is handled directly as a two's-
+  complement negation, since a byte-level sign-extend of a 0/1 `TBool` byte
+  gives the wrong answer), `fptosi`/`fptoui`/`sitofp`/`uitofp`/`fptrunc`/
+  `fpext`, `icmp` (all 10 predicates on ≤8-byte operands; `i128` — an opaque
+  16-byte blob, since no native Coil integer exceeds 64 bits — supports only
+  `eq`/`ne` via a 16-byte memory compare), `fcmp` (ordered predicates
+  `oeq`/`one`/`olt`/`ole`/`ogt`/`oge` only), `select` (scalar and
+  vector-mask, a branch-free bitwise blend), `and`/`or`/`xor`/`add`/`sub`/
+  `mul`/`shl`/`fdiv`/`sdiv`/`udiv`/`srem`/`urem` (div/rem scalar only),
+  `getelementptr` (scalar, and vector-of-i32-index for a byte element type).
+- vector ops (`insertelement`, `shufflevector` — general index-mask gather
+  across both operands, not just the `zeroinitializer` splat case,
+  `fadd`/`fsub`/`fmul`/`fdiv <4 x float>`, `@llvm.fma.v4f32`,
+  `@llvm.vector.reduce.fadd.v4f32`, `@llvm.sqrt.v4f32`,
+  `@llvm.masked.gather.v4i8.v4p0`) → NEON, all scalarized lane-by-lane (this
+  keeps results bit-identical to the LLVM backend's, which is what the
+  runtime corpus gate compares — see `codegen_a64.coil`'s `emit-vec-fbin!`).
+- Inline vector-constant literals (`<i32 1, i32 2, ...>`) and float literals
+  (`float 1.0`) are supported anywhere a value operand is expected — these
+  appear pervasively in real inline-IR (icmp/select comparands, shift
+  amounts, shuffle index masks), not just in exotic call sites.
 Anything outside the subset is a **hard error** naming the unsupported line.
 (`call void asm sideeffect` is freestanding/ELF-only → hard error on this
 Mach-O backend.)
+
+This subset was expanded from a narrower one (originally sized to Coil's own
+`slice`/`atomic`/`simd` stdlib helpers) to also cover `lib/paper`'s SIMD
+raytracer (a real external project) — verified end to end by snapshot-diffing
+its rendered output against the LLVM backend byte-for-byte, not just by
+compiling. See `tests/compiler/oracle/arm64/tests/llvm-ir-ops.coil` for
+targeted coverage of every op above.
 
 ## DWARF (always on)
 DWARF v4: CU (language C, not-optimized),
@@ -71,7 +98,7 @@ dsymutil).
 
 ## Gates (behavioral — runtime equality, not IR equality)
 `tests/compiler/oracle/arm64/`:
-- `tests/*.coil` — 10 adversarial feature tests beyond the examples corpus:
+- `tests/*.coil` — 11 adversarial feature tests beyond the examples corpus:
   narrow-width wraparound + signed div/rem negatives + u2/i3/u7 arithmetic,
   NaN-aware float comparisons + frem + f32 rounding, ABI stress (10 stack
   args, mixed int/float, struct sizes 1..24B across every AAPCS64 class,
@@ -81,7 +108,11 @@ dsymutil).
   6-arg variadic snprintf + qsort-callback fnptrs + fnptr tables, 4000-deep
   mutual recursion + ackermann + hashmap stress (200 string keys),
   8-variant sums + Option<Result<struct>> nesting + recursive trees,
-  atomic old-value semantics + static globals. Verified byte-for-byte against
+  atomic old-value semantics + static globals; the expanded `llvm-ir` op
+  subset above (bitcast/icmp incl. i128/fcmp/select/sext-zext-trunc/float
+  conversions/bitwise-shift-div-rem/plain load-store/getelementptr/
+  masked.gather/sqrt, plus inline vector-constant literals and general
+  shufflevector). Verified byte-for-byte against
   the LLVM backend. Teeth re-proven: compiling signed `<` as unsigned fails 8/54.
 - `python3 scripts/oracle.py runtime snapshot arm64 --compiler <bin>` — builds the corpus with the **LLVM** backend and
   records stdout+exit per program.

@@ -57,6 +57,20 @@ Everything not listed here is deliberately identical.
   name is a hard error with the same per-arch diagnostic the LLVM backend gives
   for the reverse case, rather than silently picking the same-numbered register.
 
+## The `llvm-ir` escape hatch
+Mirrors `docs/reference/ARM64_BACKEND.md`'s section of the same name —
+`codegen_x64.coil` ported the identical op subset op-for-op (`bitcast`,
+`icmp`/`fcmp`, `select`, `sext`/`zext`/`trunc`, float↔int conversions,
+bitwise/shift/div/rem, plain load/store, `getelementptr`,
+`@llvm.masked.gather.v4i8.v4p0`, `@llvm.sqrt.v4f32`, general
+`shufflevector`, and inline vector-constant/float/i128 literal support), and
+that document's description of the subset and its scope edges (i128 is
+eq/ne-only; `getelementptr`/`masked.gather` cover the exact shapes a real
+external SIMD project needed) applies here unchanged. Verified against the
+LLVM backend the same way: byte-for-byte on `tests/compiler/oracle/arm64/tests/llvm-ir-ops.coil`
+(shared between both native backends' corpora) and on the project that
+motivated the expansion.
+
 ## Gates
 `tests/compiler/oracle/x64/`:
 - `gate-encode.sh` — every instruction the encoder can emit is diffed against
@@ -73,7 +87,7 @@ Everything not listed here is deliberately identical.
   checks readelf's view and that the link produces no warnings (a missing
   `.note.GNU-stack` silently gives the whole program an executable stack).
   *Teeth: a wrong `sh_info` makes the real linker reject the object.*
-- `python3 scripts/oracle.py runtime gate x64` — builds the 56-program corpus with `--backend x64`, runs each,
+- `python3 scripts/oracle.py runtime gate x64` — builds the 57-program corpus with `--backend x64`, runs each,
   and diffs stdout+exit byte-for-byte against the LLVM backend's behavior.
   Runtime equality, not IR equality, is the contract between backends.
   *Teeth: compiling signed `<` as unsigned fails 8 programs.*
@@ -106,7 +120,7 @@ Small programs are bound by the shared `cc`-link and process floor.
 ## Status
 - [x] x86-64 encoder, 108/108 cases byte-identical to llvm-mc.
 - [x] ELF64 writer; generated objects link with `cc` and run.
-- [x] Full lowering: 56/56 behavioral corpus, including the adversarial ABI
+- [x] Full lowering: 57/57 behavioral corpus, including the adversarial ABI
       stress, narrow/odd-width integers, NaN-aware float comparisons, atomics,
       6-arg variadics + fnptr tables, deep recursion, 8-variant sums, bitfields.
 - [x] DWARF always on: gdb resolves breakpoints by name, prints parameters and
