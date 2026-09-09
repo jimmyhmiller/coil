@@ -4084,6 +4084,100 @@ else
   echo "  (skip: arm64 weak-definition checks need the macOS arm64 host)"
 fi
 
+echo "== prebuilt units: build-unit + --unit (M2/M3) =="
+# A module compiled ahead of time: its interface stands in for its source, its
+# object is a link input. Exercises a struct, module state, a generic, a
+# generic-local static shared across the boundary, and a compile-time helper.
+PBU="$T/prebuilt"; mkdir -p "$PBU"
+cat > "$PBU/mathlib.coil" <<'PBU_EOF'
+(module t.mathlib)
+
+(import "coil.primitive" :as primitive)
+
+(import "coil.alloc" :use *)
+
+(export Point add combine bump! count ident slot lib-slot-bump!)
+
+(defstruct Point [(x i64) (y i64)])
+
+(defn add [(x i64) (y i64)] (-> i64)
+  (+ x y))
+
+(defn combine [(p Point)] (-> i64)
+  (* (.x p) (.y p)))
+
+(defn counter [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn bump! [] (-> i64)
+  (let [c (counter)] (store! c (+ (load c) 1)) (load c)))
+
+(defn count [] (-> i64)
+  (load (counter)))
+
+(defn ident [T] [(x T)] (-> T)
+  x)
+
+(defn slot [T] [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn lib-slot-bump! [] (-> i64)
+  (let [s (slot [i64])] (store! s (+ (load s) 10)) (load s)))
+PBU_EOF
+cat > "$PBU/app.coil" <<'PBU_EOF'
+(module t.app)
+
+(import "t.mathlib" :use *)
+
+(defn main [] (-> i64)
+  (bump!)
+  (bump!)
+  (lib-slot-bump!)
+  (store! (slot [i64]) (+ (load (slot [i64])) 1))
+  (if (and (= (add 40 2) 42)
+           (and (= (combine (Point :x 40 :y 2)) 80)
+                (and (= (count) 2)
+                     (and (= (ident [i64] 42) 42) (= (lib-slot-bump!) 21)))))
+      0
+      1))
+PBU_EOF
+UNIT_BACKENDS="llvm"
+if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then UNIT_BACKENDS="llvm arm64"; fi
+for PB in $UNIT_BACKENDS; do
+  BF=""; [ "$PB" = arm64 ] && BF="--backend arm64"
+  rm -rf "$PBU/u_$PB"
+  if COIL_NAMESPACE_ROOTS="$PBU" "$COIL" build-unit "$PBU/mathlib.coil" -o "$PBU/u_$PB" $BF >/dev/null 2>&1; then
+    ok "build-unit writes an interface and object ($PB)"
+  else
+    bad "build-unit ($PB)" "build-unit failed"
+  fi
+  [ -f "$PBU/u_$PB/interface.coil" ] && [ -f "$PBU/u_$PB/unit.o" ] \
+    && ok "build-unit ($PB) produced interface.coil and unit.o" \
+    || bad "build-unit ($PB) artifacts" "missing interface.coil or unit.o"
+  # a copied generic imports the module's own imports; a pure-declaration interface
+  # would not. mathlib has generics, so it copies source and keeps coil.primitive.
+  # The consumer links the object and runs; state and generic statics behave.
+  for CB in $UNIT_BACKENDS; do
+    CF=""; [ "$CB" = arm64 ] && CF="--backend arm64"
+    if COIL_NAMESPACE_ROOTS="$PBU" "$COIL" build "$PBU/app.coil" -o "$PBU/app_${PB}_$CB" $CF --unit "$PBU/u_$PB" >/dev/null 2>&1; then
+      expect_rc 0 "a $CB consumer links a $PB unit; state and generic statics behave" "$PBU/app_${PB}_$CB"
+    else
+      bad "a $CB consumer links a $PB unit" "consumer build failed"
+    fi
+  done
+done
+# check reads the interface too
+COIL_NAMESPACE_ROOTS="$PBU" "$COIL" check "$PBU/app.coil" --unit "$PBU/u_llvm" >/dev/null 2>&1 \
+  && ok "check reads a unit's interface in place of the module" \
+  || bad "check --unit" "check against a unit failed"
+# refusals
+printf '(module t.st)\n(def n i64 7)\n(defn main [] (-> i64) (load n))\n' > "$PBU/state.coil"
+expect_out "a runtime .def." "build-unit refuses a module with runtime state, saying why" \
+  "$COIL" build-unit "$PBU/state.coil" -o "$PBU/u_state"
+# a stale/missing unit dir
+expect_out "not a prebuilt unit" "--unit on a directory that is not a unit says so" \
+  "$COIL" build "$PBU/app.coil" -o "$PBU/none" --unit "$PBU/does-not-exist"
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL
