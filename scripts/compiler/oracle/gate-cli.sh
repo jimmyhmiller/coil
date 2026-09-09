@@ -4024,6 +4024,66 @@ expect_rc 1 "a declared function with no object to link is a link error, not a s
   "$COIL" build "$DECL/unlinked.coil" -o "$DECL/unlinked"
 expect_rc 0 "fmt accepts a declare form" "$COIL" fmt --check "$DECL/declared.coil"
 
+echo "== static cells: one per program across compilation units (prebuilt units, M4) =="
+# A static inside a generic instantiation is defined by every unit that uses the
+# generic, so it is weak_odr (LLVM) / a weak external definition (arm64 Mach-O)
+# and the linker keeps one. A concrete function's cell has one definition. A
+# vtable is one per make-dyn site and private, as the arm64 backend's always was.
+LINK="$T/linkage"; mkdir -p "$LINK"
+cat > "$LINK/statics.coil" <<'LINK_EOF'
+(module t.statics)
+
+(import "coil.primitive" :as primitive)
+
+(import "coil.alloc" :use *)
+
+(defn counter [T] [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn ticks [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        c1 (counter [i64])
+        c2 (counter [u8])
+        t (ticks)]
+    (store! c1 (+ (load c1) 1))
+    (store! c2 (+ (load c2) 2))
+    (store! t (+ (load t) 3))
+    (if (= (+ (load c1) (+ (load c2) (load t))) 6) 0 1)))
+LINK_EOF
+"$COIL" emit-ir "$LINK/statics.coil" > "$LINK/ir.ll" 2>&1
+grep -E '^@repl_static\.t\.statics\.counter__i64\.0 = weak_odr global' "$LINK/ir.ll" >/dev/null \
+  && ok "a static inside a generic instantiation is weak_odr" \
+  || bad "a static inside a generic instantiation is weak_odr" "$(grep 'counter__i64' "$LINK/ir.ll" | head -1)"
+grep -E '^@repl_static\.t\.statics\.ticks\.0 = global' "$LINK/ir.ll" >/dev/null \
+  && ok "a static inside a concrete function keeps one strong definition" \
+  || bad "a static inside a concrete function keeps one strong definition" "$(grep 'ticks' "$LINK/ir.ll" | head -1)"
+grep -E '^@vtable\.[^ ]* = private constant' "$LINK/ir.ll" >/dev/null \
+  && ok "a dyn vtable is private" \
+  || bad "a dyn vtable is private" "$(grep '^@vtable' "$LINK/ir.ll" | head -1)"
+"$COIL" build "$LINK/statics.coil" -o "$LINK/opt" >/dev/null 2>&1 \
+  && expect_rc 0 "weak_odr cells survive the partitioned optimized build and link" "$LINK/opt" \
+  || bad "weak_odr cells survive the partitioned optimized build" "build failed"
+"$COIL" build "$LINK/statics.coil" -o "$LINK/o0" -O0 >/dev/null 2>&1 \
+  && expect_rc 0 "weak_odr cells link at -O0" "$LINK/o0" \
+  || bad "weak_odr cells link at -O0" "build failed"
+if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
+  "$COIL" emit-obj "$LINK/statics.coil" -o "$LINK/a64.o" --backend arm64 >/dev/null 2>&1
+  nm -m "$LINK/a64.o" 2>/dev/null | grep -E 'weak external repl_static\.t\.statics\.counter__i64\.0' >/dev/null \
+    && ok "arm64: a generic instantiation's cell is a weak external definition" \
+    || bad "arm64: a generic instantiation's cell is a weak external definition" "$(nm -m "$LINK/a64.o" | grep counter__i64)"
+  nm -m "$LINK/a64.o" 2>/dev/null | grep -E 'non-external repl_static\.t\.statics\.ticks\.0' >/dev/null \
+    && ok "arm64: a concrete function's cell stays local to its object" \
+    || bad "arm64: a concrete function's cell stays local to its object" "$(nm -m "$LINK/a64.o" | grep ticks)"
+  "$COIL" build "$LINK/statics.coil" -o "$LINK/a64" --backend arm64 >/dev/null 2>&1 \
+    && expect_rc 0 "arm64: weak definitions link and run" "$LINK/a64" \
+    || bad "arm64: weak definitions link and run" "build failed"
+else
+  echo "  (skip: arm64 weak-definition checks need the macOS arm64 host)"
+fi
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL
