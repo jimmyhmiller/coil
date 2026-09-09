@@ -4071,10 +4071,10 @@ grep -E '^@vtable\.[^ ]* = private constant' "$LINK/ir.ll" >/dev/null \
   || bad "weak_odr cells link at -O0" "build failed"
 if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
   "$COIL" emit-obj "$LINK/statics.coil" -o "$LINK/a64.o" --backend arm64 >/dev/null 2>&1
-  nm -m "$LINK/a64.o" 2>/dev/null | grep -E 'weak external repl_static\.t\.statics\.counter__i64\.0' >/dev/null \
+  nm -m "$LINK/a64.o" 2>/dev/null | grep -E 'weak external _?repl_static\.t\.statics\.counter__i64\.0' >/dev/null \
     && ok "arm64: a generic instantiation's cell is a weak external definition" \
     || bad "arm64: a generic instantiation's cell is a weak external definition" "$(nm -m "$LINK/a64.o" | grep counter__i64)"
-  nm -m "$LINK/a64.o" 2>/dev/null | grep -E 'non-external repl_static\.t\.statics\.ticks\.0' >/dev/null \
+  nm -m "$LINK/a64.o" 2>/dev/null | grep -E 'non-external _?repl_static\.t\.statics\.ticks\.0' >/dev/null \
     && ok "arm64: a concrete function's cell stays local to its object" \
     || bad "arm64: a concrete function's cell stays local to its object" "$(nm -m "$LINK/a64.o" | grep ticks)"
   "$COIL" build "$LINK/statics.coil" -o "$LINK/a64" --backend arm64 >/dev/null 2>&1 \
