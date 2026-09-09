@@ -4171,7 +4171,7 @@ COIL_NAMESPACE_ROOTS="$PBU" "$COIL" check "$PBU/app.coil" --unit "$PBU/u_llvm" >
   && ok "check reads a unit's interface in place of the module" \
   || bad "check --unit" "check against a unit failed"
 # refusals
-printf '(module t.st)\n(def n i64 7)\n(defn main [] (-> i64) (load n))\n' > "$PBU/state.coil"
+printf '(module t.st)\n(def n i64 7)\n(defn main [] (-> i64) n)\n' > "$PBU/state.coil"
 expect_out "a runtime .def." "build-unit refuses a module with runtime state, saying why" \
   "$COIL" build-unit "$PBU/state.coil" -o "$PBU/u_state"
 # a stale/missing unit dir
