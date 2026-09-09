@@ -189,11 +189,6 @@
 (defn has-byte? [(s (slice u8)) (b u8)] (-> bool)
   (>= (index-of s b 0) (primitive/cast i64 0)))
 
-; Everything before the first byte `b` (whole string if absent).
-(defn before [(s (slice u8)) (b u8)] (-> (slice u8))
-  (let [i (index-of s b 0)]
-    (if (< i (primitive/cast i64 0)) s (subslice [u8] s 0 i))))
-
 ; Remove EVERY occurrence of `pat` from `s` (for `const `/`volatile `/`restrict `).
 (defn remove-all [(a (dyn Allocator)) (s (slice u8)) (pat (slice u8))] (-> (slice u8))
   (let [m (len pat)]
@@ -484,94 +479,445 @@
         (or (= s "_Bool") (= s "bool")) (Some "u8")
         :else (None [(slice u8)])))
 
-(defn map-type-d [(a (dyn Allocator))
-                  (c (slice u8))
-                  (ctx (ptr Ctx))
-                  (depth i64)] (-> (Result (slice u8) (slice u8)))
+; ============================ C declarator parsing ==========================
+; clang spells every type as a base followed by an abstract declarator: `int *`,
+; `char [37]`, `void (*)(int)`, `void (*[4])(int)`, and even
+; `int (*(*)(char))(double)` — a pointer to a function taking char that returns
+; a pointer to a function taking double that returns int. A declarator reads
+; inside-out, so the only way to map one without guessing is to parse it into a
+; tree and render the tree. A bare function type is legal only at the top of an
+; extern's own signature; everywhere else C (and Coil) want the pointer to it.
+(defsum CType
+  (CBase [(coil (slice u8))])
+  (CPtr [(inner (ptr CType))])
+  (CArr [(inner (ptr CType)) (count i64)])
+  (CFn [(ret (ptr CType)) (params (ptr (ArrayList CType))) (variadic bool)]))
+
+(defn ctype-box [(a (dyn Allocator)) (t CType)] (-> (ptr CType))
+  (box! a CType t))
+
+; Index of the ')' matching the '(' at `open`, or -1 when unbalanced.
+(defn matching-paren [(s (slice u8)) (open i64)] (-> i64)
+  (let [n (len s)
+        (mut depth) 0
+        (mut i) open
+        (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) (primitive/cast i64 0)))
+              (break)
+              (let [c (primitive/cast i64 (get s (load i)))]
+                (when (= c (primitive/cast i64 40))
+                  (store! depth (primitive/iadd (load depth) 1))
+                  0)
+                (when (= c (primitive/cast i64 41))
+                  (store! depth (primitive/isub (load depth) 1))
+                  (when (= (load depth) (primitive/cast i64 0))
+                    (store! found (load i))
+                    0)
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
+; Split at the commas that are not nested inside () or [] — a parameter list
+; whose parameters are themselves function pointers has commas at depth 1.
+(defn split-top-commas [(a (dyn Allocator)) (s (slice u8))] (-> (ptr (ArrayList (slice u8))))
+  (let [out (box! a (ArrayList (slice u8)) (al-new [(slice u8)] a))
+        n (len s)
+        (mut depth) 0
+        (mut lo) 0
+        (mut i) 0]
+    (loop (if (> (load i) n)
+              (break)
+              (do
+                (if (= (load i) n)
+                    (do
+                      (push! [(slice u8)]
+                             out
+                             (trim (subslice [u8] s (load lo) n)))
+                      0)
+                    (let [c (primitive/cast i64 (get s (load i)))]
+                      (cond (or (= c (primitive/cast i64 40))
+                                (= c (primitive/cast i64 91)))
+                              (do
+                                (store! depth (primitive/iadd (load depth) 1))
+                                0)
+                            (or (= c (primitive/cast i64 41))
+                                (= c (primitive/cast i64 93)))
+                              (do
+                                (store! depth (primitive/isub (load depth) 1))
+                                0)
+                            (and (= c (primitive/cast i64 44))
+                                 (= (load depth) (primitive/cast i64 0)))
+                              (do
+                                (push! [(slice u8)]
+                                       out
+                                       (trim (subslice [u8]
+                                                       s
+                                                       (load lo)
+                                                       (load i))))
+                                (store! lo (primitive/iadd (load i) 1))
+                                0)
+                            :else 0)))
+                (set! i (primitive/iadd (load i) 1)))))
+    out))
+
+; A type in parameter position: C passes arrays and functions as pointers, and
+; clang's ParmVarDecl types are already adjusted that way — except when the
+; array hides behind a typedef (`va_list` on x86_64 is `__va_list_tag[1]`).
+(defn ctype-decay [(a (dyn Allocator)) (t (ptr CType))] (-> (ptr CType))
+  (match (load t)
+    (CArr [inner _] (ctype-box a (CPtr inner)))
+    (CFn [_ _ _] (ctype-box a (CPtr t)))
+    (_ t)))
+
+; The base of a type: what is left once every declarator has been peeled away.
+(defn map-base [(a (dyn Allocator))
+                (s (slice u8))
+                (ctx (ptr Ctx))
+                (depth i64)] (-> (Result (ptr CType) (slice u8)))
+  (match (scalar s)
+    (Some [m] (Ok (ctype-box a (CBase m))))
+    (None []
+          (cond (= s "void") (Ok (ctype-box a (CBase "void")))
+                (or (= s "struct")
+                    (or (= s "union")
+                        (or (contains-str? s "(anonymous")
+                            (contains-str? s "(unnamed"))))
+                  (Err (cat3 a "anonymous C aggregate type '" s "'"))
+                (starts-with s "struct ")
+                  (Ok (ctype-box a
+                                 (CBase (trim (subslice [u8] s 7 (len s))))))
+                (starts-with s "union ")
+                  (Ok (ctype-box a
+                                 (CBase (trim (subslice [u8] s 6 (len s))))))
+                (starts-with s "enum ")
+                  (let [tag (trim (subslice [u8] s 5 (len s)))]
+                    (match (get (load (field ctx enums)) tag)
+                      (Some [t] (Ok (ctype-box a (CBase t))))
+                      (None [] (Ok (ctype-box a (CBase "i32"))))))
+                ; clang's own va_list record. It is never emitted as a struct; a
+                ; va_list reaches a binding only as the pointer a parameter decays to.
+                (= s "__va_list_tag") (Ok (ctype-box a (CBase "__va_list_tag")))
+                :else
+                  (match (get (load (field ctx typedefs)) s)
+                    (Some [under]
+                          (parse-c-type a under ctx (primitive/iadd depth 1)))
+                    (None []
+                          (Err (cat3 a "unsupported C type '" s "'"))))))))
+
+(defn parse-c-type [(a (dyn Allocator))
+                    (c (slice u8))
+                    (ctx (ptr Ctx))
+                    (depth i64)] (-> (Result (ptr CType) (slice u8)))
   (if (> depth (primitive/cast i64 64))
       (Err (cat3 a "typedef chain too deep resolving '" c "' (cycle?)"))
-      (let [s (normalize a c)]
-        (cond (ends-with s "]")
+      (let [s (normalize a c)
+            p (index-of s (primitive/cast u8 40) 0)]
+        (cond (or (contains-str? s "(anonymous") (contains-str? s "(unnamed"))
+                (Err (cat3 a "anonymous C aggregate type '" s "'"))
+              ; `base (declarator)…`: the base is everything before the first paren.
+              (>= p (primitive/cast i64 0))
+                (match (parse-c-type a
+                                     (trim (subslice [u8] s 0 p))
+                                     ctx
+                                     (primitive/iadd depth 1))
+                  (Err [e] (Err e))
+                  (Ok [base]
+                      (parse-declarator a
+                                        base
+                                        (subslice [u8] s p (len s))
+                                        ctx
+                                        depth)))
+              (ends-with s "]")
                 (let [lb (index-of s (primitive/cast u8 91) 0)]
                   (if (< lb (primitive/cast i64 0))
                       (Err (cat3 a "unsupported C array type '" s "'"))
-                      (let [base (trim (subslice [u8] s 0 lb))
-                            count
-                              (parse-dec (subslice [u8]
-                                                   s
-                                                   (primitive/iadd lb 1)
-                                                   (primitive/isub (len s) 1)))]
-                        (if (< count (primitive/cast i64 0))
-                            (Err (cat3 a
-                                       "non-constant C array bound in '"
-                                       s
-                                       "'"))
-                            (match (map-type-d a
-                                               base
-                                               ctx
-                                               (primitive/iadd depth 1))
-                              (Ok [inner]
-                                  (Ok (cat3 a
-                                            (cat3 a "(array " inner " ")
-                                            (i64->dec a count)
-                                            ")")))
-                              (Err [e] (Err e)))))))
+                      (match (parse-c-type a
+                                           (trim (subslice [u8] s 0 lb))
+                                           ctx
+                                           (primitive/iadd depth 1))
+                        (Err [e] (Err e))
+                        (Ok [base]
+                            (apply-suffixes a
+                                            base
+                                            (subslice [u8] s lb (len s))
+                                            ctx
+                                            depth)))))
               (ends-with s "*")
-                (let [base (trim (subslice [u8] s 0 (primitive/isub (len s) 1)))]
-                  (if (= base "void")
-                      (Ok "(ptr i8)")
-                      (if (has-byte? base (primitive/cast u8 40))
-                          (Err (cat3 a
-                                     "function-pointer type '"
-                                     c
-                                     "' (Phase 2+)"))
-                          (match (map-type-d a
-                                             base
-                                             ctx
-                                             (primitive/iadd depth 1))
-                            (Ok [inner] (Ok (cat3 a "(ptr " inner ")")))
-                            (Err [e] (Err e))))))
-              :else
-                (match (scalar s)
-                  (Some [m] (Ok m))
-                  (None []
-                        (cond (or (= s "struct")
-                                  (or (= s "union")
-                                      (or (contains-str? s "(anonymous")
-                                          (contains-str? s "(unnamed"))))
-                                (Err (cat3 a
-                                           "anonymous C aggregate type '"
-                                           s
-                                           "'"))
-                              (starts-with s "struct ")
-                                (Ok (trim (subslice [u8] s 7 (len s))))
-                              (starts-with s "union ")
-                                (Ok (trim (subslice [u8] s 6 (len s))))
-                              (starts-with s "enum ")
-                                (let [tag (trim (subslice [u8] s 5 (len s)))]
-                                  (match (get (load (field ctx enums)) tag)
-                                    (Some [t] (Ok t))
-                                    (None [] (Ok "i32"))))
-                              :else
-                                (match (get (load (field ctx typedefs)) s)
-                                  (Some [under]
-                                        (map-type-d a
-                                                    under
-                                                    ctx
-                                                    (primitive/iadd depth 1)))
-                                  (None []
-                                        (Err (cat3 a
-                                                   "unsupported C type '"
-                                                   s
-                                                   "'")))))))))))
+                (match (parse-c-type a
+                                     (trim (subslice [u8]
+                                                     s
+                                                     0
+                                                     (primitive/isub (len s) 1)))
+                                     ctx
+                                     (primitive/iadd depth 1))
+                  (Err [e] (Err e))
+                  (Ok [inner] (Ok (ctype-box a (CPtr inner)))))
+              :else (map-base a s ctx depth)))))
+
+; `text` is an abstract declarator applied to `t`: leading stars, then either a
+; parenthesised inner declarator followed by suffixes, or bare suffixes.
+(defn parse-declarator [(a (dyn Allocator))
+                        (t (ptr CType))
+                        (text0 (slice u8))
+                        (ctx (ptr Ctx))
+                        (depth i64)] (-> (Result (ptr CType) (slice u8)))
+  (let [text1 (trim text0)
+        n (len text1)
+        (mut cur) t
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (primitive/cast i64 (get text1 (load i)))]
+                (cond (= c (primitive/cast i64 42))
+                        (do
+                          (store! cur (ctype-box a (CPtr (load cur))))
+                          (set! i (primitive/iadd (load i) 1)))
+                      (ws-byte? (primitive/cast u8 c))
+                        (set! i (primitive/iadd (load i) 1))
+                      :else (break)))))
+    (let [text (subslice [u8] text1 (load i) n)]
+      (if (and (> (len text) (primitive/cast i64 0))
+               (= (primitive/cast i64 (get text 0)) (primitive/cast i64 40)))
+          (let [close (matching-paren text 0)]
+            (if (< close (primitive/cast i64 0))
+                (Err (cat3 a "unbalanced C declarator '" text0 "'"))
+                (let [inner (trim (subslice [u8] text 1 close))
+                      after
+                        (subslice [u8] text (primitive/iadd close 1) (len text))
+                      lead
+                        (if (> (len inner) (primitive/cast i64 0))
+                            (primitive/cast i64 (get inner 0))
+                            (primitive/cast i64 0))]
+                  ; `(*…)`, `((…))`, `([…])` group an inner declarator; anything
+                  ; else inside the parens is a parameter list.
+                  (if (or (= lead (primitive/cast i64 42))
+                          (or (= lead (primitive/cast i64 40))
+                              (= lead (primitive/cast i64 91))))
+                      (match (apply-suffixes a (load cur) after ctx depth)
+                        (Err [e] (Err e))
+                        (Ok [outer] (parse-declarator a outer inner ctx depth)))
+                      (apply-suffixes a (load cur) text ctx depth)))))
+          (apply-suffixes a (load cur) text ctx depth)))))
+
+; The `[N]` and `(params)` suffixes of a declarator apply right to left:
+; `int [4][5]` is an array of 4 arrays of 5.
+(defn apply-suffixes [(a (dyn Allocator))
+                      (t (ptr CType))
+                      (text (slice u8))
+                      (ctx (ptr Ctx))
+                      (depth i64)] (-> (Result (ptr CType) (slice u8)))
+  (let [n (len text)
+        (mut kinds) (al-new [i64] a)
+        (mut bodies) (al-new [(slice u8)] a)
+        (mut err) (None [(slice u8)])
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (primitive/cast i64 (get text (load i)))]
+                (cond (ws-byte? (primitive/cast u8 c))
+                        (set! i (primitive/iadd (load i) 1))
+                      (= c (primitive/cast i64 91))
+                        (let [rb (index-of text (primitive/cast u8 93) (load i))]
+                          (if (< rb (primitive/cast i64 0))
+                              (do
+                                (store! err
+                                        (Some (cat3 a
+                                                    "unbalanced C array type '"
+                                                    text
+                                                    "'")))
+                                (break))
+                              (do
+                                (push! (mut kinds) 1)
+                                (push! (mut bodies)
+                                       (trim (subslice [u8]
+                                                       text
+                                                       (primitive/iadd (load i)
+                                                                       1)
+                                                       rb)))
+                                (set! i (primitive/iadd rb 1)))))
+                      (= c (primitive/cast i64 40))
+                        (let [rp (matching-paren text (load i))]
+                          (if (< rp (primitive/cast i64 0))
+                              (do
+                                (store! err
+                                        (Some (cat3 a
+                                                    "unbalanced C declarator '"
+                                                    text
+                                                    "'")))
+                                (break))
+                              (do
+                                (push! (mut kinds) 2)
+                                (push! (mut bodies)
+                                       (trim (subslice [u8]
+                                                       text
+                                                       (primitive/iadd (load i)
+                                                                       1)
+                                                       rp)))
+                                (set! i (primitive/iadd rp 1)))))
+                      :else
+                        (do
+                          (store! err
+                                  (Some (cat3 a
+                                              "unsupported C declarator '"
+                                              text
+                                              "'")))
+                          (break))))))
+    (match (load err)
+      (Some [e] (Err e))
+      (None []
+            (let [m (len (load kinds))
+                  (mut cur) t
+                  (mut fail) (None [(slice u8)])
+                  (mut k) (primitive/isub m 1)]
+              (loop (if (or (< (load k) (primitive/cast i64 0))
+                            (match (load fail) (Some [_] true) (None [] false)))
+                        (break)
+                        (let [body (get (load bodies) (load k))]
+                          (if (= (get (load kinds) (load k))
+                                 (primitive/cast i64 1))
+                              (let [count (parse-dec body)]
+                                (if (< count (primitive/cast i64 0))
+                                    (store! fail
+                                            (Some (cat3 a
+                                                        "non-constant C array bound in '"
+                                                        text
+                                                        "'")))
+                                    (store! cur
+                                            (ctype-box a
+                                                       (CArr (load cur) count)))))
+                              (match (parse-params a body ctx depth)
+                                (Err [e] (store! fail (Some e)))
+                                (Ok [ps]
+                                    (store! cur
+                                            (ctype-box a
+                                                       (CFn (load cur)
+                                                            ps
+                                                            (params-variadic? body)))))))
+                          (set! k (primitive/isub (load k) 1)))))
+              (match (load fail)
+                (Some [e] (Err e))
+                (None [] (Ok (load cur)))))))))
+
+(defn params-variadic? [(body (slice u8))] (-> bool)
+  (contains-str? body "..."))
+
+; A C parameter list: `void` and `` are both empty, `...` marks a variadic tail,
+; and each remaining entry is a full type that decays like a C parameter.
+(defn parse-params [(a (dyn Allocator))
+                    (body (slice u8))
+                    (ctx (ptr Ctx))
+                    (depth i64)] (-> (Result (ptr (ArrayList CType)) (slice u8)))
+  (let [out (box! a (ArrayList CType) (al-new [CType] a))
+        parts (split-top-commas a body)
+        n (len (load parts))
+        (mut err) (None [(slice u8)])
+        (mut i) 0]
+    (unless (or (= (trim body) "") (= (trim body) "void"))
+      (loop (if (>= (load i) n)
+                (break)
+                (let [part (get (load parts) (load i))]
+                  (unless (= part "...")
+                    (match (parse-c-type a part ctx (primitive/iadd depth 1))
+                      (Err [e] (do (store! err (Some e)) 0))
+                      (Ok [t]
+                          (do (push! [CType] out (load (ctype-decay a t))) 0))))
+                  (if (match (load err) (Some [_] true) (None [] false))
+                      (break)
+                      (set! i (primitive/iadd (load i) 1))))))
+      0)
+    (match (load err)
+      (Some [e] (Err e))
+      (None [] (Ok out)))))
+
+; Render a parsed type as Coil source. `ret` marks return position, the one
+; place `void` is a type. Anything the tree can express but Coil cannot spell is
+; refused here, by name, so the binding is skipped rather than approximated.
+(defn render-ctype [(a (dyn Allocator))
+                    (t (ptr CType))
+                    (ret bool)] (-> (Result (slice u8) (slice u8)))
+  (match (load t)
+    (CBase [c]
+           (cond (= c "void")
+                   (if ret (Ok "void") (Err "void is not a value type"))
+                 (= c "__va_list_tag")
+                   (Err "va_list storage outside a parameter (its layout is platform-specific)")
+                 :else (Ok c)))
+    (CPtr [inner]
+          (match (load inner)
+            (CBase [c]
+                   (if (or (= c "void") (= c "__va_list_tag"))
+                       (Ok "(ptr i8)")
+                       (Ok (cat3 a "(ptr " c ")"))))
+            (CFn [r ps variadic]
+                 (if variadic
+                     (Err "variadic function pointer (a Coil fnptr type cannot spell ...)")
+                     (render-fnptr a r ps)))
+            (_ (match (render-ctype a inner false)
+                 (Ok [x] (Ok (cat3 a "(ptr " x ")")))
+                 (Err [e] (Err e))))))
+    (CArr [inner count]
+          (match (load inner)
+            (CFn [_ _ _] (Err "array of functions"))
+            (_ (match (render-ctype a inner false)
+                 (Ok [x]
+                     (Ok (cat3 a
+                               (cat3 a "(array " x " ")
+                               (i64->dec a count)
+                               ")")))
+                 (Err [e] (Err e))))))
+    (CFn [_ _ _] (Err "a function type is only a value behind a pointer"))))
+
+(defn render-fnptr [(a (dyn Allocator))
+                    (r (ptr CType))
+                    (ps (ptr (ArrayList CType)))] (-> (Result (slice u8)
+                                                              (slice u8)))
+  (let [(mut b) (sb-new a)
+        n (len (load ps))
+        (mut err) (None [(slice u8)])
+        (mut i) 0]
+    (sb-push-str! (mut b) "(fnptr c [")
+    (loop (if (>= (load i) n)
+              (break)
+              (let [p (al-elem [CType] ps (load i))]
+                (match (render-ctype a p false)
+                  (Err [e] (do (store! err (Some e)) (break)))
+                  (Ok [x]
+                      (do
+                        (when (> (load i) (primitive/cast i64 0))
+                          (sb-push-str! (mut b) " ")
+                          0)
+                        (sb-push-str! (mut b) x)
+                        (set! i (primitive/iadd (load i) 1))))))))
+    (match (load err)
+      (Some [e] (Err e))
+      (None []
+            (match (render-ctype a r true)
+              (Err [e] (Err e))
+              (Ok [rt]
+                  (do
+                    (sb-push-str! (mut b) "] ")
+                    (sb-push-str! (mut b) rt)
+                    (sb-push-str! (mut b) ")")
+                    (Ok (sb-str (load b))))))))))
 
 (defn map-type [(a (dyn Allocator)) (c (slice u8)) (ctx (ptr Ctx))] (-> (Result (slice u8)
                                                                                 (slice u8)))
-  (map-type-d a c ctx 0))
+  (match (parse-c-type a c ctx 0)
+    (Err [e] (Err e))
+    (Ok [t] (render-ctype a t false))))
+
+; A parameter: the same mapping after C's array/function-to-pointer decay.
+(defn map-param [(a (dyn Allocator)) (c (slice u8)) (ctx (ptr Ctx))] (-> (Result (slice u8)
+                                                                                 (slice u8)))
+  (match (parse-c-type a c ctx 0)
+    (Err [e] (Err e))
+    (Ok [t] (render-ctype a (ctype-decay a t) false))))
 
 (defn map-return [(a (dyn Allocator)) (c (slice u8)) (ctx (ptr Ctx))] (-> (Result (slice u8)
                                                                                   (slice u8)))
-  (if (= (normalize a c) "void") (Ok "void") (map-type a c ctx)))
+  (match (parse-c-type a c ctx 0)
+    (Err [e] (Err e))
+    (Ok [t] (render-ctype a t true))))
 
 ; size + align (bytes) of a mapped scalar/pointer type; None for aggregates.
 (defstruct SzAl [(size i64) (align i64)])
@@ -616,7 +962,7 @@
                                                       (Some "a parameter has no type"))
                                               (break)))
                                       (Some [ty]
-                                            (match (map-type a ty ctx)
+                                            (match (map-param a ty ctx)
                                               (Err [e]
                                                    (do
                                                      (store! err (Some e))
@@ -637,48 +983,45 @@
                     (match (jgets (jget d "type") "qualType")
                       (None [] (Err "no function type"))
                       (Some [qt]
-                            (match (map-return a
-                                               (trim (before qt
-                                                             (primitive/cast u8
-                                                                             40)))
-                                               ctx)
+                            ; The declaration's own type is a function type. Its
+                            ; return type is whatever the declarator leaves
+                            ; behind — for `R (*f(P))(Q)` that is a pointer to a
+                            ; function, which the old "text before the first
+                            ; paren" shortcut misread as a bare `R`.
+                            (match (parse-c-type a qt ctx 0)
                               (Err [e] (Err e))
-                              (Ok [ret]
-                                  (let [psstr (sb-str (load ps))
-                                        variadic (has-dots qt)
-                                        psfull
-                                          (if variadic
-                                              (if (> (len psstr)
-                                                     (primitive/cast i64 0))
-                                                  (cat3 a psstr " " "...")
-                                                  "...")
-                                              psstr)]
-                                    (Ok (cat3 a
-                                              (cat3 a
-                                                    "(extern "
-                                                    name
-                                                    (cat3 a
-                                                          " :cc c ["
-                                                          psfull
-                                                          "] (-> "))
-                                              ret
-                                              "))\n")))))))))))))
-
-; Does the function type contain a "..." (variadic)?
-(defn has-dots [(s (slice u8))] (-> bool)
-  (let [n (len s)
-        (mut i) 0
-        (mut r) false]
-    (loop (if (>= (primitive/iadd (load i) 2) n)
-              (break)
-              (if (and (= (get s (load i)) (primitive/cast u8 46))
-                       (and (= (get s (primitive/iadd (load i) 1))
-                               (primitive/cast u8 46))
-                            (= (get s (primitive/iadd (load i) 2))
-                               (primitive/cast u8 46))))
-                  (do (set! r true) (break))
-                  (set! i (primitive/iadd (load i) 1)))))
-    (load r)))
+                              (Ok [ft]
+                                  (match (load ft)
+                                    (CFn [rt _ variadic]
+                                         (match (render-ctype a rt true)
+                                           (Err [e] (Err e))
+                                           (Ok [ret]
+                                               (let [psstr (sb-str (load ps))
+                                                     psfull
+                                                       (if variadic
+                                                           (if (> (len psstr)
+                                                                  (primitive/cast i64
+                                                                                  0))
+                                                               (cat3 a
+                                                                     psstr
+                                                                     " "
+                                                                     "...")
+                                                               "...")
+                                                           psstr)]
+                                                 (Ok (cat3 a
+                                                           (cat3 a
+                                                                 "(extern "
+                                                                 name
+                                                                 (cat3 a
+                                                                       " :cc c ["
+                                                                       psfull
+                                                                       "] (-> "))
+                                                           ret
+                                                           "))\n"))))))
+                                    (_ (Err (cat3 a
+                                                  "declaration type '"
+                                                  qt
+                                                  "' is not a function type"))))))))))))))
 
 ; A RecordDecl → (Ok (Some text)) emitted / (Ok (None)) skip-silently (fwd/anon) /
 ; (Err reason) refuse-with-note. Unions map to :layout explicit (every field :at 0).

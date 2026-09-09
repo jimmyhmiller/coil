@@ -330,6 +330,25 @@ def test(args: argparse.Namespace) -> None:
         test_modernize_fast(compiler)
 
 
+# What `coil cimport` must produce from tests/compiler/cimport/expressions.h:
+# literal aliases and expressions, a fixed array, function pointers in field,
+# array, parameter, return and nested positions (a va_list parameter is the
+# pointer it decays to), and the opaque fallback for a record it cannot bind.
+CIMPORT_EXPECTED = (
+    "(const COIL_ALIAS_OPTION 256)",
+    "(const COIL_OR_OPTION 260)",
+    "(const COIL_CAST_OPTION 512)",
+    "(array u8 37)",
+    "(callback (fnptr c [(ptr i8)] void))",
+    "(table (array (fnptr c [i32] void) 4))",
+    "(chain (fnptr c [i8] (fnptr c [f64] i32)))",
+    "(extern coil_set_trace :cc c [(fnptr c [i32 (ptr i8) (ptr i8)] void)] (-> void))",
+    "(extern coil_set_loader :cc c [(fnptr c [(ptr i8) (ptr i32)] (ptr u8))] (-> void))",
+    "(extern coil_get_loader :cc c [] (-> (fnptr c [(ptr i8) (ptr i32)] (ptr u8))))",
+    "(defstruct coil_uninspectable :layout explicit",
+)
+
+
 def _test_modernize_fast_serial(compiler: str) -> None:
     """Bounded focused tests for an already-built candidate compiler."""
     started = time.monotonic()
@@ -348,12 +367,7 @@ def _test_modernize_fast_serial(compiler: str) -> None:
         execute(str(candidate), "cimport", "tests/compiler/cimport/expressions.h",
                 "-o", str(bindings))
         generated = bindings.read_text()
-        for expected in (
-                "(const COIL_ALIAS_OPTION 256)",
-                "(const COIL_OR_OPTION 260)",
-                "(const COIL_CAST_OPTION 512)",
-                "(array u8 37)",
-                "(defstruct coil_uninspectable :layout explicit"):
+        for expected in CIMPORT_EXPECTED:
             if expected not in generated:
                 raise SystemExit(f"fast modernization gate: cimport omitted {expected!r}")
         execute(str(candidate), "check", str(bindings))
@@ -539,9 +553,7 @@ def test_modernize_fast(compiler: str) -> None:
             bindings = tmp / "cimport-expressions.coil"
             execute(coil, "cimport", "tests/compiler/cimport/expressions.h", "-o", str(bindings))
             generated = bindings.read_text()
-            for expected in ("(const COIL_ALIAS_OPTION 256)", "(const COIL_OR_OPTION 260)",
-                             "(const COIL_CAST_OPTION 512)", "(array u8 37)",
-                             "(defstruct coil_uninspectable :layout explicit"):
+            for expected in CIMPORT_EXPECTED:
                 if expected not in generated:
                     raise RuntimeError(f"fast modernization gate: cimport omitted {expected!r}")
             execute(coil, "check", str(bindings))

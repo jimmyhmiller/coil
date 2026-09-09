@@ -768,10 +768,8 @@ printf '(module app)\n(import "util" :use *)\n(defn main [] (-> i64) (forty-two)
 ( cd "$T" && "$COIL" run "$T/sib/src/main.coil" >/dev/null 2>&1 ); [ $? = 42 ] \
   && ok "namespace lookup works from an unrelated cwd" \
   || bad "namespace index (arbitrary cwd)" "want rc=42"
-# Once project mode supplies explicit roots, a temporary/synthetic entry does not
-# expand the namespace boundary to its containing directory. Besides preventing
-# accidental imports, this keeps lint's /tmp/coil-project-lint-root-*.coil from
-# recursively indexing all of /tmp and retaining tens of gigabytes of paths.
+# Once project mode supplies explicit roots, an entry outside them does not
+# expand the namespace boundary to its containing directory.
 mkdir -p "$T/configured-root" "$T/outside-entry"
 printf '(module leaked)\n(defn value [] (-> i64) 42)\n' > "$T/outside-entry/leaked.coil"
 printf '(module configured-boundary)\n(import "leaked" :use *)\n(defn main [] (-> i64) (value))\n' \
@@ -829,6 +827,44 @@ printf '(module lint-root-entry)\n(defn main [] (-> i64) (ior 40 2))\n' \
   && grep -q '(primitive/ior 40 2)' "$T/lint-root-entry/main.coil" \
   && ok "project lint includes a package entry outside source roots" \
   || bad "project lint root entry" "entry = main.coil was silently skipped"
+
+# Project lint loads the project as a set of modules; there is no entry file and
+# none is invented. A namespace two files declare (a before/after fixture pair
+# under a source root) is reported at the declaring file, that module is left
+# out, and every fix that survived its own compile gate stays applied.
+mkdir -p "$T/lint-dup/src" "$T/lint-dup/tests/fixtures"
+printf '[package]\nname = "lint-dup"\nentry = "src/main.coil"\nsource-roots = ["src", "tests"]\n' \
+  > "$T/lint-dup/Coil.toml"
+printf '(module lint-dup.main)\n(defn main [] (-> i64) (ior 40 2))\n' > "$T/lint-dup/src/main.coil"
+printf '(module fixture)\n(defn v [] (-> i64) 1)\n' > "$T/lint-dup/tests/fixtures/before.coil"
+printf '(module fixture)\n(defn v [] (-> i64) 2)\n' > "$T/lint-dup/tests/fixtures/after.coil"
+out=$(cd "$T/lint-dup" && "$COIL" lint --fix 2>&1); rc=$?
+case "$out" in *"namespace 'fixture' is declared by multiple source files"*) dup_reported=1;; *) dup_reported=0;; esac
+case "$out" in *"tests/fixtures/after.coil"*) dup_at_file=1;; *) dup_at_file=0;; esac
+case "$out" in *"/tmp/coil-project-lint"*|*"all changes reverted"*) dup_leak=1;; *) dup_leak=0;; esac
+[ "$rc" != 0 ] && [ "$dup_reported" = 1 ] && [ "$dup_at_file" = 1 ] && [ "$dup_leak" = 0 ] \
+  && grep -q '(primitive/ior 40 2)' "$T/lint-dup/src/main.coil" \
+  && ok "project lint reports a duplicate namespace at its files and keeps the other fixes" \
+  || bad "project lint duplicate namespace" "rc=$rc: $out"
+# The manifest's exclude list takes glob patterns; an excluded fixture pair is
+# neither indexed nor linted, so the same project is clean.
+printf '[package]\nname = "lint-dup"\nentry = "src/main.coil"\nsource-roots = ["src", "tests"]\nexclude = ["tests/fixtures/*"]\n' \
+  > "$T/lint-dup/Coil.toml"
+out=$(cd "$T/lint-dup" && "$COIL" lint 2>&1); rc=$?
+[ "$rc" = 0 ] \
+  && ok "a glob exclude keeps fixture modules out of project lint" \
+  || bad "project lint glob exclude" "rc=$rc: $out"
+# A file that does not parse is reported in that file and left out; fixes to the
+# rest of the project still land.
+printf '(module lint-dup.main)\n(defn main [] (-> i64) (ior 40 2))\n' > "$T/lint-dup/src/main.coil"
+printf '(module lint-dup.broken)\n(defn broken [] (-> i64) (\n' > "$T/lint-dup/src/broken.coil"
+out=$(cd "$T/lint-dup" && "$COIL" lint --fix 2>&1); rc=$?
+case "$out" in *"src/broken.coil"*) broken_at_file=1;; *) broken_at_file=0;; esac
+[ "$rc" != 0 ] && [ "$broken_at_file" = 1 ] \
+  && grep -q '(primitive/ior 40 2)' "$T/lint-dup/src/main.coil" \
+  && ok "project lint reports an unreadable file in place and still fixes the rest" \
+  || bad "project lint unreadable file" "rc=$rc: $out"
+rm -f "$T/lint-dup/src/broken.coil"
 
 printf '(module owner-alias-migrate)\n(import "coil.alloc" :as memory)\n(import "coil.primitive" :as metal)\n(defn main [] (-> i64) (let [p (stack i64)] (store! p (ior 40 2)) (load p)))\n' \
   > "$T/sib/src/owner-alias-migrate.coil"
