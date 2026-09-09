@@ -531,6 +531,10 @@ The argument order is the trait's declared non-`Self` parameter order; for
 
 **Any type can carry an impl** — a struct, sum, scalar, generic instance, and the
 structural types `(ptr T)`, `(slice T)`, `(array T N)`, `(vec T N)`, `(fnptr c […] R)`.
+Vector widths may be declared generic parameters: `[T N]` with `(vec T N)`
+specializes at calls such as `[u8 16]`. `(mask N)` is `(vec bool N)`.
+`coil.simd` provides typed arithmetic, masks, safe tails, permutations, conversions,
+and scans; see `docs/reference/SIMD.md` for contracts and examples.
 A generic impl's `[T …]` params are inferred from the receiver, and every declared
 param must appear in the implementing type.
 

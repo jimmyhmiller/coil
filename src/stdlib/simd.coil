@@ -1,14 +1,586 @@
 (module coil.simd)
 (import "coil.primitive" :as primitive)
 
-; SIMD as a *library* -- every operation is a macro over the `(primitive/llvm-ir ...)`
-; primitive, so nothing here is in the compiler. Each op is a raw-IR template;
-; `$ret`/`$tN` expand to the result/operand LLVM type strings and `$N` to the
-; operand SSA names, so one template serves every lane type and width. The LLVM
-; verifier checks the bodies, and `-O3` inlines them away to bare NEON/SSE.
-;
-; This file targets <4 x float> (NEON / 128-bit). Widen by editing the lane
-; count and intrinsic suffix, or generate per-target with a `target-arch` macro.
+;;; Double lane bits in the low half, preserving integer or float kind and total bits.
+;;; Integer extension uses source signedness. The result type determines U and M.
+(defn vwiden-low :inline (Always) [U M T N] [(value (vec T N))] (-> (vec U M))
+  (primitive/vector-widen-low [(vec U M)] value))
+
+;;; Widen the high half with the same contract as vwiden-low.
+(defn vwiden-high :inline (Always) [U M T N] [(value (vec T N))] (-> (vec U M))
+  (primitive/vector-widen-high [(vec U M)] value))
+
+;;; Concatenate a,b and halve lane bits. Integer lanes truncate; floats round.
+(defn vnarrow :inline (Always) [U M T N] [(a (vec T N)) (b (vec T N))] (-> (vec U M))
+  (primitive/vector-narrow [(vec U M)] a b))
+
+;;; Concatenate integer vectors and saturate to the destination's half-width range.
+;;; Source and destination signedness may differ.
+(defn vnarrow-saturating :inline (Always) [U M T N]
+  [(a (vec T N)) (b (vec T N))] (-> (vec U M))
+  (primitive/vector-narrow-saturating [(vec U M)] a b))
+
+(import "coil.result" :use [Option Some None])
+
+;;; A bitmap iterator step: the lowest set bit and the remaining bitmap.
+(defstruct BitIndex [(index i64) (remaining u64)])
+
+;;; A fixed-width bitmap shift and the bits shifted out of the logical width.
+(defstruct BitShift [(bits u64) (carry u64)])
+
+;;; An inclusive bit-prefix result with the outgoing parity state.
+(defstruct BitPrefix [(bits u64) (carry bool)])
+
+;;; Low count bits set, clamping count to [0,64]. No shift by 64 occurs.
+(defn bits-low :inline (Always) [(count i64)] (-> u64)
+  (cond (<= count 0) (cast u64 0)
+        (>= count 64) (cast u64 -1)
+        :else (primitive/isub (primitive/ishl (cast u64 1) (cast u64 count)) (cast u64 1))))
+
+;;; Bits in the half-open range [start,end), with both endpoints clamped to [0,64].
+(defn bits-range :inline (Always) [(start i64) (end i64)] (-> u64)
+  (primitive/iand (bits-low end) (primitive/inot (bits-low start))))
+
+;;; Number of set bits before the exclusive end index.
+(defn bits-rank :inline (Always) [(bits u64) (end i64)] (-> i64)
+  (cast i64 (primitive/popcount (primitive/iand bits (bits-low end)))))
+
+;;; Remove the lowest set bit. Empty input returns None, without a sentinel index.
+(defn bits-pop-first :inline (Always) [(bits u64)] (-> (Option BitIndex))
+  (if (= bits (cast u64 0)) (None)
+    (Some (BitIndex :index (cast i64 (primitive/ctz bits))
+                    :remaining (primitive/iand bits (primitive/isub bits (cast u64 1)))))))
+
+;;; Shift toward higher bit indices within width, filling from incoming's low bits.
+;;; Width clamps to [0,64], distance to [0,width]. Carry preserves outgoing bit order.
+(defn bits-shift-left :inline (Always)
+  [(bits u64) (width i64) (distance i64) (incoming u64)] (-> BitShift)
+  (let [w (cond (< width 0) 0 (> width 64) 64 :else width)
+        d (cond (< distance 0) 0 (> distance w) w :else distance)
+        mask (bits-low w) value (primitive/iand bits mask)]
+    (if (= d 0) (BitShift :bits value :carry (cast u64 0))
+      (let [outgoing (primitive/ishr value (cast u64 (- w d)))
+            shifted (if (= d 64) (cast u64 0) (primitive/ishl value (cast u64 d)))
+            filled (primitive/ior shifted (primitive/iand incoming (bits-low d)))]
+        (BitShift :bits (primitive/iand filled mask) :carry outgoing)))))
+
+;;; Shift toward lower bit indices, filling the high end from incoming's low bits.
+(defn bits-shift-right :inline (Always)
+  [(bits u64) (width i64) (distance i64) (incoming u64)] (-> BitShift)
+  (let [w (cond (< width 0) 0 (> width 64) 64 :else width)
+        d (cond (< distance 0) 0 (> distance w) w :else distance)
+        value (primitive/iand bits (bits-low w))]
+    (if (= d 0) (BitShift :bits value :carry (cast u64 0))
+      (let [outgoing (primitive/iand value (bits-low d))
+            shifted (if (= d 64) (cast u64 0) (primitive/ishr value (cast u64 d)))
+            filled (primitive/ishl (primitive/iand incoming (bits-low d)) (cast u64 (- w d)))]
+        (BitShift :bits (primitive/ior shifted filled) :carry outgoing)))))
+
+;;; Inclusive parity prefix over count low bits, carrying parity across chunks.
+(defn bits-prefix-xor :inline (Always) [(bits u64) (count i64) (carry bool)] (-> BitPrefix)
+  (let [n (cond (< count 0) 0 (> count 64) 64 :else count)
+        (mut x) (primitive/iand bits (bits-low n))]
+    (set! x (primitive/ixor (load x) (primitive/ishl (load x) (cast u64 1))))
+    (set! x (primitive/ixor (load x) (primitive/ishl (load x) (cast u64 2))))
+    (set! x (primitive/ixor (load x) (primitive/ishl (load x) (cast u64 4))))
+    (set! x (primitive/ixor (load x) (primitive/ishl (load x) (cast u64 8))))
+    (set! x (primitive/ixor (load x) (primitive/ishl (load x) (cast u64 16))))
+    (set! x (primitive/ixor (load x) (primitive/ishl (load x) (cast u64 32))))
+    (let [value (primitive/iand (if carry (primitive/inot (load x)) (load x)) (bits-low n))
+          outgoing (if (= n 0) carry
+            (!= (primitive/iand (primitive/ishr value (cast u64 (- n 1))) (cast u64 1)) (cast u64 0)))]
+      (BitPrefix :bits value :carry outgoing))))
+
+;;; Inclusive byte-range classification using unsigned byte comparisons.
+(defn byte-in-range? :inline (Always) [N]
+  [(bytes (vec u8 N)) (low u8) (high u8)] (-> (mask N))
+  (vand (v>= bytes (vsplat [u8 N] low)) (v<= bytes (vsplat [u8 N] high))))
+
+(defn ascii-digit? :inline (Always) [N] [(bytes (vec u8 N))] (-> (mask N))
+  (byte-in-range? bytes 48 57))
+
+(defn ascii-alpha? :inline (Always) [N] [(bytes (vec u8 N))] (-> (mask N))
+  (byte-in-range? (vor bytes (vsplat [u8 N] 32)) 97 122))
+
+(defn ascii-hex-digit? :inline (Always) [N] [(bytes (vec u8 N))] (-> (mask N))
+  (vor (ascii-digit? bytes) (byte-in-range? (vor bytes (vsplat [u8 N] 32)) 97 102)))
+
+(defn ascii-whitespace? :inline (Always) [N] [(bytes (vec u8 N))] (-> (mask N))
+  (vor (byte-in-range? bytes 9 13) (v= bytes (vsplat [u8 N] 32))))
+
+(defn utf8-continuation? :inline (Always) [N] [(bytes (vec u8 N))] (-> (mask N))
+  (v= (vand bytes (vsplat [u8 N] 192)) (vsplat [u8 N] 128)))
+
+;;; Classify with two 16-entry nibble tables: low[byte&15] & high[byte>>4] != 0.
+;;; This is the usual table-driven byte-set primitive; constructing a DSL is unnecessary.
+(defn byte-nibble-class? :inline (Always) [N]
+  [(bytes (vec u8 N)) (low (vec u8 16)) (high (vec u8 16))] (-> (mask N))
+  (v!= (vand (vtable low (vand bytes (vsplat [u8 N] 15)))
+              (vtable high (vshr-logical bytes (vsplat [u8 N] 4)))) (vzero [u8 N])))
+
+;;; Two vectors with the same lane shape.
+(defstruct VecPair [T N] [(low (vec T N)) (high (vec T N))])
+
+;;; Carryless multiplication of independent 64-bit polynomial lanes.
+;;; low/high contain the complete 128-bit product. This portable vector algorithm
+;;; needs no crypto ISA extension and performs no data-dependent memory accesses.
+(defn vclmul64 :inline (Always) [N] [(a (vec u64 N)) (b (vec u64 N))] (-> (VecPair u64 N))
+  (let [zero (vzero [u64 N]) one (vsplat [u64 N] 1)
+        (mut low) (vselect (v!= (vand b one) zero) a zero)
+        (mut high) zero]
+    (for [i 1 64]
+      (let [count (vsplat [u64 N] (cast u64 i))
+            active (v!= (vand (vshr-logical b count) one) zero)]
+        (set! low (vxor (load low) (vselect active (vshl a count) zero)))
+        (set! high (vxor (load high)
+          (vselect active (vshr-logical a (vsplat [u64 N] (cast u64 (- 64 i)))) zero)))))
+    (VecPair :low (load low) :high (load high))))
+
+;;; Low half of carryless multiplication; unused high-half work can be eliminated.
+(defn vclmul-low :inline (Always) [N] [(a (vec u64 N)) (b (vec u64 N))] (-> (vec u64 N))
+  (let [product (vclmul64 a b)] (.low product)))
+
+;;; High half of carryless multiplication.
+(defn vclmul-high :inline (Always) [N] [(a (vec u64 N)) (b (vec u64 N))] (-> (vec u64 N))
+  (let [product (vclmul64 a b)] (.high product)))
+
+;;; Four vectors, useful for small transposes and independent accumulators.
+(defstruct VecQuad [T N] [(a (vec T N)) (b (vec T N)) (c (vec T N)) (d (vec T N))])
+
+;;; Interleave a and b, splitting the 2*N result into low and high vectors.
+;;; Unlike half-vector APIs, this is also well-defined for odd widths.
+(defn vzip :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (VecPair T N))
+  (let [n (vsplat [i64 N] (vlanes a)) one (vsplat [i64 N] 1)
+        low (viota [i64 N]) high (vadd low n)
+        li (vadd (vshr-logical low one) (vmul (vand low one) n))
+        hi (vadd (vshr-logical high one) (vmul (vand high one) n))]
+    (VecPair :low (vshuffle a b li) :high (vshuffle a b hi))))
+
+;;; Deinterleave the concatenation a,b into its even and odd lanes; inverse of vzip.
+(defn vunzip :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (VecPair T N))
+  (let [even (vmul (viota [i64 N]) (vsplat [i64 N] 2))
+        odd (vadd even (vsplat [i64 N] 1))]
+    (VecPair :low (vshuffle a b even) :high (vshuffle a b odd))))
+
+;;; Transpose four rows of four lanes into four columns.
+(defn vtranspose4 :inline (Always) [T]
+  [(a (vec T 4)) (b (vec T 4)) (c (vec T 4)) (d (vec T 4))] (-> (VecQuad T 4))
+  (let [ab (vzip a b) cd (vzip c d)
+        i0 (vinsert (vinsert (viota [i64 4]) 2 4) 3 5)
+        i1 (vadd i0 (vsplat [i64 4] 2))]
+    (VecQuad :a (vshuffle (.low ab) (.low cd) i0)
+             :b (vshuffle (.low ab) (.low cd) i1)
+             :c (vshuffle (.high ab) (.high cd) i0)
+             :d (vshuffle (.high ab) (.high cd) i1))))
+
+;;; A vector with a logical validity mask, including a short final chunk.
+(defstruct Chunk [T N] [(value (vec T N)) (valid (mask N))])
+
+;;; An inclusive prefix result and the scalar state to pass to the next chunk.
+(defstruct ScanResult [T N] [(values (vec T N)) (carry T)])
+
+;;; Whether at least one lane is active. Works for widths greater than 64, too.
+(defn mask-any? :inline (Always) [N] [(mask (mask N))] (-> bool)
+  (primitive/vector-reduce-or mask))
+
+;;; Whether every lane is active.
+(defn mask-all? :inline (Always) [N] [(mask (mask N))] (-> bool)
+  (primitive/vector-reduce-and mask))
+
+;;; Whether no lane is active.
+(defn mask-none? :inline (Always) [N] [(mask (mask N))] (-> bool)
+  (not (mask-any? mask)))
+
+;;; Number of active lanes, without a bitmap-width restriction.
+(defn mask-count :inline (Always) [N] [(mask (mask N))] (-> i64)
+  (vreduce-add (vselect mask (vsplat [i64 N] 1) (vzero [i64 N]))))
+
+;;; Lowest active lane, or None for an empty mask.
+(defn mask-first :inline (Always) [N] [(mask (mask N))] (-> (Option i64))
+  (let [n (vlanes mask)
+        index (vreduce-min (vselect mask (viota [i64 N]) (vsplat [i64 N] n)))]
+    (if (= index n) (None) (Some index))))
+
+;;; Highest active lane, or None for an empty mask.
+(defn mask-last :inline (Always) [N] [(mask (mask N))] (-> (Option i64))
+  (let [index (vreduce-max (vselect mask (viota [i64 N]) (vsplat [i64 N] -1)))]
+    (if (< index 0) (None) (Some index))))
+
+;;; Shift lanes toward higher indices, inserting zero; negative distances yield zero.
+(defn vslide-up :inline (Always) [T N] [(value (vec T N)) (distance i64)] (-> (vec T N))
+  (if (< distance 0) (vzero [T N])
+      (vshuffle value (vzero [T N]) (vsub (viota [i64 N]) (vsplat [i64 N] distance)))))
+
+;;; Shift lanes toward lower indices, inserting zero; negative distances yield zero.
+(defn vslide-down :inline (Always) [T N] [(value (vec T N)) (distance i64)] (-> (vec T N))
+  (if (or (< distance 0) (>= distance (vlanes value))) (vzero [T N])
+      (vshuffle value (vzero [T N]) (vadd (viota [i64 N]) (vsplat [i64 N] distance)))))
+
+;;; Reverse the lane order.
+(defn vreverse :inline (Always) [T N] [(value (vec T N))] (-> (vec T N))
+  (vshuffle value value (vsub (vsplat [i64 N] (- (vlanes value) 1)) (viota [i64 N]))))
+
+;;; Take a vector-sized window from concatenated previous,current at offset.
+;;; Offsets outside [0,N] return zero, preventing integer-overflow ambiguity.
+(defn valign :inline (Always) [T N]
+  [(previous (vec T N)) (current (vec T N)) (offset i64)] (-> (vec T N))
+  (if (or (< offset 0) (> offset (vlanes current))) (vzero [T N])
+      (vshuffle previous current (vadd (viota [i64 N]) (vsplat [i64 N] offset)))))
+
+;;; Inclusive prefix maximum, including a carried value from preceding chunks.
+(defn vscan-max :inline (Always) [T N] [(value (vec T N)) (carry T)] (-> (ScanResult T N))
+  (let [values (vmax (primitive/vector-scan-max value) (vsplat [T N] carry))]
+    (ScanResult :values values :carry (vextract values (- (vlanes value) 1)))))
+
+;;; Stable compaction: active lanes retain their order, remaining lanes come from fill.
+(defn vcompress :inline (Always) [T N]
+  [(value (vec T N)) (active (mask N)) (fill (vec T N))] (-> (vec T N))
+  (primitive/vector-compress value active fill))
+
+;;; Store active lanes contiguously, touching exactly mask-count(active) elements.
+;;; Returns the number written.
+(defn vcompress-store :inline (Always) [T N]
+  [(p (ptr T)) (active (mask N)) (value (vec T N))] (-> i64)
+  (do (primitive/vector-compress-store p active value) (mask-count active)))
+
+;;; Read consecutive packed elements into active lanes; inactive lanes retain fill.
+(defn vexpand-load :inline (Always) [T N]
+  [(p (ptr T)) (active (mask N)) (fill (vec T N))] (-> (vec T N))
+  (primitive/vector-expand-load p active fill))
+
+;;; Inclusive prefix add, including carry. Addition wraps for integers;
+;;; floating addition uses a fixed balanced tree, without reassociation flags.
+(defn vscan-add :inline (Always) [T N] [(value (vec T N)) (carry T)] (-> (ScanResult T N))
+  (let [values (vadd (primitive/vector-scan-add value) (vsplat [T N] carry))]
+    (ScanResult :values values :carry (vextract values (- (vlanes value) 1)))))
+
+;;; Inclusive prefix XOR over integer or boolean lanes, including carry.
+(defn vscan-xor :inline (Always) [T N] [(value (vec T N)) (carry T)] (-> (ScanResult T N))
+  (let [values (vxor (primitive/vector-scan-xor value) (vsplat [T N] carry))]
+    (ScanResult :values values :carry (vextract values (- (vlanes value) 1)))))
+
+;;; Inclusive prefix OR over integer or boolean lanes, including carry.
+(defn vscan-or :inline (Always) [T N] [(value (vec T N)) (carry T)] (-> (ScanResult T N))
+  (let [values (vor (primitive/vector-scan-or value) (vsplat [T N] carry))]
+    (ScanResult :values values :carry (vextract values (- (vlanes value) 1)))))
+
+;;; Expand packed vector lanes into active positions, leaving fill elsewhere.
+(defn vexpand :inline (Always) [T N]
+  [(packed (vec T N)) (active (mask N)) (fill (vec T N))] (-> (vec T N))
+  (let [counts (vselect active (vsplat [i64 N] 1) (vzero [i64 N]))
+        ranks (vscan-add counts 0)
+        indices (vsub (.values ranks) (vsplat [i64 N] 1))]
+    (vselect active (vshuffle packed (vzero [T N]) indices) fill)))
+
+;;; Each lane says whether any earlier lane (excluding itself) was active.
+;;; Carry represents preceding chunks; returned carry includes this chunk.
+(defn mask-preceding-any :inline (Always) [N]
+  [(active (mask N)) (carry bool)] (-> (ScanResult bool N))
+  (let [inclusive (vscan-or active carry)]
+    (ScanResult :values (vselect (mask-low [N] 1) (vsplat [bool N] carry)
+                                 (vslide-up (.values inclusive) 1))
+                :carry (.carry inclusive))))
+
+;;; Reinterpret equal-sized numeric vectors without numeric conversion.
+;;; Lane packing follows the target's byte order; mask bitmaps use mask->bits instead.
+(defn vbitcast :inline (Always) [U M T N] [(value (vec T N))] (-> (vec U M))
+  (primitive/vector-bitcast [(vec U M)] value))
+
+;;; Convert numeric lanes, preserving lane count. Integer narrowing truncates;
+;;; widening uses source signedness. Float-to-integer truncates toward zero and
+;;; saturates out-of-range values; NaN becomes zero. Float narrowing rounds to nearest.
+(defn vconvert :inline (Always) [U T N] [(value (vec T N))] (-> (vec U N))
+  (primitive/vector-convert [(vec U N)] value))
+
+;;; Select lanes from concatenated a,b. Out-of-range indices produce zero.
+;;; Constant index vectors lower to static shuffles; dynamic indices are supported.
+(defn vshuffle :inline (Always) [T I N M]
+  [(a (vec T N)) (b (vec T N)) (indices (vec I M))] (-> (vec T M))
+  (primitive/vector-shuffle a b indices))
+
+;;; Byte table lookup, with zero for indices outside the table (including negatives).
+(defn vtable :inline (Always) [I N M]
+  [(table (vec u8 N)) (indices (vec I M))] (-> (vec u8 M))
+  (primitive/vector-table table indices))
+
+;;; Load from a pointer aligned to the next power of two of the vector's byte size.
+;;; The caller must uphold alignment and provide all N readable elements.
+(defn vload-aligned :inline (Always) [T N] [(p (ptr T))] (-> (vec T N))
+  (primitive/vector-load-aligned [(vec T N)] p))
+
+;;; Store with the same alignment contract as vload-aligned.
+(defn vstore-aligned :inline (Always) [T N] [(p (ptr T)) (value (vec T N))] (-> i64)
+  (primitive/vector-store-aligned p value))
+
+;;; Read only active lanes. Inactive lanes retain fill and do not access memory.
+(defn vload-masked :inline (Always) [T N]
+  [(p (ptr T)) (active (mask N)) (fill (vec T N))] (-> (vec T N))
+  (primitive/vector-load-masked p active fill))
+
+;;; Write only active lanes; inactive addresses need not be accessible.
+(defn vstore-masked :inline (Always) [T N]
+  [(p (ptr T)) (active (mask N)) (value (vec T N))] (-> i64)
+  (primitive/vector-store-masked p active value))
+
+;;; Gather active element offsets from base; inactive lanes retain fill.
+;;; Offsets are signed or unsigned according to I, and scaled by sizeof(T).
+(defn vgather :inline (Always) [T I N]
+  [(base (ptr T)) (offsets (vec I N)) (active (mask N)) (fill (vec T N))] (-> (vec T N))
+  (primitive/vector-gather base offsets active fill))
+
+;;; Scatter active element offsets in lane order: last active duplicate wins.
+(defn vscatter :inline (Always) [T I N]
+  [(base (ptr T)) (offsets (vec I N)) (active (mask N)) (value (vec T N))] (-> i64)
+  (primitive/vector-scatter base offsets active value))
+
+;;; A mask with the first count lanes active; count is clamped to [0,N].
+(defn mask-low [(width Code) (count Code)] (-> Code)
+  (if (and (primitive/code-vector? width) (= (primitive/code-count width) 1))
+      `(primitive/vector-mask-low [(mask ~(primitive/code-nth width 0))]
+         (primitive/cast i64 ~count))
+      (primitive/error "mask-low expects [lane-count] and a count")))
+
+;;; Consecutive integer lane values 0..N-1, truncated to the lane bit width.
+(defn viota :inline (Always) [T N] [] (-> (vec T N))
+  (primitive/vector-iota [(vec T N)]))
+
+;;; Read a tail of count elements without reading beyond it, preserving fill elsewhere.
+(defn vload-partial :inline (Always) [T N]
+  [(p (ptr T)) (count i64) (fill (vec T N))] (-> (vec T N))
+  (vload-masked p (mask-low [N] count) fill))
+
+;;; Write only the first count lanes. Negative count writes nothing; count>N writes N.
+(defn vstore-partial :inline (Always) [T N]
+  [(p (ptr T)) (count i64) (value (vec T N))] (-> i64)
+  (vstore-masked p (mask-low [N] count) value))
+
+;;; Floating-point lane-wise division.
+(defn vdiv :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-div a b))
+
+;;; Saturating integer addition, using the lane signedness.
+(defn vadd-saturating :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-add-saturating a b))
+
+;;; Saturating integer subtraction, using the lane signedness.
+(defn vsub-saturating :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-sub-saturating a b))
+
+;;; Lane-wise minimum; floating NaNs propagate and negative zero wins.
+(defn vmin :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-min a b))
+
+;;; Lane-wise maximum; floating NaNs propagate and positive zero wins.
+(defn vmax :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-max a b))
+
+;;; Shift left; each count is reduced modulo the lane bit width.
+(defn vshl :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-shl a b))
+
+;;; Logical right shift with counts modulo the lane bit width.
+(defn vshr-logical :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-shr a b))
+
+;;; Sign-extending right shift with counts modulo the lane bit width.
+(defn vshr-arithmetic :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-ashr a b))
+
+;;; Rotate each lane left, with counts modulo the lane bit width.
+(defn vrotate-left :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-rotate-left a b))
+
+;;; Rotate each lane right, with counts modulo the lane bit width.
+(defn vrotate-right :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-rotate-right a b))
+
+;;; Bitwise complement, or logical complement of mask lanes.
+(defn vnot :inline (Always) [T N] [(value (vec T N))] (-> (vec T N))
+  (primitive/vector-not value))
+
+;;; Population count in each lane, returned in the same integer lane type.
+(defn vpopcount :inline (Always) [T N] [(value (vec T N))] (-> (vec T N))
+  (primitive/vector-popcount value))
+
+;;; Count leading zero bits; zero returns the lane bit width.
+(defn vclz :inline (Always) [T N] [(value (vec T N))] (-> (vec T N))
+  (primitive/vector-clz value))
+
+;;; Count trailing zero bits; zero returns the lane bit width.
+(defn vctz :inline (Always) [T N] [(value (vec T N))] (-> (vec T N))
+  (primitive/vector-ctz value))
+
+;;; Reverse bytes within each lane; byte lanes are unchanged.
+(defn vbyte-swap :inline (Always) [T N] [(value (vec T N))] (-> (vec T N))
+  (primitive/vector-bswap value))
+
+;;; Reverse all bits within each integer lane.
+(defn vbit-reverse :inline (Always) [T N] [(value (vec T N))] (-> (vec T N))
+  (primitive/vector-bit-reverse value))
+
+;;; Absolute value; the signed integer minimum wraps to itself.
+(defn vabs :inline (Always) [T N] [(value (vec T N))] (-> (vec T N))
+  (primitive/vector-abs value))
+
+;;; Negate each lane, wrapping for integers.
+(defn vneg :inline (Always) [T N] [(value (vec T N))] (-> (vec T N))
+  (primitive/vector-neg value))
+
+;;; IEEE square root in each floating-point lane.
+(defn vsqrt :inline (Always) [T N] [(value (vec T N))] (-> (vec T N))
+  (primitive/vector-sqrt value))
+
+;;; Round floating lanes toward negative infinity.
+(defn vfloor :inline (Always) [T N] [(value (vec T N))] (-> (vec T N))
+  (primitive/vector-floor value))
+
+;;; Round floating lanes toward positive infinity.
+(defn vceil :inline (Always) [T N] [(value (vec T N))] (-> (vec T N))
+  (primitive/vector-ceil value))
+
+;;; Round floating lanes toward zero.
+(defn vtrunc :inline (Always) [T N] [(value (vec T N))] (-> (vec T N))
+  (primitive/vector-trunc value))
+
+;;; Round floating lanes to nearest, with ties to even.
+(defn vround :inline (Always) [T N] [(value (vec T N))] (-> (vec T N))
+  (primitive/vector-round value))
+
+;;; Sum all lanes; integers wrap and floating addition preserves lane order.
+(defn vreduce-add :inline (Always) [T N] [(value (vec T N))] (-> T)
+  (primitive/vector-reduce-add value))
+
+;;; Bitwise OR of every lane.
+(defn vreduce-or :inline (Always) [T N] [(value (vec T N))] (-> T)
+  (primitive/vector-reduce-or value))
+
+;;; Bitwise AND of every lane.
+(defn vreduce-and :inline (Always) [T N] [(value (vec T N))] (-> T)
+  (primitive/vector-reduce-and value))
+
+;;; Bitwise XOR of every lane.
+(defn vreduce-xor :inline (Always) [T N] [(value (vec T N))] (-> T)
+  (primitive/vector-reduce-xor value))
+
+;;; Minimum of all lanes, using the lane signedness; float NaNs propagate.
+(defn vreduce-min :inline (Always) [T N] [(value (vec T N))] (-> T)
+  (primitive/vector-reduce-min value))
+
+;;; Maximum of all lanes, using the lane signedness; float NaNs propagate.
+(defn vreduce-max :inline (Always) [T N] [(value (vec T N))] (-> T)
+  (primitive/vector-reduce-max value))
+
+;;; Fused multiply-add: a*b+c with one floating-point rounding.
+(defn vfma :inline (Always) [T N] [(a (vec T N)) (b (vec T N)) (c (vec T N))] (-> (vec T N))
+  (primitive/vector-fma a b c))
+
+;;; True for NaN lanes.
+(defn visnan :inline (Always) [T N] [(value (vec T N))] (-> (vec bool N))
+  (primitive/vector-is-nan value))
+
+;;; True for finite lanes, including zero and subnormal values.
+(defn visfinite :inline (Always) [T N] [(value (vec T N))] (-> (vec bool N))
+  (primitive/vector-is-finite value))
+
+
+;;; All-zero vector. The lane type and width may be explicit, e.g. [u8 16],
+;;; or inferred from the expected result type.
+(defn vzero :inline (Always) [T N] [] (-> (vec T N))
+  (primitive/vector-zero [(vec T N)]))
+
+;;; Broadcast a scalar to every lane, e.g. (vsplat [u8 16] 32).
+(defn vsplat :inline (Always) [T N] [(value T)] (-> (vec T N))
+  (primitive/vector-splat [(vec T N)] value))
+
+;;; The statically known number of lanes. The argument is evaluated once.
+(defn vlanes :inline (Always) [T N] [(value (vec T N))] (-> i64)
+  (primitive/vector-lanes value))
+
+;;; Lane-wise addition. Integer lanes wrap; floating lanes use ordinary IEEE addition.
+(defn vadd :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-add a b))
+
+;;; Lane-wise subtraction, wrapping for integers.
+(defn vsub :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-sub a b))
+
+;;; Lane-wise multiplication, wrapping for integers.
+(defn vmul :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-mul a b))
+
+;;; Read a lane; an out-of-range dynamic index returns zero.
+(defn vextract :inline (Always) [T N] [(value (vec T N)) (lane i64)] (-> T)
+  (primitive/vector-extract value lane))
+
+;;; Replace one lane; an out-of-range dynamic index leaves the vector unchanged.
+(defn vinsert :inline (Always) [T N] [(value (vec T N)) (lane i64) (scalar T)] (-> (vec T N))
+  (primitive/vector-insert value lane scalar))
+
+;;; Select the yes lane when the corresponding logical mask lane is true.
+(defn vselect :inline (Always) [T N]
+  [(mask (vec bool N)) (yes (vec T N)) (no (vec T N))] (-> (vec T N))
+  (primitive/vector-select mask yes no))
+
+;;; Read a complete vector from any valid address. No alignment is assumed.
+;;; All N lanes must be readable; use vload-partial at an external buffer tail.
+(defn vloadu :inline (Always) [T N] [(pointer (ptr T))] (-> (vec T N))
+  (primitive/vector-load [(vec T N)] pointer))
+
+;;; Write a complete vector without requiring vector alignment.
+(defn vstoreu :inline (Always) [T N] [(pointer (ptr T)) (value (vec T N))] (-> i64)
+  (primitive/vector-store pointer value))
+
+;;; Lane-wise equality, returning logical boolean lanes. Float NaNs compare false.
+(defn v= :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec bool N))
+  (primitive/vector-eq a b))
+
+;;; Lane-wise inequality; float NaNs compare true.
+(defn v!= :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec bool N))
+  (primitive/vector-ne a b))
+
+;;; Less-than follows the lane type's signedness; float comparisons are ordered.
+(defn v< :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec bool N))
+  (primitive/vector-lt a b))
+
+;;; Less-than-or-equal follows the lane type's signedness; float NaNs compare false.
+(defn v<= :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec bool N))
+  (primitive/vector-le a b))
+
+;;; Greater-than follows the lane type's signedness; float NaNs compare false.
+(defn v> :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec bool N))
+  (primitive/vector-gt a b))
+
+;;; Greater-than-or-equal follows the lane type's signedness; float NaNs compare false.
+(defn v>= :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec bool N))
+  (primitive/vector-ge a b))
+
+;;; Integer bitwise AND, or logical AND for masks.
+(defn vand :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-and a b))
+
+;;; Integer bitwise OR, or logical OR for masks.
+(defn vor :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-or a b))
+
+;;; Integer bitwise XOR, or logical XOR for masks.
+(defn vxor :inline (Always) [T N] [(a (vec T N)) (b (vec T N))] (-> (vec T N))
+  (primitive/vector-xor a b))
+
+;;; Pack a mask of at most 64 lanes. Lane i becomes bit i; high bits are zero.
+(defn mask->bits :inline (Always) [N] [(mask (vec bool N))] (-> u64)
+  (primitive/vector-mask-bits mask))
+
+;;; `(bits->mask [N] bits)` creates N logical mask lanes from the low bits.
+;;; Bits above N are ignored; N must be in 1..64.
+(defn bits->mask [(width Code) (bits Code)] (-> Code)
+  (if (and (primitive/code-vector? width) (= (primitive/code-count width) 1))
+      `(primitive/vector-bits-mask [(vec bool ~(primitive/code-nth width 0))]
+         (primitive/cast u64 ~bits))
+      (primitive/error "bits->mask expects [lane-count] and a bitmap")))
+
+; Compatibility API for existing four-wide float programs. New code should use
+; the typed generic operations above; widths and lane types are inferred from
+; arguments or an expected result type, with no raw LLVM templates required.
 
 ; ---- construct a <4 x float> from four scalars (primitive/cast to f32) ----------------
 (defn vec4f [(x0 Code) (x1 Code) (x2 Code) (x3 Code)] (-> Code)
