@@ -444,6 +444,15 @@ checking. It migrates legacy path imports by opening the old target, reading its
 two-digit `\xHH` string and C-string escapes to `\xHH;`, and legacy `\c` character
 literals to canonical `#\c`. These fixes work even when legacy syntax prevents the
 program from compiling.
+
+Project mode (`coil lint` with no file) loads every module the package owns as
+one program rooted in those modules; there is no entry file and none is
+invented. A namespace two files declare, or a file that does not parse, is
+reported at that file and left out while the rest is still linted and fixed;
+`--fix` keeps every round that recompiled cleanly and only ever reverts the
+round that broke the build. Fixture pairs and standalone repro programs that
+live under a source root belong in the manifest's `exclude` list (paths,
+directories, or `*` patterns) so they are neither indexed nor linted.
 ⚠ `extern` declarations are NOT deduped across modules — declare each libc
 extern in ONE module and `:use *` it, or two importers colliding will fail to link.
 
