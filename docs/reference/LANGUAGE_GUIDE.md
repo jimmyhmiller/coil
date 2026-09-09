@@ -770,7 +770,8 @@ arguments and named constructor fields:
 
 The backing array is a function-frame place, so the slice is suitable for a call or
 another value that does not outlive the frame. Literals do not allocate. Empty array
-literals are currently rejected because Coil has no zero-length array type.
+literals are currently rejected because Coil has no zero-length array type. The same
+borrow is what gives an array the collection traits — see Collections below.
 
 - `(.name p)` reads a field value. It requires `p` to be a pointer/reference to a
   struct. Accessors compose like ordinary Lisp calls: `(.x (.origin rect))`.
@@ -1059,6 +1060,26 @@ traits; they are not alternate spellings to teach for a trait operation.
 | `coil.slice`: `(slice T)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Iterable` (`iter`) |
 | `coil.arraylist`: `(ArrayList T)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Push` (`push!`), `Pop` (`pop!`), `Iterable` (`iter`) |
 | `coil.hashmap`: `(HashMap K V)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Iterable` (`iter`, over keys) |
+| `(array T N)` | the `(slice T)` row, reached by borrowing (below) |
+
+A fixed `(array T N)` has no impls of its own, and cannot: array length is part of
+the type and Coil has no const generics, so `(impl [T N] Iterable (array T N))` is
+not expressible. Instead an array BORROWS as a slice wherever a slice is wanted,
+and that borrow reaches trait dispatch too — so `(len xs)`, `(get xs i)`,
+`(set! (mut xs) i v)`, `(for x (iter xs) ...)`, and the `coil.iter` adapters all
+work on an array and behave exactly as they do on `(slice T)`:
+
+    (let [xs [10 20 12]]
+      (len xs)                                   ; 3
+      (for x (iter xs) ...)                      ; the slice's SliceIter
+      (fold (primitive/fnptr-of add) 0 xs))      ; a (C (Iterable I)) bound
+
+Writes go through to the array's own storage, and the receiver still obeys the
+ordinary mutability rules: three-argument `set!` wants a `(mut Self)`, so it is
+spelled `(set! (mut xs) i v)` and rejected on an immutable binding. The array's own
+type is always tried first, so an `(impl Len (array i64 3))` written for one literal
+length still wins for that length. `(over ARR LEN)` remains available as the
+length-explicit `for` form, and `(index xs i)` remains the low-level element place.
 
 `coil.iter` provides allocation-free lazy ranges, adapters, and consumers over this
 same protocol. Adapter constructors accept any `Iterable`, mint its iterator once,

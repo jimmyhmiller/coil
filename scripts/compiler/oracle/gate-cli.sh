@@ -1146,6 +1146,12 @@ expect_rc 23 "closure values are callable and a typed code-pointer update change
 expect_rc 0 "Var forwards typed calls of several arities and observes code-pointer updates" \
   "$COIL" run tests/compiler/features/callable_var_reload.coil
 
+# A fixed array carries no impls of its own (no const generics), so every
+# collection operation on one goes through the array->slice borrow: trait
+# dispatch, `(slice T)` inference, and a bounded `(C (Iterable I))` parameter.
+expect_rc 0 "a fixed array borrows as a slice for Len/Get/Set/Iterable and coil.iter" \
+  "$COIL" run tests/compiler/features/array_collection_traits.coil
+
 echo "== store! yields unit (std-12): effect-only stores type-check without a wrapping do =="
 # was: `store!` took the STORED VALUE's type, so `(if c (coil.primitive/store! p ptr) 0)` was a type error
 # (then=(ptr i64) vs else=i64) and every non-i64 effect-only store needed `(do (coil.primitive/store! …) 0)`.
