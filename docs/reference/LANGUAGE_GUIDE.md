@@ -1617,6 +1617,31 @@ prebuilt unit's interface is written in, so an ordinary program rarely writes
 one by hand; when it does, the defining object must be linked, or the build is
 a link error rather than a function that silently returns nothing.
 
+**Prebuilt units.** A module with a concrete public surface can be compiled
+once, ahead of the programs that use it, and linked instead of recompiled.
+`coil build-unit ENTRY.coil -o DIR` writes an interface, an object, and a shared
+library into DIR; a consumer names it with `--unit DIR` on `build`, `run` or
+`check`, and reads the interface in place of the module's source. The interface
+declares the module's exports -- concrete functions as `declare`, records and
+sums as themselves, generics and macros copied as source -- so the consumer
+compiles against a handful of declarations rather than the whole dependency and
+everything behind it. A module the interface cannot express (a runtime `def`, an
+exported macro produced by another macro) is refused by name, never shipped
+narrower than its source. A rebuild into the same directory is skipped when the
+compiler, target, options and every source are unchanged.
+
+In a manifest, `engine = { path = "../engine", prebuilt = true }` under
+`[dependencies]` does this automatically: the dependency is built into
+`.coil/units/<name>` on first build and linked thereafter, recompiled only when
+it changes. A dependency that cannot be prebuilt compiles from source with a
+note. The object a unit contributes is linked only when the program actually
+imports the module, so a unit made available but unused costs nothing.
+
+The motivating case is `coil.jit`, the in-process compiler SDK: importing it
+used to compile the whole compiler (~28s of LLVM per build). An installed
+toolchain ships it as a unit, so `(import "coil.jit")` links the prebuilt
+compiler with no flag and builds in a fraction of a second.
+
 `(printf c"%d\n" 42)`. Floats cross the C ABI correctly; structs pass/return by
 value with the real C ABI. To call a Coil fn from C (e.g. `qsort` comparator) pass
 `(primitive/fnptr-of f)`. Scalar-only callbacks need no export. A callback with a

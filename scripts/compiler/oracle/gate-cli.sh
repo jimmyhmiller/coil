@@ -4178,6 +4178,59 @@ expect_out "a runtime .def." "build-unit refuses a module with runtime state, sa
 expect_out "not a prebuilt unit" "--unit on a directory that is not a unit says so" \
   "$COIL" build "$PBU/app.coil" -o "$PBU/none" --unit "$PBU/does-not-exist"
 
+# a registered unit's object is linked only when its module is imported.
+printf '(module noimp)\n(defn main [] (-> i64) 0)\n' > "$PBU/noimp.coil"
+if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
+  COIL_NAMESPACE_ROOTS="$PBU" "$COIL" build "$PBU/noimp.coil" -o "$PBU/noimp" --backend arm64 --unit "$PBU/u_llvm" >/dev/null 2>&1
+  if nm "$PBU/noimp" 2>/dev/null | grep -q 't.mathlib.add'; then
+    bad "a unit is not linked into a program that does not import it" "found t.mathlib.add in noimp"
+  else
+    ok "a unit is not linked into a program that does not import it"
+  fi
+fi
+# `prebuilt = true`: a path dependency compiled once, linked not recompiled.
+PBD="$T/prebuilt-dep"; mkdir -p "$PBD/engine/src" "$PBD/app/src"
+cat > "$PBD/engine/Coil.toml" <<'PBD_EOF'
+[package]
+name = "engine"
+entry = "src/engine.coil"
+PBD_EOF
+cat > "$PBD/engine/src/engine.coil" <<'PBD_EOF'
+(module engine)
+(import "coil.primitive" :as primitive)
+(export tick! ticks)
+(defn counter [] (-> (ptr i64)) (primitive/alloc-static i64))
+(defn tick! [] (-> i64) (let [c (counter)] (store! c (+ (load c) 1)) (load c)))
+(defn ticks [] (-> i64) (load (counter)))
+PBD_EOF
+cat > "$PBD/app/Coil.toml" <<'PBD_EOF'
+[package]
+name = "app"
+entry = "src/main.coil"
+
+[dependencies]
+engine = { path = "../engine", prebuilt = true }
+PBD_EOF
+cat > "$PBD/app/src/main.coil" <<'PBD_EOF'
+(module app)
+(import "engine" :use *)
+(defn main [] (-> i64) (tick!) (tick!) (if (= (ticks) 2) 0 1))
+PBD_EOF
+PBD_BF=""; [ "$HOST_OS" = Darwin ] && PBD_BF="--backend arm64"
+if (cd "$PBD/app" && "$COIL" build src/main.coil -o app $PBD_BF >/dev/null 2>&1); then
+  [ -f "$PBD/app/.coil/units/engine/unit.o" ]     && ok "prebuilt = true builds the dependency into .coil/units"     || bad "prebuilt = true builds into .coil/units" "no unit object under .coil/units/engine"
+  expect_rc 0 "a program with a prebuilt dependency runs" "$PBD/app/app"
+  # the app object references the dependency, it does not recompile it
+  (cd "$PBD/app" && "$COIL" emit-obj src/main.coil -o app.o $PBD_BF >/dev/null 2>&1)
+  if nm "$PBD/app/app.o" 2>/dev/null | grep -qE '^ *U _?engine.tick!'; then
+    ok "a prebuilt dependency is referenced (U), not recompiled, by its consumer"
+  else
+    bad "a prebuilt dependency is referenced by its consumer" "engine.tick! is not an undefined symbol in the app object"
+  fi
+else
+  bad "prebuilt = true end to end" "the app with a prebuilt dependency did not build"
+fi
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL
