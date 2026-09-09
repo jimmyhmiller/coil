@@ -575,6 +575,13 @@ def test_modernize_fast(compiler: str) -> None:
             if "alloca " in main_ir.split("loop.body:", 1)[1]:
                 raise RuntimeError("fast modernization gate: aggregate loop contains a dynamic alloca")
 
+        def typed_narrow_integer_consts_task() -> None:
+            source = "tests/compiler/features/typed_narrow_integer_consts.coil"
+            # The reported failure was invalid LLVM: the checked u8 value was
+            # emitted as an i64 operand. Exercise LLVM explicitly even on arm64
+            # hosts, where the ordinary focused fixtures prefer the native backend.
+            build_run(source, "typed-narrow-integer-consts")
+
         def alloc_static_initial_task() -> None:
             source = "tests/compiler/features/alloc_static_initial.coil"
             build_run(source, "alloc-static-initial")
@@ -1110,6 +1117,7 @@ source-roots = ["src"]
         ]
         if has_llvm:
             tasks.extend((aggregate_ir_task, alloc_static_initial_task, alias_memory_task,
+                          typed_narrow_integer_consts_task,
                           lambda: build_run("tests/compiler/features/linker_address_native.coil",
                                             "linker-address-native")))
         else:
