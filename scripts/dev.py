@@ -210,7 +210,36 @@ def install(args: argparse.Namespace) -> None:
             check=False,
         )
     print(f"installed {source} -> {destination}")
+    warm_jit_unit(destination, libdir)
     report_installed(destination)
+
+
+def warm_jit_unit(compiler: Path, libdir: Path) -> None:
+    """Prebuild coil.compiler.jit_api as a unit beside the library.
+
+    A program that imports coil.jit links the in-process compiler. Compiled from
+    source that is ~28s of LLVM per build; against this unit it is a fraction of a
+    second. The loader discovers `<lib>/coil/units/coil.compiler.jit_api` in an
+    installed layout and reads its interface in place of the SDK's source, so the
+    win needs no flag. Built with the compiler and sources just installed, so its
+    content key matches; best-effort, since a toolchain without it still works by
+    compiling from source.
+    """
+    entry = libdir / "compiler" / "jit_api.coil"
+    if not entry.is_file():
+        return
+    out = libdir / "units" / "coil.compiler.jit_api"
+    out.mkdir(parents=True, exist_ok=True)
+    backend = ["--backend", "arm64"] if platform.machine() in ("arm64", "aarch64") else []
+    result = subprocess.run(
+        [str(compiler), "build-unit", str(entry), "-o", str(out), *backend],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print(f"warmed coil.jit unit -> {out}")
+    else:
+        print("note: could not warm the coil.jit unit; coil.jit programs will compile it from source")
+        shutil.rmtree(out, ignore_errors=True)
 
 
 def report_installed(destination: Path) -> None:
