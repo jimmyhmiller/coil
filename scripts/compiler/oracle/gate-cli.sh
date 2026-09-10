@@ -536,6 +536,10 @@ printf '[package]\nname = "git-dep"\nentry = "src/main.coil"\n\n[dependencies]\n
 [ "$(find "$T/git-dep/.coil/deps" -mindepth 1 -maxdepth 1 -type d -name "*-$dep_sha" | wc -l | tr -d ' ')" = 1 ] \
   && ok "Git dependency is cached by repository and SHA" \
   || bad "Git dependency cache" "missing pinned checkout"
+out=$( cd "$T/git-dep" && "$COIL" run 2>&1 ); rc=$?
+[ "$rc" = 42 ] && [ -z "$out" ] \
+  && ok "a cached Git dependency does not repeat checkout output" \
+  || bad "quiet cached Git dependency" "want rc=42 and no output, got rc=$rc: $out"
 
 # A Git subdir is a package boundary: consume its Coil.toml roots, module map,
 # exclusions, transitive Coil dependency, and native flags. Two aliases selecting
