@@ -11,7 +11,8 @@ over a small compiler-owned set of forms.
 2. Their compiler-owned counterparts are `let*`, `fn*`, and `defn*`.
 3. Square brackets destructure sequences. Constructor-shaped patterns select
    named struct fields: `(Point :x x :y y)`.
-4. One recursive pattern elaborator serves all three macros and method bodies.
+4. One recursive pattern elaborator serves all three macros, method bodies, closure
+   generators, and sum-match payloads.
 5. Public `let` remains sequential. This does not introduce parallel Lisp `let`
    semantics or change existing simple binding behavior.
 6. Keep Coil's existing typed function headers, return annotations, generics,
@@ -173,6 +174,27 @@ variadic. Existing outer `&` for variadic Code macros remains unchanged.
 
 For simple struct selections, keeping a named parameter and destructuring in a
 body `let` is equally valid and can be easier to read than a dense signature.
+
+### 2.6 Sum-match payloads
+
+Variant payload vectors accept the same recursive patterns. Variant dispatch and
+exhaustiveness remain compiler-owned; after a variant is selected, an arm-local
+primitive binding prologue materializes and projects structured payload fields:
+
+```clojure
+(defsum Event
+  (Pair [(values (slice i64))])
+  (Located [(point Point)]))
+
+(match event
+  (Pair [[left right & rest]] (+ left (+ right (len rest))))
+  (Located [(Point :x x :y y)] (+ x y)))
+```
+
+Each entry in the arm vector corresponds to one variant payload field. An inner
+pattern is required destructuring once its variant has matched; failure does not
+backtrack to another arm. General fallible patterns over literals and ordinary
+struct scrutinees remain a separate pattern-matching feature.
 
 ## 3. Primitive language and library organization
 

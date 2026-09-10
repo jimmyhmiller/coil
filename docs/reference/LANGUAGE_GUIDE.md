@@ -863,6 +863,23 @@ cast pointers — the header is at offset 0, so `(primitive/cast (ptr Sub) hdrpt
       (VBool [b] …) (VNil [] …) (VNumber [n] …) (VObj [o] …))   ; must be exhaustive
     (Some 42)  (None)  (VNumber 1.5)             ; construct
 
+A variant payload accepts the same recursive binding patterns as `let` and
+function parameters. The variant still selects the arm; its payload patterns
+then destructure the selected fields. Each payload field remains one argument:
+
+    (defstruct Point [(x i64) (y i64)])
+    (defsum Event (Pair [(values (slice i64))]) (Located [(point Point)]))
+
+    (match event
+      (Pair [[left right & rest]] (+ left (+ right (len rest))))
+      (Located [(Point :x x :y y)] (+ x y)))
+
+Sequence `_`, `&`, and `:as`, constructor field selection, nesting, and
+`(as whole pattern)` retain their ordinary binding meanings. A payload pattern
+is required after its variant has matched; it does not cause dispatch to continue
+to another arm when an inner shape is too short. `match` still dispatches on sum
+variants rather than arbitrary literals or ordinary struct values.
+
 `match` must be exhaustive, and `(_ body…)` is the catch-all that makes it so —
 it covers every variant the explicit arms left out:
 
