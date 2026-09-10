@@ -35,30 +35,9 @@ def build(args: argparse.Namespace) -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
         if Path(compiler).resolve() == output.resolve():
             raise SystemExit("candidate output must not overwrite the stage0 compiler")
-        # A compiler normally loads compiler support modules beside its own
-        # executable. Stage the existing binary in a temporary toolchain layout
-        # pointing at this checkout, or an installed stage0 would quietly compile
-        # its installed copy of rules.coil/driver.coil instead of the edits here.
-        build_root = ROOT / "build"
-        build_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=".coil-candidate-stage0-", dir=build_root) as raw:
-            prefix = Path(raw)
-            staged = prefix / "bin" / "coil"
-            staged.parent.mkdir(parents=True)
-            shutil.copy2(compiler, staged)
-            library = prefix / "lib" / "coil"
-            library.mkdir(parents=True)
-            (library / "stdlib").symlink_to(ROOT / "src" / "stdlib", target_is_directory=True)
-            (library / "compiler").symlink_to(ROOT / "src" / "compiler", target_is_directory=True)
-            (library / "prelude.coil").symlink_to(ROOT / "src" / "compiler" / "prelude.coil")
-            bootstrap_env = os.environ.copy()
-            # Stage 0 predates package namespace exclusions and therefore cannot
-            # interpret this checkout's root workspace yet. Build the first
-            # candidate through the direct compiler source root; that candidate
-            # is what verifies the workspace configuration below.
-            bootstrap_env["COIL_NAMESPACE_ROOTS"] = str(ROOT / "src" / "compiler")
-            execute(str(staged), "build", "src/compiler/main.coil", "-o", str(output),
-                    *llvm_flags("dynamic"), env=bootstrap_env)
+        execute(sys.executable, str(ROOT / "scripts/compiler/stage0.py"), compiler,
+                "build", str(ROOT / "src/compiler/main.coil"), "-o", str(output),
+                *llvm_flags("dynamic"))
         print(f"built compiler candidate -> {output}")
         return
 
@@ -325,7 +304,7 @@ def test(args: argparse.Namespace) -> None:
     elif args.suite == "generated":
         for name in ("digest", "artifact-wire", "codegen-session", "extern-aliases",
                      "dynamic-stack", "union-hfa", "c-aggregate-bounded-read", "sparse-static", "oracle-corpus",
-                     "provider-artifacts", "generated-modules"):
+                     "provider-artifacts", "generated-modules", "binding_macros"):
             execute(sys.executable, f"scripts/tests/{name}.py", compiler)
     elif args.suite == "runtime":
         execute(sys.executable, "scripts/oracle.py", "runtime", "gate", "arm64", "--compiler", compiler)

@@ -49,7 +49,7 @@ long data __asm__("alias.data$1") = 20;
     stage_source = work / "stage.coil"
     stage_source.write_text('(module alias.stage) (import "coil.core" :use []) '
         '(extern operation :as "alias.function$1" :cc c [i64] (-> i64)) '
-        '(defn main [] (-> i64) (operation 42))')
+        '(defn* main [] (-> i64) (operation 42))')
     # dump-resolved currently fails even on refer_no_core.coil with the installed
     # compiler; it parses loaded core macros before expansion (coil-bugs).
     for stage in ["dump-load", "dump-checked", "dump-mono"]:
