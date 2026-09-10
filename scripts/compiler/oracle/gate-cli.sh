@@ -4138,15 +4138,21 @@ cat > "$PBU/mathlib.coil" <<'PBU_EOF'
 
 (import "coil.alloc" :use *)
 
-(export Point add combine bump! count ident slot lib-slot-bump!)
+(export Point Vec2 add combine make-vec bump! count ident slot lib-slot-bump!)
 
 (defstruct Point [(x i64) (y i64)])
+
+(defstruct Vec2 :layout explicit :size 8 :align 4
+  [(x f32 :at 0) (y f32 :at 4)])
 
 (defn add [(x i64) (y i64)] (-> i64)
   (+ x y))
 
 (defn combine [(p Point)] (-> i64)
   (* (.x p) (.y p)))
+
+(defn make-vec [] (-> Vec2)
+  (Vec2 :x 123.0 :y 77.0))
 
 (defn counter [] (-> (ptr i64))
   (primitive/alloc-static i64))
@@ -4179,7 +4185,11 @@ cat > "$PBU/app.coil" <<'PBU_EOF'
   (if (and (= (add 40 2) 42)
            (and (= (combine (Point :x 40 :y 2)) 80)
                 (and (= (count) 2)
-                     (and (= (ident [i64] 42) 42) (= (lib-slot-bump!) 21)))))
+                     (and (= (ident [i64] 42) 42)
+                          (and (= (lib-slot-bump!) 21)
+                               (let [v (make-vec)]
+                                 (and (= (cast i64 (.x v)) 123)
+                                      (= (cast i64 (.y v)) 77))))))))
       0
       1))
 PBU_EOF

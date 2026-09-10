@@ -1032,8 +1032,9 @@ source-roots = ["src"]
   (if (>= i n) 0
       (do (bad-walk (primitive/code-nth ms i))
           (bad-modules ms (primitive/iadd i 1) n))))
-(defn lint-bad [(modules Code)] (-> i64)
-  (bad-modules modules 0 (primitive/code-count modules)))
+(defn lint-bad [(modules Code)] (-> Code)
+  (bad-modules modules 0 (primitive/code-count modules))
+  modules)
 (checker lint-bad)
 """)
             for file_index in range(7):
