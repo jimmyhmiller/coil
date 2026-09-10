@@ -331,6 +331,8 @@ def test(args: argparse.Namespace) -> None:
     elif args.suite == "interpreter":
         execute(sys.executable, "scripts/oracle.py", "interpreter", "live", "--compiler", compiler,
                 *(["--verbose"] if args.verbose else []))
+    elif args.suite == "simd":
+        execute(sys.executable, "tests/compiler/simd_test.py", "--compiler", compiler, "--differential")
     elif args.suite == "modernize-fast":
         execute(sys.executable, "tests/compiler/features/transparent_arc_source_guard.py")
         execute(sys.executable, "tests/compiler/features/authored_gensym_source_guard.py")
@@ -1379,7 +1381,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.set_defaults(func=test)
