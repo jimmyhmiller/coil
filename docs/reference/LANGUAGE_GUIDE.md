@@ -266,11 +266,13 @@ full 40- or 64-digit commit ID. Tags and branches are resolved to a concrete com
 at the start of each invocation, so they intentionally follow repository updates.
 An optional `subdir` selects a package inside the checkout. It must be
 repository-relative, may not contain an escaping `..`
-component, and must name a directory containing `Coil.toml`. Coil treats that manifest
-as the dependency boundary: its source roots, exclusions, module/reader mappings,
-transitive dependencies, native dependencies, C inputs, and link inputs compose into
-the root build. Repository-relative native paths remain relative to the selected
-package. Checkouts are cached by repository and SHA, so dependencies selecting several
+component, and must name a directory containing `Coil.toml`. Every dependency whose
+directory holds a `Coil.toml` -- a path dependency, a Git checkout, or a selected
+subdirectory -- is a package boundary: its source roots (the package directory itself
+when it has no `src/`, `tests/` or declared roots), exclusions, module/reader
+mappings, transitive dependencies, native dependencies, C inputs, and link inputs
+compose into the root build. A package reached more than once, through a diamond or a
+cycle, is composed once. Package-relative native paths stay relative to their package. Checkouts are cached by repository and SHA, so dependencies selecting several
 subpackages at the same pin share one checkout. The string shorthand
 `local_math = "../local-math"` is equivalent to `{ path = "../local-math" }`.
 
