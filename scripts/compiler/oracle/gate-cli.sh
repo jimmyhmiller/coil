@@ -3815,6 +3815,16 @@ if { [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; } \
   mkdir -p "$T/jit-sdk"
   python3 scripts/dev.py install --source "$COIL" --dest "$T/jit-prefix/bin/coil" >/dev/null 2>&1
   INSTALLED="$T/jit-prefix/bin/coil"
+  JIT_UNITS="$T/jit-prefix/lib/coil/units"
+  # One coil.jit unit per backend, each emitted by that backend: install warms
+  # the default (LLVM) one. The earlier single unit -- an arm64 object linked
+  # into LLVM programs, where the backends' calling conventions disagree -- is gone.
+  [ -f "$JIT_UNITS/llvm/coil.compiler.jit_api/unit.o" ] \
+    && ok "install warms the coil.jit unit for the default (LLVM) backend" \
+    || bad "install warms the LLVM coil.jit unit" "no $JIT_UNITS/llvm/coil.compiler.jit_api/unit.o"
+  [ ! -e "$JIT_UNITS/coil.compiler.jit_api" ] \
+    && ok "install leaves no backend-less coil.jit unit" \
+    || bad "install leaves no backend-less coil.jit unit" "$JIT_UNITS/coil.compiler.jit_api exists"
   cp src/examples/jit_sdk.coil "$T/jit-sdk/main.coil"
   if [ "$HOST_OS" = Darwin ]; then
     JIT_BUILD_ARGS=(--backend arm64)
@@ -3844,12 +3854,42 @@ EOF
       *repl-session-new*) ok "coil.jit import links the compiler SDK" ;;
       *) bad "coil.jit import links the compiler SDK" "missing SDK symbol" ;;
     esac
+    if [ "$HOST_OS" = Darwin ]; then
+      # The arm64 build above was the first by that backend: it built the arm64
+      # unit on demand (install only warms LLVM's) and linked it.
+      ARM_UNIT="$JIT_UNITS/arm64/coil.compiler.jit_api"
+      case "$(cat "$ARM_UNIT/unit.key" 2>/dev/null)" in
+        *"backend arm64"*) ok "the first arm64 coil.jit build builds the arm64 unit on demand" ;;
+        *) bad "the first arm64 coil.jit build builds the arm64 unit on demand" "no arm64 unit key under $ARM_UNIT" ;;
+      esac
+      before=$(stat -f %i "$ARM_UNIT/unit.o" 2>/dev/null)
+      (cd "$T/jit-sdk" && "$INSTALLED" build main.coil --backend arm64 -o app2 >/dev/null 2>&1)
+      after=$(stat -f %i "$ARM_UNIT/unit.o" 2>/dev/null)
+      [ -n "$before" ] && [ "$before" = "$after" ] \
+        && ok "a later arm64 coil.jit build reuses the arm64 unit" \
+        || bad "a later arm64 coil.jit build reuses the arm64 unit" "unit.o was replaced (inode $before -> $after)"
+      # The default build is LLVM: it links the LLVM unit, emitted by its own backend.
+      if (cd "$T/jit-sdk" && "$INSTALLED" build main.coil -o app-llvm >/dev/null 2>&1); then
+        llvm_out=$(cd "$T/jit-sdk" && PATH="$T/no-cc:$T/jit-prefix/bin:$PATH" ./app-llvm 2>&1)
+        case "$llvm_out" in
+          *$'20\n'*$'30\n'*) ok "an LLVM coil.jit program links the LLVM unit and hot reloads" ;;
+          *) bad "an LLVM coil.jit program links the LLVM unit and hot reloads" "$llvm_out" ;;
+        esac
+      else
+        bad "an LLVM coil.jit program builds from the installed toolchain" "build failed"
+      fi
+    fi
   else
     bad "coil.jit userland application builds from the installed toolchain" "build failed"
   fi
   printf '(module plain)\n(defn main [] (-> i64) 0)\n' > "$T/jit-sdk/plain.coil"
   if [ "$HOST_OS" = Darwin ]; then
+    # A backend's unit is built only when a program actually imports coil.jit.
+    rm -rf "$JIT_UNITS/arm64"
     (cd "$T/jit-sdk" && "$INSTALLED" emit-obj plain.coil --backend arm64 -o plain.o >/dev/null 2>&1)
+    [ ! -e "$JIT_UNITS/arm64" ] \
+      && ok "a program that does not import coil.jit builds no coil.jit unit" \
+      || bad "a program that does not import coil.jit builds no coil.jit unit" "$JIT_UNITS/arm64 was created"
   else
     (cd "$T/jit-sdk" && "$INSTALLED" emit-obj plain.coil -o plain.o >/dev/null 2>&1)
   fi
@@ -4142,7 +4182,10 @@ cat > "$PBU/mathlib.coil" <<'PBU_EOF'
 
 (import "coil.alloc" :use *)
 
-(export Point Vec2 add combine make-vec bump! count ident slot lib-slot-bump!)
+(import "coil.slice" :use [slice-len])
+
+(export Point Vec2 add combine make-vec bump! count ident slot lib-slot-bump!
+        straddle Big mk-big big-total)
 
 (defstruct Point [(x i64) (y i64)])
 
@@ -4175,6 +4218,24 @@ cat > "$PBU/mathlib.coil" <<'PBU_EOF'
 
 (defn lib-slot-bump! [] (-> i64)
   (let [s (slot [i64])] (store! s (+ (load s) 10)) (load s)))
+
+; Aggregate arguments whose passing differs between Coil's backends: the fifth
+; argument is a slice straddling the last integer argument register, and Big is a
+; 32-byte sum passed and returned by value. Each crashes or reads garbage when a
+; unit and its consumer come from different backends.
+(defn straddle [(n i64) (s1 (slice u8)) (s2 (slice u8)) (s3 (slice u8))
+                (s4 (slice u8))] (-> i64)
+  (+ n (+ (slice-len s1) (+ (slice-len s2) (+ (slice-len s3) (* 100 (slice-len s4)))))))
+
+(defsum Big (BigV [(x i64) (y i64) (z i64)]) (BigNone))
+
+(defn mk-big [(x i64)] (-> Big)
+  (BigV x (+ x 1) (+ x 2)))
+
+(defn big-total [(b Big) (t i64)] (-> i64)
+  (match b
+    (BigV [x y z] (+ (+ x (* 10 y)) (+ (* 100 z) t)))
+    (BigNone [] -1)))
 PBU_EOF
 cat > "$PBU/app.coil" <<'PBU_EOF'
 (module t.app)
@@ -4186,16 +4247,19 @@ cat > "$PBU/app.coil" <<'PBU_EOF'
   (bump!)
   (lib-slot-bump!)
   (store! (slot [i64]) (+ (load (slot [i64])) 1))
-  (if (and (= (add 40 2) 42)
-           (and (= (combine (Point :x 40 :y 2)) 80)
-                (and (= (count) 2)
-                     (and (= (ident [i64] 42) 42)
-                          (and (= (lib-slot-bump!) 21)
-                               (let [v (make-vec)]
-                                 (and (= (cast i64 (.x v)) 123)
-                                      (= (cast i64 (.y v)) 77))))))))
-      0
-      1))
+  (if (or (!= (straddle 1 "ab" "cde" "f" "ghij") 407)
+          (!= (big-total (mk-big 1) 5) 326))
+      2
+      (if (and (= (add 40 2) 42)
+               (and (= (combine (Point :x 40 :y 2)) 80)
+                    (and (= (count) 2)
+                         (and (= (ident [i64] 42) 42)
+                              (and (= (lib-slot-bump!) 21)
+                                   (let [v (make-vec)]
+                                     (and (= (cast i64 (.x v)) 123)
+                                          (= (cast i64 (.y v)) 77))))))))
+          0
+          1)))
 PBU_EOF
 UNIT_BACKENDS="llvm"
 if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then UNIT_BACKENDS="llvm arm64"; fi
@@ -4213,12 +4277,26 @@ for PB in $UNIT_BACKENDS; do
   # a copied generic imports the module's own imports; a pure-declaration interface
   # would not. mathlib has generics, so it copies source and keeps coil.primitive.
   # The consumer links the object and runs; state and generic statics behave.
+  case "$(cat "$PBU/u_$PB/unit.key" 2>/dev/null)" in
+    *"backend $PB"*) ok "build-unit ($PB) records its backend in the unit key" ;;
+    *) bad "build-unit ($PB) records its backend" "no 'backend $PB' line in unit.key" ;;
+  esac
   for CB in $UNIT_BACKENDS; do
     CF=""; [ "$CB" = arm64 ] && CF="--backend arm64"
-    if COIL_NAMESPACE_ROOTS="$PBU" "$COIL" build "$PBU/app.coil" -o "$PBU/app_${PB}_$CB" $CF --unit "$PBU/u_$PB" >/dev/null 2>&1; then
-      expect_rc 0 "a $CB consumer links a $PB unit; state and generic statics behave" "$PBU/app_${PB}_$CB"
+    if [ "$CB" = "$PB" ]; then
+      if COIL_NAMESPACE_ROOTS="$PBU" "$COIL" build "$PBU/app.coil" -o "$PBU/app_${PB}_$CB" $CF --unit "$PBU/u_$PB" >/dev/null 2>&1; then
+        expect_rc 0 "a $CB consumer links a $PB unit; state, generic statics and aggregate arguments behave" "$PBU/app_${PB}_$CB"
+      else
+        bad "a $CB consumer links a $PB unit" "consumer build failed"
+      fi
     else
-      bad "a $CB consumer links a $PB unit" "consumer build failed"
+      # A unit's object follows the calling convention of the backend that
+      # emitted it, and the backends do not share one for every aggregate (the
+      # straddling slice and the 32-byte sum in mathlib crash across them). So
+      # another backend's unit is refused, with the reason and the fix.
+      expect_out "built with the $PB backend" \
+        "a $CB build refuses a unit built by the $PB backend, saying why" \
+        env COIL_NAMESPACE_ROOTS="$PBU" "$COIL" build "$PBU/app.coil" -o "$PBU/app_${PB}_$CB" $CF --unit "$PBU/u_$PB"
     fi
   done
 done
@@ -4237,11 +4315,19 @@ expect_out "not a prebuilt unit" "--unit on a directory that is not a unit says 
 # a registered unit's object is linked only when its module is imported.
 printf '(module noimp)\n(defn main [] (-> i64) 0)\n' > "$PBU/noimp.coil"
 if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
-  COIL_NAMESPACE_ROOTS="$PBU" "$COIL" build "$PBU/noimp.coil" -o "$PBU/noimp" --backend arm64 --unit "$PBU/u_llvm" >/dev/null 2>&1
-  if nm "$PBU/noimp" 2>/dev/null | grep -q 't.mathlib.add'; then
-    bad "a unit is not linked into a program that does not import it" "found t.mathlib.add in noimp"
+  # The unit must match the build's backend (a mismatched one is refused and
+  # there would be no binary to inspect), and the build must succeed before the
+  # symbol's absence means anything.
+  rm -f "$PBU/noimp"
+  if COIL_NAMESPACE_ROOTS="$PBU" "$COIL" build "$PBU/noimp.coil" -o "$PBU/noimp" --backend arm64 --unit "$PBU/u_arm64" >/dev/null 2>&1 \
+     && [ -x "$PBU/noimp" ]; then
+    noimp_syms=$(nm "$PBU/noimp" 2>/dev/null)
+    case "$noimp_syms" in
+      *t.mathlib.add*) bad "a unit is not linked into a program that does not import it" "found t.mathlib.add in noimp" ;;
+      *) ok "a unit is not linked into a program that does not import it" ;;
+    esac
   else
-    ok "a unit is not linked into a program that does not import it"
+    bad "a unit is not linked into a program that does not import it" "the program without the import did not build"
   fi
 fi
 # `prebuilt = true`: a path dependency compiled once, linked not recompiled.
@@ -4272,10 +4358,30 @@ cat > "$PBD/app/src/main.coil" <<'PBD_EOF'
 (import "engine" :use *)
 (defn main [] (-> i64) (tick!) (tick!) (if (= (ticks) 2) 0 1))
 PBD_EOF
-PBD_BF=""; [ "$HOST_OS" = Darwin ] && PBD_BF="--backend arm64"
+PBD_BF=""; PBD_BK=llvm
+[ "$HOST_OS" = Darwin ] && { PBD_BF="--backend arm64"; PBD_BK=arm64; }
 if (cd "$PBD/app" && "$COIL" build src/main.coil -o app $PBD_BF >/dev/null 2>&1); then
-  [ -f "$PBD/app/.coil/units/engine/unit.o" ]     && ok "prebuilt = true builds the dependency into .coil/units"     || bad "prebuilt = true builds into .coil/units" "no unit object under .coil/units/engine"
+  # The unit is built by the CONSUMER's backend, into a per-backend directory:
+  # an object from one backend is never linked into a build by another.
+  [ -f "$PBD/app/.coil/units/$PBD_BK/engine/unit.o" ] \
+    && ok "prebuilt = true builds the dependency into .coil/units/<backend> with the consumer's backend" \
+    || bad "prebuilt = true builds into .coil/units/$PBD_BK" "no unit object under .coil/units/$PBD_BK/engine"
+  case "$(cat "$PBD/app/.coil/units/$PBD_BK/engine/unit.key" 2>/dev/null)" in
+    *"backend $PBD_BK"*) ok "a prebuilt dependency's key records the backend that built it" ;;
+    *) bad "a prebuilt dependency's key records its backend" "no 'backend $PBD_BK' line in unit.key" ;;
+  esac
   expect_rc 0 "a program with a prebuilt dependency runs" "$PBD/app/app"
+  if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
+    # The same project built by the other backend gets its own unit.
+    if (cd "$PBD/app" && "$COIL" build src/main.coil -o app-llvm >/dev/null 2>&1); then
+      [ -f "$PBD/app/.coil/units/llvm/engine/unit.o" ] \
+        && ok "an LLVM build of the same project builds its own LLVM unit" \
+        || bad "an LLVM build of the same project builds its own unit" "no unit under .coil/units/llvm/engine"
+      expect_rc 0 "the LLVM build with a prebuilt dependency runs" "$PBD/app/app-llvm"
+    else
+      bad "an LLVM build of a project with a prebuilt dependency" "build failed"
+    fi
+  fi
   # the app object references the dependency, it does not recompile it
   (cd "$PBD/app" && "$COIL" emit-obj src/main.coil -o app.o $PBD_BF >/dev/null 2>&1)
   if nm "$PBD/app/app.o" 2>/dev/null | grep -qE '^ *U _?engine.tick!'; then
