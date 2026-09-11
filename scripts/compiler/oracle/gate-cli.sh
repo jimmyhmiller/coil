@@ -518,6 +518,55 @@ printf '(module pdcyc)\n(import "cyca" :use *)\n(import "cycb" :use *)\n(defn ma
   && ok "a cycle between path dependencies terminates, each package composed once" \
   || bad "path dependency cycle" "want rc=42"
 
+# A before-expand transform may remove declarations plain Coil rejects. The
+# metaprogram engine's own closure check runs before it, over a tolerant parse
+# that skips a struct that does not parse; a struct naming the skipped one must
+# not fail that check either. Without the transform, the struct that does not
+# parse is reported at its own field, not as an unknown type in its dependent.
+mkdir -p "$T/mc-meta" "$T/mc-app"
+printf '[package]\nname = "mc-meta"\n' > "$T/mc-meta/Coil.toml"
+cat > "$T/mc-meta/drop.coil" <<'EOF'
+(module mcdrop)
+(import "coil.primitive" :as primitive)
+(export mc-drop)
+
+(defn mc-struct? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (and (> (primitive/code-count f) 0)
+            (and (primitive/code-from-user? f)
+                 (and (primitive/code-sym? (primitive/code-nth f 0))
+                      (= (primitive/code-str (primitive/code-nth f 0)) "defstruct"))))))
+
+(defn mc-record [(m Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (primitive/code-list-push! out (primitive/code-nth m 0))
+    (for [k 1 (primitive/code-count m)]
+      (let [f (primitive/code-nth m k)]
+        (when (not (mc-struct? f)) (primitive/code-list-push! out f) 0)
+        0))
+    (primitive/code-list-done out)))
+
+(defn mc-drop [(prog Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count prog)]
+      (primitive/code-list-push! out (mc-record (primitive/code-nth prog i)))
+      0)
+    `(do ~@(primitive/code-list-done out))))
+
+(transform mc-drop :phase before-expand)
+EOF
+printf '[package]\nname = "mc-app"\nentry = "main.coil"\n\n[dependencies]\nmeta = { path = "../mc-meta" }\n\n[metaprograms]\nuse = ["mcdrop"]\n' > "$T/mc-app/Coil.toml"
+printf '(module mcapp)\n(defstruct Inner [(x i64) (hue i64 20)])\n(defstruct Outer [(a Inner)])\n(defn main [] (-> i64) 42)\n' > "$T/mc-app/main.coil"
+( cd "$T/mc-app" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "a before-expand transform can remove structs the engine's tolerant parse skipped" \
+  || bad "transform removes unparseable structs" "want rc=42: $( cd "$T/mc-app" && "$COIL" run 2>&1 | head -5 )"
+printf '(module mcplain)\n(defstruct Inner [(x i64) (hue i64 20)])\n(defstruct Outer [(a Inner)])\n(defn main [] (-> i64) 0)\n' > "$T/mc-plain.coil"
+expect_rc 1 "a struct that does not parse fails the check" "$COIL" check "$T/mc-plain.coil"
+expect_out "mc-plain.coil:2:[0-9]+" "a struct that does not parse is reported at its own field" \
+  "$COIL" check "$T/mc-plain.coil"
+expect_out "unknown field option 20" "the real parse error is shown, not an unknown type in a dependent" \
+  "$COIL" check "$T/mc-plain.coil"
+
 # The root manifest can replace the entire ambient library universe. The selected
 # prelude is an ordinary dependency module: it is indexed through the declared
 # dependency root, auto-referred in every loaded module, and gets no bundled-path
