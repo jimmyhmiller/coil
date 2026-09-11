@@ -42,15 +42,36 @@
             (and (= (load (field a bytes)) (load (field b bytes)))
                  (= (load (field a align)) (load (field b align)))))))
 
+;;; murmur3's fmix64 finalizer over the address. Heap addresses share their high
+;;; bits and are strided by size class in the low ones, and linear probing punishes
+;;; any structure that survives into the masked bits: a single xor-shift left
+;;; clusters thousands of slots long at 40% load. Every address bit must reach every
+;;; slot bit. Shifts are on u64 so they lower to logical shifts.
 (defn region-hash [(data (ptr i8))] (-> i64)
-  ;; Allocation alignment leaves the low bits uninteresting. Mix the address before
-  ;; masking so sequential allocations do not form long clusters.
-  (let [x (primitive/udiv (primitive/cast i64 data) 8)]
-    (primitive/ixor x (primitive/ishr x 17))))
+  (let [k0 (primitive/cast u64 (primitive/cast i64 data))
+        k1
+          (primitive/imul (primitive/ixor k0
+                                          (primitive/ishr k0
+                                                          (primitive/cast u64
+                                                                          33)))
+                          (primitive/cast u64 -49064778989728563))
+        k2
+          (primitive/imul (primitive/ixor k1
+                                          (primitive/ishr k1
+                                                          (primitive/cast u64
+                                                                          33)))
+                          (primitive/cast u64 -4265267296055464877))]
+    (primitive/cast i64
+                    (primitive/ixor k2
+                                    (primitive/ishr k2
+                                                    (primitive/cast u64 33))))))
+
+(defn region-registry-home [(cap i64) (data (ptr i8))] (-> i64)
+  (primitive/iand (region-hash data) (primitive/isub cap 1)))
 
 (defn region-registry-slot [(region (ptr Region)) (data (ptr i8))] (-> i64)
   (let [cap (load (field region registry-cap))
-        (mut i) (primitive/iand (region-hash data) (primitive/isub cap 1))]
+        (mut i) (region-registry-home cap data)]
     (block :found
            (loop (store! (field region ownership-probes)
                          (primitive/iadd (load (field region ownership-probes))
@@ -72,18 +93,25 @@
       (load (primitive/index (load (field region registry))
                              (region-registry-slot region data)))))
 
+(defn region-count-probes! [(region (ptr Region)) (n i64)] (-> i64)
+  (store! (field region ownership-probes)
+          (primitive/iadd (load (field region ownership-probes)) n))
+  0)
+
+;;; Returns the number of slots inspected.
 (defn region-registry-insert-raw! [(slots (ptr (ptr RegionNode)))
                                    (cap i64)
                                    (node (ptr RegionNode))] (-> i64)
-  (let [(mut i)
-          (primitive/iand (region-hash (load (field node data)))
-                          (primitive/isub cap 1))]
+  (let [(mut i) (region-registry-home cap (load (field node data)))
+        (mut probes) 1]
     (loop (if (= (primitive/cast i64 (load (primitive/index slots (load i)))) 0)
               (do (store! (primitive/index slots (load i)) node) (break))
-              (store! i
-                      (primitive/iand (primitive/iadd (load i) 1)
-                                      (primitive/isub cap 1)))))
-    0))
+              (do
+                (store! i
+                        (primitive/iand (primitive/iadd (load i) 1)
+                                        (primitive/isub cap 1)))
+                (store! probes (primitive/iadd (load probes) 1)))))
+    (load probes)))
 
 (defn region-registry-rehash! [(region (ptr Region))
                                (slots (ptr (ptr RegionNode)))
@@ -92,7 +120,10 @@
     (loop (if (= (primitive/cast i64 (load node)) 0)
               (break)
               (do
-                (region-registry-insert-raw! slots cap (load node))
+                (region-count-probes! region
+                                      (region-registry-insert-raw! slots
+                                                                   cap
+                                                                   (load node)))
                 (store! node (load (field (load node) next))))))
     0))
 
@@ -147,31 +178,54 @@
                     true)))))))
 
 (defn region-registry-insert! [(region (ptr Region)) (node (ptr RegionNode))] (-> i64)
-  (region-registry-insert-raw! (load (field region registry))
-                               (load (field region registry-cap))
-                               node)
+  (region-count-probes! region
+                        (region-registry-insert-raw! (load (field region
+                                                                  registry))
+                                                     (load (field region
+                                                                  registry-cap))
+                                                     node))
   (store! (field region registry-len)
           (primitive/iadd (load (field region registry-len)) 1))
   0)
 
-;;; Backward-shift deletion for a linear-probing table. Reinsert the following cluster
-;;; into the newly empty table; no allocation is involved.
+;;; Whether `x` lies in the cyclic interval (lo, hi] of the slot ring.
+(defn region-registry-cyclic-in? [(x i64) (lo i64) (hi i64)] (-> bool)
+  (if (<= lo hi)
+      (and (< lo x) (<= x hi))
+      (or (< lo x) (<= x hi))))
+
+;;; Backward-shift deletion for a linear-probing table (Knuth's Algorithm R). Walk the
+;;; rest of the cluster once; an entry moves into the hole unless its home lies
+;;; cyclically in (hole, entry], where the hole would sit before its probe start.
+;;; One home computation per entry, so removal is linear in the cluster tail.
 (defn region-registry-remove! [(region (ptr Region)) (data (ptr i8))] (-> i64)
   (let [slots (load (field region registry))
         cap (load (field region registry-cap))
-        at (region-registry-slot region data)]
-    (store! (primitive/index slots at) (primitive/cast (ptr RegionNode) 0))
-    (let [(mut i) (primitive/iand (primitive/iadd at 1) (primitive/isub cap 1))]
-      (loop (let [node (load (primitive/index slots (load i)))]
-              (if (= (primitive/cast i64 node) 0)
-                  (break)
-                  (do
+        (mut hole) (region-registry-slot region data)
+        (mut i)
+          (primitive/iand (primitive/iadd (load hole) 1)
+                          (primitive/isub cap 1))
+        (mut probes) 0]
+    (store! (primitive/index slots (load hole))
+            (primitive/cast (ptr RegionNode) 0))
+    (loop (let [node (load (primitive/index slots (load i)))]
+            (store! probes (primitive/iadd (load probes) 1))
+            (if (= (primitive/cast i64 node) 0)
+                (break)
+                (do
+                  (unless (region-registry-cyclic-in? (region-registry-home cap
+                                                                            (load (field node
+                                                                                         data)))
+                                                      (load hole)
+                                                      (load i))
+                    (store! (primitive/index slots (load hole)) node)
                     (store! (primitive/index slots (load i))
                             (primitive/cast (ptr RegionNode) 0))
-                    (region-registry-insert-raw! slots cap node)
-                    (store! i
-                            (primitive/iand (primitive/iadd (load i) 1)
-                                            (primitive/isub cap 1))))))))
+                    (store! hole (load i)))
+                  (store! i
+                          (primitive/iand (primitive/iadd (load i) 1)
+                                          (primitive/isub cap 1)))))))
+    (region-count-probes! region (load probes))
     (store! (field region registry-len)
             (primitive/isub (load (field region registry-len)) 1))
     0))
@@ -337,7 +391,8 @@
   (load (field region closed)))
 
 ;;; Deterministic observability for allocator diagnostics and complexity regression
-;;; tests. Counts exact registry slots inspected by free/resize ownership lookup.
+;;; tests. Counts every registry slot inspected: ownership lookup, insertion,
+;;; rehashing on growth, and the backward shift after removal.
 (defn region-ownership-probes [(region (ptr Region))] (-> i64)
   (load (field region ownership-probes)))
 
