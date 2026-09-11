@@ -488,6 +488,36 @@ printf '[package]\nname = "path-dep"\nentry = "src/main.coil"\n\n[dependencies]\
   && ok "path dependency imports through its declared namespace" \
   || bad "path dependency" "want rc=42"
 
+# A path dependency is a package boundary too: its Coil.toml's roots and its own
+# dependencies compose into the consumer. A chain app -> mid -> base with a diamond
+# (app also names base), a package keeping its modules at its top level (no src/),
+# a namespace reached only transitively, and a cycle between two packages.
+mkdir -p "$T/pd-base" "$T/pd-mid/src" "$T/pd-app/src" "$T/pd-trans/src" \
+         "$T/pd-cyc-a" "$T/pd-cyc-b" "$T/pd-cyc/src"
+printf '[package]\nname = "pd-base"\n' > "$T/pd-base/Coil.toml"
+printf '(module pdbase)\n(defn base-answer [] (-> i64) 40)\n' > "$T/pd-base/base.coil"
+printf '[package]\nname = "pd-mid"\n\n[dependencies]\nbase = { path = "../pd-base" }\n' > "$T/pd-mid/Coil.toml"
+printf '(module pdmid)\n(import "pdbase" :use *)\n(defn mid-answer [] (-> i64) (+ (base-answer) 1))\n' > "$T/pd-mid/src/mid.coil"
+printf '[package]\nname = "pd-app"\nentry = "src/main.coil"\n\n[dependencies]\nmid = { path = "../pd-mid" }\nbase = { path = "../pd-base" }\n' > "$T/pd-app/Coil.toml"
+printf '(module pdapp)\n(import "pdmid" :use *)\n(import "pdbase" :use *)\n(defn main [] (-> i64) (+ (mid-answer) (- (base-answer) 39)))\n' > "$T/pd-app/src/main.coil"
+( cd "$T/pd-app" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "a path dependency's own dependencies compose; a diamond is composed once" \
+  || bad "path dependency package boundary" "want rc=42"
+printf '[package]\nname = "pd-trans"\nentry = "src/main.coil"\n\n[dependencies]\nmid = { path = "../pd-mid" }\n' > "$T/pd-trans/Coil.toml"
+printf '(module pdtrans)\n(import "pdmid" :use *)\n(defn main [] (-> i64) (+ (mid-answer) 1))\n' > "$T/pd-trans/src/main.coil"
+( cd "$T/pd-trans" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "a module that imports a path dependency's own dependency resolves" \
+  || bad "transitive path dependency" "want rc=42"
+printf '[package]\nname = "pd-cyc-a"\n\n[dependencies]\nb = { path = "../pd-cyc-b" }\n' > "$T/pd-cyc-a/Coil.toml"
+printf '(module cyca)\n(defn cyc-a [] (-> i64) 20)\n' > "$T/pd-cyc-a/a.coil"
+printf '[package]\nname = "pd-cyc-b"\n\n[dependencies]\na = { path = "../pd-cyc-a" }\n' > "$T/pd-cyc-b/Coil.toml"
+printf '(module cycb)\n(defn cyc-b [] (-> i64) 22)\n' > "$T/pd-cyc-b/b.coil"
+printf '[package]\nname = "pd-cyc"\nentry = "src/main.coil"\n\n[dependencies]\na = { path = "../pd-cyc-a" }\n' > "$T/pd-cyc/Coil.toml"
+printf '(module pdcyc)\n(import "cyca" :use *)\n(import "cycb" :use *)\n(defn main [] (-> i64) (+ (cyc-a) (cyc-b)))\n' > "$T/pd-cyc/src/main.coil"
+( cd "$T/pd-cyc" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "a cycle between path dependencies terminates, each package composed once" \
+  || bad "path dependency cycle" "want rc=42"
+
 # The root manifest can replace the entire ambient library universe. The selected
 # prelude is an ordinary dependency module: it is indexed through the declared
 # dependency root, auto-referred in every loaded module, and gets no bundled-path
