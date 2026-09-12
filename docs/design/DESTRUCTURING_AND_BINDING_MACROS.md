@@ -1,9 +1,9 @@
 # Destructuring and binding macros
 
-Status: implementation proposal. None of the new syntax below is implemented by
-this document. This supersedes the brace/`:keys` direction in the earlier pad
-sketch. The intended deliverable is a coherent binding language implemented by
-ordinary core macros over a small compiler-owned set of forms.
+Status: implemented. This document records the syntax, semantics, and compiler
+boundaries of binding destructuring. It supersedes the brace/`:keys` direction
+in the earlier pad sketch. Ordinary core macros implement the binding language
+over a small compiler-owned set of forms.
 
 ## 1. Decisions
 
@@ -11,7 +11,8 @@ ordinary core macros over a small compiler-owned set of forms.
 2. Their compiler-owned counterparts are `let*`, `fn*`, and `defn*`.
 3. Square brackets destructure sequences. Constructor-shaped patterns select
    named struct fields: `(Point :x x :y y)`.
-4. One recursive pattern elaborator serves all three macros and method bodies.
+4. One recursive pattern elaborator serves all three macros, method bodies, closure
+   generators, and sum-match payloads.
 5. Public `let` remains sequential. This does not introduce parallel Lisp `let`
    semantics or change existing simple binding behavior.
 6. Keep Coil's existing typed function headers, return annotations, generics,
@@ -174,6 +175,27 @@ variadic. Existing outer `&` for variadic Code macros remains unchanged.
 For simple struct selections, keeping a named parameter and destructuring in a
 body `let` is equally valid and can be easier to read than a dense signature.
 
+### 2.6 Sum-match payloads
+
+Variant payload vectors accept the same recursive patterns. Variant dispatch and
+exhaustiveness remain compiler-owned; after a variant is selected, an arm-local
+primitive binding prologue materializes and projects structured payload fields:
+
+```clojure
+(defsum Event
+  (Pair [(values (slice i64))])
+  (Located [(point Point)]))
+
+(match event
+  (Pair [[left right & rest]] (+ left (+ right (len rest))))
+  (Located [(Point :x x :y y)] (+ x y)))
+```
+
+Each entry in the arm vector corresponds to one variant payload field. An inner
+pattern is required destructuring once its variant has matched; failure does not
+backtrack to another arm. General fallible patterns over literals and ordinary
+struct scrutinees remain a separate pattern-matching feature.
+
 ## 3. Primitive language and library organization
 
 | Public form | Compiler primitive | Responsibilities of public macro |
@@ -217,10 +239,9 @@ macros choose binding structure; the ordinary checker validates typed projection
 For a constructor pattern, introduce a narrow internal checked-view operation
 (proposed `primitive/pattern-view Type source`). It checks that the source is a
 place/reference/value of the exact nominal type after ordinary type normalization,
-without casts, copies, implicit loads of owners, or new storage. It retains the
-source's usable place/mutability information. Bind the root first if an rvalue
-needs materializing. Erase this operation after checking. An existing type
-ascription may replace it only if verified to preserve all these place semantics.
+without casts, copies, implicit loads of owners, or new storage. The implementation emits a borrowed nominal-type assertion and then projects
+from the original root, retaining its place information. Bind the root first if
+an rvalue needs materializing. Erase this operation after checking.
 
 Sequence patterns require a defined indexed-view contract, not just `Get i64`:
 integer-keyed maps also have `Get`, and fixed arrays currently lack length generics.
@@ -448,3 +469,27 @@ commit, and push as required by the repository guide.
 Completion means the public forms are genuinely ordinary macros, all supported
 patterns use one elaborator, the primitive forms carry only core semantics, and
 no temporary bootstrap compatibility behavior remains in the final language.
+
+## Bootstrap implementation
+
+The checked-in `scripts/compiler/stage0.py` adapter probes the selected stage0
+compiler for primitive binding forms. For a legacy compiler only, it stages a
+prelude without the two new binding imports, allowing that compiler's existing
+public binding forms to compile the new compiler sources. Embedded compiler and
+stdlib sources remain the new sources. A compiler that supports primitive forms
+uses the full prelude. Both `dev.py build candidate` and release stage0 selection
+use this adapter; the final parser has no legacy public-binding dispatch.
+
+Source tools retain an authored syntax snapshot alongside normalized declarations.
+Storage snapshots preserve node identities; semantic revisions assign canonical
+IDs when a form changes. Source checkers join authored nodes to checked nodes only
+when source interval, node kind, and lexical scope identify one canonical node.
+Ambiguous projections remain unknown. This lets checkers propose edits to authored
+forms without attributing a generated expression's type to the wrong source node.
+Generated declaration bundles participate in the same staged expansion and parsing
+pipeline. Named declarations are matched by module and name before comparing their
+syntax and lexical scope, so adding source locations does not discard a normalized
+helper body. Quoted templates remain data; expansion visits only active unquotes.
+Isolated stage programs normalize public bindings while keeping their declared
+entry functions out of ordinary macro invocation. `dump-ast` remains a primitive-parser view; its fixtures use starred forms,
+while loaded and expanded stage fixtures exercise the public binding macros.

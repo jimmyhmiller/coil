@@ -572,8 +572,8 @@ expect_out "unknown field option 20" "the real parse error is shown, not an unkn
 # dependency root, auto-referred in every loaded module, and gets no bundled-path
 # privilege of its own.
 mkdir -p "$T/platform/src" "$T/no-stdlib/src"
-printf '(module platform.prelude)\n(defn platform-answer [] (-> i64) 42)\n' > "$T/platform/src/prelude.coil"
-printf '(module app)\n(defn main [] (-> i64) (platform-answer))\n' > "$T/no-stdlib/src/main.coil"
+printf '(module platform.prelude)\n(defn* platform-answer [] (-> i64) 42)\n' > "$T/platform/src/prelude.coil"
+printf '(module app)\n(defn* main [] (-> i64) (platform-answer))\n' > "$T/no-stdlib/src/main.coil"
 printf '[package]\nname = "no-stdlib"\nentry = "src/main.coil"\n\n[language]\nstdlib = false\nprelude = "platform.prelude"\n\n[dependencies]\nplatform = { path = "../platform" }\n' > "$T/no-stdlib/Coil.toml"
 ( cd "$T/no-stdlib" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
   && ok "stdlib=false auto-refers an ordinary dependency-module prelude" \
@@ -594,7 +594,7 @@ esac
   || bad "sealed transitive universe" "want located no-stdlib lookup failure, got rc=$rc: $out"
 
 # Restore the positive entry before checking the manifest's two invalid states.
-printf '(module app)\n(defn main [] (-> i64) (platform-answer))\n' > "$T/no-stdlib/src/main.coil"
+printf '(module app)\n(defn* main [] (-> i64) (platform-answer))\n' > "$T/no-stdlib/src/main.coil"
 printf '[package]\nname = "no-stdlib"\nentry = "src/main.coil"\n\n[language]\nstdlib = false\n' > "$T/no-stdlib/Coil.toml"
 expect_out "stdlib = false requires prelude" \
   "stdlib=false requires an explicit replacement prelude" \

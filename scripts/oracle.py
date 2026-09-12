@@ -59,7 +59,7 @@ COMMAND = {
 # files and made harmless cross-cutting changes obscure real regressions.
 STAGE_INPUTS = {
     "read": ["tests/compiler/oracle/stages/surface.coil"],
-    "ast": ["tests/compiler/oracle/stages/surface.coil"],
+    "ast": ["tests/compiler/oracle/stages/primitive_surface.coil"],
     "load": [
         "tests/compiler/oracle/load/fixtures/edge.coil",
         "tests/compiler/features/scoped_namespace.coil",

@@ -89,7 +89,7 @@ def justification(path: str, op: str, line: str) -> str:
             return "display spelling input to explicit context removal"
         if path.endswith("lints/named_constructor.coil"):
             return "keyword datum assembled for named-constructor syntax"
-        if path.endswith("lints/field_syntax.coil") or path.endswith("prelude.coil"):
+        if path.endswith("lints/field_syntax.coil") or path.endswith("prelude.coil") or path.endswith("binding.coil"):
             return "field/qualified selector datum inspected or emitted as syntax data"
         if path.endswith("closure.coil"):
             return "closure capture field selector or named-constructor keyword assembled as syntax data"
@@ -99,7 +99,7 @@ def justification(path: str, op: str, line: str) -> str:
             return "negative fixture proving unscoped datum cannot establish lexical identity"
         if path.startswith("tests/metaprogramming/compile-and-run/staged_"):
             return "guest syntax datum a stage entry returns, matched structurally by the next transform round rather than resolved"
-        if path.endswith("lints/no_star_imports.coil"):
+        if path.endswith("lints/no_star_imports.coil") or path.endswith("lints/names.coil"):
             return "module-name datum read out of an import declaration for comparison and for the rewritten :use list; never a lexical identifier"
     return ""
 
