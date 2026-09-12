@@ -14,6 +14,7 @@ COMPILER = Path(sys.argv[1]).resolve()
 
 def load_arena_bytes(root: Path, source: Path, output: Path) -> int:
     env = os.environ.copy()
+    env.pop("COIL_READERS", None)
     env["COIL_NAMESPACE_ROOTS"] = str(root)
     env["COIL_TRACE"] = "1"
     result = subprocess.run(
@@ -57,4 +58,15 @@ with tempfile.TemporaryDirectory(prefix=".coil-namespace-memory-", dir=ROOT) as 
     indexed = load_arena_bytes(root, entry, root / "indexed.o")
     increase = indexed - baseline
     assert increase < 12 * 1024 * 1024, (baseline, indexed, increase)
-    print(f"namespace index: 32 MiB of unimported source retained {increase} B")
+
+    # Irrelevant directory entries must not allocate lasting joined paths.
+    # Long names make this observable without creating a huge file payload.
+    for i in range(16000):
+        (root / f"noise-{i:05d}-{'q' * 100}.txt").touch()
+    with_noise = load_arena_bytes(root, entry, root / "with-noise.o")
+    path_increase = with_noise - indexed
+    assert path_increase < 2 * 1024 * 1024, (indexed, with_noise, path_increase)
+    print(
+        "namespace index: 32 MiB of unimported source retained "
+        f"{increase} B; 16,000 irrelevant paths retained {path_increase} B"
+    )
