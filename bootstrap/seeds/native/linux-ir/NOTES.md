@@ -47,10 +47,12 @@ and gates are what actually vouch for the seed you commit.
     coil emit-ir src/compiler/main.coil \
         --target x86_64-unknown-linux-gnu > coil-linux.ll
 
-Emitted at commit `62680c6` ("Give the linker child this process's environment") from a
+Emitted at commit `828c99f` ("Remove stale-seed subtraction dependencies") from a
 clean tree, by a compiler built from that same source (3-stage self-host, LLVM fixpoint
-stage2.o == stage3.o). Note that `emit-ir --help` does not advertise `--target`, but it
-honours it — the help text is wrong, not the flag.
+stage2.o == stage3.o). This refresh includes the private updater, so the IR's native
+link surface now also includes Coil's bundled libcurl and mbedTLS archives. Note that
+`emit-ir --help` does not advertise `--target`, but it honours it — the help text is
+wrong, not the flag.
 
 Unlike previous revisions this one was checked as far as macOS permits, which is
 further than "emitted and hoped":
@@ -91,6 +93,10 @@ xz -dk coil-linux.ll.xz
 clang -c coil-linux.ll -o coil.o
 clang coil.o -o coil-stage0 \
     -L"$(llvm-config --libdir)" -Wl,-rpath,"$(llvm-config --libdir)" -lLLVM \
+    build/bin/native/curl/x86_64-linux/libcurl.a \
+    build/bin/native/curl/x86_64-linux/libmbedtls.a \
+    build/bin/native/curl/x86_64-linux/libmbedx509.a \
+    build/bin/native/curl/x86_64-linux/libmbedcrypto.a \
     -lstdc++ -lm -lpthread -ldl
 
 # smoke-test the toolchain before the big one:
@@ -105,17 +111,21 @@ spelling; pre-21 parsers want `nocapture`. The sed is semantically inert.
 
 ## External link surface
 
-libLLVM (C API), libc/libm/libpthread/libdl. **No Darwin symbols** — the historical
+libLLVM (C API), bundled libcurl/mbedTLS, and libc/libm/libpthread/libdl. **No Darwin symbols** — the historical
 `dispatch_semaphore_*` (now pthread mutex+condvar in `metaengine.coil`) and
 `sys_icache_invalidate` (now resolved via `dlsym` at runtime in `jit.coil`, null and
 skipped on ELF hosts) are gone from the link surface.
 
-Re-checked on this emission: 229 `declare`s, of which the non-LLVM surface is exactly
-libc/libm/pthread/dl — `_exit abort access atoi calloc ceil chdir clock_gettime close
+Re-checked on this emission: 330 unique `declare`s, including 214 LLVM C-API symbols.
+The non-LLVM surface is bundled curl plus libc/libm/pthread/dl — `_exit abort access
+atexit atoi calloc ceil ceilf chdir clock_gettime close
 closedir creat dlerror dlopen dlsym dprintf dup2 execvp exit fabs fclose fcntl floor
-fmod fmodf fopen fork free fwrite getcwd getenv getpid getppid kill malloc memcmp memcpy
-memmove memset mmap mprotect munmap nanosleep open opendir pipe pow printf pthread_*
-putchar puts read realloc realpath rename setenv setpgid snprintf sqrt strcmp strlen
-strtod strtol system unlink unsetenv waitpid write`. Worth re-running that scan after any
+floorf fma fmaf fmod fmodf fopen fork free fwrite getcwd getenv getpid getppid isatty
+kill malloc memchr memcmp memcpy memmove memset mkdir mkdtemp mkstemp mmap mprotect
+munmap nanosleep open opendir pipe poll posix_memalign posix_spawnp pow printf pthread_*
+putchar puts read readdir realloc realpath remove rename rmdir setenv setpgid snprintf
+sqrt sqrtf strcmp strlen strtod strtol system trunc truncf unlink unsetenv waitpid write`,
+plus the `curl_easy_*`, `curl_multi_*`, and `curl_slist_*` API used by `coil update`.
+Worth re-running that scan after any
 cross-emission, since a Darwin-only extern creeping back in is invisible on the emitting
 host and only shows up as a link failure on the target.
