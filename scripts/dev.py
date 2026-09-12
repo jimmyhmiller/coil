@@ -147,8 +147,8 @@ def install(args: argparse.Namespace) -> None:
     again. `--build` delegates to the existing verified bootstrap scripts.
 
     The library goes in before the binary, so the last step is the one that makes
-    the new compiler current -- and `coil --version` is run at the end to print
-    which library the installed command actually found.
+    the new compiler current. An off-checkout compilation checks the installed
+    library before the command reports its version.
     """
     destination = install_destination(args.dest)
     if args.build:
@@ -229,20 +229,13 @@ def warm_jit_unit(compiler: Path, libdir: Path) -> None:
 
 
 def report_installed(destination: Path) -> None:
-    """Print what the installed command reports about itself.
-
-    `coil --version` names the library it found, so this turns "did the install
-    actually take, and against which standard library" into something the install
-    itself answers.
-    """
-    done = subprocess.run([str(destination), "--version"], capture_output=True, text=True)
+    """Verify the installed library and print the compiler version."""
+    verified_test_compiler(str(destination))
+    done = subprocess.run(
+        [str(destination), "--version"], capture_output=True, text=True, check=True,
+    )
     for line in (done.stdout or done.stderr).splitlines():
         print(f"  {line}")
-    if "NOT FOUND" in done.stdout:
-        raise SystemExit(
-            "install: the installed compiler cannot find its standard library.\n"
-            f"  expected {destination.parent.parent / 'lib' / 'coil' / 'stdlib'}"
-        )
 
 
 def install_destination(explicit: str | None) -> Path:
@@ -279,16 +272,19 @@ def verified_test_compiler(raw: str) -> str:
     if not os.access(compiler, os.X_OK):
         raise SystemExit(f"test compiler is not executable: {compiler}")
     with tempfile.TemporaryDirectory(prefix="coil-toolchain-preflight-") as cwd:
+        probe = Path(cwd) / "stdlib-probe.coil"
+        probe.write_text(
+            '(import "coil.io" :use *)\n'
+            '(defn main [] (-> i64) (do (stdout) 0))\n'
+        )
         checked = subprocess.run(
-            [str(compiler), "--version"],
+            [str(compiler), "check", str(probe)],
             cwd=cwd,
             capture_output=True,
             text=True,
         )
     output = checked.stdout + checked.stderr
-    if (checked.returncode != 0
-            or "stdlib:" not in output
-            or "stdlib: NOT FOUND" in output):
+    if checked.returncode != 0:
         detail = output.strip() or f"exit status {checked.returncode} with no diagnostic"
         raise SystemExit(
             "test compiler cannot locate its matching standard library from an "

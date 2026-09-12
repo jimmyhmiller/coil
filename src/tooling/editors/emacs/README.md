@@ -94,7 +94,7 @@ not offer `hm-put!` from a namespace nobody imported.
 `coil namespace` reports signatures but no file or line, and searching also
 works on a file that does not currently compile — which is when you most want
 to jump somewhere. The standard library is searched too, located from what
-`coil --version` reports (set `coil-xref-search-stdlib` to nil to skip it).
+`coil --print-stdlib-path` reports (set `coil-xref-search-stdlib` to nil to skip it).
 
 **Diagnostics** (`coil-check.el`) run `coil check` behind flymake on a scratch
 copy of the buffer. The copy always goes in the buffer's own directory, because

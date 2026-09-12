@@ -3394,12 +3394,10 @@ INSTALLED="$T/prefix/bin/coil"
 [ -d "$T/prefix/lib/coil/stdlib" ] && [ -d "$T/prefix/lib/coil/compiler" ] && [ -f "$T/prefix/lib/coil/prelude.coil" ] \
   && ok "install: the prefix holds stdlib, opt-in compiler SDK, and prelude" \
   || bad "install: the prefix holds stdlib, opt-in compiler SDK, and prelude" "missing"
-expect_out "installed:" \
-  "install: --version says the library came from an install" \
-  bash -c 'cd / && "$1" --version' _ "$INSTALLED"
-expect_out "lib/coil/stdlib" \
-  "install: --version names the installed library's path" \
-  bash -c 'cd / && "$1" --version' _ "$INSTALLED"
+expect_rc 0 "install: version output contains only the compiler version" \
+  python3 -c 'import re, subprocess, sys; p = subprocess.run([sys.argv[1], "--version"], cwd="/", capture_output=True, text=True); assert p.returncode == 0 and re.fullmatch(r"coil [^\s]+\n", p.stdout) and not p.stderr, p' "$INSTALLED"
+expect_rc 0 "install: explicit stdlib path query returns the installed source directory" \
+  python3 -c 'import pathlib, subprocess, sys; p = subprocess.run([sys.argv[1], "--print-stdlib-path"], cwd="/", capture_output=True, text=True); assert p.returncode == 0 and pathlib.Path(p.stdout.strip()).samefile(sys.argv[2]) and not p.stderr, p' "$INSTALLED" "$T/prefix/lib/coil/stdlib"
 "$COIL" namespaces > "$T/bundle/ns.txt" 2>/dev/null
 # `--check` above compares the manifest SOURCE to src/stdlib/. This compares what
 # the compiler under test actually carries, which also catches gating a binary
@@ -3472,6 +3470,10 @@ expect_rc 1 "layout: a compiler with no library beside it fails instead of guess
 expect_out "cannot find the coil standard library" \
   "layout: the error says the library is missing, and where it looked" \
   bash -c 'cd "$1" && "$1/coil" check allns.coil 2>&1' _ "$LONELY"
+expect_rc 1 "layout: explicit stdlib path query fails when no library exists" \
+  bash -c 'cd "$1" && "$1/coil" --print-stdlib-path' _ "$LONELY"
+expect_rc 0 "version: succeeds even without a standard library" \
+  python3 -c 'import re, subprocess, sys; p = subprocess.run([sys.argv[1], "--version"], cwd=sys.argv[2], capture_output=True, text=True); assert p.returncode == 0 and re.fullmatch(r"coil [^\s]+\n", p.stdout) and not p.stderr, p' "$LONELY/coil" "$LONELY"
 rm -rf "$LONELY"
 # The other layout, built explicitly rather than assumed of $COIL: a compiler under a
 # directory that holds src/stdlib and src/compiler belongs to that checkout. (The
@@ -3482,11 +3484,8 @@ ln -sfn "$PWD/src/stdlib" "$T/fakeroot/src/stdlib"
 ln -sfn "$PWD/src/compiler" "$T/fakeroot/src/compiler"
 cp "$COIL" "$T/fakeroot/build/bin/coil"
 codesign -s - --force "$T/fakeroot/build/bin/coil" >/dev/null 2>&1 || true
-expect_out "checkout:" \
-  "layout: a compiler under a checkout uses that checkout's library" \
-  bash -c 'cd / && "$1" --version' _ "$T/fakeroot/build/bin/coil"
-expect_rc 0 "layout: and compiles with it" \
-  bash -c 'cd "$2" && "$1" check ../bundle/allns.coil' _ "$T/fakeroot/build/bin/coil" "$T/fakeroot"
+expect_rc 0 "layout: a compiler under a checkout uses its library from outside the checkout" \
+  bash -c 'cd "$2" && "$1" check allns.coil' _ "$T/fakeroot/build/bin/coil" "$T/bundle"
 
 # A loose stage binary is not an installed compiler merely because an unrelated
 # `lib/coil` exists above it. It must fall through to the checkout at cwd; this is
@@ -3495,10 +3494,10 @@ mkdir -p "$T/loose/lib/coil"
 ln -sfn "$T/bundle" "$T/loose/lib/coil/stdlib"
 cp "$COIL" "$T/loose/coil-candidate"
 codesign -s - --force "$T/loose/coil-candidate" >/dev/null 2>&1 || true
-FAKEROOT_STDLIB="$(cd "$T/fakeroot" && pwd -P)/src/stdlib"
-expect_out "checkout: $FAKEROOT_STDLIB" \
-  "layout: a loose candidate ignores an unrelated ancestor lib/coil" \
-  bash -c 'cd "$2" && "$1" --version' _ "$T/loose/coil-candidate" "$T/fakeroot"
+expect_rc 0 "layout: a loose candidate resolves the working checkout's source directory" \
+  python3 -c 'import pathlib, subprocess, sys; p = subprocess.run([sys.argv[1], "--print-stdlib-path"], cwd=sys.argv[2], capture_output=True, text=True); assert p.returncode == 0 and pathlib.Path(p.stdout.strip()).samefile(pathlib.Path(sys.argv[2]) / "src/stdlib") and not p.stderr, p' "$T/loose/coil-candidate" "$T/fakeroot"
+expect_rc 0 "layout: a loose candidate ignores an unrelated ancestor lib/coil" \
+  bash -c 'cd "$2" && "$1" check ../bundle/allns.coil' _ "$T/loose/coil-candidate" "$T/fakeroot"
 
 echo "== entry file needs no (module ...) =="
 # An ENTRY file is named on the command line and imported by nobody, so it needs no
@@ -3721,8 +3720,10 @@ cat > "$T/ver/unimported.coil" <<'EOF'
 (module vun)
 (defn main [] (-> i64) (str-eq "a" "a"))
 EOF
-expect_rc 0 "version: --version prints and exits 0" bash -c '"$1" --version' _ "$COIL"
-expect_out "coil 0" "version: names the compiler and a version" bash -c '"$1" --version' _ "$COIL"
+for version_arg in --version -V version; do
+  expect_rc 0 "version: $version_arg prints only the compiler version" \
+    python3 -c 'import re, subprocess, sys; p = subprocess.run(sys.argv[1:], capture_output=True, text=True); assert p.returncode == 0 and re.fullmatch(r"coil [^\s]+\n", p.stdout) and not p.stderr, p' "$COIL" "$version_arg"
+done
 expect_out "is a local binding here" \
   "shadow: a shadowed macro is reported as a local, not as a missing import" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" check sh.coil 2>&1' \

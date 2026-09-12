@@ -627,18 +627,16 @@ finally the file's own directory."
 
 (defun coil-stdlib-directory ()
   "Where the toolchain's standard-library sources live, or nil.
-`coil --version' reports the library it resolved; those are real `.coil'
+`coil --print-stdlib-path' reports the library it resolved; those are real `.coil'
 files, which is what makes \\[xref-find-definitions] work into the stdlib."
   (when (eq coil--stdlib-directory 'unset)
     (setq coil--stdlib-directory
           (with-temp-buffer
             (when (and (executable-find coil-program)
                        (zerop (ignore-errors
-                                (call-process coil-program nil t nil "--version"))))
-              (goto-char (point-min))
-              (when (re-search-forward "^stdlib: [a-z]+: \\(.+\\)$" nil t)
-                (let ((dir (string-trim (match-string 1))))
-                  (and (file-directory-p dir) dir)))))))
+                                (call-process coil-program nil t nil "--print-stdlib-path"))))
+              (let ((dir (string-trim (buffer-string))))
+                (and (file-directory-p dir) dir))))))
   coil--stdlib-directory)
 
 

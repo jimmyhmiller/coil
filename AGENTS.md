@@ -123,8 +123,8 @@ Use this format:
   together by `python3 scripts/dev.py install` into `<prefix>/bin/coil` +
   `<prefix>/lib/coil/stdlib`, and a compiler finds its library by walking up from
   its own location (then from the working directory, which is why a stage compiler
-  in `/tmp` still uses this checkout). `coil --version` prints which library it
-  found; there is no environment variable that redirects it. **Adding or renaming a
+  in `/tmp` still uses this checkout). Compilation reports where it searched if the library is missing; there is no
+  environment variable that redirects it. **Adding or renaming a
   file here means regenerating the manifest:**
   `python3 scripts/compiler/gen-stdlib-manifest.py`. The manifest in
   `src/compiler/stdlib_manifest.coil` lists which modules are the library's; in-repo
