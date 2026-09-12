@@ -197,27 +197,34 @@ def warm_jit_unit(compiler: Path, libdir: Path) -> None:
     """Prebuild coil.compiler.jit_api as a unit beside the library.
 
     A program that imports coil.jit links the in-process compiler. Compiled from
-    source that is ~28s of LLVM per build; against this unit it is a fraction of a
-    second. The loader discovers `<lib>/coil/units/coil.compiler.jit_api` in an
-    installed layout and reads its interface in place of the SDK's source, so the
-    win needs no flag. Built with the compiler and sources just installed, so its
-    content key matches; best-effort, since a toolchain without it still works by
-    compiling from source.
+    source that is ~28s of LLVM per build; against a unit it is a fraction of a
+    second. A unit's object follows the calling convention of the backend that
+    emitted it, and Coil's backends do not share one for every aggregate, so
+    there is one unit per backend: `<lib>/coil/units/<backend>/coil.compiler.jit_api`
+    (the layout `shipped-unit-dir` in driver.coil reads). A consumer links only
+    the unit built by its own backend, and the compiler builds a missing one on
+    the first build that imports coil.jit. Installing warms the unit for the
+    compiler's default backend (`llvm` for this LLVM-linked build), so the common
+    path is fast from the start. Always -O3: every consumer optimization level
+    shares the one unit. Best-effort: without it the compiler builds it on demand.
     """
     entry = libdir / "compiler" / "jit_api.coil"
     if not entry.is_file():
         return
-    out = libdir / "units" / "coil.compiler.jit_api"
-    out.mkdir(parents=True, exist_ok=True)
-    backend = ["--backend", "arm64"] if platform.machine() in ("arm64", "aarch64") else []
+    units = libdir / "units"
+    # The single-backend layout that preceded per-backend units. Nothing reads
+    # it any more, and its arm64 object must never be linked into an LLVM build.
+    shutil.rmtree(units / "coil.compiler.jit_api", ignore_errors=True)
+    out = units / "llvm" / "coil.compiler.jit_api"
+    out.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
-        [str(compiler), "build-unit", str(entry), "-o", str(out), *backend],
+        [str(compiler), "build-unit", str(entry), "-o", str(out), "--backend", "llvm", "-O3", "--quiet"],
         capture_output=True, text=True,
     )
     if result.returncode == 0:
         print(f"warmed coil.jit unit -> {out}")
     else:
-        print("note: could not warm the coil.jit unit; coil.jit programs will compile it from source")
+        print("note: could not warm the coil.jit unit; the first coil.jit build will build it")
         shutil.rmtree(out, ignore_errors=True)
 
 

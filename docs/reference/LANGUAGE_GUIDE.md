@@ -266,11 +266,13 @@ full 40- or 64-digit commit ID. Tags and branches are resolved to a concrete com
 at the start of each invocation, so they intentionally follow repository updates.
 An optional `subdir` selects a package inside the checkout. It must be
 repository-relative, may not contain an escaping `..`
-component, and must name a directory containing `Coil.toml`. Coil treats that manifest
-as the dependency boundary: its source roots, exclusions, module/reader mappings,
-transitive dependencies, native dependencies, C inputs, and link inputs compose into
-the root build. Repository-relative native paths remain relative to the selected
-package. Checkouts are cached by repository and SHA, so dependencies selecting several
+component, and must name a directory containing `Coil.toml`. Every dependency whose
+directory holds a `Coil.toml` -- a path dependency, a Git checkout, or a selected
+subdirectory -- is a package boundary: its source roots (the package directory itself
+when it has no `src/`, `tests/` or declared roots), exclusions, module/reader
+mappings, transitive dependencies, native dependencies, C inputs, and link inputs
+compose into the root build. A package reached more than once, through a diamond or a
+cycle, is composed once. Package-relative native paths stay relative to their package. Checkouts are cached by repository and SHA, so dependencies selecting several
 subpackages at the same pin share one checkout. The string shorthand
 `local_math = "../local-math"` is equivalent to `{ path = "../local-math" }`.
 
@@ -1722,19 +1724,29 @@ compiles against a handful of declarations rather than the whole dependency and
 everything behind it. A module the interface cannot express (a runtime `def`, an
 exported macro produced by another macro) is refused by name, never shipped
 narrower than its source. A rebuild into the same directory is skipped when the
-compiler, target, options and every source are unchanged.
+compiler, target, options, backend and every source are unchanged.
+
+A unit's object follows the calling convention of the backend that emitted it,
+and Coil's backends do not share one for every aggregate, so a unit links only
+into a build by the same backend. Its key records that backend (`--backend llvm`,
+`arm64` or `x64` on `build-unit`), and a `--unit` built by another backend is an
+error that names both and the rebuild.
 
 In a manifest, `engine = { path = "../engine", prebuilt = true }` under
-`[dependencies]` does this automatically: the dependency is built into
-`.coil/units/<name>` on first build and linked thereafter, recompiled only when
-it changes. A dependency that cannot be prebuilt compiles from source with a
-note. The object a unit contributes is linked only when the program actually
-imports the module, so a unit made available but unused costs nothing.
+`[dependencies]` does this automatically: the dependency is built by the
+consuming build's backend into `.coil/units/<backend>/<name>` on first build and
+linked thereafter, recompiled only when it changes. A dependency that cannot be
+prebuilt compiles from source with a note. The object a unit contributes is
+linked only when the program actually imports the module, so a unit made
+available but unused costs nothing.
 
 The motivating case is `coil.jit`, the in-process compiler SDK: importing it
 used to compile the whole compiler (~28s of LLVM per build). An installed
-toolchain ships it as a unit, so `(import "coil.jit")` links the prebuilt
-compiler with no flag and builds in a fraction of a second.
+toolchain keeps one coil.jit unit per backend in `lib/coil/units/<backend>/`.
+Installing builds the default backend's; the first program built by another
+backend that imports `coil.jit` builds that backend's (slow once), and every
+later build links it -- so `(import "coil.jit")` needs no flag and builds in a
+fraction of a second whichever backend you use.
 
 `(printf c"%d\n" 42)`. Floats cross the C ABI correctly; structs pass/return by
 value with the real C ABI. To call a Coil fn from C (e.g. `qsort` comparator) pass
