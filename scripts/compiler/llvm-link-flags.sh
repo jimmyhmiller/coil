@@ -52,9 +52,14 @@ case "$MODE" in
     # shellcheck disable=SC2046
     emit $("$LLVM_CONFIG" --link-static --libs $COMPONENTS)
     emit -lm -lz
-    ZSTD_A="$(brew --prefix zstd 2>/dev/null)/src/stdlib/libzstd.a"
-    if [ -f "$ZSTD_A" ]; then emit "$ZSTD_A"; else emit -lzstd; fi
-    emit -lxml2 -lc++
+    if [ "$(uname -s)" = Darwin ]; then
+      ZSTD_A="$(brew --prefix zstd 2>/dev/null)/lib/libzstd.a"
+      if [ -f "$ZSTD_A" ]; then emit "$ZSTD_A"; else emit -lzstd; fi
+      emit -lxml2 -lc++
+    else
+      emit $($LLVM_CONFIG --link-static --system-libs $COMPONENTS)
+      emit -lstdc++ -lpthread -ldl
+    fi
     ;;
   *)
     echo "llvm-link-flags: unknown mode '$MODE' (want: static | dynamic)" >&2; exit 1

@@ -313,6 +313,8 @@ def test(args: argparse.Namespace) -> None:
         execute(sys.executable, "scripts/oracle.py", "runtime", "gate", "arm64", "--compiler", compiler)
     elif args.suite == "http":
         test_http(compiler)
+    elif args.suite == "update":
+        execute(sys.executable, "scripts/tests/update.py", compiler)
     elif args.suite == "wasm":
         test_wasm(compiler)
     elif args.suite == "meta":
@@ -1384,7 +1386,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "update", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.set_defaults(func=test)

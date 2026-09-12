@@ -41,8 +41,13 @@ fi
 if [ -z "$libdir" ] || [ ! -e "$libdir/libLLVM.so" ]; then
   echo "no libLLVM.so found (install LLVM 21 from apt.llvm.org, or set COIL_LLVM_LIBDIR)"; exit 1
 fi
-LF=(--link-flag "-L$libdir" --link-flag "-Wl,-rpath,$libdir" --link-flag -lLLVM
-    --link-flag -lstdc++ --link-flag -lm --link-flag -lpthread --link-flag -ldl)
+if [ "${COIL_LLVM_LINK:-dynamic}" = static ]; then
+  LLVM_CONFIG="${LLVM_CONFIG:-llvm-config-21}" LF=($(LLVM_CONFIG="$LLVM_CONFIG" scripts/compiler/llvm-link-flags.sh static)) \
+    || { echo "cannot compute static LLVM link flags"; exit 1; }
+else
+  LF=(--link-flag "-L$libdir" --link-flag "-Wl,-rpath,$libdir" --link-flag -lLLVM
+      --link-flag -lstdc++ --link-flag -lm --link-flag -lpthread --link-flag -ldl)
+fi
 
 . scripts/compiler/select-stage0.sh
 select_stage0 "$SEED" "$SRC" x64 "${LF[@]}" || exit 1
@@ -93,6 +98,10 @@ DEST="${1:-build/bin/coil}"
 mkdir -p "$(dirname "$DEST")"
 cp "$S2" "$DEST"
 echo "=== VERIFIED self-host compiler installed -> $DEST ==="
-python3 scripts/dev.py install --source "$DEST" \
-  || { echo "global install FAILED"; exit 1; }
-echo "=== VERIFIED self-host compiler installed globally ==="
+if [ "${COIL_SKIP_INSTALL:-0}" = 1 ]; then
+  echo "=== user-level install skipped (COIL_SKIP_INSTALL=1) ==="
+else
+  python3 scripts/dev.py install --source "$DEST" \
+    || { echo "global install FAILED"; exit 1; }
+  echo "=== VERIFIED self-host compiler installed globally ==="
+fi

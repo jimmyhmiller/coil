@@ -39,6 +39,13 @@ def run(compiler: Path, arguments: list[str]) -> int:
         binary = prefix / "bin/coil"
         binary.parent.mkdir()
         shutil.copy2(compiler, binary)
+        # Native archives are part of the toolchain layout and are resolved beside
+        # the compiler executable.  The compatibility copy must therefore carry
+        # the checkout's archives just like its stdlib; running from /tmp means the
+        # compiler's cwd fallback cannot see ROOT/build/bin/native.
+        native = ROOT / "build/bin/native"
+        if native.is_dir():
+            (binary.parent / "native").symlink_to(native, target_is_directory=True)
         library = prefix / "lib/coil"
         library.mkdir(parents=True)
         (library / "stdlib").symlink_to(ROOT / "src/stdlib", target_is_directory=True)
