@@ -66,7 +66,17 @@ with tempfile.TemporaryDirectory(prefix=".coil-namespace-memory-", dir=ROOT) as 
     with_noise = load_arena_bytes(root, entry, root / "with-noise.o")
     path_increase = with_noise - indexed
     assert path_increase < 2 * 1024 * 1024, (indexed, with_noise, path_increase)
+
+    # Directory traversal paths are temporary even when no module lives below.
+    for i in range(8000):
+        (root / f"empty-{i:05d}-{'d' * 180}").mkdir()
+    with_directories = load_arena_bytes(root, entry, root / "with-directories.o")
+    directory_increase = with_directories - with_noise
+    assert directory_increase < 2 * 1024 * 1024, (
+        with_noise, with_directories, directory_increase
+    )
     print(
         "namespace index: 32 MiB of unimported source retained "
-        f"{increase} B; 16,000 irrelevant paths retained {path_increase} B"
+        f"{increase} B; 16,000 irrelevant paths retained {path_increase} B; "
+        f"8,000 empty directories retained {directory_increase} B"
     )
