@@ -50,7 +50,20 @@ else
 fi
 
 . scripts/compiler/select-stage0.sh
-select_stage0 "$SEED" "$SRC" x64 "${LF[@]}" || exit 1
+if [ -z "${STAGE0:-}" ]; then
+  installed=$(command -v coil 2>/dev/null || true)
+  if { [ -x "$SEED" ] && stage0_compat_run "$SEED" check "$SRC" "${LF[@]}" >/dev/null 2>&1; } \
+     || { [ -n "$installed" ] && stage0_compat_run "$installed" check "$SRC" "${LF[@]}" >/dev/null 2>&1; }; then
+    select_stage0 "$SEED" "$SRC" x64 "${LF[@]}" || exit 1
+  else
+    STAGE0="$RUN_DIR/coil-linux-ir-stage0"
+    scripts/compiler/build-linux-ir-stage0.sh "$STAGE0" || exit 1
+    STAGE0_SOURCE=linux-ir
+    STAGE0_BUILD_FLAGS=()
+  fi
+else
+  select_stage0 "$SEED" "$SRC" x64 "${LF[@]}" || exit 1
+fi
 echo "stage0 = $STAGE0 ($STAGE0_SOURCE; libLLVM: $libdir)"
 
 # Probe before building: a stage0 too old for this tree otherwise fails deep in
