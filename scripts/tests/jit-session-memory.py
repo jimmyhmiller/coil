@@ -97,6 +97,18 @@ def main() -> None:
         print(f'{args.replacements} retained JIT replacements: peak RSS {peak} B', flush=True)
         assert peak < 768 * 1024 * 1024, 'frontend generations accumulated'
 
+        # A retained monomorph report contains nested syntax built during the
+        # compilation unit. It must remain readable after that unit retires and
+        # after later rejected and aborted JIT transactions. This fixture used
+        # to segfault after its expected structured-rejection diagnostic.
+        feature = ROOT / 'tests/compiler/features/jit_retained_code_state.coil'
+        feature_executable = directory / 'retained-code-state'
+        run(compiler, 'build', str(feature), '-o', str(feature_executable),
+            *unit_flags)
+        run(str(feature_executable))
+        print('retained Code state survives committed, rejected, and aborted edits',
+              flush=True)
+
 
 if __name__ == '__main__':
     main()
