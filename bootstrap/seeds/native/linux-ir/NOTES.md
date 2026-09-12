@@ -97,7 +97,7 @@ clang coil.o -o coil-stage0 \
     build/bin/native/curl/x86_64-linux/libmbedtls.a \
     build/bin/native/curl/x86_64-linux/libmbedx509.a \
     build/bin/native/curl/x86_64-linux/libmbedcrypto.a \
-    -lstdc++ -lm -lpthread -ldl
+    -lz -lstdc++ -lm -lpthread -ldl
 
 # smoke-test the toolchain before the big one:
 xz -dk fib-linux.ll.xz && clang -c fib-linux.ll -o fib.o && clang fib.o -o fib

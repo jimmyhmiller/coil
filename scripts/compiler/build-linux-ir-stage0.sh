@@ -31,6 +31,6 @@ mkdir -p "$(dirname "$DEST")"
   -L"$LLVM_LIBDIR" -Wl,-rpath,"$LLVM_LIBDIR" -lLLVM \
   "$NATIVE/libcurl.a" "$NATIVE/libmbedtls.a" \
   "$NATIVE/libmbedx509.a" "$NATIVE/libmbedcrypto.a" \
-  -lstdc++ -lm -lpthread -ldl
+  -lz -lstdc++ -lm -lpthread -ldl
 chmod +x "$DEST"
 echo "built native Linux IR stage0 -> $DEST"
