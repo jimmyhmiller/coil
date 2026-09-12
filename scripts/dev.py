@@ -307,7 +307,7 @@ def test(args: argparse.Namespace) -> None:
     elif args.suite == "generated":
         for name in ("digest", "artifact-wire", "codegen-session", "extern-aliases",
                      "dynamic-stack", "union-hfa", "c-aggregate-bounded-read", "sparse-static", "oracle-corpus",
-                     "provider-artifacts", "generated-modules", "binding_macros"):
+                     "provider-artifacts", "generated-modules", "binding_macros", "jit-source-graph"):
             execute(sys.executable, f"scripts/tests/{name}.py", compiler)
     elif args.suite == "runtime":
         execute(sys.executable, "scripts/oracle.py", "runtime", "gate", "arm64", "--compiler", compiler)

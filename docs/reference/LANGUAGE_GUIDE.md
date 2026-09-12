@@ -107,6 +107,18 @@ after rendering a diagnostic. `jit-source` exposes accumulated successful
 definitions and `jit-reset!` starts a fresh state lineage. `coil.jit.reload` is
 the public metaprogram implementing stable typed function bindings.
 
+After initializing the SDK, `jit-read-source-graph(allocator, entry)` discovers
+an entry's source modules with the same namespace roots and unit configuration.
+It returns an opaque `JitSourceGraph` owned by the supplied allocator. Check
+`jit-source-graph-ok?`, then read `jit-source-graph-entry`,
+`jit-source-graph-count`, and the indexed `jit-source-graph-module`,
+`jit-source-graph-path`, and `jit-source-graph-text` accessors. On failure,
+`jit-source-graph-diagnostic`, `jit-source-graph-error-path`, and
+`jit-source-graph-error-line` describe the loader error. The snapshot survives
+the discovery operation's scratch scope and does not submit or execute code.
+Serialize discovery with other SDK operations. This API exposes source modules;
+prebuilt unit interfaces remain opaque dependencies.
+
 The execution backend is selected by host: `arm64-macho` uses Coil's native
 backend on macOS, while `llvm-mcjit-x86_64-linux` lowers each generation through
 LLVM on Linux. Both retain old code for captured function pointers and map each
