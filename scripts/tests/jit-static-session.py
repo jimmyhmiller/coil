@@ -25,7 +25,7 @@ repl = subprocess.run([str(COMPILER), "repl"], cwd=ROOT, text=True,
     capture_output=True, timeout=120)
 assert repl.returncode == 0, (repl.returncode, repl.stdout, repl.stderr)
 assert repl.stdout.count("7") == 2, repl.stdout
-assert "different signature" in repl.stderr, repl.stderr
+assert "static definition" in repl.stderr, repl.stderr
 
 with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
     work = Path(raw)
@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
                                    "--ldflags", "--libs", "--system-libs").stdout):
             flags += ["--link-flag", flag]
     fixtures = ("jit_static_session", "jit_static_lifetime", "jit_static_policy",
-                "jit_static_dynamic", "jit_static_isolation",
+                "jit_static_dynamic", "jit_static_isolation", "jit_single_form_proof",
                 "jit_generation_tokens", "jit_frontend_policy")
     for name in fixtures:
         binary = work / name

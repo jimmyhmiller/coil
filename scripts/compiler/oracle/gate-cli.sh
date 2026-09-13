@@ -3925,10 +3925,10 @@ EOF
     else
       sdk_out=$(cd "$T/jit-sdk" && PATH="$T/jit-prefix/bin:$PATH" ./app 2>&1)
     fi
-    case "$sdk_out" in
-      *$'20\n'*$'30\n'*) ok "coil.jit embeds an installed compiler and hot reloads from userland" ;;
-      *) bad "coil.jit embeds an installed compiler and hot reloads from userland" "$sdk_out" ;;
-    esac
+    sdk_rc=$?
+    [ "$sdk_rc" = 0 ] \
+      && ok "coil.jit embeds an installed compiler and retains static definitions" \
+      || bad "coil.jit embeds an installed compiler and retains static definitions" "rc=$sdk_rc: $sdk_out"
     sdk_syms=$(nm "$T/jit-sdk/app" 2>/dev/null)
     case "$sdk_syms" in
       *repl-session-new*) ok "coil.jit import links the compiler SDK" ;;
@@ -3951,10 +3951,10 @@ EOF
       # The default build is LLVM: it links the LLVM unit, emitted by its own backend.
       if (cd "$T/jit-sdk" && "$INSTALLED" build main.coil -o app-llvm >/dev/null 2>&1); then
         llvm_out=$(cd "$T/jit-sdk" && PATH="$T/no-cc:$T/jit-prefix/bin:$PATH" ./app-llvm 2>&1)
-        case "$llvm_out" in
-          *$'20\n'*$'30\n'*) ok "an LLVM coil.jit program links the LLVM unit and hot reloads" ;;
-          *) bad "an LLVM coil.jit program links the LLVM unit and hot reloads" "$llvm_out" ;;
-        esac
+        llvm_rc=$?
+        [ "$llvm_rc" = 0 ] \
+          && ok "an LLVM coil.jit program links the LLVM unit and retains static definitions" \
+          || bad "an LLVM coil.jit program links the LLVM unit and retains static definitions" "rc=$llvm_rc: $llvm_out"
       else
         bad "an LLVM coil.jit program builds from the installed toolchain" "build failed"
       fi
@@ -3979,7 +3979,7 @@ EOF
     *) ok "ordinary programs do not link the compiler SDK" ;;
   esac
 
-  echo "== repl: multiline, reload, persistent state, and transactions =="
+  echo "== repl: multiline, static bindings, persistent state, and transactions =="
   python3 scripts/dev.py install --source "$COIL" --dest "$T/repl-prefix/bin/coil" >/dev/null 2>&1
   REPL_COIL="$T/repl-prefix/bin/coil"
   repl_out=$(printf '%s\n' \
@@ -4000,11 +4000,11 @@ EOF
     '(four-times 10)' \
     ':q' | if [ "$HOST_OS" = Darwin ]; then PATH="$T/no-cc:$PATH" "$REPL_COIL" repl 2>&1; else "$REPL_COIL" repl 2>&1; fi)
   case "$repl_out" in
-    *'coil> 1'*'coil> 40'*'coil> 2'*'coil> 90'*'coil> 3'*'coil> 90'*) ok "repl preserves state, reloads dependent calls, and rejects incompatible replacement" ;;
-    *) bad "repl preserves state, reloads dependent calls, and rejects incompatible replacement" "$repl_out" ;;
+    *'coil> 1'*'coil> 40'*'coil> 2'*'coil> 40'*'coil> 3'*'coil> 40'*) ok "repl preserves state and rejects replacement of static definitions" ;;
+    *) bad "repl preserves state and rejects replacement of static definitions" "$repl_out" ;;
   esac
   case "$repl_out" in
-    *"cannot redefine a REPL function with a different signature"*) ok "repl reports the incompatible redefinition" ;;
+    *"static definition 'replsession.twice' already exists"*) ok "repl reports the incompatible redefinition" ;;
     *) bad "repl reports the incompatible redefinition" "$repl_out" ;;
   esac
 
@@ -4023,24 +4023,24 @@ EOF
     '(defn answer [] (-> i64) 42)' \
     '(answer)' \
     '(module app.tools)' \
-    '(answer)' \
+    '(app.answer)' \
     ':q' | "$REPL_COIL" repl 2>&1)
   case "$repl_module_out" in
-    *'coil> 42'*'coil> 42'*) ok "repl module form switches namespace and republishes definitions" ;;
-    *) bad "repl module form switches namespace and republishes definitions" "$repl_module_out" ;;
+    *'coil> 42'*'coil> 42'*) ok "repl module form switches namespace without moving definitions" ;;
+    *) bad "repl module form switches namespace without moving definitions" "$repl_module_out" ;;
   esac
 
   repl_macro_out=$(printf '%s\n' \
     '(defn stuff2 [(x Code)] (-> Code) x)' \
     '(stuff2 (+ 1 2))' \
-    '(defn stuff2 [(x Code)] (-> Code) `(* ~x 2))' \
-    '(stuff2 21)' \
-    '(defn stuff2 [(x Code)] (-> Code) (+ x 1))' \
-    '(stuff2 21)' \
+    '(defn stuff3 [(x Code)] (-> Code) `(* ~x 2))' \
+    '(stuff3 21)' \
+    '(defn broken [(x Code)] (-> Code) (+ x 1))' \
+    '(stuff3 21)' \
     ':q' | "$REPL_COIL" repl 2>&1)
   case "$repl_macro_out" in
-    *'coil> 3'*'coil> 42'*"'code' does not implement 'Add'"*'coil> 42'*) ok "repl compiles, invokes, replaces, and transactionally rejects macros" ;;
-    *) bad "repl compiles, invokes, replaces, and transactionally rejects macros" "$repl_macro_out" ;;
+    *'coil> 3'*'coil> 42'*"'code' does not implement 'Add'"*'coil> 42'*) ok "repl retains macros and transactionally rejects invalid new macros" ;;
+    *) bad "repl retains macros and transactionally rejects invalid new macros" "$repl_macro_out" ;;
   esac
 
   repl_ambient_derive_out=$(printf '%s\n' \

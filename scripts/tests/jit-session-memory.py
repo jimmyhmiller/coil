@@ -30,21 +30,21 @@ def source_for_replacements(count: int) -> str:
         '(defn main [] (-> i64)',
         '  (let [(mut session) (jit/jit-session-new (malloc-allocator))',
         '        (mut status) 0]',
-        '    (if (!= (jit/jit-session-set-legacy-reload! (mut session) false) 0)',
-        '        1',
-        '        (do',
+        '    (when (!= (jit/jit-compile! (mut session) "(defn retained [] (-> i64) 42)") 0)',
+        '      (set! status 1))',
     ]
     for index in range(count):
-        lines.extend(
-            [
-                '          (when (!= (jit/jit-replace-source! (mut session) '
-                f'"(defn value{index} [] (-> i64) {index})") 0)',
-                '            (set! status 2))',
-                '          (when (< (jit/jit-reclaim-retired! (mut session)) 0)',
-                '            (set! status 3))',
-            ]
-        )
-    lines.append('          (load status)))))')
+        lines.extend([
+            '    (when (= (jit/jit-compile! (mut session) '
+            f'"(defn invalid{index} [] (-> i64) true)") 0)',
+            '      (set! status 2))',
+        ])
+    lines.extend([
+        '    (when (!= (jit/jit-compile-with-entry! (mut session) "" "(if (= (retained) 42) 0 90)") 0)',
+        '      (set! status 3))',
+        '    (jit/jit-reset! (mut session))',
+        '    (load status)))',
+    ])
     return '\n'.join(lines) + '\n'
 
 
@@ -94,8 +94,8 @@ def main() -> None:
         timed = run('/usr/bin/time', '-l' if sys.platform == 'darwin' else '-v',
                     str(executable))
         peak = peak_rss(timed.stderr)
-        print(f'{args.replacements} retained JIT replacements: peak RSS {peak} B', flush=True)
-        assert peak < 768 * 1024 * 1024, 'frontend generations accumulated'
+        print(f'{args.replacements} rejected retained JIT deltas: peak RSS {peak} B', flush=True)
+        assert peak < 768 * 1024 * 1024, 'rejected frontend arenas accumulated'
 
         # A retained monomorph report contains nested syntax built during the
         # compilation unit. It must remain readable after that unit retires and

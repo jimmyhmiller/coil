@@ -80,10 +80,9 @@ except where noted):
   packaging checks are Darwin-only; Linux debugger UX is unverified.
 - `COIL_LLVM_LINK=static` and `llvm-link-flags.sh` remain macOS-shaped; the Linux
   script discovers the libdir itself (override: `COIL_LLVM_LIBDIR`).
-- The x86 `musttail` downgrade (`codegen.coil::emit-tail`): 25 aggregate-returning
-  self-tail-calls are `tail` (best-effort) instead of guaranteed TCO on x86 —
-  bounded recursions; a stack overflow inside `comptime.*` on pathological input
-  would be this.
+- Forced LLVM tail calls require scalar-only signatures. Recursive calls carrying
+  aggregate values, pointers, or references remain ordinary calls to preserve
+  borrowed stack temporaries; their stack use depends on LLVM optimization.
 
 - `gate-diag` on Linux: 31/33 — the two failures are platform-text refs
   (`02-link-fail` bakes macOS ld64 wording incl. the `_main` underscore;

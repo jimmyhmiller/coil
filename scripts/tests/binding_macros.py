@@ -23,7 +23,7 @@ def run(arguments, *, environment=None, success=True, contains=None, input=None)
 for name in ("primitive", "public", "destructuring", "nested", "code", "ownership",
              "methods", "closure", "anonymous", "loop_macro", "declaration_bundle",
              "order_views", "ignored_owner", "signatures", "match", "reload",
-             "combined_libraries"):
+             "combined_libraries", "match_callable_shadow"):
     run(["run", FIX / f"{name}.coil"])
     print(f"PASS {name}", flush=True)
 
@@ -62,6 +62,7 @@ errors = {
     "owning_element": "cannot move an owning element",
     "partial_move": "cannot move an owning field",
     "match_duplicate": "duplicate identifier",
+    "match_macro_shadow": "local is not callable",
     "match_partial_move": "cannot move an owning field",
 }
 for name, message in errors.items():

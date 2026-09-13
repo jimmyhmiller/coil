@@ -305,10 +305,10 @@ def test(args: argparse.Namespace) -> None:
     elif args.suite == "cli":
         execute("scripts/compiler/oracle/gate-cli.sh", compiler)
     elif args.suite == "generated":
-        for name in ("digest", "artifact-wire", "codegen-session", "extern-aliases",
+        for name in ("digest", "artifact-wire", "codegen-session", "tail-borrow", "extern-aliases",
                      "dynamic-stack", "union-hfa", "c-aggregate-bounded-read", "namespace-index-memory",
                      "sparse-static", "oracle-corpus", "provider-artifacts", "generated-modules",
-                     "binding_macros", "jit-source-graph", "jit-session-memory", "jit-static-session"):
+                     "binding_macros", "jit-source-graph", "jit-session-memory", "jit-static-session", "jit-single-form"):
             execute(sys.executable, f"scripts/tests/{name}.py", compiler)
     elif args.suite == "runtime":
         execute(sys.executable, "scripts/oracle.py", "runtime", "gate", "arm64", "--compiler", compiler)

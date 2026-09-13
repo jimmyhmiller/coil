@@ -137,12 +137,21 @@ Accepted compiler revisions and their native definitions remain owned by the
 session until `jit-reset!`. Reset releases them and starts a fresh environment;
 it returns -1 while caller generation leases remain outstanding. Serialize SDK
 operations: compiler contexts support synchronous nesting, not concurrent use.
-The existing `jit-submit!` and complete-source replacement operations remain
-source-replay compatibility APIs and cannot be mixed with retained compilation
-in one session without resetting. The SDK defaults to static bindings; legacy
-REPL `Var` lowering in the compatibility API requires an explicit
-`(jit-session-set-legacy-reload! (mut session) true)` before the first submission.
-The terminal `coil repl` continues to opt into that policy.
+The terminal `coil repl` uses the same retained compilation path, with static
+bindings. A module form selects a namespace without moving existing definitions.
+`:type EXPR` checks against the retained environment without executing the expression.
+Use `:compile FORMS` for arbitrary top-level metaprogram submissions.
+
+`jit-prepare!` and `jit-prepare-with-entry!` prepare new forms against the retained
+environment without publishing runtime code. Metaprogram expansion still runs.
+`jit-commit-prepared!` publishes that exact
+candidate; `jit-abort-prepared!` releases it. Preparing another candidate aborts
+an outstanding preparation. There is no full-source replacement or replay API.
+
+Set `COIL_JIT_TRACE=1` to emit per-submission `jit-work` events on stderr. These
+record actual parsed declarations, checked function bodies, and emitted native
+function bodies, including work in nested compiler units. `retained` events name
+the previously accepted function catalog; `begin` and `end` delimit submissions.
 
 After initializing the SDK, `jit-read-source-graph(allocator, entry)` discovers
 an entry's source modules with the same namespace roots and unit configuration.
@@ -864,7 +873,10 @@ Struct and array places are the exception: `(let [v s])` on one is a **view**, n
 deep copy, so passing a big struct around never copies it behind your back.
 
 There is no `return`. Structure with `if`, or use `(block :b … (return-from :b v))`.
-Self-tail-recursion is constant-stack (guaranteed `musttail`).
+The LLVM backend guarantees constant-stack self recursion for scalar-only
+signatures (integer and floating-point parameters and results). Calls carrying
+references, pointers, or aggregates stay ordinary calls so arguments can safely
+borrow stack temporaries; LLVM may optimize them when it can prove safety.
 
 ## Structs
 
