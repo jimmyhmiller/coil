@@ -97,15 +97,52 @@ reachable module graph; programs that do not import it link none of the SDK.
     (import "coil.jit" :use *)
 
     (let [(mut session) (jit-session-new (malloc-allocator))]
-      (jit-submit! (mut session) "(defn twice [(x i64)] (-> i64) (* x 2))")
-      (jit-submit! (mut session) "(twice 10)"))
+      (jit-compile! (mut session)
+        "(module example) (defstruct Point [(x i64)])
+         (defn twice [(x i64)] (-> i64) (* x 2))")
+      (jit-compile! (mut session)
+        "(defn answer [] (-> i64) (twice 21))")
+      (jit-evaluate! (mut session) "(answer)")
+      (jit-reset! (mut session)))
 
 `jit-session-new` locates the matching installed toolchain through `coil` on
 `PATH`; `jit-session-new-with-toolchain` accepts an explicit compiler command.
-`jit-submit!` returns zero after a successful transactional submission and one
-after rendering a diagnostic. `jit-source` exposes accumulated successful
-definitions and `jit-reset!` starts a fresh state lineage. `coil.jit.reload` is
-the public metaprogram implementing stable typed function bindings.
+`jit-compile!` accepts a program or further definition forms. The session retains
+imports, types, traits, impls, canonical function signatures, checked bodies,
+generic specializations, macros, and pipeline registrations. Later submissions
+parse the new forms and compile their new bodies against that environment;
+callers do not supply an environment or repeat accepted source. A module form
+selects the namespace for subsequent submissions; the initial default is
+`jit.session`.
+
+Bindings are static. An existing function definition cannot be overwritten;
+metaprograms can generate fresh implementation identities and choose whether,
+when, and how to publish them through ordinary `Var` cells or other mechanisms.
+The compiler does not retarget old callers or migrate values. Metaprograms can
+retain transactional policy data through `primitive/code-session-state` and
+`primitive/code-session-stage!`. `jit-compile-with-entry!` compiles definitions
+and runs a caller-supplied i64 expression: zero commits the candidate; any other
+result rejects it. Rejection preserves accepted compiler state and native
+publication. Runtime effects performed by that expression are the caller's
+responsibility and are not rolled back.
+
+`jit-evaluate!` evaluates an expression of any type and discards its result.
+To call compiled code directly, declare an `export-c` name and retrieve it with
+`jit-symbol-address`; null means absent. Cast a returned address only to its
+matching C function-pointer type. Operations return zero on success and nonzero
+on rejection; `jit-diagnostic`, `jit-pending`, and `jit-status` expose failures.
+`jit-source` is an inspection transcript, not input replayed by the compiler.
+
+Accepted compiler revisions and their native definitions remain owned by the
+session until `jit-reset!`. Reset releases them and starts a fresh environment;
+it returns -1 while caller generation leases remain outstanding. Serialize SDK
+operations: compiler contexts support synchronous nesting, not concurrent use.
+The existing `jit-submit!` and complete-source replacement operations remain
+source-replay compatibility APIs and cannot be mixed with retained compilation
+in one session without resetting. The SDK defaults to static bindings; legacy
+REPL `Var` lowering in the compatibility API requires an explicit
+`(jit-session-set-legacy-reload! (mut session) true)` before the first submission.
+The terminal `coil repl` continues to opt into that policy.
 
 After initializing the SDK, `jit-read-source-graph(allocator, entry)` discovers
 an entry's source modules with the same namespace roots and unit configuration.
