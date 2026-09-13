@@ -112,7 +112,13 @@
    (revision_heads (HashMap i64 i64))
    (declaration_table (ptr (ArrayList DefEntry)))
    (has_declaration_table bool)
-   (next_form_id i64)])
+   (next_form_id i64)
+   ; form_id -> the revision a TOLERANT parse last rejected. Parsing is a pure
+   ; function of a form revision and its module, so that revision is skipped
+   ; rather than parsed again: during definition-time expansion the same few
+   ; hundred not-yet-expanded forms were re-parsed, and their parser output
+   ; retained, once per tower generation.
+   (failed_parses (HashMap i64 i64))])
 
 (defn semantic-revision-token [(revision i64)] (-> i64)
   ; Zero remains the uninitialized sentinel on TaggedForm. Syntax is mutable
@@ -135,6 +141,8 @@
           (set! (.resolved_revisions ws)
                 (al-new [ResolvedRevision] (.owner slot)))
           (set! (.revision_heads ws)
+                (hm-new [i64 i64] (.owner slot) (i64-keyops)))
+          (set! (.failed_parses ws)
                 (hm-new [i64 i64] (.owner slot) (i64-keyops)))
           (set! (.declaration_table ws)
                 (primitive/cast (ptr (ArrayList DefEntry)) 0))
@@ -4880,7 +4888,8 @@
           (loop (if (>= (load i) n)
                     (break)
                     (let [pf (al-elem [ParsedForm] parsed (load i))]
-                      (unless (load (field pf fresh))
+                      (unless (or (load (field pf fresh))
+                                  (< (load (field pf entry_index)) (primitive/cast i64 0)))
                         (let [entry
                                 (al-elem [ResolvedRevision]
                                          (field ws resolved_revisions)
@@ -4933,6 +4942,48 @@
                 (Err [i64 Diag]
                      (derr "internal compiler error: duplicate semantic form parse escaped the revision cache"))
                 (Ok [i64 Diag] 0))))))
+
+;;; FORM did not parse and the tolerant parse skipped it. When it is a `defn*` whose
+;;; name is written plainly, it still DECLARES that name: record a declaration-only
+;;; entry at the form's own position. The declaration table is then the one the
+;;; form will produce once definition-time expansion makes it parse, instead of
+;;; changing under every cached form the round it first parses — which forced every
+;;; cached revision to be cloned and qualified again.
+(defn tolerant-skipped-declaration! [(a (dyn Allocator))
+                                     (parsed (mut (ArrayList ParsedForm)))
+                                     (empty (mut (ptr Program)))
+                                     (form Sexp)
+                                     (module (Option (slice u8)))
+                                     (source-index i64)] (-> i64)
+  (when (= (sx-tag form) (primitive/cast i64 6))
+    (let [items (sx-items form)]
+      (when (and (> (sx-len items) (primitive/cast i64 1))
+                 (and (= (sx-tag (sx-at items 0)) (primitive/cast i64 2))
+                      (and (= (sx-sval (sx-at items 0)) "defn*")
+                           (and (= (sx-tag (sx-at items 1)) (primitive/cast i64 2))
+                                (and (= (sx-hyg (sx-at items 1)) (primitive/cast i64 0))
+                                     (!= (sx-sval (sx-at items 1)) "main"))))))
+        (when (= (primitive/cast i64 (load empty)) (primitive/cast i64 0))
+          (let [o (primitive/alloc-stack Out)]
+            (init-out o a)
+            (set! empty (out->program o a)))
+          0)
+        (let [defs (primitive/alloc-stack Defs)
+              pf (primitive/alloc-stack ParsedForm)]
+          (set! defs (mk-empty-defs a))
+          (push! (mut (.callables defs)) (sx-sval (sx-at items 1)))
+          (set! (.prog pf) (load empty))
+          (set! (.module pf) module)
+          (set! (.defs pf) (load defs))
+          ; A declaration-only entry has no semantic revision to qualify or replay.
+          (set! (.entry_index pf) -1)
+          (set! (.fresh pf) false)
+          (set! (.source_index pf) source-index)
+          (push! (mut parsed) (load pf)))
+        0)
+      0)
+    0)
+  0)
 
 ; FORM did not parse and the tolerant parse skipped it. When it declares a struct
 ; or sum, record the names a reference to it can carry: its own name (a reference
@@ -5039,6 +5090,133 @@
                        (s (mut LS))
                        (strict bool)
                        (tolerant bool)] (-> (Result (ptr Program) Diag))
+  (resolve-program-into a
+                        (mut s)
+                        strict
+                        tolerant
+                        (primitive/cast (ptr (ptr (ArrayList (slice u8)))) 0)))
+
+;;; The resolution side tables a qualification pass appends to. A probe that
+;;; qualifies syntax it will not keep records its entries after MARK and removes
+;;; them with `resolution-side-tables-truncate!`. This is not optional hygiene: the
+;;; entries borrow names from the probe's allocator, which the caller releases.
+(defstruct ResolutionSideMark [(impl_quals i64) (type_refs i64) (value_refs i64)])
+
+(defn resolution-side-tables-mark [] (-> ResolutionSideMark)
+  (let [m (primitive/alloc-stack ResolutionSideMark)]
+    (set! (.impl_quals m) (len (load (impl-qual-list))))
+    (set! (.type_refs m) (len (load (type-res-list))))
+    (set! (.value_refs m) (len (load (value-res-list))))
+    (load m)))
+
+(defn resolution-side-tables-truncate! [(m ResolutionSideMark)] (-> i64)
+  (let [mark (primitive/alloc-stack ResolutionSideMark)]
+    (set! mark m)
+    (let [iq (impl-qual-list)
+          trefs (type-res-list)
+          vr (value-res-list)]
+      (when (< (.impl_quals mark) (len (load iq)))
+        (set! (.len iq) (.impl_quals mark))
+        0)
+      (when (< (.type_refs mark) (len (load trefs)))
+        (set! (.len trefs) (.type_refs mark))
+        0)
+      (when (< (.value_refs mark) (len (load vr)))
+        (set! (.len vr) (.value_refs mark))
+        0)))
+  0)
+
+;;; Qualify a probe program. The per-module resolution memo borrows the names this
+;;; pass allocates, and a probe allocates in a caller's scratch arena, so the memo is
+;;; dropped on the way out; the next whole resolve rebuilds it from its own names.
+(defn resolve-form-probe-qualify [(c (ptr Ctx)) (p (ptr Program))] (-> (Result i64 Diag))
+  (res-memo-free! (res-memo))
+  (let [result (qualify-program c p)]
+    (res-memo-free! (res-memo))
+    result))
+
+;;; Parse and qualify ONE top-level form against the declaration environment that
+;;; the most recent `resolve-program-into` built, whose bare-ok set is BAREOK.
+;;;
+;;; Nothing is registered with the semantic workspace and FORM is not mutated: this
+;;; is a probe of a candidate rewrite, and the next whole resolve parses the form
+;;; that survives exactly as it would have. Any parse failure or recoverable
+;;; qualification diagnostic is returned as Err — a probe never decides that an
+;;; error is real, it only declines to answer.
+(defn resolve-form-probe [(a (dyn Allocator))
+                          (s (mut LS))
+                          (form (ptr Sexp))
+                          (module (Option (slice u8)))
+                          (bareok (ptr (ArrayList (slice u8))))] (-> (Result (ptr Program)
+                                                                             Diag))
+  (let [ws (semantic-workspace (mut s))]
+    (if (not (.has_declaration_table ws))
+        (Err [(ptr Program) Diag]
+             (derr "internal compiler error: a form probe ran before any resolve built its declaration table"))
+        (let [bindings-work (primitive/alloc-stack scratch/ScratchArena)
+              _bindings-init
+                (scratch/scratch-init-with-cap bindings-work (malloc-allocator) 65536)
+              bindings-a (scratch/scratch-allocator bindings-work)
+              bindings-ls (primitive/alloc-stack LS)
+              saved-bindings (load (primitive-bindings-box))
+              (mut primitive-cache) (al-new [PrimitiveBindingsCacheEntry] bindings-a)]
+          (set! bindings-ls (load s))
+          (set! (.a bindings-ls) bindings-a)
+          (let [binding-entry
+                  (primitive-bindings-cached (mut bindings-ls)
+                                             (mut primitive-cache)
+                                             module)]
+            (primitive-add-hyg-scopes! (mut bindings-ls)
+                                       form
+                                       (load (field binding-entry bindings)))
+            (parser-set-primitive-bindings! (load (field binding-entry bindings))
+                                            (load (field binding-entry plain_index))
+                                            (load (field binding-entry scoped_index))))
+          (let [single
+                  (box! bindings-a (ArrayList Sexp) (primitive/zeroed (ArrayList Sexp)))
+                (mut sl) (al-new [Sexp] bindings-a)]
+            (push! (mut sl) (load form))
+            (set! single (load sl))
+            (let [parsed-form (parse-program a single)]
+              (set! (primitive-bindings-box) saved-bindings)
+              (scratch/scratch-close! bindings-work)
+              (match parsed-form
+                (Err [d] (Err [(ptr Program) Diag] d))
+                (Ok [prog]
+                    (let [pp (box! a Program (primitive/zeroed Program))
+                          m (match module (Some [name] name) (None [] ""))
+                          impb (primitive/alloc-stack (ArrayList ImpEntry))
+                          expb (primitive/alloc-stack (ArrayList ExpEntry))
+                          (mut rdiags) (al-new [Diag] a)
+                          (mut rpoison) (al-new [(slice u8)] a)
+                          cx (primitive/alloc-stack Ctx)]
+                      (set! pp prog)
+                      (set! impb (.imports s))
+                      (set! expb (.exports s))
+                      (init-ctx cx
+                                a
+                                m
+                                (imports-find impb m)
+                                (load (field ws declaration_table))
+                                expb
+                                bareok
+                                false
+                                (mut rdiags)
+                                (mut rpoison))
+                      (set! (.impb cx) impb)
+                      (match (resolve-form-probe-qualify cx pp)
+                        (Err [d] (Err [(ptr Program) Diag] d))
+                        (Ok [_]
+                            (if (> (len (load rdiags)) (primitive/cast i64 0))
+                                (Err [(ptr Program) Diag] (get (load rdiags) 0))
+                                (Ok [(ptr Program) Diag] pp)))))))))))))
+
+(defn resolve-program-into [(a (dyn Allocator))
+                            (s (mut LS))
+                            (strict bool)
+                            (tolerant bool)
+                            (bareok-out (ptr (ptr (ArrayList (slice u8)))))] (-> (Result (ptr Program)
+                                                                                         Diag))
   (let [impb
           (box! a (ArrayList ImpEntry) (primitive/zeroed (ArrayList ImpEntry)))
         expb
@@ -5053,6 +5231,8 @@
         (mut pfailed) false
         (mut fi) 0
         (mut cache-hits) 0
+        (mut known-failures) 0
+        (mut empty-program) (primitive/cast (ptr Program) 0)
         ; Attribute fresh parsing and immutable revision capture separately.
         ; The surrounding resolve span includes both, plus cache replay and
         ; declaration-table work, so it cannot identify the retained copies.
@@ -5102,21 +5282,33 @@
                                     (None [] "")))
                   (let [form-id (.form_id tfp)
                         (mut revision) (.revision tfp)
-                        (mut shape) (.cached_shape tfp)
+                        ; Zero means the shape was never recorded for this copy of
+                        ; the form, not that it differs. Normalize before the lookup:
+                        ; comparing the raw zero missed every form whose shape had only
+                        ; been recorded on another copy, re-parsing the whole program.
+                        (mut shape)
+                          (if (= (.cached_shape tfp) 0)
+                              (semantic-revision-token (.revision tfp))
+                              (.cached_shape tfp))
+                        _shape (store! (field tfp cached_shape) (load shape))
                         (mut cached)
                           (semantic-revision-find ws
                                                   (.module tfp)
                                                   form-id
                                                   (load revision)
-                                                  (load shape))]
-                    (when (= (load shape) 0)
-                      (store! shape (semantic-revision-token (load revision)))
-                      (store! (field tfp cached_shape) (load shape))
-                      0)
+                                                  (load shape))
+                        ; This exact revision already failed a tolerant parse: its
+                        ; nids were freshened then, and it is skipped again below.
+                        known-failure
+                          (and tolerant
+                               (and (< (load cached) 0)
+                                    (match (get (.failed_parses ws) form-id)
+                                      (Some [failed] (= failed (load revision)))
+                                      (None [] false))))]
                     ; Rewriting any part creates a new top-level semantic
                     ; revision. Freshen the complete tree so unchanged children
                     ; cannot alias annotations retained by the old revision.
-                    (when (< (load cached) 0)
+                    (when (and (< (load cached) 0) (not known-failure))
                       ; A mutation site that did not explicitly advance the
                       ; revision is repaired here and becomes visible to the
                       ; invariant audit.
@@ -5134,6 +5326,19 @@
                       (store! shape (semantic-revision-token (load revision)))
                       (store! (field tfp cached_shape) (load shape))
                       0)
+                    (if known-failure
+                        (do
+                          (set! known-failures (+ (load known-failures) 1))
+                          (tolerant-skipped-declaration! a
+                                                         (mut (.items pb))
+                                                         (mut empty-program)
+                                                         (.form tfp)
+                                                         (.module tfp)
+                                                         (load fi))
+                          (tolerant-skipped-type! a
+                                                  (mut skipped-types)
+                                                  (.form tfp)
+                                                  (.module tfp)))
                     (if (>= (load cached) 0)
                         (let [pf (primitive/alloc-stack ParsedForm)
                               entry
@@ -5195,10 +5400,20 @@
                             (match parsed-form
                               (Err [d]
                                    (if tolerant
-                                       (tolerant-skipped-type! a
-                                                               (mut skipped-types)
-                                                               (.form tfp)
-                                                               (.module tfp))
+                                       (do
+                                         (set! (mut (.failed_parses ws))
+                                               form-id
+                                               (load revision))
+                                         (tolerant-skipped-declaration! a
+                                                                        (mut (.items pb))
+                                                                        (mut empty-program)
+                                                                        (.form tfp)
+                                                                        (.module tfp)
+                                                                        (load fi))
+                                         (tolerant-skipped-type! a
+                                                                 (mut skipped-types)
+                                                                 (.form tfp)
+                                                                 (.module tfp)))
                                        (do
                                          (store! perr d)
                                          (store! pfailed true)
@@ -5239,12 +5454,13 @@
                                       (set! (.entry_index pf) entry)
                                       (set! (.fresh pf) true)
                                       (set! (.source_index pf) (load fi))
-                                      (push! (mut (.items pb)) (load pf))))))))))))
+                                      (push! (mut (.items pb)) (load pf)))))))))))))
                 (set! fi (primitive/iadd (load fi) 1)))))
     (set! (primitive-bindings-box) saved-bindings)
     (scratch/scratch-close! bindings-work)
     (tr/span-end parse-span)
     (tr/count "semantic.form-cache-hits" (load cache-hits))
+    (tr/count "semantic.known-parse-failures" (load known-failures))
     (tr/count "semantic.form-parse-bytes" (load form-parse-bytes))
     (tr/count "semantic.revision-capture-bytes" (load revision-capture-bytes))
     (unless (load pfailed)
@@ -5300,6 +5516,10 @@
                               (mut qerr) (primitive/zeroed Diag)
                               (mut qfailed) false
                               (mut qi) 0]
+                          (unless (= (primitive/cast i64 bareok-out)
+                                     (primitive/cast i64 0))
+                            (store! bareok-out bareok)
+                            0)
                           (set! rdiags (al-new [Diag] a))
                           (set! rpoison (al-new [(slice u8)] a))
                           (set! (.resolve_diags s) rdiags)
@@ -5313,16 +5533,20 @@
                                                        parsed
                                                        (load qi))
                                             prog (load (field pf prog))
+                                            declaration-only (< (.entry_index pf) 0)
                                             entry
-                                              (al-elem [ResolvedRevision]
-                                                       (field ws
-                                                              resolved_revisions)
-                                                       (.entry_index pf))
+                                              (if declaration-only
+                                                  (primitive/cast (ptr ResolvedRevision) 0)
+                                                  (al-elem [ResolvedRevision]
+                                                           (field ws
+                                                                  resolved_revisions)
+                                                           (.entry_index pf)))
                                             needs
-                                              (or (.fresh pf)
-                                                  (or (not (.qualified entry))
-                                                      (and strict
-                                                           (not (.strict entry)))))]
+                                              (and (not declaration-only)
+                                                   (or (.fresh pf)
+                                                       (or (not (.qualified entry))
+                                                           (and strict
+                                                                (not (.strict entry))))))]
                                         (when needs
                                           (let [m
                                                   (match (.module pf)
@@ -5365,7 +5589,7 @@
                                                               true)
                                                       0)))))
                                           0)
-                                        (unless needs
+                                        (unless (or needs declaration-only)
                                           (semantic-replay-resolution! entry)
                                           0)
                                         (unless (load qfailed)

@@ -14,7 +14,7 @@ ALLOWED = {
     ("expander.coil", "tower-restore-metas!"),
     ("expander.coil", "do-produced"),
     ("metaengine.coil", "meta-sub-forms"),
-    ("resolve.coil", "resolve-program"),
+    ("resolve.coil", "resolve-program-into"),
 }
 DEFN = re.compile(r"^\(defn\s+([^\s\[]+)")
 FORM_WRITE = re.compile(r"\((?:store!\s+\(field\s+[^)]*\sform\)|set!\s+\(\.form\s+)")
