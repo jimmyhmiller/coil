@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove incremental work through the real terminal, at compiler boundaries."""
+"""Prove single-form compilation and default Var policy through the real REPL."""
 from collections import Counter
 from pathlib import Path
 import os
@@ -11,8 +11,12 @@ compiler = Path(sys.argv[1]).resolve()
 source = """(defn proof-old [] (-> i64) 7)
 (defn proof-new [] (-> i64) (+ (proof-old) 1))
 (proof-new)
+(defn proof-old [] (-> i64) 15)
+(proof-new)
 :type (proof-old)
-(defn invalid [] (-> i64) true)
+(defn proof-old [] (-> bool) true)
+(proof-new)
+(defn proof-old [] (-> i64) true)
 (proof-new)
 :quit
 """
@@ -20,9 +24,10 @@ run = subprocess.run([str(compiler), "repl"], input=source, cwd=ROOT,
                      env=dict(os.environ, COIL_JIT_TRACE="1"),
                      capture_output=True, text=True, timeout=120)
 assert run.returncode == 0, (run.returncode, run.stdout, run.stderr)
-assert run.stdout.count("coil> 8\n") == 2, run.stdout
+assert run.stdout.count("coil> 8\n") == 1, run.stdout
+assert run.stdout.count("coil> 16\n") == 3, run.stdout
 assert "coil> i64\n" in run.stdout, run.stdout
-assert "invalid" in run.stderr and "error:" in run.stderr, run.stderr
+assert "conflicting types for parameter" in run.stderr, run.stderr
 
 submissions = []
 active = None
@@ -40,45 +45,48 @@ for line in run.stderr.splitlines():
     else:
         assert active is not None, (stage, name)
         active.append((stage, name))
-assert active is None and len(submissions) == 7, (active, len(submissions))
+assert active is None and len(submissions) == 11, (active, len(submissions))
 assert [status for status, _ in submissions] == [
-    "accepted", "accepted", "accepted", "accepted", "aborted", "rejected", "accepted"]
+    "accepted", "accepted", "accepted", "accepted", "accepted", "accepted",
+    "aborted", "rejected", "accepted", "rejected", "accepted"]
 
-# Positive controls: the trace must see actual work when old is first submitted.
-old = submissions[1][1]
-assert ("parse", "proof-old") in old
-assert ("check", "replsession.proof-old") in old
-assert ("emit", "replsession.proof-old") in old
+# Capture the actual hygienic identity, not merely the public Var's spelling.
+old_names = [name for stage, name in submissions[1][1]
+             if stage == "emit" and name.endswith("@$proof-old")]
+assert len(old_names) == 1, old_names
+old_name = old_names[0]
+old_parse = old_name.removeprefix("replsession.")
+assert ("parse", old_parse) in submissions[1][1]
+assert ("check", old_name) in submissions[1][1]
 
-print("Submission                         old parsed  old checked  old emitted  new emitted")
-for label, index, expected_new in (("define proof-new", 2, 1),
-                                   ("evaluate proof-new", 3, 0),
-                                   ("query type of proof-old", 4, 0),
-                                   ("reject invalid definition", 5, 0),
-                                   ("evaluate after rejection", 6, 0)):
+emitted_before = {name for stage, name in submissions[1][1]
+                  if stage == "emit" and not name.startswith("replsession.__coil_jit_entry_")}
+print("Submission                         old parsed  old checked  old emitted")
+for index, label in enumerate(("define caller", "evaluate caller", "redefine original",
+                               "evaluate existing caller", "query type", "reject signature",
+                               "evaluate after rejection", "reject body", "evaluate after rejection"), 2):
     events = submissions[index][1]
-    assert ("retained", "replsession.proof-old") in events, (label, events)
+    assert ("retained", old_name) in events, (label, events)
     counts = Counter(events)
-    old_counts = [sum(n for (stage, name), n in counts.items()
-                      if stage == wanted and name.rsplit(".", 1)[-1] == "proof-old")
-                  for wanted in ("parse", "check", "emit")]
+    old_counts = [counts["parse", old_parse], counts["check", old_name], counts["emit", old_name]]
     assert old_counts == [0, 0, 0], (label, old_counts)
-    new_emitted = counts["emit", "replsession.proof-new"]
-    assert new_emitted == expected_new, (label, new_emitted)
-    # Prove there is no hidden repeat of unrelated compiler/runtime bodies.
+    # Every previously accepted function remains metadata only, including the
+    # caller and each superseded implementation. Check actual compiler work.
+    retained = {name for stage, name in events if stage == "retained"}
+    for stage, name in events:
+        if stage in ("check", "emit"):
+            assert name not in retained, (label, stage, name)
+        if stage == "parse":
+            assert "replsession." + name not in retained, (label, stage, name)
     emitted = [name for stage, name in events if stage == "emit"]
-    allowed = {"replsession.proof-new"} if expected_new else set()
-    unexpected = [name for name in emitted
-                  if name not in allowed and not name.startswith("replsession.__coil_jit_entry_")]
-    assert not unexpected, (label, unexpected)
-    checked = [name for stage, name in events if stage == "check"]
-    allowed_checks = {"replsession.proof-new", "replsession.invalid"}
-    assert all(name in allowed_checks or name.startswith("replsession.__coil_jit_entry_")
-               for name in checked), (label, checked)
-    print(f"{label:34} {old_counts[0]:10} {old_counts[1]:12} {old_counts[2]:12} {new_emitted:12}")
+    implementations = [name for name in emitted if "@$proof-" in name]
+    assert len(implementations) == (1 if index in (2, 4) else 0), (label, implementations)
+    native = {name for name in emitted
+              if not name.startswith("replsession.__coil_jit_entry_")}
+    assert not native.intersection(emitted_before), (label, native.intersection(emitted_before))
+    emitted_before.update(native)
+    print(f"{label:34} {old_counts[0]:10} {old_counts[1]:12} {old_counts[2]:12}")
 
-# API removal is a structural contract too: no dormant replay implementation or
-# alias can silently reintroduce a second compilation route.
 for file in ("src/compiler/driver.coil", "src/compiler/jit_api.coil", "src/compiler/jit.coil"):
     text = (ROOT / file).read_text()
     for removed in ("repl-def-source", "repl-session-submit!", "repl-session-replace!",
@@ -86,13 +94,12 @@ for file in ("src/compiler/driver.coil", "src/compiler/jit_api.coil", "src/compi
                     "repl-infer-type-unscoped", "jit-submit!", "jit-replace-source!",
                     "jit-prepare-replace", "set-legacy-reload!", "jit-syms-lookup-unique-leaf"):
         assert removed not in text, (file, removed)
-print("PASS: real REPL submissions do not parse, check, or emit prior function bodies")
+print("PASS: default Var redefinition updates old callers without compiling accepted bodies")
 
-# Runtime bindings and opt-in mutation use ordinary language semantics too.
-# In particular the terminal must not rewrite `def` into a compile-time const.
+# Explicit static functions and ordinary runtime bindings remain available.
 dynamic = """(import "coil.var" :use [var-static])
-(defn double [(x i64)] (-> i64) (* x 2))
-(defn triple [(x i64)] (-> i64) (* x 3))
+(defn* double [(x i64)] (-> i64) (* x 2))
+(defn* triple [(x i64)] (-> i64) (* x 3))
 (def hot (var-static (fnptr c [i64] i64) (primitive/fnptr-of double)))
 (hot 10)
 (set hot (primitive/fnptr-of triple))
@@ -105,3 +112,53 @@ assert run.returncode == 0, (run.returncode, run.stdout, run.stderr)
 assert "error:" not in run.stderr, run.stderr
 assert "coil> 20\n" in run.stdout and "coil> 30\n" in run.stdout, run.stdout
 print("PASS: terminal runtime def supports ordinary Var publication and update")
+
+# The reported reproduction, retained nominal types, batches, recursion, and reset.
+source = """(defn f [] (-> i64) 15)
+(defn f [] (-> i64) 15)
+(f)
+(defstruct Box [(x i64)])
+(defn val [(x Box)] (-> i64) (.x x))
+(val (Box :x 17))
+(defn val [(x Box)] (-> i64) (+ (.x x) 1))
+(val (Box :x 17))
+(defstruct Pair [T] [(x T)])
+(defn pairval [(x (Pair i64))] (-> i64) (.x x))
+(pairval (Pair :x 42))
+:compile (defn twice [] (-> i64) 1) (defn twice [] (-> i64) 2)
+(twice)
+(defn fact [(n i64)] (-> i64) (if (= n 0) 1 (* n (fact (- n 1)))))
+(fact 5)
+(module other)
+(defn f [] (-> i64) 3)
+(f)
+(module replsession)
+(f)
+:reset
+(defn f [] (-> i64) 4)
+(f)
+:quit
+"""
+run = subprocess.run([str(compiler), "repl"], input=source, cwd=ROOT,
+                     capture_output=True, text=True, timeout=120)
+assert run.returncode == 0 and "error:" not in run.stderr, (run.stdout, run.stderr)
+for value in (15, 17, 18, 42, 2, 120, 3, 4):
+    assert f"coil> {value}\n" in run.stdout, (value, run.stdout)
+assert run.stdout.count("coil> 15\n") == 2, run.stdout
+print("PASS: identical redefinition, retained types, batches, recursion, namespaces, and reset")
+
+# Expansion tripwire: the policy's accepted identity registry is empty when the
+# first runtime definition expands, then nonempty for every later submission.
+source = """(defn once [] (-> Code) (if (= (primitive/code-count (primitive/code-session-state `())) 0) `7 (primitive/error "accepted macro call was replayed")))
+(defn original [] (-> i64) (once))
+(defn later [] (-> i64) (+ (original) 1))
+(later)
+(defn later [] (-> i64) (+ (original) 2))
+(later)
+:quit
+"""
+run = subprocess.run([str(compiler), "repl"], input=source, cwd=ROOT,
+                     capture_output=True, text=True, timeout=120)
+assert run.returncode == 0 and "error:" not in run.stderr, (run.stdout, run.stderr)
+assert "coil> 8\n" in run.stdout and "coil> 9\n" in run.stdout, run.stdout
+print("PASS: accepted macro calls are not expanded again by the Var policy")

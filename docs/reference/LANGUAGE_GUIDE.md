@@ -137,8 +137,18 @@ Accepted compiler revisions and their native definitions remain owned by the
 session until `jit-reset!`. Reset releases them and starts a fresh environment;
 it returns -1 while caller generation leases remain outstanding. Serialize SDK
 operations: compiler contexts support synchronous nesting, not concurrent use.
-The terminal `coil repl` uses the same retained compilation path, with static
-bindings. A module form selects a namespace without moving existing definitions.
+The terminal `coil repl` uses the same retained compilation path and enables
+`coil.repl`'s Var metaprogram by default. Redefining a runtime function gives its
+implementation a fresh identity and updates the existing Var; previously compiled
+callers observe the update. An incompatible signature or invalid body rejects the
+submission and preserves the previous value. Types, macros, generic functions,
+ordinary `def` bindings, and explicit `defn*` functions remain static.
+A module form selects a namespace without moving existing definitions.
+
+SDK consumers may opt into the same policy by importing `coil.repl` and calling
+`jit-compile-with-entry!` with `(coil.repl/publish)` as the entry expression.
+The policy uses transactional Code session state to retain binding identities;
+it never resubmits accepted bodies. A plain SDK session remains static.
 `:type EXPR` checks against the retained environment without executing the expression.
 Use `:compile FORMS` for arbitrary top-level metaprogram submissions.
 

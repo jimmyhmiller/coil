@@ -9,11 +9,12 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPILER = Path(sys.argv[1]).resolve()
+TOOLCHAIN_ENV = os.environ.copy()
 
 
 def run(*args, env=None):
     result = subprocess.run(list(map(str, args)), cwd=ROOT, text=True,
-                            capture_output=True, timeout=240, env=env)
+                            capture_output=True, timeout=240, env=env or TOOLCHAIN_ENV)
     assert result.returncode == 0, (args, result.returncode, result.stdout, result.stderr)
     return result
 
@@ -25,10 +26,16 @@ repl = subprocess.run([str(COMPILER), "repl"], cwd=ROOT, text=True,
     capture_output=True, timeout=120)
 assert repl.returncode == 0, (repl.returncode, repl.stdout, repl.stderr)
 assert repl.stdout.count("7") == 2, repl.stdout
-assert "static definition" in repl.stderr, repl.stderr
+assert "conflicting types for parameter" in repl.stderr, repl.stderr
 
 with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
     work = Path(raw)
+    # SDK sessions using the default "coil" toolchain must initialize from the
+    # candidate and its matching library, not an unrelated global installation.
+    toolbin = work / "bin"
+    toolbin.mkdir()
+    (toolbin / "coil").symlink_to(COMPILER)
+    TOOLCHAIN_ENV["PATH"] = str(toolbin) + os.pathsep + os.environ["PATH"]
     unit = work / "sdk"
     run(COMPILER, "build-unit", ROOT / "src/compiler/jit_api.coil", "-o", unit,
         "--backend", "llvm", "-O3", "--quiet")
@@ -42,7 +49,7 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
         for flag in shlex.split(run(os.environ.get("LLVM_CONFIG", "llvm-config"),
                                    "--ldflags", "--libs", "--system-libs").stdout):
             flags += ["--link-flag", flag]
-    fixtures = ("jit_static_session", "jit_static_lifetime", "jit_static_policy",
+    fixtures = ("jit_repl_policy", "jit_static_session", "jit_static_lifetime", "jit_static_policy",
                 "jit_static_dynamic", "jit_static_isolation", "jit_single_form_proof",
                 "jit_generation_tokens", "jit_frontend_policy")
     for name in fixtures:

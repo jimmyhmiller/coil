@@ -3979,7 +3979,7 @@ EOF
     *) ok "ordinary programs do not link the compiler SDK" ;;
   esac
 
-  echo "== repl: multiline, static bindings, persistent state, and transactions =="
+  echo "== repl: multiline, Var redefinition, persistent state, and transactions =="
   python3 scripts/dev.py install --source "$COIL" --dest "$T/repl-prefix/bin/coil" >/dev/null 2>&1
   REPL_COIL="$T/repl-prefix/bin/coil"
   repl_out=$(printf '%s\n' \
@@ -4000,11 +4000,11 @@ EOF
     '(four-times 10)' \
     ':q' | if [ "$HOST_OS" = Darwin ]; then PATH="$T/no-cc:$PATH" "$REPL_COIL" repl 2>&1; else "$REPL_COIL" repl 2>&1; fi)
   case "$repl_out" in
-    *'coil> 1'*'coil> 40'*'coil> 2'*'coil> 40'*'coil> 3'*'coil> 40'*) ok "repl preserves state and rejects replacement of static definitions" ;;
-    *) bad "repl preserves state and rejects replacement of static definitions" "$repl_out" ;;
+    *'coil> 1'*'coil> 40'*'coil> 2'*'coil> 90'*'coil> 3'*'coil> 90'*) ok "repl preserves state and updates previously compiled callers" ;;
+    *) bad "repl preserves state and updates previously compiled callers" "$repl_out" ;;
   esac
   case "$repl_out" in
-    *"static definition 'replsession.twice' already exists"*) ok "repl reports the incompatible redefinition" ;;
+    *"conflicting types for parameter 'T'"*) ok "repl reports the incompatible redefinition" ;;
     *) bad "repl reports the incompatible redefinition" "$repl_out" ;;
   esac
 
