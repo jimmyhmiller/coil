@@ -49,7 +49,7 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
         for flag in shlex.split(run(os.environ.get("LLVM_CONFIG", "llvm-config"),
                                    "--ldflags", "--libs", "--system-libs").stdout):
             flags += ["--link-flag", flag]
-    fixtures = ("jit_repl_policy", "jit_static_session", "jit_static_lifetime", "jit_static_policy",
+    fixtures = ("jit_metadata_lifetime", "jit_repl_policy", "jit_static_session", "jit_static_lifetime", "jit_static_policy",
                 "jit_static_dynamic", "jit_static_isolation", "jit_single_form_proof",
                 "jit_generation_tokens", "jit_frontend_policy")
     for name in fixtures:

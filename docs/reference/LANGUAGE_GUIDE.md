@@ -131,12 +131,20 @@ To call compiled code directly, declare an `export-c` name and retrieve it with
 `jit-symbol-address`; null means absent. Cast a returned address only to its
 matching C function-pointer type. Operations return zero on success and nonzero
 on rejection; `jit-diagnostic`, `jit-pending`, and `jit-status` expose failures.
-`jit-source` is an inspection transcript, not input replayed by the compiler.
+The session does not retain a submitted-source journal; keep one in the client if needed.
 
-Accepted compiler revisions and their native definitions remain owned by the
-session until `jit-reset!`. Reset releases them and starts a fresh environment;
+Each accepted edit replaces one compact live metadata graph and releases compiler
+scratch. Native definitions have separate ownership until `jit-reset!`. Reset
+releases the environment and native resources and starts a fresh environment;
 it returns -1 while caller generation leases remain outstanding. Serialize SDK
 operations: compiler contexts support synchronous nesting, not concurrent use.
+For metaprogram-generated concrete implementations, import `coil.jit.lifetime`
+and add `:jit/retain false` to exclude an implementation from metadata roots after
+publication. Retained definitions and initializers can still keep it alive through
+dependencies; its native function pointer remains callable. Generic and
+Code-returning functions cannot use this annotation. See
+[Stateful JIT](STATEFUL_JIT.md) for integration and ownership examples.
+
 The terminal `coil repl` uses the same retained compilation path and enables
 `coil.repl`'s Var metaprogram by default. Redefining a runtime function gives its
 implementation a fresh identity and updates the existing Var; previously compiled
