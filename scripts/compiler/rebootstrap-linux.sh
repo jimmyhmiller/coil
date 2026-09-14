@@ -81,7 +81,13 @@ echo "stage0 = $STAGE0 ($STAGE0_SOURCE; libLLVM: $libdir)"
 stage0_check "$STAGE0" "$SEED" "$SRC" "${LF[@]}" || exit 1
 
 echo "=== stage1: stage0 builds the self-host compiler ==="
-stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$S1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
+# The committed/IR stage0 predates the bundled-curl zlib fix. Its linker puts
+# explicit --link-flag inputs before auto-discovered archives, so an ordinary
+# early -lz is discarded by GNU ld's --as-needed. Retain zlib for this one
+# bootstrap link; stage1 and later append -lz after their curl archives.
+stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$S1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} "${LF[@]}" \
+  --link-flag "-Wl,--no-as-needed" --link-flag -lz --link-flag "-Wl,--as-needed" \
+  || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it ==="
 "$S1" build "$SRC" -o "$S2" "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
 echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="

@@ -140,10 +140,15 @@ def run(compiler: Path, command: str, source: str, *extra: str) -> subprocess.Co
 
 def normalize_stage_output(stage: str, output: bytes) -> bytes:
     if stage in {"ir", "x86", "full"}:
-        # LLVM 21 prints this double literal as f0x..., while LLVM 22 prints
-        # the same 64-bit bit pattern as 0x.... Keep snapshots about the IR,
-        # not the host LLVM printer's spelling of one floating constant.
-        return re.sub(rb"(?<![\w.])f0x([0-9A-Fa-f]{16})(?![\w])", rb"0x\1", output)
+        # LLVM 23 prints this double literal as f0x..., while LLVM 22 prints
+        # the same 64-bit bit pattern as 0x.... It also adds `nosync` to the
+        # argmem read/write intrinsic's inferred attribute set. Normalize only
+        # these two known printer/version differences, not arbitrary IR.
+        output = re.sub(rb"(?<![\w.])f0x([0-9A-Fa-f]{16})(?![\w])", rb"0x\1", output)
+        return output.replace(
+            b"nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)",
+            b"nocallback nofree nounwind willreturn memory(argmem: readwrite)",
+        )
     return output
 
 
