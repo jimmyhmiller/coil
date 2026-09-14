@@ -5,7 +5,7 @@
 #   * every stage uses the DEFAULT (LLVM) backend — the native arm64 backend emits
 #     Mach-O and never runs here, so the fixpoint is the LLVM-backend one
 #     (stage2.o == stage3.o, byte-identical; the LLVM emission is deterministic).
-#   * it runs NO gates. It builds three stages and compares two objects. The test
+#   * it runs NO gates. It builds two stages and compares two objects. The test
 #     batteries that used to hang off the end of it are not Linux-specific and
 #     made this take 17 minutes; see the note at the fixpoint for what went.
 #
@@ -30,7 +30,7 @@ SRC=src/compiler/main.coil
 SEED=bootstrap/seeds/native/coil-seed-linux-x86_64
 RUN_DIR=$(mktemp -d /tmp/coil-rebootstrap-linux.XXXXXX) || exit 1
 trap 'stage_lib_cleanup; rm -rf "$RUN_DIR"' EXIT
-S1="$RUN_DIR/coil-lrb1"; S2="$RUN_DIR/coil-lrb2"; S3="$RUN_DIR/coil-lrb3"
+S1="$RUN_DIR/coil-lrb1"; S2="$RUN_DIR/coil-lrb2"
 
 libdir="${COIL_LLVM_LIBDIR:-}"
 if [ -z "$libdir" ]; then
@@ -84,9 +84,6 @@ echo "=== stage1: stage0 builds the self-host compiler ==="
 stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$S1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it ==="
 "$S1" build "$SRC" -o "$S2" "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
-echo "=== stage3: stage2 rebuilds it ==="
-"$S2" build "$SRC" -o "$S3" "${LF[@]}" || { echo "stage3 FAILED"; exit 1; }
-
 echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="
 "$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" || { echo "stage2 object emission FAILED"; exit 1; }
 "$S2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" || { echo "stage3 object emission FAILED"; exit 1; }

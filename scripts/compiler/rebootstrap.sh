@@ -8,9 +8,9 @@
 #   (the Rust reference compiler has been removed; the seed is fully self-sufficient)
 # You never need cargo/rustc/inkwell; the seed re-derives the whole compiler from source.
 #
-# The seed is not trusted blindly: stage1 rebuilds from source, stage1 builds stage2,
-# and stage2 builds stage3. Byte-identical stage2/stage3 objects establish the fixed
-# point. Behavioral, backend, CLI, lint, Scheme, snapshot, and Wasm tests are separate
+# The seed is not trusted blindly: stage1 rebuilds from source and builds stage2.
+# Byte-identical objects emitted independently by stage1 and stage2 establish the
+# fixed point. Behavioral, backend, CLI, lint, Scheme, snapshot, and Wasm tests are separate
 # test commands; they do not belong in the bootstrap dependency chain.
 #
 # Requirements: libLLVM.dylib (brew install llvm) + a C compiler (cc). That's it.
@@ -46,13 +46,12 @@ RUN_DIR=$(mktemp -d /tmp/coil-rebootstrap.XXXXXX) \
   || { echo "cannot create bootstrap stage directory"; exit 1; }
 RB1="$RUN_DIR/coil-rb1"
 RL2="$RUN_DIR/coil-rl2"
-RL3="$RUN_DIR/coil-rl3"
 cleanup_run_dir() {
   stage_lib_cleanup
   rm -rf "$RUN_DIR"
 }
 trap cleanup_run_dir EXIT
-# ---- THE THREE BUILDS --------------------------------------------------------
+# ---- BOOTSTRAP BUILDS --------------------------------------------------------
 #
 #   flavour        script                            LLVM            links
 #   -------------  --------------------------------  --------------  -------------------------
@@ -93,9 +92,6 @@ stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$RB1" ${STAGE0_BUILD_FLAGS[@]+
 echo "=== stage2: stage1 rebuilds the compiler ==="
 "$RB1" build "$SRC" -o "$RL2" "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
 
-echo "=== stage3: stage2 rebuilds the compiler ==="
-"$RL2" build "$SRC" -o "$RL3" "${LF[@]}" || { echo "stage3 FAILED"; exit 1; }
-
 echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="
 "$RB1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" || { echo "stage2 object emission FAILED"; exit 1; }
 "$RL2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" || { echo "stage3 object emission FAILED"; exit 1; }
@@ -108,7 +104,7 @@ stage_lib_cleanup
 DEST="${1:-build/bin/coil}"
 # Install the stage-3 compiler that reproduced stage 2 byte-for-byte.
 mkdir -p "$(dirname "$DEST")"
-cp "$RL3" "$DEST"
+cp "$RL2" "$DEST"
 # Re-sign after copy: macOS invalidates a Mach-O's ad-hoc signature on cp, and the
 # kernel SIGKILLs a mis-signed binary. Re-sign so the installed compiler runs.
 codesign -s - --force "$DEST" >/dev/null 2>&1 || true

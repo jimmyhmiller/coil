@@ -29,7 +29,7 @@ SRC=src/compiler/main_a64.coil
 SEED=bootstrap/seeds/native/coil-seed-nollvm
 RUN_DIR=$(mktemp -d /tmp/coil-rebootstrap-nollvm.XXXXXX) || exit 1
 trap 'stage_lib_cleanup; rm -rf "$RUN_DIR"' EXIT
-S1="$RUN_DIR/coil-nl1"; S2="$RUN_DIR/coil-nl2"; S3="$RUN_DIR/coil-nl3"
+S1="$RUN_DIR/coil-nl1"; S2="$RUN_DIR/coil-nl2"
 # Scope the namespace scan: a seed that predates the loader's hidden-directory
 # prune would otherwise index stray tree copies (e.g. .claude/worktrees/*) and
 # report every namespace as declared twice.
@@ -54,9 +54,6 @@ echo "=== stage1: stage0 builds the LLVM-free compiler ==="
 stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$S1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} || { echo "stage1 FAILED"; exit 1; }
 echo "=== stage2: stage1 rebuilds it with --backend arm64 ==="
 "$S1" build "$SRC" -o "$S2" --backend arm64 || { echo "stage2 FAILED"; exit 1; }
-echo "=== stage3: stage2 rebuilds it with --backend arm64 ==="
-"$S2" build "$SRC" -o "$S3" --backend arm64 || { echo "stage3 FAILED"; exit 1; }
-
 echo "=== NO-LLVM: stage2 must link no libLLVM ==="
 otool_output=$(otool -L "$S2") || { echo "  FAIL — otool could not inspect stage2"; exit 3; }
 dependencies=$(printf '%s\n' "$otool_output" | tail -n +2)

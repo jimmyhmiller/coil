@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -137,6 +138,15 @@ def run(compiler: Path, command: str, source: str, *extra: str) -> subprocess.Co
     return subprocess.run([str(compiler), command, source, *extra], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
+def normalize_stage_output(stage: str, output: bytes) -> bytes:
+    if stage in {"ir", "x86", "full"}:
+        # LLVM 21 prints this double literal as f0x..., while LLVM 22 prints
+        # the same 64-bit bit pattern as 0x.... Keep snapshots about the IR,
+        # not the host LLVM printer's spelling of one floating constant.
+        return re.sub(rb"(?<![\w.])f0x([0-9A-Fa-f]{16})(?![\w])", rb"0x\1", output)
+    return output
+
+
 def reset(directory: Path) -> None:
     shutil.rmtree(directory, ignore_errors=True)
     directory.mkdir(parents=True)
@@ -159,7 +169,7 @@ def snapshot_simple(compiler: Path, stage: str, inputs: list[str], *, command: s
         if result.returncode and source not in (expected_failures or set()):
             sys.stderr.buffer.write(result.stderr)
             raise SystemExit(f"snapshot {stage} failed: {source}")
-        (reference / f"{mangle(source)}{suffix}").write_bytes(result.stdout)
+        (reference / f"{mangle(source)}{suffix}").write_bytes(normalize_stage_output(stage, result.stdout))
         accepted.append(source)
     write_list(corpus, accepted)
     return accepted
@@ -313,7 +323,8 @@ def gate(compiler: Path, stage: str, verbose: bool) -> int:
         result = run(compiler, COMMAND[stage], source, *extra)
         reference = base / "reference" / f"{mangle(source)}{suffix}"
         expected_code = 1 if stage == "checked" and source.startswith("tests/compiler/oracle/checked/fixtures/") else 0
-        if result.returncode == expected_code and reference.is_file() and result.stdout.rstrip(b"\n") == reference.read_bytes().rstrip(b"\n"):
+        got = normalize_stage_output(stage, result.stdout)
+        if result.returncode == expected_code and reference.is_file() and got.rstrip(b"\n") == reference.read_bytes().rstrip(b"\n"):
             passed += 1
             continue
         failures.append(source)
@@ -321,7 +332,7 @@ def gate(compiler: Path, stage: str, verbose: bool) -> int:
             reason = result.stderr.decode(errors="replace").splitlines()[:1]
             print(f"FAIL {stage}: {source}: {reason[0] if reason else 'output mismatch'}")
             if not reason and reference.is_file():
-                got_lines = result.stdout.decode(errors="replace").splitlines()
+                got_lines = got.decode(errors="replace").splitlines()
                 want_lines = reference.read_text(errors="replace").splitlines()
                 for line_no, (want, got) in enumerate(zip(want_lines, got_lines), 1):
                     if want != got:

@@ -4,7 +4,7 @@
 #
 # It runs against a compiler that has ALREADY been built and verified -- the
 # bootstrap job hands it the stage2 it just proved a fixpoint for -- so this costs
-# only the tests themselves. Roughly 80 seconds. That is the whole design
+# only the tests themselves. That is the whole design
 # constraint: anything that needs to compile the compiler again belongs in a
 # bootstrap job, not here.
 #
@@ -30,7 +30,6 @@ cd "$(dirname "$0")/../.."
 COIL="${1:-build/bin/coil}"
 [ -x "$COIL" ] || { echo "fast-suite: not executable: $COIL"; exit 2; }
 
-fail=0
 start=$(date +%s)
 
 step() { # step <label> <command...>
@@ -46,7 +45,9 @@ step() { # step <label> <command...>
     # The log is the point: a fast gate that fails without saying why just moves
     # the work to whoever reruns it locally.
     tail -100 /tmp/fast-suite.log
-    fail=1
+    echo "  ---- fast suite: $(( $(date +%s) - start ))s ----"
+    echo "fast-suite: FAILED"
+    exit 1
   fi
 }
 
@@ -59,4 +60,4 @@ step "lint fires"        python3 scripts/tests/lint_fires.py --coil "$COIL"
 step "target-os folding" scripts/compiler/oracle/gate-target-os.sh "$COIL"
 
 echo "  ---- fast suite: $(( $(date +%s) - start ))s ----"
-if [ "$fail" = 0 ]; then echo "fast-suite: PASS"; else echo "fast-suite: FAILED"; exit 1; fi
+echo "fast-suite: PASS"
