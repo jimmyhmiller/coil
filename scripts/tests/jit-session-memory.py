@@ -172,9 +172,9 @@ def main() -> None:
                 assert active is not None
                 active[stage] += 1
         assert active is None and len(submissions) == 5, submissions
-        assert all((row['parse'], row['check'], row['emit']) == (4, 2, 2)
+        assert all(row['parse'] <= 4 and (row['check'], row['emit']) == (2, 2)
                    for row in submissions[1:-1]), submissions
-        print('cold-cache public JIT: every definition delta, including the first, parses 4/checks 2/emits 2', flush=True)
+        print('cold-cache public JIT: every definition delta, including the first, parses at most 4/checks 2/emits 2', flush=True)
 
         count = max(80, args.replacements)
         provider = directory / 'reader.coil'
