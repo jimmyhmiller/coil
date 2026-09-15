@@ -344,6 +344,11 @@ def test(args: argparse.Namespace) -> None:
         execute(sys.executable, "tests/compiler/features/authored_gensym_source_guard.py")
         execute(sys.executable, "tests/compiler/features/tagged_form_revision_guard.py")
         execute(compiler, "run", "tests/metaprogramming/global_reference_identity.coil")
+        execute(compiler, "run", "tests/compiler/features/callable_void_return.coil")
+        rejected = subprocess.run([compiler, "check", "tests/compiler/features/void_value_argument_rejected.coil"],
+                                  cwd=ROOT, capture_output=True, text=True)
+        if rejected.returncode == 0 or "void value cannot be used as a type argument" not in rejected.stderr:
+            raise RuntimeError(f"void value argument rejection failed: {rejected.stdout}{rejected.stderr}")
         test_modernize_fast(compiler)
 
 
