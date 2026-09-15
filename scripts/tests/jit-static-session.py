@@ -51,7 +51,7 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
             flags += ["--link-flag", flag]
     fixtures = ("jit_metadata_lifetime", "jit_repl_policy", "jit_static_session", "jit_static_lifetime", "jit_static_policy",
                 "jit_static_dynamic", "jit_static_isolation", "jit_single_form_proof",
-                "jit_generation_tokens", "jit_frontend_policy", "jit_meta_pipeline", "jit_deferred_publication")
+                "jit_generation_tokens", "jit_frontend_policy", "jit_meta_pipeline", "jit_deferred_publication", "jit_repair_diagnostics")
     for name in fixtures:
         binary = work / name
         run(COMPILER, "build", ROOT / f"tests/compiler/features/{name}.coil",
