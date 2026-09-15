@@ -12,8 +12,8 @@ COMPILER = Path(sys.argv[1]).resolve()
 TOOLCHAIN_ENV = os.environ.copy()
 
 
-def run(*args, env=None):
-    result = subprocess.run(list(map(str, args)), cwd=ROOT, text=True,
+def run(*args, env=None, cwd=ROOT):
+    result = subprocess.run(list(map(str, args)), cwd=cwd, text=True,
                             capture_output=True, timeout=240, env=env or TOOLCHAIN_ENV)
     assert result.returncode == 0, (args, result.returncode, result.stdout, result.stderr)
     return result
@@ -51,13 +51,30 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
             flags += ["--link-flag", flag]
     fixtures = ("jit_metadata_lifetime", "jit_repl_policy", "jit_static_session", "jit_static_lifetime", "jit_static_policy",
                 "jit_static_dynamic", "jit_static_isolation", "jit_single_form_proof",
-                "jit_generation_tokens", "jit_frontend_policy")
+                "jit_generation_tokens", "jit_frontend_policy", "jit_meta_pipeline")
     for name in fixtures:
         binary = work / name
         run(COMPILER, "build", ROOT / f"tests/compiler/features/{name}.coil",
             "-o", binary, *flags)
         run(binary)
         print(f"PASS: {name}", flush=True)
+    project = work / "project"
+    project.mkdir()
+    dep = project / "dependency"
+    (dep / "src").mkdir(parents=True)
+    (project / "Coil.toml").write_text(
+        '[package]\nname = "project-host"\nsource-roots = ["src"]\n'
+        '[dependencies]\nproject-dependency = { path = "dependency" }\n')
+    (project / "src").mkdir()
+    (dep / "Coil.toml").write_text(
+        '[package]\nname = "project-dependency"\nsource-roots = ["src"]\n')
+    (dep / "src/values.coil").write_text(
+        '(module project-dependency.values)\n(defn answer [] (-> i64) 42)\n')
+    binary = work / "project-context"
+    run(COMPILER, "build", ROOT / "tests/compiler/features/jit_project_context.coil",
+        "-o", binary, *flags)
+    run(binary, cwd=project)
+    print("PASS: SDK manifest dependency context without process environment mutation", flush=True)
     dependency = work / "dependency.coil"
     dependency.write_text('(module retained.dependency)\n'
                           '(defstruct Point [(x i64)])\n'
