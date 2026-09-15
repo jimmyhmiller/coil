@@ -78,7 +78,9 @@ object, rather than retaining a compiler engine per submission.
 Use `export-c` for a stable C symbol/ABI and `jit-symbol-address` for its address.
 Retain a generation token with `jit-generation-retain-current!` when holding a
 pointer outside the owner's immediate operation; release it with
-`jit-generation-release-token!`. Reset returns `-1` while client leases are live.
+`jit-generation-release-token!`. For a coordinated publication that must avoid allocation, call `jit-generation-reserve-tokens!` before native acceptance, then `jit-generation-retain-reserved!` after acceptance. Reservation adds bookkeeping capacity without taking a lease; reserved acquisition returns `-1` without acquiring ownership if capacity is exhausted or there is no current generation. Reservation returns `-1` for an invalid count and `-2` on allocation failure. The ordinary retain API reserves its bookkeeping before changing native ownership.
+
+Reset returns `-1` while client leases are live.
 After releasing them, `jit-reset!` releases the accepted environment and native
 resources. The session container itself has the allocator's lifetime.
 
