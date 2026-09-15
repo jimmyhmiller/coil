@@ -343,6 +343,7 @@ def test(args: argparse.Namespace) -> None:
         execute(sys.executable, "tests/compiler/features/transparent_arc_source_guard.py")
         execute(sys.executable, "tests/compiler/features/authored_gensym_source_guard.py")
         execute(sys.executable, "tests/compiler/features/tagged_form_revision_guard.py")
+        execute(compiler, "run", "tests/metaprogramming/global_reference_identity.coil")
         test_modernize_fast(compiler)
 
 
