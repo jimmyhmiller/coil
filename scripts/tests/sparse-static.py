@@ -53,7 +53,27 @@ int64_t native_check(void) {
     run(["cc", "-c", native, "-o", obj])
     fixture = ROOT / "tests/compiler/features/sparse_static.coil"
     backends = ["llvm"] + (["arm64"] if platform.machine() == "arm64" else [])
+    # Keep the explicit initializers and native checks identical while changing
+    # the number of implicit zero elements. This separates sparse-array growth
+    # from the compiler's fixed process footprint.
+    small_native = work / "native-small.c"
+    small_native.write_text(native.read_text().replace('708334', '128')
+                            .replace('708333', '127').replace('708332', '126')
+                            .replace('350000', '64'))
+    small_obj = work / "native-small.o"
+    run(["cc", "-c", small_native, "-o", small_obj])
+    small_fixture = work / "small.coil"
+    small_fixture.write_text(fixture.read_text().replace('708334', '128').replace('708333', '127'))
+    pattern = (r"(\d+)\s+maximum resident set size" if sys.platform == "darwin"
+               else r"Maximum resident set size \(kbytes\):\s*(\d+)")
     for backend in backends:
+        small_binary = work / (backend + '-small')
+        baseline = run(["/usr/bin/time", "-l" if sys.platform == "darwin" else "-v", COMPILER,
+                        "build", small_fixture, "--backend", backend, "-O0",
+                        "--link-flag", small_obj, "-o", small_binary])
+        small_peak = int(re.search(pattern, baseline.stderr)[1]) * (1 if sys.platform == "darwin" else 1024)
+        run([small_binary])
+        print(f"baseline {backend}: 128-element arrays; peak {small_peak} B", flush=True)
         binary = work / backend
         start = time.monotonic()
         result = run(["/usr/bin/time", "-l" if sys.platform == "darwin" else "-v", COMPILER, "build", fixture, "--backend", backend,
@@ -62,9 +82,10 @@ int64_t native_check(void) {
         pattern = (r"(\d+)\s+maximum resident set size" if sys.platform == "darwin"
                    else r"Maximum resident set size \(kbytes\):\s*(\d+)")
         peak = int(re.search(pattern, result.stderr)[1]) * (1 if sys.platform == "darwin" else 1024)
-        assert peak < 450_000_000, (backend, peak)
+        assert max(small_peak, peak) < 512 * 1024 * 1024, (backend, small_peak, peak)
+        assert peak - small_peak < 16 * 1024 * 1024, (backend, 'sparse hole count grew compiler memory', small_peak, peak)
         run([binary])
-        print(f"PASS {backend}: constructor visibility, holes, nested arrays, mutation; {elapsed:.3f}s / {peak} B")
+        print(f"PASS {backend}: constructor visibility, holes, nested arrays, mutation; {elapsed:.3f}s / {peak} B (growth {peak-small_peak} B)")
     ir = run([COMPILER, "emit-ir", fixture]).stdout
     assert "target datalayout" in ir and "zeroinitializer" in ir
     assert len(ir) < 1_000_000, len(ir)

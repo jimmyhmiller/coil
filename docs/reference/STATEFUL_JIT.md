@@ -60,6 +60,37 @@ through a dependency. An unused implementation loses its compiler metadata.
 The annotation is rejected on generic and Code-returning functions. Omission
 preserves ordinary static retention. Give replacements distinct native identities.
 
+### Generated types and versioned metadata roots
+
+Records and sums also accept `:jit/retain false`, before their parameter/field or
+variant list. A submission-only type remains available while retained checked
+functions, initializers, ordinary types, traits or implementations need it.
+Dependencies include nested field types, generic bodies and sum constructors.
+Quoted source alone is not a checked type dependency. Native generation leases
+continue to protect machine code after unused type metadata has retired.
+
+For a generated schema that must stay constructible until its next revision,
+publish a fresh descriptor through a versioned metadata root:
+
+```coil
+(defstruct Physical1 :jit/retain false [(value i64)])
+(defn descriptor1 :jit/retain false :jit/root 1 :jit/root-version 1
+  [] (-> Physical1) (Physical1 :value 7))
+```
+
+A later submission can define `Physical2` and `descriptor2`, using the same
+positive root ID and a larger positive root version. Root IDs are scoped to the
+function's module. Only the newest descriptor is a metadata root; its checked
+call/type dependency closure remains retained. An older descriptor still stays
+if other retained code calls it. Advancing a root to a fresh empty function
+releases its old dependencies when no other roots need them.
+
+The compiler rejects duplicate updates to one root in a submission, stale
+versions, missing/nonpositive IDs or versions, and root annotations without
+`:jit/retain false`. A rejected candidate does not advance the accepted root.
+This is compiler metadata ownership; it does not replace the host's native code
+leases or state publication transaction.
+
 ## Ownership
 
 A successful submission publishes a compact graph of live metadata and releases

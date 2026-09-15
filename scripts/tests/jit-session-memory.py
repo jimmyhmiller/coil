@@ -84,6 +84,32 @@ def source_for_accepted(count: int, replace: bool, reader: bool = False) -> str:
     return '\n'.join(lines) + '\n'
 
 
+def source_for_schema_roots(count: int) -> str:
+    lines = [
+        '(module compiler.tests.jit-schema-memory)',
+        '(import "coil.alloc" :use [malloc-allocator])',
+        '(import "coil.jit" :as jit)',
+        '(defn main [] (-> i64)',
+        ' (let [(mut session) (jit/jit-session-new (malloc-allocator))]',
+    ]
+    def submit(form: str, entry: str = '0') -> None:
+        lines.append('(assert (= (jit/jit-compile-with-entry! (mut session) '
+                     + json.dumps(form) + ' ' + json.dumps(entry) + ') 0))')
+        lines.append('(assert (>= (jit/jit-reclaim-retired! (mut session)) 0))')
+        lines.append('(assert (<= (jit/jit-generation-count (mut session)) 3))')
+    submit('(import "coil.jit.lifetime") (defn identity [(x i64)] (-> i64) x)')
+    for i in range(count):
+        # Fixed-width names distinguish semantic identity from string-size drift.
+        name = f'Type{i:06d}'
+        root = f'root{i:06d}'
+        submit(f'(defstruct {name} :jit/retain false [(value i64)]) '
+               f'(defn {root} :jit/retain false :jit/root 1 :jit/root-version {i+1} '
+               f'[] (-> i64) (let [v ({name} :value 42)] (identity (.value v))))')
+    submit('', f'(if (= (root{count-1:06d}) 42) 0 99)')
+    lines += ['(assert (= (jit/jit-reset! (mut session)) 0))', '0))']
+    return '\n'.join(lines) + '\n'
+
+
 def peak_rss(stderr: str) -> int:
     if sys.platform == 'darwin':
         match = re.search(r'(\d+)\s+maximum resident set size', stderr)
@@ -235,6 +261,23 @@ def main() -> None:
         run(str(feature_executable))
         print('retained Code state survives committed, rejected, and aborted edits',
               flush=True)
+
+
+        source = directory / 'schema-roots.coil'
+        executable = directory / 'schema-roots'
+        source.write_text(source_for_schema_roots(count))
+        run(compiler, 'build', str(source), '-o', str(executable), *unit_flags)
+        timed = run('/usr/bin/time', '-l' if sys.platform == 'darwin' else '-v',
+                    str(executable), env=environment)
+        payload = [int(n) for n in re.findall(r'jit-work retained-payload-bytes (\d+)', timed.stderr)]
+        assert len(payload) == count + 2, 'schema root probe did not finish every publication'
+        steady = payload[10:-1]
+        assert max(steady) - min(steady) <= 64, ('schema roots or repeated resolution aliases accumulated', steady)
+        peak = peak_rss(timed.stderr)
+        assert peak < 512 * 1024 * 1024, 'schema compiler scratch accumulated'
+        print(json.dumps({'scenario': 'schema-roots', 'submissions': count,
+                          'steady_live_bytes': [min(steady), max(steady)],
+                          'peak_rss_bytes': peak}), flush=True)
 
 
 if __name__ == '__main__':
