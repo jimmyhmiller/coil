@@ -452,6 +452,17 @@ def _test_modernize_fast_serial(compiler: str) -> None:
         if private_result.returncode == 0:
             raise SystemExit("fast modernization gate: facade leaked a private re-export")
 
+        # Rebindable module-local aliases resolve every declaration kind.
+        alias_test = tmp / "defalias-static"
+        execute(str(candidate), "build", "tests/compiler/features/defalias_static.coil",
+                "--backend", "arm64", "-o", str(alias_test))
+        execute(str(alias_test))
+        duplicate = subprocess.run(
+            [str(candidate), "check", "tests/compiler/features/defalias_duplicate_rejected.coil"],
+            cwd=ROOT, capture_output=True, text=True)
+        if duplicate.returncode == 0 or "defined twice in one submission" not in duplicate.stderr:
+            raise SystemExit("fast modernization gate: duplicate alias in one submission was accepted")
+
         process_test = tmp / "process-facade"
         execute(str(candidate), "build", "tests/compiler/features/process_facade.coil",
                 "--backend", "arm64", "-o", str(process_test))

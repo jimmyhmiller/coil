@@ -51,7 +51,7 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
             flags += ["--link-flag", flag]
     fixtures = ("jit_metadata_lifetime", "jit_type_lifetime", "jit_native_metadata_roots", "jit_repl_policy", "jit_static_session", "jit_static_lifetime", "jit_static_policy",
                 "jit_static_dynamic", "jit_static_isolation", "jit_single_form_proof",
-                "jit_generation_tokens", "jit_reserved_tokens", "jit_frontend_policy", "jit_meta_pipeline", "jit_deferred_publication", "jit_repair_diagnostics")
+                "jit_generation_tokens", "jit_reserved_tokens", "jit_frontend_policy", "jit_meta_pipeline", "jit_deferred_publication", "jit_repair_diagnostics", "jit_defalias_rebind")
     for name in fixtures:
         binary = work / name
         run(COMPILER, "build", ROOT / f"tests/compiler/features/{name}.coil",
@@ -75,6 +75,22 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
         "-o", binary, *flags)
     run(binary, cwd=project)
     print("PASS: SDK manifest dependency context without process environment mutation", flush=True)
+    # Rebinding an alias in a module loaded from disk reaches `:as` and `:use`
+    # importers without changing their import declarations.
+    (dep / "src/shapes.coil").write_text(
+        '(module project-dependency.shapes)\n'
+        '(defstruct P-v1 [(x i64)])\n(defalias P P-v1)\n'
+        '(defn get-v1 [(p P)] (-> i64) (.x p))\n(defalias get get-v1)\n')
+    (project / "src/user.coil").write_text(
+        '(module project-host.user)\n'
+        '(import "project-dependency.shapes" :as shapes)\n'
+        '(import "project-dependency.shapes" :use [P])\n'
+        '(defn old [] (-> i64) (shapes/get (P :x 41)))\n')
+    binary = work / "defalias-imports"
+    run(COMPILER, "build", ROOT / "tests/compiler/features/jit_defalias_imports.coil",
+        "-o", binary, *flags)
+    run(binary, cwd=project)
+    print("PASS: alias rebinding through imports of disk modules", flush=True)
     dependency = work / "dependency.coil"
     dependency.write_text('(module retained.dependency)\n'
                           '(defstruct Point [(x i64)])\n'
