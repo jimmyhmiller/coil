@@ -120,7 +120,31 @@ metaprograms can generate fresh implementation identities and choose whether,
 when, and how to publish them through ordinary `Var` cells or other mechanisms.
 The compiler does not retarget old callers or migrate values. Metaprograms can
 retain transactional policy data through `primitive/code-session-state` and
-`primitive/code-session-stage!`. `jit-compile-with-entry!` compiles definitions
+`primitive/code-session-stage!`; a later stage of the same transaction reads what an
+earlier stage staged with `primitive/code-session-staged-state`.
+
+`(defalias Name Target)` gives a module's declaration a second name. The alias
+works for every kind of declaration `Target` is: type, constructor, function,
+variant, const or macro. It works bare, through `:as` and `:use` imports, and
+fully qualified. A later submission may rebind the alias. New references then
+resolve to the new target, while code accepted earlier keeps the target it
+bound. One submission may bind a name only once. A metaprogram can give each
+version of a declaration a fresh physical identity while every module keeps
+using the authored name.
+
+A submission may also retire accepted declarations so it can declare
+replacements under the same names:
+
+    (retire-alias Name)             ; the module's alias Name stops resolving
+    (retire-trait Name)             ; the module's trait, and every impl of it
+    (retire-impl [T…] Trait Type)   ; the trait impl with exactly this pattern
+    (retire-inherent [T…] Type)     ; inherent impls with exactly this pattern
+
+A retired declaration leaves the environment used to check this submission and
+every later one. The submission may redeclare the trait or impl, including one
+with a different method signature. Native code already accepted keeps what it
+bound. A rejected submission leaves the accepted environment unchanged.
+Retiring something that is not accepted has no effect. `jit-compile-with-entry!` compiles definitions
 and runs a caller-supplied i64 expression: zero commits the candidate; any other
 result rejects it. Rejection preserves accepted compiler state and native
 publication. Runtime effects performed by that expression are the caller's
