@@ -26,8 +26,8 @@ FIXTURES = [
 NEGATIVE = {
     "width-zero": ("(p/vector-zero [(vec u8 0)])", "positive"),
     "width-negative": ("(p/vector-zero [(vec u8 -1)])", "positive"),
-    "width-kind": ("(v/vsplat [u8 f32] 1)", "integer generic argument"),
-    "lane-kind": ("(v/vsplat [(const 16) 4] 1)", "used as a type"),
+    "width-kind": ("(v/vsplat [u8 f32] 1)", "expects a constant of type i64, got type f32"),
+    "lane-kind": ("(v/vsplat [(const 16) 4] 1)", "expects a type, got constant 16"),
     "lane-wide": ("(p/vector-zero [(vec i128 4)])", "lane"),
     "mask-arithmetic": ("(v/vadd (v/vsplat [bool 4] true) (v/vsplat [bool 4] false))", "lane type"),
     "shape-mismatch": ("(v/vadd (v/vzero [u8 4]) (v/vzero [u8 8]))", "conflicting"),

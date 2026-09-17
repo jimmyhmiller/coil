@@ -26,6 +26,52 @@ NEGATIVE = {
         "(defn m [(f (F true))] (-> i64) (.v f))",
         "(m (F [false] :v 1))",
         "(test.const-generic-negative.bool-identity.F true)"),
+    "type-for-constant": (
+        "(defstruct B [(const N i64)] [(v i64)])\n"
+        "(defn f [(b (B u8))] (-> i64) (.v b))",
+        "0",
+        "generic parameter 'N' of 'test.const-generic-negative.type-for-constant.B' expects a constant of type i64, got type u8"),
+    "constant-for-type": (
+        "(defstruct B [T] [(v T)])\n"
+        "(defn f [(b (B 4))] (-> i64) 0)",
+        "0",
+        "expects a type, got constant 4"),
+    "out-of-range": (
+        "(defstruct B [(const N u8)] [(v i64)])\n"
+        "(defn f [(b (B 300))] (-> i64) (.v b))",
+        "0",
+        "expects a constant of type u8, got 300 (out of range)"),
+    "negative-unsigned": (
+        "(defstruct B [(const N u64)] [(v i64)])\n"
+        "(defn f [(b (B -1))] (-> i64) (.v b))",
+        "0",
+        "expects a constant of type u64, got -1 (out of range)"),
+    "keyword-for-int": (
+        "(defstruct B [(const N i64)] [(v i64)])\n"
+        "(defn f [(b (B (const :x)))] (-> i64) (.v b))",
+        "0",
+        "expects a constant of type i64, got constant :x"),
+    "value-param-type-mismatch": (
+        "(defstruct B [(const N i64)] [(v i64)])\n"
+        "(defn f [(const M u8)] [(b (B M))] (-> i64) (.v b))",
+        "0",
+        "expects a constant of type i64, got value parameter 'M' of type u8"),
+    "value-param-as-type": (
+        "(defn f [(const N i64)] [(x N)] (-> i64) 0)",
+        "0",
+        "'N' is a value parameter, not a type"),
+    "value-param-bad-type": (
+        "(defstruct B [(const N f64)] [(v i64)])",
+        "0",
+        "value parameters must be an integer type, bool or Keyword"),
+    "bool-width": (
+        "(defn f [(const N bool)] [(x (vec u8 N))] (-> i64) 0)",
+        "0",
+        "vec width must be a positive integer or an integer value parameter"),
+    "explicit-type-for-constant": (
+        "(defn g [(const N i64)] [] (-> i64) 0)",
+        "(g [u8])",
+        "generic parameter 'N' of 'test.const-generic-negative.explicit-type-for-constant.g' expects a constant of type i64, got type u8"),
     "const-form": (
         "(defstruct F [(const On bool)] [(v i64)])\n"
         "(defn m [(f (F (const 1.5)))] (-> i64) (.v f))",
