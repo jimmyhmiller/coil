@@ -12,7 +12,7 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 FEATURES = ROOT / "tests/compiler/features"
-FIXTURES = ["const_generic_values"]
+FIXTURES = ["const_generic_values", "const_generic_arrays"]
 
 # name -> (top-level forms, body expression, expected diagnostic fragment)
 NEGATIVE = {
@@ -72,6 +72,31 @@ NEGATIVE = {
         "(defn g [(const N i64)] [] (-> i64) 0)",
         "(g [u8])",
         "generic parameter 'N' of 'test.const-generic-negative.explicit-type-for-constant.g' expects a constant of type i64, got type u8"),
+    "bool-array-length": (
+        "(defn f [(const N bool)] [(x (array u8 N))] (-> i64) 0)",
+        "0",
+        "array length must be a positive integer or an integer value parameter"),
+    "conflicting-lengths": (
+        "(defn f [(const N i64)] [(x (array i64 N)) (y (array i64 N))] (-> i64) 0)",
+        "(f [1 2] [1 2 3])",
+        "conflicting types for parameter 'N' (2 vs 3)"),
+    "generic-length-literal": (
+        "(defn f [(const N i64)] [] (-> i64) (let [xs (: [1 2] (array i64 N))] 0))",
+        "0",
+        "array literal has 2 elements but expected N"),
+    "fixed-length-mismatch": (
+        "(defn f [(x (array i64 3))] (-> i64) 0)\n"
+        "(defn g [(const N i64)] [(x (array i64 N))] (-> i64) (f x))",
+        "0",
+        "(array i64 N)"),
+    "value-in-comptime": (
+        "(defn f [(const N i64)] [] (-> i64) (comptime N))",
+        "0",
+        "value parameter 'N' is not known inside comptime"),
+    "type-param-as-value": (
+        "(defn f [T] [(x T)] (-> i64) T)",
+        "0",
+        "unbound variable 'T'"),
     "const-form": (
         "(defstruct F [(const On bool)] [(v i64)])\n"
         "(defn m [(f (F (const 1.5)))] (-> i64) (.v f))",
