@@ -223,9 +223,13 @@ New API this project added (all shipped):
   decide its rewrite, then the pipeline re-resolves + re-typechecks. It also TOLERATES
   a program that doesn't yet typecheck: the model is then **partial**. Every
   declaration and function that checks answers `code-decl`/`type-of`/`binding-of`
-  as usual. Inside a function that fails, each body statement is still checked, and
-  expressions answer up to the first error in their statement. Only nodes the checker
-  could not establish answer `:unknown`/`:unresolved`. When resolution itself fails
+  as usual. Inside a function that fails, checking continues past each error: the
+  failing expression gets an internal error type, every error is recorded (a failure
+  caused only by an earlier one is not reported again), and all subexpressions that
+  do not depend on a failure keep their real types and resolutions. Only nodes the
+  checker could not establish answer `:unknown`/`:unresolved`; an expression whose
+  own type depends on a failed child, such as `(.x (.origin r))` when `.origin` fails,
+  gets its type once a fixpoint round has rewritten that child. When resolution itself fails
   there is no model and the transform rewrites purely syntactically (e.g.
   `inc`→`iadd`, where `inc` is undefined until the rewrite). The authoritative
   strict check happens once, after the fixpoint. So one primitive covers
