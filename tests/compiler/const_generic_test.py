@@ -18,7 +18,7 @@ FIXTURES = ["const_generic_values", "const_generic_arrays"]
 NEGATIVE = {
     "keyword-identity": (
         "(defstruct Q [(const U Keyword)] [(v i64)])\n"
-        "(defn m [(q (Q (const :meters)))] (-> i64) (.v q))",
+        "(defn m [(q (Q :meters))] (-> i64) (.v q))",
         "(m (Q [(const :feet)] :v 1))",
         "(test.const-generic-negative.keyword-identity.Q :meters)"),
     "bool-identity": (
@@ -97,6 +97,10 @@ NEGATIVE = {
         "(defn f [T] [(x T)] (-> i64) T)",
         "0",
         "unbound variable 'T'"),
+    "keyword-type-spelling": (
+        "(defn f [(x :i64)] (-> i64) 0)",
+        "0",
+        ":i64 is a Keyword constant, not a type; write the type as i64"),
     "const-form": (
         "(defstruct F [(const On bool)] [(v i64)])\n"
         "(defn m [(f (F (const 1.5)))] (-> i64) (.v f))",

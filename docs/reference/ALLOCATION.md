@@ -50,12 +50,12 @@ is not what happened.
 `src/stdlib/alloc.coil` already has a bump allocator. This work is **routing, not building**.
 
 ```coil
-(defstruct Arena [(base (ptr i8)) (off :i64) (cap :i64)])
+(defstruct Arena [(base (ptr i8)) (off i64) (cap i64)])
 (defn ar-alloc  ...)   ; bump: align up, check cap, return base+off
 (defn ar-resize ...)   ; ALWAYS returns (None) — no in-place resize
 (defn ar-free   ...)   ; no-op — bulk-freed
-(defn arena-over-buffer [(ar …) (a …) (buf (ptr i8)) (cap :i64)] …)  ; freestanding-capable
-(defn arena-allocator [(cap :i64)] …)                                ; malloc-backed wrapper
+(defn arena-over-buffer [(ar …) (a …) (buf (ptr i8)) (cap i64)] …)  ; freestanding-capable
+(defn arena-allocator [(cap i64)] …)                                ; malloc-backed wrapper
 ```
 
 Note the comment already in that file about `alloc-static` giving one cell per *call

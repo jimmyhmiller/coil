@@ -1,8 +1,10 @@
 # Typed compile-time generic parameters
 
-Status: planned, not implemented. Step 1 of a two-step feature. Step 2, where
-compile-time functions compute types in type positions, gets its own design once
-step 1 lands.
+Status: step 1 implemented (c80558b, e3540a9, 701a93c and the migration commit).
+Step 2, where compile-time functions compute types in type positions, gets its own
+design. The user-facing description is in `docs/reference/LANGUAGE_GUIDE.md`
+(Functions & function pointers, "Value parameters"). "As implemented" below records
+where the implementation differs from this plan.
 
 ## Goal
 
@@ -33,7 +35,7 @@ case and the checker's use-based kind guessing are replaced by one uniform featu
 
     (defstruct Buffer [T (const N i64)] [(len i64) (items (array T N))])
     (defstruct Quantity [(const Unit Keyword)] [(value f64)])
-    (defn [T (const N i64)] sum [(xs (array T N))] (-> T) ...)
+    (defn sum [T (const N i64)] [(xs (array T N))] (-> T) ...)
     (impl [T (const N i64)] Len (Buffer T N) ...)
 
 - A plain name or `(T Trait...)` is a type parameter, unchanged.
@@ -139,3 +141,37 @@ Each stage builds with the current seed, passes the gates and is committed on it
 - The retained snapshot is regenerated at every stage that changes the AST.
 - Comptime runs before specialization, so value parameters are unavailable to
   `comptime` in step 1. Step 2 has to address this.
+
+## As implemented
+
+- Parameter kinds live on the parameter's `Bound` as `value_type (Option Type)`,
+  not in a separate `const_params` list. `Bound` already travels with every generic
+  declaration (functions, structs, sums, impls and the methods impls copy it to), so
+  kinds reach every consumer without new plumbing. The checker reads the scope being
+  checked from `cur_bounds`, which is now also set while struct and sum fields are
+  validated.
+- `TConstInt` was replaced in place by `TConst` over `ConstValue` (type tag 16). No
+  separate removal stage or reseed was needed.
+- `VectorWidth` became `Extent` (`FixedExtent` / `ParamExtent`) and is shared by
+  `TArray`, `TVec` and `EMakeSlice`, rather than lengths becoming type references.
+  Mono's `resolve-extent` specializes all three; backends read `extent-value`.
+- A value parameter in an expression is `EConstParam [name ty]`. Use inside
+  `comptime` is rejected by the checker (a `comptime_depth` counter on `Cx`), not by
+  the comptime evaluator.
+- No `coil lint --fix` rules were added. Both migrations were applied to this
+  repository mechanically, and the diagnostics say what to write instead:
+  `generic parameter 'N' of 'f' expects a constant of type i64, got type N` for an
+  undeclared width parameter, and `:i64 is a Keyword constant, not a type; write the
+  type as i64` for the removed keyword spelling.
+- Metaprograms still see constants in type Code as `(const 4)`, `(const true)` and
+  `(const :meters)`, which reads back as the same type. `ty->sexp` and `type->code`
+  agree on constants; their other differences (`Code`, `Never` spellings) predate
+  this work and were left alone.
+- `inst-node-mangle` only has to name derived functions deterministically, not match
+  mono's instance names, so the planned "mismatch" fix was unnecessary. It now accepts
+  keyword arguments (`kw_meters`).
+- Constants in the same unification position must now be equal, and the impl check
+  that every parameter appears in the implementing type now looks inside extents.
+- Tests: `tests/compiler/const_generic_test.py` (`dev.py test const-generics`, also
+  run by `modernize-fast`), with fixtures `const_generic_values.coil` and
+  `const_generic_arrays.coil`.

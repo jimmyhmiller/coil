@@ -20,11 +20,11 @@ backends and interpreter use the same lane semantics through scalar lowering.
 `(vec bool N)`. Masks are logical values, not integer vectors with an assumed
 all-ones representation. Use `vselect` or explicit bitmap conversion.
 
-Widths can be generic parameters in functions and aggregate types:
+Widths can be value parameters, `(const N i64)`, in functions and aggregate types:
 
 ```clojure
-(defstruct Block [T N] [(value (vec T N)) (valid (mask N))])
-(defn doubled [T N] [(x (vec T N))] (-> (vec T N)) (v/vadd x x))
+(defstruct Block [T (const N i64)] [(value (vec T N)) (valid (mask N))])
+(defn doubled [T (const N i64)] [(x (vec T N))] (-> (vec T N)) (v/vadd x x))
 (let [bytes (v/vsplat [u8 16] 42)
       wide (: (v/vwiden-low bytes) (vec u16 8))]
   (v/vextract wide 0))
@@ -34,7 +34,7 @@ Most operations infer both lane type and width from their operands. Construction
 can use explicit arguments such as `[u8 16]` or an expected result type. In a
 generic argument list containing only integers, write `(const 16)` to distinguish
 the argument from an array literal. `mask-low` and `bits->mask` accept `[N]`
-directly as width macros. Array extents remain literal integers.
+directly as width macros. Inside a generic definition `N` is also an `i64` value.
 
 Widths need not be powers of two. Numeric vector storage is padded to the next
 power-of-two byte size, but vector memory operations access exactly N lanes.
