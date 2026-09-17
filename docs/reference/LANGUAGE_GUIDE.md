@@ -658,8 +658,10 @@ The argument order is the trait's declared non-`Self` parameter order; for
 
 **Any type can carry an impl** — a struct, sum, scalar, generic instance, and the
 structural types `(ptr T)`, `(slice T)`, `(array T N)`, `(vec T N)`, `(fnptr c […] R)`.
-Vector widths may be declared generic parameters: `[T N]` with `(vec T N)`
-specializes at calls such as `[u8 16]`. `(mask N)` is `(vec bool N)`.
+Array lengths and vector widths may be value parameters: `[T (const N i64)]` with
+`(array T N)` or `(vec T N)` specializes at arguments such as `[u8 16]`, and an impl
+for `(array T 4)` is more specific than one for `(array T N)`. `(mask N)` is
+`(vec bool N)`.
 `coil.simd` provides typed arithmetic, masks, safe tails, permutations, conversions,
 and scans; see `docs/reference/SIMD.md` for contracts and examples.
 A generic impl's `[T …]` params are inferred from the receiver, and every declared
@@ -957,6 +959,38 @@ borrow is what gives an array the collection traits — see Collections below.
   three-argument `(set! collection key value)` remains the `Set` trait method.
   Symbols beginning with `.` (except `..`) are reserved accessor heads. A
   two-parameter function named `set!` is rejected because it could never be called.
+**Field access on a type that has no such field.** `(.name x)` reads a real field
+exactly as before. Only when the type has NO field `name` does the checker look for
+an impl member — `get-field`, `set-field!` or `field-place` — whose `Self` is
+`(Field X :name)`. `Field` is the prelude's zero-sized marker `(Field T (const Name Keyword))`:
+it names which field of which type, carries no value, and disappears with the
+inlined call. A type with no such impl gets the same error it always did.
+
+    (defstruct Celsius [(degrees f64)])
+    (impl FieldGet (Field Celsius :fahrenheit)
+      (get-field [(self (Field Celsius :fahrenheit)) (target Celsius)] (-> f64)
+        (+ 32.0 (* 1.8 (.degrees target)))))
+    (impl FieldSet (Field Celsius :fahrenheit)
+      (set-field! [(self (Field Celsius :fahrenheit)) (target (mut Celsius)) (value f64)] (-> i64)
+        (set! (.degrees target) (/ (- value 32.0) 1.8)) 0))
+    (let [(mut c) (Celsius :degrees 100.0)]
+      (.fahrenheit c)                  ; 212.0
+      (set! (.fahrenheit c) 32.0))     ; degrees is now 0.0
+
+- A read uses `get-field`, or reads through the place `field-place` returns.
+- `(set! (.name x) v)` uses `set-field!`, or writes through that place. A field with
+  a reader and no writer is a compile error naming the missing `set-field!`.
+- `(mut (.name x))` and a chain like `(.x (.origin h))` use `field-place`, whose
+  result type decides what comes next: a `(ptr T)` behaves like any place, and a
+  value that itself answers `.name` continues the chain.
+- One impl can cover every name: `(impl [(const N Keyword)] FieldGet (Field Bag N) …)`,
+  with `N` an ordinary `Keyword` value in the body. A concrete `(Field Bag :id)` impl
+  is more specific and wins.
+- Real fields always win, so a type cannot intercept a field it has. Two impls of the
+  same member for one `(Field X :name)` are ambiguous, as for `call`.
+- The trait names are conventions, like `Callable`: the member name is what the
+  checker looks for.
+
 - `field`, `load`, and `store!` remain available as explicit low-level place operations.
   `(field p name)` returns a pointer/reference rather than reading it. Array field
   element: `(index (field s buf) i)`. Prefer `.field` and two-argument `set!` in
@@ -1254,10 +1288,11 @@ traits; they are not alternate spellings to teach for a trait operation.
 | `coil.hashmap`: `(HashMap K V)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Iterable` (`iter`, over keys) |
 | `(array T N)` | the `(slice T)` row, reached by borrowing (below) |
 
-A fixed `(array T N)` has no impls of its own, and cannot: array length is part of
-the type and Coil has no const generics, so `(impl [T N] Iterable (array T N))` is
-not expressible. Instead an array BORROWS as a slice wherever a slice is wanted,
-and that borrow reaches trait dispatch too — so `(len xs)`, `(get xs i)`,
+The bundled collection traits are implemented on `(slice T)`, not on arrays. An
+array could carry its own impls through a length parameter,
+`(impl [T (const N i64)] Size (array T N) …)`, but it does not need to: an array
+BORROWS as a slice wherever a slice is wanted, and that borrow reaches trait dispatch
+too. An impl on the array type itself is tried first. So `(len xs)`, `(get xs i)`,
 `(set! (mut xs) i v)`, `(for x (iter xs) ...)`, and the `coil.iter` adapters all
 work on an array and behave exactly as they do on `(slice T)`:
 
@@ -1393,9 +1428,40 @@ They are plain `i64` literals — use with metal/clean ops after casting the byt
 
     (defn name [(a T) (b U)] (-> R) body…)   ; last expr is the return value
     (defn id [T] [(x T)] (-> T) x)            ; generic: [T] before the arg list
+    (defn width [T (const N i64)] [(xs (array T N))] (-> i64) N)   ; value parameter
     (defn hot-add :inline (Always) [(a i64) (b i64)] (-> i64) (+ a b))
     (defn f [(p (mut Rect))] (-> i64) …)      ; mutable-ref param
     (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64) …)   ; CLI entry
+
+**Value parameters.** A generic parameter is a type or, declared `(const NAME TYPE)`,
+a compile-time value of an integer type, `bool`, or `Keyword`. The declaration
+decides the kind, and every generic argument is checked against it:
+
+    (defstruct Buffer [T (const N i64)] [(used i64) (items (array T N))])
+    (defstruct Quantity [(const Unit Keyword)] [(value f64)])
+    (defn meters [(q (Quantity :meters))] (-> f64) (.value q))
+    (impl [T (const N i64)] Len (Buffer T N) …)
+
+- Constant arguments are literals: `4`, `true`/`false`, `:meters`. A keyword in type
+  position is always a Keyword constant, so primitive types are written bare (`i64`,
+  never `:i64`). `(const X)` spells any constant explicitly; it is required when an
+  explicit argument vector holds only constants, because `[16]` is an array literal:
+  `(Quantity [(const :meters)] :value 1.0)`.
+- Two instances are the same type exactly when their arguments are equal:
+  `(Quantity :meters)` is one type everywhere, distinct from `(Quantity :feet)`.
+- An integer argument must fit its declared type; `300` for `(const N u8)` is an error.
+- Value parameters size arrays and vectors, `(array T N)` and `(vec T N)`, and are
+  arguments to generic structs and sums. They are inferred from argument types like
+  type parameters, and a conflicting inference is an error.
+- In an expression a value parameter is its value, with its declared type. A local
+  of the same name shadows it; it shadows module constants and globals.
+  Monomorphization replaces it with the literal. Inside `(comptime …)` in a generic
+  definition it is an error, because comptime evaluates the definition once, before
+  specialization.
+- Type positions do not compute: `(array T (+ N 1))` is not a type.
+- Older source that wrote `:i64` for a type, or `[T N]` for a width, no longer loads;
+  `coil lint --fix` rewrites both (including a width passed to another module's
+  declaration), and `coil build` offers to run it.
 
 Non-capturing anonymous functions use Clojure-shaped parameter lists. Their
 parameter types come from the expected function-pointer type or a `Callable`

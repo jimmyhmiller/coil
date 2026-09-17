@@ -185,9 +185,9 @@ Coil-module visibility — orthogonal to this, which controls the C ABI surface)
 
 ```clojure
 (module shapes)
-(defstruct Point :c [(x :i64) (y :i64)])     ; :c layout — required for an exported sig
+(defstruct Point :c [(x i64) (y i64)])     ; :c layout — required for an exported sig
 
-(defn make-point [(x :i64) (y :i64)] (-> Point)
+(defn make-point [(x i64) (y i64)] (-> Point)
   (let [(mut p) (Point :x x :y y)] (load p)))
 
 (defn point-eq [(a Point) (b Point)] (-> bool) …)

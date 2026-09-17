@@ -339,7 +339,13 @@ def test(args: argparse.Namespace) -> None:
                 *(["--verbose"] if args.verbose else []))
     elif args.suite == "simd":
         execute(sys.executable, "tests/compiler/simd_test.py", "--compiler", compiler, "--differential")
+    elif args.suite == "const-generics":
+        execute(sys.executable, "tests/compiler/const_generic_test.py", "--compiler", compiler)
+    elif args.suite == "field-access":
+        execute(sys.executable, "tests/compiler/field_access_test.py", "--compiler", compiler)
     elif args.suite == "modernize-fast":
+        execute(sys.executable, "tests/compiler/const_generic_test.py", "--compiler", compiler)
+        execute(sys.executable, "tests/compiler/field_access_test.py", "--compiler", compiler)
         execute(sys.executable, "tests/compiler/features/transparent_arc_source_guard.py")
         execute(sys.executable, "tests/compiler/features/authored_gensym_source_guard.py")
         execute(sys.executable, "tests/compiler/features/tagged_form_revision_guard.py")
@@ -1136,6 +1142,10 @@ source-roots = ["src"]
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o0", "-O0"),
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o3", "-O3"),
             lambda: build_run("tests/compiler/features/void_if_discarded.coil", "void-if-discarded"),
+            lambda: build_run("tests/compiler/features/mutable_binding_fresh_value.coil",
+                              "mutable-binding-fresh-value", *backend_flags),
+            lambda: expect_rejected("tests/compiler/features/struct_reference_field_rejected.coil",
+                                    "fast modernization gate: a reference-typed field compiled"),
             lambda: build_run("src/examples/bitfields.coil", "static-assert", *backend_flags, want=42),
             lambda: build_run("tests/compiler/features/alloc_static_initial.coil",
                               "alloc-static-initial-direct", *backend_flags),
@@ -1404,7 +1414,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "update", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "update", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd", "const-generics", "field-access"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.set_defaults(func=test)
