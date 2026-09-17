@@ -158,11 +158,16 @@ Each stage builds with the current seed, passes the gates and is committed on it
 - A value parameter in an expression is `EConstParam [name ty]`. Use inside
   `comptime` is rejected by the checker (a `comptime_depth` counter on `Cx`), not by
   the comptime evaluator.
-- No `coil lint --fix` rules were added. Both migrations were applied to this
-  repository mechanically, and the diagnostics say what to write instead:
-  `generic parameter 'N' of 'f' expects a constant of type i64, got type N` for an
-  undeclared width parameter, and `:i64 is a Keyword constant, not a type; write the
-  type as i64` for the removed keyword spelling.
+- The migrations are part of the lint syntax preflight, not a `coil.lint.*` checker:
+  neither old spelling loads, and checkers run only on programs that expand.
+  `coil.compiler.generic_migration` works on read syntax. `prelint-run` applies it
+  after the legacy-import pass, reading each imported module (bundled or from the
+  namespace index) for the declared kinds of structs, sums and functions a width is
+  passed to. The build's breaking-change scan uses the same code, so `coil build` on
+  an unmigrated project offers `coil lint --fix`. A type position that exists only
+  inside a user macro is invisible to syntax. For those, the compiler's error names
+  the replacement and `coil lint --fix`, e.g. `vec width 'N' is a type parameter;
+  declare it as a value parameter, (const N i64), or run coil lint --fix`.
 - Metaprograms still see constants in type Code as `(const 4)`, `(const true)` and
   `(const :meters)`, which reads back as the same type. `ty->sexp` and `type->code`
   agree on constants; their other differences (`Code`, `Never` spellings) predate
@@ -174,4 +179,6 @@ Each stage builds with the current seed, passes the gates and is committed on it
   that every parameter appears in the implementing type now looks inside extents.
 - Tests: `tests/compiler/const_generic_test.py` (`dev.py test const-generics`, also
   run by `modernize-fast`), with fixtures `const_generic_values.coil` and
-  `const_generic_arrays.coil`.
+  `const_generic_arrays.coil`. Its migration section checks the exact rewrite of a
+  single file, report and `--diff` modes, idempotence, and a two-module project whose
+  parameters reach a width only through another module's struct and `coil.simd`'s `Chunk`.

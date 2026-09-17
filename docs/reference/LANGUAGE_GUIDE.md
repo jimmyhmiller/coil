@@ -1403,6 +1403,9 @@ decides the kind, and every generic argument is checked against it:
   definition it is an error, because comptime evaluates the definition once, before
   specialization.
 - Type positions do not compute: `(array T (+ N 1))` is not a type.
+- Older source that wrote `:i64` for a type, or `[T N]` for a width, no longer loads;
+  `coil lint --fix` rewrites both (including a width passed to another module's
+  declaration), and `coil build` offers to run it.
 
 Non-capturing anonymous functions use Clojure-shaped parameter lists. Their
 parameter types come from the expected function-pointer type or a `Callable`
