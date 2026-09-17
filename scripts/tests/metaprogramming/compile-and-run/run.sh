@@ -136,6 +136,11 @@ ua=$(grep -c "error: use after release" "$OUT/own.txt"); dr=$(grep -c "error: do
 [ "$ua" -eq 1 ] && [ "$dr" -eq 1 ] || { cat "$OUT/own.txt"; echo "expected 1 use-after + 1 double-release, got $ua/$dr"; exit 1; }
 echo "borrow-checker dialect: OK (valid runs; bad vetoed with 2 located errors)"
 
+echo "=== 12a. PARTIAL SEMANTIC MODEL: a transform types and rewrites a program that does not check yet ==="
+$COIL run tests/metaprogramming/partial_model_test.coil >/dev/null 2>&1; rc=$?
+[ $rc -eq 0 ] || { echo "partial model test FAILED (exit $rc, want 0)"; exit 1; }
+echo "partial model: OK (model-status, check-error, type-of and code-decl on a failing program)"
+
 echo "=== 12b. AOT REGEX MACRO: compile-time parser -> allocation-free state machine ==="
 $COIL run tests/regex_test.coil >/dev/null 2>&1; rc=$?
 [ $rc -eq 0 ] || { echo "AOT regex semantics FAILED (exit $rc)"; exit 1; }

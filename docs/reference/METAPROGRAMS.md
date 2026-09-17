@@ -221,10 +221,14 @@ New API this project added (all shipped):
 - **`(transform FN)`** — there is ONE kind of transform, and it is semantic. It runs
   to a fixpoint: each round it reads the checked program (via `code-decl` etc.) to
   decide its rewrite, then the pipeline re-resolves + re-typechecks. It also TOLERATES
-  a program that doesn't yet typecheck — then the model is empty (`code-decl` →
-  `:unresolved`) and the transform rewrites purely syntactically until the program
-  becomes valid (e.g. `inc`→`iadd`, where `inc` is undefined until the rewrite). The
-  authoritative strict check happens once, after the fixpoint. So one primitive covers
+  a program that doesn't yet typecheck: the model is then **partial**. Every
+  declaration and function that checks answers `code-decl`/`type-of`/`binding-of`
+  as usual. Inside a function that fails, each body statement is still checked, and
+  expressions answer up to the first error in their statement. Only nodes the checker
+  could not establish answer `:unknown`/`:unresolved`. When resolution itself fails
+  there is no model and the transform rewrites purely syntactically (e.g.
+  `inc`→`iadd`, where `inc` is undefined until the rewrite). The authoritative
+  strict check happens once, after the fixpoint. So one primitive covers
   both type-aware rewrites and syntactic desugarings. Demos: `tests/metaprogramming/retkind*.coil`
   (rewrites a marker by the wrapped call's real return type) and `dialect.coil`/`tx_test`
   (`inc`→`iadd`).
@@ -249,6 +253,15 @@ New API this project added (all shipped):
   `typecheck_test.coil` (a **type reference** `wb/Box` resolves to the right module even
   though `Box` is defined in both `wa` and `wb`). So calls, fn-ptrs, variants, AND named
   types all resolve exactly.
+- **`(primitive/model-status)` → `:complete`, `:partial`, or `:none`** — whether the
+  model the transform is reading is of a program that fully checks, one that partly
+  checks, or no model at all. A transform that must only see valid programs checks
+  for `:complete`.
+- **`(primitive/check-error NODE)` → the checker's message, or `:none`** — the error
+  located exactly at NODE in a partial model. A dialect transform uses it to find the
+  expressions that do not check yet, and why, and rewrite exactly those; together with
+  `type-of` on their subexpressions it can make type-directed rewrites of code that is
+  not valid Coil until rewritten. Demo: `tests/metaprogramming/partial_model_test.coil`.
 - **`(primitive/type-of NODE)` → the expression's inferred type** as `Code` (e.g. `i64`,
   `(ptr i64)`), or `:unknown`. This is the type the real type-checker inferred, not
   syntax — a call `(getf)` reports `f64` because `getf` returns `f64`. Demo:
