@@ -47,22 +47,22 @@ and gates are what actually vouch for the seed you commit.
     coil emit-ir src/compiler/main.coil \
         --target x86_64-unknown-linux-gnu > coil-linux.ll
 
-Emitted at commit `828c99f` ("Remove stale-seed subtraction dependencies") from a
-clean tree, by a compiler built from that same source (3-stage self-host, LLVM fixpoint
-stage2.o == stage3.o). This refresh includes the private updater, so the IR's native
-link surface now also includes Coil's bundled libcurl and mbedTLS archives. Note that
+Emitted from compiler source at commit `28b8c03` by the refreshed macOS LLVM seed,
+which passed the stage2/stage3 LLVM object fixed point. This refresh includes the
+field-access traits and private updater, so the IR's native link surface includes
+Coil's bundled libcurl and mbedTLS archives. Note that
 `emit-ir --help` does not advertise `--target`, but it honours it — the help text is
 wrong, not the flag.
 
 Unlike previous revisions this one was checked as far as macOS permits, which is
 further than "emitted and hoped":
 
-  - `llvm-as` parses it (24.9 MB of IR -> 6.5 MB bitcode, 8118 defines);
+  - `llvm-as` parses it (39.7 MB of IR, 11,083 definitions);
   - `llc -mtriple=x86_64-unknown-linux-gnu -filetype=obj` produces a real
     `ELF 64-bit LSB relocatable, x86-64` object, so codegen does not hit an
     unimplemented ABI path;
-  - the undefined-symbol scan finds **176** distinct `LLVMxxx` C-API symbols, newest
-    `LLVMArrayType2` / `LLVMConstArray2` (LLVM 17), so LLVM 20/21/22 all satisfy it.
+  - the declaration scan finds **234** distinct `LLVMxxx` C-API symbols. The
+    target Linux bootstrap must still verify their availability in its LLVM build.
 
 What that does NOT establish is that the binary works. Only running it does, and only a
 Linux host can. Emitted from `main` rather than a side branch this time: the `(_ …)`
@@ -116,7 +116,7 @@ libLLVM (C API), bundled libcurl/mbedTLS, and libc/libm/libpthread/libdl. **No D
 `sys_icache_invalidate` (now resolved via `dlsym` at runtime in `jit.coil`, null and
 skipped on ELF hosts) are gone from the link surface.
 
-Re-checked on this emission: 330 unique `declare`s, including 214 LLVM C-API symbols.
+Re-checked on this emission: 356 `declare`s, including 234 LLVM C-API symbols.
 The non-LLVM surface is bundled curl plus libc/libm/pthread/dl — `_exit abort access
 atexit atoi calloc ceil ceilf chdir clock_gettime close
 closedir creat dlerror dlopen dlsym dprintf dup2 execvp exit fabs fclose fcntl floor
