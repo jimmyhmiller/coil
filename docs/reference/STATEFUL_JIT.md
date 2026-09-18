@@ -69,6 +69,15 @@ Dependencies include nested field types, generic bodies and sum constructors.
 Quoted source alone is not a checked type dependency. Native generation leases
 continue to protect machine code after unused type metadata has retired.
 
+An impl whose selection key includes a submission-only type is conditional
+metadata: its generated methods do not independently keep that type alive.
+The key includes the self type and inferred associated types. A migration impl
+from Old to New therefore does not keep Old alive solely because New survives.
+Retained callers and selected methods still keep their actual dependencies.
+Inherent and generic impls follow the same rule. Retiring such an impl removes
+its lookup entries and specializations together; a native lease continues to
+protect already-published machine code independently.
+
 For a generated schema that must stay constructible until its next revision,
 publish a fresh descriptor through a versioned metadata root:
 
@@ -90,6 +99,13 @@ versions, missing/nonpositive IDs or versions, and root annotations without
 `:jit/retain false`. A rejected candidate does not advance the accepted root.
 This is compiler metadata ownership; it does not replace the host's native code
 leases or state publication transaction.
+
+The structural `code-session-monomorphs` report is rebuilt from the native
+program supplied to the accepted compilation. That program already includes
+still-live reused specializations. Reports do not union all earlier reports:
+retired artifacts disappear when they leave the compiler's native table, while
+unrelated live artifacts remain. Rejected or aborted candidates do not replace
+the accepted report.
 
 ## Ownership
 
