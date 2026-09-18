@@ -221,6 +221,9 @@ def main() -> None:
             assert len(retained) == count + 2, 'accepted memory probe did not complete every submission'
             payload = [int(n) for n in re.findall(r'jit-work retained-payload-bytes (\d+)', timed.stderr)]
             assert len(payload) == len(retained), 'missing live-byte accounting'
+            bodies = [int(n) for n in re.findall(r'jit-work body-owned-bytes (\d+)', timed.stderr)]
+            assert len(bodies) == len(retained), 'missing immutable-body accounting'
+            body_live = bodies[10:-1]
             steady = retained[10:-1]
             live = payload[10:-1]
             if replacement:
@@ -229,14 +232,19 @@ def main() -> None:
                 # Address-order packing can change alignment gaps by a few bytes.
                 # Payload is exact; total packed storage must also stay bounded.
                 assert max(steady) - min(steady) <= 64, ('snapshot padding grew', steady)
+                assert max(body_live) == min(body_live), (
+                    'identical replacement retained historical body blocks', body_live)
             else:
                 assert steady[-1] - steady[0] < 4096 * len(steady), (
                     'trivial definitions retained more than their metadata', steady)
+                assert body_live[-1] - body_live[0] < 4096 * len(body_live), (
+                    'trivial definitions retained more than their body storage', body_live)
             peak = peak_rss(timed.stderr)
             assert peak < 512 * 1024 * 1024, 'accepted compilation scratch accumulated'
             print(json.dumps({'scenario': name, 'submissions': count,
                               'steady_metadata_bytes': [min(steady), max(steady)],
                               'steady_live_bytes': [min(live), max(live)],
+                              'steady_body_bytes': [min(body_live), max(body_live)],
                               'peak_rss_bytes': peak}), flush=True)
 
         # Exercise ORC even on macOS ARM64, whose public JIT defaults to Mach-O.
@@ -273,10 +281,15 @@ def main() -> None:
         assert len(payload) == count + 2, 'schema root probe did not finish every publication'
         steady = payload[10:-1]
         assert max(steady) - min(steady) <= 64, ('schema roots or repeated resolution aliases accumulated', steady)
+        bodies = [int(n) for n in re.findall(r'jit-work body-owned-bytes (\d+)', timed.stderr)]
+        assert len(bodies) == len(payload), 'missing schema-body accounting'
+        body_live = bodies[10:-1]
+        assert max(body_live) - min(body_live) <= 64, ('obsolete schema bodies accumulated', body_live)
         peak = peak_rss(timed.stderr)
         assert peak < 512 * 1024 * 1024, 'schema compiler scratch accumulated'
         print(json.dumps({'scenario': 'schema-roots', 'submissions': count,
                           'steady_live_bytes': [min(steady), max(steady)],
+                          'steady_body_bytes': [min(body_live), max(body_live)],
                           'peak_rss_bytes': peak}), flush=True)
 
 

@@ -10,10 +10,12 @@
 (import "coil.mem" :use [mem-copy])
 (import "coil.str" :use [str-find])
 (import "coil.compiler.retained_source" :as sources)
+(import "coil.compiler.retained_heap" :as heap)
 
 (defstruct GraphKey [(address i64) (kind i64)])
-(defstruct GraphRange [(lo i64) (hi i64) (alignment i64) (offset i64)])
-(defstruct GraphVisit [(kind i64) (address i64) (fix (fnptr c [(ptr Graph) (ptr i8) (ptr i8)] i64))])
+(defstruct GraphRange [(lo i64) (hi i64) (alignment i64) (offset i64) (target i64) (frozen bool)])
+(defstruct GraphVisit [(kind i64) (address i64) (fix (fnptr c [(ptr Graph) (ptr i8) (ptr i8)] i64))
+  (walk (fnptr c [(ptr Graph) (ptr i8)] i64))])
 (defstruct Graph
   [(a (dyn Allocator))
    (destination (dyn Allocator))
@@ -30,7 +32,11 @@
    (payload-bytes i64)
    (source-store (ptr sources/SourceStore))
    (source-cache (HashMap i64 (ptr sources/SourcePayload)))
-   (source-owners (ArrayList (ptr sources/SourcePayload)))])
+   (source-owners (ArrayList (ptr sources/SourcePayload)))
+   (heap (ptr heap/Heap)) (freezing bool)
+   (frozen-roots (HashMap i64 i64))
+   (held (HashMap i64 i64))
+   (owners (ArrayList (ptr heap/Block)))])
 
 (defn graph-key-hash [(raw (ptr i8)) (size i64)] (-> i64)
   (let [key (p/cast (ptr GraphKey) raw)]
@@ -54,7 +60,18 @@
     :data (p/cast (ptr i8) 0) :bytes 0 :payload-bytes 0
     :source-store (p/cast (ptr sources/SourceStore) 0)
     :source-cache (hm-new [i64 (ptr sources/SourcePayload)] a (i64-keyops))
-    :source-owners (al-new [(ptr sources/SourcePayload)] a)))
+    :source-owners (al-new [(ptr sources/SourcePayload)] a)
+    :heap (p/cast (ptr heap/Heap) 0) :freezing false
+    :frozen-roots (hm-new [i64 i64] a (i64-keyops))
+    :held (hm-new [i64 i64] a (i64-keyops))
+    :owners (al-new [(ptr heap/Block)] a)))
+
+(defn graph-hold! [(g (ptr Graph)) (item (ptr heap/Block))] (-> i64)
+  (let [key (p/cast i64 item)]
+    (unless (hm-contains? (.held g) key)
+      (set! (mut (.held g)) key 0)
+      (push! (mut (.owners g)) item) 0))
+  0)
 
 ;;; The caller takes source-owners after graph-finish!, and releases that list
 ;;; when the destination snapshot retires. Marking never acquires ownership.
@@ -75,19 +92,38 @@
           source)))))
 (defn graph-range! [(g (ptr Graph)) (address i64) (bytes i64) (alignment i64)] (-> i64)
   (when (and (!= address 0) (> bytes 0))
-    (push! (mut (.ranges g))
-      (GraphRange :lo address :hi (+ address bytes) :alignment alignment :offset 0)) 0)
+    (let [item (heap/find-block (.heap g) address)]
+      (if (= (p/cast i64 item) 0)
+        (push! (mut (.ranges g))
+          (GraphRange :lo address :hi (+ address bytes) :alignment alignment :offset 0
+            :target 0 :frozen (.freezing g)))
+        (do
+          (assert (<= (+ address bytes) (+ (p/cast i64 (.data item)) (.bytes item))))
+          (graph-hold! g item)))) 0)
   0)
+(defn graph-enter-typed! [(g (ptr Graph)) (address i64) (bytes i64) (alignment i64)
+                    (kind i64) (fix (fnptr c [(ptr Graph) (ptr i8) (ptr i8)] i64))
+                    (walk (fnptr c [(ptr Graph) (ptr i8)] i64))] (-> bool)
+  (if (= address 0) false
+    (let [key (GraphKey :address address :kind kind)
+          ; One entry per typed node: 1 is visited, 2 is visited as immutable.
+          ; Upgrading 1 -> 2 must walk again to promote its pointer closure.
+          state (match (get (.seen g) key) (Some [value] value) (None [] 0))]
+      (if (or (= state 2) (and (= state 1) (not (.freezing g)))) false
+        (do
+          (set! (mut (.seen g)) key (if (.freezing g) 2 1))
+          (graph-range! g address bytes alignment)
+          (when (and (= state 0) (= (p/cast i64 (heap/find-block (.heap g) address)) 0))
+            (push! (mut (.visits g)) (GraphVisit :kind kind :address address :fix fix :walk walk)) 0)
+          true)))))
+(defn graph-untyped-walk [(g (ptr Graph)) (node (ptr i8))] (-> i64)
+  ; Untyped clients may relocate graphs but must supply a walker to freeze an
+  ; overlapping pointer closure. Silently omitting those edges is unsafe.
+  (abort) 0)
 (defn graph-enter! [(g (ptr Graph)) (address i64) (bytes i64) (alignment i64)
                     (kind i64) (fix (fnptr c [(ptr Graph) (ptr i8) (ptr i8)] i64))] (-> bool)
-  (if (= address 0) false
-    (let [key (GraphKey :address address :kind kind)]
-      (if (hm-contains? [GraphKey i64] (.seen g) key) false
-        (do
-          (set! (mut (.seen g)) key 0)
-          (graph-range! g address bytes alignment)
-          (push! (mut (.visits g)) (GraphVisit :kind kind :address address :fix fix))
-          true)))))
+  (graph-enter-typed! g address bytes alignment kind fix
+    (p/fnptr-of graph-untyped-walk)))
 
 (extern retained.qsort :cc c [(ptr i8) u64 u64 (fnptr c [(ptr i8) (ptr i8)] i32)] (-> void))
 (defn graph-range-compare [(left (ptr i8)) (right (ptr i8))] (-> i32)
@@ -98,6 +134,8 @@
 (defn graph-address [(g (ptr Graph)) (address i64)] (-> i64)
   (block :found
     (when (= address 0) (return-from :found 0))
+    (unless (= (p/cast i64 (heap/find-block (.heap g) address)) 0)
+      (return-from :found address))
     (let [(mut lo) 0 (mut hi) (len (.ranges g))]
       (loop
         (if (>= (load lo) (load hi))
@@ -109,12 +147,11 @@
                   (if (>= address (.hi range))
                       (set! lo (+ mid 1))
                       (return-from :found
-                        (+ (p/cast i64 (.data g))
-                           (+ (.offset range) (- address (.lo range)))))))))))
+                        (+ (.target range) (- address (.lo range))))))))))
     (abort)
     0))
 
-(defn graph-finish! [(g (ptr Graph))] (-> i64)
+(defn graph-coalesce! [(g (ptr Graph))] (-> i64)
   (let [ranges (field g ranges)]
     (retained.qsort (p/cast (ptr i8) (.data ranges)) (p/cast u64 (.len ranges))
       (p/cast u64 (p/sizeof GraphRange)) (p/fnptr-of graph-range-compare))
@@ -126,19 +163,64 @@
             (let [last (al-elem [GraphRange] ranges (- (load count) 1))]
               (if (< (.lo current) (.hi last))
                 (do
+                  (set! (.frozen last) (or (.frozen last) (.frozen current)))
                   (when (> (.hi current) (.hi last)) (set! (.hi last) (.hi current)) 0)
                   (when (> (.alignment current) (.alignment last))
                     (set! (.alignment last) (.alignment current)) 0) 0)
                 (do (set! (al-elem [GraphRange] ranges (load count)) current)
                   (set! count (+ (load count) 1)) 0))))))
-      (set! (.len ranges) (load count)))
+      (set! (.len ranges) (load count))))
+  0)
+
+(defn graph-containing-range [(g (ptr Graph)) (address i64)] (-> (ptr GraphRange))
+  (block :found
+    (let [(mut lo) 0 (mut hi) (len (.ranges g))]
+      (loop
+        (when (>= (load lo) (load hi)) (break))
+        (let [mid (/ (+ (load lo) (load hi)) 2)
+              r (al-elem [GraphRange] (field g ranges) mid)]
+          (cond (< address (.lo r)) (set! hi mid)
+                (>= address (.hi r)) (set! lo (+ mid 1))
+                :else (return-from :found r)))))
+    (p/cast (ptr GraphRange) 0)))
+
+;;; Overlapping typed ranges can expose more fields than the original body
+;;; pointer. Promote their entire pointer closure before allocating anything.
+(defn graph-freeze-closure! [(g (ptr Graph))] (-> i64)
+  (loop
+    (graph-coalesce! g)
+    (let [(mut pending) (al-new [GraphVisit] (.a g))]
+      (for [i 0 (len (.visits g))]
+        (let [visit (get (.visits g) i)
+              r (graph-containing-range g (.address visit))]
+          (when (and (!= (p/cast i64 r) 0) (.frozen r))
+            (unless (= (match (get (.seen g)
+              (GraphKey :address (.address visit) :kind (.kind visit)))
+                (Some [state] state) (None [] 0)) 2)
+              (push! (mut pending) visit) 0))))
+      (when (= (len (load pending)) 0) (break))
+      (set! (.freezing g) true)
+      (for [i 0 (len (load pending))]
+        (let [visit (get (load pending) i)]
+          (p/call-ptr (.walk visit) g (p/cast (ptr i8) (.address visit)))))
+      (set! (.freezing g) false)))
+  0)
+
+(defn graph-finish! [(g (ptr Graph))] (-> i64)
+  (graph-freeze-closure! g)
+  (let [ranges (field g ranges)]
     (let [(mut total) 0 (mut alignment) 1]
       (for [i 0 (.len ranges)]
         (let [r (al-elem [GraphRange] ranges i) a (.alignment r)
               gap (% (+ (- (% (.lo r) a) (% (load total) a)) a) a)]
-          (set! total (+ (load total) gap))
-          (set! (.offset r) (load total))
-          (set! total (+ (load total) (- (.hi r) (.lo r))))
+          (if (.frozen r)
+            (let [item (heap/allocate-block! (.heap g) (- (.hi r) (.lo r)) a (% (.lo r) a))]
+              (set! (.target r) (p/cast i64 (.data item)))
+              (graph-hold! g item))
+            (do
+              (set! total (+ (load total) gap))
+              (set! (.offset r) (load total))
+              (set! total (+ (load total) (- (.hi r) (.lo r)))) 0))
           (set! (.payload-bytes g) (+ (.payload-bytes g) (- (.hi r) (.lo r))))
           (when (> a (load alignment)) (set! alignment a) 0)))
       (set! (.bytes g) (load total))
@@ -148,12 +230,24 @@
           (None [] (oom-at c"retained compiler graph" (load total)))) 0))
     (for [i 0 (.len ranges)]
       (let [r (al-elem [GraphRange] ranges i)]
-        (mem-copy [i8] (p/index (.data g) (.offset r))
+        (unless (.frozen r) (set! (.target r) (+ (p/cast i64 (.data g)) (.offset r))) 0)
+        (mem-copy [i8] (p/cast (ptr i8) (.target r))
           (p/cast (ptr i8) (.lo r)) (- (.hi r) (.lo r)))))
     (for [i 0 (len (.visits g))]
-      (let [visit (al-elem [GraphVisit] (field g visits) i)]
+      (let [visit (al-elem [GraphVisit] (field g visits) i)
+            target (graph-address g (.address visit)) destination (.destination g)]
+        (unless (= (p/cast i64 (heap/find-block (.heap g) target)) 0)
+          (set! (.destination g) (.a (.heap g))) 0)
         (p/call-ptr (.fix visit) g (p/cast (ptr i8) (.address visit))
-          (p/cast (ptr i8) (graph-address g (.address visit)))))))
+          (p/cast (ptr i8) target))
+        (set! (.destination g) destination))))
+  (unless (= (p/cast i64 (.heap g)) 0)
+    (let [(mut owners) (al-new [(ptr heap/Block)] (.a (.heap g)))]
+      (for [i 0 (len (.owners g))]
+        (let [item (get (.owners g) i)]
+          (heap/retain! item)
+          (push! (mut owners) item)))
+      (set! (.owners g) (load owners))) 0)
   0)
 
 

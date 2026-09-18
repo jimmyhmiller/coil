@@ -109,6 +109,33 @@ the accepted report.
 
 ## Ownership
 
+Checked function bodies have immutable, nonmoving storage. Their typed pointer
+closures are allocated as shared ranges; ordinary compiler indexes remain in
+the replaceable snapshot. Overlapping ranges preserve interior aliases, and
+any additional typed fields exposed by overlap are promoted before allocation.
+The visitor generator audits the checked-body traversal to prevent mutable phase
+state or separately owned source records from entering this boundary unnoticed.
+
+Each snapshot owns every body block reached by its typed traversal. Blocks do
+not own each other, so cycles can retire. The new snapshot acquires ownership
+before the preceding one releases it. Source-provider snapshots have separate
+ownership lists. This still traverses metadata and copies owner lists on each
+publication; it is not yet a persistent query database.
+
+Snapshot marking and relocation use a separate temporary arena. Pruning writes
+retained metadata through its owning loader or resolution-state allocator;
+marking tables are then discarded before relocation starts. After pointer
+fixups and ownership transfer, relocation scratch is freed too. With
+`COIL_TRACE=1`, `jit.snapshot.mark-scratch` and `jit.snapshot.copy-scratch`
+report this arena separately from compilation scratch. Its peak counter spans
+both traversals; live bytes describe the current traversal.
+
+`COIL_JIT_TRACE=1` reports cumulative `body-copied-bytes` plus
+`body-owned-bytes` and `body-owned-blocks` before releasing the preceding
+snapshot. These count body payload storage, not allocator, page-index, or
+ownership-list overhead. The memory gate checks body storage separately from
+the relocated snapshot and also enforces its process-memory limits.
+
 Source names, source text, and line tables are immutable shared payloads owned
 independently of the copied metadata graph. Each accepted snapshot and configured
 source provider retains its own deduplicated payload list. Replacing a source
