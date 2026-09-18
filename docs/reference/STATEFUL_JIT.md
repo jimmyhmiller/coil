@@ -109,6 +109,19 @@ the accepted report.
 
 ## Ownership
 
+Source names, source text, and line tables are immutable shared payloads owned
+independently of the copied metadata graph. Each accepted snapshot and configured
+source provider retains its own deduplicated payload list. Replacing a source
+slot creates a new payload; retiring the last snapshot that refers to a payload
+releases it. Rejected candidates acquire no snapshot ownership. Other metadata
+still uses the precise graph relocation path; this is not yet an incremental
+semantic database.
+
+With `COIL_JIT_TRACE=1`, `source-copies`, `source-copied-bytes`, and
+`source-reuses` are cumulative counters for that session. `source-owned-bytes`
+reports payload storage before the preceding snapshot is released. These
+counters are separate from `retained-bytes`, which counts the relocated graph.
+
 A successful submission publishes a compact graph of live metadata and releases
 its compiler and linker scratch. The next success replaces that metadata graph;
 accepted compilation arenas do not accumulate. Source locations and hygiene

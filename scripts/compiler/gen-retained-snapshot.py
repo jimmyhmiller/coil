@@ -191,7 +191,18 @@ def body(t):
         if head in ('coil.compiler.ast.ValueResEntry','coil.compiler.ast.TypeResEntry'):
             walks=['(set! (.weak-alias g) true)']+walks+['(set! (.weak-alias g) false)']
         if head=='coil.reader.Sexp': walks.append('(set! (mut (.live-scopes g)) (.hyg value) 0)')
-        return '(do '+' '.join(walks)+' 0)', '('+head+' '+' '.join(fields)+')'
+        walk='(do '+' '.join(walks)+' 0)'
+        value='('+head+' '+' '.join(fields)+')'
+        if head=='coil.compiler.loader.Source':
+            # Source slots are mutable revision-local records, but their payload
+            # is immutable. The graph owner explicitly opts into shared storage.
+            disabled='(= (p/cast i64 (.source-store g)) 0)'
+            walk=f'(if {disabled} {walk} 0)'
+            value=f'''(if {disabled} {value}
+              (let [source (graph-source! g (.name value) (.text value) (.line_starts value))]
+                (coil.compiler.loader.Source :name (.name source) :text (.text source)
+                  :line_starts (field source lines))))'''
+        return walk,value
     walks=[];values=[]
     for variant in tail:
         name=mod+'.'+variant[0];fields=variant[1] if len(variant)>1 else [];args=['v'+str(i) for i in range(len(fields))]
