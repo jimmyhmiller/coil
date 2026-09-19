@@ -1,0 +1,646 @@
+(module coil.pmap)
+(import "coil.primitive" :as primitive)
+
+; A persistent hash map `PMap[K V]`: a compressed hash-array-mapped trie whose
+; nodes are reference counted and shared between maps. `pm-assoc`/`pm-dissoc`
+; return a NEW map that shares every untouched node with the old one, so a map of
+; n entries costs O(log32 n) small nodes per update and the old map stays valid
+; and unchanged. That is the whole point: a value you can hand to another owner
+; without copying it and without either side being able to disturb the other.
+;
+;   (import "coil.pmap" :use *) (import "coil.alloc" :use *)
+;   (let [a (pm-new-scalar [i64 i64] (malloc-allocator-lease))
+;         b (pm-assoc a 7 42)]           ; a is still empty
+;     (match (pm-get b 7) (Some [v] v) (None [] 0)))
+;
+; OWNERSHIP. A `PMap` is an owner: it implements `Drop` (release the root) and
+; `Clone` (share the root — O(1), no node is copied). Keys and values are owned by
+; the node that holds them: a copied node CLONES them, a freed node DROPS them, so
+; `V` may itself be an owner (an `Rc`, another `PMap`, a handle whose `Drop`
+; releases an external reference). Both must implement `Clone`; scalars, pointers
+; and slices already do.
+;
+; A map outlives the scope that made it, so it holds an `AllocatorLease`, never a
+; borrowed `(dyn Allocator)`. Every map derived from one ancestor carries a clone
+; of the same lease, and whichever of them releases a node last frees it.
+;
+; IN-PLACE EDITS. `pm-assoc!`/`pm-dissoc!` take `(mut (PMap K V))` and edit nodes
+; in place where that is unobservable: a node is edited only when it and every
+; node above it have exactly one reference. Building a map with `pm-assoc!` from a
+; fresh `pm-new` therefore never copies a node, while the same call on a map whose
+; root is shared copies exactly the path. The pure forms are `clone` + the mutating
+; form, so there is one implementation of each operation.
+;
+; HASHING reuses `coil.hashmap`'s `KeyOps` capability (hash + eq), for the reasons
+; given there. Only non-owning ops are accepted: key storage is governed by
+; `Clone`/`Drop` here, so `owns = 1` would free a key twice. `pm-new` rejects it.
+;
+; NOT THREAD SAFE: reference counts are plain integers, as in `coil.rc`.
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.mem" :use *)
+(import "coil.slice" :use [slice-new slice-data])
+(import "coil.control" :use *)
+(import "coil.hashmap" :use [KeyOps scalar-keyops keyops-valid? ko-hash ko-eq ko-owns?])
+
+;;; One key/value pair plus the key's full hash. Keeping the hash means a pair
+;;; pushed one level down never has to be rehashed.
+(defstruct PEntry [K V] [(hash i64) (key K) (val V)])
+
+;;; A trie node. `datamap` marks the 5-bit hash fragments stored inline in
+;;; `entries`; `nodemap` marks the fragments that lead to a sub-node in
+;;; `children`. A fragment is never in both. Both arrays are exactly as long as
+;;; their counts, in fragment order. Below the last hash fragment a node is a
+;;; COLLISION node: the maps are unused and `entries` is an unordered list of
+;;; pairs whose full hashes are equal.
+(defstruct PNode [K V]
+  [(refs i64)
+   (datamap i64)
+   (nodemap i64)
+   (nentries i64)
+   (nchildren i64)
+   (entries (ptr (PEntry K V)))
+   (children (ptr (ptr (PNode K V))))])
+
+(defstruct PMap [K V]
+  [(root (ptr (PNode K V)))
+   (count i64)
+   (lease AllocatorLease)
+   (ops (ptr KeyOps))])
+
+(defn pm-fail [(site (ptr i8))] (-> i64)
+  (oom-puts c"coil.pmap: ")
+  (oom-puts site)
+  (oom-puts c"\n")
+  (abort)
+  0)
+
+; Thirteen fragments consume all 64 hash bits (12 of five bits, one of four).
+(defn pm-collision-level? [(shift i64)] (-> bool) (> shift 60))
+
+(defn pm-fragment-bit [(hash i64) (shift i64)] (-> i64)
+  (primitive/ishl 1 (primitive/iand (primitive/ishr hash shift) 31)))
+
+(defn pm-rank [(bitmap i64) (bit i64)] (-> i64)
+  (primitive/popcount (primitive/iand bitmap (primitive/isub bit 1))))
+
+(defn pm-no-node [K V] [] (-> (ptr (PNode K V)))
+  (primitive/cast (ptr (PNode K V)) 0))
+
+(defn pm-clone-at [(T Clone)] [(p (ref T))] (-> T) (clone p))
+
+;;; Clone the pair at `src` into the uninitialized slot `dst`.
+(defn pm-clone-entry [(K Clone) (V Clone)] [(dst (ptr (PEntry K V)))
+                                             (src (ptr (PEntry K V)))] (-> i64)
+  (store! (field dst hash) (load (field src hash)))
+  (store! (field dst key) (pm-clone-at [K] (field src key)))
+  (store! (field dst val) (pm-clone-at [V] (field src val)))
+  0)
+
+;;; Drop the pair at `e`, leaving the slot uninitialized.
+(defn pm-drop-entry [K V] [(e (ptr (PEntry K V)))] (-> i64)
+  (let [key (take! [K] (field e key))
+        val (take! [V] (field e val))]
+    0))
+
+(defn pm-node-new [K V] [(a (dyn Allocator)) (nentries i64) (nchildren i64)] (-> (ptr (PNode K V)))
+  (let [node (match (alloc [(PNode K V)] a 1)
+               (Some [memory] (slice-data memory))
+               (None [] (do (oom-at c"pmap node" (primitive/sizeof (PNode K V)))
+                            (pm-no-node [K V]))))]
+    (store! (field node refs) 1)
+    (store! (field node datamap) 0)
+    (store! (field node nodemap) 0)
+    (store! (field node nentries) nentries)
+    (store! (field node nchildren) nchildren)
+    (store! (field node entries)
+            (if (= nentries 0)
+                (primitive/cast (ptr (PEntry K V)) 0)
+                (match (alloc [(PEntry K V)] a nentries)
+                  (Some [memory] (slice-data memory))
+                  (None [] (do (oom-at c"pmap entries"
+                                       (primitive/imul nentries
+                                                       (primitive/sizeof (PEntry K V))))
+                               (primitive/cast (ptr (PEntry K V)) 0))))))
+    (store! (field node children)
+            (if (= nchildren 0)
+                (primitive/cast (ptr (ptr (PNode K V))) 0)
+                (match (alloc [(ptr (PNode K V))] a nchildren)
+                  (Some [memory] (slice-data memory))
+                  (None [] (do (oom-at c"pmap children"
+                                       (primitive/imul nchildren
+                                                       (primitive/sizeof (ptr (PNode K V)))))
+                               (primitive/cast (ptr (ptr (PNode K V))) 0))))))
+    node))
+
+;;; Free a node's storage without touching what its slots hold: every pair and
+;;; child reference must already have been moved out or released.
+(defn pm-node-free-shell [K V] [(a (dyn Allocator)) (node (ptr (PNode K V)))] (-> i64)
+  (when (> (load (field node nentries)) 0)
+    (free [(PEntry K V)] a (slice-new (load (field node entries)) (load (field node nentries))))
+    0)
+  (when (> (load (field node nchildren)) 0)
+    (free [(ptr (PNode K V))]
+          a
+          (slice-new (load (field node children)) (load (field node nchildren))))
+    0)
+  (free [(PNode K V)] a (slice-new node 1))
+  0)
+
+;;; Give up one reference. The last one drops every pair, releases every child
+;;; and frees the node. Depth is bounded by the 14 trie levels.
+(defn pm-node-release! [K V] [(a (dyn Allocator)) (node (ptr (PNode K V)))] (-> i64)
+  (let [remaining (primitive/isub (load (field node refs)) 1)]
+    (store! (field node refs) remaining)
+    (when (= remaining 0)
+      (for [i 0 (load (field node nentries))]
+        (pm-drop-entry (primitive/index (load (field node entries)) i)))
+      (for [i 0 (load (field node nchildren))]
+        (pm-node-release! a (load (primitive/index (load (field node children)) i))))
+      (pm-node-free-shell a node)
+      0)
+    0))
+
+;;; Build a node from `src` with one slot optionally removed and one optionally
+;;; opened in each array. `drop-*` index the OLD array, `open-*` the NEW one; -1
+;;; means none. An opened slot is left uninitialized for the caller to fill, and
+;;; the bitmaps are copied unchanged for the caller to adjust.
+;;;
+;;; With `move` false, `src` is untouched: kept pairs are cloned and kept children
+;;; retained. With `move` true, `src` is consumed: kept slots are moved bitwise and
+;;; its shell is freed. The caller must already own whatever the dropped slots
+;;; held, because nothing here drops or releases them.
+(defn pm-node-derive [(K Clone) (V Clone)] [(a (dyn Allocator))
+                                             (src (ptr (PNode K V)))
+                                             (move bool)
+                                             (drop-entry i64)
+                                             (drop-child i64)
+                                             (open-entry i64)
+                                             (open-child i64)] (-> (ptr (PNode K V)))
+  (let [old-entries (load (field src nentries))
+        old-children (load (field src nchildren))
+        node (pm-node-new [K V]
+                          a
+                          (primitive/iadd (primitive/isub old-entries (if (>= drop-entry 0) 1 0))
+                                          (if (>= open-entry 0) 1 0))
+                          (primitive/iadd (primitive/isub old-children (if (>= drop-child 0) 1 0))
+                                          (if (>= open-child 0) 1 0)))
+        (mut at) 0]
+    (store! (field node datamap) (load (field src datamap)))
+    (store! (field node nodemap) (load (field src nodemap)))
+    (for [i 0 old-entries]
+      (when (!= i drop-entry)
+        (when (= (load at) open-entry) (store! at (primitive/iadd (load at) 1)) 0)
+        (let [from (primitive/index (load (field src entries)) i)
+              to (primitive/index (load (field node entries)) (load at))]
+          (if move (mem-copy to from 1) (pm-clone-entry to from)))
+        (store! at (primitive/iadd (load at) 1))
+        0))
+    (store! at 0)
+    (for [i 0 old-children]
+      (when (!= i drop-child)
+        (when (= (load at) open-child) (store! at (primitive/iadd (load at) 1)) 0)
+        (let [child (load (primitive/index (load (field src children)) i))]
+          (unless move
+            (store! (field child refs) (primitive/iadd (load (field child refs)) 1))
+            0)
+          (store! (primitive/index (load (field node children)) (load at)) child))
+        (store! at (primitive/iadd (load at) 1))
+        0))
+    (when move (pm-node-free-shell a src) 0)
+    node))
+
+;;; A subtree holding exactly the two pairs at `first` and `second`, whose keys
+;;; differ. Both are moved in.
+(defn pm-node-pair [K V] [(a (dyn Allocator))
+                          (shift i64)
+                          (first (ptr (PEntry K V)))
+                          (second (ptr (PEntry K V)))] (-> (ptr (PNode K V)))
+  (if (pm-collision-level? shift)
+      (let [node (pm-node-new [K V] a 2 0)]
+        (mem-copy (load (field node entries)) first 1)
+        (mem-copy (primitive/index (load (field node entries)) 1) second 1)
+        node)
+      (let [first-bit (pm-fragment-bit (load (field first hash)) shift)
+            second-bit (pm-fragment-bit (load (field second hash)) shift)]
+        (if (= first-bit second-bit)
+            (let [node (pm-node-new [K V] a 0 1)]
+              (store! (field node nodemap) first-bit)
+              (store! (load (field node children))
+                      (pm-node-pair a (primitive/iadd shift 5) first second))
+              node)
+            ; Unsigned order: the sign bit is fragment 31 and sorts last.
+            (let [node (pm-node-new [K V] a 2 0)
+                  first-leads (= (pm-rank second-bit first-bit) 0)]
+              (store! (field node datamap) (primitive/ior first-bit second-bit))
+              (mem-copy (load (field node entries)) (if first-leads first second) 1)
+              (mem-copy (primitive/index (load (field node entries)) 1)
+                        (if first-leads second first)
+                        1)
+              node)))))
+
+;;; Index of the pair in a collision node equal to the key at `key`, or -1.
+(defn pm-node-find [K V] [(ops (ptr KeyOps))
+                          (node (ptr (PNode K V)))
+                          (hash i64)
+                          (key (ptr i8))] (-> i64)
+  (let [(mut found) -1]
+    (for [i 0 (load (field node nentries))]
+      (let [e (primitive/index (load (field node entries)) i)]
+        (when (and (< (load found) 0)
+                   (and (= (load (field e hash)) hash)
+                        (ko-eq ops (primitive/cast (ptr i8) (field e key)) key)))
+          (store! found i)
+          0)))
+    (load found)))
+
+(defn pm-entry-matches? [K V] [(ops (ptr KeyOps))
+                               (e (ptr (PEntry K V)))
+                               (hash i64)
+                               (key (ptr i8))] (-> bool)
+  (and (= (load (field e hash)) hash)
+       (ko-eq ops (primitive/cast (ptr i8) (field e key)) key)))
+
+;;; Put `fresh` where the pair at `at` is. Owned: drop the old pair in place.
+;;; Shared: derive a node with that slot reopened.
+(defn pm-node-replace [(K Clone) (V Clone)] [(a (dyn Allocator))
+                                              (node (ptr (PNode K V)))
+                                              (owned bool)
+                                              (at i64)
+                                              (fresh (ptr (PEntry K V)))] (-> (ptr (PNode K V)))
+  (let [target (if owned
+                   (do (pm-drop-entry (primitive/index (load (field node entries)) at)) node)
+                   (pm-node-derive a node false at -1 at -1))]
+    (mem-copy (primitive/index (load (field target entries)) at) fresh 1)
+    target))
+
+;;; Swap the child at `at` for `fresh`, which the caller owns. `child-owned` says
+;;; the old child was consumed by whatever produced `fresh`.
+(defn pm-node-set-child [(K Clone) (V Clone)] [(a (dyn Allocator))
+                                                (node (ptr (PNode K V)))
+                                                (owned bool)
+                                                (child-owned bool)
+                                                (at i64)
+                                                (fresh (ptr (PNode K V)))] (-> (ptr (PNode K V)))
+  (if owned
+      (let [slot (primitive/index (load (field node children)) at)]
+        (unless child-owned (pm-node-release! a (load slot)) 0)
+        (store! slot fresh)
+        node)
+      (let [derived (pm-node-derive a node false -1 at -1 at)]
+        (store! (primitive/index (load (field derived children)) at) fresh)
+        derived)))
+
+;;; Insert or replace the pair at `fresh`, which is always consumed. `owned` means
+;;; `node` and everything above it has one reference: then `node` is consumed too
+;;; and the result may be the same pointer. Otherwise `node` is left intact and
+;;; the result is a new node the caller owns. `added` is set when the key is new.
+(defn pm-node-assoc [(K Clone) (V Clone)] [(a (dyn Allocator))
+                                            (ops (ptr KeyOps))
+                                            (node (ptr (PNode K V)))
+                                            (owned bool)
+                                            (shift i64)
+                                            (fresh (ptr (PEntry K V)))
+                                            (added (ptr i64))] (-> (ptr (PNode K V)))
+  (let [hash (load (field fresh hash))
+        key (primitive/cast (ptr i8) (field fresh key))]
+    (if (pm-collision-level? shift)
+        (let [at (pm-node-find ops node hash key)]
+          (if (>= at 0)
+              (pm-node-replace a node owned at fresh)
+              (let [grown (pm-node-derive a node owned -1 -1 (load (field node nentries)) -1)]
+                (mem-copy (primitive/index (load (field grown entries))
+                                           (primitive/isub (load (field grown nentries)) 1))
+                          fresh
+                          1)
+                (store! added 1)
+                grown)))
+        (let [bit (pm-fragment-bit hash shift)]
+          (cond
+            (!= (primitive/iand (load (field node datamap)) bit) 0)
+            (let [at (pm-rank (load (field node datamap)) bit)
+                  existing (primitive/index (load (field node entries)) at)]
+              (if (pm-entry-matches? ops existing hash key)
+                  (pm-node-replace a node owned at fresh)
+                  ; Two keys share this fragment: both move one level down.
+                  (let [displaced (primitive/alloc-stack (PEntry K V))
+                        child-at (pm-rank (load (field node nodemap)) bit)]
+                    (if owned (mem-copy displaced existing 1) (pm-clone-entry displaced existing))
+                    (let [subtree (pm-node-pair a (primitive/iadd shift 5) displaced fresh)
+                          derived (pm-node-derive a node owned at -1 -1 child-at)]
+                      (store! (primitive/index (load (field derived children)) child-at) subtree)
+                      (store! (field derived datamap)
+                              (primitive/ixor (load (field derived datamap)) bit))
+                      (store! (field derived nodemap)
+                              (primitive/ior (load (field derived nodemap)) bit))
+                      (store! added 1)
+                      derived))))
+
+            (!= (primitive/iand (load (field node nodemap)) bit) 0)
+            (let [at (pm-rank (load (field node nodemap)) bit)
+                  child (load (primitive/index (load (field node children)) at))
+                  child-owned (and owned (= (load (field child refs)) 1))
+                  updated (pm-node-assoc a ops child child-owned (primitive/iadd shift 5) fresh added)]
+              (if (= updated child)
+                  node
+                  (pm-node-set-child a node owned child-owned at updated)))
+
+            :else
+            (let [at (pm-rank (load (field node datamap)) bit)
+                  derived (pm-node-derive a node owned -1 -1 at -1)]
+              (mem-copy (primitive/index (load (field derived entries)) at) fresh 1)
+              (store! (field derived datamap) (primitive/ior (load (field derived datamap)) bit))
+              (store! added 1)
+              derived))))))
+
+;;; Remove the pair at `at`. The bitmap is the caller's to clear.
+(defn pm-node-remove-entry [(K Clone) (V Clone)] [(a (dyn Allocator))
+                                                   (node (ptr (PNode K V)))
+                                                   (owned bool)
+                                                   (at i64)] (-> (ptr (PNode K V)))
+  (when owned (pm-drop-entry (primitive/index (load (field node entries)) at)) 0)
+  (pm-node-derive a node owned at -1 -1 -1))
+
+;;; Remove the key at `key`. Ownership of `node` is as in `pm-node-assoc`. When
+;;; nothing matches, `removed` stays 0 and `node` is returned untouched. A result
+;;; holding a single pair and no children is folded into its parent by the caller,
+;;; which keeps the trie canonical: equal maps have equal shapes.
+(defn pm-node-dissoc [(K Clone) (V Clone)] [(a (dyn Allocator))
+                                             (ops (ptr KeyOps))
+                                             (node (ptr (PNode K V)))
+                                             (owned bool)
+                                             (shift i64)
+                                             (hash i64)
+                                             (key (ptr i8))
+                                             (removed (ptr i64))] (-> (ptr (PNode K V)))
+  (if (pm-collision-level? shift)
+      (let [at (pm-node-find ops node hash key)]
+        (if (< at 0)
+            node
+            (do (store! removed 1) (pm-node-remove-entry a node owned at))))
+      (let [bit (pm-fragment-bit hash shift)]
+        (cond
+          (!= (primitive/iand (load (field node datamap)) bit) 0)
+          (let [at (pm-rank (load (field node datamap)) bit)]
+            (if (pm-entry-matches? ops (primitive/index (load (field node entries)) at) hash key)
+                (let [shrunk (pm-node-remove-entry a node owned at)]
+                  (store! (field shrunk datamap) (primitive/ixor (load (field shrunk datamap)) bit))
+                  (store! removed 1)
+                  shrunk)
+                node))
+
+          (!= (primitive/iand (load (field node nodemap)) bit) 0)
+          (let [at (pm-rank (load (field node nodemap)) bit)
+                child (load (primitive/index (load (field node children)) at))
+                child-owned (and owned (= (load (field child refs)) 1))
+                updated (pm-node-dissoc a ops child child-owned (primitive/iadd shift 5) hash key removed)]
+            (cond
+              (= (load removed) 0)
+              node
+
+              ; `updated` is now uniquely ours: either new, or edited in place
+              ; along an owned path.
+              (and (= (load (field updated nentries)) 1) (= (load (field updated nchildren)) 0))
+              (let [survivor (primitive/alloc-stack (PEntry K V))
+                    entry-at (pm-rank (load (field node datamap)) bit)]
+                (mem-copy survivor (load (field updated entries)) 1)
+                (pm-node-free-shell a updated)
+                (when (and owned (not child-owned)) (pm-node-release! a child) 0)
+                (let [derived (pm-node-derive a node owned -1 at entry-at -1)]
+                  (mem-copy (primitive/index (load (field derived entries)) entry-at) survivor 1)
+                  (store! (field derived datamap) (primitive/ior (load (field derived datamap)) bit))
+                  (store! (field derived nodemap) (primitive/ixor (load (field derived nodemap)) bit))
+                  derived))
+
+              (and (= (load (field updated nentries)) 0) (= (load (field updated nchildren)) 0))
+              (do (pm-fail c"a sub-node became empty; the trie was not canonical") node)
+
+              (= updated child)
+              node
+
+              :else
+              (pm-node-set-child a node owned child-owned at updated)))
+
+          :else
+          node))))
+
+; ---- the map ------------------------------------------------------------------
+
+;;; An empty map allocating through `lease`, hashing and comparing keys with
+;;; `ops`. `ops` must not own its keys (see the module comment).
+(defn pm-new [K V] [(lease AllocatorLease) (ops (ptr KeyOps))] (-> (PMap K V))
+  (unless (keyops-valid? ops) (pm-fail c"pm-new: invalid KeyOps vtable") 0)
+  (when (ko-owns? ops)
+    (pm-fail c"pm-new: owning KeyOps are not supported; key storage follows Clone/Drop")
+    0)
+  (PMap :root (pm-no-node [K V]) :count 0 :lease lease :ops ops))
+
+;;; An empty map for scalar or pointer keys, where byte equality is value equality.
+(defn pm-new-scalar [K V] [(lease AllocatorLease)] (-> (PMap K V))
+  (pm-new [K V] lease (scalar-keyops [K])))
+
+(defn pm-len [K V] [(m (ref (PMap K V)))] (-> i64) (load (field m count)))
+
+(defn pm-empty? [K V] [(m (ref (PMap K V)))] (-> bool) (= (load (field m count)) 0))
+
+;;; Do two maps share their whole structure? True after `clone` and until either
+;;; side is edited; it is identity of storage, not equality of contents.
+(defn pm-same? [K V] [(left (ref (PMap K V))) (right (ref (PMap K V)))] (-> bool)
+  (= (load (field left root)) (load (field right root))))
+
+;;; A borrowed pointer to the value stored under `key`. It is valid while this map,
+;;; or any map sharing that node, is alive and the node is not edited in place.
+;;; Like `hm-get`, a lookup takes its key by value.
+(defn pm-get-ptr [K V] [(m (ref (PMap K V))) (key K)] (-> (Option (ptr V)))
+  (let [ops (load (field m ops))
+        key-slot (primitive/alloc-stack K)
+        key-stored (store! key-slot key)
+        key-bytes (primitive/cast (ptr i8) key-slot)
+        hash (ko-hash ops key-bytes)
+        (mut node) (load (field m root))
+        (mut shift) 0
+        (mut found) (None [(ptr V)])]
+    (loop
+      (cond
+        (= (load node) (pm-no-node [K V]))
+        (break)
+
+        (pm-collision-level? (load shift))
+        (let [at (pm-node-find ops (load node) hash key-bytes)]
+          (when (>= at 0)
+            (store! found (Some (field (primitive/index (load (field (load node) entries)) at) val)))
+            0)
+          (break))
+
+        :else
+        (let [bit (pm-fragment-bit hash (load shift))
+              current (load node)]
+          (cond
+            (!= (primitive/iand (load (field current datamap)) bit) 0)
+            (let [e (primitive/index (load (field current entries))
+                                     (pm-rank (load (field current datamap)) bit))]
+              (when (pm-entry-matches? ops e hash key-bytes) (store! found (Some (field e val))) 0)
+              (break))
+
+            (!= (primitive/iand (load (field current nodemap)) bit) 0)
+            (do
+              (store! node
+                      (load (primitive/index (load (field current children))
+                                             (pm-rank (load (field current nodemap)) bit))))
+              (store! shift (primitive/iadd (load shift) 5))
+              0)
+
+            :else
+            (break)))))
+    (let [spent (take! [K] key-slot)] 0)
+    (load found)))
+
+;;; The value stored under `key`, cloned out of the map.
+(defn pm-get [K (V Clone)] [(m (ref (PMap K V))) (key K)] (-> (Option V))
+  (match (pm-get-ptr m key)
+    (Some [value] (Some (pm-clone-at [V] value)))
+    (None [] (None [V]))))
+
+(defn pm-contains? [K V] [(m (ref (PMap K V))) (key K)] (-> bool)
+  (match (pm-get-ptr m key) (Some [_] true) (None [] false)))
+
+;;; Insert or replace, editing in place wherever this map is the only owner.
+;;; Returns 1 when the key is new and 0 when its value was replaced.
+(defn pm-assoc! [(K Clone) (V Clone)] [(m (mut (PMap K V))) (key K) (value V)] (-> i64)
+  (let [a (allocator-lease-borrow (field m lease))
+        ops (load (field m ops))
+        fresh (primitive/alloc-stack (PEntry K V))
+        added (primitive/alloc-stack i64)]
+    (store! (field fresh key) key)
+    (store! (field fresh val) value)
+    (store! (field fresh hash) (ko-hash ops (primitive/cast (ptr i8) (field fresh key))))
+    (store! added 0)
+    (let [root (load (field m root))]
+      (store! (field m root)
+              (if (= root (pm-no-node [K V]))
+                  (let [node (pm-node-new [K V] a 1 0)]
+                    (mem-copy (load (field node entries)) fresh 1)
+                    (store! (field node datamap) (pm-fragment-bit (load (field fresh hash)) 0))
+                    (store! added 1)
+                    node)
+                  (let [owned (= (load (field root refs)) 1)
+                        updated (pm-node-assoc a ops root owned 0 fresh added)]
+                    (unless owned (pm-node-release! a root) 0)
+                    updated))))
+    (store! (field m count) (primitive/iadd (load (field m count)) (load added)))
+    (load added)))
+
+;;; Remove `key`, editing in place wherever this map is the only owner. Returns 1
+;;; when a pair was removed and 0 when the key was absent.
+(defn pm-dissoc! [(K Clone) (V Clone)] [(m (mut (PMap K V))) (key K)] (-> i64)
+  (let [root (load (field m root))
+        key-slot (primitive/alloc-stack K)
+        removed (primitive/alloc-stack i64)]
+    (store! key-slot key)
+    (store! removed 0)
+    (unless (= root (pm-no-node [K V]))
+      (let [a (allocator-lease-borrow (field m lease))
+            ops (load (field m ops))
+            key-bytes (primitive/cast (ptr i8) key-slot)
+            owned (= (load (field root refs)) 1)
+            updated (pm-node-dissoc a ops root owned 0 (ko-hash ops key-bytes) key-bytes removed)]
+        (when (= (load removed) 1)
+          (unless owned (pm-node-release! a root) 0)
+          (store! (field m root)
+                  (if (and (= (load (field updated nentries)) 0)
+                           (= (load (field updated nchildren)) 0))
+                      (do (pm-node-release! a updated) (pm-no-node [K V]))
+                      updated))
+          (store! (field m count) (primitive/isub (load (field m count)) 1))
+          0)
+        0)
+      0)
+    (let [spent (take! [K] key-slot)] 0)
+    (load removed)))
+
+;;; A new map with `key` bound to `value`. `m` is unchanged and shares every node
+;;; off the path to `key` with the result.
+(defn pm-assoc [(K Clone) (V Clone)] [(m (ref (PMap K V))) (key K) (value V)] (-> (PMap K V))
+  (let [(mut next) (clone m)]
+    (pm-assoc! (mut next) key value)
+    next))
+
+;;; A new map without `key`. `m` is unchanged.
+(defn pm-dissoc [(K Clone) (V Clone)] [(m (ref (PMap K V))) (key K)] (-> (PMap K V))
+  (let [(mut next) (clone m)]
+    (pm-dissoc! (mut next) key)
+    next))
+
+(impl [K V] Clone (PMap K V)
+  (clone [(self (ref (PMap K V)))]
+         (-> (PMap K V))
+         (let [root (load (field self root))]
+           (unless (= root (pm-no-node [K V]))
+             (store! (field root refs) (primitive/iadd (load (field root refs)) 1))
+             0)
+           (PMap :root root
+                 :count (load (field self count))
+                 :lease (clone (field self lease))
+                 :ops (load (field self ops))))))
+
+; The lease field is dropped after this body, so the allocator outlives the nodes.
+(impl [K V] Drop (PMap K V)
+  (drop [(self (mut (PMap K V)))]
+        (-> void)
+        (let [root (load (field self root))]
+          (unless (= root (pm-no-node [K V]))
+            (pm-node-release! (allocator-lease-borrow (field self lease)) root)
+            (store! (field self root) (pm-no-node [K V]))
+            0)
+          0)))
+
+; ---- iteration ----------------------------------------------------------------
+
+;;; A depth-first cursor over a map's pairs. It borrows the map: it holds no
+;;; reference, so the map must outlive it and must not be edited in place meanwhile.
+;;; Order is by hash fragment, which is stable for a given set of keys.
+(defstruct PMapIter [K V]
+  [(nodes (array (ptr (PNode K V)) 14))
+   (entry-at (array i64 14))
+   (child-at (array i64 14))
+   (depth i64)])
+
+(defn pm-iter [K V] [(m (ref (PMap K V)))] (-> (PMapIter K V))
+  (let [(mut it) (primitive/zeroed (PMapIter K V))
+        root (load (field m root))]
+    (if (= root (pm-no-node [K V]))
+        (store! (field it depth) -1)
+        (do (store! (primitive/index (field it nodes) 0) root) (store! (field it depth) 0)))
+    (load it)))
+
+(impl [K V] Iterator (PMapIter K V)
+  (next [(it (mut (PMapIter K V)))]
+        (-> (Option (ptr (PEntry K V))))
+        (loop
+          (let [depth (load (field it depth))]
+            (if (< depth 0)
+                (break (None))
+                (let [node (load (primitive/index (field it nodes) depth))
+                      entry-at (load (primitive/index (field it entry-at) depth))
+                      child-at (load (primitive/index (field it child-at) depth))]
+                  (cond
+                    (< entry-at (load (field node nentries)))
+                    (do
+                      (store! (primitive/index (field it entry-at) depth) (primitive/iadd entry-at 1))
+                      (break (Some (primitive/index (load (field node entries)) entry-at))))
+
+                    (< child-at (load (field node nchildren)))
+                    (let [below (primitive/iadd depth 1)]
+                      (store! (primitive/index (field it child-at) depth) (primitive/iadd child-at 1))
+                      (store! (primitive/index (field it nodes) below)
+                              (load (primitive/index (load (field node children)) child-at)))
+                      (store! (primitive/index (field it entry-at) below) 0)
+                      (store! (primitive/index (field it child-at) below) 0)
+                      (store! (field it depth) below)
+                      0)
+
+                    :else
+                    (do (store! (field it depth) (primitive/isub depth 1)) 0))))))))
+
+(impl [K V] Len (PMap K V)
+  (len [(m (PMap K V))] (-> i64) (pm-len m)))
