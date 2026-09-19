@@ -26,8 +26,10 @@ ATTEMPT_RE = re.compile(r"\[autofix (\d+)\]")
 
 
 def api(path, raw=False):
-    out = subprocess.run(["gh", "api", path], check=True, capture_output=True).stdout
-    return out if raw else json.loads(out)
+    proc = subprocess.run(["gh", "api", path], capture_output=True)
+    if proc.returncode != 0:
+        sys.exit(f"gh api {path} failed ({proc.returncode}): {proc.stderr.decode(errors='replace').strip()}")
+    return proc.stdout if raw else json.loads(proc.stdout)
 
 
 def output(**values):
