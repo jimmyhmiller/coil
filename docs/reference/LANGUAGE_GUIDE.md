@@ -1286,6 +1286,8 @@ traits; they are not alternate spellings to teach for a trait operation.
 | `coil.slice`: `(slice T)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Iterable` (`iter`) |
 | `coil.arraylist`: `(ArrayList T)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Push` (`push!`), `Pop` (`pop!`), `Iterable` (`iter`) |
 | `coil.hashmap`: `(HashMap K V)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Iterable` (`iter`, over keys) |
+| `coil.pmap`: `(PMap K V)` | `Len` (`len`), `Clone`, `Drop`; persistent (below) |
+| `coil.pvec`: `(PVec T)` | `Len` (`len`), `Clone`, `Drop`; persistent (below) |
 | `(array T N)` | the `(slice T)` row, reached by borrowing (below) |
 
 The bundled collection traits are implemented on `(slice T)`, not on arrays. An
@@ -1349,6 +1351,49 @@ are representation-specific: use `hm-remove!` and `hm-free!`. String keys:
 (each is copied into the map's allocator on insert and freed on remove/clear/free);
 `(str-keyops-borrowed)` opts into borrowing (the key bytes must outlive the map).
 Type args `[T]` come right after the name; usually inferable, so often omittable.
+
+**Persistent collections.** `coil.pmap` (`PMap K V`, a hash trie) and `coil.pvec`
+(`PVec T`, an indexed trie with a tail) are immutable values with structural
+sharing: an update returns a new collection that shares every untouched node with
+the old one, which stays valid and unchanged. Use them when two owners need the
+same data at different versions — snapshots, undo, a candidate edit over an
+accepted state — and copying the whole collection per version is the cost you are
+trying to avoid. For one owner mutating in place, `HashMap`/`ArrayList` are faster.
+
+    (import "coil.pmap" :use *)
+    (let [a (pm-new-scalar [i64 i64] (malloc-allocator-lease))
+          b (pm-assoc a 7 42)]                    ; a is still empty
+      (match (pm-get b 7) (Some [v] v) (None [] 0)))
+
+    (import "coil.pvec" :use *)
+    (let [(mut v) (pv-new [i64] (malloc-allocator-lease))]
+      (pv-push! (mut v) 10)
+      (let [snapshot (clone v)]                   ; O(1): shares every node
+        (pv-set! (mut v) 0 11)                    ; copies one leaf; snapshot holds 10
+        (pv-get snapshot 0)))
+
+Both are **owners**: `Clone` shares the structure in O(1) and `Drop` releases it, so
+they follow the affine rules above, and a struct holding one becomes an owner too.
+They take an `AllocatorLease`, not a borrowed `(dyn Allocator)`, because a shared
+node outlives the scope that allocated it. Keys, values and elements must implement
+`Clone` (scalars, pointers and slices do) and may themselves be owners: a copied
+node clones them and a freed node drops them, exactly once each.
+
+| Pure (takes a `ref`, returns a new value) | In place (takes `(mut …)`) |
+|---|---|
+| `pm-assoc m k v`, `pm-dissoc m k` | `pm-assoc! (mut m) k v` → 1 if new, `pm-dissoc! (mut m) k` → 1 if removed |
+| `pv-push v x`, `pv-set v i x`, `pv-pop v` | `pv-push! (mut v) x` → length, `pv-set! (mut v) i x` → 1 if in range, `pv-pop! (mut v)` → `(Option T)` |
+
+The `!` forms are not a different data structure: they edit a node in place only
+when it and every node above it have a single reference, which is exactly when no
+other value can observe the edit, and copy the path otherwise. Building a
+collection with them from a fresh `pm-new`/`pv-new` never copies a node. Reads are
+`pm-get`/`pv-get` (cloned out, `(Option V)`), `pm-get-ptr`/`pv-get-ptr` (borrowed
+`(Option (ptr V))`, valid while a collection sharing that node lives and is not
+edited in place), `pm-contains?`, `pm-len`/`pv-len`, and the borrowing cursors
+`pm-iter` (yields `(ptr (PEntry K V))`) and `pv-iter` (yields `(ptr T)`). `PMap`
+hashes through `coil.hashmap`'s `KeyOps`, non-owning ops only. Neither is thread
+safe: the counts are plain integers, as in `coil.rc`.
 
 ## Strings & bytes
 
