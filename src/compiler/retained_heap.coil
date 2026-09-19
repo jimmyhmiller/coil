@@ -1,6 +1,13 @@
 ;;; Stable immutable metadata ranges. Ownership is from snapshots to every
 ;;; reachable block, not from blocks to one another, so cyclic graphs retire.
 ;;; A page index supports interior-pointer lookup without scanning the heap.
+;;;
+;;; A block is written once, between `allocate-block!` and `seal-all!`, and never
+;;; again. Nothing in the type system says so, so a PROTECTED heap enforces it:
+;;; each block gets its own pages and `seal-all!` makes them read-only, turning a
+;;; stray store into a fault at the store instead of a corrupted session several
+;;; edits later. It costs a mapping per block, so it is a checking mode
+;;; (`COIL_JIT_PROTECT=1`), not the default.
 (module coil.compiler.retained_heap)
 (import "coil.primitive" :as p)
 (import "coil.alloc" :use *)
@@ -8,18 +15,47 @@
 (import "coil.hashmap" :use *)
 (import "coil.slice" :use *)
 
+(cimport "sys/mman.h"
+         :probe-only
+         :probe
+         [(RETAINED_PROT_READ "PROT_READ")
+          (RETAINED_PROT_RW "PROT_READ | PROT_WRITE")
+          (RETAINED_MAP_PRIVATE_ANON "MAP_PRIVATE | MAP_ANONYMOUS")])
+
+(extern retained.mmap :cc c [(ptr i8) i64 i32 i32 i32 i64] (-> (ptr i8)))
+(extern retained.munmap :cc c [(ptr i8) i64] (-> i32))
+(extern retained.mprotect :cc c [(ptr i8) i64 i32] (-> i32))
+(extern retained.getpagesize :cc c [] (-> i32))
+
+;;; `mapped` is the byte length of a protected block's own mapping, else 0.
 (defstruct Block
   [(data (ptr u8)) (allocation (slice u8)) (bytes i64) (alignment i64) (references i64)
-   (pages (ptr PageLink))])
+   (pages (ptr PageLink)) (mapped i64)])
 (defstruct PageLink
   [(page i64) (block (ptr Block)) (previous (ptr PageLink))
    (next (ptr PageLink)) (block-next (ptr PageLink))])
 (defstruct Heap
   [(a (dyn Allocator)) (pages (HashMap i64 (ptr PageLink)))
-   (live-blocks i64) (live-bytes i64) (copied-bytes i64)])
+   (live-blocks i64) (live-bytes i64) (copied-bytes i64)
+   (protect bool) (unsealed (ArrayList (ptr Block)))])
 (defn heap-new [(a (dyn Allocator))] (-> Heap)
   (Heap :a a :pages (hm-new [i64 (ptr PageLink)] a (i64-keyops))
-    :live-blocks 0 :live-bytes 0 :copied-bytes 0))
+    :live-blocks 0 :live-bytes 0 :copied-bytes 0
+    :protect false :unsealed (al-new [(ptr Block)] a)))
+
+;;; Give every later block its own pages and make them read-only once sealed.
+(defn heap-protect! [(heap (ptr Heap))] (-> i64)
+  (set! (.protect heap) true) 0)
+
+;;; A private read-write mapping of whole pages, for one protected block.
+(defn map-block-storage [(bytes i64)] (-> (slice u8))
+  (let [page (p/cast i64 (retained.getpagesize))
+        length (* (/ (+ bytes (- page 1)) page) page)
+        memory (retained.mmap (p/cast (ptr i8) 0) length (p/cast i32 RETAINED_PROT_RW)
+                 (p/cast i32 RETAINED_MAP_PRIVATE_ANON) -1 0)]
+    (when (= (p/cast i64 memory) -1)
+      (oom-at c"protected immutable compiler metadata" length) 0)
+    (slice-new [u8] (p/cast (ptr u8) memory) length)))
 
 (defn find-block [(heap (ptr Heap)) (address i64)] (-> (ptr Block))
   (block :found
@@ -40,13 +76,19 @@
   (assert (> bytes 0))
   (assert (and (>= residue 0) (< residue alignment)))
   (let [a (.a heap)
-        storage (match (alloc-bytes a (+ bytes residue) alignment)
-          (Some [memory] memory)
-          (None [] (do (oom-at c"immutable compiler metadata" bytes)
-            (slice-new [u8] (p/cast (ptr u8) 0) 0))))
+        ; A mapping is page aligned, which satisfies any alignment a page holds.
+        storage (if (.protect heap)
+          (do (assert (<= alignment (p/cast i64 (retained.getpagesize))))
+              (map-block-storage (+ bytes residue)))
+          (match (alloc-bytes a (+ bytes residue) alignment)
+            (Some [memory] memory)
+            (None [] (do (oom-at c"immutable compiler metadata" bytes)
+              (slice-new [u8] (p/cast (ptr u8) 0) 0)))))
         item (box! a Block (Block :data (p/index (slice-data storage) residue) :allocation storage :bytes bytes
-          :alignment alignment :references 0 :pages (p/cast (ptr PageLink) 0)))
+          :alignment alignment :references 0 :pages (p/cast (ptr PageLink) 0)
+          :mapped (if (.protect heap) (len storage) 0)))
         lo (p/cast i64 (.data item))]
+    (when (.protect heap) (push! (mut (.unsealed heap)) item) 0)
     (for [page (/ lo 4096) (+ (/ (+ lo (- bytes 1)) 4096) 1)]
       (let [head (match (get (.pages heap) page)
                    (Some [value] value) (None [] (p/cast (ptr PageLink) 0)))
@@ -59,6 +101,17 @@
     (set! (.live-bytes heap) (+ (.live-bytes heap) bytes))
     (set! (.copied-bytes heap) (+ (.copied-bytes heap) bytes))
     item))
+;;; Every block allocated since the last seal has its final contents. On a
+;;; protected heap they become read-only; otherwise there is nothing to do.
+(defn seal-all! [(heap (ptr Heap))] (-> i64)
+  (for [i 0 (len (.unsealed heap))]
+    (let [item (get (.unsealed heap) i)]
+      (when (!= (retained.mprotect (p/cast (ptr i8) (slice-data (.allocation item))) (.mapped item)
+                  (p/cast i32 RETAINED_PROT_READ))
+                (p/cast i32 0))
+        (abort) 0)))
+  (set! (.len (field heap unsealed)) 0)
+  0)
 (defn retain! [(item (ptr Block))] (-> i64)
   (set! (.references item) (+ (.references item) 1)) 0)
 (defn release! [(heap (ptr Heap)) (item (ptr Block))] (-> i64)
@@ -79,11 +132,17 @@
           (free [PageLink] a (slice-new entry 1))))
       (set! (.live-blocks heap) (- (.live-blocks heap) 1))
       (set! (.live-bytes heap) (- (.live-bytes heap) (.bytes item)))
-      (free-bytes a (.allocation item) (.alignment item))
+      (if (> (.mapped item) 0)
+        (when (!= (retained.munmap (p/cast (ptr i8) (slice-data (.allocation item))) (.mapped item))
+                  (p/cast i32 0))
+          (abort) 0)
+        (free-bytes a (.allocation item) (.alignment item)))
       (free [Block] a (slice-new item 1))) 0)
   0)
 (defn release-list! [(heap (ptr Heap)) (owners (mut (ArrayList (ptr Block))))] (-> i64)
   (for [i 0 (len (load owners))] (release! heap (get (load owners) i)))
   (al-free! (mut owners))
-  (when (= (.live-blocks heap) 0) (hm-free! (mut (.pages heap))) 0)
+  (when (= (.live-blocks heap) 0)
+    (hm-free! (mut (.pages heap)))
+    (al-free! (mut (.unsealed heap))) 0)
   0)

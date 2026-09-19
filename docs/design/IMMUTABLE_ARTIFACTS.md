@@ -311,13 +311,38 @@ own gate. Until the last phase the existing snapshot survives as a shrinking
 "legacy blob" artifact owned by the `Revision`, so the tree is always shippable.
 
 **Phase 0 — instruments and building blocks.** No behaviour change.
-- Counters for bytes copied at prepare and at publish, per edit, through the
-  existing `COIL_JIT_TRACE`; assert them in `jit-session-memory.py`. Measure the
-  baseline first, including self-host build time (the batch path must not regress).
-- `pmap`/`pvec` with property tests; `DefId` interner; heap generalised from
-  bodies to arbitrary sealed roots; page-protection debug mode.
-- Move session code out of the 22k-line `driver.coil` into `revision.coil`,
-  `txn.coil`, `artifact.coil`.
+
+| Item | State |
+|---|---|
+| Baseline: bytes and ms per edit, gate green | done — see "Baseline" above |
+| `coil.pmap`, `coil.pvec` (stdlib, public) | done — model-tested against `HashMap`/`ArrayList`, forced hash collisions, three-level growth and collapse, leak-checked allocator, clone/drop balance of owned values, path-copy allocation bound |
+| Page-protection checking mode for sealed blocks | done — `COIL_JIT_PROTECT=1`; `retained_heap` gives each block its own pages and `seal-all!` makes them read-only after the last fixup |
+| Counters for bytes copied at prepare and publish, asserted in `jit-session-memory.py` | not started (`retained-bytes` already reports the publish side) |
+| `DefId` interner | not started |
+| Heap generalised from bodies to arbitrary sealed roots | not started |
+| Session code moved out of `driver.coil` | deferred: `feature/live-whole-program` is being edited concurrently and a 4k-line move would conflict with every commit there; do it as the first step of Phase 1, coordinated |
+
+**What protection found on its first run.** The `replace` probe died with SIGBUS
+in `fold-expr`. Its `EQuasi` arm copied the template to the stack, folded it, and
+stored an identical `EQuasi` back into the node — a no-op write, since
+`fold-quasi` only ever recurses through pointers — and the guard that lets
+`fold-program` skip already-folded accepted bodies (`fold-needed?`) answered `true`
+for every quasiquote. So every accepted function containing a quasiquote, which is
+every macro in core and the prelude, was re-walked *and written* on every edit.
+Fixed: the store is gone and the guard asks `fold-quasi-needed?`, which is true
+only where an unquoted expression needs folding. This is the mutation audit's
+"`fold-program` walks inherited bodies" item, located by a fault instead of by
+reading.
+
+The full `jit-static-session.py` list then found a second writer of the same
+shape: `ml-quoted` (`metalower.coil`) stamped the hygiene module onto the quoted
+form *inside the function being lowered* and then deep-copied it. It now stamps
+the copy. With both fixed, all 31 fixtures pass with protection on, and the gate
+now sets `COIL_JIT_PROTECT=1` itself, so the next such write fails the gate at the
+offending store. Protection covers frozen checked bodies only — the one artifact
+kind that exists — so the audit's other items (check setup, `build-param-env`,
+`cte-wrap-divisor!`, nid freshening, `TaggedForm` repair) remain open until the
+data they touch is sealed too; each later phase inherits this net as it seals more.
 
 **Phase 1 — `Revision`/`Txn` skeleton and the `db-*` interface.** Mechanical:
 route every accepted-state read through `db-*`, still backed by the old

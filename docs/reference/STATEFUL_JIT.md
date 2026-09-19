@@ -130,6 +130,14 @@ fixups and ownership transfer, relocation scratch is freed too. With
 report this arena separately from compilation scratch. Its peak counter spans
 both traversals; live bytes describe the current traversal.
 
+A body block is written once, between its allocation and the end of pointer
+fixups, and never again. `COIL_JIT_PROTECT=1` enforces that: each block gets its
+own pages, made read-only after fixups, so a store into accepted metadata faults
+at the store (SIGBUS on macOS, SIGSEGV on Linux) instead of corrupting a session
+some edits later. It costs a mapping per block, so it is a checking mode rather
+than the default; `scripts/tests/jit-static-session.py` runs every fixture with it
+on. To locate a fault, run the fixture under `lldb --batch -o run -o bt`.
+
 `COIL_JIT_TRACE=1` reports cumulative `body-copied-bytes` plus
 `body-owned-bytes` and `body-owned-blocks` before releasing the preceding
 snapshot. These count body payload storage, not allocator, page-index, or
