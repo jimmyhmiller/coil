@@ -1,6 +1,6 @@
 # Immutable artifacts and persistent revisions
 
-Status: **plan, nothing implemented.** Written 2026-09-19 against
+Status: **Phase 0 in progress.** Written 2026-09-19 against
 `feature/live-whole-program` at `d88428e`. It continues the path sketched in
 live-poc-coil's `docs/INCREMENTAL_COMPILER_BOUNDARIES.md` ("Revision storage")
 and `docs/COMPILER_RETENTION.md`, and supersedes the "not yet a persistent
@@ -46,6 +46,30 @@ Only source payloads (`retained_source.coil`) and checked function bodies
 (`retained_heap.coil`) are shared between revisions today. Those two are the
 pattern; this plan generalises them until the snapshot graph is empty and sites
 1–7 are deleted rather than optimised.
+
+### Baseline (measured 2026-09-19, `d88428e`, arm64 macOS)
+
+`scripts/tests/jit-session-memory.py` passes on a candidate built from this commit.
+Its `replace` scenario — resubmitting the identical one-line `(defn value [] (-> i64) 42)`
+into a session holding nothing but core and the prelude — reports a steady
+**8,047,232 retained bytes relocated on every accept**, against 2,901,874 bytes
+of shared body storage.
+
+`COIL_TRACE=1` spans for the same workload, steady-state median per edit:
+
+| Span | ms |
+|---|---|
+| `jit.publish.snapshot` (total) | 83 |
+| — `jit.snapshot.mark` | 28 |
+| — `jit.snapshot.rescan` | 28 |
+| — `jit.snapshot.copy` | 24 |
+| `jit.publish.retain` | 17 |
+| `jit.prepare` | 7 |
+| expansion, resolve, check, codegen, link combined | ≈ 5 |
+
+So roughly 100 ms of a 110 ms edit is retention and relocation, in the smallest
+session there can be, and that part grows with the session. The numbers this
+plan has to move are the first four rows.
 
 ## What the audit says is actually mutated
 
@@ -155,7 +179,8 @@ Nothing durable is identified by an address.
   `Sexp`) exist. Equal fingerprint ⇒ equivalent result ⇒ propagation stops.
 - **Mono instances** keep their existing structural key (`name__typekey…`,
   `mono.coil:346`) with `MonoOrigin` as provenance.
-- **Node ids become artifact-local.** `Expr.nid`/`Sexp.nid` is currently a global
+- **Node ids become artifact-local** (decided 2026-09-19, over keeping global
+  nids in a persistent map). `Expr.nid`/`Sexp.nid` is currently a global
   counter carried across revisions as `next-nid`, and the checker's type, binding
   and resolution maps are unit-global tables keyed by it. Make `nid` a dense index
   assigned at seal, and move those three tables *into the checked-body artifact*
@@ -187,8 +212,9 @@ Impl selection indexes become `trait key → persistent list of impl DefId`.
 Retiring an impl removes a key; nothing is rebuilt (most of copy site 4).
 
 Stdlib has `Rc`/`Arc`, `AllocatorLease`, `leased_region`; it has **no**
-persistent collection. `pmap`/`pvec` must be written, with property tests
-against `HashMap`/`ArrayList` as the model.
+persistent collection. `coil.pmap`/`coil.pvec` are written as public stdlib
+modules (decided 2026-09-19), with property tests against
+`HashMap`/`ArrayList` as the model.
 
 ### Layer 3 — the transaction
 
