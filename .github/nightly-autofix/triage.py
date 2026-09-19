@@ -89,7 +89,9 @@ def main():
         stop(f"run was on {run['head_branch']}, not main")
     if run["event"] not in ("schedule", "workflow_dispatch"):
         stop(f"run was triggered by {run['event']}")
-    if run["conclusion"] != "failure":
+    # Called from the nightly's own failure job, the run is still in progress; its
+    # failed jobs (checked below) are what matter.
+    if run["status"] == "completed" and run["conclusion"] != "failure":
         stop(f"run concluded {run['conclusion']}")
 
     match = ATTEMPT_RE.search(run["display_title"])
