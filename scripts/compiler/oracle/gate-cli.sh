@@ -3905,6 +3905,17 @@ if { [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; } \
   [ ! -e "$JIT_UNITS/coil.compiler.jit_api" ] \
     && ok "install leaves no backend-less coil.jit unit" \
     || bad "install leaves no backend-less coil.jit unit" "$JIT_UNITS/coil.compiler.jit_api exists"
+  # Public logical IR consumers must not pull in another source metahost next
+  # to the shipped SDK. Run outside the checkout so automatic unit selection is
+  # exercised, with a host macro as well as checked-only session publication.
+  cp tests/compiler/features/jit_checked_baseline.coil "$T/jit-sdk/live-ir.coil"
+  LIVE_IR_BUILD_ARGS=(--backend llvm)
+  if [ "$HOST_OS" = Linux ]; then
+    LIVE_IR_BUILD_ARGS+=(--link-flag "-L$("${LLVM_CONFIG:-llvm-config}" --libdir)" --link-flag -lLLVM --link-flag -lm)
+  fi
+  expect_rc 0 "installed live IR consumer links beside the warmed JIT unit" \
+    bash -c 'cd "$1" && "$2" build live-ir.coil -o live-ir "${@:3}" && PATH="$(dirname "$2"):$PATH" ./live-ir' \
+    _ "$T/jit-sdk" "$INSTALLED" "${LIVE_IR_BUILD_ARGS[@]}"
   cp src/examples/jit_sdk.coil "$T/jit-sdk/main.coil"
   if [ "$HOST_OS" = Darwin ]; then
     JIT_BUILD_ARGS=(--backend arm64)
