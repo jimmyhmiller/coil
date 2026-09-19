@@ -20,16 +20,42 @@ import os
 import re
 import subprocess
 import sys
+import urllib.request
 
 NIGHTLY_PATH = ".github/workflows/nightly.yml"
 ATTEMPT_RE = re.compile(r"\[autofix (\d+)\]")
 
 
-def api(path, raw=False):
+def api(path):
     proc = subprocess.run(["gh", "api", path], capture_output=True)
     if proc.returncode != 0:
         sys.exit(f"gh api {path} failed ({proc.returncode}): {proc.stderr.decode(errors='replace').strip()}")
-    return proc.stdout if raw else json.loads(proc.stdout)
+    return json.loads(proc.stdout)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def job_log(repo, job_id):
+    """The job's raw log. Not through `gh api`: newer gh refuses output containing
+    terminal escapes, which CI logs are full of. The endpoint answers with a
+    redirect to a pre-signed URL that must be fetched without the API token."""
+    token = os.environ.get("GH_TOKEN") or subprocess.run(
+        ["gh", "auth", "token"], check=True, capture_output=True, text=True).stdout.strip()
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/actions/jobs/{job_id}/logs",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+    try:
+        urllib.request.build_opener(NoRedirect).open(req)
+        sys.exit(f"job {job_id} logs: expected a redirect")
+    except urllib.error.HTTPError as e:
+        if e.code != 302:
+            sys.exit(f"job {job_id} logs: HTTP {e.code}")
+        location = e.headers["Location"]
+    with urllib.request.urlopen(location) as resp:
+        return resp.read()
 
 
 def output(**values):
@@ -91,7 +117,7 @@ def main():
     for job in failed:
         steps = [s["name"] for s in job.get("steps", []) if s["conclusion"] == "failure"]
         summary.append(f"- job `{job['name']}` failed in step(s): {', '.join(steps) or 'unknown'}")
-        log = api(f"repos/{repo}/actions/jobs/{job['id']}/logs", raw=True)
+        log = job_log(repo, job["id"])
         with open(os.path.join(args.logs_dir, f"{job['name']}.log"), "wb") as f:
             f.write(log)
     with open(os.path.join(args.logs_dir, "SUMMARY.md"), "w") as f:
