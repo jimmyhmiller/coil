@@ -128,6 +128,10 @@ new state exactly as they were checked. Check one again by submitting its source
 constants that mention constants, and impl availability are not tracked yet, and a
 redefined function with trait bounds always counts as changed.
 
+`tests/compiler/features/jit_live_checker.coil` is a complete client of these
+operations: a checker that keeps a compiler running, re-checks what each edit made
+stale, and tracks what is broken.
+
 A session that generates native code refuses `jit-env-check`, as does source
 that stages session Code state: both are per-session today, not per-state.
 

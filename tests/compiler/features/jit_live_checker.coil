@@ -1,0 +1,134 @@
+(module compiler.features.jit-live-checker)
+(import "coil.alloc" :as a :use [Allocator])
+(import "coil.arraylist" :use *)
+(import "coil.str" :use [str-concat])
+(import "coil.result" :use *)
+(import "coil.jit" :as jit)
+
+; A live checker, written only against the public API: keep a compiler running,
+; submit each edit, and always know which definitions are broken. Everything that
+; makes it a *policy* lives here, not in the compiler -- what to do with an edit
+; that does not check (keep the old state), what to do with definitions an edit made
+; stale (check them again, now), and what "broken" means (failed that re-check).
+
+(defstruct Checker
+  [(allocator (dyn Allocator))
+   (session jit/JitSession)
+   (env jit/JitEnv)
+   (module-header (slice u8))
+   ; Definitions that failed a re-check, as the state still holds them.
+   (broken (ArrayList (slice u8)))])
+
+; A name reported by a state is valid while that state is held. This checker
+; replaces its state as it goes, so it keeps its own copy of every name it keeps.
+(defn own [(c (ptr Checker)) (name (slice u8))] (-> (slice u8))
+  (match (str-concat (.allocator c) name "") (Some [copy] copy) (None [] "")))
+
+(defn broken? [(c (ptr Checker)) (name (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (len (.broken c))] (when (= (get (.broken c) i) name) (set! found true) 0))
+    (load found)))
+
+(defn mark-broken! [(c (ptr Checker)) (name (slice u8))] (-> i64)
+  (unless (broken? c name) (push! (mut (.broken c)) (own c name)) 0)
+  0)
+
+(defn mark-fixed! [(c (ptr Checker)) (name (slice u8))] (-> i64)
+  (let [(mut kept) (al-new [(slice u8)] (.allocator c))]
+    (for [i 0 (len (.broken c))]
+      (unless (= (get (.broken c) i) name) (push! (mut kept) (get (.broken c) i)) 0))
+    (al-free! (mut (.broken c)))
+    (set! (.broken c) (load kept)))
+  0)
+
+; Make `next` the state this checker serves.
+(defn adopt! [(c (ptr Checker)) (next jit/JitEnv)] (-> i64)
+  (jit/jit-env-release! (mut (.session c)) (.env c))
+  (set! (.env c) next)
+  0)
+
+; Check every definition the current state reports stale, and whatever those
+; re-checks make stale in turn. A definition that no longer checks stays in the
+; state as it was, and is recorded as broken.
+(defn settle! [(c (ptr Checker))] (-> i64)
+  (let [(mut pending) (al-new [(slice u8)] (.allocator c))
+        (mut rechecked) 0]
+    (for [i 0 (jit/jit-env-stale-count (mut (.session c)) (.env c))]
+      (push! (mut pending) (own c (jit/jit-env-stale-name (mut (.session c)) (.env c) i))))
+    (loop
+      (when (= (len pending) 0) (break))
+      (let [name (match (pop! (mut pending)) (Some [n] n) (None [] ""))
+            source (jit/jit-env-definition-source (mut (.session c)) (.env c) name)
+            text (match (str-concat (.allocator c) (.module-header c) source)
+                   (Some [joined] joined)
+                   (None [] ""))
+            next (jit/jit-env-check (mut (.session c)) (.env c) text)]
+        (set! rechecked (+ (load rechecked) 1))
+        (if (jit/jit-env-valid? next)
+            (do
+              (mark-fixed! c name)
+              (adopt! c next)
+              (for [i 0 (jit/jit-env-stale-count (mut (.session c)) (.env c))]
+                (push! (mut pending) (own c (jit/jit-env-stale-name (mut (.session c)) (.env c) i))))
+              0)
+            (do (mark-broken! c name) 0))))
+    (al-free! (mut pending))
+    (load rechecked)))
+
+; Submit an edit. Returns how many definitions had to be checked again, or -1 if
+; the edit itself does not check (the state is then unchanged).
+(defn submit! [(c (ptr Checker)) (source (slice u8))] (-> i64)
+  (let [text (match (str-concat (.allocator c) (.module-header c) source)
+               (Some [joined] joined)
+               (None [] ""))
+        next (jit/jit-env-check (mut (.session c)) (.env c) text)]
+    (if (not (jit/jit-env-valid? next))
+        -1
+        (do (adopt! c next) (settle! c)))))
+
+(defn main [] (-> i64)
+  (let [allocator (a/malloc-allocator)
+        (mut c) (Checker :allocator allocator
+                         :session (jit/jit-checked-session-new allocator)
+                         :env (jit/jit-env-empty)
+                         :module-header "(module shapes) "
+                         :broken (al-new [(slice u8)] allocator))]
+    (assert (= (submit! (mut c)
+                 "(defn area [(w i64) (h i64)] (-> i64) (* w h))
+                  (defn unit [] (-> i64) (area 1 1))
+                  (defn double-unit [] (-> i64) (* 2 (unit)))
+                  (defn square [(n i64)] (-> i64) (area n n))") 0))
+    (assert (= (len (.broken c)) 0))
+
+    ; An edit that does not check changes nothing.
+    (assert (= (submit! (mut c) "(defn oops [] (-> i64) (area))") -1))
+    (assert (not (jit/jit-env-defines? (mut (.session c)) (.env c) "shapes.oops")))
+
+    ; A body edit: nothing else needs looking at.
+    (assert (= (submit! (mut c) "(defn area [(w i64) (h i64)] (-> i64) (+ 0 (* w h)))") 0))
+    (assert (= (len (.broken c)) 0))
+
+    ; A signature edit: its two readers are checked again, and both are broken.
+    ; double-unit reads unit, whose signature did not change, so it is not touched.
+    (assert (= (submit! (mut c) "(defn area [(w i64)] (-> i64) (* w w))") 2))
+    (assert (= (len (.broken c)) 2))
+    (assert (broken? (mut c) "shapes.unit"))
+    (assert (broken? (mut c) "shapes.square"))
+    (assert (not (broken? (mut c) "shapes.double-unit")))
+
+    ; Fixing one of them.
+    (assert (= (submit! (mut c) "(defn square [(n i64)] (-> i64) (area n))") 0))
+    (mark-fixed! (mut c) "shapes.square")
+    (assert (= (len (.broken c)) 1))
+
+    ; Putting the old signature back repairs the other without touching it:
+    ; it is stale again, is checked again, and this time it checks.
+    (assert (= (submit! (mut c) "(defn area [(w i64) (h i64)] (-> i64) (* w h))") 2))
+    (assert (not (broken? (mut c) "shapes.unit")))
+    ; ...and the one fixed for the narrow signature is now the broken one.
+    (assert (broken? (mut c) "shapes.square"))
+    (assert (= (len (.broken c)) 1))
+
+    (jit/jit-env-release! (mut (.session c)) (.env c))
+    (assert (= (jit/jit-reset! (mut (.session c))) 0))
+    0))

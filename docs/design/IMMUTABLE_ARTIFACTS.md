@@ -220,6 +220,17 @@ with the old arity were accepted and callers with the new one refused.
 for names the candidate redefines; it now does so only for functions the candidate
 inherited. Regression: `jit_redefined_signature.coil`; filed in `coil-bugs`.
 
+**The client exists.** `tests/compiler/features/jit_live_checker.coil` is a live
+checker written only against `coil.jit`: submit an edit, adopt the new state,
+re-check what it reports stale (and what those re-checks stale in turn), keep a list
+of what is broken. An edit that does not check leaves the state alone; narrowing
+`area` re-checks its two readers and marks both broken without touching their
+callers; restoring the signature repairs one and breaks the other. Every decision in
+that sentence is the client's. It also gives the clearest measurement so far: with
+`COIL_TRACE=1` a check that *fails* — so publishes nothing — takes **3–4 ms**, and one
+that succeeds takes **~30 ms**. The compile is already fast; what is left is
+publication.
+
 Not covered by this first cut, and reported as such rather than guessed at: macro
 bodies (a changed macro stales everything it expanded, which needs expansion reads
 recorded), constants that mention constants, impl availability, and negative
