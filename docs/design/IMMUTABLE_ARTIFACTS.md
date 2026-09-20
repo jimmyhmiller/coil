@@ -1,12 +1,43 @@
 # Immutable artifacts and persistent revisions
 
-Status: **Phase 0 in progress.** Written 2026-09-19 against
+Status: **Phase 0 in progress; architecture revised 2026-09-19** (see "The goal").
+Written 2026-09-19 against
 `feature/live-whole-program` at `d88428e`. It continues the path sketched in
 live-poc-coil's `docs/INCREMENTAL_COMPILER_BOUNDARIES.md` ("Revision storage")
 and `docs/COMPILER_RETENTION.md`, and supersedes the "not yet a persistent
 query database" caveats in `docs/reference/STATEFUL_JIT.md`.
 
 Line numbers below refer to that commit.
+
+## The goal
+
+Mechanism in the compiler, policy outside it.
+
+The compiler should not know that hot code loading exists. It should expose
+low-level operations over data structures that make hot code loading — or a
+REPL, a language server, a notebook, a test runner that reuses checked code —
+something a library or metaprogram can build, without the compiler's help and
+without copying the compiler's state to do it.
+
+That is not where things are today. `coil.jit` (`jit_api.coil`) is a thin facade;
+the hot-reload policy itself is inside the compiler: 64 `repl-session-*`,
+`compiler-revision-*`, `compiler-joint-*` and `compiler-retain-*` functions in
+`driver.coil`, 15 `code-session-*` functions in `comptime.coil`, and the parser
+itself recognises `:jit/retain` and `:jit/root`. Prepare, publish, finalize,
+abort, what is retained across edits, what retires, when native generations are
+reclaimed — all compiler internals.
+
+**It is in there because the data is mutable.** Nobody outside the compiler can
+safely hold two versions of a mutable pointer graph that lives in a scratch arena;
+only the compiler has the generated visitor that knows how to copy it. So the
+copying and the baked-in policy are one problem, not two. Make the data immutable
+and both go: holding an old version is holding a value, and what to do with it is
+the holder's business.
+
+An earlier draft of this document got this wrong: it made the data immutable but
+kept `Revision`, `Txn`, publish/abort, retirement and dependency queries as
+compiler concepts. They are policy. They are described below as what a client
+builds, not as compiler layers.
 
 ## The problem, stated by its mechanism
 
@@ -116,24 +147,24 @@ where nobody writes:
 
 ## Architecture
 
-Four layers. Each is small; the refactor is mostly *moving existing data behind
-them*, one boundary at a time.
+Three things in the compiler, all mechanism: sealed immutable storage, identity
+that is not an address, and an immutable `Env` value with a small API over it.
+Everything about versions, sessions and retention is a client.
 
 ```
-  jit_api            prepare ──► Txn ──► publish = pointer swap     abort = free scratch
-                                  │
-  phases (read/load/expand/       │  read:  db-* lookups   (overlay, then base)
-  resolve/check/mono)             │  write: txn scratch + overlay only
-                                  ▼
-  ┌──────────────────────────── Txn (mutable, private) ───────────────────────────┐
-  │ scratch arena · overlay maps (DefId → new artifact | tombstone) · unit cells   │
-  └───────────────┬───────────────────────────────────────────────────────────────┘
-                  │ seal (the only door)                       base ▼ (read-only)
-  ┌───────────────▼──────────── Revision (immutable, refcounted) ─────────────────┐
-  │ persistent indexes:  DefId → Decl · DefId → CheckedBody · impl keys → Impl    │
-  │                      module → ModuleEnv · FormId → Parsed/Expanded/Resolved   │
-  │                      instance key → MonoInstance · meta entries · Code values │
-  └───────────────┬───────────────────────────────────────────────────────────────┘
+  client (a library, a metaprogram, coil.jit, a language server …)      POLICY
+    holds Env values · decides what to keep, swap, forget, reclaim
+  ─────────────────────────────────────────────────────────────────────────────
+  compiler API                                                          MECHANISM
+    compile : (ref Env) × forms  →  Ok (Env′, outputs) | Err diagnostics
+    read    : look up / enumerate declarations, signatures, checked bodies
+    without : (ref Env) × DefId  →  Env′
+    emit    : (ref Env) × roots  →  image + the DefIds it contains
+                  │
+                  │  inside one compile call only: scratch arena + overlay,
+                  │  then seal — none of it visible to the caller
+                  ▼
+  Env = persistent indexes (DefId → sealed artifact), Clone O(1), Drop releases
                   ▼
   artifact heap: refcounted, nonmoving, sealed blocks (generalised retained_heap)
 ```
@@ -151,7 +182,7 @@ closed pointer graph plus a small header:
    (deps (slice Dep))])            ; what it *read*; see Layer 3
 ```
 
-**Sealing** is a copy of one artifact's closure out of txn scratch into a
+**Sealing** is a copy of one artifact's closure out of the call's scratch into a
 right-sized block, with interior pointers fixed up. The generated typed visitor
 (`scripts/compiler/gen-retained-snapshot.py`) already does exactly this for the
 whole graph and for frozen bodies; it becomes "seal this root" instead of
@@ -189,73 +220,89 @@ Nothing durable is identified by an address.
   `semantic-freshen-nids!` — a sealed copy of a macro result gets its own
   numbering, so aliased argument nodes are never renumbered in place.
 
-### Layer 2 — revisions and persistent indexes
+### Layer 2 — `Env`, an immutable value
 
-A **`Revision`** is an immutable, refcounted record of index roots. Indexes are
-persistent maps (HAMT over `i64` keys) and persistent vectors whose nodes live in
-the artifact heap and are individually refcounted; values are artifact pointers.
-A new revision is the old one plus O(log n) path copies per changed key.
-Releasing a revision walks only nodes it uniquely owns.
+An **`Env`** is everything the compiler knows after compiling some forms: persistent
+indexes (`coil.pmap`/`coil.pvec`, nodes in the artifact heap) from `DefId` to sealed
+artifacts. It is an ordinary owner: `clone` shares it in O(1), `Drop` releases it,
+and releasing walks only what that value uniquely owned. The compiler attaches no
+meaning to having two of them. "Accepted", "candidate", "revision" and "session"
+are words a client may use for the `Env` values it happens to be holding.
 
-**Artifacts refer to other artifacts by `DefId`, resolved through the revision's
-index — never by pointer.** Owned pointers (`owns`) form a DAG (a checked body
-owns its source payload; a mono instance owns nothing it did not build). This is
-the point that makes plain reference counts sufficient: mutually recursive
-functions, a type and its impls, `impl method → self type → impl availability` —
-none of these is a *pointer* cycle, because each edge goes through the index.
-The cycle problem in `COMPILER_RETENTION.md` is real, but it is a question of
-**which keys stay in the index** (semantic liveness), not of memory ownership.
-Separating those two is what removes the fixpoint-and-rebuild from publication;
-see Layer 3.
+**Artifacts refer to other artifacts by `DefId`, resolved through an `Env` — never
+by pointer.** Owned pointers (`owns`) form a DAG. This is what makes plain
+reference counts sufficient: mutually recursive functions, a type and its impls,
+`impl method → self type → impl availability` — none is a *pointer* cycle, because
+each edge goes through the index. It also means the same sealed body can sit in
+two `Env`s that resolve its callees differently, which is exactly what a client
+replacing one function needs.
 
-Impl selection indexes become `trait key → persistent list of impl DefId`.
-Retiring an impl removes a key; nothing is rebuilt (most of copy site 4).
+Impl selection indexes become `trait key → persistent list of impl DefId`. Dropping
+an impl is removing a key; nothing is rebuilt (most of copy site 4).
 
-Stdlib has `Rc`/`Arc`, `AllocatorLease`, `leased_region`; it has **no**
-persistent collection. `coil.pmap`/`coil.pvec` are written as public stdlib
-modules (decided 2026-09-19), with property tests against
-`HashMap`/`ArrayList` as the model.
-
-### Layer 3 — the transaction
-
-A **`Txn`** is the only mutable thing: a scratch arena, the unit-state cells, and
-one mutable overlay per index (`DefId → new artifact | tombstone`). Phases stop
-reaching into `(.sigs cx)` / `(.checked parent)` / `(.imports s)` and call a read
-interface:
+### Layer 3 — the API
 
 ```
-db-sig  db-struct  db-sum  db-trait  db-impls-for  db-const  db-extern
-db-module-env  db-parsed  db-resolved  db-checked-body  db-mono-instance
+(compile  env forms options)  →  (Result Compiled Diagnostics)   ; Compiled = new Env + outputs
+(env-sig env def) (env-struct …) (env-impls-for …) (env-checked-body …) (env-defs env)
+(env-without env def)         →  Env
+(emit env roots target)       →  Image                           ; code + symbols + the DefIds inside
 ```
 
-Each is "overlay, else base". That single indirection deletes every
-`*-inherit*` pass (copy sites 2, 5, 6): nothing is copied forward because nothing
-needs to be — the base is simply visible. Rejected candidates stop paying for the
-size of the session.
+- **`compile` never touches its input.** It works in a scratch arena with a mutable
+  overlay per index ("overlay, else the input `Env`"), seals what it produced, and
+  returns a new `Env` sharing everything else. The scratch and the overlay are locals
+  of the call. There is no prepare/publish/abort: a caller that does not want the
+  result does not keep it. Rejection cannot damage anything by construction.
+- **Phases read through `env-*` lookups** instead of reaching into `(.sigs cx)` /
+  `(.checked parent)` / `(.imports s)`. That single indirection deletes every
+  `*-inherit*` pass (copy sites 2, 5, 6): nothing is copied forward because the
+  input is simply visible. The 158 `unit-allocator` sites become trivially correct:
+  that allocator is always the call's scratch; only `seal` allocates in the heap.
+- **Ahead-of-time compilation is the same path** with an empty input `Env`, and it
+  never needs to seal: every lookup hits the overlay, which is the mutable `HashMap`
+  it is today. The HAMT is never on the batch compiler's hot path.
+- **`emit` reports what it contains** (`DefId`s, symbols, what it imports). Loading
+  it, patching call sites, keeping old code alive for running frames, reclaiming it:
+  the client's, in a library. The compiler does not know an image is ever replaced.
+- **Artifacts carry what they read** (`deps`: `(DefId, stage, fingerprint seen)`,
+  including negative lookups) *as data*. The compiler records; it does not act on
+  it. A client that wants to skip re-checking unchanged code, or to work out what a
+  signature change invalidates, reads those records. This replaces
+  `ls-accepted-function?`'s pointer-equality test, which is policy hiding in the
+  checker.
 
-- **prepare**: make a `Txn` on `current`. Run phases. Results go to scratch and
-  the overlay.
-- **publish**: seal the overlay's artifacts, apply the overlay to the persistent
-  indexes, swap `current`, release the old revision. No finalize step; nothing the
-  next prepare must wait for.
-- **abort**: free the scratch arena. Accepted state was never touched, by
-  construction rather than by care.
+### What a client builds
 
-The rule for the 158 `unit-allocator` call sites becomes trivial: it is *always*
-txn scratch. Only `seal` allocates in the artifact heap.
+Hot reload, in full, against that API:
 
-Ahead-of-time compilation is the same code path with an empty base, and it never
-seals: every lookup hits the overlay, which is the mutable `HashMap` it is today.
-The HAMT is never on the batch compiler's hot path.
+```
+(defstruct Live [(current Env) (loaded (PMap DefId Image)) …])
 
-Each artifact records what it read (`deps`: `(DefId, stage, fingerprint seen)`,
-including negative lookups). That gives demand validation — an old artifact is
-admitted into a new revision iff its recorded reads have the same fingerprints in
-the txn's view — and replaces `ls-accepted-function?`'s pointer-equality test,
-which says nothing about whether a callee's signature changed. It also gives
-retirement its edges: conditional impl ownership and joint liveness run over
-recorded `deps` incrementally instead of scanning programs to a fixpoint at
-publication.
+(defn submit! [(live (mut Live)) (forms …)] (-> …)
+  (match (compile (field live current) forms options)
+    (Err [diagnostics] (report diagnostics))            ; nothing to undo
+    (Ok [compiled]
+      (let [image (emit (.env compiled) (changed compiled) target)]
+        (swap-entry-points! live image)                  ; the client's runtime
+        (set! (.current live) (.env compiled))))))       ; old Env dropped here —
+                                                         ; unless something else holds it
+```
+
+Every behaviour the compiler implements today falls out of holding values:
+
+| Today, inside the compiler | As a client |
+|---|---|
+| prepare / publish / finalize / abort | call `compile`; keep the result or don't |
+| rejected edit leaves accepted state intact | the input `Env` was never writable |
+| previous snapshot kept alive for a lease | keep the old `Env` value until the frame returns |
+| `:jit/retain false`, submission-only types, joint retirement | `env-without` the keys you decide are dead; `deps` tells you what reaches what |
+| native generations, tokens, reclaim | a runtime library over `Image`s |
+| `code-session-*` accepted `Code` state | a value the client keeps next to its `Env` |
+| incremental "skip unchanged" | read `deps` + fingerprints; a library, optional |
+
+`coil.jit` keeps its public surface and becomes the first such client. The
+`:jit/*` annotations become ordinary annotations that client reads.
 
 ### Artifact stages
 
@@ -295,20 +342,22 @@ Coil cannot express stored immutability: references cannot be struct fields and
 
 ### Invariants
 
-1. Nothing reachable from a `Revision` points into a txn arena.
+1. Nothing reachable from an `Env` points into a compile call's scratch arena.
 2. `seal` is the only producer of artifacts; an artifact is never written after it.
-3. Artifacts reference each other by `DefId` through the index, or by an owned
+3. Artifacts reference each other by `DefId` through an `Env`, or by an owned
    DAG pointer listed in `owns`. No pointer cycles.
-4. Phases read accepted state only through `db-*` and never hold a base container.
+4. `compile` never writes its input `Env`. Phases read it only through `env-*`.
 5. Identity is `DefId`/fingerprint, never an address.
-6. `unit-allocator` is txn scratch.
-7. Publish is a pointer swap. No deferred maintenance.
+6. `unit-allocator` is the call's scratch.
+7. The compiler has no notion of session, revision, acceptance, retention or
+   reload. If a change needs one of those words in `src/compiler`, it belongs in a
+   client.
 
 ## Migration
 
 One boundary at a time; each phase deletes a ranked copy site and lands with its
 own gate. Until the last phase the existing snapshot survives as a shrinking
-"legacy blob" artifact owned by the `Revision`, so the tree is always shippable.
+"legacy blob" artifact owned by the `Env`, so the tree is always shippable.
 
 **Phase 0 — instruments and building blocks.** No behaviour change.
 
@@ -344,10 +393,11 @@ kind that exists — so the audit's other items (check setup, `build-param-env`,
 `cte-wrap-divisor!`, nid freshening, `TaggedForm` repair) remain open until the
 data they touch is sealed too; each later phase inherits this net as it seals more.
 
-**Phase 1 — `Revision`/`Txn` skeleton and the `db-*` interface.** Mechanical:
-route every accepted-state read through `db-*`, still backed by the old
-containers. Largest diff, zero semantic change; the full gate ladder is the
-contract.
+**Phase 1 — `Env` and the `env-*` read interface.** Mechanical: define `Env` as
+a wrapper over today's containers and route every read of inherited state through
+`env-*`, still backed by the old containers. Largest diff, zero semantic change;
+the full gate ladder is the contract. Its first step is moving the session code
+out of `driver.coil` into its own files, coordinated with `feature/live-whole-program`.
 
 **Phase 2 — signatures and checked bodies.** `DefId → Sig`, `DefId → CheckedBody`
 as persistent indexes; then nid localisation and per-body semantic tables. Fix
@@ -369,17 +419,20 @@ and the `.methods` pointer comparisons.
 its indexes become txn overlay. Fix `TaggedForm` repair and slot recycling.
 Deletes `ls-inherit!`, `semantic-inherit-resolution!`, `res-own-name`.
 
-**Phase 5 — mono, meta, Code, native.** `monomorphize-reusing` reads the base
-instead of replaying it; the monomorph report is derived on demand; accepted
-`Code` and `MEEntry` become artifacts; symbol tables are sealed per image. The
-snapshot graph is now empty: delete `compiler-revision-publish-snapshot!`, the
-relocation half of `retained_graph.coil`, `retain-meta`, and
-`jit-finalize-published!`'s work. The generator remains as sealer and verifier.
+**Phase 5 — mono, meta, Code, native; then evict the policy.** `monomorphize-reusing`
+reads the input `Env` instead of replaying it; the monomorph report is derived on
+demand; `MEEntry` becomes an artifact; `emit` returns an `Image` that names its
+contents. The snapshot graph is now empty: delete
+`compiler-revision-publish-snapshot!`, the relocation half of `retained_graph.coil`
+and `retain-meta`. Then the move this whole plan is for: `repl-session-*`,
+`compiler-revision-*`, joint retirement, generation leases and `code-session-*`
+leave `src/compiler` and are rebuilt in the `coil.jit` library on `compile`/`emit`,
+with the existing JIT fixtures as the contract. The parser stops knowing `:jit/*`.
 
-**Phase 6 — dependency records and incremental retirement.** `deps` with
-fingerprints and negative lookups; demand validation replaces
-`ls-accepted-function?`; joint liveness runs over recorded edges in bounded
-slices. If slices run off-thread, index refcounts become `Arc`.
+**Phase 6 — `deps` as data.** Record reads and fingerprints on artifacts and expose
+them. Incremental skipping and liveness analysis are then libraries over that
+data, not compiler passes; the compiler's only obligation is that the records are
+complete (negative lookups included).
 
 Fixtures every phase keeps green: the `jit-static-session.py` list (notably
 `retained_heap`, `jit_source_sharing`, `jit_body_sharing`, `jit_impl_lifetime`,
