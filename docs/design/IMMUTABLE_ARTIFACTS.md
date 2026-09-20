@@ -180,6 +180,32 @@ no state, where the design wants the state *with* the failure recorded in it.
 Underneath, a check still pays the snapshot: what changed is who may hold the
 result, not yet what it costs to make.
 
+### The stale set (in progress)
+
+Measured 2026-09-20: checking `(defn area [(w i64)] …)` against a state where
+`area` takes two arguments and `unit` calls `(area 1 1)` succeeds, and the result
+still contains the now-ill-typed `unit`. Accepted bodies are passed through
+unchecked (`ls-accepted-function?`), and nothing records what they read. The live
+POC compensates outside the compiler by rescanning syntax for names.
+
+The compiler's part is to *report*, not to act:
+
+1. **A dependency index per state**, persistent like `SemBase`: for each accepted
+   function, the functions it calls and the nominal types it mentions, recorded once
+   when it is accepted (`collect-calls`, `type_references`), held in both directions
+   so replacing a definition removes its old edges in O(its edges).
+2. **`jit-env-check` reports the stale set**: accepted definitions, not redefined by
+   this check, that read a definition whose *interface* this check changed — a
+   function whose signature differs from the base's, a struct or sum whose shape
+   differs. A body-only edit changes no interface and stales nothing.
+3. The client re-checks what it chooses by submitting that definition's source
+   again (`jit-env-definition-source`); the compiler does not decide when.
+
+Not covered by this first cut, and reported as such rather than guessed at: macro
+bodies (a changed macro stales everything it expanded, which needs expansion reads
+recorded), constants that mention constants, impl availability, and negative
+lookups (a new definition that changes what an old name resolves to).
+
 ### What is still walked, and the next two slices
 
 After the `SemBase` step a census of one edit shows 72,088 records walked (171k
