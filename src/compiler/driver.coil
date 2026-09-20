@@ -18494,6 +18494,10 @@
    (source-provider-body-owners (ArrayList (ptr retained-heap/Block)))
    (source-provider-owners (ArrayList (ptr retained-source/SourcePayload)))
    (source-provider-sem-base (ptr sem/SemBase))
+   ; When set, the state a compilation builds on in place of the current one.
+   (parent-override (ptr CompilerRevision))
+   ; Handles given out and not yet released.
+   (env-handles i64)
    (source-provider-body-artifacts (ArrayList (ptr retained-heap/Artifact)))
    (source-provider-enabled bool)
    (source-provider-setup (ptr LS))
@@ -19056,6 +19060,9 @@
   [(snapshot scratch/ScratchArena)
    (source-owners (ArrayList (ptr retained-source/SourcePayload)))
    (body-owners (ArrayList (ptr retained-heap/Block)))
+   ; Holders of this revision as a value: the session's current state is one, and
+   ; each handle given out by `repl-session-env-*` is another.
+   (holds i64)
    ; In the checking mode the snapshot lives in pages that are read-only once it is
    ; published; null otherwise.
    (snapshot-pages (ptr retained-heap/PageAllocator))
@@ -19079,12 +19086,42 @@
    (entry-symbol (slice u8))
    (result-type Type)])
 
-(defn compiler-revision-parent [(session (ptr ReplSession))] (-> (ptr CompilerRevision))
+;;; The state the session currently serves, or null before the first one.
+(defn compiler-revision-current [(session (ptr ReplSession))] (-> (ptr CompilerRevision))
   (let [revisions (field session compiler-revisions)
         count (len (load revisions))]
     (if (= count 0)
         (primitive/cast (ptr CompilerRevision) 0)
         (get (load revisions) (- count 1)))))
+
+;;; The state a compilation builds on. A published state is never written, so any
+;;; held one will do; the session's current state is only the default.
+(defn compiler-revision-parent [(session (ptr ReplSession))] (-> (ptr CompilerRevision))
+  (if (= (primitive/cast i64 (.parent-override session)) 0)
+      (compiler-revision-current session)
+      (.parent-override session)))
+
+(defn compiler-revision-retain! [(revision (ptr CompilerRevision))] (-> i64)
+  (set! (.holds revision) (+ (.holds revision) 1))
+  0)
+
+;;; Give up one hold. The last one returns everything the state owns: its shared
+;;; sources, sealed bodies, semantic base and snapshot.
+(defn compiler-revision-release! [(session (ptr ReplSession))
+                                  (revision (ptr CompilerRevision))] (-> i64)
+  (set! (.holds revision) (- (.holds revision) 1))
+  (when (= (.holds revision) 0)
+    (retained-source/release-list! (field session source-store) (mut (.source-owners revision)))
+    (retained-heap/release-artifacts! (field session body-heap) (mut (.body-artifacts revision)))
+    (retained-heap/release-list! (field session body-heap) (mut (.body-owners revision)))
+    (sem/sem-base-release! (.sem-base revision))
+    (scratch/scratch-close! (field revision snapshot))
+    (unless (= (primitive/cast i64 (.snapshot-pages revision)) 0)
+      (retained-heap/page-allocator-free! (.snapshot-pages revision))
+      0)
+    (free [CompilerRevision] (.a session) (slice-new revision 1))
+    0)
+  0)
 
 (defn compiler-revision-enter! [(session (ptr ReplSession))
                                 (revision (ptr CompilerRevision))] (-> (dyn Allocator))
@@ -19765,7 +19802,7 @@
             (tr/span-end span)))
         (compiler-revision-report-memory! revision)
         (tr/span-end retain-span)
-        (compiler-revision-publish-snapshot! session revision)
+        (compiler-revision-publish-snapshot! session revision true)
         (set! (.compiler-published session) (primitive/cast (ptr CompilerRevision) 0)))
       0))
   0)
@@ -19795,7 +19832,9 @@
 (defn repl-session-reset! [(raw (ptr i8))] (-> i64)
   (let [s (repl-session raw)]
     (if (or (> (.generation-leases s) 0)
-            (> (len (.client-tokens s)) 0))
+            (or (> (len (.client-tokens s)) 0)
+                ; A state someone still holds cannot be taken back.
+                (> (.env-handles s) 0)))
         -1
         (do
           (repl-session-finalize-published! raw)
@@ -19813,15 +19852,7 @@
             (loop (if (< (load i) 0)
                       (break)
                       (let [revision (get (load revisions) (load i))]
-                        (retained-source/release-list! (field s source-store) (mut (.source-owners revision)))
-                        (retained-heap/release-artifacts! (field s body-heap) (mut (.body-artifacts revision)))
-                        (retained-heap/release-list! (field s body-heap) (mut (.body-owners revision)))
-                        (sem/sem-base-release! (.sem-base revision))
-                        (scratch/scratch-close! (field revision snapshot))
-                        (unless (= (primitive/cast i64 (.snapshot-pages revision)) 0)
-                          (retained-heap/page-allocator-free! (.snapshot-pages revision))
-                          0)
-                        (free [CompilerRevision] (.a s) (slice-new revision 1))
+                        (compiler-revision-release! s revision)
                         (set! i (- (load i) 1)))))
             (set! (.len revisions) 0))
           (repl-owned-clear! (mut (.pending s)))
@@ -21396,7 +21427,8 @@ Pipeline stage dumps (for debugging the compiler itself), each <file.coil>
 ;;; Publish one compact mutable metadata graph and retain immutable body ranges.
 ;;; Native resource ownership is independent of the replaceable metadata snapshot.
 (defn compiler-revision-publish-snapshot! [(session (ptr ReplSession))
-                                           (revision (ptr CompilerRevision))] (-> i64)
+                                           (revision (ptr CompilerRevision))
+                                           (install bool)] (-> i64)
   (let [snapshot-span (tr/span-begin "jit.publish.snapshot")]
   (if (.protect (field session body-heap))
       (do
@@ -21413,8 +21445,7 @@ Pipeline stage dumps (for debugging the compiler itself), each <file.coil>
         destination (scratch/scratch-allocator (field revision snapshot))
         graph (box! a retained/Graph (retained/graph-new walk-a destination))
         ast (ast-unit-state)
-        entries (.entries (meta-engine))
-        parent (compiler-revision-parent session)]
+        entries (.entries (meta-engine))]
     (retained/graph-share-sources! graph (field session source-store))
     (compiler-snapshot-share-bodies! session graph (.loader revision))
     (set! (.next-nid revision) (.n (nid-cell)))
@@ -21426,9 +21457,12 @@ Pipeline stage dumps (for debugging the compiler itself), each <file.coil>
       (snapshot/scan-program! graph (.native revision))
       (snapshot/scan-resolution! graph ast)
       (snapshot/scan-meta-entries! graph entries)
-      (let [state (.code-session-state session)]
-        (when (.has_accepted state) (snapshot/scan-syntax! graph (field state accepted)) 0)
-        (when (.has_accepted_monomorphs state) (snapshot/scan-syntax! graph (field state accepted_monomorphs)) 0))
+      ; The session's accepted Code state moves with the state the session serves.
+      (when install
+        (let [state (.code-session-state session)]
+          (when (.has_accepted state) (snapshot/scan-syntax! graph (field state accepted)) 0)
+          (when (.has_accepted_monomorphs state) (snapshot/scan-syntax! graph (field state accepted_monomorphs)) 0))
+        0)
       (tr/span-end mark-span))
     (compiler-snapshot-prune-scopes! ast graph)
     (compiler-snapshot-prune-scopes! (.resolution_state (.loader revision)) graph)
@@ -21462,9 +21496,11 @@ Pipeline stage dumps (for debugging the compiler itself), each <file.coil>
     ; is: it has to travel into the destination with everything else. Scanning it
     ; only in the marking pass above left it behind in this revision's arenas,
     ; which are discarded here -- so the next generation walked freed syntax.
-    (let [state (.code-session-state session)]
-      (when (.has_accepted state) (snapshot/scan-syntax! graph (field state accepted)) 0)
-      (when (.has_accepted_monomorphs state) (snapshot/scan-syntax! graph (field state accepted_monomorphs)) 0))
+    (when install
+      (let [state (.code-session-state session)]
+        (when (.has_accepted state) (snapshot/scan-syntax! graph (field state accepted)) 0)
+        (when (.has_accepted_monomorphs state) (snapshot/scan-syntax! graph (field state accepted_monomorphs)) 0))
+      0)
     (let [finish-span (tr/span-begin "jit.snapshot.copy")]
       (compiler-snapshot-census! graph)
       (retained/graph-finish! graph)
@@ -21483,12 +21519,12 @@ Pipeline stage dumps (for debugging the compiler itself), each <file.coil>
     ; These two live inline in the session's code state, which the graph does not
     ; own, so their relocated values are read back into it by hand.
     (let [state (.code-session-state session)]
-      (when (.has_accepted state)
+      (when (and install (.has_accepted state))
         (set! (.accepted state)
               (load (primitive/cast (ptr Sexp)
                       (retained/graph-address graph
                         (primitive/cast i64 (field state accepted)))))) 0)
-      (when (.has_accepted_monomorphs state)
+      (when (and install (.has_accepted_monomorphs state))
         (set! (.accepted_monomorphs state)
               (load (primitive/cast (ptr Sexp)
                       (retained/graph-address graph
@@ -21531,18 +21567,19 @@ Pipeline stage dumps (for debugging the compiler itself), each <file.coil>
     (set! (.unit revision) (primitive/zeroed CompilationUnitSession))
     (set! (.entry-name revision) "")
     (set! (.result-type revision) (TVoid))
-    (unless (= (primitive/cast i64 parent) 0)
-      (retained-source/release-list! (field session source-store) (mut (.source-owners parent)))
-      (retained-heap/release-artifacts! (field session body-heap) (mut (.body-artifacts parent)))
-      (retained-heap/release-list! (field session body-heap) (mut (.body-owners parent)))
-      (sem/sem-base-release! (.sem-base parent))
-      (scratch/scratch-close! (field parent snapshot))
-      (unless (= (primitive/cast i64 (.snapshot-pages parent)) 0)
-        (retained-heap/page-allocator-free! (.snapshot-pages parent))
-        0)
-      (free [CompilerRevision] (.a session) (slice-new parent 1)) 0)
-    (set! (.len (field session compiler-revisions)) 0)
-    (push! (mut (.compiler-revisions session)) revision))
+    ; The new state holds everything it needs, so it is a value in its own right.
+    ; Installing it makes it the one the session serves and drops the session's
+    ; hold on the state it was built from, which goes away unless someone else
+    ; still holds it.
+    (set! (.holds revision) 1)
+    (when install
+      (let [previous (compiler-revision-current session)]
+        (set! (.len (field session compiler-revisions)) 0)
+        (push! (mut (.compiler-revisions session)) revision)
+        (unless (= (primitive/cast i64 previous) 0)
+          (compiler-revision-release! session previous)
+          0))
+      0))
   (tr/span-end snapshot-span))
   0)
 
@@ -22307,6 +22344,118 @@ Pipeline stage dumps (for debugging the compiler itself), each <file.coil>
     (compiler-prune-resolution-values! (ast-unit-state) (.types out) a)
     (compiler-prune-resolution-types! (ast-unit-state) (.types out)))
   0)
+
+;;; ---- compiler states as values --------------------------------------------------
+;;; A published state is never written again (`COIL_JIT_PROTECT` checks that), so it
+;;; can be held, built on any number of times, and released in any order, with no
+;;; notion of which one is "current". These operations are that, for checked-only
+;;; sessions: a client that wants to know whether an edit still type checks, or to
+;;; compare two edits of one base, needs nothing else from the compiler.
+
+;;; A hold on the state the session currently serves, or null before the first one.
+(defn repl-session-env-current [(raw (ptr i8))] (-> (ptr i8))
+  (repl-session-finalize-published! raw)
+  (let [session (repl-session raw)
+        current (compiler-revision-current session)]
+    (unless (= (primitive/cast i64 current) 0)
+      (compiler-revision-retain! current)
+      (set! (.env-handles session) (+ (.env-handles session) 1))
+      0)
+    (primitive/cast (ptr i8) current)))
+
+(defn repl-session-env-retain! [(raw (ptr i8)) (env (ptr i8))] (-> (ptr i8))
+  (let [session (repl-session raw)]
+    (compiler-revision-retain! (primitive/cast (ptr CompilerRevision) env))
+    (set! (.env-handles session) (+ (.env-handles session) 1))
+    env))
+
+(defn repl-session-env-release! [(raw (ptr i8)) (env (ptr i8))] (-> i64)
+  (let [session (repl-session raw)]
+    (unless (= (primitive/cast i64 env) 0)
+      (set! (.env-handles session) (- (.env-handles session) 1))
+      (compiler-revision-release! session (primitive/cast (ptr CompilerRevision) env))
+      0)
+    0))
+
+;;; Check `source` against the state `env` (null: against nothing) and return a hold
+;;; on the resulting state, or null with the session's diagnostic set when it does
+;;; not check. `env` is not written, and neither is the state the session serves:
+;;; the result is simply another value, and whoever holds it decides what it is for.
+(defn repl-session-env-check! [(raw (ptr i8)) (env (ptr i8)) (source (slice u8))] (-> (ptr i8))
+  (repl-session-finalize-published! raw)
+  (repl-session-abort-prepared! raw)
+  (let [session (repl-session raw)
+        none (primitive/cast (ptr i8) 0)]
+    (if (not (.checked-only session))
+        (do
+          (repl-set-failure! session
+                             source
+                             "error: compiler states as values are implemented for checked-only sessions; this session generates native code\n")
+          none)
+        (let [revision (box! (.a session) CompilerRevision (primitive/zeroed CompilerRevision))
+              _base (set! (.parent-override session) (primitive/cast (ptr CompilerRevision) env))
+              a (compiler-revision-enter! session revision)
+              s (.loader revision)
+              writer (primitive/alloc-stack Writer)]
+          (set! (.jit_work_trace (ast-unit-state))
+                (!= (primitive/cast i64 (unit-getenv c"COIL_JIT_TRACE")) 0))
+          (repl-clear-diagnostic! session)
+          (code-session-begin! (.code-session-state session))
+          (let [checked (compiler-revision-check session revision source "0")
+                ; The session's Code state follows the state the session serves, so a
+                ; value built beside it must not have moved it.
+                staged (or (.has_staged (.code-session-state session))
+                           (.has_staged_monomorphs (.code-session-state session)))]
+            (code-session-abort! (.code-session-state session))
+            (match checked
+              (Err [diagnostic]
+                   (do
+                     (report-diag (repl-diagnostic-writer session writer) (mut s) diagnostic)
+                     (compilation-unit-leave! (field revision unit))
+                     (free [CompilerRevision] (.a session) (slice-new revision 1))
+                     (set! (.parent-override session) (primitive/cast (ptr CompilerRevision) 0))
+                     (repl-set-failure! session source "error: the source does not check against that compiler state\n")
+                     none))
+              (Ok [program]
+                  (if staged
+                      (do
+                        (compilation-unit-leave! (field revision unit))
+                        (free [CompilerRevision] (.a session) (slice-new revision 1))
+                        (set! (.parent-override session) (primitive/cast (ptr CompilerRevision) 0))
+                        (repl-set-failure! session
+                                           source
+                                           "error: the source stages session Code state, which a compiler state held as a value cannot carry yet\n")
+                        none)
+                      (do
+                        (set! (.native revision) program)
+                        (compiler-revision-hide-entry! a (.checked s) (.entry-name revision))
+                        (compiler-revision-hide-entry! a (.native revision) (.entry-name revision))
+                        (compiler-revision-hide-declaration! revision)
+                        (ls-accept-checked! (mut s) (.checked s))
+                        (compiler-revision-promote-maps! session revision)
+                        (compiler-revision-retain-meta! (mut s))
+                        (compiler-revision-prune-joint! revision)
+                        (compiler-revision-publish-snapshot! session revision false)
+                        (set! (.parent-override session) (primitive/cast (ptr CompilerRevision) 0))
+                        (set! (.env-handles session) (+ (.env-handles session) 1))
+                        (set! (.status session) 0)
+                        (primitive/cast (ptr i8) revision))))))))))
+
+;;; Whether the state `env` defines a function named `name`.
+(defn repl-session-env-defines? [(raw (ptr i8)) (env (ptr i8)) (name (slice u8))] (-> bool)
+  (let [revision (primitive/cast (ptr CompilerRevision) env)]
+    (if (= (primitive/cast i64 revision) 0)
+        false
+        (hm-contains? [(slice u8) i64] (.checked_functions (.loader revision)) name))))
+
+;;; Lower one of `env`'s checked functions before native physical layout, as
+;;; `repl-session-live-function` does for a prepared candidate.
+(defn repl-session-env-live-function [(allocator (dyn Allocator)) (raw (ptr i8)) (env (ptr i8))
+                                      (name (slice u8))] (-> (Option live-ir/Function))
+  (let [revision (primitive/cast (ptr CompilerRevision) env)]
+    (if (= (primitive/cast i64 revision) 0)
+        (None)
+        (Some (live-ir/lower allocator (.checked (.loader revision)) name)))))
 
 ;;; Lower a selected checked function before native physical layout. The output
 ;;; belongs entirely to the caller's allocator; no candidate pointer escapes.

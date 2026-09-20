@@ -152,6 +152,34 @@ cannot disturb the state it was given — and it is now a gate rather than a rea
 of the code. (`jit-session-memory.py` is not run protected: a page per block is
 what its RSS ceiling exists to catch.)
 
+### Compiler states as values: the first piece of the API
+
+`coil.jit` now has `JitEnv` (`jit_api.coil`; `repl-session-env-*` in `driver.coil`):
+
+```
+(jit-env-empty)                      ; the state with nothing in it
+(jit-env-check session base source)  ; -> a new state, or an invalid one + jit-diagnostic
+(jit-env-current session)            ; a hold on the state the session itself serves
+(jit-env-retain session env) (jit-env-release! session env)
+(jit-env-defines? session env name) (jit-env-live-function allocator session env name)
+```
+
+`jit-env-check` builds on *any* held state and writes neither it nor the state the
+session serves, so several are alive at once. `jit_env_values.coil` holds a base and
+two different edits of it, checks that a failing edit changes nothing, chains twelve
+more, and releases everything in an unrelated order — with the whole accepted state
+sealed read-only. A `CompilerRevision` is now reference counted
+(`compiler-revision-retain!`/`-release!`); "current" is just the hold the session
+keeps. This is the live checker's entire need from the compiler.
+
+Deliberately not there yet, each a hard error rather than a silent gap:
+checked-only sessions only (a state that owns native code cannot be branched —
+symbol resolution is per session); source that stages session Code state is
+refused (that state is one per session, not one per value); a failed check returns
+no state, where the design wants the state *with* the failure recorded in it.
+Underneath, a check still pays the snapshot: what changed is who may hold the
+result, not yet what it costs to make.
+
 ### What is still walked, and the next two slices
 
 After the `SemBase` step a census of one edit shows 72,088 records walked (171k

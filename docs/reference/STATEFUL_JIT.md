@@ -107,6 +107,19 @@ retired artifacts disappear when they leave the compiler's native table, while
 unrelated live artifacts remain. Rejected or aborted candidates do not replace
 the accepted report.
 
+## Compiler states as values
+
+A checked-only session can hand out its states as values. `(jit-env-check session
+base source)` checks `source` against any state you hold and returns a new one;
+`base`, and the state the session itself serves, are not written. Hold as many as
+you like — the state before an edit and after it, or two edits of one base — and
+release them in any order with `jit-env-release!`. `(jit-env-empty)` is the state
+to build the first one on, `jit-env-valid?` is false for it and for the result of a
+check that failed (then `jit-diagnostic` says why), and `jit-env-defines?` /
+`jit-env-live-function` read a particular state. `jit-reset!` refuses while any is
+held. A session that generates native code refuses `jit-env-check`, as does source
+that stages session Code state: both are per-session today, not per-state.
+
 ## Ownership
 
 Checked function bodies have immutable, nonmoving storage. Their typed pointer
