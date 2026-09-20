@@ -1,0 +1,190 @@
+;;; What each accepted definition reads, as a persistent value.
+
+;;;
+;;; A checked function was checked against the signatures and types it mentions.
+;;; Once it is accepted it is not checked again, so when one of those changes,
+;;; something has to know who was relying on it. A `DepBase` records, for every
+;;; accepted definition, the names it reads, and keeps the same edges the other way
+;;; round: the readers of each name. Both directions are persistent maps, so a base
+;;; derived from another shares every edge that does not change, and replacing a
+;;; definition removes its old edges in time proportional to how many it had.
+;;;
+;;; The compiler only answers "who reads this". Deciding that a change matters, and
+;;; doing anything about the readers, is for whoever asked.
+(module coil.compiler.dep_index)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :use *)
+(import "coil.result" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [str-keyops-borrowed])
+(import "coil.scratch" :as scratch)
+(import "coil.pmap" :use *)
+(import "coil.compiler.sem_base" :use *)
+
+;;; The readers of one name. `key` is that name as the map stores it, and `hold`
+;;; keeps its bytes alive for as long as the set exists, whichever readers come and
+;;; go. Each reader's own bytes are kept alive by the hold stored under it.
+(defstruct NameSet
+  [(key (slice u8)) (hold SemHold) (names (PMap (slice u8) SemHold))])
+
+(impl Clone NameSet
+  (clone [(self (ref NameSet))]
+         (-> NameSet)
+         (NameSet
+           :key (.key self)
+           :hold (clone (field self hold))
+           :names (pm-clone-at [(PMap (slice u8) SemHold)] (field self names)))))
+
+;;; The names one definition reads, under its own name's storage.
+(defstruct ReadList [(reads (ArrayList (slice u8))) (hold SemHold)])
+
+(impl Clone ReadList
+  (clone [(self (ref ReadList))]
+         (-> ReadList)
+         (ReadList :reads (.reads self) :hold (clone (field self hold)))))
+
+(defstruct DepBase
+  [(refs i64)
+   (a (dyn Allocator))
+   ; name -> who reads it
+   (readers (PMap (slice u8) NameSet))
+   ; name -> what it reads; the list lives in the hold's arena
+   (reads (PMap (slice u8) ReadList))])
+
+(defn dep-no-base [] (-> (ptr DepBase))
+  (p/cast (ptr DepBase) 0))
+
+(defn dep-base-new [(a (dyn Allocator))] (-> (ptr DepBase))
+  (let [raw
+          (match (alloc [DepBase] a 1)
+            (Some [memory] (slice-data memory))
+            (None []
+                  (do
+                    (oom-at c"dependency base" (p/sizeof DepBase))
+                    (dep-no-base))))]
+    (set! (.refs raw) 1)
+    (set! (.a raw) a)
+    (set! (.readers raw)
+          (pm-new [(slice u8) NameSet] (sem-lease a) (str-keyops-borrowed)))
+    (set! (.reads raw)
+          (pm-new [(slice u8) ReadList] (sem-lease a) (str-keyops-borrowed)))
+    raw))
+
+(defn dep-base-retain [(base (ptr DepBase))] (-> (ptr DepBase))
+  (unless (= base (dep-no-base)) (set! (.refs base) (+ (.refs base) 1)) 0)
+  base)
+
+(defn dep-base-release! [(base (ptr DepBase))] (-> i64)
+  (unless (= base (dep-no-base))
+    (let [remaining (- (.refs base) 1)]
+      (set! (.refs base) remaining)
+      (when (= remaining 0)
+        (let [readers (take! [(PMap (slice u8) NameSet)] (field base readers))
+              reads (take! [(PMap (slice u8) ReadList)] (field base reads))]
+          0)
+        (free [DepBase] (.a base) (slice-new base 1))
+        0)
+      0)
+    0)
+  0)
+
+;;; A new base equal to `parent` (which may be null), sharing all of its edges. It
+;;; holds one reference and may be written until someone else can see it.
+(defn dep-base-derive [(a (dyn Allocator)) (parent (ptr DepBase))] (-> (ptr DepBase))
+  (if (= parent (dep-no-base))
+      (dep-base-new a)
+      (let [raw
+              (match (alloc [DepBase] a 1)
+                (Some [memory] (slice-data memory))
+                (None []
+                      (do
+                        (oom-at c"dependency base" (p/sizeof DepBase))
+                        (dep-no-base))))]
+        (set! (.refs raw) 1)
+        (set! (.a raw) a)
+        (set! (.readers raw)
+              (pm-clone-at [(PMap (slice u8) NameSet)] (field parent readers)))
+        (set! (.reads raw)
+              (pm-clone-at [(PMap (slice u8) ReadList)] (field parent reads)))
+        raw)))
+
+;;; An empty reader set stored under `name`, whose bytes `owner` holds.
+(defn dep-fresh-set [(base (ptr DepBase))
+                     (owner (ptr SemOwner))
+                     (name (slice u8))] (-> NameSet)
+  (NameSet
+    :key name
+    :hold (sem-owner-hold owner)
+    :names
+      (pm-new [(slice u8) SemHold] (sem-lease (.a base)) (str-keyops-borrowed))))
+
+;;; Drop `reader` from the readers of `name`.
+(defn dep-unlink! [(base (ptr DepBase)) (name (slice u8)) (reader (slice u8))] (-> i64)
+  (match (pm-get-ptr (field base readers) name)
+    (None [] 0)
+    (Some [stored]
+          (let [(mut set) (pm-clone-at [NameSet] stored)]
+            (pm-dissoc! (mut (.names set)) reader)
+            (let [emptied (pm-empty? (field set names))
+                  key (.key set)]
+              (if emptied
+                  (let [gone set] (pm-dissoc! (mut (.readers base)) key))
+                  (pm-assoc! (mut (.readers base)) key set)))))))
+
+;;; Forget everything `reader` reads, because it is going away or being replaced.
+(defn dep-base-forget! [(base (ptr DepBase)) (reader (slice u8))] (-> i64)
+  (match (pm-get-ptr (field base reads) reader)
+    (None [] 0)
+    (Some [stored]
+          ; Held across the unlinking, which frees what only this entry kept alive.
+          (let [listed (pm-clone-at [ReadList] stored)]
+            (for [i 0 (len (.reads listed))]
+              (dep-unlink! base (get (.reads listed) i) reader))
+            (pm-dissoc! (mut (.reads base)) reader)))))
+
+;;; Record that `reader` reads exactly `names`, replacing whatever it read before.
+;;; `owner` is the arena the recorded names are copied into.
+(defn dep-base-set-reads! [(base (ptr DepBase))
+                           (owner (ptr SemOwner))
+                           (reader (slice u8))
+                           (names (ptr (ArrayList (slice u8))))] (-> i64)
+  (dep-base-forget! base reader)
+  (let [arena (scratch/scratch-allocator (field owner arena))
+        stored-reader (sem-own-bytes arena reader)
+        (mut listed) (al-new [(slice u8)] arena)]
+    (for [i 0 (len (load names))]
+      (let [name (sem-own-bytes arena (get (load names) i))]
+        (push! (mut listed) name)
+        ; An existing set keeps the key it is stored under; a new one is stored
+        ; under this copy of the name, which it then keeps alive itself.
+        (let [(mut set)
+                (match (pm-get-ptr (field base readers) name)
+                  (Some [stored] (pm-clone-at [NameSet] stored))
+                  (None [] (dep-fresh-set base owner name)))
+              key (.key set)]
+          (pm-assoc! (mut (.names set)) stored-reader (sem-owner-hold owner))
+          (pm-assoc! (mut (.readers base)) key set))))
+    (pm-assoc! (mut (.reads base))
+               stored-reader
+               (ReadList :reads (load listed) :hold (sem-owner-hold owner)))))
+
+;;; Append every recorded reader of `name` to `out`. The slices borrow from the
+;;; base: valid while it is held.
+(defn dep-base-readers! [(base (ptr DepBase))
+                         (name (slice u8))
+                         (out (mut (ArrayList (slice u8))))] (-> i64)
+  (unless (= base (dep-no-base))
+    (match (pm-get-ptr (field base readers) name)
+      (None [] 0)
+      (Some [set]
+            (let [(mut it) (pm-iter (field set names))]
+              (loop (match (next (mut it))
+                      (None [] (break))
+                      (Some [e] (do (push! (mut out) (.key e)) 0)))))))
+    0)
+  0)
+
+(defn dep-base-reader-count [(base (ptr DepBase))] (-> i64)
+  (if (= base (dep-no-base)) 0 (pm-len (field base reads))))
