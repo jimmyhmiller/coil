@@ -138,6 +138,20 @@ are the previous facade's (`compiler-revision-retain-meta!` installs the facade 
 the next `meta_environment`). Pruning still iterates the base against the
 snapshot's `live-nids`; that scan goes when the walk does.
 
+### Accepted state is immutable, and now that is checked
+
+`COIL_JIT_PROTECT=1` covers the whole published snapshot, not only sealed bodies:
+the snapshot is allocated from a page-backed allocator (`PageAllocator` in
+`retained_heap.coil`) and sealed read-only at the end of publication. All 31
+`jit-static-session.py` fixtures, plus `jit-source-graph`, `jit-single-form` and
+`codegen-session`, pass with it on. So nothing those exercise writes into accepted
+metadata after it is published: the in-place writers the mutation audit listed
+(check setup, `build-param-env`, `TaggedForm` repair, slot recycling) all land on a
+candidate's own copies. That is the property an `Env` value needs — a compile that
+cannot disturb the state it was given — and it is now a gate rather than a reading
+of the code. (`jit-session-memory.py` is not run protected: a page per block is
+what its RSS ceiling exists to catch.)
+
 ### What is still walked, and the next two slices
 
 After the `SemBase` step a census of one edit shows 72,088 records walked (171k

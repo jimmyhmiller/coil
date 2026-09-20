@@ -130,9 +130,10 @@ fixups and ownership transfer, relocation scratch is freed too. With
 report this arena separately from compilation scratch. Its peak counter spans
 both traversals; live bytes describe the current traversal.
 
-A body block is written once, between its allocation and the end of pointer
-fixups, and never again. `COIL_JIT_PROTECT=1` enforces that: each block gets its
-own pages, made read-only after fixups, so a store into accepted metadata faults
+Accepted metadata is written once, up to the end of pointer fixups, and never
+again. `COIL_JIT_PROTECT=1` enforces that for all of it: each sealed body block
+and the whole published snapshot live in their own pages, made read-only once
+publication completes, so a store into accepted metadata faults
 at the store (SIGBUS on macOS, SIGSEGV on Linux) instead of corrupting a session
 some edits later. It costs a mapping per block, so it is a checking mode rather
 than the default; `scripts/tests/jit-static-session.py` runs every fixture with it
