@@ -243,12 +243,26 @@ an impl is removing a key; nothing is rebuilt (most of copy site 4).
 ### Layer 3 — the API
 
 ```
-(compile  env forms options)  →  (Result Compiled Diagnostics)   ; Compiled = new Env + outputs
+(compile  env forms options)  →  Compiled        ; new Env + diagnostics + outputs + stale set
+(recheck  env defs options)   →  Compiled        ; re-run a stage for definitions already in env
+(emit     env roots target)   →  Image           ; code + symbols + the DefIds inside
+
 (env-sig env def) (env-struct …) (env-impls-for …) (env-checked-body …) (env-defs env)
+(env-diagnostics env)         ; DefId → diagnostics, an index like any other
+(env-dependents env def stage); who recorded a read of this
+(env-diff old new)            ; what changed, skipping every shared subtree
 (env-without env def)         →  Env
-(emit env roots target)       →  Image                           ; code + symbols + the DefIds inside
 ```
 
+- **`compile` always returns an `Env`.** Accepting or rejecting a result is policy,
+  so the compiler does not decide it. A definition whose body fails to check is
+  recorded as a failed artifact carrying its diagnostics, its signature still
+  available to everyone else; the statement-level recovery the checker already has
+  (`recover_statements`, `recovered_diags`) is what makes that useful. A reloader
+  looks at the diagnostics and keeps the old `Env`; a checker keeps the new one.
+- **Checking and emitting are separate calls.** Checking never monomorphises or
+  generates code. (Today's `jit-checked-session-new` is this distinction, expressed
+  as a kind of session.)
 - **`compile` never touches its input.** It works in a scratch arena with a mutable
   overlay per index ("overlay, else the input `Env`"), seals what it produced, and
   returns a new `Env` sharing everything else. The scratch and the overlay are locals
@@ -266,11 +280,22 @@ an impl is removing a key; nothing is rebuilt (most of copy site 4).
   it, patching call sites, keeping old code alive for running frames, reclaiming it:
   the client's, in a library. The compiler does not know an image is ever replaced.
 - **Artifacts carry what they read** (`deps`: `(DefId, stage, fingerprint seen)`,
-  including negative lookups) *as data*. The compiler records; it does not act on
-  it. A client that wants to skip re-checking unchanged code, or to work out what a
-  signature change invalidates, reads those records. This replaces
-  `ls-accepted-function?`'s pointer-equality test, which is policy hiding in the
-  checker.
+  including negative lookups — a name that was absent, a candidate set for an impl
+  or an import). Sealing an artifact also maintains the reverse index behind
+  `env-dependents`, at a cost proportional to that artifact's own reads. Every
+  result reports its **stale set**: definitions whose recorded reads no longer match
+  this `Env`. The compiler records and reports; it never re-checks on its own
+  initiative. This replaces `ls-accepted-function?`'s pointer-equality test, which
+  is policy hiding in the checker.
+- **`recheck` takes the definitions the caller names**, re-runs the stage against
+  this `Env` from the expanded form the `Env` already holds, and returns a new `Env`.
+  The caller chooses how many per call, so the work is interruptible and
+  prioritisable without the compiler knowing about either.
+- **`env-diff` is the general tool for derived state.** Two `Env`s share every node
+  an edit did not touch, so a diff that skips pointer-equal subtrees costs what the
+  edit cost. Any index a client wants to keep — diagnostics per file, a symbol
+  table, its own notion of what is loaded — is maintained from diffs, and the
+  compiler needs no hook for it.
 
 ### What a client builds
 
@@ -280,12 +305,12 @@ Hot reload, in full, against that API:
 (defstruct Live [(current Env) (loaded (PMap DefId Image)) …])
 
 (defn submit! [(live (mut Live)) (forms …)] (-> …)
-  (match (compile (field live current) forms options)
-    (Err [diagnostics] (report diagnostics))            ; nothing to undo
-    (Ok [compiled]
-      (let [image (emit (.env compiled) (changed compiled) target)]
-        (swap-entry-points! live image)                  ; the client's runtime
-        (set! (.current live) (.env compiled))))))       ; old Env dropped here —
+  (let [compiled (compile (field live current) forms options)]
+    (if (has-errors? compiled)
+        (report compiled)                                ; its policy: reject. Nothing to undo
+        (let [image (emit (.env compiled) (changed compiled) target)]
+          (swap-entry-points! live image)                ; the client's runtime
+          (set! (.current live) (.env compiled))))))     ; old Env dropped here —
                                                          ; unless something else holds it
 ```
 
@@ -294,12 +319,71 @@ Every behaviour the compiler implements today falls out of holding values:
 | Today, inside the compiler | As a client |
 |---|---|
 | prepare / publish / finalize / abort | call `compile`; keep the result or don't |
-| rejected edit leaves accepted state intact | the input `Env` was never writable |
+| rejected edit leaves accepted state intact | the input `Env` was never writable; rejecting is not keeping the result |
 | previous snapshot kept alive for a lease | keep the old `Env` value until the frame returns |
 | `:jit/retain false`, submission-only types, joint retirement | `env-without` the keys you decide are dead; `deps` tells you what reaches what |
 | native generations, tokens, reclaim | a runtime library over `Image`s |
 | `code-session-*` accepted `Code` state | a value the client keeps next to its `Env` |
 | incremental "skip unchanged" | read `deps` + fingerprints; a library, optional |
+
+### A second client: a live checker
+
+Keep a compiler running, edit, and know within a keystroke's budget whether the
+whole program still type checks. It is a harder test of the API than hot reload,
+and it changed the API above in four places:
+
+1. **A reloader rejects on error; a checker must not.** It needs an `Env` that
+   contains the broken definition, so everything else can still be checked against
+   its signature. Hence `compile` always returns an `Env`, and rejection is the
+   reloader's decision.
+2. **A reloader can check only what was submitted; a checker cannot.** Change `f`'s
+   signature and every unedited caller is now wrong. Hence `deps`, the stale set
+   and `env-dependents` are core, not the optional last phase an earlier draft made
+   them.
+3. **Nobody resubmits the callers.** Their expanded forms are already in the `Env`.
+   Hence `recheck`.
+4. **It wants to be interrupted.** A new edit arrives mid-recheck. Because `compile`
+   and `recheck` never write their input, abandoning work is dropping a value, and
+   because `recheck` takes a caller-sized slice, there is always a near point to
+   stop at.
+
+```
+(defn on-edit! [(c (mut Checker)) (forms …)] (-> …)
+  (let [compiled (compile (field c env) forms check-only)]
+    (set! (.env c) (.env compiled))                      ; keep it, errors and all
+    (set! (.queue c) (prioritise (.stale compiled) (.open-files c)))))
+
+(defn on-idle! [(c (mut Checker))] (-> …)                 ; a few definitions at a time
+  (let [compiled (recheck (field c env) (take 8 (.queue c)) check-only)]
+    (set! (.env c) (.env compiled))
+    (enqueue! c (.stale compiled))                        ; rarely non-empty; see below
+    (publish-diagnostics! c (env-diff …))))
+```
+
+What stays outside: eager or lazy, which definitions first, debouncing, mapping
+files to definitions (a form that vanished from a file is an `env-without`), and
+how diagnostics are shown.
+
+Two properties of Coil keep this cheap, and are worth protecting:
+
+- **Signatures are written, not inferred.** A function body reads the signatures,
+  types, traits, impls and constants it uses, and nothing reads a body. So a body
+  edit with an unchanged signature stales nothing, and a signature edit stales its
+  readers and stops — the fingerprint of each reader's *own* signature is
+  unchanged. Invalidation is one hop, except through macros (a changed macro
+  re-expands its users, whose output may differ) and constants that mention
+  constants. The stale set handles those by being recomputed on each result.
+- **Per-body semantic tables live in the body artifact** (the artifact-local nid
+  decision). "What is the type of this expression" is a read of one sealed artifact,
+  valid for as long as the client holds that `Env`, with no global side map to
+  consult or keep consistent.
+
+Whole-program metaprograms (lints, transforms) read everything and so are stale
+after every edit. The compiler reports that honestly; when to run them is the
+client's call.
+
+The measured baseline says this is within reach: parse, expand, resolve and check
+for a one-function edit total about 5 ms today. The other 100 ms is the copying.
 
 `coil.jit` keeps its public surface and becomes the first such client. The
 `:jit/*` annotations become ordinary annotations that client reads.
@@ -367,6 +451,7 @@ own gate. Until the last phase the existing snapshot survives as a shrinking
 | `coil.pmap`, `coil.pvec` (stdlib, public) | done — model-tested against `HashMap`/`ArrayList`, forced hash collisions, three-level growth and collapse, leak-checked allocator, clone/drop balance of owned values, path-copy allocation bound |
 | Page-protection checking mode for sealed blocks | done — `COIL_JIT_PROTECT=1`; `retained_heap` gives each block its own pages and `seal-all!` makes them read-only after the last fixup |
 | Counters for bytes copied at prepare and publish, asserted in `jit-session-memory.py` | not started (`retained-bytes` already reports the publish side) |
+| `pm-diff`: structural diff of two `PMap`s that skips shared subtrees (what `env-diff` is built on) | not started |
 | `DefId` interner | not started |
 | Heap generalised from bodies to arbitrary sealed roots | not started |
 | Session code moved out of `driver.coil` | deferred: `feature/live-whole-program` is being edited concurrently and a 4k-line move would conflict with every commit there; do it as the first step of Phase 1, coordinated |
@@ -429,10 +514,12 @@ and `retain-meta`. Then the move this whole plan is for: `repl-session-*`,
 leave `src/compiler` and are rebuilt in the `coil.jit` library on `compile`/`emit`,
 with the existing JIT fixtures as the contract. The parser stops knowing `:jit/*`.
 
-**Phase 6 — `deps` as data.** Record reads and fingerprints on artifacts and expose
-them. Incremental skipping and liveness analysis are then libraries over that
-data, not compiler passes; the compiler's only obligation is that the records are
-complete (negative lookups included).
+**Phase 6 — `recheck`, the stale set, `env-dependents`, `env-diff`.** `deps` are
+recorded from Phase 2 on, as each stage is sealed; this phase makes them complete
+(negative lookups, impl candidate sets, macro reads) and exposes them. Acceptance
+is the live checker built as a client: a signature edit in a large program reports
+exactly its readers as stale, a body edit reports none, and work per edit is
+proportional to the definitions re-checked.
 
 Fixtures every phase keeps green: the `jit-static-session.py` list (notably
 `retained_heap`, `jit_source_sharing`, `jit_body_sharing`, `jit_impl_lifetime`,
