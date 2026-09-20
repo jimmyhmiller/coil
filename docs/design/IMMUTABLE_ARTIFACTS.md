@@ -236,6 +236,28 @@ bodies (a changed macro stales everything it expanded, which needs expansion rea
 recorded), constants that mention constants, impl availability, and negative
 lookups (a new definition that changes what an old name resolves to).
 
+### Release verification (2026-09-20)
+
+`python3 scripts/dev.py build full` passes — stage1, stage2, LLVM fixed point on
+independently emitted stage2/stage3 objects — and the result is installed globally.
+It needed an explicit `STAGE0`: the committed seed (2026-09-07) cannot parse the
+`(const Name Keyword)` value parameters the parent branch added, which the
+bootstrap reports as "native stage0 unavailable or stale". The seeds want refreshing
+on whichever branch lands first (`scripts/compiler/refresh-seed.sh`, after the source
+commit; the Linux pair needs a Linux host).
+
+Gates on the installed compiler: `modernize-fast`, `cli` (**green** — its one
+standing failure is fixed, see below), `generated`, `runtime` 80/0, `snapshots`,
+`metaprogramming`, `interpreter`, and `meta`'s engine comparison. Still red, and not
+from this work: `meta`'s interpreted-runtime half, which times out building
+`simd.coil` under `COIL_META_INTERP=1`.
+
+Two compiler bugs that predate this branch were fixed because they stood in its way:
+a redefined function kept its old signature (`check-inherit-signatures!`), and no
+deriver or reflection op accepted a type spelled through an import alias
+(`(derive Serialize s/Shape)` — the comptime context knew only the metaprogram's own
+imports). Both are in `coil-bugs` and need porting if this branch does not land first.
+
 ### What is still walked, and the next two slices
 
 After the `SemBase` step a census of one edit shows 72,088 records walked (171k
