@@ -106,7 +106,10 @@ EMPTY_MAPS={
  ('coil.compiler.resolve.SemanticWorkspace','failed_parses')}
 
 OPAQUE_FIELDS={('coil.compiler.loader.LS','code_session_state'),
-               ('coil.compiler.metaengine.MEEntry','fp')}
+               ('coil.compiler.metaengine.MEEntry','fp'),
+               # A persistent base is owned by its revision and shared between
+               # snapshots; a snapshot only points at it.
+               ('coil.compiler.comptime.SemMapsSnap','base')}
 ids={}; queue=[]; output=[]; used=set()
 def ident(t):
     t=freeze(t)

@@ -102,6 +102,26 @@ So roughly 100 ms of a 110 ms edit is retention and relocation, in the smallest
 session there can be, and that part grows with the session. The numbers this
 plan has to move are the first four rows.
 
+### Progress against the baseline
+
+Same workload and machine as the baseline; steady-state median per edit.
+
+| Step | relocated per edit | `publish.snapshot` | `publish.retain` | `prepare` |
+|---|---|---|---|---|
+| baseline | 8,047,232 B | 83 ms | 17 ms | 7 ms |
+| application side tables as a persistent `SemBase` (`sem_base.coil`) | 3,303,720 B | 55 ms | 17 ms | 6 ms |
+
+The first step moves the *application's* type, binding and resolution entries out
+of the snapshot: a finished compilation's entries are promoted into a base derived
+from the one it read through (`compiler-revision-promote-maps!`), the snapshot
+carries empty maps and a pointer, and the next compilation reads through instead of
+calling `sem-maps-inherit!` over everything. Peak RSS in the `accepted` scenario
+fell from 391 MB to 259 MB. Still listed, and so still walked, relocated and
+re-inherited every edit: the meta environment's entries, which after each accept
+are the previous facade's (`compiler-revision-retain-meta!` installs the facade as
+the next `meta_environment`). Pruning still iterates the base against the
+snapshot's `live-nids`; that scan goes when the walk does.
+
 ## What the audit says is actually mutated
 
 The whole compiler does not need to become functional. The mutation audit sorts
