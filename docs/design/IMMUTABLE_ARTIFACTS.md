@@ -122,6 +122,29 @@ are the previous facade's (`compiler-revision-retain-meta!` installs the facade 
 the next `meta_environment`). Pruning still iterates the base against the
 snapshot's `live-nids`; that scan goes when the walk does.
 
+### What is still walked, and the next two slices
+
+After the `SemBase` step a census of one edit shows 72,088 records walked (171k
+before), with no side-table records among them. The rest, by share: `Expr` 20%,
+name strings 10%, `Type` 8%, `ArrayList Expr` 7%, `(slice u8) → i64` index entries
+6% (`sigidx`, `checked_functions`, …), `Param`, `Sexp`, `Func`, `Extern`, `Sig`.
+
+1. **Stop walking into frozen bodies** (≈35% of records: `Expr`, its lists, `Bind`,
+   `Quasi`, body `Type`s). They are no longer copied, but the walker still descends
+   every accepted body on every edit, for two reasons: to list the blocks the new
+   snapshot must own, and to mark node ids live for pruning. Make a frozen body an
+   artifact that owns its blocks and records its node ids once, when it is frozen.
+   The snapshot then owns artifacts (one count per function, not one per block),
+   and a body's entries leave the `SemBase` when its artifact dies rather than by
+   failing a liveness scan. This needs the same treatment for retained syntax
+   (`TaggedForm` trees), because a liveness scan that no longer sees body ids can no
+   longer be the rule for anything.
+2. **Declarations in persistent indexes** (`Func` headers, `Sig`, `Extern`,
+   `StructDef`, `ImplDef`, their `Param`/`Type`/name storage, and the position
+   indexes over them — most of the remainder, and all of `publish.retain`'s 17 ms,
+   which is list unions and index rebuilds). This is Phase 2/3 proper: `Cx.sigs` and
+   the `Program` sections stop being lists addressed by position.
+
 ## What the audit says is actually mutated
 
 The whole compiler does not need to become functional. The mutation audit sorts
