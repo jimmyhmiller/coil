@@ -115,6 +115,7 @@ Same workload and machine as the baseline; steady-state median per edit.
 | application side tables as a persistent `SemBase` (`sem_base.coil`) | 3,303,720 B | 55 ms | 17 ms | 6 ms |
 | sealed bodies held as artifacts, not walked into (`retained_heap.coil` `Artifact`) | 3,303,720 B | 28 ms | 17 ms | 6 ms |
 | declaration closures sealed; unchanged runs of records held as **chunk artifacts**; each pass does only its own work | 1,872,632 B | 19 ms | 17 ms | 5 ms |
+| one sealed block per publication; the native program no longer re-made per edit | 1,895,148 B | **8 ms** | 13 ms | 5 ms |
 
 With plain definitions (no `coil.repl` Var policy, so nothing is ever a retirement
 candidate) `publish.retain` is 2 ms, not 17: joint liveness analysis now returns at
@@ -155,8 +156,37 @@ Each pass now does only what it is for: the first answers "what is live" and rec
 ranges, visits or chunk notes; the second lays the pruned graph out and marks no ids
 (`graph-liveness-only!`, `graph-layout-only!`). Mark 7 → 3 ms, rescan 7 → 5 ms.
 
-What is left of the 19 ms: mark 3, rescan 5, copy 4, recording new artifacts 3, pruning
-1. The two-pass shape itself is next: the first pass exists only so weak tables can be
+**A profile, not a guess, found the next one.** `sample` on a 400-edit loop showed
+`graph-range!`, `graph-address` and the page-index lookups at ~15% of all time: every
+sealed range was its own block — tens of thousands, some forty to a 4 KB page — and
+"which block holds this address" walks a page's chain, for every range, visit and
+pointer fixed. Everything a publication seals now goes into **one block**, laid out
+like the snapshot beside it (`allocate-packed-block!`). Blocks: ~28,000 → 4. Snapshot
+17 → 8 ms, and `retain` 18 → 13 because the same lookups ran under it. Protection now
+costs a mapping per publication, not per range, so `jit-session-memory.py` passes with
+`COIL_JIT_PROTECT=1` as well.
+
+Packing has a price, and the memory gate caught it: one long-lived function pins the
+whole block it was sealed in, so anything *transient* sealed beside it is retained
+with it. Two things were being re-made and re-sealed on every edit, and both were
+real waste independent of packing:
+
+- `monomorphize-reusing` re-created the native program wholesale: a newly allocated
+  empty body list for every carried-over function, and every concrete struct and sum
+  re-specialised into fresh field lists that overwrote identical definitions. It now
+  reuses the empty body a declaration already has and keeps a prior definition when
+  the re-specialised one says nothing new (`mono-struct-already?`,
+  `mono-sum-already?`). Records sealed per edit: 831 → 22.
+- `semantic-inherit-resolution!` copies every resolution entry's strings into fresh
+  storage for every candidate, so a run of them is never spelled the same twice. Those
+  two record kinds are left unsealed until inheriting stops copying them.
+
+With both, sealed storage grows 1.2 KB per added function (19.5 KB before the fixes),
+and the plateaus are exact again — from the third submission rather than the first,
+since a block goes when both the next state and the facade one behind it let go.
+
+What is left of the 8 ms: mark 2, rescan 1, copy 2, recording new artifacts ~2, pruning
+~1. The two-pass shape itself is next: the first pass exists only so weak tables can be
 pruned before layout.
 
 The first step moves the *application's* type, binding and resolution entries out

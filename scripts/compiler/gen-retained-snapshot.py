@@ -140,9 +140,12 @@ SEALED_RECORDS={
  ('slice','u8'):9,
  'coil.reader.Sexp':10,
  'coil.compiler.loader.Expansion':11,
- 'coil.compiler.ast.SrcModEntry':12,
- 'coil.compiler.ast.ValueResEntry':13,
- 'coil.compiler.ast.TypeResEntry':14}
+ 'coil.compiler.ast.SrcModEntry':12}
+# NOT the resolver's value and type entries (kinds 13 and 14 are left unused).
+# `semantic-inherit-resolution!` copies every entry's strings into fresh storage for
+# every candidate, so a run of them is never spelled the same twice: sealing them put
+# ~20 KB of new strings into each publication's block, which one long-lived function
+# then pins. They can be sealed once inheriting stops copying them.
 CHUNK_SIZES={}
 def chunk_records(t): return CHUNK_SIZES.get(freeze(t),CHUNK_RECORDS)
 # A run shorter than this is walked: holding a chunk costs more than visiting a few
