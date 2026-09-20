@@ -117,7 +117,18 @@ release them in any order with `jit-env-release!`. `(jit-env-empty)` is the stat
 to build the first one on, `jit-env-valid?` is false for it and for the result of a
 check that failed (then `jit-diagnostic` says why), and `jit-env-defines?` /
 `jit-env-live-function` read a particular state. `jit-reset!` refuses while any is
-held. A session that generates native code refuses `jit-env-check`, as does source
+held.
+
+A check never re-checks what it did not submit, so it reports what it may have
+broken instead: `jit-env-stale-count` / `jit-env-stale-name` list the functions that
+were already in `base`, were not part of this check, and read a function whose
+signature or a struct or sum whose shape this check changed. They are still in the
+new state exactly as they were checked. Check one again by submitting its source
+(`jit-env-definition-source` returns it). A body-only edit reports nothing. Macros,
+constants that mention constants, and impl availability are not tracked yet, and a
+redefined function with trait bounds always counts as changed.
+
+A session that generates native code refuses `jit-env-check`, as does source
 that stages session Code state: both are per-session today, not per-state.
 
 ## Ownership

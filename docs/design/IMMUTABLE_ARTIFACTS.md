@@ -180,7 +180,7 @@ no state, where the design wants the state *with* the failure recorded in it.
 Underneath, a check still pays the snapshot: what changed is who may hold the
 result, not yet what it costs to make.
 
-### The stale set (in progress)
+### The stale set
 
 Measured 2026-09-20: checking `(defn area [(w i64)] …)` against a state where
 `area` takes two arguments and `unit` calls `(area 1 1)` succeeds, and the result
@@ -200,6 +200,25 @@ The compiler's part is to *report*, not to act:
    differs. A body-only edit changes no interface and stales nothing.
 3. The client re-checks what it chooses by submitting that definition's source
    again (`jit-env-definition-source`); the compiler does not decide when.
+
+**Landed.** `dep_index.coil` holds the edges as a persistent `DepBase`, owned by the
+revision like `SemBase`. `compiler-revision-promote-deps!` records what each of a
+compilation's new functions reads (`type-refs/func!`), drops the edges of whatever
+it retired, compares each redefined function, struct and sum with the base's, and
+stores the readers of what changed. `jit-env-stale-count` / `jit-env-stale-name`
+report them and `jit-env-definition-source` returns a definition's own text to check
+again. `jit_env_stale.coil`: a body edit stales nothing; narrowing `area` reports
+exactly `unit` and `box-area`, not their callers; re-checking `unit` then fails for
+the right reason; repairing both leaves nothing stale; a function that stopped
+reading `area` is left alone when it changes again; reshaping `Box` stales only what
+mentions `Box`. Bounded functions are conservatively always "changed" when redefined.
+
+Building it exposed a **bug in retained sessions that predates this work**: a
+function redefined with a different signature kept its *old* signature, so callers
+with the old arity were accepted and callers with the new one refused.
+`check-inherit-signatures!` gave every same-named signature the parent's, including
+for names the candidate redefines; it now does so only for functions the candidate
+inherited. Regression: `jit_redefined_signature.coil`; filed in `coil-bugs`.
 
 Not covered by this first cut, and reported as such rather than guessed at: macro
 bodies (a changed macro stales everything it expanded, which needs expansion reads
