@@ -1392,7 +1392,12 @@ collection with them from a fresh `pm-new`/`pv-new` never copies a node. Reads a
 `(Option (ptr V))`, valid while a collection sharing that node lives and is not
 edited in place), `pm-contains?`, `pm-len`/`pv-len`, and the borrowing cursors
 `pm-iter` (yields `(ptr (PEntry K V))`) and `pv-iter` (yields `(ptr T)`). `PMap`
-hashes through `coil.hashmap`'s `KeyOps`, non-owning ops only. Neither is thread
+hashes through `coil.hashmap`'s `KeyOps`, non-owning ops only. `pm-diff before after
+same visit context` calls `visit` once per key on which two maps differ (a null pair
+marks the side lacking the key; `same` compares two values) and **skips every subtree
+the maps share without reading it**, so diffing a map against an edit of it costs
+what the edit cost. That is how to keep a derived index in step with a persistent
+map: apply diffs, never rescan. Neither is thread
 safe: the counts are plain integers, as in `coil.rc`.
 
 ## Strings & bytes

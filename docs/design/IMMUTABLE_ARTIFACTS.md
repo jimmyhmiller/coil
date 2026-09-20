@@ -451,7 +451,7 @@ own gate. Until the last phase the existing snapshot survives as a shrinking
 | `coil.pmap`, `coil.pvec` (stdlib, public) | done — model-tested against `HashMap`/`ArrayList`, forced hash collisions, three-level growth and collapse, leak-checked allocator, clone/drop balance of owned values, path-copy allocation bound |
 | Page-protection checking mode for sealed blocks | done — `COIL_JIT_PROTECT=1`; `retained_heap` gives each block its own pages and `seal-all!` makes them read-only after the last fixup |
 | Counters for bytes copied at prepare and publish, asserted in `jit-session-memory.py` | not started (`retained-bytes` already reports the publish side) |
-| `pm-diff`: structural diff of two `PMap`s that skips shared subtrees (what `env-diff` is built on) | not started |
+| `pm-diff`: structural diff of two `PMap`s that skips shared subtrees (what `env-diff` is built on) | done — checked against a brute-force model under a real hash, total collisions, and a shallow hash that forces the lone-pair-against-subtree cases; a one-key diff of a 50,000-entry map examines at most two paths |
 | `DefId` interner | not started |
 | Heap generalised from bodies to arbitrary sealed roots | not started |
 | Session code moved out of `driver.coil` | deferred: `feature/live-whole-program` is being edited concurrently and a 4k-line move would conflict with every commit there; do it as the first step of Phase 1, coordinated |
