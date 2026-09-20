@@ -105,6 +105,18 @@ EMPTY_MAPS={
  ('coil.compiler.resolve.SemanticWorkspace','revision_heads'),
  ('coil.compiler.resolve.SemanticWorkspace','failed_parses')}
 
+# Pointer fields whose closure is sealed once and then held as an artifact. The
+# number is the root kind: it names the walk a sealed root is recorded with. A
+# field is only sealed when the driver registered its pointer as a root, which it
+# does for records nothing will write again.
+ARTIFACT_FIELDS={
+ ('coil.compiler.ast.Func','body'):1,
+ ('coil.compiler.ast.Func','params'):2,
+ ('coil.compiler.ast.Extern','params'):6,
+ ('coil.compiler.check.Sig','params'):6,
+ ('coil.compiler.check.Sig','fnptr_params'):6}
+ARTIFACT_KINDS={}
+
 OPAQUE_FIELDS={('coil.compiler.loader.LS','code_session_state'),
                ('coil.compiler.metaengine.MEEntry','fp'),
                # A persistent base is owned by its revision and shared between
@@ -191,8 +203,11 @@ def body(t):
             if isinstance(field,tuple) and field[0]=='ptr' and scalar(field[1]):
                 raise ValueError(('unclassified raw pointer',head,name,field))
             field_walk=call('walk',field,expr)
-            if head=='coil.compiler.ast.Func' and name=='body':
-                # A body sealed by an earlier graph is an artifact: it is held whole and
+            if key in ARTIFACT_FIELDS:
+                pointee=freeze(field[1]); kind=ARTIFACT_FIELDS[key]
+                if ARTIFACT_KINDS.setdefault(kind,pointee)!=pointee:
+                    raise ValueError(('artifact kind names two types',kind,pointee))
+                # A closure sealed by an earlier graph is an artifact: it is held whole and
                 # its recorded ids are marked, instead of being walked into again.
                 field_walk=f'''(let [saved (.freezing g)]
                   (unless (graph-enter-artifact! g (p/cast i64 {expr}))
@@ -242,7 +257,7 @@ while i<len(queue):
 # Checked bodies may freeze only AST/syntax payloads, never mutable phase state
 # or independently owned Source payload headers. Audit the actual generated
 # traversal so a future AST field cannot silently expand this lifetime boundary.
-frozen_pending=[ids[('coil.arraylist.ArrayList','coil.compiler.ast.Expr')]]
+frozen_pending=[ids[t] for t in ARTIFACT_KINDS.values()]
 frozen_seen=set()
 while frozen_pending:
     index=frozen_pending.pop()
@@ -269,8 +284,9 @@ type_names='(defn snapshot-type-name [(kind i64)] (-> (slice u8)) (cond '+ ' '.j
 wrappers=''
 for name,t in zip(('scan-loader!','scan-program!','scan-resolution!','scan-meta-entries!','scan-syntax!'), ROOTS):
     wrappers+='(defn '+name+' [(g (ptr Graph)) (root (ptr '+render(t)+'))] (-> i64) ('+ident(t)+'-scan g root))\n'
-# The walk a sealed body is recorded with, as an erased entry point.
-wrappers+='(defn scan-body-erased [(g (ptr Graph)) (body (ptr i8))] (-> i64) ('+ident(('coil.arraylist.ArrayList','coil.compiler.ast.Expr'))+'-scan-erased g body))\n'
+# The walk a sealed root of each kind is recorded with.
+wrappers+='(defn artifact-scan [(kind i64)] (-> (fnptr c [(ptr Graph) (ptr i8)] i64)) (cond '+' '.join(
+    '(= kind '+str(k)+') (p/fnptr-of '+ident(t)+'-scan-erased)' for k,t in sorted(ARTIFACT_KINDS.items()))+' :else (do (abort) (p/fnptr-of '+ident(ARTIFACT_KINDS[1])+'-scan-erased))))\n'
 result=header+imports+'\n'+''.join(output)+type_names+wrappers
 target=ROOT/'src/compiler/retained_snapshot.coil'
 if '--check' in sys.argv:
