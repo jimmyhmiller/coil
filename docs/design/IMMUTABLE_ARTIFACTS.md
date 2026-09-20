@@ -1,6 +1,9 @@
 # Immutable artifacts and persistent revisions
 
-Status: **Phase 0 in progress; architecture revised 2026-09-19** (see "The goal").
+Status: **Phase 0 done; the semantic side tables, sealed-closure artifacts, whole-snapshot
+protection, compiler states as values and the stale set have landed (2026-09-20, released).
+The flat accumulated `Program` is the remaining structural work.** Architecture revised
+2026-09-19 (see "The goal").
 Written 2026-09-19 against
 `feature/live-whole-program` at `d88428e`. It continues the path sketched in
 live-poc-coil's `docs/INCREMENTAL_COMPILER_BOUNDARIES.md` ("Revision storage")
@@ -265,6 +268,8 @@ before), with no side-table records among them. The rest, by share: `Expr` 20%,
 name strings 10%, `Type` 8%, `ArrayList Expr` 7%, `(slice u8) → i64` index entries
 6% (`sigidx`, `checked_functions`, …), `Param`, `Sexp`, `Func`, `Extern`, `Sig`.
 
+*(Slice 1 below has landed — see "Progress against the baseline". Slice 2 is what remains.)*
+
 1. **Stop walking into frozen bodies** (≈35% of records: `Expr`, its lists, `Bind`,
    `Quasi`, body `Type`s). They are no longer copied, but the walker still descends
    every accepted body on every edit, for two reasons: to list the blocks the new
@@ -280,6 +285,17 @@ name strings 10%, `Type` 8%, `ArrayList Expr` 7%, `(slice u8) → i64` index ent
    indexes over them — most of the remainder, and all of `publish.retain`'s 17 ms,
    which is list unions and index rebuilds). This is Phase 2/3 proper: `Cx.sigs` and
    the `Program` sections stop being lists addressed by position.
+
+   Scoped 2026-09-20: even the smallest container, `externs`, has ~45 consumers on
+   the session path and most *iterate the whole list* with their own meaning
+   (resolve's merge and definition-name tables, mono's aliasing, metalower, the
+   comptime closure, the driver's root names). So this is not a per-container patch.
+   It is Phase 1 as planned: one read interface (`env-*`: look up by name, enumerate)
+   that every phase goes through, introduced mechanically with the gates as the
+   contract, *then* a persistent representation behind it. The pattern to copy is
+   `SemBase`: a pass records into its own mutable containers and reads through to a
+   persistent base on a miss; a finished compile promotes only what it added. What
+   that buys is measured: a check that publishes nothing costs 3–4 ms today.
 
 ## What the audit says is actually mutated
 
@@ -642,10 +658,10 @@ own gate. Until the last phase the existing snapshot survives as a shrinking
 | Baseline: bytes and ms per edit, gate green | done — see "Baseline" above |
 | `coil.pmap`, `coil.pvec` (stdlib, public) | done — model-tested against `HashMap`/`ArrayList`, forced hash collisions, three-level growth and collapse, leak-checked allocator, clone/drop balance of owned values, path-copy allocation bound |
 | Page-protection checking mode for sealed blocks | done — `COIL_JIT_PROTECT=1`; `retained_heap` gives each block its own pages and `seal-all!` makes them read-only after the last fixup |
-| Counters for bytes copied at prepare and publish, asserted in `jit-session-memory.py` | not started (`retained-bytes` already reports the publish side) |
+| Counters and timing | done for publication: `retained-bytes`, `artifacts-held/-recorded/-roots` in `COIL_JIT_TRACE`; `jit.retain.*`, `jit.snapshot.*`, `jit.env.check` spans in `COIL_TRACE`. The prepare side has no byte counter yet |
 | `pm-diff`: structural diff of two `PMap`s that skips shared subtrees (what `env-diff` is built on) | done — checked against a brute-force model under a real hash, total collisions, and a shallow hash that forces the lone-pair-against-subtree cases; a one-key diff of a 50,000-entry map examines at most two paths |
-| `DefId` interner | not started |
-| Heap generalised from bodies to arbitrary sealed roots | not started |
+| `DefId` interner | not started — names are still the key everywhere (`SemBase` keys by node id, `DepBase` by qualified name), which has been enough so far |
+| Heap generalised from bodies to arbitrary sealed roots | done — `Artifact` in `retained_heap.coil`, sealed per registered pointer field (`ARTIFACT_FIELDS` in the generator); bodies and parameter lists use it |
 | Session code moved out of `driver.coil` | deferred: `feature/live-whole-program` is being edited concurrently and a 4k-line move would conflict with every commit there; do it as the first step of Phase 1, coordinated |
 
 **What protection found on its first run.** The `replace` probe died with SIGBUS
