@@ -143,6 +143,11 @@ $COIL run tests/metaprogramming/partial_model_test.coil >/dev/null 2>&1; rc=$?
 [ $rc -eq 0 ] || { echo "partial model test FAILED (exit $rc, want 0)"; exit 1; }
 echo "partial model: OK (model-status, check-error, type-of and code-decl on a failing program)"
 
+echo "=== 12a'. COMPILE-TIME-ONLY TYPES: a struct holding Code, and the helpers that take it, stay out of the runtime program ==="
+$COIL test tests/metaprogramming/code_field_struct_test.coil > "$OUT/code-field.txt" 2>&1; rc=$?
+[ $rc -eq 0 ] || { cat "$OUT/code-field.txt"; echo "compile-time-only types FAILED (exit $rc): codegen used to abort on a struct with a Code field"; exit 1; }
+echo "compile-time-only types: OK (Code held directly, through a struct, in a sum payload, as a local, and under an impl)"
+
 echo "=== 12b. AOT REGEX MACRO: compile-time parser -> allocation-free state machine ==="
 $COIL run tests/regex_test.coil >/dev/null 2>&1; rc=$?
 [ $rc -eq 0 ] || { echo "AOT regex semantics FAILED (exit $rc)"; exit 1; }

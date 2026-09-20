@@ -20,6 +20,8 @@
 (import "coil.compiler.parser" :use *)
 (import "coil.compiler.resolve" :use *)
 (import "coil.compiler.loader" :use *)
+(import "coil.compiler.type_references" :as type-refs)
+(import "coil.compiler.retained_graph" :use [GraphKey graph-keyops])
 
 (defstruct Subst
   [(names (ptr (ArrayList (slice u8)))) (types (ptr (ArrayList Type)))])
@@ -74,7 +76,10 @@
    (origins (ArrayList MonoOrigin))
    (trait_uses (ArrayList MonoTraitUse))
    (current_source (slice u8))
-   (retained_funcs (HashMap (slice u8) i64))])
+   (retained_funcs (HashMap (slice u8) i64))
+   ; Structs and sums whose values exist only at compile time; see
+   ; `phase-only-nominals`. They get no runtime layout.
+   (phase_only (ptr (HashMap (slice u8) i64)))])
 
 ; ---- small constructors -----------------------------------------------------
 (defn mk-field [(name (slice u8)) (ty Type)] (-> Field)
@@ -2343,28 +2348,43 @@
     (if (load failed) (Err [i64 Diag] (load err)) (Ok [i64 Diag] 0))))
 
 ; ---- orchestration ------------------------------
-(defn mono-phase-only-type? [(t (ptr Type))] (-> bool)
+;;; Whether a value of this type can exist only at compile time: it is `Code`, or is
+;;; built from a type that is. `nominals` names the structs and sums already known to
+;;; be such (see `phase-only-nominals`), so that holding a `Code` in a field, or a
+;;; struct that does, counts the same as mentioning `Code` directly. Neither this test
+;;; nor its twin for function signatures used to look through a nominal type: a struct
+;;; with a `Code` field was correctly left out of the runtime layouts, a helper taking
+;;; a pointer to it was not recognized as compile-time code, and codegen then met a
+;;; struct nobody had laid out and aborted.
+(defn mono-phase-only-type? [(t (ptr Type)) (nominals (ptr (HashMap (slice u8) i64)))] (-> bool)
   (match (load t)
     (TCode [] true)
     (TCodeBuilder [] true)
-    (TPtr [inner] (mono-phase-only-type? inner))
-    (TRef [_ inner] (mono-phase-only-type? inner))
-    (TArray [inner _] (mono-phase-only-type? inner))
-    (TSlice [inner] (mono-phase-only-type? inner))
-    (TVec [inner _] (mono-phase-only-type? inner))
+    (TStruct [name] (hm-contains? [(slice u8) i64] (load nominals) name))
+    (TPtr [inner] (mono-phase-only-type? inner nominals))
+    (TRef [_ inner] (mono-phase-only-type? inner nominals))
+    (TArray [inner _] (mono-phase-only-type? inner nominals))
+    (TSlice [inner] (mono-phase-only-type? inner nominals))
+    (TVec [inner _] (mono-phase-only-type? inner nominals))
     (TFn [_ params ret]
-         (or (mono-phase-only-types? params 0 (len (load params)))
-             (mono-phase-only-type? ret)))
-    (TApp [_ args] (mono-phase-only-types? args 0 (len (load args))))
+         (or (mono-phase-only-types? params 0 (len (load params)) nominals)
+             (mono-phase-only-type? ret nominals)))
+    (TApp [name args]
+          (or (hm-contains? [(slice u8) i64] (load nominals) name)
+              (mono-phase-only-types? args 0 (len (load args)) nominals)))
     (_ false)))
 
-(defn mono-phase-only-types? [(types (ptr (ArrayList Type))) (i i64) (n i64)] (-> bool)
+(defn mono-phase-only-types? [(types (ptr (ArrayList Type)))
+                              (i i64)
+                              (n i64)
+                              (nominals (ptr (HashMap (slice u8) i64)))] (-> bool)
   (if (>= i n)
       false
-      (or (mono-phase-only-type? (al-elem [Type] types i))
-          (mono-phase-only-types? types (primitive/iadd i 1) n))))
+      (or (mono-phase-only-type? (al-elem [Type] types i) nominals)
+          (mono-phase-only-types? types (primitive/iadd i 1) n nominals))))
 
-(defn mono-phase-only-fields? [(fields (ptr (ArrayList Field)))] (-> bool)
+(defn mono-phase-only-fields? [(fields (ptr (ArrayList Field)))
+                               (nominals (ptr (HashMap (slice u8) i64)))] (-> bool)
   (let [n (len (load fields))
         (mut i) 0
         (mut found) false]
@@ -2374,13 +2394,15 @@
                 (when (mono-phase-only-type? (field (al-elem [Field]
                                                              fields
                                                              (load i))
-                                                    ty))
+                                                    ty)
+                                             nominals)
                   (store! found true)
                   0)
                 (set! i (primitive/iadd (load i) 1)))))
     (load found)))
 
-(defn mono-phase-only-variants? [(variants (ptr (ArrayList Variant)))] (-> bool)
+(defn mono-phase-only-variants? [(variants (ptr (ArrayList Variant)))
+                                 (nominals (ptr (HashMap (slice u8) i64)))] (-> bool)
   (let [n (len (load variants))
         (mut i) 0
         (mut found) false]
@@ -2390,11 +2412,39 @@
                 (when (mono-phase-only-fields? (load (field (al-elem [Variant]
                                                                      variants
                                                                      (load i))
-                                                            fields)))
+                                                            fields))
+                                               nominals)
                   (store! found true)
                   0)
                 (set! i (primitive/iadd (load i) 1)))))
     (load found)))
+
+;;; The structs and sums of `p` whose values can exist only at compile time, by name.
+;;; Found to a fixed point, because such a type may hold another rather than `Code`
+;;; itself. A generic definition is in the set when its own fields say so; an
+;;; instantiation with a compile-time argument is caught at the use by the type test.
+(defn phase-only-nominals [(a (dyn Allocator)) (p (ptr Program))] (-> (ptr (HashMap (slice u8) i64)))
+  (let [found (box! a
+                    (HashMap (slice u8) i64)
+                    (hm-new [(slice u8) i64] a (str-keyops-borrowed)))]
+    (loop
+      (let [before (len (load found))]
+        (for [i 0 (len (load (.structs p)))]
+          (let [sp (al-elem [StructDef] (.structs p) i)]
+            (unless (hm-contains? [(slice u8) i64] (load found) (.name sp))
+              (when (mono-phase-only-fields? (load (field sp fields)) found)
+                (hm-put! found (.name sp) 0)
+                0)
+              0)))
+        (for [i 0 (len (load (.sums p)))]
+          (let [sp (al-elem [SumDef] (.sums p) i)]
+            (unless (hm-contains? [(slice u8) i64] (load found) (.name sp))
+              (when (mono-phase-only-variants? (load (field sp variants)) found)
+                (hm-put! found (.name sp) 0)
+                0)
+              0)))
+        (when (= before (len (load found))) (break))))
+    found))
 
 (defn collect-generic-structs [(a (dyn Allocator)) (p (ptr Program))] (-> (ptr (ArrayList StructDef)))
   (let [fs (load (field p structs))
@@ -2497,7 +2547,8 @@
                   (when (and (= (len (load (field sp type_params)))
                                 (primitive/cast i64 0))
                              (not (mono-phase-only-fields? (load (field sp
-                                                                        fields)))))
+                                                                        fields))
+                                                           (.phase_only m))))
                     (match (resolve-fields m (load (field sp fields)) map)
                       (Err [d] (do (store! err d) (store! failed true) (break)))
                       (Ok [nfs]
@@ -2534,7 +2585,8 @@
                   (when (and (= (len (load (field sp type_params)))
                                 (primitive/cast i64 0))
                              (not (mono-phase-only-variants? (load (field sp
-                                                                          variants)))))
+                                                                          variants))
+                                                             (.phase_only m))))
                     (match (resolve-sum m sp map (load (field sp name)))
                       (Err [d] (do (store! err d) (store! failed true) (break)))
                       (Ok [ns]
@@ -2835,6 +2887,7 @@
                             (prior (ptr Program))] (-> (Result (ptr Program) Diag))
   (try (let [m (box! a MonoCtx (primitive/zeroed MonoCtx))]
          (set! (.a m) a)
+         (set! (.phase_only m) (phase-only-nominals a p))
          (set! (.gfuncs m) (collect-generic-funcs a p))
          (set! (.gstructs m) (collect-generic-structs a p))
          (set! (.gsums m) (collect-generic-sums a p))
@@ -2962,38 +3015,10 @@
 ; synthesized dispatch wrapper uses TPtr. Code can also be nested in a result such
 ; as `(Option Code)` (Iterator.next is the canonical case). Walk every compound type:
 ; a runtime signature cannot contain a comptime-only value at any depth.
-(defn type-list-has-comptime-code [(ts (ptr (ArrayList Type)))] (-> bool)
-  (let [n (len (load ts))
-        (mut i) 0
-        (mut found) false]
-    (loop (if (or (load found) (>= (load i) n))
-              (break)
-              (do
-                (when (type-is-comptime-code (al-elem [Type] ts (load i)))
-                  (store! found true)
-                  0)
-                (set! i (primitive/iadd (load i) 1)))))
-    (load found)))
-
-(defn type-is-comptime-code [(tp (ptr Type))] (-> bool)
-  (match (load tp)
-    (TCode [] true)
-    (TCodeBuilder [] true)
-    (TRef [_ inner] (type-is-comptime-code inner))
-    (TPtr [inner] (type-is-comptime-code inner))
-    (TSlice [inner] (type-is-comptime-code inner))
-    (TArray [inner _] (type-is-comptime-code inner))
-    (TVec [inner _] (type-is-comptime-code inner))
-    (TApp [_ args] (type-list-has-comptime-code args))
-    (TFn [_ params ret]
-         (or (type-list-has-comptime-code params)
-             (type-is-comptime-code ret)))
-    (_ false)))
-
-(defn func-has-code [(fp (ptr Func))] (-> bool)
+(defn func-has-code [(fp (ptr Func)) (nominals (ptr (HashMap (slice u8) i64)))] (-> bool)
   (let [rt (primitive/alloc-stack Type)]
     (set! rt (.ret fp))
-    (if (type-is-comptime-code rt)
+    (if (mono-phase-only-type? rt nominals)
         true
         (let [ps (load (field fp params))
               n (len ps)
@@ -3005,7 +3030,7 @@
                       (let [pp (al-elem [Param] ps (load i))
                             pt (primitive/alloc-stack Type)]
                         (set! pt (.ty pp))
-                        (when (type-is-comptime-code pt) (store! found true) 0))
+                        (when (mono-phase-only-type? pt nominals) (store! found true) 0))
                       (set! i (primitive/iadd (load i) 1)))))
           (load found)))))
 
@@ -3135,6 +3160,25 @@
 (defn func-body-has-code-node? [(fp (ptr Func))] (-> bool)
   (expr-list-has-code-node? (load (field fp body))))
 
+;;; Whether `fp` mentions, anywhere in it, a struct or sum that exists only at compile
+;;; time: a local of that type, a cast to it, a constructor of it. Such a function has
+;;; no `Code` in its signature and may have no `Code` operation in its body, and is
+;;; compile-time code all the same, because nothing it names has a runtime layout.
+(defn func-mentions-phase-only? [(a (dyn Allocator))
+                                 (fp (ptr Func))
+                                 (nominals (ptr (HashMap (slice u8) i64)))] (-> bool)
+  (let [(mut refs) (hm-new [(slice u8) i64] a (str-keyops-borrowed))
+        (mut seen) (hm-new [GraphKey i64] a (graph-keyops))
+        (mut found) false]
+    (type-refs/func! (mut refs) (mut seen) fp)
+    (for [k 0 (.cap refs)]
+      (let [e (primitive/index (.slots refs) k)]
+        (when (and (= (.state e) 1)
+                   (hm-contains? [(slice u8) i64] (load nominals) (.key e)))
+          (set! found true)
+          0)))
+    (load found)))
+
 (defn func-calls-dropped? [(a (dyn Allocator))
                            (fp (ptr Func))
                            (names (ptr FnNames))
@@ -3156,6 +3200,7 @@
   ; dropped too. Calls are collected once and propagated over reverse edges.
   (let [fs (load (field p funcs))
         names (prog-fn-names p a)
+        nominals (phase-only-nominals a p)
         (mut dropped) (al-new [(slice u8)] a)
         (mut dropped-index) (hm-new [(slice u8) i64] a (str-keyops-borrowed))
         ; callee name -> index of its latest (caller, next) link
@@ -3165,7 +3210,11 @@
     (for [i 0 (len (load fs))]
       (let [fp (al-elem [Func] fs i)
             calls (box! a SBox (primitive/zeroed SBox))]
-        (when (or (func-has-code fp) (func-body-has-code-node? fp))
+        (when (or (func-has-code fp nominals)
+                  (or (func-body-has-code-node? fp)
+                      ; Only a program that has such a type pays for looking.
+                      (and (> (len (load nominals)) 0)
+                           (func-mentions-phase-only? a fp nominals))))
           (unless (hm-contains? [(slice u8) i64] dropped-index (load (field fp name)))
             (hm-put! (mut dropped-index) (load (field fp name)) 0)
             (push! (mut dropped) (load (field fp name))) 0)
@@ -3192,7 +3241,8 @@
     (box-al [(slice u8)] a (load dropped))))
 
 (defn drop-code-impls [(a (dyn Allocator)) (p (ptr Program))] (-> i64)
-  (let [is (load (field p impls))
+  (let [nominals (phase-only-nominals a p)
+        is (load (field p impls))
         n (len (load is))
         (mut out) (al-new [ImplDef] a)
         (mut i) 0]
@@ -3200,7 +3250,7 @@
               (break)
               (do
                 (let [ip (al-elem [ImplDef] is (load i))]
-                  (unless (type-is-comptime-code (field ip self_type))
+                  (unless (mono-phase-only-type? (field ip self_type) nominals)
                     (push! (mut out) (load ip))))
                 (set! i (primitive/iadd (load i) 1)))))
     (set! (.impls p) (box-al [ImplDef] a (load out)))
