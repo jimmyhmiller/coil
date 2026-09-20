@@ -416,7 +416,7 @@ and the `.methods` pointer comparisons.
 
 **Phase 4 — loader, expansion, resolution.** `ModuleEnv`, `ParsedForm`,
 `ExpandedForm`, `ResolvedForm`; `SemanticWorkspace` entries become artifacts and
-its indexes become txn overlay. Fix `TaggedForm` repair and slot recycling.
+its indexes become the compile call's overlay. Fix `TaggedForm` repair and slot recycling.
 Deletes `ls-inherit!`, `semantic-inherit-resolution!`, `res-own-name`.
 
 **Phase 5 — mono, meta, Code, native; then evict the policy.** `monomorphize-reusing`
