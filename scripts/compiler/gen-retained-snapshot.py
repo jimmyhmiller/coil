@@ -117,6 +117,85 @@ ARTIFACT_FIELDS={
  ('coil.compiler.check.Sig','fnptr_params'):6}
 ARTIFACT_KINDS={}
 
+# Declaration records an accepted program is made of. Their closures are sealed,
+# and a run of them that is spelled exactly like a run sealed before is held as one
+# chunk artifact instead of being walked record by record. That is what makes the
+# cost of publishing follow what changed: the flat arrays are rebuilt on every
+# edit, but the records in them mostly are not. The number is the chunk kind.
+SEALED_RECORDS={
+ 'coil.compiler.ast.Func':1,
+ 'coil.compiler.ast.Extern':2,
+ 'coil.compiler.check.Sig':3,
+ 'coil.compiler.ast.StructDef':4,
+ 'coil.compiler.ast.SumDef':5,
+ 'coil.compiler.ast.TraitDef':6,
+ 'coil.compiler.ast.ImplDef':7,
+ # NOT the slots of the name -> position tables (kind 8 is left unused). Measured:
+ # their values are list positions, so removing one function renumbers every later
+ # one, and hashing scatters those across the table -- 177 of its chunks were
+ # re-recorded on every edit. Those tables stop churning when they map a name to
+ # something stable instead of a position; chunking cannot fix that from outside.
+ # Lists of names, and the loader's and resolver's own record lists: rebuilt by the
+ # pruning passes on every edit, unchanged in content on almost all of them.
+ ('slice','u8'):9,
+ 'coil.reader.Sexp':10,
+ 'coil.compiler.loader.Expansion':11,
+ 'coil.compiler.ast.SrcModEntry':12,
+ 'coil.compiler.ast.ValueResEntry':13,
+ 'coil.compiler.ast.TypeResEntry':14}
+CHUNK_SIZES={}
+def chunk_records(t): return CHUNK_SIZES.get(freeze(t),CHUNK_RECORDS)
+# A run shorter than this is walked: holding a chunk costs more than visiting a few
+# records, and a freshly submitted form is made of hundreds of tiny nested lists.
+CHUNK_MINIMUM=8
+def occupied(t,node):
+    # Only an occupied slot has a key and a value; the rest of the table is whatever
+    # was there before, and is neither walked nor part of a chunk's spelling.
+    return '(= (.state '+node+') 1)' if isinstance(t,tuple) and t[0]=='coil.hashmap.Entry' else 'true'
+CHUNK_RECORDS=64
+
+# A record spelled out field by field, with an address for every pointer: two runs
+# with the same spelling are the same records. Padding never enters it, which a
+# comparison of their bytes could not promise.
+ident_ids={}; ident_queue=[]
+def ident_name(t):
+    t=freeze(t)
+    if t not in ident_ids: ident_ids[t]=len(ident_ids); ident_queue.append(t)
+    return 'identity-'+str(ident_ids[t])
+def ident_call(t,value): return '('+ident_name(t)+' out '+value+')'
+def ident_body(t):
+    push=lambda v:'(push! out '+v+')'
+    if isinstance(t,str) and t in PRIMITIVES:
+        if t in ('void','never'): return '0'
+        if t=='bool': return push('(if value 1 0)')
+        if t in ('f32','f64'):
+            wide='i32' if t=='f32' else 'i64'
+            return '(let [(mut bits) value] '+push('(p/cast i64 (load (p/cast (ptr '+wide+') (mut bits))))')+')'
+        if t in ('Code','CodeBuilder'): raise ValueError(('no identity for a compile-time value',t))
+        return push('(p/cast i64 value)')
+    if isinstance(t,tuple):
+        head=t[0]
+        if head in ('ptr','ref','mut'): return push('(p/cast i64 value)')
+        if head=='fnptr': return push('(p/cast i64 (p/cast (ptr i8) value))')
+        if head=='slice': return '(do '+push('(p/cast i64 (slice-data value))')+' '+push('(len value)')+' 0)'
+        if head in ('dyn','array'): raise ValueError(('no identity for',t))
+    head,mod,kind,params,tail=definition(t)
+    if head=='coil.arraylist.ArrayList':
+        return '(do '+push('(p/cast i64 (.data value))')+' '+push('(.len value)')+' 0)'
+    if head=='coil.hashmap.HashMap':
+        return '(do '+push('(p/cast i64 (.slots value))')+' '+push('(.cap value)')+' '+push('(.len value)')+' 0)'
+    if head=='coil.hashmap.Entry':
+        return ('(do '+push('(.state value)')+' (when (= (.state value) 1) '
+                +' '.join(ident_call(qualify(f[1],mod,params),'(.'+f[0]+' value)') for f in tail[0] if f[0]!='state')+' 0) 0)')
+    if kind=='defstruct':
+        return '(do '+' '.join(ident_call(qualify(f[1],mod,params),'(.'+f[0]+' value)') for f in tail[0])+' 0)'
+    arms=[]
+    for index,variant in enumerate(tail):
+        name=mod+'.'+variant[0];fields=variant[1] if len(variant)>1 else [];args=['v'+str(i) for i in range(len(fields))]
+        types=[qualify(f[1],mod,params) for f in fields]
+        arms.append('('+name+' ['+' '.join(args)+'] (do '+push(str(index))+' '+' '.join(ident_call(f,a) for f,a in zip(types,args))+' 0))')
+    return '(match value '+' '.join(arms)+')'
+
 OPAQUE_FIELDS={('coil.compiler.loader.LS','code_session_state'),
                ('coil.compiler.metaengine.MEEntry','fp'),
                # A persistent base is owned by its revision and shared between
@@ -159,6 +238,22 @@ def body(t):
         inner=t[1];ity=render(inner)
         walk=f'''(do (graph-range! g (p/cast i64 (.data value)) (* (.len value) (p/sizeof {ity})) (p/alignof {ity}))
           (for [i 0 (.len value)] {('0' if scalar(inner) else call('scan',inner,'(p/index (.data value) i)'))}) 0)'''
+        if freeze(inner) in SEALED_RECORDS:
+            chunk_kind=SEALED_RECORDS[freeze(inner)]; stem=ident(inner)
+            walk=f'''(do (graph-range! g (p/cast i64 (.data value)) (* (.len value) (p/sizeof {ity})) (p/alignof {ity}))
+          (let [(mut at) 0]
+            (loop
+              (when (>= (load at) (.len value)) (break))
+              (let [count (if (< (- (.len value) (load at)) {chunk_records(inner)}) (- (.len value) (load at)) {chunk_records(inner)})
+                    first (p/index (.data value) (load at))]
+                (if (< count {CHUNK_MINIMUM})
+                  (for [k 0 count] ({stem}-seal-scan g (p/index first k)))
+                  (unless (graph-chunk-held? g {chunk_kind} (p/cast (ptr i8) first) count (p/fnptr-of {stem}-chunk-identify))
+                    (for [k 0 count] ({stem}-seal-scan g (p/index first k)))
+                    (graph-note-chunk! g {chunk_kind} (p/cast i64 first) count)
+                    0))
+                (set! at (+ (load at) count)))))
+          0)'''
         value=f'''(coil.arraylist.ArrayList :data (p/cast (ptr {ity}) (if (= (.len value) 0) 0 (graph-address g (p/cast i64 (.data value)))))
           :len (.len value) :cap (.len value) :alc (.destination g))'''
         return walk,value
@@ -169,6 +264,23 @@ def body(t):
           (for [i 0 (.cap value)]
             (let [item (p/index (.slots value) i)]
               (when (= (.state item) 1) {call('scan',entry,'item')} 0))) 0)'''
+        if freeze(entry) in SEALED_RECORDS:
+            chunk_kind=SEALED_RECORDS[freeze(entry)]; stem=ident(entry)
+            walk=f'''(do (graph-range! g (p/cast i64 (.slots value)) (* (.cap value) (p/sizeof {ety})) (p/alignof {ety}))
+          {call('walk',('ptr','coil.hashmap.KeyOps'),'(.ops value)')}
+          (let [(mut at) 0]
+            (loop
+              (when (>= (load at) (.cap value)) (break))
+              (let [count (if (< (- (.cap value) (load at)) {chunk_records(entry)}) (- (.cap value) (load at)) {chunk_records(entry)})
+                    first (p/index (.slots value) (load at))]
+                (unless (graph-chunk-held? g {chunk_kind} (p/cast (ptr i8) first) count (p/fnptr-of {stem}-chunk-identify))
+                  (for [k 0 count]
+                    (let [item (p/index first k)]
+                      (when (= (.state item) 1) ({stem}-seal-scan g item) 0)))
+                  (graph-note-chunk! g {chunk_kind} (p/cast i64 first) count)
+                  0)
+                (set! at (+ (load at) count)))))
+          0)'''
         value=f'''(coil.hashmap.HashMap :slots (p/cast (ptr {ety}) (if (= (.cap value) 0) 0 (graph-address g (p/cast i64 (.slots value)))))
           :cap (.cap value) :len (.len value) :tombs (.tombs value) :alc (.destination g)
           :ops {call('value',('ptr','coil.hashmap.KeyOps'),'(.ops value)')})'''
@@ -176,15 +288,15 @@ def body(t):
     if kind=='defstruct':
         walks=[]; fields=[]
         if head in ('coil.compiler.ast.Expr','coil.reader.Sexp'):
-            walks.append('(set! (mut (.live-nids g)) (.nid value) 0)')
+            walks.append('(when (.liveness g) (set! (mut (.live-nids g)) (.nid value) 0) 0)')
         for name,raw,*rest in tail[0]:
             field=qualify(raw,mod,params);expr='(.'+name+' value)';key=(head,name)
             if name=='source' and field=='i64' and head!='coil.compiler.ast.SrcModEntry':
-                walks.append('(set! (mut (.live-sources g)) '+expr+' 0)')
-            if name=='ctxt' and field=='i64': walks.append('(set! (mut (.live-contexts g)) '+expr+' 0)')
+                walks.append('(when (.liveness g) (set! (mut (.live-sources g)) '+expr+' 0) 0)')
+            if name=='ctxt' and field=='i64': walks.append('(when (.liveness g) (set! (mut (.live-contexts g)) '+expr+' 0) 0)')
             if head=='coil.compiler.ast.CoreDeclBox' and name in ('srcs','ctxts'):
                 target='live-sources' if name=='srcs' else 'live-contexts'
-                walks.append('(unless (= (p/cast i64 '+expr+') 0) (for [i 0 (len (load '+expr+'))] (set! (mut (.'+target+' g)) (get (load '+expr+') i) 0)) 0)')
+                walks.append('(unless (or (not (.liveness g)) (= (p/cast i64 '+expr+') 0)) (for [i 0 (len (load '+expr+'))] (set! (mut (.'+target+' g)) (get (load '+expr+') i) 0)) 0)')
 
             if key in EMPTY_LISTS:
                 fields+=[':'+name, '(al-new ['+render(field[1])+'] (.destination g))'];continue
@@ -216,7 +328,7 @@ def body(t):
             walks.append(field_walk);fields+=[':'+name,call('value',field,expr)]
         if head in ('coil.compiler.ast.ValueResEntry','coil.compiler.ast.TypeResEntry'):
             walks=['(set! (.weak-alias g) true)']+walks+['(set! (.weak-alias g) false)']
-        if head=='coil.reader.Sexp': walks.append('(set! (mut (.live-scopes g)) (.hyg value) 0)')
+        if head=='coil.reader.Sexp': walks.append('(when (.liveness g) (set! (mut (.live-scopes g)) (.hyg value) 0) 0)')
         walk='(do '+' '.join(walks)+' 0)'
         value='('+head+' '+' '.join(fields)+')'
         if head=='coil.compiler.loader.Source':
@@ -253,11 +365,30 @@ while i<len(queue):
     ({name}-walk g (load node)) 0) 0)
 (defn {name}-scan-erased [(g (ptr Graph)) (node (ptr i8))] (-> i64)
   ({name}-scan g (p/cast (ptr {ty}) node)))
-'''];i+=1
+''']
+    if freeze(t) in SEALED_RECORDS:
+        # The record itself belongs to whatever array holds it and is relocated with
+        # it; what it points to is sealed.
+        output += [f'''
+(defn {name}-seal-scan [(g (ptr Graph)) (node (ptr {ty}))] (-> i64)
+  (when (graph-enter-typed! g (p/cast i64 node) (p/sizeof {ty}) (p/alignof {ty}) {i+1} (p/fnptr-of {name}-fix) (p/fnptr-of {name}-scan-erased))
+    (let [saved (.freezing g)]
+      (unless (= (p/cast i64 (.heap g)) 0) (set! (.freezing g) true) 0)
+      ({name}-walk g (load node))
+      (set! (.freezing g) saved) 0) 0) 0)
+(defn {name}-walk-erased [(g (ptr Graph)) (node (ptr i8))] (-> i64)
+  (when {occupied(t,'(p/cast (ptr '+ty+') node)')} ({name}-walk g (load (p/cast (ptr {ty}) node))) 0) 0)
+(defn {name}-chunk-identify [(out (ptr (ArrayList i64))) (first (ptr i8)) (count i64)] (-> i64)
+  (for [k 0 count] {ident_call(t,'(load (p/index (p/cast (ptr '+ty+') first) k))')}) 0)
+''']
+    i+=1
 # Checked bodies may freeze only AST/syntax payloads, never mutable phase state
 # or independently owned Source payload headers. Audit the actual generated
 # traversal so a future AST field cannot silently expand this lifetime boundary.
 frozen_pending=[ids[t] for t in ARTIFACT_KINDS.values()]
+# A sealed record is not itself sealed; everything its walk reaches is.
+for record in SEALED_RECORDS:
+    frozen_pending.extend(int(n) for n in re.findall(r'snapshot-(\d+)-(?:walk|scan)\b',typed_walks[ids[record]]))
 frozen_seen=set()
 while frozen_pending:
     index=frozen_pending.pop()
@@ -287,7 +418,18 @@ for name,t in zip(('scan-loader!','scan-program!','scan-resolution!','scan-meta-
 # The walk a sealed root of each kind is recorded with.
 wrappers+='(defn artifact-scan [(kind i64)] (-> (fnptr c [(ptr Graph) (ptr i8)] i64)) (cond '+' '.join(
     '(= kind '+str(k)+') (p/fnptr-of '+ident(t)+'-scan-erased)' for k,t in sorted(ARTIFACT_KINDS.items()))+' :else (do (abort) (p/fnptr-of '+ident(ARTIFACT_KINDS[1])+'-scan-erased))))\n'
-result=header+imports+'\n'+''.join(output)+type_names+wrappers
+identity_output=[]; k=0
+while k<len(ident_queue):
+    t=ident_queue[k]
+    identity_output.append('(defn '+ident_name(t)+' [(out (ptr (ArrayList i64))) (value '+render(t)+')] (-> i64) '+ident_body(t)+' 0)\n')
+    k+=1
+def dispatch(name,result,pick):
+    return '(defn '+name+' [(kind i64)] (-> '+result+') (cond '+' '.join(
+        '(= kind '+str(kind)+') '+pick(record) for record,kind in sorted(SEALED_RECORDS.items(),key=lambda e:e[1]))+' :else (do (abort) '+pick(min(SEALED_RECORDS.items(),key=lambda e:e[1])[0])+')))\n'
+wrappers+=dispatch('chunk-walk','(fnptr c [(ptr Graph) (ptr i8)] i64)',lambda r:'(p/fnptr-of '+ident(r)+'-walk-erased)')
+wrappers+=dispatch('chunk-identify','(fnptr c [(ptr (ArrayList i64)) (ptr i8) i64] i64)',lambda r:'(p/fnptr-of '+ident(r)+'-chunk-identify)')
+wrappers+=dispatch('chunk-stride','i64',lambda r:'(p/sizeof '+render(r)+')')
+result=header+imports+'\n'+''.join(output)+''.join(identity_output)+type_names+wrappers
 target=ROOT/'src/compiler/retained_snapshot.coil'
 if '--check' in sys.argv:
     if not target.exists() or target.read_text()!=result:

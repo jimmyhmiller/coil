@@ -114,6 +114,7 @@ Same workload and machine as the baseline; steady-state median per edit.
 | baseline | 8,047,232 B | 83 ms | 17 ms | 7 ms |
 | application side tables as a persistent `SemBase` (`sem_base.coil`) | 3,303,720 B | 55 ms | 17 ms | 6 ms |
 | sealed bodies held as artifacts, not walked into (`retained_heap.coil` `Artifact`) | 3,303,720 B | 28 ms | 17 ms | 6 ms |
+| declaration closures sealed; unchanged runs of records held as **chunk artifacts**; each pass does only its own work | 1,872,632 B | 19 ms | 17 ms | 5 ms |
 
 With plain definitions (no `coil.repl` Var policy, so nothing is ever a retirement
 candidate) `publish.retain` is 2 ms, not 17: joint liveness analysis now returns at
@@ -129,6 +130,34 @@ descending, which took the mark and rescan passes from 20 ms to 6 ms each. What 
 left of the snapshot is mostly `snapshot.copy` (15 ms): the declaration records and
 the flat containers over them, which the accumulated flat `Program` forces every
 edit to rebuild and relocate.
+
+**The flat program, without rewriting its 750 consumers.** The accumulated `Program`
+is flat arrays that every edit rebuilds, so every accepted record used to be visited
+again on every publication. The walker is cheap per record (~0.2 µs); the cost was the
+count. Now every accepted declaration's closure is sealed, and an array of declaration
+records is walked in runs of 64: a run whose records are spelled, field by field,
+exactly like a run sealed before is held as one **chunk artifact** and skipped whole
+(`SEALED_RECORDS` in the generator; `graph-chunk-held?` / `graph-record-chunk!`). The
+spelling is generated per type and contains addresses, never padding, so equal
+spelling means equal pointers, all of which lead into storage the chunk holds. Per
+edit about 17,500 records are held in ~330 chunks and ~26 runs are re-recorded — the
+tails of the arrays the edit touched. Chunks are reference counted like everything
+else, so the body-storage plateaus stay exact.
+
+Two things measured and rejected, recorded so they are not retried blind: chunking the
+slots of the name → position tables (their values are list positions, so one removal
+renumbers every later entry and hashing scatters those across the table: 177 chunks
+re-recorded per edit), and chunking runs shorter than 8 (a submitted form is hundreds
+of tiny nested lists). The tables did get **borrowed keys** — each key is the name held
+by the record it indexes — which removed an allocation per function per rebuild.
+
+Each pass now does only what it is for: the first answers "what is live" and records no
+ranges, visits or chunk notes; the second lays the pruned graph out and marks no ids
+(`graph-liveness-only!`, `graph-layout-only!`). Mark 7 → 3 ms, rescan 7 → 5 ms.
+
+What is left of the 19 ms: mark 3, rescan 5, copy 4, recording new artifacts 3, pruning
+1. The two-pass shape itself is next: the first pass exists only so weak tables can be
+pruned before layout.
 
 The first step moves the *application's* type, binding and resolution entries out
 of the snapshot: a finished compilation's entries are promoted into a base derived
