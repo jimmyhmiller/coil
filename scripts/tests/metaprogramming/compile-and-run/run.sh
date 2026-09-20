@@ -148,6 +148,11 @@ $COIL test tests/metaprogramming/code_field_struct_test.coil > "$OUT/code-field.
 [ $rc -eq 0 ] || { cat "$OUT/code-field.txt"; echo "compile-time-only types FAILED (exit $rc): codegen used to abort on a struct with a Code field"; exit 1; }
 echo "compile-time-only types: OK (Code held directly, through a struct, in a sum payload, as a local, and under an impl)"
 
+echo "=== 12a''. CODE-DECL ON METHOD CALLS: inherent, trait (which impl), and through a type parameter ==="
+$COIL test tests/metaprogramming/code_decl_methods_test.coil > "$OUT/code-decl-methods.txt" 2>&1; rc=$?
+[ $rc -eq 0 ] || { cat "$OUT/code-decl-methods.txt"; echo "code-decl on method calls FAILED (exit $rc)"; exit 1; }
+echo "code-decl on method calls: OK"
+
 echo "=== 12b. AOT REGEX MACRO: compile-time parser -> allocation-free state machine ==="
 $COIL run tests/regex_test.coil >/dev/null 2>&1; rc=$?
 [ $rc -eq 0 ] || { echo "AOT regex semantics FAILED (exit $rc)"; exit 1; }

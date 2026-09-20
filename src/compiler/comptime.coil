@@ -4,6 +4,16 @@
 (import "coil.primitive" :as primitive)
 (import "coil.compiler.unit_state" :use *)
 
+;;; The impl methods of the current semantic model, by the name a checked call to one
+;;; resolves to. Built the first time a declaration query misses the function list, so
+;;; a compilation that never asks pays nothing.
+(defstruct MethodDeclBox
+  [(init i64)
+   (prog (ptr Program))
+   ; resolved method name -> impl index * 65536 + method index for an impl's method,
+   ; or -(trait index * 65536 + method index) - 1 for a trait's own declaration
+   (index (ptr (HashMap (slice u8) i64)))])
+
 (defstruct ComptimeUnitState
   [(gensym GsCell)
    (lint_parameters LintParamBox)
@@ -29,7 +39,9 @@
    (variant_owners VariantOwnerBox)
    (derivations DeriveReg)
    (opaque_items (ptr (array i64 1048576)))
-   (opaque_count i64)])
+   (opaque_count i64)
+   ; Appended. See `method-decl-index`.
+   (method_decls MethodDeclBox)])
 
 (defn comptime-unit-state-cell [] (-> (ptr (ptr ComptimeUnitState)))
   (primitive/alloc-static (ptr ComptimeUnitState)))
@@ -2603,6 +2615,8 @@
     (set! (.status b) (if (= (primitive/cast i64 p) 0) 0 2))
     (set! (.diags b) (primitive/cast (ptr (ArrayList Diag)) 0))
     (variant-owner-build! p)
+    ; Whatever was indexed belonged to the previous model.
+    (set! (.init (field (comptime-unit-state) method_decls)) 0)
     0))
 
 ;;; A model of a program that does not fully check: everything the checker
@@ -3336,6 +3350,100 @@
 ; A resolved decl: found=false → not in cp (caller falls back to name-based lookup).
 (defstruct CpDecl [(found bool) (rec Sexp)])
 
+;;; The checker resolves a call that dispatches to an impl method -- inherent or
+;;; trait -- to that method's own function name, and an impl's methods are not in the
+;;; program's function list, so a lookup there finds nothing and the call used to be
+;;; reported `:unresolved` although the checker had chosen exactly one method. This
+;;; indexes every impl method of `p` under that name.
+(defn method-decl-index [(p (ptr Program))] (-> (ptr (HashMap (slice u8) i64)))
+  (let [b (field (comptime-unit-state) method_decls)
+        a (unit-allocator)]
+    (unless (and (= (.init b) 1) (= (.prog b) p))
+      (let [(mut idx) (hm-new [(slice u8) i64] a (str-keyops))
+            is (load (field p impls))]
+        (for [i 0 (len (load is))]
+          (let [im (al-elem [ImplDef] is i)
+                ms (load (field im methods))]
+            (for [j 0 (len (load ms))]
+              (let [mname (.name (al-elem [Func] ms j))
+                    resolved
+                      (if (impl-is-trait im)
+                          (tmfn a
+                                (impl-trait-name im)
+                                (impl-mangle-key a (field im self_type) (.type_params im))
+                                mname)
+                          (inherent-fn-name a im mname))]
+                ; The first impl to claim a name keeps it; a second would be a
+                ; duplicate impl, which the checker has already refused.
+                (unless (hm-contains? [(slice u8) i64] (load idx) resolved)
+                  (set! (mut idx) resolved (primitive/iadd (primitive/imul i 65536) j))
+                  0)))))
+        ; A call through a type parameter reaches the trait's declaration, no impl
+        ; having been chosen. The checker records it under this key.
+        (for [t 0 (len (load (.traits p)))]
+          (let [td (al-elem [TraitDef] (.traits p) t)]
+            (for [j 0 (len (load (.methods td)))]
+              (set! (mut idx)
+                    (tmfn a (.name td) (trait-self-key) (.name (al-elem [TraitMethod] (.methods td) j)))
+                    (primitive/isub (primitive/isub 0 (primitive/iadd (primitive/imul t 65536) j)) 1)))))
+        (set! (.index b) (box! a (HashMap (slice u8) i64) (load idx)))
+        (set! (.prog b) p)
+        (set! (.init b) 1)
+        0))
+    (.index b)))
+
+;;; `(decl MODULE method QUALIFIED-NAME [PARAM-TYPE…] RET OWNER-TYPE [TRAIT])`.
+;;;
+;;; The first six elements read exactly like a function's record with `method` for
+;;; `fn`, so a tool that treats calls uniformly can ignore the difference. MODULE is
+;;; the module of the type the impl is for, which is where a selector like
+;;; `myapp.jobs/*` expects to find the type's methods. QUALIFIED-NAME is that module
+;;; and the method's own name. OWNER-TYPE is the type the selected impl is for; TRAIT
+;;; is present only for a trait method and names the trait, so the pair identifies
+;;; the impl the checker chose.
+(defn method-decl-record [(a (dyn Allocator)) (im (ptr ImplDef)) (fp (ptr Func))] (-> Sexp)
+  (let [(mut items) (al-new [Sexp] a)
+        owner (ty-str a (field im self_type))
+        module (qual-module-of owner)]
+    (push! (mut items) (sx-sym "decl"))
+    (push! (mut items) (sx-sym module))
+    (push! (mut items) (sx-sym "method"))
+    (push! (mut items)
+           (sx-sym (if (= (len module) 0)
+                       (decl-simple-name (.name fp))
+                       (sconcat3 a module "." (decl-simple-name (.name fp))))))
+    (push! (mut items) (fn-params-vec a fp))
+    (push! (mut items) (ty->sexp a (field fp ret)))
+    (push! (mut items) (ty->sexp a (field im self_type)))
+    (when (impl-is-trait im)
+      (push! (mut items) (sx-sym (impl-trait-name im)))
+      0)
+    (mk-sexp (KList (box-al [Sexp] a (load items))) -1 -1)))
+
+;;; The same record for a call whose receiver is a type parameter: the trait's own
+;;; declaration, with the trait's Self parameter where the owning type would be,
+;;; since which type that is depends on how the enclosing function is specialised.
+(defn trait-method-decl-record [(a (dyn Allocator))
+                                (td (ptr TraitDef))
+                                (tm (ptr TraitMethod))] (-> Sexp)
+  (let [(mut items) (al-new [Sexp] a)
+        (mut params) (al-new [Sexp] a)
+        module (qual-module-of (.name td))]
+    (for [i 0 (len (load (.params tm)))]
+      (push! (mut params) (ty->sexp a (field (al-elem [Param] (load (field tm params)) i) ty))))
+    (push! (mut items) (sx-sym "decl"))
+    (push! (mut items) (sx-sym module))
+    (push! (mut items) (sx-sym "method"))
+    (push! (mut items)
+           (sx-sym (if (= (len module) 0)
+                       (decl-simple-name (.name tm))
+                       (sconcat3 a module "." (decl-simple-name (.name tm))))))
+    (push! (mut items) (mk-sexp (KVec (box-al [Sexp] a (load params))) -1 -1))
+    (push! (mut items) (ty->sexp a (field tm ret)))
+    (push! (mut items) (sx-sym (.self_param td)))
+    (push! (mut items) (sx-sym (.name td)))
+    (mk-sexp (KList (box-al [Sexp] a (load items))) -1 -1)))
+
 ; Exact variant reflection is a common semantic-checker query. Index it once per
 ; semantic model; repeatedly walking every sum for each constructor made a generic
 ; Code traversal quadratic in the size of the checked program.
@@ -3390,8 +3498,12 @@
                           (qname (slice u8))] (-> CpDecl)
   (let [r (primitive/alloc-stack CpDecl)
         sumq (variant-owner qname)
+        ; A checked program also lists each impl method as a function under its
+        ; resolved name. Asked for as a method first, so that it is reported as the
+        ; method it is, with its type and trait, not as a function of that name.
         fn
-          (if (> (len sumq) (primitive/cast i64 0))
+          (if (or (> (len sumq) (primitive/cast i64 0))
+                  (hm-contains? [(slice u8) i64] (load (method-decl-index p)) qname))
               (primitive/cast (ptr Func) 0)
               (cp-find-fn-exact p qname))]
     (set! (.found r) false)
@@ -3404,6 +3516,25 @@
             (do
               (set! (.found r) true)
               (set! (.rec r) (fn-decl-record a fn))
+              0)
+          (if (hm-contains? [(slice u8) i64] (load (method-decl-index p)) qname)
+            (let [at (match (get (load (method-decl-index p)) qname) (Some [v] v) (None [] 0))]
+              (set! (.found r) true)
+              (set! (.rec r)
+                    (if (>= at 0)
+                        (let [im (al-elem [ImplDef] (load (field p impls)) (primitive/idiv at 65536))]
+                          (method-decl-record a
+                                              im
+                                              (al-elem [Func]
+                                                       (load (field im methods))
+                                                       (primitive/irem at 65536))))
+                        (let [code (primitive/isub (primitive/isub 0 at) 1)
+                              td (al-elem [TraitDef] (load (field p traits)) (primitive/idiv code 65536))]
+                          (trait-method-decl-record a
+                                                    td
+                                                    (al-elem [TraitMethod]
+                                                             (load (field td methods))
+                                                             (primitive/irem code 65536))))))
               0)
             (let [nks (cp-kind-decls a p)
                   n (len (load nks))
@@ -3426,7 +3557,7 @@
                   (when (> (len sq) (primitive/cast i64 0))
                     (store! (field r found) true)
                     (store! (field r rec) (variant-decl-record a sq qname))
-                    0))))))
+                    0)))))))
     (load r)))
 
 ; A (qualified-name, kind) pair, for the non-function declaration kinds.

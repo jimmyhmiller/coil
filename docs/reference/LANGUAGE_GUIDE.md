@@ -1883,6 +1883,18 @@ compiler's authoritative output and layer *policy* on code that already typechec
   **reference node** (a call, `fnptr-of`, variant construction, or
   type reference) and it resolves to the exact entity the checker picked — correct even
   when the same simple name exists in several modules.
+  **Pass the call, not its head symbol.** The whole call node is what the checker
+  resolved; the head symbol alone resolves only by name, and misses a head a macro
+  introduced from another module, a generic function, and every method call.
+  A call that dispatches to an **impl method** answers
+  `(decl MODULE method QUALIFIED-NAME [PARAM-TYPE…] RET OWNER-TYPE [TRAIT])`: the first
+  six elements read like a function's, MODULE is the owning type's module (so a selector
+  such as `myapp.jobs/*` finds a type's methods with its functions), OWNER-TYPE is the
+  type the selected impl is for, and TRAIT is present only for a trait method — together
+  they name the impl the checker chose. Operators are trait methods, so `(+ a b)` answers
+  this way too. When the receiver is a type parameter no impl is chosen until the
+  function is specialised: the record is the trait's own declaration, with the trait's
+  `Self` parameter where the owning type would be.
 - `(primitive/type-of NODE)` → the expression's **inferred** type as Code (`i64`, `(ptr i64)`), or
   `:unknown`. Inferred, not syntactic: `(getf)` reports `f64` because that's what `getf`
   returns.
