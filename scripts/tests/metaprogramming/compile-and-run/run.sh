@@ -6,7 +6,9 @@ cd "$(dirname "$0")/../../../.."
 COIL=${1:-build/bin/coil}
 case "$COIL" in /*) ABSCOIL="$COIL";; *) ABSCOIL="$PWD/$COIL";; esac
 D=tests/metaprogramming/compile-and-run
-OUT=$(mktemp -d)
+# Removed on every exit, not only a clean one: a failing check leaves the script
+# early, and a directory removed only by its last line is then never removed.
+OUT=$(mktemp -d); trap 'rm -rf "$OUT"' EXIT
 DL="--link-flag -Wl,-undefined,dynamic_lookup"
 EX="--link-flag -Wl,-export_dynamic"
 

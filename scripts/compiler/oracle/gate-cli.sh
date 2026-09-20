@@ -3462,7 +3462,7 @@ expect_out "missing from the bundled stdlib manifest" \
 # Keep this outside both the checkout and /tmp: bootstrap stage compilers use
 # /tmp/lib/coil while they are being verified, and a "lonely" compiler beneath
 # /tmp would otherwise discover that stage library by walking upward.
-LONELY=$(mktemp -d /var/tmp/coil-lonely.XXXXXX)
+LONELY=$(mktemp -d /var/tmp/coil-lonely.XXXXXX); trap 'rm -rf "$T" "$LONELY"' EXIT
 cp "$COIL" "$LONELY/coil"
 cp "$T/bundle/allns.coil" "$LONELY/allns.coil"
 expect_rc 1 "layout: a compiler with no library beside it fails instead of guessing" \

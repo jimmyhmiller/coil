@@ -26,13 +26,13 @@ command -v hyperfine >/dev/null || { echo "need hyperfine (brew install hyperfin
 # Does Zig work end-to-end on this host (compile an object + link it with cc)?
 HAVE_ZIG=0
 if command -v zig >/dev/null; then
-  ZT="$(mktemp -d)"
+  ZT="$(mktemp -d)"; trap 'rm -rf "$ZT"' EXIT
   printf 'export fn main() c_int { return 0; }\n' > "$ZT/probe.zig"
   if zig build-obj -OReleaseFast "$ZT/probe.zig" -femit-bin="$ZT/probe.o" >/dev/null 2>&1 \
      && "$CC" "$ZT/probe.o" -o "$ZT/probe" >/dev/null 2>&1; then
     HAVE_ZIG=1
   fi
-  rm -rf "$ZT"
+  rm -rf "$ZT"; trap - EXIT
 fi
 [ "$HAVE_ZIG" = 1 ] && echo "zig: enabled ($(zig version))" || echo "zig: skipped (absent or can't link on this host)"
 
@@ -43,7 +43,7 @@ build_zig() { # <src.zig> <out.o> <out.bin>
 }
 
 BENCHES=("$@"); [ ${#BENCHES[@]} -eq 0 ] && BENCHES=(fib tak loop float memory structcall slicesum genreduce)
-T="$(mktemp -d)"
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 RESULTS="src/benchmarks/RESULTS.md"
 {
   echo "# Coil vs C vs Zig benchmarks"

@@ -14,7 +14,7 @@ COIL="${COIL:-build/bin/coil}"
 [ -x "$COIL" ] || { echo "need compiler at $COIL; run scripts/compiler/rebootstrap.sh"; exit 1; }
 
 SIZES=("$@"); [ ${#SIZES[@]} -eq 0 ] && SIZES=(250 1000 4000 8000)
-T="$(mktemp -d)"
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 
 # Generate a program with N functions. A mix that exercises the scaling risks:
 #  - a reachable chain of plain functions (codegen volume),
