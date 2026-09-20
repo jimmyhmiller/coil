@@ -1,0 +1,356 @@
+;;; Accepted semantic side tables as persistent values.
+
+;;;
+;;; While a program is being checked, the type, binding and resolution of each node
+;;; are recorded in mutable tables keyed by node id (`comptime.coil`). That is the
+;;; right shape for one check pass. It is the wrong shape for results that outlive
+;;; the pass: a compilation that builds on earlier results had to copy all of them
+;;; into its own tables before it could add one, and whoever kept the results had
+;;; to copy them out of the pass's arena again.
+;;;
+;;; A `SemBase` holds the same three tables as persistent maps. Deriving one from
+;;; another shares every entry that does not change, a check pass reads through to
+;;; it on a miss instead of copying it, and two of them can be alive at once. The
+;;; compiler attaches no meaning to that; it only guarantees that a `SemBase` is
+;;; never written once another holder can see it.
+;;;
+;;; Entries own their storage. A `Type` holds pointers and names, and a check pass
+;;; records them in scratch memory, so adding an entry deep-copies it into a
+;;; `SemOwner` arena, and the entry holds that arena alive. Entries added together
+;;; share one arena; it is freed when the last of them is dropped.
+(module coil.compiler.sem_base)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :use *)
+(import "coil.result" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.slice" :use *)
+(import "coil.mem" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.pmap" :use *)
+(import "coil.compiler.ast" :use *)
+
+; ---- storage shared by the entries added together ---------------------------------
+(defstruct SemOwner
+  [(refs i64) (arena scratch/ScratchArena) (a (dyn Allocator))])
+
+;;; One reference to a `SemOwner`. Cloning shares it; dropping the last frees the
+;;; arena and everything the entries holding it point into.
+(defstruct SemHold [(owner (ptr SemOwner))])
+
+(defn sem-owner-release! [(owner (ptr SemOwner))] (-> i64)
+  (let [remaining (- (.refs owner) 1)]
+    (set! (.refs owner) remaining)
+    (when (= remaining 0)
+      (scratch/scratch-close! (field owner arena))
+      (free [SemOwner] (.a owner) (slice-new owner 1))
+      0)
+    0))
+
+(impl Clone SemHold
+  (clone [(self (ref SemHold))]
+         (-> SemHold)
+         (let [owner (.owner self)]
+           (set! (.refs owner) (+ (.refs owner) 1))
+           (SemHold :owner owner))))
+
+(impl Drop SemHold
+  (drop [(self (mut SemHold))]
+        (-> void)
+        (sem-owner-release! (.owner self))))
+
+;;; A fresh arena holding one reference, the builder's. Pair with `sem-owner-done!`.
+(defn sem-owner-new [(a (dyn Allocator))] (-> (ptr SemOwner))
+  (let [owner (box! a SemOwner (p/zeroed SemOwner))]
+    (set! (.refs owner) 1)
+    (set! (.a owner) a)
+    ; Most additions are a handful of entries; the first ever is the whole prelude.
+    (scratch/scratch-init-with-cap (field owner arena) a 512)
+    owner))
+
+(defn sem-owner-done! [(owner (ptr SemOwner))] (-> i64)
+  (sem-owner-release! owner))
+
+(defn sem-owner-hold [(owner (ptr SemOwner))] (-> SemHold)
+  (set! (.refs owner) (+ (.refs owner) 1))
+  (SemHold :owner owner))
+
+(defn sem-own-bytes [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (if (= (len text) 0)
+      ""
+      (match (alloc [u8] a (len text))
+        (Some [memory]
+              (do
+                (mem-copy (slice-data memory) (slice-data text) (len text))
+                memory))
+        (None [] (do (oom-at c"semantic entry name" (len text)) "")))))
+
+(defn sem-own-extent [(a (dyn Allocator)) (n Extent)] (-> Extent)
+  (match n
+    (FixedExtent [value] (FixedExtent value))
+    (ParamExtent [name] (ParamExtent (sem-own-bytes a name)))))
+
+;;; A copy of the type at `tp` that points only into `a`, names included.
+(defn sem-own-type [(a (dyn Allocator)) (tp (ptr Type))] (-> Type)
+  (match (load tp)
+    (TInt [bits signed] (TInt bits signed))
+    (TFloat [bits] (TFloat bits))
+    (TBool [] (TBool))
+    (TVoid [] (TVoid))
+    (TPtr [inner] (TPtr (box! a Type (sem-own-type a inner))))
+    (TRef [mu inner] (TRef mu (box! a Type (sem-own-type a inner))))
+    (TStruct [name] (TStruct (sem-own-bytes a name)))
+    (TArray [elem n]
+            (TArray (box! a Type (sem-own-type a elem)) (sem-own-extent a n)))
+    (TSlice [elem] (TSlice (box! a Type (sem-own-type a elem))))
+    (TVec [elem n]
+          (TVec (box! a Type (sem-own-type a elem)) (sem-own-extent a n)))
+    (TFn [cc params ret]
+         (TFn
+           :cc (sem-own-bytes a cc)
+           :params (sem-own-type-list a params)
+           :ret (box! a Type (sem-own-type a ret))))
+    (TApp [name args] (TApp (sem-own-bytes a name) (sem-own-type-list a args)))
+    (TNever [] (TNever))
+    (TCode [] (TCode))
+    (TExternRef [] (TExternRef))
+    (TCodeBuilder [] (TCodeBuilder))
+    (TConst [value]
+            (TConst (match value
+                      (ConstInt [v] (ConstInt v))
+                      (ConstBool [v] (ConstBool v))
+                      (ConstKeyword [name]
+                                    (ConstKeyword (sem-own-bytes a name))))))
+    (TError [] (TError))))
+
+(defn sem-own-type-list [(a (dyn Allocator)) (xs (ptr (ArrayList Type)))] (-> (ptr (ArrayList Type)))
+  (let [(mut out) (al-new [Type] a)
+        n (len (load xs))]
+    (when (> n 0) (al-reserve! [Type] (mut out) n) 0)
+    (for [i 0 n]
+      (push! (mut out) (sem-own-type a (al-elem [Type] xs i))))
+    (box! a (ArrayList Type) (load out))))
+
+; ---- entries ----------------------------------------------------------------------
+(defstruct SemType [(ty Type) (hold SemHold)])
+
+(impl Clone SemType
+  (clone [(self (ref SemType))]
+         (-> SemType)
+         (SemType :ty (.ty self) :hold (clone (field self hold)))))
+
+(defstruct SemName [(name (slice u8)) (hold SemHold)])
+
+(impl Clone SemName
+  (clone [(self (ref SemName))]
+         (-> SemName)
+         (SemName :name (.name self) :hold (clone (field self hold)))))
+
+; ---- the base ---------------------------------------------------------------------
+
+;;; `fallback` is consulted after this base's own tables, and is never written
+;;; through this base. `bnext` is the highest binding id any entry may carry.
+(defstruct SemBase
+  [(refs i64)
+   (a (dyn Allocator))
+   (types (PMap i64 SemType))
+   (binds (PMap i64 i64))
+   (names (PMap i64 SemName))
+   (bnext i64)
+   (fallback (ptr SemBase))])
+
+(defn sem-no-base [] (-> (ptr SemBase))
+  (p/cast (ptr SemBase) 0))
+
+(defn sem-lease-noop [(state (ptr i8))] (-> i64)
+  0)
+
+; A base is freed through the same allocator that made it, by whoever released it
+; last. The allocator is the embedding session's and outlives every base, so the
+; lease carries no state of its own.
+(defn sem-lease [(a (dyn Allocator))] (-> AllocatorLease)
+  (unsafe-allocator-lease-new a
+                              (p/cast (ptr i8) 0)
+                              (p/fnptr-of sem-lease-noop)
+                              (p/fnptr-of sem-lease-noop)))
+
+;;; An empty base holding one reference.
+(defn sem-base-new [(a (dyn Allocator))] (-> (ptr SemBase))
+  (let [raw
+          (match (alloc [SemBase] a 1)
+            (Some [memory] (slice-data memory))
+            (None []
+                  (do
+                    (oom-at c"semantic base" (p/sizeof SemBase))
+                    (sem-no-base))))]
+    (set! (.refs raw) 1)
+    (set! (.a raw) a)
+    (set! (.types raw) (pm-new [i64 SemType] (sem-lease a) (i64-keyops)))
+    (set! (.binds raw) (pm-new [i64 i64] (sem-lease a) (i64-keyops)))
+    (set! (.names raw) (pm-new [i64 SemName] (sem-lease a) (i64-keyops)))
+    (set! (.bnext raw) 0)
+    (set! (.fallback raw) (sem-no-base))
+    raw))
+
+(defn sem-base-retain [(base (ptr SemBase))] (-> (ptr SemBase))
+  (unless (= base (sem-no-base)) (set! (.refs base) (+ (.refs base) 1)) 0)
+  base)
+
+(defn sem-base-release! [(base (ptr SemBase))] (-> i64)
+  (unless (= base (sem-no-base))
+    (let [remaining (- (.refs base) 1)]
+      (set! (.refs base) remaining)
+      (when (= remaining 0)
+        (let [types (take! [(PMap i64 SemType)] (field base types))
+              binds (take! [(PMap i64 i64)] (field base binds))
+              names (take! [(PMap i64 SemName)] (field base names))]
+          0)
+        (sem-base-release! (.fallback base))
+        (free [SemBase] (.a base) (slice-new base 1))
+        0)
+      0)
+    0)
+  0)
+
+;;; A new base equal to `parent` (which may be null), sharing all of its entries.
+;;; It holds one reference and may be written until someone else can see it.
+(defn sem-base-derive [(a (dyn Allocator)) (parent (ptr SemBase))] (-> (ptr SemBase))
+  (if (= parent (sem-no-base))
+      (sem-base-new a)
+      (let [raw
+              (match (alloc [SemBase] a 1)
+                (Some [memory] (slice-data memory))
+                (None []
+                      (do
+                        (oom-at c"semantic base" (p/sizeof SemBase))
+                        (sem-no-base))))]
+        (set! (.refs raw) 1)
+        (set! (.a raw) a)
+        (set! (.types raw)
+              (pm-clone-at [(PMap i64 SemType)] (field parent types)))
+        (set! (.binds raw) (pm-clone-at [(PMap i64 i64)] (field parent binds)))
+        (set! (.names raw)
+              (pm-clone-at [(PMap i64 SemName)] (field parent names)))
+        (set! (.bnext raw) (.bnext parent))
+        (set! (.fallback raw) (sem-base-retain (.fallback parent)))
+        raw)))
+
+;;; Consult `fallback` after this base. Replaces, and releases, any earlier one.
+(defn sem-base-set-fallback! [(base (ptr SemBase)) (fallback (ptr SemBase))] (-> i64)
+  (let [previous (.fallback base)]
+    (set! (.fallback base) (sem-base-retain fallback))
+    (sem-base-release! previous)))
+
+(defn sem-base-put-type! [(base (ptr SemBase))
+                          (owner (ptr SemOwner))
+                          (nid i64)
+                          (ty (ptr Type))] (-> i64)
+  (pm-assoc! (mut (.types base))
+             nid
+             (SemType :ty
+                        (sem-own-type (scratch/scratch-allocator (field owner
+                                                                        arena))
+                                      ty)
+               :hold (sem-owner-hold owner))))
+
+(defn sem-base-put-bid! [(base (ptr SemBase)) (nid i64) (bid i64)] (-> i64)
+  (when (> bid (.bnext base)) (set! (.bnext base) bid) 0)
+  (pm-assoc! (mut (.binds base)) nid bid))
+
+(defn sem-base-put-name! [(base (ptr SemBase))
+                          (owner (ptr SemOwner))
+                          (nid i64)
+                          (name (slice u8))] (-> i64)
+  (pm-assoc! (mut (.names base))
+             nid
+             (SemName :name
+                        (sem-own-bytes (scratch/scratch-allocator (field owner
+                                                                         arena))
+                                       name)
+               :hold (sem-owner-hold owner))))
+
+;;; The type recorded for `nid` in `start` or its fallbacks. The result borrows
+;;; from the base: it is valid while that base is held.
+(defn sem-base-type [(start (ptr SemBase)) (nid i64)] (-> (Option Type))
+  (let [(mut base) start
+        (mut found) (None [Type])]
+    (loop (when (= (load base) (sem-no-base)) (break))
+      (match (pm-get-ptr (field (load base) types) nid)
+        (Some [entry] (do (set! found (Some (.ty entry))) (break)))
+        (None [] (set! base (.fallback (load base))))))
+    (load found)))
+
+(defn sem-base-bid [(start (ptr SemBase)) (nid i64)] (-> (Option i64))
+  (let [(mut base) start
+        (mut found) (None [i64])]
+    (loop (when (= (load base) (sem-no-base)) (break))
+      (match (pm-get-ptr (field (load base) binds) nid)
+        (Some [entry] (do (set! found (Some (load entry))) (break)))
+        (None [] (set! base (.fallback (load base))))))
+    (load found)))
+
+(defn sem-base-name [(start (ptr SemBase)) (nid i64)] (-> (Option (slice u8)))
+  (let [(mut base) start
+        (mut found) (None [(slice u8)])]
+    (loop (when (= (load base) (sem-no-base)) (break))
+      (match (pm-get-ptr (field (load base) names) nid)
+        (Some [entry] (do (set! found (Some (.name entry))) (break)))
+        (None [] (set! base (.fallback (load base))))))
+    (load found)))
+
+(defn sem-base-has? [(base (ptr SemBase)) (nid i64)] (-> bool)
+  (match (sem-base-type base nid)
+    (Some [_] true)
+    (None []
+          (match (sem-base-bid base nid)
+            (Some [_] true)
+            (None []
+                  (match (sem-base-name base nid)
+                    (Some [_] true)
+                    (None [] false)))))))
+
+;;; Entries in this base's own tables (not its fallbacks), for reporting.
+(defn sem-base-entries [(base (ptr SemBase))] (-> i64)
+  (if (= base (sem-no-base))
+      0
+      (+ (pm-len (field base types))
+         (+ (pm-len (field base binds)) (pm-len (field base names))))))
+
+;;; Drop every entry of this base's own tables whose node id is not a key of
+;;; `live`. Entries die with the syntax that carries their id; the caller says
+;;; which ids those are. Returns how many entries were dropped.
+(defn sem-base-prune! [(base (ptr SemBase)) (live (ptr (HashMap i64 i64)))] (-> i64)
+  (let [a (.a base)
+        (mut dead) (al-new [i64] a)
+        (mut dropped) 0]
+    (let [(mut it) (pm-iter (field base types))]
+      (loop (match (next (mut it))
+              (None [] (break))
+              (Some [e]
+                    (unless (hm-contains? [i64 i64] (load live) (.key e))
+                      (push! (mut dead) (.key e))
+                      0)))))
+    (for [i 0 (len dead)] (pm-dissoc! (mut (.types base)) (get dead i)))
+    (set! dropped (+ (load dropped) (len dead)))
+    (set! (.len dead) 0)
+    (let [(mut it) (pm-iter (field base binds))]
+      (loop (match (next (mut it))
+              (None [] (break))
+              (Some [e]
+                    (unless (hm-contains? [i64 i64] (load live) (.key e))
+                      (push! (mut dead) (.key e))
+                      0)))))
+    (for [i 0 (len dead)] (pm-dissoc! (mut (.binds base)) (get dead i)))
+    (set! dropped (+ (load dropped) (len dead)))
+    (set! (.len dead) 0)
+    (let [(mut it) (pm-iter (field base names))]
+      (loop (match (next (mut it))
+              (None [] (break))
+              (Some [e]
+                    (unless (hm-contains? [i64 i64] (load live) (.key e))
+                      (push! (mut dead) (.key e))
+                      0)))))
+    (for [i 0 (len dead)] (pm-dissoc! (mut (.names base)) (get dead i)))
+    (set! dropped (+ (load dropped) (len dead)))
+    (al-free! (mut dead))
+    (load dropped)))
