@@ -200,6 +200,59 @@ are the previous facade's (`compiler-revision-retain-meta!` installs the facade 
 the next `meta_environment`). Pruning still iterates the base against the
 snapshot's `live-nids`; that scan goes when the walk does.
 
+### The small probe hid the scaling; a 2,000-definition probe shows it (2026-09-20)
+
+The baseline workload accumulates almost nothing of its own: the accepted program is
+the prelude plus `coil.repl`, about 800 functions. Per edit it now costs ~19.5 ms end
+to end (25 ms at the start of the day), from three changes a profile pointed at:
+
+- **The liveness closure asked its two questions by scanning.** "Is this callee a
+  program function" scanned the name list per call site, and "which function is it"
+  scanned the function list per reached function. `FnNames` (`comptime.coil`) carries a
+  hash index with each first-function position. Retain 13 → 10 ms.
+- **The joint fixpoint ran a confirming round on every edit.** A round whose only
+  change came from its first step has already run every later step against the final
+  state, and that step's closure is transitive, so the second round can only repeat
+  the first. Under the Var policy something is rescued on every edit. Retain 10 → 6 ms.
+- **Map keys were hashed a byte at a time** (FNV-1a over forty-byte qualified names).
+  `str-hash` keeps FNV because its values are written down (cache directory names,
+  replay seeds); `str-key-hash` is never stored and now takes eight bytes a step. The
+  profile share barely moved, which says the cost is the cache miss on the key, not the
+  arithmetic: the real fix is fewer rebuilt maps, not a faster hash.
+
+Then the probe that should have existed from the start: **2,000 accepted user
+functions, edit one** (`replace-big`). Per edit, before any of today's constant work:
+prepare 38 ms, native 28 (link 21), retain 21, **snapshot 99** — about 190 ms, so
+publication still scales with the program. A census of one edit there: 170k records
+walked, 66k of them `Expr` under `Const`. Under the Var policy a retained definition
+*is* a constant whose value is an expression tree, and nothing treated constants the
+way functions are treated:
+
+- `setup-consts` re-checked **every** constant on every edit and replaced each
+  runtime constant's value with the newly elaborated tree, so no two states shared a
+  constant and the checker did O(program) typing per edit. Its lookup `const-find`
+  was a scan, which made that setup quadratic. Now: `Cx.constidx`, and a constant
+  handed back unchanged (same value node id, `ConstEntry.source_nid`) keeps the
+  parent's checked entry, exactly as an accepted function keeps its body.
+- `mono-consts` resolved every runtime constant again into new storage; it now keeps
+  the prior native record when the checked node is the same.
+- Since an accepted constant is no longer re-checked, it has to be findable when what
+  it reads changes: constants are recorded as readers in the `DepBase` and reported
+  in the stale set (`jit_env_stale.coil` covers it).
+- `Const` and `ConstEntry` are sealed records (chunk kinds 15, 16).
+
+With those: prepare 44 → 29 ms, and the checker's entries and the native constants
+are held as chunks. **Not finished:** the checked program's own `Const` records are
+still spelled differently on every edit (64 chunks re-recorded, 22k `Expr` walked),
+because some pass still re-allocates a node under each constant per compilation —
+the same node id and span, a pointer into the new candidate's arena. It is not
+`setup-consts`, `mono-consts`, the facade copy, or qualification of inherited forms.
+Finding that pass is the next step; after it, the remaining big-probe costs in order
+are `merge-consts`' quadratic duplicate scan (resolve), the JIT link step (21 ms: it
+rebuilds a flat symbol namespace from every generation and resolves by linear scan),
+and the name → position tables (20k hash entries re-walked per edit), which want to
+be persistent maps.
+
 ### Accepted state is immutable, and now that is checked
 
 `COIL_JIT_PROTECT=1` covers the whole published snapshot, not only sealed bodies:
