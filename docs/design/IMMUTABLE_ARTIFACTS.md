@@ -110,6 +110,22 @@ Same workload and machine as the baseline; steady-state median per edit.
 |---|---|---|---|---|
 | baseline | 8,047,232 B | 83 ms | 17 ms | 7 ms |
 | application side tables as a persistent `SemBase` (`sem_base.coil`) | 3,303,720 B | 55 ms | 17 ms | 6 ms |
+| sealed bodies held as artifacts, not walked into (`retained_heap.coil` `Artifact`) | 3,303,720 B | 28 ms | 17 ms | 6 ms |
+
+With plain definitions (no `coil.repl` Var policy, so nothing is ever a retirement
+candidate) `publish.retain` is 2 ms, not 17: joint liveness analysis now returns at
+once when its candidate set is empty. Under the Var policy every redefinition
+declares a `:jit/retain false` implementation, so the analysis still reads every
+program to a fixed point; making that proportional needs recorded references
+(`deps`), not a better scan.
+
+A sealed body is now an `Artifact`: it owns its blocks and remembers the node,
+source, context and scope ids found in it, recorded once from the sealed copy. A
+later graph that meets its root holds the artifact and marks those ids instead of
+descending, which took the mark and rescan passes from 20 ms to 6 ms each. What is
+left of the snapshot is mostly `snapshot.copy` (15 ms): the declaration records and
+the flat containers over them, which the accumulated flat `Program` forces every
+edit to rebuild and relocate.
 
 The first step moves the *application's* type, binding and resolution entries out
 of the snapshot: a finished compilation's entries are promoted into a base derived

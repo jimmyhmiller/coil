@@ -192,9 +192,12 @@ def body(t):
                 raise ValueError(('unclassified raw pointer',head,name,field))
             field_walk=call('walk',field,expr)
             if head=='coil.compiler.ast.Func' and name=='body':
+                # A body sealed by an earlier graph is an artifact: it is held whole and
+                # its recorded ids are marked, instead of being walked into again.
                 field_walk=f'''(let [saved (.freezing g)]
-                  (when (hm/hm-contains? (.frozen-roots g) (p/cast i64 {expr})) (set! (.freezing g) true) 0)
-                  {field_walk} (set! (.freezing g) saved) 0)'''
+                  (unless (graph-enter-artifact! g (p/cast i64 {expr}))
+                    (when (hm/hm-contains? (.frozen-roots g) (p/cast i64 {expr})) (set! (.freezing g) true) 0)
+                    {field_walk} (set! (.freezing g) saved) 0) 0)'''
             walks.append(field_walk);fields+=[':'+name,call('value',field,expr)]
         if head in ('coil.compiler.ast.ValueResEntry','coil.compiler.ast.TypeResEntry'):
             walks=['(set! (.weak-alias g) true)']+walks+['(set! (.weak-alias g) false)']
@@ -266,6 +269,8 @@ type_names='(defn snapshot-type-name [(kind i64)] (-> (slice u8)) (cond '+ ' '.j
 wrappers=''
 for name,t in zip(('scan-loader!','scan-program!','scan-resolution!','scan-meta-entries!','scan-syntax!'), ROOTS):
     wrappers+='(defn '+name+' [(g (ptr Graph)) (root (ptr '+render(t)+'))] (-> i64) ('+ident(t)+'-scan g root))\n'
+# The walk a sealed body is recorded with, as an erased entry point.
+wrappers+='(defn scan-body-erased [(g (ptr Graph)) (body (ptr i8))] (-> i64) ('+ident(('coil.arraylist.ArrayList','coil.compiler.ast.Expr'))+'-scan-erased g body))\n'
 result=header+imports+'\n'+''.join(output)+type_names+wrappers
 target=ROOT/'src/compiler/retained_snapshot.coil'
 if '--check' in sys.argv:
