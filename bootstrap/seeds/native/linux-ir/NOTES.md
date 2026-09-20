@@ -47,43 +47,28 @@ and gates are what actually vouch for the seed you commit.
     coil emit-ir src/compiler/main.coil \
         --target x86_64-unknown-linux-gnu > coil-linux.ll
 
-Emitted at commit `828c99f` ("Remove stale-seed subtraction dependencies") from a
-clean tree, by a compiler built from that same source (3-stage self-host, LLVM fixpoint
-stage2.o == stage3.o). This refresh includes the private updater, so the IR's native
-link surface now also includes Coil's bundled libcurl and mbedTLS archives. Note that
-`emit-ir --help` does not advertise `--target`, but it honours it — the help text is
-wrong, not the flag.
+Emitted at commit `ec34452` on `design/immutable-artifacts` (2026-09-20) from a clean
+tree, by a compiler built from that same source (3-stage self-host, LLVM fixpoint
+stage2.o == stage3.o). It was refreshed because both committed Linux seeds predate the
+`(const Name Keyword)` value-parameter syntax and cannot compile this tree (`unknown
+trait 'Name' in bound`); the two macOS seeds were refreshed in the same sitting, the
+Linux pair cannot be from a Mac. The IR's native link surface includes Coil's bundled
+libcurl and mbedTLS archives. Note that `emit-ir --help` does not advertise `--target`,
+but it honours it — the help text is wrong, not the flag.
 
-Unlike previous revisions this one was checked as far as macOS permits, which is
-further than "emitted and hoped":
+Checked as far as macOS permits:
 
-  - `llvm-as` parses it (24.9 MB of IR -> 6.5 MB bitcode, 8118 defines);
+  - `llvm-as` parses it (43.2 MB of IR, 12492 defines);
   - `llc -mtriple=x86_64-unknown-linux-gnu -filetype=obj` produces a real
     `ELF 64-bit LSB relocatable, x86-64` object, so codegen does not hit an
     unimplemented ABI path;
-  - the undefined-symbol scan finds **176** distinct `LLVMxxx` C-API symbols, newest
-    `LLVMArrayType2` / `LLVMConstArray2` (LLVM 17), so LLVM 20/21/22 all satisfy it.
+  - the undefined-symbol scan finds **214** distinct `LLVMxxx` C-API symbols, newest
+    still `LLVMArrayType2` / `LLVMConstArray2` (LLVM 17), so LLVM 20/21/22 all satisfy it.
 
-What that does NOT establish is that the binary works. Only running it does, and only a
-Linux host can. Emitted from `main` rather than a side branch this time: the `(_ …)`
-catch-all syntax that motivated pinning `596c66f` has long since landed, so there is no
-longer a reason to prefer an older revision.
-
-Why this revision exists: the committed ELF seed `coil-seed-linux-x86_64` went
-internally inconsistent — its own embedded stdlib calls
-`coil.primitive.fresh-identifier`, which its compiler does not have, so it cannot
-compile anything and no checkout-side change can fix it. The portable WASM seed is
-stale too. That leaves no viable stage0 on a Linux box, which is exactly the
-circularity these files exist to break.
-
-An earlier revision of these files was emitted natively on Linux, after the port fixes
-landed in `src/compiler` (portable pthread semaphores replacing Darwin GCD, dlsym'd
-i-cache flush, host-aware dylib link lines, layout-aware SysV classification). The
-revision before *that* was cross-emitted from macOS and needed a 4-symbol Darwin shim;
-that is still unnecessary — the external symbol scan below was re-run on this emission
-and found no Darwin-only extern. (History has the old NOTES if you need the original
-cross-emission story, including the x86 `musttail` aggregate-return downgrade in
-`codegen.coil::emit-tail`.)
+**The Linux seeds are still the stale ones.** On a Linux x86-64 host: link this IR into a
+stage0 as described below, smoke-test it against the frozen `fib`/`io` controls, then
+`STAGE0=<that> python3 scripts/dev.py build linux`, then
+`STAGE0=<verified> ./scripts/compiler/refresh-seed.sh` for `full` and again for `nollvm`.
 
 ## Rebuilding a stage0 from this IR
 
