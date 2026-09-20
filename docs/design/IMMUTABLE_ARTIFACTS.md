@@ -210,15 +210,29 @@ Nothing durable is identified by an address.
   `Sexp`) exist. Equal fingerprint ⇒ equivalent result ⇒ propagation stops.
 - **Mono instances** keep their existing structural key (`name__typekey…`,
   `mono.coil:346`) with `MonoOrigin` as provenance.
-- **Node ids become artifact-local** (decided 2026-09-19, over keeping global
-  nids in a persistent map). `Expr.nid`/`Sexp.nid` is currently a global
-  counter carried across revisions as `next-nid`, and the checker's type, binding
-  and resolution maps are unit-global tables keyed by it. Make `nid` a dense index
-  assigned at seal, and move those three tables *into the checked-body artifact*
-  as arrays. This deletes `SemMapsSnap`, `sem-maps-inherit!` (copy site 2),
-  pass-1 "live nid" marking and the weak-map prune between snapshot passes, and
-  `semantic-freshen-nids!` — a sealed copy of a macro result gets its own
-  numbering, so aliased argument nodes are never renumbered in place.
+- **Node ids stay global; the side tables become persistent maps.** `Expr.nid` /
+  `Sexp.nid` is a global counter, and the checker's type, binding and resolution
+  maps are unit-global tables keyed by it. A census of one steady-state edit shows
+  those three tables and their hash indexes are **about 58% of every record the
+  snapshot walks and relocates** (≈99k of 171k), and `sem-maps-inherit!` re-inserts
+  all of them per candidate. They become `PMap nid → entry` held by the `Env`, with
+  a mutable overlay during a compile; a candidate reads through to the accepted map
+  instead of copying it.
+
+  An earlier draft (and a decision taken on its recommendation) made nids
+  artifact-local with the tables inside each checked body. The audit killed it:
+  metaprogram reflection (`type-of`, `binding-of`, `code-decl`,
+  `comptime.coil:2817-3441`) looks up an arbitrary `Code` handle's nid with no
+  function context; lint and `join-source-nodes!` key on `Sexp` nids of raw forms
+  that no function owns; metalower and fold read nodes in consts, impls and asserts;
+  mono instances *share* their generic origin's nids on purpose
+  (`mono.coil:2139`); and generated names embed nids (`$borrow.temp.<nid>`,
+  `$qqscope<nid>`). Global ids with a persistent map keep every one of those working.
+
+  Entries die with the syntax that carries their nid. After `semantic-freshen-nids!`
+  a form revision occupies a contiguous pre-order nid range, so retiring a form can
+  name its entries without a program-wide liveness walk; until the snapshot walk is
+  gone, its existing `live-nids` marking is reused to prune.
 
 ### Layer 2 — `Env`, an immutable value
 
@@ -373,10 +387,9 @@ Two properties of Coil keep this cheap, and are worth protecting:
   unchanged. Invalidation is one hop, except through macros (a changed macro
   re-expands its users, whose output may differ) and constants that mention
   constants. The stale set handles those by being recomputed on each result.
-- **Per-body semantic tables live in the body artifact** (the artifact-local nid
-  decision). "What is the type of this expression" is a read of one sealed artifact,
-  valid for as long as the client holds that `Env`, with no global side map to
-  consult or keep consistent.
+- **The semantic tables are part of the `Env`.** "What is the type of this
+  expression" is a read of a persistent map, valid for as long as the client holds
+  that `Env`, and the same read metaprogram reflection already performs.
 
 Whole-program metaprograms (lints, transforms) read everything and so are stale
 after every edit. The compiler reports that honestly; when to run them is the
@@ -485,7 +498,8 @@ the full gate ladder is the contract. Its first step is moving the session code
 out of `driver.coil` into its own files, coordinated with `feature/live-whole-program`.
 
 **Phase 2 — signatures and checked bodies.** `DefId → Sig`, `DefId → CheckedBody`
-as persistent indexes; then nid localisation and per-body semantic tables. Fix
+as persistent indexes, after the semantic side tables (the first slice, because
+they are the majority of what is copied). Fix
 `build-param-env`, `fold-program`, `cte-wrap-divisor!`. Deletes
 `check-inherit-signatures!`, `ls-accept-checked!` rebuilds, `SemMapsSnap`,
 `sem-maps-inherit!`, the nid-liveness pass. **Gate** (from the boundary audit): a
@@ -548,9 +562,11 @@ terms of artifact and index bytes — restated, not loosened.
 
 - **Phase 1 is wide.** Every accepted-state read site changes. Mitigation: it is
   behaviour-preserving, so the existing gates fully specify it.
-- **Nid localisation touches hygiene and diagnostics.** Anything that treats `nid`
-  as globally unique (provenance, scope pruning, `SynthKey`) needs auditing before
-  Phase 2b; `SynthKey` is per-function scratch and can keep raw pointers.
+- **Shared nids are legitimate** (template atoms re-emitted by `mh-quoted`, mono
+  instances, tower and lint copies), and the maps are latest-wins. Accepted entries
+  must therefore never be overwritten by a candidate that is later dropped — which
+  the overlay guarantees — but two accepted artifacts can still contend for one nid,
+  exactly as today.
 - **By-value record copies alias inner lists** (`Func` copies share `params`;
   mono's output `Program` aliases the input's `externs`/`traits`/`impls`). Seal
   must copy or reference-by-artifact at every such edge; the generator schema
