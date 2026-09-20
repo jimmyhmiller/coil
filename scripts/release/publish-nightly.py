@@ -7,35 +7,10 @@ import argparse
 import hashlib
 import http.client
 import json
-import os
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
-
-def oidc_token(audience: str) -> str:
-    request_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
-    bearer = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
-    if not request_url or not bearer:
-        raise SystemExit("GitHub OIDC environment is unavailable; workflow needs id-token: write")
-    separator = "&" if "?" in request_url else "?"
-    request = urllib.request.Request(
-        request_url + separator + urllib.parse.urlencode({"audience": audience}),
-        headers={"Authorization": f"Bearer {bearer}"},
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response)["value"]
-
-
-def call(base: str, audience: str, method: str, path: str, body: bytes = b"") -> dict:
-    url = urllib.parse.urljoin(base.rstrip("/") + "/", path.lstrip("/"))
-    request = urllib.request.Request(url, data=body, method=method, headers={
-        "Authorization": f"Bearer {oidc_token(audience)}",
-        "Content-Type": "application/json",
-    })
-    with urllib.request.urlopen(request, timeout=60) as response:
-        raw = response.read()
-        return json.loads(raw) if raw else {}
+from gatekeeper import call, oidc_token
 
 
 def upload(base: str, audience: str, path: str, artifact: Path, size: int) -> None:
