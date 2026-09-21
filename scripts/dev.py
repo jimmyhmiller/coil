@@ -179,15 +179,26 @@ def install(args: argparse.Namespace) -> None:
         report_installed(destination)
         return
 
-    shutil.copy2(source, destination)
-    destination.chmod(source.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    if sys.platform == "darwin":
-        subprocess.run(
-            ["codesign", "-s", "-", "--force", str(destination)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+    # Written beside the destination and renamed over it, never copied into it.
+    # Linux refuses to open a running executable for writing (ETXTBSY), so with any
+    # `coil` process alive -- an editor's language tooling, a long test run -- an
+    # in-place copy failed the install after the whole bootstrap had passed. A
+    # rename replaces the name and leaves the running process its old file; it
+    # also means nobody ever executes a half-written compiler.
+    staged = destination.with_name(f".{destination.name}.installing-{os.getpid()}")
+    try:
+        shutil.copy2(source, staged)
+        staged.chmod(source.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        if sys.platform == "darwin":
+            subprocess.run(
+                ["codesign", "-s", "-", "--force", str(staged)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        os.replace(staged, destination)
+    finally:
+        staged.unlink(missing_ok=True)
     print(f"installed {source} -> {destination}")
     warm_jit_unit(destination, libdir)
     report_installed(destination)
