@@ -38,37 +38,41 @@ through.
 
 ## Provenance
 
-**This revision was cross-emitted from macOS (arm64) and has never been RUN.** It is an
-UNVERIFIED stage0 in the only sense that matters — nothing on the emitting host can
-execute an ELF binary — so treat it as a bootstrap of last resort, smoke-test the
-toolchain first, and use it only to drive a real `rebootstrap-linux.sh` whose fixpoint
-and gates are what actually vouch for the seed you commit.
+**This revision has been RUN.** It was cross-emitted from macOS (arm64), linked into a
+stage0 on Linux x86-64 (Ubuntu, LLVM 21.1.8, `/usr/lib/llvm-21/bin/clang`), and that
+stage0 drove `python3 scripts/dev.py build linux` to a byte-identical LLVM fixed point.
+Both committed Linux seeds were then refreshed from the verified compiler, and a plain
+`python3 scripts/dev.py build linux` (no `STAGE0`) was re-run to prove the new seed
+bootstraps this tree by itself. So the IR is the escape hatch again, not the only way in.
 
     coil emit-ir src/compiler/main.coil \
         --target x86_64-unknown-linux-gnu > coil-linux.ll
 
-Emitted at commit `ec34452` on `design/immutable-artifacts` (2026-09-20) from a clean
+Emitted at commit `7ed1648` on `design/immutable-artifacts` (2026-09-20) from a clean
 tree, by a compiler built from that same source (3-stage self-host, LLVM fixpoint
-stage2.o == stage3.o). It was refreshed because both committed Linux seeds predate the
-`(const Name Keyword)` value-parameter syntax and cannot compile this tree (`unknown
-trait 'Name' in bound`); the two macOS seeds were refreshed in the same sitting, the
-Linux pair cannot be from a Mac. The IR's native link surface includes Coil's bundled
-libcurl and mbedTLS archives. Note that `emit-ir --help` does not advertise `--target`,
-but it honours it — the help text is wrong, not the flag.
+stage2.o == stage3.o). Note that `emit-ir --help` does not advertise `--target`, but it
+honours it — the help text is wrong, not the flag.
 
-Checked as far as macOS permits:
+**The emitting LLVM was 22; the build host's was 21.** LLVM 22 writes an attribute LLVM
+21's parser does not know, on two intrinsic declarations. Before compiling with an
+older clang:
 
-  - `llvm-as` parses it (43.2 MB of IR, 12492 defines);
-  - `llc -mtriple=x86_64-unknown-linux-gnu -filetype=obj` produces a real
-    `ELF 64-bit LSB relocatable, x86-64` object, so codegen does not hit an
-    unimplemented ABI path;
-  - the undefined-symbol scan finds **214** distinct `LLVMxxx` C-API symbols, newest
-    still `LLVMArrayType2` / `LLVMConstArray2` (LLVM 17), so LLVM 20/21/22 all satisfy it.
+    sed -i 's/ nocreateundeforpoison//g' coil-linux.ll
 
-**The Linux seeds are still the stale ones.** On a Linux x86-64 host: link this IR into a
-stage0 as described below, smoke-test it against the frozen `fib`/`io` controls, then
-`STAGE0=<that> python3 scripts/dev.py build linux`, then
-`STAGE0=<verified> ./scripts/compiler/refresh-seed.sh` for `full` and again for `nollvm`.
+It only tells the optimizer an intrinsic does not create undef or poison, so dropping
+it is semantically inert. The artifact is committed as emitted, not as edited.
+
+What the run found, none of it in the IR:
+
+- The x64 runtime references had gone stale, and nothing could notice: that gate only
+  builds on an x86-64 host. `simd.coil` exits 0 on every backend but its x64 reference
+  said 42; `args.coil`'s recorded `argv[0]` predated the gate running programs under
+  their source name; `llvm-ir-ops.coil` had no x64 reference at all. Re-blessed on Linux
+  from the LLVM backend, as that gate intends — 57/57, x64 and LLVM agreeing on each.
+- The installer copied the new compiler INTO the running one, which Linux refuses
+  (`ETXTBSY`) whenever a `coil` process is alive. It renames into place now.
+- `rebootstrap-nollvm-linux.sh` needs `COIL_LLVM_LIBDIR=/usr/lib/llvm-21/lib` for its
+  stage0; the script says so itself when it is missing.
 
 ## Rebuilding a stage0 from this IR
 
