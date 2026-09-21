@@ -105,6 +105,18 @@ EMPTY_MAPS={
  ('coil.compiler.resolve.SemanticWorkspace','revision_heads'),
  ('coil.compiler.resolve.SemanticWorkspace','failed_parses')}
 
+# Name -> position tables whose keys are BORROWED from the records they index (each
+# key is the very name that record holds). Their slot arrays are entered as one node
+# and their keys re-pointed on copy (`graph-name-index!`), instead of one visited
+# node per slot: with 2,000 accepted definitions these slots were 22k of the 43k
+# records a publication touched, and none of them led anywhere the records had not.
+# Only a table that really borrows belongs here; one that owns its keys would have
+# them dropped, and the copy aborts rather than publish a name nothing reached.
+BORROWED_NAME_INDEXES={
+ ('coil.compiler.loader.LS','checked_functions'),
+ ('coil.compiler.check.Cx','sigidx'),
+ ('coil.compiler.check.Cx','constidx')}
+
 # Pointer fields whose closure is sealed once and then held as an artifact. The
 # number is the root kind: it names the walk a sealed root is recorded with. A
 # field is only sealed when the driver registered its pointer as a root, which it
@@ -314,6 +326,10 @@ def body(t):
                 ops='(.ops '+expr+')'
                 walks.append(call('walk',('ptr','coil.hashmap.KeyOps'),ops))
                 fields+=[':'+name, '(coil.hashmap.HashMap :slots (p/cast (ptr (coil.hashmap.Entry '+render(field[1])+' '+render(field[2])+')) 0) :len 0 :cap 0 :tombs 0 :alc (.destination g) :ops '+call('value',('ptr','coil.hashmap.KeyOps'),ops)+')'];continue
+            if key in BORROWED_NAME_INDEXES:
+                walks.append(call('walk',('ptr','coil.hashmap.KeyOps'),'(.ops '+expr+')'))
+                walks.append('(graph-name-index! g (.slots '+expr+') (.cap '+expr+'))')
+                fields+=[':'+name,call('value',field,expr)];continue
             if key in NULL_FIELDS:
                 fields+=[':'+name,f'(p/cast {render(field)} 0)'];continue
             if key in OPAQUE_FIELDS:
