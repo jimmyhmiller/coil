@@ -37,7 +37,7 @@ case "$(uname -s):$(uname -m)" in
     full_seed=bootstrap/seeds/native/coil-seed
     full_version=bootstrap/seeds/native/SEED_VERSION
     full_source='src/compiler/main.coil (LLVM + arm64)'
-    full_proof='arm64 fixpoint (stage2.o==stage3.o) + gate-full + arm64 gate-run'
+    full_proof='LLVM fixed point (stage2.o==stage3.o)'
     nollvm_script=./scripts/compiler/rebootstrap-nollvm.sh
     nollvm_seed=bootstrap/seeds/native/coil-seed-nollvm
     nollvm_version=bootstrap/seeds/native/SEED_VERSION_NOLLVM
@@ -49,7 +49,7 @@ case "$(uname -s):$(uname -m)" in
     full_seed=bootstrap/seeds/native/coil-seed-linux-x86_64
     full_version=bootstrap/seeds/native/SEED_VERSION_LINUX
     full_source='src/compiler/main.coil (LLVM + x64)'
-    full_proof='x64 fixpoint (stage2.o==stage3.o) + full Linux and stage gates'
+    full_proof='LLVM fixed point (stage2.o==stage3.o)'
     nollvm_script=./scripts/compiler/rebootstrap-nollvm-linux.sh
     nollvm_seed=bootstrap/seeds/native/coil-seed-nollvm-linux-x86_64
     nollvm_version=bootstrap/seeds/native/SEED_VERSION_NOLLVM_LINUX
