@@ -241,17 +241,56 @@ way functions are treated:
   in the stale set (`jit_env_stale.coil` covers it).
 - `Const` and `ConstEntry` are sealed records (chunk kinds 15, 16).
 
-With those: prepare 44 → 29 ms, and the checker's entries and the native constants
-are held as chunks. **Not finished:** the checked program's own `Const` records are
-still spelled differently on every edit (64 chunks re-recorded, 22k `Expr` walked),
-because some pass still re-allocates a node under each constant per compilation —
-the same node id and span, a pointer into the new candidate's arena. It is not
-`setup-consts`, `mono-consts`, the facade copy, or qualification of inherited forms.
-Finding that pass is the next step; after it, the remaining big-probe costs in order
-are `merge-consts`' quadratic duplicate scan (resolve), the JIT link step (21 ms: it
-rebuilds a flat symbol namespace from every generation and resolves by linear scan),
-and the name → position tables (20k hash entries re-walked per edit), which want to
-be persistent maps.
+With those: prepare 44 → 29 ms. What still re-spelled every constant on every edit
+turned out to be **mono**: `mono-ownership-context` built a whole new checker context
+per edit with no accepted state to read from, so it typed all 2,002 constants a second
+time and — because setting up replaces a runtime constant's value in place — rewrote
+the *checked* program's records while doing it. It is now handed the state the program
+was checked on (`monomorphize-reusing … accepted`). `check.constants-accepted` under
+`COIL_TRACE` shows every pass accepting all of them. Snapshot 59 → 35 ms.
+
+The rest of that probe's cost, in the order it was removed:
+
+- **Linking (22 ms → <1).** For every undefined symbol the loader asked `dlsym` first
+  and only then the session's own definitions, and resolved those through a flat list
+  rebuilt from every live image per load. The session now keeps a hashed
+  `JitNamespace` (`jit.coil`), consulted before the process, extended when an image is
+  added and dropped when one is freed (it borrows the images' names).
+- **`merge-consts` / `merge-externs`** scanned the growing output per entry; `Out`
+  indexes both by name.
+- **The name → position tables** (`checked_functions`, `sigidx`, `constidx`) were 22k
+  of the 43k records a publication touched. They borrow their keys from the records
+  they index, so nothing is found by walking them: their slot arrays are now entered
+  as one node and the keys re-pointed on copy (`graph-name-index!`,
+  `BORROWED_NAME_INDEXES` in the generator). **They are not persistent maps, and
+  cannot usefully be:** their values are positions in lists that are rebuilt with the
+  submission first, so every inherited position moves on every edit and a persistent
+  map would share nothing. Sharing them needs a stable value — name → declaration —
+  which is the declaration-index step below, not a change of container.
+- The snapshot graph's visited-table hash used an address's low bits, which alignment
+  zeroes; it now mixes and folds.
+
+| `replace-big` (2,000 accepted definitions) | before | now |
+|---|---|---|
+| prepare | 38 ms | 17 ms |
+| native (codegen + link) | 28 ms | 7 ms |
+| retain | 21 ms | 19 ms |
+| snapshot | 99 ms | 29 ms |
+| **per edit** | **~190 ms** | **~72 ms** |
+
+The small probe: 25 → ~17 ms per edit, snapshot 7 ms.
+
+**What is still O(program) per edit**, measured on that probe, largest first: `retain`
+(19 ms — the joint liveness closure and type-reference walk over every program, then
+list rebuilds by the prune passes), `prepare` (17 ms — `setup-sigs` for every function,
+the resolver's merges, stage-3 rounds over the whole definition table), the snapshot's
+remaining walk (8k `Sexp`, of which 34 chunks are re-recorded per edit, and 4.5k
+resolver entries whose strings `semantic-inherit-resolution!` copies per candidate),
+and codegen's `g-register-sigs!` over every signature. Each wants the treatment the
+constants got: recognize what the accepted state already established and take it,
+rather than recompute it. The structural end state is unchanged — declarations in
+persistent indexes keyed by name, read through by every phase — and is the only thing
+that makes the name tables above shareable.
 
 ### Accepted state is immutable, and now that is checked
 
