@@ -122,7 +122,10 @@ def main() -> None:
                     r'^coil-trace end ([^ ]+) (\d+)ms$', measured.stderr, re.MULTILINE):
                 spans.setdefault(name, []).append(int(elapsed))
             wanted = ('jit.prepare', 'jit.publish.native', 'jit.publish.retain',
-                      'jit.publish.snapshot')
+                      'jit.publish.snapshot', 'jit.retain.meta',
+                      'jit.retain.prune-joint',
+                      'jit.retain.promote-declarations',
+                      'jit.retain.promote-sigs', 'jit.retain.promote-deps')
             report['span_medians_ms'] = {
                 name: statistics.median(spans[name][1 + args.warmup_edits:])
                 for name in wanted if len(spans.get(name, [])) >= args.edits + 1

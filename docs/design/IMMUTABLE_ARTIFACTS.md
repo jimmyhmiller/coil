@@ -1018,13 +1018,22 @@ candidates, and ORC generation leases remain covered by the generated gates.
 
 The retained census on the 2,000-definition edit probe changed from 9,385
 `HashMap (slice u8) i64` entries to 8. Snapshot median under tracing fell from
-20 ms to 15 ms. The correctness-preserving compatibility boundary still rebuilds
-the flat per-module declaration indexes after pruning before diffing them into the
-HAMT; removing that rebuild requires the declaration records themselves to become
-persistent artifacts. Consequently `jit.publish.retain` is 11 ms, and the final
-30-edit measurements are 54 ms untraced and 53 ms traced (prepare 15 ms, native
-12 ms, retain 11 ms, snapshot 15 ms). This is a structural storage milestone, not
-the `<16 ms` endpoint.
+20 ms to 15 ms. Pruning and explicit retirement now maintain authoritative sparse
+candidate overlays, including zero-mask tombstones, so publication no longer
+rebuilds every flat per-module declaration index before deriving the next HAMT.
+The macro facade merges those overlays and shares the application or prior macro
+base; its legacy lists still exist as a compatibility view, but their union is
+linear rather than repeatedly scanning the accumulated result.
+
+On the final 30-edit measurements, the untraced median is **53 ms** (50--54 ms,
+p95 54 ms). With tracing enabled the median is 52 ms: prepare 16 ms, native 12 ms,
+retain 9 ms, and snapshot 16 ms. Within retain, macro-facade merging is 2 ms,
+joint pruning is 5 ms, and declaration, signature, and dependency promotion all
+round to 0 ms. `COIL_JIT_PROTECT=1` gives a 50 ms median over the shorter protected
+probe, establishing that the optimization does not mutate accepted state. This is
+a structural storage milestone, not the `<16 ms` endpoint: reaching that target
+requires delta-based preparation and snapshot publication plus removing or
+overlapping native publication's 12 ms serial cost.
 
 - **Undo log over the mutable graph.** Cheap rejection, but every mutation and
   dependency must be logged correctly forever, and an old revision pinned by a
