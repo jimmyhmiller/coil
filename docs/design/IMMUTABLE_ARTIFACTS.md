@@ -843,6 +843,15 @@ a wrapper over today's containers and route every read of inherited state throug
 the full gate ladder is the contract. Its first step is moving the session code
 out of `driver.coil` into its own files, coordinated with `feature/live-whole-program`.
 
+The first read boundary has landed: all name-based checked-function reads now go
+through `ls-function`, `ls-defines-function?`, or the identity-aware
+`ls-same-function?`. Resolver duplicate checks, checker inheritance, macro-runtime
+detection, dependency maintenance, and the public JIT environment no longer know
+that `checked_functions` stores positions in `Program.funcs`. The sole direct read
+of that table is the compatibility implementation in `loader.coil`, so the Phase 2
+checked-body index can change representation without another cross-compiler call-site
+migration.
+
 **Phase 2 — signatures and checked bodies.** `DefId → Sig`, `DefId → CheckedBody`
 as persistent indexes, after the semantic side tables (the first slice, because
 they are the majority of what is copied). Fix
