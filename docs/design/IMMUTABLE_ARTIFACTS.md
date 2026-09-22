@@ -988,6 +988,23 @@ their phase-wide consumers are the next boundary: until enumeration moves to the
 persistent index, function headers themselves are still duplicated in the legacy
 snapshot even though name lookup no longer depends on them.
 
+Candidate `checked_functions` is now an overlay too. `ls-accept-checked!` inserts
+only functions whose body differs from the persistent base; a negative position is
+an explicit tombstone for entry hiding and joint pruning. Thus a one-definition
+edit no longer allocates and hashes 2,000 redundant name slots during prepare or
+again during retain, although it still scans the flat function list to discover
+that those definitions are unchanged. Removing that scan requires the next
+enumeration boundary, not another hash-table optimization.
+
+`scripts/benchmarks/jit_edit_cycle.py` makes the actual target reproducible: it
+submits 2,000 definitions once and times complete `jit-compile-with-entry!` calls,
+including native publication and metadata finalization. At this checkpoint the
+untraced median is **56 ms** over 27 steady edits. With tracing enabled, medians are
+prepare 18 ms, native 12 ms, retain 9 ms, snapshot 20 ms (tracing itself raises the
+whole-cycle median to 59 ms). This directly contradicts completion of the `<16 ms`
+goal and identifies the legacy snapshot and whole-program prepare work as the next
+two boundaries.
+
 - **Undo log over the mutable graph.** Cheap rejection, but every mutation and
   dependency must be logged correctly forever, and an old revision pinned by a
   native lease still needs a stable view — which is a snapshot again.
