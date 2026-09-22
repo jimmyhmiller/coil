@@ -127,7 +127,8 @@ ARTIFACT_FIELDS={
  ('coil.compiler.ast.Extern','params'):6,
  ('coil.compiler.check.Sig','params'):6,
  ('coil.compiler.check.Sig','fnptr_params'):6}
-ARTIFACT_KINDS={}
+# Whole checked-function artifacts back the persistent declaration index.
+ARTIFACT_KINDS={7:'coil.compiler.ast.Func'}
 
 # Declaration records an accepted program is made of. Their closures are sealed,
 # and a run of them that is spelled exactly like a run sealed before is held as one
@@ -220,6 +221,7 @@ def ident_body(t):
 
 OPAQUE_FIELDS={('coil.compiler.loader.LS','code_session_state'),
                ('coil.compiler.loader.LS','persistent_sigs'),
+               ('coil.compiler.loader.LS','persistent_checked'),
                ('coil.compiler.check.Cx','sig_base'),
                ('coil.compiler.ast.AstUnitState','resolution_base'),
                ('coil.compiler.metaengine.MEEntry','fp'),
@@ -444,6 +446,7 @@ type_names='(defn snapshot-type-name [(kind i64)] (-> (slice u8)) (cond '+ ' '.j
 wrappers=''
 for name,t in zip(('scan-loader!','scan-program!','scan-resolution!','scan-meta-entries!','scan-syntax!'), ROOTS):
     wrappers+='(defn '+name+' [(g (ptr Graph)) (root (ptr '+render(t)+'))] (-> i64) ('+ident(t)+'-scan g root))\n'
+wrappers+='(defn scan-func! [(g (ptr Graph)) (root (ptr coil.compiler.ast.Func))] (-> i64) ('+ident('coil.compiler.ast.Func')+'-scan g root))\n'
 # The walk a sealed root of each kind is recorded with.
 wrappers+='(defn artifact-scan [(kind i64)] (-> (fnptr c [(ptr Graph) (ptr i8)] i64)) (cond '+' '.join(
     '(= kind '+str(k)+') (p/fnptr-of '+ident(t)+'-scan-erased)' for k,t in sorted(ARTIFACT_KINDS.items()))+' :else (do (abort) (p/fnptr-of '+ident(ARTIFACT_KINDS[1])+'-scan-erased))))\n'

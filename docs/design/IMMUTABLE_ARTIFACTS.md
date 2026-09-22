@@ -963,6 +963,31 @@ candidate or conditional impl can be rescued, so the former whole-program type
 reference walk could not change the result. This reduced median
 `jit.retain.prune-joint` from about 9 ms to about 5 ms on the probe.
 
+### Checked functions become sealed persistent entries (2026-09-21)
+
+Accepted name lookup no longer retains `checked_functions`, the mutable
+name-to-`Program.funcs` position table. Publication seals every new or replaced
+`Func` header and its pointer closure as a whole-function artifact, then associates
+the name with that stable pointer in `checked_base.coil`. A derived base path-copies
+only changed names; unchanged entries retain their prior function artifact. The
+application program and macro-union facade have separate bases because they expose
+different sets of functions. Retirement dissociates the name before publication.
+
+The compatibility `Program` lists still exist for phase-wide enumeration, but
+all name lookup goes through the base after acceptance and the mutable position
+maps are replaced with empty maps before relocation. Whole-function sealing uses
+the generated precise visitor and holds already-sealed bodies and parameter lists
+as nested artifacts, so no persistent entry points into a revision snapshot.
+Read-only page protection covers these new artifacts through the existing heap.
+
+On the repeated replacement memory probe, steady snapshot metadata fell from
+1,183,128 bytes to 1,052,072 bytes. Exact live bytes and whole-function artifact
+bytes remain flat across 80 identical replacements; the full generated gate and
+its protected session suite pass. The remaining flat `Program.funcs` arrays and
+their phase-wide consumers are the next boundary: until enumeration moves to the
+persistent index, function headers themselves are still duplicated in the legacy
+snapshot even though name lookup no longer depends on them.
+
 - **Undo log over the mutable graph.** Cheap rejection, but every mutation and
   dependency must be logged correctly forever, and an old revision pinned by a
   native lease still needs a stable view — which is a snapshot again.
