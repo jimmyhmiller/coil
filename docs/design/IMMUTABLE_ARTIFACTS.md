@@ -892,6 +892,21 @@ terms of artifact and index bytes — restated, not loosened.
 
 ## Alternatives considered
 
+### Retain follow-up (2026-09-21)
+
+The macro facade produced by `compiler-revision-retain-meta!` is already the union
+of the application and macro checked programs. Joint liveness used to analyze both
+the application program and that union, visiting every application definition
+twice, even though the two owned programs still have to be pruned separately.
+Reachability now analyzes only the union while candidate discovery, impl ownership,
+and pruning continue to inspect both loaders.
+
+On 27 edits of the 2,000-definition `replace-big` probe, median
+`jit.retain.joint-analyze` fell from 14 to 13 ms, `jit.retain.prune-joint` from 19
+to 17 ms, and total `jit.publish.retain` from 25 to 24 ms. This removes one
+redundant whole-program walk; the remaining pass is still O(program), so the
+persistent declaration/dependency indexes above remain the structural fix.
+
 - **Undo log over the mutable graph.** Cheap rejection, but every mutation and
   dependency must be logged correctly forever, and an old revision pinned by a
   native lease still needs a stable view — which is a snapshot again.
