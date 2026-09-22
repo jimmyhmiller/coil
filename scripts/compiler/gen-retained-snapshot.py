@@ -219,6 +219,8 @@ def ident_body(t):
     return '(match value '+' '.join(arms)+')'
 
 OPAQUE_FIELDS={('coil.compiler.loader.LS','code_session_state'),
+               ('coil.compiler.loader.LS','persistent_sigs'),
+               ('coil.compiler.check.Cx','sig_base'),
                ('coil.compiler.metaengine.MEEntry','fp'),
                # A persistent base is owned by its revision and shared between
                # snapshots; a snapshot only points at it.

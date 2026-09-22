@@ -907,6 +907,31 @@ to 17 ms, and total `jit.publish.retain` from 25 to 24 ms. This removes one
 redundant whole-program walk; the remaining pass is still O(program), so the
 persistent declaration/dependency indexes above remain the structural fix.
 
+### Callable signatures become the first persistent declaration index (2026-09-21)
+
+Accepted callable signatures now live in a refcounted persistent map
+(`sig_base.coil`) keyed by name. A candidate builds only the signatures whose
+checked function body is not the exact accepted body, reads inherited entries
+through the base, and promotes its overlay after joint pruning. Retired names are
+removed before promotion. The accepted `function_abis` list is no longer retained:
+it is a transient compatibility report materialized from the base for codegen and
+live IR, then cleared from every checked/native snapshot root.
+
+The persistent entries own deep copies of all nested types, bounds and names.
+Candidate materialization also deep-copies an entry because checked expressions may
+retain pointers into its types. The application and macro facade share the same
+published base; failing to publish it through the facade made later accepted macros
+lose core callables, which `jit-single-form.py` now exercises through the existing
+no-reexpansion case.
+
+On 27 edits after one submission defining 2,000 functions, median
+`frontend.check.setup` is now below the timer's 1 ms resolution and
+`jit.retain.promote-sigs` is 0 ms. End-to-end remains about 56 ms: prepare 15 ms,
+native 7 ms, retain 13 ms, snapshot 21 ms. This removes the signature setup walk
+and roughly 16 ms from the previous ~72 ms result, but it deliberately does not
+claim the `<16 ms` target: resolution/stage-3 work, joint liveness/pruning, and the
+remaining snapshot graph are still proportional to the accepted program.
+
 - **Undo log over the mutable graph.** Cheap rejection, but every mutation and
   dependency must be logged correctly forever, and an old revision pinned by a
   native lease still needs a stable view — which is a snapshot again.
