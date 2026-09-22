@@ -841,8 +841,144 @@ sed 's/kind = "object"/kind = "archive"/' "$T/secondary-artifact/Coil.toml" \
   > "$T/secondary-artifact/Coil.bad.toml"
 mv "$T/secondary-artifact/Coil.toml" "$T/secondary-artifact/Coil.good.toml"
 mv "$T/secondary-artifact/Coil.bad.toml" "$T/secondary-artifact/Coil.toml"
-expect_out 'artifact kind must be "object"' "unsupported secondary artifact kinds are rejected" \
+expect_out 'artifact kind must be "object" or "executable"' "unsupported secondary artifact kinds are rejected" \
   sh -c "cd '$T/secondary-artifact' && '$COIL' build"
+
+echo "== manifest executable artifacts =="
+# One package, two independently linked programs. `internal.o` and `vt.o` both
+# define helper_value, and `rootlink.o` and `vt.o` both define shared_marker: if
+# either program received the other's native dependency or the root [link]
+# objects, its link would fail with a duplicate symbol. The helper also imports a
+# path dependency whose [link] object it needs, and prints through the stdlib.
+X="$T/exe-artifact"
+mkdir -p "$X/dep/src" "$X/dep/native" "$X/app/src/helper" "$X/app/native"
+printf '[package]\nname = "depkg"\n\n[link]\nobjects = ["native/dep.o"]\n' > "$X/dep/Coil.toml"
+printf 'long dep_value(void) { return 30; }\n' > "$X/dep/native/dep.c"
+cat > "$X/dep/src/lib.coil" <<'EOF'
+(module depkg.lib)
+(extern dep_value :cc c [] (-> i64))
+(defn dep-part [] (-> i64) (dep_value))
+EOF
+printf 'long helper_value(void) { return 7; }\n' > "$X/app/native/internal.c"
+printf 'long helper_value(void) { return 12; }\nlong shared_marker(void) { return 0; }\n' > "$X/app/native/vt.c"
+printf 'long shared_marker(void) { return 0; }\n' > "$X/app/native/rootlink.c"
+exe_objects_ok=1
+for f in dep/native/dep app/native/internal app/native/vt app/native/rootlink; do
+  cc -c "$X/$f.c" -o "$X/$f.o" || exe_objects_ok=0
+done
+cat > "$X/app/native/flags" <<'EOF'
+#!/bin/sh
+echo "$1" >> "$(dirname "$0")/flags.log"
+printf '%s\n' "$(cd "$(dirname "$0")" && pwd)/$1.o"
+EOF
+chmod +x "$X/app/native/flags"
+cat > "$X/app/Coil.toml" <<'EOF'
+[package]
+name = "app"
+entry = "src/main.coil"
+
+[dependencies]
+depkg = { path = "../dep" }
+
+[link]
+objects = ["native/rootlink.o"]
+
+[native-dependencies]
+internal = { flags-command = "native/flags internal" }
+vt = { flags-command = "native/flags vt" }
+
+[artifacts.helper]
+kind = "executable"
+entry = "src/helper/main.coil"
+out = "build/tools/helper"
+optimization = 2
+native-dependencies = ["vt"]
+EOF
+cat > "$X/app/src/main.coil" <<'EOF'
+(module app.main)
+(extern helper_value :cc c [] (-> i64))
+(extern shared_marker :cc c [] (-> i64))
+(defn main [] (-> i64) (+ (helper_value) (shared_marker)))
+EOF
+cat > "$X/app/src/helper/main.coil" <<'EOF'
+(module app.helper.main)
+(import "depkg.lib" :as dep)
+(extern helper_value :cc c [] (-> i64))
+(extern shared_marker :cc c [] (-> i64))
+(defn main [] (-> i64)
+  (println "helper running")
+  (+ (+ (dep/dep-part) (helper_value)) (shared_marker)))
+EOF
+cp "$X/app/Coil.toml" "$X/app/Coil.good.toml"
+exe_build_out=$(cd "$X/app" && "$COIL" build 2>&1); exe_build_rc=$?
+helper_out=""; helper_rc=""; app_rc=""
+if [ "$exe_objects_ok" = 1 ] && [ "$exe_build_rc" = 0 ] && [ -x "$X/app/build/tools/helper" ]; then
+  helper_out=$("$X/app/build/tools/helper"); helper_rc=$?
+  "$X/app/build/release/app"; app_rc=$?
+fi
+[ "$helper_rc" = 42 ] && [ "$helper_out" = "helper running" ] \
+  && ok "bare build links and runs an executable artifact with dependency link inputs" \
+  || bad "executable artifact" "want helper rc=42 output 'helper running', got rc=$helper_rc '$helper_out': $exe_build_out"
+[ "$app_rc" = 7 ] \
+  && ok "package executable keeps its own native dependency and [link] inputs" \
+  || bad "package executable beside executable artifact" "want app rc=7, got rc=$app_rc"
+exe_flags_log=$(cat "$X/app/native/flags.log" 2>/dev/null)
+case "$exe_flags_log" in
+  *vt*) ok "an artifact-selected native dependency's flags-command runs" ;;
+  *) bad "artifact native dependency" "flags-command for 'vt' never ran: $exe_flags_log" ;;
+esac
+
+# The artifact is replaced by rename, never rewritten in place: the new file is a
+# new inode and no staged link output is left behind.
+helper_inode_before=$(ls -i "$X/app/build/tools/helper" 2>/dev/null | awk '{print $1}')
+( cd "$X/app" && "$COIL" build >/dev/null 2>&1 )
+helper_inode_after=$(ls -i "$X/app/build/tools/helper" 2>/dev/null | awk '{print $1}')
+exe_leftovers=$(ls -A "$X/app/build/tools" "$X/app/build/release" 2>/dev/null)
+case "$exe_leftovers" in
+  *coil-link*) bad "atomic artifact replacement" "staged link output left behind: $exe_leftovers" ;;
+  *) if [ -n "$helper_inode_before" ] && [ -n "$helper_inode_after" ] \
+        && [ "$helper_inode_before" != "$helper_inode_after" ]; then
+       ok "a rebuilt executable replaces its output by rename"
+     else
+       bad "atomic artifact replacement" "inode $helper_inode_before -> $helper_inode_after"
+     fi ;;
+esac
+
+rm -rf "$X/app/build"
+exe_run_rc=$(cd "$X/app" && "$COIL" run >/dev/null 2>&1; echo $?)
+[ "$exe_run_rc" = 7 ] && [ -x "$X/app/build/tools/helper" ] \
+  && ok "bare coil run builds executable artifacts before running the package" \
+  || bad "coil run artifacts" "want rc=7 and build/tools/helper, got rc=$exe_run_rc"
+
+rm -rf "$X/app/build"
+( cd "$X/app" && "$COIL" build src/main.coil -o explicit-main >/dev/null 2>&1 ) \
+  && [ -x "$X/app/explicit-main" ] && [ ! -e "$X/app/build/tools/helper" ] \
+  && ok "explicit-file build does not build executable artifacts" \
+  || bad "explicit-file executable artifact selection" "helper was built or main build failed"
+
+sed 's/native-dependencies = \["vt"\]/native-dependencies = ["missing"]/' "$X/app/Coil.good.toml" > "$X/app/Coil.toml"
+expect_out "Coil.toml:20: artifact 'helper' selects unknown native dependency 'missing'" \
+  "an unknown artifact native dependency is a located manifest error" \
+  sh -c "cd '$X/app' && '$COIL' build"
+sed 's/kind = "executable"/kind = "object"/' "$X/app/Coil.good.toml" > "$X/app/Coil.toml"
+expect_out "Coil.toml:20: artifact 'helper' has kind = \"object\"; 'native-dependencies' is a link input" \
+  "object artifacts reject native-dependencies" \
+  sh -c "cd '$X/app' && '$COIL' build"
+printf '[package]\nname = "o"\n\n[artifacts.rt]\nkind = "object"\nentry = "src/rt.coil"\nout = "rt.o"\nlibs = ["m"]\n' \
+  > "$X/app/Coil.toml"
+expect_out "Coil.toml:8: artifact 'rt' has kind = \"object\"; 'libs' is a link input" \
+  "object artifacts reject link keys" \
+  sh -c "cd '$X/app' && '$COIL' build"
+(cat "$X/app/Coil.good.toml"; printf '\n[artifacts.again]\nkind = "executable"\nentry = "src/helper/main.coil"\nout = "build//tools/./helper"\n') \
+  > "$X/app/Coil.toml"
+expect_out "Coil.toml:22: artifact 'again' out 'build//tools/./helper' is also the output of artifact 'helper'" \
+  "two artifacts with one output path are rejected" \
+  sh -c "cd '$X/app' && '$COIL' build"
+sed 's|out = "build/tools/helper"|out = "build/debug/../release/app"|' "$X/app/Coil.good.toml" > "$X/app/Coil.toml"
+expect_out "artifact 'helper' out 'build/debug/../release/app' is the package executable's output 'build/release/app'" \
+  "an artifact may not write the package executable's output" \
+  sh -c "cd '$X/app' && '$COIL' build"
+cp "$X/app/Coil.good.toml" "$X/app/Coil.toml"
 
 echo "== namespace index: file placement is irrelevant and paths are rejected =="
 mkdir -p "$T/sib/src/unrelated/place"
