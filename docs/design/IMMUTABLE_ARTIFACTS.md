@@ -932,6 +932,28 @@ and roughly 16 ms from the previous ~72 ms result, but it deliberately does not
 claim the `<16 ms` target: resolution/stage-3 work, joint liveness/pruning, and the
 remaining snapshot graph are still proportional to the accepted program.
 
+### Resolution registries become a persistent overlay (2026-09-21)
+
+The accepted `(module, raw) -> qualified` type and value registries and the
+`source -> module` registry now live in a refcounted persistent base. A candidate
+records only its own qualification results in the existing mutable lists and
+looks through to the base on a miss. After the snapshot liveness pass has used
+those lists to mark hygiene scopes, publication promotes the overlay, applies
+retirements, and empties the lists before relocation. Rejected candidates never
+write the accepted base, and held revisions continue to share unchanged HAMT
+nodes.
+
+On the same 2,000-definition probe, the snapshot median fell from 21 ms to
+19 ms. Resolution copying is gone, but the loader graph still walks the accepted
+syntax and declaration structures, so this is a structural checkpoint rather
+than the end-to-end target.
+
+Joint liveness also now stops after transitive function closure when there are no
+submission-only nominal types. In that common value-replacement case no type
+candidate or conditional impl can be rescued, so the former whole-program type
+reference walk could not change the result. This reduced median
+`jit.retain.prune-joint` from about 9 ms to about 5 ms on the probe.
+
 - **Undo log over the mutable graph.** Cheap rejection, but every mutation and
   dependency must be logged correctly forever, and an old revision pinned by a
   native lease still needs a stable view — which is a snapshot again.
