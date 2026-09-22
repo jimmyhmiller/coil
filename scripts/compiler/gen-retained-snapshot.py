@@ -128,7 +128,8 @@ ARTIFACT_FIELDS={
  ('coil.compiler.check.Sig','params'):6,
  ('coil.compiler.check.Sig','fnptr_params'):6}
 # Whole checked-function artifacts back the persistent declaration index.
-ARTIFACT_KINDS={7:'coil.compiler.ast.Func',8:'coil.compiler.check.ConstEntry'}
+ARTIFACT_KINDS={7:'coil.compiler.ast.Func',8:'coil.compiler.check.ConstEntry',
+                9:'coil.compiler.ast.Const'}
 
 # Declaration records an accepted program is made of. Their closures are sealed,
 # and a run of them that is spelled exactly like a run sealed before is held as one
@@ -452,6 +453,7 @@ for name,t in zip(('scan-loader!','scan-program!','scan-resolution!','scan-meta-
     wrappers+='(defn '+name+' [(g (ptr Graph)) (root (ptr '+render(t)+'))] (-> i64) ('+ident(t)+'-scan g root))\n'
 wrappers+='(defn scan-func! [(g (ptr Graph)) (root (ptr coil.compiler.ast.Func))] (-> i64) ('+ident('coil.compiler.ast.Func')+'-scan g root))\n'
 wrappers+='(defn scan-const-entry! [(g (ptr Graph)) (root (ptr coil.compiler.check.ConstEntry))] (-> i64) ('+ident('coil.compiler.check.ConstEntry')+'-scan g root))\n'
+wrappers+='(defn scan-const! [(g (ptr Graph)) (root (ptr coil.compiler.ast.Const))] (-> i64) ('+ident('coil.compiler.ast.Const')+'-scan g root))\n'
 # The walk a sealed root of each kind is recorded with.
 wrappers+='(defn artifact-scan [(kind i64)] (-> (fnptr c [(ptr Graph) (ptr i8)] i64)) (cond '+' '.join(
     '(= kind '+str(k)+') (p/fnptr-of '+ident(t)+'-scan-erased)' for k,t in sorted(ARTIFACT_KINDS.items()))+' :else (do (abort) (p/fnptr-of '+ident(ARTIFACT_KINDS[1])+'-scan-erased))))\n'
@@ -492,6 +494,8 @@ SEMANTIC_NAMES={
  ('coil.compiler.ast.ExprKind','EVar'):{'name'},
  ('coil.compiler.ast.ExprKind','ECall'):{'func'},
  ('coil.compiler.ast.ExprKind','ENamedCall'):{'func'},
+ ('coil.compiler.ast.ExprKind','EFnPtrOf'):{'name'},
+ ('coil.compiler.ast.ExprKind','EStaticRef'):{'name'},
  ('coil.compiler.ast.ExprKind','EConstruct'):{'sum'},
  ('coil.compiler.ast.ExprKind','EDynDispatch'):{'dyn_struct','vtable_struct'},
  ('coil.compiler.ast.ExprKind','EMakeDyn'):{'dyn_struct','vtable_struct'},
