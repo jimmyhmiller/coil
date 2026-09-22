@@ -101,7 +101,7 @@ nothing; one that wants semantics calls the queries.
 ```
                  ┌─────────────────────────────────────────┐
    Sexp nodes ──▶│  SemanticModel  (side table, not dumped) │
-   (the program) │   nid → { qualified-name, def-site,      │
+   (the program) │   node-id → { qualified-name, def-site,      │
                  │           inferred-type, … }             │
                  │   + fn-sig index (from CtCtx.fns/Cx.sigs)│
                  │   + call graph / ref index (S3)          │
@@ -119,10 +119,10 @@ join key is the span `(source, lo, hi, ctxt)`, copied Sexp→Expr by the parser.
 Spans are **not** reliably unique: a macro that duplicates a subtree (e.g. `(when
 c body)` expanding `body` once) yields two `Expr`s sharing one span+ctxt.
 
-**Recommendation: a stable node id.** Add a non-dumped `nid : i64` to `Sexp` and
+**Recommendation: a stable node id.** Add a non-dumped `node-id : i64` to `Sexp` and
 `Expr`, assigned monotonically at read time and to macro-generated nodes at
-expansion, propagated through `parse-program` (Sexp.nid → Expr.nid). The
-`SemanticModel` is keyed by `nid`. Because `nid` is **not** emitted by the
+expansion, propagated through `parse-program` (Sexp.node-id → Expr.node-id). The
+`SemanticModel` is keyed by `node-id`. Because `node-id` is **not** emitted by the
 canonical dumpers, the AST/reader oracles stay byte-exact; quote/unquote
 round-trips simply mint fresh ids for generated code (correct — generated nodes
 are new).
@@ -130,7 +130,7 @@ are new).
 *Interim fallback (if we want S1 before touching `Sexp`):* key by
 `(source,lo,hi,ctxt)` and document the macro-duplication sharp edge. S1 (names +
 signatures) rarely needs per-node identity — it resolves by symbol text in a
-module context — so S1 can ship on span-keys and S2 introduces `nid`.
+module context — so S1 can ship on span-keys and S2 introduces `node-id`.
 
 ### 3.2 What a "Type" looks like to a metaprogram
 
@@ -259,20 +259,20 @@ Four load-bearing properties:
 Each phase is independently shippable and gated by `scripts/compiler/oracle/*.sh` +
 rebootstrap fixpoint, in the established style.
 
-- **S0 — node identity — ✅ SHIPPED.** A non-dumped `nid : i64` on `Sexp` and `Expr`,
-  assigned by a monotonic counter (`ast.coil` `next-nid`) in the central constructors
+- **S0 — node identity — ✅ SHIPPED.** A non-dumped `node-id : i64` on `Sexp` and `Expr`,
+  assigned by a monotonic counter (`ast.coil` `next-node-id`) in the central constructors
   `mk-sexp`/`mk-sexp-src` (every node — source-read and macro-generated — gets a unique
-  id); `parse-expr` copies `Sexp.nid` → `Expr.nid` (`mk-expr-nid`; synthesized exprs get
-  `-1`). The canonical dumpers emit only the span, never `nid`, so the oracle stays
+  id); `parse-expr` copies `Sexp.node-id` → `Expr.node-id` (`mk-expr-node-id`; synthesized exprs get
+  `-1`). The canonical dumpers emit only the span, never `node-id`, so the oracle stays
   byte-exact; assignment is deterministic, so the rebootstrap fixpoint holds. **`type-of`
-  now keys the type map on `nid`** (`type-map-*` + `do-synth` record `e.nid → type`),
+  now keys the type map on `node-id`** (`type-map-*` + `do-synth` record `e.node-id → type`),
   making it exact per node instead of span-collidable — correct even for macro-generated
   code (demo `tests/metaprogramming/nofloat_macro.coil` + `sneakymac.coil`: the checker reads the
   inferred type of a node inside a macro expansion). Verified: rebootstrap fixpoint +
   gates byte-exact.
 
-  **S0.1 — nid-based EXACT `code-decl` — ✅ SHIPPED.** A **resolution map**
-  (`comptime.coil` `res-map-*`) records each call's resolved callee — `call-node.nid` →
+  **S0.1 — node-id-based EXACT `code-decl` — ✅ SHIPPED.** A **resolution map**
+  (`comptime.coil` `res-map-*`) records each call's resolved callee — `call-node.node-id` →
   fully-qualified callee name — populated at `do-synth` from the already-resolved
   `ECall.func` (`res-map-record` in `check.coil`). `(code-decl NODE)` tries this first: if
   `NODE` is a call the checker resolved, it returns that exact function's decl
@@ -298,7 +298,7 @@ rebootstrap fixpoint, in the established style.
   Rebootstrap fixpoint + gates green.
 
   **S0.3 — exact NAMED-TYPE references — ✅ SHIPPED.** `Type` is a *sum* (matched all over
-  codegen/mono), so a `nid` field there would ripple across ~140 sites and risk the
+  codegen/mono), so a `node-id` field there would ripple across ~140 sites and risk the
   byte-exact oracle. Instead, resolution is recorded WITHOUT touching `Type`: the resolver
   records, at `qualify-type`, `(module, raw-name) → qualified-name` for each `TStruct`/`TApp`
   (`ast.coil` `type-res-*`); `resolve-program` builds a `source-id → module` map
@@ -383,7 +383,7 @@ rebootstrap fixpoint, in the established style.
   plain mutable-accumulator loop is correct; always rebuild before testing.
 
 - **S2 — the semantic loop + type map.** Reorder to parse/resolve/best-effort-
-  check before transformers/checkers; build the `nid→Type` map; expose
+  check before transformers/checkers; build the `node-id→Type` map; expose
   `type-of`, `kind-of`, the `type-*` deconstructors. The heavy phase (best-effort
   checker + fixpoint loop). Unlocks true expression typing.
 
@@ -413,9 +413,9 @@ effect systems) actually need.
    guarded fixpoint and document that transformers should be **monotonic** (never
    un-rewrite). Do we want to *enforce* monotonicity, or just document it?
 
-3. **Node identity: `nid` vs span-key.** `nid` is robust but touches
+3. **Node identity: `node-id` vs span-key.** `node-id` is robust but touches
    reader/parser/expander. Span-keys are zero-new-fields but wrong under macro
-   duplication. Recommendation: `nid` (S0). Acceptable to ship S1 on span-keys.
+   duplication. Recommendation: `node-id` (S0). Acceptable to ship S1 on span-keys.
 
 4. **Scope of semantics — user code vs library.** Should `type-of` /
    `fn-sig` answer for imported stdlib nodes too? The model *can*; the cost is

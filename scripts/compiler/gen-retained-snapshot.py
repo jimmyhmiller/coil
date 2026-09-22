@@ -319,7 +319,7 @@ def body(t):
     if kind=='defstruct':
         walks=[]; fields=[]
         if head in ('coil.compiler.ast.Expr','coil.reader.Sexp'):
-            walks.append('(when (.liveness g) (set! (mut (.live-nids g)) (.nid value) 0) 0)')
+            walks.append('(when (.liveness g) (set! (mut (.live-node-ids g)) (.node-id value) 0) 0)')
         for name,raw,*rest in tail[0]:
             field=qualify(raw,mod,params);expr='(.'+name+' value)';key=(head,name)
             if name=='source' and field=='i64' and head!='coil.compiler.ast.SrcModEntry':

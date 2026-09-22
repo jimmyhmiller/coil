@@ -80,7 +80,7 @@ it is coverage that disappears with the interpreter.
 | 2 | mac-12 | `ec0d40ecd` | `export-c` on the arm64 backend (`g-register-sigs!` / `g-export-c-sym`; by-value struct param is a located error via `g-export-needs-thunk`). `main_a64` registers `meta-build-obj-a64`, so the LLVM-free compiler builds metaprogram dylibs with the arm64 backend and the compiled engine is its default. |
 | 3a | — | `fa2ec42e7` | Aggregate/string comptime readback on the compiled engine: a write-through `(ptr T)` thunk entry + walk the C struct/`(slice u8)` layout by field offset (`comptime_eval.coil`). |
 
-The compiled engine (`comptime_eval.coil`) today: recovers the site's checked type by nid,
+The compiled engine (`comptime_eval.coil`) today: recovers the site's checked type by node-id,
 builds a minimal closure sub-program of what `E` calls plus a synthetic
 `(defn coil.ct.thunk [] (-> T) E)` exported as C symbol `coil_ct_thunk`, monomorphizes +
 builds + `dlopen`s it (its own raw build, no metashim handshake — comptime has no code ops),

@@ -208,7 +208,7 @@ arm64 gate-run + gate-cli + gate-diag) and the finding's own repro.
    like `set-meta-build-obj!`). A genuine SEMANTIC error (division by zero, an arithmetic type
    mismatch) is left to stand — the discriminator is the interpreter's own "supported yet" wording,
    so the compiled engine never masks a real bug with a target-specific value. The engine
-   (`comptime_eval.coil`) recovers the site's checked type (type map by nid), builds a MINIMAL closure
+   (`comptime_eval.coil`) recovers the site's checked type (type map by node-id), builds a MINIMAL closure
    sub-program of what E calls plus a synthetic `(defn coil.ct.thunk [] (-> T) E)` exported as C
    symbol `coil_ct_thunk`, monomorphizes + builds + dlopens it (its OWN raw build, no metashim
    handshake — comptime has no code ops), runs the entry, and reads the SCALAR result (int/bool/f64)
