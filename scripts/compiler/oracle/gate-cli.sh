@@ -414,6 +414,11 @@ expect_rc 2 "fmt --width requires a value" "$COIL" fmt "$T/seven.coil" --width
 cmp -s tests/compiler/formatter_vertical_spacing_expected.coil "$T/vertical-spacing.got" \
   && ok "fmt canonicalizes top-level spacing and keeps leading comments attached" \
   || bad "fmt top-level vertical spacing" "$(diff -u tests/compiler/formatter_vertical_spacing_expected.coil "$T/vertical-spacing.got")"
+printf '; one-line file header\n(module header)\n' > "$T/fmt-header.want"
+"$COIL" fmt - < "$T/fmt-header.want" > "$T/fmt-header.got"
+cmp -s "$T/fmt-header.want" "$T/fmt-header.got" \
+  && ok "fmt keeps a one-line file header attached to its form" \
+  || bad "fmt one-line file header" "$(diff -u "$T/fmt-header.want" "$T/fmt-header.got")"
 expect_rc 0 "standalone formatter entry typechecks" \
   "$COIL" check src/compiler/formatter/fmt.coil
 
