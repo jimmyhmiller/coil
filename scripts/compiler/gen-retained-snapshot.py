@@ -222,7 +222,9 @@ def ident_body(t):
 OPAQUE_FIELDS={('coil.compiler.loader.LS','code_session_state'),
                ('coil.compiler.loader.LS','persistent_sigs'),
                ('coil.compiler.loader.LS','persistent_checked'),
+               ('coil.compiler.loader.LS','persistent_declarations'),
                ('coil.compiler.check.Cx','sig_base'),
+               ('coil.compiler.resolve.DefEntry','base'),
                ('coil.compiler.ast.AstUnitState','resolution_base'),
                ('coil.compiler.metaengine.MEEntry','fp'),
                # A persistent base is owned by its revision and shared between

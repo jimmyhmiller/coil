@@ -70,6 +70,8 @@ def main() -> None:
     parser.add_argument('--require-ms', type=float)
     parser.add_argument('--trace', action='store_true',
                         help='enable compiler spans and report steady medians')
+    parser.add_argument('--census', action='store_true',
+                        help='report the final retained graph record census')
     args = parser.parse_args()
     compiler_path = Path(args.compiler).resolve()
     with tempfile.TemporaryDirectory(prefix='.coil-jit-edit-cycle-', dir=ROOT) as raw:
@@ -92,8 +94,11 @@ def main() -> None:
         (toolbin / 'coil').symlink_to(compiler_path)
         environment = dict(os.environ)
         environment['PATH'] = str(toolbin) + os.pathsep + environment['PATH']
-        if args.trace:
+        if args.trace or args.census:
             environment['COIL_TRACE'] = '1'
+        if args.census:
+            environment['COIL_JIT_TRACE'] = '1'
+            environment['COIL_JIT_TRACE_MEMORY'] = '1'
         measured = run(str(executable), env=environment)
         values = [int(line) for line in measured.stdout.splitlines() if line.strip()]
         if len(values) != args.edits:
@@ -122,6 +127,31 @@ def main() -> None:
                 name: statistics.median(spans[name][1 + args.warmup_edits:])
                 for name in wanted if len(spans.get(name, [])) >= args.edits + 1
             }
+        if args.census:
+            cycles: list[dict[str, int]] = []
+            memory: list[dict[str, int]] = []
+            active: dict[str, int] | None = None
+            for line in measured.stderr.splitlines():
+                if line.startswith('jit-work begin '):
+                    active = {}
+                elif line.startswith('jit-work memory '):
+                    memory.append({
+                        key: int(value)
+                        for key, value in re.findall(r'([^ =]+)=([0-9]+)', line)
+                    })
+                elif line.startswith('jit-work retained-kind ') and active is not None:
+                    count, kind = line.removeprefix('jit-work retained-kind ').split(' ', 1)
+                    active[kind] = int(count)
+                elif line.startswith('jit-work end ') and active is not None:
+                    cycles.append(active)
+                    active = None
+            if len(cycles) != args.edits + 1:
+                raise RuntimeError(f'expected {args.edits + 1} censuses, got {len(cycles)}')
+            report['retained_census'] = dict(
+                sorted(cycles[-1].items(), key=lambda item: item[1], reverse=True)
+            )
+            if memory:
+                report['memory'] = memory[-1]
         print(json.dumps(report))
         if args.require_ms is not None and median >= args.require_ms:
             raise SystemExit(

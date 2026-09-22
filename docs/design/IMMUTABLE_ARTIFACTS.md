@@ -1005,6 +1005,27 @@ whole-cycle median to 59 ms). This directly contradicts completion of the `<16 m
 goal and identifies the legacy snapshot and whole-program prepare work as the next
 two boundaries.
 
+### Declaration-kind lookup becomes persistent (2026-09-22)
+
+Resolver declaration lookup now reads accepted `(module, raw name) -> kind mask`
+answers through `declaration_base.coil`, a refcounted persistent HAMT. Application
+and macro-union environments have separate bases. A candidate keeps only a mutable
+overlay while resolving; publication diffs the post-pruning authoritative table
+into a derived base, points every `DefEntry` at that base, and clears the mutable
+maps before snapshot relocation. Held revisions retain their own HAMT roots, and
+new definitions, replacements, alias rebinding, explicit retirement, rejected
+candidates, and ORC generation leases remain covered by the generated gates.
+
+The retained census on the 2,000-definition edit probe changed from 9,385
+`HashMap (slice u8) i64` entries to 8. Snapshot median under tracing fell from
+20 ms to 15 ms. The correctness-preserving compatibility boundary still rebuilds
+the flat per-module declaration indexes after pruning before diffing them into the
+HAMT; removing that rebuild requires the declaration records themselves to become
+persistent artifacts. Consequently `jit.publish.retain` is 11 ms, and the final
+30-edit measurements are 54 ms untraced and 53 ms traced (prepare 15 ms, native
+12 ms, retain 11 ms, snapshot 15 ms). This is a structural storage milestone, not
+the `<16 ms` endpoint.
+
 - **Undo log over the mutable graph.** Cheap rejection, but every mutation and
   dependency must be logged correctly forever, and an old revision pinned by a
   native lease still needs a stable view — which is a snapshot again.
