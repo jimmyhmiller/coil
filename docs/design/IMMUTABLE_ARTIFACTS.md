@@ -1111,6 +1111,33 @@ index already stores both directions of those edges. The next implementation mus
 derive its current-edit delta before lifetime pruning and compute rescue from that
 index, rather than adding another cache or scanning compatibility lists.
 
+### Lifetime rescue reads the dependency delta (2026-09-22)
+
+Dependency promotion is now split at its real ownership boundary. Before joint
+pruning, a revision derives the parent's persistent `DepBase`, applies function
+tombstones, and records only the checked-function and new-constant delta. Lifetime
+rescue follows reverse edges from each submission-only candidate: a reader outside
+the candidate set rescues it, and each rescue can expose the next candidate in the
+transitive chain. The publication step completes stale-interface reporting and
+publishes that same derived base instead of rebuilding it.
+
+Lowered `Var` initializers revealed an edge class that the semantic reference
+collector does not contain: function values represented only by `ECall`,
+`EFnPtrOf`, or `EMakeDyn`. The delta therefore also runs the existing call walker,
+but seeds its name universe with the persistent lifetime candidates rather than
+rebuilding all 2,000 function names. This preserves those callable roots across
+accepted, rejected, and subsequent edits without retaining a loader snapshot.
+
+The common replacement path no longer walks all accepted function bodies for
+lifetime rescue. Detailed tracing reports lifetime synchronization at 0 ms,
+dependency-delta preparation at 1 ms, and indexed closure at 1 ms; joint pruning
+fell from 5.5 ms to 4 ms. The measured whole-cycle median is still **46 ms**
+(44--48 ms in traced samples): prepare 15 ms, native publication 12 ms, retain
+8 ms, and snapshot 11.5 ms. The protected lifetime suite, flat-memory probe,
+modernization gate, and full generated gate pass. The result removes a scaling
+walk but confirms that the next material reductions must come from stage-3
+preparation and snapshot marking rather than further pruning-table work.
+
 - **Undo log over the mutable graph.** Cheap rejection, but every mutation and
   dependency must be logged correctly forever, and an old revision pinned by a
   native lease still needs a stable view — which is a snapshot again.
