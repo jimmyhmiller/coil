@@ -1089,6 +1089,28 @@ Removing that scan requires a persistent lifetime-candidate set updated from the
 accepted delta; a scalar "has candidates" cache was tested and rejected because
 function roots and submission-only nominal types transition independently.
 
+### Lifetime candidates become a persistent value (2026-09-22)
+
+Each published revision now owns a persistent `LifetimeBase`: separate HAMT sets
+for submission-only functions and nominal types. A candidate derives those roots,
+updates them from the checked-function overlay and the bounded nominal tables, and
+removes names that joint pruning actually retires. The sets own their key storage
+through semantic holds, so old revisions and independently derived environment
+values keep valid names without retaining a mutable loader or copying the whole
+set. The protected lifetime, metadata, type, implementation, source/body-sharing,
+and environment-value tests all pass, as does the flat-memory probe.
+
+This establishes the required incremental enumeration boundary, but measurement
+also exposes the next boundary precisely. On the 2,000-definition probe the
+untraced median remains **46 ms** (45--49 ms, 12 steady samples). With tracing it
+is 50.5 ms: prepare 16 ms, native 13 ms, retain 9 ms, and snapshot 11.5 ms. Joint
+pruning is still 5.5 ms. Candidate discovery is no longer a flat scan; the time is
+now in `compiler-retain-function-dependencies!`, which walks the whole program to
+rescue candidates reachable from retained definitions. The persistent dependency
+index already stores both directions of those edges. The next implementation must
+derive its current-edit delta before lifetime pruning and compute rescue from that
+index, rather than adding another cache or scanning compatibility lists.
+
 - **Undo log over the mutable graph.** Cheap rejection, but every mutation and
   dependency must be logged correctly forever, and an old revision pinned by a
   native lease still needs a stable view — which is a snapshot again.
