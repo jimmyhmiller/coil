@@ -1035,6 +1035,39 @@ a structural storage milestone, not the `<16 ms` endpoint: reaching that target
 requires delta-based preparation and snapshot publication plus removing or
 overlapping native publication's 12 ms serial cost.
 
+### Completed revision caches leave the published graph (2026-09-22)
+
+Parsed and resolved revision caches are compilation scratch, not accepted state.
+After persistent declaration, signature, and dependency promotion, publication
+now discards `resolved_revisions`, `revision_heads`, and `failed_parses` from the
+application environment and macro facade. A later edit creates a fresh semantic
+workspace and reads the accepted declaration table and persistent indexes; it
+never queries a completed revision's form caches.
+
+`CodeSessionState` is independently owned as well. Staging already deep-copies
+all accepted `Code` syntax and strings into `staged_arena`, and commit swaps that
+arena into `accepted_arena`. The revision snapshot therefore no longer scans,
+copies, relocates, and writes back `accepted` or `accepted_monomorphs`. The REPL
+identity transform also stages a true delta: a replacement that introduces no
+identity leaves the accepted 2,000-entry registry untouched instead of rebuilding
+and deep-copying it.
+
+On the 2,000-definition replacement probe, retained `coil.reader.Sexp` instances
+fell from 7,981 to 1,259 and retained `(ArrayList Sexp)` instances from 2,264 to
+91. The stable untraced median is **45--47 ms**; a representative traced edit is
+47 ms: prepare 15 ms, native 12 ms, retain 9 ms, snapshot 11 ms. Snapshot marking
+is 5--6 ms (loader 4 ms, native 1 ms), pruning 1 ms, rescanning 2 ms, and copying
+1 ms. The protected-state probe is 48 ms and the generated ownership and flat-
+memory gates pass.
+
+The next high-value boundary is the macro phase environment. Keeping its roughly
+90-function program separate from the 2,000-function application/facade union
+removes most stage-3 work, but it cannot merely borrow the current facade's
+qualification and declaration state. Its resolution and declaration bases must
+first become independently promoted and owned; only then can the facade and phase
+views be separated without retaining revision pointers. After that, joint liveness
+pruning (about 5 ms), loader marking/rescanning, and native publication remain.
+
 - **Undo log over the mutable graph.** Cheap rejection, but every mutation and
   dependency must be logged correctly forever, and an old revision pinned by a
   native lease still needs a stable view — which is a snapshot again.
