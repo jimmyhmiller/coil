@@ -144,6 +144,9 @@ def main() -> None:
                       'jit.snapshot.rescan', 'jit.snapshot.copy',
                       'jit.snapshot.record',
                       'jit.retain.prune-joint',
+                      'jit.joint.prune-function-list',
+                      'jit.joint.prune-function-metadata',
+                      'jit.joint.prune-signatures',
                       'jit.retain.promote-declarations',
                       'jit.retain.promote-sigs', 'jit.retain.promote-deps')
             report['span_medians_ms'] = {

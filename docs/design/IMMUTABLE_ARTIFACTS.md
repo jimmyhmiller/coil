@@ -1068,6 +1068,27 @@ first become independently promoted and owned; only then can the facade and phas
 views be separated without retaining revision pointers. After that, joint liveness
 pruning (about 5 ms), loader marking/rescanning, and native publication remain.
 
+### Candidate pruning preserves the accepted prefix (2026-09-22)
+
+Joint lifetime pruning no longer rebuilds a 2,000-entry `Program.funcs` list when
+the functions being retired are the candidate's appended suffix. It proves the
+suffix against the loader's sparse checked-function overlay; a name found only in
+the persistent base forces the general filter because the base intentionally does
+not expose flat-list positions. The candidate header is then shortened in place,
+while the much smaller export, ABI, and unit-export metadata is filtered normally.
+If joint analysis finds no function or nominal-type candidates, publication skips
+all identity pruning and checker-index reconstruction.
+
+The protected lifetime suite—including retained nominal types, metadata roots,
+rejections, body sharing, and generation leases—and the flat-memory and generated
+gates pass. Tracing confirms the function-list, metadata, and signature pruning
+subspans round to 0 ms on the 2,000-definition replacement probe. Total joint
+pruning remains about 5 ms because candidate discovery still scans the flat
+application/facade programs for `:jit/retain false` functions and nominal types.
+Removing that scan requires a persistent lifetime-candidate set updated from the
+accepted delta; a scalar "has candidates" cache was tested and rejected because
+function roots and submission-only nominal types transition independently.
+
 - **Undo log over the mutable graph.** Cheap rejection, but every mutation and
   dependency must be logged correctly forever, and an old revision pinned by a
   native lease still needs a stable view — which is a snapshot again.
