@@ -980,6 +980,165 @@ expect_out "artifact 'helper' out 'build/debug/../release/app' is the package ex
   sh -c "cd '$X/app' && '$COIL' build"
 cp "$X/app/Coil.good.toml" "$X/app/Coil.toml"
 
+echo "== dependency package link inputs follow the loaded module graph =="
+# Four packages, one project: `depa` (which needs `dept`'s object through an
+# extern, without importing its module), `depb`, and `depc` which nothing imports.
+# The executable artifact imports only depa. `depb`'s object and the artifact's own
+# object both define dep_b_only, so linking depb into the artifact would fail with a
+# duplicate symbol -- and the value each program returns says which object it got.
+D="$T/dep-usage"
+mkdir -p "$D/dept/src" "$D/dept/native" "$D/depa/src" "$D/depa/native" \
+         "$D/depb/src" "$D/depb/native" "$D/depc/src" \
+         "$D/app/src/helper" "$D/app/native" "$D/app/tests"
+printf 'long t_value(void) { return 100; }\n' > "$D/dept/native/t.c"
+printf '[package]\nname = "dept"\nsource-roots = ["src"]\n\n[link]\nobjects = ["native/t.o"]\n' > "$D/dept/Coil.toml"
+printf '(module dept.lib)\n(defn unused [] (-> i64) 0)\n' > "$D/dept/src/lib.coil"
+printf 'long a_value(void) { return 20; }\n' > "$D/depa/native/a.c"
+cat > "$D/depa/Coil.toml" <<'EOF'
+[package]
+name = "depa"
+source-roots = ["src"]
+
+[dependencies]
+dept = { path = "../dept" }
+
+[link]
+objects = ["native/a.o"]
+EOF
+cat > "$D/depa/src/lib.coil" <<'EOF'
+(module depa.lib)
+(extern a_value :cc c [] (-> i64))
+(extern t_value :cc c [] (-> i64))
+(defn a-part [] (-> i64) (+ (a_value) (t_value)))
+EOF
+printf 'long dep_b_only(void) { return 5; }\n' > "$D/depb/native/b.c"
+cat > "$D/depb/Coil.toml" <<'EOF'
+[package]
+name = "depb"
+source-roots = ["src"]
+
+[link]
+objects = ["native/b.o"]
+
+[native-dependencies]
+blog = { flags-command = "./flags" }
+EOF
+cat > "$D/depb/src/lib.coil" <<'EOF'
+(module depb.lib)
+(extern dep_b_only :cc c [] (-> i64))
+(defn b-part [] (-> i64) (dep_b_only))
+EOF
+printf '(module depc.lib)\n(defn unused [] (-> i64) 0)\n' > "$D/depc/src/lib.coil"
+cat > "$D/depc/Coil.toml" <<'EOF'
+[package]
+name = "depc"
+source-roots = ["src"]
+
+[native-dependencies]
+clog = { flags-command = "./flags" }
+EOF
+for pkg in depb depc; do
+  printf '#!/bin/sh\necho ran >> "$(cd "$(dirname "$0")" && pwd)/ran.log"\nprintf -- ""\n' > "$D/$pkg/flags"
+  chmod +x "$D/$pkg/flags"
+done
+printf 'long dep_b_only(void) { return 42; }\n' > "$D/app/native/own.c"
+dep_objects_ok=1
+for f in dept/native/t depa/native/a depb/native/b app/native/own; do
+  cc -c "$D/$f.c" -o "$D/$f.o" || dep_objects_ok=0
+done
+cat > "$D/app/Coil.toml" <<'EOF'
+[package]
+name = "app"
+entry = "src/main.coil"
+source-roots = ["src", "tests"]
+
+[dependencies]
+depa = { path = "../depa" }
+depb = { path = "../depb" }
+depc = { path = "../depc" }
+
+[artifacts.helper]
+kind = "executable"
+entry = "src/helper/main.coil"
+out = "build/tools/helper"
+objects = ["native/own.o"]
+
+[test]
+roots = ["tests"]
+suffixes = ["_test.coil"]
+EOF
+cat > "$D/app/src/main.coil" <<'EOF'
+(module app.main)
+(import "depa.lib" :as depa)
+(import "depb.lib" :as depb)
+(defn main [] (-> i64) (+ (depa/a-part) (depb/b-part)))
+EOF
+cat > "$D/app/src/helper/main.coil" <<'EOF'
+(module app.helper.main)
+(import "depa.lib" :as depa)
+(extern dep_b_only :cc c [] (-> i64))
+(defn main [] (-> i64) (+ (depa/a-part) (dep_b_only)))
+EOF
+cat > "$D/app/tests/link_test.coil" <<'EOF'
+(module app.tests.link-test)
+(import "depb.lib" :as depb)
+(deftest b-links (assert-eq (depb/b-part) 5))
+EOF
+dep_build_out=$(cd "$D/app" && "$COIL" build 2>&1); dep_build_rc=$?
+dep_helper_rc=""; dep_app_rc=""
+if [ "$dep_objects_ok" = 1 ] && [ "$dep_build_rc" = 0 ]; then
+  "$D/app/build/tools/helper"; dep_helper_rc=$?
+  "$D/app/build/release/app"; dep_app_rc=$?
+fi
+# 20 (depa) + 100 (dept, required by depa but never imported) + 42 (the artifact's
+# own object): the artifact took depa's chain and none of depb's.
+[ "$dep_helper_rc" = 162 ] \
+  && ok "an executable artifact links only the dependency packages it loads, and what they require" \
+  || bad "artifact dependency selection" "want helper rc=162, got rc=$dep_helper_rc: $dep_build_out"
+# 20 + 100 + 5: the package executable imports depb, so it gets depb's object.
+[ "$dep_app_rc" = 125 ] \
+  && ok "the package executable links the dependency packages it loads" \
+  || bad "package executable dependency selection" "want app rc=125, got rc=$dep_app_rc: $dep_build_out"
+dep_b_runs=$(wc -l < "$D/depb/ran.log" 2>/dev/null | tr -d ' ')
+[ "$dep_b_runs" = 1 ] \
+  && ok "a dependency's flags-command runs once, for the program that links it" \
+  || bad "dependency native provider" "want 1 run for the package executable, got ${dep_b_runs:-0}"
+[ ! -f "$D/depc/ran.log" ] \
+  && ok "a dependency nothing imports never runs its flags-command" \
+  || bad "unimported dependency native provider" "depc's flags-command ran: $(cat "$D/depc/ran.log")"
+
+rm -f "$D/depb/ran.log" "$D/depc/ran.log"
+dep_test_out=$(cd "$D/app" && "$COIL" test 2>&1)
+case "$dep_test_out" in
+  *"1 passed; 0 failed"*)
+    if [ -f "$D/depb/ran.log" ] && [ ! -f "$D/depc/ran.log" ]; then
+      ok "coil test links the dependency packages its tests load"
+    else
+      bad "coil test dependency selection" "depb ran: $([ -f "$D/depb/ran.log" ] && echo yes || echo no), depc ran: $([ -f "$D/depc/ran.log" ] && echo yes || echo no)"
+    fi ;;
+  *) bad "coil test with dependency link inputs" "$dep_test_out" ;;
+esac
+
+# Reaching a dependency's symbols without importing any of its modules is the one
+# behavior this rule takes away, so it has to say exactly that.
+mkdir -p "$D/extern-only/src"
+cat > "$D/extern-only/Coil.toml" <<'EOF'
+[package]
+name = "extern-only"
+entry = "src/main.coil"
+
+[dependencies]
+depb = { path = "../depb" }
+EOF
+cat > "$D/extern-only/src/main.coil" <<'EOF'
+(module extern-only.main)
+(extern dep_b_only :cc c [] (-> i64))
+(defn main [] (-> i64) (dep_b_only))
+EOF
+expect_out "dependency 'depb' declares link inputs, but this program imports no" \
+  "an unlinked dependency package is named when the link fails" \
+  sh -c "cd '$D/extern-only' && '$COIL' build"
+
 echo "== namespace index: file placement is irrelevant and paths are rejected =="
 mkdir -p "$T/sib/src/unrelated/place"
 printf '[package]\nname  = "sib"\nentry = "src/main.coil"\n'                             > "$T/sib/Coil.toml"

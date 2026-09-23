@@ -6797,6 +6797,12 @@
   (cond (= arg "-o") true
         (= arg "--link-flag") true
         (= arg "--runtime-link-flag") true
+        (= arg "--dep-package") true
+        (= arg "--dep-name") true
+        (= arg "--dep-requires") true
+        (= arg "--dep-link") true
+        (= arg "--dep-native-pkg") true
+        (= arg "--dep-native-command") true
         (= arg "--target") true
         (= arg "--use") true
         (= arg "--reader-artifact") true
@@ -7904,6 +7910,191 @@
 (defn native-only [(body Code) (alt Code)] (-> Code)
   (if (= (primitive/target-os) `wasm) alt body))
 
+; ===================== dependency-package link inputs ========================
+; A dependency package's link inputs reach a program only when that program's
+; compilation loaded the package's code. The command layer describes each package
+; on the build's command line (m-dep-package-args); the build registers the
+; package's source roots with the loader before compiling, and afterwards asks the
+; loader which packages the module graph actually reached.
+;
+; `kind` 0 is a literal linker token, 1 a pkg-config package name, and 2 a
+; project-owned flags-command. A provider is consulted only for a package this
+; program links, which is why the command layer does not expand it.
+(defstruct DepLinkEntry [(id i64) (kind i64) (value (slice u8))])
+(defstruct DepPackageName [(id i64) (name (slice u8))])
+(defstruct DepRequire [(owner i64) (id i64)])
+
+; `--dep-<...> <id>:<payload>`: one argv element carries both, so a payload with
+; spaces (a flags-command) needs no quoting rules of its own.
+(defn dep-arg-colon [(value (slice u8))] (-> i64)
+  (let [n (len value)
+        (mut at) -1
+        (mut i) 0]
+    (loop (if (or (>= (load i) n) (>= (load at) 0))
+              (break)
+              (do
+                (when (= (get value (load i)) (primitive/cast u8 58))
+                  (set! at (load i))
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (load at)))
+
+(defn dep-arg-reject! [(flag (slice u8)) (value (slice u8))] (-> i64)
+  (let [w (stderr)]
+    (ps w "error: ")
+    (ps w flag)
+    (ps w " expects <package-id>:<value>, got '")
+    (ps w value)
+    (ps w "'")
+    (wb w 10)
+    (exit 1)
+    0))
+
+(defn dep-arg-id [(flag (slice u8)) (value (slice u8))] (-> i64)
+  (let [at (dep-arg-colon value)]
+    (if (<= at 0)
+        (do (dep-arg-reject! flag value) 0)
+        (match (parse-int (subslice [u8] value 0 at))
+          (Some [id] (if (> id 0) id (do (dep-arg-reject! flag value) 0)))
+          (None [] (do (dep-arg-reject! flag value) 0))))))
+
+(defn dep-arg-payload [(flag (slice u8)) (value (slice u8))] (-> (slice u8))
+  (let [at (dep-arg-colon value)]
+    (if (<= at 0)
+        (do (dep-arg-reject! flag value) "")
+        (subslice [u8] value (primitive/iadd at 1) (len value)))))
+
+(defn dep-id-member? [(ids (ptr (ArrayList i64))) (id i64)] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (len (load ids))]
+      (when (= (get (load ids) i) id) (set! found true) 0)
+      0)
+    (load found)))
+
+(defn dep-id-add! [(ids (ptr (ArrayList i64))) (id i64)] (-> bool)
+  (if (dep-id-member? ids id)
+      false
+      (do (push! ids id) true)))
+
+(defn dep-package-name [(names (ptr (ArrayList DepPackageName))) (id i64)] (-> (slice u8))
+  (let [(mut found) ""]
+    (for [i 0 (len (load names))]
+      (let [x (al-elem [DepPackageName] names i)]
+        (when (and (= (.id x) id) (= (len (load found)) 0)) (set! found (.name x)) 0))
+      0)
+    (load found)))
+
+; The packages this program links: those the loader saw, closed over the
+; `requires` edges, because a package that is loaded brings the packages it is
+; built against.
+(defn dep-packages-used [(a (dyn Allocator))
+                         (entries (ptr (ArrayList DepLinkEntry)))
+                         (requires (ptr (ArrayList DepRequire)))] (-> (ptr (ArrayList i64)))
+  (let [used (box-al [i64] a (al-new [i64] a))]
+    (for [i 0 (len (load entries))]
+      (let [e (al-elem [DepLinkEntry] entries i)]
+        (when (link-package-used? (.id e)) (dep-id-add! used (.id e)) 0))
+      0)
+    (for [i 0 (len (load requires))]
+      (let [r (al-elem [DepRequire] requires i)]
+        (when (link-package-used? (.owner r)) (dep-id-add! used (.owner r)) 0))
+      0)
+    (let [(mut changed) true]
+      (loop (if (not (load changed))
+                (break)
+                (do
+                  (set! changed false)
+                  (for [i 0 (len (load requires))]
+                    (let [r (al-elem [DepRequire] requires i)]
+                      (when (and (dep-id-member? used (.owner r))
+                                 (dep-id-add! used (.id r)))
+                        (set! changed true)
+                        0))
+                    0)))))
+    used))
+
+; Read a native provider's linker arguments: pkg-config for a `pkg-config`
+; provider, the project's own command for a `flags-command` one. The provider runs
+; here, in the build that links the package, and nowhere else -- a program that
+; does not link the package never runs it. A failing provider stops the build.
+(defn dep-native-tokens [(a (dyn Allocator))
+                         (package (slice u8))
+                         (kind i64)
+                         (value (slice u8))] (-> (ptr (ArrayList (slice u8))))
+  (let [tmp
+          (cat3-d a
+                  "/tmp/coil-dep-flags-"
+                  (i64->str a (primitive/cast i64 (getpid))))
+        (mut cmd) (sb-new a)]
+    (if (= kind 1)
+        (do
+          (sb-push-str! (mut cmd) "pkg-config --libs-only-l ")
+          (m-shell-quoted! (mut cmd) value)
+          (sb-push-str! (mut cmd) " && pkg-config --libs-only-L --libs-only-other ")
+          (m-shell-quoted! (mut cmd) value))
+        (sb-push-str! (mut cmd) value))
+    (sb-push-str! (mut cmd) " > ")
+    (m-shell-quoted! (mut cmd) tmp)
+    (let [rc (wait-code (primitive/cast i64 (system (str->cstr a (sb-str (load cmd))))))
+          text (read-file a (str->cstr a tmp))]
+      (unlink (str->cstr a tmp))
+      (when (!= rc (primitive/cast i64 0))
+        (let [w (stderr)]
+          (ps w "error: dependency package '")
+          (ps w package)
+          (ps w "' native dependency '")
+          (ps w value)
+          (ps w (if (= kind 1)
+                    "' was not found by pkg-config"
+                    "' flags-command failed"))
+          (wb w 10)
+          (exit 1))
+        0)
+      (let [out (box-al [(slice u8)] a (al-new [(slice u8)] a))
+            n (len text)
+            (mut start) 0]
+        (for [i 0 (+ n 1)]
+          (let [space
+                  (or (= i n)
+                      (let [c (primitive/cast i64 (get text i))]
+                        (or (= c 32) (or (= c 9) (or (= c 10) (= c 13))))))]
+            (when space
+              (when (> i (load start))
+                (push! out (subslice [u8] text (load start) i))
+                0)
+              (set! start (+ i 1))
+              0))
+          0)
+        out))))
+
+; Append the link inputs of every dependency package this program loaded, in the
+; order the command layer described them, and report the packages whose inputs
+; were left out because nothing imported them.
+(defn dep-link-flags! [(a (dyn Allocator))
+                       (flags (mut (ArrayList (slice u8))))
+                       (entries (ptr (ArrayList DepLinkEntry)))
+                       (names (ptr (ArrayList DepPackageName)))
+                       (requires (ptr (ArrayList DepRequire)))] (-> (ptr (ArrayList i64)))
+  (let [used (dep-packages-used a entries requires)
+        excluded (box-al [i64] a (al-new [i64] a))]
+    (for [i 0 (len (load entries))]
+      (let [e (al-elem [DepLinkEntry] entries i)]
+        (if (dep-id-member? used (.id e))
+            (if (= (.kind e) 0)
+                (do (push! (mut flags) (.value e)) 0)
+                (let [tokens
+                        (dep-native-tokens a
+                                           (dep-package-name names (.id e))
+                                           (.kind e)
+                                           (.value e))]
+                  (for [j 0 (len (load tokens))]
+                    (push! (mut flags) (get (load tokens) j))
+                    0)
+                  0))
+            (do (dep-id-add! excluded (.id e)) 0)))
+      0)
+    excluded))
+
 (defn build-cmd [(a (dyn Allocator))
                  (argc i32)
                  (argv (ptr (ptr i8)))
@@ -7931,6 +8122,9 @@
         (mut outp) (primitive/cast (ptr i8) 0)
         (mut flags) (al-new [(slice u8)] a)
         (mut meta-flags) (al-new [(slice u8)] a)
+        dep-entries (box-al [DepLinkEntry] a (al-new [DepLinkEntry] a))
+        dep-names (box-al [DepPackageName] a (al-new [DepPackageName] a))
+        dep-requires (box-al [DepRequire] a (al-new [DepRequire] a))
         (mut backend) default-backend
         (mut trip) (primitive/cast (ptr i8) 0)
         (mut libmode) 0  ; 0 = executable, 1 = --lib (.a), 2 = --shared (.dylib)
@@ -8006,6 +8200,55 @@
                                    (cstr->slice (load (primitive/index argv
                                                                        (primitive/iadd (load i)
                                                                                        1)))))
+                            (store! i (primitive/iadd (load i) 2))
+                            0)
+                        ; A dependency package's source root: the loader marks the
+                        ; package used when a namespace resolves under it.
+                        (= arg "--dep-package")
+                          (let [value
+                                  (cstr->slice (load (primitive/index argv
+                                                                      (primitive/iadd (load i) 1))))]
+                            (link-package-register! a
+                                                    (dep-arg-id arg value)
+                                                    (dep-arg-payload arg value))
+                            (store! i (primitive/iadd (load i) 2))
+                            0)
+                        (= arg "--dep-name")
+                          (let [value
+                                  (cstr->slice (load (primitive/index argv
+                                                                      (primitive/iadd (load i) 1))))
+                                x (primitive/alloc-stack DepPackageName)]
+                            (set! (.id x) (dep-arg-id arg value))
+                            (set! (.name x) (dep-arg-payload arg value))
+                            (push! [DepPackageName] dep-names (load x))
+                            (store! i (primitive/iadd (load i) 2))
+                            0)
+                        (= arg "--dep-requires")
+                          (let [value
+                                  (cstr->slice (load (primitive/index argv
+                                                                      (primitive/iadd (load i) 1))))
+                                x (primitive/alloc-stack DepRequire)]
+                            (set! (.owner x) (dep-arg-id arg value))
+                            (set! (.id x)
+                                  (match (parse-int (dep-arg-payload arg value))
+                                    (Some [v] v)
+                                    (None [] (do (dep-arg-reject! arg value) 0))))
+                            (push! [DepRequire] dep-requires (load x))
+                            (store! i (primitive/iadd (load i) 2))
+                            0)
+                        (or (= arg "--dep-link")
+                            (or (= arg "--dep-native-pkg") (= arg "--dep-native-command")))
+                          (let [value
+                                  (cstr->slice (load (primitive/index argv
+                                                                      (primitive/iadd (load i) 1))))
+                                x (primitive/alloc-stack DepLinkEntry)]
+                            (set! (.id x) (dep-arg-id arg value))
+                            (set! (.kind x)
+                                  (cond (= arg "--dep-native-pkg") 1
+                                        (= arg "--dep-native-command") 2
+                                        :else 0))
+                            (set! (.value x) (dep-arg-payload arg value))
+                            (push! [DepLinkEntry] dep-entries (load x))
                             (store! i (primitive/iadd (load i) 2))
                             0)
                         (= arg "--target")
@@ -8188,7 +8431,13 @@
                     0)
                   ; final step depends on libmode. Every argument is a distinct argv
                   ; element and the linker driver is spawned directly, without a shell.
-                  (let [(mut linkargs) (al-new [(slice u8)] a)
+                  (let [dep-excluded
+                          (dep-link-flags! a
+                                           (mut flags)
+                                           dep-entries
+                                           dep-names
+                                           dep-requires)
+                        (mut linkargs) (al-new [(slice u8)] a)
                         link-out (staged-output-path a out-slice)
                         direct-sdk (darwin-direct-sdk a)
                         direct-darwin-link
@@ -8439,6 +8688,20 @@
                                         "      (applied to `coil build`, `coil run` and `coil test` alike), or pass\n")
                                     (ps w
                                         "      --link-flag on the command line.\n")
+                                    ; A dependency package's link inputs reach only
+                                    ; a program that imports its code. Say so when
+                                    ; one was left out: the symbols it would have
+                                    ; supplied are the likely cause.
+                                    (for [di 0 (len (load dep-excluded))]
+                                      (let [name
+                                              (dep-package-name dep-names
+                                                                (get (load dep-excluded) di))]
+                                        (ps w "note: dependency '")
+                                        (ps w name)
+                                        (ps w "' declares link inputs, but this program imports no\n")
+                                        (ps w "      module from it, so they were not linked. Import what you use\n")
+                                        (ps w "      from it, or declare those inputs in this package's own [link].\n"))
+                                      0)
                                     0))
                               0)
                             1)
@@ -9146,6 +9409,10 @@
    ; the consumer's build, and link the object instead of recompiling the
    ; dependency every time. Its export surface must be concrete.
    (prebuilt bool)
+   ; The dependency package that declared this dependency, as a `dep-packages` id,
+   ; or 0 for one the root package declared. Transitive link inputs follow these
+   ; edges: a package whose code is loaded brings the packages it depends on.
+   (owner i64)
    (line i64)])
 
 (defstruct ManifestNativeDep
@@ -9547,6 +9814,18 @@
     (set! (.ccflags s) (m-new-strings a))
     s))
 
+; One dependency package's own link contribution. Its inputs apply to a build
+; target only when that target's compilation loads a module from `roots` (or from
+; a package that requires this one) -- a dependency a program never imports
+; contributes nothing to its link.
+(defstruct ManifestDepPackage
+  [(id i64)
+   (name (slice u8))
+   (root (slice u8))
+   (roots (ptr (ArrayList (slice u8))))
+   (link (ptr ManifestLinkSet))
+   (requires (ptr (ArrayList i64)))])
+
 (defn m-link-set-empty? [(s (ptr ManifestLinkSet))] (-> bool)
   (and (= (len (load (.frameworks s))) 0)
        (= (len (load (.libs s))) 0)
@@ -9773,10 +10052,11 @@
    ; belong to those artifacts and are removed from `native-deps`, so the package
    ; executable and its tests never link them.
    (artifact-native-deps (ptr (ArrayList ManifestNativeDep)))
-   ; Link inputs contributed by dependency packages. They are ALSO merged into the
-   ; root lists above (the package executable links them); executable artifacts
-   ; link these without the root package's own `[link]`, `[cc]` and natives.
-   (dep-link (ptr ManifestLinkSet))
+   ; Link inputs contributed by dependency packages, one record per package. They
+   ; are kept apart from the root lists above: the root package's `[link]`, `[cc]`
+   ; and `[native-dependencies]` are author intent and always apply, while a
+   ; dependency's inputs apply only to a target that loads its code.
+   (dep-packages (ptr (ArrayList (ptr ManifestDepPackage))))
    (lint-rules (ptr (ArrayList (slice u8))))
    ; `[metaprograms] use` — namespaces loaded ahead of the entry file for every
    ; command that COMPILES this project, exactly as `--use` does on the command
@@ -9861,7 +10141,10 @@
                 (al-new [(ptr ManifestArtifact)] a)))
     (set! (.artifact-native-deps m)
           (box! a (ArrayList ManifestNativeDep) (al-new [ManifestNativeDep] a)))
-    (set! (.dep-link m) (m-new-link-set a))
+    (set! (.dep-packages m)
+          (box! a
+                (ArrayList (ptr ManifestDepPackage))
+                (al-new [(ptr ManifestDepPackage)] a)))
     (set! (.lint-rules m)
           (box! a (ArrayList (slice u8)) (al-new [(slice u8)] a)))
     (set! (.metaprograms m)
@@ -10886,18 +11169,65 @@
       0)
     (load seen)))
 
-; Append one dependency package's inputs to the root package list and to the
-; dependency-only list. A non-empty `root` anchors each (relative) path at the
-; dependency package.
+; Append one dependency package's inputs to its own link record. A non-empty
+; `root` anchors each (relative) path at the dependency package.
 (defn m-compose-dep-inputs! [(a (dyn Allocator))
                              (src (ptr (ArrayList (slice u8))))
-                             (package (ptr (ArrayList (slice u8))))
-                             (deps-only (ptr (ArrayList (slice u8))))
+                             (dst (ptr (ArrayList (slice u8))))
                              (root (slice u8))] (-> i64)
   (for [i 0 (len (load src))]
-    (let [v (if (= (len root) 0) (get (load src) i) (path-join a root (get (load src) i)))]
-      (push! package v)
-      (push! deps-only v))
+    (push! dst
+           (if (= (len root) 0)
+               (get (load src) i)
+               (path-join a root (get (load src) i))))
+    0)
+  0)
+
+; The dependency package composed from `root`, or 0 when none is. A package
+; reached twice -- a diamond, or a cycle -- keeps the id of its first composition.
+(defn m-dep-package-id [(m (ptr Manifest)) (root (slice u8))] (-> i64)
+  (let [pkgs (load (field m dep-packages))
+        (mut id) 0]
+    (for [i 0 (len pkgs)]
+      (let [p (get (load pkgs) i)]
+        (when (and (= (load id) 0) (= (.root p) root)) (set! id (.id p)) 0))
+      0)
+    (load id)))
+
+(defn m-new-dep-package! [(a (dyn Allocator))
+                          (m (ptr Manifest))
+                          (name (slice u8))
+                          (root (slice u8))
+                          (roots (ptr (ArrayList (slice u8))))] (-> (ptr ManifestDepPackage))
+  (let [pkgs (load (field m dep-packages))
+        p (box! a ManifestDepPackage (primitive/zeroed ManifestDepPackage))]
+    (set! (.id p) (+ (len pkgs) 1))
+    (set! (.name p) name)
+    (set! (.root p) root)
+    (set! (.roots p) roots)
+    (set! (.link p) (m-new-link-set a))
+    (set! (.requires p) (box! a (ArrayList i64) (al-new [i64] a)))
+    (push! [(ptr ManifestDepPackage)] pkgs p)
+    p))
+
+; Record that package `owner` depends on package `id`. Root-declared dependencies
+; (owner 0), self-edges and repeats are not edges.
+(defn m-dep-package-requires! [(a (dyn Allocator))
+                               (m (ptr Manifest))
+                               (owner i64)
+                               (id i64)] (-> i64)
+  (when (and (> owner 0) (and (> id 0) (!= owner id)))
+    (let [pkgs (load (field m dep-packages))]
+      (for [i 0 (len pkgs)]
+        (let [p (get (load pkgs) i)]
+          (when (= (.id p) owner)
+            (let [(mut seen) false]
+              (for [j 0 (len (load (.requires p)))]
+                (when (= (get (load (.requires p)) j) id) (set! seen true) 0)
+                0)
+              (unless (load seen) (push! (.requires p) id) 0))
+            0))
+        0))
     0)
   0)
 
@@ -10968,47 +11298,40 @@
                             (.value x)
                             (.line x)))
           0))
-      ; Compose transitive Coil dependencies. Relative path dependencies belong
-      ; to the selected package, so make them absolute before the root resolver
-      ; processes the newly appended records.
-      (let [nested (load (field dm deps))]
-        (for [i 0 (len (load nested))]
-          (let [(mut nd) (get (load nested) i)]
-            (when (> (len (.path nd)) 0)
-              (set! (.path nd) (path-join a root (.path nd)))
-              0)
-            (push! (load (field m deps)) (load nd)))
-          0))
-      ; Native and link requirements compose in manifest order. Inputs whose
-      ; meaning is filesystem-relative are anchored at the selected package. Each
-      ; one is recorded twice: in the root lists the package executable links, and
-      ; in `dep-link`, the dependency-only inputs an executable artifact links.
-      (let [native (load (field dm native-deps))
-            deps-link (load (field m dep-link))]
+      ; This package's own link contribution, recorded under its own id. Inputs
+      ; whose meaning is filesystem-relative are anchored at the selected package.
+      (let [pkg (m-new-dep-package! a m (.name d) root (.roots d))
+            native (load (field dm native-deps))
+            link (.link pkg)]
+        (m-dep-package-requires! a m (.owner d) (.id pkg))
+        ; Compose transitive Coil dependencies. Relative path dependencies belong
+        ; to the selected package, so make them absolute before the root resolver
+        ; processes the newly appended records. Each one is owned by this package,
+        ; so loading this package's code also brings what it depends on.
+        (let [nested (load (field dm deps))]
+          (for [i 0 (len (load nested))]
+            (let [(mut nd) (get (load nested) i)]
+              (when (> (len (.path nd)) 0)
+                (set! (.path nd) (path-join a root (.path nd)))
+                0)
+              (set! (.owner nd) (.id pkg))
+              (push! (load (field m deps)) (load nd)))
+            0))
         (for [i 0 (len (load native))]
           (let [(mut x) (get (load native) i)]
             (when (> (len (.flags-command x)) 0)
               (set! (.flags-command x) (path-join a root (.flags-command x)))
               0)
-            (push! (load (field m native-deps)) (load x))
-            (push! (.native-deps deps-link) (load x)))
+            (push! (.native-deps link) (load x)))
           0)
-        (m-compose-dep-inputs! a (load (field dm frameworks)) (load (field m frameworks))
-                               (.frameworks deps-link) "")
-        (m-compose-dep-inputs! a (load (field dm libs)) (load (field m libs))
-                               (.libs deps-link) "")
-        (m-compose-dep-inputs! a (load (field dm flags)) (load (field m flags))
-                               (.flags deps-link) "")
-        (m-compose-dep-inputs! a (load (field dm search-paths)) (load (field m search-paths))
-                               (.search-paths deps-link) root)
-        (m-compose-dep-inputs! a (load (field dm objects)) (load (field m objects))
-                               (.objects deps-link) root)
-        (m-compose-dep-inputs! a (load (field dm sources)) (load (field m sources))
-                               (.sources deps-link) root)
-        (m-compose-dep-inputs! a (load (field dm include-dirs)) (load (field m include-dirs))
-                               (.include-dirs deps-link) root)
-        (m-compose-dep-inputs! a (load (field dm ccflags)) (load (field m ccflags))
-                               (.ccflags deps-link) "")
+        (m-compose-dep-inputs! a (load (field dm frameworks)) (.frameworks link) "")
+        (m-compose-dep-inputs! a (load (field dm libs)) (.libs link) "")
+        (m-compose-dep-inputs! a (load (field dm flags)) (.flags link) "")
+        (m-compose-dep-inputs! a (load (field dm search-paths)) (.search-paths link) root)
+        (m-compose-dep-inputs! a (load (field dm objects)) (.objects link) root)
+        (m-compose-dep-inputs! a (load (field dm sources)) (.sources link) root)
+        (m-compose-dep-inputs! a (load (field dm include-dirs)) (.include-dirs link) root)
+        (m-compose-dep-inputs! a (load (field dm ccflags)) (.ccflags link) "")
         0)
       0)))
 
@@ -11123,8 +11446,13 @@
                                                      (.name d)
                                                      "' is unavailable")))))))
                 (cond
-                  ; already part of the build: composed once, nothing to add
-                  (m-dep-composed? a deps (load i) (.resolved d)) 0
+                  ; already part of the build: composed once. Its link record
+                  ; exists, so only the new edge to it is recorded.
+                  (m-dep-composed? a deps (load i) (.resolved d))
+                    (m-dep-package-requires! a
+                                             m
+                                             (.owner d)
+                                             (m-dep-package-id m (.resolved d)))
                   ; a package: its manifest is the dependency boundary
                   (or (> (len (.subdir d)) 0)
                       (= (primitive/cast i64
@@ -11481,10 +11809,19 @@
                      (load (field m search-paths))
                      (load (field m objects))
                      (load (field m native-deps))
-                     raw))
+                     raw)
+  ; `raw` drives a linker directly (coil fuzz) instead of a `build` child, so
+  ; there is no compilation to decide which dependency packages are loaded: it
+  ; takes every dependency's inputs, as every command did before the rule.
+  (when raw
+    (let [pkgs (load (field m dep-packages))]
+      (for [i 0 (len pkgs)]
+        (m-emit-link-set a (mut b) (.link (get (load pkgs) i)) raw)
+        0))
+    0)
+  0)
 
-; An executable artifact's link inputs: its own link keys and selected native
-; dependencies, then the inputs dependency packages contribute.
+; One link record's inputs, in the same spelling as the manifest's own.
 (defn m-emit-link-set [(a (dyn Allocator))
                        (b (mut StrBuf))
                        (s (ptr ManifestLinkSet))
@@ -11600,6 +11937,30 @@
     (for [i 0 (len (load (field m objects)))]
       (push! (mut out) (get (load (field m objects)) i))
       0)
+    ; A metaprogram dylib is loaded into the compiler, not linked as the target
+    ; program, and it is built before the compilation that would say which
+    ; dependency packages the target loads. It takes them all.
+    (let [pkgs (load (field m dep-packages))]
+      (for [i 0 (len pkgs)]
+        (let [link (.link (get (load pkgs) i))]
+          (for [j 0 (len (load (.frameworks link)))]
+            (push! (mut out) "-framework")
+            (push! (mut out) (get (load (.frameworks link)) j))
+            0)
+          (for [j 0 (len (load (.libs link)))]
+            (push! (mut out) (sconcat a "-l" (get (load (.libs link)) j)))
+            0)
+          (for [j 0 (len (load (.flags link)))]
+            (push! (mut out) (get (load (.flags link)) j))
+            0)
+          (for [j 0 (len (load (.search-paths link)))]
+            (push! (mut out) "-L")
+            (push! (mut out) (get (load (.search-paths link)) j))
+            0)
+          (for [j 0 (len (load (.objects link)))]
+            (push! (mut out) (get (load (.objects link)) j))
+            0))
+        0))
     (box-al [(slice u8)] a (load out))))
 
 ; Explicit-file commands inside a project use the same namespace boundary as
@@ -11975,10 +12336,118 @@
                          (load (field m has-target))
                          (load (field m target))
                          (load (field m debug))
-                         raw))
+                         raw)
+  ; See m-emit-link-as: the raw linker path has no compilation to consult, so it
+  ; takes every dependency package's C objects.
+  (when raw
+    (let [pkgs (load (field m dep-packages))]
+      (for [i 0 (len pkgs)]
+        (let [link (.link (get (load pkgs) i))]
+          (m-cc-compile-sources! a
+                                 (mut b)
+                                 (.sources link)
+                                 (.include-dirs link)
+                                 (.ccflags link)
+                                 (.native-deps link)
+                                 (load (field m has-target))
+                                 (load (field m target))
+                                 (load (field m debug))
+                                 raw))
+        0))
+    0)
+  0)
 
-; Compile C translation units into content-keyed objects under .coil/build/native/
-; and append each object to the command line being built.
+(defstruct ManifestTaggedArg [(flag (slice u8)) (value (slice u8))])
+
+(defn m-tagged-arg! [(a (dyn Allocator))
+                     (out (ptr (ArrayList ManifestTaggedArg)))
+                     (flag (slice u8))
+                     (id i64)
+                     (value (slice u8))] (-> i64)
+  (let [x (primitive/alloc-stack ManifestTaggedArg)]
+    (set! (.flag x) flag)
+    (set! (.value x) (cat3-d a (i64->str a id) (cat3-d a ":" value)))
+    (push! [ManifestTaggedArg] out (load x)))
+  0)
+
+; Describe every dependency package to the build that links: its source roots, the
+; packages it requires, and its link inputs, each tagged with the package's id. The
+; build keeps the inputs of the packages its own compilation loaded (see
+; link-package-register! in the loader) and drops the rest, so a dependency a
+; program never imports contributes nothing to its link and its native provider is
+; never run for that program.
+;
+; C translation units a dependency declares are compiled here, with that package's
+; own include dirs, flags and pkg-config providers; the objects are link inputs
+; like any other and are selected the same way. Compiling one is cached and has no
+; effect on a link that does not take it.
+(defn m-dep-package-args [(a (dyn Allocator))
+                          (m (ptr Manifest))] (-> (ptr (ArrayList ManifestTaggedArg)))
+  (let [out (box-al [ManifestTaggedArg] a (al-new [ManifestTaggedArg] a))
+        pkgs (load (field m dep-packages))]
+    (for [i 0 (len pkgs)]
+      (let [p (get (load pkgs) i)
+            id (.id p)
+            link (.link p)]
+        (m-tagged-arg! a out "--dep-name" id (.name p))
+        (for [j 0 (len (load (.roots p)))]
+          (m-tagged-arg! a out "--dep-package" id (get (load (.roots p)) j))
+          0)
+        (for [j 0 (len (load (.requires p)))]
+          (m-tagged-arg! a out "--dep-requires" id (i64->str a (get (load (.requires p)) j)))
+          0)
+        (for [j 0 (len (load (.frameworks link)))]
+          (m-tagged-arg! a out "--dep-link" id "-framework")
+          (m-tagged-arg! a out "--dep-link" id (get (load (.frameworks link)) j))
+          0)
+        (for [j 0 (len (load (.libs link)))]
+          (m-tagged-arg! a out "--dep-link" id (sconcat a "-l" (get (load (.libs link)) j)))
+          0)
+        (for [j 0 (len (load (.flags link)))]
+          (m-tagged-arg! a out "--dep-link" id (get (load (.flags link)) j))
+          0)
+        (for [j 0 (len (load (.search-paths link)))]
+          (m-tagged-arg! a out "--dep-link" id "-L")
+          (m-tagged-arg! a out "--dep-link" id (get (load (.search-paths link)) j))
+          0)
+        (for [j 0 (len (load (.objects link)))]
+          (m-tagged-arg! a out "--dep-link" id (get (load (.objects link)) j))
+          0)
+        (let [natives (.native-deps link)]
+          (for [j 0 (len (load natives))]
+            (let [d (al-elem [ManifestNativeDep] natives j)]
+              (if (> (len (.pkg d)) 0)
+                  (m-tagged-arg! a out "--dep-native-pkg" id (.pkg d))
+                  (m-tagged-arg! a out "--dep-native-command" id (.flags-command d))))
+            0))
+        (let [objs (m-cc-objects! a
+                                  (.sources link)
+                                  (.include-dirs link)
+                                  (.ccflags link)
+                                  (.native-deps link)
+                                  (load (field m has-target))
+                                  (load (field m target))
+                                  (load (field m debug)))]
+          (for [j 0 (len (load objs))]
+            (m-tagged-arg! a out "--dep-link" id (get (load objs) j))
+            0)))
+      0)
+    out))
+
+(defn m-emit-dep-packages! [(a (dyn Allocator))
+                            (b (mut StrBuf))
+                            (m (ptr Manifest))] (-> i64)
+  (let [args (m-dep-package-args a m)]
+    (for [i 0 (len (load args))]
+      (let [x (al-elem [ManifestTaggedArg] args i)]
+        (sb-push-str! (mut b) " ")
+        (sb-push-str! (mut b) (.flag x))
+        (sb-push-str! (mut b) " ")
+        (m-shell-quoted! (mut b) (.value x)))
+      0))
+  0)
+
+; Compile C translation units and append each object to the command line.
 (defn m-cc-compile-sources! [(a (dyn Allocator))
                              (b (mut StrBuf))
                              (srcs (ptr (ArrayList (slice u8))))
@@ -11989,7 +12458,26 @@
                              (target (slice u8))
                              (debug bool)
                              (raw bool)] (-> i64)
-  (let [(mut i) 0
+  (let [objs (m-cc-objects! a srcs incs cf nd has-target target debug)]
+    (for [i 0 (len (load objs))]
+      (m-link-tok! (mut b) raw)
+      (sb-push-str! (mut b) (get (load objs) i))
+      0))
+  0)
+
+; Compile C translation units into content-keyed objects under .coil/build/native/
+; and return the object paths. A source is recompiled only when its inputs or the
+; toolchain change; the C compiler failing stops the build.
+(defn m-cc-objects! [(a (dyn Allocator))
+                     (srcs (ptr (ArrayList (slice u8))))
+                     (incs (ptr (ArrayList (slice u8))))
+                     (cf (ptr (ArrayList (slice u8))))
+                     (nd (ptr (ArrayList ManifestNativeDep)))
+                     (has-target bool)
+                     (target (slice u8))
+                     (debug bool)] (-> (ptr (ArrayList (slice u8))))
+  (let [out (box-al [(slice u8)] a (al-new [(slice u8)] a))
+        (mut i) 0
         ns (len srcs)]
     (loop (if (>= (load i) ns)
               (break)
@@ -12096,10 +12584,9 @@
                                               1
                                               (wait-code crc))))
                     0))
-                (m-link-tok! (mut b) raw)
-                (sb-push-str! (mut b) obj)
-                (set! i (primitive/iadd (load i) 1))))))
-  0)
+                (push! out obj)
+                (set! i (primitive/iadd (load i) 1)))))
+    out))
 
 (defn m-cc-sources [(a (dyn Allocator)) (b (mut StrBuf)) (m (ptr Manifest))] (-> i64)
   (m-cc-sources-as a (mut b) m false))
@@ -12173,11 +12660,29 @@
         0)))
   0)
 
+; Whether `coil build` can run the manifest's build in this process instead of
+; re-exec'ing a `<self> build` child. The child exists for the manifest features
+; whose implementation lives in the command layer: workspace fan-out, secondary
+; artifacts, and the root package's own C sources and native providers, which are
+; prepared before the compile. A dependency package's C sources are compiled by
+; that same command layer, so they keep the child path too; its native providers
+; do not, because the build itself consults them once it knows what it loaded.
 (defn manifest-build-in-process? [(m (ptr Manifest))] (-> bool)
   (and (not (m-workspace? m))
        (and (= (len (load (field m artifacts))) 0)
             (and (= (len (load (field m sources))) 0)
-                 (= (len (load (field m native-deps))) 0)))))
+                 (and (= (len (load (field m native-deps))) 0)
+                      (not (m-dep-packages-have-sources? m)))))))
+
+(defn m-dep-packages-have-sources? [(m (ptr Manifest))] (-> bool)
+  (let [pkgs (load (field m dep-packages))
+        (mut any) false]
+    (for [i 0 (len pkgs)]
+      (when (> (len (load (.sources (.link (get (load pkgs) i))))) 0)
+        (set! any true)
+        0)
+      0)
+    (load any)))
 
 (defn manifest-build-argv [(a (dyn Allocator))
                            (argc i32)
@@ -12232,6 +12737,15 @@
     (let [ob (load (field m objects))]
       (for [i 0 (len ob)]
         (manifest-argv-link! a args (get ob i))
+        0))
+    ; Dependency packages travel as `--dep-*` arguments, exactly as they do on a
+    ; child build's command line, and this build selects the ones its compilation
+    ; loads.
+    (let [dep-args (m-dep-package-args a m)]
+      (for [i 0 (len (load dep-args))]
+        (let [x (al-elem [ManifestTaggedArg] dep-args i)]
+          (manifest-argv-push! a args (.flag x))
+          (manifest-argv-push! a args (.value x)))
         0))
     (when (load (field m has-target))
       (manifest-argv-push! a args "--target")
@@ -12492,31 +13006,22 @@
     0)
   0)
 
-; What an executable artifact links: its own link keys and selected native
-; dependencies, then everything dependency packages contribute (their [link],
-; native dependencies and [cc] sources). The root package's own [link], [cc] and
-; unselected native dependencies describe the package executable and are absent.
+; What an executable artifact links unconditionally: its own link keys and the
+; native dependencies it selected. The root package's own [link], [cc] and
+; unselected native dependencies describe the package executable and are absent;
+; dependency packages are offered to the link separately, and each one applies
+; only if the artifact's own compilation loads its code.
 (defn m-artifact-link-set [(a (dyn Allocator))
                            (m (ptr Manifest))
                            (item (ptr ManifestArtifact))] (-> (ptr ManifestLinkSet))
   (let [s (m-new-link-set a)
-        own (.link item)
-        deps (load (field m dep-link))]
+        own (.link item)]
     (m-append-strings! (.frameworks s) (.frameworks own))
     (m-append-strings! (.libs s) (.libs own))
     (m-append-strings! (.flags s) (.flags own))
     (m-append-strings! (.search-paths s) (.search-paths own))
     (m-append-strings! (.objects s) (.objects own))
     (m-append-native-deps! (.native-deps s) (.native-deps item))
-    (m-append-strings! (.frameworks s) (.frameworks deps))
-    (m-append-strings! (.libs s) (.libs deps))
-    (m-append-strings! (.flags s) (.flags deps))
-    (m-append-strings! (.search-paths s) (.search-paths deps))
-    (m-append-strings! (.objects s) (.objects deps))
-    (m-append-native-deps! (.native-deps s) (.native-deps deps))
-    (m-append-strings! (.sources s) (.sources deps))
-    (m-append-strings! (.include-dirs s) (.include-dirs deps))
-    (m-append-strings! (.ccflags s) (.ccflags deps))
     s))
 
 ; The command-line settings an artifact shares with the package executable: the
@@ -12587,18 +13092,8 @@
         (m-shell-quoted! (mut b) (.out item))
         (m-emit-uses a (mut b) m)
         (when executable
-          (let [link (m-artifact-link-set a m item)]
-            (m-emit-link-set a (mut b) link false)
-            (m-cc-compile-sources! a
-                                   (mut b)
-                                   (.sources link)
-                                   (.include-dirs link)
-                                   (.ccflags link)
-                                   (.native-deps link)
-                                   (load (field m has-target))
-                                   (load (field m target))
-                                   (load (field m debug))
-                                   false))
+          (m-emit-link-set a (mut b) (m-artifact-link-set a m item) false)
+          (m-emit-dep-packages! a (mut b) m)
           0)
         (when (load (field m has-target))
           (sb-push-str! (mut b) " --target ")
@@ -12698,6 +13193,7 @@
                    (m-emit-uses a (mut b) m)
                    (m-emit-link a (mut b) m)
                    (m-cc-sources a (mut b) m)
+                   (m-emit-dep-packages! a (mut b) m)
                    (when (load (field m has-target))
                      (sb-push-str! (mut b) " --target ")
                      (sb-push-str! (mut b) (load (field m target)))
@@ -12863,6 +13359,7 @@
             (m-emit-uses a (mut b) m)
             (m-emit-link a (mut b) m)
             (m-cc-sources a (mut b) m)
+            (m-emit-dep-packages! a (mut b) m)
             (when (load (field m has-target))
               (sb-push-str! (mut b) " --target ")
               (m-shell-quoted! (mut b) (load (field m target)))
@@ -14574,6 +15071,7 @@
             (m-emit-uses a (mut b) m)
             (m-emit-link a (mut b) m)
             (m-cc-sources a (mut b) m)
+            (m-emit-dep-packages! a (mut b) m)
             (when (load (field m has-target))
               (sb-push-str! (mut b) " --target ")
               (sb-push-str! (mut b) (load (field m target)))
@@ -15183,6 +15681,7 @@
     (m-emit-uses a (mut cmd) m)
     (m-emit-link a (mut cmd) m)
     (m-cc-sources a (mut cmd) m)
+    (m-emit-dep-packages! a (mut cmd) m)
     (when (load (field m has-target))
       (sb-push-str! (mut cmd) " --target ")
       (m-shell-quoted! (mut cmd) (load (field m target)))
