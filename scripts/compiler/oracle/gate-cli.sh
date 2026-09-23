@@ -4160,6 +4160,24 @@ EOF
     *) bad "repl reports the incompatible redefinition" "$repl_out" ;;
   esac
 
+  # A REPL defn is published as a Var def, not a function; its :params carry the
+  # names, so named calls order their arguments exactly as for a function.
+  repl_named_out=$(printf '%s\n' \
+    '(defn sub [(a i64) (b i64)] (-> i64) (- a b))' \
+    '(sub :a 10 :b 3)' \
+    '(sub :b 3 :a 10)' \
+    '(defn sub [(a i64) (b i64)] (-> i64) (+ a b))' \
+    '(sub :b 3 :a 10)' \
+    '(sub :c 1 :a 2)' \
+    '(sub 1 2 3)' \
+    '(defn sub [(x i64) (y i64)] (-> i64) (- x y))' \
+    '(sub :b 3 :a 10)' \
+    ':q' | "$REPL_COIL" repl 2>&1)
+  case "$repl_named_out" in
+    *'coil> 7'*'coil> 7'*'coil> 13'*"has no parameter :c"*"expects 2 argument(s), got 3"*"different parameter names"*'coil> 13'*) ok "repl named calls reach Var-published functions" ;;
+    *) bad "repl named calls reach Var-published functions" "$repl_named_out" ;;
+  esac
+
   repl_bound_out=$(printf '%s\n' \
     '(deftrait Total [Self] (total [(value Self)] (-> i64)))' \
     '(defn doubled-total [(T Total)] [(value T)] (-> i64) (* (total value) 2))' \

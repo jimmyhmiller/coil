@@ -1138,6 +1138,8 @@ source-roots = ["src"]
                               *backend_flags, want=42),
             lambda: build_run("tests/compiler/features/named_call_source_order.coil",
                               "named-call-source-order", *backend_flags),
+            lambda: expect_rejected("tests/compiler/features/named_call_value_without_params_rejected.coil",
+                                    "fast modernization gate: named call on a def without :params compiled"),
             lambda: expect_rejected("tests/compiler/features/nonambient_primitive_rejected.coil",
                                     "fast modernization gate: non-ambient primitive compiled"),
             lambda: expect_rejected("tests/compiler/features/nonambient_alloc_rejected.coil",
