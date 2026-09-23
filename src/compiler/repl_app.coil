@@ -1,0 +1,360 @@
+(module coil.compiler.repl-app)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :as a)
+(import "coil.arraylist" :as al)
+(import "coil.atomic" :as atomic)
+(import "coil.jit" :as jit)
+(import "coil.compiler.driver" :as repl)
+(import "coil.compiler.formatter.balance" :as balance)
+(import "coil.io" :as io)
+(import "coil.result" :use *)
+(import "coil.slice" :as slice)
+(import "coil.str" :as str)
+(import "coil.sync" :as sync)
+(import "coil.thread" :as thread)
+(import "coil.time" :as time)
+
+(extern dlopen :cc c [(ptr i8) i64] (-> (ptr i8)))
+(extern dlsym :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+(extern dlclose :cc c [(ptr i8)] (-> i32))
+(extern read :cc c [i32 (ptr i8) u64] (-> i64))
+(extern poll :cc c [(ptr PollFd) u64 i32] (-> i32))
+(extern printf :cc c [(ptr i8) ...] (-> i32))
+(extern fflush :cc c [(ptr i8)] (-> i32))
+
+(defn now-ms [] (-> f64)
+  (match (time/monotonic-now)
+    (Ok [instant]
+      (let [value instant]
+        (+ (* (p/cast f64 (.sec value)) 1000.0)
+           (/ (p/cast f64 (.nsec value)) 1000000.0))))
+    (Err [_] (do (assert false) 0.0))))
+
+(defstruct PollFd [(fd i32) (events i16) (revents i16)])
+(defstruct RunLoopSourceContext
+  [(version i64) (info (ptr i8)) (retain (ptr i8)) (release (ptr i8))
+   (description (ptr i8)) (equal (ptr i8)) (hash (ptr i8)) (schedule (ptr i8))
+   (cancel (ptr i8)) (perform (fnptr c [(ptr i8)] void))])
+(defstruct CoreFoundation
+  [(library (ptr i8))
+   (main (fnptr c [] (ptr i8)))
+   (create (fnptr c [(ptr i8) i64 (ptr RunLoopSourceContext)] (ptr i8)))
+   (add (fnptr c [(ptr i8) (ptr i8) (ptr i8)] void))
+   (signal (fnptr c [(ptr i8)] void))
+   (wake (fnptr c [(ptr i8)] void))
+   (invalidate (fnptr c [(ptr i8)] void))
+   (release (fnptr c [(ptr i8)] void))
+   (modes (ptr i8))])
+(defstruct AppRepl
+  [(compiler (ptr jit/JitSession))
+   (tokens (al/ArrayList i64))
+   (frameworks (al/ArrayList (ptr i8)))
+   (cf CoreFoundation)
+   (source (ptr i8))
+   (redraw (fnptr c [] i64))
+   (stop (fnptr c [] i64))
+   (active bool)
+   (mutex sync/Mutex)
+   (done sync/Event)
+   (pending (slice u8))
+   (has-pending bool)
+   (running i64)])
+(defn state [] (-> (ptr AppRepl)) (p/alloc-static AppRepl))
+
+;;; A JIT image resolves native symbols in this process. Unlike an AOT build,
+;;; the compiler executable was not linked against the project's frameworks.
+(defn load-project-frameworks! [(allocator (dyn a/Allocator))] (-> bool)
+  (let [s (state)
+        manifest (repl/parse-manifest allocator
+          (repl/read-src allocator c"Coil.toml"))
+        names (.frameworks manifest)]
+    (set! (.frameworks s) (al/al-new [(ptr i8)] (a/malloc-allocator)))
+    (block :loaded
+      (for [i 0 (al/al-len names)]
+        (let [name (al/al-get names i)
+              (mut path) (str/sb-new allocator)]
+          (str/sb-push-str! (mut path) "/System/Library/Frameworks/")
+          (str/sb-push-str! (mut path) name)
+          (str/sb-push-str! (mut path) ".framework/")
+          (str/sb-push-str! (mut path) name)
+          (let [handle (dlopen (str/str->cstr allocator
+                                      (str/sb-finish! (mut path))) 2)]
+            (when (= (p/cast i64 handle) 0)
+              (printf c"error: cannot load project framework %.*s\n"
+                (p/cast i32 (slice/slice-len name)) (slice/slice-data name))
+              (break :loaded false))
+            (al/al-push! (field s frameworks) handle))))
+      true)))
+
+(defn close-project-frameworks! [] (-> i64)
+  (let [s (state)]
+    (for [i 0 (al/al-len (.frameworks s))]
+      (dlclose (al/al-get (.frameworks s) i)))
+    (al/al-free! (field s frameworks))
+    0))
+
+(defn cf-load! [(cf (ptr CoreFoundation))] (-> bool)
+  (let [library (dlopen c"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation" 2)]
+    (if (= (p/cast i64 library) 0) false
+      (do
+        (set! (.library cf) library)
+        (set! (.main cf) (p/cast (fnptr c [] (ptr i8))
+          (dlsym library c"CFRunLoopGetMain")))
+        (set! (.create cf)
+          (p/cast (fnptr c [(ptr i8) i64 (ptr RunLoopSourceContext)] (ptr i8))
+            (dlsym library c"CFRunLoopSourceCreate")))
+        (set! (.add cf) (p/cast (fnptr c [(ptr i8) (ptr i8) (ptr i8)] void)
+          (dlsym library c"CFRunLoopAddSource")))
+        (set! (.signal cf) (p/cast (fnptr c [(ptr i8)] void)
+          (dlsym library c"CFRunLoopSourceSignal")))
+        (set! (.wake cf) (p/cast (fnptr c [(ptr i8)] void)
+          (dlsym library c"CFRunLoopWakeUp")))
+        (set! (.invalidate cf) (p/cast (fnptr c [(ptr i8)] void)
+          (dlsym library c"CFRunLoopSourceInvalidate")))
+        (set! (.release cf) (p/cast (fnptr c [(ptr i8)] void)
+          (dlsym library c"CFRelease")))
+        (let [cell (dlsym library c"kCFRunLoopCommonModes")]
+          (when (!= (p/cast i64 cell) 0)
+            (set! (.modes cf) (load (p/cast (ptr (ptr i8)) cell))) 0))
+        (and (!= (p/cast i64 (p/cast (ptr i8) (.main cf))) 0)
+          (and (!= (p/cast i64 (p/cast (ptr i8) (.create cf))) 0)
+            (and (!= (p/cast i64 (p/cast (ptr i8) (.add cf))) 0)
+              (and (!= (p/cast i64 (p/cast (ptr i8) (.signal cf))) 0)
+                (and (!= (p/cast i64 (p/cast (ptr i8) (.wake cf))) 0)
+                  (and (!= (p/cast i64 (p/cast (ptr i8) (.invalidate cf))) 0)
+                    (and (!= (p/cast i64 (p/cast (ptr i8) (.release cf))) 0)
+                         (!= (p/cast i64 (.modes cf)) 0))))))))))))
+
+(defn lock! [] (-> i64)
+  (match (sync/mutex-lock! (field (state) mutex))
+    (Ok [n] n) (Err [_] (do (assert false) 1))))
+(defn unlock! [] (-> i64)
+  (match (sync/mutex-unlock! (field (state) mutex))
+    (Ok [n] n) (Err [_] (do (assert false) 1))))
+
+(defn native-form [(form (slice u8))] (-> i64)
+  (let [s (state) raw (.raw (.compiler s))
+        status (repl/repl-terminal-form! raw form)]
+    (when (= status 0)
+      (let [token (jit/jit-generation-retain-current! (.compiler s))]
+        (assert (> token 0))
+        (al/al-push! (field s tokens) token)
+        (when (.active s) (p/call-ptr (.redraw s)) 0)
+        0))
+    status))
+
+(defn handle-live-form [(form (slice u8))] (-> i32)
+  (let [s (state)]
+    (cond
+      (or (= form ":quit") (= form ":q"))
+        (do (atomic/atomic-store (field s running) 0)
+            (p/call-ptr (.stop s))
+            0)
+      (= form ":reset")
+        (printf c"error: reset would invalidate the running app\n")
+      (= form ":run")
+        (printf c"error: app is already running\n")
+      (or (= form ":help") (= form ":h"))
+        (do (io/print-str (io/stdout) (repl/repl-help-text)) 0)
+      :else
+        (let [start (now-ms)
+              status (native-form form)
+              elapsed (- (now-ms) start)]
+          (when (and (= status 0)
+                     (or (str/starts-with form "(def")
+                         (or (str/starts-with form "(const")
+                             (or (str/starts-with form "(module")
+                                 (str/starts-with form "(import")))))
+            (printf c"; ok\n") 0)
+          (printf c"; %.3f ms\n" elapsed)))))
+
+(defn perform-form [(ignored (ptr i8))] (-> void)
+  (let [s (state)]
+    (set! (.active s) true)
+    (lock!)
+    (let [form (.pending s) ready (.has-pending s)]
+      (set! (.has-pending s) false)
+      (unlock!)
+      (when ready
+        (handle-live-form form)
+        (fflush (p/cast (ptr i8) 0))
+        (a/free (a/malloc-allocator) form)
+        (match (sync/event-notify-all! (field s done))
+          (Ok [_] 0) (Err [_] (do (assert false) 1)))
+        0))
+    (do)))
+
+(defn queue-form [(form (slice u8))] (-> i64)
+  (let [s (state)
+        observed (match (sync/event-generation (field s done))
+          (Ok [n] n) (Err [_] (do (assert false) 0)))]
+    (lock!)
+    (assert (not (.has-pending s)))
+    (set! (.pending s) form)
+    (set! (.has-pending s) true)
+    (unlock!)
+    (p/call-ptr (.signal (field s cf)) (.source s))
+    (p/call-ptr (.wake (field s cf)) (p/call-ptr (.main (field s cf))))
+    (match (sync/event-wait! (field s done) observed)
+      (Ok [_] 0) (Err [_] (do (assert false) 1)))))
+
+(defn input-worker [(arg (ptr i8))] (-> (ptr i8))
+  (let [s (state)
+        byte (p/alloc-stack (array u8 1))
+        fd (p/alloc-stack PollFd)
+        (mut text) (str/sb-new (a/malloc-allocator))]
+    (set! (.fd fd) 0)
+    (set! (.events fd) 1)
+    (printf c"coil> ")
+    (fflush (p/cast (ptr i8) 0))
+    (while (!= (atomic/atomic-load (field s running)) 0)
+      (set! (.revents fd) 0)
+      (let [ready (poll fd 1 200)]
+        (when (and (> ready 0) (!= (& (p/cast i64 (.revents fd)) 1) 0))
+          (let [n (read 0 (p/cast (ptr i8) byte) 1)]
+            (if (<= n 0) (break)
+              (let [c (load (p/index byte 0))]
+                (if (= c 10)
+                  (if (balance/fully-balanced? (a/malloc-allocator)
+                                               (str/sb-str (load text)))
+                    (let [form (str/sb-finish! (mut text))]
+                      (if (> (slice/slice-len form) 0)
+                        (queue-form form)
+                        (a/free (a/malloc-allocator) form))
+                      (set! text (str/sb-new (a/malloc-allocator)))
+                      (when (!= (atomic/atomic-load (field s running)) 0)
+                        (printf c"coil> ")
+                        (fflush (p/cast (ptr i8) 0)) 0))
+                    (do (str/sb-push-byte! (mut text) 10)
+                        (printf c"....> ")
+                        (fflush (p/cast (ptr i8) 0)) 0))
+                  (str/sb-push-byte! (mut text) c))))))
+        (when (and (> ready 0) (!= (& (p/cast i64 (.revents fd)) 16) 0))
+          (break))))
+    (str/sb-free! (mut text))
+    (p/cast (ptr i8) 0)))
+
+(defn boot-source [(module (slice u8))] (-> (slice u8))
+  (let [(mut text) (str/sb-new (a/malloc-allocator))]
+    (str/sb-push-str! (mut text)
+      "(module replsession) (import \"coil.primitive\" :as primitive) (import \"coil.fmt\") (import \"coil.io\") (import \"coil.repl\") (import \"")
+    (str/sb-push-str! (mut text) module)
+    (str/sb-push-str! (mut text)
+      "\" :as app) (defn* __app_launch [] (-> i64) (app/repl-launch)) (defn* __app_redraw [] (-> i64) (app/redraw)) (defn* __app_stop [] (-> i64) (app/repl-stop)) (export-c [__app_launch :as \"coil_repl_app_launch\"] [__app_redraw :as \"coil_repl_app_redraw\"] [__app_stop :as \"coil_repl_app_stop\"])")
+    (str/sb-finish! (mut text))))
+
+(defn run-app [] (-> i64)
+  (block :done
+  (let [s (state) cf (field s cf)]
+    (unless (cf-load! cf)
+      (printf c"error: app REPL requires macOS CoreFoundation\n")
+      (break :done 1))
+    (let [launch (jit/jit-symbol-address (.compiler s) "coil_repl_app_launch")
+          redraw (jit/jit-symbol-address (.compiler s) "coil_repl_app_redraw")
+          stop (jit/jit-symbol-address (.compiler s) "coil_repl_app_stop")
+          context (p/alloc-stack RunLoopSourceContext)
+          worker (p/alloc-stack thread/Thread)]
+      (assert (!= (p/cast i64 launch) 0))
+      (assert (!= (p/cast i64 redraw) 0))
+      (assert (!= (p/cast i64 stop) 0))
+      (set! (.redraw s) (p/cast (fnptr c [] i64) redraw))
+      (set! (.stop s) (p/cast (fnptr c [] i64) stop))
+      (store! context (p/zeroed RunLoopSourceContext))
+      (set! (.perform context) (p/fnptr-of perform-form))
+      (set! (.source s) (p/call-ptr (.create cf)
+        (p/cast (ptr i8) 0) 0 context))
+      (p/call-ptr (.add cf) (p/call-ptr (.main cf)) (.source s) (.modes cf))
+      (match (sync/mutex-init (field s mutex))
+        (Ok [_] 0) (Err [_] (do (assert false) 1)))
+      (match (sync/event-init (field s done))
+        (Ok [_] 0) (Err [_] (do (assert false) 1)))
+      (atomic/atomic-store (field s running) 1)
+      (assert (= (thread/thread-spawn-configured worker (p/fnptr-of input-worker)
+        (p/cast (ptr i8) 0) (thread/thread-config 8388608 16384)) 0))
+      (let [status (p/call-ptr (p/cast (fnptr c [] i64) launch))]
+        (set! (.active s) false)
+        (atomic/atomic-store (field s running) 0)
+        (p/call-ptr (.invalidate cf) (.source s))
+        (p/call-ptr (.release cf) (.source s))
+        (match (sync/event-notify-all! (field s done))
+          (Ok [_] 0) (Err [_] (do (assert false) 1)))
+        (assert (= (thread/thread-join worker) 0))
+        (when (.has-pending s)
+          (a/free (a/malloc-allocator) (.pending s))
+          0)
+        (sync/event-destroy! (field s done))
+        (sync/mutex-destroy! (field s mutex))
+        (dlclose (.library cf))
+        status)))))
+
+(defn app-repl-main [(a (dyn a/Allocator))
+                     (argv (ptr (ptr i8)))
+                     (module (slice u8))] (-> i64)
+  (let [toolchain (str/cstr->str (load argv))
+        compiler (a/box! a jit/JitSession
+          (jit/jit-session-new-with-toolchain a toolchain))
+        s (state)]
+    (set! (.compiler s) compiler)
+    (if (!= (jit/jit-session-load-project! compiler) 0)
+      (do (printf c"error: coil repl --app needs a Coil.toml project\n") 1)
+      (if (not (load-project-frameworks! a))
+        (do (close-project-frameworks!) 1)
+      (let [source (boot-source module)
+            status (jit/jit-compile-with-entry! compiler source "0")]
+        (a/free (a/malloc-allocator) source)
+        (if (!= status 0)
+          (let [diagnostic (jit/jit-diagnostic compiler)]
+            (printf c"%.*s\n" (p/cast i32 (slice/slice-len diagnostic))
+              (slice/slice-data diagnostic))
+            (close-project-frameworks!)
+            1)
+          (do
+            (set! (.tokens s) (al/al-new [i64] (a/malloc-allocator)))
+            (let [token (jit/jit-generation-retain-current! compiler)]
+              (assert (> token 0))
+              (al/al-push! (field s tokens) token))
+            (printf c"coil repl — project %.*s is loaded. Type :run to show the app.\n"
+              (p/cast i32 (slice/slice-len module)) (slice/slice-data module))
+            (let [buf (p/alloc-stack (array u8 4))
+                  (mut result) 0
+                  (mut launched) false]
+              (while (not (load launched))
+                (printf c"coil> ")
+                (fflush (p/cast (ptr i8) 0))
+                (match (repl/repl-read-form a (p/cast (ptr i8) buf))
+                  (None [] (break))
+                  (Some [input]
+                    (let [form (repl/m-trim input)]
+                      (cond (or (= form ":quit") (= form ":q")) (break)
+                            (= form ":run")
+                              (do (set! launched true)
+                                  (set! result (run-app)))
+                            (or (= form ":help") (= form ":h"))
+                              (do (io/print-str (io/stdout) (repl/repl-help-text)) 0)
+                            (= form ":reset")
+                              (do (printf c"error: reset would invalidate the loaded app\n") 0)
+                            :else
+                              (let [rc (native-form form)]
+                                (when (and (= rc 0)
+                                  (or (str/starts-with form "(def")
+                                      (or (str/starts-with form "(module")
+                                          (str/starts-with form "(import"))))
+                                  (printf c"; ok\n") 0)
+                                rc))))))
+              (for [i 0 (al/al-len (.tokens s))]
+                (assert (>= (jit/jit-generation-release-token! compiler
+                  (al/al-get (.tokens s) i)) 0)))
+              (al/al-free! (field s tokens))
+              (jit/jit-reset! compiler)
+              (close-project-frameworks!)
+              (load result)))))))))
+
+(defn repl-main [(a (dyn a/Allocator)) (argv (ptr (ptr i8)))] (-> i64)
+  (let [mode (load (p/index argv 2))]
+    (if (and (!= (p/cast i64 mode) 0)
+             (= (str/cstr->str mode) "--app"))
+      (let [module (load (p/index argv 3))]
+        (if (= (p/cast i64 module) 0)
+          (do (printf c"usage: coil repl --app MODULE\n") 1)
+          (app-repl-main a argv (str/cstr->str module))))
+      (jit/jit-repl-main a argv))))

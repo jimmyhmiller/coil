@@ -73,6 +73,45 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
         '[package]\nname = "project-dependency"\nsource-roots = ["src"]\n')
     (dep / "src/values.coil").write_text(
         '(module project-dependency.values)\n(defn answer [] (-> i64) 42)\n')
+    terminal = subprocess.run([str(COMPILER), "repl"], cwd=project, text=True,
+        input=":load project-dependency.values\n(answer)\n:quit\n",
+        capture_output=True, timeout=120, env=TOOLCHAIN_ENV)
+    assert terminal.returncode == 0, (terminal.returncode, terminal.stdout,
+                                       terminal.stderr)
+    assert "42" in terminal.stdout, (terminal.stdout, terminal.stderr)
+    print("PASS: terminal REPL uses the current project manifest", flush=True)
+    if sys.platform == "darwin":
+        (project / "src/app.coil").write_text(
+            '(module project-host.app)\n'
+            '(export repl-launch redraw repl-stop)\n'
+            '(defn repl-launch [] (-> i64) 0)\n'
+            '(defn redraw [] (-> i64) 0)\n'
+            '(defn repl-stop [] (-> i64) 0)\n')
+        app = subprocess.run([str(COMPILER), "repl", "--app", "project-host.app"],
+            cwd=project, text=True, input=":run\n", capture_output=True,
+            timeout=120, env=TOOLCHAIN_ENV)
+        assert app.returncode == 0, (app.returncode, app.stdout, app.stderr)
+        assert "Type :run" in app.stdout, (app.stdout, app.stderr)
+        print("PASS: project app REPL compiles and launches in one JIT session", flush=True)
+    (dep / "src/live_color.coil").write_text(
+        '(module project-dependency.live-color)\n'
+        '(import "coil.repl")\n'
+        '(export value)\n'
+        '(defn value [] (-> i64) 41)\n'
+        '(defn __repl_vars [] (-> Code) (coil.repl/var-module))\n')
+    (project / "src/aot.coil").write_text(
+        '(module project-host.aot)\n'
+        '(import "project-dependency.live-color" :as color)\n'
+        '(defn main [] (-> i64) (- (color/value) 41))\n')
+    aot_binary = work / "repl-var-module-aot"
+    run(COMPILER, "build", project / "src/aot.coil", "-o", aot_binary, *flags,
+        cwd=project)
+    run(aot_binary, cwd=project)
+    binary = work / "jit-repl-import-var"
+    run(COMPILER, "build", ROOT / "tests/compiler/features/jit_repl_import_var.coil",
+        "-o", binary, *flags)
+    run(binary, cwd=project)
+    print("PASS: AOT and imported JIT modules share REPL Var lowering", flush=True)
     binary = work / "project-context"
     run(COMPILER, "build", ROOT / "tests/compiler/features/jit_project_context.coil",
         "-o", binary, *flags)
