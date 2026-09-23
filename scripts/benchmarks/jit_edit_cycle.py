@@ -137,6 +137,10 @@ def main() -> None:
                       'frontend.check.setup', 'frontend.check.functions',
                       'frontend.check.finish', 'frontend.monomorphize',
                       'frontend.mono-sort', 'jit.publish.native', 'jit.publish.retain',
+                      'jit.publish.codegen', 'jit.publish.link', 'jit.publish.entry',
+                      'jit.codegen.register-types', 'jit.codegen.asserts',
+                      'jit.codegen.register-sigs', 'jit.codegen.declare-statics',
+                      'jit.codegen.functions',
                       'jit.publish.snapshot', 'jit.retain.meta',
                       'jit.snapshot.roots', 'jit.snapshot.mark',
                       'jit.snapshot.mark.loader', 'jit.snapshot.mark.native',
@@ -156,6 +160,14 @@ def main() -> None:
             report['span_medians_ms'] = {
                 name: statistics.median(spans[name][1 + args.warmup_edits:])
                 for name in wanted if len(spans.get(name, [])) >= args.edits + 1
+            }
+            counts: dict[str, list[int]] = {}
+            for name, value in re.findall(
+                    r'^coil-trace count (jit\.(?:lifetime|deps)\.[^ ]+) (\d+)$',
+                    measured.stderr, re.MULTILINE):
+                counts.setdefault(name, []).append(int(value))
+            report['steady_counts'] = {
+                name: values[-1] for name, values in counts.items() if values
             }
         if args.census:
             cycles: list[dict[str, int]] = []

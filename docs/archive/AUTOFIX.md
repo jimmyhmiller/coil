@@ -48,7 +48,7 @@ As with the semantic model, the work is not "compute new information" — it is
 |---|---|
 | The byte range to replace | `Sexp {lo, hi, source}` (`reader.coil:30`) — on **every** node |
 | Whether a node is real source | `Sexp.ctxt` (0 = written by hand, ≠0 = macro-expanded) + `code-from-user?` |
-| Node identity across rounds | `Sexp.nid` (S0, shipped) |
+| Node identity across rounds | `Sexp.node-id` (S0, shipped) |
 | The source text to splice into | `LS.sources` → `sm-src-text` (`diag.coil`) |
 | A diagnostic carrying a span | `Diag {lo, hi, msg, source, ctxt}` (`ast.coil:199`) |
 | A collector that runs to completion | `warn-list` / `warn-push` (`comptime.coil:653`) |
@@ -199,7 +199,7 @@ A suggestion is **dropped**, silently and without ceremony, if:
    file to edit.
 3. The node's file is not among the files `--fix` was pointed at.
 
-Note that (1) also disposes of the `nid`-vs-span sharp edge from
+Note that (1) also disposes of the `node-id`-vs-span sharp edge from
 `SEMANTIC_METAPROGRAMS.md` §7.3: a macro-duplicated subtree shares a span, but it
 also has `ctxt ≠ 0`, so it is never an edit target. Fixes only ever touch spans that
 are unique by construction — the ones a human typed.
@@ -349,7 +349,7 @@ untouched bytes of the file are untouched, verbatim; (d) artifact equality on a
 
 ## 11. Summary
 
-Every `Sexp` already carries `(source, lo, hi, ctxt, nid)`, which is exactly a fix's
+Every `Sexp` already carries `(source, lo, hi, ctxt, node-id)`, which is exactly a fix's
 edit target plus the safety check that makes it honest. The design is: **(1)** rules
 emit `(suggest NODE MSG REPLACEMENT)` where the replacement is `Code`, so fixes are
 written in the language's existing quote/unquote vocabulary and can consult

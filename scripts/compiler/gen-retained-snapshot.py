@@ -128,7 +128,8 @@ ARTIFACT_FIELDS={
  ('coil.compiler.check.Sig','params'):6,
  ('coil.compiler.check.Sig','fnptr_params'):6}
 # Whole checked-function artifacts back the persistent declaration index.
-ARTIFACT_KINDS={7:'coil.compiler.ast.Func'}
+ARTIFACT_KINDS={7:'coil.compiler.ast.Func',8:'coil.compiler.check.ConstEntry',
+                9:'coil.compiler.ast.Const'}
 
 # Declaration records an accepted program is made of. Their closures are sealed,
 # and a run of them that is spelled exactly like a run sealed before is held as one
@@ -224,6 +225,7 @@ OPAQUE_FIELDS={('coil.compiler.loader.LS','code_session_state'),
                ('coil.compiler.loader.LS','persistent_checked'),
                ('coil.compiler.loader.LS','persistent_declarations'),
                ('coil.compiler.check.Cx','sig_base'),
+               ('coil.compiler.check.Cx','const_base'),
                ('coil.compiler.resolve.DefEntry','base'),
                ('coil.compiler.ast.AstUnitState','resolution_base'),
                ('coil.compiler.metaengine.MEEntry','fp'),
@@ -317,7 +319,7 @@ def body(t):
     if kind=='defstruct':
         walks=[]; fields=[]
         if head in ('coil.compiler.ast.Expr','coil.reader.Sexp'):
-            walks.append('(when (.liveness g) (set! (mut (.live-nids g)) (.nid value) 0) 0)')
+            walks.append('(when (.liveness g) (set! (mut (.live-node-ids g)) (.node-id value) 0) 0)')
         for name,raw,*rest in tail[0]:
             field=qualify(raw,mod,params);expr='(.'+name+' value)';key=(head,name)
             if name=='source' and field=='i64' and head!='coil.compiler.ast.SrcModEntry':
@@ -428,9 +430,10 @@ while frozen_pending:
     if index in frozen_seen:continue
     frozen_seen.add(index)
     typ=queue[index]; head=typ[0] if isinstance(typ,tuple) else typ
-    if head.startswith(('coil.compiler.loader.', 'coil.compiler.check.',
+    if (typ != 'coil.compiler.check.ConstEntry' and
+        head.startswith(('coil.compiler.loader.', 'coil.compiler.check.',
                         'coil.compiler.resolve.', 'coil.compiler.metaengine.',
-                        'coil.compiler.interp.')):
+                        'coil.compiler.interp.'))):
         raise ValueError(('checked body reaches mutable or separately owned metadata',typ))
     frozen_pending.extend(int(n) for n in re.findall(r'snapshot-(\d+)-(?:walk|scan)\b',typed_walks[index]))
 imports='\n'.join('(import "'+m+'")' for m in sorted(used) if m != 'coil.core')
@@ -449,6 +452,8 @@ wrappers=''
 for name,t in zip(('scan-loader!','scan-program!','scan-resolution!','scan-meta-entries!','scan-syntax!'), ROOTS):
     wrappers+='(defn '+name+' [(g (ptr Graph)) (root (ptr '+render(t)+'))] (-> i64) ('+ident(t)+'-scan g root))\n'
 wrappers+='(defn scan-func! [(g (ptr Graph)) (root (ptr coil.compiler.ast.Func))] (-> i64) ('+ident('coil.compiler.ast.Func')+'-scan g root))\n'
+wrappers+='(defn scan-const-entry! [(g (ptr Graph)) (root (ptr coil.compiler.check.ConstEntry))] (-> i64) ('+ident('coil.compiler.check.ConstEntry')+'-scan g root))\n'
+wrappers+='(defn scan-const! [(g (ptr Graph)) (root (ptr coil.compiler.ast.Const))] (-> i64) ('+ident('coil.compiler.ast.Const')+'-scan g root))\n'
 # The walk a sealed root of each kind is recorded with.
 wrappers+='(defn artifact-scan [(kind i64)] (-> (fnptr c [(ptr Graph) (ptr i8)] i64)) (cond '+' '.join(
     '(= kind '+str(k)+') (p/fnptr-of '+ident(t)+'-scan-erased)' for k,t in sorted(ARTIFACT_KINDS.items()))+' :else (do (abort) (p/fnptr-of '+ident(ARTIFACT_KINDS[1])+'-scan-erased))))\n'
@@ -489,6 +494,8 @@ SEMANTIC_NAMES={
  ('coil.compiler.ast.ExprKind','EVar'):{'name'},
  ('coil.compiler.ast.ExprKind','ECall'):{'func'},
  ('coil.compiler.ast.ExprKind','ENamedCall'):{'func'},
+ ('coil.compiler.ast.ExprKind','EFnPtrOf'):{'name'},
+ ('coil.compiler.ast.ExprKind','EStaticRef'):{'name'},
  ('coil.compiler.ast.ExprKind','EConstruct'):{'sum'},
  ('coil.compiler.ast.ExprKind','EDynDispatch'):{'dyn_struct','vtable_struct'},
  ('coil.compiler.ast.ExprKind','EMakeDyn'):{'dyn_struct','vtable_struct'},

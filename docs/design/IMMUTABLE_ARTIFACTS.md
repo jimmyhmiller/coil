@@ -198,7 +198,7 @@ fell from 391 MB to 259 MB. Still listed, and so still walked, relocated and
 re-inherited every edit: the meta environment's entries, which after each accept
 are the previous facade's (`compiler-revision-retain-meta!` installs the facade as
 the next `meta_environment`). Pruning still iterates the base against the
-snapshot's `live-nids`; that scan goes when the walk does.
+snapshot's `live-node-ids`; that scan goes when the walk does.
 
 ### The small probe hid the scaling; a 2,000-definition probe shows it (2026-09-20)
 
@@ -232,7 +232,7 @@ way functions are treated:
   runtime constant's value with the newly elaborated tree, so no two states shared a
   constant and the checker did O(program) typing per edit. Its lookup `const-find`
   was a scan, which made that setup quadratic. Now: `Cx.constidx`, and a constant
-  handed back unchanged (same value node id, `ConstEntry.source_nid`) keeps the
+  handed back unchanged (same value node id, `ConstEntry.source_node_id`) keeps the
   parent's checked entry, exactly as an accepted function keeps its body.
 - `mono-consts` resolved every runtime constant again into new storage; it now keeps
   the prior native record when the checked node is the same.
@@ -471,7 +471,7 @@ structures into three groups:
   - `fold-program` walks inherited bodies (`comptime.coil:7436`), and
     `cte-wrap-divisor!` edits a live shared body and restores it
     (`comptime_eval.coil:204-229`);
-  - `semantic-freshen-nids!` rewrites `nid` through `Sexp` trees that alias
+  - `semantic-freshen-node-ids!` rewrites `node-id` through `Sexp` trees that alias
     macro arguments (`resolve.coil:186`, `expander.coil:741-753`);
   - `TaggedForm` `form_id`/`revision`/`cached_shape` repair, and
     `ResolvedRevision` `qualified`/`strict`/`prog` replacement
@@ -556,29 +556,29 @@ Nothing durable is identified by an address.
   `Sexp`) exist. Equal fingerprint ⇒ equivalent result ⇒ propagation stops.
 - **Mono instances** keep their existing structural key (`name__typekey…`,
   `mono.coil:346`) with `MonoOrigin` as provenance.
-- **Node ids stay global; the side tables become persistent maps.** `Expr.nid` /
-  `Sexp.nid` is a global counter, and the checker's type, binding and resolution
+- **Node ids stay global; the side tables become persistent maps.** `Expr.node-id` /
+  `Sexp.node-id` is a global counter, and the checker's type, binding and resolution
   maps are unit-global tables keyed by it. A census of one steady-state edit shows
   those three tables and their hash indexes are **about 58% of every record the
   snapshot walks and relocates** (≈99k of 171k), and `sem-maps-inherit!` re-inserts
-  all of them per candidate. They become `PMap nid → entry` held by the `Env`, with
+  all of them per candidate. They become `PMap node-id → entry` held by the `Env`, with
   a mutable overlay during a compile; a candidate reads through to the accepted map
   instead of copying it.
 
-  An earlier draft (and a decision taken on its recommendation) made nids
+  An earlier draft (and a decision taken on its recommendation) made node-ids
   artifact-local with the tables inside each checked body. The audit killed it:
   metaprogram reflection (`type-of`, `binding-of`, `code-decl`,
-  `comptime.coil:2817-3441`) looks up an arbitrary `Code` handle's nid with no
-  function context; lint and `join-source-nodes!` key on `Sexp` nids of raw forms
+  `comptime.coil:2817-3441`) looks up an arbitrary `Code` handle's node-id with no
+  function context; lint and `join-source-nodes!` key on `Sexp` node-ids of raw forms
   that no function owns; metalower and fold read nodes in consts, impls and asserts;
-  mono instances *share* their generic origin's nids on purpose
-  (`mono.coil:2139`); and generated names embed nids (`$borrow.temp.<nid>`,
-  `$qqscope<nid>`). Global ids with a persistent map keep every one of those working.
+  mono instances *share* their generic origin's node-ids on purpose
+  (`mono.coil:2139`); and generated names embed node-ids (`$borrow.temp.<node-id>`,
+  `$qqscope<node-id>`). Global ids with a persistent map keep every one of those working.
 
-  Entries die with the syntax that carries their nid. After `semantic-freshen-nids!`
-  a form revision occupies a contiguous pre-order nid range, so retiring a form can
+  Entries die with the syntax that carries their node-id. After `semantic-freshen-node-ids!`
+  a form revision occupies a contiguous pre-order node-id range, so retiring a form can
   name its entries without a program-wide liveness walk; until the snapshot walk is
-  gone, its existing `live-nids` marking is reused to prune.
+  gone, its existing `live-node-ids` marking is reused to prune.
 
 ### Layer 2 — `Env`, an immutable value
 
@@ -752,7 +752,7 @@ for a one-function edit total about 5 ms today. The other 100 ms is the copying.
 | Stage | Key | Owns | Replaces |
 |---|---|---|---|
 | Source | payload identity | text, line table | *(exists: `retained_source`)* |
-| ParsedForm | `FormId` + text fingerprint | `Sexp` with local nids | `TaggedForm.form`, `raw_form` |
+| ParsedForm | `FormId` + text fingerprint | `Sexp` with local node-ids | `TaggedForm.form`, `raw_form` |
 | ExpandedForm | ParsedForm + macros read | expansion output, hygiene/provenance records | `tagged-rewrite!` results, `expansions` slots |
 | ModuleEnv | module name | imports, exports, aliases, type/value refs | `LS.imports/exports`, resolution registries, `res-own-name` copies |
 | ResolvedForm | ExpandedForm + lookups read | qualified program fragment | `ResolvedRevision.prog` and its flags |
@@ -834,7 +834,7 @@ the copy. With both fixed, all 31 fixtures pass with protection on, and the gate
 now sets `COIL_JIT_PROTECT=1` itself, so the next such write fails the gate at the
 offending store. Protection covers frozen checked bodies only — the one artifact
 kind that exists — so the audit's other items (check setup, `build-param-env`,
-`cte-wrap-divisor!`, nid freshening, `TaggedForm` repair) remain open until the
+`cte-wrap-divisor!`, node-id freshening, `TaggedForm` repair) remain open until the
 data they touch is sealed too; each later phase inherits this net as it seals more.
 
 **Phase 1 — `Env` and the `env-*` read interface.** Mechanical: define `Env` as
@@ -857,7 +857,7 @@ as persistent indexes, after the semantic side tables (the first slice, because
 they are the majority of what is copied). Fix
 `build-param-env`, `fold-program`, `cte-wrap-divisor!`. Deletes
 `check-inherit-signatures!`, `ls-accept-checked!` rebuilds, `SemMapsSnap`,
-`sem-maps-inherit!`, the nid-liveness pass. **Gate** (from the boundary audit): a
+`sem-maps-inherit!`, the node-id-liveness pass. **Gate** (from the boundary audit): a
 same-signature body edit creates one artifact and O(log n) index nodes, relocates
 nothing, leaves every old address intact on rejection, and plateaus over 1,000
 replacements — counting publication *and* the next prepare.
@@ -1154,10 +1154,10 @@ preparation and snapshot marking rather than further pruning-table work.
 
 - **Phase 1 is wide.** Every accepted-state read site changes. Mitigation: it is
   behaviour-preserving, so the existing gates fully specify it.
-- **Shared nids are legitimate** (template atoms re-emitted by `mh-quoted`, mono
+- **Shared node-ids are legitimate** (template atoms re-emitted by `mh-quoted`, mono
   instances, tower and lint copies), and the maps are latest-wins. Accepted entries
   must therefore never be overwritten by a candidate that is later dropped — which
-  the overlay guarantees — but two accepted artifacts can still contend for one nid,
+  the overlay guarantees — but two accepted artifacts can still contend for one node-id,
   exactly as today.
 - **By-value record copies alias inner lists** (`Func` copies share `params`;
   mono's output `Program` aliases the input's `externs`/`traits`/`impls`). Seal
