@@ -187,7 +187,7 @@ With NAME-GROUP, also match the name being defined as the second group."
     ("(\\(import\\|include\\)\\_>[ \t\n]*\"\\([^\"\n]*\\)\""
      (1 font-lock-keyword-face) (2 font-lock-constant-face t))
     ("(import\\_>[^()\n]*?:as[ \t]+\\(\\(?:\\sw\\|\\s_\\)+\\)"
-     (1 coil-namespace-face))
+     (1 'coil-namespace-face))
 
     ;; The rest of the definition heads, unnamed.
     (,(coil--form-head-regexp coil-definition-forms)
@@ -218,10 +218,10 @@ With NAME-GROUP, also match the name being defined as the second group."
 
     ;; The alias half of a qualified call: primitive/cast, alloc/heap, s/len.
     ("\\_<\\([a-zA-Z_][a-zA-Z0-9_-]*\\)/\\(?:\\sw\\|\\s_\\)"
-     (1 coil-namespace-face))
+     (1 'coil-namespace-face))
 
     ;; (.field place) — a field read.
-    ("(\\(\\.\\(?:\\sw\\|\\s_\\)+\\)" (1 font-lock-property-use-face))
+    ("(\\(\\.\\(?:\\sw\\|\\s_\\)+\\)" (1 'font-lock-property-use-face))
 
     ;; c"…" — the byte-string prefix.  The string body is already fontified
     ;; syntactically; this just marks the sigil.

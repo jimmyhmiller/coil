@@ -426,6 +426,45 @@ neither does the syntax table."
     (should (equal (char-syntax ?,) ?.))))
 
 
+;;; Font lock
+
+(defun coil-test--face-at (text needle)
+  "The face font-lock puts on the first character of NEEDLE in TEXT."
+  (with-temp-buffer
+    (insert text)
+    (coil-mode)
+    (font-lock-ensure)
+    (goto-char (point-min))
+    (search-forward needle)
+    (get-text-property (match-beginning 0) 'face)))
+
+(ert-deftest coil-test-font-lock-covers-every-rule ()
+  "Fontify a buffer that trips every rule in `coil-font-lock-keywords'.
+A face given unquoted in a rule is evaluated as a variable; a `defface'
+does not define one, so the whole pass signals `void-variable' and the
+buffer is left uncoloured.  That is exactly how an `:as' alias or an
+`alias/name' call used to switch highlighting off for an entire file."
+  (let ((text (concat
+               "(module demo.fontlock)\n"
+               "(import \"coil.primitive\" :use * :as primitive)\n"
+               ";;; A doc comment.\n"
+               "(defstruct Point (x i64) (y i64))\n"
+               "(defn area [(p (ptr Point)) (n u32)] (-> i64)\n"
+               "  (let [a (primitive/load (.x p))]\n"
+               "    (printf c\"%d\" \\a 0x1f)))\n")))
+    (should (eq (coil-test--face-at text "defn") 'font-lock-keyword-face))
+    (should (eq (coil-test--face-at text "area") 'font-lock-function-name-face))
+    (should (eq (coil-test--face-at text "Point") 'font-lock-type-face))
+    (should (eq (coil-test--face-at text "u32") 'font-lock-type-face))
+    (should (eq (coil-test--face-at text "primitive/")
+                'coil-namespace-face))
+    (should (eq (coil-test--face-at text "primitive)") 'coil-namespace-face))
+    (should (eq (coil-test--face-at text ".x") 'font-lock-property-use-face))
+    (should (eq (coil-test--face-at text ":use") 'font-lock-builtin-face))
+    (should (eq (coil-test--face-at text ";;; A") 'font-lock-doc-face))
+    (should (eq (coil-test--face-at text "0x1f") 'coil-number-face))))
+
+
 ;;; ---------------------------------------------------------------------------
 ;;; Scratch copies
 
