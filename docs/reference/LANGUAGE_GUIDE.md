@@ -27,7 +27,7 @@ section described below.
     coil build file.coil --target wasm32-unknown-unknown -o out.wasm
     coil run                             # build+run the ./Coil.toml project
     coil test                            # discover and run project test suites
-    coil fuzz  file.coil -n 100000       # run its properties under coverage guidance
+    coil fuzz  file.coil --time 60       # a coverage-guided campaign against its properties
     coil check                           # typecheck every project target graph (no codegen, no link)
     coil verify                          # fmt + lint + check + native build + test
     coil run -- arg1 arg2                # forward args to the program
@@ -942,14 +942,16 @@ functions must be declared separately.
 
 Int types `i8 i16 i32 i64 u8 u32 u64 …` (arbitrary width, real signedness).
 Floats `f32 f64`. `bool` is real (`true`/`false`). Literals infer width from
-context; hex `0x1F`, binary `0b1010`, octal `0o17`, underscores `1_000`.
+context; hex `0x1F`, binary `0b1010`, octal `0o17`, underscores `1_000` (only between
+digits: `1_`, `1__0` and `0x_FF` are errors, as is a literal outside its type's
+range or a float past the f64 range like `1e400`).
 
 `(primitive/cast T x)` converts: `(primitive/cast i64 f)` truncates f64→i64 (numeric), `(primitive/cast f64 i)`
 converts int→float, `(primitive/cast (ptr T) x)` reinterprets pointers, `(primitive/cast i64 p)` is a
 pointer's address. ⚠ `cast` between f64 and i64 is a **numeric conversion, not a
 bit reinterpret**. For a bitcast (e.g. NaN-boxing) round-trip through memory:
-`(let [(mut bits-place) bits] (primitive/load (primitive/cast (ptr f64) (mut bits-place))))` — LLVM at
--O3 folds this to a register move.
+`(let [p (primitive/alloc-stack i64)] (store! p bits) (primitive/load (primitive/cast (ptr f64) p)))` —
+LLVM at -O3 folds this to a register move.
 
 ## Control flow
 
@@ -2297,7 +2299,7 @@ generator's invariants survive shrinking by construction:
       counterexample:
         xs = (0 0 0)
 
-      reproduce:  --seed=1903151487994059799 --cases=200 coil test …
+      reproduce:  coil test tests/list_test.coil --seed 1903151487994059799 --cases 200
 
 Inside a body: `(assume COND)` discards a case that misses a precondition,
 `(classify "label" COND)` and `(collect "label" EXPR)` report the input
@@ -2305,7 +2307,14 @@ distribution (and warn when one bucket swallows the run), `(prop-target! EXPR)`
 asks the runner to hill-climb toward a number instead of sampling uniformly, and
 `(prop-src)` hands you the `Source` to draw from directly (`draw-int!`,
 `draw-len!`, `arb-string`, …) when a type's default distribution is wrong for one
-property.
+property. Values drawn that way are not arguments, so a report cannot print them
+unless you name them: `(prop-note "label" EXPR)` evaluates to EXPR and shows it as
+`label = …` under the arguments of a counterexample, and `(prop-draw T "label")`
+draws any `Arbitrary` type and notes it in one step:
+
+    (defprop parse-never-crashes [(seed i64)]
+      (let [text (prop-note "text" (arb-bytes (prop-src) 0 256))]
+        (parse-ok-or-error? text)))
 
 Derive both halves for your own structs and sums with
 `(derive Arbitrary Debug T)`
@@ -2324,23 +2333,49 @@ other list keeps the generic impl:
 friends into every property file), so add `(import "coil.io" :as io)` and write
 `(w (ptr io/Writer))`.
 
-**Coverage-guided fuzzing.** `coil fuzz FILE.coil [-n N]`
-rebuilds a property file with edge instrumentation (`coil emit-ir` piped through
-clang's `-fsanitize-coverage`; the callbacks are ordinary Coil functions in
-`coil.prop.cov`, so an ordinary build is unaffected) and mutates a corpus of
-tapes, keeping whatever reaches a basic block nothing has reached yet. Because
-the corpus holds *choices* rather than bytes, every mutant is a well-formed value
-of the argument types. A bug behind a four-byte magic value — unreachable by
-sampling — is found in tens of thousands of cases.
-
 A property that **crashes or hangs** is minimized too, not just one that returns
-false: generation runs in a spawned worker process, the runner bisects to the case
-that killed it, and shrinks with each candidate in its own process. Knobs, all optional:
-`--cases` (200), `--seed` (derived from the property name, so runs
-are reproducible), `--size`, `--shrink`, `--timeout` (60s),
-`--target-steps`, `--verbose`, `--no-fork`. Design and prior art:
-`docs/design/PROPERTY_TESTING.md`; worked example:
-`src/examples/property-testing.coil`.
+false: cases run in a spawned worker process that mirrors every choice it draws
+into a shared stage file, so whatever kills the worker, the runner still has the
+exact input, and shrinks it with each candidate in its own process. Knobs, all
+optional: `--cases` (200), `--seed` (derived from the property name, so runs are
+reproducible), `--size`, `--shrink`, `--timeout` (60s per case), `--target-steps`,
+`--verbose`, `--no-fork`. Design and prior art: `docs/design/PROPERTY_TESTING.md`;
+worked example: `src/examples/property-testing.coil`.
+
+**Coverage-guided fuzzing.** `coil fuzz FILE.coil` runs a *campaign* against each
+property instead of a fixed number of cases:
+
+    coil fuzz tests/fuzz/json_fuzz.coil --time 300 --jobs 4 --sanitize=address
+
+The file is rebuilt with clang's SanitizerCoverage (the callbacks are ordinary
+Coil functions in `coil.prop.cov`, so an ordinary build is unaffected), and worker
+processes mutate a **corpus** of inputs, keeping each input that reaches an edge
+nothing reached before or reaches one a new number of times (AFL's hit-count
+buckets — so loop depth counts as progress). Values a comparison was seen to want
+are fed back into mutations, which turns a magic byte from a guess into a lookup.
+Inputs are the generators' recorded choices, so every mutant is a valid value of
+the argument types, and mutations work on whole values: an element is deleted,
+repeated, swapped, or spliced in from another input.
+
+- `--time SECS` (default 60; `0` runs until Ctrl-C, which stops the workers and
+  still prints the report — a second Ctrl-C abandons it) or `-n N` mutations per worker;
+  `--jobs N` workers share one corpus; `--filter SUBSTR` picks properties.
+- `--sanitize=address` instruments the program with ASan and gives every generated
+  value its own allocation — an overrun inside the per-case arena is invisible.
+- `--input-timeout SECS` (10): an input that runs longer is reported as a hang.
+- The corpus lives in `.coil/fuzz/<property>/corpus/` and each campaign resumes
+  from it; `--minimize-corpus` keeps only entries that still add coverage.
+- `.coil/fuzz/<property>/coverage.txt` lists the functions a campaign never
+  entered, then reached/total edges for the rest. Read it: a target that never
+  gets past its first check passes forever. Counts are per *compiled* function, so
+  code inlined into a caller is counted there.
+- A finding — false, a crash, a sanitizer report, a hang — is minimized and saved
+  to `.coil/pbt/` like any counterexample, so a plain `coil test` replays it
+  first from then on. Each worker's own output goes to
+  `.coil/fuzz/<property>/worker-<n>.log`.
+
+Fuzz targets for the standard library live in `tests/fuzz/`, and
+`scripts/tests/fuzz_targets.py` runs a campaign over all of them.
 
     coil test                         ; default suites only
     coil test --suite integration     ; that suite (repeatable)
