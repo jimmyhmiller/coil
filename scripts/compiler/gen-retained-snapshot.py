@@ -94,7 +94,8 @@ OVERRIDES={
  ('coil.compiler.metaengine.MEEntry','interpcx'):('ptr','coil.compiler.interp.Interp'),
 }
 NULL_FIELDS={('coil.compiler.loader.LS','parent'),
- ('coil.compiler.check.Cx','anon_outer_env')}
+ ('coil.compiler.check.Cx','anon_outer_env'),
+ ('coil.compiler.check.Cx','ownership_subst')}
 EMPTY_LISTS={
  ('coil.compiler.loader.LS','out'),
  ('coil.compiler.check.Cx','cur_bounds'), ('coil.compiler.check.Cx','loops'),
