@@ -206,3 +206,131 @@
                                  (primitive/iadd (slice-len path) 1))
                       1)
           res))))
+
+; ---- directories, renames, shared mappings ---------------------------------
+(extern opendir :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern readdir :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern closedir :cc c [(ptr i8)] (-> i32))
+
+(extern rename :cc c [(ptr i8) (ptr i8)] (-> i32))
+
+(extern ftruncate :cc c [i32 i64] (-> i32))
+
+(extern mmap :cc c [(ptr i8) i64 i32 i32 i32 i64] (-> (ptr i8)))
+
+;;; `struct dirent` differs between the platforms before `d_name`, the only field
+;;; read here. Darwin's offset is the 64-bit-inode layout, which plain `readdir`
+;;; returns on arm64.
+(defn gen-dirent-name-offset [] (-> Code)
+  `(const ~(fs--explicit-public-name `DIRENT-NAME-OFFSET) ~(os-pick `19 `21)))
+
+(meta (gen-dirent-name-offset))
+
+;; The C path for `path`, or null when it could not be allocated. Free with
+;; `fs--free-cstr`.
+(defn fs--cstr [(a (dyn Allocator)) (path (slice u8))] (-> (ptr i8))
+  (str->cstr a path))
+
+(defn fs--free-cstr [(a (dyn Allocator)) (path (slice u8)) (cp (ptr i8))] (-> i64)
+  (if (= (primitive/cast i64 cp) (cast i64 0))
+      0
+      (free-bytes a
+                  (slice-new [u8]
+                             (primitive/cast (ptr u8) cp)
+                             (primitive/iadd (slice-len path) 1))
+                  1)))
+
+;;; The names in the directory at `path`, without `.` and `..`, in whatever order
+;;; the filesystem returns them. Each name is an owning slice from `a`; free the
+;;; list with `dir-list-free`.
+(defn dir-list [(a (dyn Allocator)) (path (slice u8))] (-> (Result (ArrayList (slice u8))
+                                                                   IoError))
+  (let [cp (fs--cstr a path)]
+    (if (= (primitive/cast i64 cp) (cast i64 0))
+        (Err (Errno 0))
+        (let [d (opendir cp)
+              open-errno
+                (if (= (primitive/cast i64 d) (cast i64 0)) (os/os-errno) 0)]
+          (fs--free-cstr a path cp)
+          (if (= (primitive/cast i64 d) (cast i64 0))
+              (Err (Errno open-errno))
+              (let [(mut out) (al-new [(slice u8)] a)]
+                (loop (let [e (readdir d)]
+                        (if (= (primitive/cast i64 e) (cast i64 0))
+                            (break)
+                            (let [nm
+                                    (cstr->str (primitive/cast (ptr i8)
+                                                               (primitive/index (primitive/cast (ptr u8)
+                                                                                                e)
+                                                                                DIRENT-NAME-OFFSET)))]
+                              (if (or (= nm ".") (= nm ".."))
+                                  0
+                                  (let [(mut sb) (sb-new a)]
+                                    (sb-push-str! (mut sb) nm)
+                                    (al-push! (mut out) (sb-finish! (mut sb)))
+                                    0))))))
+                (closedir d)
+                (Ok (load out))))))))
+
+;;; Free a list `dir-list` returned.
+(defn dir-list-free [(a (dyn Allocator)) (names (mut (ArrayList (slice u8))))] (-> i64)
+  (let [n (al-len (load names))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [s (al-get (load names) (load i))]
+                (if (= (primitive/cast i64 (slice-data s)) (cast i64 0))
+                    0
+                    (free-bytes a s 1))
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    (al-free! (mut names))
+    0))
+
+;;; Rename `from` to `to`, replacing `to` if it exists. Atomic within one
+;;; filesystem, which is what makes "write a temporary, then rename" the way to
+;;; publish a file that concurrent readers must never see half-written.
+(defn rename-file [(a (dyn Allocator)) (from (slice u8)) (to (slice u8))] (-> (Result i64
+                                                                                         IoError))
+  (let [cf (fs--cstr a from)
+        ct (fs--cstr a to)
+        r
+          (if (or (= (primitive/cast i64 cf) (cast i64 0))
+                  (= (primitive/cast i64 ct) (cast i64 0)))
+              (Err [i64 IoError] (Errno 0))
+              (if (< (primitive/cast i64 (rename cf ct)) (cast i64 0))
+                  (Err [i64 IoError] (Errno (os/os-errno)))
+                  (Ok [i64 IoError] 0)))]
+    (fs--free-cstr a from cf)
+    (fs--free-cstr a to ct)
+    r))
+
+;;; Create (or reuse) the file at `path`, size it to exactly `size` bytes, and map
+;;; it read-write and SHARED. Stores through the returned pointer reach the file
+;;; with no further system call, and they survive the process: a writer that is
+;;; killed mid-run leaves what it last stored for another process to read. The
+;;; mapping lasts until the process exits.
+(defn map-shared-file [(a (dyn Allocator)) (path (slice u8)) (size i64)] (-> (Result (ptr u8)
+                                                                                         IoError))
+  (let [cp (fs--cstr a path)]
+    (if (= (primitive/cast i64 cp) (cast i64 0))
+        (Err (Errno 0))
+        (let [fd (os/open cp (primitive/cast i32 (| O_RDWR O_CREAT)) FILE_MODE_DEFAULT)
+              open-errno
+                (if (< (primitive/cast i64 fd) (cast i64 0)) (os/os-errno) 0)]
+          (fs--free-cstr a path cp)
+          (if (< fd (cast i32 0))
+              (Err (Errno open-errno))
+              (if (< (primitive/cast i64 (ftruncate fd size)) (cast i64 0))
+                  (let [e (os/os-errno)]
+                    (os/close fd)
+                    (Err (Errno e)))
+                  ; PROT_READ|PROT_WRITE = 3 and MAP_SHARED = 1 on both platforms.
+                  (let [p (mmap (primitive/cast (ptr i8) 0) size 3 1 fd 0)
+                        e (os/os-errno)]
+                    (os/close fd)
+                    (if (= (primitive/cast i64 p) (cast i64 -1))
+                        (Err (Errno e))
+                        (Ok (primitive/cast (ptr u8) p))))))))))

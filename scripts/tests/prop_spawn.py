@@ -89,8 +89,9 @@ CRASHES = """(module spawn-crash-probe)
 (import "coil.prop" :use *)
 (import "coil.assert" :use *)
 
+(import "coil.alloc" :use *)  ; abort — declared once, by the stdlib
+
 (extern rt_call :cc c [i64] (-> i64))
-(extern abort :cc c [] (-> i64))
 
 ;; Crashes for anything past 1000, so the minimal crashing input is exactly 1001.
 ;; The runtime call is in the body on purpose: every bisection probe and every

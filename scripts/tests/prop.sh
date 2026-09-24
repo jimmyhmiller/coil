@@ -8,6 +8,7 @@
 #   scripts/tests/prop.sh              # everything
 #   scripts/tests/prop.sh -q           # only the summary lines
 #   scripts/tests/prop.sh build/bin/coil   # a specific compiler
+#   scripts/tests/prop.sh -q build/bin/coil
 #
 # A compiler PATH as the first argument selects that compiler; `COIL=` still
 # works. This used to accept only `COIL=`, and an argument was silently ignored
@@ -21,12 +22,17 @@
 
 set -u
 cd "$(dirname "$0")/../.." || exit 1
+# Options in any order: `-q`, and a compiler path. `-q` used to be recognized only
+# ALONE — `prop.sh -q <candidate>` dropped the candidate and tested the installed
+# compiler, the very trap described above, one flag later.
 QUIET=0
-if [ "${1:-}" = "-q" ]; then
-  QUIET=1
-elif [ -n "${1:-}" ]; then
-  COIL=$1
-fi
+for arg in "$@"; do
+  case "$arg" in
+    -q) QUIET=1 ;;
+    -*) printf 'prop.sh: unknown option %s\n' "$arg" >&2; exit 2 ;;
+    *) COIL=$arg ;;
+  esac
+done
 COIL=${COIL:-coil}
 
 FILES="tests/prop/core_test.coil

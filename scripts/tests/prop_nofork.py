@@ -34,8 +34,7 @@ CRASHER = """(module nofork-crash-probe)
 (import "coil.primitive" :as primitive)
 (import "coil.prop" :use *)
 (import "coil.assert" :use *)
-
-(extern abort :cc c [] (-> i64))
+(import "coil.alloc" :use *)  ; abort — declared once, by the stdlib
 
 ;; Aborts on ~1% of values, so 300 cases find one with near-certainty.
 (defprop crashes-on-a-value [(n i64)]

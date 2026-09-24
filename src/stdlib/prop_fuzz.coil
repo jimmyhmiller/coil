@@ -1,0 +1,1205 @@
+(module coil.prop.fuzz)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use [HashMap hm-new-scalar hm-put! hm-get])
+(import "coil.slice" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+(import "coil.str" :as str)
+(import "coil.os" :as os)
+(import "coil.fs" :as fs)
+(import "coil.time" :as time)
+(import "coil.args" :use *)
+(import "coil.prop.rng" :use *)
+(import "coil.prop.source" :use *)
+(import "coil.prop.shrink" :use *)
+(import "coil.prop.db" :use *)
+(import "coil.prop.cov" :use *)
+
+; COVERAGE-GUIDED FUZZING CAMPAIGNS — the worker half.
+;
+; `coil fuzz` builds a property's test binary with SanitizerCoverage (see
+; coil.prop.cov) and runs it with `--fuzz`. The runner then does not run the
+; property itself. It SUPERVISES: it starts one or more worker processes, watches
+; them, and when one dies, turns what it died on into an ordinary minimized
+; counterexample. This file is what a worker does.
+;
+; A worker is a loop over a CORPUS — inputs that each did something no earlier
+; input did — that picks an entry, mutates it, runs the property on the mutant, and
+; keeps the mutant if it reached new coverage. Three properties of the design are
+; what make the result trustworthy:
+;
+;   * THE INPUT IS NEVER LOST. The Source mirrors every choice it records into a
+;     shared file mapping (coil.prop.source, "staging"). Whatever kills a worker —
+;     a segfault, an AddressSanitizer abort, the supervisor's SIGKILL for a hang —
+;     the file holds the exact tape of the case in flight, and the supervisor
+;     reads it from there. Nothing is re-run to find out what happened.
+;
+;   * THE CORPUS IS DURABLE. Every new entry is written to
+;     `.coil/fuzz/<property>/corpus/` the moment it is found, so a campaign can be
+;     stopped at any point and the next one resumes from everything it learned;
+;     several workers share one directory and pick up each other's finds.
+;
+;   * EVERY MUTANT IS A VALID INPUT. Entries are TAPES, the choice sequences the
+;     generators consumed, together with the SPAN TREE that says which choices
+;     belong to which generated value. A mutation edits choices or moves whole
+;     spans — deletes a list element, repeats it, splices in an element or a
+;     subtree from another entry — and replay re-runs the generators, so every
+;     mutant is a well-typed value that satisfies whatever the generator
+;     guarantees. That is Zest's "semantic fuzzing", and here it falls out of the
+;     representation the shrinker already needed.
+
+; ── the stage header ─────────────────────────────────────────────────────────
+;
+; Words of the shared stage file, before the mirrored tape (whose size and length
+; words, STAGE-SIZE and STAGE-LEN, are coil.prop.source's). The worker writes; the
+; supervisor reads, except for STAGE-STOP, which runs the other way.
+(const STAGE-MAGIC-WORD 0)
+
+(const STAGE-PID 2)
+
+(const STAGE-STOP 4)  ; nonzero: the supervisor asks the worker to finish
+
+(const STAGE-CORPUS 5)
+
+(const STAGE-EDGES 6)
+
+(const STAGE-FEATURES 7)
+
+(const STAGE-GUARDS 8)
+
+(const STAGE-PHASE 11)  ; FUZZ-PHASE-*
+
+(const STAGE-LAST-NEW 12)  ; the exec count at the last new coverage
+
+(const STAGE-FUNCS 13)  ; instrumented functions (set when the coverage report is written)
+
+(const STAGE-FUNCS-HIT 14)  ; …of which the campaign entered
+
+(const STAGE-MAGIC 5282054631473678650)  ; "COILFUZ:" little-endian
+
+(const FUZZ-PHASE-START 0)
+
+(const FUZZ-PHASE-LOAD 1)  ; replaying the saved corpus
+
+(const FUZZ-PHASE-GENERATE 2)  ; random cases seeding the corpus
+
+(const FUZZ-PHASE-MUTATE 3)
+
+(const FUZZ-PHASE-DONE 4)
+
+;;; How many choices a stage holds. Matches the Source's own `max-choices`, so a
+;;; case that fits in a Source fits in the stage.
+(const STAGE-CAP 100000)
+
+;;; The stage file's size in bytes.
+(defn stage-bytes [] (-> i64)
+  (primitive/imul (primitive/iadd STAGE-HEADER
+                                  (primitive/imul STAGE-CAP STAGE-CHOICE))
+                  8))
+
+; ── where a campaign keeps its files ─────────────────────────────────────────
+
+;;; The directory holding one property's campaign: its corpus and its stages.
+;;; `--fuzz-dir` moves the root; the default sits beside the property database.
+;;; Owning.
+(defn fuzz-dir [(a (dyn Allocator)) (name (slice u8))] (-> (slice u8))
+  (let [flag (args-value "--fuzz-dir")
+        safe (db-sanitize-name a name)
+        d (db-join a (if (> (slice-len flag) 0) flag ".coil/fuzz") safe)]
+    (db-free-bytes a safe)
+    d))
+
+;;; `<dir>/corpus`, or `--corpus DIR` when given. Owning.
+(defn fuzz-corpus-dir [(a (dyn Allocator)) (dir (slice u8))] (-> (slice u8))
+  (let [flag (args-value "--corpus")]
+    (if (> (slice-len flag) 0)
+        (let [(mut sb) (str/sb-new a)]
+          (str/sb-push-str! (mut sb) flag)
+          (str/sb-finish! (mut sb)))
+        (db-join a dir "corpus"))))
+
+;;; Which campaign a worker belongs to: the supervisor's pid, handed to each worker.
+;;; Stage and log names carry it, so two campaigns on one property — two terminals,
+;;; or a campaign beside a `--minimize-corpus` — never share a stage and never read
+;;; each other's counters; they share only the corpus, which is meant to be shared.
+(const FUZZ-CAMPAIGN-FLAG "--coil-prop-fuzz-campaign")
+
+(defn fuzz-campaign-id [] (-> i64)
+  (args-int FUZZ-CAMPAIGN-FLAG 0))
+
+(defn fuzz-numbered-path [(a (dyn Allocator))
+                          (dir (slice u8))
+                          (prefix (slice u8))
+                          (campaign i64)
+                          (i i64)
+                          (suffix (slice u8))] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) prefix)
+    (str/sb-push-i64! (mut sb) campaign)
+    (str/sb-push-str! (mut sb) "-")
+    (str/sb-push-i64! (mut sb) i)
+    (str/sb-push-str! (mut sb) suffix)
+    (let [leaf (str/sb-finish! (mut sb))
+          p (db-join a dir leaf)]
+      (db-free-bytes a leaf)
+      p)))
+
+;;; `<dir>/stage-<campaign>-<i>`. Owning.
+(defn fuzz-stage-path [(a (dyn Allocator)) (dir (slice u8)) (campaign i64) (i i64)] (-> (slice u8))
+  (fuzz-numbered-path a dir "stage-" campaign i ""))
+
+;;; `<dir>/worker-<campaign>-<i>.log`. Owning.
+(defn fuzz-log-path [(a (dyn Allocator)) (dir (slice u8)) (campaign i64) (i i64)] (-> (slice u8))
+  (fuzz-numbered-path a dir "worker-" campaign i ".log"))
+
+;;; Remove the stages and logs of campaigns whose supervisor is gone — interrupted
+;;; ones, above all: a stage is 5 MB (sparse), and one per worker per interrupted
+;;; campaign adds up in a checkout. A live campaign's files are left alone.
+(defn fuzz-clean-stale! [(a (dyn Allocator)) (dir (slice u8))] (-> i64)
+  (match (fs/dir-list a dir)
+    (Err [e] 0)
+    (Ok [names]
+        (let [(mut ns) names
+              n (al-len [(slice u8)] (load ns))
+              (mut i) 0]
+          (loop (if (>= (load i) n)
+                    (break)
+                    (let [nm (al-get [(slice u8)] (load ns) (load i))
+                          start
+                            (cond (str/starts-with nm "stage-") 6
+                                  (str/starts-with nm "worker-") 7
+                                  :else -1)]
+                      (if (< start 0)
+                          0
+                          (let [pid (fuzz-leading-int nm start)]
+                            (if (and (> pid 0)
+                                     (!= (primitive/cast i64 (os/kill (primitive/cast i32 pid) 0)) 0))
+                                (let [p (db-join a dir nm)]
+                                  (db-remove-tape a p)
+                                  (db-free-bytes a p)
+                                  0)
+                                0)))
+                      (store! i (primitive/iadd (load i) 1))
+                      0)))
+          (fs/dir-list-free a (mut ns))
+          0))))
+
+;;; The decimal number starting at `at` in `s` (0 if there is none).
+(defn fuzz-leading-int [(s (slice u8)) (at i64)] (-> i64)
+  (let [(mut v) 0
+        (mut i) at]
+    (loop (if (>= (load i) (slice-len s))
+              (break)
+              (let [c (primitive/cast i64 (slice-get s (load i)))]
+                (if (and (>= c 48) (<= c 57))
+                    (do
+                      (store! v (primitive/iadd (primitive/imul (load v) 10) (primitive/isub c 48)))
+                      (store! i (primitive/iadd (load i) 1)))
+                    (break)))))
+    (load v)))
+
+;;; Send this process's stdout and stderr to worker `i`'s log, truncated.
+(defn fuzz-redirect-output! [(a (dyn Allocator)) (dir (slice u8)) (i i64)] (-> i64)
+  (let [p (fuzz-log-path a dir (fuzz-campaign-id) i)
+        cp (str/str->cstr a p)
+        fd (os/open cp (primitive/cast i32 (| fs/O_WRONLY (| fs/O_CREAT fs/O_TRUNC))) fs/FILE_MODE_DEFAULT)]
+    (if (>= fd (primitive/cast i32 0))
+        (do (os/dup2 fd 1) (os/dup2 fd 2) (os/close fd) 0)
+        0)
+    (db-free-bytes a p)
+    0))
+
+;;; Map the stage file at `path`, creating it at full size. Null on failure, with
+;;; the reason on stderr: a campaign without a stage cannot attribute a crash, so
+;;; the caller must not run one.
+(defn stage-map [(a (dyn Allocator)) (path (slice u8))] (-> (ptr i64))
+  (match (fs/map-shared-file a path (stage-bytes))
+    (Ok [p] (primitive/cast (ptr i64) p))
+    (Err [e]
+         (do
+           (fmt (stderr) "coil fuzz: cannot map the stage file {}\n" path)
+           (primitive/cast (ptr i64) 0)))))
+
+(defn stage-get [(st (ptr i64)) (w i64)] (-> i64)
+  (load (primitive/index st w)))
+
+(defn stage-set! [(st (ptr i64)) (w i64) (v i64)] (-> i64)
+  (store! (primitive/index st w) v)
+  0)
+
+;;; Zero the header, so a supervisor never reads a previous run's counters.
+(defn stage-reset! [(st (ptr i64))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) STAGE-HEADER)
+              (break)
+              (do
+                (store! (primitive/index st (load i)) 0)
+                (store! i (primitive/iadd (load i) 1)))))
+    (stage-set! st STAGE-MAGIC-WORD STAGE-MAGIC)))
+
+;;; The tape a worker was running when it stopped, read back out of its stage.
+(defn stage-tape [(a (dyn Allocator)) (st (ptr i64))] (-> (ArrayList Choice))
+  (let [(mut out) (al-new [Choice] a)
+        n0 (stage-get st STAGE-LEN)
+        n (if (> n0 STAGE-CAP) STAGE-CAP (if (< n0 0) 0 n0))
+        c (primitive/alloc-stack Choice)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [at (primitive/index st
+                                        (primitive/iadd STAGE-HEADER
+                                                        (primitive/imul (load i)
+                                                                        STAGE-CHOICE)))]
+                (store! (field c kind) (load (primitive/index at 0)))
+                (store! (field c flags) (load (primitive/index at 1)))
+                (store! (field c span) (load (primitive/index at 2)))
+                (store! (field c lo) (load (primitive/index at 3)))
+                (store! (field c hi) (load (primitive/index at 4)))
+                (store! (field c origin) (load (primitive/index at 5)))
+                (store! (field c value) (load (primitive/index at 6)))
+                (al-push! [Choice] (mut out) (load c))
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    (load out)))
+
+; ── the corpus ───────────────────────────────────────────────────────────────
+
+(defstruct FuzzEntry
+  [(tape (ArrayList Choice))
+   (spans (ArrayList Span))
+   (level i64)  ; 2: reached a new edge; 1: only a new hit-count bucket
+   (picks i64)  ; times chosen for mutation
+   (finds i64)])  ; new entries its mutants produced
+
+(defstruct Fuzz
+  [(s (ptr Source))
+   (prop (fnptr c [(ptr Source) i64] bool))
+   (mem (dyn Allocator))
+   (rng Rng)
+   (corpus (ArrayList FuzzEntry))
+   (known (HashMap i64 i64))  ; hashes of corpus file names already loaded or written
+   (stage (ptr i64))
+   (corpus-dir (slice u8))
+   (size i64)
+   (execs i64)
+   (scratch (ArrayList Choice))])  ; the candidate being built
+
+(defn fz-corpus-len [(fz (ptr Fuzz))] (-> i64)
+  (al-len [FuzzEntry] (load (field fz corpus))))
+
+(defn fz-entry [(fz (ptr Fuzz)) (i i64)] (-> (ptr FuzzEntry))
+  (al-elem [FuzzEntry] (field fz corpus) i))
+
+;;; Run the property on whatever the Source was just set up to draw, and classify
+;;; the coverage it produced. Returns the novelty level (0, 1 or 2) or -1 for a
+;;; rejected case. A case that FAILS ends the worker with CHILD-FAILED: the stage
+;;; already holds its tape, which is all the supervisor needs.
+(defn fz-exec! [(fz (ptr Fuzz))] (-> i64)
+  (let [s (load (field fz s))
+        st (load (field fz stage))]
+    (cov-case-begin!)
+    (cov-cmp-record! true)
+    (let [held (primitive/call-ptr (load (field fz prop)) s PROP-MODE-RUN)]
+      (cov-cmp-record! false)
+      (let [level (cov-case-end!)
+            n (primitive/iadd (load (field fz execs)) 1)]
+        (store! (field fz execs) n)
+        ; in every phase, so a campaign that ends early still reports its coverage
+        (if (= (primitive/iand n 255) 0) (fz-publish-stats! fz) 0)
+        (if (= (src-status s) ST-REJECTED)
+            -1
+            (if held
+                level
+                (do
+                  (os/_exit (primitive/cast i32 FUZZ-CHILD-FAILED))
+                  -1)))))))
+
+;;; Run the property like `fz-exec!` — a failure still ends the worker — but throw
+;;; the coverage away. Returns false for a rejected case.
+(defn fz-run-discarding! [(fz (ptr Fuzz))] (-> bool)
+  (let [s (load (field fz s))]
+    (cov-case-begin!)
+    (let [held (primitive/call-ptr (load (field fz prop)) s PROP-MODE-RUN)]
+      (cov-case-begin!)
+      (store! (field fz execs) (primitive/iadd (load (field fz execs)) 1))
+      (if (= (src-status s) ST-REJECTED)
+          false
+          (if held
+              true
+              (do (os/_exit (primitive/cast i32 FUZZ-CHILD-FAILED)) false))))))
+
+;;; The exit status of a worker whose property returned false. The runner's
+;;; CHILD-FAILED; repeated here because this module sits below the runner.
+(const FUZZ-CHILD-FAILED 2)
+
+;;; A 16-hex-digit file name for a tape: its content hash, so two workers that
+;;; find the same input write the same file.
+(defn fz-entry-name [(a (dyn Allocator)) (h i64)] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)
+        (mut k) 15]
+    (loop (if (< (load k) 0)
+              (break)
+              (let [nib
+                      (primitive/cast i64
+                                      (primitive/iand (primitive/ishr (primitive/cast u64
+                                                                                      h)
+                                                                      (primitive/cast u64
+                                                                                      (primitive/imul (load k)
+                                                                                                      4)))
+                                                      (primitive/cast u64 15)))]
+                (str/sb-push-byte! (mut sb)
+                                   (primitive/cast u8
+                                                   (if (< nib 10)
+                                                       (primitive/iadd 48 nib)
+                                                       (primitive/iadd 87 nib))))
+                (store! k (primitive/isub (load k) 1))
+                0)))
+    (str/sb-finish! (mut sb))))
+
+(defn fz-known? [(fz (ptr Fuzz)) (h i64)] (-> bool)
+  (match (hm-get [i64 i64] (load (field fz known)) h)
+    (Some [_] true)
+    (None [] false)))
+
+(defn fz-know! [(fz (ptr Fuzz)) (h i64)] (-> i64)
+  (hm-put! [i64 i64] (mut (field fz known)) h 1))
+
+;;; Write the Source's current tape into the corpus directory: to a temporary name
+;;; first and then renamed, so a worker scanning the directory never loads a
+;;; half-written entry.
+(defn fz-persist! [(fz (ptr Fuzz))] (-> i64)
+  (let [a (load (field fz mem))
+        s (load (field fz s))
+        name (fz-entry-name a (tape-hash (src-tape s)))
+        nh (str/str-hash name)]
+    (if (fz-known? fz nh)
+        (do (db-free-bytes a name) 0)
+        (let [(mut sb) (str/sb-new a)]
+          (fz-know! fz nh)
+          (str/sb-push-str! (mut sb) ".tmp-")
+          (str/sb-push-i64! (mut sb) (primitive/cast i64 (os/getpid)))
+          (let [tmpleaf (str/sb-finish! (mut sb))
+                tmp (db-join a (load (field fz corpus-dir)) tmpleaf)
+                dest (db-join a (load (field fz corpus-dir)) name)]
+            (if (db-save-tape a tmp (src-tape s))
+                (match (fs/rename-file a tmp dest)
+                  (Ok [k] 0)
+                  (Err [e] (do (db-remove-tape a tmp) 0)))
+                0)
+            (db-free-bytes a dest)
+            (db-free-bytes a tmp)
+            (db-free-bytes a tmpleaf)
+            (db-free-bytes a name)
+            0)))))
+
+;;; Keep the case the Source just ran as a corpus entry.
+(defn fz-add! [(fz (ptr Fuzz)) (level i64) (persist bool)] (-> i64)
+  (let [a (load (field fz mem))
+        s (load (field fz s))
+        e (primitive/alloc-stack FuzzEntry)]
+    (store! (field e tape) (tape-clone a (src-tape s)))
+    (store! (field e spans) (spans-clone a (src-spans s)))
+    (store! (field e level) level)
+    (store! (field e picks) 0)
+    (store! (field e finds) 0)
+    (al-push! [FuzzEntry] (mut (field fz corpus)) (load e))
+    (if persist (fz-persist! fz) 0)
+    (stage-set! (load (field fz stage)) STAGE-CORPUS (fz-corpus-len fz))
+    (stage-set! (load (field fz stage)) STAGE-LAST-NEW (load (field fz execs)))
+    0))
+
+;;; Replay the tape stored at `path` and keep it if it adds coverage. Entries that
+;;; cannot be read are skipped: a corpus file is an optimization, and one that has
+;;; gone bad (a generator changed shape, a disk filled up) must not stop a campaign.
+(defn fz-load-entry! [(fz (ptr Fuzz)) (path (slice u8))] (-> i64)
+  (let [a (load (field fz mem))]
+    (match (db-load-tape a path)
+      (Err [e] 0)
+      (Ok [o]
+          (match o
+            (None [] 0)
+            (Some [t]
+                  (let [(mut tape) t]
+                    (source-begin-replay! (load (field fz s))
+                                          (mut tape)
+                                          (load (field fz size)))
+                    (let [level (fz-exec! fz)]
+                      (if (> level 0) (fz-add! fz level false) 0))
+                    (al-free! [Choice] (mut tape))
+                    0)))))))
+
+;;; Load every corpus file this worker has not seen yet: the whole directory at
+;;; startup, and whatever other workers have written since, when called again.
+;;; Returns how many files were new.
+(defn fz-sync! [(fz (ptr Fuzz))] (-> i64)
+  (let [a (load (field fz mem))
+        dir (load (field fz corpus-dir))]
+    (match (fs/dir-list a dir)
+      (Err [e] 0)
+      (Ok [names]
+          (let [(mut ns) names
+                n (al-len [(slice u8)] (load ns))
+                (mut i) 0
+                (mut fresh) 0]
+            (loop (if (>= (load i) n)
+                      (break)
+                      (let [nm (al-get [(slice u8)] (load ns) (load i))
+                            h (str/str-hash nm)]
+                        (if (or (fz-known? fz h)
+                                (= (primitive/cast i64 (slice-get nm 0)) 46))
+                            0
+                            (let [p (db-join a dir nm)]
+                              (fz-know! fz h)
+                              (fz-load-entry! fz p)
+                              (db-free-bytes a p)
+                              (store! fresh (primitive/iadd (load fresh) 1))
+                              0))
+                        (store! i (primitive/iadd (load i) 1))
+                        0)))
+            (fs/dir-list-free a (mut ns))
+            (load fresh))))))
+
+; ── mutation ─────────────────────────────────────────────────────────────────
+
+;;; Append `t[from, to)` to `out`, clipped to `t`.
+(defn fz-append! [(out (ptr (ArrayList Choice)))
+                  (t (ptr (ArrayList Choice)))
+                  (from i64)
+                  (to i64)] (-> i64)
+  (let [n (al-len [Choice] (load t))
+        hi (if (> to n) n to)
+        (mut i) (if (< from 0) 0 from)]
+    (loop (if (>= (load i) hi)
+              (break)
+              (do
+                (al-push! [Choice] out (al-get [Choice] (load t) (load i)))
+                (store! i (primitive/iadd (load i) 1)))))
+    0))
+
+;;; Is span `sp` usable as a unit? A span still open when the case ended (the
+;;; generator was cut short) has no end, and one past the tape is stale.
+(defn fz-span-ok? [(sp Span) (n i64)] (-> bool)
+  (let [a (load (field sp start))
+        b (load (field sp end))]
+    (and (and (>= a 0) (>= b a)) (<= b n))))
+
+;;; The CK-LEN choice that governs element span `i`, or -1. A collection draws its
+;;; length as the first choice of its own span and then one SPAN-ELEM per element,
+;;; so the length sits at the start of the element's parent (the shrinker's
+;;; `governing-len`, over an entry instead of a shrink context).
+(defn fz-governing-len [(t (ptr (ArrayList Choice))) (spans (ptr (ArrayList Span))) (i i64)] (-> i64)
+  (let [sp (al-get [Span] (load spans) i)
+        p (load (field sp parent))]
+    (if (or (< p 0) (!= (load (field sp kind)) SPAN-ELEM))
+        -1
+        (let [at (load (field (al-elem [Span] spans p) start))]
+          (if (or (< at 0) (>= at (al-len [Choice] (load t))))
+              -1
+              (if (= (load (field (al-elem [Choice] t at) kind)) CK-LEN) at -1))))))
+
+;;; A random element span of `e` that has a governing length, or -1. Tries a few
+;;; random picks rather than scanning, because most spans of a big entry qualify
+;;; and a scan per mutation would dominate the loop.
+(defn fz-pick-elem [(fz (ptr Fuzz)) (e (ptr FuzzEntry))] (-> i64)
+  (let [ns (al-len [Span] (load (field e spans)))
+        n (al-len [Choice] (load (field e tape)))
+        (mut tries) 0
+        (mut found) -1]
+    (if (= ns 0)
+        -1
+        (do
+          (loop (if (or (>= (load found) 0) (>= (load tries) 12))
+                    (break)
+                    (let [i (rng-below! (mut (field fz rng)) ns)
+                          sp (al-get [Span] (load (field e spans)) i)]
+                      (if (and (fz-span-ok? sp n)
+                               (>= (fz-governing-len (field e tape)
+                                                     (field e spans)
+                                                     i)
+                                   0))
+                          (store! found i)
+                          0)
+                      (store! tries (primitive/iadd (load tries) 1))
+                      0)))
+          (load found)))))
+
+;;; Add `delta` to the length choice at `at` of the candidate, within what replay
+;;; will accept: the choice's own floor, and the larger of its recorded ceiling and
+;;; the size the candidate will run at (the ceiling was recorded under a smaller
+;;; size budget, and holding a corpus to it would stop inputs from ever growing).
+(defn fz-shift-len! [(fz (ptr Fuzz)) (at i64) (delta i64)] (-> i64)
+  (let [c (al-elem [Choice] (field fz scratch) at)
+        lo (load (field c lo))
+        hi0 (load (field c hi))
+        hi (if (> (load (field fz size)) hi0) (load (field fz size)) hi0)
+        v (primitive/iadd (load (field c value)) delta)]
+    (store! (field c value) (if (< v lo) lo (if (> v hi) hi v)))
+    0))
+
+;;; Structural mutation: DELETE one element of a collection, lowering its length
+;;; so replay asks for one fewer.
+(defn fz-delete-elem! [(fz (ptr Fuzz)) (e (ptr FuzzEntry))] (-> bool)
+  (let [i (fz-pick-elem fz e)]
+    (if (< i 0)
+        false
+        (let [sp (al-get [Span] (load (field e spans)) i)
+              t (field e tape)
+              out (field fz scratch)
+              gl (fz-governing-len t (field e spans) i)]
+          (al-clear! [Choice] out)
+          (fz-append! out t 0 (load (field sp start)))
+          (fz-append! out t (load (field sp end)) (al-len [Choice] (load t)))
+          (fz-shift-len! fz gl -1)
+          true))))
+
+;;; Structural mutation: REPEAT one element 1, 2, 4 or 8 times. The move that makes
+;;; depth and count reachable: a nesting bug five levels down needs the same
+;;; element five times, and value mutations would have to guess them one by one.
+(defn fz-repeat-elem! [(fz (ptr Fuzz)) (e (ptr FuzzEntry))] (-> bool)
+  (let [i (fz-pick-elem fz e)]
+    (if (< i 0)
+        false
+        (let [sp (al-get [Span] (load (field e spans)) i)
+              t (field e tape)
+              out (field fz scratch)
+              gl (fz-governing-len t (field e spans) i)
+              k (primitive/ishl 1 (rng-below! (mut (field fz rng)) 4))
+              (mut j) 0]
+          (al-clear! [Choice] out)
+          (fz-append! out t 0 (load (field sp end)))
+          (loop (if (>= (load j) k)
+                    (break)
+                    (do
+                      (fz-append! out
+                                  t
+                                  (load (field sp start))
+                                  (load (field sp end)))
+                      (store! j (primitive/iadd (load j) 1)))))
+          (fz-append! out t (load (field sp end)) (al-len [Choice] (load t)))
+          (fz-shift-len! fz gl k)
+          true))))
+
+;;; A random span of `o` whose label is `name` (and, when `elem`, that is a list
+;;; element with a governing length), or -1.
+(defn fz-find-named [(fz (ptr Fuzz)) (o (ptr FuzzEntry)) (name (slice u8)) (elem bool)] (-> i64)
+  (let [ns (al-len [Span] (load (field o spans)))
+        n (al-len [Choice] (load (field o tape)))
+        start (if (= ns 0) 0 (rng-below! (mut (field fz rng)) ns))
+        (mut k) 0
+        (mut found) -1]
+    (loop (if (or (>= (load found) 0) (>= (load k) ns))
+              (break)
+              (let [j (primitive/irem (primitive/iadd start (load k)) ns)
+                    sp (al-get [Span] (load (field o spans)) j)]
+                (if (and (fz-span-ok? sp n)
+                         (and (str/str-eq (load (field sp name)) name)
+                              (or (not elem)
+                                  (>= (fz-governing-len (field o tape)
+                                                        (field o spans)
+                                                        j)
+                                      0))))
+                    (store! found j)
+                    0)
+                (store! k (primitive/iadd (load k) 1))
+                0)))
+    (load found)))
+
+;;; Structural mutation: SPLICE an element of another entry into this one's
+;;; collection of the same kind. Crossover that respects structure — the two
+;;; entries' byte offsets mean nothing to each other, their element spans do.
+(defn fz-splice-elem! [(fz (ptr Fuzz)) (e (ptr FuzzEntry)) (o (ptr FuzzEntry))] (-> bool)
+  (let [i (fz-pick-elem fz e)]
+    (if (< i 0)
+        false
+        (let [sp (al-get [Span] (load (field e spans)) i)
+              j (fz-find-named fz o (load (field sp name)) true)]
+          (if (< j 0)
+              false
+              (let [osp (al-get [Span] (load (field o spans)) j)
+                    t (field e tape)
+                    out (field fz scratch)
+                    gl (fz-governing-len t (field e spans) i)]
+                (al-clear! [Choice] out)
+                (fz-append! out t 0 (load (field sp start)))
+                (fz-append! out
+                            (field o tape)
+                            (load (field osp start))
+                            (load (field osp end)))
+                (fz-append! out
+                            t
+                            (load (field sp start))
+                            (al-len [Choice] (load t)))
+                (fz-shift-len! fz gl 1)
+                true))))))
+
+;;; Structural mutation: REPLACE any span with a span of the same label from another
+;;; entry — a subtree swap for recursive generators, a field swap for records.
+(defn fz-replace-span! [(fz (ptr Fuzz)) (e (ptr FuzzEntry)) (o (ptr FuzzEntry))] (-> bool)
+  (let [ns (al-len [Span] (load (field e spans)))
+        n (al-len [Choice] (load (field e tape)))]
+    (if (= ns 0)
+        false
+        (let [i (rng-below! (mut (field fz rng)) ns)
+              sp (al-get [Span] (load (field e spans)) i)]
+          (if (not (fz-span-ok? sp n))
+              false
+              (let [j (fz-find-named fz o (load (field sp name)) false)]
+                (if (< j 0)
+                    false
+                    (let [osp (al-get [Span] (load (field o spans)) j)
+                          t (field e tape)
+                          out (field fz scratch)]
+                      (al-clear! [Choice] out)
+                      (fz-append! out t 0 (load (field sp start)))
+                      (fz-append! out
+                                  (field o tape)
+                                  (load (field osp start))
+                                  (load (field osp end)))
+                      (fz-append! out t (load (field sp end)) n)
+                      true))))))))
+
+;;; Structural mutation: SWAP two elements of the same collection.
+(defn fz-swap-elems! [(fz (ptr Fuzz)) (e (ptr FuzzEntry))] (-> bool)
+  (let [i (fz-pick-elem fz e)
+        n (al-len [Choice] (load (field e tape)))
+        ns (al-len [Span] (load (field e spans)))]
+    (if (< i 0)
+        false
+        (let [a (al-get [Span] (load (field e spans)) i)
+              start (rng-below! (mut (field fz rng)) ns)
+              (mut k) 0
+              (mut j) -1]
+          ; a later sibling: same parent, also an element, entirely after `a`.
+          (loop (if (or (>= (load j) 0) (>= (load k) ns))
+                    (break)
+                    (let [c (primitive/irem (primitive/iadd start (load k)) ns)
+                          b (al-get [Span] (load (field e spans)) c)]
+                      (if (and (fz-span-ok? b n)
+                               (and (= (load (field b parent))
+                                       (load (field a parent)))
+                                    (and (= (load (field b kind)) SPAN-ELEM)
+                                         (>= (load (field b start))
+                                             (load (field a end))))))
+                          (store! j c)
+                          0)
+                      (store! k (primitive/iadd (load k) 1))
+                      0)))
+          (if (< (load j) 0)
+              false
+              (let [b (al-get [Span] (load (field e spans)) (load j))
+                    t (field e tape)
+                    out (field fz scratch)]
+                (al-clear! [Choice] out)
+                (fz-append! out t 0 (load (field a start)))
+                (fz-append! out t (load (field b start)) (load (field b end)))
+                (fz-append! out t (load (field a end)) (load (field b start)))
+                (fz-append! out t (load (field a start)) (load (field a end)))
+                (fz-append! out t (load (field b end)) n)
+                true))))))
+
+;;; Unstructured crossover: this entry's prefix, the other's suffix. Crude, and
+;;; still worth a share of the budget — it is how two halves that each reached
+;;; something meet when no span labels line up.
+(defn fz-crossover! [(fz (ptr Fuzz)) (e (ptr FuzzEntry)) (o (ptr FuzzEntry))] (-> bool)
+  (let [n (al-len [Choice] (load (field e tape)))
+        m (al-len [Choice] (load (field o tape)))
+        i (rng-below! (mut (field fz rng)) (primitive/iadd n 1))
+        j (rng-below! (mut (field fz rng)) (primitive/iadd m 1))
+        out (field fz scratch)]
+    (al-clear! [Choice] out)
+    (fz-append! out (field e tape) 0 i)
+    (fz-append! out (field o tape) j m)
+    true))
+
+;;; One structural edit of `e` (drawing on `o` for the crossovers) into the
+;;; scratch tape. Returns false if the chosen kind found nothing to apply to.
+(defn fz-structural! [(fz (ptr Fuzz)) (e (ptr FuzzEntry)) (o (ptr FuzzEntry))] (-> bool)
+  (case (rng-below! (mut (field fz rng)) 6) 0
+        (fz-delete-elem! fz e) 1
+        (fz-repeat-elem! fz e) 2
+        (fz-splice-elem! fz e o) 3
+        (fz-replace-span! fz e o) 4
+        (fz-swap-elems! fz e)
+        (fz-crossover! fz e o)))
+
+;;; A random value for a choice: its full range, handled apart because the width
+;;; of the full i64 range does not fit in an i64.
+(defn fz-uniform [(fz (ptr Fuzz)) (lo i64) (hi i64)] (-> i64)
+  (if (and (= lo -9223372036854775808) (= hi 9223372036854775807))
+      (primitive/cast i64 (rng-next! (mut (field fz rng))))
+      (rng-range! (mut (field fz rng)) lo hi)))
+
+;;; One value mutation of choice `idx` of the scratch tape.
+;;;
+;;; Six moves, because one is never enough. A uniform draw escapes a local optimum;
+;;; a small nudge walks a gradient the draw steps over; an endpoint crosses the
+;;; whole range at once; a boundary value (0, ±1, 255, 2^31, …) is where
+;;; arithmetic breaks. The comparison dictionary turns "guess a magic value" into
+;;; "use the value the program was just seen comparing against and failing", which
+;;; changes the complexity class rather than the constant (coil.prop.cov). And
+;;; copying another choice's value is how an input comes to satisfy an EQUALITY
+;;; between two of its own parts — a length field that must match a payload, a
+;;; closing tag that must match its opener.
+(defn fz-mutate-value! [(fz (ptr Fuzz)) (idx i64)] (-> i64)
+  (let [out (field fz scratch)
+        c (al-elem [Choice] out idx)
+        kind (load (field c kind))
+        lo (load (field c lo))
+        hi
+          (if (and (= kind CK-LEN) (> (load (field fz size)) (load (field c hi))))
+              (load (field fz size))
+              (load (field c hi)))
+        cur (load (field c value))
+        v
+          (case (rng-below! (mut (field fz rng)) 7) 0
+                (fz-uniform fz lo hi) 1
+                (choice-minimal lo
+                                hi
+                                (primitive/iadd cur
+                                                (primitive/isub (rng-below! (mut (field fz rng))
+                                                                            17)
+                                                                8))) 2
+                hi 3
+                lo 4
+                (edge-candidate (rng-below! (mut (field fz rng)) EDGE-COUNT)
+                                lo
+                                hi
+                                (load (field c origin))) 5
+                (let [w (cov-dict-counterpart cur)]
+                  (if (and (!= w cur) (and (>= w lo) (<= w hi)))
+                      w
+                      (fz-uniform fz lo hi)))
+                (let [n (al-len [Choice] (load out))
+                      other (al-get [Choice] (load out) (rng-below! (mut (field fz rng)) n))
+                      w (load (field other value))]
+                  (if (and (>= w lo) (<= w hi)) w (fz-uniform fz lo hi))))]
+    (store! (field c value) v)
+    0))
+
+;;; Build a mutant of entry `e` in the scratch tape: sometimes one structural edit,
+;;; then a stack of 1, 2, 4 or 8 value edits (AFL's "havoc": several small changes
+;;; at once reach combinations one change at a time cannot, because each alone
+;;; does nothing new and so would never be kept).
+(defn fz-mutate! [(fz (ptr Fuzz)) (e (ptr FuzzEntry)) (o (ptr FuzzEntry))] (-> i64)
+  (let [out (field fz scratch)
+        structural
+          (if (= (rng-below! (mut (field fz rng)) 2) 0)
+              (fz-structural! fz e o)
+              false)]
+    (if structural
+        0
+        (do
+          (al-clear! [Choice] out)
+          (fz-append! out (field e tape) 0 (al-len [Choice] (load (field e tape))))
+          0))
+    (let [n (al-len [Choice] (load out))]
+      (if (= n 0)
+          0
+          (let [k
+                  (if structural
+                      (rng-below! (mut (field fz rng)) 2)
+                      (primitive/ishl 1 (rng-below! (mut (field fz rng)) 4)))
+                (mut i) 0]
+            (loop (if (>= (load i) k)
+                      (break)
+                      (do
+                        (fz-mutate-value! fz (rng-below! (mut (field fz rng)) n))
+                        (store! i (primitive/iadd (load i) 1)))))
+            0)))))
+
+;;; Which entry to mutate next — the campaign's energy assignment.
+;;;
+;;; Half the picks go to the newest few entries: an input that just found new
+;;; coverage is on the frontier, the only one that has reached the branch whose far
+;;; side is unexplored, and under uniform selection its share of the budget would
+;;; fall as 1/n while the corpus grows. The other half are uniform over entries
+;;; that reached a new EDGE, falling back to the whole corpus: entries kept only
+;;; for a new hit-count bucket are numerous (every loop count gets one) and
+;;; individually less promising, so letting them share the uniform half equally
+;;; would dilute it.
+(defn fz-pick [(fz (ptr Fuzz))] (-> i64)
+  (let [n (fz-corpus-len fz)]
+    (if (<= n 1)
+        0
+        (if (= (rng-below! (mut (field fz rng)) 2) 0)
+            (let [window (if (< n 4) n 4)]
+              (primitive/isub n
+                              (primitive/iadd (rng-below! (mut (field fz rng))
+                                                          window)
+                                              1)))
+            (let [(mut tries) 0
+                  (mut pick) (rng-below! (mut (field fz rng)) n)]
+              (loop (if (or (>= (load tries) 4)
+                            (= (load (field (fz-entry fz (load pick)) level)) 2))
+                        (break)
+                        (do
+                          (store! pick (rng-below! (mut (field fz rng)) n))
+                          (store! tries (primitive/iadd (load tries) 1)))))
+              (load pick))))))
+
+; ── the worker ───────────────────────────────────────────────────────────────
+
+(defn fz-publish-stats! [(fz (ptr Fuzz))] (-> i64)
+  (let [st (load (field fz stage))]
+    (stage-set! st STAGE-CORPUS (fz-corpus-len fz))
+    (stage-set! st STAGE-EDGES (cov-edges))
+    (stage-set! st STAGE-FEATURES (cov-features))
+    (stage-set! st STAGE-GUARDS (cov-guards))))
+
+(defn fz-now-ms [] (-> i64)
+  (match (time/monotonic-now-ms)
+    (Ok [t] t)
+    (Err [e] 0)))
+
+;;; A worker's whole life: load the corpus, seed it with random cases, then mutate
+;;; until the supervisor asks it to stop or `iterations` mutants have run (0 = no
+;;; limit). Never returns; exits 0, or FUZZ-CHILD-FAILED from inside `fz-exec!`, or
+;;; dies of whatever the property did.
+(defn fuzz-worker-run [(s (ptr Source))
+                       (prop (fnptr c [(ptr Source) i64] bool))
+                       (name (slice u8))
+                       (index i64)
+                       (seed i64)
+                       (cases i64)
+                       (max-size i64)
+                       (iterations i64)] (-> i64)
+  (let [a (malloc-allocator)
+        dir (fuzz-dir a name)
+        spath (fuzz-stage-path a dir (fuzz-campaign-id) index)
+        st (stage-map a spath)
+        fz (box! a Fuzz (zeroed Fuzz))]
+    (if (= (primitive/cast i64 st) 0)
+        (do (os/_exit (primitive/cast i32 3)) 0)
+        0)
+    ; A property may print, and a worker runs it hundreds of thousands of times a
+    ; second: its output goes to a log beside the stage, where the supervisor
+    ; points to it when something fails, and the terminal keeps the status lines.
+    (fuzz-redirect-output! a dir index)
+    ; Ctrl-C is the supervisor's to handle: it stops this worker through the stage,
+    ; after the input in flight. Dying from the terminal's SIGINT would read as a
+    ; crash on whatever input was running.
+    (fuzz-ignore-sigint!)
+    ; the supervisor zeroed the header before starting us; only the pid is ours.
+    (stage-set! st STAGE-PID (primitive/cast i64 (os/getpid)))
+    (source-stage! s st STAGE-CAP)
+    (store! (field fz s) s)
+    (store! (field fz prop) prop)
+    (store! (field fz mem) a)
+    (store! (field fz rng)
+            (rng-seed (primitive/ixor seed
+                                      (primitive/imul (primitive/iadd index 1)
+                                                      -7046029254386353131))))
+    (store! (field fz corpus) (al-new [FuzzEntry] a))
+    (store! (field fz known) (hm-new-scalar [i64 i64] a))
+    (store! (field fz stage) st)
+    (store! (field fz corpus-dir) (fuzz-corpus-dir a dir))
+    (store! (field fz size) max-size)
+    (store! (field fz execs) 0)
+    (store! (field fz scratch) (al-new [Choice] a))
+    (db-mkdir-p a (load (field fz corpus-dir)))
+    (source-seed! s (rng-next-i64 (mut (field fz rng))))
+    ; 1. everything already learned
+    (stage-set! st STAGE-PHASE FUZZ-PHASE-LOAD)
+    (fz-sync! fz)
+    ; 2. random cases, ramping in size, so a fresh campaign has variety to start
+    ;    from and an old one still sees inputs its corpus never led to
+    (stage-set! st STAGE-PHASE FUZZ-PHASE-GENERATE)
+    (let [(mut i) 0]
+      (loop (if (or (>= (load i) cases) (!= (stage-get st STAGE-STOP) 0))
+                (break)
+                (do
+                  (source-begin-generate! s (size-ramp (load i) cases max-size))
+                  ; Generation draws from the RNG, and its branches are inlined
+                  ; into the property: coverage of a GENERATED run is partly the
+                  ; generator rolling dice. Judge the case by a REPLAY of its tape
+                  ; instead — at the size every corpus entry runs at — which is
+                  ; also exactly how the corpus will reproduce it later.
+                  (if (fz-run-discarding! fz)
+                      (do
+                        (al-clear! [Choice] (field fz scratch))
+                        (fz-append! (field fz scratch)
+                                    (src-tape s)
+                                    0
+                                    (al-len [Choice] (load (src-tape s))))
+                        (source-begin-replay! s (field fz scratch) max-size)
+                        (let [level (fz-exec! fz)]
+                          (if (> level 0) (fz-add! fz level true) 0))
+                        0)
+                      0)
+                  (store! i (primitive/iadd (load i) 1))
+                  0))))
+    ; a corpus of nothing cannot be mutated into anything
+    (if (= (fz-corpus-len fz) 0)
+        (do
+          (source-begin-generate! s max-size)
+          (fz-exec! fz)
+          (fz-add! fz 1 false)
+          0)
+        0)
+    (fz-publish-stats! fz)
+    ; 3. mutate
+    (stage-set! st STAGE-PHASE FUZZ-PHASE-MUTATE)
+    (let [(mut i) 0
+          (mut last-sync) (fz-now-ms)]
+      (loop (if (or (!= (stage-get st STAGE-STOP) 0)
+                    (and (> iterations 0) (>= (load i) iterations)))
+                (break)
+                (let [n (fz-corpus-len fz)
+                      pi (fz-pick fz)
+                      e (fz-entry fz pi)
+                      o (fz-entry fz (rng-below! (mut (field fz rng)) n))]
+                  (fz-mutate! fz e o)
+                  (source-begin-replay! s (field fz scratch) max-size)
+                  (let [level (fz-exec! fz)]
+                    (store! (field (fz-entry fz pi) picks)
+                            (primitive/iadd (load (field (fz-entry fz pi) picks))
+                                            1))
+                    (if (> level 0)
+                        (do
+                          (store! (field (fz-entry fz pi) finds)
+                                  (primitive/iadd (load (field (fz-entry fz pi)
+                                                               finds))
+                                                  1))
+                          (fz-add! fz level true)
+                          0)
+                        0))
+                  (store! i (primitive/iadd (load i) 1))
+                  (if (= (primitive/iand (load i) 255) 0)
+                      (do
+                        (fz-publish-stats! fz)
+                        (let [now (fz-now-ms)]
+                          (if (>= (primitive/isub now (load last-sync)) 2000)
+                              (do (fz-sync! fz) (store! last-sync now) 0)
+                              0))
+                        0)
+                      0)
+                  0))))
+    (fz-publish-stats! fz)
+    ; one report per campaign: every worker has synced the others' corpus, so
+    ; worker 0's coverage stands for all of them
+    (if (= index 0) (fz-coverage-report! a dir st) 0)
+    (stage-set! st STAGE-PHASE FUZZ-PHASE-DONE)
+    (os/_exit (primitive/cast i32 0))
+    0))
+
+(extern signal :cc c [i32 (fnptr c [i32] i64)] (-> (fnptr c [i32] i64)))
+
+;;; SIGINT (2) to SIG_IGN (1).
+(defn fuzz-ignore-sigint! [] (-> i64)
+  (signal (primitive/cast i32 2) (primitive/cast (fnptr c [i32] i64) (primitive/cast (ptr i8) 1)))
+  0)
+
+;;; SIGINT back to SIG_DFL (0). The test runner ignores SIGINT during a campaign,
+;;; and a disposition of "ignore" is inherited across exec: once the campaign is
+;;; over, a Ctrl-C must interrupt the shrinking and reporting that follow it.
+(defn fuzz-default-sigint! [] (-> i64)
+  (signal (primitive/cast i32 2) (primitive/cast (fnptr c [i32] i64) (primitive/cast (ptr i8) 0)))
+  0)
+
+;;; The size for generated case `i` of `n`: a ramp from 1 to `max`, the same shape
+;;; as an ordinary run's, so small inputs come first.
+(defn size-ramp [(i i64) (n i64) (max i64)] (-> i64)
+  (if (<= n 1)
+      max
+      (let [s (primitive/iadd 1 (primitive/udiv (primitive/imul i max) n))]
+        (if (> s max) max s))))
+
+(defn rng-next-i64 [(r (mut Rng))] (-> i64)
+  (primitive/cast i64 (rng-next! (mut r))))
+
+; ── the coverage report ──────────────────────────────────────────────────────
+;
+; What a campaign did NOT reach is the most useful thing it can report about
+; itself. A target that never gets past a parser's first dispatch passes forever
+; and tests almost nothing; the edge count alone ("162 of 561") says there is a
+; gap without saying where. The report names every instrumented function and how
+; many of its edges were reached, never-entered functions first.
+
+(defstruct DlInfo [(fname (ptr i8)) (fbase (ptr i8)) (sname (ptr i8)) (saddr (ptr i8))])
+
+(extern dladdr :cc c [(ptr i8) (ptr DlInfo)] (-> i32))
+
+;;; The symbol containing code address `pc`, or "?".
+(defn fz-symbol-of [(pc i64)] (-> (slice u8))
+  (let [info (primitive/alloc-stack DlInfo)]
+    (if (and (!= (primitive/cast i64 (dladdr (primitive/cast (ptr i8) pc) info)) 0)
+             (!= (primitive/cast i64 (load (field info sname))) 0))
+        (str/cstr->str (load (field info sname)))
+        "?")))
+
+(defstruct FuncCov [(id i64) (edges i64) (hit i64)])
+
+;;; Write `<dir>/coverage.txt` and publish the function totals in the stage.
+(defn fz-coverage-report! [(a (dyn Allocator)) (dir (slice u8)) (st (ptr i64))] (-> i64)
+  (let [n (cov-guards)
+        (mut fs) (al-new [FuncCov] a)
+        (mut id) 1]
+    ; guards come function by function, each function's entry block first
+    (loop (if (> (load id) n)
+              (break)
+              (do
+                (if (or (cov-function-entry? (load id))
+                        (= (al-len [FuncCov] (load fs)) 0))
+                    (let [f (primitive/alloc-stack FuncCov)]
+                      (store! (field f id) (load id))
+                      (store! (field f edges) 0)
+                      (store! (field f hit) 0)
+                      (al-push! [FuncCov] (mut fs) (load f))
+                      0)
+                    0)
+                (let [cur (al-elem [FuncCov] (mut fs) (primitive/isub (al-len [FuncCov] (load fs)) 1))]
+                  (store! (field cur edges) (primitive/iadd (load (field cur edges)) 1))
+                  (if (cov-reached? (load id))
+                      (store! (field cur hit) (primitive/iadd (load (field cur hit)) 1))
+                      0))
+                (store! id (primitive/iadd (load id) 1))
+                0)))
+    (let [(mut sb) (str/sb-new a)
+          m (al-len [FuncCov] (load fs))
+          (mut entered) 0
+          (mut pass) 0]
+      (str/sb-push-str! (mut sb) "# functions a campaign never entered, then those it entered: reached/total edges\n")
+      (loop (if (>= (load pass) 2)
+                (break)
+                (let [(mut i) 0]
+                  (loop (if (>= (load i) m)
+                            (break)
+                            (let [f (al-get [FuncCov] (load fs) (load i))
+                                  hit (load (field f hit))]
+                              (if (= (= hit 0) (= (load pass) 0))
+                                  (do
+                                    (if (> hit 0) (store! entered (primitive/iadd (load entered) 1)) 0)
+                                    (str/sb-push-i64! (mut sb) hit)
+                                    (str/sb-push-str! (mut sb) "/")
+                                    (str/sb-push-i64! (mut sb) (load (field f edges)))
+                                    (str/sb-push-str! (mut sb) "  ")
+                                    (str/sb-push-str! (mut sb) (fz-symbol-of (cov-pc-of (load (field f id)))))
+                                    (str/sb-push-str! (mut sb) "\n")
+                                    0)
+                                  0)
+                              (store! i (primitive/iadd (load i) 1))
+                              0)))
+                  (store! pass (primitive/iadd (load pass) 1))
+                  0)))
+      (let [path (db-join a dir "coverage.txt")]
+        (fs/write-file a path (str/sb-str (load sb)))
+        (db-free-bytes a path))
+      (stage-set! st STAGE-FUNCS m)
+      (stage-set! st STAGE-FUNCS-HIT (load entered))
+      (al-free! [FuncCov] (mut fs))
+      0)))
+
+; ── corpus minimization ──────────────────────────────────────────────────────
+
+;;; `coil fuzz --minimize-corpus`: replay the corpus from the smallest entry up,
+;;; keep each entry that still adds coverage, and delete the rest. What survives
+;;; covers everything the old corpus did, with (usually far) fewer files — which is
+;;; what makes a long-lived corpus cheap to load and to check in. Never returns.
+(defn fuzz-minimize-run [(s (ptr Source))
+                         (prop (fnptr c [(ptr Source) i64] bool))
+                         (name (slice u8))
+                         (max-size i64)] (-> i64)
+  (let [a (malloc-allocator)
+        dir (fuzz-dir a name)
+        spath (fuzz-stage-path a dir (fuzz-campaign-id) 0)
+        st (stage-map a spath)
+        fz (box! a Fuzz (zeroed Fuzz))
+        w (stdout)]
+    (if (= (primitive/cast i64 st) 0)
+        (do (os/_exit (primitive/cast i32 3)) 0)
+        0)
+    (source-stage! s st STAGE-CAP)
+    (store! (field fz s) s)
+    (store! (field fz prop) prop)
+    (store! (field fz mem) a)
+    (store! (field fz corpus) (al-new [FuzzEntry] a))
+    (store! (field fz known) (hm-new-scalar [i64 i64] a))
+    (store! (field fz stage) st)
+    (store! (field fz corpus-dir) (fuzz-corpus-dir a dir))
+    (store! (field fz size) max-size)
+    (match (fs/dir-list a (load (field fz corpus-dir)))
+      (Err [e]
+           (do
+             (fmt w "  no corpus at {}\n" (load (field fz corpus-dir)))
+             0))
+      (Ok [names]
+          (let [(mut ns) names
+                n (al-len [(slice u8)] (load ns))
+                (mut tapes) (al-new [(ArrayList Choice)] a)
+                (mut paths) (al-new [(slice u8)] a)
+                (mut i) 0]
+            ; decode everything first, so the entries can be ordered by length
+            (loop (if (>= (load i) n)
+                      (break)
+                      (let [nm (al-get [(slice u8)] (load ns) (load i))]
+                        (if (= (primitive/cast i64 (slice-get nm 0)) 46)
+                            0
+                            (let [p (db-join a (load (field fz corpus-dir)) nm)]
+                              (match (db-load-tape a p)
+                                (Ok [o]
+                                    (match o
+                                      (Some [t]
+                                            (do
+                                              (al-push! [(ArrayList Choice)]
+                                                        (mut tapes)
+                                                        t)
+                                              (al-push! [(slice u8)] (mut paths) p)
+                                              0))
+                                      (None [] 0)))
+                                ; unreadable entries are dead weight: remove them
+                                (Err [e] (do (db-remove-tape a p) 0)))))
+                        (store! i (primitive/iadd (load i) 1))
+                        0)))
+            (let [m (al-len [(ArrayList Choice)] (load tapes))
+                  (mut done) (al-new [bool] a)
+                  (mut kept) 0
+                  (mut round) 0]
+              (let [(mut k) 0]
+                (loop (if (>= (load k) m)
+                          (break)
+                          (do
+                            (al-push! [bool] (mut done) false)
+                            (store! k (primitive/iadd (load k) 1))))))
+              ; selection by repeated minimum: m is a corpus, not a dataset
+              (loop (if (>= (load round) m)
+                        (break)
+                        (let [(mut best) -1
+                              (mut k) 0]
+                          (loop (if (>= (load k) m)
+                                    (break)
+                                    (do
+                                      (if (and (not (al-get [bool] (load done) (load k)))
+                                               (or (< (load best) 0)
+                                                   (< (al-len [Choice]
+                                                              (al-get [(ArrayList Choice)]
+                                                                      (load tapes)
+                                                                      (load k)))
+                                                      (al-len [Choice]
+                                                              (al-get [(ArrayList Choice)]
+                                                                      (load tapes)
+                                                                      (load best))))))
+                                          (store! best (load k))
+                                          0)
+                                      (store! k (primitive/iadd (load k) 1)))))
+                          (al-set! [bool] (mut done) (load best) true)
+                          (let [(mut t)
+                                  (al-get [(ArrayList Choice)]
+                                          (load tapes)
+                                          (load best))
+                                p (al-get [(slice u8)] (load paths) (load best))]
+                            (source-begin-replay! s (mut t) max-size)
+                            (if (> (fz-exec! fz) 0)
+                                (store! kept (primitive/iadd (load kept) 1))
+                                (db-remove-tape a p)))
+                          (store! round (primitive/iadd (load round) 1))
+                          0)))
+              (fmt w
+                   "  minimized corpus: kept {} of {} entries ({} edges)\n"
+                   (load kept)
+                   m
+                   (cov-edges))
+              0))))
+    (os/_exit (primitive/cast i32 0))
+    0))

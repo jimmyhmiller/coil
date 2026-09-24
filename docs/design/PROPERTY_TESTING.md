@@ -704,7 +704,7 @@ targeted phase finds it in ~3 000 cases, under a second, at default settings.
 ### 6.7 Coverage-guided mode (phase 2)
 
 Coil compiles through LLVM, so `-fsanitize-coverage=trace-pc-guard` gives an edge
-counter table. With it, `coil test --pbt-fuzz` becomes a structure-aware fuzzer:
+counter table. With it, `coil fuzz` becomes a structure-aware fuzzer:
 mutate tapes from the corpus (`Mutate` mode), keep tapes that hit new edges, and
 shrink with the same shrinker. This is [FuzzChick][fuzzchick]/Zest/HypoFuzz, and
 because the mutation operates on the **typed** tape rather than raw bytes, every
@@ -804,8 +804,84 @@ Two details that cost measurements to find:
   so the runner switches recording on around the property and off again.
   Instrumentation ignorelists (`fun:coil.prop.*`) help but cannot finish the job:
   sancov runs after inlining, so engine code inlined into the property's own
-  function is instrumented regardless of the list. Some noise is inherent.
+  function is instrumented regardless of the list. That is why no draw touches
+  the RNG while replaying a tape (§6.8): the inlined engine code that remains
+  follows the input and nothing else.
 
+
+### 6.8 Campaigns
+
+The first version of §6.7 ran the whole search inside the generation worker, as
+a phase after the random cases. It found the magic value, and it had four defects
+that stopped it from being something to rely on:
+
+- **A crash it found was reported against the wrong input.** The runner's crash
+  path bisects over *generated* cases and rebuilds one in DRAW mode; a mutant from
+  the fuzz phase is neither, so the report named an unrelated input (`s = ""` for
+  a crash on `"FUZZ"`).
+- **Coverage was seen/not-seen.** Every level of a nested structure takes the same
+  edge, so depth, counts and loop trip counts were invisible: a bracket parser
+  that overflows at depth five was never found in 100k iterations.
+- **Nothing persisted, nothing ran in parallel, there was no time budget, no
+  sanitizer, and mutations only changed values in place.**
+- **Coverage depended on history.** Draws consulted the RNG even while replaying
+  a tape, and those branches, inlined into the property, counted as coverage.
+
+**Architecture.** Under `--fuzz` the runner *supervises*: it starts N worker
+processes (`coil.prop.fuzz`) and watches them. Each worker's Source mirrors every
+choice it records into a **stage** — a shared file mapping. Stores into a shared
+mapping reach the file without a system call and outlive the process, so whatever
+kills a worker — a segfault, an ASan abort, the supervisor's SIGKILL — the stage
+holds exactly the tape of the case in flight, including everything drawn inside
+the property body. The supervisor reads it back, and a finding goes through the
+same shrinker and database as any counterexample. The stage also carries a
+per-case counter, which makes the supervisor the per-input watchdog (a counter
+that stops moving is a hang, on the input in the stage) and the clock
+(`--time`: it asks workers to stop through the stage).
+
+The same stage now backs ordinary `coil test` runs: a generation worker that dies
+leaves its case in the stage (no bisection, and body draws survive), and an
+ordinary failure shrinks in a worker whose stage catches a smaller candidate that
+crashes — which used to take the runner down with the report unwritten.
+
+**Signal.** Each case counts hits per edge (a byte per guard, touched edges on a
+list so a case costs what it executed, not the program's size) and classifies the
+counts into AFL's buckets 1, 2, 3, 4–7, 8–15, 16–31, 32–127, 128+. A feature is an
+(edge, bucket) pair; a case is kept when it produces a new feature. Draws never
+consult the RNG while replaying, and a generated case is judged by a replay of
+its tape, so a corpus reproduces its coverage in a fresh process.
+
+**Mutation.** Half the candidates start with one structural edit over the span
+tree — delete an element (and lower its length choice), repeat one 1–8 times,
+splice an element with the same span label from another entry, replace any span
+with a same-labelled one from another entry, swap two siblings, or a plain
+crossover — and then a stack of 1–8 value edits: uniform, ±8, endpoint, a
+boundary value (0, ±1, 2^31…), the comparison dictionary's counterpart, or
+another choice's value (how an input comes to satisfy an equality between two
+of its own parts). Selection is half the four newest entries, half uniform over
+entries that found a new edge.
+
+**Corpus and reports.** Entries are written to `.coil/fuzz/<property>/corpus/`
+when found (under a content-hash name, via temp-and-rename), workers sync each
+other's every two seconds, and a campaign resumes from the directory.
+`--minimize-corpus` replays smallest-first and keeps what still adds coverage.
+With clang's `pc-table`, a campaign ends by writing `coverage.txt`: every
+instrumented function, never-entered first, with reached/total edges.
+
+**Measured** on the planted bugs in `tests/fuzz/regress/` (fixed seeds, 400k
+iteration budget; `scripts/tests/fuzz_gate.py` checks each):
+
+| bug | before | now |
+|---|---|---|
+| magic value `"FUZZ"` behind 4 comparisons | found | found, `s = "FUZZ"` |
+| stack overflow at bracket depth 5 | not found in 100k | found in ~300 cases, `s = "[[[[["` |
+| crash reachable only by mutation | reported as `s = ""` | `s = "BOOM"`, CRASHED |
+| input that never finishes | — | `s = "LOP"`, TIMED OUT |
+| overrun past a trailing `\x` (ASan) | no sanitizer | `s = "\\x"`, heap-buffer-overflow |
+
+The first campaigns over `tests/fuzz/` found and minimized real bugs across the
+JSON stack, the compiler's reader, strings, collections and allocators, and two
+compiler ownership bugs (see `tests/fuzz/README.md`).
 ---
 
 ## 7. Performance
@@ -1070,8 +1146,8 @@ Example: `src/examples/property-testing.coil`. Benchmarks:
 - **The `Deserialize`→`Arbitrary` bridge (§4.4) is not built.** The reflection
   path covers the derive case; the bridge's real payoff was corpus interop, which
   the database (`prop_db.coil`) delivers directly in the tape's own format.
-- **Coverage-guided fuzzing (§6.7) is not built — but the mechanism is proven,
-  and it needs no compiler change.** See §6.7 for the working pipeline.
+- **Coverage-guided fuzzing** is built: §6.7 is the mechanism, §6.8 the campaign
+  runner around it.
 - **Parallelism is at the test-file level**, via `coil test --jobs N`, not
   in-process across cases (§7). The splittable RNG that in-process workers would
   need is built and tested (`rng-split!`); the worker pool is not.

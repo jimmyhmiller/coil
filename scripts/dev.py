@@ -354,6 +354,13 @@ def test(args: argparse.Namespace) -> None:
         execute(sys.executable, "tests/compiler/const_generic_test.py", "--compiler", compiler)
     elif args.suite == "field-access":
         execute(sys.executable, "tests/compiler/field_access_test.py", "--compiler", compiler)
+    elif args.suite == "prop":
+        # Property testing, and the fuzz engine's planted-bug gate (seconds, fixed
+        # seeds). Local: fuzzing campaigns proper are scripts/tests/fuzz_targets.py.
+        execute("sh", "scripts/tests/prop.sh", "-q", compiler)
+        execute(sys.executable, "scripts/tests/prop_spawn.py", "--coil", compiler)
+        execute(sys.executable, "scripts/tests/prop_nofork.py", "--coil", compiler)
+        execute(sys.executable, "scripts/tests/fuzz_gate.py", "--compiler", compiler)
     elif args.suite == "modernize-fast":
         execute(sys.executable, "tests/compiler/const_generic_test.py", "--compiler", compiler)
         execute(sys.executable, "tests/compiler/field_access_test.py", "--compiler", compiler)
@@ -1427,7 +1434,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "update", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd", "const-generics", "field-access"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "update", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd", "const-generics", "field-access", "prop"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.set_defaults(func=test)

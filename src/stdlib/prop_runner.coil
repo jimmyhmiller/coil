@@ -13,6 +13,9 @@
 (import "coil.prop.shrink" :use *)
 (import "coil.prop.db" :use *)
 (import "coil.prop.cov" :use *)
+(import "coil.prop.fuzz" :use *)
+(import "coil.time" :as time)
+(import "coil.signals" :use [SignalSubscription signal-subscribe signal-read signal-close!])
 
 ; THE RUNNER — what `(defprop …)` expands into a call to.
 ;
@@ -48,20 +51,6 @@
    (shrink-calls i64)
    (shrinks i64)])
 
-; What `defprop` compiles a property to, and what the second argument means.
-; One function rather than three so that the values PRINTED are provably the
-; values TESTED — regenerated from the same tape by the same code path.
-(const PROP-MODE-RUN 0)  ; draw the arguments, evaluate the body
-
-(const PROP-MODE-SHOW 1)  ; draw, print the arguments, evaluate the body
-
-(const PROP-MODE-DRAW 2)  ; draw only — never touch the body (used to rebuild
-
-; the input of a case that crashed, where running
-; the body is exactly what must not happen)
-(const PROP-MODE-DRAW-SHOW 3)  ; draw and print, still without the body: how a
-
-; crashing counterexample gets reported at all
 (defstruct RunCtx
   [(src (ptr Source))
    (prop (fnptr c [(ptr Source) i64] bool))
@@ -69,14 +58,20 @@
    (crash-code i64)  ; 128+signal when shrinking a crash, -1 otherwise
    (cand-timeout i64)  ; seconds allowed to one spawned shrink candidate
    (name (slice u8))  ; the property, to select it in a spawned worker
-   (cand-path (slice u8))])  ; where a candidate tape is handed over, "" if unused
+   (cand-path (slice u8))  ; where a candidate tape is handed over, "" if unused
+   (cand-stage-path (slice u8))  ; where a candidate's worker stages what it drew
+   (cand-stage (ptr i64))])  ; that stage, mapped (null if it could not be)
 
 (defn prop-config [(name (slice u8))] (-> PropConfig)
   (let [c (primitive/alloc-stack PropConfig)]
     (store! (field c cases) (args-int "--cases" 200))
     (store! (field c seed)
             (args-int "--seed" (primitive/ior (str/str-hash name) 1)))
-    (store! (field c max-size) (args-int "--size" 60))
+    ; a campaign runs millions of cases and can afford bigger ones than a test run;
+    ; the size bounds collection lengths and recursion, so it bounds what the
+    ; fuzzer can build at all.
+    (store! (field c max-size)
+            (args-int "--size" (if (args-has? "--fuzz") 256 60)))
     (store! (field c shrink-budget) (args-int "--shrink" 20000))
     ; Ten rejections per case is already a suite in trouble; past that, keep
     ; generating and the run is just burning time on inputs it throws away.
@@ -294,9 +289,7 @@
         (mut targeted) false
         (mut best-score) 0.0
         (mut best-tape) (al-new [Choice] mem)
-        (mut best-size) (load (field cfg max-size))
-        fuzzing (> (args-int "--fuzz" 0) 0)
-        (mut corpus) (corpus-new mem)]
+        (mut best-size) (load (field cfg max-size))]
     (source-seed! s (load (field cfg seed)))
     (loop (if (or (>= (load bad) 0)
                   (or (>= (load i) limit)
@@ -311,6 +304,7 @@
                                 (load (field cfg cases))
                                 (load (field cfg max-size)))]
                 (source-begin-generate! s size)
+                (source-stage-case! s (load i))
                 ; each case gets its own swarm mask: a random SUBSET of the
                 ; alternatives a generator offers. Feature-omission diversity
                 ; finds bugs that "every feature, every case" never reaches.
@@ -323,15 +317,6 @@
                         (store! (field st cases)
                                 (primitive/iadd (load (field st cases)) 1))
                         (if held 0 (store! bad (load i)))
-                        ; a randomly generated case that reached somewhere new is
-                        ; the seed corpus the fuzz phase mutates from. Asking for
-                        ; the fresh-edge count also RESETS it, so this has to
-                        ; happen once per case and only when fuzzing.
-                        (if fuzzing
-                            (do
-                              (corpus-offer! (mut corpus) mem (src-tape s) size)
-                              0)
-                            0)
                         ; remember the highest-scoring case seen, to start the
                         ; targeted search from something better than random.
                         (if (src-targeted? s)
@@ -372,205 +357,7 @@
             (store! bad (load (field cfg cases)))
             0)
         0)
-    ; COVERAGE-GUIDED PHASE. Same shape as the targeted phase — mutate, run, keep
-    ; what improves — with "improves" meaning "reached a basic block nothing has
-    ; reached yet" instead of "scored higher".
-    (if (and fuzzing (< (load bad) 0))
-        (if (fuzz-phase s prop cfg st (mut corpus) (args-int "--fuzz" 0))
-            (store! bad (load (field cfg cases)))
-            0)
-        0)
     (load bad)))
-
-; ------------------------------------------------------ coverage-guided fuzzing
-;
-; Random generation is blind: it learns nothing from what an input did. A
-; coverage-guided search watches which basic blocks each input reached and keeps
-; the ones that reached somewhere new, so a bug behind three nested conditions is
-; found by three lucky guesses in sequence rather than one impossible one
-; (Lampropoulos et al., "Coverage Guided, Property Based Testing", OOPSLA 2019).
-;
-; What makes this cheap here is that the corpus is made of TAPES. A mutation is an
-; edit to a few recorded choices, so every mutant is by construction a well-formed
-; value of the property's argument types — no executions wasted on inputs that
-; fail to parse, which is most of what a byte-level fuzzer does on structured
-; input. It is Zest's "parametric" fuzzing, falling out of a representation that
-; was already there for shrinking.
-;
-; Coverage arrives through `coil.prop.cov`, whose callbacks are only ever called
-; in an instrumented build (`coil fuzz`). In an ordinary build
-; every case reports zero new edges, so the loop below would keep nothing and
-; degenerate to a slower random search — which is why it refuses to run and says
-; why instead.
-(defstruct CorpusEntry
-  [(tape (ArrayList Choice))
-   (size i64)])
-
-;;; The inputs worth keeping: one per distinct piece of new coverage.
-(defn corpus-new [(mem (dyn Allocator))] (-> (ArrayList CorpusEntry))
-  (al-new [CorpusEntry] mem))
-
-;;; Keep this tape if the case that produced it reached new ground.
-;;;
-;;; ⚠ `cov-take-fresh` RESETS the counter, so it must be called exactly once per
-;;; executed case. Calling it twice attributes one case's discovery to the next.
-(defn corpus-offer! [(c (mut (ArrayList CorpusEntry)))
-                     (mem (dyn Allocator))
-                     (tape (ptr (ArrayList Choice)))
-                     (size i64)] (-> bool)
-  (if (<= (cov-take-fresh) 0)
-      false
-      (let [e (primitive/alloc-stack CorpusEntry)]
-        (store! (field e tape) (tape-clone mem tape))
-        (store! (field e size) size)
-        (al-push! [CorpusEntry] (mut c) (load e))
-        true)))
-
-;;; Mutate corpus entries for `budget` iterations, keeping whatever reaches new
-;;; coverage. Returns true if the property failed on one of them.
-(defn fuzz-phase [(s (ptr Source))
-                  (prop (fnptr c [(ptr Source) i64] bool))
-                  (cfg PropConfig)
-                  (st (ptr PropStats))
-                  (corpus (mut (ArrayList CorpusEntry)))
-                  (budget i64)] (-> bool)
-  (let [mem (malloc-allocator)
-        w (stdout)]
-    (if (not (cov-instrumented?))
-        ; Saying nothing here would be the worst outcome: the run would look like
-        ; a fuzzing run, cost the extra budget, and be a slower random search.
-        (do
-          (print-str w
-                     "\n--fuzz was given but this binary has no coverage instrumentation.\n")
-          (print-str w
-                     "  Build it with coil fuzz — a plain `coil test` binary has no edges to guide anything.\n")
-          false)
-        (let [(mut failed) false
-              (mut i) 0]
-          ; An empty corpus means no generated case reached anything new, which
-          ; only happens when the property never runs. Seed it with the minimal
-          ; input so the loop has something to mutate.
-          (if (= (al-len [CorpusEntry] (load corpus)) 0)
-              (do
-                (source-begin-generate! s (load (field cfg max-size)))
-                (primitive/call-ptr prop s PROP-MODE-RUN)
-                (cov-take-fresh)
-                (corpus-offer-forced! (mut corpus)
-                                      mem
-                                      (src-tape s)
-                                      (load (field cfg max-size)))
-                0)
-              0)
-          (loop (if (or (load failed) (>= (load i) budget))
-                    (break)
-                    (let [n (al-len [CorpusEntry] (load corpus))
-                          pick
-                            (al-get [CorpusEntry]
-                                    (load corpus)
-                                    (corpus-pick s n))
-                          ; Replay at the FULL budget, not the size the entry was
-                          ; recorded at. The ramp means the corpus is mostly early,
-                          ; tiny-size cases — they are the ones that discovered the
-                          ; most coverage — and replaying them at their own size
-                          ; caps the search at inputs too small to reach anything.
-                          size (load (field cfg max-size))
-                          (mut base) (load (field pick tape))
-                          (mut cand)
-                            (mutate-tape-sized mem
-                                               (field s rng)
-                                               (mut base)
-                                               size)]
-                      (source-begin-replay! s (mut cand) size)
-                      ; Record comparisons only while the property runs. The
-                      ; dictionary is meant to describe the code under test, and
-                      ; the loop around it compares indices and counters far more
-                      ; often than the test compares anything interesting.
-                      (cov-cmp-record! true)
-                      (let [held (primitive/call-ptr prop s PROP-MODE-RUN)]
-                        (cov-cmp-record! false)
-                        (if (= (src-status s) ST-REJECTED)
-                            (do
-                              (store! (field st rejected)
-                                      (primitive/iadd (load (field st rejected))
-                                                      1))
-                              (cov-take-fresh)
-                              0)
-                            (do
-                              (store! (field st cases)
-                                      (primitive/iadd (load (field st cases)) 1))
-                              (if held
-                                  (do
-                                    (corpus-offer! (mut corpus)
-                                                   mem
-                                                   (src-tape s)
-                                                   size)
-                                    0)
-                                  (store! failed true))
-                              0)))
-                      (store! i (primitive/iadd (load i) 1))
-                      0)))
-          ; only in the child that did the searching — the parent re-runs the whole
-          ; phase to reach the failing case, and a second identical line reads as
-          ; two runs rather than one.
-          (if (and (> (load (field cfg verbose)) 0) (load (stat-collecting)))
-              (do
-                (fmt w
-                     "  fuzzing: {} iterations, corpus {}, {} of {} edges, {} comparison pairs\n"
-                     (load i)
-                     (al-len [CorpusEntry] (load corpus))
-                     (cov-total)
-                     (cov-guards)
-                     (cov-dict-count))
-
-                0)
-              0)
-          (load failed)))))
-
-;;; Which corpus entry to mutate next — the fuzzer's energy assignment, and the
-;;; difference between climbing a ladder and wandering.
-;;;
-;;; Uniform selection sounds fair and is not. An input that JUST found new coverage
-;;; is on the frontier: it is the only one that has reached the branch whose far
-;;; side is still unexplored, and the next rung can only be climbed from it. Under
-;;; uniform selection its share of the budget falls as 1/n while the corpus grows,
-;;; so a four-condition ladder needs the budget to grow with the product of the
-;;; rungs — which is the cost coverage guidance exists to avoid paying.
-;;;
-;;; Half the iterations go to the last four entries, half uniformly to everything,
-;;; so the frontier gets attention that does not decay while older inputs keep
-;;; enough budget to explore branches the frontier walked past.
-;;;
-;;; Measured on `tests/prop/demos/fuzz_demo.coil` (a four-byte magic-value ladder),
-;;; five seeds, 200 000-iteration budget — cases until the bug is found:
-;;;
-;;;   uniform     none, 124k, 184k, none, 74k    (2 of 5 never found it)
-;;;   frontier    85k,  71k,  84k,  33k,   6k    (5 of 5)
-;;;
-;;; Same corpus, same mutations, same budget; only which entry gets mutated next.
-;;; For reference, blind sampling needs about 95^4 ≈ 10^8 cases by construction —
-;;; it is not a slower search, it is a different one.
-(defn corpus-pick [(s (ptr Source)) (n i64)] (-> i64)
-  (if (<= n 1)
-      0
-      (if (= (rng-below! (mut (field s rng)) 2) 0)
-          (let [window (if (< n 4) n 4)]
-            (primitive/isub n
-                            (primitive/iadd (rng-below! (mut (field s rng))
-                                                        window)
-                                            1)))
-          (rng-below! (mut (field s rng)) n))))
-
-;;; Seed entry: kept regardless of coverage, because a corpus of nothing cannot be
-;;; mutated into anything.
-(defn corpus-offer-forced! [(c (mut (ArrayList CorpusEntry)))
-                            (mem (dyn Allocator))
-                            (tape (ptr (ArrayList Choice)))
-                            (size i64)] (-> i64)
-  (let [e (primitive/alloc-stack CorpusEntry)]
-    (store! (field e tape) (tape-clone mem tape))
-    (store! (field e size) size)
-    (al-push! [CorpusEntry] (mut c) (load e))
-    0))
 
 ; ---------------------------------------------------------- targeted search
 ;
@@ -846,6 +633,12 @@
 
 (const PROP-REPORT-FLAG "--coil-prop-report")  ; print the success report
 
+(const PROP-QUIET-FLAG "--coil-prop-quiet")  ; discard the worker's own output
+
+(const PROP-SHOW-FLAG "--coil-prop-show")  ; replay in SHOW mode: print what it drew
+
+(const PROP-STAGE-FLAG "--coil-prop-stage")  ; mirror every choice into this file
+
 ;;; A watchdog for the child. An infinite loop in a property is a bug the tool
 ;;; should REPORT, not a reason for `coil test` to hang until someone notices;
 ;;; SIGALRM turns it into an ordinary crash, which the machinery below already
@@ -859,6 +652,13 @@
 
 ;;; Decode a waitpid status the way the rest of this repo does: a terminating
 ;;; signal in the low 7 bits, else the exit code in the high byte.
+;;; Seconds one run of a saved or candidate input may take before the watchdog
+;;; calls it a hang: a campaign's `--input-timeout`, otherwise `--timeout`.
+(defn watchdog-secs [] (-> i64)
+  (if (args-has? "--fuzz")
+      (args-int "--input-timeout" 10)
+      (args-int "--timeout" 60)))
+
 (defn wait-code [(status i64)] (-> i64)
   (let [sig (primitive/iand status 127)]
     (if (!= sig 0)
@@ -986,20 +786,67 @@
 ;;; worker to print the success report, which only the phase that ran the WHOLE
 ;;; property wants — a bisection probe re-runs a prefix and must stay silent.
 (defn spawn-run-cases [(name (slice u8)) (limit i64) (report bool)] (-> i64)
+  (spawn-run-cases-staged name limit report "" (primitive/cast (ptr i64) 0)))
+
+;;; The same, with the worker mirroring every choice into the stage file at
+;;; `stage-path` (none when empty), so that if a case kills it, the file holds that
+;;; case's tape — including values the property drew inside its body.
+(defn spawn-run-cases-staged [(name (slice u8))
+                              (limit i64)
+                              (report bool)
+                              (stage-path (slice u8))
+                              (stage (ptr i64))] (-> i64)
   (prop-argv-begin!)
   (prop-argv-flag! PROP-CHILD-FLAG name)
   (prop-argv-int! PROP-CASES-FLAG limit)
-  (prop-argv-int! PROP-ALARM-FLAG (args-int "--timeout" 60))
+  ; staged, the parent watches each case (`--timeout` per case); otherwise the
+  ; worker's own alarm bounds the whole run
+  (if (> (slice-len stage-path) 0)
+      (prop-argv-flag! PROP-STAGE-FLAG stage-path)
+      (prop-argv-int! PROP-ALARM-FLAG (args-int "--timeout" 60)))
   (if report (prop-argv-push! (prop-argv-cstr PROP-REPORT-FLAG)) 0)
-  (prop-spawn-wait (prop-argv-finish!)))
+  (prop-spawn-watch (prop-argv-finish!) stage (args-int "--timeout" 60)))
 
 ;;; Replay the tape stored at `path` in a worker, under a `secs` watchdog.
 (defn spawn-replay [(name (slice u8)) (path (slice u8)) (size i64) (secs i64)] (-> i64)
+  (spawn-replay-quietly name path size secs false))
+
+;;; Replay in a worker that prints what the case draws — its arguments and every
+;;; `prop-note` — on the way to whatever it does. For a crash, the one run that can
+;;; show values drawn inside the body.
+(defn spawn-replay-showing [(name (slice u8)) (path (slice u8)) (size i64) (secs i64)] (-> i64)
   (prop-argv-begin!)
   (prop-argv-flag! PROP-CHILD-FLAG name)
   (prop-argv-flag! PROP-REPLAY-FLAG path)
   (prop-argv-int! PROP-SIZE-FLAG size)
   (prop-argv-int! PROP-ALARM-FLAG secs)
+  (prop-argv-push! (prop-argv-cstr PROP-SHOW-FLAG))
+  (prop-spawn-wait (prop-argv-finish!)))
+
+;;; The same, optionally with the worker's stdout and stderr discarded. Shrinking a
+;;; crash runs a worker per candidate, and every one that crashes prints the
+;;; runtime's report — a sanitizer's register dump, a backtrace — so an unquiet
+;;; shrink buries the one report that matters under hundreds of copies.
+(defn spawn-replay-quietly [(name (slice u8))
+                            (path (slice u8))
+                            (size i64)
+                            (secs i64)
+                            (quiet bool)] (-> i64)
+  (spawn-replay-staged name path size secs quiet ""))
+
+(defn spawn-replay-staged [(name (slice u8))
+                           (path (slice u8))
+                           (size i64)
+                           (secs i64)
+                           (quiet bool)
+                           (stage-path (slice u8))] (-> i64)
+  (prop-argv-begin!)
+  (prop-argv-flag! PROP-CHILD-FLAG name)
+  (prop-argv-flag! PROP-REPLAY-FLAG path)
+  (prop-argv-int! PROP-SIZE-FLAG size)
+  (prop-argv-int! PROP-ALARM-FLAG secs)
+  (if quiet (prop-argv-push! (prop-argv-cstr PROP-QUIET-FLAG)) 0)
+  (if (> (slice-len stage-path) 0) (prop-argv-flag! PROP-STAGE-FLAG stage-path) 0)
   (prop-spawn-wait (prop-argv-finish!)))
 
 ; ── the worker side ──────────────────────────────────────────────────────────
@@ -1014,6 +861,8 @@
 ;;; returns. `_exit`, not `exit`: no atexit handlers, no flushing of a stream the
 ;;; parent also holds.
 (defn prop-child-run [(name (slice u8))
+                      (file (slice u8))
+                      (line i64)
                       (prop (fnptr c [(ptr Source) i64] bool))] (-> i64)
   (let [cfg (prop-config name)
         s (prop-source (load (field cfg arena-bytes)))
@@ -1030,10 +879,45 @@
     ; a hung property from stalling the run, and a parent that armed one would kill
     ; the process that is supposed to report the hang.
     (if (> secs 0) (do (alarm (primitive/cast u32 secs)) 0) 0)
-    (if (>= limit 0)
-        (prop-child-cases s prop cfg st name limit)
-        (prop-child-replay s prop cfg))
+    (if (args-has? PROP-QUIET-FLAG)
+        (let [null (os/open c"/dev/null" (primitive/cast i32 1) 0)]
+          (if (>= null (primitive/cast i32 0))
+              (do (os/dup2 null 1) (os/dup2 null 2) (os/close null) 0)
+              0))
+        0)
+    (cond (args-has? PROP-FUZZ-WORKER-FLAG)
+            (fuzz-worker-run s
+                             prop
+                             name
+                             (args-int PROP-FUZZ-WORKER-FLAG 0)
+                             (load (field cfg seed))
+                             (load (field cfg cases))
+                             (load (field cfg max-size))
+                             (args-int "--fuzz" 0))
+          (args-has? PROP-FUZZ-CMIN-FLAG)
+            (fuzz-minimize-run s prop name (load (field cfg max-size)))
+          (args-has? PROP-SHRINK-FLAG)
+            (do
+              (prop-child-attach-stage! s)
+              (prop-child-shrink s prop cfg st name file line))
+          (>= limit 0)
+            (prop-child-cases s prop cfg st name limit)
+          :else
+            (prop-child-replay s prop cfg))
     0))
+
+;;; Under `--coil-prop-stage PATH`, mirror every choice this worker draws into that
+;;; file, and sign it with our pid so the parent can tell the stage was written.
+(defn prop-child-attach-stage! [(s (ptr Source))] (-> i64)
+  (if (args-has? PROP-STAGE-FLAG)
+      (let [stage (stage-map (malloc-allocator) (args-value PROP-STAGE-FLAG))]
+        (if (= (primitive/cast i64 stage) 0)
+            0
+            (do
+              (stage-set! stage STAGE-PID (primitive/cast i64 (os/getpid)))
+              (source-stage! s stage STAGE-CAP)
+              0)))
+      0))
 
 (defn prop-child-cases [(s (ptr Source))
                         (prop (fnptr c [(ptr Source) i64] bool))
@@ -1041,6 +925,7 @@
                         (st (ptr PropStats))
                         (name (slice u8))
                         (limit i64)] (-> i64)
+  (prop-child-attach-stage! s)
   (let [bad (run-cases s prop cfg st limit)]
     (if (>= bad 0)
         (do (os/_exit (primitive/cast i32 CHILD-FAILED)) 0)
@@ -1057,6 +942,7 @@
 (defn prop-child-replay [(s (ptr Source))
                          (prop (fnptr c [(ptr Source) i64] bool))
                          (cfg PropConfig)] (-> i64)
+  (prop-child-attach-stage! s)
   (let [a (malloc-allocator)
         path (args-value PROP-REPLAY-FLAG)
         size (args-int PROP-SIZE-FLAG (load (field cfg max-size)))]
@@ -1119,17 +1005,484 @@
         path (load (field rc cand-path))
         code
           (if (db-save-tape mem path tape)
-              (spawn-replay (load (field rc name))
-                            path
-                            (load (field rc size))
-                            (load (field rc cand-timeout)))
+              (do
+                (let [cs (load (field rc cand-stage))]
+                  (if (= (primitive/cast i64 cs) 0) 0 (stage-reset! cs)))
+                (spawn-replay-staged (load (field rc name))
+                                     path
+                                     (load (field rc size))
+                                     (load (field rc cand-timeout))
+                                     true
+                                     (if (= (primitive/cast i64 (load (field rc cand-stage))) 0)
+                                         ""
+                                         (load (field rc cand-stage-path)))))
               CHILD-BROKEN)]
-    ; the tape must also be REPLAYED in the parent, so the shrinker can read the
-    ; canonical tape the run produced. Generation never crashes — only the body
-    ; does — so drawing here is safe.
+    ; The shrinker keeps the CANONICAL tape a run produced (replay clamps and fills
+    ; in minima). Only the worker ran the whole property, so its staged tape is
+    ; the canonical one; a DRAW replay here — the body must not run in this
+    ; process — would record the arguments and drop everything the body drew,
+    ; and the shrinker would carry on from an input that no longer crashes. The
+    ; DRAW replay still supplies the arguments' spans.
     (source-begin-replay! s tape (load (field rc size)))
     (primitive/call-ptr (load (field rc prop)) s PROP-MODE-DRAW)
+    (let [cs (load (field rc cand-stage))]
+      (if (and (!= (primitive/cast i64 cs) 0) (!= (stage-get cs STAGE-PID) 0))
+          (let [(mut staged) (stage-tape mem cs)
+                canon (src-tape s)
+                n (al-len [Choice] (load staged))
+                (mut i) 0]
+            (al-clear! [Choice] canon)
+            (loop (if (>= (load i) n)
+                      (break)
+                      (do
+                        (al-push! [Choice] canon (al-get [Choice] (load staged) (load i)))
+                        (store! i (primitive/iadd (load i) 1)))))
+            (al-free! [Choice] (mut staged))
+            0)
+          0))
     (= code (load (field rc crash-code)))))
+
+; ------------------------------------------------------- fuzzing campaigns
+;
+; Under `--fuzz` (which `coil fuzz` passes to an instrumented build), a property is
+; not run here at all. This process SUPERVISES a campaign: it starts worker
+; processes (coil.prop.fuzz), watches them, and acts on how they end.
+;
+; Each worker mirrors the input it is running into its own stage file, so the
+; supervisor needs nothing from a worker but its exit status and that file. That
+; is what the old design lacked: it ran the campaign inside one generation worker
+; and, on a crash, bisected over GENERATION cases — which cannot reach an input the
+; mutation phase produced, so a crash the fuzzer found was reported against an
+; unrelated random input.
+;
+; The supervisor is also the watchdog. A worker's stage counts executions; one
+; whose count has not moved for `--input-timeout` seconds is stuck on its current
+; input, and it is SIGKILLed and reported as a hang on exactly that input. And it is
+; the clock: at `--fuzz-time` it asks every worker to stop, through the stage.
+
+(const PROP-FUZZ-WORKER-FLAG "--coil-prop-fuzz-worker")  ; this process is worker N
+
+(const PROP-FUZZ-CMIN-FLAG "--coil-prop-fuzz-cmin")  ; minimize the corpus
+
+;;; The status a hung input is reported with: what the watchdog's SIGALRM produces
+;;; in a spawned shrink candidate, so the hang shrinks and reports like one.
+(const FUZZ-HANG-CODE 142)
+
+(extern usleep :cc c [u32] (-> i32))
+
+(defstruct FuzzWorker
+  [(pid i64)
+   (stage (ptr i64))
+   (alive bool)
+   (seen i64)  ; the exec count at the last check
+   (moved i64)])  ; when it last changed, in ms
+
+;;; How a campaign ended: 0 when every worker finished, else the failing worker's
+;;; status (CHILD-FAILED, 128+signal, FUZZ-HANG-CODE, CHILD-BROKEN, or an exit code)
+;;; and which worker it was.
+(defstruct FuzzOutcome [(code i64) (worker i64) (execs i64)])
+
+(defn spawn-fuzz-worker [(name (slice u8)) (flag (slice u8)) (i i64)] (-> i64)
+  (prop-argv-begin!)
+  (prop-argv-flag! PROP-CHILD-FLAG name)
+  (prop-argv-int! flag i)
+  (prop-argv-int! FUZZ-CAMPAIGN-FLAG (primitive/cast i64 (os/getpid)))
+  (let [av (prop-argv-finish!)]
+    (os/spawn (load (primitive/index av 0)) av (os/spawn-envp))))
+
+(defn fuzz-now-ms [] (-> i64)
+  (match (time/monotonic-now-ms)
+    (Ok [t] t)
+    (Err [e] 0)))
+
+;;; Ask every worker to finish after its current input.
+(defn fuzz-stop-all! [(ws (ptr (ArrayList FuzzWorker)))] (-> i64)
+  (let [n (al-len [FuzzWorker] (load ws))
+        (mut k) 0]
+    (loop (if (>= (load k) n)
+              (break)
+              (do
+                (stage-set! (load (field (al-elem [FuzzWorker] ws (load k)) stage))
+                            STAGE-STOP
+                            1)
+                (store! k (primitive/iadd (load k) 1)))))
+    0))
+
+;;; Route SIGINT and SIGTERM to a pipe this supervisor polls, instead of killing it.
+;;; False if they could not be subscribed (another subscription owns them), in which
+;;; case a Ctrl-C ends the campaign the ordinary way.
+(defn fuzz-subscribe-interrupts! [(sub (ptr SignalSubscription))] (-> bool)
+  (let [nums (primitive/alloc-stack (array i32 2))]
+    (store! (primitive/index (primitive/cast (ptr i32) nums) 0) (primitive/cast i32 2))
+    (store! (primitive/index (primitive/cast (ptr i32) nums) 1) (primitive/cast i32 15))
+    (match (signal-subscribe sub (slice-new [i32] (primitive/cast (ptr i32) nums) 2))
+      (Ok [_]
+          (do
+            ; polled from the watchdog loop, so a read must not block
+            (os/fcntl (load (field sub read-fd)) 4 (fuzz-nonblocking-flag))
+            true))
+      (Err [e] false))))
+
+(defn fuzz--explicit-public-name [(name Code)] (-> Code)
+  (primitive/syntax->datum name))
+
+;;; O_NONBLOCK: 2048 on Linux, 4 on Darwin.
+(defn gen-fuzz-nonblocking [] (-> Code)
+  (if (primitive/code-eq (primitive/target-os) `linux)
+      `(defn ~(fuzz--explicit-public-name `fuzz-nonblocking-flag) [] (-> i32) 2048)
+      `(defn ~(fuzz--explicit-public-name `fuzz-nonblocking-flag) [] (-> i32) 4)))
+
+(meta (gen-fuzz-nonblocking))
+
+;;; Kill every worker still running and reap it.
+(defn fuzz-kill-all! [(ws (ptr (ArrayList FuzzWorker)))] (-> i64)
+  (let [n (al-len [FuzzWorker] (load ws))
+        stp (primitive/alloc-stack i32)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [wk (al-elem [FuzzWorker] ws (load i))]
+                (if (load (field wk alive))
+                    (do
+                      (os/kill (primitive/cast i32 (load (field wk pid))) 9)
+                      (os/waitpid (primitive/cast i32 (load (field wk pid))) stp 0)
+                      (store! (field wk alive) false)
+                      0)
+                    0)
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    0))
+
+;;; One status line: totals across workers (executions add up; coverage and corpus
+;;; are per worker, and because workers share their finds the best one stands for
+;;; the campaign).
+(defn fuzz-status [(w (ptr Writer))
+                   (ws (ptr (ArrayList FuzzWorker)))
+                   (elapsed-ms i64)
+                   (last bool)] (-> i64)
+  (let [n (al-len [FuzzWorker] (load ws))
+        (mut execs) 0
+        (mut corpus) 0
+        (mut edges) 0
+        (mut features) 0
+        (mut guards) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [st (load (field (al-elem [FuzzWorker] ws (load i)) stage))]
+                (store! execs (primitive/iadd (load execs) (stage-get st STAGE-EXECS)))
+                (if (> (stage-get st STAGE-CORPUS) (load corpus))
+                    (store! corpus (stage-get st STAGE-CORPUS))
+                    0)
+                (if (> (stage-get st STAGE-EDGES) (load edges))
+                    (store! edges (stage-get st STAGE-EDGES))
+                    0)
+                (if (> (stage-get st STAGE-FEATURES) (load features))
+                    (store! features (stage-get st STAGE-FEATURES))
+                    0)
+                (if (> (stage-get st STAGE-GUARDS) (load guards))
+                    (store! guards (stage-get st STAGE-GUARDS))
+                    0)
+                (store! i (primitive/iadd (load i) 1))
+                0)))
+    (let [secs (primitive/udiv elapsed-ms 1000)
+          rate
+            (if (> elapsed-ms 0)
+                (primitive/udiv (primitive/imul (load execs) 1000) elapsed-ms)
+                0)]
+      (fmt w
+           "  {} {}s: {} execs ({}/s), corpus {}, {} of {} edges, {} features\n"
+           (if last "done" "#")
+           secs
+           (load execs)
+           rate
+           (load corpus)
+           (load edges)
+           (load guards)
+           (load features)))
+    (load execs)))
+
+;;; Run a campaign for property `name` and report how it ended.
+(defn fuzz-supervise [(name (slice u8)) (w (ptr Writer))] (-> FuzzOutcome)
+  (let [a (malloc-allocator)
+        cmin (args-has? "--fuzz-minimize")
+        jobs0 (args-int "--fuzz-jobs" 1)
+        jobs (if cmin 1 (if (< jobs0 1) 1 jobs0))
+        limit-ms (primitive/imul (args-int "--fuzz-time" 0) 1000)
+        timeout-ms (primitive/imul (args-int "--input-timeout" 10) 1000)
+        status-ms (primitive/imul (args-int "--status-every" 10) 1000)
+        dir (fuzz-dir a name)
+        campaign (primitive/cast i64 (os/getpid))
+        (mut ws) (al-new [FuzzWorker] a)
+        out (primitive/alloc-stack FuzzOutcome)
+        stp (primitive/alloc-stack i32)
+        start (fuzz-now-ms)
+        sub (primitive/alloc-stack SignalSubscription)
+        subscribed (fuzz-subscribe-interrupts! sub)
+        (mut interrupts) 0
+        (mut stopping) false
+        (mut last-status) start
+        (mut done) false]
+    (store! (field out code) 0)
+    (store! (field out worker) -1)
+    (store! (field out execs) 0)
+    (db-mkdir-p a dir)
+    (fuzz-clean-stale! a dir)
+    (if (not cmin)
+        (do
+          (fmt w
+               "\n  fuzzing {} with {} worker{}, {}; corpus {}\n"
+               name
+               jobs
+               (if (= jobs 1) "" "s")
+               (if (> limit-ms 0) "for a time budget" "until stopped or out of iterations")
+               (fuzz-corpus-dir a dir))
+          0)
+        0)
+    (let [(mut i) 0]
+      (loop (if (or (load done) (>= (load i) jobs))
+                (break)
+                (let [path (fuzz-stage-path a dir campaign (load i))
+                      st (stage-map a path)]
+                  (if (= (primitive/cast i64 st) 0)
+                      (do
+                        (store! (field out code) CHILD-BROKEN)
+                        (store! done true)
+                        0)
+                      (let [wk (primitive/alloc-stack FuzzWorker)]
+                        (stage-reset! st)
+                        (store! (field wk stage) st)
+                        (store! (field wk pid)
+                                (spawn-fuzz-worker name
+                                                   (if cmin
+                                                       PROP-FUZZ-CMIN-FLAG
+                                                       PROP-FUZZ-WORKER-FLAG)
+                                                   (load i)))
+                        (store! (field wk alive) (>= (load (field wk pid)) 0))
+                        (store! (field wk seen) 0)
+                        (store! (field wk moved) start)
+                        (al-push! [FuzzWorker] (mut ws) (load wk))
+                        (if (< (load (field wk pid)) 0)
+                            (do
+                              (fmt w "coil fuzz: could not start worker {}\n" (load i))
+                              (store! (field out code) CHILD-BROKEN)
+                              (store! done true)
+                              0)
+                            0)))
+                  (db-free-bytes a path)
+                  (store! i (primitive/iadd (load i) 1))
+                  0))))
+    (loop (if (load done)
+              (break)
+              (do
+                (usleep (primitive/cast u32 50000))
+                (let [now (fuzz-now-ms)
+                      n (al-len [FuzzWorker] (load ws))
+                      (mut alive) 0
+                      (mut i) 0]
+                  (loop (if (or (load done) (>= (load i) n))
+                            (break)
+                            (let [wk (al-elem [FuzzWorker] (mut ws) (load i))]
+                              (if (load (field wk alive))
+                                  (let [pid (load (field wk pid))
+                                        r
+                                          (primitive/cast i64
+                                                          (os/waitpid (primitive/cast i32 pid)
+                                                                      stp
+                                                                      1))]
+                                    (if (= r pid)
+                                        (let [code
+                                                (wait-code (primitive/cast i64
+                                                                           (load stp)))]
+                                          (store! (field wk alive) false)
+                                          (if (= code 0)
+                                              0
+                                              (do
+                                                (store! (field out code) code)
+                                                (store! (field out worker) (load i))
+                                                (store! done true)
+                                                0)))
+                                        (let [execs (stage-get (load (field wk stage))
+                                                               STAGE-EXECS)]
+                                          (store! alive (primitive/iadd (load alive) 1))
+                                          (if (!= execs (load (field wk seen)))
+                                              (do
+                                                (store! (field wk seen) execs)
+                                                (store! (field wk moved) now)
+                                                0)
+                                              (if (and (> timeout-ms 0)
+                                                       (> (primitive/isub now
+                                                                          (load (field wk moved)))
+                                                          timeout-ms))
+                                                  ; stuck on one input: that input hangs
+                                                  (do
+                                                    (os/kill (primitive/cast i32 pid) 9)
+                                                    (os/waitpid (primitive/cast i32 pid)
+                                                                stp
+                                                                0)
+                                                    (store! (field wk alive) false)
+                                                    (store! (field out code) FUZZ-HANG-CODE)
+                                                    (store! (field out worker) (load i))
+                                                    (store! done true)
+                                                    0)
+                                                  0))
+                                          0)))
+                                  0)
+                              (store! i (primitive/iadd (load i) 1))
+                              0)))
+                  ; Ctrl-C / SIGTERM: the first stops the campaign the way its
+                  ; time budget would, so it still reports what it covered; a
+                  ; second abandons it
+                  (if (and subscribed (not (load done)))
+                      (match (signal-read sub)
+                        (Ok [sig]
+                            (do
+                              (store! interrupts (primitive/iadd (load interrupts) 1))
+                              (if (= (load interrupts) 1)
+                                  (do
+                                    (print-str w "\n  interrupted: stopping the workers (interrupt again to abandon the campaign)\n")
+                                    (store! stopping true)
+                                    (fuzz-stop-all! (mut ws))
+                                    0)
+                                  (do (fuzz-kill-all! (mut ws)) (store! done true) 0))))
+                        (Err [e] 0))
+                      0)
+                  (if (load done)
+                      0
+                      (do
+                        (if (= (load alive) 0) (store! done true) 0)
+                        (if (and (> limit-ms 0)
+                                 (and (not (load stopping))
+                                      (>= (primitive/isub now start) limit-ms)))
+                            (let [(mut k) 0]
+                              (store! stopping true)
+                              (loop (if (>= (load k) n)
+                                        (break)
+                                        (do
+                                          (stage-set! (load (field (al-elem [FuzzWorker]
+                                                                            (mut ws)
+                                                                            (load k))
+                                                                   stage))
+                                                      STAGE-STOP
+                                                      1)
+                                          (store! k (primitive/iadd (load k) 1)))))
+                              0)
+                            0)
+                        (if (and (not cmin)
+                                 (and (> status-ms 0)
+                                      (>= (primitive/isub now (load last-status))
+                                          status-ms)))
+                            (do
+                              (fuzz-status w
+                                           (mut ws)
+                                           (primitive/isub now start)
+                                           false)
+                              (store! last-status now)
+                              0)
+                            0)
+                        0))
+                  0))))
+    (fuzz-kill-all! (mut ws))
+    (if subscribed (do (signal-close! sub) 0) 0)
+    (fuzz-default-sigint!)
+    ; the stages are scratch for this campaign; a failing worker's is read (and
+    ; removed) by `fuzz-campaign`
+    (let [(mut k) 0]
+      (loop (if (>= (load k) (al-len [FuzzWorker] (load ws)))
+                (break)
+                (do
+                  (if (= (load k) (load (field out worker)))
+                      0
+                      (let [pth (fuzz-stage-path a dir campaign (load k))]
+                        (db-remove-tape a pth)
+                        (db-free-bytes a pth)
+                        0))
+                  (store! k (primitive/iadd (load k) 1))))))
+    (if cmin
+        0
+        (do
+          (store! (field out execs)
+                  (fuzz-status w (mut ws) (primitive/isub (fuzz-now-ms) start) true))
+          (let [st0 (load (field (al-elem [FuzzWorker] (mut ws) 0) stage))]
+            (if (and (= (load (field out code)) 0) (> (stage-get st0 STAGE-FUNCS) 0))
+                (let [path (db-join a dir "coverage.txt")]
+                  (fmt w
+                       "  functions entered: {} of {} in the binary, which holds every property in the file (never-entered ones are listed in {})\n"
+                       (stage-get st0 STAGE-FUNCS-HIT)
+                       (stage-get st0 STAGE-FUNCS)
+                       path)
+                  (db-free-bytes a path)
+                  0)
+                0))
+          0))
+    (db-free-bytes a dir)
+    (load out)))
+
+;;; The campaign phase of `prop-run`: supervise, and if a worker failed, rebuild its
+;;; input from its stage and hand it to the same shrinker and report as any other
+;;; counterexample.
+(defn fuzz-campaign [(name (slice u8))
+                     (file (slice u8))
+                     (line i64)
+                     (prop (fnptr c [(ptr Source) i64] bool))
+                     (s (ptr Source))
+                     (cfg PropConfig)
+                     (st (ptr PropStats))
+                     (w (ptr Writer))] (-> i64)
+  (let [o (fuzz-supervise name w)
+        code (load (field o code))
+        a (malloc-allocator)]
+    (cond (= code 0) 0
+          (= code CHILD-BROKEN)
+            (do
+              (fmt w "\nFAILED: the fuzzing campaign for {} could not run (see above)\n" name)
+              (abort)
+              0)
+          :else
+            (let [dir (fuzz-dir a name)
+                  path (fuzz-stage-path a dir (primitive/cast i64 (os/getpid)) (load (field o worker)))
+                  stage (stage-map a path)]
+              (if (= (primitive/cast i64 stage) 0)
+                  (do (abort) 0)
+                  (let [(mut tape) (stage-tape a stage)
+                        size (stage-get stage STAGE-SIZE)
+                        _ (db-remove-tape a path)]
+                    (store! (stat-collecting) false)
+                    (store! (field st cases) (load (field o execs)))
+                    (source-begin-replay! s (mut tape) size)
+                    (let [log (fuzz-log-path a dir (primitive/cast i64 (os/getpid)) (load (field o worker)))]
+                      (fmt w "\n  the failing worker's output is in {}\n" log)
+                      (db-free-bytes a log))
+                    (if (= code CHILD-FAILED)
+                        ; an ordinary false: minimized in a worker, which also
+                        ; says so if the input does not fail again
+                        (do
+                          (fmt w "\nFAILED while fuzzing\n")
+                          (report-false-in-worker w
+                                                  name
+                                                  file
+                                                  line
+                                                  prop
+                                                  s
+                                                  cfg
+                                                  st
+                                                  (mut tape)
+                                                  size
+                                                  (stage-get stage STAGE-SWARM)
+                                                  (load (field o execs))))
+                        (do
+                          ; a crash, a hang, or an exit: never run the body here
+                          (source-swarm! s (stage-get stage STAGE-SWARM))
+                          (source-begin-replay! s (mut tape) size)
+                          (primitive/call-ptr prop s PROP-MODE-DRAW)
+                          (if (= code FUZZ-HANG-CODE)
+                              (fmt w
+                                   "\nTIMED OUT while fuzzing: an input ran for more than {}s\n"
+                                   (args-int "--input-timeout" 10))
+                              (if (> code 128)
+                                  (fmt w "\nCRASHED (signal {}) while fuzzing\n" (primitive/isub code 128))
+                                  (fmt w "\nEXITED with code {} while fuzzing\n" code)))
+                          (report-failure-tape w name file line prop s cfg st code (mut tape))))))))))
 
 ; ------------------------------------------------------------- the reuse phase
 ;
@@ -1183,7 +1536,7 @@
                                 (spawn-replay name
                                               path
                                               (load (field cfg max-size))
-                                              (args-int "--timeout" 60))]
+                                              (watchdog-secs))]
                           (db-free-bytes a path)
                           ; A worker that could not read the tape established NOTHING —
                           ; not that the property fails, and not that it holds. Say so
@@ -1220,7 +1573,12 @@
                       (tape (ptr (ArrayList Choice)))
                       (size i64)] (-> i64)
   (source-begin-replay! s tape size)
-  (let [held (primitive/call-ptr prop s PROP-MODE-RUN)]
+  (let [held
+          (primitive/call-ptr prop
+                              s
+                              (if (args-has? PROP-SHOW-FLAG)
+                                  PROP-MODE-SHOW
+                                  PROP-MODE-RUN))]
     (if (or held (= (src-status s) ST-REJECTED)) CHILD-OK CHILD-FAILED)))
 
 ;;; A database file that exists but cannot be read is worth one line of output: a
@@ -1242,7 +1600,7 @@
   ; for and exits inside this call. It has to be the first thing tested, because a
   ; worker that fell through to the reuse phase would replay a saved counterexample
   ; its parent is in the middle of minimizing.
-  (if (prop-child? name) (prop-child-run name prop) 0)
+  (if (prop-child? name) (prop-child-run name file line prop) 0)
   ; read ONCE, for the whole run. It used to be read inside the generation phase
   ; and nowhere else, which is how the reuse phase came to ignore it.
   (let [nofork (args-has? "--no-fork")
@@ -1271,72 +1629,361 @@
           (do
             (store! (stat-collecting) false)
             (print-str w "\n(replaying the saved counterexample)\n")
+            ; an ordinary failure shrinks in a worker (see report-false-in-worker)
+            (if (and (= reuse CHILD-FAILED) (not nofork))
+                (report-false-in-worker w
+                                        name
+                                        file
+                                        line
+                                        prop
+                                        s
+                                        cfg
+                                        st
+                                        (mut saved)
+                                        (load (field cfg max-size))
+                                        -1
+                                        0)
+                0)
             (source-begin-replay! s (mut saved) (load (field cfg max-size)))
             (primitive/call-ptr prop
                                 s
                                 (if (> reuse 128) PROP-MODE-DRAW PROP-MODE-RUN))
-            (report-failure w
-                            name
-                            file
-                            line
-                            prop
-                            s
-                            cfg
-                            st
-                            (if (> reuse 128) reuse -1))
+            ; from the SAVED tape: a crash's DRAW replay above records only the
+            ; arguments, and the saved tape also holds what the body drew
+            (report-failure-tape w
+                                 name
+                                 file
+                                 line
+                                 prop
+                                 s
+                                 cfg
+                                 st
+                                 (if (> reuse 128) reuse -1)
+                                 (mut saved))
             0)))
     ; PHASE 2 — generation. The crash branches below (`find-crashing-case`, and
     ; `run-candidate-spawned` inside `report-failure`) spawn unconditionally, and do
     ; not need to consult `nofork`: under it, `code` is only ever CHILD-OK or
     ; CHILD-FAILED, because a crashing case took this process with it rather than
     ; returning a signal from a worker. They are unreachable, not ungated.
-    (let [code
-            (if nofork
-                ; opting out: run in this process, where a debugger can see
-                ; the crash. Trades crash minimization for a usable backtrace.
-                (if (>= (run-cases s prop cfg st (load (field cfg cases))) 0)
-                    CHILD-FAILED
-                    CHILD-OK)
-                (spawn-run-cases name (load (field cfg cases)) true))]
-      (if (= code CHILD-OK)
-          ; when we spawned, the worker already printed the counts it owns; only
-          ; the no-fork path still has to report from here.
-          (if nofork (report-success w name cfg st) 0)
-          (if (or (= code CHILD-FAILED) (< code 0))
-              ; An ordinary counterexample (or a spawn that failed, in which case
-              ; we simply do the work here). Re-run to the failing case in this
-              ; process — generation is deterministic — and shrink in-process,
-              ; which is far faster than a process per candidate.
-              (do
-                (store! (stat-collecting) false)
-                (run-cases s prop cfg st (load (field cfg cases)))
-                (report-failure w name file line prop s cfg st -1))
-              (if (> code 128)
-                  ; A crash. Find which case did it, rebuild its input without
-                  ; running the body, then shrink with every candidate in its own
-                  ; process so a crashing candidate cannot take the shrinker down.
-                  (do
-                    (store! (stat-collecting) false)
-                    (let [k (find-crashing-case name (load (field cfg cases)))]
-                      (regenerate-case s prop cfg k)
-                      ; the bisection re-ran prefixes, so the case counter is
-                      ; whatever the last probe left behind; the number that
-                      ; means anything is which case crashed.
-                      (store! (field st cases) k)
-                      (fmt w
-                           "\n{} (signal {}) on case {}\n"
-                           (failure-kind code)
-                           (primitive/isub code 128)
-                           k)
-                      (report-failure w name file line prop s cfg st code)))
-                  ; The property called exit() or otherwise ended the process.
-                  (do
+    (if (args-has? "--fuzz")
+        ; PHASE 2, fuzzing: a supervised campaign replaces generation.
+        (fuzz-campaign name file line prop s cfg st w)
+      (let [stage-path (prop-stage-path name nofork)
+            stage (prop-stage-open stage-path)
+            staged (!= (primitive/cast i64 stage) 0)
+            code
+              (if nofork
+                  ; opting out: run in this process, where a debugger can see
+                  ; the crash. Trades crash minimization for a usable backtrace.
+                  (if (>= (run-cases s prop cfg st (load (field cfg cases))) 0)
+                      CHILD-FAILED
+                      CHILD-OK)
+                  (spawn-run-cases-staged name
+                                          (load (field cfg cases))
+                                          true
+                                          (if staged stage-path "")
+                                          stage))
+            ; did the worker leave the tape of the case it stopped on?
+            have-tape (and staged (!= (stage-get stage STAGE-PID) 0))]
+        (cond (= code CHILD-OK)
+                (do
+                  (prop-stage-remove! stage-path)
+                  ; when we spawned, the worker already printed the counts it
+                  ; owns; only the no-fork path still has to report from here.
+                  (if nofork (report-success w name cfg st) 0))
+              (and (= code CHILD-FAILED) have-tape)
+                ; An ordinary counterexample: the stage holds the failing case.
+                ; Minimize it in a worker, so a smaller input that crashes cannot
+                ; take this process down with the report unwritten.
+                (let [a (malloc-allocator)
+                      (mut tape) (stage-tape a stage)
+                      size (stage-get stage STAGE-SIZE)
+                      swarm (stage-get stage STAGE-SWARM)
+                      k (stage-get stage STAGE-CASE)]
+                  (prop-stage-remove! stage-path)
+                  (report-false-in-worker w name file line prop s cfg st (mut tape) size swarm k))
+              (or (= code CHILD-FAILED) (< code 0))
+                ; No stage (--no-fork, or no writable database) or no worker at
+                ; all: re-run to the failing case in this process — generation is
+                ; deterministic — and shrink here.
+                (do
+                  (prop-stage-remove! stage-path)
+                  (store! (stat-collecting) false)
+                  (run-cases s prop cfg st (load (field cfg cases)))
+                  (report-failure w name file line prop s cfg st -1))
+              (and (> code 128) have-tape)
+                ; A crash, or a case the watchdog gave up on: the stage holds it.
+                (report-staged-crash w name file line prop s cfg st code stage stage-path)
+              (> code 128)
+                ; No stage: find the case by bisection and rebuild it without
+                ; running the body — which loses anything the body itself drew.
+                (do
+                  (store! (stat-collecting) false)
+                  (let [k (find-crashing-case name (load (field cfg cases)))]
+                    (regenerate-case s prop cfg k)
+                    ; the bisection re-ran prefixes, so the case counter is
+                    ; whatever the last probe left behind; the number that
+                    ; means anything is which case crashed.
+                    (store! (field st cases) k)
                     (fmt w
-                         "\nFAILED: the property's process exited with code {}\n"
-                         code)
-                    (abort)
-                    0)))))
+                         "\n{} (signal {}) on case {}\n"
+                         (failure-kind code)
+                         (primitive/isub code 128)
+                         k)
+                    (report-failure w name file line prop s cfg st code)))
+              :else
+                ; The property called exit() or otherwise ended the process.
+                (do
+                  (prop-stage-remove! stage-path)
+                  (fmt w
+                       "\nFAILED: the property's process exited with code {}\n"
+                       code)
+                  (abort)
+                  0))))
     0))
+
+;;; Where a property's generation worker stages its cases: `<db>/<property>/stage`,
+;;; or "" under `--no-fork`, where there is no worker. Owning.
+(defn prop-stage-path [(name (slice u8)) (nofork bool)] (-> (slice u8))
+  (if nofork
+      ""
+      (let [a (malloc-allocator)
+            d (db-dir a name)
+            p (db-join a d "stage")]
+        (db-free-bytes a d)
+        p)))
+
+;;; Delete a stage file. It is scratch for one run: a stage outliving its run is a
+;;; 5 MB file (sparse, but not to every tool) left in someone's checkout.
+(defn prop-stage-remove! [(path (slice u8))] (-> i64)
+  (if (> (slice-len path) 0) (db-remove-tape (malloc-allocator) path) 0))
+
+;;; Map a fresh stage file at `path` for a generation worker, or null when there is
+;;; no path (`--no-fork`) or the file cannot be made — the caller then falls back to
+;;; finding a crashing case by bisection.
+(defn prop-stage-open [(path (slice u8))] (-> (ptr i64))
+  (if (= (slice-len path) 0)
+      (primitive/cast (ptr i64) 0)
+      (let [a (malloc-allocator)
+            dir (db-dir-of-path a path)]
+        (db-mkdir-p a dir)
+        (db-free-bytes a dir)
+        (let [st (stage-map a path)]
+          (if (= (primitive/cast i64 st) 0) 0 (stage-reset! st))
+          st))))
+
+;;; `path` followed by `suffix`. Owning.
+(defn cat-path [(a (dyn Allocator)) (path (slice u8)) (suffix (slice u8))] (-> (slice u8))
+  (let [(mut sb) (str/sb-new a)]
+    (str/sb-push-str! (mut sb) path)
+    (str/sb-push-str! (mut sb) suffix)
+    (str/sb-finish! (mut sb))))
+
+;;; `path` without its last component. Owning.
+(defn db-dir-of-path [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
+  (let [(mut cut) (slice-len path)]
+    (loop (if (or (<= (load cut) 0)
+                  (= (primitive/cast i64 (slice-get path (primitive/isub (load cut) 1))) 47))
+              (break)
+              (store! cut (primitive/isub (load cut) 1))))
+    (let [(mut sb) (str/sb-new a)]
+      (str/sb-push-str! (mut sb) (subslice path 0 (if (> (load cut) 0) (primitive/isub (load cut) 1) 0)))
+      (str/sb-finish! (mut sb)))))
+
+;;; Report a case that killed its generation worker, rebuilt from the stage.
+(defn report-staged-crash [(w (ptr Writer))
+                           (name (slice u8))
+                           (file (slice u8))
+                           (line i64)
+                           (prop (fnptr c [(ptr Source) i64] bool))
+                           (s (ptr Source))
+                           (cfg PropConfig)
+                           (st (ptr PropStats))
+                           (code i64)
+                           (stage (ptr i64))
+                           (stage-path (slice u8))] (-> i64)
+  (let [a (malloc-allocator)
+        (mut tape) (stage-tape a stage)
+        k (stage-get stage STAGE-CASE)
+        swarm (stage-get stage STAGE-SWARM)
+        size (stage-get stage STAGE-SIZE)]
+    (prop-stage-remove! stage-path)
+    (store! (stat-collecting) false)
+    ; the swarm mask steers which alternatives a generator may take, on replay too
+    (source-swarm! s swarm)
+    (source-begin-replay! s (mut tape) size)
+    ; DRAW: the arguments' spans and display, without running the body
+    (primitive/call-ptr prop s PROP-MODE-DRAW)
+    (store! (field st cases) k)
+    ; a shrink worker's stage names no generated case: the input came from shrinking
+    (if (= (stage-get stage STAGE-CASE) -1)
+        (fmt w
+             "\n{} (signal {}) on an input found while shrinking\n"
+             (failure-kind code)
+             (primitive/isub code 128))
+        (fmt w
+             "\n{} (signal {}) on case {}\n"
+             (failure-kind code)
+             (primitive/isub code 128)
+             k))
+    (report-failure-tape w name file line prop s cfg st code (mut tape))))
+
+; ── minimizing an ordinary failure in a worker ────────────────────────────────
+;
+; An ordinary counterexample (the property returned false) shrinks with every
+; candidate run in-process: a candidate costs ~100ns there, and a process each
+; would cost milliseconds. It used to run in-process in the RUNNER, and a smaller
+; candidate that crashed — common: shrink an input and you reach the edge cases —
+; took the runner down with it. No report, nothing saved; the property just died.
+;
+; So the shrink runs in ONE worker, with its Source staged. The worker prints the
+; report and saves the minimized tape itself, then exits CHILD-REPORTED. If a
+; candidate crashes or hangs, the worker dies and the stage holds that candidate:
+; a smaller input that does something worse than return false, which is then
+; reported — and minimized — as the crash it is.
+
+(const PROP-SHRINK-FLAG "--coil-prop-shrink")  ; minimize the ordinary failure at this path
+
+(const PROP-SWARM-FLAG "--coil-prop-swarm")  ; the swarm mask the failing case ran under
+
+(const PROP-COUNT-FLAG "--coil-prop-count")  ; cases run before the failure, for the report
+
+;;; A shrink worker printed and saved its report.
+(const CHILD-REPORTED 4)
+
+;;; Minimize the ordinary failure `tape` in a worker (see above). Never returns.
+(defn report-false-in-worker [(w (ptr Writer))
+                              (name (slice u8))
+                              (file (slice u8))
+                              (line i64)
+                              (prop (fnptr c [(ptr Source) i64] bool))
+                              (s (ptr Source))
+                              (cfg PropConfig)
+                              (st (ptr PropStats))
+                              (tape (ptr (ArrayList Choice)))
+                              (size i64)
+                              (swarm i64)
+                              (count i64)] (-> i64)
+  (let [a (malloc-allocator)
+        dir (db-dir a name)
+        tpath (db-join a dir "to-shrink")
+        spath (db-join a dir "shrink-stage")]
+    (db-mkdir-p a dir)
+    (let [stage (prop-stage-open spath)
+          code
+            (if (db-save-tape a tpath tape)
+                (do
+                  (prop-argv-begin!)
+                  (prop-argv-flag! PROP-CHILD-FLAG name)
+                  (prop-argv-flag! PROP-SHRINK-FLAG tpath)
+                  (prop-argv-int! PROP-SIZE-FLAG size)
+                  (prop-argv-int! PROP-SWARM-FLAG swarm)
+                  (prop-argv-int! PROP-COUNT-FLAG count)
+                  (if (= (primitive/cast i64 stage) 0)
+                      (prop-argv-int! PROP-ALARM-FLAG (watchdog-secs))
+                      (prop-argv-flag! PROP-STAGE-FLAG spath))
+                  (prop-spawn-watch (prop-argv-finish!) stage (watchdog-secs)))
+                CHILD-SPAWN-FAILED)]
+      (db-remove-tape a tpath)
+      (cond (= code CHILD-REPORTED)
+              (do (prop-stage-remove! spath) (abort) 0)
+            (= code CHILD-OK)
+              ; the worker replayed the input and it PASSED
+              (do
+                (prop-stage-remove! spath)
+                (print-str w
+                           "\nFAILED, but the failing input passes when replayed in a fresh process: the property depends on something other than its input (time, global state, uninitialized memory — try --sanitize=address).\n")
+                (abort)
+                0)
+            (and (>= code 0)
+                 (and (!= (primitive/cast i64 stage) 0) (!= (stage-get stage STAGE-PID) 0)))
+              (do
+                (fmt w
+                     "\n  while minimizing that failure, a smaller input {}: minimizing that instead\n"
+                     (if (= code FUZZ-HANG-CODE) "never finished" "crashed the property"))
+                (report-staged-crash w name file line prop s cfg st code stage spath))
+            :else
+              ; no worker could be started: shrink here, as before workers
+              (do
+                (prop-stage-remove! spath)
+                (source-swarm! s swarm)
+                (source-begin-replay! s tape size)
+                (primitive/call-ptr prop s PROP-MODE-RUN)
+                (store! (field st cases) count)
+                (report-failure-tape w name file line prop s cfg st -1 tape))))))
+
+;;; The shrink worker's side. Never returns.
+(defn prop-child-shrink [(s (ptr Source))
+                         (prop (fnptr c [(ptr Source) i64] bool))
+                         (cfg PropConfig)
+                         (st (ptr PropStats))
+                         (name (slice u8))
+                         (file (slice u8))
+                         (line i64)] (-> i64)
+  (let [a (malloc-allocator)
+        path (args-value PROP-SHRINK-FLAG)
+        size (args-int PROP-SIZE-FLAG (load (field cfg max-size)))
+        w (stdout)]
+    (store! (stat-collecting) false)
+    (source-swarm! s (args-int PROP-SWARM-FLAG -1))
+    (store! (field st cases) (args-int PROP-COUNT-FLAG 0))
+    (source-stage-case! s -1)
+    (match (db-load-tape a path)
+      (Err [e] (prop-child-broken path))
+      (Ok [o]
+          (match o
+            (None [] (prop-child-broken path))
+            (Some [t]
+                  (let [(mut tape) t]
+                    (source-begin-replay! s (mut tape) size)
+                    (let [held (primitive/call-ptr prop s PROP-MODE-RUN)]
+                      (if (or held (= (src-status s) ST-REJECTED))
+                          (do (os/_exit (primitive/cast i32 CHILD-OK)) 0)
+                          (report-failure-tape w name file line prop s cfg st -1 (mut tape)))))))))))
+
+;;; Spawn the worker whose argv was just built and wait for it, WATCHING its stage:
+;;; a worker whose case counter has not moved for `secs` seconds is stuck in one
+;;; case, and is killed and reported as a hang on that case (FUZZ-HANG-CODE). With
+;;; no stage there is nothing to watch, and the worker's own alarm is the watchdog.
+(defn prop-spawn-watch [(av (ptr (ptr i8))) (stage (ptr i64)) (secs i64)] (-> i64)
+  (if (= (primitive/cast i64 stage) 0)
+      (prop-spawn-wait av)
+      (let [pid (os/spawn (load (primitive/index av 0)) av (os/spawn-envp))]
+        (if (< pid 0)
+            CHILD-SPAWN-FAILED
+            (let [stp (primitive/alloc-stack i32)
+                  (mut seen) (stage-get stage STAGE-EXECS)
+                  (mut moved) (fuzz-now-ms)
+                  (mut nap) 1000
+                  (mut code) CHILD-SPAWN-FAILED]
+              (store! stp 0)
+              (loop (let [r
+                            (primitive/cast i64
+                                            (os/waitpid (primitive/cast i32 pid) stp 1))]
+                      (if (= r pid)
+                          (do (store! code (wait-code (primitive/cast i64 (load stp)))) (break))
+                          (let [e (stage-get stage STAGE-EXECS)
+                                now (fuzz-now-ms)]
+                            (if (!= e (load seen))
+                                (do (store! seen e) (store! moved now) 0)
+                                (if (and (> secs 0)
+                                         (> (primitive/isub now (load moved))
+                                            (primitive/imul secs 1000)))
+                                    (do
+                                      (os/kill (primitive/cast i32 pid) 9)
+                                      (os/waitpid (primitive/cast i32 pid) stp 0)
+                                      (store! code FUZZ-HANG-CODE)
+                                      (break))
+                                    0))
+                            (usleep (primitive/cast u32 (load nap)))
+                            ; poll fast at first — most workers are done in
+                            ; milliseconds — and back off to 50 ms
+                            (if (< (load nap) 50000)
+                                (store! nap (primitive/imul (load nap) 2))
+                                0)
+                            0))))
+              (load code))))))
 
 ;;; Swarm masks: the all-ones mask for every eighth case (so no alternative is ever
 ;;; unreachable), random subsets otherwise. Groce et al. found omission diversity
@@ -1399,10 +2046,18 @@
 ;;; has to be TIMED OUT costs whole seconds, so that budget collapses to a few dozen:
 ;;; with a hang, the shrinker's job is to produce a small input quickly, not the
 ;;; smallest input eventually.
+;;; Did this failure end a PROCESS rather than return false? 128+signal for a crash,
+;;; and — from a fuzzing worker, whose every exit is observed — any other exit
+;;; status too: AddressSanitizer, for one, reports and then exits 1 unless told to
+;;; abort. Such a failure can only be reproduced in a worker, so it is shrunk the
+;;; same way a crash is. -1 means an ordinary false.
+(defn crash-failure? [(crash-code i64)] (-> bool)
+  (>= crash-code 0))
+
 (defn shrink-budget-for [(cfg PropConfig) (crash-code i64)] (-> i64)
   (if (= crash-code 142)
       64
-      (if (> crash-code 128)
+      (if (crash-failure? crash-code)
           (primitive/udiv (load (field cfg shrink-budget)) 100)
           (load (field cfg shrink-budget)))))
 
@@ -1442,32 +2097,60 @@
                       (cfg PropConfig)
                       (st (ptr PropStats))
                       (crash-code i64)] (-> i64)
+  (report-failure-tape w name file line prop s cfg st crash-code (src-tape s)))
+
+;;; The same, shrinking from an explicit tape rather than the one the Source last
+;;; recorded. A crashed case's tape comes from its worker's stage: replaying it here
+;;; in DRAW mode (the body must not run) records only the arguments' choices, and
+;;; shrinking from that would drop every value the body drew — the crash would
+;;; vanish and the "minimized" input would be a different one. The Source's spans
+;;; from that replay still describe the arguments, which is what they are for.
+(defn report-failure-tape [(w (ptr Writer))
+                           (name (slice u8))
+                           (file (slice u8))
+                           (line i64)
+                           (prop (fnptr c [(ptr Source) i64] bool))
+                           (s (ptr Source))
+                           (cfg PropConfig)
+                           (st (ptr PropStats))
+                           (crash-code i64)
+                           (tape (ptr (ArrayList Choice)))] (-> i64)
   (let [mem (malloc-allocator)
         rc (box! mem RunCtx (zeroed RunCtx))
-        (mut failing) (tape-clone mem (src-tape s))
+        (mut failing) (tape-clone mem tape)
         (mut failing-spans) (spans-clone mem (src-spans s))]
     (store! (field rc src) s)
     (store! (field rc prop) prop)
     (store! (field rc size) (src-size s))
     (store! (field rc crash-code) crash-code)
-    (store! (field rc cand-timeout) (args-int "--candidate-timeout" 5))
+    ; A campaign already said how long an input may run: shrinking its hang with a
+    ; different limit would wait the wrong amount on every candidate.
+    (store! (field rc cand-timeout)
+            (args-int "--candidate-timeout"
+                      (if (args-has? "--fuzz") (args-int "--input-timeout" 10) 5)))
     (store! (field rc name) name)
     (store! (field rc cand-path) "")
     ; Only a crash hands candidates to workers, and only then is there a directory
     ; to prepare: an ordinary counterexample is shrunk entirely in this process.
-    (if (> crash-code 128)
+    (if (crash-failure? crash-code)
         (let [dir (db-dir mem name)]
           (db-mkdir-p mem dir)
           (db-free-bytes mem dir)
           (store! (field rc cand-path) (db-candidate-path mem name))
+          (let [sp (cat-path mem (load (field rc cand-path)) ".stage")]
+            (store! (field rc cand-stage-path) sp)
+            (store! (field rc cand-stage) (prop-stage-open sp)))
           0)
-        0)
+        (do
+          (store! (field rc cand-stage-path) "")
+          (store! (field rc cand-stage) (primitive/cast (ptr i64) 0))
+          0))
     (let [runner
-            (if (> crash-code 128)
+            (if (crash-failure? crash-code)
                 (primitive/fnptr-of run-candidate-spawned)
                 (primitive/fnptr-of run-candidate))
           budget
-            (if (> crash-code 128)
+            (if (crash-failure? crash-code)
                 (crash-shrink-budget w
                                      mem
                                      (load (field rc cand-path))
@@ -1477,7 +2160,6 @@
           sc (shrink-ctx-new mem s runner (primitive/cast (ptr i8) rc) budget)]
       (sc-seed-best! sc (mut failing) (mut failing-spans))
       (shrink-run! sc)
-      (if (> crash-code 128) (db-remove-tape mem (load (field rc cand-path))) 0)
       (store! (field st shrink-calls) (sc-calls sc))
       (store! (field st shrinks) (sc-accepted sc))
       ; Save the MINIMIZED tape, not the one that happened to fail: tomorrow's
@@ -1497,25 +2179,65 @@
       (source-begin-replay! s (sc-best sc) (load (field rc size)))
       (primitive/call-ptr prop
                           s
-                          (if (> crash-code 128)
+                          (if (crash-failure? crash-code)
                               PROP-MODE-DRAW-SHOW
                               PROP-MODE-SHOW))
-      (if (> crash-code 128)
+      (if (crash-failure? crash-code)
           (do
             (if (= crash-code 142)
                 (fmt w
                      "\n  the property NEVER FINISHED on this input (watchdog fired after {}s).\n"
-                     (args-int "--timeout" 60))
-                (fmt w
-                     "\n  the property CRASHED on this input (signal {}).\n"
-                     (primitive/isub crash-code 128)))
+                     (watchdog-secs))
+                (if (> crash-code 128)
+                    (fmt w
+                         "\n  the property CRASHED on this input (signal {}).\n"
+                         (primitive/isub crash-code 128))
+                    (fmt w
+                         "\n  the property's process EXITED with code {} on this input.\n"
+                         crash-code)))
             0)
           0)
+      ; Every candidate ran quietly. Run the MINIMIZED input once more with its
+      ; output shown, so the backtrace or sanitizer report on the terminal is the
+      ; one for the input being reported.
+      (if (crash-failure? crash-code)
+          (do
+            ; (a hang has no report to show: its re-run would only wait out the
+            ; watchdog again)
+            (if (and (!= crash-code 142)
+                     (db-save-tape mem (load (field rc cand-path)) (sc-best sc)))
+                (do
+                  (print-str w "\n  the minimized input, run once more:\n")
+                  (spawn-replay-showing name
+                                        (load (field rc cand-path))
+                                        (load (field rc size))
+                                        (load (field rc cand-timeout)))
+                  0)
+                0)
+            (db-remove-tape mem (load (field rc cand-path)))
+            (if (> (slice-len (load (field rc cand-stage-path))) 0)
+                (db-remove-tape mem (load (field rc cand-stage-path)))
+                0))
+          0)
       (fmt w "\n  property {}\n       at {}:{}\n" name file line)
-      (fmt w
-           "\n  reproduce:  coil test {} --seed {} --cases {}\n\n"
-           file
-           (load (field cfg seed))
-           (load (field cfg cases)))
-      (abort)
+      ; A fuzzing campaign's input is not a function of the seed — it came out of a
+      ; corpus and a mutation history — so the seed would reproduce nothing. The
+      ; minimized tape was saved above, and `coil test` replays a saved
+      ; counterexample before it generates anything.
+      (if (args-has? "--fuzz")
+          (fmt w
+               "\n  reproduce:  coil test {}{}   (replays the counterexample saved in the property database)\n\n"
+               (if (args-has? "--alloc-tracked")
+                   "--sanitize=address --alloc-tracked "
+                   "")
+               file)
+          (fmt w
+               "\n  reproduce:  coil test {} --seed {} --cases {}\n\n"
+               file
+               (load (field cfg seed))
+               (load (field cfg cases))))
+      ; a shrink worker's parent does the aborting, once it knows the report is out
+      (if (args-has? PROP-SHRINK-FLAG)
+          (do (os/_exit (primitive/cast i32 CHILD-REPORTED)) 0)
+          (do (abort) 0))
       1)))
