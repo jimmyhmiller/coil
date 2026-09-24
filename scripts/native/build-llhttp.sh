@@ -50,8 +50,11 @@ cc $cflags -I"$source_dir/build" -c "$source_dir/build/c/llhttp.c" -o "$object_d
 cc $cflags -I"$source_dir/build" -c "$source_dir/src/native/api.c" -o "$object_dir/api.o"
 cc $cflags -I"$source_dir/build" -c "$source_dir/src/native/http.c" -o "$object_dir/http.o"
 cc $cflags -I"$source_dir/build" -c "$repo_dir/scripts/native/llhttp_shim.c" -o "$object_dir/shim.o"
+# The trace driver tests/fuzz/http_upstream_fuzz.coil compares against.
+cc $cflags -I"$source_dir/build" -c "$repo_dir/tests/fuzz/native/http_fuzz_trace.c" -o "$object_dir/fuzz_trace.o"
 ar rcs "$output_dir/libllhttp.a" \
-  "$object_dir/llhttp.o" "$object_dir/api.o" "$object_dir/http.o" "$object_dir/shim.o"
+  "$object_dir/llhttp.o" "$object_dir/api.o" "$object_dir/http.o" "$object_dir/shim.o" \
+  "$object_dir/fuzz_trace.o"
 
 echo "built $output_dir/libllhttp.a"
 ls -lh "$output_dir/libllhttp.a"

@@ -1,0 +1,1500 @@
+(module http_fuzz)
+(import "coil.prop" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use *)
+(import "coil.alloc" :as alloc)
+(import "coil.str" :as str)
+(import "coil.http.parser" :as ll)
+(import "coil.http.parser.types" :as types)
+(import "coil.http.server" :as server)
+
+; Fuzz target for coil.http.parser (the pure-Coil llhttp 9.4.3 port) and the
+; request parser in coil.http.server built on it.
+;
+;   coil fuzz tests/fuzz/http_fuzz.coil --time 300 [--jobs 4] [--sanitize=address]
+;
+; These properties need nothing but the Coil standard library:
+;
+;   split-invariance(-raw)  one execute() call or arbitrary splits: same trace
+;   pause-transparent       pausing and resuming at any callback changes nothing
+;   roundtrip-requests      well-formed pipelines report exactly what was
+;   roundtrip-responses       generated, however they are split
+;   server-roundtrip        parse-request returns exactly the generated request
+;   malformed-rejected      sixteen strict-mode violations are refused
+;
+; Every input is fed through chunks copied into their own exactly-sized heap
+; blocks, so under --sanitize=address a read past the end of a chunk is caught
+; rather than landing on the next input byte.
+;
+; The DIFFERENTIAL properties -- the Coil parser against upstream C llhttp 9.4.3
+; on the same bytes, splits, pauses, callback results and injected callback
+; errors, and coil.http.server against scripts/native/llhttp_shim.c -- live in
+; http_upstream_fuzz.coil, which links upstream C and so needs the oracle
+; archive that scripts/native/build-llhttp.sh downloads and builds. Run them
+; with scripts/tests/http-upstream-fuzz.sh (see tests/fuzz/README.md).
+;
+; A value drawn in a property body is not a property argument, so a
+; counterexample does not show it. Replay with HTTP_FUZZ_VERBOSE=1 to print a
+; failing case's input and both traces, or HTTP_FUZZ_SHOW=1 to print every
+; input before it runs (for a hang).
+(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern abort :cc c [] (-> void))
+
+;;; A harness invariant broke (not a finding about the parser): say so and die.
+(defn fatal [(msg (slice u8))] (-> i64)
+  (println "http_fuzz: {}" msg)
+  (abort)
+  0)
+
+(defn verbose? [] (-> bool)
+  (!= (primitive/cast i64 (getenv c"HTTP_FUZZ_VERBOSE")) 0))
+
+(defn show-first? [] (-> bool)
+  (!= (primitive/cast i64 (getenv c"HTTP_FUZZ_SHOW")) 0))
+
+; ───────────────────────────────────────────────────────────── trace recorder
+
+;;; The callback trace of one run. Normally every callback is recorded (the
+;;; format is native/http_fuzz_trace.c's, byte for byte). With `core` only the
+;;; method/url/status/header/body spans and message completion are, with body
+;;; spans merged across chunk boundaries — what a well-formed message's generator
+;;; can predict exactly.
+;;; `pause-mask` makes simple callback number i (counting from 0) return
+;;; HPE_PAUSED when bit (i mod 64) is set; the driver resumes at once. `hc-ret`
+;;; is what on_headers_complete returns otherwise (0, 1 = skip body, 2 = upgrade).
+;;; Callback number `fail-at` (of any kind) returns `fail-code` instead.
+(defstruct Rec
+  [(buf str/StrBuf)
+   (kind i64)
+   (core bool)
+   (events i64)
+   (pause-mask i64)
+   (hc-ret i64)
+   (paused bool)
+   (calls i64)
+   (fail-at i64)
+   (fail-code i64)])
+
+(defn rec-of [(p (ptr types/Parser))] (-> (ptr Rec))
+  (primitive/cast (ptr Rec) (load (field p data))))
+
+(defn hexchar [(v i64)] (-> i64)
+  (if (< v 10) (+ 48 v) (+ 87 v)))
+
+(defn put! [(r (ptr Rec)) (c i64)] (-> i64)
+  (str/sb-push-byte! (mut (field r buf)) (primitive/cast u8 c)))
+
+(defn put-str! [(r (ptr Rec)) (s (slice u8))] (-> i64)
+  (str/sb-push-str! (mut (field r buf)) s))
+
+(defn put-hex-rec! [(r (ptr Rec)) (v i64)] (-> i64)
+  (if (= v 0)
+      0
+      (do
+        (put-hex-rec! r (primitive/udiv v 16))
+        (put! r (hexchar (primitive/urem v 16))))))
+
+;;; Unsigned hexadecimal, like nt_trace.c's put_hex_u64.
+(defn put-hex-u64! [(r (ptr Rec)) (v i64)] (-> i64)
+  (if (= v 0) (put! r 48) (put-hex-rec! r v)))
+
+;;; Signed: "-" and the magnitude, like nt_trace.c's put_i64.
+(defn put-i64! [(r (ptr Rec)) (v i64)] (-> i64)
+  (if (< v 0)
+      (do (put! r 45) (put-hex-u64! r (+ (- 0 (+ v 1)) 1)))
+      (put-hex-u64! r v)))
+
+(defn core-kind? [(kind i64)] (-> bool)
+  (or (= kind #\M)
+      (or (= kind #\U)
+          (or (= kind #\S) (or (= kind #\F) (or (= kind #\W) (= kind #\D)))))))
+
+(defn rec-span! [(p (ptr types/Parser)) (kind i64) (at (ptr u8)) (n i64)] (-> i64)
+  (let [r (rec-of p)]
+    (if (and (load (field r core)) (not (core-kind? kind)))
+        0
+        (do
+          (when (!= (load (field r kind)) kind)
+            (put! r kind)
+            (store! (field r kind) kind))
+          (let [(mut i) 0]
+            (loop (if (>= (load i) n)
+                      (break)
+                      (let [b
+                              (primitive/cast i64
+                                              (load (primitive/index at
+                                                                     (load i))))]
+                        (put! r (hexchar (primitive/udiv b 16)))
+                        (put! r (hexchar (primitive/urem b 16)))
+                        (store! i (+ (load i) 1))))))
+          (maybe-fail! r)))))
+
+;;; A non-span event. In a core trace only message completion is written, and only
+;;; header field/value completion separates spans (so body spans merge across
+;;; chunk headers, and adjacent headers never merge).
+(defn rec-simple! [(p (ptr types/Parser)) (marker i64)] (-> bool)
+  (let [r (rec-of p)]
+    (if (load (field r core))
+        (do
+          (when (or (= marker #\G) (or (= marker #\J) (= marker #\C)))
+            (store! (field r kind) 0))
+          (when (= marker #\C) (put! r marker))
+          false)
+        (do (store! (field r kind) 0) (put! r marker) true))))
+
+(defn cb-protocol [(p (ptr types/Parser)) (at (ptr u8)) (n i64)] (-> i64)
+  (rec-span! p #\P at n))
+
+(defn cb-url [(p (ptr types/Parser)) (at (ptr u8)) (n i64)] (-> i64)
+  (rec-span! p #\U at n))
+
+(defn cb-status [(p (ptr types/Parser)) (at (ptr u8)) (n i64)] (-> i64)
+  (rec-span! p #\S at n))
+
+(defn cb-method [(p (ptr types/Parser)) (at (ptr u8)) (n i64)] (-> i64)
+  (rec-span! p #\M at n))
+
+(defn cb-version [(p (ptr types/Parser)) (at (ptr u8)) (n i64)] (-> i64)
+  (rec-span! p #\V at n))
+
+(defn cb-header-field [(p (ptr types/Parser)) (at (ptr u8)) (n i64)] (-> i64)
+  (rec-span! p #\F at n))
+
+(defn cb-header-value [(p (ptr types/Parser)) (at (ptr u8)) (n i64)] (-> i64)
+  (rec-span! p #\W at n))
+
+(defn cb-ext-name [(p (ptr types/Parser)) (at (ptr u8)) (n i64)] (-> i64)
+  (rec-span! p #\X at n))
+
+(defn cb-ext-value [(p (ptr types/Parser)) (at (ptr u8)) (n i64)] (-> i64)
+  (rec-span! p #\Y at n))
+
+(defn cb-body [(p (ptr types/Parser)) (at (ptr u8)) (n i64)] (-> i64)
+  (rec-span! p #\D at n))
+
+(defn cb-message-begin [(p (ptr types/Parser))] (-> i64)
+  (rec-simple! p #\B)
+  (maybe-pause! p))
+
+(defn cb-protocol-complete [(p (ptr types/Parser))] (-> i64)
+  (rec-simple! p #\Q)
+  (maybe-pause! p))
+
+(defn cb-url-complete [(p (ptr types/Parser))] (-> i64)
+  (rec-simple! p #\R)
+  (maybe-pause! p))
+
+(defn cb-status-complete [(p (ptr types/Parser))] (-> i64)
+  (rec-simple! p #\T)
+  (maybe-pause! p))
+
+(defn cb-method-complete [(p (ptr types/Parser))] (-> i64)
+  (rec-simple! p #\N)
+  (maybe-pause! p))
+
+(defn cb-version-complete [(p (ptr types/Parser))] (-> i64)
+  (rec-simple! p #\O)
+  (maybe-pause! p))
+
+(defn cb-header-field-complete [(p (ptr types/Parser))] (-> i64)
+  (rec-simple! p #\G)
+  (maybe-pause! p))
+
+(defn cb-header-value-complete [(p (ptr types/Parser))] (-> i64)
+  (rec-simple! p #\J)
+  (maybe-pause! p))
+
+(defn cb-ext-name-complete [(p (ptr types/Parser))] (-> i64)
+  (rec-simple! p #\K)
+  (maybe-pause! p))
+
+(defn cb-ext-value-complete [(p (ptr types/Parser))] (-> i64)
+  (rec-simple! p #\L)
+  (maybe-pause! p))
+
+(defn cb-chunk-complete [(p (ptr types/Parser))] (-> i64)
+  (rec-simple! p #\E)
+  (maybe-pause! p))
+
+(defn cb-reset [(p (ptr types/Parser))] (-> i64)
+  (rec-simple! p #\A)
+  (maybe-pause! p))
+
+(defn b->i [(b bool)] (-> i64)
+  (if b 1 0))
+
+;;; Once per callback of any kind: the injected error code when this is
+;;; callback number `fail-at`, else 0.
+(defn maybe-fail! [(r (ptr Rec))] (-> i64)
+  (let [i (load (field r calls))]
+    (store! (field r calls) (+ i 1))
+    (if (= i (load (field r fail-at))) (load (field r fail-code)) 0)))
+
+;;; After a simple event: an injected error, HPE_PAUSED if the schedule says
+;;; so, else 0.
+(defn maybe-pause! [(p (ptr types/Parser))] (-> i64)
+  (let [r (rec-of p)
+        f (maybe-fail! r)
+        i (load (field r events))]
+    (store! (field r events) (+ i 1))
+    (cond (!= f 0) f
+          (= (primitive/iand (primitive/ishr (load (field r pause-mask))
+                                             (primitive/iand i 63))
+                             1)
+             1)
+            (do (store! (field r paused) true) ll/HPE_PAUSED)
+          :else 0)))
+
+(defn cb-message-complete [(p (ptr types/Parser))] (-> i64)
+  (when (rec-simple! p #\C)
+    (let [r (rec-of p)]
+      (put! r #\{)
+      (put-i64! r (b->i (ll/should-keep-alive? p)))
+      (put! r #\})))
+  (maybe-pause! p))
+
+(defn cb-chunk-header [(p (ptr types/Parser))] (-> i64)
+  (when (rec-simple! p #\Z)
+    (let [r (rec-of p)]
+      (put! r #\{)
+      (put-hex-u64! r (types/field-load p 0))
+      (put! r #\})))
+  (maybe-pause! p))
+
+(defn cb-headers-complete [(p (ptr types/Parser))] (-> i64)
+  (when (rec-simple! p #\H)
+    (let [r (rec-of p)]
+      (put! r #\{)
+      (put-i64! r (ll/get-type p))
+      (put! r 44)
+      (put-i64! r (ll/get-method p))
+      (put! r 44)
+      (put-i64! r (ll/get-http-major p))
+      (put! r 44)
+      (put-i64! r (ll/get-http-minor p))
+      (put! r 44)
+      (put-i64! r (ll/get-status-code p))
+      (put! r 44)
+      (put-i64! r (load (field p flags)))
+      (put! r 44)
+      (put-i64! r (ll/get-upgrade p))
+      (put! r 44)
+      (put-hex-u64! r (types/field-load p 0))
+      (put! r 44)
+      (put-i64! r (b->i (ll/should-keep-alive? p)))
+      (put! r 44)
+      (put-i64! r (b->i (ll/message-needs-eof? p)))
+      (put! r #\})))
+  (let [e (maybe-pause! p)]
+    (if (!= e 0) e (load (field (rec-of p) hc-ret)))))
+
+(defn install-callbacks! [(s (ptr types/Settings))] (-> i64)
+  (ll/settings-init s)
+  (ll/set-span-callback! s 1 (primitive/fnptr-of cb-protocol))
+  (ll/set-span-callback! s 2 (primitive/fnptr-of cb-url))
+  (ll/set-span-callback! s 3 (primitive/fnptr-of cb-status))
+  (ll/set-span-callback! s 4 (primitive/fnptr-of cb-method))
+  (ll/set-span-callback! s 5 (primitive/fnptr-of cb-version))
+  (ll/set-span-callback! s 6 (primitive/fnptr-of cb-header-field))
+  (ll/set-span-callback! s 7 (primitive/fnptr-of cb-header-value))
+  (ll/set-span-callback! s 8 (primitive/fnptr-of cb-ext-name))
+  (ll/set-span-callback! s 9 (primitive/fnptr-of cb-ext-value))
+  (ll/set-span-callback! s 11 (primitive/fnptr-of cb-body))
+  (ll/set-simple-callback! s 0 (primitive/fnptr-of cb-message-begin))
+  (ll/set-simple-callback! s 10 (primitive/fnptr-of cb-headers-complete))
+  (ll/set-simple-callback! s 12 (primitive/fnptr-of cb-message-complete))
+  (ll/set-simple-callback! s 13 (primitive/fnptr-of cb-protocol-complete))
+  (ll/set-simple-callback! s 14 (primitive/fnptr-of cb-url-complete))
+  (ll/set-simple-callback! s 15 (primitive/fnptr-of cb-status-complete))
+  (ll/set-simple-callback! s 16 (primitive/fnptr-of cb-method-complete))
+  (ll/set-simple-callback! s 17 (primitive/fnptr-of cb-version-complete))
+  (ll/set-simple-callback! s 18 (primitive/fnptr-of cb-header-field-complete))
+  (ll/set-simple-callback! s 19 (primitive/fnptr-of cb-header-value-complete))
+  (ll/set-simple-callback! s 20 (primitive/fnptr-of cb-ext-name-complete))
+  (ll/set-simple-callback! s 21 (primitive/fnptr-of cb-ext-value-complete))
+  (ll/set-simple-callback! s 22 (primitive/fnptr-of cb-chunk-header))
+  (ll/set-simple-callback! s 23 (primitive/fnptr-of cb-chunk-complete))
+  (ll/set-simple-callback! s 24 (primitive/fnptr-of cb-reset))
+  0)
+
+; ─────────────────────────────────────────────────────────────── the runner
+
+;;; A heap copy of `data[lo, hi)` in its own exactly-sized block (one byte for an
+;;; empty chunk, which is never read).
+(defn chunk-copy [(data (slice u8)) (lo i64) (hi i64)] (-> (slice u8))
+  (let [n (- hi lo)]
+    (match (alloc/alloc [u8] (alloc/malloc-allocator) (if (> n 0) n 1))
+      (Some [m]
+            (let [(mut i) 0]
+              (loop (if (>= (load i) n)
+                        (break)
+                        (do
+                          (slice-set! m
+                                      (load i)
+                                      (slice-get data (+ lo (load i))))
+                          (store! i (+ (load i) 1)))))
+              m))
+      (None []
+            (do
+              (fatal "out of memory copying a chunk")
+              (slice-new [u8] (primitive/cast (ptr u8) 0) 0))))))
+
+;;; Run the Coil parser over `data` cut at `cuts` and return its trace.
+(defn run-coil [(a (dyn alloc/Allocator))
+                (data (slice u8))
+                (ptype i64)
+                (lenient i64)
+                (cuts (slice i64))
+                (core bool)] (-> (slice u8))
+  (run-coil-ctl a data ptype lenient cuts core 0 0 true -1 0))
+
+;;; `run-coil` with a pause schedule, an on_headers_complete result and an
+;;; injected callback error. `finish-pause` lets a pause reach finish()'s
+;;; on_message_complete, where llhttp reports it rather than resuming.
+(defn run-coil-ctl [(a (dyn alloc/Allocator))
+                    (data (slice u8))
+                    (ptype i64)
+                    (lenient i64)
+                    (cuts (slice i64))
+                    (core bool)
+                    (pause-mask i64)
+                    (hc-ret i64)
+                    (finish-pause bool)
+                    (fail-at i64)
+                    (fail-code i64)] (-> (slice u8))
+  (when (show-first?)
+    (println "--- run type {} lenient {} pause {} hc {}"
+             ptype
+             lenient
+             pause-mask
+             hc-ret)
+    (show-bytes "input" data)
+    (show-cuts cuts)
+    0)
+  (let [parser (primitive/alloc-stack types/Parser)
+        settings (primitive/alloc-stack types/Settings)
+        r (primitive/alloc-stack Rec)
+        (mut err) 0
+        (mut err-off) -1
+        (mut fin) -1
+        (mut start) 0
+        (mut k) 0
+        ncuts (slice-len cuts)]
+    (store! r
+            (Rec
+              :buf (str/sb-new a)
+              :kind 0
+              :core core
+              :events 0
+              :pause-mask pause-mask
+              :hc-ret hc-ret
+              :paused false
+              :calls 0
+              :fail-at fail-at
+              :fail-code fail-code))
+    (install-callbacks! settings)
+    (ll/init parser ptype settings)
+    (types/field-store! parser 6 lenient)
+    (store! (field parser data) (primitive/cast (ptr i8) r))
+    (loop (if (> (load k) ncuts)
+              (break)
+              (let [end
+                      (if (< (load k) ncuts)
+                          (slice-get cuts (load k))
+                          (slice-len data))
+                    chunk (chunk-copy data (load start) end)
+                    n (- end (load start))
+                    base (primitive/cast i64 (slice-data chunk))
+                    (mut at) base
+                    (mut e) 0]
+                ; execute, resuming immediately after each pause WE requested
+                (loop (do
+                        (store! (field r paused) false)
+                        (store! e
+                                (ll/execute parser
+                                            (slice-new [u8]
+                                                       (primitive/cast (ptr u8)
+                                                                       (load at))
+                                                       (- (+ base n) (load at)))))
+                        (if (and (= (load e) ll/HPE_PAUSED)
+                                 (load (field r paused)))
+                            (do
+                              (store! at
+                                      (primitive/cast i64
+                                                      (ll/get-error-pos parser)))
+                              (ll/resume parser)
+                              0)
+                            (break))))
+                (let [e (load e)]
+                  (if (!= e 0)
+                      (let [pos (ll/get-error-pos parser)]
+                        (store! err e)
+                        (store! err-off
+                                (if (= (primitive/cast i64 pos) 0)
+                                    -1
+                                    (+ (load start)
+                                       (- (primitive/cast i64 pos)
+                                          (primitive/cast i64
+                                                          (slice-data chunk))))))
+                        (alloc/free [u8] (alloc/malloc-allocator) chunk)
+                        (break))
+                      (do
+                        (alloc/free [u8] (alloc/malloc-allocator) chunk)
+                        (store! start end)
+                        (store! k (+ (load k) 1))))))))
+    ; finish() may run on_message_complete (FINISH_SAFE_WITH_CB); a pause
+    ; there is reported by finish itself, which is not transparent by design.
+    (unless finish-pause (store! (field r pause-mask) 0) 0)
+    (when (= (load err) 0) (store! fin (ll/finish parser)))
+    (store! (field r kind) 0)
+    (put! r #\#)
+    (put-i64! r (load err))
+    (put! r 44)
+    (put-i64! r (load err-off))
+    (put! r 44)
+    (when (!= (load err) 0) (put-str! r (ll/get-error-reason parser)))
+    (put! r 44)
+    (put-i64! r (load fin))
+    (when (and (> (load fin) 0) (> (slice-len (ll/get-error-reason parser)) 0))
+      (put! r 44)
+      (put-str! r (ll/get-error-reason parser)))
+    (str/sb-str (load (field r buf)))))
+
+; ─────────────────────────────────────────────────────────────── generation
+(defn no-cuts [] (-> (slice i64))
+  (slice-new [i64] (primitive/cast (ptr i64) 0) 0))
+
+;;; HTTP_BOTH, HTTP_REQUEST or HTTP_RESPONSE.
+(defn draw-parser-type [(src (ptr Source))] (-> i64)
+  (case (draw-int! src 0 2) 0 ll/HTTP_BOTH 1 ll/HTTP_REQUEST ll/HTTP_RESPONSE))
+
+;;; Chunk boundaries: none, every byte, or a handful of random cuts. Strictly
+;;; increasing offsets in (0, n).
+(defn draw-cuts [(src (ptr Source)) (n i64)] (-> (slice i64))
+  (let [buf (primitive/cast (ptr i64) (prop-alloc src (* 8 (if (> n 0) n 1)) 8))
+        mode (draw-int! src 0 3)
+        (mut count) 0]
+    (cond (< n 2) 0
+          (= mode 0) 0
+          (= mode 1)
+            (let [(mut i) 1]
+              (loop (if (>= (load i) n)
+                        (break)
+                        (do
+                          (store! (primitive/index buf (load count)) (load i))
+                          (store! count (+ (load count) 1))
+                          (store! i (+ (load i) 1))))))
+          :else
+            (let [want (draw-int! src 1 (if (< (- n 1) 12) (- n 1) 12))
+                  (mut j) 0]
+              (loop (if (>= (load j) want)
+                        (break)
+                        (let [c (draw-int! src 1 (- n 1))
+                              (mut pos) (load count)]
+                          ; insertion into the sorted prefix, dropping duplicates
+                          (loop (if (and (> (load pos) 0)
+                                         (> (load (primitive/index buf
+                                                                   (- (load pos)
+                                                                      1)))
+                                            c))
+                                    (store! pos (- (load pos) 1))
+                                    (break)))
+                          (when (or (= (load pos) 0)
+                                    (!= (load (primitive/index buf
+                                                               (- (load pos) 1)))
+                                        c))
+                            (let [(mut m) (load count)]
+                              (loop (if (<= (load m) (load pos))
+                                        (break)
+                                        (do
+                                          (store! (primitive/index buf (load m))
+                                                  (load (primitive/index buf
+                                                                         (- (load m)
+                                                                            1))))
+                                          (store! m (- (load m) 1))))))
+                            (store! (primitive/index buf (load pos)) c)
+                            (store! count (+ (load count) 1)))
+                          (store! j (+ (load j) 1)))))))
+    (slice-new [i64] buf (load count))))
+
+;;; A lenient-flag mask: usually strict, otherwise any combination of the 11 bits.
+(defn draw-lenient [(src (ptr Source))] (-> i64)
+  (if (draw-bool-p! src 1 2) 0 (draw-int! src 0 2047)))
+
+;;; The builder a structured generator writes into. `exp` is the CORE trace the
+;;; message should produce (strict generators only), with its own merge state.
+(defstruct Gen
+  [(src (ptr Source))
+   (out str/StrBuf)
+   (exp str/StrBuf)
+   (exp-kind i64)
+   (strict bool)])
+
+(defn g-src [(g (ptr Gen))] (-> (ptr Source))
+  (load (field g src)))
+
+(defn emit! [(g (ptr Gen)) (s (slice u8))] (-> i64)
+  (str/sb-push-str! (mut (field g out)) s))
+
+(defn emit-byte! [(g (ptr Gen)) (c i64)] (-> i64)
+  (str/sb-push-byte! (mut (field g out)) (primitive/cast u8 c)))
+
+(defn emit-dec! [(g (ptr Gen)) (v i64)] (-> i64)
+  (str/sb-push-i64! (mut (field g out)) v))
+
+(defn emit-hex! [(g (ptr Gen)) (v i64) (upper bool)] (-> i64)
+  (if (= v 0)
+      0
+      (do
+        (emit-hex! g (primitive/udiv v 16) upper)
+        (let [d (primitive/urem v 16)]
+          (emit-byte! g (if (< d 10) (+ 48 d) (+ (if upper 55 87) d)))))))
+
+;;; Record expected core-trace bytes for a span of `kind`.
+(defn exp-span! [(g (ptr Gen)) (kind i64) (s (slice u8))] (-> i64)
+  ; llhttp reports an EMPTY header value as a zero-length on_header_value; no
+  ; other span kind is ever empty in a strict message.
+  (when (and (or (> (slice-len s) 0) (= kind #\W))
+             (!= (load (field g exp-kind)) kind))
+    (str/sb-push-byte! (mut (field g exp)) (primitive/cast u8 kind))
+    (store! (field g exp-kind) kind))
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (slice-len s))
+              (break)
+              (let [b (primitive/cast i64 (slice-get s (load i)))]
+                (str/sb-push-byte! (mut (field g exp))
+                                   (primitive/cast u8
+                                                   (hexchar (primitive/udiv b
+                                                                            16))))
+                (str/sb-push-byte! (mut (field g exp))
+                                   (primitive/cast u8
+                                                   (hexchar (primitive/urem b
+                                                                            16))))
+                (store! i (+ (load i) 1))))))
+  0)
+
+(defn exp-break! [(g (ptr Gen))] (-> i64)
+  (store! (field g exp-kind) 0)
+  0)
+
+(defn exp-complete! [(g (ptr Gen))] (-> i64)
+  (str/sb-push-byte! (mut (field g exp)) (primitive/cast u8 #\C))
+  (store! (field g exp-kind) 0)
+  0)
+
+(defn pick [(g (ptr Gen)) (n i64)] (-> i64)
+  (draw-int! (g-src g) 0 (- n 1)))
+
+(defn chance [(g (ptr Gen)) (num i64) (den i64)] (-> bool)
+  (draw-bool-p! (g-src g) num den))
+
+;;; Emit and return `n` bytes drawn from `alphabet`, one span element per byte.
+(defn emit-from! [(g (ptr Gen)) (alphabet (slice u8)) (lo i64) (hi i64)] (-> (slice u8))
+  (let [src (g-src g)
+        n (draw-len! src lo hi)
+        buf (prop-alloc src (if (> n 0) n 1) 1)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [sp (span-open! src "ch" SPAN-ELEM)]
+                (store! (primitive/index buf (load i))
+                        (slice-get alphabet
+                                   (draw-int! src 0 (- (slice-len alphabet) 1))))
+                (span-close! src sp)
+                (store! i (+ (load i) 1)))))
+    (let [s (slice-new [u8] buf n)]
+      (emit! g s)
+      s)))
+
+(defn tchars [] (-> (slice u8))
+  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+-.^_`|~")
+
+(defn url-chars [] (-> (slice u8))
+  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~!$&'()*+,;=:@/?%")
+
+(defn value-chars [] (-> (slice u8))
+  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+
+;;; Rarely, a few bytes from anywhere in 0..255 — the structural noise that
+;;; drives the parser off its happy path. Never in strict mode.
+(defn noise! [(g (ptr Gen))] (-> i64)
+  (if (or (load (field g strict)) (not (chance g 1 24)))
+      0
+      (do (emit! g (arb-bytes (g-src g) 1 4)) 0)))
+
+;;; A line terminator: CRLF almost always; LF, CR, CRCRLF otherwise.
+(defn eol! [(g (ptr Gen))] (-> i64)
+  (if (or (load (field g strict)) (chance g 7 8))
+      (emit! g "\r\n")
+      (case (pick g 4) 0
+            (emit! g "\n") 1
+            (emit! g "\r") 2
+            (emit! g "\r\r\n") (emit! g "\n\r"))))
+
+(defn ascii-lower-eq? [(a (slice u8)) (b (slice u8))] (-> bool)
+  (if (!= (slice-len a) (slice-len b))
+      false
+      (let [(mut i) 0
+            (mut same) true]
+        (loop (if (>= (load i) (slice-len a))
+                  (break)
+                  (let [x (primitive/cast i64 (slice-get a (load i)))
+                        y (primitive/cast i64 (slice-get b (load i)))
+                        lx (if (and (>= x 65) (<= x 90)) (+ x 32) x)
+                        ly (if (and (>= y 65) (<= y 90)) (+ y 32) y)]
+                    (if (= lx ly)
+                        (store! i (+ (load i) 1))
+                        (do (store! same false) (break))))))
+        (load same))))
+
+;;; Header names llhttp treats specially. A strict generator must not produce one
+;;; by accident (the comparison-guided mutator WILL find them).
+(defn special-header? [(name (slice u8))] (-> bool)
+  (or (ascii-lower-eq? name "content-length")
+      (or (ascii-lower-eq? name "transfer-encoding")
+          (or (ascii-lower-eq? name "connection")
+              (or (ascii-lower-eq? name "proxy-connection")
+                  (or (ascii-lower-eq? name "upgrade")
+                      (ascii-lower-eq? name "keep-alive")))))))
+
+(defn strict-method [(i i64)] (-> (slice u8))
+  (case i 0
+        "GET" 1
+        "POST" 2
+        "PUT" 3
+        "DELETE" 4
+        "PATCH" 5
+        "OPTIONS" 6
+        "HEAD" 7
+        "TRACE" 8
+        "PROPFIND" 9
+        "M-SEARCH" 10
+        "PURGE" 11
+        "QUERY" 12
+        "MKCALENDAR" 13
+        "LINK" 14
+        "UNLINK" "REPORT"))
+
+(defn gen-method! [(g (ptr Gen))] (-> (slice u8))
+  (if (load (field g strict))
+      (let [m (strict-method (pick g 16))]
+        (emit! g m)
+        m)
+      (case (pick g 8) 0
+            (emit-from! g "ABCDEFGHIJKLMNOPQRSTUVWXYZ-_" 1 10) 1
+            (emit-from! g (tchars) 0 8)
+              (let [m (ll/method-name (pick g 47))]
+                (emit! g m)
+                m))))
+
+(defn gen-url! [(g (ptr Gen))] (-> (slice u8))
+  (let [src (g-src g)
+        before (slice-len (str/sb-str (load (field g out))))]
+    (case (pick g (if (load (field g strict)) 3 6)) 0
+          (do (emit! g "/") (emit-from! g (url-chars) 0 24) 0) 1
+          (do
+            (emit! g "/")
+            (emit-from! g "abc/.-_~0123456789" 0 12)
+            (emit! g "?")
+            (emit-from! g "a=b&c=d%20" 0 12)
+            0)
+            2
+          (do
+            (emit! g "http://")
+            (emit-from! g "abcdefghijklmnop.-0123456789" 1 16)
+            (when (chance g 1 3)
+              (emit! g ":")
+              (emit-dec! g (draw-int! src 0 70000))
+              0)
+            (emit! g "/")
+            (emit-from! g (url-chars) 0 12)
+            0)
+            3
+          (do (emit! g "*") 0) 4
+          (do
+            (emit-from! g "abcdefghijklmnop.-0123456789" 1 16)
+            (emit! g ":")
+            (emit-dec! g (draw-int! src 0 70000))
+            0)
+            (do (emit! g (arb-bytes src 0 16)) 0))
+    (let [all (str/sb-str (load (field g out)))]
+      (subslice all before (slice-len all)))))
+
+(defn gen-version! [(g (ptr Gen)) (last bool)] (-> i64)
+  (if (load (field g strict))
+      (emit! g (if (and last (chance g 1 4)) "HTTP/1.0" "HTTP/1.1"))
+      (case (pick g 10) 0
+            (do
+              (emit! g "HTTP/")
+              (emit-dec! g (pick g 10))
+              (emit! g ".")
+              (emit-dec! g (pick g 10))
+              0)
+              1
+            (emit! g "HTTP/1.0") 2
+            (emit! g "RTSP/1.0") 3
+            (emit! g "ICE/1.0") 4
+            (do (emit-from! g "HTP/.0123456789 " 0 10) 0) 8
+            (do
+              (emit! g (case (pick g 4) 0 "HTTP/" 1 "RTSP/" 2 "ICE/" "HTTP/1"))
+              (emit-from! g "019.x/ " 0 4)
+              0)
+              5
+            (emit! g "HTTP/2.0") 6
+            (emit! g "HTTP/0.9") (emit! g "HTTP/1.1"))))
+
+(defn gen-request-line! [(g (ptr Gen)) (last bool)] (-> i64)
+  (let [m (gen-method! g)]
+    (exp-span! g #\M m)
+    (noise! g)
+    (emit! g " ")
+    (when (and (not (load (field g strict))) (chance g 1 16)) (emit! g " ") 0)
+    (let [u (gen-url! g)]
+      (exp-span! g #\U u)
+      (noise! g)
+      (emit! g " ")
+      (gen-version! g last)
+      (noise! g)
+      (eol! g))))
+
+(defn gen-status-line! [(g (ptr Gen)) (last bool)] (-> i64)
+  (gen-version! g last)
+  (noise! g)
+  (emit! g " ")
+  (if (load (field g strict))
+      (emit-dec! g (case (pick g 6) 0 200 1 201 2 202 3 404 4 500 299))
+      (case (pick g 6) 0
+            (emit-dec! g (draw-int! (g-src g) 100 599)) 1
+            (emit-dec! g
+                       (case (pick g 8) 0
+                             100 1
+                             101 2
+                             102 3
+                             103 4
+                             204 5
+                             304 6
+                             200 999))
+              2
+            (do (emit-from! g "0123456789" 0 5) 0)
+              (emit-dec! g (case (pick g 5) 0 200 1 404 2 500 3 301 204))))
+  (noise! g)
+  (if (and (not (load (field g strict))) (chance g 1 8))
+      0
+      (do
+        (emit! g " ")
+        (let [reason
+                (emit-from! g
+                            "abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                            (if (load (field g strict)) 1 0)
+                            16)]
+          (exp-span! g #\S reason)
+          0)))
+  (eol! g))
+
+;;; What the message's headers have committed it to, so the body can match.
+(defstruct Framing [(content-length i64) (chunked bool) (keep-alive bool)])
+
+(defn gen-cl-value! [(g (ptr Gen)) (f (ptr Framing))] (-> i64)
+  (if (or (load (field g strict)) (chance g 3 4))
+      (let [n (draw-int! (g-src g) 0 40)]
+        (emit-dec! g n)
+        (store! (field f content-length) n)
+        0)
+      (do
+        (case (pick g 10) 0
+              (emit! g "18446744073709551615") 1
+              (emit! g "18446744073709551616") 2
+              (emit! g "9223372036854775807") 3
+              (emit! g "9223372036854775808") 4
+              (emit! g "-1") 5
+              (emit! g "1 2") 6
+              (emit! g "0x10") 7
+              (emit! g "+5") 8
+              (emit! g "") (do (emit-from! g "0123456789 ,\t" 0 24) 0))
+        0)))
+
+(defn gen-te-value! [(g (ptr Gen)) (f (ptr Framing))] (-> i64)
+  (case (pick g 10) 0
+        (emit! g "gzip, chunked") 1
+        (emit! g "chunked, gzip") 2
+        (emit! g "identity") 3
+        (emit! g "CHUNKED") 4
+        (emit! g "chunkedx") 5
+        (emit! g "chunked , chunked") 6
+        (do (emit-from! g "chunkedgzip, \t" 0 20) 0) (emit! g "chunked"))
+  (store! (field f chunked) true)
+  0)
+
+(defn gen-connection-value! [(g (ptr Gen))] (-> i64)
+  (case (pick g 9) 0
+        (emit! g "close") 1
+        (emit! g "keep-alive") 2
+        (emit! g "upgrade") 3
+        (emit! g "Upgrade, keep-alive") 4
+        (emit! g "close, upgrade") 5
+        (emit! g "cLoSe") 6
+        (emit! g "keep-alive, close") 7
+        (emit! g ",,  ,upgrade ,")
+          (do (emit-from! g "closekep-aliveupgrd, " 0 20) 0)))
+
+;;; One header line in chaos mode: special names with plausible and hostile
+;;; values, and every separator llhttp distinguishes.
+(defn gen-header-chaos! [(g (ptr Gen)) (f (ptr Framing))] (-> i64)
+  (let [which (pick g 12)]
+    (case which 0
+          (emit! g "Content-Length") 1
+          (emit! g "content-length") 2
+          (emit! g "Transfer-Encoding") 3
+          (emit! g "Connection") 4
+          (emit! g "Upgrade") 5
+          (emit! g "Proxy-Connection") 6
+          (emit! g "Host") 7
+          (emit! g "Keep-Alive") 8
+          (do (emit-from! g (tchars) 0 12) 0) 9
+          (do (emit-from! g "Content-LengthTransfer-Encoding: \t" 0 20) 0)
+            (do (emit-from! g (tchars) 1 12) 0))
+    (noise! g)
+    (case (pick g 8) 0
+          (emit! g ":") 1
+          (emit! g " :") 2
+          (emit! g ":\t") 3
+          (emit! g ":  ") (emit! g ": "))
+    (case which 0
+          (gen-cl-value! g f) 1
+          (gen-cl-value! g f) 2
+          (gen-te-value! g f) 3
+          (gen-connection-value! g) 4
+          (emit! g (if (chance g 1 2) "websocket" "h2c")) 5
+          (gen-connection-value! g)
+            (if (chance g 1 4)
+                (do (emit! g (arb-bytes (g-src g) 0 12)) 0)
+                (do (emit-from! g (value-chars) 0 20) 0)))
+    (noise! g)
+    (when (chance g 1 16)
+      ; trailing whitespace, or an obs-fold continuation line
+      (if (chance g 1 2)
+          (emit! g " \t ")
+          (do
+            (eol! g)
+            (emit! g (if (chance g 1 2) " " "\t"))
+            (emit-from! g (value-chars) 0 8)
+            0)))
+    (eol! g)))
+
+;;; One strictly valid header line with a predictable core trace.
+(defn gen-header-strict! [(g (ptr Gen))] (-> i64)
+  (let [src (g-src g)
+        before (slice-len (str/sb-str (load (field g out))))
+        name0 (emit-from! g (tchars) 1 12)
+        name
+          (if (special-header? name0)
+              (do
+                (emit! g "-x")
+                (let [all (str/sb-str (load (field g out)))]
+                  (subslice all before (slice-len all))))
+              name0)]
+    (exp-span! g #\F name)
+    (exp-break! g)
+    (emit! g (if (chance g 1 2) ": " ":"))
+    ; a value of visible characters with single interior spaces, never
+    ; leading or trailing whitespace
+    (let [vstart (slice-len (str/sb-str (load (field g out))))
+          words (draw-len! src 0 3)
+          (mut w) 0]
+      (loop (if (>= (load w) words)
+                (break)
+                (let [sp (span-open! src "word" SPAN-ELEM)]
+                  (when (> (load w) 0) (emit! g " ") 0)
+                  (emit-from! g (value-chars) 1 8)
+                  (span-close! src sp)
+                  (store! w (+ (load w) 1)))))
+      (let [all (str/sb-str (load (field g out)))
+            value (subslice all vstart (slice-len all))]
+        (exp-span! g #\W value)
+        (exp-break! g)))
+    (eol! g)))
+
+(defn gen-body-bytes! [(g (ptr Gen)) (n i64)] (-> (slice u8))
+  (let [src (g-src g)
+        buf (prop-alloc src (if (> n 0) n 1) 1)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (store! (primitive/index buf (load i))
+                        (primitive/cast u8 (draw-int-origin! src 0 255 97)))
+                (store! i (+ (load i) 1)))))
+    (let [s (slice-new [u8] buf n)]
+      (emit! g s)
+      s)))
+
+(defn gen-chunk-ext! [(g (ptr Gen))] (-> i64)
+  (let [src (g-src g)
+        exts (draw-len! src 0 2)
+        (mut i) 0]
+    (loop (if (>= (load i) exts)
+              (break)
+              (let [sp (span-open! src "ext" SPAN-ELEM)]
+                (when (and (not (load (field g strict))) (chance g 1 8))
+                  (emit! g " ")
+                  0)
+                (emit! g ";")
+                (emit-from! g (tchars) (if (load (field g strict)) 1 0) 6)
+                (case (pick g 3) 0
+                      0 1
+                      (do
+                        (emit! g "=")
+                        (emit-from! g
+                                    (tchars)
+                                    (if (load (field g strict)) 1 0)
+                                    6)
+                        0)
+                        (do
+                          (emit! g "=\"")
+                          (emit-from! g
+                                      (if (load (field g strict))
+                                          "abc def"
+                                          "abc def\\\"\x01;\x7f;\t")
+                                      0
+                                      6)
+                          (emit! g "\"")
+                          0))
+                (span-close! src sp)
+                (store! i (+ (load i) 1)))))
+    0))
+
+(defn gen-chunked-body! [(g (ptr Gen))] (-> i64)
+  (let [src (g-src g)
+        chunks (draw-len! src 0 4)
+        (mut i) 0]
+    (loop (if (>= (load i) chunks)
+              (break)
+              (let [sp (span-open! src "chunk" SPAN-ELEM)
+                    n (draw-int! src 1 24)
+                    lie (and (not (load (field g strict))) (chance g 1 16))]
+                (if (and (not (load (field g strict))) (chance g 1 16))
+                    (do (emit-from! g "0123456789abcdefABCDEFxz -" 0 6) 0)
+                    (do
+                      (when (chance g 1 8) (emit! g "00") 0)
+                      (emit-hex! g (if lie (+ n (pick g 3)) n) (chance g 1 2))
+                      0))
+                (gen-chunk-ext! g)
+                (eol! g)
+                (let [data (gen-body-bytes! g n)]
+                  (exp-span! g #\D data))
+                (noise! g)
+                (eol! g)
+                (span-close! src sp)
+                (store! i (+ (load i) 1)))))
+    (emit! g (if (chance g 1 8) "000" "0"))
+    (gen-chunk-ext! g)
+    (eol! g)
+    (when (not (load (field g strict)))
+      (let [trailers (draw-len! src 0 2)
+            (mut t) 0
+            f (primitive/alloc-stack Framing)]
+        (store! f
+                (Framing
+                  :content-length -1
+                  :chunked false
+                  :keep-alive true))
+        (loop (if (>= (load t) trailers)
+                  (break)
+                  (let [sp (span-open! src "trailer" SPAN-ELEM)]
+                    (gen-header-chaos! g f)
+                    (span-close! src sp)
+                    (store! t (+ (load t) 1)))))
+        0))
+    (eol! g)))
+
+;;; One message. `request` picks the start line; `last` allows the strict
+;;; generator to end the stream with a connection-closing message.
+(defn gen-message! [(g (ptr Gen)) (request bool) (last bool)] (-> i64)
+  (let [src (g-src g)
+        f (primitive/alloc-stack Framing)
+        strict (load (field g strict))]
+    (store! f
+            (Framing
+              :content-length -1
+              :chunked false
+              :keep-alive true))
+    (if request (gen-request-line! g last) (gen-status-line! g last))
+    (let [nh (draw-len! src 0 (if strict 5 7))
+          (mut i) 0]
+      (loop (if (>= (load i) nh)
+                (break)
+                (let [sp (span-open! src "header" SPAN-ELEM)]
+                  (if strict (gen-header-strict! g) (gen-header-chaos! g f))
+                  (span-close! src sp)
+                  (store! i (+ (load i) 1))))))
+    ; A strict message declares its framing last, so the header list above can
+    ; be mutated freely without desynchronizing it from the body.
+    ; (a strict RESPONSE always declares framing: without it the body runs to EOF)
+    (when strict
+      (case (pick g (if request 3 2)) 0
+            (do
+              (let [n (draw-int! src 0 40)]
+                (emit! g "Content-Length: ")
+                (exp-span! g #\F "Content-Length")
+                (exp-break! g)
+                (emit-dec! g n)
+                (let [(mut d) (str/sb-new (src-alloc src))]
+                  (str/sb-push-i64! (mut d) n)
+                  (exp-span! g #\W (str/sb-str (load d))))
+                (exp-break! g)
+                (store! (field f content-length) n)
+                (eol! g))
+              0)
+              1
+            (do
+              (emit! g "Transfer-Encoding: chunked")
+              (exp-span! g #\F "Transfer-Encoding")
+              (exp-break! g)
+              (exp-span! g #\W "chunked")
+              (exp-break! g)
+              (store! (field f chunked) true)
+              (eol! g)
+              0)
+              0))
+    (noise! g)
+    (eol! g)
+    (cond (load (field f chunked))
+            (if (or strict (chance g 7 8))
+                (gen-chunked-body! g)
+                (do (gen-body-bytes! g (draw-int! src 0 16)) 0))
+          (>= (load (field f content-length)) 0)
+            (let [n (load (field f content-length))
+                  m (if (or strict (chance g 7 8)) n (draw-int! src 0 (+ n 4)))]
+              (exp-span! g #\D (gen-body-bytes! g m))
+              0)
+          :else
+            (if (or strict (chance g 3 4))
+                0
+                (do (gen-body-bytes! g (draw-int! src 0 16)) 0)))
+    (exp-complete! g)
+    0))
+
+;;; A pipeline of messages: requests, responses, or (HTTP_BOTH) either.
+(defn gen-stream [(src (ptr Source)) (strict bool) (ptype i64)] (-> (ptr Gen))
+  (let [g (primitive/cast (ptr Gen) (prop-alloc src (primitive/sizeof Gen) 8))
+        a (src-alloc src)]
+    (store! g
+            (Gen
+              :src src
+              :out (str/sb-new a)
+              :exp (str/sb-new a)
+              :exp-kind 0
+              :strict strict))
+    (let [count (draw-len! src 1 (if strict 3 4))
+          (mut i) 0]
+      (loop (if (>= (load i) count)
+                (break)
+                (let [sp (span-open! src "message" SPAN-ELEM)
+                      request
+                        (cond (= ptype ll/HTTP_REQUEST) true
+                              (= ptype ll/HTTP_RESPONSE) false
+                              :else (draw-bool! src))]
+                  (when (and (not strict) (chance g 1 16)) (emit! g "\r\n") 0)
+                  (if (and (not strict) (and request (chance g 1 32)))
+                      ; the HTTP/2 connection preface
+                      (do (emit! g "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") 0)
+                      (gen-message! g request (= (load i) (- count 1))))
+                  (span-close! src sp)
+                  (store! i (+ (load i) 1)))))
+      (when (and (not strict) (chance g 1 8)) (emit! g (arb-bytes src 0 8)) 0))
+    g))
+
+(defn gen-out [(g (ptr Gen))] (-> (slice u8))
+  (str/sb-str (load (field g out))))
+
+(defn gen-exp [(g (ptr Gen))] (-> (slice u8))
+  (str/sb-str (load (field g exp))))
+
+; ─────────────────────────────────────────────────────────────── reporting
+(defn show-bytes [(label (slice u8)) (s (slice u8))] (-> i64)
+  (let [(mut sb) (str/sb-new (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) (slice-len s))
+              (break)
+              (let [b (primitive/cast i64 (slice-get s (load i)))]
+                (if (and (>= b 32) (and (< b 127) (!= b 92)))
+                    (str/sb-push-byte! (mut sb) (primitive/cast u8 b))
+                    (do
+                      (str/sb-push-str! (mut sb) "\\x")
+                      (str/sb-push-byte! (mut sb)
+                                         (primitive/cast u8
+                                                         (hexchar (primitive/udiv b
+                                                                                  16))))
+                      (str/sb-push-byte! (mut sb)
+                                         (primitive/cast u8
+                                                         (hexchar (primitive/urem b
+                                                                                  16))))
+                      0))
+                (store! i (+ (load i) 1)))))
+    (println "{} ({} bytes): {}" label (slice-len s) (str/sb-str (load sb)))
+    (str/sb-free! (mut sb))
+    0))
+
+(defn show-cuts [(cuts (slice i64))] (-> i64)
+  (let [(mut sb) (str/sb-new (alloc/malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) (slice-len cuts))
+              (break)
+              (do
+                (str/sb-push-i64! (mut sb) (slice-get cuts (load i)))
+                (str/sb-push-str! (mut sb) " ")
+                (store! i (+ (load i) 1)))))
+    (println "cuts: {}" (str/sb-str (load sb)))
+    (str/sb-free! (mut sb))
+    0))
+
+(defn report [(what (slice u8))
+              (data (slice u8))
+              (ptype i64)
+              (lenient i64)
+              (cuts (slice i64))
+              (left (slice u8))
+              (right (slice u8))] (-> bool)
+  (when (verbose?)
+    (println "=== {} (type {} lenient {})" what ptype lenient)
+    (show-bytes "input" data)
+    (show-cuts cuts)
+    (println "left:  {}" left)
+    (println "right: {}" right)
+    0)
+  false)
+
+;;; Compare two traces, reporting on mismatch.
+(defn same-trace [(what (slice u8))
+                  (data (slice u8))
+                  (ptype i64)
+                  (lenient i64)
+                  (cuts (slice i64))
+                  (left (slice u8))
+                  (right (slice u8))] (-> bool)
+  (if (str/str-eq left right)
+      true
+      (report what data ptype lenient cuts left right)))
+
+;;; The end record of a run with no error whose finish() is clean.
+(defn clean-end [] (-> (slice u8))
+  "#0,-1,,0")
+
+;;; The end record of a trace: everything from its last '#'.
+(defn trace-end [(t (slice u8))] (-> (slice u8))
+  (let [(mut j) (- (slice-len t) 1)]
+    (loop (if (or (< (load j) 0)
+                  (= (primitive/cast i64 (slice-get t (load j))) #\#))
+              (break)
+              (store! j (- (load j) 1))))
+    (if (< (load j) 0) t (subslice t (load j) (slice-len t)))))
+
+;;; llhttp flushes an in-progress span at the end of every chunk, so when a span
+;;; later ends in an ERROR, a split run has reported part of it and a whole run
+;;; has not (upstream behaves identically). Drop the run of span events directly
+;;; before the end record of an errored trace; everything else must match.
+(defn span-letter? [(c i64)] (-> bool)
+  (or (= c #\P)
+      (or (= c #\U)
+          (or (= c #\S)
+              (or (= c #\M)
+                  (or (= c #\V)
+                      (or (= c #\F)
+                          (or (= c #\W) (or (= c #\X) (or (= c #\Y) (= c #\D)))))))))))
+
+(defn lower-hex? [(c i64)] (-> bool)
+  (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102))))
+
+(defn normalize-errored [(a (dyn alloc/Allocator)) (t (slice u8))] (-> (slice u8))
+  (let [(mut j) (- (slice-len t) 1)]
+    (loop (if (or (< (load j) 0)
+                  (= (primitive/cast i64 (slice-get t (load j))) #\#))
+              (break)
+              (store! j (- (load j) 1))))
+    (if (or (< (load j) 0)
+            (and (= (primitive/cast i64 (slice-get t (+ (load j) 1))) 48)
+                 (= (primitive/cast i64 (slice-get t (+ (load j) 2))) 44)))
+        t
+        (let [(mut i) (- (load j) 1)]
+          (loop (if (and (>= (load i) 0)
+                         (let [c (primitive/cast i64 (slice-get t (load i)))]
+                           (or (lower-hex? c) (span-letter? c))))
+                    (store! i (- (load i) 1))
+                    (break)))
+          (let [(mut sb) (str/sb-new a)]
+            (str/sb-push-str! (mut sb) (subslice t 0 (+ (load i) 1)))
+            (str/sb-push-str! (mut sb) (subslice t (load j) (slice-len t)))
+            (str/sb-str (load sb)))))))
+
+; ─────────────────────────────────────────────────────────────── properties
+
+;; 1. SPLIT INVARIANCE. Feeding a stream in one call or in arbitrary pieces
+;; (including one byte at a time) yields the same span-merged callback trace,
+;; error, error offset and finish result — modulo the in-progress span an error
+;; cuts off (see normalize-errored). Streams are generated pipelines of requests
+;; and responses with special headers, chunked and content-length bodies, chunk
+;; extensions, trailers, bad framing and noise.
+(defprop split-invariance
+         [(seed i64)]
+         (let [src (prop-src)
+               a (src-alloc src)
+               ptype (draw-parser-type src)
+               g (gen-stream src false ptype)
+               data (gen-out g)
+               lenient (draw-lenient src)
+               cuts (draw-cuts src (slice-len data))
+               whole
+                 (normalize-errored a
+                                    (run-coil a
+                                              data
+                                              ptype
+                                              lenient
+                                              (no-cuts)
+                                              false))
+               split
+                 (normalize-errored a
+                                    (run-coil a data ptype lenient cuts false))]
+           (same-trace "coil whole vs coil split"
+                       data
+                       ptype
+                       lenient
+                       cuts
+                       whole
+                       split)))
+
+;; 1b. The same over arbitrary bytes (0-255), any parser type and leniency: the
+;; parser also never crashes, overreads a chunk (run it under
+;; --sanitize=address) or hangs.
+(defprop split-invariance-raw
+         [(seed i64)]
+         (let [src (prop-src)
+               a (src-alloc src)
+               data (arb-bytes src 0 96)
+               ptype (draw-parser-type src)
+               lenient (draw-lenient src)
+               cuts (draw-cuts src (slice-len data))
+               whole
+                 (normalize-errored a
+                                    (run-coil a
+                                              data
+                                              ptype
+                                              lenient
+                                              (no-cuts)
+                                              false))
+               split
+                 (normalize-errored a
+                                    (run-coil a data ptype lenient cuts false))]
+           (same-trace "coil whole vs coil split (raw)"
+                       data
+                       ptype
+                       lenient
+                       cuts
+                       whole
+                       split)))
+
+;; 2. PAUSE TRANSPARENCY. Pausing at any callback and resuming at the reported
+;; error position, as llhttp's API prescribes, changes nothing the parser reports.
+(defprop pause-transparent
+         [(seed i64)]
+         (let [src (prop-src)
+               a (src-alloc src)
+               ptype (draw-parser-type src)
+               g (gen-stream src false ptype)
+               data (gen-out g)
+               lenient (draw-lenient src)
+               cuts (draw-cuts src (slice-len data))
+               pause-mask (if (draw-bool-p! src 1 4) -1 (draw-int-any! src))
+               plain
+                 (run-coil-ctl a data ptype lenient cuts false 0 0 false -1 0)
+               paused
+                 (run-coil-ctl a
+                               data
+                               ptype
+                               lenient
+                               cuts
+                               false
+                               pause-mask
+                               0
+                               false
+                               -1
+                               0)]
+           (same-trace "coil unpaused vs paused"
+                       data
+                       ptype
+                       lenient
+                       cuts
+                       plain
+                       paused)))
+
+;; 3. ROUND TRIP. For a pipeline of well-formed messages, however it is split,
+;; the parser reports exactly the generated methods, targets, reason phrases,
+;; header names and values, and bodies (de-chunked), completes every message,
+;; and finishes cleanly.
+(defprop roundtrip-requests
+         [(seed i64)]
+         (let [src (prop-src)
+               a (src-alloc src)
+               g (gen-stream src true ll/HTTP_REQUEST)
+               data (gen-out g)
+               cuts (draw-cuts src (slice-len data))
+               (mut expected) (str/sb-new a)]
+           (str/sb-push-str! (mut expected) (gen-exp g))
+           (str/sb-push-str! (mut expected) (clean-end))
+           (same-trace "roundtrip (requests)"
+                       data
+                       ll/HTTP_REQUEST
+                       0
+                       cuts
+                       (run-coil a data ll/HTTP_REQUEST 0 cuts true)
+                       (str/sb-str (load expected)))))
+
+(defprop roundtrip-responses
+         [(seed i64)]
+         (let [src (prop-src)
+               a (src-alloc src)
+               g (gen-stream src true ll/HTTP_RESPONSE)
+               data (gen-out g)
+               cuts (draw-cuts src (slice-len data))
+               (mut expected) (str/sb-new a)]
+           (str/sb-push-str! (mut expected) (gen-exp g))
+           (str/sb-push-str! (mut expected) (clean-end))
+           (same-trace "roundtrip (responses)"
+                       data
+                       ll/HTTP_RESPONSE
+                       0
+                       cuts
+                       (run-coil a data ll/HTTP_RESPONSE 0 cuts true)
+                       (str/sb-str (load expected)))))
+
+;; 4. SERVER ROUND TRIP. A well-formed request (with more pipelined after it)
+;; is accepted with exactly its method, target, headers and body, and consumed
+;; ends exactly where the first message ends.
+(defprop server-roundtrip
+         [(seed i64)]
+         (let [src (prop-src)
+               a (src-alloc src)
+               g (gen-stream src true ll/HTTP_REQUEST)
+               data (gen-out g)]
+           (match (server/parse-request a data)
+             (Err [e]
+                  (do
+                    (when (verbose?)
+                      (println "=== server rejected a well-formed request: code {} offset {}"
+                               (server/error-code e)
+                               (server/error-offset e))
+                      (show-bytes "input" data)
+                      0)
+                    false))
+             (Ok [r]
+                 (let [(mut i) 0]
+                   ; rebuild the core trace of the FIRST message from the Request
+                   (let [g2
+                           (primitive/cast (ptr Gen)
+                                           (prop-alloc src
+                                                       (primitive/sizeof Gen)
+                                                       8))]
+                     (store! g2
+                             (Gen
+                               :src src
+                               :out (str/sb-new a)
+                               :exp (str/sb-new a)
+                               :exp-kind 0
+                               :strict true))
+                     (exp-span! g2 #\M (server/method r))
+                     (exp-span! g2 #\U (server/target r))
+                     (loop (if (>= (load i) (server/header-count r))
+                               (break)
+                               (let [h (server/header-at r (load i))]
+                                 (exp-span! g2 #\F (load (field h name)))
+                                 (exp-break! g2)
+                                 (exp-span! g2 #\W (load (field h value)))
+                                 (exp-break! g2)
+                                 (store! i (+ (load i) 1)))))
+                     (when (> (slice-len (server/body r)) 0)
+                       (exp-span! g2 #\D (server/body r))
+                       0)
+                     (exp-complete! g2)
+                     (let [got (gen-exp g2)
+                           want (gen-exp g)
+                           ok
+                             (and (<= (slice-len got) (slice-len want))
+                                  (and (str/str-eq got
+                                                   (subslice want
+                                                             0
+                                                             (slice-len got)))
+                                       (<= (server/consumed r) (slice-len data))))]
+                       ; consumed: re-parsing the prefix alone must yield the same request
+                       (let [ok2
+                               (and ok
+                                    (match (server/parse-request a
+                                                                 (subslice data
+                                                                           0
+                                                                           (server/consumed r)))
+                                      (Ok [r2]
+                                          (do (server/request-free r2) true))
+                                      (Err [e2] false)))]
+                         (when (and (not ok2) (verbose?))
+                           (show-bytes "input" data)
+                           (println "want prefix of: {}" want)
+                           (println "got:            {}" got)
+                           (println "consumed {}" (server/consumed r))
+                           0)
+                         (server/request-free r)
+                         ok2))))))))
+
+;; 7. MALFORMED INPUT IS REJECTED. A well-formed request with exactly one
+;; defect injected — each a protocol violation llhttp's strict mode must refuse —
+;; is refused, however it is split, by the parser (an error, or an unclean
+;; finish) and by coil.http.server (an Err with a real error code).
+(defn defect-input [(src (ptr Source)) (defect i64)] (-> (slice u8))
+  (let [a (src-alloc src)
+        (mut sb) (str/sb-new a)
+        body (arb-string src 0 8)]
+    (str/sb-push-str! (mut sb)
+                      (case defect 0
+                            "get / HTTP/1.1\r\n" 1
+                            "GET / HTTP/1.x\r\n" 2
+                            "GET /\x01; HTTP/1.1\r\n" 3
+                            "GET / HTTP/1.1\r\nBad Name: x\r\n" 4
+                            "GET / HTTP/1.1\r\nNoColon\r\n" 5
+                            "GET / HTTP/1.1\r\nContent-Length: abc\r\n" 6
+                            "GET / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n"
+                              7
+                            "POST / HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n"
+                              8
+                            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"
+                              9
+                            "GET / HTTP/1.1\r\nX: a\x00;b\r\n" 10
+                            "GET / HTTP/1.1\nHost: x\n" 11
+                            "GET / HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n"
+                              12
+                            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcX\r\n"
+                              13
+                            "POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n" 14
+                            " GET / HTTP/1.1\r\n" "GET / HTTP/1.1\r\n : x\r\n"))
+    (str/sb-push-str! (mut sb) "Host: example\r\n\r\n")
+    (str/sb-push-str! (mut sb) body)
+    (str/sb-str (load sb))))
+
+(defprop malformed-rejected
+         [(seed i64)]
+         (let [src (prop-src)
+               a (src-alloc src)
+               defect (draw-int! src 0 15)
+               data (defect-input src defect)
+               cuts (draw-cuts src (slice-len data))
+               trace (run-coil a data ll/HTTP_REQUEST 0 cuts false)]
+           (and (not (str/str-eq (trace-end trace) (clean-end)))
+                (match (server/parse-request a data)
+                  (Ok [r]
+                      (do
+                        (when (verbose?)
+                          (println "defect {} ACCEPTED" defect)
+                          (show-bytes "input" data)
+                          0)
+                        (server/request-free r)
+                        false))
+                  (Err [e]
+                       (and (!= (server/error-code e) ll/HPE_OK)
+                            (!= (server/error-code e) ll/HPE_PAUSED)))))))
