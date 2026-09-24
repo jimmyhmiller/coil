@@ -166,12 +166,25 @@
   (variant-end [(s (ptr MpSer))] (-> (Result i64 SerError)) (Ok 0)))
 
 ; ============================ deserializer ==================================
+;;; `stk` holds one entry per open map/struct/variant frame (the frame's start
+;;; offset; -1 = a unit variant spelled as a bare tag, -2 = a bare tag whose
+;;; payload has not been decoded — a payload read then is an error). `ck`/`cpos`
+;;; are each frame's pair cursor: the byte offset of pair `ck`'s key, so the
+;;; in-order visits de-map-key/-value promise are linear, not quadratic.
+;;; `seqd` counts open arrays so array nesting shares the depth limit.
 (defstruct MpDe
   [(src (slice u8))
    (pos i64)
    (alc (dyn Allocator))
    (stk (array i64 64))
-   (sp i64)])
+   (ck (array i64 64))
+   (cpos (array i64 64))
+   (sp i64)
+   (seqd i64)])
+
+;;; Nesting limit for maps, structs, variants and arrays combined, and for
+;;; skipping an unknown value: recursion depth must not be input-controlled.
+(const MD-MAX-DEPTH 64)
 
 (defn md-need [(p (ptr MpDe)) (k i64)] (-> (Result i64 DeError))
   (if (> (+ (load (field p pos)) k) (slice-len (load (field p src))))
@@ -210,9 +223,14 @@
 
 ;;; skip one complete value starting at `pos`; returns the position after it
 (defn md-skip-at [(p (ptr MpDe)) (pos i64)] (-> (Result i64 DeError))
+  (md-skip-depth p pos 0))
+
+(defn md-skip-depth [(p (ptr MpDe)) (pos i64) (depth i64)] (-> (Result i64 DeError))
   (try (do
          (store! (field p pos) pos)
          (try! (md-need p 1))
+         (when (>= depth MD-MAX-DEPTH)
+           (return-from :try (Err (de-err DE-E-DEPTH pos "nesting too deep"))))
          (let [tag (md-take p)]
            (cond (< tag (cast i64 128)) (Ok (load (field p pos)))  ; pos fixint
                  (>= tag (cast i64 224)) (Ok (load (field p pos)))  ; neg fixint
@@ -220,13 +238,13 @@
                    (let [n (- tag 128)
                          (mut at) (load (field p pos))]
                      (for [i 0 (* n 2)]
-                       (store! at (try! (md-skip-at p (load at)))))
+                       (store! at (try! (md-skip-depth p (load at) (+ depth 1)))))
                      (Ok (load at)))
                  (and (>= tag (cast i64 144)) (<= tag (cast i64 159)))  ; fixarray
                    (let [n (- tag 144)
                          (mut at) (load (field p pos))]
                      (for [i 0 n]
-                       (store! at (try! (md-skip-at p (load at)))))
+                       (store! at (try! (md-skip-depth p (load at) (+ depth 1)))))
                      (Ok (load at)))
                  (and (>= tag (cast i64 160)) (<= tag (cast i64 191)))  ; fixstr
                    (let [n (- tag 160)]
@@ -271,25 +289,25 @@
                    (let [n (try! (md-be p 2))
                          (mut at) (load (field p pos))]
                      (for [i 0 n]
-                       (store! at (try! (md-skip-at p (load at)))))
+                       (store! at (try! (md-skip-depth p (load at) (+ depth 1)))))
                      (Ok (load at)))
                  (= tag (cast i64 221))  ; array32
                    (let [n (try! (md-be p 4))
                          (mut at) (load (field p pos))]
                      (for [i 0 n]
-                       (store! at (try! (md-skip-at p (load at)))))
+                       (store! at (try! (md-skip-depth p (load at) (+ depth 1)))))
                      (Ok (load at)))
                  (= tag (cast i64 222))  ; map16
                    (let [n (try! (md-be p 2))
                          (mut at) (load (field p pos))]
                      (for [i 0 (* n 2)]
-                       (store! at (try! (md-skip-at p (load at)))))
+                       (store! at (try! (md-skip-depth p (load at) (+ depth 1)))))
                      (Ok (load at)))
                  (= tag (cast i64 223))  ; map32
                    (let [n (try! (md-be p 4))
                          (mut at) (load (field p pos))]
                      (for [i 0 (* n 2)]
-                       (store! at (try! (md-skip-at p (load at)))))
+                       (store! at (try! (md-skip-depth p (load at) (+ depth 1)))))
                      (Ok (load at)))
                  :else
                    (Err (de-err DE-E-PARSE
@@ -297,7 +315,7 @@
                                 "unsupported msgpack tag")))))))
 
 (defn md-push! [(p (ptr MpDe)) (v i64)] (-> (Result i64 DeError))
-  (if (>= (load (field p sp)) (cast i64 64))
+  (if (>= (+ (load (field p sp)) (load (field p seqd))) MD-MAX-DEPTH)
       (Err (de-err DE-E-DEPTH (load (field p pos)) "nesting too deep"))
       (do
         (store! (primitive/index (field p stk) (load (field p sp))) v)
@@ -310,6 +328,12 @@
 
 (defn md-top [(p (ptr MpDe))] (-> i64)
   (load (primitive/index (field p stk) (- (load (field p sp)) 1))))
+
+;;; Start the top frame's pair cursor at pair 0, whose key is at `at`.
+(defn md-cursor-init! [(p (ptr MpDe)) (at i64)] (-> i64)
+  (let [f (- (load (field p sp)) 1)]
+    (store! (primitive/index (field p ck) f) 0)
+    (store! (primitive/index (field p cpos) f) at)))
 
 ;;; read any integer family into i64; `unsigned?` selects the u64 range rules
 (defn md-int [(p (ptr MpDe)) (unsigned? bool)] (-> (Result i64 DeError))
@@ -413,14 +437,22 @@
                  (try! (md-need d 1))
                  (let [off (load (field d pos))
                        tag (md-take d)]
-                   (if (= tag (cast i64 203))
-                       (let [bits (try! (md-be d 8))
-                             slot (primitive/alloc-stack i64)]
-                         (store! slot bits)
-                         (Ok (load (primitive/cast (ptr f64) slot))))
-                       (Err (de-err DE-E-EXPECTED-FLOAT
-                                    off
-                                    "expected a float64")))))))
+                   (cond (= tag (cast i64 203))
+                           (let [bits (try! (md-be d 8))
+                                 slot (primitive/alloc-stack i64)]
+                             (store! slot bits)
+                             (Ok (load (primitive/cast (ptr f64) slot))))
+                         ; float32: de-kind and md-skip-at already accept it
+                         (= tag (cast i64 202))
+                           (let [bits (try! (md-be d 4))
+                                 slot (primitive/alloc-stack i32)]
+                             (store! slot (primitive/cast i32 bits))
+                             (Ok (primitive/cast f64
+                                                 (load (primitive/cast (ptr f32) slot)))))
+                         :else
+                           (Err (de-err DE-E-EXPECTED-FLOAT
+                                        off
+                                        "expected a float")))))))
   (de-str [(d (ptr MpDe))]
           (-> (Result (slice u8) DeError))
           (try (do
@@ -466,31 +498,42 @@
                        (try! (md-need d 1))
                        (let [off (load (field d pos))
                              tag (md-take d)]
-                         (cond (and (>= tag (cast i64 144))
-                                    (<= tag (cast i64 159)))
-                                 (Ok (- tag 144))
-                               (= tag (cast i64 220)) (md-be d 2)
-                               (= tag (cast i64 221)) (md-be d 4)
-                               :else
-                                 (Err (de-err DE-E-EXPECTED-SEQ
-                                              off
-                                              "expected an array")))))))
-  (de-seq-end [(d (ptr MpDe))] (-> (Result i64 DeError)) (Ok 0))
+                         (when (>= (+ (load (field d sp)) (load (field d seqd)))
+                                   MD-MAX-DEPTH)
+                           (return-from :try
+                                          (Err (de-err DE-E-DEPTH off "nesting too deep"))))
+                         (let [n
+                                 (try! (cond (and (>= tag (cast i64 144))
+                                                  (<= tag (cast i64 159)))
+                                               (Ok [i64 DeError] (- tag 144))
+                                             (= tag (cast i64 220)) (md-be d 2)
+                                             (= tag (cast i64 221)) (md-be d 4)
+                                             :else
+                                               (Err [i64 DeError]
+                                                    (de-err DE-E-EXPECTED-SEQ
+                                                            off
+                                                            "expected an array"))))]
+                           (store! (field d seqd) (+ (load (field d seqd)) 1))
+                           (Ok n))))))
+  (de-seq-end [(d (ptr MpDe))]
+              (-> (Result i64 DeError))
+              (do (store! (field d seqd) (- (load (field d seqd)) 1)) (Ok 0)))
   (de-map-begin [(d (ptr MpDe))]
                 (-> (Result i64 DeError))
                 (try (let [off (load (field d pos))
                            n (try! (md-maphdr d))]
                        (try! (md-push! d off))
+                       (md-cursor-init! d (load (field d pos)))
                        (Ok n))))
   (de-map-key [(d (ptr MpDe)) (n i64)]
               (-> (Result (slice u8) DeError))
               (try (do
-                     (try! (md-seek-pair d (md-top d) n))
+                     (try! (md-seek-key d n))
                      (de-str d))))
   (de-map-value [(d (ptr MpDe)) (n i64)]
                 (-> (Result i64 DeError))
                 (try (do
-                       (try! (md-seek-pair d (md-top d) n))
+                       (try! (md-seek-key d n))
                        (let [after-key
                                (try! (md-skip-at d (load (field d pos))))]
                          (store! (field d pos) after-key)
@@ -503,11 +546,18 @@
                      (Ok 0))))
   (de-struct-begin [(d (ptr MpDe)) (name (slice u8))]
                    (-> (Result i64 DeError))
-                   (try (let [off (load (field d pos))
-                              n (try! (md-maphdr d))]
-                          (try! (md-push! d off))
-                          (store! (field d pos) off)
-                          (Ok n))))
+                   (try (let [off (load (field d pos))]
+                          (when (and (> (load (field d sp)) (cast i64 0))
+                                     (= (md-top d) (cast i64 -2)))
+                            (return-from :try
+                                           (Err (de-err DE-E-EXPECTED-VARIANT
+                                                        off
+                                                        "variant tag without its payload map"))))
+                          (let [n (try! (md-maphdr d))]
+                            (try! (md-push! d off))
+                            (md-cursor-init! d (load (field d pos)))
+                            (store! (field d pos) off)
+                            (Ok n)))))
   (de-field [(d (ptr MpDe)) (name (slice u8))]
             (-> (Result bool DeError))
             (try (let [start (md-top d)]
@@ -548,7 +598,11 @@
                                                (+ (load (field d pos)) sn))]
                                (store! (field d pos)
                                        (+ (load (field d pos)) sn))
-                               (try! (md-push! d -1))
+                               ; -2: a bare tag. Legal for a unit variant (whose
+                               ; arm goes straight to de-variant-end); a payload
+                               ; read (de-struct-begin) rejects it instead of
+                               ; decoding the FOLLOWING value as the payload.
+                               (try! (md-push! d -2))
                                (Ok s)))
                            ; {tag: payload}
                            (do
@@ -560,6 +614,7 @@
                                                 "expected exactly one variant tag"))
                                    (let [tagstr (try! (de-str d))]
                                      (try! (md-push! d off))
+                                     (md-cursor-init! d (load (field d pos)))
                                      (Ok tagstr))))))))))
   (de-variant-end [(d (ptr MpDe))]
                   (-> (Result i64 DeError))
@@ -585,14 +640,25 @@
                  (= tag (cast i64 223)) (md-be p 4)
                  :else (Err (de-err DE-E-EXPECTED-MAP off "expected a map")))))))
 
-;;; position the cursor at the KEY of pair `n` of the map starting at `start`
-(defn md-seek-pair [(p (ptr MpDe)) (start i64) (n i64)] (-> (Result i64 DeError))
-  (try (do
-         (store! (field p pos) start)
-         (try! (md-maphdr p))
-         (let [(mut at) (load (field p pos))]
-           (for [i 0 (* n 2)]
+;;; Position the cursor at the KEY of pair `n` of the top frame. Visits in order
+;;; (n = 0,1,2,…, as the Deserializer contract requires) continue from the frame's
+;;; pair cursor, so decoding an n-entry map skips each entry once; an earlier `n`
+;;; restarts from the frame's header.
+(defn md-seek-key [(p (ptr MpDe)) (n i64)] (-> (Result i64 DeError))
+  (try (let [f (- (load (field p sp)) 1)
+             ckp (primitive/index (field p ck) f)
+             cpp (primitive/index (field p cpos) f)]
+         (when (< n (load ckp))
+           (store! (field p pos) (md-top p))
+           (try! (md-maphdr p))
+           (store! ckp 0)
+           (store! cpp (load (field p pos)))
+           0)
+         (let [(mut at) (load cpp)]
+           (for [i 0 (* (- n (load ckp)) 2)]
              (store! at (try! (md-skip-at p (load at)))))
+           (store! ckp n)
+           (store! cpp (load at))
            (store! (field p pos) (load at))
            (Ok 0)))))
 
@@ -627,4 +693,9 @@
     (store! (field dd alc) a)
     (match (de slot (primitive/make-dyn Deserializer dd))
       (Err [e] (Err e))
-      (Ok [_] (Ok (load slot))))))
+      (Ok [_]
+          (if (< (load (field dd pos)) (slice-len src))
+              (Err (de-err DE-E-TRAILING
+                           (load (field dd pos))
+                           "bytes after the msgpack value"))
+              (Ok (load slot)))))))

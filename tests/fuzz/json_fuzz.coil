@@ -1,0 +1,1681 @@
+(module json_fuzz)
+; Production fuzz target for coil.json (the token-tape parser) and
+; coil.serde.json (+ coil.serde.value's JVal, + derived Serialize/Deserialize).
+;
+;   coil fuzz json_fuzz.coil --time 120 [--sanitize=address] [--filter NAME]
+;
+; Every property states a law that needs no hand-written expected output:
+;   * an independent reference recognizer (ref-valid?) is the oracle for
+;     "which byte strings are JSON" (differential against json/parse),
+;   * the tape is checked against the source bytes it indexes,
+;   * generators carry their own oracle (decoded string bytes, integer range),
+;   * serialize -> parse -> decode must come back equal (round trip),
+;   * a typed decode that SUCCEEDS must re-serialize to what it read (faithful).
+(import "coil.prop" :use *)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.json" :as json)
+(import "coil.serde" :use *)
+(import "coil.serde.derive" :use *)
+(import "coil.serde.json" :use *)
+(import "coil.serde.value" :use *)
+(import "coil.io" :as io)
+
+; =========================================================================
+; small helpers
+; =========================================================================
+(defn is-finite? [(x f64)] (-> bool)
+  ; NaN fails the self-compare; +-inf are the only values beyond +-DBL_MAX
+  (and (primitive/fcmp-eq x x)
+       (primitive/fcmp-le x 1.7976931348623157e308)
+       (primitive/fcmp-ge x -1.7976931348623157e308)))
+
+(defn de-code [(e DeError)] (-> i64)
+  (let [(DeError :code c) e] c))
+
+(defn ser-code [(e SerError)] (-> i64)
+  (let [(SerError :code c) e] c))
+
+(defn tok-start [(t json/Token)] (-> i64)
+  (let [(json/Token :start v) t] v))
+
+(defn tok-end [(t json/Token)] (-> i64)
+  (let [(json/Token :end v) t] v))
+
+(defn tok-aux [(t json/Token)] (-> i64)
+  (let [(json/Token :aux v) t] v))
+
+(defn byte-at [(s (slice u8)) (i i64)] (-> i64)
+  (primitive/cast i64 (slice-get s i)))
+
+(defn digit? [(c i64)] (-> bool) (and (>= c 48) (<= c 57)))
+
+(defn hex? [(c i64)] (-> bool)
+  (or (digit? c) (and (>= c 97) (<= c 102)) (and (>= c 65) (<= c 70))))
+
+(defn ws? [(c i64)] (-> bool)
+  (or (= c 32) (= c 9) (= c 10) (= c 13)))
+
+; =========================================================================
+; the REFERENCE recognizer — written independently of coil.json, iterative
+; (explicit container stack), so it is also the oracle for deep nesting.
+; Accepts exactly RFC 8259 grammar over bytes, with well-formed UTF-8 required
+; inside strings (checked by DECODING the scalar and range-checking it, where
+; coil.json checks byte ranges — two methods, so each checks the other).
+; =========================================================================
+(defn ref-skip-ws [(s (slice u8)) (i i64)] (-> i64)
+  (let [(mut p) i
+        n (slice-len s)]
+    (while (and (< (load p) n) (ws? (byte-at s (load p))))
+      (store! p (+ (load p) 1)))
+    (load p)))
+
+;;; length of the well-formed UTF-8 sequence at i (lead byte >= 0x80), or -1
+(defn ref-utf8-len [(s (slice u8)) (i i64)] (-> i64)
+  (let [n (slice-len s)
+        b0 (byte-at s i)
+        need (cond (= (primitive/iand b0 224) 192) 2
+                   (= (primitive/iand b0 240) 224) 3
+                   (= (primitive/iand b0 248) 240) 4
+                   :else 0)
+        (mut cp) (cond (= need 2) (primitive/iand b0 31)
+                       (= need 3) (primitive/iand b0 15)
+                       :else (primitive/iand b0 7))
+        (mut k) 1
+        (mut ok) (and (> need 0) (<= (+ i need) n))]
+    (while (and (load ok) (< (load k) need))
+      (let [b (byte-at s (+ i (load k)))]
+        (if (= (primitive/iand b 192) 128)
+            (do (store! cp (+ (* (load cp) 64) (primitive/iand b 63)))
+                (store! k (+ (load k) 1)))
+            (store! ok false))))
+    (if (and (load ok)
+             (>= (load cp) (cond (= need 2) 128 (= need 3) 2048 :else 65536))
+             (<= (load cp) 1114111)
+             (not (and (>= (load cp) 55296) (<= (load cp) 57343))))
+        need
+        -1)))
+
+;;; position after a JSON string starting at i (s[i] must be '"'), or -1
+(defn ref-string [(s (slice u8)) (i i64)] (-> i64)
+  (let [n (slice-len s)
+        (mut p) (+ i 1)
+        (mut r) -2]
+    (while (= (load r) -2)
+      (if (>= (load p) n)
+          (store! r -1)
+          (let [c (byte-at s (load p))]
+            (cond (= c 34) (store! r (+ (load p) 1))
+                  (< c 32) (store! r -1)
+                  (= c 92)
+                    (if (>= (+ (load p) 1) n)
+                        (store! r -1)
+                        (let [e (byte-at s (+ (load p) 1))]
+                          (cond (or (= e 34) (= e 92) (= e 47) (= e 98)
+                                    (= e 102) (= e 110) (= e 114) (= e 116))
+                                  (store! p (+ (load p) 2))
+                                (= e 117)
+                                  (if (and (< (+ (load p) 5) n)
+                                           (hex? (byte-at s (+ (load p) 2)))
+                                           (hex? (byte-at s (+ (load p) 3)))
+                                           (hex? (byte-at s (+ (load p) 4)))
+                                           (hex? (byte-at s (+ (load p) 5))))
+                                      (store! p (+ (load p) 6))
+                                      (store! r -1))
+                                :else (store! r -1))))
+                  (>= c 128)
+                    (let [k (ref-utf8-len s (load p))]
+                      (if (< k 0) (store! r -1) (store! p (+ (load p) k))))
+                  :else (store! p (+ (load p) 1))))))
+    (load r)))
+
+(defn ref-digits [(s (slice u8)) (i i64)] (-> i64)
+  (let [(mut p) i
+        n (slice-len s)]
+    (while (and (< (load p) n) (digit? (byte-at s (load p))))
+      (store! p (+ (load p) 1)))
+    (load p)))
+
+;;; position after a JSON number starting at i, or -1
+(defn ref-number [(s (slice u8)) (i i64)] (-> i64)
+  (block :num
+    (let [n (slice-len s)
+          (mut p) i]
+      (when (and (< (load p) n) (= (byte-at s (load p)) 45))
+        (store! p (+ (load p) 1)))
+      (when (>= (load p) n) (return-from :num -1))
+      (let [c (byte-at s (load p))]
+        (cond (= c 48) (store! p (+ (load p) 1))
+              (and (>= c 49) (<= c 57)) (store! p (ref-digits s (load p)))
+              :else (return-from :num -1)))
+      (when (and (< (load p) n) (= (byte-at s (load p)) 46))
+        (let [q (ref-digits s (+ (load p) 1))]
+          (when (= q (+ (load p) 1)) (return-from :num -1))
+          (store! p q)))
+      (when (and (< (load p) n)
+                 (or (= (byte-at s (load p)) 101) (= (byte-at s (load p)) 69)))
+        (store! p (+ (load p) 1))
+        (when (and (< (load p) n)
+                   (or (= (byte-at s (load p)) 43) (= (byte-at s (load p)) 45)))
+          (store! p (+ (load p) 1)))
+        (let [q (ref-digits s (load p))]
+          (when (= q (load p)) (return-from :num -1))
+          (store! p q)))
+      (load p))))
+
+(defn ref-lit [(s (slice u8)) (i i64) (lit (slice u8))] (-> i64)
+  (let [n (slice-len s)
+        m (slice-len lit)]
+    (if (> (+ i m) n)
+        -1
+        (if (str-eq (subslice s i (+ i m)) lit) (+ i m) -1))))
+
+(defn ref-scalar [(s (slice u8)) (i i64)] (-> i64)
+  (if (>= i (slice-len s))
+      -1
+      (let [c (byte-at s i)]
+        (cond (= c 34) (ref-string s i)
+              (= c 110) (ref-lit s i "null")
+              (= c 116) (ref-lit s i "true")
+              (= c 102) (ref-lit s i "false")
+              (or (= c 45) (digit? c)) (ref-number s i)
+              :else -1))))
+
+;;; where the reference recognizer is in the grammar
+(defsum RefState (RsValue) (RsKey) (RsAfter))
+
+;;; the reference answer to "is `s` one complete JSON document?"
+(defn ref-valid? [(a (dyn Allocator)) (s (slice u8))] (-> bool)
+  (let [n (slice-len s)
+        (mut stk) (al-new [bool] a)   ; open containers, innermost last: true = object
+        (mut p) 0
+        (mut st) (RsValue)
+        (mut done) false
+        (mut accepted) false]
+    (while (not (load done))
+      (match (load st)
+        (RsValue []
+                 (do
+                   (store! p (ref-skip-ws s (load p)))
+                   (let [c (if (< (load p) n) (byte-at s (load p)) -1)]
+                     (if (or (= c 91) (= c 123))
+                         (let [obj (= c 123)]
+                           (al-push! (mut stk) obj)
+                           (store! p (ref-skip-ws s (+ (load p) 1)))
+                           (if (and (< (load p) n) (= (byte-at s (load p)) (if obj 125 93)))
+                               (do (al-pop! (mut stk)) (store! p (+ (load p) 1)) (store! st (RsAfter)))
+                               (store! st (if obj (RsKey) (RsValue))))
+                           0)
+                         (let [q (ref-scalar s (load p))]
+                           (if (< q 0)
+                               (store! done true)
+                               (do (store! p q) (store! st (RsAfter))))
+                           0)))
+                   0))
+        (RsKey []
+               (do
+                 (store! p (ref-skip-ws s (load p)))
+                 (if (and (< (load p) n) (= (byte-at s (load p)) 34))
+                     (let [q (ref-string s (load p))]
+                       (if (< q 0)
+                           (store! done true)
+                           (do
+                             (store! p (ref-skip-ws s q))
+                             (if (and (< (load p) n) (= (byte-at s (load p)) 58))
+                                 (do (store! p (+ (load p) 1)) (store! st (RsValue)))
+                                 (store! done true))))
+                       0)
+                     (store! done true))
+                 0))
+        (RsAfter []
+                 (do
+                   (store! p (ref-skip-ws s (load p)))
+                   (if (= (al-len (load stk)) 0)
+                       (do (store! accepted (= (load p) n)) (store! done true))
+                       (let [obj (al-get (load stk) (- (al-len (load stk)) 1))
+                             c (if (< (load p) n) (byte-at s (load p)) -1)]
+                         (cond (= c 44)
+                                 (do (store! p (+ (load p) 1))
+                                     (store! st (if obj (RsKey) (RsValue))))
+                               (= c (if obj 125 93))
+                                 (do (al-pop! (mut stk)) (store! p (+ (load p) 1)) 0)
+                               :else (store! done true))
+                         0))
+                   0))))
+    (al-free! (mut stk))
+    (load accepted)))
+
+;;; Is `s` well-formed UTF-8 throughout? (the serializer's contract; built on
+;;; the recognizer's own ref-utf8-len, independent of coil.serde.json)
+(defn ref-utf8-valid? [(s (slice u8))] (-> bool)
+  (let [n (slice-len s)
+        (mut i) 0
+        (mut ok) true]
+    (while (and (load ok) (< (load i) n))
+      (let [k (if (< (byte-at s (load i)) 128) 1 (ref-utf8-len s (load i)))]
+        (if (< k 0) (store! ok false) (store! i (+ (load i) k)))))
+    (load ok)))
+
+; =========================================================================
+; TAPE CHECK — everything an accepted Doc claims must agree with its source
+; =========================================================================
+(defn span-is? [(src (slice u8)) (t json/Token) (lit (slice u8))] (-> bool)
+  (str-eq (subslice src (tok-start t) (tok-end t)) lit))
+
+;;; A structural walk of the tape (independent of json/next-index): a stack of
+;;; (container index, direct tokens still owed). Returns true iff consistent.
+(defn check-tape [(a (dyn Allocator)) (d json/Doc) (src (slice u8))] (-> bool)
+  (block :chk
+    (let [n (json/token-count d)
+          len (slice-len src)
+          (mut cstk) (al-new [i64] a)   ; container token index
+          (mut rstk) (al-new [i64] a)   ; direct child tokens remaining
+          (mut pstk) (al-new [i64] a)]  ; direct child tokens consumed so far
+      (when (< n 1) (return-from :chk false))
+      (for [i 0 n]
+        (let [t (json/token d i)
+              k (json/kind t)
+              s (tok-start t)
+              e (tok-end t)]
+          (when (or (< k 0) (> k 5)) (return-from :chk false))
+          (when (or (< s 0) (> e len) (> s e)) (return-from :chk false))
+          ; the root is token 0 and only token 0 lives outside every container
+          (when (and (= (al-len (load cstk)) 0) (> i 0)) (return-from :chk false))
+          (when (> (al-len (load cstk)) 0)
+            (let [top (- (al-len (load cstk)) 1)
+                  parent (json/token d (al-get (load cstk) top))
+                  pos (al-get (load pstk) top)]
+              (when (or (< s (tok-start parent)) (> e (tok-end parent)))
+                (return-from :chk false))
+              ; inside an object, even positions are keys and keys are strings
+              (when (and (json/is-object? parent) (= (% pos 2) 0) (not (json/is-string? t)))
+                (return-from :chk false))
+              (al-set! (mut rstk) top (- (al-get (load rstk) top) 1))
+              (al-set! (mut pstk) top (+ pos 1))
+              0))
+          (cond (= k 0) (when (not (span-is? src t "null")) (return-from :chk false))
+                (= k 1)
+                  (when (not (if (json/bool t) (span-is? src t "true") (span-is? src t "false")))
+                    (return-from :chk false))
+                (= k 2)
+                  (when (!= (ref-number src s) e) (return-from :chk false))
+                (= k 3)
+                  (when (or (< s 1) (>= e len)
+                            (!= (byte-at src (- s 1)) 34)
+                            (!= (byte-at src e) 34)
+                            (!= (tok-aux t) (- s 1))
+                            (!= (ref-string src (- s 1)) (+ e 1)))
+                    (return-from :chk false))
+                :else
+                  (let [open (if (= k 4) 91 123)
+                        close (if (= k 4) 93 125)
+                        owed (if (= k 4) (json/child-count t) (* 2 (json/child-count t)))]
+                    (when (or (< (json/child-count t) 0)
+                              (>= s len) (< e 1)
+                              (!= (byte-at src s) open)
+                              (!= (byte-at src (- e 1)) close))
+                      (return-from :chk false))
+                    (al-push! (mut cstk) i)
+                    (al-push! (mut rstk) owed)
+                    (al-push! (mut pstk) 0)
+                    0))
+          ; pop every container that has now received all its children
+          (while (and (> (al-len (load rstk)) 0)
+                      (= (al-get (load rstk) (- (al-len (load rstk)) 1)) 0))
+            (al-pop! (mut cstk))
+            (al-pop! (mut rstk))
+            (al-pop! (mut pstk)))
+          0))
+      (when (!= (al-len (load cstk)) 0) (return-from :chk false))
+      ; the library's own walkers must agree with the structural walk
+      (when (!= (json/next-index d 0) n) (return-from :chk false))
+      (let [r (json/root d)]
+        (when (json/is-array? r)
+          (let [(mut at) 1]
+            (for [j 0 (json/child-count r)]
+              (do
+                (when (!= (json/array-nth d 0 j) (load at)) (return-from :chk false))
+                (store! at (json/next-index d (load at)))
+                0))
+            (when (!= (load at) n) (return-from :chk false))))
+        (when (json/is-object? r)
+          (for [j 0 (json/child-count r)]
+            (let [ki (json/object-key d 0 j)
+                  vi (json/object-value d 0 j)
+                  kt (json/token d ki)
+                  raw (json/string-text d kt)]
+              (when (not (json/is-string? kt)) (return-from :chk false))
+              (when (!= vi (+ ki 1)) (return-from :chk false))
+              ; object-get finds the FIRST member with this encoded key
+              (let [g (json/object-get d 0 raw)]
+                (when (or (< g 0) (> g vi)) (return-from :chk false))
+                (when (not (str-eq (json/string-text d (json/token d (- g 1))) raw))
+                  (return-from :chk false)))
+              0)))
+        0)
+      (al-free! (mut cstk))
+      (al-free! (mut rstk))
+      (al-free! (mut pstk))
+      true)))
+
+;;; parse `text`, compare with the reference, check the tape/error. The core law.
+(defn parse-law [(a (dyn Allocator)) (text (slice u8))] (-> bool)
+  (let [want (ref-valid? a text)]
+    (match (json/parse a text)
+      (Err [e]
+           (and (not want)
+                (>= (json/error-offset e) 0)
+                (<= (json/error-offset e) (slice-len text))
+                (>= (json/error-code e) 1)
+                ; 11 = nesting limit, 12 = malformed UTF-8 in a string
+                (<= (json/error-code e) 12)))
+      (Ok [d]
+          (let [(mut dd) d
+                ok (and want (check-tape a d text))]
+            (json/doc-free! (mut dd))
+            (json/doc-free! (mut dd))   ; documented as safe to call twice
+            ok)))))
+
+; =========================================================================
+; GRAMMAR GENERATOR — JSON-shaped text with an oracle for strings
+; =========================================================================
+(defstruct G
+  [(src (ptr Source))
+   (out (ArrayList u8))
+   (dec (ArrayList u8))     ; decoded bytes of the most recent string
+   (lone bool)              ; the most recent string holds a lone surrogate
+   (anylone bool)           ; ANY string in the document holds one
+   (corrupt bool)           ; a corruption was injected (validity unknown)
+   (bad bool)               ; the most recent string holds malformed UTF-8
+   (corrupt-den i64)        ; 1-in-N chance of corruption per value (0 = never)
+   (depth i64)
+   (maxdepth i64)])
+
+(defn g-new [(src (ptr Source)) (corrupt-den i64) (maxdepth i64)] (-> G)
+  (let [(mut g) (primitive/zeroed G)]
+    (store! (field g src) src)
+    (store! (field g out) (al-new [u8] (src-alloc src)))
+    (store! (field g dec) (al-new [u8] (src-alloc src)))
+    (store! (field g corrupt-den) corrupt-den)
+    (store! (field g maxdepth) maxdepth)
+    (load g)))
+
+(defn g-text [(g (ptr G))] (-> (slice u8))
+  (al-slice (load (field g out))))
+
+(defn g-byte! [(g (ptr G)) (b i64)] (-> i64)
+  (al-push! (mut (field g out)) (primitive/cast u8 b)))
+
+(defn g-dec! [(g (ptr G)) (b i64)] (-> i64)
+  (al-push! (mut (field g dec)) (primitive/cast u8 b)))
+
+(defn g-str! [(g (ptr G)) (s (slice u8))] (-> i64)
+  (for [i 0 (slice-len s)] (g-byte! g (byte-at s i)))
+  0)
+
+(defn g-both! [(g (ptr G)) (b i64)] (-> i64)
+  (g-byte! g b)
+  (g-dec! g b))
+
+(defn g-ws! [(g (ptr G))] (-> i64)
+  (let [src (load (field g src))]
+    (when (draw-bool-p! src 1 5)
+      (let [n (draw-len! src 1 3)]
+        (for [i 0 n]
+          (g-byte! g (case (draw-int! src 0 3) 0 32 1 9 2 10 13)))))
+    0))
+
+(defn vocab [(k i64)] (-> (slice u8))
+  (case k
+    0 "a" 1 "b" 2 "w" 3 "h" 4 "r" 5 "Rect" 6 "Point" 7 "Circle"
+    8 "shape" 9 "more" 10 "n" 11 "tag" 12 "x" 13 "s" 14 "l" 15 "m"
+    ""))
+
+(const VOCAB-N 17)
+
+(defn g-hex4! [(g (ptr G)) (cp i64)] (-> i64)
+  (let [src (load (field g src))
+        upper (draw-bool-p! src 1 3)]
+    (for [k 0 4]
+      (let [nib (primitive/iand (primitive/ishr cp (* 4 (- 3 k))) 15)]
+        (g-byte! g (if (< nib 10) (+ nib 48) (+ nib (if upper 55 87))))))
+    0))
+
+;;; Append byte `b` to `l`.
+(defn put-u8! [(l (mut (ArrayList u8))) (b i64)] (-> i64)
+  (al-push! (mut l) (primitive/cast u8 b)))
+
+;;; Append the UTF-8 encoding of scalar value `cp` to `l`.
+(defn push-utf8! [(l (mut (ArrayList u8))) (cp i64)] (-> i64)
+  (do
+    (cond (< cp 128) (put-u8! (mut l) cp)
+          (< cp 2048)
+            (do (put-u8! (mut l) (+ 192 (primitive/ishr cp 6)))
+                (put-u8! (mut l) (+ 128 (primitive/iand cp 63))))
+          (< cp 65536)
+            (do (put-u8! (mut l) (+ 224 (primitive/ishr cp 12)))
+                (put-u8! (mut l) (+ 128 (primitive/iand (primitive/ishr cp 6) 63)))
+                (put-u8! (mut l) (+ 128 (primitive/iand cp 63))))
+          :else
+            (do (put-u8! (mut l) (+ 240 (primitive/ishr cp 18)))
+                (put-u8! (mut l) (+ 128 (primitive/iand (primitive/ishr cp 12) 63)))
+                (put-u8! (mut l) (+ 128 (primitive/iand (primitive/ishr cp 6) 63)))
+                (put-u8! (mut l) (+ 128 (primitive/iand cp 63)))))
+    0))
+
+;;; The decoded bytes of `cp` (the string oracle).
+(defn g-utf8! [(g (ptr G)) (cp i64)] (-> i64)
+  (push-utf8! (mut (field g dec)) cp))
+
+;;; `cp` written RAW (unescaped) into the JSON text, and into the oracle.
+(defn g-raw-cp! [(g (ptr G)) (cp i64)] (-> i64)
+  (push-utf8! (mut (field g out)) cp)
+  (push-utf8! (mut (field g dec)) cp))
+
+;;; A Unicode scalar value that needs `width` UTF-8 bytes (1..4), or an edge
+;;; case: the encoding-length boundaries, the code points around the surrogate
+;;; gap, U+FFFD, U+FEFF, U+2028 and U+10FFFF. Never a surrogate.
+(defn draw-cp [(src (ptr Source)) (width i64)] (-> i64)
+  (case width
+    1 (draw-int-origin! src 0 127 97)
+    2 (draw-int! src 128 2047)
+    3 (let [c (draw-int! src 2048 63487)]   ; 0x800..0xF7FF, then skip the gap
+        (if (>= c 55296) (+ c 2048) c))
+    4 (draw-int! src 65536 1114111)
+    (case (draw-int! src 0 13)
+      0 127 1 128 2 2047 3 2048 4 55295 5 57344 6 65533 7 65535 8 65279
+      9 8232 10 65536 11 1114111 12 160 1114110)))
+
+;;; Append bytes that are NOT well-formed UTF-8: overlongs, encoded surrogates,
+;;; code points past U+10FFFF, bytes that never start a sequence, stray
+;;; continuation bytes and truncated sequences. A continuation byte is always
+;;; written after an ASCII 'x', so it can never complete a truncated sequence
+;;; drawn just before it into a well-formed one (E2 82 then 80 is U+2080).
+(defn push-bad-utf8! [(l (mut (ArrayList u8))) (src (ptr Source))] (-> i64)
+  (case (draw-int! src 0 16)
+    0 (put-bytes! (mut l) 192 128 -1 -1)          ; overlong NUL
+    1 (put-bytes! (mut l) 193 191 -1 -1)          ; overlong U+007F
+    2 (put-bytes! (mut l) 224 128 128 -1)         ; overlong 3-byte
+    3 (put-bytes! (mut l) 224 159 191 -1)         ; overlong U+07FF
+    4 (put-bytes! (mut l) 237 160 128 -1)         ; U+D800
+    5 (put-bytes! (mut l) 237 191 191 -1)         ; U+DFFF
+    6 (put-bytes! (mut l) 240 128 128 128)        ; overlong 4-byte
+    7 (put-bytes! (mut l) 240 143 191 191)        ; overlong U+FFFF
+    8 (put-bytes! (mut l) 244 144 128 128)        ; U+110000
+    9 (put-bytes! (mut l) 245 128 128 128)        ; lead byte F5
+    10 (put-bytes! (mut l) 255 -1 -1 -1)          ; never a UTF-8 byte
+    11 (put-bytes! (mut l) 120 128 -1 -1)         ; 'x' + stray continuation
+    12 (put-bytes! (mut l) 120 191 -1 -1)
+    13 (put-bytes! (mut l) 226 130 -1 -1)         ; truncated 3-byte
+    14 (put-bytes! (mut l) 240 159 152 -1)        ; truncated 4-byte
+    15 (put-bytes! (mut l) 194 -1 -1 -1)          ; truncated 2-byte
+    (let [b (draw-int! src 128 255)]
+      ; a continuation byte goes after ASCII, as in 11/12
+      (put-bytes! (mut l) (if (< b 192) 120 b) (if (< b 192) b -1) -1 -1))))
+
+;;; Append up to four bytes; -1 marks an unused slot.
+(defn put-bytes! [(l (mut (ArrayList u8))) (b0 i64) (b1 i64) (b2 i64) (b3 i64)] (-> i64)
+  (when (>= b0 0) (put-u8! (mut l) b0))
+  (when (>= b1 0) (put-u8! (mut l) b1))
+  (when (>= b2 0) (put-u8! (mut l) b2))
+  (when (>= b3 0) (put-u8! (mut l) b3))
+  0)
+
+;;; one string literal (with quotes). `g.dec` receives its decoded bytes, `g.lone`
+;;; whether it holds a lone surrogate (which the decoder must reject).
+(defn g-string! [(g (ptr G))] (-> i64)
+  (let [src (load (field g src))
+        sp (span-open! src "string" SPAN-PLAIN)]
+    (al-clear! (mut (field g dec)))
+    (store! (field g lone) false)
+    (store! (field g bad) false)
+    (g-byte! g 34)
+    (if (draw-bool-p! src 1 3)
+        ; a vocabulary word (field names, variant tags) — the keys typed decoders seek
+        (let [w (vocab (draw-int! src 0 (- VOCAB-N 1)))]
+          (for [i 0 (slice-len w)] (g-both! g (byte-at w i)))
+          0)
+        (let [nseg (draw-len! src 0 8)]
+          (for [si 0 nseg]
+            (let [esp (span-open! src "seg" SPAN-ELEM)
+                  tag (draw-tag! src 9)]
+              (case tag
+                0 (let [m (draw-len! src 1 5)]
+                    (for [i 0 m]
+                      (let [c (draw-int-origin! src 32 126 97)]
+                        (g-both! g (if (or (= c 34) (= c 92)) 95 c))))
+                    0)
+                1 (let [w (vocab (draw-int! src 0 (- VOCAB-N 1)))]
+                    (for [i 0 (slice-len w)] (g-both! g (byte-at w i)))
+                    0)
+                2 (let [cd (load (field g corrupt-den))]
+                    (if (and (> cd 0) (draw-bool-p! src 1 cd))
+                        (do (push-bad-utf8! (mut (field g out)) src)
+                            (store! (field g bad) true)
+                            (store! (field g corrupt) true)
+                            0)
+                        (g-raw-cp! g (draw-cp src (draw-int! src 2 5)))))
+                3 (let [k (draw-int! src 0 7)]
+                    (g-byte! g 92)
+                    (g-byte! g (case k 0 34 1 92 2 47 3 98 4 102 5 110 6 114 116))
+                    (g-dec! g (case k 0 34 1 92 2 47 3 8 4 12 5 10 6 13 9)))
+                4 (let [c0 (draw-int! src 0 65535)
+                        cp (if (and (>= c0 55296) (<= c0 57343)) (- c0 2048) c0)]
+                    (g-byte! g 92) (g-byte! g 117) (g-hex4! g cp) (g-utf8! g cp))
+                5 (let [hi (draw-int! src 55296 56319)
+                        lo (draw-int! src 56320 57343)]
+                    (g-byte! g 92) (g-byte! g 117) (g-hex4! g hi)
+                    (g-byte! g 92) (g-byte! g 117) (g-hex4! g lo)
+                    (g-utf8! g (+ 65536 (+ (primitive/ishl (- hi 55296) 10) (- lo 56320)))))
+                6 (let [hi (draw-int! src 55296 56319)]
+                    ; a lone HIGH surrogate: never followed by \u, so never a pair
+                    (g-byte! g 92) (g-byte! g 117) (g-hex4! g hi) (g-byte! g 120)
+                    (store! (field g lone) true)
+                    0)
+                7 (let [lo (draw-int! src 56320 57343)]
+                    (g-byte! g 92) (g-byte! g 117) (g-hex4! g lo)
+                    (store! (field g lone) true)
+                    0)
+                ; small control-range escapes, which the SERIALIZER must produce too
+                (let [c (draw-int! src 0 31)]
+                  (g-byte! g 92) (g-byte! g 117) (g-hex4! g c) (g-dec! g c)))
+              (span-close! src esp)
+              0))
+          0))
+    (g-byte! g 34)
+    (when (load (field g lone)) (store! (field g anylone) true))
+    (span-close! src sp)
+    0))
+
+(defn numtab [(k i64)] (-> (slice u8))
+  (case k
+    0 "0" 1 "-0" 2 "9223372036854775807" 3 "-9223372036854775808"
+    4 "9223372036854775808" 5 "-9223372036854775809" 6 "18446744073709551615"
+    7 "18446744073709551616" 8 "1e999" 9 "-1e999" 10 "0.1" 11 "1E+2"
+    12 "123456789012345678901234567890" 13 "4.9406564584124654e-324"
+    14 "2.2250738585072014e-308" 15 "1.7976931348623157e308" 16 "127" 17 "-128"
+    18 "255" 19 "256" 20 "65535" 21 "4294967295" 22 "4294967296" 23 "-2147483649"
+    24 "1.0" 25 "-0.0" 26 "0e0" 27 "1e-400" 28 "32767" 29 "-32769"
+    "2147483647"))
+
+(const NUMTAB-N 31)
+
+(defn g-digits! [(g (ptr G)) (lo i64) (hi i64)] (-> i64)
+  (let [src (load (field g src))
+        n (draw-len! src lo hi)]
+    (for [i 0 n] (g-byte! g (+ 48 (draw-int! src 0 9))))
+    0))
+
+(defn g-number! [(g (ptr G))] (-> i64)
+  (let [src (load (field g src))
+        sp (span-open! src "number" SPAN-PLAIN)]
+    (if (draw-bool-p! src 1 3)
+        (g-str! g (numtab (draw-int! src 0 (- NUMTAB-N 1))))
+        (do
+          (when (draw-bool-p! src 1 3) (g-byte! g 45))
+          (if (draw-bool-p! src 1 4)
+              (g-byte! g 48)
+              (do (g-byte! g (+ 49 (draw-int! src 0 8))) (g-digits! g 0 21)))
+          (when (draw-bool-p! src 1 3) (g-byte! g 46) (g-digits! g 1 20))
+          (when (draw-bool-p! src 1 4)
+            (g-byte! g (if (draw-bool! src) 101 69))
+            (case (draw-int! src 0 2) 0 0 1 (g-byte! g 43) (g-byte! g 45))
+            (g-digits! g 1 4))
+          0))
+    (span-close! src sp)
+    0))
+
+;;; a small corruption: the reference decides whether the result is still JSON
+(defn g-corrupt! [(g (ptr G))] (-> i64)
+  (let [src (load (field g src))]
+    (store! (field g corrupt) true)
+    (case (draw-int! src 0 6)
+      0 (g-byte! g (draw-int! src 0 255))
+      1 (g-byte! g (case (draw-int! src 0 7) 0 91 1 93 2 123 3 125 4 44 5 58 6 34 92))
+      2 (g-str! g (case (draw-int! src 0 5) 0 "nul" 1 "tru" 2 "-" 3 "1." 4 "1e" "01"))
+      3 (let [c (draw-int! src 0 31)] (g-byte! g 34) (g-byte! g c) (g-byte! g 34))
+      4 (g-str! g (case (draw-int! src 0 3) 0 "\"\\u12" 1 "\"\\x\"" 2 "\"\\" "\""))
+      5 (do (g-byte! g 34) (push-bad-utf8! (mut (field g out)) src) (g-byte! g 34))
+      0)))
+
+(defn g-value! [(g (ptr G))] (-> i64)
+  (let [src (load (field g src))
+        sp (span-open! src "value" SPAN-PLAIN)
+        cd (load (field g corrupt-den))]
+    (g-ws! g)
+    (if (and (> cd 0) (draw-bool-p! src 1 cd))
+        (g-corrupt! g)
+        (let [leaf (>= (load (field g depth)) (load (field g maxdepth)))
+              k (draw-tag! src (if leaf 4 6))]
+          (case k
+            0 (g-str! g "null")
+            1 (g-str! g (if (draw-bool! src) "true" "false"))
+            2 (g-number! g)
+            3 (g-string! g)
+            4 (do
+                (store! (field g depth) (+ (load (field g depth)) 1))
+                (g-byte! g 91)
+                (g-ws! g)
+                (let [n (draw-len! src 0 6)]
+                  (for [i 0 n]
+                    (let [esp (span-open! src "elem" SPAN-ELEM)]
+                      (when (> i 0) (g-byte! g 44))
+                      (g-value! g)
+                      (span-close! src esp)
+                      0)))
+                (g-byte! g 93)
+                (store! (field g depth) (- (load (field g depth)) 1))
+                0)
+            (do
+              (store! (field g depth) (+ (load (field g depth)) 1))
+              (g-byte! g 123)
+              (g-ws! g)
+              (let [n (draw-len! src 0 6)]
+                (for [i 0 n]
+                  (let [esp (span-open! src "member" SPAN-ELEM)]
+                    (when (> i 0) (g-byte! g 44))
+                    (g-ws! g)
+                    (g-string! g)
+                    (g-ws! g)
+                    (g-byte! g 58)
+                    (g-value! g)
+                    (span-close! src esp)
+                    0)))
+              (g-byte! g 125)
+              (store! (field g depth) (- (load (field g depth)) 1))
+              0))))
+    (g-ws! g)
+    (span-close! src sp)
+    0))
+
+;;; A whole JSON-shaped document. `corrupt-den` 0 = always valid by construction.
+(defn gen-doc [(src (ptr Source)) (corrupt-den i64) (maxdepth i64)] (-> G)
+  (let [(mut g) (g-new src corrupt-den maxdepth)]
+    (g-value! (mut g))
+    (load g)))
+
+; =========================================================================
+; JVal comparison
+; =========================================================================
+;;; mode 0: STRICT (kinds must match, floats bit-identical)
+;;; mode 1: NUMERIC (JInt n ~ JFloat x when they are the same number; -0 ~ 0)
+(defn jv-eq [(x JVal) (y JVal) (mode i64)] (-> bool)
+  (match x
+    (JNull [] (match y (JNull [] true) (_ false)))
+    (JBool [b] (match y (JBool [c] (= b c)) (_ false)))
+    (JInt [n]
+          (match y
+            (JInt [m] (= n m))
+            (JFloat [f] (and (= mode 1) (primitive/fcmp-eq (primitive/cast f64 n) f)
+                             (= n (primitive/cast i64 f))))
+            (_ false)))
+    (JFloat [f]
+            (match y
+              (JFloat [g] (if (= mode 1)
+                              (primitive/fcmp-eq f g)
+                              (= (f64->bits f) (f64->bits g))))
+              (JInt [m] (and (= mode 1) (primitive/fcmp-eq (primitive/cast f64 m) f)
+                             (= m (primitive/cast i64 f))))
+              (_ false)))
+    (JStr [s] (match y (JStr [t] (str-eq s t)) (_ false)))
+    (JBytes [s] (match y (JBytes [t] (str-eq s t)) (_ false)))
+    (JArr [l]
+          (match y
+            (JArr [m]
+                  (let [n (al-len [JVal] (load l))]
+                    (if (!= n (al-len [JVal] (load m)))
+                        false
+                        (let [(mut ok) true]
+                          (for [i 0 n]
+                            (when (and (load ok)
+                                       (not (jv-eq (al-get [JVal] (load l) i)
+                                                   (al-get [JVal] (load m) i)
+                                                   mode)))
+                              (store! ok false)
+                              0))
+                          (load ok)))))
+            (_ false)))
+    (JObj [m]
+          (match y
+            (JObj [o]
+                  (if (!= (hm-len [(slice u8) JVal] (load m)) (hm-len [(slice u8) JVal] (load o)))
+                      false
+                      (let [cap (hm-cap [(slice u8) JVal] (load m))
+                            slots (load (field m slots))
+                            (mut ok) true]
+                        (for [i 0 cap]
+                          (let [e (primitive/index slots i)]
+                            (when (and (load ok) (= (load (field e state)) 1))
+                              (match (hm-get [(slice u8) JVal] (load o) (load (field e key)))
+                                (None [] (store! ok false))
+                                (Some [v] (when (not (jv-eq (load (field e val)) v mode))
+                                            (store! ok false)
+                                            0)))
+                              0)
+                            0))
+                        (load ok))))
+            (_ false)))))
+
+;;; Does the JVal tree hold a non-finite float, or a float that is integral?
+(defn jv-has-inf? [(x JVal)] (-> bool)
+  (match x
+    (JFloat [f] (not (is-finite? f)))
+    (JArr [l]
+          (let [(mut r) false]
+            (for [i 0 (al-len [JVal] (load l))]
+              (when (jv-has-inf? (al-get [JVal] (load l) i)) (store! r true) 0))
+            (load r)))
+    (JObj [m]
+          (let [cap (hm-cap [(slice u8) JVal] (load m))
+                slots (load (field m slots))
+                (mut r) false]
+            (for [i 0 cap]
+              (let [e (primitive/index slots i)]
+                (when (and (= (load (field e state)) 1) (jv-has-inf? (load (field e val))))
+                  (store! r true)
+                  0)))
+            (load r)))
+    (_ false)))
+
+;;; does any object in the tape repeat a key (compared DECODED, as serde does)?
+(defn doc-has-dup-keys? [(a (dyn Allocator)) (d json/Doc) (src (slice u8))] (-> bool)
+  (let [n (json/token-count d)
+        (mut dup) false]
+    (for [i 0 n]
+      (let [t (json/token d i)]
+        (when (and (not (load dup)) (json/is-object? t))
+          (let [c (json/child-count t)]
+            (for [p 0 c]
+              (for [q (+ p 1) c]
+                (let [kp (json/token d (json/object-key d i p))
+                      kq (json/token d (json/object-key d i q))]
+                  (match (from-json [(slice u8)] a (subslice src (- (tok-start kp) 1) (+ (tok-end kp) 1)))
+                    (Ok [sp]
+                        (match (from-json [(slice u8)] a (subslice src (- (tok-start kq) 1) (+ (tok-end kq) 1)))
+                          (Ok [sq] (when (str-eq sp sq) (store! dup true) 0))
+                          (Err [_] 0)))
+                    (Err [_] 0))
+                  0))))
+          0)))
+    (load dup)))
+
+; =========================================================================
+; ARGUMENT TYPES — every generated input is a property ARGUMENT, so a
+; counterexample prints the actual JSON text (not an opaque seed)
+; =========================================================================
+
+;;; Arbitrary bytes over the FULL 0..255 range.
+(defstruct RawBytes [(b (slice u8))])
+
+(impl Arbitrary RawBytes
+  (arbitrary [(out (mut RawBytes)) (s (ptr Source))] (-> i64)
+    (store! (field out b) (arb-bytes s 0 64))
+    0))
+
+(impl Debug RawBytes
+  (debug-fmt [(x RawBytes) (f (ptr Formatter))] (-> i64)
+    (debug-fmt (load (field x b)) f)))
+
+;;; Grammar-shaped text, 1-in-12 values corrupted, nesting up to 6.
+(defstruct NoisyDoc [(text (slice u8)) (corrupt bool)])
+
+(impl Arbitrary NoisyDoc
+  (arbitrary [(out (mut NoisyDoc)) (s (ptr Source))] (-> i64)
+    (let [(mut g) (gen-doc s 12 6)]
+      (store! (field out text) (g-text (mut g)))
+      (store! (field out corrupt) (load (field g corrupt)))
+      0)))
+
+(impl Debug NoisyDoc
+  (debug-fmt [(x NoisyDoc) (f (ptr Formatter))] (-> i64)
+    (debug-fmt (load (field x text)) f)))
+
+;;; Valid JSON by construction (no corruption), nesting up to 5.
+(defstruct ValidDoc [(text (slice u8)) (anylone bool)])
+
+(impl Arbitrary ValidDoc
+  (arbitrary [(out (mut ValidDoc)) (s (ptr Source))] (-> i64)
+    (let [(mut g) (gen-doc s 0 5)]
+      (store! (field out text) (g-text (mut g)))
+      (store! (field out anylone) (load (field g anylone)))
+      0)))
+
+(impl Debug ValidDoc
+  (debug-fmt [(x ValidDoc) (f (ptr Formatter))] (-> i64)
+    (debug-fmt (load (field x text)) f)))
+
+;;; Half raw bytes, half lightly-corrupted grammar text.
+(defstruct MixedDoc [(text (slice u8))])
+
+(impl Arbitrary MixedDoc
+  (arbitrary [(out (mut MixedDoc)) (s (ptr Source))] (-> i64)
+    (if (draw-bool! s)
+        (store! (field out text) (arb-bytes s 0 48))
+        (let [(mut g) (gen-doc s 8 5)]
+          (store! (field out text) (g-text (mut g)))))
+    0))
+
+(impl Debug MixedDoc
+  (debug-fmt [(x MixedDoc) (f (ptr Formatter))] (-> i64)
+    (debug-fmt (load (field x text)) f)))
+
+;;; One string literal plus the generator's oracle for it.
+;;; `bad`: the literal holds malformed UTF-8 (1 raw segment in 3 is corrupted),
+;;; which the PARSER must reject before any decoding happens.
+(defstruct StrLit [(text (slice u8)) (want (slice u8)) (lone bool) (bad bool)])
+
+(impl Arbitrary StrLit
+  (arbitrary [(out (mut StrLit)) (s (ptr Source))] (-> i64)
+    (let [(mut g) (g-new s 3 0)]
+      (g-string! (mut g))
+      (store! (field out text) (g-text (mut g)))
+      (store! (field out want) (al-slice (load (field g dec))))
+      (store! (field out lone) (load (field g lone)))
+      (store! (field out bad) (load (field g bad)))
+      0)))
+
+(impl Debug StrLit
+  (debug-fmt [(x StrLit) (f (ptr Formatter))] (-> i64)
+    (debug-fmt (load (field x text)) f)))
+
+;;; One number literal.
+(defstruct NumLit [(text (slice u8))])
+
+(impl Arbitrary NumLit
+  (arbitrary [(out (mut NumLit)) (s (ptr Source))] (-> i64)
+    (let [(mut g) (g-new s 0 0)]
+      (g-number! (mut g))
+      (store! (field out text) (g-text (mut g)))
+      0)))
+
+(impl Debug NumLit
+  (debug-fmt [(x NumLit) (f (ptr Formatter))] (-> i64)
+    (debug-fmt (load (field x text)) f)))
+
+;;; A nesting depth for the stack-depth properties, shrinking toward 1.
+(defstruct BigNest [(depth i64) (objs bool)])
+
+(impl Arbitrary BigNest
+  (arbitrary [(out (mut BigNest)) (s (ptr Source))] (-> i64)
+    (store! (field out depth) (draw-int-origin! s 1 400000 1))
+    (store! (field out objs) (draw-bool! s))
+    0))
+
+(defstruct SmallNest [(depth i64) (kind i64)])
+
+(impl Arbitrary SmallNest
+  (arbitrary [(out (mut SmallNest)) (s (ptr Source))] (-> i64)
+    (store! (field out depth) (draw-int-origin! s 1 3000 1))
+    (store! (field out kind) (draw-int! s 0 2))   ; 0 arrays, 1 objects, 2 alternating
+    0))
+
+(derive Debug BigNest)
+
+(derive Debug SmallNest)
+
+;;; `depth` levels of `[` / `{"k":` around a 0.
+(defn nest-text [(a (dyn Allocator)) (depth i64) (kind i64)] (-> (slice u8))
+  (let [(mut b) (al-new [u8] a)]
+    (for [i 0 depth]
+      (if (or (= kind 1) (and (= kind 2) (= (% i 2) 1)))
+          (do (al-push! (mut b) (primitive/cast u8 123))
+              (al-push! (mut b) (primitive/cast u8 34))
+              (al-push! (mut b) (primitive/cast u8 107))
+              (al-push! (mut b) (primitive/cast u8 34))
+              (al-push! (mut b) (primitive/cast u8 58)))
+          (al-push! (mut b) (primitive/cast u8 91))))
+    (al-push! (mut b) (primitive/cast u8 48))
+    (for [j 0 depth]
+      (let [i (- (- depth 1) j)]
+        (al-push! (mut b)
+                  (primitive/cast u8 (if (or (= kind 1) (and (= kind 2) (= (% i 2) 1))) 125 93)))))
+    (al-slice (load b))))
+
+; =========================================================================
+; PROPERTIES — the parser
+; =========================================================================
+
+;; 1. Arbitrary bytes (the FULL 0..255 range): parse never crashes, agrees with
+;; the reference recognizer, and anything accepted has a coherent tape.
+(defprop parse-bytes-differential [(in RawBytes)]
+  (parse-law (src-alloc (prop-src)) (load (field in b))))
+
+;; 2. Grammar-shaped documents with occasional corruption: reaches the deep
+;; states (escapes, exponents, nested containers) that random bytes never do.
+(defprop parse-grammar-differential [(in NoisyDoc)]
+  (classify "corrupted" (load (field in corrupt)))
+  (parse-law (src-alloc (prop-src)) (load (field in text))))
+
+;; 3. Deep nesting. The reference is iterative; the parser must not blow the
+;; stack on a document a few hundred KB long.
+(defprop parse-deep-nesting [(n BigNest)]
+  (let [a (malloc-allocator)
+        depth (load (field n depth))
+        objs (load (field n objs))
+        text (nest-text a depth (if objs 1 0))
+        ok (match (json/parse a text)
+             (Err [_] true)   ; a depth limit is an acceptable answer
+             (Ok [d] (let [(mut dd) d
+                           r (= (json/token-count d) (if objs (+ (* 2 depth) 1) (+ depth 1)))]
+                       (json/doc-free! (mut dd))
+                       r)))]
+    (free-bytes a text 1)
+    ok))
+
+; =========================================================================
+; PROPERTIES — decoding strings, numbers (oracle-carrying generators)
+; =========================================================================
+
+;; 4. A generated string literal decodes to exactly the bytes the generator
+;; meant (escapes, \u BMP, surrogate pairs, mixed-case hex, raw 2/3/4-byte
+;; UTF-8), is rejected when it holds a lone surrogate or malformed UTF-8, and
+;; what it decodes to is well-formed UTF-8 that survives the serializer.
+(defprop string-decode-oracle [(lit StrLit)]
+  (let [a (src-alloc (prop-src))
+        text (load (field lit text))
+        want (load (field lit want))
+        lone (load (field lit lone))
+        bad (load (field lit bad))]
+    (classify "lone surrogate" lone)
+    (classify "malformed UTF-8" bad)
+    (match (from-json [(slice u8)] a text)
+      ; malformed UTF-8 is a PARSE error (json code 12), found before any
+      ; unescaping; a lone \u surrogate is caught by the decoder
+      (Err [e] (if bad
+                   (= (de-code e) DE-E-PARSE)
+                   (and lone (= (de-code e) DE-E-BAD-STRING))))
+      (Ok [s]
+          (and (not lone)
+               (not bad)
+               (ref-utf8-valid? s)
+               (str-eq s want)
+               (match (to-json-str a s)
+                 (Err [_] false)
+                 (Ok [out]
+                     (match (from-json [(slice u8)] a out)
+                       (Err [_] false)
+                       (Ok [s2] (str-eq s2 want))))))))))
+
+;;; The reference integer reading of a JSON number's text.
+(defsum IntReading
+  (NotInt)                ; a fraction or exponent: not an integer literal
+  (Fits [(v i64)])
+  (OutOfRange))
+
+;;; For unsigned, any '-' is out of range (matching the documented contract).
+(defn ref-int [(t (slice u8)) (unsigned bool)] (-> IntReading)
+  (block :ri
+    (let [n (slice-len t)
+          neg (= (byte-at t 0) 45)
+          ds (if neg 1 0)
+          nd (- n ds)
+          (mut acc) 0]
+      (for [i ds n]
+        (when (not (digit? (byte-at t i))) (return-from :ri (NotInt))))
+      (for [i ds n]
+        (store! acc (+ (* (load acc) 10) (- (byte-at t i) 48))))
+      (let [lim (if unsigned "18446744073709551615"
+                    (if neg "9223372036854775808" "9223372036854775807"))
+            digits (subslice t ds n)
+            fits (cond (and unsigned neg) false
+                       (< nd (slice-len lim)) true
+                       (> nd (slice-len lim)) false
+                       ; equal length: decimal strings compare lexicographically
+                       :else (<= (str-cmp digits lim) 0))]
+        (if fits
+            (Fits (if neg (- 0 (load acc)) (load acc)))
+            (OutOfRange))))))
+
+;;; digits before the first '.', 'e' or 'E' (after an optional '-')
+(defn int-prefix-len [(t (slice u8))] (-> i64)
+  (let [ds (if (= (byte-at t 0) 45) 1 0)
+        (mut i) ds]
+    (while (and (< (load i) (slice-len t)) (digit? (byte-at t (load i))))
+      (store! i (+ (load i) 1)))
+    (- (load i) ds)))
+
+;;; A decode of a narrow width agrees with the reading: Ok exactly when the
+;;; literal is an integer inside [lo, hi], with that value.
+(defn narrow-ok? [(r IntReading) (got (Option i64)) (lo i64) (hi i64)] (-> bool)
+  (match r
+    (Fits [w] (match got
+                (Some [v] (and (= v w) (>= w lo) (<= w hi)))
+                (None [] (or (< w lo) (> w hi)))))
+    (_ (match got (Some [_] false) (None [] true)))))
+
+;; 5. Integers: from-json [i64]/[u64]/[i8]/[u32] agree with the reference
+;; reading of the text (value; EXPECTED-INT for fractions/exponents; INT-RANGE).
+(defprop int-decode-oracle [(lit NumLit)]
+  (let [a (src-alloc (prop-src))
+        text (load (field lit text))
+        rs (ref-int text false)
+        ru (ref-int text true)
+        ok-i64
+          (match (from-json [i64] a text)
+            (Ok [v] (match rs (Fits [w] (= v w)) (_ false)))
+            (Err [e] (match rs
+                       (NotInt [] (or (= (de-code e) DE-E-EXPECTED-INT)
+                                      ; MINOR (reported): a fraction whose integer part
+                                      ; already overflows reports INT-RANGE
+                                      (and (>= (int-prefix-len text) 19)
+                                           (= (de-code e) DE-E-INT-RANGE))))
+                       (OutOfRange [] (= (de-code e) DE-E-INT-RANGE))
+                       (Fits [_] false))))
+        ok-u64
+          (match (from-json [u64] a text)
+            (Ok [v] (match ru (Fits [w] (= (primitive/cast i64 v) w)) (_ false)))
+            (Err [e] (match ru
+                       (NotInt [] (or (= (de-code e) DE-E-EXPECTED-INT)
+                                      (and (>= (int-prefix-len text) 20)
+                                           (= (de-code e) DE-E-INT-RANGE))
+                                      ; jd-uint rejects a leading '-' before looking
+                                      ; further, so "-1.5" is a range error: fine
+                                      (and (= (byte-at text 0) 45)
+                                           (= (de-code e) DE-E-INT-RANGE))))
+                       (OutOfRange [] (= (de-code e) DE-E-INT-RANGE))
+                       (Fits [_] false))))
+        ok-i8 (narrow-ok? rs
+                          (match (from-json [i8] a text)
+                            (Ok [v] (Some (primitive/cast i64 v)))
+                            (Err [_] (None [i64])))
+                          -128 127)
+        ok-u32 (narrow-ok? rs
+                           (match (from-json [u32] a text)
+                             (Ok [v] (Some (primitive/cast i64 v)))
+                             (Err [_] (None [i64])))
+                           0 4294967295)]
+    (classify "fits i64" (match rs (Fits [_] true) (_ false)))
+    (classify "overflows i64" (match rs (OutOfRange [] true) (_ false)))
+    (and ok-i64 ok-u64 ok-i8 ok-u32)))
+
+;; 6. Integers the other way: any i64 / u64 serializes and reads back exactly.
+(defprop int-roundtrip [(v i64)]
+  (let [a (src-alloc (prop-src))]
+    (and (match (to-json-str a v)
+           (Err [_] false)
+           (Ok [s] (match (from-json [i64] a s) (Ok [w] (= v w)) (Err [_] false))))
+         (match (to-json-str a (primitive/cast u64 v))
+           (Err [_] false)
+           (Ok [s] (match (from-json [u64] a s)
+                     (Ok [w] (= v (primitive/cast i64 w)))
+                     (Err [_] false)))))))
+
+;; 7. Floats: every finite f64 round-trips bit-exactly through to-json/from-json;
+;; NaN and +-inf are refused with SER-E-UNSUPPORTED.
+(defprop float-roundtrip [(x f64)]
+  (let [a (src-alloc (prop-src))]
+    (classify "non-finite" (not (is-finite? x)))
+    (match (to-json-str a x)
+      (Err [e] (and (not (is-finite? x)) (= (ser-code e) SER-E-UNSUPPORTED)))
+      (Ok [s]
+          (and (is-finite? x)
+               (ref-valid? a s)
+               (match (from-json [f64] a s)
+                 (Ok [y] (= (f64->bits x) (f64->bits y)))
+                 (Err [_] false)))))))
+
+; =========================================================================
+; PROPERTIES — the JVal DOM
+; =========================================================================
+
+;;; A well-formed UTF-8 string of `lo`..`hi` code points, one span per code
+;;; point: ASCII (control bytes, quote and backslash included, so every escape
+;;; path of the serializer runs), 2-, 3- and 4-byte sequences, and edge values.
+(defn arb-utf8 [(src (ptr Source)) (lo i64) (hi i64)] (-> (slice u8))
+  (let [sp (span-open! src "utf8" SPAN-PLAIN)
+        n (draw-len! src lo hi)
+        (mut l) (al-new [u8] (src-alloc src))]
+    (for [i 0 n]
+      (let [esp (span-open! src "cp" SPAN-ELEM)]
+        (push-utf8! (mut l) (draw-cp src (draw-int! src 1 5)))
+        (span-close! src esp)
+        0))
+    (span-close! src sp)
+    (al-slice (load l))))
+
+;;; a random JVal tree (well-formed UTF-8 strings and keys, finite floats)
+(defn gen-jval [(src (ptr Source)) (depth i64)] (-> JVal)
+  (let [a (src-alloc src)
+        sp (span-open! src "jval" SPAN-PLAIN)
+        k (draw-tag! src (if (>= depth 5) 6 8))
+        v (case k
+            0 (JNull)
+            1 (JBool (draw-bool! src))
+            2 (JInt (draw-int-any! src))
+            3 (let [x (draw-float! src)] (JFloat (if (is-finite? x) x 0.5)))
+            4 (JStr (arb-utf8 src 0 12))
+            5 (JInt (draw-int! src -1000 1000))
+            6 (let [n (draw-len! src 0 5)
+                    (mut l) (al-new [JVal] a)]
+                (for [i 0 n]
+                  (let [esp (span-open! src "elem" SPAN-ELEM)]
+                    (al-push! (mut l) (gen-jval src (+ depth 1)))
+                    (span-close! src esp)
+                    0))
+                (JArr (box! a (ArrayList JVal) (load l))))
+            (let [n (draw-len! src 0 5)
+                  (mut m) (hm-new [(slice u8) JVal] a (str-keyops-borrowed))]
+              (for [i 0 n]
+                (let [esp (span-open! src "member" SPAN-ELEM)
+                      key (arb-utf8 src 0 6)]
+                  (hm-put! (mut m) key (gen-jval src (+ depth 1)))
+                  (span-close! src esp)
+                  0))
+              (JObj (box! a (HashMap (slice u8) JVal) (load m)))))]
+    (span-close! src sp)
+    v))
+
+(impl Arbitrary JVal
+  (arbitrary [(out (mut JVal)) (s (ptr Source))] (-> i64)
+    (store! out (gen-jval s 0))
+    0))
+
+;;; Unambiguous printing: floats as F(value #bits) so JFloat 1.0 != JInt 1 is visible.
+(impl Debug JVal
+  (debug-fmt [(x JVal) (f (ptr Formatter))] (-> i64)
+    (let [w (formatter-writer f)]
+      (match x
+        (JNull [] (do (io/print-str w "null") 0))
+        (JBool [b] (do (io/print-str w (if b "true" "false")) 0))
+        (JInt [n] (debug-fmt n f))
+        (JFloat [v] (do (io/print-str w "F(")
+                        (debug-fmt v f)
+                        (io/print-str w " #")
+                        (debug-fmt (f64->bits v) f)
+                        (io/print-str w ")")
+                        0))
+        (JStr [s] (debug-fmt s f))
+        (JBytes [s] (debug-fmt s f))
+        (JArr [l]
+              (do (io/print-str w "[")
+                  (for [i 0 (al-len [JVal] (load l))]
+                    (do (when (> i 0) (io/print-str w ", ") 0)
+                        (debug-fmt (al-get [JVal] (load l) i) f)
+                        0))
+                  (io/print-str w "]")
+                  0))
+        (JObj [m]
+              (let [cap (hm-cap [(slice u8) JVal] (load m))
+                    slots (load (field m slots))
+                    (mut first) true]
+                (io/print-str w "{")
+                (for [i 0 cap]
+                  (let [e (primitive/index slots i)]
+                    (when (= (load (field e state)) 1)
+                      (when (not (load first)) (io/print-str w ", ") 0)
+                      (store! first false)
+                      (debug-fmt (load (field e key)) f)
+                      (io/print-str w ": ")
+                      (debug-fmt (load (field e val)) f)
+                      0)
+                    0))
+                (io/print-str w "}")
+                0))))))
+
+;; 8. JVal -> JSON -> JVal is the identity (STRICT: an f64 stays an f64, and
+;; its bits are preserved). The emitted text must also satisfy the reference.
+(defprop jval-roundtrip-strict [(v JVal)]
+  (let [a (src-alloc (prop-src))]
+    (match (to-json-str a v)
+      (Err [_] false)
+      (Ok [s]
+          (and (ref-valid? a s)
+               (match (from-json [JVal] a s)
+                 (Err [_] false)
+                 (Ok [w] (jv-eq v w 0))))))))
+
+;; 9. The same law with number KIND ignored (JFloat 3.0 ~ JInt 3) — keeps
+;; hunting for other round-trip bugs past the known float/int confusion.
+(defprop jval-roundtrip-numeric [(v JVal)]
+  (let [a (src-alloc (prop-src))]
+    (match (to-json-str a v)
+      (Err [_] false)
+      (Ok [s]
+          (and (ref-valid? a s)
+               (match (from-json [JVal] a s)
+                 (Err [_] false)
+                 (Ok [w] (jv-eq v w 1))))))))
+
+;; 10. Text -> JVal -> text -> JVal: any document the reference accepts decodes
+;; to a JVal (or fails for a DOCUMENTED reason: lone surrogate, i64 overflow,
+;; depth), re-serializes, and reads back equal.
+(defprop jval-text-fixpoint [(doc ValidDoc)]
+  (let [a (src-alloc (prop-src))
+        text (load (field doc text))]
+    (if (not (ref-valid? a text))
+        false   ; the generator promised valid JSON
+        (match (from-json [JVal] a text)
+          (Err [e]
+               (let [c (de-code e)]
+                 (or (and (= c DE-E-BAD-STRING) (load (field doc anylone)))
+                     (= c DE-E-INT-RANGE)
+                     (= c DE-E-BAD-NUMBER)   ; +-1e999 (with the proposed fix)
+                     (= c DE-E-DEPTH))))
+          (Ok [v]
+              (block :fx
+                ; +-1e999 decodes to +-inf, which JSON cannot re-encode: reported, skip
+                (when (jv-has-inf? v) (return-from :fx true))
+                (match (to-json-str a v)
+                  (Err [_] false)
+                  (Ok [s]
+                      (match (from-json [JVal] a s)
+                        (Err [_] false)
+                        (Ok [w] (jv-eq v w 1)))))))))))
+
+;; 11. JVal decoding of arbitrary (possibly invalid) bytes never crashes and
+;; agrees with the parser on acceptance.
+(defprop jval-decode-bytes [(doc MixedDoc)]
+  (let [a (src-alloc (prop-src))
+        text (load (field doc text))
+        parsed (match (json/parse a text) (Ok [_] true) (Err [_] false))]
+    (match (from-json [JVal] a text)
+      (Ok [_] parsed)
+      (Err [e] (if parsed (!= (de-code e) DE-E-PARSE) (= (de-code e) DE-E-PARSE))))))
+
+;; 12. Nesting depth is symmetric: whatever the deserializer accepts the
+;; serializer can write back (decode OK => encode OK and identical), no crash.
+(defprop jval-depth-symmetry [(n SmallNest)]
+  (let [a (src-alloc (prop-src))
+        text (nest-text a (load (field n depth)) (load (field n kind)))]
+    ; KNOWN BUG (reported): arrays have no decode depth limit while the serializer
+    ; stops at 64, so an array nest deeper than 64 decodes but cannot re-encode.
+    ; Uncomment to keep fuzzing past it:
+    ; (assume (or (= (load (field n kind)) 1) (<= (load (field n depth)) 64)))
+    (match (from-json [JVal] a text)
+      (Err [e] (or (= (de-code e) DE-E-DEPTH)
+                   ; unpatched library: the parser has no limit and this is PARSE
+                   (and (= (de-code e) DE-E-PARSE) (> (load (field n depth)) 512))))
+      (Ok [v]
+          (match (to-json-str a v)
+            (Err [_] false)
+            (Ok [s] (str-eq s text)))))))
+
+; =========================================================================
+; PROPERTIES — derived types
+; =========================================================================
+(defsum Shape
+  (Point)
+  (Circle [(r f64)])
+  (Rect [(w i64) (h i64)]))
+
+; deny-unknown so that a successful decode is FAITHFUL (property 14): without
+; it an unknown payload key is skipped by design and re-serialization drops it.
+(derive (Serialize (deny-unknown)) (Deserialize (deny-unknown)) Shape)
+
+(defstruct Inner [(tag (slice u8)) (n i32)])
+
+(derive Serialize Deserialize Inner)
+
+(defstruct Rec
+  [(a i8) (b i16) (c i32) (d i64) (e u8) (f u16) (g u32) (h u64)
+   (flag bool) (x f64) (s (slice u8)) (o (Option i64)) (l (ArrayList i64))
+   (shape Shape) (shapes (ArrayList Shape)) (inner Inner)
+   (m (HashMap (slice u8) i64)) (os (Option Shape))])
+
+(derive Serialize Deserialize Rec)
+
+(defn gen-shape [(src (ptr Source))] (-> Shape)
+  (case (draw-tag! src 3)
+    0 (Point)
+    1 (let [x (draw-float! src)] (Circle (if (is-finite? x) x 1.5)))
+    (Rect (draw-int-any! src) (draw-int-any! src))))
+
+(defn shape-eq [(x Shape) (y Shape)] (-> bool)
+  (match x
+    (Point [] (match y (Point [] true) (_ false)))
+    (Circle [r] (match y (Circle [q] (= (f64->bits r) (f64->bits q))) (_ false)))
+    (Rect [w h] (match y (Rect [w2 h2] (and (= w w2) (= h h2))) (_ false)))))
+
+(defn gen-rec [(src (ptr Source))] (-> Rec)
+  (let [a (src-alloc src)
+        (mut r) (primitive/zeroed Rec)]
+    (store! (field r a) (primitive/cast i8 (draw-int! src -128 127)))
+    (store! (field r b) (primitive/cast i16 (draw-int! src -32768 32767)))
+    (store! (field r c) (primitive/cast i32 (draw-int! src -2147483648 2147483647)))
+    (store! (field r d) (draw-int-any! src))
+    (store! (field r e) (primitive/cast u8 (draw-int! src 0 255)))
+    (store! (field r f) (primitive/cast u16 (draw-int! src 0 65535)))
+    (store! (field r g) (primitive/cast u32 (draw-int! src 0 4294967295)))
+    (store! (field r h) (primitive/cast u64 (draw-int-any! src)))
+    (store! (field r flag) (draw-bool! src))
+    (let [x (draw-float! src)] (store! (field r x) (if (is-finite? x) x -2.25)))
+    (store! (field r s) (arb-utf8 src 0 16))
+    (store! (field r o) (if (draw-bool! src) (Some (draw-int-any! src)) (None [i64])))
+    (let [(mut l) (al-new [i64] a)
+          n (draw-len! src 0 5)]
+      (for [i 0 n] (al-push! (mut l) (draw-int-any! src)))
+      (store! (field r l) (load l)))
+    (store! (field r shape) (gen-shape src))
+    (let [(mut l) (al-new [Shape] a)
+          n (draw-len! src 0 4)]
+      (for [i 0 n]
+        (let [esp (span-open! src "shape" SPAN-ELEM)]
+          (al-push! (mut l) (gen-shape src))
+          (span-close! src esp)))
+      (store! (field r shapes) (load l)))
+    (store! (field (field r inner) tag) (arb-utf8 src 0 8))
+    (store! (field (field r inner) n) (primitive/cast i32 (draw-int! src -2147483648 2147483647)))
+    (let [(mut m) (hm-new [(slice u8) i64] a (str-keyops-borrowed))
+          n (draw-len! src 0 4)]
+      (for [i 0 n]
+        (let [esp (span-open! src "entry" SPAN-ELEM)]
+          (hm-put! (mut m) (arb-utf8 src 0 5) (draw-int-any! src))
+          (span-close! src esp)))
+      (store! (field r m) (load m)))
+    (store! (field r os) (if (draw-bool! src) (Some (gen-shape src)) (None [Shape])))
+    (load r)))
+
+(impl Arbitrary Rec
+  (arbitrary [(out (mut Rec)) (s (ptr Source))] (-> i64)
+    (store! out (gen-rec s))
+    0))
+
+;;; A Rec prints as its own JSON (every field is visible there).
+(impl Debug Rec
+  (debug-fmt [(x Rec) (f (ptr Formatter))] (-> i64)
+    (match (to-json-str (malloc-allocator) x)
+      (Ok [s] (do (io/print-str (formatter-writer f) s) 0))
+      (Err [_] (do (io/print-str (formatter-writer f) "<unserializable Rec>") 0)))))
+
+(defn i64-list-eq [(x (ArrayList i64)) (y (ArrayList i64))] (-> bool)
+  (if (!= (al-len x) (al-len y))
+      false
+      (let [(mut ok) true]
+        (for [i 0 (al-len x)] (when (!= (al-get x i) (al-get y i)) (store! ok false) 0))
+        (load ok))))
+
+(defn shape-list-eq [(x (ArrayList Shape)) (y (ArrayList Shape))] (-> bool)
+  (if (!= (al-len x) (al-len y))
+      false
+      (let [(mut ok) true]
+        (for [i 0 (al-len x)]
+          (when (not (shape-eq (al-get x i) (al-get y i))) (store! ok false) 0))
+        (load ok))))
+
+(defn map-eq [(x (HashMap (slice u8) i64)) (y (HashMap (slice u8) i64))] (-> bool)
+  (if (!= (hm-len x) (hm-len y))
+      false
+      (let [cap (hm-cap x)
+            slots (load (field x slots))
+            (mut ok) true]
+        (for [i 0 cap]
+          (let [e (primitive/index slots i)]
+            (when (= (load (field e state)) 1)
+              (match (hm-get y (load (field e key)))
+                (None [] (store! ok false))
+                (Some [v] (when (!= v (load (field e val))) (store! ok false) 0)))
+              0)))
+        (load ok))))
+
+(defn rec-eq [(p Rec) (q Rec)] (-> bool)
+  (and (= (load (field p a)) (load (field q a)))
+       (= (load (field p b)) (load (field q b)))
+       (= (load (field p c)) (load (field q c)))
+       (= (load (field p d)) (load (field q d)))
+       (= (load (field p e)) (load (field q e)))
+       (= (load (field p f)) (load (field q f)))
+       (= (load (field p g)) (load (field q g)))
+       (= (load (field p h)) (load (field q h)))
+       (= (load (field p flag)) (load (field q flag)))
+       (= (f64->bits (load (field p x))) (f64->bits (load (field q x))))
+       (str-eq (load (field p s)) (load (field q s)))
+       (match (load (field p o))
+         (None [] (match (load (field q o)) (None [] true) (_ false)))
+         (Some [u] (match (load (field q o)) (Some [w] (= u w)) (_ false))))
+       (i64-list-eq (load (field p l)) (load (field q l)))
+       (shape-eq (load (field p shape)) (load (field q shape)))
+       (shape-list-eq (load (field p shapes)) (load (field q shapes)))
+       (str-eq (load (field (field p inner) tag)) (load (field (field q inner) tag)))
+       (= (load (field (field p inner) n)) (load (field (field q inner) n)))
+       (map-eq (load (field p m)) (load (field q m)))
+       (match (load (field p os))
+         (None [] (match (load (field q os)) (None [] true) (_ false)))
+         (Some [u] (match (load (field q os)) (Some [w] (shape-eq u w)) (_ false))))))
+
+;; 13. A derived record covering every serde scalar width, UTF-8 strings
+;; (every escape, 1..4-byte sequences), Option, lists, a sum, a nested struct
+;; and a map round-trips.
+(defprop typed-record-roundtrip [(r Rec)]
+  (let [a (src-alloc (prop-src))]
+    (match (to-json-str a r)
+      (Err [_] false)
+      (Ok [s]
+          (and (ref-valid? a s)
+               (match (from-json [Rec] a s)
+                 (Err [_] false)
+                 (Ok [r2] (rec-eq r r2))))))))
+
+;;; Loose structural comparison of what a typed decode READ (`t`, the input's
+;;; DOM) with what it WROTE back (`s`): numbers by value; a key absent from the
+;;; input matches null in the output (Option -> None -> null); a one-key object
+;;; {"Tag": x} in the input matches the unit-variant string "Tag" in the output.
+(defn faithful? [(t JVal) (s JVal)] (-> bool)
+  (match t
+    (JObj [m]
+          (match s
+            (JObj [o]
+                  (let [(mut ok) true]
+                    (let [cap (hm-cap [(slice u8) JVal] (load o))
+                          slots (load (field o slots))]
+                      (for [i 0 cap]
+                        (let [e (primitive/index slots i)]
+                          (when (and (load ok) (= (load (field e state)) 1))
+                            (match (hm-get [(slice u8) JVal] (load m) (load (field e key)))
+                              (None [] (when (not (jv-null? (load (field e val)))) (store! ok false) 0))
+                              (Some [v] (when (not (faithful? v (load (field e val)))) (store! ok false) 0)))
+                            0))))
+                    (let [cap (hm-cap [(slice u8) JVal] (load m))
+                          slots (load (field m slots))]
+                      (for [i 0 cap]
+                        (let [e (primitive/index slots i)]
+                          (when (and (load ok) (= (load (field e state)) 1))
+                            (when (not (hm-contains? [(slice u8) JVal] (load o) (load (field e key))))
+                              (store! ok false))
+                            0))))
+                    (load ok)))
+            (JStr [tag]
+                  (and (= (hm-len [(slice u8) JVal] (load m)) 1)
+                       (hm-contains? [(slice u8) JVal] (load m) tag)))
+            (_ false)))
+    (JArr [l]
+          (match s
+            (JArr [k]
+                  (let [n (al-len [JVal] (load l))]
+                    (if (!= n (al-len [JVal] (load k)))
+                        false
+                        (let [(mut ok) true]
+                          (for [i 0 n]
+                            (when (and (load ok)
+                                       (not (faithful? (al-get [JVal] (load l) i)
+                                                       (al-get [JVal] (load k) i))))
+                              (store! ok false)
+                              0))
+                          (load ok)))))
+            (_ false)))
+    ; an integer literal read into an f64 field comes back as that f64: equal
+    ; when the integer converts to exactly that double (1e17+1 -> 1e17)
+    (JInt [n] (match s
+                (JFloat [f] (primitive/fcmp-eq (primitive/cast f64 n) f))
+                (_ (jv-eq t s 1))))
+    (_ (jv-eq t s 1))))
+
+(defstruct Holder [(shape Shape) (more (Option Shape)) (n (Option i64))])
+
+(derive (Serialize (deny-unknown)) (Deserialize (deny-unknown)) Holder)
+
+;;; Which typed decoder a faithful-decode case exercises.
+(defstruct Faith [(text (slice u8)) (which i64)])
+
+(impl Arbitrary Faith
+  (arbitrary [(out (mut Faith)) (s (ptr Source))] (-> i64)
+    (let [(mut g) (gen-doc s 0 4)]
+      (store! (field out text) (g-text (mut g)))
+      (store! (field out which) (draw-int! s 0 2))
+      0)))
+
+(impl Debug Faith
+  (debug-fmt [(x Faith) (f (ptr Formatter))] (-> i64)
+    (debug-fmt (load (field x text)) f)
+    (io/print-str (formatter-writer f) (case (load (field x which))
+                                         0 "  as (ArrayList Shape)"
+                                         1 "  as Holder"
+                                         "  as (HashMap (slice u8) (ArrayList Shape))"))
+    0))
+
+;; 14. A typed decode that SUCCEEDS must be faithful to its input: re-serializing
+;; the decoded value gives back the document it read (modulo the documented
+;; normalizations in `faithful?`). Catches a decoder that reads the wrong token.
+(defprop typed-decode-faithful [(in Faith)]
+  (let [a (src-alloc (prop-src))
+        text (load (field in text))
+        which (load (field in which))]
+    (block :tf
+      (let [tv (match (from-json [JVal] a text)
+                 (Ok [v] v)
+                 (Err [_] (return-from :tf true)))]
+        (match (json/parse a text)
+          (Ok [d] (when (doc-has-dup-keys? a d text) (return-from :tf true)))
+          (Err [_] (return-from :tf false)))
+        (let [out (case which
+                    0 (match (from-json [(ArrayList Shape)] a text)
+                        (Ok [v] (match (to-json-str a v) (Ok [s] s) (Err [_] (return-from :tf false))))
+                        (Err [_] (return-from :tf true)))
+                    1 (match (from-json [Holder] a text)
+                        (Ok [v] (match (to-json-str a v) (Ok [s] s) (Err [_] (return-from :tf false))))
+                        (Err [_] (return-from :tf true)))
+                    (match (from-json [(HashMap (slice u8) (ArrayList Shape))] a text)
+                      (Ok [v] (match (to-json-str a v) (Ok [s] s) (Err [_] (return-from :tf false))))
+                      (Err [_] (return-from :tf true))))]
+          (classify "decoded" true)
+          (match (from-json [JVal] a out)
+            (Ok [sv] (faithful? tv sv))
+            (Err [_] false)))))))
+
+;; 15. Typed decoders fed arbitrary JSON-shaped text never crash (ASan) and
+;; either succeed or return a coded error.
+(defprop typed-decode-no-crash [(doc MixedDoc)]
+  (let [a (src-alloc (prop-src))
+        text (load (field doc text))]
+    (match (from-json [Rec] a text) (Ok [_] 0) (Err [_] 0))
+    (match (from-json [(ArrayList Shape)] a text) (Ok [_] 0) (Err [_] 0))
+    (match (from-json [Holder] a text) (Ok [_] 0) (Err [_] 0))
+    (match (from-json [(Option (ArrayList (Option Inner)))] a text) (Ok [_] 0) (Err [_] 0))
+    (match (from-json [(HashMap (slice u8) Shape)] a text) (Ok [_] 0) (Err [_] 0))
+    true))
+
+; =========================================================================
+; PROPERTIES — the serializer's error paths
+; =========================================================================
+
+;;; A Writer that accepts `left` more bytes and then fails with EIO.
+(defstruct FailCtx [(left i64)])
+
+(defn fail-write [(ctx (ptr i8)) (buf (ptr i8)) (len i64)] (-> (Result i64 io/IoError))
+  (let [c (primitive/cast (ptr FailCtx) ctx)]
+    (if (< (load (field c left)) len)
+        (Err (io/Errno 5))
+        (do (store! (field c left) (- (load (field c left)) len))
+            (Ok len)))))
+
+;;; Serialize `v` into a writer that dies after `limit` bytes.
+(defn to-failing [(T Serialize)] [(v T) (limit i64)] (-> (Result i64 SerError))
+  (let [c (primitive/alloc-stack FailCtx)
+        w (primitive/alloc-stack io/Writer)]
+    (store! (field c left) limit)
+    (store! (field w write-fn) (primitive/fnptr-of fail-write))
+    (store! (field w ctx) (primitive/cast (ptr i8) c))
+    (to-json v w)))
+
+(defstruct Cut [(v JVal) (r Rec) (k i64)])
+
+(impl Arbitrary Cut
+  (arbitrary [(out (mut Cut)) (s (ptr Source))] (-> i64)
+    (store! (field out v) (gen-jval s 0))
+    (store! (field out r) (gen-rec s))
+    (store! (field out k) (draw-int! s 0 400))
+    0))
+
+(impl Debug Cut
+  (debug-fmt [(x Cut) (f (ptr Formatter))] (-> i64)
+    (debug-fmt (load (field x v)) f)
+    (io/print-str (formatter-writer f) "  /  ")
+    (debug-fmt (load (field x r)) f)
+    (io/print-str (formatter-writer f) "  cut at ")
+    (debug-fmt (load (field x k)) f)
+    0))
+
+;;; full text vs. the same value cut at k bytes
+(defn cut-ok? [(k i64) (full (Result (slice u8) SerError)) (cut (Result i64 SerError))] (-> bool)
+  (match full
+    (Err [_] false)
+    (Ok [s] (match cut
+              (Ok [_] (>= k (slice-len s)))
+              (Err [e] (and (< k (slice-len s)) (= (ser-code e) SER-E-IO)))))))
+
+;; 16. A writer failure anywhere is reported as SER-E-IO (never a crash, never a
+;; silent success); a writer with room for the whole text succeeds.
+(defprop ser-writer-failure [(c Cut)]
+  (let [a (src-alloc (prop-src))
+        k (load (field c k))]
+    (and (cut-ok? k (to-json-str a (load (field c v))) (to-failing (load (field c v)) k))
+         (cut-ok? k (to-json-str a (load (field c r))) (to-failing (load (field c r)) k)))))
+
+; =========================================================================
+; PROPERTIES — the serializer's UTF-8 contract
+; =========================================================================
+
+;;; Bytes for the UTF-8 contract: either arbitrary bytes, or a well-formed
+;;; string with one malformed sequence spliced in (or none), so both sides of
+;;; the contract are hit often.
+(defstruct Utf8ish [(b (slice u8))])
+
+(impl Arbitrary Utf8ish
+  (arbitrary [(out (mut Utf8ish)) (s (ptr Source))] (-> i64)
+    (if (draw-bool-p! s 1 3)
+        (store! (field out b) (arb-bytes s 0 24))
+        (let [pre (arb-utf8 s 0 6)
+              post (arb-utf8 s 0 6)
+              (mut l) (al-new [u8] (src-alloc s))]
+          (for [i 0 (slice-len pre)] (put-u8! (mut l) (byte-at pre i)))
+          (when (draw-bool! s) (push-bad-utf8! (mut l) s))
+          (for [i 0 (slice-len post)] (put-u8! (mut l) (byte-at post i)))
+          (store! (field out b) (al-slice (load l)))))
+    0))
+
+(impl Debug Utf8ish
+  (debug-fmt [(x Utf8ish) (f (ptr Formatter))] (-> i64)
+    (debug-fmt (load (field x b)) f)))
+
+;;; The contract for one serialization of a value holding `s`: success exactly
+;;; when `s` is well-formed UTF-8 (then the text is valid JSON), otherwise
+;;; SER-E-UNSUPPORTED.
+(defn utf8-contract? [(a (dyn Allocator)) (valid bool) (r (Result (slice u8) SerError))] (-> bool)
+  (match r
+    (Ok [text] (and valid (ref-valid? a text)))
+    (Err [e] (and (not valid) (= (ser-code e) SER-E-UNSUPPORTED)))))
+
+;; 17. The serializer refuses a string or map key that is not well-formed
+;; UTF-8 (it would be invalid JSON that coil.json itself rejects), accepts every
+;; well-formed one, and a well-formed string comes back byte-identical.
+(defprop ser-utf8-contract [(in Utf8ish)]
+  (let [a (src-alloc (prop-src))
+        s (load (field in b))
+        valid (ref-utf8-valid? s)
+        (mut m) (hm-new [(slice u8) i64] a (str-keyops-borrowed))
+        (mut jm) (hm-new [(slice u8) JVal] a (str-keyops-borrowed))]
+    (hm-put! (mut m) s 1)
+    (hm-put! (mut jm) s (JNull))
+    (classify "well-formed" valid)
+    (and (utf8-contract? a valid (to-json-str a s))
+         (utf8-contract? a valid (to-json-str a (JStr s)))
+         (utf8-contract? a valid (to-json-str a (load m)))
+         (utf8-contract? a valid (to-json-str a (JObj (box! a (HashMap (slice u8) JVal) (load jm)))))
+         (match (to-json-str a s)
+           (Ok [text] (match (from-json [(slice u8)] a text)
+                        (Ok [back] (str-eq back s))
+                        (Err [_] false)))
+           (Err [_] true)))))

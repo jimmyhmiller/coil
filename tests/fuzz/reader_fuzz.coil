@@ -1,0 +1,1026 @@
+(module reader_fuzz)
+(import "coil.primitive" :as primitive)
+(import "coil.prop" :use *)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.control" :use *)
+(import "coil.reader" :use *)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+
+; FUZZ TARGET for `coil.reader` — the s-expression reader the compiler itself
+; reads every source file with.
+;
+;   coil fuzz reader_fuzz.coil --time 120 [--jobs N] [--sanitize=address]
+;   coil test reader_fuzz.coil                         ; replays saved failures
+;
+; Laws asserted:
+;   * any input (full byte range, or text built from the reader's own alphabet,
+;     under default / scheme / RANDOM reader configs) reads to Ok or Err — no
+;     crash, no hang — and
+;       - Err carries a span inside the input and the caller's source id;
+;       - Ok is self-consistent: every node's span is inside its parent and after
+;         its left sibling, stamped with the source id, its delimiters/spelling
+;         are really at that span, and RE-READING exactly that span yields the
+;         same node (so a diagnostic pointing at a node points at that node);
+;       - reading is deterministic.
+;   * ROUND TRIP: a generated tree printed as Coil text (random whitespace,
+;     comments, all numeric radixes, underscores, float formats, string/c-string
+;     escapes incl. \xHEX; UTF-8, char literals, prefixes) reads back to exactly
+;     that tree.
+;   * integer literals agree with an independent exact decoder, INCLUDING
+;     the out-of-range cases (which must not read as a wrapped integer).
+;   * char literals `\uHEX` agree with an independent decoder.
+;   * nesting depth: deep but bounded input reads (or errors) without dying.
+
+(const SRC-ID 7)
+
+(extern snprintf :cc c [(ptr i8) i64 (ptr i8) ...] (-> i32))
+
+(defn ult [(x i64) (y i64)] (-> bool) (< (primitive/cast u64 x) (primitive/cast u64 y)))
+(defn ule [(x i64) (y i64)] (-> bool) (<= (primitive/cast u64 x) (primitive/cast u64 y)))
+(defn ugt [(x i64) (y i64)] (-> bool) (> (primitive/cast u64 x) (primitive/cast u64 y)))
+; logical shift right by 32
+(defn lshr32 [(x i64)] (-> i64) (primitive/iand (primitive/ishr x 32) 4294967295))
+
+; ─────────────────────────────── byte output ───────────────────────────────
+
+(defstruct Out [(buf (ArrayList u8))])
+
+(defn out-new [(a (dyn Allocator))] (-> (ptr Out))
+  (let [o (box! a Out (primitive/zeroed Out))]
+    (store! (field o buf) (al-new [u8] a))
+    o))
+
+(defn out-byte! [(o (ptr Out)) (b i64)] (-> i64)
+  (al-push! (mut (field o buf)) (primitive/cast u8 b))
+  0)
+
+(defn out-str! [(o (ptr Out)) (s (slice u8))] (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (slice-len s))
+              (break)
+              (do
+                (out-byte! o (primitive/cast i64 (slice-get s (load i))))
+                (store! i (+ (load i) 1)))))
+    0))
+
+(defn out-text [(o (ptr Out))] (-> (slice u8))
+  (al-slice [u8] (load (field o buf))))
+
+(defn out-len [(o (ptr Out))] (-> i64)
+  (al-len [u8] (load (field o buf))))
+
+(defn hex-digit-char [(d i64) (upper bool)] (-> i64)
+  (if (< d 10) (+ 48 d) (+ (if upper 65 97) (- d 10))))
+
+; Digits of an unsigned magnitude in `radix`, most significant first.
+(defn out-udigits! [(o (ptr Out)) (v i64) (radix i64) (upper bool)] (-> i64)
+  (if (ult v radix)
+      (out-byte! o (hex-digit-char v upper))
+      (do
+        (out-udigits! o (primitive/udiv v radix) radix upper)
+        (out-byte! o (hex-digit-char (primitive/urem v radix) upper)))))
+
+; Independent UTF-8 encoder (the reader has its own; this one is the oracle).
+(defn out-utf8! [(o (ptr Out)) (cp i64)] (-> i64)
+  (cond (<= cp 127) (out-byte! o cp)
+        (<= cp 2047)
+          (do
+            (out-byte! o (primitive/ior 192 (primitive/ishr cp 6)))
+            (out-byte! o (primitive/ior 128 (primitive/iand cp 63))))
+        (<= cp 65535)
+          (do
+            (out-byte! o (primitive/ior 224 (primitive/ishr cp 12)))
+            (out-byte! o (primitive/ior 128 (primitive/iand (primitive/ishr cp 6) 63)))
+            (out-byte! o (primitive/ior 128 (primitive/iand cp 63))))
+        :else
+          (do
+            (out-byte! o (primitive/ior 240 (primitive/ishr cp 18)))
+            (out-byte! o (primitive/ior 128 (primitive/iand (primitive/ishr cp 12) 63)))
+            (out-byte! o (primitive/ior 128 (primitive/iand (primitive/ishr cp 6) 63)))
+            (out-byte! o (primitive/ior 128 (primitive/iand cp 63))))))
+
+
+; A failing case's input, printed escaped (the runner only shows the defprop
+; ARGUMENTS, and these properties draw their real input by hand).
+(defn show-input [(label (slice u8)) (text (slice u8))] (-> i64)
+  (let [o (out-new (malloc-allocator))
+        (mut i) 0]
+    (loop (if (>= (load i) (slice-len text))
+              (break)
+              (let [c (byte-at text (load i))]
+                (if (or (< c 32) (>= c 127) (= c 92))
+                    (do (out-byte! o 92) (out-byte! o 120)
+                        (out-byte! o (hex-digit-char (primitive/ishr c 4) false))
+                        (out-byte! o (hex-digit-char (primitive/iand c 15) false)))
+                    (out-byte! o c))
+                (store! i (+ (load i) 1)))))
+    (fmt (stderr) "  {} input ({} bytes): \"{}\"\n" label (slice-len text) (out-text o))
+    0))
+
+(defn verdict [(ok bool) (label (slice u8)) (text (slice u8))] (-> bool)
+  (unless ok (show-input label text))
+  ok)
+
+; ─────────────────────────────── Sexp helpers ──────────────────────────────
+
+(defn ktag [(x (ptr Sexp))] (-> i64)
+  (match (load (field x kind))
+    (KInt [v] 0)
+    (KFloat [b] 1)
+    (KSym [s] 2)
+    (KKw [s] 3)
+    (KStr [s] 4)
+    (KCStr [s] 5)
+    (KList [items] 6)
+    (KVec [items] 7)
+    (KView [items off len] 8)))
+
+(defn kword [(x (ptr Sexp))] (-> i64)
+  (match (load (field x kind))
+    (KInt [v] v)
+    (KFloat [b] b)
+    (_ (sexp-wrong-variant [i64] c"reader_fuzz kword: not an int/float"))))
+
+(defn kbytes [(x (ptr Sexp))] (-> (slice u8))
+  (match (load (field x kind))
+    (KSym [s] s)
+    (KKw [s] s)
+    (KStr [s] s)
+    (KCStr [s] s)
+    (_ (sexp-wrong-variant [(slice u8)] c"reader_fuzz kbytes: not a byte payload"))))
+
+(defn nkids [(x (ptr Sexp))] (-> i64)
+  (sexp-count x))
+
+(defn kid [(x (ptr Sexp)) (i i64)] (-> (ptr Sexp))
+  (sexp-nth x i))
+
+; Debug rendering of a tree (kind + payload + span), for failure reports.
+(defn show-sexp [(x (ptr Sexp))] (-> i64)
+  (let [t (ktag x)]
+    (cond (= t 0) (do (fmt (stderr) "int:{}" (kword x)) 0)
+          (= t 1) (do (fmt (stderr) "float-bits:{}" (kword x)) 0)
+          (<= t 5) (do (fmt (stderr) "{}:|{}|" (case t 2 "sym" 3 "kw" 4 "str" "cstr") (kbytes x)) 0)
+          (>= t 8) (do (fmt (stderr) "view") 0)
+          :else
+            (let [k (nkids x)
+                  (mut i) 0]
+              (fmt (stderr) "{}" (if (= t 6) "(" "["))
+              (loop (if (>= (load i) k)
+                        (break)
+                        (do
+                          (show-sexp (kid x (load i)))
+                          (fmt (stderr) " ")
+                          (store! i (+ (load i) 1)))))
+              (fmt (stderr) "{}" (if (= t 6) ")" "]"))
+              0))
+    (fmt (stderr) "@{}..{}" (load (field x lo)) (load (field x hi)))
+    0))
+
+(defn show-forms [(label (slice u8)) (xs (ptr (ArrayList Sexp)))] (-> i64)
+  (let [k (al-len [Sexp] (load xs))
+        (mut i) 0]
+    (fmt (stderr) "  {}: " label)
+    (loop (if (>= (load i) k)
+              (break)
+              (do
+                (show-sexp (al-elem [Sexp] xs (load i)))
+                (fmt (stderr) "  ")
+                (store! i (+ (load i) 1)))))
+    (fmt (stderr) "\n")
+    0))
+
+(defn sexp-eq [(x (ptr Sexp)) (y (ptr Sexp))] (-> bool)
+  (let [t (ktag x)]
+    (cond (!= t (ktag y)) false
+          (<= t 1) (= (kword x) (kword y))
+          (<= t 5) (= (kbytes x) (kbytes y))
+          (>= t 8) false
+          :else
+            (let [n (nkids x)]
+              (if (!= n (nkids y))
+                  false
+                  (let [(mut i) 0
+                        (mut ok) true]
+                    (loop (if (or (>= (load i) n) (not (load ok)))
+                              (break)
+                              (do
+                                (store! ok (sexp-eq (kid x (load i)) (kid y (load i))))
+                                (store! i (+ (load i) 1)))))
+                    (load ok)))))))
+
+(defn byte-at [(s (slice u8)) (i i64)] (-> i64)
+  (primitive/cast i64 (slice-get s i)))
+
+(defn prefix-name-ok [(nm (slice u8))] (-> bool)
+  (or (= nm "quote")
+      (= nm "quasiquote")
+      (= nm "unquote")
+      (= nm "unquote-splicing")
+      (= nm "syntax")))
+
+; A list/vector node that came from a PREFIX (`'x`, `#'x`, `~@x` ...) rather
+; than from a bracket: its text does not start with `(`, `[` or `#(`.
+(defn prefix-form? [(text (slice u8)) (x (ptr Sexp))] (-> bool)
+  (and (= (ktag x) 6)
+       (!= (byte-at text (load (field x lo))) 40)))
+
+; Structural invariants of an accepted read: span bounds/nesting/order, source
+; stamping, delimiters and spellings actually at the span.
+(defn node-ok [(text (slice u8)) (x (ptr Sexp)) (plo i64) (phi i64) (head bool)] (-> bool)
+  (let [n (slice-len text)
+        lo (load (field x lo))
+        hi (load (field x hi))
+        t (ktag x)]
+    (if (not (and (<= 0 lo) (< lo hi) (<= hi n) (>= lo plo) (<= hi phi)
+                  (= (load (field x source)) SRC-ID)))
+        false
+        (let [c0 (byte-at text lo)
+              cl (byte-at text (- hi 1))
+              shape
+                (cond (= t 2)
+                        (if head
+                            (prefix-name-ok (kbytes x))
+                            (= (kbytes x) (subslice text lo hi)))
+                      (= t 3) (and (= c0 58) (= (kbytes x) (subslice text (+ lo 1) hi)))
+                      (= t 4) (and (= c0 34) (= cl 34) (>= (- hi lo) 2))
+                      (= t 5) (and (= c0 99) (= cl 34) (>= (- hi lo) 3)
+                                   (= (byte-at text (+ lo 1)) 34))
+                      (= t 6)
+                        (if (= c0 40)
+                            (= cl 41)
+                            ; prefix form: exactly (head inner), inner ends the span
+                            (and (= (nkids x) 2)
+                                 (= (load (field (kid x 0) lo)) lo)
+                                 (= (load (field (kid x 1) hi)) hi)))
+                      (= t 7)
+                        (or (and (= c0 91) (= cl 93))
+                            (and (= c0 35) (= cl 41) (>= (- hi lo) 3)
+                                 (= (byte-at text (+ lo 1)) 40)))
+                      (= t 8) false
+                      :else true)]
+          (if (not shape)
+              false
+              (if (< t 6)
+                  true
+                  (let [k (nkids x)
+                        pre (prefix-form? text x)
+                        (mut i) 0
+                        (mut prev) lo
+                        (mut ok) true]
+                    (loop (if (or (>= (load i) k) (not (load ok)))
+                              (break)
+                              (let [c (kid x (load i))]
+                                (store! ok (node-ok text c (load prev) hi
+                                                    (and pre (= (load i) 0))))
+                                (store! prev (load (field c hi)))
+                                (store! i (+ (load i) 1)))))
+                    (load ok))))))))
+
+; Re-reading exactly a node's span must give back that node (skipping the
+; synthesized head symbol of a prefix form, whose span is only the prefix).
+(defn reread-ok [(a (dyn Allocator)) (text (slice u8)) (cfg ReaderConfig) (x (ptr Sexp))] (-> bool)
+  (let [lo (load (field x lo))
+        hi (load (field x hi))
+        me
+          (match (read-all-with a (subslice text lo hi) SRC-ID cfg)
+            (Err [d] false)
+            (Ok [fs]
+                (and (= (al-len [Sexp] (load fs)) 1)
+                     (sexp-eq (al-elem [Sexp] fs 0) x))))]
+    (if (not me)
+        false
+        (let [t (ktag x)]
+          (if (or (= t 6) (= t 7))
+              (let [k (nkids x)
+                    (mut i) (if (prefix-form? text x) 1 0)
+                    (mut ok) true]
+                (loop (if (or (>= (load i) k) (not (load ok)))
+                          (break)
+                          (do
+                            (store! ok (reread-ok a text cfg (kid x (load i))))
+                            (store! i (+ (load i) 1)))))
+                (load ok))
+              true)))))
+
+(defn forms-ok [(a (dyn Allocator)) (text (slice u8)) (cfg ReaderConfig)
+                (forms (ptr (ArrayList Sexp))) (reread bool)] (-> bool)
+  (let [k (al-len [Sexp] (load forms))
+        (mut i) 0
+        (mut prev) 0
+        (mut ok) true]
+    (loop (if (or (>= (load i) k) (not (load ok)))
+              (break)
+              (let [c (al-elem [Sexp] forms (load i))]
+                (store! ok (and (node-ok text c (load prev) (slice-len text) false)
+                                (or (not reread) (reread-ok a text cfg c))))
+                (store! prev (load (field c hi)))
+                (store! i (+ (load i) 1)))))
+    (load ok)))
+
+(defn forms-eq [(x (ptr (ArrayList Sexp))) (y (ptr (ArrayList Sexp)))] (-> bool)
+  (let [n (al-len [Sexp] (load x))]
+    (if (!= n (al-len [Sexp] (load y)))
+        false
+        (let [(mut i) 0
+              (mut ok) true]
+          (loop (if (or (>= (load i) n) (not (load ok)))
+                    (break)
+                    (do
+                      (store! ok (sexp-eq (al-elem [Sexp] x (load i)) (al-elem [Sexp] y (load i))))
+                      (store! i (+ (load i) 1)))))
+          (load ok)))))
+
+(defn diag-ok? [(d Diag) (n i64)] (-> bool)
+  (let [dd d
+        lo (load (field dd lo))
+        hi (load (field dd hi))]
+    (and (<= 0 lo) (<= lo hi) (<= hi n)
+         (= (load (field dd source)) SRC-ID)
+         (> (slice-len (load (field dd msg))) 0))))
+
+; The whole "arbitrary input" law, for one text under one config.
+(defn check-text [(a (dyn Allocator)) (text (slice u8)) (cfg ReaderConfig)] (-> bool)
+  (let [n (slice-len text)
+        r1 (read-all-with a text SRC-ID cfg)
+        r2 (read-all-with a text SRC-ID cfg)]
+    (match r1
+      (Err [d]
+           (match r2
+             (Ok [f2] false)  ; nondeterministic
+             (Err [d2]
+                  (let [x d
+                        y d2]
+                    (if (and (= (load (field x lo)) (load (field y lo)))
+                             (= (load (field x hi)) (load (field y hi))))
+                        (diag-ok? d n)
+                        false)))))
+      (Ok [forms]
+          (match r2
+            (Err [d2] false)
+            (Ok [f2] (and (forms-eq forms f2) (forms-ok a text cfg forms true))))))))
+
+; ────────────────────────────── configs ───────────────────────────────────
+
+(defn interesting-punct [(s (ptr Source))] (-> i64)
+  (let [set "~,@`'#\\\";:(a.-"
+        k (draw-int! s 0 (slice-len set))]
+    (if (= k (slice-len set))
+        (draw-int! s 0 255)
+        (byte-at set k))))
+
+(defn draw-config [(s (ptr Source))] (-> ReaderConfig)
+  (let [sp (span-open! s "config" SPAN-PLAIN)
+        t (draw-tag! s 3)
+        cfg
+          (cond (= t 0) (default-reader-config)
+                (= t 1) (scheme-reader-config)
+                :else
+                  (ReaderConfig
+                    :unquote (interesting-punct s)
+                    :alternate-unquote (if (draw-bool! s) -1 (interesting-punct s))
+                    :unquote-splicing (interesting-punct s)))]
+    (span-close! s sp)
+    cfg))
+
+; ─────────────────────── reader-shaped text generator ─────────────────────
+
+(defn frag [(k i64)] (-> (slice u8))
+  (case k
+    0 "(" 1 ")" 2 "[" 3 "]" 4 " " 5 "a" 6 "\"" 7 "\\" 8 "#(" 9 "#'"
+    10 "#\\" 11 "c\"" 12 "\\x" 13 ";" 14 "\n" 15 "'" 16 "`" 17 "~" 18 "~@" 19 ","
+    20 ",@" 21 "@" 22 ":" 23 "0" 24 "1" 25 "9" 26 "0x" 27 "0b" 28 "0o" 29 "_"
+    30 "." 31 "e" 32 "E" 33 "-" 34 "+" 35 "u" 36 "z" 37 "F" 38 "space" 39 "newline"
+    40 "\\u" 41 "10FFFF" 42 "D800" 43 "λ" 44 "\t" 45 "\r" 46 "#" 47 "\\n" 48 "\\\\" 49 "\\\""
+    50 "\\0" 51 "#\\u41" 52 "\\x41;" 53 "3bb;" 54 "9223372036854775807" 55 "18446744073709551615"
+    56 "1e308" 57 "inf" 58 "nan" 59 "p" 60 "c" 61 "x" 62 "abc" 63 "-0x8000000000000000"
+    64 "1.5" 65 "tab" 66 "0x1.8p1" 67 "ff" 68 "\\\\x" 69 "\\r\\t"
+    ""))
+
+(const NFRAG 70)
+
+(defn gen-shaped [(s (ptr Source)) (a (dyn Allocator)) (maxn i64)] (-> (slice u8))
+  (let [o (out-new a)
+        sp (span-open! s "shaped" SPAN-PLAIN)
+        n (draw-len! s 0 maxn)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [esp (span-open! s "frag" SPAN-ELEM)
+                    k (draw-int! s 0 NFRAG)]
+                (if (= k NFRAG)
+                    (out-byte! o (draw-int! s 0 255))  ; one raw byte, any value
+                    (out-str! o (frag k)))
+                (span-close! s esp)
+                (store! i (+ (load i) 1)))))
+    (span-close! s sp)
+    (out-text o)))
+
+; ────────────────────────── round-trip generator ──────────────────────────
+;
+; Builds the EXPECTED tree and its text side by side. Expected nodes carry
+; dummy spans (only structure is compared).
+
+(defn mk [(k SexpKind)] (-> Sexp)
+  (mk-sexp k 0 1))
+
+; Whitespace and comments. `need` forces at least one byte of separation.
+(defn gen-sep! [(s (ptr Source)) (o (ptr Out)) (need bool)] (-> i64)
+  (let [n (draw-len! s (if need 1 0) 3)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [esp (span-open! s "sep" SPAN-ELEM)
+                    t (draw-tag! s 6)]
+                (cond (= t 0) (out-byte! o 32)
+                      (= t 1) (out-byte! o 10)
+                      (= t 2) (out-byte! o 9)
+                      (= t 3) (out-byte! o 13)
+                      (= t 4) (out-byte! o (draw-int! s 11 12))
+                      :else
+                        (let [m (draw-len! s 0 8)
+                              (mut j) 0]
+                          (out-byte! o 59)
+                          (loop (if (>= (load j) m)
+                                    (break)
+                                    (let [b (draw-int! s 0 255)]
+                                      (out-byte! o (if (= b 10) 32 b))
+                                      (store! j (+ (load j) 1)))))
+                          (out-byte! o 10)))
+                (span-close! s esp)
+                (store! i (+ (load i) 1)))))
+    0))
+
+; Bytes that can appear inside an atom under both default and scheme configs,
+; and that are not whitespace/delimiters.
+(defn atom-byte-ok [(b i64)] (-> bool)
+  (not (or (<= b 32) (= b 127)
+           (= b 40) (= b 41) (= b 91) (= b 93) (= b 59) (= b 39) (= b 96)
+           (= b 126) (= b 44) (= b 34))))
+
+(defn draw-atom-byte [(s (ptr Source))] (-> i64)
+  (let [t (draw-tag! s 4)]
+    (cond (= t 0) (draw-int! s 97 122)
+          (= t 1) (byte-at "*!?<>=/_$%&^|-+.#:@\\0123456789" (draw-int! s 0 29))
+          (= t 2) (draw-int! s 65 90)
+          :else
+            (let [b (draw-int! s 33 255)]
+              (if (atom-byte-ok b) b 120)))))
+
+(defn letter-ish? [(b i64)] (-> bool)
+  (not (or (and (>= b 48) (<= b 57))
+           (= b 35) (= b 58) (= b 64) (= b 43) (= b 45) (= b 46) (= b 92))))
+
+; A symbol that the reader must take as a symbol: first byte not a digit,
+; `#` (dispatch), `:` (keyword), `@` (would merge with a preceding `~`),
+; `\` (char literal) or a sign/dot (could look numeric).
+(defn gen-sym-text [(s (ptr Source)) (a (dyn Allocator))] (-> (slice u8))
+  (let [o (out-new a)
+        first-kind (draw-tag! s 3)]
+    (if (= first-kind 2)
+        ; a sign/dot followed by a letter (a digit there would make a number)
+        (do
+          (out-byte! o (byte-at "+-." (draw-int! s 0 2)))
+          (out-byte! o (draw-int! s 97 122)))
+        (let [(mut b) (draw-atom-byte s)]
+          (when (not (letter-ish? (load b))) (store! b 102))
+          (out-byte! o (load b))))
+    (let [m (if (and (= first-kind 2) (draw-bool-p! s 1 4))
+                0
+                (draw-len! s 0 6))
+          (mut i) 0]
+      (loop (if (>= (load i) m)
+                (break)
+                (do
+                  (out-byte! o (draw-atom-byte s))
+                  (store! i (+ (load i) 1))))))
+    (out-text o)))
+
+; String body elements: raw bytes, the named escapes, and \xHEX; code points
+; (with leading zeros and mixed case). `cbytes` = c-string rules (\x <= 0xFF,
+; emitted as one raw byte).
+(defn gen-str-body! [(s (ptr Source)) (o (ptr Out)) (ex (ptr Out)) (cbytes bool)] (-> i64)
+  (let [n (draw-len! s 0 12)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [esp (span-open! s "strel" SPAN-ELEM)
+                    t (draw-tag! s 4)]
+                (cond (= t 0)
+                        (let [b (draw-int-origin! s 0 255 97)
+                              b2 (if (or (= b 34) (= b 92)) 97 b)]
+                          (out-byte! o b2)
+                          (out-byte! ex b2))
+                      (= t 1)
+                        (let [k (draw-int! s 0 5)]
+                          (out-byte! o 92)
+                          (out-byte! o (byte-at "ntr0\"\\" k))
+                          (out-byte! ex (case k 0 10 1 9 2 13 3 0 4 34 92)))
+                      :else
+                        (let [cp0 (if cbytes
+                                      (draw-int! s 0 255)
+                                      (let [r (draw-tag! s 4)]
+                                        (cond (= r 0) (draw-int! s 0 127)
+                                              (= r 1) (draw-int! s 128 2047)
+                                              (= r 2) (draw-int! s 2048 65535)
+                                              :else (draw-int! s 65536 1114111))))
+                              cp (if (and (>= cp0 55296) (<= cp0 57343)) 65 cp0)
+                              zeros (draw-int! s 0 2)
+                              upper (draw-bool! s)
+                              (mut z) 0]
+                          (out-byte! o 92)
+                          (out-byte! o 120)
+                          (loop (if (>= (load z) zeros)
+                                    (break)
+                                    (do (out-byte! o 48) (store! z (+ (load z) 1)))))
+                          (out-udigits! o cp 16 upper)
+                          (out-byte! o 59)
+                          (if cbytes (out-byte! ex cp) (out-utf8! ex cp))))
+                (span-close! s esp)
+                (store! i (+ (load i) 1)))))
+    0))
+
+; The escape table above maps index k of "ntr0\"\\" to its byte; \0 is index 3.
+; (Written out so the oracle does not share code with the reader.)
+
+(defn gen-int-text! [(s (ptr Source)) (o (ptr Out))] (-> i64)
+  (let [v (draw-int-any! s)
+        radix-t (draw-tag! s 4)
+        radix (case radix-t 0 10 1 16 2 2 8)
+        neg (< v 0)
+        mag (if neg (primitive/isub 0 v) v)  ; i64-min stays i64-min = 2^63 unsigned
+        upper (draw-bool! s)
+        us (draw-bool-p! s 1 4)]
+    (if neg
+        (out-byte! o 45)
+        (when (draw-bool-p! s 1 4) (out-byte! o 43)))
+    (when (!= radix 10)
+      (out-byte! o 48)
+      (out-byte! o (case radix
+                     16 (if upper 88 120)
+                     2 (if upper 66 98)
+                      (if upper 79 111))))
+    (if us
+        ; digits with single underscores sprinkled BETWEEN digits (the only
+        ; place the reader accepts one)
+        (let [d (out-new (src-alloc s))]
+          (out-udigits! d mag radix upper)
+          (let [t (out-text d)
+                (mut i) 0]
+            (loop (if (>= (load i) (slice-len t))
+                      (break)
+                      (do
+                        (out-byte! o (byte-at t (load i)))
+                        (when (and (< (+ (load i) 1) (slice-len t)) (draw-bool-p! s 1 3))
+                          (out-byte! o 95))
+                        (store! i (+ (load i) 1)))))))
+        (out-udigits! o mag radix upper))
+    v))
+
+(defn float-text [(a (dyn Allocator)) (x f64) (fmtk i64)] (-> (slice u8))
+  (let [buf (primitive/cast (ptr i8) (box! a (array u8 64) (primitive/zeroed (array u8 64))))
+        n (snprintf buf 64 (if (= fmtk 0) c"%.17g" c"%.17e") x)
+        t (slice-new [u8] (primitive/cast (ptr u8) buf) (primitive/cast i64 n))
+        (mut has) false
+        (mut i) 0]
+    (loop (if (>= (load i) (slice-len t))
+              (break)
+              (let [c (byte-at t (load i))]
+                (when (or (= c 46) (= c 101) (= c 69)) (store! has true))
+                (store! i (+ (load i) 1)))))
+    (if (load has)
+        t
+        (let [o (out-new a)]
+          (out-str! o t)
+          (out-str! o ".0")
+          (out-text o)))))
+
+(defn prefix-text [(k i64) (scheme bool)] (-> (slice u8))
+  (case k
+    0 "'"
+    1 "`"
+    2 (if scheme "," "~")
+    3 (if scheme ",@" "~@")
+    4 "#'"
+    5 ","
+    ",@"))
+
+(defn prefix-sym [(k i64)] (-> (slice u8))
+  (case k 0 "quote" 1 "quasiquote" 2 "unquote" 3 "unquote-splicing" 4 "syntax" 5 "unquote" "unquote-splicing"))
+
+(defn named-char [(k i64)] (-> (slice u8))
+  (case k 0 "space" 1 "newline" 2 "tab" 3 "return" 4 "nul" 5 "null" 6 "backspace" "formfeed"))
+
+(defn named-char-code [(k i64)] (-> i64)
+  (case k 0 32 1 10 2 9 3 13 4 0 5 0 6 8 12))
+
+; One form. Returns the expected node; `last` receives 1 when the text ends in a
+; self-delimiting byte (`)` `]` `"`), so the next form may follow with no space.
+(defn gen-form [(s (ptr Source)) (a (dyn Allocator)) (o (ptr Out)) (scheme bool)
+                (depth i64) (last (ptr i64))] (-> Sexp)
+  (let [sp (span-open! s "form" SPAN-NODE)
+        leaf-only (or (>= depth 6) (= (src-spend-fuel! s 1) 0))
+        t0 (draw-tag! s 12)
+        t (if (and leaf-only (>= t0 9)) (- t0 9) t0)
+        result
+          (cond
+            (= t 0)
+              (let [v (gen-int-text! s o)]
+                (store! last 0)
+                (mk (KInt v)))
+            (= t 1)
+              (let [x (draw-float! s)
+                    xb (f64->bits x)
+                    ; NaN / inf have no numeric spelling in the reader
+                    finite (!= (primitive/iand (primitive/ishr xb 52) 2047) 2047)
+                    y (if finite x 1.5)]
+                (out-str! o (float-text a y (draw-int! s 0 1)))
+                (store! last 0)
+                (mk (KFloat (f64->bits y))))
+            (= t 2)
+              (let [st (gen-sym-text s a)]
+                (out-str! o st)
+                (store! last 0)
+                (mk (KSym st)))
+            (= t 3)
+              (let [ex (out-new a)
+                    m (draw-len! s 0 5)
+                    (mut i) 0]
+                (out-byte! o 58)
+                (loop (if (>= (load i) m)
+                          (break)
+                          (let [b (draw-atom-byte s)]
+                            (out-byte! o b)
+                            (out-byte! ex b)
+                            (store! i (+ (load i) 1)))))
+                (store! last 0)
+                (mk (KKw (out-text ex))))
+            (= t 4)
+              (let [ex (out-new a)]
+                (out-byte! o 34)
+                (gen-str-body! s o ex false)
+                (out-byte! o 34)
+                (store! last 1)
+                (mk (KStr (out-text ex))))
+            (= t 5)
+              (let [ex (out-new a)]
+                (out-byte! o 99)
+                (out-byte! o 34)
+                (gen-str-body! s o ex true)
+                (out-byte! o 34)
+                (store! last 1)
+                (mk (KCStr (out-text ex))))
+            (= t 6)
+              ; legacy char literal: \c (one byte), \name, \uHEX, \<UTF-8 char> -> KInt
+              (let [k0 (draw-tag! s 4)
+                    k k0
+                    v (cond (= k 3)
+                              (let [cp0 (draw-int! s 128 1114111)
+                                    cp (if (and (>= cp0 55296) (<= cp0 57343)) 955 cp0)]
+                                (out-byte! o 92)
+                                (out-utf8! o cp)
+                                cp)
+                            (= k 0)
+                              (let [b2 (draw-int! s 33 255)]
+                                (out-byte! o 92)
+                                (out-byte! o b2)
+                                b2)
+                            (= k 1)
+                              (let [nk (draw-int! s 0 7)]
+                                (out-byte! o 92)
+                                (out-str! o (named-char nk))
+                                (named-char-code nk))
+                            :else
+                              (let [cp0 (draw-int! s 0 1114111)
+                                    cp (if (and (>= cp0 55296) (<= cp0 57343)) 66 cp0)]
+                                (out-byte! o 92)
+                                (out-byte! o 117)
+                                (out-udigits! o cp 16 (draw-bool! s))
+                                cp))]
+                (store! last 0)
+                (mk (KInt v)))
+            (= t 7)
+              ; canonical #\ literal: the reader keeps the spelling as a symbol
+              (let [ex (out-new a)
+                    k (draw-tag! s 3)]
+                (out-str! o "#\\")
+                (out-str! ex "#\\")
+                (cond (= k 0)
+                        (let [b (draw-int! s 33 127)]
+                          (out-byte! o b)
+                          (out-byte! ex b))
+                      (= k 1)
+                        (let [nm (named-char (draw-int! s 0 7))]
+                          (out-str! o nm)
+                          (out-str! ex nm))
+                      :else
+                        ; a multi-byte UTF-8 character
+                        (let [cp (draw-int! s 128 2047)]
+                          (out-utf8! o cp)
+                          (out-utf8! ex cp)))
+                (store! last 0)
+                (mk (KSym (out-text ex))))
+            (= t 8)
+              (let [v (draw-int-any! s)]
+                ; bare signed decimal, the most common spelling
+                (when (< v 0) (out-byte! o 45))
+                (out-udigits! o (if (< v 0) (primitive/isub 0 v) v) 10 false)
+                (store! last 0)
+                (mk (KInt v)))
+            (= t 11)
+              (let [k (draw-int! s 0 (if scheme 4 6))
+                    (mut inner-last) 0]
+                (out-str! o (prefix-text k scheme))
+                (gen-sep! s o false)
+                (let [inner (gen-form s a o scheme (+ depth 1) (mut inner-last))
+                      (mut kids) (al-new [Sexp] a)]
+                  (al-push! (mut kids) (mk (KSym (prefix-sym k))))
+                  (al-push! (mut kids) inner)
+                  (store! last (load inner-last))
+                  (mk (KList (box-items a (load kids))))))
+            :else
+              ; 9 = (list), 10 = [vec], with #( as a vector spelling too
+              (let [vec-kind (if (= t 9) 0 (+ 1 (draw-int! s 0 1)))
+                    n (draw-len! s 0 5)
+                    (mut kids) (al-new [Sexp] a)
+                    (mut prev-last) 1
+                    (mut i) 0]
+                (out-str! o (case vec-kind 0 "(" 1 "[" "#("))
+                (gen-sep! s o false)
+                (loop (if (>= (load i) n)
+                          (break)
+                          (let [esp (span-open! s "kid" SPAN-ELEM)
+                                (mut kl) 0]
+                            (gen-sep! s o (= (load prev-last) 0))
+                            (al-push! (mut kids) (gen-form s a o scheme (+ depth 1) (mut kl)))
+                            (store! prev-last (load kl))
+                            (span-close! s esp)
+                            (store! i (+ (load i) 1)))))
+                (gen-sep! s o false)
+                (out-byte! o (if (= vec-kind 1) 93 41))
+                (store! last 1)
+                (mk (if (= vec-kind 0)
+                        (KList (box-items a (load kids)))
+                        (KVec (box-items a (load kids)))))))]
+    (span-close! s sp)
+    result))
+
+; `c` followed directly by `"` would read as a C-string: the generator must not
+; glue a symbol `c` to a following string. gen-sep! with need=true after every
+; atom-ending form guarantees it; this check documents the assumption.
+
+(defstruct Trip [(text (slice u8)) (expected (ptr (ArrayList Sexp))) (scheme bool)])
+
+(defn gen-trip [(s (ptr Source)) (a (dyn Allocator))] (-> Trip)
+  (let [o (out-new a)
+        scheme (draw-bool-p! s 1 4)
+        n (draw-len! s 0 6)
+        (mut kids) (al-new [Sexp] a)
+        (mut prev-last) 1
+        (mut i) 0]
+    (gen-sep! s o false)
+    (loop (if (>= (load i) n)
+              (break)
+              (let [esp (span-open! s "top" SPAN-ELEM)
+                    (mut kl) 0]
+                (gen-sep! s o (= (load prev-last) 0))
+                (al-push! (mut kids) (gen-form s a o scheme 0 (mut kl)))
+                (store! prev-last (load kl))
+                (span-close! s esp)
+                (store! i (+ (load i) 1)))))
+    (gen-sep! s o false)
+    (Trip :text (out-text o) :expected (box-items a (load kids)) :scheme scheme)))
+
+(defstruct Big [(hi i64) (lo i64) (ovf bool)])
+
+(defn big-mul-add! [(b (ptr Big)) (m i64) (d i64)] (-> i64)
+  ; (hi,lo) = (hi,lo)*m + d, with m <= 16, d < 16; track overflow of 128 bits
+  (let [lo (load (field b lo))
+        hi (load (field b hi))
+        ; split lo in 32-bit halves
+        l0 (primitive/iand lo 4294967295)
+        l1 (lshr32 lo)
+        p0 (primitive/iadd (primitive/imul l0 m) d)
+        p1 (primitive/iadd (primitive/imul l1 m) (lshr32 p0))
+        nlo (primitive/ior (primitive/iand p0 4294967295) (primitive/imul (primitive/iand p1 4294967295) 4294967296))
+        carry (lshr32 p1)
+        nhi (primitive/iadd (primitive/imul hi m) carry)]
+    (when (ugt hi 1152921504606846975) (store! (field b ovf) true))
+    (store! (field b lo) nlo)
+    (store! (field b hi) nhi)
+    0))
+
+; Expected meaning of an integer spelling:
+;   decimal: a value in [i64-min, i64-max], else NOT an integer;
+;   0x/0b/0o: magnitude <= 2^64-1 without sign (bit pattern, as in
+;     `0xFFFFFFFFFFFFFFFF` = -1, which the oracle corpus relies on), and
+;     magnitude <= 2^63 with a `-` sign; else NOT an integer.
+(defstruct IntExp [(is-int bool) (v i64)])
+
+;;; Is every `_` between two digits? A literal with a leading, trailing or doubled
+;;; underscore (`_1`, `1_`, `1__0`, `0x_FF`) is not an integer.
+(defn underscores-between-digits? [(digits (slice u8))] (-> bool)
+  (let [n (slice-len digits)
+        (mut ok) true
+        (mut i) 0]
+    (loop (if (or (not (load ok)) (>= (load i) n))
+              (break)
+              (do
+                (when (and (= (byte-at digits (load i)) 95)
+                           (or (= (load i) 0)
+                               (= (load i) (- n 1))
+                               (= (byte-at digits (+ (load i) 1)) 95)))
+                  (store! ok false))
+                (store! i (+ (load i) 1)))))
+    (load ok)))
+
+(defn int-oracle [(neg bool) (radix i64) (digits (slice u8))] (-> IntExp)
+  (let [b (primitive/alloc-stack Big)
+        (mut i) 0]
+    (store! b (Big :hi 0 :lo 0 :ovf false))
+    (loop (if (>= (load i) (slice-len digits))
+              (break)
+              (let [c (byte-at digits (load i))]
+                (when (!= c 95)
+                  (big-mul-add! b radix (cond (<= c 57) (- c 48)
+                                              (>= c 97) (- c 87)
+                                              :else (- c 55))))
+                (store! i (+ (load i) 1)))))
+    (let [hi (load (field b hi))
+          lo (load (field b lo))
+          fits-u64 (and (not (load (field b ovf))) (= hi 0))
+          ok
+            (cond (not (underscores-between-digits? digits)) false
+                  (not fits-u64) false
+                  neg (ule lo -9223372036854775808)
+                  (= radix 10) (ule lo 9223372036854775807)
+                  :else true)]
+      (IntExp :is-int ok :v (if neg (primitive/isub 0 lo) lo)))))
+
+; ───────────────────────────── properties ─────────────────────────────────
+
+(defn run-check [(s (ptr Source)) (text (slice u8)) (cfg ReaderConfig)] (-> bool)
+  (check-text (src-alloc s) text cfg))
+
+;; 1. Arbitrary bytes (0..255), native config.
+(defprop bytes-read-sane [(seed i64)]
+  (let [src (prop-src)
+        text (arb-bytes src 0 160)
+        r (run-check src text (default-reader-config))]
+    (verdict r "bytes" text)))
+
+;; 2. Reader-shaped text under default, scheme, and random punctuation configs.
+(defprop shaped-read-sane [(seed i64)]
+  (let [src (prop-src)
+        cfg (draw-config src)
+        text (gen-shaped src (src-alloc src) 60)
+        r (run-check src text cfg)]
+    (verdict r "shaped" text)))
+
+;; 3. An error's span points inside the input (EOF after a prefix included).
+(defprop error-span-in-bounds [(seed i64)]
+  (let [src (prop-src)
+        text (gen-shaped src (src-alloc src) 30)]
+    (match (read-all (src-alloc src) text SRC-ID)
+      (Ok [f] true)
+      (Err [d]
+           (let [dd d
+                 lo (load (field dd lo))
+                 hi (load (field dd hi))]
+             (do
+               (verdict (and (<= 0 lo) (<= lo hi) (<= hi (slice-len text))) "error-span" text)))))))
+
+;; 4. Round trip: printed tree reads back to the same tree, with sane spans
+;;    and every node re-readable from its own span.
+(defprop roundtrip [(seed i64)]
+  (let [src (prop-src)
+        a (src-alloc src)
+        trip (gen-trip src a)
+        text (.text trip)
+        cfg (if (.scheme trip) (scheme-reader-config) (default-reader-config))]
+    (verdict
+      (match (read-all-with a text SRC-ID cfg)
+        (Err [d] false)
+        (Ok [forms]
+            (let [eq (forms-eq forms (.expected trip))
+                  ok (forms-ok a text cfg forms true)]
+              (unless (and eq ok)
+                (fmt (stderr) "  structure-equal={} spans-ok={}\n" eq ok)
+                (show-forms "expected" (.expected trip))
+                (show-forms "read    " forms))
+              (and eq ok))))
+      (if (.scheme trip) "roundtrip(scheme)" "roundtrip")
+      text)))
+
+;; 5. Integer literals agree with an exact decoder, including out-of-range ones.
+(defprop int-literal-oracle [(seed i64)]
+  (let [src (prop-src)
+        a (src-alloc src)
+        o (out-new a)
+        dg (out-new a)
+        sign (draw-tag! src 3)
+        radix (case (draw-tag! src 4) 0 10 1 16 2 2 8)
+        nd (draw-len! src 1 40)
+        (mut i) 0]
+    (case sign 1 (out-byte! o 45) 2 (out-byte! o 43) 0)
+    (when (!= radix 10)
+      (out-byte! o 48)
+      (out-byte! o (case radix 16 120 2 98 111)))
+    ; mode 0: a random digit string; mode 1: a full-range u64 magnitude
+    ; (half of which lie in the 2^63..2^64 band where signedness matters)
+    (when (draw-bool! src)
+      (let [raw (out-new a)
+            mag (draw-int-any! src)]
+        (out-udigits! raw mag radix false)
+        (let [t (out-text raw)
+              (mut j) 0]
+          (loop (if (>= (load j) (slice-len t))
+                    (break)
+                    (do
+                      (when (draw-bool-p! src 1 5)
+                        (out-byte! dg 95))
+                      (out-byte! dg (byte-at t (load j)))
+                      (store! j (+ (load j) 1))))))
+        (store! i nd)))
+    (loop (if (>= (load i) nd)
+              (break)
+              (let [esp (span-open! src "digit" SPAN-ELEM)
+                    d (draw-int! src 0 (- radix 1))
+                    ; underscores land anywhere, well-placed or not: the
+                    ; oracle knows the rule (only between digits)
+                    us (draw-bool-p! src 1 5)]
+                (when us (out-byte! dg 95))
+                (out-byte! dg (hex-digit-char d (draw-bool! src)))
+                (span-close! src esp)
+                (store! i (+ (load i) 1)))))
+    (out-str! o (out-text dg))
+    (let [text (out-text o)
+          exp (int-oracle (= sign 1) radix (out-text dg))]
+      (verdict (match (read-all a text SRC-ID)
+        (Err [d] false)
+        (Ok [forms]
+            (and (= (al-len [Sexp] (load forms)) 1)
+                 (let [x (al-elem [Sexp] forms 0)]
+                   (if (.is-int exp)
+                       (and (= (ktag x) 0) (= (kword x) (.v exp)))
+                       (!= (ktag x) 0))))))
+               "int-literal" text))))
+
+;; 6. \uHEX char literals agree with an independent decoder: valid Unicode
+;;    scalar values read as that integer; anything else is an error (the same
+;;    rule the reader applies to \xHEX; in strings).
+(defprop uhex-char-oracle [(seed i64)]
+  (let [src (prop-src)
+        a (src-alloc src)
+        o (out-new a)
+        dg (out-new a)
+        nd (draw-len! src 1 20)
+        (mut i) 0]
+    (out-str! o "\\u")
+    (loop (if (>= (load i) nd)
+              (break)
+              (let [esp (span-open! src "digit" SPAN-ELEM)]
+                (out-byte! dg (hex-digit-char (draw-int! src 0 15) (draw-bool! src)))
+                (span-close! src esp)
+                (store! i (+ (load i) 1)))))
+    (out-str! o (out-text dg))
+    (let [text (out-text o)
+          exp (int-oracle false 16 (out-text dg))
+          scalar (and (.is-int exp)
+                      (ule (.v exp) 1114111)
+                      (not (and (>= (.v exp) 55296) (<= (.v exp) 57343))))]
+      (verdict (match (read-all a text SRC-ID)
+        (Err [d] (not scalar))
+        (Ok [forms]
+            (and scalar
+                 (= (al-len [Sexp] (load forms)) 1)
+                 (let [x (al-elem [Sexp] forms 0)]
+                   (and (= (ktag x) 0) (= (kword x) (.v exp)))))))
+               "uhex" text))))
+
+;; 7. Deep nesting: a few thousand levels must read or error, not kill the
+;;    process. (The compiler reads user files with this code.)
+(defprop deep-nesting [(seed i64)]
+  (let [src (prop-src)
+        a (src-alloc src)
+        depth (draw-int! src 0 12000)
+        kind (draw-tag! src 4)  ; 0 "(" unclosed, 1 "'" chain, 2 "#(" unclosed, 3 balanced
+        o (out-new a)
+        (mut i) 0]
+    (loop (if (>= (load i) depth)
+              (break)
+              (do (out-str! o (case kind 0 "(" 1 "'" 2 "#(" "["))
+                  (store! i (+ (load i) 1)))))
+    (out-byte! o 120)
+    (when (= kind 3)
+      (store! i 0)
+      (loop (if (>= (load i) depth)
+                (break)
+                (do (out-byte! o 93) (store! i (+ (load i) 1))))))
+    (let [closes (or (= kind 1) (= kind 3) (= depth 0))]
+      (match (read-all a (out-text o) SRC-ID)
+        (Err [d] (not closes))
+        (Ok [f] closes)))))

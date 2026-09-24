@@ -1,0 +1,1888 @@
+; Model-based fuzz targets for Coil's collections and the allocators under them.
+;
+;   coil fuzz collections_fuzz.coil --time 60 [--sanitize=address]
+;
+; Every property drives a random SEQUENCE of operations (one SPAN-ELEM span per
+; operation, so the fuzzer deletes / repeats / splices whole operations) against
+; the real structure and against a deliberately naive model, and compares them
+; after every step. The persistent structures additionally keep several VERSIONS
+; alive at once, each with its own model, and re-check every version after every
+; step: an in-place edit that leaks into a shared node shows up as an old version
+; changing. Borrowed pointers (`pm-get-ptr`/`pv-get-ptr`) are "pinned" and re-read
+; after later operations on OTHER versions.
+;
+; Each case picks the allocator the structure runs on: plain malloc (what ASan
+; sees best), the debug allocator (exact size/type/count checks on every free,
+; double-free and red-zone checks, and a leak count at the end), a Region over
+; either (whose tracked-allocation list must be empty once the structure is
+; freed), nested Regions, and an overflow arena (bump block + malloc spill).
+(module collections_fuzz)
+(import "coil.primitive" :as primitive)
+(import "coil.prop" :use *)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.mem" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.pmap" :use *)
+(import "coil.pvec" :use *)
+(import "coil.region" :use *)
+(import "coil.dbgalloc" :use *)
+(import "coil.str" :as str)
+(import "coil.io" :use *)
+(import "coil.fmt" :use *)
+
+; =================================================================== plumbing
+
+; ---- tracing: a failing case prints its operations when the runner re-runs it
+; to show the counterexample (mode 1), or always under COLLFUZZ_TRACE=1 (for a
+; crashing case, which the runner cannot re-run in-process).
+(extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
+
+(defn trace-cell [] (-> (ptr bool))
+  (primitive/alloc-static bool))
+
+(defn trace-begin! [(mode i64)] (-> i64)
+  (store! (trace-cell)
+          (or (= mode 1) (!= (primitive/cast i64 (getenv c"COLLFUZZ_TRACE")) 0)))
+  0)
+
+(defn tracing? [] (-> bool)
+  (load (trace-cell)))
+
+(defn tr [(what (slice u8)) (a i64) (b i64) (c i64)] (-> i64)
+  (when (tracing?) (fmt (stdout) "      {} {} {} {}\n" what a b c) 0)
+  0)
+
+(defn tr-fail [(what (slice u8)) (a i64) (b i64)] (-> bool)
+  (when (tracing?) (fmt (stdout) "      !! {} {} {}\n" what a b) 0)
+  false)
+
+(defn op-open [(s (ptr Source))] (-> i64)
+  (span-open! s "op" SPAN-ELEM))
+
+;;; A key from one of several ranges: tiny (collisions, overwrites, deletes of
+;;; present keys), small, huge/edge (any i64), and a mid range.
+(defn draw-key [(s (ptr Source))] (-> i64)
+  (let [t (draw-tag! s 4)]
+    (case t
+      0 (draw-int! s 0 7)
+      1 (draw-int! s -40 300)
+      2 (draw-int-any! s)
+      (draw-int! s 0 70000))))
+
+;;; A plain growable i64 buffer on malloc: the models. Deliberately not an
+;;; ArrayList — the thing under test must not also be the oracle.
+(defstruct Buf [(data (ptr i64)) (len i64) (cap i64)])
+
+(defn buf-new [] (-> Buf)
+  (Buf :data (primitive/cast (ptr i64) 0) :len 0 :cap 0))
+
+(defn buf-push! [(b (ptr Buf)) (v i64)] (-> i64)
+  (when (>= (.len b) (.cap b))
+    (let [nc (if (= (.cap b) 0) 16 (* (.cap b) 2))
+          nd (primitive/cast (ptr i64) (alloc/malloc (primitive/cast isize (* nc 8))))]
+      (for [i 0 (.len b)]
+        (store! (primitive/index nd i) (load (primitive/index (.data b) i))))
+      (when (> (.cap b) 0) (primitive/free (primitive/cast (ptr i8) (.data b))) 0)
+      (set! (.data b) nd)
+      (set! (.cap b) nc)
+      0)
+    0)
+  (store! (primitive/index (.data b) (.len b)) v)
+  (set! (.len b) (+ (.len b) 1))
+  0)
+
+(defn buf-at [(b (ptr Buf)) (i i64)] (-> i64)
+  (load (primitive/index (.data b) i)))
+
+(defn buf-set! [(b (ptr Buf)) (i i64) (v i64)] (-> i64)
+  (store! (primitive/index (.data b) i) v)
+  0)
+
+(defn buf-free! [(b (ptr Buf))] (-> i64)
+  (when (> (.cap b) 0) (primitive/free (primitive/cast (ptr i8) (.data b))) 0)
+  (set! (.data b) (primitive/cast (ptr i64) 0))
+  (set! (.len b) 0)
+  (set! (.cap b) 0)
+  0)
+
+(defn buf-copy! [(dst (ptr Buf)) (src (ptr Buf))] (-> i64)
+  (set! (.len dst) 0)
+  (for [i 0 (.len src)] (buf-push! dst (buf-at src i)))
+  0)
+
+;;; Swap-remove index i.
+(defn buf-swap-remove! [(b (ptr Buf)) (i i64)] (-> i64)
+  (let [last (- (.len b) 1)]
+    (buf-set! b i (buf-at b last))
+    (set! (.len b) last)
+    0))
+
+(defn buf-find [(b (ptr Buf)) (v i64)] (-> i64)
+  (let [(mut r) -1
+        (mut i) 0]
+    (loop (if (or (>= (load i) (.len b)) (>= (load r) 0))
+              (break)
+              (do
+                (when (= (buf-at b (load i)) v) (store! r (load i)) 0)
+                (store! i (+ (load i) 1)))))
+    (load r)))
+
+;;; An association-list map model: keys and values in two Bufs, in insertion
+;;; order (with swap-remove). Keys in the dense window [DLO, DHI) also have their
+;;; position recorded in `pos` (index+1, 0 = absent) so lookups stay O(1) for the
+;;; bulk operations; keys outside it are found by a linear scan. Either way the
+;;; answer is "where in ks is k", checked against nothing clever.
+(const DLO -64)
+(const DHI 100000)
+
+(defstruct AMap [(ks Buf) (vs Buf) (pos (ptr i64))])
+
+(extern calloc :cc c [isize isize] (-> (ptr i8)))
+
+(defn amap-new [] (-> AMap)
+  (AMap
+    :ks (buf-new)
+    :vs (buf-new)
+    :pos (primitive/cast (ptr i64) (calloc (primitive/cast isize (- DHI DLO)) (primitive/cast isize 8)))))
+
+(defn dense? [(k i64)] (-> bool)
+  (and (>= k DLO) (< k DHI)))
+
+(defn amap-len [(m (ptr AMap))] (-> i64)
+  (.len (field m ks)))
+
+(defn amap-find [(m (ptr AMap)) (k i64)] (-> i64)
+  (if (dense? k)
+      (- (load (primitive/index (.pos m) (- k DLO))) 1)
+      (buf-find (field m ks) k)))
+
+(defn amap-set-pos! [(m (ptr AMap)) (k i64) (i i64)] (-> i64)
+  (when (dense? k) (store! (primitive/index (.pos m) (- k DLO)) (+ i 1)) 0)
+  0)
+
+;;; 1 when k was new.
+(defn amap-put! [(m (ptr AMap)) (k i64) (v i64)] (-> i64)
+  (let [i (amap-find m k)]
+    (if (>= i 0)
+        (do (buf-set! (field m vs) i v) 0)
+        (do
+          (amap-set-pos! m k (amap-len m))
+          (buf-push! (field m ks) k)
+          (buf-push! (field m vs) v)
+          1))))
+
+;;; 1 when k was present.
+(defn amap-remove! [(m (ptr AMap)) (k i64)] (-> i64)
+  (let [i (amap-find m k)]
+    (if (< i 0)
+        0
+        (let [last (- (amap-len m) 1)
+              moved (buf-at (field m ks) last)]
+          (buf-swap-remove! (field m ks) i)
+          (buf-swap-remove! (field m vs) i)
+          (amap-set-pos! m k -1)
+          (unless (= i last) (amap-set-pos! m moved i) 0)
+          1))))
+
+(defn amap-clear! [(m (ptr AMap))] (-> i64)
+  (for [i 0 (amap-len m)] (amap-set-pos! m (buf-at (field m ks) i) -1))
+  (set! (.len (field m ks)) 0)
+  (set! (.len (field m vs)) 0)
+  0)
+
+(defn amap-copy! [(dst (ptr AMap)) (src (ptr AMap))] (-> i64)
+  (amap-clear! dst)
+  (for [i 0 (amap-len src)]
+    (amap-put! dst (buf-at (field src ks) i) (buf-at (field src vs) i)))
+  0)
+
+(defn amap-get-or [(m (ptr AMap)) (k i64) (dflt i64)] (-> i64)
+  (let [i (amap-find m k)]
+    (if (< i 0) dflt (buf-at (field m vs) i))))
+
+(defn amap-free! [(m (ptr AMap))] (-> i64)
+  (buf-free! (field m ks))
+  (buf-free! (field m vs))
+  (primitive/free (primitive/cast (ptr i8) (.pos m)))
+  0)
+
+; ------------------------------------------------------------ allocator harness
+
+(const H-MALLOC 0)
+(const H-DEBUG 1)
+(const H-REGION 2)
+(const H-REGION-DEBUG 3)
+(const H-OVERFLOW 4)
+(const H-REGION-REGION 5)
+(const H-COUNT 6)
+
+(defstruct Harness
+  [(kind i64)
+   (debug (ptr DebugAllocator))
+   (r1 (ptr Region))
+   (r2 (ptr Region))
+   (ov (ptr OverflowArena))
+   (a (dyn Allocator))])
+
+(defn malloc-raw [(n i64)] (-> (ptr i8))
+  (alloc/malloc (primitive/cast isize n)))
+
+(defn harness-init! [(h (ptr Harness)) (kind i64)] (-> i64)
+  (set! (.kind h) kind)
+  (set! (.debug h) (primitive/cast (ptr DebugAllocator) 0))
+  (set! (.r1 h) (primitive/cast (ptr Region) 0))
+  (set! (.r2 h) (primitive/cast (ptr Region) 0))
+  (set! (.ov h) (primitive/cast (ptr OverflowArena) 0))
+  (cond (= kind H-MALLOC) (set! (.a h) (malloc-allocator))
+        (= kind H-DEBUG)
+          (do
+            (set! (.debug h) (debug-allocator-init (malloc-allocator)))
+            (set! (.a h) (debug-allocator-view (.debug h))))
+        (= kind H-REGION)
+          (do
+            (set! (.r1 h) (primitive/cast (ptr Region) (malloc-raw (sizeof Region))))
+            (region-init (.r1 h) (malloc-allocator))
+            (set! (.a h) (region-allocator (.r1 h))))
+        (= kind H-REGION-DEBUG)
+          (do
+            (set! (.debug h) (debug-allocator-init (malloc-allocator)))
+            (set! (.r1 h) (primitive/cast (ptr Region) (malloc-raw (sizeof Region))))
+            (region-init (.r1 h) (debug-allocator-view (.debug h)))
+            (set! (.a h) (region-allocator (.r1 h))))
+        (= kind H-OVERFLOW)
+          (let [ov (primitive/cast (ptr OverflowArena) (malloc-raw (sizeof OverflowArena)))]
+            (set! (.base ov) (malloc-raw 2048))
+            (set! (.off ov) 0)
+            (set! (.cap ov) 2048)
+            (set! (.ov h) ov)
+            (set! (.a h) (primitive/make-dyn Allocator ov)))
+        :else
+          (do
+            (set! (.debug h) (debug-allocator-init (malloc-allocator)))
+            (set! (.r2 h) (primitive/cast (ptr Region) (malloc-raw (sizeof Region))))
+            (region-init (.r2 h) (debug-allocator-view (.debug h)))
+            (set! (.r1 h) (primitive/cast (ptr Region) (malloc-raw (sizeof Region))))
+            (region-init (.r1 h) (region-allocator (.r2 h)))
+            (set! (.a h) (region-allocator (.r1 h)))))
+  0)
+
+(defn region-empty? [(r (ptr Region))] (-> bool)
+  (= (primitive/cast i64 (load (field r head))) 0))
+
+;;; Tear the harness down. Call only after every structure built on it has
+;;; released its storage. True when nothing was left behind: a Region's tracked
+;;; list is empty and the debug allocator reports no live allocation.
+(defn harness-finish! [(h (ptr Harness))] (-> bool)
+  (let [(mut ok) true]
+    (when (!= (primitive/cast i64 (.r1 h)) 0)
+      (unless (region-empty? (.r1 h)) (store! ok false) 0)
+      (region-close! (.r1 h))
+      (primitive/free (primitive/cast (ptr i8) (.r1 h)))
+      0)
+    (when (!= (primitive/cast i64 (.r2 h)) 0)
+      ; r1's registry was allocated from r2 and released by its close
+      (unless (region-empty? (.r2 h)) (store! ok false) 0)
+      (region-close! (.r2 h))
+      (primitive/free (primitive/cast (ptr i8) (.r2 h)))
+      0)
+    (when (!= (primitive/cast i64 (.debug h)) 0)
+      (unless (= (debug-allocator-deinit! (.debug h)) 0) (store! ok false) 0)
+      0)
+    (when (!= (primitive/cast i64 (.ov h)) 0)
+      (primitive/free (.base (.ov h)))
+      (primitive/free (primitive/cast (ptr i8) (.ov h)))
+      0)
+    (load ok)))
+
+(defn lease-noop [(state (ptr i8))] (-> i64)
+  0)
+
+;;; A lease over the harness allocator. The harness outlives every structure of
+;;; the case, so the lease needs no retention.
+(defn harness-lease [(h (ptr Harness))] (-> AllocatorLease)
+  (unsafe-allocator-lease-new (.a h)
+                              (primitive/cast (ptr i8) 0)
+                              (primitive/fnptr-of lease-noop)
+                              (primitive/fnptr-of lease-noop)))
+
+; ---------------------------------------------------------------- key hashes
+
+(defn hash-low2 [(p (ptr i8)) (n i64)] (-> i64)
+  (primitive/iand (load (primitive/cast (ptr i64) p)) 3))
+
+(defn hash-const [(p (ptr i8)) (n i64)] (-> i64)
+  7)
+
+;;; Low bits all zero: every key's home slot is 0 in any table smaller than 2^32.
+(defn hash-shl32 [(p (ptr i8)) (n i64)] (-> i64)
+  (primitive/ishl (load (primitive/cast (ptr i64) p)) 32))
+
+(defn hash-identity [(p (ptr i8)) (n i64)] (-> i64)
+  (load (primitive/cast (ptr i64) p)))
+
+;;; Only the top five bits vary: for the pmap trie every key shares the first
+;;; twelve fragments and they diverge at the last (four-bit) level, sign included.
+(defn hash-top [(p (ptr i8)) (n i64)] (-> i64)
+  (primitive/ishl (load (primitive/cast (ptr i64) p)) 59))
+
+;;; Only the low five bits vary: the first fragment.
+(defn hash-low5 [(p (ptr i8)) (n i64)] (-> i64)
+  (primitive/iand (load (primitive/cast (ptr i64) p)) 31))
+
+;;; Two distinct keys per hash: dense collision nodes at the bottom of the trie.
+(defn hash-half [(p (ptr i8)) (n i64)] (-> i64)
+  (primitive/ishr (load (primitive/cast (ptr i64) p)) 1))
+
+(defn keyops-with [(slot (ptr KeyOps)) (h (fnptr c [(ptr i8) i64] i64))] (-> (ptr KeyOps))
+  (set! (.hash slot) h)
+  (set! (.eq slot) (primitive/fnptr-of i64-key-eq))
+  (set! (.size slot) (sizeof i64))
+  slot)
+
+(const HASH-COUNT 10)
+
+(defn pick-keyops [(t i64)] (-> (ptr KeyOps))
+  (case t
+    0 (scalar-keyops [i64])
+    1 (i64-keyops)
+    2 (keyops-with (primitive/alloc-static KeyOps) (primitive/fnptr-of hash-low2))
+    3 (keyops-with (primitive/alloc-static KeyOps) (primitive/fnptr-of hash-const))
+    4 (keyops-with (primitive/alloc-static KeyOps) (primitive/fnptr-of hash-shl32))
+    5 (keyops-with (primitive/alloc-static KeyOps) (primitive/fnptr-of hash-identity))
+    6 (keyops-with (primitive/alloc-static KeyOps) (primitive/fnptr-of hash-top))
+    7 (keyops-with (primitive/alloc-static KeyOps) (primitive/fnptr-of hash-low5))
+    8 (keyops-with (primitive/alloc-static KeyOps) (primitive/fnptr-of hash-half))
+    (i64-keyops)))
+
+;;; Degenerate hashes make every operation linear; keep bulk operations small then.
+(defn weak-hash? [(t i64)] (-> bool)
+  (or (= t 2) (or (= t 3) (or (= t 4) (or (= t 6) (= t 7))))))
+
+; ================================================================== HashMap
+
+(defstruct HmSt
+  [(m (HashMap i64 i64))
+   (model AMap)
+   (weak bool)])
+
+;;; White-box: slot states agree with the header, and at least one slot is empty
+;;; (the probe loops terminate only because of that).
+(defn hm-internals-ok [(m (ptr (HashMap i64 i64)))] (-> bool)
+  (let [cap (load (field m cap))
+        slots (load (field m slots))
+        (mut occ) 0
+        (mut tomb) 0]
+    (for [i 0 cap]
+      (let [st (load (field (primitive/index slots i) state))]
+        (cond (= st 1) (store! occ (+ (load occ) 1))
+              (= st 2) (store! tomb (+ (load tomb) 1))
+              :else 0)))
+    (and (hm-header-valid? (load m))
+         (and (= (load occ) (load (field m len)))
+              (and (= (load tomb) (load (field m tombs)))
+                   (or (= cap 0) (< (+ (load occ) (load tomb)) cap)))))))
+
+(defn hm-get-or [(m (ptr (HashMap i64 i64))) (k i64) (dflt i64)] (-> i64)
+  (match (hm-get (load m) k) (Some [v] v) (None [] dflt)))
+
+;;; Model and map agree completely: every model pair is found, the walk visits
+;;; exactly len occupied slots each matching the model, and the key iterator
+;;; yields the same number of keys.
+(defn hm-full-check [(st (ptr HmSt))] (-> bool)
+  (let [m (field st m)
+        model (field st model)
+        n (amap-len model)
+        (mut ok) (= (hm-len (load m)) n)]
+    (for [i 0 n]
+      (let [k (buf-at (field model ks) i)]
+        (match (hm-get (load m) k)
+          (Some [v] (unless (= v (buf-at (field model vs) i)) (store! ok false) 0))
+          (None [] (store! ok false)))))
+    (let [(mut seen) 0]
+      (hm-for [k v m]
+        (let [j (amap-find model k)]
+          (store! seen (+ (load seen) 1))
+          (when (or (< j 0) (!= (buf-at (field model vs) j) v)) (store! ok false) 0)
+          0))
+      (unless (= (load seen) n) (store! ok false) 0))
+    (let [(mut it) (iter (load m))
+          (mut seen) 0]
+      (loop (match (next (mut it))
+              (None [] (break))
+              (Some [k]
+                    (do
+                      (store! seen (+ (load seen) 1))
+                      (when (< (amap-find model k) 0) (store! ok false) 0)
+                      0))))
+      (unless (= (load seen) n) (store! ok false) 0))
+    (and (load ok) (hm-internals-ok m))))
+
+(defn hm-step [(st (ptr HmSt)) (s (ptr Source))] (-> bool)
+  (let [m (field st m)
+        model (field st model)
+        tag (draw-tag! s 10)]
+    (cond
+      ; put: the return says whether the key was already there
+      (= tag 0)
+        (let [k (draw-key s)
+              v (draw-int-any! s)
+              present (>= (amap-find model k) 0)
+              r (hm-put! (mut (field st m)) k v)]
+          (tr "put" k v r)
+          (amap-put! model k v)
+          (and (= (= r 0) present) (= (hm-get-or m k -1) v)))
+      (= tag 1)
+        (let [k (draw-key s)
+              i (amap-find model k)]
+          (tr "get" k 0 0)
+          (match (hm-get (load m) k)
+            (Some [v] (and (>= i 0) (= v (buf-at (field model vs) i))))
+            (None [] (< i 0))))
+      (= tag 2)
+        (let [k (draw-key s)
+              want (amap-remove! model k)
+              got (hm-remove! (mut (field st m)) k)]
+          (tr "remove" k got 0)
+          (and (= want got) (not (hm-contains? (load m) k))))
+      (= tag 3)
+        (let [k (draw-key s)]
+          (tr "contains" k 0 0)
+          (= (hm-contains? (load m) k) (>= (amap-find model k) 0)))
+      ; explicit reserve / shrink request, any capacity (even below len)
+      (= tag 4)
+        (let [c (draw-int! s -8 (+ (* 4 (amap-len model)) 70))]
+          (tr "grow" c (hm-cap (load m)) (hm-len (load m)))
+          (hm-grow! (mut (field st m)) c)
+          (hm-full-check st))
+      (= tag 5)
+        (do
+          (tr "clear" 0 0 0)
+          (hm-clear! (mut (field st m)))
+          (amap-clear! model)
+          (hm-full-check st))
+      (= tag 6) (do (tr "check" 0 0 0) (hm-full-check st))
+      ; bulk insert: drives growth and rehash quickly
+      (= tag 7)
+        (let [n (draw-int! s 0 (if (.weak st) 200 3000))
+              base (draw-int! s -64 70000)
+              stride (draw-int! s 1 8)
+              (mut ok) true]
+          (tr "bulk-put" n base stride)
+          (for [i 0 n]
+            (let [k (+ base (* i stride))
+                  present (>= (amap-find model k) 0)
+                  r (hm-put! (mut (field st m)) k i)]
+              (amap-put! model k i)
+              (when (!= (= r 0) present) (store! ok false) 0)))
+          (and (load ok) (hm-full-check st)))
+      ; bulk remove by residue: tombstone storms, then reinsertion reuses them
+      (= tag 8)
+        (let [modulus (draw-int! s 1 5)
+              residue (draw-int! s 0 4)
+              (mut ok) true
+              (mut i) 0]
+          (tr "bulk-remove" modulus residue 0)
+          (loop (if (>= (load i) (amap-len model))
+                    (break)
+                    (let [k (buf-at (field model ks) (load i))]
+                      (if (= (primitive/iand k 7) (% residue modulus))
+                          (do
+                            (when (!= (hm-remove! (mut (field st m)) k) 1) (store! ok false) 0)
+                            (amap-remove! model k)
+                            0)
+                          (store! i (+ (load i) 1))))))
+          (and (load ok) (hm-full-check st)))
+      ; free, then keep using the (reset) map
+      :else
+        (do
+          (tr "free" 0 0 0)
+          (hm-free! (mut (field st m)))
+          (amap-clear! model)
+          (hm-full-check st)))))
+
+(defprop hashmap-matches-model [(seed u8)]
+  (let [s (prop-src)
+        hk (draw-tag! s H-COUNT)
+        kt (draw-tag! s HASH-COUNT)
+        (mut h) (zeroed Harness)]
+    (trace-begin! __mode)
+    (tr "harness/hash" hk kt 0)
+    (harness-init! (mut h) hk)
+    (let [(mut st)
+            (HmSt
+              :m (hm-new [i64 i64] (.a (mut h)) (pick-keyops kt))
+              :model (amap-new)
+              :weak (weak-hash? kt))
+          n (draw-len! s 0 (src-size s))
+          (mut ok) true
+          (mut i) 0]
+      (loop (if (or (not (load ok)) (>= (load i) n))
+                (break)
+                (let [sp (op-open s)]
+                  (unless (hm-step (mut st) s) (store! ok (tr-fail "step" (load i) 0)) 0)
+                  (when (<= (hm-cap (.m (mut st))) 2048)
+                    (unless (hm-internals-ok (field (mut st) m)) (store! ok (tr-fail "internals" (load i) 0)) 0)
+                    0)
+                  (span-close! s sp)
+                  (store! i (+ (load i) 1)))))
+      (when (load ok) (unless (hm-full-check (mut st)) (store! ok (tr-fail "final-check" 0 0)) 0) 0)
+      (hm-free! (mut (field st m)))
+      (amap-free! (field (mut st) model))
+      (let [clean (harness-finish! (mut h))]
+        (unless clean (tr-fail "harness-leak" hk 0) 0)
+        (and (load ok) clean)))))
+
+; ================================================================ ArrayList
+;
+; Three lists share ONE allocator, each with its own model. Interleaved growth
+; is what makes an allocator hand out overlapping blocks (an arena resizing a
+; block that is not its last, a region registry losing an entry) visible: the
+; other lists' contents change. A "pin" holds an `al-elem` pointer into one list
+; and re-reads it after operations on the OTHER lists, which must not move it.
+
+(const NLISTS 3)
+
+(defstruct AlSt
+  [(ls (array (ArrayList i64) 3))
+   (ms (array Buf 3))
+   (epoch (array i64 3))
+   (pin (ptr i64))
+   (pin-list i64)
+   (pin-idx i64)
+   (pin-epoch i64)
+   (a (dyn Allocator))])
+
+(defn al-at [(st (ptr AlSt)) (i i64)] (-> (ptr (ArrayList i64)))
+  (index (field st ls) i))
+
+(defn al-model [(st (ptr AlSt)) (i i64)] (-> (ptr Buf))
+  (index (field st ms) i))
+
+(defn al-bump! [(st (ptr AlSt)) (i i64)] (-> i64)
+  (store! (index (field st epoch) i) (+ (load (index (field st epoch) i)) 1))
+  0)
+
+(defn al-check-list [(st (ptr AlSt)) (i i64)] (-> bool)
+  (let [l (al-at st i)
+        m (al-model st i)
+        n (.len m)
+        (mut ok) (and (= (al-len (load l)) n) (>= (al-cap (load l)) n))]
+    (when (load ok)
+      (for [j 0 n]
+        (unless (= (al-get (load l) j) (buf-at m j)) (store! ok false) 0))
+      (let [(mut j) 0]
+        (for x (iter (load l))
+          (do
+            (unless (and (< (load j) n) (= x (buf-at m (load j)))) (store! ok false) 0)
+            (store! j (+ (load j) 1))
+            0))
+        (unless (= (load j) n) (store! ok false) 0))
+      0)
+    (load ok)))
+
+(defn al-check-all [(st (ptr AlSt))] (-> bool)
+  (let [(mut ok) true]
+    (for [i 0 NLISTS]
+      (unless (al-check-list st i) (store! ok (tr-fail "list" i 0)) 0))
+    (load ok)))
+
+(defn al-pin-ok [(st (ptr AlSt))] (-> bool)
+  (let [li (.pin-list st)]
+    (if (or (< li 0) (!= (.pin-epoch st) (load (index (field st epoch) li))))
+        true
+        (= (load (.pin st)) (buf-at (al-model st li) (.pin-idx st))))))
+
+(defn al-step [(st (ptr AlSt)) (s (ptr Source))] (-> bool)
+  (let [tag (draw-tag! s 12)
+        li (draw-int! s 0 (- NLISTS 1))
+        l (al-at st li)
+        m (al-model st li)
+        n (.len m)]
+    (cond
+      (= tag 0)
+        (let [v (draw-int-any! s)
+              r (al-push! (mut (index (field st ls) li)) v)]
+          (tr "push" li v r)
+          (buf-push! m v)
+          (al-bump! st li)
+          (= r (.len m)))
+      (= tag 1)
+        (do
+          (tr "pop" li n 0)
+          (al-bump! st li)
+          (match (al-pop! (mut (index (field st ls) li)))
+            (None [] (= n 0))
+            (Some [v]
+                  (let [ok (and (> n 0) (= v (buf-at m (- n 1))))]
+                    (when (> n 0) (set! (.len m) (- n 1)) 0)
+                    ok))))
+      (= tag 2)
+        (let [j (draw-int! s 0 (if (> n 0) (- n 1) 0))
+              v (draw-int-any! s)]
+          (tr "set" li j v)
+          (when (> n 0)
+            (al-set! (mut (index (field st ls) li)) j v)
+            (buf-set! m j v)
+            (al-bump! st li)
+            0)
+          true)
+      (= tag 3)
+        (let [j (draw-int! s 0 (if (> n 0) (- n 1) 0))]
+          (tr "get" li j 0)
+          (or (= n 0) (= (al-get (load l) j) (buf-at m j))))
+      (= tag 4)
+        (let [c (draw-int! s 0 (+ n 300))]
+          (tr "reserve" li c (al-cap (load l)))
+          (al-reserve! (mut (index (field st ls) li)) c)
+          (al-bump! st li)
+          (and (>= (al-cap (load l)) c) (al-check-list st li)))
+      ; extend from another list's live storage, or from a model buffer
+      (= tag 5)
+        (let [from-list (draw-bool! s)
+              other (% (+ li (draw-int! s 1 (- NLISTS 1))) NLISTS)
+              k (draw-int! s 0 400)]
+          (tr "extend" li other (if from-list -1 k))
+          (if from-list
+              (let [src (al-model st other)
+                    cnt (.len src)
+                    sl (al-slice (load (al-at st other)))]
+                (al-extend! (mut (index (field st ls) li)) (slice-data sl) cnt)
+                (for [j 0 cnt] (buf-push! m (buf-at src j)))
+                0)
+              (let [(mut tmp) (buf-new)]
+                (for [j 0 k] (buf-push! (mut tmp) (* j 3)))
+                (al-extend! (mut (index (field st ls) li)) (.data (mut tmp)) k)
+                (for [j 0 k] (buf-push! m (* j 3)))
+                (buf-free! (mut tmp))
+                0))
+          (al-bump! st li)
+          (al-check-list st li))
+      (= tag 6)
+        (do
+          (tr "clear" li 0 0)
+          (al-clear! (mut (index (field st ls) li)))
+          (set! (.len m) 0)
+          (al-bump! st li)
+          (al-check-list st li))
+      (= tag 7)
+        (do
+          (tr "free" li 0 0)
+          (al-free! (mut (index (field st ls) li)))
+          (set! (.len m) 0)
+          (al-bump! st li)
+          (and (= (al-cap (load l)) 0) (al-check-list st li)))
+      ; hand the storage out as a slice, check it, free it the documented way
+      (= tag 8)
+        (let [sl (al-into-slice (mut (index (field st ls) li)))
+              (mut ok) (= (slice-len sl) n)]
+          (tr "into-slice" li n 0)
+          (when (load ok)
+            (for [j 0 n]
+              (unless (= (load (index (slice-data sl) j)) (buf-at m j)) (store! ok false) 0))
+            0)
+          (free [i64] (.a st) sl)
+          (set! (.len m) 0)
+          (al-bump! st li)
+          (and (load ok) (and (= (al-len (load l)) 0) (= (al-cap (load l)) 0))))
+      (= tag 9)
+        (let [k (draw-int! s 0 3000)
+              base (draw-int-any! s)]
+          (tr "bulk-push" li k 0)
+          (for [j 0 k]
+            (al-push! (mut (index (field st ls) li)) (+ base j))
+            (buf-push! m (+ base j)))
+          (al-bump! st li)
+          (al-check-list st li))
+      ; pin a live element, to be re-read after operations on other lists
+      (= tag 10)
+        (let [j (draw-int! s 0 (if (> n 0) (- n 1) 0))]
+          (tr "pin" li j 0)
+          (when (> n 0)
+            (set! (.pin st) (al-elem (al-at st li) j))
+            (set! (.pin-list st) li)
+            (set! (.pin-idx st) j)
+            (set! (.pin-epoch st) (load (index (field st epoch) li)))
+            0)
+          true)
+      :else (do (tr "check" 0 0 0) (al-check-all st)))))
+
+(defn al-run [(h (ptr Harness)) (s (ptr Source))] (-> bool)
+  (let [a (.a h)
+        (mut st)
+          (AlSt
+            :ls [(al-new [i64] a) (al-new [i64] a) (al-new [i64] a)]
+            :ms [(buf-new) (buf-new) (buf-new)]
+            :epoch [0 0 0]
+            :pin (primitive/cast (ptr i64) 0)
+            :pin-list -1
+            :pin-idx 0
+            :pin-epoch 0
+            :a a)
+        n (draw-len! s 0 (src-size s))
+        (mut ok) true
+        (mut i) 0]
+    (loop (if (or (not (load ok)) (>= (load i) n))
+              (break)
+              (let [sp (op-open s)]
+                (unless (al-step (mut st) s) (store! ok (tr-fail "step" (load i) 0)) 0)
+                (unless (al-pin-ok (mut st)) (store! ok (tr-fail "pin" (load i) 0)) 0)
+                (span-close! s sp)
+                (store! i (+ (load i) 1)))))
+    (when (load ok) (unless (al-check-all (mut st)) (store! ok false) 0) 0)
+    (for [j 0 NLISTS]
+      (al-free! (mut (index (field st ls) j)))
+      (buf-free! (index (field st ms) j)))
+    (load ok)))
+
+(defprop arraylist-matches-model [(seed u8)]
+  (let [s (prop-src)
+        hk (draw-tag! s H-COUNT)
+        (mut h) (zeroed Harness)]
+    (trace-begin! __mode)
+    (tr "harness" hk 0 0)
+    (harness-init! (mut h) hk)
+    (let [ok (al-run (mut h) s)
+          clean (harness-finish! (mut h))]
+      (unless clean (tr-fail "harness-leak" hk 0) 0)
+      (and ok clean))))
+
+; ============================================================ owned elements
+;
+; The persistent structures hold `Tok`s: a value that counts its own live
+; instances. A copied leaf/node must CLONE what it keeps and a freed one must DROP
+; what it held — exactly once each — so once every version is gone the count is
+; back to zero. A double drop drives it negative; a leak leaves it positive.
+(defn live-toks [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defstruct Tok [(id i64)])
+
+(defn tok [(id i64)] (-> Tok)
+  (store! (live-toks) (+ (load (live-toks)) 1))
+  (Tok :id id))
+
+(impl Clone Tok
+  (clone [(self (ref Tok))] (-> Tok) (tok (.id self))))
+
+(impl Drop Tok
+  (drop [(self (mut Tok))] (-> void) (store! (live-toks) (- (load (live-toks)) 1))))
+
+(defn tok-id [(p (ptr Tok))] (-> i64)
+  (load (field p id)))
+
+; ============================================================== PVec
+;
+; Four versions live at once, each with its own model. Pure operations write
+; their result into ANOTHER slot (dropping what was there), so versions share
+; structure in every combination; in-place (`!`) operations must copy exactly
+; the shared path. After every step every version is compared with its model
+; (all of it while the versions are small, a sample of indices plus the tail
+; region once they are large, and all of it at the end), and borrowed element
+; pointers taken earlier are re-read unless their own version was edited since.
+
+(const NV 4)
+(const NPINS 6)
+
+(defstruct PvSt
+  [(vs (array (PVec Tok) 4))
+   (ms (array Buf 4))
+   (epoch (array i64 4))
+   (pin-p (array (ptr Tok) 6))
+   (pin-v (array i64 6))
+   (pin-e (array i64 6))
+   (pin-x (array i64 6))
+   (next-pin i64)
+   (step i64)])
+
+(defn pv-at [(st (ptr PvSt)) (i i64)] (-> (ptr (PVec Tok)))
+  (index (field st vs) i))
+
+(defn pv-model [(st (ptr PvSt)) (i i64)] (-> (ptr Buf))
+  (index (field st ms) i))
+
+;;; Replace version j. `set!` through a pointer does NOT drop the value it
+;;; overwrites (only a local owner's replacement does), so move the old version
+;;; out explicitly; it is dropped when this returns.
+(defn pv-put! [(st (ptr PvSt)) (j i64) (v (PVec Tok))] (-> i64)
+  (let [old (take! [(PVec Tok)] (index (field st vs) j))]
+    (store! (index (field st vs) j) v)
+    0))
+
+(defn pv-clone-of [(v (ref (PVec Tok)))] (-> (PVec Tok))
+  (clone v))
+
+(defn pv-bump! [(st (ptr PvSt)) (i i64)] (-> i64)
+  (store! (index (field st epoch) i) (+ (load (index (field st epoch) i)) 1))
+  0)
+
+(defn pv-id-at [(v (ptr (PVec Tok))) (j i64)] (-> i64)
+  (match (pv-get-ptr v j) (Some [p] (tok-id p)) (None [] -999999)))
+
+;;; Element j of version i agrees with the model, through both lookup paths.
+(defn pv-check-index [(st (ptr PvSt)) (i i64) (j i64)] (-> bool)
+  (let [v (pv-at st i)
+        want (buf-at (pv-model st i) j)]
+    (= (pv-id-at v j) want)))
+
+(defn pv-check-version [(st (ptr PvSt)) (i i64) (full bool)] (-> bool)
+  (let [v (pv-at st i)
+        m (pv-model st i)
+        n (.len m)
+        (mut ok) (and (= (pv-len v) n) (= (pv-empty? v) (= n 0)))]
+    ; out of range on both sides
+    (match (pv-get-ptr v n) (Some [p] (store! ok false)) (None [] 0))
+    (match (pv-get-ptr v -1) (Some [p] (store! ok false)) (None [] 0))
+    (when (load ok)
+      (if full
+          (do
+            (for [j 0 n] (unless (pv-check-index st i j) (store! ok false) 0))
+            ; the iterator walks leaves, a different path from indexing
+            (let [(mut it) (pv-iter v)
+                  (mut j) 0]
+              (loop (match (next (mut it))
+                      (None [] (break))
+                      (Some [p]
+                            (do
+                              (unless (and (< (load j) n) (= (tok-id p) (buf-at m (load j))))
+                                (store! ok false)
+                                0)
+                              (store! j (+ (load j) 1))
+                              0))))
+              (unless (= (load j) n) (store! ok false) 0))
+            0)
+          (when (> n 0)
+            ; the last 40 (tail and the leaf before it), the first, and a stride
+            (for [j (if (> n 40) (- n 40) 0) n]
+              (unless (pv-check-index st i j) (store! ok false) 0))
+            (unless (pv-check-index st i 0) (store! ok false) 0)
+            (let [stride (+ (/ n 13) 1)
+                  off (% (* (.step st) 7919) stride)]
+              (let [(mut j) off]
+                (loop (if (>= (load j) n)
+                          (break)
+                          (do
+                            (unless (pv-check-index st i (load j)) (store! ok false) 0)
+                            (store! j (+ (load j) stride)))))))
+            0))
+      0)
+    (load ok)))
+
+(defn pv-total [(st (ptr PvSt))] (-> i64)
+  (let [(mut t) 0]
+    (for [i 0 NV] (store! t (+ (load t) (.len (pv-model st i)))))
+    (load t)))
+
+(defn pv-check-all [(st (ptr PvSt)) (full bool)] (-> bool)
+  (let [(mut ok) true]
+    (for [i 0 NV]
+      (unless (pv-check-version st i full) (store! ok (tr-fail "version" i 0)) 0))
+    (load ok)))
+
+(defn pv-pins-ok [(st (ptr PvSt))] (-> bool)
+  (let [(mut ok) true]
+    (for [k 0 NPINS]
+      (let [p (load (index (field st pin-p) k))
+            vi (load (index (field st pin-v) k))]
+        (when (and (!= (primitive/cast i64 p) 0)
+                   (= (load (index (field st pin-e) k)) (load (index (field st epoch) vi))))
+          (unless (= (tok-id p) (load (index (field st pin-x) k)))
+            (store! ok (tr-fail "pin" k vi))
+            0)
+          0)))
+    (load ok)))
+
+(defn pv-replace-model! [(st (ptr PvSt)) (dst i64) (src i64)] (-> i64)
+  (unless (= dst src) (buf-copy! (pv-model st dst) (pv-model st src)) 0)
+  (pv-bump! st dst)
+  0)
+
+(defn pv-step [(st (ptr PvSt)) (s (ptr Source))] (-> bool)
+  (let [tag (draw-tag! s 13)
+        vi (draw-int! s 0 (- NV 1))
+        vj (draw-int! s 0 (- NV 1))
+        m (pv-model st vi)
+        n (.len m)]
+    (cond
+      (= tag 0)
+        (let [x (draw-int-any! s)
+              r (pv-push! (mut (index (field st vs) vi)) (tok x))]
+          (tr "push!" vi x r)
+          (buf-push! m x)
+          (pv-bump! st vi)
+          (= r (.len m)))
+      (= tag 1)
+        (do
+          (tr "pop!" vi n 0)
+          (pv-bump! st vi)
+          (match (pv-pop! (mut (index (field st vs) vi)))
+            (None [] (= n 0))
+            (Some [t]
+                  (let [ok (and (> n 0) (= (.id t) (buf-at m (- n 1))))]
+                    (when (> n 0) (set! (.len m) (- n 1)) 0)
+                    ok))))
+      (= tag 2)
+        (let [j (draw-int! s -2 (+ n 2))
+              x (draw-int-any! s)
+              r (pv-set! (mut (index (field st vs) vi)) j (tok x))
+              inside (and (>= j 0) (< j n))]
+          (tr "set!" vi j x)
+          (when inside (buf-set! m j x) (pv-bump! st vi) 0)
+          (= r (if inside 1 0)))
+      (= tag 3)
+        (let [j (draw-int! s -2 (+ n 2))]
+          (tr "get" vi j 0)
+          (match (pv-get (pv-at st vi) j)
+            (Some [t] (and (and (>= j 0) (< j n)) (= (.id t) (buf-at m j))))
+            (None [] (or (< j 0) (>= j n)))))
+      ; pure forms: the result replaces version vj; vi must be unchanged
+      (= tag 4)
+        (let [x (draw-int-any! s)]
+          (tr "push" vj vi x)
+          (pv-put! st vj (pv-push (pv-at st vi) (tok x)))
+          (pv-replace-model! st vj vi)
+          (buf-push! (pv-model st vj) x)
+          true)
+      (= tag 5)
+        (let [j (draw-int! s -1 (+ n 1))
+              x (draw-int-any! s)]
+          (tr "set" vj vi j)
+          (pv-put! st vj (pv-set (pv-at st vi) j (tok x)))
+          (pv-replace-model! st vj vi)
+          (when (and (>= j 0) (< j n)) (buf-set! (pv-model st vj) j x) 0)
+          true)
+      (= tag 6)
+        (do
+          (tr "pop" vj vi 0)
+          (pv-put! st vj (pv-pop (pv-at st vi)))
+          (pv-replace-model! st vj vi)
+          (let [mj (pv-model st vj)]
+            (when (> (.len mj) 0) (set! (.len mj) (- (.len mj) 1)) 0))
+          true)
+      (= tag 7)
+        (do
+          (tr "clone" vj vi 0)
+          (pv-put! st vj (pv-clone-of (pv-at st vi)))
+          (pv-replace-model! st vj vi)
+          (pv-same? (pv-at st vi) (pv-at st vj)))
+      ; bulk append: reaches the 32 / 1024 / 32768 trie boundaries
+      (= tag 8)
+        (let [k (draw-int! s 0 (* (src-size s) 160))
+              base (draw-int! s 0 1000000)]
+          (tr "bulk-push!" vi k base)
+          (for [j 0 k]
+            (pv-push! (mut (index (field st vs) vi)) (tok (+ base j)))
+            (buf-push! m (+ base j)))
+          (pv-bump! st vi)
+          (pv-check-version st vi false))
+      (= tag 9)
+        (let [k (draw-int! s 0 (+ n 40))
+              (mut ok) true]
+          (tr "bulk-pop!" vi k n)
+          (for [j 0 k]
+            (match (pv-pop! (mut (index (field st vs) vi)))
+              (None [] (unless (= (.len m) 0) (store! ok false) 0))
+              (Some [t]
+                    (do
+                      (unless (and (> (.len m) 0) (= (.id t) (buf-at m (- (.len m) 1))))
+                        (store! ok false)
+                        0)
+                      (when (> (.len m) 0) (set! (.len m) (- (.len m) 1)) 0)
+                      0))))
+          (pv-bump! st vi)
+          (load ok))
+      ; pin element j of version vi
+      (= tag 10)
+        (let [j (draw-int! s 0 (if (> n 0) (- n 1) 0))]
+          (tr "pin" vi j 0)
+          (when (> n 0)
+            (let [k (% (.next-pin st) NPINS)]
+              (match (pv-get-ptr (pv-at st vi) j)
+                (Some [p]
+                      (do
+                        (store! (index (field st pin-p) k) p)
+                        (store! (index (field st pin-v) k) vi)
+                        (store! (index (field st pin-e) k) (load (index (field st epoch) vi)))
+                        (store! (index (field st pin-x) k) (buf-at m j))
+                        0))
+                (None [] 0))
+              (set! (.next-pin st) (+ (.next-pin st) 1))
+              0)
+            0)
+          true)
+      ; a chain of pure pushes, each version derived from the last
+      (= tag 11)
+        (let [k (draw-int! s 0 100)]
+          (tr "push-chain" vj vi k)
+          (pv-put! st vj (pv-clone-of (pv-at st vi)))
+          (pv-replace-model! st vj vi)
+          (for [j 0 k]
+            (pv-put! st vj (pv-push (pv-at st vj) (tok j)))
+            (buf-push! (pv-model st vj) j))
+          true)
+      :else (do (tr "check-all" 0 0 0) (pv-check-all st true)))))
+
+(defn pv-run [(h (ptr Harness)) (s (ptr Source))] (-> bool)
+  (let [null-tok (primitive/cast (ptr Tok) 0)
+        (mut st)
+          (PvSt
+            :vs [(pv-new [Tok] (harness-lease h))
+                 (pv-new [Tok] (harness-lease h))
+                 (pv-new [Tok] (harness-lease h))
+                 (pv-new [Tok] (harness-lease h))]
+            :ms [(buf-new) (buf-new) (buf-new) (buf-new)]
+            :epoch [0 0 0 0]
+            :pin-p [null-tok null-tok null-tok null-tok null-tok null-tok]
+            :pin-v [0 0 0 0 0 0]
+            :pin-e [0 0 0 0 0 0]
+            :pin-x [0 0 0 0 0 0]
+            :next-pin 0
+            :step 0)
+        n (draw-len! s 0 (src-size s))
+        (mut ok) true
+        (mut i) 0]
+    (loop (if (or (not (load ok)) (>= (load i) n))
+              (break)
+              (let [sp (op-open s)]
+                (set! (.step (mut st)) (load i))
+                (unless (pv-step (mut st) s) (store! ok (tr-fail "step" (load i) 0)) 0)
+                (unless (pv-check-all (mut st) (<= (pv-total (mut st)) 3000))
+                  (store! ok (tr-fail "check" (load i) 0))
+                  0)
+                (unless (pv-pins-ok (mut st)) (store! ok false) 0)
+                (span-close! s sp)
+                (store! i (+ (load i) 1)))))
+    (when (load ok) (unless (pv-check-all (mut st) true) (store! ok false) 0) 0)
+    (collect "pvec max version length" (let [(mut mx) 0]
+                                         (for [j 0 NV] (when (> (.len (pv-model (mut st) j)) (load mx)) (store! mx (.len (pv-model (mut st) j))) 0))
+                                         (load mx)))
+    (tr "max-shift" 0 0 (let [(mut mx) 0]
+                                (for [j 0 NV] (when (> (.shift (pv-at (mut st) j)) (load mx)) (store! mx (.shift (pv-at (mut st) j))) 0))
+                                (load mx)))
+    (for [j 0 NV] (buf-free! (index (field st ms) j)))
+    (load ok)))
+
+(defprop pvec-versions-match-models [(seed u8)]
+  (let [s (prop-src)
+        hk (draw-tag! s H-COUNT)
+        (mut h) (zeroed Harness)]
+    (trace-begin! __mode)
+    (tr "harness" hk 0 0)
+    (store! (live-toks) 0)
+    (harness-init! (mut h) hk)
+    ; every version is dropped when pv-run returns
+    (let [ok (pv-run (mut h) s)
+          live (load (live-toks))
+          clean (harness-finish! (mut h))]
+      (unless (= live 0) (tr-fail "live-toks" live 0) 0)
+      (unless clean (tr-fail "harness-leak" hk 0) 0)
+      (and ok (and (= live 0) clean)))))
+
+; ================================================================== PMap
+;
+; Same shape as the PVec property: four versions, one model each (key -> token
+; id), pure operations writing into another slot, in-place ones copying exactly
+; the shared path. The KeyOps is drawn per case from a real hash and from
+; degenerate ones that force every structural case of the trie: all keys in one
+; collision node (constant), keys diverging only at the first fragment, only at
+; the last (four-bit, sign-carrying) fragment, pairs of keys per hash, and
+; identity. `pm-diff` between any two versions is checked against the models.
+
+(defstruct PmSt
+  [(vs (array (PMap i64 Tok) 4))
+   (ms (array AMap 4))
+   (epoch (array i64 4))
+   (pin-p (array (ptr Tok) 6))
+   (pin-v (array i64 6))
+   (pin-e (array i64 6))
+   (pin-x (array i64 6))
+   (next-pin i64)
+   (weak bool)])
+
+(defn pm-at [(st (ptr PmSt)) (i i64)] (-> (ptr (PMap i64 Tok)))
+  (index (field st vs) i))
+
+(defn pm-model [(st (ptr PmSt)) (i i64)] (-> (ptr AMap))
+  (index (field st ms) i))
+
+(defn pm-bump! [(st (ptr PmSt)) (i i64)] (-> i64)
+  (store! (index (field st epoch) i) (+ (load (index (field st epoch) i)) 1))
+  0)
+
+(defn pm-clone-of [(v (ref (PMap i64 Tok)))] (-> (PMap i64 Tok))
+  (clone v))
+
+;;; Replace version j (see pv-put! for why this is not a `set!`).
+(defn pm-put! [(st (ptr PmSt)) (j i64) (v (PMap i64 Tok))] (-> i64)
+  (let [old (take! [(PMap i64 Tok)] (index (field st vs) j))]
+    (store! (index (field st vs) j) v)
+    0))
+
+(defn pm-replace-model! [(st (ptr PmSt)) (dst i64) (src i64)] (-> i64)
+  (unless (= dst src) (amap-copy! (pm-model st dst) (pm-model st src)) 0)
+  (pm-bump! st dst)
+  0)
+
+(defn pm-lookup-id [(v (ptr (PMap i64 Tok))) (k i64)] (-> i64)
+  (match (pm-get-ptr v k) (Some [p] (tok-id p)) (None [] -999999)))
+
+(defn pm-check-version [(st (ptr PmSt)) (i i64)] (-> bool)
+  (let [v (pm-at st i)
+        m (pm-model st i)
+        n (amap-len m)
+        (mut ok) (and (= (pm-len v) n) (= (pm-empty? v) (= n 0)))]
+    (for [j 0 n]
+      (let [k (buf-at (field m ks) j)]
+        (unless (= (pm-lookup-id v k) (buf-at (field m vs) j)) (store! ok false) 0)))
+    (let [(mut it) (pm-iter v)
+          (mut seen) 0]
+      (loop (match (next (mut it))
+              (None [] (break))
+              (Some [e]
+                    (do
+                      (store! seen (+ (load seen) 1))
+                      (unless (= (amap-get-or m (load (field e key)) -999999)
+                                 (tok-id (field e val)))
+                        (store! ok false)
+                        0)
+                      0))))
+      (unless (= (load seen) n) (store! ok false) 0))
+    (load ok)))
+
+(defn pm-check-all [(st (ptr PmSt))] (-> bool)
+  (let [(mut ok) true]
+    (for [i 0 NV]
+      (unless (pm-check-version st i) (store! ok (tr-fail "version" i 0)) 0))
+    (load ok)))
+
+(defn pm-total [(st (ptr PmSt))] (-> i64)
+  (let [(mut t) 0]
+    (for [i 0 NV] (store! t (+ (load t) (amap-len (pm-model st i)))))
+    (load t)))
+
+(defn pm-pins-ok [(st (ptr PmSt))] (-> bool)
+  (let [(mut ok) true]
+    (for [k 0 NPINS]
+      (let [p (load (index (field st pin-p) k))
+            vi (load (index (field st pin-v) k))]
+        (when (and (!= (primitive/cast i64 p) 0)
+                   (= (load (index (field st pin-e) k)) (load (index (field st epoch) vi))))
+          (unless (= (tok-id p) (load (index (field st pin-x) k)))
+            (store! ok (tr-fail "pin" k vi))
+            0)
+          0)))
+    (load ok)))
+
+; ---- pm-diff against the models
+(defstruct DiffRec
+  [(before (ptr AMap))
+   (after (ptr AMap))
+   (seen AMap)
+   (calls i64)
+   (bad i64)])
+
+(defn diff-same [(l (ptr i8)) (r (ptr i8))] (-> bool)
+  (= (tok-id (primitive/cast (ptr Tok) l)) (tok-id (primitive/cast (ptr Tok) r))))
+
+(defn diff-visit [(ctx (ptr i8))
+                  (b (ptr (PEntry i64 Tok)))
+                  (a (ptr (PEntry i64 Tok)))] (-> i64)
+  (let [r (primitive/cast (ptr DiffRec) ctx)
+        none (primitive/cast (ptr (PEntry i64 Tok)) 0)
+        missing -999999
+        key (if (= b none) (load (field a key)) (load (field b key)))
+        was (amap-get-or (.before r) key missing)
+        now (amap-get-or (.after r) key missing)
+        ok
+          (cond (and (= b none) (= a none)) false
+                (= b none) (and (= was missing) (= now (tok-id (field a val))))
+                (= a none) (and (= now missing) (= was (tok-id (field b val))))
+                :else
+                  (and (= (load (field b key)) (load (field a key)))
+                       (and (= was (tok-id (field b val)))
+                            (and (= now (tok-id (field a val))) (!= was now)))))]
+    (set! (.calls r) (+ (.calls r) 1))
+    (unless ok (set! (.bad r) (+ (.bad r) 1)) 0)
+    ; each key at most once
+    (unless (= (amap-put! (field r seen) key 1) 1) (set! (.bad r) (+ (.bad r) 1)) 0)
+    0))
+
+(defn diff-expected [(b (ptr AMap)) (a (ptr AMap))] (-> i64)
+  (let [(mut n) 0]
+    (for [j 0 (amap-len b)]
+      (let [k (buf-at (field b ks) j)
+            i (amap-find a k)]
+        (when (or (< i 0) (!= (buf-at (field a vs) i) (buf-at (field b vs) j)))
+          (store! n (+ (load n) 1))
+          0)))
+    (for [j 0 (amap-len a)]
+      (when (< (amap-find b (buf-at (field a ks) j)) 0) (store! n (+ (load n) 1)) 0))
+    (load n)))
+
+(defn pm-diff-check [(st (ptr PmSt)) (vi i64) (vj i64)] (-> bool)
+  (let [rec (primitive/alloc-stack DiffRec)]
+    (store! rec
+            (DiffRec
+              :before (pm-model st vi)
+              :after (pm-model st vj)
+              :seen (amap-new)
+              :calls 0
+              :bad 0))
+    (pm-diff (pm-at st vi)
+             (pm-at st vj)
+             (primitive/fnptr-of diff-same)
+             (primitive/fnptr-of diff-visit)
+             (primitive/cast (ptr i8) rec))
+    (let [want (diff-expected (pm-model st vi) (pm-model st vj))
+          ok (and (= (.bad rec) 0) (= (.calls rec) want))]
+      (unless ok (tr-fail "diff calls/want" (.calls rec) want) 0)
+      (amap-free! (field rec seen))
+      ok)))
+
+(defn pm-step [(st (ptr PmSt)) (s (ptr Source))] (-> bool)
+  (let [tag (draw-tag! s 12)
+        vi (draw-int! s 0 (- NV 1))
+        vj (draw-int! s 0 (- NV 1))
+        m (pm-model st vi)
+        n (amap-len m)]
+    (cond
+      (= tag 0)
+        (let [k (draw-key s)
+              x (draw-int-any! s)
+              fresh (< (amap-find m k) 0)
+              r (pm-assoc! (mut (index (field st vs) vi)) k (tok x))]
+          (tr "assoc!" vi k x)
+          (amap-put! m k x)
+          (pm-bump! st vi)
+          (and (= r (if fresh 1 0)) (= (pm-lookup-id (pm-at st vi) k) x)))
+      (= tag 1)
+        (let [k (draw-key s)
+              want (amap-remove! m k)
+              r (pm-dissoc! (mut (index (field st vs) vi)) k)]
+          (tr "dissoc!" vi k r)
+          (pm-bump! st vi)
+          (and (= r want) (not (pm-contains? (pm-at st vi) k))))
+      (= tag 2)
+        (let [k (draw-key s)
+              want (amap-get-or m k -999999)]
+          (tr "get" vi k 0)
+          (and (= (pm-contains? (pm-at st vi) k) (!= want -999999))
+               (match (pm-get (pm-at st vi) k)
+                 (Some [t] (= (.id t) want))
+                 (None [] (= want -999999)))))
+      (= tag 3)
+        (let [k (draw-key s)
+              x (draw-int-any! s)]
+          (tr "assoc" vj vi k)
+          (pm-put! st vj (pm-assoc (pm-at st vi) k (tok x)))
+          (pm-replace-model! st vj vi)
+          (amap-put! (pm-model st vj) k x)
+          true)
+      (= tag 4)
+        (let [k (draw-key s)]
+          (tr "dissoc" vj vi k)
+          (pm-put! st vj (pm-dissoc (pm-at st vi) k))
+          (pm-replace-model! st vj vi)
+          (amap-remove! (pm-model st vj) k)
+          true)
+      (= tag 5)
+        (do
+          (tr "clone" vj vi 0)
+          (pm-put! st vj (pm-clone-of (pm-at st vi)))
+          (pm-replace-model! st vj vi)
+          (pm-same? (pm-at st vi) (pm-at st vj)))
+      ; bulk assoc!: dense keys, growing the trie
+      (= tag 6)
+        (let [k (draw-int! s 0 (if (.weak st) 150 (* (src-size s) 12)))
+              base (draw-int! s -64 60000)
+              stride (draw-int! s 1 8)
+              x (draw-int! s 0 1000000)
+              (mut ok) true]
+          (tr "bulk-assoc!" vi k base)
+          (for [j 0 k]
+            (let [key (+ base (* j stride))
+                  fresh (< (amap-find m key) 0)]
+              (unless (= (pm-assoc! (mut (index (field st vs) vi)) key (tok (+ x j)))
+                         (if fresh 1 0))
+                (store! ok false)
+                0)
+              (amap-put! m key (+ x j))))
+          (pm-bump! st vi)
+          (load ok))
+      ; bulk dissoc! by residue: collapses subtrees back into their parents
+      (= tag 7)
+        (let [modulus (draw-int! s 1 4)
+              residue (draw-int! s 0 3)
+              (mut ok) true
+              (mut j) 0]
+          (tr "bulk-dissoc!" vi modulus residue)
+          (loop (if (>= (load j) (amap-len m))
+                    (break)
+                    (let [key (buf-at (field m ks) (load j))]
+                      (if (= (% (primitive/iand key 1023) modulus) (% residue modulus))
+                          (do
+                            (unless (= (pm-dissoc! (mut (index (field st vs) vi)) key) 1)
+                              (store! ok false)
+                              0)
+                            (amap-remove! m key)
+                            0)
+                          (store! j (+ (load j) 1))))))
+          (pm-bump! st vi)
+          (load ok))
+      (= tag 8)
+        (let [j (draw-int! s 0 (if (> n 0) (- n 1) 0))]
+          (tr "pin" vi j 0)
+          (when (> n 0)
+            (let [k (% (.next-pin st) NPINS)
+                  key (buf-at (field m ks) j)]
+              (match (pm-get-ptr (pm-at st vi) key)
+                (Some [p]
+                      (do
+                        (store! (index (field st pin-p) k) p)
+                        (store! (index (field st pin-v) k) vi)
+                        (store! (index (field st pin-e) k) (load (index (field st epoch) vi)))
+                        (store! (index (field st pin-x) k) (buf-at (field m vs) j))
+                        0))
+                (None [] 0))
+              (set! (.next-pin st) (+ (.next-pin st) 1))
+              0)
+            0)
+          true)
+      (= tag 9) (do (tr "diff" vi vj 0) (pm-diff-check st vi vj))
+      ; a burst of pure edits chained off one version
+      (= tag 10)
+        (let [k (draw-int! s 0 60)
+              base (draw-key s)]
+          (tr "assoc-chain" vj vi k)
+          (pm-put! st vj (pm-clone-of (pm-at st vi)))
+          (pm-replace-model! st vj vi)
+          (for [j 0 k]
+            (let [key (+ base (% j 11))]
+              (if (= (% j 3) 2)
+                  (do
+                    (pm-put! st vj (pm-dissoc (pm-at st vj) key))
+                    (amap-remove! (pm-model st vj) key)
+                    0)
+                  (do
+                    (pm-put! st vj (pm-assoc (pm-at st vj) key (tok j)))
+                    (amap-put! (pm-model st vj) key j)
+                    0))))
+          true)
+      :else (do (tr "check-all" 0 0 0) (pm-check-all st)))))
+
+(defn pm-run [(h (ptr Harness)) (s (ptr Source)) (kt i64)] (-> bool)
+  (let [null-tok (primitive/cast (ptr Tok) 0)
+        ops (pick-keyops kt)
+        (mut st)
+          (PmSt
+            :vs [(pm-new [i64 Tok] (harness-lease h) ops)
+                 (pm-new [i64 Tok] (harness-lease h) ops)
+                 (pm-new [i64 Tok] (harness-lease h) ops)
+                 (pm-new [i64 Tok] (harness-lease h) ops)]
+            :ms [(amap-new) (amap-new) (amap-new) (amap-new)]
+            :epoch [0 0 0 0]
+            :pin-p [null-tok null-tok null-tok null-tok null-tok null-tok]
+            :pin-v [0 0 0 0 0 0]
+            :pin-e [0 0 0 0 0 0]
+            :pin-x [0 0 0 0 0 0]
+            :next-pin 0
+            :weak (weak-hash? kt))
+        n (draw-len! s 0 (src-size s))
+        (mut ok) true
+        (mut i) 0]
+    (loop (if (or (not (load ok)) (>= (load i) n))
+              (break)
+              (let [sp (op-open s)]
+                (unless (pm-step (mut st) s) (store! ok (tr-fail "step" (load i) 0)) 0)
+                (when (<= (pm-total (mut st)) (if (.weak (mut st)) 200 1500))
+                  (unless (pm-check-all (mut st)) (store! ok (tr-fail "check" (load i) 0)) 0)
+                  0)
+                (unless (pm-pins-ok (mut st)) (store! ok false) 0)
+                (span-close! s sp)
+                (store! i (+ (load i) 1)))))
+    (when (load ok) (unless (pm-check-all (mut st)) (store! ok false) 0) 0)
+    (for [j 0 NV] (amap-free! (index (field st ms) j)))
+    (load ok)))
+
+(defprop pmap-versions-match-models [(seed u8)]
+  (let [s (prop-src)
+        hk (draw-tag! s H-COUNT)
+        kt (draw-tag! s HASH-COUNT)
+        (mut h) (zeroed Harness)]
+    (trace-begin! __mode)
+    (tr "harness/hash" hk kt 0)
+    (store! (live-toks) 0)
+    (harness-init! (mut h) hk)
+    (let [ok (pm-run (mut h) s kt)
+          live (load (live-toks))
+          clean (harness-finish! (mut h))]
+      (unless (= live 0) (tr-fail "live-toks" live 0) 0)
+      (unless clean (tr-fail "harness-leak" hk 0) 0)
+      (and ok (and (= live 0) clean)))))
+
+; ======================================================= HashMap, owned keys
+;
+; `str-keyops` OWNS its keys: an inserted key is deep-copied into the map's
+; allocator, and released on remove / clear / free. Every key here is built in
+; ONE reused scratch buffer that is scribbled over right after each call, so a
+; map that kept the caller's bytes (or freed its copy early) answers wrongly or
+; trips the debug allocator / ASan. Keys are short strings over a tiny alphabet
+; (plenty of collisions, the empty key included), encoded as an integer for the
+; model.
+
+(defstruct SkSt
+  [(m (HashMap (slice u8) i64))
+   (model AMap)
+   (scratch (ptr u8))])
+
+(defn sk-alphabet [] (-> (slice u8))
+  "abcA\x00;\xff;")
+
+;;; Draw a key into the scratch buffer; returns its encoding (len | bytes << 8).
+(defn sk-draw [(st (ptr SkSt)) (s (ptr Source))] (-> i64)
+  (let [n (draw-int! s 0 6)
+        alpha (sk-alphabet)
+        (mut code) n]
+    (for [i 0 n]
+      (let [b (slice-get alpha (draw-int! s 0 (- (slice-len alpha) 1)))]
+        (store! (primitive/index (.scratch st) i) b)
+        (store! code (primitive/ior (load code)
+                                    (primitive/ishl (primitive/cast i64 b) (* 8 (+ i 1)))))))
+    (load code)))
+
+(defn sk-key [(st (ptr SkSt)) (code i64)] (-> (slice u8))
+  (slice-new (.scratch st) (primitive/iand code 255)))
+
+(defn sk-encode [(k (slice u8))] (-> i64)
+  (let [n (slice-len k)
+        (mut code) n]
+    (for [i 0 n]
+      (store! code (primitive/ior (load code)
+                                  (primitive/ishl (primitive/cast i64 (slice-get k i)) (* 8 (+ i 1))))))
+    (load code)))
+
+(defn sk-scribble! [(st (ptr SkSt))] (-> i64)
+  (for [i 0 8] (store! (primitive/index (.scratch st) i) (primitive/cast u8 238)))
+  0)
+
+(defn sk-full-check [(st (ptr SkSt))] (-> bool)
+  (let [m (field st m)
+        model (field st model)
+        n (amap-len model)
+        (mut ok) (= (hm-len (load m)) n)
+        (mut seen) 0]
+    (hm-for [k v m]
+      (let [code (sk-encode k)]
+        (store! seen (+ (load seen) 1))
+        (unless (= (amap-get-or model code -1) v) (store! ok false) 0)
+        0))
+    (unless (= (load seen) n) (store! ok false) 0)
+    (for [j 0 n]
+      (let [code (buf-at (field model ks) j)
+            ; rebuild the key's bytes in the scratch buffer
+            len (primitive/iand code 255)]
+        (for [i 0 len]
+          (store! (primitive/index (.scratch st) i)
+                  (primitive/cast u8 (primitive/iand (primitive/ishr code (* 8 (+ i 1))) 255))))
+        (match (hm-get (load m) (sk-key st code))
+          (Some [v] (unless (= v (buf-at (field model vs) j)) (store! ok false) 0))
+          (None [] (store! ok false)))
+        (sk-scribble! st)))
+    (load ok)))
+
+(defn sk-step [(st (ptr SkSt)) (s (ptr Source))] (-> bool)
+  (let [tag (draw-tag! s 8)
+        model (field st model)]
+    (cond
+      (= tag 0)
+        (let [code (sk-draw st s)
+              v (draw-int! s 0 1000000)
+              present (>= (amap-find model code) 0)
+              r (hm-put! (mut (field st m)) (sk-key st code) v)]
+          (tr "put" code v r)
+          (sk-scribble! st)
+          (amap-put! model code v)
+          (= (= r 0) present))
+      (= tag 1)
+        (let [code (sk-draw st s)
+              want (amap-get-or model code -1)
+              got (match (hm-get (load (field st m)) (sk-key st code)) (Some [v] v) (None [] -1))]
+          (tr "get" code got 0)
+          (sk-scribble! st)
+          (= want got))
+      (= tag 2)
+        (let [code (sk-draw st s)
+              want (amap-remove! model code)
+              got (hm-remove! (mut (field st m)) (sk-key st code))]
+          (tr "remove" code got 0)
+          (sk-scribble! st)
+          (= want got))
+      (= tag 3)
+        (do (tr "clear" 0 0 0) (hm-clear! (mut (field st m))) (amap-clear! model) (sk-full-check st))
+      (= tag 4)
+        (do (tr "free" 0 0 0) (hm-free! (mut (field st m))) (amap-clear! model) (sk-full-check st))
+      (= tag 5)
+        (let [c (draw-int! s 0 200)]
+          (tr "grow" c 0 0)
+          (hm-grow! (mut (field st m)) c)
+          (sk-full-check st))
+      ; many puts of the same few keys, then removes: tombstone reuse with owned keys
+      (= tag 6)
+        (let [k (draw-int! s 0 300)
+              (mut ok) true]
+          (tr "churn" k 0 0)
+          (for [j 0 k]
+            (let [code (sk-draw st s)]
+              (if (= (% j 2) 0)
+                  (let [present (>= (amap-find model code) 0)
+                        r (hm-put! (mut (field st m)) (sk-key st code) j)]
+                    (unless (= (= r 0) present) (store! ok false) 0)
+                    (amap-put! model code j)
+                    0)
+                  (let [want (amap-remove! model code)]
+                    (unless (= (hm-remove! (mut (field st m)) (sk-key st code)) want)
+                      (store! ok false)
+                      0)
+                    0))
+              (sk-scribble! st)))
+          (and (load ok) (sk-full-check st)))
+      :else (do (tr "check" 0 0 0) (sk-full-check st)))))
+
+(defprop hashmap-owned-string-keys [(seed u8)]
+  (let [s (prop-src)
+        hk (draw-tag! s H-COUNT)
+        (mut h) (zeroed Harness)]
+    (trace-begin! __mode)
+    (tr "harness" hk 0 0)
+    (harness-init! (mut h) hk)
+    (let [(mut st)
+            (SkSt
+              :m (hm-new [(slice u8) i64] (.a (mut h)) (str/str-keyops))
+              :model (amap-new)
+              :scratch (primitive/cast (ptr u8) (malloc-raw 16)))
+          n (draw-len! s 0 (src-size s))
+          (mut ok) true
+          (mut i) 0]
+      (loop (if (or (not (load ok)) (>= (load i) n))
+                (break)
+                (let [sp (op-open s)]
+                  (unless (sk-step (mut st) s) (store! ok (tr-fail "step" (load i) 0)) 0)
+                  (span-close! s sp)
+                  (store! i (+ (load i) 1)))))
+      (when (load ok) (unless (sk-full-check (mut st)) (store! ok false) 0) 0)
+      (hm-free! (mut (field st m)))
+      (amap-free! (field (mut st) model))
+      (primitive/free (primitive/cast (ptr i8) (.scratch (mut st))))
+      (let [clean (harness-finish! (mut h))]
+        (unless clean (tr-fail "harness-leak" hk 0) 0)
+        (and (load ok) clean)))))
+
+; =============================================================== allocators
+;
+; The allocators directly: typed and raw-byte blocks are allocated, freed,
+; resized (fixed address), remapped (may move) and reallocated, each filled with
+; a pattern unique to the block. After every step every live block must still
+; hold its pattern — two blocks that overlap, a resize that clobbers a neighbour,
+; a remap that loses the prefix, all show up as a changed byte — and every
+; pointer must honour the requested alignment. Regions additionally track each
+; block's exact request, so a Region over the debug allocator checks that the
+; region hands the parent back exactly what it took; `region-close!` mid-run
+; must release everything, and the debug allocator must end with no leaks.
+
+(const MAXB 48)
+
+(const A-REGION 0)
+(const A-REGION-DEBUG 1)
+(const A-REGION-REGION 2)
+(const A-OVERFLOW 3)
+(const A-ARENA 4)
+(const A-DEBUG 5)
+(const A-MALLOC 6)
+(const A-COUNT 7)
+
+; kinds of block
+(const BK-U8 0)
+(const BK-I64 1)
+(const BK-BYTES 2)
+
+(defstruct AlcSt
+  [(kind i64)
+   (debug (ptr DebugAllocator))
+   (r1 (ptr Region))
+   (r2 (ptr Region))
+   (ov (ptr OverflowArena))
+   (ar (ptr Arena))
+   (a (dyn Allocator))
+   (bp (array (ptr u8) 48))
+   (bn (array i64 48))  ; element count
+   (bk (array i64 48))  ; BK-*
+   (balign (array i64 48))
+   (bid (array i64 48))
+   (nb i64)
+   (next-id i64)])
+
+(defn alc-init! [(st (ptr AlcSt)) (kind i64)] (-> i64)
+  (set! (.kind st) kind)
+  (set! (.debug st) (primitive/cast (ptr DebugAllocator) 0))
+  (set! (.r1 st) (primitive/cast (ptr Region) 0))
+  (set! (.r2 st) (primitive/cast (ptr Region) 0))
+  (set! (.ov st) (primitive/cast (ptr OverflowArena) 0))
+  (set! (.ar st) (primitive/cast (ptr Arena) 0))
+  (set! (.nb st) 0)
+  (set! (.next-id st) 1)
+  (cond (= kind A-REGION)
+          (do
+            (set! (.r1 st) (primitive/cast (ptr Region) (malloc-raw (sizeof Region))))
+            (region-init (.r1 st) (malloc-allocator))
+            (set! (.a st) (region-allocator (.r1 st))))
+        (= kind A-REGION-DEBUG)
+          (do
+            (set! (.debug st) (debug-allocator-init (malloc-allocator)))
+            (set! (.r1 st) (primitive/cast (ptr Region) (malloc-raw (sizeof Region))))
+            (region-init (.r1 st) (debug-allocator-view (.debug st)))
+            (set! (.a st) (region-allocator (.r1 st))))
+        (= kind A-REGION-REGION)
+          (do
+            (set! (.debug st) (debug-allocator-init (malloc-allocator)))
+            (set! (.r2 st) (primitive/cast (ptr Region) (malloc-raw (sizeof Region))))
+            (region-init (.r2 st) (debug-allocator-view (.debug st)))
+            (set! (.r1 st) (primitive/cast (ptr Region) (malloc-raw (sizeof Region))))
+            (region-init (.r1 st) (region-allocator (.r2 st)))
+            (set! (.a st) (region-allocator (.r1 st))))
+        (= kind A-OVERFLOW)
+          (let [ov (primitive/cast (ptr OverflowArena) (malloc-raw (sizeof OverflowArena)))]
+            (set! (.base ov) (malloc-raw 4096))
+            (set! (.off ov) 0)
+            (set! (.cap ov) 4096)
+            (set! (.ov st) ov)
+            (set! (.a st) (primitive/make-dyn Allocator ov)))
+        (= kind A-ARENA)
+          (let [ar (primitive/cast (ptr Arena) (malloc-raw (sizeof Arena)))]
+            (set! (.ar st) ar)
+            (set! (.a st) (arena-over-buffer ar (malloc-raw 65536) 65536)))
+        (= kind A-DEBUG)
+          (do
+            (set! (.debug st) (debug-allocator-init (malloc-allocator)))
+            (set! (.a st) (debug-allocator-view (.debug st))))
+        :else (set! (.a st) (malloc-allocator)))
+  0)
+
+(defn alc-may-fail? [(st (ptr AlcSt))] (-> bool)
+  (= (.kind st) A-ARENA))
+
+(defn b-ptr [(st (ptr AlcSt)) (j i64)] (-> (ptr u8)) (load (index (field st bp) j)))
+(defn b-n [(st (ptr AlcSt)) (j i64)] (-> i64) (load (index (field st bn) j)))
+(defn b-kind [(st (ptr AlcSt)) (j i64)] (-> i64) (load (index (field st bk) j)))
+(defn b-id [(st (ptr AlcSt)) (j i64)] (-> i64) (load (index (field st bid) j)))
+(defn b-align [(st (ptr AlcSt)) (j i64)] (-> i64) (load (index (field st balign) j)))
+
+(defn b-bytes [(st (ptr AlcSt)) (j i64)] (-> i64)
+  (if (= (b-kind st j) BK-I64) (* 8 (b-n st j)) (b-n st j)))
+
+(defn pattern [(id i64) (i i64)] (-> u8)
+  (primitive/cast u8 (primitive/iand (+ (* id 131) (* i 7)) 255)))
+
+(defn b-fill! [(st (ptr AlcSt)) (j i64) (from i64)] (-> i64)
+  (let [p (b-ptr st j) id (b-id st j)]
+    (for [i from (b-bytes st j)] (store! (primitive/index p i) (pattern id i)))
+    0))
+
+(defn b-intact? [(st (ptr AlcSt)) (j i64) (upto i64)] (-> bool)
+  (let [p (b-ptr st j) id (b-id st j) (mut ok) true]
+    (for [i 0 upto] (unless (= (load (primitive/index p i)) (pattern id i)) (store! ok false) 0))
+    (load ok)))
+
+(defn aligned? [(p (ptr u8)) (align i64)] (-> bool)
+  (= (primitive/iand (primitive/cast i64 p) (- align 1)) 0))
+
+(defn alc-check-all [(st (ptr AlcSt))] (-> bool)
+  (let [(mut ok) true]
+    (for [j 0 (.nb st)]
+      (unless (and (b-intact? st j (b-bytes st j)) (aligned? (b-ptr st j) (b-align st j)))
+        (store! ok (tr-fail "block" j (b-id st j)))
+        0))
+    (load ok)))
+
+(defn b-add! [(st (ptr AlcSt)) (p (ptr u8)) (n i64) (kind i64) (align i64)] (-> i64)
+  (let [j (.nb st)]
+    (store! (index (field st bp) j) p)
+    (store! (index (field st bn) j) n)
+    (store! (index (field st bk) j) kind)
+    (store! (index (field st balign) j) align)
+    (store! (index (field st bid) j) (.next-id st))
+    (set! (.next-id st) (+ (.next-id st) 1))
+    (set! (.nb st) (+ j 1))
+    (b-fill! st j 0)
+    j))
+
+(defn b-remove! [(st (ptr AlcSt)) (j i64)] (-> i64)
+  (let [last (- (.nb st) 1)]
+    (store! (index (field st bp) j) (b-ptr st last))
+    (store! (index (field st bn) j) (b-n st last))
+    (store! (index (field st bk) j) (b-kind st last))
+    (store! (index (field st balign) j) (b-align st last))
+    (store! (index (field st bid) j) (b-id st last))
+    (set! (.nb st) last)
+    0))
+
+(defn b-free! [(st (ptr AlcSt)) (j i64)] (-> i64)
+  (let [p (b-ptr st j) n (b-n st j) a (.a st)]
+    (cond (= (b-kind st j) BK-U8) (free [u8] a (slice-new p n))
+          (= (b-kind st j) BK-I64) (free [i64] a (slice-new (primitive/cast (ptr i64) p) n))
+          :else (free-bytes a (slice-new p n) (b-align st j)))
+    (b-remove! st j)))
+
+;;; Allocate a block; false only when the allocator refused and may not.
+(defn alc-alloc! [(st (ptr AlcSt)) (kind i64) (n i64) (align i64)] (-> bool)
+  (if (>= (.nb st) MAXB)
+      true
+      (let [a (.a st)
+            got
+              (cond (= kind BK-U8)
+                      (match (alloc [u8] a n)
+                        (Some [m] (slice-data m))
+                        (None [] (primitive/cast (ptr u8) 0)))
+                    (= kind BK-I64)
+                      (match (alloc [i64] a n)
+                        (Some [m] (primitive/cast (ptr u8) (slice-data m)))
+                        (None [] (primitive/cast (ptr u8) 0)))
+                    :else
+                      (match (alloc-bytes a n align)
+                        (Some [m] (slice-data m))
+                        (None [] (primitive/cast (ptr u8) 0))))
+            al (cond (= kind BK-U8) 1 (= kind BK-I64) 8 :else align)]
+        (if (= (primitive/cast i64 got) 0)
+            (alc-may-fail? st)
+            (do (b-add! st got n kind al) true)))))
+
+;;; Change block j's length through `how` (0 resize, 1 remap, 2 reallocate).
+(defn alc-change! [(st (ptr AlcSt)) (j i64) (n2 i64) (how i64)] (-> bool)
+  (let [a (.a st)
+        p (b-ptr st j)
+        n (b-n st j)
+        kind (b-kind st j)
+        old-bytes (b-bytes st j)
+        got
+          (if (= kind BK-U8)
+              (let [m (slice-new p n)
+                    r (case how 0 (resize [u8] a m n2) 1 (remap [u8] a m n2) (reallocate [u8] a m n2))]
+                (match r (Some [x] (slice-data x)) (None [] (primitive/cast (ptr u8) 0))))
+              (let [m (slice-new (primitive/cast (ptr i64) p) n)
+                    r (case how 0 (resize [i64] a m n2) 1 (remap [i64] a m n2) (reallocate [i64] a m n2))]
+                (match r
+                  (Some [x] (primitive/cast (ptr u8) (slice-data x)))
+                  (None [] (primitive/cast (ptr u8) 0)))))]
+    (if (= (primitive/cast i64 got) 0)
+        ; refused: the block must be untouched. reallocate refuses only on OOM.
+        (and (or (!= how 2) (alc-may-fail? st)) (b-intact? st j old-bytes))
+        (do
+          (store! (index (field st bp) j) got)
+          (store! (index (field st bn) j) n2)
+          (let [keep (if (< old-bytes (b-bytes st j)) old-bytes (b-bytes st j))
+                ok (and (b-intact? st j keep) (or (!= how 0) (= got p)))]
+            (b-fill! st j keep)
+            (unless ok (tr-fail "change lost data / moved on resize" j how) 0)
+            ok)))))
+
+(defn alc-step [(st (ptr AlcSt)) (s (ptr Source))] (-> bool)
+  (let [tag (draw-tag! s 9)
+        nb (.nb st)
+        j (draw-int! s 0 (if (> nb 0) (- nb 1) 0))]
+    (cond
+      (= tag 0)
+        (let [n (draw-int! s 1 300)]
+          (tr "alloc-u8" n 0 0)
+          (alc-alloc! st BK-U8 n 1))
+      (= tag 1)
+        (let [n (draw-int! s 1 200)]
+          (tr "alloc-i64" n 0 0)
+          (alc-alloc! st BK-I64 n 8))
+      (= tag 2)
+        (let [n (draw-int! s 1 300)
+              align (primitive/ishl 1 (draw-int! s 0 12))]
+          (tr "alloc-bytes" n align 0)
+          (alc-alloc! st BK-BYTES n align))
+      (= tag 3)
+        (do (tr "free" j nb 0) (when (> nb 0) (b-free! st j) 0) true)
+      (or (= tag 4) (or (= tag 5) (= tag 6)))
+        (let [n2 (draw-int! s 1 400)
+              how (- tag 4)]
+          (tr "change" j n2 how)
+          (if (and (> nb 0) (!= (b-kind st j) BK-BYTES))
+              (alc-change! st j n2 how)
+              true))
+      ; a burst of small blocks, every other one freed from the middle
+      (= tag 7)
+        (let [k (draw-int! s 0 40)
+              (mut ok) true]
+          (tr "burst" k 0 0)
+          (for [i 0 k]
+            (unless (alc-alloc! st BK-U8 (+ 1 (% i 16)) 1) (store! ok false) 0)
+            (when (and (= (% i 2) 1) (> (.nb st) 2)) (b-free! st (/ (.nb st) 2)) 0))
+          (load ok))
+      ; close a region mid-run: every block goes, and the region refuses more
+      :else
+        (do
+          (tr "close" (.kind st) nb 0)
+          (if (!= (primitive/cast i64 (.r1 st)) 0)
+              (do
+                (region-close! (.r1 st))
+                (set! (.nb st) 0)
+                (let [refused
+                        (match (alloc [u8] (.a st) 8) (Some [m] false) (None [] true))]
+                  (region-init (.r1 st)
+                               (if (!= (primitive/cast i64 (.r2 st)) 0)
+                                   (region-allocator (.r2 st))
+                                   (if (!= (primitive/cast i64 (.debug st)) 0)
+                                       (debug-allocator-view (.debug st))
+                                       (malloc-allocator))))
+                  refused))
+              true)))))
+
+(defn alc-finish! [(st (ptr AlcSt))] (-> bool)
+  (loop (if (= (.nb st) 0) (break) (b-free! st 0)))
+  (let [(mut ok) true]
+    (when (!= (primitive/cast i64 (.r1 st)) 0)
+      (unless (region-empty? (.r1 st)) (store! ok (tr-fail "r1 not empty" 0 0)) 0)
+      (region-close! (.r1 st))
+      (primitive/free (primitive/cast (ptr i8) (.r1 st)))
+      0)
+    (when (!= (primitive/cast i64 (.r2 st)) 0)
+      (unless (region-empty? (.r2 st)) (store! ok (tr-fail "r2 not empty" 0 0)) 0)
+      (region-close! (.r2 st))
+      (primitive/free (primitive/cast (ptr i8) (.r2 st)))
+      0)
+    (when (!= (primitive/cast i64 (.debug st)) 0)
+      (unless (= (debug-allocator-deinit! (.debug st)) 0) (store! ok (tr-fail "debug leaks" 0 0)) 0)
+      0)
+    (when (!= (primitive/cast i64 (.ov st)) 0)
+      (primitive/free (.base (.ov st)))
+      (primitive/free (primitive/cast (ptr i8) (.ov st)))
+      0)
+    (when (!= (primitive/cast i64 (.ar st)) 0)
+      (primitive/free (.base (.ar st)))
+      (primitive/free (primitive/cast (ptr i8) (.ar st)))
+      0)
+    (load ok)))
+
+(defprop allocators-keep-blocks-intact [(seed u8)]
+  (let [s (prop-src)
+        kind (draw-tag! s A-COUNT)
+        st (primitive/alloc-stack AlcSt)]
+    (trace-begin! __mode)
+    (tr "allocator" kind 0 0)
+    (alc-init! st kind)
+    (let [n (draw-len! s 0 (src-size s))
+          (mut ok) true
+          (mut i) 0]
+      (loop (if (or (not (load ok)) (>= (load i) n))
+                (break)
+                (let [sp (op-open s)]
+                  (unless (alc-step st s) (store! ok (tr-fail "step" (load i) 0)) 0)
+                  (unless (alc-check-all st) (store! ok (tr-fail "check" (load i) 0)) 0)
+                  (span-close! s sp)
+                  (store! i (+ (load i) 1)))))
+      (let [clean (alc-finish! st)]
+        (and (load ok) clean)))))
