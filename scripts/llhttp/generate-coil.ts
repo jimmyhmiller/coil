@@ -146,7 +146,12 @@ function coilString(data: Buffer | string): string {
     else if (byte === 0x0d) out += '\\r';
     else if (byte === 0x09) out += '\\t';
     else if (byte >= 0x20 && byte <= 0x7e) out += String.fromCharCode(byte);
-    else out += `\\x${byte.toString(16).padStart(2, '0')}`;
+    else {
+      /* `\xHEX;` denotes a Unicode scalar value (UTF-8 encoded), so it spells
+       * a single byte only below 0x80. */
+      assert(byte < 0x80, `cannot spell byte 0x${byte.toString(16)} in a Coil string literal`);
+      out += `\\x${byte.toString(16).padStart(2, '0')};`;
+    }
   }
   return out + '"';
 }

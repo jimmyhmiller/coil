@@ -6,16 +6,20 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { MDGator, type Group, type Test } from 'mdgator';
 
+/* Coil's `\xHEX;` escape in an ordinary string denotes a Unicode scalar value
+ * encoded as UTF-8, so escape by CODE POINT: the literal then holds exactly the
+ * UTF-8 bytes of `value`, which is what the parser is fed. */
 function coilString(value: string): string {
   let out = '"';
-  for (const byte of Buffer.from(value)) {
-    if (byte === 0x22) out += '\\"';
-    else if (byte === 0x5c) out += '\\\\';
-    else if (byte === 0x0a) out += '\\n';
-    else if (byte === 0x0d) out += '\\r';
-    else if (byte === 0x09) out += '\\t';
-    else if (byte >= 0x20 && byte <= 0x7e) out += String.fromCharCode(byte);
-    else out += `\\x${byte.toString(16).padStart(2, '0')}`;
+  for (const char of value) {
+    const code = char.codePointAt(0)!;
+    if (code === 0x22) out += '\\"';
+    else if (code === 0x5c) out += '\\\\';
+    else if (code === 0x0a) out += '\\n';
+    else if (code === 0x0d) out += '\\r';
+    else if (code === 0x09) out += '\\t';
+    else if (code >= 0x20 && code <= 0x7e) out += char;
+    else out += `\\x${code.toString(16).padStart(2, '0')};`;
   }
   return out + '"';
 }
