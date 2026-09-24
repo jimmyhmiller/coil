@@ -2125,6 +2125,29 @@ case "$plainsyms" in
   *asan*) bad "a plain build must not be instrumented" "found __asan without --sanitize" ;;
   *) ok "no ASan symbols without --sanitize=address" ;;
 esac
+# `emit-ir` renumbers attribute groups (#0, #1, …) into a canonical order. It once
+# rewrote every "#<digit>" in the text, string constants included, so a literal
+# "#0" came out as "#3" whenever that order differed from emission order — which
+# --sanitize=address reliably causes, and which `coil fuzz --sanitize=address`
+# (built through emit-ir) then ran as the program's data.
+cat > "$T/hashlits.coil" <<'EOF'
+(module hashlits)
+(defn main [] (-> i64)
+  (println "{} {} {} {}" "#0-zero" "#1-one" "#2-two" "#3-three")
+  0)
+EOF
+hashir=$("$COIL" emit-ir "$T/hashlits.coil" --sanitize=address 2>&1); hashrc=$?
+case "$hashrc:$hashir" in
+  0:*"target datalayout"*)
+    missing=""
+    for lit in '#0-zero' '#1-one' '#2-two' '#3-three'; do
+      case "$hashir" in *"c\"$lit\\00\""*) ;; *) missing="$missing $lit" ;; esac
+    done
+    if [ -z "$missing" ]; then ok "emit-ir --sanitize=address keeps \"#N\" string constants verbatim"
+    else bad "emit-ir attribute renumbering" "string constants rewritten; missing:$missing"
+    fi ;;
+  *) bad "emit-ir --sanitize=address (string constants)" "no IR (rc=$hashrc): $(printf '%s' "$hashir" | head -3)" ;;
+esac
 # ASan needs the LLVM backend — the native arm64 backend is a clear error, never a silent
 # uninstrumented binary. FAILS on the seed ('unknown flag').
 expect_out "requires the LLVM backend" "--sanitize=address --backend arm64 is rejected" \
