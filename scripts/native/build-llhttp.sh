@@ -43,10 +43,15 @@ tar -xzf "$archive" -C "$source_dir" --strip-components=1
 (cd "$source_dir" && npm ci >/dev/null && npm run build >/dev/null)
 
 cflags="-std=c99 -Os -fvisibility=hidden -ffunction-sections -fdata-sections"
+# build/c/llhttp.c is only the generated state machine; the public API
+# (llhttp_init, llhttp_execute, llhttp_finish, ...) and the protocol callbacks
+# it invokes are upstream's hand-written src/native/api.c and http.c.
 cc $cflags -I"$source_dir/build" -c "$source_dir/build/c/llhttp.c" -o "$object_dir/llhttp.o"
+cc $cflags -I"$source_dir/build" -c "$source_dir/src/native/api.c" -o "$object_dir/api.o"
+cc $cflags -I"$source_dir/build" -c "$source_dir/src/native/http.c" -o "$object_dir/http.o"
 cc $cflags -I"$source_dir/build" -c "$repo_dir/scripts/native/llhttp_shim.c" -o "$object_dir/shim.o"
 ar rcs "$output_dir/libllhttp.a" \
-  "$object_dir/llhttp.o" "$object_dir/shim.o"
+  "$object_dir/llhttp.o" "$object_dir/api.o" "$object_dir/http.o" "$object_dir/shim.o"
 
 echo "built $output_dir/libllhttp.a"
 ls -lh "$output_dir/libllhttp.a"
