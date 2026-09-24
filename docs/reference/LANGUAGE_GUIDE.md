@@ -1311,7 +1311,11 @@ Cleanup is deterministic on normal fallthrough, function exit, `break`,
 owner. Replacement covers a store through a mutable borrow, such as a
 `(mut T)` parameter, because a borrow always denotes an initialized value. A store through a raw `(ptr T)` never drops the
 old contents: the pointer may address storage the store is initializing, so
-raw stores stay unmanaged. It uses the same elaborated cleanup node in LLVM,
+raw stores stay unmanaged. A statement whose value nothing receives drops that
+value at the end of the statement when it is a fresh owner: a call or constructor
+result in a non-tail position of a body, or anywhere in a loop body. Naming an
+existing place as a statement neither moves nor drops it, and borrowed results,
+raw pointers and Copy values own nothing. It uses the same elaborated cleanup node in LLVM,
 arm64, x64, Wasm, and the interpreter. `Drop` and explicit `scope`/`defer` compose lexically: inner owning
 locals drop before an enclosing scope performs its LIFO defers.
 
