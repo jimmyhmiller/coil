@@ -289,8 +289,12 @@ class CoilEmitter {
     if (kind === 'Consume') {
       const field = this.info.properties.findIndex((p: any) => p.name === ref.field);
       assert(field >= 0);
+      /* llparse properties are unsigned, and content_length uses all 64 bits
+       * (a Content-Length or chunk size may be up to 2^64-1). Compare as u64:
+       * a signed compare takes a length >= 2^63 as negative, "consumes" it by
+       * moving `p` BACKWARDS, and hands on_body a negative length. */
       return `(let [avail (primitive/isub (primitive/cast i64 endp) (primitive/cast i64 (primitive/load p))) need (ll/field-load s ${field})] ` +
-        `(if (primitive/icmp-ge avail need) ` +
+        `(if (primitive/icmp-ge (primitive/cast u64 avail) (primitive/cast u64 need)) ` +
         `(do (primitive/store! p (primitive/index (primitive/load p) need)) (ll/field-store! s ${field} 0) ${this.transition(ref.otherwise)}) ` +
         `(do (ll/field-store! s ${field} (primitive/isub need avail)) (primitive/store! p endp) -1)))`;
     }
@@ -463,10 +467,93 @@ async function buildGraph(args: Args): Promise<any> {
   return compiler.compile(sourceRoot, (llparse as any).properties);
 }
 
+/*
+ * DELIBERATE DIVERGENCE FROM UPSTREAM C LLHTTP 9.4.3 (scripts/llhttp/README.md).
+ *
+ * With LENIENT_HEADER_VALUE_RELAXED set and LENIENT_HEADERS clear, a NUL byte in
+ * a header value makes upstream loop forever without consuming input:
+ *
+ *   header_value_relaxed      table lookup; its table leaves out 0, 10 and 13
+ *     -> header_value_otherwise   handles 10 and 13 only
+ *     -> invoke_test_lenient_flags (HEADERS clear)
+ *     -> invoke_test_lenient_flags (HEADER_VALUE_RELAXED set)
+ *     -> header_value_relaxed     ... and round again, on the same byte.
+ *
+ * The relaxed table already treats NUL as invalid; the cycle is the only reason
+ * it is not rejected. Send byte 0 from header_value_relaxed to the node the
+ * relaxed test takes when the flag is clear: the on_header_value span end
+ * followed by the ordinary "Invalid header value char" error.
+ *
+ * Every step of that shape is checked. If upstream changes it -- fixes the bug,
+ * renames a node, reroutes an edge -- generation stops, so the patch is never
+ * silently misapplied and never silently kept after it stops being needed.
+ */
+function patchRelaxedHeaderValueNul(nodes: any[], lenientFlags: Record<string, number>): void {
+  const fail = (why: string): never => {
+    throw new Error(`relaxed header value NUL patch: ${why}. The upstream llhttp ` +
+      'graph no longer has the shape this patch was written for; re-examine the ' +
+      'divergence documented in scripts/llhttp/README.md before regenerating.');
+  };
+  const nameOf = (node: any): string => unwrap(node).ref.id.name;
+  const byName = new Map<string, any>(nodes.map((node) => [nameOf(node), node]));
+  const named = (name: string, kind: string): any => {
+    const node = byName.get(`llhttp__internal__n_${name}`) ?? fail(`no node named ${name}`);
+    if (nodeKind(node) !== kind) fail(`${name} is a ${nodeKind(node)}, expected ${kind}`);
+    return node;
+  };
+  const lenientTest = (node: any, flag: number): any => {
+    if (nodeKind(node) !== 'Invoke') fail(`${nameOf(node)} is not an Invoke`);
+    const code = unwrap(unwrap(node).ref.code);
+    const ref = code.ref ?? code;
+    if (code.constructor.name !== 'Test' || ref.field !== 'lenient_flags' || ref.value !== flag) {
+      fail(`${nameOf(node)} does not test lenient_flags & ${flag}`);
+    }
+    const edges = unwrap(node).ref.edges;
+    if (edges.length !== 1 || edges[0].code !== 1) fail(`${nameOf(node)} has unexpected edges`);
+    return node;
+  };
+  const headers = lenientFlags.HEADERS ?? fail('LENIENT_FLAGS.HEADERS is gone');
+  const relaxedFlag = lenientFlags.HEADER_VALUE_RELAXED ?? fail('LENIENT_FLAGS.HEADER_VALUE_RELAXED is gone');
+
+  const relaxed = named('header_value_relaxed', 'TableLookup');
+  const relaxedRef = unwrap(relaxed).ref;
+  for (const edge of relaxedRef.edges) {
+    if (edge.node !== relaxed) fail('a header_value_relaxed edge leaves the node');
+    if (edge.keys.includes(0)) fail('header_value_relaxed now accepts byte 0');
+  }
+  const otherwise = relaxedRef.otherwise;
+  if (!otherwise.noAdvance || otherwise.node !== named('header_value_otherwise', 'Single')) {
+    fail('header_value_relaxed no longer falls through to header_value_otherwise');
+  }
+  const otherwiseRef = unwrap(otherwise.node).ref;
+  const handled = otherwiseRef.edges.map((edge: any) => edge.key).sort((a: number, b: number) => a - b);
+  if (handled.join(',') !== '10,13') fail(`header_value_otherwise handles ${handled}, not just LF and CR`);
+  const testHeaders = lenientTest(otherwiseRef.otherwise.node, headers);
+  if (unwrap(testHeaders).ref.edges[0].node !== named('header_value_lenient', 'Single')) {
+    fail('the LENIENT_HEADERS test no longer leads to header_value_lenient');
+  }
+  const testRelaxed = lenientTest(unwrap(testHeaders).ref.otherwise.node, relaxedFlag);
+  if (unwrap(testRelaxed).ref.edges[0].node !== relaxed) {
+    fail('the HEADER_VALUE_RELAXED test no longer leads back to header_value_relaxed (the cycle is gone)');
+  }
+  const reject = unwrap(testRelaxed).ref.otherwise;
+  if (!reject.noAdvance || nodeKind(reject.node) !== 'SpanEnd') fail('the strict branch is not a span end');
+  const rejectRef = unwrap(reject.node).ref;
+  const callback = unwrap(rejectRef.callback);
+  if ((callback.ref ?? callback).name !== 'llhttp__on_header_value') fail('the strict branch does not end on_header_value');
+  const error = unwrap(rejectRef.otherwise.node);
+  if (error.constructor.name !== 'ErrorNode' || error.ref.reason !== 'Invalid header value char') {
+    fail('the strict branch no longer reports "Invalid header value char"');
+  }
+  relaxedRef.edges.push({ keys: [0], node: reject.node, noAdvance: true, value: undefined });
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv);
   const info = await buildGraph(args);
   const nodes = allNodes(info.root);
+  const upstreamConstants = createRequire(resolve(args.upstream, 'package.json'))('./lib/llhttp/constants.js');
+  patchRelaxedHeaderValueNul(nodes, upstreamConstants.LENIENT_FLAGS);
   const counts = new Map<string, number>();
   const code = new Map<string, any>();
   const transforms = new Map<string, any>();
