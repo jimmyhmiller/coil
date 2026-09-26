@@ -101,6 +101,8 @@ def justification(path: str, op: str, line: str) -> str:
             return "guest syntax datum a stage entry returns, matched structurally by the next transform round rather than resolved"
         if path.endswith("lints/no_star_imports.coil") or path.endswith("lints/names.coil"):
             return "module-name datum read out of an import declaration for comparison and for the rewritten :use list; never a lexical identifier"
+        if path.endswith("jit_reload.coil") and '(primitive/code-symbol ":" binder)' in line:
+            return "keyword datum for a :params annotation, spelled from the parameter's binder; a keyword is never a lexical identifier"
     return ""
 
 
