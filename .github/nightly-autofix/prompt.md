@@ -62,5 +62,5 @@ Finish by writing `$AUTOFIX_DIR/result.json`, exactly this shape:
 - `give_up`: you could not fix it. The summary must include your diagnosis, the
   evidence (relevant log lines), what you tried, and what a human should do next.
 
-The summary is posted to a GitHub issue that the maintainer reads in the
-morning, so make it self-contained.
+The summary is written to the autofix run's job summary, which the maintainer
+reads in the morning, so make it self-contained.

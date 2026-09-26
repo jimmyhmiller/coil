@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# Privileged half of nightly-autofix. Runs with contents/actions/issues write and
-# never with the Claude credential. It executes nothing from the agent's patch:
-# it checks which paths the patch touches, applies it, pushes, reruns the nightly,
-# and reports on the tracking issue.
+# Privileged half of nightly-autofix. Runs with contents/actions write and never
+# with the Claude credential. It executes nothing from the agent's patch: it
+# checks which paths the patch touches, applies it, pushes, reruns the nightly,
+# and writes its report to the run's job summary.
 #
 # Inputs (env): RESULT_DIR (the fix job's artifact, possibly absent), ATTEMPT,
 # MAX_ATTEMPTS, FAILED_RUN_URL, TRIAGE_PROCEED, TRIAGE_REASON, FIX_RESULT,
-# AUTOFIX_RUN_URL, GH_TOKEN, GITHUB_REPOSITORY.
+# AUTOFIX_RUN_URL, GH_TOKEN, GITHUB_REPOSITORY, GITHUB_STEP_SUMMARY.
 set -euo pipefail
 
-LABEL=nightly-autofix
 report=$(mktemp)
 
 dispatch_nightly() {
@@ -19,15 +18,7 @@ dispatch_nightly() {
 
 post_report() {
   local headline=$1
-  gh label create "$LABEL" --color D93F0B \
-    --description "Reports from the nightly-autofix workflow" 2>/dev/null || true
-  local issue
-  issue=$(gh issue list --label "$LABEL" --state open --limit 1 --json number --jq '.[0].number // empty')
-  if [ -n "$issue" ]; then
-    gh issue comment "$issue" --body-file "$report"
-  else
-    gh issue create --label "$LABEL" --title "Nightly autofix: $headline" --body-file "$report"
-  fi
+  { echo "# Nightly autofix: $headline"; echo; cat "$report"; } | tee -a "$GITHUB_STEP_SUMMARY"
 }
 
 {
