@@ -5029,6 +5029,13 @@ for suite in tests/stdlib_parsers_test.coil tests/serde_test.coil tests/serde_op
   expect_rc 0 "coil test $suite passes" "$COIL" test "$suite"
 done
 
+# LLVM lowers vcompress-store / vexpand-load as a loop over the set mask bits;
+# the runtime corpus runs this file on the direct backend only.
+for opt in -O0 -O3; do
+  expect_out '^ok true$' "simd compress/expand sparse-bit loop ($opt)" \
+    "$COIL" run tests/compiler/features/simd_compress_sparse.coil "$opt"
+done
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL
