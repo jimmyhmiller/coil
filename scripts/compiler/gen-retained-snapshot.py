@@ -9,7 +9,10 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-TOKEN = re.compile(r';[^\n]*|#\\(?:[A-Za-z]+|.)|"(?:\\.|[^"\\])*"|[()\[\]]|[^\s()\[\]";]+')
+# Character literals: canonical `#\c`/`#\name`, and the legacy `\c`/`\name` the
+# reader still accepts (e.g. `\"`); without the latter a legacy quote literal
+# would open a string and unbalance the rest of the file.
+TOKEN = re.compile(r';[^\n]*|#?\\(?:[A-Za-z]+|.)|"(?:\\.|[^"\\])*"|[()\[\]]|[^\s()\[\]";]+')
 class Vector(list): pass
 
 def read(text):

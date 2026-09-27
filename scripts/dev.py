@@ -1301,27 +1301,52 @@ GENERATED_SCRIPTS = (
 )
 
 
+# These build the same -O3 coil.jit unit when run on their own; the suite builds
+# it once and hands it to them through COIL_TEST_JIT_UNIT.
+GENERATED_UNIT_SCRIPTS = {"jit-static-session", "jit-session-memory", "jit-source-graph"}
+
+
 def test_generated(compiler: str) -> None:
     override = os.environ.get("COIL_JOBS")
     workers = max(1, int(override)) if override else max(1, os.cpu_count() or 1)
     started = time.monotonic()
 
-    def run_script(name: str) -> tuple[str, int, str, float]:
+    def run_script(name: str, env: dict[str, str] | None = None) -> tuple[str, int, str, float]:
         begin = time.monotonic()
-        result = subprocess.run([sys.executable, f"scripts/tests/{name}.py", compiler], cwd=ROOT,
+        result = subprocess.run([sys.executable, f"scripts/tests/{name}.py", compiler], cwd=ROOT, env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         return name, result.returncode, result.stdout, time.monotonic() - begin
 
     failed = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(GENERATED_SCRIPTS))) as pool:
-        futures = [pool.submit(run_script, name) for name in GENERATED_SCRIPTS]
-        for future in concurrent.futures.as_completed(futures):
-            name, code, output, elapsed = future.result()
-            print(f"== {name} ({elapsed:.1f}s): {'ok' if code == 0 else f'FAIL exit {code}'}", flush=True)
-            if code != 0 or os.environ.get("COIL_VERBOSE") == "1":
-                print(output, end="" if output.endswith("\n") else "\n", flush=True)
-            if code != 0:
-                failed.append(name)
+    with tempfile.TemporaryDirectory(prefix=".coil-generated-unit-", dir=ROOT) as scratch, \
+            concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(GENERATED_SCRIPTS))) as pool:
+        unit = Path(scratch) / "jit_api"
+
+        def build_unit() -> tuple[str, int, str, float]:
+            begin = time.monotonic()
+            result = subprocess.run([compiler, "build-unit", str(ROOT / "src/compiler/jit_api.coil"), "-o", str(unit),
+                                     "--backend", "llvm", "-O3", "--quiet"], cwd=ROOT,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            return "coil.jit unit", result.returncode, result.stdout, time.monotonic() - begin
+
+        # The unit build is the longest single step, so it starts first and the
+        # scripts that do not need it run beside it.
+        futures = [pool.submit(build_unit)]
+        futures += [pool.submit(run_script, name) for name in GENERATED_SCRIPTS if name not in GENERATED_UNIT_SCRIPTS]
+        waiting = [name for name in GENERATED_SCRIPTS if name in GENERATED_UNIT_SCRIPTS]
+        while futures:
+            done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                futures.remove(future)
+                name, code, output, elapsed = future.result()
+                print(f"== {name} ({elapsed:.1f}s): {'ok' if code == 0 else f'FAIL exit {code}'}", flush=True)
+                if code != 0 or os.environ.get("COIL_VERBOSE") == "1":
+                    print(output, end="" if output.endswith("\n") else "\n", flush=True)
+                if code != 0:
+                    failed.append(name)
+                if name == "coil.jit unit":
+                    env = dict(os.environ, COIL_TEST_JIT_UNIT=str(unit)) if code == 0 else None
+                    futures += [pool.submit(run_script, waiter, env) for waiter in waiting]
     elapsed = time.monotonic() - started
     if failed:
         raise SystemExit(f"generated suite: {len(failed)} failed ({', '.join(sorted(failed))}) in {elapsed:.1f}s")
