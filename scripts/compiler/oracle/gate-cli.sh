@@ -4428,6 +4428,21 @@ EOF
     *'coil> 7'*'coil> 7'*'coil> 13'*"has no parameter :c"*"expects 2 argument(s), got 3"*"different parameter names"*'coil> 13'*) ok "repl named calls reach Var-published functions" ;;
     *) bad "repl named calls reach Var-published functions" "$repl_named_out" ;;
   esac
+  # A function pointer to a REPL function goes through its Var, so one taken
+  # before a redefinition reaches the new body; an anonymous `fn` in a REPL
+  # expression works like anywhere else.
+  repl_fnptr_out=$(printf '%s\n' \
+    '(defn double [(x i64)] (-> i64) (* x 2))' \
+    '(defn app [(f (fnptr c [i64] i64)) (x i64)] (-> i64) (f x))' \
+    '(app (fnptr-of double) 21)' \
+    '(defn double [(x i64)] (-> i64) (* x 3))' \
+    '(app (primitive/fnptr-of double) 21)' \
+    '(fold (fn [a b] (+ a b)) 0 (range 0 4))' \
+    ':q' | "$REPL_COIL" repl 2>&1)
+  case "$repl_fnptr_out" in
+    *'coil> 42'*'coil> 63'*'coil> 6'*) ok "repl fnptr-of reaches the current definition; anonymous fn works in an expression" ;;
+    *) bad "repl fnptr-of reaches the current definition; anonymous fn works in an expression" "$repl_fnptr_out" ;;
+  esac
 
   repl_bound_out=$(printf '%s\n' \
     '(deftrait Total [Self] (total [(value Self)] (-> i64)))' \
