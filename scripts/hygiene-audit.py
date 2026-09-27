@@ -82,6 +82,11 @@ def justification(path: str, op: str, line: str) -> str:
             and path.startswith("tests/metaprogramming/compile-and-run/staged_")
             and "[marker (primitive/gensym)" in line):
         return "staged metacompilation marker: an opaque token keying a (stage MARKER ...) declaration and its request sites; never bound, never resolved"
+    # A gensym spelled straight into a keyword, `(primitive/code-symbol ":"
+    # (primitive/gensym))`, is a unique block label or other keyword datum. A
+    # keyword is never a lexical identifier, so it carries no binding context.
+    if op == "gensym" and '(primitive/code-symbol ":" (primitive/gensym))' in line:
+        return "fresh keyword datum (a unique block label); a keyword is never a lexical identifier"
     if op == "code-symbol":
         if "fresh-identifier" in line:
             return "display spelling input to fresh-identifier; not itself used lexically"
