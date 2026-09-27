@@ -147,6 +147,26 @@ if grep -qF 'COIL_POLL_OUT' "$tmp/enums.full"; then
   exit 1
 fi
 
+# A clang step that fails is an error, not a quietly smaller binding: with a
+# clang whose macro dump fails, cimport used to exit 0 with no #defines.
+mkdir -p "$tmp/failing-clang"
+real_clang=$(command -v clang)
+cat >"$tmp/failing-clang/clang" <<EOF
+#!/bin/sh
+case "\$*" in *-dM*) echo "simulated macro-dump failure" >&2; exit 1;; esac
+exec "$real_clang" "\$@"
+EOF
+chmod +x "$tmp/failing-clang/clang"
+set +e
+fail_out=$(PATH="$tmp/failing-clang:$PATH" "$compiler" cimport "$tmp/enums.h" -o "$tmp/failed.coil" 2>&1)
+fail_rc=$?
+set -e
+[ "$fail_rc" != 0 ] || { echo 'cimport succeeded although clang failed' >&2; exit 1; }
+case "$fail_out" in
+  *"simulated macro-dump failure"*) ;;
+  *) echo "cimport did not report clang's failure: $fail_out" >&2; exit 1 ;;
+esac
+
 if [[ $(uname -s) == Darwin ]]; then
   cat >"$tmp/ioctl-lint.coil" <<'EOF'
 (module ioctl_lint)
