@@ -3415,6 +3415,25 @@ expect_out "export-c defines C symbol 'callback_c'.*extern.*imports it.*remove t
   "a same-unit extern/export collision explains the supported callback path" \
   "$COIL" check "$T/export-extern-collision.coil"
 
+echo "== JIT symbol map (COIL_PERF_MAP) =="
+# macOS arm64 runs metaprograms as in-memory JIT code by default; that is the
+# path the map describes. (The Linux ELF loader writes the same map.)
+if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
+printf '(module pm)\n(defn twice [(x Code)] (-> Code) `(+ ~x ~x))\n(defn main [] (-> i64) (twice 21))\n' > "$T/perfmap.coil"
+perf_pid_out=$(COIL_PERF_MAP=1 sh -c 'echo $$; exec "$0" build "$1" -o "$2" >/dev/null 2>&1' "$COIL" "$T/perfmap.coil" "$T/perfmap")
+perf_pid=$(head -1 <<<"$perf_pid_out")
+perf_map="/tmp/perf-$perf_pid.map"
+if [ -f "$perf_map" ]; then
+  perf_lines=$(cat "$perf_map")
+  rm -f "$perf_map"
+  grep -qE '^[0-9a-f]+ [0-9a-f]+ coil\.' <<<"$perf_lines" \
+    && ok "COIL_PERF_MAP writes START SIZE NAME for JIT-compiled metaprogram functions" \
+    || bad "COIL_PERF_MAP writes START SIZE NAME for JIT-compiled metaprogram functions" "$(head -3 <<<"$perf_lines")"
+else
+  bad "COIL_PERF_MAP writes START SIZE NAME for JIT-compiled metaprogram functions" "no $perf_map"
+fi
+fi
+
 echo "== focused guide lookup =="
 expect_out '^  tests[[:space:]]+deftest' "guide: no argument prints the compact topic index" "$COIL" guide
 expect_out '^## Tests$' "guide: canonical topic prints only its section" "$COIL" guide tests
