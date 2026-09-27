@@ -3528,6 +3528,24 @@ case "$nomain_out" in
   *) bad "a program with no main says so at the link" "$nomain_out" ;;
 esac
 
+echo "== a macro calls coil.fs/write-file =="
+# write-file reads O_CREAT, which coil.fs generates with (meta …); a macro and a
+# before-expand checker can call it (coil-bugs c81fo99shw8).
+cat > "$T/macro_write.coil" <<EOF
+(module macro-write)
+(import "coil.alloc" :as alloc)
+(import "coil.fs" :use [write-file])
+(defn stamp [(x Code)] (-> Code)
+  (let [a (alloc/malloc-allocator)]
+    (write-file a "$T/macro_write.out" "written")
+    \`7))
+(defn main [] (-> i64) (stamp y))
+EOF
+"$COIL" run "$T/macro_write.coil" >/dev/null 2>&1; rc=$?
+[ "$rc" = 7 ] && [ "$(cat "$T/macro_write.out" 2>/dev/null)" = "written" ] \
+  && ok "a macro calls coil.fs/write-file at expansion" \
+  || bad "a macro calls coil.fs/write-file" "$("$COIL" run "$T/macro_write.coil" 2>&1 | head -3)"
+
 echo "== focused guide lookup =="
 expect_out '^  tests[[:space:]]+deftest' "guide: no argument prints the compact topic index" "$COIL" guide
 expect_out '^## Tests$' "guide: canonical topic prints only its section" "$COIL" guide tests
