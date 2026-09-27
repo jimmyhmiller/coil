@@ -20,6 +20,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts" / "compiler"))
 import toolchain_stamp  # noqa: E402
+sys.path.insert(0, str(ROOT / "scripts" / "tests"))
+import cleanup_on_signal  # noqa: E402
 
 
 def execute(*command: str, env: dict[str, str] | None = None, cwd: Path = ROOT) -> None:
@@ -1546,6 +1548,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    cleanup_on_signal.install()
     os.chdir(ROOT)
     args = parser().parse_args()
     args.func(args)
