@@ -44,16 +44,18 @@ export COIL_STRICT_BUNDLE="${COIL_STRICT_BUNDLE:-1}"
 . scripts/compiler/select-stage0.sh
 # CI must never paper over a stale committed seed; see select_stage0.
 [ "${CI:-}" = true ] && export COIL_REQUIRE_FRESH_SEED="${COIL_REQUIRE_FRESH_SEED:-1}"
-select_stage0 "$SEED" "$SRC" arm64 || exit 1
-echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
-
-# Probe before building: a stage0 too old for this tree otherwise fails deep in
-# stage1 with an error that reads like a compiler bug. See stage0-check.sh.
-. "$(dirname "$0")/stage0-check.sh"
-stage0_check "$STAGE0" "$SEED" "$SRC" || exit 1
-
 echo "=== stage1: stage0 builds the LLVM-free compiler ==="
-stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$S1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} || { echo "stage1 FAILED"; exit 1; }
+if stage1_from_seed "$SEED" "$PWD/$SRC" "$S1"; then
+  echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
+else
+  select_stage0 "$SEED" "$SRC" arm64 || exit 1
+  echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
+  # Probe before building: a stage0 too old for this tree otherwise fails deep in
+  # stage1 with an error that reads like a compiler bug. See stage0-check.sh.
+  . "$(dirname "$0")/stage0-check.sh"
+  stage0_check "$STAGE0" "$SEED" "$SRC" || exit 1
+  stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$S1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} || { echo "stage1 FAILED"; exit 1; }
+fi
 echo "=== stage2: stage1 rebuilds it with --backend arm64 ==="
 "$S1" build "$SRC" -o "$S2" --backend arm64 || { echo "stage2 FAILED"; exit 1; }
 echo "=== NO-LLVM: stage2 must link no libLLVM ==="

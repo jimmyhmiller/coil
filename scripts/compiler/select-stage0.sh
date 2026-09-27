@@ -81,3 +81,28 @@ select_stage0() {
     || { echo "WASM stage0 cannot compile the current source tree" >&2; return 1; }
   STAGE0_VERIFIED="$STAGE0"
 }
+
+# stage1_from_seed <native-seed> <compiler-source> <stage1-out> [build flags...]
+#
+# Build stage1 straight from the committed native seed. A seed that builds the
+# tree can certainly check it, so when this succeeds the separate whole-tree
+# check in select_stage0 (which on CI costs as long as the build itself) is
+# skipped: STAGE0 is the seed and STAGE0_VERIFIED marks it. When it fails, the
+# caller falls back to select_stage0, which diagnoses a stale seed, or picks
+# another stage0 locally, and builds stage1 with that.
+stage1_from_seed() {
+  local native_seed="$1" src="$2" out="$3"; shift 3
+  [ -z "${STAGE0:-}" ] && [ "${COIL_FORCE_WASM_STAGE0:-0}" != 1 ] && [ -x "$native_seed" ] || return 1
+  local log
+  log=$(mktemp "${TMPDIR:-/tmp}/coil-seed-stage1.XXXXXX") || return 1
+  if stage0_compat_run "$native_seed" build "$src" -o "$out" "$@" >"$log" 2>&1; then
+    rm -f "$log"
+    STAGE0="$native_seed"
+    STAGE0_SOURCE=native
+    STAGE0_VERIFIED="$STAGE0"
+    STAGE0_BUILD_FLAGS=()
+    return 0
+  fi
+  rm -f "$log"
+  return 1
+}
