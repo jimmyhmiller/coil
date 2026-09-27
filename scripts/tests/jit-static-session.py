@@ -178,6 +178,33 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
     reuses = traced.stderr.count("coil-trace count reader.engine-reuses ")
     assert builds == 1 and reuses == 3, ("source provider engine builds/reuses", builds, reuses)
     print("PASS: a session's source provider engine is built once and reused", flush=True)
+    (work / "entry_provider2.coil").write_text('''(module entry.provider2)
+(import "coil.primitive" :as p)
+(import "coil.slice" :use [subslice])
+
+;; Each submission is one `(defn NAME …)`. It gets a fresh identity that is not
+;; retained after publication, NAME is bound to it, and the submission supplies
+;; its own entry.
+(defn read-source [(context Code)] (-> Code)
+  (let [path (p/code-str (p/code-nth context 1))
+        digits (subslice path 5 (- (len path) 1))
+        entry (p/syntax->datum (p/code-symbol `__coil_session_entry_s digits))
+        read (p/code-read (p/code-str (p/code-nth context 2)) context)
+        f (if (and (p/code-list? read) (= (get read 0) `do)) (get read 1) read)
+        name (get f 1)
+        version (p/syntax->datum (p/code-symbol name (p/code-str (p/code-symbol `_v digits))))
+        (mut rest) (p/code-list-new)]
+    (for i (range 2 (len f)) (push! (mut rest) (get f i)))
+    `(do (import "coil.jit.lifetime")
+         (defn ~version :jit/retain false ~@(p/code-list-done (load rest)))
+         (defalias ~name ~version)
+         (defn ~entry [] (-> i64) 0))))
+''')
+    binary = work / "designated-entry"
+    run(COMPILER, "build", ROOT / "tests/compiler/features/jit_designated_entry_revisions.coil",
+        "-o", binary, *flags)
+    run(binary, env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(work)))
+    print("PASS: a provider's designated entries across many replacing revisions", flush=True)
     # This test reaches private unit lifetime APIs and deliberately source-links
     # the implementation, rather than crossing the public opaque unit interface.
     for name in ("retained_compiler_context", "hygienic_inherent_calls"):
