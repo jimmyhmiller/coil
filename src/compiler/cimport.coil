@@ -84,37 +84,24 @@
     buf))
 
 ; Read a whole file into a (slice u8) (empty slice if it won't open).
-(defn slurp [(a (dyn Allocator)) (path (ptr i8))] (-> (slice u8))
+(defn slurp [(a (dyn Allocator)) (path (ptr i8))] (-> (Result (slice u8) (slice u8)))
   (let [fd (open path 0)]
     (if (< fd (primitive/cast i32 0))
-        (al-slice [u8] (al-new [u8] a))
-        (let [buf
-                (primitive/cast (ptr i8)
-                                (slice-data (match (alloc-bytes a 65536 1)
-                                              (Some [s] s)
-                                              (None []
-                                                    (do
-                                                      (oom-at c"compiler allocation"
-                                                              65536)
-                                                      (alloc/alloc-slice-new (primitive/cast (ptr u8)
-                                                                                             0)
-                                                                             0))))))
-              (mut bytes) (al-new [u8] a)]
-          (loop (let [n (read (primitive/cast i32 fd) buf 65536)]
-                  (if (<= n 0)
-                      (break)
-                      (let [(mut i) 0]
-                        (loop (if (>= (load i) (primitive/cast i64 n))
-                                  (break)
-                                  (do
-                                    (push! [u8]
-                                           (mut bytes)
-                                           (primitive/cast u8
-                                                           (load (primitive/index buf
-                                                                                  (load i)))))
-                                    (set! i (primitive/iadd (load i) 1)))))))))
-          (close fd)
-          (al-slice [u8] (load bytes))))))
+        (Err (cat a "cimport: cannot read " (cstr->slice path)))
+        (match (alloc-bytes a 65536 1)
+          (None [] (do (close fd) (Err "cimport: out of memory reading a clang result")))
+          (Some [chunk]
+                (let [buf (primitive/cast (ptr i8) (slice-data chunk))
+                      (mut bytes) (al-new [u8] a)
+                      (mut failed) false]
+                  (loop (let [n (read (primitive/cast i32 fd) buf 65536)]
+                          (cond (< n 0) (do (set! failed true) (break))
+                                (= n 0) (break)
+                                :else (al-extend! (mut bytes) (primitive/cast (ptr u8) buf) (cast i64 n)))))
+                  (close fd)
+                  (if failed
+                      (Err (cat a "cimport: read failed on " (cstr->slice path)))
+                      (Ok (al-slice [u8] (load bytes))))))))))
 
 ; Write a slice to stdout.
 (defn emit [(s (slice u8))] (-> i64)
@@ -130,17 +117,17 @@
   0)
 
 ; Write a slice to a file (truncating). Returns 0 on success, -1 on open failure.
-(defn write-file [(a (dyn Allocator)) (path (slice u8)) (content (slice u8))] (-> i64)
+(defn write-file [(a (dyn Allocator)) (path (slice u8)) (content (slice u8))] (-> (Result i64 (slice u8)))
   (let [f (fopen (s->cstr a path) (s->cstr a "w"))]
     (if (= (primitive/cast i64 f) (primitive/cast i64 0))
-        -1
-        (do
-          (fwrite (primitive/cast (ptr i8) (slice-data [u8] content))
-                  1
-                  (len content)
-                  f)
-          (fclose f)
-          0))))
+        (Err (cat a "cimport: cannot create " path))
+        (let [wrote (fwrite (primitive/cast (ptr i8) (slice-data [u8] content)) 1 (len content) f)
+              closed (fclose f)]
+          ; a short write or a failed close (ENOSPC shows up at either) leaves a
+          ; truncated file that clang would read as a different program
+          (if (or (!= (cast i64 wrote) (len content)) (!= (cast i64 closed) 0))
+              (Err (cat a "cimport: could not write " path))
+              (Ok 0))))))
 
 ; str-concat is fallible only on OOM; unwrap to the left operand as a fallback.
 (defn cat [(a (dyn Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
@@ -1344,10 +1331,28 @@
 (defn szal-align [(sa SzAl)] (-> i64)
   (let [p (primitive/alloc-stack SzAl)] (set! p sa) (.align p)))
 
+;;; Does any enumerator of enum declaration `d` appear in `names`?
+(defn enum-selects? [(d Json) (names (ptr (ArrayList (slice u8))))] (-> bool)
+  (match (jinner d)
+    (None [] false)
+    (Some [inner]
+          (let [(mut found) false]
+            (for c (load inner)
+              (when (= (jkind c) "EnumConstantDecl")
+                (match (jgets c "name")
+                  (Some [cname] (when (selected-name? names true cname) (set! found true)))
+                  (None [] 0))))
+            found))))
+
+;;; The enum's constants as `(const …)` lines. With `only` set, just the
+;;; enumerators `names` selects (`:use [ARD_POLLIN]` from an anonymous enum);
+;;; values still count through every enumerator.
 (defn enum-consts [(a (dyn Allocator))
                    (d Json)
-                   (seen (ptr (HashMap (slice u8) i64)))] (-> (Result (slice u8)
-                                                                      (slice u8)))
+                   (seen (ptr (HashMap (slice u8) i64)))
+                   (names (ptr (ArrayList (slice u8))))
+                   (only bool)] (-> (Result (slice u8)
+                                            (slice u8)))
   (let [(mut out) (sb-new a)
         (mut next) 0
         (mut err) (None [(slice u8)])]
@@ -1392,7 +1397,9 @@
                                             (do
                                               (store! next
                                                       (primitive/iadd value 1))
-                                              (match (get (load seen) skey)
+                                              (match (if (and only (not (selected-name? names true cname)))
+                                                         (Some 1)
+                                                         (get (load seen) skey))
                                                 (Some [_] 0)
                                                 (None []
                                                       (do
@@ -1782,29 +1789,33 @@
 ; clang normally discovers this through its driver installation, but headers from
 ; the Xcode/CLT SDK are not in /usr/include. xcrun is absent on non-Darwin hosts,
 ; so a failed lookup deliberately leaves the flags unchanged.
-(defn clang-flags [(a (dyn Allocator)) (flags (slice u8))] (-> (slice u8))
+(defn clang-flags [(a (dyn Allocator)) (flags (slice u8))] (-> (Result (slice u8) (slice u8)))
   (if (or (contains-str? flags "-isysroot") (contains-str? flags "--sysroot"))
-      flags
+      (Ok flags)
       (let [out (tmp-path a "sdk")
             cmd
               (cat a
                    "xcrun --sdk macosx --show-sdk-path > '"
                    (cat a out "' 2>/dev/null"))]
         (if (!= (run-cmd a cmd) (primitive/cast i32 0))
-            flags
-            (let [sdk (trim (slurp a (s->cstr a out)))]
-              (if (= (len sdk) (primitive/cast i64 0))
-                  flags
-                  (cat3 a flags " -isysroot '" (cat a sdk "'"))))))))
+            (Ok flags)
+            (match (slurp a (s->cstr a out))
+              (Err [e] (Err e))
+              (Ok [text]
+                  (let [sdk (trim text)]
+                    (Ok (if (= (len sdk) (primitive/cast i64 0))
+                            flags
+                            (cat3 a flags " -isysroot '" (cat a sdk "'")))))))))))
 
 ; A header name is not itself a clang translation unit: `clang pthread.h`
 ; addresses a file in the current directory and never performs include search.
 ; Compile a tiny wrapper so both SDK headers and caller-provided -I headers use
 ; clang's normal lookup rules.
-(defn include-source [(a (dyn Allocator)) (header (slice u8)) (tag (slice u8))] (-> (slice u8))
+(defn include-source [(a (dyn Allocator)) (header (slice u8)) (tag (slice u8))] (-> (Result (slice u8) (slice u8)))
   (let [src (tmp-path a tag)]
-    (write-file a src (cat3 a "#include \"" header "\"\n"))
-    src))
+    (match (write-file a src (cat3 a "#include \"" header "\"\n"))
+      (Err [e] (Err e))
+      (Ok [_] (Ok src)))))
 
 ; clang JSON AST of `header` → parsed Json (top-level TranslationUnitDecl).
 (defn run-clang-ast [(a (dyn Allocator)) (header (slice u8)) (flags (slice u8))] (-> (Result Json
@@ -1821,44 +1832,42 @@
                 (cat3 a "' 2> '" err "'"))
         rc (run-cmd a cmd)]
     (if (!= rc (primitive/cast i32 0))
-        (let [detail (trim (slurp a (s->cstr a err)))]
-          (if (= (len detail) (primitive/cast i64 0))
-              (Err "clang failed to parse the header")
-              (Err (cat a "clang failed to parse the header:\n" detail))))
-        (let [txt (slurp a (s->cstr a out))]
-          (if (= (len txt) (primitive/cast i64 0))
-              (Err "clang produced no AST")
-              (Ok (json-parse a txt)))))))
+        (match (slurp a (s->cstr a err))
+          (Err [e] (Err e))
+          (Ok [text]
+              (let [detail (trim text)]
+                (if (= (len detail) (primitive/cast i64 0))
+                    (Err "clang failed to parse the header")
+                    (Err (cat a "clang failed to parse the header:\n" detail))))))
+        (match (slurp a (s->cstr a out))
+          (Err [e] (Err e))
+          (Ok [txt]
+              (if (= (len txt) (primitive/cast i64 0))
+                  (Err "clang produced no AST")
+                  (Ok (json-parse a txt))))))))
 
 ; clang -dM macro dump for `header` (empty header path = the empty-TU baseline).
 (defn dump-macros [(a (dyn Allocator))
                    (header (slice u8))
                    (tag (slice u8))
-                   (flags (slice u8))] (-> (slice u8))
+                   (flags (slice u8))] (-> (Result (slice u8) (slice u8)))
   (let [out (tmp-path a tag)
-        resolved
-          (if (= (len header) (primitive/cast i64 0)) header (abspath a header))
-        input
-          (if (= (len header) (primitive/cast i64 0))
-              header
-              (include-source a resolved "macro-input"))
-        src
-          (if (= (len header) (primitive/cast i64 0))
-              "-"
-              (cat3 a "'" input "'"))
-        cmd
-          (cat3 a
-                (cat3 a "clang -dM -E -x c" flags " ")
-                (cat3 a src " > '" out)
-                "' 2>/dev/null")]
-    (if (= (len header) (primitive/cast i64 0))
-        (run-cmd a
-                 (cat3 a
-                       (cat3 a "printf '' | clang -dM -E -x c" flags " - > '")
-                       out
-                       "' 2>/dev/null"))
-        (run-cmd a cmd))
-    (slurp a (s->cstr a out))))
+        err (tmp-path a (cat a tag "-err"))]
+    (match (if (= (len header) (primitive/cast i64 0))
+               (Ok [(slice u8) (slice u8)] "/dev/null")
+               (include-source a (abspath a header) "macro-input"))
+      (Err [e] (Err e))
+      (Ok [input]
+          (let [cmd (cat3 a
+                          (cat3 a "clang -dM -E -x c" flags " '")
+                          (cat3 a input "' > '" out)
+                          (cat3 a "' 2> '" err "'"))]
+            (if (!= (run-cmd a cmd) (primitive/cast i32 0))
+                (match (slurp a (s->cstr a err))
+                  (Err [e] (Err e))
+                  (Ok [detail]
+                      (Err (cat a "clang could not list the header's macros:\n" (trim detail)))))
+                (slurp a (s->cstr a out))))))))
 
 ; ============================ line iteration ===============================
 (defn each-line [(a (dyn Allocator)) (text (slice u8))] (-> (ptr (ArrayList (slice u8))))
@@ -2070,8 +2079,11 @@
                           (flags (slice u8))
                           (names (ptr (ArrayList (slice u8))))
                           (selecting bool)] (-> (Result (slice u8) (slice u8)))
-  (let [flags (clang-flags a flags)
-        input (include-source a (abspath a header) "input")]
+  (try
+   (let [flags (try! (clang-flags a flags))
+        input (try! (include-source a (abspath a header) "input"))
+        base-macros (try! (dump-macros a "" "base" flags))
+        header-macros (try! (dump-macros a header "hdr" flags))]
     (match (run-clang-ast a input flags)
       (Err [e] (Err e))
       (Ok [ast]
@@ -2095,7 +2107,7 @@
             (set! (.typedefs ctx) tdefs)
             (set! (.enums ctx) enms)
             (collect-types a (load top) ctx)
-            (seed-predefined-typedefs a (dump-macros a "" "base" flags) ctx)
+            (seed-predefined-typedefs a base-macros ctx)
             (let [(mut structs) (sb-new a)
                   (mut externs) (sb-new a)
                   (mut consts) (sb-new a)
@@ -2138,11 +2150,15 @@
                                                        (selected-name? names
                                                                        selecting
                                                                        (jname d)))))
-                                        (and (or (= k "FunctionDecl")
-                                                 (= k "EnumDecl"))
+                                        (and (= k "FunctionDecl")
                                              (not (selected-name? names
                                                                   selecting
-                                                                  (jname d)))))
+                                                                  (jname d))))
+                                        ; an enum is wanted for its own name or for
+                                        ; any enumerator the caller selected
+                                        (and (= k "EnumDecl")
+                                             (not (selected-name? names selecting (jname d)))
+                                             (not (enum-selects? d names))))
                               (cond (= k "FunctionDecl")
                                       (let [key (cat a "fn:" (jname d))]
                                         (match (get (load seen) key)
@@ -2215,10 +2231,10 @@
                                                        (do
                                                          (set! seen key 1)
                                                          (let [opaque
-                                                                 (opaque-record-defstruct a
-                                                                                          header
-                                                                                          flags
-                                                                                          d)]
+                                                                 (try! (opaque-record-defstruct a
+                                                                                                header
+                                                                                                flags
+                                                                                                d))]
                                                            (if (> (len opaque)
                                                                   (primitive/cast i64
                                                                                   0))
@@ -2237,7 +2253,12 @@
                                                                                  " — "
                                                                                  why))))))))))))
                                     (= k "EnumDecl")
-                                      (match (enum-consts a d seen)
+                                      (match (enum-consts a
+                                                          d
+                                                          seen
+                                                          names
+                                                          (and selecting
+                                                               (not (selected-name? names selecting (jname d)))))
                                         (Ok [s] (sb-push-str! (mut consts) s))
                                         (Err [why]
                                              (push! [(slice u8)]
@@ -2250,7 +2271,7 @@
                           (set! i (primitive/iadd (load i) 1)))))
               (emit-needed-records! a (mut structs) deferred (sb-str (load externs)))
               ; #define pass
-              (let [baseline (each-line a (dump-macros a "" "base" flags))
+              (let [baseline (each-line a base-macros)
                     bset
                       (box! a
                             (HashMap (slice u8) i64)
@@ -2265,9 +2286,10 @@
                                 (Some [d] (do (set! bset (def-name d) 1) 0))
                                 (None [] 0))
                               (set! bi (primitive/iadd (load bi) 1))))))
-                (let [hlines (each-line a (dump-macros a header "hdr" flags))
+                (let [hlines (each-line a header-macros)
                       (mut defs) (al-new [Define] a)]
-                  (let [(mut hi) 0
+                  (let [(mut unfolded) (al-new [(slice u8)] a)
+                        (mut hi) 0
                         hn (len (load hlines))]
                     (loop (if (>= (load hi) hn)
                               (break)
@@ -2291,22 +2313,15 @@
                                                     (None []
                                                           ; Clang, not a handwritten C evaluator, resolves aliases,
                                                           ; casts and integer expressions from real system headers.
-                                                          (let [v
-                                                                  (probe-fold-one a
-                                                                                  (abspath a
-                                                                                           header)
-                                                                                  flags
-                                                                                  (def-name d))]
-                                                            (when (!= v
-                                                                      (primitive/cast i64
-                                                                                      -9999999999))
-                                                              (push! [Define]
-                                                                     (mut defs)
-                                                                     (mk-define (def-name d)
-                                                                                (i64->dec a
-                                                                                          v)))))))))))
+                                                          ; Folded together below.
+                                                          (push! (mut unfolded) (def-name d))))))))
                                   (None [] 0))
-                                (set! hi (primitive/iadd (load hi) 1))))))
+                                (set! hi (primitive/iadd (load hi) 1)))))
+                    (let [values (try! (fold-batch a (abspath a header) flags (mut unfolded)))]
+                      (for k (range 0 (len unfolded))
+                        (match (get (load values) k)
+                          (Some [v] (push! [Define] (mut defs) (mk-define (get unfolded k) (i64->dec a v))))
+                          (None [] 0)))))
                   (sort-defines (mut defs))
                   (let [(mut di) 0
                         dn (len (load defs))]
@@ -2376,7 +2391,7 @@
                                               (get (load skipped) (load si))
                                               "\n"))
                                 (set! si (primitive/iadd (load si) 1))))))
-                  (Ok (sb-str (load body)))))))))))
+                  (Ok (sb-str (load body))))))))))))
 
 (defn cimport-header [(a (dyn Allocator))
                       (header (slice u8))
@@ -2536,74 +2551,89 @@
                 (set! i (primitive/iadd (load i) 1)))))
     0))
 
+;;; The clang source lines an error diagnostic in `stderr` names in file `cf`.
+(defn fold-error-lines [(a (dyn Allocator)) (cf (slice u8)) (stderr (slice u8))] (-> (ptr (HashMap i64 bool)))
+  (let [lines (box! a (HashMap i64 bool) (hm-new-scalar [i64 bool] a))
+        prefix (cat a cf ":")]
+    (for line (load (each-line a stderr))
+      (when (and (starts-with line prefix) (contains-str? line ": error:"))
+        (let [rest (subslice line (len prefix) (len line))
+              (mut n) 0
+              (mut i) 0]
+          (while (and (< i (len rest))
+                      (>= (cast i64 (get rest i)) 48)
+                      (<= (cast i64 (get rest i)) 57))
+            (set! n (+ (* n 10) (- (cast i64 (get rest i)) 48)))
+            (set! i (+ i 1)))
+          (when (> i 0) (set! lines n true)))))
+    lines))
+
+;;; Fold every expression in `exprs` to an integer with one clang run: each is
+;;; one enumerator on its own line. An expression that is not an integer
+;;; constant (a string, a type, an unknown name) fails only its own line; those
+;;; lines are dropped and the rest retried, so the pass takes a clang run or two
+;;; however many expressions there are. It used to be one clang run per macro --
+;;; 655 of them for <unistd.h>. The result maps an expression's index to its
+;;; value; an index that did not fold is absent.
+(defn fold-batch [(a (dyn Allocator))
+                  (abs (slice u8))
+                  (flags (slice u8))
+                  (exprs (ptr (ArrayList (slice u8))))] (-> (Result (ptr (HashMap i64 i64)) (slice u8)))
+  (try
+   (let [out (box! a (HashMap i64 i64) (hm-new-scalar [i64 i64] a))
+        (mut live) (al-new [i64] a)
+        (mut done) false]
+    (for i (range 0 (len (load exprs))) (push! (mut live) i))
+    (while (and (not done) (> (len live) 0))
+      (let [(mut sb) (sb-new a)]
+        ; line 1: the include; line 2: the enum head; enumerator k on line 3 + k
+        (sb-push-str! (mut sb) "#include \"")
+        (sb-push-str! (mut sb) abs)
+        (sb-push-str! (mut sb) "\"\nenum __coilprobes : long long {\n")
+        (for k (range 0 (len live))
+          (let [i (get live k)]
+            (sb-push-str! (mut sb) "__v")
+            (sb-push-str! (mut sb) (i64->dec a i))
+            (sb-push-str! (mut sb) "=(long long)(")
+            (sb-push-str! (mut sb) (get (load exprs) i))
+            (sb-push-str! (mut sb) "),\n")))
+        (sb-push-str! (mut sb) "};\n")
+        (let [cf (tmp-path a "foldbatch")]
+          (try! (write-file a cf (sb-str (load sb))))
+          (match (run-clang-ast a cf (cat a flags " -ferror-limit=0"))
+            (Ok [ast]
+                (let [m (box! a (HashMap (slice u8) i64) (hm-new [(slice u8) i64] a (str-keyops)))]
+                  (extract-enum-values a ast m)
+                  (for i live
+                    (match (get (load m) (cat a "__v" (i64->dec a i)))
+                      (Some [v] (set! out i v))
+                      (None [] 0)))
+                  (set! done true)))
+            (Err [detail]
+                 (let [bad (fold-error-lines a cf detail)
+                       (mut kept) (al-new [i64] a)]
+                   (for k (range 0 (len live))
+                     (match (get (load bad) (+ k 3))
+                       (Some [_] 0)
+                       (None [] (push! (mut kept) (get live k)))))
+                   ; No error named one of our lines (the header itself does not
+                   ; parse with these flags): nothing here can fold.
+                   (if (= (len kept) (len live))
+                       (set! done true)
+                       (set! live kept))))))))
+    (Ok out))))
+
 ; tier 0a: fold ONE expression via a single-member long-long enum; sentinel if it
 ; isn't a constant expression (clang errors) → caller falls to tier 0b.
 (defn probe-fold-one [(a (dyn Allocator))
                       (abs (slice u8))
                       (flags (slice u8))
-                      (expr (slice u8))] (-> i64)
-  (let [(mut sb) (sb-new a)]
-    (sb-push-str! (mut sb) "#include \"")
-    (sb-push-str! (mut sb) abs)
-    (sb-push-str! (mut sb) "\"\n")
-    (sb-push-str! (mut sb) "enum __coilprobe : long long { __v = (long long)(")
-    (sb-push-str! (mut sb) expr)
-    (sb-push-str! (mut sb) ") };\n")
-    (let [cf (tmp-path a "foldone")]
-      (write-file a cf (sb-str (load sb)))
-      (try (let [ast (try-or! (run-clang-ast a cf flags) -9999999999)]
-             (let [m
-                     (box! a
-                           (HashMap (slice u8) i64)
-                           (hm-new [(slice u8) i64] a (str-keyops)))]
-               (extract-enum-values a ast m)
-               (match (get (load m) "__v") (Some [x] x) (None [] -9999999999))))))))
-
-; Fold every ordinary constant probe from one header in one clang AST. The old
-; path launched clang once per expression, so importing pthread's handful of ABI
-; sizes dominated otherwise sub-second builds. If any expression rejects the
-; batch, return None and let the existing per-expression fold/runtime fallback
-; preserve support for nonconstant probes.
-(defn probe-fold-all [(a (dyn Allocator))
-                      (abs (slice u8))
-                      (flags (slice u8))
-                      (probes (ptr (ArrayList Probe)))] (-> (Option (ptr (HashMap (slice u8)
-                                                                                  i64))))
-  (let [(mut sb) (sb-new a)
-        n (len (load probes))
-        (mut i) 0
-        (mut count) 0]
-    (sb-push-str! (mut sb) "#include \"")
-    (sb-push-str! (mut sb) abs)
-    (sb-push-str! (mut sb) "\"\nenum __coilprobes : long long {")
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (let [p (get (load probes) (load i))]
-                  (when (!= (pkind p) (primitive/cast i64 1))
-                    (when (> (load count) 0) (sb-push-str! (mut sb) ",") 0)
-                    (sb-push-str! (mut sb) "__v")
-                    (sb-push-str! (mut sb) (i64->dec a (load i)))
-                    (sb-push-str! (mut sb) "=(long long)(")
-                    (sb-push-str! (mut sb) (pget p 1))
-                    (sb-push-str! (mut sb) ")")
-                    (store! count (primitive/iadd (load count) 1))
-                    0))
-                (set! i (primitive/iadd (load i) 1)))))
-    (sb-push-str! (mut sb) "};\n")
-    (if (= (load count) 0)
-        (None [(ptr (HashMap (slice u8) i64))])
-        (let [cf (tmp-path a "foldall")]
-          (write-file a cf (sb-str (load sb)))
-          (try (let [ast
-                       (try-or! (run-clang-ast a cf flags)
-                                (None [(ptr (HashMap (slice u8) i64))]))]
-                 (let [m
-                         (box! a
-                               (HashMap (slice u8) i64)
-                               (hm-new [(slice u8) i64] a (str-keyops)))]
-                   (extract-enum-values a ast m)
-                   (Some m))))))))
+                      (expr (slice u8))] (-> (Result i64 (slice u8)))
+  (let [(mut exprs) (al-new [(slice u8)] a)]
+    (push! (mut exprs) expr)
+    (match (fold-batch a abs flags (mut exprs))
+      (Err [e] (Err e))
+      (Ok [values] (Ok (match (get (load values) 0) (Some [x] x) (None [] -9999999999)))))))
 
 ; If fields cannot be represented safely, retain the C value's ABI storage but
 ; deliberately expose no fields. This is the caller-owned opaque-value contract
@@ -2611,31 +2641,32 @@
 (defn opaque-record-defstruct [(a (dyn Allocator))
                                (header (slice u8))
                                (flags (slice u8))
-                               (d Json)] (-> (slice u8))
+                               (d Json)] (-> (Result (slice u8) (slice u8)))
   (let [name (jname d)
         tag
           (if (= (jstr-or (jgets d "tagUsed") "struct") "union")
               "union "
               "struct ")
         cty (cat a tag name)
-        size
-          (probe-fold-one a (abspath a header) flags (cat3 a "sizeof(" cty ")"))
-        align
-          (probe-fold-one a
-                          (abspath a header)
-                          flags
-                          (cat3 a "_Alignof(" cty ")"))]
+        (mut exprs) (al-new [(slice u8)] a)]
+    (push! (mut exprs) (cat3 a "sizeof(" cty ")"))
+    (push! (mut exprs) (cat3 a "_Alignof(" cty ")"))
+   (match (fold-batch a (abspath a header) flags (mut exprs))
+    (Err [e] (Err e))
+    (Ok [values]
+   (let [size (match (get (load values) 0) (Some [x] x) (None [] -9999999999))
+         align (match (get (load values) 1) (Some [x] x) (None [] -9999999999))]
     (if (or (= size (primitive/cast i64 -9999999999))
             (or (= align (primitive/cast i64 -9999999999))
                 (<= size (primitive/cast i64 0))))
-        ""
-        (cat3 a
+        (Ok "")
+        (Ok (cat3 a
               (cat3 a
                     (cat3 a "(defstruct " name " :layout explicit :size ")
                     (i64->dec a size)
                     (cat3 a " :align " (i64->dec a align) " ["))
               ""
-              "])\n"))))
+              "])\n"))))))))
 
 ; tier 0b: compile+link+run a printf of the expression (for non-constant values,
 ; e.g. a global's link-time address). `link` = extra linker args (objects/libs).
@@ -2643,7 +2674,7 @@
                  (abs (slice u8))
                  (flags (slice u8))
                  (expr (slice u8))
-                 (link (slice u8))] (-> i64)
+                 (link (slice u8))] (-> (Result i64 (slice u8)))
   (let [(mut prog) (sb-new a)]
     (sb-push-str! (mut prog) "#include \"")
     (sb-push-str! (mut prog) abs)
@@ -2654,29 +2685,36 @@
     (let [cf (tmp-path a "probec")
           exe (tmp-path a "probeexe")
           outf (tmp-path a "probeout")]
-      (write-file a cf (sb-str (load prog)))
-      (let [(mut cc) (sb-new a)]
-        ; -x c applies to the generated source; -x none resets so the linked objects
-        ; (link args) are detected by extension, not compiled as C.
-        (sb-push-str! (mut cc) "clang")
-        (sb-push-str! (mut cc) flags)
-        (sb-push-str! (mut cc) " -x c '")
-        (sb-push-str! (mut cc) cf)
-        (sb-push-str! (mut cc) "' -x none ")
-        (sb-push-str! (mut cc) link)
-        (sb-push-str! (mut cc) " -o '")
-        (sb-push-str! (mut cc) exe)
-        (sb-push-str! (mut cc) "' 2>/dev/null")
-        (if (!= (run-cmd a (sb-str (load cc))) (primitive/cast i32 0))
-            -9999999999
-            (let [(mut rc) (sb-new a)]
-              (sb-push-str! (mut rc) "'")
-              (sb-push-str! (mut rc) exe)
-              (sb-push-str! (mut rc) "' > '")
-              (sb-push-str! (mut rc) outf)
-              (sb-push-str! (mut rc) "' 2>/dev/null")
-              (run-cmd a (sb-str (load rc)))
-              (parse-signed (trim (slurp a (s->cstr a outf))))))))))
+      (match (write-file a cf (sb-str (load prog)))
+        (Err [e] (Err e))
+        (Ok [_]
+            (let [(mut cc) (sb-new a)]
+              ; -x c applies to the generated source; -x none resets so the linked objects
+              ; (link args) are detected by extension, not compiled as C.
+              (sb-push-str! (mut cc) "clang")
+              (sb-push-str! (mut cc) flags)
+              (sb-push-str! (mut cc) " -x c '")
+              (sb-push-str! (mut cc) cf)
+              (sb-push-str! (mut cc) "' -x none ")
+              (sb-push-str! (mut cc) link)
+              (sb-push-str! (mut cc) " -o '")
+              (sb-push-str! (mut cc) exe)
+              (sb-push-str! (mut cc) "' 2>/dev/null")
+              ; An expression that does not compile has no runtime value either:
+              ; that is the documented "PROBE FAILED" outcome, not an error.
+              (if (!= (run-cmd a (sb-str (load cc))) (primitive/cast i32 0))
+                  (Ok -9999999999)
+                  (let [(mut rc) (sb-new a)]
+                    (sb-push-str! (mut rc) "'")
+                    (sb-push-str! (mut rc) exe)
+                    (sb-push-str! (mut rc) "' > '")
+                    (sb-push-str! (mut rc) outf)
+                    (sb-push-str! (mut rc) "' 2>/dev/null")
+                    (if (!= (run-cmd a (sb-str (load rc))) (primitive/cast i32 0))
+                        (Err (cat a "cimport: the runtime probe for " expr))
+                        (match (slurp a (s->cstr a outf))
+                          (Err [e] (Err e))
+                          (Ok [text] (Ok (parse-signed (trim text))))))))))))))
 
 ; last whitespace-token of a slice.
 (defn last-token [(s (slice u8))] (-> (slice u8))
@@ -2771,7 +2809,7 @@
                   (flags (slice u8))
                   (name (slice u8))
                   (sname (slice u8))
-                  (fname (slice u8))] (-> (slice u8))
+                  (fname (slice u8))] (-> (Result (slice u8) (slice u8)))
   (let [(mut force) (sb-new a)]
     (sb-push-str! (mut force) "#include \"")
     (sb-push-str! (mut force) abs)
@@ -2780,30 +2818,44 @@
     (sb-push-str! (mut force) " __coil_force;\n")
     (let [cf (tmp-path a "force")
           outf (tmp-path a "layout")]
-      (write-file a cf (sb-str (load force)))
-      (let [(mut cc) (sb-new a)]
-        (sb-push-str! (mut cc) "clang -Xclang -fdump-record-layouts -x c")
-        (sb-push-str! (mut cc) flags)
-        (sb-push-str! (mut cc) " -c '")
-        (sb-push-str! (mut cc) cf)
-        (sb-push-str! (mut cc) "' -o /dev/null > '")
-        (sb-push-str! (mut cc) outf)
-        (sb-push-str! (mut cc) "' 2>&1")
-        (run-cmd a (sb-str (load cc)))
-        (parse-layout-field a (slurp a (s->cstr a outf)) name fname)))))
+      (match (write-file a cf (sb-str (load force)))
+        (Err [e] (Err e))
+        (Ok [_]
+            (let [(mut cc) (sb-new a)]
+              (sb-push-str! (mut cc) "clang -Xclang -fdump-record-layouts -x c")
+              (sb-push-str! (mut cc) flags)
+              (sb-push-str! (mut cc) " -c '")
+              (sb-push-str! (mut cc) cf)
+              (sb-push-str! (mut cc) "' -o /dev/null > '")
+              (sb-push-str! (mut cc) outf)
+              (sb-push-str! (mut cc) "' 2>&1")
+              (if (!= (run-cmd a (sb-str (load cc))) (primitive/cast i32 0))
+                  (match (slurp a (s->cstr a outf))
+                    (Err [e] (Err e))
+                    (Ok [detail]
+                        (Err (cat3 a "clang could not lay out " sname (cat a ":\n" (trim detail))))))
+                  (match (slurp a (s->cstr a outf))
+                    (Err [e] (Err e))
+                    (Ok [text] (Ok (parse-layout-field a text name fname)))))))))))
 
 ; Emit `(const …)` for every probe (routing each to the cheapest tier). "" if none.
 (defn cimport-probe [(a (dyn Allocator))
                      (header (slice u8))
                      (flags (slice u8))
                      (probes (ptr (ArrayList Probe)))
-                     (link (slice u8))] (-> (slice u8))
-  (let [flags (clang-flags a flags)
+                     (link (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (try
+   (let [flags (try! (clang-flags a flags))
         n (len (load probes))]
     (if (= n (primitive/cast i64 0))
-        ""
+        (Ok "")
         (let [abs (abspath a header)
-              folded (probe-fold-all a abs flags probes)
+              folded
+                (let [(mut exprs) (al-new [(slice u8)] a)]
+                  (for i (range 0 n)
+                    (let [p (get (load probes) i)]
+                      (push! (mut exprs) (if (= (pkind p) (primitive/cast i64 1)) "0" (pget p 1)))))
+                  (try! (fold-batch a abs flags (mut exprs))))
               (mut out) (sb-new a)
               (mut i) 0]
           (loop (if (>= (load i) n)
@@ -2812,26 +2864,22 @@
                       (let [p (get (load probes) (load i))]
                         (if (= (pkind p) (primitive/cast i64 1))
                             (sb-push-str! (mut out)
-                                          (probe-bits a
-                                                      abs
-                                                      flags
-                                                      (pget p 0)
-                                                      (pget p 2)
-                                                      (pget p 3)))
+                                          (try! (probe-bits a
+                                                            abs
+                                                            flags
+                                                            (pget p 0)
+                                                            (pget p 2)
+                                                            (pget p 3))))
                             (let [nm (pget p 0)
                                   e (pget p 1)
-                                  key (cat a "__v" (i64->dec a (load i)))
                                   v0
-                                    (match folded
-                                      (Some [values]
-                                            (match (get (load values) key)
-                                              (Some [value] value)
-                                              (None [] -9999999999)))
-                                      (None [] (probe-fold-one a abs flags e)))
+                                    (match (get (load folded) (load i))
+                                      (Some [value] value)
+                                      (None [] -9999999999))
                                   v
                                     (if (!= v0 (primitive/cast i64 -9999999999))
                                         v0
-                                        (probe-run a abs flags e link))]
+                                        (try! (probe-run a abs flags e link)))]
                               (if (!= v (primitive/cast i64 -9999999999))
                                   (sb-push-str! (mut out)
                                                 (cat3 a
@@ -2844,7 +2892,7 @@
                                                       nm
                                                       "\n"))))))
                       (set! i (primitive/iadd (load i) 1)))))
-          (sb-str (load out))))))
+          (Ok (sb-str (load out))))))))
 
 (defn cimport-run [(a (dyn Allocator))
                    (header (slice u8))
@@ -2857,10 +2905,9 @@
                 (match out
                   (None [] (do (emit body) 0))
                   (Some [o]
-                        (do
-                          (write-file a o body)
-                          (emit (cat3 a "wrote " o "\n"))
-                          0)))))]
+                        (match (write-file a o body)
+                          (Err [e] (do (ewrite (cat3 a "error: " e "\n")) 1))
+                          (Ok [_] (do (emit (cat3 a "wrote " o "\n")) 0)))))))]
     (cimport-cleanup! a)
     r))
 

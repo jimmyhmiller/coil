@@ -307,25 +307,6 @@
 (defn g-export-c-sym [(g (ptr Cga)) (name (slice u8))] (-> (Option (slice u8)))
   (get (.export_symbol_index g) name))
 
-; a by-value STRUCT param (type-tag 6) is the one C-export case this reference-model
-; backend passes differently from C (by pointer, not in registers) — it would need a
-; C-ABI marshaling thunk. Mirrors codegen.coil::cg-export-needs-thunk. Scalar/pointer
-; params, struct RETURNS (sret / x0-x1, which already match C), and the metaprogram
-; entries (Code = pointer args, empty ExportC params) are all thunk-free.
-(defn g-export-needs-thunk [(e (ptr ExportC))] (-> bool)
-  (let [ps (load (field e params))
-        n (len (load ps))
-        (mut i) 0
-        (mut r) false]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (match (load (al-at [Type] ps (load i)))
-                  (TStruct [nm] (do (set! r true) 0))
-                  (_ 0))
-                (set! i (primitive/iadd (load i) 1)))))
-    (load r)))
-
 ; register every extern + func as a GSig with a Mach-O symbol.
 (defn g-register-sigs! [(g (ptr Cga)) (mp (ptr Program))] (-> i64)
   (let [origins (load (field mp mono_origins))]
@@ -751,16 +732,20 @@
       (av-v av)
       (let [t (primitive/alloc-stack Type)]
         (set! t (av-ty av))
-        (let [off (slot-for-ty! g t)]
-          (if (= (av-kind av) (primitive/cast i64 2))
-              (do
-                (a64-mov-imm! (mut (.asm g)) 9 (av-v av))
-                (emit-store-int! g 9 28 off (ty-size g t))
-                0)
-              (do
-                (a64-mov-imm! (mut (.asm g)) 9 (av-v av))
-                (emit-store-int! g 9 28 off (ty-size g t))
-                0))
+        (let [off (slot-for-ty! g t)
+              size (ty-size g t)]
+          ; An immediate is an i64. A wider slot (the i128 llvm-ir marker type)
+          ; gets the value in its low word and the value's sign extension in
+          ; every byte above it, so no byte of the slot is left uninitialized.
+          (a64-mov-imm! (mut (.asm g)) 9 (av-v av))
+          (emit-store-int! g 9 28 off (if (> size 8) 8 size))
+          (when (> size 8)
+            (a64-mov-imm! (mut (.asm g)) 9 (if (< (av-v av) 0) -1 0))
+            (let [(mut at) 8]
+              (while (< at size)
+                (let [chunk (cond (>= (- size at) 8) 8 (>= (- size at) 4) 4 (>= (- size at) 2) 2 :else 1)]
+                  (emit-store-int! g 9 28 (+ off at) chunk)
+                  (set! at (+ at chunk))))))
           off))))
 
 ; copy `size` bytes between slots (x28-relative), through x9 (+x16/x17 for
@@ -2095,9 +2080,15 @@
                   (cga-fail "EMovePlace survived monomorphization (compiler bug)")
                   (mk-aval 0 0 (TInt 64 true))))
     (ELet [binds body]
-          (let [saved (load (field g env))]
+          (let [saved (load (field g env))
+                first-var (len (.dwvars g))]
             (emit-binds g binds)
-            (let [r (emit-body g body)]
+            (let [r (emit-body g body)
+                  here (a64-off (mut (field g asm)))]
+              ; the let's locals go out of scope here
+              (for v (range first-var (len (.dwvars g)))
+                (let [dv (al-at [DwVar] (field g dwvars) v)]
+                  (when (< (.end dv) 0) (set! (.end dv) here))))
               (set! (.env g) saved)
               r)))
     (EDo [body] (emit-body g body))
@@ -3855,24 +3846,9 @@
           ; the same way any other f64 kind-2 immediate narrows.
           (mk-aval 2 (f64-bits (str->f64 tk)) (TFloat 64))
             :else  ; integer literal (also covers negative)
-          ; A kind-0 (immediate) AVal is materialized (av-slot!) through an
-          ; 8-byte register store — fine for every type ≤8 bytes, but wrong
-          ; for i128 (our 16-byte TSlice marker): only the low 8 bytes would
-          ; get written, leaving the upper half as uninitialized stack
-          ; garbage. LLVM textual IR's only bare-integer-literal use on a
-          ; wide type in this corpus is `icmp ... i128 %x, 0`, so eagerly
-          ; zero the whole slot here (like zeroinitializer) and hard-fail on
-          ; anything else, rather than silently reading garbage.
-          (if (> (ty-size g tp) (primitive/cast i64 8))
-              (if (= tk "0")
-                  (let [slot (slot-for-ty! g tp)]
-                    (emit-zero! g slot (ty-size g tp))
-                    (mk-aval 1 slot t))
-                  (do
-                    (cga-fail2 "llvm-ir: only the literal 0 is supported for types wider than 8 bytes: "
-                               tk)
-                    (mk-aval 1 (slot-for-ty! g tp) t)))
-              (mk-aval 0 (str->i64 tk) t)))))
+          ; av-slot! sign-extends an immediate across a slot wider than 8 bytes
+          ; (the i128 marker type), so a literal needs no special case here.
+          (mk-aval 0 (str->i64 tk) t))))
 
 ; shufflevector's <N x i32> mask: either `zeroinitializer` (all N indices 0,
 ; i.e. a splat) or an explicit `<i32 IDX0, i32 IDX1, ...>` literal. Indices
@@ -4723,6 +4699,25 @@
                                                       t0
                                                       (mk-aval 1 dslot vty)))
                                   0))))
+                        (= op "extractelement")  ; %x = extractelement <N x T> V, IDXTY IDX
+                          (let [tokp (primitive/alloc-stack i64)]
+                            (store! tokp 3)
+                            (let [vty (ir-parse-type g result argtysp toks tokp)
+                                  vav (ir-value-adv! g envp avsp result argtysp toks tokp vty)
+                                  idxty (ir-parse-type g result argtysp toks tokp)
+                                  idxav (ir-value-adv! g envp avsp result argtysp toks tokp idxty)]
+                              (match vty
+                                (TVec [elemp _]
+                                      (let [lb (ty-size g elemp)
+                                            dslot (slot-for-ty! g elemp)]
+                                        ; address of lane IDX = slot base + IDX * lane bytes
+                                        (emit-slot-addr! g 9 (av-slot! g vav))
+                                        (av-to-x! g idxav 10)
+                                        (a64-mov-imm! (mut s) 11 lb)
+                                        (a64-w! (mut s) (a64-madd 9 10 11 9))
+                                        (ir-load-mem-any! g dslot 9 lb)
+                                        (ir-bind! g envp t0 (mk-aval 1 dslot (load elemp)))))
+                                (_ (cga-fail "llvm-ir: extractelement on non-vector")))))
                         (= op "shufflevector")  ; %r = shufflevector <M x T> V0, <M x T> V1, <N x i32> MASK
                           (let [tokp (primitive/alloc-stack i64)]
                             (store! tokp 3)
@@ -6260,19 +6255,27 @@
     (set! (.datasec g) (mobj-add-sect! (mut (.obj g)) "__DATA" "__data" 3 0))
     ; (export-c …): an exported function is emitted directly under its C symbol with
     ; external linkage (g-register-sigs! below) — no thunk needed for scalar/pointer
-    ; params or struct returns. A by-value STRUCT param is the sole exception (this
-    ; backend passes aggregates by pointer), and would need a C-ABI marshaling thunk;
-    ; reject it with a clear error rather than emit a silently-wrong symbol.
-    (let [es (load (field mp exports))
-          ne (len (load es))
-          (mut ei) 0]
-      (loop (if (>= (load ei) ne)
-                (break)
-                (do
-                  (when (g-export-needs-thunk (al-at [ExportC] es (load ei)))
-                    (cga-fail2 "export-c with a by-value struct parameter isn't supported by the arm64 backend yet (it needs a C-ABI marshaling thunk); scalar/pointer params and struct returns work: "
-                               (load (field (al-at [ExportC] es (load ei)) name))))
-                  (set! ei (primitive/iadd (load ei) 1))))))
+    ; params or struct returns. A by-value STRUCT parameter reaches a Coil function
+    ; by reference on this backend, so such an export gets a thunk: it receives the
+    ; C arguments by value and calls the function, which stays internal.
+  (let [thunks (export-c-thunks a mp)
+        ; codegen works on a copy of the program with the thunks added; the
+        ; caller's program (which a JIT session retains) is left as it was
+        (mut with-thunks) (load mp)
+        mp (cast (ptr Program) (mut with-thunks))]
+    (unless (= (len thunks) 0)
+      (let [(mut funcs) (al-new [Func] a)]
+        (for f (load (.funcs mp)) (push! (mut funcs) f))
+        (for f thunks (push! (mut funcs) f))
+        (set! (.funcs with-thunks) (box! a (ArrayList Func) (load funcs))))
+      (for i (range 0 (len (load (.exports mp))))
+        (let [e (al-elem [ExportC] (.exports mp) i)]
+          (when (export-c-needs-thunk? e)
+            (match (g-export-c-sym g (.name e))
+              (Some [symbol]
+                    (hm-remove! (mut (.export_symbol_index g)) (.name e))
+                    (set! (mut (.export_symbol_index g)) (export-c-thunk-name a (.name e)) symbol))
+              (None [] 0))))))
     (let [span (tr/span-begin "jit.codegen.register-types")]
       (g-register-types! g mp)
       (tr/span-end span))
@@ -6388,7 +6391,7 @@
                                          false
                                          3))
                       (store! i (primitive/iadd (load i) 1))))))))
-    (.obj g)))
+    (.obj g))))
 
 ; serialize a built object to disk — the AOT path.
 (defn cga64-last-needs-curl-cell [] (-> (ptr bool))
@@ -6748,5 +6751,9 @@
         (store! (field v param) param)
         (store! (field v source) src)
         (store! (field v lo) lo)
+        ; a local is live from here (its initializer has been emitted); a
+        ; parameter is live for the whole function
+        (store! (field v start) (if param -1 (a64-off (mut (field g asm)))))
+        (store! (field v end) -1)
         (push! (mut (field g dwvars)) (load v))
         0))))

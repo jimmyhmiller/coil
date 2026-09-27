@@ -50,6 +50,15 @@ grep -Eq '"extern".*"coil_selected_call".*"i32".*"\.\.\."' "$tmp/extern-lint.ful
 # A system header's API includes the headers it includes: macOS <stdlib.h>
 # declares qsort and abs in <_stdlib.h>, and clang spells size_t parameters
 # through its predefined __size_t.
+# Folding a header's macros is one or two clang runs, not one per macro: it used
+# to take ~45 s and 1.4 GB for <unistd.h>. 20 s is a regression ceiling that
+# stays clear of a loaded CI host.
+start=$(date +%s)
+"$compiler" cimport unistd.h -o "$tmp/unistd.coil"
+elapsed=$(( $(date +%s) - start ))
+[ "$elapsed" -lt 20 ] || { echo "cimport unistd.h took ${elapsed}s" >&2; exit 1; }
+grep -qF '(extern access ' "$tmp/unistd.coil"
+
 "$compiler" cimport stdlib.h -o "$tmp/stdlib.coil"
 "$compiler" check "$tmp/stdlib.coil"
 stdlib_bindings=$(cat "$tmp/stdlib.coil")
@@ -115,6 +124,48 @@ set +e
 rc=$?
 set -e
 [ "$rc" = 12 ] || { echo "system-header cimport program exited $rc, want 12" >&2; exit 1; }
+
+# `:use` can select an enumerator of an enum, anonymous or named, without
+# pulling in the enum's other enumerators.
+cat >"$tmp/enums.h" <<'EOF'
+enum { COIL_POLL_IN = 1, COIL_POLL_OUT = 4 };
+enum coil_color { COIL_RED, COIL_BLUE = 7 };
+EOF
+cat >"$tmp/enums.coil" <<EOF
+(module selected_enums)
+(cimport "$tmp/enums.h" :use [COIL_POLL_IN COIL_BLUE])
+(defn main [] (-> i64) (+ (cast i64 COIL_POLL_IN) (cast i64 COIL_BLUE)))
+EOF
+set +e
+"$compiler" run "$tmp/enums.coil"
+rc=$?
+set -e
+[ "$rc" = 8 ] || { echo "selected enumerators program exited $rc, want 8" >&2; exit 1; }
+"$compiler" dump-load "$tmp/enums.coil" >"$tmp/enums.full"
+if grep -qF 'COIL_POLL_OUT' "$tmp/enums.full"; then
+  echo 'selective cimport exposed an unselected enumerator' >&2
+  exit 1
+fi
+
+# A clang step that fails is an error, not a quietly smaller binding: with a
+# clang whose macro dump fails, cimport used to exit 0 with no #defines.
+mkdir -p "$tmp/failing-clang"
+real_clang=$(command -v clang)
+cat >"$tmp/failing-clang/clang" <<EOF
+#!/bin/sh
+case "\$*" in *-dM*) echo "simulated macro-dump failure" >&2; exit 1;; esac
+exec "$real_clang" "\$@"
+EOF
+chmod +x "$tmp/failing-clang/clang"
+set +e
+fail_out=$(PATH="$tmp/failing-clang:$PATH" "$compiler" cimport "$tmp/enums.h" -o "$tmp/failed.coil" 2>&1)
+fail_rc=$?
+set -e
+[ "$fail_rc" != 0 ] || { echo 'cimport succeeded although clang failed' >&2; exit 1; }
+case "$fail_out" in
+  *"simulated macro-dump failure"*) ;;
+  *) echo "cimport did not report clang's failure: $fail_out" >&2; exit 1 ;;
+esac
 
 if [[ $(uname -s) == Darwin ]]; then
   cat >"$tmp/ioctl-lint.coil" <<'EOF'
