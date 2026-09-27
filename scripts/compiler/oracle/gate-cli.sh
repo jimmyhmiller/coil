@@ -437,6 +437,13 @@ grep -q '^      (= 2 2)$' "$T/fmt-width.got" \
 expect_rc 2 "fmt --width rejects zero" "$COIL" fmt --width 0 "$T/seven.coil"
 expect_rc 2 "fmt --width requires a value" "$COIL" fmt "$T/seven.coil" --width
 
+printf '(defcc fast2 :params [rax rdx rsi rdi r8 r9] :ret rax :clobber [rax rdx rcx rsi rdi r8 r9 r10 r11] :native fast)\n' \
+  | "$COIL" fmt - > "$T/fmt-defcc.got"
+printf '(defcc fast2\n  :params [rax rdx rsi rdi r8 r9]\n  :ret rax\n  :clobber [rax rdx rcx rsi rdi r8 r9 r10 r11]\n  :native fast)\n' > "$T/fmt-defcc.want"
+cmp -s "$T/fmt-defcc.want" "$T/fmt-defcc.got" \
+  && ok "fmt keeps each defcc option with its value" \
+  || bad "fmt keeps each defcc option with its value" "$(diff -u "$T/fmt-defcc.want" "$T/fmt-defcc.got")"
+
 "$COIL" fmt tests/compiler/formatter_vertical_spacing_input.coil > "$T/vertical-spacing.got"
 cmp -s tests/compiler/formatter_vertical_spacing_expected.coil "$T/vertical-spacing.got" \
   && ok "fmt canonicalizes top-level spacing and keeps leading comments attached" \
