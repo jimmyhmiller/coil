@@ -38,41 +38,20 @@ through.
 
 ## Provenance
 
-**This revision has been RUN.** It was cross-emitted from macOS (arm64), linked into a
-stage0 on Linux x86-64 (Ubuntu, LLVM 21.1.8, `/usr/lib/llvm-21/bin/clang`), and that
-stage0 drove `python3 scripts/dev.py build linux` to a byte-identical LLVM fixed point.
-Both committed Linux seeds were then refreshed from the verified compiler, and a plain
-`python3 scripts/dev.py build linux` (no `STAGE0`) was re-run to prove the new seed
-bootstraps this tree by itself. So the IR is the escape hatch again, not the only way in.
+Regenerate with `scripts/compiler/emit-linux-ir.sh` from a clean, committed tree.
+It builds a compiler linked against the Linux CI's LLVM major (LLVM 21, via
+`LLVM_CONFIG`; Homebrew's `llvm@21` on macOS), emits
+`coil emit-ir src/compiler/main.coil --target x86_64-unknown-linux-gnu` with it,
+and refuses to write the artifact unless that same LLVM's `llvm-as` parses the text
+and its clang compiles it for x86_64-linux. The printing LLVM must match the parsing
+one: an IR written by LLVM 22 carries `nocreateundeforpoison` on intrinsic
+declarations, which LLVM 21 rejects as an "unterminated attribute group", and that is
+exactly how the Linux CI job's IR fallback broke after the seeds went stale.
 
-    coil emit-ir src/compiler/main.coil \
-        --target x86_64-unknown-linux-gnu > coil-linux.ll
-
-Emitted at commit `7ed1648` on `design/immutable-artifacts` (2026-09-20) from a clean
-tree, by a compiler built from that same source (3-stage self-host, LLVM fixpoint
-stage2.o == stage3.o). Note that `emit-ir --help` does not advertise `--target`, but it
-honours it — the help text is wrong, not the flag.
-
-**The emitting LLVM was 22; the build host's was 21.** LLVM 22 writes an attribute LLVM
-21's parser does not know, on two intrinsic declarations. Before compiling with an
-older clang:
-
-    sed -i 's/ nocreateundeforpoison//g' coil-linux.ll
-
-It only tells the optimizer an intrinsic does not create undef or poison, so dropping
-it is semantically inert. The artifact is committed as emitted, not as edited.
-
-What the run found, none of it in the IR:
-
-- The x64 runtime references had gone stale, and nothing could notice: that gate only
-  builds on an x86-64 host. `simd.coil` exits 0 on every backend but its x64 reference
-  said 42; `args.coil`'s recorded `argv[0]` predated the gate running programs under
-  their source name; `llvm-ir-ops.coil` had no x64 reference at all. Re-blessed on Linux
-  from the LLVM backend, as that gate intends — 57/57, x64 and LLVM agreeing on each.
-- The installer copied the new compiler INTO the running one, which Linux refuses
-  (`ETXTBSY`) whenever a `coil` process is alive. It renames into place now.
-- `rebootstrap-nollvm-linux.sh` needs `COIL_LLVM_LIBDIR=/usr/lib/llvm-21/lib` for its
-  stage0; the script says so itself when it is missing.
+Current artifact: emitted at commit `aa777a8` (2026-09-27) by a compiler built from
+that commit and linked against LLVM 21.1.8; parsed by LLVM 21 `llvm-as` and compiled
+by LLVM 21 clang for x86_64-unknown-linux-gnu. It has not been linked and run on a
+Linux host from this machine; the Linux CI job does that when its ELF seeds are stale.
 
 ## Rebuilding a stage0 from this IR
 
