@@ -2955,6 +2955,22 @@ depfiles=$(find "$T/project/.coil/build/native" -name source.d -type f)
 [ -n "$depfiles" ] \
   && ok "native compilation records header depfiles under .coil/build" \
   || bad "native compilation records header depfiles under .coil/build" "no source.d found"
+# The native object cache must notice a changed header and a changed source. Its
+# staleness check once asked `make -q`, which macOS's make 3.81 answered "up to
+# date" for a recipe-less depfile rule, so neither edit ever rebuilt the object.
+mkdir -p "$T/ccstale/src" "$T/ccstale/native"
+printf '[package]\nname = "ccstale"\nentry = "src/main.coil"\n[cc]\nsources = ["native/a.c"]\ninclude-dirs = ["native"]\n' > "$T/ccstale/Coil.toml"
+printf '#define VALUE 1\n' > "$T/ccstale/native/a.h"
+printf '#include "a.h"\nlong value(void) { return VALUE; }\n' > "$T/ccstale/native/a.c"
+printf '(module ccstale.main)\n(extern value :cc c [] (-> i64))\n(defn main [] (-> i64) (println "value={}" (value)) 0)\n' > "$T/ccstale/src/main.coil"
+expect_out "value=1" "native cache: first build compiles the C source" \
+  bash -c 'cd "$1" && "$2" run' _ "$T/ccstale" "$COIL"
+printf '#define VALUE 2\n' > "$T/ccstale/native/a.h"
+expect_out "value=2" "native cache: a changed included header rebuilds the object" \
+  bash -c 'cd "$1" && "$2" run' _ "$T/ccstale" "$COIL"
+printf '#include "a.h"\nlong value(void) { return VALUE * 10; }\n' > "$T/ccstale/native/a.c"
+expect_out "value=20" "native cache: a changed C source rebuilds the object" \
+  bash -c 'cd "$1" && "$2" run' _ "$T/ccstale" "$COIL"
 
 # `coil fuzz` is the one command that drives the linker ITSELF (clang, over the
 # program's IR) instead of shelling out to a `coil build` child, so the manifest's
