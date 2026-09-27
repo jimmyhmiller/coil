@@ -3230,19 +3230,82 @@
 
 (defn code-phase-func-names [(a (dyn Allocator))
                              (p (ptr Program))] (-> (ptr (ArrayList (slice u8))))
-  (let [(mut via) (hm-new [(slice u8) (slice u8)] a (str-keyops-borrowed))]
-    (code-phase-closure a p (mut via))))
+  (let [(mut cause) (hm-new [(slice u8) (slice u8)] a (str-keyops-borrowed))]
+    (code-phase-funcs a p (mut cause))))
 
-;;; The compile-time-only functions, as `code-phase-func-names`, recording in `via`
-;;; for each one dropped only for calling another the callee that dragged it in.
-(defn code-phase-closure [(a (dyn Allocator))
-                          (p (ptr Program))
-                          (via (mut (HashMap (slice u8) (slice u8))))] (-> (ptr (ArrayList (slice u8))))
+;;; A runtime root — `main`, an `export-c` function, or `extra` — that reaches
+;;; compile-time code, with the function at the end of that chain. Dropping such a
+;;; root silently would leave only a missing symbol at link or publication.
+(defstruct CompileTimeRoot [(root (ptr Func)) (seed (slice u8))])
+
+(defn runtime-root-reaching-code [(a (dyn Allocator)) (p (ptr Program)) (extra (slice u8))]
+  (-> (Option CompileTimeRoot))
+  (let [(mut cause) (hm-new [(slice u8) (slice u8)] a (str-keyops-borrowed))
+        _dropped (code-phase-funcs a p (mut cause))
+        (mut found) (None [CompileTimeRoot])]
+    (for [i 0 (len (load (.funcs p)))]
+      (let [f (al-elem [Func] (.funcs p) i)
+            name (.name f)]
+        (when (and (none? found)
+                   (and (hm-contains? cause name)
+                        (or (= name "main")
+                            (or (and (> (len extra) 0) (= name extra))
+                                (exported-c? p name)))))
+          (let [(mut at) name]
+            (loop
+              (match (hm-get cause at)
+                (None [] (break))
+                (Some [callee]
+                  (if (= (len callee) 0) (break) (set! at callee)))))
+            (set! found (Some (CompileTimeRoot :root f :seed at)))))))
+    found))
+
+(defn exported-c? [(p (ptr Program)) (name (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (for [i 0 (len (load (.exports p)))]
+      (when (= (.name (al-elem [ExportC] (.exports p) i)) name) (set! hit true)))
+    hit))
+
+(defn jit-entry-name? [(name (slice u8))] (-> bool)
+  (let [marker "__coil_jit_entry_" (mut hit) false]
+    (for [i 0 (+ (- (len name) (len marker)) 1)]
+      (when (= (subslice name i (+ i (len marker))) marker) (set! hit true)))
+    hit))
+
+;;; The diagnostic for a runtime root that reaches compile-time code.
+(defn compile-time-root-diag [(a (dyn Allocator)) (r CompileTimeRoot)] (-> Diag)
+  (let [root (.root r)
+        ; A retained session's transaction entry is synthetic; call it that.
+        subject (if (jit-entry-name? (.name root))
+                    "the entry"
+                    (sconcat3 a "'" (.name root) "'"))
+        what (if (= (.name root) (.seed r))
+                 (sconcat a subject " takes or returns Code")
+                 (sconcat a
+                   (sconcat a subject " reaches '")
+                   (sconcat a (.seed r) "', which takes or returns Code")))
+        msg (sconcat a what
+              ", so it exists only while compiling and cannot run; call Code functions from a macro or metaprogram, not from runtime code")]
+    (derr-at-src (.source root) (.lo root) (.hi root) msg)))
+
+;;; Functions that exist only at compile time. `cause` maps each to the callee
+;;; that pulled it in, or to "" for a function that mentions Code itself.
+(defn code-phase-funcs [(a (dyn Allocator))
+                        (p (ptr Program))
+                        (cause (mut (HashMap (slice u8) (slice u8))))] (-> (ptr (ArrayList (slice u8))))
   ; Seeds are functions that mention Code; every transitive caller of one is
   ; dropped too. Calls are collected once and propagated over reverse edges.
+  ;
+  ; A retained session's submission reaches functions an earlier submission
+  ; accepted, which are not in `p`. They are classified the same way, read
+  ; through the closure base as the walk reaches them: code that reaches an
+  ; accepted Code function is compile-time code too. Outside a session there is
+  ; no base, and the walk covers `p` alone.
   (let [fs (load (field p funcs))
         names (prog-fn-names p a)
         nominals (phase-only-nominals a p)
+        (mut work) (al-new [(ptr Func)] a)
+        (mut queued) (hm-new [(slice u8) i64] a (str-keyops-borrowed))
         (mut dropped) (al-new [(slice u8)] a)
         (mut dropped-index) (hm-new [(slice u8) i64] a (str-keyops-borrowed))
         ; callee name -> index of its latest (caller, next) link
@@ -3250,35 +3313,49 @@
         (mut link-caller) (al-new [i64] a)
         (mut link-next) (al-new [i64] a)]
     (for [i 0 (len (load fs))]
-      (let [fp (al-elem [Func] fs i)
-            calls (box! a SBox (primitive/zeroed SBox))]
-        (when (or (func-has-code fp nominals)
-                  (or (func-body-has-code-node? fp)
-                      ; Only a program that has such a type pays for looking.
-                      (and (> (len (load nominals)) 0)
-                           (func-mentions-phase-only? a fp nominals))))
-          (unless (hm-contains? [(slice u8) i64] dropped-index (load (field fp name)))
-            (hm-put! (mut dropped-index) (load (field fp name)) 0)
-            (push! (mut dropped) (load (field fp name))) 0)
-          0)
-        (set! (.items calls) (al-new [(slice u8)] a))
-        (cc-list (load (field fp body)) names calls (primitive/cast (ptr SBox) 0))
-        (for [j 0 (len (.items calls))]
-          (let [callee (get (.items calls) j)]
-            (push! (mut link-caller) i)
-            (push! (mut link-next) (match (hm-get first-link callee) (Some [at] at) (None [] -1)))
-            (hm-put! (mut first-link) callee (- (len link-caller) 1))))))
+      (let [fp (al-elem [Func] fs i)]
+        (push! (mut work) fp)
+        (unless (hm-contains? queued (.name fp)) (set! (mut queued) (.name fp) i))))
+    (let [(mut i) 0]
+      (loop (if (>= i (len work)) (break)
+        (let [fp (get work i)
+              calls (box! a SBox (primitive/zeroed SBox))]
+          (when (or (func-has-code fp nominals)
+                    (or (func-body-has-code-node? fp)
+                        ; Only a program that has such a type pays for looking.
+                        (and (> (len (load nominals)) 0)
+                             (func-mentions-phase-only? a fp nominals))))
+            (unless (hm-contains? [(slice u8) i64] dropped-index (load (field fp name)))
+              (hm-put! (mut dropped-index) (load (field fp name)) 0)
+              (set! (mut cause) (load (field fp name)) "")
+              (push! (mut dropped) (load (field fp name))) 0)
+            0)
+          (set! (.items calls) (al-new [(slice u8)] a))
+          (cc-list (load (field fp body)) names calls (primitive/cast (ptr SBox) 0))
+          (for [j 0 (len (.items calls))]
+            (let [callee (get (.items calls) j)]
+              (unless (hm-contains? queued callee)
+                (match (closure-base-func callee)
+                  (Some [accepted]
+                    (when (= (len (load (.type_params accepted))) 0)
+                      (set! (mut queued) callee (len work))
+                      (push! (mut work) accepted)))
+                  (None [] 0)))
+              (push! (mut link-caller) i)
+              (push! (mut link-next) (match (hm-get first-link callee) (Some [at] at) (None [] -1)))
+              (hm-put! (mut first-link) callee (- (len link-caller) 1))))
+          (set! i (+ i 1))))))
     (let [(mut next) 0]
       (loop (if (>= (load next) (len dropped)) (break)
         (let [name (get dropped (load next))
               (mut link) (match (hm-get first-link name) (Some [at] at) (None [] -1))]
           (set! next (+ (load next) 1))
           (loop (if (< (load link) 0) (break)
-            (let [caller (al-elem [Func] fs (get link-caller (load link)))
+            (let [caller (get work (get link-caller (load link)))
                   caller-name (load (field caller name))]
               (unless (hm-contains? [(slice u8) i64] dropped-index caller-name)
                 (hm-put! (mut dropped-index) caller-name 0)
-                (hm-put! (mut via) caller-name name)
+                (set! (mut cause) caller-name name)
                 (push! (mut dropped) caller-name) 0)
               (set! link (get link-next (load link))))))))))
     (box-al [(slice u8)] a (load dropped))))
@@ -3300,65 +3377,9 @@
     0))
 
 (defn drop-code-funcs [(a (dyn Allocator)) (p (ptr Program))] (-> i64)
-  (drop-code-func-names a p (code-phase-func-names a p)))
-
-;;; A program's run-time entry points: `main`, the `export-c` targets, and the
-;;; functions a compilation unit publishes.
-(defn runtime-root? [(p (ptr Program)) (name (slice u8))] (-> bool)
-  (or (= name "main")
-      (or (let [(mut hit) false]
-            (for [i 0 (if (= (primitive/cast i64 (.exports p)) 0) 0 (len (load (.exports p))))]
-              (when (= (.name (al-elem [ExportC] (.exports p) i)) name) (set! hit true) 0))
-            hit)
-          (and (!= (primitive/cast i64 (.unit_exports p)) 0)
-               (let [(mut hit) false]
-                 (for [i 0 (len (load (.unit_exports p)))]
-                   (when (= (get (load (.unit_exports p)) i) name) (set! hit true) 0))
-                 hit)))))
-
-;;; `drop-code-funcs` for a program that will run: an entry point that is
-;;; compile-time only only because it calls compile-time code (a helper using
-;;; `primitive/error`, a quote, Code) would otherwise vanish, and the build would
-;;; end in a linker's "undefined symbol _main". Report the call chain instead.
-(defn drop-code-funcs-for-runtime [(a (dyn Allocator)) (p (ptr Program))] (-> (Result i64 Diag))
-  (let [(mut via) (hm-new [(slice u8) (slice u8)] a (str-keyops-borrowed))
-        dropped (code-phase-closure a p (mut via))
-        (mut problem) (None [Diag])]
-    (for [i 0 (len (load dropped))]
-      (let [name (get (load dropped) i)]
-        (when (and (match (load problem) (None [] true) (_ false))
-                   (and (runtime-root? p name) (hm-contains? via name)))
-          (let [(mut msg) (sb-new a)
-                (mut at) name
-                (mut fp) (None [(ptr Func)])]
-            (for [k 0 (len (load (.funcs p)))]
-              (when (= (.name (al-elem [Func] (.funcs p) k)) name)
-                (set! fp (Some (al-elem [Func] (.funcs p) k)))
-                0))
-            (sb-push-str! (mut msg) "'")
-            (sb-push-str! (mut msg) name)
-            (sb-push-str! (mut msg) "' is a run-time entry point, but it calls compile-time-only code: ")
-            (sb-push-str! (mut msg) name)
-            (while (hm-contains? via at)
-              (set! at (match (hm-get via at) (Some [callee] callee) (None [] at)))
-              (sb-push-str! (mut msg) " -> ")
-              (sb-push-str! (mut msg) at))
-            (sb-push-str! (mut msg) ", and '")
-            (sb-push-str! (mut msg) at)
-            (sb-push-str! (mut msg) "' uses Code, a quote, or a compile-time operation such as primitive/error")
-            (set! problem
-                  (Some (match (load fp)
-                          (None [] (derr (sb-str (load (mut msg)))))
-                          (Some [f] (derr-at-src (.source f) (.lo f) (.hi f) (sb-str (load (mut msg))))))))))))
-    (match (load problem)
-      (Some [d] (Err d))
-      (None [] (Ok (drop-code-func-names a p dropped))))))
-
-(defn drop-code-func-names [(a (dyn Allocator))
-                            (p (ptr Program))
-                            (dropped (ptr (ArrayList (slice u8))))] (-> i64)
   (let [fs (load (field p funcs))
         n (len (load fs))
+        dropped (code-phase-func-names a p)
         (mut dropped-index) (hm-new [(slice u8) i64] a (str-keyops-borrowed))
         (mut out) (al-new [Func] a)
         (mut i) 0]
