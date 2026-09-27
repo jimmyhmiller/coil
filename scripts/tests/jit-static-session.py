@@ -54,7 +54,7 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
             flags += ["--link-flag", flag]
     fixtures = ("derive_qualified_shape", "retained_heap", "jit_metadata_lifetime", "jit_type_lifetime", "jit_impl_lifetime", "jit_monomorph_report_lifetime", "jit_source_sharing", "jit_body_sharing", "jit_native_metadata_roots", "jit_repl_policy", "jit_static_session", "jit_static_lifetime", "jit_static_policy",
                 "jit_static_dynamic", "jit_static_isolation", "jit_single_form_proof", "jit_checked_baseline", "jit_env_values", "jit_env_stale", "jit_live_checker", "jit_redefined_signature",
-                "jit_generation_tokens", "jit_reserved_tokens", "jit_frontend_policy", "jit_meta_pipeline", "jit_deferred_publication", "jit_repair_diagnostics", "jit_defalias_rebind", "jit_retire_declarations", "jit_session_imports", "jit_session_free")
+                "jit_generation_tokens", "jit_reserved_tokens", "jit_frontend_policy", "jit_meta_pipeline", "jit_deferred_publication", "jit_repair_diagnostics", "jit_defalias_rebind", "jit_retire_declarations", "jit_session_imports", "jit_session_free", "jit_llvm_backend")
     if sys.platform == "darwin":
         fixtures += ("jit_scratch_footprint",)
     # COIL_META_MAIN=1 in an embedding host: main-thread compiles run metaprograms
@@ -148,7 +148,7 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
     binary = work / "no-replay"
     run(COMPILER, "build", ROOT / "tests/compiler/features/jit_static_no_replay.coil",
         "-o", binary, *flags)
-    run(binary, dependency, env=dict(os.environ, COIL_NAMESPACE_ROOTS=str(work)))
+    run(binary, dependency, env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(work)))
     assert not dependency.exists(), "the no-replay test did not remove its input"
     print("PASS: new forms use an imported type after its source file is removed", flush=True)
     provider = work / "provider.coil"
@@ -159,7 +159,7 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
     binary = work / "reader"
     run(COMPILER, "build", ROOT / "tests/compiler/features/jit_static_reader.coil",
         "-o", binary, *flags)
-    run(binary, env=dict(os.environ, COIL_NAMESPACE_ROOTS=str(work)))
+    run(binary, env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(work)))
     print("PASS: retained source provider and one-time ABI preamble", flush=True)
     # This test reaches private unit lifetime APIs and deliberately source-links
     # the implementation, rather than crossing the public opaque unit interface.
