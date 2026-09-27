@@ -3121,6 +3121,28 @@ EOF
       && ok "lldb maps source from the .dSYM alone (no .o)" \
       || bad "lldb maps source from the .dSYM" "$(echo "$bp" | grep -iE 'breakpoint|pending' | head -1)"
   fi
+  # A local is visible only after its initializer: at function entry `sum`
+  # does not exist yet (it used to read the slot's stale bytes), and after the
+  # initializer it holds its value.
+  if command -v lldb >/dev/null 2>&1; then
+    printf '%s\n' '(module dbgl)' \
+      '(defn checkpoint [(value i64)] (-> i64)' \
+      '  (let [sum (+ value 1)' \
+      '        twice (* sum 2)]' \
+      '    (+ sum twice)))' \
+      '(defn main [] (-> i64) (checkpoint 41))' > "$T/dbgl.coil"
+    "$COIL" build "$T/dbgl.coil" -g -o "$T/dbglx" >/dev/null 2>&1
+    at_entry=$(lldb -b "$T/dbglx" -o "b dbgl.checkpoint" -o run -o "frame variable sum" -o quit 2>&1)
+    after=$(lldb -b "$T/dbglx" -o "b dbgl.checkpoint" -o run -o "thread step-over" -o "thread step-over" -o "frame variable sum" -o quit 2>&1)
+    case "$at_entry" in
+      *"sum = "*) bad "a let local is not visible before its initializer" "$(printf '%s\n' "$at_entry" | grep 'sum =')" ;;
+      *) ok "a let local is not visible before its initializer" ;;
+    esac
+    case "$after" in
+      *"sum = 42"*) ok "a let local holds its value after its initializer" ;;
+      *) bad "a let local holds its value after its initializer" "$(printf '%s\n' "$after" | tail -5)" ;;
+    esac
+  fi
 else
   echo "  skip — dsymutil not on PATH (not a macOS toolchain host)"
 fi
