@@ -113,6 +113,10 @@ fi
 
 echo "== cimport: system headers, selection, anonymous typedef records =="
 expect_rc 0 "cimport gate passes" bash scripts/compiler/oracle/gate-cimport.sh "$COIL"
+# Every C extern the compiler and standard library declare must match the host's
+# prototype, or a program that declares the C function correctly collides with it.
+expect_rc 0 "compiler and stdlib externs match the host's C prototypes" \
+  python3 scripts/tests/extern-prototypes.py "$COIL"
 
 echo "== externref never reaches linear memory =="
 # A wasm reference lives in locals, parameters and results. Every position that
@@ -4272,6 +4276,33 @@ if { [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; } \
   fi
   expect_rc 0 "installed live IR consumer links beside the warmed JIT unit" \
     bash -c 'cd "$1" && "$2" build live-ir.coil -o live-ir "${@:3}" && PATH="$(dirname "$2"):$PATH" ./live-ir' \
+    _ "$T/jit-sdk" "$INSTALLED" "${LIVE_IR_BUILD_ARGS[@]}"
+  # A coil.jit consumer reads the unit's interface, not the compiler behind it: the
+  # interface imports no compiler module, so the consumer compiles none of it and
+  # declares none of its C externs. A program that declares libc functions with
+  # their real prototypes therefore builds beside coil.jit.
+  jit_iface=$(cat "$JIT_UNITS/llvm/coil.compiler.jit_api/interface.coil" 2>/dev/null)
+  case "$jit_iface" in
+    *"(module coil.compiler.jit_api)"*)
+      case "$jit_iface" in
+        *'(import "coil.compiler.driver"'*) bad "the coil.jit unit interface imports no compiler module" "it imports coil.compiler.driver" ;;
+        *) ok "the coil.jit unit interface imports no compiler module" ;;
+      esac ;;
+    *) bad "the coil.jit unit interface imports no compiler module" "no interface at $JIT_UNITS/llvm" ;;
+  esac
+  cat > "$T/jit-sdk/c-externs.coil" <<'EOF'
+(module jit-c-externs)
+(import "coil.jit" :use [jit-backend])
+(extern access :cc c [(ptr i8) i32] (-> i32))
+(extern dlopen :cc c [(ptr i8) i32] (-> (ptr i8)))
+(extern strlen :cc c [(ptr i8)] (-> u64))
+(extern write :cc c [i32 (ptr i8) u64] (-> i64))
+(extern read :cc c [i32 (ptr i8) u64] (-> i64))
+(defn main [] (-> i64)
+  (if (and (= (access c"/" 0) 0) (= (strlen c"four") 4)) 0 1))
+EOF
+  expect_rc 0 "a coil.jit program that declares libc functions with their C prototypes builds and runs" \
+    bash -c 'cd "$1" && "$2" build c-externs.coil -o c-externs "${@:3}" && ./c-externs' \
     _ "$T/jit-sdk" "$INSTALLED" "${LIVE_IR_BUILD_ARGS[@]}"
   cp src/examples/jit_sdk.coil "$T/jit-sdk/main.coil"
   if [ "$HOST_OS" = Darwin ]; then
