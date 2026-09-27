@@ -188,7 +188,11 @@
    (resultlocal i64)
    (label (Option (slice u8)))
    (has_res bool)
-   (resty Type)])
+   (resty Type)
+   ; Operand-stack depth at loop entry. A break or continue may leave from the
+   ; middle of an expression that has already pushed operands (the destination
+   ; of an enclosing store, say); it restores this depth before jumping.
+   (stacklocal i64)])
 
 ; per-function bytecode builder.
 (defstruct FB
@@ -205,13 +209,18 @@
 (defstruct IIr [(body (slice u8)) (argtys (ArrayList Type)) (result Type)])
 
 ; the interpreter context: the mono'd program + compiled functions + layouts.
+;;; A runtime `def`'s static storage: allocated and initialized once, on its
+;;; first reference, like the data a native build lays into its binary.
+(defstruct IStatic [(name (slice u8)) (addr i64)])
+
 (defstruct Interp
   [(a (dyn Allocator))
    (mp (ptr Program))
    (externs (ptr (ArrayList Extern)))
    (bfuncs (ArrayList BFunc))
    (layouts LayoutDb)
-   (irs (ArrayList IIr))])
+   (irs (ArrayList IIr))
+   (statics (ArrayList IStatic))])
 
 ; ============================ scope helpers ==================================
 (defn cs-cons [(a (dyn Allocator))
@@ -712,6 +721,8 @@
                (set! (.label gl) label)
                (set! (.has_res gl) false)
                (set! (.resty gl) (TInt 64 true))
+               (set! (.stacklocal gl) (fb-local! fb))
+               (femit fb 44 (.stacklocal gl) 0 0)  ; SAVESP
                (push! (mut (.loops fb)) (load gl))
                (fbind-label fb contlabel)
                (compile-stmts fb body)
@@ -731,19 +742,28 @@
                 (match value
                   (Some [ve]
                         (let [vt (compile-expr fb ve)]
-                          (femit fb 3 (.resultlocal lp) 0 0)  ; SETLOCAL resultlocal
-                          (set! (.resty lp) vt)))
+                          ; A value that itself left the loop (a nested break in it)
+                          ; never completes: this break is dead, and its value's
+                          ; type must not overwrite the result type that break set.
+                          (unless (load (field fb term))
+                            (femit fb 3 (.resultlocal lp) 0 0)  ; SETLOCAL resultlocal
+                            (set! (.resty lp) vt)
+                            0)))
                   (None []
                         (do
                           (femit fb 1 0 0 0)  ; push 0
                           (femit fb 3 (.resultlocal lp) 0 0))))
-                (set! (.has_res lp) true)
-                (femit fb 11 (.breaklabel lp) 0 0)  ; JMP breaklabel
+                (unless (load (field fb term))
+                  (set! (.has_res lp) true)
+                  (femit fb 45 (.stacklocal lp) 0 0)  ; RESTORESP
+                  (femit fb 11 (.breaklabel lp) 0 0)  ; JMP breaklabel
+                  0)
                 (set! (.term fb) true)
                 (TInt 64 true)))
       (EContinue [label]
                  (let [li (cloop-index fb label)
                        lp (ial-at [CLoop] (field fb loops) li)]
+                   (femit fb 45 (.stacklocal lp) 0 0)  ; RESTORESP
                    (femit fb 11 (.contlabel lp) 0 0)
                    (set! (.term fb) true)
                    (TInt 64 true)))
@@ -810,8 +830,9 @@
                   (None [] 0))
                 (let [sz (isize-of cx tp)
                       al (ialign-of cx tp)]
-                  (when (not (= (primitive/cast i64 init) 0))
-                    (idie "initialized alloc-static is not supported by the bytecode interpreter yet")
+                  (when (and (not (= (primitive/cast i64 init) 0))
+                             (not (= storage (primitive/cast i64 1))))
+                    (idie "an initializer is a link-time constant; only alloc-static storage takes one")
                     0)
                   (cond (or (= storage (primitive/cast i64 0))
                             (= storage (primitive/cast i64 3)))
@@ -826,6 +847,8 @@
                                                 (interp-owned-alloc (primitive/cast isize
                                                                                     sz)))]
                           (memzero addr sz)
+                          (unless (= (primitive/cast i64 init) 0)
+                            (interp-static-write! cx tp init addr))
                           (femit fb 1 addr 0 0)))
                   (TPtr (box-type a t)))))
       (EZeroed [t]
@@ -1278,9 +1301,168 @@
                 value (compile-expr fb (box-expr a lowered))]
             (set! (.env fb) saved)
             value)))
+      (EStaticRef [name]
+        (let [cp (interp-runtime-def cx name)]
+          (femit fb 1 (interp-static-addr! cx name) 0 0)
+          (match (.ty cp)
+            (Some [ty] (TPtr (box-type a ty)))
+            (None [] (do (idie2 "internal: checked def has no type: " name) (TInt 64 true))))))
+      (EMakeSlice [data elem extent]
+        (let [l (fb-local! fb)]
+          (femit fb 31 16 8 0)
+          (femit fb 3 l 0 0)  ; ALLOCZ 16 -> local l
+          (femit fb 2 l 0 0)
+          (compile-expr fb data)
+          (femit fb 7 8 0 0)
+          (femit fb 4 0 0 0)  ; l[0] = data
+          (femit fb 2 l 0 0)
+          (femit fb 34 8 0 0)
+          (femit fb 1 (extent-value extent) 0 0)
+          (femit fb 7 8 0 0)
+          (femit fb 4 0 0 0)  ; l[8] = length
+          (femit fb 2 l 0 0)  ; push the slice
+          (TSlice (box-type a elem))))
+      (EAccessorField [p fname]
+        (compile-expr fb (box-expr a (mk-expr (EField p fname) (.lo e) (.hi e) (.source e) (.ctxt e)))))
       (_ (do
            (idie "unimplemented expression kind reached the interpreter compiler")
            (TInt 64 true))))))
+
+;;; The runtime `def` named `name`.
+(defn interp-runtime-def [(cx (ptr Interp)) (name (slice u8))] (-> (ptr Const))
+  (let [cs (load (field (.mp cx) consts))
+        (mut found) (primitive/cast (ptr Const) 0)]
+    (for i (range 0 (len (load cs)))
+      (let [cp (ial-at [Const] cs i)]
+        (when (and (.runtime cp) (= (.name cp) name)) (set! found cp))))
+    (when (= (primitive/cast i64 (load found)) 0)
+      (idie2 "static-ref references an unknown def: " name))
+    (load found)))
+
+;;; The address of `name`'s static storage, allocated and initialized on first use.
+(defn interp-static-addr! [(cx (ptr Interp)) (name (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for i (range 0 (len (.statics cx)))
+      (let [st (ial-at [IStatic] (field cx statics) i)]
+        (when (= (.name st) name) (set! found (.addr st)))))
+    (if (>= found 0)
+        found
+        (let [cp (interp-runtime-def cx name)
+              tp (box-type (.a cx) (match (.ty cp) (Some [t] t) (None [] (TInt 64 true))))
+              sz (isize-of cx tp)
+              addr (primitive/cast i64 (interp-owned-alloc (primitive/cast isize sz)))]
+          (memzero addr sz)
+          ; Recorded before writing: an initializer may name this def's address.
+          (push! (mut (.statics cx)) (IStatic :name name :addr addr))
+          (interp-static-write! cx tp (field cp value) addr)
+          addr))))
+
+(defn interp-field-ty [(cx (ptr Interp)) (si i64) (fi i64)] (-> (ptr Type))
+  (field (ial-at [Field] (load (field (struct-at (field cx layouts) si) fields)) fi) ty))
+
+;;; Lay the link-time constant `e` of type `t` into memory at `addr`: the same
+;;; initializers a native backend writes into its data section.
+(defn interp-static-write! [(cx (ptr Interp)) (t (ptr Type)) (e (ptr Expr)) (addr i64)] (-> i64)
+  (match (.kind e)
+    (EInt [n] (mem-store addr n (isize-of cx t)))
+    (EBool [v] (mem-store addr (if v 1 0) 1))
+    (EFloat [bits]
+      (match (load t)
+        (TFloat [width]
+          (if (= width 32)
+              (let [cell (primitive/alloc-stack i64)
+                    wide (primitive/alloc-stack f64)]
+                (store! cell bits)
+                (store! wide (load (primitive/cast (ptr f64) cell)))
+                (let [narrow (primitive/alloc-stack f32)]
+                  (store! narrow (cast f32 (load wide)))
+                  (mem-store addr (cast i64 (load (primitive/cast (ptr u32) narrow))) 4)))
+              (mem-store addr bits 8)))
+        (_ (mem-store addr bits 8))))
+    (EStr [sv]
+      (do (mem-store addr (intern-bytes sv) 8)
+          (mem-store (+ addr 8) (len sv) 8)))
+    (ECStr [sv] (mem-store addr (intern-bytes sv) 8))
+    (EConstruct [sum variant args]
+      (let [su (isum-idx cx sum)]
+        (when (< su 0) (idie2 "def initializer: unknown sum " sum))
+        (let [vidx (ivariant-idx cx su variant)
+              vs (load (field (sum-at (field cx layouts) su) variants))
+              vfields (load (field (ial-at [Variant] vs vidx) fields))]
+          (mem-store addr vidx 4)
+          (for i (range 0 (len (load args)))
+            (interp-static-write! cx
+                                  (field (ial-at [Field] vfields i) ty)
+                                  (ial-at [Expr] args i)
+                                  (+ addr (+ 8 (inatural-off cx vfields i)))))
+          0)))
+    (EZeroed [_] 0)
+    (ERecordInit [_] 0)
+    (EStaticArray [indices items]
+      (match (load t)
+        (TArray [elem _]
+          (do
+            (for i (range 0 (len (load items)))
+              (interp-static-write! cx elem (ial-at [Expr] items i)
+                                    (+ addr (* (get (load indices) i) (isize-of cx elem)))))
+            0))
+        (_ (idie "static :elements requires an array allocation"))))
+    (EFnPtrOf [name]
+      (let [fi (find-func cx name)]
+        (when (< fi 0) (idie2 "def initializer: unknown function " name))
+        (ensure-compiled cx fi)
+        (mem-store addr (+ (fnptr-base) fi) 8)))
+    (EAlloc [storage ty init symbol]
+      (if (!= storage 1)
+          (idie "def initializer: only alloc-static storage is a link-time constant")
+          (let [tp (box-type (.a cx) ty)
+                sz (isize-of cx tp)
+                inner (primitive/cast i64 (interp-owned-alloc (primitive/cast isize sz)))]
+            (match symbol
+              (Some [_] (idie "named alloc-static requires native code generation"))
+              (None [] 0))
+            (memzero inner sz)
+            (unless (= (primitive/cast i64 init) 0)
+              (interp-static-write! cx tp init inner))
+            (mem-store addr inner 8))))
+    (EStaticRef [name] (mem-store addr (interp-static-addr! cx name) 8))
+    (ECast [_ inner] (interp-static-write! cx t inner addr))
+    (ELoad [inner] (interp-static-write! cx t inner addr))
+    (ELet [_ body]
+      (match (load t)
+        (TStruct [name]
+          (let [si (istruct-idx cx name)]
+            (when (< si 0) (idie2 "def initializer: unknown struct " name))
+            (for i (range 0 (len (load body)))
+              (match (.kind (ial-at [Expr] body i))
+                (EInitStore [place value]
+                  (match (.kind place)
+                    (EField [_ fname]
+                      (let [fi (ifield-idx cx si fname)]
+                        (when (< fi 0) (idie2 "def initializer: unknown field " fname))
+                        (interp-static-write! cx (interp-field-ty cx si fi) value
+                                              (+ addr (ifield-off cx si fi)))))
+                    (_ 0)))
+                (_ 0)))
+            0))
+        (TArray [elem count-extent]
+          (let [count (extent-value count-extent)]
+            (for i (range 0 (len (load body)))
+              (match (.kind (ial-at [Expr] body i))
+                (EStore [place value]
+                  (match (.kind place)
+                    (EIndex [_ index]
+                      (match (.kind index)
+                        (EInt [item]
+                          (if (or (< item 0) (>= item count))
+                              (idie "alloc-static initializer: array index is out of bounds")
+                              (interp-static-write! cx elem value (+ addr (* item (isize-of cx elem))))))
+                        (_ (idie "alloc-static initializer: array index is not constant"))))
+                    (_ 0)))
+                (_ 0)))
+            0))
+        (_ (idie "def initializer: materialized aggregate has the wrong type"))))
+    (_ (idie "def initializer is not a link-time constant"))))
 
 ; compile function `fi` on first reference (self-recursion is guarded by marking
 ; state=1 BEFORE compiling the body). Only functions reachable from main are ever
@@ -4491,6 +4673,10 @@
                                             (primitive/cast (ptr i64) argbuf)
                                             a
                                             rb))))))  ; CALLPTR
+                      44
+                    (do (store! (primitive/index locals a) (load spc)) 0)  ; SAVESP
+                      45
+                    (do (set! spc (load (primitive/index locals a))) 0)  ; RESTORESP
                       (do (idie "VM: bad opcode") 0))))))
     (interp.free (primitive/cast (ptr i8) locals))
     (interp.free (primitive/cast (ptr i8) framemem))
@@ -4553,6 +4739,7 @@
     (set! (.mp cx) mp)
     (set! (.externs cx) (load (field mp externs)))
     (set! (.bfuncs cx) (al-new [BFunc] a))
+    (set! (.statics cx) (al-new [IStatic] a))
     (set! (.irs cx) (al-new [IIr] a))
     (iregister-types! cx mp)
     (let [fs (load (field mp funcs))
@@ -4602,6 +4789,7 @@
     (set! (.mp cx) mp)
     (set! (.externs cx) (load (field mp externs)))
     (set! (.bfuncs cx) (al-new [BFunc] a))
+    (set! (.statics cx) (al-new [IStatic] a))
     (set! (.irs cx) (al-new [IIr] a))
     (iregister-types! cx mp)
     ; pre-register: name + nparams + retty for every func (calls need these).

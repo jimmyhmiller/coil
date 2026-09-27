@@ -24,6 +24,9 @@
 # selected by `scripts/dev.py install`. No install occurs until every gate passes.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
+# The library sources this build starts from; recorded beside the result so an
+# install can never pair the compiler with different ones.
+TOOLCHAIN_STAMP=$(python3 scripts/compiler/toolchain_stamp.py digest)
 # Stage compilers land in /tmp; give /tmp the toolchain library they resolve against.
 . scripts/compiler/stage-lib.sh
 SRC=src/compiler/main.coil
@@ -122,6 +125,7 @@ stage_lib_cleanup
 DEST="${1:-build/bin/coil}"
 mkdir -p "$(dirname "$DEST")"
 cp "$S2" "$DEST"
+printf '%s\n' "$TOOLCHAIN_STAMP" > "$DEST.toolchain"
 echo "=== VERIFIED self-host compiler installed -> $DEST ==="
 if [ "${COIL_SKIP_INSTALL:-0}" = 1 ]; then
   echo "=== user-level install skipped (COIL_SKIP_INSTALL=1) ==="

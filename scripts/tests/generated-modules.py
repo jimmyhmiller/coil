@@ -11,6 +11,9 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cleanup_on_signal  # noqa: E402
+cleanup_on_signal.install()
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else "build/bin/coil-generated-v2").resolve()
 PROCESS_IDS: set[int] = set()
 

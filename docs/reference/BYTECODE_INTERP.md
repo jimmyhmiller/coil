@@ -134,6 +134,8 @@ opcodes know int-vs-float, width, and signedness.
 | 38 | `BITSET`     | a=low b=width c=backbytes    | val=pop; addr=pop; clear field, OR (val&mask)<<low, store; push val |
 | 40 | `LLVMIR`     | a=iridx b=nargs              | pop nargs; push ir-run(irs[a], args) (interprets an inline-IR body) |
 | 42 | `CALLPTR`    | a=nargs                      | pop nargs; pop fnptr; decode fidx; push vm-exec(fidx, args) |
+| 44 | `SAVESP`     | a=local                      | locals[a] = operand-stack depth (loop entry) |
+| 45 | `RESTORESP`  | a=local                      | operand-stack depth = locals[a] (break/continue out of an expression) |
 | 43 | `BOXEXT`     | a=size b=align               | v=pop; slot=frame-alloc; store the packed <=8B C aggregate return; push slot |
 
 Aggregates (struct/sum/slice/array/vec) are carried **by address**: a cell holds
