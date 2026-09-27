@@ -207,7 +207,7 @@ static size_t fmt_one(char *out, size_t cap, const char *fmt, uint64_t arg) {
 // ---- allocation ----
 uint32_t env_malloc(uint32_t size) { return (uint32_t)rt_malloc(size); }
 uint32_t env_realloc(uint32_t p, uint32_t size) { return (uint32_t)rt_realloc(p, size); }
-uint64_t env_free(uint32_t p) { rt_free(p); return 0; }
+void env_free(uint32_t p) { rt_free(p); }
 uint32_t env_calloc(uint32_t n, uint32_t sz) {
     uint64_t total = (uint64_t)n * sz; if (total == 0) total = 1;
     uint32_t p = (uint32_t)rt_malloc(total);
@@ -215,16 +215,16 @@ uint32_t env_calloc(uint32_t n, uint32_t sz) {
     return p;
 }
 uint32_t env_memset(uint32_t s, uint64_t c, uint32_t n) { memset(MEM + s, (int)c, (size_t)n); return s; }
-uint64_t env_memcmp(uint32_t a, uint32_t b, uint32_t n) {
+uint32_t env_memcmp(uint32_t a, uint32_t b, uint32_t n) {
     int r = memcmp(MEM + a, MEM + b, (size_t)n);
-    return (uint64_t)(int64_t)(r < 0 ? -1 : (r > 0 ? 1 : 0));
+    return (uint32_t)(int32_t)(r < 0 ? -1 : (r > 0 ? 1 : 0));
 }
 uint32_t env_strlen(uint32_t p) { return (uint32_t)strlen(hoststr(p)); }
 
 // ---- file / directory I/O ----
-uint32_t env_open(uint32_t path, uint32_t flags) { return (uint32_t)open(hoststr(path), (int)flags, 0666); }
-uint64_t env_creat(uint32_t path, uint64_t mode) {
-    return (uint64_t)(int64_t)open(hoststr(path), O_CREAT | O_WRONLY | O_TRUNC, (mode_t)mode);
+uint32_t env_open(uint32_t path, uint32_t flags, uint32_t mode) { return (uint32_t)open(hoststr(path), (int)flags, (mode_t)mode); }
+uint32_t env_creat(uint32_t path, uint32_t mode) {
+    return (uint32_t)open(hoststr(path), O_CREAT | O_WRONLY | O_TRUNC, (mode_t)mode);
 }
 uint32_t env_read(uint32_t fd, uint32_t ptr, uint32_t len) {
     return (uint32_t)(int32_t)read((int)fd, MEM + ptr, (size_t)len);
@@ -233,7 +233,7 @@ uint32_t env_write(uint32_t fd, uint32_t ptr, uint32_t len) {
     return (uint32_t)(int32_t)write((int)fd, MEM + ptr, (size_t)len);
 }
 uint32_t env_close(uint32_t fd) { if (fd > 2) close((int)fd); return 0; }
-uint32_t env_access(uint32_t path, uint64_t mode) { return (uint32_t)access(hoststr(path), (int)mode); }
+uint32_t env_access(uint32_t path, uint32_t mode) { return (uint32_t)access(hoststr(path), (int)mode); }
 uint32_t env_unlink(uint32_t path) { return (uint32_t)unlink(hoststr(path)); }
 uint32_t env_rename(uint32_t a, uint32_t b) { return (uint32_t)rename(hoststr(a), hoststr(b)); }
 uint32_t env_realpath(uint32_t path, uint32_t out) {
@@ -243,7 +243,7 @@ uint32_t env_realpath(uint32_t path, uint32_t out) {
     memcpy(MEM + out, buf, n);
     return out;
 }
-uint32_t env_getcwd(uint32_t buf, uint64_t size) {
+uint32_t env_getcwd(uint32_t buf, uint32_t size) {
     if (getcwd((char *)(MEM + buf), (size_t)size) == NULL) return 0;
     return buf;
 }
@@ -396,8 +396,8 @@ uint32_t env_snprintf(uint32_t buf, uint64_t size, uint32_t fmt, uint32_t arg) {
     }
     return (uint32_t)n;
 }
-uint64_t env_putchar(uint64_t c) { putchar((int)(c & 0xff)); return c & 0xff; }
-uint64_t env_puts(uint32_t p) { fputs(hoststr(p), stdout); putchar('\n'); return 1; }
+uint32_t env_putchar(uint32_t c) { return (uint32_t)putchar((int)(c & 0xff)); }
+uint32_t env_puts(uint32_t p) { return (uint32_t)puts(hoststr(p)); }
 
 // ---- math ----
 double env_sqrt(double x) { return sqrt(x); }
@@ -412,8 +412,8 @@ double env_fma(double x, double y, double z) { return fma(x, y, z); }
 float  env_fmaf(float x, float y, float z) { return fmaf(x, y, z); }
 
 // ---- process ----
-uint64_t env_abort(void) { die("env.abort() called"); return 0; }
-uint64_t env_exit(uint32_t code) { exit((int)(code & 0xff)); }
+void env_abort(void) { die("env.abort() called"); }
+void env_exit(uint32_t code) { exit((int)(code & 0xff)); }
 uint32_t env_system(uint32_t cmd) { return (uint32_t)system(hoststr(cmd)); }
 // The guest has no native exit handlers to run; accepting a registration is
 // the documented no-op, as in runtime.c.
@@ -464,11 +464,11 @@ uint32_t env_pthread_attr_destroy(uint32_t a) { (void)a; return 0; }
 // ---- DEAD imports: abort LOUDLY (comptime is pure interpretation) ----
 uint32_t env_pthread_create(uint32_t a, uint32_t b, uint32_t c, uint32_t d) { (void)a;(void)b;(void)c;(void)d; die("unreachable: env.pthread_create"); return 0; }
 uint32_t env_pthread_join(uint32_t a, uint32_t b) { (void)a;(void)b; die("unreachable: env.pthread_join"); return 0; }
-uint64_t env_pthread_exit(uint32_t a) { (void)a; die("unreachable: env.pthread_exit"); return 0; }
+void env_pthread_exit(uint32_t a) { (void)a; die("unreachable: env.pthread_exit"); }
 uint32_t env_mmap(uint32_t a, uint64_t b, uint32_t c, uint32_t d, uint32_t e, uint64_t f) { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; die("unreachable: env.mmap"); return 0; }
 uint32_t env_munmap(uint32_t a, uint64_t b) { (void)a;(void)b; die("unreachable: env.munmap"); return 0; }
 uint32_t env_mprotect(uint32_t a, uint64_t b, uint32_t c) { (void)a;(void)b;(void)c; die("unreachable: env.mprotect"); return 0; }
-uint32_t env_dlopen(uint32_t a, uint64_t b) { (void)a;(void)b; die("unreachable: env.dlopen"); return 0; }
+uint32_t env_dlopen(uint32_t a, uint32_t b) { (void)a;(void)b; die("unreachable: env.dlopen"); return 0; }
 uint32_t env_dlsym(uint32_t a, uint32_t b) { (void)a;(void)b; die("unreachable: env.dlsym"); return 0; }
 uint32_t env_dlclose(uint32_t handle) { (void)handle; die("unreachable: env.dlclose"); return 0; }
 uint32_t env_dlerror(void) { die("unreachable: env.dlerror"); return 0; }
