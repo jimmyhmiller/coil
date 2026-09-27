@@ -111,6 +111,9 @@ else
       "$(cat "$T/no-child-build.stderr")"
 fi
 
+echo "== cimport: system headers, selection, anonymous typedef records =="
+expect_rc 0 "cimport gate passes" bash scripts/compiler/oracle/gate-cimport.sh "$COIL"
+
 echo "== compile-time reader metaprograms =="
 scripts/tests/reader-metaprograms.sh "$COIL" \
   && ok "generic readers cover check/build/run, ambiguity, parity, and strict installed layout" \

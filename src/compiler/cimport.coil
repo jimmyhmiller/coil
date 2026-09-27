@@ -446,6 +446,27 @@
    (enums (ptr (HashMap (slice u8) (slice u8))))])
 
 ; ============================ type mapping ==================================
+;;; Remove every `__attribute__((…))` clause. GNU attributes such as noreturn
+;;; appear in clang's spelled function types and carry no ABI information.
+(defn remove-attributes [(a (dyn Allocator)) (s (slice u8))] (-> (slice u8))
+  (let [pat "__attribute__"
+        m (len pat)
+        n (len s)
+        (mut out) (sb-new a)
+        (mut i) 0]
+    (while (< i n)
+      (let [open (+ i m)]
+        (if (and (<= open n)
+                 (= (subslice [u8] s i open) pat)
+                 (< open n)
+                 (= (cast i64 (get s open)) 40))
+            (let [close (matching-paren s open)]
+              (if (< close 0)
+                  (do (sb-push-byte! (mut out) (get s i)) (set! i (+ i 1)))
+                  (set! i (+ close 1))))
+            (do (sb-push-byte! (mut out) (get s i)) (set! i (+ i 1))))))
+    (sb-str (load out))))
+
 (defn normalize [(a (dyn Allocator)) (c (slice u8))] (-> (slice u8))
   (trim (remove-all a
                     (remove-all a
@@ -453,7 +474,7 @@
                                             (remove-all a
                                                         (remove-all a
                                                                     (remove-all a
-                                                                                (trim c)
+                                                                                (trim (remove-attributes a c))
                                                                                 "const")
                                                                     "volatile")
                                                         "restrict")
@@ -469,7 +490,11 @@
         (or (= s "int") (or (= s "signed int") (= s "signed"))) (Some "i32")
         (or (= s "unsigned int") (= s "unsigned")) (Some "u32")
         (or (= s "long") (= s "long int")) (Some "i64")
-        (or (= s "unsigned long") (= s "unsigned long int")) (Some "u64")
+        (or (= s "unsigned long")
+            (or (= s "unsigned long int") (= s "long unsigned int")))
+          (Some "u64")
+        (= s "short unsigned int") (Some "u16")
+        (= s "long long unsigned int") (Some "u64")
         (or (= s "long long") (= s "long long int")) (Some "i64")
         (or (= s "unsigned long long") (= s "unsigned long long int"))
           (Some "u64")
@@ -1481,6 +1506,31 @@
                 (set! i (primitive/iadd (load i) 1)))))
     0))
 
+; Clang spells size_t and ptrdiff_t through predefined typedefs (`__size_t`,
+; `__ptrdiff_t`, `__signed_size_t`) that no header declares. Their definitions
+; are the target's __SIZE_TYPE__ and __PTRDIFF_TYPE__ macros.
+(defn seed-predefined-typedefs [(a (dyn Allocator)) (macros (slice u8)) (ctx (ptr Ctx))]
+  (-> i64)
+  (for line (iter (load (each-line a macros)))
+    (match (parse-define line)
+      (Some [d]
+            (cond (= (def-name d) "__SIZE_TYPE__")
+                    (do
+                      (seed-typedef! ctx "__size_t" (def-body d))
+                      (seed-typedef! ctx
+                                     "__signed_size_t"
+                                     (trim (remove-all a (def-body d) "unsigned"))))
+                  (= (def-name d) "__PTRDIFF_TYPE__")
+                    (seed-typedef! ctx "__ptrdiff_t" (def-body d))
+                  :else 0))
+      (None [] 0)))
+  0)
+
+(defn seed-typedef! [(ctx (ptr Ctx)) (name (slice u8)) (under (slice u8))] (-> i64)
+  (match (get (load (field ctx typedefs)) name)
+    (Some [_] 0)
+    (None [] (do (set! (load (field ctx typedefs)) name under) 0))))
+
 ; ============================ #define pass =================================
 
 ; Parse a "#define NAME body" line → Some(name,body); None for function-like/malformed.
@@ -1852,6 +1902,42 @@
 (defn emit-file? [(f (slice u8)) (header (slice u8))] (-> bool)
   (or (same-file f header) (not (sys-path? f))))
 
+; Which file included which, from clang's `includedFrom` on each file's first
+; declaration. Collected before emission because a header's first declaration
+; can follow those of the headers it includes.
+(defn collect-includers [(a (dyn Allocator)) (top (ArrayList Json))]
+  (-> (ptr (HashMap (slice u8) (slice u8))))
+  (let [m (box! a (HashMap (slice u8) (slice u8)) (hm-new [(slice u8) (slice u8)] a (str-keyops)))]
+    (for d (iter top)
+      (let [loc (jget d "loc")]
+        (match (jgets loc "file")
+          (Some [f]
+                (match (jgets (jget loc "includedFrom") "file")
+                  (Some [g] (set! m f g))
+                  (None [] 0)))
+          (None [] 0))))
+    m))
+
+; A system header is often a thin wrapper: macOS <stdlib.h> declares qsort and
+; abs in <_stdlib.h>, which it includes. So a file reached from the requested
+; header through system headers only is part of the requested API. A project
+; header's own system includes stay out: their includer is not a system header.
+(defn header-scope? [(includers (ptr (HashMap (slice u8) (slice u8))))
+                     (header (slice u8))
+                     (f (slice u8))] (-> bool)
+  (let [(mut at) f
+        (mut depth) 0]
+    (loop
+      (cond (same-file at header) (break true)
+            (> depth 64) (break false)
+            :else
+              (match (get includers at)
+                (Some [g]
+                      (if (sys-path? g)
+                          (do (set! at g) (set! depth (+ depth 1)) (continue))
+                          (break false)))
+                (None [] (break false)))))))
+
 (defn selected-name? [(names (ptr (ArrayList (slice u8))))
                       (selecting bool)
                       (name (slice u8))] (-> bool)
@@ -1874,6 +1960,89 @@
 ; nominal identity as an empty Coil struct only when Clang did not also give us a
 ; complete definition.  (Headers commonly forward-declare a record before defining
 ; it, and emitting the placeholder in that case would hide the real fields.)
+;;; `typedef struct { … } div_t;` declares a record with no name and a typedef
+;;; that owns it. Name each such record after its typedef, so the struct is
+;;; emitted under the name the header's functions use.
+(defn name-anonymous-records! [(a (dyn Allocator)) (top (ArrayList Json))] (-> i64)
+  (let [owners
+          (box! a (HashMap (slice u8) (slice u8)) (hm-new [(slice u8) (slice u8)] a (str-keyops)))]
+    (for d (iter top)
+      (when (= (jkind d) "TypedefDecl")
+        (match (jinner d)
+          (Some [inner]
+                (for t (iter (load inner))
+                  (when (and (= (jkind t) "RecordType") (jbool-true? t "isTagOwned"))
+                    (let [decl (jget t "decl")]
+                      (when (= (jstr-or (jgets decl "name") "") "")
+                        (match (jgets decl "id")
+                          (Some [id] (do (set! owners id (jname d)) 0))
+                          (None [] 0)))))))
+          (None [] 0))))
+    (for d (iter top)
+      (when (and (= (jkind d) "RecordDecl") (= (jstr-or (jgets d "name") "") ""))
+        (match (jgets d "id")
+          (Some [id]
+                (match (get owners id)
+                  (Some [name]
+                        (match d
+                          (JObj [o] (do (set! o "name" (JStr name)) 0))
+                          (_ 0)))
+                  (None [] 0)))
+          (None [] 0))))
+    0))
+
+;;; A record the caller did not select is held back: it is emitted only if an
+;;; emitted declaration needs it (see emit-needed-records!).
+(defn record-out! [(structs (mut StrBuf))
+                   (deferred (ptr (HashMap (slice u8) (slice u8))))
+                   (defer? bool)
+                   (name (slice u8))
+                   (text (slice u8))] (-> i64)
+  (if defer?
+      (do (set! deferred name text) 0)
+      (do (sb-push-str! (mut structs) text) 0)))
+
+(defn name-byte? [(c u8)] (-> bool)
+  (let [n (cast i64 c)]
+    (not (or (= n 32) (= n 40) (= n 41) (= n 91) (= n 93) (= n 10)))))
+
+;;; Whether `text` mentions `name` as a whole token.
+(defn mentions-name? [(text (slice u8)) (name (slice u8))] (-> bool)
+  (let [n (len text)
+        m (len name)
+        (mut i) 0]
+    (loop
+      (cond (> (+ i m) n) (break false)
+            (and (= (subslice [u8] text i (+ i m)) name)
+                 (or (= i 0) (not (name-byte? (get text (- i 1)))))
+                 (or (= (+ i m) n) (not (name-byte? (get text (+ i m))))))
+              (break true)
+            :else (do (set! i (+ i 1)) (continue))))))
+
+;;; Emit every deferred record that the emitted structs and externs mention,
+;;; to a fixpoint: a selected `stat` pulls in the `timespec` its fields use.
+(defn emit-needed-records! [(a (dyn Allocator))
+                            (structs (mut StrBuf))
+                            (deferred (ptr (HashMap (slice u8) (slice u8))))
+                            (externs (slice u8))] (-> i64)
+  (let [(mut changed) true]
+    (while (load changed)
+      (set! changed false)
+      (let [text (cat a (sb-str (load structs)) externs)
+            (mut found) (al-new [(slice u8)] a)]
+        (for name (iter deferred)
+          (when (mentions-name? text name) (push! (mut found) name)))
+        (for name (iter found)
+          (match (get deferred name)
+            (Some [t]
+                  (do
+                    (sb-push-str! (mut structs) t)
+                    (hm-remove! deferred name)
+                    (set! changed true)
+                    0))
+            (None [] 0))))))
+  0)
+
 (defn collect-complete-records [(a (dyn Allocator))
                                 (top (ArrayList Json))] (-> (ptr (HashMap (slice u8)
                                                                           i64)))
@@ -1918,11 +2087,15 @@
                   (box! a
                         (HashMap (slice u8) (slice u8))
                         (hm-new [(slice u8) (slice u8)] a (str-keyops)))
-                complete-records (collect-complete-records a (load top))
+                complete-records
+                  (do
+                    (name-anonymous-records! a (load top))
+                    (collect-complete-records a (load top)))
                 ctx (primitive/alloc-stack Ctx)]
             (set! (.typedefs ctx) tdefs)
             (set! (.enums ctx) enms)
             (collect-types a (load top) ctx)
+            (seed-predefined-typedefs a (dump-macros a "" "base" flags) ctx)
             (let [(mut structs) (sb-new a)
                   (mut externs) (sb-new a)
                   (mut consts) (sb-new a)
@@ -1932,6 +2105,11 @@
                           (HashMap (slice u8) i64)
                           (hm-new [(slice u8) i64] a (str-keyops)))
                   (mut from-header) false
+                  includers (collect-includers a (load top))
+                  deferred
+                    (box! a
+                          (HashMap (slice u8) (slice u8))
+                          (hm-new [(slice u8) (slice u8)] a (str-keyops)))
                   (mut i) 0
                   n (len (load top))]
               (loop (if (>= (load i) n)
@@ -1940,19 +2118,28 @@
                           (match (jgets (jget d "loc") "file")
                             (Some [f]
                                   (do
-                                    (set! from-header (emit-file? f header))
+                                    (set! from-header
+                                          (or (emit-file? f header)
+                                              (header-scope? includers header f)))
                                     0))
                             (None [] 0))
                           ; Records from included system headers are ABI dependencies of
                           ; public typedefs (pthread and socket headers rely on this).
-                          ; Other declaration kinds remain scoped to the requested or
-                          ; project header so cimport does not expose an entire SDK API.
+                          ; Other declaration kinds remain scoped to the requested
+                          ; header's API (see header-scope?) or the project's headers,
+                          ; unless selected by name, so cimport does not expose an
+                          ; entire SDK API.
                           (let [k (jkind d)]
                             (unless (or (and (not (load from-header))
-                                             (not (= k "RecordDecl")))
+                                             (not (= k "RecordDecl"))
+                                             ; A name the caller selected is
+                                             ; wanted wherever it is declared.
+                                             (not (and selecting
+                                                       (selected-name? names
+                                                                       selecting
+                                                                       (jname d)))))
                                         (and (or (= k "FunctionDecl")
-                                                 (or (= k "RecordDecl")
-                                                     (= k "EnumDecl")))
+                                                 (= k "EnumDecl"))
                                              (not (selected-name? names
                                                                   selecting
                                                                   (jname d)))))
@@ -1995,7 +2182,7 @@
                                                                 (set! seen
                                                                       key
                                                                       1)
-                                                                (sb-push-str! (mut structs)
+                                                                (record-out! (mut structs) deferred (and selecting (not (selected-name? names selecting (jname d)))) (jname d)
                                                                               s))))))
                                               (None []
                                                     (match (get (load complete-records)
@@ -2014,7 +2201,7 @@
                                                                         (set! seen
                                                                               key
                                                                               1)
-                                                                        (sb-push-str! (mut structs)
+                                                                        (record-out! (mut structs) deferred (and selecting (not (selected-name? names selecting (jname d)))) (jname d)
                                                                                       (cat3 a
                                                                                             "(defstruct "
                                                                                             (jname d)
@@ -2035,16 +2222,20 @@
                                                            (if (> (len opaque)
                                                                   (primitive/cast i64
                                                                                   0))
-                                                               (sb-push-str! (mut structs)
+                                                               (record-out! (mut structs) deferred (and selecting (not (selected-name? names selecting (jname d)))) (jname d)
                                                                              opaque)
-                                                               (push! [(slice u8)]
+                                                               (unless (and selecting
+                                                                            (not (selected-name? names
+                                                                                                 selecting
+                                                                                                 (jname d))))
+                                                                (push! [(slice u8)]
                                                                       (mut skipped)
                                                                       (cat3 a
                                                                             "struct "
                                                                             (jname d)
                                                                             (cat a
                                                                                  " — "
-                                                                                 why)))))))))))
+                                                                                 why))))))))))))
                                     (= k "EnumDecl")
                                       (match (enum-consts a d seen)
                                         (Ok [s] (sb-push-str! (mut consts) s))
@@ -2057,6 +2248,7 @@
                                                           (cat a " — " why)))))
                                     :else 0)))
                           (set! i (primitive/iadd (load i) 1)))))
+              (emit-needed-records! a (mut structs) deferred (sb-str (load externs)))
               ; #define pass
               (let [baseline (each-line a (dump-macros a "" "base" flags))
                     bset
