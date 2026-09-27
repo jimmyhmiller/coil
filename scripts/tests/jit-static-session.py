@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Retained compiler environments, static linkage, and user-owned JIT policy."""
 from pathlib import Path
+import concurrent.futures
 import os
 import shlex
 import subprocess
@@ -66,12 +67,20 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
     run(COMPILER, "build", ROOT / "tests/compiler/features/jit_meta_main.coil", "-o", binary, *flags)
     run(binary, env=dict(TOOLCHAIN_ENV, COIL_META_MAIN="1"))
     print("PASS: jit_meta_main", flush=True)
-    for name in fixtures:
+    # Each fixture is its own SDK host with its own binary and JIT sessions, so
+    # they build and run concurrently. COIL_JOBS=1 runs them one at a time.
+    def build_and_run(name):
         binary = work / name
         run(COMPILER, "build", ROOT / f"tests/compiler/features/{name}.coil",
             "-o", binary, *flags)
         run(binary)
-        print(f"PASS: {name}", flush=True)
+        return name
+
+    jobs = int(os.environ.get("COIL_JOBS") or os.cpu_count() or 1)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        for future in concurrent.futures.as_completed(
+                [pool.submit(build_and_run, name) for name in fixtures]):
+            print(f"PASS: {future.result()}", flush=True)
     project = work / "project"
     project.mkdir()
     dep = project / "dependency"

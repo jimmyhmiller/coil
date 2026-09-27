@@ -351,12 +351,7 @@ def test(args: argparse.Namespace) -> None:
     elif args.suite == "cli":
         execute("scripts/compiler/oracle/gate-cli.sh", compiler)
     elif args.suite == "generated":
-        for name in ("digest", "artifact-wire", "codegen-session", "tail-borrow", "extern-aliases",
-                     "dynamic-stack", "union-hfa", "c-aggregate-bounded-read", "namespace-index-memory",
-                     "sparse-static", "oracle-corpus", "provider-artifacts", "generated-modules",
-                     "binding_macros", "jit-source-graph", "jit-session-memory", "jit-static-session", "jit-single-form", "install-pairing",
-                     "project-scan-memory", "resolve-shadow-scaling", "deferred-emission"):
-            execute(sys.executable, f"scripts/tests/{name}.py", compiler)
+        test_generated(compiler)
     elif args.suite == "runtime":
         execute(sys.executable, "scripts/oracle.py", "runtime", "gate", "arm64", "--compiler", compiler)
     elif args.suite == "http":
@@ -1290,6 +1285,46 @@ def test_meta(compiler: str) -> None:
     if hashlib.sha256(left).digest() != hashlib.sha256(right).digest():
         raise SystemExit("compiled and interpreted metaprogram engines produced different compilers")
     print("metaprogram engines: PASS")
+
+
+# The generated-unit, reader-artifact and storage regressions. Each script owns a
+# private temporary directory and measures only its own processes, so they run
+# concurrently; the longest are listed first so they start first. COIL_JOBS=1
+# restores serial execution when a failure needs to be read on its own.
+GENERATED_SCRIPTS = (
+    "jit-static-session", "jit-session-memory", "generated-modules", "jit-source-graph",
+    "extern-aliases", "artifact-wire", "codegen-session", "binding_macros", "jit-single-form",
+    "install-pairing", "dynamic-stack", "sparse-static", "namespace-index-memory",
+    "provider-artifacts", "project-scan-memory", "resolve-shadow-scaling", "deferred-emission",
+    "digest", "tail-borrow", "c-aggregate-bounded-read", "union-hfa", "oracle-corpus",
+)
+
+
+def test_generated(compiler: str) -> None:
+    override = os.environ.get("COIL_JOBS")
+    workers = max(1, int(override)) if override else max(1, os.cpu_count() or 1)
+    started = time.monotonic()
+
+    def run_script(name: str) -> tuple[str, int, str, float]:
+        begin = time.monotonic()
+        result = subprocess.run([sys.executable, f"scripts/tests/{name}.py", compiler], cwd=ROOT,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        return name, result.returncode, result.stdout, time.monotonic() - begin
+
+    failed = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(GENERATED_SCRIPTS))) as pool:
+        futures = [pool.submit(run_script, name) for name in GENERATED_SCRIPTS]
+        for future in concurrent.futures.as_completed(futures):
+            name, code, output, elapsed = future.result()
+            print(f"== {name} ({elapsed:.1f}s): {'ok' if code == 0 else f'FAIL exit {code}'}", flush=True)
+            if code != 0 or os.environ.get("COIL_VERBOSE") == "1":
+                print(output, end="" if output.endswith("\n") else "\n", flush=True)
+            if code != 0:
+                failed.append(name)
+    elapsed = time.monotonic() - started
+    if failed:
+        raise SystemExit(f"generated suite: {len(failed)} failed ({', '.join(sorted(failed))}) in {elapsed:.1f}s")
+    print(f"generated suite: {len(GENERATED_SCRIPTS)} scripts passed in {elapsed:.1f}s")
 
 
 def test_http(compiler: str) -> None:
