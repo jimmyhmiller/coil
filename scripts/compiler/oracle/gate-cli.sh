@@ -114,6 +114,30 @@ fi
 echo "== cimport: system headers, selection, anonymous typedef records =="
 expect_rc 0 "cimport gate passes" bash scripts/compiler/oracle/gate-cimport.sh "$COIL"
 
+echo "== externref never reaches linear memory =="
+# A wasm reference lives in locals, parameters and results. Every position that
+# would store it in linear memory is a checker error, never a compiler
+# abort in layout or codegen.
+externref_case() {
+  local name=$1 want=$2 body=$3
+  printf '(module externref_%s)\n(extern js_get :cc c [] (-> externref))\n%s\n' "$name" "$body" > "$T/externref-$name.coil"
+  expect_out "$want" "externref: $name is a checker error, not a compiler abort" \
+    "$COIL" build "$T/externref-$name.coil" --target wasm32-unknown-unknown -o "$T/externref-$name.wasm"
+}
+externref_case field 'externref cannot be a field' \
+  '(defstruct Holder [(r externref)]) (defn main [] (-> i64) (let [h (Holder :r (js_get))] 0))'
+externref_case pointer 'externref cannot be behind a pointer' \
+  '(defn main [] (-> i64) (let [p (cast (ptr externref) 0)] 0))'
+externref_case array 'externref cannot be an array, slice or vec element' \
+  '(defn main [] (-> i64) (let [a (: [(js_get)] (array externref 1))] 0))'
+externref_case literal 'externref cannot be an array, slice or vec element' \
+  '(defn main [] (-> i64) (let [a [(js_get)]] 0))'
+externref_case generic 'externref cannot be a type argument' \
+  '(defn main [] (-> i64) (let [o (Some (js_get))] 0))'
+printf '(module externref_local)\n(extern js_get :cc c [] (-> externref))\n(extern js_use :cc c [externref] (-> i32))\n(defn id [T] [(x T)] (-> T) x)\n(defn main [] (-> i64) (let [(mut r) (js_get)] (set! r (id (js_get))) (cast i64 (js_use r))))\n' > "$T/externref-local.coil"
+expect_rc 0 "externref: locals, parameters, results and generic functions still compile" \
+  "$COIL" build "$T/externref-local.coil" --target wasm32-unknown-unknown -o "$T/externref-local.wasm"
+
 echo "== compile-time reader metaprograms =="
 scripts/tests/reader-metaprograms.sh "$COIL" \
   && ok "generic readers cover check/build/run, ambiguity, parity, and strict installed layout" \
