@@ -4985,6 +4985,12 @@ else
   bad "prebuilt = true end to end" "the app with a prebuilt dependency did not build"
 fi
 
+echo "== stdlib profiles: hermetic and core providers =="
+# Nothing else ran this script, and every hermetic case was failing: the binding
+# runtime every destructuring program loads imported coil.slice.
+expect_rc 0 "hermetic and core-provider profiles (scripts/tests/core-providers.sh)" \
+  scripts/tests/core-providers.sh "$COIL"
+
 echo "== standard-library unit suites =="
 # The deftest files under tests/ that guard standard-library behavior. Each is its
 # own `coil test` run so a failure names the file.
