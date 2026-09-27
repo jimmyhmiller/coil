@@ -3375,13 +3375,13 @@ expect_out "export-c defines C symbol 'callback_c'.*extern.*imports it.*remove t
 
 echo "== focused guide lookup =="
 expect_out '^  tests[[:space:]]+deftest' "guide: no argument prints the compact topic index" "$COIL" guide
-expect_out '^## Tests, assertions, debug checks' "guide: canonical topic prints only its section" "$COIL" guide tests
+expect_out '^## Tests$' "guide: canonical topic prints only its section" "$COIL" guide tests
 expect_out 'defstruct Point' "guide: a topic alias resolves to its canonical section" "$COIL" guide struct
-expect_out 'primitive/zeroed T' "guide: search returns a contextual excerpt" "$COIL" guide --search zeroed
-expect_out 'primitive/cast i64 f' "guide: multiword search tolerates ordinary word endings" "$COIL" guide --search "f64 conversion"
+expect_out 'zeroed T' "guide: search returns a contextual excerpt" "$COIL" guide --search zeroed
+expect_out 'cast T x' "guide: multiword search tolerates ordinary word endings" "$COIL" guide --search "f64 conversion"
 expect_out '^  structs —' "guide: broad concept search ranks the focused structs topic first" \
   "$COIL" guide --search "array struct field match"
-expect_out '^  test-suites —' "guide: project-test vocabulary routes to test-suites" \
+expect_out '^  testing —' "guide: project-test vocabulary routes to testing" \
   "$COIL" guide --search "test roots suffixes import project module"
 expect_out '^  match —' "guide: enum/variant vocabulary routes to match" \
   "$COIL" guide --search "defsum match enum"
@@ -3392,10 +3392,10 @@ expect_out '^## Structs' "guide: multiple direct topics print the first requeste
 expect_out '^## Sum types' "guide: multiple direct topics print subsequent sections" \
   "$COIL" guide structs match
 combined_float=$("$COIL" guide types floats 2>&1)
-combined_number_headings=$(printf '%s\n' "$combined_float" | awk '/^## Numbers, bool, casts$/ { n++ } END { print n+0 }')
+combined_number_headings=$(printf '%s\n' "$combined_float" | awk '/^## Values and types$/ { n++ } END { print n+0 }')
 [ "$combined_number_headings" = 1 ] \
   && ok "guide: combined topics deduplicate shared source fragments" \
-  || bad "guide: combined topics deduplicate shared source fragments" "Numbers section appeared $combined_number_headings times"
+  || bad "guide: combined topics deduplicate shared source fragments" "Values section appeared $combined_number_headings times"
 expect_rc 1 "guide: at most three direct topics are accepted" "$COIL" guide tests modules structs match
 guide_all=$("$COIL" guide --all 2>&1); guide_all_rc=$?
 case "$guide_all" in

@@ -1,128 +1,108 @@
 # Coil cheatsheet
 
-Coil is a typed, ahead-of-time, Lisp-syntax language. Forms are
-`(operation argument...)`; the last expression in a function or `do` is its
-value. Use `coil guide` for focused topics or `coil guide --all` for the complete
-reference.
+Coil is a typed, ahead-of-time compiled language with Lisp syntax. Forms are
+`(operation argument…)`, and the last expression of a body is its value.
+`coil guide TOPIC` prints one section of the language guide; `coil guide` lists
+the topics.
 
-Focused reference lookup:
+## Commands
 
-    coil guide tests          # deftest, assert, discovery
-    coil guide test-suites    # test roots, suffixes, configuration
-    coil guide modules        # module, import, source-roots
-    coil guide structs        # fields, zeroed, load/store
-    coil guide match          # defsum, variants, exhaustive match
-    coil guide operators      # %, arithmetic, comparisons
-    coil guide types          # numeric casts
-    coil guide floats         # f64 arithmetic and conversion
+```text
+coil run app.coil                  # build and run
+coil build app.coil -o app         # native executable
+coil check app.coil                # typecheck only
+coil test tests.coil               # run deftest / defprop
+coil lint app.coil --fix           # apply the standard fixes
+coil fmt app.coil --write
+coil repl
+coil namespace coil.arraylist      # a library module's API
+```
 
-Run `coil guide` for the complete topic index. Prefer direct topics; combine up
-to three when needed. Use `--search` for one or two specific terms rather than a
-list of concepts.
+## A program
 
-## Run and explore
+```coil
+(module example.cheatsheet)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [al-new al-free!])
 
-    coil run app.coil                  # build and run
-    coil build app.coil -o app         # native executable
-    coil check app.coil                # typecheck only
-    coil test tests.coil               # run deftest forms
-    coil repl
-    coil fmt app.coil --write
-    coil namespace coil.arraylist      # inspect a library module
+(defstruct Point [(x i64) (y i64)])
 
-## A small program
+(impl Point
+  (norm2 [(p Point)] (-> i64) (+ (* (.x p) (.x p)) (* (.y p) (.y p))))
+  (shift! [(p (mut Point)) (dx i64)] (-> i64) (set! (.x p) (+ (.x p) dx)) 0))
 
-    (module example)
-    (import "coil.alloc" :as alloc)
+(defsum Shape (Circle [(r i64)]) (Square [(side i64)]))
 
-    (defstruct Point [(x i64) (y i64)])
+(defn area [(s Shape)] (-> i64)
+  (match s
+    (Circle [r] (* 3 (* r r)))
+    (Square [side] (* side side))))
 
-    (defn distance-squared [(p Point)] (-> i64)
-      (+ (* (load (field p x)) (load (field p x)))
-         (* (load (field p y)) (load (field p y)))))
+(defn main [] (-> i64)
+  (let [(mut p) (Point :x 3 :y 4)
+        (mut xs) (al-new [i64] (malloc-allocator))]
+    (shift! (mut p) 1)
+    (push! (mut xs) (area (Circle 1)))
+    (push! (mut xs) (area (Square 2)))
+    (for a (iter xs) (println "area {}" a))
+    (println "norm2 {}" (norm2 p))
+    (al-free! (mut xs))
+    0))
+```
 
-    (defn main [] (-> i64)
-      (let [p (Point :x 3 :y 4)]
-        (println "distance squared: {}" (distance-squared p))
-        0))
+```output
+area 3
+area 4
+norm2 32
+```
 
-## Definitions and types
+## Definitions
 
-    (defn add [(a i64) (b i64)] (-> i64) (+ a b))
-    (defn id [T] [(x T)] (-> T) x)       ; generic
-    (const answer i64 42)
-    (defstruct Pair [T] [(left T) (right T)])
-    (defsum Option [T] (None) (Some [(value T)]))
+```text
+(defn add [(a i64) (b i64)] (-> i64) (+ a b))
+(defn id [T] [(x T)] (-> T) x)                 ; generic
+(defn biggest [(T Ord)] [(a T) (b T)] (-> T) …) ; bounded generic
+(defstruct Pair [T] [(left T) (right T)])
+(defsum Option [T] (None) (Some [(value T)]))
+(deftrait Area [Self] (area [(x Self)] (-> i64)))
+(impl Area Point (area [(p Point)] (-> i64) …))
+(derive Debug Eq Clone Point)                  ; Debug needs (import "coil.debug" :use *)
+(const LIMIT 64)                               ; compile-time
+(defn twice [(x Code)] (-> Code) `(+ ~x ~x))    ; a macro: Code -> Code
+```
 
-Scalars: `bool`, `i8`/`i16`/`i32`/`i64`, `u8`/`u32`/`u64`, `f32`/`f64`.
-Compound types: `(ptr T)`, `(slice T)`, `(array T N)`, `(mut T)`.
-Strings are UTF-8 `(slice u8)`; `c"text"` is a NUL-terminated `(ptr i8)`.
+Types: `i8`…`i64`, `u8`…`u64`, `f32`, `f64`, `bool`, `(ptr T)`, `(slice T)`,
+`(array T N)`, `(fnptr c [Args…] R)`. Strings are UTF-8 `(slice u8)`; `c"text"`
+is a C `(ptr i8)`.
 
-## Values and control flow
+## Expressions
 
-    (let [x 10 (mut total) 0]            ; immutable value + mutable cell
-      (store! total (+ (load total) x)))
-    (if condition then-value else-value) ; both branches required, same type
-    (do effect-a effect-b result)
-    (cond test-a value-a test-b value-b :else fallback)
-    (loop ... (continue) ... (break result))
-    (match value
-      (Some [x] x)
-      (None [] 0))                       ; exhaustive; (_ fallback) catches rest
+```text
+(let [x 10 (mut total) 0] … (set! total (+ total x)))
+(if test then else)                  ; both branches, same type
+(cond a 1 b 2 :else 3)   (case n 1 "one" 2 "two" "many")
+(when test body…)   (unless test body…)
+(for x (iter xs) …)   (for i (range 0 n) …)   (while test …)
+(block :done … (return-from :done v))
+(match v (Some [x] x) (None [] 0))   ; exhaustive; (_ …) catches the rest
+(Point :x 1 :y 2)   (.x p)   (set! (.x p) 5)   (Circle 3)
+(len xs) (get xs i) (set! (mut xs) i v) (push! (mut xs) v) (pop! (mut xs))
+(println "{} {:?}" a b)
+(cast i64 f)   (: 200 u8)
+```
 
-There is no `return`; use expression values, or
-`(block :done ... (return-from :done value))`.
-
-## Operators
-
-    (+ a b) (- a b) (* a b) (/ a b) (% a b)
-    (= a b) (!= a b) (< a b) (<= a b) (> a b) (>= a b)
-    (and a b) (or a b) (not a)
-    (primitive/cast i64 value)
-
-Clean operators are trait methods. `f64` deliberately has no `=` or `!=`; use
-`primitive/fcmp-eq` or `primitive/fcmp-ne` when float equality is intended.
-
-## Structs, sums, and memory
-
-    (let [p (Point :x 10 :y 20)]
-      (load (field p x)))                 ; field returns a place
-    (let [(mut slot) (Point :x 0 :y 0)]
-      (store! slot (Point :x 1 :y 2)))
-    (let [item (Some 42)]
-      (match item (Some [x] x) (None [] 0)))
-
-`(p Point)` parameters are immutable references, `(p (mut Point))` are mutable
-references, and `(p (ptr Point))` are raw pointers. Pass a mutable place as
-`(mut place)`. Use initialized mutable locals for frame storage and `alloc/box` or
-`alloc/box!` for initialized allocator-owned values. Explicit low-level static
-storage is `(primitive/alloc-static T)`.
-
-## Modules, traits, tests, and FFI
-
-    (module my.app)
-    (import "coil.io" :use [stdout])
-    (import "coil.fmt" :as fmt)
-    (export public-name)
-
-    (deftrait Show [Self] (show [(x Self)] (-> i64)))
-    (impl Show Point (show [(p Point)] (-> i64) 0))
-    (defn use-show [(T Show)] [(x T)] (-> i64) (show x))
-
-    (deftest arithmetic
-      (assert-eq (+ 2 2) 4))
-
-    (extern puts :cc c [(ptr i8)] (-> i32))
-    (puts c"hello")
+Parameters: `(p Point)` is an immutable reference, `(p (mut Point))` a mutable
+one (pass `(mut place)`), and `(p (ptr Point))` a raw pointer.
 
 ## Remember
 
-- Imported files start with `(module name)`; imports name modules, not paths.
-- `main` returns an `i64` process exit code.
-- Reserve `primitive/alloc-stack` for genuinely unsafe/uninitialized storage; it lasts
-  to function exit and must never be placed in a long-running loop.
-- `field` and `index` return places; read with `load`, write with `store!`.
-- Struct constructors require every named field exactly once.
-- `match` is exhaustive, and every `if` branch must have the same type.
+- A file that is imported starts with `(module name)`. Imports name modules, not
+  paths.
+- `main` returns an `i64` exit status.
+- `f64` has no `=`. There is no unary minus: write `(- 0 x)`.
+- `when`, `for` and `while` yield `i64` 0. In a non-`i64` function, end with the
+  value.
+- `primitive/…` needs `(import "coil.primitive" :as primitive)`.
 - `call` and `block` are reserved names.
-- Use `;;;` directly above a definition for API documentation; `;` and `;;` are comments.
+- `;;;` directly above a definition is its documentation; `;` and `;;` are
+  comments.

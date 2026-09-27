@@ -1,216 +1,364 @@
-# Stateful JIT
+# The REPL and the stateful JIT
 
-Import `coil.jit`. One session owns the accepted environment and native code.
-Every submission parses, expands, checks, and emits only its new forms. Later
-submissions can use accepted types, functions, generics, macros, and imports.
+Coil can keep a compiler running inside a process. The terminal REPL is one
+client of it; `coil.jit` lets your own program be another. Both use one
+model: a **session** holds an accepted environment (types, functions, traits,
+impls, macros, generic specializations) plus the native code compiled so far.
+Each submission compiles only its new forms against that environment, and is
+either accepted as a whole or rejected as a whole.
+
+## The terminal REPL
+
+```text
+$ coil repl
+coil> (defn double [(x i64)] (-> i64) (* x 2))
+coil> (defn quad [(x i64)] (-> i64) (double (double x)))
+coil> (quad 3)
+12
+coil> (defn double [(x i64)] (-> i64) (* x 10))
+coil> (quad 3)
+300
+coil> (double :x 3)
+30
+```
+
+Forms may span lines; the prompt changes until the brackets balance. A result
+prints through `Debug` if its type implements it, otherwise `Display`,
+otherwise the REPL says it cannot print that type yet.
+
+| Command | Does |
+|---|---|
+| `:type EXPR` | Show an expression's type without running it |
+| `:load NAMESPACE` | Import a module (from the project, when run in one) |
+| `:compile FORMS` | Submit arbitrary top-level forms, including metaprogram registrations |
+| `:defs` | List current definitions |
+| `:reset` | Throw away the environment and start fresh |
+| `:cancel` | Abandon a half-typed multi-line form |
+| `:help`, `:quit` | |
+
+### What redefinition does
+
+Ordinary non-generic `defn`s are live. Redefining one with the same signature
+updates it everywhere, including in functions compiled earlier, like `quad`
+above. Each REPL function is published through a `Var`: a stable, typed
+function-pointer cell. Callers go through the cell, and a redefinition swaps
+what it holds.
+
+- A redefinition with a different signature, including different parameter
+  names, is rejected, and the working definition stays.
+- A failed submission changes nothing. `alloc-static` storage from accepted
+  submissions survives later ones.
+- Types, macros, generic functions, `def` bindings and `defn*` functions are
+  static: you can't redefine them.
+- A `(module NAME)` form switches the namespace for later input. It does not
+  move existing definitions.
+
+### A project's REPL
+
+Run inside a project, `coil repl` reads its `Coil.toml`, so `:load app.module`
+imports project sources and dependencies.
+
+A native GUI usually has to own the main thread. For that, run
+`coil repl --app package.module` and type `:run`. The module must define three
+functions, each taking no arguments and returning `i64`:
+
+| Function | Called |
+|---|---|
+| `repl-launch` | Once, on `:run`, on the main thread |
+| `redraw` | On the UI thread after each accepted edit |
+| `repl-stop` | On `:quit`, before the session is released |
+
+You type edits on a terminal thread; the REPL compiles and publishes them on
+the UI thread. It loads the frameworks the manifest lists into its own
+process.
+
+### Making an existing module live
+
+Functions compiled in the initial build are normally bound statically, so
+redefining one in the REPL does not reach callers compiled before it. To make
+a module's functions live from the start, add this marker to it:
+
+```text
+(import "coil.repl")
+(defn __repl_vars [] (-> Code) (coil.repl/var-module))
+```
+
+Its runtime functions then use the same `Var` publication as REPL
+definitions. An ordinary ahead-of-time build leaves them at their initial
+values.
+
+## Embedding the compiler: `coil.jit`
 
 ```coil
+(module example.jit-basics)
 (import "coil.alloc" :use [malloc-allocator])
-(import "coil.jit" :as jit)
+(import "coil.jit" :use *)
 
-(let [(mut session) (jit/jit-session-new (malloc-allocator))]
-  (jit/jit-compile! (mut session)
-    "(defstruct Point [(x i64)]) (defn base [] (-> i64) 40)")
-  (jit/jit-compile! (mut session)
-    "(defn answer [] (-> i64) (+ (base) 2))")
-  (jit/jit-compile-with-entry! (mut session) ""
-    "(if (= (answer) 42) 0 1)")
-  (jit/jit-reset! (mut session)))
+(defn main [] (-> i64)
+  (let [(mut session) (jit-session-new (malloc-allocator))]
+    (jit-compile! (mut session)
+      "(defn base [] (-> i64) 40)
+       (defn answer [] (-> i64) (+ (base) 2))
+       (export-c [answer :as \"demo_answer\"])")
+    (let [address (jit-symbol-address (mut session) "demo_answer")
+          answer (cast (fnptr c [] i64) address)]
+      (println "answer = {}" (call-ptr answer)))
+    (jit-reset! (mut session))
+    0))
 ```
 
-Compilation returns zero on acceptance. Read `jit-diagnostic` after failure.
-`jit-compile-with-entry!` evaluates an `i64` entry: zero accepts the candidate;
-nonzero rejects it. Runtime side effects are the metaprogram/client's transaction
-policy. A rejected or aborted candidate does not replace accepted metadata.
-
-Use `jit-prepare!` / `jit-prepare-with-entry!`, then `jit-commit-prepared!` or
-`jit-abort-prepared!`, to control publication separately from compilation.
-`jit-evaluate!` accepts an expression of any type and discards its result.
-
-## Definitions and metaprogram policy
-
-Ordinary definitions are static. Reusing an accepted function identity is an
-error. Dynamic update semantics belong to metaprograms, such as `coil.repl`:
-
-```coil
-(jit/jit-compile-with-entry! (mut session)
-  "(import \"coil.repl\") (defn f [] (-> i64) 15)"
-  "(coil.repl/publish)")
-(jit/jit-compile-with-entry! (mut session)
-  "(defn f [] (-> i64) 27)"
-  "(coil.repl/publish)")
+```output
+answer = 42
 ```
 
-The policy publishes through a typed Var. Existing callers observe compatible
-updates. The terminal REPL enables this policy by default. Types, macros, generic
-functions, and `defn*` definitions remain static.
+Importing `coil.jit` links the compiler into your program; a program that
+doesn't import it links none of it. The installed toolchain ships it as a
+prebuilt unit, so building against it is quick after the first time per
+backend. `jit-session-new` finds the matching toolchain through `coil` on
+`PATH`; `jit-session-new-with-toolchain` takes an explicit compiler command.
 
-For your own publication policy, import `coil.jit.lifetime` in the submitted
-program and annotate generated concrete runtime implementations:
+### Session API
+
+| Call | Returns | Does |
+|---|---|---|
+| `(jit-compile! s SOURCE)` | 0 or nonzero | Compile top-level forms into the session |
+| `(jit-compile-with-entry! s SOURCE ENTRY)` | 0 or nonzero | Compile, then run the `i64` expression ENTRY: 0 accepts, anything else rejects |
+| `(jit-evaluate! s EXPR)` | 0 or nonzero | Evaluate an expression of any type and discard its value |
+| `(jit-prepare! s SOURCE)`, `(jit-prepare-with-entry! s SOURCE ENTRY)` | 0 or nonzero | Compile without publishing |
+| `(jit-commit-prepared! s)`, `(jit-abort-prepared! s)` | | Publish or discard the prepared candidate |
+| `(jit-symbol-address s NAME)` | `(ptr i8)` | Address of an `export-c` symbol; null if absent |
+| `(jit-diagnostic s)`, `(jit-pending s)`, `(jit-status s)` | | Why the last submission failed; the pending candidate |
+| `(jit-reset! s)` | 0, or -1 | Release everything and start empty; -1 while leases are held |
+
+A submission sees everything accepted before it. Never resubmit accepted
+source, because definitions are not overwritten (see below). A `(module NAME)`
+form selects the namespace for later submissions; it starts as `jit.session`.
+
+- Compilation and publication are transactional. A rejected candidate,
+  including one rejected by its entry expression, leaves the accepted
+  environment and native code as they were. Coil does not roll back the
+  entry's own runtime effects; undoing them is the caller's job.
+- Preparing a second candidate aborts the first. There is no API to replace
+  the whole source or replay it.
+- Serialize calls into one session. You may nest calls synchronously, but never
+  call it from two threads at once.
+- The session does not keep the source it was given. If you need a journal,
+  keep one yourself.
+
+### Calling compiled code
+
+To call a function directly, give it a C name with `export-c`, look up its
+address with `jit-symbol-address`, and cast the address only to its exact C
+function-pointer type. An address stays valid while the generation that
+published it is alive. To hold one beyond the current operation, take a lease:
+`jit-generation-retain-current!` returns a token and
+`jit-generation-release-token!` gives it back. `jit-reset!` refuses (returns
+-1) while any lease is outstanding.
+
+To lease without allocating at publication time, reserve capacity first with
+`jit-generation-reserve-tokens!`, then call `jit-generation-retain-reserved!`
+after acceptance. Reserving returns -1 for a bad count and -2 on allocation
+failure. The reserved retain returns -1 if capacity is exhausted or there is
+no current generation.
+
+## Opting into redefinition
+
+Plain SDK sessions are static: redefining an accepted function is an error,
+and existing callers keep what they were compiled against. A metaprogram
+decides whether to hot reload, and the REPL uses `coil.repl`'s policy. Opt in
+by importing it and using its `publish` entry:
 
 ```coil
+(module example.jit-reload)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.jit" :use *)
+
+(defn main [] (-> i64)
+  (let [(mut session) (jit-session-new (malloc-allocator))]
+    (println "first: {}"
+             (jit-compile-with-entry! (mut session)
+               "(import \"coil.repl\") (defn f [] (-> i64) 15)"
+               "(coil.repl/publish)"))
+    (println "replacement: {}"
+             (jit-compile-with-entry! (mut session)
+               "(defn f [] (-> i64) 27)"
+               "(coil.repl/publish)"))
+    (jit-reset! (mut session))
+    0))
+```
+
+```output
+first: 0
+replacement: 0
+```
+
+Under this policy each function gets a fresh implementation identity per
+version, published through a `Var`. Compatible replacements reach existing
+callers. The policy records the identities in transactional session state, so
+it never resubmits earlier bodies. Because such functions are `Var`s,
+`export-c` cannot name them.
+
+A metaprogram implementing its own policy can keep state across submissions
+with `primitive/code-session-state` and `primitive/code-session-stage!`. A
+later stage of the same transaction reads what an earlier stage staged with
+`primitive/code-session-staged-state`.
+
+### Renaming and retiring declarations
+
+`(defalias Name Target)` gives a declaration a second name. It works for types,
+constructors, functions, variants, consts and macros, used bare, through
+imports, or fully qualified. A later submission may point the alias somewhere
+else. New code then binds the new target, while code accepted earlier keeps
+the target it bound:
+
+```coil
+(module example.jit-alias)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.jit" :use *)
+
+(defn main [] (-> i64)
+  (let [(mut session) (jit-session-new (malloc-allocator))]
+    (jit-compile! (mut session)
+      "(defn area-v1 [(w i64) (h i64)] (-> i64) (* w h))
+       (defalias area area-v1)
+       (defn old-caller [] (-> i64) (area 2 3))")
+    (jit-compile! (mut session)
+      "(defn area-v2 [(w i64) (h i64)] (-> i64) (+ (* w h) 1))
+       (defalias area area-v2)
+       (defn new-caller [] (-> i64) (area 2 3))")
+    (println "old and new callers agree with their own versions: {}"
+             (jit-compile-with-entry! (mut session) ""
+               "(if (and (= (old-caller) 6) (= (new-caller) 7)) 0 1)"))
+    (jit-reset! (mut session))
+    0))
+```
+
+```output
+old and new callers agree with their own versions: 0
+```
+
+A submission can also retire accepted declarations, so it can declare
+replacements under the same names:
+
+```text
+(retire-alias Name)             ; the alias stops resolving
+(retire-trait Name)             ; the trait and every impl of it
+(retire-impl [T…] Trait Type)   ; the trait impl with exactly this pattern
+(retire-inherent [T…] Type)     ; inherent impls with exactly this pattern
+```
+
+The replacement may change method signatures. Native code already accepted
+keeps what it bound. Retiring something that is not there has no effect. One
+submission may bind a given name only once.
+
+## Letting generated code go
+
+Metaprograms that generate a new implementation per edit would otherwise keep
+every old version's compiler metadata alive. Mark generated concrete
+definitions so they stop being metadata roots once published:
+
+```text
 (import "coil.jit.lifetime")
 (defn implementation :jit/retain false [] (-> i64) 27)
 ```
 
-`false` excludes that function from the session's metadata roots after publication.
-Its native code can still be called through a published pointer. A retained
-initializer, generic, or metaprogram can keep the compiler definition alive
-through a dependency. An unused implementation loses its compiler metadata.
-The annotation is rejected on generic and Code-returning functions. Omission
-preserves ordinary static retention. Give replacements distinct native identities.
+The native code stays callable through any pointer you hold. The compiler
+metadata survives only while something retained still depends on it (a
+caller, an initializer, a generic). The annotation is rejected on generic and
+`Code`-returning functions.
 
-### Generated types and versioned metadata roots
+Records and sums accept `:jit/retain false` too, before their field or
+variant list. Their impls do not keep them alive by themselves: an impl
+selected by a retired type is dropped along with it, so a migration impl from
+`Old` to `New` does not keep `Old` alive.
 
-Records and sums also accept `:jit/retain false`, before their parameter/field or
-variant list. A submission-only type remains available while retained checked
-functions, initializers, ordinary types, traits or implementations need it.
-Dependencies include nested field types, generic bodies and sum constructors.
-Quoted source alone is not a checked type dependency. Native generation leases
-continue to protect machine code after unused type metadata has retired.
+### Versioned roots
 
-An impl whose selection key includes a submission-only type is conditional
-metadata: its generated methods do not independently keep that type alive.
-The key includes the self type and inferred associated types. A migration impl
-from Old to New therefore does not keep Old alive solely because New survives.
-Retained callers and selected methods still keep their actual dependencies.
-Inherent and generic impls follow the same rule. Retiring such an impl removes
-its lookup entries and specializations together; a native lease continues to
-protect already-published machine code independently.
+A generated schema that must stay constructible until its next revision can be
+kept alive through a versioned root:
 
-For a generated schema that must stay constructible until its next revision,
-publish a fresh descriptor through a versioned metadata root:
-
-```coil
+```text
 (defstruct Physical1 :jit/retain false [(value i64)])
 (defn descriptor1 :jit/retain false :jit/root 1 :jit/root-version 1
   [] (-> Physical1) (Physical1 :value 7))
 ```
 
-A later submission can define `Physical2` and `descriptor2`, using the same
-positive root ID and a larger positive root version. Root IDs are scoped to the
-function's module. Only the newest descriptor is a metadata root; its checked
-call/type dependency closure remains retained. An older descriptor still stays
-if other retained code calls it. Advancing a root to a fresh empty function
-releases its old dependencies when no other roots need them.
+A later submission defines `Physical2` and `descriptor2` with the same root ID
+and a larger version. Only the newest descriptor is a root, and its
+dependencies stay alive; the older version's are released unless something
+else needs them. IDs are scoped to the module. Duplicate updates of one root
+in a submission, stale versions, non-positive values, and root annotations
+without `:jit/retain false` are errors. A rejected candidate does not advance
+a root.
 
-The compiler rejects duplicate updates to one root in a submission, stale
-versions, missing/nonpositive IDs or versions, and root annotations without
-`:jit/retain false`. A rejected candidate does not advance the accepted root.
-This is compiler metadata ownership; it does not replace the host's native code
-leases or state publication transaction.
+## Checked states as values
 
-The structural `code-session-monomorphs` report is rebuilt from the native
-program supplied to the accepted compilation. That program already includes
-still-live reused specializations. Reports do not union all earlier reports:
-retired artifacts disappear when they leave the compiler's native table, while
-unrelated live artifacts remain. Rejected or aborted candidates do not replace
-the accepted report.
+A checked-only session (`jit-checked-session-new`) can hand out compiler states
+as values, for tools like a live type checker that never run code.
 
-## Compiler states as values
+| Call | Does |
+|---|---|
+| `(jit-env-empty)` | The state to build the first one on |
+| `(jit-env-check s BASE SOURCE)` | Check SOURCE against BASE; returns a new state. BASE is unchanged |
+| `(jit-env-valid? E)` | False for the empty state and for a failed check (see `jit-diagnostic`) |
+| `(jit-env-defines? s E NAME)`, `(jit-env-live-function allocator s E …)` | Query a state |
+| `(jit-env-stale-count s E)`, `(jit-env-stale-name s E I)` | Earlier functions this check may have broken |
+| `(jit-env-definition-source s E NAME)` | The source to resubmit to recheck one |
+| `(jit-env-release! s E)` | Release a state; any order |
 
-A checked-only session can hand out its states as values. `(jit-env-check session
-base source)` checks `source` against any state you hold and returns a new one;
-`base`, and the state the session itself serves, are not written. Hold as many as
-you like — the state before an edit and after it, or two edits of one base — and
-release them in any order with `jit-env-release!`. `(jit-env-empty)` is the state
-to build the first one on, `jit-env-valid?` is false for it and for the result of a
-check that failed (then `jit-diagnostic` says why), and `jit-env-defines?` /
-`jit-env-live-function` read a particular state. `jit-reset!` refuses while any is
-held.
+Hold as many states as you like, such as before and after an edit, or two
+edits of the same base. A check never rechecks functions it was not given, so
+it reports instead the ones that read a function whose signature, or a struct
+or sum whose shape, it changed. Those stay in the new state as they were.
+Resubmit their source to recheck them. Body-only edits report nothing. Macros,
+constants that mention constants, and impl availability are not tracked yet,
+and a redefined function with trait bounds always counts as changed.
 
-A check never re-checks what it did not submit, so it reports what it may have
-broken instead: `jit-env-stale-count` / `jit-env-stale-name` list the functions that
-were already in `base`, were not part of this check, and read a function whose
-signature or a struct or sum whose shape this check changed. They are still in the
-new state exactly as they were checked. Check one again by submitting its source
-(`jit-env-definition-source` returns it). A body-only edit reports nothing. Macros,
-constants that mention constants, and impl availability are not tracked yet, and a
-redefined function with trait bounds always counts as changed.
+`jit-reset!` refuses while any state is held. A session that generates native
+code refuses `jit-env-check`, as does source that stages session state.
+`tests/compiler/features/jit_live_checker.coil` is a complete client.
 
-`tests/compiler/features/jit_live_checker.coil` is a complete client of these
-operations: a checker that keeps a compiler running, re-checks what each edit made
-stale, and tracks what is broken.
+## Discovering a program's sources
 
-A session that generates native code refuses `jit-env-check`, as does source
-that stages session Code state: both are per-session today, not per-state.
+`(jit-read-source-graph allocator ENTRY)` finds an entry's source modules using
+the same namespace roots and configuration as a build, without compiling
+anything. Check `jit-source-graph-ok?`, then read `jit-source-graph-entry`,
+`jit-source-graph-count`, and, by index, `jit-source-graph-module`,
+`jit-source-graph-path` and `jit-source-graph-text`. On failure,
+`jit-source-graph-diagnostic`, `jit-source-graph-error-path` and
+`jit-source-graph-error-line` describe the error. The result belongs to the
+allocator you passed. Prebuilt units appear as opaque dependencies, not as
+sources.
 
-## Ownership
+## Platforms
 
-Checked function bodies have immutable, nonmoving storage. Their typed pointer
-closures are allocated as shared ranges; ordinary compiler indexes remain in
-the replaceable snapshot. Overlapping ranges preserve interior aliases, and
-any additional typed fields exposed by overlap are promoted before allocation.
-The visitor generator audits the checked-body traversal to prevent mutable phase
-state or separately owned source records from entering this boundary unnoticed.
+On macOS arm64 the JIT uses Coil's own arm64 backend. On Linux x86-64 it
+lowers each submission through LLVM, so a program embedding `coil.jit` there
+must link LLVM:
 
-Each snapshot owns every body block reached by its typed traversal. Blocks do
-not own each other, so cycles can retire. The new snapshot acquires ownership
-before the preceding one releases it. Source-provider snapshots have separate
-ownership lists. This still traverses metadata and copies owner lists on each
-publication; it is not yet a persistent query database.
+```sh
+coil build app.coil --link-flag "-L$(llvm-config --libdir)" --link-flag -lLLVM
+```
 
-Snapshot marking and relocation use a separate temporary arena. Pruning writes
-retained metadata through its owning loader or resolution-state allocator;
-marking tables are then discarded before relocation starts. After pointer
-fixups and ownership transfer, relocation scratch is freed too. With
-`COIL_TRACE=1`, `jit.snapshot.mark-scratch` and `jit.snapshot.copy-scratch`
-report this arena separately from compilation scratch. Its peak counter spans
-both traversals; live bytes describe the current traversal.
+The stock `coil repl` is already linked against LLVM. On both platforms, old
+code stays mapped for function pointers that captured it. Each new
+generation's `alloc-static` storage keeps the addresses the previous
+generation gave it.
 
-Accepted metadata is written once, up to the end of pointer fixups, and never
-again. `COIL_JIT_PROTECT=1` enforces that for all of it: each sealed body block
-and the whole published snapshot live in their own pages, made read-only once
-publication completes, so a store into accepted metadata faults
-at the store (SIGBUS on macOS, SIGSEGV on Linux) instead of corrupting a session
-some edits later. It costs a mapping per block, so it is a checking mode rather
-than the default; `scripts/tests/jit-static-session.py` runs every fixture with it
-on. To locate a fault, run the fixture under `lldb --batch -o run -o bt`.
+## Memory and tracing
 
-`COIL_JIT_TRACE=1` reports cumulative `body-copied-bytes` plus
-`body-owned-bytes` and `body-owned-blocks` before releasing the preceding
-snapshot. These count body payload storage, not allocator, page-index, or
-ownership-list overhead. The memory gate checks body storage separately from
-the relocated snapshot and also enforces its process-memory limits.
+Each accepted submission replaces one compact graph of live compiler metadata
+and frees the compiler's scratch memory, so accepted compilations do not
+accumulate. Native code is owned separately: retiring metadata does not unmap
+code that a published pointer may still call, and `jit-reset!` releases both.
+Source text is kept only while live metadata refers to it.
 
-Source names, source text, and line tables are immutable shared payloads owned
-independently of the copied metadata graph. Each accepted snapshot and configured
-source provider retains its own deduplicated payload list. Replacing a source
-slot creates a new payload; retiring the last snapshot that refers to a payload
-releases it. Rejected candidates acquire no snapshot ownership. Other metadata
-still uses the precise graph relocation path; this is not yet an incremental
-semantic database.
+| Variable | Shows |
+|---|---|
+| `COIL_JIT_TRACE=1` | Per-submission events on stderr: parsed declarations, checked and emitted function bodies (including nested units), the retained catalog, and retained byte counts |
+| `COIL_JIT_TRACE_MEMORY=1` | With the above, a census of retained record types |
+| `COIL_JIT_PROTECT=1` | Make accepted metadata read-only. A stray store faults at the store (SIGBUS on macOS, SIGSEGV on Linux) instead of corrupting a later edit. A checking mode: it costs a mapping per block |
+| `COIL_TRACE=1` | Compiler phase timings, including the snapshot's scratch arenas |
 
-With `COIL_JIT_TRACE=1`, `source-copies`, `source-copied-bytes`, and
-`source-reuses` are cumulative counters for that session. `source-owned-bytes`
-reports payload storage before the preceding snapshot is released. These
-counters are separate from `retained-bytes`, which counts the relocated graph.
-
-A successful submission publishes a compact graph of live metadata and releases
-its compiler and linker scratch. The next success replaces that metadata graph;
-accepted compilation arenas do not accumulate. Source locations and hygiene
-aliases are retained only while referenced by live metadata or session Code.
-The API does not retain a submission-source journal; the former `jit-source`
-accessor has been removed. Keep a journal in the client if your application needs one.
-
-Native code and its necessary symbol/dependency data have separate ownership.
-Previously published function pointers may remain callable after metadata is
-retired. Code mappings are page-sized, and code that remains callable still
-occupies memory. LLVM uses one ORC linker per session and resource trackers per
-object, rather than retaining a compiler engine per submission.
-
-Use `export-c` for a stable C symbol/ABI and `jit-symbol-address` for its address.
-Retain a generation token with `jit-generation-retain-current!` when holding a
-pointer outside the owner's immediate operation; release it with
-`jit-generation-release-token!`. For a coordinated publication that must avoid allocation, call `jit-generation-reserve-tokens!` before native acceptance, then `jit-generation-retain-reserved!` after acceptance. Reservation adds bookkeeping capacity without taking a lease; reserved acquisition returns `-1` without acquiring ownership if capacity is exhausted or there is no current generation. Reservation returns `-1` for an invalid count and `-2` on allocation failure. The ordinary retain API reserves its bookkeeping before changing native ownership.
-
-Reset returns `-1` while client leases are live.
-After releasing them, `jit-reset!` releases the accepted environment and native
-resources. The session container itself has the allocator's lifetime.
-
-Set `COIL_JIT_TRACE=1` to inspect actual parse/check/emit events and the accepted
-metadata byte count. Add `COIL_JIT_TRACE_MEMORY=1` for a census of retained record
-types. The trace separates live payload bytes from packed storage, which also includes
-alignment gaps. These counts describe the compiler metadata graph; native mappings
-and linker bookkeeping are separate. RSS also includes allocator caches and process
-infrastructure, so the tests check both logical retained bytes and process memory.
+To find the writer behind a `COIL_JIT_PROTECT` fault, run the program under
+`lldb --batch -o run -o bt`.

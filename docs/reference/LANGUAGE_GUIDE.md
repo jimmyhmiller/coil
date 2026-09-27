@@ -1,2517 +1,1343 @@
-# The Coil Language — a guide for agents
-
-A dense, practical reference for writing correct Coil. Coil is a low-level,
-Lisp-syntax, ahead-of-time language: s-expressions, a macro system, and a type
-system where **calling convention** and **allocation** are first-class. It emits
-a native object and links with the system `cc`; the `wasm32-unknown-unknown`
-target instead writes a WebAssembly module directly. Read this end to end before
-writing Coil; most mistakes come from the gotchas marked ⚠.
-
-The compiler and its standard library form one installed toolchain. An installation
-places `coil` beside `lib/coil`, so the matching prelude and library work from any
-directory; a checkout compiler finds the checkout's `src/` tree the same way. A bare
-executable copied elsewhere is not a complete installation. A project may instead
-select a sealed, dependency-supplied library universe with the `[language]` manifest
-section described below.
-
-## Build & run
-
-    coil run   file.coil                 # build + run a single file
-    coil build file.coil                 # release build: build/release/file
-    coil build file.coil --debug         # DWARF debug build: build/debug/file
-    coil build file.coil -o out          # override the output path
-    coil install                         # install this package to ~/.local/bin
-    coil install --root DIR              # install to DIR/bin instead
-    COIL_UPDATE_URL=https://host/channel.json coil update
-    coil update --rollback               # atomically restore the prior binary toolchain
-    coil build file.coil --target wasm32-unknown-unknown -o out.wasm
-    coil run                             # build+run the ./Coil.toml project
-    coil test                            # discover and run project test suites
-    coil fuzz  file.coil --time 60       # a coverage-guided campaign against its properties
-    coil check                           # typecheck every project target graph (no codegen, no link)
-    coil verify                          # fmt + lint + check + native build + test
-    coil run -- arg1 arg2                # forward args to the program
-    coil build file.coil -lm             # link a library (-l<name>)
-    coil repl                            # interactive session
-    coil fmt   file.coil                 # print formatted source (--write / --check)
-    generate-source | coil fmt -         # format standard input
-    coil lint  file.coil --fix            # apply the standard safe fixes
-    coil lint  file.coil --use my.rules   # add project/policy checkers
-    coil doc   file.coil                 # markdown for the module's `;;;`-documented surface
-    coil namespaces                      # bundled standard-library namespace names
-    coil namespace coil.arraylist        # every definition/signature, plus available docs
-
-`main`'s `i64` return is the process exit code. Normal builds are ahead of time;
-the interactive `coil repl` uses the native in-process JIT. A file that is
-imported must start with `(module NAME)`. `Coil.toml`:
-
-Native `build` writes its intermediate object in a private temporary directory,
-spawns the linker driver directly with an argument vector (never through a shell),
-and removes the object after linking. Only the requested executable remains.
-Set `COIL_CC` to select a compatible linker driver; the default is `cc`.
-
-### Binary toolchain updates
-
-`coil update` installs a complete compiler-and-library toolchain beneath
-`~/.local/lib/coil/toolchains/nightly/<commit>` and atomically switches
-`~/.local/bin/coil`. It never contains a service URL or authentication scheme.
-Set `COIL_UPDATE_URL` to an absolute HTTPS schema-v1 manifest. For a private
-endpoint, set exactly one of `COIL_UPDATE_HEADERS` (newline-delimited `Name:
-value` fields) or `COIL_UPDATE_HEADERS_FILE`. For Gatekeeper, for example:
-
-    export COIL_UPDATE_URL=https://computer.jimmyhmiller.com/coil/v1/channels/nightly.json
-    export COIL_UPDATE_HEADERS="Authorization: Bearer $(gatekeeper-login --print)"
-    coil update
-
-Headers are applied to the manifest and its same-origin artifact only. Redirects,
-cross-origin artifacts, malformed or duplicate fields, and transport-owned fields
-such as `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, and `Range`
-are rejected. Header values are never printed or passed to the installed binary's
-smoke test. Coil validates the declared byte size and SHA-256 before extraction;
-the new toolchain must run `--version` before the symlink changes. The old symlink
-is retained for `coil update --rollback`.
-
-### Interactive development
-
-`coil repl` keeps definitions and runtime state for the life of the session.
-Forms may span lines; the prompt changes to `....>` until delimiters balance.
-Ordinary, non-generic `defn`s are hot reloadable: redefining one with the same
-typed signature updates its stable `Var (fnptr c [Args...] R)`, so functions
-already compiled against that binding call the new implementation. A different
-signature is rejected transactionally, leaving the working definition intact.
-
-Expression results use the same formatting traits as ordinary programs. The REPL
-prefers `Debug`, including derived structs and collections whose members implement
-`Debug`; if that is unavailable it tries `Display`. If neither trait is available,
-the expression remains valid and the REPL says that it cannot print the value yet.
-Useful commands are `:type EXPR`, `:load NAMESPACE`, `:defs`, `:reset`, `:cancel`,
-`:help`, and `:quit`. Definitions and failed evaluations are transactional;
-successful `alloc-static` storage survives later evaluations and reloads.
-
-The same engine is available to applications through the optional `coil.jit`
-standard-library module. It is an in-process, source-linked compiler SDK—there is
-no subprocess protocol. Importing it pulls the compiler into that program's
-reachable module graph; programs that do not import it link none of the SDK.
-
-    (import "coil.alloc" :use [malloc-allocator])
-    (import "coil.jit" :use *)
-
-    (let [(mut session) (jit-session-new (malloc-allocator))]
-      (jit-compile! (mut session)
-        "(module example) (defstruct Point [(x i64)])
-         (defn twice [(x i64)] (-> i64) (* x 2))")
-      (jit-compile! (mut session)
-        "(defn answer [] (-> i64) (twice 21))")
-      (jit-evaluate! (mut session) "(answer)")
-      (jit-reset! (mut session)))
-
-`jit-session-new` locates the matching installed toolchain through `coil` on
-`PATH`; `jit-session-new-with-toolchain` accepts an explicit compiler command.
-`jit-compile!` accepts a program or further definition forms. The session retains
-imports, types, traits, impls, canonical function signatures, checked bodies,
-generic specializations, macros, and pipeline registrations. Later submissions
-parse the new forms and compile their new bodies against that environment;
-callers do not supply an environment or repeat accepted source. A module form
-selects the namespace for subsequent submissions; the initial default is
-`jit.session`.
-
-Bindings are static. An existing function definition cannot be overwritten;
-metaprograms can generate fresh implementation identities and choose whether,
-when, and how to publish them through ordinary `Var` cells or other mechanisms.
-The compiler does not retarget old callers or migrate values. Metaprograms can
-retain transactional policy data through `primitive/code-session-state` and
-`primitive/code-session-stage!`; a later stage of the same transaction reads what an
-earlier stage staged with `primitive/code-session-staged-state`.
-
-`(defalias Name Target)` gives a module's declaration a second name. The alias
-works for every kind of declaration `Target` is: type, constructor, function,
-variant, const or macro. It works bare, through `:as` and `:use` imports, and
-fully qualified. A later submission may rebind the alias. New references then
-resolve to the new target, while code accepted earlier keeps the target it
-bound. One submission may bind a name only once. A metaprogram can give each
-version of a declaration a fresh physical identity while every module keeps
-using the authored name.
-
-A submission may also retire accepted declarations so it can declare
-replacements under the same names:
-
-    (retire-alias Name)             ; the module's alias Name stops resolving
-    (retire-trait Name)             ; the module's trait, and every impl of it
-    (retire-impl [T…] Trait Type)   ; the trait impl with exactly this pattern
-    (retire-inherent [T…] Type)     ; inherent impls with exactly this pattern
-
-A retired declaration leaves the environment used to check this submission and
-every later one. The submission may redeclare the trait or impl, including one
-with a different method signature. Native code already accepted keeps what it
-bound. A rejected submission leaves the accepted environment unchanged.
-Retiring something that is not accepted has no effect. `jit-compile-with-entry!` compiles definitions
-and runs a caller-supplied i64 expression: zero commits the candidate; any other
-result rejects it. Rejection preserves accepted compiler state and native
-publication. Runtime effects performed by that expression are the caller's
-responsibility and are not rolled back.
-
-`jit-evaluate!` evaluates an expression of any type and discards its result.
-To call compiled code directly, declare an `export-c` name and retrieve it with
-`jit-symbol-address`; null means absent. Cast a returned address only to its
-matching C function-pointer type. Operations return zero on success and nonzero
-on rejection; `jit-diagnostic`, `jit-pending`, and `jit-status` expose failures.
-The session does not retain a submitted-source journal; keep one in the client if needed.
-
-Each accepted edit replaces one compact live metadata graph and releases compiler
-scratch. Native definitions have separate ownership until `jit-reset!`. Reset
-releases the environment and native resources and starts a fresh environment;
-it returns -1 while caller generation leases remain outstanding. Serialize SDK
-operations: compiler contexts support synchronous nesting, not concurrent use.
-For metaprogram-generated concrete implementations, import `coil.jit.lifetime`
-and add `:jit/retain false` to exclude an implementation from metadata roots after
-publication. Retained definitions and initializers can still keep it alive through
-dependencies; its native function pointer remains callable. Generic and
-Code-returning functions cannot use this annotation. See
-[Stateful JIT](STATEFUL_JIT.md) for integration and ownership examples.
-
-The terminal `coil repl` uses the same retained compilation path and enables
-`coil.repl`'s Var metaprogram by default. Redefining a runtime function gives its
-implementation a fresh identity and updates the existing Var; previously compiled
-callers observe the update. An incompatible signature or invalid body rejects the
-submission and preserves the previous value. Types, macros, generic functions,
-ordinary `def` bindings, and explicit `defn*` functions remain static.
-A module form selects a namespace without moving existing definitions.
-
-From a project directory, `coil repl` reads that project's `Coil.toml`, so
-`:load package.module` can import its source and dependencies. For a native UI
-that must run on the main thread, use `coil repl --app package.module` and enter
-`:run` to launch it. The app module must export `repl-launch`, `redraw`, and
-`repl-stop`, each taking no arguments and returning `i64`. The REPL accepts
-edits on a terminal input thread and compiles, publishes, and calls `redraw`
-on the UI thread. `:quit` calls `repl-stop` before releasing the JIT session.
-The project manifest's native frameworks are loaded into the REPL process.
-
-To make a source module's functions live from the initial app compilation,
-import `coil.repl` and add `(defn __repl_vars [] (-> Code)
-(coil.repl/var-module))` as a direct module marker. Runtime functions in that
-module use the same Var indirection and publication policy as terminal REPL
-definitions; ordinary AOT builds leave them at their initial values. Without
-the marker, existing callers remain statically bound to the imported function.
-
-SDK consumers may opt into the same policy by importing `coil.repl` and calling
-`jit-compile-with-entry!` with `(coil.repl/publish)` as the entry expression.
-The policy uses transactional Code session state to retain binding identities;
-it never resubmits accepted bodies. A plain SDK session remains static.
-`:type EXPR` checks against the retained environment without executing the expression.
-Use `:compile FORMS` for arbitrary top-level metaprogram submissions.
-
-`jit-prepare!` and `jit-prepare-with-entry!` prepare new forms against the retained
-environment without publishing runtime code. Metaprogram expansion still runs.
-`jit-commit-prepared!` publishes that exact
-candidate; `jit-abort-prepared!` releases it. Preparing another candidate aborts
-an outstanding preparation. There is no full-source replacement or replay API.
-
-Set `COIL_JIT_TRACE=1` to emit per-submission `jit-work` events on stderr. These
-record actual parsed declarations, checked function bodies, and emitted native
-function bodies, including work in nested compiler units. `retained` events name
-the previously accepted function catalog; `begin` and `end` delimit submissions.
-
-After initializing the SDK, `jit-read-source-graph(allocator, entry)` discovers
-an entry's source modules with the same namespace roots and unit configuration.
-It returns an opaque `JitSourceGraph` owned by the supplied allocator. Check
-`jit-source-graph-ok?`, then read `jit-source-graph-entry`,
-`jit-source-graph-count`, and the indexed `jit-source-graph-module`,
-`jit-source-graph-path`, and `jit-source-graph-text` accessors. On failure,
-`jit-source-graph-diagnostic`, `jit-source-graph-error-path`, and
-`jit-source-graph-error-line` describe the loader error. The snapshot survives
-the discovery operation's scratch scope and does not submit or execute code.
-Serialize discovery with other SDK operations. This API exposes source modules;
-prebuilt unit interfaces remain opaque dependencies.
-
-The execution backend is selected by host: `arm64-macho` uses Coil's native
-backend on macOS, while `llvm-mcjit-x86_64-linux` lowers each generation through
-LLVM on Linux. Both retain old code for captured function pointers and map each
-new generation's `alloc-static` declarations onto its prior stable addresses.
-An application embedding `coil.jit` on Linux must link LLVM, for example with
-`--link-flag "-L$(llvm-config --libdir)" --link-flag -lLLVM`; the stock
-`coil repl` binary is already LLVM-linked.
-
-    [package]
-    name  = "app"
-    entry = "main.coil"      # default src/main.coil
-    [dependencies]
-    local_math = { path = "../local-math" }
-    remote_math = { git = "https://example.com/math.git", sha = "0123456789abcdef0123456789abcdef01234567", subdir = "packages/math" }
-    [link]
-    libs = ["m"]             # -> -lm
-
-To compile without any ambient bundled library, select an ordinary module from an
-explicit dependency as the replacement prelude:
-
-    [language]
-    stdlib = false
-    prelude = "platform.prelude"
-
-    [dependencies]
-    platform = { path = "../platform" }
-
-`stdlib = false` removes both the bundled `coil.core` prelude and bundled namespace
-fallback. `platform.prelude` is loaded through the same namespace index as any other
-dependency module, and its public names become the implicit refer-all for every module.
-The root project's choice applies to the complete reachable module graph: a transitive
-dependency cannot silently restore `coil.os`, `coil.io`, or another bundled namespace.
-Language syntax, fundamental types, and compiler primitives remain available; every
-library-shaped API must come from the declared dependency universe. A replacement
-prelude is required when `stdlib` is false and is rejected when `stdlib` is true.
-
-For code that keeps the bundled language foundation but must not depend on its
-host environment, use the hermetic standard-library profile:
-
-    [language]
-    stdlib = "hermetic"
-    core-providers = ["platform.core"]
-
-    [dependencies]
-    platform = { path = "../platform" }
-
-`"full"` is the spelled-out form of the default `stdlib = true`; `false` retains
-its sealed replacement-prelude meaning. The hermetic profile admits only the
-closed bundled namespace set `coil.primitive`, `coil.control`, `coil.try`,
-`coil.result`, `coil.match`, `coil.dyn`, `coil.var`, `coil.async`,
-`coil.atomic`, `coil.simd`, and `coil.assert.hermetic`. Imports of other bundled
-namespaces are rejected while loading the complete reachable graph, including
-imports made by a core provider. Native dependencies and `[link]` inputs are also rejected.
-The built-in ambient assertion provider traps on failure without writing output;
-the full profile instead activates `coil.print` and `coil.assert`.
-
-A module contributes selected declarations to the single ambient namespace
-`coil.core` with an explicit declaration:
-
-    (module platform.core)
-
-    (defn platform-answer [] (-> i64) 42)
-    (provide-core [platform-answer])
-
-Declaring `provide-core` does not activate the module. Only the root manifest's
-`core-providers` list does that; dependency manifests cannot add ambient names.
-Names not listed in the declaration stay ordinary qualified exports.
-
-`core-providers` is **ordered, and a later entry overrides an earlier one**. The
-profile's own ambient providers are activated first, so a root provider outranks
-them: listing a module that provides `println` replaces `coil.print`'s, and under
-`stdlib = "hermetic"` a module providing `assert-eq` replaces the trap-only one
-from `coil.assert.hermetic` -- which is how a board supplies its own fault
-handler. A provider also outranks names the prelude merely reexports, such as
-`when`, so ambient macros are replaceable too, and a provider holding a plain
-function replaces an ambient macro of that name completely. An overridden
-definition is never reached ambiently; it remains available under its own
-module name.
-
-Project tools inherit the same package, native, target, and link configuration as
-`coil build`. **Naming a file inside a project changes only the entry, not the
-configuration**: `coil build src/main.coil`, `coil run src/main.coil` and
-`coil check src/main.coil` resolve the same dependencies and apply the same
-`[cc]`, `[link]` and `[metaprograms]` as the bare command, so an
-`(import "somedep.lib")` that works one way works the other. Build artifacts default
-to `build/release/<source-stem>` for a named file and `build/release/<package-name>`
-for a package. `-g` or `--debug` emits DWARF symbols and selects the corresponding
-`build/debug/` directory. `-o` overrides the complete path, and `[build] out`
-overrides the package artifact name. `[build] optimization = 0` (or `1`, `2`,
-`3`) supplies the default `-O` level for manifest builds; an explicit command-line
-`-O` flag takes precedence.
-Outside a project — no `Coil.toml` — a file is compiled on its own, as always.
-`coil new` adds both `/build` and `/.coil` to the new package's `.gitignore`.
-
-A fuller project can declare:
-
-    [package]
-    name = "app"
-    entry = "src/main.coil"
-    source-roots = ["src", "tests"]
-    exclude = ["src/generated/*"]
-
-    [build]
-    optimization = 2
-
-    [artifacts.runtime]
-    kind = "object"
-    entry = "src/runtime.coil"
-    out = "build/release/runtime.o"
-
-    [artifacts.helper]                ; a second, independently linked program
-    kind = "executable"
-    entry = "src/helper/main.coil"
-    out = "build/helper"
-    optimization = 2
-    native-dependencies = ["zlib"]    ; linked into the helper only
-    libs = ["m"]
-
-    [cc]
-    sources = ["native/app.c"]
-    include-dirs = ["native"]
-    flags = ["-std=c11", "-Wall"]
-
-    [link]
-    libs = ["curl"]
-    search-paths = []
-    frameworks = []
-    objects = []
-    flags = []
-
-    [native-dependencies]
-    libcurl = { pkg-config = "libcurl" }
-    llvm = { flags-command = "llvm-config --ldflags --libs --system-libs" }
-    zlib = { pkg-config = "zlib" }
-
-    [test]
-    roots = ["tests"]
-    suffixes = ["_test.coil"]
-
-    [test.suites.integration]         ; a named suite; `default = false` keeps it
-    roots = ["tests/integration"]     ; out of a bare `coil test`
-    suffixes = ["_integration.coil"]
-    default = false
-
-    [lint]
-    rules = ["tools/project_rules.coil"]
-
-    [metaprograms]
-    use = ["myproj.gcauto", "httptap"]
-
-    [readers]
-    ".json" = "myproj.readers.json"
-
-    [manifest.providers]
-    c = "myproj.readers.c"
-
-    [c.raylib]
-    sources = ["vendor/raylib/src/raylib.c"]
-    include-paths = ["vendor/raylib/src"]
-
-    [modules]
-    "myproj.data.people" = "src/data/people.json"
-
-Native objects and depfiles live under `.coil/build/native/`; sources and headers
-are rebuilt only when their inputs or toolchain configuration change. Test runners
-use collision-free paths under `.coil/build/test/`.
-
-A package may declare additional outputs with `[artifacts.NAME]`. Each has a
-`kind`, a Coil `entry`, and an explicit `out` path:
-
-- `kind = "object"` compiles the entry to a relocatable object (`coil emit-obj`).
-- `kind = "executable"` compiles and links the entry as a separate program.
-
-A bare `coil build` builds every declared artifact, in manifest order, before
-the package executable. A bare `coil run` does the same before building and running
-the package executable. Every artifact compiles with the package's source roots,
-dependencies, target, metaprograms, readers, and debug settings. Command-line
-target, backend, profile, optimization, sanitizer, and debug-check flags are passed
-on too, but the package's `-o` is not. `optimization = 0`–`3` overrides
-`[build] optimization` for one artifact. As with the package, an explicit `-O` on
-the command line still takes precedence. `coil build FILE.coil`, `coil run FILE.coil`,
-`coil install`, and `coil test` build no artifacts.
-
-An executable artifact does not inherit the package's own `[link]` inputs, `[cc]`
-objects, or `[native-dependencies]`, because those belong to the package
-executable. It links:
-
-- its own `libs`, `frameworks`, `search-paths`, `objects`, and `flags` arrays, which
-  have the same meaning as the `[link]` keys;
-- the native dependencies it names in `native-dependencies`. Each name must be an
-  entry of the package's own `[native-dependencies]` table;
-- the inputs of the dependency packages its own code loads, by the rule below.
-
-**A native dependency that an executable artifact names belongs to the artifacts
-that name it.** The package executable and its tests do not link it. This keeps
-apart two static libraries that define the same symbols, such as a full library
-for the application and a reduced one for a helper. If both programs need the same
-library, declare it twice under two names, one per program. Artifact-owned
-flags-commands run before compilation on every bare `build` and `run`, and a
-failing command stops the build. Object artifacts are not linked, so Coil rejects
-link keys on them.
-
-Artifact `out` paths are relative to the package manifest, and Coil creates their
-parent directories. Two artifacts cannot share an output path. An artifact also
-cannot use the package executable's output path in either build profile. Coil
-compares paths after resolving `.` and `..` components.
-
-A linked executable or library never overwrites its destination in place. The
-linker writes a private file in the destination directory, and Coil renames it
-over the destination. A running copy of the old program therefore keeps its file:
-on macOS, rewriting a running signed binary in place gets it killed. The
-destination name always points to a complete file. This applies to every
-`coil build`, including package executables and executable artifacts.
-
-#### Dependency link inputs follow what a program loads
-
-A dependency package's `[link]` inputs, `[native-dependencies]` and `[cc]` objects
-apply to a program only when that program's compilation loads a module from that
-package, plus everything that package itself depends on. The package you are
-building is not affected: its own `[link]`, `[cc]` and `[native-dependencies]` are
-what its author wrote for it and always apply.
-
-The rule is the same for every program Coil links — the package executable, each
-executable artifact, and a test runner — and it is decided by the compiler's own
-module resolution, not by reading source. Two programs in one package therefore
-link different things: a service whose entry imports one small module links that
-module's package and nothing else, while the application beside it links the UI
-packages it imports.
-
-A dependency's native provider is consulted only by a build that links it. A
-`flags-command` never runs for a program that does not need it, and a command that
-is never needed never runs at all — `coil check`, which links nothing, runs none of
-them. A provider that fails stops the build that needed it.
-
-The one thing this takes away is reaching a dependency's native symbols with your
-own `extern` while importing none of its modules. If a link fails that way, Coil
-names the dependency whose inputs it left out; import what you use from it, or
-declare those inputs in your own `[link]`.
-
-Two paths necessarily keep every dependency's inputs, because they link without a
-compilation that could say what is loaded: `coil fuzz`, which drives the linker
-itself, and the dylib a metaprogram is loaded from.
-
-A native dependency selects exactly one discovery provider. `pkg-config` names a
-package whose link flags Coil queries in the usual way. `flags-command` runs a
-project-owned configuration command and treats its whitespace-separated stdout as
-linker arguments; it is intended for libraries such as LLVM that ship a dedicated
-`*-config` tool but no pkg-config metadata. A nonzero provider exit stops the build
-before compilation.
-
-Dependency names are manifest-local handles, not import prefixes. Coil adds each
-dependency root to the namespace index, so consumers import the namespace declared
-by the dependency's source—for example `"local_math.numeric"`—regardless of where
-that source lives inside the dependency. `path` is relative to the project directory.
-A Git dependency selects exactly one of `sha`, `tag`, or `branch`; `sha` requires a
-full 40- or 64-digit commit ID. Tags and branches are resolved to a concrete commit
-at the start of each invocation, so they intentionally follow repository updates.
-An optional `subdir` selects a package inside the checkout. It must be
-repository-relative, may not contain an escaping `..`
-component, and must name a directory containing `Coil.toml`. Every dependency whose
-directory holds a `Coil.toml` -- a path dependency, a Git checkout, or a selected
-subdirectory -- is a package boundary: its source roots (the package directory itself
-when it has no `src/`, `tests/` or declared roots), exclusions, module/reader
-mappings, transitive dependencies, native dependencies, C inputs, and link inputs
-compose into the root build. Its link inputs apply to the programs that load its code
-(see above). A package reached more than once, through a diamond or a
-cycle, is composed once. Package-relative native paths stay relative to their package. Checkouts are cached by repository and SHA, so dependencies selecting several
-subpackages at the same pin share one checkout. The string shorthand
-`local_math = "../local-math"` is equivalent to `{ path = "../local-math" }`.
-
-### Workspaces
-
-A repository containing several packages uses a `[workspace]` root instead of a
-root `[package]`:
-
-    [workspace]
-    name = "tools"
-    members = ["src/apps/*", "src/libraries/*"]
-
-Each matched member directory contains its own `Coil.toml` with a `[package]`
-name. A member's namespace is `<workspace>.<package>` plus at least one module
-segment: package `parser` in workspace `tools` may declare
-`tools.parser.syntax`, but not exactly `tools.parser`. The namespace index reports
-an incorrectly owned module at its source path.
-
-Workspace members compile as one namespace graph and import each other without
-dependency declarations. `check`, `build`, `lint`, and `fmt` at the workspace
-root fan out over executable members; a member with no `entry` is a library and is
-compiled through the executable members that import it. Command-line flags are
-forwarded to each member. Package `source-roots` and `exclude` settings still own
-source discovery and namespace indexing, so excluded fixtures do not create
-duplicate or incorrectly owned modules. A workspace-level `tests/` directory is
-also indexed without becoming a package.
-
-`[readers]` associates a source suffix with an ordinary Coil module containing one
-`reader-provider`. Imported files with that suffix are read by the provider and
-then continue through normal loading and checking. A guest file becomes a module
-only through an explicit `[modules]` namespace-to-file entry or a first-line
-`coil-module: NAME` marker (anything before the marker is treated as the guest
-language's comment leader). Merely configuring a reader suffix does not derive
-modules from every matching file in a source root. Reader modules themselves always
-use Coil's default reader, and reader output may omit `(module ...)`; the loader
-inserts and validates the namespace it indexed.
-
-Different suffixes may name different providers in the same project. Each distinct
-provider is compiled into an isolated reader setup, and every imported guest file is
-dispatched by its longest matching configured suffix. This also applies recursively:
-one program may import JSON, Scheme, or other guest modules together without either
-reader seeing the other's input. Repeating an extension, mapping one file to two
-module names, selecting a module with no `reader-provider`, or returning a conflicting
-`(module ...)` declaration is a manifest/load error.
-
-`[manifest.providers]` lets a library own arbitrary manifest sections without
-building their schema into Coil. A mapping such as `c = "myproj.readers.c"`
-claims `[c]` and every `[c.*]` section for that metaprogram. Coil preserves strict
-manifest checking: an unclaimed section is still an error, while keys inside a
-claimed section belong entirely to its provider. Providers can read their project’s
-`Coil.toml` through the `COIL_MANIFEST_PATH` environment variable. The provider
-mapping and `[readers]` have separate jobs: the former owns configuration syntax;
-the latter chooses the reader for a source suffix.
-
-The Wasm target produces an instantiable module. The compiler performs the final
-Wasm-object conversion itself; this target does not invoke a linker process, and
-native libraries cannot be linked into the module. It is otherwise a full target
-for **the browser** — enough to build interactive pages in Coil:
-
-- **Exports.** `main` and its linear `memory` are always exported. Every
-  `(export-c [f :as "name"])` function is also exported, so JS can call into Coil:
-  `instance.exports.name(args)`. Args/results are wasm scalars (`i32`/`i64`/floats).
-- **Host imports.** An `extern … :cc c` that is *declared but never defined* becomes
-  a wasm import `env.<name>` — this is how Coil calls out to JS (DOM, `console`,
-  fetch, …). Pass a string as a `(ptr u8)`+`i32` pair via `(slice-data s)` /
-  `(slice-len s)`; the host reads it from linear memory as UTF-8.
-- **Self-contained.** The finalizer resolves the linker-provided `__memory_base`
-  and `GOT.mem.*` globals to concrete addresses, so string literals and
-  `alloc-static` global state work with no JS-side plumbing. The only imports a
-  module has are the host functions it actually calls.
-- **`externref`.** A built-in opaque type: a wasm reference to a host (JS) value,
-  held directly by the runtime and GC-managed. Use it in `extern` signatures and as
-  params/returns/`let`-locals to pass JS values to and from Coil without a handle
-  table — `(extern js_get :cc c [externref (ptr u8) i32] (-> externref))`. ⚠ An
-  `externref` lives only in wasm locals/args; it **cannot** be stored in linear
-  memory (no struct field, array, `(mut …)` slot, or `(ptr externref)`). To persist
-  one across calls, hand it to a host retain-table and keep the returned `i32`
-  index. Transient `externref`s are collected automatically — nothing to free.
-
-To run one: instantiate the `.wasm` from JS and supply each `env.*` import the
-module declares (the DOM calls you `extern`-declared), then call
-`instance.exports.main()`. Build with `--target wasm32-unknown-unknown`.
-
-## Modules & imports
-
-    (module myproject.app)               ; conventional project-prefixed namespace
-    (import "coil.io" :use *)            ; bring all exported names in, unqualified
-    (import "coil.io" :use [a b])        ; specific names
-    (import "coil.io" :as io)            ; qualified: io/name
-    (import "coil.io" :use * :exclude [print])          ; all but these
-    (import "coil.io" :use * :rename [[print io-print]]) ; refer under a local name
-    (export foo bar)                     ; optional; omitted = everything visible
-
-Every module behaves as if it began with `(import "coil.core" :use *)`. Writing any
-explicit `(import "coil.core" …)` replaces that implicit line — Clojure's
-`:refer-clojure` rule — so you can shadow a core name with your own, or drop core
-entirely:
-
-    (import "coil.core" :use * :exclude [len get])   ; define your own len/get
-    (import "coil.core" :use [Eq Ord Option Result]) ; a whitelist
-    (import "coil.core" :use [])                     ; no core; special forms + primitives
-    (import "coil.core" :as core :use [])            ; nothing bare; core/Option still works
-
-An `:exclude` entry matches a definition name, a trait name, or a method name, so
-`:exclude [Ord]` drops `< <= > >=` together while `:exclude [<]` drops only `<`. Special
-forms (`defn*`, `fn*`, `let*`, `if`, `match`, …) are not names and are never affected.
-The public `defn`, `fn`, and `let` are ordinary core macros; excluding core also
-excludes these names. Use the primitive spellings or import the macros explicitly. This
-controls *which names you may write*; it does not change what reaches your binary — dead
-code is already stripped whether or not you exclude anything.
-
-Wildcard imports are allowed. To audit or replace them on demand, use the bundled
-opt-in checker (it is not enabled by ordinary builds or lint runs):
-
-    coil lint app.coil --use coil.lint.no-star-imports
-    coil lint app.coil --use coil.lint.no-star-imports --diff
-    coil lint app.coil --use coil.lint.no-star-imports --fix
-
-The fix changes `:use *` to an explicit list of the target module's exported names
-and preserves other clauses such as `:as` and `:reexport`.
-
-Module names may contain dots. By convention, every project owns a prefix and uses
-it for all importable modules: `myproject`, `myproject.http`, `myproject.db.user`,
-and so on. This is a convention, not a compiler requirement; a one-part name remains
-valid. Public/package namespaces may also use a leading owner scope, for example
-`(module @myname.project.thing)`. The complete scoped name is the module identity.
-
-The bundled standard library follows the same rule under `coil.*`: `coil.core`,
-`coil.json`, `coil.http.client`, `coil.http.server`, `coil.slice`, etc. Import these
-using their public namespace, for example `(import "coil.time" :as time)`.
-
-Compiler setup modules selected with `--use` may replace the entry file's initial
-read by declaring `(reader-provider "provider.namespace" function)`. The provider
-is ordinary compiled Coil with signature `[(context Code)] -> Code`; its argument
-starts `(read-context PATH SOURCE entry INPUTS ARGS)`, preserving the original
-path/source/role positions. `INPUTS` is `(read-inputs (read-input PATH SOURCE
-entry) ...)` for every command-line input, and `ARGS` is `(reader-args ARG...)`
-for arguments after `--`. The provider is invoked once for the complete set.
-It returns either one form or `(do FORM...)`, after which normal loading,
-expansion, checking, compilation, and linking continue. Provider imports always
-bootstrap with Coil's default reader. Zero providers preserves the ordinary
-reader, and more than one selected provider is an error.
-
-A provider can delegate to the built-in configurable s-expression reader:
+# The Coil Language
+
+Coil is a low-level, ahead-of-time compiled language with Lisp syntax. It has
+structs, sum types with exhaustive `match`, Rust-style traits, explicit
+allocators, and a macro system that is ordinary Coil run at compile time. The
+compiler is written in Coil.
+
+Each section opens with a program you can run with `coil run FILE.coil`, followed
+by the output it prints. `scripts/docs/check-guide-examples.py` compiles and runs
+every complete program here; run it after you change an example.
+
+⚠ marks a trap. [Gotchas](#gotchas) collects them all.
+
+Other references:
+
+| Topic | Where |
+|---|---|
+| Projects, `Coil.toml`, dependencies, workspaces | [PROJECTS.md](PROJECTS.md) · `coil guide project` |
+| `coil test`, property tests, fuzzing | [TESTING.md](TESTING.md) · `coil guide testing` |
+| Debug checks, sanitizers, debugging allocators | [DEBUGGING.md](DEBUGGING.md) · `coil guide debugging` |
+| The REPL and the in-process JIT | [STATEFUL_JIT.md](STATEFUL_JIT.md) · `coil guide jit` |
+| WebAssembly | [WASM.md](WASM.md) · `coil guide wasm` |
+| Metaprogram details | [METAPROGRAMS.md](METAPROGRAMS.md) |
+| One namespace's API | `coil namespace coil.arraylist` |
+
+## Tour
 
 ```coil
-(primitive/code-read source
-  `(reader-config :unquote #\, :splice #\@))
+(module example.tour)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.debug" :use *)
+(import "coil.arraylist" :use [al-new al-free!])
+
+(defstruct Point [(x i64) (y i64)])
+(derive Debug Point)
+
+(impl Point
+  (manhattan [(p Point)] (-> i64) (+ (abs (.x p)) (abs (.y p)))))
+
+(defn abs [(n i64)] (-> i64) (if (< n 0) (- 0 n) n))
+
+(defsum Shape
+  (Circle [(radius i64)])
+  (Rect [(width i64) (height i64)]))
+
+(defn area [(s Shape)] (-> i64)
+  (match s
+    (Circle [r] (* 3 (* r r)))
+    (Rect [w h] (* w h))))
+
+(defn main [] (-> i64)
+  (let [p (Point :x 3 :y -4)
+        (mut areas) (al-new [i64] (malloc-allocator))]
+    (push! (mut areas) (area (Circle 2)))
+    (push! (mut areas) (area (Rect :width 2 :height 5)))
+    (println "{:?} is {} blocks away" p (manhattan p))
+    (for a (iter areas) (println "area {}" a))
+    (al-free! (mut areas))
+    0))
 ```
 
-The current context kind is only `entry`; textual imports retain Coil's default
-reader and do not automatically inherit the entry reader.
-
-Use `coil namespaces` to discover every standard-library namespace bundled into
-the installed compiler. `coil namespace NAME` prints the definitions, signatures,
-and available `;;;` docs in one of those namespaces. It also accepts a source path,
-so `coil namespace src/my_lib.coil` is the namespace inventory for project code.
-When a namespace implements traits, its guide entry states those traits and their
-methods first; treat those methods as the public vocabulary. `coil doc FILE` remains
-the concise, documented-only view.
-
-Imports name namespaces, never files. Coil indexes every `.coil` source under the
-project's configured `source-roots` (the project directory for a direct-file build),
-each dependency root, and the bundled standard library. File placement beneath those
-roots is irrelevant: `(import "myproject.db.user" :as user)` resolves the file whose
-leading declaration is `(module myproject.db.user)`. A namespace declared by multiple
-files is an error. Relative paths, absolute paths, dependency-prefixed paths, and bare
-filenames such as `"time.coil"` are not valid imports.
-
-`coil lint --fix` has a syntax-preflight phase that runs before import loading or type
-checking. It migrates legacy path imports by opening the old target, reading its
-`(module …)` declaration, and replacing only the import string. It also migrates old
-two-digit `\xHH` string and C-string escapes to `\xHH;`, and legacy `\c` character
-literals to canonical `#\c`. These fixes work even when legacy syntax prevents the
-program from compiling.
-
-Project mode (`coil lint` with no file) loads every module the package owns as
-one program rooted in those modules; there is no entry file and none is
-invented. A namespace two files declare, or a file that does not parse, is
-reported at that file and left out while the rest is still linted and fixed;
-`--fix` keeps every round that recompiled cleanly and only ever reverts the
-round that broke the build. Fixture pairs and standalone repro programs that
-live under a source root belong in the manifest's `exclude` list (paths,
-directories, or `*` patterns) so they are neither indexed nor linted.
-⚠ `extern` declarations are NOT deduped across modules — declare each libc
-extern in ONE module and `:use *` it, or two importers colliding will fail to link.
-
-## The two operator tiers
-
-- **Metal ops**, any width: `iadd isub imul idiv irem`, `icmp-eq icmp-ne icmp-lt
-  icmp-le icmp-gt icmp-ge`, `iand ior ixor ishl ishr`, `udiv urem` (unsigned),
-  `fadd fsub fmul fdiv`, `fcmp-eq fcmp-ne fcmp-lt fcmp-le fcmp-gt fcmp-ge`.
-- **Clean prelude operators**: `+ - * / %`, `= != < <= > >=`, `& | ^ << >>`.
-  Implemented on `i64` (all of them) and `bool` (`=` / `!=`). `f64` has `+ - * /`
-  and `< <= > >=` but **deliberately no `Eq`** — like Rust, because `NaN != NaN`
-  breaks reflexivity; use `primitive/fcmp-eq` / `primitive/fcmp-ne` for float equality. **`(ptr T)` has
-  `= != < <= > >=` for any `T`, comparing ADDRESSES** (like Rust's `*const T`) — the
-  metal `icmp-*` ops reject pointers, so these operators are the way to compare them.
-  Every signed and unsigned integer width implements `Eq` and `Ord`, so use the
-  clean comparison operators for ordinary integer code. The metal `icmp-*` ops
-  remain the lowering primitives used to implement those traits.
-
-These operators are not builtins — they are **trait methods** (see Traits & impls),
-so they work on your own types the moment you write an `impl`.
-
-The integer metal tier also provides operations that cannot be expressed cheaply
-from those operators:
-
-- `primitive/clz`, `primitive/ctz`, and `primitive/popcount` return a count in the
-  operand's integer type. `clz` and `ctz` are defined on zero and return the type's
-  bit width.
-- `primitive/bswap` reverses the bytes of an integer (`u8` is unchanged; wider
-  operands must contain a whole, even number of bytes).
-- `primitive/rotl` and `primitive/rotr` rotate within the operand's declared bit
-  width; the count is reduced modulo that width.
-- `primitive/mulhi` returns the high half of the double-width product. Its meaning
-  is signed for `iN` and unsigned for `uN`; ordinary `imul` supplies the low half.
-- `primitive/iadd-overflow?`, `primitive/isub-overflow?`, and
-  `primitive/imul-overflow?` report overflow according to the operand type's
-  signedness. `coil.integer` supplies `overflowing-add`, `overflowing-sub`, and
-  `overflowing-mul`, which return `Overflow[T]` containing both the wrapped result
-  and the flag.
-
-All of these operations preserve the operand width. Both operands of a binary
-operation, including a rotate count, therefore have the same integer type.
-
-`and` and `or` are variadic, short-circuiting syntax forms. Their zero-argument
-identities are `(and)` → `true` and `(or)` → `false`; a single argument is returned
-unchanged.
-
-## Traits & impls
-
-Rust-style, and the source of every clean operator: `Eq` (`=`), `Ord` (`< <= > >=`),
-`Add`/`Sub`/`Mul`/`Div`/`Rem`, `BitAnd`/…, `Hash`, and the collection traits `Len`
-(`len`), `Get` (`get`), `Set` (`set!`), `Push` (`push!`), `Pop` (`pop!`). The trait
-names are in scope with no import.
-
-    (deftrait Show [Self] (show [(x Self)] (-> i64)))   ; Self = the implementing type
-    (impl Show Point (show [(p Point)] (-> i64) 1))     ; concrete
-    (impl [T] Show (Box T) (show [(b (Box T))] (-> i64) 2))   ; generic: [T] first
-    (impl [(T Eq)] Eq (Box T) …)                        ; with a bound on T
-    (defn tell [(T Show)] [(x T)] (-> i64) (show x))    ; bounded generic: [(T Show)]
-
-An impl's `[T …]` entries take bounds in the same `(name Trait…)` form `defn` uses —
-write `(impl [(T Eq)] Eq (Box T) …)` when the body needs `T: Eq`. The bound is checked
-where the impl is used, so `(Box f64)` is rejected (`f64` has no `Eq`) at the call site
-rather than inside the impl.
-
-Parameterized traits may constrain their non-`Self` associated types in a bound.
-Write the trait and its associated arguments as a nested form:
-
-    (defn next-i64 [(I (Iterator i64))] [(source I)] (-> (Option i64))
-      (let [(mut it) source] (next (mut it))))
-
-Here `I` must implement `Iterator` with `Item = i64`. Associated arguments participate
-in inference as well as checking: if `I` is known, its selected impl can infer an
-otherwise-unmentioned item type. A mismatched impl is rejected at the generic call.
-The argument order is the trait's declared non-`Self` parameter order; for
-`(deftrait Pairing [Self Left Right] ...)`, the bound is `(T (Pairing L R))`.
-
-**Any type can carry an impl** — a struct, sum, scalar, generic instance, and the
-structural types `(ptr T)`, `(slice T)`, `(array T N)`, `(vec T N)`, `(fnptr c […] R)`.
-Array lengths and vector widths may be value parameters: `[T (const N i64)]` with
-`(array T N)` or `(vec T N)` specializes at arguments such as `[u8 16]`, and an impl
-for `(array T 4)` is more specific than one for `(array T N)`. `(mask N)` is
-`(vec bool N)`.
-`coil.simd` provides typed arithmetic, masks, safe tails, permutations, conversions,
-and scans; see `docs/reference/SIMD.md` for contracts and examples.
-A generic impl's `[T …]` params are inferred from the receiver, and every declared
-param must appear in the implementing type.
-
-    (impl [T] Show (ptr T)   (show [(x (ptr T))]   (-> i64) 3))   ; all pointers
-    (impl [T] Show (slice T) (show [(x (slice T))] (-> i64) 4))   ; all slices
-    (impl Show (Pair i64 i64) (show [(p (Pair i64 i64))] (-> i64) 5))  ; ONE instance
-
-That last one applies to `(Pair i64 i64)` **only** — calling `show` on a `(Pair u8
-bool)` is "does not implement", not a silent mismatch.
-
-**Specialization.** Several impls may cover the same type constructor; the **most
-specific** one matching the receiver wins. `(Pair i64 i64)` is more specific than
-`(Pair A B)` because the general pattern matches the concrete type and not the reverse.
-
-    (impl [A B] Len (Pair A B)   (len [(p (Pair A B))]   (-> i64) 1))
-    (impl     Len (Pair i64 i64) (len [(p (Pair i64 i64))] (-> i64) 2))
-    ; (Pair i64 i64) -> 2 ;  (Pair u8 bool) -> 1
-
-Disjoint instances are fine too — `(slice i64)` and `(slice u8)` can never both match.
-Two impls that *do* overlap with neither more specific (`(Pair i64 B)` and
-`(Pair A bool)`) are only an error where something actually instantiates the overlap:
-"ambiguous impls … none is more specific". Two impls with the same pattern (up to
-renaming) are always a "duplicate impl".
-
-**Dispatch** picks the impl by matching the receiver's type, trying the receiver's own
-type first and then auto-dereferencing through `(ptr …)`/`(mut …)` layers. So `(len p)`
-on a `(ptr (ArrayList i64))` finds `ArrayList`'s `Len` (pointers have none), while
-`(< p q)` finds the pointer's own `Ord` and compares addresses rather than peeling to
-the pointee's.
-
-⚠ You cannot impl on a reference type `(mut T)` — impl on `T` itself.
-
-**Inherent/extension methods.** Omit the trait to attach methods directly to a type.
-Generic and imported targets work too. A method whose first parameter is the target
-type (possibly behind `ptr`/`mut`) is receiver-dispatched from argument zero, so the
-call is bare; the parameter name is ordinary and need not be `self`.
-
-    (defstruct Point [(x i64) (y i64)])
-    (impl Point
-      (new [(x i64) (y i64)] (-> Point) …)       ; associated: no receiver
-      (sum [(p Point)] (-> i64) …)               ; receiver by value
-      (shift! [(p (mut Point)) (d i64)] (-> i64) …))
-
-    (let [(mut p) (Point::new 10 20)]
-      (shift! (mut p) 1)                         ; owner inferred from p
-      (sum p))
-
-A receiverless associated function has no argument from which to infer its owner, so
-call it as `Type::name`. Inherent methods take precedence over a same-named trait
-method for a matching receiver; `Trait::method` still explicitly selects the trait.
-Every type that can carry a trait impl can be extended: structs, sums, scalars,
-generic instances, pointers, slices, arrays, vectors, function pointers, and `Code`.
-An extension is present when its defining module is imported; duplicate applicable
-definitions are reported rather than silently selected. For a generic target:
-
-    (impl [T] (Box T)
-      (box [(x T)] (-> (Box T)) …)
-      (get [(b (Box T))] (-> T) …))
-    (let [b (Box::box 42)] (get b))              ; T inferred = i64
-
-**Trait objects:** `(dyn Trait)` is a copyable two-word value containing the concrete
-object pointer and a compiler-generated vtable pointer. It is valid in every ordinary
-type position: fields, sums, locals, parameters, returns, arrays, and generic containers.
-The legacy `dyn` module and `(defdyn Trait)` remain available to request explicit
-object-safety diagnostics, but are not required. A concrete `(ptr Implementer)` coerces automatically wherever a
-`(dyn Trait)` is expected, or explicitly with `(primitive/make-dyn Trait p)`. The trait's methods
-must take `(self (ptr Self))`; later parameters and the return type may not mention
-`Self`. Copying the dynamic value does not copy or preserve the concrete object: its
-`data` pointer follows the same validity rules as any other Coil pointer.
-
-**Callable values.** `Callable` is the conventional core marker for static call
-implementations. It is an ordinary namespaced trait, and `call` is an ordinary impl
-member rather than a reserved method. A `call` method's signature defines that type's
-arity, argument types, and result type. A local value in call-head position dispatches
-through the matching ordinary trait impl:
-
-    (defstruct Vec3 [(x i64) (y i64) (z i64)])
-    (defn get [(v Vec3) (i i64)] (-> i64) …)
-    (impl Callable Vec3
-      (call [(self Vec3) (i i64)] (-> i64) (get self i)))
-    (let [v (Vec3 :x 10 :y 20 :z 30)]
-      (v 2))                              ; statically dispatches to call, yields 30
-
-There is no boxed argument list, tuple value, vtable, or runtime trait lookup. The
-checker selects the impl from the head value's concrete type and lowers the expression
-to its ordinary monomorphized `call` function. `Callable.call` declares
-`:inline (Always)`, inherited through the normal function-annotation pipeline, so its
-dispatch wrapper cannot remain as an extra runtime hop. Defining `call` in any other
-namespaced trait works identically. More than one
-matching `call` implementation for a type is ambiguous; use a distinct wrapper type
-when the same underlying state needs a different signature.
-
-`Callable` uses a type pack to describe one fully typed family of signatures:
-
-    (deftrait Callable [Self Args... R]
-      (call :inline (Always)
-            [(self Self) (args Args...) ...]
-            (-> R)))
-
-`Args...` declares one type-sequence parameter. In a type sequence such as the
-parameter vector of `fnptr`, writing `Args...` expands that sequence. A value parameter
-whose type is a pack is followed by a separate `...`; its name is then available as an
-expression expansion (`args...`) in argument-list position. Packs are inferred as one
-ordered sequence, may be empty, and are substituted before ABI lowering. They never
-become a tuple, slice, boxed list, or runtime value. A specialization therefore has the
-same concrete signature as if every parameter had been written by hand.
-
-`coil.var/Var` is a pointer-backed generic value cell. Copying a `Var` copies the
-cell pointer, so every alias observes later updates. Use `Var::new` for an
-allocator-owned cell and `var-static` for a call-site static cell. For a
-function-pointer element type `Var` implements `Callable` with the same pack:
-
-    (import "coil.var" :use [Var var-static])
-    (let [a (malloc-allocator)
-          slot (Var::new a (primitive/fnptr-of old-code))
-          alias slot]
-      (slot 10)
-      (set slot (primitive/fnptr-of new-code))
-      (alias 10)
-      (destroy slot a))
-
-    (def hot
-      (var-static (fnptr c [i64] i64) (primitive/fnptr-of old-code)))
-    (hot 10)
-    (set hot (primitive/fnptr-of new-code))
-    (hot 10)
-
-After inlining, a call through such a `Var` loads the shared cell, loads its current
-function pointer, and performs one indirect call. Updating the cell changes subsequent
-calls through every alias without changing the `Var`'s static function-pointer type.
-
-A function-pointer type carries no parameter names, so a named call on a callable
-`def` needs them from the built-in `:params` annotation, a `(slice Keyword)` in
-parameter order. The call is ordered exactly as a function's would be, with
-arguments still evaluated in source order:
-
-    (def hot :params [:x]
-      (var-static (fnptr c [i64] i64) (primitive/fnptr-of old-code)))
-    (hot :x 10)
-
-The compiler reads the value from its literal form, so it must be a vector of
-keywords. The REPL publishes every `defn` this way, which is why `(double :x 3)`
-works there. The names are part of a REPL function's published signature: a
-redefinition may change the body but not the parameter names or types.
-
-`coil.closure/defclosure` generates a `Callable` closure and a typed
-`NAME-set-code!` operation. The closure retains its environment while the code pointer
-may be replaced, which is the stable value shape used by hot-reload tooling. Calls
-through it inline to a code-pointer load and indirect call.
-
-### Deriving trait implementations
-
-`coil.derive` implements the registry-backed generic form `(derive Trait... Type)`;
-`derive` itself is ambient and needs no import. A trait's deriver is registered by
-the module that defines that derivable trait, so that module must still be imported.
-A deriver is registered explicitly; its function name has no special meaning.
-Libraries and applications can define their own with one or both type-shape arms:
-
-    (deftrait Tag [Self] (tag [(x Self)] (-> i64)))
-    (defderive Tag
-      (struct [T] `(impl Tag ~T (tag [(x ~T)] (-> i64) 1)))
-      (sum [T] `(impl Tag ~T (tag [(x ~T)] (-> i64) 2))))
-
-    (defstruct Point [(x i64)])
-    (derive Eq Hash Tag Point)
-
-An option-bearing trait is written as a list. Options belong to that trait, so
-two configured derives spell the options twice rather than hiding which impl
-consumes them:
-
-    (derive (Serialize (rename-all :camelCase))
-            (Deserialize (rename-all :camelCase))
-            User)
-
-Either `struct` or `sum` may be omitted. Deriving that trait for the omitted
-shape is a direct error at the `derive` call. Duplicate registrations for one
-trait are errors rather than load-order-dependent overrides. `register-derive`
-is the lower-level spelling used by `defderive`; use it only when the deriver
-functions must be declared separately.
-
-## Numbers, bool, casts
-
-Int types `i8 i16 i32 i64 u8 u32 u64 …` (arbitrary width, real signedness).
-Floats `f32 f64`. `bool` is real (`true`/`false`). Literals infer width from
-context; hex `0x1F`, binary `0b1010`, octal `0o17`, underscores `1_000` (only between
-digits: `1_`, `1__0` and `0x_FF` are errors, as is a literal outside its type's
-range or a float past the f64 range like `1e400`).
-
-`(primitive/cast T x)` converts: `(primitive/cast i64 f)` truncates f64→i64 (numeric), `(primitive/cast f64 i)`
-converts int→float, `(primitive/cast (ptr T) x)` reinterprets pointers, `(primitive/cast i64 p)` is a
-pointer's address. ⚠ `cast` between f64 and i64 is a **numeric conversion, not a
-bit reinterpret**. For a bitcast (e.g. NaN-boxing) round-trip through memory:
-`(let [p (primitive/alloc-stack i64)] (store! p bits) (primitive/load (primitive/cast (ptr f64) p)))` —
-LLVM at -O3 folds this to a register move.
-
-## Control flow
-
-Core: `if`, `do`, `let`, `loop`/`break`/`continue`. `cond` is defined directly in
-`coil.core`; the other everyday macros are reexported there, so none require an
-import: `when unless cond case case-by while for and or not`.
-
-    (if cond then else)      ; ⚠ BOTH branches required, and they must have the
-                             ;    SAME type (the whole if yields a value).
-    (do a b c)               ; sequence, yields last
-    (let [x e (mut y) e0] …) ; bindings; (mut y) is a mutable stack cell
-    (loop … (break) … (break v) … (continue))
-    (cond t1 e1 t2 e2 … :else e)   ; :else is always true; a lone trailing clause
-                                   ;   is also an else (the older flat spelling)
-    (case x k1 e1 k2 e2 … default) ; x evaluated once; a dense integer case
-                                   ;   compiles to a JUMP TABLE
-
-⚠ `if` needs matching branch types. For effect-only conditionals write
-`(if c (do …effects… 0) 0)` so both sides are `i64`. `store!` yields unit (canonical
-`i64` 0), so `(if c (primitive/store! p ptr) 0)` type-checks directly — no wrapping `do` needed.
-
-**Destructuring.** `let` binds sequentially: each initializer sees the earlier
-bindings, and each initializer runs once. Brackets select a prefix of an array,
-slice, or Code list/vector. Extra elements are allowed; too few array elements
-are a compile error, too few slice elements abort, and malformed/short Code reports
-a macro error. `&` binds the remaining suffix as a view, and final `:as` names the
-whole value. `_` ignores a binding without suppressing its owner's cleanup.
-
-    (let [[x y & tail :as all] values] (+ x y))
-    (let [(Point :x x :y y) point] (+ x y))
-    (let [(Rect :lo (Point :x x) :buf [first & rest]) rect] …)
-    (let [((Pair i64 bool) :first n :second enabled) pair] …)
-    (let [(as whole (Point :x x)) point] …)
-
-Constructor patterns check the exact nominal struct type. Select any subset of
-fields with `:field pattern`; field order is free. `(as name pattern)` names a
-whole struct, leaving `:as` available for a struct field named `as`. Patterns may
-nest. Leaf names within one pattern must be distinct. `(mut name)` remains a
-simple top-level let binder; nested mutable leaves are rejected.
-
-Functions use the same patterns: a named function parameter is `(pattern Type)`,
-while an anonymous `fn` takes contextually typed bare patterns.
-
-    (defn sum-pair [([x y] (slice i64))] (-> i64) (+ x y))
-    (defn point-x [((as point (Point :x x)) Point)] (-> i64) x)
-    (point-x :point p)
-    (: (fn [[x y]] (+ x y)) (fnptr c [(slice i64)] i64))
-
-A structured parameter is positional-only unless its outer pattern supplies a
-whole-value name; that name becomes its named-call label. `_` has no label.
-Methods and closure parameters share these rules. Captures retain their existing
-syntax. Owning elements and owning fields cannot be extracted by value: such
-patterns are rejected rather than cloning or partially moving an owner. Ignoring
-an owning field is permitted, and ordinary scalar fields can be read from owners.
-Suffixes and aggregate views follow Coil's existing borrow/lifetime rules.
-
-`let`, `fn`, and `defn` are library macros exported by `coil.core`. Their compiler
-primitives are `let*`, `fn*`, and `defn*`, with simple binders only. Macro generators
-can use `coil.binding/destructure` and `coil.binding/normalize-parameters` to share
-the public pattern elaborator; parameter normalization returns
-`[primitive-parameters primitive-let-bindings]`.
-
-**Binding from a place.** When the initializer is already a place — another `(mut …)`
-cell, or a `(mut T)`/`(ptr T)` parameter — a bare name binds its **value**, and an alias
-is spelled `(mut …)`, exactly as at a call site:
-
-    (let [(mut a) 10]
-      (let [(mut b) (load a)] …)   ; b is a FRESH cell holding 10
-      (let [(mut c) (mut a)]  …)   ; c IS a; a store through either shows in both
-      (let [(mut d) a]        …))  ; ⚠ compile error — say which one you meant
-
-Struct and array places are the exception: `(let [v s])` on one is a **view**, not a
-deep copy, so passing a big struct around never copies it behind your back.
-
-There is no `return`. Structure with `if`, or use `(block :b … (return-from :b v))`.
-The LLVM backend guarantees constant-stack self recursion for scalar-only
-signatures (integer and floating-point parameters and results). Calls carrying
-references, pointers, or aggregates stay ordinary calls so arguments can safely
-borrow stack temporaries; LLVM may optimize them when it can prove safety.
+```output
+(Point :x 3 :y -4) is 7 blocks away
+area 12
+area 10
+```
+
+- Every form is `(operation argument…)`. The last expression of a body is its value.
+- `main` returns an `i64`, which becomes the process exit status.
+- A type follows the name it describes: `(x i64)`, `(-> i64)`.
+- `len`, `get`, `push!` and `iter` are trait methods, so they work on any
+  collection that implements them.
+- Definitions may appear in any order within a file.
+
+## Values and types
+
+| Type | Examples |
+|---|---|
+| Signed and unsigned integers of any width: `i8`, `i32`, `i64`, `u8`, `u64`, `i7`… | `42`, `-1`, `0xFF`, `0b1010`, `0o17`, `1_000_000` |
+| Floats: `f32`, `f64` | `1.5`, `2e10` |
+| `bool` | `true`, `false` |
+| Characters (an integer byte value) | `#\a`, `#\space`, `#\newline`, `#\tab`, `#\u41` |
+| Strings: `(slice u8)`, UTF-8, static storage | `"hello\n"`, `"\x1f603;"` |
+| C strings: `(ptr i8)`, NUL-terminated | `c"hello"` |
+| Keywords: `Keyword` | `:fast` |
+| `(ptr T)`, `(slice T)`, `(array T N)`, `(fnptr c [Args…] R)` | |
+
+An integer literal takes its width from context. A literal that does not fit its
+type is a compile error. `(: EXPR TYPE)` states a type where context doesn't
+supply one:
+
+```coil
+(module example.values)
+(defn main [] (-> i64)
+  (let [small (: 200 u8)
+        big (cast i64 small)
+        ratio (/ (cast f64 big) 3.0)]
+    (println "{} {} {}" small big ratio)
+    0))
+```
+
+```output
+200 200 66.666667
+```
+
+`(cast T x)` converts between integers, floats and pointers. Between `f64` and an
+integer it converts the *number* (truncating); it never reinterprets bits.
+
+⚠ `f64` has no `=`. NaN ≠ NaN, so floats don't implement `Eq`. Compare with
+`<`/`>`, or use `primitive/fcmp-eq` for IEEE equality.
+
+⚠ There is no unary `-`. `-5` is a literal; negate an expression with `(- 0 x)`.
+Operators take two arguments, so `(+ a b c)` is an error.
+
+## Bindings and control flow
+
+```coil
+(module example.control)
+(defn classify [(n i64)] (-> (slice u8))
+  (cond (< n 0) "negative"
+        (= n 0) "zero"
+        :else "positive"))
+
+(defn main [] (-> i64)
+  (let [limit 5
+        (mut total) 0]
+    (for i (range 0 limit)
+      (set! total (+ total i)))
+    (println "total={} sign={}" total (classify total))
+    (println "{}" (case total 10 "ten" 11 "eleven" "other"))
+    (let [found (block :search
+                  (for i (range 1 100)
+                    (when (= (% i 7) 0) (return-from :search i)))
+                  -1)]
+      (println "first multiple of 7: {}" found))
+    0))
+```
+
+```output
+total=10 sign=positive
+ten
+first multiple of 7: 7
+```
+
+- `let` binds in sequence. A plain name is immutable; `(mut name)` is a mutable
+  cell, written with `(set! name value)`.
+- `(if test then else)` requires both branches, and they must have the same type.
+- `(do a b c)` runs forms in order and yields the last.
+- `cond` takes flat test/value pairs; `:else` is always true. `case` compares one
+  value against keys with `=`, and a lone final clause is the default.
+- `when` evaluates its body if the test holds; `unless` if it fails.
+- `for x (iter coll)` walks any `Iterable`, and `(range lo hi)` is half-open.
+  `while`, `loop` with `(break value)` and `(continue)`, and labelled
+  `(block :name … (return-from :name value))` cover everything else.
+- There is no `return`; a function's value is its last expression.
+
+⚠ `when`, `unless` and the loops produce `i64` 0 when they don't run their body.
+In a function whose result is not `i64`, end with the real value:
+`(for …) result`.
+
+`scope` with `defer` runs cleanups in reverse order when the scope exits, including
+by `return-from`:
+
+```coil
+(module example.scope)
+(defn main [] (-> i64)
+  (let [(mut log) 1]
+    (scope :work
+      (defer (set! log (* log 10)))
+      (defer (set! log (+ log 2)))
+      (return-from :work 0))
+    (println "{}" log)
+    0))
+```
+
+```output
+30
+```
+
+### Destructuring
+
+`let` bindings and function parameters accept patterns:
+
+```coil
+(module example.destructuring)
+(defstruct Point [(x i64) (y i64)])
+
+(defn sum-pair [([a b] (slice i64))] (-> i64) (+ a b))
+
+(defn main [] (-> i64)
+  (let [[first second & rest] [10 20 30 40]
+        (Point :x px) (Point :x 1 :y 2)]
+    (println "{} {} {} {}" first second (len rest) px)
+    (println "{}" (sum-pair [3 4]))
+    0))
+```
+
+```output
+10 20 2 1
+7
+```
+
+- `[a b & rest :as all]` matches a prefix of an array, slice or Code list. `&`
+  binds the remainder, `:as` binds the whole value, and `_` ignores an element.
+- `(Point :x px)` selects any subset of a struct's fields, and patterns nest.
+  `(as whole (Point :x x))` names the whole struct.
+
+## Functions
+
+```coil
+(module example.functions)
+(defn move [(x i64) (dx i64) (scale i64)] (-> i64)
+  (+ x (* dx scale)))
+
+(defn largest [(T Ord)] [(a T) (b T)] (-> T)
+  (if (> a b) a b))
+
+(defn apply-twice [(f (fnptr c [i64] i64)) (x i64)] (-> i64)
+  (f (f x)))
+
+(defn main [] (-> i64)
+  (println "{}" (move 1 2 3))
+  (println "{}" (move :scale 3 :x 1 :dx 2))
+  (println "{} {}" (largest 3 9) (largest 2.5 1.0))
+  (println "{}" (apply-twice (fn [n] (* n n)) 3))
+  (println "{}" (fold (fn [acc n] (+ acc n)) 0 (map (fn [n] (* n 2)) (range 0 4))))
+  0)
+```
+
+```output
+7
+7
+9 2.5
+81
+12
+```
+
+- A generic function lists its type parameters before its parameters: `[T]`, or
+  `[(T Ord)]` to require a trait. Calls infer type arguments, or you can write
+  them: `(largest [i64] 3 9)`.
+- Any call may name its arguments, `(move :scale 3 :x 1 :dx 2)`. A call is either
+  all positional or all named, and Coil evaluates arguments left to right as
+  written.
+- `(fn [x] body)` is an anonymous function. Its parameter types come from the
+  expected function-pointer type or `Callable` bound. It cannot capture locals; use
+  `coil.closure/defclosure` when you need an environment.
+- `(fnptr-of name)` takes a named function's address. You call a value of `fnptr`
+  type like a function.
+
+### Compile-time value parameters
+
+A type parameter declared `(const N TYPE)` is a value known at compile time: an
+integer, `bool` or `Keyword`. It sizes arrays and makes types distinct:
+
+```coil
+(module example.quantities)
+(defstruct Quantity [(const Unit Keyword)] [(value f64)])
+
+(defn add [(const U Keyword)] [(a (Quantity U)) (b (Quantity U))] (-> (Quantity U))
+  (Quantity :value (+ (.value a) (.value b))))
+
+(defn length [T (const N i64)] [(xs (array T N))] (-> i64) N)
+
+(defn main [] (-> i64)
+  (let [a (: (Quantity :value 1.5) (Quantity :meters))
+        b (: (Quantity :value 2.0) (Quantity :meters))]
+    (let [sum (add a b)]
+      (println "{} {}" (.value sum) (length [1 2 3])))
+    0))
+```
+
+```output
+3.5 3
+```
+
+`(Quantity :meters)` and `(Quantity :feet)` are different types, so passing one
+where the other is expected is a type error. Type positions don't compute:
+`(array T (+ N 1))` is not a type.
+
+### Annotations
+
+Declarations take typed `:key value` annotations between the name and the
+parameter list. `defannotation` declares a key and its value type; metaprograms
+read them.
+
+```coil
+(module example.annotations)
+(defsum Route (Get [(path (slice u8))]) (Post [(path (slice u8))]))
+(defannotation :http/route Route)
+
+(defn list-users :http/route (Get "/users") [] (-> i64) 0)
+
+(defn square :inline (Always) [(x i64)] (-> i64) (* x x))
+
+(defn main [] (-> i64) (square (list-users)))
+```
+
+`:inline` (`Always`, `Hint`, `Never`) is built in. So is `:params`, which names the
+parameters of a callable `def`.
 
 ## Structs
 
-    (defstruct Point [(x i64) (y i64)])
-    (defstruct Rect  [(lo Point) (hi Point) (data (ptr u8)) (buf (array u8 64))])
-    (Point :x 10 :y 20)                    ; named construction
-    (Point :y 20 :x 10)                    ; field order is irrelevant
-
-Struct values are constructed with `:field value` pairs. Every declared field is
-required exactly once; missing, repeated, and unknown fields are compile errors.
-Argument expressions are evaluated from left to right in source order, then fields
-are initialized in declaration order. Sum variants accept the same named syntax for
-their payload fields: `(Rect :width 10 :height 20)`.
-
-Bracket expressions are homogeneous fixed-array literals. Their length is part of
-the inferred type: `[10 20 30]` has type `(array i64 3)`. An array literal is
-borrowed automatically when the expected type is `(slice T)`, including function
-arguments and named constructor fields:
-
-    (defstruct Header [(name (slice u8)) (value (slice u8))])
-    (defstruct Request [(headers (slice Header))])
-    (Request :headers [(Header :name "Accept" :value "application/json")
-                       (Header :name "User-Agent" :value "my-agent")])
-
-The backing array is a function-frame place, so the slice is suitable for a call or
-another value that does not outlive the frame. Literals do not allocate. Empty array
-literals are currently rejected because Coil has no zero-length array type. The same
-borrow is what gives an array the collection traits — see Collections below.
-
-- `(.name p)` reads a field value. It requires `p` to be a pointer/reference to a
-  struct. Accessors compose like ordinary Lisp calls: `(.x (.origin rect))`.
-- `(.. rect origin x)` is a core macro expanding to `(.x (.origin rect))`.
-- The same accessor denotes a place where surrounding syntax requires one:
-  `(mut (.name p))` borrows the field mutably and `(set! (.name p) value)` writes it.
-  Two-argument `set!` writes any place, including a mutable local or raw pointer;
-  three-argument `(set! collection key value)` remains the `Set` trait method.
-  Symbols beginning with `.` (except `..`) are reserved accessor heads. A
-  two-parameter function named `set!` is rejected because it could never be called.
-**Field access on a type that has no such field.** `(.name x)` reads a real field
-exactly as before. Only when the type has NO field `name` does the checker look for
-an impl member — `get-field`, `set-field!` or `field-place` — whose `Self` is
-`(Field X :name)`. `Field` is the prelude's zero-sized marker `(Field T (const Name Keyword))`:
-it names which field of which type, carries no value, and disappears with the
-inlined call. A type with no such impl gets the same error it always did.
-
-    (defstruct Celsius [(degrees f64)])
-    (impl FieldGet (Field Celsius :fahrenheit)
-      (get-field [(self (Field Celsius :fahrenheit)) (target Celsius)] (-> f64)
-        (+ 32.0 (* 1.8 (.degrees target)))))
-    (impl FieldSet (Field Celsius :fahrenheit)
-      (set-field! [(self (Field Celsius :fahrenheit)) (target (mut Celsius)) (value f64)] (-> i64)
-        (set! (.degrees target) (/ (- value 32.0) 1.8)) 0))
-    (let [(mut c) (Celsius :degrees 100.0)]
-      (.fahrenheit c)                  ; 212.0
-      (set! (.fahrenheit c) 32.0))     ; degrees is now 0.0
-
-- A read uses `get-field`, or reads through the place `field-place` returns.
-- `(set! (.name x) v)` uses `set-field!`, or writes through that place. A field with
-  a reader and no writer is a compile error naming the missing `set-field!`.
-- `(mut (.name x))` and a chain like `(.x (.origin h))` use `field-place`, whose
-  result type decides what comes next: a `(ptr T)` behaves like any place, and a
-  value that itself answers `.name` continues the chain.
-- One impl can cover every name: `(impl [(const N Keyword)] FieldGet (Field Bag N) …)`,
-  with `N` an ordinary `Keyword` value in the body. A concrete `(Field Bag :id)` impl
-  is more specific and wins.
-- Real fields always win, so a type cannot intercept a field it has. Two impls of the
-  same member for one `(Field X :name)` are ambiguous, as for `call`.
-- The trait names are conventions, like `Callable`: the member name is what the
-  checker looks for.
-
-- `field`, `load`, and `store!` remain available as explicit low-level place operations.
-  `(field p name)` returns a pointer/reference rather than reading it. Array field
-  element: `(index (field s buf) i)`. Prefer `.field` and two-argument `set!` in
-  ordinary code; `coil lint --fix` performs mechanically safe migrations.
-- Before an interactive project `build`, Coil quickly scans the project's readable
-  source forms for syntax that is genuinely no longer accepted, currently legacy
-  path imports and the removed `alloc-stack`, `alloc-static`, and `alloc-heap` call
-  heads. If it finds any, it offers to run the transactional `coil lint --fix`
-  migration before continuing. Valid explicit low-level operations such as
-  `primitive/load`, `primitive/store!`, and `primitive/field` do not trigger the
-  offer; the semantic linter may still modernize safe typed uses. The scan is based
-  on syntax actually present, not a project or compiler version. Non-interactive
-  builds never prompt or write; they print the migration command and continue.
-- `(primitive/zeroed T)` = a zero value; `(primitive/sizeof T)`, `(primitive/alignof T)`, `(primitive/offsetof S f)` are
-  compile-time.
-- Passing: `(p Point)` = **immutable ref** (a `store!` through it won't type-check);
-  `(mut Point)` = **mutable ref**, pass a place with `(mut place)`; `(ptr Point)` =
-  raw pointer (metal / FFI / allocators). A `let` of struct/array type is a stack place.
-- ⚠ `(primitive/field rvalue name)` fails — `field` needs a place (a pointer), not a value.
-  Load into a place first, or take its address.
-
-**Struct "inheritance" (C-style):** embed a header struct as the first field and
-cast pointers — the header is at offset 0, so `(primitive/cast (ptr Sub) hdrptr)` and
-`(primitive/cast (ptr Hdr) subptr)` are the same address.
-
-## Sum types (tagged unions)
-
-    (defsum Value (VBool [(b bool)]) (VNil) (VNumber [(n f64)]) (VObj [(o (ptr Obj))]))
-    (defsum Option [T] (None) (Some [(val T)]))   ; generic
-
-    (match v
-      (VBool [b] …) (VNil [] …) (VNumber [n] …) (VObj [o] …))   ; must be exhaustive
-    (Some 42)  (None)  (VNumber 1.5)             ; construct
-
-A variant payload accepts the same recursive binding patterns as `let` and
-function parameters. The variant still selects the arm; its payload patterns
-then destructure the selected fields. Each payload field remains one argument:
-
-    (defstruct Point [(x i64) (y i64)])
-    (defsum Event (Pair [(values (slice i64))]) (Located [(point Point)]))
-
-    (match event
-      (Pair [[left right & rest]] (+ left (+ right (len rest))))
-      (Located [(Point :x x :y y)] (+ x y)))
-
-Sequence `_`, `&`, and `:as`, constructor field selection, nesting, and
-`(as whole pattern)` retain their ordinary binding meanings. A payload pattern
-is required after its variant has matched; it does not cause dispatch to continue
-to another arm when an inner shape is too short. `match` still dispatches on sum
-variants rather than arbitrary literals or ordinary struct values.
-
-`match` must be exhaustive, and `(_ body…)` is the catch-all that makes it so —
-it covers every variant the explicit arms left out:
-
-    (match v (VNumber [n] n) (_ 0.0))    ; the other three variants -> 0.0
-    (match v (_ 0.0))                    ; legal: nothing left to cover
-
-The catch-all names no variant, so it takes **no bind vector** (its body starts right
-after the `_`), and it must be written **last** — arms after it could never run.
-Nothing else changes: without a `_`, leaving a variant out is still a compile error
-that names the missing variants.
-
-Stored by value (tag + payload). Fine inside structs and generic collections.
-Recursive sums need a `(ptr …)` child. `_` is also an ordinary wildcard binder in an
-arm's bind vector (`(VNumber [_] 1)`).
-
-**Choose `defsum` for a closed set of mutually exclusive shapes.** This is the
-default for `Option`/`Result`, state machines, protocol messages, syntax trees,
-and compiler type representations: adding a variant makes every non-exhaustive
-`match` a compile error. Prefer several small domain sums over one giant
-all-purpose node type. For a recursive syntax tree, keep recursive children
-behind pointers:
-
-    (defsum Expr
-      (IntLit [(value i64)])
-      (Add [(left (ptr Expr)) (right (ptr Expr))]))
-
-    (defstruct LocatedExpr [(line i64) (col i64) (expr Expr)])
-
-Use a `defstruct` with an integer `kind` tag only when a uniform,
-representation-sensitive record is intentional: for example, a hot token
-stream, bytecode instruction, FFI record, or an externally prescribed layout.
-Do not use it merely to avoid writing a sum; it permits invalid combinations of
-fields and does not make new cases visible to the type checker.
-
-## Pointers, memory, allocation
-
-Import the allocation API with `(import "coil.alloc" :as alloc)`. Use an initialized
-`(mut name)` local for ordinary frame storage. Use `alloc/box` (recoverable `Option`)
-or `alloc/box!` (diagnostic abort on exhaustion) for one initialized allocator-owned
-value. Raw `(primitive/alloc-stack T)` is only for genuinely uninitialized/unsafe
-storage such as an FFI output buffer. Low-level global cells may use
-`primitive/alloc-static`; hide them behind an accessor.
-
-`(primitive/alloc-stack-bytes count)` takes a `u64` byte count and returns an
-uninitialized `(ptr u8)`, aligned to 16 bytes. It allocates directly in the
-executing function's frame. The storage survives nested calls and lexical block
-exits, and is reclaimed when that function returns. Do not return its pointer or
-wrap this primitive in a function that returns the pointer. Each evaluation
-allocates fresh storage: using it in a loop grows the stack until function return.
-The caller must keep the count within available stack space; exhaustion is not a
-recoverable allocation failure. Zero bytes may return an address shared with
-another zero-sized allocation. This low-level operation currently requires the
-LLVM backend on AArch64 or x86-64; other backends reject it explicitly.
-
-An `llvm-ir` expression is not a substitute for this operation: its body is an
-LLVM helper function, and inlining does not extend a helper's stack allocations
-to the caller's lifetime.
-
-Everyday memory and layout operations are aliases in ambient `coil.core`: `load`,
-`store!`, `field`, `index`, `cast`, `sizeof`, `alignof`, `offsetof`, `zeroed`,
-`fnptr-of`, and `call-ptr`. Their primitive declarations live only in
-`coil.primitive`; core does not redeclare them.
-
-`(primitive/alias-load T p)` and `(primitive/alias-store! p value)` are unsafe,
-explicitly opt-in versions of scalar load/store. They promise that accesses through
-incompatible scalar types do not alias, allowing the LLVM backend to attach TBAA
-metadata. Use them only when implementing a source language with strict aliasing;
-ordinary Coil pointer casts remain permissive, so ordinary `load`/`store!` deliberately
-make no such promise. Signed and unsigned integers of the same width may alias, all
-pointer types may alias, and 8-bit integer accesses may alias any type.
-
-Allocator-owned storage is managed by `coil.alloc`. Raw storage operations are
-available only through `coil.primitive`,
-including unsigned `primitive/udiv`/`primitive/urem`, integer bit operations such as
-`primitive/ior` and `primitive/ishr`, and floating comparisons such as
-`primitive/fcmp-eq`. The modernization lint qualifies code written during the brief
-period when those names were accidentally ambient.
-
-`(primitive/index p i)` → `(ptr T)` at element i (pointer arithmetic, scaled by `sizeof T`);
-`(primitive/index p -1)` is p−1. Null: `(primitive/cast (ptr T) 0)`; null test `(= (primitive/cast i64 p) 0)`.
-
-**Comparing pointers:** `= != < <= > >=` work on any `(ptr T)` and compare
-**addresses** — `(= p q)` is identity (same slot), never a comparison of pointees.
-⚠ The metal `icmp-*` ops *reject* pointers ("comparison requires integers"), so these
-operators are how you compare them. Ordering makes range checks direct — e.g.
-`(and (>= p lo) (< p hi))` to test that `p` points inside a buffer.
-
-**Allocator API** (`alloc.coil`, thread a `(dyn Allocator)`):
-
-    (malloc-allocator)                 ; stable global libc allocator
-    (arena-allocator cap)              ; bump allocator
-    (alloc [T] a n)                    ; -> (Option (slice T))
-    (free [T] a memory)
-    (resize [T] a memory n)            ; fixed address only
-    (remap [T] a memory n)             ; may move; no copy fallback
-    (reallocate [T] a memory n)        ; remap or allocate/copy/free
-    (box a T value) / (box! a T value) ; initialized one-value storage
-    (destroy [T] a p)
-
-`Allocator` is object-safe: its raw methods mention the concrete `Self` only in the
-receiver, so implementations pass as borrowed, copyable `(dyn Allocator)` trait objects.
-They do not own or extend the implementation's lifetime. Every raw call carries an
-`AllocRequest` with `type-id`, logical `count`, actual `bytes`, and `align`. A TypeId is
-represented by that `i64` field: `type-id [T]` produces a process-local nonzero identity
-token (including for typed `u8`); only
-`bytes-request`/`alloc-bytes` use ID 0 for intentionally untyped bytes. IDs are policy
-and diagnostic data, not serializable values. Prefer the typed APIs, which construct and
-validate requests and preserve the request across free and growth.
-
-`coil.region` is a tracking allocator: it validates exact ownership and supports
-individual free/resize, while `region-close!` releases every remaining allocation.
-Ownership lookup and removal are expected O(1), backed by a pointer registry, so a
-Region may safely use another Region as its parent without quadratic teardown. Such
-nesting still doubles tracking work and metadata; `coil lint --use coil.lint.allocator`
-warns about it, and `--debug-checks` enables that lint plus a runtime warning.
-
-For high-churn temporary memory, prefer the owned segmented allocator in
-`coil.scratch`. It allocates in amortized O(1), treats individual free as a no-op,
-and releases backing segments on reset or close:
-
-    (import "coil.scratch" :as scratch)
-    (let [(mut scope) (primitive/zeroed scratch/ScratchArena)]
-      (scratch/scratch-init (mut scope) (malloc-allocator))
-      (let [a (scratch/scratch-allocator (mut scope))
-            mark (scratch/scratch-mark (mut scope))]
-        (temporary-work a)
-        (scratch/scratch-reset-to! (mut scope) mark)
-        (more-temporary-work a))
-      (scratch/scratch-close! (mut scope)))
-
-`scratch-reset!` releases every segment while keeping the arena usable;
-`scratch-close!` is idempotent and prevents later allocation. A mark belongs to one
-arena and becomes invalid if an earlier reset has already released its segment.
-Pointers allocated after a mark must not be used after `scratch-reset-to!`.
-
-## Opt-in ownership, deterministic drop, and reference counting
-
-Coil's existing raw/manual memory model remains the default. A type opts into
-automatic ownership only by implementing `Drop`, or by structurally containing a
-droppable value. The ambient ownership traits are ordinary, inspectable traits:
-
-    (deftrait Copy [Self])
-    (deftrait Clone [Self]
-      (clone [(self (ref Self))] (-> Self)))
-    (deftrait Drop [Self]
-      (drop [(self (mut Self))] (-> void)))
-
-An owning value is affine: binding, passing, returning, or storing it transfers
-ownership, and reusing the old binding is a compile error. `clone` is the explicit
-way to duplicate ownership. Raw pointers, references, slices, scalars, and legacy
-manual structs do not acquire a destructor or imply ownership of their pointees.
-`(derive Clone T)` generates fieldwise cloning; `(derive Copy T)` generates the
-marker only when the compiler can prove that no contained destructor would be
-skipped. Structs, active sum payloads, arrays, and generic instances receive
-recursive drop glue, in reverse field/element initialization order.
-
-Cleanup is deterministic on normal fallthrough, function exit, `break`,
-`continue`, labeled `return-from`, and replacement of an initialized mutable
-owner. Replacement covers a store through a mutable borrow, such as a
-`(mut T)` parameter, because a borrow always denotes an initialized value. A store through a raw `(ptr T)` never drops the
-old contents: the pointer may address storage the store is initializing, so
-raw stores stay unmanaged. A statement whose value nothing receives drops that
-value at the end of the statement when it is a fresh owner: a call or constructor
-result in a non-tail position of a body, or anywhere in a loop body. Naming an
-existing place as a statement neither moves nor drops it, and borrowed results,
-raw pointers and Copy values own nothing. It uses the same elaborated cleanup node in LLVM,
-arm64, x64, Wasm, and the interpreter. `Drop` and explicit `scope`/`defer` compose lexically: inner owning
-locals drop before an enclosing scope performs its LIFO defers.
-
-The deliberate escape hatches are:
-
-    (manually-drop owner)             ; suppress automatic destruction
-    (manually-drop-into-inner held)   ; consume wrapper, recover owner
-    (forget owner)                    ; consume without destruction
-    (take! [T] (mut owner))           ; move out, leave place uninitialized
-
-`coil.alloc.AllocatorLease` is an owned, cloneable allocator capability for values
-that can escape an allocator's lexical scope. It retains the allocator state and
-routes deallocation back to the allocator that created the storage. A borrowed
-`(dyn Allocator)` cannot be passed where a lease is required. Use
-`malloc-allocator-lease` for process-lifetime allocation or
-`coil.leased-region/leased-region-new` for a region that closes only after its last
-lease disappears. `unsafe-allocator-lease-new` is reserved for allocator
-implementations that can prove their borrowed dispatch object remains valid until
-the final lease release. Scratch/resettable allocators do not provide general
-escaping leases.
-
-`coil.rc` supplies thread-confined `Rc<T>`/`WeakRc<T>`; `coil.arc` supplies atomic
-`Arc<T>`/`Weak<T>`. Both store their allocator lease in the control block and
-support `new-in`, `clone`, borrow, count inspection, `downgrade`/`upgrade`, unique
-`get-mut`, `try-unwrap`/`into-inner`, and strong/weak destruction. The last strong
-owner drops `T` exactly once; the last weak owner moves the lease out, frees the
-control block through it, and only then drops the lease. Raw ownership transfers
-are explicit pairs such as `arc-into-raw`/`unsafe-arc-from-raw` and must be balanced
-exactly once. Strong cycles intentionally leak; use weak handles to break them.
-An `Arc` may cross threads only when the retained allocator lease and its callbacks
-are thread-safe; Coil does not yet express that requirement with a `Send`-like
-trait. Borrow accessors return non-owning pointers which must not outlive a strong
-owner—the affine checker is not a general pointer-lifetime checker.
-
-`coil.arc.auto` is the experimental whole-program transparent ARC transform. With
-the transform enabled, user modules keep ordinary structs, constructors,
-collections, bindings, calls, and closures; lowering supplies hidden ARC owners,
-retains, releases, and recursive destruction. Activation is compilation-unit
-configuration, not a lexical ownership scope. The definitive semantics and
-completion criteria are in `docs/design/TRANSPARENT_AUTOMATIC_ARC.md`.
-
-For Zig-style development allocation, `coil.dbgalloc` provides a stateful allocator
-that wraps any backing allocator while exposing the same ordinary `(dyn Allocator)`
-interface:
-
-    (import "coil.dbgalloc" :use *)
-    (let [debug (debug-allocator-init (malloc-allocator))
-          a (debug-allocator-view debug)]
-      (some-library-that-allocates a)
-      (let [leaks (debug-allocator-deinit! debug)]
-        …))
-
-The view can be stored and passed anywhere another allocator can. It tracks exact
-allocation ownership in allocator-owned metadata, checks prefix/suffix red zones,
-rejects arbitrary and interior-pointer frees without dereferencing the suspect
-pointer, checks free size and alignment, detects double frees, and poisons and
-quarantines freed payloads. `debug-allocator-deinit!` releases the registry and all
-backing blocks, prints a diagnostic when live allocations remain, and returns the
-live allocation count (`0` means leak-free). It must run only after all threads have
-stopped using the allocator view.
-
-The convenience macro `(debug-allocator inner)` returns a wrapped allocator under
-`--debug-checks` and exactly `inner` otherwise, for zero-cost conditional checking.
-Use the explicit init/view/deinit API when leak checking or deterministic teardown is
-required regardless of compiler flags. `coil.guardalloc` is the heavier alternative:
-it places allocations next to inaccessible pages and protects quarantined payload
-pages so stale accesses fault immediately.
-
-## Collections (bundled)
-
-The ambient capability traits are the public vocabulary across collections:
-`Len`/`len`, `Get`/`get`, `Set`/three-argument `set!`, `Push`/`push!`,
-`Pop`/`pop!`, and `Iterable`/`iter` plus `Iterator`/`next`. A collection implements
-only the operations its representation can support. `(empty? xs)` works for any
-`Len`; `(for x (iter xs) ...)` works for any `Iterable`. Prefer these methods in
-application code and examples: they state the capability being used and keep code
-generic over any type with the same trait. Namespace-specific functions are for
-construction, ownership, representation-specific operations, and implementing the
-traits; they are not alternate spellings to teach for a trait operation.
-
-| Namespace and type | Implemented traits and methods |
-|---|---|
-| `coil.slice`: `(slice T)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Iterable` (`iter`) |
-| `coil.arraylist`: `(ArrayList T)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Push` (`push!`), `Pop` (`pop!`), `Iterable` (`iter`) |
-| `coil.hashmap`: `(HashMap K V)` | `Len` (`len`), `Get` (`get`), `Set` (`set!`), `Iterable` (`iter`, over keys) |
-| `coil.pmap`: `(PMap K V)` | `Len` (`len`), `Clone`, `Drop`; persistent (below) |
-| `coil.pvec`: `(PVec T)` | `Len` (`len`), `Clone`, `Drop`; persistent (below) |
-| `(array T N)` | the `(slice T)` row, reached by borrowing (below) |
-
-The bundled collection traits are implemented on `(slice T)`, not on arrays. An
-array could carry its own impls through a length parameter,
-`(impl [T (const N i64)] Size (array T N) …)`, but it does not need to: an array
-BORROWS as a slice wherever a slice is wanted, and that borrow reaches trait dispatch
-too. An impl on the array type itself is tried first. So `(len xs)`, `(get xs i)`,
-`(set! (mut xs) i v)`, `(for x (iter xs) ...)`, and the `coil.iter` adapters all
-work on an array and behave exactly as they do on `(slice T)`:
-
-    (let [xs [10 20 12]]
-      (len xs)                                   ; 3
-      (for x (iter xs) ...)                      ; the slice's SliceIter
-      (fold (primitive/fnptr-of add) 0 xs))      ; a (C (Iterable I)) bound
-
-Writes go through to the array's own storage, and the receiver still obeys the
-ordinary mutability rules: three-argument `set!` wants a `(mut Self)`, so it is
-spelled `(set! (mut xs) i v)` and rejected on an immutable binding. The array's own
-type is always tried first, so an `(impl Len (array i64 3))` written for one literal
-length still wins for that length. `(over ARR LEN)` remains available as the
-length-explicit `for` form, and `(index xs i)` remains the low-level element place.
-
-`coil.iter` provides allocation-free lazy ranges, adapters, and consumers over this
-same protocol. Adapter constructors accept any `Iterable`, mint its iterator once,
-and pull only when the result's `next` is called. Its public sequence operations
-are part of the ambient core vocabulary, so no import is required:
-
-    (let [xs (take 10
-               (filter (primitive/fnptr-of divisible-by-four?)
-                 (map (primitive/fnptr-of double) (range 0 100))))]
-      (fold (primitive/fnptr-of add) 0 xs))
-
-`range` is half-open (`start` through `end - 1`) and itself implements both
-`Iterable` and `Iterator`. Lazy adapters are `map`, `filter`, `take`, `skip`,
-`enumerate`, `chain`, and `zip`. Consumers are `fold`, `count`, `find`, `any?`, and
-`all?`. Following Clojure, callbacks and counts precede the collection: `map f coll`,
-`filter pred coll`, `take n coll`, `skip n coll`, and `fold f init coll`. Mapping and
-predicates use typed function pointers. No adapter allocates or
-materializes an intermediate collection; `take` therefore safely bounds a pipeline
-whose source iterator can otherwise be infinite.
-
-For an `ArrayList`, `get` returns an element by value and the mutating methods take
-`(mut …)`. Create one with `(al-new [T] a)` and release its backing storage with
-`(al-free! (mut xs))`.
-`coil.collect` provides allocator-explicit, trait-dispatched construction of owned
-collections from array literals or slices:
-
-    (import "coil.collect" :use [collect])
-    (let [(mut xs) (collect [(ArrayList i64)] allocator [10 20 30])]
-      ...
-      (al-free! [i64] (mut xs)))
-
-`collect` dispatches through the public `Collect` trait; collection modules can add
-implementations without compiler support. The allocator is deliberately explicit—
-the bracket literal itself is inline storage and never silently selects a heap.
-For a `HashMap`, `get` returns `(Option V)` and three-argument `set!` inserts or
-updates. Construct scalar-key maps with `(hm-new-scalar [K V] a)`
-or supply key operations to `(hm-new [K V] a ops)`. Removal and storage release
-are representation-specific: use `hm-remove!` and `hm-free!`. String keys:
-`(str-keyops)` from `str.coil` OWNS keys
-(each is copied into the map's allocator on insert and freed on remove/clear/free);
-`(str-keyops-borrowed)` opts into borrowing (the key bytes must outlive the map).
-Type args `[T]` come right after the name; usually inferable, so often omittable.
-
-**Persistent collections.** `coil.pmap` (`PMap K V`, a hash trie) and `coil.pvec`
-(`PVec T`, an indexed trie with a tail) are immutable values with structural
-sharing: an update returns a new collection that shares every untouched node with
-the old one, which stays valid and unchanged. Use them when two owners need the
-same data at different versions — snapshots, undo, a candidate edit over an
-accepted state — and copying the whole collection per version is the cost you are
-trying to avoid. For one owner mutating in place, `HashMap`/`ArrayList` are faster.
-
-    (import "coil.pmap" :use *)
-    (let [a (pm-new-scalar [i64 i64] (malloc-allocator-lease))
-          b (pm-assoc a 7 42)]                    ; a is still empty
-      (match (pm-get b 7) (Some [v] v) (None [] 0)))
-
-    (import "coil.pvec" :use *)
-    (let [(mut v) (pv-new [i64] (malloc-allocator-lease))]
-      (pv-push! (mut v) 10)
-      (let [snapshot (clone v)]                   ; O(1): shares every node
-        (pv-set! (mut v) 0 11)                    ; copies one leaf; snapshot holds 10
-        (pv-get snapshot 0)))
-
-Both are **owners**: `Clone` shares the structure in O(1) and `Drop` releases it, so
-they follow the affine rules above, and a struct holding one becomes an owner too.
-They take an `AllocatorLease`, not a borrowed `(dyn Allocator)`, because a shared
-node outlives the scope that allocated it. Keys, values and elements must implement
-`Clone` (scalars, pointers and slices do) and may themselves be owners: a copied
-node clones them and a freed node drops them, exactly once each.
-
-| Pure (takes a `ref`, returns a new value) | In place (takes `(mut …)`) |
-|---|---|
-| `pm-assoc m k v`, `pm-dissoc m k` | `pm-assoc! (mut m) k v` → 1 if new, `pm-dissoc! (mut m) k` → 1 if removed |
-| `pv-push v x`, `pv-set v i x`, `pv-pop v` | `pv-push! (mut v) x` → length, `pv-set! (mut v) i x` → 1 if in range, `pv-pop! (mut v)` → `(Option T)` |
-
-The `!` forms are not a different data structure: they edit a node in place only
-when it and every node above it have a single reference, which is exactly when no
-other value can observe the edit, and copy the path otherwise. Building a
-collection with them from a fresh `pm-new`/`pv-new` never copies a node. Reads are
-`pm-get`/`pv-get` (cloned out, `(Option V)`), `pm-get-ptr`/`pv-get-ptr` (borrowed
-`(Option (ptr V))`, valid while a collection sharing that node lives and is not
-edited in place), `pm-contains?`, `pm-len`/`pv-len`, and the borrowing cursors
-`pm-iter` (yields `(ptr (PEntry K V))`) and `pv-iter` (yields `(ptr T)`). `PMap`
-hashes through `coil.hashmap`'s `KeyOps`, non-owning ops only. `pm-diff before after
-same visit context` calls `visit` once per key on which two maps differ (a null pair
-marks the side lacking the key; `same` compares two values) and **skips every subtree
-the maps share without reading it**, so diffing a map against an edit of it costs
-what the edit cost. That is how to keep a derived index in step with a persistent
-map: apply diffs, never rescan. Neither is thread
-safe: the counts are plain integers, as in `coil.rc`.
-
-## Strings & bytes
-
-`"…"` has type `(slice u8)` (UTF-8 bytes, static storage). `c"…"` has type
-`(ptr i8)` (NUL-terminated C string, for FFI/`printf`). ⚠ Don't pass `"…"` to a
-`(ptr i8)` param or `c"…"` to a `(slice u8)` param.
-
-Hexadecimal escapes require an explicit semicolon terminator. In ordinary strings,
-`"\x0;"`, `"\x3bb;"`, and `"\x1f603;"` denote Unicode scalar values encoded as
-UTF-8. An empty escape, a missing semicolon, a surrogate, or a value above
-`0x10ffff` is a reader error. C strings preserve their byte-oriented contract:
-`c"\xff;"` emits exactly one byte, and values above `0xff` are rejected.
-
-`(slice T)` is a fat pointer `{data, len}`. `(slice-data s)`, `(slice-len s)`,
-`(slice-get s i)`, `(subslice s lo hi)`, `(slice-new [T] ptr n)`. String helpers
-(`str.coil`): `(str-len s)`, `(char-at s i)`, `(str-eq a b)`, `(str-hash s)`,
-`(substr s lo hi)`, `(str-concat a x y)`.
-
-`coil.str` also provides validated text types alongside the compatible byte-slice
-API. `StringView` is a borrowed immutable view of valid UTF-8; `String` is an owned,
-growable UTF-8 buffer that stores its allocator and is released explicitly:
-
-    (let [view (string-view-unchecked "hello") ; trusted literal -> StringView
-          (mut text) (string-from-view allocator view)]
-      (string-push-view! (mut text) (string-view-unchecked " world"))
-      (print-str writer (string-view-bytes (string-as-view (load text))))
-      (string-free! (mut text)))
-
-Use `(string-view-from-utf8 bytes)` for untrusted bytes; it returns
-`(Result StringView Utf8Error)`. `(string-view-bytes view)` borrows the underlying
-bytes. `(string-clone allocator text)` makes an independent owner. As with
-`al-slice`, a `StringView` into a `String` is invalidated by mutation or free.
-`(string-from-utf8 allocator bytes)` validates and copies into an owner.
-`(string-take! (mut text))` transfers ownership and resets the source;
-`(string-into-bytes! (mut text))` transfers the allocation as a byte slice.
-
-`Rune` represents a Unicode scalar value. `(rune-new value)` validates it, and
-iteration over `StringView` or `String` currently yields `Rune` values. Text has no
-integer `Get`/`Set`; `(string-index-at-byte view offset)` accepts only UTF-8 scalar
-boundaries and returns an opaque `StringIndex`. Search returns the same index type:
-`string-view-find`, `string-view-contains?`, `string-view-starts-with?`, and
-`string-view-ends-with?`. `String` implements `TextWrite`, whose `write-view!` and
-`write-rune!` methods append validated text without exposing byte mutation.
-`string-view-trim-ascii` and `string-view-split` return borrowed views; splitting is
-an allocation-free `StringSplitIter` driven with `next`.
-
-`(sv "literal")` is the concise, zero-validation spelling for a literal
-`StringView`; it rejects non-literal arguments at expansion time. Ordinary string
-literals remain `(slice u8)` during migration, so byte-oriented code does not change
-meaning implicitly.
-
-Import `coil.unicode.grapheme` for Unicode extended grapheme clusters. `(chars
-view)` returns an iterable whose items are borrowed `Char` views. Its generated
-Unicode 17 tables implement UAX #29 GB3–GB13, including combining sequences, Hangul,
-emoji ZWJ sequences, regional indicators, and Indic conjuncts. Scalar iteration in
-`coil.str` remains available without pulling the Unicode tables into the reachable
-program.
-
-For migration inventory, mark a declaration with `;; string` and run:
-
-    coil lint file.coil --use coil.lint.string
-
-The checker classifies marked `(slice u8)` declarations as propagation-required,
-byte-mutation-ambiguous, or stale-marker. It is report-only: it does not apply a
-local signature rewrite that would leave callers ill-typed.
-
-## Character literals
-
-`#\a` `#\Z` `#\0` are that byte's value (an integer literal). Delimiters/quotes work:
-`#\(` `#\)` `#\[` `#\]` `#\"` `#\;`. Named: `#\space`=32 `#\newline`=10,
-`#\tab`=9 `#\return`=13 `#\nul`=0 `#\backspace`=8, and `#\formfeed`=12.
-Hex: `#\u41`=65.
-They are plain `i64` literals — use with metal/clean ops after casting the byte:
-`(= (primitive/cast i64 (primitive/load p)) #\a)`.
-
-## Functions & function pointers
-
-    (defn name [(a T) (b U)] (-> R) body…)   ; last expr is the return value
-    (defn id [T] [(x T)] (-> T) x)            ; generic: [T] before the arg list
-    (defn width [T (const N i64)] [(xs (array T N))] (-> i64) N)   ; value parameter
-    (defn hot-add :inline (Always) [(a i64) (b i64)] (-> i64) (+ a b))
-    (defn f [(p (mut Rect))] (-> i64) …)      ; mutable-ref param
-    (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64) …)   ; CLI entry
-
-**Value parameters.** A generic parameter is a type or, declared `(const NAME TYPE)`,
-a compile-time value of an integer type, `bool`, or `Keyword`. The declaration
-decides the kind, and every generic argument is checked against it:
-
-    (defstruct Buffer [T (const N i64)] [(used i64) (items (array T N))])
-    (defstruct Quantity [(const Unit Keyword)] [(value f64)])
-    (defn meters [(q (Quantity :meters))] (-> f64) (.value q))
-    (impl [T (const N i64)] Len (Buffer T N) …)
-
-- Constant arguments are literals: `4`, `true`/`false`, `:meters`. A keyword in type
-  position is always a Keyword constant, so primitive types are written bare (`i64`,
-  never `:i64`). `(const X)` spells any constant explicitly; it is required when an
-  explicit argument vector holds only constants, because `[16]` is an array literal:
-  `(Quantity [(const :meters)] :value 1.0)`.
-- Two instances are the same type exactly when their arguments are equal:
-  `(Quantity :meters)` is one type everywhere, distinct from `(Quantity :feet)`.
-- An integer argument must fit its declared type; `300` for `(const N u8)` is an error.
-- Value parameters size arrays and vectors, `(array T N)` and `(vec T N)`, and are
-  arguments to generic structs and sums. They are inferred from argument types like
-  type parameters, and a conflicting inference is an error.
-- In an expression a value parameter is its value, with its declared type. A local
-  of the same name shadows it; it shadows module constants and globals.
-  Monomorphization replaces it with the literal. Inside `(comptime …)` in a generic
-  definition it is an error, because comptime evaluates the definition once, before
-  specialization.
-- Type positions do not compute: `(array T (+ N 1))` is not a type.
-- Older source that wrote `:i64` for a type, or `[T N]` for a width, no longer loads;
-  `coil lint --fix` rewrites both (including a width passed to another module's
-  declaration), and `coil build` offers to run it.
-
-Non-capturing anonymous functions use Clojure-shaped parameter lists. Their
-parameter types come from the expected function-pointer type or a `Callable`
-bound, and their return type is inferred from the body:
-
-    (map (fn [x] (+ x 2)) (range 0 10))
-    (fold (fn [total value] (+ total value)) 0 values)
-
-An anonymous `fn` lowers to an ordinary `c` function pointer, so it may refer to
-its parameters, constants, and global functions but cannot capture an enclosing
-runtime local. A capture is a compile error that names the local. Pass that value
-as an explicit parameter, or use `coil.closure/defclosure` when stored environment
-is required. When no call context supplies the signature, ascribe one explicitly:
-
-    (: (fn [x] (+ x 2)) (fnptr c [i64] i64))
-
-Ordinary Coil functions may be called with `:parameter value` pairs in any order:
-
-    (defn move [(point Point) (dx i64) (dy i64)] (-> Point) …)
-    (move :dy 20 :point p :dx 10)
-
-Every parameter is required exactly once; missing, repeated, and unknown parameters
-are compile errors. A call is either entirely positional or entirely named. Named
-argument expressions are evaluated from left to right in source order, while values
-are passed to the function in declaration order. Extern, variadic, function-pointer,
-and callable-value calls remain positional. To pass a keyword as the first positional
-argument, group it with a type ascription: `(takes-keyword (: :hot Keyword))`.
-
-**Function pointers** (native callbacks, dispatch tables):
-`(fnptr c [ArgTs…] Ret)` is the type (`c` = C convention); `(primitive/fnptr-of fn)` takes a
-function's address; `(primitive/call-ptr fp args…)` calls indirectly. The ambient
-`fnptr-of` and `call-ptr` names are core aliases of those declarations. A normal `defn` can be
-taken as a `(fnptr c …)` and called indirectly. When C will invoke a callback
-that takes a struct by value, include the function in `export-c`; `fnptr-of` then
-returns the address of that function's public C ABI entry, which unpacks the C
-argument representation before entering Coil. Do not add an `extern` declaration
-for that exported symbol: `extern` imports a definition supplied by another link
-unit, while `export-c` defines it in the current one. Aggregate returns cross the
-call correctly. Forward references within a file resolve (mutual recursion is
-fine) — define in any order.
-
-Declarations accept open, typed annotation pairs between the name and parameter
-list. Define an annotation key with its value type, then use any Coil expression
-of that type as its value:
-
-    (defsum Route (Get [(path (slice u8))]) (Post [(path (slice u8))]))
-    (defannotation :http/route Route)
-    (defn users :http/route (Get "/users") [] (-> i64) …)
-
-Annotation values are evaluated once at compile time. Unknown keys, duplicate
-uses on one declaration, and values of the wrong type are compile errors. Keys
-are open—libraries may define their own—and values may be sums, structs, keywords,
-or results of arbitrary compile-time-evaluable expressions.
-
-Two annotations are built in and cannot be redeclared. `:params`, a
-`(slice Keyword)`, applies to a `def` and names the parameters of the callable it
-holds (see `Var`). `:inline` applies to functions and has value type
-`InlinePolicy` (`Always`, `Hint`, or `Never`). The three policies map to LLVM `alwaysinline`, `inlinehint`, and `noinline`,
-respectively. Large parallel O3 builds perform mandatory inlining before
-partitioning, so module splitting cannot silently strand an annotated callee in
-another partition.
-
-Keywords are first-class `Keyword` values. A literal such as `:hot` constructs a
-keyword value in expression position; keywords consumed by a surrounding special
-form, such as `:else` or an annotation key, retain their syntactic role.
-
-## Global mutable state
-
-`(def NAME VALUE)` and `(def NAME TYPE VALUE)` introduce ordinary runtime module
-bindings with static storage. Like a `defn`, a `def` takes declaration
-annotations between its name and its optional type:
-`(def NAME :key value … [TYPE] VALUE)`. The initializer is evaluated as a link-time constant;
-the untyped form infers its value type. A reference to `NAME` loads the current value:
-
-    (def answer 42)
-    (def state (var-static i64 0))
-    (set state (+ (get state) 1))
-
-Use explicit low-level `primitive/alloc-static` inside a zero-arg accessor when the
-cell itself, rather than a named module value, is the desired API:
-
-    (defn counter [] (-> (ptr i64)) (primitive/alloc-static i64))
-    (primitive/store! (counter) (+ (primitive/load (counter)) 1))
-    ; for a global struct singleton (like a VM):
-    (defstruct VM [(x i64) …])
-    (defn vm [] (-> (ptr VM)) (primitive/alloc-static VM))   ; (primitive/load (primitive/field (vm) x)) …
-
-`(primitive/alloc-static T INITIAL)` gives the same persistent writable cell,
-but lays `INITIAL` into the binary instead of running stores to construct it.
-The initializer is checked as `T` and must be a link-time constant; aggregate
-constructors, numeric constant expressions, null pointers, C strings, and
-`primitive/fnptr-of` relocations are supported. The global carries `T`'s
-alignment. An initializer that depends on runtime state is rejected.
-
-`(primitive/alloc-static T :as "native_symbol")` gives that allocation an
-explicit public linker name. The symbol denotes the bytes of `T` themselves,
-not a pointer-valued proxy, so native code and Coil code share one address and
-one value. `:as` composes with an ordinary initializer or `:elements`, in either
-option order. `linker-address` can reference it before or after its definition.
-Multiple allocation sites must not claim the same linker name; emission rejects
-duplicate definitions. This low-level facility is intended for ABI generators; authored
-Coil APIs should normally keep storage behind an accessor. Named static storage
-is supported by LLVM and direct AArch64. Other direct backends and the bytecode
-interpreter reject it explicitly rather than silently hiding the requested
-symbol.
-
-For a mostly-zero array, `(primitive/alloc-static (array i64 708334)
-:elements [(0 1) (708333 42)])` stores only the specified constant elements in
-the compiler; all other elements are link-time zero. Indices must be integer
-literals, in bounds, unique, and strictly increasing. This creates ordinary
-writable, aligned array storage, visible to native constructors before `main`;
-there are no runtime initialization stores. Nested array entries may use
-`(:elements [(INDEX VALUE) ...])` as their value. The compact representation
-is supported by LLVM and direct AArch64, like initialized `alloc-static`;
-backends without initialized-static support reject it.
-
-`(const NAME VALUE)` / `(const NAME TYPE VALUE)` — compile-time immutable bindings.
-The value is ANY expression, run at compile time: `(const OP_RETURN 0)`, `(const
-FACT5 (fact 5))`. An aggregate const (struct/array) is evaluated once and emitted as
-a static global (a compile-time lookup table): `(const SQUARES (build-squares))`.
-
-## Compile-time: comptime, macros, reflection
-
-The whole language runs at compile time — one language, two phases. No separate
-macro dialect.
-
-**`(comptime E)`** evaluates `E` during compilation and splices the literal result:
-`(comptime (fact 5))` compiles to the constant `120` (no call in the output). `E` is
-compiled and run as native code, so **the whole language is available**: arithmetic,
-`if`/`let`/`loop`, `match`, mutable locals, memory, **generics**, **`sizeof`/`alignof`
-/`offsetof`**, allocators and collections, and even **`extern` FFI** (a comptime
-`(strlen c"hello!")` really calls libc).
-
-The limit is the RESULT, not the computation — it must be materializable as a
-literal: a scalar, a plain struct, a plain sum, an array, or a string. Two things are
-a clear located error, never a miscompile:
-
-- a **pointer** (a comptime address would be meaningless in the built program), and
-- an aggregate that is a **generic instance** — `(comptime (mk))` returning
-  `(Option i64)` or `(Pair i64 i64)` reports "cannot be materialized". Return a plain
-  (non-generic) struct or sum instead, or return the scalar you actually need.
-
-Build a lookup table with a loop and index it at runtime. ⚠ Deep **self-recursion**
-at comptime is not tail-call-optimized on this path — around 10M frames it crashes the
-compiler rather than erroring; write comptime loops with `loop`, which is unaffected.
-
-**Macros are ordinary functions** `[Code…] (-> Code)` — detected by type, no
-`defmacro`. `Code` is a first-class value: quote a form with `` `FORM ``, splice a
-value in with `~E`, splice a list's elements with `~@E`. Template identifiers keep
-their definition context; unquoted syntax keeps its original context. Equal printed
-spelling never establishes a binding across independently built fragments.
-
-Create a readable local identifier once with
-`(primitive/fresh-identifier "temporary")`, pass that `Code` value through helpers,
-and unquote the same value at every binding/reference site. `primitive/gensym`
-remains shorthand for an anonymously named fresh identifier. Plain `'name` is
-metaprogram-authored syntax too, with the same identity rule as a template
-literal: create it once and reuse the value if two fragments must share it. The explicit context
-operations are `(primitive/datum->syntax prototype "name")` (intentional capture),
-`syntax->datum`, `free-identifier=?`, and `bound-identifier=?`; context introduction
-must not be hidden behind `code-symbol`. `&` before the last param makes a macro
-variadic (soaks up the rest as one Code list). Calls expand inline, outside-in:
-
-Use `coil dump-hygiene file.coil` when auditing generated code. It prints the
-expanded program with canonical `scope`, definition `module`, syntax `origin`,
-and transport `flags` metadata while ordinary dumps and diagnostics continue to
-show readable source names. An unscoped `code-symbol` used as a lexical identifier
-is a hard error; it is suitable only for syntax data such as fields and keywords.
-
-    (defn when [(c Code) (body Code)] (-> Code) `(if ~c (do ~@body) 0))
-    (when (< x 10) (println "small"))     ; → (if (< x 10) (do (println …)) 0)
-
-**`(meta (gen …))`** runs a generator at compile time and splices its result as new
-top-level forms; later code may depend on what it generates. A name in the
-generator's template carries the generator's own definition context, so a
-declaration the surrounding program refers to by hand is published with the
-explicit context removal — `` `(const ~(primitive/syntax->datum `O_CREAT) 512) ``
-(`src/stdlib/fs.coil` is the worked example). A name only the generated forms use
-needs no such thing; `primitive/fresh-identifier` gives it its own identity.
-
-**Reflection** — introspect a type by name at comptime (fold to literals):
-`(primitive/field-count T)`, `(primitive/variant-count T)`, `(primitive/struct? T)`/`(primitive/sum? T)`/`(primitive/int? T)`/`(primitive/float?
-T)`/`(primitive/ptr? T)`/`(primitive/array? T)`, `(primitive/field-name T i)`, `(primitive/field-type-kind T i)`,
-`(primitive/field-type-name T i)`, `(primitive/field-index T "name")`. Inside a macro (where a type
-arrives as a Code symbol) use the `code-*` family: `code-field-count`/`-name`/`-kind`
-/`-type`, `code-type-shape` (safely returns `struct`, `sum`, or `unknown` without
-calling a shape-specific reflector), `code-variant-sum`/`-count`/`-name`/`-fields`,
-`code-variant-field-name`/`-type` (a variant's payload field by `(SUM VIDX FIDX)`;
-the type comes back structured and canonically qualified), and trait reflection
-`code-trait-method-count`/`-name`/`-arity`/`-param-type`/`-ret-type` (for generating
-vtables). Take Code apart with `code-count`/`code-nth`/`code-rest`/`code-sym`
-/`code-list?`/`code-sym?`/`code-int?`. This makes `derive` (`derive.coil`:
-eq/hash/keyops) a pure library, not a compiler builtin.
-
-**Memory, made explicit** (docs/design/META_MEMORY.md). Every operation above is
-O(1) — `code-rest` and `(primitive/code-slice CODE LO HI)` return *views* that
-alias the parent list, which is why cdr-style recursion over Code is linear.
-The only operations that copy say so in their names: `(primitive/code-copy c)`
-(the deep copy — fresh structure and string payloads) and
-`(primitive/code-concat a b)` (a fresh list of A's elements then B's).
-
-Lists are **built**, never grown by re-splicing: `(primitive/code-list-new)`
-makes a `CodeBuilder` — its own type, not `Code` — `(primitive/code-list-push!
-b elem)` appends, and `(primitive/code-list-done b)` (or unquoting `b` into a
-template) freezes it into `Code`. The checker holds the line in both
-directions: pushing onto finished Code and reading an unfrozen builder are
-compile errors. Writing `` `(~@acc ~x) `` to append — which copies the whole
-accumulator per element — is flagged by the standard-profile lint
-`coil.lint.meta`, along with `code-rest` fed to its own recursion and splicing
-a recursive result per level.
-
-Finished `Code` is also an ordinary immutable collection of child `Code` values:
-`(len form)`, `(get form i)`, and `(for child (iter form) ...)` delegate to the
-O(1) code accessors and preserve syntax identity, hygiene, source provenance, and
-views. Non-list syntax has collection length zero (`code-count` itself remains a
-strict list/vector primitive). `CodeBuilder`
-implements `Push` but deliberately not `Len`, `Get`, or `Iterable`; use a mutable
-binding and `(push! (mut builder) child)`, then
-freeze with `(primitive/code-list-done (load builder))`. More commonly,
-`(code-extend! builder form)` appends every child and returns the builder, while
-`(code-collect form)` returns a new finished list. This lets metaprograms use the
-same iterator and push vocabulary as ordinary collection code without weakening
-the arena lifetime or allowing finished syntax to mutate.
-
-Each metaprogram invocation runs in its **own arena**: everything it allocates
-is released when it returns, and exactly one value survives — the returned
-Code, copied out at the boundary. So peak memory is one expansion's working
-set, not its allocation history. `COIL_META_ARENA=0` opts out;
-`COIL_META_ARENA=poison` fills released memory with `0xDD` so a leaked alias
-fails loudly. `COIL_MTRACE=mem` prints a per-metaprogram allocation table at
-exit, including cumulative bytes, live bytes at return, peak live bytes, and
-backing capacity — the tool to reach for when a compile's memory surprises you.
-
-Reader providers, macros, checkers, and transforms can borrow that same arena
-through `coil.meta` instead of constructing a process-lifetime malloc allocator:
-
 ```coil
-(import "coil.meta" :use [expansion-allocator])
+(module example.structs)
+(defstruct Point [(x i64) (y i64)])
+(defstruct Rect [(origin Point) (size Point)])
 
-(defn read-source [(context Code)] (-> Code)
-  (let [a (expansion-allocator)]
-    ; pass a to ArrayList, HashMap, string builders, parsers, and other
-    ; APIs that accept (dyn Allocator)
-    ...))
+(defn area [(r Rect)] (-> i64)
+  (* (.x (.size r)) (.y (.size r))))
+
+(defn grow! [(r (mut Rect)) (by i64)] (-> void)
+  (set! (.x (.size r)) (+ (.x (.size r)) by))
+  (set! (.. r size y) (+ (.. r size y) by)))
+
+(defn main [] (-> i64)
+  (let [(mut r) (Rect :origin (Point :x 0 :y 0) :size (Point :x 2 :y 3))]
+    (grow! (mut r) 1)
+    (println "{}" (area r))
+    0))
 ```
 
-The returned `(dyn Allocator)` is a borrowed capability valid only for the
-current invocation. Storage allocated through it must not escape. Returned
-`Code` is the supported ownership transfer: the compiler promotes it before
-resetting (or poisoning) the arena. The API has identical semantics in native,
-JIT, interpreted, and wasm metaprogram engines.
-
-For allocator-specific accounting outside this automatic metaprogram scope,
-`coil.tracealloc` wraps any `(dyn Allocator)` and reports allocation calls,
-requested and cumulative bytes, current live bytes, and peak live bytes through
-`tracing-allocator-stats`. Generic wrappers report `backing-bytes = -1` because
-reserved capacity is not part of the `Allocator` contract; presenting it as an
-exact value would be misleading.
-
-## Metaprograms: whole-program checkers & transforms
-
-A **metaprogram** is an ordinary Coil function that runs at compile time and operates
-on the program. There is no metalanguage — it is Coil over Coil, and it is compiled
-and run as native code. Four kinds, told apart only by what they receive:
-
-| kind | signature | receives | does |
-|---|---|---|---|
-| macro | `[Code…] (-> Code)` | its own call site | expands inline |
-| generator | via `(meta …)` | nothing | adds top-level forms |
-| **checker** | `[(prog Code)] (-> Code)` | every module | reports / vetoes |
-| **transform** | `[(prog Code)] (-> Code)` | every module | rewrites the program |
-
-Macros you *call*; checkers and transforms you **register** at top level:
-
-    (checker   my-lint)      ; run it over the whole program
-    (transform my-lowering)  ; rewrite the whole program
-
-Registration happens when the module is imported, so a metaprogram can be switched on
-without editing any source that uses it. `--use NAME` prepends `(import "NAME" :use *)`
-to the entry file; declaring it in `Coil.toml` does the same for every command that
-compiles the project — `build`, `run`, `check`, `test` and `lint` alike:
-
-    [metaprograms]
-    use = ["myproj.gcauto", "httptap"]
-
-`NAME` is a namespace, never a path: any file under the source roots — or under a
-dependency's root, which Coil adds to the namespace index — that declares
-`(module httptap)` *is* `httptap`. So a **library can ship a transform** and a consumer
-turns it on with one manifest line, no import and no source edit. Transforms compose in
-the order listed, the first seeing the original program.
-
-The unqualified forms run at the existing semantic phase, after macro expansion,
-resolution, and typechecking. A checker or transform that needs the author's surface
-syntax can opt into the syntax phase:
-
-    (checker raw-depth :phase before-expand)
-    (transform surface-lowering :phase before-expand)
-
-A transform that must see ordinary macro output but run before resolution and
-typechecking can select the post-expansion boundary:
-
-    (transform lower-expanded-markers :phase after-expand)
-
-This phase runs exactly once. Its output is the authoritative input to ordinary
-resolution and typechecking and does not enter a second macro-expansion pass. It may
-add or remove top-level forms and imports, but any executable macro syntax it emits is
-therefore unresolved output rather than a request to expand again. Semantic reflection
-is unavailable because no checked model exists yet.
-
-An idempotent semantic pass that completes its rewrite in one traversal can use
-`(transform-once FN)`. It receives the same checked whole-program model, but Coil
-does not invoke it again merely to prove a fixpoint; the transformed program is
-still resolved and typechecked authoritatively before code generation.
-
-Before-expansion metaprograms receive the same module-shaped program, but semantic
-reflection is unavailable (`type-of` is `:unknown`, `code-decl` is `:unresolved`, and
-`binding-of` has no checked binding). Syntax transforms run to a fixpoint, then syntax
-checkers run once, and the resulting forms enter ordinary macro expansion. Registrations
-must occur literally at module top level; generated code cannot retroactively register a
-before-expansion pass.
-
-Both are handed the program as a list of modules — `((name form…) …)`, one record per
-module, head = module name — and see **everything**, including imported and bundled
-code. Scope yourself with `(primitive/code-from-user? NODE)` (false for bundled stdlib) or
-`(primitive/code-file NODE)`.
-
-**Reporting.** `(primitive/warn NODE MSG)` is a located, non-fatal warning; `(primitive/report NODE MSG)`
-is a located error. Both **collect** — you get every diagnostic in one pass, with the
-source span underlined, and the build fails after printing them all if any was a
-`report`.
-
-**Fixing.** `(primitive/suggest NODE MSG REPLACEMENT)` is a `warn` that also proposes a rewrite:
-`REPLACEMENT` is a `Code` value, normally built out of the author's own subnodes, and
-the diagnostic gains a `help: try: …` line. Nothing is written by an ordinary build —
-`coil lint --fix` is the only writer, and it renders any node that came from source as
-its **original bytes**, so comments and formatting inside an untouched branch survive
-and only the part that changed is new text. A round that stops compiling is reverted.
-Comments between nodes — the one thing no `Code` value records — are carried across the
-rewrite, so collapsing a commented `if` chain keeps every comment. See
-`docs/archive/AUTOFIX.md`, and `src/examples/metaprogramming/condlint.coil` for a rule that turns a chain of
-three or more nested `if`s into a `cond`:
-
-    coil lint app.coil --use myproject.condlint          # report + `help: try:` lines
-    coil lint app.coil --use myproject.condlint --diff   # the patch; writes nothing
-    coil lint app.coil --use myproject.condlint --fix    # apply it
-
-Checker rules can accept string parameters from the lint CLI. Qualify keys with the
-rule namespace so independently loaded rules do not collide, and provide the default
-at the read site:
-
-    (let [limit (primitive/lint-param "myproject.depth.maximum" "24")] ...)
-    coil lint app.coil --use myproject.depth \
-      --lint-param myproject.depth.maximum=40
-
-`--lint-param KEY=VALUE` is repeatable; the last value for a key wins. The checker
-owns parsing and validation because parameter schemas are rule-specific. Parameters
-apply only to `coil lint`, not ordinary build/run/check commands.
-
-By default, checkers see the program **after macro expansion**, so every
-`cond`/`when`/`case` in the file has already become nested `if`s.
-`(primitive/code-macro? NODE)` is true for a node the expander produced, which is how
-a semantic rule about `if` tells the author's ifs from the ones a macro wrote. Use
-`:phase before-expand` when the rule instead needs to inspect the original macro calls
-or calculate properties such as raw syntactic nesting depth.
-
-**Checkers run after the program is resolved and typechecked**, so they read the
-compiler's authoritative output and layer *policy* on code that already typechecks:
-
-- `(primitive/code-decl NODE)` → a record beginning `(decl MODULE KIND QUALIFIED-NAME)`.
-  A function record continues with `[PARAM-TYPE…] RET`; a sum-variant construction's
-  qualified name is the exact selected variant. Struct/sum/trait/const/extern records
-  need no additional fields; `:unresolved`/`:ambiguous` are returned otherwise. Pass the
-  **reference node** (a call, `fnptr-of`, variant construction, or
-  type reference) and it resolves to the exact entity the checker picked — correct even
-  when the same simple name exists in several modules.
-  **Pass the call, not its head symbol.** The whole call node is what the checker
-  resolved; the head symbol alone resolves only by name, and misses a head a macro
-  introduced from another module, a generic function, and every method call.
-  A call that dispatches to an **impl method** answers
-  `(decl MODULE method QUALIFIED-NAME [PARAM-TYPE…] RET OWNER-TYPE [TRAIT])`: the first
-  six elements read like a function's, MODULE is the owning type's module (so a selector
-  such as `myapp.jobs/*` finds a type's methods with its functions), OWNER-TYPE is the
-  type the selected impl is for, and TRAIT is present only for a trait method — together
-  they name the impl the checker chose. Operators are trait methods, so `(+ a b)` answers
-  this way too. When the receiver is a type parameter no impl is chosen until the
-  function is specialised: the record is the trait's own declaration, with the trait's
-  `Self` parameter where the owning type would be.
-- `(primitive/type-of NODE)` → the expression's **inferred** type as Code (`i64`, `(ptr i64)`), or
-  `:unknown`. Inferred, not syntactic: `(getf)` reports `f64` because that's what `getf`
-  returns.
-- `(primitive/binding-of NODE)` → the local-binding identity a reference resolves to (0 = a
-  global). Two references with the same positive id name the same local, so a shadowed
-  local is distinguishable from its outer namesake — what a borrow/move checker keys on.
-
-**Transforms** run to a fixpoint before checkers: each round reads the checked program,
-rewrites, and the program is re-resolved and re-typechecked. A transform also *tolerates*
-a program that doesn't typecheck yet (the model is empty, `code-decl` → `:unresolved`),
-so it can be the thing that makes the program valid — e.g. rewriting `(inc E)` to
-`(primitive/iadd E 1)` where `inc` is otherwise undefined. It may add or remove top-level forms.
-
-Macro expansion detects an invocation that reproduces identical syntax and reports it
-as a structural cycle immediately. The diagnostic names the qualified macro, points at
-the invocation, and renders the macro-expansion provenance chain. The global expansion
-budget reports the active macro, total expansion count, and current expansion-chain
-depth. Aggregate macro expansions are unlimited by default;
-`--macro-expansion-limit N` opts into a total-expansion budget;
-`--trace-macros` prints every macro invocation, while `--trace-macro QUALIFIED.NAME`
-prints only the selected macro. These flags work with every frontend command, including
-`check`, `build`, `run`, and the dump commands.
-
-**A dialect is a single import.** A module containing `(checker …)`/`(transform …)`
-registrations *is* a dialect; importing it applies the whole stack, in import order,
-transforms before checkers. To apply one without editing the source:
-
-    coil run app.coil --use myproject.lint  # repeatable; works on run and build
-
-Metaprograms compile to native code — always. Macros, `(meta …)` generators,
-checkers, transforms, and `(comptime E)` / `(const …)` folding all run on the one
-compiled engine with the whole language available: generics, collections, FFI,
-allocation. (The old tree-walking interpreter and its `COIL_META` flag are gone.)
-
-## I/O & FFI
-
-    (extern printf   :cc c [(ptr i8) ...] (-> i32))     ; ... = variadic
-    (extern snprintf :cc c [(ptr i8) i64 (ptr i8) ...] (-> i32))
-    (extern write    :cc c [i64 (ptr i8) i64] (-> i64)) ; fd 1=stdout 2=stderr
-    (extern exit     :cc c [i32] (-> void))
-
-An explicit linker name keeps the Coil binding separate from the native symbol:
-
-    (extern safe-call :as "call" :cc c [i64] (-> i64))
-    (extern versioned :cc c :as "library.function$1" [i64] (-> i64))
-
-`:as` takes a nonempty string without NUL bytes; `:as` and `:cc` may appear in
-either order before the parameter vector. Calls and `fnptr-of` use the Coil
-binding; native linking uses the explicit spelling, with the target's ordinary
-symbol-prefix convention. Without `:as`, the final component of the Coil name
-remains the linker name. Declarations naming the same symbol must have compatible
-native signatures. This declares functions, not native data. For a native data
-address use `(primitive/linker-address "library.data$1")` and cast the resulting
-pointer to the known storage type; an identifier argument is also accepted.
-
-**Declaring a Coil function defined elsewhere.** `extern` describes a native
-symbol with a C signature. A function written in Coil but compiled in another
-compilation unit is declared with its Coil signature instead:
-
-    (declare combine [(p Point)] (-> i64))
-
-A `declare` reads like a `defn` head with no body: the parameters, return type,
-`:cc` and annotations are checked exactly as a definition's would be, callers
-pass arguments under Coil's own ABI (a non-affine aggregate such as `Point`
-arrives by reference, not by C value), and the backend emits a declaration for
-the linker to resolve from the object that holds the definition. A declaration
-cannot be generic, because a generic is instantiated wherever it is used and so
-has no single definition to link; and it cannot carry a body. It is the form a
-prebuilt unit's interface is written in, so an ordinary program rarely writes
-one by hand; when it does, the defining object must be linked, or the build is
-a link error rather than a function that silently returns nothing.
-
-**Prebuilt units.** A module with a concrete public surface can be compiled
-once, ahead of the programs that use it, and linked instead of recompiled.
-`coil build-unit ENTRY.coil -o DIR` writes an interface, an object, and a shared
-library into DIR; a consumer names it with `--unit DIR` on `build`, `run` or
-`check`, and reads the interface in place of the module's source. The interface
-declares the module's exports -- concrete functions as `declare`, records and
-sums as themselves, generics and macros copied as source -- so the consumer
-compiles against a handful of declarations rather than the whole dependency and
-everything behind it. A module the interface cannot express (a runtime `def`, an
-exported macro produced by another macro) is refused by name, never shipped
-narrower than its source. A rebuild into the same directory is skipped when the
-compiler, target, options, backend and every source are unchanged.
-
-A unit's object follows the calling convention of the backend that emitted it,
-and Coil's backends do not share one for every aggregate, so a unit links only
-into a build by the same backend. Its key records that backend (`--backend llvm`,
-`arm64` or `x64` on `build-unit`), and a `--unit` built by another backend is an
-error that names both and the rebuild.
-
-In a manifest, `engine = { path = "../engine", prebuilt = true }` under
-`[dependencies]` does this automatically: the dependency is built by the
-consuming build's backend into `.coil/units/<backend>/<name>` on first build and
-linked thereafter, recompiled only when it changes. A dependency that cannot be
-prebuilt compiles from source with a note. The object a unit contributes is
-linked only when the program actually imports the module, so a unit made
-available but unused costs nothing.
-
-The motivating case is `coil.jit`, the in-process compiler SDK: importing it
-used to compile the whole compiler (~28s of LLVM per build). An installed
-toolchain keeps one coil.jit unit per backend in `lib/coil/units/<backend>/`.
-Installing builds the default backend's; the first program built by another
-backend that imports `coil.jit` builds that backend's (slow once), and every
-later build links it -- so `(import "coil.jit")` needs no flag and builds in a
-fraction of a second whichever backend you use.
-
-`(printf c"%d\n" 42)`. Floats cross the C ABI correctly; structs pass/return by
-value with the real C ABI. To call a Coil fn from C (e.g. `qsort` comparator) pass
-`(primitive/fnptr-of f)`. Scalar-only callbacks need no export. A callback with a
-by-value struct parameter must be listed in `export-c`; the resulting pointer is
-the C ABI wrapper, including when a library stores that pointer for later calls.
-Ambient `print`/`println` (over stdout) need no import.
-`io.coil`/`fmt.coil` give a `(ptr Writer)` API: `(stdout)`, `(stderr)`,
-`(print-str w s)`, `(fmt w "n={} s={} f={}\n" a b c)`. Formatting is
-type-directed: `{}` uses `Display`, `{:?}` uses compact `Debug`, `{:#?}` uses
-pretty `Debug`, and `{:x}`/`{:#x}` use lowercase hexadecimal formatting.
-Float `Display` uses fixed six-digit precision, not C `%g`; for exact formatting call libc `snprintf` with
-`c"%g"`. `coil cimport header.h` auto-generates bindings from a real C header.
-
-`coil.fmt` provides `Display` and `Debug`; `coil.debug` adds standard collection
-implementations, deriving, and the `debug`/`debugln` compatibility helpers:
-
-    (import "coil.debug" :use *)
-    (derive Debug Point)
-    (println "{:?}" (Point :x 10 :y 20))
-    ; (Point :x 10 :y 20)
-    (println "{:#?}" (Point :x 10 :y 20))
-    ; (Point
-    ;   :x 10
-    ;   :y 20
-    ; )
-
-Derived structs and sums use compact Coil constructor syntax for `{:?}` and
-recursively indented constructor syntax for `{:#?}`. A value whose component
-`Debug` implementations emit source can be pasted back into a program. `ArrayList<T>`,
-`Option<T>`, and `HashMap<K,V>` implement `Debug` when their members do.
-
-An option-bearing `Debug` derive can omit sensitive, noisy, or non-debuggable struct
-fields:
-
-    (defstruct Account [(name (slice u8)) (password_hash (slice u8)) (active bool)])
-    (derive (Debug (field password_hash (skip))) Account)
-    (println "{:#?}" (Account :name "Ada" :password_hash "secret" :active true))
-    ; (Account
-    ;   :name "Ada"
-    ;   :active true
-    ; )
-
-Sum fields are qualified by their variant so identical field names in different
-variants are never conflated:
-
-    (defsum Event
-      (Created [(name (slice u8)) (token (slice u8))])
-      (Deleted [(name (slice u8)) (audit_record (slice u8))]))
-    (derive (Debug
-              (variant Created (field token (skip)))
-              (variant Deleted (field audit_record (skip))))
-            Event)
-
-A skipped field does not need a `Debug` implementation because the generated method
-does not reference it. Unknown or duplicate variants, fields, and options are compile
-errors. Omitting a required constructor field necessarily means this configured output
-is diagnostic rather than pasteable source.
-In source, `(cimport "sys/ioctl.h" :use [ioctl])` asks Clang to emit only the
-named declarations and macros, so using a large platform header does not expose
-its whole API. The generated declaration preserves details such as C variadics.
-
-To migrate or audit a handwritten declaration, associate it with its authoritative
-header and run `coil lint`:
-
-    (extern ioctl :cc c [i32 u64 (ptr TerminalWindowSize)] (-> i32)
-            :header "sys/ioctl.h")
-
-If Clang can selectively import `ioctl`, lint reports the handwritten declaration;
-`coil lint FILE --fix` replaces it with
-`(cimport "sys/ioctl.h" :use [ioctl])`. The replacement imports only `ioctl`, not
-the header's neighboring declarations. `:header` is a lint migration annotation,
-not part of the resulting FFI declaration.
-
-## Doc comments (`;;;`)
-
-A run of lines starting with `;;;` **directly above a definition** is that
-definition's documentation. `;` and `;;` stay ordinary comments, so documenting
-something is opt-in and an incidental note never becomes API docs.
-
-    ;;; Append v; grows (doubling, min 4) if full.
-    ;;; Returns the new length.
-    (defn append-one! [T] [(l (mut (ArrayList T))) (v T)] (-> i64) …)
-
-    ;; internal note — NOT documentation
-    (defn al-raw [] (-> i64) …)
-
-    coil doc src/stdlib/arraylist.coil     ; markdown: name, signature, doc, per definition
-
-`defn`, `defstruct`, `defsum`, `deftrait`, `defcc`, `const` and `extern` are all
-documentable. The doc lives in the source and nowhere else — there is no separate
-doc field to drift.
-
-**`(primitive/code-doc NODE)`** returns a node's doc as a `(slice u8)` at comptime (`""` when
-it has none, including any macro-generated node), so doc tooling is a library
-metaprogram rather than a compiler feature: a checker holding the program can read
-every definition's doc, e.g. to enforce that exported functions are documented.
-
-## Tests, assertions, debug checks
-
-`deftest`, `assert`, `assert-eq`, and `assert-ne` are ambient `coil.core` names.
-`deftest` expands to a conventionally named function; the assertions and runner remain
-in the ordinary library module `coil.assert`, not compiler syntax. Its transform
-discovers every `(deftest …)` and runs each in its **own process** — so a failing
-assertion aborts only its own test and still prints. The process is spawned, not
-forked: a test binary that links a threaded runtime (a Go c-archive, CoreFoundation)
-gives a forked child locks whose owning threads do not exist in it.
-
-    (deftest arithmetic               ; no import needed
-      (assert-eq (+ 2 2) 4)
-      (assert (< 1 2))
-      (assert-ne 1 2))
-
-    coil test mytests.coil            ; exit 0 iff all pass
-    coil test mytests.coil --filter arithmetic
-                                       ; run names containing "arithmetic"
-    coil test mytests.coil --filter fast --filter smoke
-                                       ; repeatable filters combine by OR
-    coil test mytests.coil --list --filter arithmetic
-                                       ; list that same selected set, run nothing
-
-Name filters apply after `deftest` and `defprop` discovery and before test processes
-are spawned. A filtered-out test is neither run nor counted as passing; an invocation
-whose filters match no tests reports `0 tests matched` and exits nonzero. The positional
-selector remains exclusively a project path/suite selector.
-
-Inside a project, `coil test FILE` inherits `Coil.toml`, including `[cc]`, `[link]`,
-dependencies, and the configured target. With no file, Coil discovers every test file
-under `[test].roots` whose name has a configured suffix (defaults: `tests/` and
-`_test.coil`):
-
-    coil test                         ; every test file in the default suites
-    coil test provider                ; only paths containing "provider"
-    coil test --list                  ; what would run, grouped by suite
-    coil test --jobs 4                ; build once, run up to four tests concurrently
-    coil test --no-run                ; compile and link without executing
-
-### Named test suites
-
-Some tests should not run just because someone typed `coil test` — they hit a live
-service, they cost money, they take minutes. Declare those as a **named suite** and
-mark it `default = false`:
-
-    [test.suites.unit]
-    roots = ["tests"]
-    suffixes = ["_test.coil"]
-
-    [test.suites.integration]
-    roots = ["tests/integration"]
-    suffixes = ["_integration.coil"]
-    default = false
-
-Membership is **opt-out**: a suite runs unless it says `default = false`. So `coil test`
-keeps meaning "run the tests", and the expensive suite hides behind exactly one line.
-
-### Property-based testing (`coil.prop`)
-
-`(defprop …)` states a law over generated inputs instead of one example, and on
-failure reports the **smallest** input that breaks it. It is a library too, and
-`coil test` discovers a `defprop` exactly like a `deftest`.
-
-    (import "coil.prop" :use *)
-
-    (defprop reverse-is-its-own-inverse [(xs (ArrayList i64))]
-      (list-eq (reverse (reverse xs)) xs))     ; the body yields bool
-
-Arguments are generated by each type's `Arbitrary` impl — scalars, `(slice u8)`,
-`(ArrayList T)`, `(Option T)` and anything you `(derive Arbitrary T)` — so there is
-nothing to wire up. **Nobody writes a shrinker.** Every random decision is recorded
-on a *tape*, and minimization edits the tape and re-runs the generator, so a
-generator's invariants survive shrinking by construction:
-
-    FAILED after 27 cases (2 shrinks, 8 shrink calls)
-
-      counterexample:
-        xs = (0 0 0)
-
-      reproduce:  coil test tests/list_test.coil --seed 1903151487994059799 --cases 200
-
-Inside a body: `(assume COND)` discards a case that misses a precondition,
-`(classify "label" COND)` and `(collect "label" EXPR)` report the input
-distribution (and warn when one bucket swallows the run), `(prop-target! EXPR)`
-asks the runner to hill-climb toward a number instead of sampling uniformly, and
-`(prop-src)` hands you the `Source` to draw from directly (`draw-int!`,
-`draw-len!`, `arb-string`, …) when a type's default distribution is wrong for one
-property. Values drawn that way are not arguments, so a report cannot print them
-unless you name them: `(prop-note "label" EXPR)` evaluates to EXPR and shows it as
-`label = …` under the arguments of a counterexample, and `(prop-draw T "label")`
-draws any `Arbitrary` type and notes it in one step:
-
-    (defprop parse-never-crashes [(seed i64)]
-      (let [text (prop-note "text" (arb-bytes (prop-src) 0 256))]
-        (parse-ok-or-error? text)))
-
-Derive both halves for your own structs and sums with
-`(derive Arbitrary Debug T)`
-(recursive sums terminate on a fuel budget and shrink toward the first-declared
-variant, so declare the base case first).
-
-Or override generation per type with a trait impl — the most specific one wins,
-so `(impl Arbitrary (ArrayList u8))` can produce realistic payloads while every
-other list keeps the generic impl:
-
-    (impl Arbitrary Email
-      (arbitrary [(out (mut Email)) (s (ptr Source))] (-> i64) …))
-
-⚠ A hand-written `Debug` impl names `Writer`, which lives in `coil.io` —
-`coil.prop` does not reexport that module (it would put `print-str`, `stdout` and
-friends into every property file), so add `(import "coil.io" :as io)` and write
-`(w (ptr io/Writer))`.
-
-A property that **crashes or hangs** is minimized too, not just one that returns
-false: cases run in a spawned worker process that mirrors every choice it draws
-into a shared stage file, so whatever kills the worker, the runner still has the
-exact input, and shrinks it with each candidate in its own process. Knobs, all
-optional: `--cases` (200), `--seed` (derived from the property name, so runs are
-reproducible), `--size`, `--shrink`, `--timeout` (60s per case), `--target-steps`,
-`--verbose`, `--no-fork`. Design and prior art: `docs/design/PROPERTY_TESTING.md`;
-worked example: `src/examples/property-testing.coil`.
-
-**Coverage-guided fuzzing.** `coil fuzz FILE.coil` runs a *campaign* against each
-property instead of a fixed number of cases:
-
-    coil fuzz tests/fuzz/json_fuzz.coil --time 300 --jobs 4 --sanitize=address
-
-The file is rebuilt with clang's SanitizerCoverage (the callbacks are ordinary
-Coil functions in `coil.prop.cov`, so an ordinary build is unaffected), and worker
-processes mutate a **corpus** of inputs, keeping each input that reaches an edge
-nothing reached before or reaches one a new number of times (AFL's hit-count
-buckets — so loop depth counts as progress). Values a comparison was seen to want
-are fed back into mutations, which turns a magic byte from a guess into a lookup.
-Inputs are the generators' recorded choices, so every mutant is a valid value of
-the argument types, and mutations work on whole values: an element is deleted,
-repeated, swapped, or spliced in from another input.
-
-- `--time SECS` (default 60; `0` runs until Ctrl-C, which stops the workers and
-  still prints the report — a second Ctrl-C abandons it) or `-n N` mutations per worker;
-  `--jobs N` workers share one corpus; `--filter SUBSTR` picks properties.
-- `--sanitize=address` instruments the program with ASan and gives every generated
-  value its own allocation — an overrun inside the per-case arena is invisible.
-- `--input-timeout SECS` (10): an input that runs longer is reported as a hang.
-- The corpus lives in `.coil/fuzz/<property>/corpus/` and each campaign resumes
-  from it; `--minimize-corpus` keeps only entries that still add coverage.
-- `.coil/fuzz/<property>/coverage.txt` lists the functions a campaign never
-  entered, then reached/total edges for the rest. Read it: a target that never
-  gets past its first check passes forever. Counts are per *compiled* function, so
-  code inlined into a caller is counted there.
-- A finding — false, a crash, a sanitizer report, a hang — is minimized and saved
-  to `.coil/pbt/` like any counterexample, so a plain `coil test` replays it
-  first from then on. Each worker's own output goes to
-  `.coil/fuzz/<property>/worker-<n>.log`.
-
-Fuzz targets for the standard library live in `tests/fuzz/`, and
-`scripts/tests/fuzz_targets.py` runs a campaign over all of them.
-
-    coil test                         ; default suites only
-    coil test --suite integration     ; that suite (repeatable)
-    coil test --suite all             ; every suite, default or not
-    coil test --list --suite all      ; opt-in suites are marked [opt-in]
-
-`coil verify` runs the default suites only, and `coil check` typechecks exactly those
-files, so an opt-in suite never gets pulled in by the everyday pipeline. Two things deliberately ignore suite
-membership: naming a file (`coil test tests/integration/live_integration.coil` always
-runs it), and `lint`, which treats every configured suffix as a test file whichever
-suite owns it. A filename selector applies *after* suite selection.
-
-Project testing compiles every selected test file into one harness executable. That
-executable then runs each `deftest` in an isolated child process, so shared imports
-are compiled once for the suite rather than once per test file. Naming one file
-explicitly remains a one-file test build. `coil check` loads the same corpus the same
-way, and loads it alongside the entry graph: one front end over the whole project, not
-one per test file and not one per graph. Typechecking is not reachability-gated, so the
-tests are checked without the runner's generated `main`, and everything the two graphs
-share is read, expanded and checked once. That is why `check` stays a few seconds on a
-project with dozens of test files.
-
-A bare `[test]` section is still exactly what it was — it becomes the suite named
-`default`, so a manifest that never mentions suites behaves identically, down to the
-flat `--list` output. Both `all` and `default` are reserved as suite names.
-
-Suites are validated like the rest of the manifest: an unknown `--suite` name, a
-duplicate suite, a non-boolean `default`, or a declared `roots` entry that does not
-exist is a hard error rather than a run that quietly tests nothing.
-
-A failure prints the offending expression and its `file:line`, recovered at expansion
-time via `code-src`/`code-line`, then aborts.
-
-**`--debug-checks`** turns on the safety tier, all of it zero-cost when off (each
-check lives behind a macro branched on `(primitive/debug-checks?)` at expansion time, so the
-off-path expansion is byte-identical to the unchecked form):
-
-- `slice-get`/`slice-set!`/`subslice` bounds-check (and `subslice` rejects `lo > hi`);
-- slice/string headers reject negative lengths and nonempty null data pointers;
-- `ArrayList` reads, writes, growth, clearing, freeing, and ownership transfer validate
-  `0 <= len <= cap`; indexed `get`/`set!` operations also bounds-check, turning
-  corrupt collection headers into named diagnostics before pointer traversal;
-- `HashMap` validates its capacity/counts, storage, allocator, and `KeyOps` vtable;
-- allocator calls validate the allocator and its three function slots;
-- `debug-allocator-init`/`debug-allocator-view` (`dbgalloc.coil`) create a passable,
-  registry-backed allocator that detects invalid/interior/double frees, size and
-  alignment mismatches, checks prefix/suffix red zones, quarantines blocks, poisons
-  freed payloads to `0xDE`, and reports live leaks from `debug-allocator-deinit!`;
-- `(guard-allocator inner)` (`guardalloc.coil`) uses inaccessible pages around mappings
-  and changes freed payload pages to `PROT_NONE` while quarantined;
-- a bundled checker warns when a function returns a pointer to a stack local.
-
-`--debug-checks` auto-loads that checker as a metaprogram by injecting an import into
-your file. The entry file need not declare `(module NAME)`.
-
-`--sanitize=address` marks generated functions for LLVM AddressSanitizer and runs the
-ASan pass over the program object. Sanitized executable links use the Clang beside
-`llvm-config`, keeping instrumentation and runtime versions matched.
-
-Three additional, mutually exclusive modes cover different failure classes:
-
-- `--sanitize=thread` applies LLVM ThreadSanitizer and diagnoses unsynchronized
-  memory accesses with their participating thread stacks;
-- `--sanitize=memory` applies LLVM MemorySanitizer to find reads of uninitialized
-  values. It is Linux-only because LLVM ships no Darwin MSan runtime, and useful
-  results require native dependencies to be instrumented or intercepted too;
-- `--sanitize=undefined` inserts Coil's language-level checks for signed add/subtract/
-  multiply overflow, integer division/remainder by zero, signed division overflow,
-  and negative or oversized shift exponents. These checks are emitted in Coil codegen
-  because LLVM has no general UBSan IR pass—Clang normally inserts them in its frontend.
-
-Select only one `--sanitize=…` mode per artifact. ASan, TSan, and MSan have
-incompatible process-wide runtimes, and Coil rejects combinations rather than
-silently producing a partially instrumented executable. Metaprogram dylibs remain
-unsanitized because they are loaded into the already-running compiler process.
-
-`--debug-runtime` is the development profile: it enables `--debug-checks`, ASan,
-LLVM strong stack canaries, indirect-call/dynamic-dispatch validation, and automatic
-fatal-signal diagnostics. The crash handler reports the signal, fault address, thread,
-context pointer, recent events, and a bounded stack trace, then restores and re-raises
-the original signal. Set `COIL_CRASH_REPORT=/path/to/report` to pre-open a crash artifact;
-it includes compiler/profile/target/process metadata plus the crash report. Applications
-can add context with `debug-runtime-event!` and bound the ring with
-`debug-runtime-set-event-capacity!` from `coil.debug-runtime`.
-
-For foreign APIs that fill caller storage, `coil.checked-ffi` provides
-`with-checked-out`: it allocates the supplied probed `sizeof(T)`/`alignof(T)` range,
-surrounds the output with canaries, evaluates the foreign call, and validates the
-canaries before returning. `coil.thread/thread-spawn-configured` accepts explicit stack and guard
-sizes using a probed opaque `pthread_attr_t`. Compiler worker defaults can be overridden
-with `COIL_WORKER_STACK_SIZE` and `COIL_WORKER_GUARD_SIZE` (decimal bytes). Parallel
-LLVM codegen workers have a separate 8 MiB default, overridden with
-`COIL_LLVM_WORKER_STACK_SIZE`, so changing their stack does not change the compiler
-pipeline's deep stack.
-
-## Reserved-name gotchas ⚠
-
-`call` and `block` are builtins/macros — don't name a `defn` `call` or `block`
-(the one exception is the method inside an `impl Callable`). You'll otherwise get
-"call target: expected symbol" / "macro arity mismatch". Avoid `type`
-as a struct field name. When in doubt, prefix your name (`p-call`, `vm-call`).
-
-## The standard library
-
-The library ships WITH the compiler as one toolchain: `<prefix>/bin/coil` beside
-`<prefix>/lib/coil/stdlib`, installed together by `python3 scripts/dev.py install`. A
-compiler locates it by walking up from its own executable (then from the working
-directory, so a checkout works as-is), which is how the compiler and the library can
-never be two different versions. If there is no library, compilation reports where
-it searched instead of guessing. Given a toolchain,
-`(import "coil.NAME" :use *)` works from anywhere with no path setup:
-`coil.alloc` (allocators), `coil.arraylist`, `coil.hashmap`, `coil.slice`, `coil.str`,
-`coil.mem`, `coil.io`, `coil.fmt`, `coil.print`, `coil.fs` (files), `coil.result`
-(Option/Result), `coil.control` (case/while/for/…), `coil.match` (deprecated: its
-`match-else` is now just `match` with a `_` arm — plain `coil lint --fix` rewrites
-calls), `coil.try`,
-`coil.thread`, `coil.atomic`, `coil.simd`, `coil.closure`, `coil.derive`, `coil.mmio`,
-`coil.reader` (THE s-expression reader — the one the compiler itself uses), `coil.json` (zero-copy token-tape parser), `coil.serde` +
-`coil.serde.derive`/`coil.serde.json`/`coil.serde.sexp`/`coil.serde.msgpack`/
-`coil.serde.value` (format-agnostic serialization: derive `Serialize`/
-`Deserialize` once — with `rename`/`default`/`skip`/`with`/`boxed`/`deny-unknown`
-field options — and pick the format at the call; `JVal` decodes documents of
-unknown shape — see `docs/design/SERDE.md`), `coil.http.parser`
-(streaming HTTP/1.x messages), `coil.http.server`
-(strict llhttp-backed HTTP/1.x requests), `coil.http.client` (blocking libcurl transport —
-`request` buffers the body, `request-stream` delivers it to a `BodySink` as it arrives, and
-`request-stream-cancellable` accepts a `coil.cancellation/Cancellation` token whose pipe
-wakes an otherwise idle transfer),
-`coil.jit` (optional source-linked in-process compiler/JIT), `coil.assert`
-(assert/deftest), `coil.prop` (property-based testing: `defprop`,
-the `Arbitrary` trait, tape-based shrinking — see above), `coil.dbgalloc`, `coil.guardalloc`, `coil.crash`,
-`coil.debug-runtime` and `coil.checked-ffi`, plus `coil.os`,
-`coil.time`, `coil.selectors`, `coil.subprocess`,
-`coil.process`, and the standard `coil.lint.default` safe-fix profile. Plain
-`coil lint` automatically loads `coil.lint.modernize`, `coil.lint.match-else`,
-`coil.lint.result-flow`, and `coil.lint.named-constructor` through that profile;
-allocator-composition checks remain opt-in policy/debug checks. The common
-ones are summarized above; import a module and call
-its functions directly.
+```output
+12
+```
+
+- Construct with `:field value` pairs in any order, giving each field exactly
+  once.
+- `(.field v)` reads a field, `(.. v a b)` is shorthand for `(.b (.a v))`, and
+  `(set! (.field v) x)` writes one. ⚠ `v` must be a place (a binding, parameter
+  or pointer). For a call result or a loop's element value, `let`-bind it first.
+- A parameter's type decides how it passes. `(r Rect)` is an immutable
+  reference, so passing a big struct never copies it. `(r (mut Rect))` is a
+  mutable reference, and the caller passes `(mut place)`. `(r (ptr Rect))` is a
+  raw pointer.
+- `[1 2 3]` is an `(array i64 3)`. Where Coil expects a `(slice T)`, it borrows the
+  array as one.
+- `(zeroed T)`, `(sizeof T)`, `(alignof T)` and `(offsetof T field)` are
+  compile-time.
+
+### Computed fields
+
+When a type has no field named `name`, `(.name x)` looks for an impl on the marker
+type `(Field X :name)`. You then read and write the computed field like a stored
+one:
+
+```coil
+(module example.fields)
+(defstruct Celsius [(degrees f64)])
+
+(impl FieldGet (Field Celsius :fahrenheit)
+  (get-field [(self (Field Celsius :fahrenheit)) (c Celsius)] (-> f64)
+    (+ 32.0 (* 1.8 (.degrees c)))))
+
+(impl FieldSet (Field Celsius :fahrenheit)
+  (set-field! [(self (Field Celsius :fahrenheit)) (c (mut Celsius)) (f f64)] (-> i64)
+    (set! (.degrees c) (/ (- f 32.0) 1.8))
+    0))
+
+(defn main [] (-> i64)
+  (let [(mut t) (Celsius :degrees 100.0)]
+    (println "{}" (.fahrenheit t))
+    (set! (.fahrenheit t) 32.0)
+    (println "{}" (.degrees t))
+    0))
+```
+
+```output
+212.0
+0.0
+```
+
+## Sum types and match
+
+```coil
+(module example.exprs)
+(import "coil.alloc" :as alloc :use [arena-allocator])
+
+(defsum Expr
+  (Num [(value i64)])
+  (Add [(left (ptr Expr)) (right (ptr Expr))])
+  (Neg [(inner (ptr Expr))]))
+
+(defn eval [(e (ptr Expr))] (-> i64)
+  (match (load e)
+    (Num [n] n)
+    (Add [l r] (+ (eval l) (eval r)))
+    (Neg [x] (- 0 (eval x)))))
+
+(defn describe [(e Expr)] (-> (slice u8))
+  (match e
+    (Num [_] "a number")
+    (_ "an operation")))
+
+(defn main [] (-> i64)
+  (let [a (arena-allocator 1024)
+        two (alloc/box! a Expr (Num 2))
+        five (alloc/box! a Expr (Num 5))
+        sum (Add :left two :right (alloc/box! a Expr (Neg five)))]
+    (println "{} is {}" (eval (alloc/box! a Expr sum)) (describe sum))
+    0))
+```
+
+```output
+-3 is an operation
+```
+
+- `match` must be exhaustive; a missing variant is a compile error that names it.
+  A final `(_ body)` arm covers every variant not already listed.
+- Payload fields bind positionally, `(Add [l r] …)`, and each position accepts a
+  full pattern, such as `(Located [(Point :x x)] …)`.
+- Construct a variant positionally or by name: `(Num 2)`,
+  `(Add :left a :right b)`.
+- A recursive sum holds its children behind `(ptr …)`.
+
+Use `defsum` for a closed set of shapes: states, messages, syntax trees, errors.
+When you add a variant, the compiler flags each `match` that misses it. Use a
+struct with an integer `kind` field only when you need a fixed binary layout.
+
+### Option, Result and try
+
+`(Option T)` is `(Some v)` or `(None)`. `(Result T E)` is `(Ok v)` or `(Err e)`.
+Both are ambient. Inside `(try …)`, `(try! r)` unwraps an `Ok` or returns the
+`Err`, and `(try? o)` does the same for `Option`:
+
+```coil
+(module example.parsing)
+(import "coil.try" :use [try try!])
+
+(defsum ParseError (Empty) (NotADigit [(at i64)]))
+
+(defn parse [(s (slice u8))] (-> (Result i64 ParseError))
+  (if (empty? s)
+      (Err (Empty))
+      (let [(mut n) 0 (mut bad) -1]
+        (for i (range 0 (len s))
+          (let [c (get s i)]
+            (if (and (>= c #\0) (<= c #\9))
+                (set! n (+ (* n 10) (- (cast i64 c) #\0)))
+                (when (< bad 0) (set! bad i)))))
+        (if (< bad 0) (Ok n) (Err (NotADigit bad))))))
+
+(defn add-strings [(a (slice u8)) (b (slice u8))] (-> (Result i64 ParseError))
+  (try (Ok (+ (try! (parse a)) (try! (parse b))))))
+
+(defn show [(r (Result i64 ParseError))] (-> i64)
+  (match r
+    (Ok [v] (println "ok {}" v))
+    (Err [e] (match e
+               (NotADigit [at] (println "bad digit at {}" at))
+               (Empty [] (println "empty")))))
+  0)
+
+(defn main [] (-> i64)
+  (show (add-strings "12" "30"))
+  (show (add-strings "12" "3x"))
+  (show (add-strings "" "1")))
+```
+
+```output
+ok 42
+bad digit at 1
+empty
+```
+
+`coil.result` has the combinators: `unwrap-or`, `opt-map`, `res-map`, `map-err`,
+`and-then`, `ok-or`, `some?`, `ok?`.
+
+## Traits
+
+```coil
+(module example.traits)
+(import "coil.fmt" :use [fmt Display Formatter formatter-writer])
+
+(defstruct Vec2 [(x i64) (y i64)])
+
+(impl Add Vec2
+  (+ [(a Vec2) (b Vec2)] (-> Vec2)
+    (Vec2 :x (+ (.x a) (.x b)) :y (+ (.y a) (.y b)))))
+
+(impl Display Vec2
+  (display-fmt [(v Vec2) (f (ptr Formatter))] (-> i64)
+    (fmt (formatter-writer f) "<{}, {}>" (.x v) (.y v))
+    0))
+
+(deftrait Area [Self]
+  (area [(self Self)] (-> i64)))
+
+(impl Area Vec2
+  (area [(v Vec2)] (-> i64) (* (.x v) (.y v))))
+
+(defn total-area [(T Area)] [(a T) (b T)] (-> i64)
+  (+ (area a) (area b)))
+
+(defn main [] (-> i64)
+  (let [a (Vec2 :x 1 :y 2)
+        b (Vec2 :x 3 :y 4)]
+    (println "{} + {} = {}" a b (+ a b))
+    (println "{}" (total-area a b))
+    0))
+```
+
+```output
+<1, 2> + <3, 4> = <4, 6>
+14
+```
+
+- `(deftrait Name [Self] (method [(self Self) …] (-> R)) …)` declares a trait;
+  `(impl Trait Type (method …))` implements it.
+- Operators are trait methods. `+ - * / %` are `Add Sub Mul Div Rem`, `=`/`!=` are
+  `Eq`, `< <= > >=` are `Ord`, and `& | ^ << >>` are `BitAnd`…`Shr`. An `impl` gives
+  your type the operator.
+- Collection operations are traits too: `Len` (`len`), `Get` (`get`), `Set`
+  (three-argument `set!`), `Push` (`push!`), `Pop` (`pop!`), `Iterable` (`iter`) and
+  `Iterator` (`next`). `empty?` works on anything with `Len`.
+- `Display` (`{}`) and `Debug` (`{:?}`) live in `coil.fmt`.
+- Any type can have an impl, including `(ptr T)`, `(slice T)`, `(array T N)`,
+  function pointers, and one specific instance like `(Pair i64 i64)`.
+
+### Methods without a trait
+
+An `impl` with no trait attaches methods to a type. When a method's first
+parameter is the type (or a `ptr`/`mut` to it), you pass that value first. Call a
+method with no such parameter as `Type::name`:
+
+```coil
+(module example.counter)
+(defstruct Counter [(count i64) (step i64)])
+
+(impl Counter
+  (new [(step i64)] (-> Counter) (Counter :count 0 :step step))
+  (tick! [(c (mut Counter))] (-> i64) (set! (.count c) (+ (.count c) (.step c))) (.count c))
+  (value [(c Counter)] (-> i64) (.count c)))
+
+(defn main [] (-> i64)
+  (let [(mut c) (Counter::new 5)]
+    (tick! (mut c))
+    (tick! (mut c))
+    (println "{}" (value c))
+    0))
+```
+
+```output
+10
+```
+
+A method from a trait with the same name is still reachable as `Trait::method`.
+
+### Generic impls, bounds and specialization
+
+```coil
+(module example.specialization)
+(defstruct Pair [A B] [(first A) (second B)])
+
+(deftrait Describe [Self] (describe [(x Self)] (-> (slice u8))))
+
+(impl [A B] Describe (Pair A B) (describe [(p (Pair A B))] (-> (slice u8)) "a pair"))
+(impl Describe (Pair i64 i64) (describe [(p (Pair i64 i64))] (-> (slice u8)) "two integers"))
+
+(impl [(T Eq)] Eq (Pair T T)
+  (= [(a (Pair T T)) (b (Pair T T))] (-> bool)
+    (and (= (.first a) (.first b)) (= (.second a) (.second b)))))
+
+(defn main [] (-> i64)
+  (println "{}" (describe (Pair :first 1 :second true)))
+  (println "{}" (describe (Pair :first 1 :second 2)))
+  (println "{}" (= (Pair :first 1 :second 2) (Pair :first 1 :second 2)))
+  0)
+```
+
+```output
+a pair
+two integers
+true
+```
+
+- Type parameters go first, `(impl [A B] …)`, and take bounds the same way `defn`
+  does: `[(T Eq)]`. Coil checks a bound where code uses the impl.
+- When several impls match, the most specific one wins. Coil reports two
+  overlapping impls, neither more specific, at the first use of the overlap.
+- Bounds can constrain associated types: `[(I (Iterator i64))]` means "an iterator
+  whose item is `i64`".
+- Method calls see through `ptr` and `mut`, so `(len p)` on a `(ptr (ArrayList T))`
+  finds the list's `len`.
+
+⚠ You can't implement a trait for a reference type `(mut T)`. Implement it for `T`.
+
+### Deriving
+
+```coil
+(module example.deriving)
+(import "coil.debug" :use *)
+
+(defstruct Point [(x i64) (y i64)])
+(derive Debug Eq Hash Clone Point)
+
+(defsum Event
+  (Login [(user (slice u8)) (token (slice u8))])
+  (Logout [(user (slice u8))]))
+(derive (Debug (variant Login (field token (skip)))) Event)
+
+(defn main [] (-> i64)
+  (println "{:?} {}" (Point :x 1 :y 2) (= (Point :x 1 :y 2) (Point :x 1 :y 2)))
+  (println "{:?}" (Login :user "ada" :token "secret"))
+  (println "{:#?}" (Point :x 1 :y 2))
+  0)
+```
+
+```output
+(Point :x 1 :y 2) true
+(Login :user "ada")
+(Point
+  :x 1
+  :y 2
+)
+```
+
+`derive` is a library macro. Each derivable trait registers its own generator, and
+you can register one for your own trait; see [Custom derives](#custom-derives).
+Derivers ship with `Eq`, `Hash`, `Clone`, `Copy`, `Debug` (from `coil.debug`),
+`Arbitrary` (from `coil.prop`) and `Serialize`/`Deserialize` (from `coil.serde`).
+
+### Trait objects
+
+`(dyn Trait)` pairs a pointer with a generated vtable, so one function can accept
+values of different types at run time. The trait's methods take `(self (ptr Self))`,
+and a `(ptr T)` converts to `(dyn Trait)` wherever one is expected:
+
+```coil
+(module example.speak)
+(import "coil.alloc" :as alloc :use [malloc-allocator])
+
+(deftrait Speak [Self] (speak [(self (ptr Self))] (-> (slice u8))))
+
+(defstruct Dog [(age i64)])
+(defstruct Cat [(lives i64)])
+(impl Speak Dog (speak [(self (ptr Dog))] (-> (slice u8)) "woof"))
+(impl Speak Cat (speak [(self (ptr Cat))] (-> (slice u8)) "meow"))
+
+(defn introduce [(animal (dyn Speak))] (-> i64)
+  (println "{}" (speak animal))
+  0)
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        dog (alloc/box! a Dog (Dog :age 3))
+        cat (alloc/box! a Cat (Cat :lives 9))]
+    (introduce dog)
+    (introduce cat)
+    (alloc/destroy a dog)
+    (alloc/destroy a cat)
+    0))
+```
+
+```output
+woof
+meow
+```
+
+⚠ A `(mut local)` borrow does not convert to `(dyn Trait)`. The value has to be
+behind a `(ptr T)`, as allocator-owned storage is.
+
+### Callable values
+
+A type that implements `Callable` can be called like a function. Dispatch is
+static, and the call inlines:
+
+```coil
+(module example.callable)
+(defstruct Scale [(factor i64)])
+
+(impl Callable Scale
+  (call [(self Scale) (x i64)] (-> i64) (* (.factor self) x)))
+
+(defn main [] (-> i64)
+  (let [triple (Scale :factor 3)]
+    (println "{}" (triple 14))
+    0))
+```
+
+```output
+42
+```
+
+`coil.var/Var` is a shared, updatable cell. A `Var` holding a function pointer is
+callable; the REPL builds hot reload on it. `coil.closure/defclosure`
+generates a callable closure type with a captured environment.
+
+## Memory and ownership
+
+Coil has no garbage collector and no ambient heap. Storage is one of three kinds:
+
+- **Locals.** `(let [(mut x) value] …)` is initialized frame storage.
+- **Allocator-owned.** Every allocating API takes a `(dyn Allocator)` argument, so
+  the caller chooses the strategy.
+- **Static.** `(def name value)` is a module-level global.
+
+```coil
+(module example.memory)
+(import "coil.alloc" :as alloc :use [malloc-allocator arena-allocator])
+(import "coil.debug" :use *)
+(import "coil.arraylist" :use [ArrayList al-new al-free!])
+
+(defstruct Node [(value i64) (next (ptr Node))])
+
+(defn main [] (-> i64)
+  (let [heap (malloc-allocator)
+        node (alloc/box! heap Node (Node :value 7 :next (cast (ptr Node) 0)))]
+    (println "boxed {}" (.value node))
+    (alloc/destroy heap node))
+
+  ; An arena frees everything at once when it is released.
+  (let [scratch (arena-allocator 4096)
+        (mut xs) (al-new [i64] scratch)]
+    (push! (mut xs) 1)
+    (push! (mut xs) 2)
+    (println "{} items" (len xs)))
+
+  (let [(mut ys) (al-new [i64] (malloc-allocator))]
+    (push! (mut ys) 3)
+    (println "{:?}" (pop! (mut ys)))
+    (al-free! (mut ys)))
+  0)
+```
+
+```output
+boxed 7
+2 items
+(Some 3)
+```
+
+| Allocator | Use |
+|---|---|
+| `(malloc-allocator)` | general purpose, process lifetime |
+| `(arena-allocator cap)` | bump allocation, freed together |
+| `coil.scratch` | segmented arena with marks and reset, for temporaries |
+| `coil.region` | tracks each allocation; closing frees what's left |
+| `coil.dbgalloc`, `coil.guardalloc` | leak, double-free and overflow detection ([DEBUGGING.md](DEBUGGING.md)) |
+
+`alloc/box!` allocates one initialized value (it aborts on exhaustion; `alloc/box`
+returns an `Option`). The typed APIs are `alloc/alloc`, `alloc/free`,
+`alloc/reallocate` and `alloc/destroy`.
+
+⚠ `(ptr T)` is a raw pointer: nothing checks its lifetime. Don't return a pointer
+to a local.
+
+### Ownership: Drop and Clone
+
+Most types are plain data. A type that implements `Drop` becomes an **owner**.
+Coil destroys an owner exactly once, when it goes out of scope, and assigning or
+passing it moves it:
+
+```coil
+(module example.files)
+(defstruct File [(name (slice u8))])
+
+(impl Drop File
+  (drop [(self (mut File))] (-> void)
+    (println "closing {}" (.name self))))
+
+(defn consume [(f File)] (-> i64)
+  (println "using {}" (.name f))
+  0)
+
+(defn main [] (-> i64)
+  (let [a (File :name "a.txt")
+        b (File :name "b.txt")]
+    (consume b)
+    (println "end of scope"))
+  0)
+```
+
+```output
+using b.txt
+closing b.txt
+end of scope
+closing a.txt
+```
+
+- Using a moved value is a compile error. `(clone x)` duplicates through `Clone`,
+  which `derive` can generate.
+- Structs, sums and arrays that contain owners get generated drop code, run in
+  reverse field order. Drops run on every exit path: fall-through, `break`,
+  `return-from`, and reassignment.
+- Coil drops a call result that nothing receives at the end of its statement.
+- Stores through a raw `(ptr T)` never drop the old value.
+- Escape hatches: `(forget x)`, `(manually-drop x)`, `(take! (mut x))`.
+
+`coil.rc` (`Rc`, `WeakRc`) and `coil.arc` (atomic `Arc`, `Weak`) are reference-counted
+owners. `coil.pmap` and `coil.pvec` are persistent collections whose `clone` is O(1).
+Owners that outlive a lexical allocator take an `AllocatorLease` instead of a
+`(dyn Allocator)`, for example `(malloc-allocator-lease)`.
+
+### Globals
+
+```coil
+(module example.globals)
+(import "coil.var" :use [var-static])
+
+(const TABLE-SIZE 16)
+(def answer 42)
+(def counter (var-static i64 0))
+
+(defn bump! [] (-> i64)
+  (set counter (+ (get counter) 1))
+  (get counter))
+
+(defn main [] (-> i64)
+  (bump!)
+  (bump!)
+  (println "{} {} {}" answer TABLE-SIZE (bump!))
+  0)
+```
+
+```output
+42 16 3
+```
+
+`const` is evaluated at compile time and may call any function. `def` is a
+module-level binding with static storage; it can't be assigned. For a mutable
+global, `def` a `Var` made by `var-static`, then read it with `get` and write it
+with `set`.
+
+## Collections and iteration
+
+| Namespace and type | Traits |
+|---|---|
+| `(slice T)`, `(array T N)` | `Len` `Get` `Set` `Iterable` |
+| `coil.arraylist`: `(ArrayList T)` | `Len` `Get` `Set` `Push` `Pop` `Iterable` |
+| `coil.hashmap`: `(HashMap K V)` | `Len` `Get` (returns `Option`) `Set` `Iterable` (keys) |
+| `coil.pvec`: `(PVec T)`, `coil.pmap`: `(PMap K V)` | persistent; `Len` `Clone` `Drop` |
+
+```coil
+(module example.collections)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList al-free!])
+(import "coil.hashmap" :use [hm-new-scalar hm-free!])
+(import "coil.collect" :use [collect])
+
+(defn even? [(n i64)] (-> bool) (= (% n 2) 0))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut xs) (collect [(ArrayList i64)] a [5 2 8 1])
+        (mut ages) (hm-new-scalar [i64 i64] a)]
+    (set! (mut xs) 0 50)
+    (println "len={} first={} last={}" (len xs) (get xs 0) (get xs 3))
+
+    (let [evens (count (filter (fn [n] (even? n)) xs))
+          total (fold (fn [acc n] (+ acc n)) 0 (take 2 (skip 1 xs)))]
+      (println "evens={} total={}" evens total))
+
+    (for entry (iter (enumerate [10 20]))
+      (let [e entry] (println "{}: {}" (.index e) (.value e))))
+
+    (set! (mut ages) 7 42)
+    (match (get ages 7)
+      (Some [age] (println "7 -> {}" age))
+      (None [] (println "missing")))
+
+    (al-free! (mut xs))
+    (hm-free! (mut ages))
+    0))
+```
+
+```output
+len=4 first=50 last=1
+evens=3 total=10
+0: 10
+1: 20
+7 -> 42
+```
+
+- Iterator adapters are lazy and never allocate: `map`, `filter`, `take`, `skip`,
+  `enumerate` (yielding `.index`/`.value` pairs), `chain`, `zip`, `range`. The
+  consumers are `fold`, `count`, `find`, `any?` and `all?`. The function or count
+  comes first, as in Clojure.
+- `collect` builds an owned collection from an array or slice, with the allocator
+  explicit.
+- `HashMap` keys that are strings need key operations: `(str-keyops)` copies keys
+  into the map, while `(str-keyops-borrowed)` borrows them.
+- Release an `ArrayList` from a general-purpose allocator with
+  `(al-free! (mut xs))`. Remove a map entry with `hm-remove!`.
+
+## Text and output
+
+```coil
+(module example.text)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.str" :use [sv string-from-view string-push-view! string-as-view string-view-bytes string-free!])
+
+(defn main [] (-> i64)
+  (println "{} {:?} {:x} {}" 42 "quoted" 255 1.5)
+  (let [(mut s) (string-from-view (malloc-allocator) (sv "hello"))]
+    (string-push-view! (mut s) (sv ", world"))
+    (println "{}" (string-view-bytes (string-as-view s)))
+    (string-free! (mut s)))
+  (println "{}" (= "abc" "abc"))
+  0)
+```
+
+```output
+42 "quoted" ff 1.5
+hello, world
+true
+```
+
+- `println`/`print` take a format string. `{}` uses `Display`, `{:?}` compact
+  `Debug`, `{:#?}` pretty `Debug`, and `{:x}` hex.
+- `(fmt w "…" args…)` formats to any `(ptr Writer)`, such as `(stdout)`, `(stderr)`,
+  a buffer or a file (from `coil.io`).
+- A string literal is `(slice u8)`, and byte strings compare with `=`.
+- `coil.str` adds validated UTF-8 types. `StringView` is a borrowed view (`(sv "…")`
+  for literals, `string-view-from-utf8` for untrusted bytes). `String` is an owned,
+  growable buffer. Iterating either yields `Rune`s; `coil.unicode.grapheme` gives
+  grapheme clusters.
+
+⚠ `println` returns a `Result`, so `match` arms that print on one side need to
+print, or produce the same type, on the other.
+
+⚠ `{:?}` on a library type such as `Option` or `ArrayList` needs
+`(import "coil.debug" :use *)`.
+
+## Modules
+
+```
+; src/geometry/shapes.coil
+(module myapp.geometry.shapes)
+(export Circle area)                          ; optional: default exports everything
+
+(defstruct Circle [(radius f64)])
+(defn area [(c Circle)] (-> f64) (* 3.14159 (* (.radius c) (.radius c))))
+```
+
+```
+; src/main.coil
+(module myapp.main)
+(import "myapp.geometry.shapes" :as shapes)    ; qualified: shapes/area
+(import "coil.arraylist" :use [ArrayList al-new])   ; selected names
+(import "coil.hashmap" :use *)                 ; everything
+(import "coil.io" :use * :exclude [print])     ; all but these
+(import "coil.fmt" :use * :rename [[fmt fmt-to]])
+```
+
+- An import names a **namespace**, never a file. Coil indexes every `.coil` file
+  under the project's source roots, its dependencies and the standard library.
+  The file that declares `(module myapp.geometry.shapes)` is that module wherever it
+  lives.
+- Prefix every module with your project's name. The standard library is `coil.*`.
+- A file that other modules import must start with `(module NAME)`. A single-file
+  program can omit it.
+- Every module implicitly imports `coil.core` (`Option`, the traits, `println`,
+  `when`, `for`…). An explicit `(import "coil.core" …)` replaces that implicit
+  import, so you can exclude or shadow core names.
+
+⚠ Declare each C `extern` in one module and import it from there. Two modules
+declaring the same symbol collide at link time.
+
+`coil namespaces` lists the standard library, and `coil namespace NAME` prints one
+namespace's definitions and docs.
+
+## Compile time
+
+Coil runs ordinary Coil at compile time: the full language, including allocation,
+collections and FFI.
+
+```coil
+(module example.consteval)
+(defn fib [(n i64)] (-> i64) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+
+(const FIB-20 (fib 20))
+
+(defn main [] (-> i64)
+  (println "{} {}" FIB-20 (comptime (* 6 7)))
+  0)
+```
+
+```output
+6765 42
+```
+
+`const` and `(comptime E)` evaluate once during compilation and embed the result.
+The result must be a literal-shaped value: a scalar, string, array, or non-generic
+struct or sum. It can't be a pointer.
+
+### Macros
+
+A macro is a function from `Code` to `Code`. Quasiquote builds code: `` `form ``
+quotes it, `~x` inserts a value, and `~@xs` splices a list.
+
+```coil
+(module example.macros)
+(defn swap! [(a Code) (b Code)] (-> Code)
+  `(let [tmp ~a]
+     (set! ~a ~b)
+     (set! ~b tmp)))
+
+(defn repeat [(n Code) & (body Code)] (-> Code)
+  `(for _ (range 0 ~n) ~@body))
+
+(defn main [] (-> i64)
+  (let [(mut tmp) 1 (mut other) 2]
+    (swap! tmp other)
+    (println "tmp={} other={}" tmp other)
+    (repeat 2 (println "again"))
+    0))
+```
+
+```output
+tmp=2 other=1
+again
+again
+```
+
+- Macros are hygienic. The template's `tmp` is not the caller's `tmp`: names
+  resolve where they were written.
+- `& (body Code)` collects the remaining arguments as one Code list.
+- `Code` is an immutable collection: `(len form)`, `(get form i)` and
+  `(for child (iter form) …)` walk it. To build a list, use a `CodeBuilder`
+  (`primitive/code-list-new`, then `push!`, then `primitive/code-list-done`).
+- `coil dump-hygiene FILE` prints the expanded program with scope information, and
+  `--trace-macros` logs each expansion.
+- `(meta (generator))` runs a generator and splices the top-level forms it returns.
+
+### Reflection
+
+Inside a macro, `primitive/code-field-count`, `code-field-name`, `code-field-type`,
+`code-variant-count`, `code-variant-name` and `code-trait-method-*` describe a type
+named by a Code symbol. `derive` is built from them.
+
+### Custom derives
+
+```coil
+(module example.derive)
+(import "coil.primitive" :as primitive)
+
+(deftrait FieldNames [Self] (field-name [(x Self) (i i64)] (-> (slice u8))))
+
+(defderive FieldNames
+  (struct [T]
+    (let [(mut arms) (primitive/code-list-new)]
+      (for i (range 0 (primitive/code-field-count T))
+        (push! (mut arms) `~i)
+        (push! (mut arms) `~(primitive/code-str (primitive/code-field-name T i))))
+      `(impl FieldNames ~T
+         (field-name [(x ~T) (i i64)] (-> (slice u8))
+           (case i ~@(primitive/code-list-done (load arms)) "?"))))))
+
+(defstruct Point [(x i64) (y i64) (z i64)])
+(derive FieldNames Point)
+
+(defn main [] (-> i64)
+  (let [p (Point :x 1 :y 2 :z 3)]
+    (for i (range 0 3) (println "{}" (field-name p i))))
+  0)
+```
+
+```output
+x
+y
+z
+```
+
+Unquoting an ordinary value, as in `` `~i `` or a string, makes it a literal in the
+generated code. A `defderive` has a `struct` arm, a `sum` arm, or both, and
+deriving for a shape it lacks is an error at the `derive`.
+
+## Metaprograms: lints and transforms
+
+A **checker** is a function over the whole program that reports problems. A
+**transform** rewrites the whole program. Both are ordinary Coil functions of type
+`[(modules Code)] (-> Code)`, registered at top level. They run whenever a build
+loads their module: through an import, through `--use NAME` on the command line,
+or through `[metaprograms] use = [...]` in `Coil.toml`.
+
+The program arrives as a list of modules, `((module-name form…) …)`, and includes
+the standard library. `(primitive/code-from-user? form)` selects the user's own
+code.
+
+### A lint with an automatic fix
+
+This checker finds three or more nested `if`s and proposes an equivalent `cond`.
+`primitive/suggest` reports a warning together with a replacement built from the
+author's own nodes. Plain `coil lint` then prints the fix, and `coil lint --fix`
+applies it, keeping the original text and comments of every reused node.
+
+```
+(module myapp.lint.cond)
+(import "coil.primitive" :as primitive)
+
+(defn hand-written-if? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (= (len f) 4)
+       (= (get f 0) `if)
+       (not (primitive/code-macro? f))))    ; not produced by when/cond/case
+
+(defn chain-length [(f Code)] (-> i64)
+  (if (hand-written-if? f) (+ 1 (chain-length (get f 3))) 0))
+
+(defn as-cond [(f Code)] (-> Code)
+  (let [(mut clauses) (primitive/code-list-new)
+        (mut at) f]
+    (while (hand-written-if? at)
+      (push! (mut clauses) (get at 1))
+      (push! (mut clauses) (get at 2))
+      (set! at (get at 3)))
+    (push! (mut clauses) `:else)
+    (push! (mut clauses) at)
+    `(cond ~@(primitive/code-list-done (load clauses)))))
+
+(defn walk [(f Code)] (-> i64)
+  (when (>= (chain-length f) 3)
+    (primitive/suggest f "three or more nested ifs read better as a cond" (as-cond f))
+    0)
+  (for child (iter f) (walk child))
+  0)
+
+(defn nested-ifs [(modules Code)] (-> Code)
+  (for m (iter modules)
+    (for form (iter m)
+      (when (primitive/code-from-user? form) (walk form))))
+  `0)
+
+(checker nested-ifs)
+```
+
+```
+$ coil lint src/main.coil --use myapp.lint.cond
+warning: three or more nested ifs read better as a cond
+  --> src/main.coil:3:3
+help: try: (cond (= n 1) "one"
+                 (= n 2) "two"
+                 :else "many")
+$ coil lint src/main.coil --use myapp.lint.cond --fix
+```
+
+To report without a fix, use `(primitive/warn node msg)`, or
+`(primitive/report node msg)` for an error that fails the build. Coil collects
+diagnostics, so one run reports all of them. `(primitive/lint-param "myapp.lint.depth" "3")` reads a
+`--lint-param myapp.lint.depth=5` option.
+
+Checkers run after type checking, so they can ask what the compiler decided:
+
+- `(primitive/type-of node)` is the inferred type.
+- `(primitive/code-decl call)` is exactly which definition or impl method a call
+  resolved to, even among same-named functions in several modules. Pass the whole
+  call node, not its head symbol.
+- `(primitive/binding-of ref)` identifies a local binding, which distinguishes
+  shadowed names.
+- `(primitive/code-doc node)` is a definition's `;;;` documentation.
+
+### A transform
+
+This transform defines a tiny dialect: `(inc e)` means `(+ e 1)`. It rebuilds only
+the nodes that contain an `inc`. `code-list-like` keeps each rebuilt node's source
+location and hygiene. It returns the modules wrapped in `(do …)`.
+
+```
+(module myapp.inc)
+(import "coil.primitive" :as primitive)
+
+(defn inc-call? [(f Code)] (-> bool)
+  (and (primitive/code-list? f) (= (len f) 2) (= (get f 0) `inc)))
+
+(defn mentions-inc? [(f Code)] (-> bool)
+  (let [(mut found) (inc-call? f)]
+    (for child (iter f) (when (mentions-inc? child) (set! found true)))
+    found))
+
+(defn rewrite [(f Code)] (-> Code)
+  (cond (inc-call? f) `(+ ~(rewrite (get f 1)) 1)
+        (mentions-inc? f)
+          (let [(mut kids) (primitive/code-list-new)]
+            (for child (iter f) (push! (mut kids) (rewrite child)))
+            (let [items (primitive/code-list-done (load kids))]
+              (primitive/code-list-like f (if (primitive/code-vector? f) `[~@items] items))))
+        :else f))
+
+(defn desugar-inc [(modules Code)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)]
+    (for m (iter modules) (push! (mut out) (rewrite m)))
+    `(do ~@(primitive/code-list-done (load out)))))
+
+(transform desugar-inc)
+```
+
+A module that does `(import "myapp.inc")` can now write `(inc (inc 40))`.
+
+Transforms run until the program stops changing, and Coil type-checks the program
+again after each round. A transform may receive code that doesn't type-check yet;
+that is how `inc` becomes valid. Checkers run afterwards, once.
+`:phase before-expand` runs a checker or transform on the source before macro
+expansion; see [METAPROGRAMS.md](METAPROGRAMS.md) for phases, `transform-once`, and
+the full reflection API.
+
+The bundled lints are in `coil.lint.*`. Plain `coil lint` applies the default
+profile (`coil.lint.default`). Add opt-in lints with `--use`, for example
+`coil.lint.no-star-imports`, `coil.lint.unused` and `coil.lint.allocator`.
+
+## FFI
+
+```coil
+(module example.ffi)
+(import "coil.slice" :use [slice-data])
+
+(extern strlen :cc c [(ptr i8)] (-> u64))
+(extern qsort :cc c [(ptr i8) u64 u64 (fnptr c [(ptr i64) (ptr i64)] i32)] (-> void))
+
+(defn compare [(a (ptr i64)) (b (ptr i64))] (-> i32)
+  (cond (< (load a) (load b)) -1
+        (> (load a) (load b)) 1
+        :else 0))
+
+(defn main [] (-> i64)
+  (let [xs [5 3 9 1]]
+    (qsort (cast (ptr i8) (slice-data xs)) 4 8 (fnptr-of compare))
+    (println "{} {} {} {} / {}" (get xs 0) (get xs 1) (get xs 2) (get xs 3) (strlen c"four"))
+    0))
+```
+
+```output
+1 3 5 9 / 4
+```
+
+- `(extern name :cc c [ArgTypes…] (-> R))` declares a C function; `...` marks
+  varargs. `:as "symbol"` binds a different linker name.
+- Structs and floats cross the C ABI by value in both directions.
+- A Coil function passed to C as a callback is `(fnptr-of f)`. If the callback takes
+  a struct by value, also list the function in `(export-c f)`.
+- `(export-c [f :as "name"])` makes a Coil function callable from C.
+- `(cimport "header.h" :use [names…])` generates declarations for the listed names
+  from a real header, and `coil cimport header.h` prints bindings for a whole
+  header.
+- `(declare f [(x T)] (-> R))` declares a Coil function compiled in another unit,
+  as prebuilt units use.
+- Link libraries with `-lNAME`, or in `Coil.toml` ([PROJECTS.md](PROJECTS.md)).
+
+## Documentation comments
+
+```
+;;; Parse a decimal integer. Returns `(Err (Empty))` for an empty slice.
+(defn parse [(s (slice u8))] (-> (Result i64 ParseError)) …)
+
+;; An ordinary comment; not documentation.
+```
+
+A run of `;;;` lines directly above a definition is its documentation. `coil doc
+FILE` prints a module's documented API as Markdown, and checkers can read it with
+`primitive/code-doc`.
+
+## Tests
+
+```coil
+(module example.tests)
+(defn clamp [(x i64) (lo i64) (hi i64)] (-> i64)
+  (cond (< x lo) lo (> x hi) hi :else x))
+
+(deftest clamp-keeps-values-in-range
+  (assert-eq (clamp 5 0 10) 5)
+  (assert-eq (clamp -3 0 10) 0)
+  (assert (<= (clamp 99 0 10) 10)))
+```
+
+`coil test FILE` runs each `deftest` in its own process, so a crash in one test
+leaves the others running. In a project, `coil test` with no file finds the test
+files from `Coil.toml`.
+
+`defprop` states a property over generated inputs and shrinks any failure to a
+minimal counterexample:
+
+```
+(import "coil.prop" :use *)
+
+(defprop clamp-stays-in-range [(x i64) (lo i64) (hi i64)]
+  (assume (<= lo hi))
+  (let [y (clamp x lo hi)] (and (>= y lo) (<= y hi))))
+```
+
+[TESTING.md](TESTING.md) covers filters, suites, generators and `coil fuzz`.
+
+## The metal tier
+
+The rest of the language sits on primitive operations in `coil.primitive`. You
+rarely need them directly:
+
+```coil
+(module example.metal)
+(import "coil.primitive" :as primitive)
+
+(defn main [] (-> i64)
+  (let [x (: 0b1011_0000 u8)]
+    (println "{} {} {}" (primitive/popcount x) (primitive/ctz x) (primitive/udiv (: 200 u8) 3))
+    (println "{}" (primitive/imul-overflow? (: 9223372036854775807 i64) 2))
+    0))
+```
+
+```output
+3 4 66
+true
+```
+
+| Operation | Primitives |
+|---|---|
+| Integer arithmetic, any width | `iadd isub imul idiv irem`, unsigned `udiv urem`, `iand ior ixor ishl ishr` |
+| Comparison | `icmp-eq`… (integers only); `fcmp-eq`… for floats |
+| Bits | `clz ctz popcount bswap rotl rotr mulhi` |
+| Overflow | `iadd-overflow? isub-overflow? imul-overflow?`; `coil.integer` has `overflowing-add` and friends |
+| Places | `load`, `store!`, `field`, `index` (pointer arithmetic) |
+| Uninitialized storage | `alloc-stack` (frame lifetime), `alloc-stack-bytes`, `alloc-static` (a global cell, with an optional initializer, `:as "symbol"`, or sparse `:elements`) |
+| Aliasing | `alias-load`/`alias-store!` promise type-based non-aliasing (TBAA) |
+| Inline IR | `llvm-ir` |
+| SIMD | `(vec T N)`, `(mask N)`, and `coil.simd`; see [SIMD.md](SIMD.md) |
+
+`load`, `store!`, `field`, `index`, `cast`, `sizeof`, `alignof`, `offsetof`, `zeroed`,
+`fnptr-of` and `call-ptr` are also available without the prefix. Null is
+`(cast (ptr T) 0)`, and pointers compare by address with the ordinary operators.
+
+⚠ `alloc-stack` storage lasts until the *function* returns, so calling it in a loop
+grows the stack on every iteration. Prefer an initialized `(mut x)` local.
+
+## Gotchas
+
+- `f64` has no `=`; use `primitive/fcmp-eq` for IEEE equality.
+- There is no unary minus: write `(- 0 x)`.
+- Arithmetic operators take exactly two arguments: `(+ a (+ b c))`, not `(+ a b c)`.
+- `if` needs both branches, of the same type.
+- `when`, `unless`, `for` and `while` produce `i64` 0. In a non-`i64` function, end
+  with the real result.
+- `cast` between floats and integers converts the value, not the bits.
+- `println` returns a `Result`, which matters when it is a `match` arm's value.
+- `primitive/…` names require `(import "coil.primitive" :as primitive)`.
+- `Display` needs `(import "coil.fmt" :use [Display …])`. `{:?}` on library types
+  needs `(import "coil.debug" :use *)`.
+- `(dyn Trait)` needs a `(ptr T)`, not a `(mut local)`.
+- You can't implement a trait for `(mut T)`; implement it for `T`.
+- `(.field (f))` fails on a call result or a `for` element value; `let`-bind the
+  value first.
+- Only one `(try …)` block per function.
+- Declare each `extern` in one module only.
+- Don't call `alloc-stack` in a loop, and never return a pointer to a local.
+- `call` and `block` are reserved and can't be function names (except the `call`
+  method of a `Callable` impl). Avoid `type` as a field name.
+- In a macro, splice a `(mut …)` CodeBuilder with
+  `(primitive/code-list-done (load b))`.

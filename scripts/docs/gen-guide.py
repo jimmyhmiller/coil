@@ -6,7 +6,9 @@ documents. They live in src/compiler/guide.coil as string constants so the
 compiled binary is self-contained (works from the global install, no repo
 needed). This script keeps them in sync with the Markdown sources.
 
-Run from the repo root after editing docs/reference/LANGUAGE_GUIDE.md:
+Run from the repo root after editing docs/reference/LANGUAGE_GUIDE.md, CHEATSHEET.md,
+or one of the task guides a topic embeds (PROJECTS, TESTING, DEBUGGING, STATEFUL_JIT,
+WASM):
     python3 scripts/docs/gen-guide.py
 then rebuild the compiler (scripts/compiler/rebootstrap.sh) — and because main.coil is in
 the gate corpus, regenerate the snapshot first:
@@ -30,34 +32,47 @@ def read(path):
 GUIDE = read("docs/reference/LANGUAGE_GUIDE.md")
 CHEATSHEET = read("docs/reference/CHEATSHEET.md")
 
-# A topic is one or more heading-bounded fragments from the reference. Keeping the
-# map here makes aliases and descriptions reviewable while all prose remains in the
-# Markdown source of truth. A fragment ends at the next heading of the same or higher
-# level, unless an explicit end heading is supplied.
+# Documents a topic may draw from. The language guide is the default; the others
+# are the task guides split out of it.
+DOCS = {
+    "guide": GUIDE,
+    "projects": read("docs/reference/PROJECTS.md"),
+    "testing": read("docs/reference/TESTING.md"),
+    "debugging": read("docs/reference/DEBUGGING.md"),
+    "jit": read("docs/reference/STATEFUL_JIT.md"),
+    "wasm": read("docs/reference/WASM.md"),
+}
+
+# A topic is one or more fragments. A fragment is (heading, end-heading) in the
+# language guide, or (document, None, None) for a whole split-out document. A
+# heading fragment ends at the next heading of the same or higher level unless an
+# explicit end heading is supplied. Keeping the map here makes aliases and
+# descriptions reviewable while all prose remains in the Markdown sources.
 TOPICS = [
-    ("build", "building, running, projects, targets, and WebAssembly", ["getting-started", "run", "project"], "build run project target wasm executable", [("Build & run", None)]),
-    ("modules", "module declarations, imports, exports, and namespaces", ["module", "import", "imports", "namespace"], "source-roots source roots package dependency export qualified", [("Modules & imports", None)]),
-    ("operators", "arithmetic, comparison, remainder, and metal operations", ["operator", "remainder", "modulo", "%"], "arithmetic comparison division multiplication irem rem", [("The two operator tiers", None)]),
-    ("traits", "traits, implementations, bounds, methods, and deriving", ["trait", "impl", "derive"], "method bound generic protocol implementation", [("Traits & impls", None)]),
-    ("types", "integer and floating-point types, bool, literals, and casts", ["type", "integers", "numbers", "bool"], "numeric cast conversion integer literal signed unsigned", [("Numbers, bool, casts", None)]),
-    ("floats", "f32/f64 arithmetic, comparison, conversion, and casts", ["float", "f32", "f64", "cast", "conversion"], "floating GetFrameTime frame time numeric arithmetic comparison NaN", [("The two operator tiers", None), ("Numbers, bool, casts", None)]),
-    ("control-flow", "if, cond, loops, blocks, and return-from", ["control", "if", "loop", "block"], "branch while break continue return case", [("Control flow", None)]),
-    ("structs", "defstruct, construction, fields, zeroed, load, and store!", ["struct", "defstruct", "field", "fields", "zeroed", "load", "store", "store!"], "array index construction named place layout", [("Structs", None)]),
-    ("match", "sum types and exhaustive pattern matching", ["matching", "sum", "sums", "defsum", "exhaustive"], "enum variant variants pattern patterns arm tagged union", [("Sum types (tagged unions)", None)]),
-    ("memory", "pointers, allocation, mutability, and lifetimes", ["pointer", "pointers", "allocation", "alloc"], "mutable mut parameter place load store index zeroed address lifetime", [("Pointers, memory, allocation", None)]),
-    ("collections", "arrays, slices, maps, lists, and collection traits", ["collection", "array", "slice", "hashmap"], "index vector list map iteration", [("Collections (bundled)", None)]),
-    ("strings", "strings, byte slices, and character literals", ["string", "bytes", "characters", "chars"], "text utf8 cstring character literal", [("Strings & bytes", None), ("Character literals", None)]),
-    ("functions", "functions, callbacks, closures, and function pointers", ["function", "fnptr", "callback", "closures"], "defn parameter arguments native call pointer", [("Functions & function pointers", None)]),
-    ("globals", "global mutable and constant state", ["global", "state"], "static const mutable", [("Global mutable state", None)]),
-    ("comptime", "compile-time evaluation, macros, and reflection", ["compile-time", "macro", "macros", "reflection"], "code generation expansion const meta", [("Compile-time: comptime, macros, reflection", None)]),
-    ("metaprograms", "whole-program checkers, transforms, and dialects", ["metaprogram", "checker", "checkers", "transform", "transforms"], "dialect whole program lint rewrite", [("Metaprograms: whole-program checkers & transforms", None)]),
-    ("ffi", "extern, primitive/native definitions, cimport, and the C ABI", ["extern", "native", "primitive", "cimport", "c-abi"], "foreign C ABI header printf raylib", [("I/O & FFI", None)]),
-    ("docs", ";;; documentation comments and generated API docs", ["doc", "comments", "documentation"], "code-doc markdown reference", [("Doc comments (`;;;`)", None)]),
-    ("tests", "deftest, assert, discovery, filtering, and debug checks", ["test", "testing", "assert", "assertions", "deftest", "discovery"], "runner filter no-run list failure project", [("Tests, assertions, debug checks", "Named test suites")]),
-    ("test-suites", "named test suites and project test configuration", ["suite", "suites", "named-tests"], "test roots suffixes project configuration Coil.toml default opt-in", [("Named test suites", "Property-based testing (`coil.prop`)")]),
-    ("properties", "property tests, generators, shrinking, and fuzzing", ["property", "property-tests", "prop", "fuzz", "fuzzing"], "generator arbitrary shrink cases seed coverage", [("Property-based testing (`coil.prop`)", "Reserved-name gotchas ⚠")]),
-    ("gotchas", "reserved names and common language traps", ["gotcha", "reserved", "reserved-names"], "call block type mistakes", [("Reserved-name gotchas ⚠", None)]),
-    ("stdlib", "standard-library discovery and commonly used namespaces", ["standard-library", "library"], "bundled API modules namespaces", [("The standard library", None)]),
+    ("tour", "one program touching every major feature", ["overview", "start", "getting-started"], "hello example program main first", [("Tour", None)]),
+    ("types", "integer, float, bool, character, string and keyword values; casts", ["type", "integers", "numbers", "bool", "literals", "floats", "float", "f64", "cast"], "numeric cast conversion integer literal signed unsigned width NaN f32", [("Values and types", None)]),
+    ("control-flow", "let, if, cond, case, when, loops, blocks, scope/defer, destructuring", ["control", "if", "loop", "let", "destructuring", "defer"], "branch while for break continue return case block pattern", [("Bindings and control flow", None)]),
+    ("functions", "defn, named arguments, generics, value parameters, fn, fnptr, annotations", ["function", "defn", "fn", "fnptr", "callback", "generics", "annotations"], "parameter arguments generic const keyword inline anonymous lambda", [("Functions", None)]),
+    ("structs", "defstruct, construction, .field access, set!, references, computed fields", ["struct", "defstruct", "field", "fields"], "array construction named place layout reference mut zeroed sizeof", [("Structs", None)]),
+    ("match", "sum types, exhaustive match, Option, Result and try", ["matching", "sum", "sums", "defsum", "option", "result", "try"], "enum variant variants pattern arm tagged union error", [("Sum types and match", None)]),
+    ("traits", "traits, impls, operators, methods, specialization, derive, dyn, Callable", ["trait", "impl", "derive", "dyn", "operators", "operator", "callable", "methods"], "method bound generic protocol implementation display debug eq ord add", [("Traits", None)]),
+    ("memory", "allocators, references and pointers, ownership, Drop, Rc/Arc", ["pointer", "pointers", "allocation", "alloc", "ownership", "drop", "allocator"], "mutable mut parameter box arena free lifetime clone rc arc lease", [("Memory and ownership", None)]),
+    ("globals", "const, def, and mutable global cells", ["global", "state", "const", "def"], "static var-static mutable constant", [("Globals", None)]),
+    ("collections", "slices, arrays, ArrayList, HashMap, iterators and adapters", ["collection", "array", "slice", "hashmap", "arraylist", "iter", "iterator"], "index vector list map iteration filter fold range collect", [("Collections and iteration", None)]),
+    ("strings", "printing, formatting, strings and text", ["string", "text", "println", "format", "print"], "utf8 cstring display debug fmt str rune", [("Text and output", None)]),
+    ("modules", "module declarations, imports, exports and namespaces", ["module", "import", "imports", "namespace", "stdlib", "library"], "export qualified core namespaces standard", [("Modules", None)]),
+    ("comptime", "const/comptime evaluation, macros, reflection, custom derives", ["compile-time", "macro", "macros", "reflection", "defderive"], "code generation expansion quasiquote hygiene meta", [("Compile time", None)]),
+    ("metaprograms", "whole-program checkers (lints with fixes) and transforms", ["metaprogram", "checker", "checkers", "transform", "transforms", "lint", "lints"], "dialect whole program rewrite suggest fix", [("Metaprograms: lints and transforms", None)]),
+    ("ffi", "extern, cimport, export-c, callbacks and the C ABI", ["extern", "native", "cimport", "c-abi", "export-c"], "foreign C ABI header printf", [("FFI", None)]),
+    ("docs", ";;; documentation comments", ["doc", "comments", "documentation"], "code-doc markdown reference", [("Documentation comments", None)]),
+    ("tests", "deftest, assertions and a first property test", ["test", "deftest", "assert", "assertions"], "assert-eq defprop", [("Tests", None)]),
+    ("metal", "coil.primitive: raw operations, uninitialized storage, SIMD", ["primitive", "primitives", "bits", "unsafe"], "iadd udiv popcount alloc-stack alloc-static load store index tbaa llvm-ir", [("The metal tier", None)]),
+    ("gotchas", "common traps, collected", ["gotcha", "reserved", "reserved-names", "mistakes"], "call block type error", [("Gotchas", None)]),
+    ("project", "Coil.toml, dependencies, workspaces, linking, artifacts, toolchain updates", ["projects", "build", "run", "manifest", "dependencies", "workspace", "workspaces", "coil.toml", "update"], "package entry link libs native artifacts readers providers hermetic prebuilt unit install", [("projects", None, None)]),
+    ("testing", "coil test, suites, property tests and fuzz campaigns", ["test-suites", "suites", "suite", "property", "properties", "prop", "fuzz", "fuzzing"], "runner filter list jobs generator arbitrary shrink seed coverage corpus roots suffixes", [("testing", None, None)]),
+    ("debugging", "debug checks, sanitizers, crash reports, debugging allocators", ["debug", "sanitize", "sanitizer", "sanitizers", "debug-checks", "asan"], "address thread memory undefined crash dbgalloc guardalloc tracealloc", [("debugging", None, None)]),
+    ("jit", "the REPL and the in-process coil.jit compiler", ["repl", "hot-reload", "stateful-jit"], "session var reload sdk evaluate compile", [("jit", None, None)]),
+    ("wasm", "the wasm32 target, exports, host imports and externref", ["wasm32", "webassembly", "browser"], "javascript export import externref", [("wasm", None, None)]),
 ]
 
 
@@ -81,22 +96,35 @@ def headings(markdown):
 HEADINGS = headings(GUIDE)
 
 
+def fragment_key(fragment):
+    if len(fragment) == 3:
+        return "@" + fragment[0]
+    start_name, end_name = fragment
+    return start_name + ("" if end_name is None else " -> " + end_name)
+
+
+def fragment_text(fragment):
+    if len(fragment) == 3:
+        if fragment[0] not in DOCS:
+            raise SystemExit(f"guide topic names unknown document: {fragment[0]}")
+        return DOCS[fragment[0]].rstrip()
+    start_name, end_name = fragment
+    if start_name not in HEADINGS:
+        raise SystemExit(f"guide topic starts at missing heading: {start_name}")
+    start, default_end = HEADINGS[start_name]
+    if end_name is None:
+        end = default_end
+    else:
+        if end_name not in HEADINGS:
+            raise SystemExit(f"guide topic ends at missing heading: {end_name}")
+        end = HEADINGS[end_name][0]
+    if end <= start:
+        raise SystemExit(f"empty/reversed guide fragment: {start_name} -> {end_name}")
+    return GUIDE[start:end].rstrip()
+
+
 def topic_text(fragments):
-    pieces = []
-    for start_name, end_name in fragments:
-        if start_name not in HEADINGS:
-            raise SystemExit(f"guide topic starts at missing heading: {start_name}")
-        start, default_end = HEADINGS[start_name]
-        if end_name is None:
-            end = default_end
-        else:
-            if end_name not in HEADINGS:
-                raise SystemExit(f"guide topic ends at missing heading: {end_name}")
-            end = HEADINGS[end_name][0]
-        if end <= start:
-            raise SystemExit(f"empty/reversed guide fragment: {start_name} -> {end_name}")
-        pieces.append(GUIDE[start:end].rstrip())
-    return "\n\n".join(pieces) + "\n"
+    return "\n\n".join(fragment_text(fragment) for fragment in fragments) + "\n"
 
 
 seen_names = set()
@@ -143,10 +171,10 @@ fragment_rows = {}
 topic_fragment_rows = []
 for canonical, _, _, _, fragments in TOPICS:
     keys = []
-    for start_name, end_name in fragments:
-        key = start_name + ("" if end_name is None else " -> " + end_name)
+    for fragment in fragments:
+        key = fragment_key(fragment)
         keys.append(key)
-        fragment_rows[key] = topic_text([(start_name, end_name)])
+        fragment_rows[key] = topic_text([fragment])
     topic_fragment_rows.append((canonical, "\n".join(keys) + "\n"))
 
 out = (

@@ -1,52 +1,39 @@
-# Metaprogram PoC — the four kinds, on today's machinery
+# Metaprograms: a checker and a lint
 
-A metaprogram is a Coil function that runs at compile time and operates on the
-program. This shows the **Checker** kind (reject power) working now; the
-**Transformer** kind is in [`src/experiments/gc-dialect`](../../experiments/gc-dialect/)
-(a GC as a metaprogram).
+A metaprogram is a Coil function that runs at compile time over the whole
+program. Registering one with `(checker f)` runs it after type checking, so it can
+ask the compiler what a call resolved to (`code-decl`) and which local a name
+refers to (`binding-of`). Importing the module that registers it switches it on.
 
-## checker.coil — a use-after-free checker that VETOES compilation
+## checker.coil: refuse a use after free
 
-`check-uaf` is a macro `[Code…] -> Code` that scans a sequence for a `(free X)`
-followed by a later use of `X`, and calls `error` (aborting the build) if it
-finds one — otherwise it returns the body unchanged. Uses only Code builtins.
+`use-after-free` walks every sequence of forms. After a call that resolves to
+`coil.alloc/destroy`, it reports any later form that mentions the freed local,
+and the build fails.
 
 ```sh
-../.build/bin/coil run ok.coil    # clean → compiles & runs
-../.build/bin/coil run bad.coil   # use-after-free → REJECTED: "check-uaf: use after free …"
+coil run src/examples/metaprogramming/ok.coil    # frees last: compiles, exits 42
+coil run src/examples/metaprogramming/bad.coil   # reads after the free: rejected
 ```
 
-Limitation: scans the straight-line top-level sequence handed to it (wrap a region
-in `(check-uaf …)`). Making it *automatic* over the whole program — no wrapping —
-is the compiler-level `(checker f)` hook in `docs/reference/METAPROGRAMS.md` (Phase 1.1).
+It is a demonstration, not an analysis: it looks at straight-line sequences only
+and does not follow aliases or control flow.
 
-## condlint.coil — a lint that FIXES: nested ifs → cond
+## condlint.coil: a lint that fixes
 
-`lint-nested-if` finds an `if` chain of three or more tests and proposes the `cond`
-it should have been, with `:else` as the final clause. It reports with
-`(suggest NODE MSG REPLACEMENT)`, so the proposal is a real `Code` value built from
-the author's own test and body nodes — which is what lets `coil lint --fix` splice it
-in while reprinting those branches as their **original bytes**.
+`nested-ifs` finds a chain of three or more hand-written `if`s and proposes the
+`cond` it should be, using `primitive/suggest`. The replacement is built from the
+author's own nodes, so `--fix` reprints them as their original source text,
+comments included.
 
 ```sh
 cd src/examples/metaprogramming
-../.build/bin/coil lint condlint_test.coil --use condlint.coil            # report + `help: try:`
-../.build/bin/coil lint condlint_test.coil --use condlint.coil --diff     # the patch, no writes
-../.build/bin/coil lint condlint_test.coil --use condlint.coil --fix      # apply it
+coil lint condlint_test.coil --use condlint          # report
+coil lint condlint_test.coil --use condlint --diff   # show the patch
+coil lint condlint_test.coil --use condlint --fix    # apply it
 ```
 
-`condlint_test.coil` covers the three cases that matter: a three-test staircase (fixed),
-a two-armed `if` (left alone — that is what `if` is for), and a `cond` the author already
-wrote. The last one is the subtle one: checkers run on the **expanded** program, so that
-`cond` is already nested ifs by the time the rule sees it. `(code-macro? NODE)` is what
-tells the expander's ifs from the author's.
-
-Three properties the fix keeps, and how to see them:
-
-- **Behaviour** — run the program before and after; the exit code is the same.
-- **Idempotence** — a second `--fix` produces a byte-identical file.
-- **Your comments** — a chain with a comment between a test and its body cannot be
-  collapsed without deleting it, so it is reported with a `note:` and left alone.
-
-`--fix` loops to a fixpoint (a chain nested inside another chain's body takes a second
-round) and reverts any round that stops compiling. Design: `docs/archive/AUTOFIX.md`.
+`condlint_test.coil` holds a three-test chain, which is flagged; a two-test chain,
+which is not; and a `cond` the author already wrote. The checker sees that `cond`
+after expansion, as nested ifs, and `code-macro?` is how it knows to leave it
+alone.
