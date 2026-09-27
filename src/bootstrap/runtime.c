@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #include <spawn.h>
 #include <sys/wait.h>
 
@@ -247,6 +248,8 @@ uint64_t env_mkdtemp(uint64_t path) { return mkdtemp(hoststr(path)) ? path : 0; 
 uint32_t env_mkstemp(uint64_t path) { return (uint32_t)mkstemp(hoststr(path)); }
 uint32_t env_remove(uint64_t path) { return (uint32_t)remove(hoststr(path)); }
 uint32_t env_rmdir(uint64_t path) { return (uint32_t)rmdir(hoststr(path)); }
+uint32_t env_mkdir(uint64_t path, uint32_t mode) { return (uint32_t)mkdir(hoststr(path), (mode_t)mode); }
+uint32_t env_chdir(uint64_t path) { return (uint32_t)chdir(hoststr(path)); }
 uint32_t env_unlink(uint64_t path) { return (uint32_t)unlink(hoststr(path)); }
 uint32_t env_rename(uint64_t a, uint64_t b) { return (uint32_t)rename(hoststr(a), hoststr(b)); }
 uint64_t env_realpath(uint64_t path, uint64_t out) {
@@ -402,6 +405,12 @@ double env_sqrt(double x) { return sqrt(x); }
 double env_pow(double x, double y) { return pow(x, y); }
 double env_fmod(double x, double y) { return fmod(x, y); }
 float  env_fmodf(float x, float y) { return fmodf(x, y); }
+float  env_sqrtf(float x) { return sqrtf(x); }
+float  env_floorf(float x) { return floorf(x); }
+float  env_ceilf(float x) { return ceilf(x); }
+float  env_truncf(float x) { return truncf(x); }
+double env_fma(double x, double y, double z) { return fma(x, y, z); }
+float  env_fmaf(float x, float y, float z) { return fmaf(x, y, z); }
 
 // ---- process ----
 uint64_t env_abort(void) { die("env.abort() called"); return 0; }
