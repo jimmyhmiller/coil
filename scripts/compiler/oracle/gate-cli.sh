@@ -3546,6 +3546,26 @@ EOF
   && ok "a macro calls coil.fs/write-file at expansion" \
   || bad "a macro calls coil.fs/write-file" "$("$COIL" run "$T/macro_write.coil" 2>&1 | head -3)"
 
+echo "== a reader provider's error names the file it was reading =="
+# An error raised inside a reader provider has no span of its own; it names the
+# file and the reader, and a code-symbol part it cannot use (coil-bugs cdcxfov39ng).
+mkdir -p "$T/rdr/src"
+printf '[package]\nname = "rdr"\nentry = "src/main.coil"\n\n[readers]\n".bad" = "rdr.reader"\n\n[modules]\n"rdr.data" = "src/data.bad"\n' > "$T/rdr/Coil.toml"
+cat > "$T/rdr/src/reader.coil" <<'EOF'
+(module rdr.reader)
+(import "coil.primitive" :as p)
+(reader-provider "rdr.reader" read-bad)
+(defn read-bad [(context Code)] (-> Code)
+  `(defn value [] (-> i64) ~(p/code-symbol `:oops)))
+EOF
+echo "anything" > "$T/rdr/src/data.bad"
+printf '(module rdr.main)\n(import "rdr.data" :as d)\n(defn main [] (-> i64) (d/value))\n' > "$T/rdr/src/main.coil"
+rdr_out=$(cd "$T/rdr" && "$COIL" check 2>&1)
+case "$rdr_out" in
+  *"data.bad' with reader 'rdr.reader'"*"got the keyword :oops"*) ok "a reader provider's error names the file, the reader and the bad part" ;;
+  *) bad "reader provider error location" "$rdr_out" ;;
+esac
+
 echo "== focused guide lookup =="
 expect_out '^  tests[[:space:]]+deftest' "guide: no argument prints the compact topic index" "$COIL" guide
 expect_out '^## Tests$' "guide: canonical topic prints only its section" "$COIL" guide tests
