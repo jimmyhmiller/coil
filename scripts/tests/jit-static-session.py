@@ -173,9 +173,13 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
     binary = work / "reader-reuse"
     run(COMPILER, "build", ROOT / "tests/compiler/features/jit_reader_engine_reuse.coil",
         "-o", binary, *flags)
-    traced = run(binary, env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(work), COIL_TRACE="1"))
-    builds = traced.stderr.count("coil-trace count reader.engine-builds ")
-    reuses = traced.stderr.count("coil-trace count reader.engine-reuses ")
+    # The trace is diagnostic output, not text this test owns; count its ASCII
+    # markers from the raw bytes.
+    traced = subprocess.run([str(binary)], cwd=ROOT, capture_output=True, timeout=240,
+                            env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(work), COIL_TRACE="1"))
+    assert traced.returncode == 0, (traced.returncode, traced.stderr[-2000:])
+    builds = traced.stderr.count(b"coil-trace count reader.engine-builds ")
+    reuses = traced.stderr.count(b"coil-trace count reader.engine-reuses ")
     assert builds == 1 and reuses == 3, ("source provider engine builds/reuses", builds, reuses)
     print("PASS: a session's source provider engine is built once and reused", flush=True)
     (work / "entry_provider2.coil").write_text('''(module entry.provider2)
