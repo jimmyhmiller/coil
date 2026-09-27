@@ -129,10 +129,13 @@ backend. `jit-session-new` finds the matching toolchain through `coil` on
 | `(jit-symbol-address s NAME)` | `(ptr i8)` | Address of an `export-c` symbol; null if absent |
 | `(jit-diagnostic s)`, `(jit-pending s)`, `(jit-status s)` | | Why the last submission failed; the pending candidate |
 | `(jit-reset! s)` | 0, or -1 | Release everything and start empty; -1 while leases are held |
+| `(jit-session-free! s)` | 0, or -1 | Reset, then free the session itself and null the handle; -1 while leases are held |
 
 A submission sees everything accepted before it. Never resubmit accepted
 source, because definitions are not overwritten (see below). A `(module NAME)`
 form selects the namespace for later submissions; it starts as `jit.session`.
+A module accepted earlier, or declared earlier in the same source, can be
+imported by name like one on disk.
 
 - Compilation and publication are transactional. A rejected candidate,
   including one rejected by its entry expression, leaves the accepted
@@ -141,7 +144,12 @@ form selects the namespace for later submissions; it starts as `jit.session`.
 - Preparing a second candidate aborts the first. There is no API to replace
   the whole source or replay it.
 - Serialize calls into one session. You may nest calls synchronously, but never
-  call it from two threads at once.
+  call it from two threads at once. The calls may all come from one worker
+  thread, and other threads may run code published by any session meanwhile.
+  `jit-evaluate!` and entry expressions run on the calling thread.
+- `COIL_META_MAIN=1` asks for metaprograms on the process main thread. An
+  embedding host honors it only when it compiles on its main thread; a
+  submission from any other thread fails with a diagnostic saying so.
 - The session does not keep the source it was given. If you need a journal,
   keep one yourself.
 
@@ -349,7 +357,10 @@ generation gave it.
 
 Each accepted submission replaces one compact graph of live compiler metadata
 and frees the compiler's scratch memory, so accepted compilations do not
-accumulate. Native code is owned separately: retiring metadata does not unmap
+accumulate. Scratch segments of 1 MiB and more are page mappings returned to
+the system when freed, so a host does not stay large after a compile. The
+first compile in a session, and the first after a reset, checks the implicit
+prelude and takes about 250 ms; later compiles take a few milliseconds. Native code is owned separately: retiring metadata does not unmap
 code that a published pointer may still call, and `jit-reset!` releases both.
 Source text is kept only while live metadata refers to it.
 
