@@ -5,8 +5,8 @@ LLVM IR of the Coil self-hosted compiler (and two smoke-test programs) for
 Linux toolchain: the normal path is the committed ELF seed
 (`bootstrap/seeds/native/coil-seed-linux-x86_64`) via `python3 scripts/dev.py build linux`; if that
 seed's libLLVM (21) doesn't match your system, rebuild a stage0 from this IR against
-whatever libLLVM you have (the C-API surface used — 149 `LLVMxxx` symbols, newest is
-`LLVMArrayType2`, LLVM 17 — is stable across 20/21).
+your installed libLLVM. The current artifact declares 235 LLVM C-API symbols and is
+verified with LLVM 21; check parser and C-API compatibility before using another major.
 
 ## Artifacts (xz-compressed textual IR)
 
@@ -38,41 +38,20 @@ through.
 
 ## Provenance
 
-**This revision has been RUN.** It was cross-emitted from macOS (arm64), linked into a
-stage0 on Linux x86-64 (Ubuntu, LLVM 21.1.8, `/usr/lib/llvm-21/bin/clang`), and that
-stage0 drove `python3 scripts/dev.py build linux` to a byte-identical LLVM fixed point.
-Both committed Linux seeds were then refreshed from the verified compiler, and a plain
-`python3 scripts/dev.py build linux` (no `STAGE0`) was re-run to prove the new seed
-bootstraps this tree by itself. So the IR is the escape hatch again, not the only way in.
+Regenerate with `scripts/compiler/emit-linux-ir.sh` from a clean, committed tree.
+It builds a compiler linked against the Linux CI's LLVM major (LLVM 21, via
+`LLVM_CONFIG`; Homebrew's `llvm@21` on macOS), emits
+`coil emit-ir src/compiler/main.coil --target x86_64-unknown-linux-gnu` with it,
+and refuses to write the artifact unless that same LLVM's `llvm-as` parses the text
+and its clang compiles it for x86_64-linux. The printing LLVM must match the parsing
+one: an IR written by LLVM 22 carries `nocreateundeforpoison` on intrinsic
+declarations, which LLVM 21 rejects as an "unterminated attribute group", and that is
+exactly how the Linux CI job's IR fallback broke after the seeds went stale.
 
-    coil emit-ir src/compiler/main.coil \
-        --target x86_64-unknown-linux-gnu > coil-linux.ll
-
-Emitted at commit `7ed1648` on `design/immutable-artifacts` (2026-09-20) from a clean
-tree, by a compiler built from that same source (3-stage self-host, LLVM fixpoint
-stage2.o == stage3.o). Note that `emit-ir --help` does not advertise `--target`, but it
-honours it — the help text is wrong, not the flag.
-
-**The emitting LLVM was 22; the build host's was 21.** LLVM 22 writes an attribute LLVM
-21's parser does not know, on two intrinsic declarations. Before compiling with an
-older clang:
-
-    sed -i 's/ nocreateundeforpoison//g' coil-linux.ll
-
-It only tells the optimizer an intrinsic does not create undef or poison, so dropping
-it is semantically inert. The artifact is committed as emitted, not as edited.
-
-What the run found, none of it in the IR:
-
-- The x64 runtime references had gone stale, and nothing could notice: that gate only
-  builds on an x86-64 host. `simd.coil` exits 0 on every backend but its x64 reference
-  said 42; `args.coil`'s recorded `argv[0]` predated the gate running programs under
-  their source name; `llvm-ir-ops.coil` had no x64 reference at all. Re-blessed on Linux
-  from the LLVM backend, as that gate intends — 57/57, x64 and LLVM agreeing on each.
-- The installer copied the new compiler INTO the running one, which Linux refuses
-  (`ETXTBSY`) whenever a `coil` process is alive. It renames into place now.
-- `rebootstrap-nollvm-linux.sh` needs `COIL_LLVM_LIBDIR=/usr/lib/llvm-21/lib` for its
-  stage0; the script says so itself when it is missing.
+Current artifact: emitted at commit `8b02edfa` (2026-09-27) by a compiler built from
+that commit and linked against LLVM 21.1.8; parsed by LLVM 21 `llvm-as` and compiled
+by LLVM 21 clang for x86_64-unknown-linux-gnu. It has not been linked and run on a
+Linux host from this machine; the Linux CI job does that when its ELF seeds are stale.
 
 ## Rebuilding a stage0 from this IR
 
@@ -100,19 +79,19 @@ spelling; pre-21 parsers want `nocapture`. The sed is semantically inert.
 
 ## External link surface
 
-libLLVM (C API), bundled libcurl/mbedTLS, and libc/libm/libpthread/libdl. **No Darwin symbols** — the historical
+libLLVM (C API), bundled libcurl/mbedTLS, and libc/libm/libpthread/libdl. **No referenced Darwin-only symbols** — the historical
 `dispatch_semaphore_*` (now pthread mutex+condvar in `metaengine.coil`) and
 `sys_icache_invalidate` (now resolved via `dlsym` at runtime in `jit.coil`, null and
 skipped on ELF hosts) are gone from the link surface.
 
-Re-checked on this emission: 330 unique `declare`s, including 214 LLVM C-API symbols.
+Re-checked on this emission: 364 unique `declare`s, including 235 LLVM C-API symbols.
 The non-LLVM surface is bundled curl plus libc/libm/pthread/dl — `_exit abort access
 atexit atoi calloc ceil ceilf chdir clock_gettime close
-closedir creat dlerror dlopen dlsym dprintf dup2 execvp exit fabs fclose fcntl floor
-floorf fma fmaf fmod fmodf fopen fork free fwrite getcwd getenv getpid getppid isatty
+closedir creat dladdr dlclose dlerror dlopen dlsym dprintf dup2 execvp exit fabs fclose fcntl fflush floor
+floorf fma fmaf fmod fmodf fopen fork free ftruncate fwrite getcwd getpagesize getenv getpid getppid gettid isatty
 kill malloc memchr memcmp memcpy memmove memset mkdir mkdtemp mkstemp mmap mprotect
 munmap nanosleep open opendir pipe poll posix_memalign posix_spawnp pow printf pthread_*
-putchar puts read readdir realloc realpath remove rename rmdir setenv setpgid snprintf
+putchar puts qsort read readdir realloc realpath remove rename rmdir setenv setpgid snprintf
 sqrt sqrtf strcmp strlen strtod strtol system trunc truncf unlink unsetenv waitpid write`,
 plus the `curl_easy_*`, `curl_multi_*`, and `curl_slist_*` API used by `coil update`.
 Worth re-running that scan after any
