@@ -622,6 +622,15 @@ printf '[package]\nname = "no-stdlib"\nentry = "src/main.coil"\n\n[language]\nst
   && ok "stdlib=false auto-refers an ordinary dependency-module prelude" \
   || bad "replacement prelude" "want rc=42"
 
+# Compiler-known prelude declarations come from the SELECTED prelude: an
+# `:inline` annotation takes the replacement prelude's own InlinePolicy
+# (coil-bugs cchijlrbx8w).
+printf '(module platform.prelude)\n(defsum InlinePolicy (Always) (Hint) (Never))\n(defn* platform-answer [] (-> i64) 42)\n' > "$T/platform/src/prelude.coil"
+printf '(module app)\n(defn* twice :inline (Always) [(x i64)] (-> i64) x)\n(defn* main [] (-> i64) (twice (platform-answer)))\n' > "$T/no-stdlib/src/main.coil"
+( cd "$T/no-stdlib" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "a replacement prelude supplies the InlinePolicy that :inline takes" \
+  || bad "replacement prelude InlinePolicy" "$( cd "$T/no-stdlib" && "$COIL" run 2>&1 | head -3 )"
+
 # A reachable dependency is loaded by the same LS and therefore cannot recover
 # the compiler bundle. This is the transitive-universe guarantee, not a spelling
 # ban: an explicitly supplied dependency would still be allowed to own that name.
@@ -3410,6 +3419,42 @@ EOF
 expect_out "export-c defines C symbol 'callback_c'.*extern.*imports it.*remove the extern.*fnptr-of" \
   "a same-unit extern/export collision explains the supported callback path" \
   "$COIL" check "$T/export-extern-collision.coil"
+
+echo "== diamond re-export =="
+# Two modules re-exporting one definition name one entity; `:use`-ing both is not
+# an ambiguity (coil-bugs paper-layout-diamond-reexport).
+mkdir -p "$T/diamond/src"
+printf '[package]\nname = "repro"\n' > "$T/diamond/Coil.toml"
+printf '(module repro.base)\n(defn answer [] (-> i64) 42)\n' > "$T/diamond/src/base.coil"
+printf '(module repro.a)\n(import "repro.base" :use * :reexport)\n' > "$T/diamond/src/a.coil"
+printf '(module repro.b)\n(import "repro.base" :use * :reexport)\n' > "$T/diamond/src/b.coil"
+printf '(module repro.main)\n(import "repro.a" :use *)\n(import "repro.b" :use *)\n(defn main [] (-> i64) (answer))\n' > "$T/diamond/src/main.coil"
+( cd "$T/diamond" && "$COIL" run src/main.coil >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "a definition re-exported by two :use'd modules is one name" \
+  || bad "diamond re-export" "$( cd "$T/diamond" && "$COIL" run src/main.coil 2>&1 | head -3 )"
+
+echo "== same-named types in two test modules =="
+# Two test modules may each define and derive their own `Rec`; reflection resolves
+# the name in the deriving module (coil-bugs cf0bk2oqjbs).
+mkdir -p "$T/twomods/tests"
+printf '[package]\nname = "twomods"\n' > "$T/twomods/Coil.toml"
+cat > "$T/twomods/tests/a_test.coil" <<'EOF'
+(module twomods.a-test)
+(defstruct Rec [(x i64)])
+(derive Debug Eq Rec)
+(deftest a-rec (assert-eq (Rec :x 1) (Rec :x 1)))
+EOF
+cat > "$T/twomods/tests/b_test.coil" <<'EOF'
+(module twomods.b-test)
+(defstruct Rec [(y i64) (z i64)])
+(derive Debug Eq Hash Rec)
+(deftest b-rec (assert-eq (Rec :y 1 :z 2) (Rec :y 1 :z 2)))
+EOF
+twomods_out=$(cd "$T/twomods" && "$COIL" test 2>&1)
+case "$twomods_out" in
+  *"2 passed; 0 failed"*) ok "two test modules each derive their own same-named type" ;;
+  *) bad "two test modules each derive their own same-named type" "$twomods_out" ;;
+esac
 
 echo "== focused guide lookup =="
 expect_out '^  tests[[:space:]]+deftest' "guide: no argument prints the compact topic index" "$COIL" guide
