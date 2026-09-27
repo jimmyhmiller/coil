@@ -19514,7 +19514,13 @@
    ; The compilation configuration points into it, so it lives as long as the
    ; session; `project-loaded` says whether it was initialized.
    (manifest-arena scratch/ScratchArena)
-   (project-loaded bool)])
+   (project-loaded bool)
+   ; The shared checked prelude this session builds on when it has no state of
+   ; its own (see `repl-session-use-prelude-baseline!`), or null. The process
+   ; table owns it.
+   (prelude-baseline (ptr CompilerRevision))
+   ; This session exists to produce a shared prelude baseline.
+   (builds-prelude-baseline bool)])
 
 ; Compiler-SDK entry: the returned pointer is intentionally erased by coil.jit.
 (defn repl-session-new-with-runner [(a (dyn Allocator))
@@ -20174,7 +20180,8 @@
 ;;; held one will do; the session's current state is only the default.
 (defn compiler-revision-parent [(session (ptr ReplSession))] (-> (ptr CompilerRevision))
   (if (= (primitive/cast i64 (.parent-override session)) 0)
-      (compiler-revision-current session)
+      (let [current (compiler-revision-current session)]
+        (if (= (primitive/cast i64 current) 0) (.prelude-baseline session) current))
       (.parent-override session)))
 
 (defn compiler-revision-retain! [(revision (ptr CompilerRevision))] (-> i64)
@@ -20364,6 +20371,27 @@
       0))
   0)
 
+;;; Add every concrete accepted function to a candidate's runtime program, in a
+;;; list of its own: the program shares its function list with the checked one.
+(defn compiler-runtime-add-accepted-functions! [(a (dyn Allocator)) (runtime (ptr Program))
+                                                (base (ptr checkedbase/CheckedBase))] (-> i64)
+  (let [(mut accepted) (al-new [Func] a)
+        (mut functions) (al-new [Func] a)
+        (mut present) (hm-new [(slice u8) i64] a (str-keyops-borrowed))]
+    (checkedbase/checked-base-functions! base (mut accepted))
+    (for i (range 0 (len (load (.funcs runtime))))
+      (let [f (get (load (.funcs runtime)) i)]
+        (set! (mut present) (.name f) 0)
+        (push! (mut functions) f)))
+    (for i (range 0 (len accepted))
+      (let [f (get accepted i)]
+        (when (and (= (len (load (.type_params f))) 0)
+                   (not (hm-contains? present (.name f))))
+          (push! (mut functions) f)
+          0)))
+    (set! (.funcs runtime) (box-al [Func] a (load functions)))
+    0))
+
 (defn compiler-revision-check [(session (ptr ReplSession))
                                (revision (ptr CompilerRevision))
                                (source (slice u8))
@@ -20393,9 +20421,14 @@
          (set! (.entry_module s) module)
          ; This candidate re-checks only what it submits; a metaprogram it runs
          ; reads accepted functions through the checked base.
-         (set-closure-checked-base!
-           (primitive/cast (ptr checkedbase/CheckedBase) (.persistent_checked s))
-           (.persistent_sigs s))
+         (let [meta (.meta_environment s)
+               no-meta (= (primitive/cast i64 meta) 0)]
+           (set-closure-checked-base!
+             (primitive/cast (ptr checkedbase/CheckedBase) (.persistent_checked s))
+             (.persistent_sigs s)
+             (if no-meta (checkedbase/checked-no-base)
+                 (primitive/cast (ptr checkedbase/CheckedBase) (.persistent_checked meta)))
+             (if no-meta (primitive/cast (ptr i8) 0) (.persistent_sigs meta))))
          ; Provider ABI declarations are ordinary Coil, outside the guest
          ; reader. Load them once; later submissions inherit the checked ABI.
          (when (and (= (primitive/cast i64 parent) 0)
@@ -20480,15 +20513,23 @@
                  runtime (box! a Program (load checked))]
              (sem-maps-save maps)
              (set! (.semantic_maps s) (primitive/cast (ptr i8) maps))
+             (when (and (!= (primitive/cast i64 parent) 0)
+                        (= parent (.prelude-baseline session)))
+               ; The shared prelude's code belongs to the session that built it,
+               ; so a session's first state emits the prelude's functions as a
+               ; session's first compile always has.
+               (compiler-runtime-add-accepted-functions! a runtime (.checked-base parent)))
              (drop-code-funcs a runtime)
              (when (.checked-only session)
                (break :try (Ok [(ptr Program) Diag] runtime)))
              (let [native
                      (try! (monomorphize-reusing a
                                                  runtime
-                                                 (if (= (primitive/cast i64
-                                                                        parent)
-                                                        0)
+                                                 ; The shared prelude's code was
+                                                 ; published in another session, so
+                                                 ; none of it is callable from here.
+                                                 (if (or (= (primitive/cast i64 parent) 0)
+                                                         (= parent (.prelude-baseline session)))
                                                      (primitive/cast (ptr Program)
                                                                      0)
                                                      (.native parent))
@@ -20554,6 +20595,180 @@
   (let [status (repl-session-prepare! raw source entry)]
     (if (!= status 0) status (repl-session-commit-prepared! raw))))
 
+;; ---- the shared checked prelude --------------------------------------------------
+;; A session's first compile loads, expands and checks the whole implicit prelude:
+;; about a third of a second, the same in every session. The first eligible session
+;; of a configuration builds that state once, in a session of its own that compiles
+;; no source, and the process keeps it. Later sessions with the same configuration,
+;; and sessions after a reset, build on it as their first parent. Nothing writes
+;; it: its metadata stays in its own heap, which a session's snapshots point into
+;; without copying or holding, and its native code belongs to its own session, so a
+;; session builds on it as on a state with no code.
+
+(defstruct PreludeBaseline
+  [(key (slice u8))
+   (session (ptr i8))
+   (revision (ptr CompilerRevision))
+   (live (ptr retained-heap/Artifact))])
+
+(defstruct PreludeBaselines [(init bool) (entries (ArrayList PreludeBaseline))])
+
+(defn prelude-baselines [] (-> (ptr PreludeBaselines))
+  (let [table (primitive/alloc-static PreludeBaselines)]
+    (unless (.init table)
+      (set! (.entries table) (al-new [PreludeBaseline] (malloc-allocator)))
+      (set! (.init table) true)
+      0)
+    table))
+
+(defn prelude-key-number! [(a (dyn Allocator)) (key (mut StrBuf)) (value i64)] (-> i64)
+  (sb-push-str! (mut key) " ")
+  (sb-push-str! (mut key) (i64->str a value)))
+
+(defn prelude-key-names! [(key (mut StrBuf)) (names (ptr (ArrayList (slice u8))))] (-> i64)
+  (sb-push-str! (mut key) "\n")
+  (unless (= (primitive/cast i64 names) 0)
+    (for name (iter (load names))
+      (sb-push-str! (mut key) name)
+      (sb-push-str! (mut key) " "))
+    0)
+  0)
+
+;;; Everything about a session that decides what its prelude compiles to: the
+;;; toolchain, the backend, and the whole compilation configuration.
+(defn prelude-baseline-key [(a (dyn Allocator)) (session (ptr ReplSession))] (-> (slice u8))
+  (let [config (field session compiler-config)
+        (mut key) (sb-new a)]
+    (sb-push-str! (mut key) (self-command))
+    (prelude-key-number! a (mut key) (primitive/cast i64 (primitive/cast (ptr i8) (.runner session))))
+    (prelude-key-number! a (mut key) (.optimization config))
+    (prelude-key-number! a (mut key) (.meta_optimization config))
+    (prelude-key-number! a (mut key) (.sanitizer config))
+    (prelude-key-number! a (mut key) (.debug config))
+    (prelude-key-number! a (mut key) (if (.dwarf config) 1 0))
+    (prelude-key-number! a (mut key) (if (.quiet config) 1 0))
+    (prelude-key-number! a (mut key) (.on (.jit config)))
+    (prelude-key-number! a (mut key) (.v (.wasm_side config)))
+    (prelude-key-number! a (mut key) (primitive/cast i64 (.units config)))
+    (sb-push-str! (mut key) "\n")
+    (unless (= (primitive/cast i64 (.triple config)) 0)
+      (sb-push-str! (mut key) (cstr->slice (.triple config)))
+      0)
+    (sb-push-str! (mut key) "\n")
+    (sb-push-str! (mut key) (.reader_artifact config))
+    (prelude-key-names! (mut key) (.uses config))
+    (prelude-key-names! (mut key) (.owner_uses config))
+    (prelude-key-names! (mut key)
+      (if (= (.isset (.links config)) 0)
+          (primitive/cast (ptr (ArrayList (slice u8))) 0)
+          (.flags (.links config))))
+    (for i (range 0 (len (.environment config)))
+      (let [entry (get (.environment config) i)]
+        (sb-push-str! (mut key) "\n")
+        (sb-push-str! (mut key) (cstr->slice (.key entry)))
+        (sb-push-str! (mut key) "=")
+        (unless (= (primitive/cast i64 (.value entry)) 0)
+          (sb-push-str! (mut key) (cstr->slice (.value entry)))
+          0)))
+    (sb-str (load key))))
+
+;;; Only a session whose configuration is its own snapshot of the process's may
+;;; share: a loaded project's configuration points into that session's manifest, a
+;;; source provider reads submissions differently, and a checked-only session
+;;; resolves logical names that a native one does not.
+(defn repl-session-prelude-eligible? [(s (ptr ReplSession))] (-> bool)
+  (not (or (.builds-prelude-baseline s)
+           (or (.project-loaded s)
+               (or (.source-provider-enabled s)
+                   (or (.checked-only s)
+                       (!= (primitive/cast i64 (.parent-override s)) 0)))))))
+
+;;; What a baseline keeps live, found the way a publication's first walk finds it.
+(defn prelude-baseline-live [(owner (ptr ReplSession)) (revision (ptr CompilerRevision))]
+  (-> (ptr retained-heap/Artifact))
+  (let [walk-arena (primitive/alloc-stack scratch/ScratchArena)
+        _init (scratch/scratch-init walk-arena (retained-heap/compiler-scratch-parent))
+        walk-a (scratch/scratch-allocator walk-arena)
+        graph (box! walk-a retained/Graph (retained/graph-new walk-a walk-a))
+        durable (malloc-allocator)
+        (mut node-ids) (al-new [i64] durable) (mut sources) (al-new [i64] durable)
+        (mut contexts) (al-new [i64] durable) (mut scopes) (al-new [i64] durable)]
+    (retained/graph-share-sources! graph (field owner source-store))
+    (retained/graph-liveness-only! graph)
+    (compiler-snapshot-share-bodies! owner graph (.loader revision))
+    (if (= (.meta-checked-base revision) (checkedbase/checked-no-base))
+        (checkedbase/checked-base-mark-liveness! (.checked-base revision) graph)
+        (checkedbase/checked-base-mark-liveness! (.meta-checked-base revision) graph))
+    (snapshot/scan-loader! graph (.loader revision))
+    (snapshot/scan-program! graph (.native revision))
+    (snapshot/scan-resolution! graph (.accepted-ast revision))
+    (snapshot/scan-meta-entries! graph (.entries (field revision accepted-engine)))
+    (assert (= (len (.source-owners graph)) 0))
+    (for [i 0 (.cap (.live-node-ids graph))]
+      (let [e (primitive/index (.slots (.live-node-ids graph)) i)]
+        (when (= (.state e) 1) (push! (mut node-ids) (.key e)) 0)))
+    (for [i 0 (.cap (.live-sources graph))]
+      (let [e (primitive/index (.slots (.live-sources graph)) i)]
+        (when (= (.state e) 1) (push! (mut sources) (.key e)) 0)))
+    (for [i 0 (.cap (.live-contexts graph))]
+      (let [e (primitive/index (.slots (.live-contexts graph)) i)]
+        (when (= (.state e) 1) (push! (mut contexts) (.key e)) 0)))
+    (for [i 0 (.cap (.live-scopes graph))]
+      (let [e (primitive/index (.slots (.live-scopes graph)) i)]
+        (when (= (.state e) 1) (push! (mut scopes) (.key e)) 0)))
+    (scratch/scratch-close! walk-arena)
+    (retained-heap/live-record-new durable (load node-ids) (load sources) (load contexts) (load scopes))))
+
+;;; The baseline for `key`, building it with `like`'s backend if there is none.
+;;; Null if the prelude does not compile; the session then compiles it itself and
+;;; reports why.
+(defn prelude-baseline-for [(like (ptr ReplSession)) (key (slice u8))] (-> (ptr PreludeBaseline))
+  (let [table (prelude-baselines)
+        (mut found) (primitive/cast (ptr PreludeBaseline) 0)]
+    (for [i 0 (len (.entries table))]
+      (let [entry (al-elem [PreludeBaseline] (field table entries) i)]
+        (when (= (.key entry) key) (set! found entry) 0)))
+    (if (!= (primitive/cast i64 (load found)) 0)
+        (load found)
+        (let [durable (malloc-allocator)
+              raw (repl-session-new-with-runner durable (.runner like) (.reclaimer like)
+                    (.generation-count like) (.generation-retain-current like)
+                    (.generation-release-token like) (.generation-token-leases like)
+                    (.generation-set-roots like))
+              owner (repl-session raw)]
+          (set! (.builds-prelude-baseline owner) true)
+          (if (or (!= (repl-session-compile! raw "" "0") 0)
+                  (!= (prelude-baseline-key durable owner) key))
+              ; A configuration that changed between the two sessions' creation
+              ; is simply not shared.
+              (do (repl-session-free! raw) (primitive/cast (ptr PreludeBaseline) 0))
+              (let [revision (compiler-revision-current owner)]
+                (push! (field table entries)
+                  (PreludeBaseline :key (sconcat durable key "") :session raw :revision revision
+                    :live (prelude-baseline-live owner revision)))
+                (al-elem [PreludeBaseline] (field table entries) (- (len (.entries table)) 1))))))))
+
+;;; Build on the shared prelude if this session may and has no state of its own.
+(defn repl-session-use-prelude-baseline! [(raw (ptr i8))] (-> i64)
+  (let [s (repl-session raw)]
+    (when (and (= (primitive/cast i64 (.prelude-baseline s)) 0)
+               (and (= (primitive/cast i64 (compiler-revision-current s)) 0)
+                    (repl-session-prelude-eligible? s)))
+      (let [scratch-arena (primitive/alloc-stack scratch/ScratchArena)
+            _init (scratch/scratch-init scratch-arena (malloc-allocator))
+            key (prelude-baseline-key (scratch/scratch-allocator scratch-arena) s)
+            baseline (prelude-baseline-for s key)]
+        (unless (= (primitive/cast i64 baseline) 0)
+          (let [owner (repl-session (.session baseline))]
+            (set! (.prelude-baseline s) (.revision baseline))
+            (set! (.external (field s body-heap)) (field owner body-heap))
+            (set! (.external-live (field s body-heap)) (.live baseline))
+            (set! (.external (field s source-store)) (field owner source-store))
+            0))
+        (scratch/scratch-close! scratch-arena))
+      0)
+    0))
+
 (defn repl-session-prepare! [(raw (ptr i8))
                              (source (slice u8))
                              (entry (slice u8))] (-> i64)
@@ -20565,7 +20780,8 @@
         (repl-set-failure! session source (meta-main-unservable-message))
         (wb (stderr) 10)
         1)
-      (repl-session-prepare-checked! raw source entry)))
+      (do (repl-session-use-prelude-baseline! raw)
+          (repl-session-prepare-checked! raw source entry))))
 
 (defn repl-session-prepare-checked! [(raw (ptr i8))
                                      (source (slice u8))
@@ -20587,7 +20803,8 @@
           s (.loader revision)
           writer (primitive/alloc-stack Writer)]
       (set! (.jit_work_trace (ast-unit-state))
-            (!= (primitive/cast i64 (unit-getenv c"COIL_JIT_TRACE")) 0))
+            (and (not (.builds-prelude-baseline session))
+                 (!= (primitive/cast i64 (unit-getenv c"COIL_JIT_TRACE")) 0)))
       (compiler-work! "begin" (i64->str a (+ (.epoch session) 1)))
       (when (and (.jit_work_trace (ast-unit-state))
                  (!= (primitive/cast i64 (.parent s)) 0))
@@ -22867,6 +23084,7 @@ Pipeline stage dumps (for debugging the compiler itself), each <file.coil>
 (defn compiler-snapshot-share-bodies! [(session (ptr ReplSession)) (g (ptr retained/Graph))
                                        (s (ptr LS))] (-> i64)
   (set! (.heap g) (field session body-heap))
+  (retained/graph-mark-external! g)
   (compiler-snapshot-body-roots! g (.checked s))
   (compiler-snapshot-signature-roots! g s)
   (unless (= (primitive/cast i64 (.meta_environment s)) 0)
