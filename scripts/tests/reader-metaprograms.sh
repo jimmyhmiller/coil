@@ -55,6 +55,21 @@ COIL_META_ARENA=poison "$COIL" run "$FIX/raw.answer" --use reader.fixture.arena 
 [ $? = 42 ] || fail "reader borrowed expansion allocator survives Code promotion"
 COIL_META_INTERP=1 COIL_META_ARENA=poison "$COIL" run "$FIX/raw.answer" --use reader.fixture.arena >/dev/null
 [ $? = 42 ] || fail "interpreted reader borrowed expansion allocator parity"
+# Direct reader invocation prints ordinary source. Distinct fresh identifiers
+# with the same display spelling must survive that text boundary, and generated
+# names must avoid spellings already present in the emitted module
+# (coil-bugs cdfvsx275dd).
+"$COIL" run "$FIX/fresh_serialization_provider.coil" "$FIX/raw.answer" \
+  > "$T/fresh-serialization.coil" \
+  || fail "direct fresh-identifier reader serialization"
+fresh_defs=$(grep -Eo '\(defn helper__[0-9]+' "$T/fresh-serialization.coil" | sort -u | wc -l | tr -d ' ')
+[ "$fresh_defs" = 3 ] \
+  || fail "serialized fresh definitions were not distinct and collision-free"
+"$COIL" build "$T/fresh-serialization.coil" -o "$T/fresh-serialization" >/dev/null \
+  || fail "compile directly emitted fresh-identifier source"
+"$T/fresh-serialization"
+[ $? = 42 ] || fail "directly emitted fresh identifiers changed binding identity"
+
 "$COIL" run "$FIX/raw.answer" "$FIX/config.sexpr" \
   --use reader.fixture.computed -- -I inc -DNAME=7 -include forced.h >/dev/null
 [ $? = 25 ] || fail "aggregate reader inputs/arguments"

@@ -73,9 +73,14 @@ done
 cat >"$tmp/anon.h" <<'EOF'
 typedef struct { int width; int height; } ReproSize;
 void repro_size(ReproSize *size);
+ReproSize repro_size_value(int width, int height);
+typedef ReproSize ReproSizeAlias;
+ReproSizeAlias repro_size_alias(void);
 EOF
 "$compiler" cimport "$tmp/anon.h" -o "$tmp/anon.coil"
 grep -qF '(defstruct ReproSize [(width i32) (height i32)])' "$tmp/anon.coil"
+grep -qF '(extern repro_size_value :cc c [i32 i32] (-> ReproSize))' "$tmp/anon.coil"
+grep -qF '(extern repro_size_alias :cc c [] (-> ReproSize))' "$tmp/anon.coil"
 "$compiler" check "$tmp/anon.coil"
 
 # A project wrapper keeps its system includes out, unless a name is selected;

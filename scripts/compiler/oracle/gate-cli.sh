@@ -623,6 +623,15 @@ printf '[package]\nname = "no-stdlib"\nentry = "src/main.coil"\n\n[language]\nst
   && ok "stdlib=false auto-refers an ordinary dependency-module prelude" \
   || bad "replacement prelude" "want rc=42"
 
+# Compiler-known prelude declarations come from the SELECTED prelude: an
+# `:inline` annotation takes the replacement prelude's own InlinePolicy
+# (coil-bugs cchijlrbx8w).
+printf '(module platform.prelude)\n(defsum InlinePolicy (Always) (Hint) (Never))\n(defn* platform-answer [] (-> i64) 42)\n' > "$T/platform/src/prelude.coil"
+printf '(module app)\n(defn* twice :inline (Always) [(x i64)] (-> i64) x)\n(defn* main [] (-> i64) (twice (platform-answer)))\n' > "$T/no-stdlib/src/main.coil"
+( cd "$T/no-stdlib" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "a replacement prelude supplies the InlinePolicy that :inline takes" \
+  || bad "replacement prelude InlinePolicy" "$( cd "$T/no-stdlib" && "$COIL" run 2>&1 | head -3 )"
+
 # A reachable dependency is loaded by the same LS and therefore cannot recover
 # the compiler bundle. This is the transitive-universe guarantee, not a spelling
 # ban: an explicitly supplied dependency would still be allowed to own that name.
@@ -3444,6 +3453,123 @@ expect_out "export-c defines C symbol 'callback_c'.*extern.*imports it.*remove t
   "a same-unit extern/export collision explains the supported callback path" \
   "$COIL" check "$T/export-extern-collision.coil"
 
+echo "== diamond re-export =="
+# Two modules re-exporting one definition name one entity; `:use`-ing both is not
+# an ambiguity (coil-bugs paper-layout-diamond-reexport).
+mkdir -p "$T/diamond/src"
+printf '[package]\nname = "repro"\n' > "$T/diamond/Coil.toml"
+printf '(module repro.base)\n(defn answer [] (-> i64) 42)\n' > "$T/diamond/src/base.coil"
+printf '(module repro.a)\n(import "repro.base" :use * :reexport)\n' > "$T/diamond/src/a.coil"
+printf '(module repro.b)\n(import "repro.base" :use * :reexport)\n' > "$T/diamond/src/b.coil"
+printf '(module repro.main)\n(import "repro.a" :use *)\n(import "repro.b" :use *)\n(defn main [] (-> i64) (answer))\n' > "$T/diamond/src/main.coil"
+( cd "$T/diamond" && "$COIL" run src/main.coil >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "a definition re-exported by two :use'd modules is one name" \
+  || bad "diamond re-export" "$( cd "$T/diamond" && "$COIL" run src/main.coil 2>&1 | head -3 )"
+
+echo "== same-named types in two test modules =="
+# Two test modules may each define and derive their own `Rec`; reflection resolves
+# the name in the deriving module (coil-bugs cf0bk2oqjbs).
+mkdir -p "$T/twomods/tests"
+printf '[package]\nname = "twomods"\n' > "$T/twomods/Coil.toml"
+cat > "$T/twomods/tests/a_test.coil" <<'EOF'
+(module twomods.a-test)
+(defstruct Rec [(x i64)])
+(derive Debug Eq Rec)
+(deftest a-rec (assert-eq (Rec :x 1) (Rec :x 1)))
+EOF
+cat > "$T/twomods/tests/b_test.coil" <<'EOF'
+(module twomods.b-test)
+(defstruct Rec [(y i64) (z i64)])
+(derive Debug Eq Hash Rec)
+(deftest b-rec (assert-eq (Rec :y 1 :z 2) (Rec :y 1 :z 2)))
+EOF
+twomods_out=$(cd "$T/twomods" && "$COIL" test 2>&1)
+case "$twomods_out" in
+  *"2 passed; 0 failed"*) ok "two test modules each derive their own same-named type" ;;
+  *) bad "two test modules each derive their own same-named type" "$twomods_out" ;;
+esac
+
+echo "== a before-expand transform imports a module nothing loaded =="
+# The transform adds an import of tiu.n and a main calling through it; tiu.n is
+# loaded when the declarations are rebuilt (coil-bugs transform-import-unloaded).
+mkdir -p "$T/tiu/src"
+printf '[package]\nname = "tiu"\nentry = "src/main.coil"\n\n[metaprograms]\nuse = ["tiu.xf"]\n' > "$T/tiu/Coil.toml"
+printf '(module tiu.main)\n' > "$T/tiu/src/main.coil"
+printf '(module tiu.n)\n(defn f [] (-> i64) 42)\n' > "$T/tiu/src/n.coil"
+cat > "$T/tiu/src/xf.coil" <<'EOF'
+(module tiu.xf)
+(import "coil.primitive" :as p)
+(defn has-main? [(m Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n)
+      false
+      (let [f (p/code-nth m i)]
+        (if (and (p/code-list? f) (and (> (p/code-count f) 1) (p/code-eq (p/code-nth f 1) `main)))
+            true
+            (has-main? m (p/iadd i 1) n)))))
+(defn add-call-from [(ms Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      (let [m (p/code-nth ms i)
+            here (p/code-nth m 0)
+            m2 (if (and (p/code-eq here `tiu.main) (not (has-main? m 1 (p/code-count m))))
+                   `(~@m (import "tiu.n" :as ~(p/datum->syntax here "n"))
+                         (defn ~(p/datum->syntax here "main") [] (-> i64)
+                           (~(p/datum->syntax here "n/f"))))
+                   m)]
+        `(~m2 ~@(add-call-from ms (p/iadd i 1) n)))))
+(defn add-call [(modules Code)] (-> Code) (add-call-from modules 0 (p/code-count modules)))
+(transform add-call :phase before-expand)
+EOF
+( cd "$T/tiu" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "a transform's import of an unloaded module loads it" \
+  || bad "transform import of an unloaded module" "$( cd "$T/tiu" && "$COIL" run 2>&1 | head -3 )"
+
+echo "== an executable with no main =="
+printf '(module nomain)\n(defn f [] (-> i64) 1)\n' > "$T/nomain.coil"
+nomain_out=$("$COIL" build "$T/nomain.coil" -o "$T/nomain" 2>&1)
+case "$nomain_out" in
+  *"the program defines no"*) ok "a program with no main says so at the link" ;;
+  *) bad "a program with no main says so at the link" "$nomain_out" ;;
+esac
+
+echo "== a macro calls coil.fs/write-file =="
+# write-file reads O_CREAT, which coil.fs generates with (meta …); a macro and a
+# before-expand checker can call it (coil-bugs c81fo99shw8).
+cat > "$T/macro_write.coil" <<EOF
+(module macro-write)
+(import "coil.alloc" :as alloc)
+(import "coil.fs" :use [write-file])
+(defn stamp [(x Code)] (-> Code)
+  (let [a (alloc/malloc-allocator)]
+    (write-file a "$T/macro_write.out" "written")
+    \`7))
+(defn main [] (-> i64) (stamp y))
+EOF
+"$COIL" run "$T/macro_write.coil" >/dev/null 2>&1; rc=$?
+[ "$rc" = 7 ] && [ "$(cat "$T/macro_write.out" 2>/dev/null)" = "written" ] \
+  && ok "a macro calls coil.fs/write-file at expansion" \
+  || bad "a macro calls coil.fs/write-file" "$("$COIL" run "$T/macro_write.coil" 2>&1 | head -3)"
+
+echo "== a reader provider's error names the file it was reading =="
+# An error raised inside a reader provider has no span of its own; it names the
+# file and the reader, and a code-symbol part it cannot use (coil-bugs cdcxfov39ng).
+mkdir -p "$T/rdr/src"
+printf '[package]\nname = "rdr"\nentry = "src/main.coil"\n\n[readers]\n".bad" = "rdr.reader"\n\n[modules]\n"rdr.data" = "src/data.bad"\n' > "$T/rdr/Coil.toml"
+cat > "$T/rdr/src/reader.coil" <<'EOF'
+(module rdr.reader)
+(import "coil.primitive" :as p)
+(reader-provider "rdr.reader" read-bad)
+(defn read-bad [(context Code)] (-> Code)
+  `(defn value [] (-> i64) ~(p/code-symbol `:oops)))
+EOF
+echo "anything" > "$T/rdr/src/data.bad"
+printf '(module rdr.main)\n(import "rdr.data" :as d)\n(defn main [] (-> i64) (d/value))\n' > "$T/rdr/src/main.coil"
+rdr_out=$(cd "$T/rdr" && "$COIL" check 2>&1)
+case "$rdr_out" in
+  *"data.bad' with reader 'rdr.reader'"*"got the keyword :oops"*) ok "a reader provider's error names the file, the reader and the bad part" ;;
+  *) bad "reader provider error location" "$rdr_out" ;;
+esac
+
 echo "== JIT symbol map (COIL_PERF_MAP) =="
 # macOS arm64 runs metaprograms as in-memory JIT code by default; that is the
 # path the map describes. (The Linux ELF loader writes the same map.)
@@ -4525,6 +4651,16 @@ EOF
   case "$repl_macro_out" in
     *'coil> 3'*'coil> 42'*"'code' does not implement 'Add'"*'coil> 42'*) ok "repl retains macros and transactionally rejects invalid new macros" ;;
     *) bad "repl retains macros and transactionally rejects invalid new macros" "$repl_macro_out" ;;
+  esac
+
+  # An array literal passed to a destructured slice parameter (coil-bugs cdhmhg1p5mn).
+  repl_array_slice_out=$(printf '%s\n' \
+    '(defn sp [([a b] (slice i64))] (-> i64) (+ a b))' \
+    '(sp [1 2])' \
+    ':q' | "$REPL_COIL" repl 2>&1)
+  case "$repl_array_slice_out" in
+    *'coil> 3'*) ok "repl passes an array literal to a destructured slice parameter" ;;
+    *) bad "repl passes an array literal to a destructured slice parameter" "$repl_array_slice_out" ;;
   esac
 
   repl_ambient_derive_out=$(printf '%s\n' \
