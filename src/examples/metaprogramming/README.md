@@ -12,8 +12,9 @@ refers to (`binding-of`). Importing the module that registers it switches it on.
 and the build fails.
 
 ```sh
-coil run src/examples/metaprogramming/ok.coil    # frees last: compiles, exits 42
-coil run src/examples/metaprogramming/bad.coil   # reads after the free: rejected
+cd src/examples/metaprogramming
+coil run ok.coil    # frees last: compiles, exits 42
+coil run bad.coil   # reads after the free: rejected
 ```
 
 It is a demonstration, not an analysis: it looks at straight-line sequences only
