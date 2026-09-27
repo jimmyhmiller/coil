@@ -4985,6 +4985,14 @@ else
   bad "prebuilt = true end to end" "the app with a prebuilt dependency did not build"
 fi
 
+echo "== standard-library unit suites =="
+# The deftest files under tests/ that guard standard-library behavior. Each is its
+# own `coil test` run so a failure names the file.
+for suite in tests/stdlib_parsers_test.coil tests/serde_test.coil tests/serde_options_test.coil \
+             tests/serde_value_test.coil tests/serde_sum_posthoc_test.coil; do
+  expect_rc 0 "coil test $suite passes" "$COIL" test "$suite"
+done
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL
