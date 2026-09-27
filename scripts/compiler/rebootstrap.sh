@@ -81,6 +81,8 @@ LF=($(./scripts/compiler/llvm-link-flags.sh "${COIL_LLVM_LINK:-dynamic}")) \
   || { echo "cannot compute LLVM link flags"; exit 1; }
 
 . scripts/compiler/select-stage0.sh
+# CI must never paper over a stale committed seed; see select_stage0.
+[ "${CI:-}" = true ] && export COIL_REQUIRE_FRESH_SEED="${COIL_REQUIRE_FRESH_SEED:-1}"
 select_stage0 "$SEED" "$SRC" arm64 "${LF[@]}" || exit 1
 echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
 

@@ -38,13 +38,21 @@ select_stage0() {
     return 0
   fi
 
-  if [ "${COIL_FORCE_WASM_STAGE0:-0}" != 1 ] \
-     && [ -x "$native_seed" ] \
-     && stage0_compat_run "$native_seed" check "$src" "$@" >/dev/null 2>&1; then
-    STAGE0="$native_seed"
-    STAGE0_SOURCE=native
-    STAGE0_VERIFIED="$STAGE0"
-    return 0
+  if [ "${COIL_FORCE_WASM_STAGE0:-0}" != 1 ] && [ -x "$native_seed" ]; then
+    if stage0_compat_run "$native_seed" check "$src" "$@" >/dev/null 2>&1; then
+      STAGE0="$native_seed"
+      STAGE0_SOURCE=native
+      STAGE0_VERIFIED="$STAGE0"
+      return 0
+    fi
+    # A committed seed that cannot compile the tree it ships with is a stale seed.
+    # Falling back keeps a developer's build going, but in CI it would hide the
+    # rot until the fallback breaks too, so there it is an error.
+    echo "committed seed $native_seed cannot compile $src: the seed is stale." >&2
+    echo "Refresh the seeds with scripts/compiler/refresh-seed.sh (it also rebuilds the WASM seed) and commit them." >&2
+    if [ "${COIL_REQUIRE_FRESH_SEED:-0}" = 1 ]; then
+      return 1
+    fi
   fi
 
   # A developer may have a newer compiler installed than the committed seed. It

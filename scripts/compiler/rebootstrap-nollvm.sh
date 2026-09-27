@@ -42,6 +42,8 @@ export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts}"
 export COIL_STRICT_BUNDLE="${COIL_STRICT_BUNDLE:-1}"
 
 . scripts/compiler/select-stage0.sh
+# CI must never paper over a stale committed seed; see select_stage0.
+[ "${CI:-}" = true ] && export COIL_REQUIRE_FRESH_SEED="${COIL_REQUIRE_FRESH_SEED:-1}"
 select_stage0 "$SEED" "$SRC" arm64 || exit 1
 echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
 
