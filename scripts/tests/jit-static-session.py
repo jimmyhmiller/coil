@@ -169,6 +169,15 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
         "-o", binary, *flags)
     run(binary, env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(work)))
     print("PASS: retained source provider and one-time ABI preamble", flush=True)
+    # The provider is compiled once per session: later reads reuse its engine.
+    binary = work / "reader-reuse"
+    run(COMPILER, "build", ROOT / "tests/compiler/features/jit_reader_engine_reuse.coil",
+        "-o", binary, *flags)
+    traced = run(binary, env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(work), COIL_TRACE="1"))
+    builds = traced.stderr.count("coil-trace count reader.engine-builds ")
+    reuses = traced.stderr.count("coil-trace count reader.engine-reuses ")
+    assert builds == 1 and reuses == 3, ("source provider engine builds/reuses", builds, reuses)
+    print("PASS: a session's source provider engine is built once and reused", flush=True)
     # This test reaches private unit lifetime APIs and deliberately source-links
     # the implementation, rather than crossing the public opaque unit interface.
     for name in ("retained_compiler_context", "hygienic_inherent_calls"):
