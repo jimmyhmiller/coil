@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts" / "compiler"))
+import toolchain_stamp  # noqa: E402
 
 
 def execute(*command: str, env: dict[str, str] | None = None, cwd: Path = ROOT) -> None:
@@ -35,9 +37,11 @@ def build(args: argparse.Namespace) -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
         if Path(compiler).resolve() == output.resolve():
             raise SystemExit("candidate output must not overwrite the stage0 compiler")
+        stamp = toolchain_stamp.digest()
         execute(sys.executable, str(ROOT / "scripts/compiler/stage0.py"), compiler,
                 "build", str(ROOT / "src/compiler/main.coil"), "-o", str(output),
                 *llvm_flags("dynamic"))
+        toolchain_stamp.stamp_path(output).write_text(stamp + "\n")
         print(f"built compiler candidate -> {output}")
         return
 
@@ -70,6 +74,30 @@ def build(args: argparse.Namespace) -> None:
         env = os.environ.copy()
         env["COIL_SKIP_INSTALL"] = "1"
     execute(*command, env=env)
+
+
+def verify_toolchain_pair(binary: Path) -> str:
+    """The library digest `binary` was built from, when it matches this checkout.
+
+    Install copies this checkout's src/stdlib and src/compiler beside the binary.
+    A binary built from other sources -- a stale build/bin/coil, or the already
+    installed compiler after the tree moved on -- would then run against a library
+    it was not built with. That pairing is refused rather than installed.
+    """
+    stamp = toolchain_stamp.stamp_path(binary)
+    current = toolchain_stamp.digest()
+    if not stamp.is_file():
+        raise SystemExit(
+            f"install: {binary} has no {stamp.name}, so nothing says which library "
+            "sources it was built from; build it with `python3 scripts/dev.py build` "
+            "(or `install --build`) so the stamp is written")
+    built = stamp.read_text().strip()
+    if built != current:
+        raise SystemExit(
+            f"install: {binary} was built from different library sources than this "
+            "checkout's src/stdlib and src/compiler; installing it would pair the compiler "
+            "with a library it was not built with. Rebuild it, or use `install --build`")
+    return current
 
 
 def install_library(prefix: Path) -> Path:
@@ -165,6 +193,8 @@ def install(args: argparse.Namespace) -> None:
             "build it first, or use `python3 scripts/dev.py install --build`"
         )
 
+    stamp = verify_toolchain_pair(source)
+
     destination.parent.mkdir(parents=True, exist_ok=True)
     # <prefix>/bin/coil -> <prefix>/lib/coil, the layout loader.coil searches for.
     libdir = install_library(destination.parent.parent)
@@ -175,6 +205,8 @@ def install(args: argparse.Namespace) -> None:
         print(f"installed native archives -> {native_dir}")
 
     if source.resolve() == destination.resolve():
+        # The stamp beside it was verified above: the library just installed is
+        # the one this binary was built from.
         print(f"already installed: {destination}")
         report_installed(destination)
         return
@@ -199,6 +231,7 @@ def install(args: argparse.Namespace) -> None:
         os.replace(staged, destination)
     finally:
         staged.unlink(missing_ok=True)
+    toolchain_stamp.stamp_path(destination).write_text(stamp + "\n")
     print(f"installed {source} -> {destination}")
     warm_jit_unit(destination, libdir)
     report_installed(destination)
@@ -319,7 +352,7 @@ def test(args: argparse.Namespace) -> None:
         for name in ("digest", "artifact-wire", "codegen-session", "tail-borrow", "extern-aliases",
                      "dynamic-stack", "union-hfa", "c-aggregate-bounded-read", "namespace-index-memory",
                      "sparse-static", "oracle-corpus", "provider-artifacts", "generated-modules",
-                     "binding_macros", "jit-source-graph", "jit-session-memory", "jit-static-session", "jit-single-form"):
+                     "binding_macros", "jit-source-graph", "jit-session-memory", "jit-static-session", "jit-single-form", "install-pairing"):
             execute(sys.executable, f"scripts/tests/{name}.py", compiler)
     elif args.suite == "runtime":
         execute(sys.executable, "scripts/oracle.py", "runtime", "gate", "arm64", "--compiler", compiler)

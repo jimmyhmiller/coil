@@ -24,6 +24,9 @@
 # artifact local to the checkout and leave the user-level toolchain untouched.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
+# The library sources this build starts from; recorded beside the result so an
+# install can never pair the compiler with different ones.
+TOOLCHAIN_STAMP=$(python3 scripts/compiler/toolchain_stamp.py digest)
 SRC=src/compiler/main.coil
 SEED=bootstrap/seeds/native/coil-seed
 # Scope the namespace scan: a seed that predates the loader's hidden-directory
@@ -105,6 +108,7 @@ DEST="${1:-build/bin/coil}"
 # Install the stage-3 compiler that reproduced stage 2 byte-for-byte.
 mkdir -p "$(dirname "$DEST")"
 cp "$RL2" "$DEST"
+printf '%s\n' "$TOOLCHAIN_STAMP" > "$DEST.toolchain"
 # Re-sign after copy: macOS invalidates a Mach-O's ad-hoc signature on cp, and the
 # kernel SIGKILLs a mis-signed binary. Re-sign so the installed compiler runs.
 codesign -s - --force "$DEST" >/dev/null 2>&1 || true
