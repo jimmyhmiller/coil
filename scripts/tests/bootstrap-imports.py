@@ -11,7 +11,7 @@ with the `env_*` definitions in the matching runtime: names and exact types.
 
     python3 scripts/tests/bootstrap-imports.py                    # committed wasm64 seed vs runtime.c
     python3 scripts/tests/bootstrap-imports.py --compiler build/bin/coil
-        # also builds the current compiler for wasm64 and wasm32 and checks both runtimes
+        # also builds the current compiler for wasm32 and checks runtime32.c
 """
 import argparse
 import re
@@ -116,7 +116,7 @@ def check(module, runtime, label):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("compiler_positional", nargs="?", help=argparse.SUPPRESS)
-    parser.add_argument("--compiler", help="also build the current compiler for wasm64 and wasm32 and check both")
+    parser.add_argument("--compiler", help="also build the current compiler for wasm32 and check runtime32.c")
     parser.add_argument("--module", help="check this wasm64 module against runtime.c instead of the committed seed")
     args = parser.parse_args()
     # The generated suite passes its compiler positionally, like its other scripts.
@@ -126,7 +126,10 @@ def main():
     ok = check(ROOT / "bootstrap/seeds/wasm/coilc.wasm", ROOT / "src/bootstrap/runtime.c", "committed wasm64 seed")
     if args.compiler:
         with tempfile.TemporaryDirectory(prefix="coil-bootstrap-imports-") as scratch:
-            for target, runtime in (("wasm64-unknown-unknown", "runtime.c"), ("wasm32-unknown-unknown", "runtime32.c")):
+            # wasm32 only: the wasm64 host is checked against the committed seed
+            # above (in the Seed provenance job) and against every refreshed seed
+            # by refresh-seed.sh, and a whole-compiler build is minutes of CI.
+            for target, runtime in (("wasm32-unknown-unknown", "runtime32.c"),):
                 module = Path(scratch) / f"{target}.wasm"
                 # Built exactly as the WASM seed is. An unoptimized build keeps
                 # unreachable code (the libcurl client, for one) whose imports no

@@ -14,8 +14,10 @@ COMPILER = Path(sys.argv[1]).resolve()
 
 
 def install(source: Path, dest: Path) -> subprocess.CompletedProcess:
+    # The pairing check is about the compiler and library; warming the coil.jit
+    # unit is an -O3 build of the whole compiler that it never looks at.
     return subprocess.run([sys.executable, str(ROOT / "scripts/dev.py"), "install",
-                           "--source", str(source), "--dest", str(dest)],
+                           "--source", str(source), "--dest", str(dest), "--no-warm-unit"],
                           cwd=ROOT, text=True, capture_output=True, timeout=600)
 
 

@@ -235,7 +235,8 @@ def install(args: argparse.Namespace) -> None:
         staged.unlink(missing_ok=True)
     toolchain_stamp.stamp_path(destination).write_text(stamp + "\n")
     print(f"installed {source} -> {destination}")
-    warm_jit_unit(destination, libdir)
+    if not args.no_warm_unit:
+        warm_jit_unit(destination, libdir)
     report_installed(destination)
 
 
@@ -1292,12 +1293,12 @@ def test_meta(compiler: str) -> None:
 # concurrently; the longest are listed first so they start first. COIL_JOBS=1
 # restores serial execution when a failure needs to be read on its own.
 GENERATED_SCRIPTS = (
-    "jit-static-session", "jit-session-memory", "generated-modules", "jit-source-graph",
+    "jit-static-session", "jit-session-memory", "generated-modules", "bootstrap-imports", "jit-source-graph",
     "extern-aliases", "artifact-wire", "codegen-session", "binding_macros", "jit-single-form",
     "install-pairing", "dynamic-stack", "sparse-static", "namespace-index-memory",
     "provider-artifacts", "project-scan-memory", "resolve-shadow-scaling", "deferred-emission",
     "digest", "tail-borrow", "c-aggregate-bounded-read", "union-hfa", "oracle-corpus",
-    "aggregate-abi-sizes", "export-c-aggregates", "bootstrap-imports",
+    "aggregate-abi-sizes", "export-c-aggregates",
 )
 
 
@@ -1569,6 +1570,8 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--build", action="store_true", help="run the full bootstrap before installing")
     command.add_argument("--variant", choices=("full", "nollvm", "linux", "nollvm-linux", "x64"),
                          default="full", help="bootstrap variant used with --build")
+    command.add_argument("--no-warm-unit", action="store_true",
+                         help="skip prebuilding the coil.jit unit (the first coil.jit build then builds it)")
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
