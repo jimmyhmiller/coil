@@ -103,3 +103,29 @@ game failure is recorded in the investigation pad; no game source was edited.
 Live investigation, phase measurements, and bug reports:
 `coil-game-compile-speed`, linked from the `coil`
 and `game-attempt-1` project pads.
+
+## Follow-up: aggregate assignment
+
+An ordinary `(set! dst (load src))` had the same aggregate SSA-copy risk as
+array snapshot spills. `EStore` and `EInitStore` now lower loaded structs and
+arrays directly to `llvm.memmove`, keeping destination-before-source evaluation,
+byte alignment, and target-aware layout size. A move rather than a copy is
+required because these pointers can be identical or partially overlap. Other
+value expressions still use the existing SSA store; scalar assignments do too.
+
+`aggregate_store_copy.coil` tests a 16KiB struct and array, overlap by one i64,
+self-assignment, and side-effecting pointer expressions whose order determines
+both the copied value and an explicit sequence counter. The performance gate
+runs the fixture at O0 and O3 and checks emitted bulk-move IR.
+
+Before/after candidate measurements (three ordinary builds per compiler) gave a
+1.094s versus 0.602s median for the initial copy fixture, and 1.373s versus 1.317s
+for the game. These small samples include cold-run variation; they demonstrate
+that the copy path improves without claiming another large game speedup. The
+subsecond game target remains unmet.
+
+The follow-up candidate passed the complete generated gate and the final focused
+modernization gate (18.00s). The all-stage refresh changed only `ir`, `x86`, and
+`full`, and its final audit passed. The final self-host bootstrap reproduced
+stage-two/stage-three objects byte-for-byte. The user subsequently authorized
+merging this branch into main and completing the separate bug-fix handoff.
