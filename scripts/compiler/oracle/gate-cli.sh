@@ -298,6 +298,19 @@ for opt in -o --link-flag --backend --target --use --unit; do
 done
 expect_out "option '-o' requires a value" "a missing option value is named" "$COIL" build "$T/seven.coil" -o
 expect_rc 0 "lint accepts the frontend-wide --macro-expansion-limit" "$COIL" lint "$T/seven.coil" --macro-expansion-limit 1000000
+# A user extern whose C symbol the standard library also declares must agree on
+# machine types. `lint --fix` repairs a conflicting user declaration to the
+# library's C types even though the program does not compile until it does.
+printf '(module extern-repair)\n(import "coil.fs" :as fs)\n(extern mkdir :cc c [(ptr i8) i32] (-> i32))\n(defn main [] (-> i64) (mkdir c"/nonexistent-coil-dir/x" 448) 0)\n' > "$T/extern_repair.coil"
+expect_out "rewrites the non-library declaration" "a conflicting user extern names the lint --fix migration" \
+  "$COIL" check "$T/extern_repair.coil"
+"$COIL" lint "$T/extern_repair.coil" --fix >/dev/null 2>&1
+expect_rc 0 "lint --fix repairs a user extern to the library's C signature" "$COIL" check "$T/extern_repair.coil"
+repaired=$(cat "$T/extern_repair.coil")
+case "$repaired" in
+  *"[(ptr i8) i32]"*) bad "the repaired extern no longer declares mode as i32" "$repaired" ;;
+  *) ok "the repaired extern no longer declares mode as i32" ;;
+esac
 rm -rf "$T/default-build"
 mkdir -p "$T/default-build"
 ( cd "$T/default-build" && "$COIL" build "$T/seven.coil" >/dev/null 2>&1 )
