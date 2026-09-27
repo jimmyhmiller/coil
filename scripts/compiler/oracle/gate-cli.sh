@@ -4956,6 +4956,33 @@ else
   bad "build-unit records the C symbols its object defines" "build-unit of api.coil failed"
 fi
 
+# A public record holding a generic instance of a local type: the interface
+# writes the instance as the source wrote it, `(ArrayList Item)`, and imports the
+# generic's module -- not the mangled artifact name, which names no module.
+mkdir -p "$PBU/generic-field"
+cat > "$PBU/generic-field/lib.coil" <<'EOF2'
+(module gg.lib)
+(import "coil.arraylist" :use [ArrayList al-new])
+(import "coil.alloc" :use [malloc-allocator])
+(export Item Graph make-graph graph-count)
+(defstruct Item [(n i64)])
+(defstruct Graph [(files (ArrayList Item))])
+(defn make-graph [] (-> Graph)
+  (let [(mut xs) (al-new [Item] (malloc-allocator))]
+    (push! (mut xs) (Item :n 1))
+    (push! (mut xs) (Item :n 2))
+    (Graph :files xs)))
+(defn graph-count [(g Graph)] (-> i64) (len (.files g)))
+EOF2
+printf '(module gg.app)\n(import "gg.lib" :as lib)\n(defn main [] (-> i64) (println "{}" (lib/graph-count (lib/make-graph))) 0)\n' > "$PBU/generic-field/app.coil"
+rm -rf "$PBU/generic-field/unit"
+if (cd "$PBU/generic-field" && "$COIL" build-unit lib.coil -o unit >/dev/null 2>&1); then
+  expect_out "^2$" "a unit's public record may hold a generic instance of a local type" \
+    sh -c "cd '$PBU/generic-field' && '$COIL' run app.coil --unit unit"
+else
+  bad "a unit's public record may hold a generic instance of a local type" "build-unit of lib.coil failed"
+fi
+
 # `prebuilt = true`: a path dependency compiled once, linked not recompiled.
 PBD="$T/prebuilt-dep"; mkdir -p "$PBD/engine/src" "$PBD/app/src"
 cat > "$PBD/engine/Coil.toml" <<'PBD_EOF'
