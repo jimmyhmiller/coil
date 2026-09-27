@@ -1996,11 +1996,18 @@ EOF
 else
   bad "export-c --backend arm64: emit-obj rejected a thunk-free export" "seed hard-errors on all exports"
 fi
-# a by-value struct param is a clear located hard error (SIGABRT), naming the reason
-printf '(module s)\n(defstruct P [(x i64)(y i64)])\n(defn d [(p P)] (-> i64) (coil.primitive/load (coil.primitive/field p x)))\n(export-c [d :as "s_d"])\n' > "$T/expc_bad.coil"
-expect_out "by-value struct parameter isn't supported" \
-  "export-c arm64: by-value struct param is a clear error, not a bad symbol" \
-  "$COIL" emit-obj "$T/expc_bad.coil" -o "$T/expc_bad.o" --backend arm64
+# a by-value struct param goes through a C-ABI thunk (scripts/tests/export-c-aggregates.py
+# covers the shapes); here, the one gate-cli always runs: it compiles and exports s_d.
+printf '(module s)\n(defstruct P [(x i64)(y i64)])\n(defn d [(p P)] (-> i64) (.x p))\n(export-c [d :as "s_d"])\n' > "$T/expc_val.coil"
+if "$COIL" emit-obj "$T/expc_val.coil" -o "$T/expc_val.o" --backend arm64 >/dev/null 2>&1; then
+  expc_syms=$(nm "$T/expc_val.o" 2>&1)
+  case "$expc_syms" in
+    *" T _s_d"*) ok "export-c arm64: a by-value struct param is exported through a thunk" ;;
+    *) bad "export-c arm64: by-value struct export" "no global _s_d in the object" ;;
+  esac
+else
+  bad "export-c arm64: by-value struct export" "emit-obj rejected it"
+fi
 
 echo "== std-3: string HashMap keys are OWNED by default (copied on insert/freed on remove) =="
 # Was: str-keyops stored the caller's (slice u8) fat pointer VERBATIM, so two keys built
