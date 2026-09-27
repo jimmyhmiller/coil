@@ -99,7 +99,7 @@ NULL_FIELDS={('coil.compiler.loader.LS','parent'),
 EMPTY_LISTS={
  ('coil.compiler.loader.LS','out'),
  ('coil.compiler.check.Cx','cur_bounds'), ('coil.compiler.check.Cx','loops'),
- ('coil.compiler.check.Cx','anon_funcs'),
+ ('coil.compiler.check.Cx','anon_funcs'), ('coil.compiler.check.Cx','anon_c_entries'),
  ('coil.compiler.resolve.SemanticWorkspace','resolved_revisions')}
 EMPTY_MAPS={
  ('coil.compiler.check.Cx','synth_cache'),
