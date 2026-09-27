@@ -82,6 +82,13 @@ def justification(path: str, op: str, line: str) -> str:
             and path.startswith("tests/metaprogramming/compile-and-run/staged_")
             and "[marker (primitive/gensym)" in line):
         return "staged metacompilation marker: an opaque token keying a (stage MARKER ...) declaration and its request sites; never bound, never resolved"
+    # A fresh block label for a match whose arms fall through: `(block :gN …
+    # (return-from :gN …))`. Labels are keywords, matched by spelling as data and
+    # never bound or resolved as lexical identifiers.
+    if (op == "gensym"
+            and path.endswith("stdlib/binding.coil")
+            and '(primitive/code-symbol ":" (primitive/gensym))' in line):
+        return "fresh block-label keyword for a nested-pattern match; a label is keyword data, never a lexical identifier"
     if op == "code-symbol":
         if "fresh-identifier" in line:
             return "display spelling input to fresh-identifier; not itself used lexically"
