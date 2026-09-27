@@ -87,6 +87,13 @@ function hostErrno() {
   if (errnoPtr === 0n) errnoPtr = malloc(4n);
   return errnoPtr;
 }
+// Report a failed fs call the way libc does: store errno and return -1. The
+// numbers are the POSIX values shared by Linux and Darwin.
+const ERRNO = { ENOENT: 2, EACCES: 13, EEXIST: 17, ENOTDIR: 20, EISDIR: 21, ENOTEMPTY: 39 };
+function hostFail(e) {
+  dv().setInt32(Number(hostErrno()), (e && ERRNO[e.code]) || 5, true);   // EIO otherwise
+  return -1;
+}
 function realloc(ptr, size) {
   ptr = BigInt(ptr); size = BigInt(size);
   if (ptr === 0n) return malloc(size);
@@ -138,6 +145,49 @@ function hostMkdtemp(templatePtr) {
   } catch {
     return 0n;
   }
+}
+
+// fma/fmaf round a*b+c ONCE. JavaScript has no fused operation and a*b+c rounds
+// twice, so compute the exact value as an integer scaled by a power of two and
+// round that to `precision` significant bits, with `minExponent` the exponent of
+// the smallest subnormal.
+function exactParts(x) {
+  const view = new DataView(new ArrayBuffer(8));
+  view.setFloat64(0, x, true);
+  const bits = view.getBigUint64(0, true);
+  const exponent = Number((bits >> 52n) & 0x7ffn);
+  const fraction = bits & 0xfffffffffffffn;
+  const mantissa = exponent === 0 ? fraction : fraction | (1n << 52n);
+  const scale = exponent === 0 ? -1074 : exponent - 1075;
+  return { mantissa: bits >> 63n ? -mantissa : mantissa, scale };
+}
+function fusedMultiplyAdd(a, b, c, precision, minExponent) {
+  if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(c)) return a * b + c;
+  const pa = exactParts(a), pb = exactParts(b), pc = exactParts(c);
+  let m1 = pa.mantissa * pb.mantissa, e1 = pa.scale + pb.scale;
+  let m2 = pc.mantissa, e2 = pc.scale;
+  const e = Math.min(e1, e2);
+  let m = (m1 << BigInt(e1 - e)) + (m2 << BigInt(e2 - e));
+  if (m === 0n) {
+    // An exact zero sum is -0 only when both addends are -0 or negative zeros.
+    const productNegative = (Object.is(a * b, -0) || a * b < 0);
+    const cNegative = Object.is(c, -0) || c < 0;
+    return productNegative && cNegative ? -0 : 0;
+  }
+  const negative = m < 0n;
+  if (negative) m = -m;
+  const bitLength = m.toString(2).length;
+  const shift = Math.max(bitLength - precision, minExponent - e);
+  let q = m, qe = e;
+  if (shift > 0) {
+    const s = BigInt(shift);
+    q = m >> s;
+    const rest = m - (q << s), half = 1n << (s - 1n);
+    if (rest > half || (rest === half && (q & 1n) === 1n)) q += 1n;
+    qe = e + shift;
+  }
+  const magnitude = Number(q) * Math.pow(2, qe);
+  return negative ? -magnitude : magnitude;
 }
 
 // libc environment bridge. Keep returned strings alive for the process lifetime,
@@ -361,6 +411,10 @@ const env = {
   // will not instantiate at all ("import requires a callable"), which is how the
   // whole wasm gate went red on one added extern.
   rmdir:(p)=>{ try{fs.rmdirSync(cstr(p));return 0;}catch{return -1;} },
+  // The driver creates build and unit output directories, and changes into a
+  // project directory, through these.
+  mkdir:(p,mode)=>{ try{fs.mkdirSync(cstr(p),{mode:Number(mode)});return 0;}catch(e){return hostFail(e);} },
+  chdir:(p)=>{ try{process.chdir(cstr(p));return 0;}catch(e){return hostFail(e);} },
   rename:(a,b)=>{ try{fs.renameSync(cstr(a),cstr(b));return 0;}catch{return -1;} },
   realpath:(p,out)=>{ try{const r=Buffer.from(fs.realpathSync(cstr(p))+'\0');writeBytes(out,r);return out;}catch{return 0n;} },
   fopen:(p,mode)=>{ try{return BigInt(fs.openSync(cstr(p), cstr(mode).includes('w')?'w':'r'));}catch{return 0n;} },
@@ -409,6 +463,10 @@ const env = {
   strcmp:(a,b)=>{ const sa=cstr(a),sb=cstr(b); return sa<sb?-1:(sa>sb?1:0); },
   strtol:(p,endptr,base)=>{ const v=parseInt(cstr(p),Number(base)||10); if(endptr&&Number(endptr)!==0){} return BigInt(isNaN(v)?0:Math.trunc(v)); },
   sqrt:(x)=>Math.sqrt(x), pow:(x,y)=>Math.pow(x,y),
+  sqrtf:(x)=>Math.fround(Math.sqrt(x)), floorf:(x)=>Math.fround(Math.floor(x)),
+  ceilf:(x)=>Math.fround(Math.ceil(x)), truncf:(x)=>Math.fround(Math.trunc(x)),
+  fma:(a,b,c)=>fusedMultiplyAdd(a,b,c,53,-1074),
+  fmaf:(a,b,c)=>Math.fround(fusedMultiplyAdd(a,b,c,24,-149)),
   fmod:(x,y)=>x%y, fmodf:(x,y)=>Math.fround(Math.fround(x)%Math.fround(y)),
   // process
   abort:()=>{ throw new Error('env.abort() called'); }, exit:(c)=>{ throw new ExitSignal(Number(c)); },
