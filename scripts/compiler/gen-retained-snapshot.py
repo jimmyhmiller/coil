@@ -9,7 +9,9 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-TOKEN = re.compile(r';[^\n]*|#\\(?:[A-Za-z]+|.)|"(?:\\.|[^"\\])*"|[()\[\]]|[^\s()\[\]";]+')
+# A Coil character literal is `\"`, `\(`, `\newline`: read it whole, or `\"`
+# opens a phantom string and `\(` an extra list (serde_json.coil has both).
+TOKEN = re.compile(r';[^\n]*|#\\(?:[A-Za-z]+|.)|\\(?:[A-Za-z]+|.)|"(?:\\.|[^"\\])*"|[()\[\]]|[^\s()\[\]";]+')
 class Vector(list): pass
 
 def read(text):
