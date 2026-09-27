@@ -3456,6 +3456,15 @@ case "$twomods_out" in
   *) bad "two test modules each derive their own same-named type" "$twomods_out" ;;
 esac
 
+echo "== by-value c function pointer entries =="
+# Anonymous functions and fnptr-of ascribed a by-value `c` signature go through a
+# by-value C entry (LLVM backend; coil-bugs anonymous-aggregate-fnptr).
+byval_out=$("$COIL" run tests/compiler/features/fnptr_c_by_value.coil 2>&1)
+byval_want=$(printf 'anon 21 7\nfnptr-of 7 2\nexport 7\ncall-ptr 8\nconst 100')
+[ "$byval_out" = "$byval_want" ] \
+  && ok "structs pass by value through c function pointers to anonymous functions and fnptr-of" \
+  || bad "by-value c function pointer entries" "$byval_out"
+
 echo "== focused guide lookup =="
 expect_out '^  tests[[:space:]]+deftest' "guide: no argument prints the compact topic index" "$COIL" guide
 expect_out '^## Tests$' "guide: canonical topic prints only its section" "$COIL" guide tests
