@@ -473,6 +473,25 @@ stage0_source=$(
   && ok "stage0 selection tries a compatible installed coil before WASM" \
   || bad "installed stage0 fallback" "selected '$stage0_source' instead of installed"
 
+# The committed native seeds must compile the tree they ship with. When they
+# cannot, rebootstrap silently falls back to an installed `coil` locally and to
+# the WASM seed in CI, and the seeds rot unnoticed until the fallback breaks too
+# (2026-09-27: every CI job red). Only the seeds this host can rebuild are
+# checked; the Linux seeds are the Linux job's to prove.
+if [ "$HOST_OS:$HOST_ARCH" = Darwin:arm64 ]; then
+  . scripts/compiler/select-stage0.sh
+  for pair in "bootstrap/seeds/native/coil-seed src/compiler/main.coil" \
+              "bootstrap/seeds/native/coil-seed-nollvm src/compiler/main_a64.coil"; do
+    set -- $pair
+    if [ -x "$1" ] && stage0_compat_run "$1" check "$2" >"$T/seed-check.out" 2>&1; then
+      ok "committed seed $1 compiles $2"
+    else
+      bad "committed seed $1 compiles $2" \
+        "the seed is stale; refresh the seeds with scripts/compiler/refresh-seed.sh (and the WASM seed) in this commit. $(head -c 300 "$T/seed-check.out" | tr '\n' ' ')"
+    fi
+  done
+fi
+
 echo "== per-subcommand help =="
 for c in build run install fmt new emit-ir; do
   expect_out "usage: coil $c" "$c --help"                "$COIL" "$c" --help
