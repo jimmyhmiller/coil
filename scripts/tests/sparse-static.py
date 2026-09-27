@@ -13,6 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cleanup_on_signal  # noqa: E402
 cleanup_on_signal.install()
 COMPILER = Path(sys.argv[1]).resolve()
+# The fixture's static storage: storage, empty and callbacks are one
+# 708334-element array of 8-byte values each, nested is two.
+FIXTURE_DATA_BYTES = 5 * 708334 * 8
 
 
 def run(args, expected=0):
@@ -87,9 +90,18 @@ int64_t native_check(void) {
         peak = int(re.search(pattern, result.stderr)[1]) * (1 if sys.platform == "darwin" else 1024)
         assert max(small_peak, peak) < 512 * 1024 * 1024, (backend, small_peak, peak)
         # The sparse-static regression guard is relative: a 708334-element sparse
-        # array must cost no more than the same program with 128 elements. An
-        # absolute ceiling here tracked the whole compiler's working set instead.
-        assert peak - small_peak < 16 * 1024 * 1024, (backend, 'sparse hole count grew compiler memory', small_peak, peak)
+        # array must cost no more than the same program with 128 elements, beyond
+        # the data the object itself must contain. An absolute ceiling here tracked
+        # the whole compiler's working set instead.
+        # LLVM's object writer keeps runs of zeros as fill fragments, so it may
+        # grow by nothing. The arm64 backend builds objects in memory: each large
+        # static's section holds its bytes, holes included, and the finished image
+        # is one more copy. It may grow by those two copies and no more; an
+        # outgrown buffer left behind in the arena (as its data section once did,
+        # 125 MB for this fixture) exceeds that.
+        materialized = 0 if backend == "llvm" else 2 * FIXTURE_DATA_BYTES
+        assert peak - small_peak < 16 * 1024 * 1024 + materialized, (
+            backend, 'sparse hole count grew compiler memory', small_peak, peak)
         run([binary])
         print(f"PASS {backend}: constructor visibility, holes, nested arrays, mutation; {elapsed:.3f}s / {peak} B (growth {peak-small_peak} B)")
     ir = run([COMPILER, "emit-ir", fixture]).stdout
