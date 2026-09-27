@@ -4767,6 +4767,27 @@ COIL_NAMESPACE_ROOTS="$PBU" "$COIL" check "$PBU/app.coil" --unit "$PBU/u_llvm" >
 printf '(module t.st)\n(def n i64 7)\n(defn main [] (-> i64) n)\n' > "$PBU/state.coil"
 expect_out "a runtime .def." "build-unit refuses a module with runtime state, saying why" \
   "$COIL" build-unit "$PBU/state.coil" -o "$PBU/u_state"
+# no export list: every definition is public, so the interface declares them all
+printf '(module t.open)\n(defstruct Pt [(x i64)])\n(defn twice [(x i64)] (-> i64) (* x 2))\n' > "$PBU/open.coil"
+printf '(module t.openapp)\n(import "t.open" :as o)\n(defn main [] (-> i64) (+ (o/twice 20) (let [p (o/Pt :x 2)] (.x p))))\n' > "$PBU/openapp.coil"
+if COIL_NAMESPACE_ROOTS="$PBU" "$COIL" build-unit "$PBU/open.coil" -o "$PBU/u_open" >/dev/null 2>&1; then
+  open_iface=$(cat "$PBU/u_open/interface.coil")
+  case "$open_iface" in
+    *"(declare twice "*"(defstruct Pt "*|*"(defstruct Pt "*"(declare twice "*)
+      ok "build-unit without an export list declares every definition" ;;
+    *) bad "build-unit without an export list declares every definition" "$open_iface" ;;
+  esac
+  expect_rc 42 "a consumer uses an export-less unit" \
+    env COIL_NAMESPACE_ROOTS="$PBU" "$COIL" run "$PBU/openapp.coil" --unit "$PBU/u_open"
+else
+  bad "build-unit without an export list" "build-unit failed"
+fi
+printf '(module t.withimpl)\n(export P)\n(defstruct P [(x i64)])\n(impl P (half [(p P)] (-> i64) 1))\n' > "$PBU/withimpl.coil"
+expect_out "its .impl. form acts on every importer" "build-unit refuses an impl a consumer would lose" \
+  "$COIL" build-unit "$PBU/withimpl.coil" -o "$PBU/u_withimpl"
+printf '(module t.openconst)\n(const LIMIT 10)\n(defn f [] (-> i64) LIMIT)\n' > "$PBU/openconst.coil"
+expect_out "makes public 'LIMIT'" "build-unit refuses a public const it cannot express" \
+  "$COIL" build-unit "$PBU/openconst.coil" -o "$PBU/u_openconst"
 # a stale/missing unit dir
 expect_out "not a prebuilt unit" "--unit on a directory that is not a unit says so" \
   "$COIL" build "$PBU/app.coil" -o "$PBU/none" --unit "$PBU/does-not-exist"
