@@ -4616,8 +4616,9 @@ cat > "$PBU/mathlib.coil" <<'PBU_EOF'
 
 (import "coil.slice" :use [slice-len])
 
+; `BigV`/`BigNone` are variants: exporting them is exporting `Big`.
 (export Point Vec2 add combine make-vec bump! count ident slot lib-slot-bump!
-        straddle Big mk-big big-total)
+        straddle Big BigV BigNone mk-big big-total)
 
 (defstruct Point [(x i64) (y i64)])
 
@@ -4680,7 +4681,8 @@ cat > "$PBU/app.coil" <<'PBU_EOF'
   (lib-slot-bump!)
   (store! (slot [i64]) (+ (load (slot [i64])) 1))
   (if (or (!= (straddle 1 "ab" "cde" "f" "ghij") 407)
-          (!= (big-total (mk-big 1) 5) 326))
+          (!= (big-total (mk-big 1) 5) 326)
+          (!= (big-total (BigNone) 5) -1))
       2
       (if (and (= (add 40 2) 42)
                (and (= (combine (Point :x 40 :y 2)) 80)

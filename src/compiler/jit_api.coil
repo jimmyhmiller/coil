@@ -56,6 +56,18 @@
         jit-source-graph-path
         jit-source-graph-text
         JitSession
+        JitBackend
+        Native
+        Llvm
+        JitOptions
+        JitOptionsError
+        UnsupportedBackend
+        InvalidOptLevel
+        jit-default-options
+        jit-session-new-with-options
+        jit-session-backend
+        jit-backend-name
+        jit-options-error-message
         jit-session-new
         jit-session-new-with-toolchain
         jit-session-load-project!
@@ -97,9 +109,42 @@
         jit-backend
         jit-repl-main)
 
+;;; The code generator a session publishes runtime code with. `Native` is Coil's
+;;; own arm64 backend: it compiles fast and generates unoptimized code, and exists
+;;; only on macOS arm64. `Llvm` compiles through LLVM's ORC JIT at a chosen
+;;; optimization level, on macOS arm64 and Linux. Metaprograms run on the host's
+;;; in-memory engine whichever backend publishes the runtime code.
+(defsum JitBackend (Native) (Llvm))
+
+;;; Options for `jit-session-new-with-options`. `toolchain` locates the runtime
+;;; compiler's matching standard library (an absolute coil executable or a
+;;; PATH-resolvable name). `opt-level` is 0-3 and applies to `Llvm` only; it runs
+;;; LLVM's `default<ON>` pipeline, as an AOT `-ON` build does.
+(defstruct JitOptions [(toolchain (slice u8)) (backend JitBackend) (opt-level i64)])
+
+;;; Why `jit-session-new-with-options` refused its options.
+(defsum JitOptionsError
+  (UnsupportedBackend [(backend JitBackend)])
+  (InvalidOptLevel [(level i64)]))
+
 ;;; Opaque session owner. Treat `raw` as private; its representation is not a
 ;;; compatibility promise. Session memory has the allocator's lifetime.
-(defstruct JitSession [(raw (ptr i8))])
+(defstruct JitSession [(raw (ptr i8)) (backend JitBackend)])
+
+; Plain functions rather than Eq/Debug impls: a prebuilt unit's interface does not
+; carry a module's impls yet, and coil.jit is always consumed as one.
+;;; `"native"` or `"llvm"`.
+(defn jit-backend-name [(backend JitBackend)] (-> (slice u8))
+  (match backend (Native [] "native") (Llvm [] "llvm")))
+
+;;; Why options were refused, as one line of text.
+(defn jit-options-error-message [(error JitOptionsError)] (-> (slice u8))
+  (match error
+    (UnsupportedBackend [backend]
+      (match backend
+        (Native [] "this host has no native JIT backend")
+        (Llvm [] "this host has no LLVM JIT backend")))
+    (InvalidOptLevel [_] "opt-level must be 0-3, and 0 for the native backend")))
 
 (defn sdk-meta-object [(a (dyn Allocator)) (mp (ptr Program)) (out (ptr i8))] (-> i64)
   (cga64-build-object a
@@ -157,9 +202,17 @@
                                     (primitive/fnptr-of sdk/repl-arm64-token-leases)
                                     (primitive/fnptr-of sdk/repl-arm64-set-roots!)))
 
-(defn sdk-session-llvm [(a (dyn Allocator))] (-> (ptr i8))
+(defn sdk-llvm-runner [(opt-level i64)]
+  (-> (fnptr c [(ref (dyn Allocator)) (ptr Program) (ptr (ArrayList (slice u8)))
+                (ptr (ArrayList (slice u8))) (ptr (ptr i8)) (slice u8)] i64))
+  (cond (= opt-level 1) (primitive/fnptr-of llvm-jit/jit-llvm-run-o1)
+        (= opt-level 2) (primitive/fnptr-of llvm-jit/jit-llvm-run-o2)
+        (= opt-level 3) (primitive/fnptr-of llvm-jit/jit-llvm-run-o3)
+        :else (primitive/fnptr-of llvm-jit/jit-llvm-run)))
+
+(defn sdk-session-llvm [(a (dyn Allocator)) (opt-level i64)] (-> (ptr i8))
   (sdk/repl-session-new-with-runner a
-                                    (primitive/fnptr-of llvm-jit/jit-llvm-run)
+                                    (sdk-llvm-runner opt-level)
                                     (primitive/fnptr-of llvm-jit/llvm-jit-reclaim!)
                                     (primitive/fnptr-of llvm-jit/llvm-jit-generation-count)
                                     (primitive/fnptr-of llvm-jit/llvm-jit-retain-current!)
@@ -172,33 +225,72 @@
     (if (= (primitive/cast i64 state) 0) (primitive/cast (ptr i8) 0)
       (llvm-jit/llvm-jit-sym-lookup (primitive/cast (ptr llvm-jit/LLVMJitState) state) name))))
 
-; Generate the host-specific SDK calls so an ARM64 user program does not acquire
-; LLVM references merely because the Linux implementation is available, and an
-; x86-64 program never reaches the Mach-O builder.
+; Generate the host-specific SDK calls. Metaprograms use the host's in-memory
+; engine; the native runtime backend exists only on macOS arm64, so an x86-64
+; program never reaches the Mach-O loader.
 (defn sdk-host-impl [] (-> Code)
   (let [linux-x64 (= (primitive/target-os) `linux)
         ; hygiene: host-selected SDK declarations intentionally enter this module's namespace.
         init-name (primitive/syntax->datum `sdk-init!)
-        session-name (primitive/syntax->datum `sdk-new-session)
-        lookup-name (primitive/syntax->datum `sdk-symbol-address)]
+        native-session-name (primitive/syntax->datum `sdk-native-session)
+        native-lookup-name (primitive/syntax->datum `sdk-native-symbol-address)
+        native-name (primitive/syntax->datum `sdk-native-available?)
+        default-name (primitive/syntax->datum `sdk-default-backend)]
     `(do
        (defn ~init-name [(toolchain (slice u8))] (-> i64)
          (~(if linux-x64 `sdk-init-llvm! `sdk-init-arm64!) toolchain))
-       (defn ~session-name [(a (dyn Allocator))] (-> (ptr i8))
-         (~(if linux-x64 `sdk-session-llvm `sdk-session-arm64) a))
-       (defn ~lookup-name [(raw (ptr i8)) (name (slice u8))] (-> (ptr i8))
-         (~(if linux-x64 `sdk-symbol-address-llvm `sdk/repl-arm64-symbol-address) raw name)))))
+       (defn ~native-name [] (-> bool) ~(not linux-x64))
+       (defn ~default-name [] (-> JitBackend) ~(if linux-x64 `(Llvm) `(Native)))
+       ~(if linux-x64
+            `(defn ~native-session-name [(a (dyn Allocator))] (-> (ptr i8))
+               (primitive/cast (ptr i8) 0))
+            `(defn ~native-session-name [(a (dyn Allocator))] (-> (ptr i8))
+               (sdk-session-arm64 a)))
+       ~(if linux-x64
+            `(defn ~native-lookup-name [(raw (ptr i8)) (name (slice u8))] (-> (ptr i8))
+               (primitive/cast (ptr i8) 0))
+            `(defn ~native-lookup-name [(raw (ptr i8)) (name (slice u8))] (-> (ptr i8))
+               (sdk/repl-arm64-symbol-address raw name))))))
 
 (meta (sdk-host-impl))
 
 ;;; Create a session using `toolchain` to locate the runtime compiler's matching
 ;;; standard library. Pass an absolute coil executable or a PATH-resolvable name.
+;;; The host's default options: the `coil` on PATH, the `Native` backend on macOS
+;;; arm64 and `Llvm` elsewhere, and optimization level 0.
+(defn jit-default-options [] (-> JitOptions)
+  (JitOptions :toolchain "coil" :backend (sdk-default-backend) :opt-level 0))
+
+;;; Create a session with explicit options. Fails without creating anything when
+;;; this host has no such backend, or `opt-level` is outside 0-3 (or nonzero for
+;;; `Native`, which has no optimization levels).
+(defn jit-session-new-with-options [(a (dyn Allocator)) (options JitOptions)]
+  (-> (Result JitSession JitOptionsError))
+  (let [level (.opt-level options)
+        backend (.backend options)
+        native? (match backend (Native [] true) (Llvm [] false))]
+    (cond (not (jit-supported?)) (Err (UnsupportedBackend backend))
+          (and native? (not (sdk-native-available?))) (Err (UnsupportedBackend backend))
+          (or (< level 0) (> level 3)) (Err (InvalidOptLevel level))
+          (and native? (!= level 0)) (Err (InvalidOptLevel level))
+          :else
+            (do
+              (sdk-init! (.toolchain options))
+              (Ok (JitSession :raw (if native? (sdk-native-session a) (sdk-session-llvm a level))
+                              :backend backend))))))
+
+;;; The backend this session publishes runtime code with.
+(defn jit-session-backend [(session (ptr JitSession))] (-> JitBackend)
+  (.backend session))
+
+;;; Create a session with the host's default backend, using `toolchain` to locate
+;;; the runtime compiler's matching standard library.
 (defn jit-session-new-with-toolchain [(a (dyn Allocator))
                                       (toolchain (slice u8))] (-> JitSession)
   (sdk-init! toolchain)
-  (let [s (primitive/alloc-stack JitSession)]
-    (set! (.raw s) (sdk-new-session a))
-    (load s)))
+  (let [backend (sdk-default-backend)]
+    (JitSession :raw (match backend (Native [] (sdk-native-session a)) (Llvm [] (sdk-session-llvm a 0)))
+                :backend backend)))
 
 ;;; Create a session using the `coil` executable found on PATH.
 (defn jit-session-new [(a (dyn Allocator))] (-> JitSession)
@@ -240,7 +332,9 @@
 ;;; Null means absent. The address is borrowed until reset or reclamation; retain
 ;;; a generation token when transferring it outside the owner's lifetime.
 (defn jit-symbol-address [(session (ptr JitSession)) (name (slice u8))] (-> (ptr i8))
-  (sdk-symbol-address (.raw session) name))
+  (match (.backend session)
+    (Native [] (sdk-native-symbol-address (.raw session) name))
+    (Llvm [] (sdk-symbol-address-llvm (.raw session) name))))
 
 ;;; Compile definitions and evaluate an i64 transaction entry. Zero accepts the
 ;;; candidate. Runtime effects belong to the caller/metaprogram's transaction.
@@ -390,7 +484,7 @@
        (defn ~backend-name [] (-> (slice u8))
          ~(if darwin-arm
               "arm64-macho"
-              (if linux-x64 "llvm-mcjit-x86_64-linux" "unsupported"))))))
+              (if linux-x64 "llvm-orc" "unsupported"))))))
 
 (meta (sdk-target-api))
 
