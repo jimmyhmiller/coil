@@ -20,9 +20,15 @@
 ;;; imports exactly the modules its declarations mention -- not the module's own
 ;;; imports, unless a copied source form drags them in.
 ;;;
+;;; Traits and impls travel too. A trait or impl the module wrote (an `impl`, a
+;;; `derive`) is copied as source; one its own metaprograms produced is carried
+;;; from the checked program: a trait by its signature, a concrete impl by a
+;;; forwarding impl whose methods call wrappers of the unit's compiled methods.
+;;;
 ;;; A module the interface cannot express is refused by name, never shipped
-;;; narrower than its source: a runtime `def` (shared module state), or an
-;;; exported name that is neither a concrete function nor a record/sum nor a
+;;; narrower than its source: a runtime `def` (shared module state), a metaprogram
+;;; registration, a generated GENERIC impl (no compiled method to forward to), or
+;;; an exported name that is neither a function, record, sum nor trait nor a
 ;;; copyable source form (a macro produced by a `meta`, say).
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use *)
@@ -34,12 +40,13 @@
 (import "coil.compiler.ast" :use *)
 (import "coil.compiler.parser"
         :use
-        [sx-tag sx-sval sx-items sx-at sx-len sconcat sconcat3 i64->str box-al])
-(import "coil.compiler.loader" :use [l-list-head])
+        [sx-tag sx-sval sx-items sx-at sx-len sconcat sconcat3 i64->str box-al impl-base-name])
+(import "coil.compiler.loader" :use [l-list-head TaggedForm])
 (import "coil.compiler.resolve" :use [ty-str])
 (import "coil.compiler.check" :use [last-component])
 
-(export unit-interface-render unit-module-of-name unit-concrete-function?)
+(export unit-interface-render unit-module-of-name unit-concrete-function?
+        UnitForward unit-generated-forwards unit-wrapper-source)
 
 ;; The module a qualified name belongs to: everything before its last `.`, or
 ;; "" for a name with no module (a primitive type, a type parameter).
@@ -83,8 +90,10 @@
                        (mods (mut (ArrayList (slice u8))))
                        (types (mut (ArrayList (slice u8))))] (-> i64)
   (match (load t)
+    ; A type parameter a macro introduced carries a hygienic `$scope…` name; it
+    ; names no module.
     (TStruct [name]
-             (let [m (unit-module-of-name name)]
+             (let [m (if (unit-hygienic-name? name) "" (unit-module-of-name name))]
                (if (= m ns)
                    (unit-add! (mut types) (last-component name))
                    (unless (= m "") (unit-add! (mut mods) m) 0))
@@ -326,6 +335,395 @@
   (sb-push-str! (mut out) ")\n")
   0)
 
+;; ---- impls a module's own metaprograms produce ---------------------------
+;;
+;; A literal `impl` or `derive` is copied as source and the consumer compiles it
+;; again. An impl that a `(meta …)` generator or a custom top-level macro produced
+;; has no source form to copy, and re-running the generator in the consumer would
+;; define its other outputs twice. Such an impl is carried by identity instead:
+;; the unit compiles one small wrapper function per method, which calls the
+;; method it already compiled, and the interface declares the wrapper and
+;; carries a forwarding impl whose methods call it. The consumer dispatches to
+;; the unit's own compiled method; nothing is expanded twice, so hygiene never
+;; enters. A generated GENERIC impl has no single compiled method to forward to,
+;; and is refused by name.
+
+;;; One method of a generated impl, carried through a wrapper named `wrapper`.
+(defstruct UnitForward
+  [(trait (slice u8))          ; qualified trait name, or "" for an inherent impl
+   (self_type Type)
+   (method (slice u8))
+   (params (ptr (ArrayList Type)))
+   (ret Type)
+   (wrapper (slice u8))
+   (call_head (slice u8))])    ; what the wrapper calls: `T::m`, or `m` for a receiver
+
+(defn unit-list-items [(f (ptr Sexp))] (-> (ptr (ArrayList Sexp)))
+  (match (.kind f)
+    (KList [items] items)
+    (_ (primitive/cast (ptr (ArrayList Sexp)) 0))))
+
+;; The last dotted or `/`-qualified component of a symbol, or "" for a non-symbol.
+(defn unit-sym-leaf [(f (ptr Sexp))] (-> (slice u8))
+  (if (= (sx-tag (load f)) 2)
+      (let [name (last-component (sx-sval (load f)))
+            (mut at) -1]
+        (for [i 0 (len name)]
+          (when (= (get name i) (cast u8 47)) (set! at i)))
+        (if (< at 0) name (subslice [u8] name (+ at 1) (len name))))
+      ""))
+
+;; The nominal head of a written type: `Point` for `Point` or `(Box T)`.
+(defn unit-type-leaf [(f (ptr Sexp))] (-> (slice u8))
+  (if (= (sx-tag (load f)) 2)
+      (unit-sym-leaf f)
+      (let [items (unit-list-items f)]
+        (if (or (= (cast i64 items) 0) (= (len (load items)) 0))
+            ""
+            (unit-sym-leaf (al-elem [Sexp] items 0))))))
+
+;; A method form inside an impl: a list with a parameter vector at top level.
+(defn unit-method-form? [(f (ptr Sexp))] (-> bool)
+  (let [items (unit-list-items f)
+        (mut found) false]
+    (unless (= (cast i64 items) 0)
+      (for [i 0 (len (load items))]
+        (when (= (sx-tag (get (load items) i)) 7) (set! found true))))
+    found))
+
+;; The shape of a written `(impl …)`: whether it has type parameters, its trait
+;; leaf ("" for inherent), its type leaf, and its method names.
+(defstruct UnitImplShape
+  [(generic bool) (trait (slice u8)) (type (slice u8)) (methods (ArrayList (slice u8)))])
+
+(defn unit-impl-shape [(a (dyn Allocator)) (f (ptr Sexp))] (-> UnitImplShape)
+  (let [items (unit-list-items f)
+        n (len (load items))
+        (mut i) 1
+        (mut generic) false
+        (mut methods) (al-new [(slice u8)] a)]
+    (when (and (< i n) (= (sx-tag (get (load items) i)) 7))
+      (set! generic true)
+      (set! i (+ i 1)))
+    (let [first i
+          ; `(impl Trait Type m…)` when the element after the first is not a method.
+          trait-impl (and (< (+ first 1) n)
+                          (not (unit-method-form? (al-elem [Sexp] items (+ first 1)))))
+          type-at (if trait-impl (+ first 1) first)]
+      (for [j (+ type-at 1) n]
+        (let [m (al-elem [Sexp] items j)
+              mi (unit-list-items m)]
+          (unless (or (= (cast i64 mi) 0) (= (len (load mi)) 0))
+            (push! (mut methods) (unit-sym-leaf (al-elem [Sexp] mi 0))))))
+      (UnitImplShape :generic generic
+                     :trait (if trait-impl (unit-sym-leaf (al-elem [Sexp] items first)) "")
+                     :type (if (< type-at n) (unit-type-leaf (al-elem [Sexp] items type-at)) "")
+                     :methods methods))))
+
+;; `(derive T1 (T2 opts) … Type)`: does it produce an impl of `trait` for `type`?
+(defn unit-derive-covers? [(f (ptr Sexp)) (trait (slice u8)) (type (slice u8))] (-> bool)
+  (let [items (unit-list-items f)
+        n (len (load items))
+        (mut covers) false]
+    (when (and (> n 2) (= (unit-type-leaf (al-elem [Sexp] items (- n 1))) type))
+      (for [i 1 (- n 1)]
+        (when (= (unit-type-leaf (al-elem [Sexp] items i)) trait) (set! covers true))))
+    covers))
+
+(defn unit-same-names? [(xs (ArrayList (slice u8))) (ys (ArrayList (slice u8)))] (-> bool)
+  (let [(mut same) (= (len xs) (len ys))]
+    (for x (iter xs)
+      (let [(mut found) false]
+        (for y (iter ys) (when (= x y) (set! found true)))
+        (unless found (set! same false))))
+    same))
+
+(defn unit-type-is-self? [(t (ptr Type)) (self-str (slice u8)) (a (dyn Allocator))] (-> bool)
+  (match (load t)
+    (TRef [_ inner] (= (ty-str a inner) self-str))
+    (TPtr [inner] (= (ty-str a inner) self-str))
+    (_ (= (ty-str a t) self-str))))
+
+;;; The generated impls of module `ns` among the pipeline's `expanded` forms, as
+;;; one UnitForward per method. `forms`/`text` are the module's literal source;
+;;; an impl written there, or produced by a literal `derive`, is copied instead.
+(defn unit-generated-forwards [(a (dyn Allocator))
+                               (p (ptr Program))
+                               (expanded (ptr (ArrayList TaggedForm)))
+                               (forms (ptr (ArrayList Sexp)))
+                               (ns (slice u8))] (-> (Result (ArrayList UnitForward) (slice u8)))
+  (let [(mut out) (al-new [UnitForward] a)
+        (mut err) (None [(slice u8)])]
+    (unless (= (cast i64 expanded) 0)
+      (for k (range 0 (len (load expanded)))
+        (let [t (al-elem [TaggedForm] expanded k)
+              f (field t form)
+              in-module (match (.module t) (Some [m] (= m ns)) (None [] false))]
+          (when (and in-module
+                     (and (= (unit-form-head f) "impl")
+                          (match (load err) (None [] true) (_ false))))
+            (let [(mut literal) false
+                  shape (unit-impl-shape a f)]
+              (for i (range 0 (len (load forms)))
+                (let [g (al-elem [Sexp] forms i)
+                      head (unit-form-head g)]
+                  (when (and (= head "impl")
+                             (and (= (.ctxt f) 0)
+                                  (and (= (.lo g) (.lo f)) (= (.hi g) (.hi f)))))
+                    (set! literal true))
+                  (when (and (= head "derive")
+                             (unit-derive-covers? g (.trait shape) (.type shape)))
+                    (set! literal true))))
+              (cond literal 0
+                    (.generic shape)
+                      (set! err (Some (sconcat3 a
+                                                (sconcat3 a "cannot prebuild '" ns "': a metaprogram generates a generic impl for '")
+                                                (.type shape)
+                                                "', which a unit cannot carry -- it has no compiled method to forward to; write it as source or make it concrete")))
+                    :else
+                      (match (unit-forward-impl! a p ns shape (mut out))
+                        (Some [e] (set! err (Some e)))
+                        (None [] 0))))))))
+    (match (load err)
+      (Some [e] (Err [(ArrayList UnitForward) (slice u8)] e))
+      (None [] (Ok [(ArrayList UnitForward) (slice u8)] (load out))))))
+
+;; Find the checked impl a generated `(impl …)` produced and add its methods.
+(defn unit-forward-impl! [(a (dyn Allocator))
+                          (p (ptr Program))
+                          (ns (slice u8))
+                          (shape UnitImplShape)
+                          (out (mut (ArrayList UnitForward)))] (-> (Option (slice u8)))
+  (let [(mut found) (primitive/cast (ptr ImplDef) 0)]
+    (for i (range 0 (len (load (field p impls))))
+      (let [ip (al-elem [ImplDef] (load (field p impls)) i)
+            trait-leaf (if (impl-is-trait ip) (last-component (impl-trait-name ip)) "")
+            (mut names) (al-new [(slice u8)] a)]
+        (for m (range 0 (len (load (.methods ip))))
+          (push! (mut names) (last-component (.name (al-elem [Func] (.methods ip) m)))))
+        (when (and (= (cast i64 (load found)) 0)
+                   (and (= trait-leaf (.trait shape))
+                        (and (= (last-component (impl-base-name a (field ip self_type))) (.type shape))
+                             (and (= (len (load (.type_params ip))) 0)
+                                  (unit-same-names? (.methods shape) (load names))))))
+          (set! found ip))))
+    (if (= (cast i64 (load found)) 0)
+        (Some (sconcat3 a "cannot prebuild '" ns
+                        (sconcat3 a "': a generated impl for '" (.type shape)
+                                  "' has no checked counterpart (compiler bug)")))
+        (let [ip (load found)
+              self-str (ty-str a (field ip self_type))
+              (mut problem) (None [(slice u8)])]
+          (for m (range 0 (len (load (.methods ip))))
+            (let [f (al-elem [Func] (.methods ip) m)
+                  method (last-component (.name f))
+                  (mut params) (al-new [Type] a)]
+              (for k (range 0 (len (load (.params f))))
+                (push! (mut params) (.ty (al-elem [Param] (.params f) k))))
+              (let [receiver (and (> (len params) 0)
+                                  (unit-type-is-self? (al-elem [Type] (mut params) 0) self-str a))
+                    head (cond (impl-is-trait ip) (sconcat3 a (impl-trait-name ip) "::" method)
+                               receiver method
+                               :else (sconcat3 a self-str "::" method))]
+                (when (and (not (impl-is-trait ip))
+                           (and (not receiver) (some? (str-find self-str " "))))
+                  (set! problem (Some (sconcat3 a "cannot prebuild '" ns
+                                                (sconcat3 a "': a generated associated function '" method
+                                                          "' of an applied type cannot be forwarded")))))
+                (push! (mut out)
+                       (UnitForward :trait (if (impl-is-trait ip) (impl-trait-name ip) "")
+                                    :self_type (load (field ip self_type))
+                                    :method method
+                                    :params (box-al [Type] a (load params))
+                                    :ret (load (field f ret))
+                                    :wrapper (sconcat a "__unit-impl-" (i64->str a (len (load out))))
+                                    :call_head head)))))
+          (load problem)))))
+
+(defn unit-push-params! [(a (dyn Allocator)) (out (mut StrBuf)) (params (ptr (ArrayList Type)))] (-> i64)
+  (sb-push-str! (mut out) "[")
+  (for k (range 0 (len (load params)))
+    (when (> k 0) (sb-push-byte! (mut out) (cast u8 32)))
+    (sb-push-str! (mut out) (sconcat3 a "(p" (i64->str a k) " "))
+    (sb-push-str! (mut out) (ty-str a (al-elem [Type] params k)))
+    (sb-push-str! (mut out) ")"))
+  (sb-push-str! (mut out) "]")
+  0)
+
+(defn unit-push-args! [(a (dyn Allocator)) (out (mut StrBuf)) (params (ptr (ArrayList Type)))] (-> i64)
+  (for k (range 0 (len (load params)))
+    (sb-push-byte! (mut out) (cast u8 32))
+    (let [mutable (match (load (al-elem [Type] params k)) (TRef [m _] m) (_ false))]
+      (sb-push-str! (mut out)
+                    (if mutable
+                        (sconcat3 a "(mut p" (i64->str a k) ")")
+                        (sconcat a "p" (i64->str a k))))))
+  0)
+
+;;; The wrapper functions a unit with generated impls compiles in its module.
+(defn unit-wrapper-source [(a (dyn Allocator)) (forwards (ptr (ArrayList UnitForward)))] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (sb-push-str! (mut out) "\n; Wrappers `coil build-unit` added for impls a metaprogram generated.\n")
+    (for i (range 0 (len (load forwards)))
+      (let [fw (al-elem [UnitForward] forwards i)]
+        (sb-push-str! (mut out) (sconcat3 a "(defn " (.wrapper fw) " "))
+        (unit-push-params! a (mut out) (.params fw))
+        (sb-push-str! (mut out) (sconcat3 a " (-> " (ty-str a (field fw ret)) ") ("))
+        (sb-push-str! (mut out) (.call_head fw))
+        (unit-push-args! a (mut out) (.params fw))
+        (sb-push-str! (mut out) "))\n")))
+    (sb-str (load out))))
+
+;; The forwarding impls, one per generated impl, into `out`; every type they name
+;; and every wrapper they call enters the worklist.
+(defn unit-write-forwards! [(a (dyn Allocator))
+                            (out (mut StrBuf))
+                            (forwards (ptr (ArrayList UnitForward)))
+                            (ns (slice u8))
+                            (mods (mut (ArrayList (slice u8))))
+                            (work (mut (ArrayList (slice u8))))] (-> i64)
+  (let [n (len (load forwards))
+        (mut i) 0]
+    (while (< i n)
+      (let [first (al-elem [UnitForward] forwards i)
+            key-trait (.trait first)
+            key-type (ty-str a (field first self_type))]
+        (sb-push-str! (mut out) "(impl ")
+        (unless (= key-trait "")
+          (sb-push-str! (mut out) (sconcat a key-trait " "))
+          (let [m (unit-module-of-name key-trait)]
+            (if (= m ns)
+                (unit-add! (mut work) (last-component key-trait))
+                (unless (= m "") (unit-add! (mut mods) m)))))
+        (sb-push-str! (mut out) key-type)
+        (unit-type-refs! (field first self_type) ns (mut mods) (mut work))
+        (while (and (< i n)
+                    (let [fw (al-elem [UnitForward] forwards i)]
+                      (and (= (.trait fw) key-trait) (= (ty-str a (field fw self_type)) key-type))))
+          (let [fw (al-elem [UnitForward] forwards i)]
+            (sb-push-str! (mut out) (sconcat3 a "\n  (" (.method fw) " "))
+            (unit-push-params! a (mut out) (.params fw))
+            (for k (range 0 (len (load (.params fw))))
+              (unit-type-refs! (al-elem [Type] (.params fw) k) ns (mut mods) (mut work)))
+            (sb-push-str! (mut out) (sconcat3 a " (-> " (ty-str a (field fw ret)) ") ("))
+            (unit-type-refs! (field fw ret) ns (mut mods) (mut work))
+            (sb-push-str! (mut out) (.wrapper fw))
+            (unit-push-args! a (mut out) (.params fw))
+            (sb-push-str! (mut out) "))")
+            (unit-add! (mut work) (.wrapper fw))
+            (set! i (+ i 1))))
+        (sb-push-str! (mut out) ")\n"))))
+  0)
+
+;; ---- traits ---------------------------------------------------------------
+
+;; A binder a macro introduced is renamed `$scopeN@module$name`; within one
+;; printed declaration its plain spelling names the same parameter.
+(defn unit-hygienic-name? [(name (slice u8))] (-> bool)
+  (and (> (len name) 0) (= (get name 0) (cast u8 36))))
+
+(defn unit-plain-name [(name (slice u8))] (-> (slice u8))
+  (if (unit-hygienic-name? name)
+      (let [(mut at) 0]
+        (for i (range 0 (len name))
+          (when (= (get name i) (cast u8 36)) (set! at i)))
+        (subslice [u8] name (+ at 1) (len name)))
+      name))
+
+;; `ty-str`, with each of a declaration's hygienic parameter names printed plainly.
+(defn unit-plain-ty-str [(a (dyn Allocator)) (t (ptr Type)) (params (ptr (ArrayList (slice u8))))] (-> (slice u8))
+  (let [(mut text) (ty-str a t)]
+    (for i (range 0 (len (load params)))
+      (let [name (get (load params) i)]
+        (when (unit-hygienic-name? name)
+          (set! text (unit-replace-all a (load text) name (unit-plain-name name))))))
+    text))
+
+(defn unit-replace-all [(a (dyn Allocator)) (text (slice u8)) (from (slice u8)) (to (slice u8))] (-> (slice u8))
+  (let [(mut out) (sb-new a)
+        (mut i) 0
+        n (len text)
+        m (len from)]
+    (while (< i n)
+      (if (and (<= (+ i m) n) (= (subslice [u8] text i (+ i m)) from))
+          (do (sb-push-str! (mut out) to) (set! i (+ i m)))
+          (do (sb-push-byte! (mut out) (get text i)) (set! i (+ i 1)))))
+    (sb-str (load out))))
+
+(defn unit-find-trait [(p (ptr Program)) (name (slice u8))] (-> (ptr TraitDef))
+  (let [ds (load (field p traits))
+        (mut found) (primitive/cast (ptr TraitDef) 0)]
+    (for i (range 0 (len (load ds)))
+      (let [d (al-elem [TraitDef] ds i)]
+        (when (= (.name d) name) (set! found d))))
+    (load found)))
+
+;; The leaf of the trait in `ns` that declares the method `leaf`, or "".
+(defn unit-method-trait-leaf [(p (ptr Program)) (ns (slice u8)) (leaf (slice u8))] (-> (slice u8))
+  (let [ds (load (field p traits))
+        (mut found) ""]
+    (for i (range 0 (len (load ds)))
+      (let [d (al-elem [TraitDef] ds i)]
+        (when (= (unit-module-of-name (.name d)) ns)
+          (for j (range 0 (len (load (.methods d))))
+            (when (= (last-component (.name (al-elem [TraitMethod] (.methods d) j))) leaf)
+              (set! found (last-component (.name d))))))))
+    found))
+
+;; A trait the module's metaprograms produced, printed from its checked
+;; signature. `:inline` is the only method annotation a signature carries that a
+;; consumer needs; any other annotation is refused by name.
+(defn unit-write-trait! [(a (dyn Allocator))
+                         (out (mut StrBuf))
+                         (d (ptr TraitDef))
+                         (ns (slice u8))
+                         (mods (mut (ArrayList (slice u8))))
+                         (work (mut (ArrayList (slice u8))))] (-> (Option (slice u8)))
+  (let [(mut problem) (None [(slice u8)])
+        (mut binders) (al-new [(slice u8)] a)]
+    (sb-push-str! (mut out) (sconcat3 a "(deftrait " (last-component (.name d)) " ["))
+    (sb-push-str! (mut out) (unit-plain-name (.self_param d)))
+    (push! (mut binders) (.self_param d))
+    (for tp (iter (load (.type_params d)))
+      (sb-push-byte! (mut out) (cast u8 32))
+      (sb-push-str! (mut out) (unit-plain-name tp))
+      (push! (mut binders) tp))
+    (sb-push-str! (mut out) "]")
+    (when (> (len (load (.requires d))) 0)
+      (sb-push-str! (mut out) " :requires [")
+      (for k (range 0 (len (load (.requires d))))
+        (let [r (get (load (.requires d)) k)
+              m (unit-module-of-name r)]
+          (when (> k 0) (sb-push-byte! (mut out) (cast u8 32)))
+          (sb-push-str! (mut out) r)
+          (if (= m ns) (unit-add! (mut work) (last-component r)) (unless (= m "") (unit-add! (mut mods) m)))))
+      (sb-push-str! (mut out) "]"))
+    (for j (range 0 (len (load (.methods d))))
+      (let [m (al-elem [TraitMethod] (.methods d) j)]
+        (sb-push-str! (mut out) (sconcat3 a "\n  (" (last-component (.name m)) ""))
+        (for an (range 0 (len (load (.annotations m))))
+          (let [ann (al-elem [Annotation] (.annotations m) an)]
+            (if (= (.key ann) "inline")
+                (match (.kind (field ann value))
+                  (EConstruct [_ variant args]
+                    (sb-push-str! (mut out) (sconcat3 a " :inline (" (last-component variant) ")")))
+                  (_ (set! problem (Some (sconcat3 a "cannot prebuild '" ns "': a generated trait method's :inline value is not a policy constructor")))))
+                (set! problem (Some (sconcat3 a "cannot prebuild '" ns
+                                              (sconcat3 a "': generated trait method '" (.name m)
+                                                        "' carries an annotation a unit cannot print")))))))
+        (sb-push-str! (mut out) " [")
+        (for k (range 0 (len (load (.params m))))
+          (let [pm (al-elem [Param] (.params m) k)]
+            (when (> k 0) (sb-push-byte! (mut out) (cast u8 32)))
+            (sb-push-str! (mut out) (sconcat3 a "(" (unit-plain-name (.name pm)) " "))
+            (sb-push-str! (mut out) (unit-plain-ty-str a (field pm ty) (mut binders)))
+            (unit-type-refs! (field pm ty) ns (mut mods) (mut work))
+            (sb-push-str! (mut out) ")")))
+        (sb-push-str! (mut out) (sconcat3 a "] (-> " (unit-plain-ty-str a (field m ret) (mut binders)) "))"))
+        (unit-type-refs! (field m ret) ns (mut mods) (mut work))))
+    (sb-push-str! (mut out) ")\n")
+    (load problem)))
+
 ;; The leaves a module's `(export …)` forms name.
 (defn unit-exported-leaves [(a (dyn Allocator)) (forms (ptr (ArrayList Sexp)))] (-> (ptr (ArrayList (slice u8))))
   (let [(mut out) (al-new [(slice u8)] a)]
@@ -384,7 +782,8 @@
           (Some [head]
                 (when (or (or (= head "defn") (= head "defn*"))
                           (or (= head "declare")
-                              (or (= head "defstruct") (= head "defsum"))))
+                              (or (= head "defstruct")
+                                  (or (= head "defsum") (= head "deftrait")))))
                   (match (unit-form-name f)
                     (Some [name] (when (= name leaf) (set! found f) 0))
                     (None [] 0))
@@ -403,7 +802,9 @@
 ;; the consumer); an exported generic or macro is copied as source and the names
 ;; IT reaches are pulled in too -- a private concrete helper it calls is declared
 ;; and marked external so the consumer's instantiation can link it. A build-time
-;; helper no export reaches (a `meta`'s generator, say) is simply dropped.
+;; helper no export reaches (a `meta`'s generator, say) is simply dropped. Every
+;; `impl` and `derive` form is copied as source too, so the module's impls reach
+;; its consumers.
 ;; `externals` is filled with the qualified names the object must expose; every
 ;; other function stays local, so a consumer that also compiles a module the unit
 ;; embeds does not collide with it. `Err` names the first exported thing a unit
@@ -413,9 +814,11 @@
                              (forms (ptr (ArrayList Sexp)))
                              (text (slice u8))
                              (ns (slice u8))
+                             (forwards (ptr (ArrayList UnitForward)))
                              (externals (mut (ArrayList (slice u8))))] (-> (Result (slice u8)
                                                                                    (slice u8)))
   (let [(mut decls) (sb-new a)
+        (mut forward-out) (sb-new a)
         (mut types-out) (sb-new a)
         (mut copied) (sb-new a)
         (mut import-forms) (sb-new a)
@@ -448,24 +851,38 @@
                                 "': a runtime `def` is module state a consumer would need to share, which a unit cannot express yet; put it behind a function")))
           0))
       0)
-    ; A form that acts on importers without a name to declare -- an impl, a
-    ; derive, a metaprogram registration -- would be silently lost to a
-    ; consumer reading the interface, so refuse it rather than ship less.
+    ; Every impl the module writes, trait or inherent, directly or through
+    ; `derive`: a consumer dispatches to it wherever the module's values go, so
+    ; the interface carries it as source, like a generic. The consumer compiles
+    ; its own copy (the object keeps these methods local, so the two never
+    ; collide) and the names a body reaches enter the worklist, which declares
+    ; any private helper and marks it external.
+    ;
+    ; A metaprogram registration also acts on every importer, but a consumer
+    ; cannot run the unit's metaprograms from an interface yet, so refuse it
+    ; rather than ship less.
     (for [i 0 (len (load forms))]
       (let [f (al-elem [Sexp] forms i)
             head (unit-form-head f)]
-        (when (and (or (= head "impl") (= head "derive") (= head "checker")
-                       (= head "transform") (= head "transform-once")
+        (cond (or (= head "impl") (= head "derive"))
+                (do
+                  (unit-copy-form! (mut copied) text f)
+                  (unit-collect-syms! f (mut work))
+                  (set! copies-source true)
+                  0)
+              (and (or (= head "checker") (= head "transform") (= head "transform-once")
                        (= head "provide-core") (= head "reader-provider"))
                    (match (load err) (None [] true) (_ false)))
-          (set! err
-                (Some (sconcat a
-                               (sconcat3 a "cannot prebuild '" ns "': its `")
-                               (sconcat a
-                                        head
-                                        "` form acts on every importer, and a unit's interface cannot carry it yet; a consumer would silently lose it"))))
-          0))
+                (set! err
+                      (Some (sconcat a
+                                     (sconcat3 a "cannot prebuild '" ns "': its `")
+                                     (sconcat a
+                                              head
+                                              "` form acts on every importer, and a unit's interface cannot carry it yet; a consumer would silently lose it"))))
+              :else 0))
       0)
+    ; Impls the module's metaprograms generated forward to wrappers in the object.
+    (unit-write-forwards! a (mut forward-out) forwards ns (mut mods) (mut work))
     ; Seed the worklist with the exports.
     (for [i 0 (len (load roots))] (push! (mut work) (get (load roots) i)) 0)
     ; Process each needed name once. A concrete function is declared and not
@@ -552,6 +969,27 @@
                               (do
                                 (push! (mut work) (unit-variant-sum-leaf p ns leaf))
                                 0)
+                            ; A trait the module wrote: its source. One its metaprograms
+                            ; produced: its checked signature.
+                            (!= (primitive/cast i64 (unit-find-trait p qname)) 0)
+                              (if (and form? (= fhead "deftrait"))
+                                  (do
+                                    (unit-copy-form! (mut copied) text form)
+                                    (unit-collect-syms! form (mut work))
+                                    (set! copies-source true)
+                                    0)
+                                  (match (unit-write-trait! a (mut types-out) (unit-find-trait p qname)
+                                                            ns (mut mods) (mut work))
+                                    (Some [e]
+                                      (when (match (load err) (None [] true) (_ false))
+                                        (set! err (Some e)))
+                                      0)
+                                    (None [] 0)))
+                            ; A trait's method: its trait declares it.
+                            (> (len (unit-method-trait-leaf p ns leaf)) 0)
+                              (do
+                                (push! (mut work) (unit-method-trait-leaf p ns leaf))
+                                0)
                             ; An export naming nothing a unit can express (a macro another
                             ; macro produced, a runtime value): refuse. A NON-root name that
                             ; resolves to nothing here is simply another module's symbol the
@@ -583,13 +1021,22 @@
                             "`, written by `coil build-unit`. Do not edit: the\n;; object beside it defines what is declared here, and a consumer reads this\n;; file in place of the module's source.\n(module ")
               (sb-push-str! (mut out) ns)
               (sb-push-str! (mut out) ")\n")
-              (if (load copies-source)
-                  (sb-push-str! (mut out) (sb-str (load import-forms)))
-                  (for [i 0 (len (load mods))]
-                    (sb-push-str! (mut out) "(import \"")
-                    (sb-push-str! (mut out) (get (load mods) i))
-                    (sb-push-str! (mut out) "\")\n")
-                    0))
+              ; Copied source needs the module's own imports (their aliases);
+              ; printed declarations name their types' modules in full. Import
+              ; each such module the copied imports do not already name.
+              (let [copied-imports (if (load copies-source) (sb-str (load import-forms)) "")]
+                (sb-push-str! (mut out) copied-imports)
+                (for [i 0 (len (load mods))]
+                  (let [m (get (load mods) i)]
+                    ; coil.core is every module's implicit import; naming it
+                    ; explicitly would REPLACE that import and hide its traits.
+                    (unless (or (= m "coil.core")
+                                (some? (str-find copied-imports (sconcat3 a "\"" m "\""))))
+                      (sb-push-str! (mut out) "(import \"")
+                      (sb-push-str! (mut out) m)
+                      (sb-push-str! (mut out) "\")\n")
+                      0))
+                  0))
               (when (> (len (load roots)) 0)
                 (sb-push-str! (mut out) "(export")
                 (for [i 0 (len (load roots))]
@@ -601,4 +1048,5 @@
               (sb-push-str! (mut out) (sb-str (load types-out)))
               (sb-push-str! (mut out) (sb-str (load decls)))
               (sb-push-str! (mut out) (sb-str (load copied)))
+              (sb-push-str! (mut out) (sb-str (load forward-out)))
               (Ok [(slice u8) (slice u8)] (sb-str (load out))))))))
