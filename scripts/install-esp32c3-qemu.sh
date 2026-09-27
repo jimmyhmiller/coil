@@ -37,5 +37,6 @@ mkdir -p "$destination"
 tar -xJf "$temporary/$archive" -C "$destination"
 binary="$destination/qemu/bin/qemu-system-riscv32"
 [[ -x "$binary" ]] || { echo "archive did not contain $binary" >&2; exit 1; }
-"$binary" -machine help | grep -q esp32c3
+machines=$("$binary" -machine help)
+grep -q esp32c3 <<<"$machines"
 echo "installed Espressif QEMU: $binary"

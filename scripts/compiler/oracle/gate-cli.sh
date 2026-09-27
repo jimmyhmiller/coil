@@ -59,7 +59,7 @@ expect_rc_arm64() {
 expect_out() {
   local want=$1 name=$2; shift 2
   local out; out=$("$@" 2>&1)
-  echo "$out" | grep -qE "$want" && ok "$name" || bad "$name" "want /$want/, got: $out"
+  grep -qE "$want" <<<"$out" && ok "$name" || bad "$name" "want /$want/, got: $out"
 }
 # expect_crash_out <regex> <name> <cmd...>
 # Runtime-safety tests must prove that a program was built and then trapped. A
@@ -68,7 +68,7 @@ expect_out() {
 expect_crash_out() {
   local want=$1 name=$2; shift 2
   local out; out=$("$@" 2>&1); local rc=$?
-  if [ "$rc" -ge 128 ] && echo "$out" | grep -qE "$want"; then
+  if [ "$rc" -ge 128 ] && grep -qE "$want" <<<"$out"; then
     ok "$name"
   else
     bad "$name" "want runtime signal and /$want/, got rc=$rc: $out"
@@ -489,7 +489,8 @@ printf '(module app)\n(defn main [] (-> i64) 3)\n'            > "$T/proj/src/mai
                                                             || bad "project run" "want 3"
 # the headline case: --target wasm32 used to print `wrote proj`, exit 0, and emit a Mach-O
 ( cd "$T/proj" && rm -f build/release/proj && "$COIL" build --target wasm32-unknown-unknown >/dev/null 2>&1 )
-if file "$T/proj/build/release/proj" 2>/dev/null | grep -q WebAssembly; then
+proj_kind=$(file "$T/proj/build/release/proj" 2>/dev/null)
+if grep -q WebAssembly <<<"$proj_kind"; then
   ok "project --target wasm32 emits WebAssembly"
 else
   bad "project --target wasm32" "got: $(file "$T/proj/build/release/proj" 2>/dev/null | sed 's/.*: //')"
@@ -742,7 +743,7 @@ printf '[package]\nname  = "s"\nentry = "src/main.coil"\n\n[dependecies]\nfoo = 
   && ok "a typo'd manifest section is rejected" \
   || bad "strict section" "want rc=1"
 out=$( cd "$T/strict" && "$COIL" build 2>&1 )
-echo "$out" | grep -qE "Coil.toml:5: unknown section \[dependecies\]" \
+grep -qE "Coil.toml:5: unknown section \[dependecies\]" <<<"$out" \
   && ok "…and the error is located at the section line" \
   || bad "strict section location" "got: $out"
 # Libraries can claim a manifest namespace without teaching Coil the keys inside
@@ -755,7 +756,7 @@ printf '[package]\nname = "s"\nentry = "src/main.coil"\n\n[c.raylib]\nsources = 
   || bad "custom manifest provider" "project did not build"
 printf '[package]\nname = "s"\nentry = "src/main.coil"\n\n[c.raylib]\nsources = ["raylib.c"]\n' > "$T/strict/Coil.toml"
 out=$( cd "$T/strict" && "$COIL" build 2>&1 ); rc=$?
-[ "$rc" = 1 ] && echo "$out" | grep -qE "Coil.toml:5: unknown section \[c.raylib\].*register its root under \[manifest.providers\]" \
+[ "$rc" = 1 ] && grep -qE "Coil.toml:5: unknown section \[c.raylib\].*register its root under \[manifest.providers\]" <<<"$out" \
   && ok "an unclaimed custom manifest section remains a located error" \
   || bad "unclaimed custom manifest section" "got rc=$rc: $out"
 # typo'd key `entrypoint`
@@ -763,13 +764,13 @@ printf '[package]\nname  = "s"\nentrypoint = "src/main.coil"\n' > "$T/strict/Coi
 out=$( cd "$T/strict" && "$COIL" build 2>&1 ); rc=$?
 [ "$rc" = 1 ] && ok "a typo'd key (entrypoint) is rejected (was: swallowed)" \
               || bad "strict typo key" "want rc=1 got rc=$rc: $out"
-echo "$out" | grep -qE "Coil.toml:3: unknown key 'entrypoint' in \[package\]" \
+grep -qE "Coil.toml:3: unknown key 'entrypoint' in \[package\]" <<<"$out" \
   && ok "…and the error names the key + section + line" \
   || bad "strict typo key location" "got: $out"
 # Git source without an immutable pin
 printf '[package]\nname = "s"\nentry = "src/main.coil"\n\n[dependencies]\nfoo = { git = "https://example.invalid/foo.git" }\n' > "$T/strict/Coil.toml"
 out=$( cd "$T/strict" && "$COIL" build 2>&1 ); rc=$?
-[ "$rc" = 1 ] && echo "$out" | grep -qE "Coil.toml:6: dependency must specify either path, or git together with exactly one of sha, tag, or branch" \
+[ "$rc" = 1 ] && grep -qE "Coil.toml:6: dependency must specify either path, or git together with exactly one of sha, tag, or branch" <<<"$out" \
   && ok "a Git dependency requires exactly one commit selector" \
   || bad "Git dependency without SHA" "got rc=$rc: $out"
 # a valid manifest still builds
@@ -1431,7 +1432,7 @@ EOF
 out=$(timeout 30 "$COIL" build "$T/runaway.coil" -o "$T/rw" 2>&1); rc=$?
 [ "$rc" = 1 ] && ok "runaway monomorphization errors (was: infinite hang)" \
               || bad "runaway monomorphization" "rc=$rc (124=still hanging)"
-echo "$out" | grep -q "never reaches a fixpoint" && ok "…and explains the growth" \
+grep -q "never reaches a fixpoint" <<<"$out" && ok "…and explains the growth" \
                                                  || bad "runaway message" "$(echo "$out" | head -1)"
 
 # deep macro-generated nesting: `cond` expands to nested ifs, so 800 clauses — an
@@ -1468,7 +1469,7 @@ cat > "$T/multi.coil" <<'EOF'
 (defn main [] (-> i64) 0)
 EOF
 out=$("$COIL" build "$T/multi.coil" -o "$T/x" 2>&1)
-echo "$out" | grep -q "4 errors" && ok "4 independent errors in one pass (1 resolve + 3 type)" \
+grep -q "4 errors" <<<"$out" && ok "4 independent errors in one pass (1 resolve + 3 type)" \
                                  || bad "multi-error report" "no '4 errors': $(echo "$out" | tail -1)"
 # a resolve error with NO type errors must still fail the build, not reach codegen
 cat > "$T/resonly.coil" <<'EOF'
@@ -1910,7 +1911,8 @@ echo "== cross-compiling a native non-host target LINKS (passes -arch), not reje
 # (xcompile). This FAILS on the seed (rc 1, no output file) and PASSES here.
 if [ "$HOST_OS" = Darwin ]; then
   out=$("$COIL" build "$T/seven.coil" -o "$T/xseven" --target x86_64-apple-macosx11.0.0 2>&1); rc=$?
-  if [ "$rc" = 0 ] && file "$T/xseven" 2>/dev/null | grep -q "x86_64"; then
+  xseven_kind=$(file "$T/xseven" 2>/dev/null)
+  if [ "$rc" = 0 ] && grep -q "x86_64" <<<"$xseven_kind"; then
     ok "cross-target build links an x86_64 Mach-O executable"
   else
     bad "cross-target build" "rc=$rc, file=$(file "$T/xseven" 2>/dev/null): $(echo "$out" | head -1)"
@@ -1949,7 +1951,7 @@ for e in src/examples/shim.coil src/examples/everything.coil; do
     # These examples declare arm64-register shim conventions; on an x86 host the
     # LLVM backend targets x86_64 and the per-arch diagnostic MUST fire (never a
     # silently-wrong build).
-    if [ "$rc" != 0 ] && echo "$out" | grep -q "not a general-purpose register on the target architecture"; then
+    if [ "$rc" != 0 ] && grep -q "not a general-purpose register on the target architecture" <<<"$out"; then
       ok "$e: arm64-register shim convention is a clear per-arch error on $HOST_ARCH"
     else
       bad "$e on $HOST_ARCH" "want the per-arch shim-convention error, got rc=$rc: $(echo "$out" | head -1)"
@@ -2053,7 +2055,7 @@ expect_out "slice-get index out of bounds" "--debug-checks catches a slice-get O
   "$COIL" run "$T/dbgget.coil" --debug-checks
 # OFF (default): NO check emitted — the read runs past the end WITHOUT the debug message.
 out=$("$COIL" run "$T/dbgget.coil" 2>&1)
-echo "$out" | grep -q "out of bounds" && bad "off: the bounds check must NOT fire (zero-cost)" "$out" \
+grep -q "out of bounds" <<<"$out" && bad "off: the bounds check must NOT fire (zero-cost)" "$out" \
                                       || ok "off: no bounds check emitted (zero-cost when off)"
 # the mem-6 headline: subslice lo>hi used to yield a slice reporting length -2.
 cat > "$T/dbgsub.coil" <<'EOF'
@@ -2144,7 +2146,7 @@ esac
 rm -f "$T/sanrun"
 if "$COIL" build "$T/asanstore.coil" --sanitize=address -O0 -o "$T/sanrun" >/dev/null 2>&1; then
   sanout=$("$T/sanrun" 2>&1); sanrc=$?
-  if [ "$sanrc" != 0 ] && echo "$sanout" | grep -qE 'AddressSanitizer: heap-use-after-free|SUMMARY: AddressSanitizer'; then
+  if [ "$sanrc" != 0 ] && grep -qE 'AddressSanitizer: heap-use-after-free|SUMMARY: AddressSanitizer' <<<"$sanout"; then
     ok "--sanitize=address runtime diagnoses a deliberate use-after-free"
   else
     bad "--sanitize=address runtime" "want a nonzero ASan use-after-free report, got rc=$sanrc: $sanout"
@@ -2212,7 +2214,7 @@ cat > "$T/tsan-race.coil" <<'EOF'
 EOF
 if "$COIL" build "$T/tsan-race.coil" --sanitize=thread -O1 -o "$T/tsan-race" >/dev/null 2>&1; then
   tsanout=$(TSAN_OPTIONS=halt_on_error=1 "$T/tsan-race" 2>&1); tsanrc=$?
-  if [ "$tsanrc" != 0 ] && echo "$tsanout" | grep -qE 'ThreadSanitizer: data race|SUMMARY: ThreadSanitizer'; then
+  if [ "$tsanrc" != 0 ] && grep -qE 'ThreadSanitizer: data race|SUMMARY: ThreadSanitizer' <<<"$tsanout"; then
     ok "--sanitize=thread diagnoses a deliberate data race"
   else
     bad "--sanitize=thread runtime" "want a nonzero TSan data-race report, got rc=$tsanrc: $tsanout"
@@ -2261,7 +2263,7 @@ else
 EOF
   if "$COIL" build "$T/msan-uninit.coil" --sanitize=memory -O1 -o "$T/msan-uninit" >/dev/null 2>&1; then
     msanout=$(MSAN_OPTIONS=halt_on_error=1 "$T/msan-uninit" 2>&1); msanrc=$?
-    if [ "$msanrc" != 0 ] && echo "$msanout" | grep -qE 'MemorySanitizer: use-of-uninitialized-value|SUMMARY: MemorySanitizer'; then
+    if [ "$msanrc" != 0 ] && grep -qE 'MemorySanitizer: use-of-uninitialized-value|SUMMARY: MemorySanitizer' <<<"$msanout"; then
       ok "--sanitize=memory diagnoses an uninitialized read"
     else
       bad "--sanitize=memory runtime" "want a nonzero MSan report, got rc=$msanrc: $msanout"
@@ -2346,13 +2348,13 @@ out=$("$COIL" run "$T/crash.coil" 2>&1); rc=$?
 [ "$rc" = 134 ] \
   && ok "crash diagnostics preserve SIGABRT exit semantics" \
   || bad "crash signal semantics" "want rc=134 got rc=$rc: $out"
-echo "$out" | grep -q "coil crash: signal=" \
+grep -q "coil crash: signal=" <<<"$out" \
   && ok "fatal handler prints signal, address, thread, and context" \
   || bad "crash diagnostic header" "$out"
-echo "$out" | grep -q "before deliberate abort" \
+grep -q "before deliberate abort" <<<"$out" \
   && ok "fatal handler includes the recent-event ring" \
   || bad "crash recent events" "$out"
-echo "$out" | grep -q "stack trace:" \
+grep -q "stack trace:" <<<"$out" \
   && ok "fatal handler emits a bounded stack trace" \
   || bad "crash stack trace" "$out"
 COIL_CRASH_REPORT="$T/crash-report.txt" "$COIL" run "$T/crash.coil" >/dev/null 2>&1
@@ -2423,7 +2425,7 @@ EOF
 expect_out "invalid indirect target in callptr" "debug checks validate call-ptr before control transfer" \
   "$COIL" run "$T/null-callptr.coil" --debug-checks
 out=$("$COIL" emit-ir "$T/null-callptr.coil" 2>&1)
-echo "$out" | grep -q "indirect.invalid" \
+grep -q "indirect.invalid" <<<"$out" \
   && bad "off: indirect validation must be zero-cost" "debug branch appears without the flag" \
   || ok "off: indirect validation emits no branch"
 
@@ -2702,7 +2704,7 @@ expect_out "returns a pointer to a stack local" "--debug-checks warns on a stack
            || bad "stack-return lint severity" "the build failed"
 # OFF (default): the checker is not even loaded — silent, zero cost.
 out=$("$COIL" build "$T/dangle.coil" -o "$T/dl3" 2>&1)
-echo "$out" | grep -q "stack local" && bad "off: the lint must not run" "$out" \
+grep -q "stack local" <<<"$out" && bad "off: the lint must not run" "$out" \
                                       || ok "off: the stack-return lint is not loaded (zero cost)"
 
 # no false positive: a function returning a HEAP pointer is fine under the flag.
@@ -2714,7 +2716,7 @@ cat > "$T/heapret.coil" <<'EOF'
 (defn main [] (-> i64) (coil.primitive/load (mk (malloc-allocator))))
 EOF
 out=$("$COIL" build "$T/heapret.coil" -o "$T/hr" --debug-checks 2>&1)
-echo "$out" | grep -q "stack local" && bad "no false positive: heap return" "flagged a heap ptr" \
+grep -q "stack local" <<<"$out" && bad "no false positive: heap return" "flagged a heap ptr" \
                                     || ok "no false positive: a heap-pointer return is not flagged"
 
 echo "== assert / assert-eq: located failures via the span machinery (tool-12) =="
@@ -3016,7 +3018,8 @@ expect_out "unit:" "--list groups discovered files under their suite" \
 expect_out "integration \[opt-in\]:" "--list marks a suite that a bare run would skip" \
   bash -c 'cd "$1" && "$2" test --list --suite all' _ "$T/suites" "$COIL"
 # A default --list that leaked the opt-in suite would mean a bare run reaches it too.
-(cd "$T/suites" && "$COIL" test --list 2>/dev/null) | grep -q integration \
+suites_list=$(cd "$T/suites" && "$COIL" test --list 2>/dev/null)
+grep -q integration <<<"$suites_list" \
   && bad "a default --list omits the opt-in suite" "integration appeared" \
   || ok "a default --list omits the opt-in suite"
 expect_rc 1 "an explicit file runs whichever suite claims it" \
@@ -3049,7 +3052,8 @@ expect_rc 0 "lint understands test files in every suite, default or not" \
 # A bare [test] section keeps working untouched, and keeps its FLAT listing: a project
 # that never wrote [test.suites.…] should see no suite headers appear under it. ($T/project
 # above declares a plain [test] section.)
-(cd "$T/project" && "$COIL" test --list 2>/dev/null) | grep -qE '^[a-z-]+:$' \
+project_list=$(cd "$T/project" && "$COIL" test --list 2>/dev/null)
+grep -qE '^[a-z-]+:$' <<<"$project_list" \
   && bad "a suite-less project keeps its flat --list" "a suite header appeared" \
   || ok "a suite-less project keeps its flat --list"
 
@@ -3117,7 +3121,7 @@ EOF
   # artifact). On the seed there is no .dSYM, so lldb has nothing.
   if command -v lldb >/dev/null 2>&1; then
     bp=$(lldb "$T/dbgx" -o "breakpoint set --file dbg.coil --line 3" -o quit 2>&1)
-    echo "$bp" | grep -qE 'Breakpoint 1: where = .*dbg\.coil:3' \
+    grep -qE 'Breakpoint 1: where = .*dbg\.coil:3' <<<"$bp" \
       && ok "lldb maps source from the .dSYM alone (no .o)" \
       || bad "lldb maps source from the .dSYM" "$(echo "$bp" | grep -iE 'breakpoint|pending' | head -1)"
   fi
@@ -3302,9 +3306,9 @@ echo "== C size types are target-width: the prelude's size_t/ssize_t are i32 on 
 printf '(defn main [] (-> i64) (println "hi") 0)\n' > "$T/sizet.coil"
 w_native=$("$COIL" emit-ir "$T/sizet.coil" 2>/dev/null | grep -oE 'declare i(64|32) @write\([^)]*\)' | head -1)
 w_wasm=$("$COIL" emit-ir "$T/sizet.coil" --target wasm32-unknown-unknown 2>/dev/null | grep -oE 'declare i(64|32) @write\([^)]*\)' | head -1)
-echo "$w_native" | grep -q 'i64 @write(i32, ptr, i64)' \
+grep -q 'i64 @write(i32, ptr, i64)' <<<"$w_native" \
   && ok "write is (int fd=i32, ptr, size_t=i64) -> ssize_t=i64 on native"    || bad "native write width" "got: $w_native"
-echo "$w_wasm"   | grep -q 'i32 @write(i32, ptr, i32)' \
+grep -q 'i32 @write(i32, ptr, i32)' <<<"$w_wasm" \
   && ok "write's fd stays i32 and size_t/ssize_t narrow to i32 on wasm32" || bad "wasm32 write width (fd/usize/isize)" "got: $w_wasm"
 
 echo "== A1: a wasm32 module exports __stack_pointer so a host longjmp can restore SP =="
@@ -3488,7 +3492,7 @@ expect_out '\(defn add \[\(a i64\) \(b i64\)\] \(-> i64\)\)' "doc: shows the sig
   "$COIL" doc "$T/docs/m.coil"
 # non-vacuous: the documented `add` MUST be listed while the `;;`-commented `helper` must not
 _dout=$("$COIL" doc "$T/docs/m.coil" 2>&1)
-if echo "$_dout" | grep -q '## add' && ! echo "$_dout" | grep -q 'helper'; then
+if grep -q '## add' <<<"$_dout" && ! grep -q 'helper' <<<"$_dout"; then
   ok "doc: a two-semicolon comment is NOT a doc (add listed, helper not)"
 else
   bad "doc: a two-semicolon comment is NOT a doc (add listed, helper not)" "got: $_dout"
@@ -4922,6 +4926,36 @@ if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
     bad "a unit is not linked into a program that does not import it" "the program without the import did not build"
   fi
 fi
+# One owner per C symbol: a program that links a unit AND compiles, from source,
+# a module the unit embeds leaves that module's `export-c` symbols to the unit.
+# (Two definitions of a C symbol fail to link, as a program importing compiler
+# internals beside the shipped coil.jit unit did with 34 duplicate symbols.)
+mkdir -p "$PBU/owner"
+printf '(module u.lib)\n(defn f [(x i64)] (-> i64) (+ x 1))\n(export-c [f :as "u_owner_f"])\n' > "$PBU/owner/lib.coil"
+printf '(module u.api)\n(import "u.lib" :as lib)\n(export g)\n(defn g [(x i64)] (-> i64) (lib/f x))\n' > "$PBU/owner/api.coil"
+printf '(module u.main)\n(import "u.api" :as api)\n(import "u.lib" :as lib)\n(defn main [] (-> i64) (println "{} {}" (api/g 1) (lib/f 10)) 0)\n' > "$PBU/owner/main.coil"
+rm -rf "$PBU/owner/unit" "$PBU/owner/main.o"
+if (cd "$PBU/owner" && "$COIL" build-unit api.coil -o unit >/dev/null 2>&1); then
+  owner_cexports=$(cat "$PBU/owner/unit/unit.cexports" 2>/dev/null)
+  case "$owner_cexports" in
+    *u_owner_f*) ok "build-unit records the C symbols its object defines" ;;
+    *) bad "build-unit records the C symbols its object defines" "unit.cexports: '$owner_cexports'" ;;
+  esac
+  if (cd "$PBU/owner" && "$COIL" emit-obj main.coil --unit unit -o main.o >/dev/null 2>&1) && [ -f "$PBU/owner/main.o" ]; then
+    owner_syms=$(nm "$PBU/owner/main.o" 2>/dev/null)
+    case "$owner_syms" in
+      *" T _u_owner_f"*|*" T u_owner_f"*) bad "a consumer leaves a unit-owned C symbol to the unit" "main.o also defines u_owner_f" ;;
+      *) ok "a consumer leaves a unit-owned C symbol to the unit" ;;
+    esac
+  else
+    bad "a consumer leaves a unit-owned C symbol to the unit" "main.coil did not compile against the unit"
+  fi
+  expect_out "^2 11$" "a consumer that also compiles a unit's embedded module links and runs" \
+    sh -c "cd '$PBU/owner' && '$COIL' run main.coil --unit unit"
+else
+  bad "build-unit records the C symbols its object defines" "build-unit of api.coil failed"
+fi
+
 # `prebuilt = true`: a path dependency compiled once, linked not recompiled.
 PBD="$T/prebuilt-dep"; mkdir -p "$PBD/engine/src" "$PBD/app/src"
 cat > "$PBD/engine/Coil.toml" <<'PBD_EOF'
@@ -4976,7 +5010,8 @@ if (cd "$PBD/app" && "$COIL" build src/main.coil -o app $PBD_BF >/dev/null 2>&1)
   fi
   # the app object references the dependency, it does not recompile it
   (cd "$PBD/app" && "$COIL" emit-obj src/main.coil -o app.o $PBD_BF >/dev/null 2>&1)
-  if nm "$PBD/app/app.o" 2>/dev/null | grep -qE '^ *U _?engine.tick!'; then
+  pbd_syms=$(nm "$PBD/app/app.o" 2>/dev/null)
+  if grep -qE '^ *U _?engine.tick!' <<<"$pbd_syms"; then
     ok "a prebuilt dependency is referenced (U), not recompiled, by its consumer"
   else
     bad "a prebuilt dependency is referenced by its consumer" "engine.tick! is not an undefined symbol in the app object"
