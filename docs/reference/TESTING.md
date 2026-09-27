@@ -153,10 +153,6 @@ every other list keeps the generic one:
   (arbitrary [(out (mut Email)) (s (ptr Source))] (-> i64) ...))
 ```
 
-A hand-written `Debug` impl mentions `Writer`, from `coil.io`, which
-`coil.prop` does not re-export. Add `(import "coil.io" :as io)` and write
-`(w (ptr io/Writer))`.
-
 There is no shrinker to write. The runner records every random choice a
 generator makes, shrinks by editing that record and regenerating, and so keeps
 the generator's invariants in every shrunk value.

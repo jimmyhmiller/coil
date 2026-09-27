@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""`dev.py install` pairs a compiler only with the library it was built from."""
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts" / "compiler"))
+import toolchain_stamp  # noqa: E402
+
+COMPILER = Path(sys.argv[1]).resolve()
+
+
+def install(source: Path, dest: Path) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(ROOT / "scripts/dev.py"), "install",
+                           "--source", str(source), "--dest", str(dest)],
+                          cwd=ROOT, text=True, capture_output=True, timeout=600)
+
+
+with tempfile.TemporaryDirectory(prefix="coil-install-pairing-") as raw:
+    work = Path(raw)
+    source = work / "coil"
+    shutil.copy2(COMPILER, source)
+    dest = work / "prefix" / "bin" / "coil"
+
+    missing = install(source, dest)
+    assert missing.returncode != 0 and "no coil.toolchain" in missing.stderr, missing
+    assert not dest.exists(), "an unstamped compiler was installed"
+
+    toolchain_stamp.stamp_path(source).write_text("0" * 64 + "\n")
+    stale = install(source, dest)
+    assert stale.returncode != 0 and "different library sources" in stale.stderr, stale
+    assert not (dest.parent.parent / "lib").exists(), "a stale pairing touched the library"
+
+    toolchain_stamp.stamp_path(source).write_text(toolchain_stamp.digest() + "\n")
+    matched = install(source, dest)
+    assert matched.returncode == 0, matched
+    assert toolchain_stamp.stamp_path(dest).read_text().strip() == toolchain_stamp.digest()
+print("install pairing: PASS")

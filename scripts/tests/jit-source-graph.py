@@ -8,6 +8,9 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cleanup_on_signal  # noqa: E402
+cleanup_on_signal.install()
 COMPILER = Path(sys.argv[1]).resolve()
 
 def run(args, cwd, env=None):
@@ -37,7 +40,9 @@ with tempfile.TemporaryDirectory(prefix=".coil-jit-source-graph-", dir=ROOT) as 
     entry.write_text('(module graph.entry)\n(import "graph.dependency" :as dep)\n'
                      '(defn main [] (-> i64) (dep/value))\n')
     dependency.write_text('(module graph.dependency)\n(defn value [] (-> i64) 42)\n')
-    # The SDK finds its toolchain through `coil` on PATH: the candidate under test.
+    # The SDK locates its toolchain through `coil` on PATH. Pin the candidate so
+    # the graph is read with this checkout's library, never an installed one
+    # that may predate it.
     toolbin = work / "bin"
     toolbin.mkdir()
     (toolbin / "coil").symlink_to(COMPILER)

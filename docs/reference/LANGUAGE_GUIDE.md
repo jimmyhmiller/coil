@@ -28,7 +28,6 @@ Other references:
 ```coil
 (module example.tour)
 (import "coil.alloc" :use [malloc-allocator])
-(import "coil.debug" :use *)
 (import "coil.arraylist" :use [al-new al-free!])
 
 (defstruct Point [(x i64) (y i64)])
@@ -37,7 +36,7 @@ Other references:
 (impl Point
   (manhattan [(p Point)] (-> i64) (+ (abs (.x p)) (abs (.y p)))))
 
-(defn abs [(n i64)] (-> i64) (if (< n 0) (- 0 n) n))
+(defn abs [(n i64)] (-> i64) (if (< n 0) (- n) n))
 
 (defsum Shape
   (Circle [(radius i64)])
@@ -54,7 +53,7 @@ Other references:
     (push! (mut areas) (area (Circle 2)))
     (push! (mut areas) (area (Rect :width 2 :height 5)))
     (println "{:?} is {} blocks away" p (manhattan p))
-    (for a (iter areas) (println "area {}" a))
+    (for a areas (println "area {}" a))
     (al-free! (mut areas))
     0))
 ```
@@ -68,8 +67,8 @@ area 10
 - Every form is `(operation argument…)`. The last expression of a body is its value.
 - `main` returns an `i64`, which becomes the process exit status.
 - A type follows the name it describes: `(x i64)`, `(-> i64)`.
-- `len`, `get`, `push!` and `iter` are trait methods, so they work on any
-  collection that implements them.
+- `len`, `get` and `push!` are trait methods, and `for` walks anything
+  `Iterable`, so they work on any collection that implements them.
 - Definitions may appear in any order within a file.
 
 ## Values and types
@@ -109,8 +108,8 @@ integer it converts the *number* (truncating); it never reinterprets bits.
 ⚠ `f64` has no `=`. NaN ≠ NaN, so floats don't implement `Eq`. Compare with
 `<`/`>`, or use `primitive/fcmp-eq` for IEEE equality.
 
-⚠ There is no unary `-`. `-5` is a literal; negate an expression with `(- 0 x)`.
-Operators take two arguments, so `(+ a b c)` is an error.
+`(- x)` negates (the `Neg` trait), and `+ - * /` and the bitwise operators take
+any number of operands, folding left: `(+ a b c)` is `(+ (+ a b) c)`.
 
 ## Bindings and control flow
 
@@ -149,14 +148,14 @@ first multiple of 7: 7
 - `cond` takes flat test/value pairs; `:else` is always true. `case` compares one
   value against keys with `=`, and a lone final clause is the default.
 - `when` evaluates its body if the test holds; `unless` if it fails.
-- `for x (iter coll)` walks any `Iterable`, and `(range lo hi)` is half-open.
+- `for x coll` walks anything `Iterable`, and `(range lo hi)` is half-open. The
+  binding may be a pattern: `(for (Point :x x) points …)`.
   `while`, `loop` with `(break value)` and `(continue)`, and labelled
   `(block :name … (return-from :name value))` cover everything else.
 - There is no `return`; a function's value is its last expression.
 
-⚠ `when`, `unless` and the loops produce `i64` 0 when they don't run their body.
-In a function whose result is not `i64`, end with the real value:
-`(for …) result`.
+A form whose value nothing uses is a statement, so `when`, loops, and `if` or
+`match` arms of different types all work in a `void` function.
 
 `scope` with `defer` runs cleanups in reverse order when the scope exits, including
 by `return-from`:
@@ -264,8 +263,7 @@ integer, `bool` or `Keyword`. It sizes arrays and makes types distinct:
 (defn main [] (-> i64)
   (let [a (: (Quantity :value 1.5) (Quantity :meters))
         b (: (Quantity :value 2.0) (Quantity :meters))]
-    (let [sum (add a b)]
-      (println "{} {}" (.value sum) (length [1 2 3])))
+    (println "{} {}" (.value (add a b)) (length [1 2 3]))
     0))
 ```
 
@@ -326,8 +324,8 @@ parameters of a callable `def`.
 - Construct with `:field value` pairs in any order, giving each field exactly
   once.
 - `(.field v)` reads a field, `(.. v a b)` is shorthand for `(.b (.a v))`, and
-  `(set! (.field v) x)` writes one. ⚠ `v` must be a place (a binding, parameter
-  or pointer). For a call result or a loop's element value, `let`-bind it first.
+  `(set! (.field v) x)` writes one. Reading a field of a call result works too;
+  writing one is an error, since the temporary would be discarded.
 - A parameter's type decides how it passes. `(r Rect)` is an immutable
   reference, so passing a big struct never copies it. `(r (mut Rect))` is a
   mutable reference, and the caller passes `(mut place)`. `(r (ptr Rect))` is a
@@ -378,13 +376,13 @@ one:
 (defsum Expr
   (Num [(value i64)])
   (Add [(left (ptr Expr)) (right (ptr Expr))])
-  (Neg [(inner (ptr Expr))]))
+  (Negate [(inner (ptr Expr))]))
 
 (defn eval [(e (ptr Expr))] (-> i64)
   (match (load e)
     (Num [n] n)
     (Add [l r] (+ (eval l) (eval r)))
-    (Neg [x] (- 0 (eval x)))))
+    (Negate [x] (- (eval x)))))
 
 (defn describe [(e Expr)] (-> (slice u8))
   (match e
@@ -395,7 +393,7 @@ one:
   (let [a (arena-allocator 1024)
         two (alloc/box! a Expr (Num 2))
         five (alloc/box! a Expr (Num 5))
-        sum (Add :left two :right (alloc/box! a Expr (Neg five)))]
+        sum (Add :left two :right (alloc/box! a Expr (Negate five)))]
     (println "{} is {}" (eval (alloc/box! a Expr sum)) (describe sum))
     0))
 ```
@@ -442,18 +440,17 @@ Both are ambient. Inside `(try …)`, `(try! r)` unwraps an `Ok` or returns the
 (defn add-strings [(a (slice u8)) (b (slice u8))] (-> (Result i64 ParseError))
   (try (Ok (+ (try! (parse a)) (try! (parse b))))))
 
-(defn show [(r (Result i64 ParseError))] (-> i64)
+(defn show [(r (Result i64 ParseError))] (-> void)
   (match r
     (Ok [v] (println "ok {}" v))
-    (Err [e] (match e
-               (NotADigit [at] (println "bad digit at {}" at))
-               (Empty [] (println "empty")))))
-  0)
+    (Err [(NotADigit [at])] (println "bad digit at {}" at))
+    (Err [_] (println "empty"))))
 
 (defn main [] (-> i64)
   (show (add-strings "12" "30"))
   (show (add-strings "12" "3x"))
-  (show (add-strings "" "1")))
+  (show (add-strings "" "1"))
+  0)
 ```
 
 ```output
@@ -462,14 +459,15 @@ bad digit at 1
 empty
 ```
 
-`coil.result` has the combinators: `unwrap-or`, `opt-map`, `res-map`, `map-err`,
+A nested variant pattern such as `(Err [(NotADigit [at])] …)` matches only when
+the inner variant does; otherwise matching moves on to the next arm. `coil.result`
+has the combinators: `unwrap-or`, `opt-map`, `res-map`, `map-err`,
 `and-then`, `ok-or`, `some?`, `ok?`.
 
 ## Traits
 
 ```coil
 (module example.traits)
-(import "coil.fmt" :use [fmt Display Formatter formatter-writer])
 
 (defstruct Vec2 [(x i64) (y i64)])
 
@@ -512,7 +510,8 @@ empty
 - Collection operations are traits too: `Len` (`len`), `Get` (`get`), `Set`
   (three-argument `set!`), `Push` (`push!`), `Pop` (`pop!`), `Iterable` (`iter`) and
   `Iterator` (`next`). `empty?` works on anything with `Len`.
-- `Display` (`{}`) and `Debug` (`{:?}`) live in `coil.fmt`.
+- `Display` (`{}`) and `Debug` (`{:?}`) are ambient; implement `display-fmt` or
+  `debug-fmt`, or `derive Debug`.
 - Any type can have an impl, including `(ptr T)`, `(slice T)`, `(array T N)`,
   function pointers, and one specific instance like `(Pair i64 i64)`.
 
@@ -588,7 +587,6 @@ true
 
 ```coil
 (module example.deriving)
-(import "coil.debug" :use *)
 
 (defstruct Point [(x i64) (y i64)])
 (derive Debug Eq Hash Clone Point)
@@ -616,18 +614,18 @@ true
 
 `derive` is a library macro. Each derivable trait registers its own generator, and
 you can register one for your own trait; see [Custom derives](#custom-derives).
-Derivers ship with `Eq`, `Hash`, `Clone`, `Copy`, `Debug` (from `coil.debug`),
+Derivers ship with `Eq`, `Hash`, `Clone`, `Copy`, `Debug`,
 `Arbitrary` (from `coil.prop`) and `Serialize`/`Deserialize` (from `coil.serde`).
 
 ### Trait objects
 
 `(dyn Trait)` pairs a pointer with a generated vtable, so one function can accept
 values of different types at run time. The trait's methods take `(self (ptr Self))`,
-and a `(ptr T)` converts to `(dyn Trait)` wherever one is expected:
+and a `(mut local)` or a `(ptr T)` converts to `(dyn Trait)` wherever one is
+expected:
 
 ```coil
 (module example.speak)
-(import "coil.alloc" :as alloc :use [malloc-allocator])
 
 (deftrait Speak [Self] (speak [(self (ptr Self))] (-> (slice u8))))
 
@@ -641,13 +639,10 @@ and a `(ptr T)` converts to `(dyn Trait)` wherever one is expected:
   0)
 
 (defn main [] (-> i64)
-  (let [a (malloc-allocator)
-        dog (alloc/box! a Dog (Dog :age 3))
-        cat (alloc/box! a Cat (Cat :lives 9))]
-    (introduce dog)
-    (introduce cat)
-    (alloc/destroy a dog)
-    (alloc/destroy a cat)
+  (let [(mut dog) (Dog :age 3)
+        (mut cat) (Cat :lives 9)]
+    (introduce (mut dog))
+    (introduce (mut cat))
     0))
 ```
 
@@ -656,8 +651,8 @@ woof
 meow
 ```
 
-⚠ A `(mut local)` borrow does not convert to `(dyn Trait)`. The value has to be
-behind a `(ptr T)`, as allocator-owned storage is.
+An immutable borrow does not convert, because a trait method may write through
+its `(ptr Self)`.
 
 ### Callable values
 
@@ -697,7 +692,6 @@ Coil has no garbage collector and no ambient heap. Storage is one of three kinds
 ```coil
 (module example.memory)
 (import "coil.alloc" :as alloc :use [malloc-allocator arena-allocator])
-(import "coil.debug" :use *)
 (import "coil.arraylist" :use [ArrayList al-new al-free!])
 
 (defstruct Node [(value i64) (next (ptr Node))])
@@ -797,7 +791,7 @@ Owners that outlive a lexical allocator take an `AllocatorLease` instead of a
 (import "coil.var" :use [var-static])
 
 (const TABLE-SIZE 16)
-(def answer 42)
+(def greeting "hello")
 (def counter (var-static i64 0))
 
 (defn bump! [] (-> i64)
@@ -807,12 +801,12 @@ Owners that outlive a lexical allocator take an `AllocatorLease` instead of a
 (defn main [] (-> i64)
   (bump!)
   (bump!)
-  (println "{} {} {}" answer TABLE-SIZE (bump!))
+  (println "{} {} {}" greeting TABLE-SIZE (bump!))
   0)
 ```
 
 ```output
-42 16 3
+hello 16 3
 ```
 
 `const` is evaluated at compile time and may call any function. `def` is a
@@ -835,6 +829,7 @@ with `set`.
 (import "coil.arraylist" :use [ArrayList al-free!])
 (import "coil.hashmap" :use [hm-new-scalar hm-free!])
 (import "coil.collect" :use [collect])
+(import "coil.iter" :use [Indexed])
 
 (defn even? [(n i64)] (-> bool) (= (% n 2) 0))
 
@@ -849,8 +844,8 @@ with `set`.
           total (fold (fn [acc n] (+ acc n)) 0 (take 2 (skip 1 xs)))]
       (println "evens={} total={}" evens total))
 
-    (for entry (iter (enumerate [10 20]))
-      (let [e entry] (println "{}: {}" (.index e) (.value e))))
+    (for (Indexed :index i :value n) (enumerate [10 20])
+      (println "{}: {}" i n))
 
     (set! (mut ages) 7 42)
     (match (get ages 7)
@@ -890,6 +885,7 @@ evens=3 total=10
 
 (defn main [] (-> i64)
   (println "{} {:?} {:x} {}" 42 "quoted" 255 1.5)
+  (println "[{:>6}] [{:<6}] [{:06.2}]" "ab" "cd" 3.14159)
   (let [(mut s) (string-from-view (malloc-allocator) (sv "hello"))]
     (string-push-view! (mut s) (sv ", world"))
     (println "{}" (string-view-bytes (string-as-view s)))
@@ -900,12 +896,14 @@ evens=3 total=10
 
 ```output
 42 "quoted" ff 1.5
+[    ab] [cd    ] [003.14]
 hello, world
 true
 ```
 
 - `println`/`print` take a format string. `{}` uses `Display`, `{:?}` compact
-  `Debug`, `{:#?}` pretty `Debug`, and `{:x}` hex.
+  `Debug`, `{:#?}` pretty `Debug`, and `{:x}` hex. A spec can add
+  `[[fill]align][+][0][width][.precision]`: `{:>8}`, `{:.2}`, `{:08.3}`.
 - `(fmt w "…" args…)` formats to any `(ptr Writer)`, such as `(stdout)`, `(stderr)`,
   a buffer or a file (from `coil.io`).
 - A string literal is `(slice u8)`, and byte strings compare with `=`.
@@ -914,11 +912,8 @@ true
   growable buffer. Iterating either yields `Rune`s; `coil.unicode.grapheme` gives
   grapheme clusters.
 
-⚠ `println` returns a `Result`, so `match` arms that print on one side need to
-print, or produce the same type, on the other.
-
-⚠ `{:?}` on a library type such as `Option` or `ArrayList` needs
-`(import "coil.debug" :use *)`.
+`println` returns a `Result` carrying any I/O error. As a statement its value is
+discarded.
 
 ## Modules
 
@@ -952,8 +947,8 @@ print, or produce the same type, on the other.
   `when`, `for`…). An explicit `(import "coil.core" …)` replaces that implicit
   import, so you can exclude or shadow core names.
 
-⚠ Declare each C `extern` in one module and import it from there. Two modules
-declaring the same symbol collide at link time.
+Two modules may declare the same C `extern`; Coil shares one declaration and
+reports an error only if the signatures differ.
 
 `coil namespaces` lists the standard library, and `coil namespace NAME` prints one
 namespace's definitions and docs.
@@ -1015,8 +1010,9 @@ again
   resolve where they were written.
 - `& (body Code)` collects the remaining arguments as one Code list.
 - `Code` is an immutable collection: `(len form)`, `(get form i)` and
-  `(for child (iter form) …)` walk it. To build a list, use a `CodeBuilder`
-  (`primitive/code-list-new`, then `push!`, then `primitive/code-list-done`).
+  `(for child form …)` walk it, and iterator consumers such as `any?` and `fold`
+  accept it. To build a list, push onto a `CodeBuilder` from
+  `primitive/code-list-new` and splice it with `~@`.
 - `coil dump-hygiene FILE` prints the expanded program with scope information, and
   `--trace-macros` logs each expansion.
 - `(meta (generator))` runs a generator and splices the top-level forms it returns.
@@ -1043,7 +1039,7 @@ named by a Code symbol. `derive` is built from them.
         (push! (mut arms) `~(primitive/code-str (primitive/code-field-name T i))))
       `(impl FieldNames ~T
          (field-name [(x ~T) (i i64)] (-> (slice u8))
-           (case i ~@(primitive/code-list-done (load arms)) "?"))))))
+           (case i ~@arms "?"))))))
 
 (defstruct Point [(x i64) (y i64) (z i64)])
 (derive FieldNames Point)
@@ -1073,8 +1069,8 @@ loads their module: through an import, through `--use NAME` on the command line,
 or through `[metaprograms] use = [...]` in `Coil.toml`.
 
 The program arrives as a list of modules, `((module-name form…) …)`, and includes
-the standard library. `(primitive/code-from-user? form)` selects the user's own
-code.
+the standard library. `coil.meta/user-forms` returns just the forms the user
+wrote, and `user-module?` tells a transform which modules to leave alone.
 
 ### A lint with an automatic fix
 
@@ -1086,6 +1082,7 @@ applies it, keeping the original text and comments of every reused node.
 ```
 (module myapp.lint.cond)
 (import "coil.primitive" :as primitive)
+(import "coil.meta" :use [user-forms])
 
 (defn hand-written-if? [(f Code)] (-> bool)
   (and (primitive/code-list? f)
@@ -1105,19 +1102,15 @@ applies it, keeping the original text and comments of every reused node.
       (set! at (get at 3)))
     (push! (mut clauses) `:else)
     (push! (mut clauses) at)
-    `(cond ~@(primitive/code-list-done (load clauses)))))
+    `(cond ~@clauses)))
 
-(defn walk [(f Code)] (-> i64)
+(defn walk [(f Code)] (-> void)
   (when (>= (chain-length f) 3)
-    (primitive/suggest f "three or more nested ifs read better as a cond" (as-cond f))
-    0)
-  (for child (iter f) (walk child))
-  0)
+    (primitive/suggest f "three or more nested ifs read better as a cond" (as-cond f)))
+  (for child f (walk child)))
 
 (defn nested-ifs [(modules Code)] (-> Code)
-  (for m (iter modules)
-    (for form (iter m)
-      (when (primitive/code-from-user? form) (walk form))))
+  (for form (user-forms modules) (walk form))
   `0)
 
 (checker nested-ifs)
@@ -1135,7 +1128,8 @@ $ coil lint src/main.coil --use myapp.lint.cond --fix
 
 To report without a fix, use `(primitive/warn node msg)`, or
 `(primitive/report node msg)` for an error that fails the build. Coil collects
-diagnostics, so one run reports all of them. `(primitive/lint-param "myapp.lint.depth" "3")` reads a
+diagnostics, so one run reports all of them.
+`(primitive/lint-param "myapp.lint.depth" "3")` reads a
 `--lint-param myapp.lint.depth=5` option.
 
 Checkers run after type checking, so they can ask what the compiler decided:
@@ -1151,8 +1145,8 @@ Checkers run after type checking, so they can ask what the compiler decided:
 ### A transform
 
 This transform defines a tiny dialect: `(inc e)` means `(+ e 1)`. It rebuilds only
-the nodes that contain an `inc`. `code-list-like` keeps each rebuilt node's source
-location and hygiene. It returns the modules wrapped in `(do …)`.
+the nodes that contain an `inc`. `code-list-like` keeps each rebuilt node's shape,
+source location and hygiene. A transform returns the list of modules.
 
 ```
 (module myapp.inc)
@@ -1162,23 +1156,20 @@ location and hygiene. It returns the modules wrapped in `(do …)`.
   (and (primitive/code-list? f) (= (len f) 2) (= (get f 0) `inc)))
 
 (defn mentions-inc? [(f Code)] (-> bool)
-  (let [(mut found) (inc-call? f)]
-    (for child (iter f) (when (mentions-inc? child) (set! found true)))
-    found))
+  (or (inc-call? f) (any? (fn [child] (mentions-inc? child)) f)))
 
 (defn rewrite [(f Code)] (-> Code)
   (cond (inc-call? f) `(+ ~(rewrite (get f 1)) 1)
         (mentions-inc? f)
           (let [(mut kids) (primitive/code-list-new)]
-            (for child (iter f) (push! (mut kids) (rewrite child)))
-            (let [items (primitive/code-list-done (load kids))]
-              (primitive/code-list-like f (if (primitive/code-vector? f) `[~@items] items))))
+            (for child f (push! (mut kids) (rewrite child)))
+            (primitive/code-list-like f `(~@kids)))
         :else f))
 
 (defn desugar-inc [(modules Code)] (-> Code)
   (let [(mut out) (primitive/code-list-new)]
-    (for m (iter modules) (push! (mut out) (rewrite m)))
-    `(do ~@(primitive/code-list-done (load out)))))
+    (for m modules (push! (mut out) (rewrite m)))
+    `(~@out)))
 
 (transform desugar-inc)
 ```
@@ -1200,7 +1191,6 @@ profile (`coil.lint.default`). Add opt-in lints with `--use`, for example
 
 ```coil
 (module example.ffi)
-(import "coil.slice" :use [slice-data])
 
 (extern strlen :cc c [(ptr i8)] (-> u64))
 (extern qsort :cc c [(ptr i8) u64 u64 (fnptr c [(ptr i64) (ptr i64)] i32)] (-> void))
@@ -1211,8 +1201,8 @@ profile (`coil.lint.default`). Add opt-in lints with `--use`, for example
         :else 0))
 
 (defn main [] (-> i64)
-  (let [xs [5 3 9 1]]
-    (qsort (cast (ptr i8) (slice-data xs)) 4 8 (fnptr-of compare))
+  (let [(mut xs) [5 3 9 1]]
+    (qsort (cast (ptr i8) (mut xs)) 4 8 (fnptr-of compare))
     (println "{} {} {} {} / {}" (get xs 0) (get xs 1) (get xs 2) (get xs 3) (strlen c"four"))
     0))
 ```
@@ -1224,6 +1214,7 @@ profile (`coil.lint.default`). Add opt-in lints with `--use`, for example
 - `(extern name :cc c [ArgTypes…] (-> R))` declares a C function; `...` marks
   varargs. `:as "symbol"` binds a different linker name.
 - Structs and floats cross the C ABI by value in both directions.
+- `(cast (ptr T) (mut x))` gives C a raw pointer to a local.
 - A Coil function passed to C as a callback is `(fnptr-of f)`. If the callback takes
   a struct by value, also list the function in `(export-c f)`.
 - `(export-c [f :as "name"])` makes a Coil function callable from C.
@@ -1320,24 +1311,11 @@ grows the stack on every iteration. Prefer an initialized `(mut x)` local.
 ## Gotchas
 
 - `f64` has no `=`; use `primitive/fcmp-eq` for IEEE equality.
-- There is no unary minus: write `(- 0 x)`.
-- Arithmetic operators take exactly two arguments: `(+ a (+ b c))`, not `(+ a b c)`.
-- `if` needs both branches, of the same type.
-- `when`, `unless`, `for` and `while` produce `i64` 0. In a non-`i64` function, end
-  with the real result.
+- `if` needs both branches, of the same type, when its value is used.
 - `cast` between floats and integers converts the value, not the bits.
-- `println` returns a `Result`, which matters when it is a `match` arm's value.
 - `primitive/…` names require `(import "coil.primitive" :as primitive)`.
-- `Display` needs `(import "coil.fmt" :use [Display …])`. `{:?}` on library types
-  needs `(import "coil.debug" :use *)`.
-- `(dyn Trait)` needs a `(ptr T)`, not a `(mut local)`.
 - You can't implement a trait for `(mut T)`; implement it for `T`.
-- `(.field (f))` fails on a call result or a `for` element value; `let`-bind the
-  value first.
-- Only one `(try …)` block per function.
-- Declare each `extern` in one module only.
+- `(dyn Trait)` accepts a `(mut local)` or a `(ptr T)`, not an immutable borrow.
 - Don't call `alloc-stack` in a loop, and never return a pointer to a local.
-- `call` and `block` are reserved and can't be function names (except the `call`
-  method of a `Callable` impl). Avoid `type` as a field name.
-- In a macro, splice a `(mut …)` CodeBuilder with
-  `(primitive/code-list-done (load b))`.
+- `call` is a built-in form, so no function can be named `call` (except the
+  method of a `Callable` impl).

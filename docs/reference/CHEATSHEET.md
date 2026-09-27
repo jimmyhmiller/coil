@@ -29,7 +29,7 @@ coil namespace coil.arraylist      # a library module's API
 
 (impl Point
   (norm2 [(p Point)] (-> i64) (+ (* (.x p) (.x p)) (* (.y p) (.y p))))
-  (shift! [(p (mut Point)) (dx i64)] (-> i64) (set! (.x p) (+ (.x p) dx)) 0))
+  (shift! [(p (mut Point)) (dx i64)] (-> void) (set! (.x p) (+ (.x p) dx))))
 
 (defsum Shape (Circle [(r i64)]) (Square [(side i64)]))
 
@@ -44,7 +44,7 @@ coil namespace coil.arraylist      # a library module's API
     (shift! (mut p) 1)
     (push! (mut xs) (area (Circle 1)))
     (push! (mut xs) (area (Square 2)))
-    (for a (iter xs) (println "area {}" a))
+    (for a xs (println "area {}" a))
     (println "norm2 {}" (norm2 p))
     (al-free! (mut xs))
     0))
@@ -66,7 +66,7 @@ norm2 32
 (defsum Option [T] (None) (Some [(value T)]))
 (deftrait Area [Self] (area [(x Self)] (-> i64)))
 (impl Area Point (area [(p Point)] (-> i64) …))
-(derive Debug Eq Clone Point)                  ; Debug needs (import "coil.debug" :use *)
+(derive Debug Eq Clone Point)
 (const LIMIT 64)                               ; compile-time
 (defn twice [(x Code)] (-> Code) `(+ ~x ~x))    ; a macro: Code -> Code
 ```
@@ -82,12 +82,12 @@ is a C `(ptr i8)`.
 (if test then else)                  ; both branches, same type
 (cond a 1 b 2 :else 3)   (case n 1 "one" 2 "two" "many")
 (when test body…)   (unless test body…)
-(for x (iter xs) …)   (for i (range 0 n) …)   (while test …)
+(for x xs …)   (for i (range 0 n) …)   (while test …)
 (block :done … (return-from :done v))
 (match v (Some [x] x) (None [] 0))   ; exhaustive; (_ …) catches the rest
 (Point :x 1 :y 2)   (.x p)   (set! (.x p) 5)   (Circle 3)
 (len xs) (get xs i) (set! (mut xs) i v) (push! (mut xs) v) (pop! (mut xs))
-(println "{} {:?}" a b)
+(println "{} {:?} {:.2}" a b f)
 (cast i64 f)   (: 200 u8)
 ```
 
@@ -99,9 +99,8 @@ one (pass `(mut place)`), and `(p (ptr Point))` a raw pointer.
 - A file that is imported starts with `(module name)`. Imports name modules, not
   paths.
 - `main` returns an `i64` exit status.
-- `f64` has no `=`. There is no unary minus: write `(- 0 x)`.
-- `when`, `for` and `while` yield `i64` 0. In a non-`i64` function, end with the
-  value.
+- `f64` has no `=`; use `primitive/fcmp-eq` for IEEE equality.
+- `if` needs both branches, of the same type, when its value is used.
 - `primitive/…` needs `(import "coil.primitive" :as primitive)`.
 - `call` and `block` are reserved names.
 - `;;;` directly above a definition is its documentation; `;` and `;;` are

@@ -14,6 +14,9 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cleanup_on_signal  # noqa: E402
+cleanup_on_signal.install()
 
 
 def run(*command: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -131,6 +134,12 @@ def main() -> None:
     run(sys.executable, str(ROOT / 'scripts/compiler/gen-retained-snapshot.py'), '--check')
     with tempfile.TemporaryDirectory(prefix='.coil-jit-session-memory-', dir=ROOT) as raw:
         directory = Path(raw)
+        # Every SDK session here locates its toolchain through `coil` on PATH:
+        # pin the candidate, never an installed toolchain that predates it.
+        toolbin = directory / 'bin'
+        toolbin.mkdir()
+        (toolbin / 'coil').symlink_to(compiler)
+        os.environ['PATH'] = str(toolbin) + os.pathsep + os.environ['PATH']
         installed_sdk = compiler_path.parent.parent / 'lib/coil/compiler'
         sources = ('jit_api.coil', 'driver.coil')
         installed_matches = all(
@@ -156,25 +165,19 @@ def main() -> None:
         run(str(graph_executable))
         print('precise graph copies only live bytes and preserves cyclic interior aliases', flush=True)
 
-        # SDK sessions find their toolchain through `coil` on PATH; it must be the
-        # candidate under test and its library, not whatever is installed.
-        toolbin = directory / 'bin'
-        toolbin.mkdir()
-        (toolbin / 'coil').symlink_to(compiler)
-        toolchain = dict(os.environ, PATH=str(toolbin) + os.pathsep + os.environ['PATH'])
         source = directory / 'replacements.coil'
         executable = directory / 'replacements'
         source.write_text(source_for_replacements(args.replacements))
         run(compiler, 'build', str(source), '-o', str(executable), *unit_flags)
         timed = run('/usr/bin/time', '-l' if sys.platform == 'darwin' else '-v',
-                    str(executable), env=toolchain)
+                    str(executable))
         peak = peak_rss(timed.stderr)
         print(f'{args.replacements} rejected retained JIT deltas: peak RSS {peak} B', flush=True)
         assert peak < 768 * 1024 * 1024, 'rejected frontend arenas accumulated'
 
         # Accepted commits must retire their compiler arenas too. A rejection-only
         # soak cannot establish this: it completely missed multi-GB accepted growth.
-        environment = dict(toolchain, COIL_JIT_TRACE='1')
+        environment = dict(os.environ, COIL_JIT_TRACE='1')
         # A checked Code-returning trait method must not be rediscovered as a
         # syntax macro on the first delta. Disable the disk cache: otherwise a
         # cached macro image hides recompilation of the accepted helper closure.

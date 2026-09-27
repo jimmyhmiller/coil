@@ -111,6 +111,33 @@ else
       "$(cat "$T/no-child-build.stderr")"
 fi
 
+echo "== cimport: system headers, selection, anonymous typedef records =="
+expect_rc 0 "cimport gate passes" bash scripts/compiler/oracle/gate-cimport.sh "$COIL"
+
+echo "== externref never reaches linear memory =="
+# A wasm reference lives in locals, parameters and results. Every position that
+# would store it in linear memory is a checker error, never a compiler
+# abort in layout or codegen.
+externref_case() {
+  local name=$1 want=$2 body=$3
+  printf '(module externref_%s)\n(extern js_get :cc c [] (-> externref))\n%s\n' "$name" "$body" > "$T/externref-$name.coil"
+  expect_out "$want" "externref: $name is a checker error, not a compiler abort" \
+    "$COIL" build "$T/externref-$name.coil" --target wasm32-unknown-unknown -o "$T/externref-$name.wasm"
+}
+externref_case field 'externref cannot be a field' \
+  '(defstruct Holder [(r externref)]) (defn main [] (-> i64) (let [h (Holder :r (js_get))] 0))'
+externref_case pointer 'externref cannot be behind a pointer' \
+  '(defn main [] (-> i64) (let [p (cast (ptr externref) 0)] 0))'
+externref_case array 'externref cannot be an array, slice or vec element' \
+  '(defn main [] (-> i64) (let [a (: [(js_get)] (array externref 1))] 0))'
+externref_case literal 'externref cannot be an array, slice or vec element' \
+  '(defn main [] (-> i64) (let [a [(js_get)]] 0))'
+externref_case generic 'externref cannot be a type argument' \
+  '(defn main [] (-> i64) (let [o (Some (js_get))] 0))'
+printf '(module externref_local)\n(extern js_get :cc c [] (-> externref))\n(extern js_use :cc c [externref] (-> i32))\n(defn id [T] [(x T)] (-> T) x)\n(defn main [] (-> i64) (let [(mut r) (js_get)] (set! r (id (js_get))) (cast i64 (js_use r))))\n' > "$T/externref-local.coil"
+expect_rc 0 "externref: locals, parameters, results and generic functions still compile" \
+  "$COIL" build "$T/externref-local.coil" --target wasm32-unknown-unknown -o "$T/externref-local.wasm"
+
 echo "== compile-time reader metaprograms =="
 scripts/tests/reader-metaprograms.sh "$COIL" \
   && ok "generic readers cover check/build/run, ambiguity, parity, and strict installed layout" \
@@ -409,6 +436,13 @@ grep -q '^      (= 2 2)$' "$T/fmt-width.got" \
   || bad "fmt --width controls stdin layout" "$(cat "$T/fmt-width.got")"
 expect_rc 2 "fmt --width rejects zero" "$COIL" fmt --width 0 "$T/seven.coil"
 expect_rc 2 "fmt --width requires a value" "$COIL" fmt "$T/seven.coil" --width
+
+printf '(defcc fast2 :params [rax rdx rsi rdi r8 r9] :ret rax :clobber [rax rdx rcx rsi rdi r8 r9 r10 r11] :native fast)\n' \
+  | "$COIL" fmt - > "$T/fmt-defcc.got"
+printf '(defcc fast2\n  :params [rax rdx rsi rdi r8 r9]\n  :ret rax\n  :clobber [rax rdx rcx rsi rdi r8 r9 r10 r11]\n  :native fast)\n' > "$T/fmt-defcc.want"
+cmp -s "$T/fmt-defcc.want" "$T/fmt-defcc.got" \
+  && ok "fmt keeps each defcc option with its value" \
+  || bad "fmt keeps each defcc option with its value" "$(diff -u "$T/fmt-defcc.want" "$T/fmt-defcc.got")"
 
 "$COIL" fmt tests/compiler/formatter_vertical_spacing_input.coil > "$T/vertical-spacing.got"
 cmp -s tests/compiler/formatter_vertical_spacing_expected.coil "$T/vertical-spacing.got" \
@@ -4616,8 +4650,9 @@ cat > "$PBU/mathlib.coil" <<'PBU_EOF'
 
 (import "coil.slice" :use [slice-len])
 
+; `BigV`/`BigNone` are variants: exporting them is exporting `Big`.
 (export Point Vec2 add combine make-vec bump! count ident slot lib-slot-bump!
-        straddle Big mk-big big-total)
+        straddle Big BigV BigNone mk-big big-total)
 
 (defstruct Point [(x i64) (y i64)])
 
@@ -4680,7 +4715,8 @@ cat > "$PBU/app.coil" <<'PBU_EOF'
   (lib-slot-bump!)
   (store! (slot [i64]) (+ (load (slot [i64])) 1))
   (if (or (!= (straddle 1 "ab" "cde" "f" "ghij") 407)
-          (!= (big-total (mk-big 1) 5) 326))
+          (!= (big-total (mk-big 1) 5) 326)
+          (!= (big-total (BigNone) 5) -1))
       2
       (if (and (= (add 40 2) 42)
                (and (= (combine (Point :x 40 :y 2)) 80)
@@ -4740,6 +4776,27 @@ COIL_NAMESPACE_ROOTS="$PBU" "$COIL" check "$PBU/app.coil" --unit "$PBU/u_llvm" >
 printf '(module t.st)\n(def n i64 7)\n(defn main [] (-> i64) n)\n' > "$PBU/state.coil"
 expect_out "a runtime .def." "build-unit refuses a module with runtime state, saying why" \
   "$COIL" build-unit "$PBU/state.coil" -o "$PBU/u_state"
+# no export list: every definition is public, so the interface declares them all
+printf '(module t.open)\n(defstruct Pt [(x i64)])\n(defn twice [(x i64)] (-> i64) (* x 2))\n' > "$PBU/open.coil"
+printf '(module t.openapp)\n(import "t.open" :as o)\n(defn main [] (-> i64) (+ (o/twice 20) (let [p (o/Pt :x 2)] (.x p))))\n' > "$PBU/openapp.coil"
+if COIL_NAMESPACE_ROOTS="$PBU" "$COIL" build-unit "$PBU/open.coil" -o "$PBU/u_open" >/dev/null 2>&1; then
+  open_iface=$(cat "$PBU/u_open/interface.coil")
+  case "$open_iface" in
+    *"(declare twice "*"(defstruct Pt "*|*"(defstruct Pt "*"(declare twice "*)
+      ok "build-unit without an export list declares every definition" ;;
+    *) bad "build-unit without an export list declares every definition" "$open_iface" ;;
+  esac
+  expect_rc 42 "a consumer uses an export-less unit" \
+    env COIL_NAMESPACE_ROOTS="$PBU" "$COIL" run "$PBU/openapp.coil" --unit "$PBU/u_open"
+else
+  bad "build-unit without an export list" "build-unit failed"
+fi
+printf '(module t.withimpl)\n(export P)\n(defstruct P [(x i64)])\n(impl P (half [(p P)] (-> i64) 1))\n' > "$PBU/withimpl.coil"
+expect_out "its .impl. form acts on every importer" "build-unit refuses an impl a consumer would lose" \
+  "$COIL" build-unit "$PBU/withimpl.coil" -o "$PBU/u_withimpl"
+printf '(module t.openconst)\n(const LIMIT 10)\n(defn f [] (-> i64) LIMIT)\n' > "$PBU/openconst.coil"
+expect_out "makes public 'LIMIT'" "build-unit refuses a public const it cannot express" \
+  "$COIL" build-unit "$PBU/openconst.coil" -o "$PBU/u_openconst"
 # a stale/missing unit dir
 expect_out "not a prebuilt unit" "--unit on a directory that is not a unit says so" \
   "$COIL" build "$PBU/app.coil" -o "$PBU/none" --unit "$PBU/does-not-exist"

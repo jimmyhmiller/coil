@@ -47,6 +47,75 @@ grep -qF '(cimport "tests/compiler/cimport/selective.h" :use [coil_selected_call
 "$compiler" dump-load "$tmp/extern-lint.coil" >"$tmp/extern-lint.full"
 grep -Eq '"extern".*"coil_selected_call".*"i32".*"\.\.\."' "$tmp/extern-lint.full"
 
+# A system header's API includes the headers it includes: macOS <stdlib.h>
+# declares qsort and abs in <_stdlib.h>, and clang spells size_t parameters
+# through its predefined __size_t.
+"$compiler" cimport stdlib.h -o "$tmp/stdlib.coil"
+"$compiler" check "$tmp/stdlib.coil"
+stdlib_bindings=$(cat "$tmp/stdlib.coil")
+for fn in qsort abs malloc free abort exit; do
+  case "$stdlib_bindings" in
+    *"(extern $fn "*) ;;
+    *) echo "cimport stdlib.h did not emit $fn" >&2; exit 1 ;;
+  esac
+done
+
+# An anonymous record named by its typedef is emitted under the typedef's name.
+cat >"$tmp/anon.h" <<'EOF'
+typedef struct { int width; int height; } ReproSize;
+void repro_size(ReproSize *size);
+EOF
+"$compiler" cimport "$tmp/anon.h" -o "$tmp/anon.coil"
+grep -qF '(defstruct ReproSize [(width i32) (height i32)])' "$tmp/anon.coil"
+"$compiler" check "$tmp/anon.coil"
+
+# A project wrapper keeps its system includes out, unless a name is selected;
+# a selected struct brings the records its fields need.
+cat >"$tmp/wrapper.h" <<'EOF'
+#include <stdlib.h>
+#include <sys/stat.h>
+int wrapper_own(int);
+EOF
+"$compiler" cimport "$tmp/wrapper.h" -o "$tmp/wrapper.coil"
+wrapper_bindings=$(cat "$tmp/wrapper.coil")
+case "$wrapper_bindings" in
+  *"(extern qsort "*) echo 'a project wrapper header exposed its system includes' >&2; exit 1 ;;
+esac
+case "$wrapper_bindings" in
+  *"(extern wrapper_own "*) ;;
+  *) echo 'a project wrapper header lost its own declaration' >&2; exit 1 ;;
+esac
+cat >"$tmp/selected.coil" <<EOF
+(module selected_system)
+(cimport "$tmp/wrapper.h" :use [fstat stat])
+(defn main [] (-> i64)
+  (let [(mut st) (zeroed stat)]
+    (cast i64 (fstat -1 (cast (ptr stat) 0)))))
+EOF
+"$compiler" check "$tmp/selected.coil"
+
+cat >"$tmp/sort.coil" <<'EOF'
+(module system_sort)
+(cimport "stdlib.h" :use [qsort abs malloc free])
+(defn compare [(a (ptr i8)) (b (ptr i8))] (-> i32)
+  (let [x (load (cast (ptr i64) a)) y (load (cast (ptr i64) b))]
+    (cond (< x y) -1 (> x y) 1 :else 0)))
+(defn main [] (-> i64)
+  (let [p (cast (ptr i64) (malloc 24))]
+    (store! (index p 0) 30)
+    (store! (index p 1) 10)
+    (store! (index p 2) 20)
+    (qsort (cast (ptr i8) p) 3 8 (fnptr-of compare))
+    (let [r (+ (load (index p 0)) (cast i64 (abs -2)))]
+      (free (cast (ptr i8) p))
+      r)))
+EOF
+set +e
+"$compiler" run "$tmp/sort.coil"
+rc=$?
+set -e
+[ "$rc" = 12 ] || { echo "system-header cimport program exited $rc, want 12" >&2; exit 1; }
+
 if [[ $(uname -s) == Darwin ]]; then
   cat >"$tmp/ioctl-lint.coil" <<'EOF'
 (module ioctl_lint)
