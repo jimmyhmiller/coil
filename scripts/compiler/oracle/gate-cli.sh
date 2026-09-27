@@ -291,6 +291,12 @@ expect_rc 7 "build: flags BEFORE the file"               "$COIL" run "$T/seven.c
                     || bad "build leaves no adjacent object" "$T/a.o exists"
 expect_rc 1 "unknown flag is rejected"                   "$COIL" build "$T/seven.coil" -o "$T/b" --frobnicate
 expect_out "unknown flag" "unknown flag is named"        "$COIL" build "$T/seven.coil" -o "$T/b" --frobnicate
+# A value-taking option at the end of the command line used to segfault (139) in
+# whichever subcommand scanner read the missing argv entry.
+for opt in -o --link-flag --backend --target --use --unit; do
+  expect_rc 2 "a trailing $opt without its value is a usage error" "$COIL" build "$T/seven.coil" "$opt"
+done
+expect_out "option '-o' requires a value" "a missing option value is named" "$COIL" build "$T/seven.coil" -o
 rm -rf "$T/default-build"
 mkdir -p "$T/default-build"
 ( cd "$T/default-build" && "$COIL" build "$T/seven.coil" >/dev/null 2>&1 )
