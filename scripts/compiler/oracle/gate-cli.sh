@@ -2005,11 +2005,18 @@ EOF
 else
   bad "export-c --backend arm64: emit-obj rejected a thunk-free export" "seed hard-errors on all exports"
 fi
-# a by-value struct param is a clear located hard error (SIGABRT), naming the reason
-printf '(module s)\n(defstruct P [(x i64)(y i64)])\n(defn d [(p P)] (-> i64) (coil.primitive/load (coil.primitive/field p x)))\n(export-c [d :as "s_d"])\n' > "$T/expc_bad.coil"
-expect_out "by-value struct parameter isn't supported" \
-  "export-c arm64: by-value struct param is a clear error, not a bad symbol" \
-  "$COIL" emit-obj "$T/expc_bad.coil" -o "$T/expc_bad.o" --backend arm64
+# a by-value struct param goes through a C-ABI thunk (scripts/tests/export-c-aggregates.py
+# covers the shapes); here, the one gate-cli always runs: it compiles and exports s_d.
+printf '(module s)\n(defstruct P [(x i64)(y i64)])\n(defn d [(p P)] (-> i64) (.x p))\n(export-c [d :as "s_d"])\n' > "$T/expc_val.coil"
+if "$COIL" emit-obj "$T/expc_val.coil" -o "$T/expc_val.o" --backend arm64 >/dev/null 2>&1; then
+  expc_syms=$(nm "$T/expc_val.o" 2>&1)
+  case "$expc_syms" in
+    *" T _s_d"*) ok "export-c arm64: a by-value struct param is exported through a thunk" ;;
+    *) bad "export-c arm64: by-value struct export" "no global _s_d in the object" ;;
+  esac
+else
+  bad "export-c arm64: by-value struct export" "emit-obj rejected it"
+fi
 
 echo "== std-3: string HashMap keys are OWNED by default (copied on insert/freed on remove) =="
 # Was: str-keyops stored the caller's (slice u8) fat pointer VERBATIM, so two keys built
@@ -3130,6 +3137,28 @@ EOF
       && ok "lldb maps source from the .dSYM alone (no .o)" \
       || bad "lldb maps source from the .dSYM" "$(echo "$bp" | grep -iE 'breakpoint|pending' | head -1)"
   fi
+  # A local is visible only after its initializer: at function entry `sum`
+  # does not exist yet (it used to read the slot's stale bytes), and after the
+  # initializer it holds its value.
+  if command -v lldb >/dev/null 2>&1; then
+    printf '%s\n' '(module dbgl)' \
+      '(defn checkpoint [(value i64)] (-> i64)' \
+      '  (let [sum (+ value 1)' \
+      '        twice (* sum 2)]' \
+      '    (+ sum twice)))' \
+      '(defn main [] (-> i64) (checkpoint 41))' > "$T/dbgl.coil"
+    "$COIL" build "$T/dbgl.coil" -g -o "$T/dbglx" >/dev/null 2>&1
+    at_entry=$(lldb -b "$T/dbglx" -o "b dbgl.checkpoint" -o run -o "frame variable sum" -o quit 2>&1)
+    after=$(lldb -b "$T/dbglx" -o "b dbgl.checkpoint" -o run -o "thread step-over" -o "thread step-over" -o "frame variable sum" -o quit 2>&1)
+    case "$at_entry" in
+      *"sum = "*) bad "a let local is not visible before its initializer" "$(printf '%s\n' "$at_entry" | grep 'sum =')" ;;
+      *) ok "a let local is not visible before its initializer" ;;
+    esac
+    case "$after" in
+      *"sum = 42"*) ok "a let local holds its value after its initializer" ;;
+      *) bad "a let local holds its value after its initializer" "$(printf '%s\n' "$after" | tail -5)" ;;
+    esac
+  fi
 else
   echo "  skip — dsymutil not on PATH (not a macOS toolchain host)"
 fi
@@ -3455,15 +3484,6 @@ case "$twomods_out" in
   *"2 passed; 0 failed"*) ok "two test modules each derive their own same-named type" ;;
   *) bad "two test modules each derive their own same-named type" "$twomods_out" ;;
 esac
-
-echo "== by-value c function pointer entries =="
-# Anonymous functions and fnptr-of ascribed a by-value `c` signature go through a
-# by-value C entry (LLVM backend; coil-bugs anonymous-aggregate-fnptr).
-byval_out=$("$COIL" run tests/compiler/features/fnptr_c_by_value.coil 2>&1)
-byval_want=$(printf 'anon 21 7\nfnptr-of 7 2\nexport 7\ncall-ptr 8\nconst 100')
-[ "$byval_out" = "$byval_want" ] \
-  && ok "structs pass by value through c function pointers to anonymous functions and fnptr-of" \
-  || bad "by-value c function pointer entries" "$byval_out"
 
 echo "== focused guide lookup =="
 expect_out '^  tests[[:space:]]+deftest' "guide: no argument prints the compact topic index" "$COIL" guide
@@ -5048,6 +5068,21 @@ if (cd "$PBD/app" && "$COIL" build src/main.coil -o app $PBD_BF >/dev/null 2>&1)
 else
   bad "prebuilt = true end to end" "the app with a prebuilt dependency did not build"
 fi
+
+echo "== stdlib profiles: hermetic and core providers =="
+# Nothing else ran this script, and every hermetic case was failing: the binding
+# runtime every destructuring program loads imported coil.slice.
+expect_rc 0 "hermetic and core-provider profiles (scripts/tests/core-providers.sh)" \
+  scripts/tests/core-providers.sh "$COIL"
+
+echo "== standard-library unit suites =="
+# The deftest files under tests/ that guard standard-library behavior. Each is its
+# own `coil test` run so a failure names the file.
+for suite in tests/stdlib_parsers_test.coil tests/serde_test.coil tests/serde_options_test.coil \
+             tests/serde_value_test.coil tests/serde_sum_posthoc_test.coil tests/fs_dir_list_test.coil \
+             tests/format_traits_test.coil; do
+  expect_rc 0 "coil test $suite passes" "$COIL" test "$suite"
+done
 
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"

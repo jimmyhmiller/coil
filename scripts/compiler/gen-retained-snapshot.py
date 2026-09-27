@@ -9,7 +9,9 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-TOKEN = re.compile(r';[^\n]*|#\\(?:[A-Za-z]+|.)|"(?:\\.|[^"\\])*"|[()\[\]]|[^\s()\[\]";]+')
+# A character literal is `#\c` or `\c` (`\"` and `\\` included), never a string
+# delimiter or an escape.
+TOKEN = re.compile(r';[^\n]*|#?\\(?:[A-Za-z]+|.)|"(?:\\.|[^"\\])*"|[()\[\]]|[^\s()\[\]";]+')
 class Vector(list): pass
 
 def read(text):

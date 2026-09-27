@@ -82,6 +82,14 @@ def justification(path: str, op: str, line: str) -> str:
             and path.startswith("tests/metaprogramming/compile-and-run/staged_")
             and "[marker (primitive/gensym)" in line):
         return "staged metacompilation marker: an opaque token keying a (stage MARKER ...) declaration and its request sites; never bound, never resolved"
+    # Loop labels are keywords matched by spelling (`(loop :L …)` / `(break :L …)`),
+    # never bound or resolved as identifiers, so a gensym spelling is what makes
+    # a macro's label distinct from every label in the user's arm bodies. Keyed on
+    # the exact construction, so another gensym in binding.coil stays unclassified.
+    if (op in {"gensym", "code-symbol"}
+            and path == "src/stdlib/binding.coil"
+            and '(primitive/code-symbol ":" (primitive/gensym))' in line):
+        return "loop-label keyword spelled from a gensym: labels are matched by spelling, never bound or resolved, so the fresh spelling keeps the macro's label from capturing a user's (break :label)"
     if op == "code-symbol":
         if "fresh-identifier" in line:
             return "display spelling input to fresh-identifier; not itself used lexically"
