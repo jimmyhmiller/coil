@@ -49,7 +49,7 @@ is not what happened.
 
 `src/stdlib/alloc.coil` already has a bump allocator. This work is **routing, not building**.
 
-```coil
+```text
 (defstruct Arena [(base (ptr i8)) (off i64) (cap i64)])
 (defn ar-alloc  ...)   ; bump: align up, check cap, return base+off
 (defn ar-resize ...)   ; ALWAYS returns (None) — no in-place resize
@@ -171,7 +171,7 @@ Each step is independently verifiable; do not batch them.
 A bulk-append primitive landed alongside step 2 because `loader.read-file` needed it (see
 [wasm64-reserve-abort.md](../archive/wasm64-reserve-abort.md)):
 
-```coil
+```text
 (defn al-extend! [T] [(l (mut (ArrayList T))) (src (ptr T)) (n i64)] (-> i64)
 ```
 

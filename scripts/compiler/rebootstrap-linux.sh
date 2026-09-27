@@ -94,8 +94,11 @@ stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$S1" ${STAGE0_BUILD_FLAGS[@]+"
 echo "=== stage2: stage1 rebuilds it ==="
 "$S1" build "$SRC" -o "$S2" "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
 echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="
-"$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" || { echo "stage2 object emission FAILED"; exit 1; }
-"$S2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" || { echo "stage3 object emission FAILED"; exit 1; }
+# The two emissions are independent; run them at once.
+"$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" & stage2_pid=$!
+"$S2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" & stage3_pid=$!
+wait "$stage2_pid" || { wait "$stage3_pid"; echo "stage2 object emission FAILED"; exit 1; }
+wait "$stage3_pid" || { echo "stage3 object emission FAILED"; exit 1; }
 cmp "$RUN_DIR/stage2.o" "$RUN_DIR/stage3.o" || { echo "FIXPOINT FAIL — objects differ (nondeterminism)"; exit 2; }
 echo "  ok — byte-identical, the compiler reproduces itself"
 

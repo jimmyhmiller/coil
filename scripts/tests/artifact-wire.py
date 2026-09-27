@@ -18,7 +18,9 @@ COMPILER = Path(sys.argv[1]).resolve()
 
 
 def run(args, expected=0):
-    result = subprocess.run(list(map(str, args)), cwd=ROOT, capture_output=True, timeout=30)
+    # A hang guard, not a speed check: the generated suite runs its scripts
+    # concurrently, so one -O2 build can take several times its unloaded 10 s.
+    result = subprocess.run(list(map(str, args)), cwd=ROOT, capture_output=True, timeout=180)
     assert result.returncode == expected, (args, result.returncode, result.stdout, result.stderr)
     return result.stdout
 

@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -12,3 +13,5 @@ with tempfile.TemporaryDirectory(prefix="coil-bootstrap-runtime-") as directory:
                     "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                     str(ROOT / "tests/bootstrap/runtime_test.c"), "-lm", "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True, env=os.environ | {"ASAN_OPTIONS": "detect_leaks=0"})
+# The committed wasm64 seed's imports against runtime.c, names and exact types.
+subprocess.run([sys.executable, str(ROOT / "scripts/tests/bootstrap-imports.py")], check=True)

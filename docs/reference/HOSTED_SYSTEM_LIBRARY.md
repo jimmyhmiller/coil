@@ -18,7 +18,8 @@ path. Matching is linear in the haystack length and uses no runtime allocation.
 ```coil
 (import "coil.regex" :as re)
 
-(re/is-match? "^[A-Za-z_][A-Za-z0-9_]*$" name)
+(defn valid-name? [(name (slice u8))] (-> bool)
+  (re/is-match? "^[A-Za-z_][A-Za-z0-9_]*$" name))
 ```
 
 Coil's hosted system APIs follow Python's separation of concerns while retaining
@@ -43,13 +44,17 @@ objects or every platform-specific `os` function are reproduced verbatim.
 They keep system code linear:
 
 ```coil
+(import "coil.alloc" :as alloc)
+(import "coil.os" :as os)
+(import "coil.primitive" :as primitive)
+
 (defn main [] (-> i64)
   (try
     (let [a (alloc/malloc-allocator)
           cwd (try-or! (os/current-dir a) 1)
           (mut cwdp) (primitive/zeroed os/OwnedString)]
       (store! cwdp cwd)
-      (println (os/owned-string-slice cwd))
+      (println "{}" (os/owned-string-slice cwd))
       (os/owned-string-free a cwdp)
       0)))
 ```

@@ -9,8 +9,9 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-# A character literal is `#\c` or `\c` (`\"` and `\\` included), never a string
-# delimiter or an escape.
+# Character literals: canonical `#\c`/`#\name`, and the legacy `\c`/`\name` the
+# reader still accepts (e.g. `\"`); without the latter a legacy quote literal
+# would open a string and unbalance the rest of the file.
 TOKEN = re.compile(r';[^\n]*|#?\\(?:[A-Za-z]+|.)|"(?:\\.|[^"\\])*"|[()\[\]]|[^\s()\[\]";]+')
 class Vector(list): pass
 
@@ -101,7 +102,7 @@ NULL_FIELDS={('coil.compiler.loader.LS','parent'),
 EMPTY_LISTS={
  ('coil.compiler.loader.LS','out'),
  ('coil.compiler.check.Cx','cur_bounds'), ('coil.compiler.check.Cx','loops'),
- ('coil.compiler.check.Cx','anon_funcs'), ('coil.compiler.check.Cx','anon_c_entries'),
+ ('coil.compiler.check.Cx','anon_funcs'),
  ('coil.compiler.resolve.SemanticWorkspace','resolved_revisions')}
 EMPTY_MAPS={
  ('coil.compiler.check.Cx','synth_cache'),

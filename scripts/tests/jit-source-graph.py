@@ -21,9 +21,11 @@ def run(args, cwd, env=None):
 
 with tempfile.TemporaryDirectory(prefix=".coil-jit-source-graph-", dir=ROOT) as raw:
     work = Path(raw)
-    unit = work / "sdk"
-    run([COMPILER, "build-unit", ROOT / "src/compiler/jit_api.coil", "-o", unit,
-         "--backend", "llvm", "-O3", "--quiet"], ROOT)
+    # The generated suite builds this unit once for every script that needs it.
+    unit = Path(os.environ["COIL_TEST_JIT_UNIT"]) if os.environ.get("COIL_TEST_JIT_UNIT") else work / "sdk"
+    if not os.environ.get("COIL_TEST_JIT_UNIT"):
+        run([COMPILER, "build-unit", ROOT / "src/compiler/jit_api.coil", "-o", unit,
+             "--backend", "llvm", "-O3", "--quiet"], ROOT)
     binary = work / "graph-test"
     args = [COMPILER, "build", ROOT / "tests/compiler/features/jit_source_graph.coil",
             "--unit", unit, "--backend", "llvm", "-o", binary]

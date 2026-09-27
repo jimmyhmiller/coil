@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #include <spawn.h>
 #include <sys/wait.h>
 
@@ -216,7 +217,7 @@ static size_t fmt_one(char *out, size_t cap, const char *fmt, uint64_t arg) {
 // ---- allocation ----
 uint64_t env_malloc(uint64_t size) { return rt_malloc(size); }
 uint64_t env_realloc(uint64_t p, uint64_t size) { return rt_realloc(p, size); }
-uint64_t env_free(uint64_t p) { rt_free(p); return 0; }
+void env_free(uint64_t p) { rt_free(p); }
 uint64_t env_calloc(uint64_t n, uint64_t sz) {
     uint64_t total = n * sz; if (total == 0) total = 1;
     uint64_t p = rt_malloc(total);
@@ -224,16 +225,16 @@ uint64_t env_calloc(uint64_t n, uint64_t sz) {
     return p;
 }
 uint64_t env_memset(uint64_t s, uint64_t c, uint64_t n) { memset(MEM + s, (int)c, (size_t)n); return s; }
-uint64_t env_memcmp(uint64_t a, uint64_t b, uint64_t n) {
+uint32_t env_memcmp(uint64_t a, uint64_t b, uint64_t n) {
     int r = memcmp(MEM + a, MEM + b, (size_t)n);
-    return (uint64_t)(int64_t)(r < 0 ? -1 : (r > 0 ? 1 : 0));
+    return (uint32_t)(int32_t)(r < 0 ? -1 : (r > 0 ? 1 : 0));
 }
 uint64_t env_strlen(uint64_t p) { return (uint64_t)strlen(hoststr(p)); }
 
 // ---- file / directory I/O (guest O_* constants == host's; same OS) ----
-uint32_t env_open(uint64_t path, uint32_t flags) { return (uint32_t)open(hoststr(path), (int)flags, 0666); }
-uint64_t env_creat(uint64_t path, uint64_t mode) {
-    return (uint64_t)(int64_t)open(hoststr(path), O_CREAT | O_WRONLY | O_TRUNC, (mode_t)mode);
+uint32_t env_open(uint64_t path, uint32_t flags, uint64_t mode) { return (uint32_t)open(hoststr(path), (int)flags, (mode_t)mode); }
+uint32_t env_creat(uint64_t path, uint32_t mode) {
+    return (uint32_t)open(hoststr(path), O_CREAT | O_WRONLY | O_TRUNC, (mode_t)mode);
 }
 uint64_t env_read(uint32_t fd, uint64_t ptr, uint64_t len) {
     return (uint64_t)(int64_t)read((int)fd, MEM + ptr, (size_t)len);
@@ -242,11 +243,13 @@ uint64_t env_write(uint32_t fd, uint64_t ptr, uint64_t len) {
     return (uint64_t)(int64_t)write((int)fd, MEM + ptr, (size_t)len);
 }
 uint32_t env_close(uint32_t fd) { if (fd > 2) close((int)fd); return 0; }
-uint32_t env_access(uint64_t path, uint64_t mode) { return (uint32_t)access(hoststr(path), (int)mode); }
+uint32_t env_access(uint64_t path, uint32_t mode) { return (uint32_t)access(hoststr(path), (int)mode); }
 uint64_t env_mkdtemp(uint64_t path) { return mkdtemp(hoststr(path)) ? path : 0; }
 uint32_t env_mkstemp(uint64_t path) { return (uint32_t)mkstemp(hoststr(path)); }
 uint32_t env_remove(uint64_t path) { return (uint32_t)remove(hoststr(path)); }
 uint32_t env_rmdir(uint64_t path) { return (uint32_t)rmdir(hoststr(path)); }
+uint32_t env_mkdir(uint64_t path, uint32_t mode) { return (uint32_t)mkdir(hoststr(path), (mode_t)mode); }
+uint32_t env_chdir(uint64_t path) { return (uint32_t)chdir(hoststr(path)); }
 uint32_t env_unlink(uint64_t path) { return (uint32_t)unlink(hoststr(path)); }
 uint32_t env_rename(uint64_t a, uint64_t b) { return (uint32_t)rename(hoststr(a), hoststr(b)); }
 uint64_t env_realpath(uint64_t path, uint64_t out) {
@@ -394,18 +397,24 @@ uint32_t env_snprintf(uint64_t buf, uint64_t size, uint64_t fmt, uint64_t arg) {
     }
     return (uint32_t)n;
 }
-uint64_t env_putchar(uint64_t c) { putchar((int)(c & 0xff)); return c & 0xff; }
-uint64_t env_puts(uint64_t p) { fputs(hoststr(p), stdout); putchar('\n'); return 1; }
+uint32_t env_putchar(uint32_t c) { return (uint32_t)putchar((int)(c & 0xff)); }
+uint32_t env_puts(uint64_t p) { return (uint32_t)puts(hoststr(p)); }
 
 // ---- math ----
 double env_sqrt(double x) { return sqrt(x); }
 double env_pow(double x, double y) { return pow(x, y); }
 double env_fmod(double x, double y) { return fmod(x, y); }
 float  env_fmodf(float x, float y) { return fmodf(x, y); }
+float  env_sqrtf(float x) { return sqrtf(x); }
+float  env_floorf(float x) { return floorf(x); }
+float  env_ceilf(float x) { return ceilf(x); }
+float  env_truncf(float x) { return truncf(x); }
+double env_fma(double x, double y, double z) { return fma(x, y, z); }
+float  env_fmaf(float x, float y, float z) { return fmaf(x, y, z); }
 
 // ---- process ----
-uint64_t env_abort(void) { die("env.abort() called"); return 0; }
-uint64_t env_exit(uint32_t code) { exit((int)(code & 0xff)); }
+void env_abort(void) { die("env.abort() called"); }
+void env_exit(uint32_t code) { exit((int)(code & 0xff)); }
 // atexit takes a WASM function pointer (a table index), and this runtime has no
 // indirect-call bridge back into the module -- it provides flat env.* imports and
 // nothing else. The sole registrant is mtrace's memory report, a diagnostic that
@@ -464,11 +473,11 @@ uint32_t env_pthread_attr_destroy(uint64_t a) { (void)a; return 0; }
 // so a regression that starts calling them is caught immediately.
 uint32_t env_pthread_create(uint64_t a, uint64_t b, uint64_t c, uint64_t d) { (void)a;(void)b;(void)c;(void)d; die("unreachable: env.pthread_create"); return 0; }
 uint32_t env_pthread_join(uint64_t a, uint64_t b) { (void)a;(void)b; die("unreachable: env.pthread_join"); return 0; }
-uint64_t env_pthread_exit(uint64_t a) { (void)a; die("unreachable: env.pthread_exit"); return 0; }
+void env_pthread_exit(uint64_t a) { (void)a; die("unreachable: env.pthread_exit"); }
 uint64_t env_mmap(uint64_t a, uint64_t b, uint32_t c, uint32_t d, uint32_t e, uint64_t f) { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; die("unreachable: env.mmap"); return 0; }
 uint32_t env_munmap(uint64_t a, uint64_t b) { (void)a;(void)b; die("unreachable: env.munmap"); return 0; }
 uint32_t env_mprotect(uint64_t a, uint64_t b, uint32_t c) { (void)a;(void)b;(void)c; die("unreachable: env.mprotect"); return 0; }
-uint64_t env_dlopen(uint64_t a, uint64_t b) { (void)a;(void)b; die("unreachable: env.dlopen"); return 0; }
+uint64_t env_dlopen(uint64_t a, uint32_t b) { (void)a;(void)b; die("unreachable: env.dlopen"); return 0; }
 uint64_t env_dlsym(uint64_t a, uint64_t b) { (void)a;(void)b; die("unreachable: env.dlsym"); return 0; }
 // Guest function pointers identify wasm table entries, never native images.
 uint32_t env_dladdr(uint64_t address, uint64_t info) { (void)address; (void)info; return 0; }

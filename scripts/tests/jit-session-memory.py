@@ -151,17 +151,21 @@ def main() -> None:
         # adding another copy would duplicate every symbol. A candidate uses
         # an explicit unit built from this checkout, so its test cannot silently
         # link the previously installed SDK instead.
-        unit_flags: list[str] = []
+        # Host programs are built at -O0: the JIT work they measure runs in the
+        # -O3 unit, and optimizing a few lines of host code only costs build time.
+        unit_flags: list[str] = ['-O0']
         if not installed_matches:
             if installed_sdk.is_dir():
                 raise AssertionError('installed compiler SDK does not match this checkout')
-            unit = directory / 'jit-unit'
-            run(compiler, 'build-unit', str(ROOT / 'src/compiler/jit_api.coil'),
-                '-o', str(unit), '--backend', 'llvm', '-O3', '--quiet')
-            unit_flags = ['--unit', str(unit)]
+            # The generated suite builds this unit once for every script that needs it.
+            unit = Path(os.environ['COIL_TEST_JIT_UNIT']) if os.environ.get('COIL_TEST_JIT_UNIT') else directory / 'jit-unit'
+            if not os.environ.get('COIL_TEST_JIT_UNIT'):
+                run(compiler, 'build-unit', str(ROOT / 'src/compiler/jit_api.coil'),
+                    '-o', str(unit), '--backend', 'llvm', '-O3', '--quiet')
+            unit_flags += ['--unit', str(unit)]
         graph_executable = directory / 'retained-graph'
         run(compiler, 'build', str(ROOT / 'tests/compiler/retained_graph_test.coil'),
-            '-o', str(graph_executable))
+            '-o', str(graph_executable), '-O0')
         run(str(graph_executable))
         print('precise graph copies only live bytes and preserves cyclic interior aliases', flush=True)
 
@@ -259,7 +263,7 @@ def main() -> None:
             llvm_flags += ['--link-flag', flag]
         llvm_executable = directory / 'llvm-session'
         run(compiler, 'build', str(ROOT / 'tests/compiler/jit_llvm_session_test.coil'),
-            '-o', str(llvm_executable), '--backend', 'llvm', *llvm_flags)
+            '-o', str(llvm_executable), '--backend', 'llvm', '-O0', *llvm_flags)
         run(str(llvm_executable), env=environment)
         print('ORC incremental objects, static cells, rejection, old pointers, leases, and reset', flush=True)
 

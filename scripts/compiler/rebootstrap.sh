@@ -81,23 +81,30 @@ LF=($(./scripts/compiler/llvm-link-flags.sh "${COIL_LLVM_LINK:-dynamic}")) \
   || { echo "cannot compute LLVM link flags"; exit 1; }
 
 . scripts/compiler/select-stage0.sh
-select_stage0 "$SEED" "$SRC" arm64 "${LF[@]}" || exit 1
-echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
-
-# Probe before building: a stage0 too old for this tree otherwise fails deep in
-# stage1 with an error that reads like a compiler bug. See stage0-check.sh.
-. "$(dirname "$0")/stage0-check.sh"
-stage0_check "$STAGE0" "$SEED" "$SRC" "${LF[@]}" || exit 1
-
+# CI must never paper over a stale committed seed; see select_stage0.
+[ "${CI:-}" = true ] && export COIL_REQUIRE_FRESH_SEED="${COIL_REQUIRE_FRESH_SEED:-1}"
 echo "=== stage1: stage0 builds the self-host compiler (default LLVM backend) ==="
-stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$RB1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
+if stage1_from_seed "$SEED" "$PWD/$SRC" "$RB1" "${LF[@]}"; then
+  echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
+else
+  select_stage0 "$SEED" "$SRC" arm64 "${LF[@]}" || exit 1
+  echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
+  # Probe before building: a stage0 too old for this tree otherwise fails deep in
+  # stage1 with an error that reads like a compiler bug. See stage0-check.sh.
+  . "$(dirname "$0")/stage0-check.sh"
+  stage0_check "$STAGE0" "$SEED" "$SRC" "${LF[@]}" || exit 1
+  stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$RB1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} "${LF[@]}" || { echo "stage1 FAILED"; exit 1; }
+fi
 
 echo "=== stage2: stage1 rebuilds the compiler ==="
 "$RB1" build "$SRC" -o "$RL2" "${LF[@]}" || { echo "stage2 FAILED"; exit 1; }
 
 echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="
-"$RB1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" || { echo "stage2 object emission FAILED"; exit 1; }
-"$RL2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" || { echo "stage3 object emission FAILED"; exit 1; }
+# The two emissions are independent; run them at once.
+"$RB1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" & stage2_pid=$!
+"$RL2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" & stage3_pid=$!
+wait "$stage2_pid" || { wait "$stage3_pid"; echo "stage2 object emission FAILED"; exit 1; }
+wait "$stage3_pid" || { echo "stage3 object emission FAILED"; exit 1; }
 cmp "$RUN_DIR/stage2.o" "$RUN_DIR/stage3.o" \
   || { echo "LLVM FIXPOINT FAIL — LLVM-backend objects differ"; exit 2; }
 echo "  LLVM fixed point: PASS"

@@ -7,7 +7,8 @@ machine. The regex parser and pattern do not remain in the executable.
 ```coil
 (import "coil.regex" :as regex)
 
-(regex/is-match? "^(?i:[a-z][a-z0-9_]{2,15})$" username)
+(defn valid-username? [(username (slice u8))] (-> bool)
+  (regex/is-match? "^(?i:[a-z][a-z0-9_]{2,15})$" username))
 ```
 
 ## Syntax

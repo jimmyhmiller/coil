@@ -42,16 +42,20 @@ export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts}"
 export COIL_STRICT_BUNDLE="${COIL_STRICT_BUNDLE:-1}"
 
 . scripts/compiler/select-stage0.sh
-select_stage0 "$SEED" "$SRC" arm64 || exit 1
-echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
-
-# Probe before building: a stage0 too old for this tree otherwise fails deep in
-# stage1 with an error that reads like a compiler bug. See stage0-check.sh.
-. "$(dirname "$0")/stage0-check.sh"
-stage0_check "$STAGE0" "$SEED" "$SRC" || exit 1
-
+# CI must never paper over a stale committed seed; see select_stage0.
+[ "${CI:-}" = true ] && export COIL_REQUIRE_FRESH_SEED="${COIL_REQUIRE_FRESH_SEED:-1}"
 echo "=== stage1: stage0 builds the LLVM-free compiler ==="
-stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$S1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} || { echo "stage1 FAILED"; exit 1; }
+if stage1_from_seed "$SEED" "$PWD/$SRC" "$S1"; then
+  echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
+else
+  select_stage0 "$SEED" "$SRC" arm64 || exit 1
+  echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
+  # Probe before building: a stage0 too old for this tree otherwise fails deep in
+  # stage1 with an error that reads like a compiler bug. See stage0-check.sh.
+  . "$(dirname "$0")/stage0-check.sh"
+  stage0_check "$STAGE0" "$SEED" "$SRC" || exit 1
+  stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$S1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} || { echo "stage1 FAILED"; exit 1; }
+fi
 echo "=== stage2: stage1 rebuilds it with --backend arm64 ==="
 "$S1" build "$SRC" -o "$S2" --backend arm64 || { echo "stage2 FAILED"; exit 1; }
 echo "=== NO-LLVM: stage2 must link no libLLVM ==="
@@ -63,8 +67,11 @@ esac
 echo "  ok — links only:$(printf '%s\n' "$dependencies" | awk '{printf " %s", $1}')"
 
 echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="
-"$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" --backend arm64 || { echo "stage2 object emission FAILED"; exit 1; }
-"$S2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" --backend arm64 || { echo "stage3 object emission FAILED"; exit 1; }
+# The two emissions are independent; run them at once.
+"$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" --backend arm64 & stage2_pid=$!
+"$S2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" --backend arm64 & stage3_pid=$!
+wait "$stage2_pid" || { wait "$stage3_pid"; echo "stage2 object emission FAILED"; exit 1; }
+wait "$stage3_pid" || { echo "stage3 object emission FAILED"; exit 1; }
 cmp "$RUN_DIR/stage2.o" "$RUN_DIR/stage3.o" || { echo "FIXPOINT FAIL — arm64 objects differ"; exit 2; }
 echo "  ok — byte-identical, the compiler reproduces itself"
 

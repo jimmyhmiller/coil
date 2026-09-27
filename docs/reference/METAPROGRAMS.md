@@ -43,6 +43,12 @@ Rust-like ownership dialect, a Scheme frontend).
 collection loop over hand-written `(modules i n)` recursion:
 
 ```coil
+(import "coil.primitive" :as primitive)
+
+(defn walk-form [(form Code)] (-> Code)
+  ; Replace this with the check to perform on each top-level form.
+  form)
+
 (defn walk-module [(module Code)] (-> Code)
   (do
     ; The record head is the module name; its O(1) rest view contains the forms.
@@ -103,6 +109,8 @@ worked example — its `open()` flags differ per OS (512 is `O_CREAT` on darwin
 and `O_TRUNC` on Linux), and it selects them with
 
 ```coil
+(import "coil.primitive" :as primitive)
+
 (defn os-pick [(linux Code) (darwin Code)] (-> Code)
   (if (primitive/code-eq (primitive/target-os) `linux) linux darwin))
 ;; A generated const the surrounding PROGRAM refers to is a published name, not a

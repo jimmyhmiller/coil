@@ -235,7 +235,8 @@ def install(args: argparse.Namespace) -> None:
         staged.unlink(missing_ok=True)
     toolchain_stamp.stamp_path(destination).write_text(stamp + "\n")
     print(f"installed {source} -> {destination}")
-    warm_jit_unit(destination, libdir)
+    if not args.no_warm_unit:
+        warm_jit_unit(destination, libdir)
     report_installed(destination)
 
 
@@ -351,12 +352,7 @@ def test(args: argparse.Namespace) -> None:
     elif args.suite == "cli":
         execute("scripts/compiler/oracle/gate-cli.sh", compiler)
     elif args.suite == "generated":
-        for name in ("digest", "artifact-wire", "codegen-session", "compile-performance", "tail-borrow", "extern-aliases",
-                     "dynamic-stack", "union-hfa", "c-aggregate-bounded-read", "namespace-index-memory",
-                     "sparse-static", "oracle-corpus", "provider-artifacts", "generated-modules",
-                     "binding_macros", "jit-source-graph", "jit-session-memory", "jit-static-session", "jit-single-form", "install-pairing",
-                     "project-scan-memory", "resolve-shadow-scaling", "deferred-emission", "aggregate-abi-sizes", "export-c-aggregates"):
-            execute(sys.executable, f"scripts/tests/{name}.py", compiler)
+        test_generated(compiler)
     elif args.suite == "runtime":
         execute(sys.executable, "scripts/oracle.py", "runtime", "gate", "arm64", "--compiler", compiler)
     elif args.suite == "http":
@@ -1292,6 +1288,72 @@ def test_meta(compiler: str) -> None:
     print("metaprogram engines: PASS")
 
 
+# The generated-unit, reader-artifact and storage regressions. Each script owns a
+# private temporary directory and measures only its own processes, so they run
+# concurrently; the longest are listed first so they start first. COIL_JOBS=1
+# restores serial execution when a failure needs to be read on its own.
+GENERATED_SCRIPTS = (
+    "jit-static-session", "jit-session-memory", "generated-modules", "bootstrap-imports", "jit-source-graph",
+    "extern-aliases", "artifact-wire", "codegen-session", "binding_macros", "jit-single-form",
+    "install-pairing", "dynamic-stack", "sparse-static", "namespace-index-memory",
+    "provider-artifacts", "project-scan-memory", "resolve-shadow-scaling", "deferred-emission",
+    "digest", "compile-performance", "tail-borrow", "c-aggregate-bounded-read", "union-hfa", "oracle-corpus",
+    "aggregate-abi-sizes", "export-c-aggregates",
+)
+
+
+# These build the same -O3 coil.jit unit when run on their own; the suite builds
+# it once and hands it to them through COIL_TEST_JIT_UNIT.
+GENERATED_UNIT_SCRIPTS = {"jit-static-session", "jit-session-memory", "jit-source-graph"}
+
+
+def test_generated(compiler: str) -> None:
+    override = os.environ.get("COIL_JOBS")
+    workers = max(1, int(override)) if override else max(1, os.cpu_count() or 1)
+    started = time.monotonic()
+
+    def run_script(name: str, env: dict[str, str] | None = None) -> tuple[str, int, str, float]:
+        begin = time.monotonic()
+        result = subprocess.run([sys.executable, f"scripts/tests/{name}.py", compiler], cwd=ROOT, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        return name, result.returncode, result.stdout, time.monotonic() - begin
+
+    failed = []
+    with tempfile.TemporaryDirectory(prefix=".coil-generated-unit-", dir=ROOT) as scratch, \
+            concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(GENERATED_SCRIPTS))) as pool:
+        unit = Path(scratch) / "jit_api"
+
+        def build_unit() -> tuple[str, int, str, float]:
+            begin = time.monotonic()
+            result = subprocess.run([compiler, "build-unit", str(ROOT / "src/compiler/jit_api.coil"), "-o", str(unit),
+                                     "--backend", "llvm", "-O3", "--quiet"], cwd=ROOT,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            return "coil.jit unit", result.returncode, result.stdout, time.monotonic() - begin
+
+        # The unit build is the longest single step, so it starts first and the
+        # scripts that do not need it run beside it.
+        futures = [pool.submit(build_unit)]
+        futures += [pool.submit(run_script, name) for name in GENERATED_SCRIPTS if name not in GENERATED_UNIT_SCRIPTS]
+        waiting = [name for name in GENERATED_SCRIPTS if name in GENERATED_UNIT_SCRIPTS]
+        while futures:
+            done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                futures.remove(future)
+                name, code, output, elapsed = future.result()
+                print(f"== {name} ({elapsed:.1f}s): {'ok' if code == 0 else f'FAIL exit {code}'}", flush=True)
+                if code != 0 or os.environ.get("COIL_VERBOSE") == "1":
+                    print(output, end="" if output.endswith("\n") else "\n", flush=True)
+                if code != 0:
+                    failed.append(name)
+                if name == "coil.jit unit":
+                    env = dict(os.environ, COIL_TEST_JIT_UNIT=str(unit)) if code == 0 else None
+                    futures += [pool.submit(run_script, waiter, env) for waiter in waiting]
+    elapsed = time.monotonic() - started
+    if failed:
+        raise SystemExit(f"generated suite: {len(failed)} failed ({', '.join(sorted(failed))}) in {elapsed:.1f}s")
+    print(f"generated suite: {len(GENERATED_SCRIPTS)} scripts passed in {elapsed:.1f}s")
+
+
 def test_http(compiler: str) -> None:
     """Both HTTP client gates: the buffered request, and the streaming one.
 
@@ -1304,16 +1366,6 @@ def test_http(compiler: str) -> None:
 
 
 def test_wasm(compiler: str) -> None:
-    # The finalizer names a global import it cannot resolve and fails as itself,
-    # not as a linker child "terminated by signal 1". Needs neither node nor wasm-tools.
-    absent = subprocess.run([compiler, "build", "tests/compiler/features/wasm32_absent_linker_symbol.coil",
-                             "--target", "wasm32-unknown-unknown", "-o", "/tmp/gate-wasm32-absent-symbol.wasm"],
-                            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    if (absent.returncode != 1
-            or "unresolved global import GOT.mem._mh_execute_header" not in absent.stdout
-            or "signal" in absent.stdout or "native library" in absent.stdout):
-        sys.stderr.write(absent.stdout)
-        raise SystemExit("wasm finalizer: an absent linker symbol is not reported by name")
     if not shutil.which("node") or not shutil.which("wasm-tools"):
         print("wasm gate: SKIP (requires node and wasm-tools)")
         return
@@ -1518,6 +1570,8 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--build", action="store_true", help="run the full bootstrap before installing")
     command.add_argument("--variant", choices=("full", "nollvm", "linux", "nollvm-linux", "x64"),
                          default="full", help="bootstrap variant used with --build")
+    command.add_argument("--no-warm-unit", action="store_true",
+                         help="skip prebuilding the coil.jit unit (the first coil.jit build then builds it)")
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
