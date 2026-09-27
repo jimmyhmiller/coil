@@ -4433,11 +4433,11 @@ EOF
     '(defstruct Action [(value i64)])' \
     '(derive Eq Action)' \
     '(= (Action :value 1) (Action :value 1))' \
-    '(derive Debug Action)' \
+    '(derive Serialize Action)' \
     ':q' | "$REPL_COIL" repl 2>&1)
   case "$repl_ambient_derive_out" in
-    *"true"*"no deriver is registered for trait 'Debug'"*"| (derive Debug Action)"*|\
-    *"no deriver is registered for trait 'Debug'"*"| (derive Debug Action)"*"true"*)
+    *"true"*"no deriver is registered for trait 'Serialize'"*"| (derive Serialize Action)"*|\
+    *"no deriver is registered for trait 'Serialize'"*"| (derive Serialize Action)"*"true"*)
       ok "repl keeps derive ambient and diagnoses the missing trait module at the submitted form" ;;
     *) bad "repl keeps derive ambient and diagnoses the missing trait module at the submitted form" "$repl_ambient_derive_out" ;;
   esac

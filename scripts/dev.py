@@ -606,6 +606,40 @@ def test_modernize_fast(compiler: str) -> None:
             if result.returncode == 0:
                 raise RuntimeError(message)
 
+        def expect_diagnostic(path: str, needle: str) -> None:
+            # The fixture must fail for THIS reason: a bare non-zero exit would also
+            # accept a fixture broken in some unrelated way.
+            result = subprocess.run([coil, "check", path], cwd=ROOT, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            if result.returncode == 0:
+                raise RuntimeError(f"fast modernization gate: {path} compiled")
+            if needle not in result.stdout:
+                raise RuntimeError(f"fast modernization gate: {path} failed without {needle!r}:\n"
+                                   + result.stdout[:2000])
+
+        def result_flow_fix_task() -> None:
+            source = ROOT / "tests/compiler/features/result_flow_fix.coil"
+            probe = tmp / "result-flow-fix.coil"
+            probe.write_text(source.read_text())
+            before = subprocess.run([coil, "run", str(probe)], cwd=ROOT, capture_output=True, text=True)
+            if before.returncode != 0 or not before.stdout.strip():
+                raise RuntimeError("fast modernization gate: result_flow_fix.coil does not run:\n"
+                                   + before.stdout + before.stderr)
+            fixed = subprocess.run([coil, "lint", str(probe), "--fix"], cwd=ROOT,
+                                   capture_output=True, text=True)
+            if fixed.returncode != 0 or "round reverted" in fixed.stdout + fixed.stderr:
+                raise RuntimeError("fast modernization gate: result-flow fix did not apply cleanly:\n"
+                                   + fixed.stdout + fixed.stderr)
+            text = probe.read_text()
+            if "(mut owned) (try-or! (found ok) 0)" not in " ".join(text.split()):
+                raise RuntimeError("fast modernization gate: result-flow fix did not fuse a mutable rebinding")
+            if text.count("(match (found ok)") != 1:
+                raise RuntimeError("fast modernization gate: result-flow fix rewrote the wrong matches")
+            after = subprocess.run([coil, "run", str(probe)], cwd=ROOT, capture_output=True, text=True)
+            if after.returncode != 0 or after.stdout != before.stdout:
+                raise RuntimeError("fast modernization gate: result-flow fix changed behavior:\n"
+                                   + before.stdout + after.stdout + after.stderr)
+
         def cimport_task() -> None:
             bindings = tmp / "cimport-expressions.coil"
             execute(coil, "cimport", "tests/compiler/cimport/expressions.h", "-o", str(bindings))
@@ -1166,6 +1200,13 @@ source-roots = ["src"]
                               "mutable-binding-fresh-value", *backend_flags),
             lambda: expect_rejected("tests/compiler/features/struct_reference_field_rejected.coil",
                                     "fast modernization gate: a reference-typed field compiled"),
+            lambda: expect_diagnostic("tests/compiler/features/ownership_match_payload_move_rejected.coil",
+                                      "cannot move an owned value out of 'v', which is a reference"),
+            lambda: expect_diagnostic("tests/compiler/features/ownership_field_move_rejected.coil",
+                                      "cannot move an owned value out of a field or element of 'p'"),
+            lambda: expect_diagnostic("tests/compiler/features/ownership_field_take_rejected.coil",
+                                      "cannot take! an owned field or element of 'p'"),
+            result_flow_fix_task,
             lambda: build_run("src/examples/bitfields.coil", "static-assert", *backend_flags, want=42),
             lambda: build_run("tests/compiler/features/alloc_static_initial.coil",
                               "alloc-static-initial-direct", *backend_flags),
