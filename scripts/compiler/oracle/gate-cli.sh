@@ -311,6 +311,17 @@ case "$repaired" in
   *"[(ptr i8) i32]"*) bad "the repaired extern no longer declares mode as i32" "$repaired" ;;
   *) ok "the repaired extern no longer declares mode as i32" ;;
 esac
+# Only the entry module's `main` is the program entry. An imported module that
+# defines its own `main` used to replace a test file's synthesized runner, so
+# `coil test` ran the application and none of the tests.
+mkdir -p "$T/mainimport"
+printf '(module mainimport.lib)\n(defn helper [] (-> i64) 7)\n(defn main [] (-> i64) (println "LIB MAIN") 3)\n' > "$T/mainimport/lib.coil"
+printf '(module mainimport.lib-test)\n(import "mainimport.lib" :as lib)\n(deftest helper-works (assert-eq (lib/helper) 7))\n' > "$T/mainimport/lib_test.coil"
+printf '(module mainimport.entry)\n(import "mainimport.lib" :as lib)\n(defn main [] (-> i64) (lib/main))\n' > "$T/mainimport/entry.coil"
+expect_out "1 passed; 0 failed" "coil test runs the tests when an imported module defines main" \
+  bash -c 'cd "$1" && "$2" test lib_test.coil' _ "$T/mainimport" "$COIL"
+expect_rc 3 "an imported module's main is an ordinary function (lib/main)" \
+  bash -c 'cd "$1" && "$2" run entry.coil >/dev/null' _ "$T/mainimport" "$COIL"
 rm -rf "$T/default-build"
 mkdir -p "$T/default-build"
 ( cd "$T/default-build" && "$COIL" build "$T/seven.coil" >/dev/null 2>&1 )
@@ -3470,7 +3481,7 @@ combined_number_headings=$(printf '%s\n' "$combined_float" | awk '/^## Values an
 [ "$combined_number_headings" = 1 ] \
   && ok "guide: combined topics deduplicate shared source fragments" \
   || bad "guide: combined topics deduplicate shared source fragments" "Values section appeared $combined_number_headings times"
-expect_rc 1 "guide: at most three direct topics are accepted" "$COIL" guide tests modules structs match
+expect_rc 0 "guide: any number of direct topics may be combined" "$COIL" guide tests modules structs match
 guide_all=$("$COIL" guide --all 2>&1); guide_all_rc=$?
 case "$guide_all" in
   '# The Coil Language'*)
@@ -3792,7 +3803,9 @@ INSTALLED="$T/prefix/bin/coil"
   && ok "install: the prefix holds stdlib, opt-in compiler SDK, and prelude" \
   || bad "install: the prefix holds stdlib, opt-in compiler SDK, and prelude" "missing"
 expect_rc 0 "install: version output contains only the compiler version" \
-  python3 -c 'import re, subprocess, sys; p = subprocess.run([sys.argv[1], "--version"], cwd="/", capture_output=True, text=True); assert p.returncode == 0 and re.fullmatch(r"coil [^\s]+\n", p.stdout) and not p.stderr, p' "$INSTALLED"
+  python3 -c 'import re, subprocess, sys; p = subprocess.run([sys.argv[1], "--version"], cwd="/", capture_output=True, text=True); assert p.returncode == 0 and re.fullmatch(r"coil [^\s]+( \(commit [0-9a-f]{12}(, [0-9-]{10})?(, dirty)?\))?\n", p.stdout) and not p.stderr, p' "$INSTALLED"
+expect_out "^coil [^ ]+ \\(commit [0-9a-f]{12}" "install: --version names the commit the installed build came from" \
+  "$INSTALLED" --version
 expect_rc 0 "install: explicit stdlib path query returns the installed source directory" \
   python3 -c 'import pathlib, subprocess, sys; p = subprocess.run([sys.argv[1], "--print-stdlib-path"], cwd="/", capture_output=True, text=True); assert p.returncode == 0 and pathlib.Path(p.stdout.strip()).samefile(sys.argv[2]) and not p.stderr, p' "$INSTALLED" "$T/prefix/lib/coil/stdlib"
 "$COIL" namespaces > "$T/bundle/ns.txt" 2>/dev/null
@@ -3870,7 +3883,7 @@ expect_out "cannot find the coil standard library" \
 expect_rc 1 "layout: explicit stdlib path query fails when no library exists" \
   bash -c 'cd "$1" && "$1/coil" --print-stdlib-path' _ "$LONELY"
 expect_rc 0 "version: succeeds even without a standard library" \
-  python3 -c 'import re, subprocess, sys; p = subprocess.run([sys.argv[1], "--version"], cwd=sys.argv[2], capture_output=True, text=True); assert p.returncode == 0 and re.fullmatch(r"coil [^\s]+\n", p.stdout) and not p.stderr, p' "$LONELY/coil" "$LONELY"
+  python3 -c 'import re, subprocess, sys; p = subprocess.run([sys.argv[1], "--version"], cwd=sys.argv[2], capture_output=True, text=True); assert p.returncode == 0 and re.fullmatch(r"coil [^\s]+( \(commit [0-9a-f]{12}(, [0-9-]{10})?(, dirty)?\))?\n", p.stdout) and not p.stderr, p' "$LONELY/coil" "$LONELY"
 rm -rf "$LONELY"
 # The other layout, built explicitly rather than assumed of $COIL: a compiler under a
 # directory that holds src/stdlib and src/compiler belongs to that checkout. (The
@@ -4119,7 +4132,7 @@ cat > "$T/ver/unimported.coil" <<'EOF'
 EOF
 for version_arg in --version -V version; do
   expect_rc 0 "version: $version_arg prints only the compiler version" \
-    python3 -c 'import re, subprocess, sys; p = subprocess.run(sys.argv[1:], capture_output=True, text=True); assert p.returncode == 0 and re.fullmatch(r"coil [^\s]+\n", p.stdout) and not p.stderr, p' "$COIL" "$version_arg"
+    python3 -c 'import re, subprocess, sys; p = subprocess.run(sys.argv[1:], capture_output=True, text=True); assert p.returncode == 0 and re.fullmatch(r"coil [^\s]+( \(commit [0-9a-f]{12}(, [0-9-]{10})?(, dirty)?\))?\n", p.stdout) and not p.stderr, p' "$COIL" "$version_arg"
 done
 expect_out "is a local binding here" \
   "shadow: a shadowed macro is reported as a local, not as a missing import" \

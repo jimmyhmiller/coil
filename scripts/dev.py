@@ -39,11 +39,11 @@ def build(args: argparse.Namespace) -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
         if Path(compiler).resolve() == output.resolve():
             raise SystemExit("candidate output must not overwrite the stage0 compiler")
-        stamp = toolchain_stamp.digest()
+        stamp = toolchain_stamp.stamp_text()
         execute(sys.executable, str(ROOT / "scripts/compiler/stage0.py"), compiler,
                 "build", str(ROOT / "src/compiler/main.coil"), "-o", str(output),
                 *llvm_flags("dynamic"))
-        toolchain_stamp.stamp_path(output).write_text(stamp + "\n")
+        toolchain_stamp.stamp_path(output).write_text(stamp)
         print(f"built compiler candidate -> {output}")
         return
 
@@ -93,13 +93,35 @@ def verify_toolchain_pair(binary: Path) -> str:
             f"install: {binary} has no {stamp.name}, so nothing says which library "
             "sources it was built from; build it with `python3 scripts/dev.py build` "
             "(or `install --build`) so the stamp is written")
-    built = stamp.read_text().strip()
+    built = toolchain_stamp.stamp_digest(stamp.read_text())
     if built != current:
         raise SystemExit(
             f"install: {binary} was built from different library sources than this "
             "checkout's src/stdlib and src/compiler; installing it would pair the compiler "
             "with a library it was not built with. Rebuild it, or use `install --build`")
-    return current
+    return stamp.read_text()
+
+
+def refuse_downgrade(new_stamp: str, destination: Path, allow: bool) -> None:
+    """Refuse to replace an installed compiler with an older one.
+
+    Both stamps name the commit they were built from. Installing a build whose
+    commit is a strict ancestor of the installed one silently rolls every user of
+    `coil` back; it needs `--allow-downgrade`.
+    """
+    installed_stamp = toolchain_stamp.stamp_path(destination)
+    if allow or not installed_stamp.is_file():
+        return
+    new_commit = toolchain_stamp.stamp_commit(new_stamp)
+    old_commit = toolchain_stamp.stamp_commit(installed_stamp.read_text())
+    if not new_commit or not old_commit or new_commit == old_commit:
+        return
+    older = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", new_commit, old_commit],
+                           capture_output=True).returncode == 0
+    if older:
+        raise SystemExit(
+            f"install: {destination} is {old_commit[:12]}, newer than this build ({new_commit[:12]}); "
+            "refusing to downgrade. Pass --allow-downgrade to install it anyway")
 
 
 def install_library(prefix: Path) -> Path:
@@ -196,6 +218,7 @@ def install(args: argparse.Namespace) -> None:
         )
 
     stamp = verify_toolchain_pair(source)
+    refuse_downgrade(stamp, destination, getattr(args, "allow_downgrade", False))
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     # <prefix>/bin/coil -> <prefix>/lib/coil, the layout loader.coil searches for.
@@ -233,7 +256,7 @@ def install(args: argparse.Namespace) -> None:
         os.replace(staged, destination)
     finally:
         staged.unlink(missing_ok=True)
-    toolchain_stamp.stamp_path(destination).write_text(stamp + "\n")
+    toolchain_stamp.stamp_path(destination).write_text(stamp)
     print(f"installed {source} -> {destination}")
     warm_jit_unit(destination, libdir)
     report_installed(destination)
@@ -1508,6 +1531,8 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--build", action="store_true", help="run the full bootstrap before installing")
     command.add_argument("--variant", choices=("full", "nollvm", "linux", "nollvm-linux", "x64"),
                          default="full", help="bootstrap variant used with --build")
+    command.add_argument("--allow-downgrade", action="store_true",
+                         help="install even when the installed compiler was built from a newer commit")
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")

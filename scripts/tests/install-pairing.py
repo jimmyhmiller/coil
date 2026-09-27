@@ -37,5 +37,19 @@ with tempfile.TemporaryDirectory(prefix="coil-install-pairing-") as raw:
     toolchain_stamp.stamp_path(source).write_text(toolchain_stamp.digest() + "\n")
     matched = install(source, dest)
     assert matched.returncode == 0, matched
-    assert toolchain_stamp.stamp_path(dest).read_text().strip() == toolchain_stamp.digest()
+    assert toolchain_stamp.stamp_digest(toolchain_stamp.stamp_path(dest).read_text()) == toolchain_stamp.digest()
+
+    # A build from an ancestor of the installed commit is a downgrade.
+    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True,
+                          capture_output=True, check=True).stdout.strip()
+    parent = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD~1"], text=True,
+                            capture_output=True, check=True).stdout.strip()
+    toolchain_stamp.stamp_path(dest).write_text(f"{toolchain_stamp.digest()}\ncommit {head}\n")
+    toolchain_stamp.stamp_path(source).write_text(f"{toolchain_stamp.digest()}\ncommit {parent}\n")
+    older = install(source, dest)
+    assert older.returncode != 0 and "refusing to downgrade" in older.stderr, older
+    allowed = subprocess.run([sys.executable, str(ROOT / "scripts/dev.py"), "install", "--allow-downgrade",
+                              "--source", str(source), "--dest", str(dest)],
+                             cwd=ROOT, text=True, capture_output=True, timeout=600)
+    assert allowed.returncode == 0, allowed
 print("install pairing: PASS")
