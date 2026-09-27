@@ -210,10 +210,14 @@
 ; everything that reasons about impls (specificity, selection), one per type. Mono
 ; already had `ImplDef`; check now uses it too, so those functions exist once and both
 ; phases share them.
+; `place_breaks` holds the value of every break so far whose type is the place
+; recorded in `break_ty`. A later break that joins it at the value re-types the loop
+; and loads each of them in place (see `join-branch-types`).
 (defstruct LoopFrame
   [(label (Option (slice u8)))
    (break_ty (Option Type))
-   (expected (Option Type))])
+   (expected (Option Type))
+   (place_breaks (ArrayList (ptr Expr)))])
 
 ; `bid` is the local-binding identity (see comptime.coil binding-map): a fresh id
 ; per let-binding / parameter, so `(primitive/binding-of REF)` distinguishes shadows.
@@ -3878,7 +3882,7 @@
                                      (push! (mut out) ee))))))
                       (match (do-synth-recorded a
                                     ep
-                                    (primitive/cast (ptr Type) 0)
+                                    (discard-expected a)
                                     env
                                     cx
                                     tps
@@ -4343,7 +4347,8 @@
                 (cx (ptr Cx))
                 (tps (ptr (ArrayList (slice u8))))
                 (fname (slice u8))] (-> (Result SynPair Diag))
-  (let [cacheable
+  (let [expected (effective-expected e expected)
+        cacheable
           (match (.kind e)
             (EInt [_] true)
             (EFloat [_] true)
@@ -4378,6 +4383,30 @@
 
 (defn null-type [] (-> (ptr Type))
   (primitive/cast (ptr Type) 0))
+
+; A statement's value is discarded, so a statement is checked against void: the
+; "discard" expectation. Only the forms that route a value through branches or a
+; body — if, match, loop, do, let — use it, so their branches need not agree and a
+; loop may end with a bare (break). Every other expression is synthesized with no
+; expectation (void carries nothing to infer from; unifying a generic result with
+; it would make void a type argument) and its value is then dropped by `coerce`.
+(defn discard-expected [(a (dyn Allocator))] (-> (ptr Type))
+  (box-type a (TVoid)))
+
+(defn discard-carrier? [(e (ptr Expr))] (-> bool)
+  (match (.kind e)
+    (EIf [_ _ _] true)
+    (EMatch [_ _] true)
+    (ELoop [_ _] true)
+    (EDo [_] true)
+    (ELet [_ _] true)
+    (_ false)))
+
+(defn effective-expected [(e (ptr Expr)) (expected (ptr Type))] (-> (ptr Type))
+  (if (and (expected-some? expected)
+           (and (type-is-void expected) (not (discard-carrier? e))))
+      (null-type)
+      expected))
 
 ; A literal made entirely of constants supported by every static-data backend
 ; can be materialized from static data. The receiving array is still a fresh
@@ -5600,6 +5629,36 @@
                               (ty-str a x))
                      (sconcat a " vs " (sconcat a (ty-str a y) ")"))))))
 
+; A place `(ref T)`/`(mut T)` joined with a value `T` joins at the value, and so do
+; two places that disagree only in mutability. An owning aggregate `let` is a
+; `(ref T)` place and a constructed temporary a `(mut T)` one, so
+; `(if c (let [x (make)] x) (make))` has one of each; so does a `block` whose tail
+; names a local while a `return-from` carries a fresh value, which is how `try-or!`
+; over an aggregate `Ok` payload used to fail. A place side is loaded, exactly as
+; `coerce` does when an annotation supplies `T`, so an owner moves out and a
+; borrowed owner is still rejected by the affine pass. Null means no join.
+(defn place-decays-to? [(place (ptr Type)) (value (ptr Type))] (-> bool)
+  (and (= (type-tag place) (primitive/cast i64 5))
+       (and (!= (type-tag value) (primitive/cast i64 5))
+            (type-eq (t-inner place) value))))
+
+(defn join-branch-types [(x (ptr Type)) (y (ptr Type))] (-> (ptr Type))
+  (cond (type-eq x y) x
+        (place-decays-to? x y) y
+        (place-decays-to? y x) x
+        (and (and (= (type-tag x) (primitive/cast i64 5))
+                  (= (type-tag y) (primitive/cast i64 5)))
+             (type-eq (t-inner x) (t-inner y)))
+          (t-inner x)
+        :else (primitive/cast (ptr Type) 0)))
+
+(defn load-place-expr [(a (dyn Allocator)) (e (ptr Expr))] (-> Expr)
+  (mk-expr (ELoad (box-expr a (load e)))
+           (load (field e lo))
+           (load (field e hi))
+           (load (field e source))
+           (load (field e ctxt))))
+
 ; unify_branches: fill `out` with coerced exprs, return target type.
 (defn unify-branches [(a (dyn Allocator))
                       (branches (ptr (ArrayList Branch)))
@@ -5621,11 +5680,19 @@
                   (when (and (not (is-literal be)) (not (type-is-never bt)))
                     (if (not (load have))
                         (do (store! have true) (store! concrete bt) 0)
-                        (when (not (type-eq (load concrete) bt))
-                          (store! err
-                                  (mismatch-msg a (load concrete) bt fname what))
-                          (store! failed true)
-                          (break)))))
+                        (let [joined (join-branch-types (load concrete) bt)]
+                          (if (= (primitive/cast i64 joined)
+                                 (primitive/cast i64 0))
+                              (do
+                                (store! err
+                                        (mismatch-msg a
+                                                      (load concrete)
+                                                      bt
+                                                      fname
+                                                      what))
+                                (store! failed true)
+                                (break))
+                              (do (store! concrete joined) 0))))))
                 (set! i (primitive/iadd (load i) 1)))))
     (if (load failed)
         (Err [Type Diag] (load err))
@@ -5655,29 +5722,32 @@
                         (let [bp (al-elem [Branch] branches (load k))
                               be (load (field bp e))
                               bt (load (field bp t))]
-                          (if (or (type-eq bt (load target)) (type-is-never bt))
-                              (push! [Expr] out (load be))
-                              (if (and (same-number-kind bt (load target))
-                                       (is-literal be))
-                                  (match (coerce-lit a
-                                                     (load be)
-                                                     (load target)
-                                                     fname)
-                                    (Err [d]
-                                         (do
-                                           (set! err2 d)
-                                           (set! failed2 true)
-                                           (break)))
-                                    (Ok [ce] (push! [Expr] out ce)))
-                                  (do
-                                    (set! err2
-                                          (mismatch-msg a
-                                                        bt
-                                                        (load target)
-                                                        fname
-                                                        what))
-                                    (set! failed2 true)
-                                    (break)))))
+                          (cond (or (type-eq bt (load target)) (type-is-never bt))
+                                  (push! [Expr] out (load be))
+                                (place-decays-to? bt (load target))
+                                  (push! [Expr] out (load-place-expr a be))
+                                :else
+                                  (if (and (same-number-kind bt (load target))
+                                           (is-literal be))
+                                      (match (coerce-lit a
+                                                         (load be)
+                                                         (load target)
+                                                         fname)
+                                        (Err [d]
+                                             (do
+                                               (set! err2 d)
+                                               (set! failed2 true)
+                                               (break)))
+                                        (Ok [ce] (push! [Expr] out ce)))
+                                      (do
+                                        (set! err2
+                                              (mismatch-msg a
+                                                            bt
+                                                            (load target)
+                                                            fname
+                                                            what))
+                                        (set! failed2 true)
+                                        (break)))))
                         (set! k (primitive/iadd (load k) 1)))))
             (if (load failed2)
                 (Err [Type Diag] (load err2))
@@ -5886,13 +5956,38 @@
     (Ok [sp0]
         (let [sp (primitive/alloc-stack SynPair)]
           (set! sp sp0)
-          (coerce a
-                  (load (load (field sp e)))
-                  (load (field sp t))
-                  want
-                  false
-                  fname
-                  what)))))
+          (match (coerce a
+                         (load (load (field sp e)))
+                         (load (field sp t))
+                         want
+                         false
+                         fname
+                         what)
+            (Err [d] (Err [Expr Diag] d))
+            (Ok [ce]
+                (if (discarded-value? want (load (field sp t)))
+                    (Ok (discard-value a ce))
+                    (Ok ce))))))))
+
+; A value checked against void is discarded (a statement, or a branch of one).
+; Its branches may have different types, so each becomes `(do value (do))`: the
+; value is evaluated for effect and the branch yields the canonical unit, which
+; is what every backend already produces for an empty body.
+(defn discarded-value? [(want (ptr Type)) (actual (ptr Type))] (-> bool)
+  (and (expected-some? want)
+       (and (type-is-void want)
+            (not (or (type-is-void actual)
+                     (or (type-is-never actual)
+                         (match (load actual) (TError [] true) (_ false))))))))
+
+(defn discard-value [(a (dyn Allocator)) (e Expr)] (-> Expr)
+  (let [(mut items) (al-new [Expr] a)]
+    (push! (mut items) e)
+    (push! (mut items)
+           (mk-expr (EDo (box-al [Expr] a (al-new [Expr] a)))
+                    (.lo e) (.hi e) (.source e) (.ctxt e)))
+    (mk-expr (EDo (box-al [Expr] a (load items)))
+             (.lo e) (.hi e) (.source e) (.ctxt e))))
 
  ; Function-pointer return positions describe an ABI, not a value argument.
  ; R may denote void here; the ordinary unifier still rejects a void expression
@@ -7303,14 +7398,39 @@
                   ""))]
     (if (= (len wdname) (primitive/cast i64 0))
         (Ok (mk-synpair a ae at))
-        (if (and (type-is-ptr at)
-                 (not (and (= (type-tag (t-inner at)) (primitive/cast i64 6))
-                           (= (type-struct-name (t-inner at)) wdname))))
-            (let [tr (dyn-struct-trait cx wdname)]
-              (if (> (len tr) (primitive/cast i64 0))
+        (let [tr (dyn-struct-trait cx wdname)
+              at-tag (type-tag at)
+              is-self-dyn (and (or (= at-tag (primitive/cast i64 4))
+                                   (= at-tag (primitive/cast i64 5)))
+                               (and (= (type-tag (t-inner at)) (primitive/cast i64 6))
+                                    (= (type-struct-name (t-inner at)) wdname)))]
+          (cond (or (= (len tr) (primitive/cast i64 0)) is-self-dyn)
+                  (Ok (mk-synpair a ae at))
+                (type-is-ptr at)
                   (build-make-dyn a cx tr ae at lo hi src ctxt fname)
-                  (Ok (mk-synpair a ae at))))
-            (Ok (mk-synpair a ae at))))))
+                ; A mutable borrow of a place is the same address a pointer would
+                ; be, so `(mut local)` erases to a trait object too. The methods
+                ; receive `(ptr Self)` and may write through it, which is why an
+                ; immutable borrow does not.
+                (= at-tag (primitive/cast i64 5))
+                  (match (load at)
+                    (TRef [mutable pointee]
+                          (if mutable
+                              (build-make-dyn a cx tr ae (box-type a (TPtr pointee)) lo hi src ctxt fname)
+                              (Err [SynPair Diag]
+                                   (derr-at-src src
+                                                lo
+                                                hi
+                                                (sconcat a
+                                                         (sconcat5 a
+                                                                   "in '"
+                                                                   fname
+                                                                   "': a (dyn "
+                                                                   (display-name tr)
+                                                                   ") can write through its receiver, so it needs a mutable borrow: pass (mut …) instead of ")
+                                                         (ty-str a at))))))
+                    (_ (Ok (mk-synpair a ae at))))
+                :else (Ok (mk-synpair a ae at)))))))
 
 ; synth_construct
 (defn variant-in-sum [(si (ptr SumInfo)) (variant (slice u8))] (-> (ptr Variant))
@@ -10693,7 +10813,7 @@
                                 (push! [Expr] out (load (load (field sp e))))))))
                     (match (do-synth a
                                      (al-elem [Expr] body (load i))
-                                     (null-type)
+                                     (discard-expected a)
                                      env
                                      cx
                                      tps
@@ -10831,17 +10951,7 @@
                     (let [borrowed (is-mut-borrow (field bp value))
                           src_mut (t-ref-mut vt)
                           pointee (t-inner vt)]
-                      (cond (and mutable (not src_mut))
-                              (Err [i64 Diag]
-                                   (derr (sconcat1 a
-                                                   (sconcat4 a
-                                                             "in '"
-                                                             fname
-                                                             "': cannot make a mutable alias '"
-                                                             (sconcat a
-                                                                      name
-                                                                      "' of an immutable reference")))))
-                            ; A bare affine owner moves out of its old place and is
+                      (cond ; A bare affine owner moves out of its old place and is
                             ; materialized in a fresh owning slot. Legacy aggregate
                             ; places retain Coil's historical view semantics.
                             (and (not borrowed) (binding-may-own? a cx pointee))
@@ -10864,6 +10974,19 @@
                                                    esrc
                                                    ectxt)
                                 (Ok [i64 Diag] 0))
+                            ; Anything else bound mutably through an immutable
+                            ; reference would be a writable alias of a place the
+                            ; source cannot write.
+                            (and mutable (not src_mut))
+                              (Err [i64 Diag]
+                                   (derr (sconcat1 a
+                                                   (sconcat4 a
+                                                             "in '"
+                                                             fname
+                                                             "': cannot make a mutable alias '"
+                                                             (sconcat a
+                                                                      name
+                                                                      "' of an immutable reference")))))
                             ; A freshly built value is nobody else's place, so a mutable
                             ; binding owns a copy of it. `(let [(mut r) (Rect :w 1 :h 2)])`
                             ; is the ordinary way to start a mutable local.
@@ -11576,6 +11699,7 @@
     (set! (.break_ty fr) (None [Type]))
     (set! (.expected fr)
           (if (expected-some? expected) (Some (load expected)) (None [Type])))
+    (set! (.place_breaks fr) (al-new [(ptr Expr)] a))
     (push! [LoopFrame] (field cx loops) (load fr)))
   (let [n (len (load body))
         (mut i) 0
@@ -11586,7 +11710,7 @@
               (do
                 (match (do-synth a
                                  (al-elem [Expr] body (load i))
-                                 (null-type)
+                                 (discard-expected a)
                                  env
                                  cx
                                  tps
@@ -11634,6 +11758,19 @@
     (match (run-loop-body a label body expected outl env cx tps fname)
       (Err [d] (err-ep d))
       (Ok [lty] (ok-ep (mk-expr (ELoop label outl) elo ehi esrc ectxt) lty)))))
+
+; A value-carrying break whose type is a place is remembered, so that a later
+; break joining the loop at the value can load it (see `join-branch-types`).
+(defn record-place-break! [(cx (ptr Cx))
+                           (idx i64)
+                           (have_val bool)
+                           (vty (ptr Type))
+                           (valexpr (ptr Expr))] (-> i64)
+  (when (and have_val (= (type-tag vty) (primitive/cast i64 5)))
+    (push! [(ptr Expr)]
+           (field (al-elem [LoopFrame] (field cx loops) idx) place_breaks)
+           valexpr)
+    0))
 
 (defn synth-break [(a (dyn Allocator))
                    (label (Option (slice u8)))
@@ -11708,7 +11845,11 @@
                          0))
                  (None []
                        (match (load texp)
+                         ; A bare (break) leaves a loop whose value is discarded.
                          (Some [exp]
+                               (when (type-is-void (box-type a exp))
+                                 (store! vty (box-type a exp))
+                                 0)
                                (when (not (type-eq (box-type a exp) (load vty)))
                                  (break :try
                                           (err-ep (derr (sconcat a
@@ -11726,22 +11867,46 @@
                  (match (load (field (al-elem [LoopFrame] (field cx loops) idx)
                                      break_ty))
                    (Some [prev]
-                         (when (not (type-eq (box-type a prev) (load vty)))
-                           (break :try
-                                    (err-ep (derr (sconcat a
-                                                           (sconcat a
-                                                                    (sconcat a
-                                                                             (sconcat4 a
-                                                                                       "in '"
-                                                                                       fname
-                                                                                       "': loop breaks with different value types ("
-                                                                                       (ty-str a
-                                                                                               (box-type a
-                                                                                                         prev)))
-                                                                             " vs ")
-                                                                    (ty-str a
-                                                                            (load vty)))
-                                                           ")"))))))
+                         (let [pt (box-type a prev)
+                               joined (join-branch-types pt (load vty))]
+                           (when (= (primitive/cast i64 joined)
+                                    (primitive/cast i64 0))
+                             (break :try
+                                      (err-ep (derr (sconcat a
+                                                             (sconcat a
+                                                                      (sconcat a
+                                                                               (sconcat4 a
+                                                                                         "in '"
+                                                                                         fname
+                                                                                         "': loop breaks with different value types ("
+                                                                                         (ty-str a
+                                                                                                 pt))
+                                                                               " vs ")
+                                                                      (ty-str a
+                                                                              (load vty)))
+                                                             ")")))))
+                           ; Earlier breaks were places and the loop now joins at
+                           ; the value: load each of them where it stands.
+                           (when (not (type-eq joined pt))
+                             (let [fp (al-elem [LoopFrame] (field cx loops) idx)]
+                               (for p (iter (field fp place_breaks))
+                                 (store! p (load-place-expr a p)))
+                               (al-clear! (field fp place_breaks))
+                               (store! (field fp break_ty) (Some (load joined)))
+                               0))
+                           (if (place-decays-to? (load vty) joined)
+                               (do
+                                 (store! valexpr
+                                         (box-expr a
+                                                   (load-place-expr a
+                                                                    (load valexpr))))
+                                 (store! vty joined)
+                                 0)
+                               (record-place-break! cx
+                                                    idx
+                                                    (load have_val)
+                                                    (load vty)
+                                                    (load valexpr)))))
                    (None []
                          (do
                            (store! (field (al-elem [LoopFrame]
@@ -11749,7 +11914,11 @@
                                                    idx)
                                           break_ty)
                                    (Some (load (load vty))))
-                           0))))
+                           (record-place-break! cx
+                                                    idx
+                                                    (load have_val)
+                                                    (load vty)
+                                                    (load valexpr))))))
                (ok-ep (mk-expr (EBreak label
                                        (if (load have_val)
                                            (Some (load valexpr))
@@ -12190,6 +12359,14 @@
          (let [csp0 (try! (do-synth a cnd (null-type) env cx tps fname))
                csp (primitive/alloc-stack SynPair)]
            (store! csp csp0)
+           ; A `(mut b)` local is a place; the condition reads its value, as
+           ; every other value position does.
+           (when (and (= (type-tag (load (field csp t))) (primitive/cast i64 5))
+                      (is-cond (t-inner (load (field csp t)))))
+             (store! (field csp e)
+                     (box-expr a (load-place-expr a (load (field csp e)))))
+             (store! (field csp t) (t-inner (load (field csp t))))
+             0)
            (when (not (is-cond (load (field csp t))))
              (break :try
                       (err-ep (derr (sconcat a
@@ -12425,6 +12602,15 @@
         0))
     (load out)))
 
+;;; Is `e` a place inside a spilled temporary: `(.a (.b (f)))` checks to field
+;;; projections and loads over `ESpillRef`.
+(defn place-in-spilled-temporary? [(e (ptr Expr))] (-> bool)
+  (match (.kind e)
+    (EField [p _] (place-in-spilled-temporary? p))
+    (ELoad [inner] (place-in-spilled-temporary? inner))
+    (ESpillRef [_] true)
+    (_ false)))
+
 (defn synth-field [(a (dyn Allocator))
                    (pp (ptr Expr))
                    (ffld (slice u8))
@@ -12482,6 +12668,26 @@
                                                     (load (load (field sp e)))
                                                     (no-extra-args a) ffld (null-type) env tps fname
                                                     elo ehi esrc ectxt))))
+               ; `(.name value)` on a struct value that is not a place: a call
+               ; result, a `for` element, a match payload. Spill it to a frame
+               ; temporary and read through that. The borrow is immutable, so a
+               ; write through the temporary is rejected like any other.
+               (when (and accessor
+                          (and (is-struct-or-app (load pt))
+                               (has-real-field? a cx (load pt) ffld)))
+                 (let [value-type (load pt)]
+                   (set! checked-base
+                         (box-expr a
+                                   (mk-expr (ESpillRef (box-expr a (load checked-base)))
+                                            elo
+                                            ehi
+                                            esrc
+                                            ectxt)))
+                   (set! pt (box-type a (TRef false (box-type a value-type))))
+                   (set! pointee (place-pointee (load pt)))
+                   0)))
+             (when (= (primitive/cast i64 (load pointee))
+                      (primitive/cast i64 0))
                (break :try
                         (err-ep (derr (sconcat a
                                                (sconcat a
@@ -12616,6 +12822,13 @@
                                                      fname
                                                      "': store! expects a pointer or reference, got ")
                                            (ty-str a pt))))))
+         (when (and (not (is-writable pt))
+                    (place-in-spilled-temporary? (box-expr a place)))
+           (break :try
+                    (err-ep (derr (sconcat3 a
+                                            "in '"
+                                            fname
+                                            "': cannot assign to a field of a temporary value; bind it with `(let [(mut v) …])` and assign to that")))))
          (when (not (is-writable pt))
            (break :try
                     (err-ep (derr (sconcat a
@@ -12725,6 +12938,16 @@
                                 initializing
                                 env cx tps fname elo ehi esrc ectxt)))))
 
+;;; A constructor pattern may name a generic struct without its type arguments:
+;;; `(Indexed :index i)` matches any `(Indexed T)`, which the value supplies.
+(defn bare-generic-pattern? [(ty Type) (value-type (ptr Type))] (-> bool)
+  (match ty
+    (TStruct [name]
+             (match (load value-type)
+               (TApp [vname _] (= name vname))
+               (_ false)))
+    (_ false)))
+
 (defn synth-pattern [(a (dyn Allocator))
                      (op i64)
                      (ty Type)
@@ -12746,7 +12969,7 @@
              checked (.e holder)]
          (if (or (= op 0) (= op 4))
              (do
-               (when (= op 0)
+               (when (and (= op 0) (not (bare-generic-pattern? ty value-type)))
                  (try! (validate-type (box-type a ty) cx tps))
                  (unless (and (match ty
                                 (TStruct [name]
@@ -13000,12 +13223,22 @@
                                                                    (= etg
                                                                       (primitive/cast i64
                                                                                       4)))
-                                                              (and (= tt
-                                                                      (primitive/cast i64
-                                                                                      4))
-                                                                   (= etg
-                                                                      (primitive/cast i64
-                                                                                      10))))))))))))]
+                                                              (or (and (= tt
+                                                                          (primitive/cast i64
+                                                                                          4))
+                                                                       (= etg
+                                                                          (primitive/cast i64
+                                                                                          10)))
+                                                                  ; A borrow is an address. Casting one to a
+                                                                  ; raw pointer is the explicit way to hand a
+                                                                  ; local's storage to code that takes a
+                                                                  ; `(ptr T)`, such as a C function.
+                                                                  (and (= tt
+                                                                          (primitive/cast i64
+                                                                                          4))
+                                                                       (= etg
+                                                                          (primitive/cast i64
+                                                                                          5)))))))))))))]
                     (if ok
                         (ok-ep (mk-expr (ECast ty (load (field sp e)))
                                         elo
@@ -13019,7 +13252,7 @@
                                                                  (sconcat4 a
                                                                            "in '"
                                                                            fname
-                                                                           "': cast only converts among int, float, and ptr (got "
+                                                                           "': cast only converts among int, float, and ptr, or a borrow to a ptr (got "
                                                                            (ty-str a
                                                                                    et))
                                                                  " to ")
@@ -14124,7 +14357,18 @@
                    (let [sp (primitive/alloc-stack SynPair)]
                      (set! sp sp0)
                      (let [pp (place-pointee (load (field sp t)))]
-                       (cond (!= (primitive/cast i64 pp) (primitive/cast i64 0))
+                       (cond (and (!= (primitive/cast i64 pp) (primitive/cast i64 0))
+                                  (and (place-in-spilled-temporary? (load (field sp e)))
+                                       (type-needs-drop a cx pp)))
+                               (err-ep (derr (sconcat a
+                                                      (sconcat3 a
+                                                                "in '"
+                                                                fname
+                                                                "': cannot move an owning ")
+                                                      (sconcat a
+                                                               (ty-str a pp)
+                                                               " out of a temporary; bind the value with `let`, then clone or take! the field"))))
+                             (!= (primitive/cast i64 pp) (primitive/cast i64 0))
                                (ok-ep (mk-expr (ELoad (load (field sp e)))
                                                elo
                                                ehi
@@ -14361,7 +14605,8 @@
              (cx (ptr Cx))
              (tps (ptr (ArrayList (slice u8))))
              (fname (slice u8))] (-> (Result EvalPair Diag))
-  (let [dynt (if (expected-some? expected) (is-dyn-target expected cx) false)]
+  (let [expected (effective-expected e expected)
+        dynt (if (expected-some? expected) (is-dyn-target expected cx) false)]
     (match (synth-inner a e expected env cx tps fname)
       (Err [d]
            (err-ep (dwspan d
@@ -15122,7 +15367,7 @@
                 (_ (primitive/cast (ptr MoveState) 0))))))))
 
 ; Type of a place projection rooted in `root-type`. Whole-binding move checking
-; deliberately treats a consumed projection as consuming its owner; overwrite
+; rejects a move out of a projection (see `ownership-require-movable`); overwrite
 ; still needs the narrower projected type so it destroys exactly the replaced
 ; field or array element.
 (defn ownership-place-type [(a (dyn Allocator))
@@ -15796,6 +16041,11 @@
                                                                    loops
                                                                    fname
                                                                    false))
+                                        (try! (ownership-require-whole-take a
+                                                                            cx
+                                                                            place
+                                                                            states
+                                                                            fname))
                                         (try! (ownership-consume-root! a
                                                                        place
                                                                        states
@@ -15809,6 +16059,11 @@
                                                              loops
                                                              fname
                                                              false))
+                                  (try! (ownership-require-whole-take a
+                                                                      cx
+                                                                      arg
+                                                                      states
+                                                                      fname))
                                   (try! (ownership-consume-root! a
                                                                  arg
                                                                  states
@@ -15867,6 +16122,97 @@
 ; pair used by checked `let` bindings around the complete call expression. The
 ; call result is preserved by ECleanup while the temporary is destroyed after
 ; the borrow ends.
+(defn ownership-bind-owned-spill! [(a (dyn Allocator))
+                                   (cx (ptr Cx))
+                                   (anchor (ptr Expr))
+                                   (arg (ptr Expr))
+                                   (index i64)
+                                   (binds (ptr (ArrayList Bind)))
+                                   (states (ptr (ArrayList MoveState)))] (-> bool)
+  (match (.kind arg)
+    (ESpillRef [inner]
+               (if (or (!= (primitive/cast i64 (ownership-root-state inner states))
+                           0)
+                       (not (ownership-expr-needs-drop a cx inner)))
+                   false
+                   (match (ownership-expr-type a cx inner)
+                     (None [] false)
+                     (Some [owner-type]
+                           (let [name
+                                   (sconcat a
+                                            (sconcat a
+                                                     "$borrow.temp."
+                                                     (i64->str a (.node-id anchor)))
+                                            (sconcat a "." (i64->str a index)))
+                                 slot (sconcat a name ".slot")
+                                 bid (next-bid)
+                                 ownerp (box-type a owner-type)
+                                 (mut init) (al-new [Expr] a)]
+                             (push! [Bind]
+                                    binds
+                                    (mk-bind slot
+                                             false
+                                             (mk-expr (EAlloc
+                                                        :symbol (None)
+                                                        :storage 3
+                                                        :ty owner-type
+                                                        :init
+                                                          (primitive/cast (ptr Expr) 0))
+                                                      (.lo arg)
+                                                      (.hi arg)
+                                                      (.source arg)
+                                                      (.ctxt arg))))
+                             (push! [Expr]
+                                    (mut init)
+                                    (mk-expr (EStore (box-expr a
+                                                               (mk-expr (EVar slot)
+                                                                        (.lo arg)
+                                                                        (.hi arg)
+                                                                        (.source arg)
+                                                                        (.ctxt arg)))
+                                                     (box-expr a (load inner)))
+                                             (.lo arg)
+                                             (.hi arg)
+                                             (.source arg)
+                                             (.ctxt arg)))
+                             (push! [Expr]
+                                    (mut init)
+                                    (mk-expr (EVar slot)
+                                             (.lo arg)
+                                             (.hi arg)
+                                             (.source arg)
+                                             (.ctxt arg)))
+                             (let [owner (primitive/alloc-stack Bind)]
+                               (set! owner
+                                     (mk-bind name
+                                              false
+                                              (mk-expr (EDo (box-al [Expr]
+                                                                    a
+                                                                    (load init)))
+                                                       (.lo arg)
+                                                       (.hi arg)
+                                                       (.source arg)
+                                                       (.ctxt arg))))
+                               (set! (.bid owner) bid)
+                               (set! (.owned_type owner) ownerp)
+                               (push! [Bind] binds (load owner)))
+                             (set! (.kind arg) (EVar name))
+                             true)))))
+    (_ false)))
+
+; Wrap `e` in the let that owns the temporaries `binds` introduced, so each is
+; destroyed once `e` has finished with it.
+(defn ownership-wrap-in-binds! [(a (dyn Allocator))
+                                (e (ptr Expr))
+                                (binds (ptr (ArrayList Bind)))] (-> i64)
+  (let [(mut body) (al-new [Expr] a)
+        saved (load e)]
+    (push! [Expr] (mut body) saved)
+    (set! (.kind e)
+          (ELet (box-al [Bind] a (load binds))
+                (box-al [Expr] a (load body))))
+    0))
+
 (defn ownership-wrap-borrowed-rvalues! [(a (dyn Allocator))
                                         (cx (ptr Cx))
                                         (call (ptr Expr))
@@ -15875,93 +16221,35 @@
   (let [(mut binds) (al-new [Bind] a)
         (mut changed) false]
     (for [i 0 (len (load args))]
-      (let [arg (al-elem [Expr] args i)]
-        (match (.kind arg)
-          (ESpillRef [inner]
-                     (if (or (!= (primitive/cast i64
-                                                 (ownership-root-state inner
-                                                                       states))
-                                 0)
-                             (not (ownership-expr-needs-drop a cx inner)))
-                         0
-                         (match (ownership-expr-type a cx inner)
-                           (None [] 0)
-                           (Some [owner-type]
-                                 (let [name
-                                         (sconcat a
-                                                  (sconcat a
-                                                           "$borrow.temp."
-                                                           (i64->str a
-                                                                     (.node-id call)))
-                                                  (sconcat a "." (i64->str a i)))
-                                       slot (sconcat a name ".slot")
-                                       bid (next-bid)
-                                       ownerp (box-type a owner-type)
-                                       (mut init) (al-new [Expr] a)]
-                                   (push! [Bind]
-                                          (mut binds)
-                                          (mk-bind slot
-                                                   false
-                                                   (mk-expr (EAlloc
-                                                              :symbol (None)
-                                                              :storage 3
-                                                              :ty owner-type
-                                                              :init
-                                                                (primitive/cast (ptr Expr)
-                                                                                0))
-                                                            (.lo arg)
-                                                            (.hi arg)
-                                                            (.source arg)
-                                                            (.ctxt arg))))
-                                   (push! [Expr]
-                                          (mut init)
-                                          (mk-expr (EStore (box-expr a
-                                                                     (mk-expr (EVar slot)
-                                                                              (.lo arg)
-                                                                              (.hi arg)
-                                                                              (.source arg)
-                                                                              (.ctxt arg)))
-                                                           (box-expr a
-                                                                     (load inner)))
-                                                   (.lo arg)
-                                                   (.hi arg)
-                                                   (.source arg)
-                                                   (.ctxt arg)))
-                                   (push! [Expr]
-                                          (mut init)
-                                          (mk-expr (EVar slot)
-                                                   (.lo arg)
-                                                   (.hi arg)
-                                                   (.source arg)
-                                                   (.ctxt arg)))
-                                   (let [owner (primitive/alloc-stack Bind)]
-                                     (set! owner
-                                           (mk-bind name
-                                                    false
-                                                    (mk-expr (EDo (box-al [Expr]
-                                                                          a
-                                                                          (load init)))
-                                                             (.lo arg)
-                                                             (.hi arg)
-                                                             (.source arg)
-                                                             (.ctxt arg))))
-                                     (set! (.bid owner) bid)
-                                     (set! (.owned_type owner) ownerp)
-                                     (push! [Bind] (mut binds) (load owner)))
-                                   (set! (.kind arg)
-                                         (EVar name))
-                                   (set! changed true)
-                                   0)))))
-          (_ 0))))
-    (if (not (load changed))
+      (when (ownership-bind-owned-spill! a cx call (al-elem [Expr] args i) i (mut binds) states)
+        (set! changed true)
+        0))
+    (when (load changed)
+      (ownership-wrap-in-binds! a call (mut binds)))
+    (load changed)))
+
+; The spilled struct value under a `.field` read, if any: `(.x (.origin (f)))`
+; checks to loads and field projections over `ESpillRef(f)`.
+(defn ownership-field-read-spill [(e (ptr Expr))] (-> (ptr Expr))
+  (match (.kind e)
+    (EField [p _] (ownership-field-read-spill p))
+    (ELoad [inner] (ownership-field-read-spill inner))
+    (ESpillRef [_] e)
+    (_ (primitive/cast (ptr Expr) 0))))
+
+; A field read from an owning temporary gives the temporary a lexical owner, the
+; same pair a borrowed call argument gets, so it is destroyed after the read.
+(defn ownership-wrap-field-read-temporary! [(a (dyn Allocator))
+                                            (cx (ptr Cx))
+                                            (e (ptr Expr))
+                                            (states (ptr (ArrayList MoveState)))] (-> bool)
+  (let [spill (ownership-field-read-spill e)]
+    (if (= (primitive/cast i64 spill) (primitive/cast i64 0))
         false
-        (let [(mut body) (al-new [Expr] a)
-              saved (load call)]
-          (push! [Expr] (mut body) saved)
-          (set! (.kind call)
-                (ELet (box-al [Bind] a (load binds))
-                      (box-al [Expr] a (load body))))
-          true))))
+        (let [(mut binds) (al-new [Bind] a)]
+          (if (ownership-bind-owned-spill! a cx e spill 0 (mut binds) states)
+              (do (ownership-wrap-in-binds! a e (mut binds)) true)
+              false)))))
 
 ; Replace the value in an initialized owning place: evaluate both operands once
 ; and in source order, run the old value's drop glue, then store. The replacement
@@ -16187,6 +16475,266 @@
         0))
     (ownership-walk-list a cx items states loops fname tail-consumes)))
 
+; Ownership is tracked per binding, so an owner can move only as a whole binding
+; or as an rvalue. Loading one out of a reference, or out of a field or element of
+; an owner, would leave the real owner running its drop glue over the moved value:
+; a double drop, and a use after drop when the moved copy is still live. A match
+; on a named value binds its payload by reference, so this is also what rejects
+; moving a payload out of `(match r (Ok [v] v) …)`. `take!` is the sanctioned move
+; out of a mutable binding (not out of part of one: see
+; `ownership-require-whole-take`), and raw pointers never own their pointees.
+; Would the root owner's drop glue destroy what `place` holds? Only if every
+; enclosing part on the way down has glue of its own: a `ManuallyDrop` never drops
+; its field, so moving that field out is exactly what it is for.
+(defn ownership-glue-reaches? [(a (dyn Allocator))
+                               (cx (ptr Cx))
+                               (place (ptr Expr))
+                               (root-type (ptr Type))] (-> bool)
+  (match (.kind place)
+    (EField [base _] (ownership-glue-covers? a cx base root-type))
+    (EIndex [base _] (ownership-glue-covers? a cx base root-type))
+    (ELoad [inner] (ownership-glue-reaches? a cx inner root-type))
+    (ESpillRef [inner] (ownership-glue-reaches? a cx inner root-type))
+    (EMovePlace [inner] (ownership-glue-reaches? a cx inner root-type))
+    (_ true)))
+
+(defn ownership-glue-covers? [(a (dyn Allocator))
+                              (cx (ptr Cx))
+                              (place (ptr Expr))
+                              (root-type (ptr Type))] (-> bool)
+  (and (match (ownership-place-type a cx place root-type)
+         (Some [t]
+               (let [tp (primitive/alloc-stack Type)]
+                 (set! tp t)
+                 (type-needs-drop a cx tp)))
+         (None [] true))
+       (ownership-glue-reaches? a cx place root-type)))
+
+; `take!` leaves its place uninitialized, which whole-binding tracking can record
+; only for a whole binding: taking a field or element of an owner would leave the
+; owner's drop glue to destroy the taken value a second time.
+(defn ownership-require-whole-take [(a (dyn Allocator))
+                                    (cx (ptr Cx))
+                                    (place (ptr Expr))
+                                    (states (ptr (ArrayList MoveState)))
+                                    (fname (slice u8))] (-> (Result i64 Diag))
+  (let [owner (ownership-root-state place states)]
+    (if (or (= (primitive/cast i64 owner) (primitive/cast i64 0))
+            (!= (primitive/cast i64 (ownership-root-var place))
+                (primitive/cast i64 0))
+            (not (ownership-glue-reaches? a cx place (.ty owner))))
+        (Ok [i64 Diag] 0)
+        (match (ownership-place-type a cx place (.ty owner))
+          (Some [t]
+                (let [tp (primitive/alloc-stack Type)]
+                  (set! tp t)
+                  (if (type-needs-drop a cx tp)
+                      (Err [i64 Diag]
+                           (derr-at-src (.source place)
+                                        (.lo place)
+                                        (.hi place)
+                                        (sconcat a
+                                                 (sconcat4 a
+                                                           "in '"
+                                                           fname
+                                                           "': cannot take! an owned field or element of '"
+                                                           (.name owner))
+                                                 "'; ownership is tracked per binding, so take! the whole value, or borrow or clone the part")))
+                      (Ok [i64 Diag] 0))))
+          (None [] (Ok [i64 Diag] 0))))))
+
+(defn ownership-require-movable [(a (dyn Allocator))
+                                 (cx (ptr Cx))
+                                 (e (ptr Expr))
+                                 (states (ptr (ArrayList MoveState)))
+                                 (fname (slice u8))] (-> (Result i64 Diag))
+  (match (.kind e)
+    (ELoad [place]
+           (if (or (= fname "coil.core.take!")
+                   (starts-with fname "coil.core.take!__"))
+               (Ok [i64 Diag] 0)
+               (ownership-require-movable-place a
+                                                cx
+                                                e
+                                                place
+                                                (box-al [(ptr (ArrayList Bind))]
+                                                        a
+                                                        (al-new [(ptr (ArrayList Bind))]
+                                                                a))
+                                                states
+                                                fname)))
+    (_ (Ok [i64 Diag] 0))))
+
+(defn ownership-require-movable-list [(a (dyn Allocator))
+                                      (cx (ptr Cx))
+                                      (e (ptr Expr))
+                                      (body (ptr (ArrayList Expr)))
+                                      (scoped (ptr (ArrayList (ptr (ArrayList Bind)))))
+                                      (states (ptr (ArrayList MoveState)))
+                                      (fname (slice u8))] (-> (Result i64 Diag))
+  (if (= (len (load body)) (primitive/cast i64 0))
+      (Ok [i64 Diag] 0)
+      (ownership-require-movable-place a
+                                       cx
+                                       e
+                                       (al-last-expr body)
+                                       scoped
+                                       states
+                                       fname)))
+
+; `place` is what `e` loads. A compound place (a `let`, `do`, `if` or `match`
+; whose result is a place) is loaded at each of its tails, so check each one.
+; `scoped` holds the bindings of the `let`s entered on the way down: the walk has
+; not registered them yet, so a tail naming one of their owners is recognized here.
+(defn ownership-require-movable-place [(a (dyn Allocator))
+                                       (cx (ptr Cx))
+                                       (e (ptr Expr))
+                                       (place (ptr Expr))
+                                       (scoped (ptr (ArrayList (ptr (ArrayList Bind)))))
+                                       (states (ptr (ArrayList MoveState)))
+                                       (fname (slice u8))] (-> (Result i64 Diag))
+  (match (.kind place)
+    (ELet [binds body]
+          (do
+            (push! [(ptr (ArrayList Bind))] scoped binds)
+            (let [r (ownership-require-movable-list a
+                                                    cx
+                                                    e
+                                                    body
+                                                    scoped
+                                                    states
+                                                    fname)]
+              (pop! [(ptr (ArrayList Bind))] scoped)
+              r)))
+    (EDo [body]
+         (ownership-require-movable-list a cx e body scoped states fname))
+    (ECleanup [body _]
+              (ownership-require-movable-place a cx e body scoped states fname))
+    (EIf [_ thn els]
+         (try (do
+                (try! (ownership-require-movable-place a
+                                                       cx
+                                                       e
+                                                       thn
+                                                       scoped
+                                                       states
+                                                       fname))
+                (ownership-require-movable-place a
+                                                 cx
+                                                 e
+                                                 els
+                                                 scoped
+                                                 states
+                                                 fname))))
+    (EMatch [_ arms]
+            (try (do
+                   (for i (range 0 (len (load arms)))
+                     (try! (ownership-require-movable-place a
+                                                            cx
+                                                            e
+                                                            (field (al-elem [Arm]
+                                                                            arms
+                                                                            i)
+                                                                   body)
+                                                            scoped
+                                                            states
+                                                            fname)))
+                   (Ok [i64 Diag] 0))))
+    (_ (let [root (ownership-place-root-var place)
+             ; The moved value's type. A projection node may carry no recorded
+             ; type; when `e` loads it directly, the load's own type is the same.
+             pointee
+               (match (ownership-node-type a cx (.node-id place))
+                 (Some [t] (match t (TRef [_ inner] (Some (load inner))) (_ (None [Type]))))
+                 (None []
+                       (match (.kind e)
+                         (ELoad [direct]
+                                (if (= (primitive/cast i64 direct)
+                                       (primitive/cast i64 place))
+                                    (ownership-expr-type a cx e)
+                                    (None [Type])))
+                         (_ (None [Type])))))]
+         (match pointee
+           (Some [pt]
+                 (let [ptp (primitive/alloc-stack Type)]
+                   (set! ptp pt)
+                   (if (or (= (primitive/cast i64 root) (primitive/cast i64 0))
+                           (not (type-needs-drop a cx ptp)))
+                       (Ok [i64 Diag] 0)
+                       (ownership-require-movable-root a
+                                                       cx
+                                                       e
+                                                       place
+                                                       root
+                                                       scoped
+                                                       states
+                                                       fname))))
+           ; Not a reference: a raw pointer never owns its pointee, and a value
+           ; is not a place at all.
+           (None [] (Ok [i64 Diag] 0)))))))
+
+; Is `root` an owning binding of one of the `let`s in `scoped`? Binding identity
+; comes from the checker's side map, as in `ownership-consume-root!`.
+(defn ownership-scoped-owner? [(root (ptr Expr))
+                               (scoped (ptr (ArrayList (ptr (ArrayList Bind)))))] (-> bool)
+  (let [bid (bind-map-lookup (.node-id root))
+        (mut found) false]
+    (when (> bid (primitive/cast i64 0))
+      (for binds (iter (load scoped))
+        (for i (range 0 (len (load binds)))
+          (let [bp (al-elem [Bind] binds i)]
+            (when (and (= (.bid bp) bid)
+                       (!= (primitive/cast i64 (.owned_type bp))
+                           (primitive/cast i64 0)))
+              (set! found true)
+              0))))
+      0)
+    found))
+
+(defn ownership-require-movable-root [(a (dyn Allocator))
+                                      (cx (ptr Cx))
+                                      (e (ptr Expr))
+                                      (place (ptr Expr))
+                                      (root (ptr Expr))
+                                      (scoped (ptr (ArrayList (ptr (ArrayList Bind)))))
+                                      (states (ptr (ArrayList MoveState)))
+                                      (fname (slice u8))] (-> (Result i64 Diag))
+  (let [whole (!= (primitive/cast i64 (ownership-root-var place))
+                  (primitive/cast i64 0))
+        owner (ownership-root-state place states)
+        name (match (.kind root) (EVar [n] n) (_ ""))]
+    (cond (and whole (ownership-scoped-owner? root scoped))
+            (Ok [i64 Diag] 0)
+          (and whole (!= (primitive/cast i64 owner) (primitive/cast i64 0)))
+            (Ok [i64 Diag] 0)
+          (and (!= (primitive/cast i64 owner) (primitive/cast i64 0))
+               (not (ownership-glue-reaches? a cx place (.ty owner))))
+            (Ok [i64 Diag] 0)
+          (!= (primitive/cast i64 owner) (primitive/cast i64 0))
+            (Err [i64 Diag]
+                 (derr-at-src (.source place)
+                              (.lo place)
+                              (.hi place)
+                              (sconcat a
+                                       (sconcat4 a
+                                                 "in '"
+                                                 fname
+                                                 "': cannot move an owned value out of a field or element of '"
+                                                 (.name owner))
+                                       "'; ownership is tracked per binding, so borrow or clone the part, or move the whole value")))
+          :else
+            (Err [i64 Diag]
+                 (derr-at-src (.source place)
+                              (.lo place)
+                              (.hi place)
+                              (sconcat a
+                                       (sconcat4 a
+                                                 "in '"
+                                                 fname
+                                                 "': cannot move an owned value out of '"
+                                                 name)
+                                       "', which is a reference; a match on a named value binds its payload by reference, so match on (take! (mut …)) to own the payload, or (clone …) it"))))))
+
 (defn ownership-walk-expr [(a (dyn Allocator))
                            (cx (ptr Cx))
                            (e (ptr Expr))
@@ -16196,6 +16744,7 @@
                            (consumes bool)] (-> (Result i64 Diag))
   (try (do
          (when consumes
+           (try! (ownership-require-movable a cx e states fname))
            (try! (ownership-consume-root! a e states fname))
            0)
          (unless consumes
@@ -16303,6 +16852,8 @@
                        (ownership-walk-expr a cx init states loops fname true)))
            (EField [p _] (ownership-walk-expr a cx p states loops fname false))
            (ELoad [inner]
+                  (if (ownership-wrap-field-read-temporary! a cx e states)
+                      (ownership-walk-expr a cx e states loops fname consumes)
                   (if consumes
                       ; A direct load from a named place was consumed by the root check at
                       ; entry. For a compound place-producing expression (notably a
@@ -16318,7 +16869,7 @@
                                                fname
                                                true)
                           (Ok [i64 Diag] 0))
-                      (ownership-walk-expr a cx inner states loops fname false)))
+                      (ownership-walk-expr a cx inner states loops fname false))))
            (EStore [p value]
                    (let [owner (ownership-root-state p states)
                          owner-bid
