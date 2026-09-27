@@ -64,6 +64,9 @@ echo "       marker to call it — undefined without the transform; exit 42 with
 $COIL run $D/addforms_test.coil >/dev/null 2>&1; rc=$?
 [ $rc -eq 42 ] || { echo "add-forms transform FAILED (exit $rc, want 42)"; exit 1; }
 echo "add-top-level-forms: OK (transform emitted a real defn; exit 42)"
+$COIL run $D/identity_test.coil >/dev/null 2>&1; rc=$?
+[ $rc -eq 42 ] || { echo "identity transform FAILED (exit $rc, want 42)"; exit 1; }
+echo "identity transform: OK (a plain module list is accepted as the result)"
 
 echo "=== 8. THE BINDING ORACLE: a use-after-free checker keyed on binding identity ==="
 echo "       (binding-of NODE) distinguishes a SHADOWED local from its namesake —"
