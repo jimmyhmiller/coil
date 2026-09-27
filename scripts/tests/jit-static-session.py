@@ -57,7 +57,7 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
             flags += ["--link-flag", flag]
     fixtures = ("derive_qualified_shape", "retained_heap", "jit_metadata_lifetime", "jit_type_lifetime", "jit_impl_lifetime", "jit_monomorph_report_lifetime", "jit_source_sharing", "jit_body_sharing", "jit_native_metadata_roots", "jit_repl_policy", "jit_static_session", "jit_static_lifetime", "jit_static_policy",
                 "jit_static_dynamic", "jit_static_isolation", "jit_single_form_proof", "jit_checked_baseline", "jit_env_values", "jit_env_stale", "jit_live_checker", "jit_redefined_signature",
-                "jit_generation_tokens", "jit_reserved_tokens", "jit_frontend_policy", "jit_meta_pipeline", "jit_deferred_publication", "jit_repair_diagnostics", "jit_defalias_rebind", "jit_retire_declarations", "jit_session_imports", "jit_session_free", "jit_llvm_backend", "jit_repl_second_submission", "jit_meta_accepted_impl", "jit_meta_generator_later", "jit_shared_prelude")
+                "jit_generation_tokens", "jit_reserved_tokens", "jit_frontend_policy", "jit_meta_pipeline", "jit_deferred_publication", "jit_repair_diagnostics", "jit_defalias_rebind", "jit_retire_declarations", "jit_session_imports", "jit_session_free", "jit_llvm_backend", "jit_repl_second_submission", "jit_meta_accepted_impl", "jit_meta_generator_later", "jit_shared_prelude", "jit_before_expand_const_replacement", "jit_before_expand_sum_replacement", "jit_qualified_names", "jit_entry_compile_time_code", "jit_generic_replacement")
     if sys.platform == "darwin":
         fixtures += ("jit_scratch_footprint",)
     # COIL_META_MAIN=1 in an embedding host: main-thread compiles run metaprograms
@@ -169,6 +169,46 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
         "-o", binary, *flags)
     run(binary, env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(work)))
     print("PASS: retained source provider and one-time ABI preamble", flush=True)
+    # The provider is compiled once per session: later reads reuse its engine.
+    binary = work / "reader-reuse"
+    run(COMPILER, "build", ROOT / "tests/compiler/features/jit_reader_engine_reuse.coil",
+        "-o", binary, *flags)
+    # The trace is diagnostic output, not text this test owns; count its ASCII
+    # markers from the raw bytes.
+    traced = subprocess.run([str(binary)], cwd=ROOT, capture_output=True, timeout=240,
+                            env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(work), COIL_TRACE="1"))
+    assert traced.returncode == 0, (traced.returncode, traced.stderr[-2000:])
+    builds = traced.stderr.count(b"coil-trace count reader.engine-builds ")
+    reuses = traced.stderr.count(b"coil-trace count reader.engine-reuses ")
+    assert builds == 1 and reuses == 3, ("source provider engine builds/reuses", builds, reuses)
+    print("PASS: a session's source provider engine is built once and reused", flush=True)
+    (work / "entry_provider2.coil").write_text('''(module entry.provider2)
+(import "coil.primitive" :as p)
+(import "coil.slice" :use [subslice])
+
+;; Each submission is one `(defn NAME …)`. It gets a fresh identity that is not
+;; retained after publication, NAME is bound to it, and the submission supplies
+;; its own entry.
+(defn read-source [(context Code)] (-> Code)
+  (let [path (p/code-str (p/code-nth context 1))
+        digits (subslice path 5 (- (len path) 1))
+        entry (p/syntax->datum (p/code-symbol `__coil_session_entry_s digits))
+        read (p/code-read (p/code-str (p/code-nth context 2)) context)
+        f (if (and (p/code-list? read) (= (get read 0) `do)) (get read 1) read)
+        name (get f 1)
+        version (p/syntax->datum (p/code-symbol name (p/code-str (p/code-symbol `_v digits))))
+        (mut rest) (p/code-list-new)]
+    (for i (range 2 (len f)) (push! (mut rest) (get f i)))
+    `(do (import "coil.jit.lifetime")
+         (defn ~version :jit/retain false ~@(p/code-list-done (load rest)))
+         (defalias ~name ~version)
+         (defn ~entry [] (-> i64) 0))))
+''')
+    binary = work / "designated-entry"
+    run(COMPILER, "build", ROOT / "tests/compiler/features/jit_designated_entry_revisions.coil",
+        "-o", binary, *flags)
+    run(binary, env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(work)))
+    print("PASS: a provider's designated entries across many replacing revisions", flush=True)
     # This test reaches private unit lifetime APIs and deliberately source-links
     # the implementation, rather than crossing the public opaque unit interface.
     for name in ("retained_compiler_context", "hygienic_inherent_calls"):

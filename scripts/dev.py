@@ -1304,6 +1304,16 @@ def test_http(compiler: str) -> None:
 
 
 def test_wasm(compiler: str) -> None:
+    # The finalizer names a global import it cannot resolve and fails as itself,
+    # not as a linker child "terminated by signal 1". Needs neither node nor wasm-tools.
+    absent = subprocess.run([compiler, "build", "tests/compiler/features/wasm32_absent_linker_symbol.coil",
+                             "--target", "wasm32-unknown-unknown", "-o", "/tmp/gate-wasm32-absent-symbol.wasm"],
+                            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if (absent.returncode != 1
+            or "unresolved global import GOT.mem._mh_execute_header" not in absent.stdout
+            or "signal" in absent.stdout or "native library" in absent.stdout):
+        sys.stderr.write(absent.stdout)
+        raise SystemExit("wasm finalizer: an absent linker symbol is not reported by name")
     if not shutil.which("node") or not shutil.which("wasm-tools"):
         print("wasm gate: SKIP (requires node and wasm-tools)")
         return
