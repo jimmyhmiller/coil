@@ -5110,6 +5110,51 @@ else
   bad "prebuilt = true end to end" "the app with a prebuilt dependency did not build"
 fi
 
+# A prebuilt dependency whose entry a reader (from another package) turns into a
+# module the file's path does not spell -- the C reader's `module-name`, as in
+# coil-experiments' raylib-demo. Its [link] inputs must still reach the link:
+# the unit's recorded sources (now including the non-.coil entry) tie it to its
+# package. Its sources also key the unit, so an edited entry rebuilds it.
+PRD="$T/prebuilt-reader-dep"; mkdir -p "$PRD/rdr" "$PRD/nat" "$PRD/app"
+printf '[package]\nname = "natreader"\nsource-roots = ["."]\n' > "$PRD/rdr/Coil.toml"
+cat > "$PRD/rdr/natreader.coil" <<'PRD_EOF'
+(module natreader)
+(import "coil.primitive" :as primitive)
+(reader-provider "natreader" read-num)
+(defn read-num [(context Code)] (-> Code)
+  (primitive/code-read "(module rd.nat) (extern natlib_value :cc c [] (-> i64)) (defn value [] (-> i64) (natlib_value)) (export value)" context))
+PRD_EOF
+cat > "$PRD/nat/Coil.toml" <<'PRD_EOF'
+[package]
+name = "nat"
+entry = "nat.num"
+source-roots = ["."]
+
+[dependencies]
+natreader = { path = "../rdr" }
+
+[readers]
+".num" = "natreader"
+
+[link]
+libs = ["natlib"]
+search-paths = ["."]
+PRD_EOF
+echo "value" > "$PRD/nat/nat.num"
+printf 'long natlib_value(void) { return 42; }\n' > "$PRD/natlib.c"
+cc -c "$PRD/natlib.c" -o "$PRD/natlib.o" && ar rcs "$PRD/nat/libnatlib.a" "$PRD/natlib.o"
+printf '[package]\nname = "app"\nentry = "main.coil"\n\n[dependencies]\nnat = { path = "../nat", prebuilt = true }\n' > "$PRD/app/Coil.toml"
+printf '(module app)\n(import "rd.nat" :as nat)\n(defn main [] (-> i64) (if (= (nat/value) 42) 0 1))\n' > "$PRD/app/main.coil"
+if prd_out=$(cd "$PRD/app" && "$COIL" build main.coil -o app 2>&1); then
+  expect_rc 0 "a reader-named prebuilt dependency links its package's [link] inputs" "$PRD/app/app"
+  case "$(cat "$PRD/app/.coil/units/llvm/nat/unit.sources" 2>/dev/null)" in
+    *"/nat/nat.num"*) ok "a unit records its non-.coil entry among its sources" ;;
+    *) bad "a unit records its non-.coil entry" "nat.num is not in unit.sources" ;;
+  esac
+else
+  bad "a reader-named prebuilt dependency links its package's [link] inputs" "$prd_out"
+fi
+
 echo "== stdlib profiles: hermetic and core providers =="
 # Nothing else ran this script, and every hermetic case was failing: the binding
 # runtime every destructuring program loads imported coil.slice.
