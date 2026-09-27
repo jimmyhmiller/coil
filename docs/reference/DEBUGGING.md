@@ -196,6 +196,8 @@ which boundary it crossed.
 | `COIL_META_ARENA=0\|poison` | Disable per-expansion metaprogram arenas, or fill released arena memory with `0xDD` |
 | `COIL_WORKER_STACK_SIZE`, `COIL_WORKER_GUARD_SIZE` | Compiler worker-thread stack and guard size, in bytes |
 | `COIL_LLVM_WORKER_STACK_SIZE` | Stack size of parallel LLVM code-generation workers, in bytes |
+| `COIL_PERF_MAP=1` | Append `START SIZE NAME` for every JIT-compiled function (metaprograms, `coil.jit` sessions) to `/tmp/perf-<pid>.map`, the map Linux `perf` reads |
+| `COIL_META_JIT=0` | Run metaprograms from symbolized dylibs instead of in-memory code, so macOS `sample` and Instruments can name their frames |
 
 A program that needs its own thread stack size uses
 `coil.thread/thread-spawn-configured`, which takes explicit stack and guard
