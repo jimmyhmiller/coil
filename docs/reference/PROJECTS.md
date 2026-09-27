@@ -292,7 +292,7 @@ imported like any module.
 
 (reader-provider "myproj.readers.json" read-json)
 
-;;; `context` is (read-context PATH SOURCE ROLE INPUTS ARGS).
+;;; `context` is (read-context PATH SOURCE ROLE INPUTS ARGS (read-package MANIFEST)).
 (defn read-json [(context Code)] (-> Code)
   (let [source (primitive/code-nth context 2)]
     ...))   ; return one form, or (do FORM...)
@@ -301,7 +301,10 @@ imported like any module.
 - A file becomes a module only through a `[modules]` entry, or through a
   `coil-module: NAME` marker on its first line (anything before the marker is
   treated as the guest language's comment leader). Configuring a suffix does
-  not turn every matching file into a module.
+  not turn every matching file into a module. A dependency's `entry` may also
+  be named by its reader: when a namespace is found nowhere else, Coil reads
+  each dependency's reader-served entry once and uses the one whose output
+  declares `(module NAME)`.
 - Reader modules are read by Coil's ordinary reader. Their output may omit
   `(module …)`; the loader supplies the indexed name.
 - Different suffixes can use different readers, each compiled in isolation,
@@ -328,9 +331,13 @@ include-paths = ["vendor/raylib/src"]
 ```
 
 A provider claims a section and every `[section.*]` below it. Coil does not
-check the keys inside a claimed section; they belong to the provider, which
-finds the manifest through the `COIL_MANIFEST_PATH` environment variable. An
-unclaimed unknown section is still an error.
+check the keys inside a claimed section; they belong to the provider. A reader
+finds its manifest with `(read-context-manifest context)` from `coil.meta`: the
+`Coil.toml` of the package that owns the file being read, so a dependency's
+reader gets the dependency's sections whether the dependency is prebuilt or
+compiled from inside its consumer. Resolve relative paths in a section against
+that manifest's directory. (`COIL_MANIFEST_PATH` still names the consumer's
+manifest for older providers.) An unclaimed unknown section is still an error.
 
 ## Choosing the standard library
 

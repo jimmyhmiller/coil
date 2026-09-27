@@ -5110,19 +5110,38 @@ else
   bad "prebuilt = true end to end" "the app with a prebuilt dependency did not build"
 fi
 
-# A prebuilt dependency whose entry a reader (from another package) turns into a
-# module the file's path does not spell -- the C reader's `module-name`, as in
-# coil-experiments' raylib-demo. Its [link] inputs must still reach the link:
-# the unit's recorded sources (now including the non-.coil entry) tie it to its
-# package. Its sources also key the unit, so an edited entry rebuilds it.
+# A dependency whose entry a reader (from another package) turns into a module
+# the file's path does not spell -- the C reader's `module-name`, as in
+# coil-experiments' raylib-demo -- and whose reader configures itself from ITS
+# package's manifest (read-context-manifest), not the consumer's. It must build
+# three ways: prebuilt, from source (`prebuilt = false`, where only the reader
+# names the module), and through the fallback when prebuilding fails. Each way
+# must link the dependency's [link] inputs, and the prebuilt unit's key must
+# include the non-.coil entry.
 PRD="$T/prebuilt-reader-dep"; mkdir -p "$PRD/rdr" "$PRD/nat" "$PRD/app"
 printf '[package]\nname = "natreader"\nsource-roots = ["."]\n' > "$PRD/rdr/Coil.toml"
 cat > "$PRD/rdr/natreader.coil" <<'PRD_EOF'
 (module natreader)
 (import "coil.primitive" :as primitive)
+(import "coil.meta" :use [expansion-allocator read-context-manifest])
+(import "coil.fs" :as fs)
+(import "coil.str" :as str)
+(import "coil.slice" :use [subslice])
 (reader-provider "natreader" read-num)
 (defn read-num [(context Code)] (-> Code)
-  (primitive/code-read "(module rd.nat) (extern natlib_value :cc c [] (-> i64)) (defn value [] (-> i64) (natlib_value)) (export value)" context))
+  (let [a (expansion-allocator)
+        manifest (read-context-manifest context)
+        (mut path) (str/sb-new a)
+        (mut out) (str/sb-new a)]
+    (str/sb-push-str! (mut path) (subslice manifest 0 (- (len manifest) 9)))
+    (str/sb-push-str! (mut path) "offset.txt")
+    (let [offset (match (fs/read-file a (str/sb-str path))
+                   (Ok [t] (str/str-trim t))
+                   (Err [_] (primitive/error "natreader: no offset.txt beside the package manifest")))]
+      (str/sb-push-str! (mut out) "(module rd.nat) (extern natlib_value :cc c [] (-> i64)) (defn value [] (-> i64) (+ (natlib_value) ")
+      (str/sb-push-str! (mut out) offset)
+      (str/sb-push-str! (mut out) ")) (export value)")
+      (primitive/code-read (str/sb-str out) context))))
 PRD_EOF
 cat > "$PRD/nat/Coil.toml" <<'PRD_EOF'
 [package]
@@ -5141,19 +5160,33 @@ libs = ["natlib"]
 search-paths = ["."]
 PRD_EOF
 echo "value" > "$PRD/nat/nat.num"
+echo 5 > "$PRD/nat/offset.txt"
 printf 'long natlib_value(void) { return 42; }\n' > "$PRD/natlib.c"
 cc -c "$PRD/natlib.c" -o "$PRD/natlib.o" && ar rcs "$PRD/nat/libnatlib.a" "$PRD/natlib.o"
-printf '[package]\nname = "app"\nentry = "main.coil"\n\n[dependencies]\nnat = { path = "../nat", prebuilt = true }\n' > "$PRD/app/Coil.toml"
-printf '(module app)\n(import "rd.nat" :as nat)\n(defn main [] (-> i64) (if (= (nat/value) 42) 0 1))\n' > "$PRD/app/main.coil"
-if prd_out=$(cd "$PRD/app" && "$COIL" build main.coil -o app 2>&1); then
-  expect_rc 0 "a reader-named prebuilt dependency links its package's [link] inputs" "$PRD/app/app"
-  case "$(cat "$PRD/app/.coil/units/llvm/nat/unit.sources" 2>/dev/null)" in
-    *"/nat/nat.num"*) ok "a unit records its non-.coil entry among its sources" ;;
-    *) bad "a unit records its non-.coil entry" "nat.num is not in unit.sources" ;;
-  esac
-else
-  bad "a reader-named prebuilt dependency links its package's [link] inputs" "$prd_out"
-fi
+printf '(module app)\n(import "rd.nat" :as nat)\n(defn main [] (-> i64) (if (= (nat/value) 47) 0 1))\n' > "$PRD/app/main.coil"
+prd_build() {  # prd_build <prebuilt> <label>
+  printf '[package]\nname = "app"\nentry = "main.coil"\n\n[dependencies]\nnat = { path = "../nat", prebuilt = %s }\n' "$1" > "$PRD/app/Coil.toml"
+  rm -f "$PRD/app/app"
+  if prd_out=$(cd "$PRD/app" && "$COIL" build main.coil -o app 2>&1); then
+    expect_rc 0 "reader-named dependency, $2: builds, links its [link] inputs, reads its own manifest" "$PRD/app/app"
+  else
+    bad "reader-named dependency, $2" "$prd_out"
+  fi
+}
+rm -rf "$PRD/app/.coil"; prd_build true "prebuilt"
+case "$(cat "$PRD/app/.coil/units/llvm/nat/unit.sources" 2>/dev/null)" in
+  *"/nat/nat.num"*) ok "a unit records its non-.coil entry among its sources" ;;
+  *) bad "a unit records its non-.coil entry" "nat.num is not in unit.sources" ;;
+esac
+rm -rf "$PRD/app/.coil"; prd_build false "from source"
+# A unit directory that cannot be created makes prebuilding fail: the build
+# falls back to source, with a note, and must still succeed.
+rm -rf "$PRD/app/.coil"; mkdir -p "$PRD/app/.coil/units/llvm"; : > "$PRD/app/.coil/units/llvm/nat"
+prd_build true "prebuild failed, fallback to source"
+case "$prd_out" in
+  *"could not be prebuilt; compiling it from source"*) ok "the failed prebuild fell back to source, with a note" ;;
+  *) bad "the failed prebuild fell back to source" "no fallback note: $prd_out" ;;
+esac
 
 echo "== stdlib profiles: hermetic and core providers =="
 # Nothing else ran this script, and every hermetic case was failing: the binding
