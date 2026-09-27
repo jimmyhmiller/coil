@@ -57,6 +57,12 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
                 "jit_generation_tokens", "jit_reserved_tokens", "jit_frontend_policy", "jit_meta_pipeline", "jit_deferred_publication", "jit_repair_diagnostics", "jit_defalias_rebind", "jit_retire_declarations", "jit_session_imports", "jit_session_free")
     if sys.platform == "darwin":
         fixtures += ("jit_scratch_footprint",)
+    # COIL_META_MAIN=1 in an embedding host: main-thread compiles run metaprograms
+    # in place; a worker-thread compile is a diagnostic instead of a crash.
+    binary = work / "jit_meta_main"
+    run(COMPILER, "build", ROOT / "tests/compiler/features/jit_meta_main.coil", "-o", binary, *flags)
+    run(binary, env=dict(TOOLCHAIN_ENV, COIL_META_MAIN="1"))
+    print("PASS: jit_meta_main", flush=True)
     for name in fixtures:
         binary = work / name
         run(COMPILER, "build", ROOT / f"tests/compiler/features/{name}.coil",
