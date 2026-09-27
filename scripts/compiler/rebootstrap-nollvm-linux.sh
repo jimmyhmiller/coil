@@ -41,7 +41,7 @@ echo "stage0 = $STAGE0 ($STAGE0_SOURCE)"
 # LLVM backend and therefore needs the libLLVM link line. Once stage1 exists it is
 # LLVM-free and every later stage links nothing extra.
 S1FLAGS=()
-if ldd "$STAGE0" 2>/dev/null | grep -qi llvm; then
+if grep -qi llvm <<<"$(ldd "$STAGE0" 2>/dev/null)"; then
   libdir="${COIL_LLVM_LIBDIR:-}"
   if [ -z "$libdir" ]; then
     for d in /usr/src/stdlib/llvm-21/lib /usr/src/stdlib/x86_64-linux-gnu; do
