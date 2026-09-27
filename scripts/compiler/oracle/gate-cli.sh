@@ -297,6 +297,7 @@ for opt in -o --link-flag --backend --target --use --unit; do
   expect_rc 2 "a trailing $opt without its value is a usage error" "$COIL" build "$T/seven.coil" "$opt"
 done
 expect_out "option '-o' requires a value" "a missing option value is named" "$COIL" build "$T/seven.coil" -o
+expect_rc 0 "lint accepts the frontend-wide --macro-expansion-limit" "$COIL" lint "$T/seven.coil" --macro-expansion-limit 1000000
 rm -rf "$T/default-build"
 mkdir -p "$T/default-build"
 ( cd "$T/default-build" && "$COIL" build "$T/seven.coil" >/dev/null 2>&1 )
