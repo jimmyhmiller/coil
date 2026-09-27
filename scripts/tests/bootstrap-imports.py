@@ -117,9 +117,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("compiler_positional", nargs="?", help=argparse.SUPPRESS)
     parser.add_argument("--compiler", help="also build the current compiler for wasm64 and wasm32 and check both")
+    parser.add_argument("--module", help="check this wasm64 module against runtime.c instead of the committed seed")
     args = parser.parse_args()
     # The generated suite passes its compiler positionally, like its other scripts.
     args.compiler = args.compiler or args.compiler_positional
+    if args.module:
+        return 0 if check(Path(args.module), ROOT / "src/bootstrap/runtime.c", "wasm64 module") else 1
     ok = check(ROOT / "bootstrap/seeds/wasm/coilc.wasm", ROOT / "src/bootstrap/runtime.c", "committed wasm64 seed")
     if args.compiler:
         with tempfile.TemporaryDirectory(prefix="coil-bootstrap-imports-") as scratch:
