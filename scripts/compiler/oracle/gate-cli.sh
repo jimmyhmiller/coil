@@ -4460,6 +4460,16 @@ EOF
     *) bad "repl retains macros and transactionally rejects invalid new macros" "$repl_macro_out" ;;
   esac
 
+  # An array literal passed to a destructured slice parameter (coil-bugs cdhmhg1p5mn).
+  repl_array_slice_out=$(printf '%s\n' \
+    '(defn sp [([a b] (slice i64))] (-> i64) (+ a b))' \
+    '(sp [1 2])' \
+    ':q' | "$REPL_COIL" repl 2>&1)
+  case "$repl_array_slice_out" in
+    *'coil> 3'*) ok "repl passes an array literal to a destructured slice parameter" ;;
+    *) bad "repl passes an array literal to a destructured slice parameter" "$repl_array_slice_out" ;;
+  esac
+
   repl_ambient_derive_out=$(printf '%s\n' \
     '(defstruct Action [(value i64)])' \
     '(derive Eq Action)' \
