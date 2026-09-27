@@ -79,8 +79,11 @@ esac
 echo "  ok — links only:$(ldd "$S2" | awk '{printf " %s", $1}')"
 
 echo "=== FIXPOINT: independently emitted stage2 vs stage3 objects ==="
-"$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" --backend x64 || { echo "stage2 object emission FAILED"; exit 1; }
-"$S2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" --backend x64 || { echo "stage3 object emission FAILED"; exit 1; }
+# The two emissions are independent; run them at once.
+"$S1" emit-obj "$SRC" -o "$RUN_DIR/stage2.o" --backend x64 & stage2_pid=$!
+"$S2" emit-obj "$SRC" -o "$RUN_DIR/stage3.o" --backend x64 & stage3_pid=$!
+wait "$stage2_pid" || { wait "$stage3_pid"; echo "stage2 object emission FAILED"; exit 1; }
+wait "$stage3_pid" || { echo "stage3 object emission FAILED"; exit 1; }
 cmp "$RUN_DIR/stage2.o" "$RUN_DIR/stage3.o" || { echo "FIXPOINT FAIL — x64 objects differ"; exit 2; }
 echo "  ok — byte-identical, the compiler reproduces itself"
 

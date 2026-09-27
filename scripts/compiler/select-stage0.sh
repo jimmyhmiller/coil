@@ -29,6 +29,9 @@ stage0_compat_run() {
 select_stage0() {
   local native_seed="$1" src="$2" fallback_backend="$3"; shift 3
   STAGE0_BUILD_FLAGS=()
+  # The stage0 this function has already proved can check the tree, so that
+  # stage0_check does not repeat the same whole-tree check (minutes on CI).
+  STAGE0_VERIFIED=
 
   if [ -n "${STAGE0:-}" ]; then
     STAGE0_SOURCE=explicit
@@ -40,6 +43,7 @@ select_stage0() {
      && stage0_compat_run "$native_seed" check "$src" "$@" >/dev/null 2>&1; then
     STAGE0="$native_seed"
     STAGE0_SOURCE=native
+    STAGE0_VERIFIED="$STAGE0"
     return 0
   fi
 
@@ -55,6 +59,7 @@ select_stage0() {
      && stage0_compat_run "$installed" check "$src" "$@" >/dev/null 2>&1; then
     STAGE0="$installed"
     STAGE0_SOURCE=installed
+    STAGE0_VERIFIED="$STAGE0"
     return 0
   fi
 
@@ -66,4 +71,5 @@ select_stage0() {
   STAGE0_BUILD_FLAGS=(--backend "$fallback_backend")
   stage0_compat_run "$STAGE0" check "$src" "$@" >/dev/null 2>&1 \
     || { echo "WASM stage0 cannot compile the current source tree" >&2; return 1; }
+  STAGE0_VERIFIED="$STAGE0"
 }

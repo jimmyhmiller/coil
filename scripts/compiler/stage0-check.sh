@@ -18,6 +18,8 @@
 stage0_check() {
   local stage0="$1" seed="$2" src="$3"; shift 3
   local out
+  # select_stage0 already ran exactly this check on this binary.
+  [ -n "${STAGE0_VERIFIED:-}" ] && [ "$STAGE0_VERIFIED" = "$stage0" ] && return 0
   # Stage 0 necessarily carries yesterday's bundled-module manifest. Let this
   # one compatibility probe discover newly added source-tree namespaces; the
   # compiler it produces embeds today's manifest and all later stages run with
