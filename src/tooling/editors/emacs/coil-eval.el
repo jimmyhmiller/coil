@@ -184,16 +184,34 @@ wrong."
 ;;; ---------------------------------------------------------------------------
 ;;; Evaluation commands
 
+(defvar-local coil--eval-generation 0
+  "Count of evaluations started in this buffer.
+Each request captures the value when it starts; a result is shown only if
+no newer request has started since, so a slow answer to an old form can
+never land on top of the answer to the form evaluated after it.")
+
+(defun coil--begin-eval (position)
+  "Start a new evaluation generation and mark POSITION as pending."
+  (setq coil--eval-generation (1+ coil--eval-generation))
+  (coil--show-overlay "…" 'coil-result-overlay-face position)
+  coil--eval-generation)
+
+(defun coil--current-eval-p (buffer generation)
+  "Whether GENERATION is still BUFFER's latest evaluation."
+  (and (buffer-live-p buffer)
+       (= generation (buffer-local-value 'coil--eval-generation buffer))))
+
 (defun coil--eval (text position)
   "Evaluate TEXT and report the result at POSITION.
 The reporting buffer is captured now rather than looked up later: the
 answer arrives whenever it arrives, and by then point may be somewhere
-else entirely."
-  (let ((buffer (current-buffer)))
+else entirely.  A result superseded by a newer evaluation is discarded."
+  (let ((buffer (current-buffer))
+        (generation (coil--begin-eval position)))
     (coil-eval-async
      text
      (lambda (result)
-       (when (buffer-live-p buffer)
+       (when (coil--current-eval-p buffer generation)
          (with-current-buffer buffer (coil--report result position)))))))
 
 ;;;###autoload
@@ -220,7 +238,7 @@ does not scroll past under the ones that followed it."
   (interactive "r")
   (let ((forms (coil--toplevel-forms-in start end)))
     (unless forms (user-error "No complete form in the region"))
-    (coil--eval-sequentially forms end)))
+    (coil--eval-sequentially forms end nil nil (coil--begin-eval end))))
 
 (defun coil--toplevel-forms-in (start end)
   "A list of the complete top-level forms between START and END."
@@ -238,25 +256,29 @@ does not scroll past under the ones that followed it."
               (scan-error (goto-char end))))))
       (nreverse forms))))
 
-(defun coil--eval-sequentially (forms position &optional index total)
+(defun coil--eval-sequentially (forms position &optional index total generation)
   "Evaluate FORMS one after another, reporting at POSITION.
 The REPL applies one form at a time and later forms may depend on earlier
-ones, so these are chained rather than fired off together."
+ones, so these are chained rather than fired off together.  GENERATION is
+the evaluation this sequence belongs to; a newer evaluation stops it."
   (let* ((total (or total (length forms)))
          (index (or index 1))
-         (buffer (current-buffer)))
+         (buffer (current-buffer))
+         (generation (or generation (coil--begin-eval position))))
     (if (null forms)
-        (message "Loaded %d form%s" total (if (= total 1) "" "s"))
+        (progn
+          (coil--remove-result-overlays)
+          (message "Loaded %d form%s" total (if (= total 1) "" "s")))
       (coil-eval-async
        (car forms)
        (lambda (result)
-         (when (buffer-live-p buffer)
+         (when (coil--current-eval-p buffer generation)
            (with-current-buffer buffer
              (if (coil-result-error result)
                  (progn
                    (message "Form %d of %d failed" index total)
                    (coil--report result position))
-               (coil--eval-sequentially (cdr forms) position (1+ index) total)))))))))
+               (coil--eval-sequentially (cdr forms) position (1+ index) total generation)))))))))
 
 ;;;###autoload
 (defun coil-load-buffer ()
