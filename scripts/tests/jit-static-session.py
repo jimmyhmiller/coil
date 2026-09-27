@@ -125,6 +125,11 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
         "-o", binary, *flags)
     run(binary, cwd=project)
     print("PASS: SDK manifest dependency context without process environment mutation", flush=True)
+    binary = work / "project-free"
+    run(COMPILER, "build", ROOT / "tests/compiler/features/jit_project_free.coil",
+        "-o", binary, *flags)
+    run(binary, cwd=project)
+    print("PASS: freeing a session releases the manifest it loaded", flush=True)
     # Rebinding an alias in a module loaded from disk reaches `:as` and `:use`
     # importers without changing their import declarations.
     (dep / "src/shapes.coil").write_text(
