@@ -3485,6 +3485,49 @@ case "$twomods_out" in
   *) bad "two test modules each derive their own same-named type" "$twomods_out" ;;
 esac
 
+echo "== a before-expand transform imports a module nothing loaded =="
+# The transform adds an import of tiu.n and a main calling through it; tiu.n is
+# loaded when the declarations are rebuilt (coil-bugs transform-import-unloaded).
+mkdir -p "$T/tiu/src"
+printf '[package]\nname = "tiu"\nentry = "src/main.coil"\n\n[metaprograms]\nuse = ["tiu.xf"]\n' > "$T/tiu/Coil.toml"
+printf '(module tiu.main)\n' > "$T/tiu/src/main.coil"
+printf '(module tiu.n)\n(defn f [] (-> i64) 42)\n' > "$T/tiu/src/n.coil"
+cat > "$T/tiu/src/xf.coil" <<'EOF'
+(module tiu.xf)
+(import "coil.primitive" :as p)
+(defn has-main? [(m Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n)
+      false
+      (let [f (p/code-nth m i)]
+        (if (and (p/code-list? f) (and (> (p/code-count f) 1) (p/code-eq (p/code-nth f 1) `main)))
+            true
+            (has-main? m (p/iadd i 1) n)))))
+(defn add-call-from [(ms Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      `()
+      (let [m (p/code-nth ms i)
+            here (p/code-nth m 0)
+            m2 (if (and (p/code-eq here `tiu.main) (not (has-main? m 1 (p/code-count m))))
+                   `(~@m (import "tiu.n" :as ~(p/datum->syntax here "n"))
+                         (defn ~(p/datum->syntax here "main") [] (-> i64)
+                           (~(p/datum->syntax here "n/f"))))
+                   m)]
+        `(~m2 ~@(add-call-from ms (p/iadd i 1) n)))))
+(defn add-call [(modules Code)] (-> Code) (add-call-from modules 0 (p/code-count modules)))
+(transform add-call :phase before-expand)
+EOF
+( cd "$T/tiu" && "$COIL" run >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "a transform's import of an unloaded module loads it" \
+  || bad "transform import of an unloaded module" "$( cd "$T/tiu" && "$COIL" run 2>&1 | head -3 )"
+
+echo "== an executable with no main =="
+printf '(module nomain)\n(defn f [] (-> i64) 1)\n' > "$T/nomain.coil"
+nomain_out=$("$COIL" build "$T/nomain.coil" -o "$T/nomain" 2>&1)
+case "$nomain_out" in
+  *"the program defines no"*) ok "a program with no main says so at the link" ;;
+  *) bad "a program with no main says so at the link" "$nomain_out" ;;
+esac
+
 echo "== focused guide lookup =="
 expect_out '^  tests[[:space:]]+deftest' "guide: no argument prints the compact topic index" "$COIL" guide
 expect_out '^## Tests$' "guide: canonical topic prints only its section" "$COIL" guide tests
