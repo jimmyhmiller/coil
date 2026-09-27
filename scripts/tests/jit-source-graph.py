@@ -40,7 +40,14 @@ with tempfile.TemporaryDirectory(prefix=".coil-jit-source-graph-", dir=ROOT) as 
     entry.write_text('(module graph.entry)\n(import "graph.dependency" :as dep)\n'
                      '(defn main [] (-> i64) (dep/value))\n')
     dependency.write_text('(module graph.dependency)\n(defn value [] (-> i64) 42)\n')
-    env = dict(os.environ, COIL_NAMESPACE_ROOTS=str(project))
+    # The SDK locates its toolchain through `coil` on PATH. Pin the candidate so
+    # the graph is read with this checkout's library, never an installed one
+    # that may predate it.
+    toolbin = work / "bin"
+    toolbin.mkdir()
+    (toolbin / "coil").symlink_to(COMPILER)
+    env = dict(os.environ, COIL_NAMESPACE_ROOTS=str(project),
+               PATH=str(toolbin) + os.pathsep + os.environ["PATH"])
     run([binary, entry], Path("/"), env)
     dependency.write_text('(module graph.dependency)\n(defn value [\n')
     run([binary, entry, "invalid"], Path("/"), env)

@@ -134,6 +134,12 @@ def main() -> None:
     run(sys.executable, str(ROOT / 'scripts/compiler/gen-retained-snapshot.py'), '--check')
     with tempfile.TemporaryDirectory(prefix='.coil-jit-session-memory-', dir=ROOT) as raw:
         directory = Path(raw)
+        # Every SDK session here locates its toolchain through `coil` on PATH:
+        # pin the candidate, never an installed toolchain that predates it.
+        toolbin = directory / 'bin'
+        toolbin.mkdir()
+        (toolbin / 'coil').symlink_to(compiler)
+        os.environ['PATH'] = str(toolbin) + os.pathsep + os.environ['PATH']
         installed_sdk = compiler_path.parent.parent / 'lib/coil/compiler'
         sources = ('jit_api.coil', 'driver.coil')
         installed_matches = all(
@@ -172,10 +178,6 @@ def main() -> None:
         # Accepted commits must retire their compiler arenas too. A rejection-only
         # soak cannot establish this: it completely missed multi-GB accepted growth.
         environment = dict(os.environ, COIL_JIT_TRACE='1')
-        toolbin = directory / 'bin'
-        toolbin.mkdir()
-        (toolbin / 'coil').symlink_to(compiler)
-        environment['PATH'] = str(toolbin) + os.pathsep + os.environ['PATH']
         # A checked Code-returning trait method must not be rediscovered as a
         # syntax macro on the first delta. Disable the disk cache: otherwise a
         # cached macro image hides recompilation of the accepted helper closure.
