@@ -4662,6 +4662,18 @@ cat > "$PBU/mathlib.coil" <<'PBU_EOF'
 
 (defsum Big (BigV [(x i64) (y i64) (z i64)]) (BigNone))
 
+; Impls travel with the unit: a trait impl reaching a private helper, an inherent
+; impl, and a derived one. The consumer dispatches to each.
+(defn point-key [(p Point)] (-> i64) (+ (* 1000 (.x p)) (.y p)))
+
+(impl Eq Point
+  (= [(a Point) (b Point)] (-> bool) (= (point-key a) (point-key b))))
+
+(impl Point
+  (norm1 [(p Point)] (-> i64) (+ (.x p) (.y p))))
+
+(derive Hash Point)
+
 (defn mk-big [(x i64)] (-> Big)
   (BigV x (+ x 1) (+ x 2)))
 
@@ -4682,7 +4694,11 @@ cat > "$PBU/app.coil" <<'PBU_EOF'
   (store! (slot [i64]) (+ (load (slot [i64])) 1))
   (if (or (!= (straddle 1 "ab" "cde" "f" "ghij") 407)
           (!= (big-total (mk-big 1) 5) 326)
-          (!= (big-total (BigNone) 5) -1))
+          (!= (big-total (BigNone) 5) -1)
+          (not (= (Point :x 1 :y 2) (Point :x 1 :y 2)))
+          (= (Point :x 1 :y 2) (Point :x 2 :y 1))
+          (!= (norm1 (Point :x 3 :y 4)) 7)
+          (!= (hash (Point :x 1 :y 2)) (hash (Point :x 1 :y 2))))
       2
       (if (and (= (add 40 2) 42)
                (and (= (combine (Point :x 40 :y 2)) 80)

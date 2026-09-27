@@ -187,7 +187,7 @@ A session publishes runtime code through one of two backends:
             (println "{}" (sum-to 1000000)))
           (jit-session-free! (mut s))
           0))
-      (Err [problem] (println "refused: {}" (jit-options-error-message problem)) 1))))
+      (Err [problem] (println "refused: {:?}" problem) 1))))
 ```
 
 ```output
@@ -197,7 +197,7 @@ A session publishes runtime code through one of two backends:
 Metaprograms run on the host's in-memory engine whichever backend publishes the
 runtime code, and the level applies only to runtime code. The session keeps its
 backend and level across `jit-reset!`; `(jit-session-backend s)` reports the
-backend, and `jit-backend-name` names one. The options are refused with `(Err …)`, before anything is created,
+backend, and `JitBackend` implements `Eq` and `Debug`. The options are refused with `(Err …)`, before anything is created,
 when the host lacks the backend (`UnsupportedBackend`) or `opt-level` is
 outside 0–3 or nonzero for `Native` (`InvalidOptLevel`);
 `jit-options-error-message` describes either.

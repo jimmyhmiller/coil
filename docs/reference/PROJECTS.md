@@ -134,7 +134,8 @@ the build options change. Consumers compile against a small interface instead
 of the dependency's whole source. The dependency's manifest needs an `entry`
 naming the module to prebuild; without one, Coil prints a note and compiles it
 from source. Only the names the module lists in `(export …)` go into the
-interface.
+interface, plus every `impl` and `derive` the module writes: consumers compile
+those from source, so dispatch on the module's types works across the unit.
 
 To build and use a unit by hand:
 
