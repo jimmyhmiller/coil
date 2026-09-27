@@ -4815,6 +4815,54 @@ if "$COIL" build-unit "$PBU/withimpl.coil" -o "$PBU/u_withimpl" >/dev/null 2>&1;
 else
   bad "a unit's inherent impl reaches its consumer" "build-unit failed"
 fi
+# Impls, traits and functions a module's OWN metaprograms produce reach the
+# consumer too: a `meta` generator emits a trait (with a mutable receiver and a
+# supertrait), concrete trait impls and a function; a custom top-level macro emits
+# an inherent impl. The unit forwards each generated method to its compiled body.
+cat > "$PBU/genlib.coil" <<'PBU_EOF'
+(module t.genlib)
+(import "coil.primitive" :as primitive)
+(export Pt Weigh weight Bump bump! make-pt area)
+(deftrait Weigh [Self] (weight [(x Self)] (-> i64)))
+(defstruct Pt [(x i64) (y i64)])
+(defn scale [] (-> i64) 10)
+(defn gen [] (-> Code)
+  `(do
+     (deftrait ~(primitive/syntax->datum `Bump) [Self] :requires [Weigh]
+       (~(primitive/syntax->datum `bump!) [(x (mut Self))] (-> i64)))
+     (impl Weigh Pt
+       (weight [(p Pt)] (-> i64) (let [tmp (* (.x p) (scale))] (+ tmp (.y p)))))
+     (impl Bump Pt (bump! [(p (mut Pt))] (-> i64) (set! (.x p) (+ (.x p) 1)) (.x p)))
+     (defn ~(primitive/syntax->datum `area) [(p Pt)] (-> i64) (* (.x p) (.y p)))))
+(meta (gen))
+(defn def-doubler [(ty Code)] (-> Code)
+  `(impl ~ty (~(primitive/syntax->datum `doubled) [(p ~ty)] (-> i64) (* 2 (+ (.x p) (.y p))))))
+(def-doubler Pt)
+(defn make-pt [] (-> Pt) (Pt :x 3 :y 4))
+PBU_EOF
+cat > "$PBU/genapp.coil" <<'PBU_EOF'
+(module t.genapp)
+(import "t.genlib" :use *)
+(defn main [] (-> i64)
+  (let [p (make-pt) (mut q) (make-pt)]
+    (bump! (mut q))
+    (if (and (= (weight p) 34)
+             (and (= (doubled p) 14)
+                  (and (= (area p) 12) (= (bump! (mut q)) 5))))
+        42
+        1)))
+PBU_EOF
+for PB in $UNIT_BACKENDS; do
+  if "$COIL" build-unit "$PBU/genlib.coil" -o "$PBU/u_gen_$PB" --backend "$PB" >/dev/null 2>&1; then
+    expect_rc 42 "generated impls, traits and functions reach a $PB unit's consumer" \
+      env COIL_NAMESPACE_ROOTS="$PBU" "$COIL" run "$PBU/genapp.coil" --unit "$PBU/u_gen_$PB" --backend "$PB"
+  else
+    bad "generated impls reach a $PB unit's consumer" "build-unit failed"
+  fi
+done
+printf '(module t.gengeneric)\n(defstruct Bx [T] [(item T)])\n(defn gen [] (-> Code) `(impl [T] (Bx T) (peek [(b (Bx T))] (-> T) (.item b))))\n(meta (gen))\n' > "$PBU/gengeneric.coil"
+expect_out "generates a generic impl for 'Bx'" "build-unit refuses a generated generic impl, saying why" \
+  "$COIL" build-unit "$PBU/gengeneric.coil" -o "$PBU/u_gengeneric"
 printf '(module t.withchecker)\n(export f)\n(defn f [(m Code)] (-> Code) m)\n(checker f)\n' > "$PBU/withchecker.coil"
 expect_out "its .checker. form acts on every importer" "build-unit refuses a metaprogram registration a consumer would lose" \
   "$COIL" build-unit "$PBU/withchecker.coil" -o "$PBU/u_withchecker"
