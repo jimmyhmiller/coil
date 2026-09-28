@@ -5609,6 +5609,11 @@ for suite in tests/stdlib_parsers_test.coil tests/serde_test.coil tests/serde_op
   expect_rc 0 "coil test $suite passes" "$COIL" test "$suite"
 done
 
+expect_rc 0 "TCP listener, client and accepted sockets are close-on-exec" \
+  "$COIL" run tests/stdlib/socket_test.coil
+expect_rc 0 "Unix listener, client and accepted sockets are close-on-exec" \
+  "$COIL" run tests/stdlib/unix_socket_test.coil
+
 # LLVM lowers vcompress-store / vexpand-load as a loop over the set mask bits;
 # the runtime corpus runs this file on the direct backend only.
 for opt in -O0 -O3; do
