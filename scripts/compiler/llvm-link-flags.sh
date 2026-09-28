@@ -41,6 +41,15 @@ COMPONENTS="core target analysis passes executionengine mcjit orcjit jitlink aar
 
 emit() { for f in "$@"; do printf -- '--link-flag %s ' "$f"; done; }
 
+# The LLVM C entry points the shipped coil.jit unit reaches and the compiler's own
+# code never calls, declared in ONE place: src/compiler/orc.coil, the typed C
+# boundary to LLVM's object linker. Derived rather than listed here so the two
+# cannot drift as that boundary grows.
+jit_boundary_symbols() {
+  sed -n 's/^(extern \(LLVM[A-Za-z0-9_]*\).*/\1/p' \
+    "$(dirname "$0")/../../src/compiler/orc.coil" | sort -u
+}
+
 case "$MODE" in
   dynamic)
     # Coil's interpreter uses libm directly (`floor`, `fmod`, ...). macOS folds
@@ -56,6 +65,19 @@ case "$MODE" in
       ZSTD_A="$(brew --prefix zstd 2>/dev/null)/lib/libzstd.a"
       if [ -f "$ZSTD_A" ]; then emit "$ZSTD_A"; else emit -lzstd; fi
       emit -lxml2 -lc++
+      # The shipped coil.jit unit is a dylib whose LLVM references are left
+      # undefined (`-Wl,-undefined,dynamic_lookup`) and resolved in the flat
+      # namespace when the compiler dlopens it. A DYNAMIC build finds them in
+      # libLLVM.dylib. A STATIC build has to find them in the compiler executable
+      # itself, and every executable is linked `-dead_strip`: an archive member is
+      # pulled in to satisfy the JIT SDK's references, then the functions are
+      # deleted again because nothing reachable from `main` calls them (main.coil
+      # imports coil.compiler.jit_api for the module graph, not for a call). ld
+      # neither keeps nor exports a dead-stripped symbol, so loading the unit died
+      # on `symbol not found in flat namespace '_LLVMGetFirstUse'`. `-u` makes each
+      # one an undefined symbol of the link, which is both a dead-strip root and an
+      # export.
+      for sym in $(jit_boundary_symbols); do emit "-Wl,-u,_$sym"; done
     else
       emit $($LLVM_CONFIG --link-static --system-libs $COMPONENTS)
       emit -lstdc++ -lpthread -ldl
