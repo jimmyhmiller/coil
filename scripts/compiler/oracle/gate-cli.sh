@@ -387,6 +387,8 @@ rm "$T/libpkg/src/orphan.coil"
 expect_rc 0 "library check passes once its modules are clean" bash -c 'cd "$1" && "$2" check' _ "$T/libpkg" "$COIL"
 expect_out "is a library package" "building a library package says there is nothing to link" \
   bash -c 'cd "$1" && "$2" build' _ "$T/libpkg" "$COIL"
+expect_rc 0 "verify checks and tests a library package without an entry" \
+  bash -c 'cd "$1" && "$2" fmt --write >/dev/null && "$2" verify' _ "$T/libpkg" "$COIL"
 
 # `lint --fix` runs only the requested checkers: a checker module that lives in the
 # project's source roots but is not in [lint] rules does not run.

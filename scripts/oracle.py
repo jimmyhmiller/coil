@@ -142,12 +142,13 @@ def normalize_stage_output(stage: str, output: bytes) -> bytes:
     if stage in {"ir", "x86", "full"}:
         # LLVM 23 prints this double literal as f0x..., while LLVM 22 prints
         # the same 64-bit bit pattern as 0x.... It also adds `nosync` to the
-        # argmem read/write intrinsic's inferred attribute set. Normalize only
-        # these two known printer/version differences, not arbitrary IR.
+        # argmem intrinsic's inferred attribute set (read, write or readwrite).
+        # Normalize only these known printer/version differences, not arbitrary IR.
         output = re.sub(rb"(?<![\w.])f0x([0-9A-Fa-f]{16})(?![\w])", rb"0x\1", output)
-        return output.replace(
-            b"nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)",
-            b"nocallback nofree nounwind willreturn memory(argmem: readwrite)",
+        return re.sub(
+            rb"nocallback nofree nosync nounwind willreturn memory\(argmem: (read|write|readwrite)\)",
+            rb"nocallback nofree nounwind willreturn memory(argmem: \1)",
+            output,
         )
     return output
 
