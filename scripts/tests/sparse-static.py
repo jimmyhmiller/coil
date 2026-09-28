@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Sparse constants retain link-time semantics and compile cost independent of holes."""
 from pathlib import Path
+import os
 import platform
 import re
 import subprocess
@@ -18,8 +19,9 @@ COMPILER = Path(sys.argv[1]).resolve()
 FIXTURE_DATA_BYTES = 5 * 708334 * 8
 
 
-def run(args, expected=0):
-    result = subprocess.run(list(map(str, args)), cwd=ROOT, text=True, capture_output=True)
+def run(args, expected=0, env=None):
+    result = subprocess.run(list(map(str, args)), cwd=ROOT, text=True,
+                            capture_output=True, env=env)
     assert result.returncode == expected, (args, result.returncode, result.stdout, result.stderr)
     return result
 
@@ -73,17 +75,21 @@ int64_t native_check(void) {
     pattern = (r"(\d+)\s+maximum resident set size" if sys.platform == "darwin"
                else r"Maximum resident set size \(kbytes\):\s*(\d+)")
     for backend in backends:
+        # The arm64 backend builds its object in the compiler's tracked arena.
+        # Resident pages vary with host memory pressure, so compare the actual
+        # object-phase allocation instead of subtracting two RSS peaks.
+        trace_env = {**os.environ, "COIL_TRACE": "1"} if backend == "arm64" else None
         small_binary = work / (backend + '-small')
         baseline = run(["/usr/bin/time", "-l" if sys.platform == "darwin" else "-v", COMPILER,
                         "build", small_fixture, "--backend", backend, "-O0",
-                        "--link-flag", small_obj, "-o", small_binary])
+                        "--link-flag", small_obj, "-o", small_binary], env=trace_env)
         small_peak = int(re.search(pattern, baseline.stderr)[1]) * (1 if sys.platform == "darwin" else 1024)
         run([small_binary])
         print(f"baseline {backend}: 128-element arrays; peak {small_peak} B", flush=True)
         binary = work / backend
         start = time.monotonic()
         result = run(["/usr/bin/time", "-l" if sys.platform == "darwin" else "-v", COMPILER, "build", fixture, "--backend", backend,
-                      "-O0", "--link-flag", obj, "-o", binary])
+                      "-O0", "--link-flag", obj, "-o", binary], env=trace_env)
         elapsed = time.monotonic() - start
         pattern = (r"(\d+)\s+maximum resident set size" if sys.platform == "darwin"
                    else r"Maximum resident set size \(kbytes\):\s*(\d+)")
@@ -91,8 +97,8 @@ int64_t native_check(void) {
         assert max(small_peak, peak) < 512 * 1024 * 1024, (backend, small_peak, peak)
         # The sparse-static regression guard is relative: a 708334-element sparse
         # array must cost no more than the same program with 128 elements, beyond
-        # the data the object itself must contain. An absolute ceiling here tracked
-        # the whole compiler's working set instead.
+        # the data the object itself must contain. The absolute RSS ceiling above
+        # still catches gross runaway growth.
         # LLVM's object writer keeps runs of zeros as fill fragments, so it may
         # grow by nothing. The arm64 backend builds objects in memory: each large
         # static's section holds its bytes, holes included, and the finished image
@@ -100,10 +106,24 @@ int64_t native_check(void) {
         # outgrown buffer left behind in the arena (as its data section once did,
         # 125 MB for this fixture) exceeds that.
         materialized = 0 if backend == "llvm" else 2 * FIXTURE_DATA_BYTES
-        assert peak - small_peak < 16 * 1024 * 1024 + materialized, (
-            backend, 'sparse hole count grew compiler memory', small_peak, peak)
+        if backend == "arm64":
+            allocation_pattern = r"coil-profile\tallocated\tbackend\.arm64-object\t(\d+)"
+            small_allocations = re.findall(allocation_pattern, baseline.stderr)
+            large_allocations = re.findall(allocation_pattern, result.stderr)
+            assert len(small_allocations) == len(large_allocations) == 1, (
+                'missing or duplicate arm64 object allocation trace',
+                small_allocations, large_allocations)
+            allocated_growth = int(large_allocations[0]) - int(small_allocations[0])
+            assert allocated_growth < 16 * 1024 * 1024 + materialized, (
+                backend, 'sparse hole count grew compiler allocation',
+                small_allocations[0], large_allocations[0])
+        else:
+            assert peak - small_peak < 16 * 1024 * 1024, (
+                backend, 'sparse hole count grew compiler memory', small_peak, peak)
         run([binary])
-        print(f"PASS {backend}: constructor visibility, holes, nested arrays, mutation; {elapsed:.3f}s / {peak} B (growth {peak-small_peak} B)")
+        growth = (f"object allocation growth {allocated_growth} B" if backend == "arm64"
+                  else f"RSS growth {peak-small_peak} B")
+        print(f"PASS {backend}: constructor visibility, holes, nested arrays, mutation; {elapsed:.3f}s / {peak} B ({growth})")
     ir = run([COMPILER, "emit-ir", fixture]).stdout
     assert "target datalayout" in ir and "zeroinitializer" in ir
     assert len(ir) < 1_000_000, len(ir)
