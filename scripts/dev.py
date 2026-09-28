@@ -1275,6 +1275,8 @@ source-roots = ["src"]
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o3", "-O3"),
             lambda: build_run("tests/compiler/features/void_if_discarded.coil", "void-if-discarded"),
             lambda: build_run("tests/compiler/features/void_match_discarded.coil", "void-match-discarded"),
+            lambda: build_run("tests/compiler/features/meta_semantic_transform_partial_model.coil",
+                              "meta-semantic-transform-partial-model", want=42),
             lambda: build_run("tests/compiler/features/mutable_binding_fresh_value.coil",
                               "mutable-binding-fresh-value", *backend_flags),
             lambda: expect_rejected("tests/compiler/features/struct_reference_field_rejected.coil",
