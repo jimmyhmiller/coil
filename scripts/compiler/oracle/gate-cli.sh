@@ -384,7 +384,7 @@ printf '(module verdict)\n(import "coil.prop" :use *)\n(deftest bad (assert-eq 1
 verdict_out=$("$COIL" test "$T/verdict_test.coil" 2>&1)
 case "$verdict_out" in
   *"signal"*) bad "a failed assertion or property is reported without a signal" "$verdict_out" ;;
-  *"test bad ... FAILED"*"FAILED after 0 cases "*"test result: FAILED. 0 passed; 2 failed"*) ok "a failed assertion or property is reported without a signal" ;;
+  *"test bad ... FAILED"*"counterexample:"*"test always-false ... FAILED"*"test result: FAILED. 0 passed; 2 failed"*) ok "a failed assertion or property is reported without a signal" ;;
   *) bad "a failed assertion or property is reported without a signal" "$verdict_out" ;;
 esac
 
@@ -4073,6 +4073,56 @@ expect_rc 1 "lint --fix: a fix that does not compile fails the run" \
 cmp -s "$T/lint/victim.coil" "$T/lint/victim.orig" \
   && ok "lint --fix: the reverted round left the file byte-identical" \
   || bad "lint --fix: the reverted round left the file byte-identical" "the file was left broken"
+
+# Two suggestions from one checker are one transaction. A signature rewrite and
+# its call rewrite must land together; if a comment makes the signature unsafe,
+# the call must stay as it was too. The renderer must not move a comment from a
+# deleted function body onto the following definition to make the counts match.
+cat > "$T/lint/pairrule.coil" <<'EOF'
+(module pairrule)
+(import "coil.primitive" :as p)
+(defn pair-matching? [(form Code) (head Code) (name Code)] (-> bool)
+  (and (p/code-list? form)
+       (and (> (len form) 1)
+            (and (= (get form 0) head)
+                 (= (get form 1) name)))))
+(defn pair-inspect [(form Code)] (-> void)
+  (when (pair-matching? form `defn `f)
+    (p/suggest form "replace f signature" `(defn f [(x i64)] (-> i64) x)))
+  (when (pair-matching? form `f `1)
+    (p/suggest form "replace f call" `(f 1)))
+  (for child form (pair-inspect child)))
+(defn pair-propose [(modules Code)] (-> Code)
+  (for m modules
+    (when (= (get m 0) `sample)
+      (for form (p/code-rest m) (pair-inspect form))))
+  `0)
+(checker pair-propose :phase before-expand)
+EOF
+cat > "$T/lint/sample.coil" <<'EOF'
+(module sample)
+(defn f [(x i64) (y i64) (z i64)] (-> i64) (+ x (+ y z)))
+(defn main [] (-> i64) (f 1 2 3))
+EOF
+(cd "$T/lint" && "$COIL" lint sample.coil --use pairrule --fix) >/dev/null 2>&1 \
+  && ok "lint --fix: coordinated signature and call edits land together" \
+  || bad "lint --fix: coordinated signature and call edits land together" "fix failed"
+expect_rc 1 "lint --fix: coordinated edits leave a working program" \
+  "$COIL" run "$T/lint/sample.coil"
+cat > "$T/lint/sample.coil" <<'EOF'
+(module sample)
+(defn f [(x i64) (y i64) (z i64)] (-> i64)
+  ; keep the comment in f
+  (+ x (+ y z)))
+(defn main [] (-> i64) (f 1 2 3))
+EOF
+cp "$T/lint/sample.coil" "$T/lint/sample.comment.orig"
+(cd "$T/lint" && "$COIL" lint sample.coil --use pairrule --fix) >/dev/null 2>&1 \
+  && ok "lint --fix: a comment blocks its entire suggestion group" \
+  || bad "lint --fix: a comment blocks its entire suggestion group" "fix failed"
+cmp -s "$T/lint/sample.coil" "$T/lint/sample.comment.orig" \
+  && ok "lint --fix: withheld group leaves both definition and call untouched" \
+  || bad "lint --fix: withheld group leaves both definition and call untouched" "source changed"
 
 echo "== bundled stdlib manifest =="
 # The manifest in src/compiler/embedded_stdlib.coil decides which namespaces a
