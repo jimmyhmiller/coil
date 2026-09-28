@@ -298,6 +298,27 @@ for opt in -o --link-flag --backend --target --use --unit; do
 done
 expect_out "option '-o' requires a value" "a missing option value is named" "$COIL" build "$T/seven.coil" -o
 expect_rc 0 "lint accepts the frontend-wide --macro-expansion-limit" "$COIL" lint "$T/seven.coil" --macro-expansion-limit 1000000
+# A lint edit must pass through a second semantic analysis. Keep the budget on
+# that validation pass too, or a valid fix is rolled back after its first round.
+cat > "$T/lint-budget.coil" <<'EOF'
+(module lint-budget)
+(import "coil.primitive" :as primitive)
+(defstruct Box [(value i64)])
+(defn main [] (-> i64)
+  (let [(mut x) (Box :value 42)]
+    (load (field x value))))
+EOF
+expect_out "macro expansion budget exhausted" "lint's low expansion budget is enforced" \
+  "$COIL" lint "$T/lint-budget.coil" --diff --macro-expansion-limit 1
+expect_rc 0 "lint --fix keeps a raised macro budget through validation" \
+  "$COIL" lint "$T/lint-budget.coil" --fix --macro-expansion-limit 1000
+lint_budget_src=$(cat "$T/lint-budget.coil")
+case "$lint_budget_src" in
+  *'(.value x)'*) ok "lint applied the field syntax fix under the raised budget" ;;
+  *) bad "lint applied the field syntax fix under the raised budget" "$lint_budget_src" ;;
+esac
+expect_rc 0 "the budgeted lint result has no remaining warning" \
+  "$COIL" lint "$T/lint-budget.coil" --macro-expansion-limit 1000
 # A user extern whose C symbol the standard library also declares must agree on
 # machine types. `lint --fix` repairs a conflicting user declaration to the
 # library's C types even though the program does not compile until it does.
