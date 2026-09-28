@@ -119,6 +119,26 @@ def main() -> int:
         )
 
         expect_finding(compiler, tmp, "nesting_depth_regress.coil", 's = "[[[[["', "FAILED while fuzzing")
+        d = fixture_dir(tmp, "early_failure_regress.coil")
+        p = run(compiler, d, "fuzz", "early_failure_regress.coil", "--seed", "7", "-n", "100", "--status-every", "0")
+        totals = re.search(r"done .*?: 1 execs .*?, corpus 0, (\d+) of (\d+) edges", p.stdout)
+        check(
+            "first-case failure publishes coverage totals",
+            p.returncode != 0 and totals is not None and int(totals.group(2)) > 0
+            and "FAILED while fuzzing" in p.stdout,
+            "missing early coverage totals",
+            p.stdout,
+        )
+        d = fixture_dir(tmp, "early_failure_regress.coil", "early-replay-failure")
+        p = run(compiler, d, "fuzz", "early_failure_regress.coil", "--seed", "7", "-n", "100", "--cases", "0", "--status-every", "0")
+        totals = re.search(r"done .*?: 1 execs .*?, corpus 0, (\d+) of (\d+) edges", p.stdout)
+        check(
+            "first replay failure publishes coverage totals",
+            p.returncode != 0 and totals is not None and int(totals.group(2)) > 0
+            and "FAILED while fuzzing" in p.stdout,
+            "missing early replay coverage totals",
+            p.stdout,
+        )
         expect_finding(
             compiler,
             tmp,
