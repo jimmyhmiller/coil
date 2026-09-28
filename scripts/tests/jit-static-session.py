@@ -88,7 +88,7 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
             flags += ["--link-flag", flag]
     fixtures = ("derive_qualified_shape", "retained_heap", "jit_metadata_lifetime", "jit_type_lifetime", "jit_impl_lifetime", "jit_monomorph_report_lifetime", "jit_source_sharing", "jit_body_sharing", "jit_native_metadata_roots", "jit_repl_policy", "jit_static_session", "jit_static_lifetime", "jit_static_policy",
                 "jit_static_dynamic", "jit_static_isolation", "jit_single_form_proof", "jit_checked_baseline", "jit_env_values", "jit_env_stale", "jit_live_checker", "jit_redefined_signature",
-                "jit_generation_tokens", "jit_reserved_tokens", "jit_frontend_policy", "jit_meta_pipeline", "jit_deferred_publication", "jit_repair_diagnostics", "jit_defalias_rebind", "jit_retire_declarations", "jit_session_imports", "jit_session_free", "jit_llvm_backend", "jit_repl_second_submission", "jit_meta_accepted_impl", "jit_meta_generator_later", "jit_shared_prelude", "jit_before_expand_const_replacement", "jit_before_expand_sum_replacement", "jit_qualified_names", "jit_entry_compile_time_code", "jit_generic_replacement")
+                "jit_generation_tokens", "jit_reserved_tokens", "jit_frontend_policy", "jit_meta_pipeline", "jit_deferred_publication", "jit_repair_diagnostics", "jit_defalias_rebind", "jit_retire_declarations", "jit_session_imports", "jit_session_free", "jit_llvm_backend", "jit_repl_second_submission", "jit_meta_accepted_impl", "jit_meta_generator_later", "jit_shared_prelude", "jit_before_expand_const_replacement", "jit_before_expand_sum_replacement", "jit_qualified_names", "jit_entry_compile_time_code", "jit_generic_replacement", "jit_import_tolerant_helper")
     if sys.platform == "darwin":
         fixtures += ("jit_scratch_footprint",)
     # COIL_META_MAIN=1 in an embedding host: main-thread compiles run metaprograms
@@ -254,3 +254,16 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
             print(f"PASS: {future.result()}", flush=True)
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
+
+    # Importing the public JIT facade checks a large compiler graph. Keep this
+    # stack-depth regression serial so its memory does not overlap other hosts.
+    print(f"PASS: {build_and_run('jit_import_jit_facade')}", flush=True)
+
+    # A retained type-resolution record once borrowed names from the next
+    # resolve round's scratch arena. Source-link under ASan so the SDK itself
+    # is instrumented and the stale reflection lookup fails at the read.
+    reflected = work / "jit-nested-type-reflection"
+    run(COMPILER, "build", ROOT / "tests/compiler/features/jit_nested_type_reflection.coil",
+        "-o", reflected, "-O0", "--sanitize=address")
+    run(reflected, env=dict(TOOLCHAIN_ENV, ASAN_OPTIONS="detect_leaks=0"))
+    print("PASS: retained nested type reflection under AddressSanitizer", flush=True)
