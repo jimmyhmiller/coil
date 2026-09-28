@@ -993,6 +993,22 @@ def test_modernize_fast(compiler: str) -> None:
                 raise RuntimeError("fast modernization gate: serde options were not copied to both traits")
             execute(coil, "check", str(serde_probe))
 
+        def heap_binding_lint_task() -> None:
+            probe = tmp / "lint-heap-binding.coil"
+            probe.write_text("""(module lint-heap-binding)
+(defn keep [(heap i64)] (-> i64) heap)
+(defn main [] (-> i64) (keep 1))
+""")
+            original = probe.read_bytes()
+            execute(coil, "check", str(probe))
+            preview = subprocess.run([coil, "lint", "--diff", str(probe)], cwd=ROOT,
+                                     capture_output=True, text=True)
+            if preview.returncode != 0 or preview.stdout or "legacy metal operation" in preview.stderr:
+                raise RuntimeError("fast modernization gate: lint mistook a heap parameter for allocation:\n"
+                                   + preview.stdout + preview.stderr)
+            if probe.read_bytes() != original:
+                raise RuntimeError("fast modernization gate: lint preview changed a heap binding")
+
         def default_lint_task() -> None:
             probe = tmp / "default-lint.coil"
             probe.write_text((ROOT / "tests/metaprogramming/default_lint_input.coil").read_text())
@@ -1258,6 +1274,7 @@ source-roots = ["src"]
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o0", "-O0"),
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o3", "-O3"),
             lambda: build_run("tests/compiler/features/void_if_discarded.coil", "void-if-discarded"),
+            lambda: build_run("tests/compiler/features/void_match_discarded.coil", "void-match-discarded"),
             lambda: build_run("tests/compiler/features/mutable_binding_fresh_value.coil",
                               "mutable-binding-fresh-value", *backend_flags),
             lambda: expect_rejected("tests/compiler/features/struct_reference_field_rejected.coil",
@@ -1274,6 +1291,7 @@ source-roots = ["src"]
                               "alloc-static-initial-direct", *backend_flags),
             mtrace_fatal_report_task,
             lint_task,
+            heap_binding_lint_task,
             default_lint_task,
             broken_lint_task,
             broken_project_task,
