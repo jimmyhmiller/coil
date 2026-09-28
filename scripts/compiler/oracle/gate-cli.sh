@@ -3535,6 +3535,13 @@ echo "== C size types are target-width: the prelude's size_t/ssize_t are i32 on 
 # (Checked via emit-ir, not a full wasm build, because the C0/C1 wasm finalizer that lets
 # such a module link is not on this branch — the LLVM IR is what carries the width.)
 printf '(defn main [] (-> i64) (println "hi") 0)\n' > "$T/sizet.coil"
+# A leading --target used to be skipped because emit-ir scanned options only
+# after argv[2], even though the file finder accepted options before the file.
+linux_ir=$("$COIL" emit-ir --target x86_64-unknown-linux-gnu "$T/sizet.coil" 2>&1); linux_rc=$?
+case "$linux_rc:$linux_ir" in
+  0:*'target triple = "x86_64-unknown-linux-gnu"'*) ok "emit-ir applies --target before the file" ;;
+  *) bad "emit-ir --target before file" "wrong target or no IR (rc=$linux_rc)" ;;
+esac
 w_native=$("$COIL" emit-ir "$T/sizet.coil" 2>/dev/null | grep -oE 'declare i(64|32) @write\([^)]*\)' | head -1)
 w_wasm=$("$COIL" emit-ir "$T/sizet.coil" --target wasm32-unknown-unknown 2>/dev/null | grep -oE 'declare i(64|32) @write\([^)]*\)' | head -1)
 grep -q 'i64 @write(i32, ptr, i64)' <<<"$w_native" \
