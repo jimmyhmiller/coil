@@ -4423,6 +4423,12 @@ expect_rc_arm64 52 "const: same on the arm64 backend" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build a.coil --backend arm64 -o a2 && ./a2' \
   _ "$T/aggconst" "$COIL"
 
+expect_rc 112 "typed f32 consts preserve float width through a call (LLVM)" \
+  "$COIL" run tests/compiler/features/f32_typed_const.coil
+expect_rc_arm64 112 "typed f32 consts preserve float width through a call (arm64)" \
+  bash -c '"$1" build tests/compiler/features/f32_typed_const.coil --backend arm64 -o "$2" && "$2"' \
+  _ "$COIL" "$T/f32-typed-const"
+
 echo "== comptime generic-instance aggregates =="
 # `(Option i64)` / `(Pair i64 i64)` reported "cannot be materialized"; plain structs,
 # sums and arrays worked. Two independent causes: the readback did not understand TApp,
