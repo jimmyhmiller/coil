@@ -83,6 +83,13 @@ Use this format:
   sessions, sparse/named static storage, extern aliases and the supporting ABI
   fixes. The full CI job runs it against its verified compiler. Run this gate
   when changing those features; it includes actual-pipeline memory regressions.
+- **Changing expansion, resolution or checking without meaning to change meaning?**
+  Build a reference compiler from the commit before your change and run
+  `python3 scripts/tests/pipeline-differential.py <reference> <candidate>`. It
+  compares `dump-checked` and `dump-mono` over the compiler, `src/examples`,
+  `tests/compiler/features` and `tests/`; anything but `0 differ` is
+  a behaviour change to explain. It takes ~10 minutes, so it is a pre-merge check,
+  not a gate.
 - ⚠ **Two ways a shell gate reports a result it never established.** Both were
   found live in `gate-cli.sh`/`gate-target-os.sh`, in checks that had been green
   or red for months without meaning anything:
