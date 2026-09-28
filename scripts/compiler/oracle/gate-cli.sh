@@ -1418,6 +1418,40 @@ printf '(module lint-root-entry)\n(defn main [] (-> i64) (ior 40 2))\n' \
   && ok "project lint includes a package entry outside source roots" \
   || bad "project lint root entry" "entry = main.coil was silently skipped"
 
+# The project path and an entry-file lint use the same checked semantic model.
+# A pointer-valued field needs its explicit load before indexing; a scalar field
+# read does not. Report mode must make the same distinction in both paths.
+mkdir -p "$T/lint-field-parity/src"
+cat > "$T/lint-field-parity/Coil.toml" <<'EOF'
+[package]
+name = "field-parity"
+entry = "src/main.coil"
+source-roots = ["src"]
+EOF
+cat > "$T/lint-field-parity/src/ray.coil" <<'EOF'
+(module field-parity.ray)
+(defstruct Model [(materials (ptr i64)) (count i64)])
+EOF
+cat > "$T/lint-field-parity/src/main.coil" <<'EOF'
+(module field-parity.main)
+(import "field-parity.ray" :as r)
+(defn value [(model r/Model)] (-> i64)
+  (+ (load (field model count))
+     (load (index (cast (ptr i64) (load (field model materials))) 0))))
+(defn main [] (-> i64) 0)
+EOF
+field_file_out=$(cd "$T/lint-field-parity" && "$COIL" lint src/main.coil 2>&1)
+field_file_rc=$?
+field_project_out=$(cd "$T/lint-field-parity" && "$COIL" lint 2>&1)
+field_project_rc=$?
+field_file_count=$(printf '%s\n' "$field_file_out" | grep -c 'field access reads implicitly')
+field_project_count=$(printf '%s\n' "$field_project_out" | grep -c 'field access reads implicitly')
+[ "$field_file_rc" = 0 ] && [ "$field_project_rc" = 0 ] \
+  && [ "$field_file_count" = 1 ] && [ "$field_project_count" = 1 ] \
+  && ok "project and file lint agree on scalar versus pointer-valued field reads" \
+  || bad "project and file lint agree on scalar versus pointer-valued field reads" \
+         "file rc=$field_file_rc warnings=$field_file_count; project rc=$field_project_rc warnings=$field_project_count"
+
 # Project lint loads the project as a set of modules; there is no entry file and
 # none is invented. A namespace two files declare (a before/after fixture pair
 # under a source root) is reported at the declaring file, that module is left
