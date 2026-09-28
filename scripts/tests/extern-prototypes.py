@@ -226,7 +226,18 @@ def main():
             for name in sorted(names):
                 if name.endswith(".coil") and name != "guide.coil":
                     path = os.path.join(dirpath, name)
-                    declared[os.path.relpath(path, ROOT)] = externs_in(open(path).read())
+                    source = open(path).read()
+                    # Meta forms can select an ABI declaration for the target.
+                    # Inspect the compiler's expansion, not both quoted branches
+                    # in the source, so the gate checks the emitted extern.
+                    if re.search(r"(?m)^\s*\(meta(?:\s|\()", source):
+                        result = subprocess.run([compiler, "expand", path], cwd=ROOT,
+                                                capture_output=True, text=True, timeout=900)
+                        if result.returncode:
+                            raise SystemExit(f"cannot expand {path}:\n"
+                                             f"{result.stdout}{result.stderr}")
+                        source = result.stdout
+                    declared[os.path.relpath(path, ROOT)] = externs_in(source)
     names = {sig[0] for found in declared.values() for _, sig in found}
 
     with tempfile.TemporaryDirectory(prefix="coil-extern-prototypes-") as tmp:
