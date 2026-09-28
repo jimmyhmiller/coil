@@ -5609,9 +5609,9 @@ for suite in tests/stdlib_parsers_test.coil tests/serde_test.coil tests/serde_op
   expect_rc 0 "coil test $suite passes" "$COIL" test "$suite"
 done
 
-expect_rc 0 "TCP listener, client and accepted sockets are close-on-exec" \
+expect_rc 0 "TCP sockets are close-on-exec and timed accepts report the host timeout" \
   "$COIL" run tests/stdlib/socket_test.coil
-expect_rc 0 "Unix listener, client and accepted sockets are close-on-exec" \
+expect_rc 0 "Unix sockets are close-on-exec and timed accepts report the host timeout" \
   "$COIL" run tests/stdlib/unix_socket_test.coil
 
 # LLVM lowers vcompress-store / vexpand-load as a loop over the set mask bits;
