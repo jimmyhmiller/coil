@@ -26,7 +26,7 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 # The library sources this build starts from; recorded beside the result so an
 # install can never pair the compiler with different ones.
-TOOLCHAIN_STAMP=$(python3 scripts/compiler/toolchain_stamp.py digest)
+TOOLCHAIN_STAMP=$(python3 scripts/compiler/toolchain_stamp.py stamp)
 # Stage compilers land in /tmp; give /tmp the toolchain library they resolve against.
 . scripts/compiler/stage-lib.sh
 SRC=src/compiler/main.coil

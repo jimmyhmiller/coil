@@ -21,6 +21,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'cl-lib)
 (require 'coil-mode)
 (require 'coil-doc)
 (require 'coil-check)
@@ -59,6 +60,24 @@
 
 
 ;;; Indentation
+
+;; An answer to an older form must never replace the answer to a newer one:
+;; evaluations complete out of order, and only the latest request is shown.
+(ert-deftest coil-test-eval-discards-superseded-results ()
+  (let ((pending nil)
+        (reported nil))
+    (cl-letf (((symbol-function 'coil-eval-async)
+               (lambda (_text callback) (push callback pending)))
+              ((symbol-function 'coil--report)
+               (lambda (result &optional _position) (push result reported))))
+      (with-temp-buffer
+        (insert "(+ 1 1)\n(+ 2 2)\n")
+        (coil--eval "(+ 1 1)" 8)
+        (coil--eval "(+ 2 2)" 16)
+        ;; pending is newest first: deliver the newer answer, then the stale one.
+        (funcall (nth 0 pending) 'newer)
+        (funcall (nth 1 pending) 'older)
+        (should (equal reported '(newer)))))))
 
 (ert-deftest coil-test-indent-definition-body ()
   "A definition's body is two columns in, however long its signature ran."

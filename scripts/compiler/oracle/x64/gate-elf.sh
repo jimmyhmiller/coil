@@ -25,7 +25,7 @@ OBJ="$WORK/elf_selftest.o"
 EXE="$WORK/elf_selftest"
 fail=0
 check() {  # check <description> <condition-output> <expected-substring>
-  if printf '%s' "$2" | grep -q "$3"; then
+  if grep -q "$3" <<<"$2"; then
     echo "  ok   — $1"
   else
     echo "  FAIL — $1 (wanted /$3/, got: $(printf '%s' "$2" | head -1))"

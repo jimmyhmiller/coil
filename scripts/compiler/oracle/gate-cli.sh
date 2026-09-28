@@ -291,6 +291,123 @@ expect_rc 7 "build: flags BEFORE the file"               "$COIL" run "$T/seven.c
                     || bad "build leaves no adjacent object" "$T/a.o exists"
 expect_rc 1 "unknown flag is rejected"                   "$COIL" build "$T/seven.coil" -o "$T/b" --frobnicate
 expect_out "unknown flag" "unknown flag is named"        "$COIL" build "$T/seven.coil" -o "$T/b" --frobnicate
+# A value-taking option at the end of the command line used to segfault (139) in
+# whichever subcommand scanner read the missing argv entry.
+for opt in -o --link-flag --backend --target --use --unit; do
+  expect_rc 2 "a trailing $opt without its value is a usage error" "$COIL" build "$T/seven.coil" "$opt"
+done
+expect_out "option '-o' requires a value" "a missing option value is named" "$COIL" build "$T/seven.coil" -o
+expect_rc 0 "lint accepts the frontend-wide --macro-expansion-limit" "$COIL" lint "$T/seven.coil" --macro-expansion-limit 1000000
+# A user extern whose C symbol the standard library also declares must agree on
+# machine types. `lint --fix` repairs a conflicting user declaration to the
+# library's C types even though the program does not compile until it does.
+printf '(module extern-repair)\n(import "coil.fs" :as fs)\n(extern mkdir :cc c [(ptr i8) i32] (-> i32))\n(defn main [] (-> i64) (mkdir c"/nonexistent-coil-dir/x" 448) 0)\n' > "$T/extern_repair.coil"
+expect_out "rewrites the non-library declaration" "a conflicting user extern names the lint --fix migration" \
+  "$COIL" check "$T/extern_repair.coil"
+"$COIL" lint "$T/extern_repair.coil" --fix >/dev/null 2>&1
+expect_rc 0 "lint --fix repairs a user extern to the library's C signature" "$COIL" check "$T/extern_repair.coil"
+repaired=$(cat "$T/extern_repair.coil")
+case "$repaired" in
+  *"[(ptr i8) i32]"*) bad "the repaired extern no longer declares mode as i32" "$repaired" ;;
+  *) ok "the repaired extern no longer declares mode as i32" ;;
+esac
+# Only the entry module's `main` is the program entry. An imported module that
+# defines its own `main` used to replace a test file's synthesized runner, so
+# `coil test` ran the application and none of the tests.
+mkdir -p "$T/mainimport"
+printf '(module mainimport.lib)\n(defn helper [] (-> i64) 7)\n(defn main [] (-> i64) (println "LIB MAIN") 3)\n' > "$T/mainimport/lib.coil"
+printf '(module mainimport.lib-test)\n(import "mainimport.lib" :as lib)\n(deftest helper-works (assert-eq (lib/helper) 7))\n' > "$T/mainimport/lib_test.coil"
+printf '(module mainimport.entry)\n(import "mainimport.lib" :as lib)\n(defn main [] (-> i64) (lib/main))\n' > "$T/mainimport/entry.coil"
+expect_out "1 passed; 0 failed" "coil test runs the tests when an imported module defines main" \
+  bash -c 'cd "$1" && "$2" test lib_test.coil' _ "$T/mainimport" "$COIL"
+expect_rc 3 "an imported module's main is an ordinary function (lib/main)" \
+  bash -c 'cd "$1" && "$2" run entry.coil >/dev/null' _ "$T/mainimport" "$COIL"
+
+# A Coil --lib archive keeps its private copy of the stdlib, functions AND their
+# static cells, internal; the cells used to be exported and collided with the
+# program's own (15 duplicate symbols under -force_load).
+mkdir -p "$T/libdup"
+printf '(module libdup-lib)\n(defn lib-hello [] (-> i64) (println "from lib") 7)\n(export-c [lib-hello :as "libdup_hello"])\n' > "$T/libdup/lib.coil"
+printf '(module libdup-app)\n(extern libdup_hello :cc c [] (-> i64))\n(defn main [] (-> i64) (println "app {}" (libdup_hello)) 0)\n' > "$T/libdup/app.coil"
+"$COIL" build "$T/libdup/lib.coil" --lib -o "$T/libdup/liblib.a" >/dev/null 2>&1
+libdup_out=$("$COIL" build "$T/libdup/app.coil" -o "$T/libdup/app" --link-flag "-Wl,-force_load,$T/libdup/liblib.a" 2>&1)
+case "$libdup_out" in
+  *"duplicate symbol"*) bad "a Coil --lib archive links into a Coil program without duplicate stdlib statics" "$libdup_out" ;;
+  *) ok "a Coil --lib archive links into a Coil program without duplicate stdlib statics" ;;
+esac
+expect_out 'from lib' "the linked archive runs its own stdlib code" "$T/libdup/app"
+expect_out '^7$' "the program receives the archive result" "$T/libdup/app"
+
+# A transform that rebuilds forms keeps their source locations: with coil.arc.auto
+# active, each unused import is reported at its own line.
+printf '(module arcloc)\n(import "coil.lint.unused" :as u)\n(import "coil.arc.auto" :as aa)\n(import "coil.time" :as t)\n(import "coil.json" :as j)\n(defn main [] (-> i64) 0)\n' > "$T/arcloc.coil"
+arcloc_out=$("$COIL" check "$T/arcloc.coil" 2>&1)
+case "$arcloc_out" in
+  *"arcloc.coil:4:1"*"arcloc.coil:5:1"*) ok "rebuilt forms keep their own source locations" ;;
+  *) bad "rebuilt forms keep their own source locations" "$arcloc_out" ;;
+esac
+
+# A command run from inside a workspace member's directory compiles that member
+# inside its workspace: its namespace and the other members resolve.
+mkdir -p "$T/wsm/pkgs/alpha/src" "$T/wsm/pkgs/beta/src"
+printf '[workspace]\nname = "wsm"\nmembers = ["pkgs/*"]\n' > "$T/wsm/Coil.toml"
+printf '[package]\nname = "alpha"\n' > "$T/wsm/pkgs/alpha/Coil.toml"
+printf '[package]\nname = "beta"\nentry = "src/main.coil"\n' > "$T/wsm/pkgs/beta/Coil.toml"
+printf '(module wsm.alpha.core)\n(defn seven [] (-> i64) 7)\n' > "$T/wsm/pkgs/alpha/src/core.coil"
+printf '(module wsm.beta.main)\n(import "wsm.alpha.core" :as core)\n(defn main [] (-> i64) (core/seven))\n' > "$T/wsm/pkgs/beta/src/main.coil"
+expect_rc 0 "checking a file from inside a workspace member resolves the other members" \
+  bash -c 'cd "$1" && "$2" check src/main.coil' _ "$T/wsm/pkgs/beta" "$COIL"
+
+# A failed assertion or property is a test verdict, not a crash.
+printf '(module verdict)\n(import "coil.prop" :use *)\n(deftest bad (assert-eq 1 2))\n(defprop always-false [(x i64)] false)\n' > "$T/verdict_test.coil"
+verdict_out=$("$COIL" test "$T/verdict_test.coil" 2>&1)
+case "$verdict_out" in
+  *"signal"*) bad "a failed assertion or property is reported without a signal" "$verdict_out" ;;
+  *"test bad ... FAILED"*"FAILED after 0 cases "*"test result: FAILED. 0 passed; 2 failed"*) ok "a failed assertion or property is reported without a signal" ;;
+  *) bad "a failed assertion or property is reported without a signal" "$verdict_out" ;;
+esac
+
+# `coil test DIR` with no Coil.toml runs every *_test.coil under the directory.
+mkdir -p "$T/testdir/t/nested"
+printf '(module td-a)\n(deftest one (assert-eq 1 1))\n' > "$T/testdir/t/a_test.coil"
+printf '(module td-b)\n(deftest two (assert-eq 2 2))\n' > "$T/testdir/t/nested/b_test.coil"
+expect_out "2 test files: 2 passed, 0 failed" "coil test DIR outside a project runs the directory's tests" \
+  bash -c 'cd "$1" && "$2" test t' _ "$T/testdir" "$COIL"
+
+# A library package (no entry, no src/main.coil) checks its modules and tests and
+# has no program to build.
+mkdir -p "$T/libpkg/src" "$T/libpkg/tests"
+printf '[package]\nname = "libpkg"\n' > "$T/libpkg/Coil.toml"
+printf '(module libpkg.core)\n(defn twice [(x i64)] (-> i64) (* 2 x))\n' > "$T/libpkg/src/core.coil"
+printf '(module libpkg.orphan)\n(defn broken [] (-> i64) (no-such-function))\n' > "$T/libpkg/src/orphan.coil"
+printf '(module libpkg.core-test)\n(import "libpkg.core" :as c)\n(deftest t (assert-eq (c/twice 2) 4))\n' > "$T/libpkg/tests/core_test.coil"
+expect_out "no-such-function" "library check covers modules no test imports" \
+  bash -c 'cd "$1" && "$2" check' _ "$T/libpkg" "$COIL"
+rm "$T/libpkg/src/orphan.coil"
+expect_rc 0 "library check passes once its modules are clean" bash -c 'cd "$1" && "$2" check' _ "$T/libpkg" "$COIL"
+expect_out "is a library package" "building a library package says there is nothing to link" \
+  bash -c 'cd "$1" && "$2" build' _ "$T/libpkg" "$COIL"
+
+# `lint --fix` runs only the requested checkers: a checker module that lives in the
+# project's source roots but is not in [lint] rules does not run.
+mkdir -p "$T/lintscope/src" "$T/lintscope/tools"
+printf '[package]\nname = "lintscope"\nsource-roots = ["src", "tools"]\n' > "$T/lintscope/Coil.toml"
+printf '(module lintscope.main)\n(defn main [] (-> i64) 0)\n' > "$T/lintscope/src/main.coil"
+printf '(module lintscope.noisy)\n(import "coil.primitive" :as primitive)\n(defn noisy [(ms Code)] (-> Code) (primitive/warn (get ms 0) "UNREQUESTED CHECKER RAN") `0)\n(checker noisy)\n' > "$T/lintscope/tools/noisy.coil"
+lintscope_out=$(cd "$T/lintscope" && "$COIL" lint --fix 2>&1)
+case "$lintscope_out" in
+  *"UNREQUESTED CHECKER RAN"*) bad "lint --fix runs only requested checkers" "$lintscope_out" ;;
+  *) ok "lint --fix runs only requested checkers" ;;
+esac
+
+# manual-box migration also recognizes the modern `set!` initialization.
+printf '(module mbset)\n(import "coil.alloc" :as alloc :use [create unwrap-ptr malloc-allocator])\n(defstruct P [(x i64)])\n(defn make [] (-> (ptr P))\n  (let [p (unwrap-ptr [P] (create [P] (malloc-allocator)))]\n    (set! p (P :x 1))\n    p))\n(defn main [] (-> i64) (.x (make)))\n' > "$T/mbset.coil"
+"$COIL" lint "$T/mbset.coil" --fix >/dev/null 2>&1
+mbset=$(cat "$T/mbset.coil")
+case "$mbset" in
+  *"box!"*) case "$mbset" in *"unwrap-ptr [P]"*) bad "manual-box rewrites a set!-initialized create" "$mbset" ;; *) ok "manual-box rewrites a set!-initialized create" ;; esac ;;
+  *) bad "manual-box rewrites a set!-initialized create" "$mbset" ;;
+esac
 rm -rf "$T/default-build"
 mkdir -p "$T/default-build"
 ( cd "$T/default-build" && "$COIL" build "$T/seven.coil" >/dev/null 2>&1 )
@@ -3631,7 +3748,9 @@ combined_number_headings=$(printf '%s\n' "$combined_float" | awk '/^## Values an
 [ "$combined_number_headings" = 1 ] \
   && ok "guide: combined topics deduplicate shared source fragments" \
   || bad "guide: combined topics deduplicate shared source fragments" "Values section appeared $combined_number_headings times"
-expect_rc 1 "guide: at most three direct topics are accepted" "$COIL" guide tests modules structs match
+for guide_topic in '## Tests' '## Modules' '## Structs' '## Sum types'; do
+  expect_out "^$guide_topic" "guide: four direct topics include $guide_topic" "$COIL" guide tests modules structs match
+done
 guide_all=$("$COIL" guide --all 2>&1); guide_all_rc=$?
 case "$guide_all" in
   '# The Coil Language'*)
@@ -3952,8 +4071,8 @@ INSTALLED="$T/prefix/bin/coil"
 [ -d "$T/prefix/lib/coil/stdlib" ] && [ -d "$T/prefix/lib/coil/compiler" ] && [ -f "$T/prefix/lib/coil/prelude.coil" ] \
   && ok "install: the prefix holds stdlib, opt-in compiler SDK, and prelude" \
   || bad "install: the prefix holds stdlib, opt-in compiler SDK, and prelude" "missing"
-expect_rc 0 "install: version output contains only the compiler version" \
-  python3 -c 'import re, subprocess, sys; p = subprocess.run([sys.argv[1], "--version"], cwd="/", capture_output=True, text=True); assert p.returncode == 0 and re.fullmatch(r"coil [^\s]+\n", p.stdout) and not p.stderr, p' "$INSTALLED"
+expect_rc 0 "install: version output includes valid compiler provenance" \
+  python3 -c 'import re, subprocess, sys; p = subprocess.run([sys.argv[1], "--version"], cwd="/", capture_output=True, text=True); assert p.returncode == 0 and re.fullmatch(r"coil [^\s()]+(?: \(commit [0-9a-f]+, \d{4}-\d{2}-\d{2}(?:, dirty)?\))?\n", p.stdout) and not p.stderr, p' "$INSTALLED"
 expect_rc 0 "install: explicit stdlib path query returns the installed source directory" \
   python3 -c 'import pathlib, subprocess, sys; p = subprocess.run([sys.argv[1], "--print-stdlib-path"], cwd="/", capture_output=True, text=True); assert p.returncode == 0 and pathlib.Path(p.stdout.strip()).samefile(sys.argv[2]) and not p.stderr, p' "$INSTALLED" "$T/prefix/lib/coil/stdlib"
 "$COIL" namespaces > "$T/bundle/ns.txt" 2>/dev/null
@@ -4279,8 +4398,8 @@ cat > "$T/ver/unimported.coil" <<'EOF'
 (defn main [] (-> i64) (str-eq "a" "a"))
 EOF
 for version_arg in --version -V version; do
-  expect_rc 0 "version: $version_arg prints only the compiler version" \
-    python3 -c 'import re, subprocess, sys; p = subprocess.run(sys.argv[1:], capture_output=True, text=True); assert p.returncode == 0 and re.fullmatch(r"coil [^\s]+\n", p.stdout) and not p.stderr, p' "$COIL" "$version_arg"
+  expect_rc 0 "version: $version_arg prints valid compiler provenance" \
+    python3 -c 'import re, subprocess, sys; p = subprocess.run(sys.argv[1:], capture_output=True, text=True); assert p.returncode == 0 and re.fullmatch(r"coil [^\s()]+(?: \(commit [0-9a-f]+, \d{4}-\d{2}-\d{2}(?:, dirty)?\))?\n", p.stdout) and not p.stderr, p' "$COIL" "$version_arg"
 done
 expect_out "is a local binding here" \
   "shadow: a shadowed macro is reported as a local, not as a missing import" \
@@ -4862,9 +4981,9 @@ LINK_EOF
 grep -E '^@repl_static\.t\.statics\.counter__i64\.0 = weak_odr global' "$LINK/ir.ll" >/dev/null \
   && ok "a static inside a generic instantiation is weak_odr" \
   || bad "a static inside a generic instantiation is weak_odr" "$(grep 'counter__i64' "$LINK/ir.ll" | head -1)"
-grep -E '^@repl_static\.t\.statics\.ticks\.0 = global' "$LINK/ir.ll" >/dev/null \
-  && ok "a static inside a concrete function keeps one strong definition" \
-  || bad "a static inside a concrete function keeps one strong definition" "$(grep 'ticks' "$LINK/ir.ll" | head -1)"
+grep -E '^@repl_static\.t\.statics\.ticks\.0 = internal global' "$LINK/ir.ll" >/dev/null \
+  && ok "a concrete function's anonymous static is private to its unit" \
+  || bad "a concrete function's anonymous static is private to its unit" "$(grep 'ticks' "$LINK/ir.ll" | head -1)"
 grep -E '^@vtable\.[^ ]* = private constant' "$LINK/ir.ll" >/dev/null \
   && ok "a dyn vtable is private" \
   || bad "a dyn vtable is private" "$(grep '^@vtable' "$LINK/ir.ll" | head -1)"
@@ -5331,6 +5450,24 @@ for opt in -O0 -O3; do
   expect_out '^ok true$' "simd compress/expand sparse-bit loop ($opt)" \
     "$COIL" run tests/compiler/features/simd_compress_sparse.coil "$opt"
 done
+
+echo "== large zeroed stack array =="
+# An aggregate store of 32 KiB of zero bytes made LLVM's O3 InstCombine take
+# about 55 seconds when a fixed-length loop subsequently touched the array.
+large_zeroed_ir=$("$COIL" emit-ir tests/compiler/features/large_zeroed_stack.coil 2>&1)
+large_zeroed_rc=$?
+case "$large_zeroed_ir" in
+  *"call void @llvm.memset.p0.i64"*"i64 32768"*)
+    [ "$large_zeroed_rc" = 0 ] \
+      && ok "large zeroed stack array lowers to memset" \
+      || bad "large zeroed stack array lowers to memset" "emit-ir exited $large_zeroed_rc" ;;
+  *) bad "large zeroed stack array lowers to memset" "$large_zeroed_ir" ;;
+esac
+if [ "$large_zeroed_rc" = 0 ]; then
+  expect_rc 0 "large zeroed stack array compiles at O3" \
+    "$COIL" build tests/compiler/features/large_zeroed_stack.coil -O3 -o "$T/large-zeroed-stack"
+  [ -x "$T/large-zeroed-stack" ] && expect_rc 0 "large zeroed stack array runs correctly" "$T/large-zeroed-stack"
+fi
 
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
