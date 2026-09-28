@@ -5651,6 +5651,16 @@ if [ "$large_zeroed_rc" = 0 ]; then
   [ -x "$T/large-zeroed-stack" ] && expect_rc 0 "large zeroed stack array runs correctly" "$T/large-zeroed-stack"
 fi
 
+echo "== nested coil from a test reloads project configuration =="
+expect_rc 0 "nested coil runs the manifest checker" \
+  python3 scripts/tests/nested-coil-test-env.py "$COIL"
+
+echo "== subprocess cancellation survives output EOF =="
+expect_rc 0 "run honors cancellation and deadline after output EOF" \
+  "$COIL" run tests/stdlib/subprocess_run_test.coil
+expect_rc 0 "cancellation wake descriptors are close-on-exec" \
+  "$COIL" run tests/stdlib/selectors_many_test.coil
+
 echo
 [ "$FAIL" = 0 ] && echo "gate-cli: PASS" || echo "gate-cli: FAIL"
 exit $FAIL

@@ -93,6 +93,28 @@ def main() -> int:
         print(f"  before={len(deep_before)} bytes, after={len(deep_after)} bytes")
         return 1
 
+    # The arm head and bind vector are a pattern. Only the constructor in its
+    # body should receive a named-argument rewrite.
+    with tempfile.TemporaryDirectory() as td:
+        pattern = pathlib.Path(td) / "match-pattern.coil"
+        pattern.write_text("""(module lint-match)
+(defsum Item (A [(x i64) (y i64) (z i64)]))
+(defn f [(item Item)] (-> Item)
+  (match item
+    (A [x y z] (A x y z))))
+""")
+        pattern_proc = subprocess.run(
+            [args.coil, "lint", str(pattern), "--fix"],
+            capture_output=True, text=True, timeout=300)
+        pattern_after = pattern.read_text()
+    if (pattern_proc.returncode != 0 or "(A [x y z]" not in pattern_after
+            or ":x x" not in pattern_after or ":y y" not in pattern_after
+            or ":z z" not in pattern_after):
+        print("gate-lint-fires: FAIL — match pattern or body constructor rewritten incorrectly")
+        print(pattern_proc.stdout + pattern_proc.stderr)
+        print(pattern_after)
+        return 1
+
     print("gate-lint-fires: PASS (checkers fire; deep-column layout stays bounded)")
     return 0
 
