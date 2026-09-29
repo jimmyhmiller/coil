@@ -2,14 +2,15 @@
 """Check every C `extern` the compiler and standard library declare against the
 host's real prototypes.
 
-A program that declares a C function correctly must be able to import any
-standard-library module, or link `coil.jit`, without the compiler reporting
-"C symbol 'X' is declared twice with different signatures". So each extern in
-src/compiler and src/stdlib must agree with the system headers under the rule the
-compiler itself uses (resolve.coil `extern-abi-type-eq`): all pointers and
-function pointers agree, integers agree when their widths do (signedness is not
-ABI), and every other type must match exactly. Two declarations of one symbol in
-the repository must also agree with each other.
+The standard library's declarations are the reference a program's own can be
+compared against, so each extern in src/compiler and src/stdlib must agree with the
+system headers under the rule the compiler uses for a symbol's own declarations
+(resolve.coil `extern-abi-type-eq`): all pointers and function pointers agree,
+integers agree when their widths do (signedness is not ABI), and every other type
+must match exactly. Two declarations of one symbol in the repository must also
+agree with each other. (A program may declare a symbol with another integer width
+than the library; that is its own claim about the callee. The library is held to
+the headers.)
 
 The truth comes from one selective `cimport` of a header that includes the system
 headers listed below (each only if the host has it), asking for exactly the names
