@@ -135,7 +135,7 @@ long native_named_increment(void) { return ++coil_named_data; }
         ('(extern f :as "" [] (-> i64))', 'nonempty'),
         ('(extern f :as "a" :as "b" [] (-> i64))', 'duplicate :as'),
         ('(extern f :cc c :cc c [] (-> i64))', 'duplicate :cc'),
-        ('(extern f :as "call" [] (-> i64)) (extern g :as "call" [i64] (-> i64))', 'different signatures'),
+        ('(extern f :as "call" [] (-> i64)) (extern g :as "call" [i64] (-> i64))', 'incompatible signatures'),
     ]:
         source.write_text('(module alias.bad) ' + declaration + ' (defn main [] (-> i64) 0)')
         failed = run([COMPILER, "check", source], 1)
@@ -150,11 +150,11 @@ long native_named_increment(void) { return ++coil_named_data; }
             '(defn main [] (-> i64) 0)')
         result = run([COMPILER, "check", source], expected)
         if expected:
-            assert "extern in the same program imports it" in result.stdout + result.stderr
+            assert "cannot stand in for an extern of that symbol" in result.stdout + result.stderr
     source.write_text(source.read_text().replace(':as "other_callback"', ':as "callback_c"')
                       .replace('(extern callback_c ', '(extern renamed '))
     result = run([COMPILER, "check", source], 1)
-    assert "extern in the same program imports it" in result.stdout + result.stderr
+    assert "cannot stand in for an extern of that symbol" in result.stdout + result.stderr
 
     callback_obj = work / "callbacks.o"
     run(["cc", "-c", ROOT / "tests/compiler/features/c_aggregate_callback_export.c", "-o", callback_obj])

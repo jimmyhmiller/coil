@@ -319,19 +319,20 @@ case "$lint_budget_src" in
 esac
 expect_rc 0 "the budgeted lint result has no remaining warning" \
   "$COIL" lint "$T/lint-budget.coil" --macro-expansion-limit 1000
-# A user extern whose C symbol the standard library also declares must agree on
-# machine types. `lint --fix` repairs a conflicting user declaration to the
-# library's C types even though the program does not compile until it does.
-printf '(module extern-repair)\n(import "coil.fs" :as fs)\n(extern mkdir :cc c [(ptr i8) i32] (-> i32))\n(defn main [] (-> i64) (mkdir c"/nonexistent-coil-dir/x" 448) 0)\n' > "$T/extern_repair.coil"
-expect_out "rewrites the non-library declaration" "a conflicting user extern names the lint --fix migration" \
-  "$COIL" check "$T/extern_repair.coil"
-"$COIL" lint "$T/extern_repair.coil" --fix >/dev/null 2>&1
-expect_rc 0 "lint --fix repairs a user extern to the library's C signature" "$COIL" check "$T/extern_repair.coil"
-repaired=$(cat "$T/extern_repair.coil")
-case "$repaired" in
-  *"[(ptr i8) i32]"*) bad "the repaired extern no longer declares mode as i32" "$repaired" ;;
-  *) ok "the repaired extern no longer declares mode as i32" ;;
-esac
+# A user extern whose C symbol the standard library also declares is the user's
+# own claim about the callee: it may differ from the library's in integer width
+# (mode_t here), builds and runs against its own prototype, and `lint --fix`
+# leaves it alone. Only a different register class is a conflict.
+printf '(module extern-width)\n(import "coil.fs" :as fs)\n(extern mkdir :cc c [(ptr i8) i32] (-> i32))\n(defn main [] (-> i64) (mkdir c"/nonexistent-coil-dir/x" 448) 0)\n' > "$T/extern_width.coil"
+expect_rc 0 "a user extern may declare a library symbol with another integer width" "$COIL" check "$T/extern_width.coil"
+before=$(cat "$T/extern_width.coil")
+"$COIL" lint "$T/extern_width.coil" --fix >/dev/null 2>&1
+after=$(cat "$T/extern_width.coil")
+[ "$before" = "$after" ] && ok "lint --fix leaves a width-differing extern alone" \
+  || bad "lint --fix leaves a width-differing extern alone" "$after"
+printf '(module extern-class)\n(import "coil.fs" :as fs)\n(extern mkdir :cc c [(ptr i8) f64] (-> i32))\n(defn main [] (-> i64) 0)\n' > "$T/extern_class.coil"
+expect_out "declared twice with incompatible signatures" "a register-class conflict between declarations is rejected" \
+  "$COIL" check "$T/extern_class.coil"
 # Only the entry module's `main` is the program entry. An imported module that
 # defines its own `main` used to replace a test file's synthesized runner, so
 # `coil test` ran the application and none of the tests.
@@ -3649,7 +3650,7 @@ cat > "$T/export-extern-collision.coil" <<'EOF'
 (extern callback_c :cc c [Pair] (-> i64))
 (defn main [] (-> i64) 0)
 EOF
-expect_out "export-c defines C symbol 'callback_c'.*extern.*imports it.*remove the extern.*fnptr-of" \
+expect_out "export-c defines C symbol 'callback_c'.*also declares.*struct by value cannot stand in for an extern" \
   "a same-unit extern/export collision explains the supported callback path" \
   "$COIL" check "$T/export-extern-collision.coil"
 
