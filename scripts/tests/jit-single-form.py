@@ -52,7 +52,7 @@ assert [status for status, _ in submissions] == [
 
 # Capture the actual hygienic identity, not merely the public Var's spelling.
 old_names = [name for stage, name in submissions[1][1]
-             if stage == "emit" and name.endswith("@$proof-old")]
+             if stage == "emit" and name.endswith("@$proof-old--impl")]
 assert len(old_names) == 1, old_names
 old_name = old_names[0]
 old_parse = old_name.removeprefix("replsession.")
