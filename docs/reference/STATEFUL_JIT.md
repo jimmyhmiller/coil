@@ -51,6 +51,9 @@ what it holds.
 - A generic function can be redefined too. It has no single function pointer
   to swap, so new uses specialize the new template, while code compiled earlier
   keeps the specialization it already bound.
+- An impl submitted again replaces the accepted one: a trait impl, an inherent
+  impl or a generic impl with the same header. Code compiled earlier keeps the
+  impl it bound.
 - Types, macros, `def` bindings and `defn*` functions are static: you can't
   redefine them.
 - A `(module NAME)` form switches the namespace for later input. It does not
@@ -265,6 +268,11 @@ by importing it and using its `publish` entry:
 first: 0
 replacement: 0
 ```
+
+Under this policy an impl submitted again replaces the accepted impl with the
+same header, as if the submission began with the matching `retire-impl` or
+`retire-inherent` (below). A plain session keeps the strict rule, and a duplicate
+impl is an error there unless the submission retires the old one itself.
 
 Under this policy each function gets a fresh implementation identity per
 version, published through a `Var`. Compatible replacements reach existing

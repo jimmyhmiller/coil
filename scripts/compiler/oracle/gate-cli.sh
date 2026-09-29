@@ -4849,6 +4849,20 @@ EOF
     *"conflicting types for parameter 'T'"*) ok "repl reports the incompatible redefinition" ;;
     *) bad "repl reports the incompatible redefinition" "$repl_out" ;;
   esac
+  # An impl submitted again replaces the accepted one, as a function does.
+  impl_out=$(printf '%s\n' \
+    '(deftrait Hittable [Self] (hit [(self (ptr Self))] (-> i64)))' \
+    '(defstruct Dummy [(id i32)])' \
+    '(impl Hittable Dummy (hit [(self (ptr Dummy))] (-> i64) 1))' \
+    '(hit (cast (ptr Dummy) 0))' \
+    '(impl Hittable Dummy (hit [(self (ptr Dummy))] (-> i64) 2))' \
+    '(hit (cast (ptr Dummy) 0))' \
+    ':q' | if [ "$HOST_OS" = Darwin ]; then PATH="$T/no-cc:$PATH" "$REPL_COIL" repl 2>&1; else "$REPL_COIL" repl 2>&1; fi)
+  case "$impl_out" in
+    *"duplicate impl"*) bad "repl replaces an impl submitted again" "$impl_out" ;;
+    *'coil> 1'*'coil> 2'*) ok "repl replaces an impl submitted again" ;;
+    *) bad "repl replaces an impl submitted again" "$impl_out" ;;
+  esac
 
   # A REPL defn is published as a Var def, not a function; its :params carry the
   # names, so named calls order their arguments exactly as for a function.
