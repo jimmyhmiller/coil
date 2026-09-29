@@ -1009,6 +1009,26 @@ def test_modernize_fast(compiler: str) -> None:
             if probe.read_bytes() != original:
                 raise RuntimeError("fast modernization gate: lint preview changed a heap binding")
 
+            static_probe = tmp / "lint-static-parameter.coil"
+            static_probe.write_text("""(module lint-static-parameter)
+(defstruct Cell [(value i64)])
+(defn read [(static (ref Cell))] (-> i64) (.value static))
+(defn generic [T] [(static (ref T))] (-> i64) 0)
+(deftrait CellReader [Self] (cell-value [(static (ref Self))] (-> i64)))
+(impl CellReader Cell
+  (cell-value [(static (ref Cell))] (-> i64) (.value static)))
+(defn main [] (-> i64) 0)
+""")
+            static_original = static_probe.read_bytes()
+            execute(coil, "check", str(static_probe))
+            preview = subprocess.run([coil, "lint", "--diff", str(static_probe)], cwd=ROOT,
+                                     capture_output=True, text=True)
+            if preview.returncode != 0 or preview.stdout or "alloc-static" in preview.stderr:
+                raise RuntimeError("fast modernization gate: lint rewrote a static parameter binder:\n"
+                                   + preview.stdout + preview.stderr)
+            if static_probe.read_bytes() != static_original:
+                raise RuntimeError("fast modernization gate: lint preview changed a static parameter binder")
+
         def default_lint_task() -> None:
             probe = tmp / "default-lint.coil"
             probe.write_text((ROOT / "tests/metaprogramming/default_lint_input.coil").read_text())
