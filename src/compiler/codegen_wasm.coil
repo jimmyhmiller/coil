@@ -843,16 +843,66 @@
 ; Coil function are interchangeable behind a function pointer:
 ;   - an integer of 32 bits or fewer, or bool, is an i32; i64 and pointers are i64;
 ;     f32/f64 are f32/f64;
-;   - an aggregate argument is passed as a pointer to a copy (byval);
-;   - an aggregate result is written through a leading pointer (sret), and the
-;     function then has no result;
+;   - a struct whose only data is one scalar (clang's single-element struct)
+;     travels as that scalar, and an empty struct is not passed or returned at
+;     all (wabi-class);
+;   - any other aggregate argument is passed as a pointer to a copy (byval), and
+;     any other aggregate result is written through a leading pointer (sret),
+;     the function then having no result;
 ;   - a variadic function takes one more i64: the address of a buffer holding the
 ;     variadic arguments (see wemit-invoke).
 ; Inside a function every scalar is an i64 in a frame slot (canonical: extended
 ; from its width; a float is its bit pattern), so values convert at the boundary.
+; How the C ABI carries a value of type `t` (a declared parameter or result type).
+(defsum WAbi
+  (WAbiScalar [(t Type)])  ; a scalar: `t` itself, or a single-element struct's element
+  (WAbiEmpty [])  ; an empty struct, or void: nothing
+  (WAbiIndirect []))  ; any other aggregate: by pointer
+
+; clang's single-element struct, as codegen.coil's cg-single-element: the one
+; scalar a type's data amounts to, ignoring empty fields and seeing through
+; nested structs and one-element arrays; none for a bit-struct, a sum, a slice,
+; or anything with more than one scalar.
+(defn wsingle-element [(g (ptr Wcg)) (t (ptr Type))] (-> (Option Type))
+  (match (load t)
+    (TStruct [nm]
+             (let [si (wstruct-idx g nm)]
+               (if (< si (primitive/cast i64 0))
+                   (None [Type])
+                   (let [e (struct-at (field g layouts) si)]
+                     (match (.layout e)
+                       (LBits [_ _] (None [Type]))
+                       (_ (let [fs (load (field e fields))
+                                (mut found) (None [Type])
+                                (mut count) 0]
+                            (for [i 0 (len (load fs))]
+                              (let [ft (field (wal-at [Field] fs i) ty)]
+                                (unless (= (wty-size g ft) (primitive/cast i64 0))
+                                  (set! count (+ count 1))
+                                  (set! found (wsingle-element g ft)))))
+                            (if (= count 1) found (None [Type])))))))))
+    (TArray [elem n] (if (= (extent-value n) 1) (wsingle-element g elem) (None [Type])))
+    (TInt [_ _] (Some (load t)))
+    (TFloat [_] (Some (load t)))
+    (TBool [] (Some (load t)))
+    (TPtr [_] (Some (load t)))
+    (TFn [_ _ _] (Some (load t)))
+    (_ (None [Type]))))
+
+(defn wabi-class [(g (ptr Wcg)) (t (ptr Type))] (-> WAbi)
+  (cond (match (load t) (TVoid [] true) (_ false)) (WAbiEmpty)
+        (wty-scalar? t) (WAbiScalar (load t))
+        (= (wty-size g t) (primitive/cast i64 0)) (WAbiEmpty)
+        :else
+          (match (wsingle-element g t)
+            (Some [e] (if (= (wty-size g (box-type (.a g) e)) (wty-size g t))
+                          (WAbiScalar e)
+                          (WAbiIndirect)))
+            (None [] (WAbiIndirect)))))
+
+; A result written through an sret pointer.
 (defn wty-aggret? [(g (ptr Wcg)) (ret (ptr Type))] (-> bool)
-  (and (not (match (load ret) (TVoid [] true) (_ false)))
-       (not (wty-scalar? ret))))
+  (match (wabi-class g ret) (WAbiIndirect [] true) (_ false)))
 
 ; the wasm value type (0x7F i32, 0x7E i64, 0x7D f32, 0x7C f64) carrying `t`.
 (defn wvaltype [(t (ptr Type))] (-> i64)
@@ -868,18 +918,22 @@
                         (variadic bool)
                         (b (mut (ArrayList u8)))] (-> i64)
   (let [np (len (load types))
-        retvoid (match (load ret) (TVoid [] true) (_ false))
-        aggret (wty-aggret? g ret)]
+        aggret (wty-aggret? g ret)
+        (mut passed) 0]
+    (for [i 0 np]
+      (match (wabi-class g (al-elem [Type] types i)) (WAbiEmpty [] 0) (_ (set! passed (+ passed 1)))))
     (wb! (mut b) 96)
-    (wuleb! (mut b) (+ np (+ (when aggret 1) (when variadic 1))))
+    (wuleb! (mut b) (+ passed (+ (when aggret 1) (when variadic 1))))
     (when aggret (wb! (mut b) 126))
     (for [i 0 np]
-      (let [pt (al-elem [Type] types i)]
-        (wb! (mut b) (if (wty-scalar? pt) (wvaltype pt) 126))))
+      (match (wabi-class g (al-elem [Type] types i))
+        (WAbiScalar [st] (wb! (mut b) (wvaltype (box-type (.a g) st))))
+        (WAbiEmpty [] 0)
+        (WAbiIndirect [] (wb! (mut b) 126))))
     (when variadic (wb! (mut b) 126))
-    (if (or retvoid aggret)
-        (wuleb! (mut b) 0)
-        (do (wuleb! (mut b) 1) (wb! (mut b) (wvaltype ret))))
+    (match (wabi-class g ret)
+      (WAbiScalar [st] (do (wuleb! (mut b) 1) (wb! (mut b) (wvaltype (box-type (.a g) st)))))
+      (_ (wuleb! (mut b) 0)))
     0))
 
 (defn wtype-idx! [(g (ptr Wcg)) (types (ptr (ArrayList Type))) (ret (ptr Type)) (variadic bool)] (-> i64)
@@ -1022,7 +1076,11 @@
 (defn wcollect-expr! [(out (mut (ArrayList (slice u8)))) (e (ptr Expr))] (-> i64)
   (match (.kind e)
     (ECall [func _t _args] (wname-add! (mut out) func))
-    (EFnPtrOf [name] (wname-add! (mut out) name))
+    ; a function pointer may be its by-value C entry (wfnptr-target)
+    (EFnPtrOf [name]
+              (do
+                (wname-add! (mut out) name)
+                (wname-add! (mut out) (export-c-thunk-name (.alc out) name))))
     (EMakeDyn [_d _v methods _i]
               (for [i 0 (len (load methods))]
                 (wname-add! (mut out) (get (load methods) i))))
@@ -1084,11 +1142,6 @@
 
 ; reachability SEEDS: standalone ⇒ `main`; side-module ⇒ every (export-c …) entry.
 (defn wseeds [(a (dyn Allocator)) (mp (ptr Program)) (side bool)] (-> (ptr (ArrayList (slice u8))))
-  ; An unpublished export is the by-value C entry of an anonymous `c` function (or
-  ; a fnptr-of forwarder) taking a struct by value. Native backends need a thunk
-  ; there because they pass a struct to a Coil function by address but to C by
-  ; value; under the wasm C ABI a struct argument is a pointer to a copy either
-  ; way, so the function itself is its C entry and needs no thunk or export.
   (let [(mut s) (al-new [(slice u8)] a)]
     (if side
         (let [es (load (field mp exports))
@@ -1730,57 +1783,75 @@
             (primitive/cast u8 (if (< k 4) (primitive/ior byte 128) byte)))))
   0)
 
-; Copy an aggregate value into a fresh slot and push the copy's address: a C
-; callee owns its byval argument and may write to it.
-(defn wg-push-agg-copy! [(g (ptr Wcg)) (av WAVal)] (-> i64)
-  (let [tp (primitive/alloc-stack Type)]
-    (set! tp (av-ty av))
-    (let [slot (wslot-for-ty! g tp)]
-      (wg-push-addr! g slot)
-      (wg-addr-of-av! g av)
-      (wg-i64-const! g (wty-size g tp))
-      (wg-memcopy! g)
-      (wg-push-addr! g slot))))
+; Push the address of the aggregate `av` stands for: `av` is the aggregate
+; itself, or a pointer to it (mono binds an aggregate local as its slot's address).
+(defn wg-push-agg-addr! [(g (ptr Wcg)) (av WAVal)] (-> i64)
+  (let [tp (box-type (.a g) (av-ty av))]
+    (if (wty-scalar? tp) (wg-push-av! g av) (wg-addr-of-av! g av))))
+
+; Copy the aggregate `av` stands for (of type `tp`) into a fresh slot and push the
+; copy's address: a C callee owns its byval argument and may write to it.
+(defn wg-push-agg-copy! [(g (ptr Wcg)) (av WAVal) (tp (ptr Type))] (-> i64)
+  (let [slot (wslot-for-ty! g tp)]
+    (wg-push-addr! g slot)
+    (wg-push-agg-addr! g av)
+    (wg-i64-const! g (wty-size g tp))
+    (wg-memcopy! g)
+    (wg-push-addr! g slot)))
+
+; Push the scalar a single-element struct value `av` amounts to (element type
+; `et`, at offset 0), as its canonical i64.
+(defn wg-push-single! [(g (ptr Wcg)) (av WAVal) (et Type)] (-> i64)
+  (let [etp (box-type (.a g) et)]
+    (wg-push-agg-addr! g av)
+    (wg-load-mem! g (wty-size g etp) (wty-signed? etp))))
+
+; The bytes a scalar of type `t` takes in the va_list buffer: a 32-bit-or-narrower
+; integer or an f32 is 4 (LLVM legalizes narrower integers to i32), else 8.
+(defn wvararg-size [(t (ptr Type))] (-> i64)
+  (let [vt (wvaltype t)]
+    (if (or (= vt (primitive/cast i64 127)) (= vt (primitive/cast i64 125))) 4 8)))
 
 ; The variadic arguments, stored where the callee's va_list reads them: each at
-; its natural size and alignment in a frame buffer, an integer narrower than 32
-; bits widened to an i32 slot and an aggregate as a pointer to a copy — the
-; layout LLVM's wasm lowering gives the same call. Pushes the buffer's address,
-; or 0 when there are none.
+; its natural size and alignment in a frame buffer — an integer narrower than 32
+; bits widened to an i32 slot, a single-element struct as its element, an empty
+; struct not at all, and any other aggregate as a pointer to a copy — the layout
+; clang's va_arg reads and LLVM's wasm lowering writes. Pushes the buffer's
+; address, or 0 when it is empty.
 (defn wg-push-varargs! [(g (ptr Wcg)) (avs (ptr (ArrayList WAVal))) (from i64)] (-> i64)
-  (let [n (len (load avs))
+  (let [a (.a g)
+        n (len (load avs))
         (mut off) 0
-        (mut offs) (al-new [i64] (.a g))]
+        (mut offs) (al-new [i64] a)]
     (for [i from n]
-      (let [tp (primitive/alloc-stack Type)]
-        (set! tp (av-ty (get (load avs) i)))
-        (let [sz (if (and (wty-scalar? tp) (!= (wvaltype tp) (primitive/cast i64 126))
-                          (!= (wvaltype tp) (primitive/cast i64 124)))
-                     4
-                     8)]
-          (set! off (* (/ (+ off (- sz 1)) sz) sz))
-          (push! (mut offs) off)
-          (set! off (+ off sz)))))
+      (let [tp (box-type a (av-ty (get (load avs) i)))
+            sz (match (wabi-class g tp)
+                 (WAbiScalar [st] (wvararg-size (box-type a st)))
+                 (WAbiEmpty [] 0)
+                 (WAbiIndirect [] 8))]
+        (unless (= sz (primitive/cast i64 0))
+          (set! off (* (/ (+ off (- sz 1)) sz) sz)))
+        (push! (mut offs) off)
+        (set! off (+ off sz))))
     (if (= (load off) (primitive/cast i64 0))
         (wg-i64-const! g 0)
         (let [buf (wslot-new! g (load off) 16)]
           (for [i from n]
             (let [av (get (load avs) i)
-                  tp (primitive/alloc-stack Type)
+                  tp (box-type a (av-ty av))
                   at (+ buf (get offs (- i from)))]
-              (set! tp (av-ty av))
-              (if (wty-scalar? tp)
-                  (do
-                    (wg-push-addr! g at)
-                    (wg-push-av! g av)
-                    (if (or (= (wvaltype tp) (primitive/cast i64 126))
-                            (= (wvaltype tp) (primitive/cast i64 124)))
-                        (wg-i64-store! g)
-                        (wg-store-mem! g 4)))
-                  (do
-                    (wg-push-addr! g at)
-                    (wg-push-agg-copy! g av)
-                    (wg-i64-store! g)))))
+              (match (wabi-class g tp)
+                (WAbiScalar [st]
+                            (do
+                              (wg-push-addr! g at)
+                              (if (wty-scalar? tp) (wg-push-av! g av) (wg-push-single! g av st))
+                              (wg-store-mem! g (wvararg-size (box-type a st)))))
+                (WAbiEmpty [] 0)
+                (WAbiIndirect []
+                              (do
+                                (wg-push-addr! g at)
+                                (wg-push-agg-copy! g av tp)
+                                (wg-i64-store! g))))))
           (wg-push-addr! g buf)))
     0))
 
@@ -1793,30 +1864,45 @@
                         (avs (ptr (ArrayList WAVal)))
                         (callee WCallee)
                         (variadic bool)] (-> WAVal)
-  (let [retvoid (match (load retp) (TVoid [] true) (_ false))
-        aggret (wty-aggret? g retp)
-        scalarret (and (not retvoid) (not aggret))
+  (let [a (.a g)
+        rclass (wabi-class g retp)
+        retvoid (match (load retp) (TVoid [] true) (_ false))
+        aggret (match rclass (WAbiIndirect [] true) (_ false))
+        ; a scalar result, or a single-element struct's element, stored into resslot
+        scalarret (match rclass (WAbiScalar [_] true) (_ false))
         n (len (load avs))
         nfixed (len (load types))
         ; a Coil function copies an aggregate argument into its own frame; any
         ; other callee is C, which owns its byval copy
         copy (match callee (WDefined [_] false) (_ true))
-        resslot (if scalarret (wslot-new! g 8 8) -1)
-        retslot (if aggret (wslot-for-ty! g retp) -1)]
+        resslot (cond (and scalarret (wty-scalar? retp)) (wslot-new! g 8 8)
+                      (not retvoid) (wslot-for-ty! g retp)  ; an aggregate result's storage
+                      :else -1)]
     (when (and (> n nfixed) (not variadic))
       (wcg-fail "call passes more arguments than a non-variadic callee takes"))
-    (when scalarret (wg-push-addr! g resslot))  ; address for the post-call scalar store
-    (when aggret (wg-push-addr! g retslot))  ; sret pointer (first arg)
-    ; an aggregate argument travels as an address whatever the declared type says
-    ; (mono types a by-value struct parameter of a Coil function as a pointer, and
-    ; a raw call-ptr keeps that type), as arm64 classifies by the argument's type
+    (when scalarret (wg-push-addr! g resslot))  ; address for the post-call store
+    (when aggret (wg-push-addr! g resslot))  ; sret pointer (first arg)
     (for [j 0 (if (< n nfixed) n nfixed)]
       (let [av (get (load avs) j)
             pt (al-elem [Type] types j)
-            at (box-type (.a g) (av-ty av))]
-        (if (wty-scalar? at)
-            (do (wg-push-av! g av) (wg-canon->c! g (if (wty-scalar? pt) pt at)) 0)
-            (if copy (wg-push-agg-copy! g av) (wg-addr-of-av! g av)))))
+            at (box-type a (av-ty av))]
+        (if (wty-scalar? pt)
+            (if (wty-scalar? at)
+                (do (wg-push-av! g av) (wg-canon->c! g pt) 0)
+                ; an aggregate argument declared as a pointer travels as its
+                ; address: mono types a by-value struct parameter of a Coil
+                ; function as a pointer, and a raw call-ptr keeps that type
+                (if copy (wg-push-agg-copy! g av at) (wg-addr-of-av! g av)))
+            ; a by-value aggregate parameter (the argument is the aggregate or a
+            ; pointer to it), carried as the C ABI says
+            (match (wabi-class g pt)
+              (WAbiScalar [et]
+                          (do
+                            (wg-push-single! g av et)
+                            (wg-canon->c! g (box-type a et))
+                            0))
+              (WAbiEmpty [] 0)
+              (WAbiIndirect [] (if copy (wg-push-agg-copy! g av pt) (wg-push-agg-addr! g av)))))))
     (when variadic (wg-push-varargs! g avs nfixed))
     (match callee
       (WDefined [ordinal]
@@ -1833,11 +1919,16 @@
                    (wg-op! g 17)
                    (wg-uleb! g typeidx)
                    (wg-uleb! g 0))))  ; call_indirect typeidx table0
-    (if scalarret
-        (do (wg-c->canon! g retp) (wg-i64-store! g) (mk-av 1 resslot (load retp)))
-        (if aggret
-            (mk-av 1 retslot (load retp))
-            (mk-av 0 0 (TInt 64 true))))))
+    (match rclass
+      (WAbiScalar [st]
+                  (let [stp (box-type a st)]
+                    (wg-c->canon! g stp)
+                    ; a single-element struct result: its element at offset 0
+                    (if (wty-scalar? retp) (wg-i64-store! g) (wg-store-mem! g (wty-size g stp)))
+                    (mk-av 1 resslot (load retp))))
+      (_ (if retvoid
+             (mk-av 0 0 (TInt 64 true))
+             (mk-av 1 resslot (load retp)))))))
 
 (defn wemit-args [(g (ptr Wcg)) (args (ptr (ArrayList Expr)))] (-> (ptr (ArrayList WAVal)))
   (let [(mut avs) (al-new [WAVal] (.a g))]
@@ -1884,8 +1975,15 @@
            (mk-av 0 0 (TInt 64 true)))))))
 
 ; The type of `(fnptr-of name)`.
-(defn wfnptr-type [(g (ptr Wcg)) (name0 (slice u8))] (-> Type)
+; The function a `(fnptr-of name)` points at: its by-value C entry when it has
+; one (see wcg-build-module), otherwise the function or the extern it binds to.
+(defn wfnptr-target [(g (ptr Wcg)) (name0 (slice u8))] (-> (slice u8))
   (let [name (wcall-target (.program g) name0)
+        thunk (export-c-thunk-name (.a g) name)]
+    (if (>= (wsig-idx g thunk) (primitive/cast i64 0)) thunk name)))
+
+(defn wfnptr-type [(g (ptr Wcg)) (name0 (slice u8))] (-> Type)
+  (let [name (wfnptr-target g name0)
         si (wsig-idx g name)]
     (if (>= si (primitive/cast i64 0))
         (let [e (wal-at [WSig] (field g sigs) si)]
@@ -1898,7 +1996,7 @@
 ; program does not define: its import is the target.
 (defn wfnptr-slot [(g (ptr Wcg)) (name0 (slice u8))] (-> i64)
   (set! (.needs-table g) true)
-  (let [name (wcall-target (.program g) name0)
+  (let [name (wfnptr-target g name0)
         si (wsig-idx g name)]
     (if (>= si (primitive/cast i64 0))
         (.ordinal (wal-at [WSig] (field g sigs) si))
@@ -3111,33 +3209,44 @@
           aggret (wty-aggret? g retp)
           sretoff (when aggret 1)]
       (set! (.aggret g) aggret)
-      ; the frame base lives in the first local after the parameters
-      (set! (.fp-local g) (+ np sretoff))
-      ; parameter intake: wasm local (i + sretoff) → a slot bound to the name.
-      (let [(mut i) 0]
+      ; the frame base lives in the first local after the parameters (an empty
+      ; struct parameter has no local)
+      (let [(mut nlocals) sretoff]
+        (for [k 0 np]
+          (match (wabi-class g (field (wal-at [Param] ps k) ty))
+            (WAbiEmpty [] 0)
+            (_ (set! nlocals (+ nlocals 1)))))
+        (set! (.fp-local g) nlocals))
+      ; parameter intake: each parameter's local → a slot bound to its name.
+      (let [(mut i) 0
+            (mut local) sretoff]
         (loop (if (>= (load i) np)
                   (break)
                   (do
                     (let [prm (wal-at [Param] ps (load i))
                           t (field prm ty)
                           slot (wslot-for-ty! g t)]
-                      (if (wty-scalar? t)
-                          ; scalar: the C value in the local → its canonical i64 slot
-                          (do
-                            (wg-push-addr! g slot)
-                            (we-local-get! (mut (.code g))
-                                           (primitive/iadd (load i) sretoff))
-                            (wg-c->canon! g t)
-                            (wg-i64-store! g)
-                            0)
-                          ; aggregate: local is a pointer; copy the pointee into a private slot
-                          (do
-                            (wg-push-addr! g slot)
-                            (we-local-get! (mut (.code g))
-                                           (primitive/iadd (load i) sretoff))
-                            (wg-i64-const! g (wty-size g t))
-                            (wg-memcopy! g)
-                            0))
+                      (match (wabi-class g t)
+                        ; a scalar, or a single-element struct's element (stored at
+                        ; offset 0 of the struct's slot): the C value → canonical
+                        (WAbiScalar [st]
+                                    (let [stp (box-type a st)]
+                                      (wg-push-addr! g slot)
+                                      (we-local-get! (mut (.code g)) local)
+                                      (wg-c->canon! g stp)
+                                      (if (wty-scalar? t) (wg-i64-store! g) (wg-store-mem! g (wty-size g stp)))
+                                      (set! local (+ local 1))))
+                        ; an empty struct: nothing was passed
+                        (WAbiEmpty [] 0)
+                        ; any other aggregate: the local is a pointer; copy the
+                        ; pointee into a private slot
+                        (WAbiIndirect []
+                                      (do
+                                        (wg-push-addr! g slot)
+                                        (we-local-get! (mut (.code g)) local)
+                                        (wg-i64-const! g (wty-size g t))
+                                        (wg-memcopy! g)
+                                        (set! local (+ local 1)))))
                       (set! (.env g)
                             (wscope-put a
                                         (load (field g env))
@@ -3153,16 +3262,22 @@
           (if (.terminated g)
               (wg-op! g 0)  ; unreachable
               (do
-                (unless retvoid
-                  (if aggret
-                      ; copy the aggregate result through the sret pointer (local 0)
-                      (do
-                        (we-local-get! (mut (field g code)) 0)
-                        (wg-addr-of-av! g bav)
-                        (wg-i64-const! g (wty-size g retp))
-                        (wg-memcopy! g)
-                        0)
-                      (do (wg-push-av! g bav) (wg-canon->c! g retp) 0)))  ; scalar result on the stack
+                (match (wabi-class g retp)
+                  ; a scalar result on the stack — for a single-element struct, its element
+                  (WAbiScalar [st]
+                              (let [stp (box-type a st)]
+                                (if (wty-scalar? retp) (wg-push-av! g bav) (wg-push-single! g bav st))
+                                (wg-canon->c! g stp)))
+                  ; an empty struct or void: nothing
+                  (WAbiEmpty [] 0)
+                  ; copy the aggregate result through the sret pointer (local 0)
+                  (WAbiIndirect []
+                                (do
+                                  (we-local-get! (mut (field g code)) 0)
+                                  (wg-addr-of-av! g bav)
+                                  (wg-i64-const! g (wty-size g retp))
+                                  (wg-memcopy! g)
+                                  0)))
                 ; epilogue: $sp = frame base + framesize, which also releases every
                 ; alloc-stack-bytes block (net stack-neutral; a scalar result stays on top)
                 (we-local-get! (mut (.code g)) (.fp-local g))
@@ -3292,9 +3407,41 @@
           (wbytes! (mut out) (al-slice [u8] (load eb)))
           (al-slice [u8] (load out))))))
 
+; A by-value STRUCT parameter reaches a Coil function by reference (mono types it
+; as a pointer), but C passes it by value — a single-element struct as its
+; scalar. So a function reached from C with one (an export-c, or the by-value C
+; entry the checker records for an anonymous `c` function or a fnptr-of ascribed
+; a by-value C type) gets the checker's thunk: it receives the C arguments and
+; calls the function with their addresses. Codegen works on a copy of the program
+; with the thunks added and the published exports renamed to them, as the x64
+; backend does; the caller's program is left as it was.
 (defn wcg-build-module [(a (dyn Allocator))
-                        (mp (ptr Program))
+                        (mp0 (ptr Program))
                         (side-module bool)] (-> (slice u8))
+  (let [thunks (export-c-thunks a mp0)
+        (mut with-thunks) (load mp0)
+        mp (cast (ptr Program) (mut with-thunks))]
+    (unless (= (len thunks) 0)
+      (let [(mut funcs) (al-new [Func] a)
+            (mut exports) (al-new [ExportC] a)]
+        (for f (load (.funcs mp)) (push! (mut funcs) f))
+        (for f thunks (push! (mut funcs) f))
+        (for i (range 0 (len (load (.exports mp))))
+          (let [e (wal-at [ExportC] (.exports mp) i)
+                (mut copy) (load e)]
+            (when (export-c-needs-thunk? e)
+              (set! (.name copy) (export-c-thunk-name a (.name e))))
+            ; an unpublished entry is reached only through fnptr-of, so its thunk
+            ; is not exported
+            (when (.published e) (push! (mut exports) copy))
+            0))
+        (set! (.funcs with-thunks) (box! a (ArrayList Func) (load funcs)))
+        (set! (.exports with-thunks) (box! a (ArrayList ExportC) (load exports)))))
+    (wcg-build-module-thunked a mp side-module)))
+
+(defn wcg-build-module-thunked [(a (dyn Allocator))
+                                (mp (ptr Program))
+                                (side-module bool)] (-> (slice u8))
   (let [g (primitive/alloc-stack Wcg)]
     (set! (.a g) a)
     (set! (.program g) mp)

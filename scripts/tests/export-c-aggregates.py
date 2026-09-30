@@ -19,7 +19,7 @@ cleanup_on_signal.install()
 COMPILER = Path(sys.argv[1]).resolve()
 SOURCE = ROOT / "tests/compiler/features/export_c_aggregates.coil"
 DRIVER = ROOT / "tests/compiler/features/export_c_aggregates.c"
-EXPECTED = "13 7 110 9.0 11 8765 7321 4321"
+EXPECTED = "13 7 110 9.0 11 8765 7321 4321 304 56"
 
 
 def run(command):
