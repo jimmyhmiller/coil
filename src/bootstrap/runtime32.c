@@ -410,6 +410,45 @@ float  env_ceilf(float x) { return ceilf(x); }
 float  env_truncf(float x) { return truncf(x); }
 double env_fma(double x, double y, double z) { return fma(x, y, z); }
 float  env_fmaf(float x, float y, float z) { return fmaf(x, y, z); }
+// coil.math's libm functions (interp.coil's host externs)
+double env_round(double x) { return round(x); }
+double env_nearbyint(double x) { return nearbyint(x); }
+float  env_roundf(float x) { return roundf(x); }
+float  env_nearbyintf(float x) { return nearbyintf(x); }
+float  env_copysignf(float x, float y) { return copysignf(x, y); }
+float  env_fabsf(float x) { return fabsf(x); }
+double env_copysign(double x, double y) { return copysign(x, y); }
+double env_sin(double x) { return sin(x); }
+double env_cos(double x) { return cos(x); }
+double env_tan(double x) { return tan(x); }
+double env_asin(double x) { return asin(x); }
+double env_acos(double x) { return acos(x); }
+double env_atan(double x) { return atan(x); }
+double env_sinh(double x) { return sinh(x); }
+double env_cosh(double x) { return cosh(x); }
+double env_tanh(double x) { return tanh(x); }
+double env_exp(double x) { return exp(x); }
+double env_exp2(double x) { return exp2(x); }
+double env_log(double x) { return log(x); }
+double env_log2(double x) { return log2(x); }
+double env_log10(double x) { return log10(x); }
+double env_atan2(double y, double x) { return atan2(y, x); }
+float  env_sinf(float x) { return sinf(x); }
+float  env_cosf(float x) { return cosf(x); }
+float  env_tanf(float x) { return tanf(x); }
+float  env_asinf(float x) { return asinf(x); }
+float  env_acosf(float x) { return acosf(x); }
+float  env_atanf(float x) { return atanf(x); }
+float  env_sinhf(float x) { return sinhf(x); }
+float  env_coshf(float x) { return coshf(x); }
+float  env_tanhf(float x) { return tanhf(x); }
+float  env_expf(float x) { return expf(x); }
+float  env_exp2f(float x) { return exp2f(x); }
+float  env_logf(float x) { return logf(x); }
+float  env_log2f(float x) { return log2f(x); }
+float  env_log10f(float x) { return log10f(x); }
+float  env_atan2f(float y, float x) { return atan2f(y, x); }
+float  env_powf(float x, float y) { return powf(x, y); }
 
 // ---- process ----
 void env_abort(void) { die("env.abort() called"); }
