@@ -1352,7 +1352,10 @@ needs it. Null is
 `(cast (ptr T) 0)`, and pointers compare by address with the ordinary operators.
 
 ⚠ `alloc-stack` storage lasts until the *function* returns, so calling it in a loop
-grows the stack on every iteration. Prefer an initialized `(mut x)` local.
+grows the stack on every iteration. Prefer an initialized `(mut x)` local: a
+`(mut x)` is frame storage with an address, and `(mut x)` passed to a function taking
+`(ptr T)` is that address. `coil lint --fix` turns a stack cell into such a local when
+every use allows it and its type owns nothing (a cell never runs `Drop`).
 
 ## Gotchas
 

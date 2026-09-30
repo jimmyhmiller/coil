@@ -1406,13 +1406,13 @@ grep -q '(import "unrelated/place/anything.coil" :use \*)' "$T/sib/src/migrate.c
 # the rewritten calls, otherwise the retry fails resolution and rolls everything back.
 # The legacy bare `ior` is qualified to `primitive/ior`, and stays there: on literals
 # alone its type comes from the store's context, which `|` would not see
-# (coil.lint.primitives).
+# (coil.lint.primitives). The stack cell itself becomes a mutable local.
 printf '(module owner-migrate)\n(defn main [] (-> i64) (let [p (stack i64)] (store! p (ior 40 2)) (load p)))\n' \
   > "$T/sib/src/owner-migrate.coil"
 "$COIL" lint "$T/sib/src/owner-migrate.coil" --fix >/dev/null 2>&1
 grep -q '(import "coil.primitive" :as primitive)' "$T/sib/src/owner-migrate.coil" \
-  && grep -q '(primitive/alloc-stack i64)' "$T/sib/src/owner-migrate.coil" \
-  && grep -q '(primitive/ior 40 2)' "$T/sib/src/owner-migrate.coil" \
+  && grep -q '(let \[(mut p) (primitive/ior 40 2)\] p)' "$T/sib/src/owner-migrate.coil" \
+  && ! grep -q 'alloc-stack' "$T/sib/src/owner-migrate.coil" \
   && ok "lint --fix adds missing owner imports with primitive/allocation rewrites" \
   || bad "owner import migration" "missing import or qualified replacement"
 expect_rc 42 "owner-import migration still runs" "$COIL" run "$T/sib/src/owner-migrate.coil"
@@ -1518,8 +1518,7 @@ rm -f "$T/lint-dup/src/broken.coil"
 printf '(module owner-alias-migrate)\n(import "coil.alloc" :as memory)\n(import "coil.primitive" :as metal)\n(defn main [] (-> i64) (let [p (stack i64)] (store! p (ior 40 2)) (load p)))\n' \
   > "$T/sib/src/owner-alias-migrate.coil"
 "$COIL" lint "$T/sib/src/owner-alias-migrate.coil" --fix >/dev/null 2>&1
-grep -q '(metal/alloc-stack i64)' "$T/sib/src/owner-alias-migrate.coil" \
-  && grep -q '(metal/ior 40 2)' "$T/sib/src/owner-alias-migrate.coil" \
+grep -q '(let \[(mut p) (metal/ior 40 2)\] p)' "$T/sib/src/owner-alias-migrate.coil" \
   && [ "$(grep -c 'coil.alloc' "$T/sib/src/owner-alias-migrate.coil")" = 1 ] \
   && [ "$(grep -c 'coil.primitive' "$T/sib/src/owner-alias-migrate.coil")" = 1 ] \
   && ok "lint --fix reuses existing owner aliases without duplicate imports" \
