@@ -704,6 +704,35 @@ def test_modernize_fast(compiler: str) -> None:
                 raise RuntimeError("fast modernization gate: result-flow fix changed behavior:\n"
                                    + before.stdout + after.stdout + after.stderr)
 
+        def primitive_spelling_task() -> None:
+            # coil.lint.primitives: the fix fixture loses every primitive and then
+            # its import; the keep fixture, whose primitives have no equivalent
+            # everyday spelling, must come back byte-identical. Both still run
+            # the same afterwards.
+            for name, clean in (("primitive_spelling_fix", True), ("primitive_spelling_keep", False)):
+                source = ROOT / "tests/compiler/features" / f"{name}.coil"
+                probe = tmp / f"{name}.coil"
+                probe.write_text(source.read_text())
+                before = subprocess.run([coil, "run", str(probe)], cwd=ROOT, capture_output=True, text=True)
+                if before.returncode != 0 or not before.stdout.strip():
+                    raise RuntimeError(f"fast modernization gate: {name}.coil does not run:\n"
+                                       + before.stdout + before.stderr)
+                fixed = subprocess.run([coil, "lint", str(probe), "--fix"], cwd=ROOT,
+                                       capture_output=True, text=True)
+                if fixed.returncode != 0 or "round reverted" in fixed.stdout + fixed.stderr:
+                    raise RuntimeError(f"fast modernization gate: {name} fix did not apply cleanly:\n"
+                                       + fixed.stdout + fixed.stderr)
+                text = probe.read_text()
+                if clean and ("primitive/" in text or '"coil.primitive"' in text):
+                    raise RuntimeError(f"fast modernization gate: {name} kept a primitive:\n" + text)
+                if not clean and text != source.read_text():
+                    raise RuntimeError(f"fast modernization gate: {name} rewrote a primitive it must keep:\n"
+                                       + text)
+                after = subprocess.run([coil, "run", str(probe)], cwd=ROOT, capture_output=True, text=True)
+                if after.returncode != 0 or after.stdout != before.stdout:
+                    raise RuntimeError(f"fast modernization gate: {name} fix changed behavior:\n"
+                                       + before.stdout + after.stdout + after.stderr)
+
         def cimport_task() -> None:
             bindings = tmp / "cimport-expressions.coil"
             execute(coil, "cimport", "tests/compiler/cimport/expressions.h", "-o", str(bindings))
@@ -961,8 +990,9 @@ def test_modernize_fast(compiler: str) -> None:
 """)
             execute(coil, "lint", str(use_only), "--fix")
             use_migrated = use_only.read_text()
+            # The legacy bare `iand` is qualified, and then (i64) respelled as `&`.
             for expected in (":use * :as primitive",
-                             "(primitive/alloc-static i64)", "(primitive/iand x y)"):
+                             "(primitive/alloc-static i64)", "(& x y)"):
                 if expected not in use_migrated:
                     raise RuntimeError(
                         f"fast modernization gate: use-only import omitted {expected!r}")
@@ -1312,6 +1342,7 @@ source-roots = ["src"]
             lambda: expect_diagnostic("tests/compiler/features/ownership_field_take_rejected.coil",
                                       "cannot take! an owned field or element of 'p'"),
             result_flow_fix_task,
+            primitive_spelling_task,
             lambda: build_run("src/examples/bitfields.coil", "static-assert", *backend_flags, want=42),
             lambda: build_run("tests/compiler/features/alloc_static_initial.coil",
                               "alloc-static-initial-direct", *backend_flags),
