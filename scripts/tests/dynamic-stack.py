@@ -3,6 +3,7 @@
 from pathlib import Path
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,14 +39,24 @@ with tempfile.TemporaryDirectory(prefix=".coil-dynamic-stack-", dir=ROOT) as raw
     assert re.search(r"alloca i8, i64 .*align 16", ir), ir[-4000:]
     assert "llvm.stackrestore" not in ir and "llvm.stacksave" not in ir
 
+    # The host's direct backend and the interpreter run the same program: the
+    # direct backends move the stack pointer at run time, the interpreter
+    # allocates from the call's frame memory.
     backend = "arm64" if platform.machine() == "arm64" else "x64"
-    for selected in [backend, "wasm"]:
-        bad = run([COMPILER, "build", SOURCE, "--backend", selected, "-o", work / selected], 1)
-        assert "alloc-stack-bytes is not supported" in bad.stdout + bad.stderr
-        assert not (work / selected).exists()
-    bad = run([COMPILER, "emit-ir", ROOT / "tests/compiler/oracle/ir/fixtures/stack_bytes.coil",
-               "--backend", "llvm", "--target", "wasm32-unknown-unknown"], 1)
-    assert "alloc-stack-bytes currently requires" in bad.stdout + bad.stderr, bad.stdout + bad.stderr
+    run([COMPILER, "build", SOURCE, "--backend", backend, "-o", work / backend])
+    run([work / backend])
+    run([COMPILER, "interp", SOURCE])
+    wasm_ir = run([COMPILER, "emit-ir", ROOT / "tests/compiler/oracle/ir/fixtures/stack_bytes.coil",
+                   "--backend", "llvm", "--target", "wasm32-unknown-unknown"]).stdout
+    assert re.search(r"alloca i8, i(32|64) .*align 16", wasm_ir), wasm_ir[-4000:]
+    run([COMPILER, "emit-obj", ROOT / "tests/compiler/oracle/ir/fixtures/stack_bytes.coil",
+         "--backend", "llvm", "--target", "wasm32-unknown-unknown", "-o", work / "stack_bytes.wasm.o"])
+    # The direct wasm backend moves $sp and releases the blocks on return.
+    assert shutil.which("node"), "the direct wasm check needs node"
+    wasm = work / "dynamic.wasm"
+    run([COMPILER, "build", SOURCE, "--backend", "wasm", "-o", wasm])
+    run(["node", ROOT / "src/tooling/wasm-host/run-standalone.mjs", wasm])
+    run(["node", ROOT / "src/tooling/wasm-host/run-standalone.mjs", wasm, "two", "args"])
 
     negative = work / "bad.coil"
     for argument in ['"wrong"', "(cast i64 8)", "true", ""]:
@@ -53,8 +64,6 @@ with tempfile.TemporaryDirectory(prefix=".coil-dynamic-stack-", dir=ROOT) as raw
                             f'(defn main [] (-> i64) (p/alloc-stack-bytes {argument}) 0)')
         bad = run([COMPILER, "check", negative], 1)
         assert "alloc-stack-bytes" in bad.stdout + bad.stderr
-    bad = run([COMPILER, "interp", ROOT / "tests/compiler/oracle/ir/fixtures/stack_bytes.coil"], 1)
-    assert "alloc-stack-bytes is not supported by the interpreter" in bad.stdout + bad.stderr, bad.stdout + bad.stderr
     negative.write_text('''(module dynamic.escape)
 (import "coil.primitive" :as primitive)
 (defn dangling [(n u64)] (-> (ptr u8)) (primitive/alloc-stack-bytes n))
@@ -63,4 +72,4 @@ with tempfile.TemporaryDirectory(prefix=".coil-dynamic-stack-", dir=ROOT) as raw
     checked = run([COMPILER, "build", negative, "--backend", "llvm", "--debug-checks", "-o", work / "dangling"])
     assert "returns a pointer to a stack local" in checked.stdout + checked.stderr, checked.stdout + checked.stderr
 
-print("dynamic stack: LLVM O0/O2 lifetime/alignment/loop/branch tests and unsupported/type diagnostics passed")
+print("dynamic stack: LLVM O0/O2, direct backend, interpreter and wasm32 IR lifetime/alignment/loop/branch tests and type diagnostics passed")
