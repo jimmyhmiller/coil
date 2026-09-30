@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""export-c with by-value struct parameters works from C on every backend.
+"""export-c with by-value struct parameters, and stack-passed arguments in both
+directions, work from C on every backend.
 
 The direct arm64 and x86-64 backends pass a struct parameter to a Coil function
 by reference, so each such export gets a thunk that receives the C arguments
@@ -18,7 +19,7 @@ cleanup_on_signal.install()
 COMPILER = Path(sys.argv[1]).resolve()
 SOURCE = ROOT / "tests/compiler/features/export_c_aggregates.coil"
 DRIVER = ROOT / "tests/compiler/features/export_c_aggregates.c"
-EXPECTED = "13 7 110 9.0 11"
+EXPECTED = "13 7 110 9.0 11 8765 7321 4321"
 
 
 def run(command):
