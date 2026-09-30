@@ -1301,6 +1301,8 @@ source-roots = ["src"]
                               "meta-semantic-transform-partial-model", want=42),
             lambda: build_run("tests/compiler/features/mutable_binding_fresh_value.coil",
                               "mutable-binding-fresh-value", *backend_flags),
+            lambda: build_run("tests/compiler/features/primitive_mut_operand.coil",
+                              "primitive-mut-operand", *backend_flags),
             lambda: expect_rejected("tests/compiler/features/struct_reference_field_rejected.coil",
                                     "fast modernization gate: a reference-typed field compiled"),
             lambda: expect_diagnostic("tests/compiler/features/ownership_match_payload_move_rejected.coil",
