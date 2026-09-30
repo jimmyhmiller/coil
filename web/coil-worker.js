@@ -427,6 +427,8 @@ function makeEnv(run) {
     // returns null, and the compiler reports the recorded Diag.
     pthread_exit: () => { throw new MetaHalt(); },
     pthread_create: trap('pthread_create'),
+    // only the interpreter's native thread wrapper asks, and it never runs here
+    pthread_attr_getstacksize: trap('pthread_attr_getstacksize'),
 
     meta_run_wasm: (bytesPtr, len, symPtr, argc, ...args) => {
       const sym = run.cstr(symPtr);

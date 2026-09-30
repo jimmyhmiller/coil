@@ -499,6 +499,7 @@ uint32_t env_pthread_attr_init(uint32_t a) { (void)a; return 0; }
 uint32_t env_pthread_attr_setstacksize(uint32_t a, uint64_t b) { (void)a; (void)b; return 0; }
 uint32_t env_pthread_attr_setguardsize(uint32_t a, uint64_t b) { (void)a; (void)b; return 0; }
 uint32_t env_pthread_attr_destroy(uint32_t a) { (void)a; return 0; }
+uint32_t env_pthread_attr_getstacksize(uint32_t a, uint32_t b) { (void)a;(void)b; die("unreachable: env.pthread_attr_getstacksize"); return 0; }
 
 // ---- DEAD imports: abort LOUDLY (comptime is pure interpretation) ----
 uint32_t env_pthread_create(uint32_t a, uint32_t b, uint32_t c, uint32_t d) { (void)a;(void)b;(void)c;(void)d; die("unreachable: env.pthread_create"); return 0; }

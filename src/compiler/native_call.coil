@@ -1,0 +1,807 @@
+; src/compiler/native_call.coil — native C calls whose signature is known only at
+; run time, for the bytecode interpreter (interp.coil).
+;
+; The interpreter holds every value in an i64 cell (an integer, a float's bit
+; pattern, a pointer, or the ADDRESS of an aggregate's bytes). To call a real C
+; function it needs the host C ABI, which compiled code gets from the backends:
+;
+;   - `nc-plan` classifies a signature under the host ABI (Apple AAPCS64 or SysV
+;     x86-64) into pieces: which bytes of which argument go to which integer
+;     register, vector register or stack offset, and where the result comes back.
+;   - `nc-invoke!` fills a NativeFrame (a register file plus a stack image) from
+;     the plan and runs a small trampoline, emitted once into executable memory,
+;     that loads the registers and the stack, calls the target, and stores the
+;     return registers back into the frame.
+;   - Callbacks go the other way: an interpreted function's pointer is a native
+;     thunk (`nc-make-thunks`) that loads the address of the interpreter's record
+;     for it and enters a shared stub (`nc-callback-stub`), which saves the
+;     argument registers into a NativeFrame and calls the interpreter's
+;     dispatcher; the dispatcher reads the arguments with the same plan
+;     (`nc-receive-arg`) and leaves the result in the frame (`nc-return!`).
+;
+; The machine code is emitted with the backends' own assemblers (a64.coil,
+; x64.coil). Hosts: AArch64 macOS and x86-64 Linux, the two the native backends
+; target. Anywhere else (a wasm build of the compiler) `nc-available?` is false
+; and the interpreter keeps its built-in libc table.
+(module coil.compiler.native_call)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.io" :use *)
+(import "coil.control" :use *)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.layoutdb" :use *)
+(import "coil.compiler.a64" :use *)
+(import "coil.compiler.x64" :use *)
+
+; ============================ host ===========================================
+;;; The host this compiler was built for: 1 = AArch64 macOS, 2 = x86-64 Linux,
+;;; 0 = anything else (no native calls).
+(defn nc-host-code [] (-> Code)
+  (if (primitive/code-eq (primitive/target-arch) `aarch64)
+      (if (primitive/code-eq (primitive/target-os) `darwin) `1 `0)
+      (if (primitive/code-eq (primitive/target-arch) `x86_64)
+          (if (primitive/code-eq (primitive/target-os) `linux) `2 `0)
+          `0)))
+
+(defn nc-host [] (-> i64)
+  (nc-host-code))
+
+(defn nc-available? [] (-> bool)
+  (!= (nc-host) 0))
+
+(defn nc-fail [(msg (slice u8))] (-> i64)
+  (print-str (stderr) "interp: ")
+  (print-str (stderr) msg)
+  (write-byte (stderr) (cast u8 10))
+  (abort)
+  0)
+
+(defn nc-fail2 [(msg (slice u8)) (what (slice u8))] (-> i64)
+  (print-str (stderr) "interp: ")
+  (print-str (stderr) msg)
+  (print-str (stderr) what)
+  (write-byte (stderr) (cast u8 10))
+  (abort)
+  0)
+
+(extern nc.mmap :as "mmap" :cc c [(ptr i8) i64 i32 i32 i32 i64] (-> (ptr i8)))
+(extern nc.mprotect :as "mprotect" :cc c [(ptr i8) i64 i32] (-> i32))
+(extern nc.dlsym :as "dlsym" :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+(extern nc.malloc :as "malloc" :cc c [isize] (-> (ptr i8)))
+(extern nc.free :as "free" :cc c [(ptr i8)] (-> void))
+
+;;; dlsym's RTLD_DEFAULT: every image loaded in this process.
+(defn nc-rtld-default [] (-> (ptr i8))
+  (cast (ptr i8) (if (= (nc-host) 2) 0 -2)))
+
+;;; The address of C symbol `name` in this process, or 0.
+(defn nc-symbol [(a (dyn Allocator)) (name (slice u8))] (-> i64)
+  (cast i64 (nc.dlsym (nc-rtld-default) (str->cstr a name))))
+
+; ============================ executable memory ==============================
+;;; Copy `code` into fresh read+execute pages and return their address. Each
+;;; block is written once and never again, so no page is ever writable and
+;;; executable at the same time.
+(defn nc-install-code [(code (ptr (ArrayList u8)))] (-> i64)
+  (let [n (len (load code))
+        size (* (/ (+ n 16383) 16384) 16384)
+        anon (if (= (nc-host) 2) 34 4098)  ; MAP_PRIVATE|MAP_ANON(YMOUS)
+        base (nc.mmap (cast (ptr i8) 0) size (cast i32 3) (cast i32 anon) (cast i32 -1) 0)]
+    (when (or (= (cast i64 base) 0) (= (cast i64 base) -1))
+      (nc-fail "native calls: mmap of code pages failed"))
+    (for [i 0 n]
+      (store! (cast (ptr u8) (+ (cast i64 base) i)) (get (load code) i)))
+    (when (!= (cast i64 (nc.mprotect base size (cast i32 5))) 0)
+      (nc-fail "native calls: mprotect of code pages failed"))
+    (nc-flush-icache (cast i64 base) n)
+    (cast i64 base)))
+
+;;; AArch64 has no coherent instruction cache: flush code just written.
+(defn nc-flush-icache [(base i64) (n i64)] (-> i64)
+  (when (= (nc-host) 1)
+    (let [f (nc.dlsym (nc-rtld-default) c"sys_icache_invalidate")]
+      (when (= (cast i64 f) 0)
+        (nc-fail "native calls: sys_icache_invalidate is missing"))
+      (call-ptr (cast (fnptr c [(ptr i8) i64] i64) f) (cast (ptr i8) base) n)))
+  0)
+
+; ============================ the frame ======================================
+;;; What the trampoline and the callback stub exchange with Coil code. The
+;;; offsets are part of the machine code below; `nc-check-frame-layout` keeps
+;;; them honest.
+(defstruct NativeFrame
+  [(ints (array i64 9))  ;   0: x0-x8 | rdi rsi rdx rcx r8 r9
+   (pad0 i64)  ;  72
+   (vecs (array i64 16))  ;  80: q0-q7 | xmm0-xmm7, 16 bytes each
+   (nvec i64)  ; 208: x86-64 call: al; callback: the callee's index
+   (stack i64)  ; 216: call: stack image; callback: the incoming stack args
+   (stack_bytes i64)  ; 224: call: image size, a multiple of 16
+   (ret_ints (array i64 2))  ; 232: x0 x1 | rax rdx
+   (pad1 i64)  ; 248
+   (ret_vecs (array i64 8))])  ; 256: q0-q3 | xmm0-xmm1
+
+(defn nc-check-frame-layout [] (-> i64)
+  (unless (and (= (offsetof NativeFrame vecs) 80)
+               (= (offsetof NativeFrame nvec) 208)
+               (= (offsetof NativeFrame stack) 216)
+               (= (offsetof NativeFrame stack_bytes) 224)
+               (= (offsetof NativeFrame ret_ints) 232)
+               (= (offsetof NativeFrame ret_vecs) 256)
+               (= (sizeof NativeFrame) 320))
+    (nc-fail "native calls: NativeFrame layout does not match the trampoline"))
+  0)
+
+; ============================ machine code ===================================
+; AArch64 trampoline: x0 = function, x1 = frame.
+(defn nc-a64-trampoline [(a (dyn Allocator))] (-> (ArrayList u8))
+  (let [(mut s) (asm-new a)
+        copy (a64-new-label (mut s))
+        done (a64-new-label (mut s))]
+    (a64-w! (mut s) (a64-stp-pre 29 30 31 -16))
+    (a64-w! (mut s) (a64-mov-sp 29 31))
+    (a64-w! (mut s) (a64-stp-pre 19 20 31 -16))
+    (a64-w! (mut s) (a64-mov-reg 19 1))
+    (a64-w! (mut s) (a64-mov-reg 16 0))
+    ; the stack arguments: sp -= bytes; copy the image to [sp]
+    (a64-w! (mut s) (a64-ldr-x 9 19 224))
+    (a64-w! (mut s) (a64-sub-ext 31 31 9))
+    (a64-w! (mut s) (a64-ldr-x 10 19 216))
+    (a64-w! (mut s) (a64-mov-sp 11 31))
+    (a64-bind-label! (mut s) copy)
+    (a64-cbz-label! (mut s) 9 done)
+    (a64-w! (mut s) (a64-ldr-x 12 10 0))
+    (a64-w! (mut s) (a64-str-x 12 11 0))
+    (a64-w! (mut s) (a64-add-imm 10 10 8))
+    (a64-w! (mut s) (a64-add-imm 11 11 8))
+    (a64-w! (mut s) (a64-sub-imm 9 9 8))
+    (a64-b-label! (mut s) copy)
+    (a64-bind-label! (mut s) done)
+    (for [r 0 8] (a64-w! (mut s) (a64-ldr-q r 19 (+ 80 (* r 16)))))
+    (for [r 0 9] (a64-w! (mut s) (a64-ldr-x r 19 (* r 8))))
+    (a64-w! (mut s) (a64-blr 16))
+    (a64-w! (mut s) (a64-str-x 0 19 232))
+    (a64-w! (mut s) (a64-str-x 1 19 240))
+    (for [r 0 4] (a64-w! (mut s) (a64-str-q r 19 (+ 256 (* r 16)))))
+    (a64-w! (mut s) (a64-sub-imm 31 29 16))
+    (a64-w! (mut s) (a64-ldp-post 19 20 31 16))
+    (a64-w! (mut s) (a64-ldp-post 29 30 31 16))
+    (a64-w! (mut s) (a64-ret))
+    (a64-resolve-fixups! (mut s))
+    (.buf s)))
+
+; AArch64 callback stub, entered from a thunk with x9 = the callee's index.
+(defn nc-a64-callback-stub [(a (dyn Allocator)) (dispatch i64)] (-> (ArrayList u8))
+  (let [(mut s) (asm-new a)]
+    (a64-w! (mut s) (a64-stp-pre 29 30 31 -16))
+    (a64-w! (mut s) (a64-mov-sp 29 31))
+    (a64-w! (mut s) (a64-sub-imm 31 31 320))
+    (for [r 0 9] (a64-w! (mut s) (a64-str-x r 31 (* r 8))))
+    (for [r 0 8] (a64-w! (mut s) (a64-str-q r 31 (+ 80 (* r 16)))))
+    (a64-w! (mut s) (a64-str-x 9 31 208))
+    (a64-w! (mut s) (a64-add-imm 10 29 16))
+    (a64-w! (mut s) (a64-str-x 10 31 216))
+    (a64-w! (mut s) (a64-mov-sp 0 31))
+    (a64-mov-imm! (mut s) 16 dispatch)
+    (a64-w! (mut s) (a64-blr 16))
+    (a64-w! (mut s) (a64-ldr-x 0 31 232))
+    (a64-w! (mut s) (a64-ldr-x 1 31 240))
+    (for [r 0 4] (a64-w! (mut s) (a64-ldr-q r 31 (+ 256 (* r 16)))))
+    (a64-w! (mut s) (a64-mov-sp 31 29))
+    (a64-w! (mut s) (a64-ldp-post 29 30 31 16))
+    (a64-w! (mut s) (a64-ret))
+    (.buf s)))
+
+;;; movdqu xmm`x`, [base + disp32] (store = false) or movdqu [base + disp32], xmm`x`.
+(defn nc-x64-movdqu! [(s (mut XAsm)) (store bool) (x i64) (base i64) (disp i64)] (-> i64)
+  (x64-b! (mut s) 243)
+  (when (>= base 8) (x64-b! (mut s) 65))
+  (x64-b! (mut s) 15)
+  (x64-b! (mut s) (if store 127 111))
+  (x64-mem! (mut s) x (& base 7) disp))
+
+; x86-64 trampoline: rdi = function, rsi = frame.
+(defn nc-x64-trampoline [(a (dyn Allocator))] (-> (ArrayList u8))
+  (let [(mut s) (xasm-new a)
+        copy (x64-new-label (mut s))
+        done (x64-new-label (mut s))]
+    (x64-push! (mut s) 5)
+    (x64-mov-rr! (mut s) 5 4)
+    (x64-push! (mut s) 3)
+    (x64-push! (mut s) 12)
+    (x64-mov-rr! (mut s) 3 6)  ; rbx = frame
+    (x64-mov-rr! (mut s) 11 7)  ; r11 = function
+    (x64-mov-rm! (mut s) 1 3 224)  ; rcx = stack bytes
+    (x64-sub-rr! (mut s) 4 1)
+    (x64-mov-rm! (mut s) 6 3 216)  ; rsi = image
+    (x64-mov-rr! (mut s) 7 4)  ; rdi = rsp
+    (x64-bind-label! (mut s) copy)
+    (x64-test-rr! (mut s) 1 1)
+    (x64-jcc-label! (mut s) (x64-cc-e) done)
+    (x64-mov-rm! (mut s) 0 6 0)
+    (x64-mov-mr! (mut s) 7 0 0)
+    (x64-add-ri! (mut s) 6 8)
+    (x64-add-ri! (mut s) 7 8)
+    (x64-sub-ri! (mut s) 1 8)
+    (x64-jmp-label! (mut s) copy)
+    (x64-bind-label! (mut s) done)
+    (for [r 0 8] (nc-x64-movdqu! (mut s) false r 3 (+ 80 (* r 16))))
+    (x64-mov-rm! (mut s) 7 3 0)
+    (x64-mov-rm! (mut s) 6 3 8)
+    (x64-mov-rm! (mut s) 2 3 16)
+    (x64-mov-rm! (mut s) 1 3 24)
+    (x64-mov-rm! (mut s) 8 3 32)
+    (x64-mov-rm! (mut s) 9 3 40)
+    (x64-mov-rm! (mut s) 0 3 208)  ; al = vector registers used (variadic callees)
+    (x64-call-r! (mut s) 11)
+    (x64-mov-mr! (mut s) 3 232 0)
+    (x64-mov-mr! (mut s) 3 240 2)
+    (nc-x64-movdqu! (mut s) true 0 3 256)
+    (nc-x64-movdqu! (mut s) true 1 3 272)
+    (x64-lea! (mut s) 4 5 -16)
+    (x64-pop! (mut s) 12)
+    (x64-pop! (mut s) 3)
+    (x64-pop! (mut s) 5)
+    (x64-ret! (mut s))
+    (x64-resolve-fixups! (mut s))
+    (.buf s)))
+
+; x86-64 callback stub, entered from a thunk with r10 = the callee's index.
+(defn nc-x64-callback-stub [(a (dyn Allocator)) (dispatch i64)] (-> (ArrayList u8))
+  (let [(mut s) (xasm-new a)]
+    (x64-push! (mut s) 5)
+    (x64-mov-rr! (mut s) 5 4)
+    (x64-sub-ri! (mut s) 4 320)
+    (x64-mov-mr! (mut s) 4 0 7)
+    (x64-mov-mr! (mut s) 4 8 6)
+    (x64-mov-mr! (mut s) 4 16 2)
+    (x64-mov-mr! (mut s) 4 24 1)
+    (x64-mov-mr! (mut s) 4 32 8)
+    (x64-mov-mr! (mut s) 4 40 9)
+    (for [r 0 8] (nc-x64-movdqu! (mut s) true r 4 (+ 80 (* r 16))))
+    (x64-mov-mr! (mut s) 4 208 10)
+    (x64-lea! (mut s) 0 5 16)
+    (x64-mov-mr! (mut s) 4 216 0)
+    (x64-mov-rr! (mut s) 7 4)
+    (x64-mov-imm64! (mut s) 0 dispatch)
+    (x64-call-r! (mut s) 0)
+    (x64-mov-rm! (mut s) 0 4 232)
+    (x64-mov-rm! (mut s) 2 4 240)
+    (nc-x64-movdqu! (mut s) false 0 4 256)
+    (nc-x64-movdqu! (mut s) false 1 4 272)
+    (x64-leave! (mut s))
+    (x64-ret! (mut s))
+    (.buf s)))
+
+;;; Bytes per callback thunk (see nc-make-thunks).
+(defn nc-thunk-bytes [] (-> i64)
+  (if (= (nc-host) 1) 24 16))
+
+; ============================ the ABI plan ===================================
+; Where one argument or the result travels. `dest`: 0 = integer register `idx`,
+; 1 = vector register `idx`, 2 = stack image at offset `idx`. `val_off`/`bytes`
+; select the bytes of the value (for a scalar, of its cell) that go there.
+(defstruct NcPiece [(val_off i64) (bytes i64) (dest i64) (idx i64)])
+
+; kind: 0 integer scalar, 1 float scalar, 2 aggregate passed in place,
+; 3 aggregate passed by reference (the pieces carry a pointer to a copy).
+; `signed`/`bits` let a callee canonicalize an integer scalar it receives.
+(defstruct NcArg
+  [(kind i64)
+   (size i64)
+   (align i64)
+   (signed bool)
+   (bits i64)
+   (pieces (ArrayList NcPiece))])
+
+(defstruct NcPlan
+  [(args (ArrayList NcArg))
+   (ret NcArg)
+   (ret_void bool)
+   ; the result is written through a pointer the caller passes: in x8 on AArch64,
+   ; in the first integer register on x86-64
+   (sret bool)
+   (stack_bytes i64)
+   (nvec i64)])
+
+; One scalar leaf of an aggregate: its offset, size and whether it is a float.
+(defstruct NcLeaf [(off i64) (size i64) (float bool)])
+
+(defn nc-leaves! [(a (dyn Allocator)) (db (ptr LayoutDb)) (t (ptr Type)) (base i64) (out (ptr (ArrayList NcLeaf)))] (-> i64)
+  (match (load t)
+    (TFloat [bits] (push! out (NcLeaf :off base :size (/ bits 8) :float true)))
+    (TArray [elem n-extent]
+      (let [esz (size db elem)]
+        (for [i 0 (extent-value n-extent)]
+          (nc-leaves! a db elem (+ base (* i esz)) out))))
+    (TVec [elem n-extent]
+      (let [esz (size db elem)]
+        (for [i 0 (extent-value n-extent)]
+          (nc-leaves! a db elem (+ base (* i esz)) out))))
+    (TSlice [_]
+      (do
+        (push! out (NcLeaf :off base :size (.word_bytes db) :float false))
+        (push! out (NcLeaf :off (+ base (.word_bytes db)) :size (.word_bytes db) :float false))))
+    (TStruct [name]
+      (let [si (struct-index db name)]
+        (if (< si 0)
+            ; a sum: its tag and payload words are integer data
+            (let [sz (size db t)]
+              (for [k 0 (/ (+ sz 7) 8)]
+                (push! out (NcLeaf :off (+ base (* k 8)) :size (if (< (- sz (* k 8)) 8) (- sz (* k 8)) 8) :float false))))
+            (let [ls (struct-at db si)]
+              (match (.layout ls)
+                (LBits [backing _] (push! out (NcLeaf :off base :size (size db (box-type a (TInt backing false))) :float false)))
+                (_ (for [fi 0 (len (load (.fields ls)))]
+                     (nc-leaves! a db
+                                 (field (layout-at [Field] (.fields ls) fi) ty)
+                                 (+ base (field-offset db si fi))
+                                 out))))))))
+    (_ (push! out (NcLeaf :off base :size (size db t) :float false))))
+  0)
+
+;;; AAPCS64's homogeneous float aggregate: 1-4 floats of one size and nothing else.
+;;; Returns the element size, or 0.
+(defn nc-hfa-elem [(leaves (ptr (ArrayList NcLeaf))) (size i64)] (-> i64)
+  (let [n (len (load leaves))]
+    (if (or (= n 0) (> n 4))
+        0
+        (let [e (.size (get (load leaves) 0))
+              (mut ok) true]
+          (for [i 0 n]
+            (let [l (get (load leaves) i)]
+              (unless (and (.float l) (= (.size l) e) (= (.off l) (* i e)))
+                (set! ok false))))
+          (if (and ok (= (* n e) size)) e 0)))))
+
+(defn nc-align-up [(n i64) (al i64)] (-> i64)
+  (* (/ (+ n (- al 1)) al) al))
+
+(defn nc-new-arg [(a (dyn Allocator)) (kind i64) (size i64) (align i64)] (-> NcArg)
+  (NcArg :kind kind :size size :align align :signed false :bits 64 :pieces (al-new [NcPiece] a)))
+
+(defn nc-piece! [(arg (ptr NcArg)) (val-off i64) (bytes i64) (dest i64) (idx i64)] (-> i64)
+  (push! (mut (.pieces arg)) (NcPiece :val_off val-off :bytes bytes :dest dest :idx idx))
+  0)
+
+;;; Registers and stack consumed so far while classifying one signature.
+(defstruct NcCursor [(gp i64) (vec i64) (stk i64)])
+
+(defn nc-stack! [(cur (ptr NcCursor)) (size i64) (align i64)] (-> i64)
+  (let [off (nc-align-up (.stk cur) align)]
+    (set! (.stk cur) (+ off size))
+    off))
+
+(defn nc-scalar-kind [(t (ptr Type))] (-> i64)
+  (match (load t) (TFloat [_] 1) (_ 0)))
+
+(defn nc-is-aggregate [(t (ptr Type))] (-> bool)
+  (match (load t)
+    (TStruct [_] true)
+    (TSlice [_] true)
+    (TArray [_ _] true)
+    (TVec [_ _] true)
+    (_ false)))
+
+(defn nc-int-info! [(arg (ptr NcArg)) (t (ptr Type))] (-> i64)
+  (match (load t)
+    (TInt [bits signed] (do (set! (.signed arg) signed) (set! (.bits arg) bits) 0))
+    (TBool [] (do (set! (.bits arg) 1) 0))
+    (_ 0)))
+
+; ---- Apple AAPCS64 ----------------------------------------------------------
+(defn nc-a64-arg [(a (dyn Allocator)) (db (ptr LayoutDb)) (t (ptr Type)) (variadic bool) (cur (ptr NcCursor))] (-> NcArg)
+  (let [sz (size db t)
+        al (align db t)]
+    (if (not (nc-is-aggregate t))
+        (let [(mut arg) (nc-new-arg a (nc-scalar-kind t) sz al)]
+          (nc-int-info! (mut arg) t)
+          (cond variadic
+                  ; Apple: every variadic argument takes an 8-byte stack slot
+                  (nc-piece! (mut arg) 0 8 2 (nc-stack! cur 8 8))
+                (= (.kind arg) 1)
+                  (if (< (.vec cur) 8)
+                      (do (nc-piece! (mut arg) 0 sz 1 (.vec cur)) (set! (.vec cur) (+ (.vec cur) 1)))
+                      (nc-piece! (mut arg) 0 sz 2 (nc-stack! cur sz sz)))
+                :else
+                  (if (< (.gp cur) 8)
+                      (do (nc-piece! (mut arg) 0 8 0 (.gp cur)) (set! (.gp cur) (+ (.gp cur) 1)))
+                      (nc-piece! (mut arg) 0 sz 2 (nc-stack! cur sz sz))))
+          arg)
+        (let [(mut leaves) (al-new [NcLeaf] a)
+              _ (nc-leaves! a db t 0 (mut leaves))
+              hfa (if variadic 0 (nc-hfa-elem (mut leaves) sz))
+              short-vec (match (load t) (TVec [_ _] (or (= sz 8) (= sz 16))) (_ false))]
+          (cond (and short-vec (not variadic))
+                  ; a short vector is one vector register
+                  (let [(mut arg) (nc-new-arg a 2 sz al)]
+                    (if (< (.vec cur) 8)
+                        (do (nc-piece! (mut arg) 0 sz 1 (.vec cur)) (set! (.vec cur) (+ (.vec cur) 1)))
+                        (do (set! (.vec cur) 8) (nc-piece! (mut arg) 0 sz 2 (nc-stack! cur sz sz))))
+                    arg)
+                (> hfa 0)
+                  (let [(mut arg) (nc-new-arg a 2 sz al)
+                        n (/ sz hfa)]
+                    (if (<= (+ (.vec cur) n) 8)
+                        (do
+                          (for [k 0 n] (nc-piece! (mut arg) (* k hfa) hfa 1 (+ (.vec cur) k)))
+                          (set! (.vec cur) (+ (.vec cur) n)))
+                        ; on the stack an HFA is its floats at their own alignment
+                        (do (set! (.vec cur) 8) (nc-piece! (mut arg) 0 sz 2 (nc-stack! cur sz hfa))))
+                    arg)
+                (> sz 16)
+                  ; by reference: a pointer to a copy, as an integer argument
+                  (let [(mut arg) (nc-new-arg a 3 sz al)]
+                    (cond variadic (nc-piece! (mut arg) 0 8 2 (nc-stack! cur 8 8))
+                          (< (.gp cur) 8)
+                            (do (nc-piece! (mut arg) 0 8 0 (.gp cur)) (set! (.gp cur) (+ (.gp cur) 1)))
+                          :else (nc-piece! (mut arg) 0 8 2 (nc-stack! cur 8 8)))
+                    arg)
+                :else
+                  (let [(mut arg) (nc-new-arg a 2 sz al)
+                        words (/ (+ sz 7) 8)
+                        salign (if (>= al 16) 16 8)
+                        gp0 (if (>= al 16) (nc-align-up (.gp cur) 2) (.gp cur))]
+                    (if (and (not variadic) (<= (+ gp0 words) 8))
+                        (do
+                          (for [k 0 words]
+                            (nc-piece! (mut arg) (* k 8) (if (< (- sz (* k 8)) 8) (- sz (* k 8)) 8) 0 (+ gp0 k)))
+                          (set! (.gp cur) (+ gp0 words)))
+                        (do
+                          (unless variadic (set! (.gp cur) 8))
+                          (nc-piece! (mut arg) 0 sz 2 (nc-stack! cur (* words 8) salign))))
+                    arg))))))
+
+(defn nc-a64-ret [(a (dyn Allocator)) (db (ptr LayoutDb)) (t (ptr Type))] (-> NcArg)
+  (let [sz (size db t)
+        al (align db t)]
+    (if (not (nc-is-aggregate t))
+        (let [(mut arg) (nc-new-arg a (nc-scalar-kind t) sz al)]
+          (nc-int-info! (mut arg) t)
+          (nc-piece! (mut arg) 0 (if (= (.kind arg) 1) sz 8) (.kind arg) 0)
+          arg)
+        (let [(mut leaves) (al-new [NcLeaf] a)
+              _ (nc-leaves! a db t 0 (mut leaves))
+              hfa (nc-hfa-elem (mut leaves) sz)
+              short-vec (match (load t) (TVec [_ _] (or (= sz 8) (= sz 16))) (_ false))
+              (mut arg) (nc-new-arg a 2 sz al)]
+          (cond short-vec (nc-piece! (mut arg) 0 sz 1 0)
+                (> hfa 0) (for [k 0 (/ sz hfa)] (nc-piece! (mut arg) (* k hfa) hfa 1 k))
+                (> sz 16) (set! (.kind arg) 3)
+                :else (for [k 0 (/ (+ sz 7) 8)]
+                        (nc-piece! (mut arg) (* k 8) (if (< (- sz (* k 8)) 8) (- sz (* k 8)) 8) 0 k)))
+          arg))))
+
+; ---- SysV x86-64 ------------------------------------------------------------
+;;; The classes of an aggregate's eightbytes: 0 INTEGER, 1 SSE; or an empty list
+;;; for MEMORY (over 16 bytes, or a misaligned field).
+(defn nc-sysv-classes [(a (dyn Allocator)) (db (ptr LayoutDb)) (t (ptr Type)) (sz i64)] (-> (ArrayList i64))
+  (let [(mut out) (al-new [i64] a)]
+    (when (<= sz 16)
+      (let [(mut leaves) (al-new [NcLeaf] a)
+            (mut sse) (al-new [bool] a)
+            (mut used) (al-new [bool] a)
+            (mut memory) false
+            n (/ (+ sz 7) 8)]
+        (nc-leaves! a db t 0 (mut leaves))
+        (for [k 0 n] (push! (mut sse) true) (push! (mut used) false))
+        (for [i 0 (len leaves)]
+          (let [l (get leaves i)
+                w (/ (.off l) 8)]
+            (if (or (!= (% (.off l) (if (> (.size l) 0) (.size l) 1)) 0) (>= w n))
+                (set! memory true)
+                (do
+                  (set! (mut used) w true)
+                  (unless (.float l) (set! (mut sse) w false))))))
+        (unless memory
+          (for [k 0 n]
+            ; an eightbyte holding only padding travels as integer data
+            (push! (mut out) (if (and (get used k) (get sse k)) 1 0))))))
+    out))
+
+(defn nc-x64-arg [(a (dyn Allocator)) (db (ptr LayoutDb)) (t (ptr Type)) (cur (ptr NcCursor))] (-> NcArg)
+  (let [sz (size db t)
+        al (align db t)]
+    (if (not (nc-is-aggregate t))
+        (let [(mut arg) (nc-new-arg a (nc-scalar-kind t) sz al)]
+          (nc-int-info! (mut arg) t)
+          (if (= (.kind arg) 1)
+              (if (< (.vec cur) 8)
+                  (do (nc-piece! (mut arg) 0 sz 1 (.vec cur)) (set! (.vec cur) (+ (.vec cur) 1)))
+                  (nc-piece! (mut arg) 0 8 2 (nc-stack! cur 8 8)))
+              (if (< (.gp cur) 6)
+                  (do (nc-piece! (mut arg) 0 8 0 (.gp cur)) (set! (.gp cur) (+ (.gp cur) 1)))
+                  (nc-piece! (mut arg) 0 8 2 (nc-stack! cur 8 8))))
+          arg)
+        (let [classes (nc-sysv-classes a db t sz)
+              n (len classes)
+              (mut needg) 0
+              (mut needv) 0
+              (mut arg) (nc-new-arg a 2 sz al)]
+          (for [k 0 n] (if (= (get classes k) 1) (set! needv (+ needv 1)) (set! needg (+ needg 1))))
+          (cond (= sz 0) 0  ; an empty struct is not passed at all
+                (and (> n 0) (<= (+ (.gp cur) needg) 6) (<= (+ (.vec cur) needv) 8))
+              (for [k 0 n]
+                (let [bytes (if (< (- sz (* k 8)) 8) (- sz (* k 8)) 8)]
+                  (if (= (get classes k) 1)
+                      (do (nc-piece! (mut arg) (* k 8) bytes 1 (.vec cur)) (set! (.vec cur) (+ (.vec cur) 1)))
+                      (do (nc-piece! (mut arg) (* k 8) bytes 0 (.gp cur)) (set! (.gp cur) (+ (.gp cur) 1))))))
+                ; MEMORY, or no room for every eightbyte: the bytes go on the stack
+                :else (nc-piece! (mut arg) 0 sz 2 (nc-stack! cur (nc-align-up sz 8) (if (>= al 16) 16 8))))
+          arg))))
+
+(defn nc-x64-ret [(a (dyn Allocator)) (db (ptr LayoutDb)) (t (ptr Type))] (-> NcArg)
+  (let [sz (size db t)
+        al (align db t)]
+    (if (not (nc-is-aggregate t))
+        (let [(mut arg) (nc-new-arg a (nc-scalar-kind t) sz al)]
+          (nc-int-info! (mut arg) t)
+          (nc-piece! (mut arg) 0 (if (= (.kind arg) 1) sz 8) (.kind arg) 0)
+          arg)
+        (let [classes (nc-sysv-classes a db t sz)
+              (mut arg) (nc-new-arg a 2 sz al)
+              (mut gi) 0
+              (mut vi) 0]
+          (if (and (= (len classes) 0) (> sz 0))
+              (set! (.kind arg) 3)
+              (for [k 0 (len classes)]
+                (let [bytes (if (< (- sz (* k 8)) 8) (- sz (* k 8)) 8)]
+                  (if (= (get classes k) 1)
+                      (do (nc-piece! (mut arg) (* k 8) bytes 1 vi) (set! vi (+ vi 1)))
+                      (do (nc-piece! (mut arg) (* k 8) bytes 0 gi) (set! gi (+ gi 1)))))))
+          arg))))
+
+;;; The host C ABI's plan for a call with argument types `types` (the first
+;;; `nfixed` named, the rest variadic) returning `ret`.
+(defn nc-plan [(a (dyn Allocator)) (db (ptr LayoutDb)) (types (ptr (ArrayList Type))) (nfixed i64) (ret (ptr Type))] (-> NcPlan)
+  (let [ret-void (match (load ret) (TVoid [] true) (_ false))
+        r (if ret-void
+              (nc-new-arg a 0 0 1)
+              (if (= (nc-host) 1) (nc-a64-ret a db ret) (nc-x64-ret a db ret)))
+        sret (= (.kind r) 3)
+        ; x86-64 passes the result pointer as a hidden first argument
+        (mut cur) (NcCursor :gp (if (and sret (= (nc-host) 2)) 1 0) :vec 0 :stk 0)
+        (mut args) (al-new [NcArg] a)]
+    (for [i 0 (len (load types))]
+      (let [t (layout-at [Type] types i)]
+        (push! (mut args)
+               (if (= (nc-host) 1)
+                   (nc-a64-arg a db t (>= i nfixed) (mut cur))
+                   (nc-x64-arg a db t (mut cur))))))
+    (NcPlan :args args :ret r :ret_void ret-void :sret sret
+            :stack_bytes (nc-align-up (.stk cur) 16)
+            :nvec (.vec cur))))
+
+;;; Free a plan's lists (everything nc-plan allocated).
+(defn nc-plan-free! [(plan (ptr NcPlan))] (-> i64)
+  (for [i 0 (len (.args plan))]
+    (al-free! (mut (.pieces (layout-at [NcArg] (field plan args) i)))))
+  (al-free! (mut (.args plan)))
+  (al-free! (mut (.pieces (.ret plan))))
+  0)
+
+; ============================ calling out ====================================
+(defstruct NcState [(trampoline i64) (stub i64)])
+
+(defn nc-state [] (-> (ptr NcState))
+  (primitive/alloc-static NcState))
+
+(defn nc-trampoline [(a (dyn Allocator))] (-> i64)
+  (let [st (nc-state)]
+    (when (= (.trampoline st) 0)
+      (unless (nc-available?)
+        (nc-fail "native calls need an AArch64 macOS or x86-64 Linux host"))
+      (nc-check-frame-layout)
+      (let [(mut code) (if (= (nc-host) 1) (nc-a64-trampoline a) (nc-x64-trampoline a))]
+        (set! (.trampoline st) (nc-install-code (mut code)))))
+    (.trampoline st)))
+
+;;; Bytes `bytes` long starting at `src`, zero-extended into an i64.
+(defn nc-read-bytes [(src i64) (bytes i64)] (-> i64)
+  (let [(mut v) 0]
+    (for [k 0 bytes]
+      (set! v (| v (<< (cast i64 (load (cast (ptr u8) (+ src k)))) (* k 8)))))
+    v))
+
+(defn nc-copy [(dst i64) (src i64) (n i64)] (-> i64)
+  (for [k 0 n]
+    (store! (cast (ptr u8) (+ dst k)) (load (cast (ptr u8) (+ src k)))))
+  0)
+
+;;; Where a piece's bytes live in the frame (a register slot) or the stack image.
+(defn nc-piece-home [(frame (ptr NativeFrame)) (image i64) (p NcPiece) (ret bool)] (-> i64)
+  (cond (= (.dest p) 0)
+          (+ (cast i64 frame) (+ (if ret 232 0) (* (.idx p) 8)))
+        (= (.dest p) 1)
+          (+ (cast i64 frame) (+ (if ret 256 80) (* (.idx p) 16)))
+        :else (+ image (.idx p))))
+
+;;; Call the C function at `fnaddr` with the interpreter cells `cells` under
+;;; `plan`. An aggregate result is written to `retbuf` and `retbuf` is returned;
+;;; any other result is returned as its cell (0 for void).
+(defn nc-invoke! [(a (dyn Allocator)) (plan (ptr NcPlan)) (fnaddr i64) (cells (ptr i64)) (retbuf i64)] (-> i64)
+  (let [tramp (nc-trampoline a)
+        (mut frame) (primitive/zeroed NativeFrame)
+        nargs (len (.args plan))
+        image (if (> (.stack_bytes plan) 0)
+                  (cast i64 (nc.malloc (cast isize (.stack_bytes plan))))
+                  0)
+        (mut copies) (al-new [i64] a)]
+    (for [i 0 nargs]
+      (let [arg (get (.args plan) i)
+            cell (load (primitive/index cells i))
+            ; the bytes a piece reads: a scalar's cell, an aggregate's storage, or
+            ; for a by-reference aggregate, the pointer to a fresh copy
+            src (cond (< (.kind arg) 2) (cast i64 (primitive/index cells i))
+                      (= (.kind arg) 2) cell
+                      :else
+                        (let [copy (cast i64 (nc.malloc (cast isize (if (> (.size arg) 0) (.size arg) 1))))
+                              box (cast i64 (nc.malloc (cast isize 8)))]
+                          (nc-copy copy cell (.size arg))
+                          (store! (cast (ptr i64) box) copy)
+                          (push! (mut copies) copy)
+                          (push! (mut copies) box)
+                          box))]
+        (for [k 0 (len (.pieces arg))]
+          (let [p (get (.pieces arg) k)
+                home (nc-piece-home (mut frame) image p false)]
+            (if (and (< (.kind arg) 2) (!= (.dest p) 2))
+                ; a scalar fills its whole register slot (its cell is already
+                ; extended to 64 bits)
+                (store! (cast (ptr i64) home) cell)
+                (nc-copy home (+ src (.val_off p)) (.bytes p)))))))
+    (when (.sret plan)
+      (if (= (nc-host) 1)
+          (set! (mut (.ints frame)) 8 retbuf)
+          (set! (mut (.ints frame)) 0 retbuf)))
+    (set! (.nvec frame) (.nvec plan))
+    (set! (.stack frame) image)
+    (set! (.stack_bytes frame) (.stack_bytes plan))
+    (call-ptr (cast (fnptr c [i64 (ptr NativeFrame)] void) (cast (ptr i8) tramp)) fnaddr (cast (ptr NativeFrame) (mut frame)))
+    (unless (= image 0) (nc.free (cast (ptr i8) image)))
+    (for [i 0 (len copies)] (nc.free (cast (ptr i8) (get copies i))))
+    (al-free! (mut copies))
+    (nc-take-result (mut frame) plan retbuf)))
+
+;;; The call's result as an interpreter cell (see nc-invoke!).
+(defn nc-take-result [(frame (ptr NativeFrame)) (plan (ptr NcPlan)) (retbuf i64)] (-> i64)
+  (let [r (.ret plan)]
+    (cond (.ret_void plan) 0
+          (= (.kind r) 3) retbuf
+          (= (.kind r) 2)
+            (do
+              (for [k 0 (len (.pieces r))]
+                (let [p (get (.pieces r) k)]
+                  (nc-copy (+ retbuf (.val_off p)) (nc-piece-home frame 0 p true) (.bytes p))))
+              retbuf)
+          :else
+            (let [p (get (.pieces r) 0)
+                  raw (nc-read-bytes (nc-piece-home frame 0 p true) (if (= (.kind r) 1) (.size r) 8))]
+              (if (= (.kind r) 1) raw (nc-canon r raw))))))
+
+;;; An integer cell received from C, extended from its width as the interpreter
+;;; keeps every integer (the ABIs leave the upper bits unspecified).
+(defn nc-canon [(arg NcArg) (v i64)] (-> i64)
+  (let [bits (.bits arg)]
+    (cond (>= bits 64) v
+          (= bits 1) (& v 1)
+          (.signed arg) (let [sh (- 64 bits)] (>> (<< v sh) sh))
+          :else (& v (- (<< 1 bits) 1)))))
+
+; ============================ callbacks ======================================
+;;; The shared callback entry: saves the argument registers into a NativeFrame
+;;; (with the entering thunk's record in `nvec` and the caller's stack arguments
+;;; in `stack`) and calls dispatch(frame), which leaves the result in the frame.
+;;; Installed once per process.
+(defn nc-callback-stub [(a (dyn Allocator)) (dispatch i64)] (-> i64)
+  (let [st (nc-state)]
+    (when (= (.stub st) 0)
+      (unless (nc-available?)
+        (nc-fail "native callbacks need an AArch64 macOS or x86-64 Linux host"))
+      (nc-check-frame-layout)
+      (let [(mut code) (if (= (nc-host) 1)
+                           (nc-a64-callback-stub a dispatch)
+                           (nc-x64-callback-stub a dispatch))]
+        (set! (.stub st) (nc-install-code (mut code)))))
+    (.stub st)))
+
+;;; Bytes of the mapping that holds `n` thunks.
+(defn nc-thunks-size [(n i64)] (-> i64)
+  (nc-align-up (if (> n 0) (* n (nc-thunk-bytes)) 1) 16384))
+
+;;; `n` callback thunks: thunk i puts `records + i * record-bytes` in x9 (r10 on
+;;; x86-64) and branches to `stub`. Its address is a C function pointer to that
+;;; record's function. Returns the table's base; its mapping is
+;;; (nc-thunks-size n) bytes, for nc-release-code.
+(defn nc-make-thunks [(a (dyn Allocator)) (n i64) (records i64) (record-bytes i64) (stub i64)] (-> i64)
+  (let [size (nc-thunks-size n)
+        anon (if (= (nc-host) 2) 34 4098)
+        base (cast i64 (nc.mmap (cast (ptr i8) 0) size (cast i32 3) (cast i32 anon) (cast i32 -1) 0))]
+    (when (or (= base 0) (= base -1))
+      (nc-fail "native callbacks: mmap of thunk pages failed"))
+    ; the branches are pc-relative, so the code is generated for its final address
+    (let [(mut code)
+            (if (= (nc-host) 1)
+                (let [(mut s) (asm-new a)]
+                  (for [i 0 n]
+                    (let [at (a64-off (mut s))
+                          record (+ records (* i record-bytes))]
+                      (a64-w! (mut s) (a64-movz 9 (& record 65535) 0))
+                      (for [hw 1 4]
+                        (a64-w! (mut s) (a64-movk 9 (& (>> record (* hw 16)) 65535) hw)))
+                      (let [rel (/ (- stub (+ base (+ at 16))) 4)]
+                        (a64-w! (mut s) (| (<< 5 26) (& rel 67108863))))
+                      (a64-w! (mut s) (a64-nop))))
+                  (.buf s))
+                (let [(mut s) (xasm-new a)]
+                  (for [i 0 n]
+                    (let [at (x64-off (mut s))]
+                      ; mov r10, imm64
+                      (x64-b! (mut s) 73)
+                      (x64-b! (mut s) 186)
+                      (x64-w64! (mut s) (+ records (* i record-bytes)))
+                      ; jmp rel32
+                      (x64-b! (mut s) 233)
+                      (x64-w32! (mut s) (- stub (+ base (+ at 15))))
+                      (x64-nop! (mut s))))
+                  (.buf s)))]
+      (for [i 0 (len code)]
+        (store! (cast (ptr u8) (+ base i)) (get code i)))
+      (when (!= (cast i64 (nc.mprotect (cast (ptr i8) base) size (cast i32 5))) 0)
+        (nc-fail "native callbacks: mprotect of thunk pages failed"))
+      (nc-flush-icache base (len code))
+      base)))
+
+(extern nc.munmap :as "munmap" :cc c [(ptr i8) i64] (-> i32))
+
+(defn nc-release-code [(base i64) (size i64)] (-> i64)
+  (unless (= base 0) (nc.munmap (cast (ptr i8) base) size))
+  0)
+
+;;; Read incoming argument `i` of a callback into `dst` (its storage for an
+;;; aggregate) and return its cell.
+(defn nc-receive-arg [(frame (ptr NativeFrame)) (plan (ptr NcPlan)) (i i64) (dst i64)] (-> i64)
+  (let [arg (get (.args plan) i)
+        stack (.stack frame)]
+    (cond (< (.kind arg) 2)
+            (let [p (get (.pieces arg) 0)
+                  home (nc-piece-home frame stack p false)
+                  raw (nc-read-bytes home (if (= (.dest p) 2) (.bytes p) (if (= (.kind arg) 1) (.size arg) 8)))]
+              (if (= (.kind arg) 1) raw (nc-canon arg raw)))
+          (= (.kind arg) 2)
+            (do
+              (for [k 0 (len (.pieces arg))]
+                (let [p (get (.pieces arg) k)]
+                  (nc-copy (+ dst (.val_off p)) (nc-piece-home frame stack p false) (.bytes p))))
+              dst)
+          :else
+            ; by reference: copy the caller's aggregate in
+            (let [p (get (.pieces arg) 0)
+                  ptr (nc-read-bytes (nc-piece-home frame stack p false) 8)]
+              (nc-copy dst ptr (.size arg))
+              dst))))
+
+;;; Where a callback must write an aggregate result the caller passed a pointer for.
+(defn nc-sret-pointer [(frame (ptr NativeFrame))] (-> i64)
+  (if (= (nc-host) 1) (get (.ints frame) 8) (get (.ints frame) 0)))
+
+;;; Store a callback's result `cell` for the stub to return.
+(defn nc-return! [(frame (ptr NativeFrame)) (plan (ptr NcPlan)) (cell i64)] (-> i64)
+  (let [r (.ret plan)]
+    (cond (.ret_void plan) 0
+          (= (.kind r) 3)
+            ; the caller's result buffer; x86-64 also returns its address in rax
+            (let [dst (nc-sret-pointer frame)]
+              (nc-copy dst cell (.size r))
+              (set! (mut (.ret_ints frame)) 0 dst)
+              0)
+          (= (.kind r) 2)
+            (for [k 0 (len (.pieces r))]
+              (let [p (get (.pieces r) k)]
+                (nc-copy (nc-piece-home frame 0 p true) (+ cell (.val_off p)) (.bytes p))))
+          :else
+            (let [p (get (.pieces r) 0)]
+              (store! (cast (ptr i64) (nc-piece-home frame 0 p true)) cell)
+              0))))

@@ -503,6 +503,8 @@ const env = {
   // compiler then reads the recorded Diag via meta-host-err and reports it located.
   pthread_exit:()=>{ throw new MetaHalt(); },
   pthread_create: trap('pthread_create'),
+  // only the interpreter's native thread wrapper asks, and it never runs here
+  pthread_attr_getstacksize: trap('pthread_attr_getstacksize'),
   // Wall 1: comptime JIT / dylib / subprocess — the wasm meta path replaces these
   // with meta_run_wasm (run a metaprogram as a shared-memory side-module in-sandbox).
   meta_run_wasm, meta_run_ct,

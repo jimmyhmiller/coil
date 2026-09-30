@@ -233,6 +233,9 @@ OPAQUE_FIELDS={('coil.compiler.loader.LS','code_session_state'),
                ('coil.compiler.resolve.DefEntry','base'),
                ('coil.compiler.ast.AstUnitState','resolution_base'),
                ('coil.compiler.metaengine.MEEntry','fp'),
+               # Native-call state is shared by every copy of an interpreter: its
+               # bytecode names call sites and thunks that live there.
+               ('coil.compiler.interp.Interp','ffi'),
                # A persistent base is owned by its revision and shared between
                # snapshots; a snapshot only points at it.
                ('coil.compiler.comptime.SemMapsSnap','base')}
