@@ -72,6 +72,12 @@ substitution it parses each line and lowers structurally:
   `@llvm.masked.gather.v4i8.v4p0`) → NEON, all scalarized lane-by-lane (this
   keeps results bit-identical to the LLVM backend's, which is what the
   runtime corpus gate compares — see `codegen_a64.coil`'s `emit-vec-fbin!`).
+- scalar float math intrinsics (`@llvm.<op>.f32` / `.f64`, the operations
+  `coil.math` is written over; the table is `src/compiler/float_math.coil`) →
+  `fsqrt`, `fabs`, `frintm`/`frintp`/`frintz`/`frinta`/`frintn`, `fmadd`, and
+  `fmin`/`fmax` for `minimum`/`maximum`; `copysign` and the transcendentals call
+  the libm function (`sinf`, `atan2`, …). `roundeven` calls C99 `nearbyint`,
+  since macOS libm has no `roundeven`.
 - Inline vector-constant literals (`<i32 1, i32 2, ...>`) and float literals
   (`float 1.0`) are supported anywhere a value operand is expected — these
   appear pervasively in real inline-IR (icmp/select comparands, shift

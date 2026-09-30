@@ -71,6 +71,11 @@ LLVM backend the same way: byte-for-byte on `tests/compiler/oracle/arm64/tests/l
 (shared between both native backends' corpora) and on the project that
 motivated the expansion.
 
+The scalar float math intrinsics `coil.math` uses are lowered differently: SSE2
+has `sqrtss`/`sqrtsd`, and IEEE `minimum`/`maximum` is an inline sequence
+(`minss`/`maxss` differ on NaN and signed zero); everything else, rounding
+included, since SSE2 has no rounding instruction, calls the libm function.
+
 ## Gates
 `tests/compiler/oracle/x64/`:
 - `gate-encode.sh` — every instruction the encoder can emit is diffed against

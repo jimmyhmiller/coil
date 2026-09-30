@@ -32,6 +32,7 @@
 (module coil.compiler.codegen_x64)
 (import "coil.primitive" :as primitive)
 (import "coil.compiler.vector_scalar" :use *)
+(import "coil.compiler.float_math" :use *)
 (import "coil.alloc" :as alloc :use *)
 (import "coil.result" :use *)
 (import "coil.slice" :use *)
@@ -82,6 +83,7 @@
    (has_res bool)])
 
 (defstruct GStr [(s (slice u8)) (symidx i64)])  ; interned string literal
+(defstruct GStatic [(name (slice u8)) (ty Type) (symidx i64)])  ; a runtime `def`
 
 ; a lowered value: kind 0 = int/ptr immediate, 1 = slot (by-value), 2 = f64 imm bits
 (defstruct AVal [(kind i64) (v i64) (ty Type)])
@@ -100,6 +102,7 @@
    (datasec i64)  ; section ordinals
    (asm XAsm)
    (strs (ArrayList GStr))  ; interned EStr/ECStr globals
+   (statics (ArrayList GStatic))  ; runtime defs, each one data symbol
    (nglob i64)  ; g.N counter
    ; ---- per-function state ----
    (frame i64)  ; next free slot offset
@@ -1648,12 +1651,6 @@
 (defn g-field-ty [(g (ptr Cga)) (si i64) (fi i64)] (-> (ptr Type))
   (field (xal-at [Field] (.fields (struct-at (field g layouts) si)) fi) ty))
 
-;;; An f64 constant's bit pattern narrowed to the f32 bit pattern.
-(defn g-f32-bits [(bits64 i64)] (-> i64)
-  (let [(mut wide) bits64
-        (mut narrow) (cast f32 (load (cast (ptr f64) (mut wide))))]
-    (cast i64 (load (cast (ptr u32) (mut narrow))))))
-
 ;;; Write the link-time constant `e` of type `t` at `off` in data section `sect`:
 ;;; the initializer of an `alloc-static` (array literals lower to one). Pointers
 ;;; become absolute relocations the loader or linker resolves.
@@ -1673,7 +1670,7 @@
       (EFloat [bits]
               (do
                 (if (= (ty-size g t) 4)
-                    (xb-patch-u32! (mut buf) off (g-f32-bits bits))
+                    (xb-patch-u32! (mut buf) off (f64-bits->f32-bits bits))
                     (xb-patch-u64! (mut buf) off bits))
                 0))
       (EBool [v] (do (set! (mut buf) off (cast u8 (if v 1 0))) 0))
@@ -1782,6 +1779,38 @@
                         0))
               (_ (do (cgx-fail "static initializer: materialized aggregate has the wrong type") 0))))
       (_ (do (cgx-fail "static initializer is not a link-time constant") 0)))))
+
+;;; The static of the runtime `def` NAME, or -1.
+(defn g-static-idx [(g (ptr Cga)) (name (slice u8))] (-> i64)
+  (let [(mut found) -1]
+    (for i (range 0 (len (.statics g)))
+      (when (and (< found 0) (= (.name (xal-at [GStatic] (field g statics) i)) name))
+        (set! found i)))
+    found))
+
+;;; Give every runtime `def` its own local data symbol, initialized with the
+;;; def's link-time constant value; `EStaticRef` addresses it.
+(defn g-declare-statics! [(g (ptr Cga)) (p (ptr Program))] (-> i64)
+  (let [cs (load (field p consts))]
+    (for i (range 0 (len (load cs)))
+      (let [cp (xal-at [Const] (.consts p) i)]
+        (when (.runtime cp)
+          (match (.ty cp)
+            (None [] (cgx-fail "internal: checked def has no type"))
+            (Some [ty]
+              (let [tp (box-type (.a g) ty)
+                    buf (eobj-sect-buf (mut (.obj g)) (.datasec g))
+                    align (ty-align g tp)]
+                (xb-align! (mut buf) (if (< align 8) 8 align))
+                (let [off (len (load buf))
+                      sym (do (xb-zeros! (mut buf) (ty-size g tp))
+                              (eobj-add-sym! (mut (.obj g))
+                                             (sconcat (.a g) "coil_def." (.name cp))
+                                             (.datasec g) off false))]
+                  (push! (mut (.statics g)) (GStatic :name (.name cp) :ty ty :symidx sym))
+                  (g-static-write! g tp (field cp value) (.datasec g) off)))))))
+      0))
+  0)
 
 ; reg = address of a symbol. A defined symbol can use a RIP-relative lea.
 ; An undefined symbol may be preempted by a shared library: a PC32 relocation
@@ -3407,10 +3436,16 @@
     (EDynDispatch [ds vt mi cc params ret recv args]
                   (emit-dyn-dispatch g ds vt mi cc params ret recv args))
     (EStaticRef [name]
-                (do
-                  (cgx-fail2 "static-ref unsupported (statics are never populated): "
-                             name)
-                  (mk-aval 0 0 (TInt 64 true))))
+                (let [si (g-static-idx g name)]
+                  (if (< si 0)
+                      (do
+                        (cgx-fail2 "static-ref references an unknown def: " name)
+                        (mk-aval 0 0 (TInt 64 true)))
+                      (let [st (xal-at [GStatic] (field g statics) si)
+                            slot (slot-new! g 8 8)]
+                        (emit-sym-addr! g (x-scratch0) (.symidx st))
+                        (emit-store-int! g (x-scratch0) (x-slotbase) slot 8)
+                        (mk-aval 1 slot (TPtr (box-type (.a g) (.ty st))))))))
     (EErase [_t _i]
             (do
               (cgx-fail "EErase reached codegen (checker bug)")
@@ -5501,6 +5536,77 @@
               :else (cgx-fail2 "llvm-ir: unsupported line: " line))))))
 
 ; intrinsic calls: @llvm.fma.v4f32 and @llvm.vector.reduce.fadd.v4f32
+; IEEE minimum/maximum of xmm0 and xmm1 into xmm0. SSE2 has no instruction for
+; it (minss/maxss return the second operand for NaN and for equal zeros), so:
+; unordered -> xmm0+xmm1 (a quiet NaN); equal -> OR (minimum: -0 wins) or AND
+; (maximum: +0 wins) of the bit patterns; otherwise the lesser/greater operand.
+(defn emit-float-minmax! [(g (ptr Cga)) (dbl bool) (maximum bool)] (-> i64)
+  (let [s (field g asm)
+        lnan (x64-new-label (mut (.asm g)))
+        leq (x64-new-label (mut (.asm g)))
+        lother (x64-new-label (mut (.asm g)))
+        lend (x64-new-label (mut (.asm g)))]
+    (x64-ucomis! (mut s) dbl 0 1)
+    (x64-jcc-label! (mut s) (x64-cc-p) lnan)
+    (x64-jcc-label! (mut s) (x64-cc-e) leq)
+    ; minimum takes xmm1 when xmm0 > xmm1; maximum when xmm0 < xmm1
+    (x64-jcc-label! (mut s) (if maximum (x64-cc-b) (x64-cc-a)) lother)
+    (x64-jmp-label! (mut s) lend)
+    (x64-bind-label! (mut s) lother)
+    (x64-movs-rr! (mut s) dbl 0 1)
+    (x64-jmp-label! (mut s) lend)
+    (x64-bind-label! (mut s) leq)
+    (x64-movq-rx! (mut s) (x-scratch0) 0)
+    (x64-movq-rx! (mut s) (x-scratch1) 1)
+    (if maximum
+        (x64-and-rr! (mut s) (x-scratch0) (x-scratch1))
+        (x64-or-rr! (mut s) (x-scratch0) (x-scratch1)))
+    (x64-movq-xr! (mut s) 0 (x-scratch0))
+    (x64-jmp-label! (mut s) lend)
+    (x64-bind-label! (mut s) lnan)
+    (x64-adds! (mut s) dbl 0 1)
+    (x64-bind-label! (mut s) lend)
+    0))
+
+; A scalar float math intrinsic (src/compiler/float_math.coil), `tokp` at the
+; callee: `sqrtss`/`sqrtsd` and an inline minimum/maximum, otherwise a call to
+; the libm function of the same meaning (SSE2 has no rounding instruction).
+(defn emit-ir-float-math! [(g (ptr Cga))
+                           (envp (ptr (ptr GScope)))
+                           (avsp (ptr (ArrayList AVal)))
+                           (argtysp (ptr (ArrayList Type)))
+                           (result Type)
+                           (toks (ptr (ArrayList (slice u8))))
+                           (tokp (ptr i64))
+                           (t0 (slice u8))
+                           (rty Type)
+                           (fi FloatIntrinsic)] (-> i64)
+  (let [s (field g asm)
+        fb (primitive/idiv (.bits fi) 8)
+        dbl (= (.bits fi) 64)
+        rtp (primitive/alloc-stack Type)]
+    (set! rtp rty)
+    (set! tokp (primitive/iadd (load tokp) 2))  ; skip callee, "("
+    (for [i 0 (.arity fi)]
+      (let [at (ir-parse-type g result argtysp toks tokp)
+            av (ir-value-adv! g envp avsp result argtysp toks tokp at)]
+        (av-to-d! g av i)))
+    (match (.op fi)
+      (FloatSqrt [] (x64-sqrts! (mut s) dbl 0 0))
+      (FloatMinimum [] (emit-float-minmax! g dbl false))
+      (FloatMaximum [] (emit-float-minmax! g dbl true))
+      ; the operands are already in xmm0..xmm2, where the SysV convention wants
+      ; them; al = 0 vector registers for a (hypothetically) variadic callee
+      (_ (let [fsym (g-runtime-sym! g (.libm fi))
+               off (do (x64-mov-imm! (mut s) (x-scratch0) 0)
+                       (x64-call-rel32! (mut s)))]
+           (eobj-add-reloc! (mut (field g obj)) (load (field g text)) off fsym
+                            (r-x86-64-plt32) -4)
+           0)))
+    (let [slot (slot-for-ty! g rtp)]
+      (emit-store-fp! g 0 (x-slotbase) slot fb)
+      (ir-bind! g envp t0 (mk-aval 1 slot rty)))))
+
 (defn emit-ir-call! [(g (ptr Cga))
                      (envp (ptr (ptr GScope)))
                      (avsp (ptr (ArrayList AVal)))
@@ -5515,6 +5621,9 @@
     (set! tokp 3)
     (let [rty (ir-parse-type g result argtysp toks tokp)
           callee (get (load toks) (load tokp))]
+      (match (float-intrinsic callee)
+        (Some [fi] (emit-ir-float-math! g envp avsp argtysp result toks tokp t0 rty fi))
+        (None []
       (if (= callee "@llvm.fma.v4f32")
           ; ( $t0 $0 $t1 $1 $t2 $2 ) -> per-lane single-rounding fmadd
           (let [rtp (primitive/alloc-stack Type)]
@@ -5798,7 +5907,7 @@
                                                                           1)))))
                                       (ir-bind! g envp t0 (mk-aval 1 dslot rty))))
                               (_ (cgx-fail "llvm-ir: masked.gather on non-vector result"))))))
-                      (cgx-fail2 "llvm-ir: unsupported intrinsic: " callee))))))))
+                      (cgx-fail2 "llvm-ir: unsupported intrinsic: " callee))))))))))
 
 ; ============================ function emission ==============================
 ; Frame, in the order the prologue builds it:
@@ -6446,6 +6555,7 @@
     (set! (.obj g) (eobj-new a))
     (set! (.asm g) (xasm-new a))
     (set! (.strs g) (al-new [GStr] a))
+    (set! (.statics g) (al-new [GStatic] a))
     (set! (.nglob g) 0)
     (set! (.loops g) (al-new [GLoop] a))
     (set! (.env g) (gscope-nil a))
@@ -6507,6 +6617,7 @@
     (g-register-types! g mp)
     (g-eval-asserts! g mp)
     (g-register-sigs! g mp)
+    (g-declare-statics! g mp)
     (let [fs (load (field mp funcs))
           n (len (load fs))
           (mut i) 0]

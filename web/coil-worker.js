@@ -383,6 +383,26 @@ function makeEnv(run) {
     },
     sqrt: (x) => Math.sqrt(x), pow: (x, y) => Math.pow(x, y),
     fmod: (x, y) => x % y, fmodf: (x, y) => Math.fround(Math.fround(x) % Math.fround(y)),
+    // coil.math's libm functions (interp.coil's host externs). JS has no f32
+    // transcendentals, so the f32 forms round the f64 result.
+    round:(x)=>(x<0?-Math.round(-x):Math.round(x)),
+    nearbyint:(x)=>{ const r=Math.round(x); return (Math.abs(x%1)===0.5&&r%2!==0)?r-1:r; },
+    copysign:(x,y)=>{ const d=new DataView(new ArrayBuffer(8)); d.setFloat64(0,y); return (d.getUint8(0)&0x80)?-Math.abs(x):Math.abs(x); },
+    roundf:(x)=>Math.fround(x<0?-Math.round(-x):Math.round(x)),
+    nearbyintf:(x)=>{ const r=Math.round(x); return Math.fround((Math.abs(x%1)===0.5&&r%2!==0)?r-1:r); },
+    copysignf:(x,y)=>{ const d=new DataView(new ArrayBuffer(4)); d.setFloat32(0,y); return Math.fround((d.getUint8(0)&0x80)?-Math.abs(x):Math.abs(x)); },
+    fabsf:(x)=>Math.fround(Math.abs(x)),
+    sin:Math.sin, cos:Math.cos, tan:Math.tan, asin:Math.asin, acos:Math.acos, atan:Math.atan,
+    atan2:Math.atan2, sinh:Math.sinh, cosh:Math.cosh, tanh:Math.tanh, exp:Math.exp,
+    exp2:(x)=>Math.pow(2,x), log:Math.log, log2:Math.log2, log10:Math.log10,
+    sinf:(x)=>Math.fround(Math.sin(x)), cosf:(x)=>Math.fround(Math.cos(x)),
+    tanf:(x)=>Math.fround(Math.tan(x)), asinf:(x)=>Math.fround(Math.asin(x)),
+    acosf:(x)=>Math.fround(Math.acos(x)), atanf:(x)=>Math.fround(Math.atan(x)),
+    atan2f:(y,x)=>Math.fround(Math.atan2(y,x)), sinhf:(x)=>Math.fround(Math.sinh(x)),
+    coshf:(x)=>Math.fround(Math.cosh(x)), tanhf:(x)=>Math.fround(Math.tanh(x)),
+    expf:(x)=>Math.fround(Math.exp(x)), exp2f:(x)=>Math.fround(Math.pow(2,x)),
+    logf:(x)=>Math.fround(Math.log(x)), log2f:(x)=>Math.fround(Math.log2(x)),
+    log10f:(x)=>Math.fround(Math.log10(x)), powf:(x,y)=>Math.fround(Math.pow(x,y)),
 
     // stdio used by the interpreter's FFI table — real implementations so an
     // interpreted program that prints behaves correctly.
