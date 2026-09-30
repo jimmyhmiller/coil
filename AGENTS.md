@@ -13,8 +13,8 @@ of those three states separately; never leave their status implicit.
 
 **Writing Coil? Run `coil guide`** (or read [`docs/reference/LANGUAGE_GUIDE.md`](docs/reference/LANGUAGE_GUIDE.md)).
 It's an example-first language reference, and its `Gotchas` section lists what
-trips agents up (f64 has no `Eq`; no unary minus; `if` branches must share a type;
-`primitive/` needs an import). Read it before writing Coil.
+trips agents up (float `=` is IEEE, so NaN ≠ NaN; no unary minus; `if` branches
+must share a type; `primitive/` needs an import). Read it before writing Coil.
 
 ## Bug reports
 

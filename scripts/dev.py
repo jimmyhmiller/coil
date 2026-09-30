@@ -1335,6 +1335,8 @@ source-roots = ["src"]
                               "primitive-mut-operand", *backend_flags),
             lambda: build_run("tests/compiler/features/code_type_traits.coil",
                               "code-type-traits", *backend_flags),
+            lambda: build_run("tests/compiler/features/float_eq.coil",
+                              "float-eq", *backend_flags),
             lambda: expect_rejected("tests/compiler/features/struct_reference_field_rejected.coil",
                                     "fast modernization gate: a reference-typed field compiled"),
             lambda: expect_diagnostic("tests/compiler/features/ownership_match_payload_move_rejected.coil",

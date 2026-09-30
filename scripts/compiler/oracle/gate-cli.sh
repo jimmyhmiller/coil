@@ -1713,10 +1713,10 @@ printf '(module m)\n(defn f [(T NoSuchTrait)] [(x T)] (-> i64) 0)\n(defn main []
 expect_rc 1 "unknown trait in a bound is rejected" "$COIL" build "$T/badtrait.coil" -o "$T/x"
 expect_out "unknown trait" "…and named" "$COIL" build "$T/badtrait.coil" -o "$T/x"
 # defstruct bound ENFORCED at instantiation (was: silently ignored)
-printf '(module m)\n(defstruct Box [(T Eq)] [(v T)])\n(defn u [] (-> i64) (let [b (coil.primitive/alloc-stack (Box f64))] 0))\n(defn main [] (-> i64) (u))\n' > "$T/structbound.coil"
-expect_rc 1 "defstruct bound enforced ((Box f64), f64 has no Eq)" "$COIL" build "$T/structbound.coil" -o "$T/x"
+printf '(module m)\n(defstruct P [(x i64)])\n(defstruct Box [(T Eq)] [(v T)])\n(defn u [] (-> i64) (let [b (coil.primitive/alloc-stack (Box P))] 0))\n(defn main [] (-> i64) (u))\n' > "$T/structbound.coil"
+expect_rc 1 "defstruct bound enforced ((Box P), P has no Eq)" "$COIL" build "$T/structbound.coil" -o "$T/x"
 # defsum now PARSES a bound (was: 'expected symbol') and enforces it
-printf '(module m)\n(defsum Opt [(T Eq)] (Non) (Som [(v T)]))\n(defn u [] (-> i64) (let [o (coil.primitive/alloc-stack (Opt f64))] 0))\n(defn main [] (-> i64) (u))\n' > "$T/sumbound.coil"
+printf '(module m)\n(defstruct P [(x i64)])\n(defsum Opt [(T Eq)] (Non) (Som [(v T)]))\n(defn u [] (-> i64) (let [o (coil.primitive/alloc-stack (Opt P))] 0))\n(defn main [] (-> i64) (u))\n' > "$T/sumbound.coil"
 expect_rc 1 "defsum bound parses + enforced" "$COIL" build "$T/sumbound.coil" -o "$T/x"
 # and the valid instantiations still compile
 printf '(module m)\n(defstruct Box [(T Eq)] [(v T)])\n(defn main [] (-> i64) (let [b (coil.primitive/alloc-stack (Box i64))] (coil.primitive/store! (coil.primitive/field b v) 7) 0))\n' > "$T/okbound.coil"

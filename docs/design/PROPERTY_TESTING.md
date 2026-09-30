@@ -1084,7 +1084,8 @@ this system automates.
    Seeds/settings arrive via environment (`--seed`, `--cases`,
    `COIL_PBT_DB`) using `coil.os/getenv`, with `coil test` flags setting them —
    or the transform is extended to synthesize an argv-taking `main`.
-6. **Float shrinking.** `f64` deliberately has no `Eq` in Coil; the shrinker
+6. **Float shrinking.** `f64`'s `=` is IEEE equality (`NaN` is unequal to
+   itself, `0.0` equals `-0.0`), so it cannot order choices; the shrinker
    compares float choices by their *bit* distance from origin, which needs the
    documented memory round-trip bitcast idiom rather than `cast`.
 7. **Deadlines/hangs.** Detecting a hung case in-process needs `SIGALRM` +

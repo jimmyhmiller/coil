@@ -105,8 +105,9 @@ supply one:
 `(cast T x)` converts between integers, floats and pointers. Between `f64` and an
 integer it converts the *number* (truncating); it never reinterprets bits.
 
-⚠ `f64` has no `=`. NaN ≠ NaN, so floats don't implement `Eq`. Compare with
-`<`/`>`, or use `primitive/fcmp-eq` for IEEE equality.
+Floats compare with IEEE `=`: NaN equals nothing, not even itself, and `-0.0`
+equals `0.0`. So `(= x x)` is false for a NaN `x`, and `!=` is true whenever either
+side is NaN.
 
 `coil.math` has the float functions, for `f32` and `f64` alike: `sqrt`, `abs`,
 `floor`, `ceil`, `trunc`, `round` (ties away from zero), `round-even`, `min`, `max`,
@@ -1355,7 +1356,7 @@ grows the stack on every iteration. Prefer an initialized `(mut x)` local.
 
 ## Gotchas
 
-- `f64` has no `=`; use `primitive/fcmp-eq` for IEEE equality.
+- Float `=` is IEEE equality, so a NaN is not `=` to itself.
 - `if` needs both branches, of the same type, when its value is used.
 - `cast` between floats and integers converts the value, not the bits.
 - `primitive/…` names require `(import "coil.primitive" :as primitive)`.
