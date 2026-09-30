@@ -53,9 +53,10 @@ by pointer arithmetic is a genuine address.
   real `free`.
 - **Static** (`alloc-static`, storage 1): a `malloc`'d, zeroed region (leaked for
   the process lifetime — statics live forever).
-- **Stack** (`alloc-stack`, storage 0): bump-allocated from a **per-frame buffer**
-  (see below). Returns a real address into that buffer, valid for the frame's
-  lifetime.
+- **Stack** (`alloc-stack`, storage 0): bump-allocated from the call's **frame
+  memory** (see below). Returns a real address, valid for the frame's lifetime.
+  `alloc-stack-bytes` (`ALLOCDYN`) takes its run-time byte count from the same
+  memory, 16-aligned.
 - **Loads/stores** (`ELoad`/`EStore`, and mut-cell access): real
   `load`/`store` at the address, at the value's byte width (1/2/4/8), with
   sign/zero extension chosen by the pointee type (`mem-load`/`mem-store`).
@@ -75,11 +76,15 @@ return:
   directly. A `(mut x)` binding instead holds a **pointer** to a frame-buffer cell
   (see `MUTCELL`), so `(primitive/load x)`/`(primitive/store! x v)` lower to real `ELoad`/`EStore` —
   exactly as the type-checker already rewrote them.
-- **frame buffer**: a 1 MiB malloc'd region with a bump pointer, backing
-  `alloc-stack`, `(mut …)` cells, spilled refs, and string-literal slices.
-  Overflow is a hard error, never silent.
-- **operand stack**: a 4096-cell (`32 KiB`) `i64[]`. Bytecode is stack-machine
-  code: operands are pushed and popped here.
+- **frame memory** (`FrameMem`): a chain of malloc'd chunks bump-allocated in
+  order, backing `alloc-stack`, `alloc-stack-bytes`, `(mut …)` cells, spilled
+  refs, and string-literal slices. A request that does not fit the current chunk
+  starts a new one at least as large, so addresses never move and a frame has no
+  size limit.
+- **operand stack** (`VStack`): an `i64[]` that doubles when an expression nests
+  deeper than it has room for. Bytecode is stack-machine code: operands are
+  pushed and popped here. A call's arguments are popped at once (`vpop-n`) and
+  the callee reads them in place.
 
 Calls recurse through the **host call stack** — `OP_CALL` invokes `vm-exec`
 re-entrantly — so Coil recursion (e.g. `fib`) maps onto native recursion. The
@@ -133,19 +138,24 @@ opcodes know int-vs-float, width, and signedness.
 | 37 | `BITGET`     | a=low b=width c=signed\|(backbytes<<1) | addr=pop; load backing; shift/mask/sign-extend field; push |
 | 38 | `BITSET`     | a=low b=width c=backbytes    | val=pop; addr=pop; clear field, OR (val&mask)<<low, store; push val |
 | 40 | `LLVMIR`     | a=iridx b=nargs              | pop nargs; push ir-run(irs[a], args) (interprets an inline-IR body) |
-| 42 | `CALLPTR`    | a=nargs                      | pop nargs; pop fnptr; decode fidx; push vm-exec(fidx, args) |
+| 42 | `CALLPTR`    | a=nargs b=native call site   | pop nargs; pop fnptr; an interpreted function's pointer runs vm-exec(fidx, args), any other address is the native call at site b (-1: none possible) |
 | 44 | `SAVESP`     | a=local                      | locals[a] = operand-stack depth (loop entry) |
 | 45 | `RESTORESP`  | a=local                      | operand-stack depth = locals[a] (break/continue out of an expression) |
-| 43 | `BOXEXT`     | a=size b=align               | v=pop; slot=frame-alloc; store the packed <=8B C aggregate return; push slot |
+| 43 | `BOXEXT`     | a=size b=align               | v=pop; slot=frame-alloc; store the packed <=8B C aggregate return; push slot (built-in table calls only) |
+| 46 | `ALLOCDYN`   |                              | n=pop; push frame-alloc(n rounded up to 16, align 16) (`alloc-stack-bytes`) |
+| 47 | `CALLNATIVE` | a=call site b=nargs          | pop nargs; push the result of the native C call at site a (see FFI) |
 
 Aggregates (struct/sum/slice/array/vec) are carried **by address**: a cell holds
 the address of the bytes. `LOADAGG`/`STOREAGG` copy; `FIELDPTR`/`INDEX` are
 pointer arithmetic; `EConstruct`/`EMatch` build and destructure the sum's
 `{i32 tag, payload}` at the same offsets the backends use. A function's aggregate
 return is copied into a caller-provided `retbuf` before its frame is freed.
-Function pointers encode `2^51 + fidx`; `EFnPtrOf`/`EMakeDyn` vtables store that,
-and `CALLPTR` decodes it (real C addresses are not callable). `alloc-static`
-sites allocate one persistent zeroed region at compile time and bake its address.
+With native calls (below), an interpreted function's pointer is the address of
+its native **thunk**, so C code can call it; `CALLPTR` maps a thunk back to its
+function and calls any other address natively. Without them, function pointers
+encode `2^51 + fidx`. `alloc-static` sites allocate one persistent zeroed region
+at compile time and bake its address; `(alloc-static T :as "sym")` sites share
+one cell per symbol, and a second definition is the same error a link reports.
 
 ### `BIN` / `CMP` operand encoding
 
@@ -171,18 +181,60 @@ the body, so a `for`-macro's top-of-loop increment still runs (matching C `for`)
 
 ## FFI dispatch
 
-`extern` calls (`CALLEXT`) dispatch through a **builtin table** (`extern-call`):
-the extern's C symbol (its name's last dot component, `last-component2`, matching
-the backends' `g-last-component`) selects a real native libc call with the
-correct signature. Currently wired: `putchar`, `putc`, `write`, `puts`, `exit`,
-`malloc`, `free`. Arguments are passed as `i64` cells and cast to the callee's C
-types at the call site. An extern not in the table is a **hard error** (never a
-silent no-op) — add it to the table to support it.
+### Native calls (AArch64 macOS, x86-64 Linux)
 
-This is self-contained (no `dlsym`): the libc symbols are declared as
-module-qualified `coil.compiler.interp.*` externs (so the Coil scope name never collides while
-the C symbol is the real one, e.g. `interp.write` -> `write`), with signatures
-matching the compiler's existing declarations of those symbols.
+`src/compiler/native_call.coil` calls C functions whose signature is known only
+at run time, the way libffi does:
+
+- **Outgoing.** An `extern` call resolves its C symbol with `dlsym` in this
+  process and compiles to `CALLNATIVE`. `nc-plan` classifies the call under the
+  host C ABI (Apple AAPCS64 with its packed stack arguments and 8-byte variadic
+  slots; SysV x86-64 eightbyte classes) into pieces: which bytes of which
+  argument go to which integer register, vector register (full 128-bit) or stack
+  offset, and where the result comes back. `nc-invoke!` fills a `NativeFrame`
+  from the plan and runs a trampoline, emitted once with the backends' own
+  assemblers into read+execute pages, that loads the registers and the stack
+  image, calls the function, and stores the return registers. Variadic calls,
+  structs of any size in either direction (by value, by reference, homogeneous
+  float aggregates), and results through a caller-provided pointer are covered.
+  A `call-ptr` to an address that is not an interpreted function is the same
+  native call, planned from the function-pointer type.
+- **Callbacks.** An interpreted function's pointer is a native thunk that loads
+  the address of its `{context, function}` record and enters a shared stub; the
+  stub saves the argument registers into a `NativeFrame` and calls
+  `interp-callback-dispatch`, which reads the arguments with the same plan, runs
+  the function, and leaves the result for the stub to return. The plan comes
+  from the C-level signature (for `fnptr-of` a function taking a struct by
+  value, the checker's by-value C entry), fixed when the pointer is taken. A
+  function whose signature has compile-time-only types cannot be called from C,
+  and says so if it is.
+- **State.** Call-site plans, callback plans and the thunk table live in a
+  malloc-backed `IFfiCtx` that a retained snapshot of the interpreter shares
+  rather than copies (compiled bytecode names call sites by index and function
+  pointers by thunk address). It is released with the compilation unit.
+- **Threads.** `pthread_create` is the real one, reached through
+  `interp-pthread-create`, which raises the new thread's stack to the size the
+  compiler gives its own pipeline (interpreted frames are far larger than
+  compiled ones). The IR's atomics are performed atomically (a compare-and-swap
+  on the aligned 8-byte word containing the value), and inline-IR scratch
+  memory is per run, so interpreted threads run concurrently.
+
+`coil interp` resolves symbols among the images loaded in its own process: libc,
+libm and the system libraries. A program's own C library must be loaded into the
+process (for instance with `DYLD_INSERT_LIBRARIES`/`LD_PRELOAD`); an `export-c`
+symbol of the interpreted program is not visible to C by name.
+
+### The built-in table
+
+Without native calls (a wasm build of the compiler), and for an extern this
+process has no symbol for when a metaprogram host hook is installed, extern
+calls (`CALLEXT`) go through a **builtin table** (`extern-call`): the extern's C
+symbol selects a real libc call with the correct signature, and the `mh_*`
+metaprogram host functions go to the hook. The libc symbols are declared as
+module-qualified `coil.compiler.interp.*` externs (so the Coil scope name never
+collides while the C symbol is the real one, e.g. `interp.write` -> `write`),
+with signatures matching the compiler's existing declarations of those symbols.
+An extern in neither is a **hard error**.
 
 ## What is implemented and what hard-errors
 
@@ -198,14 +250,14 @@ aggregate load/store/return by value), **bit-structs** (`EBitGet`/`EBitSet`),
 **function pointers** (`EFnPtrOf`/`ECallPtr`), **trait objects**
 (`EMakeDyn`/`EDynDispatch` over a compile-time vtable), **inline LLVM IR**
 (`ELlvmIr`: slice extract/insert, vector `fadd/fsub/fmul`/`insertelement`/
-`shufflevector`/fma/reduce, atomic load/store/`atomicrmw`/`cmpxchg` modeled
-sequentially), a by-value `<=8`-byte C **struct return** (`div`), a **qsort** that
-calls its Coil comparator back through the VM, **synchronous pthread** emulation,
-program **argc/argv**, and a broad libc/libm builtin table (mem/string/stdio/math).
+`shufflevector`/fma/reduce, atomic load/store/`atomicrmw`/`cmpxchg` performed
+atomically), `alloc-stack-bytes`, named `alloc-static`, native C calls and
+callbacks (above), real threads, and program **argc/argv**.
 
-Everything still outside the subset raises a clear `idie` hard error — never a
-silent stub: `>8`-byte by-value C struct returns, `%f`-family (v-register)
-variadic FFI, and calling a real C function address as a Coil `fnptr`.
+What raises a clear `idie` hard error, never a silent stub: an extern with no
+symbol in the process (and no host hook), a callback into a function whose
+signature C cannot express, and a `declare`d (prebuilt) function, whose machine
+code is in another unit's object.
 
 ## Gate
 

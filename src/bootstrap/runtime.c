@@ -506,6 +506,7 @@ uint32_t env_pthread_attr_init(uint64_t a) { (void)a; return 0; }
 uint32_t env_pthread_attr_setstacksize(uint64_t a, uint64_t b) { (void)a; (void)b; return 0; }
 uint32_t env_pthread_attr_setguardsize(uint64_t a, uint64_t b) { (void)a; (void)b; return 0; }
 uint32_t env_pthread_attr_destroy(uint64_t a) { (void)a; return 0; }
+uint32_t env_pthread_attr_getstacksize(uint64_t a, uint64_t b) { (void)a;(void)b; die("unreachable: env.pthread_attr_getstacksize"); return 0; }
 
 // ---- DEAD imports: comptime is pure interpretation, so real threads, native
 // JIT/dylib and raw mmap are never reached. Abort LOUDLY (not a silent no-op)

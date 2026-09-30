@@ -55,6 +55,9 @@
 (import "coil.compiler.ast" :use *)
 (import "coil.compiler.parser" :use *)
 (import "coil.compiler.layoutdb" :use *)
+(import "coil.scratch" :use [ScratchArena scratch-init scratch-allocator scratch-close!])
+(import "coil.compiler.native_call" :use *)
+(import "coil.atomic" :use [atomic-load atomic-cas])
 
 ; libc functions the interpreter itself uses + the FFI builtin table. Names are
 ; module-qualified so the C SYMBOL is the last dot component (g-last-component),
@@ -260,7 +263,232 @@
    (bfuncs (ArrayList BFunc))
    (layouts LayoutDb)
    (irs (ArrayList IIr))
-   (statics (ArrayList IStatic))])
+   (statics (ArrayList IStatic))
+   ; `(alloc-static T :as "sym")` cells by symbol: one per symbol, as a link
+   (named_statics (ArrayList IStatic))
+   ; native calls and callbacks (interp-ffi); null until first needed
+   (ffi (ptr IFfiCtx))])
+
+;;; The zeroed cell behind `(alloc-static T :as "symbol")`. There is no linker
+;;; here, but the symbol still names exactly one cell: a second definition of it
+;;; is the same error native linking reports.
+(defn interp-named-static! [(cx (ptr Interp)) (symbol (slice u8)) (size i64)] (-> i64)
+  (for [i 0 (len (.named_statics cx))]
+    (when (= (.name (get (.named_statics cx) i)) symbol)
+      (idie2 "duplicate static storage symbol: " symbol)))
+  (let [addr (primitive/cast i64 (interp-owned-alloc (primitive/cast isize size)))]
+    (memzero addr size)
+    (push! (mut (.named_statics cx)) (IStatic :name symbol :addr addr))
+    addr))
+
+;; ============================ native calls ===================================
+; On a host with native calls (native_call.coil) an extern is the real C
+; function, found with dlsym, called under the host C ABI; a call-ptr to an
+; address that is not an interpreted function is a native call too; and an
+; interpreted function's pointer is a native thunk, so C can call it back.
+; Without native calls (a wasm build of the compiler) externs go through the
+; built-in table in extern-call and function pointers stay (fnptr-base + index).
+
+;;; A call site that goes to native code: an extern, or a call-ptr whose target
+;;; turns out not to be an interpreted function.
+(defstruct IFfiCall [(addr i64) (plan NcPlan)])
+
+;;; How C calls interpreted function i: `state` 0 = not yet asked, 1 = `plan`,
+;;; 2 = its signature has types C cannot express.
+(defstruct ICallback [(state i64) (plan NcPlan)])
+
+;;; What a callback thunk carries: the context and the function it enters.
+(defstruct ICallbackTarget [(ctx (ptr IFfiCtx)) (fidx i64)])
+
+;;; An interpreter's native-call state. It is malloc-backed, and an Interp holds
+;;; it by a pointer a retained snapshot shares rather than copies: compiled
+;;; bytecode names call sites by index and function pointers by thunk address,
+;;; so a copy of the interpreter must reach this same state. `cx` is whichever
+;;; interpreter last entered it; a callback runs there.
+(defstruct IFfiCtx
+  [(cx (ptr Interp))
+   (calls (ArrayList IFfiCall))
+   (callbacks (ArrayList ICallback))
+   (targets (ptr ICallbackTarget))
+   (thunks i64)
+   (nthunks i64)])
+
+(defn interp-ffi-release [(p (ptr i8))] (-> i64)
+  (let [ctx (primitive/cast (ptr IFfiCtx) p)]
+    (nc-release-code (.thunks ctx) (nc-thunks-size (.nthunks ctx)))
+    (unless (= (primitive/cast i64 (.targets ctx)) 0)
+      (interp.free (primitive/cast (ptr i8) (.targets ctx))))
+    (for [i 0 (len (.calls ctx))]
+      (nc-plan-free! (field (ial-at [IFfiCall] (field ctx calls) i) plan)))
+    (for [i 0 (len (.callbacks ctx))]
+      (when (= (.state (get (.callbacks ctx) i)) 1)
+        (nc-plan-free! (field (ial-at [ICallback] (field ctx callbacks) i) plan))))
+    (al-free! (mut (.calls ctx)))
+    (al-free! (mut (.callbacks ctx)))
+    (interp.free p)
+    0))
+
+(defn interp-ffi [(cx (ptr Interp))] (-> (ptr IFfiCtx))
+  (when (= (primitive/cast i64 (.ffi cx)) 0)
+    (let [a (malloc-allocator)
+          ctx (primitive/cast (ptr IFfiCtx) (interp.malloc (primitive/cast isize (sizeof IFfiCtx))))]
+      (set! ctx (IFfiCtx :cx cx
+                         :calls (al-new [IFfiCall] a)
+                         :callbacks (al-new [ICallback] a)
+                         :targets (primitive/cast (ptr ICallbackTarget) 0)
+                         :thunks 0
+                         :nthunks 0))
+      (unit-resource-kinded! (primitive/cast (ptr i8) ctx)
+                             (primitive/fnptr-of interp-ffi-release)
+                             UNIT-RESOURCE-INTERPRETER)
+      (set! (.ffi cx) ctx)))
+  (.ffi cx))
+
+;;; `cx` is about to run: callbacks through its (possibly shared) context land here.
+(defn interp-ffi-enter! [(cx (ptr Interp))] (-> i64)
+  (unless (= (primitive/cast i64 (.ffi cx)) 0)
+    (set! (.cx (.ffi cx)) cx))
+  0)
+
+;;; Can C express this type? (Compile-time-only types cannot be laid out.)
+(defn ffi-c-type? [(t (ptr Type))] (-> bool)
+  (match (load t)
+    (TInt [_ _] true)
+    (TFloat [_] true)
+    (TBool [] true)
+    (TPtr [_] true)
+    (TRef [_ _] true)
+    (TFn [_ _ _] true)
+    (TStruct [_] true)
+    (TSlice [_] true)
+    (TVoid [] true)
+    (TNever [] true)
+    (TArray [e _] (ffi-c-type? e))
+    (TVec [e _] (ffi-c-type? e))
+    (_ false)))
+
+(defn ffi-c-types? [(ts (ptr (ArrayList Type))) (ret (ptr Type))] (-> bool)
+  (let [(mut ok) (ffi-c-type? ret)]
+    (for [i 0 (len (load ts))]
+      (unless (ffi-c-type? (ial-at [Type] ts i)) (set! ok false)))
+    ok))
+
+;;; Register a native call site; returns its index for CALLNATIVE/CALLPTR.
+(defn ffi-register-call! [(cx (ptr Interp)) (addr i64) (types (ptr (ArrayList Type))) (nfixed i64) (ret (ptr Type))] (-> i64)
+  (let [ctx (interp-ffi cx)
+        plan (nc-plan (malloc-allocator) (field cx layouts) types nfixed ret)
+        idx (len (.calls ctx))]
+    (push! (mut (.calls ctx)) (IFfiCall :addr addr :plan plan))
+    idx))
+
+;;; Run native call site `site` on the argument cells at `argv`; `fm` holds an
+;;; aggregate result.
+(defn ffi-run-call [(cx (ptr Interp)) (site i64) (addr i64) (argv (ptr i64)) (fm (ptr FrameMem))] (-> i64)
+  (let [call (ial-at [IFfiCall] (field (.ffi cx) calls) site)
+        plan (field call plan)
+        r (.ret plan)
+        retbuf (if (and (not (.ret_void plan)) (>= (.kind r) 2))
+                   (frame-alloc fm (if (> (.size r) 0) (.size r) 1) 16)
+                   0)]
+    (nc-invoke! (malloc-allocator) plan addr argv retbuf)))
+
+;;; Interpreted function `fi` as a function pointer value.
+(defn interp-fnptr [(cx (ptr Interp)) (fi i64)] (-> i64)
+  (if (not (nc-available?))
+      (primitive/iadd (fnptr-base) fi)
+      (let [ctx (interp-ffi cx)]
+        (when (= (.thunks ctx) 0)
+          (let [n (len (.bfuncs cx))
+                targets (primitive/cast (ptr ICallbackTarget)
+                                        (interp.malloc (primitive/cast isize (* (if (> n 0) n 1) (sizeof ICallbackTarget)))))]
+            (for [i 0 n]
+              (set! (primitive/index targets i) (ICallbackTarget :ctx ctx :fidx i))
+              (push! (mut (.callbacks ctx)) (ICallback :state 0 :plan (primitive/zeroed NcPlan))))
+            (set! (.targets ctx) targets)
+            (set! (.nthunks ctx) n)
+            (set! (.thunks ctx)
+                  (nc-make-thunks (malloc-allocator)
+                                  n
+                                  (primitive/cast i64 targets)
+                                  (sizeof ICallbackTarget)
+                                  (nc-callback-stub (malloc-allocator)
+                                                    (primitive/cast i64 (primitive/cast (ptr i8) (primitive/fnptr-of interp-callback-dispatch))))))))
+        ; decide now, while only the compiling thread runs, how C would call it
+        (let [cb (ial-at [ICallback] (field ctx callbacks) fi)]
+          (when (= (.state cb) 0)
+            (let [fd (ial-at [Func] (load (field (load (field cx mp)) funcs)) fi)
+                  (mut types) (interp-c-params cx fd)
+                  ret (box-type (.a cx) (.ret fd))]
+              (if (ffi-c-types? (mut types) ret)
+                  (do
+                    (set! (.plan cb) (nc-plan (malloc-allocator) (field cx layouts) (mut types) (len types) ret))
+                    (set! (.state cb) 1))
+                  (set! (.state cb) 2)))))
+        (+ (.thunks ctx) (* fi (nc-thunk-bytes))))))
+
+;;; The parameter types C sees for function `fd`. A C entry the checker made
+;;; for `fnptr-of` (or export-c) takes each struct by value while the function
+;;; itself takes its address; the interpreter passes an aggregate by address
+;;; either way, so the C types are what the callback must read.
+(defn interp-c-params [(cx (ptr Interp)) (fd (ptr Func))] (-> (ArrayList Type))
+  (let [(mut types) (al-new [Type] (.a cx))
+        exports (load (field (load (field cx mp)) exports))
+        (mut entry) (primitive/cast (ptr ExportC) 0)]
+    (for [i 0 (len (load exports))]
+      (let [e (ial-at [ExportC] exports i)]
+        (when (= (.name e) (.name fd)) (set! entry e))))
+    (if (= (primitive/cast i64 entry) 0)
+        (for [i 0 (len (load (field fd params)))]
+          (push! (mut types) (.ty (ial-at [Param] (load (field fd params)) i))))
+        (for [i 0 (len (load (.params entry)))]
+          (push! (mut types) (load (ial-at [Type] (.params entry) i)))))
+    types))
+
+;;; The interpreted function a function pointer value denotes, or -1 for any
+;;; other address (a native function, when native calls are available).
+(defn interp-fnptr-index [(cx (ptr Interp)) (v i64)] (-> i64)
+  (if (nc-available?)
+      (let [ctx (.ffi cx)]
+        (if (or (= (primitive/cast i64 ctx) 0) (= (.thunks ctx) 0))
+            -1
+            (let [off (- v (.thunks ctx))
+                  tb (nc-thunk-bytes)]
+              (if (and (>= off 0) (< off (* (.nthunks ctx) tb)) (= (% off tb) 0))
+                  (/ off tb)
+                  -1))))
+      (let [fi (primitive/isub v (fnptr-base))]
+        (if (and (>= fi 0) (< fi (len (.bfuncs cx)))) fi -1))))
+
+;;; A native caller entered interpreted code through a thunk: read its arguments
+;;; under the function's C signature, run it, and leave the result in the frame
+;;; for the callback stub to return.
+(defn interp-callback-dispatch [(frame (ptr NativeFrame))] (-> i64)
+  (let [target (primitive/cast (ptr ICallbackTarget) (.nvec frame))
+        ctx (.ctx target)
+        cx (.cx ctx)
+        fi (.fidx target)
+        cb (ial-at [ICallback] (field ctx callbacks) fi)]
+    (unless (= (.state cb) 1)
+      (idie2 "C called a function whose signature C cannot express: "
+             (.name (ial-at [BFunc] (field cx bfuncs) fi))))
+    (let [plan (field cb plan)
+          n (len (.args plan))
+          (mut fm) (frame-new)
+          cells (primitive/cast (ptr i64) (frame-alloc (mut fm) (* (if (> n 0) n 1) 8) 8))]
+      (for [i 0 n]
+        (let [arg (get (.args plan) i)
+              dst (if (>= (.kind arg) 2)
+                      (frame-alloc (mut fm) (if (> (.size arg) 0) (.size arg) 1) 16)
+                      0)]
+          (set! (primitive/index cells i) (nc-receive-arg frame plan i dst))))
+      (let [r (.ret plan)
+            retbuf (if (and (not (.ret_void plan)) (>= (.kind r) 2))
+                       (frame-alloc (mut fm) (if (> (.size r) 0) (.size r) 1) 16)
+                       0)
+            v (vm-exec cx fi cells n retbuf)]
+        (nc-return! frame plan v)
+        (frame-free! (mut fm))
+        0))))
 
 ; ============================ scope helpers ==================================
 (defn cs-cons [(a (dyn Allocator))
@@ -604,6 +832,94 @@
           (if (match interposer (Some [_] true) (None [] false))
               (compile-call fb (match interposer (Some [f] f) (None [] "")) args)
           (if (>= ei (primitive/cast i64 0))
+              (let [ep (ial-at [Extern] (load (field cx externs)) ei)
+                    addr (if (nc-available?) (interp-native-target cx ep) 0)]
+                (if (!= addr 0)
+                    (compile-native-call fb addr args (if (.variadic ep) (len (load (.params ep))) (len (load args))) ep)
+                    (compile-table-call fb ei args)))
+              (do (idie2 "call to unknown function: " func) (TInt 64 true))))))))
+
+;;; Threads an interpreted program creates run interpreted code, whose native
+;;; frames are far larger than the compiled program's would be; they get at
+;;; least the stack the compiler gives its own deep pipeline (worker-stack-size).
+(defn interp-thread-stack-size [] (-> i64)
+  268435456)
+
+(extern interp.pthread_create :as "pthread_create" :cc c
+        [(ptr i8) (ptr i8) (fnptr c [(ptr i8)] (ptr i8)) (ptr i8)] (-> i32))
+(extern interp.pthread_attr_init :as "pthread_attr_init" :cc c [(ptr i8)] (-> i32))
+(extern interp.pthread_attr_destroy :as "pthread_attr_destroy" :cc c [(ptr i8)] (-> i32))
+(extern interp.pthread_attr_setstacksize :as "pthread_attr_setstacksize" :cc c [(ptr i8) i64] (-> i32))
+(extern interp.pthread_attr_getstacksize :as "pthread_attr_getstacksize" :cc c [(ptr i8) (ptr i64)] (-> i32))
+
+;;; What an interpreted program's pthread_create calls: the real one, with the
+;;; requested stack raised to interp-thread-stack-size when it is smaller. A
+;;; caller's attributes are restored afterwards (pthread_create copies them).
+(defn interp-pthread-create [(thread (ptr i8))
+                             (attr (ptr i8))
+                             (start (fnptr c [(ptr i8)] (ptr i8)))
+                             (arg (ptr i8))] (-> i32)
+  (let [want (interp-thread-stack-size)]
+    (if (= (primitive/cast i64 attr) 0)
+        ; pthread_attr_t is 64 bytes on Darwin and 56 on glibc, 8-aligned
+        (let [(mut own) (primitive/zeroed (array i64 16))
+              ap (primitive/cast (ptr i8) (mut own))
+              init (interp.pthread_attr_init ap)]
+          (if (!= init (primitive/cast i32 0))
+              init
+              (let [_ (interp.pthread_attr_setstacksize ap want)
+                    r (interp.pthread_create thread ap start arg)]
+                (interp.pthread_attr_destroy ap)
+                r)))
+        (let [(mut have) 0]
+          (interp.pthread_attr_getstacksize attr (mut have))
+          (if (>= have want)
+              (interp.pthread_create thread attr start arg)
+              (let [_ (interp.pthread_attr_setstacksize attr want)
+                    r (interp.pthread_create thread attr start arg)]
+                (interp.pthread_attr_setstacksize attr have)
+                r))))))
+
+;;; The native address an extern call goes to: the C symbol, except that
+;;; pthread_create goes through interp-pthread-create. 0 when this process has
+;;; no such symbol.
+(defn interp-native-target [(cx (ptr Interp)) (ep (ptr Extern))] (-> i64)
+  (let [name (extern-link-name ep)]
+    (if (= name "pthread_create")
+        (primitive/cast i64 (primitive/cast (ptr i8) (primitive/fnptr-of interp-pthread-create)))
+        (nc-symbol (.a cx) name))))
+
+;;; The native address of extern `ep` (for fnptr-of). Without native calls there
+;;; is no address to take.
+(defn interp-extern-address [(cx (ptr Interp)) (ep (ptr Extern))] (-> i64)
+  (unless (nc-available?)
+    (idie2 "fnptr-of an extern needs native calls, which this host lacks: " (.name ep)))
+  (let [addr (interp-native-target cx ep)]
+    (when (= addr 0)
+      (idie2 "fnptr-of: no C symbol in this process: " (extern-link-name ep)))
+    addr))
+
+;;; An extern with a native address: the arguments' types (the declared ones for
+;;; named parameters, the expressions' own for variadic ones) plan the C call.
+(defn compile-native-call [(fb (ptr FB))
+                           (addr i64)
+                           (args (ptr (ArrayList Expr)))
+                           (nfixed i64)
+                           (ep (ptr Extern))] (-> Type)
+  (let [cx (load (field fb cx))
+        (mut types) (al-new [Type] (.a cx))]
+    (for [i 0 (len (load args))]
+      (let [t (compile-expr fb (ial-at [Expr] args i))]
+        (push! (mut types) (if (< i nfixed) (load (ial-at [Type] (.params ep) i)) t))))
+    (let [ret (box-type (.a cx) (.ret ep))
+          site (ffi-register-call! cx addr (mut types) nfixed ret)]
+      (femit fb 47 site (len (load args)) 0)  ; CALLNATIVE
+      (.ret ep))))
+
+;;; An extern the process has no symbol for: the built-in table (and the
+;;; metaprogram host hook) in extern-call.
+(defn compile-table-call [(fb (ptr FB)) (ei i64) (args (ptr (ArrayList Expr)))] (-> Type)
+  (let [cx (load (field fb cx))]
               (do
                 (compile-args fb args)
                 (femit fb 14 ei (len (load args)) 0)
@@ -615,8 +931,7 @@
                   ; behaves as an aggregate value (an address) like any other.
                   (when (ty-is-agg rtp)
                     (femit fb 43 (isize-of cx rtp) (ialign-of cx rtp) 0))
-                  rt))
-              (do (idie2 "call to unknown function: " func) (TInt 64 true))))))))
+                  rt))))
 
 ; compile a sequence, POPping all but the last; returns the last expr's type
 ; (the sequence's value). Used for do / let body / function body.
@@ -874,10 +1189,6 @@
       (EAlloc [storage t init symbol]
               (let [tp (primitive/alloc-stack Type)]
                 (set! tp t)
-                (match symbol
-                  (Some [_]
-                        (idie "named alloc-static requires native code generation"))
-                  (None [] 0))
                 (let [sz (isize-of cx tp)
                       al (ialign-of cx tp)]
                   (when (and (not (= (primitive/cast i64 init) 0))
@@ -893,10 +1204,13 @@
                         ; region per alloc-static site, shared across all executions —
                         ; mirrors codegen's per-site zeroed global) and bake its address.
                         (let [addr
-                                (primitive/cast i64
-                                                (interp-owned-alloc (primitive/cast isize
-                                                                                    sz)))]
-                          (memzero addr sz)
+                                (match symbol
+                                  (Some [name] (interp-named-static! cx name sz))
+                                  (None []
+                                        (let [cell (primitive/cast i64
+                                                                   (interp-owned-alloc (primitive/cast isize sz)))]
+                                          (memzero cell sz)
+                                          cell)))]
                           (unless (= (primitive/cast i64 init) 0)
                             (interp-static-write! cx tp init addr))
                           (femit fb 1 addr 0 0)))
@@ -1169,9 +1483,11 @@
                     (set! (.term fb) (load allterm))
                     (load rty)))))
       (ELlvmIr [result args body]
-               (do
-                 (when (= body "coil.mem.alloc-stack-bytes")
-                   (idie "alloc-stack-bytes is not supported by the interpreter"))
+               (if (= body "coil.mem.alloc-stack-bytes")
+                 (do
+                   (compile-expr fb (ial-at [Expr] args 0))
+                   (femit fb 46 0 0 0)  ; ALLOCDYN
+                   result)
                  (let [n (len (load args))
                        (mut i) 0
                        ir0 (primitive/alloc-stack IIr)]
@@ -1211,12 +1527,18 @@
       (EFnPtrOf [name]
                 (let [fi (find-func cx name)]
                   (if (< fi (primitive/cast i64 0))
-                      (do
-                        (idie2 "fnptr-of unknown function: " name)
-                        (TInt 64 true))
+                      ; an extern's pointer is its native address
+                      (let [ei (find-extern cx name)]
+                        (if (< ei (primitive/cast i64 0))
+                            (do
+                              (idie2 "fnptr-of unknown function: " name)
+                              (TInt 64 true))
+                            (let [ep (ial-at [Extern] (load (field cx externs)) ei)]
+                              (femit fb 1 (interp-extern-address cx ep) 0 0)
+                              (TFn :cc "c" :params (.params ep) :ret (box-type a (.ret ep))))))
                       (do
                         (ensure-compiled cx fi)
-                        (femit fb 1 (primitive/iadd (fnptr-base) fi) 0 0)
+                        (femit fb 1 (interp-fnptr cx fi) 0 0)
                         (func-fn-type cx fi)))))
       (ECallPtr [fp args]
                 (match (compile-linked-call fb fp args)
@@ -1224,7 +1546,16 @@
                   (None [] (let [ft (primitive/alloc-stack Type)]
                   (set! ft (compile-expr fb fp))  ; push the fnptr value
                   (compile-args fb args)  ; push args
-                  (femit fb 42 (len (load args)) 0 0)  ; CALLPTR
+                  ; CALLPTR; c = the native call site for a target that is not an
+                  ; interpreted function (-1: none possible)
+                  (femit fb 42 (len (load args))
+                         (match (load ft)
+                           (TFn [cc ps r]
+                                (if (and (nc-available?) (ffi-c-types? ps r))
+                                    (ffi-register-call! cx 0 ps (len (load ps)) r)
+                                    -1))
+                           (_ -1))
+                         0)
                   (match (load ft)
                     (TFn [cc ps r] (load r))
                     (_ (do
@@ -1302,7 +1633,7 @@
                                                       (primitive/iadd vt
                                                                       (primitive/imul (load i)
                                                                                       8)))
-                                      (primitive/iadd (fnptr-base) mfi)))
+                                      (interp-fnptr cx mfi)))
                               (set! i (primitive/iadd (load i) 1)))))
                   (femit fb 31 16 8 0)
                   (femit fb 3 l 0 0)  ; ALLOCZ 16 -> local l
@@ -1331,10 +1662,10 @@
                       (femit fb 2 r 0 0)
                       (femit fb 6 8 0 0)  ; data ptr (first arg)
                       (compile-args fb args)
-                      (femit fb 42 (primitive/iadd 1 (len (load args))) 0 0)  ; CALLPTR
+                      (femit fb 42 (primitive/iadd 1 (len (load args))) -1 0)  ; CALLPTR (always a method)
                       ret))
-      (EErase [tn inner] (do (idie2 "TODO EErase: " tn) (TInt 64 true)))
-      (ETypeQuery [q t] (do (idie "TODO ETypeQuery") (TInt 64 true)))
+      (EErase [tn inner] (do (idie2 "EErase reached the interpreter (checker bug): " tn) (TInt 64 true)))
+      (ETypeQuery [q t] (do (idie "ETypeQuery reached the interpreter (checker bug)") (TInt 64 true)))
       (EVector [op result types args]
         (let [saved (.env fb) (mut slots) (al-new [i64] a)]
           (for [i 0 (len (load args))]
@@ -1455,17 +1786,18 @@
       (let [fi (find-func cx name)]
         (when (< fi 0) (idie2 "def initializer: unknown function " name))
         (ensure-compiled cx fi)
-        (mem-store addr (+ (fnptr-base) fi) 8)))
+        (mem-store addr (interp-fnptr cx fi) 8)))
     (EAlloc [storage ty init symbol]
       (if (!= storage 1)
           (idie "def initializer: only alloc-static storage is a link-time constant")
           (let [tp (box-type (.a cx) ty)
                 sz (isize-of cx tp)
-                inner (primitive/cast i64 (interp-owned-alloc (primitive/cast isize sz)))]
-            (match symbol
-              (Some [_] (idie "named alloc-static requires native code generation"))
-              (None [] 0))
-            (memzero inner sz)
+                inner (match symbol
+                        (Some [name] (interp-named-static! cx name sz))
+                        (None []
+                              (let [cell (primitive/cast i64 (interp-owned-alloc (primitive/cast isize sz)))]
+                                (memzero cell sz)
+                                cell)))]
             (unless (= (primitive/cast i64 init) 0)
               (interp-static-write! cx tp init inner))
             (mem-store addr inner 8))))
@@ -1647,20 +1979,49 @@
                 (set! i (primitive/iadd (load i) 1))))))
   0)
 
-; bump-allocate `size` bytes (aligned) from the frame buffer; returns a real host
-; address. Overflow of the fixed frame buffer is a hard error, never silent.
-(defn frame-alloc [(base i64) (offc (ptr i64)) (size i64) (align i64)] (-> i64)
-  (let [al (if (<= align (primitive/cast i64 1)) 1 align)
-        off
-          (primitive/imul (primitive/idiv (primitive/iadd (load offc)
-                                                          (primitive/isub al 1))
-                                          al)
-                          al)
-        addr (primitive/iadd base off)]
-    (set! offc (primitive/iadd off size))
-    (when (> (load offc) (primitive/cast i64 1048576))
-      (idie "frame overflow: stack allocation exceeded 1 MiB frame buffer"))
-    addr))
+; A call's frame memory: `alloc-stack` slots, aggregate temporaries and
+; `alloc-stack-bytes` blocks, all living until the call returns. It is a chain of
+; malloc'd chunks bump-allocated in order; a request that does not fit the current
+; chunk starts a new one (at least as large as the request), so an address handed
+; out never moves and a frame has no size limit. Each chunk begins with the
+; address of the one before it, which is how `frame-free!` walks them.
+(defstruct FrameMem [(chunk i64) (off i64) (cap i64)])
+
+(defn frame-chunk-default [] (-> i64)
+  65536)
+
+(defn frame-new-chunk! [(fm (ptr FrameMem)) (need i64)] (-> i64)
+  (let [cap (if (> (+ need 16) (frame-chunk-default)) (+ need 16) (frame-chunk-default))
+        chunk (primitive/cast i64 (interp.malloc (primitive/cast isize cap)))]
+    (when (= chunk 0)
+      (idie "frame memory: malloc failed"))
+    (set! (primitive/cast (ptr i64) chunk) (.chunk fm))
+    (set! (.chunk fm) chunk)
+    (set! (.off fm) 16)
+    (set! (.cap fm) cap)
+    chunk))
+
+(defn frame-new [] (-> FrameMem)
+  (let [(mut fm) (FrameMem :chunk 0 :off 0 :cap 0)]
+    (frame-new-chunk! (mut fm) 0)
+    fm))
+
+; `size` bytes aligned to `align`, a real host address valid until the frame ends.
+(defn frame-alloc [(fm (ptr FrameMem)) (size i64) (align i64)] (-> i64)
+  (let [al (if (<= align (primitive/cast i64 1)) 1 align)]
+    (when (> (+ (align-up (.off fm) al) size) (.cap fm))
+      (frame-new-chunk! fm (+ size al)))
+    (let [off (align-up (.off fm) al)]
+      (set! (.off fm) (+ off size))
+      (+ (.chunk fm) off))))
+
+(defn frame-free! [(fm (ptr FrameMem))] (-> i64)
+  (loop (if (= (.chunk fm) 0)
+            (break)
+            (let [prev (load (primitive/cast (ptr i64) (.chunk fm)))]
+              (interp.free (primitive/cast (ptr i8) (.chunk fm)))
+              (set! (.chunk fm) prev))))
+  0)
 
 ; ============================ float bit-casts ================================
 ; The f64 pair (`bits->f64` / `f64->bits`) moved to coil.mem as `bits->f64` /
@@ -1677,16 +2038,6 @@
     (set! p x)
     (primitive/cast i64
                     (primitive/cast u32 (load (primitive/cast (ptr i32) p))))))
-
-(defn f64-frem-unsupported [] (-> f64)
-  (do
-    (idie "float remainder (frem) not implemented in interp yet")
-    (bits->f64 0)))
-
-(defn f32-frem-unsupported [] (-> f32)
-  (do
-    (idie "float remainder (frem) not implemented in interp yet")
-    (bits->f32 0)))
 
 ; ============================ VM arithmetic =================================
 ; canonicalize `v` to exact iN width (container invariant: values are sign/zero
@@ -1988,7 +2339,7 @@
 ; corpus' distinct keys the final order equals libc qsort's. cmp returns i32
 ; (<0 / 0 / >0); we sign-extend it. Ascending: swap while prev > cur.
 (defn interp-qsort [(cx (ptr Interp)) (base i64) (n i64) (size i64) (cmpfp i64)] (-> i64)
-  (let [fi (primitive/isub cmpfp (fnptr-base))
+  (let [fi (interp-fnptr-index cx cmpfp)
         tmp
           (primitive/cast i64
                           (interp.malloc (primitive/cast isize
@@ -2229,7 +2580,7 @@
           ; nonzero id so join has something; the routine's return is discarded.
           (= nm "pthread_create")
             (let [fi
-                    (primitive/isub (load (primitive/index buf 2)) (fnptr-base))
+                    (interp-fnptr-index cx (load (primitive/index buf 2)))
                   wargs (primitive/alloc-stack (array i64 1))]
               (when (or (< fi (primitive/cast i64 0))
                         (>= fi (len (load (field cx bfuncs)))))
@@ -2287,9 +2638,117 @@
                                     buf
                                     n)
                 (do
-                  (idie2 "unsupported extern (add it to the interp builtin table): "
+                  (idie2 (if (nc-available?)
+                             "extern has no C symbol in this process: "
+                             "extern is not in the interpreter's built-in table (no native calls on this host): ")
                          nm)
                   0))))))
+
+;; ============================ real atomics ===================================
+; Interpreted programs run real threads (pthread_create goes to the native
+; function), so the IR's atomics are performed atomically. Every width is done
+; on the naturally aligned 8-byte word that contains it, with a compare-and-swap
+; loop: correct for any mix of widths, since the hardware's atomics are
+; coherent per byte. An aligned word never crosses a page, so reading the
+; bytes beside a value is always safe.
+
+(defn ia-word [(p i64)] (-> i64)
+  (& p -8))
+
+(defn ia-mask [(size i64)] (-> i64)
+  (if (>= size 8) -1 (- (<< 1 (* size 8)) 1)))
+
+;;; The `size`-byte value at `p` inside `word`'s bits, extended like mem-load.
+(defn ia-extract [(word i64) (p i64) (size i64) (signed bool)] (-> i64)
+  (if (>= size 8)
+      word
+      (let [shift (* (- p (ia-word p)) 8)
+            v (& (>> word shift) (ia-mask size))
+            bits (* size 8)]
+        (if signed (>> (<< v (- 64 bits)) (- 64 bits)) v))))
+
+(defn ia-insert [(word i64) (p i64) (size i64) (v i64)] (-> i64)
+  (if (>= size 8)
+      v
+      (let [shift (* (- p (ia-word p)) 8)
+            m (<< (ia-mask size) shift)]
+        (| (& word (^ m -1)) (& (<< v shift) m)))))
+
+(defn ia-load [(p i64) (size i64) (signed bool)] (-> i64)
+  (ia-extract (atomic-load (primitive/cast (ptr i64) (ia-word p))) p size signed))
+
+;;; Atomically replace the value at `p` with (f old v) and return the old value.
+;;; `op` is an atomicrmw operation; `float` says the operands are f32/f64 bits.
+(defn ia-rmw [(op (slice u8)) (p i64) (v i64) (size i64) (signed bool) (float bool)] (-> i64)
+  (let [wp (primitive/cast (ptr i64) (ia-word p))
+        (mut result) 0]
+    (loop
+      (let [w (atomic-load wp)
+            old (ia-extract w p size signed)
+            new (ia-combine op old v size float)]
+        (when (= (atomic-cas wp w (ia-insert w p size new)) w)
+          (set! result old)
+          (break))))
+    result))
+
+(defn ia-combine [(op (slice u8)) (old i64) (v i64) (size i64) (float bool)] (-> i64)
+  (let [m (ia-mask size)
+        uold (& old m)
+        uv (& v m)
+        bits (* size 8)
+        sold (if (>= size 8) old (>> (<< old (- 64 bits)) (- 64 bits)))
+        sv (if (>= size 8) v (>> (<< v (- 64 bits)) (- 64 bits)))]
+    (cond float (ia-float-combine op old v size)
+          (= op "xchg") v
+          (= op "add") (+ old v)
+          (= op "sub") (- old v)
+          (= op "and") (& old v)
+          (= op "or") (| old v)
+          (= op "xor") (^ old v)
+          (= op "nand") (^ (& old v) -1)
+          (= op "max") (if (> sold sv) old v)
+          (= op "min") (if (< sold sv) old v)
+          ; unsigned: compare with the sign bit flipped
+          (= op "umax") (if (> (^ uold (<< 1 63)) (^ uv (<< 1 63))) old v)
+          (= op "umin") (if (< (^ uold (<< 1 63)) (^ uv (<< 1 63))) old v)
+          (= op "uinc_wrap") (if (>= (^ uold (<< 1 63)) (^ uv (<< 1 63))) 0 (+ old 1))
+          (= op "udec_wrap") (if (or (= uold 0) (> (^ uold (<< 1 63)) (^ uv (<< 1 63)))) v (- old 1))
+          :else (do (idie2 "llvm-ir: unsupported atomicrmw op: " op) 0))))
+
+(defn ia-float-combine [(op (slice u8)) (old i64) (v i64) (size i64)] (-> i64)
+  (if (= size 4)
+      (let [a (bits->f32 old)
+            b (bits->f32 v)]
+        (f32->bits (cond (= op "xchg") b
+                         (= op "fadd") (+ a b)
+                         (= op "fsub") (- a b)
+                         (= op "fmax") (interp-minmax32 true a b)
+                         (= op "fmin") (interp-minmax32 false a b)
+                         :else (do (idie2 "llvm-ir: unsupported atomicrmw op: " op) a))))
+      (let [a (bits->f64 old)
+            b (bits->f64 v)]
+        (f64-bits (cond (= op "xchg") b
+                        (= op "fadd") (+ a b)
+                        (= op "fsub") (- a b)
+                        (= op "fmax") (interp-minmax64 true a b)
+                        (= op "fmin") (interp-minmax64 false a b)
+                        :else (do (idie2 "llvm-ir: unsupported atomicrmw op: " op) a))))))
+
+;;; cmpxchg: if the value at `p` equals `expected`, store `desired`. Returns the
+;;; observed value; the caller compares it with `expected` for success.
+(defn ia-cmpxchg [(p i64) (expected i64) (desired i64) (size i64) (signed bool)] (-> i64)
+  (let [wp (primitive/cast (ptr i64) (ia-word p))
+        m (ia-mask size)
+        (mut result) 0]
+    (loop
+      (let [w (atomic-load wp)
+            old (ia-extract w p size signed)]
+        (if (!= (& old m) (& expected m))
+            (do (set! result old) (break))
+            (when (= (atomic-cas wp w (ia-insert w p size desired)) w)
+              (set! result old)
+              (break)))))
+    result))
 
 ; ============================ inline LLVM-IR interpreter ====================
 ; The corpus' (primitive/llvm-ir …) bodies are straight-line SSA (slice / atomic / simd /
@@ -2533,12 +2992,12 @@
 
 ; parse an IR type token (context: result + arg types); advances *tokp past it.
 (defn ir-parse-type2 [(cx (ptr Interp))
+                      (a (dyn Allocator))
                       (result Type)
                       (argtys (ptr (ArrayList Type)))
                       (toks (ptr (ArrayList (slice u8))))
                       (tokp (ptr i64))] (-> Type)
-  (let [a (.a cx)
-        tk (irtok toks (load tokp))]
+  (let [tk (irtok toks (load tokp))]
     (set! tokp (primitive/iadd (load tokp) 1))
     (cond (= tk "$ret") result
           (= tk "i64") (TInt 64 true)
@@ -2557,15 +3016,15 @@
           (= tk "float") (TFloat 32)
           (= tk "double") (TFloat 64)
           (= tk "{")
-            (let [t0 (ir-parse-type2 cx result argtys toks tokp)
-                  t1 (ir-parse-type2 cx result argtys toks tokp)]
+            (let [t0 (ir-parse-type2 cx a result argtys toks tokp)
+                  t1 (ir-parse-type2 cx a result argtys toks tokp)]
               (store! tokp (primitive/iadd (load tokp) 1))  ; skip }
               (TSlice (box-type a t0)))
           (= tk "<")
             (let [nstr (irtok toks (load tokp))]
               (store! tokp (primitive/iadd (load tokp) 1))  ; N
               (store! tokp (primitive/iadd (load tokp) 1))  ; x
-              (let [elem (ir-parse-type2 cx result argtys toks tokp)]
+              (let [elem (ir-parse-type2 cx a result argtys toks tokp)]
                 (store! tokp (primitive/iadd (load tokp) 1))  ; >
                 (fixed-vec (box-type a elem) (istr->i64 nstr))))
           (and (>= (len tk) (primitive/cast i64 3))
@@ -2609,19 +3068,18 @@
                  (args (ptr i64))
                  (tk (slice u8))
                  (tp (ptr Type))
-                 (fm i64)
-                 (moff (ptr i64))] (-> i64)
+                 (fm (ptr FrameMem))] (-> i64)
   (let [c0 (primitive/cast i64 (get tk 0))]
     (cond (= c0 (primitive/cast i64 37))  ; %
             (ir-env-get names vals tk)
           (= c0 (primitive/cast i64 36))  ; $N  (value arg)
             (load (primitive/index args (istr->i64 (subslice tk 1 (len tk)))))
           (or (= tk "undef") (= tk "poison"))
-            (frame-alloc fm moff (isize-of cx tp) (ialign-of cx tp))
+            (frame-alloc fm (isize-of cx tp) (ialign-of cx tp))
           ; fresh, uninitialized slot (poison is a stricter undef; a fresh
           ; garbage slot is a valid choice for both here)
           (= tk "zeroinitializer")
-            (let [addr (frame-alloc fm moff (isize-of cx tp) (ialign-of cx tp))]
+            (let [addr (frame-alloc fm (isize-of cx tp) (ialign-of cx tp))]
               (do (memzero addr (isize-of cx tp)) addr))
           (= tk "true") 1  ; i1 literal, e.g. inside a <...> mask
           (= tk "false") 0
@@ -2636,7 +3094,7 @@
           (if (> (isize-of cx tp) (primitive/cast i64 8))
               (let [size (isize-of cx tp)
                     value (istr->i64 tk)
-                    addr (frame-alloc fm moff size (ialign-of cx tp))]
+                    addr (frame-alloc fm size (ialign-of cx tp))]
                 (memzero addr size)
                 (mem-store addr value 8)
                 (when (< value 0)
@@ -2649,6 +3107,7 @@
 ; select/shl/or/fadd comparands and shuffle index masks) — always homogeneous,
 ; always plain per-element literals (never %name/$N).
 (defn ir-lit-vec2! [(cx (ptr Interp))
+                    (a (dyn Allocator))
                     (names (ptr (ArrayList (slice u8))))
                     (vals (ptr (ArrayList i64)))
                     (args (ptr i64))
@@ -2657,20 +3116,19 @@
                     (toks (ptr (ArrayList (slice u8))))
                     (tokp (ptr i64))
                     (tp (ptr Type))
-                    (fm i64)
-                    (moff (ptr i64))] (-> i64)
+                    (fm (ptr FrameMem))] (-> i64)
   (store! tokp (primitive/iadd (load tokp) 1))  ; skip "<"
   (match (load tp)
     (TVec [elemp lanes]
           (let [lb (isize-of cx elemp)
-                dslot (frame-alloc fm moff (isize-of cx tp) (ialign-of cx tp))
+                dslot (frame-alloc fm (isize-of cx tp) (ialign-of cx tp))
                 (mut k) 0]
             (loop (if (>= (load k) (extent-value lanes))
                       (break)
                       (do
                         (let [etp (primitive/alloc-stack Type)]
                           (store! etp
-                                  (ir-parse-type2 cx result argtys toks tokp))
+                                  (ir-parse-type2 cx a result argtys toks tokp))
                           (let [ev
                                   (ir-value2 cx
                                              names
@@ -2678,8 +3136,7 @@
                                              args
                                              (irtok toks (load tokp))
                                              etp
-                                             fm
-                                             moff)]
+                                             fm)]
                             (store! tokp (primitive/iadd (load tokp) 1))
                             (mem-store (primitive/iadd dslot
                                                        (primitive/imul (load k)
@@ -2695,6 +3152,7 @@
 ; it — either a single token (the common case, same as ir-value2) or a whole
 ; inline vector literal (ir-lit-vec2!, several tokens).
 (defn ir-value2-adv! [(cx (ptr Interp))
+                      (a (dyn Allocator))
                       (names (ptr (ArrayList (slice u8))))
                       (vals (ptr (ArrayList i64)))
                       (args (ptr i64))
@@ -2703,11 +3161,10 @@
                       (toks (ptr (ArrayList (slice u8))))
                       (tokp (ptr i64))
                       (tp (ptr Type))
-                      (fm i64)
-                      (moff (ptr i64))] (-> i64)
+                      (fm (ptr FrameMem))] (-> i64)
   (if (= (irtok toks (load tokp)) "<")
-      (ir-lit-vec2! cx names vals args result argtys toks tokp tp fm moff)
-      (let [v (ir-value2 cx names vals args (irtok toks (load tokp)) tp fm moff)]
+      (ir-lit-vec2! cx a names vals args result argtys toks tokp tp fm)
+      (let [v (ir-value2 cx names vals args (irtok toks (load tokp)) tp fm)]
         (store! tokp (primitive/iadd (load tokp) 1))
         v)))
 
@@ -2794,6 +3251,7 @@
 
 ; interpret ONE IR line; on `ret` writes *retvalp and sets *donep.
 (defn ir-line! [(cx (ptr Interp))
+                (a (dyn Allocator))
                 (names (ptr (ArrayList (slice u8))))
                 (vals (ptr (ArrayList i64)))
                 (args (ptr i64))
@@ -2802,10 +3260,8 @@
                 (retvalp (ptr i64))
                 (donep (ptr bool))
                 (line (slice u8))
-                (fm i64)
-                (moff (ptr i64))] (-> i64)
-  (let [a (.a cx)
-        toks (ir-tokens2 a line)
+                (fm (ptr FrameMem))] (-> i64)
+  (let [toks (ir-tokens2 a line)
         ntk (len (load toks))]
     (unless (= ntk (primitive/cast i64 0))
       (let [t0 (irtok toks 0)]
@@ -2814,7 +3270,7 @@
                 (let [tokp (primitive/alloc-stack i64)
                       rtp (primitive/alloc-stack Type)]
                   (store! tokp 1)
-                  (store! rtp (ir-parse-type2 cx result argtys toks tokp))
+                  (store! rtp (ir-parse-type2 cx a result argtys toks tokp))
                   (store! retvalp
                           (ir-value2 cx
                                      names
@@ -2822,8 +3278,7 @@
                                      args
                                      (irtok toks (load tokp))
                                      rtp
-                                     fm
-                                     moff))
+                                     fm))
                   (store! donep true)
                   0)
               (= t0 "store")  ; store atomic TYPE VAL, ptr PTR seq_cst, align N   (sequential model)
@@ -2832,7 +3287,7 @@
                     (let [tokp (primitive/alloc-stack i64)
                           vtp (primitive/alloc-stack Type)]
                       (store! tokp 2)
-                      (store! vtp (ir-parse-type2 cx result argtys toks tokp))
+                      (store! vtp (ir-parse-type2 cx a result argtys toks tokp))
                       (let [v
                               (ir-value2 cx
                                          names
@@ -2840,8 +3295,7 @@
                                          args
                                          (irtok toks (load tokp))
                                          vtp
-                                         fm
-                                         moff)
+                                         fm)
                             ptp (primitive/alloc-stack Type)]
                         (store! ptp (TPtr (box-type a (TInt 8 true))))
                         (let [p
@@ -2852,17 +3306,16 @@
                                            (irtok toks
                                                   (primitive/iadd (load tokp) 2))
                                            ptp
-                                           fm
-                                           moff)]
-                          (mem-store p v (isize-of cx vtp))
+                                           fm)]
+                          (ia-rmw "xchg" p v (isize-of cx vtp) false false)
                           0)))
                     ; plain (non-atomic) form: store TYPE VAL, ptr PTR, align N
                     (let [tokp (primitive/alloc-stack i64)
                           vtp (primitive/alloc-stack Type)]
                       (store! tokp 1)
-                      (store! vtp (ir-parse-type2 cx result argtys toks tokp))
+                      (store! vtp (ir-parse-type2 cx a result argtys toks tokp))
                       (let [v
-                              (ir-value2-adv! cx
+                              (ir-value2-adv! cx a
                                               names
                                               vals
                                               args
@@ -2871,13 +3324,12 @@
                                               toks
                                               tokp
                                               vtp
-                                              fm
-                                              moff)]
+                                              fm)]
                         (store! tokp (primitive/iadd (load tokp) 1))  ; skip "ptr"
                         (let [ptp (primitive/alloc-stack Type)]
                           (store! ptp (TPtr (box-type a (TInt 8 true))))
                           (let [p
-                                  (ir-value2-adv! cx
+                                  (ir-value2-adv! cx a
                                                   names
                                                   vals
                                                   args
@@ -2886,8 +3338,7 @@
                                                   toks
                                                   tokp
                                                   ptp
-                                                  fm
-                                                  moff)]
+                                                  fm)]
                             (ir-store-at cx p v vtp)
                             0)))))
               (and (>= ntk (primitive/cast i64 3))
@@ -2898,7 +3349,7 @@
                                 aggtp (primitive/alloc-stack Type)]
                             (store! tokp 3)
                             (store! aggtp
-                                    (ir-parse-type2 cx result argtys toks tokp))
+                                    (ir-parse-type2 cx a result argtys toks tokp))
                             (let [aggv
                                     (ir-value2 cx
                                                names
@@ -2906,8 +3357,7 @@
                                                args
                                                (irtok toks (load tokp))
                                                aggtp
-                                               fm
-                                               moff)
+                                               fm)
                                   idx
                                     (istr->i64 (irtok toks
                                                       (primitive/iadd (load tokp)
@@ -2918,7 +3368,6 @@
                               (if (ty-is-agg etp)
                                   (let [ns
                                           (frame-alloc fm
-                                                       moff
                                                        (isize-of cx etp)
                                                        (ialign-of cx etp))]
                                     (memcopy ns
@@ -2938,7 +3387,7 @@
                                 aggtp (primitive/alloc-stack Type)]
                             (store! tokp 3)
                             (store! aggtp
-                                    (ir-parse-type2 cx result argtys toks tokp))
+                                    (ir-parse-type2 cx a result argtys toks tokp))
                             (let [aggtk (irtok toks (load tokp))]
                               (store! tokp (primitive/iadd (load tokp) 1))
                               (let [aggv
@@ -2948,11 +3397,10 @@
                                                  args
                                                  aggtk
                                                  aggtp
-                                                 fm
-                                                 moff)
+                                                 fm)
                                     eltp (primitive/alloc-stack Type)]
                                 (store! eltp
-                                        (ir-parse-type2 cx
+                                        (ir-parse-type2 cx a
                                                         result
                                                         argtys
                                                         toks
@@ -2964,15 +3412,13 @@
                                                    args
                                                    (irtok toks (load tokp))
                                                    eltp
-                                                   fm
-                                                   moff)
+                                                   fm)
                                       idx
                                         (istr->i64 (irtok toks
                                                           (primitive/iadd (load tokp)
                                                                           1)))
                                       dslot
                                         (frame-alloc fm
-                                                     moff
                                                      (isize-of cx aggtp)
                                                      (ialign-of cx aggtp))
                                       offp (primitive/alloc-stack i64)]
@@ -2996,13 +3442,12 @@
                                                args
                                                (irtok toks 5)
                                                ptp
-                                               fm
-                                               moff)
+                                               fm)
                                   tokp (primitive/alloc-stack i64)
                                   vtp (primitive/alloc-stack Type)]
                               (store! tokp 6)
                               (store! vtp
-                                      (ir-parse-type2 cx
+                                      (ir-parse-type2 cx a
                                                       result
                                                       argtys
                                                       toks
@@ -3014,18 +3459,8 @@
                                                  args
                                                  (irtok toks (load tokp))
                                                  vtp
-                                                 fm
-                                                 moff)
-                                    sz (isize-of cx vtp)
-                                    old (mem-load p sz false)]
-                                (cond (= sub "add")
-                                        (mem-store p (primitive/iadd old v) sz)
-                                      (= sub "sub")
-                                        (mem-store p (primitive/isub old v) sz)
-                                      (= sub "xchg") (mem-store p v sz)
-                                      :else
-                                        (idie2 "llvm-ir: unsupported atomicrmw op: "
-                                               sub))
+                                                 fm)
+                                    old (ia-rmw sub p v (isize-of cx vtp) (signed-of vtp) (ty-is-float2 vtp))]
                                 (ir-env-put! names vals t0 old)
                                 0)))
                         (= op "cmpxchg")  ; %r = cmpxchg ptr PTR, TYPE EXP, TYPE NEW seq_cst seq_cst -> {old,success}
@@ -3038,13 +3473,12 @@
                                                args
                                                (irtok toks 4)
                                                ptp
-                                               fm
-                                               moff)
+                                               fm)
                                   tokp (primitive/alloc-stack i64)
                                   etp (primitive/alloc-stack Type)]
                               (store! tokp 5)
                               (store! etp
-                                      (ir-parse-type2 cx
+                                      (ir-parse-type2 cx a
                                                       result
                                                       argtys
                                                       toks
@@ -3056,12 +3490,11 @@
                                                  args
                                                  (irtok toks (load tokp))
                                                  etp
-                                                 fm
-                                                 moff)]
+                                                 fm)]
                                 (store! tokp (primitive/iadd (load tokp) 1))
                                 (let [ntp (primitive/alloc-stack Type)]
                                   (store! ntp
-                                          (ir-parse-type2 cx
+                                          (ir-parse-type2 cx a
                                                           result
                                                           argtys
                                                           toks
@@ -3073,12 +3506,11 @@
                                                      args
                                                      (irtok toks (load tokp))
                                                      ntp
-                                                     fm
-                                                     moff)
-                                        old (mem-load p 8 false)
-                                        ok (= old exp)
-                                        slot (frame-alloc fm moff 16 8)]
-                                    (when ok (mem-store p nv 8))
+                                                     fm)
+                                        sz (isize-of cx etp)
+                                        old (ia-cmpxchg p exp nv sz (signed-of etp))
+                                        ok (= (& old (ia-mask sz)) (& exp (ia-mask sz)))
+                                        slot (frame-alloc fm 16 8)]
                                     (mem-store slot old 8)
                                     (mem-store (primitive/iadd slot 8)
                                                (when ok 1)
@@ -3091,7 +3523,7 @@
                                     vtp (primitive/alloc-stack Type)]
                                 (store! tokp 4)
                                 (store! vtp
-                                        (ir-parse-type2 cx
+                                        (ir-parse-type2 cx a
                                                         result
                                                         argtys
                                                         toks
@@ -3107,21 +3539,20 @@
                                                             (primitive/iadd (load tokp)
                                                                             1))
                                                      ptp
-                                                     fm
-                                                     moff)]
+                                                     fm)]
                                     (ir-env-put! names
                                                  vals
                                                  t0
-                                                 (mem-load p
-                                                           (isize-of cx vtp)
-                                                           (signed-of vtp)))
+                                                 (ia-load p
+                                                          (isize-of cx vtp)
+                                                          (signed-of vtp)))
                                     0)))
                               ; plain (non-atomic) form: load TYPE, ptr PTR, align N
                               (let [tokp (primitive/alloc-stack i64)
                                     vtp (primitive/alloc-stack Type)]
                                 (store! tokp 3)
                                 (store! vtp
-                                        (ir-parse-type2 cx
+                                        (ir-parse-type2 cx a
                                                         result
                                                         argtys
                                                         toks
@@ -3130,7 +3561,7 @@
                                 (let [ptp (primitive/alloc-stack Type)]
                                   (store! ptp (TPtr (box-type a (TInt 8 true))))
                                   (let [p
-                                          (ir-value2-adv! cx
+                                          (ir-value2-adv! cx a
                                                           names
                                                           vals
                                                           args
@@ -3139,15 +3570,13 @@
                                                           toks
                                                           tokp
                                                           ptp
-                                                          fm
-                                                          moff)]
+                                                          fm)]
                                     (ir-env-put! names
                                                  vals
                                                  t0
                                                  (if (ty-is-agg vtp)
                                                      (let [dst
                                                              (frame-alloc fm
-                                                                          moff
                                                                           (isize-of cx
                                                                                     vtp)
                                                                           (ialign-of cx
@@ -3165,11 +3594,11 @@
                                 vtp (primitive/alloc-stack Type)
                                 itp (primitive/alloc-stack Type)]
                             (store! tokp 3)
-                            (store! vtp (ir-parse-type2 cx result argtys toks tokp))
-                            (let [vecv (ir-value2 cx names vals args (irtok toks (load tokp)) vtp fm moff)]
+                            (store! vtp (ir-parse-type2 cx a result argtys toks tokp))
+                            (let [vecv (ir-value2 cx names vals args (irtok toks (load tokp)) vtp fm)]
                               (store! tokp (+ (load tokp) 1))
-                              (store! itp (ir-parse-type2 cx result argtys toks tokp))
-                              (let [idx (ir-value2 cx names vals args (irtok toks (load tokp)) itp fm moff)]
+                              (store! itp (ir-parse-type2 cx a result argtys toks tokp))
+                              (let [idx (ir-value2 cx names vals args (irtok toks (load tokp)) itp fm)]
                                 (match (load vtp)
                                   (TVec [elemp _]
                                         (let [lb (isize-of cx elemp)]
@@ -3184,7 +3613,7 @@
                                 vtp (primitive/alloc-stack Type)]
                             (store! tokp 3)
                             (store! vtp
-                                    (ir-parse-type2 cx result argtys toks tokp))
+                                    (ir-parse-type2 cx a result argtys toks tokp))
                             (let [aggtk (irtok toks (load tokp))]
                               (store! tokp (primitive/iadd (load tokp) 1))
                               (let [aggv
@@ -3194,11 +3623,10 @@
                                                  args
                                                  aggtk
                                                  vtp
-                                                 fm
-                                                 moff)
+                                                 fm)
                                     etp (primitive/alloc-stack Type)]
                                 (store! etp
-                                        (ir-parse-type2 cx
+                                        (ir-parse-type2 cx a
                                                         result
                                                         argtys
                                                         toks
@@ -3210,8 +3638,7 @@
                                                    args
                                                    (irtok toks (load tokp))
                                                    etp
-                                                   fm
-                                                   moff)
+                                                   fm)
                                       k
                                         (istr->i64 (irtok toks
                                                           (primitive/iadd (load tokp)
@@ -3219,7 +3646,6 @@
                                       lb (isize-of cx etp)
                                       dslot
                                         (frame-alloc fm
-                                                     moff
                                                      (isize-of cx vtp)
                                                      (ialign-of cx vtp))]
                                   (memcopy dslot aggv (isize-of cx vtp))
@@ -3235,9 +3661,9 @@
                                 vtp (primitive/alloc-stack Type)]
                             (store! tokp 3)
                             (store! vtp
-                                    (ir-parse-type2 cx result argtys toks tokp))
+                                    (ir-parse-type2 cx a result argtys toks tokp))
                             (let [v
-                                    (ir-value2-adv! cx
+                                    (ir-value2-adv! cx a
                                                     names
                                                     vals
                                                     args
@@ -3246,12 +3672,11 @@
                                                     toks
                                                     tokp
                                                     vtp
-                                                    fm
-                                                    moff)
+                                                    fm)
                                   v2tp (primitive/alloc-stack Type)]
-                              (store! v2tp (ir-parse-type2 cx result argtys toks tokp))
+                              (store! v2tp (ir-parse-type2 cx a result argtys toks tokp))
                               (let [v2
-                                      (ir-value2-adv! cx
+                                      (ir-value2-adv! cx a
                                                       names
                                                       vals
                                                       args
@@ -3260,11 +3685,10 @@
                                                       toks
                                                       tokp
                                                       v2tp
-                                                      fm
-                                                      moff)
+                                                      fm)
                                     masktp (primitive/alloc-stack Type)]
                                 (store! masktp
-                                        (ir-parse-type2 cx result argtys toks tokp))
+                                        (ir-parse-type2 cx a result argtys toks tokp))
                                 (match (load vtp)
                                   (TVec [elem srclanes]
                                         (match (load masktp)
@@ -3277,7 +3701,6 @@
                                                                            (extent-value dstlanes))
                                                       dslot
                                                         (frame-alloc fm
-                                                                     moff
                                                                      (primitive/imul (extent-value dstlanes)
                                                                                      lb)
                                                                      (ialign-of cx
@@ -3329,9 +3752,9 @@
                                 vtp (primitive/alloc-stack Type)]
                             (store! tokp 3)
                             (store! vtp
-                                    (ir-parse-type2 cx result argtys toks tokp))
+                                    (ir-parse-type2 cx a result argtys toks tokp))
                             (let [av
-                                    (ir-value2-adv! cx
+                                    (ir-value2-adv! cx a
                                                     names
                                                     vals
                                                     args
@@ -3340,10 +3763,9 @@
                                                     toks
                                                     tokp
                                                     vtp
-                                                    fm
-                                                    moff)
+                                                    fm)
                                   bv
-                                    (ir-value2-adv! cx
+                                    (ir-value2-adv! cx a
                                                     names
                                                     vals
                                                     args
@@ -3352,14 +3774,12 @@
                                                     toks
                                                     tokp
                                                     vtp
-                                                    fm
-                                                    moff)]
+                                                    fm)]
                               (match (load vtp)
                                 (TVec [elem lanes]
                                       (let [lb (isize-of cx elem)
                                             dslot
                                               (frame-alloc fm
-                                                           moff
                                                            (isize-of cx vtp)
                                                            (ialign-of cx
                                                                       vtp))]
@@ -3418,9 +3838,9 @@
                           (let [tokp (primitive/alloc-stack i64)
                                 srctp (primitive/alloc-stack Type)]
                             (store! tokp 3)
-                            (store! srctp (ir-parse-type2 cx result argtys toks tokp))
+                            (store! srctp (ir-parse-type2 cx a result argtys toks tokp))
                             (let [v
-                                    (ir-value2-adv! cx
+                                    (ir-value2-adv! cx a
                                                     names
                                                     vals
                                                     args
@@ -3429,12 +3849,11 @@
                                                     toks
                                                     tokp
                                                     srctp
-                                                    fm
-                                                    moff)]
+                                                    fm)]
                               (store! tokp (primitive/iadd (load tokp) 1))  ; skip "to"
                               (let [dsttp (primitive/alloc-stack Type)]
                                 (store! dsttp
-                                        (ir-parse-type2 cx result argtys toks tokp))
+                                        (ir-parse-type2 cx a result argtys toks tokp))
                                 (unless (= (isize-of cx srctp) (isize-of cx dsttp))
                                   (idie "llvm-ir: bitcast between different-size types"))
                                 ; a value here is already either an address
@@ -3450,9 +3869,9 @@
                                 tokp (primitive/alloc-stack i64)
                                 tp (primitive/alloc-stack Type)]
                             (store! tokp 4)
-                            (store! tp (ir-parse-type2 cx result argtys toks tokp))
+                            (store! tp (ir-parse-type2 cx a result argtys toks tokp))
                             (let [lv
-                                    (ir-value2-adv! cx
+                                    (ir-value2-adv! cx a
                                                     names
                                                     vals
                                                     args
@@ -3461,10 +3880,9 @@
                                                     toks
                                                     tokp
                                                     tp
-                                                    fm
-                                                    moff)
+                                                    fm)
                                   rv
-                                    (ir-value2-adv! cx
+                                    (ir-value2-adv! cx a
                                                     names
                                                     vals
                                                     args
@@ -3473,13 +3891,12 @@
                                                     toks
                                                     tokp
                                                     tp
-                                                    fm
-                                                    moff)]
+                                                    fm)]
                               (match (load tp)
                                 (TVec [elem lanes]
                                       (let [lb (isize-of cx elem)
                                             bits (ir-int-bits elem)
-                                            dslot (frame-alloc fm moff (extent-value lanes) 1)
+                                            dslot (frame-alloc fm (extent-value lanes) 1)
                                             (mut k) 0]
                                         (loop (if (>= (load k) (extent-value lanes))
                                                   (break)
@@ -3528,9 +3945,9 @@
                                 tokp (primitive/alloc-stack i64)
                                 tp (primitive/alloc-stack Type)]
                             (store! tokp 4)
-                            (store! tp (ir-parse-type2 cx result argtys toks tokp))
+                            (store! tp (ir-parse-type2 cx a result argtys toks tokp))
                             (let [lv
-                                    (ir-value2-adv! cx
+                                    (ir-value2-adv! cx a
                                                     names
                                                     vals
                                                     args
@@ -3539,10 +3956,9 @@
                                                     toks
                                                     tokp
                                                     tp
-                                                    fm
-                                                    moff)
+                                                    fm)
                                   rv
-                                    (ir-value2-adv! cx
+                                    (ir-value2-adv! cx a
                                                     names
                                                     vals
                                                     args
@@ -3551,13 +3967,12 @@
                                                     toks
                                                     tokp
                                                     tp
-                                                    fm
-                                                    moff)]
+                                                    fm)]
                               (match (load tp)
                                 (TVec [elem lanes]
                                       (let [lb (isize-of cx elem)
                                             fbits (primitive/imul lb 8)
-                                            dslot (frame-alloc fm moff (extent-value lanes) 1)
+                                            dslot (frame-alloc fm (extent-value lanes) 1)
                                             (mut k) 0]
                                         (loop (if (>= (load k) (extent-value lanes))
                                                   (break)
@@ -3597,9 +4012,9 @@
                                 condtp (primitive/alloc-stack Type)]
                             (store! tokp 3)
                             (store! condtp
-                                    (ir-parse-type2 cx result argtys toks tokp))
+                                    (ir-parse-type2 cx a result argtys toks tokp))
                             (let [condv
-                                    (ir-value2-adv! cx
+                                    (ir-value2-adv! cx a
                                                     names
                                                     vals
                                                     args
@@ -3608,12 +4023,11 @@
                                                     toks
                                                     tokp
                                                     condtp
-                                                    fm
-                                                    moff)
+                                                    fm)
                                   valtp (primitive/alloc-stack Type)]
-                              (store! valtp (ir-parse-type2 cx result argtys toks tokp))
+                              (store! valtp (ir-parse-type2 cx a result argtys toks tokp))
                               (let [av
-                                      (ir-value2-adv! cx
+                                      (ir-value2-adv! cx a
                                                       names
                                                       vals
                                                       args
@@ -3622,13 +4036,12 @@
                                                       toks
                                                       tokp
                                                       valtp
-                                                      fm
-                                                      moff)
+                                                      fm)
                                     valtp2 (primitive/alloc-stack Type)]
                                 (store! valtp2
-                                        (ir-parse-type2 cx result argtys toks tokp))
+                                        (ir-parse-type2 cx a result argtys toks tokp))
                                 (let [bv
-                                        (ir-value2-adv! cx
+                                        (ir-value2-adv! cx a
                                                         names
                                                         vals
                                                         args
@@ -3637,14 +4050,12 @@
                                                         toks
                                                         tokp
                                                         valtp2
-                                                        fm
-                                                        moff)]
+                                                        fm)]
                                   (match (load valtp)
                                     (TVec [elem lanes]
                                           (let [lb (isize-of cx elem)
                                                 dslot
                                                   (frame-alloc fm
-                                                               moff
                                                                (primitive/imul (extent-value lanes)
                                                                                lb)
                                                                (ialign-of cx elem))
@@ -3692,9 +4103,9 @@
                                 srctp (primitive/alloc-stack Type)
                                 mode (cond (= op "sext") 0 (= op "zext") 1 :else 2)]
                             (store! tokp 3)
-                            (store! srctp (ir-parse-type2 cx result argtys toks tokp))
+                            (store! srctp (ir-parse-type2 cx a result argtys toks tokp))
                             (let [srcv
-                                    (ir-value2-adv! cx
+                                    (ir-value2-adv! cx a
                                                     names
                                                     vals
                                                     args
@@ -3703,12 +4114,11 @@
                                                     toks
                                                     tokp
                                                     srctp
-                                                    fm
-                                                    moff)]
+                                                    fm)]
                               (store! tokp (primitive/iadd (load tokp) 1))  ; skip "to"
                               (let [dsttp (primitive/alloc-stack Type)]
                                 (store! dsttp
-                                        (ir-parse-type2 cx result argtys toks tokp))
+                                        (ir-parse-type2 cx a result argtys toks tokp))
                                 (match (load dsttp)
                                   (TVec [delem dlanes]
                                         (let [selem
@@ -3720,7 +4130,6 @@
                                               sbits (ir-int-bits selem)
                                               dslot
                                                 (frame-alloc fm
-                                                             moff
                                                              (primitive/imul (extent-value dlanes) dlb)
                                                              (ialign-of cx delem))
                                               (mut k) 0]
@@ -3763,9 +4172,9 @@
                           (let [tokp (primitive/alloc-stack i64)
                                 srctp (primitive/alloc-stack Type)]
                             (store! tokp 3)
-                            (store! srctp (ir-parse-type2 cx result argtys toks tokp))
+                            (store! srctp (ir-parse-type2 cx a result argtys toks tokp))
                             (let [srcv
-                                    (ir-value2-adv! cx
+                                    (ir-value2-adv! cx a
                                                     names
                                                     vals
                                                     args
@@ -3774,12 +4183,11 @@
                                                     toks
                                                     tokp
                                                     srctp
-                                                    fm
-                                                    moff)]
+                                                    fm)]
                               (store! tokp (primitive/iadd (load tokp) 1))  ; skip "to"
                               (let [dsttp (primitive/alloc-stack Type)]
                                 (store! dsttp
-                                        (ir-parse-type2 cx result argtys toks tokp))
+                                        (ir-parse-type2 cx a result argtys toks tokp))
                                 (match (load dsttp)
                                   (TVec [delem dlanes]
                                         (let [selem
@@ -3790,7 +4198,6 @@
                                               dlb (isize-of cx delem)
                                               dslot
                                                 (frame-alloc fm
-                                                             moff
                                                              (primitive/imul (extent-value dlanes) dlb)
                                                              (ialign-of cx delem))
                                               (mut k) 0]
@@ -3841,9 +4248,9 @@
                                         (= op "xor") 9
                                         :else 10)]
                             (store! tokp 3)
-                            (store! tp (ir-parse-type2 cx result argtys toks tokp))
+                            (store! tp (ir-parse-type2 cx a result argtys toks tokp))
                             (let [lv
-                                    (ir-value2-adv! cx
+                                    (ir-value2-adv! cx a
                                                     names
                                                     vals
                                                     args
@@ -3852,10 +4259,9 @@
                                                     toks
                                                     tokp
                                                     tp
-                                                    fm
-                                                    moff)
+                                                    fm)
                                   rv
-                                    (ir-value2-adv! cx
+                                    (ir-value2-adv! cx a
                                                     names
                                                     vals
                                                     args
@@ -3864,15 +4270,13 @@
                                                     toks
                                                     tokp
                                                     tp
-                                                    fm
-                                                    moff)]
+                                                    fm)]
                               (match (load tp)
                                 (TVec [elem lanes]
                                       (let [lb (isize-of cx elem)
                                             bits (ir-int-bits elem)
                                             dslot
                                               (frame-alloc fm
-                                                           moff
                                                            (primitive/imul (extent-value lanes) lb)
                                                            (ialign-of cx elem))
                                             (mut k) 0]
@@ -3929,7 +4333,7 @@
                                         (= op "udiv") 5
                                         :else 6)]
                             (store! tokp 3)
-                            (store! tp (ir-parse-type2 cx result argtys toks tokp))
+                            (store! tp (ir-parse-type2 cx a result argtys toks tokp))
                             (match (load tp)
                               (TVec [_ _]
                                     (do
@@ -3938,7 +4342,7 @@
                                       0))
                               (_
                                 (let [lv
-                                        (ir-value2-adv! cx
+                                        (ir-value2-adv! cx a
                                                         names
                                                         vals
                                                         args
@@ -3947,10 +4351,9 @@
                                                         toks
                                                         tokp
                                                         tp
-                                                        fm
-                                                        moff)
+                                                        fm)
                                       rv
-                                        (ir-value2-adv! cx
+                                        (ir-value2-adv! cx a
                                                         names
                                                         vals
                                                         args
@@ -3959,8 +4362,7 @@
                                                         toks
                                                         tokp
                                                         tp
-                                                        fm
-                                                        moff)]
+                                                        fm)]
                                   (ir-env-put! names
                                                vals
                                                t0
@@ -3976,12 +4378,12 @@
                           (let [tokp (primitive/alloc-stack i64)
                                 etp (primitive/alloc-stack Type)]
                             (store! tokp 3)
-                            (store! etp (ir-parse-type2 cx result argtys toks tokp))
+                            (store! etp (ir-parse-type2 cx a result argtys toks tokp))
                             (store! tokp (primitive/iadd (load tokp) 1))  ; skip "ptr"
                             (let [ptp (primitive/alloc-stack Type)]
                               (store! ptp (TPtr (box-type a (TInt 8 true))))
                               (let [base
-                                      (ir-value2-adv! cx
+                                      (ir-value2-adv! cx a
                                                       names
                                                       vals
                                                       args
@@ -3990,16 +4392,15 @@
                                                       toks
                                                       tokp
                                                       ptp
-                                                      fm
-                                                      moff)
+                                                      fm)
                                     esz (isize-of cx etp)
                                     itp (primitive/alloc-stack Type)]
-                                (store! itp (ir-parse-type2 cx result argtys toks tokp))
+                                (store! itp (ir-parse-type2 cx a result argtys toks tokp))
                                 (match (load itp)
                                   (TVec [ielem lanes]
                                         (let [ilb (isize-of cx ielem)
                                               idxaddr
-                                                (ir-value2-adv! cx
+                                                (ir-value2-adv! cx a
                                                                 names
                                                                 vals
                                                                 args
@@ -4008,11 +4409,9 @@
                                                                 toks
                                                                 tokp
                                                                 itp
-                                                                fm
-                                                                moff)
+                                                                fm)
                                               dslot
                                                 (frame-alloc fm
-                                                             moff
                                                              (primitive/imul (extent-value lanes) 8)
                                                              8)
                                               (mut k) 0]
@@ -4037,7 +4436,7 @@
                                           0))
                                   (_
                                     (let [idx
-                                            (ir-value2-adv! cx
+                                            (ir-value2-adv! cx a
                                                             names
                                                             vals
                                                             args
@@ -4046,8 +4445,7 @@
                                                             toks
                                                             tokp
                                                             itp
-                                                            fm
-                                                            moff)]
+                                                            fm)]
                                       (ir-env-put! names
                                                    vals
                                                    t0
@@ -4055,7 +4453,7 @@
                                                                    (primitive/imul idx esz)))
                                       0))))))
                         (= op "call")
-                          (ir-call! cx
+                          (ir-call! cx a
                                     names
                                     vals
                                     args
@@ -4064,8 +4462,7 @@
                                     toks
                                     t0
                                     line
-                                    fm
-                                    moff)
+                                    fm)
                         :else (do (idie2 "llvm-ir: unsupported op: " op) 0)))
               :else (do (idie2 "llvm-ir: unsupported line: " line) 0))))))
 
@@ -4152,6 +4549,7 @@
 ; A scalar float math intrinsic (src/compiler/float_math.coil), `tokp` at the
 ; callee. Scalar float SSA values are their bit patterns.
 (defn ir-float-math! [(cx (ptr Interp))
+                      (a (dyn Allocator))
                       (names (ptr (ArrayList (slice u8))))
                       (vals (ptr (ArrayList i64)))
                       (args (ptr i64))
@@ -4160,17 +4558,16 @@
                       (toks (ptr (ArrayList (slice u8))))
                       (tokp (ptr i64))
                       (t0 (slice u8))
-                      (fm i64)
-                      (moff (ptr i64))
+                      (fm (ptr FrameMem))
                       (fi FloatIntrinsic)] (-> i64)
   (let [operands (primitive/alloc-stack (array i64 3))
         at (primitive/alloc-stack Type)]
     (for [i 0 3] (store! (primitive/index (primitive/cast (ptr i64) operands) i) 0))
     (set! tokp (primitive/iadd (load tokp) 2))  ; skip callee, "("
     (for [i 0 (.arity fi)]
-      (set! at (ir-parse-type2 cx result argtys toks tokp))
+      (set! at (ir-parse-type2 cx a result argtys toks tokp))
       (store! (primitive/index (primitive/cast (ptr i64) operands) i)
-              (ir-value2-adv! cx names vals args result argtys toks tokp at fm moff)))
+              (ir-value2-adv! cx a names vals args result argtys toks tokp at fm)))
     (let [x (load (primitive/index (primitive/cast (ptr i64) operands) 0))
           y (load (primitive/index (primitive/cast (ptr i64) operands) 1))
           z (load (primitive/index (primitive/cast (ptr i64) operands) 2))
@@ -4181,6 +4578,7 @@
       0)))
 
 (defn ir-call! [(cx (ptr Interp))
+                (a (dyn Allocator))
                 (names (ptr (ArrayList (slice u8))))
                 (vals (ptr (ArrayList i64)))
                 (args (ptr i64))
@@ -4189,23 +4587,21 @@
                 (toks (ptr (ArrayList (slice u8))))
                 (t0 (slice u8))
                 (line (slice u8))
-                (fm i64)
-                (moff (ptr i64))] (-> i64)
-  (let [a (.a cx)
-        tokp (primitive/alloc-stack i64)
+                (fm (ptr FrameMem))] (-> i64)
+  (let [tokp (primitive/alloc-stack i64)
         rtp (primitive/alloc-stack Type)]
     (set! tokp 3)
-    (set! rtp (ir-parse-type2 cx result argtys toks tokp))
+    (set! rtp (ir-parse-type2 cx a result argtys toks tokp))
     (let [callee (irtok toks (load tokp))]
       (match (float-intrinsic callee)
-        (Some [fi] (ir-float-math! cx names vals args argtys result toks tokp t0 fm moff fi))
+        (Some [fi] (ir-float-math! cx a names vals args argtys result toks tokp t0 fm fi))
         (None []
       (if (= callee "@llvm.fma.v4f32")
           (let [t1 (primitive/alloc-stack Type)
                 t2 (primitive/alloc-stack Type)
                 t3 (primitive/alloc-stack Type)]
             (set! tokp (primitive/iadd (load tokp) 2))  ; skip name + "("
-            (set! t1 (ir-parse-type2 cx result argtys toks tokp))
+            (set! t1 (ir-parse-type2 cx a result argtys toks tokp))
             (let [av
                     (ir-value2 cx
                                names
@@ -4213,10 +4609,9 @@
                                args
                                (irtok toks (load tokp))
                                t1
-                               fm
-                               moff)]
+                               fm)]
               (set! tokp (primitive/iadd (load tokp) 1))
-              (set! t2 (ir-parse-type2 cx result argtys toks tokp))
+              (set! t2 (ir-parse-type2 cx a result argtys toks tokp))
               (let [bv
                       (ir-value2 cx
                                  names
@@ -4224,10 +4619,9 @@
                                  args
                                  (irtok toks (load tokp))
                                  t2
-                                 fm
-                                 moff)]
+                                 fm)]
                 (set! tokp (primitive/iadd (load tokp) 1))
-                (set! t3 (ir-parse-type2 cx result argtys toks tokp))
+                (set! t3 (ir-parse-type2 cx a result argtys toks tokp))
                 (let [cv
                         (ir-value2 cx
                                    names
@@ -4235,14 +4629,12 @@
                                    args
                                    (irtok toks (load tokp))
                                    t3
-                                   fm
-                                   moff)]
+                                   fm)]
                   (match result
                     (TVec [elem lanes]
                           (let [lb (isize-of cx elem)
                                 dslot
                                   (frame-alloc fm
-                                               moff
                                                (isize-of cx (box-type a result))
                                                (ialign-of cx
                                                           (box-type a result)))
@@ -4285,11 +4677,11 @@
           (if (= callee "@llvm.vector.reduce.fadd.v4f32")
               (let [vtp (primitive/alloc-stack Type)]
                 (set! tokp (primitive/iadd (load tokp) 2))  ; skip name + "("
-                (ir-parse-type2 cx result argtys toks tokp)  ; float
+                (ir-parse-type2 cx a result argtys toks tokp)  ; float
                 (unless (= (irtok toks (load tokp)) "0.0")
                   (idie2 "llvm-ir: reduce.fadd start must be 0.0: " line))
                 (set! tokp (primitive/iadd (load tokp) 1))
-                (set! vtp (ir-parse-type2 cx result argtys toks tokp))
+                (set! vtp (ir-parse-type2 cx a result argtys toks tokp))
                 (let [v
                         (ir-value2 cx
                                    names
@@ -4297,8 +4689,7 @@
                                    args
                                    (irtok toks (load tokp))
                                    vtp
-                                   fm
-                                   moff)]
+                                   fm)]
                   (match (load vtp)
                     (TVec [elem lanes]
                           (let [lb (isize-of cx elem)
@@ -4333,9 +4724,9 @@
                   ; too, since f64 has far more precision).
                   (let [at (primitive/alloc-stack Type)]
                     (set! tokp (primitive/iadd (load tokp) 2))  ; skip name, "("
-                    (set! at (ir-parse-type2 cx result argtys toks tokp))
+                    (set! at (ir-parse-type2 cx a result argtys toks tokp))
                     (let [av
-                            (ir-value2-adv! cx
+                            (ir-value2-adv! cx a
                                             names
                                             vals
                                             args
@@ -4344,14 +4735,12 @@
                                             toks
                                             tokp
                                             at
-                                            fm
-                                            moff)]
+                                            fm)]
                       (match (load rtp)
                         (TVec [elem lanes]
                               (let [lb (isize-of cx elem)
                                     dslot
                                       (frame-alloc fm
-                                                   moff
                                                    (isize-of cx rtp)
                                                    (ialign-of cx rtp))
                                     (mut k) 0]
@@ -4386,9 +4775,9 @@
                       (let [ptrsty (primitive/alloc-stack Type)]
                         (set! tokp (primitive/iadd (load tokp) 2))  ; skip name, "("
                         (set! ptrsty
-                              (ir-parse-type2 cx result argtys toks tokp))
+                              (ir-parse-type2 cx a result argtys toks tokp))
                         (let [ptrsaddr
-                                (ir-value2-adv! cx
+                                (ir-value2-adv! cx a
                                                 names
                                                 vals
                                                 args
@@ -4397,15 +4786,14 @@
                                                 toks
                                                 tokp
                                                 ptrsty
-                                                fm
-                                                moff)]
-                          (ir-parse-type2 cx result argtys toks tokp)  ; i32 (immarg align)
+                                                fm)]
+                          (ir-parse-type2 cx a result argtys toks tokp)  ; i32 (immarg align)
                           (set! tokp (primitive/iadd (load tokp) 1))  ; skip its literal
                           (let [maskty (primitive/alloc-stack Type)]
                             (set! maskty
-                                  (ir-parse-type2 cx result argtys toks tokp))
+                                  (ir-parse-type2 cx a result argtys toks tokp))
                             (let [maskaddr
-                                    (ir-value2-adv! cx
+                                    (ir-value2-adv! cx a
                                                     names
                                                     vals
                                                     args
@@ -4414,13 +4802,12 @@
                                                     toks
                                                     tokp
                                                     maskty
-                                                    fm
-                                                    moff)
+                                                    fm)
                                   passty (primitive/alloc-stack Type)]
                               (set! passty
-                                    (ir-parse-type2 cx result argtys toks tokp))
+                                    (ir-parse-type2 cx a result argtys toks tokp))
                               (let [passaddr
-                                      (ir-value2-adv! cx
+                                      (ir-value2-adv! cx a
                                                       names
                                                       vals
                                                       args
@@ -4429,14 +4816,12 @@
                                                       toks
                                                       tokp
                                                       passty
-                                                      fm
-                                                      moff)]
+                                                      fm)]
                                 (match (load rtp)
                                   (TVec [relem lanes]
                                         (let [relb (isize-of cx relem)
                                               dslot
                                                 (frame-alloc fm
-                                                             moff
                                                              (isize-of cx rtp)
                                                              (ialign-of cx rtp))
                                               (mut k) 0]
@@ -4487,9 +4872,13 @@
 (defn ir-run [(cx (ptr Interp))
               (irp (ptr IIr))
               (args (ptr i64))
-              (fm i64)
-              (moff (ptr i64))] (-> i64)
-  (let [a (.a cx)
+              (fm (ptr FrameMem))] (-> i64)
+  ; Everything the run allocates (its name table, parsed types, token lists) is
+  ; scratch that dies with it; a per-run arena keeps runs from growing the
+  ; interpreter's allocator and from sharing it across threads.
+  (let [(mut arena) (primitive/zeroed ScratchArena)
+        _ (scratch-init (mut arena) (malloc-allocator))
+        a (scratch-allocator (mut arena))
         names (box-al [(slice u8)] a (al-new [(slice u8)] a))
         vals (box-al [i64] a (al-new [i64] a))
         argtys (field irp argtys)
@@ -4515,7 +4904,7 @@
                     (unless (= (len line) (primitive/cast i64 0))
                       (if (load donep)
                           (idie2 "llvm-ir: code after ret: " line)
-                          (ir-line! cx
+                          (ir-line! cx a
                                     names
                                     vals
                                     args
@@ -4524,22 +4913,39 @@
                                     retvalp
                                     donep
                                     line
-                                    fm
-                                    moff)))))
+                                    fm)))))
                 0)))
     (unless (load donep) (idie "llvm-ir: body did not ret"))
+    (scratch-close! (mut arena))
     (load retvalp)))
 
 ; ============================ the VM ========================================
-(defn vpush [(ops (ptr i64)) (spc (ptr i64)) (v i64)] (-> i64)
-  (set! (primitive/index ops (load spc)) v)
+; A call's operand stack, grown by doubling when an expression nests deeper
+; than it has room for.
+(defstruct VStack [(buf (ptr i64)) (cap i64)])
+
+(defn vpush [(ops (ptr VStack)) (spc (ptr i64)) (v i64)] (-> i64)
+  (when (>= (load spc) (.cap ops))
+    (let [cap (* (.cap ops) 2)
+          grown (interp.realloc (primitive/cast (ptr i8) (.buf ops)) (primitive/cast isize (* cap 8)))]
+      (when (= (primitive/cast i64 grown) 0)
+        (idie "operand stack: realloc failed"))
+      (set! (.buf ops) (primitive/cast (ptr i64) grown))
+      (set! (.cap ops) cap)))
+  (set! (primitive/index (.buf ops) (load spc)) v)
   (set! spc (primitive/iadd (load spc) 1))
   0)
 
-(defn vpop [(ops (ptr i64)) (spc (ptr i64))] (-> i64)
+;;; Pop the top `n` values at once, returning where they sit, in push order:
+;;; a call's arguments, read by the callee before this stack is pushed again.
+(defn vpop-n [(ops (ptr VStack)) (spc (ptr i64)) (n i64)] (-> (ptr i64))
+  (set! spc (- (load spc) n))
+  (primitive/index (.buf ops) (load spc)))
+
+(defn vpop [(ops (ptr VStack)) (spc (ptr i64))] (-> i64)
   (let [t (primitive/isub (load spc) 1)]
     (set! spc t)
-    (load (primitive/index ops t))))
+    (load (primitive/index (.buf ops) t))))
 
 ; execute compiled function `fidx` with `argc` i64 arguments; return its i64
 ; result. Recursion uses the host call stack (one vm-exec activation per call).
@@ -4555,12 +4961,10 @@
           (primitive/cast (ptr i64)
                           (interp.malloc (primitive/cast isize
                                                          (primitive/imul nlb 8))))
-        framemem (primitive/cast i64 (interp.malloc 1048576))
-        ops (primitive/cast (ptr i64) (interp.malloc 32768))
+        (mut framemem) (frame-new)
+        (mut ops) (VStack :buf (primitive/cast (ptr i64) (interp.malloc 512)) :cap 64)
         spc (primitive/alloc-stack i64)
-        memoffc (primitive/alloc-stack i64)
         code (load (field bf code))
-        argbuf (primitive/alloc-stack (array i64 32))
         retp (primitive/alloc-stack Type)
         (mut pc) 0
         (mut halt) false
@@ -4569,7 +4973,6 @@
     (let [retagg (ty-is-agg retp)
           retsz (when (ty-is-agg retp) (isize-of cx retp))]
       (set! spc 0)
-      (set! memoffc 0)
       (let [(mut i) 0]
         (loop (if (>= (load i) argc)
                   (break)
@@ -4590,30 +4993,30 @@
                   c (.c ins)]
               (set! pc (primitive/iadd (load pc) 1))
               (case op 1
-                    (vpush ops spc a) 2
-                    (vpush ops spc (load (primitive/index locals a))) 3
-                    (store! (primitive/index locals a) (vpop ops spc)) 4
-                    (do (vpop ops spc) 0) 5
-                    (vpush ops spc (frame-alloc framemem memoffc a b)) 6
-                    (let [addr (vpop ops spc)]
-                      (vpush ops
+                    (vpush (mut ops) spc a) 2
+                    (vpush (mut ops) spc (load (primitive/index locals a))) 3
+                    (store! (primitive/index locals a) (vpop (mut ops) spc)) 4
+                    (do (vpop (mut ops) spc) 0) 5
+                    (vpush (mut ops) spc (frame-alloc (mut framemem) a b)) 6
+                    (let [addr (vpop (mut ops) spc)]
+                      (vpush (mut ops)
                              spc
                              (mem-load addr a (!= b (primitive/cast i64 0)))))
                       7
-                    (let [v (vpop ops spc)
-                          addr (vpop ops spc)]
-                      (do (mem-store addr v a) (vpush ops spc 0)))
+                    (let [v (vpop (mut ops) spc)
+                          addr (vpop (mut ops) spc)]
+                      (do (mem-store addr v a) (vpush (mut ops) spc 0)))
                       8
-                    (let [r (vpop ops spc)
-                          l (vpop ops spc)]
-                      (vpush ops spc (do-bin a b c l r)))
+                    (let [r (vpop (mut ops) spc)
+                          l (vpop (mut ops) spc)]
+                      (vpush (mut ops) spc (do-bin a b c l r)))
                       9
-                    (let [r (vpop ops spc)
-                          l (vpop ops spc)]
-                      (vpush ops spc (do-cmp a b c l r)))
+                    (let [r (vpop (mut ops) spc)
+                          l (vpop (mut ops) spc)]
+                      (vpush (mut ops) spc (do-cmp a b c l r)))
                       10
-                    (let [v (vpop ops spc)]
-                      (vpush ops
+                    (let [v (vpop (mut ops) spc)]
+                      (vpush (mut ops)
                              spc
                              (cond (= a (primitive/cast i64 0))
                                      (primitive/ixor v -1)
@@ -4622,18 +5025,10 @@
                                    :else (do-int-unary a b v))))
                       11
                     (store! pc a) 12
-                    (let [v (vpop ops spc)]
+                    (let [v (vpop (mut ops) spc)]
                       (when (= v (primitive/cast i64 0)) (store! pc a)))
                       13
-                    (let [(mut k) (primitive/isub b 1)]
-                      (loop (if (< (load k) (primitive/cast i64 0))
-                                (break)
-                                (do
-                                  (store! (primitive/index (primitive/cast (ptr i64)
-                                                                           argbuf)
-                                                           (load k))
-                                          (vpop ops spc))
-                                  (store! k (primitive/isub (load k) 1)))))
+                    (let [argbuf (vpop-n (mut ops) spc b)]
                       (let [crp (primitive/alloc-stack Type)]
                         (store! crp
                                 (load (field (ial-at [BFunc]
@@ -4642,11 +5037,10 @@
                                              retty)))
                         (let [rb
                                 (when (ty-is-agg crp)
-                                  (frame-alloc framemem
-                                               memoffc
+                                  (frame-alloc (mut framemem)
                                                (isize-of cx crp)
                                                16))]
-                          (vpush ops
+                          (vpush (mut ops)
                                  spc
                                  (vm-exec cx
                                           a
@@ -4654,41 +5048,32 @@
                                           b
                                           rb)))))
                       14
-                    (let [(mut k) (primitive/isub b 1)]
-                      (loop (if (< (load k) (primitive/cast i64 0))
-                                (break)
-                                (do
-                                  (store! (primitive/index (primitive/cast (ptr i64)
-                                                                           argbuf)
-                                                           (load k))
-                                          (vpop ops spc))
-                                  (store! k (primitive/isub (load k) 1)))))
-                      (vpush ops
+                    (let [argbuf (vpop-n (mut ops) spc b)]
+                      (vpush (mut ops)
                              spc
                              (extern-call cx
                                           a
                                           (primitive/cast (ptr i64) argbuf)
                                           b)))
                       15
-                    (let [v (vpop ops spc)]
+                    (let [v (vpop (mut ops) spc)]
                       (if retagg
                           (do (memcopy retbuf v retsz) (store! retval retbuf))
                           (store! retval v))
                       (store! halt true)
                       0)
                       16
-                    (let [v (vpop ops spc)]
-                      (vpush ops
+                    (let [v (vpop (mut ops) spc)]
+                      (vpush (mut ops)
                              spc
                              (canon-int v a (!= b (primitive/cast i64 0)))))
                       17
-                    (let [v (vpop ops spc)] (vpush ops spc (i2f v a b))) 18
-                    (let [v (vpop ops spc)] (vpush ops spc (f2i v a b c))) 19
-                    (let [v (vpop ops spc)] (vpush ops spc (f2f v a b))) 21
-                    (let [src (vpop ops spc)
+                    (let [v (vpop (mut ops) spc)] (vpush (mut ops) spc (i2f v a b))) 18
+                    (let [v (vpop (mut ops) spc)] (vpush (mut ops) spc (f2i v a b c))) 19
+                    (let [v (vpop (mut ops) spc)] (vpush (mut ops) spc (f2f v a b))) 21
+                    (let [src (vpop (mut ops) spc)
                           addr
-                            (frame-alloc framemem
-                                         memoffc
+                            (frame-alloc (mut framemem)
                                          b
                                          (if (!= c (primitive/cast i64 0)) 16 8))]
                       (do
@@ -4697,12 +5082,12 @@
                             (mem-store addr src b))
                         (store! (primitive/index locals a) addr)))
                       22
-                    (let [addr (vpop ops spc)]
+                    (let [addr (vpop (mut ops) spc)]
                       (do
                         (interp.free (primitive/cast (ptr i8) addr))
-                        (vpush ops spc 0)))
+                        (vpush (mut ops) spc 0)))
                       23
-                    (vpush ops
+                    (vpush (mut ops)
                            spc
                            (primitive/cast i64
                                            (interp.malloc (primitive/cast isize
@@ -4712,31 +5097,31 @@
                             (primitive/cast i64
                                             (interp.malloc (primitive/cast isize
                                                                            a)))]
-                      (do (memzero addr a) (vpush ops spc addr)))
+                      (do (memzero addr a) (vpush (mut ops) spc addr)))
                       30
-                    (let [addr (frame-alloc framemem memoffc 16 8)]
+                    (let [addr (frame-alloc (mut framemem) 16 8)]
                       (do
                         (mem-store addr a 8)
                         (mem-store (primitive/iadd addr 8) b 8)
-                        (vpush ops spc addr)))
+                        (vpush (mut ops) spc addr)))
                       31
-                    (let [addr (frame-alloc framemem memoffc a b)]
-                      (do (memzero addr a) (vpush ops spc addr)))
+                    (let [addr (frame-alloc (mut framemem) a b)]
+                      (do (memzero addr a) (vpush (mut ops) spc addr)))
                       32
-                    (let [src (vpop ops spc)
-                          dst (frame-alloc framemem memoffc a b)]
-                      (do (memcopy dst src a) (vpush ops spc dst)))  ; LOADAGG (fresh copy)
+                    (let [src (vpop (mut ops) spc)
+                          dst (frame-alloc (mut framemem) a b)]
+                      (do (memcopy dst src a) (vpush (mut ops) spc dst)))  ; LOADAGG (fresh copy)
                       33
-                    (let [src (vpop ops spc)
-                          dst (vpop ops spc)]
-                      (do (memcopy dst src a) (vpush ops spc 0)))  ; STOREAGG
+                    (let [src (vpop (mut ops) spc)
+                          dst (vpop (mut ops) spc)]
+                      (do (memcopy dst src a) (vpush (mut ops) spc 0)))  ; STOREAGG
                       34
-                    (let [addr (vpop ops spc)]
-                      (vpush ops spc (primitive/iadd addr a)))  ; FIELDPTR
+                    (let [addr (vpop (mut ops) spc)]
+                      (vpush (mut ops) spc (primitive/iadd addr a)))  ; FIELDPTR
                       35
-                    (let [idx (vpop ops spc)
-                          base (vpop ops spc)]
-                      (vpush ops
+                    (let [idx (vpop (mut ops) spc)
+                          base (vpop (mut ops) spc)]
+                      (vpush (mut ops)
                              spc
                              (primitive/iadd base (primitive/imul idx a))))  ; INDEX
                       36
@@ -4744,7 +5129,7 @@
                       (idie "match: no variant matched (non-exhaustive match reached at runtime)")
                       0)  ; TRAP
                       37
-                    (let [addr (vpop ops spc)
+                    (let [addr (vpop (mut ops) spc)
                           low a
                           width b
                           sg (primitive/iand c 1)
@@ -4756,7 +5141,7 @@
                                                                               cont)
                                                               (primitive/cast u64
                                                                               low)))]
-                        (vpush ops
+                        (vpush (mut ops)
                                spc
                                (if (< width (primitive/cast i64 64))
                                    (canon-int v
@@ -4764,8 +5149,8 @@
                                               (!= sg (primitive/cast i64 0)))
                                    v))))  ; BITGET
                       38
-                    (let [val (vpop ops spc)
-                          addr (vpop ops spc)
+                    (let [val (vpop (mut ops) spc)
+                          addr (vpop (mut ops) spc)
                           low a
                           width b
                           bb c]
@@ -4785,50 +5170,34 @@
                                                                              fieldmask)
                                                              low))]
                         (mem-store addr merged bb)
-                        (vpush ops spc val)))  ; BITSET
+                        (vpush (mut ops) spc val)))  ; BITSET
                       40
-                    (let [(mut k) (primitive/isub b 1)]
-                      (loop (if (< (load k) (primitive/cast i64 0))
-                                (break)
-                                (do
-                                  (store! (primitive/index (primitive/cast (ptr i64)
-                                                                           argbuf)
-                                                           (load k))
-                                          (vpop ops spc))
-                                  (store! k (primitive/isub (load k) 1)))))
-                      (vpush ops
+                    (let [argbuf (vpop-n (mut ops) spc b)]
+                      (vpush (mut ops)
                              spc
                              (ir-run cx
                                      (ial-at [IIr] (field cx irs) a)
                                      (primitive/cast (ptr i64) argbuf)
-                                     framemem
-                                     memoffc)))  ; LLVMIR
+                                     (mut framemem))))  ; LLVMIR
                       43
-                    (let [val (vpop ops spc)
-                          slot (frame-alloc framemem memoffc a b)]
+                    (let [val (vpop (mut ops) spc)
+                          slot (frame-alloc (mut framemem) a b)]
                       (when (> a (primitive/cast i64 8))
-                        (idie "extern by-value struct return >8 bytes not supported by interp"))
+                        (idie "BOXEXT: a built-in table function returned an aggregate over 8 bytes (none does)"))
                       (memzero slot a)
                       (mem-store slot val a)
-                      (vpush ops spc slot))  ; box extern agg return
+                      (vpush (mut ops) spc slot))  ; box extern agg return
                       42
-                    (let [(mut k) (primitive/isub a 1)]
-                      (loop (if (< (load k) (primitive/cast i64 0))
-                                (break)
-                                (do
-                                  (store! (primitive/index (primitive/cast (ptr i64)
-                                                                           argbuf)
-                                                           (load k))
-                                          (vpop ops spc))
-                                  (store! k (primitive/isub (load k) 1)))))
-                      (let [fpv (vpop ops spc)
-                            fi (primitive/isub fpv (fnptr-base))]
-                        (when (or (< fi (primitive/cast i64 0))
-                                  (>= fi
-                                      (len (load (field cx
-                                                        bfuncs)))))
-                          (idie "call-ptr: not a Coil function pointer (real C addresses unsupported)")
-                          0)
+                    (let [argbuf (vpop-n (mut ops) spc a)]
+                      (let [fpv (vpop (mut ops) spc)
+                            fi (interp-fnptr-index cx fpv)]
+                        (if (< fi (primitive/cast i64 0))
+                        ; not an interpreted function: a native one, called
+                        ; through call site b's plan
+                        (do
+                          (when (< b (primitive/cast i64 0))
+                            (idie "call-ptr: not a function pointer"))
+                          (vpush (mut ops) spc (ffi-run-call cx b fpv argbuf (mut framemem))))
                         (let [crp (primitive/alloc-stack Type)]
                           (store! crp
                                   (load (field (ial-at [BFunc]
@@ -4837,25 +5206,35 @@
                                                retty)))
                           (let [rb
                                   (when (ty-is-agg crp)
-                                    (frame-alloc framemem
-                                                 memoffc
+                                    (frame-alloc (mut framemem)
                                                  (isize-of cx crp)
                                                  16))]
-                            (vpush ops
+                            (vpush (mut ops)
                                    spc
                                    (vm-exec cx
                                             fi
                                             (primitive/cast (ptr i64) argbuf)
                                             a
-                                            rb))))))  ; CALLPTR
+                                            rb)))))))  ; CALLPTR
                       44
                     (do (store! (primitive/index locals a) (load spc)) 0)  ; SAVESP
                       45
                     (do (set! spc (load (primitive/index locals a))) 0)  ; RESTORESP
+                      47
+                    ; CALLNATIVE: a = call site, b = argument count
+                    (let [argbuf (vpop-n (mut ops) spc b)]
+                      (vpush (mut ops) spc
+                             (ffi-run-call cx a (.addr (ial-at [IFfiCall] (field (.ffi cx) calls) a))
+                                           argbuf (mut framemem))))
+                      46
+                    ; ALLOCDYN: n = pop; push a fresh 16-aligned block of n bytes that
+                    ; lives until this call returns (alloc-stack-bytes)
+                    (let [n (vpop (mut ops) spc)]
+                      (vpush (mut ops) spc (frame-alloc (mut framemem) (align-up n 16) 16)))
                       (do (idie "VM: bad opcode") 0))))))
     (interp.free (primitive/cast (ptr i8) locals))
-    (interp.free (primitive/cast (ptr i8) framemem))
-    (interp.free (primitive/cast (ptr i8) ops))
+    (frame-free! (mut framemem))
+    (interp.free (primitive/cast (ptr i8) (.buf ops)))
     (load retval)))
 
 ; ============================ top-level entry ================================
@@ -4915,6 +5294,7 @@
     (set! (.externs cx) (load (field mp externs)))
     (set! (.bfuncs cx) (al-new [BFunc] a))
     (set! (.statics cx) (al-new [IStatic] a))
+    (set! (.named_statics cx) (al-new [IStatic] a))
     (set! (.irs cx) (al-new [IIr] a))
     (iregister-types! cx mp)
     (let [fs (load (field mp funcs))
@@ -4948,6 +5328,7 @@
         (do (idie2 "interp meta: no such entry function: " nm) 0)
         (do
           (ensure-compiled cx fi)
+          (interp-ffi-enter! cx)
           (vm-exec cx fi argv argc 0)))))
 
 ; Does the context define an entry with this coil function name? (e.g. the comptime
@@ -4959,32 +5340,7 @@
 ; (the process exit code). Registration happens BEFORE compilation so calls
 ; resolve by name regardless of order.
 (defn interp-program [(a (dyn Allocator)) (mp (ptr Program))] (-> i64)
-  (let [cx (primitive/alloc-stack Interp)]
-    (set! (.a cx) a)
-    (set! (.mp cx) mp)
-    (set! (.externs cx) (load (field mp externs)))
-    (set! (.bfuncs cx) (al-new [BFunc] a))
-    (set! (.statics cx) (al-new [IStatic] a))
-    (set! (.irs cx) (al-new [IIr] a))
-    (iregister-types! cx mp)
-    ; pre-register: name + nparams + retty for every func (calls need these).
-    (let [fs (load (field mp funcs))
-          n (len (load fs))
-          (mut i) 0
-          bf0 (primitive/alloc-stack BFunc)]
-      (loop (if (>= (load i) n)
-                (break)
-                (do
-                  (let [fd (ial-at [Func] fs (load i))]
-                    (set! (.name bf0) (.name fd))
-                    (set! (.nparams bf0) (len (load (field fd params))))
-                    (set! (.nlocals bf0) 0)
-                    (set! (.code bf0)
-                          (primitive/cast (ptr (ArrayList Instr)) 0))
-                    (set! (.retty bf0) (.ret fd))
-                    (set! (.state bf0) 0)
-                    (push! (mut (.bfuncs cx)) (load bf0)))
-                  (set! i (primitive/iadd (load i) 1))))))
+  (let [cx (interp-build a mp)]
     ; lazily compile from main (transitively compiles exactly the reachable set),
     ; then run it. main's i64 return is the process exit code.
     (let [mi (find-func cx "main")]
