@@ -53,6 +53,9 @@ Everything not listed here is deliberately identical.
   body is emitted, so the prologue emits `sub rsp, imm32` and
   `lea rbx, [rsp+disp32]` at their maximum width and patches the immediates in
   place. A shorter encoding chosen up front would have to move code to widen.
+  `alloc-stack-bytes` moves `rsp` down by the 16-rounded count at run time and
+  hands out the bytes above the outgoing-args area, through another such `lea`;
+  `leave` undoes it on return.
 - **`:shim` conventions** name x86-64 registers (`rdi`, `r10`, …). An arm64 `xN`
   name is a hard error with the same per-arch diagnostic the LLVM backend gives
   for the reverse case, rather than silently picking the same-numbered register.

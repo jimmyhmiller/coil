@@ -31,16 +31,25 @@ LLVM backend end-to-end).
   fp-relative location for its lifetime.
 - Scratch regs: x8–x15 (int/ptr), d0–d7/v16.. (float/vec) — used only within a
   single expression's emission, never across statements.
-- Frame: `stp x29,x30,[sp,#-16]!; mov x29,sp; sub sp,sp,#frame` (frame size
-  back-patched after the function body is emitted). fp chain intact everywhere
-  → lldb backtraces work without eh_frame.
+- Frame: `stp x29,x30,[sp,#-16]!; mov x29,sp`, then `sp -= frame` through a
+  `movz/movk` x16 (any frame the 48-bit address space can hold) and `x28 = sp +
+  outbytes`, all back-patched after the function body is emitted. fp chain
+  intact everywhere → lldb backtraces work without eh_frame. The epilogue
+  restores sp from x29, so `alloc-stack-bytes` simply moves sp down at run time
+  and hands out the bytes above the outgoing-args area (another back-patched
+  `sp + outbytes`).
 - Aggregates are slot-resident by value; copies are inline `ldr/str` loops
   (small) or `memcpy` calls (large).
 - **One calling convention: AAPCS64 (Apple)** for both internal functions and
   externs — reuses the `abi-classify-aapcs64` classifier already ported in
   `codegen.coil`. Small structs ≤16B in x-pairs (HFA in v-regs), >16B indirect
-  via x8 (sret) / caller copy. Variadic calls: Apple rule — anonymous args go
-  on the stack, 8-byte aligned. `(vec f32 4)` internally passes in q-regs.
+  via x8 (sret) / caller copy. Named arguments past the registers use Apple's
+  packed stack layout: a scalar at its natural size and alignment (an i32 takes
+  4 bytes), each float of an HFA at the float's alignment, other aggregates in
+  8-byte-aligned words; a 16-aligned composite starts at an even register.
+  Variadic calls: Apple rule — anonymous args go on the stack in 8-byte slots,
+  a struct over 16 bytes as a pointer to a copy. `(vec f32 4)` internally passes
+  in q-regs.
 - Sum construct/match, slices, EIf/ELoop divergence discipline, entry-alloca
   discipline: all mirror `codegen.coil` exactly (see the lowering spec that
   file embodies; tag = i32 variant index at offset 0, payload = `[words x i64]`).
