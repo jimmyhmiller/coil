@@ -164,7 +164,9 @@ first multiple of 7: 7
 ```
 
 - `let` binds in sequence. A plain name is immutable; `(mut name)` is a mutable
-  cell, written with `(set! name value)`.
+  cell, written with `(set! name value)`. For plain data (no `Drop`) the cell is a
+  copy, even of a parameter or another local: `(let [(mut c) r] …)` never changes
+  `r`. To alias a place instead, write it as `(mut place)`.
 - `(if test then else)` requires both branches, and they must have the same type.
 - `(do a b c)` runs forms in order and yields the last.
 - `cond` takes flat test/value pairs; `:else` is always true. `case` compares one
