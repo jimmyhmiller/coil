@@ -1383,6 +1383,9 @@ grep -q '(import "unrelated/place/anything.coil" :use \*)' "$T/sib/src/migrate.c
   || bad "transactional preflight migration" "broken file was left partially rewritten"
 # Namespace-owner migrations are one transaction too: add missing aliases alongside
 # the rewritten calls, otherwise the retry fails resolution and rolls everything back.
+# The legacy bare `ior` is qualified to `primitive/ior`, and stays there: on literals
+# alone its type comes from the store's context, which `|` would not see
+# (coil.lint.primitives).
 printf '(module owner-migrate)\n(defn main [] (-> i64) (let [p (stack i64)] (store! p (ior 40 2)) (load p)))\n' \
   > "$T/sib/src/owner-migrate.coil"
 "$COIL" lint "$T/sib/src/owner-migrate.coil" --fix >/dev/null 2>&1
