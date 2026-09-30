@@ -910,16 +910,22 @@ def test_modernize_fast(compiler: str) -> None:
   (let [p (alloc/stack i64)]
     (primitive/store! p 7)
     (read-cell p)))
+(defn main [] (-> i64)
+  (+ (safe) (address-sensitive) (initialized-address-sensitive)))
 """)
             execute(coil, "lint", str(stack_probe), "--fix")
             stack_fixed = stack_probe.read_text()
             if "(let [(mut p) 20]" not in stack_fixed:
                 raise RuntimeError("fast modernization gate: initialized stack cell did not become a mutable local")
-            if stack_fixed.count("(primitive/alloc-stack i64)") != 2:
-                raise RuntimeError("fast modernization gate: address-sensitive stack cell was not preserved explicitly")
-            if "alloc/stack" in stack_fixed:
-                raise RuntimeError("fast modernization gate: public stack allocation survived autofix")
-            execute(coil, "check", str(stack_probe))
+            # A cell handed to a function taking the pointer becomes a local whose
+            # address is passed as `(mut p)`.
+            if stack_fixed.count("(read-cell (mut p))") != 2:
+                raise RuntimeError("fast modernization gate: address-taking stack cell did not pass (mut p)")
+            if "alloc-stack" in stack_fixed or "alloc/stack" in stack_fixed:
+                raise RuntimeError("fast modernization gate: a stack cell survived autofix")
+            ran = subprocess.run([coil, "run", str(stack_probe)], cwd=ROOT, capture_output=True, text=True)
+            if ran.returncode != 49:
+                raise RuntimeError(f"fast modernization gate: migrated stack cells returned {ran.returncode}, want 49")
 
             nested_or_probe = tmp / "nested-or.coil"
             nested_or_probe.write_text("""(module nested-or)

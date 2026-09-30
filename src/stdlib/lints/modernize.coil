@@ -313,14 +313,10 @@
 (defn mz-binder-form? [(f Code)] (-> bool)
   (or (mz-head? f `defstruct) (mz-head? f `defsum)))
 
-;;; Safe storage-duration migration:
-;;;
-;;;   (let [p (alloc/stack T)] (store! p value) body...)
-;;;   -> (let [(mut p) value] body...)
-;;;
-;;; The first store must be unconditional and its value must not mention the still-
-;;; uninitialized slot. One rewrite per fixer round keeps binding identity and source
-;;; spans simple; the transactional fixer recompiles before applying the next one.
+;;; Stack cells: `(alloc/stack T)` is the legacy spelling of `primitive/alloc-stack`,
+;;; and both migrate to a mutable local (see the general stack-cell migration below).
+;;; One rewrite per fixer round keeps binding identity and source spans simple; the
+;;; transactional fixer recompiles before applying the next one.
 (defn mz-legacy-stack-call? [(f Code) (env Code)] (-> bool)
   (and (primitive/code-list? f)
        (= (primitive/code-count f) 2)
@@ -374,56 +370,205 @@
            (= (primitive/binding-of f) bid)
            (primitive/code-eq f target))))
 
-; A stack cell can become a mutable local only while every remaining use is a
-; value read or write. Passing its address, casting it, indexing it, or taking a
-; field requires real storage even when the first operation happened to initialize
-; the cell. This check is intentionally conservative: uncertain syntax keeps the
-; explicit primitive allocation.
-(defn mz-local-uses-safe? [(f Code) (env Code) (target Code) (bid i64)] (-> bool)
-  (if (primitive/code-sym? f)
-      (not (mz-target-symbol? f target bid))
-      (if (primitive/code-list? f)
-          (let [n (primitive/code-count f)]
-            (if (and (= n 2)
-                     (or (mz-head? f `load)
-                         (names/ln-is? (names/ln-head-text f)
-                                       env
-                                       "coil.primitive/load"))
-                     (mz-target-symbol? (primitive/code-nth f 1) target bid))
-                true
-                (if (and (= n 3)
-                         (mz-store? f env)
-                         (mz-target-symbol? (primitive/code-nth f 1)
-                                            target
-                                            bid))
-                    (mz-local-uses-safe? (primitive/code-nth f 2)
-                                         env
-                                         target
-                                         bid)
-                    (mz-local-kids-safe? f env target bid 0 n))))
-          true)))
+;;; ---- general stack-cell migration -------------------------------------------
+;;;
+;;;   (let [… x (primitive/alloc-stack T) …] (store! x v) body…)
+;;;   -> (let [… (mut x) v …] body′…)
+;;;
+;;; A mutable local IS frame storage with an address, so a stack cell becomes one
+;;; whenever every use of the cell has a local spelling: `(load x)` is `x`, a store
+;;; is `(set! x v)`, field access `(.f x)` reads the local in place, and handing
+;;; the cell to a function or extern is `(mut x)`, which passes the local's address
+;;; as the pointer. Without an initializing store the local starts `(zeroed T)`.
+;;; Any other use (the cell as a value, in `field`/`index`, as a direct macro or
+;;; special-form operand, captured by a `fn`, inside a template) keeps the cell.
+;;;
+;;; A cell never runs Drop and a local does, so a type that owns anything keeps its
+;;; cell: one that implements Drop, holds a field or variant that does, or that
+;;; the lint cannot see into (asked of the checked program via code-type-traits).
 
-(defn mz-local-kids-safe? [(f Code)
-                           (env Code)
-                           (target Code)
-                           (bid i64)
-                           (i i64)
-                           (n i64)] (-> bool)
-  (if (>= i n)
-      true
-      (and (mz-local-uses-safe? (primitive/code-nth f i) env target bid)
-           (mz-local-kids-safe? f env target bid (+ i 1) n))))
+(defn mz-scalar-type? [(ty Code)] (-> bool)
+  (and (primitive/code-sym? ty)
+       (let [s (primitive/code-sym ty)]
+         (or (= s "bool") (= s "isize") (= s "usize")
+             (and (> (len s) 1)
+                  (let [c (cast i64 (get s 0))]
+                    (or (= c 105) (= c 117) (= c 102))))))))  ; i… u… f…
 
-(defn mz-local-tail-safe? [(f Code)
-                           (env Code)
-                           (target Code)
-                           (bid i64)
-                           (i i64)
-                           (n i64)] (-> bool)
-  (if (>= i n)
-      true
-      (and (mz-local-uses-safe? (primitive/code-nth f i) env target bid)
-           (mz-local-tail-safe? f env target bid (+ i 1) n))))
+(defn mz-traits-have? [(traits Code) (name (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (when (primitive/code-list? traits)
+      (for [i 0 (len traits)]
+        (when (and (primitive/code-sym? (get traits i))
+                   (= (primitive/code-sym (get traits i)) name))
+          (set! found true))))
+    found))
+
+;;; May a value of type `ty` (a type as type-of reports it) own something?
+;;; Unknown answers yes.
+(defn mz-owner? [(ty Code) (depth i64)] (-> bool)
+  (cond (> depth 8) true
+        (mz-scalar-type? ty) false
+        (and (primitive/code-list? ty) (> (len ty) 0)
+             (or (mz-head? ty `ptr) (mz-head? ty `slice) (mz-head? ty `fnptr)
+                 (mz-head? ty `ref) (mz-head? ty `mut)))
+          false
+        (and (mz-head? ty `array) (= (len ty) 3)) (mz-owner? (get ty 1) (+ depth 1))
+        :else
+          (let [traits (primitive/code-type-traits ty)]
+            (cond (not (primitive/code-list? traits)) true
+                  (mz-traits-have? traits "coil.core.Drop") true
+                  (mz-traits-have? traits "coil.core.Copy") false
+                  (not (primitive/code-sym? ty)) true
+                  (= (primitive/code-type-shape ty) `struct)
+                    (let [(mut owns) false]
+                      (for [i 0 (primitive/code-field-count ty)]
+                        (when (mz-owner? (primitive/code-field-qtype ty i) (+ depth 1))
+                          (set! owns true)))
+                      owns)
+                  (= (primitive/code-type-shape ty) `sum)
+                    (let [(mut owns) false]
+                      (for [v 0 (primitive/code-variant-count ty)]
+                        (for [i 0 (primitive/code-variant-fields ty v)]
+                          (when (mz-owner? (primitive/code-variant-field-type ty v i) (+ depth 1))
+                            (set! owns true))))
+                      owns)
+                  :else true))))
+
+(defn mz-special-form? [(f Code)] (-> bool)
+  (or (mz-head? f `if) (mz-head? f `do) (mz-head? f `when) (mz-head? f `unless)
+      (mz-head? f `cond) (mz-head? f `case) (mz-head? f `let) (mz-head? f `let*)
+      (mz-head? f `loop) (mz-head? f `while) (mz-head? f `for) (mz-head? f `block)
+      (mz-head? f `return-from) (mz-head? f `break) (mz-head? f `continue)
+      (mz-head? f `and) (mz-head? f `or) (mz-head? f `not) (mz-head? f `match)
+      (mz-head? f `scope) (mz-head? f `defer) (mz-head? f `set!) (mz-head? f `:)
+      (mz-head? f `quote) (mz-head? f `mut) (mz-head? f `defn) (mz-head? f `defn*)))
+
+(defn mz-field-access? [(f Code)] (-> bool)
+  (and (primitive/code-list? f) (not (primitive/code-vector? f)) (> (len f) 1)
+       (primitive/code-sym? (get f 0))
+       (let [s (primitive/code-sym (get f 0))]
+         (and (> (len s) 1) (= (cast i64 (get s 0)) 46)))))  ; `.f` / `..`
+
+;;; `f` with its children from `from` rewritten. A form none of whose children
+;;; mention the cell comes back as the original syntax, untouched, so the fix
+;;; rebuilds only the path down to each use.
+(defn mz-symbols-of [(pattern Code) (out CodeBuilder)] (-> i64)
+  (cond (primitive/code-sym? pattern) (do (primitive/code-list-push! out pattern) 0)
+        (primitive/code-list? pattern)
+          (do (for [i 0 (len pattern)] (mz-symbols-of (get pattern i) out)) 0)
+        :else 0))
+
+(defn mz-mentions-spelling? [(f Code) (name Code)] (-> bool)
+  (cond (primitive/code-sym? f) (= f name)
+        (primitive/code-list? f)
+          (let [(mut found) false]
+            (for [i 0 (len f)] (when (mz-mentions-spelling? (get f i) name) (set! found true)))
+            found)
+        :else false))
+
+;;; Does `value` mention a name that a binder at `from`, `from + 2`, … introduces?
+(defn mz-mentions-later-binder? [(value Code) (binds Code) (from i64)] (-> bool)
+  (let [names (primitive/code-list-new)
+        (mut j) from]
+    (while (< j (len binds))
+      (mz-symbols-of (get binds j) names)
+      (set! j (+ j 2)))
+    (let [done (primitive/code-list-done names)
+          (mut found) false]
+      (for [i 0 (len done)]
+        (when (mz-mentions-spelling? value (get done i)) (set! found true)))
+      found)))
+
+(defn mz-cell-rewrite-kids [(f Code) (env Code) (target Code) (bid i64)
+                            (ok (ptr bool)) (from i64) (as-call bool)] (-> Code)
+  (if (not (mz-mentions-binding? f target bid))
+      f
+      (let [out (primitive/code-list-new)]
+        (for [i 0 (len f)]
+          (let [kid (get f i)]
+            (primitive/code-list-push! out
+              (cond (< i from) kid
+                    (mz-target-symbol? kid target bid)
+                      (if as-call `(mut ~target) (do (store! ok false) kid))
+                    :else (mz-cell-rewrite kid env target bid ok)))))
+        (let [done (primitive/code-list-done out)]
+          (if (primitive/code-vector? f) `[~@done] `(~@done))))))
+
+;;; `f` with every use of the cell `target` in its local spelling; clears `ok` at
+;;; a use that has none.
+(defn mz-cell-rewrite [(f Code) (env Code) (target Code) (bid i64) (ok (ptr bool))] (-> Code)
+  (cond (mz-target-symbol? f target bid) (do (store! ok false) f)
+        (not (primitive/code-list? f)) f
+        (primitive/code-vector? f) (mz-cell-rewrite-kids f env target bid ok 0 false)
+        (or (mz-head? f `quasiquote) (mz-head? f `fn))
+          (do (when (mz-mentions-binding? f target bid) (store! ok false)) f)
+        (and (= (len f) 2)
+             (or (mz-head? f `load) (names/ln-is? (names/ln-head-text f) env "coil.primitive/load"))
+             (mz-target-symbol? (get f 1) target bid))
+          target
+        (and (mz-store? f env) (mz-target-symbol? (get f 1) target bid))
+          `(set! ~target ~(mz-cell-rewrite (get f 2) env target bid ok))
+        (and (mz-field-access? f) (mz-target-symbol? (get f 1) target bid))
+          (mz-cell-rewrite-kids f env target bid ok 2 false)
+        (or (mz-head? f `field) (mz-head? f `index)
+            (names/ln-is? (names/ln-head-text f) env "coil.primitive/field")
+            (names/ln-is? (names/ln-head-text f) env "coil.primitive/index"))
+          (mz-cell-rewrite-kids f env target bid ok 1 false)
+        (or (primitive/code-macro-call? f) (mz-special-form? f)
+            (not (primitive/code-sym? (get f 0))))
+          (mz-cell-rewrite-kids f env target bid ok 0 false)
+        ; A function or extern parameter takes `(mut x)` as the pointer; so does
+        ; `cast`. `call-ptr`, a constructor, a trait method, a macro (a `defn`
+        ; returning Code, whose expansion decides what the operand becomes) or
+        ; anything the checker did not resolve does not, so the cell stays.
+        :else
+          (let [d (primitive/code-decl f)
+                kind (if (primitive/code-list? d) (primitive/code-sym (get d 2)) "")
+                qname (if (primitive/code-list? d) (primitive/code-sym (get d 3)) "")
+                macro (and (= kind "fn") (> (len d) 5) (= (get d 5) `code))]
+            (mz-cell-rewrite-kids f env target bid ok 1
+                                  (or (and (= kind "fn") (not macro)) (= kind "extern")
+                                      (= qname "coil.primitive.cast"))))))
+
+;;; The migration of the let `f` whose binding `bi` is a stack cell, or `_`.
+(defn mz-migrate-cell [(f Code) (env Code) (binds Code) (bi i64)] (-> Code)
+  (let [target (get binds bi)
+        bid (primitive/binding-of target)
+        alloc (get binds (+ bi 1))
+        cell-type (primitive/type-of alloc)]
+    (if (or (not (mz-head? cell-type `ptr)) (mz-owner? (get cell-type 1) 0)
+            (not (primitive/code-sym? target)))
+        `_
+        (let [elem-type (get cell-type 1)
+              written (get alloc 1)
+              first (get f 2)
+              ; the store's value becomes the cell's binding, so it may not read
+              ; the cell, nor a name bound after the cell in this let
+              initialized (and (mz-store? first env)
+                               (mz-target-symbol? (get first 1) target bid)
+                               (not (mz-mentions-binding? (get first 2) target bid))
+                               (not (mz-mentions-later-binder? (get first 2) binds (+ bi 2))))
+              value (if initialized (get first 2) `_)
+              init (cond (not initialized) `(zeroed ~written)
+                         (= (primitive/type-of value) elem-type) value
+                         :else `(: ~value ~written))
+              (mut ok) true
+              out-binds (primitive/code-list-new)]
+          (for [i 0 (len binds)]
+            (primitive/code-list-push! out-binds
+              (cond (= i bi) `(mut ~target)
+                    (= i (+ bi 1)) init
+                    (and (> i (+ bi 1)) (= (% (- i bi) 2) 1))
+                      (mz-cell-rewrite (get binds i) env target bid (mut ok))
+                    :else (get binds i))))
+          (let [body (primitive/code-list-new)]
+            (for [i (if initialized 3 2) (len f)]
+              (primitive/code-list-push! body (mz-cell-rewrite (get f i) env target bid (mut ok))))
+            (if ok
+                `(~(get f 0) [~@(primitive/code-list-done out-binds)]
+                  ~@(primitive/code-list-done body))
+                `_))))))
 
 (defn mz-stack-binding-index [(binds Code) (env Code) (i i64) (n i64)] (-> i64)
   (if (>= (+ i 1) n)
@@ -432,30 +577,6 @@
                (mz-stack-call? (primitive/code-nth binds (+ i 1)) env))
           i
           (mz-stack-binding-index binds env (+ i 2) n))))
-
-(defn mz-rewritten-binds [(binds Code) (replace i64) (value Code)] (-> Code)
-  (let [out (primitive/code-list-new)
-        (mut i) 0
-        n (primitive/code-count binds)]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (if (= (load i) replace)
-                    (do
-                      (primitive/code-list-push! out
-                                                 `(mut ~(primitive/code-nth binds
-                                                                            (load i))))
-                      (primitive/code-list-push! out value))
-                    (do
-                      (primitive/code-list-push! out
-                                                 (primitive/code-nth binds
-                                                                     (load i)))
-                      (primitive/code-list-push! out
-                                                 (primitive/code-nth binds
-                                                                     (+ (load i)
-                                                                        1)))))
-                (store! i (+ (load i) 2)))))
-    (primitive/code-list-done out)))
 
 (defn mz-walk [(f Code) (env Code) (impl-form Code)] (-> i64)
   (let [in-impl (mz-head? impl-form `impl)
@@ -477,52 +598,23 @@
         ; macro itself so the allocation and its initializing store can be
         ; replaced transactionally as one expression.
         (if (and (or (mz-head? f `let) (mz-head? f `let*))
-                 (>= (primitive/code-count f) 4))
+                 (>= (primitive/code-count f) 3))
             (let [binds (primitive/code-nth f 1)]
               (if (primitive/code-vector? binds)
                   (let [bi
                           (mz-stack-binding-index binds
                                                   env
                                                   0
-                                                  (primitive/code-count binds))
-                        first (primitive/code-nth f 2)]
+                                                  (primitive/code-count binds))]
                     (if (>= bi 0)
-                        (let [target (primitive/code-nth binds bi)
-                              bid (primitive/binding-of target)]
-                          (if (mz-store? first env)
-                              (let [value (primitive/code-nth first 2)]
-                                (if (and (primitive/code-sym? (primitive/code-nth first
-                                                                                  1))
-                                         (and (or (= (primitive/binding-of (primitive/code-nth first
-                                                                                               1))
-                                                     bid)
-                                                  (primitive/code-eq (primitive/code-nth first
-                                                                                         1)
-                                                                     target))
-                                              (and (not (mz-head? (primitive/type-of value)
-                                                                  `ptr))
-                                                   (and (primitive/code-int? value)
-                                                        (and (not (mz-mentions-binding? value
-                                                                                        target
-                                                                                        bid))
-                                                             (mz-local-tail-safe? f
-                                                                                  env
-                                                                                  target
-                                                                                  bid
-                                                                                  3
-                                                                                  (primitive/code-count f)))))))
-                                    (do
-                                      (primitive/suggest f
-                                                         "initialized stack storage is a mutable local"
-                                                         `(let [~@(mz-rewritten-binds binds
-                                                                                      bi
-                                                                                      value)]
-                                                            ~@(mz-code-tail f
-                                                                            3
-                                                                            (primitive/code-count f))))
-                                      true)
-                                    false))
-                              false))
+                        (let [replacement (mz-migrate-cell f env binds bi)]
+                          (if (= replacement `_)
+                              false
+                              (do
+                                (primitive/suggest f
+                                                   "a stack cell whose every use has a local spelling is a mutable local"
+                                                   replacement)
+                                true)))
                         false))
                   false))
             false)]
