@@ -101,10 +101,9 @@ already is a precise, type-aware reachability analysis — seeding it from roots
 references) would let it drop dead code before codegen instead of after. Two latent gaps
 have to close first, both harmless while everything is seeded: `EFnPtrOf` (`mono.coil:711`)
 never queues its target, and `EMakeDyn` (`mono.coil:733`) ignores its `methods` list, which
-is exactly the vtable contents. The wasm collector `wcollect-expr!`
-(`codegen_wasm.coil:492`) has the same `EMakeDyn` omission today, which is an independent
-wasm+`dyn` bug. Binary size would not change — only compile time. Expect a whole-corpus
-snapshot re-bless.
+is exactly the vtable contents. (The direct wasm backend's own reachability walk,
+`wcollect-expr!`, follows vtables, cleanups and static initializers.) Binary size would
+not change — only compile time. Expect a whole-corpus snapshot re-bless.
 
 ### 2.3 Windows
 
