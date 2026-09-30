@@ -574,6 +574,27 @@ printf '(defn no-write [] (-> i64) 1)\n' | "$COIL" fmt --write - >/dev/null 2>&1
 [ "$?" = 2 ] && ok "fmt --write rejects standard input" \
   || bad "fmt --write rejects standard input" "wrong exit status"
 
+# A comment right after `(` used to be laid out as the list's head, with the real
+# head written after it on the comment's line: `(; note if (= x 1) …` commented
+# the `if` out. It now moves in front of the list. A comment between a binding and
+# its value used to end the pair, so the value was paired with the next name.
+printf '(module fmtcomments)\n(defn main [] (-> i64)\n  (let [x 1\n        v\n        ; between name and value\n        [1 2]\n        w [; inside\n           3]]\n    (; before the head\n     if (= x 1) (+ x (get v 1) (get w 0)) 0)))\n' \
+  > "$T/fmt-comments.coil"
+"$COIL" fmt --write "$T/fmt-comments.coil" >/dev/null 2>&1
+expect_rc 6 "fmt keeps a list whose first child is a comment a program" \
+  "$COIL" run "$T/fmt-comments.coil"
+expect_rc 0 "fmt of leading and between-binding comments is idempotent" \
+  "$COIL" fmt --check "$T/fmt-comments.coil"
+fmt_comments=$(cat "$T/fmt-comments.coil")
+case "$fmt_comments" in
+  *"; before the head"*"(if (= x 1)"*) ok "fmt moves a comment after ( in front of the list" ;;
+  *) bad "fmt moves a comment after ( in front of the list" "$fmt_comments" ;;
+esac
+case "$fmt_comments" in
+  *"v"*"; between name and value"*"[1 2]"*"w"*) ok "fmt keeps a comment between a binding and its value in that binding" ;;
+  *) bad "fmt keeps a comment between a binding and its value" "$fmt_comments" ;;
+esac
+
 printf '(defn width [] (-> bool) (or (= 1 1) (= 2 2) (= 3 3) (= 4 4) (= 5 5)))\n' \
   | "$COIL" fmt --width 40 - > "$T/fmt-width.got"
 grep -q '^      (= 2 2)$' "$T/fmt-width.got" \
