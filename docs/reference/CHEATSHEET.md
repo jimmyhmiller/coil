@@ -99,7 +99,7 @@ one (pass `(mut place)`), and `(p (ptr Point))` a raw pointer.
 - A file that is imported starts with `(module name)`. Imports name modules, not
   paths.
 - `main` returns an `i64` exit status.
-- `f64` has no `=`; use `primitive/fcmp-eq` for IEEE equality.
+- Float `=` is IEEE equality, so a NaN is not `=` to itself.
 - `if` needs both branches, of the same type, when its value is used.
 - `primitive/…` needs `(import "coil.primitive" :as primitive)`.
 - `call` and `block` are reserved names.
