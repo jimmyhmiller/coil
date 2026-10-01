@@ -1180,6 +1180,21 @@ Checkers run after type checking, so they can ask what the compiler decided:
   shadowed names.
 - `(primitive/code-doc node)` is a definition's `;;;` documentation.
 
+Dependency queries in `coil.meta` read the same checked model, including earlier
+accepted definitions in a JIT session. `(meta/dependencies NAME)` and
+`(meta/dependents NAME)` return direct edges; `(meta/dependency-closure NAME)` and
+`(meta/dependent-closure NAME)` follow all reachable edges. Pass a fully qualified
+Code symbol (for example, `` `myapp.math.add ``) or a checked reference node. The
+result is a sorted Code list of fully qualified declaration names, or
+`:unresolved` when the declaration/model is unavailable. Cycles terminate and
+closure results exclude the queried declaration itself. In a partial model,
+answers describe the dependencies the compiler could establish.
+
+Edges describe declaration use: calls, function pointers, generic templates,
+nominal types (including nested fields), traits, aliases, constants, globals,
+and macro expansion. They report dependencies, not whether a particular edit
+requires recompilation. The queries never compile, replace, or retire code.
+
 ### A transform
 
 This transform defines a tiny dialect: `(inc e)` means `(+ e 1)`. It rebuilds only
