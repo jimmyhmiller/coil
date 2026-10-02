@@ -479,14 +479,29 @@ static char **host_vector(uint64_t offset) {
     for (size_t i = 0; i < count; ++i) result[i] = hoststr(hdr_size_get(offset + i * 8));
     return result;
 }
+// A NULL guest envp means "I have no environment to hand over", which is not the
+// same thing as an empty environment — and in this host it is the normal case. The
+// portable compiler's `main` (src/compiler/main_wasm.coil) cannot publish one the
+// way the native `main`s do: wasm has no third argument to main, and `getenv` is a
+// lookup, not an enumeration, so the guest's `os/spawn-envp` is always NULL here.
+// Marshalling that NULL gave every child a CLEARED environment. Apple's cc finds
+// `ld` without consulting PATH, so the macOS seed verification never noticed; GNU
+// cc's collect2 does consult it, so linking a native stage1 on Linux died with
+// `collect2: fatal error: cannot find 'ld'`. The guest already sees this process's
+// environment through the `getenv` bridge, so this host is the one that can answer
+// the question: give the child our own. A guest that really wants an empty child
+// environment passes a vector whose first entry is NULL, which is not offset 0.
+extern char **environ;
 uint32_t env_posix_spawnp(uint64_t pid_out, uint64_t path, uint64_t actions,
                          uint64_t attributes, uint64_t argv, uint64_t envp) {
     // Opaque native spawn attributes cannot be represented as guest offsets.
     if (actions || attributes) return ENOTSUP;
-    char **args = host_vector(argv), **environment = host_vector(envp);
-    if (!args || !environment) { free(args); free(environment); return ENOMEM; }
+    char **args = host_vector(argv);
+    char **environment = envp ? host_vector(envp) : NULL;
+    if (!args || (envp && !environment)) { free(args); free(environment); return ENOMEM; }
     pid_t pid;
-    int result = posix_spawnp(&pid, hoststr(path), NULL, NULL, args, environment);
+    int result = posix_spawnp(&pid, hoststr(path), NULL, NULL, args,
+                              environment ? environment : environ);
     if (!result) { int32_t value = (int32_t)pid; memcpy(MEM + pid_out, &value, 4); }
     free(args); free(environment);
     return (uint32_t)result;
