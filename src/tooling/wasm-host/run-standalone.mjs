@@ -43,6 +43,11 @@ function malloc(n) {
   return p;
 }
 function strlen(p) { const m = mem(); let i = Number(p); while (m[i] !== 0) i++; return BigInt(i - Number(p)); }
+let errnoPtr = 0n;
+function errnoCell() {
+  if (errnoPtr === 0n) errnoPtr = malloc(4n);
+  return errnoPtr;
+}
 
 const libm = {};
 for (const [name, f] of Object.entries({
@@ -67,12 +72,20 @@ for (const [name, f] of Object.entries({
 
 const known = {
   ...libm,
+  __error: errnoCell,
   host_add: (a, b) => a + b,
   host_sub: (a, b) => a - b,
   write: (fd, p, n) => {
+    if (Number(fd) < 0) {
+      dv().setInt32(Number(errnoCell()), 9, true); // EBADF, before Node's range validation.
+      return -1n;
+    }
     const bytes = mem().slice(Number(p), Number(p) + Number(n));
-    fs.writeSync(Number(fd) === 2 ? 2 : 1, bytes);
-    return BigInt(n);
+    try { return BigInt(fs.writeSync(Number(fd), bytes)); }
+    catch (e) {
+      dv().setInt32(Number(errnoCell()), Math.abs(e.errno) || 5, true);
+      return -1n;
+    }
   },
   putchar: (c) => { fs.writeSync(1, Uint8Array.of(Number(c) & 255)); return c; },
   puts: (p) => { fs.writeSync(1, mem().slice(Number(p), Number(p) + Number(strlen(p)))); fs.writeSync(1, '\n'); return 0; },

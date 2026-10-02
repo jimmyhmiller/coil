@@ -160,6 +160,9 @@ static uint64_t rt_realloc(uint64_t ptr, uint64_t size) {
 // each real conversion to host snprintf (byte-identical to native libc); %s
 // reads its string straight out of linear memory.
 // ---------------------------------------------------------------------------
+#include "errno_bridge.h"
+uint64_t env___error(void) { return guest_errno_address(); }
+
 static size_t fmt_one(char *out, size_t cap, const char *fmt, uint64_t arg) {
     size_t o = 0;
     int used = 0;
@@ -532,6 +535,8 @@ int main(int argc, char **argv) {
 
     g_cap = *wasm___heap_base;                   // initial memory ends at heap_base
     g_brk = *wasm___heap_base;                   // heap grows upward from there
+    wasm_host_call_enter = guest_errno_enter;
+    wasm_host_call_leave = guest_errno_leave;
 
     // argv = ["coil", user args...] laid out in linear memory as an array of
     // i64 offsets to NUL-terminated strings.

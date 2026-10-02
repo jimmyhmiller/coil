@@ -13,5 +13,14 @@ with tempfile.TemporaryDirectory(prefix="coil-bootstrap-runtime-") as directory:
                     "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                     str(ROOT / "tests/bootstrap/runtime_test.c"), "-lm", "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True, env=os.environ | {"ASAN_OPTIONS": "detect_leaks=0"})
+    for width in (32, 64):
+        binary = Path(directory) / f"errno-{width}"
+        subprocess.run([os.environ.get("CC", "cc"), "-O1", "-g",
+                        "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+                        *(["-DTEST_WASM32"] if width == 32 else []),
+                        str(ROOT / "tests/bootstrap/errno_runtime_test.c"),
+                        "-lm", "-o", str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
 # The committed wasm64 seed's imports against runtime.c, names and exact types.
 subprocess.run([sys.executable, str(ROOT / "scripts/tests/bootstrap-imports.py")], check=True)
+subprocess.run([sys.executable, str(ROOT / "scripts/tests/wasm2c-import-hooks.py")], check=True)

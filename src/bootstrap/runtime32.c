@@ -150,6 +150,9 @@ static uint64_t rt_realloc(uint64_t ptr, uint64_t size) {
 // ---------------------------------------------------------------------------
 // printf family (one variadic arg; identical to runtime.c).
 // ---------------------------------------------------------------------------
+#include "errno_bridge.h"
+uint32_t env___error(void) { return (uint32_t)guest_errno_address(); }
+
 static size_t fmt_one(char *out, size_t cap, const char *fmt, uint64_t arg) {
     size_t o = 0;
     int used = 0;
@@ -523,6 +526,8 @@ int main(int argc, char **argv) {
 
     g_cap = *wasm___heap_base;                   // initial memory ends at heap_base
     g_brk = *wasm___heap_base;
+    wasm_host_call_enter = guest_errno_enter;
+    wasm_host_call_leave = guest_errno_leave;
 
     // argv = ["coil", user args...] as an array of i32 offsets to NUL strings.
     uint32_t *offs = malloc(sizeof(uint32_t) * (size_t)argc);

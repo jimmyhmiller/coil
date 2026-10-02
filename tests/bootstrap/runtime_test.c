@@ -4,6 +4,8 @@
 #undef main
 
 static uint8_t *test_memory;
+void (*wasm_host_call_enter)(void);
+void (*wasm_host_call_leave)(void);
 static const uint64_t test_heap_base = 65536;
 uint8_t **const wasm_memory = &test_memory;
 const uint64_t *const wasm___heap_base = &test_heap_base;
@@ -24,6 +26,19 @@ static uint64_t guest_vector(const uint64_t *items, size_t count) {
 }
 int main(void) {
     wasm_init(); g_brk = g_cap = test_heap_base;
+    errno = EACCES;
+    uint64_t errno_cell = env___error();
+    int32_t errno_value;
+    memcpy(&errno_value, MEM + errno_cell, sizeof errno_value);
+    assert(errno_value == EACCES);
+    errno_value = 0;
+    memcpy(MEM + errno_cell, &errno_value, sizeof errno_value);
+    guest_errno_enter();
+    assert(errno == 0);
+    errno = ENOENT;
+    guest_errno_leave();
+    memcpy(&errno_value, MEM + errno_cell, sizeof errno_value);
+    assert(errno_value == ENOENT && env___error() == errno_cell);
     uint64_t out = rt_malloc(8);
     hdr_size_set(out, 123);
     assert(env_posix_memalign(out, 3, 100) == EINVAL);

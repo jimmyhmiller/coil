@@ -1484,6 +1484,11 @@ def test_wasm(compiler: str) -> None:
     if not shutil.which("node") or not shutil.which("wasm-tools"):
         print("wasm gate: SKIP (requires node and wasm-tools)")
         return
+    with tempfile.TemporaryDirectory(prefix="coil-wasm-errno-") as directory:
+        errno_module = str(Path(directory) / "errno.wasm")
+        execute(compiler, "build", "tests/bootstrap/errno.coil", "--backend", "wasm",
+                "--target", "wasm64-unknown-unknown", "-o", errno_module)
+        execute("node", "src/tooling/wasm-host/run-standalone.mjs", errno_module)
     wasm = "/tmp/gate-wasm-coilc.wasm"
     execute(compiler, "build", "src/compiler/main_wasm.coil", "--target", "wasm64-unknown-unknown",
             "--wasm-stack-size=64", "-o", wasm)

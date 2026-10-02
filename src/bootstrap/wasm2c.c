@@ -362,11 +362,11 @@ int main(int argc, char **argv) {
 
     struct FuncType *types;
     uint32_t max_param_len = 0;
-    (void)InputStream_skipToSection(&in, WasmSectionId_type);
     {
-        uint32_t len = InputStream_readLeb128_u32(&in);
+        uint32_t len = InputStream_skipToSection(&in, WasmSectionId_type)
+                     ? InputStream_readLeb128_u32(&in) : 0;
         types = malloc(sizeof(struct FuncType) * len);
-        if (types == NULL) panic("out of memory");
+        if (types == NULL && len != 0) panic("out of memory");
         for (uint32_t i = 0; i < len; i += 1) {
             if (InputStream_readByte(&in) != 0x60) panic("expected functype");
             types[i].param = InputStream_readResultType(&in);
@@ -375,16 +375,20 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Optional host-boundary hooks let runtimes synchronize guest-visible
+    // state (such as errno) around every direct or indirect imported call.
+    fputs("void (*wasm_host_call_enter)(void) = NULL;\n"
+          "void (*wasm_host_call_leave)(void) = NULL;\n\n", out);
     struct Import {
         const char *mod;
         const char *name;
         uint32_t type_idx;
     } *imports;
-    (void)InputStream_skipToSection(&in, WasmSectionId_import);
-    uint32_t imports_len = InputStream_readLeb128_u32(&in);
+    uint32_t imports_len = InputStream_skipToSection(&in, WasmSectionId_import)
+                        ? InputStream_readLeb128_u32(&in) : 0;
     {
         imports = malloc(sizeof(struct Import) * imports_len);
-        if (imports == NULL) panic("out of memory");
+        if (imports == NULL && imports_len != 0) panic("out of memory");
         for (uint32_t i = 0; i < imports_len; i += 1) {
             imports[i].mod = InputStream_readName(&in);
             imports[i].name = InputStream_readName(&in);
@@ -404,6 +408,25 @@ int main(int argc, char **argv) {
                         fputs(WasmValType_toC(func_type->param->types[param_i]), out);
                     }
                     fputs(");\n", out);
+                    fputs("static ", out);
+                    fputs(func_type->result->len ? WasmValType_toC(func_type->result->types[0]) : "void", out);
+                    fprintf(out, " import_%" PRIu32 "(", i);
+                    if (func_type->param->len == 0) fputs("void", out);
+                    for (uint32_t j = 0; j < func_type->param->len; j++) {
+                        if (j) fputs(", ", out);
+                        fprintf(out, "%s p%" PRIu32, WasmValType_toC(func_type->param->types[j]), j);
+                    }
+                    fputs(") {\n    if (wasm_host_call_enter) wasm_host_call_enter();\n    ", out);
+                    if (func_type->result->len)
+                        fprintf(out, "%s result = ", WasmValType_toC(func_type->result->types[0]));
+                    fprintf(out, "%s_%s(", imports[i].mod, imports[i].name);
+                    for (uint32_t j = 0; j < func_type->param->len; j++) {
+                        if (j) fputs(", ", out);
+                        fprintf(out, "p%" PRIu32, j);
+                    }
+                    fputs(");\n    if (wasm_host_call_leave) wasm_host_call_leave();\n", out);
+                    if (func_type->result->len) fputs("    return result;\n", out);
+                    fputs("}\n", out);
                     break;
                 }
 
@@ -420,11 +443,11 @@ int main(int argc, char **argv) {
     struct Func {
         uint32_t type_idx;
     } *funcs;
-    (void)InputStream_skipToSection(&in, WasmSectionId_func);
     {
-        uint32_t len = InputStream_readLeb128_u32(&in);
+        uint32_t len = InputStream_skipToSection(&in, WasmSectionId_func)
+                     ? InputStream_readLeb128_u32(&in) : 0;
         funcs = malloc(sizeof(struct Func) * len);
-        if (funcs == NULL) panic("out of memory");
+        if (funcs == NULL && len != 0) panic("out of memory");
         for (uint32_t i = 0; i < len; i += 1) {
             funcs[i].type_idx = InputStream_readLeb128_u32(&in);
             const struct FuncType *func_type = &types[funcs[i].type_idx];
@@ -449,11 +472,11 @@ int main(int argc, char **argv) {
         int8_t type;
         struct Limits limits;
     } *tables;
-    (void)InputStream_skipToSection(&in, WasmSectionId_table);
     {
-        uint32_t len = InputStream_readLeb128_u32(&in);
+        uint32_t len = InputStream_skipToSection(&in, WasmSectionId_table)
+                     ? InputStream_readLeb128_u32(&in) : 0;
         tables = malloc(sizeof(struct Table) * len);
-        if (tables == NULL) panic("out of memory");
+        if (tables == NULL && len != 0) panic("out of memory");
         for (uint32_t i = 0; i < len; i += 1) {
             int64_t ref_type = InputStream_readLeb128_i64(&in);
             switch (ref_type) {
@@ -481,11 +504,11 @@ int main(int argc, char **argv) {
     struct Mem {
         struct Limits limits;
     } *mems;
-    (void)InputStream_skipToSection(&in, WasmSectionId_mem);
-    uint32_t mems_len = InputStream_readLeb128_u32(&in);
+    uint32_t mems_len = InputStream_skipToSection(&in, WasmSectionId_mem)
+                        ? InputStream_readLeb128_u32(&in) : 0;
     {
         mems = malloc(sizeof(struct Mem) * mems_len);
-        if (mems == NULL) panic("out of memory");
+        if (mems == NULL && mems_len != 0) panic("out of memory");
         for (uint32_t i = 0; i < mems_len; i += 1) {
             mems[i].limits = InputStream_readLimits(&in);
             fprintf(out, "static uint8_t *m%" PRIu32 ";\n"
@@ -499,11 +522,11 @@ int main(int argc, char **argv) {
         bool mut;
         int8_t val_type;
     } *globals;
-    (void)InputStream_skipToSection(&in, WasmSectionId_global);
     {
-        uint32_t len = InputStream_readLeb128_u32(&in);
+        uint32_t len = InputStream_skipToSection(&in, WasmSectionId_global)
+                     ? InputStream_readLeb128_u32(&in) : 0;
         globals = malloc(sizeof(struct Global) * len);
-        if (globals == NULL) panic("out of memory");
+        if (globals == NULL && len != 0) panic("out of memory");
         for (uint32_t i = 0; i < len; i += 1) {
             int64_t val_type = InputStream_readLeb128_i64(&in);
             enum WasmMut mut = InputStream_readByte(&in);
@@ -516,9 +539,9 @@ int main(int argc, char **argv) {
         fputc('\n', out);
     }
 
-    (void)InputStream_skipToSection(&in, WasmSectionId_export);
     {
-        uint32_t len = InputStream_readLeb128_u32(&in);
+        uint32_t len = InputStream_skipToSection(&in, WasmSectionId_export)
+                     ? InputStream_readLeb128_u32(&in) : 0;
         for (uint32_t i = 0; i < len; i += 1) {
             char *name = InputStream_readName(&in);
             uint8_t kind = InputStream_readByte(&in);
@@ -574,9 +597,9 @@ int main(int argc, char **argv) {
         fputc('\n', out);
     }
 
-    (void)InputStream_skipToSection(&in, WasmSectionId_elem);
     {
-        uint32_t len = InputStream_readLeb128_u32(&in);
+        uint32_t len = InputStream_skipToSection(&in, WasmSectionId_elem)
+                     ? InputStream_readLeb128_u32(&in) : 0;
         fputs("static void init_elem(void) {\n", out);
         for (uint32_t segment_i = 0; segment_i < len; segment_i += 1) {
             uint32_t table_idx = 0;
@@ -589,7 +612,7 @@ int main(int argc, char **argv) {
                 fprintf(out, "    t%" PRIu32 "[UINT32_C(%" PRIu32 ")] = (void (*)(void))&",
                         table_idx, offset + i);
                 if (func_id < imports_len)
-                    fprintf(out, "%s_%s", imports[func_id].mod, imports[func_id].name);
+                    fprintf(out, "import_%" PRIu32, func_id);
                 else
                     fprintf(out, "f%" PRIu32, func_id - imports_len);
                 fputs(";\n", out);
@@ -598,14 +621,14 @@ int main(int argc, char **argv) {
         fputs("}\n\n", out);
     }
 
-    (void)InputStream_skipToSection(&in, WasmSectionId_code);
+    bool has_code = InputStream_skipToSection(&in, WasmSectionId_code);
     {
         struct FuncGen fg;
         FuncGen_init(&fg);
         bool *param_used = malloc(sizeof(bool) * max_param_len);
         uint32_t *param_stash = malloc(sizeof(uint32_t) * max_param_len);
 
-        uint32_t len = InputStream_readLeb128_u32(&in);
+        uint32_t len = has_code ? InputStream_readLeb128_u32(&in) : 0;
         for (uint32_t func_i = 0; func_i < len; func_i += 1) {
             FuncGen_reset(&fg);
 
@@ -1051,7 +1074,7 @@ int main(int argc, char **argv) {
                             switch (opcode) {
                                 case WasmOpcode_call:
                                     if (func_id < imports_len)
-                                        fprintf(out, "%s_%s", imports[func_id].mod, imports[func_id].name);
+                                        fprintf(out, "import_%" PRIu32, func_id);
                                     else
                                         fprintf(out, "f%" PRIu32, func_id - imports_len);
                                     break;
@@ -2289,9 +2312,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    (void)InputStream_skipToSection(&in, WasmSectionId_data);
     {
-        uint32_t len = InputStream_readLeb128_u32(&in);
+        uint32_t len = InputStream_skipToSection(&in, WasmSectionId_data)
+                     ? InputStream_readLeb128_u32(&in) : 0;
         fputs("static void init_data(void) {\n", out);
         for (uint32_t i = 0; i < mems_len; i += 1)
             fprintf(out, "    p%" PRIu32 " = UINT32_C(%" PRIu32 ");\n"

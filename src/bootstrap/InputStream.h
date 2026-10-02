@@ -146,8 +146,17 @@ static void InputStream_skipBytes(struct InputStream *self, size_t len) {
 }
 
 static uint32_t InputStream_skipToSection(struct InputStream *self, uint8_t expected_id) {
+    fpos_t original;
+    if (fgetpos(self->stream, &original) != 0) panic("unable to save section position");
     while (true) {
-        uint8_t id = InputStream_readByte(self);
+        int id = fgetc(self->stream);
+        if (id == EOF) {
+            if (ferror(self->stream)) panic("unable to read section");
+            // Sections are optional. Preserve the next section for a later
+            // lookup instead of consuming it when this section is absent.
+            if (fsetpos(self->stream, &original) != 0) panic("unable to restore section position");
+            return 0;
+        }
         uint32_t size = InputStream_readLeb128_u32(self);
         if (id == expected_id) return size;
         InputStream_skipBytes(self, size);
