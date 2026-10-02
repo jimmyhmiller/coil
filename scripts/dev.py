@@ -1336,6 +1336,7 @@ source-roots = ["src"]
             lambda: build_run("tests/compiler/features/void_match_discarded.coil", "void-match-discarded"),
             lambda: build_run("tests/compiler/features/meta_dependencies.coil", "meta-dependencies", want=14),
             lambda: build_run("tests/compiler/features/meta_resolve_at.coil", "meta-resolve-at", want=17),
+            lambda: build_run("tests/compiler/features/meta_provenance.coil", "meta-provenance", want=22),
             lambda: build_run("tests/compiler/features/meta_semantic_transform_partial_model.coil",
                               "meta-semantic-transform-partial-model", want=42),
             lambda: build_run("tests/compiler/features/mutable_binding_fresh_value.coil",

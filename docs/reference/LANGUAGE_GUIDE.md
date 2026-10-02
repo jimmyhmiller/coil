@@ -1191,6 +1191,14 @@ Checkers run after type checking, so they can ask what the compiler decided:
   compiler did not resolve (a macro call; ask at an argument instead). Ask it
   before a fix inserts a name: a local `len`, or a module's own `len`, would
   otherwise capture the call.
+- `(primitive/code-alias-of ref)` is the `defalias` a reference went through,
+  as a qualified symbol, or `:none` when it names its declaration directly or a
+  local (`code-decl` gives the declaration the alias leads to). Pass a symbol or a
+  whole call; `:unknown` means the compiler did not resolve that node.
+- `(primitive/code-macro-of node)` is the macro whose expansion produced the node,
+  as a qualified symbol, or `:none` when it was written by hand (`code-macro?` is
+  false). A macro's own quasiquoted template is hand-written; the forms its
+  expansion produces at a call site are not.
 - `(primitive/code-doc node)` is a definition's `;;;` documentation.
 
 Dependency queries in `coil.meta` read the same checked model, including earlier
