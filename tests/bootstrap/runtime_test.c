@@ -100,6 +100,20 @@ int main(void) {
     memcpy(&result, MEM + status, 4);
     assert(WIFEXITED(result) && WEXITSTATUS(result) == 7);
     assert(env_posix_spawnp(pid_out, guest_string("/nonexistent/coil-test"), 0, 0, argv, envp) == ENOENT);
+
+    // A NULL guest envp is "I have no environment to hand over" — which is what the
+    // portable compiler's `main` always says, since wasm gives it no envp argument.
+    // The child gets THIS process's environment rather than an empty one: without
+    // PATH, GNU cc's collect2 cannot find `ld`, and the seed could not link.
+    setenv("COIL_BOOTSTRAP_HOST_ENV", "inherited", 1);
+    uint64_t host_args[] = {guest_string("sh"), guest_string("-c"),
+        guest_string("test \"$COIL_BOOTSTRAP_HOST_ENV\" = inherited || exit 9; exit 6")};
+    uint64_t host_argv = guest_vector(host_args, 3);
+    assert(env_posix_spawnp(pid_out, host_args[0], 0, 0, host_argv, 0) == 0);
+    memcpy(&pid, MEM + pid_out, 4);
+    assert((int32_t)env_waitpid((uint32_t)pid, status, 0) == pid);
+    memcpy(&result, MEM + status, 4);
+    assert(WIFEXITED(result) && WEXITSTATUS(result) == 6);
     assert(env_dladdr(123, out) == 0);
     free(test_memory);
     puts("bootstrap runtime: aligned reuse, relocation, environment, directory I/O, and process marshalling passed");
