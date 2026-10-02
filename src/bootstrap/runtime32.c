@@ -472,14 +472,20 @@ static char **host_vector(uint32_t offset) {
     for (size_t i = 0; i < count; ++i) { memcpy(&item, MEM + offset + i * 4, 4); result[i] = hoststr(item); }
     return result;
 }
+// A NULL guest envp is "no environment to hand over", not an empty one; see the
+// same import in runtime.c for why the guest never has one and what a cleared
+// child environment breaks.
+extern char **environ;
 uint32_t env_posix_spawnp(uint32_t pid_out, uint32_t path, uint32_t actions,
                           uint32_t attributes, uint32_t argv, uint32_t envp) {
     // Opaque native spawn attributes cannot be represented as guest offsets.
     if (actions || attributes) return ENOTSUP;
-    char **args = host_vector(argv), **environment = host_vector(envp);
-    if (!args || !environment) { free(args); free(environment); return ENOMEM; }
+    char **args = host_vector(argv);
+    char **environment = envp ? host_vector(envp) : NULL;
+    if (!args || (envp && !environment)) { free(args); free(environment); return ENOMEM; }
     pid_t pid;
-    int result = posix_spawnp(&pid, hoststr(path), NULL, NULL, args, environment);
+    int result = posix_spawnp(&pid, hoststr(path), NULL, NULL, args,
+                              environment ? environment : environ);
     if (!result) { int32_t value = (int32_t)pid; memcpy(MEM + pid_out, &value, 4); }
     free(args); free(environment);
     return (uint32_t)result;
