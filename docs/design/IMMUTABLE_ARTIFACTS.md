@@ -390,6 +390,25 @@ bodies (a changed macro stales everything it expanded, which needs expansion rea
 recorded), constants that mention constants, impl availability, and negative
 lookups (a new definition that changes what an old name resolves to).
 
+**Widened (2026-10-02).** "Changed" now covers every kind of declaration, and it
+is closed under what carries a change. A struct or sum holding a changed type by
+value has a new layout. A function passing or returning one by value has a new
+interface. A constant reading a changed one may have a new value. An alias
+naming a changed name changes with it. A stale macro, generic or `:inline`
+function changes what its expansion sites compiled. These are followed to a
+fixpoint over the reverse index, so `(.x (.p (.q q)))` two structs away is found.
+
+New edits that enter "changed": a redefined `const` or `def` (which a checked
+session may now redefine at all), a macro's, generic's or inlined function's
+body (compared as forms, spans aside), a re-targeted alias, a retired alias or
+trait, and a function retired without a replacement, impl methods included.
+
+Fixing `def` identity was part of it. A runtime `def`'s checked value had no node
+id, so every `def` looked like the accepted one and none was ever recorded as a
+reader. `jit_env_stale_complete.coil` lists the exact expected set for each kind
+of edit. Still not covered: negative lookups, meaning a new definition or impl
+that changes what an old name or dispatch resolves to.
+
 ### Release verification (2026-09-20)
 
 `python3 scripts/dev.py build full` passes — stage1, stage2, LLVM fixed point on
