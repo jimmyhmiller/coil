@@ -12,6 +12,9 @@
 # stage0 is chosen automatically:
 #   1. $STAGE0 if you set it explicitly
 #   2. bootstrap/seeds/native/coil-seed-linux-x86_64  (the committed ELF seed) — DEFAULT
+#   3. an installed `coil` newer than that seed
+#   4. a stage0 built from bootstrap/seeds/native/linux-ir, when it compiles this tree
+#   5. the portable WASM seed (bootstrap/seeds/wasm), via select_stage0
 #
 # Requirements: cc/clang and libLLVM 21 (Ubuntu: apt.llvm.org llvm-21 packages).
 # The libdir is discovered via llvm-config-21/llvm-config; override with
@@ -68,10 +71,26 @@ if [ -z "${STAGE0:-}" ]; then
      || { [ -n "$installed" ] && stage0_compat_run "$installed" check "$SRC" "${LF[@]}" >/dev/null 2>&1; }; then
     select_stage0 "$SEED" "$SRC" x64 "${LF[@]}" || exit 1
   else
-    STAGE0="$RUN_DIR/coil-linux-ir-stage0"
-    scripts/compiler/build-linux-ir-stage0.sh "$STAGE0" || exit 1
-    STAGE0_SOURCE=linux-ir
-    STAGE0_BUILD_FLAGS=()
+    # Neither the committed ELF seed nor an installed coil can compile this tree.
+    # The shipped bootstrap IR answers a libLLVM VERSION mismatch, not staleness:
+    # it was cross-emitted at some past commit and goes out of date exactly like a
+    # seed does. Taking it unconditionally made it a dead end — when it is stale
+    # too the whole bootstrap stops, with no attempt at the portable WASM seed that
+    # bootstrap/seeds/wasm/SEED_VERSION names as this host's fallback. So prove the
+    # IR stage0 on this tree first, and hand over to select_stage0's WASM path when
+    # it cannot build it either.
+    IR_STAGE0="$RUN_DIR/coil-linux-ir-stage0"
+    if scripts/compiler/build-linux-ir-stage0.sh "$IR_STAGE0" \
+       && stage0_compat_run "$IR_STAGE0" check "$SRC" "${LF[@]}" >/dev/null 2>&1; then
+      STAGE0="$IR_STAGE0"
+      STAGE0_SOURCE=linux-ir
+      STAGE0_VERIFIED="$STAGE0"
+      STAGE0_BUILD_FLAGS=()
+    else
+      echo "the shipped bootstrap IR cannot compile this tree either; falling back" >&2
+      echo "to the portable WASM seed." >&2
+      COIL_FORCE_WASM_STAGE0=1 select_stage0 "$SEED" "$SRC" x64 "${LF[@]}" || exit 1
+    fi
   fi
 else
   select_stage0 "$SEED" "$SRC" x64 "${LF[@]}" || exit 1
