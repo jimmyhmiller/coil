@@ -412,7 +412,9 @@ changed:
 - a generic's or `:inline` function's body, for every caller that instantiated
   or inlined it;
 - what an alias names;
-- a function, alias or trait it used being retired.
+- a function, alias or trait it used being retired;
+- a new definition in its module capturing a name it reached elsewhere (an
+  import, `coil.core`, or a trait method).
 
 A plain function's body edit reports nothing, and a check may redefine a
 `const` or `def` it accepted earlier. A redefined function with trait bounds

@@ -406,8 +406,15 @@ trait, and a function retired without a replacement, impl methods included.
 Fixing `def` identity was part of it. A runtime `def`'s checked value had no node
 id, so every `def` looked like the accepted one and none was ever recorded as a
 reader. `jit_env_stale_complete.coil` lists the exact expected set for each kind
-of edit. Still not covered: negative lookups, meaning a new definition or impl
-that changes what an old name or dispatch resolves to.
+of edit.
+
+Negative lookups for names are covered too. Wherever the resolver answers a bare
+name the module does not define (an import, coil.core, or the checker's method
+dispatch), the reader also reads the absent module-level name. A declaration new
+in a submission enters "changed", so defining `p.len` stales whoever reached
+coil.core's `len` from `p`. Measured on the self-host build: no time cost, and
++55 MB peak (+1.2%). Still not covered: a new impl that changes which impl an
+existing call dispatches to.
 
 ### Release verification (2026-09-20)
 
