@@ -14,6 +14,7 @@
 (import "coil.control" :use *)
 (import "coil.try" :use *)
 (import "coil.reader" :use *)
+(import "coil.hashmap" :use *)  ; the scope map's node index
 (import "coil.compiler.unit_state" :use *)
 (import "coil.compiler.stdlib_manifest" :as sm)  ; which namespaces the toolchain owns
 (import "coil.compiler.resolution_base" :as resbase)
@@ -28,6 +29,7 @@
    (core_declarations CoreDeclBox)
    (source_modules SrcModBox)
    (shadow_calls ShadowBox)
+   (scope_at ScopeAtBox)
    (profile bool)
    (boxed_exprs i64)
    (boxed_types i64)
@@ -1192,6 +1194,133 @@
     (if (!= (load r) "")
         (load r)
         (resbase/resolution-source-lookup (.resolution_base (ast-unit-state)) source))))
+
+;;; ── LEXICAL SCOPE MAP: which locals were in scope at each qualified node ──────
+;;; The resolver decides at every reference whether a spelling names a local or a
+;;; global. This map keeps the local half of that decision so a checker can ask it
+;;; afterwards about a spelling the program does not contain yet — "if `len` were
+;;; written here, what would it name?" (`primitive/resolve-at`). The resolver's own
+;;; scope is a stack truncated on scope exit, so by the time a checker runs it
+;;; remembers nothing.
+;;;
+;;; Each binding appends a LINK naming its parent, the innermost link in scope when
+;;; it was made, and each qualified node records the innermost link in scope at it
+;;; (its TIP; -1 when no local is). Following parents from a tip visits exactly that
+;;; node's locals, innermost first. Qualification pays only the appends; the node
+;;; index is built when a query first needs it.
+(defstruct ScopeLink [(name (slice u8)) (parent i64)])
+
+(defstruct ScopeAtEntry [(node-id i64) (tip i64) (module i64)])
+
+(defstruct ScopeAtBox
+  [(init i64)
+   (links (ptr (ArrayList ScopeLink)))
+   (nodes (ptr (ArrayList ScopeAtEntry)))
+   (modules (ptr (ArrayList (slice u8))))
+   ; node id -> index into `nodes`, current only while `indexed` is true
+   (index (ptr (HashMap i64 i64)))
+   (indexed bool)
+   (arena scratch/ScratchArena)])
+
+(defn scope-at-box [] (-> (ptr ScopeAtBox))
+  (field (ast-unit-state) scope_at))
+
+(defn scope-at-fresh-lists! [(b (ptr ScopeAtBox))] (-> i64)
+  (let [sa (scratch/scratch-allocator (field b arena))]
+    (set! (load (field b links)) (al-new [ScopeLink] sa))
+    (set! (load (field b nodes)) (al-new [ScopeAtEntry] sa))
+    (set! (load (field b modules)) (al-new [(slice u8)] sa))
+    (set! (.indexed b) false)
+    0))
+
+(defn scope-at-ready [] (-> (ptr ScopeAtBox))
+  (let [b (scope-at-box)]
+    (when (= (.init b) 0)
+      (scratch/scratch-init-with-cap (field b arena) (retained-heap/compiler-scratch-parent) 65536)
+      (unit-resource! (primitive/cast (ptr i8) (field b arena))
+                      (primitive/fnptr-of resolution-map-arena-release))
+      (set! (.links b) (box! (unit-allocator) (ArrayList ScopeLink) (primitive/zeroed (ArrayList ScopeLink))))
+      (set! (.nodes b) (box! (unit-allocator) (ArrayList ScopeAtEntry) (primitive/zeroed (ArrayList ScopeAtEntry))))
+      (set! (.modules b) (box! (unit-allocator) (ArrayList (slice u8)) (primitive/zeroed (ArrayList (slice u8)))))
+      (set! (.index b) (box! (unit-allocator) (HashMap i64 i64) (primitive/zeroed (HashMap i64 i64))))
+      (scope-at-fresh-lists! b)
+      (set! (.init b) 1)
+      0)
+    b))
+
+;;; Drop every entry. Same lifetime as the other qualification side maps.
+(defn scope-at-reset [] (-> i64)
+  (let [b (scope-at-ready)]
+    (scratch/scratch-reset! (field b arena))
+    (scope-at-fresh-lists! b)))
+
+(defn scope-link-count [] (-> i64) (len (load (.links (scope-at-ready)))))
+(defn scope-node-count [] (-> i64) (len (load (.nodes (scope-at-ready)))))
+(defn scope-module-count [] (-> i64) (len (load (.modules (scope-at-ready)))))
+
+(defn scope-link-at [(i i64)] (-> ScopeLink) (get (load (.links (scope-at-ready))) i))
+(defn scope-module-at [(i i64)] (-> (slice u8)) (get (load (.modules (scope-at-ready))) i))
+
+;;; Remove the entries appended after a mark (a probe that keeps nothing).
+(defn scope-at-truncate! [(links i64) (nodes i64) (modules i64)] (-> i64)
+  (let [b (scope-at-ready)]
+    (set! (.len (.links b)) links)
+    (set! (.len (.nodes b)) nodes)
+    (set! (.len (.modules b)) modules)
+    (set! (.indexed b) false)
+    0))
+
+;;; A new binding of NAME whose enclosing scope is the link PARENT; its index.
+(defn scope-link-push! [(name (slice u8)) (parent i64)] (-> i64)
+  (let [b (scope-at-ready)]
+    (push! (.links b)
+           (ScopeLink :name (res-own-name (scratch/scratch-allocator (field b arena)) name)
+                      :parent parent))
+    (- (len (load (.links b))) 1)))
+
+;;; The index of MODULE in the module list, adding it when it is new.
+(defn scope-at-module! [(module (slice u8))] (-> i64)
+  (let [b (scope-at-ready)
+        ms (load (.modules b))]
+    (block :found
+      (for [i 0 (len ms)]
+        (when (= (get ms i) module) (break :found i)))
+      (push! (.modules b) (res-own-name (scratch/scratch-allocator (field b arena)) module))
+      (- (len (load (.modules b))) 1))))
+
+(defn scope-at-record! [(node-id i64) (tip i64) (module i64)] (-> i64)
+  (unless (<= node-id 0)
+    (let [b (scope-at-ready)]
+      (push! (.nodes b) (ScopeAtEntry :node-id node-id :tip tip :module module))
+      (set! (.indexed b) false)
+      0)))
+
+;;; The scope recorded at NODE-ID: the latest record wins, as a requalified or
+;;; replayed form records its nodes again.
+(defn scope-at-lookup [(node-id i64)] (-> (Option ScopeAtEntry))
+  (let [b (scope-at-ready)
+        nodes (load (.nodes b))]
+    (unless (.indexed b)
+      (let [(mut index) (hm-new [i64 i64] (scratch/scratch-allocator (field b arena)) (i64-keyops))]
+        (for [i 0 (len nodes)]
+          (set! (mut index) (.node-id (get nodes i)) i))
+        (set! (load (field b index)) index)
+        (set! (.indexed b) true))
+      0)
+    (match (get (load (load (field b index))) node-id)
+      (None [] (None [ScopeAtEntry]))
+      (Some [i] (Some (get nodes i))))))
+
+;;; Is NAME one of the locals in scope at the link TIP?
+(defn scope-binds? [(tip i64) (name (slice u8))] (-> bool)
+  (let [links (load (.links (scope-at-ready)))
+        (mut at) tip]
+    (block :found
+      (while (>= at 0)
+        (let [l (get links at)]
+          (when (= (.name l) name) (break :found true))
+          (set! at (.parent l))))
+      false)))
 
 ; mk-sexp / mk-tok / mk-diag / mk-diag-src / mk-strread / box-items / box-sexp
 ; moved to the reader with the types they construct.

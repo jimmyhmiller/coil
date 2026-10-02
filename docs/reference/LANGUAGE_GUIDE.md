@@ -1164,6 +1164,12 @@ help: try: (cond (= n 1) "one"
 $ coil lint src/main.coil --use myapp.lint.cond --fix
 ```
 
+`lint --fix` applies each checker run's suggestions as one transaction: all of
+them or none. That keeps coordinated edits together, such as a signature and the
+rewrites of its calls. When a checker's suggestions are independent of each other,
+call `(primitive/suggest-transaction)` before each one. Then a fix that does not
+compile is dropped alone and reported, and the rest still land.
+
 To report without a fix, use `(primitive/warn node msg)`, or
 `(primitive/report node msg)` for an error that fails the build. Coil collects
 diagnostics, so one run reports all of them.
@@ -1178,6 +1184,13 @@ Checkers run after type checking, so they can ask what the compiler decided:
   call node, not its head symbol.
 - `(primitive/binding-of ref)` identifies a local binding, which distinguishes
   shadowed names.
+- `(primitive/resolve-at node name)` is what the symbol `name` would denote if it
+  were written as a call head at `node`: `:local` under a local of that name, the
+  qualified declaration a call there reaches (`coil.core.len` for the `Len`
+  method), `:unresolved` when nothing has that name, or `:unknown` for a node the
+  compiler did not resolve (a macro call; ask at an argument instead). Ask it
+  before a fix inserts a name: a local `len`, or a module's own `len`, would
+  otherwise capture the call.
 - `(primitive/code-doc node)` is a definition's `;;;` documentation.
 
 Dependency queries in `coil.meta` read the same checked model, including earlier
