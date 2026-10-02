@@ -398,10 +398,17 @@ naming a changed name changes with it. A stale macro, generic or `:inline`
 function changes what its expansion sites compiled. These are followed to a
 fixpoint over the reverse index, so `(.x (.p (.q q)))` two structs away is found.
 
-New edits that enter "changed": a redefined `const` or `def` (which a checked
-session may now redefine at all), a macro's, generic's or inlined function's
-body (compared as forms, spans aside), a re-targeted alias, a retired alias or
-trait, and a function retired without a replacement, impl methods included.
+New edits that enter "changed": a re-targeted alias, a retired alias or trait,
+and a function retired without a replacement, impl methods included.
+
+**No replacement (2026-10-02).** A session never replaces a definition. The
+checked-only "logical" replacement of functions, structs, sums and constants
+(f4198e70) is removed: writing a definition again is "already exists" in every
+session. A client gives a new definition its own name and points a name at it
+with `defalias`, so "changed" is a name now pointing elsewhere, a retirement, or
+a new definition capturing a name. The comparisons of an old and new definition
+of one name remain only where retirement makes one reachable (an impl method
+retired and declared again).
 
 Fixing `def` identity was part of it. A runtime `def`'s checked value had no node
 id, so every `def` looked like the accepted one and none was ever recorded as a
