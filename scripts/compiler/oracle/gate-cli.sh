@@ -4189,6 +4189,116 @@ cmp -s "$T/lint/sample.coil" "$T/lint/sample.comment.orig" \
   && ok "lint --fix: withheld group leaves both definition and call untouched" \
   || bad "lint --fix: withheld group leaves both definition and call untouched" "source changed"
 
+# A rewrite that inserts a name must insert one that means, where it lands, what
+# the rule means by it (primitive/resolve-at). A local `len` shadows the trait
+# method, and so does the module's own `len`: both used to get `(len xs)`, which
+# named the local (no longer compiling) or the module's function (compiling, and
+# calling the wrong thing).
+cat > "$T/lint/shadowlen.coil" <<'EOF'
+(module shadowlen)
+(import "coil.slice" :use [slice-len])
+(defn count-to [(s (slice u8))] (-> i64)
+  (let [len 10]
+    (if (< (slice-len s) len) 1 0)))
+(defn main [] (-> i64) (count-to "abc"))
+EOF
+(cd "$T/lint" && "$COIL" lint shadowlen.coil --fix) >/dev/null 2>&1 \
+  && ok "lint --fix: a call under a local of the method's name is fixed" \
+  || bad "lint --fix: a call under a local of the method's name is fixed" "fix failed"
+shadowlen_text=$(cat "$T/lint/shadowlen.coil")
+case "$shadowlen_text" in
+  *"(Len::len s)"*) ok "lint --fix: a shadowed method is inserted trait-qualified" ;;
+  *) bad "lint --fix: a shadowed method is inserted trait-qualified" "$shadowlen_text" ;;
+esac
+expect_rc 1 "lint --fix: the fixed file still means what it did" \
+  "$COIL" run "$T/lint/shadowlen.coil"
+cat > "$T/lint/ownlen.coil" <<'EOF'
+(module ownlen)
+(import "coil.slice" :use [slice-len])
+(defn len [(x i64)] (-> i64) (* x 100))
+(defn size [(s (slice u8))] (-> i64) (slice-len s))
+(defn main [] (-> i64) (size "abc"))
+EOF
+(cd "$T/lint" && "$COIL" lint ownlen.coil --fix) >/dev/null 2>&1 \
+  && ok "lint --fix: a call in a module with its own len is fixed" \
+  || bad "lint --fix: a call in a module with its own len is fixed" "fix failed"
+expect_rc 3 "lint --fix: the module's own len is not called by the fix" \
+  "$COIL" run "$T/lint/ownlen.coil"
+
+# A quasiquote template's text is data the metaprogram may rename or re-scope, so
+# rewrites leave it alone and lint only the code under `~`. This generator renames
+# every `len` it emits, as thecount's specialized scanners do; rewriting its
+# `(slice-len bytes)` to `(len bytes)` made the call name that local.
+cat > "$T/lint/tmplgen.coil" <<'EOF'
+(module tmplgen)
+(import "coil.primitive" :as primitive)
+(import "coil.slice" :use [slice-len])
+(defn rename-len [(id Code) (f Code)] (-> Code)
+  (cond (primitive/code-list? f)
+          (let [out (primitive/code-list-new)]
+            (for [i 0 (primitive/code-count f)]
+              (primitive/code-list-push! out (rename-len id (primitive/code-nth f i))))
+            (if (primitive/code-vector? f)
+                `[~@(primitive/code-list-done out)]
+                (primitive/code-list-done out)))
+        (and (primitive/code-sym? f) (= (primitive/code-sym f) "len")) id
+        :else f))
+(defn gen-counter [& (_ Code)] (-> Code)
+  (rename-len (primitive/fresh-identifier "len")
+              `(defn ~(primitive/syntax->datum `count-bytes) [(bytes (slice u8))] (-> i64)
+                 (let [len (slice-len bytes)]
+                   len))))
+(gen-counter)
+(defn main [] (-> i64) (count-bytes "abc"))
+EOF
+(cd "$T/lint" && "$COIL" lint tmplgen.coil --fix) >/dev/null 2>&1 \
+  && ok "lint --fix: a generator with a template is fixed" \
+  || bad "lint --fix: a generator with a template is fixed" "fix failed"
+tmplgen_text=$(cat "$T/lint/tmplgen.coil")
+case "$tmplgen_text" in
+  *"(let [len (slice-len bytes)]"*) ok "lint --fix: a template's text is left as written" ;;
+  *) bad "lint --fix: a template's text is left as written" "$tmplgen_text" ;;
+esac
+case "$tmplgen_text" in
+  *"(primitive/code-count f)"*) bad "lint --fix: the code around templates is still linted" "$tmplgen_text" ;;
+  *) ok "lint --fix: the code around templates is still linted" ;;
+esac
+expect_rc 3 "lint --fix: the generator still generates working code" \
+  "$COIL" run "$T/lint/tmplgen.coil"
+
+# A fix that does not compile is dropped alone; the round's other fixes stay. The
+# bad rule's rewrite of `(+ …)` contains modernize's `(slice-len "ab")` edit, so the
+# first round is the bad rule's alone; it is rejected, and modernize's lands next.
+cat > "$T/lint/partial.coil" <<'EOF'
+(module app)
+(import "coil.slice" :use [slice-len])
+(defn main [] (-> i64)
+  (+ 40 (slice-len "ab")))
+EOF
+partial_out=$(cd "$T/lint" && "$COIL" lint partial.coil --use badrule --fix 2>&1)
+partial_rc=$?
+[ "$partial_rc" -eq 1 ] \
+  && ok "lint --fix: a rejected fix still fails the run" \
+  || bad "lint --fix: a rejected fix still fails the run" "rc=$partial_rc"
+case "$partial_out" in
+  *"does not compile, so it was not applied"*) ok "lint --fix: the rejected fix is reported" ;;
+  *) bad "lint --fix: the rejected fix is reported" "$partial_out" ;;
+esac
+partial_text=$(cat "$T/lint/partial.coil")
+case "$partial_text" in
+  *no-such-function*) bad "lint --fix: the rest of the run is applied without the rejected fix" "$partial_text" ;;
+  *'(len "ab")'*) ok "lint --fix: the rest of the run is applied without the rejected fix" ;;
+  *) bad "lint --fix: the rest of the run is applied without the rejected fix" "$partial_text" ;;
+esac
+expect_rc 42 "lint --fix: what was applied compiles" "$COIL" run "$T/lint/partial.coil"
+# A fully rejected round changed nothing, so it must not claim it did.
+cp "$T/lint/victim.orig" "$T/lint/victim.coil"
+victim_out=$(cd "$T/lint" && "$COIL" lint victim.coil --use badrule --fix 2>&1)
+case "$victim_out" in
+  *"fixed "*) bad "lint --fix: a reverted file is not announced as fixed" "$victim_out" ;;
+  *) ok "lint --fix: a reverted file is not announced as fixed" ;;
+esac
+
 echo "== bundled stdlib manifest =="
 # The manifest in src/compiler/embedded_stdlib.coil decides which namespaces a
 # compiler binary can serve when it runs OUTSIDE this repo. In-repo the loader

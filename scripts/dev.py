@@ -1251,20 +1251,22 @@ source-roots = ["src"]
                     "(import \"coil.primitive\" :as primitive)\n"
                     f"{forms}{trigger}")
             files = sorted(source.glob("*.coil"))
-            before = {path: hashlib.sha256(path.read_bytes()).digest() for path in files}
             execute(coil, "check", cwd=project)
             result = subprocess.run([coil, "lint", "--fix", "--use", "rollback.badlint"],
                                     cwd=project, text=True, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # One fix that does not compile among 119 that do: the round keeps the
+            # 119 (lint-salvage-round), drops the one, and the run still fails.
             if result.returncode == 0:
-                raise RuntimeError("fast modernization gate: invalid scale fix unexpectedly succeeded")
-            if "reverted" not in result.stderr:
-                raise RuntimeError("fast modernization gate: scale rollback did not report reversion")
-            changed = [path for path in files
-                       if hashlib.sha256(path.read_bytes()).digest() != before[path]]
-            if changed:
-                raise RuntimeError(
-                    f"fast modernization gate: scale rollback changed {len(changed)} file(s)")
+                raise RuntimeError("fast modernization gate: a rejected scale fix did not fail the run")
+            if "does not compile, so it was not applied" not in result.stderr:
+                raise RuntimeError("fast modernization gate: scale salvage did not report the rejected fix")
+            # the rule's own source spells its bad replacement; read only its targets
+            text = "".join(path.read_text() for path in files if path.name.startswith("part"))
+            if "missing" in text:
+                raise RuntimeError("fast modernization gate: scale salvage applied the fix that does not compile")
+            if "primitive/icmp-eq" in text:
+                raise RuntimeError("fast modernization gate: scale salvage dropped fixes that compile")
             execute(coil, "check", cwd=project)
 
         def breaking_scan_task() -> None:
@@ -1333,6 +1335,7 @@ source-roots = ["src"]
             lambda: build_run("tests/compiler/features/void_if_discarded.coil", "void-if-discarded"),
             lambda: build_run("tests/compiler/features/void_match_discarded.coil", "void-match-discarded"),
             lambda: build_run("tests/compiler/features/meta_dependencies.coil", "meta-dependencies", want=14),
+            lambda: build_run("tests/compiler/features/meta_resolve_at.coil", "meta-resolve-at", want=17),
             lambda: build_run("tests/compiler/features/meta_semantic_transform_partial_model.coil",
                               "meta-semantic-transform-partial-model", want=42),
             lambda: build_run("tests/compiler/features/mutable_binding_fresh_value.coil",
