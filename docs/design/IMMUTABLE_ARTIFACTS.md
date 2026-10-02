@@ -423,6 +423,28 @@ coil.core's `len` from `p`. Measured on the self-host build: no time cost, and
 +55 MB peak (+1.2%). Still not covered: a new impl that changes which impl an
 existing call dispatches to.
 
+**Retiring definitions (2026-10-02).** `retire-defn`, `retire-struct`,
+`retire-sum`, `retire-const` and `retire-def` join the alias, trait and impl
+forms. A retired declaration is removed: resolution stops finding it, and its name
+may be defined again in the same submission or a later one. No new mechanism
+was needed for the removal. It is the same removal reclamation does, applied to
+every accepted index that holds the name:
+
+- the retained candidate's declaration overlay (a retired name is written into
+  it as what the module now declares, since unchanged names are otherwise read
+  through the accepted `DeclarationBase`);
+- the checked, signature and dependency bases, through the revision's pruned
+  set (a function retired and not defined again);
+- the constant base (`const-base-remove!`);
+- the macro engine. A candidate starts from a copy of its parent's compiled macro
+  entries, and drops the inherited entry of a retired macro so a macro defined
+  under that name is staged and run.
+
+The checker's view of the parent's signatures hides the functions the
+submission retires (`Cx.retired_sigs`). `jit_retire_definitions.coil` covers each
+kind in a native session; `jit_env_stale_complete.coil` lists what each
+retirement makes stale.
+
 ### Release verification (2026-09-20)
 
 `python3 scripts/dev.py build full` passes — stage1, stage2, LLVM fixed point on
