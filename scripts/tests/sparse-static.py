@@ -52,11 +52,10 @@ __attribute__((constructor)) static void before_main(void) {
   callback *callbacks = sparse_callbacks();
   if (callbacks[0] || callbacks[708332] || callbacks[708333]() != 81) failed = 7;
 }
-int64_t native_check(void) __asm__("SPARSE_CHECK");
-int64_t native_check(void) {
+int64_t sparse_native_check(void) {
   return failed ? failed : sparse_storage()[350000] == 99 ? 0 : 4;
 }
-'''.replace('SPARSE_CHECK', '_sparse-native-check' if sys.platform == 'darwin' else 'sparse-native-check'))
+''')
     obj = work / "native.o"
     run(["cc", "-c", native, "-o", obj])
     fixture = ROOT / "tests/compiler/features/sparse_static.coil"

@@ -4,10 +4,12 @@
 A 12-byte struct is coerced to [2 x i64]. A callee that stored those 16 bytes
 into a 12-byte slot wrote past it; LLVM treated that as UB and at -O2 read the
 last field back as 0 (cfia3fumjgg). Run the sweep at each optimization level,
-under ASan (which traps the overflowing store directly), and on the arm64
-backend.
+under ASan (which traps the overflowing store directly), and on the host's
+native backend: arm64 emits Mach-O and runs on Apple silicon; x64 runs on any
+x86-64 host. A host with neither (aarch64 Linux) has no native backend to run.
 """
 from pathlib import Path
+import platform
 import subprocess
 import sys
 import tempfile
@@ -29,8 +31,12 @@ def run(command):
 
 with tempfile.TemporaryDirectory(prefix=".coil-aggregate-abi-", dir=ROOT / "build") as raw:
     work = Path(raw)
-    variants = [["-O0"], ["-O1"], ["-O2"], ["-O3"], ["-O2", "--sanitize=address"],
-                ["--backend", "arm64"]]
+    machine = platform.machine()
+    native = ("arm64" if machine == "arm64" and sys.platform == "darwin"
+              else "x64" if machine in ("x86_64", "AMD64") else None)
+    variants = [["-O0"], ["-O1"], ["-O2"], ["-O3"], ["-O2", "--sanitize=address"]]
+    if native:
+        variants.append(["--backend", native])
     for i, flags in enumerate(variants):
         executable = work / f"v{i}"
         run([COMPILER, "build", SOURCE, *flags, "-o", executable])

@@ -87,7 +87,7 @@ long native_named_increment(void) { return ++coil_named_data; }
         binary = work / ("named-" + name)
         run([COMPILER, "build", source, "--backend", name, "-O0", "--link-flag", named_obj, "-o", binary])
         run([binary])
-        symbols = run(["nm", "-gm", binary]).stdout
+        symbols = run(["nm", "-g", binary]).stdout
         assert "_coil_named_data" in symbols if sys.platform == "darwin" else "coil_named_data" in symbols
 
     # References must bind the exact definition irrespective of function order,

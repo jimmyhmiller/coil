@@ -302,8 +302,11 @@ New API this project added (all shipped):
   the compiler and target the declarations assume. `(meta/describe NAMES)` and
   `(meta/describe-modules MODULES)` assemble a description, `(meta/describe-source
   D)` renders it as text, and `(meta/source CODE)` renders any form. A description
-  is ordinary source: store it in the program (a transform can add a function
-  returning it as a string) or write it anywhere with `coil.fs`.
+  is ordinary source: store it in the program or write it anywhere with
+  `coil.fs`. `(meta/embed-description MODULES HOST NAME DESCRIBED)` does the
+  common case for a transform (describe, export, and add `(NAME)` to HOST
+  returning the text); `(meta/embed-text MODULES HOST NAME TEXT)` embeds any text,
+  and `(meta/transform-result MODULES)` is what a transform returns.
   `(meta/link-export! NAME)` keeps a function or `def` in the binary and exports it
   under its Coil symbol, which a declaration of it links to.
   `tests/compiler/features/host_environment*.coil` describe a module, embed it and

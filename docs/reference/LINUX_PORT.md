@@ -78,8 +78,6 @@ except where noted):
   the driver (no `-arch` on ELF; you'd need a cross toolchain).
 - `-g` on Linux: DWARF is emitted into the object/executable but the lldb/dsymutil
   packaging checks are Darwin-only; Linux debugger UX is unverified.
-- `COIL_LLVM_LINK=static` and `llvm-link-flags.sh` remain macOS-shaped; the Linux
-  script discovers the libdir itself (override: `COIL_LLVM_LIBDIR`).
 - Forced LLVM tail calls require scalar-only signatures. Recursive calls carrying
   aggregate values, pointers, or references remain ordinary calls to preserve
   borrowed stack temporaries; their stack use depends on LLVM optimization.
