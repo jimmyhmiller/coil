@@ -91,6 +91,16 @@ def justification(path: str, op: str, line: str) -> str:
             and '(primitive/code-symbol ":" (primitive/gensym))' in line):
         return "loop-label keyword spelled from a gensym: labels are matched by spelling, never bound or resolved, so the fresh spelling keeps the macro's label from capturing a user's (break :label)"
     if op == "code-symbol":
+        if (path == "src/stdlib/lints/import_aliases.coil"
+                and ("(primitive/code-symbol leaf)" in line
+                     or "(primitive/code-symbol (if (load collision) name leaf))" in line)):
+            return "module-alias datum compared with import clauses or passed to the binding-aware qualification planner; never a lexical binder"
+        if (path == "src/stdlib/lints/primitives.coil"
+                and "names/ln-spelling-at node" in line):
+            return "candidate qualified operator-name data validated at the authored reference by ln-spelling-at before proposing a replacement; never a lexical binder"
+        if (path == "src/stdlib/meta.coil"
+                and "(primitive/code-symbol (subslice text 0 cut))" in line):
+            return "module-name datum extracted from a qualified declaration name; never a lexical identifier"
         if "fresh-identifier" in line:
             return "display spelling input to fresh-identifier; not itself used lexically"
         if "syntax->datum" in line:
