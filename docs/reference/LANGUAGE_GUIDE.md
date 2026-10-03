@@ -1301,7 +1301,9 @@ profile (`coil.lint.default`). Add opt-in lints with `--use`, for example
   from a real header, and `coil cimport header.h` prints bindings for a whole
   header.
 - `(declare f [(x T)] (-> R))` declares a Coil function compiled in another unit,
-  as prebuilt units use.
+  as prebuilt units use. `(declare g T)` declares a `def` of type `T` another unit
+  holds the storage of; reading `g` reads that unit's value. A JIT session uses
+  both to reach the program it runs in ([STATEFUL_JIT.md](STATEFUL_JIT.md)).
 - Link libraries with `-lNAME`, or in `Coil.toml` ([PROJECTS.md](PROJECTS.md)).
 
 ## Documentation comments
