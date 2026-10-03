@@ -512,9 +512,6 @@ the program: a session never reclaims or redefines them. It may `retire-` one an
 define the name again, and code the program compiled ahead of time keeps calling
 the original. `tests/compiler/features/host_environment.coil` is a complete host.
 
-A session cannot yet import `coil.meta` itself (pad `coil-bugs`), so keep the
-metaprogram that writes a description in a module the description does not cover.
-
 ## Discovering a program's sources
 
 `(jit-read-source-graph allocator ENTRY)` finds an entry's source modules using
