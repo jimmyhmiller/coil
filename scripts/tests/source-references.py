@@ -107,7 +107,46 @@ def main():
 (defn main [] (-> i64) (unavailable `0))
 ''')
         run('run', 'main.coil')
-    print('authored source references: binding identity, macro heads, local shadowing, diff, idempotence, alias policy, atomic refusals, quoted data, primitives, renamed facade, phase isolation: PASS')
+
+        # A whole-project lint rewrites what resolution reports for every kind of
+        # use, not only the ones a first pass could see: a call that is the whole
+        # body of a function, a constructor, a type in a signature, the trait of a
+        # `dyn`, a function a macro generates (coil.fs's), and an identifier an
+        # `assert` shows in its failure message. The result must compile and run.
+        main_path.write_text('''(module source-probe.main)
+(import "source-probe.lib" :use *)
+(import "coil.alloc" :use *)
+(import "coil.fs" :use *)
+(defn tail [] (-> i64) (double 4))
+(defn built [] (-> i64) (.value (Box :value 5)))
+(defn takes [(a (dyn Allocator)) (b Box)] (-> i64) (.value b))
+(defn made [] (-> i64) (if (= (make-dir c"made-by-lint-test" 493) 0) 1 1))
+(defn main [] (-> i64)
+  (let [b (Box :value 2)]
+    (assert (= (double 2) 4))
+    (- (+ (tail) (+ (built) (+ (takes (malloc-allocator) b) (made)))) 16)))
+''')
+        run('run', 'main.coil')
+        run('lint', 'main.coil', '--use', 'coil.lint.import-aliases', '--fix')
+        rewritten = main_path.read_text()
+        for expected in ('lib/double', 'lib/Box', 'alloc/Allocator', 'alloc/malloc-allocator', 'fs/make-dir'):
+            assert expected in rewritten, (expected, rewritten)
+        assert ':use *' not in rewritten, rewritten
+        run('run', 'main.coil')
+
+        # A name a quasiquote template generates resolves where the macro is
+        # defined, which an edit cannot see: the import stays and the reason is said.
+        template = '''(module source-probe.main)
+(import "source-probe.lib" :use *)
+(defn make-box [] (-> Code) `(Box :value 1))
+(defn main [] (-> i64) (- (.value (make-box)) 1))
+'''
+        main_path.write_text(template)
+        output = run('lint', 'main.coil', '--use', 'coil.lint.import-aliases', '--fix')
+        assert 'quasiquote template names' in output, output
+        assert main_path.read_text() == template, main_path.read_text()
+        run('run', 'main.coil')
+    print('authored source references: binding identity, macro heads, local shadowing, diff, idempotence, alias policy, atomic refusals, quoted data, primitives, renamed facade, phase isolation, calls, constructors, dyn traits, generated functions, assert, templates: PASS')
 
 
 if __name__ == '__main__':
