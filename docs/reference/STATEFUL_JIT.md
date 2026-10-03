@@ -478,23 +478,33 @@ against a running session.
 
 A session inside a program can be given that program as its environment, so the
 code it compiles calls the program's own functions, reads and writes its own
-`def`s, and uses its types, generics and macros. Nothing is visible to a session
-unless the program says so. A definition marked `:jit/expose true` (an annotation
-from `coil.jit.environment`) is one a session can use; the rest of the program
-stays out of reach.
+`def`s, and uses its types, generics and macros. The compiler never does this on
+its own and nothing marks a definition for it. `coil.meta` offers queries about the
+checked program (see [METAPROGRAMS.md](METAPROGRAMS.md)) and a helper that builds an
+environment from them, and a metaprogram you write calls them and decides what to
+hand over. The program gives the session the result before its first submission:
 
 ```text
-;; app/core.coil
-(import "coil.jit.environment")
-(import "coil.var" :use [var-static])
-(defstruct Point [(x i64) (y i64)])
-(def counter :jit/expose true (var-static i64 0))
-(defn helper :jit/expose true [(p Point) (n i64)] (-> Point) (Point :x (+ (.x p) n) :y (.y p)))
+(jit-session-set-environment! (mut session) text)
+```
 
+`text` is ordinary Coil source that begins with a `(toolchain :compiler … :target …)`
+header (`(meta/toolchain)` is the form). The session checks that header against
+its own toolchain, and compiles the rest as its first submission. It returns 0, or:
+-1 once the session has started; -2 when the header is missing or another
+toolchain or target made it; -4 when the text does not compile. `jit-diagnostic`
+says which.
+
+`meta/embed-environment` is the helper. Called from a transform, it adds to a host
+module a function that returns the environment of some modules as text:
+
+```text
 ;; app/tooling.coil -- build time
 (defn embed [(modules Code)] (-> Code)
   (meta/transform-result
-    (meta/embed-environment modules `app.main "environment" `(app.core))))
+    (meta/embed-environment modules `app.main "environment"
+      `(app.core)                    ; the modules to describe
+      (meta/definitions `app.core)))) ; the functions and defs to hand over
 
 ;; app/main.coil
 (import "app.core" :as core)
@@ -505,41 +515,43 @@ stays out of reach.
 (let [text (environment)]
   (jit-session-set-environment! (mut session) text)
   (env/environment-free! text))
-(jit-compile! (mut session) "(module app.core) (defn more [] (-> i64) (.x (helper (Point :x 1 :y 2) (get counter))))")
 ```
 
-`embed-environment` adds to `app.main` a function `environment` that builds the
-environment of `app.core` as text when it is called, and `meta/embed-text` embeds
-any text the same way. The environment is ordinary Coil source: a
-`(toolchain :compiler … :target …)` header, then each module's header and its
-definitions:
+The last argument is a list of qualified names, so everything in a module is
+`(meta/definitions M)`, and a smaller set is a list you build, or an empty list for
+types only. What the text holds:
 
-- A record, sum, trait, generic, macro, alias, constant and impl is its source,
-  which the session compiles itself.
-- A function marked `:jit/expose` becomes a `defn` with the function's own
-  signature whose body calls the program's function through its address. The
-  address is only known when the program runs, so the text is built then, and
-  the generated function naming the function is also what keeps it in the binary
-  at every optimization level. The host module must import the modules it
-  exposes so it can name them. A function that takes or returns a record works,
-  and a call goes through a pointer, so it is not inlined.
-- A `def` of type `Var` marked `:jit/expose` is a `Var` over the program's own
-  cell, so `(get counter)` and `(set counter v)` in the session reach the
-  program's storage. Any other `def` marked `:jit/expose` is copied as written,
-  which is the same value because a plain `def` cannot change.
-- A function or `def` not marked is left out. A generic or macro that calls a
-  function must find it exposed where the session uses it.
+- A record, sum, trait, generic, macro, alias, constant and impl of a described
+  module is copied as written, and the session compiles it itself.
+- A function in the list becomes a `defn` with the function's own signature whose
+  body calls the program's function through its address. The address is only known
+  when the program runs, so the generated function builds the text then
+  (`coil.jit.environment` holds the builder it calls). Naming the function in that
+  generated code also keeps it in the binary at every optimization level, and the
+  host module must import the modules it hands over so it can name them. A call
+  goes through a pointer, so it is not inlined, and a function that takes or returns
+  a record works.
+- A `def` of type `Var` in the list becomes a `Var` over the program's own cell, so
+  `(get counter)` and `(set counter v)` in the session reach the program's storage.
+  A plain `def` is not a place and cannot change, so a copy of it is the same value.
+- A function or `def` not in the list is left out, and a generic or macro that calls
+  one must find it handed over where the session uses it.
 
 The program owns the text the function returns and releases it with
-`coil.jit.environment/environment-free!`.
+`coil.jit.environment/environment-free!`. None of this is required: a metaprogram can
+build the text itself from `meta/declaration`, `meta/definition-source`,
+`meta/module-header`, `meta/module-impls` and `meta/source`, and `meta/source`
+renders any form as text, so what it learns can be written to a file with `coil.fs`
+and read in a later build, or handed on in any form it likes.
+`tests/compiler/features/host_environment.coil` is a complete host, and
+`src/examples/jit_expose/` is a small demo you can run
+(`COIL_NAMESPACE_ROOTS=src/examples coil run src/examples/jit_expose/demo.coil`): a
+metaprogram hands an application to a session, which type checks new code against
+it, calls the program's own functions, and shares one of its globals.
 
-`jit-session-set-environment!` returns 0, or: -1 once the session has started; -2
-when the environment has no toolchain header or another toolchain or target made
-it; -4 when the environment does not compile. `jit-diagnostic` says which. The
-exposed definitions belong to the program: a session never reclaims or redefines
-them. It may `retire-` one and define the name again, and code the program
+The handed-over definitions belong to the program: a session never reclaims or
+redefines them. It may `retire-` one and define the name again, and code the program
 compiled ahead of time keeps calling the original.
-`tests/compiler/features/host_environment.coil` is a complete host.
 
 ## Discovering a program's sources
 
