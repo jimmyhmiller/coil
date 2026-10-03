@@ -395,9 +395,11 @@ definitions so they stop being metadata roots once published:
 ```
 
 The native code stays callable through any pointer you hold. The compiler
-metadata survives only while something retained still depends on it (a
-caller, an initializer, a generic). The annotation is rejected on generic and
-`Code`-returning functions.
+metadata survives only while something retained still depends on it: a
+caller, an initializer, a generic, a function that names a type anywhere in
+its body, or a type that holds it in a field. That holds however long ago the
+reader was accepted. A retired declaration depends on nothing. The annotation is
+rejected on generic and `Code`-returning functions.
 
 Records and sums accept `:jit/retain false` too, before their field or
 variant list. Their impls do not keep them alive by themselves: an impl
@@ -483,17 +485,24 @@ At run time the program hands the description to the session before its first
 submission:
 
 ```text
-;; at build time, in a transform the program registers
-(let [description (meta/describe-modules `(app.core))]
-  (for name (iter (meta/definitions `app.core))
-    (when (meta/linkable? name) (meta/link-export! name)))
-  ;; … add `(defn* environment [] (-> (slice u8)) ~(meta/describe-source description))`
-  )
+;; app/tooling.coil -- build time
+(defn embed [(modules Code)] (-> Code)
+  (meta/transform-result
+    (meta/embed-description modules `app.main "environment" `(app.core))))
 
-;; at run time
+;; app/main.coil
+(import "app.tooling" :use [embed])
+(transform embed)
+…
 (jit-session-set-environment! (mut session) (environment))
 (jit-compile! (mut session) "(module app.core) (defn more [] (-> i64) (+ (helper 1) (get counter)))")
 ```
+
+`embed-description` describes every definition of `app.core`, exports every
+function and `def` among them (`meta/link-export!`), and adds to `app.main` a
+function `environment` returning the description. `meta/embed-text` embeds any
+text the same way, and `meta/describe` makes a description of exactly the names
+you pass, so a program can embed a subset too.
 
 A description is ordinary Coil source: a `(toolchain :compiler … :target …)`
 header, then each module's header and the declaration of each definition. A

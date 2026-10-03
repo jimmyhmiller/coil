@@ -47,21 +47,13 @@ fi
 if [ -z "$libdir" ] || [ ! -e "$libdir/libLLVM.so" ]; then
   echo "no libLLVM.so found (install LLVM 21 from apt.llvm.org, or set COIL_LLVM_LIBDIR)"; exit 1
 fi
-# A prebuilt unit's shared library (`unit.so`, see build-unit in driver.coil) is
-# linked with its references to the compiler's own runtime left UNDEFINED, and
-# `--unit DIR` dlopen's it with RTLD_NOW. ld64 puts every global symbol of a
-# Mach-O executable in the export table, so macOS resolves those references with
-# no flag at all; ELF puts an executable's symbols in .dynsym only when it is
-# linked --export-dynamic, so without this the dlopen fails outright and the
-# install's own verification cannot load the unit it just warmed.
-EXPORT=(--link-flag "-Wl,--export-dynamic")
+# The link line lives in ONE place, scripts/compiler/llvm-link-flags.sh.
 if [ "${COIL_LLVM_LINK:-dynamic}" = static ]; then
-  LLVM_CONFIG="${LLVM_CONFIG:-llvm-config-21}" LF=($(LLVM_CONFIG="$LLVM_CONFIG" scripts/compiler/llvm-link-flags.sh static) "${EXPORT[@]}") \
+  LLVM_CONFIG="${LLVM_CONFIG:-llvm-config-21}" LF=($(LLVM_CONFIG="$LLVM_CONFIG" scripts/compiler/llvm-link-flags.sh static)) \
     || { echo "cannot compute static LLVM link flags"; exit 1; }
 else
-  LF=(--link-flag "-L$libdir" --link-flag "-Wl,-rpath,$libdir" --link-flag -lLLVM
-      --link-flag -lstdc++ --link-flag -lm --link-flag -lpthread --link-flag -ldl
-      "${EXPORT[@]}")
+  LF=($(COIL_LLVM_LIBDIR="$libdir" scripts/compiler/llvm-link-flags.sh dynamic)) \
+    || { echo "cannot compute dynamic LLVM link flags"; exit 1; }
 fi
 
 . scripts/compiler/select-stage0.sh

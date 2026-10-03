@@ -31,9 +31,13 @@ set -uo pipefail
 
 MODE="${1:-dynamic}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}"
+command -v "$LLVM_CONFIG" >/dev/null 2>&1 || LLVM_CONFIG=llvm-config-21
 command -v "$LLVM_CONFIG" >/dev/null 2>&1 || LLVM_CONFIG=llvm-config
 command -v "$LLVM_CONFIG" >/dev/null 2>&1 || {
   echo "llvm-link-flags: no llvm-config (set LLVM_CONFIG=/path/to/llvm-config)" >&2; exit 1; }
+# COIL_LLVM_LIBDIR overrides where libLLVM lives, for an LLVM whose llvm-config
+# reports somewhere else.
+LIBDIR="${COIL_LLVM_LIBDIR:-$("$LLVM_CONFIG" --libdir)}"
 
 # the components the Coil backend actually calls into (see src/compiler/ffi.coil):
 # IR construction + the three targets it can emit for + the O3 pass pipeline.
@@ -54,10 +58,20 @@ case "$MODE" in
   dynamic)
     # Coil's interpreter uses libm directly (`floor`, `fmod`, ...). macOS folds
     # those symbols into libSystem, while ELF linkers require an explicit -lm.
-    emit "-L$("$LLVM_CONFIG" --libdir)" -lLLVM -lm
+    emit "-L$LIBDIR" -lLLVM -lm
+    if [ "$(uname -s)" != Darwin ]; then
+      # Load libLLVM from LIBDIR, the LLVM this compiler was linked against. The
+      # compiler finds its matching clang (sanitizer and coil.jit links) beside
+      # the library the loader reports for an LLVM symbol. Without an rpath the
+      # loader takes the library through its cache instead: on Debian that is
+      # /usr/lib/x86_64-linux-gnu/libLLVM.so.21.1, which has no bin/clang
+      # beside it, and every such link fails. A Homebrew dylib's install name
+      # is already its absolute path.
+      emit "-Wl,-rpath,$LIBDIR" -lstdc++ -lpthread -ldl
+    fi
     ;;
   static)
-    emit "-L$("$LLVM_CONFIG" --libdir)"
+    emit "-L$LIBDIR"
     # shellcheck disable=SC2046
     emit $("$LLVM_CONFIG" --link-static --libs $COMPONENTS)
     emit -lm -lz
@@ -87,4 +101,13 @@ case "$MODE" in
     echo "llvm-link-flags: unknown mode '$MODE' (want: static | dynamic)" >&2; exit 1
     ;;
 esac
+if [ "$(uname -s)" != Darwin ]; then
+  # A prebuilt unit's shared library (`unit.so`, see build-unit in driver.coil)
+  # is linked with its references to the compiler's own runtime left UNDEFINED,
+  # and `--unit DIR` dlopen's it with RTLD_NOW. ld64 puts every global symbol of
+  # a Mach-O executable in the export table; ELF puts an executable's symbols in
+  # .dynsym only when it is linked --export-dynamic, so without it the dlopen
+  # fails outright.
+  emit "-Wl,--export-dynamic"
+fi
 echo
