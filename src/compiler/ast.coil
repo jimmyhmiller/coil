@@ -706,6 +706,188 @@
 ; so instead the resolver records, at qualify-type, what each `(module, raw type
 ; name)` resolves to. A metaprogram then resolves a type node exactly: its raw name
 ; (the symbol) + its module (via the source→module map below) → the qualified type.
+;; ── Resolution lookup index ──────────────────────────────────────────────────
+;; The three registries below (type refs, value refs, source modules) are
+;; append-only lists that a checker queries once per syntax node it walks. A
+;; list scan per query made a checker that resolves every node cost
+;; nodes × registered references. Each list therefore has an open-addressing
+;; hash index beside it.
+;;
+;; The list stays the source of truth: other passes append to it, truncate it
+;; for a rollback, and replace it wholesale when pruning, so the index follows
+;; the list rather than owning it. A lookup first brings the index up to date by
+;; adding the entries appended since the last sync. The index lives OUTSIDE the
+;; unit state on purpose: the unit state is walked and rebuilt field by field by
+;; the retained-snapshot generator, which cannot copy a pointer to a table of
+;; unknown length. Being process-wide, it records which list it was built for
+;; and the list's buffer and length, and starts over whenever any of them no
+;; longer agree. Every pass that shrinks or replaces a list in place also calls
+;; `res-indexes-invalidate!` explicitly; the check is a safety net, not the
+;; mechanism.
+(defstruct ResSlot
+  [(a (slice u8)) (b (slice u8)) (n i64) (val (slice u8)) (used i64)])
+
+(defstruct ResIndex
+  [(mem (slice ResSlot))
+   (cap i64)
+   (count i64)
+   (synced i64)
+   (owner i64)
+   (buf i64)])
+
+(defn type-res-index [] (-> (ptr ResIndex)) (primitive/alloc-static ResIndex))
+(defn value-res-index [] (-> (ptr ResIndex)) (primitive/alloc-static ResIndex))
+(defn src-mod-index [] (-> (ptr ResIndex)) (primitive/alloc-static ResIndex))
+
+(defn res-index-hash [(a (slice u8)) (b (slice u8)) (n i64)] (-> i64)
+  (let [(mut h) 1469598103934665603]
+    (for [i 0 (len a)]
+      (set! h (primitive/imul (primitive/ixor (load h) (primitive/cast i64 (get a i)))
+                              1099511628211)))
+    (set! h (primitive/imul (primitive/ixor (load h) 255) 1099511628211))
+    (for [i 0 (len b)]
+      (set! h (primitive/imul (primitive/ixor (load h) (primitive/cast i64 (get b i)))
+                              1099511628211)))
+    (set! h (primitive/imul (primitive/ixor (load h) n) 1099511628211))
+    (load h)))
+
+(defn res-index-clear! [(ix (ptr ResIndex))] (-> i64)
+  (when (> (.cap ix) 0)
+    (free [ResSlot] (malloc-allocator) (.mem ix))
+    0)
+  (set! (.mem ix) (primitive/zeroed (slice ResSlot)))
+  (set! (.cap ix) 0)
+  (set! (.count ix) 0)
+  (set! (.synced ix) 0)
+  (set! (.owner ix) 0)
+  (set! (.buf ix) 0)
+  0)
+
+(defn res-indexes-invalidate! [] (-> i64)
+  (res-index-clear! (type-res-index))
+  (res-index-clear! (value-res-index))
+  (res-index-clear! (src-mod-index))
+  0)
+
+(defn res-index-slot-matches? [(s (ptr ResSlot)) (a (slice u8)) (b (slice u8)) (n i64)] (-> bool)
+  (and (= (.n s) n) (= (.a s) a) (= (.b s) b)))
+
+; Insert or, when `overwrite`, replace. A first-wins registry passes false.
+(defn res-index-put! [(ix (ptr ResIndex))
+                      (a (slice u8))
+                      (b (slice u8))
+                      (n i64)
+                      (val (slice u8))
+                      (overwrite bool)] (-> i64)
+  (when (>= (primitive/imul (primitive/iadd (.count ix) 1) 2) (.cap ix))
+    (res-index-grow! ix)
+    0)
+  (let [slots (slice-data [ResSlot] (.mem ix))
+        mask (primitive/isub (.cap ix) 1)
+        (mut at) (primitive/iand (res-index-hash a b n) mask)]
+    (loop (let [s (primitive/index slots (load at))]
+            (cond (= (.used s) 0)
+                    (do
+                      (set! (.a s) a)
+                      (set! (.b s) b)
+                      (set! (.n s) n)
+                      (set! (.val s) val)
+                      (set! (.used s) 1)
+                      (set! (.count ix) (primitive/iadd (.count ix) 1))
+                      (break))
+                  (res-index-slot-matches? s a b n)
+                    (do
+                      (when overwrite (set! (.val s) val) 0)
+                      (break))
+                  :else (set! at (primitive/iand (primitive/iadd (load at) 1) mask)))))
+    0))
+
+(defn res-index-grow! [(ix (ptr ResIndex))] (-> i64)
+  (let [old-mem (.mem ix)
+        old-cap (.cap ix)
+        new-cap (if (< old-cap 1024) 1024 (primitive/imul old-cap 2))
+        mem (match (alloc [ResSlot] (malloc-allocator) new-cap)
+              (Some [m] m)
+              (None [] (do (ps (stderr) "error: out of memory growing a resolution index\n")
+                           (abort)
+                           old-mem)))]
+    (mem-zero [ResSlot] (slice-data [ResSlot] mem) new-cap)
+    (set! (.mem ix) mem)
+    (set! (.cap ix) new-cap)
+    (set! (.count ix) 0)
+    (for [i 0 old-cap]
+      (let [s (primitive/index (slice-data [ResSlot] old-mem) i)]
+        (when (!= (.used s) 0)
+          ; Entries already in the table are distinct keys, so a plain insert
+          ; restores each one exactly.
+          (res-index-put! ix (.a s) (.b s) (.n s) (.val s) true)
+          0)))
+    (when (> old-cap 0)
+      (free [ResSlot] (malloc-allocator) old-mem)
+      0)
+    0))
+
+(defn res-index-get [(ix (ptr ResIndex)) (a (slice u8)) (b (slice u8)) (n i64)] (-> (slice u8))
+  (if (= (.cap ix) 0)
+      ""
+      (let [slots (slice-data [ResSlot] (.mem ix))
+            mask (primitive/isub (.cap ix) 1)
+            (mut at) (primitive/iand (res-index-hash a b n) mask)
+            (mut r) ""]
+        (loop (let [s (primitive/index slots (load at))]
+                (cond (= (.used s) 0) (break)
+                      (res-index-slot-matches? s a b n)
+                        (do (store! r (load (field s val))) (break))
+                      :else (set! at (primitive/iand (primitive/iadd (load at) 1) mask)))))
+        (load r))))
+
+; Bring `ix` up to date with a list of `len` entries at `buf`, belonging to
+; `owner`. Returns true when the index may be extended in place; false when it
+; was started over and must be refilled from entry 0.
+(defn res-index-reset-if-stale! [(ix (ptr ResIndex)) (owner i64) (buf i64) (len i64)] (-> i64)
+  (when (or (!= (.owner ix) owner) (!= (.buf ix) buf) (< len (.synced ix)))
+    (res-index-clear! ix)
+    (set! (.owner ix) owner)
+    0)
+  0)
+
+(defn type-res-synced [] (-> (ptr ResIndex))
+  (let [lst (type-res-list)
+        ix (type-res-index)
+        n (len (load lst))]
+    (res-index-reset-if-stale! ix (primitive/cast i64 lst) (primitive/cast i64 (.data lst)) n)
+    (for [i (.synced ix) n]
+      (let [e (al-elem [TypeResEntry] lst i)]
+        (res-index-put! ix (.module e) (.raw e) 0 (.qual e) true)))
+    (set! (.synced ix) n)
+    (set! (.buf ix) (primitive/cast i64 (.data lst)))
+    ix))
+
+(defn value-res-synced [] (-> (ptr ResIndex))
+  (let [lst (value-res-list)
+        ix (value-res-index)
+        n (len (load lst))]
+    (res-index-reset-if-stale! ix (primitive/cast i64 lst) (primitive/cast i64 (.data lst)) n)
+    (for [i (.synced ix) n]
+      (let [e (al-elem [ValueResEntry] lst i)]
+        (res-index-put! ix (.module e) (.raw e) 0 (.qual e) true)))
+    (set! (.synced ix) n)
+    (set! (.buf ix) (primitive/cast i64 (.data lst)))
+    ix))
+
+(defn src-mod-synced [] (-> (ptr ResIndex))
+  (let [lst (src-mod-list)
+        ix (src-mod-index)
+        n (len (load lst))]
+    (res-index-reset-if-stale! ix (primitive/cast i64 lst) (primitive/cast i64 (.data lst)) n)
+    (for [i (.synced ix) n]
+      (let [e (al-elem [SrcModEntry] lst i)]
+        ; The first registration of a source id wins.
+        (res-index-put! ix "" "" (.source e) (.module e) false)))
+    (set! (.synced ix) n)
+    (set! (.buf ix) (primitive/cast i64 (.data lst)))
+    ix))
+
 (defstruct TypeResEntry
   [(module (slice u8)) (raw (slice u8)) (qual (slice u8))])
 
@@ -715,6 +897,8 @@
    (arena scratch/ScratchArena)])
 
 (defn resolution-map-arena-release [(raw (ptr i8))] (-> i64)
+  ; The lists live in these arenas; an index built over them must not outlive them.
+  (res-indexes-invalidate!)
   (scratch/scratch-close! (primitive/cast (ptr scratch/ScratchArena) raw)))
 
 ;;; Qualified `defalias` bindings visible to this compilation: the forms being
@@ -795,6 +979,7 @@
       (store! (load (field b lst))
               (al-new [TypeResEntry] (scratch/scratch-allocator (field b arena))))
       (store! (field b init) 1)
+      (res-indexes-invalidate!)
       0)
     (load (field b lst))))
 
@@ -804,6 +989,7 @@
     (scratch/scratch-reset! (field b arena))
     (set! (load (field b lst))
           (al-new [TypeResEntry] (scratch/scratch-allocator (field b arena))))
+    (res-indexes-invalidate!)
     0))
 
 ; An owned copy of a resolution name. The names handed to the two record
@@ -836,24 +1022,9 @@
     0))
 
 (defn type-res-lookup [(module (slice u8)) (raw (slice u8))] (-> (slice u8))
-  (let [lst (type-res-list)
-        n (len (load lst))
-        (mut i) (primitive/isub n 1)
-        (mut r) ""
-        e (primitive/alloc-stack TypeResEntry)]
-    (loop (if (< (load i) (primitive/cast i64 0))
-              (break)
-              (do
-                (set! e (get (load lst) (load i)))
-                (when (and (= (load (field e module)) module)
-                           (= (load (field e
-                                           raw))
-                              raw))
-                  (store! r (load (field e qual)))
-                  (break))
-                (set! i (primitive/isub (load i) 1)))))
-    (if (!= (load r) "")
-        (load r)
+  (let [r (res-index-get (type-res-synced) module raw 0)]
+    (if (!= r "")
+        r
         (resbase/resolution-lookup (.resolution_base (ast-unit-state)) true module raw))))
 
 ; ── VALUE-REFERENCE resolution registry ─────────────────────────────────────
@@ -887,6 +1058,7 @@
       (store! (load (field b lst))
               (al-new [ValueResEntry] (scratch/scratch-allocator (field b arena))))
       (store! (field b init) 1)
+      (res-indexes-invalidate!)
       0)
     (load (field b lst))))
 
@@ -896,6 +1068,7 @@
     (scratch/scratch-reset! (field b arena))
     (set! (load (field b lst))
           (al-new [ValueResEntry] (scratch/scratch-allocator (field b arena))))
+    (res-indexes-invalidate!)
     0))
 
 ; Owns its names for the same reason type-res-record does.
@@ -910,22 +1083,9 @@
     0))
 
 (defn value-res-lookup [(module (slice u8)) (raw (slice u8))] (-> (slice u8))
-  (let [lst (value-res-list)
-        n (len (load lst))
-        (mut i) (primitive/isub n 1)
-        (mut r) ""
-        e (primitive/alloc-stack ValueResEntry)]
-    (loop (if (< (load i) (primitive/cast i64 0))
-              (break)
-              (do
-                (set! e (get (load lst) (load i)))
-                (when (and (= (load (field e module)) module)
-                           (= (load (field e raw)) raw))
-                  (store! r (load (field e qual)))
-                  (break))
-                (set! i (primitive/isub (load i) 1)))))
-    (if (!= (load r) "")
-        (load r)
+  (let [r (res-index-get (value-res-synced) module raw 0)]
+    (if (!= r "")
+        r
         (resbase/resolution-lookup (.resolution_base (ast-unit-state)) false module raw))))
 
 ; ── ambient core provider ORDER ──────────────────────────────────────────────
@@ -1170,6 +1330,7 @@
       (store! (load (field b lst))
               (al-new [SrcModEntry] (scratch/scratch-allocator (field b arena))))
       (store! (field b init) 1)
+      (res-indexes-invalidate!)
       0)
     (load (field b lst))))
 
@@ -1179,6 +1340,7 @@
     (scratch/scratch-reset! (field b arena))
     (set! (load (field b lst))
           (al-new [SrcModEntry] (scratch/scratch-allocator (field b arena))))
+    (res-indexes-invalidate!)
     0))
 
 (defn src-mod-record [(source i64) (module (slice u8))] (-> i64)
@@ -1190,23 +1352,9 @@
       0)))
 
 (defn src-mod-lookup [(source i64)] (-> (slice u8))
-  (let [lst (src-mod-list)
-        n (len (load lst))
-        (mut i) 0
-        (mut r) ""
-        e (primitive/alloc-stack SrcModEntry)]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (set! e (get (load lst) (load i)))
-                (when (= (load (field e source)) source)
-                  (store! r
-                          (load (field e
-                                       module)))
-                  (break))
-                (set! i (primitive/iadd (load i) 1)))))
-    (if (!= (load r) "")
-        (load r)
+  (let [r (res-index-get (src-mod-synced) "" "" source)]
+    (if (!= r "")
+        r
         (resbase/resolution-source-lookup (.resolution_base (ast-unit-state)) source))))
 
 ;;; ── LEXICAL SCOPE MAP: which locals were in scope at each qualified node ──────
