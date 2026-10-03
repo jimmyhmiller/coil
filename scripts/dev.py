@@ -430,6 +430,7 @@ def test(args: argparse.Namespace) -> None:
         execute(sys.executable, "tests/compiler/features/authored_gensym_source_guard.py")
         execute(sys.executable, "tests/compiler/features/tagged_form_revision_guard.py")
         execute(compiler, "run", "tests/metaprogramming/global_reference_identity.coil")
+        execute(sys.executable, "scripts/tests/source-references.py", "--compiler", compiler)
         execute(compiler, "run", "tests/compiler/features/callable_void_return.coil")
         execute(compiler, "run", "tests/compiler/features/const_generic_trait_method.coil")
         rejected = subprocess.run([compiler, "check", "tests/compiler/features/void_value_argument_rejected.coil"],
