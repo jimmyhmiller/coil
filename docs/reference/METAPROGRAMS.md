@@ -326,7 +326,10 @@ New API this project added (all shipped):
   `declare` of a function's exact signature or of a `def`'s storage, a record or
   sum with qualified types, or the source of what is instantiated or expanded
   where it is used; `(meta/module-header M)` and `(meta/module-impls M)` are its
-  `module`/`import`/`export` and `impl`/`derive` forms; `(meta/toolchain)` names
+  `module`/`import`/`export` and `impl`/`derive` forms; `(meta/annotations NAME)`
+  is the `:key value` pairs NAME's `defn` or `def` carries, as one list (empty if
+  it has none, `:unresolved` if the program has no such definition), which is how
+  a transform finds the definitions an annotation marks; `(meta/toolchain)` names
   the compiler and target the declarations assume. `(meta/describe NAMES)` and
   `(meta/describe-modules MODULES)` assemble a description, `(meta/describe-source
   D)` renders it as text, and `(meta/source CODE)` renders any form. A description
