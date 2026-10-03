@@ -417,6 +417,7 @@ function makeEnv(run) {
     exit: (c) => { throw new ExitSignal(Number(c)); },
 
     // threads — single-threaded, so init/lock are no-ops and create is a hard trap
+    pthread_self: () => 1,  // the only thread there is
     pthread_mutex_init: () => 0, pthread_mutex_lock: () => 0, pthread_mutex_unlock: () => 0,
     pthread_cond_init: () => 0, pthread_cond_signal: () => 0, pthread_cond_wait: () => 0,
     pthread_attr_init: () => 0, pthread_attr_destroy: () => 0,
