@@ -4,8 +4,13 @@
 (import "coil.io" :as io)
 (import "coil.compiler.mtrace" :as mt)
 (import "coil.scratch" :as scratch)
+(import "coil.thread" :as thread)
 
 (extern getenv :cc c [(ptr i8)] (-> (ptr i8)))
+(extern atexit :cc c [(fnptr c [] i64)] (-> i32))
+(extern pthread_mutex_init :cc c [(ptr i8) (ptr i8)] (-> i32))
+(extern pthread_mutex_lock :cc c [(ptr i8)] (-> i32))
+(extern pthread_mutex_unlock :cc c [(ptr i8)] (-> i32))
 
 (defstruct Span
   [(name (slice u8))
@@ -15,6 +20,8 @@
    ; unit and ends in another (it straddles compilation-unit-leave!) cannot
    ; subtract the two readings.
    (started-unit (ptr mt/MtraceUnitState))
+   ; Row in the `--timings` table; -1 when timings are off.
+   (timing-slot i64)
    (enabled bool)])
 
 ; A trace observation is flushed immediately, but formatting it should not issue
@@ -33,10 +40,242 @@
                       (primitive/cast (ptr i8) (field out buffer))
                       1024))
 
-(defn trace-enabled? [] (-> bool)
+(defn trace-env? [] (-> bool)
   (let [value (getenv c"COIL_TRACE")]
     (and (!= (primitive/cast i64 value) 0)
          (!= (load value) (primitive/cast i8 48)))))
+
+;;; `coil build --timings`: aggregate every span into a table printed once at
+;;; exit instead of streaming `coil-trace` lines. The table is fixed static
+;;; storage for the same reason as mtrace's: a timing aid must not allocate
+;;; through the allocator it measures. Spans begin on several threads (the
+;;; parallel backend), so every access is under one mutex, and nesting depth is
+;;; tracked per thread id.
+(defstruct TimingRow
+  [(name (array u8 96))
+   (name-len i64)
+   (depth i64)
+   (total-ms i64)
+   (count i64)])
+
+(defstruct TimingOpen [(thread i64) (row i64)])
+
+(defstruct TimingTable
+  [(on bool)
+   (mutex (array i8 64))
+   (started-ms i64)
+   (rows i64)
+   (dropped i64)
+   (open-n i64)
+   (open-dropped i64)
+   (open (array TimingOpen 1024))
+   (table (array TimingRow 512))])
+
+(defn timing-table [] (-> (ptr TimingTable))
+  (primitive/alloc-static TimingTable))
+
+(defn timings? [] (-> bool)
+  (load (field (timing-table) on)))
+
+(defn trace-enabled? [] (-> bool)
+  (or (timings?) (trace-env?)))
+
+(defn timing-lock! [(t (ptr TimingTable))] (-> i64)
+  (pthread_mutex_lock (primitive/cast (ptr i8) (field t mutex)))
+  0)
+
+(defn timing-unlock! [(t (ptr TimingTable))] (-> i64)
+  (pthread_mutex_unlock (primitive/cast (ptr i8) (field t mutex)))
+  0)
+
+(defn timing-name-eq? [(row (ptr TimingRow)) (name (slice u8))] (-> bool)
+  (let [n (if (> (len name) 96) 96 (len name))]
+    (if (!= (.name-len row) n)
+        false
+        (let [(mut i) 0
+              (mut same) true]
+          (loop (if (or (>= (load i) n) (not (load same)))
+                    (break)
+                    (do
+                      (when (!= (load (primitive/index (field row name) (load i)))
+                                (get name (load i)))
+                        (store! same false)
+                        0)
+                      (set! i (primitive/iadd (load i) 1)))))
+          (load same)))))
+
+;;; Register a span at begin and return its row. Rows are keyed by name and
+;;; depth-at-first-sight, in first-begin order, so the table reads as the
+;;; pipeline did. Returns -1 when the table is full (counted, reported).
+(defn timing-begin! [(name (slice u8))] (-> i64)
+  (let [t (timing-table)
+        me (thread/thread-current-id)]
+    (timing-lock! t)
+    (let [(mut depth) 0
+          (mut i) 0
+          (mut hit) -1
+          (mut row) -1]
+      (loop (if (>= (load i) (.open-n t))
+                (break)
+                (do
+                  (when (= (.thread (primitive/index (field t open) (load i))) me)
+                    (store! depth (primitive/iadd (load depth) 1))
+                    0)
+                  (set! i (primitive/iadd (load i) 1)))))
+      (store! i 0)
+      (loop (if (>= (load i) (.rows t))
+                (break)
+                (if (timing-name-eq? (primitive/index (field t table) (load i)) name)
+                    (do (store! hit (load i)) (break))
+                    (set! i (primitive/iadd (load i) 1)))))
+      (if (>= (load hit) 0)
+          (store! row (load hit))
+          (if (>= (.rows t) (primitive/cast i64 512))
+              (set! (.dropped t) (primitive/iadd (.dropped t) 1))
+              (let [r (primitive/index (field t table) (.rows t))
+                    n (if (> (len name) 96) 96 (len name))]
+                (let [(mut j) 0]
+                  (loop (if (>= (load j) n)
+                            (break)
+                            (do
+                              (set! (primitive/index (field r name) (load j))
+                                    (get name (load j)))
+                              (set! j (primitive/iadd (load j) 1))))))
+                (set! (.name-len r) n)
+                (set! (.depth r) (load depth))
+                (set! (.total-ms r) 0)
+                (set! (.count r) 0)
+                (store! row (.rows t))
+                (set! (.rows t) (primitive/iadd (.rows t) 1)))))
+      (if (>= (.open-n t) (primitive/cast i64 1024))
+          (set! (.open-dropped t) (primitive/iadd (.open-dropped t) 1))
+          (let [o (primitive/index (field t open) (.open-n t))]
+            (set! (.thread o) me)
+            (set! (.row o) (load row))
+            (set! (.open-n t) (primitive/iadd (.open-n t) 1))))
+      (timing-unlock! t)
+      (load row))))
+
+;;; Close the innermost open span of this thread and charge it `elapsed`.
+(defn timing-end! [(row i64) (elapsed i64)] (-> i64)
+  (let [t (timing-table)
+        me (thread/thread-current-id)]
+    (timing-lock! t)
+    (let [(mut i) (primitive/isub (.open-n t) 1)]
+      (loop (if (< (load i) 0)
+                (break)
+                (if (= (.thread (primitive/index (field t open) (load i))) me)
+                    (do
+                      ; remove entry i, preserving order
+                      (let [(mut j) (load i)]
+                        (loop (if (>= (primitive/iadd (load j) 1) (.open-n t))
+                                  (break)
+                                  (do
+                                    (set! (primitive/index (field t open) (load j))
+                                          (load (primitive/index (field t open)
+                                                                 (primitive/iadd (load j) 1))))
+                                    (set! j (primitive/iadd (load j) 1))))))
+                      (set! (.open-n t) (primitive/isub (.open-n t) 1))
+                      (break))
+                    (set! i (primitive/isub (load i) 1))))))
+    (when (>= row 0)
+      (let [r (primitive/index (field t table) row)]
+        (set! (.total-ms r) (primitive/iadd (.total-ms r) elapsed))
+        (set! (.count r) (primitive/iadd (.count r) 1))
+        0))
+    (timing-unlock! t)
+    0))
+
+(defn timing-print-padded-int [(w (ptr io/Writer)) (v i64) (width i64)] (-> i64)
+  (let [(mut digits) 1
+        (mut x) v]
+    (loop (if (< (load x) 10)
+              (break)
+              (do (store! x (primitive/idiv (load x) 10))
+                  (store! digits (primitive/iadd (load digits) 1)))))
+    (let [(mut pad) (primitive/isub width (load digits))]
+      (loop (if (<= (load pad) 0)
+                (break)
+                (do (io/write-byte w (primitive/cast u8 32))
+                    (set! pad (primitive/isub (load pad) 1))))))
+    (io/print-int w v)
+    0))
+
+;;; The exit report. Times are inclusive of nested spans, and a span running on
+;;; several threads at once (the parallel backend) can exceed the wall total.
+(defn timing-report! [] (-> i64)
+  (if (not (timings?))
+      0
+      (timing-report-table!)))
+
+(defn timing-report-table! [] (-> i64)
+  (let [t (timing-table)
+        out (primitive/alloc-stack TraceOutput)
+        w (trace-writer out)
+        wall (primitive/isub (trace-now-ms) (.started-ms t))
+        (mut hidden) 0]
+    (io/print-str w "\ncoil timings (inclusive; wall ")
+    (io/print-int w wall)
+    (io/print-str w "ms; threaded spans can exceed wall)\n")
+    (io/print-str w "      ms     %  calls  phase\n")
+    (let [(mut i) 0]
+      (loop (if (>= (load i) (.rows t))
+                (break)
+                (let [r (primitive/index (field t table) (load i))]
+                  (if (< (.total-ms r) 1)
+                      (set! hidden (primitive/iadd (load hidden) 1))
+                      (do
+                        (timing-print-padded-int w (.total-ms r) 8)
+                        (io/print-str w "  ")
+                        (timing-print-padded-int
+                          w
+                          (if (> wall 0)
+                              (primitive/idiv (primitive/imul (.total-ms r) 100) wall)
+                              0)
+                          3)
+                        (io/print-str w "%  ")
+                        (timing-print-padded-int w (.count r) 5)
+                        (io/print-str w "  ")
+                        (let [(mut d) 0]
+                          (loop (if (>= (load d) (.depth r))
+                                    (break)
+                                    (do (io/print-str w "  ")
+                                        (set! d (primitive/iadd (load d) 1))))))
+                        (let [(mut k) 0]
+                          (loop (if (>= (load k) (.name-len r))
+                                    (break)
+                                    (do (io/write-byte w (load (primitive/index (field r name) (load k))))
+                                        (set! k (primitive/iadd (load k) 1))))))
+                        (io/write-byte w (primitive/cast u8 10))))
+                  (set! i (primitive/iadd (load i) 1))))))
+    (when (> (load hidden) 0)
+      (io/print-int w (load hidden))
+      (io/print-str w " spans under 1 ms not shown\n")
+      0)
+    (when (> (.dropped t) 0)
+      (io/print-str w "timings table full: ")
+      (io/print-int w (.dropped t))
+      (io/print-str w " spans against further names were not recorded\n")
+      0)
+    (io/buffered-flush (field out state))
+    0))
+
+;;; This process is handing the build to a child that received `--timings`:
+;;; stop recording and reporting here so the child's table is the only one.
+(defn timings-delegate! [] (-> i64)
+  (set! (.on (timing-table)) false)
+  0)
+
+;;; Turn timings on for this process. Called once, before any worker exists.
+(defn timings-enable! [] (-> i64)
+  (let [t (timing-table)]
+    (when (not (.on t))
+      (pthread_mutex_init (primitive/cast (ptr i8) (field t mutex)) (primitive/cast (ptr i8) 0))
+      (set! (.started-ms t) (trace-now-ms))
+      (set! (.on t) true)
+      (atexit (primitive/fnptr-of timing-report!))
+      0)
+    0))
 
 (defn trace-now-ms [] (-> i64)
   (try (let [value (try-or! (time/monotonic-now-ms) 0)] value)))
@@ -65,11 +304,15 @@
     (set! (.started-ms span) (if enabled (trace-now-ms) 0))
     (set! (.started-bytes span) (if enabled (mt/mtrace-mem-now) 0))
     (set! (.started-unit span) (mt/mtrace-unit-state))
-    (when enabled (trace-line "begin" name -1) 0)
+    (set! (.timing-slot span) (if (timings?) (timing-begin! name) -1))
+    (when (and enabled (trace-env?)) (trace-line "begin" name -1) 0)
     (load span)))
 
 (defn span-end [(span Span)] (-> i64)
-  (when (load (field span enabled))
+  (when (and (load (field span enabled)) (timings?))
+    (timing-end! (.timing-slot span) (- (trace-now-ms) (.started-ms span)))
+    0)
+  (when (and (load (field span enabled)) (trace-env?))
     (trace-line "end"
                 (load (field span name))
                 (- (trace-now-ms) (load (field span started-ms))))
@@ -85,7 +328,7 @@
 ; Tab-delimited observations for development profiling. Names/paths are retained
 ; by their owning compilation, never by the profiler. No global accumulation.
 (defn profile-event [(kind (slice u8)) (name (slice u8)) (value i64)] (-> i64)
-  (when (trace-enabled?)
+  (when (trace-env?)
     (let [out (primitive/alloc-stack TraceOutput)
           w (trace-writer out)]
       (io/print-str w "coil-profile\t")
@@ -100,7 +343,7 @@
   0)
 
 (defn arena-snapshot [(name (slice u8)) (arena (ptr scratch/ScratchArena))] (-> i64)
-  (when (and (trace-enabled?) (!= (primitive/cast i64 arena) 0))
+  (when (and (trace-env?) (!= (primitive/cast i64 arena) 0))
     (profile-event "arena.live" name (scratch/scratch-live arena))
     (profile-event "arena.peak" name (scratch/scratch-peak arena))
     (profile-event "arena.capacity" name (scratch/scratch-capacity arena))
@@ -108,7 +351,7 @@
   0)
 
 (defn count [(name (slice u8)) (value i64)] (-> i64)
-  (when (trace-enabled?)
+  (when (trace-env?)
     (let [out (primitive/alloc-stack TraceOutput)
           w (trace-writer out)]
       (io/print-str w "coil-trace count ")
