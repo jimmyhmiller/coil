@@ -472,6 +472,49 @@ cannot be checked as a value. `tests/compiler/features/jit_live_checker.coil` is
 a complete client that names its own versions; `jit_env_native.coil` checks
 against a running session.
 
+## The program a session runs in
+
+A session inside a program can be given that program as its environment, so the
+code it compiles calls the program's own functions, reads and writes its own
+`def`s, and uses its types, generics and macros. The program describes itself when
+it is built: a metaprogram queries the compiler (`coil.meta`, see
+[METAPROGRAMS.md](METAPROGRAMS.md)) and stores the description wherever it likes.
+At run time the program hands the description to the session before its first
+submission:
+
+```text
+;; at build time, in a transform the program registers
+(let [description (meta/describe-modules `(app.core))]
+  (for name (iter (meta/definitions `app.core))
+    (when (meta/linkable? name) (meta/link-export! name)))
+  ;; … add `(defn* environment [] (-> (slice u8)) ~(meta/describe-source description))`
+  )
+
+;; at run time
+(jit-session-set-environment! (mut session) (environment))
+(jit-compile! (mut session) "(module app.core) (defn more [] (-> i64) (+ (helper 1) (get counter)))")
+```
+
+A description is ordinary Coil source: a `(toolchain :compiler … :target …)`
+header, then each module's header and the declaration of each definition. A
+function is `(declare name [params] (-> ret))` and a `def` is `(declare name TYPE)`,
+both resolved to the running program's own symbols; records, sums and constants
+are spelled out; generics, macros, traits and impls are their source, which the
+session compiles itself. Describe whatever you like: every definition of some
+modules (`describe-modules`), or exactly some names (`describe`).
+
+`jit-session-set-environment!` returns 0, or: -1 once the session has started; -2
+when the description has no toolchain header or another toolchain or target made
+it; -3 when the running program does not export a symbol the description
+declares (give it to `meta/link-export!` when building); -4 when the description
+does not compile. `jit-diagnostic` says which. The described definitions belong to
+the program: a session never reclaims or redefines them. It may `retire-` one and
+define the name again, and code the program compiled ahead of time keeps calling
+the original. `tests/compiler/features/host_environment.coil` is a complete host.
+
+A session cannot yet import `coil.meta` itself (pad `coil-bugs`), so keep the
+metaprogram that writes a description in a module the description does not cover.
+
 ## Discovering a program's sources
 
 `(jit-read-source-graph allocator ENTRY)` finds an entry's source modules using
