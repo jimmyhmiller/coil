@@ -514,6 +514,8 @@ uint32_t env_waitpid(uint32_t pid, uint64_t status, uint32_t options) {
 }
 
 // ---- threads: single-threaded no-ops (called during metaengine setup) ----
+// The only thread there is: its identity is constant.
+uint64_t env_pthread_self(void) { return 1; }
 uint32_t env_pthread_mutex_init(uint64_t a, uint64_t b) { (void)a; (void)b; return 0; }
 uint32_t env_pthread_mutex_lock(uint64_t a) { (void)a; return 0; }
 uint32_t env_pthread_mutex_unlock(uint64_t a) { (void)a; return 0; }

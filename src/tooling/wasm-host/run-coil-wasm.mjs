@@ -491,6 +491,7 @@ const env = {
   // process
   abort:()=>{ throw new Error('env.abort() called'); }, exit:(c)=>{ throw new ExitSignal(Number(c)); },
   // threads — init/lock are noops (single-threaded); create spawns → WALL1
+  pthread_self:()=>1,  // the only thread there is
   pthread_mutex_init:()=>0, pthread_mutex_lock:()=>0, pthread_mutex_unlock:()=>0,
   pthread_cond_init:()=>0, pthread_cond_signal:()=>0, pthread_cond_wait:()=>0,
   pthread_attr_init:()=>0, pthread_attr_destroy:()=>0,

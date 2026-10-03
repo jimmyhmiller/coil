@@ -498,6 +498,8 @@ uint32_t env_waitpid(uint32_t pid, uint32_t status, uint32_t options) {
 }
 
 // ---- threads: single-threaded no-ops ----
+// The only thread there is: its identity is constant.
+uint32_t env_pthread_self(void) { return 1; }
 uint32_t env_pthread_mutex_init(uint32_t a, uint32_t b) { (void)a; (void)b; return 0; }
 uint32_t env_pthread_mutex_lock(uint32_t a) { (void)a; return 0; }
 uint32_t env_pthread_mutex_unlock(uint32_t a) { (void)a; return 0; }
