@@ -247,7 +247,20 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
         print("PASS: a provider's designated entries across many replacing revisions", flush=True)
         return "project checks"
 
+    # The demo in src/examples/jit_expose: a metaprogram hands an application to a
+    # session, which type checks new code against it. Its output is its contract.
+    def jit_expose_demo():
+        binary = work / "jit-expose-demo"
+        run(COMPILER, "build", ROOT / "src/examples/jit_expose/demo.coil", "-o", binary, *flags,
+            env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS="src/examples"))
+        out = run(binary).stdout
+        for line in ("status 0", "calls = 1", "expects a reference to example.jit-expose.app.Point, got i64",
+                     "call to undefined function 'no-such-function'", "the program reads 41"):
+            assert line in out, (line, out)
+        return "jit_expose demo"
+
     pending += [pool.submit(project_chain)]
+    pending += [pool.submit(jit_expose_demo)]
     pending += [pool.submit(build_and_run, name) for name in fixtures]
     try:
         for future in concurrent.futures.as_completed(pending):

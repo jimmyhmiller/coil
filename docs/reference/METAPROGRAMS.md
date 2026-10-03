@@ -335,12 +335,14 @@ New API this project added (all shipped):
   the compiler and target the declarations assume; `(meta/source CODE)` renders any
   form as text. `(meta/embed-text MODULES HOST NAME TEXT)` adds a function `(NAME)`
   to module HOST returning TEXT, and `(meta/transform-result MODULES)` is what a
-  transform returns. `(meta/embed-environment MODULES HOST NAME DESCRIBED)` is the
-  policy built from these for a JIT session: it adds `(NAME)`, which builds the
-  environment of the modules DESCRIBED from their definitions marked
-  `:jit/expose` ([STATEFUL_JIT.md](STATEFUL_JIT.md)).
-  `tests/compiler/features/host_environment*.coil` embed an environment and hand
-  it to a session.
+  transform returns. `(meta/embed-environment MODULES HOST NAME DESCRIBED EXPOSE)`
+  is a helper built from these queries for handing the program to a JIT session:
+  it describes the modules DESCRIBED and hands over the functions and `def`s in the
+  list EXPOSE ([STATEFUL_JIT.md](STATEFUL_JIT.md)). These are functions a metaprogram
+  calls. The compiler does nothing with them by itself, and what to hand over is
+  always the caller's choice.
+  `tests/compiler/features/host_environment*.coil` embed an environment and hand it
+  to a session.
 - **`(checker FN)` / `(transform FN)`** — register a whole-program metaprogram.
 - **A dialect is a single import.** A module that contains `(checker …)`/`(transform …)`
   registrations *is* a dialect — importing it applies the whole stack (import order =
