@@ -315,33 +315,32 @@ New API this project added (all shipped):
   skips the standard library while still linting the user's own modules. (Checkers can't
   call imported string functions — the closure doesn't include them — so `code-from-user?`
   does the check in the compiler and hands the checker a bool.)
-- **Describing the program to another unit.** A checker or transform can ask the
-  compiler what the program is, as declarations another compilation unit (a JIT
-  session inside the program, say) can compile against. `coil.meta` wraps each
-  query: `(meta/modules)` lists every module, the library's included;
+- **Asking the compiler about the program.** A checker or transform can ask the
+  compiler what the program is, for instance to describe it to another unit (a JIT
+  session inside the program, say). `coil.meta` wraps each query:
+  `(meta/modules)` lists every module, the library's included;
   `(meta/definitions M)` lists M's definitions as qualified symbols;
   `(meta/definition-kind NAME)` is `:function`, `:macro`, `:generic`, `:def`,
   `:const`, `:struct`, `:sum`, `:trait`, `:alias` or `:extern`;
   `(meta/declaration NAME)` is the form that declares NAME to another unit: a
-  `declare` of a function's exact signature or of a `def`'s storage, a record or
-  sum with qualified types, or the source of what is instantiated or expanded
-  where it is used; `(meta/module-header M)` and `(meta/module-impls M)` are its
+  `declare` of a function's exact signature (an aggregate parameter is spelled
+  `(ref T)`, as `fnptr-of` types it) or of a `def`'s storage, a record or sum with
+  qualified types, or the source of what is instantiated or expanded where it is
+  used; `(meta/definition-source NAME)` is the form that defines NAME as written;
+  `(meta/module-header M)` and `(meta/module-impls M)` are its
   `module`/`import`/`export` and `impl`/`derive` forms; `(meta/annotations NAME)`
   is the `:key value` pairs NAME's `defn` or `def` carries, as one list (empty if
   it has none, `:unresolved` if the program has no such definition), which is how
   a transform finds the definitions an annotation marks; `(meta/toolchain)` names
-  the compiler and target the declarations assume. `(meta/describe NAMES)` and
-  `(meta/describe-modules MODULES)` assemble a description, `(meta/describe-source
-  D)` renders it as text, and `(meta/source CODE)` renders any form. A description
-  is ordinary source: store it in the program or write it anywhere with
-  `coil.fs`. `(meta/embed-description MODULES HOST NAME DESCRIBED)` does the
-  common case for a transform (describe, export, and add `(NAME)` to HOST
-  returning the text); `(meta/embed-text MODULES HOST NAME TEXT)` embeds any text,
-  and `(meta/transform-result MODULES)` is what a transform returns.
-  `(meta/link-export! NAME)` keeps a function or `def` in the binary and exports it
-  under its Coil symbol, which a declaration of it links to.
-  `tests/compiler/features/host_environment*.coil` describe a module, embed it and
-  hand it to a session.
+  the compiler and target the declarations assume; `(meta/source CODE)` renders any
+  form as text. `(meta/embed-text MODULES HOST NAME TEXT)` adds a function `(NAME)`
+  to module HOST returning TEXT, and `(meta/transform-result MODULES)` is what a
+  transform returns. `(meta/embed-environment MODULES HOST NAME DESCRIBED)` is the
+  policy built from these for a JIT session: it adds `(NAME)`, which builds the
+  environment of the modules DESCRIBED from their definitions marked
+  `:jit/expose` ([STATEFUL_JIT.md](STATEFUL_JIT.md)).
+  `tests/compiler/features/host_environment*.coil` embed an environment and hand
+  it to a session.
 - **`(checker FN)` / `(transform FN)`** — register a whole-program metaprogram.
 - **A dialect is a single import.** A module that contains `(checker …)`/`(transform …)`
   registrations *is* a dialect — importing it applies the whole stack (import order =
