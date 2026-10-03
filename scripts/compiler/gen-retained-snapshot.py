@@ -99,6 +99,12 @@ OVERRIDES={
 NULL_FIELDS={('coil.compiler.loader.LS','parent'),
  ('coil.compiler.check.Cx','anon_outer_env'),
  ('coil.compiler.check.Cx','ownership_subst')}
+# Source refactoring evidence belongs to one lint analysis, not a retained
+# compiler revision. A snapshot starts with these views unavailable.
+ZERO_FIELDS={
+ ('coil.compiler.ast.AstUnitState','source_facts'),
+ ('coil.compiler.ast.AstUnitState','source_import_origins'),
+ ('coil.compiler.ast.AstUnitState','source_import_origins_ready')}
 EMPTY_LISTS={
  ('coil.compiler.loader.LS','out'),
  ('coil.compiler.check.Cx','cur_bounds'), ('coil.compiler.check.Cx','loops'),
@@ -337,6 +343,8 @@ def body(t):
                 target='live-sources' if name=='srcs' else 'live-contexts'
                 walks.append('(unless (or (not (.liveness g)) (= (p/cast i64 '+expr+') 0)) (for [i 0 (len (load '+expr+'))] (set! (mut (.'+target+' g)) (get (load '+expr+') i) 0)) 0)')
 
+            if key in ZERO_FIELDS:
+                fields+=[':'+name, '(p/zeroed '+render(field)+')'];continue
             if key in EMPTY_LISTS:
                 fields+=[':'+name, '(al-new ['+render(field[1])+'] (.destination g))'];continue
             if key in EMPTY_MAPS:

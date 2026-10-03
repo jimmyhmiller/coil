@@ -194,6 +194,34 @@ New API this project added (all shipped):
   executed later, once the whole program is checked, so it reads the compiler's
   authoritative output. A checker therefore layers *policy* on a program that already
   typechecks.
+- **Authored references in lint profiles.** `coil.meta` joins original source
+  syntax to resolver evidence, including macro heads before expansion. In a
+  semantic checker loaded with `coil lint --use`, `meta/source-modules` returns
+  original module records, `meta/imports MODULE` returns editable import records,
+  and `meta/references MODULE` returns authored reference occurrences. Use
+  `meta/reference-node`, `meta/reference-role`, and `meta/reference-binding` to
+  read a reference. Bindings are `(global QUALIFIED-NAME)`, `(local ID)`,
+  `:unknown`, or `:ambiguous`; a local lacking a unique checked identity contains
+  `:unknown` or `:ambiguous` instead of an ID. `meta/source-binding NODE` is strict
+  occurrence lookup: a newly constructed symbol never acquires a binding from its
+  spelling. Source queries outside this lint phase return `:unavailable`.
+
+  `meta/references-through IMPORT` selects references resolved through that
+  import's facade. `meta/reference-import` and `meta/reference-exported-name`
+  preserve that route separately from canonical ownership, including renames and
+  reexports. `meta/import-node` and `meta/import-target` expose the declaration
+  and its resolved module namespace.
+
+  `meta/qualify-import IMPORT ALIAS` produces `(edits (edit NODE REPLACEMENT) …)`
+  or `(refused "reason")`. `meta/suggest-edits PLAN MESSAGE` submits the entire
+  plan as a coordinated lint suggestion group; writing still requires `--fix`.
+  Qualification refuses incomplete evidence, alias conflicts, names inspected by
+  macros, repeated imports of one module, and imports that reexport their target.
+  Inert quoted data is excluded. Generic type occurrences whose identity cannot
+  be distinguished conservatively remain ambiguous. The opt-in policy is
+  `coil lint FILE --use coil.lint.import-aliases --diff` (replace `--diff` with
+  `--fix` to apply). It replaces wildcard imports with aliases and qualifies
+  references while preserving local shadowing and the facade's exported spelling.
 - **Transforms are MODULE-SHAPED and may ADD/REMOVE top-level forms.** `(transform
   FN)` hands FN the program as `((name form…) …)` (one record per module, like a
   checker) and FN returns those records **`do`-wrapped**: `` `(do ~@records) ``. Every
