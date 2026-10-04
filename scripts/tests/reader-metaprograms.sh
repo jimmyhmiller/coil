@@ -208,6 +208,6 @@ cp -R src/compiler "$T/prefix/lib/coil/compiler"
 cp src/compiler/prelude.coil "$T/prefix/lib/coil/prelude.coil"
 cp "$FIX/raw_provider.coil" "$T/out/provider.coil"
 cp "$FIX/raw.answer" "$T/out/program.answer"
-(cd "$T/out" && COIL_STRICT_BUNDLE=1 "$T/prefix/bin/coil" check program.answer --use reader.fixture.raw) \
+(cd "$T/out" && COIL_NAMESPACE_ROOTS=. COIL_STRICT_BUNDLE=1 "$T/prefix/bin/coil" check program.answer --use reader.fixture.raw) \
   || fail "strict installed bundle from outside the repository"
 echo "reader metaprograms: PASS"
