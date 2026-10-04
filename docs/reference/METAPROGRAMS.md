@@ -70,6 +70,31 @@ walk is linear and does not build intermediate lists. Use `primitive/code-nth` d
 when an algorithm genuinely needs random access; use `CodeBuilder` plus `push!` when it
 needs to construct output.
 
+### Building lists by recursion costs what it looks like
+
+Write the recursion the way it reads. A splice of a long list does not copy it: the
+result shares the list it was given and lays its items out once, the first time one is
+read (and once more when the expansion finishes), so each of these is linear:
+
+```text
+;; one item, then the rest
+(defn nat [(i i64) (n i64)] (-> Code)
+  (if (>= i n) `() `(~i ~@(nat (+ i 1) n))))
+
+;; an accumulator that grows by a splice
+(defn gather [(i i64) (n i64) (acc Code)] (-> Code)
+  (if (>= i n) acc (gather (+ i 1) n `(~@acc ~i))))
+
+;; items before and after a long list, and joins of joins
+`(first second ~@(nat 0 n) last)
+```
+
+`code-rest` and `code-slice` are windows onto the same items and copy nothing either.
+Short splices (under 32 items) are copied, since that is the cheaper join. Reading an
+item of a joined list lays it out, so a recursion that reads every level's result before
+using it pays that layout at each level; it is still correct. `code-copy` and
+`code-concat` copy, and say so.
+
 ## The API (the vocabulary), all shipped
 
 - **Take Code apart:** `code-count`, `code-nth`, `code-rest`, `code-sym`,
