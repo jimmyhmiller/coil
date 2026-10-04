@@ -8,6 +8,28 @@ commits: `7ec494e` (phase 0, the scope fix), `f9cf84f` (metering), `0e69c3d`
 kept as originally written — including the budget, which was later cut (see
 the deviations).
 
+**Update (2026-10-03): splices share, and the quadratic lint is gone.** The two
+idioms the lint still flagged, ``(item ~@(f …))`` and ``(~@acc x)``, are linear now.
+A splice of a list of 32 or more items records a reference to it (a window of exactly
+the items spliced, so a builder that grows later changes nothing) instead of copying
+it. The result is a joined list (`KSeg`). To every reader it is an ordinary list:
+`sx-tag` reports a list and `sx-items` lays its parts out once, into a cache it keeps,
+the first time an item is asked for, so nothing that works on a list had to learn
+about it. Only the length (`code-node-len`) is answered without laying out, which keeps
+a recursion that joins and counts cheap; promotion at the end of the expansion
+flattens it to an ordinary `KList`. (The first version gave it a tag of its own, and
+every check of the form `tag = 6` then silently changed meaning for lists of 32 or
+more items: `code-list-like` built an empty list from one and `bytes->str` refused
+one. Reading as a list is what makes the sweep unnecessary.) At 128,000 items the
+natural recursion peaks at about 250 MB in 0.4 s, the same as a hand-written builder;
+the old copying needed about 3.9 GB at 8,000 and would need about a terabyte at
+128,000. `coil.lint.meta` is deleted: the `code-rest` rule was already stale since
+views, and the other rules warned about idioms that no longer cost anything. The
+evidence is `tests/compiler/features/meta_shared_splice.coil` (the lists equal
+builder-made ones at sizes under, at and over the threshold, read every way a list can
+be read) and `meta_shared_splice_scale.coil` (100,000 items; it does not finish unless
+splices share). The text below records the design as it was written.
+
 Deviations from the plan below, and why:
 
 - **The builder/resplice rules remain warn-only.** Their linear rewrite changes

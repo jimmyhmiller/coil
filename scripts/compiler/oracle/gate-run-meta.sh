@@ -402,6 +402,18 @@ COIL_META_INTERP=1 "$BIN" run tests/compiler/features/code_collections.coil >/de
 rc=$?
 [ "$rc" = 0 ] || { echo "GATE FAIL: interpreter engine: Code collection traits exited $rc, want 0"; fail=1; }
 
+# A splice of a long list is shared, not copied (docs/design/META_MEMORY.md): the
+# natural recursive list building must give the same lists on both engines, and the
+# scale guard does not finish unless it is linear.
+for case in meta_shared_splice meta_shared_splice_scale; do
+  "$BIN" run "tests/compiler/features/$case.coil" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" = 0 ] || { echo "GATE FAIL: shared splices: $case exited $rc, want 0"; fail=1; }
+  COIL_META_INTERP=1 "$BIN" run "tests/compiler/features/$case.coil" >/dev/null 2>&1
+  rc=$?
+  [ "$rc" = 0 ] || { echo "GATE FAIL: interpreter engine: shared splices: $case exited $rc, want 0"; fail=1; }
+done
+
 for fixture in implicit_cross_template_capture implicit_variadic_splice_capture \
                use_site_binder_cannot_capture before_expand_transform_capture \
                semantic_transform_capture quote_capture; do

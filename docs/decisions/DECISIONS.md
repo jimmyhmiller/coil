@@ -371,8 +371,8 @@ six gated phases (docs/design/META_MEMORY.md has the full record):
    `code-list-done`, and the checker rejects mutation of finished Code and
    reads of unfrozen builders;
 3. failures are attributable: `COIL_MTRACE=mem` attributes allocation per
-   metaprogram, and the standard-profile lint `coil.lint.meta` flags the
-   quadratic idioms.
+   metaprogram. (The lint `coil.lint.meta` that once flagged the quadratic idioms
+   was removed when splices began sharing long lists instead of copying them.)
 
 An expansion BUDGET (a 64 MiB default cap raisable by a source-level
 `(meta-budget NAME MIB)` declaration) shipped with phase 6 and was REMOVED at
