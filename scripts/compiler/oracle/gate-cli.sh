@@ -3999,6 +3999,9 @@ EOF
 cp "$T/lint/target.coil" "$T/lint/target.orig"
 
 expect_rc 54 "lint: the target program runs before any fix"   "$COIL" run "$T/lint/target.coil"
+# `--use condlint` names a module under src/examples; the working directory is
+# not a namespace root, so say where it lives.
+export COIL_NAMESPACE_ROOTS=src/examples/metaprogramming
 expect_out 'help: try: \(cond \(= x 1\) 100' "lint: reports the chain with a help line" \
   "$COIL" lint "$T/lint/target.coil" --use condlint
 # The lint reports the 3-test chain and the commented one — but NOT the two-armed if,
@@ -4090,6 +4093,7 @@ expect_out 'cond \(= x 1\) "a; b" \(= x 2\) "c; d" \(= x 3\) "e" :else "f"' \
   cat "$T/lint/comments.coil"
 cp "$T/lint/comments.coil" "$T/lint/comments.fixed"
 "$COIL" lint "$T/lint/comments.coil" --use condlint --fix >/dev/null 2>&1
+unset COIL_NAMESPACE_ROOTS
 cmp -s "$T/lint/comments.coil" "$T/lint/comments.fixed" \
   && ok "lint --fix (comments): idempotent" \
   || bad "lint --fix (comments): idempotent" "a second --fix changed the file"
