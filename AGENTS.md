@@ -78,6 +78,18 @@ Use this format:
   `build full` while diagnosing or iterating.** Run
   `python3 scripts/dev.py build full` only once for final release verification
   after focused tests and the focused gate are green.
+- ⚠ **`build full` peaks near 9.4 GB of memory, and that is expected.** Compiling
+  the compiler once costs about 4.7 GB (measured: the largest single process), and
+  the fixpoint step in `scripts/compiler/rebootstrap.sh` deliberately emits the
+  stage 2 and stage 3 objects at the same time, so two such compiles are live at
+  once. It is the same on untouched `main` (9.38 and 9.33 GB on two runs, 2026-10-04).
+  Do not run anything else heavy beside it, and give it a memory cap when you run it
+  in the background. A candidate built by `build candidate` is heavier still per
+  compile than the installed compiler (the all-namespaces check needs about 10 GB
+  with a candidate and 3.3 GB with the installed one), so size parallel gates and
+  searches accordingly. The causes inside a single compile are tracked in the
+  `coil-bugs` pad: the self-build frontend re-parses and re-checks the expanded
+  program, and expansion re-resolves it several times.
 - `python3 scripts/dev.py test generated --compiler <candidate>` exercises
   generated-unit lifetime/ownership, native reader artifacts, incremental LLVM
   sessions, sparse/named static storage, extern aliases and the supporting ABI
