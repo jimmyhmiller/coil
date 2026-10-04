@@ -83,8 +83,12 @@ Use this format:
   the fixpoint step in `scripts/compiler/rebootstrap.sh` deliberately emits the
   stage 2 and stage 3 objects at the same time, so two such compiles are live at
   once. It is the same on untouched `main` (9.38 and 9.33 GB on two runs, 2026-10-04).
-  Do not run anything else heavy beside it, and give it a memory cap when you run it
-  in the background. A candidate built by `build candidate` is heavier still per
+  The install step that follows (`build full` without `--no-install`, or
+  `dev.py install`) warms the `coil.jit` unit with `coil build-unit jit_api.coil`,
+  which compiles the whole compiler at -O3 in a single process; measured once at
+  about 9.9 GB on 2026-10-04, not measured on untouched `main`. Do not run anything
+  else heavy beside either, and give them a memory cap when you run them in the
+  background. A candidate built by `build candidate` is heavier still per
   compile than the installed compiler (the all-namespaces check needs about 10 GB
   with a candidate and 3.3 GB with the installed one), so size parallel gates and
   searches accordingly. The causes inside a single compile are tracked in the
