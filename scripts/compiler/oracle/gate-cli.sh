@@ -278,6 +278,10 @@ expect_rc 0 "reader/runtime options after -- cannot configure compilation" \
 echo "== a file the user named must exist =="
 expect_rc 1 "build: missing file is an error"            "$COIL" build "$T/nope.coil" -o "$T/x"
 expect_out "no such file" "build: missing file is named" "$COIL" build "$T/nope.coil" -o "$T/x"
+# A directory reads as empty text, so it used to build an empty program and fail at the
+# linker for want of `main`; `check` reported success on nothing.
+expect_out "is a directory, not a source file" "build: a directory is not a source file" "$COIL" build "$T" -o "$T/x"
+expect_out "is a directory, not a source file" "check: a directory is not a source file" "$COIL" check "$T"
 expect_rc 2 "fmt: missing file is an error (not 'unformatted')" "$COIL" fmt --check "$T/nope.coil"
 "$COIL" fmt --write "$T/ghost.coil" >/dev/null 2>&1
 [ -e "$T/ghost.coil" ] && bad "fmt --write must not fabricate a file" "it created one" \
