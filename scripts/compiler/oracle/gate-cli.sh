@@ -1384,6 +1384,16 @@ printf '(module app)\n(import "util" :use *)\n(defn main [] (-> i64) (forty-two)
 ( cd "$T" && "$COIL" run "$T/sib/src/main.coil" >/dev/null 2>&1 ); [ $? = 42 ] \
   && ok "namespace lookup works from an unrelated cwd" \
   || bad "namespace index (arbitrary cwd)" "want rc=42"
+# A directory holding a Coil.toml is a project: `run DIR` is `cd DIR && run`, from anywhere,
+# with the directory dropped so the rest of the arguments mean what they always did.
+( cd "$T" && "$COIL" run sib >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "run DIR runs the project in DIR" || bad "run DIR" "want rc=42"
+( cd "$T/sib" && "$COIL" run . >/dev/null 2>&1 ); [ $? = 42 ] \
+  && ok "run . runs the project in the current directory" || bad "run ." "want rc=42"
+( cd "$T" && "$COIL" check sib >/dev/null 2>&1 ) \
+  && ok "check DIR checks the project in DIR" || bad "check DIR" "failed"
+expect_out "take a directory only when it holds a Coil.toml" \
+  "run DIR: a directory with no Coil.toml is refused with the reason" "$COIL" run "$T/sib/src"
 # Once project mode supplies explicit roots, an entry outside them does not
 # expand the namespace boundary to its containing directory.
 mkdir -p "$T/configured-root" "$T/outside-entry"
