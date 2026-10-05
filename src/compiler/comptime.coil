@@ -83,7 +83,11 @@
    (source_export_table (ptr (ArrayList ExpEntry)))
    (source_coverage_unknown Sexp)
    ; The unknown identifier above is inside a quasiquote template.
-   (source_coverage_template bool)])
+   (source_coverage_template bool)
+   ; The caller asked to treat an imported name written in a quasiquote template as
+   ; a free reference to the import, which is true unless the template itself binds
+   ; that spelling. Set per `qualify-import` call.
+   (source_assume_free bool)])
 
 (defn set-closure-checked-base! [(base (ptr checkedbase/CheckedBase)) (sigs (ptr i8))
                                  (meta-base (ptr checkedbase/CheckedBase)) (meta-sigs (ptr i8))] (-> i64)
@@ -8887,7 +8891,9 @@
 ; An identifier in a quasiquote template is not inert: the code the template
 ; generates resolves it where the macro is defined, so a template that names
 ; something this import brings in depends on the import. No evidence records how
-; such a name binds, so the edit is refused instead of leaving it unqualified.
+; such a name binds, so the edit is refused instead of leaving it unqualified,
+; unless the caller assumes template names are free references (see
+; `source-template-edits!`).
 (defn source-import-coverage? [(a (dyn Allocator)) (node Sexp) (depth i64)
                                (use (ptr Use)) (old-alias (slice u8))
                                (exports (ptr (ArrayList ExpEntry)))] (-> bool)
@@ -8907,6 +8913,8 @@
               (return-from :done false))))
         (return-from :done true))
       (when (and (> depth 0) (and (= tag 2) (source-import-candidate? node use old-alias exports)))
+        (when (.source_assume_free (comptime-unit-state))
+          (return-from :done true))
         (set! (.source_coverage_unknown (comptime-unit-state)) node)
         (set! (.source_coverage_template (comptime-unit-state)) true)
         (return-from :done false))
@@ -8940,6 +8948,48 @@
                         (return-from :done false))))) 0)))))
       true)))
 
+; Under `assume-no-shadow`: every identifier in a quasiquote template that the
+; import supplies is rewritten as a reference to it. Nothing here knows whether the
+; template binds the same spelling itself; the caller has said none does, and the
+; fix loop still reverts a round that stops compiling. This mirrors the depth
+; discipline of `source-import-coverage?`, which is what let these names through.
+(defn source-template-edits! [(a (dyn Allocator)) (node Sexp) (depth i64)
+                              (use (ptr Use)) (old-alias (slice u8))
+                              (exports (ptr (ArrayList ExpEntry)))
+                              (alias (slice u8))
+                              (edits (mut (ArrayList Sexp)))] (-> bool)
+  (block :done
+    (let [tag (sx-tag node)
+          head (if (= (sx-tag node) 6) (sx-head-name (sx-items node)) "")]
+      (when (and (= depth 0) (or (= head "quote") (or (= head "import") (= head "export"))))
+        (return-from :done true))
+      (when (or (= tag 6) (= tag 7))
+        (let [next-depth (cond (= head "quasiquote") (+ depth 1)
+                              (and (> depth 0) (or (= head "unquote") (= head "unquote-splicing")))
+                                (- depth 1)
+                              :else depth)
+              items (sx-items node)]
+          (for [i 0 (sx-len items)]
+            (unless (source-template-edits! a (sx-at items i) next-depth use old-alias exports alias (mut edits))
+              (return-from :done false))))
+        (return-from :done true))
+      (when (and (> depth 0) (and (= tag 2) (source-import-candidate? node use old-alias exports)))
+        (unless (and (= (sx-ctxt node) 0) (code-from-user-node? node))
+          (set! (.source_coverage_unknown (comptime-unit-state)) node)
+          (return-from :done false))
+        (let [name (sx-sval node)
+              slash (find-slash name)
+              leaf (if (>= slash 0)
+                       (subslice name (+ slash 1) (len name))
+                       (match (use-refers use name)
+                         (Some [exported] exported)
+                         (None [] name)))
+              replacement (sx-sym (sconcat3 a alias "/" leaf))]
+          (unless (= (sx-sval node) (sx-sval replacement))
+            (push! (mut edits) (source-plan-edit a node replacement))
+            0)))
+      true)))
+
 (defn source-qualified-import [(a (dyn Allocator)) (form Sexp) (alias Sexp)] (-> Sexp)
   (let [items (sx-items form)
         (mut out) (al-new [Sexp] a)
@@ -8956,7 +9006,7 @@
             (do (push! (mut out) part) (set! i (+ (load i) 1))))))
     (sx-mklist (box-al [Sexp] a (load out)))))
 
-(defn source-qualify-import [(a (dyn Allocator)) (record Sexp) (alias-node Sexp)] (-> Sexp)
+(defn source-qualify-import [(a (dyn Allocator)) (record Sexp) (alias-node Sexp) (assume-free bool)] (-> Sexp)
   (block :done
     (let [state (comptime-unit-state)]
       (unless (.source_ready state)
@@ -9028,6 +9078,7 @@
             (unless (sexp-eq form replacement)
               (push! (mut edits) (source-plan-edit a form replacement)) 0))
           (set! (.source_coverage_template state) false)
+          (set! (.source_assume_free state) assume-free)
           (for m (load (sx-items (.source_modules state)))
             (when (= (sx-sval (sx-at (sx-items m) 0)) module)
               (let [forms (sx-items m)]
@@ -9041,6 +9092,17 @@
                               (sconcat a (sconcat3 a "a quasiquote template names '" (sx-sval unknown) "' at ")
                                 (sconcat a where "; code a template generates resolves its names where the macro is defined, which an edit cannot see"))
                               (sconcat3 a "source binding is incomplete for '" (sx-sval unknown) (sconcat a "' at " where))))))))) 0))
+          (when assume-free
+            (for m (load (sx-items (.source_modules state)))
+              (when (= (sx-sval (sx-at (sx-items m) 0)) module)
+                (let [forms (sx-items m)]
+                  (for [i 1 (sx-len forms)]
+                    (unless (source-template-edits! a (sx-at forms i) 0 use (load old-alias)
+                                                    (.source_export_table state) alias (mut edits))
+                      (return-from :done
+                        (source-plan-refused a
+                          (sconcat a "a template name has no editable authored source: "
+                                    (sx-sval (.source_coverage_unknown state)))))))))))
           (for ref (load (sx-items (.source_references state)))
             (let [ref-parts (sx-items ref)
                   ref-module (sx-sval (sx-at ref-parts 1))
@@ -9058,12 +9120,18 @@
           (sx-mklist (box-al [Sexp] a (load edits))))))))
 
 (defn cop-qualify-import [(args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
-  (if (!= (len (load args)) 2)
-      (Err [CtVal Diag] (derr "qualify-import: expects an import record and alias symbol"))
-      (let [record (get (load args) 0) alias (get (load args) 1)]
-        (if (and (is-ccode record) (is-ccode alias))
-            (Ok [CtVal Diag] (CCode (source-qualify-import (.a cx) (ccode-of record) (ccode-of alias))))
-            (Err [CtVal Diag] (derr "qualify-import: expects Code arguments"))))))
+  (let [usage "qualify-import: expects an import record, an alias symbol and a mode, `strict or `assume-no-shadow"]
+    (if (!= (len (load args)) 3)
+        (Err [CtVal Diag] (derr usage))
+        (let [record (get (load args) 0) alias (get (load args) 1) mode (get (load args) 2)]
+          (if (and (is-ccode record) (and (is-ccode alias) (is-ccode mode)))
+              (let [m (ccode-of mode)]
+                (cond (and (= (sx-tag m) 2) (= (sx-sval m) "strict"))
+                        (Ok [CtVal Diag] (CCode (source-qualify-import (.a cx) (ccode-of record) (ccode-of alias) false)))
+                      (and (= (sx-tag m) 2) (= (sx-sval m) "assume-no-shadow"))
+                        (Ok [CtVal Diag] (CCode (source-qualify-import (.a cx) (ccode-of record) (ccode-of alias) true)))
+                      :else (Err [CtVal Diag] (derr usage))))
+              (Err [CtVal Diag] (derr usage)))))))
 
 (defn cop-suggest-edits [(args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
   (try (do

@@ -71,7 +71,7 @@ def main():
 (defn qualify [(modules Code)] (-> Code)
   (do (for import (iter (meta/imports `source-probe.main))
         (when (= (meta/import-target import) `coil.primitive)
-          (meta/suggest-edits (meta/qualify-import import `p) "primitive qualification") 0)) `0))
+          (meta/suggest-edits (meta/qualify-import import `p `strict) "primitive qualification") 0)) `0))
 (checker qualify)
 ''')
         main_path.write_text('(module source-probe.main)\n(import "coil.primitive" :use [code-copy])\n(defn copy [(x Code)] (-> Code) (code-copy x))\n(defn main [] (-> i64) 0)\n')
@@ -87,7 +87,7 @@ def main():
 (defn qualify [(modules Code)] (-> Code)
   (do (for import (iter (meta/imports `source-probe.main))
         (when (= (meta/import-target import) `source-probe.facade)
-          (meta/suggest-edits (meta/qualify-import import `api) "facade qualification") 0)) `0))
+          (meta/suggest-edits (meta/qualify-import import `api `strict) "facade qualification") 0)) `0))
 (checker qualify)
 ''')
         main_path.write_text(original.replace('"source-probe.lib" :use *', '"source-probe.facade" :use * :rename [[double twice]]').replace('(double ', '(twice '))
@@ -145,6 +145,14 @@ def main():
         output = run('lint', 'main.coil', '--use', 'coil.lint.import-aliases', '--fix')
         assert 'quasiquote template names' in output, output
         assert main_path.read_text() == template, main_path.read_text()
+        run('run', 'main.coil')
+
+        # Told that no template binds the spelling, the lint qualifies the template's
+        # name too, and the program still compiles and runs.
+        output = run('lint', 'main.coil', '--use', 'coil.lint.import-aliases',
+                     '--lint-param', 'coil.lint.import-aliases.assume-no-shadow=true', '--fix')
+        assumed = main_path.read_text()
+        assert '`(lib/Box :value 1)' in assumed and ':use *' not in assumed, assumed
         run('run', 'main.coil')
     print('authored source references: binding identity, macro heads, local shadowing, diff, idempotence, alias policy, atomic refusals, quoted data, primitives, renamed facade, phase isolation, calls, constructors, dyn traits, generated functions, assert, templates: PASS')
 

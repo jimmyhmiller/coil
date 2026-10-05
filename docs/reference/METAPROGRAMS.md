@@ -237,8 +237,13 @@ New API this project added (all shipped):
   reexports. `meta/import-node` and `meta/import-target` expose the declaration
   and its resolved module namespace.
 
-  `meta/qualify-import IMPORT ALIAS` produces `(edits (edit NODE REPLACEMENT) …)`
-  or `(refused "reason")`. `meta/suggest-edits PLAN MESSAGE` submits the entire
+  `meta/qualify-import IMPORT ALIAS MODE` produces `(edits (edit NODE REPLACEMENT) …)`
+  or `(refused "reason")`. MODE is `` `strict `` or `` `assume-no-shadow ``: strict
+  refuses when a quasiquote template names something the import supplies, since
+  nothing records how a template's bare name binds; `assume-no-shadow` rewrites
+  those names as references to the import, which is right unless the template binds
+  the same spelling itself. `coil.lint.import-aliases` selects it with
+  `--lint-param coil.lint.import-aliases.assume-no-shadow=true`. `meta/suggest-edits PLAN MESSAGE` submits the entire
   plan as a coordinated lint suggestion group; writing still requires `--fix`.
   Qualification refuses incomplete evidence, alias conflicts, names inspected by
   macros, repeated imports of one module, and imports that reexport their target.
