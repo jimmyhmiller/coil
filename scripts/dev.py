@@ -1419,7 +1419,7 @@ GENERATED_SCRIPTS = (
     "install-pairing", "dynamic-stack", "sparse-static", "namespace-index-memory",
     "provider-artifacts", "project-scan-memory", "resolve-shadow-scaling", "deferred-emission",
     "digest", "compile-performance", "tail-borrow", "c-aggregate-bounded-read", "union-hfa", "oracle-corpus",
-    "aggregate-abi-sizes", "export-c-aggregates",
+    "aggregate-abi-sizes", "export-c-aggregates", "sum-return-abi",
 )
 
 
