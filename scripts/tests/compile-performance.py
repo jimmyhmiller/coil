@@ -52,6 +52,10 @@ for name in ("make-block", "forward", "store-result", "hold", "pass-result", "re
         (name, "a big call result must be copied as memory, not stored as an LLVM aggregate", fn.group(1))
     if name != "reuse":
         assert re.search(r"@llvm\.mem(?:cpy|move)\.[^\n]*i64 4096", fn.group(1)), (name, fn.group(1))
+    # A whole-struct load left unused reads to SROA as a typed access to every
+    # field, which splits each copy of that struct into one load/store per field.
+    assert not re.search(r"= load (?:%test\.aggregate-call-result-copy\.(?:Block|Holder)|\[4096 x i8\]),", fn.group(1)), \
+        (name, "no unused aggregate load may survive emission", fn.group(1))
 invoke("run", "tests/compiler/features/declaration_index.coil")
 invoke("run", "tests/compiler/features/syntax_accessors.coil")
 print("PASS: aggregate snapshots, assignments, and big call results preserve evaluation order, overlap, and self-assignment with bulk copies; declaration indexes preserve exact, ambiguous, missing, growing, and republished model queries")
