@@ -98,11 +98,16 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
     run(binary, env=dict(TOOLCHAIN_ENV, COIL_META_MAIN="1"))
     print("PASS: jit_meta_main", flush=True)
     # Each fixture is its own SDK host with its own binary and JIT sessions.
+    # A session's source has no file behind it, so it owns no namespace tree: a
+    # fixture whose submission imports another test module names that root.
+    session_roots = {"jit_import_tolerant_helper": "tests"}
+
     def build_and_run(name):
         binary = work / name
         run(COMPILER, "build", ROOT / f"tests/compiler/features/{name}.coil",
             "-o", binary, *flags)
-        run(binary)
+        roots = session_roots.get(name)
+        run(binary, env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=roots) if roots else None)
         return name
 
     # The project checks share one project directory and edit it as they go, so
