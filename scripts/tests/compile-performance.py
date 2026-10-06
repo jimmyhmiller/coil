@@ -39,6 +39,19 @@ assert not re.search(r"(?:load|store) %test\.aggregate-store-copy\.Block", copy.
 items = re.search(r"define[^\n]*@test\.aggregate-store-copy\.copy-items\([^\n]*\)\s*\{(.*?)\n\}", copy_ir, re.S)
 assert items and "@llvm.memmove." in items.group(1), "array assignment must use an overlap-safe bulk copy"
 assert not re.search(r"(?:load|store) \[2048 x", items.group(1)), items.group(1)
+result_source = "tests/compiler/features/aggregate_call_result_copy.coil"
+for level in ("-O0", "-O3"):
+    invoke("run", result_source, level)
+result_ir = invoke("emit-ir", result_source)
+assert "target datalayout" in result_ir, result_ir
+for name in ("make-block", "forward", "store-result", "hold", "pass-result", "reuse"):
+    fn = re.search(r"define[^\n]*@test\.aggregate-call-result-copy\." + re.escape(name)
+                   + r"\([^\n]*\)\s*\{(.*?)\n\}", result_ir, re.S)
+    assert fn, f"{name} missing from emitted IR"
+    assert not re.search(r"store (?:%test\.aggregate-call-result-copy\.Block|\[4096 x i8\]) %", fn.group(1)), \
+        (name, "a big call result must be copied as memory, not stored as an LLVM aggregate", fn.group(1))
+    if name != "reuse":
+        assert re.search(r"@llvm\.mem(?:cpy|move)\.[^\n]*i64 4096", fn.group(1)), (name, fn.group(1))
 invoke("run", "tests/compiler/features/declaration_index.coil")
 invoke("run", "tests/compiler/features/syntax_accessors.coil")
-print("PASS: aggregate snapshots and assignments preserve evaluation order, overlap, and self-assignment with bulk copies; declaration indexes preserve exact, ambiguous, missing, growing, and republished model queries")
+print("PASS: aggregate snapshots, assignments, and big call results preserve evaluation order, overlap, and self-assignment with bulk copies; declaration indexes preserve exact, ambiguous, missing, growing, and republished model queries")
