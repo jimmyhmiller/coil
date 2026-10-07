@@ -99,6 +99,14 @@ Use this format:
   sessions, sparse/named static storage, extern aliases and the supporting ABI
   fixes. The full CI job runs it against its verified compiler. Run this gate
   when changing those features; it includes actual-pipeline memory regressions.
+- **Changing LLVM codegen?** Run `python3 scripts/dev.py test aggregates --compiler
+  <candidate>` before installing (add `--all-sources` for every test plus the
+  compiler itself, ~20 min). It fails if emitted IR moves a struct, sum or array
+  over 64 bytes as a first-class value — a `load`/`store`/`ret`/`phi`/call of the
+  whole aggregate — which LLVM expands element by element: that cost a 17 s build
+  once and a 10 s build again for an array of 32 structs. Aggregates live in
+  memory in codegen (`cg-mem-ty?`, `emit-into`); only the C ABI's own register
+  values may appear. Local only: CI does not run it.
 - **Changing expansion, resolution or checking without meaning to change meaning?**
   Build a reference compiler from the commit before your change and run
   `python3 scripts/tests/pipeline-differential.py <reference> <candidate>`. It
