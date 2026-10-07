@@ -143,6 +143,10 @@
 
 (defstruct CgStatic [(name (slice u8)) (ptr (ptr i8)) (ty Type)])
 
+;; A pointer the current function builds aggregates in, and the alignment it is
+;; known to have: a destination stood in for a stack slot (see emit-let-into).
+(defstruct CgAlign [(at (ptr i8)) (align i64)])
+
 ; A `:shim` convention function's realization: the `ccc` __impl
 ; function that carries the body, plus the convention's register layout.
 (defstruct CgShim
@@ -189,6 +193,8 @@
    ; the helper's own name elided. See llvm-ir-helper.
    (llvm_ir_helpers (HashMap (slice u8) (ptr i8)))
    (loops (ArrayList CgLoop))
+   ; alignments known for this function's non-alloca destinations
+   (aligns (ArrayList CgAlign))
    (csigs (ArrayList CSigEntry))  ; only struct-by-value callables
    ; Finalized C exports for selecting the public ABI entry in fnptr-of.
    ; Direct calls continue to use `funcs`, which names the Coil entry.
@@ -1256,7 +1262,11 @@
                 (set! i (primitive/iadd (load i) 1)))))
     (load out)))
 
-; ---- reconcile_args: spill a struct/array VALUE passed to a pointer param ----
+; ---- reconcile_args: match argument values to a plain LLVM signature ----
+; A memory value travels as its address, which is what a reference parameter
+; takes; an aggregate-typed parameter (an array of a signature with no C ABI
+; lowering) takes the value itself. A first-class aggregate (a slice) given to a
+; pointer parameter is spilled.
 (defn reconcile-args [(cg (ptr Cg))
                       (fnty (ptr i8))
                       (vals (ArrayList (ptr i8)))] (-> (ArrayList (ptr i8)))
@@ -1297,20 +1307,26 @@
                       (mut av) v]
                   (when (< (load i) np)
                     (let [pt (load (primitive/index ptbuf (load i)))
+                          pk (LLVMGetTypeKind pt)
                           vk (LLVMGetTypeKind (LLVMTypeOf v))]
-                      (when (and (= (LLVMGetTypeKind pt)
-                                    (primitive/cast i32 12))
+                      (cond (and (= pk (primitive/cast i32 12))
                                  (or (= vk (primitive/cast i32 10))
-                                     (= vk
-                                        (primitive/cast i32
-                                                        11))))
-                        (let [slot
-                                (cg-entry-alloca cg
-                                                 (LLVMTypeOf v)
-                                                 (cg-bl cg "arg.spill"))]
-                          (cg-store-value cg v slot 0)
-                          (store! av slot)
-                          0))))
+                                     (= vk (primitive/cast i32 11))))
+                              (let [slot
+                                      (cg-entry-alloca cg
+                                                       (LLVMTypeOf v)
+                                                       (cg-bl cg "arg.spill"))]
+                                (LLVMBuildStore (cg-bld cg) v slot)
+                                (store! av slot)
+                                0)
+                            (and (or (= pk (primitive/cast i32 10))
+                                     (= pk (primitive/cast i32 11)))
+                                 (= vk (primitive/cast i32 12)))
+                              (let [ins (LLVMBuildLoad2 (cg-bld cg) pt v (cg-bl cg "agg.value"))]
+                                (LLVMSetAlignment ins 1)
+                                (store! av ins)
+                                0)
+                            :else 0)))
                   (push! (mut out) (load av)))
                 (set! i (primitive/iadd (load i) 1)))))
     (load out)))
@@ -1346,11 +1362,13 @@
              tv (emit-expr cg inner scp)
              t (tv-ty tv)
              slot (cg-entry-alloca cg (basic-ty cg (box-type a t)) (cg-bl cg "spill"))]
-         (cg-store-value cg (tv-val tv) slot 0)
+         ; a copy even of a memory value: the reference may be written through,
+         ; and that value's storage may back a binding still in scope
+         (cg-store-tv! cg tv slot 0)
          (mk-tv slot (TPtr (box-type a t)))))))
 
 (defn emit-store-ssa [(cg (ptr Cg)) (pv Tv) (val (ptr Expr)) (scp (ptr Scope))] (-> i64)
-  (cg-store-value cg (tv-val (emit-expr cg val scp)) (tv-val pv) 1))
+  (cg-store-tv! cg (emit-expr cg val scp) (tv-val pv) 1))
 
 ; Evaluate the destination first, then the source place, just as a value
 ; load/store would. There are no intervening expressions after the source load.
@@ -1443,8 +1461,8 @@
             (match (scope-get scp name)
               (Some [tv] tv)
               (None [] (cg-bug (sconcat a "codegen: unbound " name)))))
-      (EZeroed [t] (mk-tv (LLVMConstNull (basic-ty cg (box-type a t))) t))
-      (ERecordInit [t] (mk-tv (LLVMConstNull (basic-ty cg (box-type a t))) t))
+      (EZeroed [t] (emit-zeroed cg t))
+      (ERecordInit [t] (emit-zeroed cg t))
       (EBorrow [m place] (emit-expr cg place scp))
       (ESpillRef [inner]
                  (emit-spill-ref cg inner scp))
@@ -1633,11 +1651,11 @@
                   result))
       (ELet [binds body]
             (let [child (emit-binds cg binds scp)] (emit-body cg body child)))
-      (EIf [cnd thn els] (emit-if cg cnd thn els scp))
+      (EIf [cnd thn els] (emit-if cg cnd thn els scp (no-dest)))
       (ELoop [label body] (emit-loop cg label body scp))
       (EBreak [label value] (emit-break cg label value scp))
       (EContinue [label] (emit-continue cg label))
-      (ECall [func targs args] (emit-call cg func args scp))
+      (ECall [func targs args] (emit-call cg func args scp (no-dest)))
       (ENamedCall [_func _targs _names _args]
                   (do
                     (cg-fail "named constructor call survived type checking")
@@ -1656,24 +1674,37 @@
                        (_ (do
                             (unimplemented "codegen: load of non-pointer")
                             (TInt 64 true))))]
-               (let [ins
-                       (LLVMBuildLoad2 b
-                                       (basic-ty cg (box-type a pointee))
-                                       (tv-val pv)
-                                       (cg-bl cg "load"))]
-                 ; A byte-offset GEP may address a packed or explicitly placed
-                 ; field.  The pointer type does not carry that reduced
-                 ; alignment, so LLVM's natural default can be a false promise.
-                 (LLVMSetAlignment ins 1)
-                 (mk-tv ins pointee))))
+               (if (cg-mem-ty? cg (box-type a pointee))
+                   ; A memory value is a snapshot: later expressions may write
+                   ; the place before this value is used.
+                   (let [slot (cg-mem-temp cg (box-type a pointee) "load")]
+                     (cg-mem-copy! cg slot (tv-val pv) (box-type a pointee))
+                     (mk-tv slot pointee))
+                   (let [ins
+                           (LLVMBuildLoad2 b
+                                           (basic-ty cg (box-type a pointee))
+                                           (tv-val pv)
+                                           (cg-bl cg "load"))]
+                     ; A byte-offset GEP may address a packed or explicitly placed
+                     ; field.  The pointer type does not carry that reduced
+                     ; alignment, so LLVM's natural default can be a false promise.
+                     (LLVMSetAlignment ins 1)
+                     (mk-tv ins pointee)))))
       (EStore [pe val]
               (let [pv (emit-expr cg pe scp)]
                 (emit-store-value cg pv val scp)
                 ; store! yields canonical unit, matching its checked type.
                 (mk-tv (cg-zero-i64 cg) (TInt 64 true))))
+      ; Initialization of storage that has never held a value, and that the
+      ; value cannot name: a memory value is built straight into it.
       (EInitStore [pe val]
                   (let [pv (emit-expr cg pe scp)]
-                    (emit-store-value cg pv val scp)
+                    (match (tv-ty pv)
+                      (TPtr [pointee]
+                            (if (cg-mem-ty? cg pointee)
+                                (emit-into cg val (cg-dest-at cg (tv-val pv)) scp)
+                                (emit-store-value cg pv val scp)))
+                      (_ (emit-store-value cg pv val scp)))
                     (mk-tv (cg-zero-i64 cg) (TInt 64 true))))
       (EIndex [pe idx] (emit-index cg pe idx scp))
       (ECast [t inner] (emit-cast cg (box-type a t) inner scp))
@@ -1690,10 +1721,10 @@
              (let [pv (emit-expr cg p scp)]
                (LLVMBuildFree b (tv-val pv))
                (mk-tv (cg-zero-i64 cg) (TInt 64 true))))
-      (EConstruct [sum variant args] (emit-construct cg sum variant args scp))
-      (EMatch [scrut arms] (emit-match cg scrut arms scp))
+      (EConstruct [sum variant args] (emit-construct cg sum variant args scp (no-dest)))
+      (EMatch [scrut arms] (emit-match cg scrut arms scp (no-dest)))
       (EFnPtrOf [name] (emit-fnptr cg name))
-      (ECallPtr [fp args] (emit-callptr cg fp args scp))
+      (ECallPtr [fp args] (emit-callptr cg fp args scp (no-dest)))
       (ELlvmIr [result args body]
                (emit-llvm-ir cg (box-type a result) args body scp))
       (EStaticRef [name]
@@ -1757,7 +1788,7 @@
       (EFieldIndex [t name]
                    (cg-bug "codegen: unresolved field-reflection (compiler bug)"))
       (EMakeDyn [ds vt methods inner]
-                (emit-make-dyn cg ds vt methods inner scp))
+                (emit-make-dyn cg ds vt methods inner scp (no-dest)))
       (EDynDispatch [ds vt mi cc params ret recv args]
                     (emit-dyn-dispatch cg
                                        ds
@@ -1768,7 +1799,8 @@
                                        (box-type (.a cg) ret)
                                        recv
                                        args
-                                       scp)))))
+                                       scp
+                                       (no-dest))))))
 
 ; ExprKind::MakeDyn — erase a concrete (ptr T) to a
 ; (dyn Trait) fat pointer. Materialise a constant vtable global (the impl methods'
@@ -1778,7 +1810,8 @@
                      (vt (slice u8))
                      (methods (ptr (ArrayList (slice u8))))
                      (inner (ptr Expr))
-                     (scp (ptr Scope))] (-> Tv)
+                     (scp (ptr Scope))
+                     (dest Dest)] (-> Tv)
   (let [a (.a cg)
         b (cg-bld cg)
         iv (emit-expr cg inner scp)
@@ -1824,7 +1857,11 @@
                                                 (field cg structs)
                                                 dsi)
                                        ty))
-                        slot (cg-entry-alloca cg dty (cg-bl cg "dyn.obj"))
+                        slot
+                          (if (dest-fits? dest
+                                          (primitive/cast i64 (LLVMABIAlignmentOfType (.td cg) dty)))
+                              (.at dest)
+                              (cg-entry-alloca cg dty (cg-bl cg "dyn.obj")))
                         dp
                           (LLVMBuildStructGEP2 b
                                                dty
@@ -1839,8 +1876,7 @@
                                                  1
                                                  (cg-bl cg "dyn.vt"))]
                       (LLVMBuildStore b g vp)
-                      (mk-tv (LLVMBuildLoad2 b dty slot (cg-bl cg "dyn.val"))
-                             (TStruct ds)))))))))))
+                      (cg-deliver cg (mk-tv slot (TStruct ds)) dest))))))))))
 
 ; ExprKind::DynDispatch — call a trait method through the
 ; fat pointer's vtable: spill the receiver, load data + vtable, load the method's
@@ -1854,7 +1890,8 @@
                          (ret (ptr Type))
                          (recv (ptr Expr))
                          (args (ptr (ArrayList Expr)))
-                         (scp (ptr Scope))] (-> Tv)
+                         (scp (ptr Scope))
+                         (dest Dest)] (-> Tv)
   (let [a (.a cg)
         b (cg-bld cg)
         pty (LLVMPointerTypeInContext (cg-ctx cg) 0)
@@ -1863,8 +1900,8 @@
     (if (< dsi (primitive/cast i64 0))
         (cg-bug (sconcat a "codegen: unknown dyn struct " ds))
         (let [dty (load (field (al-elem [CgStruct] (field cg structs) dsi) ty))
-              slot (cg-entry-alloca cg dty (cg-bl cg "dyn.recv"))]
-          (cg-store-value cg (tv-val rv) slot 0)
+              ; the receiver is a memory value: read data and vtable in place
+              slot (tv-val rv)]
           (let [dp (LLVMBuildStructGEP2 b dty slot 0 (cg-bl cg "dyn.data"))
                 data (LLVMBuildLoad2 b pty dp (cg-bl cg "data"))
                 vp (LLVMBuildStructGEP2 b dty slot 1 (cg-bl cg "dyn.vt"))
@@ -1931,7 +1968,8 @@
                                     sig
                                     (load argtv)
                                     (load ret)
-                                    "dyn.call")))))))))
+                                    "dyn.call"
+                                    dest)))))))))
 
 ; emit a `do`/let body: last value, default (i64 0); stop at a terminator.
 (defn emit-body [(cg (ptr Cg)) (body (ptr (ArrayList Expr))) (scp (ptr Scope))] (-> Tv)
@@ -1963,10 +2001,323 @@
                 (set! i (primitive/iadd (load i) 1)))))
     (load s)))
 
+;; ---- destination-driven aggregate emission ----
+;; Where a memory value is to be built: storage nothing else can observe yet (a
+;; slot no value has been stored to, or this function's own result), and the
+;; alignment that storage is known to have. A null `at` is no destination: the
+;; producer makes its own storage.
+(defstruct Dest [(at (ptr i8)) (align i64)])
+
+(defn no-dest [] (-> Dest) (Dest :at (primitive/cast (ptr i8) 0) :align 0))
+
+(defn has-dest? [(d Dest)] (-> bool)
+  (!= (primitive/cast i64 (.at d)) (primitive/cast i64 0)))
+
+;; DEST, when there is one and it is aligned for NEED bytes: a producer may then
+;; build in it directly instead of in storage of its own.
+(defn dest-fits? [(d Dest) (need i64)] (-> bool)
+  (and (has-dest? d) (>= (.align d) need)))
+
+;; The alignment a destination pointer is known to have: an alloca's own, or
+;; one recorded when a destination stood in for a slot; any other address (a
+;; field of a packed struct, say) promises nothing.
+(defn cg-known-align [(cg (ptr Cg)) (p (ptr i8))] (-> i64)
+  (if (!= (primitive/cast i64 (LLVMIsAAllocaInst p)) (primitive/cast i64 0))
+      (primitive/cast i64 (LLVMGetAlignment p))
+      (let [(mut r) 1]
+        (for [i 0 (len (.aligns cg))]
+          (let [k (al-elem [CgAlign] (field cg aligns) i)]
+            (when (= (primitive/cast i64 (.at k)) (primitive/cast i64 p)) (set! r (.align k)))))
+        (load r))))
+
+(defn cg-note-align! [(cg (ptr Cg)) (d Dest)] (-> i64)
+  (push! (mut (.aligns cg)) (CgAlign :at (.at d) :align (.align d)))
+  0)
+
+(defn cg-dest-at [(cg (ptr Cg)) (p (ptr i8))] (-> Dest) (Dest :at p :align (cg-known-align cg p)))
+
+;; A produced value, handed to DEST when there is one the producer did not
+;; build in.
+(defn cg-deliver [(cg (ptr Cg)) (tv Tv) (dest Dest)] (-> Tv)
+  (if (and (has-dest? dest)
+           (and (!= (primitive/cast i64 (tv-val tv)) (primitive/cast i64 (.at dest)))
+                (not (cg-terminated cg))))
+      (do (cg-store-tv! cg tv (.at dest) 1)
+          (mk-tv (.at dest) (tv-ty tv)))
+      tv))
+
+(defn cg-mem-zero! [(cg (ptr Cg)) (dst (ptr i8)) (t (ptr Type))] (-> i64)
+  (LLVMBuildMemSet (cg-bld cg)
+                   dst
+                   (LLVMConstInt (LLVMInt8TypeInContext (cg-ctx cg)) 0 0)
+                   (cg-const-uoff cg (cg-layout-size cg t))
+                   1)
+  0)
+
+;; Evaluate E, of a memory type, straight into DEST. A call writes its result
+;; there, a constructor builds there, and an `if` or `match` hands DEST to each
+;; branch: clang's destination-driven aggregate emission, so a value is not built
+;; in one temporary and copied through the next. DEST's freshness is what makes
+;; this sound: no part of E can read or write it, so E cannot see it half built.
+(defn emit-into [(cg (ptr Cg)) (e (ptr Expr)) (dest Dest) (scp (ptr Scope))] (-> i64)
+  (let [a (.a cg)]
+    (match (.kind e)
+      (EZeroed [t] (cg-mem-zero! cg (.at dest) (box-type a t)))
+      (ERecordInit [t] (cg-mem-zero! cg (.at dest) (box-type a t)))
+      (ELoad [inner]
+             (match (.kind inner)
+               ; a nested record literal: a `let` that yields its slot's address
+               (ELet [binds body] (emit-let-into cg binds body dest scp true))
+               (_ (let [pv (emit-expr cg inner scp)]
+                    (match (tv-ty pv)
+                      (TPtr [pointee] (cg-mem-copy! cg (.at dest) (tv-val pv) pointee))
+                      (_ (do (unimplemented "codegen: load of non-pointer") 0)))))))
+      (EDo [body] (emit-body-into cg body dest scp))
+      (ELet [binds body] (emit-let-into cg binds body dest scp false))
+      (ECleanup [body cleanups]
+                (do (emit-into cg body dest scp)
+                    (emit-body cg cleanups scp)
+                    0))
+      (EIf [cnd thn els] (do (emit-if cg cnd thn els scp dest) 0))
+      (EMatch [scrut arms] (do (emit-match cg scrut arms scp dest) 0))
+      (ECall [func _targs args] (do (emit-call cg func args scp dest) 0))
+      (ECallPtr [fp args] (do (emit-callptr cg fp args scp dest) 0))
+      (EConstruct [sum variant args] (do (emit-construct cg sum variant args scp dest) 0))
+      (EMakeDyn [ds vt methods inner] (do (emit-make-dyn cg ds vt methods inner scp dest) 0))
+      (EDynDispatch [ds vt mi cc params ret recv args]
+                    (do (emit-dyn-dispatch cg ds vt mi cc params (box-type a ret) recv args scp dest)
+                        0))
+      (_ (do (cg-deliver cg (emit-expr cg e scp) dest) 0)))))
+
+;; A `do` body whose last value goes to DEST.
+(defn emit-body-into [(cg (ptr Cg)) (body (ptr (ArrayList Expr))) (dest Dest) (scp (ptr Scope))] (-> i64)
+  (let [n (len (load body))]
+    (for [i 0 (- n 1)]
+      (unless (cg-terminated cg) (emit-expr cg (al-elem [Expr] body i) scp) 0))
+    (when (and (> n 0) (not (cg-terminated cg)))
+      (emit-into cg (al-elem [Expr] body (- n 1)) dest scp))
+    0))
+
+;; A `let` whose value goes to DEST. When it ends by loading a stack slot it
+;; allocated itself -- a record literal (a slot, its field stores, a load), or
+;; `(let [(mut r) …] … r)` -- that slot is built in DEST and the final copy goes
+;; away: the named return value optimization. It is sound only while nothing can
+;; tell the slot lives in DEST, so the slot may be named solely as the root of a
+;; place read or written in place, never passed, stored, borrowed or cast
+;; (nrvo-slot). ADDRESS is the form a nested literal takes, `(load (let … slot))`:
+;; the `let` ends with the slot's address and the load around it is the copy.
+(defn emit-let-into [(cg (ptr Cg))
+                     (binds (ptr (ArrayList Bind)))
+                     (body (ptr (ArrayList Expr)))
+                     (dest Dest)
+                     (scp (ptr Scope))
+                     (address bool)] (-> i64)
+  (let [a (.a cg)
+        slot (nrvo-slot cg binds body dest address)]
+    (if (< slot (primitive/cast i64 0))
+        (if address
+            ; the address of some storage: copy what it holds
+            (let [pv (emit-expr cg (box-expr a (mk-expr (ELet binds body) -1 -1 -1 0)) scp)]
+              (unless (cg-terminated cg)
+                (match (tv-ty pv)
+                  (TPtr [pointee] (cg-mem-copy! cg (.at dest) (tv-val pv) pointee))
+                  (_ (do (unimplemented "codegen: load of non-pointer") 0))))
+              0)
+            (emit-body-into cg body dest (emit-binds cg binds scp)))
+        (let [n (len (load body))
+              (mut s) scp]
+          (for [i 0 (len (load binds))]
+            (let [bp (al-elem [Bind] binds i)
+                  tv (if (= i slot)
+                         (match (.kind (field bp value))
+                           (EAlloc [_ t _ _]
+                                   (do (cg-note-align! cg dest)
+                                       (mk-tv (.at dest) (TPtr (box-type a t)))))
+                           (_ (cg-bug "codegen: the named return slot is not an alloc")))
+                         (emit-expr cg (field bp value) (load s)))]
+              (set! s (scope-put a (load s) (.name bp) (tv-val tv) (tv-ty tv)))))
+          (for [i 0 (- n 1)]
+            (unless (cg-terminated cg) (emit-expr cg (al-elem [Expr] body i) (load s)) 0))
+          0))))
+
+;; The index of the bind whose stack slot a `let` may build in DEST (see
+;; emit-let-into), or -1.
+(defn nrvo-slot [(cg (ptr Cg))
+                 (binds (ptr (ArrayList Bind)))
+                 (body (ptr (ArrayList Expr)))
+                 (dest Dest)
+                 (address bool)] (-> i64)
+  (let [a (.a cg)
+        n (len (load body))
+        nb (len (load binds))
+        (mut result) -1]
+    (when (> n 0)
+      ; the slot a value-form `let` loads last, or an address-form one yields
+      (match (if address
+                 (.kind (al-elem [Expr] body (- n 1)))
+                 (match (.kind (al-elem [Expr] body (- n 1)))
+                   (ELoad [inner] (.kind inner))
+                   (_ (EInt 0))))
+                 (EVar [x]
+                       (let [xi (bind-index binds x)
+                             ; the loaded name is the slot, or a `do` that stores
+                             ; the slot's first value and yields the slot
+                             si (if (< xi 0)
+                                    -1
+                                    (match (.kind (field (al-elem [Bind] binds xi) value))
+                                      (EAlloc [_ _ _ _] xi)
+                                      (EDo [stmts]
+                                           (let [k (len (load stmts))]
+                                             (if (= k 0)
+                                                 -1
+                                                 (match (.kind (al-elem [Expr] stmts (- k 1)))
+                                                   (EVar [y] (bind-index binds y))
+                                                   (_ -1)))))
+                                      (_ -1)))]
+                         (when (>= si 0)
+                           (match (.kind (field (al-elem [Bind] binds si) value))
+                             (EAlloc [storage t init _]
+                                     (let [tp (box-type a t)
+                                           (mut names) (al-new [(slice u8)] a)]
+                                       (push! (mut names) (.name (al-elem [Bind] binds si)))
+                                       (unless (= xi si) (push! (mut names) x) 0)
+                                       (when (and (or (= storage 0) (= storage 3))
+                                                  (and (= (primitive/cast i64 init) 0)
+                                                       (and (cg-mem-ty? cg tp)
+                                                            (dest-fits? dest (cg-slot-align cg tp)))))
+                                         (let [(mut ok) true]
+                                           (for [i 0 nb]
+                                             (let [bp (al-elem [Bind] binds i)]
+                                               (cond (= i si) 0
+                                                     ; a later bind that reuses a name hides the slot
+                                                     (and (!= i xi) (name-in? (mut names) (.name bp)))
+                                                       (do (set! ok false) 0)
+                                                     (= i xi)
+                                                       (match (.kind (field bp value))
+                                                         (EDo [stmts]
+                                                              (do
+                                                                (for [j 0 (- (len (load stmts)) 1)]
+                                                                  (when (names-escape? (al-elem [Expr] stmts j) (mut names))
+                                                                    (set! ok false)))
+                                                                0))
+                                                         (_ 0))
+                                                     :else
+                                                       (do
+                                                         (when (names-escape? (field bp value) (mut names))
+                                                           (set! ok false))
+                                                         0))))
+                                           (for [i 0 (- n 1)]
+                                             (when (names-escape? (al-elem [Expr] body i) (mut names))
+                                               (set! ok false)))
+                                           (when (load ok) (set! result si))))
+                                       0))
+                             (_ 0)))
+                         0))
+                 (_ 0)))
+    (load result)))
+
+(defn bind-index [(binds (ptr (ArrayList Bind))) (name (slice u8))] (-> i64)
+  (let [(mut r) -1]
+    (for [i 0 (len (load binds))]
+      (when (= (.name (al-elem [Bind] binds i)) name) (set! r i)))
+    (load r)))
+
+(defn name-in? [(names (ptr (ArrayList (slice u8)))) (n (slice u8))] (-> bool)
+  (let [(mut r) false]
+    (for [i 0 (len (load names))]
+      (when (= (get (load names) i) n) (set! r true)))
+    (load r)))
+
+;; The alignment a stack slot of T gets: the ABI's, or a forced one.
+(defn cg-slot-align [(cg (ptr Cg)) (t (ptr Type))] (-> i64)
+  (let [fa (cg-force-align cg t)
+        abi (primitive/cast i64 (LLVMABIAlignmentOfType (.td cg) (basic-ty cg t)))]
+    (if (> fa abi) fa abi)))
+
+;; Does E use one of NAMES other than as the root of a place it reads or writes
+;; in place? Any expression kind not listed counts as a use, which only forgoes
+;; the optimization.
+(defn names-escape? [(e (ptr Expr)) (names (ptr (ArrayList (slice u8))))] (-> bool)
+  (match (.kind e)
+    (EVar [n] (name-in? names n))
+    (ELoad [p] (place-escapes? p names))
+    (EStore [p v] (or (place-escapes? p names) (names-escape? v names)))
+    (EInitStore [p v] (or (place-escapes? p names) (names-escape? v names)))
+    (EBitGet [p _] (place-escapes? p names))
+    (EBitSet [p _ v] (or (place-escapes? p names) (names-escape? v names)))
+    (EInt [_] false)
+    (EFloat [_] false)
+    (EBool [_] false)
+    (EStr [_] false)
+    (ECStr [_] false)
+    (EZeroed [_] false)
+    (ERecordInit [_] false)
+    (ESizeOf [_] false)
+    (EAlignOf [_] false)
+    (EOffsetOf [_ _] false)
+    (EFnPtrOf [_] false)
+    (EStaticRef [_] false)
+    (EContinue [_] false)
+    (EField [p _] (names-escape? p names))
+    (EIndex [p i] (or (names-escape? p names) (names-escape? i names)))
+    (ECast [_ x] (names-escape? x names))
+    (EBin [_ l r] (or (names-escape? l names) (names-escape? r names)))
+    (ECmp [_ l r] (or (names-escape? l names) (names-escape? r names)))
+    (EIntUnary [_ x] (names-escape? x names))
+    (EIf [c t f] (or (names-escape? c names) (or (names-escape? t names) (names-escape? f names))))
+    (EDo [body] (exprs-escape? body names))
+    (ECall [_ _ args] (exprs-escape? args names))
+    (ECallPtr [fp args] (or (names-escape? fp names) (exprs-escape? args names)))
+    (EConstruct [_ _ args] (exprs-escape? args names))
+    (EMakeSlice [d _ _] (names-escape? d names))
+    (ESpillRef [x] (names-escape? x names))
+    (EBorrow [_ x] (names-escape? x names))
+    (ECleanup [b cs] (or (names-escape? b names) (exprs-escape? cs names)))
+    (ELet [bs body]
+          (let [(mut r) (exprs-escape? body names)]
+            (for [i 0 (len (load bs))]
+              (when (names-escape? (field (al-elem [Bind] bs i) value) names) (set! r true)))
+            (load r)))
+    (EMatch [scrut arms]
+            (let [(mut r) (names-escape? scrut names)]
+              (for [i 0 (len (load arms))]
+                (when (names-escape? (field (al-elem [Arm] arms i) body) names) (set! r true)))
+              (load r)))
+    (EAlloc [_ _ init _]
+            (if (= (primitive/cast i64 init) (primitive/cast i64 0))
+                false
+                (names-escape? init names)))
+    (ELoop [_ body] (exprs-escape? body names))
+    (EBreak [_ value] (match value (Some [v] (names-escape? v names)) (None [] false)))
+    (EFree [x] (names-escape? x names))
+    (EMakeDyn [_ _ _ inner] (names-escape? inner names))
+    (EDynDispatch [_ _ _ _ _ _ recv args]
+                  (or (names-escape? recv names) (exprs-escape? args names)))
+    (ELlvmIr [_ args _] (exprs-escape? args names))
+    (_ true)))
+
+(defn exprs-escape? [(es (ptr (ArrayList Expr))) (names (ptr (ArrayList (slice u8))))] (-> bool)
+  (let [(mut r) false]
+    (for [i 0 (len (load es))]
+      (when (names-escape? (al-elem [Expr] es i) names) (set! r true)))
+    (load r)))
+
+;; A place rooted at a name through field and index projections, or a borrow
+;; of it that only serves as their base, is used in place; any other place
+;; expression is an ordinary use of what it names.
+(defn place-escapes? [(p (ptr Expr)) (names (ptr (ArrayList (slice u8))))] (-> bool)
+  (match (.kind p)
+    (EVar [_] false)
+    (EBorrow [_ q] (place-escapes? q names))
+    (EField [q _] (place-escapes? q names))
+    (EIndex [q i] (or (place-escapes? q names) (names-escape? i names)))
+    (_ (names-escape? p names))))
+
 (defn emit-call [(cg (ptr Cg))
                  (func (slice u8))
                  (args (ptr (ArrayList Expr)))
-                 (scp (ptr Scope))] (-> Tv)
+                 (scp (ptr Scope))
+                 (dest Dest)] (-> Tv)
   (let [a (.a cg)
         b (cg-bld cg)
         ret-ty
@@ -1980,14 +2331,15 @@
         (let [vals (emit-vals cg args scp)
               vp (primitive/alloc-stack (ArrayList (ptr i8)))]
           (set! vp vals)
-          (mk-tv (cg-emit-shim-call cg func shim vp) ret-ty))
-        (emit-call-native cg func args scp ret-ty))))
+          (cg-deliver cg (mk-tv (cg-emit-shim-call cg func shim vp) ret-ty) dest))
+        (emit-call-native cg func args scp ret-ty dest))))
 
 (defn emit-call-native [(cg (ptr Cg))
                         (func (slice u8))
                         (args (ptr (ArrayList Expr)))
                         (scp (ptr Scope))
-                        (ret-ty Type)] (-> Tv)
+                        (ret-ty Type)
+                        (dest Dest)] (-> Tv)
   (let [a (.a cg)
         b (cg-bld cg)
         callee (cg-func cg func)]
@@ -1995,7 +2347,7 @@
         (cg-bug (sconcat a "codegen: call to undefined " func))
         (let [sig (cg-csig cg func)]
           (if (!= (primitive/cast i64 sig) (primitive/cast i64 0))
-              (emit-c-call cg func callee sig (emit-argtv cg args scp) ret-ty)
+              (emit-c-call cg func callee sig (emit-argtv cg args scp) ret-ty dest)
               (let [fnty (cg-func-fnty cg func callee)
                     np (primitive/cast i64 (LLVMCountParamTypes fnty))
                     argtv (emit-argtv cg args scp)
@@ -2025,7 +2377,7 @@
                 (cg-variadic-byvals! cg cs byvals)
                 (if (ty-is-void (box-type a ret-ty))
                     (mk-tv (cg-zero-i64 cg) (TVoid))
-                    (mk-tv cs ret-ty))))))))))
+                    (cg-deliver cg (cg-tv-of-ssa cg cs ret-ty) dest))))))))))
 
 (defn cg-bug-ty [(msg (slice u8))] (-> Type)
   (unimplemented msg)
@@ -2220,7 +2572,8 @@
                       (sum (slice u8))
                       (variant (slice u8))
                       (args (ptr (ArrayList Expr)))
-                      (scp (ptr Scope))] (-> Tv)
+                      (scp (ptr Scope))
+                      (dest Dest)] (-> Tv)
   (let [a (.a cg)
         b (cg-bld cg)
         ui (cg-sum-idx cg sum)]
@@ -2230,7 +2583,11 @@
               vidx (cg-variant-idx cg sp variant)
               sum-ty (load (field sp ty))
               var-struct (get (load (field sp vstructs)) vidx)
-              tmp (cg-entry-alloca cg sum-ty (cg-bl cg "sum.tmp"))
+              ; built in place when the destination is aligned for the sum
+              in-place
+                (dest-fits? dest
+                            (primitive/cast i64 (LLVMABIAlignmentOfType (.td cg) sum-ty)))
+              tmp (if in-place (.at dest) (cg-entry-alloca cg sum-ty (cg-bl cg "sum.tmp")))
               tagptr (LLVMBuildStructGEP2 b sum-ty tmp 0 (cg-bl cg "tag"))]
           (LLVMBuildStore b (LLVMConstInt (cg-i32t cg) vidx 0) tagptr)
           (let [payload
@@ -2240,8 +2597,6 @@
             (loop (if (>= (load i) n)
                       (break)
                       (do
-                        ; the field address first, so an aggregate argument's
-                        ; load stays the last instruction for cg-store-value
                         (let [fptr
                                 (LLVMBuildStructGEP2 b
                                                      var-struct
@@ -2249,18 +2604,57 @@
                                                      (primitive/cast i32
                                                                      (load i))
                                                      (cg-bl cg "vf"))
-                              vv
-                                (emit-expr cg
-                                           (al-elem [Expr] args (load i))
-                                           scp)]
-                          (cg-store-value cg (tv-val vv) fptr 0))
+                              arg (al-elem [Expr] args (load i))
+                              vfs (load (field (al-elem [Variant] (load (field sp variants)) vidx) fields))
+                              fty (box-type a (.ty (al-elem [Field] vfs (load i))))]
+                          ; the sum's storage is fresh and aligned, so each payload
+                          ; field is too: the variant struct is unpacked
+                          (if (cg-mem-ty? cg fty)
+                              (emit-into cg
+                                         arg
+                                         (Dest :at fptr
+                                               :align (primitive/cast i64
+                                                                      (LLVMABIAlignmentOfType (.td cg)
+                                                                                              (basic-ty cg fty))))
+                                         scp)
+                              (cg-store-tv! cg (emit-expr cg arg scp) fptr 0)))
                         (set! i (primitive/iadd (load i) 1)))))
-            (mk-tv (LLVMBuildLoad2 b sum-ty tmp (cg-bl cg "sum")) (TStruct sum)))))))
+            (cg-deliver cg (mk-tv tmp (TStruct sum)) dest))))))
+
+;; The storage a match reads: the borrowed place, or the scrutinee's own
+;; storage, since a sum value is a memory value.
+(defn cg-match-storage [(cg (ptr Cg)) (sv Tv) (borrowed bool)] (-> (ptr i8))
+  (unless (or borrowed (cg-mem-ty? cg (box-type (.a cg) (tv-ty sv))))
+    (unimplemented "codegen: a matched sum value is not in memory"))
+  (tv-val sv))
+
+;; An arm's binding of the payload field at FPTR. A `$match.ref.` name on a
+;; borrowed scrutinee binds the field's address. Any other binding is a value:
+;; a memory value read from a borrowed place is copied, since the place may
+;; change while the binding lives; one read from a scrutinee value is that
+;; value's own storage, which nothing writes again.
+(defn cg-match-binding [(cg (ptr Cg))
+                        (fptr (ptr i8))
+                        (fty Type)
+                        (bname (slice u8))
+                        (borrowed bool)] (-> Tv)
+  (let [a (.a cg)
+        ft (box-type a fty)]
+    (cond (and borrowed (starts-with bname "$match.ref.")) (mk-tv fptr (TPtr ft))
+          (cg-mem-ty? cg ft)
+            (if borrowed
+                (let [slot (cg-mem-temp cg ft bname)]
+                  (cg-mem-copy! cg slot fptr ft)
+                  (mk-tv slot fty))
+                (mk-tv fptr fty))
+          :else (mk-tv (LLVMBuildLoad2 (cg-bld cg) (basic-ty cg ft) fptr (str->cstr a bname))
+                       fty))))
 
 (defn emit-match [(cg (ptr Cg))
                   (scrut (ptr Expr))
                   (arms (ptr (ArrayList Arm)))
-                  (scp (ptr Scope))] (-> Tv)
+                  (scp (ptr Scope))
+                  (dest Dest)] (-> Tv)
   (let [a (.a cg)
         b (cg-bld cg)
         sv (emit-expr cg scrut scp)
@@ -2287,11 +2681,7 @@
         (cg-bug (sconcat a "codegen: match on non-sum " sumname))
         (let [sp (al-elem [CgSum] (field cg sums) ui)
               sum-ty (load (field sp ty))
-              tmp
-                (if borrowed
-                    (tv-val sv)
-                    (cg-entry-alloca cg sum-ty (cg-bl cg "match.tmp")))]
-          (unless borrowed (cg-store-value cg (tv-val sv) tmp 0) 0)
+              tmp (cg-match-storage cg sv borrowed)]
           (let [tagptr (LLVMBuildStructGEP2 b sum-ty tmp 0 (cg-bl cg "tag"))
                 tag (LLVMBuildLoad2 b (cg-i32t cg) tagptr (cg-bl cg "tag"))
                 payload
@@ -2375,35 +2765,14 @@
                                                                 (load j)))
                                                 bname
                                                   (get (load binds) (load j))
-                                                borrowed-binding
-                                                  (and borrowed
-                                                       (starts-with bname
-                                                                    "$match.ref."))
-                                                fval
-                                                  (if borrowed-binding
-                                                      fptr
-                                                      (LLVMBuildLoad2 b
-                                                                      (basic-ty cg
-                                                                                (box-type a
-                                                                                          fty))
-                                                                      fptr
-                                                                      (str->cstr a
-                                                                                 bname)))
-                                                bind-ty
-                                                  (if borrowed-binding
-                                                      (TPtr (box-type a fty))
-                                                      fty)]
-                                            (set! child
-                                                  (scope-put a
-                                                             (load child)
-                                                             bname
-                                                             fval
-                                                             bind-ty)))
+                                                bv (cg-match-binding cg fptr fty bname borrowed)]
+                                          (set! child (scope-put a (load child) bname (tv-val bv) (tv-ty bv))))
                                           (set! j (primitive/iadd (load j) 1)))))
                               (let [bv
-                                      (emit-expr cg
-                                                 (field ap body)
-                                                 (load child))
+                                      (emit-branch cg
+                                                   (field ap body)
+                                                   (load child)
+                                                   dest)
                                     endbb (cg-cur-block cg)]
                                 (when (= (primitive/cast i64
                                                          (LLVMGetBasicBlockTerminator endbb))
@@ -2424,9 +2793,9 @@
                         (mk-tv (cg-zero-i64 cg) (TVoid))
                         (let [phi
                                 (LLVMBuildPhi b
-                                              (basic-ty cg
-                                                        (box-type a
-                                                                  (load result-ty)))
+                                              (cg-value-ty cg
+                                                           (box-type a
+                                                                     (load result-ty)))
                                               (cg-bl cg "match.val"))]
                           (LLVMAddIncoming phi
                                            (carr a (load inc-vals))
@@ -3225,11 +3594,20 @@
               (mk-tv g (TPtr (box-type a (load t)))))))))
 
 ; ======================== emit_if / loop / break / continue ==================
+;; One arm of an `if` or `match`. With a destination the arm writes its value
+;; there and yields nothing, so the merge needs no phi.
+(defn emit-branch [(cg (ptr Cg)) (e (ptr Expr)) (scp (ptr Scope)) (dest Dest)] (-> Tv)
+  (if (has-dest? dest)
+      (do (emit-into cg e dest scp)
+          (mk-tv (cg-zero-i64 cg) (TVoid)))
+      (emit-expr cg e scp)))
+
 (defn emit-if [(cg (ptr Cg))
                (cnd (ptr Expr))
                (thn (ptr Expr))
                (els (ptr Expr))
-               (scp (ptr Scope))] (-> Tv)
+               (scp (ptr Scope))
+               (dest Dest)] (-> Tv)
   (let [a (.a cg)
         b (cg-bld cg)
         func (cg-cur-func cg)
@@ -3240,13 +3618,13 @@
         else-bb (cg-append cg func (cg-bl cg "else"))]
     (LLVMBuildCondBr b cmp then-bb else-bb)
     (cg-pos cg then-bb)
-    (let [tv (emit-expr cg thn scp)
+    (let [tv (emit-branch cg thn scp dest)
           then-end (cg-cur-block cg)
           then-div
             (!= (primitive/cast i64 (LLVMGetBasicBlockTerminator then-end))
                 (primitive/cast i64 0))]
       (cg-pos cg else-bb)
-      (let [ev (emit-expr cg els scp)
+      (let [ev (emit-branch cg els scp dest)
             else-end (cg-cur-block cg)
             else-div
               (!= (primitive/cast i64 (LLVMGetBasicBlockTerminator else-end))
@@ -3265,8 +3643,8 @@
                       (mk-tv (cg-zero-i64 cg) (TVoid))
                       (let [phi
                               (LLVMBuildPhi b
-                                            (basic-ty cg
-                                                      (box-type a (tv-ty tv)))
+                                            (cg-value-ty cg
+                                                         (box-type a (tv-ty tv)))
                                             (cg-bl cg "ifval"))
                             (mut vs) (al-new [(ptr i8)] a)
                             (mut bs) (al-new [(ptr i8)] a)]
@@ -3332,7 +3710,7 @@
                     (match (.break_ty lp) (Some [t] t) (None [] (TInt 64 true)))
                   phi
                     (LLVMBuildPhi b
-                                  (basic-ty cg (box-type a ty))
+                                  (cg-value-ty cg (box-type a ty))
                                   (cg-bl cg "loop.val"))
                   (mut vs) (al-new [(ptr i8)] a)
                   (mut bs) (al-new [(ptr i8)] a)
@@ -3624,7 +4002,8 @@
 (defn emit-callptr [(cg (ptr Cg))
                     (fp (ptr Expr))
                     (args (ptr (ArrayList Expr)))
-                    (scp (ptr Scope))] (-> Tv)
+                    (scp (ptr Scope))
+                    (dest Dest)] (-> Tv)
   (let [a (.a cg)
         b (cg-bld cg)
         fpv (emit-expr cg fp scp)
@@ -3671,9 +4050,10 @@
                           sig
                           (emit-argtv cg args scp)
                           (load retp)
-                          "callptr"))
+                          "callptr"
+                          dest))
         (let [fnty (cg-fn-type cg params retp)
-              vals (emit-vals cg args scp)
+              vals (reconcile-args cg fnty (emit-vals cg args scp))
               cs
                 (LLVMBuildCall2 b
                                 fnty
@@ -3687,7 +4067,9 @@
             (when (>= ccid 0)
               (LLVMSetInstructionCallConv cs (primitive/cast i32 ccid))
               0))
-          (mk-tv cs (load retp))))))
+          (if (ty-is-void retp)
+              (mk-tv cs (load retp))
+              (cg-deliver cg (cg-tv-of-ssa cg cs (load retp)) dest))))))
 
 (defstruct FnSig
   [(cc (slice u8)) (params (ptr (ArrayList Type))) (ret (ptr Type))])
@@ -4056,14 +4438,14 @@
                                       (tv-val (get (load vals) 0))
                                       (cg-bl cg "volatile.load"))]
                 (LLVMSetVolatile inst 1)
-                (mk-tv inst (load result))))
+                (cg-tv-of-ssa cg inst (load result))))
           (= body "coil.mem.volatile-store")
             (do
               (unless (= (len (load vals)) (primitive/cast i64 2))
                 (cg-fail "volatile-store!: compiler operand mismatch"))
               (let [inst
                       (LLVMBuildStore b
-                                      (tv-val (get (load vals) 1))
+                                      (cg-tv-ssa cg (get (load vals) 1))
                                       (tv-val (get (load vals) 0)))]
                 (LLVMSetVolatile inst 1)
                 (mk-tv (cg-zero-i64 cg) (load result))))
@@ -4077,7 +4459,7 @@
                                       (tv-val (get (load vals) 0))
                                       (cg-bl cg "alias.load"))]
                 (set-alias-metadata cg inst result)
-                (mk-tv inst (load result))))
+                (cg-tv-of-ssa cg inst (load result))))
           (= body "coil.mem.alias-store")
             (do
               (unless (= (len (load vals)) (primitive/cast i64 2))
@@ -4085,7 +4467,7 @@
               (let [value (get (load vals) 1)
                     inst
                       (LLVMBuildStore b
-                                      (tv-val value)
+                                      (cg-tv-ssa cg value)
                                       (tv-val (get (load vals) 0)))]
                 (set-alias-metadata cg
                                     inst
@@ -4281,15 +4663,18 @@
                             (break)
                             (do
                               (push! (mut vs)
-                                     (tv-val (get (load argtv) (load q))))
+                                     (cg-tv-ssa cg (get (load argtv) (load q))))
                               (set! q (primitive/iadd (load q) 1)))))
-                  (mk-tv (LLVMBuildCall2 b
-                                         (LLVMGlobalGetValueType callee)
-                                         callee
-                                         (carr a (load vs))
-                                         (primitive/cast i32 nargs)
-                                         (cg-bl cg "llvmir"))
-                         (load result)))))))))
+                  (let [call
+                          (LLVMBuildCall2 b
+                                          (LLVMGlobalGetValueType callee)
+                                          callee
+                                          (carr a (load vs))
+                                          (primitive/cast i32 nargs)
+                                          (cg-bl cg "llvmir"))]
+                    (if (ty-is-void result)
+                        (mk-tv call (load result))
+                        (cg-tv-of-ssa cg call (load result)))))))))))
 
 (defn emit-arg-tvs [(cg (ptr Cg)) (es (ptr (ArrayList Expr))) (scp (ptr Scope))] (-> (ArrayList Tv))
   (let [n (len (load es))
@@ -4331,43 +4716,32 @@
                                                       ret_direct)))
                          (primitive/cast i64 0)))]
           (if (not (or has-sret has-rd))
-              (do (LLVMBuildRet b (tv-val last)) 0)
+              (do (LLVMBuildRet b (cg-tv-ssa cg last)) 0)
               (let [sa
                       (if has-sret
                           (load (field sig sret))
                           (load (field sig ret_direct)))
-                    lv (tv-val last)
-                    loaded (cg-just-loaded-agg cg lv)]
-                (if (and has-sret (!= (primitive/cast i64 loaded) (primitive/cast i64 0)))
+                    ; the result is a memory value: copy it from its storage
+                    lv (tv-val last)]
+                (if has-sret
                     (do
                       (LLVMBuildMemCpy b
                                        (LLVMGetParam (cg-cur-func cg) 0)
                                        (.align sa)
-                                       loaded
-                                       (LLVMGetAlignment lv)
+                                       lv
+                                       1
                                        (cg-const-uoff cg (.size sa)))
                       (LLVMBuildRetVoid b)
                       0)
-                    (let [src
-                            (if (= (LLVMGetTypeKind (LLVMTypeOf lv))
-                                   (primitive/cast i32 12))
-                                lv
-                                (let [slot (cg-struct-slot-padded cg sa "ret.spill")]
-                                  (LLVMBuildStore b lv slot)
-                                  slot))]
-                      (if has-sret
-                          (do
-                            (cg-copy-struct cg
-                                            (LLVMGetParam (cg-cur-func cg) 0)
-                                            src
-                                            sa)
-                            (LLVMBuildRetVoid b)
-                            0)
-                          (let [rt (abi-direct-return-type cg sa)]
-                            (if (= (LLVMGetTypeKind rt) (primitive/cast i32 0))
-                                (LLVMBuildRetVoid b)
-                                (LLVMBuildRet b (LLVMBuildLoad2 b rt src (cg-bl cg "abi.ret.coerce"))))
-                            0))))))))))
+                    ; a direct return reads whole ABI slots, so it needs storage
+                    ; padded to them, not the value's exactly sized storage
+                    (let [rt (abi-direct-return-type cg sa)
+                          slot (cg-struct-slot-padded cg sa "ret.spill")]
+                      (LLVMBuildMemCpy b slot (.align sa) lv 1 (cg-const-uoff cg (.size sa)))
+                      (if (= (LLVMGetTypeKind rt) (primitive/cast i32 0))
+                          (LLVMBuildRetVoid b)
+                          (LLVMBuildRet b (LLVMBuildLoad2 b rt slot (cg-bl cg "abi.ret.coerce"))))
+                      0))))))))
 
 ;;; May this call in tail position be emitted as a tail call?
 ;;;
@@ -4482,7 +4856,25 @@
                  (ret (ptr Type))
                  (scp (ptr Scope))] (-> i64)
   (let [a (.a cg)
-        b (cg-bld cg)]
+        b (cg-bld cg)
+        sret-sa
+          (if (= (primitive/cast i64 sig) (primitive/cast i64 0))
+              (primitive/cast (ptr StructAbi) 0)
+              (load (field sig sret)))
+        branches (match (.kind e) (EIf [_ _ _] true) (EMatch [_ _] true) (_ false))]
+    ; A result returned through a hidden pointer is built in the caller's
+    ; storage, which the caller hands over fresh (an `if` or `match` passes this
+    ; down to each branch's own tail).
+    (if (and (!= (primitive/cast i64 sret-sa) (primitive/cast i64 0))
+             (and (not branches) (cg-mem-ty? cg ret)))
+        (do
+          (emit-into cg
+                     e
+                     (Dest :at (LLVMGetParam function 0)
+                           :align (primitive/cast i64 (.align sret-sa)))
+                     scp)
+          (unless (cg-terminated cg) (LLVMBuildRetVoid b))
+          0)
     (match (.kind e)
       (ECleanup [_body _cleanups]
                 (emit-c-return cg sig ret (emit-expr cg e scp)))
@@ -4551,9 +4943,9 @@
                      (and (= (primitive/cast i64 function)
                              (primitive/cast i64 (load (field cg reset_func))))
                           (not (cg-has-csig cg func))))
-                 (let [vals (emit-vals cg args scp)
-                       callee (cg-func cg func)
+                 (let [callee (cg-func cg func)
                        cfnty (cg-func-fnty cg func callee)
+                       vals (reconcile-args cg cfnty (emit-vals cg args scp))
                        cs
                          (LLVMBuildCall2 b
                                          cfnty
@@ -4587,7 +4979,7 @@
                  (let [v (emit-expr cg e scp)]
                    (when (not (cg-terminated cg)) (emit-c-return cg sig ret v)))))
       (ECallPtr [fp args]
-                (let [v (emit-callptr cg fp args scp)]
+                (let [v (emit-callptr cg fp args scp (no-dest))]
                   (if (and (let [cc
                                    (primitive/cast i64
                                                    (LLVMGetFunctionCallConv function))]
@@ -4607,7 +4999,7 @@
                         (emit-c-return cg sig ret v)))))
       (EMatch [scrut arms] (emit-tail-match cg scrut arms function sig ret scp))
       (_ (let [v (emit-expr cg e scp)]
-           (when (not (cg-terminated cg)) (emit-c-return cg sig ret v)))))))
+           (when (not (cg-terminated cg)) (emit-c-return cg sig ret v))))))))
 
 (defn emit-tail-match [(cg (ptr Cg))
                        (scrut (ptr Expr))
@@ -4640,11 +5032,7 @@
         ui (cg-sum-idx cg sumname)
         sp (al-elem [CgSum] (field cg sums) ui)
         sum-ty (load (field sp ty))
-        tmp
-          (if borrowed
-              (tv-val sv)
-              (cg-entry-alloca cg sum-ty (cg-bl cg "match.tmp")))]
-    (unless borrowed (cg-store-value cg (tv-val sv) tmp 0) 0)
+        tmp (cg-match-storage cg sv borrowed)]
     (let [tagptr (LLVMBuildStructGEP2 b sum-ty tmp 0 (cg-bl cg "tag"))
           tag (LLVMBuildLoad2 b (cg-i32t cg) tagptr (cg-bl cg "tag"))
           payload (LLVMBuildStructGEP2 b sum-ty tmp 1 (cg-bl cg "payload"))
@@ -4706,30 +5094,8 @@
                                           fty
                                             (.ty (al-elem [Field] vfs (load j)))
                                           bname (get (load binds) (load j))
-                                          borrowed-binding
-                                            (and borrowed
-                                                 (starts-with bname
-                                                              "$match.ref."))
-                                          fval
-                                            (if borrowed-binding
-                                                fptr
-                                                (LLVMBuildLoad2 b
-                                                                (basic-ty cg
-                                                                          (box-type a
-                                                                                    fty))
-                                                                fptr
-                                                                (str->cstr a
-                                                                           bname)))
-                                          bind-ty
-                                            (if borrowed-binding
-                                                (TPtr (box-type a fty))
-                                                fty)]
-                                      (set! child
-                                            (scope-put a
-                                                       (load child)
-                                                       bname
-                                                       fval
-                                                       bind-ty)))
+                                          bv (cg-match-binding cg fptr fty bname borrowed)]
+                                    (set! child (scope-put a (load child) bname (tv-val bv) (tv-ty bv))))
                                     (set! j (primitive/iadd (load j) 1)))))
                         (emit-tail cg
                                    (field ap body)
@@ -4789,6 +5155,7 @@
                          (primitive/cast i64 0)))
             1)]
     (set! (.nstatic cg) 0)
+    (al-clear! (mut (.aligns cg)))
     (let [policy (func-inline-policy f)]
       (if (= policy 1)
           (do
@@ -4869,31 +5236,17 @@
                                                                                   1)))))
                                                 0))
                                     (_ 0))
-                                  (set! scp
-                                        (scope-put a
-                                                   (load scp)
-                                                   pname
-                                                   (LLVMBuildLoad2 b
-                                                                   (load (field sa
-                                                                                llvm_ty))
-                                                                   slot
-                                                                   (str->cstr a
-                                                                              pname))
-                                                   pty))))
+                                  ; the reassembled slot holds the value
+                                  (set! scp (scope-put a (load scp) pname slot pty))))
                       (AAIndirect [sa]
+                                  ; the caller's copy holds the value
                                   (let [ptr
                                           (LLVMGetParam function
                                                         (primitive/cast i32
-                                                                        (load idx)))
-                                        val
-                                          (LLVMBuildLoad2 b
-                                                          (load (field sa
-                                                                       llvm_ty))
-                                                          ptr
-                                                          (str->cstr a pname))]
+                                                                        (load idx)))]
                                     (set! idx (primitive/iadd (load idx) 1))
                                     (set! scp
-                                          (scope-put a (load scp) pname val pty))))
+                                          (scope-put a (load scp) pname ptr pty))))
                       (AAScalar []
                                 (let [v
                                         (LLVMGetParam function
@@ -4903,8 +5256,11 @@
                                                      (str->cstr a pname)
                                                      (len pname))
                                   (set! idx (primitive/iadd (load idx) 1))
-                                  (set! scp
-                                        (scope-put a (load scp) pname v pty))))))
+                                  ; an array of a plain LLVM signature arrives as a
+                                  ; first-class value; give it storage
+                                  (let [pv (cg-tv-of-ssa cg v pty)]
+                                    (set! scp
+                                          (scope-put a (load scp) pname (tv-val pv) pty)))))))
                   (set! i (primitive/iadd (load i) 1)))))
       (load scp))))
 
@@ -4934,7 +5290,6 @@
                          sig
                          (field f ret)
                          scp))))))
-  (cg-erase-dead-aggregate-loads! function)
   0)
 
 ; ======================== the module driver (compile_for_dbg, dbg=None) ======
@@ -5089,6 +5444,7 @@
         (set! (.llvm_ir_helpers cgp)
               (hm-new [(slice u8) (ptr i8)] a (str-keyops)))
         (set! (.loops cgp) (al-new [CgLoop] a))
+        (set! (.aligns cgp) (al-new [CgAlign] a))
         (set! (.csigs cgp) (al-new [CSigEntry] a))
         (set! (.exports cgp) (load (field p exports)))
         (set! (.unit_build cgp) (> (len (load (field p unit_exports))) 0))
@@ -7117,80 +7473,91 @@
       (LLVMSetAlignment z 1))
     p))
 
-(defn cg-struct-arg-ptr [(cg (ptr Cg)) (v (ptr i8)) (sa (ptr StructAbi))] (-> (ptr i8))
-  ; A pointer-valued aggregate may refer to an exactly sized caller spill, heap
-  ; object, or packed field. It does not promise readable ABI tail padding (or
-  ; register alignment). Normalize pointers as well as SSA aggregate values:
-  ; copy only the logical object bytes into initialized, aligned ABI storage.
-  ; Ask for the loaded source before the slot's zeroing store is emitted.
-  (let [loaded (cg-just-loaded-agg cg v)
-        slot (cg-struct-slot-padded cg sa "abi.arg")]
-    (cond (= (LLVMGetTypeKind (LLVMTypeOf v)) (primitive/cast i32 12))
-            (LLVMBuildMemCpy (cg-bld cg) slot (.align sa) v 1 (cg-const-uoff cg (.size sa)))
-          (!= (primitive/cast i64 loaded) (primitive/cast i64 0))
-            (LLVMBuildMemCpy (cg-bld cg)
-                             slot
-                             (.align sa)
-                             loaded
-                             (LLVMGetAlignment v)
-                             (cg-const-uoff cg (.size sa)))
-          :else (LLVMBuildStore (cg-bld cg) v slot))
+;; A struct, sum, `dyn` pair or fixed array is a MEMORY value: its Tv holds the
+;; address of storage that nothing writes again while the Tv is live, never an
+;; LLVM first-class aggregate. LLVM's advice to frontends is to move aggregates
+;; with memcpy: first-class aggregate loads and stores make SROA and instruction
+;; selection expand every field, which cost seconds per copy of a 3 KB struct.
+;; A slice stays a first-class {ptr, i64}: a pair of scalars, as in Rust's
+;; ScalarPair. Code that needs the value itself (inline LLVM IR, a volatile
+;; store, an array parameter of a plain LLVM signature) loads it there, and
+;; only there (cg-tv-ssa); the reverse boundary is cg-tv-of-ssa.
+(defn cg-mem-ty? [(cg (ptr Cg)) (t (ptr Type))] (-> bool)
+  (match (load t)
+    (TSlice [_] false)
+    (_ (let [k (LLVMGetTypeKind (basic-ty cg t))]
+         (or (= k (primitive/cast i32 10)) (= k (primitive/cast i32 11)))))))
+
+;; Fresh storage for one value of the memory type T, in the entry block.
+(defn cg-mem-temp [(cg (ptr Cg)) (t (ptr Type)) (name (slice u8))] (-> (ptr i8))
+  (let [slot (cg-entry-alloca cg (basic-ty cg t) (cg-bl cg name))
+        al (cg-layout-align cg t)]
+    (when (> al (primitive/cast i64 (LLVMGetAlignment slot)))
+      (LLVMSetAlignment slot (primitive/cast i32 al)))
     slot))
 
-; The memory an aggregate value was just loaded from, or null.
-;
-; Codegen carries aggregates as LLVM first-class values, so a call's sret
-; result or a place read arrives as `load %T, ptr %src`. Storing that value
-; again makes an aggregate load/store pair, which SROA and instruction
-; selection expand field by field: a 3 KB struct returned by value at four call
-; sites cost ten seconds of AArch64 instruction selection. When the load is the
-; last instruction of the block the builder appends to, nothing has run since
-; it, so %src still holds the value and the caller can copy memory instead. The
-; load itself stays, since an SSA binding may still refer to it; once the whole
-; function is emitted, cg-erase-dead-aggregate-loads! removes it if none did.
-(defn cg-just-loaded-agg [(cg (ptr Cg)) (v (ptr i8))] (-> (ptr i8))
-  (let [kind (LLVMGetTypeKind (LLVMTypeOf v))
-        last (LLVMGetLastInstruction (LLVMGetInsertBlock (cg-bld cg)))]
-    (if (and (or (= kind (primitive/cast i32 10)) (= kind (primitive/cast i32 11)))
-             (= (primitive/cast i64 last) (primitive/cast i64 v))
-             (!= (primitive/cast i64 (LLVMIsALoadInst v)) (primitive/cast i64 0)))
-        (LLVMGetOperand v 0)
-        (primitive/cast (ptr i8) 0))))
+;; Copy one value of the memory type T. The source is a memory value's storage
+;; or a fresh slot, never storage overlapping DST, so this is a memcpy.
+(defn cg-mem-copy! [(cg (ptr Cg)) (dst (ptr i8)) (src (ptr i8)) (t (ptr Type))] (-> i64)
+  (LLVMBuildMemCpy (cg-bld cg) dst 1 src 1 (cg-const-uoff cg (cg-layout-size cg t)))
+  0)
 
-; Store `v` at `dst`, copying memory when `v` is an aggregate just loaded (see
-; cg-just-loaded-agg). memmove, since that source may overlap `dst`. A nonzero
-; `align` is the alignment `dst` promises; zero leaves the store's default.
-(defn cg-store-value [(cg (ptr Cg)) (v (ptr i8)) (dst (ptr i8)) (align i32)] (-> i64)
-  (let [src (cg-just-loaded-agg cg v)]
-    (if (!= (primitive/cast i64 src) (primitive/cast i64 0))
-        (LLVMBuildMemMove (cg-bld cg) dst align src (LLVMGetAlignment v)
-          (cg-const-uoff cg (LLVMStoreSizeOfType (load (field cg td)) (LLVMTypeOf v))))
-        (let [ins (LLVMBuildStore (cg-bld cg) v dst)]
+;; The LLVM type a value of T travels as: a memory value as its address.
+(defn cg-value-ty [(cg (ptr Cg)) (t (ptr Type))] (-> (ptr i8))
+  (if (cg-mem-ty? cg t) (LLVMPointerTypeInContext (cg-ctx cg) 0) (basic-ty cg t)))
+
+;; The value itself, for a boundary that needs a first-class LLVM value.
+(defn cg-tv-ssa [(cg (ptr Cg)) (tv Tv)] (-> (ptr i8))
+  (let [t (box-type (.a cg) (tv-ty tv))]
+    (if (cg-mem-ty? cg t)
+        (let [ins (LLVMBuildLoad2 (cg-bld cg) (basic-ty cg t) (tv-val tv) (cg-bl cg "agg.value"))]
+          (LLVMSetAlignment ins 1)
+          ins)
+        (tv-val tv))))
+
+;; A first-class value an LLVM construct produced (a call with a plain LLVM
+;; signature, inline IR, a volatile load), as a Tv: a memory value goes to
+;; fresh storage.
+(defn cg-tv-of-ssa [(cg (ptr Cg)) (v (ptr i8)) (t Type)] (-> Tv)
+  (let [tp (box-type (.a cg) t)]
+    (if (cg-mem-ty? cg tp)
+        (let [slot (cg-mem-temp cg tp "agg.tmp")]
+          (LLVMBuildStore (cg-bld cg) v slot)
+          (mk-tv slot t))
+        (mk-tv v t))))
+
+;; Store a Tv's value at DST; a memory value is copied from its storage. A
+;; nonzero ALIGN is the alignment DST promises a scalar store.
+(defn cg-store-tv! [(cg (ptr Cg)) (tv Tv) (dst (ptr i8)) (align i32)] (-> i64)
+  (let [t (box-type (.a cg) (tv-ty tv))]
+    (if (cg-mem-ty? cg t)
+        (cg-mem-copy! cg dst (tv-val tv) t)
+        (let [ins (LLVMBuildStore (cg-bld cg) (tv-val tv) dst)]
           (when (!= align (primitive/cast i32 0)) (LLVMSetAlignment ins align))
-          ins))
-    0))
+          0))))
 
-; Erase every aggregate load left with no uses once FUNCTION is complete, which
-; is the first moment "no uses" is final (see cg-just-loaded-agg). LLVM would
-; delete them eventually, but SROA runs first and reads a whole-struct load as a
-; typed access to each of its fields: it then partitions the alloca per field and
-; turns each struct copy into one load/store per field. A 4.8 KB record copied
-; that way cost 1.3 s of instruction selection in a single function.
-(defn cg-erase-dead-aggregate-loads! [(function (ptr i8))] (-> i64)
-  (let [(mut bb) (LLVMGetFirstBasicBlock function)]
-    (while (!= (primitive/cast i64 (load bb)) (primitive/cast i64 0))
-      (let [(mut inst) (LLVMGetFirstInstruction (load bb))]
-        (while (!= (primitive/cast i64 (load inst)) (primitive/cast i64 0))
-          (let [i (load inst)
-                kind (LLVMGetTypeKind (LLVMTypeOf i))]
-            (set! inst (LLVMGetNextInstruction i))
-            (when (and (or (= kind (primitive/cast i32 10)) (= kind (primitive/cast i32 11)))
-                       (and (!= (primitive/cast i64 (LLVMIsALoadInst i)) (primitive/cast i64 0))
-                            (and (= (primitive/cast i64 (LLVMGetFirstUse i)) (primitive/cast i64 0))
-                                 (= (LLVMGetVolatile i) (primitive/cast i32 0)))))
-              (LLVMInstructionEraseFromParent i)))))
-      (set! bb (LLVMGetNextBasicBlock (load bb))))
-    0))
+;; A zero of T: fresh zeroed storage for a memory type, else a constant.
+(defn emit-zeroed [(cg (ptr Cg)) (t Type)] (-> Tv)
+  (let [tp (box-type (.a cg) t)]
+    (if (cg-mem-ty? cg tp)
+        (let [slot (cg-mem-temp cg tp "zeroed")]
+          (LLVMBuildMemSet (cg-bld cg)
+                           slot
+                           (LLVMConstInt (LLVMInt8TypeInContext (cg-ctx cg)) 0 0)
+                           (cg-const-uoff cg (cg-layout-size cg tp))
+                           1)
+          (mk-tv slot t))
+        (mk-tv (LLVMConstNull (basic-ty cg tp)) t))))
+
+;; The ABI copy of an aggregate argument. V is the address of a memory value,
+;; an exactly sized object that promises no readable tail padding or register
+;; alignment, so copy only the logical bytes into initialized, aligned storage.
+(defn cg-struct-arg-ptr [(cg (ptr Cg)) (v (ptr i8)) (sa (ptr StructAbi))] (-> (ptr i8))
+  (let [slot (cg-struct-slot-padded cg sa "abi.arg")]
+    (if (= (LLVMGetTypeKind (LLVMTypeOf v)) (primitive/cast i32 12))
+        (do (LLVMBuildMemCpy (cg-bld cg) slot (.align sa) v 1 (cg-const-uoff cg (.size sa))) 0)
+        (do (unimplemented "codegen: an aggregate argument is not in memory") 0))
+    slot))
 
 (defn cg-copy-struct [(cg (ptr Cg))
                       (dst (ptr i8))
@@ -7368,7 +7735,7 @@
             v (tv-val tv)
             ty (box-type a (tv-ty tv))]
         (if (not (cg-abi-aggregate? cg ty))
-            (push! meta v)
+            (push! meta (cg-tv-ssa cg tv))
             (let [sa (cg-variadic-struct-abi cg ty (mut regs))
                   src (cg-struct-arg-ptr cg v sa)]
               (match (.arg sa)
@@ -7474,7 +7841,8 @@
                       (sig (ptr CSig))
                       (argtv (ArrayList Tv))
                       (ret-ty Type)
-                      (label (slice u8))] (-> Tv)
+                      (label (slice u8))
+                      (dest Dest)] (-> Tv)
   (let [a (.a cg)
         b (cg-bld cg)
         ctx (cg-ctx cg)
@@ -7485,7 +7853,10 @@
         nargs (len argtv)
         nfixed (len (load (field sig args)))]
     (when (!= (primitive/cast i64 sret-sa) (primitive/cast i64 0))
-      (let [s (cg-struct-slot cg sret-sa "abi.sret")]
+      ; the callee writes its result straight into a destination aligned for it
+      (let [s (if (dest-fits? dest (primitive/cast i64 (.align sret-sa)))
+                  (.at dest)
+                  (cg-struct-slot cg sret-sa "abi.sret"))]
         (store! sret-slot s)
         (push! (mut meta) s)))
     (let [(mut i) 0]
@@ -7496,11 +7867,11 @@
                         tv (get argtv (load i))
                         v (tv-val tv)]
                     (match aa
-                      (AAScalar [] (push! (mut meta) v))
+                      (AAScalar [] (push! (mut meta) (cg-tv-ssa cg tv)))
+                      ; the callee's own copy, straight from the value's storage
                       (AAIndirect [sa]
-                                  (let [src (cg-struct-arg-ptr cg v sa)
-                                        copy (cg-struct-slot cg sa "abi.byval")]
-                                    (cg-copy-struct cg copy src sa)
+                                  (let [copy (cg-struct-slot cg sa "abi.byval")]
+                                    (LLVMBuildMemCpy b copy (.align sa) v 1 (cg-const-uoff cg (.size sa)))
                                     (push! (mut meta) copy)))
                       (AADirect [sa]
                                 (let [src (cg-struct-arg-ptr cg v sa)]
@@ -7553,26 +7924,19 @@
       (LLVMSetInstructionCallConv cs ccid)
       (cg-apply-csig-attrs cg sig cs true)
       (cg-variadic-byvals! cg cs byvals)
+      ; an aggregate result is a memory value where the call left it
       (if (!= (primitive/cast i64 sret-sa) (primitive/cast i64 0))
-          (mk-tv (LLVMBuildLoad2 b
-                                 (load (field sret-sa llvm_ty))
-                                 (load sret-slot)
-                                 (cg-bl cg "abi.ret"))
-                 ret-ty)
+          (cg-deliver cg (mk-tv (load sret-slot) ret-ty) dest)
           (let [rd (load (field sig ret_direct))]
             (if (!= (primitive/cast i64 rd) (primitive/cast i64 0))
                 (let [slot (cg-struct-slot-padded cg rd "abi.ret")]
                   ; an empty struct's call returns nothing; its value is the empty one
                   (unless (= (LLVMGetTypeKind (LLVMTypeOf cs)) (primitive/cast i32 0))
                     (LLVMBuildStore b cs slot))
-                  (mk-tv (LLVMBuildLoad2 b
-                                         (load (field rd llvm_ty))
-                                         slot
-                                         (cg-bl cg "abi.ret.val"))
-                         ret-ty))
+                  (cg-deliver cg (mk-tv slot ret-ty) dest))
                 (if (ty-is-void (box-type a ret-ty))
                     (mk-tv (cg-zero-i64 cg) (TVoid))
-                    (mk-tv cs ret-ty))))))))
+                    (cg-deliver cg (cg-tv-of-ssa cg cs ret-ty) dest))))))))
 
 ; a DIRECT call to a named C function: the global carries both its type and its cc.
 (defn emit-c-call [(cg (ptr Cg))
@@ -7580,7 +7944,8 @@
                    (callee (ptr i8))
                    (sig (ptr CSig))
                    (argtv (ArrayList Tv))
-                   (ret-ty Type)] (-> Tv)
+                   (ret-ty Type)
+                   (dest Dest)] (-> Tv)
   (emit-c-call-ty cg
                   callee
                   (cg-func-fnty cg func callee)
@@ -7588,7 +7953,8 @@
                   sig
                   argtv
                   ret-ty
-                  "ccall"))
+                  "ccall"
+                  dest))
 
 ; Two `(extern …)` declarations that resolve to the same C symbol must agree on
 ; their LLVM function type. A module holds ONE function per symbol, so the second
