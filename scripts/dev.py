@@ -412,6 +412,10 @@ def test(args: argparse.Namespace) -> None:
                 *(["--verbose"] if args.verbose else []))
     elif args.suite == "simd":
         execute(sys.executable, "tests/compiler/simd_test.py", "--compiler", compiler, "--differential")
+    elif args.suite == "aggregates":
+        # Local only, not in CI: run it before installing a codegen change.
+        execute(sys.executable, "scripts/tests/aggregate-ir-scan.py", compiler,
+                *(["--all"] if args.all_sources else []))
     elif args.suite == "const-generics":
         execute(sys.executable, "tests/compiler/const_generic_test.py", "--compiler", compiler)
     elif args.suite == "field-access":
@@ -1703,9 +1707,11 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "update", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd", "const-generics", "field-access", "prop"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "update", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd", "const-generics", "field-access", "prop", "aggregates"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
+    command.add_argument("--all-sources", action="store_true",
+                         help="aggregates: scan every test and the compiler itself, not the fast subset")
     command.set_defaults(func=test)
 
     command = commands.add_parser("snapshot", help="regenerate compiler snapshots")
