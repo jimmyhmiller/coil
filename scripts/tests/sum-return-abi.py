@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sum results follow the C aggregate rules on every backend.
+"""Sum and array results follow the C aggregate rules on every backend.
 
 A sum is integer words (tag, then payload). The native backends and native_call
 always returned one like a C struct of those words: in registers up to 16 bytes,
@@ -52,15 +52,19 @@ with tempfile.TemporaryDirectory(prefix=".coil-sum-return-abi-", dir=ROOT / "bui
         executable = work / f"v{i}"
         run([COMPILER, "build", FEATURES / "sum_return_abi.coil", *flags, "-o", executable])
         passes(executable, flags)
-        print(f"PASS: {' '.join(flags)}: sums of 0/1/2/3/8 payload words through direct, generic, fnptr and dyn calls")
+        print(f"PASS: {' '.join(flags)}: sums of 0/1/2/3/8 payload words and arrays through direct, generic, fnptr and dyn calls")
 
     ir = run([COMPILER, "emit-ir", FEATURES / "sum_return_abi.coil"]).stdout
     assert "target datalayout" in ir, ir
-    for name in ("mk3", "mk8", "forward8"):
+    for name in ("mk3", "mk8", "forward8", "mka3", "mka32"):
         sig = re.search(r"^define[^\n]*@sum-return-abi\." + name + r"\([^\n]*", ir, re.M)
         assert sig and "sret(" in sig.group(0), (name, sig and sig.group(0))
     assert not re.search(r"\bret %sum-return-abi-types\.S\d", ir), "a sum must not be returned as an LLVM aggregate"
-    print("PASS: sums beyond 16 bytes return through sret")
+    # (two words, or an HFA of up to four floats, return in registers as the ABI's
+    # coerced value; anything else must go through sret)
+    assert not re.search(r"\bret \[\d+ x [^\]]+\] %(?!abi\.ret\.coerce)", ir), \
+        "an array must not be returned as an LLVM aggregate"
+    print("PASS: sums and arrays beyond 16 bytes return through sret")
 
     if native:
         pairs = [("llvm", native), (native, "llvm"), ("llvm", "llvm")]
@@ -72,4 +76,4 @@ with tempfile.TemporaryDirectory(prefix=".coil-sum-return-abi-", dir=ROOT / "bui
             run([COMPILER, "build", FEATURES / "sum_return_abi_use.coil",
                  "--backend", use_backend, "--link-flag", obj, "-o", executable])
             passes(executable, (lib_backend, use_backend))
-            print(f"PASS: sums returned by {lib_backend} code read correctly by {use_backend} code")
+            print(f"PASS: sums and arrays returned by {lib_backend} code read correctly by {use_backend} code")
