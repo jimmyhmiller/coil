@@ -44,18 +44,49 @@ for level in ("-O0", "-O3"):
     invoke("run", result_source, level)
 result_ir = invoke("emit-ir", result_source)
 assert "target datalayout" in result_ir, result_ir
-for name in ("make-block", "forward", "store-result", "hold", "pass-result", "reuse"):
-    fn = re.search(r"define[^\n]*@test\.aggregate-call-result-copy\." + re.escape(name)
-                   + r"\([^\n]*\)\s*\{(.*?)\n\}", result_ir, re.S)
+def function_body(ir, prefix, name):
+    fn = re.search(r"define[^\n]*@" + re.escape(prefix + name) + r"\([^\n]*\)\s*\{(.*?)\n\}", ir, re.S)
     assert fn, f"{name} missing from emitted IR"
-    assert not re.search(r"store (?:%test\.aggregate-call-result-copy\.Block|\[4096 x i8\]) %", fn.group(1)), \
-        (name, "a big call result must be copied as memory, not stored as an LLVM aggregate", fn.group(1))
-    if name != "reuse":
-        assert re.search(r"@llvm\.mem(?:cpy|move)\.[^\n]*i64 4096", fn.group(1)), (name, fn.group(1))
-    # A whole-struct load left unused reads to SROA as a typed access to every
-    # field, which splits each copy of that struct into one load/store per field.
-    assert not re.search(r"= load (?:%test\.aggregate-call-result-copy\.(?:Block|Holder)|\[4096 x i8\]),", fn.group(1)), \
-        (name, "no unused aggregate load may survive emission", fn.group(1))
+    return fn.group(1)
+
+
+# An aggregate is a memory value: it moves by memcpy, never as an LLVM
+# first-class load or store, which SROA and instruction selection expand field
+# by field (seconds per copy of a 3 KB struct).
+block_prefix = "test.aggregate-call-result-copy."
+for name in ("make-block", "forward", "store-result", "hold", "pass-result", "reuse"):
+    body = function_body(result_ir, block_prefix, name)
+    assert not re.search(r"(?:load|store) (?:%test\.aggregate-call-result-copy\.(?:Block|Holder)|\[4096 x i8\])[ ,]", body), \
+        (name, "a big aggregate must move as memory, not as an LLVM aggregate value", body)
+# It is built where it is going: a returned local in the caller's result slot,
+# a forwarded call's result in this function's own, a payload in its sum.
+assert "alloca %test.aggregate-call-result-copy.Block" not in function_body(result_ir, block_prefix, "make-block"), \
+    "a returned local is built in the caller's result slot"
+forward = function_body(result_ir, block_prefix, "forward")
+assert re.search(r"@test\.aggregate-call-result-copy\.make-block\(ptr sret\([^)]*\) align 8 %0,", forward), forward
+assert "@llvm.mem" not in forward, ("a forwarded result is written once, by its callee", forward)
+hold = function_body(result_ir, block_prefix, "hold")
+assert re.search(r"make-block\(ptr sret\([^)]*\) align 8 %vf", hold), ("a payload is built in its sum", hold)
+# An assignment's new value may read the old one, so it is built aside and copied.
+assert re.search(r"@llvm\.mem(?:cpy|move)\.[^\n]*i64 4096", function_body(result_ir, block_prefix, "store-result"))
+
+dest_source = "tests/compiler/features/aggregate_destinations.coil"
+for level in ("-O0", "-O3"):
+    invoke("run", dest_source, level)
+dest_ir = invoke("emit-ir", dest_source)
+assert "target datalayout" in dest_ir, dest_ir
+dest_prefix = "test.aggregate-destinations."
+for name in ("mk", "build"):
+    body = function_body(dest_ir, dest_prefix, name)
+    assert "alloca" not in body and "@llvm.memcpy" not in body, (name, "built in the caller's result slot", body)
+pick = function_body(dest_ir, dest_prefix, "pick")
+assert len(re.findall(r"\(ptr sret\([^)]*\) align 8 %0,", pick)) == 2 and "@llvm.memcpy" not in pick, \
+    ("each branch of an if writes the result itself", pick)
+some = function_body(dest_ir, dest_prefix, "some")
+assert re.search(r"@test\.aggregate-destinations\.mk\(ptr sret\([^)]*\) align 8 %vf", some), some
+main = function_body(dest_ir, "", "main")
+assert re.search(r"@test\.aggregate-destinations\.wrap\(ptr sret\([^)]*\) align 8 %stack\.slot", main), \
+    ("a binding's slot receives its initializer's result directly", main)
 invoke("run", "tests/compiler/features/declaration_index.coil")
 invoke("run", "tests/compiler/features/syntax_accessors.coil")
-print("PASS: aggregate snapshots, assignments, and big call results preserve evaluation order, overlap, and self-assignment with bulk copies; declaration indexes preserve exact, ambiguous, missing, growing, and republished model queries")
+print("PASS: aggregate snapshots, assignments, big call results and destinations preserve evaluation order, overlap, and self-assignment with bulk copies; declaration indexes preserve exact, ambiguous, missing, growing, and republished model queries")
