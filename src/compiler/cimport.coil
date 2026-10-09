@@ -31,7 +31,8 @@
 (import "coil.arraylist" :use *)
 (import "coil.hashmap" :use *)
 (import "coil.control" :use *)
-(import "coil.compiler.ffi" :use [realpath-rooted])
+(import "coil.compiler.ffi" :use [realpath-rooted unlink])
+(import "coil.compiler.artifact_identity" :as artifact-id)
 
 ; ---- externs (libc: subprocess + file IO + stdout). Externs are global C symbols
 ; (not namespaced); these signatures MATCH the compiler's ffi.coil/io.coil so the
@@ -1757,28 +1758,104 @@
 
 ; ============================ clang subprocess =============================
 
-; Build a unique temp path "/tmp/coil-cimport-<pid>-<tag>.txt".
+; ---- what a process keeps between cimports ----------------------------------
+;;; The text of one clang run and the content digest of every file it read.
+(defstruct CimportMemo [(text (slice u8)) (inputs (ArrayList artifact-id/ArtifactInput))])
+
+;;; Process-owned, malloc storage. `coil lint --fix` loads a program once per
+;;; analysis and a program can import one header many ways; each of these was a
+;;; process spawn per cimport.
+;;;  - `sdk`: the `xcrun` answer (`sdk-known` once asked), which cannot change.
+;;;  - `baselines`: the predefined-macro dump per working directory and flags.
+;;;  - `scratch`: every scratch path `tmp-path` handed out since the last cleanup.
+(defstruct CimportProcess
+  [(ready bool)
+   (sdk-known bool)
+   (sdk (slice u8))
+   (baselines (HashMap (slice u8) CimportMemo))
+   (scratch (ArrayList (slice u8)))])
+
+(defn cimport-process-cell [] (-> (ptr CimportProcess))
+  (primitive/alloc-static CimportProcess))
+
+(defn cimport-process [] (-> (ptr CimportProcess))
+  (let [cell (cimport-process-cell)]
+    (unless (.ready cell)
+      (set! (.baselines cell) (hm-new [(slice u8) CimportMemo] (malloc-allocator) (str-keyops)))
+      (set! (.scratch cell) (al-new [(slice u8)] (malloc-allocator)))
+      (set! (.ready cell) true)
+      0)
+    cell))
+
+; Build a unique temp path "/tmp/coil-cimport-<pid>-<tag>.txt", and record it for
+; `cimport-cleanup!`.
 (defn tmp-path [(a (dyn Allocator)) (tag (slice u8))] (-> (slice u8))
-  (cat3 a
-        (cat3 a
-              "/tmp/coil-cimport-"
-              (i64->dec a (primitive/cast i64 (getpid)))
-              "-")
-        tag
-        ".txt"))
+  (let [path (cat3 a
+                   (cat3 a
+                         "/tmp/coil-cimport-"
+                         (i64->dec a (primitive/cast i64 (getpid)))
+                         "-")
+                   tag
+                   ".txt")
+        cell (cimport-process)]
+    (unless (block :seen
+              (for known (.scratch cell) (when (= known path) (break :seen true)))
+              false)
+      (push! (mut (.scratch cell)) (sconcat-malloc path))
+      0)
+    path))
+
+(defn sconcat-malloc [(s (slice u8))] (-> (slice u8))
+  (cat (malloc-allocator) s ""))
 
 ; Remove every scratch file this process made. There are eleven `tmp-path` call
 ; sites across clang invocations, constant folding and ABI probing, each with
 ; several failure exits, so unlinking at each one reliably misses paths -- and it
-; did: 4,611 of these were left in /tmp. One sweep keyed on our OWN pid is both
-; complete and safe, since no other process writes this prefix. The pid is decimal
-; digits, so the glob carries no shell metacharacters.
+; did: 4,611 of these were left in /tmp. Every one of them is named by `tmp-path`,
+; which records it, so removing what it recorded is complete. (This was a
+; `rm -f /tmp/coil-cimport-<pid>-*` through the shell: a process spawn after
+; every cimport.)
 (defn cimport-cleanup! [(a (dyn Allocator))] (-> i64)
-  (system (s->cstr a
-                   (cat3 a
-                         "rm -f /tmp/coil-cimport-"
-                         (i64->dec a (primitive/cast i64 (getpid)))
-                         "-* 2>/dev/null")))
+  (let [cell (cimport-process)]
+    (for path (.scratch cell)
+      (unlink (s->cstr a path))
+      (free [u8] (malloc-allocator) path))
+    (al-clear! (mut (.scratch cell))))
+  0)
+
+;;; Digests of the files at PATHS, in malloc storage; None when one cannot be read,
+;;; since a result generated from it could never be shown fresh again.
+(defn cimport-inputs [(a (dyn Allocator)) (paths (ptr (ArrayList (slice u8))))] (-> (Option (ArrayList artifact-id/ArtifactInput)))
+  (block :done
+    (let [m (malloc-allocator)
+          (mut digests) (al-new [(slice u8)] a)]
+      (for path (load paths)
+        (match (artifact-id/artifact-file-digest a path)
+          (Ok [digest] (push! (mut digests) digest))
+          (Err [_] (return-from :done (None [(ArrayList artifact-id/ArtifactInput)])))))
+      (let [(mut inputs) (al-new [artifact-id/ArtifactInput] m)]
+        (for [i 0 (len (load paths))]
+          (push! (mut inputs)
+                 (artifact-id/ArtifactInput :path (cat m (get (load paths) i) "")
+                                            :digest (cat m (get digests i) ""))))
+        (Some (load inputs))))))
+
+;;; Does every file in INPUTS still hold the bytes it was digested with?
+(defn cimport-inputs-fresh? [(a (dyn Allocator)) (inputs (ArrayList artifact-id/ArtifactInput))] (-> bool)
+  (block :done
+    (for input inputs
+      (match (artifact-id/artifact-file-digest a (.path input))
+        (Ok [digest] (unless (= digest (.digest input)) (return-from :done false)))
+        (Err [_] (return-from :done false))))
+    true))
+
+(defn cimport-inputs-free! [(inputs (ArrayList artifact-id/ArtifactInput))] (-> i64)
+  (let [m (malloc-allocator)
+        (mut owned) inputs]
+    (for input owned
+      (free [u8] m (.path input))
+      (free [u8] m (.digest input)))
+    (al-free! (mut owned)))
   0)
 
 ; Run a clang command that writes stdout to `outfile`; returns exit status.
@@ -1792,20 +1869,37 @@
 (defn clang-flags [(a (dyn Allocator)) (flags (slice u8))] (-> (Result (slice u8) (slice u8)))
   (if (or (contains-str? flags "-isysroot") (contains-str? flags "--sysroot"))
       (Ok flags)
-      (let [out (tmp-path a "sdk")
-            cmd
-              (cat a
-                   "xcrun --sdk macosx --show-sdk-path > '"
-                   (cat a out "' 2>/dev/null"))]
-        (if (!= (run-cmd a cmd) (primitive/cast i32 0))
-            (Ok flags)
-            (match (slurp a (s->cstr a out))
-              (Err [e] (Err e))
-              (Ok [text]
-                  (let [sdk (trim text)]
-                    (Ok (if (= (len sdk) (primitive/cast i64 0))
-                            flags
-                            (cat3 a flags " -isysroot '" (cat a sdk "'")))))))))))
+      (match (sdk-path a)
+        (Err [e] (Err e))
+        (Ok [sdk]
+            (Ok (if (= (len sdk) (primitive/cast i64 0))
+                    flags
+                    (cat3 a flags " -isysroot '" (cat a sdk "'"))))))))
+
+;;; The active SDK's path, or "" where there is none; asked of `xcrun` once per
+;;; process. It was asked on every clang command line, three or four times per
+;;; cimport.
+(defn sdk-path [(a (dyn Allocator))] (-> (Result (slice u8) (slice u8)))
+  (let [cell (cimport-process)]
+    (if (.sdk-known cell)
+        (Ok (.sdk cell))
+        (let [out (tmp-path a "sdk")
+              cmd
+                (cat a
+                     "xcrun --sdk macosx --show-sdk-path > '"
+                     (cat a out "' 2>/dev/null"))
+              found
+                (if (!= (run-cmd a cmd) (primitive/cast i32 0))
+                    (Ok [(slice u8) (slice u8)] "")
+                    (match (slurp a (s->cstr a out))
+                      (Err [e] (Err [(slice u8) (slice u8)] e))
+                      (Ok [text] (Ok [(slice u8) (slice u8)] (trim text)))))]
+          (match found
+            (Err [e] (Err e))
+            (Ok [sdk]
+                (set! (.sdk cell) (sconcat-malloc sdk))
+                (set! (.sdk-known cell) true)
+                (Ok (.sdk cell))))))))
 
 ; A header name is not itself a clang translation unit: `clang pthread.h`
 ; addresses a file in the current directory and never performs include search.
@@ -1893,33 +1987,75 @@
                    (cat3 a "' > /dev/null 2> '" err "'"))]
      (if (!= (run-cmd a cmd) (primitive/cast i32 0))
          (Err (cat a "clang could not list the header's dependencies:\n" (trim (try! (slurp a (s->cstr a err))))))
-         (let [all (depfile-prerequisites a (try! (slurp a (s->cstr a out))))
-               deps (box! a (ArrayList (slice u8)) (al-new [(slice u8)] a))]
-           (for path (load all) (unless (= path input) (push! deps path)))
-           (Ok deps))))))
+         (depfile-inputs a out input)))))
 
-; clang -dM macro dump for `header` (empty header path = the empty-TU baseline).
-(defn dump-macros [(a (dyn Allocator))
-                   (header (slice u8))
-                   (tag (slice u8))
-                   (flags (slice u8))] (-> (Result (slice u8) (slice u8)))
+;;; The flags that make a clang run also write the files it reads to DEPFILE.
+(defn depfile-flags [(a (dyn Allocator)) (depfile (slice u8))] (-> (slice u8))
+  (cat3 a " -MD -MT coil-cimport -MF '" depfile "'"))
+
+;;; What clang read for INPUT, from the DEPFILE it wrote: its prerequisites minus
+;;; INPUT itself, which is a scratch file of this run (or /dev/null).
+(defn depfile-inputs [(a (dyn Allocator)) (depfile (slice u8)) (input (slice u8))] (-> (Result (ptr (ArrayList (slice u8)))
+                                                                                                 (slice u8)))
+  (try
+   (let [all (depfile-prerequisites a (try! (slurp a (s->cstr a depfile))))
+         deps (box! a (ArrayList (slice u8)) (al-new [(slice u8)] a))]
+     (for path (load all) (unless (= path input) (push! deps path)))
+     (Ok deps))))
+
+;;; clang -dM macro dump of the translation unit INPUT (a wrapper including a
+;;; header, or /dev/null for the predefined macros alone).
+(defn dump-macros-of [(a (dyn Allocator))
+                      (input (slice u8))
+                      (tag (slice u8))
+                      (flags (slice u8))] (-> (Result (slice u8) (slice u8)))
   (let [out (tmp-path a tag)
-        err (tmp-path a (cat a tag "-err"))]
-    (match (if (= (len header) (primitive/cast i64 0))
-               (Ok [(slice u8) (slice u8)] "/dev/null")
-               (include-source a (abspath a header) "macro-input"))
-      (Err [e] (Err e))
-      (Ok [input]
-          (let [cmd (cat3 a
-                          (cat3 a "clang -dM -E -x c" flags " '")
-                          (cat3 a input "' > '" out)
-                          (cat3 a "' 2> '" err "'"))]
-            (if (!= (run-cmd a cmd) (primitive/cast i32 0))
-                (match (slurp a (s->cstr a err))
-                  (Err [e] (Err e))
-                  (Ok [detail]
-                      (Err (cat a "clang could not list the header's macros:\n" (trim detail)))))
-                (slurp a (s->cstr a out))))))))
+        err (tmp-path a (cat a tag "-err"))
+        cmd (cat3 a
+                  (cat3 a "clang -dM -E -x c" flags " '")
+                  (cat3 a input "' > '" out)
+                  (cat3 a "' 2> '" err "'"))]
+    (if (!= (run-cmd a cmd) (primitive/cast i32 0))
+        (match (slurp a (s->cstr a err))
+          (Err [e] (Err e))
+          (Ok [detail]
+              (Err (cat a "clang could not list the header's macros:\n" (trim detail)))))
+        (slurp a (s->cstr a out)))))
+
+;;; The macros an empty translation unit predefines under FLAGS: what a header's
+;;; own dump is read against. It depends on nothing but the flags, the working
+;;; directory they resolve in and whatever files they force in (`-include`), so a
+;;; process keeps it per flags and directory while those files are unchanged; it
+;;; was one clang run per cimport.
+(defn baseline-macros [(a (dyn Allocator)) (flags (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (try
+   (let [cell (cimport-process)
+         key (cat3 a (abspath a ".") "\n" flags)]
+     (match (get (.baselines cell) key)
+       (Some [memo] (if (cimport-inputs-fresh? a (.inputs memo))
+                        (Ok (.text memo))
+                        (baseline-macros-run a cell key flags)))
+       (None [] (baseline-macros-run a cell key flags))))))
+
+(defn baseline-macros-run [(a (dyn Allocator))
+                           (cell (ptr CimportProcess))
+                           (key (slice u8))
+                           (flags (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (try
+     (let [depfile (tmp-path a "base-deps")
+           text (try! (dump-macros-of a "/dev/null" "base" (cat a flags (depfile-flags a depfile))))
+           deps (try! (depfile-inputs a depfile "/dev/null"))]
+       (match (cimport-inputs a deps)
+         (None [] (Ok text))
+         (Some [inputs]
+             (let [m (malloc-allocator)]
+               (match (get (.baselines cell) key)
+                 (Some [old]
+                     (free [u8] m (.text old))
+                     (cimport-inputs-free! (.inputs old)))
+                 (None [] 0))
+               (set! (mut (.baselines cell)) key (CimportMemo :text (cat m text "") :inputs inputs))
+               (Ok text)))))))
 
 ; ============================ line iteration ===============================
 (defn each-line [(a (dyn Allocator)) (text (slice u8))] (-> (ptr (ArrayList (slice u8))))
@@ -2136,14 +2272,33 @@
                           (flags (slice u8))
                           (names (ptr (ArrayList (slice u8))))
                           (selecting bool)] (-> (Result (slice u8) (slice u8)))
+  (cimport-header-generate a
+                           header
+                           flags
+                           names
+                           selecting
+                           (box! a (ArrayList (slice u8)) (al-new [(slice u8)] a))))
+
+;;; `cimport-header-use`, also pushing onto DEPS every file clang read to generate
+;;; the bindings: what they are generated from, so a caller that records their
+;;; digests knows when the bindings go stale. The AST run lists them as it reads
+;;; them; a separate `clang -M` was one more process per cimport.
+(defn cimport-header-generate [(a (dyn Allocator))
+                               (header (slice u8))
+                               (flags (slice u8))
+                               (names (ptr (ArrayList (slice u8))))
+                               (selecting bool)
+                               (deps (ptr (ArrayList (slice u8))))] (-> (Result (slice u8) (slice u8)))
   (try
    (let [flags (try! (clang-flags a flags))
         input (try! (include-source a (abspath a header) "input"))
-        base-macros (try! (dump-macros a "" "base" flags))
-        header-macros (try! (dump-macros a header "hdr" flags))]
-    (match (run-clang-ast a input flags)
+        base-macros (try! (baseline-macros a flags))
+        header-macros (try! (dump-macros-of a input "hdr" flags))
+        depfile (tmp-path a "ast-deps")]
+    (match (run-clang-ast a input (cat a flags (depfile-flags a depfile)))
       (Err [e] (Err e))
       (Ok [ast]
+        (for path (load (try! (depfile-inputs a depfile input))) (push! deps path))
           (let [top
                   (match (jinner ast)
                     (Some [t] t)
@@ -2567,10 +2722,11 @@
   (let [q (primitive/alloc-stack Probe)] (set! q p) (.kind q)))
 
 (defn abspath [(a (dyn Allocator)) (header (slice u8))] (-> (slice u8))
-  (let [r (realpath-rooted (s->cstr a header) (primitive/cast (ptr i8) 0))]
+  (let [buf (primitive/cast (ptr i8) (primitive/alloc-stack (array u8 4096)))
+        r (realpath-rooted (s->cstr a header) buf)]
     (if (= (primitive/cast i64 r) (primitive/cast i64 0))
         header
-        (cstr->slice r))))
+        (cat a (cstr->slice r) ""))))
 
 ; put every EnumConstantDecl's folded value into `m` (used for the probe enum).
 (defn ee-one [(a (dyn Allocator)) (d Json) (m (ptr (HashMap (slice u8) i64)))] (-> i64)

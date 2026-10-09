@@ -218,6 +218,39 @@ fix_runs=$(count_runs '')
 grep -qF '(+ COIL_SELECTED_VALUE 1)' "$tmp/fix-cimport.coil"
 [ "$fix_runs" = "$check_runs" ] || { echo "lint --fix ran clang $fix_runs times, one load runs it $check_runs times" >&2; exit 1; }
 
+# One header imported three ways is three generations, but what does not depend on
+# the `:use` list is not redone: the predefined-macro baseline is one clang run per
+# flags in a process, the files clang read come from the AST run itself rather than
+# a `clang -M` of their own, and the SDK path is asked of xcrun once. Each of those
+# was a process per cimport.
+cat >"$tmp/three-ways.coil" <<EOF
+(module three_ways)
+(cimport "$PWD/tests/compiler/cimport/selective.h" :use [coil_selected_call])
+(cimport "$PWD/tests/compiler/cimport/selective.h" :use [COIL_SELECTED_VALUE])
+(cimport "$PWD/tests/compiler/cimport/selective.h" :use [coil_unselected_call])
+(defn main [] (-> i64) COIL_SELECTED_VALUE)
+EOF
+real_xcrun=$(command -v xcrun || true)
+if [ -n "$real_xcrun" ]; then
+  cat >"$tmp/counting-clang/xcrun" <<EOF
+#!/bin/sh
+printf 'xcrun %s\n' "\$*" >>"$tmp/clang-runs.log"
+exec "$real_xcrun" "\$@"
+EOF
+  chmod +x "$tmp/counting-clang/xcrun"
+fi
+clang_runs "$compiler" check "$tmp/three-ways.coil"
+baselines=$(count_runs '/dev/null')
+listings=$(count_runs '^-M ')
+[ "$(count_runs '-ast-dump=json')" -ge 3 ] || { echo 'three cimports did not each dump the header' >&2; exit 1; }
+[ "$baselines" = 1 ] || { echo "three cimports dumped the predefined macros $baselines times, want 1" >&2; exit 1; }
+[ "$listings" = 0 ] || { echo "three cimports listed their dependencies with $listings separate clang runs, want 0" >&2; exit 1; }
+if [ -n "$real_xcrun" ]; then
+  sdk_queries=$(count_runs '^xcrun ')
+  [ "$sdk_queries" = 1 ] || { echo "three cimports asked xcrun for the SDK $sdk_queries times, want 1" >&2; exit 1; }
+fi
+rm -f "$tmp/counting-clang/xcrun"
+
 # Each analysis releases what it acquired: the unit holds as many resources after
 # the third analysis as after the first. Expansion arenas used to stay registered
 # until the command ended, one set per --fix round.
