@@ -1,0 +1,447 @@
+(module coil.safety)
+(import "coil.primitive" :as primitive)
+(import "coil.meta" :as meta)
+(import "coil.str" :as str)
+(import "coil.lint.names" :as names)
+(import "coil.safety.checked")
+(import "coil.safety.runtime" :as rt)
+
+;;; Runtime safety checks for the whole program, after Zig's safe build modes.
+;;; Apply it with `--use coil.safety`, a `[metaprograms]` or `[profile.NAME]` `use`
+;;; list in Coil.toml, or an import. A failed check prints what failed and where,
+;;; then aborts:
+;;;
+;;;   panic: index out of bounds: index 5, len 3
+;;;     at src/main.coil:12:9
+;;;
+;;; Checked, in every module including the standard library's:
+;;;
+;;;   * integer `+ - *` and negation overflow, signed and unsigned alike;
+;;;   * `/` and `%` by zero, and the minimum signed value divided by -1;
+;;;   * `<< >>` by a negative amount or by the type's width or more;
+;;;   * `get`/`set!` on a slice or array outside `[0, len)`, and the same for
+;;;     `slice-get`, `slice-set!` and `subslice`;
+;;;   * an integer `cast` whose value does not fit the destination, and a
+;;;     float-to-integer `cast` whose integer part does not.
+;;;
+;;; The `coil.primitive` operations are the raw machine operations and are never
+;;; checked, except division and shifts, whose bad operands have no defined result:
+;;; `primitive/iadd`, `isub` and `imul` wrap, and `primitive/cast` keeps the low bits
+;;; (Zig's `+%` and `@truncate`/`@bitCast`). `:safety/checked false` on a function
+;;; (from `coil.safety.checked`) turns the checks off inside it.
+;;;
+;;; Two limits. Integer arithmetic on a type parameter is checked inside `coil.core`'s
+;;; impls, where no call site is known, so its report has no location. And a
+;;; library collection (ArrayList, HashMap, …) checks its own invariants only under
+;;; `--debug-checks` (or a profile with `debug-checks = true`).
+
+; ---- types -------------------------------------------------------------------
+;;; The width in bits of a standard integer type, or 0 for any other type.
+(defn int-bits [(t Code)] (-> i64)
+  (cond (or (= t `i8) (= t `u8)) 8
+        (or (= t `i16) (= t `u16)) 16
+        (or (= t `i32) (= t `u32)) 32
+        (or (= t `i64) (= t `u64)) 64
+        :else 0))
+
+(defn int-type? [(t Code)] (-> bool)
+  (> (int-bits t) 0))
+
+(defn signed-type? [(t Code)] (-> bool)
+  (or (= t `i8) (= t `i16) (= t `i32) (= t `i64)))
+
+(defn float-type? [(t Code)] (-> bool)
+  (or (= t `f32) (= t `f64)))
+
+(defn head-is? [(f Code) (name Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (not (primitive/code-vector? f))
+       (> (len f) 0)
+       (= (get f 0) name)))
+
+(defn ptr-type? [(t Code)] (-> bool)
+  (and (head-is? t `ptr) (= (len t) 2)))
+
+;;; `t` without the `mut`, `ref` and `ptr` wrappers method calls see through.
+(defn strip-refs [(t Code)] (-> Code)
+  (if (and (or (head-is? t `mut) (head-is? t `ref) (head-is? t `ptr)) (= (len t) 2))
+      (strip-refs (get t 1))
+      t))
+
+(defn slice-type? [(t Code)] (-> bool)
+  (and (head-is? t `slice) (= (len t) 2)))
+
+(defn array-type? [(t Code)] (-> bool)
+  (and (head-is? t `array) (= (len t) 3)))
+
+;;; Whether converting an integer of type `s` to type `d` keeps every value.
+(defn lossless-int? [(s Code) (d Code)] (-> bool)
+  (let [bs (int-bits s)
+        bd (int-bits d)]
+    (if (= (signed-type? s) (signed-type? d))
+        (>= bd bs)
+        (and (not (signed-type? s)) (> bd bs)))))
+
+; ---- context -----------------------------------------------------------------
+;;; Where a rewrite is happening: the import environment that names resolve in,
+;;; whether the function has checks on, and whether this is `coil.core`, whose
+;;; sites are only ever reached through generic dispatch and so get no location.
+(defstruct Cx [(env Code) (checked bool) (core bool)])
+
+(defn with-checked [(cx Cx) (checked bool)] (-> Cx)
+  (Cx :env (.env cx) :checked checked :core (.core cx)))
+
+;;; `file:line:col` of `f`, as a string literal; empty in `coil.core`.
+(defn site [(cx Cx) (f Code)] (-> Code)
+  (if (.core cx)
+      `""
+      (let [(mut sb) (str/sb-new (meta/expansion-allocator))]
+        (str/sb-push-str! (mut sb) (primitive/code-str (primitive/code-file f)))
+        (str/sb-push-str! (mut sb) ":")
+        (str/sb-push-i64! (mut sb) (primitive/code-line f))
+        (str/sb-push-str! (mut sb) ":")
+        (str/sb-push-i64! (mut sb) (primitive/code-int (primitive/code-col f)))
+        (let [text (str/sb-str sb)]
+          `~text))))
+
+;;; Does the call head of `f` spell the coil.core name `name`, and not a local that
+;;; shadows it? Core names are referred into every module under the one spelling
+;;; (coil.lint.names says so too), and an operator named `/` cannot go through its
+;;; alias/name split.
+(defn calls-core? [(f Code) (name (slice u8))] (-> bool)
+  (and (= (names/ln-head-text f) name)
+       (= (primitive/binding-of (get f 0)) 0)))
+
+;;; Does the call head of `f` name `qname` here, and not a local that shadows it?
+(defn calls? [(cx Cx) (f Code) (qname (slice u8))] (-> bool)
+  (let [h (names/ln-head-text f)]
+    (and (> (len h) 0)
+         (= (primitive/binding-of (get f 0)) 0)
+         (names/ln-is? h (.env cx) qname))))
+
+;;; The qualified name of the function `f` calls, as the checker resolved it, or "".
+(defn callee [(f Code)] (-> (slice u8))
+  (let [d (primitive/code-decl (get f 0))]
+    (if (and (primitive/code-list? d)
+             (> (len d) 3)
+             (= (get d 2) `fn))
+        (primitive/code-sym (get d 3))
+        "")))
+
+; ---- purity ------------------------------------------------------------------
+;;; Whether evaluating `f` twice is the same as evaluating it once: a name, a
+;;; literal, or a place built from those by `.field`, `load`, `mut` and `index`.
+(defn pure? [(f Code)] (-> bool)
+  (cond (primitive/code-sym? f) true
+        (primitive/code-int? f) true
+        (not (primitive/code-list? f)) false
+        (primitive/code-vector? f) false
+        (= (len f) 0) false
+        :else
+          (let [h (names/ln-head-text f)]
+            (cond (and (> (len h) 1) (= (get h 0) (cast u8 46)) (= (len f) 2)) (pure? (get f 1))
+                  (or (= h "load") (= h "mut")) (and (= (len f) 2) (pure? (get f 1)))
+                  (= h "index") (and (= (len f) 3) (and (pure? (get f 1)) (pure? (get f 2))))
+                  :else false))))
+
+;;; The collection a `get`/`set!` reads: `(mut P)` names the place P.
+(defn collection-place [(x Code)] (-> Code)
+  (if (and (head-is? x `mut) (= (len x) 2)) (get x 1) x))
+
+; ---- rewriting ----------------------------------------------------------------
+;;; `f` with its elements from `from` on rewritten, or None when none changes.
+(defn rw-kids [(cx Cx) (f Code) (from i64)] (-> (Option Code))
+  (let [(mut changed) false
+        out (primitive/code-list-new)]
+    (for k (range 0 (len f))
+      (let [kid (get f k)]
+        (if (< k from)
+            (primitive/code-list-push! out kid)
+            (match (rw cx kid)
+              (Some [r] (do (set! changed true) (primitive/code-list-push! out r) 0))
+              (None [] (do (primitive/code-list-push! out kid) 0))))))
+    (if changed
+        (Some (primitive/code-list-like f (primitive/code-list-done out)))
+        (None [Code]))))
+
+;;; `f` rewritten, or None when nothing in it changes. The checker's types are read
+;;; off the ORIGINAL nodes; the replacement is built from the rewritten children.
+(defn rw [(cx Cx) (f Code)] (-> (Option Code))
+  (cond (not (primitive/code-list? f)) (None [Code])
+        (= (len f) 0) (None [Code])
+        (names/ln-quasiquote? f) (None [Code])
+        (primitive/code-vector? f) (rw-kids cx f 0)
+        (skipped-form? f) (None [Code])
+        (or (head-is? f `defn) (head-is? f `defn*)) (rw-kids (with-checked cx (checked-def? f 2)) f 1)
+        (head-is? f `impl) (rw-impl cx f)
+        :else
+          (let [kids (rw-kids cx f 0)
+                g (match kids (Some [k] k) (None [] f))]
+            (match (rw-node cx f g)
+              (Some [r] (Some r))
+              (None [] kids)))))
+
+;;; Forms with no runtime expressions to check: declarations, and compile-time
+;;; values.
+(defn skipped-form? [(f Code)] (-> bool)
+  (or (head-is? f `import) (head-is? f `export) (head-is? f `extern)
+      (head-is? f `defstruct) (head-is? f `defsum) (head-is? f `deftrait)
+      (head-is? f `defannotation) (head-is? f `const) (head-is? f `def)
+      (head-is? f `declare)))
+
+;;; Whether the annotations of a definition starting at `from` leave its checks on:
+;;; everything but `:safety/checked false`.
+(defn checked-def? [(f Code) (from i64)] (-> bool)
+  (let [(mut k) from
+        (mut checked) true]
+    (while (and (< (+ k 1) (len f)) (primitive/code-keyword? (get f k)))
+      (when (and (= (get f k) `:safety/checked) (= (get f (+ k 1)) `false))
+        (set! checked false))
+      (set! k (+ k 2)))
+    checked))
+
+;;; An impl: each method under its own annotations. In `coil.core`, the integer
+;;; `+ - *` and negation impls are what generic code reaches, so their bodies become
+;;; the checked operations.
+(defn rw-impl [(cx Cx) (f Code)] (-> (Option Code))
+  (let [trait-at (if (primitive/code-vector? (get f 1)) 2 1)
+        trait (get f trait-at)
+        ty (if (< (+ trait-at 1) (len f)) (get f (+ trait-at 1)) `_)
+        (mut changed) false
+        out (primitive/code-list-new)]
+    (for k (range 0 (len f))
+      (let [m (get f k)
+            next (if (and (> k (+ trait-at 1)) (primitive/code-list? m) (> (len m) 1))
+                     (if (and (.core cx) (and (int-type? ty) (checked-def? m 1)))
+                         (match (core-operator-body trait ty m)
+                           (Some [r] (Some r))
+                           (None [] (rw-kids (with-checked cx (checked-def? m 1)) m 1)))
+                         (rw-kids (with-checked cx (checked-def? m 1)) m 1))
+                     (None [Code]))]
+        (match next
+          (Some [r] (do (set! changed true) (primitive/code-list-push! out r) 0))
+          (None [] (do (primitive/code-list-push! out m) 0)))))
+    (if changed
+        (Some (primitive/code-list-like f (primitive/code-list-done out)))
+        (None [Code]))))
+
+;;; The method form `(name annotations… [params] (-> R) body…)` with its body replaced
+;;; by the checked operation, for an integer `Add`, `Sub`, `Mul` or `Neg` impl.
+(defn core-operator-body [(trait Code) (ty Code) (m Code)] (-> (Option Code))
+  (let [params-at (params-index m 1)
+        params (get m params-at)
+        p0 (param-name params 0)]
+    (cond (= trait `Add) (Some (replace-body m params-at `(rt/checked-add [~ty] ~p0 ~(param-name params 1) "")))
+          (= trait `Sub) (Some (replace-body m params-at `(rt/checked-sub [~ty] ~p0 ~(param-name params 1) "")))
+          (= trait `Mul) (Some (replace-body m params-at `(rt/checked-mul [~ty] ~p0 ~(param-name params 1) "")))
+          (= trait `Neg) (Some (replace-body m params-at `(rt/checked-neg [~ty] ~p0 "")))
+          :else (None [Code]))))
+
+(defn params-index [(m Code) (k i64)] (-> i64)
+  (if (primitive/code-vector? (get m k)) k (params-index m (+ k 1))))
+
+(defn param-name [(params Code) (i i64)] (-> Code)
+  (get (get params i) 0))
+
+;;; `m` up to and including its `(-> R)`, then `body`.
+(defn replace-body [(m Code) (params-at i64) (body Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for k (range 0 (+ params-at 2)) (primitive/code-list-push! out (get m k)))
+    (primitive/code-list-push! out body)
+    (primitive/code-list-like m (primitive/code-list-done out))))
+
+;;; The replacement for one expression node, or None. `f` is the original node,
+;;; `g` the same node with its children already rewritten.
+(defn rw-node [(cx Cx) (f Code) (g Code)] (-> (Option Code))
+  (let [n (len f)]
+    (cond (and (= n 3) (arithmetic-op f cx)) (rw-arithmetic cx f g)
+          (and (= n 2) (or (calls-core? f "-") (calls-core? f "neg"))) (rw-negate cx f g)
+          (not (.checked cx)) (None [Code])
+          (and (= n 3) (primitive-op f cx)) (rw-primitive cx f g)
+          (and (= n 3) (calls-core? f "get")) (rw-get cx f g)
+          (and (= n 4) (calls-core? f "set!")) (rw-set cx f g)
+          (and (= n 3) (calls-core? f "cast")) (rw-cast cx f g)
+          (slice-accessor? (callee f)) (rw-slice-call cx f g (callee f))
+          :else (None [Code]))))
+
+(defn slice-accessor? [(name (slice u8))] (-> bool)
+  (or (= name "coil.slice.slice-get") (or (= name "coil.slice.slice-set!") (= name "coil.slice.subslice"))))
+
+;;; Whether `f` is a binary operator from coil.core's arithmetic traits.
+(defn arithmetic-op [(f Code) (cx Cx)] (-> bool)
+  (or (calls-core? f "+") (calls-core? f "-") (calls-core? f "*")
+      (calls-core? f "/") (calls-core? f "%")
+      (calls-core? f "<<") (calls-core? f ">>")))
+
+;;; Whether `f` calls one of the primitives with no defined result for some
+;;; operands: division and remainder by zero, a shift by the width or more.
+(defn primitive-op [(f Code) (cx Cx)] (-> bool)
+  (or (calls? cx f "coil.primitive/idiv") (calls? cx f "coil.primitive/irem")
+      (calls? cx f "coil.primitive/udiv") (calls? cx f "coil.primitive/urem")
+      (calls? cx f "coil.primitive/ishl") (calls? cx f "coil.primitive/ishr")))
+
+;;; `+ - * / % << >>` on a standard integer type. Checked, it is the runtime's checked
+;;; operation; unchecked, the primitive, so it does not reach the checked impl.
+(defn rw-arithmetic [(cx Cx) (f Code) (g Code)] (-> (Option Code))
+  (let [ty (primitive/type-of f)
+        h (names/ln-head-text f)
+        a (get g 1)
+        b (get g 2)]
+    (if (not (int-type? ty))
+        (None [Code])
+        (if (.checked cx)
+            (let [at (site cx f)]
+              (Some (cond (= h "+") `(rt/checked-add [~ty] ~a ~b ~at)
+                          (= h "-") `(rt/checked-sub [~ty] ~a ~b ~at)
+                          (= h "*") `(rt/checked-mul [~ty] ~a ~b ~at)
+                          (= h "/") `(rt/checked-div [~ty] ~a ~b ~at)
+                          (= h "%") `(rt/checked-rem [~ty] ~a ~b ~at)
+                          (= h "<<") `(rt/checked-shl [~ty] ~a ~b ~at)
+                          :else `(rt/checked-shr [~ty] ~a ~b ~at))))
+            (Some (cond (= h "+") `(primitive/iadd (: ~a ~ty) (: ~b ~ty))
+                        (= h "-") `(primitive/isub (: ~a ~ty) (: ~b ~ty))
+                        (= h "*") `(primitive/imul (: ~a ~ty) (: ~b ~ty))
+                        (= h "/") `(primitive/idiv (: ~a ~ty) (: ~b ~ty))
+                        (= h "%") `(primitive/irem (: ~a ~ty) (: ~b ~ty))
+                        (= h "<<") `(primitive/ishl (: ~a ~ty) (: ~b ~ty))
+                        :else `(primitive/ishr (: ~a ~ty) (: ~b ~ty))))))))
+
+;;; Unary minus on a signed integer type.
+(defn rw-negate [(cx Cx) (f Code) (g Code)] (-> (Option Code))
+  (let [ty (primitive/type-of f)
+        a (get g 1)]
+    (cond (not (signed-type? ty)) (None [Code])
+          (.checked cx) (Some `(rt/checked-neg [~ty] ~a ~(site cx f)))
+          :else (Some `(primitive/isub (: 0 ~ty) (: ~a ~ty))))))
+
+;;; A division, remainder or shift primitive on a standard integer type.
+(defn rw-primitive [(cx Cx) (f Code) (g Code)] (-> (Option Code))
+  (let [ty (primitive/type-of f)
+        a (get g 1)
+        b (get g 2)
+        at (site cx f)]
+    (cond (not (int-type? ty)) (None [Code])
+          (calls? cx f "coil.primitive/idiv") (Some `(rt/checked-div [~ty] ~a ~b ~at))
+          (calls? cx f "coil.primitive/irem") (Some `(rt/checked-rem [~ty] ~a ~b ~at))
+          (calls? cx f "coil.primitive/udiv") (Some `(rt/checked-udiv [~ty] ~a ~b ~at))
+          (calls? cx f "coil.primitive/urem") (Some `(rt/checked-urem [~ty] ~a ~b ~at))
+          (calls? cx f "coil.primitive/ishl") (Some `(rt/checked-shl [~ty] ~a ~b ~at))
+          :else (Some `(rt/checked-shr [~ty] ~a ~b ~at)))))
+
+;;; The type of the collection `get`/`set!` reads, with references stripped, when
+;;; it is a slice or an array; `_` otherwise.
+(defn indexed-type [(x Code)] (-> Code)
+  (let [t (strip-refs (primitive/type-of x))]
+    (if (or (slice-type? t) (array-type? t)) t `_)))
+
+;;; `(get X I)` on a slice or array: I is checked against X's length.
+(defn rw-get [(cx Cx) (f Code) (g Code)] (-> (Option Code))
+  (let [t (indexed-type (get f 1))
+        x (get g 1)
+        i (get g 2)
+        at (site cx f)]
+    (cond (= t `_) (None [Code])
+          (pure? x) (Some `(get ~x (rt/check-index ~i (len ~x) ~at)))
+          (array-type? t) (Some `(get ~x (rt/check-index ~i ~(get t 2) ~at)))
+          :else (Some `(let* [xs ~x] (get xs (rt/check-index ~i (len xs) ~at)))))))
+
+;;; `(set! (mut P) I V)` on a slice or array: I is checked against P's length. A
+;;; slice is a view, so a copy of it writes the same elements.
+(defn rw-set [(cx Cx) (f Code) (g Code)] (-> (Option Code))
+  (let [t (indexed-type (get f 1))
+        x (get g 1)
+        place (collection-place x)
+        i (get g 2)
+        v (get g 3)
+        at (site cx f)]
+    (cond (= t `_) (None [Code])
+          (pure? place) (Some `(set! ~x (rt/check-index ~i (len ~place) ~at) ~v))
+          (array-type? t) (Some `(set! ~x (rt/check-index ~i ~(get t 2) ~at) ~v))
+          (slice-type? t)
+            (Some `(let* [(mut xs) ~place] (set! (mut xs) (rt/check-index ~i (len xs) ~at) ~v)))
+          :else (None [Code]))))
+
+;;; `coil.slice`'s indexed functions: `slice-get`, `slice-set!` and `subslice`. Each
+;;; may carry an explicit type-argument vector before the slice.
+(defn rw-slice-call [(cx Cx) (f Code) (g Code) (name (slice u8))] (-> (Option Code))
+  (let [n (len f)
+        s-at (if (and (> n 1) (primitive/code-vector? (get f 1))) 2 1)]
+    (cond (and (= name "coil.slice.slice-get") (= n (+ s-at 2)))
+            (Some (with-checked-index g s-at (site cx f)))
+          (and (= name "coil.slice.slice-set!") (= n (+ s-at 3)))
+            (Some (with-checked-index g s-at (site cx f)))
+          (and (= name "coil.slice.subslice") (= n (+ s-at 3)))
+            (Some (checked-subslice g s-at (site cx f)))
+          :else (None [Code]))))
+
+;;; `g` with the index after its slice argument at `s-at` checked against the slice.
+(defn with-checked-index [(g Code) (s-at i64) (at Code)] (-> Code)
+  (let [s (get g s-at)
+        ; the slice, evaluated once: itself when that is free, else a fresh local
+        xs (if (pure? s) s (primitive/fresh-identifier "xs"))
+        out (primitive/code-list-new)]
+    (for k (range 0 (len g))
+      (primitive/code-list-push! out
+                                 (cond (= k s-at) xs
+                                       (= k (+ s-at 1)) `(rt/check-index ~(get g k) (len ~xs) ~at)
+                                       :else (get g k))))
+    (let [call (primitive/code-list-like g (primitive/code-list-done out))]
+      (if (pure? s) call `(let* [~xs ~s] ~call)))))
+
+;;; `(subslice S LO HI)` with `[LO, HI)` checked against S, each evaluated once and in
+;;; order.
+(defn checked-subslice [(g Code) (s-at i64) (at Code)] (-> Code)
+  (let [xs (primitive/fresh-identifier "xs")
+        lo (primitive/fresh-identifier "lo")
+        hi (primitive/fresh-identifier "hi")
+        out (primitive/code-list-new)]
+    (for k (range 0 s-at) (primitive/code-list-push! out (get g k)))
+    (primitive/code-list-push! out xs)
+    (primitive/code-list-push! out lo)
+    (primitive/code-list-push! out hi)
+    (let [call (primitive/code-list-like g (primitive/code-list-done out))]
+      `(let* [~xs ~(get g s-at)
+              ~lo ~(get g (+ s-at 1))
+              ~hi ~(get g (+ s-at 2))]
+         (rt/check-range ~lo ~hi (len ~xs) ~at)
+         ~call))))
+
+;;; `(cast D X)`: an integer conversion that can lose the value, or a float-to-integer
+;;; conversion. A pointer conversion is not checked: where it stands decides how the
+;;; checker adapts it (to a borrow, say), and a rewrite would change that.
+(defn rw-cast [(cx Cx) (f Code) (g Code)] (-> (Option Code))
+  (let [d (primitive/type-of f)
+        s (primitive/type-of (get f 2))
+        x (get g 2)
+        at (site cx f)]
+    (cond (and (int-type? d) (int-type? s))
+            (if (lossless-int? s d)
+                (None [Code])
+                (Some `(let* [v ~x
+                             r (cast ~d v)]
+                         (rt/check-int-cast (= (cast ~s r) v) (< v (cast ~s 0)) (< r (cast ~d 0)) ~at)
+                         r)))
+          (and (int-type? d) (float-type? s))
+            (Some `(let* [v ~x]
+                     (rt/check-float-cast (cast f64 v) ~(int-bits d) ~(if (signed-type? d) `true `false) ~at)
+                     (cast ~d v)))
+          :else (None [Code]))))
+
+; ---- entry -------------------------------------------------------------------
+(defn safety-module [(prelude Code) (m Code)] (-> Code)
+  (let [cx (Cx :env (names/ln-env prelude m)
+               :checked true
+               :core (= (get m 0) `coil.core))]
+    (match (rw-kids cx m 1)
+      (Some [r] r)
+      (None [] m))))
+
+;;; Rewrite every module but this one, whose functions run only inside the compiler.
+(defn safety [(modules Code)] (-> Code)
+  (let [prelude (names/ln-prelude modules 0 (len modules))
+        out (primitive/code-list-new)]
+    (for m (iter modules)
+      (primitive/code-list-push! out (if (= (get m 0) `coil.safety) m (safety-module prelude m))))
+    (meta/transform-result (primitive/code-list-done out))))
+
+(transform-once safety)

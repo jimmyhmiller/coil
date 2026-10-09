@@ -439,8 +439,10 @@ of the project. What remains:
 ### Core-form demotion
 **Demote `store!` first** — the parser would emit an interceptable `(primitive/store! …)` call
 over a `%store!` primitive so transforms can rewrite it on idiomatic code. This is the
-one change that re-blesses the oracle snapshots. Unlocks write barriers and
-bounds-checking on unmodified Coil.
+one change that re-blesses the oracle snapshots. Unlocks write barriers on unmodified
+Coil. (Checks on operators, indexing and casts need no such change: a semantic
+transform rewrites those calls with the checker's types, which is what
+`coil.safety` does.)
 
 ### Richer reflection
 Function-signature reflection, for auto-coercion at dialect boundaries.

@@ -170,9 +170,11 @@ OLD_FILE = """(module old-syntax)
 """
 
 # The keyword `:i64` returned by `tag` is a Keyword value and must survive.
-# The default lint profile also respells `p/cast`/`p/sizeof` as the core aliases
-# (coil.lint.primitives), which leaves the coil.primitive import unused and deleted.
+# The default lint profile also respells `p/sizeof` as the core alias
+# (coil.lint.primitives). `p/cast` stays: it is the raw conversion, which
+# coil.safety never checks, so `cast` would not mean the same thing.
 NEW_FILE = """(module old-syntax)
+(import "coil.primitive" :as p)
 (import "coil.simd" :as v)
 
 (defstruct Px [(r u8) (g u8)])
@@ -195,12 +197,12 @@ NEW_FILE = """(module old-syntax)
   :i64)
 
 (defn main [] (-> i64)
-  (let [x (cast u8 200)
-        bytes (seed [u8 16] (cast u8 21))
+  (let [x (p/cast u8 200)
+        bytes (seed [u8 16] (p/cast u8 21))
         packet (Packet :values bytes)
         size (sizeof i32)]
     (tag)
-    (+ (+ (cast i64 (packet-first packet)) (cast i64 x)) (+ size (: 0 i64)))))
+    (+ (+ (p/cast i64 (packet-first packet)) (p/cast i64 x)) (+ size (: 0 i64)))))
 """
 
 PROJECT_CHUNKS = """(module widths.chunks)
