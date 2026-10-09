@@ -31,12 +31,14 @@ COIL="${1:-build/bin/coil}"
 [ -x "$COIL" ] || { echo "fast-suite: not executable: $COIL"; exit 2; }
 
 start=$(date +%s)
+log=$(mktemp "${TMPDIR:-/tmp}/coil-fast-suite.XXXXXX") || exit 2
+trap 'rm -f "$log"' EXIT
 
 step() { # step <label> <command...>
   local label=$1; shift
   local t0 t1
   t0=$(date +%s)
-  if "$@" >/tmp/fast-suite.log 2>&1; then
+  if "$@" >"$log" 2>&1; then
     t1=$(date +%s)
     printf '  %-22s PASS  %ss\n' "$label" "$((t1 - t0))"
   else
@@ -44,7 +46,7 @@ step() { # step <label> <command...>
     printf '  %-22s FAIL  %ss\n' "$label" "$((t1 - t0))"
     # The log is the point: a fast gate that fails without saying why just moves
     # the work to whoever reruns it locally.
-    tail -100 /tmp/fast-suite.log
+    tail -100 "$log"
     echo "  ---- fast suite: $(( $(date +%s) - start ))s ----"
     echo "fast-suite: FAILED"
     exit 1

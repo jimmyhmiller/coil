@@ -489,32 +489,41 @@ mkdir -p "$T/default-build"
 [ -x "$T/default-build/build/debug/seven" ] \
   && ok "--debug selects build/debug/<source-stem>" \
   || bad "--debug output profile" "no build/debug/seven"
-# Both the ordinary return path and the linker-failure path must remove the
-# private object directory.
-#
-# The sections of this gate run CONCURRENTLY (gate-cli-parallel.py), so a snapshot
-# of the global glob races: another section's in-flight link legitimately appears
-# between the two `find`s and looks like a leak. Wait for the set to come back to
-# what our own builds left -- a real leak never drains, a concurrent link does.
+# Temporary files (coil.temp): each process's directory goes at exit, a killed
+# process's directory is swept by the next command once nothing runs from it, and a
+# staged output never outlives its build. Under a private TMPDIR, so the concurrent
+# sections of this gate cannot show up in it.
 printf '(defn helper [] (-> i64) 1)\n' > "$T/no-main.coil"
-find /tmp -maxdepth 1 -name 'coil-link-*' -print 2>/dev/null | sort > "$T/link-tmp-before"
-"$COIL" build "$T/seven.coil" -o "$T/link-clean-success" >/dev/null 2>&1
-"$COIL" build "$T/no-main.coil" -o "$T/no-main" >/dev/null 2>&1 || true
-# The window has to outlast a concurrent COMPILER build, not just a link: the
-# heaviest sections here compile whole programs, and their link directory is live
-# for as long as that takes. 60s is far past any of them and still far short of
-# hanging the gate on a genuine leak.
-link_leak=1
-for _ in $(seq 60); do
-  find /tmp -maxdepth 1 -name 'coil-link-*' -print 2>/dev/null | sort > "$T/link-tmp-after"
-  # Only directories that are NEW since the snapshot count; anything that was
-  # already there belongs to someone else.
-  if [ -z "$(comm -13 "$T/link-tmp-before" "$T/link-tmp-after")" ]; then link_leak=0; break; fi
-  sleep 1
+cat > "$T/sleeper.coil" <<'EOF2'
+(extern sleep :cc c [u32] (-> u32))
+(defn main [] (-> i64) (sleep (cast u32 60)) 0)
+EOF2
+TT="$T/tmpdir"; mkdir -p "$TT"; TROOT="$TT/coil-$(id -u)"
+temp_left() { ls -A "$TROOT" 2>/dev/null | tr '\n' ' '; }
+TMPDIR="$TT" "$COIL" build "$T/seven.coil" -o "$T/link-clean-success" >/dev/null 2>&1
+TMPDIR="$TT" "$COIL" build "$T/no-main.coil" -o "$T/no-main" >/dev/null 2>&1 || true
+TMPDIR="$TT" "$COIL" run "$T/seven.coil" >/dev/null 2>&1
+staged=$(ls -A "$T" | grep 'coil-tmp' | tr '\n' ' ')
+[ -z "$(temp_left)" ] && [ -z "$staged" ] \
+  && ok "build (linked or failed) and run leave no temporary files" \
+  || bad "temporary cleanup at exit" "left: [$(temp_left)] staged: [$staged]"
+TMPDIR="$TT" "$COIL" run "$T/sleeper.coil" >/dev/null 2>&1 & run_pid=$!
+# wait for the program to start: its directory is then marked .keep-<pid>-
+prog_pid=""
+for _ in $(seq 120); do
+  keep=$(ls -A "$TROOT"/*/ 2>/dev/null | grep '^\.keep-' | head -1)
+  if [ -n "$keep" ]; then prog_pid=${keep#.keep-}; prog_pid=${prog_pid%-}; break; fi
+  sleep 0.5
 done
-[ "$link_leak" = 0 ] \
-  && ok "successful and failed links leave no temporary object directory" \
-  || bad "link temporary cleanup" "new /tmp/coil-link-* directory remains: $(comm -13 "$T/link-tmp-before" "$T/link-tmp-after" | tr '\n' ' ')"
+kill -9 "$run_pid" 2>/dev/null; wait "$run_pid" 2>/dev/null
+TMPDIR="$TT" "$COIL" build "$T/seven.coil" -o "$T/link-clean-success" >/dev/null 2>&1
+kept=$(temp_left)
+[ -n "$prog_pid" ] && kill -9 "$prog_pid" 2>/dev/null
+for _ in $(seq 20); do kill -0 "$prog_pid" 2>/dev/null || break; sleep 0.2; done
+TMPDIR="$TT" "$COIL" build "$T/seven.coil" -o "$T/link-clean-success" >/dev/null 2>&1
+[ -n "$prog_pid" ] && [ -n "$kept" ] && [ -z "$(temp_left)" ] \
+  && ok "a killed run's directory stays while its program runs, then is swept" \
+  || bad "temporary sweep" "program pid: [$prog_pid] kept while running: [$kept] left after: [$(temp_left)]"
 expect_rc 1 "bogus --target is rejected"                 "$COIL" build "$T/seven.coil" -o "$T/c" --target not-a-real-triple
 
 echo "== check mode: typecheck/compile with no object (diag-12) =="

@@ -324,6 +324,16 @@ function makeEnv(run) {
     atexit: () => 0,
     getpid: () => 1,
     __error: () => { if (run.errnoPtr === 0n) run.errnoPtr = run.malloc(4n); return run.errnoPtr; },
+    // coil.temp: one user, and no process but this one (pid 1), so kill(pid, 0)
+    // answers ESRCH for every other pid.
+    getuid: () => 0,
+    fchmod: () => 0,
+    kill: (pid) => {
+      if (Number(pid) === 1) return 0;
+      if (run.errnoPtr === 0n) run.errnoPtr = run.malloc(4n);
+      run.dv().setInt32(Number(run.errnoPtr), 3, true);
+      return -1;
+    },
 
     // environment
     getenv: (namePtr) => {

@@ -61,7 +61,11 @@ def run(compiler: Path, arguments: list[str]) -> int:
             (library / "prelude.coil").write_text(
                 "".join(line for line in lines if line.rstrip("\n") not in BINDING_IMPORTS))
         environment = dict(os.environ)
-        environment["COIL_NAMESPACE_ROOTS"] = str(ROOT / "src/compiler")
+        # The checkout's stdlib is on the roots too: a stdlib module newer than the
+        # stage-zero compiler is missing from its bundled manifest, and only the
+        # namespace scan can find it (COIL_STRICT_BUNDLE=0 permits that fallback;
+        # every module the bundle does name still resolves through the bundle).
+        environment["COIL_NAMESPACE_ROOTS"] = f"{ROOT / 'src/compiler'}:{ROOT / 'src/stdlib'}"
         environment["COIL_STRICT_BUNDLE"] = "0"
         # The old stage zero cannot interpret the current workspace manifest.
         return subprocess.run([str(binary), *arguments], cwd=tempfile.gettempdir(),

@@ -1442,15 +1442,16 @@ def test_meta(compiler: str) -> None:
     if os.environ.get("COIL_META_SKIP_RUNTIME") != "1":
         execute(sys.executable, "scripts/oracle.py", "runtime", "gate", "arm64", "--compiler", compiler,
                 env=interpreted)
-    compiled = Path("/tmp/coil-meta-compiled")
-    interp = Path("/tmp/coil-meta-interp")
-    execute(compiler, "build", "src/compiler/main_a64.coil", "--backend", "arm64", "-o", str(compiled))
-    execute(compiler, "build", "src/compiler/main_a64.coil", "--backend", "arm64", "-o", str(interp), env=interpreted)
-    left = subprocess.run(["otool", "-X", "-s", "__TEXT", "__text", str(compiled)], stdout=subprocess.PIPE, check=True).stdout
-    right = subprocess.run(["otool", "-X", "-s", "__TEXT", "__text", str(interp)], stdout=subprocess.PIPE, check=True).stdout
-    if hashlib.sha256(left).digest() != hashlib.sha256(right).digest():
-        raise SystemExit("compiled and interpreted metaprogram engines produced different compilers")
-    print("metaprogram engines: PASS")
+    with tempfile.TemporaryDirectory(prefix="coil-meta-") as scratch:
+        compiled = Path(scratch) / "compiled"
+        interp = Path(scratch) / "interp"
+        execute(compiler, "build", "src/compiler/main_a64.coil", "--backend", "arm64", "-o", str(compiled))
+        execute(compiler, "build", "src/compiler/main_a64.coil", "--backend", "arm64", "-o", str(interp), env=interpreted)
+        left = subprocess.run(["otool", "-X", "-s", "__TEXT", "__text", str(compiled)], stdout=subprocess.PIPE, check=True).stdout
+        right = subprocess.run(["otool", "-X", "-s", "__TEXT", "__text", str(interp)], stdout=subprocess.PIPE, check=True).stdout
+        if hashlib.sha256(left).digest() != hashlib.sha256(right).digest():
+            raise SystemExit("compiled and interpreted metaprogram engines produced different compilers")
+        print("metaprogram engines: PASS")
 
 
 # The generated-unit, reader-artifact and storage regressions. Each script owns a
@@ -1539,32 +1540,33 @@ def test_wasm(compiler: str) -> None:
         execute(compiler, "build", "tests/bootstrap/errno.coil", "--backend", "wasm",
                 "--target", "wasm64-unknown-unknown", "-o", errno_module)
         execute("node", "src/tooling/wasm-host/run-standalone.mjs", errno_module)
-    wasm = "/tmp/gate-wasm-coilc.wasm"
-    execute(compiler, "build", "src/compiler/main_wasm.coil", "--target", "wasm64-unknown-unknown",
-            "--wasm-stack-size=64", "-o", wasm)
-    execute("wasm-tools", "validate", "--features=memory64", wasm)
-    printed = subprocess.run(["wasm-tools", "print", wasm], text=True, stdout=subprocess.PIPE, check=True).stdout
-    if sum(line.startswith("(module") for line in printed.splitlines()) != 1:
-        raise SystemExit("wasm compiler is not a single static module")
-    env = os.environ.copy()
-    env["COIL_WASM_META_TRACE"] = "1"
-    result = subprocess.run(["node", "src/tooling/wasm-host/run-coil-wasm.mjs", wasm,
-                             "check", "src/compiler/main_a64.coil"], cwd=ROOT, env=env,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    if result.returncode or b"meta_run_wasm" in result.stderr or b"WALL1" in result.stderr:
-        sys.stderr.buffer.write(result.stderr)
-        raise SystemExit("wasm compiler self-check failed")
-    record_wasm = "/tmp/gate-wasm32-arraylist-record.wasm"
-    execute(compiler, "build", "tests/compiler/features/wasm32_arraylist_record.coil",
-            "--target", "wasm32-unknown-unknown", "-o", record_wasm)
-    execute("wasm-tools", "validate", record_wasm)
-    execute("node", "scripts/tests/wasm32-arraylist-record.mjs", record_wasm)
-    dyn_wasm = "/tmp/gate-wasm32-dyn-aggregate-return.wasm"
-    execute(compiler, "build", "tests/compiler/features/wasm32_dyn_aggregate_return.coil",
-            "--target", "wasm32-unknown-unknown", "-o", dyn_wasm)
-    execute("wasm-tools", "validate", dyn_wasm)
-    execute("node", "scripts/tests/wasm32-dyn-aggregate-return.mjs", dyn_wasm)
-    print("wasm gate: PASS")
+    with tempfile.TemporaryDirectory(prefix="coil-wasm-") as scratch:
+        wasm = str(Path(scratch) / "coilc.wasm")
+        execute(compiler, "build", "src/compiler/main_wasm.coil", "--target", "wasm64-unknown-unknown",
+                "--wasm-stack-size=64", "-o", wasm)
+        execute("wasm-tools", "validate", "--features=memory64", wasm)
+        printed = subprocess.run(["wasm-tools", "print", wasm], text=True, stdout=subprocess.PIPE, check=True).stdout
+        if sum(line.startswith("(module") for line in printed.splitlines()) != 1:
+            raise SystemExit("wasm compiler is not a single static module")
+        env = os.environ.copy()
+        env["COIL_WASM_META_TRACE"] = "1"
+        result = subprocess.run(["node", "src/tooling/wasm-host/run-coil-wasm.mjs", wasm,
+                                 "check", "src/compiler/main_a64.coil"], cwd=ROOT, env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if result.returncode or b"meta_run_wasm" in result.stderr or b"WALL1" in result.stderr:
+            sys.stderr.buffer.write(result.stderr)
+            raise SystemExit("wasm compiler self-check failed")
+        record_wasm = str(Path(scratch) / "arraylist-record.wasm")
+        execute(compiler, "build", "tests/compiler/features/wasm32_arraylist_record.coil",
+                "--target", "wasm32-unknown-unknown", "-o", record_wasm)
+        execute("wasm-tools", "validate", record_wasm)
+        execute("node", "scripts/tests/wasm32-arraylist-record.mjs", record_wasm)
+        dyn_wasm = str(Path(scratch) / "dyn-aggregate-return.wasm")
+        execute(compiler, "build", "tests/compiler/features/wasm32_dyn_aggregate_return.coil",
+                "--target", "wasm32-unknown-unknown", "-o", dyn_wasm)
+        execute("wasm-tools", "validate", dyn_wasm)
+        execute("node", "scripts/tests/wasm32-dyn-aggregate-return.mjs", dyn_wasm)
+        print("wasm gate: PASS")
 
 
 def snapshot(args: argparse.Namespace) -> None:

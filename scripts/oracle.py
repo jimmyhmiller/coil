@@ -378,7 +378,7 @@ def refresh_mismatched_snapshots(compiler: Path, verbose: bool) -> int:
 
 
 def runtime_one(entry: str, compiler: Path, action: str, platform: str, verbose: bool,
-                reference: Path, excluded: set[str]) -> tuple[bool, list[str]]:
+                reference: Path, excluded: set[str], scratch: Path) -> tuple[bool, list[str]]:
     """Build and run one corpus entry. Returns (passed, lines to report)."""
     parts = shlex.split(entry)
     rust_reference = parts[0] == "R"
@@ -387,7 +387,7 @@ def runtime_one(entry: str, compiler: Path, action: str, platform: str, verbose:
     source, *program_args = parts
     identity = source.replace("/", "_").replace(".", "_")
     fixed_prefix = "coil-arm64" if platform in ("arm64", "linux") else "coil-x64"
-    executable = Path("/tmp") / f"{fixed_prefix}-fixed-{identity}"
+    executable = scratch / f"{fixed_prefix}-fixed-{identity}"
     build = [str(compiler), "build", source, "-o", str(executable)]
     if action == "gate" and platform != "linux":
         build += ["--backend", platform]
@@ -430,9 +430,11 @@ def runtime(compiler: Path, action: str, platform: str, verbose: bool) -> int:
     reference = base / "reference"
     excluded = set(read_list(ORACLE / "linux/arm64-only.txt")) if platform == "linux" else set()
     entries = read_list(base / "corpus.txt")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs()) as pool:
+    with tempfile.TemporaryDirectory(prefix="coil-runtime-") as scratch, \
+            concurrent.futures.ThreadPoolExecutor(max_workers=jobs()) as pool:
         results = list(pool.map(
-            lambda entry: runtime_one(entry, compiler, action, platform, verbose, reference, excluded),
+            lambda entry: runtime_one(entry, compiler, action, platform, verbose, reference, excluded,
+                                      Path(scratch)),
             entries))
     failures = 0
     passed = 0
@@ -504,6 +506,11 @@ def linux_ir(compiler: Path, action: str, verbose: bool) -> int:
 
 
 def interpreter(compiler: Path, live: bool, verbose: bool) -> int:
+    with tempfile.TemporaryDirectory(prefix="coil-interp-") as scratch:
+        return interpreter_in(compiler, live, verbose, Path(scratch))
+
+
+def interpreter_in(compiler: Path, live: bool, verbose: bool, scratch: Path) -> int:
     base = ORACLE / "arm64"
     reference = base / "reference"
     failures = 0
@@ -519,7 +526,7 @@ def interpreter(compiler: Path, live: bool, verbose: bool) -> int:
                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, timeout=60)
         if live:
-            executable = Path("/tmp") / f"coil-interp-compiled-{identity}"
+            executable = scratch / f"coil-interp-compiled-{identity}"
             build = [str(compiler), "build", source, "-o", str(executable)]
             if special_backend:
                 build += ["--backend", "arm64"]
