@@ -332,6 +332,7 @@
 (import "coil.reader" :use *)
 (import "coil.compiler.resolve" :use *)
 (import "coil.compiler.cimport" :as ci)  ; the (cimport "h.h") source form generates bindings at load time
+(import "coil.compiler.artifact_identity" :as artifact-id)  ; content digests of cimport inputs
 
 (extern opendir :cc c [(ptr i8)] (-> (ptr i8)))
 
@@ -4016,6 +4017,165 @@
                   (_ (set! j (primitive/iadd (load j) 1)))))))
     plist))
 
+;; ── cimport results, reused for the life of the process ─────────────────────
+;;; Everything a cimport's generated text is computed from, as the source form
+;;; gives it.
+(defstruct CimportRequest
+  [(path (slice u8))
+   (flags (slice u8))
+   (use-present bool)
+   (use-names (ptr (ArrayList (slice u8))))
+   (probes (ptr (ArrayList ci/Probe)))
+   (link (slice u8))
+   (probe-only bool)])
+
+;;; A generated binding text and the content digest of every file clang read to
+;;; generate it. Owned by the cache: malloc storage, freed when replaced.
+(defstruct CimportCached [(text (slice u8)) (inputs (ArrayList artifact-id/ArtifactInput))])
+
+;;; Process-owned, like the link-package registry. A process can load the same
+;;; program many times: `coil lint --fix` analyses it once per round, once per
+;;; trial while salvaging a round, and once more to report, and every load ran
+;;; every cimport through clang again. For the Mach headers that was seconds and
+;;; gigabytes per cimport, per analysis.
+(defstruct CimportCacheCell [(ready bool) (entries (HashMap (slice u8) CimportCached))])
+
+(defn cimport-cache-cell [] (-> (ptr CimportCacheCell))
+  (primitive/alloc-static CimportCacheCell))
+
+(defn cimport-cache [] (-> (ptr CimportCacheCell))
+  (let [cell (cimport-cache-cell)]
+    (unless (.ready cell)
+      (set! (.entries cell) (hm-new [(slice u8) CimportCached] (malloc-allocator) (str-keyops)))
+      (set! (.ready cell) true)
+      0)
+    cell))
+
+;;; One length-prefixed field of a cache key, so no two requests share a key.
+(defn cimport-key-field! [(out (mut StrBuf)) (text (slice u8))] (-> i64)
+  (sb-push-i64! (mut out) (len text))
+  (sb-push-str! (mut out) ":")
+  (sb-push-str! (mut out) text)
+  0)
+
+;;; The request as a cache key. The working directory is part of it: a relative
+;;; header path and relative `-I` flags resolve against it.
+(defn cimport-request-key [(a (dyn Allocator)) (r CimportRequest)] (-> (slice u8))
+  (let [(mut out) (sb-new a)]
+    (cimport-key-field! (mut out) (cwd-slice a))
+    (cimport-key-field! (mut out) (.path r))
+    (cimport-key-field! (mut out) (.flags r))
+    (cimport-key-field! (mut out) (.link r))
+    (cimport-key-field! (mut out) (if (.use-present r) "use" ""))
+    (cimport-key-field! (mut out) (if (.probe-only r) "probe-only" ""))
+    (sb-push-i64! (mut out) (len (load (.use-names r))))
+    (for name (load (.use-names r)) (cimport-key-field! (mut out) name))
+    (sb-push-i64! (mut out) (len (load (.probes r))))
+    (for probe (load (.probes r))
+      (sb-push-i64! (mut out) (ci/pkind probe))
+      (for [which 0 4] (cimport-key-field! (mut out) (ci/pget probe which))))
+    (sb-str (load out))))
+
+;;; The cached text for KEY, when every file it was generated from still has the
+;;; digest recorded for it. A file that changed or went away means regenerate.
+(defn cimport-cache-hit [(a (dyn Allocator)) (key (slice u8))] (-> (Option (slice u8)))
+  (match (get (.entries (cimport-cache)) key)
+    (None [] (None [(slice u8)]))
+    (Some [cached]
+      (let [(mut fresh) true]
+        (for input (.inputs cached)
+          (when (load fresh)
+            (match (artifact-id/artifact-file-digest a (.path input))
+              (Ok [digest] (unless (= digest (.digest input)) (set! fresh false) 0))
+              (Err [_] (set! fresh false)))
+            0))
+        (if (load fresh) (Some (.text cached)) (None [(slice u8)]))))))
+
+;;; Free what the cache owns of one entry.
+(defn cimport-cached-free! [(cached CimportCached)] (-> i64)
+  (let [m (malloc-allocator)
+        (mut inputs) (.inputs cached)]
+    (free [u8] m (.text cached))
+    (for input inputs
+      (free [u8] m (.path input))
+      (free [u8] m (.digest input)))
+    (al-free! (mut inputs)))
+  0)
+
+;;; Record TEXT under KEY with the digests of DEPS. A dependency that cannot be
+;;; read leaves the request uncached: its freshness could never be established.
+(defn cimport-cache-store! [(a (dyn Allocator))
+                            (key (slice u8))
+                            (text (slice u8))
+                            (deps (ptr (ArrayList (slice u8))))] (-> i64)
+  (block :done
+    (let [m (malloc-allocator)
+          (mut digests) (al-new [(slice u8)] a)]
+      (for path (load deps)
+        (match (artifact-id/artifact-file-digest a path)
+          (Ok [digest] (push! (mut digests) digest))
+          (Err [_] (return-from :done 0))))
+      (let [(mut inputs) (al-new [artifact-id/ArtifactInput] m)
+            cache (cimport-cache)]
+        (for [i 0 (len (load deps))]
+          (push! (mut inputs)
+                 (artifact-id/ArtifactInput :path (sconcat m (get (load deps) i) "")
+                                            :digest (sconcat m (get digests i) ""))))
+        (match (get (.entries cache) key)
+          (Some [old] (cimport-cached-free! old))
+          (None [] 0))
+        (set! (mut (.entries cache)) key (CimportCached :text (sconcat m text "") :inputs (load inputs)))
+        0))))
+
+;;; Run the generator for R: its clang dumps, layout probes and folds. Probe
+;;; values come first; a :probe-only request skips the header dump
+;;; (structs/externs/#defines) and emits ONLY the probe consts, the
+;;; ABI-extraction workflow.
+(defn cimport-generate [(a (dyn Allocator)) (r CimportRequest)] (-> (Result (slice u8) (slice u8)))
+  (match (ci/cimport-probe a (.path r) (.flags r) (.probes r) (.link r))
+    (Err [e] (Err [(slice u8) (slice u8)] e))
+    (Ok [probes]
+        (if (.probe-only r)
+            (Ok [(slice u8) (slice u8)] (sconcat a "(module cbindings)\n" probes))
+            (match (ci/cimport-header-use a (.path r) (.flags r) (.use-names r) (.use-present r))
+              (Err [e] (Err [(slice u8) (slice u8)] e))
+              (Ok [hdr] (Ok [(slice u8) (slice u8)] (sconcat a hdr probes))))))))
+
+;;; R's generated binding text, allocated in A. A request whose inputs are all
+;;; known is served from the process cache while they are unchanged. A `:link`
+;;; request is not: its probes link and run objects that the header's
+;;; dependencies do not cover.
+;;;
+;;; Generation works in its own arena and only the text is copied out. Its clang
+;;; JSON is the largest thing a compile allocates for C (tens of MB per header,
+;;; parsed), and leaving it in the program's arena made every cimport of a load
+;;; live at once.
+(defn cimport-text [(a (dyn Allocator)) (r CimportRequest)] (-> (Result (slice u8) (slice u8)))
+  (let [cacheable (= (len (.link r)) 0)
+        key (cimport-request-key a r)]
+    (match (if cacheable (cimport-cache-hit a key) (None [(slice u8)]))
+      (Some [text] (Ok [(slice u8) (slice u8)] (sconcat a text "")))
+      (None []
+        (let [work (primitive/alloc-stack scratch/ScratchArena)
+              _init (scratch/scratch-init-with-cap work (retained-heap/compiler-scratch-parent) 1048576)
+              wa (scratch/scratch-allocator work)
+              result
+                (match (cimport-generate wa r)
+                  (Err [e] (Err [(slice u8) (slice u8)] (sconcat a e "")))
+                  (Ok [text]
+                      (do
+                        (when cacheable
+                          (match (ci/cimport-deps wa (.path r) (.flags r))
+                            (Ok [deps] (cimport-cache-store! wa key text deps))
+                            (Err [_] 0))
+                          0)
+                        (Ok [(slice u8) (slice u8)] (sconcat a text "")))))]
+          ; The compile path reaches cimport WITHOUT going through its CLI entry,
+          ; so this is the only place its mid-compile clang files get swept.
+          (ci/cimport-cleanup! wa)
+          (scratch/scratch-close! work)
+          result)))))
+
 ; `(cimport "header.h" [:flags […]] [:probe […]] [:link […]])` — generate C bindings
 ; via clang AT LOAD TIME and splice the externs/defstructs/consts + probe consts
 ; into the CURRENT module (dropping the generated `(module cbindings)` header).
@@ -4046,38 +4206,15 @@
                                                           (sconcat a
                                                                    (.cross_target (loader-unit-state))
                                                                    "; select per-target values with (primitive/target-os) and (primitive/target-arch)"))))
-                      (let [flags (cimport-kwstr a items nit "flags")
-                        use-present (has-kw? items nit "use")
-                        use-names (cimport-use-names a items nit)
-                        probe-out
-                          (ci/cimport-probe a
-                                            path
-                                            flags
-                                            (cimport-probes a items nit)
-                                            (cimport-kwstr a items nit "link"))
-                        ; :probe-only skips the whole header dump (structs/externs/#defines)
-                        ; and emits ONLY the probe consts — the ABI-extraction workflow.
-                        rtext
-                          (match probe-out
-                            (Err [e] (Err [(slice u8) (slice u8)] e))
-                            (Ok [probes]
-                                (if (has-kw? items nit "probe-only")
-                                    (Ok [(slice u8) (slice u8)]
-                                        (sconcat a "(module cbindings)\n" probes))
-                                    (match (ci/cimport-header-use a
-                                                                  path
-                                                                  flags
-                                                                  use-names
-                                                                  use-present)
-                                      (Err [e] (Err [(slice u8) (slice u8)] e))
-                                      (Ok [hdr]
-                                          (Ok [(slice u8) (slice u8)]
-                                              (sconcat a hdr probes)))))))
-                        ; Both calls above are done with their clang scratch files by
-                        ; now, and their results are already in the arena. The compile
-                        ; path reaches cimport WITHOUT going through its CLI entry, so
-                        ; this is the only place the mid-compile files get swept.
-                        _swept (ci/cimport-cleanup! a)]
+                      (let [rtext
+                              (cimport-text a
+                                            (CimportRequest :path path
+                                                            :flags (cimport-kwstr a items nit "flags")
+                                                            :use-present (has-kw? items nit "use")
+                                                            :use-names (cimport-use-names a items nit)
+                                                            :probes (cimport-probes a items nit)
+                                                            :link (cimport-kwstr a items nit "link")
+                                                            :probe-only (has-kw? items nit "probe-only")))]
                     (match rtext
                       (Err [e] (ls-set-err! (mut s) (diag-at-form form e)))
                       (Ok [text]
