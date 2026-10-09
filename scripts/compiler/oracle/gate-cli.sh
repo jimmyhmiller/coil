@@ -451,6 +451,24 @@ case "$nestfix" in
   *) bad "lint --fix rewrites nested forms in one round" "$nestfix" ;;
 esac
 
+# Each analysis is announced only when asked for, with its purpose and time.
+printf '(module nestverbose)\n(import "coil.primitive" :as primitive)\n(defn main [] (-> i64) (primitive/ior 1 2))\n' > "$T/nestverbose.coil"
+cp "$T/nestverbose.coil" "$T/nestquiet.coil"
+verbose_out=$("$COIL" lint "$T/nestverbose.coil" --fix --verbose 2>&1)
+quiet_out=$("$COIL" lint "$T/nestquiet.coil" --fix 2>&1)
+case "$verbose_out" in
+  *"lint: analysis 1 (the starting tree) "*s*)
+    case "$verbose_out" in
+      *GB*) bad "lint --verbose announces analyses without memory figures" "$verbose_out" ;;
+      *) ok "lint --verbose announces analyses without memory figures" ;;
+    esac ;;
+  *) bad "lint --verbose announces analyses without memory figures" "$verbose_out" ;;
+esac
+case "$quiet_out" in
+  *"lint: analysis"*) bad "lint --fix announces no analyses without --verbose" "$quiet_out" ;;
+  *) ok "lint --fix announces no analyses without --verbose" ;;
+esac
+
 # manual-box migration also recognizes the modern `set!` initialization.
 printf '(module mbset)\n(import "coil.alloc" :as alloc :use [create unwrap-ptr malloc-allocator])\n(defstruct P [(x i64)])\n(defn make [] (-> (ptr P))\n  (let [p (unwrap-ptr [P] (create [P] (malloc-allocator)))]\n    (set! p (P :x 1))\n    p))\n(defn main [] (-> i64) (.x (make)))\n' > "$T/mbset.coil"
 "$COIL" lint "$T/mbset.coil" --fix >/dev/null 2>&1

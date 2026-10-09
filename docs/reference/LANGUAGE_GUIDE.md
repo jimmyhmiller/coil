@@ -1175,8 +1175,8 @@ program, which costs about what `coil check` does, and a round whose fixes do no
 compile is split until the part that does is found, one analysis per try. A run
 spends at most 64 analyses, or N with `--max-analyses N`. When they run out it
 stops with an error, every file holds a state that compiled, and running `--fix`
-again continues from there. On a terminal, `--fix` prints a line as each analysis
-finishes, with what it was for, how long it took and the process's peak memory.
+again continues from there. With `--verbose`, lint prints a line as each analysis
+finishes, with what it was for and how long it took.
 
 To report without a fix, use `(primitive/warn node msg)`, or
 `(primitive/report node msg)` for an error that fails the build. Coil collects
