@@ -33,6 +33,7 @@
 (import "coil.control" :use *)
 (import "coil.compiler.ffi" :use [realpath-rooted unlink])
 (import "coil.compiler.artifact_identity" :as artifact-id)
+(import "coil.scratch" :as scratch)
 
 ; ---- externs (libc: subprocess + file IO + stdout). Externs are global C symbols
 ; (not namespaced); these signatures MATCH the compiler's ffi.coil/io.coil so the
@@ -1768,12 +1769,17 @@
 ;;;  - `sdk`: the `xcrun` answer (`sdk-known` once asked), which cannot change.
 ;;;  - `baselines`: the predefined-macro dump per working directory and flags.
 ;;;  - `scratch`: every scratch path `tmp-path` handed out since the last cleanup.
+;;;  - `loads`, `arena`, `headers`: the header memos of the load in progress (see
+;;;    CimportHeaderMemo), kept in `arena` while `loads` is above zero.
 (defstruct CimportProcess
   [(ready bool)
    (sdk-known bool)
    (sdk (slice u8))
    (baselines (HashMap (slice u8) CimportMemo))
-   (scratch (ArrayList (slice u8)))])
+   (scratch (ArrayList (slice u8)))
+   (loads i64)
+   (arena scratch/ScratchArena)
+   (headers (HashMap (slice u8) (ptr CimportHeaderMemo)))])
 
 (defn cimport-process-cell [] (-> (ptr CimportProcess))
   (primitive/alloc-static CimportProcess))
@@ -1786,6 +1792,86 @@
       (set! (.ready cell) true)
       0)
     cell))
+
+;;; What one load keeps of a header's clang work, per working directory, header and
+;;; flags. None of it depends on the `:use` list, and a program imports one header
+;;; many ways — async-rust-debugger imports its platform header eleven times and the
+;;; Mach header (a 25 MB AST) five — so each of those dumped the macros, dumped the
+;;; AST and folded the same expressions again.
+;;;  - `macros`, `ast`: the header's `-dM` dump and JSON AST, once dumped.
+;;;  - `deps`: every file those runs read, once a run has listed them.
+;;;  - `folds`: each expression folded so far, and its value (None: it does not
+;;;    fold to an integer).
+;;; A load reads each header once, as it reads each source file once; the loader's
+;;; own cache, which checks digests, is what carries results to the next load.
+(defstruct CimportHeaderMemo
+  [(macros (Option (slice u8)))
+   (ast (Option (slice u8)))
+   (deps (Option (ptr (ArrayList (slice u8)))))
+   (folds (HashMap (slice u8) (Option i64)))])
+
+;;; A load is starting: until the matching `cimport-load-end!`, cimports keep their
+;;; header memos. Loads nest (a namespace set loads the entry program inside it), so
+;;; this counts them.
+(defn cimport-load-begin! [] (-> i64)
+  (let [cell (cimport-process)]
+    (when (= (.loads cell) 0)
+      (scratch/scratch-init-with-cap (field cell arena) (malloc-allocator) 1048576)
+      (set! (.headers cell)
+            (hm-new [(slice u8) (ptr CimportHeaderMemo)]
+                    (scratch/scratch-allocator (field cell arena))
+                    (str-keyops)))
+      0)
+    (set! (.loads cell) (+ (.loads cell) 1))
+    0))
+
+;;; The outermost load is over: its header memos go with it.
+(defn cimport-load-end! [] (-> i64)
+  (let [cell (cimport-process)]
+    (when (<= (.loads cell) 0)
+      (ewrite "internal error: cimport-load-end! without a matching cimport-load-begin!\n")
+      (abort)
+      0)
+    (set! (.loads cell) (- (.loads cell) 1))
+    (when (= (.loads cell) 0)
+      (scratch/scratch-close! (field cell arena))
+      0)
+    0))
+
+;;; The memo for header ABS under FLAGS (already through `clang-flags`) in the
+;;; current working directory, or null outside a load.
+(defn header-memo [(a (dyn Allocator)) (abs (slice u8)) (flags (slice u8))] (-> (ptr CimportHeaderMemo))
+  (let [cell (cimport-process)]
+    (if (= (.loads cell) 0)
+        (primitive/cast (ptr CimportHeaderMemo) 0)
+        (let [key (cat3 a (cat3 a (abspath a ".") "\n" abs) "\n" flags)]
+          (match (get (.headers cell) key)
+            (Some [memo] memo)
+            (None []
+              (let [m (scratch/scratch-allocator (field cell arena))
+                    memo (box! m CimportHeaderMemo
+                               (CimportHeaderMemo :macros (None [(slice u8)])
+                                                  :ast (None [(slice u8)])
+                                                  :deps (None [(ptr (ArrayList (slice u8)))])
+                                                  :folds (hm-new [(slice u8) (Option i64)] m (str-keyops))))]
+                (set! (mut (.headers cell)) key memo)
+                memo)))))))
+
+(defn header-memo? [(memo (ptr CimportHeaderMemo))] (-> bool)
+  (!= (primitive/cast i64 memo) 0))
+
+;;; Where a load's memos keep what they own.
+(defn memo-allocator [] (-> (dyn Allocator))
+  (scratch/scratch-allocator (field (cimport-process) arena)))
+
+;;; Record DEPS as the files MEMO's header reads, the first time they are known.
+(defn memo-note-deps! [(memo (ptr CimportHeaderMemo)) (deps (ptr (ArrayList (slice u8))))] (-> i64)
+  (when (and (header-memo? memo) (none? (.deps memo)))
+    (let [m (memo-allocator)
+          (mut kept) (al-new [(slice u8)] m)]
+      (for path (load deps) (push! (mut kept) (cat m path "")))
+      (set! (.deps memo) (Some (box! m (ArrayList (slice u8)) (load kept))))))
+  0)
 
 ; Build a unique temp path "/tmp/coil-cimport-<pid>-<tag>.txt", and record it for
 ; `cimport-cleanup!`.
@@ -1915,6 +2001,13 @@
 ; the first declaration an `-ast-dump-filter` in `flags` selects.
 (defn run-clang-ast [(a (dyn Allocator)) (header (slice u8)) (flags (slice u8))] (-> (Result Json
                                                                                              (slice u8)))
+  (match (run-clang-ast-text a header flags)
+    (Err [e] (Err e))
+    (Ok [txt] (Ok (json-parse a txt)))))
+
+;;; `run-clang-ast`'s JSON, unparsed.
+(defn run-clang-ast-text [(a (dyn Allocator)) (header (slice u8)) (flags (slice u8))] (-> (Result (slice u8)
+                                                                                                  (slice u8)))
   (let [out (tmp-path a "ast")
         err (tmp-path a "ast-err")
         cmd
@@ -1939,7 +2032,7 @@
           (Ok [txt]
               (if (= (len txt) (primitive/cast i64 0))
                   (Err "clang produced no AST")
-                  (Ok (json-parse a txt))))))))
+                  (Ok txt)))))))
 
 ;;; The prerequisites a clang `-MMD` depfile names: everything after the first
 ;;; `target:`, with `\\` line continuations joined and `\ ` read as a space.
@@ -1974,20 +2067,32 @@
 ;;; minus that wrapper itself, which is a scratch file of this run. What these
 ;;; files hold is everything a cimport of HEADER is generated from, so a caller
 ;;; that records their digests knows exactly when a generated result goes stale.
+;;; A load that already ran clang over HEADER knows them (see CimportHeaderMemo):
+;;; a `:probe-only` cimport's fold lists them, and that was a `clang -M` per cimport.
 (defn cimport-deps [(a (dyn Allocator)) (header (slice u8)) (flags (slice u8))] (-> (Result (ptr (ArrayList (slice u8)))
                                                                                              (slice u8)))
   (try
    (let [flags (try! (clang-flags a flags))
-         input (try! (include-source a (abspath a header) "deps-input"))
-         out (tmp-path a "deps")
-         err (tmp-path a "deps-err")
-         cmd (cat3 a
-                   (cat3 a "clang -M -MT coil-cimport -x c" flags " '")
-                   (cat3 a input "' -MF '" out)
-                   (cat3 a "' > /dev/null 2> '" err "'"))]
-     (if (!= (run-cmd a cmd) (primitive/cast i32 0))
-         (Err (cat a "clang could not list the header's dependencies:\n" (trim (try! (slurp a (s->cstr a err))))))
-         (depfile-inputs a out input)))))
+         abs (abspath a header)
+         memo (header-memo a abs flags)]
+     (match (if (header-memo? memo) (.deps memo) (None [(ptr (ArrayList (slice u8)))]))
+       (Some [known]
+         (let [deps (box! a (ArrayList (slice u8)) (al-new [(slice u8)] a))]
+           (for path (load known) (push! deps path))
+           (Ok deps)))
+       (None []
+         (let [input (try! (include-source a abs "deps-input"))
+               out (tmp-path a "deps")
+               err (tmp-path a "deps-err")
+               cmd (cat3 a
+                         (cat3 a "clang -M -MT coil-cimport -x c" flags " '")
+                         (cat3 a input "' -MF '" out)
+                         (cat3 a "' > /dev/null 2> '" err "'"))]
+           (if (!= (run-cmd a cmd) (primitive/cast i32 0))
+               (Err (cat a "clang could not list the header's dependencies:\n" (trim (try! (slurp a (s->cstr a err))))))
+               (let [deps (try! (depfile-inputs a out input))]
+                 (memo-note-deps! memo deps)
+                 (Ok deps)))))))))
 
 ;;; The flags that make a clang run also write the files it reads to DEPFILE.
 (defn depfile-flags [(a (dyn Allocator)) (depfile (slice u8))] (-> (slice u8))
@@ -2021,6 +2126,49 @@
           (Ok [detail]
               (Err (cat a "clang could not list the header's macros:\n" (trim detail)))))
         (slurp a (s->cstr a out)))))
+
+;;; The `-dM` dump of INPUT, the wrapper including MEMO's header: dumped once per
+;;; load (see CimportHeaderMemo).
+(defn header-macros [(a (dyn Allocator))
+                     (memo (ptr CimportHeaderMemo))
+                     (input (slice u8))
+                     (flags (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (try
+   (match (if (header-memo? memo) (.macros memo) (None [(slice u8)]))
+     (Some [text] (Ok text))
+     (None []
+       (let [text (try! (dump-macros-of a input "hdr" flags))]
+         (when (header-memo? memo)
+           (set! (.macros memo) (Some (cat (memo-allocator) text "")))
+           0)
+         (Ok text))))))
+
+;;; The JSON AST of INPUT, the wrapper including MEMO's header, parsed into A, also
+;;; pushing onto DEPS every file the dump read. Dumped once per load (see
+;;; CimportHeaderMemo); each cimport parses its own copy, since generating from one
+;;; names its anonymous records in place.
+(defn header-ast [(a (dyn Allocator))
+                  (memo (ptr CimportHeaderMemo))
+                  (input (slice u8))
+                  (flags (slice u8))
+                  (deps (ptr (ArrayList (slice u8))))] (-> (Result Json (slice u8)))
+  (try
+   (match (if (header-memo? memo) (.ast memo) (None [(slice u8)]))
+     (Some [text]
+       (match (.deps memo)
+         (Some [known] (for path (load known) (push! deps path)))
+         (None [] 0))
+       (Ok (json-parse a text)))
+     (None []
+       (let [depfile (tmp-path a "ast-deps")
+             text (try! (run-clang-ast-text a input (cat a flags (depfile-flags a depfile))))
+             read (try! (depfile-inputs a depfile input))]
+         (for path (load read) (push! deps path))
+         (when (header-memo? memo)
+           (memo-note-deps! memo read)
+           (set! (.ast memo) (Some (cat (memo-allocator) text "")))
+           0)
+         (Ok (json-parse a text)))))))
 
 ;;; The macros an empty translation unit predefines under FLAGS: what a header's
 ;;; own dump is read against. It depends on nothing but the flags, the working
@@ -2187,7 +2335,10 @@
                 (match (get owners id)
                   (Some [name]
                         (match d
-                          (JObj [o] (do (set! o "name" (JStr name)) 0))
+                          (JObj [o]
+                                (do (set! o "name" (JStr name))
+                                    (set! o "coilTypedefName" (JBool 1))
+                                    0))
                           (_ 0)))
                   (None [] 0)))
           (None [] 0))))
@@ -2291,14 +2442,14 @@
                                (deps (ptr (ArrayList (slice u8))))] (-> (Result (slice u8) (slice u8)))
   (try
    (let [flags (try! (clang-flags a flags))
-        input (try! (include-source a (abspath a header) "input"))
+        abs (abspath a header)
+        memo (header-memo a abs flags)
+        input (try! (include-source a abs "input"))
         base-macros (try! (baseline-macros a flags))
-        header-macros (try! (dump-macros-of a input "hdr" flags))
-        depfile (tmp-path a "ast-deps")]
-    (match (run-clang-ast a input (cat a flags (depfile-flags a depfile)))
+        header-macros (try! (header-macros a memo input flags))]
+    (match (header-ast a memo input flags deps)
       (Err [e] (Err e))
       (Ok [ast]
-        (for path (load (try! (depfile-inputs a depfile input))) (push! deps path))
           (let [top
                   (match (jinner ast)
                     (Some [t] t)
@@ -2765,21 +2916,69 @@
           (when (> i 0) (set! lines n true)))))
     lines))
 
-;;; Fold every expression in `exprs` to an integer with one clang run: each is
-;;; one enumerator on its own line. An expression that is not an integer
-;;; constant (a string, a type, an unknown name) fails only its own line; those
-;;; lines are dropped and the rest retried, so the pass takes a clang run or two
-;;; however many expressions there are. It used to be one clang run per macro --
-;;; 655 of them for <unistd.h>. The result maps an expression's index to its
-;;; value; an index that did not fold is absent.
+;;; Fold every expression in `exprs` to an integer: the result maps an
+;;; expression's index to its value, and an index that did not fold is absent.
+;;; During a load each header keeps what its expressions folded to (see
+;;; CimportHeaderMemo), so only expressions it has not seen reach clang: imports of
+;;; one header with different `:use` lists, and its layout probes, ask for many of
+;;; the same ones.
 (defn fold-batch [(a (dyn Allocator))
                   (abs (slice u8))
                   (flags (slice u8))
                   (exprs (ptr (ArrayList (slice u8))))] (-> (Result (ptr (HashMap i64 i64)) (slice u8)))
   (try
+   (let [memo (header-memo a abs flags)]
+     (if (not (header-memo? memo))
+         (Ok (.values (try! (fold-batch-run a abs flags exprs ""))))
+         (let [out (box! a (HashMap i64 i64) (hm-new-scalar [i64 i64] a))
+               (mut unknown) (al-new [(slice u8)] a)
+               (mut at) (al-new [i64] a)]
+           (for i (range 0 (len (load exprs)))
+             (let [e (get (load exprs) i)]
+               (match (get (.folds memo) e)
+                 (Some [known] (match known (Some [v] (set! out i v)) (None [] 0)))
+                 (None [] (push! (mut unknown) e) (push! (mut at) i)))))
+           (when (> (len unknown) 0)
+             (let [depfile (if (none? (.deps memo)) (tmp-path a "fold-deps") "")
+                   run (try! (fold-batch-run a abs flags (mut unknown) depfile))]
+               (for k (range 0 (len unknown))
+                 (let [v (get (load (.values run)) k)]
+                   (set! (mut (.folds memo)) (get unknown k) v)
+                   (match v (Some [x] (set! out (get at k) x)) (None [] 0))))
+               ; Only a run that compiled read the whole header; a header that does
+               ; not parse leaves its dependencies to `cimport-deps`, which fails.
+               (when (and (> (len depfile) 0) (.clean run))
+                 (match (depfile-inputs a depfile (.source run))
+                   (Ok [deps] (memo-note-deps! memo deps))
+                   (Err [_] 0)))
+               0))
+           (Ok out))))))
+
+;;; One `fold-batch` pass through clang: the values, the scratch translation unit it
+;;; compiled, and whether its last clang run compiled without error.
+(defstruct FoldRun [(values (ptr (HashMap i64 i64))) (source (slice u8)) (clean bool)])
+
+;;; Fold every expression in `exprs` with one clang run: each is one enumerator on
+;;; its own line. An expression that is not an integer constant (a string, a type,
+;;; an unknown name) fails only its own line; those lines are dropped and the rest
+;;; retried, so the pass takes a clang run or two however many expressions there
+;;; are. It used to be one clang run per macro -- 655 of them for <unistd.h>. Each
+;;; run also writes the files it read to DEPFILE, unless that is "".
+(defn fold-batch-run [(a (dyn Allocator))
+                      (abs (slice u8))
+                      (flags (slice u8))
+                      (exprs (ptr (ArrayList (slice u8))))
+                      (depfile (slice u8))] (-> (Result FoldRun (slice u8)))
+  (try
    (let [out (box! a (HashMap i64 i64) (hm-new-scalar [i64 i64] a))
+        cf (tmp-path a "foldbatch")
+        run-flags (cat3 a
+                        flags
+                        " -ferror-limit=0 -Xclang -ast-dump-filter=__coilprobes"
+                        (if (> (len depfile) 0) (depfile-flags a depfile) ""))
         (mut live) (al-new [i64] a)
-        (mut done) false]
+        (mut done) false
+        (mut clean) false]
     (for i (range 0 (len (load exprs))) (push! (mut live) i))
     (while (and (not done) (> (len live) 0))
       (let [(mut sb) (sb-new a)]
@@ -2795,33 +2994,33 @@
             (sb-push-str! (mut sb) (get (load exprs) i))
             (sb-push-str! (mut sb) "),\n")))
         (sb-push-str! (mut sb) "};\n")
-        (let [cf (tmp-path a "foldbatch")]
-          (try! (write-file a cf (sb-str (load sb))))
-          ; Only the probe enum is dumped. The full AST of the header behind it is
-          ; what every other declaration costs, and a batch needs none of it: for
-          ; <mach/mach.h> that was 25 MB of JSON per batch, parsed and kept.
-          (match (run-clang-ast a cf (cat a flags " -ferror-limit=0 -Xclang -ast-dump-filter=__coilprobes"))
-            (Ok [ast]
-                (let [m (box! a (HashMap (slice u8) i64) (hm-new [(slice u8) i64] a (str-keyops)))]
-                  (ee-one a ast m)
-                  (for i live
-                    (match (get (load m) (cat a "__v" (i64->dec a i)))
-                      (Some [v] (set! out i v))
-                      (None [] 0)))
-                  (set! done true)))
-            (Err [detail]
-                 (let [bad (fold-error-lines a cf detail)
-                       (mut kept) (al-new [i64] a)]
-                   (for k (range 0 (len live))
-                     (match (get (load bad) (+ k 3))
-                       (Some [_] 0)
-                       (None [] (push! (mut kept) (get live k)))))
-                   ; No error named one of our lines (the header itself does not
-                   ; parse with these flags): nothing here can fold.
-                   (if (= (len kept) (len live))
-                       (set! done true)
-                       (set! live kept))))))))
-    (Ok out))))
+        (try! (write-file a cf (sb-str (load sb))))
+        ; Only the probe enum is dumped. The full AST of the header behind it is
+        ; what every other declaration costs, and a batch needs none of it: for
+        ; <mach/mach.h> that was 25 MB of JSON per batch, parsed and kept.
+        (match (run-clang-ast a cf run-flags)
+          (Ok [ast]
+              (let [m (box! a (HashMap (slice u8) i64) (hm-new [(slice u8) i64] a (str-keyops)))]
+                (ee-one a ast m)
+                (for i live
+                  (match (get (load m) (cat a "__v" (i64->dec a i)))
+                    (Some [v] (set! out i v))
+                    (None [] 0)))
+                (set! done true)
+                (set! clean true)))
+          (Err [detail]
+               (let [bad (fold-error-lines a cf detail)
+                     (mut kept) (al-new [i64] a)]
+                 (for k (range 0 (len live))
+                   (match (get (load bad) (+ k 3))
+                     (Some [_] 0)
+                     (None [] (push! (mut kept) (get live k)))))
+                 ; No error named one of our lines (the header itself does not
+                 ; parse with these flags): nothing here can fold.
+                 (if (= (len kept) (len live))
+                     (set! done true)
+                     (set! live kept)))))))
+    (Ok (FoldRun :values out :source cf :clean clean)))))
 
 ; tier 0a: fold ONE expression via a single-member long-long enum; sentinel if it
 ; isn't a constant expression (clang errors) → caller falls to tier 0b.
@@ -2838,11 +3037,18 @@
 ;;; A record's ABI size and alignment, as clang folded them.
 (defstruct RecordLayout [(size i64) (align i64)])
 
-;;; The C spelling of record D's type: `struct NAME` or `union NAME`.
+;;; The C spelling of record D's type: `struct NAME`, `union NAME`, or the typedef
+;;; that names an untagged one.
 (defn record-c-type [(a (dyn Allocator)) (d Json)] (-> (slice u8))
-  (cat a
-       (if (= (jstr-or (jgets d "tagUsed") "struct") "union") "union " "struct ")
-       (jname d)))
+  ; A record with no tag of its own is named after the typedef that owns it
+  ; (name-anonymous-records!), and C reaches it only through that typedef:
+  ; `union __mbstate_t` names no type, so its layout never folded and the record
+  ; was skipped.
+  (if (jbool-true? d "coilTypedefName")
+      (jname d)
+      (cat a
+           (if (= (jstr-or (jgets d "tagUsed") "struct") "union") "union " "struct ")
+           (jname d))))
 
 ;;; The size and alignment of every top-level record in TOP that record-defstruct
 ;;; cannot lay out field by field, folded in ONE clang run for the whole header and

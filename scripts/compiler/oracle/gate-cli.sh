@@ -428,6 +428,29 @@ case "$lintscope_out" in
   *) ok "lint --fix runs only requested checkers" ;;
 esac
 
+# coil.lint.names answers, for every rule, whether a call head's spelling reaches
+# the rule's qualified name. It rejects on the spelling's last bytes before reading
+# the imports; the fixture's cases include the ones that reject must not get wrong.
+names_out=$("$COIL" run tests/compiler/features/lint_names_resolution.coil 2>&1)
+[ "$names_out" = "10000110011010" ] && ok "lint name resolution answers each spelling case" \
+  || bad "lint name resolution answers each spelling case" "want 10000110011010, got: $names_out"
+# A rule name with no module is refused once a spelling meets it, never a silent miss.
+printf '(module lint-names-unqualified)\n(import "coil.primitive" :as primitive)\n(import "coil.lint.names" :use [ln-env ln-is?])\n(defn reaches [(spelling Code)] (-> Code)\n  (if (ln-is? (primitive/code-str spelling) (ln-env `() `()) "al-get") `1 `0))\n(defn main [] (-> i64) (reaches al-get))\n' > "$T/lint-names-unqualified.coil"
+expect_out "name a rule's module" "lint name resolution refuses a rule name without its module" \
+  "$COIL" run "$T/lint-names-unqualified.coil"
+
+# A checker's rewrites of nested forms land in one --fix round: the outer edit
+# carries the inner ones (SugBatch, src/compiler/comptime.coil). Each level of
+# nesting used to cost a whole-program analysis, so two analyses (the starting
+# tree, then the round's own gate) left the inner `primitive/ior`s in place.
+printf '(module nestfix)\n(import "coil.primitive" :as primitive)\n(defn flags [(a i64) (b i64) (c i64) (d i64)] (-> i64)\n  (primitive/ior a (primitive/ior b (primitive/ior c d))))\n(defn main [] (-> i64) (flags 1 2 4 8))\n' > "$T/nestfix.coil"
+"$COIL" lint "$T/nestfix.coil" --fix --max-analyses 2 >/dev/null 2>&1
+nestfix=$(cat "$T/nestfix.coil")
+case "$nestfix" in
+  *'(| a (| b (| c d)))'*) ok "lint --fix rewrites nested forms in one round" ;;
+  *) bad "lint --fix rewrites nested forms in one round" "$nestfix" ;;
+esac
+
 # manual-box migration also recognizes the modern `set!` initialization.
 printf '(module mbset)\n(import "coil.alloc" :as alloc :use [create unwrap-ptr malloc-allocator])\n(defstruct P [(x i64)])\n(defn make [] (-> (ptr P))\n  (let [p (unwrap-ptr [P] (create [P] (malloc-allocator)))]\n    (set! p (P :x 1))\n    p))\n(defn main [] (-> i64) (.x (make)))\n' > "$T/mbset.coil"
 "$COIL" lint "$T/mbset.coil" --fix >/dev/null 2>&1
