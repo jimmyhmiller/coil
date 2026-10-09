@@ -89,7 +89,7 @@ function hostErrno() {
 }
 // Report a failed fs call the way libc does: store errno and return -1. The
 // numbers are the POSIX values shared by Linux and Darwin.
-const ERRNO = { ENOENT: 2, EACCES: 13, EEXIST: 17, ENOTDIR: 20, EISDIR: 21, ENOTEMPTY: 39 };
+const ERRNO = { EPERM: 1, ENOENT: 2, ESRCH: 3, EACCES: 13, EEXIST: 17, ENOTDIR: 20, EISDIR: 21, ENOTEMPTY: 39 };
 function hostFail(e) {
   dv().setInt32(Number(hostErrno()), (e && ERRNO[e.code]) || 5, true);   // EIO otherwise
   return -1;
@@ -135,11 +135,20 @@ function hostMkstemp(templatePtr) {
   return -1;
 }
 
+// This host cannot list a directory (opendir is a stub) or run the guest's atexit
+// handlers, so coil.temp inside the guest can neither sweep nor clean up. The host
+// removes every directory the guest made when node exits instead.
+const madeDirectories = [];
+process.on('exit', () => {
+  for (const d of madeDirectories) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
+});
+
 function hostMkdtemp(templatePtr) {
   const template = cstr(templatePtr);
   if (!template.endsWith('XXXXXX')) return 0n;
   try {
     const path = fs.mkdtempSync(template.slice(0, -6));
+    madeDirectories.push(path);
     writeBytes(templatePtr, Buffer.from(path + '\0'));
     return templatePtr;
   } catch {
@@ -426,6 +435,11 @@ const env = {
   isatty:()=>0,
   atexit:()=>0,
   getpid:()=>Number(process.pid), realpath_stub:()=>0n, __error:hostErrno,
+  // coil.temp: its root is per user, and is used only if this user owns it; a
+  // directory is swept when kill(pid, 0) says its owner is gone.
+  getuid:()=>process.getuid(),
+  fchmod:(fd,mode)=>{ try{fs.fchmodSync(Number(fd),Number(mode));return 0;}catch(e){return hostFail(e);} },
+  kill:(pid,sig)=>{ try{process.kill(Number(pid),Number(sig));return 0;}catch(e){return hostFail(e);} },
   // Coil's wasm64 Timespec uses two i64 fields. Date.now is wall-clock rather than
   // monotonic, but it preserves the libc ABI and is sufficient for compiler timing.
   clock_gettime:(_clockId,out)=>{

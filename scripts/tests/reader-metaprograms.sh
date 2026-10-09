@@ -35,11 +35,10 @@ case "$artifact_undef" in
 esac
 "$T/artifact-pure"; [ $? = 42 ] || fail "artifact-boundary reader result"
 
-"$COIL" check "$FIX/raw.answer" --use reader.fixture.fs \
+COIL_READER_FS_OUT="$T/fs-provider.txt" "$COIL" check "$FIX/raw.answer" --use reader.fixture.fs \
   || fail "ordinary filesystem read/write from reader"
-cmp -s "$FIX/raw.answer" /tmp/coil-reader-fs-provider.txt \
+cmp -s "$FIX/raw.answer" "$T/fs-provider.txt" \
   || fail "reader filesystem write contents"
-rm -f /tmp/coil-reader-fs-provider.txt
 
 counter="$T/reader-count"
 "$COIL" check "$FIX/raw.answer" --use reader.fixture.once -- "$counter" \

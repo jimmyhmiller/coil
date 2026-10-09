@@ -15,13 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cleanup_on_signal  # noqa: E402
 cleanup_on_signal.install()
 COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else "build/bin/coil-generated-v2").resolve()
-PROCESS_IDS: set[int] = set()
 
 
 def run(args: list[str], expected: int = 0, *, env: dict[str, str] | None = None, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(args, cwd=cwd, env=env, text=True,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    PROCESS_IDS.add(process.pid)
     stdout, stderr = process.communicate()
     result = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
     if result.returncode != expected:
@@ -36,6 +34,11 @@ with tempfile.TemporaryDirectory(prefix=".coil-generated-tests-", dir=ROOT) as r
     provider_path = directory / "provider.coil"
     environment = os.environ.copy()
     environment["COIL_NAMESPACE_ROOTS"] = str(directory)
+    # Every compiler here keeps its temporaries in this private TMPDIR, so the end
+    # of the test can see exactly what they left.
+    temporaries = directory / "tmp"
+    temporaries.mkdir()
+    environment["TMPDIR"] = str(temporaries)
     environment["COIL_META_ARENA"] = "poison"
     environment.pop("COIL_MODULE_MAP", None)
     environment.pop("COIL_READERS", None)
@@ -452,11 +455,11 @@ with tempfile.TemporaryDirectory(prefix=".coil-generated-tests-", dir=ROOT) as r
     assert peak_bytes < 256 * 1024 * 1024, f"object scans retained input bytes: {peak_bytes} RSS"
     print(f"object link facts: repeated 32 MiB scans peak at {peak_bytes} bytes RSS")
 
-    leftovers = [path for pid in PROCESS_IDS for path in Path("/tmp").glob(f"coil-generated-{pid}-*")]
+    leftovers = [path for root in temporaries.glob("coil-*") for path in root.iterdir()]
     if leftovers:
-        raise AssertionError(f"generated sessions leaked source directories: {sorted(leftovers)}")
-    if list(directory.glob(".coil-object-*")):
-        raise AssertionError("emit-obj leaked its private artifact directory")
+        raise AssertionError(f"compiler processes left temporary directories: {sorted(leftovers)}")
+    if list(directory.rglob(".*.coil-tmp-*")):
+        raise AssertionError("emit-obj leaked its staged artifact directory")
 
 memory = run([sys.executable, str(ROOT / "scripts/tests/generated-unit-memory.py"), str(COMPILER)])
 print(memory.stdout.strip())

@@ -27,6 +27,7 @@
 #include <math.h>
 #include <fcntl.h>
 #include <time.h>
+#include <signal.h>
 #include <unistd.h>
 #include <errno.h>
 #include <dirent.h>
@@ -300,6 +301,9 @@ uint32_t env_unsetenv(uint64_t name) { return (uint32_t)unsetenv(hoststr(name));
 // the same (`isatty:()=>0`).
 uint32_t env_isatty(uint32_t fd) { (void)fd; return 0; }
 uint32_t env_getpid(void) { return (uint32_t)getpid(); }
+uint32_t env_getuid(void) { return (uint32_t)getuid(); }
+uint32_t env_kill(uint32_t pid, uint32_t sig) { return (uint32_t)kill((pid_t)(int32_t)pid, (int)sig); }
+uint32_t env_fchmod(uint32_t fd, uint32_t mode) { return (uint32_t)fchmod((int)fd, (mode_t)mode); }
 uint32_t env_clock_gettime(uint32_t clock_id, uint64_t out) {
     struct timespec ts;
     int rc = clock_gettime((clockid_t)clock_id, &ts);
