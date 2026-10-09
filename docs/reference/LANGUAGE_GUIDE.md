@@ -1412,6 +1412,9 @@ every use allows it and its type owns nothing (a cell never runs `Drop`).
 - `if` needs both branches, of the same type, when its value is used.
 - `cast` between floats and integers converts the value, not the bits.
 - `primitive/…` names require `(import "coil.primitive" :as primitive)`.
+- `primitive/iadd`/`isub`/`imul` wrap and `primitive/cast` keeps the low bits; under
+  `coil.safety` (DEBUGGING.md) `+ - *` and `cast` are checked instead. Use the
+  primitive when wrapping or truncating is the point.
 - You can't implement a trait for `(mut T)`; implement it for `T`.
 - `(dyn Trait)` accepts a `(mut local)` or a `(ptr T)`, not an immutable borrow.
 - Don't call `alloc-stack` in a loop, and never return a pointer to a local.

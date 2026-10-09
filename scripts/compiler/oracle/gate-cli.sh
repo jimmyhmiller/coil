@@ -542,6 +542,45 @@ printf '(module scope-block)\n(defn main [] (-> i64) (loop (scope :s (defer 0) (
 expect_out "an unlabeled break/continue cannot exit a \\(scope" "a break in a block cannot leave a scope past its defers" \
   "$COIL" check "$T/scope-block.coil"
 
+echo "== coil.safety: runtime checks for the whole program =="
+# tests/compiler/features/safety_checks.coil trips one check per argument; with
+# none it runs what must not trap (in-range values, the wrapping primitives,
+# :safety/checked false). Each trap names the check and the operation's location.
+SC=tests/compiler/features/safety_checks.coil
+if "$COIL" build "$SC" -o "$T/safety-checks" --use coil.safety >/dev/null 2>&1; then
+  expect_out "in range: 42 255 3" "safety: in-range operations do not trap" "$T/safety-checks"
+  expect_out "wrapping: -9223372036854775808 44" "safety: primitive/iadd wraps and primitive/cast truncates" "$T/safety-checks"
+  expect_out "unchecked: -9223372036854775808" "safety: :safety/checked false keeps wrapping +" "$T/safety-checks"
+  expect_out "min prints: -9223372036854775808" "safety: the minimum i64 still prints" "$T/safety-checks"
+  # the message and its location are separate lines of the report
+  while IFS='|' read -r case want; do
+    out=$("$T/safety-checks" "$case" 2>&1); rc=$?
+    flat=$(tr '\n' ' ' <<<"$out")
+    if [ "$rc" -ge 128 ] && grep -qE "$want" <<<"$flat"; then
+      ok "safety: $case traps with its location"
+    else
+      bad "safety: $case traps with its location" "want a signal and /$want/, got rc=$rc: $flat"
+    fi
+  done <<'CASES'
+index|index out of bounds: index 4, len 3.*safety_checks.coil:18:
+add|integer overflow.*safety_checks.coil:19:
+sub|integer overflow.*safety_checks.coil:20:
+mul|integer overflow.*safety_checks.coil:21:
+neg|integer overflow.*safety_checks.coil:22:
+div|division by zero.*safety_checks.coil:23:
+min-div|integer overflow.*safety_checks.coil:24:
+shift|shift amount is greater than the type size.*safety_checks.coil:25:
+narrow|integer cast truncated bits.*safety_checks.coil:26:
+unsigned|cast negative value to unsigned integer.*safety_checks.coil:27:
+float|integer part of floating point value out of bounds.*safety_checks.coil:28:
+slice-get|index out of bounds: index 6, len 3.*safety_checks.coil:29:
+subslice|start index 3 is larger than end index 2.*safety_checks.coil:30:
+generic|integer overflow.*in generic code
+CASES
+else
+  bad "safety: the checks fixture builds under coil.safety" "$("$COIL" build "$SC" -o "$T/safety-checks" --use coil.safety 2>&1 | head -5)"
+fi
+
 echo "== check mode: typecheck/compile with no object (diag-12) =="
 # `build -o /dev/null` USED to SIGABRT with a bare 'LLVMTargetMachineEmitToFile ...
 # Operation not permitted' (exit 134) because /dev is unwritable. It now routes to the

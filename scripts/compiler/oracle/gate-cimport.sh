@@ -214,14 +214,14 @@ cat >"$tmp/fix-cimport.coil" <<EOF
 (module fix_cimport)
 (import "coil.primitive" :as primitive)
 (cimport "$PWD/tests/compiler/cimport/selective.h" :use [coil_selected_call COIL_SELECTED_VALUE])
-(defn main [] (-> i64) (primitive/iadd COIL_SELECTED_VALUE 1))
+(defn main [] (-> i64) (primitive/ior COIL_SELECTED_VALUE 1))
 EOF
 cp "$tmp/fix-cimport.coil" "$tmp/fix-cimport.orig"
 clang_runs "$compiler" check "$tmp/fix-cimport.coil"
 check_runs=$(count_runs '')
 clang_runs "$compiler" lint "$tmp/fix-cimport.coil" --fix 2>"$tmp/fix-cimport.err"
 fix_runs=$(count_runs '')
-grep -qF '(+ COIL_SELECTED_VALUE 1)' "$tmp/fix-cimport.coil"
+grep -qF '(| COIL_SELECTED_VALUE 1)' "$tmp/fix-cimport.coil"
 [ "$fix_runs" = "$check_runs" ] || { echo "lint --fix ran clang $fix_runs times, one load runs it $check_runs times" >&2; exit 1; }
 
 # One header imported three ways is three generations, but what does not depend on

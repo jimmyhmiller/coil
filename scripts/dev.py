@@ -420,6 +420,10 @@ def test(args: argparse.Namespace) -> None:
         execute(sys.executable, "tests/compiler/const_generic_test.py", "--compiler", compiler)
     elif args.suite == "field-access":
         execute(sys.executable, "tests/compiler/field_access_test.py", "--compiler", compiler)
+    elif args.suite == "safety":
+        # Local only, not in CI: the runtime corpus built under coil.safety must
+        # behave as it does without it. gate-cli checks the traps themselves.
+        execute(sys.executable, "scripts/tests/safety-corpus.py", compiler)
     elif args.suite == "prop":
         # Property testing, and the fuzz engine's planted-bug gate (seconds, fixed
         # seeds). Local: fuzzing campaigns proper are scripts/tests/fuzz_targets.py.
@@ -1749,7 +1753,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "update", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd", "const-generics", "field-access", "prop", "aggregates"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "update", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd", "const-generics", "field-access", "prop", "aggregates", "safety"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.add_argument("--all-sources", action="store_true",
