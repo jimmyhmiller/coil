@@ -642,6 +642,35 @@ source-roots = ["src"]
     print(f"fast modernization gate: PASS ({elapsed:.2f}s, compiler={candidate})")
 
 
+# A checker whose one suggestion, at every `(rollback-trigger)` call, does not
+# compile: it replaces the call with an unbound name.
+ROLLBACK_BADLINT = """(module rollback.badlint)
+(import "coil.primitive" :as primitive)
+(defn bad-head? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (and (> (primitive/code-count f) 0)
+            (primitive/code-eq (primitive/code-nth f 0) `rollback-trigger))))
+(defn bad-walk [(f Code)] (-> i64)
+  (if (primitive/code-list? f)
+      (if (bad-head? f)
+          (do (primitive/suggest f "transaction rollback probe" `missing) 0)
+          (bad-kids f 0 (primitive/code-count f)))
+      0))
+(defn bad-kids [(f Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n) 0
+      (do (bad-walk (primitive/code-nth f i))
+          (bad-kids f (primitive/iadd i 1) n))))
+(defn bad-modules [(ms Code) (i i64) (n i64)] (-> i64)
+  (if (>= i n) 0
+      (do (bad-walk (primitive/code-nth ms i))
+          (bad-modules ms (primitive/iadd i 1) n))))
+(defn lint-bad [(modules Code)] (-> Code)
+  (bad-modules modules 0 (primitive/code-count modules))
+  modules)
+(checker lint-bad)
+"""
+
+
 def test_modernize_fast(compiler: str) -> None:
     """Run the independent focused modernization fixtures concurrently."""
     started = time.monotonic()
@@ -1214,31 +1243,7 @@ name = "rollback"
 entry = "src/part0.coil"
 source-roots = ["src"]
 """)
-            (source / "badlint.coil").write_text("""(module rollback.badlint)
-(import "coil.primitive" :as primitive)
-(defn bad-head? [(f Code)] (-> bool)
-  (and (primitive/code-list? f)
-       (and (> (primitive/code-count f) 0)
-            (primitive/code-eq (primitive/code-nth f 0) `rollback-trigger))))
-(defn bad-walk [(f Code)] (-> i64)
-  (if (primitive/code-list? f)
-      (if (bad-head? f)
-          (do (primitive/suggest f "transaction rollback probe" `missing) 0)
-          (bad-kids f 0 (primitive/code-count f)))
-      0))
-(defn bad-kids [(f Code) (i i64) (n i64)] (-> i64)
-  (if (>= i n) 0
-      (do (bad-walk (primitive/code-nth f i))
-          (bad-kids f (primitive/iadd i 1) n))))
-(defn bad-modules [(ms Code) (i i64) (n i64)] (-> i64)
-  (if (>= i n) 0
-      (do (bad-walk (primitive/code-nth ms i))
-          (bad-modules ms (primitive/iadd i 1) n))))
-(defn lint-bad [(modules Code)] (-> Code)
-  (bad-modules modules 0 (primitive/code-count modules))
-  modules)
-(checker lint-bad)
-""")
+            (source / "badlint.coil").write_text(ROLLBACK_BADLINT)
             for file_index in range(7):
                 forms = "\n".join(
                     f"(defn legacy-{file_index}-{form_index} [] (-> bool) "
@@ -1272,6 +1277,40 @@ source-roots = ["src"]
                 raise RuntimeError("fast modernization gate: scale salvage applied the fix that does not compile")
             if "primitive/icmp-eq" in text:
                 raise RuntimeError("fast modernization gate: scale salvage dropped fixes that compile")
+            execute(coil, "check", cwd=project)
+
+        def analysis_budget_task() -> None:
+            # Every fix here fails to compile, so the round is bisected one full
+            # analysis per trial. --max-analyses stops that: the run fails, says so,
+            # and leaves files that compile, with none of the broken fixes applied.
+            project = tmp / "analysis-budget"
+            source = project / "src"
+            source.mkdir(parents=True)
+            (project / "Coil.toml").write_text("""[package]
+name = "rollback"
+entry = "src/main.coil"
+source-roots = ["src"]
+""")
+            # each broken fix its own transaction, so the round has twelve groups to bisect
+            independent = ROLLBACK_BADLINT.replace(
+                "(do (primitive/suggest f", "(do (primitive/suggest-transaction) (primitive/suggest f")
+            if independent == ROLLBACK_BADLINT:
+                raise RuntimeError("fast modernization gate: the budget fixture's checker did not change")
+            (source / "badlint.coil").write_text(independent)
+            calls = "\n".join(f"(defn use-{i} [] (-> i64) (rollback-trigger))" for i in range(12))
+            (source / "main.coil").write_text(
+                "(module rollback.main)\n(defn rollback-trigger [] (-> i64) 0)\n"
+                f"{calls}\n(defn main [] (-> i64) (use-0))\n")
+            original = (source / "main.coil").read_text()
+            result = subprocess.run([coil, "lint", "--fix", "--use", "rollback.badlint", "--max-analyses", "3"],
+                                    cwd=project, text=True, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode == 0:
+                raise RuntimeError("fast modernization gate: an exhausted analysis budget did not fail the run")
+            if "--fix stopped after 3 analyses" not in result.stderr:
+                raise RuntimeError(f"fast modernization gate: the analysis budget did not stop --fix: {result.stderr}")
+            if (source / "main.coil").read_text() != original:
+                raise RuntimeError("fast modernization gate: an exhausted analysis budget left a broken fix applied")
             execute(coil, "check", cwd=project)
 
         def breaking_scan_task() -> None:
@@ -1373,6 +1412,7 @@ source-roots = ["src"]
             broken_lint_task,
             broken_project_task,
             rollback_scale_task,
+            analysis_budget_task,
             breaking_scan_task,
         ]
         if has_llvm:

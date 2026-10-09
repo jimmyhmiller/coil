@@ -210,12 +210,24 @@ cat >"$tmp/fix-cimport.coil" <<EOF
 (cimport "$PWD/tests/compiler/cimport/selective.h" :use [coil_selected_call COIL_SELECTED_VALUE])
 (defn main [] (-> i64) (primitive/iadd COIL_SELECTED_VALUE 1))
 EOF
+cp "$tmp/fix-cimport.coil" "$tmp/fix-cimport.orig"
 clang_runs "$compiler" check "$tmp/fix-cimport.coil"
 check_runs=$(count_runs '')
 clang_runs "$compiler" lint "$tmp/fix-cimport.coil" --fix 2>"$tmp/fix-cimport.err"
 fix_runs=$(count_runs '')
 grep -qF '(+ COIL_SELECTED_VALUE 1)' "$tmp/fix-cimport.coil"
 [ "$fix_runs" = "$check_runs" ] || { echo "lint --fix ran clang $fix_runs times, one load runs it $check_runs times" >&2; exit 1; }
+
+# Each analysis releases what it acquired: the unit holds as many resources after
+# the third analysis as after the first. Expansion arenas used to stay registered
+# until the command ended, one set per --fix round.
+cp "$tmp/fix-cimport.orig" "$tmp/fix-cimport.coil"
+COIL_TRACE=1 "$compiler" lint "$tmp/fix-cimport.coil" --fix >/dev/null 2>"$tmp/fix-cimport.trace"
+resource_lines=$(grep 'coil-trace count lint.unit-resources ' "$tmp/fix-cimport.trace" || true)
+resource_counts=$(printf '%s\n' "$resource_lines" | awk 'NF {print $NF}' | sort -u)
+analyses=$(printf '%s\n' "$resource_lines" | grep -c . || true)
+[ "$analyses" -ge 3 ] || { echo "lint --fix ran $analyses analyses, want at least 3" >&2; exit 1; }
+[ "$(printf '%s\n' "$resource_counts" | wc -l | tr -d ' ')" = 1 ] || { echo "unit resources grew across lint analyses: $resource_counts" >&2; exit 1; }
 
 # Lint's source facts copy the resolver's declaration inventory once per resolve,
 # not once per qualified form: that was 8,380 copies, 2.7 GB, for one analysis of
