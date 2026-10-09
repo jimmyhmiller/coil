@@ -172,6 +172,66 @@ case "$fail_out" in
   *) echo "cimport did not report clang's failure: $fail_out" >&2; exit 1 ;;
 esac
 
+# Clang runs are counted, not timed: a counting clang logs each run.
+mkdir -p "$tmp/counting-clang"
+cat >"$tmp/counting-clang/clang" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >>"$tmp/clang-runs.log"
+exec "$real_clang" "\$@"
+EOF
+chmod +x "$tmp/counting-clang/clang"
+clang_runs() { : >"$tmp/clang-runs.log"; PATH="$tmp/counting-clang:$PATH" "$@"; }
+count_runs() { grep -c -e "$1" "$tmp/clang-runs.log" || true; }
+
+# Every record cimport keeps opaque is folded by ONE clang run that dumps only the
+# probe enum. Each used to be folded alone, by a full AST dump of the header: for
+# the Mach headers that was 82 dumps of 25 MB of JSON per cimport.
+clang_runs "$compiler" cimport tests/compiler/cimport/opaque_records.h -o "$tmp/opaque_records.coil"
+"$compiler" check "$tmp/opaque_records.coil"
+opaque_records=$(cat "$tmp/opaque_records.coil")
+for record in "0 16" "7 16" "8 24" "23 32"; do
+  set -- $record
+  case "$opaque_records" in
+    *"(defstruct coil_opaque_record_$1 :layout explicit :size $2 :align 8 [])"*) ;;
+    *) echo "opaque record $1 was not laid out as $2 bytes" >&2; exit 1 ;;
+  esac
+done
+dumps=$(count_runs '-ast-dump=json')
+filtered=$(count_runs '-ast-dump-filter=__coilprobes')
+[ "$((dumps - filtered))" = 1 ] || { echo "cimport parsed the whole header $((dumps - filtered)) times, want 1" >&2; exit 1; }
+[ "$filtered" -le 2 ] || { echo "cimport folded 24 opaque records in $filtered clang runs, want at most 2" >&2; exit 1; }
+
+# One process loads a program many times (lint --fix: once per round, once per
+# salvage trial, once to report); its cimports run clang once. The fix below takes
+# two rounds, so three analyses, and must cost the clang runs of one check.
+cat >"$tmp/fix-cimport.coil" <<EOF
+(module fix_cimport)
+(import "coil.primitive" :as primitive)
+(cimport "$PWD/tests/compiler/cimport/selective.h" :use [coil_selected_call COIL_SELECTED_VALUE])
+(defn main [] (-> i64) (primitive/iadd COIL_SELECTED_VALUE 1))
+EOF
+clang_runs "$compiler" check "$tmp/fix-cimport.coil"
+check_runs=$(count_runs '')
+clang_runs "$compiler" lint "$tmp/fix-cimport.coil" --fix 2>"$tmp/fix-cimport.err"
+fix_runs=$(count_runs '')
+grep -qF '(+ COIL_SELECTED_VALUE 1)' "$tmp/fix-cimport.coil"
+[ "$fix_runs" = "$check_runs" ] || { echo "lint --fix ran clang $fix_runs times, one load runs it $check_runs times" >&2; exit 1; }
+
+# Lint's source facts copy the resolver's declaration inventory once per resolve,
+# not once per qualified form: that was 8,380 copies, 2.7 GB, for one analysis of
+# a 40k-line project. A program of many forms shows the difference.
+{
+  echo '(module many_forms)'
+  echo '(defn f0 [] (-> i64) 0)'
+  for i in $(seq 1 60); do echo "(defn f$i [] (-> i64) (+ (f$((i - 1))) 1))"; done
+  echo '(defn main [] (-> i64) (f60))'
+} >"$tmp/many-forms.coil"
+COIL_TRACE=1 "$compiler" lint "$tmp/many-forms.coil" >/dev/null 2>"$tmp/many-forms.trace"
+captures=$(grep -c 'coil-trace count source-facts.declaration-capture ' "$tmp/many-forms.trace" || true)
+resolves=$(grep -c 'coil-trace end frontend.resolve.qualify ' "$tmp/many-forms.trace" || true)
+[ "$captures" -ge 1 ] || { echo 'lint recorded no declaration inventory' >&2; exit 1; }
+[ "$captures" -le "$resolves" ] || { echo "lint copied the declaration inventory $captures times in $resolves resolves" >&2; exit 1; }
+
 if [[ $(uname -s) == Darwin ]]; then
   cat >"$tmp/ioctl-lint.coil" <<'EOF'
 (module ioctl_lint)

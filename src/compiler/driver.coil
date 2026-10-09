@@ -5248,7 +5248,7 @@
                            (engine-mark i64)
                            (prior-rule-sources (ptr (ArrayList i64)))] (-> i64)
   (set! (.source_ready (comptime-unit-state)) false)
-  (set! (.enabled (source-facts)) false)
+  (source-facts-stop!)
   (clear-sem-model)
   (type-map-reset)
   (bind-map-reset)
@@ -12784,41 +12784,13 @@
 ; Compile C translation units into content-keyed objects under .coil/build/native/
 ; and return the object paths. A source is recompiled only when its inputs or the
 ; toolchain change; the C compiler failing stops the build.
-;;; The prerequisites a clang `-MMD` depfile names: everything after the first
-;;; `target:`, with `\\` line continuations joined and `\ ` read as a space.
-(defn m-depfile-prerequisites [(a (dyn Allocator)) (text (slice u8))] (-> (ptr (ArrayList (slice u8))))
-  (let [out (box-al [(slice u8)] a (al-new [(slice u8)] a))
-        n (len text)
-        (mut i) 0
-        (mut past-target) false
-        (mut word) (sb-new a)]
-    (while (< i n)
-      (let [c (get text i)]
-        (cond (and (= c #\\) (< (+ i 1) n) (= (get text (+ i 1)) #\newline))
-                (set! i (+ i 2))
-              (and (= c #\\) (< (+ i 1) n) (= (get text (+ i 1)) #\space))
-                (do (sb-push-byte! (mut word) #\space) (set! i (+ i 2)))
-              (or (= c #\space) (= c #\tab) (= c #\newline) (= c #\return))
-                (do
-                  (when (and past-target (> (len (sb-str word)) 0))
-                    (push! out (sb-str word)))
-                  (set! word (sb-new a))
-                  (set! i (+ i 1)))
-              (and (= c #\:) (not past-target)
-                   (or (>= (+ i 1) n) (= (get text (+ i 1)) #\space) (= (get text (+ i 1)) #\newline)))
-                (do (set! past-target true) (set! word (sb-new a)) (set! i (+ i 1)))
-              :else (do (sb-push-byte! (mut word) c) (set! i (+ i 1))))))
-    (when (and past-target (> (len (sb-str word)) 0))
-      (push! out (sb-str word)))
-    out))
-
 ;;; Write STAMP: one `digest path` line per prerequisite DEP names, so a later
 ;;; build can tell whether any input changed without trusting timestamps or make.
 (defn m-cc-write-stamp! [(a (dyn Allocator)) (dep (slice u8)) (stamp (slice u8))] (-> bool)
   (match (read-file-opt a (str->cstr a dep))
     (None [] false)
     (Some [text]
-          (let [prereqs (m-depfile-prerequisites a text)
+          (let [prereqs (ci/depfile-prerequisites a text)
                 (mut body) (sb-new a)
                 (mut ok) true]
             (for p (load prereqs)
@@ -18101,12 +18073,17 @@
                                                 (ArrayList (slice u8))
                                                 (al-new [(slice u8)] a))]
                                     (push! [(slice u8)] names name)
+                                    ; Asked as the replacement cimport will ask it, so that
+                                    ; load is served from the process cimport cache.
                                     (try (let [generated
-                                                 (try-or! (ci/cimport-header-use a
-                                                                                 (load header)
-                                                                                 ""
-                                                                                 names
-                                                                                 true)
+                                                 (try-or! (cimport-text a
+                                                                        (CimportRequest :path (load header)
+                                                                                        :flags ""
+                                                                                        :use-present true
+                                                                                        :use-names names
+                                                                                        :probes (ci/probe-list-new a)
+                                                                                        :link ""
+                                                                                        :probe-only false))
                                                           (None [LintEdit]))]
                                            (if (match (str-find generated
                                                                 (sconcat3 a
@@ -19591,6 +19568,65 @@
 (defn lint-fix-outcome [] (-> (ptr LintFixOutcome))
   (primitive/alloc-static LintFixOutcome))
 
+;;; `lint --fix` and `--diff` run one full analysis of the target per round, one per
+;;; trial while salvaging a round, and one more for the report. Each costs what a
+;;; compile does, and a quiet run that does many of them looks hung. On a terminal
+;;; every analysis is announced as it finishes, with what it was for, how long it
+;;; took and the process's peak memory, so a run that is slow, or growing, shows it.
+(defstruct LintProgress [(on bool) (count i64)])
+
+(defn lint-progress [] (-> (ptr LintProgress))
+  (primitive/alloc-static LintProgress))
+
+;;; struct rusage: two timevals, then fourteen longs; ru_maxrss is the first long.
+(defstruct LintRusage [(words (array i64 18))])
+(extern getrusage :cc c [i32 (ptr LintRusage)] (-> i32))
+
+;;; ru_maxrss is bytes on Darwin and KiB on Linux.
+(defn lint-maxrss-unit [] (-> Code)
+  (if (primitive/code-eq (primitive/target-os) `darwin) `1 `1024))
+
+;;; The process's peak resident memory. None when the host does not report it,
+;;; and always on wasm, whose runtime has no getrusage.
+(defn lint-peak-rss-bytes [] (-> (Option i64))
+  (native-only
+    (let [usage (primitive/alloc-stack LintRusage)]
+      (if (= (getrusage 0 usage) (primitive/cast i32 0))
+          (Some (* (load (index (cast (ptr i64) (field usage words)) 4)) (lint-maxrss-unit)))
+          (None [i64])))
+    (None [i64])))
+
+;;; N/DIVISOR with one decimal digit.
+(defn lint-progress-tenths! [(w (ptr Writer)) (n i64) (divisor i64)] (-> i64)
+  (let [tenths (/ (* n 10) divisor)]
+    (ps w (i64->str (malloc-allocator) (/ tenths 10)))
+    (ps w ".")
+    (ps w (i64->str (malloc-allocator) (% tenths 10))))
+  0)
+
+;;; One analysis of T for PURPOSE, announced when it finishes (see LintProgress).
+(defn lint-analyze-for [(a (dyn Allocator)) (t (ptr LintTarget)) (purpose (slice u8))] (-> i64)
+  (let [progress (lint-progress)
+        started (tr/trace-now-ms)
+        ok (lint-analyze a t)]
+    (set! (.count progress) (+ (.count progress) 1))
+    (when (.on progress)
+      (let [w (stderr)]
+        (ps w "lint: analysis ")
+        (ps w (i64->str a (.count progress)))
+        (ps w " (")
+        (ps w purpose)
+        (ps w ") ")
+        (lint-progress-tenths! w (- (tr/trace-now-ms) started) 1000)
+        (ps w "s")
+        (match (lint-peak-rss-bytes)
+          (Some [peak]
+                (do (ps w ", peak ") (lint-progress-tenths! w peak 1073741824) (ps w " GB")))
+          (None [] 0))
+        (ps w "\n"))
+      0)
+    ok))
+
 ; The transactional part of `lint --fix` / `--diff`, and the report that follows.
 (defn lint-transaction [(a (dyn Allocator))
                         (t (ptr LintTarget))
@@ -19606,6 +19642,8 @@
     ; the round keeps only what compiles (lint-salvage-round).
     (set! (.rejected (lint-fix-outcome)) 0)
     (set! (.compiles (lint-fix-outcome)) false)
+    (set! (.count (lint-progress)) 0)
+    (set! (.on (lint-progress)) (and apply? (!= (isatty 2) (primitive/cast i32 0))))
     (when apply?
       (set! rc (lint-fix-loop a t (mut originals) announce)))
     ; PHASE 2 — one analysis with output. This is the report: what the checkers say
@@ -19646,7 +19684,7 @@
               (sug-reset)
               (diag-reset)
               (lint-set-errors-reset!)
-              (let [ok (lint-analyze a t)]
+              (let [ok (lint-analyze-for a t "report")]
                 (set! (.compiles (lint-fix-outcome)) (!= ok (primitive/cast i64 0)))
                 (if (= ok (primitive/cast i64 0))
                     (set! rc 1)
@@ -19769,7 +19807,7 @@
 (defn lint-compiles? [(a (dyn Allocator)) (t (ptr LintTarget))] (-> bool)
   (sug-reset)
   (diag-reset)
-  (!= (lint-analyze a t) 0))
+  (!= (lint-analyze-for a t "salvaging a round") 0))
 
 ;;; Report group G of the round as not applied, and remember its fixes.
 (defn lint-reject-group! [(a (dyn Allocator))
@@ -19865,7 +19903,10 @@
     (loop (do
             (sug-reset)
             (diag-reset)
-            (let [ok (lint-analyze a t)
+            (let [ok (lint-analyze-for a t
+                                       (if (= (load rounds) (primitive/cast i64 0))
+                                           "the starting tree"
+                                           (sconcat a "fix round " (i64->str a (load rounds)))))
                   failed (and (= ok (primitive/cast i64 0)) (= (sug-repairs) 0))]
               ; The program does not compile. Before the first edit that is simply the
               ; state of the file — phase 2 will say so. After one it means a fix we
@@ -22944,7 +22985,7 @@ Pipeline stage dumps (for debugging the compiler itself), each <file.coil>
               (ps w
                   "  --diff         preview the complete --fix fixpoint; write nothing\n")
               (ps w
-                  "  --fix          apply them, re-analysing to a fixpoint (max 8 rounds)\n")
+                  "  --fix          apply them, re-analysing to a fixpoint\n")
               (ps w
                   "The standard safe-fix profile runs automatically; --use adds project or policy\n")
               (ps w

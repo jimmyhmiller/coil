@@ -4711,7 +4711,7 @@ cat > "$T/variant/bare.coil" <<'EOF'
 (defn code [(e socket/SocketError)] (-> i64) (match e (Closed [] 1) (_ 0)))
 (defn main [] (-> i64) (code (socket/Closed)))
 EOF
-expect_rc 0 "match: alias-qualified variants plus a `_` arm RUN correctly" \
+expect_rc 0 "match: alias-qualified variants plus a \`_\` arm RUN correctly" \
   bash -c 'cd "$1" && COIL_NAMESPACE_ROOTS=. "$2" build v.coil -o v && ./v' \
   _ "$T/variant" "$COIL"
 expect_rc_arm64 0 "match: same on the arm64 backend" \
