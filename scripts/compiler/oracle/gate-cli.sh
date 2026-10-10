@@ -526,6 +526,17 @@ TMPDIR="$TT" "$COIL" build "$T/seven.coil" -o "$T/link-clean-success" >/dev/null
   || bad "temporary sweep" "program pid: [$prog_pid] kept while running: [$kept] left after: [$(temp_left)]"
 expect_rc 1 "bogus --target is rejected"                 "$COIL" build "$T/seven.coil" -o "$T/c" --target not-a-real-triple
 
+echo "== a block is left only by a labelled break =="
+# An unlabeled break or continue inside (block* :label …) belongs to the loop around
+# it (tests/compiler/features/block_break.coil runs the cases); with no loop, or with
+# the loop's label shadowed by the block's, there is nothing it can mean.
+printf '(module block-no-loop)\n(defn main [] (-> i64) (block* :b (break)) 0)\n' > "$T/block-no-loop.coil"
+expect_out "break inside a block has no enclosing loop" "a break in a block with no loop around it is an error" \
+  "$COIL" check "$T/block-no-loop.coil"
+printf '(module block-shadow)\n(defn main [] (-> i64) (loop :b (block* :b (break))) 0)\n' > "$T/block-shadow.coil"
+expect_out "cannot reach the enclosing loop with the same label" "a block shadowing its loop's label is an error" \
+  "$COIL" check "$T/block-shadow.coil"
+
 echo "== check mode: typecheck/compile with no object (diag-12) =="
 # `build -o /dev/null` USED to SIGABRT with a bare 'LLVMTargetMachineEmitToFile ...
 # Operation not permitted' (exit 134) because /dev is unwritable. It now routes to the
