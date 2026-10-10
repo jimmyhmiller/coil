@@ -21,7 +21,7 @@ for level in ("-O0", "-O3"):
     invoke("run", source, level)
 ir = invoke("emit-ir", source)
 assert "target datalayout" in ir, ir
-snapshot = re.search(r"define[^\n]*@test\.aggregate-spill-snapshot\.snapshot\([^\n]*\)\s*\{(.*?)\n\}", ir, re.S)
+snapshot = re.search(r"define[^\n]*@test\.aggregate-spill-snapshot\.snapshot\([^\n]*\)[^\n{]*\{(.*?)\n\}", ir, re.S)
 assert snapshot, "snapshot function missing from emitted IR"
 body = snapshot.group(1)
 assert "@llvm.memcpy." in body and "i64 6144" in body, body
@@ -32,11 +32,11 @@ for level in ("-O0", "-O3"):
     invoke("run", copy_source, level)
 copy_ir = invoke("emit-ir", copy_source)
 assert "target datalayout" in copy_ir, copy_ir
-copy = re.search(r"define[^\n]*@test\.aggregate-store-copy\.copy-block\([^\n]*\)\s*\{(.*?)\n\}", copy_ir, re.S)
+copy = re.search(r"define[^\n]*@test\.aggregate-store-copy\.copy-block\([^\n]*\)[^\n{]*\{(.*?)\n\}", copy_ir, re.S)
 assert copy, "copy-block function missing from emitted IR"
 assert "@llvm.memmove." in copy.group(1) and "i64 16384" in copy.group(1), copy.group(1)
 assert not re.search(r"(?:load|store) %test\.aggregate-store-copy\.Block", copy.group(1)), copy.group(1)
-items = re.search(r"define[^\n]*@test\.aggregate-store-copy\.copy-items\([^\n]*\)\s*\{(.*?)\n\}", copy_ir, re.S)
+items = re.search(r"define[^\n]*@test\.aggregate-store-copy\.copy-items\([^\n]*\)[^\n{]*\{(.*?)\n\}", copy_ir, re.S)
 assert items and "@llvm.memmove." in items.group(1), "array assignment must use an overlap-safe bulk copy"
 assert not re.search(r"(?:load|store) \[2048 x", items.group(1)), items.group(1)
 result_source = "tests/compiler/features/aggregate_call_result_copy.coil"
@@ -45,7 +45,7 @@ for level in ("-O0", "-O3"):
 result_ir = invoke("emit-ir", result_source)
 assert "target datalayout" in result_ir, result_ir
 def function_body(ir, prefix, name):
-    fn = re.search(r"define[^\n]*@" + re.escape(prefix + name) + r"\([^\n]*\)\s*\{(.*?)\n\}", ir, re.S)
+    fn = re.search(r"define[^\n]*@" + re.escape(prefix + name) + r"\([^\n]*\)[^\n{]*\{(.*?)\n\}", ir, re.S)
     assert fn, f"{name} missing from emitted IR"
     return fn.group(1)
 

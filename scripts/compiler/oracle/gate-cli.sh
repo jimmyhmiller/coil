@@ -577,9 +577,82 @@ slice-get|index out of bounds: index 6, len 3.*safety_checks.coil:29:
 subslice|start index 3 is larger than end index 2.*safety_checks.coil:30:
 generic|integer overflow.*in generic code
 CASES
+  # A panic report ends with the stack trace, which needs the frame records below.
+  out=$("$T/safety-checks" index 2>&1)
+  case "$out" in
+    *"stack trace:"*) ok "safety: a panic prints the stack trace" ;;
+    *) bad "safety: a panic prints the stack trace" "$out" ;;
+  esac
+  if [ "$HOST_OS" = Darwin ]; then
+    expect_out "coil\.safety\.runtime\.finish! .*main \+" "safety: the trace reaches main" \
+      sh -c "'$T/safety-checks' index 2>&1 | tr '\n' ' '"
+  fi
 else
   bad "safety: the checks fixture builds under coil.safety" "$("$COIL" build "$SC" -o "$T/safety-checks" --use coil.safety 2>&1 | head -5)"
 fi
+
+echo "== frame records: a backtrace sees every Coil frame =="
+# LLVM saves x29 in a prologue but points it at the new frame record only when the
+# function carries "frame-pointer"; without it backtrace(3) on Darwin skipped every
+# Coil frame and printed one. The value follows the platform's C compiler, and every
+# definition carries it. emit-ir shows that for each target, whatever the host.
+FR=tests/compiler/features/frame_records.coil
+while IFS='|' read -r triple want; do
+  ir=$("$COIL" emit-ir "$FR" --target "$triple" 2>&1); rc=$?
+  case "$ir" in
+    *"target datalayout"*) ;;
+    *) bad "frame-pointer: emit-ir for $triple" "rc=$rc: ${ir:0:300}"; continue ;;
+  esac
+  got=$(python3 -c '
+import re, sys
+ir = sys.stdin.read()
+groups = dict(re.findall(r"^attributes #(\d+) = \{(.*)\}$", ir, re.M))
+kinds = set()
+for line in re.findall(r"^define .*$", ir, re.M):
+    found = [re.search(r"\"frame-pointer\"=\"([a-z-]+)\"", groups.get(g, ""))
+             for g in re.findall(r"#(\d+)", line.split(")")[-1])]
+    kinds.add(next((m.group(1) for m in found if m), "none"))
+print(" ".join(sorted(kinds)))' <<<"$ir")
+  if [ "$got" = "$want" ]; then
+    ok "frame-pointer: every function for $triple is \"$want\""
+  else
+    bad "frame-pointer: every function for $triple is \"$want\"" "got: $got"
+  fi
+done <<'TARGETS'
+aarch64-apple-darwin24.0.0|non-leaf
+x86_64-apple-macosx14.0.0|all
+aarch64-unknown-linux-gnu|non-leaf
+x86_64-pc-linux-gnu|none
+wasm32-unknown-unknown|none
+TARGETS
+backends="llvm"
+[ "$HOST_OS-$HOST_ARCH" = Darwin-arm64 ] && backends="llvm arm64"
+for backend in $backends; do
+  for level in -O0 -O3; do
+    if "$COIL" build "$FR" -o "$T/frame-records" --backend "$backend" "$level" >/dev/null 2>&1; then
+      out=$("$T/frame-records" 2>&1)
+      if [ "$HOST_OS" = Darwin ]; then
+        # backtrace_symbols names each frame; the levels must appear in call order
+        flat=$(tr '\n' ' ' <<<"$out")
+        if grep -qE "frame-records\.trace .*frame-records\.level3 .*frame-records\.level2 .*frame-records\.level1 .*main " <<<"$flat"; then
+          ok "frame records: $backend $level traces every level"
+        else
+          bad "frame records: $backend $level traces every level" "$out"
+        fi
+      else
+        # glibc names no internal symbol; count the frames inside the program
+        frames=$(grep -c "frame-records(" <<<"$out")
+        if [ "$frames" -ge 5 ]; then
+          ok "frame records: $backend $level traces every level"
+        else
+          bad "frame records: $backend $level traces every level" "$frames frames: $out"
+        fi
+      fi
+    else
+      bad "frame records: $backend $level builds" "$("$COIL" build "$FR" -o "$T/frame-records" --backend "$backend" "$level" 2>&1 | head -5)"
+    fi
+  done
+done
 
 echo "== check mode: typecheck/compile with no object (diag-12) =="
 # `build -o /dev/null` USED to SIGABRT with a bare 'LLVMTargetMachineEmitToFile ...

@@ -20,7 +20,7 @@ ir = run(compiler, "emit-ir", source)
 assert "target datalayout" in ir
 for name, forced in (("walk", False), ("spin", True)):
     body = re.search(r'define[^\n]*@"?tail-borrowed-temporary\.' + name +
-                     r'"?\([^\n]*\)\s*\{(.*?)\n\}', ir, re.S)
+                     r'"?\([^\n]*\)[^\n{]*\{(.*?)\n\}', ir, re.S)
     assert body, (name, ir[-4000:])
     assert ("musttail" in body.group(1)) == forced, (name, body.group(1))
 with tempfile.TemporaryDirectory(prefix="coil-tail-borrow-") as tmp:
