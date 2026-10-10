@@ -536,6 +536,11 @@ expect_out "break inside a block has no enclosing loop" "a break in a block with
 printf '(module block-shadow)\n(defn main [] (-> i64) (loop :b (block* :b (break))) 0)\n' > "$T/block-shadow.coil"
 expect_out "cannot reach the enclosing loop with the same label" "a block shadowing its loop's label is an error" \
   "$COIL" check "$T/block-shadow.coil"
+# A block inside a scope does not hide an unlabeled break from the scope's check: the
+# break would leave the scope past its defers.
+printf '(module scope-block)\n(defn main [] (-> i64) (loop (scope :s (defer 0) (block :b (break)))) 0)\n' > "$T/scope-block.coil"
+expect_out "an unlabeled break/continue cannot exit a \\(scope" "a break in a block cannot leave a scope past its defers" \
+  "$COIL" check "$T/scope-block.coil"
 
 echo "== check mode: typecheck/compile with no object (diag-12) =="
 # `build -o /dev/null` USED to SIGABRT with a bare 'LLVMTargetMachineEmitToFile ...
