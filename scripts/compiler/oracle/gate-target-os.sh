@@ -53,12 +53,15 @@ cat > "$WORK/flags.coil" <<'EOF'
   (print-int (stdout) O_CREAT) (print-int (stdout) O_TRUNC) 0)
 EOF
 
+# The literal is the call's LAST argument. Match it by callee and position only:
+# print-int returns a Result, so whether an sret pointer leads the argument list
+# is an ABI detail, and pinning the first argument once made this gate read ''.
 folded() {  # folded <triple-or-empty> -> the two folded literals, space separated
   if [ -z "$1" ]; then
     "$BIN" emit-ir "$WORK/flags.coil" 2>/dev/null
   else
     "$BIN" emit-ir "$WORK/flags.coil" --target "$1" 2>/dev/null
-  fi | grep -o 'print-int(ptr %call[0-9]*, i64 [0-9]*' | grep -o '[0-9]*$' | tr '\n' ' '
+  fi | grep -o '@coil\.io\.print-int(.*, i64 [0-9]*)$' | grep -o '[0-9]*)$' | tr -d ')' | tr '\n' ' '
 }
 
 check() {  # check <label> <got> <want>
