@@ -34,6 +34,7 @@ A directory with no `Coil.toml` is an error, not a project.
 coil run                    # build and run the package; args after -- go to the program
 coil build                  # build/release/<package-name>
 coil build --debug          # DWARF symbols, build/debug/<package-name>
+coil build --profile safe   # a [profile.safe] build, build/safe/<package-name>
 coil check                  # typecheck the entry graph and every test file; no codegen
 coil test                   # run the test suites (see TESTING.md)
 coil fmt --write            # format the project's sources
@@ -59,6 +60,7 @@ inputs and metaprograms as a bare `coil build`, and writes
 | `[workspace]` | `name`, `members` | A root that groups several packages (replaces `[package]`) |
 | `[dependencies]` | `NAME = { path … }` or `{ git … }` | Other Coil packages |
 | `[build]` | `out`, `optimization`, `target`, `debug` | Defaults for the package executable |
+| `[profile.NAME]` | `inherits`, `optimization`, `debug`, `debug-checks`, `use` | A named build configuration (`--profile NAME`) |
 | `[run]` | `args` | Arguments `coil run` passes to the program |
 | `[artifacts.NAME]` | `kind`, `entry`, `out`, `optimization`, link keys | Extra objects and executables |
 | `[link]` | `libs`, `frameworks`, `search-paths`, `objects`, `flags` | Native link inputs |
@@ -264,6 +266,39 @@ apart two libraries that define the same symbols. Object artifacts are not
 linked, so link keys on them are errors. Output paths are relative to the
 manifest and must all differ.
 
+## Build profiles
+
+A profile is a named build configuration. `release` is the default and `debug`
+is what `--debug` selects; a `[profile.NAME]` section defines another, or adds to
+one of those two.
+
+```toml
+[profile.safe]
+inherits = "release"          # start from release (the default) or debug
+use = ["coil.safety"]         # metaprograms added to [metaprograms] use
+
+[profile.checked]
+inherits = "debug"            # DWARF symbols
+debug-checks = true           # the library's invariant checks
+optimization = 1
+```
+
+```sh
+coil build --profile safe   # build/safe/<package-name>
+coil test --profile safe    # the tests, built under coil.safety
+```
+
+- `--profile NAME` selects one for `build`, `run`, `check`, `test`, `lint` and
+  `install`; `--debug` is `--profile debug`. With neither, `[build] debug = true`
+  selects `debug`, and otherwise `release`.
+- The output goes to `build/<NAME>/`.
+- `[build] optimization` is where every profile starts; a profile's own
+  `optimization` replaces it. A flag on the command line (`-O2`) still wins.
+- A profile inherits everything its `inherits` names, and its own keys take
+  precedence. A profile with no `inherits` starts from `release`.
+- Only the package's own profiles apply; a dependency's are ignored. Outside a
+  project `--profile` is an error.
+
 ## Metaprograms for the whole project
 
 ```toml
@@ -274,7 +309,8 @@ use = ["myproj.gcauto", "httptap"]
 Each namespace is imported into every compile the project runs: `build`,
 `run`, `check`, `test` and `lint`. A library can ship a checker or a transform,
 and a consumer turns it on with one line. The command-line form is
-`--use NAME`. See the language guide's metaprogram section for writing one.
+`--use NAME`, and a profile's `use` adds to the list for the builds that select
+it. See the language guide's metaprogram section for writing one.
 
 ## Reading other file formats as modules
 

@@ -811,6 +811,55 @@ rm -rf "$T/install-root"
   && ok "COIL_INSTALL_ROOT selects the install prefix" \
   || bad "COIL_INSTALL_ROOT" "missing $T/install-root/bin/proj"
 
+echo "== Coil.toml build profiles =="
+# [profile.NAME]: a profile's settings and metaprograms apply to the command that
+# selects it, and its output goes to build/<NAME>/.
+PRJ="$T/profiles"; mkdir -p "$PRJ/src"
+cat > "$PRJ/Coil.toml" <<'EOF2'
+[package]
+name = "prof"
+entry = "src/main.coil"
+
+[profile.safe]
+inherits = "release"
+use = ["coil.safety"]
+
+[profile.checked]
+inherits = "debug"
+debug-checks = true
+EOF2
+cat > "$PRJ/src/main.coil" <<'EOF2'
+(module prof.main)
+(import "coil.args" :as args)
+(import "coil.slice" :use [slice-get])
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (args/args-set! argc argv)
+  (if (= (args/args-nth 1) "index")
+      (slice-get [1 2 3] (+ 2 (args/args-count)))
+      (do (println "{}" (+ 9223372036854775807 (args/args-count))) 0)))
+EOF2
+( cd "$PRJ" && "$COIL" build >/dev/null 2>&1 ) && [ -x "$PRJ/build/release/prof" ] \
+  && expect_out "^-9223372036854775808$" "profiles: the default release build wraps" "$PRJ/build/release/prof" \
+  || bad "profiles: the default build writes build/release/prof" "$(ls "$PRJ/build" 2>&1)"
+( cd "$PRJ" && "$COIL" build --profile safe >/dev/null 2>&1 ) && [ -x "$PRJ/build/safe/prof" ] \
+  && expect_crash_out "panic: integer overflow" "profiles: --profile safe applies its metaprograms, into build/safe/" "$PRJ/build/safe/prof" \
+  || bad "profiles: --profile safe writes build/safe/prof" "$(ls "$PRJ/build" 2>&1)"
+expect_out "slice-get index out of bounds \\(--debug-checks\\)" "profiles: a profile turns on debug-checks" \
+  sh -c "cd '$PRJ' && '$COIL' run --profile checked -- index"
+expect_out "unknown profile 'nope'; the profiles are release, debug, safe, checked" "profiles: an unknown profile lists the real ones" \
+  sh -c "cd '$PRJ' && '$COIL' build --profile nope"
+cp "$PRJ/Coil.toml" "$PRJ/Coil.toml.base"
+printf '\n[profile.a]\ninherits = "b"\n\n[profile.b]\ninherits = "a"\n' >> "$PRJ/Coil.toml"
+expect_out "profile 'a' inherits from itself" "profiles: an inheritance cycle is an error" \
+  sh -c "cd '$PRJ' && '$COIL' build --profile a"
+cp "$PRJ/Coil.toml.base" "$PRJ/Coil.toml"
+printf '\n[profile.x]\nspeed = 3\n' >> "$PRJ/Coil.toml"
+expect_out "unknown key 'speed' in \\[profile.x\\]" "profiles: an unknown profile key is an error" \
+  sh -c "cd '$PRJ' && '$COIL' build"
+cp "$PRJ/Coil.toml.base" "$PRJ/Coil.toml"
+expect_out "no Coil.toml here" "profiles: --profile outside a project is an error" \
+  sh -c "cd '$T' && '$COIL' build seven.coil --profile safe -o seven-profile"
+
 echo "== Coil.toml dependencies and strict manifest errors =="
 # Dependency roots participate in the namespace index; Git dependencies are checked
 # out at an exact SHA.
