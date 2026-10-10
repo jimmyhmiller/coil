@@ -173,7 +173,9 @@ def codegen(compiler: str) -> None:
                 tables = re.findall(r"\btbl(?:\.\w+)?\s+[^\n{]+\{([^}]+)\}", body)
                 if not any(len(re.findall(r"\bv\d+", registers)) == width // 16 for registers in tables):
                     raise AssertionError(f"codegen: expected NEON {width}-byte table lookup\n{body}")
-            for name, pattern in [("simd_classify16", r"\baddv(?:\.|\s)"),
+            # mask->bits sums the weighted lanes across the vector: one addv, or (as
+            # LLVM 23 lowers it) a chain of pairwise addp on the 16-byte register.
+            for name, pattern in [("simd_classify16", r"\b(?:addv(?:\.|\s)|addp(?:\.16b|\s+v\d+\.16b))"),
                                   ("simd_scan16", r"\badd(?:\.16b|\s+v\d+\.16b)")]:
                 if not re.search(pattern, functions[name]):
                     raise AssertionError(f"codegen: missing vector operation in {name}\n{functions[name]}")
