@@ -1,0 +1,259 @@
+;;; A parallel Mandelbrot renderer.
+;;;
+;;; Renders the set twice: once with a scalar kernel on one thread, as the reference,
+;;; then with a `coil.simd` f64 kernel (16 lanes on arm64, 8 on x86-64) on a pool of
+;;; `coil.thread` workers that claim rows from an atomic counter. It checks that the
+;;; two images agree bit for bit, reports both timings, prints an ASCII thumbnail, and
+;;; writes the image as a binary PPM (P6) with a smooth color palette.
+;;;
+;;;   coil run examples/mandelbrot
+;;;   coil run examples/mandelbrot -- --width 1920 --height 1080 --iterations 2000 --threads 8 --out build/big.ppm
+;;;
+;;; The output path is relative to the package directory; the default is
+;;; build/mandelbrot.ppm. --threads defaults to the number of CPUs. Sample output on
+;;; a 12-core Apple M2 Max:
+;;;
+;;;                                ............::..........
+;;;                             ...............:::::.........
+;;;                           ................::-@-:..........
+;;;                        ..................::@@@@+:...........
+;;;                     ...............::::::::@@@@-:::....:.....
+;;;                  .................:-@=:-%@@@@@@@@@@::=:-:.....
+;;;              ....................:::-@@@@@@@@@@@@@@@@@@-.......
+;;;           ..........-:.........::-@@@@@@@@@@@@@@@@@@@@@+::.....
+;;;        .............:-:::::::::::@@@@@@@@@@@@@@@@@@@@@@@*-......
+;;;       ..............::-@+@@@@+::+@@@@@@@@@@@@@@@@@@@@@@@+:......
+;;;      ............::::-@@@@@@@@@-@@@@@@@@@@@@@@@@@@@@@@@@-.......
+;;;      .....:.::::::-@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@:.........
+;;;      .....:.::::::-@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@:.........
+;;;      ............::::-@@@@@@@@@-@@@@@@@@@@@@@@@@@@@@@@@@-.......
+;;;       ..............::-@+@@@@+::+@@@@@@@@@@@@@@@@@@@@@@@+:......
+;;;        .............:-:::::::::::@@@@@@@@@@@@@@@@@@@@@@@*-......
+;;;           ..........-:.........::-@@@@@@@@@@@@@@@@@@@@@+::.....
+;;;              ....................:::-@@@@@@@@@@@@@@@@@@-.......
+;;;                  .................:-@=:-%@@@@@@@@@@::=:-:.....
+;;;                     ...............::::::::@@@@-:::....:.....
+;;;                        ..................::@@@@+:...........
+;;;                           ................::-@-:..........
+;;;                             ...............:::::.........
+;;;                                ............::..........
+;;;
+;;;   800x600 pixels, 1000 max iterations
+;;;     scalar   1 lane    1 thread      364.6 ms
+;;;     simd    16 lanes  12 threads      20.2 ms   18.0x faster
+;;;     checksum b5ee2c787d87eaf5, identical for both kernels
+;;;     wrote build/mandelbrot.ppm
+(module examples.mandelbrot.main)
+(import "coil.alloc" :as alloc :use [Allocator malloc-allocator])
+(import "coil.args" :use [args-set! args-count args-nth])
+(import "coil.arraylist" :use [ArrayList al-new al-free! al-slice])
+(import "coil.fs" :as fs)
+(import "coil.io"
+        :use
+        [IoError Eof Errno LineTooLong OutOfMemory InvalidLimit stderr])
+(import "coil.os" :as os)
+(import "coil.slice" :use [slice-new subslice])
+(import "coil.str" :use [str->cstr cstr->str])
+(import "coil.thread" :use [available-parallelism])
+(import "coil.time" :use [Instant TimeError monotonic-now time-error-code])
+(import "coil.try" :use [try try!])
+(import "examples.mandelbrot.kernel" :use [LANES])
+(import "examples.mandelbrot.render"
+        :use
+        [Viewport
+         EscapeImage
+         plane-new
+         render-scalar
+         render-parallel
+         images-equal?
+         checksum
+         RenderError])
+(import "examples.mandelbrot.options"
+        :use
+        [Options OptionError parse-options USAGE])
+(import "examples.mandelbrot.image" :use [write-ppm print-ascii])
+
+;; The whole set, slightly off-center so the main cardioid sits in the middle.
+(def VIEW
+  (Viewport
+    :center-re -0.65
+    :center-im 0.0
+    :span 3.0))
+
+(const THUMBNAIL-COLUMNS 64)
+
+(const THUMBNAIL-ROWS 24)
+
+;; A terminal cell is about twice as tall as it is wide.
+(const TERMINAL-CELL-ASPECT 2.0)
+
+(defsum AppError
+  (BadOptions [(error OptionError)])
+  (RenderFailed [(error RenderError)])
+  (KernelsDisagree)
+  (ClockFailed [(error TimeError)])
+  (WriteFailed [(path (slice u8)) (error IoError)]))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (args-set! argc argv)
+  (match (run (malloc-allocator))
+    (Ok [_] 0)
+    (Err [e]
+         (report e)
+         1)))
+
+(defn run [(a (dyn Allocator))] (-> (Result i64 AppError))
+  (let [(mut args) (command-line a)
+        parsed (parse-options (al-slice args) (default-options))]
+    (al-free! (mut args))
+    (try (let [options
+                 (match parsed
+                   (Ok [options] options)
+                   (Err [e] (return-from :try (Err (BadOptions e)))))]
+           (print-thumbnail a (.max-iter options))
+           (render-and-save a options)))))
+
+(defn default-options [] (-> Options)
+  (Options :width
+           800
+           :height
+           600
+           :max-iter
+           1000
+           ;; A guess for the rare system that will not say how many CPUs it has.
+           :threads
+           (try (try-or! (available-parallelism) 4))
+           :out
+           "build/mandelbrot.ppm"))
+
+;;; The program's arguments, without the program name.
+(defn command-line [(a (dyn Allocator))] (-> (ArrayList (slice u8)))
+  (let [(mut args) (al-new [(slice u8)] a)]
+    (for i
+      (range 1 (args-count))
+      (push! (mut args) (args-nth i)))
+    args))
+
+(defn print-thumbnail [(a (dyn Allocator)) (max-iter i64)] (-> void)
+  (let [plane
+          (plane-new a
+                     VIEW
+                     THUMBNAIL-COLUMNS
+                     THUMBNAIL-ROWS
+                     TERMINAL-CELL-ASPECT)]
+    (print-ascii (render-scalar a plane max-iter))))
+
+(defn render-and-save [(a (dyn Allocator)) (options Options)] (-> (Result i64
+                                                                          AppError))
+  (let [(Options
+          :width width
+          :height height
+          :max-iter max-iter
+          :threads threads
+          :out out)
+          options
+        plane (plane-new a VIEW width height 1.0)]
+    (try (let [t0 (try! (now))
+               reference (render-scalar a plane max-iter)
+               t1 (try! (now))
+               image
+                 (match (render-parallel a plane max-iter threads)
+                   (Ok [image] image)
+                   (Err [e] (return-from :try (Err (RenderFailed e)))))
+               t2 (try! (now))
+               scalar-ms (elapsed-ms t0 t1)
+               simd-ms (elapsed-ms t1 t2)]
+           (unless (images-equal? reference image)
+             (return-from :try (Err (KernelsDisagree))))
+           (println "")
+           (println "{}x{} pixels, {} max iterations" width height max-iter)
+           (println "  scalar   1 lane    1 thread   {:>8.1} ms" scalar-ms)
+           (println "  simd    {:>2} lanes  {:>2} threads  {:>8.1} ms   {:.1}x faster"
+                    LANES
+                    threads
+                    simd-ms
+                    (/ scalar-ms simd-ms))
+           (println "  checksum {:016x}, identical for both kernels"
+                    (checksum image))
+           (try! (save a out image))
+           (println "  wrote {}" out)
+           (Ok 0)))))
+
+(defn now [] (-> (Result Instant AppError))
+  (match (monotonic-now)
+    (Ok [instant] (Ok instant))
+    (Err [e] (Err (ClockFailed e)))))
+
+(defn elapsed-ms [(start Instant) (end Instant)] (-> f64)
+  (+ (* (cast f64 (- (.sec end) (.sec start))) 1000.0)
+     (/ (cast f64 (- (.nsec end) (.nsec start))) 1000000.0)))
+
+(defn save [(a (dyn Allocator)) (path (slice u8)) (image (ref EscapeImage))] (-> (Result i64
+                                                                                         AppError))
+  (match (write-creating-dir a path image)
+    (Ok [n] (Ok n))
+    (Err [e] (Err (WriteFailed path e)))))
+
+(defn write-creating-dir [(a (dyn Allocator))
+                          (path (slice u8))
+                          (image (ref EscapeImage))] (-> (Result i64 IoError))
+  (try (try! (ensure-parent-dir a path))
+       (write-ppm a path image)))
+
+;;; Create the directory `path` is in, if it has one and it does not exist yet. Only
+;;; the last level is created, which is all the default `build/` output needs.
+(defn ensure-parent-dir [(a (dyn Allocator)) (path (slice u8))] (-> (Result i64
+                                                                            IoError))
+  (match (last-slash path)
+    (None [] (Ok 0))
+    (Some [at]
+          (let [dir (subslice path 0 at)]
+            (try (if (try! (fs/exists? a dir)) (Ok 0) (make-dir a dir)))))))
+
+(defn last-slash [(path (slice u8))] (-> (Option i64))
+  (block :search
+         (for i
+           (range 0 (len path))
+           (let [at (- (len path) 1 i)]
+             (when (= (get path at) #\/)
+               (return-from :search (Some at)))))
+         (None)))
+
+(defn make-dir [(a (dyn Allocator)) (dir (slice u8))] (-> (Result i64 IoError))
+  (let [cdir (str->cstr a dir)]
+    (if (= cdir (cast (ptr i8) 0))
+        (Err (OutOfMemory))
+        (let [status (fs/make-dir cdir 493)
+              errno (os/os-errno)]
+          ;; str->cstr allocated the bytes of `dir` plus a terminating NUL.
+          (alloc/free a (slice-new (cast (ptr u8) cdir) (+ (len dir) 1)))
+          (if (= status 0) (Ok 0) (Err (Errno errno)))))))
+
+(defn report [(e AppError)] (-> void)
+  (match e
+    (BadOptions [error]
+                (fmt (stderr) "mandelbrot: {}\n" error)
+                (fmt (stderr) "{}\n" USAGE))
+    (RenderFailed [error] (fmt (stderr) "mandelbrot: {}\n" error))
+    (KernelsDisagree []
+                     (fmt (stderr)
+                          "mandelbrot: the SIMD kernel disagrees with the scalar kernel\n"))
+    (ClockFailed [error]
+                 (fmt (stderr)
+                      "mandelbrot: cannot read the monotonic clock (error {})\n"
+                      (time-error-code error)))
+    (WriteFailed [path error]
+                 (fmt (stderr)
+                      "mandelbrot: cannot write {}: {}\n"
+                      path
+                      (io-error-text error)))))
+
+(extern strerror :cc c [i32] (-> (ptr i8)))
+
+(defn io-error-text [(e IoError)] (-> (slice u8))
+  (match e
+    (Errno [code] (cstr->str (strerror (cast i32 code))))
+    (OutOfMemory [] "out of memory")
+    (Eof [] "unexpected end of file")
+    (LineTooLong [] "line too long")
+    (InvalidLimit [] "invalid limit")))

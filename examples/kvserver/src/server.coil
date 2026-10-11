@@ -1,0 +1,212 @@
+(module examples.kvserver.server)
+(import "coil.alloc" :as alloc)
+(import "coil.arraylist" :use [ArrayList al-new al-slice al-extend! al-free!])
+(import "coil.http.parser" :use [HPE_INVALID_EOF_STATE])
+(import "coil.http.server" :as http)
+(import "coil.selectors" :as selectors)
+(import "coil.slice" :use [slice-data subslice])
+(import "coil.socket" :as socket :use [TcpConnection TcpListener SocketError])
+(import "coil.str" :use [cstr->str])
+(import "coil.time" :as time)
+(import "coil.try" :use [try try!])
+(import "examples.kvserver.handler" :use [handle])
+(import "examples.kvserver.response"
+        :use
+        [Response ApiError Malformed TooLarge error-response render])
+(import "examples.kvserver.store" :use [Store])
+
+(extern strerror :cc c [i32] (-> (ptr i8)))
+
+;; coil.http.server documents error code 1000 as "a configured size/count limit"
+;; (headers over 64 KiB, more than 100 of them, or a body over 8 MiB) but exports
+;; no name for it.
+(const PARSER-LIMIT-EXCEEDED 1000)
+
+;;; Bytes received on a connection that no complete request has consumed yet. A
+;;; request can arrive split across reads, and a pipelining client can send several
+;;; in one.
+(defstruct Inbox [(allocator (dyn alloc/Allocator)) (bytes (ArrayList u8))])
+
+(impl Inbox
+  ;;; An empty inbox that buffers in `a`.
+  (new [(a (dyn alloc/Allocator))]
+       (-> Inbox)
+       (Inbox :allocator a :bytes (al-new [u8] a)))
+
+  (unread [(inbox (ref Inbox))]
+          (-> (slice u8))
+          (al-slice (.bytes inbox)))
+
+  (append! [(inbox (mut Inbox)) (data (slice u8))]
+           (-> void)
+           (al-extend! (mut (.bytes inbox)) (slice-data data) (len data)))
+
+  ;;; Discard the first `n` bytes, keeping whatever follows them.
+  (consume! [(inbox (mut Inbox)) (n i64)]
+            (-> void)
+            (let [all (unread inbox)
+                  rest (subslice all n (len all))
+                  (mut kept) (al-new [u8] (.allocator inbox))]
+              (al-extend! (mut kept) (slice-data rest) (len rest))
+              (al-free! (mut (.bytes inbox)))
+              (set! (.bytes inbox) kept))))
+
+(impl Drop Inbox
+  (drop [(self (mut Inbox))]
+        (-> void)
+        (al-free! (mut (.bytes self)))))
+
+;;; Whether a connection stays open after an exchange.
+(defsum Next (KeepOpen) (Hangup))
+
+(defn os-error-text [(errno i64)] (-> (slice u8))
+  (cstr->str (strerror (cast i32 errno))))
+
+(defn socket-error-text [(error SocketError)] (-> (slice u8))
+  (match error
+    (socket/InvalidAddress [] "invalid address")
+    (socket/Closed [] "socket is closed")
+    (socket/OpenFailed [errno] (os-error-text errno))
+    (socket/OptionFailed [errno] (os-error-text errno))
+    (socket/BindFailed [errno] (os-error-text errno))
+    (socket/ListenFailed [errno] (os-error-text errno))
+    (socket/AcceptFailed [errno] (os-error-text errno))
+    (socket/ConnectFailed [errno] (os-error-text errno))
+    (socket/IoFailed [errno] (os-error-text errno))))
+
+;;; The `Connection` header a response needs. HTTP/1.1 persists by default, so only
+;;; closing is announced; an HTTP/1.0 client that asked to keep the connection is
+;;; told it was kept, since 1.0 closes by default.
+(defn connection-header [(keep-alive bool) (version (slice u8))] (-> (Option (slice u8)))
+  (cond (not keep-alive) (Some "close")
+        (= version "HTTP/1.0") (Some "keep-alive")
+        :else (None)))
+
+(defn send-all! [(conn (ptr TcpConnection)) (bytes (slice u8))] (-> (Result i64
+                                                                            SocketError))
+  (let [(mut sent) 0]
+    (try (while (< sent (len bytes))
+           (let [rest (subslice bytes sent (len bytes))]
+             (set! sent
+                   (+ sent
+                      (try! (socket/tcp-write conn
+                                              (cast (ptr i8) (slice-data rest))
+                                              (len rest)))))))
+         (Ok sent))))
+
+(defn send-response! [(a (dyn alloc/Allocator))
+                      (conn (ptr TcpConnection))
+                      (response (ref Response))
+                      (connection (Option (slice u8)))] (-> (Result i64
+                                                                    SocketError))
+  (let [wire (render a response connection)
+        result (send-all! conn wire)]
+    (alloc/free a wire)
+    result))
+
+;;; Answer the complete request at the front of the inbox, then drop its bytes.
+(defn exchange! [(a (dyn alloc/Allocator))
+                 (store (mut Store))
+                 (conn (ptr TcpConnection))
+                 (inbox (mut Inbox))
+                 (request http/Request)] (-> (Result Next SocketError))
+  (let [keep-alive (http/keep-alive? request)
+        response (handle a (mut store) request)
+        sent
+          (send-response! a
+                          conn
+                          response
+                          (connection-header keep-alive (http/version request)))]
+    (println "{} {} -> {}"
+             (http/method request)
+             (http/target request)
+             (.status response))
+    ;; The request's method, target and headers borrow the inbox, so it is freed
+    ;; before the inbox lets go of those bytes.
+    (let [used (http/consumed request)]
+      (http/request-free request)
+      (consume! (mut inbox) used))
+    (try (try! sent)
+         (Ok (if keep-alive (KeepOpen) (Hangup))))))
+
+;;; Answer bytes that can never become a valid request, then close: nothing says
+;;; where a following request would begin.
+(defn reject! [(a (dyn alloc/Allocator))
+               (conn (ptr TcpConnection))
+               (error ApiError)] (-> (Result Next SocketError))
+  (let [response (error-response a error)]
+    (println "rejected request -> {}" (.status response))
+    (try (try! (send-response! a conn response (Some "close")))
+         (Ok (Hangup)))))
+
+;;; Wait for more bytes. A peer that closes, or stays silent for `idle`, ends the
+;;; connection, so an idle keep-alive client cannot hold the server forever.
+(defn receive! [(conn (ptr TcpConnection))
+                (inbox (mut Inbox))
+                (idle time/Duration)] (-> (Result Next SocketError))
+  (match (selectors/wait-fd-for (.fd conn) (selectors/interest-readable) idle)
+    (Err [error]
+         (match error
+           (selectors/Timeout [] (Ok (Hangup)))
+           (selectors/InvalidFd [] (Err (socket/Closed)))
+           (selectors/Syscall [errno] (Err (socket/IoFailed errno)))))
+    (Ok [_]
+        (let [(mut chunk) (zeroed (array u8 65536))]
+          (try (let [n
+                       (try! (socket/tcp-read conn
+                                              (cast (ptr i8) (mut chunk))
+                                              (len chunk)))]
+                 (if (= n 0)
+                     (Ok (Hangup))
+                     (do
+                       (append! (mut inbox) (subslice chunk 0 n))
+                       (Ok (KeepOpen))))))))))
+
+;;; Take the next step on a connection: answer a complete request, read more of an
+;;; incomplete one, or reject input that cannot be one. `parse-request` takes a
+;;; whole request, so an incomplete one is parsed again from its start once more
+;;; bytes arrive.
+(defn step! [(a (dyn alloc/Allocator))
+             (store (mut Store))
+             (conn (ptr TcpConnection))
+             (inbox (mut Inbox))
+             (idle time/Duration)] (-> (Result Next SocketError))
+  (match (http/parse-request a (unread inbox))
+    (Ok [request] (exchange! a (mut store) conn (mut inbox) request))
+    (Err [error]
+         (let [code (http/error-code error)]
+           (cond (= code HPE_INVALID_EOF_STATE) (receive! conn (mut inbox) idle)
+                 (= code PARSER-LIMIT-EXCEEDED) (reject! a conn (TooLarge))
+                 :else (reject! a conn (Malformed)))))))
+
+;;; Serve requests on one connection until the client closes it or asks to, idles
+;;; for `idle`, or sends something unparseable. Pipelined requests are answered in
+;;; order. The caller still owns, and closes, `conn`.
+(defn serve-connection! [(a (dyn alloc/Allocator))
+                         (store (mut Store))
+                         (conn (ptr TcpConnection))
+                         (idle time/Duration)] (-> (Result i64 SocketError))
+  (let [(mut inbox) (Inbox::new a)]
+    (try (loop (match (try! (step! a (mut store) conn (mut inbox) idle))
+                 (KeepOpen [] (continue))
+                 (Hangup [] (break))))
+         (Ok 0))))
+
+;;; Accept and serve connections one at a time until accepting fails. Serving one
+;;; at a time keeps the store free of locking; the idle timeout bounds how long a
+;;; single client can hold the server. A failed connection is logged and dropped.
+(defn serve! [(a (dyn alloc/Allocator))
+              (store (mut Store))
+              (listener (ptr TcpListener))
+              (idle time/Duration)] (-> SocketError)
+  (loop (let [(mut conn) (zeroed TcpConnection)]
+          (match (socket/tcp-accept listener (mut conn))
+            (Err [error] (break error))
+            (Ok [_]
+                (do
+                  (match (serve-connection! a (mut store) (mut conn) idle)
+                    (Err [error]
+                         (println "connection dropped: {}"
+                                  (socket-error-text error)))
+                    (Ok [_] 0))
+                  (socket/tcp-connection-close! (mut conn))))))))
