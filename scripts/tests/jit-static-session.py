@@ -27,15 +27,16 @@ def run(*args, env=None, cwd=ROOT):
 
 
 def repl_signature_check():
-    # A rejected signature edit must not leave phase metadata dangling in the CLI's
-    # enclosing command scope. The accepted definition remains callable afterwards.
+    # A signature edit publishes the new typed cell in the CLI command scope.
+    # A rejected edit must leave both the binding and phase metadata intact.
     repl = subprocess.run([str(COMPILER), "repl"], cwd=ROOT, text=True,
-        input="(defn f [] (-> i64) 7)\n(f)\n(defn f [] (-> bool) true)\n(f)\n:quit\n",
+        input="(defn f [] (-> i64) 7)\n(f)\n(defn f [] (-> bool) true)\n(f)\n(defn f [] (-> i64) unknown-value)\n(f)\n:quit\n",
         capture_output=True, timeout=120)
     assert repl.returncode == 0, (repl.returncode, repl.stdout, repl.stderr)
-    assert repl.stdout.count("7") == 2, repl.stdout
-    assert "conflicting types for parameter" in repl.stderr, repl.stderr
-    return "rejected REPL signature edit keeps the accepted definition"
+    assert repl.stdout.count("7") == 1, repl.stdout
+    assert repl.stdout.count("true") == 2, repl.stdout
+    assert "unbound variable 'unknown-value'" in repl.stderr, repl.stderr
+    return "REPL signature edit publishes and a rejected edit preserves it"
 
 
 with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
@@ -86,8 +87,8 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
         for flag in shlex.split(run(os.environ.get("LLVM_CONFIG", "llvm-config"),
                                    "--ldflags", "--libs", "--system-libs").stdout):
             flags += ["--link-flag", flag]
-    fixtures = ("derive_qualified_shape", "retained_heap", "jit_metadata_lifetime", "jit_type_lifetime", "jit_impl_lifetime", "jit_monomorph_report_lifetime", "jit_source_sharing", "jit_body_sharing", "jit_native_metadata_roots", "jit_repl_policy", "jit_repl_reclaim", "jit_static_session", "jit_static_lifetime", "jit_static_policy",
-                "jit_static_dynamic", "jit_static_isolation", "jit_single_form_proof", "jit_checked_baseline", "jit_env_values", "jit_deep_source", "jit_env_stale", "jit_env_stale_complete", "jit_env_native", "jit_live_checker", "jit_redefined_signature",
+    fixtures = ("type_identity", "derive_qualified_shape", "retained_heap", "jit_metadata_lifetime", "jit_type_lifetime", "jit_impl_lifetime", "jit_monomorph_report_lifetime", "jit_source_sharing", "jit_body_sharing", "jit_native_metadata_roots", "jit_repl_policy", "jit_repl_signature_cells", "jit_repl_reclaim", "jit_static_session", "jit_static_lifetime", "jit_static_policy",
+                "jit_static_dynamic", "jit_static_isolation", "jit_single_form_proof", "jit_checked_baseline", "jit_env_values", "jit_deep_source", "jit_env_stale", "jit_env_stale_complete", "jit_env_native", "jit_live_checker", "jit_redefined_signature", "jit_return_type_replacement", "jit_return_type_coupled", "jit_closure_return_type_replacement", "jit_closure_return_alias_replacement",
                 "jit_generation_tokens", "jit_reserved_tokens", "jit_frontend_policy", "jit_meta_pipeline", "jit_deferred_publication", "jit_repair_diagnostics", "jit_defalias_rebind", "jit_retire_declarations", "jit_retire_definitions", "host_environment", "jit_session_import_meta", "jit_retained_declarations", "jit_hidden_names", "jit_reader_keeps_type", "jit_session_imports", "jit_session_free", "jit_llvm_backend", "jit_repl_second_submission", "jit_repl_impl_replace", "jit_const_across_submissions", "jit_repl_const_eval", "jit_const_generic_trait_method", "jit_meta_accepted_impl", "jit_meta_dependencies", "jit_meta_generator_later", "jit_shared_prelude", "jit_before_expand_const_replacement", "jit_before_expand_sum_replacement", "jit_qualified_names", "jit_entry_compile_time_code", "jit_generic_replacement", "jit_import_tolerant_helper", "jit_cimport_header_change")
     if sys.platform == "darwin":
         fixtures += ("jit_scratch_footprint",)

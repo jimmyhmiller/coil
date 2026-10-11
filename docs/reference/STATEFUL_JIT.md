@@ -44,8 +44,11 @@ above. Each REPL function is published through a `Var`: a stable, typed
 function-pointer cell. Callers go through the cell, and a redefinition swaps
 what it holds.
 
-- A redefinition with a different signature, including different parameter
-  names, is rejected, and the working definition stays.
+- A redefinition with different parameter or return types publishes a new typed
+  cell. New code sees the new signature; earlier callers and stored function
+  pointers keep their old cell and its last implementation. Subsequent edits
+  with the current signature update the current cell.
+- Different parameter names are rejected, and the working definition stays.
 - A failed submission changes nothing. `alloc-static` storage from accepted
   submissions survives later ones.
 - Each implementation is its `Var`'s metadata root (`:jit/root`, versioned by

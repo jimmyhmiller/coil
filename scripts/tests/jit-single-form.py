@@ -27,7 +27,7 @@ assert run.returncode == 0, (run.returncode, run.stdout, run.stderr)
 assert run.stdout.count("coil> 8\n") == 1, run.stdout
 assert run.stdout.count("coil> 16\n") == 3, run.stdout
 assert "coil> i64\n" in run.stdout, run.stdout
-assert "conflicting types for parameter" in run.stderr, run.stderr
+assert "body has type bool but the declared return type is i64" in run.stderr, run.stderr
 
 submissions = []
 active = None
@@ -48,7 +48,7 @@ for line in run.stderr.splitlines():
 assert active is None and len(submissions) == 11, (active, len(submissions))
 assert [status for status, _ in submissions] == [
     "accepted", "accepted", "accepted", "accepted", "accepted", "accepted",
-    "aborted", "rejected", "accepted", "rejected", "accepted"]
+    "aborted", "accepted", "accepted", "rejected", "accepted"]
 
 # Capture the actual hygienic identity, not merely the public Var's spelling.
 old_names = [name for stage, name in submissions[1][1]
@@ -63,8 +63,8 @@ emitted_before = {name for stage, name in submissions[1][1]
                   if stage == "emit" and not name.startswith("replsession.__coil_jit_entry_")}
 print("Submission                         old parsed  old checked  old emitted")
 for index, label in enumerate(("define caller", "evaluate caller", "redefine original",
-                               "evaluate existing caller", "query type", "reject signature",
-                               "evaluate after rejection", "reject body", "evaluate after rejection"), 2):
+                               "evaluate existing caller", "query type", "replace signature",
+                               "evaluate old caller after replacement", "reject body", "evaluate after rejection"), 2):
     events = submissions[index][1]
     # The retained event enumerates only the compact Program overlay. Older
     # accepted functions can live solely in the persistent checked index, so
@@ -81,8 +81,10 @@ for index, label in enumerate(("define caller", "evaluate caller", "redefine ori
         if stage == "parse":
             assert "replsession." + name not in retained, (label, stage, name)
     emitted = [name for stage, name in events if stage == "emit"]
-    implementations = [name for name in emitted if "@$proof-" in name]
-    assert len(implementations) == (1 if index in (2, 4) else 0), (label, implementations)
+    implementations = [name for name in emitted if "@$proof-" in name and name.endswith("--impl")]
+    assert len(implementations) == (1 if index in (2, 4, 7) else 0), (label, implementations)
+    trampolines = [name for name in emitted if "@$proof-" in name and name.endswith("--pointer")]
+    assert len(trampolines) == (1 if index in (2, 7) else 0), (label, trampolines)
     native = {name for name in emitted
               if not name.startswith("replsession.__coil_jit_entry_")}
     assert not native.intersection(emitted_before), (label, native.intersection(emitted_before))
