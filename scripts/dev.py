@@ -174,15 +174,14 @@ def install_native_archives(source: Path, destination: Path) -> Path | None:
     replacement atomic for the same reason as the stdlib replacement above.
     """
     # Beside the binary for a checkout build; otherwise the checkout's own
-    # build/bin/native, where scripts/native/build-curl.sh writes them. A candidate
-    # built elsewhere (`build candidate --output /tmp/x`) used to install with no
-    # archives at all, and the toolchain failed at the first HTTP program's link.
-    source_dir = next((d for d in (source.parent / "native", ROOT / "build" / "bin" / "native")
-                       if d.is_dir()), None)
-    if source_dir is None:
-        raise SystemExit(
-            "install: no native archives beside the compiler or in build/bin/native; "
-            "run scripts/native/build-curl.sh first")
+    # build/bin/native, which scripts/native/build-curl.sh fills from the machine's
+    # cache. A candidate built elsewhere (`build candidate --output /tmp/x`) used to
+    # install with no archives at all, and the toolchain failed at the first HTTP
+    # program's link.
+    source_dir = source.parent / "native"
+    if not source_dir.is_dir():
+        execute(str(ROOT / "scripts/native/build-curl.sh"))
+        source_dir = ROOT / "build" / "bin" / "native"
 
     live = destination.parent / "native"
     staged = destination.parent / "native.incoming"

@@ -14,11 +14,14 @@
 mkdir -p /tmp/lib/coil
 ln -sfn "$PWD/src/stdlib" /tmp/lib/coil/stdlib
 ln -sfn "$PWD/src/compiler/prelude.coil" /tmp/lib/coil/prelude.coil
-# Native archives are resolved beside the compiler executable. Stage compilers live
-# directly in /tmp, so mirror the installed <prefix>/bin/native layout there too.
-if [ -d "$PWD/build/bin/native" ]; then
-  ln -sfn "$PWD/build/bin/native" /tmp/native
-fi
+# Every compiler links the hosted HTTP client, so every stage needs the bundled
+# curl archives. A fresh checkout or worktree has none; build-curl.sh copies them
+# from the machine-wide cache (building them once on a miss), here rather than at
+# stage1's link. Native archives are resolved beside the compiler executable, and
+# stage compilers live directly in /tmp, so mirror <prefix>/bin/native there too.
+scripts/native/build-curl.sh >&2 \
+  || { echo "stage-lib: cannot provide the bundled curl archives" >&2; exit 1; }
+ln -sfn "$PWD/build/bin/native" /tmp/native
 
 # Remove only the links this checkout installed. Leaving them behind makes a later
 # CLI layout test accidentally discover this checkout through /tmp and report a

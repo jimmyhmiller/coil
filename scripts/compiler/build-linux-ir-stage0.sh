@@ -18,8 +18,7 @@ LLVM_LIBDIR=$($LLVM_CONFIG --libdir)
 CLANG=${COIL_CC:-$LLVM_BINDIR/clang}
 [ -x "$CLANG" ] || { echo "linux IR stage0: clang not found at $CLANG" >&2; exit 1; }
 NATIVE="$PWD/build/bin/native/curl/x86_64-linux"
-[ -f "$NATIVE/libcurl.a" ] \
-  || { echo "linux IR stage0: bundled curl is missing; run scripts/native/build-curl.sh" >&2; exit 1; }
+scripts/native/build-curl.sh >&2
 
 RUN_DIR=$(mktemp -d /tmp/coil-linux-ir-stage0.XXXXXX)
 cleanup() { rm -rf "$RUN_DIR"; }

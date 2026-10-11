@@ -30,11 +30,11 @@ clang beside the libLLVM you are linking against (`/usr/lib/llvm-21/bin/clang` o
 Debian-ish box), which keeps parser and library on one version. A
 `-Woverride-module` warning on the `-c` step is expected and harmless.
 
-**Run `scripts/native/build-curl.sh` first.** stage1 otherwise stops with
-`http_client.coil needs Coil's bundled libcurl`. It builds `libcurl.a` + mbedtls into
-`build/bin/native/curl/<arch>/`. The error names its own fix, but it lands between
-"no stage0" and "build linux", which is exactly the stretch this file is walking you
-through.
+**The bundled curl needs network the first time.** Every bootstrap runs
+`scripts/native/build-curl.sh`, which builds `libcurl.a` + mbedtls once per machine
+into `~/.cache/coil` (downloading the pinned sources) and copies them into
+`build/bin/native/curl/<arch>/`. On a fresh box that first build happens before
+stage1, and needs cmake as well as a C compiler.
 
 ## Provenance
 
