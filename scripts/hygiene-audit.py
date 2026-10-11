@@ -96,6 +96,9 @@ def justification(path: str, op: str, line: str) -> str:
                      or "(primitive/code-symbol (if (load collision) name leaf))" in line)):
             return "module-alias datum compared with import clauses or passed to the binding-aware qualification planner; never a lexical binder"
         if (path == "src/stdlib/lints/primitives.coil"
+                and "names/ln-reaches?" in line):
+            return "operator-name datum compared with a call head and then resolved through names/ln-reaches? against coil.core; never a lexical binder"
+        if (path == "src/stdlib/lints/primitives.coil"
                 and "names/ln-spelling-at node" in line):
             return "candidate qualified operator-name data validated at the authored reference by ln-spelling-at before proposing a replacement; never a lexical binder"
         if (path == "src/stdlib/meta.coil"
