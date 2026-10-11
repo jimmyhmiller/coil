@@ -494,11 +494,11 @@ field count (feeds `deny-unknown`). Tests: `tests/serde_options_test.coil`,
         0))))
 
 ; a DeError is located: {"port": "yes"} ->
-;   (Err {code=EXPECTED-NUMBER offset=9 ctx="port"})
+;   (Err (DeError :kind (ExpectedInt) :offset 9 :ctx "number is not an integer"))
+; and its Display says so: "expected an integer at byte 9: number is not an integer"
 (defn report-de-err [(e DeError)] (-> i64)
-  (do (fmt (stderr) "decode error at byte {d}: {s}\n"
-        (load (field e offset)) (load (field e ctx)))
-      1))
+  (eprintln "decode error: {}" e)
+  1)
 ```
 
 ### 7. Unknown shape: the DOM
