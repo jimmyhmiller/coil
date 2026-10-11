@@ -436,6 +436,7 @@ def test(args: argparse.Namespace) -> None:
         execute(sys.executable, "tests/compiler/extern_scoping_test.py", "--compiler", compiler)
         execute(sys.executable, "tests/compiler/features/authored_gensym_source_guard.py")
         execute(sys.executable, "tests/compiler/features/tagged_form_revision_guard.py")
+        execute(sys.executable, "tests/compiler/meta_suffix_test.py", "--compiler", compiler)
         execute(compiler, "run", "tests/metaprogramming/global_reference_identity.coil")
         execute(sys.executable, "scripts/tests/source-references.py", "--compiler", compiler)
         execute(compiler, "run", "tests/compiler/features/callable_void_return.coil")
@@ -1510,6 +1511,8 @@ GENERATED_UNIT_SCRIPTS = {"jit-static-session", "jit-session-memory", "jit-sourc
 
 
 def test_generated(compiler: str) -> None:
+    # A compiler self-build is heavy: measure it before starting parallel jobs.
+    execute(sys.executable, "scripts/tests/self-build-expansion-memory.py", compiler)
     override = os.environ.get("COIL_JOBS")
     workers = max(1, int(override)) if override else max(1, os.cpu_count() or 1)
     started = time.monotonic()
