@@ -910,29 +910,44 @@ evens=3 total=10
 ```coil
 (module example.text)
 (import "coil.alloc" :use [malloc-allocator])
-(import "coil.str" :use [sv string-from-view string-push-view! string-as-view string-view-bytes string-free!])
+(import "coil.str" :use [sv string-from-view string-push-view! string-free!
+                         sb-new sb-format! sb-str sb-free!])
 
 (defn main [] (-> i64)
   (println "{} {:?} {:x} {}" 42 "quoted" 255 1.5)
-  (println "[{:>6}] [{:<6}] [{:06.2}]" "ab" "cd" 3.14159)
-  (let [(mut s) (string-from-view (malloc-allocator) (sv "hello"))]
+  (println "[{:>6}] [{:<6}] [{:06.2}] [{:<6}]" "ab" "cd" 3.14159 "café")
+  (println "[{:>*}] [{:.*}]" 5 "ab" 1 2.25)
+  (let [a (malloc-allocator)
+        (mut s) (string-from-view a (sv "hello"))
+        (mut line) (sb-new a)]
     (string-push-view! (mut s) (sv ", world"))
-    (println "{}" (string-view-bytes (string-as-view s)))
-    (string-free! (mut s)))
+    (println "{}" s)
+    (sb-format! (mut line) "{}+{}={}" 2 2 4)
+    (println "{}" (sb-str line))
+    (string-free! (mut s))
+    (sb-free! (mut line)))
+  (eprintln "this line goes to stderr")
   (println "{}" (= "abc" "abc"))
   0)
 ```
 
 ```output
 42 "quoted" ff 1.5
-[    ab] [cd    ] [003.14]
+[    ab] [cd    ] [003.14] [café  ]
+[   ab] [2.2]
 hello, world
+2+2=4
 true
 ```
 
 - `println`/`print` take a format string. `{}` uses `Display`, `{:?}` compact
   `Debug`, `{:#?}` pretty `Debug`, and `{:x}` hex. A spec can add
   `[[fill]align][+][0][width][.precision]`: `{:>8}`, `{:.2}`, `{:08.3}`.
+  Width and precision count characters, not bytes.
+- `*` in place of the width, or `.*` in place of the precision, takes it from the
+  argument list: `(println "{:>*}" w x)` pads `x` to `w` characters. The width
+  argument comes first, then the precision, then the value, and each must be an
+  `i64`; a negative one means none.
 - All of a format's arguments are evaluated, left to right, before anything is
   written.
 - `eprintln`/`eprint` are the same for stderr.
@@ -946,8 +961,8 @@ true
 - A string literal is `(slice u8)`, and byte strings compare with `=`.
 - `coil.str` adds validated UTF-8 types. `StringView` is a borrowed view (`(sv "…")`
   for literals, `string-view-from-utf8` for untrusted bytes). `String` is an owned,
-  growable buffer. Iterating either yields `Rune`s; `coil.unicode.grapheme` gives
-  grapheme clusters.
+  growable buffer. Both print with `{}` and `{:?}`. Iterating either yields
+  `Rune`s; `coil.unicode.grapheme` gives grapheme clusters.
 - `coil.temp` names temporary files: `(temp-path "name")` in a private per-process
   directory, `(temp-sibling dest)` beside `dest` for writing and then renaming into
   place. Both are removed when the process exits, and ones a killed process left are
