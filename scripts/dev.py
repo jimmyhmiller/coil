@@ -1414,6 +1414,7 @@ source-roots = ["src"]
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o3", "-O3"),
             lambda: build_run("tests/compiler/features/void_if_discarded.coil", "void-if-discarded"),
             lambda: build_run("tests/compiler/features/void_match_discarded.coil", "void-match-discarded"),
+            lambda: build_run("tests/compiler/features/empty_capture_closure.coil", "empty-capture-closure"),
             lambda: build_run("tests/compiler/features/meta_dependencies.coil", "meta-dependencies", want=14),
             lambda: build_run("tests/compiler/features/meta_resolve_at.coil", "meta-resolve-at", want=17),
             lambda: build_run("tests/compiler/features/meta_provenance.coil", "meta-provenance", want=22),
