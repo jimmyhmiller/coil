@@ -974,7 +974,8 @@ true
 - `coil.temp` names temporary files: `(temp-path "name")` in a private per-process
   directory, `(temp-sibling dest)` beside `dest` for writing and then renaming into
   place. Both are removed when the process exits, and ones a killed process left are
-  removed by the next process that makes a temporary.
+  removed by the next process that makes a temporary. The returned path is yours;
+  `temp-free` releases it.
 
 `println` returns a `Result` carrying any I/O error. As a statement its value is
 discarded.
