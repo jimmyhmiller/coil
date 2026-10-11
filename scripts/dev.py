@@ -733,8 +733,11 @@ def test_modernize_fast(compiler: str) -> None:
             text = probe.read_text()
             if "(mut owned) (try-or! (found ok) 0)" not in " ".join(text.split()):
                 raise RuntimeError("fast modernization gate: result-flow fix did not fuse a mutable rebinding")
-            if text.count("(match (found ok)") != 1:
+            if text.count("(match (found ok)") != 2:
                 raise RuntimeError("fast modernization gate: result-flow fix rewrote the wrong matches")
+            if "(ok? (found ok))" not in text or "(err? (found ok))" not in text:
+                raise RuntimeError("fast modernization gate: a Result match that only asks which "
+                                   "variant it is did not become ok?/err?")
             after = subprocess.run([coil, "run", str(probe)], cwd=ROOT, capture_output=True, text=True)
             if after.returncode != 0 or after.stdout != before.stdout:
                 raise RuntimeError("fast modernization gate: result-flow fix changed behavior:\n"
@@ -892,6 +895,29 @@ def test_modernize_fast(compiler: str) -> None:
             execute(coil, "lint", str(hex_probe), "--fix")
             if before_hex != hashlib.sha256(hex_probe.read_bytes()).digest():
                 raise RuntimeError("fast modernization gate: hex escape fix is not idempotent")
+
+            # A rewrite that replaces the last use of an imported name takes the
+            # name out of the `:use` list in the next round, and the whole import
+            # when nothing it names is left.
+            idle_probe = tmp / "idle-uses.coil"
+            idle_probe.write_text("""(module idle-uses)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [al-new al-push! al-len al-free!])
+(import "coil.slice" :use [slice-len])
+(defn main [] (-> i64)
+  (let [(mut xs) (al-new [i64] (malloc-allocator))]
+    (al-push! (mut xs) 1)
+    (let [n (+ (al-len xs) (slice-len "abc"))]
+      (al-free! (mut xs))
+      n)))
+""")
+            execute(coil, "lint", str(idle_probe), "--fix")
+            idle_fixed = idle_probe.read_text()
+            if '(import "coil.arraylist" :use [al-new al-free!])' not in idle_fixed \
+                    or "coil.slice" in idle_fixed:
+                raise RuntimeError("fast modernization gate: names the rewrites left idle stayed "
+                                   "imported:\n" + idle_fixed)
+            execute(coil, "check", str(idle_probe))
 
             probe = tmp / "probe.coil"
             probe.write_text("""(module modernization-probe)
