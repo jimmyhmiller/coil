@@ -43,6 +43,7 @@ tests/prop/stateful_test.coil
 tests/prop/db_test.coil
 tests/prop/cov_test.coil
 tests/prop/stdlib_props_test.coil
+tests/prop/surface_test.coil
 src/examples/property-testing.coil"
 
 failed=0

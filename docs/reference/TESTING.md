@@ -165,9 +165,17 @@ the generator's invariants in every shrunk value.
 | `(classify "label" COND)` | Count how often a condition holds; warns when one label covers nearly every case |
 | `(collect "label" EXPR)` | Record a number's min, mean and max over the run; yields EXPR |
 | `(prop-target! EXPR)` | Steer generation toward inputs that maximize EXPR |
-| `(prop-src)` | The `Source` to draw from by hand: `draw-int!`, `draw-len!`, `arb-bytes`, `arb-string`, … |
+| `(prop-src)` | The `Source` to draw from by hand: `draw-int!`, `draw-len!`, `arb-bytes`, `arb-string`, …. It works in any function the property calls, too |
 | `(prop-note "label" EXPR)` | Show EXPR as `label = …` in a counterexample; yields EXPR |
 | `(prop-draw T "label")` | Draw any `Arbitrary` type and note it, in one step |
+
+`(import "coil.prop" :use *)` brings in what writing properties takes: these
+forms, `defprop`, `defprop-stateful`, `Arbitrary` and its `arb-…` helpers, the
+`draw-…` and `span-…` operations, and generator values (`gen-…`). The engine
+itself (`coil.prop.source`'s tapes and spans, `coil.prop.runner`) is not
+re-exported; import those modules directly to work on it. `defprop` itself
+needs nothing else in scope, so `(import "coil.prop" :use [defprop])` is enough
+for a property that draws only its arguments.
 
 Values drawn by hand are not arguments, so a report shows them only if you
 note them:
