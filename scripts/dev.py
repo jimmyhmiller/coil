@@ -1000,6 +1000,37 @@ def test_modernize_fast(compiler: str) -> None:
                 raise RuntimeError(
                     "fast modernization gate: nested `or` fix is not idempotent")
 
+            # Bitwise chains flatten on the standard integer types, where the
+            # operators are associative; arithmetic and a user type's BitOr do not.
+            nested_bits_probe = tmp / "nested-bits.coil"
+            nested_bits_probe.write_text("""(module nested-bits)
+(defstruct Bits [(v u8)])
+(impl BitOr Bits (| [(a Bits) (b Bits)] (-> Bits) (Bits :v (| (.v a) (.v b)))))
+(defn enc [(rs i64) (rn i64)] (-> i64) (| (<< 3 30) (| (<< rs 16) (| (<< rn 5) 1))))
+(defn masks [(x u16) (y u16)] (-> u16) (& (& x y) (& (: 255 u16) (^ x (^ y x)))))
+(defn mixed [(a u32) (b u32)] (-> u32) (| a (& b (| a b))))
+(defn sums [(a i64) (b i64)] (-> i64) (+ a (+ b 1)))
+(defn user [(a Bits) (b Bits)] (-> u8) (.v (| a (| b a))))
+(defn main [] (-> i64)
+  (println "{} {} {} {} {}" (enc 1 2) (masks (: 12 u16) (: 10 u16)) (mixed (: 5 u32) (: 6 u32))
+           (sums 1 2) (user (Bits :v (: 1 u8)) (Bits :v (: 2 u8))))
+  0)
+""")
+            bits_before = subprocess.run([coil, "run", str(nested_bits_probe)], cwd=ROOT,
+                                         capture_output=True, text=True)
+            execute(coil, "lint", str(nested_bits_probe), "--fix")
+            bits_fixed = " ".join(nested_bits_probe.read_text().split())
+            for want in ("(| (<< 3 30) (<< rs 16) (<< rn 5) 1)", "(& x y (: 255 u16) (^ x y x))",
+                         "(| a (& b (| a b)))", "(+ a (+ b 1))", "(| a (| b a))"):
+                if want not in bits_fixed:
+                    raise RuntimeError(
+                        f"fast modernization gate: bitwise flattening, want {want!r} in:\n{bits_fixed}")
+            bits_after = subprocess.run([coil, "run", str(nested_bits_probe)], cwd=ROOT,
+                                        capture_output=True, text=True)
+            if bits_before.returncode != 0 or bits_after.stdout != bits_before.stdout:
+                raise RuntimeError("fast modernization gate: bitwise flattening changed behavior:\n"
+                                   + bits_before.stdout + bits_after.stdout + bits_after.stderr)
+
             preflight = tmp / "legacy-preflight.coil"
             preflight.write_text("""(module legacy-preflight)
 (import "coil.alloc" :as alloc)
