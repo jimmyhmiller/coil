@@ -6,9 +6,11 @@ The first standard-library increment is implemented in `coil.str`: `StringView`,
 owned `String`, `Rune`, `StringIndex`, UTF-8 validation, scalar iteration, explicit
 clone/free/transfer, allocation-free trimming and splitting, and the `Text` and
 `TextWrite` traits. `coil.unicode.grapheme` implements Unicode 17 extended grapheme
-`Char` iteration and passes the official conformance corpus. `(sv "...")` provides
-explicit literal construction while existing literals and `(slice u8)` APIs remain
-compatible. `coil.lint.string` implements the report-only annotation inventory;
+`Char` iteration and passes the official conformance corpus. `coil.unicode` adds
+Unicode 17 general categories, the Alphabetic, Numeric, White_Space, Uppercase and
+Lowercase properties, and simple case mapping and folding for `Rune`s and whole
+texts. `(sv "...")` provides explicit literal construction while existing literals
+and `(slice u8)` APIs remain compatible. `coil.lint.string` implements the report-only annotation inventory;
 transactional cross-caller fixes remain future work described below.
 
 ## Summary

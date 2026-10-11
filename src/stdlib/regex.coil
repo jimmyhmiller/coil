@@ -3,41 +3,275 @@
 (import "coil.slice" :as slice)
 (import "coil.mem" :as mem)
 
-; Ahead-of-time byte regular expressions. `is-match?` is a macro: it parses and
-; compiles its pattern while the caller is compiled, then emits an allocation-free
-; bit-parallel Thompson state machine. The runtime program contains no parser,
+; Ahead-of-time byte regular expressions. Every entry point is a macro: it
+; parses and compiles its pattern while the caller is compiled and emits a
+; specialized, allocation-free matcher. The runtime program contains no parser,
 ; allocator, or regex object.
 ;
-; This first engine deliberately has a hard 63-state limit. A limit is preferable
-; to a hidden slow path: every accepted expression is represented by one machine
-; word and has the same bounded-memory, linear-time runtime contract.
+; Two engines share one parser and one Thompson NFA:
+;
+; - `is-match?` emits a bit-parallel state machine: the active state set is one
+;   machine word, so it has a hard 63-state limit. A limit is preferable to a
+;   hidden slow path: every accepted expression has the same bounded-memory,
+;   linear-time contract.
+; - `find`, `captures` and their `-at`/`-iter` forms emit a Pike VM (a tagged
+;   NFA simulation). Threads are kept in priority order with their capture
+;   slots, which yields leftmost-first match semantics (Perl/RE2/Rust): the
+;   leftmost start wins, and among matches starting there the one the
+;   pattern's alternation order and greedy/lazy preferences select. Its state
+;   lists live in fixed-size locals, sized by the compiled pattern, so the
+;   runtime is O(states * slots) per byte with no allocation. It allows up to
+;   256 NFA states.
 ;
 ; The compile-time helpers intentionally use metal integer operations. Macro
 ; closures are pruned and carry no trait implementations, so clean operators in
-; this layer would make `is-match?` unstaggable inside another macro body.
-(export is-match?)
+; this layer would make these macros unstaggable inside another macro body.
+(export is-match?
+        find
+        find-at
+        find-iter
+        captures
+        captures-at
+        captures-iter
+        Span
+        span-len
+        span-bytes
+        Captures
+        group
+        group-count
+        group-bytes
+        Matches
+        CapturesIter)
 
-; Compile-time-only mutable storage. State opcodes are:
-;   0 byte class, 1 split/epsilon, 2 accepting match.
-; A byte class is four 64-bit masks. Patch records name an unresolved out edge.
-(defn rx--mem [(c (mut (array i64 1280))) (i i64)] (-> i64)
+; ---- runtime results ---------------------------------------------------------
+
+;;; A match position: the half-open byte range `[start, end)` of the haystack.
+(defstruct Span [(start i64) (end i64)])
+
+(derive Debug Eq Span)
+
+;;; Number of bytes the span covers.
+(defn span-len [(span Span)] (-> i64)
+  (- (.end span) (.start span)))
+
+;;; The bytes of HAYSTACK that SPAN covers.
+(defn span-bytes [(haystack (slice u8)) (span Span)] (-> (slice u8))
+  (slice/subslice haystack (.start span) (.end span)))
+
+;;; The groups of one match. `N` is the number of groups including group 0, the
+;;; whole match; it is fixed by the pattern at compile time. A group that did not
+;;; participate in the match has start and end -1.
+(defstruct Captures [(const N i64)]
+  [(starts (array i64 N)) (ends (array i64 N))])
+
+;;; Number of groups, including group 0.
+(defn group-count [(const N i64)] [(caps (Captures N))] (-> i64)
+  N)
+
+;;; Group I's span, or None when I is out of range or the group did not
+;;; participate in the match. Group 0 is the whole match.
+(defn group [(const N i64)] [(caps (Captures N)) (i i64)] (-> (Option Span))
+  (cond (or (< i 0) (>= i N)) (None)
+        (< (get (.starts caps) i) 0) (None)
+        :else
+          (Some (Span :start (get (.starts caps) i) :end (get (.ends caps) i)))))
+
+;;; The bytes of HAYSTACK that group I covers, or None (see `group`).
+(defn group-bytes [(const N i64)] [(caps (Captures N))
+                                   (haystack (slice u8))
+                                   (i i64)] (-> (Option (slice u8)))
+  (match (group caps i)
+    (Some [span] (Some (span-bytes haystack span)))
+    (None [] (None))))
+
+;;; The iterator `find-iter` returns: successive non-overlapping matches. An
+;;; empty match that ends where the previous match ended is skipped (as in RE2,
+;;; Go and Rust), and after an empty match the next search starts one byte later.
+(defstruct Matches
+  [(haystack (slice u8))
+   (at i64)
+   (last_end i64)
+   (finder (fnptr c [(slice u8) i64] (Option Span)))])
+
+;;; The iterator `captures-iter` returns; it advances like `Matches`.
+(defstruct CapturesIter [(const N i64)]
+  [(haystack (slice u8))
+   (at i64)
+   (last_end i64)
+   (finder (fnptr c [(slice u8) i64] (Option (Captures N))))])
+
+; Record a match at [START, END) and move AT past it. Returns false when the
+; match must be skipped because it is empty and abuts the previous match.
+(defn rx--advance [(at (mut i64)) (last-end (mut i64)) (start i64) (end i64)] (-> bool)
+  (if (= start end)
+      (let [abuts (= end last-end)]
+        (set! at (+ end 1))
+        (when (not abuts) (set! last-end end))
+        (not abuts))
+      (do
+        (set! at end)
+        (set! last-end end)
+        true)))
+
+(impl Iterator Matches
+  (next [(it (mut Matches))]
+        (-> (Option Span))
+        (let [(mut result) (: (None) (Option Span))
+              (mut searching) true]
+          (while (and searching (<= (.at it) (len (.haystack it))))
+            (let [finder (.finder it)]
+              (match (finder (.haystack it) (.at it))
+                (None []
+                      (do
+                        (set! (.at it) (+ (len (.haystack it)) 1))
+                        (set! searching false)))
+                (Some [span]
+                      (when (rx--advance (mut (.at it))
+                                         (mut (.last_end it))
+                                         (.start span)
+                                         (.end span))
+                        (set! result (Some span))
+                        (set! searching false))))))
+          result)))
+
+(impl Iterable Matches
+  (iter [(it Matches)] (-> Matches) it))
+
+(impl [(const N i64)] Iterator (CapturesIter N)
+  (next [(it (mut (CapturesIter N)))]
+        (-> (Option (Captures N)))
+        (let [(mut result) (: (None) (Option (Captures N)))
+              (mut searching) true]
+          (while (and searching (<= (.at it) (len (.haystack it))))
+            (let [finder (.finder it)]
+              (match (finder (.haystack it) (.at it))
+                (None []
+                      (do
+                        (set! (.at it) (+ (len (.haystack it)) 1))
+                        (set! searching false)))
+                (Some [caps]
+                      (when (rx--advance (mut (.at it))
+                                         (mut (.last_end it))
+                                         (get (.starts caps) 0)
+                                         (get (.ends caps) 0))
+                        (set! result (Some caps))
+                        (set! searching false))))))
+          result)))
+
+(impl [(const N i64)] Iterable (CapturesIter N)
+  (iter [(it (CapturesIter N))] (-> (CapturesIter N)) it))
+
+; Entry points the macro expansions call. They give the generated matcher's
+; anonymous function its parameter types.
+(defn rx--matches [(haystack (slice u8))
+                   (finder (fnptr c [(slice u8) i64] (Option Span)))] (-> Matches)
+  (Matches
+    :haystack haystack
+    :at 0
+    :last_end -1
+    :finder finder))
+
+(defn rx--captures-iter [(const N i64)] [(haystack (slice u8))
+                                         (finder (fnptr c
+                                                        [(slice u8) i64]
+                                                        (Option (Captures N))))] (-> (CapturesIter N))
+  (CapturesIter
+    :haystack haystack
+    :at 0
+    :last_end -1
+    :finder finder))
+
+(defn rx--run-find [(haystack (slice u8))
+                    (start i64)
+                    (finder (fnptr c [(slice u8) i64] (Option Span)))] (-> (Option Span))
+  (finder haystack start))
+
+(defn rx--run-captures [(const N i64)] [(haystack (slice u8))
+                                        (start i64)
+                                        (finder (fnptr c
+                                                       [(slice u8) i64]
+                                                       (Option (Captures N))))] (-> (Option (Captures N)))
+  (finder haystack start))
+
+; ---- compile-time NFA storage ----------------------------------------------
+;
+; One i64 array holds the whole compile-time NFA. Header slots:
+;   0 parse position, 1 parse end, 2 state count, 3 patch count,
+;   4 pattern bytes (opaque handle), 5 scoped flags (1 i, 2 s, 4 m),
+;   6 state limit, 7 capturing groups seen so far,
+;   8 save mode (0 none, 1 whole match only, 2 every group),
+;   9 visit generation, 10 start state, 11 accept state.
+; State opcodes: 0 byte class, 1 split, 2 accept, 3 ^, 4 $, 5 \b, 6 \B,
+; 7 multiline ^, 8 multiline $, 9 save (slot number in mask word 0).
+; A split prefers out1. A byte class is four 64-bit masks. Patch records name an
+; unresolved out edge (1 = out1, 2 = out2).
+(defn rx--mem [(c (mut (array i64 5392))) (i i64)] (-> i64)
   (primitive/load (primitive/index c i)))
 
-(defn rx--put [(c (mut (array i64 1280))) (i i64) (v i64)] (-> i64)
+(defn rx--put [(c (mut (array i64 5392))) (i i64) (v i64)] (-> i64)
   (primitive/store! (primitive/index c i) v)
   0)
+
+(defn rx--op-slot [(s i64)] (-> i64)
+  (primitive/iadd 16 s))
+
+(defn rx--out1-slot [(s i64)] (-> i64)
+  (primitive/iadd 272 s))
+
+(defn rx--out2-slot [(s i64)] (-> i64)
+  (primitive/iadd 528 s))
+
+(defn rx--mask-slot [(word i64) (s i64)] (-> i64)
+  (primitive/iadd (primitive/iadd 784 (primitive/imul word 256)) s))
+
+(defn rx--patch-state-slot [(p i64)] (-> i64)
+  (primitive/iadd 1808 p))
+
+(defn rx--patch-edge-slot [(p i64)] (-> i64)
+  (primitive/iadd 2832 p))
+
+(defn rx--patch-next-slot [(p i64)] (-> i64)
+  (primitive/iadd 3856 p))
+
+(defn rx--visit-slot [(s i64)] (-> i64)
+  (primitive/iadd 4880 s))
+
+(defn rx--live-slot [(s i64)] (-> i64)
+  (primitive/iadd 5136 s))
+
+(defn rx--op [(c (mut (array i64 5392))) (s i64)] (-> i64)
+  (rx--mem (mut c) (rx--op-slot s)))
+
+(defn rx--out1 [(c (mut (array i64 5392))) (s i64)] (-> i64)
+  (rx--mem (mut c) (rx--out1-slot s)))
+
+(defn rx--out2 [(c (mut (array i64 5392))) (s i64)] (-> i64)
+  (rx--mem (mut c) (rx--out2-slot s)))
 
 ; A fragment packs its start state and patch-list head into one i64. State and
 ; patch indices are non-negative; +1 reserves zero for the empty patch list.
 (defn rx--frag [(start i64) (outs i64)] (-> i64)
-  (primitive/ior start (primitive/ishl (primitive/iadd outs 1) 8)))
+  (primitive/ior start (primitive/ishl (primitive/iadd outs 1) 16)))
 
 (defn rx--frag-start [(f i64)] (-> i64)
-  (primitive/iand f 255))
+  (primitive/iand f 65535))
 
 (defn rx--frag-outs [(f i64)] (-> i64)
-  (primitive/isub (primitive/ishr f 8) 1))
+  (primitive/isub (primitive/ishr f 16) 1))
 
+; Depth-first searches over the NFA mark states with the current generation.
+(defn rx--new-visit! [(c (mut (array i64 5392)))] (-> i64)
+  (rx--put (mut c) 9 (primitive/iadd (rx--mem (mut c) 9) 1)))
+
+(defn rx--visit! [(c (mut (array i64 5392))) (s i64)] (-> bool)
+  (if (primitive/icmp-eq (rx--mem (mut c) (rx--visit-slot s))
+                         (rx--mem (mut c) 9))
+      false
+      (do
+        (rx--put (mut c) (rx--visit-slot s) (rx--mem (mut c) 9))
+        true)))
+
+; ---- pure-literal fast path ------------------------------------------------
 (defn rx--backslash-count [(bytes Code) (i i64) (count i64)] (-> i64)
   (if (primitive/icmp-lt i 0)
       count
@@ -57,8 +291,8 @@
                           0)))
 
 ; Return the decoded literal bytes, or :not-literal when the expression needs
-; the Thompson compiler. Keeping this recognizer separate from the full parser
-; makes the fastest and most common regex shape compile to a plain search loop.
+; an automaton. Keeping this recognizer separate from the full parser makes the
+; fastest and most common regex shape compile to a plain search loop.
 (defn rx--literal-bytes [(bytes Code) (i i64) (end i64) (out CodeBuilder)] (-> Code)
   (if (primitive/icmp-ge i end)
       (primitive/code-list-done out)
@@ -187,104 +421,182 @@
                                                              (primitive/index ~candidate
                                                                               1)))))))))))))))
 
-(defn rx--peek [(c (mut (array i64 1280)))] (-> i64)
+(defn rx--some-span [(start Code) (width i64)] (-> Code)
+  `(Some (coil.regex.Span :start ~start :end (primitive/iadd ~start ~width))))
+
+; The leftmost occurrence of a literal at or after FROM, as (Option Span).
+; Anchors use absolute haystack positions: `^` matches only at 0, `$` only at
+; the end.
+(defn rx--literal-find [(literal Code)
+                        (hay Code)
+                        (from Code)
+                        (start-anchor bool)
+                        (end-anchor bool)] (-> Code)
+  (let [width (primitive/code-count literal)
+        length (primitive/fresh-identifier "regex-length")
+        cursor (primitive/fresh-identifier "regex-cursor")
+        candidate (primitive/fresh-identifier "regex-candidate")
+        last (primitive/fresh-identifier "regex-last")
+        at (primitive/fresh-identifier "regex-at")
+        first
+          (if (primitive/icmp-eq width 0)
+              0
+              (primitive/code-int (primitive/code-nth literal 0)))]
+    `(let [~length (coil.slice.slice-len ~hay)]
+       (if (or (primitive/icmp-lt ~from 0)
+               (or (primitive/icmp-gt ~from ~length)
+                   (primitive/icmp-lt ~length ~width)))
+           (None)
+           ~(if start-anchor
+                `(if (and (primitive/icmp-eq ~from 0)
+                          (and ~(if end-anchor
+                                    `(primitive/icmp-eq ~length ~width)
+                                    `true)
+                               ~(rx--literal-eq literal hay `0 0)))
+                     ~(rx--some-span `0 width)
+                     (None))
+                (if end-anchor
+                    `(let [~at (primitive/isub ~length ~width)]
+                       (if (and (primitive/icmp-ge ~at ~from)
+                                ~(rx--literal-eq literal hay at 0))
+                           ~(rx--some-span at width)
+                           (None)))
+                    (if (primitive/icmp-eq width 0)
+                        (rx--some-span from width)
+                        `(let [(mut ~cursor)
+                                 (primitive/index (coil.slice.slice-data ~hay)
+                                                  ~from)
+                               ~last
+                                 (primitive/index (coil.slice.slice-data ~hay)
+                                                  (primitive/isub ~length
+                                                                  ~width))]
+                           (loop :regex-literal-find
+                             (if (> (primitive/load ~cursor) ~last)
+                                 (break :regex-literal-find (None))
+                                 (let [~candidate
+                                         (coil.mem.mem-find-byte (primitive/load ~cursor)
+                                                                 (primitive/cast u8
+                                                                                 ~first)
+                                                                 (primitive/iadd (primitive/isub (primitive/cast i64
+                                                                                                                 ~last)
+                                                                                                 (primitive/cast i64
+                                                                                                                 (primitive/load ~cursor)))
+                                                                                 1))]
+                                   (if (= (primitive/cast i64 ~candidate) 0)
+                                       (break :regex-literal-find (None))
+                                       (if ~(rx--literal-ptr-eq literal
+                                                                candidate
+                                                                1)
+                                           (break :regex-literal-find
+                                                    ~(rx--some-span `(primitive/isub (primitive/cast i64
+                                                                                                     ~candidate)
+                                                                                     (primitive/cast i64
+                                                                                                     (coil.slice.slice-data ~hay)))
+                                                                    width))
+                                           (primitive/store! ~cursor
+                                                             (primitive/index ~candidate
+                                                                              1)))))))))))))))
+
+; ---- parser and Thompson construction --------------------------------------
+(defn rx--peek [(c (mut (array i64 5392)))] (-> i64)
   (if (primitive/icmp-ge (rx--mem (mut c) 0) (rx--mem (mut c) 1))
       -1
       (primitive/code-int (primitive/code-nth (primitive/code-from-opaque (rx--mem (mut c)
                                                                                    4))
                                               (rx--mem (mut c) 0)))))
 
-(defn rx--take [(c (mut (array i64 1280)))] (-> i64)
+(defn rx--peek-at [(c (mut (array i64 5392))) (ahead i64)] (-> i64)
+  (let [i (primitive/iadd (rx--mem (mut c) 0) ahead)]
+    (if (primitive/icmp-ge i (rx--mem (mut c) 1))
+        -1
+        (primitive/code-int (primitive/code-nth (primitive/code-from-opaque (rx--mem (mut c)
+                                                                                     4))
+                                                i)))))
+
+(defn rx--take [(c (mut (array i64 5392)))] (-> i64)
   (let [b (rx--peek (mut c))]
     (if (primitive/icmp-ge b 0)
         (rx--put (mut c) 0 (primitive/iadd (rx--mem (mut c) 0) 1))
         0)
     b))
 
-(defn rx--state [(c (mut (array i64 1280))) (op i64)] (-> i64)
-  (let [s (rx--mem (mut c) 2)]
-    (if (primitive/icmp-ge s 63)
-        (primitive/error "regex: expression needs more than 63 Thompson states")
+(defn rx--state [(c (mut (array i64 5392))) (op i64)] (-> i64)
+  (let [s (rx--mem (mut c) 2)
+        limit (rx--mem (mut c) 6)]
+    (if (primitive/icmp-ge s limit)
+        (if (primitive/icmp-eq limit 63)
+            (primitive/error "regex: expression needs more than 63 Thompson states (is-match? keeps its state set in one machine word)")
+            (primitive/error "regex: expression needs more than 256 NFA states"))
         0)
     (rx--put (mut c) 2 (primitive/iadd s 1))
-    (rx--put (mut c) (primitive/iadd 16 s) op)
-    (rx--put (mut c) (primitive/iadd 80 s) -1)
-    (rx--put (mut c) (primitive/iadd 144 s) -1)
-    (rx--put (mut c) (primitive/iadd 208 s) 0)
-    (rx--put (mut c) (primitive/iadd 272 s) 0)
-    (rx--put (mut c) (primitive/iadd 336 s) 0)
-    (rx--put (mut c) (primitive/iadd 400 s) 0)
+    (rx--put (mut c) (rx--op-slot s) op)
+    (rx--put (mut c) (rx--out1-slot s) -1)
+    (rx--put (mut c) (rx--out2-slot s) -1)
+    (rx--put (mut c) (rx--mask-slot 0 s) 0)
+    (rx--put (mut c) (rx--mask-slot 1 s) 0)
+    (rx--put (mut c) (rx--mask-slot 2 s) 0)
+    (rx--put (mut c) (rx--mask-slot 3 s) 0)
     s))
 
-(defn rx--new-patch [(c (mut (array i64 1280))) (state i64) (slot i64)] (-> i64)
+(defn rx--new-patch [(c (mut (array i64 5392))) (state i64) (edge i64)] (-> i64)
   (let [p (rx--mem (mut c) 3)]
-    (if (primitive/icmp-ge p 256)
+    (if (primitive/icmp-ge p 1024)
         (primitive/error "regex: internal patch-list capacity exceeded")
         0)
     (rx--put (mut c) 3 (primitive/iadd p 1))
-    (rx--put (mut c) (primitive/iadd 512 p) state)
-    (rx--put (mut c) (primitive/iadd 768 p) slot)
-    (rx--put (mut c) (primitive/iadd 1024 p) -1)
+    (rx--put (mut c) (rx--patch-state-slot p) state)
+    (rx--put (mut c) (rx--patch-edge-slot p) edge)
+    (rx--put (mut c) (rx--patch-next-slot p) -1)
     p))
 
-(defn rx--patch-tail [(c (mut (array i64 1280))) (p i64)] (-> i64)
-  (let [n (rx--mem (mut c) (primitive/iadd 1024 p))]
+(defn rx--patch-tail [(c (mut (array i64 5392))) (p i64)] (-> i64)
+  (let [n (rx--mem (mut c) (rx--patch-next-slot p))]
     (if (primitive/icmp-lt n 0) p (rx--patch-tail (mut c) n))))
 
-(defn rx--append-patches [(c (mut (array i64 1280))) (a i64) (b i64)] (-> i64)
+(defn rx--append-patches [(c (mut (array i64 5392))) (a i64) (b i64)] (-> i64)
   (if (primitive/icmp-lt a 0)
       b
       (if (primitive/icmp-lt b 0)
           a
           (do
-            (rx--put (mut c) (primitive/iadd 1024 (rx--patch-tail (mut c) a)) b)
+            (rx--put (mut c) (rx--patch-next-slot (rx--patch-tail (mut c) a)) b)
             a))))
 
-(defn rx--patch [(c (mut (array i64 1280))) (p i64) (target i64)] (-> i64)
+(defn rx--patch [(c (mut (array i64 5392))) (p i64) (target i64)] (-> i64)
   (if (primitive/icmp-lt p 0)
       0
-      (let [s (rx--mem (mut c) (primitive/iadd 512 p))
-            slot (rx--mem (mut c) (primitive/iadd 768 p))
-            next (rx--mem (mut c) (primitive/iadd 1024 p))]
-        (if (primitive/icmp-eq slot 1)
-            (rx--put (mut c) (primitive/iadd 80 s) target)
-            (rx--put (mut c) (primitive/iadd 144 s) target))
+      (let [s (rx--mem (mut c) (rx--patch-state-slot p))
+            edge (rx--mem (mut c) (rx--patch-edge-slot p))
+            next (rx--mem (mut c) (rx--patch-next-slot p))]
+        (if (primitive/icmp-eq edge 1)
+            (rx--put (mut c) (rx--out1-slot s) target)
+            (rx--put (mut c) (rx--out2-slot s) target))
         (rx--patch (mut c) next target))))
 
-(defn rx--empty [(c (mut (array i64 1280)))] (-> i64)
-  (let [s (rx--state (mut c) 1)
+(defn rx--single [(c (mut (array i64 5392))) (op i64)] (-> i64)
+  (let [s (rx--state (mut c) op)
         p (rx--new-patch (mut c) s 1)]
     (rx--frag s p)))
 
-(defn rx--class-state [(c (mut (array i64 1280)))] (-> i64)
-  (let [s (rx--state (mut c) 0)
-        p (rx--new-patch (mut c) s 1)]
-    (rx--frag s p)))
+(defn rx--empty [(c (mut (array i64 5392)))] (-> i64)
+  (rx--single (mut c) 1))
 
-(defn rx--class-add-one [(c (mut (array i64 1280))) (s i64) (b i64)] (-> i64)
-  (let [word (primitive/udiv b 64)
-        bit (primitive/urem b 64)
-        mask (primitive/ishl 1 bit)]
-    (if (primitive/icmp-eq word 0)
-        (rx--put (mut c)
-                 (primitive/iadd 208 s)
-                 (primitive/ior (rx--mem (mut c) (primitive/iadd 208 s)) mask))
-        (if (primitive/icmp-eq word 1)
-            (rx--put (mut c)
-                     (primitive/iadd 272 s)
-                     (primitive/ior (rx--mem (mut c) (primitive/iadd 272 s))
-                                    mask))
-            (if (primitive/icmp-eq word 2)
-                (rx--put (mut c)
-                         (primitive/iadd 336 s)
-                         (primitive/ior (rx--mem (mut c) (primitive/iadd 336 s))
-                                        mask))
-                (rx--put (mut c)
-                         (primitive/iadd 400 s)
-                         (primitive/ior (rx--mem (mut c) (primitive/iadd 400 s))
-                                        mask)))))))
+(defn rx--class-state [(c (mut (array i64 5392)))] (-> i64)
+  (rx--single (mut c) 0))
 
-(defn rx--class-add [(c (mut (array i64 1280))) (s i64) (b i64)] (-> i64)
+(defn rx--save [(c (mut (array i64 5392))) (slot i64)] (-> i64)
+  (let [f (rx--single (mut c) 9)]
+    (rx--put (mut c) (rx--mask-slot 0 (rx--frag-start f)) slot)
+    f))
+
+(defn rx--class-add-one [(c (mut (array i64 5392))) (s i64) (b i64)] (-> i64)
+  (let [slot (rx--mask-slot (primitive/udiv b 64) s)]
+    (rx--put (mut c)
+             slot
+             (primitive/ior (rx--mem (mut c) slot)
+                            (primitive/ishl 1 (primitive/urem b 64))))))
+
+(defn rx--class-add [(c (mut (array i64 5392))) (s i64) (b i64)] (-> i64)
   (rx--class-add-one (mut c) s b)
   (if (not (primitive/icmp-eq (primitive/iand (rx--mem (mut c) 5) 1) 0))
       (if (and (primitive/icmp-ge b 65) (primitive/icmp-le b 90))
@@ -295,7 +607,7 @@
       0)
   0)
 
-(defn rx--class-range [(c (mut (array i64 1280))) (s i64) (lo i64) (hi i64)] (-> i64)
+(defn rx--class-range [(c (mut (array i64 5392))) (s i64) (lo i64) (hi i64)] (-> i64)
   (let [(mut b) lo]
     (loop (if (primitive/icmp-gt (primitive/load b) hi)
               (break)
@@ -304,22 +616,22 @@
                 (primitive/store! b (primitive/iadd (primitive/load b) 1)))))
     0))
 
-(defn rx--class-negate [(c (mut (array i64 1280))) (s i64)] (-> i64)
+(defn rx--class-negate [(c (mut (array i64 5392))) (s i64)] (-> i64)
   (rx--put (mut c)
-           (primitive/iadd 208 s)
-           (primitive/ixor (rx--mem (mut c) (primitive/iadd 208 s)) -1))
+           (rx--mask-slot 0 s)
+           (primitive/ixor (rx--mem (mut c) (rx--mask-slot 0 s)) -1))
   (rx--put (mut c)
-           (primitive/iadd 272 s)
-           (primitive/ixor (rx--mem (mut c) (primitive/iadd 272 s)) -1))
+           (rx--mask-slot 1 s)
+           (primitive/ixor (rx--mem (mut c) (rx--mask-slot 1 s)) -1))
   (rx--put (mut c)
-           (primitive/iadd 336 s)
-           (primitive/ixor (rx--mem (mut c) (primitive/iadd 336 s)) -1))
+           (rx--mask-slot 2 s)
+           (primitive/ixor (rx--mem (mut c) (rx--mask-slot 2 s)) -1))
   (rx--put (mut c)
-           (primitive/iadd 400 s)
-           (primitive/ixor (rx--mem (mut c) (primitive/iadd 400 s)) -1))
+           (rx--mask-slot 3 s)
+           (primitive/ixor (rx--mem (mut c) (rx--mask-slot 3 s)) -1))
   0)
 
-(defn rx--escape-class [(c (mut (array i64 1280))) (s i64) (b i64)] (-> bool)
+(defn rx--escape-class [(c (mut (array i64 5392))) (s i64) (b i64)] (-> bool)
   (if (primitive/icmp-eq b 100)  ; \d
       (do (rx--class-range (mut c) s 48 57) true)
       (if (primitive/icmp-eq b 119)  ; \w
@@ -372,7 +684,7 @@
               (primitive/iadd 10 (primitive/isub b 97))
               -1))))
 
-(defn rx--hex-byte [(c (mut (array i64 1280)))] (-> i64)
+(defn rx--hex-byte [(c (mut (array i64 5392)))] (-> i64)
   (let [hi (rx--hex-value (rx--take (mut c)))
         lo (rx--hex-value (rx--take (mut c)))]
     (if (or (primitive/icmp-lt hi 0) (primitive/icmp-lt lo 0))
@@ -412,7 +724,7 @@
                                                (and (primitive/icmp-ge b 97)
                                                     (primitive/icmp-le b 122))))))))))))))
 
-(defn rx--class-item [(c (mut (array i64 1280))) (s i64)] (-> i64)
+(defn rx--class-item [(c (mut (array i64 5392))) (s i64)] (-> i64)
   (let [b (rx--take (mut c))]
     (if (primitive/icmp-lt b 0)
         (primitive/error "regex: unterminated byte class")
@@ -433,7 +745,7 @@
                           (primitive/error "regex: unsupported alphanumeric escape (backreferences and Unicode properties are not yet supported)"))))))
         b)))
 
-(defn rx--parse-class-items [(c (mut (array i64 1280))) (s i64) (first bool)] (-> i64)
+(defn rx--parse-class-items [(c (mut (array i64 5392))) (s i64) (first bool)] (-> i64)
   (let [p (rx--peek (mut c))]
     (if (primitive/icmp-lt p 0)
         (primitive/error "regex: unterminated byte class")
@@ -444,16 +756,8 @@
           (if (primitive/icmp-eq lo -2)
               (rx--parse-class-items (mut c) s false)
               (if (and (primitive/icmp-eq (rx--peek (mut c)) 45)
-                       (and (primitive/icmp-lt (primitive/iadd (rx--mem (mut c)
-                                                                        0)
-                                                               1)
-                                               (rx--mem (mut c) 1))
-                            (not (primitive/icmp-eq (primitive/code-int (primitive/code-nth (primitive/code-from-opaque (rx--mem (mut c)
-                                                                                                                                 4))
-                                                                                            (primitive/iadd (rx--mem (mut c)
-                                                                                                                     0)
-                                                                                                            1)))
-                                                    93))))
+                       (and (primitive/icmp-ge (rx--peek-at (mut c) 1) 0)
+                            (not (primitive/icmp-eq (rx--peek-at (mut c) 1) 93))))
                   (do
                     (rx--take (mut c))
                     (let [hi (rx--class-item (mut c) s)]
@@ -466,7 +770,7 @@
                     (rx--class-add (mut c) s lo)
                     (rx--parse-class-items (mut c) s false))))))))
 
-(defn rx--parse-class [(c (mut (array i64 1280)))] (-> i64)
+(defn rx--parse-class [(c (mut (array i64 5392)))] (-> i64)
   (let [f (rx--class-state (mut c))
         neg (primitive/icmp-eq (rx--peek (mut c)) 94)]
     (if neg (rx--take (mut c)) 0)
@@ -474,16 +778,14 @@
     (if neg (rx--class-negate (mut c) (rx--frag-start f)) 0)
     f))
 
-(defn rx--literal [(c (mut (array i64 1280))) (b i64)] (-> i64)
+(defn rx--literal [(c (mut (array i64 5392))) (b i64)] (-> i64)
   (let [f (rx--class-state (mut c))]
     (rx--class-add (mut c) (rx--frag-start f) b)
     f))
 
-(defn rx--escaped [(c (mut (array i64 1280))) (b i64)] (-> i64)
+(defn rx--escaped [(c (mut (array i64 5392))) (b i64)] (-> i64)
   (if (or (primitive/icmp-eq b 98) (primitive/icmp-eq b 66))  ; \b / \B
-      (let [s (rx--state (mut c) (if (primitive/icmp-eq b 98) 5 6))
-            p (rx--new-patch (mut c) s 1)]
-        (rx--frag s p))
+      (rx--single (mut c) (if (primitive/icmp-eq b 98) 5 6))
       (let [f (rx--class-state (mut c))]
         (if (rx--escape-class (mut c) (rx--frag-start f) b)
             0
@@ -498,23 +800,16 @@
                     (primitive/error "regex: unsupported alphanumeric escape (backreferences and Unicode properties are not yet supported)"))))
         f)))
 
-(defn rx--assertion [(c (mut (array i64 1280))) (op i64)] (-> i64)
-  (let [s (rx--state (mut c) op)
-        p (rx--new-patch (mut c) s 1)]
-    (rx--frag s p)))
-
 (defn rx--unexpected-atom? [(b i64)] (-> bool)
   (or (primitive/icmp-eq b 42)
       (or (primitive/icmp-eq b 43)
           (or (primitive/icmp-eq b 63)
               (or (primitive/icmp-eq b 41)
                   (or (primitive/icmp-eq b 124)
-                      (or (primitive/icmp-eq b 94)
-                          (or (primitive/icmp-eq b 36)
-                              (or (primitive/icmp-eq b 123)
-                                  (primitive/icmp-eq b 125))))))))))
+                      (or (primitive/icmp-eq b 123)
+                          (primitive/icmp-eq b 125))))))))
 
-(defn rx--parse-group-flags [(c (mut (array i64 1280))) (flags i64)] (-> i64)
+(defn rx--parse-group-flags [(c (mut (array i64 5392))) (flags i64)] (-> i64)
   (let [b (rx--take (mut c))]
     (if (primitive/icmp-eq b 58)
         flags
@@ -526,11 +821,26 @@
                     (rx--parse-group-flags (mut c) (primitive/ior flags 4))
                     (primitive/error "regex: unsupported '(?' group; expected ?:, ?i:, ?s:, ?m:, or combined flags")))))))
 
-(defn rx--parse-atom [(c (mut (array i64 1280)))] (-> i64)
+; Wrap fragment F in the save states of capturing group INDEX.
+(defn rx--capture [(c (mut (array i64 5392))) (index i64) (f i64)] (-> i64)
+  (let [open (rx--save (mut c) (primitive/imul index 2))
+        close (rx--save (mut c) (primitive/iadd (primitive/imul index 2) 1))]
+    (rx--patch (mut c) (rx--frag-outs open) (rx--frag-start f))
+    (rx--patch (mut c) (rx--frag-outs f) (rx--frag-start close))
+    (rx--frag (rx--frag-start open) (rx--frag-outs close))))
+
+(defn rx--parse-atom [(c (mut (array i64 5392)))] (-> i64)
   (let [b (rx--take (mut c))]
     (if (primitive/icmp-eq b 40)  ; (
         (let [saved-flags (rx--mem (mut c) 5)
-              special (primitive/icmp-eq (rx--peek (mut c)) 63)]
+              special (primitive/icmp-eq (rx--peek (mut c)) 63)
+              ; Groups are numbered by their opening parenthesis, left to right.
+              index
+                (if special
+                    0
+                    (do
+                      (rx--put (mut c) 7 (primitive/iadd (rx--mem (mut c) 7) 1))
+                      (rx--mem (mut c) 7)))]
           (if special
               (do
                 (rx--take (mut c))
@@ -542,27 +852,25 @@
               (if (not (primitive/icmp-eq closed 41))
                   (primitive/error "regex: unmatched '('")
                   0))
-            f))
+            (if (and (not special) (primitive/icmp-eq (rx--mem (mut c) 8) 2))
+                (rx--capture (mut c) index f)
+                f)))
         (if (primitive/icmp-eq b 91)  ; [
             (rx--parse-class (mut c))
             (if (primitive/icmp-eq b 46)  ; . except newline
-                (let [f (rx--class-state (mut c))]
-                  (rx--class-negate (mut c) (rx--frag-start f))
-                  (let [word (primitive/udiv 10 64)
-                        bit (primitive/urem 10 64)
-                        mask (primitive/ishl 1 bit)]
-                    (if (and (primitive/icmp-eq word 0)
-                             (primitive/icmp-eq (primitive/iand (rx--mem (mut c)
-                                                                         5)
-                                                                2)
-                                                0))
-                        (rx--put (mut c)
-                                 (primitive/iadd 208 (rx--frag-start f))
-                                 (primitive/iand (rx--mem (mut c)
-                                                          (primitive/iadd 208
-                                                                          (rx--frag-start f)))
-                                                 (primitive/ixor mask -1)))
-                        0))
+                (let [f (rx--class-state (mut c))
+                      s (rx--frag-start f)]
+                  (rx--class-negate (mut c) s)
+                  (if (primitive/icmp-eq (primitive/iand (rx--mem (mut c) 5) 2)
+                                         0)
+                      (rx--put (mut c)
+                               (rx--mask-slot 0 s)
+                               (primitive/iand (rx--mem (mut c)
+                                                        (rx--mask-slot 0 s))
+                                               (primitive/ixor (primitive/ishl 1
+                                                                               10)
+                                                               -1)))
+                      0)
                   f)
                 (if (primitive/icmp-eq b 92)
                     (let [e (rx--take (mut c))]
@@ -571,54 +879,54 @@
                           0)
                       (rx--escaped (mut c) e))
                     (if (primitive/icmp-eq b 94)
-                        (rx--assertion (mut c)
-                                       (if (primitive/icmp-eq (primitive/iand (rx--mem (mut c)
-                                                                                       5)
-                                                                              4)
-                                                              0)
-                                           3
-                                           7))
+                        (rx--single (mut c)
+                                    (if (primitive/icmp-eq (primitive/iand (rx--mem (mut c)
+                                                                                    5)
+                                                                           4)
+                                                           0)
+                                        3
+                                        7))
                         (if (primitive/icmp-eq b 36)
-                            (rx--assertion (mut c)
-                                           (if (primitive/icmp-eq (primitive/iand (rx--mem (mut c)
-                                                                                           5)
-                                                                                  4)
-                                                                  0)
-                                               4
-                                               8))
+                            (rx--single (mut c)
+                                        (if (primitive/icmp-eq (primitive/iand (rx--mem (mut c)
+                                                                                        5)
+                                                                               4)
+                                                               0)
+                                            4
+                                            8))
                             (if (rx--unexpected-atom? b)
                                 (primitive/error "regex: unexpected metacharacter")
                                 (rx--literal (mut c) b))))))))))
 
-(defn rx--star [(c (mut (array i64 1280))) (f i64)] (-> i64)
+; Greedy repetition prefers another iteration (out1); lazy prefers to stop.
+(defn rx--loop-edges [(c (mut (array i64 5392))) (s i64) (body i64) (lazy bool)] (-> i64)
+  (rx--put (mut c) (if lazy (rx--out2-slot s) (rx--out1-slot s)) body)
+  (rx--new-patch (mut c) s (if lazy 1 2)))
+
+(defn rx--star [(c (mut (array i64 5392))) (f i64) (lazy bool)] (-> i64)
   (let [s (rx--state (mut c) 1)]
-    (rx--put (mut c) (primitive/iadd 80 s) (rx--frag-start f))
     (rx--patch (mut c) (rx--frag-outs f) s)
-    (let [p (rx--new-patch (mut c) s 2)]
-      (rx--frag s p))))
+    (rx--frag s (rx--loop-edges (mut c) s (rx--frag-start f) lazy))))
 
-(defn rx--plus [(c (mut (array i64 1280))) (f i64)] (-> i64)
+(defn rx--plus [(c (mut (array i64 5392))) (f i64) (lazy bool)] (-> i64)
   (let [s (rx--state (mut c) 1)]
-    (rx--put (mut c) (primitive/iadd 80 s) (rx--frag-start f))
     (rx--patch (mut c) (rx--frag-outs f) s)
-    (let [p (rx--new-patch (mut c) s 2)]
-      (rx--frag (rx--frag-start f) p))))
+    (rx--frag (rx--frag-start f)
+              (rx--loop-edges (mut c) s (rx--frag-start f) lazy))))
 
-(defn rx--question [(c (mut (array i64 1280))) (f i64)] (-> i64)
-  (let [s (rx--state (mut c) 1)]
-    (rx--put (mut c) (primitive/iadd 80 s) (rx--frag-start f))
-    (let [skip (rx--new-patch (mut c) s 2)
-          outs (rx--append-patches (mut c) (rx--frag-outs f) skip)]
-      (rx--frag s outs))))
+(defn rx--question [(c (mut (array i64 5392))) (f i64) (lazy bool)] (-> i64)
+  (let [s (rx--state (mut c) 1)
+        skip (rx--loop-edges (mut c) s (rx--frag-start f) lazy)]
+    (rx--frag s (rx--append-patches (mut c) (rx--frag-outs f) skip))))
 
-(defn rx--concat-frags [(c (mut (array i64 1280))) (left i64) (right i64)] (-> i64)
+(defn rx--concat-frags [(c (mut (array i64 5392))) (left i64) (right i64)] (-> i64)
   (rx--patch (mut c) (rx--frag-outs left) (rx--frag-start right))
   (rx--frag (rx--frag-start left) (rx--frag-outs right)))
 
 ; Decimal parser result: low 32 bits are the value, high 32 bits the number of
 ; consumed digits. Counted repetition is intentionally bounded by the machine's
 ; explicit state limit rather than by an arbitrary parser limit.
-(defn rx--parse-uint [(c (mut (array i64 1280))) (value i64) (digits i64)] (-> i64)
+(defn rx--parse-uint [(c (mut (array i64 5392))) (value i64) (digits i64)] (-> i64)
   (let [b (rx--peek (mut c))]
     (if (and (primitive/icmp-ge b 48) (primitive/icmp-le b 57))
         (let [next (primitive/iadd (primitive/imul value 10) (primitive/isub b 48))]
@@ -637,23 +945,33 @@
 (defn rx--uint-digits [(packed i64)] (-> i64)
   (primitive/ishr packed 32))
 
-(defn rx--clone-atom [(c (mut (array i64 1280))) (start i64) (end i64)] (-> i64)
-  (let [resume (rx--mem (mut c) 0)]
+; Re-parse the atom at [START, END) to get a fresh copy of its states. Its
+; capturing groups keep the numbers they had in the first copy: every copy of a
+; repeated group reports to the same group.
+(defn rx--clone-atom [(c (mut (array i64 5392)))
+                      (start i64)
+                      (end i64)
+                      (groups i64)] (-> i64)
+  (let [resume (rx--mem (mut c) 0)
+        groups-after (rx--mem (mut c) 7)]
     (rx--put (mut c) 0 start)
+    (rx--put (mut c) 7 groups)
     (let [f (rx--parse-atom (mut c))]
       (if (not (primitive/icmp-eq (rx--mem (mut c) 0) end))
           (primitive/error "regex: internal counted-repeat atom boundary mismatch")
           0)
       (rx--put (mut c) 0 resume)
+      (rx--put (mut c) 7 groups-after)
       f)))
 
-(defn rx--copies [(c (mut (array i64 1280)))
+(defn rx--copies [(c (mut (array i64 5392)))
                   (start i64)
                   (end i64)
+                  (groups i64)
                   (count i64)
                   (first i64)
                   (use-first bool)] (-> i64)
-  (let [item (if use-first first (rx--clone-atom (mut c) start end))]
+  (let [item (if use-first first (rx--clone-atom (mut c) start end groups))]
     (if (primitive/icmp-eq count 1)
         item
         (rx--concat-frags (mut c)
@@ -661,19 +979,25 @@
                           (rx--copies (mut c)
                                       start
                                       end
+                                      groups
                                       (primitive/isub count 1)
                                       first
                                       false)))))
 
-(defn rx--optional-copies [(c (mut (array i64 1280)))
+(defn rx--optional-copies [(c (mut (array i64 5392)))
                            (start i64)
                            (end i64)
+                           (groups i64)
                            (count i64)
                            (first i64)
-                           (use-first bool)] (-> i64)
+                           (use-first bool)
+                           (lazy bool)] (-> i64)
   (let [item
           (rx--question (mut c)
-                        (if use-first first (rx--clone-atom (mut c) start end)))]
+                        (if use-first
+                            first
+                            (rx--clone-atom (mut c) start end groups))
+                        lazy)]
     (if (primitive/icmp-eq count 1)
         item
         (rx--concat-frags (mut c)
@@ -681,13 +1005,21 @@
                           (rx--optional-copies (mut c)
                                                start
                                                end
+                                               groups
                                                (primitive/isub count 1)
                                                first
-                                               false)))))
+                                               false
+                                               lazy)))))
 
-(defn rx--counted [(c (mut (array i64 1280)))
+(defn rx--take-lazy [(c (mut (array i64 5392)))] (-> bool)
+  (if (primitive/icmp-eq (rx--peek (mut c)) 63)
+      (do (rx--take (mut c)) true)
+      false))
+
+(defn rx--counted [(c (mut (array i64 5392)))
                    (atom-start i64)
                    (atom-end i64)
+                   (groups i64)
                    (first i64)] (-> i64)
   (rx--take (mut c))  ; {
   (let [lower-packed (rx--parse-uint (mut c) 0 0)]
@@ -697,9 +1029,11 @@
     (let [lower (rx--uint-value lower-packed)
           separator (rx--take (mut c))]
       (if (primitive/icmp-eq separator 125)  ; {m}
-          (if (primitive/icmp-eq lower 0)
-              (rx--empty (mut c))
-              (rx--copies (mut c) atom-start atom-end lower first true))
+          (do
+            (rx--take-lazy (mut c))  ; {m}? matches exactly m times either way
+            (if (primitive/icmp-eq lower 0)
+                (rx--empty (mut c))
+                (rx--copies (mut c) atom-start atom-end groups lower first true)))
           (if (not (primitive/icmp-eq separator 44))
               (primitive/error "regex: counted repetition expects ',' or '}'")
               (let [upper-packed (rx--parse-uint (mut c) 0 0)
@@ -712,12 +1046,14 @@
                          (primitive/icmp-lt upper lower))
                     (primitive/error "regex: counted repetition upper bound is below lower bound")
                     0)
-                (let [base
+                (let [lazy (rx--take-lazy (mut c))
+                      base
                         (if (primitive/icmp-eq lower 0)
                             (rx--empty (mut c))
                             (rx--copies (mut c)
                                         atom-start
                                         atom-end
+                                        groups
                                         lower
                                         first
                                         true))]
@@ -728,7 +1064,9 @@
                                             first
                                             (rx--clone-atom (mut c)
                                                             atom-start
-                                                            atom-end)))]
+                                                            atom-end
+                                                            groups))
+                                        lazy)]
                         (rx--concat-frags (mut c) base tail))
                       (let [extra (primitive/isub upper lower)]
                         (if (primitive/icmp-eq extra 0)
@@ -738,198 +1076,127 @@
                                               (rx--optional-copies (mut c)
                                                                    atom-start
                                                                    atom-end
+                                                                   groups
                                                                    extra
                                                                    first
                                                                    (primitive/icmp-eq lower
-                                                                                      0)))))))))))))
+                                                                                      0)
+                                                                   lazy))))))))))))
 
-(defn rx--parse-repeat [(c (mut (array i64 1280)))] (-> i64)
+(defn rx--parse-repeat [(c (mut (array i64 5392)))] (-> i64)
   (let [atom-start (rx--mem (mut c) 0)
+        groups (rx--mem (mut c) 7)
         f (rx--parse-atom (mut c))
         atom-end (rx--mem (mut c) 0)
-        q (rx--peek (mut c))
-        repeated
-          (if (primitive/icmp-eq q 42)
-              (do (rx--take (mut c)) (rx--star (mut c) f))
-              (if (primitive/icmp-eq q 43)
-                  (do (rx--take (mut c)) (rx--plus (mut c) f))
-                  (if (primitive/icmp-eq q 63)
-                      (do (rx--take (mut c)) (rx--question (mut c) f))
-                      (if (primitive/icmp-eq q 123)
-                          (rx--counted (mut c) atom-start atom-end f)
-                          f))))]
-    ; Greedy and lazy quantifiers recognize the same language. Until captures
-    ; expose match preference, consuming the lazy suffix is semantically exact.
-    (if (and (or (primitive/icmp-eq q 42)
-                 (or (primitive/icmp-eq q 43)
-                     (or (primitive/icmp-eq q 63) (primitive/icmp-eq q 123))))
-             (primitive/icmp-eq (rx--peek (mut c)) 63))
-        (rx--take (mut c))
-        0)
-    repeated))
+        q (rx--peek (mut c))]
+    (if (primitive/icmp-eq q 42)
+        (do (rx--take (mut c)) (rx--star (mut c) f (rx--take-lazy (mut c))))
+        (if (primitive/icmp-eq q 43)
+            (do (rx--take (mut c)) (rx--plus (mut c) f (rx--take-lazy (mut c))))
+            (if (primitive/icmp-eq q 63)
+                (do
+                  (rx--take (mut c))
+                  (rx--question (mut c) f (rx--take-lazy (mut c))))
+                (if (primitive/icmp-eq q 123)
+                    (rx--counted (mut c) atom-start atom-end groups f)
+                    f))))))
 
 (defn rx--concat-end? [(b i64)] (-> bool)
   (or (primitive/icmp-lt b 0)
       (or (primitive/icmp-eq b 41) (primitive/icmp-eq b 124))))
 
-(defn rx--parse-concat-tail [(c (mut (array i64 1280))) (left i64)] (-> i64)
+(defn rx--parse-concat-tail [(c (mut (array i64 5392))) (left i64)] (-> i64)
   (if (rx--concat-end? (rx--peek (mut c)))
       left
-      (let [right (rx--parse-repeat (mut c))]
-        (rx--patch (mut c) (rx--frag-outs left) (rx--frag-start right))
-        (rx--parse-concat-tail (mut c)
-                               (rx--frag (rx--frag-start left)
-                                         (rx--frag-outs right))))))
+      (rx--parse-concat-tail (mut c)
+                             (rx--concat-frags (mut c)
+                                               left
+                                               (rx--parse-repeat (mut c))))))
 
-(defn rx--parse-concat [(c (mut (array i64 1280)))] (-> i64)
+(defn rx--parse-concat [(c (mut (array i64 5392)))] (-> i64)
   (if (rx--concat-end? (rx--peek (mut c)))
       (rx--empty (mut c))
       (rx--parse-concat-tail (mut c) (rx--parse-repeat (mut c)))))
 
-(defn rx--parse-alt [(c (mut (array i64 1280)))] (-> i64)
+(defn rx--parse-alt [(c (mut (array i64 5392)))] (-> i64)
   (let [left (rx--parse-concat (mut c))]
     (if (primitive/icmp-eq (rx--peek (mut c)) 124)
         (do
           (rx--take (mut c))
           (let [right (rx--parse-alt (mut c))
                 s (rx--state (mut c) 1)]
-            (rx--put (mut c) (primitive/iadd 80 s) (rx--frag-start left))
-            (rx--put (mut c) (primitive/iadd 144 s) (rx--frag-start right))
-            (let [outs
-                    (rx--append-patches (mut c)
-                                        (rx--frag-outs left)
-                                        (rx--frag-outs right))]
-              (rx--frag s outs))))
+            (rx--put (mut c) (rx--out1-slot s) (rx--frag-start left))
+            (rx--put (mut c) (rx--out2-slot s) (rx--frag-start right))
+            (rx--frag s
+                      (rx--append-patches (mut c)
+                                          (rx--frag-outs left)
+                                          (rx--frag-outs right)))))
         left)))
 
-(defn rx--word-at [(hay Code) (index Code) (length Code)] (-> Code)
-  `(if (or (primitive/icmp-lt ~index 0) (primitive/icmp-ge ~index ~length))
-       false
-       (let [b
-               (primitive/cast i64
-                               (primitive/load (primitive/index (coil.slice.slice-data ~hay)
-                                                                ~index)))]
-         (or (and (primitive/icmp-ge b 48) (primitive/icmp-le b 57))
-             (or (and (primitive/icmp-ge b 65) (primitive/icmp-le b 90))
-                 (or (primitive/icmp-eq b 95)
-                     (and (primitive/icmp-ge b 97) (primitive/icmp-le b 122))))))))
+; Parse BYTES into C. SAVE-MODE 0 emits no save states (is-match?), 1 saves
+; only the whole match, 2 saves every capturing group. Records the start state in
+; header slot 10 and the accept state in slot 11.
+(defn rx--build [(c (mut (array i64 5392)))
+                 (bs Code)
+                 (save-mode i64)
+                 (limit i64)] (-> i64)
+  (rx--put (mut c) 4 (primitive/code-opaque bs))
+  (rx--put (mut c) 0 0)
+  (rx--put (mut c) 1 (primitive/code-count bs))
+  (rx--put (mut c) 6 limit)
+  (rx--put (mut c) 8 save-mode)
+  (let [body (rx--parse-alt (mut c))]
+    (if (not (primitive/icmp-eq (rx--mem (mut c) 0) (rx--mem (mut c) 1)))
+        (if (primitive/icmp-eq (rx--peek (mut c)) 41)
+            (primitive/error "regex: unmatched ')'")
+            (primitive/error "regex: pattern did not parse completely"))
+        0)
+    (let [whole
+            (if (primitive/icmp-eq save-mode 0)
+                body
+                (rx--capture (mut c) 0 body))
+          accept (rx--state (mut c) 2)]
+      (rx--patch (mut c) (rx--frag-outs whole) accept)
+      (rx--put (mut c) 10 (rx--frag-start whole))
+      (rx--put (mut c) 11 accept))))
 
-(defn rx--boundary-at [(hay Code) (index Code) (length Code)] (-> Code)
-  `(not (= ~(rx--word-at hay `(primitive/isub ~index 1) length)
-           ~(rx--word-at hay index length))))
-
-(defn rx--closure [(c (mut (array i64 1280)))
-                   (s i64)
-                   (seen i64)
-                   (index Code)
-                   (length Code)
-                   (hay Code)] (-> Code)
-  (if (primitive/icmp-lt s 0)
-      `0
-      (let [bit (primitive/ishl 1 s)]
-        (if (not (primitive/icmp-eq (primitive/iand seen bit) 0))
-            `0
-            (let [now (primitive/ior seen bit)
-                  op (rx--mem (mut c) (primitive/iadd 16 s))]
-              (if (primitive/icmp-eq op 1)
-                  `(primitive/ior ~(rx--closure (mut c)
-                                                (rx--mem (mut c)
-                                                         (primitive/iadd 80 s))
-                                                now
-                                                index
-                                                length
-                                                hay)
-                                  ~(rx--closure (mut c)
-                                                (rx--mem (mut c)
-                                                         (primitive/iadd 144 s))
-                                                now
-                                                index
-                                                length
-                                                hay))
-                  (if (or (primitive/icmp-eq op 3)
-                          (or (primitive/icmp-eq op 4)
-                              (or (primitive/icmp-eq op 5)
-                                  (or (primitive/icmp-eq op 6)
-                                      (or (primitive/icmp-eq op 7)
-                                          (primitive/icmp-eq op 8))))))
-                      `(if ~(if (primitive/icmp-eq op 3)
-                                `(primitive/icmp-eq ~index 0)
-                                (if (primitive/icmp-eq op 4)
-                                    `(primitive/icmp-eq ~index ~length)
-                                    (if (primitive/icmp-eq op 5)
-                                        (rx--boundary-at hay index length)
-                                        (if (primitive/icmp-eq op 6)
-                                            `(not ~(rx--boundary-at hay
-                                                                    index
-                                                                    length))
-                                            (if (primitive/icmp-eq op 7)
-                                                `(or (primitive/icmp-eq ~index
-                                                                        0)
-                                                     (and (primitive/icmp-gt ~index
-                                                                             0)
-                                                          (primitive/icmp-eq (primitive/cast i64
-                                                                                             (primitive/load (primitive/index (coil.slice.slice-data ~hay)
-                                                                                                                              (primitive/isub ~index
-                                                                                                                                              1))))
-                                                                             10)))
-                                                `(or (primitive/icmp-eq ~index
-                                                                        ~length)
-                                                     (and (primitive/icmp-lt ~index
-                                                                             ~length)
-                                                          (primitive/icmp-eq (primitive/cast i64
-                                                                                             (primitive/load (primitive/index (coil.slice.slice-data ~hay)
-                                                                                                                              ~index)))
-                                                                             10))))))))
-                           ~(rx--closure (mut c)
-                                         (rx--mem (mut c) (primitive/iadd 80 s))
-                                         now
-                                         index
-                                         length
-                                         hay)
-                           0)
-                      `~bit)))))))
-
-(defn rx--reachable-without? [(c (mut (array i64 1280)))
-                              (state i64)
-                              (accept i64)
-                              (skip i64)
-                              (seen i64)] (-> bool)
+; ---- compile-time analyses -------------------------------------------------
+(defn rx--reachable-without-from? [(c (mut (array i64 5392)))
+                                   (state i64)
+                                   (accept i64)
+                                   (skip i64)] (-> bool)
   (if (or (primitive/icmp-lt state 0) (primitive/icmp-eq state skip))
       false
       (if (primitive/icmp-eq state accept)
           true
-          (let [bit (primitive/ishl 1 state)]
-            (if (not (primitive/icmp-eq (primitive/iand seen bit) 0))
-                false
-                (let [now (primitive/ior seen bit)
-                      op (rx--mem (mut c) (primitive/iadd 16 state))]
-                  (if (primitive/icmp-eq op 1)
-                      (or (rx--reachable-without? (mut c)
-                                                  (rx--mem (mut c)
-                                                           (primitive/iadd 80
-                                                                           state))
-                                                  accept
-                                                  skip
-                                                  now)
-                          (rx--reachable-without? (mut c)
-                                                  (rx--mem (mut c)
-                                                           (primitive/iadd 144
-                                                                           state))
-                                                  accept
-                                                  skip
-                                                  now))
-                      (rx--reachable-without? (mut c)
-                                              (rx--mem (mut c)
-                                                       (primitive/iadd 80 state))
-                                              accept
-                                              skip
-                                              now))))))))
+          (if (not (rx--visit! (mut c) state))
+              false
+              (if (primitive/icmp-eq (rx--op (mut c) state) 1)
+                  (or (rx--reachable-without-from? (mut c)
+                                                   (rx--out1 (mut c) state)
+                                                   accept
+                                                   skip)
+                      (rx--reachable-without-from? (mut c)
+                                                   (rx--out2 (mut c) state)
+                                                   accept
+                                                   skip))
+                  (rx--reachable-without-from? (mut c)
+                                               (rx--out1 (mut c) state)
+                                               accept
+                                               skip))))))
 
-(defn rx--singleton-byte [(c (mut (array i64 1280))) (state i64)] (-> i64)
-  (let [m0 (rx--mem (mut c) (primitive/iadd 208 state))
-        m1 (rx--mem (mut c) (primitive/iadd 272 state))
-        m2 (rx--mem (mut c) (primitive/iadd 336 state))
-        m3 (rx--mem (mut c) (primitive/iadd 400 state))
+(defn rx--reachable-without? [(c (mut (array i64 5392)))
+                              (state i64)
+                              (accept i64)
+                              (skip i64)] (-> bool)
+  (rx--new-visit! (mut c))
+  (rx--reachable-without-from? (mut c) state accept skip))
+
+(defn rx--singleton-byte [(c (mut (array i64 5392))) (state i64)] (-> i64)
+  (let [m0 (rx--mem (mut c) (rx--mask-slot 0 state))
+        m1 (rx--mem (mut c) (rx--mask-slot 1 state))
+        m2 (rx--mem (mut c) (rx--mask-slot 2 state))
+        m3 (rx--mem (mut c) (rx--mask-slot 3 state))
         count
           (primitive/iadd (primitive/iadd (primitive/popcount m0)
                                           (primitive/popcount m1))
@@ -948,16 +1215,16 @@
 ; A singleton consuming state that dominates accept is a required byte. A
 ; whole-haystack memchr can reject the overwhelmingly common absent case before
 ; entering the state machine. This is conservative: no dominator means no filter.
-(defn rx--required-byte [(c (mut (array i64 1280)))
+(defn rx--required-byte [(c (mut (array i64 5392)))
                          (start i64)
                          (accept i64)
                          (state i64)] (-> i64)
   (if (primitive/icmp-ge state (rx--mem (mut c) 2))
       -1
-      (if (primitive/icmp-eq (rx--mem (mut c) (primitive/iadd 16 state)) 0)
+      (if (primitive/icmp-eq (rx--op (mut c) state) 0)
           (let [byte (rx--singleton-byte (mut c) state)]
             (if (and (primitive/icmp-ge byte 0)
-                     (not (rx--reachable-without? (mut c) start accept state 0)))
+                     (not (rx--reachable-without? (mut c) start accept state)))
                 byte
                 (rx--required-byte (mut c)
                                    start
@@ -965,11 +1232,90 @@
                                    (primitive/iadd state 1))))
           (rx--required-byte (mut c) start accept (primitive/iadd state 1)))))
 
-(defn rx--byte-test [(c (mut (array i64 1280))) (s i64) (byte Code)] (-> Code)
-  (let [m0 (rx--mem (mut c) (primitive/iadd 208 s))
-        m1 (rx--mem (mut c) (primitive/iadd 272 s))
-        m2 (rx--mem (mut c) (primitive/iadd 336 s))
-        m3 (rx--mem (mut c) (primitive/iadd 400 s))]
+; True when every path from STATE meets a non-multiline `^` before consuming a
+; byte or accepting, so a match can only start at haystack offset 0.
+(defn rx--anchored-from? [(c (mut (array i64 5392))) (state i64)] (-> bool)
+  (if (or (primitive/icmp-lt state 0) (not (rx--visit! (mut c) state)))
+      true
+      (let [op (rx--op (mut c) state)]
+        (if (primitive/icmp-eq op 3)
+            true
+            (if (or (primitive/icmp-eq op 0) (primitive/icmp-eq op 2))
+                false
+                (if (primitive/icmp-eq op 1)
+                    (and (rx--anchored-from? (mut c) (rx--out1 (mut c) state))
+                         (rx--anchored-from? (mut c) (rx--out2 (mut c) state)))
+                    (rx--anchored-from? (mut c) (rx--out1 (mut c) state))))))))
+
+(defn rx--anchored? [(c (mut (array i64 5392)))] (-> bool)
+  (rx--new-visit! (mut c))
+  (rx--anchored-from? (mut c) (rx--mem (mut c) 10)))
+
+; Mark the states reachable from STATE in the live area.
+(defn rx--mark-live [(c (mut (array i64 5392))) (state i64)] (-> i64)
+  (if (or (primitive/icmp-lt state 0)
+          (primitive/icmp-eq (rx--mem (mut c) (rx--live-slot state)) 1))
+      0
+      (do
+        (rx--put (mut c) (rx--live-slot state) 1)
+        (rx--mark-live (mut c) (rx--out1 (mut c) state))
+        (if (primitive/icmp-eq (rx--op (mut c) state) 1)
+            (rx--mark-live (mut c) (rx--out2 (mut c) state))
+            0))))
+
+(defn rx--live? [(c (mut (array i64 5392))) (state i64)] (-> bool)
+  (primitive/icmp-eq (rx--mem (mut c) (rx--live-slot state)) 1))
+
+; ---- shared code generation ------------------------------------------------
+(defn rx--word-at [(hay Code) (index Code) (length Code)] (-> Code)
+  `(if (or (primitive/icmp-lt ~index 0) (primitive/icmp-ge ~index ~length))
+       false
+       (let [b
+               (primitive/cast i64
+                               (primitive/load (primitive/index (coil.slice.slice-data ~hay)
+                                                                ~index)))]
+         (or (and (primitive/icmp-ge b 48) (primitive/icmp-le b 57))
+             (or (and (primitive/icmp-ge b 65) (primitive/icmp-le b 90))
+                 (or (primitive/icmp-eq b 95)
+                     (and (primitive/icmp-ge b 97) (primitive/icmp-le b 122))))))))
+
+(defn rx--boundary-at [(hay Code) (index Code) (length Code)] (-> Code)
+  `(not (= ~(rx--word-at hay `(primitive/isub ~index 1) length)
+           ~(rx--word-at hay index length))))
+
+(defn rx--assertion? [(op i64)] (-> bool)
+  (and (primitive/icmp-ge op 3) (primitive/icmp-le op 8)))
+
+; The run-time condition of zero-width assertion OP at INDEX.
+(defn rx--assert-test [(op i64) (hay Code) (index Code) (length Code)] (-> Code)
+  (if (primitive/icmp-eq op 3)
+      `(primitive/icmp-eq ~index 0)
+      (if (primitive/icmp-eq op 4)
+          `(primitive/icmp-eq ~index ~length)
+          (if (primitive/icmp-eq op 5)
+              (rx--boundary-at hay index length)
+              (if (primitive/icmp-eq op 6)
+                  `(not ~(rx--boundary-at hay index length))
+                  (if (primitive/icmp-eq op 7)
+                      `(or (primitive/icmp-eq ~index 0)
+                           (and (primitive/icmp-gt ~index 0)
+                                (primitive/icmp-eq (primitive/cast i64
+                                                                   (primitive/load (primitive/index (coil.slice.slice-data ~hay)
+                                                                                                    (primitive/isub ~index
+                                                                                                                    1))))
+                                                   10)))
+                      `(or (primitive/icmp-eq ~index ~length)
+                           (and (primitive/icmp-lt ~index ~length)
+                                (primitive/icmp-eq (primitive/cast i64
+                                                                   (primitive/load (primitive/index (coil.slice.slice-data ~hay)
+                                                                                                    ~index)))
+                                                   10)))))))))
+
+(defn rx--byte-test [(c (mut (array i64 5392))) (s i64) (byte Code)] (-> Code)
+  (let [m0 (rx--mem (mut c) (rx--mask-slot 0 s))
+        m1 (rx--mem (mut c) (rx--mask-slot 1 s))
+        m2 (rx--mem (mut c) (rx--mask-slot 2 s))
+        m3 (rx--mem (mut c) (rx--mask-slot 3 s))]
     `(let [word (primitive/udiv ~byte 64)
            bit (primitive/urem ~byte 64)
            mask
@@ -981,7 +1327,52 @@
        (not (primitive/icmp-eq (primitive/iand mask (primitive/ishl 1 bit))
                                0)))))
 
-(defn rx--step [(c (mut (array i64 1280)))
+; ---- bit-parallel engine (is-match?) -----------------------------------------
+(defn rx--closure [(c (mut (array i64 5392)))
+                   (s i64)
+                   (seen i64)
+                   (index Code)
+                   (length Code)
+                   (hay Code)] (-> Code)
+  (if (primitive/icmp-lt s 0)
+      `0
+      (let [bit (primitive/ishl 1 s)]
+        (if (not (primitive/icmp-eq (primitive/iand seen bit) 0))
+            `0
+            (let [now (primitive/ior seen bit)
+                  op (rx--op (mut c) s)]
+              (if (primitive/icmp-eq op 1)
+                  `(primitive/ior ~(rx--closure (mut c)
+                                                (rx--out1 (mut c) s)
+                                                now
+                                                index
+                                                length
+                                                hay)
+                                  ~(rx--closure (mut c)
+                                                (rx--out2 (mut c) s)
+                                                now
+                                                index
+                                                length
+                                                hay))
+                  (if (rx--assertion? op)
+                      `(if ~(rx--assert-test op hay index length)
+                           ~(rx--closure (mut c)
+                                         (rx--out1 (mut c) s)
+                                         now
+                                         index
+                                         length
+                                         hay)
+                           0)
+                      (if (primitive/icmp-eq op 9)
+                          (rx--closure (mut c)
+                                       (rx--out1 (mut c) s)
+                                       now
+                                       index
+                                       length
+                                       hay)
+                          `~bit))))))))
+
+(defn rx--step [(c (mut (array i64 5392)))
                 (state i64)
                 (active Code)
                 (byte Code)
@@ -990,10 +1381,15 @@
                 (hay Code)] (-> Code)
   (if (primitive/icmp-ge state (rx--mem (mut c) 2))
       `0
-      (if (primitive/icmp-eq (rx--mem (mut c) (primitive/iadd 16 state)) 0)
+      (if (primitive/icmp-eq (rx--op (mut c) state) 0)
           (let [bit (primitive/ishl 1 state)
-                target (rx--mem (mut c) (primitive/iadd 80 state))
-                closure (rx--closure (mut c) target 0 next-index length hay)]
+                closure
+                  (rx--closure (mut c)
+                               (rx--out1 (mut c) state)
+                               0
+                               next-index
+                               length
+                               hay)]
             `(primitive/ior (if (and (not (primitive/icmp-eq (primitive/iand ~active
                                                                              ~bit)
                                                              0))
@@ -1015,111 +1411,596 @@
                     length
                     hay))))
 
-(defn rx--compile [(pattern Code) (haystack Code)] (-> Code)
+(defn rx--pattern-bytes [(pattern Code)] (-> Code)
   (if (not (primitive/code-string? pattern))
       (primitive/error "regex: pattern must be a string literal")
       0)
-  (let [bs (primitive/str-bytes pattern)
-        n (primitive/code-count bs)]
-    (let [start-anchor
-            (and (primitive/icmp-gt n 0)
-                 (primitive/icmp-eq (primitive/code-int (primitive/code-nth bs
-                                                                            0))
-                                    94))
-          end-anchor
-            (and (primitive/icmp-gt n 0)
-                 (and (primitive/icmp-eq (primitive/code-int (primitive/code-nth bs
-                                                                                 (primitive/isub n
-                                                                                                 1)))
-                                         36)
-                      (not (rx--escaped-at? bs (primitive/isub n 1)))))
-          lo (if start-anchor 1 0)
-          hi (if end-anchor (primitive/isub n 1) n)
-          literal (rx--literal-bytes bs lo hi (primitive/code-list-new))]
-      (if (not (primitive/code-eq literal `:not-literal))
-          (rx--literal-search literal haystack start-anchor end-anchor)
-          (let [(mut compiler) (primitive/zeroed (array i64 1280))]
-            (rx--put (mut compiler) 4 (primitive/code-opaque bs))
-            (rx--put (mut compiler) 0 lo)
-            (rx--put (mut compiler) 1 hi)
-            (let [f (rx--parse-alt (mut compiler))]
-              (if (not (primitive/icmp-eq (rx--mem (mut compiler) 0) hi))
-                  (primitive/error "regex: pattern did not parse completely")
-                  0)
-              (let [accept (rx--state (mut compiler) 2)]
-                (rx--patch (mut compiler) (rx--frag-outs f) accept)
-                (let [required
-                        (rx--required-byte (mut compiler)
-                                           (rx--frag-start f)
-                                           accept
-                                           0)
-                      accept-bit (primitive/ishl 1 accept)
-                      hay (primitive/fresh-identifier "regex-haystack")
-                      active (primitive/fresh-identifier "regex-active")
-                      current (primitive/fresh-identifier "regex-current")
-                      byte (primitive/fresh-identifier "regex-byte")
-                      index (primitive/fresh-identifier "regex-index")
-                      length `(coil.slice.slice-len ~hay)
-                      initial
-                        (rx--closure (mut compiler)
-                                     (rx--frag-start f)
-                                     0
-                                     `0
-                                     length
-                                     hay)]
-                  `(let [~hay ~haystack
-                         (mut ~active) ~initial
-                         (mut ~index)
-                           ~(if (primitive/icmp-ge required 0)
-                                `(if (= (primitive/cast i64
-                                                        (coil.mem.mem-find-byte (coil.slice.slice-data ~hay)
-                                                                                (primitive/cast u8
-                                                                                                ~required)
-                                                                                (coil.slice.slice-len ~hay)))
-                                        0)
-                                     (coil.slice.slice-len ~hay)
-                                     0)
-                                `0)]
-                     (loop :regex-search
-                       (let [~current
-                               (if ~start-anchor
-                                   (primitive/load ~active)
-                                   (primitive/ior (primitive/load ~active)
-                                                  ~(rx--closure (mut compiler)
-                                                                (rx--frag-start f)
-                                                                0
-                                                                `(primitive/load ~index)
-                                                                length
-                                                                hay)))]
-                         (if (and (not (primitive/icmp-eq (primitive/iand ~current
-                                                                          ~accept-bit)
-                                                          0))
-                                  (if ~end-anchor
-                                      (primitive/icmp-eq (primitive/load ~index)
-                                                         (coil.slice.slice-len ~hay))
-                                      true))
-                             (break :regex-search true)
-                             (if (primitive/icmp-ge (primitive/load ~index)
-                                                    (coil.slice.slice-len ~hay))
-                                 (break :regex-search false)
-                                 (let [~byte
-                                         (primitive/cast i64
-                                                         (primitive/load (primitive/index (coil.slice.slice-data ~hay)
-                                                                                          (primitive/load ~index))))]
-                                   (primitive/store! ~active
-                                                     ~(rx--step (mut compiler)
-                                                                0
-                                                                current
-                                                                byte
-                                                                `(primitive/iadd (primitive/load ~index)
-                                                                                 1)
-                                                                length
-                                                                hay))
-                                   (primitive/store! ~index
-                                                     (primitive/iadd (primitive/load ~index)
-                                                                     1))))))))))))))))
+  (primitive/str-bytes pattern))
 
-;;; Compile PATTERN into an allocation-free byte matcher at the call site.
-;;; See docs/reference/REGEX.md for syntax and explicit compatibility limits.
+; When the pattern is a literal between optional `^`/`$` anchors, return the
+; literal bytes; otherwise :not-literal. Anchors only count at the very ends, so
+; the literal recognizer rejecting `|` keeps `^a|b` on the automaton path.
+(defn rx--literal-shape [(bs Code)] (-> Code)
+  (let [n (primitive/code-count bs)
+        start-anchor (rx--starts-anchored? bs)
+        end-anchor (rx--ends-anchored? bs)
+        lo (if start-anchor 1 0)
+        hi (if (and end-anchor (primitive/icmp-gt n lo)) (primitive/isub n 1) n)]
+    (rx--literal-bytes bs lo hi (primitive/code-list-new))))
+
+(defn rx--starts-anchored? [(bs Code)] (-> bool)
+  (and (primitive/icmp-gt (primitive/code-count bs) 0)
+       (primitive/icmp-eq (primitive/code-int (primitive/code-nth bs 0)) 94)))
+
+(defn rx--ends-anchored? [(bs Code)] (-> bool)
+  (let [n (primitive/code-count bs)]
+    (and (primitive/icmp-gt n (if (rx--starts-anchored? bs) 1 0))
+         (and (primitive/icmp-eq (primitive/code-int (primitive/code-nth bs
+                                                                         (primitive/isub n
+                                                                                         1)))
+                                 36)
+              (not (rx--escaped-at? bs (primitive/isub n 1)))))))
+
+(defn rx--compile [(pattern Code) (haystack Code)] (-> Code)
+  (let [bs (rx--pattern-bytes pattern)
+        literal (rx--literal-shape bs)]
+    (if (not (primitive/code-eq literal `:not-literal))
+        (rx--literal-search literal
+                            haystack
+                            (rx--starts-anchored? bs)
+                            (rx--ends-anchored? bs))
+        (let [(mut compiler) (primitive/zeroed (array i64 5392))]
+          (rx--build (mut compiler) bs 0 63)
+          (let [start (rx--mem (mut compiler) 10)
+                accept (rx--mem (mut compiler) 11)
+                required (rx--required-byte (mut compiler) start accept 0)
+                anchored (rx--anchored? (mut compiler))
+                accept-bit (primitive/ishl 1 accept)
+                hay (primitive/fresh-identifier "regex-haystack")
+                active (primitive/fresh-identifier "regex-active")
+                current (primitive/fresh-identifier "regex-current")
+                byte (primitive/fresh-identifier "regex-byte")
+                index (primitive/fresh-identifier "regex-index")
+                length `(coil.slice.slice-len ~hay)
+                initial (rx--closure (mut compiler) start 0 `0 length hay)]
+            `(let [~hay ~haystack
+                   (mut ~active) ~initial
+                   (mut ~index)
+                     ~(if (primitive/icmp-ge required 0)
+                          `(if (= (primitive/cast i64
+                                                  (coil.mem.mem-find-byte (coil.slice.slice-data ~hay)
+                                                                          (primitive/cast u8
+                                                                                          ~required)
+                                                                          (coil.slice.slice-len ~hay)))
+                                  0)
+                               (coil.slice.slice-len ~hay)
+                               0)
+                          `0)]
+               (loop :regex-search
+                 (let [~current
+                         ~(if anchored
+                              `(primitive/load ~active)
+                              `(primitive/ior (primitive/load ~active)
+                                              ~(rx--closure (mut compiler)
+                                                            start
+                                                            0
+                                                            `(primitive/load ~index)
+                                                            length
+                                                            hay)))]
+                   (if (not (primitive/icmp-eq (primitive/iand ~current
+                                                               ~accept-bit)
+                                               0))
+                       (break :regex-search true)
+                       (if (or (primitive/icmp-ge (primitive/load ~index)
+                                                  (coil.slice.slice-len ~hay))
+                               ~(if anchored
+                                    `(primitive/icmp-eq ~current 0)
+                                    `false))
+                           (break :regex-search false)
+                           (let [~byte
+                                   (primitive/cast i64
+                                                   (primitive/load (primitive/index (coil.slice.slice-data ~hay)
+                                                                                    (primitive/load ~index))))]
+                             (primitive/store! ~active
+                                               ~(rx--step (mut compiler)
+                                                          0
+                                                          current
+                                                          byte
+                                                          `(primitive/iadd (primitive/load ~index)
+                                                                           1)
+                                                          length
+                                                          hay))
+                             (primitive/store! ~index
+                                               (primitive/iadd (primitive/load ~index)
+                                                               1)))))))))))))
+
+; ---- Pike VM (find, captures) ------------------------------------------------
+;
+; Generated locals, all fixed-size: two thread lists of N states each with K
+; capture slots per thread, a visit stamp per state, the working capture
+; registers, and an explicit stack for the epsilon closure (one entry per
+; visited state at most: a split pushes its second edge, a save pushes the
+; register value to restore).
+(defstruct RxPike
+  [(n i64)
+   (k i64)
+   (hay Code)
+   (len Code)
+   (lists Code)
+   (caps Code)
+   (marks Code)
+   (gen Code)
+   (regs Code)
+   (stk Code)
+   (stv Code)
+   (sp Code)
+   (s Code)
+   (best Code)])
+
+(defn rx--cell [(array Code) (index Code)] (-> Code)
+  `(primitive/index (mut ~array) ~index))
+
+(defn rx--get [(array Code) (index Code)] (-> Code)
+  `(primitive/load ~(rx--cell array index)))
+
+; Copy K slots from FROM[from-base..] to TO[to-base..], unrolled.
+(defn rx--copy-slots [(k i64)
+                      (to Code)
+                      (to-base Code)
+                      (from Code)
+                      (from-base Code)] (-> Code)
+  (let [out (primitive/code-list-new)
+        (mut j) 0]
+    (loop (if (primitive/icmp-ge (primitive/load j) k)
+              (break)
+              (do
+                (primitive/code-list-push! out
+                                           `(primitive/store! ~(rx--cell to
+                                                                         `(primitive/iadd ~to-base
+                                                                                          ~(primitive/load j)))
+                                                              ~(rx--get from
+                                                                        `(primitive/iadd ~from-base
+                                                                                         ~(primitive/load j)))))
+                (primitive/store! j (primitive/iadd (primitive/load j) 1)))))
+    `(do ~@(primitive/code-list-done out) 0)))
+
+(defn rx--follow-arms [(c (mut (array i64 5392)))
+                       (p RxPike)
+                       (pos Code)
+                       (state i64)
+                       (out CodeBuilder)] (-> Code)
+  (if (primitive/icmp-ge state (rx--mem (mut c) 2))
+      (primitive/code-list-done out)
+      (let [op (rx--op (mut c) state)
+            next (rx--out1 (mut c) state)]
+        (if (rx--live? (mut c) state)
+            (if (and (primitive/icmp-eq op 1)
+                     (primitive/icmp-ge (rx--out2 (mut c) state) 0))
+                (do
+                  (primitive/code-list-push! out `~state)
+                  (primitive/code-list-push! out
+                                             `(do
+                                                (primitive/store! ~(rx--cell (.stk p)
+                                                                             `(primitive/load ~(.sp p)))
+                                                                  ~(rx--out2 (mut c)
+                                                                             state))
+                                                (primitive/store! ~(.sp p)
+                                                                  (primitive/iadd (primitive/load ~(.sp p))
+                                                                                  1))
+                                                (primitive/store! ~(.s p) ~next)
+                                                0)))
+                (if (or (primitive/icmp-eq op 1)
+                        (and (primitive/icmp-eq op 9)
+                             (primitive/icmp-ge (rx--mem (mut c)
+                                                         (rx--mask-slot 0 state))
+                                                (.k p))))
+                    ; An empty fragment (a split with one edge), or a group
+                    ; save this mode does not record.
+                    (do
+                      (primitive/code-list-push! out `~state)
+                      (primitive/code-list-push! out
+                                                 `(do
+                                                    (primitive/store! ~(.s p)
+                                                                      ~next)
+                                                    0)))
+                    (if (primitive/icmp-eq op 9)
+                        (let [slot (rx--mem (mut c) (rx--mask-slot 0 state))]
+                          (primitive/code-list-push! out `~state)
+                          (primitive/code-list-push! out
+                                                     `(do
+                                                        (primitive/store! ~(rx--cell (.stv p)
+                                                                                     `(primitive/load ~(.sp p)))
+                                                                          ~(rx--get (.regs p)
+                                                                                    `~slot))
+                                                        (primitive/store! ~(rx--cell (.stk p)
+                                                                                     `(primitive/load ~(.sp p)))
+                                                                          ~(primitive/isub -1
+                                                                                           slot))
+                                                        (primitive/store! ~(.sp p)
+                                                                          (primitive/iadd (primitive/load ~(.sp p))
+                                                                                          1))
+                                                        (primitive/store! ~(rx--cell (.regs p)
+                                                                                     `~slot)
+                                                                          ~pos)
+                                                        (primitive/store! ~(.s p)
+                                                                          ~next)
+                                                        0)))
+                        (if (rx--assertion? op)
+                            (do
+                              (primitive/code-list-push! out `~state)
+                              (primitive/code-list-push! out
+                                                         `(if ~(rx--assert-test op
+                                                                                (.hay p)
+                                                                                pos
+                                                                                (.len p))
+                                                              (do
+                                                                (primitive/store! ~(.s p)
+                                                                                  ~next)
+                                                                0)
+                                                              (do
+                                                                (primitive/store! ~(.s p)
+                                                                                  -1)
+                                                                0))))
+                            0))))
+            0)
+        (rx--follow-arms (mut c) p pos (primitive/iadd state 1) out))))
+
+; Add the epsilon closure of START at position POS to thread list LIST (a
+; run-time 0 or 1), in priority order, as RE2's AddToThreadq does. States
+; already stamped with the current generation are skipped: an earlier, higher
+; priority path reached them first. Leaves (byte classes and accept) join the
+; list with a copy of the capture registers.
+(defn rx--pike-add [(c (mut (array i64 5392)))
+                    (p RxPike)
+                    (list Code)
+                    (count Code)
+                    (start Code)
+                    (pos Code)] (-> Code)
+  (let [n (.n p)
+        k (.k p)
+        sp (.sp p)
+        s (.s p)
+        entry (primitive/fresh-identifier "regex-entry")
+        state (primitive/fresh-identifier "regex-state")
+        slot (primitive/fresh-identifier "regex-slot")
+        arms (rx--follow-arms (mut c) p pos 0 (primitive/code-list-new))]
+    `(do
+       (primitive/store! ~(rx--cell (.stk p) `0) ~start)
+       (primitive/store! ~sp 1)
+       (loop :regex-add
+         (if (primitive/icmp-eq (primitive/load ~sp) 0)
+             (break :regex-add 0)
+             (do
+               (primitive/store! ~sp (primitive/isub (primitive/load ~sp) 1))
+               (let [~entry ~(rx--get (.stk p) `(primitive/load ~sp))]
+                 (if (primitive/icmp-lt ~entry 0)
+                     (do
+                       (primitive/store! ~(rx--cell (.regs p)
+                                                    `(primitive/isub -1 ~entry))
+                                         ~(rx--get (.stv p)
+                                                   `(primitive/load ~sp)))
+                       0)
+                     (do
+                       (primitive/store! ~s ~entry)
+                       (loop :regex-follow
+                         (let [~state (primitive/load ~s)]
+                           (if (or (primitive/icmp-lt ~state 0)
+                                   (primitive/icmp-eq ~(rx--get (.marks p)
+                                                                state)
+                                                      (primitive/load ~(.gen p))))
+                               (break :regex-follow 0)
+                               (do
+                                 (primitive/store! ~(rx--cell (.marks p) state)
+                                                   (primitive/load ~(.gen p)))
+                                 (case ~state ~@arms
+                                       (let [~slot
+                                               (primitive/iadd (primitive/imul ~list
+                                                                               ~n)
+                                                               (primitive/load ~count))]
+                                         (primitive/store! ~(rx--cell (.lists p)
+                                                                      slot)
+                                                           ~state)
+                                         ~(rx--copy-slots k
+                                                          (.caps p)
+                                                          `(primitive/imul ~slot
+                                                                           ~k)
+                                                          (.regs p)
+                                                          `0)
+                                         (primitive/store! ~count
+                                                           (primitive/iadd (primitive/load ~count)
+                                                                           1))
+                                         (primitive/store! ~s -1)
+                                         0))))))
+                       0))))))
+       0)))
+
+; The successor of byte-class STATE on BYTE, or -1, as a `case` arm list.
+(defn rx--consume-arms [(c (mut (array i64 5392)))
+                        (byte Code)
+                        (state i64)
+                        (out CodeBuilder)] (-> Code)
+  (if (primitive/icmp-ge state (rx--mem (mut c) 2))
+      (primitive/code-list-done out)
+      (do
+        (if (and (rx--live? (mut c) state)
+                 (primitive/icmp-eq (rx--op (mut c) state) 0))
+            (do
+              (primitive/code-list-push! out `~state)
+              (primitive/code-list-push! out
+                                         `(if ~(rx--byte-test (mut c)
+                                                              state
+                                                              byte)
+                                              ~(rx--out1 (mut c) state)
+                                              -1)))
+            0)
+        (rx--consume-arms (mut c) byte (primitive/iadd state 1) out))))
+
+; Emit an anonymous `(fn [haystack start] ...)` that runs the Pike VM and builds
+; its result with (RESULT best-slots-code).
+(defn rx--pike [(pattern Code) (save-mode i64)] (-> Code)
+  (let [bs (rx--pattern-bytes pattern)
+        (mut compiler) (primitive/zeroed (array i64 5392))]
+    (rx--build (mut compiler) bs save-mode 256)
+    (let [start (rx--mem (mut compiler) 10)
+          accept (rx--mem (mut compiler) 11)
+          n (rx--mem (mut compiler) 2)
+          groups (primitive/iadd (rx--mem (mut compiler) 7) 1)
+          k (if (primitive/icmp-eq save-mode 2) (primitive/imul groups 2) 2)
+          required (rx--required-byte (mut compiler) start accept 0)
+          anchored (rx--anchored? (mut compiler))
+          hay (primitive/fresh-identifier "regex-haystack")
+          from (primitive/fresh-identifier "regex-from")
+          length (primitive/fresh-identifier "regex-length")
+          pos (primitive/fresh-identifier "regex-pos")
+          cur (primitive/fresh-identifier "regex-cur")
+          ccount (primitive/fresh-identifier "regex-ccount")
+          ncount (primitive/fresh-identifier "regex-ncount")
+          matched (primitive/fresh-identifier "regex-matched")
+          i (primitive/fresh-identifier "regex-i")
+          slot (primitive/fresh-identifier "regex-slot")
+          state (primitive/fresh-identifier "regex-state")
+          target (primitive/fresh-identifier "regex-target")
+          byte (primitive/fresh-identifier "regex-byte")
+          p
+            (RxPike
+              :n n
+              :k k
+              :hay hay
+              :len length
+              :lists (primitive/fresh-identifier "regex-lists")
+              :caps (primitive/fresh-identifier "regex-caps")
+              :marks (primitive/fresh-identifier "regex-marks")
+              :gen (primitive/fresh-identifier "regex-gen")
+              :regs (primitive/fresh-identifier "regex-regs")
+              :stk (primitive/fresh-identifier "regex-stack")
+              :stv (primitive/fresh-identifier "regex-saved")
+              :sp (primitive/fresh-identifier "regex-sp")
+              :s (primitive/fresh-identifier "regex-s")
+              :best (primitive/fresh-identifier "regex-best"))]
+      (rx--mark-live (mut compiler) start)
+      (let [consume
+              (rx--consume-arms (mut compiler) byte 0 (primitive/code-list-new))
+            seed
+              (rx--pike-add (mut compiler)
+                            p
+                            `(primitive/load ~cur)
+                            ccount
+                            `~start
+                            `(primitive/load ~pos))
+            advance
+              (rx--pike-add (mut compiler)
+                            p
+                            `(primitive/isub 1 (primitive/load ~cur))
+                            ncount
+                            target
+                            `(primitive/iadd (primitive/load ~pos) 1))
+            clear-regs
+              (let [out (primitive/code-list-new)
+                    (mut j) 0]
+                (loop (if (primitive/icmp-ge (primitive/load j) k)
+                          (break)
+                          (do
+                            (primitive/code-list-push! out
+                                                       `(primitive/store! ~(rx--cell (.regs p)
+                                                                                     `~(primitive/load j))
+                                                                          -1))
+                            (primitive/store! j
+                                              (primitive/iadd (primitive/load j)
+                                                              1)))))
+                `(do ~@(primitive/code-list-done out) 0))]
+        `(fn [~hay ~from]
+           (let [~length (coil.slice.slice-len ~hay)
+                 (mut ~(.lists p))
+                   (primitive/zeroed (array i64 ~(primitive/imul n 2)))
+                 (mut ~(.caps p))
+                   (primitive/zeroed (array i64
+                                            ~(primitive/imul (primitive/imul n
+                                                                             2)
+                                                             k)))
+                 (mut ~(.marks p)) (primitive/zeroed (array i64 ~n))
+                 (mut ~(.regs p)) (primitive/zeroed (array i64 ~k))
+                 (mut ~(.best p)) (primitive/zeroed (array i64 ~k))
+                 (mut ~(.stk p))
+                   (primitive/zeroed (array i64 ~(primitive/iadd n 1)))
+                 (mut ~(.stv p))
+                   (primitive/zeroed (array i64 ~(primitive/iadd n 1)))
+                 (mut ~(.gen p)) 1
+                 (mut ~(.sp p)) 0
+                 (mut ~(.s p)) 0
+                 (mut ~pos) ~from
+                 (mut ~cur) 0
+                 (mut ~ccount) 0
+                 (mut ~ncount) 0
+                 (mut ~matched) false
+                 (mut ~i) 0]
+             (if (or (primitive/icmp-lt ~from 0)
+                     (or (primitive/icmp-gt ~from ~length)
+                         ~(if (primitive/icmp-ge required 0)
+                              `(= (primitive/cast i64
+                                                  (coil.mem.mem-find-byte (primitive/index (coil.slice.slice-data ~hay)
+                                                                                           ~from)
+                                                                          (primitive/cast u8
+                                                                                          ~required)
+                                                                          (primitive/isub ~length
+                                                                                          ~from)))
+                                  0)
+                              `false)))
+                 (None)
+                 (do
+                   (loop :regex-run
+                     (if (and (not (primitive/load ~matched))
+                              ~(if anchored
+                                   `(primitive/icmp-eq (primitive/load ~pos) 0)
+                                   `true))
+                         (do ~clear-regs ~seed)
+                         0)
+                     (if (and (primitive/icmp-eq (primitive/load ~ccount) 0)
+                              (or (primitive/load ~matched)
+                                  (or (primitive/icmp-ge (primitive/load ~pos)
+                                                         ~length)
+                                      ~(if anchored `true `false))))
+                         (break :regex-run 0)
+                         0)
+                     (primitive/store! ~(.gen p)
+                                       (primitive/iadd (primitive/load ~(.gen p))
+                                                       1))
+                     (primitive/store! ~ncount 0)
+                     (primitive/store! ~i 0)
+                     (let [~byte
+                             (if (primitive/icmp-lt (primitive/load ~pos)
+                                                    ~length)
+                                 (primitive/cast i64
+                                                 (primitive/load (primitive/index (coil.slice.slice-data ~hay)
+                                                                                  (primitive/load ~pos))))
+                                 -1)]
+                       (loop :regex-step
+                         (if (primitive/icmp-ge (primitive/load ~i)
+                                                (primitive/load ~ccount))
+                             (break :regex-step 0)
+                             (let [~slot
+                                     (primitive/iadd (primitive/imul (primitive/load ~cur)
+                                                                     ~n)
+                                                     (primitive/load ~i))
+                                   ~state ~(rx--get (.lists p) slot)]
+                               (primitive/store! ~i
+                                                 (primitive/iadd (primitive/load ~i)
+                                                                 1))
+                               (if (primitive/icmp-eq ~state ~accept)
+                                   (do
+                                     ~(rx--copy-slots k
+                                                      (.best p)
+                                                      `0
+                                                      (.caps p)
+                                                      `(primitive/imul ~slot ~k))
+                                     (primitive/store! ~matched true)
+                                     ; Lower-priority threads can only produce
+                                     ; less preferred matches.
+                                     (break :regex-step 0))
+                                   (let [~target
+                                           (if (primitive/icmp-lt ~byte 0)
+                                               -1
+                                               (case ~state ~@consume -1))]
+                                     (if (primitive/icmp-ge ~target 0)
+                                         (do
+                                           ~(rx--copy-slots k
+                                                            (.regs p)
+                                                            `0
+                                                            (.caps p)
+                                                            `(primitive/imul ~slot
+                                                                             ~k))
+                                           ~advance)
+                                         0)))))))
+                     (if (primitive/icmp-ge (primitive/load ~pos) ~length)
+                         (break :regex-run 0)
+                         0)
+                     (primitive/store! ~pos
+                                       (primitive/iadd (primitive/load ~pos) 1))
+                     (primitive/store! ~cur
+                                       (primitive/isub 1 (primitive/load ~cur)))
+                     (primitive/store! ~ccount (primitive/load ~ncount)))
+                   (if (primitive/load ~matched)
+                       (Some ~(if (primitive/icmp-eq save-mode 2)
+                                  (rx--captures-result (.best p) groups)
+                                  (rx--span-result (.best p) groups)))
+                       (None))))))))))
+
+(defn rx--span-result [(best Code) (groups i64)] (-> Code)
+  `(coil.regex.Span :start ~(rx--get best `0) :end ~(rx--get best `1)))
+
+(defn rx--captures-result [(best Code) (groups i64)] (-> Code)
+  (let [starts (primitive/code-list-new)
+        ends (primitive/code-list-new)
+        (mut g) 0]
+    (loop (if (primitive/icmp-ge (primitive/load g) groups)
+              (break)
+              (do
+                (primitive/code-list-push! starts
+                                           (rx--get best
+                                                    `~(primitive/imul (primitive/load g)
+                                                                      2)))
+                (primitive/code-list-push! ends
+                                           (rx--get best
+                                                    `~(primitive/iadd (primitive/imul (primitive/load g)
+                                                                                      2)
+                                                                      1)))
+                (primitive/store! g (primitive/iadd (primitive/load g) 1)))))
+    `(coil.regex.Captures :starts [~@(primitive/code-list-done starts)]
+       :ends [~@(primitive/code-list-done ends)])))
+
+(defn rx--group-total [(pattern Code)] (-> i64)
+  (let [(mut compiler) (primitive/zeroed (array i64 5392))]
+    (rx--build (mut compiler) (rx--pattern-bytes pattern) 2 256)
+    (primitive/iadd (rx--mem (mut compiler) 7) 1)))
+
+; An anonymous finder `(fn [haystack start] (-> (Option Span)))`.
+(defn rx--finder [(pattern Code)] (-> Code)
+  (let [bs (rx--pattern-bytes pattern)
+        literal (rx--literal-shape bs)]
+    (if (not (primitive/code-eq literal `:not-literal))
+        (let [hay (primitive/fresh-identifier "regex-haystack")
+              from (primitive/fresh-identifier "regex-from")]
+          `(fn [~hay ~from]
+             ~(rx--literal-find literal
+                                hay
+                                from
+                                (rx--starts-anchored? bs)
+                                (rx--ends-anchored? bs))))
+        (rx--pike pattern 1))))
+
+(defn rx--captures-finder [(pattern Code)] (-> Code)
+  (let [groups (rx--group-total pattern)]
+    `(: ~(rx--pike pattern 2)
+        (fnptr c [(slice u8) i64] (Option (coil.regex.Captures ~groups))))))
+
+;;; Compile PATTERN into an allocation-free byte matcher at the call site and
+;;; test whether it matches anywhere in HAYSTACK. See docs/reference/REGEX.md.
 (defn is-match? [(pattern Code) (haystack Code)] (-> Code)
   (rx--compile pattern haystack))
+
+;;; The leftmost-first match of PATTERN in HAYSTACK, as `(Option Span)`.
+(defn find [(pattern Code) (haystack Code)] (-> Code)
+  `(coil.regex.rx--run-find ~haystack 0 ~(rx--finder pattern)))
+
+;;; The leftmost-first match of PATTERN in HAYSTACK that starts at or after byte
+;;; offset START, as `(Option Span)`. Assertions still see the whole haystack:
+;;; `^` matches only at offset 0, and `\b` looks at the byte before START.
+(defn find-at [(pattern Code) (haystack Code) (start Code)] (-> Code)
+  `(coil.regex.rx--run-find ~haystack ~start ~(rx--finder pattern)))
+
+;;; An iterator over the successive non-overlapping matches of PATTERN in
+;;; HAYSTACK, yielding `Span`s.
+(defn find-iter [(pattern Code) (haystack Code)] (-> Code)
+  `(coil.regex.rx--matches ~haystack ~(rx--finder pattern)))
+
+;;; The groups of the leftmost-first match of PATTERN in HAYSTACK, as
+;;; `(Option (Captures N))` where N counts the pattern's groups plus group 0.
+(defn captures [(pattern Code) (haystack Code)] (-> Code)
+  `(coil.regex.rx--run-captures ~haystack 0 ~(rx--captures-finder pattern)))
+
+;;; Like `captures`, for the first match starting at or after byte offset START.
+(defn captures-at [(pattern Code) (haystack Code) (start Code)] (-> Code)
+  `(coil.regex.rx--run-captures ~haystack ~start ~(rx--captures-finder pattern)))
+
+;;; An iterator over the groups of each successive non-overlapping match.
+(defn captures-iter [(pattern Code) (haystack Code)] (-> Code)
+  `(coil.regex.rx--captures-iter ~haystack ~(rx--captures-finder pattern)))

@@ -2,24 +2,33 @@
 
 ## Ahead-of-time byte regular expressions
 
-`coil.regex` provides the macro `(is-match? PATTERN HAYSTACK)`. `PATTERN` must be
-a string literal: the macro parses it during compilation and emits an
-allocation-free, bit-parallel Thompson state machine at the call site. The
-runtime binary contains neither a regex parser nor a compiled-regex object, and
-the haystack expression is evaluated exactly once.
+`coil.regex` provides macros that compile a string-literal pattern during
+compilation and emit an allocation-free matcher at the call site:
+`(is-match? PATTERN HAYSTACK)` (a bit-parallel Thompson state machine), and
+`find`, `find-at`, `find-iter`, `captures`, `captures-at` and `captures-iter`
+(a Pike VM with leftmost-first semantics that reports match spans and capture
+groups). The runtime binary contains neither a regex parser nor a compiled-regex
+object, and the haystack expression is evaluated exactly once.
 
-The initial byte-oriented syntax supports literals, `.`, grouping, alternation,
-`*`, `+`, `?`, byte classes and ranges (including negation), `\d`, `\w`, `\s`,
-and outer `^`/`$` anchors. Dot excludes newline. Accepted expressions are
-limited to 63 Thompson states so the active set always fits in one machine word;
-larger expressions fail at compile time instead of selecting a hidden slow
-path. Matching is linear in the haystack length and uses no runtime allocation.
+The byte-oriented syntax supports literals, `.`, groups, alternation, greedy and
+lazy repetition including counted forms, byte classes and ranges (including
+negation), `\d`, `\w`, `\s`, the assertions `^`, `$`, `\b`, `\B`, and scoped
+`i`/`s`/`m` flags. Dot excludes newline. `is-match?` is limited to 63 Thompson
+states so the active set fits in one machine word, the Pike VM to 256; larger
+expressions fail at compile time instead of selecting a hidden slow path.
+Matching is linear in the haystack length and uses no runtime allocation. See
+[REGEX.md](REGEX.md).
 
 ```coil
 (import "coil.regex" :as re)
 
 (defn valid-name? [(name (slice u8))] (-> bool)
   (re/is-match? "^[A-Za-z_][A-Za-z0-9_]*$" name))
+
+(defn status-code [(log-line (slice u8))] (-> (Option (slice u8)))
+  (match (re/captures "\" (\\d{3}) " log-line)
+    (Some [caps] (re/group-bytes caps log-line 1))
+    (None [] (None))))
 ```
 
 Coil's hosted system APIs follow Python's separation of concerns while retaining

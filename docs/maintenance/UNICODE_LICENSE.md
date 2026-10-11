@@ -1,7 +1,8 @@
 # Unicode License V3
 
-The generated grapheme property tables in `src/stdlib/unicode_grapheme_data.coil`
-and their conformance fixture use Unicode Character Database files.
+The generated grapheme property tables in `src/stdlib/unicode_grapheme_data.coil`,
+the character property and case mapping tables in `src/stdlib/unicode_data.coil`,
+and their conformance fixtures use Unicode Character Database files.
 
 COPYRIGHT AND PERMISSION NOTICE
 
