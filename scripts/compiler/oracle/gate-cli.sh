@@ -552,6 +552,8 @@ if "$COIL" build "$SC" -o "$T/safety-checks" --use coil.safety >/dev/null 2>&1; 
   expect_out "wrapping: -9223372036854775808 44" "safety: primitive/iadd wraps and primitive/cast truncates" "$T/safety-checks"
   expect_out "unchecked: -9223372036854775808" "safety: :safety/checked false keeps wrapping +" "$T/safety-checks"
   expect_out "min prints: -9223372036854775808" "safety: the minimum i64 still prints" "$T/safety-checks"
+  expect_out "pointers: 14" "safety: aligned casts, field reads and disjoint copies do not trap" "$T/safety-checks"
+  expect_out "undefined: -6148914691236517206" "safety: unwritten frame storage reads as the undefined pattern" "$T/safety-checks"
   # the message and its location are separate lines of the report
   while IFS='|' read -r case want; do
     out=$("$T/safety-checks" "$case" 2>&1); rc=$?
@@ -562,20 +564,32 @@ if "$COIL" build "$SC" -o "$T/safety-checks" --use coil.safety >/dev/null 2>&1; 
       bad "safety: $case traps with its location" "want a signal and /$want/, got rc=$rc: $flat"
     fi
   done <<'CASES'
-index|index out of bounds: index 4, len 3.*safety_checks.coil:18:
-add|integer overflow.*safety_checks.coil:19:
-sub|integer overflow.*safety_checks.coil:20:
-mul|integer overflow.*safety_checks.coil:21:
-neg|integer overflow.*safety_checks.coil:22:
-div|division by zero.*safety_checks.coil:23:
-min-div|integer overflow.*safety_checks.coil:24:
-shift|shift amount is greater than the type size.*safety_checks.coil:25:
-narrow|integer cast truncated bits.*safety_checks.coil:26:
-unsigned|cast negative value to unsigned integer.*safety_checks.coil:27:
-float|integer part of floating point value out of bounds.*safety_checks.coil:28:
-slice-get|index out of bounds: index 6, len 3.*safety_checks.coil:29:
-subslice|start index 3 is larger than end index 2.*safety_checks.coil:30:
-generic|integer overflow.*in generic code
+index|index out of bounds: index 4, len 3.*safety_checks.coil:19:
+add|integer overflow.*safety_checks.coil:20:
+sub|integer overflow.*safety_checks.coil:21:
+mul|integer overflow.*safety_checks.coil:22:
+neg|integer overflow.*safety_checks.coil:23:
+div|division by zero.*safety_checks.coil:24:
+min-div|integer overflow.*safety_checks.coil:25:
+shift|shift amount is greater than the type size.*safety_checks.coil:26:
+narrow|integer cast truncated bits.*safety_checks.coil:27:
+unsigned|cast negative value to unsigned integer.*safety_checks.coil:28:
+float|integer part of floating point value out of bounds.*safety_checks.coil:29:
+slice-get|index out of bounds: index 6, len 3.*safety_checks.coil:30:
+subslice|start index 3 is larger than end index 2.*safety_checks.coil:31:
+generic|integer overflow.*safety_checks.coil:14:.*in generic code
+null-next|null pointer dereference.*safety_checks.coil:103:
+null-volatile|null pointer dereference.*safety_checks.coil:104:
+bad-tag|invalid variant tag: 9, the type has 3 variants.*safety_checks.coil:105:
+bad-bool|invalid boolean value.*safety_checks.coil:109:
+ptr-index|pointer arithmetic overflow.*safety_checks.coil:110:
+memcpy-null|null pointer dereference.*safety_checks.coil:111:
+unreachable|reached unreachable code.*safety_checks.coil:112:
+stack|diagnosis: stack-overflow guard fault
+align|misaligned pointer: address [0-9]+ is not a multiple of 8.*safety_checks.coil:45:
+null-load|null pointer dereference.*safety_checks.coil:48:
+null-field|null pointer dereference.*safety_checks.coil:51:
+memcpy|memcpy source and destination overlap.*safety_checks.coil:57:
 CASES
   # A panic report ends with the stack trace, which needs the frame records below.
   out=$("$T/safety-checks" index 2>&1)
@@ -2976,13 +2990,13 @@ expect_rc 0 "thread config applies explicit stack and guard sizes" \
   "$COIL" run "$T/thread-config.coil"
 
 echo "== poison-on-free debug-allocator: detects double-free (mem-2) =="
-# (debug-allocator a) from dbgalloc.coil — under --debug-checks it detects a double-free
+# (debug-allocator a) from debug_allocator.coil — under --debug-checks it detects a double-free
 # with a located abort (was: a bare signal or silent reuse). FAILS on the seed
-# (dbgalloc.coil is not bundled there, so the build fails and prints no such message).
+# (debug_allocator.coil is not bundled there, so the build fails and prints no such message).
 cat > "$T/df.coil" <<'EOF'
 (module m)
 (import "coil.alloc" :use *)
-(import "coil.dbgalloc" :use *)
+(import "coil.debug-allocator" :use *)
 (defn main [] (-> i64)
   (let [a (debug-allocator (malloc-allocator))
         p (unwrap-ptr [i64] (create [i64] a))]
@@ -3000,10 +3014,10 @@ cat > "$T/dbg-off.coil" <<'EOF'
 (module m)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use *)
-(import "coil.dbgalloc" :use *)
+(import "coil.debug-allocator" :use *)
 ; With checks OFF the `debug-allocator` macro expands to its argument verbatim, so
 ; the wrapper cannot be observed: allocating through it just works, and nothing from
-; coil.dbgalloc is linked. (This used to compare the two allocators by casting each
+; coil.debug-allocator is linked. (This used to compare the two allocators by casting each
 ; to i64. A `(dyn Allocator)` is a fat trait-object VALUE, not a pointer, so that is
 ; not a legal cast any more -- and identity of a copied fat value was never what the
 ; passthrough property meant.)
@@ -3019,7 +3033,7 @@ expect_rc 0 "off: debug-allocator is a passthrough (no detection, zero cost)" \
 cat > "$T/uaf.coil" <<'EOF'
 (module m)
 (import "coil.alloc" :use *)
-(import "coil.dbgalloc" :use *)
+(import "coil.debug-allocator" :use *)
 (defn main [] (-> i64)
   (let [a (debug-allocator (malloc-allocator))
         p (unwrap-ptr [i64] (create [i64] a))]
@@ -3028,10 +3042,10 @@ EOF
 expect_rc 222 "--debug-checks poisons freed memory (use-after-free reads 0xDE)" \
   "$COIL" run "$T/uaf.coil" --debug-checks
 
-cat > "$T/dbgalloc-misuse.coil" <<'EOF'
+cat > "$T/debug-allocator-misuse.coil" <<'EOF'
 (module m)
 (import "coil.alloc" :use *)
-(import "coil.dbgalloc" :use *)
+(import "coil.debug-allocator" :use *)
 (defn main [] (-> i64)
   (let [a (debug-allocator (malloc-allocator))
         p (unwrap-ptr [i64] (create [i64] a))]
@@ -3041,16 +3055,16 @@ cat > "$T/dbgalloc-misuse.coil" <<'EOF'
     0))
 EOF
 expect_out "buffer underrun in debug-allocator" "debug-allocator detects a prefix underrun" \
-  "$COIL" run "$T/dbgalloc-misuse.coil" --debug-checks
+  "$COIL" run "$T/debug-allocator-misuse.coil" --debug-checks
 
-sed 's/-32)/8)/' "$T/dbgalloc-misuse.coil" > "$T/dbgalloc-overflow.coil"
+sed 's/-32)/8)/' "$T/debug-allocator-misuse.coil" > "$T/debug-allocator-overflow.coil"
 expect_out "buffer overflow in debug-allocator" "debug-allocator detects a suffix overflow" \
-  "$COIL" run "$T/dbgalloc-overflow.coil" --debug-checks
+  "$COIL" run "$T/debug-allocator-overflow.coil" --debug-checks
 
-cat > "$T/dbgalloc-size.coil" <<'EOF'
+cat > "$T/debug-allocator-size.coil" <<'EOF'
 (module m)
 (import "coil.alloc" :use *)
-(import "coil.dbgalloc" :use *)
+(import "coil.debug-allocator" :use *)
 (defn main [] (-> i64)
   (let [a (debug-allocator (malloc-allocator))]
     (match (bytes-request 8 8)
@@ -3064,12 +3078,12 @@ cat > "$T/dbgalloc-size.coil" <<'EOF'
               (Some [bad] (raw-free a p bad)))))))))
 EOF
 expect_out "allocation size mismatch in debug-allocator" "debug-allocator detects a free-size mismatch" \
-  "$COIL" run "$T/dbgalloc-size.coil" --debug-checks
+  "$COIL" run "$T/debug-allocator-size.coil" --debug-checks
 
-cat > "$T/dbgalloc-stateful.coil" <<'EOF'
+cat > "$T/debug-allocator-stateful.coil" <<'EOF'
 (module m)
 (import "coil.alloc" :use *)
-(import "coil.dbgalloc" :use *)
+(import "coil.debug-allocator" :use *)
 (defn use-allocator [(a (dyn Allocator))] (-> i64)
   (let [p (unwrap-ptr [i64] (create [i64] a))]
     (store! p 42)
@@ -3083,16 +3097,16 @@ cat > "$T/dbgalloc-stateful.coil" <<'EOF'
     (if (and (= value 42) (= leaks 0)) 0 1)))
 EOF
 expect_rc 0 "stateful debug allocator exposes a passable Allocator view" \
-  "$COIL" run "$T/dbgalloc-stateful.coil"
+  "$COIL" run "$T/debug-allocator-stateful.coil"
 for opt in -O0 -O1 -O3; do
   expect_rc 0 "stateful debug allocator works at $opt" \
-    "$COIL" run "$T/dbgalloc-stateful.coil" "$opt"
+    "$COIL" run "$T/debug-allocator-stateful.coil" "$opt"
 done
 
-cat > "$T/dbgalloc-leak.coil" <<'EOF'
+cat > "$T/debug-allocator-leak.coil" <<'EOF'
 (module m)
 (import "coil.alloc" :use *)
-(import "coil.dbgalloc" :use *)
+(import "coil.debug-allocator" :use *)
 (defn main [] (-> i64)
   (let [debug (debug-allocator-init (malloc-allocator))
         a (debug-allocator-view debug)
@@ -3100,15 +3114,17 @@ cat > "$T/dbgalloc-leak.coil" <<'EOF'
     (store! p 7)
     (debug-allocator-deinit! debug)))
 EOF
-expect_out "debug-allocator leaked 1 allocation" "debug allocator reports live allocations at deinit" \
-  "$COIL" run "$T/dbgalloc-leak.coil"
+expect_out "coil: leaked 8 byte" "debug allocator reports live allocations at deinit" \
+  "$COIL" run "$T/debug-allocator-leak.coil"
+expect_out "allocated at:" "debug allocator names where a leaked block was allocated" \
+  "$COIL" run "$T/debug-allocator-leak.coil"
 expect_rc 1 "debug allocator deinit returns the live leak count" \
-  "$COIL" run "$T/dbgalloc-leak.coil"
+  "$COIL" run "$T/debug-allocator-leak.coil"
 
-cat > "$T/dbgalloc-invalid-free.coil" <<'EOF'
+cat > "$T/debug-allocator-invalid-free.coil" <<'EOF'
 (module m)
 (import "coil.alloc" :use *)
-(import "coil.dbgalloc" :use *)
+(import "coil.debug-allocator" :use *)
 (defn main [] (-> i64)
   (let [debug (debug-allocator-init (malloc-allocator))
         a (debug-allocator-view debug)]
@@ -3117,12 +3133,12 @@ cat > "$T/dbgalloc-invalid-free.coil" <<'EOF'
       (Some [rq] (raw-free a (coil.primitive/cast (ptr i8) 4096) rq)))))
 EOF
 expect_out "invalid free in debug-allocator" "debug allocator rejects an unowned pointer without dereferencing it" \
-  "$COIL" run "$T/dbgalloc-invalid-free.coil"
+  "$COIL" run "$T/debug-allocator-invalid-free.coil"
 
-cat > "$T/dbgalloc-interior-free.coil" <<'EOF'
+cat > "$T/debug-allocator-interior-free.coil" <<'EOF'
 (module m)
 (import "coil.alloc" :use *)
-(import "coil.dbgalloc" :use *)
+(import "coil.debug-allocator" :use *)
 (defn main [] (-> i64)
   (let [debug (debug-allocator-init (malloc-allocator))
         a (debug-allocator-view debug)]
@@ -3137,12 +3153,12 @@ cat > "$T/dbgalloc-interior-free.coil" <<'EOF'
               (Some [bad] (raw-free a (coil.primitive/index p 1) bad)))))))))
 EOF
 expect_out "interior pointer passed to debug-allocator free" "debug allocator diagnoses an interior-pointer free" \
-  "$COIL" run "$T/dbgalloc-interior-free.coil"
+  "$COIL" run "$T/debug-allocator-interior-free.coil"
 
-cat > "$T/dbgalloc-alignment.coil" <<'EOF'
+cat > "$T/debug-allocator-alignment.coil" <<'EOF'
 (module m)
 (import "coil.alloc" :use *)
-(import "coil.dbgalloc" :use *)
+(import "coil.debug-allocator" :use *)
 (defn main [] (-> i64)
   (let [debug (debug-allocator-init (malloc-allocator))
         a (debug-allocator-view debug)]
@@ -3158,7 +3174,7 @@ cat > "$T/dbgalloc-alignment.coil" <<'EOF'
                     (if (and aligned (= leaks 0)) 0 1)))))))))
 EOF
 expect_rc 0 "debug allocator honors over-aligned requests independently of its backing allocator" \
-  "$COIL" run "$T/dbgalloc-alignment.coil"
+  "$COIL" run "$T/debug-allocator-alignment.coil"
 
 echo "== stack-return lint under --debug-checks (mem-8) =="
 # A bundled (checker …) the driver auto-applies under --debug-checks warns when a

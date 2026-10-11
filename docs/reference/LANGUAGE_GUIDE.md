@@ -753,7 +753,7 @@ boxed 7
 | `(arena-allocator cap)` | bump allocation, freed together |
 | `coil.scratch` | segmented arena with marks and reset, for temporaries |
 | `coil.region` | tracks each allocation; closing frees what's left |
-| `coil.dbgalloc`, `coil.guardalloc` | leak, double-free and overflow detection ([DEBUGGING.md](DEBUGGING.md)) |
+| `coil.debug-allocator`, `coil.guardalloc` | leak, double-free and overflow detection ([DEBUGGING.md](DEBUGGING.md)) |
 
 `alloc/box!` allocates one initialized value (it aborts on exhaustion; `alloc/box`
 returns an `Option`). The typed APIs are `alloc/alloc`, `alloc/free`,

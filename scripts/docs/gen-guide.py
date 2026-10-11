@@ -70,7 +70,7 @@ TOPICS = [
     ("gotchas", "common traps, collected", ["gotcha", "reserved", "reserved-names", "mistakes"], "call block type error", [("Gotchas", None)]),
     ("project", "Coil.toml, dependencies, workspaces, linking, artifacts, toolchain updates", ["projects", "build", "run", "manifest", "dependencies", "workspace", "workspaces", "coil.toml", "update"], "package entry link libs native artifacts readers providers hermetic prebuilt unit install", [("projects", None, None)]),
     ("testing", "coil test, suites, property tests and fuzz campaigns", ["test-suites", "suites", "suite", "property", "properties", "prop", "fuzz", "fuzzing"], "runner filter list jobs generator arbitrary shrink seed coverage corpus roots suffixes", [("testing", None, None)]),
-    ("debugging", "debug checks, sanitizers, crash reports, debugging allocators", ["debug", "sanitize", "sanitizer", "sanitizers", "debug-checks", "asan"], "address thread memory undefined crash dbgalloc guardalloc tracealloc", [("debugging", None, None)]),
+    ("debugging", "debug checks, sanitizers, crash reports, debugging allocators", ["debug", "sanitize", "sanitizer", "sanitizers", "debug-checks", "asan"], "address thread memory undefined crash debug-allocator guardalloc tracealloc", [("debugging", None, None)]),
     ("jit", "the REPL and the in-process coil.jit compiler", ["repl", "hot-reload", "stateful-jit"], "session var reload sdk evaluate compile", [("jit", None, None)]),
     ("wasm", "the wasm32 target, exports, host imports and externref", ["wasm32", "webassembly", "browser"], "javascript export import externref", [("wasm", None, None)]),
 ]

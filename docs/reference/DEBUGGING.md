@@ -8,7 +8,7 @@ the sanitizer runtime won't link.
 |---|---|
 | Overflow, a bad cast, division by zero, or an index out of bounds, anywhere | `--use coil.safety` |
 | An index, slice or collection going out of bounds | `--debug-checks` |
-| A leak, double free or bad free | `coil.dbgalloc` (or `--debug-checks` plus `(debug-allocator …)`) |
+| A leak, double free or bad free | `coil.debug-allocator` (or `--debug-checks` plus `(debug-allocator …)`) |
 | Use-after-free or overrun that faults late | `--sanitize=address`, or `coil.guardalloc` |
 | A data race | `--sanitize=thread` |
 | A read of uninitialized memory (Linux) | `--sanitize=memory` |
@@ -41,11 +41,42 @@ stack trace:
 On Linux the trace names frames only for symbols the executable exports, and a
 wasm target, which cannot walk its own stack, prints none.
 
-It checks integer `+ - *` and negation for overflow (signed and unsigned), `/` and
-`%` for a zero divisor and for the minimum signed value divided by -1, shifts by a
-negative amount or by the width or more, `get`/`set!`/`slice-get`/`slice-set!`/
-`subslice` on a slice or array outside its bounds, and an integer or
-float-to-integer `cast` whose value does not fit.
+It checks:
+
+- integer `+ - *` and negation for overflow (signed and unsigned), `/` and `%` for a
+  zero divisor and for the minimum signed value divided by -1, and shifts by a
+  negative amount or by the width or more;
+- `get`/`set!`/`slice-get`/`slice-set!`/`subslice` on a slice or array outside its
+  bounds;
+- an integer or float-to-integer `cast` whose value does not fit;
+- a `cast` to a pointer type whose address is not a multiple of the pointee's
+  alignment. A zero address, the null pointer, passes, and so does a cast to a byte
+  pointer;
+- a `load`, `store!`, `volatile-load`, `alias-load` or `.field` read through a null
+  pointer, including a pointer stored in a field;
+- a `load` of a `bool` whose byte is not 0 or 1, and of a sum whose tag names no
+  variant, which only memory reinterpreted through a pointer cast can produce;
+- pointer arithmetic, `(index p k)`, that overflows the address space;
+- `memcpy` ranges that overlap, and `memcpy`, `memmove`, `memset` and `memcmp` given a
+  null pointer or a negative count;
+- `(unreachable)` (below);
+- the heap and unwritten storage (below).
+
+`(unreachable)` marks a branch the program's own logic rules out. It is a hard
+failure, never an optimizer hint. It yields `0`; `(unreachable T)` yields a `T`, for
+a position that needs one. Under `coil.safety` it panics with its location and a
+trace; otherwise it prints `reached unreachable code` and ends the program the way a
+failed `assert` does.
+
+`malloc-allocator` is the process-wide `coil.debug-allocator`, so a double free, an
+invalid or interior free, a buffer overrun and a size or type mismatch are reported
+with the stack of the allocation (and, for a double free, of the first free), a leak
+is reported when the program exits, and a freed block of a page or more is made
+inaccessible so a stale access faults. Fresh heap and frame storage is filled with
+0xAA, so a read of memory nothing wrote is plainly wrong.
+
+A segmentation fault or bus error, a stack overflow in particular, is reported with
+its address, the diagnosis, and a stack trace instead of dying silently.
 
 The `coil.primitive` operations are the raw machine operations and are never
 checked: `primitive/iadd`, `isub` and `imul` wrap, and `primitive/cast` keeps the
@@ -61,9 +92,12 @@ checks off in one function, give it `:safety/checked false`, from
 
 Arithmetic on a type parameter is checked inside the integer impls, where its call
 site is not known, so that report says "in generic code" instead of a location;
-the stack trace shows its caller. A
-library collection such as `ArrayList` checks its own invariants only under
-`--debug-checks`; use both for the most coverage.
+the report names the generic operation's own location when it can, and the stack
+trace shows its caller. Naming `coil.safety` in `--use`, a `[metaprograms]`
+list or a `[profile.NAME]` list also turns on `--debug-checks`, so a library
+collection such as `ArrayList` checks its own invariants too. Importing
+`coil.safety` from source does not: that needs `--debug-checks` or a profile with
+`debug-checks = true`.
 
 ## Runtime checks: `--debug-checks`
 
@@ -148,12 +182,12 @@ along with the compiler, profile, backend and target that built the program.
 Every allocator in Coil is a `(dyn Allocator)`, so you can pass a checking
 allocator anywhere an ordinary one goes.
 
-### Leaks and bad frees: `coil.dbgalloc`
+### Leaks and bad frees: `coil.debug-allocator`
 
 ```coil
 (module example.leak-check)
 (import "coil.alloc" :as alloc :use [malloc-allocator])
-(import "coil.dbgalloc" :use [debug-allocator-init debug-allocator-view debug-allocator-deinit!])
+(import "coil.debug-allocator" :use [debug-allocator-init debug-allocator-view debug-allocator-deinit!])
 
 (defn main [] (-> i64)
   (let [debug (debug-allocator-init (malloc-allocator))
@@ -170,13 +204,19 @@ allocator anywhere an ordinary one goes.
 live allocations at exit: 1
 ```
 
-The debug allocator wraps any backing allocator. It tracks every allocation,
-checks red zones before and after each block, and rejects frees of unknown or
-interior pointers without touching them. It also catches double frees and size
-or alignment mismatches, and poisons and quarantines freed memory.
-`debug-allocator-deinit!` releases everything, prints a diagnostic if anything
-is still live, and returns the live count. Call it only after every thread has
-stopped using the allocator.
+The debug allocator wraps any backing allocator, in the manner of Zig's
+`DebugAllocator`. It tracks every allocation and records its stack, checks red
+zones before and after each block, and rejects frees of unknown or interior
+pointers without touching them. It also catches double frees, naming where the
+block was allocated and where it was first freed, and size, type or alignment
+mismatches. A freed block is poisoned and held in a quarantine of at most 64 MiB
+(`debug-allocator-set-quarantine-limit!`; 0 holds every block), and a freed block of
+a page or more is made inaccessible, so a stale access to it faults.
+`debug-allocator-report-leaks!` prints every live allocation with its stack and
+returns how many there were; `debug-allocator-deinit!` does that, releases
+everything, and returns the count. Call it only after every thread has stopped
+using the allocator. `(debug-allocator-global)` is the process-wide instance over the
+C heap, whose leaks are reported at exit.
 
 To check only in debug builds, use the macro form. `(debug-allocator inner)`
 is the wrapped allocator under `--debug-checks`, and exactly `inner`

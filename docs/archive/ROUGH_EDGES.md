@@ -325,7 +325,7 @@ Coil is unsafe by design — legitimate. The finding is that the design's own es
       object; sanitizer flags are filtered off the metaprogram dylib, so `--link-flag
       -fsanitize=address` no longer aborts the compiler. A non-LLVM backend is a clear error. See
       DECISIONS.md #9.
-- [x] **mem-2** — ✅ DONE. `(debug-allocator inner)` (bundled src/stdlib/dbgalloc.coil) — a macro that is
+- [x] **mem-2** — ✅ DONE. `(debug-allocator inner)` (bundled src/stdlib/debug_allocator.coil) — a macro that is
       `inner` when off; on, it detects double-free (located abort) and poisons freed memory to 0xDE
       (quarantine so detection is reliable). See DECISIONS.md #9.
 - [x] **mem-8 / diag-11** — ✅ SUPERSEDED. The public stack allocator and its dedicated checker were

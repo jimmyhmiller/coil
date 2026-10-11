@@ -5,6 +5,8 @@
 (import "coil.lint.names" :as names)
 (import "coil.safety.checked")
 (import "coil.safety.runtime" :as rt)
+(import "coil.crash" :as crash)
+(import "coil.debug-allocator" :as dbg)
 
 ;;; Runtime safety checks for the whole program, after Zig's safe build modes.
 ;;; Apply it with `--use coil.safety`, a `[metaprograms]` or `[profile.NAME]` `use`
@@ -22,7 +24,20 @@
 ;;;   * `get`/`set!` on a slice or array outside `[0, len)`, and the same for
 ;;;     `slice-get`, `slice-set!` and `subslice`;
 ;;;   * an integer `cast` whose value does not fit the destination, and a
-;;;     float-to-integer `cast` whose integer part does not.
+;;;     float-to-integer `cast` whose integer part does not;
+;;;   * a `cast` to a pointer type whose address is not a multiple of the pointee's
+;;;     alignment (zero, the null pointer, passes);
+;;;   * a `load`, `store!` or field read through a null pointer;
+;;;   * a `memcpy` whose source and destination overlap, and a C memory function
+;;;     given a null pointer or a negative count;
+;;;   * a `load` of a `bool` or a sum whose bytes are not a value of that type;
+;;;   * pointer arithmetic (`index`) that overflows the address space;
+;;;   * `unreachable`, which panics with its location;
+;;;   * the heap: `malloc-allocator` is the process-wide `coil.debug-allocator`, so a
+;;;     double free, an invalid free, a buffer overrun and a leak are reported with
+;;;     the stack of the allocation, and fresh heap and frame storage is filled with
+;;;     0xAA so a read of memory nothing wrote is plainly wrong;
+;;;   * a segmentation fault or stack overflow, reported with its address and trace.
 ;;;
 ;;; The `coil.primitive` operations are the raw machine operations and are never
 ;;; checked, except division and shifts, whose bad operands have no defined result:
@@ -30,10 +45,11 @@
 ;;; (Zig's `+%` and `@truncate`/`@bitCast`). `:safety/checked false` on a function
 ;;; (from `coil.safety.checked`) turns the checks off inside it.
 ;;;
-;;; Two limits. Integer arithmetic on a type parameter is checked inside `coil.core`'s
-;;; impls, where no call site is known, so its report has no location. And a
-;;; library collection (ArrayList, HashMap, …) checks its own invariants only under
-;;; `--debug-checks` (or a profile with `debug-checks = true`).
+;;; Naming this module in `--use`, a `[metaprograms]` list or a profile also turns on
+;;; `--debug-checks`, so the library collections (ArrayList, HashMap, …) check their
+;;; own invariants; importing it from source does not. Integer arithmetic on a type
+;;; parameter is checked inside `coil.core`'s impls, which have no call site of their
+;;; own, so the generic site records itself in a cell first and the report names it.
 
 ; ---- types -------------------------------------------------------------------
 ;;; The width in bits of a standard integer type, or 0 for any other type.
@@ -74,6 +90,14 @@
 (defn array-type? [(t Code)] (-> bool)
   (and (head-is? t `array) (= (len t) 3)))
 
+(defn borrow-type? [(t Code)] (-> bool)
+  (and (or (head-is? t `mut) (head-is? t `ref)) (= (len t) 2)))
+
+;;; Whether a pointer to `t` can be misaligned: false for one-byte types, which every
+;;; address suits.
+(defn needs-alignment? [(t Code)] (-> bool)
+  (not (or (= t `i8) (= t `u8))))
+
 ;;; Whether converting an integer of type `s` to type `d` keeps every value.
 (defn lossless-int? [(s Code) (d Code)] (-> bool)
   (let [bs (int-bits s)
@@ -86,10 +110,10 @@
 ;;; Where a rewrite is happening: the import environment that names resolve in,
 ;;; whether the function has checks on, and whether this is `coil.core`, whose
 ;;; sites are only ever reached through generic dispatch and so get no location.
-(defstruct Cx [(env Code) (checked bool) (core bool)])
+(defstruct Cx [(env Code) (checked bool) (core bool) (heap bool)])
 
 (defn with-checked [(cx Cx) (checked bool)] (-> Cx)
-  (Cx :env (.env cx) :checked checked :core (.core cx)))
+  (Cx :env (.env cx) :checked checked :core (.core cx) :heap (.heap cx)))
 
 ;;; `file:line:col` of `f`, as a string literal; empty in `coil.core`.
 (defn site [(cx Cx) (f Code)] (-> Code)
@@ -124,7 +148,7 @@
   (let [d (primitive/code-decl (get f 0))]
     (if (and (primitive/code-list? d)
              (> (len d) 3)
-             (= (get d 2) `fn))
+             (or (= (get d 2) `fn) (= (get d 2) `extern)))
         (primitive/code-sym (get d 3))
         "")))
 
@@ -172,7 +196,12 @@
         (names/ln-quasiquote? f) (None [Code])
         (primitive/code-vector? f) (rw-kids cx f 0)
         (skipped-form? f) (None [Code])
-        (or (head-is? f `defn) (head-is? f `defn*)) (rw-kids (with-checked cx (checked-def? f 2)) f 1)
+        (or (head-is? f `defn) (head-is? f `defn*))
+          (let [body (rw-kids (with-checked cx (checked-def? f 2)) f 1)
+                def (match body (Some [r] r) (None [] f))]
+            (if (and (= (get f 1) `main) (and (not (.core cx)) (not (wasm-target?))))
+                (Some (with-fault-reports def))
+                body))
         (head-is? f `impl) (rw-impl cx f)
         :else
           (let [kids (rw-kids cx f 0)
@@ -188,6 +217,15 @@
       (head-is? f `defstruct) (head-is? f `defsum) (head-is? f `deftrait)
       (head-is? f `defannotation) (head-is? f `const) (head-is? f `def)
       (head-is? f `declare)))
+
+;;; The entry point `main` with the fault reports installed before its body runs.
+(defn with-fault-reports [(m Code)] (-> Code)
+  (let [params-at (params-index m 2)
+        out (primitive/code-list-new)]
+    (for k (range 0 (+ params-at 2)) (primitive/code-list-push! out (get m k)))
+    (primitive/code-list-push! out `(crash/crash-install-memory-faults!))
+    (for k (range (+ params-at 2) (len m)) (primitive/code-list-push! out (get m k)))
+    (primitive/code-list-like m (primitive/code-list-done out))))
 
 ;;; Whether the annotations of a definition starting at `from` leave its checks on:
 ;;; everything but `:safety/checked false`.
@@ -261,6 +299,21 @@
           (and (= n 3) (calls-core? f "get")) (rw-get cx f g)
           (and (= n 4) (calls-core? f "set!")) (rw-set cx f g)
           (and (= n 3) (calls-core? f "cast")) (rw-cast cx f g)
+          (and (= n 1)
+               (and (.heap cx)
+                    (or (= (callee f) "coil.alloc.malloc-allocator")
+                        (and (= (callee f) "") (calls-core? f "malloc-allocator")))))
+            (Some `(dbg/debug-allocator-global))
+          (and (= n 2) (calls? cx f "coil.primitive/alloc-stack")) (rw-alloc-stack cx f g)
+          (and (= n 2) (calls? cx f "coil.primitive/alloc-stack-bytes")) (rw-alloc-stack-bytes cx f g)
+          (and (= n 3) (calls-core? f "unreachable-fail"))
+            (Some `(rt/fail! "reached unreachable code" ~(site cx f)))
+          (and (= n 3) (or (calls-core? f "index") (calls? cx f "coil.primitive/index"))) (rw-index cx f g)
+          (and (= n 2) (reads-through-pointer? cx f)) (rw-load cx f g)
+          (and (= n 3) (typed-read-through-pointer? cx f)) (rw-deref cx f g 2)
+          (and (= n 3) (writes-through-pointer? cx f)) (rw-deref cx f g 1)
+          (field-read? f) (rw-deref cx f g 1)
+          (and (= n 4) (> (mem-call-kind (callee f)) 0)) (rw-mem-call cx f g (mem-call-kind (callee f)))
           (slice-accessor? (callee f)) (rw-slice-call cx f g (callee f))
           :else (None [Code]))))
 
@@ -288,7 +341,7 @@
         a (get g 1)
         b (get g 2)]
     (if (not (int-type? ty))
-        (None [Code])
+        (generic-site cx f g ty)
         (if (.checked cx)
             (let [at (site cx f)]
               (Some (cond (= h "+") `(rt/checked-add [~ty] ~a ~b ~at)
@@ -306,11 +359,21 @@
                         (= h "<<") `(primitive/ishl (: ~a ~ty) (: ~b ~ty))
                         :else `(primitive/ishr (: ~a ~ty) (: ~b ~ty))))))))
 
+;;; An operator on a type that is not a standard integer: a float, which is never
+;;; checked, or a type parameter or a user type, whose operator is a trait method. For
+;;; a type parameter that method is coil.core's integer impl, which has no call site,
+;;; so the site records itself first and the report can name it.
+(defn generic-site [(cx Cx) (f Code) (g Code) (ty Code)] (-> (Option Code))
+  (if (or (float-type? ty) (not (.checked cx)) (.core cx))
+      (None [Code])
+      (Some `(do (rt/set-site! ~(site cx f)) ~g))))
+
 ;;; Unary minus on a signed integer type.
 (defn rw-negate [(cx Cx) (f Code) (g Code)] (-> (Option Code))
   (let [ty (primitive/type-of f)
         a (get g 1)]
-    (cond (not (signed-type? ty)) (None [Code])
+    (cond (not (int-type? ty)) (generic-site cx f g ty)
+          (not (signed-type? ty)) (None [Code])
           (.checked cx) (Some `(rt/checked-neg [~ty] ~a ~(site cx f)))
           :else (Some `(primitive/isub (: 0 ~ty) (: ~a ~ty))))))
 
@@ -419,22 +482,186 @@
                 (None [Code])
                 (Some `(let* [v ~x
                              r (cast ~d v)]
-                         (rt/check-int-cast (= (cast ~s r) v) (< v (cast ~s 0)) (< r (cast ~d 0)) ~at)
+                         (rt/check-int-cast (= (cast ~s r) v) (< v (cast ~s 0)) (< r (cast ~d 0))
+                                           ~(if (signed-type? d) `false `true) ~at)
                          r)))
           (and (int-type? d) (float-type? s))
             (Some `(let* [v ~x]
                      (rt/check-float-cast (cast f64 v) ~(int-bits d) ~(if (signed-type? d) `true `false) ~at)
                      (cast ~d v)))
+          (and (ptr-type? d) (or (ptr-type? s) (int-type? s)))
+            (if (needs-alignment? (get d 1))
+                (let [p (primitive/fresh-identifier "p")]
+                  (Some `(let* [~p ~x]
+                           (rt/check-align (cast i64 ~p) (primitive/alignof ~(get d 1)) ~at)
+                           (cast ~d ~p))))
+                (None [Code]))
+          ; A borrow cannot be bound to a local: the local would hold a copy, and the
+          ; pointer would point at that. The borrow is first converted to a byte
+          ; pointer, which is what the checker adapts it to, and that is bound.
+          (and (ptr-type? d) (borrow-type? s))
+            (if (and (needs-alignment? (get d 1)) (not (= (get s 1) (get d 1))))
+                (let [p (primitive/fresh-identifier "p")]
+                  (Some `(let* [~p (cast (ptr i8) ~x)]
+                           (rt/check-align (cast i64 ~p) (primitive/alignof ~(get d 1)) ~at)
+                           (cast ~d ~p))))
+                (None [Code]))
           :else (None [Code]))))
+
+;;; `x` as a pointer that is not null.
+(defn nonnull [(x Code) (at Code)] (-> Code)
+  (let [p (primitive/fresh-identifier "p")]
+    `(let* [~p ~x] (rt/check-nonnull (cast i64 ~p) ~at) ~p)))
+
+;;; Whether `x` names a place, `(.name y)` or `(field y name)`, rather than computing a
+;;; value.
+(defn place-form? [(x Code)] (-> bool)
+  (and (primitive/code-list? x)
+       (not (primitive/code-vector? x))
+       (> (len x) 0)
+       (let [h (names/ln-head-text x)]
+         (or (= h "field") (and (> (len h) 1) (= (get h 0) (cast u8 46)))))))
+
+;;; `g`, a form that dereferences its operand at `k`, with that operand checked when
+;;; it is a pointer.
+;;;
+;;; The checker types `(.name y)` as the address of the place when it is the operand
+;;; of another field access. A pointer-valued field is then `(ptr (ptr T))`: the
+;;; stored pointer is read into a local and checked. A nested aggregate is `(ptr S)`
+;;; for a struct `S`: binding it would copy the struct, so it is left to the access
+;;; beneath it, which is checked on its own. Everywhere else the operand is a value.
+(defn rw-deref [(cx Cx) (f Code) (g Code) (k i64)] (-> (Option Code))
+  (let [t (primitive/type-of (get f k))
+        operand (get f k)
+        through-place (and (field-read? f) (place-form? operand))]
+    (if (and (ptr-type? t)
+             (or (not through-place) (ptr-type? (get t 1))))
+        (let [out (primitive/code-list-new)]
+          (for j (range 0 (len g))
+            (primitive/code-list-push! out (if (= j k) (nonnull (get g j) (site cx f)) (get g j))))
+          (Some (primitive/code-list-like g (primitive/code-list-done out))))
+        (None [Code]))))
+
+;;; `(load P)`: P is checked for null, and when the loaded type is a `bool` or a sum
+;;; its bytes are checked to be a value of that type, so memory reinterpreted through
+;;; a pointer cast cannot produce one the language has no name for. A sum is its tag,
+;;; an `i32` at offset 0, then its payload; the tag is the variant's index.
+(defn rw-load [(cx Cx) (f Code) (g Code)] (-> (Option Code))
+  (let [t (primitive/type-of f)
+        operand (get f 1)
+        null-checked (rw-deref cx f g 1)
+        gg (match null-checked (Some [r] r) (None [] g))
+        at (site cx f)
+        sum? (= (primitive/code-type-shape t) `sum)
+        p (primitive/fresh-identifier "p")]
+    (cond (or (not (ptr-type? (primitive/type-of operand))) (place-form? operand)) null-checked
+          (= t `bool)
+            (Some `(let* [~p ~(get gg 1)]
+                     (rt/check-bool (load (cast (ptr u8) ~p)) ~at)
+                     (load ~p)))
+          sum?
+            (Some `(let* [~p ~(get gg 1)]
+                     (rt/check-tag (cast i64 (load (cast (ptr i32) ~p))) ~(primitive/code-variant-count t) ~at)
+                     (load ~p)))
+          :else null-checked)))
+
+;;; `(load P)`.
+(defn reads-through-pointer? [(cx Cx) (f Code)] (-> bool)
+  (or (calls-core? f "load") (calls? cx f "coil.primitive/load")))
+
+;;; `(volatile-load T P)` and `(alias-load T P)`.
+(defn typed-read-through-pointer? [(cx Cx) (f Code)] (-> bool)
+  (or (calls? cx f "coil.primitive/volatile-load")
+      (calls? cx f "coil.primitive/alias-load")))
+
+;;; `(store! P V)` and the volatile and alias-tolerant writes of the same kind.
+(defn writes-through-pointer? [(cx Cx) (f Code)] (-> bool)
+  (or (calls-core? f "store!")
+      (or (calls? cx f "coil.primitive/store!")
+          (or (calls? cx f "coil.primitive/volatile-store!")
+              (calls? cx f "coil.primitive/alias-store!")))))
+
+;;; Whether `f` is a field read, `(.name x)`.
+(defn field-read? [(f Code)] (-> bool)
+  (let [h (names/ln-head-text f)]
+    (and (= (len f) 2) (and (> (len h) 1) (= (get h 0) (cast u8 46))))))
+
+;;; `(alloc-stack-bytes N)`, filled the same way.
+(defn rw-alloc-stack-bytes [(cx Cx) (f Code) (g Code)] (-> (Option Code))
+  (let [p (primitive/fresh-identifier "p")
+        c (primitive/fresh-identifier "n")]
+    (Some `(let* [~c (: ~(get g 1) u64)
+                  ~p (primitive/alloc-stack-bytes ~c)]
+             (rt/fill-undefined! (cast (ptr i8) ~p) (cast i64 ~c))
+             ~p))))
+
+;;; `(index P K)`: pointer arithmetic, whose result must stay inside the address space.
+;;; P is bound once and K once, in order. A place such as an array local is not a
+;;; pointer value, and is left alone.
+(defn rw-index [(cx Cx) (f Code) (g Code)] (-> (Option Code))
+  (let [t (primitive/type-of f)
+        base (get f 1)]
+    (if (and (ptr-type? t) (and (ptr-type? (primitive/type-of base)) (not (place-form? base))))
+        (let [p (primitive/fresh-identifier "p")
+              k (primitive/fresh-identifier "k")]
+          (Some `(let* [~p ~(get g 1)
+                        ~k ~(get g 2)]
+                   (rt/check-ptr-index (cast i64 ~p) (cast i64 ~k) (cast i64 (primitive/sizeof ~(get t 1))) ~(site cx f))
+                   (primitive/index ~p ~k))))
+        (None [Code]))))
+
+;;; `(alloc-stack T)`: the frame storage is filled with the `undefined` pattern before
+;;; anyone reads it.
+(defn rw-alloc-stack [(cx Cx) (f Code) (g Code)] (-> (Option Code))
+  (let [p (primitive/fresh-identifier "p")]
+    (Some `(let* [~p ~g]
+             (rt/fill-undefined! (cast (ptr i8) ~p) (cast i64 (primitive/sizeof ~(get g 1))))
+             ~p))))
+
+;;; The C memory functions, which take a pointer and a byte count and have no defined
+;;; result for a null pointer or a negative count. `memcpy` also needs ranges that do
+;;; not overlap; `memmove` is the call for overlapping ones.
+(defn mem-call-kind [(name (slice u8))] (-> i64)
+  (cond (or (= name "coil.mem.memcpy") (= name "coil.io.memcpy")) 1
+        (= name "coil.mem.memmove") 2
+        (= name "coil.mem.memset") 3
+        (= name "coil.mem.memcmp") 4
+        :else 0))
+
+;;; `(memcpy DST SRC N)`, `(memmove …)`, `(memset P V N)`, `(memcmp A B N)`: each
+;;; operand evaluated once, in order, then the pointers and the count checked.
+(defn rw-mem-call [(cx Cx) (f Code) (g Code) (kind i64)] (-> (Option Code))
+  (let [x (primitive/fresh-identifier "x")
+        y (primitive/fresh-identifier "y")
+        n (primitive/fresh-identifier "n")
+        at (site cx f)
+        head (get g 0)
+        second-is-pointer (!= kind 3)]
+    (Some `(let* [~x ~(get g 1)
+                  ~y ~(if second-is-pointer (get g 2) `(: ~(get g 2) i32))
+                  ~n ~(get g 3)]
+             (rt/check-bytes (cast i64 ~x) (cast i64 ~n) ~at)
+             ~(if second-is-pointer
+                  `(rt/check-bytes (cast i64 ~y) (cast i64 ~n) ~at)
+                  `0)
+             ~(if (= kind 1)
+                  `(rt/check-copy (cast i64 ~x) (cast i64 ~y) (cast i64 ~n) ~at)
+                  `0)
+             (~head ~x ~y ~n)))))
 
 ; ---- entry -------------------------------------------------------------------
 (defn safety-module [(prelude Code) (m Code)] (-> Code)
   (let [cx (Cx :env (names/ln-env prelude m)
                :checked true
-               :core (= (get m 0) `coil.core))]
+               :core (= (get m 0) `coil.core)
+               :heap (!= (get m 0) `coil.debug-allocator))]
     (match (rw-kids cx m 1)
       (Some [r] r)
       (None [] m))))
+
+(defn wasm-target? [] (-> bool)
+  (let [arch (primitive/target-arch)]
+    (or (primitive/code-eq arch `wasm32) (primitive/code-eq arch `wasm64))))
 
 ;;; Rewrite every module but this one, whose functions run only inside the compiler.
 (defn safety [(modules Code)] (-> Code)

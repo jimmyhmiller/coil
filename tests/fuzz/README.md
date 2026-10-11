@@ -29,7 +29,7 @@ serde_json, five reader bugs (unlocated errors, split UTF-8 character literals,
 silently wrapping integer literals, `\uHEX` wrapping, stack overflow on deep
 nesting), a negative-index write in `string-truncate!`, a size-mismatched hand-off
 in `al-into-slice`, arena alignment of offsets rather than addresses, a quadratic
-free in `coil.dbgalloc`; in msgpack/sexp, a token-tape overread, uninitialized
+free in `coil.debug-allocator`; in msgpack/sexp, a token-tape overread, uninitialized
 skipped fields, stack overflow on deep nesting, quadratic map decoding, a bare
 tag that swallowed the next value, trailing bytes accepted, malformed floats
 accepted; and two compiler ownership bugs (generic locals wrapping `T` never
