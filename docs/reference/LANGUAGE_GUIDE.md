@@ -110,9 +110,10 @@ equals `0.0`. So `(= x x)` is false for a NaN `x`, and `!=` is true whenever eit
 side is NaN.
 
 `coil.math` has the float functions, for `f32` and `f64` alike: `sqrt`, `abs`,
-`floor`, `ceil`, `trunc`, `round` (ties away from zero), `round-even`, `min`, `max`,
+`floor`, `ceil`, `trunc`, `round` (ties away from zero), `round-even`,
 `mul-add`, `copysign`, the trigonometric and hyperbolic functions with `atan2`, `exp`,
-`exp2`, `log`, `log2`, `log10` and `pow`, and the `f64` constants `pi`, `tau` and `e`:
+`exp2`, `log`, `log2`, `log10` and `pow`, and the `f64` constants `pi`, `tau` and `e`.
+Its `min` and `max` take any integer type as well:
 
 ```coil
 (module example.math)
@@ -123,16 +124,19 @@ side is NaN.
         side (: 2.0 f32)]
     (println "{} {} {}" (math/sqrt side) (math/floor -2.5) (/ angle math/pi))
     (println "{}" (math/round (* (cast f32 math/tau) 10.0)))
+    (println "{} {}" (math/max 3 7) (math/min (: 200 u8) (: 9 u8)))
     0))
 ```
 
 ```output
 1.414214 -3.0 0.75
 63.0
+7 9
 ```
 
 `(- x)` negates (the `Neg` trait), and `+ - * /` and the bitwise operators take
-any number of operands, folding left: `(+ a b c)` is `(+ (+ a b) c)`.
+any number of operands, folding left: `(+ a b c)` is `(+ (+ a b) c)`. The
+operators, comparisons and `{}` cover `i8` through `i128` and `u8` through `u128`.
 
 ## Bindings and control flow
 
