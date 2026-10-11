@@ -937,7 +937,9 @@ true
   the shortest text that reads back as the same value (`0.1`, `1.5e-7`,
   `0.30000000000000004`), unless the spec gives a precision.
 - `(fmt w "…" args…)` formats to any `(ptr Writer)`, such as `(stdout)`, `(stderr)`,
-  a buffer or a file (from `coil.io`).
+  a buffer or a file (from `coil.io`). To format into a string, `coil.str` has
+  `(sb-format! (mut sb) "…" args…)` for a `StrBuf`, and `sb-writer` makes a `StrBuf`
+  a Writer.
 - A string literal is `(slice u8)`, and byte strings compare with `=`.
 - `coil.str` adds validated UTF-8 types. `StringView` is a borrowed view (`(sv "…")`
   for literals, `string-view-from-utf8` for untrusted bytes). `String` is an owned,
