@@ -1436,6 +1436,8 @@ source-roots = ["src"]
                                       "cannot move an owned value out of a field or element of 'p'"),
             lambda: expect_diagnostic("tests/compiler/features/ownership_field_take_rejected.coil",
                                       "cannot take! an owned field or element of 'p'"),
+            lambda: expect_diagnostic("tests/compiler/features/ownership_move_out_of_borrow_rejected.coil",
+                                      "cannot move an owned ownership-move-out-of-borrow-rejected.Bag out of a borrow"),
             result_flow_fix_task,
             primitive_spelling_task,
             lambda: build_run("src/examples/bitfields.coil", "static-assert", *backend_flags, want=42),
