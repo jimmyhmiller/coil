@@ -1752,7 +1752,10 @@
 ; The parser tracks the loops and blocks around the expression it is parsing, back
 ; to the enclosing function, and gives such a break or continue the label of the loop
 ; it reaches. A loop with no label of its own is given one that source cannot spell.
-(defsum LoopScopeKind (ScopeLoop) (ScopeBlock) (ScopeFunction))
+; A defer's cleanup runs on the way out of the forms it guards, so a break or
+; continue inside it may only reach loops and blocks inside the cleanup itself:
+; `ScopeCleanup` is the wall it cannot cross.
+(defsum LoopScopeKind (ScopeLoop) (ScopeBlock) (ScopeFunction) (ScopeCleanup))
 
 (defstruct LoopScope
   [(kind LoopScopeKind)
@@ -1788,6 +1791,26 @@
 (defn scope-loop? [(s LoopScope)] (-> bool)
   (match (.kind s) (ScopeLoop [] true) (_ false)))
 
+(defn scope-cleanup? [(s LoopScope)] (-> bool)
+  (match (.kind s) (ScopeCleanup [] true) (_ false)))
+
+(defn cleanup-escape-diag [(a (dyn Allocator)) (what (slice u8)) (slo i64) (shi i64)] (-> Diag)
+  (derr-at slo shi (sconcat a what " cannot leave a (defer …) cleanup; a cleanup runs on the way out and must finish")))
+
+;;; Whether a break or continue to `label` would leave a defer cleanup: the
+;;; cleanup's wall comes before any loop or block with that label.
+(defn label-leaves-cleanup? [(label (slice u8))] (-> bool)
+  (let [c (loop-scopes)
+        (mut i) (- (len (.items c)) 1)
+        (mut leaves) false]
+    (while (>= i 0)
+      (let [sc (get (.items c) i)]
+        (cond (scope-cleanup? sc) (do (set! leaves true) (set! i -1))
+              (match (.kind sc) (ScopeFunction [] true) (_ false)) (set! i -1)
+              (match (.label sc) (Some [l] (= l label)) (None [] false)) (set! i -1)
+              :else (set! i (- i 1)))))
+    leaves))
+
 ;;; The label an unlabeled break or continue at this point must carry: None when
 ;;; the innermost scope is a loop (the plain meaning), or the label of the nearest
 ;;; loop past the blocks around it.
@@ -1795,13 +1818,17 @@
   (let [c (loop-scopes)
         n (len (.items c))]
     (if (or (= n 0) (not (scope-block? (get (.items c) (- n 1)))))
-        (Ok (None [(slice u8)]))
+        (if (and (> n 0) (scope-cleanup? (get (.items c) (- n 1))))
+            (Err [(Option (slice u8)) Diag] (cleanup-escape-diag a what slo shi))
+            (Ok (None [(slice u8)])))
         (let [(mut i) (- n 1)]
           (while (and (>= i 0) (scope-block? (get (.items c) i)))
             (set! i (- i 1)))
           (if (or (< i 0) (not (scope-loop? (get (.items c) i))))
               (Err [(Option (slice u8)) Diag]
-                   (derr-at slo shi (sconcat3 a what " inside a block has no enclosing loop; leave the block with (return-from :label value)" "")))
+                   (if (and (>= i 0) (scope-cleanup? (get (.items c) i)))
+                       (cleanup-escape-diag a what slo shi)
+                       (derr-at slo shi (sconcat3 a what " inside a block has no enclosing loop; leave the block with (return-from :label value)" ""))))
               (let [target (get (.items c) i)]
                 (match (.label target)
                   (Some [l]
@@ -1836,14 +1863,71 @@
 ;;; Parse a function body: break and continue inside it cannot reach loops outside.
 (defn parse-function-body [(a (dyn Allocator)) (items (ptr (ArrayList Sexp)))] (-> (Result (ptr (ArrayList Expr)) Diag))
   (push-loop-scope! (ScopeFunction) (None [(slice u8)]))
-  (let [body (parse-exprs a items)]
+  (let [body (parse-body a items)]
     (pop-loop-scope!)
     body))
+
+; ---- defer ---------------------------------------------------------------------
+; `(defer* cleanup)` is a form of a BODY: the forms of a function, `let`, `do`,
+; `loop`, `block*` or match-arm body, and so of every macro that expands to one
+; (`when`, `for`, `block`, `scope`, ...). It guards the forms after it in that body:
+; once control has reached it, `cleanup` runs when control leaves the body, by
+; falling off its end or by any break, continue or return-from that leaves it --
+; including the ones a macro such as `try!` writes. Several defers in one body run
+; last-registered first, and an inner body's defers run before an outer one's.
+; The parser records the guarded forms as `(EDefer cleanup rest)`; ownership
+; elaboration places the cleanup at each exit, in order with the drops there.
+(defn defer-form? [(s Sexp)] (-> bool)
+  (and (= (sx-tag s) (primitive/cast i64 6))
+       (let [items (sx-items s)]
+         (and (> (sx-len items) (primitive/cast i64 0))
+              (let [h (sx-at items 0)]
+                (and (= (sx-tag h) (primitive/cast i64 2))
+                     (= (sx-sval h) "defer*")))))))
+
+;;; Parse a defer's cleanup. Nothing in it may break or continue past it.
+(defn parse-defer-cleanup [(a (dyn Allocator)) (s Sexp)] (-> (Result Expr Diag))
+  (let [items (sx-items s)]
+    (if (!= (sx-len items) (primitive/cast i64 2))
+        (Err (dwspan (derr-at (sx-lo s) (sx-hi s) "defer: expects exactly one cleanup form, (defer cleanup)")
+                     (sx-source s) (sx-lo s) (sx-hi s) (sx-ctxt s)))
+        (do
+          (push-loop-scope! (ScopeCleanup) (None [(slice u8)]))
+          (let [cleanup (parse-expr a (sx-at items 1))]
+            (pop-loop-scope!)
+            cleanup)))))
+
+;;; Parse the forms of a body, folding each `(defer* cleanup)` and the forms after
+;;; it into one `EDefer`.
+(defn parse-body [(a (dyn Allocator)) (items (ptr (ArrayList Sexp)))] (-> (Result (ptr (ArrayList Expr)) Diag))
+  (try (let [(mut out) (al-new [Expr] a)
+             n (sx-len items)
+             (mut i) 0]
+         (al-reserve! [Expr] (mut out) n)
+         (while (< i n)
+           (let [s (sx-at items i)]
+             (if (defer-form? s)
+                 (do
+                   (when (= (+ i 1) n)
+                     (break :try
+                            (Err [(ptr (ArrayList Expr)) Diag]
+                                 (dwspan (derr-at (sx-lo s) (sx-hi s) "defer: nothing follows it to guard; (defer cleanup) runs cleanup when control leaves the forms after it, so as the last form of a body it would run at once")
+                                         (sx-source s) (sx-lo s) (sx-hi s) (sx-ctxt s)))))
+                   (let [cleanup (try! (parse-defer-cleanup a s))
+                         rest (try! (parse-body a (rest-from a items (+ i 1))))]
+                     (push! (mut out)
+                            (mk-expr-node-id (EDefer (box-expr a cleanup) rest)
+                                             (sx-lo s) (sx-hi s) (sx-source s) (sx-ctxt s) (sx-node-id s))))
+                   (set! i n))
+                 (do
+                   (push! (mut out) (try! (parse-expr a s)))
+                   (set! i (+ i 1))))))
+         (Ok (box-al [Expr] a (load out))))))
 
 (defn parse-loop [(a (dyn Allocator)) (args (ptr (ArrayList Sexp))) (slo i64) (shi i64)] (-> (Result ExprKind Diag))
   (let [lr (split-label a args)]
     (push-loop-scope! (ScopeLoop) (.label lr))
-    (let [parsed (parse-exprs a (.rest lr))
+    (let [parsed (parse-body a (.rest lr))
           scope (pop-loop-scope!)]
       (match parsed
         (Err [d] (Err [ExprKind Diag] d))
@@ -1858,7 +1942,7 @@
       (None [] (Err [ExprKind Diag] (derr-at slo shi "block*: expects (block* :label body...)")))
       (Some [label]
         (push-loop-scope! (ScopeBlock) (.label lr))
-        (let [parsed (parse-exprs a (.rest lr))]
+        (let [parsed (parse-body a (.rest lr))]
           (pop-loop-scope!)
           (match parsed
             (Err [d] (Err [ExprKind Diag] d))
@@ -1874,7 +1958,10 @@
     (if (> (sx-len r) 1)
         (Err [ExprKind Diag] (derr-at slo shi "break: expects (break [:label] [value])"))
         (let [label (match (.label lr)
-                      (Some [l] (Ok [(Option (slice u8)) Diag] (Some l)))
+                      (Some [l]
+                        (if (label-leaves-cleanup? l)
+                            (Err [(Option (slice u8)) Diag] (cleanup-escape-diag a "break" slo shi))
+                            (Ok [(Option (slice u8)) Diag] (Some l))))
                       (None [] (unlabeled-target a "break" slo shi)))]
           (match label
             (Err [d] (Err [ExprKind Diag] d))
@@ -1891,7 +1978,10 @@
     (if (> (sx-len (.rest lr)) 0)
         (Err [ExprKind Diag] (derr-at slo shi "continue: expects (continue [:label])"))
         (match (.label lr)
-          (Some [l] (Ok (EContinue (Some l))))
+          (Some [l]
+            (if (label-leaves-cleanup? l)
+                (Err [ExprKind Diag] (cleanup-escape-diag a "continue" slo shi))
+                (Ok (EContinue (Some l)))))
           (None []
             (match (unlabeled-target a "continue" slo shi)
               (Err [d] (Err [ExprKind Diag] d))
@@ -1966,7 +2056,7 @@
                                      (Err [error] (break :try (Err error)))))
                            (push! (mut binds) (load bp)))
                          (store! k (primitive/iadd (load k) 2)))))
-             (let [body (try! (parse-exprs a (rest-from a args 1)))]
+             (let [body (try! (parse-body a (rest-from a args 1)))]
                (when (= (len (load body)) (primitive/cast i64 0))
                  (break :try
                           (Err [ExprKind Diag]
@@ -2084,7 +2174,7 @@
                                          (push! (mut binds) (lexical-name a bn)))
                                        (store! bi (primitive/iadd (load bi) 1)))))
                            (let [bodyf
-                                   (try! (parse-exprs a
+                                   (try! (parse-body a
                                                       (rest-from a
                                                                  al
                                                                  (if wild 1 2))))
@@ -2578,7 +2668,10 @@
                                                                      (sx-at args
                                                                             2)))))))
                            (= source-head "do")
-                             (Ok (EDo (try! (parse-exprs a args))))
+                             (Ok (EDo (try! (parse-body a args))))
+                           (= source-head "defer*")
+                             (Err [ExprKind Diag]
+                                  (derr-at slo shi "defer: (defer cleanup) is a form of a body -- a function, let, do, loop, block or match-arm body -- where it guards the forms after it; it cannot stand in a value position"))
                            (= source-head "fn*") (parse-anon-fn a args slo shi)
                            (= source-head "comptime")
                              (if (!= nargs (primitive/cast i64 1))
