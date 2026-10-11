@@ -1,0 +1,677 @@
+(module regex-reference-test)
+(import "coil.primitive" :as primitive)
+(import "coil.regex" :as re)
+(import "coil.slice" :use [slice-of])
+
+; Differential test of coil.regex against a reference matcher.
+;
+; Patterns: a compile-time generator (a seeded xorshift PRNG inside the
+; `gen-regex-cases` macro) writes random small patterns over `a`, `b`, `.`,
+; byte classes, groups, alternation, greedy and lazy repetition and the
+; assertions `^ $ \b \B`, and emits, for each, functions that run the real
+; macros on it.
+;
+; Reference: the test re-parses the pattern at run time, builds a Thompson NFA
+; by backward construction (a different algorithm from the macro's patch lists),
+; and searches it by recursive backtracking: alternatives in priority order, the
+; first accepting path wins, and a path may not revisit a state at the same
+; position. That is the leftmost-first semantics the Pike VM implements, stated
+; as plainly as possible.
+;
+; Inputs: every string over {a, b, space} up to length 4, plus seeded random
+; strings up to length 12, at every start offset.
+
+; ---- run-time pattern parser (AST) -----------------------------------------
+; Kinds: 0 empty, 1 class, 2 concat, 3 alternation, 4 group, 5 assertion,
+;        6 star, 7 plus, 8 question, 9 counted (min, max; max -1 = unbounded).
+(defstruct Ast
+  [(kind (array i64 256))
+   (a (array i64 256))
+   (b (array i64 256))
+   (lo (array i64 256))
+   (hi (array i64 256))
+   (lazy (array bool 256))
+   (m0 (array i64 256))
+   (m1 (array i64 256))
+   (m2 (array i64 256))
+   (m3 (array i64 256))
+   (count i64)
+   (groups i64)
+   (pattern (slice u8))
+   (pos i64)])
+
+(defn node! [(t (ptr Ast)) (kind i64) (a i64) (b i64)] (-> i64)
+  (let [n (.count t)]
+    (assert (< n 256))
+    (set! (.count t) (+ n 1))
+    (set! (mut (.kind t)) n kind)
+    (set! (mut (.a t)) n a)
+    (set! (mut (.b t)) n b)
+    (set! (mut (.lo t)) n 0)
+    (set! (mut (.hi t)) n 0)
+    (set! (mut (.lazy t)) n false)
+    (set! (mut (.m0 t)) n 0)
+    (set! (mut (.m1 t)) n 0)
+    (set! (mut (.m2 t)) n 0)
+    (set! (mut (.m3 t)) n 0)
+    n))
+
+(defn class-add! [(t (ptr Ast)) (n i64) (byte i64)] (-> void)
+  (let [bit (primitive/ishl 1 (% byte 64))]
+    (case (/ byte 64) 0
+          (set! (mut (.m0 t)) n (| (get (.m0 t) n) bit)) 1
+          (set! (mut (.m1 t)) n (| (get (.m1 t) n) bit)) 2
+          (set! (mut (.m2 t)) n (| (get (.m2 t) n) bit))
+            (set! (mut (.m3 t)) n (| (get (.m3 t) n) bit)))))
+
+(defn class-negate! [(t (ptr Ast)) (n i64)] (-> void)
+  (set! (mut (.m0 t)) n (^ (get (.m0 t) n) -1))
+  (set! (mut (.m1 t)) n (^ (get (.m1 t) n) -1))
+  (set! (mut (.m2 t)) n (^ (get (.m2 t) n) -1))
+  (set! (mut (.m3 t)) n (^ (get (.m3 t) n) -1)))
+
+(defn peek [(t (ptr Ast))] (-> i64)
+  (if (>= (.pos t) (len (.pattern t)))
+      -1
+      (cast i64 (get (.pattern t) (.pos t)))))
+
+(defn take! [(t (ptr Ast))] (-> i64)
+  (let [b (peek t)]
+    (set! (.pos t) (+ (.pos t) 1))
+    b))
+
+(defn parse-number [(t (ptr Ast))] (-> i64)
+  (let [(mut v) -1]
+    (while (and (>= (peek t) #\0) (<= (peek t) #\9))
+      (set! v (+ (* (if (< v 0) 0 (load v)) 10) (- (take! t) #\0))))
+    v))
+
+(defn parse-atom [(t (ptr Ast))] (-> i64)
+  (let [b (take! t)]
+    (cond (= b #\()
+            (if (= (peek t) #\?)
+                (do
+                  (take! t)
+                  (assert (= (take! t) #\:))
+                  (let [inner (parse-alt t)]
+                    (assert (= (take! t) #\)))
+                    inner))
+                (let [index (+ (.groups t) 1)]
+                  (set! (.groups t) index)
+                  (let [inner (parse-alt t)
+                        n (node! t 4 inner 0)]
+                    (assert (= (take! t) #\)))
+                    (set! (mut (.lo t)) n index)
+                    n)))
+          (= b #\[)
+            (let [n (node! t 1 0 0)
+                  negated (= (peek t) #\^)]
+              (when negated (take! t))
+              (while (!= (peek t) #\])
+                (class-add! t n (take! t)))
+              (take! t)
+              (when negated (class-negate! t n))
+              n)
+          (= b #\.)
+            (let [n (node! t 1 0 0)]
+              (class-add! t n 10)
+              (class-negate! t n)
+              n)
+          (= b #\\)
+            (let [e (take! t)
+                  n (node! t 5 0 0)]
+              (set! (mut (.lo t)) n (if (= e #\b) 5 6))
+              n)
+          (= b #\^) (let [n (node! t 5 0 0)] (set! (mut (.lo t)) n 3) n)
+          (= b #\$) (let [n (node! t 5 0 0)] (set! (mut (.lo t)) n 4) n)
+          :else (let [n (node! t 1 0 0)] (class-add! t n b) n))))
+
+(defn lazy-suffix! [(t (ptr Ast)) (n i64)] (-> i64)
+  (when (= (peek t) #\?)
+    (take! t)
+    (set! (mut (.lazy t)) n true))
+  n)
+
+(defn parse-repeat [(t (ptr Ast))] (-> i64)
+  (let [atom (parse-atom t)
+        q (peek t)]
+    (cond (= q #\*) (do (take! t) (lazy-suffix! t (node! t 6 atom 0)))
+          (= q #\+) (do (take! t) (lazy-suffix! t (node! t 7 atom 0)))
+          (= q #\?) (do (take! t) (lazy-suffix! t (node! t 8 atom 0)))
+          (= q #\{)
+            (do
+              (take! t)
+              (let [lo (parse-number t)
+                    n (node! t 9 atom 0)]
+                (set! (mut (.lo t)) n lo)
+                (if (= (take! t) #\})
+                    (set! (mut (.hi t)) n lo)
+                    (let [hi (parse-number t)]
+                      (assert (= (take! t) #\}))
+                      (set! (mut (.hi t)) n hi)))
+                (lazy-suffix! t n)))
+          :else atom)))
+
+(defn concat-end? [(b i64)] (-> bool)
+  (or (< b 0) (= b #\)) (= b #\|)))
+
+(defn parse-concat [(t (ptr Ast))] (-> i64)
+  (if (concat-end? (peek t))
+      (node! t 0 0 0)
+      (let [first (parse-repeat t)]
+        (if (concat-end? (peek t))
+            first
+            (node! t 2 first (parse-concat t))))))
+
+(defn parse-alt [(t (ptr Ast))] (-> i64)
+  (let [left (parse-concat t)]
+    (if (= (peek t) #\|)
+        (do (take! t) (node! t 3 left (parse-alt t)))
+        left)))
+
+; ---- reference NFA: backward Thompson construction --------------------------
+; Ops: 0 class (masks), 1 split (out1 preferred), 2 accept, 3..6 assertions,
+;      9 save (slot in `arg`).
+(defstruct Nfa
+  [(op (array i64 512))
+   (out1 (array i64 512))
+   (out2 (array i64 512))
+   (arg (array i64 512))
+   (m0 (array i64 512))
+   (m1 (array i64 512))
+   (m2 (array i64 512))
+   (m3 (array i64 512))
+   (mark (array i64 512))
+   (regs (array i64 64))
+   (count i64)
+   (epoch i64)
+   (start i64)
+   (slots i64)])
+
+(defn state! [(m (ptr Nfa)) (op i64) (out1 i64) (out2 i64)] (-> i64)
+  (let [s (.count m)]
+    (assert (< s 512))
+    (set! (.count m) (+ s 1))
+    (set! (mut (.op m)) s op)
+    (set! (mut (.out1 m)) s out1)
+    (set! (mut (.out2 m)) s out2)
+    (set! (mut (.arg m)) s 0)
+    (set! (mut (.mark m)) s 0)
+    s))
+
+(defn split! [(m (ptr Nfa)) (preferred i64) (other i64) (lazy bool)] (-> i64)
+  (if lazy (state! m 1 other preferred) (state! m 1 preferred other)))
+
+(defn star! [(m (ptr Nfa)) (t (ptr Ast)) (child i64) (lazy bool) (next i64)] (-> i64)
+  (let [loop (state! m 1 -1 -1)
+        body (build m t child loop)]
+    (if lazy
+        (do (set! (mut (.out1 m)) loop next) (set! (mut (.out2 m)) loop body))
+        (do (set! (mut (.out1 m)) loop body) (set! (mut (.out2 m)) loop next)))
+    loop))
+
+(defn build [(m (ptr Nfa)) (t (ptr Ast)) (n i64) (next i64)] (-> i64)
+  (let [kind (get (.kind t) n)
+        a (get (.a t) n)
+        lazy (get (.lazy t) n)]
+    (case kind 0
+          next 1
+          (let [s (state! m 0 next -1)]
+            (set! (mut (.m0 m)) s (get (.m0 t) n))
+            (set! (mut (.m1 m)) s (get (.m1 t) n))
+            (set! (mut (.m2 m)) s (get (.m2 t) n))
+            (set! (mut (.m3 m)) s (get (.m3 t) n))
+            s)
+            2
+          (build m t a (build m t (get (.b t) n) next)) 3
+          (let [right (build m t (get (.b t) n) next)
+                left (build m t a next)]
+            (state! m 1 left right))
+            4
+          (let [index (get (.lo t) n)
+                close (state! m 9 next -1)]
+            (set! (mut (.arg m)) close (+ (* index 2) 1))
+            (let [open (state! m 9 (build m t a close) -1)]
+              (set! (mut (.arg m)) open (* index 2))
+              open))
+            5
+          (state! m (get (.lo t) n) next -1) 6
+          (star! m t a lazy next) 7
+          (let [loop (state! m 1 -1 -1)
+                body (build m t a loop)]
+            (if lazy
+                (do
+                  (set! (mut (.out1 m)) loop next)
+                  (set! (mut (.out2 m)) loop body))
+                (do
+                  (set! (mut (.out1 m)) loop body)
+                  (set! (mut (.out2 m)) loop next)))
+            body)
+            8
+          (split! m (build m t a next) next lazy)
+            ; Counted: LO copies, then HI-LO independent optional copies, or a star.
+            (let [lo (get (.lo t) n)
+                  hi (get (.hi t) n)
+                  (mut tail) next]
+              (if (< hi 0)
+                  (set! tail (star! m t a lazy next))
+                  (for _
+                    (range 0 (- hi lo))
+                    (set! tail (split! m (build m t a tail) tail lazy))))
+              (for _
+                (range 0 lo)
+                (set! tail (build m t a tail)))
+              tail))))
+
+(defn compile-reference [(m (ptr Nfa)) (t (ptr Ast)) (pattern (slice u8))] (-> void)
+  (set! (.pattern t) pattern)
+  (set! (.pos t) 0)
+  (set! (.count t) 0)
+  (set! (.groups t) 0)
+  (set! (.count m) 0)
+  (set! (.epoch m) 1)
+  (let [root (parse-alt t)]
+    (assert (= (.pos t) (len pattern)))
+    (let [accept (state! m 2 -1 -1)
+          close (state! m 9 accept -1)]
+      (set! (mut (.arg m)) close 1)
+      (let [open (state! m 9 (build m t root close) -1)]
+        (set! (mut (.arg m)) open 0)
+        (set! (.start m) open)
+        (set! (.slots m) (* 2 (+ (.groups t) 1)))))))
+
+; ---- reference search -------------------------------------------------------
+(defn word? [(hay (slice u8)) (i i64)] (-> bool)
+  (and (>= i 0)
+       (< i (len hay))
+       (let [b (get hay i)]
+         (or (and (>= b #\a) (<= b #\z))
+             (and (>= b #\A) (<= b #\Z))
+             (and (>= b #\0) (<= b #\9))
+             (= b #\_)))))
+
+(defn assertion-holds? [(op i64) (hay (slice u8)) (pos i64)] (-> bool)
+  (case op 3
+        (= pos 0) 4
+        (= pos (len hay)) 5
+        (!= (word? hay (- pos 1)) (word? hay pos))
+          (= (word? hay (- pos 1)) (word? hay pos))))
+
+(defn in-class? [(m (ptr Nfa)) (s i64) (byte i64)] (-> bool)
+  (let [mask
+          (case (/ byte 64) 0
+                (get (.m0 m) s) 1
+                (get (.m1 m) s) 2
+                (get (.m2 m) s) (get (.m3 m) s))]
+    (!= (& mask (primitive/ishl 1 (% byte 64))) 0)))
+
+; Does some path from S at POS reach accept? Paths are tried in priority order,
+; so the registers hold the first accepting path's captures. EPOCH names the
+; stretch of the path since its last consumed byte; a state already marked with
+; it would be revisited at the same position.
+(defn walk [(m (ptr Nfa)) (hay (slice u8)) (s i64) (pos i64) (epoch i64)] (-> bool)
+  (if (= (get (.mark m) s) epoch)
+      false
+      (let [saved (get (.mark m) s)
+            op (get (.op m) s)]
+        (set! (mut (.mark m)) s epoch)
+        (let [ok
+                (case op 0
+                      (and (< pos (len hay))
+                           (in-class? m s (cast i64 (get hay pos)))
+                           (do
+                             (set! (.epoch m) (+ (.epoch m) 1))
+                             (walk m hay (get (.out1 m) s) (+ pos 1) (.epoch m))))
+                        1
+                      (or (walk m hay (get (.out1 m) s) pos epoch)
+                          (and (>= (get (.out2 m) s) 0)
+                               (walk m hay (get (.out2 m) s) pos epoch)))
+                        2
+                      true 9
+                      (let [slot (get (.arg m) s)
+                            old (get (.regs m) slot)]
+                        (set! (mut (.regs m)) slot pos)
+                        (if (walk m hay (get (.out1 m) s) pos epoch)
+                            true
+                            (do (set! (mut (.regs m)) slot old) false)))
+                        (and (assertion-holds? op hay pos)
+                             (walk m hay (get (.out1 m) s) pos epoch)))]
+          (set! (mut (.mark m)) s saved)
+          ok))))
+
+; Leftmost-first search from FROM: true when a match exists; the registers then
+; hold its captures.
+(defn reference-search [(m (ptr Nfa)) (hay (slice u8)) (from i64)] (-> bool)
+  (block :search
+         (when (or (< from 0) (> from (len hay))) (return-from :search false))
+         (for start
+           (range from (+ (len hay) 1))
+           (for i (range 0 (.slots m)) (set! (mut (.regs m)) i -1))
+           (set! (.epoch m) (+ (.epoch m) 1))
+           (when (walk m hay (.start m) start (.epoch m))
+             (return-from :search true)))
+         false))
+
+; ---- comparison --------------------------------------------------------------
+(defn failures [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn reference-cell [] (-> (ptr Nfa))
+  (primitive/alloc-static Nfa))
+
+(defn ast-cell [] (-> (ptr Ast))
+  (primitive/alloc-static Ast))
+
+(defn fail! [(pattern (slice u8)) (hay (slice u8)) (from i64) (what (slice u8))] (-> void)
+  (store! (failures) (+ (load (failures)) 1))
+  (when (<= (load (failures)) 20)
+    (println "MISMATCH {} pattern {:?} haystack {:?} from {}"
+             what
+             pattern
+             hay
+             from)))
+
+(defn prepare! [(pattern (slice u8))] (-> void)
+  (compile-reference (reference-cell) (ast-cell) pattern))
+
+(defn check-case [(const N i64)] [(pattern (slice u8))
+                                  (hay (slice u8))
+                                  (from i64)
+                                  (matched bool)
+                                  (found (Option re/Span))
+                                  (caps (Option (re/Captures N)))] (-> void)
+  (let [m (reference-cell)
+        expected (reference-search m hay from)]
+    (assert-eq (.slots m) (* 2 N))
+    (when (= from 0)
+      (when (!= matched expected) (fail! pattern hay from "is-match?")))
+    (match found
+      (None []
+            (when expected (fail! pattern hay from "find (expected a match)")))
+      (Some [span]
+            (when (or (not expected)
+                      (!= (.start span) (get (.regs m) 0))
+                      (!= (.end span) (get (.regs m) 1)))
+              (println "  find gave ({} {}), reference ({} {})"
+                       (.start span)
+                       (.end span)
+                       (get (.regs m) 0)
+                       (get (.regs m) 1))
+              (fail! pattern hay from "find"))))
+    (match caps
+      (None []
+            (when expected
+              (fail! pattern hay from "captures (expected a match)")))
+      (Some [c]
+            (if (not expected)
+                (fail! pattern hay from "captures (expected none)")
+                (for g
+                  (range 0 N)
+                  (let [want-start (get (.regs m) (* 2 g))
+                        want-end (get (.regs m) (+ (* 2 g) 1))]
+                    (match (re/group c g)
+                      (None []
+                            (when (>= want-start 0)
+                              (println "  group {} unset, reference ({} {})"
+                                       g
+                                       want-start
+                                       want-end)
+                              (fail! pattern hay from "captures")))
+                      (Some [span]
+                            (when (or (!= (.start span) want-start)
+                                      (!= (.end span) want-end))
+                              (println "  group {} ({} {}), reference ({} {})"
+                                       g
+                                       (.start span)
+                                       (.end span)
+                                       want-start
+                                       want-end)
+                              (fail! pattern hay from "captures")))))))))))
+
+; The reference's non-overlapping iteration, replayed against the real
+; iterators.
+(defn check-iter [(const N i64)] [(pattern (slice u8))
+                                  (hay (slice u8))
+                                  (matches re/Matches)
+                                  (all (re/CapturesIter N))] (-> void)
+  (let [m (reference-cell)
+        (mut spans) matches
+        (mut groups) all
+        (mut at) 0
+        (mut last-end) -1]
+    (block :walk
+             (loop (when (> at (len hay)) (return-from :walk 0))
+               (if (not (reference-search m hay at))
+                   (do
+                     (match (next (mut spans))
+                       (Some [s]
+                             (fail! pattern hay at "find-iter (extra match)"))
+                       (None [] 0))
+                     (match (next (mut groups))
+                       (Some [c]
+                             (fail! pattern
+                                    hay
+                                    at
+                                    "captures-iter (extra match)"))
+                       (None [] 0))
+                     (return-from :walk 0))
+                   (let [start (get (.regs m) 0)
+                         end (get (.regs m) 1)
+                         skip (and (= start end) (= end last-end))]
+                     (if (= start end)
+                         (set! at (+ end 1))
+                         (set! at end))
+                     (when (not skip)
+                       (set! last-end end)
+                       (match (next (mut spans))
+                         (Some [s]
+                               (when (or (!= (.start s) start)
+                                         (!= (.end s) end))
+                                 (fail! pattern hay at "find-iter")))
+                         (None []
+                               (fail! pattern
+                                      hay
+                                      at
+                                      "find-iter (missing match)")))
+                       (match (next (mut groups))
+                         (Some [c]
+                               (for g
+                                 (range 0 N)
+                                 (let [want (get (.regs m) (* 2 g))
+                                       got
+                                         (match (re/group c g)
+                                           (Some [span] (.start span))
+                                           (None [] -1))]
+                                   (when (!= got want)
+                                     (fail! pattern hay at "captures-iter")))))
+                         (None []
+                               (fail! pattern
+                                      hay
+                                      at
+                                      "captures-iter (missing match)"))))))))))
+
+; ---- compile-time pattern generator ----------------------------------------
+(defn rng! [(state (mut i64))] (-> i64)
+  (let [x0 (load state)
+        x1 (primitive/ixor x0 (primitive/ishl x0 13))
+        x2
+          (primitive/ixor x1
+                          (primitive/iand (primitive/ishr x1 7)
+                                          144115188075855871))
+        x3 (primitive/ixor x2 (primitive/ishl x2 17))]
+    (store! state x3)
+    (primitive/iand (primitive/ishr x3 3) 1152921504606846975)))
+
+(defn pick! [(state (mut i64)) (n i64)] (-> i64)
+  (primitive/urem (rng! (mut state)) n))
+
+(defn emit-str! [(out CodeBuilder) (text (slice u8))] (-> void)
+  (for b text (primitive/code-list-push! out `~(cast i64 b))))
+
+(defn gen-atom! [(state (mut i64)) (out CodeBuilder) (depth i64)] (-> bool)
+  ; Returns true when the atom may take a counted quantifier.
+  (let [choice (pick! (mut state) (if (< depth 2) 13 10))]
+    (case choice 0
+          (do (emit-str! out "a") true) 1
+          (do (emit-str! out "a") true) 2
+          (do (emit-str! out "b") true) 3
+          (do (emit-str! out "b") true) 4
+          (do (emit-str! out ".") true) 5
+          (do (emit-str! out "[ab]") true) 6
+          (do (emit-str! out "[^a]") true) 7
+          (do
+            (emit-str! out
+                       (case (pick! (mut state) 4) 0 "^" 1 "$" 2 "\\b" "\\B"))
+            false)
+            8
+          (do (emit-str! out " ") true) 9
+          (do (emit-str! out "a") true) 10
+          (do
+            (emit-str! out "(")
+            (gen-alt! (mut state) out (+ depth 1))
+            (emit-str! out ")")
+            false)
+            11
+          (do
+            (emit-str! out "(?:")
+            (gen-alt! (mut state) out (+ depth 1))
+            (emit-str! out ")")
+            false)
+            (do
+              (emit-str! out "(")
+              (gen-alt! (mut state) out (+ depth 1))
+              (emit-str! out ")")
+              false))))
+
+(defn gen-repeat! [(state (mut i64)) (out CodeBuilder) (depth i64)] (-> void)
+  (let [countable (gen-atom! (mut state) out depth)
+        q (pick! (mut state) 10)]
+    (case q 0
+          (emit-str! out "*") 1
+          (emit-str! out "+") 2
+          (emit-str! out "?") 3
+          (emit-str! out
+                     (if countable
+                         (case (pick! (mut state) 5) 0
+                               "{2}" 1
+                               "{0,2}" 2
+                               "{1,2}" 3
+                               "{1,}" "{0,1}")
+                         "*"))
+            0)
+    (when (and (<= q 3) (= (pick! (mut state) 3) 0))
+      (emit-str! out "?"))))
+
+(defn gen-concat! [(state (mut i64)) (out CodeBuilder) (depth i64)] (-> void)
+  (for _
+    (range 0 (if (= depth 0) (+ 1 (pick! (mut state) 5)) (pick! (mut state) 3)))
+    (gen-repeat! (mut state) out depth)))
+
+(defn gen-alt! [(state (mut i64)) (out CodeBuilder) (depth i64)] (-> void)
+  (gen-concat! (mut state) out depth)
+  (when (= (pick! (mut state) 4) 0)
+    (emit-str! out "|")
+    (gen-concat! (mut state) out depth)))
+
+(defn gen-pattern [(state (mut i64))] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (gen-alt! (mut state) out 0)
+    (primitive/bytes->str (primitive/code-list-done out))))
+
+(defn case-name [(prefix (slice u8)) (i i64)] (-> Code)
+  (primitive/syntax->datum (primitive/code-symbol prefix (primitive/int->str i))))
+
+; `(gen-regex-cases SEED COUNT)` defines `pattern-count`, `run-pattern` and
+; `run-pattern-iter` over COUNT generated patterns.
+(defn gen-regex-cases [(seed Code) (total Code)] (-> Code)
+  (let [(mut state) (primitive/code-int seed)
+        n (primitive/code-int total)
+        forms (primitive/code-list-new)
+        arms (primitive/code-list-new)
+        iter-arms (primitive/code-list-new)
+        texts (primitive/code-list-new)
+        hay (primitive/fresh-identifier "hay")
+        from (primitive/fresh-identifier "from")]
+    (for i
+      (range 0 n)
+      (let [pattern (gen-pattern (mut state))
+            name (case-name "pattern-case-" i)
+            iter-name (case-name "pattern-iter-" i)]
+        (primitive/code-list-push! texts pattern)
+        (primitive/code-list-push! forms
+                                   `(defn ~name [(hay (slice u8)) (from i64)] (-> void)
+                                      (check-case ~pattern
+                                                  hay
+                                                  from
+                                                  (re/is-match? ~pattern hay)
+                                                  (re/find-at ~pattern hay from)
+                                                  (re/captures-at ~pattern
+                                                                  hay
+                                                                  from))))
+        (primitive/code-list-push! forms
+                                   `(defn ~iter-name [(hay (slice u8))] (-> void)
+                                      (check-iter ~pattern
+                                                  hay
+                                                  (re/find-iter ~pattern hay)
+                                                  (re/captures-iter ~pattern
+                                                                    hay))))
+        (primitive/code-list-push! arms `~i)
+        (primitive/code-list-push! arms `(~name ~hay ~from))
+        (primitive/code-list-push! iter-arms `~i)
+        (primitive/code-list-push! iter-arms `(~iter-name ~hay))))
+    `(do
+       ~@(primitive/code-list-done forms)
+       (defn ~(primitive/syntax->datum `pattern-count) [] (-> i64)
+         ~n)
+       (defn ~(primitive/syntax->datum `pattern-text) [(i i64)] (-> (slice u8))
+         (get [~@(primitive/code-list-done texts)] i))
+       (defn ~(primitive/syntax->datum `run-pattern) [(i i64)
+                                                      (~hay (slice u8))
+                                                      (~from i64)] (-> void)
+         (case i ~@(primitive/code-list-done arms) (assert false)))
+       (defn ~(primitive/syntax->datum `run-pattern-iter) [(i i64)
+                                                           (~hay (slice u8))] (-> void)
+         (case i ~@(primitive/code-list-done iter-arms) (assert false))))))
+
+(gen-regex-cases 20261011 200)
+
+; ---- driver ------------------------------------------------------------------
+(defn check-input [(i i64) (hay (slice u8))] (-> void)
+  (for from
+    (range 0 (+ (len hay) 2))
+    (run-pattern i hay from))
+  (run-pattern-iter i hay))
+
+(deftest generated-patterns-agree-with-reference
+         (let [alphabet "ab "
+               (mut buf) (zeroed (array u8 12))
+               (mut rng) 88172645463325252]
+           (for i
+             (range 0 (pattern-count))
+             (prepare! (pattern-text i))
+             ; Every string over the alphabet up to length 4.
+             (for length
+               (range 0 5)
+               (let [(mut total) 1]
+                 (for _ (range 0 length) (set! total (* total 3)))
+                 (for code
+                   (range 0 total)
+                   (let [(mut rest) code]
+                     (for k
+                       (range 0 length)
+                       (set! (mut buf) k (get alphabet (% rest 3)))
+                       (set! rest (/ rest 3))))
+                   (check-input i (slice-of (mut buf) length)))))
+             ; Longer random strings.
+             (for _
+               (range 0 40)
+               (let [length (pick! (mut rng) 13)]
+                 (for k
+                   (range 0 length)
+                   (set! (mut buf) k (get alphabet (pick! (mut rng) 3))))
+                 (check-input i (slice-of (mut buf) length)))))
+           (when (> (load (failures)) 0)
+             (println "{} mismatches over {} patterns"
+                      (load (failures))
+                      (pattern-count)))
+           (assert-eq (load (failures)) 0)))

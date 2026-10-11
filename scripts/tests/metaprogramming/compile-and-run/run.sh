@@ -173,6 +173,9 @@ $COIL check tests/compiler/features/regex_invalid_rejected.coil > "$OUT/regex-in
 $COIL check tests/compiler/features/regex_unsupported_rejected.coil > "$OUT/regex-unsupported.txt" 2>&1; rc=$?
 [ $rc -ne 0 ] && grep -q "backreferences and Unicode properties are not yet supported" "$OUT/regex-unsupported.txt" \
   || { cat "$OUT/regex-unsupported.txt"; echo "AOT regex unsupported-feature diagnostic FAILED"; exit 1; }
+$COIL check tests/compiler/features/regex_state_limit_rejected.coil > "$OUT/regex-limit.txt" 2>&1; rc=$?
+[ $rc -ne 0 ] && grep -q "needs more than 256 NFA states" "$OUT/regex-limit.txt" \
+  || { cat "$OUT/regex-limit.txt"; echo "AOT regex Pike VM state-limit diagnostic FAILED"; exit 1; }
 echo "AOT regex: OK (semantics, single evaluation, and compile-time diagnostics)"
 
 # Step 13 was the transparent-GC demo (normal code, zero annotations, a transform
