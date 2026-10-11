@@ -5985,7 +5985,7 @@ for suite in tests/stdlib_parsers_test.coil tests/serde_test.coil tests/serde_op
              tests/serde_value_test.coil tests/serde_sum_posthoc_test.coil tests/fs_dir_list_test.coil \
              tests/fs_directory_test.coil tests/thread_available_parallelism_test.coil \
              tests/os_linux_test.coil tests/format_traits_test.coil tests/core_traits_test.coil \
-             tests/error_display_test.coil; do
+             tests/error_display_test.coil tests/io_buffered_test.coil; do
   expect_rc 0 "coil test $suite passes" "$COIL" test "$suite"
 done
 

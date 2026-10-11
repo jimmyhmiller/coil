@@ -962,6 +962,10 @@ true
   a buffer or a file (from `coil.io`). To format into a string, `coil.str` has
   `(sb-format! (mut sb) "…" args…)` for a `StrBuf`, and `sb-writer` makes a `StrBuf`
   a Writer.
+- `coil.io` reads through a `(ptr Reader)`. `read-line` and `read-line-alloc` must
+  take one byte per read to stop at the newline, unless the reader comes from
+  `buffered-reader` (or a `BufferedInput`), which they read a run at a time:
+  wrap a file, socket or `(stdin)` in one before reading lines.
 - A string literal is `(slice u8)`, and byte strings compare with `=`.
 - `coil.str` adds validated UTF-8 types. `StringView` is a borrowed view (`(sv "…")`
   for literals, `string-view-from-utf8` for untrusted bytes). `String` is an owned,
