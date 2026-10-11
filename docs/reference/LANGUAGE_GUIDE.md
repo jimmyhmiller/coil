@@ -726,7 +726,7 @@ Coil has no garbage collector and no ambient heap. Storage is one of three kinds
 
 ```coil
 (module example.memory)
-(import "coil.alloc" :as alloc :use [malloc-allocator arena-allocator])
+(import "coil.alloc" :as alloc :use [malloc-allocator arena-new arena-view arena-release!])
 (import "coil.arraylist" :use [ArrayList al-new al-free!])
 
 (defstruct Node [(value i64) (next (ptr Node))])
@@ -738,11 +738,12 @@ Coil has no garbage collector and no ambient heap. Storage is one of three kinds
     (alloc/destroy heap node))
 
   ; An arena frees everything at once when it is released.
-  (let [scratch (arena-allocator 4096)
-        (mut xs) (al-new [i64] scratch)]
+  (let [scratch (arena-new 4096)
+        (mut xs) (al-new [i64] (arena-view scratch))]
     (push! (mut xs) 1)
     (push! (mut xs) 2)
-    (println "{} items" (len xs)))
+    (println "{} items" (len xs))
+    (arena-release! scratch))
 
   (let [(mut ys) (al-new [i64] (malloc-allocator))]
     (push! (mut ys) 3)
@@ -760,7 +761,7 @@ boxed 7
 | Allocator | Use |
 |---|---|
 | `(malloc-allocator)` | general purpose, process lifetime |
-| `(arena-allocator cap)` | bump allocation, freed together |
+| `(arena-new cap)` | bump allocation, freed together by `arena-release!`; `arena-view` is its allocator. `(arena-allocator cap)` is one that is never freed |
 | `coil.scratch` | segmented arena with marks and reset, for temporaries |
 | `coil.region` | tracks each allocation; closing frees what's left |
 | `coil.dbgalloc`, `coil.guardalloc` | leak, double-free and overflow detection ([DEBUGGING.md](DEBUGGING.md)) |
