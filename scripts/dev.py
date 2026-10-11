@@ -756,9 +756,11 @@ def test_modernize_fast(compiler: str) -> None:
                                        + before.stdout + before.stderr)
                 fixed = subprocess.run([coil, "lint", str(probe), "--fix"], cwd=ROOT,
                                        capture_output=True, text=True)
-                if fixed.returncode != 0 or "round reverted" in fixed.stdout + fixed.stderr:
+                fix_output = fixed.stdout + fixed.stderr
+                if (fixed.returncode != 0 or "round reverted" in fix_output
+                        or "does not compile" in fix_output):
                     raise RuntimeError(f"fast modernization gate: {name} fix did not apply cleanly:\n"
-                                       + fixed.stdout + fixed.stderr)
+                                       + fix_output)
                 text = probe.read_text()
                 if clean and ("primitive/" in text or '"coil.primitive"' in text):
                     raise RuntimeError(f"fast modernization gate: {name} kept a primitive:\n" + text)
