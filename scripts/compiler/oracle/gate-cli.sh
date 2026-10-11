@@ -362,7 +362,9 @@ case "$libdup_out" in
   *) ok "a Coil --lib archive links into a Coil program without duplicate stdlib statics" ;;
 esac
 expect_out 'from lib' "the linked archive runs its own stdlib code" "$T/libdup/app"
-expect_out '^7$' "the program receives the archive result" "$T/libdup/app"
+# println evaluates its argument before writing, so the library's own line comes
+# first and the result follows on the app's line.
+expect_out '^app 7$' "the program receives the archive result" "$T/libdup/app"
 
 # A transform that rebuilds forms keeps their source locations: with coil.arc.auto
 # active, each unused import is reported at its own line.
