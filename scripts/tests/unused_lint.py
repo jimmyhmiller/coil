@@ -40,7 +40,7 @@ import argparse, os, pathlib, subprocess, sys, tempfile
 # One executable. Every definition is labelled by what must happen to it.
 PROGRAM = """(module unused-probe)
 (import "coil.primitive" :as primitive)
-(import "coil.time" :as unusedalias)
+(import "coil.integer" :as unusedalias)
 
 (export exported-api)
 
@@ -140,7 +140,7 @@ MUST_GO_DEFS = ["(defstruct Orphan", "(defsum NeverUsed", "(const DEAD-K", "(ext
                 "(defn dead-loop", "(defn ping", "(defn pong", "(defn only-from-dead"]
 # Module-local dead weight, which that reading does not bear on: an import and a
 # `let` binding are unused or not within one file either way.
-MUST_GO_LOCAL = ['(import "coil.time"', "dead-binding",
+MUST_GO_LOCAL = ['(import "coil.integer"', "dead-binding",
                  "(Green [(n i64)])", "(Green [n] n)"]
 MUST_GO = MUST_GO_DEFS + MUST_GO_LOCAL
 
@@ -277,6 +277,48 @@ def main() -> int:
         check('(import "uprobe.ambient" :as ambient)' in after,
               "deleted an import of a module declaring a trait impl; the impl is in "
               "scope through that import and no mention records it")
+
+        # 6b. A MACRO leaves no mention in the expanded program, so only the
+        #     compiler's record of authored references shows it was used. One name of
+        #     a `:use` list that nothing refers to goes on its own; the rest stay.
+        (proj / "src/macros.coil").write_text(
+            "(module uprobe.macros)\n"
+            "(defn twice [(x Code)] (-> Code) `(+ ~x ~x))\n"
+            "(defn thrice [(x Code)] (-> Code) `(+ ~x (+ ~x ~x)))\n"
+            "(defn plain [(x i64)] (-> i64) x)\n")
+        uses = proj / "src/uses.coil"
+        uses.write_text("""(module uprobe.uses)
+(import "uprobe.macros" :as m)
+(import "uprobe.macros" :use [twice plain])
+
+(defn main [] (-> i64) (+ (twice 1) (m/thrice 2)))
+""")
+        run(coil, "lint", "src/uses.coil", "--use", "coil.lint.unused", "--fix",
+            cwd=proj, env=env)
+        after = uses.read_text()
+        check('(import "uprobe.macros" :as m)' in after,
+              f"deleted an import whose alias qualifies a macro call:\n{after}")
+        check('(import "uprobe.macros" :use [twice])' in after,
+              "did not delete exactly the unused name `plain` from a `:use` list whose "
+              f"other name is a macro the module calls:\n{after}")
+
+        # 6c. A `let` a macro expanded into is not the author's: `for _` and a `_`
+        #     inside a nested pattern bind names nobody spelled.
+        loops = tmp / "loops.coil"
+        loops.write_text("""(module uprobe.loops)
+(defn count [(o (Option (Option i64)))] (-> i64)
+  (let [(mut n) 0]
+    (for _ (range 0 2) (set! n (+ n 1)))
+    (match o
+      (Some [(Some [_])] n)
+      (_ 0))))
+
+(defn main [] (-> i64) (count (Some (Some 1))))
+""")
+        report = run(coil, "lint", str(loops), "--use", "coil.lint.unused")
+        check("never read" not in report.stdout + report.stderr,
+              "reported a binding a macro introduced as never read:\n"
+              + report.stdout + report.stderr)
 
         # 7. PROJECT MODE, and the trap it exposes. A bare `coil lint` lints the whole
         #    project, tests included — and a test is an ENTRY POINT: `coil test` finds
