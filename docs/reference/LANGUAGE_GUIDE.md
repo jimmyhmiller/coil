@@ -355,10 +355,13 @@ parameters of a callable `def`.
 - `(.field v)` reads a field, `(.. v a b)` is shorthand for `(.b (.a v))`, and
   `(set! (.field v) x)` writes one. Reading a field of a call result works too;
   writing one is an error, since the temporary would be discarded.
-- A parameter's type decides how it passes. `(r Rect)` is an immutable
-  reference, so passing a big struct never copies it. `(r (mut Rect))` is a
-  mutable reference, and the caller passes `(mut place)`. `(r (ptr Rect))` is a
-  raw pointer.
+- A parameter's type decides how it passes. `(r Rect)` passes the value; for
+  plain data like `Rect` that is done by reference, so a big struct is never
+  copied, and the caller still has it. `(r (ref Rect))` says outright that the
+  function only borrows it. `(r (mut Rect))` is a mutable reference, and the
+  caller passes `(mut place)`. `(r (ptr Rect))` is a raw pointer. For an owner
+  (a type with `Drop`, below) the first and second differ: see
+  [Ownership](#ownership-drop-and-clone).
 - `[1 2 3]` is an `(array i64 3)`. Where Coil expects a `(slice T)`, it borrows the
   array as one.
 - `(zeroed T)`, `(sizeof T)`, `(alignof T)` and `(offsetof T field)` are
@@ -791,10 +794,15 @@ passing it moves it:
   (println "using {}" (.name f))
   0)
 
+(defn peek [(f (ref File))] (-> i64)
+  (println "looking at {}" (.name f))
+  0)
+
 (defn main [] (-> i64)
   (let [a (File :name "a.txt")
         b (File :name "b.txt")]
     (consume b)
+    (peek a)
     (println "end of scope"))
   0)
 ```
@@ -802,12 +810,17 @@ passing it moves it:
 ```output
 using b.txt
 closing b.txt
+looking at a.txt
 end of scope
 closing a.txt
 ```
 
 - Using a moved value is a compile error. `(clone x)` duplicates through `Clone`,
   which `derive` can generate.
+- A parameter `(f File)` takes the owner: the caller's `File` moves into the call,
+  and the function drops it, as `consume` does above. To look at an owner without
+  taking it, declare the parameter `(f (ref File))`; the caller passes `f` as usual
+  and still owns it afterwards. `(f (mut File))` borrows it mutably.
 - Structs, sums and arrays that contain owners get generated drop code, run in
   reverse field order. Drops run on every exit path: fall-through, `break`,
   `return-from`, and reassignment.
@@ -1453,6 +1466,8 @@ every use allows it and its type owns nothing (a cell never runs `Drop`).
   primitive when wrapping or truncating is the point.
 - You can't implement a trait for `(mut T)`; implement it for `T`.
 - `(dyn Trait)` accepts a `(mut local)` or a `(ptr T)`, not an immutable borrow.
+- A parameter `(x T)` of an owner type moves the caller's value into the call.
+  Use `(x (ref T))` to borrow it.
 - Don't call `alloc-stack` in a loop, and never return a pointer to a local.
 - `call` is a built-in form, so no function can be named `call` (except the
   method of a `Callable` impl).
