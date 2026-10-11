@@ -249,11 +249,11 @@ def main() -> int:
         (proj / "src").mkdir(parents=True)
         (proj / "src/plain.coil").write_text(
             "(module uprobe.plain)\n(export helper-a)\n(defn helper-a [] (-> i64) 1)\n")
+        # an impl of another module's trait for another module's type: in scope
+        # wherever this module is loaded, with nothing that names the module
         (proj / "src/ambient.coil").write_text(
             "(module uprobe.ambient)\n"
-            "(defstruct Tag [(v i64)])\n"
-            "(deftrait Tagged [Self] (tag-of [(self (ptr Self))] (-> i64)))\n"
-            "(impl Tagged Tag (tag-of [(self (ptr Tag))] (-> i64) (load (field self v))))\n")
+            "(impl Hash f64 (hash [(x f64)] (-> i64) (cast i64 x)))\n")
         app = proj / "src/app.coil"
         app.write_text("""(module uprobe.app)
 (import "coil.primitive" :as primitive)
@@ -277,6 +277,66 @@ def main() -> int:
         check('(import "uprobe.ambient" :as ambient)' in after,
               "deleted an import of a module declaring a trait impl; the impl is in "
               "scope through that import and no mention records it")
+        # …while an impl for the module's own type, or of its own trait, is not:
+        # using it names the module, or comes through one that loads it anyway.
+        (proj / "src/owned.coil").write_text(
+            "(module uprobe.owned)\n"
+            "(defstruct Tag [(v i64)])\n"
+            "(deftrait Tagged [Self] (tag-of [(self (ptr Self))] (-> i64)))\n"
+            "(impl Tagged Tag (tag-of [(self (ptr Tag))] (-> i64) (load (field self v))))\n"
+            "(impl Display Tag (display-fmt [(t Tag) (f (ptr Formatter))] (-> i64) 0))\n")
+        owner = proj / "src/owner.coil"
+        owner.write_text("""(module uprobe.owner)
+(import "uprobe.owned" :as owned)
+
+(defn main [] (-> i64) 0)
+""")
+        run(coil, "lint", "src/owner.coil", "--use", "coil.lint.unused", "--fix",
+            cwd=proj, env=env)
+        check('uprobe.owned' not in owner.read_text(),
+              "kept an import whose impls are all for the module's own type and trait")
+
+        # 6b. A MACRO leaves no mention in the expanded program, so only the
+        #     compiler's record of authored references shows it was used. One name of
+        #     a `:use` list that nothing refers to goes on its own; the rest stay.
+        (proj / "src/macros.coil").write_text(
+            "(module uprobe.macros)\n"
+            "(defn twice [(x Code)] (-> Code) `(+ ~x ~x))\n"
+            "(defn thrice [(x Code)] (-> Code) `(+ ~x (+ ~x ~x)))\n"
+            "(defn plain [(x i64)] (-> i64) x)\n")
+        uses = proj / "src/uses.coil"
+        uses.write_text("""(module uprobe.uses)
+(import "uprobe.macros" :as m)
+(import "uprobe.macros" :use [twice plain])
+
+(defn main [] (-> i64) (+ (twice 1) (m/thrice 2)))
+""")
+        run(coil, "lint", "src/uses.coil", "--use", "coil.lint.unused", "--fix",
+            cwd=proj, env=env)
+        after = uses.read_text()
+        check('(import "uprobe.macros" :as m)' in after,
+              f"deleted an import whose alias qualifies a macro call:\n{after}")
+        check('(import "uprobe.macros" :use [twice])' in after,
+              "did not delete exactly the unused name `plain` from a `:use` list whose "
+              f"other name is a macro the module calls:\n{after}")
+
+        # 6c. A `let` a macro expanded into is not the author's: `for _` and a `_`
+        #     inside a nested pattern bind names nobody spelled.
+        loops = tmp / "loops.coil"
+        loops.write_text("""(module uprobe.loops)
+(defn count [(o (Option (Option i64)))] (-> i64)
+  (let [(mut n) 0]
+    (for _ (range 0 2) (set! n (+ n 1)))
+    (match o
+      (Some [(Some [_])] n)
+      (_ 0))))
+
+(defn main [] (-> i64) (count (Some (Some 1))))
+""")
+        report = run(coil, "lint", str(loops), "--use", "coil.lint.unused")
+        check("never read" not in report.stdout + report.stderr,
+              "reported a binding a macro introduced as never read:\n"
+              + report.stdout + report.stderr)
 
         # 7. PROJECT MODE, and the trap it exposes. A bare `coil lint` lints the whole
         #    project, tests included — and a test is an ENTRY POINT: `coil test` finds

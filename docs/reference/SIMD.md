@@ -121,6 +121,13 @@ inspection (`--shared` keeps otherwise-unused exported functions alive).
 The direct ARM64/x86-64 backends and interpreter prioritize semantic parity via
 scalar lowering. Direct Wasm supports the integer, no-runtime subset; floating
 math requiring external library calls depends on the backend's runtime support.
+`(v/native-vector-bytes)` is the width in bytes of the vector registers the
+compiled code may use: 16 on x86-64 (the baseline CPU, without AVX) and ARM64, 0
+on WebAssembly and RISC-V, where no vector unit is enabled. `(v/native-lanes T)`
+is how many lanes of `T` fill one such register, at least 1, so
+`(vec u8 (v/native-lanes u8))` matches the hardware. Both are macros: constants of
+the target being compiled for, usable as a width.
+
 Fixed widths are not runtime CPU capability claims. Runtime CPU discovery,
 feature-specific multiversion dispatch, and hardware polynomial instructions
 are not provided by this baseline API yet.

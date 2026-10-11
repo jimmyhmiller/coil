@@ -1,5 +1,7 @@
 (module coil.temp)
 (import "coil.primitive" :as primitive)
+(import "coil.io" :as io)
+(import "coil.fmt" :use [fmt Display display-fmt Formatter formatter-writer])
 (import "coil.alloc" :as alloc)
 (import "coil.os" :as os)
 (import "coil.fs" :as fs)
@@ -13,6 +15,10 @@
 ;;; first use; `temp-path` names things inside it. `temp-sibling` names a file
 ;;; beside a destination, `.<name>.coil-tmp-<pid>-<n>`, for writing it whole and
 ;;; renaming it into place on the destination's filesystem.
+;;;
+;;; Every path these return is the caller's: a `(slice u8)` from the malloc
+;;; allocator, valid until the caller passes it to `temp-free`, independently of the
+;;; file it names. Not freeing one only costs its bytes.
 ;;;
 ;;; Both are removed when the process exits. A process that died without exiting
 ;;; (`kill -9`, Ctrl-C) leaves them, so whatever makes a new temporary first removes
@@ -33,6 +39,15 @@
 (defsum TempError
   (TempUnavailable [(what (slice u8)) (code i64)]))
 
+;;; `{}` is a message for a person; an errno reads as the operating system describes it.
+(impl Display TempError
+  (display-fmt [(e TempError) (f (ptr Formatter))] (-> i64)
+    (match e
+      (TempUnavailable [what code]
+        (fmt (formatter-writer f) "{}: " what)
+        (io/write-os-error (formatter-writer f) code)))
+    0))
+
 ;;; A sentence describing `e`, for an error message.
 (defn temp-error-text [(e TempError)] (-> (slice u8))
   (match e
@@ -52,6 +67,14 @@
 
 (defn cstr [(s (slice u8))] (-> (ptr i8))
   (str/str->cstr (temp-alloc) s))
+
+(defn free-cstr [(p (ptr i8))] (-> i64)
+  (str/cstr-free (temp-alloc) p))
+
+;;; Release a path `temp-path`, `temp-sibling` or `temp-dir` returned. The file it
+;;; names is untouched, and is still removed at exit.
+(defn temp-free [(path (slice u8))] (-> i64)
+  (alloc/free [u8] (temp-alloc) path))
 
 (defn copy [(s (slice u8))] (-> (slice u8))
   (let [(mut sb) (str/sb-new (temp-alloc))]
@@ -88,30 +111,30 @@
 
 ; ---- removal -----------------------------------------------------------------
 
+;;; The names in the directory at `path`, or none when it cannot be read. Release
+;;; the list with `free-names`.
 (defn dir-names [(path (slice u8))] (-> (ArrayList (slice u8)))
-  (let [(mut names) (al-new [(slice u8)] (temp-alloc))]
-    (match (fs/directory-open (temp-alloc) path)
-      (Err [_] 0)
-      (Ok [d]
-        (let [(mut dir) d]
-          (loop (match (fs/directory-next! (mut dir))
-                  (Ok [next]
-                    (match next
-                      (Some [entry] (push! (mut names) (copy (.name entry))))
-                      (None [] (break))))
-                  (Err [_] (break))))
-          (fs/directory-close! (mut dir))
-          0)))
-    names))
+  (match (fs/dir-list (temp-alloc) path)
+    (Ok [names] names)
+    (Err [_] (al-new [(slice u8)] (temp-alloc)))))
+
+(defn free-names [(names (mut (ArrayList (slice u8))))] (-> i64)
+  (fs/dir-list-free (temp-alloc) (mut names)))
 
 ;;; Remove `path`: a file or symbolic link is unlinked, never followed; a directory
 ;;; is emptied and removed.
 (defn remove-tree! [(path (slice u8))] (-> i64)
   (let [p (cstr path)]
     (when (!= (unlink p) (cast i32 0))
-      (for name (iter (dir-names path)) (remove-tree! (join path name)))
+      (let [(mut names) (dir-names path)]
+        (for name (iter names)
+          (let [child (join path name)]
+            (remove-tree! child)
+            (temp-free child)))
+        (free-names (mut names)))
       (rmdir p)
-      0))
+      0)
+    (free-cstr p))
   0)
 
 ;;; The pid a temporary's name starts with, read up to `-`; 0 when there is none.
@@ -137,11 +160,13 @@
 ;;; its owner is gone, and so is every process it was kept for (`temp-keep-for!`).
 (defn abandoned? [(path (slice u8)) (name (slice u8))] (-> bool)
   (and (dead? (name-pid name))
-       (let [(mut alive) false]
-         (for entry (iter (dir-names path))
+       (let [(mut alive) false
+             (mut names) (dir-names path)]
+         (for entry (iter names)
            (when (and (str/starts-with entry ".keep-")
                       (not (dead? (name-pid (subslice entry 6 (len entry))))))
              (set! alive true)))
+         (free-names (mut names))
          (not alive))))
 
 ; ---- the directory -----------------------------------------------------------
@@ -157,34 +182,61 @@
   0)
 
 (defn make-dir! [(st (ptr TempState))] (-> (Result i64 TempError))
-  (let [root (temp-root)]
-    (fs/make-dir (cstr root) 448)
+  (let [root (temp-root)
+        result (make-dir-in! st root)]
+    (temp-free root)
+    result))
+
+(defn make-dir-in! [(st (ptr TempState)) (root (slice u8))] (-> (Result i64 TempError))
+  (let [croot (cstr root)]
+    (fs/make-dir croot 448)
     ; Sweep only a directory we own: `fchmod` succeeds only for its owner.
-    (let [fd (os/open (cstr root) (cast i32 (+ fs/O_RDONLY (+ fs/O_DIRECTORY fs/O_NOFOLLOW))))
-          owned (and (>= fd (cast i32 0)) (= (fs/change-mode fd 448) (cast i32 0)))]
+    (let [fd (os/open croot (cast i32 (+ fs/O_RDONLY (+ fs/O_DIRECTORY fs/O_NOFOLLOW))))
+          owned (and (>= fd (cast i32 0)) (= (fs/change-mode fd 448) (cast i32 0)))
+          ; read errno before anything below can change it
+          failure (if owned
+                      (: (None) (Option TempError))
+                      (Some (unavailable "the temporary directory root is missing or not owned by this user")))]
       (when (>= fd (cast i32 0)) (os/close fd))
-      (if (not owned)
-          (Err (unavailable "the temporary directory root is missing or not owned by this user"))
-          (do
-            (for name (iter (dir-names root))
-              (when (abandoned? (join root name) name) (remove-tree! (join root name))))
+      (free-cstr croot)
+      (match failure
+        (Some [e] (Err e))
+        (None []
+            (let [(mut names) (dir-names root)]
+              (for name (iter names)
+                (let [path (join root name)]
+                  (when (abandoned? path name) (remove-tree! path))
+                  (temp-free path)))
+              (free-names (mut names)))
             (let [(mut tb) (str/sb-new (temp-alloc))]
               (str/sb-push-str! (mut tb) root)
               (str/sb-push-str! (mut tb) "/")
               (str/sb-push-i64! (mut tb) (cast i64 (os/getpid)))
               (str/sb-push-str! (mut tb) "-XXXXXX")
-              (let [made (mkdtemp (cstr (str/sb-finish! (mut tb))))]
-                (if (= (primitive/cast i64 made) 0)
-                    (Err (unavailable "cannot make a temporary directory"))
-                    (do
-                      (set! (.dir st) (copy (str/cstr->str made)))
-                      (set! (.siblings st) (al-new [(slice u8)] (temp-alloc)))
-                      (atexit (fnptr-of temp-cleanup!))
-                      (set! (.ready st) true)
-                      (Ok 0))))))))))
+              (let [template (str/sb-finish! (mut tb))
+                    ctemplate (cstr template)
+                    made (mkdtemp ctemplate)
+                    result
+                      (if (= (primitive/cast i64 made) 0)
+                          (Err (unavailable "cannot make a temporary directory"))
+                          (do
+                            (set! (.dir st) (copy (str/cstr->str made)))
+                            (set! (.siblings st) (al-new [(slice u8)] (temp-alloc)))
+                            (atexit (fnptr-of temp-cleanup!))
+                            (set! (.ready st) true)
+                            (Ok 0)))]
+                (free-cstr ctemplate)
+                (temp-free template)
+                result)))))))
 
 ;;; This process's temporary directory, made on first use.
 (defn temp-dir [] (-> (Result (slice u8) TempError))
+  (match (temp-dir-ready)
+    (Err [e] (Err e))
+    (Ok [dir] (Ok (copy dir)))))
+
+;; The directory itself, owned by the temp state.
+(defn temp-dir-ready [] (-> (Result (slice u8) TempError))
   (let [st (temp-state)]
     (if (.ready st)
         (Ok (.dir st))
@@ -195,7 +247,7 @@
 ;;; A fresh name in this process's temporary directory ending in `name`. Nothing is
 ;;; created; whatever is made there, file or directory, goes with the directory.
 (defn temp-path [(name (slice u8))] (-> (Result (slice u8) TempError))
-  (match (temp-dir)
+  (match (temp-dir-ready)
     (Err [e] (Err e))
     (Ok [dir]
       (let [st (temp-state)
@@ -212,17 +264,25 @@
 ;;; from it, say. If this process is killed, the directory stays until `pid` is
 ;;; gone as well.
 (defn temp-keep-for! [(pid i64)] (-> (Result i64 TempError))
-  (match (temp-dir)
+  (match (temp-dir-ready)
     (Err [e] (Err e))
     (Ok [dir]
       (let [(mut sb) (str/sb-new (temp-alloc))]
         (str/sb-push-str! (mut sb) ".keep-")
         (str/sb-push-i64! (mut sb) pid)
         (str/sb-push-str! (mut sb) "-")
-        (let [fd (fs/create-file (cstr (join dir (str/sb-finish! (mut sb)))) 384)]
-          (if (< fd 0)
-              (Err (unavailable "cannot mark a temporary directory"))
-              (do (os/close (cast i32 fd)) (Ok 0))))))))
+        (let [name (str/sb-finish! (mut sb))
+              path (join dir name)
+              cpath (cstr path)
+              fd (fs/create-file cpath 384)
+              ; before the frees below can change errno
+              error (if (< fd 0) (Some (unavailable "cannot mark a temporary directory")) (: (None) (Option TempError)))]
+          (free-cstr cpath)
+          (temp-free path)
+          (temp-free name)
+          (match error
+            (Some [e] (Err e))
+            (None [] (do (os/close (cast i32 fd)) (Ok 0)))))))))
 
 ; ---- siblings ----------------------------------------------------------------
 
@@ -230,7 +290,7 @@
 ;;; directory and renaming it to `dest`. Removed at exit if it still exists. Stale
 ;;; siblings of `dest` from processes that are gone are removed first.
 (defn temp-sibling [(dest (slice u8))] (-> (Result (slice u8) TempError))
-  (match (temp-dir)
+  (match (temp-dir-ready)
     (Err [e] (Err e))
     (Ok [_]
       (let [st (temp-state)
@@ -251,19 +311,25 @@
               (str/sb-push-i64! (mut sb) (cast i64 (os/getpid)))
               (str/sb-push-str! (mut sb) "-")
               (str/sb-push-i64! (mut sb) (.counter st))
+              (temp-free prefix)
               (let [path (str/sb-finish! (mut sb))]
-                (push! (mut (.siblings st)) path)
+                ; the state keeps its own copy for the exit cleanup
+                (push! (mut (.siblings st)) (copy path))
                 (Ok path)))))))))
 
 ;;; Remove every `<prefix><pid>-…` in `dir` whose pid is not running.
 (defn sweep-siblings! [(dir (slice u8)) (prefix (slice u8))] (-> i64)
-  (for name (iter (dir-names (if (= (len dir) 0) "." dir)))
-    (when (and (str/starts-with name prefix)
-               (dead? (name-pid (subslice name (len prefix) (len name)))))
-      (let [(mut sb) (str/sb-new (temp-alloc))]
-        (str/sb-push-str! (mut sb) dir)
-        (str/sb-push-str! (mut sb) name)
-        (remove-tree! (str/sb-finish! (mut sb))))))
+  (let [(mut names) (dir-names (if (= (len dir) 0) "." dir))]
+    (for name (iter names)
+      (when (and (str/starts-with name prefix)
+                 (dead? (name-pid (subslice name (len prefix) (len name)))))
+        (let [(mut sb) (str/sb-new (temp-alloc))]
+          (str/sb-push-str! (mut sb) dir)
+          (str/sb-push-str! (mut sb) name)
+          (let [path (str/sb-finish! (mut sb))]
+            (remove-tree! path)
+            (temp-free path)))))
+    (free-names (mut names)))
   0)
 
 ;;; Remove `path`, a file or a whole directory, now: for a temporary finished with

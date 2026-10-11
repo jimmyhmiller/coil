@@ -362,7 +362,9 @@ case "$libdup_out" in
   *) ok "a Coil --lib archive links into a Coil program without duplicate stdlib statics" ;;
 esac
 expect_out 'from lib' "the linked archive runs its own stdlib code" "$T/libdup/app"
-expect_out '^7$' "the program receives the archive result" "$T/libdup/app"
+# println evaluates its argument before writing, so the library's own line comes
+# first and the result follows on the app's line.
+expect_out '^app 7$' "the program receives the archive result" "$T/libdup/app"
 
 # A transform that rebuilds forms keeps their source locations: with coil.arc.auto
 # active, each unused import is reported at its own line.
@@ -5984,9 +5986,19 @@ echo "== standard-library unit suites =="
 for suite in tests/stdlib_parsers_test.coil tests/serde_test.coil tests/serde_options_test.coil \
              tests/serde_value_test.coil tests/serde_sum_posthoc_test.coil tests/fs_dir_list_test.coil \
              tests/fs_directory_test.coil tests/thread_available_parallelism_test.coil \
-             tests/os_linux_test.coil tests/format_traits_test.coil; do
+             tests/os_linux_test.coil tests/format_traits_test.coil tests/core_traits_test.coil \
+             tests/error_display_test.coil tests/io_buffered_test.coil \
+             tests/temp_test.coil tests/arena_test.coil tests/simd_native_test.coil; do
   expect_rc 0 "coil test $suite passes" "$COIL" test "$suite"
 done
+
+# eprintln writes to stderr, println to stdout, each line whole.
+printf '(module eprint)\n(defn main [] (-> i64) (eprintln "err {}" 1) (println "out {}" 2) 0)\n' > "$T/eprint.coil"
+eprint_stdout=$("$COIL" run "$T/eprint.coil" 2>/dev/null)
+eprint_stderr=$("$COIL" run "$T/eprint.coil" 2>&1 >/dev/null)
+[ "$eprint_stdout" = "out 2" ] && [ "$eprint_stderr" = "err 1" ] \
+  && ok "eprintln writes to stderr and println to stdout" \
+  || bad "eprintln writes to stderr and println to stdout" "stdout=[$eprint_stdout] stderr=[$eprint_stderr]"
 
 expect_rc 0 "TCP sockets are close-on-exec and timed accepts report the host timeout" \
   "$COIL" run tests/stdlib/socket_test.coil
