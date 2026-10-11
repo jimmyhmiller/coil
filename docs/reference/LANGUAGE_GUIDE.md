@@ -270,6 +270,11 @@ by `return-from`:
   `coil.closure/defclosure` when you need an environment.
 - `(fnptr-of name)` takes a named function's address. You call a value of `fnptr`
   type like a function.
+- A `c` function pointer that takes a struct or sum by value, `(fnptr c [Point]
+  i64)`, passes it by value as C does. A Coil function takes it by reference, so
+  `fnptr-of` or `(fn …)` reaches it through a by-value entry, also when inference
+  supplies the pointer type: `(sort xs (fnptr-of by-rank))` with `by-rank` over
+  `Point`s.
 
 ### Compile-time value parameters
 
