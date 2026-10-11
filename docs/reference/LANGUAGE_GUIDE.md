@@ -489,6 +489,10 @@ the inner variant does; otherwise matching moves on to the next arm. `coil.resul
 has the combinators: `unwrap-or`, `opt-map`, `res-map`, `map-err`,
 `and-then`, `ok-or`, `some?`, `ok?`.
 
+Every error type in the standard library implements `Display`, so
+`(eprintln "error: {}" e)` reports one. An error that carries an errno reads as
+the operating system describes it: `No such file or directory (os error 2)`.
+
 ## Traits
 
 ```coil
