@@ -1051,8 +1051,7 @@ again during retain, although it still scans the flat function list to discover
 that those definitions are unchanged. Removing that scan requires the next
 enumeration boundary, not another hash-table optimization.
 
-`scripts/benchmarks/jit_edit_cycle.py` (deleted on 2026-10-12 with `coil.repl`, the
-live-update policy it drove) made the actual target reproducible: it
+`scripts/benchmarks/jit_edit_cycle.py` makes the actual target reproducible: it
 submits 2,000 definitions once and times complete `jit-compile-with-entry!` calls,
 including native publication and metadata finalization. At this checkpoint the
 untraced median is **56 ms** over 27 steady edits. With tracing enabled, medians are

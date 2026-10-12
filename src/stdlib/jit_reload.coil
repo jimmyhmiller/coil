@@ -1,0 +1,436 @@
+; Native reload lowering. In a module that contains the
+; `(reloadable-module)` opt-in marker, every ordinary runtime defn is
+; replaced by a private implementation. The public name is represented by one
+; alloc-static Var cell, and calls through that name load the cell first.
+(module coil.jit.reload)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.control" :use *)
+(import "coil.str" :as str)
+(import "coil.var" :as var)
+
+(defn rr-sym? [(x Code) (s Code)] (-> bool)
+  (and (primitive/code-sym? x) (primitive/code-eq x s)))
+
+(defn rr-defn? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (and (>= (primitive/code-count f) 5)
+            (and (or (rr-sym? (primitive/code-nth f 0) `defn)
+                     (rr-sym? (primitive/code-nth f 0) `defn*))
+                 (primitive/code-sym? (primitive/code-nth f 1))))))
+
+(defn rr-vector? [(x Code)] (-> bool)
+  (primitive/code-vector? x))
+
+(defn rr-generic-defn? [(f Code)] (-> bool)
+  (and (rr-defn? f)
+       (and (>= (primitive/code-count f) 6)
+            (and (rr-vector? (primitive/code-nth f 2))
+                 (rr-vector? (primitive/code-nth f 3))))))
+
+(defn rr-internal-name? [(name Code)] (-> bool)
+  (let [s (primitive/code-str name)]
+    (or (= s "__repl_init")
+        (or (= s "__repl_eval")
+            (or (= s "__repl_probe")
+                (or (= s "main")
+                    ; gensym spellings and generated cell accessors must survive
+                    ; the transform's next fixpoint round unchanged.
+                    (or (str/starts-with s "$g")
+                        (match (str/str-find s "--repl-")
+                          (Some [_] true)
+                          (None [] false)))))))))
+
+(defn rr-reload-defn? [(f Code)] (-> bool)
+  (and (rr-defn? f)
+       (and (not (rr-generic-defn? f))
+            (not (rr-internal-name? (primitive/code-nth f 1))))))
+
+(defn rr-generated-defn? [(f Code)] (-> bool)
+  (if (rr-defn? f)
+      (let [s (primitive/code-str (primitive/code-nth f 1))]
+        (or (str/starts-with s "$g")
+            (match (str/str-find s "--repl-")
+              (Some [_] true)
+              (None [] false))))
+      false))
+
+(defn rr-marker? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (and (= (primitive/code-count f) 1)
+            (rr-sym? (primitive/code-nth f 0) `reloadable-module))))
+
+; Compiler-owned declaration installed from the last accepted checked Program.
+; A one-definition submission intentionally does not repeat its surrounding
+; struct declarations, but reload-cell lowering still needs their native ABI.
+(defn rr-struct-marker? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (and (= (primitive/code-count f) 2)
+            (rr-sym? (primitive/code-nth f 0) `reload-struct))))
+
+; Compiler-owned signature retained from an accepted REPL definition.  It gives
+; a one-definition submission enough surface to resolve/check calls without
+; replaying the old implementation through expansion, mono, and codegen.
+(defn rr-function-marker? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (and (= (primitive/code-count f) 4)
+            (and (rr-sym? (primitive/code-nth f 0) `reload-function)
+                 (primitive/code-sym? (primitive/code-nth f 1))))))
+
+; Compiler-owned phase marker placed beside a retained compile-time defn. The
+; defn stays top-level so the loader can discover it as a macro before transforms;
+; this marker tells reload lowering not to give that name a runtime trampoline.
+(defn rr-comptime-marker? [(f Code)] (-> bool)
+  (and (primitive/code-list? f)
+       (and (= (primitive/code-count f) 2)
+            (and (rr-sym? (primitive/code-nth f 0) `repl-compile-time)
+                 (primitive/code-sym? (primitive/code-nth f 1))))))
+
+(defn rr-comptime-name? [(m Code) (name Code) (i i64)] (-> bool)
+  (if (>= i (primitive/code-count m))
+      false
+      (let [f (primitive/code-nth m i)]
+        (if (and (rr-comptime-marker? f)
+                 (primitive/code-eq (primitive/code-nth f 1) name))
+            true
+            (rr-comptime-name? m name (+ i 1))))))
+
+(defn rr-function-form? [(f Code)] (-> bool)
+  (or (rr-reload-defn? f) (rr-function-marker? f)))
+
+(defn rr-has-marker? [(m Code) (i i64)] (-> bool)
+  (if (>= i (primitive/code-count m))
+      false
+      (if (rr-marker? (primitive/code-nth m i))
+          true
+          (rr-has-marker? m (+ i 1)))))
+
+(defn rr-module? [(m Code)] (-> bool)
+  (and (> (primitive/code-count m) 0)
+       (rr-has-marker? m 1)))
+
+(defn rr-name-defined? [(m Code) (name Code) (i i64) (n i64)] (-> bool)
+  (if (>= i n)
+      false
+      (let [f (primitive/code-nth m i)]
+        (if (and (rr-function-form? f)
+                 (not (rr-comptime-name? m (primitive/code-nth f 1) 1))
+                 (primitive/code-eq (primitive/code-nth f 1) name))
+            true
+            (rr-name-defined? m name (primitive/iadd i 1) n)))))
+
+(defn rr-compatible-before? [(m Code) (f Code) (i i64)] (-> bool)
+  (if (<= i 1)
+      true
+      (let [prev (primitive/code-nth m (primitive/isub i 1))]
+        (if (and (rr-reload-defn? prev)
+                 (primitive/code-eq (primitive/code-nth prev 1)
+                                    (primitive/code-nth f 1)))
+            (and (primitive/code-eq (primitive/code-nth prev 2)
+                                    (primitive/code-nth f 2))
+                 (primitive/code-eq (primitive/code-nth prev 3)
+                                    (primitive/code-nth f 3)))
+            (rr-compatible-before? m f (primitive/isub i 1))))))
+
+(defn rr-first-def [(m Code) (name Code) (i i64) (n i64)] (-> Code)
+  (if (>= i n)
+      name
+      (let [f (primitive/code-nth m i)]
+        (if (and (rr-function-form? f)
+                 (primitive/code-eq (primitive/code-nth f 1) name))
+            f
+            (rr-first-def m name (primitive/iadd i 1) n)))))
+
+(defn rr-code-hash [(node Code) (seed i64)] (-> i64)
+  (if (primitive/code-list? node)
+      (let [(mut h) (primitive/iadd (primitive/imul seed 1099511628211) (primitive/code-count node))]
+        (for [i 0 (primitive/code-count node)]
+          (set! h (rr-code-hash (primitive/code-nth node i) (load h))))
+        (load h))
+      (primitive/iadd (primitive/imul seed 1099511628211)
+         (str/str-hash (if (primitive/code-keyword? node)
+                           (primitive/code-keyword-name node)
+                           (primitive/code-str node))))))
+
+(defn rr-signature-suffix [(f Code) (label (slice u8))] (-> (slice u8))
+  (let [(mut out) (str/sb-new (malloc-allocator))
+        hash
+          (rr-code-hash (primitive/code-nth f 3)
+                        (rr-code-hash (primitive/code-nth f 2)
+                                      1469598103934665603))]
+    (str/sb-push-str! (mut out) label)
+    (str/sb-push-i64! (mut out) hash)
+    (str/sb-finish! (mut out))))
+
+(defn rr-binder-name [(f Code)] (-> Code)
+  ; hygiene: reload binders are stable public declarations addressed by later generations.
+  (primitive/syntax->datum (primitive/code-symbol (primitive/code-nth f 1)
+                                                  (rr-signature-suffix f
+                                                                       "--repl-bind-"))))
+
+(defn rr-struct-type? [(m Code) (t Code)] (-> bool)
+  (let [(mut i) 1
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) (primitive/code-count m)))
+              (break)
+              (let [f (primitive/code-nth m (load i))]
+                (if (and (primitive/code-list? f)
+                         (and (>= (primitive/code-count f) 2)
+                              (and (or (rr-sym? (primitive/code-nth f 0)
+                                                `defstruct)
+                                       (rr-struct-marker? f))
+                                   (primitive/code-eq (primitive/code-nth f 1)
+                                                      t))))
+                    (set! found true)
+                    (set! i (primitive/iadd (load i) 1))))))
+    (load found)))
+
+; Checked Coil passes nominal structs by reference. The reload cell describes
+; the post-check native ABI, not merely the surface spelling of the parameter.
+(defn rr-abi-param-type [(m Code) (t Code)] (-> Code)
+  (if (rr-struct-type? m t) `(ref ~t) t))
+
+; Authored pattern parameters are ordinary (pattern Type) pairs. The binding
+; macro normalizes their implementation body after this before-expand pass.
+; Already-normalized declarations can also carry positional-only parameters.
+(defn rr-param-type [(param Code)] (-> Code)
+  (primitive/code-nth param
+                      (if (and (= (primitive/code-count param) 3)
+                               (primitive/code-eq (primitive/code-nth param 0)
+                                                  `:positional))
+                          2
+                          1)))
+
+(defn rr-param-types [(m Code) (params Code) (i i64) (n i64)] (-> Code)
+  (let [out (primitive/code-list-new)
+        (mut k) i]
+    (loop (if (>= (load k) n)
+              (break)
+              (do
+                (primitive/code-list-push! out
+                                           (rr-abi-param-type m
+                                                              (rr-param-type (primitive/code-nth params
+                                                                                                 (load k)))))
+                (store! k (primitive/iadd (load k) 1)))))
+    (primitive/code-list-done out)))
+
+;;; The `:params` annotation for the Var that publishes a defn, spliced into its
+;;; `def`, so named calls through the Var order their arguments exactly as they
+;;; would for the function itself. A named call must name every parameter, so a
+;;; defn with a positional-only or destructured parameter gets no annotation, and
+;;; neither does one with no parameters: there is nothing to name.
+(defn rr-params-annotation [(params Code)] (-> Code)
+  (let [names (primitive/code-list-new)
+        (mut nameable) true]
+    (for [k 0 (primitive/code-count params)]
+      (let [param (primitive/code-nth params k)
+            binder (primitive/code-nth param 0)]
+        (if (and (primitive/code-sym? binder)
+                 (= (primitive/code-count param) 2))
+            (do
+              (primitive/code-list-push! names (primitive/code-symbol ":" binder))
+              0)
+            (do (set! nameable false) 0))))
+    (let [keywords (primitive/code-list-done names)]
+      (if (and (load nameable) (> (primitive/code-count keywords) 0))
+          `(:params [~@keywords])
+          `()))))
+
+(defn rr-body [(f Code) (i i64) (n i64)] (-> Code)
+  (let [out (primitive/code-list-new)
+        (mut k) i]
+    (loop (if (>= (load k) n)
+              (break)
+              (do
+                (primitive/code-list-push! out (primitive/code-nth f (load k)))
+                (store! k (primitive/iadd (load k) 1)))))
+    (primitive/code-list-done out)))
+
+(defn rr-lower-defn [(m Code) (f Code) (i i64)] (-> Code)
+  (unless (rr-vector? (primitive/code-nth f 2))
+    (primitive/error "repl lowering: source parameter form is not a vector"))
+  (if (rr-compatible-before? m f i)
+      0
+      (do
+        (primitive/report f
+                          "cannot redefine a REPL function with a different signature")
+        0))
+  (let [name (primitive/code-nth f 1)
+        params (primitive/code-nth f 2)
+        first-def (rr-first-def m name 1 (primitive/code-count m))
+        stable-params (primitive/code-nth first-def 2)
+        stable-retform (primitive/code-nth first-def 3)
+        stable-ret (primitive/code-nth stable-retform 1)
+        binder (rr-binder-name first-def)
+        last
+          (not (rr-name-defined? m
+                                 name
+                                 (primitive/iadd i 1)
+                                 (primitive/code-count m)))
+        ; hygiene: current implementation declarations intentionally use the public module context shared by JIT generations.
+        impl
+          (if last
+              (primitive/syntax->datum (primitive/code-symbol name
+                                                              "--repl-current"))
+              (primitive/fresh-identifier "temporary"))]
+    `((defn ~impl
+        ~(primitive/code-nth f 2)
+        ~(primitive/code-nth f 3)
+        ~@(rr-body f 4 (primitive/code-count f))) ~@(if last
+                                                        `((def ~name
+                                                            ~@(rr-params-annotation stable-params)
+                                                            (var/var-static (fnptr c
+                                                                                   [~@(rr-param-types m
+                                                                                                      stable-params
+                                                                                                      0
+                                                                                                      (primitive/code-count stable-params))]
+                                                                                   ~stable-ret)
+                                                                            (primitive/fnptr-of ~impl))) (defn ~binder [] (-> i64)
+                                                                                                           ; hygiene: set is deliberately emitted as ordinary receiver-dispatched syntax in the transformed module.
+                                                                                                           (~(primitive/syntax->datum `set) ~name
+                                                                                                              (primitive/fnptr-of ~impl))))
+                                                        `()))))
+
+; Materialize only the stable accessors for an accepted implementation owned by
+; an older JIT generation.  Their alloc-static storage is remapped to the first
+; generation's address by the backend.  No body, binder, or trampoline is
+; regenerated, so an incremental submission cannot accidentally republish old
+; code.  A marker shadowed by a new defn emits nothing; rr-lower-defn emits the
+; complete replacement surface using this marker as its stable signature.
+(defn rr-lower-function-marker [(m Code) (f Code) (i i64)] (-> Code)
+  (let [name (primitive/code-nth f 1)]
+    (if (rr-name-defined? m name (primitive/iadd i 1) (primitive/code-count m))
+        `()
+        (let [params (primitive/code-nth f 2)
+              retform (primitive/code-nth f 3)
+              ret (primitive/code-nth retform 1)]
+          `((def ~name
+              ~@(rr-params-annotation params)
+              (var/var-static (fnptr c
+                                     [~@(rr-param-types m
+                                                        params
+                                                        0
+                                                        (primitive/code-count params))]
+                                     ~ret)
+                              (primitive/zeroed (fnptr c
+                                                       [~@(rr-param-types m
+                                                                          params
+                                                                          0
+                                                                          (primitive/code-count params))]
+                                                       ~ret)))))))))
+
+(defn rr-binder-calls [(m Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 1 (primitive/code-count m)]
+      (let [f (primitive/code-nth m i)]
+        (if (and (rr-reload-defn? f)
+                 (not (rr-comptime-name? m (primitive/code-nth f 1) 1))
+                 (not (rr-name-defined? m
+                                        (primitive/code-nth f 1)
+                                        (+ i 1)
+                                        (primitive/code-count m))))
+            (do (primitive/code-list-push! out `(~(rr-binder-name f))) 0)
+            0)))
+    (primitive/code-list-done out)))
+
+(defn rr-main-defn? [(f Code)] (-> bool)
+  (and (rr-defn? f) (= (primitive/code-str (primitive/code-nth f 1)) "main")))
+
+;;; Append every element of list `xs` onto the growable list `out` — how rr-forms
+;;; splices rr-lower-defn's one-or-two forms without re-splicing its own recursion
+;;; (docs/design/META_MEMORY.md).
+(defn rr-push-each [(out CodeBuilder) (xs Code)] (-> CodeBuilder)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (primitive/code-count xs))
+              (break)
+              (do
+                (primitive/code-list-push! out (primitive/code-nth xs (load i)))
+                (store! i (primitive/iadd (load i) 1)))))
+    out))
+
+(defn rr-forms [(m Code) (i i64) (n i64)] (-> Code)
+  (let [out (primitive/code-list-new)
+        (mut k) i]
+    (loop (if (>= (load k) n)
+              (break)
+              (let [f (primitive/code-nth m (load k))
+                    _p
+                      (if (rr-comptime-marker? f)
+                          out
+                          (if (or (rr-marker? f) (rr-struct-marker? f))
+                              out
+                              (if (rr-function-marker? f)
+                                  (rr-push-each out
+                                                (rr-lower-function-marker m
+                                                                          f
+                                                                          (load k)))
+                                  (if (and (rr-defn? f)
+                                           (rr-comptime-name? m
+                                                              (primitive/code-nth f
+                                                                                  1)
+                                                              1))
+                                      (primitive/code-list-push! out f)
+                                      (if (rr-reload-defn? f)
+                                          (rr-push-each out
+                                                        (rr-lower-defn m
+                                                                       f
+                                                                       (load k)))
+                                          (if (rr-generated-defn? f)
+                                              (primitive/code-list-push! out f)
+                                              (if (rr-generic-defn? f)
+                                                  (primitive/code-list-push! out
+                                                                             f)
+                                                  (if (rr-main-defn? f)
+                                                      (primitive/code-list-push! out
+                                                                                 `(defn ~(primitive/code-nth f
+                                                                                                             1)
+                                                                                    ~(primitive/code-nth f
+                                                                                                         2)
+                                                                                    ~(primitive/code-nth f
+                                                                                                         3)
+                                                                                    ~@(rr-binder-calls m)
+                                                                                    ~@(rr-body f
+                                                                                               4
+                                                                                               (primitive/code-count f))))
+                                                      (if (rr-defn? f)
+                                                          (primitive/code-list-push! out
+                                                                                     `(defn ~(primitive/code-nth f
+                                                                                                                 1)
+                                                                                        ~(primitive/code-nth f
+                                                                                                             2)
+                                                                                        ~(primitive/code-nth f
+                                                                                                             3)
+                                                                                        ~@(rr-body f
+                                                                                                   4
+                                                                                                   (primitive/code-count f))))
+                                                          ; A remaining top-level list is definition-position
+                                                          ; syntax for the ordinary expander (for example
+                                                          ; `(derive Debug T)`). It is not a runtime expression,
+                                                          ; so reload lowering must neither rewrite it nor replace
+                                                          ; its authored source span with transform-owned syntax.
+                                                          (primitive/code-list-push! out
+                                                                                     f))))))))))]
+                (store! k (primitive/iadd (load k) 1)))))
+    (primitive/code-list-done out)))
+
+(defn rr-module [(m Code)] (-> Code)
+  (if (rr-module? m)
+      `(~(primitive/code-nth m 0) ~@(rr-forms m 1 (primitive/code-count m)))
+      m))
+
+(defn rr-modules [(mods Code) (i i64) (n i64)] (-> Code)
+  (let [out (primitive/code-list-new)
+        (mut k) i]
+    (loop (if (>= (load k) n)
+              (break)
+              (do
+                (primitive/code-list-push! out
+                                           (rr-module (primitive/code-nth mods
+                                                                          (load k))))
+                (store! k (primitive/iadd (load k) 1)))))
+    (primitive/code-list-done out)))
+
+(defn repl-reload-transform [(mods Code)] (-> Code)
+  `(do ~@(rr-modules mods 0 (primitive/code-count mods))))
+
+(transform repl-reload-transform :phase before-expand)

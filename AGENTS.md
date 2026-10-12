@@ -18,24 +18,25 @@ must share a type; `primitive/` needs an import). Read it before writing Coil.
 
 ## Live code: the JIT produces code, nothing else
 
-Coil has no policy for updating live code, and will not get one. The JIT
-compiles forms to code and exposes mechanism: dependency queries (what depends
-on what, what is now dead), addresses, allocation and release of code. It never
-decides what happens to code that is already running.
+The compiler and the JIT never replace code. They compile forms against what is
+already accepted and expose mechanism: dependency queries (what depends on
+what, what is now dead), `Var` cells, `defalias`, the retire forms, session
+state, addresses, allocation and release of code. Defining a name twice is an
+error to the compiler, in a session as anywhere else.
 
-So neither the compiler nor the standard library may replace, redefine, retire,
-migrate, re-type or delete a running definition, or re-point its callers at a
-new one. Defining a name twice is an error, in a session as anywhere else.
-Whether and how a program swaps live code (a Var it `set`s, a cell per
-signature, a migration for a global) is a policy, and policies belong to the
-user's metaprograms.
+Replacing running code is a policy, and a policy lives in a metaprogram.
+`coil.repl` is the stock one: a transform that publishes each REPL `defn`
+through a `Var` and `set`s it when a definition with the same signature is
+submitted again. `coil repl` uses it.
 
-- A report that the JIT or REPL "cannot add a parameter to a published
-  function", "rejects replacing a constant", "cannot migrate a global" and the
-  like is **not a bug**. Do not fix it, file it, or review it toward a merge;
-  close a pull request that adds such behaviour.
-- A JIT bug in the code it produces (a crash, wrong output, a valid program
-  rejected on its first compile) is an ordinary bug.
+- Never add replacement, migration or rebinding to the compiler or the JIT.
+- `coil.repl`'s policy is deliberately limited. A report asking it, or the JIT,
+  to handle more kinds of edits (a changed signature, an added or removed
+  parameter, a retyped global, a migrated value, deleting a definition) is
+  **not a bug**. Do not fix it, file it, or review it toward a merge; close a
+  pull request that adds such behaviour.
+- A crash, wrong output or missing diagnostic in what the JIT or `coil.repl`
+  already supports is an ordinary bug.
 
 ## Bug reports
 
