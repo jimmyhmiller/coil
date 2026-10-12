@@ -1,621 +1,322 @@
 #!/usr/bin/env python3
-"""Generate and verify Coil compiler snapshots without per-stage shell wrappers."""
+"""The runtime corpus and the diagnostic goldens.
+
+corpus: tests/corpus/*.coil are a handful of large, self-checking programs, each
+covering one area of the language. Every lane builds or runs each program its own
+way and compares stdout and the exit status with tests/corpus/reference/:
+
+    python3 scripts/oracle.py corpus arm64|llvm|x64|interp|safety|meta-interp|opt3 [--all] [--compiler C]
+    python3 scripts/oracle.py corpus bless [--compiler C]     # rewrite the references (LLVM lane)
+
+tests/corpus/corpus.txt lists the programs. After the file name come options:
+`safety` and `meta-interp` put a program in those lanes (`--all` runs every
+program there), `interp-refused=TEXT` says the interpreter must refuse it with a
+diagnostic containing TEXT, and everything after `--` is the program's argv.
+
+diag: tests/diag/{compile,link,no-hang}/*.coil and their goldens in reference/.
+`compile` and `no-hang` run `coil check`; `link` runs `coil build`. A golden holds
+the combined output, then `exit: N`. An input whose first line is `; args: …` uses
+those arguments instead of the default (`-o {out}` for link).
+
+    python3 scripts/oracle.py diag gate|bless [compile|link|no-hang|all]
+"""
 
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ORACLE = ROOT / "tests/compiler/oracle"
-TARGET_X86 = "x86_64-apple-macosx11.0.0"
-TARGET_FULL = "arm64-apple-darwin25.5.0"
-
-# Stages whose output is host-sensitive, and the triple they are pinned to.
-#
-# These dumps are meant to be target-INDEPENDENT — they compare frontend output,
-# not machine code — but they are not, because src/stdlib/os.coil selects the
-# errno accessor (`__error` on darwin, `__errno_location` elsewhere) with an
-# expression macro on `target-os`, and io.coil's staged printers pull os-errno
-# into every program. Emitted natively, the snapshot records whichever host ran
-# it last: the macOS-blessed references differ from a Linux run in exactly that
-# one region, out of 23,121 tokens.
-#
-# Pinning a triple makes the independence real rather than aspirational — both
-# hosts then produce identical bytes from one shared reference, with no
-# per-platform duplication. Linux, because that is the platform that had no
-# representation at all. Requires the compiler to apply --target in these dumps.
-TARGET_PINNED = "x86_64-pc-linux-gnu"
-PINNED_STAGES = ("checked", "expand", "ir", "mono", "resolved")
+CORPUS = ROOT / "tests" / "corpus"
+DIAG = ROOT / "tests" / "diag"
+DIAG_SETS = ("compile", "link", "no-hang")
+LANES = ("arm64", "llvm", "x64", "interp", "safety", "meta-interp", "opt3")
+BUILD_TIMEOUT = 120
+RUN_TIMEOUT = 30
 
 
-def stage_extra(stage: str) -> list[str]:
-    """The --target arguments a stage's dump must be invoked with."""
-    if stage == "x86":
-        return ["--target", TARGET_X86]
-    if stage == "full":
-        return ["--target", TARGET_FULL]
-    if stage in PINNED_STAGES:
-        return ["--target", TARGET_PINNED]
-    return shlex.split(os.environ.get("COIL_SELF_ARGS", ""))
-STAGES = ("read", "ast", "load", "resolved", "checked", "expand", "mono", "ir", "diag", "x86", "full")
-COMMAND = {
-    "read": "dump-read", "ast": "dump-ast", "load": "dump-load",
-    "resolved": "dump-resolved", "checked": "dump-checked",
-    "expand": "dump-expand", "mono": "dump-mono", "ir": "dump-ir",
-    "full": "emit-ir", "x86": "emit-ir",
-}
+@dataclass
+class Program:
+    source: str
+    safety: bool = False
+    meta_interp: bool = False
+    interp_refused: str | None = None
+    args: list[str] = field(default_factory=list)
 
-# Intermediate representations are high-signal only when each snapshot has a reason
-# to exist. Broad examples/apps/stdlib coverage belongs to the runtime and CLI gates;
-# duplicating every program through every compiler stage produced 100+ MB of golden
-# files and made harmless cross-cutting changes obscure real regressions.
-STAGE_INPUTS = {
-    "read": ["tests/compiler/oracle/stages/surface.coil"],
-    "ast": ["tests/compiler/oracle/stages/primitive_surface.coil"],
-    "load": [
-        "tests/compiler/oracle/load/fixtures/edge.coil",
-        "tests/compiler/features/scoped_namespace.coil",
-    ],
-    "resolved": [
-        "tests/compiler/oracle/resolved/fixtures/app.coil",
-        "tests/compiler/oracle/resolved/fixtures/helper2.coil",
-        "tests/compiler/features/scoped_namespace.coil",
-    ],
-    "checked": ["tests/compiler/oracle/stages/surface.coil", "tests/compiler/features/extern_alias.coil",
-                "tests/compiler/oracle/ir/fixtures/stack_bytes.coil",
-                "tests/compiler/oracle/ir/fixtures/static_elements.coil"],
-    "expand": [
-        "tests/compiler/oracle/features/meta_stage3.coil",
-        "src/examples/metaprogramming/condlint.coil",
-    ],
-    "mono": [
-        "tests/compiler/oracle/ir/fixtures/static_elements.coil",
-        "tests/compiler/oracle/ir/fixtures/stack_bytes.coil",
-        "tests/compiler/features/extern_alias.coil",
-        "src/examples/generics.coil",
-        "src/examples/sums.coil",
-        "src/examples/dyn_write.coil",
-    ],
-    "ir": [
-        "tests/compiler/oracle/ir/fixtures/static_elements.coil",
-        "tests/compiler/oracle/ir/fixtures/stack_bytes.coil",
-        "tests/compiler/features/extern_alias.coil",
-        "tests/compiler/oracle/ir/fixtures/call.coil",
-        "tests/compiler/oracle/ir/fixtures/iadd.coil",
-        "tests/compiler/oracle/ir/fixtures/ret0.coil",
-        "tests/compiler/oracle/features/export_c.coil",
-    ],
-    # Shared macOS/Linux IR baselines: one program per materially different path.
-    "full": [
-        "src/examples/conventions.coil",
-        "src/examples/generics.coil",
-        "src/examples/dyn_write.coil",
-        "src/examples/per-arch.coil",
-        "tests/compiler/oracle/features/export_c.coil",
-        "tests/compiler/oracle/features/meta_stage3.coil",
-        "tests/compiler/oracle/features/fs_lib.coil",
-        "tests/compiler/oracle/ir/fixtures/call.coil",
-    ],
-}
+    @property
+    def stem(self) -> str:
+        return Path(self.source).stem
 
 
-def jobs() -> int:
-    """Concurrency for the corpus gates. Each unit is a subprocess, so oversubscribing
-    the efficiency cores still pays; COIL_JOBS=1 restores serial execution when a
-    failure needs to be read without interleaving."""
-    override = os.environ.get("COIL_JOBS")
-    if override:
-        return max(1, int(override))
-    return max(1, os.cpu_count() or 1)
-
-
-def rel(path: Path) -> str:
-    return path.relative_to(ROOT).as_posix()
-
-
-def mangle(path: str) -> str:
-    return path.replace("/", "_")
-
-
-def read_list(path: Path) -> list[str]:
-    return [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.lstrip().startswith("#")]
-
-
-def write_list(path: Path, entries: list[str]) -> None:
-    path.write_text("".join(f"{entry}\n" for entry in sorted(entries)))
-
-
-def run(compiler: Path, command: str, source: str, *extra: str) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run([str(compiler), command, source, *extra], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-
-def normalize_stage_output(stage: str, output: bytes) -> bytes:
-    if stage in {"ir", "x86", "full"}:
-        # LLVM 23 prints this double literal as f0x..., while LLVM 22 prints
-        # the same 64-bit bit pattern as 0x.... It also adds `nosync` to the
-        # argmem intrinsic's inferred attribute set (read, write or readwrite).
-        # Normalize only these known printer/version differences, not arbitrary IR.
-        output = re.sub(rb"(?<![\w.])f0x([0-9A-Fa-f]{16})(?![\w])", rb"0x\1", output)
-        return re.sub(
-            rb"nocallback nofree nosync nounwind willreturn memory\(argmem: (read|write|readwrite)\)",
-            rb"nocallback nofree nounwind willreturn memory(argmem: \1)",
-            output,
-        )
-    return output
-
-
-def reset(directory: Path) -> None:
-    shutil.rmtree(directory, ignore_errors=True)
-    directory.mkdir(parents=True)
-
-
-def snapshot_simple(compiler: Path, stage: str, inputs: list[str], *, command: str | None = None,
-                    extra: tuple[str, ...] = (), suffix: str = ".dump", allow_fail: bool = False,
-                    expected_failures: set[str] | None = None) -> list[str]:
-    base = ORACLE if stage == "read" else ORACLE / stage
-    reference = base / "reference"
-    corpus = base / "corpus.txt"
-    reset(reference)
-    accepted: list[str] = []
-    for source in inputs:
-        result = run(compiler, command or COMMAND[stage], source, *extra)
-        if result.returncode and allow_fail:
-            first = result.stderr.decode(errors="replace").splitlines()[:1]
-            print(f"SKIP {source}: {first[0] if first else 'compiler failed'}")
+def read_corpus() -> list[Program]:
+    programs = []
+    for raw in (CORPUS / "corpus.txt").read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
             continue
-        if result.returncode and source not in (expected_failures or set()):
-            sys.stderr.buffer.write(result.stderr)
-            raise SystemExit(f"snapshot {stage} failed: {source}")
-        (reference / f"{mangle(source)}{suffix}").write_bytes(normalize_stage_output(stage, result.stdout))
-        accepted.append(source)
-    write_list(corpus, accepted)
-    return accepted
+        words = shlex.split(line)
+        program = Program(str((CORPUS / words[0]).relative_to(ROOT)))
+        options, args = (words[1:], []) if "--" not in words else (
+            words[1:words.index("--")], words[words.index("--") + 1:])
+        program.args = args
+        for option in options:
+            if option == "safety":
+                program.safety = True
+            elif option == "meta-interp":
+                program.meta_interp = True
+            elif option.startswith("interp-refused="):
+                program.interp_refused = option.split("=", 1)[1]
+            else:
+                raise SystemExit(f"corpus.txt: unknown option {option!r} for {words[0]}")
+        if not (ROOT / program.source).is_file():
+            raise SystemExit(f"corpus.txt names a missing program: {program.source}")
+        programs.append(program)
+    return programs
 
 
-def snapshot_diag(compiler: Path) -> int:
-    base = ORACLE / "diag"
-    reference = base / "reference"
-    reset(reference)
-    # Most diagnostics live beside this oracle, but the corpus can also point at
-    # feature fixtures whose source belongs with the feature it exercises.  Keep
-    # those explicit entries when regenerating instead of silently discarding
-    # them.
-    local_inputs = [rel(path) for path in sorted((base / "inputs").glob("*.coil"))]
-    listed_inputs = read_list(base / "corpus.txt") if (base / "corpus.txt").is_file() else []
-    inputs = sorted(set(local_inputs + [source for source in listed_inputs if (ROOT / source).is_file()]))
-    write_list(base / "corpus.txt", inputs)
-    root_prefix = f"{ROOT}/".encode()
-    for source in inputs:
-        result = run(compiler, "emit-ir", source)
-        (reference / f"{mangle(source)}.diag").write_bytes((result.stdout + result.stderr).replace(root_prefix, b""))
-    build_inputs = [rel(path) for path in sorted((base / "build-inputs").glob("*.coil"))]
-    write_list(base / "build-corpus.txt", build_inputs)
-    with tempfile.TemporaryDirectory() as temp:
-        temp_path = Path(temp)
-        for source in build_inputs:
-            output = temp_path / Path(source).stem
-            target = ["--target", TARGET_FULL] if source.endswith("14-shim-bad-gpr.coil") else []
-            result = subprocess.run([str(compiler), "build", source, "-o", str(output), *target], cwd=ROOT,
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            normalized = normalize_build_diag(
-                result.stdout.replace(root_prefix, b"").replace(f"{temp}/".encode(), b""))
-            stem = reference / f"{mangle(source)}"
-            Path(f"{stem}.diag").write_bytes(normalized)
-            Path(f"{stem}.exit").write_text(f"{result.returncode}\n")
-    print(f"snapshot diag: {len(inputs)} diagnostics, {len(build_inputs)} build diagnostics")
-    return 0
+def lane_build_flags(lane: str) -> list[str]:
+    return {
+        "arm64": ["--backend", "arm64"],
+        "meta-interp": ["--backend", "arm64"],
+        "x64": ["--backend", "x64"],
+        "llvm": [],
+        "safety": ["--use", "coil.safety"],
+        "opt3": ["-O3"],
+    }[lane]
 
 
-def snapshot(compiler: Path, stage: str) -> int:
-    if not compiler.is_file() or not os.access(compiler, os.X_OK):
-        raise SystemExit(f"reference compiler is not executable: {compiler}")
-    if stage == "all":
-        for item in STAGES:
-            snapshot(compiler, item)
-        return 0
-    if stage == "diag":
-        return snapshot_diag(compiler)
-    if stage == "read":
-        inputs = STAGE_INPUTS[stage] + [rel(path) for path in sorted((ORACLE / "negative").glob("*.coil"))]
-        accepted = snapshot_simple(compiler, stage, inputs)
-    elif stage == "ast":
-        inputs = STAGE_INPUTS[stage] + [rel(path) for path in sorted((ORACLE / "ast/negative").glob("*.coil"))]
-        accepted = snapshot_simple(compiler, stage, inputs)
-    elif stage in ("load", "resolved", "checked", "expand", "mono", "ir"):
-        inputs = list(STAGE_INPUTS[stage])
-        expected_failures: set[str] = set()
-        if stage == "checked":
-            expected_failures = {rel(path) for path in sorted((ORACLE / "checked/fixtures").glob("*.coil"))}
-            inputs += sorted(expected_failures)
-        # Same --target as the gate, or blessing and gating disagree by construction.
-        accepted = snapshot_simple(compiler, stage, inputs, expected_failures=expected_failures,
-                                   extra=tuple(stage_extra(stage)))
-    elif stage == "full":
-        accepted = snapshot_simple(compiler, stage, STAGE_INPUTS[stage],
-                                   command=os.environ.get("COIL_IR_CMD", "emit-ir"),
-                                   extra=tuple(stage_extra(stage)))
-    elif stage == "x86":
-        inputs = [rel(path) for path in sorted((ORACLE / "features").glob("*x86*.coil"))]
-        accepted = snapshot_simple(compiler, stage, inputs, extra=("--target", TARGET_X86))
+def lane_env(lane: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("COIL_META_INTERP", None)
+    if lane == "meta-interp":
+        env["COIL_META_INTERP"] = "1"
+    return env
+
+
+def reference(program: Program) -> tuple[bytes, int]:
+    base = CORPUS / "reference" / program.stem
+    stdout = Path(f"{base}.stdout")
+    exit_file = Path(f"{base}.exit")
+    if not stdout.is_file() or not exit_file.is_file():
+        raise FileNotFoundError(f"no reference for {program.source}; run `oracle.py corpus bless`")
+    return stdout.read_bytes(), int(exit_file.read_text())
+
+
+def first_difference(want: bytes, got: bytes) -> str:
+    want_lines = want.decode(errors="replace").splitlines()
+    got_lines = got.decode(errors="replace").splitlines()
+    for number, (a, b) in enumerate(zip(want_lines, got_lines), 1):
+        if a != b:
+            return f"line {number}: expected {a!r}, got {b!r}"
+    return f"expected {len(want_lines)} lines, got {len(got_lines)}"
+
+
+def run_program(compiler: str, program: Program, lane: str, scratch: Path) -> tuple[bytes, bytes, int] | str:
+    """The program's stdout, stderr and exit status in this lane, or why it failed."""
+    env = lane_env(lane)
+    if lane == "interp":
+        command = [compiler, "interp", program.source, *program.args]
     else:
-        raise SystemExit(f"unknown snapshot stage: {stage}")
-    print(f"snapshot {stage}: {len(accepted)} files")
-    return 0
+        executable = scratch / f"{program.stem}-{lane}"
+        build = [compiler, "build", program.source, *lane_build_flags(lane), "-o", str(executable)]
+        try:
+            built = subprocess.run(build, cwd=ROOT, env=env, capture_output=True, timeout=BUILD_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return f"build did not finish in {BUILD_TIMEOUT}s"
+        if built.returncode:
+            return "build failed:\n" + (built.stdout + built.stderr).decode(errors="replace")[-3000:]
+        command = [str(executable), *program.args]
+    try:
+        ran = subprocess.run(command, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+                             capture_output=True, timeout=RUN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return f"did not finish in {RUN_TIMEOUT}s"
+    return ran.stdout, ran.stderr, ran.returncode
 
 
-def normalize_build_diag(output: bytes) -> bytes:
-    """Discard platform linker prose while retaining Coil's stable diagnostic."""
-    marker = b"error: linker/ar failed with exit status:"
-    at = output.find(marker)
-    return output[at:] if at >= 0 else output
-
-
-def gate_diag(compiler: Path, verbose: bool) -> int:
-    base = ORACLE / "diag"
-    reference = base / "reference"
-    failures: list[str] = []
-    root_prefix = f"{ROOT}/".encode()
-    for source in read_list(base / "corpus.txt"):
-        result = run(compiler, "emit-ir", source)
-        got = (result.stdout + result.stderr).replace(root_prefix, b"")
-        golden = reference / f"{mangle(source)}.diag"
-        if not golden.is_file() or got != golden.read_bytes():
-            failures.append(source)
-            if verbose:
-                print(f"FAIL diag: {source}")
-    with tempfile.TemporaryDirectory() as temp:
-        for source in read_list(base / "build-corpus.txt"):
-            output = Path(temp) / Path(source).stem
-            target = ["--target", TARGET_FULL] if source.endswith("14-shim-bad-gpr.coil") else []
-            result = subprocess.run([str(compiler), "build", source, "-o", str(output), *target], cwd=ROOT,
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            got = normalize_build_diag(
-                result.stdout.replace(root_prefix, b"").replace(f"{temp}/".encode(), b""))
-            stem = reference / mangle(source)
-            diag_golden = Path(f"{stem}.diag")
-            exit_golden = Path(f"{stem}.exit")
-            if not diag_golden.is_file() or not exit_golden.is_file():
-                failures.append(source)
-                if verbose:
-                    print(f"FAIL build diagnostic: {source}: missing reference")
-                continue
-            want = normalize_build_diag(diag_golden.read_bytes())
-            want_code = int(exit_golden.read_text())
-            if got != want or result.returncode != want_code:
-                failures.append(source)
-                if verbose:
-                    print(f"FAIL build diagnostic: {source}")
-    print(f"gate diag: {'PASS' if not failures else f'{len(failures)} failed'}")
-    return 1 if failures else 0
-
-
-def gate(compiler: Path, stage: str, verbose: bool) -> int:
-    if stage == "all":
-        failed_stages: list[str] = []
-        for item in STAGES:
-            if gate(compiler, item, verbose):
-                failed_stages.append(item)
-        if failed_stages:
-            joined = " ".join(failed_stages)
-            print(f"gate all: failed stages: {joined}")
-            print(f"refresh once with: {sys.executable} scripts/oracle.py refresh --compiler {compiler}")
-            return 1
-        print("gate all: PASS")
-        return 0
-    if stage == "diag":
-        return gate_diag(compiler, verbose)
-    base = ORACLE if stage == "read" else ORACLE / stage
-    suffix = ".dump"
-    extra = stage_extra(stage)
-    failures: list[str] = []
-    passed = 0
-    corpus = read_list(base / "corpus.txt")
-    # A newly declared fixture must fail the audit before its first snapshot;
-    # auditing only the old corpus silently omitted newly added stage inputs.
-    missing = sorted(set(STAGE_INPUTS.get(stage, [])) - set(corpus))
-    for source in missing:
-        failures.append(source)
-        print(f"FAIL {stage}: declared input missing from snapshot corpus: {source}")
-    for source in corpus:
-        result = run(compiler, COMMAND[stage], source, *extra)
-        reference = base / "reference" / f"{mangle(source)}{suffix}"
-        expected_code = 1 if stage == "checked" and source.startswith("tests/compiler/oracle/checked/fixtures/") else 0
-        got = normalize_stage_output(stage, result.stdout)
-        if result.returncode == expected_code and reference.is_file() and got.rstrip(b"\n") == reference.read_bytes().rstrip(b"\n"):
-            passed += 1
-            continue
-        failures.append(source)
-        if verbose:
-            reason = result.stderr.decode(errors="replace").splitlines()[:1]
-            print(f"FAIL {stage}: {source}: {reason[0] if reason else 'output mismatch'}")
-            if not reason and reference.is_file():
-                got_lines = got.decode(errors="replace").splitlines()
-                want_lines = reference.read_text(errors="replace").splitlines()
-                for line_no, (want, got) in enumerate(zip(want_lines, got_lines), 1):
-                    if want != got:
-                        print(f"  first difference at line {line_no}")
-                        print(f"  expected: {want}")
-                        print(f"       got: {got}")
-                        break
+def corpus(compiler: str, lane: str, everything: bool, only: list[str] | None) -> int:
+    programs = read_corpus()
+    if only:
+        programs = [p for p in programs if p.stem in only]
+    if lane == "safety" and not everything:
+        programs = [p for p in programs if p.safety]
+    if lane == "meta-interp" and not everything:
+        programs = [p for p in programs if p.meta_interp]
+    failures = 0
+    with tempfile.TemporaryDirectory(prefix="coil-corpus-", dir=os.environ.get("COIL_TEST_SCRATCH")) as raw:
+        scratch = Path(raw)
+        for program in programs:
+            if lane == "interp" and program.interp_refused is not None:
+                result = subprocess.run([compiler, "interp", program.source, *program.args], cwd=ROOT,
+                                        env=lane_env(lane), stdin=subprocess.DEVNULL,
+                                        capture_output=True, timeout=RUN_TIMEOUT)
+                if result.returncode != 0 and program.interp_refused.encode() in result.stderr:
+                    print(f"ok   {program.stem} (refused by the interpreter, as it must be)")
                 else:
-                    print(f"  line counts: expected {len(want_lines)}, got {len(got_lines)}")
-    print(f"gate {stage}: {passed} passed, {len(failures)} failed")
-    return 1 if failures else 0
-
-
-def refresh_mismatched_snapshots(compiler: Path, verbose: bool) -> int:
-    """Refresh every currently mismatched stage in one deliberate transaction.
-
-    The initial audit always runs every stage. This prevents the slow and error-prone
-    pattern of discovering one mismatch, blessing it, rerunning from the beginning,
-    and repeating. Only failing stages are rewritten; a final all-stage audit proves
-    that the refreshed set is internally consistent.
-    """
-    failed_stages: list[str] = []
-    print("=== snapshot mismatch audit (all stages; no writes) ===")
-    for stage in STAGES:
-        if gate(compiler, stage, verbose):
-            failed_stages.append(stage)
-    if not failed_stages:
-        print("refresh: snapshots already match; wrote nothing")
-        return 0
-
-    print(f"=== refreshing mismatched stages once: {' '.join(failed_stages)} ===")
-    for stage in failed_stages:
-        snapshot(compiler, stage)
-
-    print("=== final snapshot audit (all stages) ===")
-    return gate(compiler, "all", verbose)
-
-
-def runtime_one(entry: str, compiler: Path, action: str, platform: str, verbose: bool,
-                reference: Path, excluded: set[str], scratch: Path) -> tuple[bool, list[str]]:
-    """Build and run one corpus entry. Returns (passed, lines to report)."""
-    parts = shlex.split(entry)
-    rust_reference = parts[0] == "R"
-    if rust_reference:
-        parts.pop(0)
-    source, *program_args = parts
-    identity = source.replace("/", "_").replace(".", "_")
-    fixed_prefix = "coil-arm64" if platform in ("arm64", "linux") else "coil-x64"
-    executable = scratch / f"{fixed_prefix}-fixed-{identity}"
-    build = [str(compiler), "build", source, "-o", str(executable)]
-    if action == "gate" and platform != "linux":
-        build += ["--backend", platform]
-    elif action == "snapshot" and rust_reference and platform == "arm64":
-        build += ["--backend", "arm64"]
-    result = subprocess.run(build, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
-    if platform == "linux" and source in excluded:
-        if result.returncode and b"not a general-purpose register on the target architecture" in result.stderr:
-            return True, []
-        return False, [f"FAIL architecture diagnostic: {source}"]
-    if result.returncode:
-        report = [f"FAIL build: {source}"]
-        if verbose:
-            report.append(str(result.stderr.decode(errors="replace").splitlines()[:3]))
-        return False, report
-    # The user-visible program identity is the corpus source, not the oracle's
-    # temporary output path. `coil interp` exposes the same argv contract, and
-    # `executable=` lets the native reference run preserve it exactly.
-    ran = subprocess.run([source, *program_args], executable=str(executable), stdin=subprocess.DEVNULL,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-    stdout_file = reference / f"{identity}.stdout"
-    stderr_file = reference / f"{identity}.stderr"
-    exit_file = reference / f"{identity}.exit"
-    if action == "snapshot":
-        stdout_file.write_bytes(ran.stdout)
-        stderr_file.write_bytes(ran.stderr)
-        exit_file.write_text(f"{ran.returncode}\n")
-        return True, []
-    if stdout_file.is_file() and ran.stdout == stdout_file.read_bytes() and ran.returncode == int(exit_file.read_text()):
-        return True, []
-    return False, [f"FAIL run: {source} exit={ran.returncode}"]
-
-
-def runtime(compiler: Path, action: str, platform: str, verbose: bool) -> int:
-    """Corpus entries are independent — each builds to its own fixed path and only
-    reads stdin from /dev/null — so they run concurrently. Reporting stays in corpus
-    order regardless of completion order, which keeps failure output diffable."""
-    source_platform = "arm64" if platform == "linux" else platform
-    base = ORACLE / source_platform
-    reference = base / "reference"
-    excluded = set(read_list(ORACLE / "linux/arm64-only.txt")) if platform == "linux" else set()
-    entries = read_list(base / "corpus.txt")
-    with tempfile.TemporaryDirectory(prefix="coil-runtime-") as scratch, \
-            concurrent.futures.ThreadPoolExecutor(max_workers=jobs()) as pool:
-        results = list(pool.map(
-            lambda entry: runtime_one(entry, compiler, action, platform, verbose, reference, excluded,
-                                      Path(scratch)),
-            entries))
-    failures = 0
-    passed = 0
-    for ok, report in results:
-        for line in report:
-            print(line)
-        if ok:
-            passed += 1
-        else:
-            failures += 1
-    print(f"runtime {action} {platform}: {passed} passed, {failures} failed")
-    return 1 if failures else 0
-
-
-def coverage() -> int:
-    corpus = read_list(ORACLE / "full/corpus.txt")
-    excluded = set(read_list(ORACLE / "linux/arm64-only.txt"))
-    mac = ORACLE / "full/reference"
-    linux = ORACLE / "linux/full-reference"
-    expected_mac = {f"{mangle(source)}.dump" for source in corpus}
-    expected_linux = {f"{mangle(source)}.dump" for source in corpus if source not in excluded}
-    actual_mac = {path.name for path in mac.glob("*.dump")}
-    actual_linux = {path.name for path in linux.glob("*.dump")}
-    problems = []
-    for label, expected, actual in (("macOS", expected_mac, actual_mac), ("Linux", expected_linux, actual_linux)):
-        problems += [f"MISSING {label}: {name}" for name in sorted(expected - actual)]
-        problems += [f"ORPHAN {label}: {name}" for name in sorted(actual - expected)]
-    if problems:
-        print("\n".join(problems))
-        print(f"coverage: {len(problems)} problem(s)")
-        return 1
-    print(f"coverage: PASS ({len(corpus)} shared full-pipeline entries)")
-    return 0
-
-
-def linux_ir(compiler: Path, action: str, verbose: bool) -> int:
-    corpus = read_list(ORACLE / "full/corpus.txt")
-    excluded = set(read_list(ORACLE / "linux/arm64-only.txt"))
-    reference = ORACLE / "linux/full-reference"
-    reference.mkdir(parents=True, exist_ok=True)
-    failures = 0
-    passed = 0
-    for source in corpus:
-        result = run(compiler, "emit-ir", source, *shlex.split(os.environ.get("COIL_SELF_ARGS", "")))
-        if source in excluded:
-            if result.returncode and b"not a general-purpose register on the target architecture" in result.stderr:
-                passed += 1
-            else:
-                failures += 1
-                print(f"FAIL architecture diagnostic: {source}")
-            continue
-        output = reference / f"{mangle(source)}.dump"
-        if action == "snapshot":
-            if result.returncode:
-                failures += 1
-                print(f"FAIL snapshot: {source}")
-            else:
-                output.write_bytes(result.stdout)
-                passed += 1
-        elif result.returncode == 0 and output.is_file() and result.stdout.rstrip(b"\n") == output.read_bytes().rstrip(b"\n"):
-            passed += 1
-        else:
-            failures += 1
-            print(f"FAIL Linux IR: {source}")
-            if verbose and result.stderr:
-                print(result.stderr.decode(errors="replace").splitlines()[0])
-    print(f"Linux IR {action}: {passed} passed, {failures} failed")
-    return 1 if failures else 0
-
-
-def interpreter(compiler: Path, live: bool, verbose: bool) -> int:
-    with tempfile.TemporaryDirectory(prefix="coil-interp-") as scratch:
-        return interpreter_in(compiler, live, verbose, Path(scratch))
-
-
-def interpreter_in(compiler: Path, live: bool, verbose: bool, scratch: Path) -> int:
-    base = ORACLE / "arm64"
-    reference = base / "reference"
-    # Programs the interpreter refuses by design (it keeps every integer in one
-    # 64-bit cell): each must still be refused, with the diagnostic that says so.
-    refused = {line.split()[0]: line.split(None, 1)[1] for line in read_list(base / "interp-refused.txt")}
-    failures = 0
-    passed = 0
-    for line in read_list(base / "corpus.txt"):
-        parts = shlex.split(line)
-        special_backend = parts[0] == "R"
-        if special_backend:
-            parts.pop(0)
-        source, *program_args = parts
-        identity = source.replace("/", "_").replace(".", "_")
-        if source in refused:
-            result = subprocess.run([str(compiler), "interp", source, *program_args], cwd=ROOT,
-                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, timeout=60)
-            if result.returncode != 0 and refused[source].encode() in result.stderr:
-                passed += 1
-            else:
-                failures += 1
-                print(f"FAIL interpreter refusal: {source} exit={result.returncode}")
-            continue
-        interpreted = subprocess.run([str(compiler), "interp", source, *program_args], cwd=ROOT,
-                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, timeout=60)
-        if live:
-            executable = scratch / f"coil-interp-compiled-{identity}"
-            build = [str(compiler), "build", source, "-o", str(executable)]
-            if special_backend:
-                build += ["--backend", "arm64"]
-            built = subprocess.run(build, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
-            if built.returncode:
-                failures += 1
-                print(f"FAIL interpreter comparison build: {source}")
+                    failures += 1
+                    print(f"FAIL {program.stem}: the interpreter must refuse it with "
+                          f"{program.interp_refused!r}; exit {result.returncode}\n"
+                          + result.stderr.decode(errors="replace")[-1500:])
                 continue
-            compiled = subprocess.run([source, *program_args], executable=str(executable), cwd=ROOT,
-                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                      stderr=subprocess.DEVNULL, timeout=30)
-            want_stdout, want_code = compiled.stdout, compiled.returncode
-        else:
-            want_stdout = (reference / f"{identity}.stdout").read_bytes()
-            want_code = int((reference / f"{identity}.exit").read_text())
-        if interpreted.stdout == want_stdout and interpreted.returncode == want_code:
-            passed += 1
-        else:
+            outcome = run_program(compiler, program, lane, scratch)
+            if isinstance(outcome, str):
+                failures += 1
+                print(f"FAIL {program.stem} [{lane}]: {outcome}")
+                continue
+            stdout, stderr, code = outcome
+            want_stdout, want_code = reference(program)
+            if stdout == want_stdout and code == want_code:
+                print(f"ok   {program.stem} [{lane}]")
+                continue
             failures += 1
-            print(f"FAIL interpreter: {source} exit={interpreted.returncode} want={want_code}")
-            if verbose:
-                print(f"stdout bytes: got={len(interpreted.stdout)} want={len(want_stdout)}")
-    label = "live" if live else "snapshot"
-    print(f"interpreter {label}: {passed} passed, {failures} failed")
+            detail = first_difference(want_stdout, stdout) if stdout != want_stdout else "stdout matches"
+            print(f"FAIL {program.stem} [{lane}]: exit {code} (want {want_code}); {detail}")
+            tail = stderr.decode(errors="replace")[-2000:]
+            if tail:
+                print("  stderr:\n" + "\n".join("    " + line for line in tail.splitlines()))
+    print(f"corpus {lane}: {len(programs) - failures} passed, {failures} failed")
     return 1 if failures else 0
+
+
+def bless(compiler: str, only: list[str] | None) -> int:
+    """Write each program's reference from the LLVM lane, after checking that the
+    arm64 lane agrees with it, so a reference never records one backend's bug."""
+    (CORPUS / "reference").mkdir(exist_ok=True)
+    failures = 0
+    with tempfile.TemporaryDirectory(prefix="coil-corpus-bless-") as raw:
+        for program in read_corpus():
+            if only and program.stem not in only:
+                continue
+            llvm = run_program(compiler, program, "llvm", Path(raw))
+            arm64 = run_program(compiler, program, "arm64", Path(raw))
+            if isinstance(llvm, str) or isinstance(arm64, str):
+                failures += 1
+                print(f"FAIL {program.stem}: {llvm if isinstance(llvm, str) else arm64}")
+                continue
+            if llvm[0] != arm64[0] or llvm[2] != arm64[2]:
+                failures += 1
+                print(f"FAIL {program.stem}: arm64 and LLVM disagree "
+                      f"(exit {arm64[2]} vs {llvm[2]}; {first_difference(llvm[0], arm64[0])})")
+                continue
+            base = CORPUS / "reference" / program.stem
+            Path(f"{base}.stdout").write_bytes(llvm[0])
+            Path(f"{base}.exit").write_text(f"{llvm[2]}\n")
+            print(f"blessed {program.stem} (exit {llvm[2]}, {len(llvm[0])} bytes)")
+    return 1 if failures else 0
+
+
+def normalize(output: bytes, scratch: Path) -> bytes:
+    text = output.decode(errors="replace")
+    text = text.replace(f"{scratch}/", "{tmp}/").replace(str(scratch), "{tmp}")
+    text = text.replace(f"{ROOT}/", "")
+    # A diagnostic inside the library names wherever this toolchain keeps it.
+    text = re.sub(r"\S*/lib/coil/stdlib/", "<stdlib>/", text)
+    text = text.replace("src/stdlib/", "<stdlib>/")
+    # The platform linker's own prose varies; Coil's line about it does not.
+    marker = "error: linker/ar failed with exit status:"
+    at = text.find(marker)
+    if at >= 0:
+        text = text[at:]
+    return text.encode()
+
+
+def diag_inputs(which: str) -> list[Path]:
+    sets = DIAG_SETS if which == "all" else (which,)
+    inputs = []
+    for name in sets:
+        inputs += sorted((DIAG / name).glob("*.coil"))
+    return inputs
+
+
+def diag_command(compiler: str, source: Path, scratch: Path) -> list[str]:
+    kind = source.parent.name
+    relative = str(source.relative_to(ROOT))
+    first = source.read_text().splitlines()[:1]
+    out = scratch / source.stem
+    if first and first[0].startswith("; args:"):
+        extra = [a.replace("{out}", str(out)).replace("{tmp}", str(scratch))
+                 for a in shlex.split(first[0][len("; args:"):])]
+    else:
+        extra = ["-o", str(out)] if kind == "link" else []
+    return [compiler, "build" if kind == "link" else "check", relative, *extra]
+
+
+def diag_output(compiler: str, source: Path, scratch: Path) -> bytes:
+    command = diag_command(compiler, source, scratch)
+    timeout = 60 if source.parent.name == "no-hang" else BUILD_TIMEOUT
+    try:
+        result = subprocess.run(command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return f"TIMEOUT: did not finish in {timeout}s\n".encode()
+    return normalize(result.stdout, scratch) + f"exit: {result.returncode}\n".encode()
+
+
+def diag(compiler: str, action: str, which: str, only: list[str] | None) -> int:
+    failures = 0
+    inputs = [p for p in diag_inputs(which) if not only or p.stem in only]
+    if not inputs:
+        raise SystemExit(f"diag {which}: no inputs")
+    with tempfile.TemporaryDirectory(prefix="coil-diag-", dir=os.environ.get("COIL_TEST_SCRATCH")) as raw:
+        scratch = Path(raw)
+        for source in inputs:
+            got = diag_output(compiler, source, scratch)
+            golden = source.parent / "reference" / f"{source.stem}.diag"
+            if action == "bless":
+                golden.parent.mkdir(exist_ok=True)
+                golden.write_bytes(got)
+                print(f"blessed {golden.relative_to(ROOT)}")
+                continue
+            if not golden.is_file():
+                failures += 1
+                print(f"FAIL {source.relative_to(ROOT)}: no golden; run `oracle.py diag bless`")
+                continue
+            want = golden.read_bytes()
+            if got == want:
+                print(f"ok   {source.relative_to(ROOT)}")
+                continue
+            failures += 1
+            print(f"FAIL {source.relative_to(ROOT)}: {first_difference(want, got)}")
+            print("  got:\n" + "\n".join("    " + line for line in got.decode(errors="replace").splitlines()[:60]))
+    if action == "gate":
+        print(f"diag {which}: {len(inputs) - failures} passed, {failures} failed")
+    return 1 if failures else 0
+
+
+def default_compiler() -> str:
+    return os.environ.get("COIL") or str(ROOT / "build" / "bin" / "coil")
 
 
 def main() -> int:
-    # Long all-stage audits must show progress as each stage finishes. Without line
-    # buffering a non-interactive invocation appears hung until the entire transaction
-    # exits, which invites users and agents to interrupt it or start redundant runs.
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="action", required=True)
-    for action in ("gate", "snapshot"):
-        command = sub.add_parser(action)
-        command.add_argument("stage", choices=("all", *STAGES))
-        command.add_argument("--compiler", default=os.environ.get("COIL_REF_BIN", "build/bin/coil"))
-        if action == "gate":
-            command.add_argument("--verbose", action="store_true", default=os.environ.get("VERBOSE") == "1")
-    command = sub.add_parser("refresh", help="audit all stages, refresh every mismatch once, then re-audit")
-    command.add_argument("--compiler", default=os.environ.get("COIL_REF_BIN", "build/bin/coil"))
-    command.add_argument("--verbose", action="store_true", default=os.environ.get("VERBOSE") == "1")
-    command = sub.add_parser("runtime")
-    command.add_argument("operation", choices=("gate", "snapshot"))
-    command.add_argument("platform", choices=("arm64", "x64", "linux"))
-    command.add_argument("--compiler", default="build/bin/coil")
-    command.add_argument("--verbose", action="store_true")
-    command = sub.add_parser("linux-ir")
-    command.add_argument("operation", choices=("gate", "snapshot"))
-    command.add_argument("--compiler", default="build/bin/coil")
-    command.add_argument("--verbose", action="store_true")
-    command = sub.add_parser("interpreter")
-    command.add_argument("mode", choices=("snapshot", "live"), nargs="?", default="snapshot")
-    command.add_argument("--compiler", default="build/bin/coil")
-    command.add_argument("--verbose", action="store_true")
-    sub.add_parser("coverage")
+    command = sub.add_parser("corpus")
+    command.add_argument("lane", choices=(*LANES, "bless"))
+    command.add_argument("--all", action="store_true", help="every program, not only the lane's own")
+    command.add_argument("--only", action="append", help="one program by stem (repeatable)")
+    command.add_argument("--compiler", default=default_compiler())
+    command = sub.add_parser("diag")
+    command.add_argument("operation", choices=("gate", "bless"))
+    command.add_argument("set", choices=(*DIAG_SETS, "all"), nargs="?", default="all")
+    command.add_argument("--only", action="append", help="one input by stem (repeatable)")
+    command.add_argument("--compiler", default=default_compiler())
     args = parser.parse_args()
     os.chdir(ROOT)
-    if args.action == "coverage":
-        return coverage()
-    compiler = Path(args.compiler)
-    if not compiler.is_absolute():
-        compiler = ROOT / compiler
-    if args.action == "snapshot":
-        return snapshot(compiler, args.stage)
-    if args.action == "refresh":
-        return refresh_mismatched_snapshots(compiler, args.verbose)
-    if args.action == "runtime":
-        return runtime(compiler, args.operation, args.platform, args.verbose)
-    if args.action == "linux-ir":
-        return linux_ir(compiler, args.operation, args.verbose)
-    if args.action == "interpreter":
-        return interpreter(compiler, args.mode == "live", args.verbose)
-    return gate(compiler, args.stage, args.verbose)
+    compiler = str(Path(args.compiler).resolve()) if os.sep in args.compiler else args.compiler
+    if args.action == "corpus":
+        if args.lane == "bless":
+            return bless(compiler, args.only)
+        return corpus(compiler, args.lane, args.all, args.only)
+    return diag(compiler, args.operation, args.set, args.only)
 
 
 if __name__ == "__main__":

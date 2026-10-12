@@ -14,8 +14,8 @@
 # stale/tampered seed cannot slip through:
 #   * NO-LLVM : otool proves stage2 links no libLLVM
 #   * FIXPOINT: stage2.o == stage3.o byte-identical (arm64 backend is deterministic)
-#   * GATE    : arm64 gate-run — every corpus program runs identically to the
-#               LLVM-reference. (gate-full/emit-ir is N/A: this build has no LLVM IR.)
+#   * GATE    : the runtime corpus (tests/corpus) on --backend arm64 matches its
+#               blessed references.
 #
 # Requirements: a C compiler (cc). That's the whole toolchain.
 #
@@ -75,10 +75,10 @@ wait "$stage3_pid" || { echo "stage3 object emission FAILED"; exit 1; }
 cmp "$RUN_DIR/stage2.o" "$RUN_DIR/stage3.o" || { echo "FIXPOINT FAIL — arm64 objects differ"; exit 2; }
 echo "  ok — byte-identical, the compiler reproduces itself"
 
-echo "=== GATE: arm64 behavioral gate-run ==="
-python3 scripts/oracle.py runtime gate arm64 --compiler "$S2" --verbose \
-  || { echo "arm64 runtime gate FAIL"; exit 1; }
-echo "  arm64 gate-run: PASS (programs run identically to the LLVM reference)"
+echo "=== GATE: the runtime corpus on --backend arm64 ==="
+python3 scripts/oracle.py corpus arm64 --compiler "$S2" \
+  || { echo "corpus on arm64 FAIL"; exit 1; }
+echo "  corpus on arm64: PASS (every program matches its reference)"
 
 stage_lib_cleanup
 

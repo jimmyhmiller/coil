@@ -62,9 +62,9 @@ cmp "$RUN_DIR/stage2.o" "$RUN_DIR/stage3.o" || { echo "FIXPOINT FAIL — x64 obj
 echo "  ok — byte-identical, the compiler reproduces itself through the x64 backend"
 
 echo "=== GATE: the x64-built compiler must itself pass the corpus ==="
-python3 scripts/oracle.py runtime gate x64 --compiler "$S2" >/dev/null 2>&1 \
-  || { echo "x64 gate-run FAIL (run it directly to see which programs)"; exit 1; }
-echo "  ok — every corpus program runs identically to the LLVM reference"
+python3 scripts/oracle.py corpus x64 --compiler "$S2" >/dev/null 2>&1 \
+  || { echo "corpus on x64 FAIL (run scripts/oracle.py corpus x64 --compiler <stage2> to see which)"; exit 1; }
+echo "  ok — every corpus program matches its reference"
 
 echo "=== CABI: the SysV rules agree with a gcc-compiled translation unit ==="
 ./scripts/compiler/oracle/x64/gate-cabi.sh "$S2" >/dev/null 2>&1 \

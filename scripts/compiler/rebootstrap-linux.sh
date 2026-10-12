@@ -114,25 +114,10 @@ cmp "$RUN_DIR/stage2.o" "$RUN_DIR/stage3.o" || { echo "FIXPOINT FAIL — objects
 echo "  ok — byte-identical, the compiler reproduces itself"
 
 # This script proves ONE thing: the compiler reproduces itself on Linux x86-64.
-# It used to run a whole test battery after the fixpoint -- scheme, cli, lint,
-# prop, wasm-build, target-os and the per-stage snapshots -- which is why this job
-# took 17 minutes while the macOS bootstrap took two. Those suites are not
-# Linux-specific and the bootstrap is not the place to discover they are red.
-#
-# What was dropped, so it can be put back deliberately rather than rediscovered:
-#   linux-ir + runtime gates, lint_fires, unused_lint, prop_nofork, prop_spawn,
-#   wasm build, gate-cli, gate-target-os, dev.py test scheme, the read/ast/load/
-#   resolved/checked/expand/mono/x86 stage snapshots, and oracle coverage.
-# They are all still runnable by hand against the compiler this script installs;
-# `scripts/oracle.py coverage` and the linux-ir references in particular now have
-# nothing running them on a schedule.
-#
-# The staged-metacompilation branch proposed putting the whole battery back here,
-# plus gate-run-meta and gate-staged-meta. The battery stays out -- 58b6e68 took
-# it out on purpose and this job proves the fixpoint -- but the two metaprogram
-# gates were a real gap, since nothing ran either of them anywhere. They are
-# wired into the macOS `full` CI job and `dev.py test staged` instead, which is
-# where the already-built compiler is.
+# Tests are not part of the bootstrap. Run `python3 scripts/dev.py test fast
+# --compiler build/bin/coil` against what it builds; the x86-64 Linux half of
+# `dev.py test comprehensive` (scripts/tests/x64-host.py) runs this bootstrap, the
+# runtime corpus and the x64 backend's gates on the Linux host.
 
 stage_lib_cleanup
 
