@@ -4027,13 +4027,13 @@ cat > "$T/rdr/src/reader.coil" <<'EOF'
 (import "coil.primitive" :as p)
 (reader-provider "rdr.reader" read-bad)
 (defn read-bad [(context Code)] (-> Code)
-  `(defn value [] (-> i64) ~(p/code-symbol `:oops)))
+  `(defn value [] (-> i64) ~(p/code-symbol `1.5)))
 EOF
 echo "anything" > "$T/rdr/src/data.bad"
 printf '(module rdr.main)\n(import "rdr.data" :as d)\n(defn main [] (-> i64) (d/value))\n' > "$T/rdr/src/main.coil"
 rdr_out=$(cd "$T/rdr" && "$COIL" check 2>&1)
 case "$rdr_out" in
-  *"data.bad' with reader 'rdr.reader'"*"got the keyword :oops"*) ok "a reader provider's error names the file, the reader and the bad part" ;;
+  *"data.bad' with reader 'rdr.reader'"*"got a float"*) ok "a reader provider's error names the file, the reader and the bad part" ;;
   *) bad "reader provider error location" "$rdr_out" ;;
 esac
 
