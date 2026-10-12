@@ -64,7 +64,8 @@ limit. `COIL_BUDGET_SCALE` multiplies every budget and limit; CI uses 1.5.
 
 To change a budget, re-baseline on a quiet machine and review the diff like code:
 `python3 scripts/dev.py test fast --compiler <coil> --rebaseline 3` sets each to
-1.5 times the median of three runs.
+twice the median of three runs, at least 3 s. One run of a step on a busy machine
+can take twice its median; a budget is there to catch a step that has grown.
 
 Every step gets `$COIL`, the compiler under test, with `coil` first on `PATH`
 as a symlink to it (a nested `coil`, or a coil.jit session, resolves the same

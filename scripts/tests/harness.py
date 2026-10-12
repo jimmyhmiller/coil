@@ -384,8 +384,9 @@ def run_tier(tier: str, steps: list[Step], compiler: str, *, total_key: str | No
 
 
 def write_rebaseline(section: str, timings: dict[str, list[float]]) -> None:
-    """Budgets become 1.5x the median of the rounds, rounded up to a whole second.
-    Only this tier's [<section>.steps] table is rewritten; review the diff."""
+    """Budgets become twice the median of the rounds, rounded up to a whole second
+    and at least 3 s. Only this tier's [<section>.steps] table is rewritten; review
+    the diff."""
     lines = BUDGETS.read_text().splitlines()
     header = f"[{section}.steps]"
     try:
@@ -402,7 +403,7 @@ def write_rebaseline(section: str, timings: dict[str, list[float]]) -> None:
             kept[line.split('"')[1]] = line
     for name, seconds in timings.items():
         median = statistics.median(seconds)
-        kept[name] = (f'"{name}" = {max(1, math.ceil(median * 1.5))}'
+        kept[name] = (f'"{name}" = {max(3, math.ceil(median * 2))}'
                       f"  # median {median:.1f}s of {len(seconds)}")
     body = list(kept.values()) + [""]
     BUDGETS.write_text("\n".join(lines[:start + 1] + body + lines[end:]) + "\n")
