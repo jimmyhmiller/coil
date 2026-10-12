@@ -62,8 +62,10 @@ def main() -> int:
                            cwd=ROOT, capture_output=True, check=True).stdout
     present = b"\0".join(f for f in files.split(b"\0") if f and (ROOT / f.decode()).exists())
     print(f"== copying the working tree to {args.host}:~/{remote}", flush=True)
-    tar = subprocess.Popen(["tar", "--null", "-T", "-", "-czf", "-"], cwd=ROOT,
-                           stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    # macOS tar would also send extended attributes GNU tar on the host warns about.
+    tar = subprocess.Popen(["tar", "--no-mac-metadata", "--no-xattrs", "--null", "-T", "-", "-czf", "-"],
+                           cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                           env={**os.environ, "COPYFILE_DISABLE": "1"})
     untar = subprocess.Popen(["ssh", "-o", "BatchMode=yes", args.host,
                               f"mkdir -p {remote} && tar -xzf - -C {remote}"], stdin=tar.stdout)
     tar.stdin.write(present)

@@ -51,14 +51,14 @@ def steps(quick: bool) -> list[Step]:
         Step("corpus/meta-interp", [*corpus, "meta-interp"]),
         # Compile and build diagnostics against byte-exact goldens.
         Step("diag/compile", [PY, "scripts/oracle.py", "diag", "gate", "compile"], quick=True),
-        Step("diag/link", [PY, "scripts/oracle.py", "diag", "gate", "link"], quick=True),
+        Step("diag/link", [PY, "scripts/oracle.py", "diag", "gate", "link"]),
         Step("diag/no-hang", [PY, "scripts/oracle.py", "diag", "gate", "no-hang"], quick=True),
         # The command-line contract.
         Step("cli/run", [cli, "run"], quick=True),
-        Step("cli/usage", [cli, "usage"], quick=True),
+        Step("cli/usage", [cli, "usage"]),
         Step("cli/reference", [cli, "reference"]),
-        Step("cli/new-project", [cli, "new-project"], quick=True),
-        Step("cli/check", [cli, "check"], quick=True),
+        Step("cli/new-project", [cli, "new-project"]),
+        Step("cli/check", [cli, "check"]),
         Step("cli/fmt", [cli, "fmt"], quick=True),
         Step("cli/lint", [cli, "lint"]),
         Step("cli/objects", [cli, "objects"]),
