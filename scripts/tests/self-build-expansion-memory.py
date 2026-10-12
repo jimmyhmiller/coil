@@ -74,6 +74,11 @@ with tempfile.TemporaryDirectory(prefix="self-build-memory-", dir=ROOT / "build"
     required = {"frontend.expand", "frontend.check.meta-elaboration",
                 "frontend.check.typecheck", "frontend.monomorphize", "backend.object-emit"}
     assert required <= observed, ("missing self-build phases", required - observed)
+    # The bound sums growth in PHASES inside meta elaboration only, so a zero sum
+    # proves nothing unless those phases still exist under these names: the
+    # initial expansion runs every one of them.
+    assert PHASES <= observed, ("measured phases were renamed or are no longer traced",
+                                PHASES - observed)
     assert live is not None and all(name in costs for name in
                                    ("frontend.resolve.prepare-table", "frontend.check.functions",
                                     "frontend.monomorphize")), "missing memory measurements"
