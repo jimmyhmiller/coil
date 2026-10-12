@@ -16,13 +16,16 @@
 ; them. One region rather than two keeps every PC32 displacement inside +/-2GB by
 ; construction (the whole image is a few MB).
 ;
-; NO VENEERS, unlike the arm64 loader. There, a bl reaches only +/-128MB, so every
-; branch to a dlsym'd address needed a trampoline. Here a call/jmp carries a signed
-; 32-bit displacement — +/-2GB — but a dlsym'd libc address can still be further than
-; that from our mapping, so the range check in jit-elf-patch! is a real guard and not
-; a formality. It fails loudly rather than truncating: silently wrapping a call
-; displacement produces a jump into nothing. If it ever fires the fix is a PLT-style
-; indirect stub, which is why the message says so.
+; STUBS FOR FAR CALLS. A call/jmp carries a signed 32-bit displacement — +/-2GB —
+; and a symbol resolved from the process need not be that close to our mapping:
+; libc usually is (shared libraries and anonymous mappings sit together), but the
+; compiler's own executable is not, and loaded code reaches it for `atexit`
+; (jit-process-symbol). So the text half ends with one 16-byte stub per undefined
+; symbol, `jmp *0(%rip)` followed by the absolute address, and a PLT32 call whose
+; target is out of reach goes through its symbol's stub, as a linker's PLT entry
+; would. An address the code takes is never a PC32 against an undefined symbol
+; (codegen_x64 loads it from a data slot), so anything else out of range is still
+; an error rather than a truncated displacement, which would jump into nothing.
 ;
 ; NO ICACHE FLUSH, also unlike arm64: x86 instruction caches are coherent with
 ; stores, so writing code and then executing it needs no explicit invalidation.
@@ -90,7 +93,8 @@
 ;
 ; Note this does NOT need the compiler linked -rdynamic. The metaprogram/host
 ; boundary is a VTABLE handshake (metashim.coil), not dynamic symbols: the only
-; undefined symbols a metaprogram object actually carries are plain libc.
+; undefined symbols a metaprogram object actually carries are libc's, and the
+; exit-handler registration jit-process-symbol substitutes for `atexit`.
 (defn ejit-rtld-default [] (-> (ptr i8))
   (primitive/cast (ptr i8) 0))
 
@@ -159,7 +163,25 @@
 ; ---- apply one relocation ------------------------------------------------------
 ; loc = the fixup address, tgt = the resolved target address S, addend = the RELA
 ; addend A. RELA means the slot carries nothing to preserve: it is written outright.
-(defn jit-elf-patch! [(loc (ptr u8)) (tgt (ptr i8)) (rtype i64) (addend i64)] (-> (Result i64
+(defn ejit-pc32-reaches? [(delta i64)] (-> bool)
+  (and (< delta (ejit-pc32-max)) (>= delta (primitive/isub 0 (ejit-pc32-max)))))
+
+; One stub: `jmp *0(%rip)` (ff 25 00000000), then the 8-byte target it reads.
+(defn ejit-stub-size [] (-> i64)
+  16)
+
+(defn ejit-write-stub! [(at (ptr u8)) (tgt (ptr i8))] (-> i64)
+  (set! (primitive/index at 0) (primitive/cast u8 255))
+  (set! (primitive/index at 1) (primitive/cast u8 37))
+  (ejit-st32! (primitive/index at 2) 0)
+  (ejit-st64! (primitive/index at 6) (primitive/cast i64 tgt))
+  (set! (primitive/index at 14) (primitive/cast u8 204))  ; int3 padding
+  (set! (primitive/index at 15) (primitive/cast u8 204))
+  0)
+
+; `stub` is the target's stub (null for a symbol defined in the image), taken by a
+; PLT32 call the target itself is too far for.
+(defn jit-elf-patch! [(loc (ptr u8)) (tgt (ptr i8)) (stub (ptr i8)) (rtype i64) (addend i64)] (-> (Result i64
                                                                                           (slice u8)))
   (let [p (primitive/cast i64 loc)
         s (primitive/cast i64 tgt)]
@@ -169,20 +191,25 @@
               (Ok [i64 (slice u8)] 0))
           ; PC32 and PLT32 are the same arithmetic here. PLT32 means "L + A - P",
           ; where L is the PLT entry for S; with no PLT in an in-memory image, L is
-          ; S, exactly as a static link resolves it when the target is in range.
+          ; S, exactly as a static link resolves it when the target is in range,
+          ; and S's stub when it is not.
           (or (= rtype (r-x86-64-pc32)) (= rtype (r-x86-64-plt32)))
-            (let [delta (primitive/iadd (primitive/isub s p) addend)]
-              (if (or (>= delta (ejit-pc32-max))
-                      (< delta (primitive/isub 0 (ejit-pc32-max))))
-                  ; A dlsym'd address more than 2GB from our mapping. Truncating
-                  ; would jump into nothing, so fail loudly; the fix is an indirect
-                  ; stub (load the absolute address into a scratch register and jump
-                  ; through it), not a wider mask.
-                  (Err [i64 (slice u8)]
-                       "jit_elf: pc-relative target out of +/-2GB range for an in-memory symbol")
-                  (do
-                    (ejit-st32! loc delta)
-                    (Ok [i64 (slice u8)] 0))))
+            (let [delta (primitive/iadd (primitive/isub s p) addend)
+                  via-stub (primitive/iadd (primitive/isub (primitive/cast i64 stub) p) addend)]
+              (cond (ejit-pc32-reaches? delta)
+                      (do
+                        (ejit-st32! loc delta)
+                        (Ok [i64 (slice u8)] 0))
+                    (and (= rtype (r-x86-64-plt32))
+                         (!= (primitive/cast i64 stub) 0)
+                         (ejit-pc32-reaches? via-stub))
+                      (do
+                        (ejit-st32! loc via-stub)
+                        (Ok [i64 (slice u8)] 0))
+                    ; Truncating would jump into nothing, so fail loudly.
+                    :else
+                      (Err [i64 (slice u8)]
+                           "jit_elf: pc-relative target out of +/-2GB range for an in-memory symbol")))
           :else
             (Err [i64 (slice u8)]
                  "jit_elf: unhandled x86-64 relocation type in the in-memory loader"))))
@@ -222,6 +249,19 @@
                                          (alloc/alloc-slice-new (primitive/cast (ptr (ptr i8))
                                                                                 0)
                                                                 0)))))
+                 stubs
+                   (slice-data (match (alloc [(ptr i8)]
+                                             a
+                                             (if (> nsym (primitive/cast i64 0))
+                                                 nsym
+                                                 1))
+                                 (Some [s] s)
+                                 (None []
+                                       (do
+                                         (oom-at c"compiler jit_elf" -1)
+                                         (alloc/alloc-slice-new (primitive/cast (ptr (ptr i8))
+                                                                                0)
+                                                                0)))))
                  (mut cur) 0
                  (mut i) 0]
 
@@ -247,6 +287,16 @@
                                      (primitive/iadd (load cur)
                                                      (len (load (field s buf)))))))
                          (store! i (primitive/iadd (load i) 1)))))
+
+             ; then the stubs, one per undefined symbol (see the header)
+             (let [stubs-off (ejit-align-up (load cur) (ejit-stub-size))
+                   (mut nundef) 0
+                   (mut nstub) 0]
+               (for [k 0 nsym]
+                 (when (= (.sect (xal-at [ESym] (field o syms) k)) 0)
+                   (set! nundef (+ nundef 1))
+                   0))
+               (store! cur (+ stubs-off (* nundef (ejit-stub-size))))
 
              ; the text/data boundary is a page boundary: mprotect works in whole
              ; pages, and making a data page executable (or a text page writable)
@@ -334,7 +384,7 @@
                                  (if (= sect (primitive/cast i64 0))
                                      ; undefined: it must already be somewhere in this process
                                      (let [fp
-                                             (dlsym (ejit-rtld-default)
+                                             (jit-process-symbol (ejit-rtld-default)
                                                     (ejit-sym-cstr a
                                                                    (load (field sy
                                                                                 name))))]
@@ -347,7 +397,13 @@
                                                                       (load (field sy
                                                                                    name))))))
                                        (store! (primitive/index addrs (load i))
-                                               fp))
+                                               fp)
+                                       (let [stub (primitive/index base
+                                                                   (+ stubs-off
+                                                                      (* nstub (ejit-stub-size))))]
+                                         (ejit-write-stub! (primitive/cast (ptr u8) stub) fp)
+                                         (store! (primitive/index stubs (load i)) stub)
+                                         (set! nstub (+ nstub 1))))
                                      (let [old
                                              (if (and (!= (primitive/cast i64
                                                                           prior)
@@ -385,6 +441,8 @@
                                          (store! (primitive/index addrs
                                                                   (load i))
                                                  ad)
+                                         (store! (primitive/index stubs (load i))
+                                                 (primitive/cast (ptr i8) 0))
                                          (let [js (primitive/alloc-stack JitSym)]
                                            (store! (field js name)
                                                    (load (field sy name)))
@@ -425,6 +483,7 @@
                                                (load (primitive/index addrs sym))]
                                          (match (jit-elf-patch! loc
                                                                 tgt
+                                                                (load (primitive/index stubs sym))
                                                                 (load (field r
                                                                              rtype))
                                                                 (load (field r
@@ -458,7 +517,7 @@
                      (store! (field img base) base)
                      (store! (field img size) total)
                      (store! (field img syms) (load syms))
-                     (Ok [JitImage JitErr] (load img)))))))))
+                     (Ok [JitImage JitErr] (load img))))))))))
 
 (defn jit-elf-load [(a (dyn Allocator)) (o (mut EObj))] (-> (Result JitImage
                                                                     JitErr))

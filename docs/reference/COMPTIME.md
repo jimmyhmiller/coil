@@ -34,9 +34,13 @@ is the same impl the runtime uses — literally the same `=`.
   the natural C layout. `build-value` turns that into a literal. There is no
   interpreter (`docs/archive/INTERP_DELETION.md`).
 - ⚠ Because the thunk is real compiled code, a runaway comptime computation is
-  **unbounded**, and deep self-recursion is not tail-call-optimized on this path, so
-  it crashes rather than reporting. Division by zero **is** explicitly guarded
-  (integer only — a comptime float division to infinity is legal).
+  **unbounded**, and deep non-tail recursion crashes rather than reporting (a self
+  call in tail position is a jump, as in any compiled code). Division by zero **is**
+  explicitly guarded (integer only — a comptime float division to infinity is
+  legal), on a type parameter too when its bounds admit only integers.
+- Comptime code runs in the compiler's process. An exit handler it registers with
+  `atexit` (the debug allocator under `coil.safety` registers one) runs when the
+  compiler unloads that code, as `dlclose` runs a library's.
 
 ## Supported
 

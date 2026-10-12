@@ -53,6 +53,7 @@
 (import "coil.fs" :as fs)
 (import "coil.io" :as io)
 (import "coil.compiler.parser" :use [i64->str])
+(import "coil.atomic" :use [atomic-cas atomic-store])
 
 (extern mmap :cc c [(ptr i8) i64 i32 i32 i32 i64] (-> (ptr i8)))
 
@@ -91,6 +92,105 @@
 ; the compiler exports. RTLD_DEFAULT is (void*)-2 on macOS.
 (defn jit-rtld-default [] (-> (ptr i8))
   (primitive/cast (ptr i8) -2))
+
+;;; Exit handlers registered by loaded code. `atexit` in a dlopen'd library ties the
+;;; handler to that library, so `dlclose` runs it; a JIT image is not a library the
+;;; C runtime knows, so code in one that called the process's `atexit` left a
+;;; pointer into memory `jit-free!` later unmapped, and the process crashed at exit
+;;; (a `const` whose initializer allocates under `coil.safety` registers one).
+;;; Loaded code's `atexit` and `__cxa_atexit` resolve to the two functions below
+;;; instead, and an image's handlers run when it is released, as a library's do.
+;;; A handler outside every released image runs at process exit.
+(defstruct JitExitHandler [(f (ptr i8)) (arg (ptr i8)) (with-arg bool)])
+
+(defstruct JitExitHandlers
+  [(lock i64) (hooked bool) (items (ptr (ArrayList JitExitHandler)))])
+
+(defn jit-exit-handlers [] (-> (ptr JitExitHandlers))
+  (primitive/alloc-static JitExitHandlers))
+
+(defn jit-exit-lock! [] (-> i64)
+  (let [h (jit-exit-handlers)]
+    (while (!= (atomic-cas (field h lock) 0 1) 0) 0)
+    0))
+
+(defn jit-exit-unlock! [] (-> i64)
+  (atomic-store (field (jit-exit-handlers) lock) 0)
+  0)
+
+(extern jit.atexit :as "atexit" :cc c [(fnptr c [] i64)] (-> i32))
+
+(defn jit-exit-register! [(f (ptr i8)) (arg (ptr i8)) (with-arg bool)] (-> i32)
+  (jit-exit-lock!)
+  (let [h (jit-exit-handlers)
+        first (not (.hooked h))]
+    (when (= (primitive/cast i64 (.items h)) 0)
+      (set! (.items h) (box! (malloc-allocator) (ArrayList JitExitHandler)
+                             (al-new [JitExitHandler] (malloc-allocator))))
+      0)
+    (push! (.items h) (JitExitHandler :f f :arg arg :with-arg with-arg))
+    (set! (.hooked h) true)
+    (jit-exit-unlock!)
+    (if first
+        (jit.atexit (primitive/fnptr-of jit-exit-handlers-at-exit))
+        (primitive/cast i32 0))))
+
+;;; What loaded code reaches for `atexit`.
+(defn jit-atexit [(f (fnptr c [] i64))] (-> i32)
+  (jit-exit-register! (primitive/cast (ptr i8) f) (primitive/cast (ptr i8) 0) false))
+
+;;; What loaded code reaches for `__cxa_atexit`. The DSO handle names the caller's
+;;; library, which an image does not have; the handler's address says which image
+;;; it belongs to.
+(defn jit-cxa-atexit [(f (fnptr c [(ptr i8)] i64)) (arg (ptr i8)) (dso (ptr i8))] (-> i32)
+  (jit-exit-register! (primitive/cast (ptr i8) f) arg true))
+
+;;; Take out the most recently registered handler whose code lies in [lo, hi).
+(defn jit-exit-take! [(lo i64) (hi i64)] (-> (Option JitExitHandler))
+  (jit-exit-lock!)
+  (let [items (.items (jit-exit-handlers))
+        (mut found) (None [JitExitHandler])
+        (mut searching) true]
+    (unless (= (primitive/cast i64 items) 0)
+      (let [n (len (load items))
+            (mut i) n]
+        (while (and (= searching true) (> i 0))
+          (set! i (- i 1))
+          (let [e (get (load items) i)
+                at (primitive/cast i64 (.f e))]
+            (when (and (>= at lo) (< at hi))
+              (set! found (Some e))
+              (set! searching false)
+              (for [j i (- n 1)]
+                (store! (al-elem [JitExitHandler] items j) (get (load items) (+ j 1))))
+              (al-pop! items)
+              0)))
+        0)
+      0)
+    (jit-exit-unlock!)
+    (load found)))
+
+;;; Run, most recently registered first, every handler whose code lies in
+;;; [lo, hi), and forget it. A handler may register another; each is taken out of
+;;; the list before it runs, and the list is searched again after.
+(defn jit-run-exit-handlers! [(lo i64) (hi i64)] (-> i64)
+  (while-let [(Some [e]) (jit-exit-take! lo hi)]
+    (if (.with-arg e)
+        (call-ptr (primitive/cast (fnptr c [(ptr i8)] i64) (.f e)) (.arg e))
+        (call-ptr (primitive/cast (fnptr c [] i64) (.f e)))))
+  0)
+
+(defn jit-exit-handlers-at-exit [] (-> i64)
+  (jit-run-exit-handlers! 0 9223372036854775807))
+
+;;; The address an undefined symbol of a loaded image resolves to from the
+;;; process: the image's own exit-handler registration for `atexit` and
+;;; `__cxa_atexit`, and otherwise whatever `dlsym` finds. `name` is the C name.
+(defn jit-process-symbol [(rtld (ptr i8)) (name (ptr i8))] (-> (ptr i8))
+  (let [s (cstr->str name)]
+    (cond (= s "atexit") (primitive/cast (ptr i8) (primitive/fnptr-of jit-atexit))
+          (= s "__cxa_atexit") (primitive/cast (ptr i8) (primitive/fnptr-of jit-cxa-atexit))
+          :else (dlsym rtld name))))
 
 ; Darwin's explicit i-cache flush after writing JIT pages, resolved dynamically:
 ; the symbol does not exist on ELF hosts (this JIT emits arm64 and never runs
@@ -712,7 +812,7 @@
                                                    process-fp
                                                      (if (!= (primitive/cast i64 exact) 0)
                                                          (primitive/cast (ptr i8) 0)
-                                                         (dlsym (jit-rtld-default)
+                                                         (jit-process-symbol (jit-rtld-default)
                                                                 (jit-sym-cstr a
                                                                               (load (field sy
                                                                                            name)))))
@@ -1035,6 +1135,9 @@
   (do
     (when (!= (primitive/cast i64 (load (field img base)))
               (primitive/cast i64 0))
+      ; the exit handlers its code registered run now, while it is still mapped
+      (let [lo (primitive/cast i64 (load (field img base)))]
+        (jit-run-exit-handlers! lo (+ lo (load (field img size)))))
       (primitive/cast i64
                       (munmap (load (field img base)) (load (field img size)))))
     (set! (.base img) (primitive/cast (ptr i8) 0))
