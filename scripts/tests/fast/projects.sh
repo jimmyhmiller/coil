@@ -8,7 +8,8 @@
 #               [link], [profile.safe], an executable and an object artifact, and
 #               a default plus an opt-in test suite.
 #   workspace/  members that import each other with no dependency declarations,
-#               a library member, and a directory the members glob skips.
+#               a library member, a directory the members glob skips, a
+#               dependency of the workspace's (with C source) and one of a member's.
 #   hermetic/   the hermetic standard-library profile with a core provider.
 #   units/      a module built ahead of time with build-unit, and its consumer.
 #
@@ -101,6 +102,8 @@ expect 0 "-9223372036854775807" "a release build wraps on overflow"
 echo "== app: profiles, install"
 run "$APP" "$COIL" build --profile safe
 expect 0 "build/safe/pfapp" "--profile safe builds into build/safe"
+run "$APP" "$COIL" build --profile safe src/main.coil
+expect 0 "wrote build/safe/main" "--profile safe builds a named file into build/safe too"
 run "$APP" ./build/safe/pfapp overflow
 [ "$RC" -ge 128 ] && case "$OUT" in *"panic: integer overflow"*) true ;; *) false ;; esac \
   && ok "the safe profile's coil.safety traps the overflow" \
@@ -173,7 +176,9 @@ expect 0 "workspace check: 2/2 members ok" "check fans out over the members, ski
 run "$WS" "$COIL" build
 expect 0 "workspace build: 1/1 members ok" "build fans out over the members with an entry"
 run "$WS" ./members/cli/build/release/cli
-expect 0 "cli 7" "a member's program calls into a library member"
+expect 0 "cli 7 area 21 version 2" "a member's program calls into a library member, the workspace's dependency and its C code, and its own dependency"
+run "$WS/members/cli" "$COIL" run src/main.coil
+expect 0 "cli 7 area 21 version 2" "a member's file, run from its directory, compiles inside the workspace with both dependencies"
 run "$WS" "$COIL" test
 expect 0 "workspace test: 2/2 members ok" "test runs every member's tests"
 cp "$WS/Coil.toml" "$W/Coil.workspace.toml"
