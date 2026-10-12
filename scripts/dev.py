@@ -40,6 +40,11 @@ def build(args: argparse.Namespace) -> None:
         if Path(compiler).resolve() == output.resolve():
             raise SystemExit("candidate output must not overwrite the stage0 compiler")
         stamp = toolchain_stamp.stamp_text()
+        # The compiler links the hosted HTTP client, whose bundled curl archives
+        # are found beside the compiling binary in build/bin/native. A fresh
+        # checkout or worktree has none; the bootstraps provide them through
+        # stage-lib.sh, and a candidate build needs them just the same.
+        execute(str(ROOT / "scripts/native/build-curl.sh"))
         execute(sys.executable, str(ROOT / "scripts/compiler/stage0.py"), compiler,
                 "build", str(ROOT / "src/compiler/main.coil"), "-o", str(output),
                 *llvm_flags("dynamic"))
