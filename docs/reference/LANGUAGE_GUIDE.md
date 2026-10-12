@@ -81,7 +81,7 @@ area 10
 | Characters (an integer byte value) | `#\a`, `#\space`, `#\newline`, `#\tab`, `#\u41` |
 | Strings: `(slice u8)`, UTF-8, static storage | `"hello\n"`, `"\x1f603;"` |
 | C strings: `(ptr i8)`, NUL-terminated | `c"hello"` |
-| Keywords: `Keyword` | `:fast` |
+| Keywords: `Keyword`; `{}` and `{:?}` print one as written | `:fast` |
 | `(ptr T)`, `(slice T)`, `(array T N)`, `(fnptr c [Args…] R)` | |
 
 An integer literal takes its width from context. A literal that does not fit its
