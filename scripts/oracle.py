@@ -11,7 +11,10 @@ way and compares stdout and the exit status with tests/corpus/reference/:
 tests/corpus/corpus.txt lists the programs. After the file name come options:
 `safety` and `meta-interp` put a program in those lanes (`--all` runs every
 program there), `interp-refused=TEXT` says the interpreter must refuse it with a
-diagnostic containing TEXT, and everything after `--` is the program's argv.
+diagnostic containing TEXT, `safety-fails=TEXT` records a known compiler bug that
+makes its coil.safety build fail with TEXT (the lane checks the failure is still
+that one, so fixing the bug turns it red until the marker goes), and everything
+after `--` is the program's argv.
 
 diag: tests/diag/{compile,link,no-hang}/*.coil and their goldens in reference/.
 `compile` and `no-hang` run `coil check`; `link` runs `coil build`. A golden holds
@@ -48,6 +51,7 @@ class Program:
     safety: bool = False
     meta_interp: bool = False
     interp_refused: str | None = None
+    safety_fails: str | None = None
     args: list[str] = field(default_factory=list)
 
     @property
@@ -73,6 +77,8 @@ def read_corpus() -> list[Program]:
                 program.meta_interp = True
             elif option.startswith("interp-refused="):
                 program.interp_refused = option.split("=", 1)[1]
+            elif option.startswith("safety-fails="):
+                program.safety_fails = option.split("=", 1)[1]
             else:
                 raise SystemExit(f"corpus.txt: unknown option {option!r} for {words[0]}")
         if not (ROOT / program.source).is_file():
@@ -164,6 +170,17 @@ def corpus(compiler: str, lane: str, everything: bool, only: list[str] | None) -
                     print(f"FAIL {program.stem}: the interpreter must refuse it with "
                           f"{program.interp_refused!r}; exit {result.returncode}\n"
                           + result.stderr.decode(errors="replace")[-1500:])
+                continue
+            if lane == "safety" and program.safety_fails is not None:
+                outcome = run_program(compiler, program, lane, scratch)
+                if isinstance(outcome, str) and program.safety_fails in outcome:
+                    print(f"ok   {program.stem} [safety] still fails with the known bug: "
+                          f"{program.safety_fails!r}")
+                else:
+                    failures += 1
+                    print(f"FAIL {program.stem} [safety]: corpus.txt says its coil.safety build fails "
+                          f"with {program.safety_fails!r}, and it no longer does; if the bug is fixed, "
+                          "remove the safety-fails marker\n" + (outcome if isinstance(outcome, str) else ""))
                 continue
             outcome = run_program(compiler, program, lane, scratch)
             if isinstance(outcome, str):
