@@ -586,7 +586,7 @@ CASES
     *) bad "safety: a panic prints the stack trace" "$out" ;;
   esac
   if [ "$HOST_OS" = Darwin ]; then
-    expect_out "coil\.safety\.runtime\.finish! .*main \+" "safety: the trace reaches main" \
+    expect_out "coil\.panic\.finish! .*main \+" "safety: the trace reaches main" \
       sh -c "'$T/safety-checks' index 2>&1 | tr '\n' ' '"
   fi
 else

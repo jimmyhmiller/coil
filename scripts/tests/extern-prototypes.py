@@ -125,6 +125,10 @@ def extern_signature(form):
             k += 1
         elif isinstance(x, list) and items(x)[:1] == ["->"]:
             ret = type_class(items(x)[1]) if len(items(x)) > 1 else "void"
+            # A function that never returns has a void C return (resolve.coil's
+            # extern-abi-ret-eq): `(extern abort … (-> never))` is C's void abort().
+            if ret == "never":
+                ret = "void"
             k += 1
         else:
             k += 1
