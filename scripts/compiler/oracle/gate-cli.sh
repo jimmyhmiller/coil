@@ -798,6 +798,11 @@ cmp -s "$T/fmt-defcc.want" "$T/fmt-defcc.got" \
 cmp -s tests/compiler/formatter_vertical_spacing_expected.coil "$T/vertical-spacing.got" \
   && ok "fmt canonicalizes top-level spacing and keeps leading comments attached" \
   || bad "fmt top-level vertical spacing" "$(diff -u tests/compiler/formatter_vertical_spacing_expected.coil "$T/vertical-spacing.got")"
+"$COIL" fmt tests/compiler/formatter_layout_input.coil > "$T/layout.got"
+cmp -s tests/compiler/formatter_layout_expected.coil "$T/layout.got" \
+  && ok "fmt lays out for/block/scope/try/case, methods, deftest and long return types" \
+  || bad "fmt layout rules" "$(diff -u tests/compiler/formatter_layout_expected.coil "$T/layout.got")"
+expect_rc 0 "fmt layout fixture is a fixpoint" "$COIL" fmt --check tests/compiler/formatter_layout_expected.coil
 printf '; one-line file header\n(module header)\n' > "$T/fmt-header.want"
 "$COIL" fmt - < "$T/fmt-header.want" > "$T/fmt-header.got"
 cmp -s "$T/fmt-header.want" "$T/fmt-header.got" \

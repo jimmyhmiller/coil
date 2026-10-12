@@ -46,7 +46,9 @@ Indentation is always normalized.
 
 At the top level, forms are separated by one empty line, following the Clojure
 style guide. Coil's separate `module` and `import` forms are treated as one compact
-namespace header. A leading comment block stays attached to the form it documents.
+namespace header. A leading comment block stays attached to the form it documents; one the
+author separated from the form by a blank line is a section comment and keeps
+that blank line.
 
 ## Layout conventions
 
@@ -58,7 +60,14 @@ Per the Clojure style guide, the head symbol decides how a broken form lines up:
 | macro / body form — 2-space body indent | `(when test`<br>`  body)` |
 | `defn` — signature on the head line, body +2 | `(defn f [x] (-> i64)`<br>`  body)` |
 | `let`/`loop`/… — binding vector laid out in **pairs** | `(let [a 1`<br>`      b 2]`<br>`  body)` |
-| `cond`/`case` — clauses in **pairs**, aligned | `(cond t1 r1`<br>`      t2 r2)` |
+| `cond` — clauses in **pairs**, aligned | `(cond t1 r1`<br>`      t2 r2)` |
+| `case` — scrutinee on the head line, one clause pair per line at +2 | `(case n`<br>`  0 "zero"`<br>`  "many")` |
+| `for PATTERN COLL` — pattern and collection on the head line, body +2 | `(for x xs`<br>`  body)` |
+| `block`/`scope` (after the label), `try`, `defer` — one body form hangs on the head line, several go +2 | `(block :found`<br>`  (for …)`<br>`  0)` |
+| `impl`/`deftrait` methods, `fn` — laid out like a `defn`, the name as head | `(impl Drop T`<br>`  (drop [(t T)] (-> void)`<br>`    body))` |
+| `deftest`/`defprop` — name (and parameters) on the head line, body +2 | `(deftest name`<br>`  body)` |
+| a `(-> ret)` that does not fit after the parameters — its own line at +2, joined | `(defn f [params…]`<br>`  (-> (Result T E))`<br>`  body)` |
+| a vector of numbers, symbols or keywords — filled like a paragraph | `[1 2 3 … 23`<br>` 24 25]` |
 
 A comment is always the last thing on its line: nothing is ever joined onto a
 line after a comment.
