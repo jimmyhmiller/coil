@@ -4418,6 +4418,57 @@ cmp -s "$T/lint/comments.coil" "$T/lint/comments.fixed" \
   && ok "lint --fix (comments): the result is already fmt-clean" \
   || bad "lint --fix (comments): the result is already fmt-clean" "coil fmt would rewrite it"
 
+# A comment belongs to the node it was written in front of, wherever the rewrite
+# puts that node. The result-flow fix emits the Ok body AFTER the Err fallback, and
+# the comment above the body used to land in front of the fallback.
+cat > "$T/lint/arms.coil" <<'EOF'
+(module arms)
+(import "coil.try" :use [try try-or!])
+(defn parse [(x i64)] (-> (Result i64 i64)) (if (> x 0) (Ok x) (Err 1)))
+(defn f [(x i64)] (-> i64)
+  (match (parse x)
+    (Ok [v]
+        ;; about the body
+        (* v 2))
+    (Err [_]
+         ;; about the fallback
+         0)))
+(defn main [] (-> i64) (f 3))
+EOF
+"$COIL" lint "$T/lint/arms.coil" --fix >/dev/null 2>&1
+arms=$(cat "$T/lint/arms.coil")
+arms_body=$(grep -A1 'about the body' "$T/lint/arms.coil" | tail -1)
+arms_fallback=$(grep -A1 'about the fallback' "$T/lint/arms.coil" | tail -1)
+case "$arms" in
+  *try-or!*)
+    case "$arms_body$arms_fallback" in
+      *"(* v 2)"*0*) ok "lint --fix: a comment stays with the arm body it was written above" ;;
+      *) bad "lint --fix: a comment stays with the arm body it was written above" "$arms" ;;
+    esac ;;
+  *) bad "lint --fix: a comment stays with the arm body it was written above" "the fix was not applied: $arms" ;;
+esac
+expect_rc 6 "lint --fix: the commented result match behaves identically after" \
+  "$COIL" run "$T/lint/arms.coil"
+# A comment in front of an arm the rewrite takes apart goes with the first node the
+# rewrite keeps from that arm (here the Ok binder), never with a later arm's.
+cat > "$T/lint/identity.coil" <<'EOF'
+(module identity)
+(import "coil.try" :use [try try-or!])
+(defn parse [(x i64)] (-> (Result i64 i64)) (if (> x 0) (Ok x) (Err 1)))
+(defn g [(x i64)] (-> i64)
+  (match (parse x)
+    ;; about the Ok arm
+    (Ok [v] v)
+    (Err [_] 0)))
+(defn main [] (-> i64) (g 4))
+EOF
+"$COIL" lint "$T/lint/identity.coil" --fix >/dev/null 2>&1
+identity_next=$(grep -A1 ';; about the Ok arm' "$T/lint/identity.coil" | tail -1)
+case "$identity_next" in
+  *"v (try-or!"*) ok "lint --fix: a comment on a taken-apart arm stays with what is kept of it" ;;
+  *) bad "lint --fix: a comment on a taken-apart arm stays with what is kept of it" "$(cat "$T/lint/identity.coil")" ;;
+esac
+
 # A rule whose fix does not compile must leave the file byte-identical. Fail-closed is
 # the whole reason --fix is allowed near anyone's source.
 cat > "$T/lint/badrule.coil" <<'EOF'
