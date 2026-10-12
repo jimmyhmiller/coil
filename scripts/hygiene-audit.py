@@ -96,6 +96,9 @@ def justification(path: str, op: str, line: str) -> str:
                      or "(primitive/code-symbol (if (load collision) name leaf))" in line)):
             return "module-alias datum compared with import clauses or passed to the binding-aware qualification planner; never a lexical binder"
         if (path == "src/stdlib/lints/primitives.coil"
+                and "names/ln-reaches?" in line):
+            return "operator-name datum compared with a call head and then resolved through names/ln-reaches? against coil.core; never a lexical binder"
+        if (path == "src/stdlib/lints/primitives.coil"
                 and "names/ln-spelling-at node" in line):
             return "candidate qualified operator-name data validated at the authored reference by ln-spelling-at before proposing a replacement; never a lexical binder"
         if (path == "src/stdlib/meta.coil"
@@ -119,8 +122,6 @@ def justification(path: str, op: str, line: str) -> str:
             return "guest syntax datum a stage entry returns, matched structurally by the next transform round rather than resolved"
         if path.endswith("lints/no_star_imports.coil") or path.endswith("lints/names.coil"):
             return "module-name datum read out of an import declaration for comparison and for the rewritten :use list; never a lexical identifier"
-        if path.endswith("jit_reload.coil") and '(primitive/code-symbol ":" binder)' in line:
-            return "keyword datum for a :params annotation, spelled from the parameter's binder; a keyword is never a lexical identifier"
     return ""
 
 

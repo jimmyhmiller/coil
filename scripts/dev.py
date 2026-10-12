@@ -41,6 +41,11 @@ def build(args: argparse.Namespace) -> None:
         if Path(compiler).resolve() == output.resolve():
             raise SystemExit("candidate output must not overwrite the stage0 compiler")
         stamp = toolchain_stamp.stamp_text()
+        # The compiler links the hosted HTTP client, whose bundled curl archives
+        # are found beside the compiling binary in build/bin/native. A fresh
+        # checkout or worktree has none; the bootstraps provide them through
+        # stage-lib.sh, and a candidate build needs them just the same.
+        execute(str(ROOT / "scripts/native/build-curl.sh"))
         execute(sys.executable, str(ROOT / "scripts/compiler/stage0.py"), compiler,
                 "build", str(ROOT / "src/compiler/main.coil"), "-o", str(output),
                 *llvm_flags("dynamic"))
@@ -416,6 +421,10 @@ def test(args: argparse.Namespace) -> None:
         # Local only, not in CI: run it before installing a codegen change.
         execute(sys.executable, "scripts/tests/aggregate-ir-scan.py", compiler,
                 *(["--all"] if args.all_sources else []))
+    elif args.suite == "self-build-memory":
+        # Local only, not in CI: a whole -O0 compiler self-build (about 4 GB).
+        # Run it when changing how meta output is expanded.
+        execute(sys.executable, "scripts/tests/self-build-expansion-memory.py", compiler)
     elif args.suite == "const-generics":
         execute(sys.executable, "tests/compiler/const_generic_test.py", "--compiler", compiler)
     elif args.suite == "field-access":
@@ -437,6 +446,7 @@ def test(args: argparse.Namespace) -> None:
         execute(sys.executable, "tests/compiler/extern_scoping_test.py", "--compiler", compiler)
         execute(sys.executable, "tests/compiler/features/authored_gensym_source_guard.py")
         execute(sys.executable, "tests/compiler/features/tagged_form_revision_guard.py")
+        execute(sys.executable, "tests/compiler/meta_suffix_test.py", "--compiler", compiler)
         execute(compiler, "run", "tests/metaprogramming/global_reference_identity.coil")
         execute(sys.executable, "scripts/tests/source-references.py", "--compiler", compiler)
         execute(compiler, "run", "tests/compiler/features/callable_void_return.coil")
@@ -1457,6 +1467,7 @@ source-roots = ["src"]
             lambda: build_run("tests/compiler/features/aggregate_loop_stack.coil", "aggregate-loop-o3", "-O3"),
             lambda: build_run("tests/compiler/features/void_if_discarded.coil", "void-if-discarded"),
             lambda: build_run("tests/compiler/features/void_match_discarded.coil", "void-match-discarded"),
+            lambda: build_run("tests/compiler/features/empty_capture_closure.coil", "empty-capture-closure"),
             lambda: build_run("tests/compiler/features/meta_dependencies.coil", "meta-dependencies", want=14),
             lambda: build_run("tests/compiler/features/meta_resolve_at.coil", "meta-resolve-at", want=17),
             lambda: build_run("tests/compiler/features/meta_provenance.coil", "meta-provenance", want=22),
@@ -1883,7 +1894,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "update", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd", "const-generics", "field-access", "prop", "aggregates", "safety"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "update", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd", "const-generics", "field-access", "prop", "aggregates", "safety", "self-build-memory"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.add_argument("--all-sources", action="store_true",

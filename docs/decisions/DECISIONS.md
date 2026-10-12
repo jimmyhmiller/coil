@@ -296,7 +296,7 @@ arm64 gate-run + gate-cli + gate-diag) and the finding's own repro.
      the length-(-2) invariant break). The panic helper is GENERIC (T inferred from the slice) so
      it is emitted only when instantiated — off, nothing calls it and no byte reaches the output;
      slice.coil gained an `(export …)` list so its private `write` extern can't collide with io's.
-   • **mem-2**: `(debug-allocator inner)` (a NEW bundled module src/stdlib/dbgalloc.coil — kept out of the
+   • **mem-2**: `(debug-allocator inner)` (a NEW bundled module src/stdlib/debug_allocator.coil — kept out of the
      always-loaded alloc.coil, whose concrete hooks mono can't dead-strip) — a macro that is `inner`
      when off, and when on wraps with a `{magic,size}`-header allocator that detects double-free
      (located abort) and poisons freed payloads to 0xDE (quarantining blocks so detection is
