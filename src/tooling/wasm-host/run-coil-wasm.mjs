@@ -135,13 +135,48 @@ function hostMkstemp(templatePtr) {
   return -1;
 }
 
-// This host cannot list a directory (opendir is a stub) or run the guest's atexit
-// handlers, so coil.temp inside the guest can neither sweep nor clean up. The host
-// removes every directory the guest made when node exits instead.
+// This host cannot run the guest's atexit handlers, so coil.temp inside the guest
+// cannot clean up. The host removes every directory the guest made when node exits
+// instead.
 const madeDirectories = [];
 process.on('exit', () => {
   for (const d of madeDirectories) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
 });
+
+// opendir/readdir/closedir over the real filesystem. A handle is a small integer
+// naming the listing taken at opendir; readdir hands back one `struct dirent` per
+// entry in a buffer owned by the handle, in the layout coil.fs reads for a target
+// that is not Linux (the wasm targets): `d_type` at byte 20, `d_name` from byte 21.
+const DIRENT_TYPE_OFFSET = 20, DIRENT_NAME_OFFSET = 21, DT_DIR = 4, DT_REG = 8;
+const dirHandles = new Map();
+let nextDirHandle = 1n;
+function hostOpendir(p) {
+  try {
+    const entries = fs.readdirSync(cstr(p), { withFileTypes: true });
+    const handle = nextDirHandle++;
+    dirHandles.set(handle, { entries, next: 0, buf: 0n });
+    return handle;
+  } catch (e) { hostFail(e); return 0n; }
+}
+function hostReaddir(handle) {
+  const d = dirHandles.get(BigInt(handle));
+  if (!d || d.next >= d.entries.length) return 0n;
+  const entry = d.entries[d.next++];
+  const name = Buffer.from(entry.name + '\0');
+  if (d.buf !== 0n) hostFree(d.buf);
+  d.buf = malloc(BigInt(DIRENT_NAME_OFFSET + name.length));
+  u8().fill(0, Number(d.buf), Number(d.buf) + DIRENT_NAME_OFFSET);
+  u8()[Number(d.buf) + DIRENT_TYPE_OFFSET] = entry.isDirectory() ? DT_DIR : entry.isFile() ? DT_REG : 0;
+  writeBytes(d.buf + BigInt(DIRENT_NAME_OFFSET), name);
+  return d.buf;
+}
+function hostClosedir(handle) {
+  const d = dirHandles.get(BigInt(handle));
+  if (!d) return -1;
+  if (d.buf !== 0n) hostFree(d.buf);
+  dirHandles.delete(BigInt(handle));
+  return 0;
+}
 
 function hostMkdtemp(templatePtr) {
   const template = cstr(templatePtr);
@@ -429,7 +464,7 @@ const env = {
   fopen:(p,mode)=>{ try{return BigInt(fs.openSync(cstr(p), cstr(mode).includes('w')?'w':'r'));}catch{return 0n;} },
   fclose:(f)=>{ if(Number(f)>2){try{fs.closeSync(Number(f));}catch{}} return 0; },
   fwrite:(ptr,sz,nm,f)=>{ const n=Number(sz)*Number(nm); doWrite(Number(f),ptr,BigInt(n)); return BigInt(nm); },
-  opendir:(p)=>0n, readdir:()=>0n, closedir:(d)=>0,
+  opendir:hostOpendir, readdir:hostReaddir, closedir:hostClosedir,
   getcwd:(b,sz)=>{ const r=Buffer.from(process.cwd()+'\0'); writeBytes(b,r); return b; },
   getenv:hostGetenv, setenv:hostSetenv, unsetenv:hostUnsetenv,
   isatty:()=>0,

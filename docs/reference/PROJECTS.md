@@ -177,6 +177,10 @@ apps/cli/Coil.toml                [package] name = "cli", entry = "src/main.coil
 apps/cli/src/main.coil            (module tools.cli.main) (import "tools.parser.syntax")
 ```
 
+- `members` lists member directories relative to the root. An entry with `*`
+  is a pattern: it takes every matching directory that holds a `Coil.toml` and
+  skips any other (a `docs/` beside the packages). An entry without `*` names
+  one member, and it is an error if that directory has no `Coil.toml`.
 - Each member's modules are named `<workspace>.<package>.<more>`. Package
   `parser` owns `tools.parser.syntax`, and a module named exactly
   `tools.parser` is an error, reported at its path.

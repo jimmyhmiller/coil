@@ -1258,6 +1258,27 @@ EOF
   && [ -x "$T/workspace/members/app/build/release/app" ] \
   && ok "workspace build fans out over executable members" \
   || bad "workspace build" "member executable was not produced"
+# A member pattern skips a directory that is not a package; a member named outright
+# must be one, and the error points at the `members` line and names it.
+mkdir -p "$T/workspace/members/notes"
+printf 'not a package\n' > "$T/workspace/members/notes/README.txt"
+( cd "$T/workspace" && "$COIL" check >/dev/null 2>&1 ) \
+  && ok "workspace: a member glob skips a directory without a Coil.toml" \
+  || bad "workspace: a member glob skips a directory without a Coil.toml" "check failed"
+cp "$T/workspace/Coil.toml" "$T/workspace/Coil.toml.glob"
+printf '[workspace]\nname = "demo"\nmembers = ["members/app", "members/util", "members/notes"]\n' \
+  > "$T/workspace/Coil.toml"
+expect_rc 1 "workspace: an explicit member without a Coil.toml is an error" \
+  sh -c "cd '$T/workspace' && '$COIL' check"
+expect_out "Coil.toml:3: .*'members/notes' has no Coil.toml" \
+  "workspace: the member error is located at the members line and names the member" \
+  sh -c "cd '$T/workspace' && '$COIL' check"
+printf '[workspace]\nname = "demo"\nmembers = ["members/app", "members/gone"]\n' > "$T/workspace/Coil.toml"
+expect_out "Coil.toml:3: .*'members/gone' is not a directory" \
+  "workspace: a missing explicit member is located and named" \
+  sh -c "cd '$T/workspace' && '$COIL' check"
+mv "$T/workspace/Coil.toml.glob" "$T/workspace/Coil.toml"
+rm -rf "$T/workspace/members/notes"
 
 echo "== manifest secondary Coil artifacts =="
 mkdir -p "$T/secondary-artifact/src/runtime"
