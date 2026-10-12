@@ -40,7 +40,7 @@ S1="$RUN_DIR/coil-lrb1"; S2="$RUN_DIR/coil-lrb2"
 
 libdir="${COIL_LLVM_LIBDIR:-}"
 if [ -z "$libdir" ]; then
-  for lc in llvm-config-21 /usr/src/stdlib/llvm-21/bin/llvm-config llvm-config; do
+  for lc in llvm-config-21 /usr/lib/llvm-21/bin/llvm-config llvm-config; do
     if command -v "$lc" >/dev/null 2>&1; then libdir="$("$lc" --libdir)"; break; fi
   done
 fi

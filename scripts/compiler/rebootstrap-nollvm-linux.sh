@@ -45,7 +45,7 @@ stage0_libs=$(ldd "$STAGE0" 2>/dev/null)
 if grep -qi llvm <<<"$stage0_libs"; then
   libdir="${COIL_LLVM_LIBDIR:-}"
   if [ -z "$libdir" ]; then
-    for d in /usr/src/stdlib/llvm-21/lib /usr/src/stdlib/x86_64-linux-gnu; do
+    for d in /usr/lib/llvm-21/lib /usr/lib/x86_64-linux-gnu; do
       { [ -e "$d/libLLVM.so" ] || [ -e "$d/libLLVM-21.so" ]; } && { libdir="$d"; break; }
     done
   fi
