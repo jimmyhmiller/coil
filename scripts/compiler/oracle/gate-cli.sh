@@ -3274,6 +3274,18 @@ expect_out "0 tests matched" "coil test --filter: an empty selected set is clear
   "$COIL" test "$T/noimp.coil" --filter no-such-test
 expect_rc 2 "coil test --filter: a missing substring is rejected" \
   "$COIL" test "$T/noimp.coil" --filter
+# Runner options take `--name=VALUE` as TESTING.md documents, `--verbose=N` included,
+# and may come before the file.
+expect_out "1 passed; 0 failed" "coil test --filter=VALUE: the = spelling selects" \
+  "$COIL" test "$T/noimp.coil" --filter=b
+expect_rc 0 "coil test --verbose=1: the documented level spelling is accepted" \
+  "$COIL" test "$T/noimp.coil" --verbose=1
+expect_rc 2 "coil test --verbose=x: a level that is not a number is rejected" \
+  "$COIL" test "$T/noimp.coil" --verbose=x
+expect_out "1 passed; 0 failed" "coil test: runner options before the file" \
+  "$COIL" test --filter b "$T/noimp.coil"
+expect_out "0 tests matched" "coil test --filter: a value with a space stays one argument" \
+  "$COIL" test "$T/noimp.coil" --filter "a b"
 cat > "$T/filter-prop.coil" <<'EOF'
 (module filter_prop)
 (import "coil.prop" :use *)

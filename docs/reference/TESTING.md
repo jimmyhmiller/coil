@@ -191,7 +191,8 @@ note them:
 
 ### Runner options
 
-Pass these after the file name. Everything else goes to the build.
+Pass these with the file name, as `--cases 5000` or `--cases=5000`. Everything
+else goes to the build.
 
 | Flag | Default | Meaning |
 |---|---|---|
