@@ -1500,6 +1500,8 @@ source-roots = ["src"]
                                       "def_reads_def_rejected.coil:4:14"),
             lambda: expect_diagnostic("tests/compiler/features/if_let_irrefutable_rejected.coil",
                                       "if-let: a name or struct pattern always matches"),
+            lambda: expect_diagnostic("tests/compiler/features/builtin_type_name_rejected.coil",
+                                      "'Code' is a built-in type, so a sum can't take its name; choose another"),
             result_flow_fix_task,
             primitive_spelling_task,
             lambda: build_run("src/examples/bitfields.coil", "static-assert", *backend_flags, want=42),
