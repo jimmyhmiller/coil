@@ -10,8 +10,8 @@ way and compares stdout and the exit status with tests/corpus/reference/:
 
 tests/corpus/corpus.txt lists the programs. After the file name come options:
 `safety` and `meta-interp` put a program in those lanes (`--all` runs every
-program there), `interp-refused=TEXT` says the interpreter must refuse it with a
-diagnostic containing TEXT, `safety-fails=TEXT` records a known compiler bug that
+program there), `interp-refused=TEXT` and `x64-refused=TEXT` say that lane must
+refuse it (by design) with a diagnostic containing TEXT, `safety-fails=TEXT` records a known compiler bug that
 makes its coil.safety build fail with TEXT (the lane checks the failure is still
 that one, so fixing the bug turns it red until the marker goes), and everything
 after `--` is the program's argv.
@@ -50,7 +50,7 @@ class Program:
     source: str
     safety: bool = False
     meta_interp: bool = False
-    interp_refused: str | None = None
+    refused: dict[str, str] = field(default_factory=dict)  # lane -> the refusal's text
     safety_fails: str | None = None
     args: list[str] = field(default_factory=list)
 
@@ -75,8 +75,9 @@ def read_corpus() -> list[Program]:
                 program.safety = True
             elif option == "meta-interp":
                 program.meta_interp = True
-            elif option.startswith("interp-refused="):
-                program.interp_refused = option.split("=", 1)[1]
+            elif option.startswith(("interp-refused=", "x64-refused=")):
+                lane, text = option.split("=", 1)
+                program.refused[lane.removesuffix("-refused")] = text
             elif option.startswith("safety-fails="):
                 program.safety_fails = option.split("=", 1)[1]
             else:
@@ -159,17 +160,19 @@ def corpus(compiler: str, lane: str, everything: bool, only: list[str] | None) -
     with tempfile.TemporaryDirectory(prefix="coil-corpus-", dir=os.environ.get("COIL_TEST_SCRATCH")) as raw:
         scratch = Path(raw)
         for program in programs:
-            if lane == "interp" and program.interp_refused is not None:
-                result = subprocess.run([compiler, "interp", program.source, *program.args], cwd=ROOT,
-                                        env=lane_env(lane), stdin=subprocess.DEVNULL,
-                                        capture_output=True, timeout=RUN_TIMEOUT)
-                if result.returncode != 0 and program.interp_refused.encode() in result.stderr:
-                    print(f"ok   {program.stem} (refused by the interpreter, as it must be)")
+            if lane in program.refused:
+                outcome = run_program(compiler, program, lane, scratch)
+                text = program.refused[lane]
+                if isinstance(outcome, str):
+                    refused = text in outcome
+                else:
+                    refused = outcome[2] != 0 and text.encode() in outcome[1]
+                if refused:
+                    print(f"ok   {program.stem} [{lane}] refused, as it must be")
                 else:
                     failures += 1
-                    print(f"FAIL {program.stem}: the interpreter must refuse it with "
-                          f"{program.interp_refused!r}; exit {result.returncode}\n"
-                          + result.stderr.decode(errors="replace")[-1500:])
+                    detail = outcome if isinstance(outcome, str) else outcome[1].decode(errors="replace")
+                    print(f"FAIL {program.stem} [{lane}]: must be refused with {text!r}\n{detail[-1500:]}")
                 continue
             if lane == "safety" and program.safety_fails is not None:
                 outcome = run_program(compiler, program, lane, scratch)
