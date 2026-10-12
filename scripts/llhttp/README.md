@@ -12,13 +12,12 @@ During the migration, upstream C llhttp is retained only as a differential
 oracle. It is not part of the final Coil runtime.
 
 Run `scripts/llhttp/regenerate.sh` to download the checksum-pinned `v9.4.3`
-source and regenerate both the state machine and checked-in differential corpus.
+source and regenerate the state machine.
 You may pass an existing checkout to avoid the download; its package version is
 verified. The tag resolves to `45c8699d0ca8431ab366c8706e613b2e2ac62c04`.
 
-`regenerate.sh` reproduces `src/stdlib/llhttp_generated.coil` and
-`tests/llhttp_corpus_generated_test.coil` exactly. Do not edit either by hand;
-change the generator and regenerate.
+`regenerate.sh` reproduces `src/stdlib/llhttp_generated.coil` exactly. Do not
+edit it by hand; change the generator and regenerate.
 
 ## Deliberate divergence from upstream C llhttp
 
@@ -50,5 +49,4 @@ goes when the flag is clear, the `on_header_value` span end followed by
 parser rejects the byte. The patch checks every node and edge of the cycle
 by name and by meaning before it applies, and generation fails if upstream
 changes that shape. When upstream fixes the bug, the check fails and the patch
-should be removed. `tests/llhttp_coil_test.coil`
-(`relaxed-header-value-rejects-nul`) covers the behaviour.
+should be removed.

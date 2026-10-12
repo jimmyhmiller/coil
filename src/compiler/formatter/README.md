@@ -31,8 +31,9 @@ atom/string/number are kept **verbatim**. Blank lines inside forms are preserved
 To check that over the tree: `coil fmt --check` on every `.coil` file must be clean
 after a `--write` pass (idempotence), and `coil dump-read` of a file must match
 `coil dump-read` of its formatted form once spans are stripped (token-equivalence —
-the compiler's own reader, not `fmt`, is the judge). `scripts/compiler/oracle/gate-cli.sh`
-gates the `fmt` CLI contract itself: argv, exit codes, multi-file, `--check`/`--write`.
+the compiler's own reader, not `fmt`, is the judge). The `cli/fmt` step of
+`dev.py test fast` (`scripts/tests/fast/cli.sh fmt`) gates the `fmt` CLI contract
+itself: stdin, `--write`, `--width`, multi-file `--check`, and two layout goldens.
 
 ## Reflow policy (hybrid)
 
@@ -105,8 +106,8 @@ delimiters, and each is balanced on its own. A region that already balances is c
 out byte-for-byte — never analysed, so never "fixed". Column 0 is the resynchronisation
 anchor that survives a wrong depth count, which is exactly what a whole-file
 Parinfer-style pass lacks: after one early defect its running depth is off, and it then
-"corrects" forms downstream that were fine. `tests/repro/paredit-balance-coil` is that
-failure, recorded from a real tool.
+"corrects" forms downstream that were fine. A repair by a real tool, which silently moved
+two `)` out of the next function, was the motivating case.
 
 **Insert-only or delete-only, never a move.** A form short of closers gets closers
 inserted; an unmistakable stray one gets deleted; a form wanting both is refused. Every
@@ -193,12 +194,11 @@ indentation, so write it unindented and indent the rest to suit.
 
 ## Testing
 
-| script | what it establishes |
-|--------|---------------------|
-| `scripts/tests/balance_fuzz.py` | damages one delimiter in known-good tree files and asks whether the tool restores it; the pre-damage file is ground truth, so correctness is byte equality, not judgement. **`diverged` must stay 0** — that is the bucket where the file reads, compiles, and means something else. `--compare paredit-like` scores both; `--kind` isolates a damage shape; `--self-check` proves the Coil scanner and an independent Python one agree on every delimiter. Run it under a CPU ceiling: each mutant may compile several candidates |
-| `scripts/tests/balance_cases.py` | pins the specific decisions, above all the **refusals** — a refusal turning into a repair improves every summary statistic while being the failure the design rejects |
-| `scripts/tests/edit_roundtrip.py` | `--show` then `--replace` with the same bytes, for every form in the tree; the file must be identical. Catches a span off by one, a prefix glyph left outside a node, a comment swallowed at either end |
-| `scripts/tests/edit_cases.py` | the refusals and listings around `edit` |
+`coil balance` and `coil edit` have no automated tests. The scripts that exercised
+them (`scripts/tests/balance_fuzz.py`, `balance_cases.py`, `edit_roundtrip.py` and
+`edit_cases.py`) were run by no gate, and were deleted with the test-suite
+restructure on 2026-10-12; `git log --diff-filter=D -- scripts/tests/balance_fuzz.py`
+finds them. Restore and run them when changing these tools.
 
 ## Known limitations (v1)
 

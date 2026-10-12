@@ -30,7 +30,4 @@ cd "$repo_dir/scripts/llhttp"
 npm ci
 npm run check
 npm run generate -- --upstream "$upstream" --output "$repo_dir/src/stdlib/llhttp_generated.coil"
-npx tsx generate-corpus.ts "$upstream" "$repo_dir/tests/llhttp_corpus_generated_test.coil"
-"$repo_dir/build/bin/coil" fmt --write \
-  "$repo_dir/src/stdlib/llhttp_generated.coil" \
-  "$repo_dir/tests/llhttp_corpus_generated_test.coil"
+"$repo_dir/build/bin/coil" fmt --write "$repo_dir/src/stdlib/llhttp_generated.coil"

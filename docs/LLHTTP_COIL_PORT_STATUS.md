@@ -145,6 +145,11 @@ Span callback error handling matches the upstream wrapper contract: `-1` becomes
 
 ### Smoke tests
 
+> **Removed 2026-10-12.** No gate ran the llhttp smoke, differential or corpus
+> tests below, so they were deleted with the test-suite restructure; the parser
+> is exercised end to end by the `kvserver` example in `dev.py test fast`. The
+> rest of this section is the record of what they covered.
+
 [`tests/llhttp_coil_test.coil`](../tests/llhttp_coil_test.coil) currently exercises:
 
 - a request delivered in one buffer;
