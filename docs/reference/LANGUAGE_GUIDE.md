@@ -362,6 +362,9 @@ parameters of a callable `def`.
   raw pointer.
 - `[1 2 3]` is an `(array i64 3)`. Where Coil expects a `(slice T)`, it borrows the
   array as one.
+- `[]` is empty, so it takes its type from where it stands: a parameter, a return
+  type or an ascription that asks for a `(slice T)` (one of length 0) or an
+  `(array T 0)`. With nothing to say, write `(: [] (slice i64))`.
 - `(zeroed T)`, `(sizeof T)`, `(alignof T)` and `(offsetof T field)` are
   compile-time.
 

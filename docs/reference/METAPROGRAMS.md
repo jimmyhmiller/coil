@@ -100,7 +100,8 @@ using it pays that layout at each level; it is still correct. `code-copy` and
 - **Take Code apart:** `code-count`, `code-nth`, `code-rest`, `code-sym`,
   `code-list?`, `code-sym?`, `code-int?`, `code-keyword?`, `code-str`, `code-eq`.
 - **Build Code:** quote `` ` ``, unquote `~`, splice `~@`, `code-symbol` (make a
-  name from a symbol/string base plus suffix parts — an int part becomes its decimal
+  name from a symbol/string base plus suffix parts — a keyword part is its name
+  without the colon, an int part becomes its decimal
   digits, and a **generic instantiation** base `(Gen A B)`, the same shape
   `code-field-count` accepts, is mangled deterministically (`(Box i64)` → `Box__i64`)
   so `derive` can name a helper over a generic instance), `code-str` (same, yielding a

@@ -75,7 +75,7 @@ NEGATIVE = {
     "bool-array-length": (
         "(defn f [(const N bool)] [(x (array u8 N))] (-> i64) 0)",
         "0",
-        "array length must be a positive integer or an integer value parameter"),
+        "array length must be a non-negative integer or an integer value parameter"),
     "conflicting-lengths": (
         "(defn f [(const N i64)] [(x (array i64 N)) (y (array i64 N))] (-> i64) 0)",
         "(f [1 2] [1 2 3])",
