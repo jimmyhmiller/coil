@@ -309,6 +309,11 @@ integer, `bool` or `Keyword`. It sizes arrays and makes types distinct:
 where the other is expected is a type error. Type positions don't compute:
 `(array T (+ N 1))` is not a type.
 
+An explicit generic argument can name a constant: with `(const LANES 4)`,
+`(width [(const LANES)])` is `(width [(const 4)])`. The constant's value must be
+written as an integer, `true`, `false` or a keyword (or come from a macro that
+expands to one), since generic arguments are read before compile-time code runs.
+
 ### Annotations
 
 Declarations take typed `:key value` annotations between the name and the

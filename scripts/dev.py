@@ -1484,6 +1484,8 @@ source-roots = ["src"]
                                       "the arm (Err [(A [])] ...) can never match"),
             lambda: expect_diagnostic("tests/compiler/features/match_empty_arm_value_rejected.coil",
                                       "match arm has no body, so it yields no value"),
+            lambda: expect_diagnostic("tests/compiler/features/const_generic_computed_rejected.coil",
+                                      "the generic argument (const COMPUTED) names a constant whose value is computed"),
             lambda: expect_diagnostic("tests/compiler/features/wide_literal_untyped_rejected.coil",
                                       "literal 18446744073709551615 does not fit in i64; give it a type that holds it, e.g. (: 18446744073709551615 u64)"),
             lambda: expect_diagnostic("tests/compiler/features/wide_literal_overflow_rejected.coil",
