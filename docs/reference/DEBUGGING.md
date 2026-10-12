@@ -32,11 +32,15 @@ $ coil run app.coil --use coil.safety
 panic: index out of bounds: index 5, len 3
   at app.coil:12:9
 stack trace:
-0   app   0x0000000104f2ca3c coil.safety.runtime.finish! + 124
-1   app   0x0000000104f2c7b4 app.lookup + 80
-2   app   0x0000000104f2c80c app.handle + 44
-3   app   0x0000000104f2c598 main + 80
+0   app   0x0000000104f2ca3c coil.panic.finish! + 124
+1   app   0x0000000104f2c9d0 coil.safety.runtime.fail-index! + 372
+2   app   0x0000000104f2c7b4 app.lookup + 80
+3   app   0x0000000104f2c80c app.handle + 44
+4   app   0x0000000104f2c598 main + 80
 ```
+
+The report is the one `(panic …)` writes ([the language guide](LANGUAGE_GUIDE.md#panics-and-never)),
+and a check that fails while a panic is being reported aborts at once.
 
 On Linux the trace names frames only for symbols the executable exports, and a
 wasm target, which cannot walk its own stack, prints none.

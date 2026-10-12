@@ -346,6 +346,10 @@ New API this project added (all shipped):
   skips the standard library while still linting the user's own modules. (Checkers can't
   call imported string functions — the closure doesn't include them — so `code-from-user?`
   does the check in the compiler and hands the checker a bool.)
+- **`(primitive/code-call-site)` → the macro call being expanded**, as Code, so a macro
+  can say where it was written with `code-file`, `code-line` and `code-col` even when it
+  takes no arguments: `(unreachable)` reports its own location this way. Outside a
+  macro's expansion (in a checker, a transform or compiled code) it is an error.
 - **Asking the compiler about the program.** A checker or transform can ask the
   compiler what the program is, for instance to describe it to another unit (a JIT
   session inside the program, say). `coil.meta` wraps each query:

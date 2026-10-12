@@ -205,6 +205,53 @@ by `return-from`:
 30
 ```
 
+### Panics and never
+
+`(panic "fmt" args…)` formats its message like `println`, writes it to stderr with
+where the panic was written and a stack trace, and aborts. `(unreachable)` is a
+panic saying control reached code the program's logic rules out, and takes an
+optional message the same way:
+
+```coil
+(module example.panic)
+(defsum Light (Red) (Green))
+
+(defn parse-digit [(c u8)] (-> i64)
+  (if (and (>= c #\0) (<= c #\9))
+      (- (cast i64 c) #\0)
+      (panic "not a digit: {}" c)))
+
+(defn next [(l Light) (blocked bool)] (-> Light)
+  (match l
+    (Red [] (if blocked (unreachable "red while blocked") (Green)))
+    (Green [] (Red))))
+
+(defn main [] (-> i64)
+  (println "{}" (parse-digit #\7))
+  (match (next (Red) false) (Green [] (println "green")) (Red [] (println "red")))
+  0)
+```
+
+```output
+7
+green
+```
+
+```text
+panic: not a digit: 120
+  at app.coil:6:7
+stack trace:
+…
+```
+
+Neither returns, so their type is `never`, which fits wherever a value of any type
+is wanted: the `if` above is an `i64`, and no dummy value is needed after a panic.
+A function that does not return declares `(-> never)`, and its body must end in
+something that does not return either: a panic, another `never` call, or a `loop`
+with no `break`. `never` is only a return type; a parameter, field or binding
+can't have it. A C function that does not return can be declared the same way,
+`(extern abort :cc c [] (-> never))`.
+
 ### Destructuring
 
 `let` bindings and function parameters accept patterns:

@@ -10,6 +10,7 @@ import os
 import platform
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -790,6 +791,22 @@ def test_modernize_fast(compiler: str) -> None:
             if result.returncode != want:
                 raise RuntimeError(f"fast modernization gate: {name} returned {result.returncode}, want {want}")
 
+        def panic_report_task() -> None:
+            # A panic's report is stderr and an abort, which the runtime corpus does
+            # not compare: check the message and location of each kind here.
+            source = "tests/compiler/features/panic_report.coil"
+            output = tmp / "panic-report"
+            execute(coil, "build", source, "-o", str(output))
+            for args, want in (([], "panic: not a digit: 120 at 7\n  at tests/compiler/features/panic_report.coil:16:7\n"),
+                               (["a"], "panic: entered unreachable code\n  at tests/compiler/features/panic_report.coil:10:25\n"),
+                               (["a", "b"], "panic: entered unreachable code: green while blocked\n"
+                                            "  at tests/compiler/features/panic_report.coil:11:27\n")):
+                result = subprocess.run([str(output), *args], cwd=ROOT, capture_output=True, text=True)
+                if result.returncode != -signal.SIGABRT or result.stdout != "4\n" \
+                        or not result.stderr.startswith(want):
+                    raise RuntimeError(f"fast modernization gate: panic report {args} was "
+                                       f"exit {result.returncode}, stdout {result.stdout!r}, stderr {result.stderr[:400]!r}")
+
         def aggregate_ir_task() -> None:
             source = "tests/compiler/features/aggregate_loop_stack.coil"
             ir = subprocess.run([coil, "emit-ir", source], cwd=ROOT,
@@ -1500,9 +1517,14 @@ source-roots = ["src"]
                                       "def_reads_def_rejected.coil:4:14"),
             lambda: expect_diagnostic("tests/compiler/features/if_let_irrefutable_rejected.coil",
                                       "if-let: a name or struct pattern always matches"),
+            lambda: expect_diagnostic("tests/compiler/features/never_returns_rejected.coil",
+                                      "function 'never-returns-rejected.give-up' is declared (-> never) but can return: its body ends in a value of type i64"),
+            lambda: expect_diagnostic("tests/compiler/features/never_param_rejected.coil",
+                                      "param 'x': 'never' is only valid as a return type"),
             lambda: expect_diagnostic("tests/compiler/features/builtin_type_name_rejected.coil",
                                       "'Code' is a built-in type, so a sum can't take its name; choose another"),
             result_flow_fix_task,
+            panic_report_task,
             primitive_spelling_task,
             lambda: build_run("src/examples/bitfields.coil", "static-assert", *backend_flags, want=42),
             lambda: build_run("tests/compiler/features/alloc_static_initial.coil",

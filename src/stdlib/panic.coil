@@ -1,0 +1,158 @@
+(module coil.panic)
+(import "coil.primitive" :as primitive)
+(import "coil.safety.checked")
+(import "coil.fmt" :use [fmt])
+(import "coil.io" :use [stderr])
+(import "coil.slice" :use [slice-data slice-len])
+
+;;; Stopping a program that reached a state it cannot continue from.
+;;;
+;;;   (panic "bad {} in {}" value name)   ; formats like println, to stderr
+;;;   (unreachable)                       ; "entered unreachable code"
+;;;   (unreachable "state {}" s)          ; the same, with a message
+;;;
+;;; Both print where they were written and a stack trace, then abort:
+;;;
+;;;   panic: bad 4 in config
+;;;     at src/main.coil:12:9
+;;;   stack trace:
+;;;   …
+;;;
+;;; Neither returns, so their type is `never` and they stand in any position:
+;;; `(if ok v (panic "bad {}" x))` is an `i64` when `v` is. The arguments are
+;;; evaluated, in order, before anything is written.
+;;;
+;;; `coil.safety`'s failed checks report through the same functions, so a panic
+;;; and a failed check look alike, and a second failure while one is being
+;;; reported aborts at once instead of reporting again.
+(export panic unreachable begin! finish! put! put-int! put-trace!)
+
+(provide-core [panic unreachable])
+
+; The report writes with write(2) and formats its own numbers: it runs while the
+; program is in a state it cannot continue from, and under coil.safety a report
+; that ran checked code could fail inside itself. Only the panic's own message
+; goes through coil.fmt, with the in-progress flag already set.
+
+(extern write :cc c [i32 (ptr i8) isize] (-> isize))
+
+(extern abort :cc c [] (-> never))
+
+(defn wasm-target? [] (-> bool)
+  (let [arch (primitive/target-arch)]
+    (or (primitive/code-eq arch `wasm32) (primitive/code-eq arch `wasm64))))
+
+;;; backtrace(3), declared only where it exists: it walks frame records on Darwin
+;;; and DWARF CFI on Linux, and a wasm module cannot walk its own stack at all.
+(defn trace-externs [] (-> Code)
+  (if (wasm-target?)
+      `(do)
+      ; hygiene: the libc symbols the trace below calls enter this module by their C names.
+      `(do (extern ~(primitive/syntax->datum `backtrace) :cc c [(ptr (ptr i8)) i32] (-> i32))
+           (extern ~(primitive/syntax->datum `backtrace_symbols_fd) :cc c [(ptr (ptr i8)) i32 i32]
+                   (-> void)))))
+(meta (trace-externs))
+
+;;; `trace` on a target that has backtrace(3), `0` on one that does not.
+(defn on-native [(trace Code)] (-> Code)
+  (if (wasm-target?) `0 trace))
+
+;;; Write `s` to stderr.
+(defn put! :safety/checked false [(s (slice u8))] (-> i64)
+  (write 2 (cast (ptr i8) (slice-data s)) (cast isize (slice-len s)))
+  0)
+
+;;; Write `v` to stderr in decimal. Digits come off the low end with `%`, whose
+;;; result has the sign of `v`, so each digit is made positive on its own rather
+;;; than negating `v`, which would overflow at the minimum i64.
+(defn put-int! :safety/checked false [(v i64)] (-> i64)
+  (let [buf (primitive/alloc-stack (array u8 24))
+        digits (cast (ptr u8) buf)
+        (mut rest) v
+        (mut at) 24]
+    (loop
+      (let [r (primitive/irem rest 10)
+            d (if (< r 0) (primitive/isub 0 r) r)]
+        (set! at (primitive/isub at 1))
+        (store! (primitive/index digits at) (cast u8 (primitive/iadd d 48)))
+        (set! rest (primitive/idiv rest 10))
+        (when (= rest 0) (break))))
+    (when (< v 0)
+      (set! at (primitive/isub at 1))
+      (store! (primitive/index digits at) (cast u8 45)))
+    (write 2 (cast (ptr i8) (primitive/index digits at)) (cast isize (primitive/isub 24 at)))
+    0))
+
+;;; Whether a panic is already being reported.
+(defn panicking :safety/checked false [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+;;; Start a panic report: write `panic: `. A panic that begins while another is
+;;; being reported -- in a Display impl formatting the message, or a failed
+;;; check inside the report -- aborts at once.
+(defn begin! :safety/checked false [] (-> i64)
+  (let [flag (panicking)]
+    (when (!= (load flag) 0)
+      (put! "\npanic: panicked while reporting a panic\n")
+      (abort))
+    (store! flag 1)
+    (put! "panic: ")
+    0))
+
+;;; Write the stack trace, innermost first, starting with this report's own frames.
+(defn put-trace! :safety/checked false [] (-> i64)
+  (on-native
+    (let [frames (primitive/alloc-stack (array (ptr i8) 64))
+          n (backtrace (cast (ptr (ptr i8)) frames) 64)]
+      (when (> n 0)
+        (put! "stack trace:\n")
+        (backtrace_symbols_fd (cast (ptr (ptr i8)) frames) n 2)
+        0)
+      0)))
+
+;;; Finish a panic report with where it was raised, `file:line:col`, and the
+;;; stack trace, and abort. An empty `at` is a site no source location is known
+;;; for: an operation on a type parameter that coil.safety checks inside
+;;; coil.core's impl.
+(defn finish! :safety/checked false [(at (slice u8))] (-> never)
+  (put! "\n")
+  (if (> (slice-len at) 0)
+      (do (put! "  at ") (put! at) (put! "\n") 0)
+      (do (put! "  in generic code: the operation's source location is not known\n") 0))
+  (put-trace!)
+  (abort))
+
+;;; `file:line:col` of `node`, as a string literal.
+(defn site [(node Code)] (-> Code)
+  (let [text (primitive/code-str (primitive/code-file node) ":" (primitive/code-line node)
+                                 ":" (primitive/code-col node))]
+    `~text))
+
+;;; The report of a panic raised at `at` whose message is the format string `f`
+;;; with `args`. The arguments are bound first, in order, so a panic while one is
+;;; computed is its own panic and not one "while reporting".
+(defn report [(at Code) (f Code) (args Code)] (-> Code)
+  (let [binds (primitive/code-list-new)
+        names (primitive/code-list-new)]
+    (for arg args
+      (let [name (primitive/fresh-identifier "panic-arg")]
+        (primitive/code-list-push! binds name)
+        (primitive/code-list-push! binds arg)
+        (primitive/code-list-push! names name)))
+    `(let [~@(primitive/code-list-done binds)]
+       (begin!)
+       (fmt (stderr) ~f ~@(primitive/code-list-done names))
+       (finish! ~(site at)))))
+
+;;; `(panic "fmt" args…)` -- report the formatted message, where the panic was
+;;; written and the stack trace to stderr, and abort. Its type is `never`.
+(defn panic [(f Code) & (args Code)] (-> Code)
+  (report (primitive/code-call-site) f args))
+
+;;; `(unreachable)` or `(unreachable "fmt" args…)` -- a panic that says control
+;;; reached code the program's logic rules out. Its type is `never`.
+(defn unreachable [& (args Code)] (-> Code)
+  (if (= (len args) 0)
+      (report (primitive/code-call-site) `"entered unreachable code" args)
+      (let [message (primitive/code-str "entered unreachable code: " (get args 0))]
+        (report (primitive/code-call-site) `~message (primitive/code-slice args 1 (len args))))))
