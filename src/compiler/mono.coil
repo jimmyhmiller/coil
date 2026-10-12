@@ -1209,6 +1209,15 @@
         body
         (let [(mut wrapped) (al-new [Expr] a)
               (mut inner) (al-new [Expr] a)]
+          ; The body was checked with each such parameter a VALUE; its name now
+          ; denotes the owning slot, so every use reads the slot, as a concrete
+          ; owner parameter's uses do.
+          (for [k 0 (len (load binds))]
+            (let [name (.name (al-elem [Bind] (mut binds) k))]
+              (unless (starts-with name "$owned.slot.")
+                (for [j 0 (len (load body))]
+                  (owner-param-uses-load! a (al-elem [Expr] body j) name))
+                0)))
           (if (= (len (load body)) (primitive/cast i64 0))
               (push! (mut inner)
                      (mk-expr (EDo (box-al [Expr] a (al-new [Expr] a)))
@@ -1227,6 +1236,48 @@
                           -1
                           0))
           (box-al [Expr] a (load wrapped))))))
+
+;;; Rewrite each use of the variable `name` in `e` to a load of it, except where
+;;; a binding inside `e` shadows it.
+(defn owner-param-uses-load! [(a (dyn Allocator)) (e (ptr Expr)) (name (slice u8))] (-> i64)
+  (match (.kind e)
+    (EVar [n]
+          (when (= n name)
+            (let [place (box-expr a (load e))]
+              (set! (.kind e) (ELoad place))
+              0)))
+    (ELet [binds body]
+          (let [(mut shadowed) false]
+            (for [i 0 (len (load binds))]
+              (unless (load shadowed)
+                (let [bp (al-elem [Bind] binds i)]
+                  (owner-param-uses-load! a (field bp value) name)
+                  (when (= (.name bp) name) (set! shadowed true))
+                  0)))
+            (unless (load shadowed)
+              (for [i 0 (len (load body))]
+                (owner-param-uses-load! a (al-elem [Expr] body i) name)))
+            0))
+    (EMatch [scrut arms]
+            (do
+              (owner-param-uses-load! a scrut name)
+              (for [i 0 (len (load arms))]
+                (let [arm (al-elem [Arm] arms i)]
+                  (unless (block :binds
+                            (for [j 0 (len (load (.binds arm)))]
+                              (when (= (get (load (.binds arm)) j) name) (break :binds true)))
+                            false)
+                    (owner-param-uses-load! a (field arm body) name))
+                  0))
+              0))
+    ; a lifted function's body is its own
+    (EAnonFn [_ _] 0)
+    (_ (let [(mut kids) (al-new [(ptr Expr)] a)]
+         (ownership-children! e (mut kids))
+         (for [i 0 (len kids)]
+           (owner-param-uses-load! a (get kids i) name))
+         0)))
+  0)
 
 ; ---- resolve a function --------------------------
 (defn resolve-func [(m (ptr MonoCtx))
@@ -1289,9 +1340,11 @@
            (try! (instance-c-entry! m gf rtargs mng))
            (Ok (EFnPtrOf mng))))))
 
-;;; Record the by-value C entry of instance `mng` of `gf`, when a parameter
-;;; declared as a bare type parameter is, in this instance, a struct or sum the
-;;; instance takes by reference.
+;;; Record the by-value C entry of instance `mng` of `gf`, when a parameter the
+;;; pointer takes by value -- one declared as a bare type parameter, or one that
+;;; may own (`(Option T)`) -- is, in this instance, a struct or sum the instance
+;;; takes by reference. A parameter the pointer already takes by reference stays
+;;; a reference in the entry.
 (defn instance-c-entry! [(m (ptr MonoCtx))
                          (gf (ptr Func))
                          (rtargs (ptr (ArrayList Type)))
@@ -1304,12 +1357,24 @@
              (mut surface) (al-new [Type] a)
              (mut needed) false]
          (for [i 0 (len (load params))]
-           (let [declared (field (al-elem [Param] params i) ty)
-                 t (try! (resolve-ty m declared smap))
+           (let [pp (al-elem [Param] params i)
+                 declared (field pp ty)
+                 owner (.owned_type pp)
                  bare-param (match (load declared)
                               (TStruct [n] (set-contains tparams n))
-                              (_ false))]
-             (when (and bare-param (by-value-c-entry-param? cx (box-type a t)))
+                              (_ false))
+                 ; A parameter that may own is a struct or sum the pointer takes by
+                 ; value (`(Option T)`), and the body by reference: resolved, it is
+                 ; an instantiated aggregate whatever its arguments are.
+                 owned-aggregate (and (not bare-param)
+                                      (!= (primitive/cast i64 owner) (primitive/cast i64 0))
+                                      (match (load owner)
+                                        (TStruct [_] true)
+                                        (TApp [_ _] true)
+                                        (_ false)))
+                 t (try! (resolve-ty m (if owned-aggregate owner declared) smap))]
+             (when (or owned-aggregate
+                       (and bare-param (by-value-c-entry-param? cx (box-type a t))))
                (set! needed true))
              (push! (mut surface) t)))
          (when (and (load needed)
@@ -1595,7 +1660,8 @@
 (defn adjust-generic-call-abi! [(m (ptr MonoCtx))
                                 (gf (ptr Func))
                                 (rtargs (ptr (ArrayList Type)))
-                                (nargs (ptr (ArrayList Expr)))] (-> (Result i64
+                                (nargs (ptr (ArrayList Expr)))
+                                (first-pass bool)] (-> (Result i64
                                                                             Diag))
   (try (let [a (load (field m a))
              smap (subst-map a (load (field gf type_params)) rtargs)
@@ -1610,7 +1676,19 @@
                    (do
                      (let [pp (al-elem [Param] params (load i))
                            arg (al-elem [Expr] nargs (load i))
-                           owner-type (.owned_type pp)]
+                           owner-type (.owned_type pp)
+                           ; `(Option T)` may own, but this instance may be Copy:
+                           ; then nothing moved, and the argument is a value
+                           ; however it is spelled
+                           instance-owns
+                             (and (!= (primitive/cast i64 owner-type)
+                                      (primitive/cast i64 0))
+                                  (match (resolve-ty m owner-type smap)
+                                    (Ok [t]
+                                        (type-is-affine a
+                                                        (load (field m ownership_cx))
+                                                        (box-type a (ownership-semantic-type m (box-type a t)))))
+                                    (Err [_] true)))]
                        (match (.kind arg)
                          (EMovePlace [place]
                                      (if (match (load (field pp ty))
@@ -1621,8 +1699,24 @@
                                          (set! (.kind arg) (ELoad place)))
                                      0)
                          (_ 0))
-                       (when (and (!= (primitive/cast i64 owner-type)
+                       ; Only the first pass sees arguments as checked: the second
+                       ; (see the caller) sees them already passed by address.
+                       (when (and first-pass
+                                  (!= (primitive/cast i64 owner-type)
                                       (primitive/cast i64 0))
+                                  (not instance-owns)
+                                  (match (load (field pp ty))
+                                    (TPtr [_] true)
+                                    (TRef [_ _] true)
+                                    (_ false)))
+                         ; a place is passed as itself; a value is spilled
+                         (match (.kind arg)
+                           (ELoad [place] (do (set! (.kind arg) (.kind place)) 0))
+                           (ESpillRef [_] 0)
+                           (_ (let [saved (box-expr a (load arg))]
+                                (set! (.kind arg) (ESpillRef saved))
+                                0))))
+                       (when (and instance-owns
                                   (match (load (field pp ty))
                                     (TPtr [_] true)
                                     (TRef [_ _] true)
@@ -1792,7 +1886,8 @@
                                (try! (adjust-generic-call-abi! m
                                                                gf
                                                                rtargs
-                                                               nargs))
+                                                               nargs
+                                                               true))
                                0)
                              (queue-func m func rtargs)
                              (Ok (ECall
@@ -1820,7 +1915,8 @@
                                  (try! (adjust-generic-call-abi! m
                                                                  gf
                                                                  (.args orig)
-                                                                 nargs))
+                                                                 nargs
+                                                                 false))
                                  0)
                                (move-args-to-places! nargs)))
                          (Ok (ECall
