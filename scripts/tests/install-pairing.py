@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """`dev.py install` pairs a compiler only with the library it was built from."""
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import sys
@@ -10,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts" / "compiler"))
 import toolchain_stamp  # noqa: E402
 
-COMPILER = Path(sys.argv[1]).resolve()
+COMPILER = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ["COIL"]).resolve()
 
 
 def install(source: Path, dest: Path) -> subprocess.CompletedProcess:
@@ -51,7 +52,7 @@ with tempfile.TemporaryDirectory(prefix="coil-install-pairing-") as raw:
     older = install(source, dest)
     assert older.returncode != 0 and "refusing to downgrade" in older.stderr, older
     allowed = subprocess.run([sys.executable, str(ROOT / "scripts/dev.py"), "install", "--allow-downgrade",
-                              "--source", str(source), "--dest", str(dest)],
+                              "--source", str(source), "--dest", str(dest), "--no-warm-unit"],
                              cwd=ROOT, text=True, capture_output=True, timeout=600)
     assert allowed.returncode == 0, allowed
 print("install pairing: PASS")
