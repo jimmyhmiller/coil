@@ -596,6 +596,12 @@ CASES
   # A definition's signature declares names; it has no expressions to check. A
   # parameter spelled like a checked operator, `(neg bool)`, used to be rewritten as a
   # call to `neg`, so the program no longer compiled under coil.safety.
+  # The arguments of a named constructor or an out-of-order named call are checked
+  # twice; the second check used to leave `type-of` a `(mut x)` local written in them
+  # as a pointer, which the transform then checked for null by copying it.
+  printf '(module safety-named)\n(defstruct P [(n i64) (ok bool)])\n(defsum S (V [(n i64) (ok bool)]))\n(defn g [(n i64) (ok bool)] (-> i64) n)\n(defn main [] (-> i64)\n  (let [p (P :ok true :n (let [(mut s) 0] (for [j 0 3] (set! s (+ s j)) 0) s))\n        v (V :ok true :n (let [(mut s) 0] (for [j 0 4] (set! s (+ s j)) 0) s))\n        k (g :ok true :n (let [(mut s) 0] (for [j 0 5] (set! s (+ s j)) 0) s))]\n    (println "named: {} {} {}" (.n p) (match v (V [n _] n)) k))\n  0)\n' > "$T/safety-named.coil"
+  expect_out "named: 3 6 10" "safety: a mutable local inside named arguments is a place, not a pointer to check" \
+    "$COIL" run "$T/safety-named.coil" --use coil.safety
   printf '(module safety-names)\n(defstruct Sign [(v i64)])\n(deftrait Flip [Self] (flip [(neg Self)] (-> Self)))\n(impl Flip Sign (flip [(neg Sign)] (-> Sign) (Sign :v (- 0 (.v neg)))))\n(defn pick [(neg bool) (x i64)] (-> i64) (if neg (- 0 x) x))\n(defn main [] (-> i64) (println "names: {} {}" (pick true 5) (.v (flip (Sign :v 7)))) 0)\n' > "$T/safety-names.coil"
   expect_out "names: -5 -7" "safety: a parameter spelled like a checked operator is a declaration, not a call" \
     "$COIL" run "$T/safety-names.coil" --use coil.safety
