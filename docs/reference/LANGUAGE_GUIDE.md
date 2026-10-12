@@ -186,24 +186,59 @@ first multiple of 7: 7
 A form whose value nothing uses is a statement, so `when`, loops, and `if` or
 `match` arms of different types all work in a `void` function.
 
-`scope` with `defer` runs cleanups in reverse order when the scope exits, including
-by `return-from`:
+`(defer cleanup)` guards the forms after it in the body it is written in: the body
+of a function, `let`, `do`, `loop`, `block` or match arm, or of anything that
+expands to one, such as `when`, `for` and `try`. Once control has reached the
+`defer`, `cleanup` runs whenever control leaves that body: by falling off the end,
+by `return-from`, by `break` or `continue` to a loop outside it, or through a macro
+such as `try!` that leaves it. `scope` is a `block` to hang defers on.
 
 ```coil
-(module example.scope)
+(module example.defer)
+(defsum Fault (Missing))
+
+(defn find [(key i64)] (-> (Result i64 Fault))
+  (if (= key 1) (Ok 10) (Err (Missing))))
+
+(defn lookup [(key i64)] (-> (Result i64 Fault))
+  (try
+    (println "open {}" key)
+    (defer (println "close {}" key))
+    (Ok (+ (try! (find key)) 1))))
+
 (defn main [] (-> i64)
   (let [(mut log) 1]
     (scope :work
       (defer (set! log (* log 10)))
       (defer (set! log (+ log 2)))
       (return-from :work 0))
-    (println "{}" log)
-    0))
+    (println "{}" log))
+  (for key (range 1 3)
+    (match (lookup key)
+      (Ok [v] (println "found {}" v))
+      (Err [_] (println "missing {}" key))))
+  0)
 ```
 
 ```output
 30
+open 1
+close 1
+found 11
+open 2
+close 2
+missing 2
 ```
+
+- Cleanups run last-registered first, and an inner body's before an outer one's.
+  They interleave with the drops of owners by where each began: an owner bound
+  before a `defer` is dropped after its cleanup runs.
+- A value leaving the body is computed before the cleanups run, so
+  `(return-from :s n)` delivers `n` as it was, whatever a cleanup then does to it.
+- A `defer` that control never reached registers nothing. One with no forms after
+  it is an error, as is one in a value position such as an `if` branch.
+- A cleanup cannot `break` or `continue` out of itself, and cannot move an owner;
+  it may read one, provided the body has not moved it first.
 
 ### Panics and never
 
