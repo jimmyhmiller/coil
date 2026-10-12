@@ -1156,7 +1156,8 @@ true
 
 - `println`/`print` take a format string. `{}` uses `Display`, `{:?}` compact
   `Debug`, `{:#?}` pretty `Debug`, and `{:x}` hex. A spec can add
-  `[[fill]align][+][0][width][.precision]`: `{:>8}`, `{:.2}`, `{:08.3}`.
+  `[[fill]align][+][0][width][.precision]`: `{:>8}`, `{:.2}`, `{:08.3}`,
+  `{:─^20}`. The fill is any one character; width counts characters.
 - A float's `{}` rounds to at most six decimals (`1.5e-7` prints `0.0`); its `{:?}` is
   the shortest text that reads back as the same value (`0.1`, `1.5e-7`,
   `0.30000000000000004`), unless the spec gives a precision.
