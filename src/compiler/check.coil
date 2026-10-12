@@ -231,7 +231,20 @@
    (place_breaks (ArrayList (ptr Expr)))
    ; `Cx.defer_depth` when the loop was entered: a break to it from deeper runs
    ; the cleanups of the defers in between.
-   (defers i64)])
+   (defers i64)
+   ; Break values that need the loop's type to be checked, `(return-from :try (Err
+   ; e))` before the block's tail has said what that type is.
+   (pending (ArrayList PendingBreak))])
+
+;;; A break value checked once its loop's type is known. `slot` is the value the
+;;; break carries, patched in place; `env` is the scope it was written in.
+(defstruct PendingBreak
+  [(value (ptr Expr))
+   (slot (ptr Expr))
+   (env (ptr (ArrayList EnvEntry)))
+   (err Diag)
+   ; its `pending-break-count`, which orders it among the others
+   (seq i64)])
 
 ; `bid` is the local-binding identity (see comptime.coil binding-map): a fresh id
 ; per let-binding / parameter, so `(primitive/binding-of REF)` distinguishes shadows.
@@ -5247,7 +5260,45 @@
             (_ 0))
           (Ok (mk-synpair a (box-expr a (.e r)) (box-type a (.t r)))))))))
 
+;;; How many break values have waited for their loop's type. A synthesis that
+;;; recorded one is not cached: the value is patched when the loop is popped, and
+;;; a loop whose check fails never patches it, so reusing that result after the
+;;; loop is checked again would reuse an unchecked value.
+(defn pending-break-count [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+;;; A synthesis that failed is discarded with every break value it left waiting:
+;;; the loops still open keep only the ones recorded before it began.
+(defn drop-pending-breaks-since! [(cx (ptr Cx)) (since i64)] (-> i64)
+  (for [i 0 (len (.loops cx))]
+    (let [fr (al-elem [LoopFrame] (field cx loops) i)
+          (mut keep) 0]
+      (for [j 0 (len (field fr pending))]
+        (when (<= (.seq (al-elem [PendingBreak] (field fr pending) j)) since)
+          (al-set! [PendingBreak] (field fr pending) (load keep) (load (al-elem [PendingBreak] (field fr pending) j)))
+          (set! keep (+ (load keep) 1))
+          0))
+      (set! (.len (field fr pending)) (load keep))
+      0))
+  0)
+
 (defn do-synth [(a (dyn Allocator))
+                (e (ptr Expr))
+                (expected (ptr Type))
+                (env (ptr (ArrayList EnvEntry)))
+                (cx (ptr Cx))
+                (tps (ptr (ArrayList (slice u8))))
+                (fname (slice u8))] (-> (Result SynPair Diag))
+  (let [pending (load (pending-break-count))]
+    (match (do-synth-cached a e expected env cx tps fname)
+      (Ok [sp] (Ok [SynPair Diag] sp))
+      (Err [d]
+           (do
+             (when (!= (load (pending-break-count)) pending)
+               (drop-pending-breaks-since! cx pending))
+             (Err [SynPair Diag] d))))))
+
+(defn do-synth-cached [(a (dyn Allocator))
                 (e (ptr Expr))
                 (expected (ptr Type))
                 (env (ptr (ArrayList EnvEntry)))
@@ -5278,12 +5329,14 @@
           (match (get (.synth_cache cx) (load key))
             (Some [sp] (Ok [SynPair Diag] sp))
             (None []
-                  (match (do-synth-recorded a e expected env cx tps fname)
-                    (Err [d] (Err [SynPair Diag] d))
-                    (Ok [sp]
-                        (do
-                          (set! (mut (.synth_cache cx)) (load key) sp)
-                          (Ok [SynPair Diag] sp))))))))))
+                  (let [pending (load (pending-break-count))]
+                    (match (do-synth-recorded a e expected env cx tps fname)
+                      (Err [d] (Err [SynPair Diag] d))
+                      (Ok [sp]
+                          (do
+                            (when (= (load (pending-break-count)) pending)
+                              (set! (mut (.synth_cache cx)) (load key) sp))
+                            (Ok [SynPair Diag] sp)))))))))))
 
 (defn expected-some? [(expected (ptr Type))] (-> bool)
   (!= (primitive/cast i64 expected) (primitive/cast i64 0)))
@@ -7092,7 +7145,9 @@
              (tpset (ptr (ArrayList (slice u8))))
              (subst (ptr (ArrayList SubstEntry)))
              (fname (slice u8))] (-> (Result i64 Diag))
-  (if (and (type-is-void decl) (type-is-void actual))
+  ; An inference hole is a part nothing has determined: it agrees with anything
+  ; and binds nothing.
+  (if (or (and (type-is-void decl) (type-is-void actual)) (inference-hole? actual))
       (Ok [i64 Diag] 0)
       (if (or (type-is-void decl) (type-is-void actual))
           (Err [i64 Diag]
@@ -7683,12 +7738,18 @@
                         (let [slot (al-elem [ArgSlot] arglist j)]
                           (when (load (field slot present))
                             (let [literal (is-literal (load (field slot e)))
+                                  ; `(Some 5)`: a constructor of literals is as weak
+                                  ; a constraint as the literal, and is checked
+                                  ; again at the type the other arguments choose
+                                  ; (`ca-resynth-weak-literals`).
+                                  weak (and (not literal) (weak-literal-arg? cx (load (field slot e))))
                                   decl (al-elem [Type] declared j)
                                   applied (box-type a (subst-apply a decl subst))]
-                              (when (and (= literal (= pass 1))
+                              (when (and (= (or literal weak) (= pass 1))
                                          ; a literal lent to a `(ref T)` parameter is a
                                          ; weak constraint on T just the same
-                                         (not (and literal (numeric (peel-refs applied) tps))))
+                                         (not (and literal (numeric (peel-refs applied) tps)))
+                                         (not (and weak (type-params-bound? decl type_params subst))))
                                 (match (unify a decl (load (field slot t))
                                               type_params subst fname)
                                   (Err [d] (do (store! err d) (store! failed true)))
@@ -9706,6 +9767,8 @@
                 (set! i (primitive/iadd (load i) 1)))))
     (if (load failed) (Err [i64 Diag] (load err)) (Ok [i64 Diag] 0))))
 
+; A type argument still holding an inference hole binds nothing: the
+; constructor infers that parameter from its arguments instead.
 (defn build-subst! [(subst (ptr (ArrayList SubstEntry)))
                     (tparams (ptr (ArrayList (slice u8))))
                     (targs (ptr (ArrayList Type)))] (-> i64)
@@ -9714,9 +9777,11 @@
     (loop (if (>= (load i) n)
               (break)
               (do
-                (subst-insert! subst
-                               (get (load tparams) (load i))
-                               (al-elem [Type] targs (load i)))
+                (unless (type-has-hole? (al-elem [Type] targs (load i)))
+                  (subst-insert! subst
+                                 (get (load tparams) (load i))
+                                 (al-elem [Type] targs (load i)))
+                  0)
                 (set! i (primitive/iadd (load i) 1)))))
     0))
 
@@ -10772,6 +10837,83 @@
                 (if (load failed) (break) (set! i (primitive/iadd (load i) 1))))))
     (if (load failed) (Err [i64 Diag] (load err)) (Ok [i64 Diag] 0))))
 
+(defn with-inference-holes [(a (dyn Allocator))
+                            (tparams (ptr (ArrayList (slice u8))))
+                            (subst (ptr (ArrayList SubstEntry)))] (-> (ptr (ArrayList SubstEntry)))
+  (let [out (subst-new a)]
+    (for [i 0 (len (load subst))]
+      (push! [SubstEntry] out (get (load subst) i)))
+    (for [i 0 (len (load tparams))]
+      (let [tp (get (load tparams) i)]
+        (unless (subst-has subst tp)
+          (subst-insert! out tp (box-type a (inference-hole a tp)))
+          0)))
+    out))
+
+;;; Is this checked argument a literal, or a variant built only of literals
+;;; (`(Some 5)`, `(Ok (Some 2))`)? Its type is the literals' defaults, which say
+;;; nothing about what the call wants.
+(defn weak-literal-arg? [(cx (ptr Cx)) (e (ptr Expr))] (-> bool)
+  (if (is-literal e)
+      true
+      (match (.kind e)
+        (ECall [func _ args]
+               (and (!= (primitive/cast i64 (vts-find cx func)) (primitive/cast i64 0))
+                    (> (len (load args)) (primitive/cast i64 0))
+                    (block :strong
+                      (for [i 0 (len (load args))]
+                        (unless (weak-literal-arg? cx (al-elem [Expr] args i))
+                          (break :strong false)))
+                      true)))
+        (_ false))))
+
+;;; Does every one of `tparams` that `t` mentions already have a binding?
+(defn type-params-bound? [(t (ptr Type))
+                          (tparams (ptr (ArrayList (slice u8))))
+                          (subst (ptr (ArrayList SubstEntry)))] (-> bool)
+  (block :open
+    (for [i 0 (len (load tparams))]
+      (let [tp (get (load tparams) i)]
+        (when (and (type-mentions t tp) (not (subst-has subst tp)))
+          (break :open false))))
+    true))
+
+;;; A literal-built argument (`weak-literal-arg?`) was typed by its literals'
+;;; defaults and did not bind the parameter the others bound. Check it again at the
+;;; parameter's type, so `(= (f) (Some 5))` with `f` an `(Option u32)` makes the 5
+;;; a u32, as a bare literal argument already is.
+(defn ca-resynth-weak-literals [(a (dyn Allocator))
+                                (argl (ptr (ArrayList ArgSlot)))
+                                (sig (ptr Sig))
+                                (subst (ptr (ArrayList SubstEntry)))
+                                (args (ptr (ArrayList Expr)))
+                                (env (ptr (ArrayList EnvEntry)))
+                                (cx (ptr Cx))
+                                (tps (ptr (ArrayList (slice u8))))
+                                (fname (slice u8))] (-> (Result i64 Diag))
+  (try (let [params (subst-apply-list a (load (field sig params)) subst)
+             n (if (< (len (load params)) (len (load argl)))
+                   (len (load params))
+                   (len (load argl)))]
+         (for [i 0 n]
+           (let [sl (al-elem [ArgSlot] argl i)]
+             (when (and (.present sl)
+                        (not (is-literal (.e sl)))
+                        (weak-literal-arg? cx (.e sl)))
+               (let [want (al-elem [Type] params i)
+                     wp (match (load want)
+                          (TRef [_ inner] inner)
+                          (_ want))]
+                 (unless (type-eq (peel-refs (.t sl)) wp)
+                   (let [sp (primitive/alloc-stack SynPair)]
+                     (set! sp (try! (do-synth a (al-elem [Expr] args i) wp env cx tps fname)))
+                     (set! (.e sl) (load (field sp e)))
+                     (set! (.t sl) (load (field sp t)))
+                     0))
+                 0))
+             0))
+         (Ok [i64 Diag] 0))))
+
 (defn ca-resynth-deferred [(a (dyn Allocator))
                            (defs (ptr (ArrayList Deferred)))
                            (argl (ptr (ArrayList ArgSlot)))
@@ -10782,7 +10924,12 @@
                            (cx (ptr Cx))
                            (tps (ptr (ArrayList (slice u8))))
                            (fname (slice u8))] (-> (Result i64 Diag))
-  (let [params (subst-apply-list a (load (field sig params)) subst)
+  ; A type parameter no other argument bound is an inference hole in the
+  ; parameter type, not the callee's own name for it: the deferred argument
+  ; supplies that part (`(map-err r (fn [e] (W e)))` binds F from the body).
+  (let [params (subst-apply-list a
+                                 (load (field sig params))
+                                 (with-inference-holes a (load (field sig type_params)) subst))
         n (len (load defs))
         (mut i) 0
         (mut err) (primitive/zeroed Diag)
@@ -11375,6 +11522,15 @@
                                             ehi
                                             esrc
                                             ectxt))
+                     (try! (ca-resynth-weak-literals a
+                                                     argl
+                                                     sig
+                                                     subst
+                                                     args
+                                                     env
+                                                     cx
+                                                     tps
+                                                     fname))
                      (let [new_args
                              (try! (ca-final-coerce a
                                                     argl
@@ -13240,6 +13396,7 @@
           (if (expected-some? expected) (Some (load expected)) (None [Type])))
     (set! (.place_breaks fr) (al-new [(ptr Expr)] a))
     (set! (.defers fr) (.defer_depth cx))
+    (set! (.pending fr) (al-new [PendingBreak] a))
     (push! [LoopFrame] (field cx loops) (load fr)))
   (let [n (len (load body))
         (mut i) 0
@@ -13264,13 +13421,22 @@
                                (load (load (field sp
                                                   e)))))))
                 (set! i (primitive/iadd (load i) 1)))))
-    (let [popped (pop! [LoopFrame] (field cx loops))]
+    (let [(mut popped) (pop! [LoopFrame] (field cx loops))]
+      (when (not (load failed))
+        (match (load popped)
+          (Some [pf]
+                (let [pfp (primitive/alloc-stack LoopFrame)]
+                  (set! pfp pf)
+                  (match (check-pending-breaks! a pfp cx tps fname)
+                    (Err [d] (do (set! err d) (set! failed true) 0))
+                    (Ok [_] (do (set! popped (Some (load pfp))) 0)))))
+          (None [] 0)))
       (if (load failed)
           (Err [Type Diag] (load err))
           (let [(mut lty) (TNever)]
             (if (expected-some? expected)
                 (set! lty (load expected))
-                (match popped
+                (match (load popped)
                   (Some [pf]
                         (let [pfp (primitive/alloc-stack LoopFrame)]
                           (set! pfp pf)
@@ -13311,6 +13477,63 @@
            (field (al-elem [LoopFrame] (field cx loops) idx) place_breaks)
            valexpr)
     0))
+
+; The value type a break into a loop of type `bt` delivers: a loop that has only
+; carried places so far joins a value at the place's type.
+(defn break-value-type [(bt Type)] (-> Type)
+  (match bt (TRef [_ inner] (load inner)) (_ bt)))
+
+(defn env-snapshot [(a (dyn Allocator)) (env (ptr (ArrayList EnvEntry)))] (-> (ptr (ArrayList EnvEntry)))
+  (let [(mut out) (al-new [EnvEntry] a)]
+    (for [i 0 (len (load env))]
+      (push! (mut out) (get (load env) i)))
+    (box-al [EnvEntry] a (load out))))
+
+;;; Does checking `e` reach a break or continue? A pending break value is checked
+;;; after its loop's frame is gone, so only one that leaves no loop may wait.
+(defn expr-leaves-loop? [(a (dyn Allocator)) (e (ptr Expr))] (-> bool)
+  (let [(mut work) (al-new [(ptr Expr)] a)
+        (mut found) false]
+    (push! (mut work) e)
+    (loop (if (or (load found) (= (len (load work)) (primitive/cast i64 0)))
+              (break)
+              (let [x (match (pop! (mut work)) (Some [p] p) (None [] e))]
+                (match (.kind x)
+                  (EBreak [_ _] (store! found true))
+                  (EContinue [_] (store! found true))
+                  ; a lifted function's body is its own
+                  (EAnonFn [_ _] 0)
+                  (_ (ownership-children! x (mut work))))
+                0)))
+    (load found)))
+
+;;; Check the break values that waited for the loop's type, now that its other
+;;; breaks have given it. With none, the first one's own error stands.
+(defn check-pending-breaks! [(a (dyn Allocator))
+                             (fr (ptr LoopFrame))
+                             (cx (ptr Cx))
+                             (tps (ptr (ArrayList (slice u8))))
+                             (fname (slice u8))] (-> (Result i64 Diag))
+  (try (let [n (len (field fr pending))]
+         (when (> n (primitive/cast i64 0))
+           (match (load (field fr break_ty))
+             (None [] (break :try (Err [i64 Diag] (.err (al-elem [PendingBreak] (field fr pending) 0)))))
+             (Some [bt]
+                   (let [vt (box-type a (break-value-type bt))]
+                     (for [i 0 n]
+                       (let [pb (al-elem [PendingBreak] (field fr pending) i)
+                             ve (try! (check-to a (.value pb) vt (.env pb) cx tps fname "break value"))]
+                         (store! (.slot pb) ve)))
+                     ; The loop now also carries a value: earlier place breaks load
+                     ; theirs, as `join-branch-types` does for a value break.
+                     (when (not (type-eq (box-type a bt) vt))
+                       (for p (iter (field fr place_breaks))
+                         (store! p (load-place-expr a p)))
+                       (al-clear! (field fr place_breaks))
+                       (store! (field fr break_ty) (Some (load vt)))
+                       0)
+                     0))))
+         (Ok [i64 Diag] 0))))
 
 (defn synth-break [(a (dyn Allocator))
                    (label (Option (slice u8)))
@@ -13370,18 +13593,48 @@
                                    (store! valexpr (box-expr a ve))
                                    (store! vty (box-type a exp))
                                    0))
-                           (_ (let [vsp
-                                      (try! (do-synth a
-                                                      vp
-                                                      (null-type)
-                                                      env
-                                                      cx
-                                                      tps
-                                                      fname))]
-                                (store! valpair vsp)
-                                (store! valexpr (load (field valpair e)))
-                                (store! vty (load (field valpair t)))
-                                0)))
+                           (_ (let [saved (len (load env))]
+                                (match (do-synth a vp (null-type) env cx tps fname)
+                                  (Ok [vsp]
+                                      (do
+                                        (store! valpair vsp)
+                                        (store! valexpr (load (field valpair e)))
+                                        (store! vty (load (field valpair t)))
+                                        0))
+                                  (Err [d]
+                                       (do
+                                         (env-truncate! env saved)
+                                         ; The value may need the loop's type, which
+                                         ; a break still to come may give: `(Err e)`
+                                         ; under a `try!` before the block's tail.
+                                         (match (load (field fr break_ty))
+                                           (Some [bt]
+                                                 (let [vt (box-type a (break-value-type bt))
+                                                       ve (try! (check-to a vp vt env cx tps fname "break value"))]
+                                                   (store! valexpr (box-expr a ve))
+                                                   (store! vty vt)
+                                                   0))
+                                           (None []
+                                                 (if (expr-leaves-loop? a vp)
+                                                     (break :try (Err [EvalPair Diag] d))
+                                                     (let [slot (box-expr a (load vp))]
+                                                       (store! (pending-break-count)
+                                                               (+ (load (pending-break-count)) 1))
+                                                       (push! [PendingBreak]
+                                                              (field fr pending)
+                                                              (PendingBreak :value vp
+                                                                            :slot slot
+                                                                            :env (env-snapshot a env)
+                                                                            :err d
+                                                                            :seq (load (pending-break-count))))
+                                                       (break :try
+                                                              (ok-ep (mk-expr (EBreak label (Some slot))
+                                                                              elo
+                                                                              ehi
+                                                                              esrc
+                                                                              ectxt)
+                                                                     (TNever)))))))
+                                         0))))))
                          0))
                  (None []
                        (match (load texp)
@@ -15713,12 +15966,22 @@
                           (_ (err-ep (derr "static :elements requires an array allocation"))))))
       (EAnonFn [params body]
                (if (and (expected-some? expected)
-                        (= (type-tag expected) (primitive/cast i64 10)))
+                        (= (type-tag expected) (primitive/cast i64 10))
+                        ; parameter types are what a lambda cannot supply itself
+                        (not (block :hole
+                               (for [i 0 (len (load (t-fn-params expected)))]
+                                 (when (type-has-hole? (al-elem [Type] (t-fn-params expected) i))
+                                   (break :hole true)))
+                               false)))
                    (synth-anon-fn a
                                   params
                                   body
                                   (t-fn-params expected)
-                                  (t-fn-ret expected)
+                                  ; a result type inference has not determined comes
+                                  ; from the body
+                                  (if (type-has-hole? (t-fn-ret expected))
+                                      (null-type)
+                                      (t-fn-ret expected))
                                   env
                                   cx
                                   tps
