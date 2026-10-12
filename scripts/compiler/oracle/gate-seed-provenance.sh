@@ -27,7 +27,8 @@ ok()  { echo "  ok   — $1"; }
 bad() { echo "  FAIL — $1: $2"; fail=$((fail+1)); }
 
 shopt -s nullglob
-stamps=(bootstrap/seeds/native/SEED_VERSION*)
+# The portable WASM seed is a seed too: rebootstrap-linux.sh falls back to it.
+stamps=(bootstrap/seeds/native/SEED_VERSION* bootstrap/seeds/wasm/SEED_VERSION)
 if [ ${#stamps[@]} = 0 ]; then
   echo "GATE FAIL: no SEED_VERSION* files found — did the seed directory move?"
   exit 2
@@ -35,7 +36,7 @@ fi
 
 echo "== committed seeds name a resolvable commit in this history =="
 for stamp in "${stamps[@]}"; do
-  name=$(basename "$stamp")
+  name=${stamp#bootstrap/seeds/}
 
   # `commit:` may carry a trailing marker (refresh-seed.sh appends one when the
   # working tree was dirty). Take the first field and judge the rest separately.
