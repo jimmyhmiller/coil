@@ -80,7 +80,10 @@
    (retained_funcs (HashMap (slice u8) i64))
    ; Structs and sums whose values exist only at compile time; see
    ; `phase-only-nominals`. They get no runtime layout.
-   (phase_only (ptr (HashMap (slice u8) i64)))])
+   (phase_only (ptr (HashMap (slice u8) i64)))
+   ; The by-value C entries of generic instances a function pointer reaches
+   ; (`fnptr-inst`), one per instance; added to the program's exports.
+   (instance_entries (ArrayList ExportC))])
 
 ; ---- small constructors -----------------------------------------------------
 (defn mk-field [(name (slice u8)) (ty Type)] (-> Field)
@@ -441,12 +444,15 @@
   (let [s (primitive/alloc-stack ImplSel)]
     (set! s
           (impl-select-indexed a
+                               (.ownership_cx m)
                                (load (field m impls))
                                (impl-index-get (field m trait_impl_idx)
                                                (impl-index-key a
                                                                tr
                                                                (type-impl-name a
                                                                                recv)))
+                               (impl-index-get (field m trait_impl_idx)
+                                               (impl-index-key a tr BLANKET-IMPL-KEY))
                                tr
                                recv))
     (load (field s ip))))
@@ -876,7 +882,7 @@
                 (Err [Type Diag]
                      (derr "internal: unbound type pack during monomorphization"))))
         (if (= nm "$pack")
-            (Ok (load t))
+            (resolve-pack m t map)
             (match (resolve-ty-list m (t-app-args t) map)
               (Err [d] (Err [Type Diag] d))
               (Ok [rargs]
@@ -911,6 +917,25 @@
                                                  "unknown generic type '"
                                                  nm
                                                  "'"))))))))))))
+
+;;; A concrete type pack, `$pack [A B …]`, with its element types specialized. In
+;;; a generic body one may name the body's own type parameters -- the argument
+;;; list of a function pointer `(fnptr c [T] R)` called there -- and a pack
+;;; variable among them stands for its whole pack, spliced in place.
+(defn resolve-pack [(m (ptr MonoCtx)) (t (ptr Type)) (map (ptr Subst))] (-> (Result Type Diag))
+  (try (let [a (.a m)
+             elems (t-app-args t)
+             (mut out) (al-new [Type] a)]
+         (for [i 0 (len (load elems))]
+           (let [e (al-elem [Type] elems i)
+                 spliced (and (= (type-tag e) (primitive/cast i64 11)) (= (t-app-name e) "$pack-var"))
+                 r (try! (resolve-ty m e map))]
+             (if (and spliced (and (= (type-tag (box-type a r)) (primitive/cast i64 11))
+                                   (= (t-app-name (box-type a r)) "$pack")))
+                 (for [j 0 (len (load (t-app-args (box-type a r))))]
+                   (push! (mut out) (get (load (t-app-args (box-type a r))) j)))
+                 (push! (mut out) r))))
+         (Ok [Type Diag] (TApp "$pack" (box-al [Type] a (load out)))))))
 
 ; A specialized extent is a literal: positive for a vector's width, and for an
 ; array's length (`zero`) not negative.
@@ -1238,6 +1263,71 @@
                         (set! (.ctxt nf) (.ctxt f))
                         (set! (.hi nf) (.hi f))
                         (Ok (load nf)))))))))))
+
+;;; `(fnptr-of f [T…])` with the type arguments of this specialization: the
+;;; instance of `f` at them, queued like a call's, and a pointer to it. Its type
+;;; takes a parameter of type `T` by value, as a `c` pointer does; when the
+;;; instance takes that argument by reference -- `T` is a struct or sum -- the
+;;; pointer is to a by-value C entry, as for a lifted anonymous function.
+(defn fnptr-inst [(m (ptr MonoCtx))
+                  (nm (slice u8))
+                  (targs (ptr (ArrayList Type)))
+                  (map (ptr Subst))] (-> (Result ExprKind Diag))
+  (try (let [a (.a m)]
+         (unless (gfunc-has m nm)
+           (break :try (Err [ExprKind Diag]
+                            (derr (sconcat3 a "fnptr-of '" nm "': no generic function by that name (compiler bug)")))))
+         (let [rtargs (try! (resolve-ty-args m targs map))
+               gf (al-elem [Func] (load (field m gfuncs)) (find-func-named (load (field m gfuncs)) nm))
+               mng (mangle a nm rtargs)]
+           (when (not (= (len (load rtargs)) (gfunc-arity m nm)))
+             (break :try (Err [ExprKind Diag]
+                              (derr (arity-err a (sconcat3 a "generic function '" nm "'")
+                                               (gfunc-arity m nm) (len (load rtargs)))))))
+           (try! (register-monomorphized-call-sig! m gf rtargs mng))
+           (queue-func m nm rtargs)
+           (try! (instance-c-entry! m gf rtargs mng))
+           (Ok (EFnPtrOf mng))))))
+
+;;; Record the by-value C entry of instance `mng` of `gf`, when a parameter
+;;; declared as a bare type parameter is, in this instance, a struct or sum the
+;;; instance takes by reference.
+(defn instance-c-entry! [(m (ptr MonoCtx))
+                         (gf (ptr Func))
+                         (rtargs (ptr (ArrayList Type)))
+                         (mng (slice u8))] (-> (Result i64 Diag))
+  (try (let [a (.a m)
+             cx (.ownership_cx m)
+             tparams (load (field gf type_params))
+             smap (subst-map a tparams rtargs)
+             params (load (field gf params))
+             (mut surface) (al-new [Type] a)
+             (mut needed) false]
+         (for [i 0 (len (load params))]
+           (let [declared (field (al-elem [Param] params i) ty)
+                 t (try! (resolve-ty m declared smap))
+                 bare-param (match (load declared)
+                              (TStruct [n] (set-contains tparams n))
+                              (_ false))]
+             (when (and bare-param (by-value-c-entry-param? cx (box-type a t)))
+               (set! needed true))
+             (push! (mut surface) t)))
+         (when (and (load needed)
+                    (not (block :seen
+                           (for [i 0 (len (.instance_entries m))]
+                             (when (= (.name (al-elem [ExportC] (field m instance_entries) i)) mng)
+                               (break :seen true)))
+                           false)))
+           (push! (mut (field m instance_entries))
+                  (ExportC :name mng
+                           :symbol (Some (sconcat a mng ".c"))
+                           :params (box-al [Type] a (load surface))
+                           :published false
+                           :lo (.lo gf)
+                           :hi (.hi gf)
+                           :source (.source gf)
+                           :ctxt (.ctxt gf))))
+         (Ok [i64 Diag] 0))))
 
 ; ---- resolve expressions -------------------------
 (defn resolve-expr-list [(m (ptr MonoCtx))
@@ -1880,8 +1970,9 @@
                               (derr (sconcat3 a
                                               "fnptr-of '"
                                               nm
-                                              "': cannot take a function pointer to a generic function")))
+                                              "': a generic function's pointer reached specialization without its type arguments (compiler bug)")))
                          (Ok (EFnPtrOf nm))))
+           (EFnPtrInst [nm targs] (fnptr-inst m nm targs map))
            (ECallPtr [fp args]
                      (Ok (ECallPtr (box-expr a (try! (resolve-expr m fp map)))
                                    (try! (resolve-expr-list m args map)))))
@@ -2834,6 +2925,17 @@
              (push! (mut out) (load ne))))
          (Ok [(ptr (ArrayList ExportC)) Diag] (box-al [ExportC] a (load out))))))
 
+;;; The program's exports, then the by-value C entries of generic instances.
+(defn with-instance-entries [(a (dyn Allocator))
+                             (m (ptr MonoCtx))
+                             (exports (ptr (ArrayList ExportC)))] (-> (ptr (ArrayList ExportC)))
+  (let [(mut out) (al-new [ExportC] a)]
+    (for [i 0 (len (load exports))]
+      (push! (mut out) (get (load exports) i)))
+    (for [i 0 (len (.instance_entries m))]
+      (push! (mut out) (get (.instance_entries m) i)))
+    (box-al [ExportC] a (load out))))
+
 ;;; A function declared `(-> never)` returns nothing, as a void one does; the
 ;;; checker followed each call of one with a loop that never exits, so nothing
 ;;; after specialization reads a value of type never from a call. Backends see
@@ -3058,6 +3160,7 @@
          (set! (.out-structs m) (al-new [StructDef] a))
          (set! (.out-sums m) (al-new [SumDef] a))
          (set! (.out-funcs m) (al-new [Func] a))
+         (set! (.instance_entries m) (al-new [ExportC] a))
          (set! (.pending-structs m) (al-new [PendInst] a))
          (set! (.pending-sums m) (al-new [PendInst] a))
          (set! (.pending-funcs m) (al-new [PendInst] a))
@@ -3170,7 +3273,7 @@
                                                                                p
                                                                                asserts
                                                                                consts
-                                                                               exports)))))))))))))))))))))
+                                                                               (with-instance-entries a m exports))))))))))))))))))))))
 
 (defn monomorphize [(a (dyn Allocator)) (p (ptr Program))] (-> (Result (ptr Program) Diag))
   (monomorphize-reusing a p (primitive/cast (ptr Program) 0) (primitive/cast (ptr LS) 0)))

@@ -320,7 +320,11 @@ can't have it. A C function that does not return can be declared the same way,
   expected function-pointer type or `Callable` bound. It cannot capture locals; use
   `coil.closure/defclosure` when you need an environment.
 - `(fnptr-of name)` takes a named function's address. You call a value of `fnptr`
-  type like a function.
+  type like a function. For a generic function, write the type arguments as a call
+  does, `(fnptr-of largest [i64])`, or take it where a function pointer type is
+  expected and they are inferred from it. Inside a generic function the type
+  arguments may be its own type parameters, `(fnptr-of hash-key [K])`, and an
+  anonymous function there may use them too.
 - A `c` function pointer that takes a struct or sum by value, `(fnptr c [Point]
   i64)`, passes it by value as C does. A Coil function takes it by reference, so
   `fnptr-of` or `(fn …)` reaches it through a by-value entry, also when inference
@@ -760,6 +764,32 @@ true
   overlapping impls, neither more specific, at the first use of the overlap.
 - Bounds can constrain associated types: `[(I (Iterator i64))]` means "an iterator
   whose item is `i64`".
+- A blanket impl implements a trait for every type that satisfies its bounds:
+  `(impl [(T Hash Eq)] Key T …)`. Any other impl that accepts a type is more
+  specific, so it wins. A trait can have one blanket impl, whose bounds can't
+  include the trait itself. A type parameter bounded by `Hash` and `Eq` has `Key`
+  through it, so `(defn f [(K Hash Eq)] [(k K)] …)` can call Key's methods on `k`.
+
+```coil
+(module example.blanket)
+(deftrait Shape [Self] (area [(s Self)] (-> i64)))
+(defstruct Square [(side i64)])
+(impl Shape Square (area [(s Square)] (-> i64) (* (.side s) (.side s))))
+
+; every Shape displays as its area; integers keep their own Display
+(impl [(T Shape)] Display T
+  (display-fmt [(s T) (f (ptr Formatter))] (-> i64)
+    (fmt (formatter-writer f) "area {}" (area s))
+    0))
+
+(defn main [] (-> i64)
+  (println "{} {}" (Square :side 3) 12)
+  0)
+```
+
+```output
+area 9 12
+```
 - Method calls see through `ptr` and `mut`, so `(len p)` on a `(ptr (ArrayList T))`
   finds the list's `len`.
 

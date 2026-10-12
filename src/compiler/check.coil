@@ -2446,7 +2446,9 @@
 (defn impl-mangle-key [(a (dyn Allocator))
                        (t (ptr Type))
                        (params (ptr (ArrayList (slice u8))))] (-> (slice u8))
-  (if (impl-general? a t params) (impl-base-name a t) (ty-mangle a t)))
+  (cond (match (load t) (TStruct [n] (set-contains params n)) (_ false)) BLANKET-IMPL-KEY
+        (impl-general? a t params) (impl-base-name a t)
+        :else (ty-mangle a t)))
 
 (defn impl-find-method [(im (ptr ImplDef)) (mname (slice u8))] (-> (ptr Func))
   (let [ms (load (field im methods))
@@ -3110,11 +3112,12 @@
                (when (impl-dup? a
                                 cx
                                 tr
+                                forty
                                 (field im self_type)
                                 (load (field im type_params)))
                  (break :try
                           (Err [i64 Diag]
-                               (derr (sconcat a
+                               (impl-located (derr (sconcat a
                                               (sconcat3 a
                                                         "duplicate impl of '"
                                                         tr
@@ -3123,7 +3126,10 @@
                                                        (ty-str a
                                                                (field im
                                                                       self_type))
-                                                       "'"))))))
+                                                       (if (blanket-impl? im)
+                                                           "': a trait has at most one blanket impl, or a type could get it two ways"
+                                                           "'"))))
+                                             im))))
                (register-impl! a cx im)
                (let [td (trait-find cx tr)
                      cty (box-type a (load (field im self_type)))]
@@ -3328,8 +3334,8 @@
     (set! (.is_extern sg) false)
     (set! (.variadic sg) false)
     (set! (.cc sg) cc)
-    (set! (.fnptr_ok sg)
-          (and native (= (len (load tps)) (primitive/cast i64 0))))
+    ; A generic function's pointer is to one of its instances, `(fnptr-of f [T…])`.
+    (set! (.fnptr_ok sg) native)
     (push! (mut (.sigs cx)) (load sg))
     (sig-index-put! cx (.name sg))
     (set! (mut (.new_sig_names cx)) (.name sg) 0)
@@ -3589,6 +3595,7 @@
 (defn expr-names-link-address? [(a (dyn Allocator)) (e (ptr Expr)) (source bool)] (-> bool)
   (match (.kind e)
     (EFnPtrOf [_] true)
+    (EFnPtrInst [_ _] true)
     (ECStr [_] true)
     (EStaticRef [_] true)
     (EAnonFn [_ _] true)
@@ -3632,6 +3639,7 @@
       (EZeroed [_] none)
       (ERecordInit [_] none)
       (EFnPtrOf [_] none)
+      (EFnPtrInst [_ _] none)
       ; computed at compile time, before any backend sees it
       (EComptime [_] none)
       (EConstruct [_ _ args] (static-unlinkable-in cx args))
@@ -3652,6 +3660,7 @@
                (TFn [_ _ _]
                     (match (.kind inner)
                       (EFnPtrOf [_] none)
+                      (EFnPtrInst [_ _] none)
                       (_ (if (static-address? inner) none e))))
                (TInt [_ _] (match (.kind inner) (EInt [_] none) (EWideInt [_ _ _ _ _] none) (_ e)))
                (TFloat [_] (match (.kind inner) (EFloat [_] none) (_ e)))
@@ -5123,6 +5132,7 @@
             (ECall [func targs args] (res-map-record (.node-id e) func))
             (ENamedCall [func targs names args] (res-map-record (.node-id e) func))
             (EFnPtrOf [name] (res-map-record (.node-id e) name))
+            (EFnPtrInst [name _] (res-map-record (.node-id e) name))
             ; Dedicated memory nodes still have declarations. Lints use these
             ; authoritative identities so an alias or lookalike user function
             ; cannot be mistaken for a primitive operation.
@@ -5774,21 +5784,126 @@
 ; only an actually-instantiated overlap is an error.
 (defstruct ImplSel [(ip (ptr ImplDef)) (ambiguous bool)])
 
+;;; The dispatch key of a blanket impl, `(impl [(T Hash)] Key T)`: one for every
+;;; type, which no type's own key can equal.
+(def BLANKET-IMPL-KEY "*")
+
+(defn blanket-impl? [(ip (ptr ImplDef))] (-> bool)
+  (= (.for_type ip) BLANKET-IMPL-KEY))
+
 ; Does candidate `ip` of `tr` accept `recv`? (`key` narrows by head constructor first)
+; A blanket impl accepts exactly the types that satisfy its bounds on Self.
 (defn impl-cand? [(a (dyn Allocator))
+                  (cx (ptr Cx))
                   (tr (slice u8))
                   (key (slice u8))
                   (recv (ptr Type))
                   (ip (ptr ImplDef))] (-> bool)
-  (and (and (and (impl-is-trait ip) (= (impl-trait-name ip) tr))
-            (= (.for_type ip) key))
-       (pat-matches? a (field ip self_type) (load (field ip type_params)) recv)))
+  (and (and (impl-is-trait ip) (= (impl-trait-name ip) tr))
+       (if (blanket-impl? ip)
+           (blanket-applies? a cx ip recv)
+           (and (= (.for_type ip) key)
+                (pat-matches? a (field ip self_type) (load (field ip type_params)) recv)))))
 
-; Takes an impl list plus its precomputed candidate bucket, so check and mono share
-; one specificity algorithm without either phase scanning unrelated impls.
+;;; The blanket impls whose bounds are being decided, as `impl-address:type`, so
+;;; a cycle of blanket impls bounded by each other's traits ends: a bound that
+;;; holds only if it already holds is not established.
+(defstruct BlanketProgress [(init bool) (keys (ArrayList (slice u8)))])
+
+(defn blanket-in-progress [] (-> (ptr (ArrayList (slice u8))))
+  (let [cell (primitive/alloc-static BlanketProgress)]
+    (unless (.init cell)
+      (set! (.keys cell) (al-new [(slice u8)] (unit-allocator)))
+      (set! (.init cell) true)
+      0)
+    (field cell keys)))
+
+;;; Does a blanket impl give type parameter `tp` the trait `tr`, by bounds `tp`
+;;; is declared with here -- `(K Hash Eq)` has `Key` through
+;;; `(impl [(T Hash Eq)] Key T)`? A trait with associated types is not given
+;;; this way: nothing would state them.
+(defn blanket-entails? [(a (dyn Allocator)) (cx (ptr Cx)) (tp (slice u8)) (tr (slice u8))] (-> bool)
+  (let [td (trait-find cx tr)
+        bucket (impl-index-get (field cx trait_impl_idx) (impl-index-key a tr BLANKET-IMPL-KEY))
+        key (sconcat3 a tp ":" tr)
+        active (blanket-in-progress)]
+    (if (or (or (= (primitive/cast i64 bucket) 0) (= (primitive/cast i64 td) 0))
+            (or (> (len (load (field td type_params))) 0) (set-contains active key)))
+        false
+        (do
+          (push! active key)
+          (let [ok (block :found
+                     (for [i 0 (len (.items bucket))]
+                       (let [ip (al-elem [ImplDef] (field cx impls) (get (.items bucket) i))
+                             self-name (type-struct-name (field ip self_type))
+                             bounds (load (field ip bounds))]
+                         (when (block :all
+                                 (for [j 0 (len (load bounds))]
+                                   (let [b (al-elem [Bound] bounds j)]
+                                     (when (= (.name b) self-name)
+                                       (for [k 0 (len (load (field b traits)))]
+                                         (let [need (.name (al-elem [BoundTrait] (.traits b) k))]
+                                           (unless (or (bounds-has (field cx cur_bounds) tp need)
+                                                       (blanket-entails? a cx tp need))
+                                             (break :all false)))))))
+                                 true)
+                           (break :found true))))
+                     false)]
+            (pop! active)
+            ok)))))
+
+;;; For a "does not implement" error: which bound of the trait's blanket impl
+;;; `recv` lacks, or "" when the trait has none.
+(defn blanket-unmet-note [(a (dyn Allocator)) (cx (ptr Cx)) (tr (slice u8)) (recv (ptr Type))] (-> (slice u8))
+  (let [bucket (impl-index-get (field cx trait_impl_idx) (impl-index-key a tr BLANKET-IMPL-KEY))]
+    (if (= (primitive/cast i64 bucket) 0)
+        ""
+        (let [ip (al-elem [ImplDef] (field cx impls) (get (.items bucket) 0))
+              self-name (type-struct-name (field ip self_type))
+              bounds (load (field ip bounds))]
+          (block :found
+            (for [i 0 (len (load bounds))]
+              (let [b (al-elem [Bound] bounds i)]
+                (when (= (.name b) self-name)
+                  (for [k 0 (len (load (field b traits)))]
+                    (let [need (.name (al-elem [BoundTrait] (.traits b) k))]
+                      (unless (impl-match a cx need recv)
+                        (break :found (sconcat3 a "; its blanket impl covers only types that implement '"
+                                                (display-name need) "'"))))))))
+            "")))))
+
+;;; Does `recv` satisfy blanket impl `ip`'s bounds on its Self parameter?
+(defn blanket-applies? [(a (dyn Allocator)) (cx (ptr Cx)) (ip (ptr ImplDef)) (recv (ptr Type))] (-> bool)
+  (let [self-name (type-struct-name (field ip self_type))
+        key (sconcat3 a (i64->str a (primitive/cast i64 ip)) ":" (ty-str a recv))
+        active (blanket-in-progress)]
+    (if (set-contains active key)
+        false
+        (do
+          (push! active key)
+          (let [ok (block :holds
+                     (let [bounds (load (field ip bounds))]
+                       (for [i 0 (len (load bounds))]
+                         (let [b (al-elem [Bound] bounds i)]
+                           (when (= (.name b) self-name)
+                             (for [k 0 (len (load (field b traits)))]
+                               (unless (impl-match a cx (.name (al-elem [BoundTrait] (.traits b) k)) recv)
+                                 (break :holds false)))))))
+                     true)]
+            (pop! active)
+            ok)))))
+
+; Takes an impl list plus its precomputed candidate buckets -- the receiver's head
+; constructor's and the trait's blanket impls' -- so check and mono share one
+; specificity algorithm without either phase scanning unrelated impls. A blanket
+; impl's pattern, a bare type parameter, matches every type, so it is less
+; specific than any other impl that accepts the receiver and is chosen only when
+; none does.
 (defn impl-select-indexed [(a (dyn Allocator))
+                           (cx (ptr Cx))
                            (impls (ptr (ArrayList ImplDef)))
                            (bucket (ptr ImplBucket))
+                           (blanket (ptr ImplBucket))
                            (tr (slice u8))
                            (recv (ptr Type))] (-> ImplSel)
   (let [r (primitive/alloc-stack ImplSel)]
@@ -5797,49 +5912,31 @@
     (if (not (has-impl-name a recv))
         (load r)
         (let [key (type-impl-name a recv)
-              n
-                (if (= (primitive/cast i64 bucket) (primitive/cast i64 0))
-                    0
-                    (len (.items bucket)))]
+              nb (if (= (primitive/cast i64 bucket) (primitive/cast i64 0)) 0 (len (.items bucket)))
+              n (+ nb (if (= (primitive/cast i64 blanket) (primitive/cast i64 0)) 0 (len (.items blanket))))]
           ; pass 1 — greedy minimum under the specificity order
-          (let [(mut i) 0]
-            (loop (if (>= (load i) n)
-                      (break)
-                      (do
-                        (let [ip
-                                (al-elem [ImplDef]
-                                         impls
-                                         (get (.items bucket) (load i)))]
-                          (when (impl-cand? a tr key recv ip)
-                            (let [best (load (field r ip))]
-                              (when (or (= (primitive/cast i64 best)
-                                           (primitive/cast i64 0))
-                                        (impl-le? a ip best))
-                                (store! (field r
-                                               ip)
-                                        ip)
-                                0))))
-                        (set! i (primitive/iadd (load i) 1))))))
+          (for [i 0 n]
+            (let [ip (al-elem [ImplDef] impls (if (< i nb) (get (.items bucket) i) (get (.items blanket) (- i nb))))]
+              (when (impl-cand? a cx tr key recv ip)
+                (let [best (load (field r ip))]
+                  (when (or (= (primitive/cast i64 best) (primitive/cast i64 0))
+                            (impl-le? a ip best))
+                    (store! (field r ip) ip)
+                    0)))))
           ; pass 2 — the winner must be at least as specific as EVERY candidate, not just
           ; the ones it happened to be compared against. A single greedy scan would let
           ; `(Pair i64 B)` and `(Pair A bool)` at `(Pair i64 bool)` silently pick whichever
           ; came last instead of reporting the overlap.
-          (let [best (load (field r ip))
-                (mut j) 0]
+          (let [best (load (field r ip))]
             (unless (= (primitive/cast i64 best) (primitive/cast i64 0))
-              (loop (if (>= (load j) n)
-                        (break)
-                        (do
-                          (let [ip
-                                  (al-elem [ImplDef]
-                                           impls
-                                           (get (load (field bucket items))
-                                                (load j)))]
-                            (when (impl-cand? a tr key recv ip)
-                              (unless (impl-le? a best ip)
-                                (store! (field r ambiguous) true)
-                                (break))))
-                          (store! j (primitive/iadd (load j) 1)))))))
+              (block :done
+                (for [j 0 n]
+                  (let [ip (al-elem [ImplDef] impls (if (< j nb) (get (.items bucket) j) (get (.items blanket) (- j nb))))]
+                    (when (impl-cand? a cx tr key recv ip)
+                      (unless (impl-le? a best ip)
+                        (store! (field r ambiguous) true)
+                        (break :done))))))
+              0))
           (load r)))))
 
 (defn inherent-owner-matches? [(owner (slice u8)) (qual (slice u8))] (-> bool)
@@ -5995,9 +6092,12 @@
                       (recv (ptr Type))] (-> ImplSel)
   (let [key (type-impl-name a recv)]
     (impl-select-indexed a
+                         cx
                          (field cx impls)
                          (impl-index-get (field cx trait_impl_idx)
                                          (impl-index-key a tr key))
+                         (impl-index-get (field cx trait_impl_idx)
+                                         (impl-index-key a tr BLANKET-IMPL-KEY))
                          tr
                          recv)))
 
@@ -6251,10 +6351,10 @@
 (defn impl-dup? [(a (dyn Allocator))
                  (cx (ptr Cx))
                  (tr (slice u8))
+                 (forty (slice u8))
                  (st (ptr Type))
                  (params (ptr (ArrayList (slice u8))))] (-> bool)
-  (let [forty (type-impl-name a st)
-        bucket
+  (let [bucket
           (impl-index-get (field cx trait_impl_idx) (impl-index-key a tr forty))
         n
           (if (= (primitive/cast i64 bucket) (primitive/cast i64 0))
@@ -8827,6 +8927,7 @@
     (EStr [_] true)
     (ECStr [_] true)
     (EFnPtrOf [_] true)
+    (EFnPtrInst [_ _] true)
     (EZeroed [_] true)
     (ERecordInit [_] true)
     (ESizeOf [_] true)
@@ -10290,7 +10391,9 @@
                                         name
                                         (.name required))]
         (if (= (primitive/cast i64 available) 0)
-          false
+          ; a trait given by a blanket impl, from bounds declared here
+          (and (= (len (load (field required args))) 0)
+               (blanket-entails? a cx name (.name required)))
           (let [have (load (field available args))
                 want (load (field required args))
                 (mut ok) (= (len (load have)) (len (load want)))]
@@ -11783,9 +11886,10 @@
                              ; extra params become associated types (build-trait-subst); the
                              ; method sig, substituted, types the call — mono resolves it to the
                              ; impl once Self is concrete.
-                             (if (not (bounds-has (field cx cur_bounds)
-                                                  self_name
-                                                  trait_name))
+                             (if (not (or (bounds-has (field cx cur_bounds)
+                                                      self_name
+                                                      trait_name)
+                                          (blanket-entails? a cx self_name trait_name)))
                                  (return-from :try
                                                 (err-ep (derr (sconcat a
                                                                        (sconcat a
@@ -11812,8 +11916,11 @@
                                                             self_name
                                                             trait_name
                                                             td
-                                                            (load (field bt
-                                                                         args)))
+                                                            ; through a blanket impl: no
+                                                            ; associated types stated
+                                                            (if (= (primitive/cast i64 bt) 0)
+                                                                (box-items-type a)
+                                                                (load (field bt args))))
                                        new_args
                                          (try! (trait-tp-args a
                                                               tm
@@ -11862,7 +11969,7 @@
                                                                                             self_ty)
                                                                                     "' does not implement '")
                                                                           (display-name trait_name))
-                                                                 "'")))))
+                                                                 (sconcat a "'" (blanket-unmet-note a cx trait_name self_ty)))))))
                                (when (load (field sel ambiguous))
                                  (break :try
                                           (err-ep (derr (sconcat a
@@ -14905,6 +15012,84 @@
                                  ectxt)
                         (load ret)))))))))
 
+;;; Is `name` a generic function?
+(defn generic-sig? [(cx (ptr Cx)) (name (slice u8))] (-> bool)
+  (let [sig (sig-find cx name)]
+    (and (!= (primitive/cast i64 sig) (primitive/cast i64 0))
+         (> (len (load (field sig type_params))) (primitive/cast i64 0)))))
+
+;;; `(fnptr-of f [T…])`: a pointer to the instance of the generic function `f`
+;;; at the type arguments, written or, when none are, inferred from the function
+;;; pointer type expected here. Type arguments may be the enclosing function's own
+;;; type parameters; specialization instantiates `f` for each concrete set. The
+;;; pointer's type is `f`'s, substituted: a parameter of type `T` takes the
+;;; argument by value, as a `c` function pointer does, and an instance whose
+;;; `T` is a struct is reached through a by-value entry (mono.coil).
+(defn synth-fnptr-inst [(a (dyn Allocator))
+                        (name (slice u8))
+                        (written (ptr (ArrayList Type)))
+                        (expected (ptr Type))
+                        (cx (ptr Cx))
+                        (tps (ptr (ArrayList (slice u8))))
+                        (fname (slice u8))
+                        (elo i64)
+                        (ehi i64)
+                        (esrc i64)
+                        (ectxt i64)] (-> (Result EvalPair Diag))
+  (try
+    (let [sig (sig-find cx name)
+          tparams (load (field sig type_params))
+          targs (try! (explicit-type-args a cx written fname))
+          subst (subst-new a)
+          shown (display-ident name)]
+      (unless (load (field sig fnptr_ok))
+        (break :try (err-ep (derr-at-src esrc elo ehi
+                                         (sconcat3 a "in '" fname
+                                                   (sconcat3 a "': cannot take a function pointer to '" shown
+                                                             "' (shim-convention functions are not supported yet)"))))))
+      (if (> (len (load targs)) (primitive/cast i64 0))
+          (do
+            (unless (= (len (load targs)) (len (load tparams)))
+              (break :try (err-ep (derr-at-src esrc elo ehi
+                                               (sconcat a
+                                                        (sconcat3 a "in '" fname "': fnptr-of '")
+                                                        (sconcat a
+                                                                 (sconcat3 a shown "' expects "
+                                                                           (i64->str a (len (load tparams))))
+                                                                 (sconcat a " type arguments, got "
+                                                                          (i64->str a (len (load targs))))))))))
+            (try! (validate-targs a cx targs tps fname))
+            (build-subst! subst tparams targs)
+            0)
+          ; No type arguments written: the pointer type expected here supplies them.
+          (let [params (load (field sig fnptr_params))]
+            (unless (and (expected-some? expected)
+                         (and (= (type-tag expected) (primitive/cast i64 10))
+                              (= (len (load (t-fn-params expected))) (len (load params)))))
+              (break :try (err-ep (derr-at-src esrc elo ehi
+                                               (sconcat a
+                                                        (sconcat3 a "in '" fname "': '")
+                                                        (sconcat3 a shown "' is generic; write its type arguments, (fnptr-of "
+                                                                  (sconcat a (after-last-dot name) " [T…]), or take it where a function pointer type is expected")))))))
+            (for [i 0 (len (load params))]
+              (try! (unify a (al-elem [Type] params i) (al-elem [Type] (t-fn-params expected) i)
+                           tparams subst fname)))
+            (try! (unify a (field sig ret) (t-fn-ret expected) tparams subst fname))
+            (for [i 0 (len (load tparams))]
+              (when (= (primitive/cast i64 (subst-get subst (get (load tparams) i))) (primitive/cast i64 0))
+                (break :try (err-ep (derr-at-src esrc elo ehi
+                                                 (sconcat a
+                                                          (sconcat3 a "in '" fname "': cannot infer type argument '")
+                                                          (sconcat3 a (get (load tparams) i) "' of '"
+                                                                    (sconcat3 a shown "'; write it: (fnptr-of " (sconcat a (after-last-dot name) " [T…])")))))))))
+            0))
+      (try! (ca-check-bounds a sig subst name (box-al [Expr] a (al-new [Expr] a)) cx fname elo ehi esrc ectxt))
+      (ok-ep (mk-expr (EFnPtrInst name (subst-targs a tparams subst)) elo ehi esrc ectxt)
+             (TFn
+               :cc (load (field sig cc))
+               :params (subst-apply-list a (load (field sig fnptr_params)) subst)
+               :ret (box-type a (subst-apply a (field sig ret) subst)))))))
+
 ; Does a `c` function pointer that takes `t` by value need a by-value C entry
 ; to reach a Coil function? A plain struct or sum, generic or not, is a Coil
 ; parameter passed by immutable reference; a `c` pointer passes it by value.
@@ -15024,7 +15209,17 @@
                                       (i64->str a nt))))
         (let [(mut ps) (al-new [Param] a)
               (mut checked_body) (al-new [Expr] a)
-              empty_tps (box-al [(slice u8)] a (al-new [(slice u8)] a))
+              ; Inside a generic function the body may use its type parameters, so
+              ; the lifted function is generic over the same ones, with the same
+              ; bounds, and the pointer is to its instance at them; specialization
+              ; instantiates it with each instance of the enclosing function.
+              generic (> (len (load tps)) (primitive/cast i64 0))
+              own_tps (if generic
+                          (box-al [(slice u8)] a (load tps))
+                          (box-al [(slice u8)] a (al-new [(slice u8)] a)))
+              own_bounds (if generic
+                             (box-al [Bound] a (load (field cx cur_bounds)))
+                             (box-al [Bound] a (al-new [Bound] a)))
               (mut i) 0
               (mut failed) false
               (mut err) (primitive/zeroed Diag)
@@ -15041,7 +15236,7 @@
                       (push! (mut ps) (load pp))
                       (set! i (primitive/iadd (load i) 1)))))
           (let [psp (box-al [Param] a (load ps))
-                local (build-param-env a cx psp empty_tps)
+                local (build-param-env a cx psp own_tps)
                 old_outer (load (field cx anon_outer_env))
                 bn (len (load body))
                 ; the body runs at run time, even when the function is a
@@ -15102,12 +15297,12 @@
                       (mut fnparams) (al-new [Type] a)]
                   (store! (field cx anon_counter) (primitive/iadd counter 1))
                   (set! (.name fp) generated)
-                  (set! (.type_params fp) empty_tps)
-                  (set! (.bounds fp) (box-al [Bound] a (al-new [Bound] a)))
+                  (set! (.type_params fp) own_tps)
+                  (set! (.bounds fp) own_bounds)
                   (set! (.cc fp) "c")
                   (set! (.annotations fp)
                         (box-al [Annotation] a (al-new [Annotation] a)))
-                  (set! (.params fp) (erase-param-types a cx psp local empty_tps))
+                  (set! (.params fp) (erase-param-types a cx psp local own_tps))
                   (set! (.ret fp) (erase-refs a (box-type a (load result_ty))))
                   (set! (.body fp) (box-al [Expr] a (load checked_body)))
                   (set! (.macro_variadic fp) false)
@@ -15127,13 +15322,15 @@
                           ; `fnptr-of` has: an aggregate parameter is `(ref T)`.
                           ; A `c` pointer that takes a C struct by value instead
                           ; reaches the function through a by-value C entry that
-                          ; marshals the C ABI into the reference-model body.
+                          ; marshals the C ABI into the reference-model body. A
+                          ; generic one's instances get theirs from specialization,
+                          ; where every parameter's type is known.
                           (let [(mut c-entry) false]
                             (for [pi 0 nn]
                               (let [t (al-elem [Type] param_types pi)
-                                    surface (param-ref-type cx t empty_tps)]
-                                (if (by-value-c-entry-param? cx t)
-                                    (do (set! c-entry true)
+                                    surface (param-ref-type cx t own_tps)]
+                                (if (or generic (by-value-c-entry-param? cx t))
+                                    (do (unless generic (set! c-entry true) 0)
                                         (push! (mut fnparams) (load t)))
                                     (push! (mut fnparams) surface))))
                             (when (load c-entry)
@@ -15158,10 +15355,10 @@
                             (for [pi 0 nn]
                               (push! (mut pnames) "")
                               (push! (mut surface)
-                                     (param-ref-type cx (al-elem [Type] param_types pi) empty_tps)))
+                                     (param-ref-type cx (al-elem [Type] param_types pi) own_tps)))
                             (set! (.name sg) generated)
-                            (set! (.type_params sg) empty_tps)
-                            (set! (.bounds sg) (box-al [Bound] a (al-new [Bound] a)))
+                            (set! (.type_params sg) own_tps)
+                            (set! (.bounds sg) own_bounds)
                             (set! (.param_names sg) (box-al [(slice u8)] a (load pnames)))
                             (set! (.params sg) (box-al [Type] a (load surface)))
                             (set! (.fnptr_params sg) (box-al [Type] a (load fnparams)))
@@ -15173,7 +15370,12 @@
                             (push! (mut (.sigs cx)) (load sg))
                             (sig-index-put! cx generated)
                             (set! (mut (.new_sig_names cx)) generated 0))
-                          (ok-ep (mk-expr (EFnPtrOf generated)
+                          (ok-ep (mk-expr (if generic
+                                              (let [(mut targs) (al-new [Type] a)]
+                                                (for [ti 0 (len (load own_tps))]
+                                                  (push! (mut targs) (TStruct (get (load own_tps) ti))))
+                                                (EFnPtrInst generated (box-al [Type] a (load targs))))
+                                              (EFnPtrOf generated))
                                           elo
                                           ehi
                                           esrc
@@ -15486,6 +15688,7 @@
                                           ; constant: each use is the pointer.
                                           (match (.kind (.value ce))
                                             (EFnPtrOf [_] true)
+                                            (EFnPtrInst [_ _] true)
                                             (_ false)))
                                       (let [lit
                                               (mk-expr (.kind (.value ce))
@@ -16190,7 +16393,15 @@
                            esrc
                            ectxt))
       (EFnPtrOf [name]
-                (synth-fnptr-expected a name expected env cx tps fname elo ehi esrc ectxt))
+                (if (generic-sig? cx name)
+                    (synth-fnptr-inst a name (box-items-type a) expected cx tps fname elo ehi esrc ectxt)
+                    (synth-fnptr-expected a name expected env cx tps fname elo ehi esrc ectxt)))
+      (EFnPtrInst [name targs]
+                  (if (generic-sig? cx name)
+                      (synth-fnptr-inst a name targs expected cx tps fname elo ehi esrc ectxt)
+                      (err-ep (derr-at-src esrc elo ehi
+                                           (sconcat3 a "fnptr-of: '" (display-ident name)
+                                                     "' is not generic, so it takes no type arguments; write (fnptr-of NAME)")))))
       (ECallPtr [fp args]
                 (synth-callptr a fp args env cx tps fname elo ehi esrc ectxt))
       (EConstruct [sum variant args]
@@ -17859,6 +18070,7 @@
                   (push! (mut na) (load arm))))
               (EMatch (ownership-clone a scrut) (box-al [Arm] a (load na)))))
     (EFnPtrOf [n] (EFnPtrOf n))
+    (EFnPtrInst [n ts] (EFnPtrInst n ts))
     (ECallPtr [fp args] (ECallPtr (ownership-clone a fp) (ownership-clone-list a args)))
     (ELoop [l body] (ELoop l (ownership-clone-list a body)))
     (EBreak [l v]
