@@ -89,7 +89,10 @@ return:
 Calls recurse through the **host call stack** — `OP_CALL` invokes `vm-exec`
 re-entrantly — so Coil recursion (e.g. `fib`) maps onto native recursion. The
 whole interpreter runs on the driver's 512 MiB pipeline pthread, so deep
-recursion has room.
+recursion has room. A call in tail position whose arguments and result are all
+scalars is a `TAILCALL` instead (`mark-tail-calls!`): its caller's activation
+ends, and `vm-exec` runs the callee in the same host frame, so tail recursion
+runs in constant stack, as the LLVM backend's `musttail` makes it run compiled.
 
 ## The bytecode ISA
 
@@ -144,6 +147,7 @@ opcodes know int-vs-float, width, and signedness.
 | 43 | `BOXEXT`     | a=size b=align               | v=pop; slot=frame-alloc; store the packed <=8B C aggregate return; push slot (built-in table calls only) |
 | 46 | `ALLOCDYN`   |                              | n=pop; push frame-alloc(n rounded up to 16, align 16) (`alloc-stack-bytes`) |
 | 47 | `CALLNATIVE` | a=call site b=nargs          | pop nargs; push the result of the native C call at site a (see FFI) |
+| 48 | `TAILCALL`   | a=funcidx b=nargs            | pop nargs; end this activation and run function a in its place (a `CALL` that only jumps to `RET`, all scalars) |
 
 Aggregates (struct/sum/slice/array/vec) are carried **by address**: a cell holds
 the address of the bytes. `LOADAGG`/`STOREAGG` copy; `FIELDPTR`/`INDEX` are
