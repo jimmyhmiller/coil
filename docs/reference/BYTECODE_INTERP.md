@@ -238,7 +238,7 @@ An extern in neither is a **hard error**.
 
 ## What is implemented and what hard-errors
 
-Implemented end-to-end (verified by `python3 scripts/dev.py test interpreter`):
+Implemented end-to-end (verified by the corpus `interp` lane, below):
 integer + float arithmetic and comparisons (incl. unsigned logical right shift and
 float remainder via `fmod`), `bool`, casts (int width, int↔float honouring source
 signedness, float↔float, pointer/fnptr identity), `let`/`(mut …)` locals, `if`,
@@ -261,32 +261,21 @@ code is in another unit's object.
 
 ## Gate
 
-There are two gates, both over `tests/compiler/oracle/arm64/corpus.txt` (all 44
-`src/examples/` programs plus the 12 `tests/` programs = 56 entries). Runtime equality
-with the compiled program is the contract.
+The interpreter is a lane of the runtime corpus (`tests/corpus`, see
+`docs/reference/COMPILER_TESTS.md`). FAST's `corpus/interp` step runs
 
-**`python3 scripts/dev.py test interpreter --compiler <coil-bin>` — the contract
-gate (56/56).** For every corpus program it BUILDS the program (default backend,
-or `--backend arm64` for the `R`-marked inline-asm `:shim` programs, exactly as the
-corpus declares), runs the compiled binary, and diffs its stdout+exit against
-`coil interp` on the same source. This checks the interpreter against LIVE compiler
-output — the direct, strongest form of "interp == codegen". `argv[0]` is an
-invocation artifact, not program behavior (a compiled binary reports its own
-filesystem path; an interpreter reports the source path it was handed), so the
-compiled side is invoked with `exec -a <srcpath>` and BOTH sides see the identical
-`argv[0]` (= the source path). This normalization is applied **uniformly** to all
-56 programs: for the 54 that never read `argv[0]` it changes nothing; for
-`src/examples/args.coil` and `src/examples/everything.coil` (which `puts(argv[0])`) it
-makes the diff a comparison of program *semantics* rather than of where the binary
-happens to live. Nothing is faked, skipped, or special-cased.
+```sh
+python3 scripts/oracle.py corpus interp --compiler <coil-bin>
+```
 
-**`python3 scripts/oracle.py interpreter snapshot --compiler <coil-bin>` — the snapshot gate (54/56).**
-This diffs `coil interp` against the frozen LLVM reference snapshots in
-`tests/compiler/oracle/arm64/reference` (the same snapshots the arm64 backend gate uses).
-It reports **54/56**: the two "failures" are `src/examples/args.coil` and
-`src/examples/everything.coil`, whose snapshots bake the *compiled binary's* path
-(`/tmp/coil-arm64-fixed-…`) as `argv[0]` — a filesystem location an interpreter
-structurally cannot and should not reproduce (fabricating it would be a hardcode,
-not a real result). Both programs otherwise run identically. The contract gate
-above resolves this honestly by normalizing `argv[0]` on both sides rather than
-comparing against a path frozen into a snapshot.
+which runs each of the eight corpus programs under `coil interp` and compares
+its stdout and exit status with the program's reference, the output its compiled
+arm64 and LLVM builds agree on. Runtime equality with the compiled program is the
+contract. `numerics.coil` computes with 128-bit integers, which the interpreter
+refuses by design (its cells hold 64 bits); the lane checks that it is refused
+with the diagnostic that says so (`interp-refused=` in `tests/corpus/corpus.txt`).
+
+The corpus programs do not read `argv[0]`, so an interpreted run and a compiled
+binary see the same program behaviour wherever the binary lives. The
+`src/examples` demos, which the old 56-entry gate also interpreted, are now run
+compiled only, by COMPREHENSIVE's `guide-demos` step.

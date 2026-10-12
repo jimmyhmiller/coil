@@ -177,8 +177,8 @@ Each stage builds with the current seed, passes the gates and is committed on it
   keyword arguments (`kw_meters`).
 - Constants in the same unification position must now be equal, and the impl check
   that every parameter appears in the implementing type now looks inside extents.
-- Tests: `tests/compiler/const_generic_test.py` (`dev.py test const-generics`, also
-  run by `modernize-fast`), with fixtures `const_generic_values.coil` and
-  `const_generic_arrays.coil`. Its migration section checks the exact rewrite of a
-  single file, report and `--diff` modes, idempotence, and a two-module project whose
-  parameters reach a width only through another module's struct and `coil.simd`'s `Chunk`.
+- Tests: value parameters run in `tests/corpus/types_traits.coil` (const `Keyword`
+  and `i64` parameters, `(const NAME)` arguments), and their rejections are goldens
+  in `tests/diag/compile/generics.coil`, both in FAST. The original
+  `const_generic_test.py`, with its migration checks, was deleted in the test
+  restructure of 2026-10-12.

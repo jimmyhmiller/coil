@@ -339,9 +339,10 @@ fields.
 
 Every milestone gets a focused Coil test plus at least one integration test. The lists
 below are the complete staged matrix, not a claim that every future stress/platform case
-belongs to P0. Delivered P0 coverage lives in `tests/hosted_system_test.coil`,
-`tests/subprocess_test.coil`, `tests/io_hosted_test.coil`, and the compiler facade
-fixtures under `tests/compiler/features/`.
+belongs to P0. Delivered P0 coverage lives in `tests/stdlib/system_test.coil` (FAST's
+`stdlib/system` step), which absorbed the hosted-system tests in the test restructure
+of 2026-10-12; the subprocess-argv, hosted-I/O and facade fixtures no gate ran were
+deleted then.
 
 ### I/O and time
 

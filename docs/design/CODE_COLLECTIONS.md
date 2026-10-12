@@ -279,4 +279,5 @@ capability.
 6. Reading or iterating a `CodeBuilder`, and pushing into finished `Code`, remain
    compile-time errors.
 7. Metaprogram poison-arena tests, focused compiler tests, and the bounded
-   `modernize-fast` gate pass with a freshly built candidate.
+   `modernize-fast` gate pass with a freshly built candidate (today: `dev.py test
+   fast`; `modernize-fast` was replaced on 2026-10-12).

@@ -4,8 +4,10 @@
 
 Fixed on 2026-08-25. Primitive dispatch now retains the complete hygienic head
 through parser dispatch and selects bindings using the identifier's definition
-module. Regression coverage lives in
-`tests/compiler/hygiene/semantic_transform_primitive{,_provider}.coil`.
+module. Regression coverage lived in
+`tests/compiler/hygiene/semantic_transform_primitive{,_provider}.coil`; since the test
+restructure of 2026-10-12 it is check 4 of `tests/meta/hygiene_identity.coil` (a
+semantic transform re-reading its own output), in FAST's `meta` step.
 
 ## Summary
 

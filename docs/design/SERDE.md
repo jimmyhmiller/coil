@@ -24,7 +24,7 @@ Shipped modules (all bundled):
 | `coil.serde.msgpack` | `src/stdlib/serde_msgpack.coil` | MessagePack binary format |
 | `coil.serde.value` | `src/stdlib/serde_value.coil` | `JVal` — the DOM for documents of unknown shape, driven by `de-kind` |
 
-Tests: `tests/serde_test.coil` (`coil test tests/serde_test.coil`) — round-trips,
+Tests: `tests/stdlib/serde_test.coil` (`coil test tests/stdlib/serde_test.coil`; FAST's `stdlib/serde` step) — round-trips,
 decode-error codes, unescaping (incl. surrogate pairs), integer encoding
 boundaries, u64 range rules, truncated input, and one value decoded equal from
 all three formats. The **as-built deviations** from the original proposal are
@@ -351,9 +351,9 @@ opt-in); the DOM (`coil.serde.value`'s `JVal` + the `de-kind` peek on
 `Deserializer`, implemented by all three backends); per-variant field reflection
 in the compiler (`code-variant-field-name`/`-type`, ops 47/48) and post-hoc
 `derive-serde-sum` on top of it; `de-struct-begin` now returns the input's
-field count (feeds `deny-unknown`). Tests: `tests/serde_options_test.coil`,
-`tests/serde_value_test.coil`, `tests/serde_sum_posthoc_test.coil`, and
-`tests/metaprogramming/compile-and-run/variantrefl_test.coil` (harness step 9b).
+field count (feeds `deny-unknown`). Tests: `tests/stdlib/serde_test.coil` (FAST's
+`stdlib/serde` step), which merged the options, value and post-hoc sum suites in the
+test restructure of 2026-10-12; the variant-reflection harness step went then.
 
 **Remaining**:
 

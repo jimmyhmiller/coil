@@ -406,7 +406,7 @@ before the next phase begins.
 During compiler development, build one candidate and repeatedly run:
 
 ```sh
-python3 scripts/dev.py test modernize-fast --compiler <candidate>
+python3 scripts/dev.py test fast --compiler <candidate> --quick
 ```
 
 Use focused unit/feature tests for each phase. Do not run `build full` while

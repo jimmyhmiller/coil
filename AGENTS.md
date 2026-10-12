@@ -90,16 +90,33 @@ Use this format:
   library rather than a missing binary.
 - `coil doc file.coil` — markdown for that module's `;;`-documented definitions
   (a `;;` block directly above a definition is its doc; a single `;` is not).
-- The compiler is **self-hosted** (written in Coil, in `src/compiler/`). During
-  development, first run the focused inner-loop gate:
-  Build one candidate after compiler-source edits, then repeatedly run
-  `python3 scripts/dev.py test modernize-fast --compiler <candidate>`.
-  The gate tests the supplied compiler and does not rebuild the compiler on every
-  iteration. Its elapsed time is reported for visibility but is not a correctness
-  condition. **Do not run
-  `build full` while diagnosing or iterating.** Run
-  `python3 scripts/dev.py build full` only once for final release verification
-  after focused tests and the focused gate are green.
+- The compiler is **self-hosted** (written in Coil, in `src/compiler/`). Its tests
+  are two tiers, both serial and both budgeted; `docs/reference/COMPILER_TESTS.md`
+  describes every step.
+  - **FAST**, before every push: `python3 scripts/dev.py test fast --compiler
+    <candidate>`. At most 270 s, and it fails over 300 s. It never builds the
+    compiler, and any process over 1.5 GB fails it.
+  - **The inner loop**: build one candidate after compiler edits (`python3
+    scripts/dev.py build candidate`, writing `build/bin/coil-candidate`), then
+    rerun `python3 scripts/dev.py test fast --compiler build/bin/coil-candidate
+    --quick` (at most 60 s). `--only NAME` reruns one step, e.g. `--only corpus`.
+  - **COMPREHENSIVE**, before a release or a risky merge: `python3 scripts/dev.py
+    test comprehensive`. It runs `build full` once, installs into a private prefix
+    and runs FAST plus every check that needs a whole-compiler build or an
+    installed toolchain (JIT, generated units, all namespaces, the wasm self-host,
+    memory caps, breadth lanes), about 25 minutes. Its x64 step runs on
+    `computer.jimmyhmiller.com` over ssh; when that host is unreachable the step
+    fails and says so, and `--no-x64` leaves it out.
+  - **The release**: `python3 scripts/dev.py build full` builds the fixpoint and
+    installs. **Do not run it, or COMPREHENSIVE, while diagnosing or iterating.**
+- **Adding a test.** Do not add a test per fixed bug. Extend the end-to-end
+  program that covers the area: a section of a `tests/corpus` program (rebless
+  with `python3 scripts/oracle.py corpus bless --only NAME`), a case in a
+  `tests/diag` file (`python3 scripts/oracle.py diag bless …`, then read the
+  golden), a check in `scripts/tests/fast/cli.sh`, a deftest in a `tests/stdlib`
+  suite. A new step needs a budget in `scripts/tests/budgets.toml`, and a step
+  that builds the compiler belongs in COMPREHENSIVE. Budgets change only by
+  `--rebaseline 3` on a quiet machine, reviewed like code.
 - ⚠ **`build full` peaks near 9.4 GB of memory, and that is expected.** Compiling
   the compiler once costs about 4.7 GB (measured: the largest single process), and
   the fixpoint step in `scripts/compiler/rebootstrap.sh` deliberately emits the
@@ -116,33 +133,14 @@ Use this format:
   searches accordingly. The causes inside a single compile are tracked in the
   `coil-bugs` pad: the self-build frontend re-parses and re-checks the expanded
   program, and expansion re-resolves it several times.
-- `python3 scripts/dev.py test generated --compiler <candidate>` exercises
-  generated-unit lifetime/ownership, native reader artifacts, incremental LLVM
-  sessions, sparse/named static storage, extern aliases and the supporting ABI
-  fixes. The full CI job runs it against its verified compiler. Run this gate
-  when changing those features; it includes actual-pipeline memory regressions.
-- **Changing LLVM codegen?** Run `python3 scripts/dev.py test aggregates --compiler
-  <candidate>` before installing (add `--all-sources` for every test plus the
-  compiler itself, ~20 min). It fails if emitted IR moves a struct, sum or array
-  over 64 bytes as a first-class value — a `load`/`store`/`ret`/`phi`/call of the
-  whole aggregate — which LLVM expands element by element: that cost a 17 s build
-  once and a 10 s build again for an array of 32 structs. Aggregates live in
-  memory in codegen (`cg-mem-ty?`, `emit-into`); only the C ABI's own register
-  values may appear. Local only: CI does not run it.
-- **Changing how meta output is expanded?** Run `python3 scripts/dev.py test
-  self-build-memory --compiler <candidate>`. It self-builds the compiler at -O0
-  (about 4 GB, under a minute) and fails if expanding the meta output retains
-  more than 512 MiB, which re-expanding the whole program used to cost. Local
-  only: CI does not run it.
 - **Changing expansion, resolution or checking without meaning to change meaning?**
   Build a reference compiler from the commit before your change and run
-  `python3 scripts/tests/pipeline-differential.py <reference> <candidate>`. It
-  compares `dump-checked` and `dump-mono` over the compiler, `src/examples`,
-  `tests/compiler/features` and `tests/`; anything but `0 differ` is
-  a behaviour change to explain. It takes ~10 minutes, so it is a pre-merge check,
-  not a gate.
+  `python3 scripts/tests/pipeline-differential.py <reference> <candidate> --jobs 1`.
+  It compares `dump-checked` and `dump-mono` over the compiler, `src/examples`,
+  `tests/corpus`, `tests/diag` and `tests/stdlib`; anything but `0 differ` is a
+  behaviour change to explain. It is a manual pre-merge check, not a gate.
 - ⚠ **Two ways a shell gate reports a result it never established.** Both were
-  found live in `gate-cli.sh`/`gate-target-os.sh`, in checks that had been green
+  found live in shell gates since deleted, in checks that had been green
   or red for months without meaning anything:
   - **`grep -q` in a pipeline.** `grep -q` exits at its first match and closes the
     pipe; a producer still writing (`nm`, `find`, `objdump`) takes SIGPIPE, and
@@ -155,21 +153,6 @@ Use this format:
     exits non-zero, so a failed build yields a few hundred bytes that trivially
     lack whatever you grepped for. Check the exit status, and sniff for something
     that must be present (e.g. `target datalayout`).
-- The snapshot gates use small, stage-specific fixtures listed in
-  `scripts/oracle.py::STAGE_INPUTS`, plus curated negative and diagnostic fixtures.
-  Broad application and standard-library coverage belongs to the runtime and CLI gates.
-  When a listed fixture or its compiler-stage output changes, re-bless that stage in the
-  same commit: `python3 scripts/oracle.py snapshot <stage> --compiler build/bin/coil`
-  (`<stage>` is `read`, `full`, `ast`, `load`, `resolved`, `checked`, `expand`,
-  `mono`, `ir`, `diag`, `x86`, or `all`). Rebootstrap runs all of them and also
-  verifies the larger behavioral corpus.
-- **Never discover/re-bless cross-cutting snapshot changes one stage at a time.**
-  `gate all` audits every stage and reports the complete failing-stage set. For an
-  intentional compiler/prelude change that affects several stages, review the scope,
-  then run `python3 scripts/dev.py refresh-snapshots --compiler <new-compiler> --verbose`.
-  That command audits all stages without writes, refreshes every mismatched stage once,
-  and performs one final all-stage audit. Do not loop through `snapshot <stage>` plus
-  `gate all` to discover the next mismatch.
 
 ## Where things live
 
@@ -190,7 +173,8 @@ Use this format:
   `python3 scripts/compiler/gen-stdlib-manifest.py`. The manifest in
   `src/compiler/stdlib_manifest.coil` lists which modules are the library's; in-repo
   a missing entry still resolves through the namespace scan, so nothing fails locally
-  and the namespace ships unreachable. `gate-cli` checks it, and the build exports
+  and the namespace ships unreachable. COMPREHENSIVE's `installed/allns` step checks
+  it, and the build exports
   `COIL_STRICT_BUNDLE=1` so the in-repo fallback is a hard error instead of a silent
   success.
 - `src/examples/*.coil` — one idea each (`sums`, `hashmap`, `references`, `lisp`, …).
@@ -201,6 +185,11 @@ Use this format:
   what stops them from being mistaken for the API surface. `src/examples/*.coil`
   is the exception: those are feature demos the language guide points at.
 - `src/compiler/*.coil` — the compiler itself (`reader.coil` = lexer/parser).
+- `tests/` — what the two test tiers run: `corpus` (the runtime programs), `diag`
+  (diagnostic goldens), `cli`, `projects`, `stdlib`, `meta`, `readers`, `cabi`,
+  `wasm`, `simd`, `jit`, `http`, `comprehensive`, plus `prop` and `fuzz` (property
+  and fuzz targets) and `bootstrap` (the portable bootstrap's runtime). The
+  scripts are `scripts/tests/`; `docs/reference/COMPILER_TESTS.md` maps them.
 
 ## Workspaces
 

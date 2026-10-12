@@ -173,33 +173,22 @@ C adapters for environment, cwd, time, readiness, or ordinary child lifecycle.
 
 ## Verification and handoff
 
-The focused behavioral entry points are:
+The behaviour is tested by `tests/stdlib/system_test.coil` (FAST's `stdlib/system`
+step): owned environment lookup and mutation, cwd change and restore, monotonic
+time, readable pipes and selectors (`hosted-env-cwd-time-pipes-and-selectors`),
+`run` with bounded capture, deadlines and cancellation (including after the child
+closes its output), close-on-exec cancellation wakeups, TCP and Unix sockets, and
+subscribed signals. The private re-export rejection is a golden in
+`tests/diag/compile/names.coil`. Earlier focused files for exact argv bytes,
+hosted line I/O, the facade's qualified re-exports and the Result-flow lint were
+run by no gate and were deleted in the test restructure of 2026-10-12.
 
-- `tests/hosted_system_test.coil`: owned environment lookup/mutation/unset, cwd
-  change/restore, process identifiers, monotonic sleep, readable pipes, timeout,
-  hangup/EOF, invalid descriptors, and proof that selector waits retain fd ownership;
-- `tests/subprocess_test.coil`: exact argv bytes (spaces, shell metacharacters, and an
-  empty argument), missing executables, stdin/stdout round trip, null stdio, nonblocking
-  and deadline waits, signal termination, cached repeated waits, and idempotent close;
-- `tests/io_hosted_test.coil`: hosted fd and allocator-backed line I/O;
-- `tests/compiler/features/reexport_*.coil` and `process_facade.coil`: qualified,
-  transitive, macro/type/function facade lookup plus private-export rejection;
-- `tests/metaprogramming/result_flow_lint.coil`: the linear Result-flow diagnostic.
-
-For iteration, build one candidate compiler and run:
+For iteration, build one candidate compiler and run FAST (`--quick` while iterating):
 
 ```text
-python3 scripts/dev.py test modernize-fast --compiler /tmp/coil-candidate
-```
-
-The focused gate includes the hosted system and facade fixtures and reports its
-elapsed time without imposing a timing-based failure. Final compiler evidence is
-an ARM64 candidate rebuild with a byte-for-byte object comparison, followed by one
-consolidated snapshot audit:
-
-```text
-cmp /tmp/coil-candidate.o /tmp/coil-candidate-next.o
-python3 scripts/oracle.py gate all --compiler /tmp/coil-candidate-next
+python3 scripts/dev.py build candidate
+python3 scripts/dev.py test fast --compiler build/bin/coil-candidate --only stdlib/system
+python3 scripts/dev.py test fast --compiler build/bin/coil-candidate
 ```
 
 The current POSIX backend is exercised on macOS. Linux uses the same public API and

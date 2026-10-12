@@ -242,8 +242,8 @@ optimization, not a prerequisite for this feature. Noted in `FUTURE_WORK.md`.)
 
 ## 6. Gating
 
-In the focused inner-loop gate (`scripts/dev.py test modernize-fast`), so a regression
-shows up in seconds rather than in a release rebootstrap:
+The fixtures below were in the focused inner-loop gate (`modernize-fast`) until the
+test restructure of 2026-10-12, which deleted them with that gate:
 
 | Fixture | Asserts |
 |---|---|
@@ -255,9 +255,9 @@ shows up in seconds rather than in a release rebootstrap:
 | `refer_exclude_method_rejected.coil` | surface 3: trait methods |
 | `refer_exclude_alias_rejected.coil` | surface 4: ambient primitive aliases |
 
-The four `_rejected` fixtures are the point: one predicate feeding four passes is only
-trustworthy if each pass is independently pinned. The gate names the surface in its
-failure message.
+Today FAST pins one surface: `tests/diag/compile/names.coil` excludes the `<` trait
+method from `coil.core` and requires its use to be rejected. The other three
+surfaces, and the positive `:rename` and `:use []` cases, have no test.
 
 The mechanism refactor was verified inert before any syntax was added —
 `scripts/oracle.py gate all` passed with zero snapshot movement across all eleven stages.

@@ -24,12 +24,13 @@ deliberately.
 ## Fast inner loop
 
 Do not use a full rebootstrap to diagnose ordinary compiler-source or core-operation
-changes. Build one candidate after editing compiler sources, then run the bounded
-gate against that candidate as often as needed:
+changes. Build one candidate after editing compiler sources, then run the test tiers
+against that candidate as often as needed:
 
 ```sh
-python3 scripts/dev.py build candidate --output /tmp/coil-candidate
-python3 scripts/dev.py test modernize-fast --compiler /tmp/coil-candidate
+python3 scripts/dev.py build candidate
+python3 scripts/dev.py test fast --compiler build/bin/coil-candidate --quick
+python3 scripts/dev.py test fast --compiler build/bin/coil-candidate
 ```
 
 The candidate command stages the active compiler against this checkout's compiler
@@ -37,14 +38,13 @@ modules, performs one build, and obtains the platform's LLVM link line from
 `scripts/compiler/llvm-link-flags.sh`. It does not run a fixpoint or install
 anything.
 
-It tests clean comparisons at every integer width and in `static-assert`, then verifies
-qualified/transitive namespace re-exports, the `coil.process` facade, and the
-legacy-operation autofixer and its idempotence. The gate reports elapsed time for
-visibility but does not fail based on wall-clock duration.
+`--quick` is the inner loop (at most 60 s); without it, FAST is the pre-push tier
+(at most 270 s). Neither builds the compiler. `docs/reference/COMPILER_TESTS.md`
+describes both, and COMPREHENSIVE, which builds once and runs everything that needs a
+whole-compiler build or an installed toolchain.
 
-Run `python3 scripts/dev.py build full` once, after the fast gate is green. The full
-gate remains authoritative for fixpoint reproduction, snapshots, the behavioral and
-CLI corpora, metaprogram-engine parity, and WebAssembly.
+Run `python3 scripts/dev.py build full` once, after FAST is green. It proves the
+fixpoint and installs; it runs no tests.
 
 ## LLVM-free: zero external dependencies
 
@@ -107,8 +107,9 @@ inject:
 - `src/compiler/main_a64.coil` imports neither and injects hard-error stubs → no
   reference to any LLVM symbol → links no libLLVM.
 
-There is no code duplication between them, and the gate-full corpus includes both
-top files so the snapshot oracle keeps them from drifting apart.
+There is no code duplication between them. Each is built on every release: `build
+full` builds `main.coil`, and `build nollvm` (the CI `llvm-free` job) builds
+`main_a64.coil` and runs the corpus with it, which keeps them from drifting apart.
 
 ## The seeds
 
@@ -134,11 +135,10 @@ tampered seed cannot slip through:
    a faithful compiler reproduces its own object exactly. (stage1 is lowered by
    stage0's default backend; stage2/stage3 use `--backend arm64`. Only the
    stage2==stage3 fixpoint is required.)
-2. **Gates** — the LLVM-free path runs `python3 scripts/oracle.py runtime gate arm64` (built programs
-   produce identical stdout + exit code vs the LLVM reference) and asserts the binary
-   links no libLLVM; the full path additionally runs `python3 scripts/oracle.py gate full` (emitted
-   IR byte-exact vs the reference snapshot across the corpus). The LLVM-free build has
-   no `emit-ir`, so gate-full does not apply to it.
+2. **Gates** — the LLVM-free path runs `python3 scripts/oracle.py corpus arm64` (the
+   runtime corpus built on arm64 produces the reference stdout and exit status) and
+   asserts the binary links no libLLVM. The full path proves the fixpoint only; its
+   tests are `dev.py test fast` and `dev.py test comprehensive`.
 
 This is the standard trusting-trust mitigation: the binary blob is validated against
 source on every use, and you can always re-anchor to a different stage0 with

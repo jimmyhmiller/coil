@@ -155,18 +155,17 @@ and `O_TRUNC` on Linux), and it selects them with
 ```
 
 so the flags stay true compile-time literals (no runtime branch at any use) and
-are still right under cross-compilation. `scripts/compiler/oracle/gate-target-os.sh`
-pins this by diffing `emit-ir` across `--target` values, which is the only place
-the property is observable — a cross-built binary never runs on the builder.
+are still right under cross-compilation. FAST's `cli/cross` step pins this by
+checking the folded `(target-arch)`/`(target-os)` choice across `--target` values,
+which is the only place the property is observable — a cross-built binary never runs on the builder.
 
 New API this project added (all shipped):
 
 - **`(primitive/report NODE MSG)`** — a located compile-time **error** at `NODE`. It **collects**:
   a checker keeps running and surfaces EVERY error in one pass; the build fails after
-  printing them all (see `tests/metaprogramming/located_multi.coil` → 2 errors, then failure).
+  printing them all.
 - **`(primitive/warn NODE MSG)`** — a located, **non-fatal** warning at `NODE`; collects and all
-  print, the build succeeds. What a *linter* wants — `tests/metaprogramming/lint.coil` warns at
-  every `icmp-*`, suggesting `< > = …`.
+  print, the build succeeds. What a *linter* wants.
 - **`(primitive/suggest NODE MSG REPLACEMENT)`** — a `warn` that also proposes a **rewrite**.
   `REPLACEMENT` is a `Code` value, normally built from the author's own subnodes; the
   diagnostic gains a `help: try: …` line, and `coil lint --fix` (and only it) splices it
@@ -188,7 +187,7 @@ New API this project added (all shipped):
   rewrite still reads exactly as written. So a rule may bind around the author's code
   — `(let [tmp 1] (primitive/imul ~their-node tmp))` — without silently rebinding
   their `tmp`; it is rendered `(let [tmp__1 1] (primitive/imul tmp tmp__1))`. Pinned by
-  `tests/compiler/hygiene/suggestion_capture_rule.coil` in `gate-run-meta.sh`.
+  `tests/meta/suggestion_capture_rule.coil` in FAST's `meta` step.
 - **`(primitive/delete NODE MSG)`** — a `warn` that proposes REMOVING the node. Deletion is a
   separate op rather than a `suggest` with an empty replacement for two reasons: no
   `Code` value renders as nothing, and a deletion legitimately covers source the
@@ -208,8 +207,8 @@ New API this project added (all shipped):
   apart. It is the same `ctxt ≠ 0` test autofix uses internally to refuse to edit
   macro-generated code.
 - **Metaprograms are fed the WHOLE program, including all imports** (their own modules
-  and bundled stdlib). A checker sees imported code too — `tests/metaprogramming/imports_test.coil`
-  shows the linter flag an `icmp` in an imported user module.
+  and bundled stdlib). A checker sees imported code too, so a linter flags an `icmp`
+  in an imported user module as well as in the entry.
 - **Checkers also see source `import` and `export` declarations.** The loader keeps
   these out of the checked runtime program but adds their original, source-spanned
   forms to the checker-facing module records. That makes syntax-policy rules and
@@ -259,12 +258,12 @@ New API this project added (all shipped):
   form in a returned module record is tagged with that module, so a transform may EMIT
   new top-level defns (a GC dialect's per-type `trace-T`, a root table, a runtime
   import) or drop forms. Demo:
-  `tests/metaprogramming/compile-and-run/addforms.coil` emits a whole new defn.
+  `tests/meta/addforms.coil` emits a whole new defn.
 
   The `do` is not optional padding, and it is the easiest thing to get wrong: a
   return value that is not a `do` bundle is read as ONE module record, so handing
   back the argument unchanged — the identity transform — fails with *"a module
-  record's head must be its name symbol"*. `tests/metaprogramming/safe_dialect.coil`
+  record's head must be its name symbol"*. `tests/meta/safe_dialect.coil`
   shows the shape.
 - **Phase selection.** The two-item registrations keep their semantic behavior: they
   run after expansion and have access to the checked model. Add `:phase before-expand`
@@ -282,12 +281,11 @@ New API this project added (all shipped):
   Two references with the same positive id name the SAME local, so a checker
   distinguishes a **shadowed** local from its outer namesake — which name-matching
   cannot. This is what a borrow/move checker keys its dataflow on. Demo:
-  `tests/metaprogramming/compile-and-run/borrowlike.coil` (a use-after-free checker).
+  `tests/meta/borrowlike.coil` (a use-after-free checker).
 - **Generic reflection.** `code-field-type`/`code-field-kind` accept a type
   **instantiation** `(Gen A B)`, not only a bare name, and substitute the type
   parameters — `code-field-type (Pair i64 (ptr u8)) 1` → `(ptr u8)`. So a derive/
-  trace generator sees concrete field types through a generic. Demo:
-  `tests/metaprogramming/compile-and-run/genrefl_test.coil`.
+  trace generator sees concrete field types through a generic.
 - **`(transform FN)`** — there is ONE kind of transform, and it is semantic. It runs
   to a fixpoint: each round it reads the checked program (via `code-decl` etc.) to
   decide its rewrite, then the pipeline re-resolves + re-typechecks. It also TOLERATES
@@ -303,9 +301,8 @@ New API this project added (all shipped):
   there is no model and the transform rewrites purely syntactically (e.g.
   `inc`→`iadd`, where `inc` is undefined until the rewrite). The authoritative
   strict check happens once, after the fixpoint. So one primitive covers
-  both type-aware rewrites and syntactic desugarings. Demos: `tests/metaprogramming/retkind*.coil`
-  (rewrites a marker by the wrapped call's real return type) and `dialect.coil`/`tx_test`
-  (`inc`→`iadd`).
+  both type-aware rewrites and syntactic desugarings: rewriting a marker by the
+  wrapped call's real return type, or `inc`→`iadd` (`tests/meta/safe_dialect.coil`).
 - **`(transform-once FN)`** — the single-pass semantic variant. It receives the
   same checked program and its output still receives the authoritative strict
   resolve/typecheck, but Coil does not execute it a second time to prove a
@@ -335,14 +332,14 @@ New API this project added (all shipped):
   located exactly at NODE in a partial model. A dialect transform uses it to find the
   expressions that do not check yet, and why, and rewrite exactly those; together with
   `type-of` on their subexpressions it can make type-directed rewrites of code that is
-  not valid Coil until rewritten. Demo: `tests/metaprogramming/partial_model_test.coil`.
+  not valid Coil until rewritten.
 - **`(primitive/type-of NODE)` → the expression's inferred type** as `Code` (e.g. `i64`,
   `(ptr i64)`), or `:unknown`. This is the type the real type-checker inferred, not
   syntax — a call `(getf)` reports `f64` because `getf` returns `f64`. Demo:
-  `tests/metaprogramming/nofloat*.coil` bans floating-point-typed expressions.
+  `tests/meta/nofloat.coil` bans floating-point-typed expressions.
 - **`(primitive/code-file NODE)` → the source file name** of a node, and **`(primitive/code-from-user? NODE)`
   → bool** (true for a real file, false for a bundled `<…>` source). So a linter can
-  *scope itself* — `tests/metaprogramming/lint.coil` warns only where `(primitive/code-from-user? f)`, which
+  *scope itself*, warning only where `(primitive/code-from-user? f)`, which
   skips the standard library while still linting the user's own modules. (Checkers can't
   call imported string functions — the closure doesn't include them — so `code-from-user?`
   does the check in the compiler and hands the checker a bool.)
@@ -376,13 +373,13 @@ New API this project added (all shipped):
   list EXPOSE ([STATEFUL_JIT.md](STATEFUL_JIT.md)). These are functions a metaprogram
   calls. The compiler does nothing with them by itself, and what to hand over is
   always the caller's choice.
-  `tests/compiler/features/host_environment*.coil` embed an environment and hand it
+  `tests/jit/host_environment*.coil` embed an environment and hand it
   to a session.
 - **`(checker FN)` / `(transform FN)`** — register a whole-program metaprogram.
 - **A dialect is a single import.** A module that contains `(checker …)`/`(transform …)`
   registrations *is* a dialect — importing it applies the whole stack (import order =
   pass order; transformers run before checkers). No new syntax; the module is the
-  manifest. See `tests/metaprogramming/safe_dialect.coil`.
+  manifest. See `tests/meta/safe_dialect.coil`.
 
 ## The engine: everything compiles
 
@@ -391,7 +388,7 @@ program (`metalower.coil`: `Code` -> opaque handle, code ops -> boundary calls),
 compiles it with the ordinary pipeline (cached content-addressed under
 `~/.cache/coil/metaprog`), and runs each entry as **native code**. Everything the
 language can do, a metaprogram can do — generics, HashMap, `malloc`, libc FFI at
-expansion time (`tests/metaprogramming/compile-and-run/arbitrary.coil`).
+expansion time (`tests/meta/samecode_test.coil` runs the same code both ways).
 
 This covers **every** compile-time call site with one semantics: macros, `(meta …)`
 generators, checkers, transforms, and `(comptime E)` / `(const …)` folding. So a helper

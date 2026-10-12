@@ -99,8 +99,9 @@ This subset was expanded from a narrower one (originally sized to Coil's own
 `slice`/`atomic`/`simd` stdlib helpers) to also cover `lib/paper`'s SIMD
 raytracer (a real external project) — verified end to end by snapshot-diffing
 its rendered output against the LLVM backend byte-for-byte, not just by
-compiling. See `tests/compiler/oracle/arm64/tests/llvm-ir-ops.coil` for
-targeted coverage of every op above.
+compiling. A per-op test file (`llvm-ir-ops.coil`) covered every op above until
+the test restructure of 2026-10-12 removed it; the ops are now exercised only
+where the corpus and SIMD tests reach them.
 
 ## DWARF (always on)
 DWARF v4: CU (language C, not-optimized),
@@ -112,31 +113,25 @@ the `.o`; the linker's debug map makes lldb find it (same as `clang -g` without
 dsymutil).
 
 ## Gates (behavioral — runtime equality, not IR equality)
-`tests/compiler/oracle/arm64/`:
-- `tests/*.coil` — 11 adversarial feature tests beyond the examples corpus:
-  narrow-width wraparound + signed div/rem negatives + u2/i3/u7 arithmetic,
-  NaN-aware float comparisons + frem + f32 rounding, ABI stress (10 stack
-  args, mixed int/float, struct sizes 1..24B across every AAPCS64 class,
-  HFA2/HFA4, nested structs, sret), 328-byte loop-path aggregate copies +
-  sums carrying aggregates, labeled break/continue with aggregate break
-  values, odd-width bitfields (u1/u3/u4/u9/u11/u12 across u8/u32 backings),
-  6-arg variadic snprintf + qsort-callback fnptrs + fnptr tables, 4000-deep
-  mutual recursion + ackermann + hashmap stress (200 string keys),
-  8-variant sums + Option<Result<struct>> nesting + recursive trees,
-  atomic old-value semantics + static globals; the expanded `llvm-ir` op
-  subset above (bitcast/icmp incl. i128/fcmp/select/sext-zext-trunc/float
-  conversions/bitwise-shift-div-rem/plain load-store/getelementptr/
-  masked.gather/sqrt, plus inline vector-constant literals and general
-  shufflevector). Verified byte-for-byte against
-  the LLVM backend. Teeth re-proven: compiling signed `<` as unsigned fails 8/54.
-- `python3 scripts/oracle.py runtime snapshot arm64 --compiler <bin>` — builds the corpus with the **LLVM** backend and
-  records stdout+exit per program.
-- `python3 scripts/oracle.py runtime gate arm64 --compiler <bin>` — builds the same corpus with `--backend arm64`, runs,
-  diffs stdout+exit byte-for-byte. Teeth: a miscompiled corpus program fails.
-- lldb gate (`gate-cli.sh`): breakpoint-by-line, step, `frame variable` on
-  scalars/structs.
-- The finale: the arm64-built self-host compiler must itself pass the existing
-  oracle gates (it is a working compiler), and `bench` compile-time comparison
+The arm64 backend is held to the LLVM backend's behaviour by the runtime corpus
+(`tests/corpus`, see `docs/reference/COMPILER_TESTS.md`): eight self-checking
+programs whose references were blessed only where the arm64 and LLVM builds
+agree. They cover narrow-width wraparound and signed division, NaN-aware float
+comparison and f32 rounding, ABI stress (stack arguments, every AAPCS64 struct
+class, HFAs, sret), large aggregate copies, labelled break and continue, odd-width
+bitfields, variadic snprintf and qsort callbacks, deep recursion, nested sums,
+atomics and static globals.
+- `python3 scripts/oracle.py corpus arm64 --compiler <bin>` builds each program
+  with `--backend arm64`, runs it, and compares stdout and the exit status with
+  the reference. FAST runs it as `corpus/arm64`; the LLVM-free bootstrap gates on it.
+- `python3 scripts/oracle.py corpus bless --compiler <bin>` rewrites the references,
+  refusing any program whose arm64 and LLVM builds disagree.
+- `scripts/tests/c-abi.py` (FAST `c-abi`) links arm64 and LLVM objects together
+  and against C.
+- lldb: FAST's `cli/debuginfo` step sets a breakpoint by line and reads a
+  variable from a `-g` build.
+- The finale: the arm64-built self-host compiler must itself pass the runtime
+  corpus (it is a working compiler), and `bench` compile-time comparison
   must show ≥10× vs the LLVM backend on both a small program and
   `src/compiler/main.coil`.
 
@@ -163,7 +158,7 @@ once with the LLVM backend, iterate with the arm64 backend.
 
 ## Status / progress log
 - [x] Architecture survey, lowering spec, llvm-ir + extern + DWARF inventories.
-- [x] Behavioral snapshot harness (`python3 scripts/oracle.py runtime snapshot arm64`).
+- [x] Behavioral snapshot harness (now `python3 scripts/oracle.py corpus arm64`).
 - [x] a64 encoder (llvm-mc-verified) + spike: fib → .o → link → runs (exit 55).
 - [x] Mach-O writer (BRANCH26/PAGE21/PAGEOFF12/UNSIGNED relocs, symbol permutation).
 - [x] Full Expr lowering: **42/42 behavioral corpus gate** (sums/match, slices,
@@ -192,6 +187,3 @@ once with the LLVM backend, iterate with the arm64 backend.
 - [x] 10× bench report (see Results above: 17.1× on the compiler itself).
 - [ ] (future) direct executable emission + ad-hoc codesign to drop the `cc`
       link and its ~45 ms floor on small programs.
-- Note: `tests/compiler/oracle/full` snapshots are of the compiler's OWN source —
-  regenerate (`python3 scripts/oracle.py snapshot full`) after changing src/compiler, or the full gate
-  reports a stale mismatch on `src/compiler/main.coil`.

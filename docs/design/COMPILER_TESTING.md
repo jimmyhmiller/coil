@@ -1,5 +1,16 @@
 # Compiler testing: a small trust core, deftest for everything else
 
+> **Superseded (2026-10-12).** The compiler's tests were restructured another way;
+> `docs/reference/COMPILER_TESTS.md` describes what exists. Two serial, budgeted
+> tiers replaced the gates this plan meant to shrink: FAST (pre-push, at most 270 s,
+> never builds the compiler) and COMPREHENSIVE (release). Instead of a deftest
+> testkit and canaries, most coverage is end-to-end: eight self-checking runtime
+> programs (`tests/corpus`), byte-exact diagnostic goldens (`tests/diag`), a shell
+> CLI contract (`scripts/tests/fast/cli.sh`), a multi-feature project fixture, and
+> deftest suites for the standard library. `gate-cli.sh`, the stage snapshots and
+> `modernize-fast` were deleted rather than migrated. The rest of this document is
+> the original plan.
+
 **Status:** plan. Written after the trait-method hygiene work
 (`TRAIT_METHOD_HYGIENE.md`), which demonstrated both sides of this design: the
 gates caught two bugs the author's tests missed, and deftest itself was the

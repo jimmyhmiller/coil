@@ -439,12 +439,12 @@ a named metaprogram representation; this plan does not assume Code can be stored
 in arbitrary runtime structs.
 
 Update guide, formatter, source tools, migration notes, manifest and snapshots.
-Run focused regressions and `modernize-fast` against the candidate without
-rebuilding between tests. Run the generated gate because declaration generation,
-Code transport and lifetime behavior are affected. Audit all snapshots together;
-use `refresh-snapshots` for intentional cross-cutting changes. Finally run
-`python3 scripts/dev.py build full` once, install the verified toolchain globally,
-commit, and push as required by the repository guide.
+Run FAST (`dev.py test fast --compiler <candidate>`) against the candidate without
+rebuilding between tests. Run COMPREHENSIVE's JIT and generated slice (`dev.py test
+comprehensive --compiler <installed> --only jit --only generated`) because
+declaration generation, Code transport and lifetime behavior are affected. Finally
+run `python3 scripts/dev.py build full` once, install the verified toolchain
+globally, commit, and push as required by the repository guide.
 
 ### Required regression matrix
 

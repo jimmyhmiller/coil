@@ -70,9 +70,9 @@ bitwise/shift/div/rem, plain load/store, `getelementptr`,
 that document's description of the subset and its scope edges (i128 is
 eq/ne-only; `getelementptr`/`masked.gather` cover the exact shapes a real
 external SIMD project needed) applies here unchanged. Verified against the
-LLVM backend the same way: byte-for-byte on `tests/compiler/oracle/arm64/tests/llvm-ir-ops.coil`
-(shared between both native backends' corpora) and on the project that
-motivated the expansion.
+LLVM backend the same way: byte-for-byte on a per-op test program shared by both
+native backends' corpora (removed in the test restructure of 2026-10-12) and on
+the project that motivated the expansion.
 
 The scalar float math intrinsics `coil.math` uses are lowered differently: SSE2
 has `sqrtss`/`sqrtsd`, and IEEE `minimum`/`maximum` is an inline sequence
@@ -80,7 +80,10 @@ has `sqrtss`/`sqrtsd`, and IEEE `minimum`/`maximum` is an inline sequence
 included, since SSE2 has no rounding instruction, calls the libm function.
 
 ## Gates
-`tests/compiler/oracle/x64/`:
+The scripts are in `scripts/compiler/oracle/x64/`. They run on an x86-64 Linux
+host: `python3 scripts/dev.py build x64` runs them after its fixpoint, and so does
+COMPREHENSIVE's `x64/host` step (`scripts/tests/x64-host.py`), which also runs
+`gate-elf.sh`.
 - `gate-encode.sh` — every instruction the encoder can emit is diffed against
   **llvm-mc**, an independent assembler. 108 cases covering the encoding edge
   cases: `r8`–`r15` in each operand position, `rsp`/`r12` as a memory base
@@ -95,10 +98,11 @@ included, since SSE2 has no rounding instruction, calls the libm function.
   checks readelf's view and that the link produces no warnings (a missing
   `.note.GNU-stack` silently gives the whole program an executable stack).
   *Teeth: a wrong `sh_info` makes the real linker reject the object.*
-- `python3 scripts/oracle.py runtime gate x64` — builds the 57-program corpus with `--backend x64`, runs each,
-  and diffs stdout+exit byte-for-byte against the LLVM backend's behavior.
-  Runtime equality, not IR equality, is the contract between backends.
-  *Teeth: compiling signed `<` as unsigned fails 8 programs.*
+- `python3 scripts/oracle.py corpus x64` — builds the runtime corpus (`tests/corpus`,
+  eight self-checking programs) with `--backend x64`, runs each, and compares
+  stdout and the exit status with the references, which record the LLVM and arm64
+  backends' agreed behaviour. Runtime equality, not IR equality, is the contract
+  between backends.
 - `gate-cabi.sh` — the SysV eightbyte rules, differentially against **gcc**.
   This gate exists because the corpus structurally cannot reach those rules:
   for Coil-to-Coil calls this backend passes aggregates BY POINTER (same as

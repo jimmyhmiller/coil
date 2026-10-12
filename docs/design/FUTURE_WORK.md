@@ -7,7 +7,7 @@ the work is.
 ## Where Coil stands
 
 The compiler core is done and is not the bottleneck. Coil is self-hosted, self-verifying
-(rebootstrap fixpoint + the `tests/compiler/oracle` gates over a 96-file corpus), self-hosts on
+(rebootstrap fixpoint + the FAST and COMPREHENSIVE test tiers, `docs/reference/COMPILER_TESTS.md`), self-hosts on
 macOS arm64 and Linux x86-64, emits wasm, and even runs *inside* wasm where it
 self-compiles to a byte-identical arm64 binary. Diagnostics carry `file:line:col` and a
 caret. DWARF works through lldb. Traits, generics, sums, slices, strings, a module

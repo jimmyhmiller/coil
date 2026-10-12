@@ -54,7 +54,7 @@ producing an empty `.dSYM`, zero line rows, and "No source available" in lldb.
   `DUMMY` until the reader stamps real multi-source spans) — never wrong info, just
   none.
 
-Gated in `scripts/compiler/oracle/gate-cli.sh`: with the `.o` deleted so lldb must use the
+Gated in FAST's `cli/debuginfo` step (`scripts/tests/fast/cli.sh`): with no `.o` left, so lldb must use the
 `.dSYM` alone, a line breakpoint still resolves — which fails on a seed that emits no
 relocations. Beyond the gate, `frame variable` at such a breakpoint reports typed
 values (`(app.Pt *) p = 0x16fdfde70`, `(long) s = 42`).

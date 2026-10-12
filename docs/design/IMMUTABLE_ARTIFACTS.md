@@ -374,7 +374,7 @@ with the old arity were accepted and callers with the new one refused.
 for names the candidate redefines; it now does so only for functions the candidate
 inherited. Regression: `jit_redefined_signature.coil`; filed in `coil-bugs`.
 
-**The client exists.** `tests/compiler/features/jit_live_checker.coil` is a live
+**The client exists.** `tests/jit/live_checker.coil` is a live
 checker written only against `coil.jit`: submit an edit, adopt the new state,
 re-check what it reports stale (and what those re-checks stale in turn), keep a list
 of what is broken. An edit that does not check leaves the state alone; narrowing
@@ -945,11 +945,14 @@ is the live checker built as a client: a signature edit in a large program repor
 exactly its readers as stale, a body edit reports none, and work per edit is
 proportional to the definitions re-checked.
 
-Fixtures every phase keeps green: the `jit-static-session.py` list (notably
-`retained_heap`, `jit_source_sharing`, `jit_body_sharing`, `jit_impl_lifetime`,
-`jit_type_lifetime`, `jit_metadata_lifetime`, `jit_monomorph_report_lifetime`,
-`jit_retire_declarations`), `jit-session-memory.py`, `jit-source-graph.py`,
-`jit-single-form.py`, plus modernize-fast and the self-host fixed point. The
+Fixtures every phase keeps green: the `jit-static-session.py` hosts (the lifetime
+fixtures in `tests/jit/`: `impl_lifetime`, `type_lifetime`, `metadata_lifetime`,
+`monomorph_report_lifetime`, `retire_declarations`), `jit-session-memory.py` and
+`jit-single-form.py` (COMPREHENSIVE's `jit/*` steps), plus `dev.py test fast` and the
+self-host fixed point. The `retained_heap`, `jit_source_sharing` and
+`jit_body_sharing` fixtures, which compiled the compiler's internals, and
+`jit-source-graph.py` (folded into `jit-static-session.py`) went in the test
+restructure of 2026-10-12. The
 numeric bounds in `jit-session-memory.py` (`retained-bytes` drift ≤ 64, body
 growth < 4096/step) describe the snapshot allocator and will need restating in
 terms of artifact and index bytes — restated, not loosened.

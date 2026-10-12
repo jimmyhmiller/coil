@@ -1,5 +1,13 @@
 # Trait methods escape macro hygiene
 
+> **Tests moved (2026-10-12).** The test files and gate scripts named below
+> (`tests/metaprogramming/…`, `tests/compiler/hygiene/…`,
+> `tests/compiler/reader_metaprograms/…`, `gate-run-meta.sh`, `gate-staged-meta.sh`)
+> were deleted or consolidated in the test restructure. What tests this area now is
+> FAST's `meta` and `readers` steps (`scripts/tests/fast/meta.sh` and `readers.sh`,
+> fixtures in `tests/meta/` and `tests/readers/`); see `docs/reference/COMPILER_TESTS.md`.
+> The record below is kept as written.
+
 **Status: FIXED.** Parts 1–3 of the reverted attempt (`78e599e`) are reinstated,
 and the binder obstacle of §5 is closed by **re-baring binder heads at the
 expansion boundary** (§10). All ten reproductions in `tests/compiler/hygiene/`

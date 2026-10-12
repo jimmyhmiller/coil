@@ -468,11 +468,11 @@ definition that holds it by value:
   method).
 
 A definition marked `:jit/retain false` is released once nothing uses it, so it
-stops being reported. `tests/compiler/features/jit_env_stale_complete.coil`
+stops being reported. `tests/jit/env_stale_complete.coil`
 lists the expected set for each kind of edit.
 
 `jit-reset!` refuses while any state is held. Source that stages session state
-cannot be checked as a value. `tests/compiler/features/jit_live_checker.coil` is
+cannot be checked as a value. `tests/jit/live_checker.coil` is
 a complete client that names its own versions; `jit_env_native.coil` checks
 against a running session.
 
@@ -545,7 +545,7 @@ build the text itself from `meta/declaration`, `meta/definition-source`,
 `meta/module-header`, `meta/module-impls` and `meta/source`, and `meta/source`
 renders any form as text, so what it learns can be written to a file with `coil.fs`
 and read in a later build, or handed on in any form it likes.
-`tests/compiler/features/host_environment.coil` is a complete host, and
+`tests/jit/host_environment.coil` is a complete host, and
 `src/examples/jit_expose/` is a small demo you can run
 (`COIL_NAMESPACE_ROOTS=src/examples coil run src/examples/jit_expose/demo.coil`): a
 metaprogram hands an application to a session, which type checks new code against

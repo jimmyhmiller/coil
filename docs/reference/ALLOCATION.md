@@ -437,10 +437,13 @@ back-to-back with it, not a comparison of numbers from different rounds.
 
 ## How to verify
 
-`gate-full` is the safety net: it asserts the emitted IR is byte-identical to the
-reference across a 60-program corpus, so any allocation change that alters behaviour
-fails loudly. Run the ten stage gates too — they say *which* stage moved when something
-does. `python3 scripts/dev.py build full` runs all of it plus the fixpoint check.
+FAST is the safety net (`python3 scripts/dev.py test fast --compiler <candidate>`):
+the runtime corpus, the examples and the stdlib suites must behave exactly as their
+references say, so an allocation change that alters behaviour fails loudly. A change
+meant to preserve meaning exactly can also be checked with
+`scripts/tests/pipeline-differential.py`, which compares `dump-checked` and
+`dump-mono` against a reference compiler. `python3 scripts/dev.py build full` proves
+the fixpoint.
 
 Benchmark honestly: min-of-3, back-to-back against the previous binary in the same
 session. Single measurements at this scale move ±20% with machine load — during this work

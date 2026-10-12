@@ -104,6 +104,7 @@ Inside a project, a bare `coil test` discovers test files instead:
 ```sh
 coil test                  # every file in the default suites
 coil test parser           # only files whose path contains "parser"
+coil test parser lexer     # files whose path contains either
 coil test --list           # what would run, grouped by suite
 coil test --jobs 4         # run up to four tests at once
 coil test --no-run         # compile and link, run nothing

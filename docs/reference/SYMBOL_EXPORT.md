@@ -10,8 +10,9 @@ and x86-64 (SysV) via the C-ABI thunk — plus the tooling to ship a library:
   typedefs) for the export set — the inverse of `coil cimport`.
 
 Verified end to end: a C client `#include`s the generated header, links the generated
-`.a`, and calls Coil (incl. struct by value) correctly (gated by `gate-cli.sh`,
-which builds a C client against an exported Coil library on both backends). The only
+`.a`, and calls Coil (incl. struct by value) correctly (gated by FAST's `cli/cexport`
+step, which builds C clients against exported Coil code on both backends, and the
+`c-abi` step, which crosses the C boundary with aggregates of every shape). The only
 deferred item is phase 5 (freestanding entry as an explicit
 export, to internalize the rest of a bare-metal image).
 

@@ -89,14 +89,15 @@ inside an outer streaming callback and both complete.
 TLS, redirect or cleanup behavior — the failure mode where a fix lands in one path and
 not the other.
 
-The existing buffered integration gate (`scripts/tests/http-client.sh`) passes unchanged,
+The existing buffered integration test (now in `scripts/tests/http.sh`) passes unchanged,
 which is the evidence that the rewrite preserved behavior.
 
 ## Tests
 
-`scripts/tests/http-client-stream.sh` starts `tests/http_client_stream_server.py` and runs
-`tests/http_client_stream_integration.coil`; each check returns a distinct exit code so a
-failure names itself. `python3 scripts/dev.py test http` runs both HTTP gates.
+`scripts/tests/http.sh` starts `tests/http/client_stream_server.py` and runs
+`tests/http/client_stream_integration.coil`; each check returns a distinct exit code so a
+failure names itself. It runs the buffered client's test the same way, and is
+COMPREHENSIVE's `http` step.
 
 The load-bearing test is **`check-streams-incrementally`**. The server flushes three
 fragments 300 ms apart, and the test asserts the first callback ran well before the
@@ -110,8 +111,8 @@ consumer stop after a partial body, total timeout after partial delivery, connec
 connection refused before headers, disconnect mid-body, 50 repeated requests for leaks and
 fd exhaustion, reentrancy, and the buffered API still behaving as before.
 
-`tests/http_client_stream_compile.coil` covers the whole exported surface with no network,
-so the API shape is gated even where the suite cannot run.
+A compile-only file covering the whole exported surface with no network was run by no
+gate, had stopped compiling, and was deleted in the test restructure of 2026-10-12.
 
 ## Not done
 

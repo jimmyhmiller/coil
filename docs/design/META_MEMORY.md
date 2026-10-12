@@ -25,10 +25,10 @@ natural recursion peaks at about 250 MB in 0.4 s, the same as a hand-written bui
 the old copying needed about 3.9 GB at 8,000 and would need about a terabyte at
 128,000. `coil.lint.meta` is deleted: the `code-rest` rule was already stale since
 views, and the other rules warned about idioms that no longer cost anything. The
-evidence is `tests/compiler/features/meta_shared_splice.coil` (the lists equal
-builder-made ones at sizes under, at and over the threshold, read every way a list can
-be read) and `meta_shared_splice_scale.coil` (100,000 items; it does not finish unless
-splices share). The text below records the design as it was written.
+evidence was `meta_shared_splice.coil` (the lists equal builder-made ones at sizes
+under, at and over the threshold, read every way a list can be read) and
+`meta_shared_splice_scale.coil` (100,000 items; it does not finish unless splices
+share), both deleted in the test restructure of 2026-10-12. The text below records the design as it was written.
 
 Deviations from the plan below, and why:
 
@@ -306,8 +306,8 @@ walkers — small n today, latent), the remaining `code-rest` recursions in
 harmless, but fix for idiom hygiene), and whatever the lint finds that grep
 didn't.
 
-**Regression teeth (phase 1):** a gate-cli test generates a flat 8,000-form
-`scope` body and runs `coil check` under `ulimit -v` 3 GiB. A quadratic
+**Regression teeth (phase 1):** a gate-cli test (deleted with gate-cli on 2026-10-12)
+generated a flat 8,000-form `scope` body and ran `coil check` under `ulimit -v` 3 GiB. A quadratic
 regression OOMs the gate; the linear implementation passes with headroom.
 
 ## Migration phases

@@ -78,16 +78,14 @@ COIL_TRACE=1 /absolute/path/to/coil build
 
 Time ordinary builds without COIL_TRACE; check that each invocation succeeds.
 For a native sample, launch the build and run `sample PID 5 -file profile.txt`.
-The dedicated compiler regressions run with:
-
-```sh
-python3 scripts/tests/compile-performance.py build/bin/coil
-```
+The dedicated compiler regressions ran with `scripts/tests/compile-performance.py`,
+which pinned internal IR and trace order and was deleted in the test restructure of
+2026-10-12.
 
 They check snapshot mutation/evaluation order at O0 and O3, bulk-copy IR,
 function lookup ambiguity and exact identity, growing and republished models,
 non-function declaration invalidation, and all syntax accessor variants.
-The regression script is included in the generated gate.
+The regression script was in the generated gate until then.
 
 The dedicated regressions also passed against the verified self-host compiler.
 The focused modernization gate, full generated/JIT gate, all-stage snapshot

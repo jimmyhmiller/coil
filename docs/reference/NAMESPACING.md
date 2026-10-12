@@ -143,8 +143,8 @@ goes through the same `use-refers` predicate as every other import, consulted by
 
 Four mirrors of one rule is what would make this a hack: an `:exclude [<]` that hid the
 name from the resolver but left the operator callable would be worse than no feature.
-Each surface has its own `tests/compiler/features/refer_exclude_*_rejected.coil` fixture
-in the focused inner-loop gate for exactly that reason.
+For exactly that reason the diagnostic golden `tests/diag/compile/names.coil` excludes
+the `<` trait method from `coil.core` and requires its use to be rejected.
 
 Trait methods need one extra distinction. A method whose declaring trait is unique is
 callable today with **no import at all**, so the mere absence of an import cannot suppress
@@ -226,14 +226,13 @@ ever needed to contain *more* metas, the two passes would become a fixpoint loop
 
 ## How this is gated
 
-Covered by `tests/compiler/oracle`:
-
-- **`gate-cli.sh`** — end-to-end teeth: namespace lookup independent of file placement
-  and process CWD, rejection of relative paths, pre-typecheck autofix of legacy imports,
-  bundled namespace isolation, and located export errors.
-- **`python3 scripts/oracle.py gate resolved|expand`** — snapshot focused resolver and
-  expander fixtures, so any drift in name resolution or macro hygiene
-  (including the second-order cross-module case) shows up as a diff.
-- **`python3 scripts/oracle.py gate full`** — emitted IR for a compact cross-platform set,
-  byte-exact, which catches a resolution change that
-  survives to codegen.
+- **FAST's `projects` step** (`scripts/tests/fast/projects.sh`): a module placed deep
+  in the tree is imported by its namespace, a path-style import is rejected, and a
+  workspace's members import each other with no dependency declaration.
+- **FAST's `diag/compile` step**: `tests/diag/compile/names.coil` pins the located
+  name-resolution errors (undefined and unbound names, a name not imported, an
+  `:exclude`d trait method, ambiguous `:use`, a private re-export) in one run.
+- **COMPREHENSIVE's `installed/allns` step**: every advertised `coil.*` namespace
+  resolves from an install, outside the checkout.
+- `scripts/tests/pipeline-differential.py` (manual): a change to resolution that is
+  meant to preserve meaning must leave `dump-checked` and `dump-mono` byte-identical.

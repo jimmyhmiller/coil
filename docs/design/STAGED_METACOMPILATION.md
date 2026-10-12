@@ -1,5 +1,13 @@
 # Staged metacompilation
 
+> **Tests moved (2026-10-12).** The test files and gate scripts named below
+> (`tests/metaprogramming/…`, `tests/compiler/hygiene/…`,
+> `tests/compiler/reader_metaprograms/…`, `gate-run-meta.sh`, `gate-staged-meta.sh`)
+> were deleted or consolidated in the test restructure. What tests this area now is
+> FAST's `meta` and `readers` steps (`scripts/tests/fast/meta.sh` and `readers.sh`,
+> fixtures in `tests/meta/` and `tests/readers/`); see `docs/reference/COMPILER_TESTS.md`.
+> The record below is kept as written.
+
 > The Scheme dialect this document uses as its guest language — every
 > `src/apps/scheme/…`, `coil.scheme.…`, and `tests/scheme/…` path below —
 > now lives in the **coil-experiments** repository. The `(stage MARKER …)`
@@ -413,8 +421,10 @@ linkage check rejected it — "unscoped generated identifier 't'".
 `gate-staged-meta.sh` used a bare `"${env[@]}"` under `set -u`, which is an
 unbound-variable error for an EMPTY array in bash 3.2 — the bash macOS ships. The
 gate died on its first mode before testing anything. It was also referenced from
-nowhere: not `dev.py`, not CI. It is now `dev.py test meta-entries` (alongside
-`gate-run-meta.sh`, which had the same problem) and a step in the `full` CI job.
+nowhere: not `dev.py`, not CI. It became `dev.py test meta-entries` (alongside
+`gate-run-meta.sh`, which had the same problem) and a step in the `full` CI job;
+since 2026-10-12 the staged-entry checks are part of FAST's `meta` step, which CI
+runs.
 
 `rebootstrap-linux.sh` was *not* given the battery back. The branch proposed
 restoring the whole Linux gate battery there; `58b6e68` had removed it on

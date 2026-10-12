@@ -4,8 +4,7 @@ Coil self-hosts on Linux x86-64. From a clean checkout on an Ubuntu-ish box with
 LLVM 21 (apt.llvm.org) and a C compiler:
 
     python3 scripts/dev.py build linux          # seed -> stage1 -> stage2 -> stage3
-                                           # fixpoint + linux gate-full + linux
-                                           # gate-run + gate-cli, installs build/bin/coil
+                                           # fixpoint, installs build/bin/coil
 
 `build/bin/coil` and `build/bin/coil-nollvm` are ignored build outputs. The Linux
 compiler installs under ignored `build/bin/`, and its seed is
@@ -37,8 +36,8 @@ except where noted):
   MObj JIT itself emits arm64 and never runs on this host (see gaps).
 - **`main.coil`** — the in-memory MObj comptime fast path is registered only when
   the HOST is arm64 (`host-arm64?`); on Linux, comptime sites the interpreter can't
-  fold take `comptime_eval`'s dylib route (`cc -shared` + `dlopen`), which passes
-  the full gate-cli comptime battery including aggregate/sum/string readbacks.
+  fold take `comptime_eval`'s dylib route (`cc -shared` + `dlopen`), which handles
+  aggregate, sum and string readbacks (`tests/corpus/comptime.coil`).
 - **`driver.coil`** — `run`/`test` prepend `exec` to the `system()` command so a
   signal death reaches `wait-report` unmasked on shells that fork (Linux dash);
   `-arch` (a Mach-O toolchain flag) is not passed on ELF hosts; `dsymutil` is
@@ -51,23 +50,20 @@ except where noted):
   `:at` offsets for explicit ones). Invisible on arm64 (AAPCS64 never flattens
   int-field structs); on x86 it unblocked by-value packed/explicit structs entirely.
 
-## Verification (the Linux oracle)
+## Verification on Linux
 
-- `python3 scripts/oracle.py runtime gate linux` — builds the shared behavioral corpus with the
-  LLVM backend and diffs stdout+exit against the SAME reference snapshots the arm64
-  gate uses (56/56; the two arm64-register-convention examples must fail with the
-  per-arch diagnostic, asserted).
-- `python3 scripts/oracle.py linux-ir gate|snapshot` — byte-exact `emit-ir`
-  against a Linux-blessed IR snapshot (`full-reference/`, 58 refs + the 2 asserted
-  per-arch errors). The macOS snapshot can't serve here (triple/datalayout/musttail
-  legitimately differ).
-- `gate-cli.sh` — shared, now host-aware: Mach-O cross-link, arm64-object execution,
-  and dSYM checks run on Darwin only; the gen-10 perf probe skips when the committed
-  (Mach-O) seed can't exec on the host; everything else — including the full
-  compiled-comptime readback battery — runs on both.
-- `tests/metaprogramming/compile-and-run/parity.sh` — 114/116 byte-identical between the
-  interpreter and compiled metaprogram engines on Linux. The 2 divergences are
-  pre-existing engine differences, not port issues (see INTERP_DELETION.md).
+`rebootstrap-linux.sh` proves the fixpoint and runs no tests. The tests that run on
+Linux:
+
+- COMPREHENSIVE's `x64/host` step (`scripts/tests/x64-host.py`, run from a Mac over
+  ssh) bootstraps on the Linux host, runs the runtime corpus on the LLVM backend
+  (`python3 scripts/oracle.py corpus llvm`), then self-hosts through the x64 backend
+  and runs its gates (see `X64_BACKEND.md`).
+- CI's `linux` job builds with `dev.py build linux` and runs the SIMD slice of
+  COMPREHENSIVE.
+- `python3 scripts/dev.py test fast --compiler build/bin/coil` runs on Linux too;
+  its arm64-only and Mach-O-only checks (the arm64 lanes, `-g` with dsymutil and
+  lldb, Mach-O cross-links) are macOS-host checks.
 
 ## Known gaps (by design or deferred)
 
@@ -82,7 +78,5 @@ except where noted):
   aggregate values, pointers, or references remain ordinary calls to preserve
   borrowed stack temporaries; their stack use depends on LLVM optimization.
 
-- `gate-diag` on Linux: 31/33 — the two failures are platform-text refs
-  (`02-link-fail` bakes macOS ld64 wording incl. the `_main` underscore;
-  `14-shim-bad-gpr` bakes the arm64-register diagnostic). Pre-existing, not in the
-  Linux authoritative set (`rebootstrap-linux.sh` runs gate-full/gate-run/gate-cli).
+- The link-diagnostic goldens (`tests/diag/link`) record macOS linker wording and
+  the arm64-register diagnostic, so `oracle.py diag gate link` is a macOS check.

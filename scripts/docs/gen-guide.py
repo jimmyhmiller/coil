@@ -10,9 +10,8 @@ Run from the repo root after editing docs/reference/LANGUAGE_GUIDE.md, CHEATSHEE
 or one of the task guides a topic embeds (PROJECTS, TESTING, DEBUGGING, STATEFUL_JIT,
 WASM):
     python3 scripts/docs/gen-guide.py
-then rebuild the compiler (scripts/compiler/rebootstrap.sh) — and because main.coil is in
-the gate corpus, regenerate the snapshot first:
-    python3 scripts/oracle.py snapshot full --compiler build/bin/coil
+then rebuild the compiler (`python3 scripts/dev.py build candidate`, and `build full`
+for the release) so `coil guide` prints the new text.
 """
 import os
 import re

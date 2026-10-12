@@ -1,5 +1,13 @@
 # Trait-method macro hygiene — bug report (received, not yet fixed)
 
+> **Tests moved (2026-10-12).** The test files and gate scripts named below
+> (`tests/metaprogramming/…`, `tests/compiler/hygiene/…`,
+> `tests/compiler/reader_metaprograms/…`, `gate-run-meta.sh`, `gate-staged-meta.sh`)
+> were deleted or consolidated in the test restructure. What tests this area now is
+> FAST's `meta` and `readers` steps (`scripts/tests/fast/meta.sh` and `readers.sh`,
+> fixtures in `tests/meta/` and `tests/readers/`); see `docs/reference/COMPILER_TESTS.md`.
+> The record below is kept as written.
+
 **Status:** open. Reported to this session by another Claude session (`remote-coil`) on
 2026-08-09, on Jimmy's instruction. Recorded here so it survives; **the fix has not been
 attempted.**

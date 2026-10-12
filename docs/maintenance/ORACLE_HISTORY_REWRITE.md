@@ -1,5 +1,10 @@
 # Removing obsolete compiler dumps from Git history
 
+> **`tests/compiler/oracle` was deleted on 2026-10-12**, with every stage snapshot.
+> Diagnostics are now `tests/diag` and runtime references `tests/corpus/reference`
+> (see `docs/reference/COMPILER_TESTS.md`). The procedure below still describes how
+> the old dumps can be removed from history.
+
 The compact oracle keeps targeted `.dump` files in the current tree. Older commits
 contain broad generated snapshots, especially under `load`, `expand`, and their
 expanded `corpus/` directories. Deleting those files normally does not remove their

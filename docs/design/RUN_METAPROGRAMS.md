@@ -330,6 +330,14 @@ clean target; the arity diagnostic; pipe composition; and the
 normal-program regression. Run under the native engine, `COIL_META_INTERP=1`,
 and `COIL_META_ARENA=poison`.
 
+Since the test restructure of 2026-10-12 these checks run in FAST's `meta` step
+(`scripts/tests/fast/meta.sh`, fixtures `tests/meta/run_code_main_{gen,two,sem,float}.coil`
+and `safe_dialect.coil`): the desugar over stdin, two-input mapping, the generator
+round trip, the semantic checker's located error, and the missing-file error. They
+run under the native engine only; identity over stdin, the stdin lint warning, pipe
+composition, and the interpreter and poison-arena passes were dropped, and
+`gate-run-meta.sh` was deleted.
+
 ## Delivery phases
 
 Gated by the usual discipline (fixpoint rebootstrap, gate all, gate-cli,

@@ -132,5 +132,6 @@ Fixed widths are not runtime CPU capability claims. Runtime CPU discovery,
 feature-specific multiversion dispatch, and hardware polynomial instructions
 are not provided by this baseline API yet.
 
-Run `python3 scripts/dev.py test simd --compiler <candidate>` for focused semantics,
+Run `python3 scripts/tests/simd.py full --compiler <candidate>` (COMPREHENSIVE's `simd`
+step; `simd.py fast` is FAST's) for focused semantics,
 negative diagnostics, and deterministic scalar-oracle tests across lane widths.

@@ -300,8 +300,9 @@ exports with by-value record parameters; use LLVM for this Emacs experiment.
 
 Owner-side layout mutation is covered by executable before-expand and after-expand
 transform regressions. Matching duplicate declarations, unequal multiplicities,
-reordering, and declined-reader retries are covered by
-`tests/compiler/features/generated_session_contract.coil`. The shared-state
+reordering, and declined-reader retries were covered by a
+`generated_session_contract` fixture, which compiled the whole compiler and was
+deleted in the test restructure of 2026-10-12; those cases are now untested. The shared-state
 fixture also runs with AddressSanitizer and UndefinedBehaviorSanitizer through
 LLVM. Cross-target execution beyond the local LLVM/direct AArch64 probes remains
 a validation gap; the current implementation carries normalized settings in the
@@ -313,7 +314,8 @@ Validation commands:
 python3 scripts/dev.py build candidate --output build/bin/coil-generated-inprocess-facade
 COIL_TEST_GENERATED_SANITIZERS=1 python3 scripts/tests/generated-modules.py build/bin/coil-generated-inprocess-facade
 python3 scripts/tests/generated-unit-memory.py build/bin/coil-generated-inprocess-facade --units 128
-python3 scripts/tests/extern-aliases.py build/bin/coil-generated-inprocess-facade
-python3 scripts/tests/dynamic-stack.py build/bin/coil-generated-inprocess-facade
-python3 scripts/dev.py test modernize-fast --compiler build/bin/coil-generated-inprocess-facade
+python3 scripts/dev.py test fast --compiler build/bin/coil-generated-inprocess-facade
 ```
+
+FAST covers the extern aliases (`c-abi`) and dynamic stack storage
+(`tests/corpus/memory.coil`) that separate scripts used to.

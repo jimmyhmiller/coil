@@ -1,8 +1,8 @@
 # Coil — Layout Control
 
 > Status: **mostly implemented.** Tiers 1–3 are done and gated
-> (`src/examples/layout.coil` / `bitfields.coil` / `explicit-layout.coil`, all in the
-> `tests/compiler/oracle` corpus): `:c`/`:packed`/`(align N)` strategies, `:explicit`
+> (`src/examples/layout.coil` / `bitfields.coil` / `explicit-layout.coil`, all run by
+> COMPREHENSIVE's `guide-demos` step, and explicit layouts in `tests/corpus`): `:c`/`:packed`/`(align N)` strategies, `:explicit`
 > `:at` offsets + unions, `:bits` bitfields, and the `sizeof`/`alignof`/
 > `offsetof`/`static-assert` primitives. Still future: per-field `:endian`,
 > `deflayout` policies, and sum-type tag/niche control (see the phasing at the
