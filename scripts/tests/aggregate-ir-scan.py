@@ -135,18 +135,16 @@ def check(sources, jobs):
 
 
 sources = sorted((ROOT / "src/examples").glob("*.coil"))
-sources += sorted((ROOT / "tests/compiler/oracle/arm64/tests").glob("*.coil"))
-sources += sorted((ROOT / "tests/compiler/features").glob("aggregate_*.coil"))
-sources += sorted((ROOT / "tests/compiler/features").glob("sum_return_abi*.coil"))
+sources += sorted((ROOT / "tests/corpus").glob("*.coil"))
+sources += sorted((ROOT / "tests/cabi").glob("*.coil"))
 if FULL:
-    sources += sorted((ROOT / "tests").glob("*.coil"))
-    sources += sorted(p for p in (ROOT / "tests/compiler/features").glob("*.coil")
-                      if p not in sources)
+    sources += sorted(p for p in (ROOT / "tests").rglob("*.coil") if p not in sources)
 sources = list(dict.fromkeys(sources))
 
-# A jit_* fixture links the whole compiler as a unit and needs ~5 GB to
-# compile, as does the compiler itself: those go one at a time.
-heavy = [p for p in sources if p.name.startswith("jit_")]
+# A coil.jit program (src/examples/jit_sdk.coil, tests/jit/) links the whole
+# compiler as a unit and needs ~5 GB to compile, as does the compiler itself:
+# those go one at a time.
+heavy = [p for p in sources if p.name.startswith("jit_") or p.parent.name == "jit"]
 light = [p for p in sources if p not in heavy]
 emitted, failures = check(light, max(1, min(4, (os.cpu_count() or 2) // 2)))
 more, found = check(heavy, 1)

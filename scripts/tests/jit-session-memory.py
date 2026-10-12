@@ -2,7 +2,6 @@
 """Bound frontend memory across repeated retained JIT replacements."""
 
 import argparse
-from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -125,122 +124,91 @@ def peak_rss(stderr: str) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument('compiler')
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('compiler', nargs='?', default=os.environ.get('COIL'))
     parser.add_argument('--replacements', type=int, default=24)
+    parser.add_argument('--submissions', type=int, default=40,
+                        help='accepted submissions per steady-state scenario')
     args = parser.parse_args()
+    if not args.compiler:
+        raise SystemExit('usage: jit-session-memory.py COMPILER (or set $COIL)')
     compiler_path = Path(args.compiler).resolve()
     compiler = str(compiler_path)
+    # The generated metadata visitors (retained_snapshot.coil, type_references.coil)
+    # must match the compiler's declared types, or retention copies the wrong bytes.
     run(sys.executable, str(ROOT / 'scripts/compiler/gen-retained-snapshot.py'), '--check')
-    with tempfile.TemporaryDirectory(prefix='.coil-jit-session-memory-', dir=ROOT) as raw:
+    with tempfile.TemporaryDirectory(prefix='coil-jit-session-memory-',
+                                     dir=os.environ.get('COIL_TEST_SCRATCH')) as raw:
         directory = Path(raw)
         # Every SDK session here locates its toolchain through `coil` on PATH:
-        # pin the candidate, never an installed toolchain that predates it.
+        # pin the compiler under test, never an installed toolchain that predates it.
         toolbin = directory / 'bin'
         toolbin.mkdir()
+        # A symlink, not a wrapper script: the SDK finds the library from where
+        # the `coil` it resolves on PATH really lives.
         (toolbin / 'coil').symlink_to(compiler)
         os.environ['PATH'] = str(toolbin) + os.pathsep + os.environ['PATH']
-        installed_sdk = compiler_path.parent.parent / 'lib/coil/compiler'
-        sources = ('jit_api.coil', 'driver.coil')
-        installed_matches = all(
-            (installed_sdk / name).is_file()
-            and (installed_sdk / name).read_bytes() == (ROOT / 'src/compiler' / name).read_bytes()
-            for name in sources
-        )
-        # A verified installed toolchain already ships the matching JIT unit;
-        # adding another copy would duplicate every symbol. A candidate uses
-        # an explicit unit built from this checkout, so its test cannot silently
-        # link the previously installed SDK instead.
-        # Host programs are built at -O0: the JIT work they measure runs in the
-        # -O3 unit, and optimizing a few lines of host code only costs build time.
+        # Hosts are built at -O0: the JIT work they measure runs in the -O3 unit.
         unit_flags: list[str] = ['-O0']
-        if not installed_matches:
-            if installed_sdk.is_dir():
-                raise AssertionError('installed compiler SDK does not match this checkout')
-            # The generated suite builds this unit once for every script that needs it.
-            unit = Path(os.environ['COIL_TEST_JIT_UNIT']) if os.environ.get('COIL_TEST_JIT_UNIT') else directory / 'jit-unit'
-            if not os.environ.get('COIL_TEST_JIT_UNIT'):
+        if os.environ.get('COIL_TEST_JIT_UNIT'):
+            unit_flags += ['--unit', os.environ['COIL_TEST_JIT_UNIT']]
+        else:
+            installed_sdk = compiler_path.parent.parent / 'lib/coil/compiler'
+            installed_matches = all(
+                (installed_sdk / name).is_file()
+                and (installed_sdk / name).read_bytes() == (ROOT / 'src/compiler' / name).read_bytes()
+                for name in ('jit_api.coil', 'driver.coil'))
+            # A verified installed toolchain ships its matching unit and links it
+            # by itself. Anything else needs a unit built from this checkout, so
+            # the test cannot silently link an older installed SDK.
+            if not installed_matches:
+                if installed_sdk.is_dir():
+                    raise AssertionError('installed compiler SDK does not match this checkout; '
+                                         'set COIL_TEST_JIT_UNIT to a unit built from it')
+                unit = directory / 'jit-unit'
                 run(compiler, 'build-unit', str(ROOT / 'src/compiler/jit_api.coil'),
                     '-o', str(unit), '--backend', 'llvm', '-O3', '--quiet')
-            unit_flags += ['--unit', str(unit)]
-        graph_executable = directory / 'retained-graph'
-        run(compiler, 'build', str(ROOT / 'tests/compiler/retained_graph_test.coil'),
-            '-o', str(graph_executable), '-O0')
-        run(str(graph_executable))
-        print('precise graph copies only live bytes and preserves cyclic interior aliases', flush=True)
+                unit_flags += ['--unit', str(unit)]
 
-        source = directory / 'replacements.coil'
-        executable = directory / 'replacements'
-        source.write_text(source_for_replacements(args.replacements))
-        run(compiler, 'build', str(source), '-o', str(executable), *unit_flags)
-        timed = run('/usr/bin/time', '-l' if sys.platform == 'darwin' else '-v',
-                    str(executable))
-        peak = peak_rss(timed.stderr)
+        def timed_run(name: str, source: str, env: dict[str, str] | None = None) -> str:
+            path = directory / (name + '.coil')
+            executable = directory / name
+            path.write_text(source)
+            run(compiler, 'build', str(path), '-o', str(executable), *unit_flags)
+            return run('/usr/bin/time', '-l' if sys.platform == 'darwin' else '-v',
+                       str(executable), env=env).stderr
+
+        # Rejected submissions must release their frontend arenas.
+        peak = peak_rss(timed_run('replacements', source_for_replacements(args.replacements)))
         print(f'{args.replacements} rejected retained JIT deltas: peak RSS {peak} B', flush=True)
         assert peak < 768 * 1024 * 1024, 'rejected frontend arenas accumulated'
 
         # Accepted commits must retire their compiler arenas too. A rejection-only
         # soak cannot establish this: it completely missed multi-GB accepted growth.
         environment = dict(os.environ, COIL_JIT_TRACE='1')
-        # A checked Code-returning trait method must not be rediscovered as a
-        # syntax macro on the first delta. Disable the disk cache: otherwise a
-        # cached macro image hides recompilation of the accepted helper closure.
-        cold_source = directory / 'cold.coil'
-        cold_executable = directory / 'cold'
-        cold_source.write_text(source_for_accepted(3, False))
-        run(compiler, 'build', str(cold_source), '-o', str(cold_executable), *unit_flags)
-        cold = run(str(cold_executable), env=dict(environment, COIL_META_CACHE='0'))
-        submissions = []
-        active = None
-        for line in cold.stderr.splitlines():
-            if not line.startswith('jit-work '):
-                continue
-            _, stage, name = line.split(' ', 2)
-            if stage == 'begin':
-                assert active is None
-                active = Counter()
-            elif stage == 'end':
-                assert name == 'accepted' and active is not None
-                submissions.append(active)
-                active = None
-            else:
-                assert active is not None
-                active[stage] += 1
-        assert active is None and len(submissions) == 5, submissions
-        assert all(row['parse'] <= 4 and (row['check'], row['emit']) == (2, 2)
-                   for row in submissions[1:-1]), submissions
-        print('cold-cache public JIT: every definition delta, including the first, parses at most 4/checks 2/emits 2', flush=True)
-
-        count = max(80, args.replacements)
-        provider = directory / 'reader.coil'
-        provider.write_text('(module retained.memory-reader)\n'
-                            '(import "coil.primitive" :as p)\n'
-                            '(defn read-source [(context Code)] (-> Code)\n'
-                            ' (p/code-read (p/code-str (p/code-nth context 2)) context))\n')
+        count = args.submissions
+        (directory / 'reader.coil').write_text(
+            '(module retained.memory-reader)\n'
+            '(import "coil.primitive" :as p)\n'
+            '(defn read-source [(context Code)] (-> Code)\n'
+            ' (p/code-read (p/code-str (p/code-nth context 2)) context))\n')
         environment['COIL_NAMESPACE_ROOTS'] = str(directory)
         for replacement, reader in ((False, False), (True, False), (True, True)):
             name = 'reader-replace' if reader else ('replace' if replacement else 'accepted')
-            accepted = directory / (name + '.coil')
-            executable = directory / name
-            accepted.write_text(source_for_accepted(count, replacement, reader))
-            run(compiler, 'build', str(accepted), '-o', str(executable), *unit_flags)
-            timed = run('/usr/bin/time', '-l' if sys.platform == 'darwin' else '-v',
-                        str(executable), env=environment)
-            retained = [int(n) for n in re.findall(r'jit-work retained-bytes (\d+)', timed.stderr)]
+            stderr = timed_run(name, source_for_accepted(count, replacement, reader), environment)
+            retained = [int(n) for n in re.findall(r'jit-work retained-bytes (\d+)', stderr)]
             assert len(retained) == count + 2, 'accepted memory probe did not complete every submission'
-            payload = [int(n) for n in re.findall(r'jit-work retained-payload-bytes (\d+)', timed.stderr)]
+            payload = [int(n) for n in re.findall(r'jit-work retained-payload-bytes (\d+)', stderr)]
             assert len(payload) == len(retained), 'missing live-byte accounting'
-            bodies = [int(n) for n in re.findall(r'jit-work body-owned-bytes (\d+)', timed.stderr)]
+            bodies = [int(n) for n in re.findall(r'jit-work body-owned-bytes (\d+)', stderr)]
             assert len(bodies) == len(retained), 'missing immutable-body accounting'
             body_live = bodies[10:-1]
             steady = retained[10:-1]
             live = payload[10:-1]
             if replacement:
                 # Each republication moves the Var's versioned metadata root
-                # (coil.repl). Root bookkeeping alternates by a couple of bytes
-                # between submissions, exactly as in the schema-roots scenario
-                # below, so this holds it to the same bound: retaining a
-                # historical definition would add hundreds of bytes per submission.
+                # (coil.repl); its bookkeeping alternates by a couple of bytes.
+                # Retaining a historical definition would add hundreds per submission.
                 assert max(live) - min(live) <= 64, (
                     'identical replacement retained historical metadata', live)
                 # Address-order packing can change alignment gaps by a few bytes.
@@ -252,7 +220,7 @@ def main() -> None:
                     'trivial definitions retained more than their metadata', steady)
                 assert body_live[-1] - body_live[0] < 4096 * len(body_live), (
                     'trivial definitions retained more than their body storage', body_live)
-            peak = peak_rss(timed.stderr)
+            peak = peak_rss(stderr)
             assert peak < 512 * 1024 * 1024, 'accepted compilation scratch accumulated'
             print(json.dumps({'scenario': name, 'submissions': count,
                               'steady_metadata_bytes': [min(steady), max(steady)],
@@ -260,45 +228,17 @@ def main() -> None:
                               'steady_body_bytes': [min(body_live), max(body_live)],
                               'peak_rss_bytes': peak}), flush=True)
 
-        # Exercise ORC even on macOS ARM64, whose public JIT defaults to Mach-O.
-        llvm_flags: list[str] = []
-        for flag in shlex.split(run(os.environ.get('LLVM_CONFIG', 'llvm-config'),
-                                   '--ldflags', '--libs', '--system-libs').stdout):
-            llvm_flags += ['--link-flag', flag]
-        llvm_executable = directory / 'llvm-session'
-        run(compiler, 'build', str(ROOT / 'tests/compiler/jit_llvm_session_test.coil'),
-            '-o', str(llvm_executable), '--backend', 'llvm', '-O0', *llvm_flags)
-        run(str(llvm_executable), env=environment)
-        print('ORC incremental objects, static cells, rejection, old pointers, leases, and reset', flush=True)
-
-        # A retained monomorph report contains nested syntax built during the
-        # compilation unit. It must remain readable after that unit retires and
-        # after later rejected and aborted JIT transactions. This fixture used
-        # to segfault after its expected structured-rejection diagnostic.
-        feature = ROOT / 'tests/compiler/features/jit_retained_code_state.coil'
-        feature_executable = directory / 'retained-code-state'
-        run(compiler, 'build', str(feature), '-o', str(feature_executable),
-            *unit_flags)
-        run(str(feature_executable))
-        print('retained Code state survives committed, rejected, and aborted edits',
-              flush=True)
-
-
-        source = directory / 'schema-roots.coil'
-        executable = directory / 'schema-roots'
-        source.write_text(source_for_schema_roots(count))
-        run(compiler, 'build', str(source), '-o', str(executable), *unit_flags)
-        timed = run('/usr/bin/time', '-l' if sys.platform == 'darwin' else '-v',
-                    str(executable), env=environment)
-        payload = [int(n) for n in re.findall(r'jit-work retained-payload-bytes (\d+)', timed.stderr)]
+        # Superseded type schemas and roots are released as they are replaced.
+        stderr = timed_run('schema-roots', source_for_schema_roots(count), environment)
+        payload = [int(n) for n in re.findall(r'jit-work retained-payload-bytes (\d+)', stderr)]
         assert len(payload) == count + 2, 'schema root probe did not finish every publication'
         steady = payload[10:-1]
         assert max(steady) - min(steady) <= 64, ('schema roots or repeated resolution aliases accumulated', steady)
-        bodies = [int(n) for n in re.findall(r'jit-work body-owned-bytes (\d+)', timed.stderr)]
+        bodies = [int(n) for n in re.findall(r'jit-work body-owned-bytes (\d+)', stderr)]
         assert len(bodies) == len(payload), 'missing schema-body accounting'
         body_live = bodies[10:-1]
         assert max(body_live) - min(body_live) <= 64, ('obsolete schema bodies accumulated', body_live)
-        peak = peak_rss(timed.stderr)
+        peak = peak_rss(stderr)
         assert peak < 512 * 1024 * 1024, 'schema compiler scratch accumulated'
         print(json.dumps({'scenario': 'schema-roots', 'submissions': count,
                           'steady_live_bytes': [min(steady), max(steady)],

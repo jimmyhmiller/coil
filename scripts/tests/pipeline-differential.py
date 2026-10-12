@@ -9,7 +9,8 @@ commit before the change:
     python3 scripts/tests/pipeline-differential.py REFERENCE CANDIDATE [--jobs N]
 
 The corpus is deterministic: the compiler itself, then every file in
-src/examples, tests/compiler/features and tests/, in sorted order. Both dumps
+src/examples, the runtime corpus (tests/corpus), the diagnostic inputs
+(tests/diag) and the stdlib suites (tests/stdlib), in sorted order. Both dumps
 must match, including their error output when a file does not check. A
 mismatch prints the file, the dump, and the first differing line.
 """
@@ -28,7 +29,8 @@ DUMPS = ("dump-checked", "dump-mono")
 
 def corpus():
     files = [ROOT / "src/compiler/main.coil"]
-    for pattern in ("src/examples/*.coil", "tests/compiler/features/*.coil", "tests/*.coil"):
+    for pattern in ("src/examples/*.coil", "tests/corpus/*.coil", "tests/diag/*/*.coil",
+                    "tests/stdlib/*.coil"):
         files.extend(sorted(ROOT.glob(pattern)))
     return files
 

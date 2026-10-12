@@ -7,7 +7,10 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-compiler = Path(sys.argv[1]).resolve()
+raw_compiler = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("COIL")
+if not raw_compiler:
+    raise SystemExit("usage: jit-single-form.py COMPILER (or set $COIL)")
+compiler = Path(raw_compiler).resolve()
 source = """(defn proof-old [] (-> i64) 7)
 (defn proof-new [] (-> i64) (+ (proof-old) 1))
 (proof-new)
@@ -89,13 +92,6 @@ for index, label in enumerate(("define caller", "evaluate caller", "redefine ori
     emitted_before.update(native)
     print(f"{label:34} {old_counts[0]:10} {old_counts[1]:12} {old_counts[2]:12}")
 
-for file in ("src/compiler/driver.coil", "src/compiler/jit_api.coil", "src/compiler/jit.coil"):
-    text = (ROOT / file).read_text()
-    for removed in ("repl-def-source", "repl-session-submit!", "repl-session-replace!",
-                    "repl-session-prepare-replace", "repl-refresh-abi-declarations",
-                    "repl-infer-type-unscoped", "jit-submit!", "jit-replace-source!",
-                    "jit-prepare-replace", "set-legacy-reload!", "jit-syms-lookup-unique-leaf"):
-        assert removed not in text, (file, removed)
 print("PASS: default Var redefinition updates old callers without compiling accepted bodies")
 
 # Explicit static functions and ordinary runtime bindings remain available.

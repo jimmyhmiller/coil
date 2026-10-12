@@ -1,287 +1,299 @@
 #!/usr/bin/env python3
-"""Retained compiler environments, static linkage, and user-owned JIT policy."""
-from pathlib import Path
-import concurrent.futures
+"""The coil.jit session API: retained environments, lifetime, policy and projects.
+
+    jit-static-session.py [COMPILER]        (default: $COIL)
+
+Each fixture in tests/jit/ is an SDK host program whose `main` returns 0 on
+success. They are grouped into a few host programs, each of which imports its
+group's fixtures as modules and calls their `main`s in turn, so the suite pays
+for eight links of the coil.jit unit rather than sixty. A host prints `== NAME`
+to stderr before each fixture, so a crash names the fixture it happened in.
+
+The unit comes from COIL_TEST_JIT_UNIT (the comprehensive tier passes the
+installed toolchain's warmed one); without it this builds one, which compiles
+the whole compiler.
+"""
+from __future__ import annotations
+
 import os
 import shlex
 import subprocess
 import sys
 import tempfile
+import time
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+FIXTURES = ROOT / "tests" / "jit"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cleanup_on_signal  # noqa: E402
 cleanup_on_signal.install()
-COMPILER = Path(sys.argv[1]).resolve()
+
+raw_compiler = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("COIL")
+if not raw_compiler:
+    raise SystemExit("usage: jit-static-session.py COMPILER (or set $COIL)")
+COMPILER = Path(raw_compiler).resolve()
 TOOLCHAIN_ENV = os.environ.copy()
+TOOLCHAIN_ENV.pop("COIL_NAMESPACE_ROOTS", None)
 # Sealed compiler metadata is read-only for every fixture here, so a store into an
 # accepted artifact is a fault at that store rather than a later wrong answer.
 TOOLCHAIN_ENV["COIL_JIT_PROTECT"] = "1"
 
+# Groups of fixtures that share one host process. Order matters only in
+# "lifetime": scratch_footprint measures the process footprint after its first
+# compile, so it runs before any other session exists.
+GROUPS: dict[str, list[str]] = {
+    "lifetime": ["scratch_footprint", "metadata_lifetime", "type_lifetime", "impl_lifetime",
+                 "monomorph_report_lifetime", "native_metadata_roots", "static_lifetime",
+                 "generation_tokens", "retire_declarations", "retire_definitions",
+                 "session_free", "shared_prelude", "retained_code_state"],
+    "sessions": ["static_session", "static_policy", "static_dynamic", "static_isolation",
+                 "single_form_proof", "checked_baseline", "retained_declarations", "hidden_names",
+                 "deferred_publication", "repair_diagnostics", "redefined_signature",
+                 "qualified_names", "session_imports", "session_import_meta",
+                 "import_tolerant_helper"],
+    "replacement": ["repl_policy", "repl_reclaim", "repl_second_submission", "repl_inline_edit",
+                    "repl_impl_replace", "const_across_submissions", "repl_const_eval",
+                    "const_generic_trait_method", "generic_replacement", "defalias_rebind",
+                    "before_expand_const_replacement", "before_expand_sum_replacement",
+                    "entry_compile_time_code"],
+    "environment": ["env_values", "deep_source", "env_stale", "env_stale_complete", "env_native",
+                    "host_environment", "live_checker", "meta_pipeline", "meta_accepted_impl",
+                    "meta_dependencies", "meta_generator_later", "frontend_policy",
+                    "reader_keeps_type", "llvm_backend", "cimport_header_change"],
+    # Run with the project below as the working directory.
+    "project": ["repl_import_var", "project_context", "project_free", "defalias_imports"],
+    # Run with the scratch directory as the namespace root, for its source providers.
+    "providers": ["static_no_replay", "static_reader", "designated_entry_revisions"],
+    # COIL_META_MAIN=1 changes how every compile in the process runs metaprograms.
+    "meta-main": ["meta_main"],
+}
+# Fixtures whose main takes (argc argv): the host passes its own through.
+TAKES_ARGV = {"static_no_replay"}
+# The import a session in this fixture submits resolves through tests/jit.
+SESSION_ROOTS = {"sessions": str(FIXTURES)}
 
-def run(*args, env=None, cwd=ROOT):
+
+def run(*args, env=None, cwd=ROOT, timeout=240):
     result = subprocess.run(list(map(str, args)), cwd=cwd, text=True,
-                            capture_output=True, timeout=240, env=env or TOOLCHAIN_ENV)
-    assert result.returncode == 0, (args, result.returncode, result.stdout, result.stderr)
+                            capture_output=True, timeout=timeout, env=env or TOOLCHAIN_ENV)
+    assert result.returncode == 0, (args, result.returncode, result.stdout[-4000:], result.stderr[-4000:])
     return result
 
 
-def repl_signature_check():
-    # A rejected signature edit must not leave phase metadata dangling in the CLI's
-    # enclosing command scope. The accepted definition remains callable afterwards.
-    repl = subprocess.run([str(COMPILER), "repl"], cwd=ROOT, text=True,
-        input="(defn f [] (-> i64) 7)\n(f)\n(defn f [] (-> bool) true)\n(f)\n:quit\n",
-        capture_output=True, timeout=120)
-    assert repl.returncode == 0, (repl.returncode, repl.stdout, repl.stderr)
-    assert repl.stdout.count("7") == 2, repl.stdout
-    assert "conflicting types for parameter" in repl.stderr, repl.stderr
-    return "rejected REPL signature edit keeps the accepted definition"
+def module_name(fixture: str) -> str:
+    first = (FIXTURES / f"{fixture}.coil").read_text().split("(module ", 1)
+    assert len(first) == 2, f"tests/jit/{fixture}.coil has no (module …)"
+    return first[1].split(")", 1)[0].strip()
 
 
-with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
-    work = Path(raw)
-    # SDK sessions using the default "coil" toolchain must initialize from the
-    # candidate and its matching library, not an unrelated global installation.
-    toolbin = work / "bin"
-    toolbin.mkdir()
-    (toolbin / "coil").symlink_to(COMPILER)
-    TOOLCHAIN_ENV["PATH"] = str(toolbin) + os.pathsep + os.environ["PATH"]
+def host_source(group: str, fixtures: list[str]) -> str:
+    argv = any(f in TAKES_ARGV for f in fixtures)
+    lines = [f"(module jit-host.{group})"]
+    lines += [f'(import "{module_name(f)}" :as f{i})' for i, f in enumerate(fixtures)]
+    lines.append("(defn report [(name (slice u8)) (status i64)] (-> i64)")
+    lines.append('  (if (= status 0) (do (println "PASS: {}" name) 0)')
+    lines.append('      (do (println "FAIL: {} returned {}" name status) 1)))')
+    lines.append("(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)" if argv
+                 else "(defn main [] (-> i64)")
+    lines.append("  (let [(mut failed) 0]")
+    for i, fixture in enumerate(fixtures):
+        # A fixture's main may return any integer width.
+        call = f"(cast i64 (f{i}/main argc argv))" if fixture in TAKES_ARGV else f"(cast i64 (f{i}/main))"
+        lines.append(f'    (eprintln "== {fixture}")')
+        lines.append(f'    (set! failed (+ failed (report "{fixture}" {call})))')
+    lines.append("    failed))")
+    return "\n".join(lines) + "\n"
 
-    # Everything below is an independent host program, so one pool runs it all.
-    # Work that needs no prebuilt unit starts first and overlaps the unit build,
-    # the longest single step. COIL_JOBS=1 runs one job at a time.
-    jobs = int(os.environ.get("COIL_JOBS") or os.cpu_count() or 1)
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs))
 
-    # This test reaches private unit lifetime APIs and deliberately source-links
-    # the implementation, rather than crossing the public opaque unit interface.
-    # That compiles the whole compiler, and optimizing it (40 s of CPU apiece)
-    # buys nothing the lifetime checks look at, so it is built at -O0 (12 s), as
-    # are the fixtures that import coil.compiler.driver (they get -O0 via flags).
-    def source_linked(name):
-        binary = work / name
-        run(COMPILER, "build", ROOT / f"tests/compiler/features/{name}.coil", "-o", binary, "-O0")
-        run(binary)
-        return name
-
-    pending = [pool.submit(repl_signature_check)]
-    pending += [pool.submit(source_linked, name)
-                for name in ("retained_compiler_context", "hygienic_inherent_calls")]
-
-    # The generated suite builds this unit once for every script that needs it.
-    unit = Path(os.environ["COIL_TEST_JIT_UNIT"]) if os.environ.get("COIL_TEST_JIT_UNIT") else work / "sdk"
-    if not os.environ.get("COIL_TEST_JIT_UNIT"):
-        run(COMPILER, "build-unit", ROOT / "src/compiler/jit_api.coil", "-o", unit,
-            "--backend", "llvm", "-O3", "--quiet")
-    # Diagnostic labels such as <bundled compiler/check.coil> must not hide
-    # actual compiler or library dependencies from the prebuilt-unit cache.
-    sources = (unit / "unit.sources").read_text()
-    for name in ("compiler/check.coil", "compiler/resolve.coil", "stdlib/var.coil"):
-        assert name in sources, (name, sources)
-    # Host programs are built at -O0. A host's own code is a few lines around
-    # calls into the -O3 unit, which does all the JIT work, so optimizing it only
-    # costs build time (3.3 s of CPU per host at the default, 1.1 s at -O0).
-    flags = ["--unit", unit, "--backend", "llvm", "-O0"]
-    if sys.platform.startswith("linux"):
-        for flag in shlex.split(run(os.environ.get("LLVM_CONFIG", "llvm-config"),
-                                   "--ldflags", "--libs", "--system-libs").stdout):
-            flags += ["--link-flag", flag]
-    fixtures = ("derive_qualified_shape", "retained_heap", "jit_metadata_lifetime", "jit_type_lifetime", "jit_impl_lifetime", "jit_monomorph_report_lifetime", "jit_source_sharing", "jit_body_sharing", "jit_native_metadata_roots", "jit_repl_policy", "jit_repl_reclaim", "jit_static_session", "jit_static_lifetime", "jit_static_policy",
-                "jit_static_dynamic", "jit_static_isolation", "jit_single_form_proof", "jit_checked_baseline", "jit_env_values", "jit_deep_source", "jit_env_stale", "jit_env_stale_complete", "jit_env_native", "jit_live_checker", "jit_redefined_signature",
-                "jit_generation_tokens", "jit_reserved_tokens", "jit_frontend_policy", "jit_meta_pipeline", "jit_deferred_publication", "jit_repair_diagnostics", "jit_defalias_rebind", "jit_retire_declarations", "jit_retire_definitions", "host_environment", "jit_session_import_meta", "jit_retained_declarations", "jit_hidden_names", "jit_reader_keeps_type", "jit_session_imports", "jit_session_free", "jit_llvm_backend", "jit_repl_second_submission", "jit_repl_inline_edit", "jit_repl_impl_replace", "jit_const_across_submissions", "jit_repl_const_eval", "jit_const_generic_trait_method", "jit_meta_accepted_impl", "jit_meta_dependencies", "jit_meta_generator_later", "jit_shared_prelude", "jit_before_expand_const_replacement", "jit_before_expand_sum_replacement", "jit_qualified_names", "jit_entry_compile_time_code", "jit_generic_replacement", "jit_import_tolerant_helper", "jit_cimport_header_change")
+def terminal_repl_checks(project: Path) -> None:
+    terminal = subprocess.run([str(COMPILER), "repl"], cwd=project, text=True,
+        input=":load project-dependency.values\n(answer)\n:quit\n",
+        capture_output=True, timeout=120, env=TOOLCHAIN_ENV)
+    assert terminal.returncode == 0, (terminal.returncode, terminal.stdout, terminal.stderr)
+    assert "42" in terminal.stdout, (terminal.stdout, terminal.stderr)
+    print("PASS: terminal REPL uses the current project manifest", flush=True)
     if sys.platform == "darwin":
-        fixtures += ("jit_scratch_footprint",)
-    # COIL_META_MAIN=1 in an embedding host: main-thread compiles run metaprograms
-    # in place; a worker-thread compile is a diagnostic instead of a crash.
-    binary = work / "jit_meta_main"
-    run(COMPILER, "build", ROOT / "tests/compiler/features/jit_meta_main.coil", "-o", binary, *flags)
-    run(binary, env=dict(TOOLCHAIN_ENV, COIL_META_MAIN="1"))
-    print("PASS: jit_meta_main", flush=True)
-    # Each fixture is its own SDK host with its own binary and JIT sessions.
-    # A session's source has no file behind it, so it owns no namespace tree: a
-    # fixture whose submission imports another test module names that root.
-    session_roots = {"jit_import_tolerant_helper": "tests"}
+        app = subprocess.run([str(COMPILER), "repl", "--app", "project-host.app"],
+            cwd=project, text=True, input=":run\n", capture_output=True,
+            timeout=120, env=TOOLCHAIN_ENV)
+        assert app.returncode == 0, (app.returncode, app.stdout, app.stderr)
+        assert "Type :run" in app.stdout, (app.stdout, app.stderr)
+        print("PASS: project app REPL compiles and launches in one JIT session", flush=True)
 
-    def build_and_run(name):
-        binary = work / name
-        run(COMPILER, "build", ROOT / f"tests/compiler/features/{name}.coil",
-            "-o", binary, *flags)
-        roots = session_roots.get(name)
-        run(binary, env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=roots) if roots else None)
-        return name
 
-    # The project checks share one project directory and edit it as they go, so
-    # they run in order, as one job beside the fixtures.
-    def project_chain():
-        project = work / "project"
-        project.mkdir()
-        dep = project / "dependency"
-        (dep / "src").mkdir(parents=True)
-        (project / "Coil.toml").write_text(
-            '[package]\nname = "project-host"\nsource-roots = ["src"]\n'
-            '[dependencies]\nproject-dependency = { path = "dependency" }\n')
-        (project / "src").mkdir()
-        (dep / "Coil.toml").write_text(
-            '[package]\nname = "project-dependency"\nsource-roots = ["src"]\n')
-        (dep / "src/values.coil").write_text(
-            '(module project-dependency.values)\n(defn answer [] (-> i64) 42)\n')
-        terminal = subprocess.run([str(COMPILER), "repl"], cwd=project, text=True,
-            input=":load project-dependency.values\n(answer)\n:quit\n",
-            capture_output=True, timeout=120, env=TOOLCHAIN_ENV)
-        assert terminal.returncode == 0, (terminal.returncode, terminal.stdout,
-                                           terminal.stderr)
-        assert "42" in terminal.stdout, (terminal.stdout, terminal.stderr)
-        print("PASS: terminal REPL uses the current project manifest", flush=True)
-        if sys.platform == "darwin":
-            (project / "src/app.coil").write_text(
-                '(module project-host.app)\n'
-                '(export repl-launch redraw repl-stop)\n'
-                '(defn repl-launch [] (-> i64) 0)\n'
-                '(defn redraw [] (-> i64) 0)\n'
-                '(defn repl-stop [] (-> i64) 0)\n')
-            app = subprocess.run([str(COMPILER), "repl", "--app", "project-host.app"],
-                cwd=project, text=True, input=":run\n", capture_output=True,
-                timeout=120, env=TOOLCHAIN_ENV)
-            assert app.returncode == 0, (app.returncode, app.stdout, app.stderr)
-            assert "Type :run" in app.stdout, (app.stdout, app.stderr)
-            print("PASS: project app REPL compiles and launches in one JIT session", flush=True)
-        (dep / "src/live_color.coil").write_text(
-            '(module project-dependency.live-color)\n'
-            '(import "coil.repl")\n'
-            '(export value)\n'
-            '(defn value [] (-> i64) 41)\n'
-            '(defn __repl_vars [] (-> Code) (coil.repl/var-module))\n')
-        (project / "src/aot.coil").write_text(
-            '(module project-host.aot)\n'
-            '(import "project-dependency.live-color" :as color)\n'
-            '(defn main [] (-> i64) (- (color/value) 41))\n')
+def make_project(work: Path) -> Path:
+    project = work / "project"
+    dep = project / "dependency"
+    (dep / "src").mkdir(parents=True)
+    (project / "src").mkdir()
+    (project / "Coil.toml").write_text(
+        '[package]\nname = "project-host"\nsource-roots = ["src"]\n'
+        '[dependencies]\nproject-dependency = { path = "dependency" }\n')
+    (dep / "Coil.toml").write_text('[package]\nname = "project-dependency"\nsource-roots = ["src"]\n')
+    (dep / "src/values.coil").write_text('(module project-dependency.values)\n(defn answer [] (-> i64) 42)\n')
+    (project / "src/app.coil").write_text(
+        '(module project-host.app)\n(export repl-launch redraw repl-stop)\n'
+        '(defn repl-launch [] (-> i64) 0)\n(defn redraw [] (-> i64) 0)\n(defn repl-stop [] (-> i64) 0)\n')
+    (dep / "src/live_color.coil").write_text(
+        '(module project-dependency.live-color)\n(import "coil.repl")\n(export value)\n'
+        '(defn value [] (-> i64) 41)\n(defn __repl_vars [] (-> Code) (coil.repl/var-module))\n')
+    (project / "src/aot.coil").write_text(
+        '(module project-host.aot)\n(import "project-dependency.live-color" :as color)\n'
+        '(defn main [] (-> i64) (- (color/value) 41))\n')
+    # Rebinding an alias in a module loaded from disk reaches `:as` and `:use`
+    # importers without changing their import declarations.
+    (dep / "src/shapes.coil").write_text(
+        '(module project-dependency.shapes)\n(defstruct P-v1 [(x i64)])\n(defalias P P-v1)\n'
+        '(defn get-v1 [(p P)] (-> i64) (.x p))\n(defalias get get-v1)\n')
+    (project / "src/user.coil").write_text(
+        '(module project-host.user)\n(import "project-dependency.shapes" :as shapes)\n'
+        '(import "project-dependency.shapes" :use [P])\n(defn old [] (-> i64) (shapes/get (P :x 41)))\n')
+    return project
+
+
+def make_providers(work: Path) -> Path:
+    providers = work / "providers"
+    providers.mkdir()
+    (providers / "dependency.coil").write_text(
+        '(module retained.dependency)\n(defstruct Point [(x i64)])\n'
+        '(defn point [] (-> Point) (Point :x 42))\n')
+    (providers / "provider.coil").write_text(
+        '(module retained.provider)\n(import "coil.primitive" :as p)\n'
+        '(defn read-source [(context Code)] (-> Code)\n'
+        '  (p/code-read (p/code-str (p/code-nth context 2)) context))\n')
+    (providers / "entry_provider2.coil").write_text('''(module entry.provider2)
+(import "coil.primitive" :as p)
+(import "coil.slice" :use [subslice])
+
+;; Each submission is one `(defn NAME …)`. It gets a fresh identity that is not
+;; retained after publication, NAME is bound to it, and the submission supplies
+;; its own entry.
+(defn read-source [(context Code)] (-> Code)
+  (let [path (p/code-str (p/code-nth context 1))
+        digits (subslice path 5 (- (len path) 1))
+        entry (p/syntax->datum (p/code-symbol `__coil_session_entry_s digits))
+        read (p/code-read (p/code-str (p/code-nth context 2)) context)
+        f (if (and (p/code-list? read) (= (get read 0) `do)) (get read 1) read)
+        name (get f 1)
+        version (p/syntax->datum (p/code-symbol name (p/code-str (p/code-symbol `_v digits))))
+        (mut rest) (p/code-list-new)]
+    (for i (range 2 (len f)) (push! (mut rest) (get f i)))
+    `(do (import "coil.jit.lifetime")
+         (defn ~version :jit/retain false ~@(p/code-list-done (load rest)))
+         (defalias ~name ~version)
+         (defn ~entry [] (-> i64) 0))))
+''')
+    return providers
+
+
+def main() -> None:
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="coil-jit-sessions-", dir=os.environ.get("COIL_TEST_SCRATCH")) as raw:
+        work = Path(raw)
+        # SDK sessions using the default "coil" toolchain must initialize from the
+        # compiler under test and its library, not an unrelated installation.
+        toolbin = work / "bin"
+        toolbin.mkdir()
+        # A symlink, not a wrapper script: the SDK finds the library from where
+        # the `coil` it resolves on PATH really lives.
+        (toolbin / "coil").symlink_to(COMPILER)
+        TOOLCHAIN_ENV["PATH"] = str(toolbin) + os.pathsep + os.environ["PATH"]
+
+        unit = Path(os.environ["COIL_TEST_JIT_UNIT"]) if os.environ.get("COIL_TEST_JIT_UNIT") else work / "sdk"
+        if not os.environ.get("COIL_TEST_JIT_UNIT"):
+            run(COMPILER, "build-unit", ROOT / "src/compiler/jit_api.coil", "-o", unit,
+                "--backend", "llvm", "-O3", "--quiet", timeout=1200)
+        # Diagnostic labels such as <bundled compiler/check.coil> must not hide
+        # actual compiler or library dependencies from the prebuilt-unit cache.
+        sources = (unit / "unit.sources").read_text()
+        for name in ("compiler/check.coil", "compiler/resolve.coil", "stdlib/var.coil"):
+            assert name in sources, (name, sources)
+        # Hosts are a few lines around calls into the -O3 unit, which does all the
+        # JIT work, so they are built at -O0.
+        flags = ["--unit", unit, "--backend", "llvm", "-O0"]
+        if sys.platform.startswith("linux"):
+            for flag in shlex.split(run(os.environ.get("LLVM_CONFIG", "llvm-config"),
+                                       "--ldflags", "--libs", "--system-libs").stdout):
+                flags += ["--link-flag", flag]
+        build_env = dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(FIXTURES))
+
+        project = make_project(work)
+        providers = make_providers(work)
+        terminal_repl_checks(project)
+        # A module that opts into the REPL's Var lowering builds ahead of time too.
         aot_binary = work / "repl-var-module-aot"
-        run(COMPILER, "build", project / "src/aot.coil", "-o", aot_binary, *flags,
-            cwd=project)
+        run(COMPILER, "build", project / "src/aot.coil", "-o", aot_binary, *flags, cwd=project)
         run(aot_binary, cwd=project)
-        binary = work / "jit-repl-import-var"
-        run(COMPILER, "build", ROOT / "tests/compiler/features/jit_repl_import_var.coil",
-            "-o", binary, *flags)
-        run(binary, cwd=project)
-        print("PASS: AOT and imported JIT modules share REPL Var lowering", flush=True)
-        binary = work / "project-context"
-        run(COMPILER, "build", ROOT / "tests/compiler/features/jit_project_context.coil",
-            "-o", binary, *flags)
-        run(binary, cwd=project)
-        print("PASS: SDK manifest dependency context without process environment mutation", flush=True)
-        binary = work / "project-free"
-        run(COMPILER, "build", ROOT / "tests/compiler/features/jit_project_free.coil",
-            "-o", binary, *flags)
-        run(binary, cwd=project)
-        print("PASS: freeing a session releases the manifest it loaded", flush=True)
-        # Rebinding an alias in a module loaded from disk reaches `:as` and `:use`
-        # importers without changing their import declarations.
-        (dep / "src/shapes.coil").write_text(
-            '(module project-dependency.shapes)\n'
-            '(defstruct P-v1 [(x i64)])\n(defalias P P-v1)\n'
-            '(defn get-v1 [(p P)] (-> i64) (.x p))\n(defalias get get-v1)\n')
-        (project / "src/user.coil").write_text(
-            '(module project-host.user)\n'
-            '(import "project-dependency.shapes" :as shapes)\n'
-            '(import "project-dependency.shapes" :use [P])\n'
-            '(defn old [] (-> i64) (shapes/get (P :x 41)))\n')
-        binary = work / "defalias-imports"
-        run(COMPILER, "build", ROOT / "tests/compiler/features/jit_defalias_imports.coil",
-            "-o", binary, *flags)
-        run(binary, cwd=project)
-        print("PASS: alias rebinding through imports of disk modules", flush=True)
-        dependency = work / "dependency.coil"
-        dependency.write_text('(module retained.dependency)\n'
-                              '(defstruct Point [(x i64)])\n'
-                              '(defn point [] (-> Point) (Point :x 42))\n')
-        binary = work / "no-replay"
-        run(COMPILER, "build", ROOT / "tests/compiler/features/jit_static_no_replay.coil",
-            "-o", binary, *flags)
-        run(binary, dependency, env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(work)))
-        assert not dependency.exists(), "the no-replay test did not remove its input"
-        print("PASS: new forms use an imported type after its source file is removed", flush=True)
-        provider = work / "provider.coil"
-        provider.write_text('(module retained.provider)\n'
-                            '(import "coil.primitive" :as p)\n'
-                            '(defn read-source [(context Code)] (-> Code)\n'
-                            '  (p/code-read (p/code-str (p/code-nth context 2)) context))\n')
-        binary = work / "reader"
-        run(COMPILER, "build", ROOT / "tests/compiler/features/jit_static_reader.coil",
-            "-o", binary, *flags)
-        run(binary, env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(work)))
-        print("PASS: retained source provider and one-time ABI preamble", flush=True)
-        # The provider is compiled once per session: later reads reuse its engine.
-        binary = work / "reader-reuse"
-        run(COMPILER, "build", ROOT / "tests/compiler/features/jit_reader_engine_reuse.coil",
-            "-o", binary, *flags)
-        # The trace is diagnostic output, not text this test owns; count its ASCII
-        # markers from the raw bytes.
-        traced = subprocess.run([str(binary)], cwd=ROOT, capture_output=True, timeout=240,
-                                env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(work), COIL_TRACE="1"))
-        assert traced.returncode == 0, (traced.returncode, traced.stderr[-2000:])
-        builds = traced.stderr.count(b"coil-trace count reader.engine-builds ")
-        reuses = traced.stderr.count(b"coil-trace count reader.engine-reuses ")
-        assert builds == 1 and reuses == 3, ("source provider engine builds/reuses", builds, reuses)
-        print("PASS: a session's source provider engine is built once and reused", flush=True)
-        (work / "entry_provider2.coil").write_text('''(module entry.provider2)
-    (import "coil.primitive" :as p)
-    (import "coil.slice" :use [subslice])
+        print("PASS: an AOT build of a module using REPL Var lowering", flush=True)
 
-    ;; Each submission is one `(defn NAME …)`. It gets a fresh identity that is not
-    ;; retained after publication, NAME is bound to it, and the submission supplies
-    ;; its own entry.
-    (defn read-source [(context Code)] (-> Code)
-      (let [path (p/code-str (p/code-nth context 1))
-            digits (subslice path 5 (- (len path) 1))
-            entry (p/syntax->datum (p/code-symbol `__coil_session_entry_s digits))
-            read (p/code-read (p/code-str (p/code-nth context 2)) context)
-            f (if (and (p/code-list? read) (= (get read 0) `do)) (get read 1) read)
-            name (get f 1)
-            version (p/syntax->datum (p/code-symbol name (p/code-str (p/code-symbol `_v digits))))
-            (mut rest) (p/code-list-new)]
-        (for i (range 2 (len f)) (push! (mut rest) (get f i)))
-        `(do (import "coil.jit.lifetime")
-             (defn ~version :jit/retain false ~@(p/code-list-done (load rest)))
-             (defalias ~name ~version)
-             (defn ~entry [] (-> i64) 0))))
-    ''')
-        binary = work / "designated-entry"
-        run(COMPILER, "build", ROOT / "tests/compiler/features/jit_designated_entry_revisions.coil",
-            "-o", binary, *flags)
-        run(binary, env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(work)))
-        print("PASS: a provider's designated entries across many replacing revisions", flush=True)
-        return "project checks"
+        failures = []
+        for group, fixtures in GROUPS.items():
+            if sys.platform != "darwin":
+                fixtures = [f for f in fixtures if f != "scratch_footprint"]
+            source = work / f"host_{group.replace('-', '_')}.coil"
+            source.write_text(host_source(group, fixtures))
+            binary = work / f"host-{group}"
+            begin = time.monotonic()
+            run(COMPILER, "build", source, "-o", binary, *flags, env=build_env)
+            built = time.monotonic() - begin
+            env, cwd, args = dict(TOOLCHAIN_ENV), ROOT, []
+            if group in SESSION_ROOTS:
+                env["COIL_NAMESPACE_ROOTS"] = SESSION_ROOTS[group]
+            if group == "project":
+                cwd = project
+            if group == "providers":
+                env["COIL_NAMESPACE_ROOTS"] = str(providers)
+                args = [providers / "dependency.coil"]
+            if group == "meta-main":
+                env["COIL_META_MAIN"] = "1"
+            result = subprocess.run([str(binary), *map(str, args)], cwd=cwd, env=env, text=True,
+                                    capture_output=True, timeout=600)
+            print(result.stdout, end="", flush=True)
+            ran = time.monotonic() - begin - built
+            if result.returncode != 0:
+                last = [line for line in result.stderr.splitlines() if line.startswith("== ")]
+                failures.append(group)
+                print(f"FAIL: host {group} exited {result.returncode}"
+                      f" (last fixture started: {last[-1][3:] if last else 'none'})\n"
+                      + result.stderr[-3000:], flush=True)
+            print(f"   host {group}: {len(fixtures)} fixtures, build {built:.1f}s, run {ran:.1f}s", flush=True)
+            if group == "providers" and (providers / "dependency.coil").exists():
+                failures.append("static_no_replay did not remove its input")
 
-    # The demo in src/examples/jit_expose: a metaprogram hands an application to a
-    # session, which type checks new code against it. Its output is its contract.
-    def jit_expose_demo():
-        binary = work / "jit-expose-demo"
-        run(COMPILER, "build", ROOT / "src/examples/jit_expose/demo.coil", "-o", binary, *flags,
+        # Public SDK source graph: discovery follows module identity, the prebuilt
+        # ABI stays opaque, read failures keep their diagnostics.
+        graph = work / "graph-test"
+        run(COMPILER, "build", FIXTURES / "source_graph.coil", "-o", graph, *flags)
+        consumer = work / "consumer"
+        consumer.mkdir()
+        entry = consumer / "entry.coil"
+        dependency = consumer / "arbitrary-file-name.coil"
+        entry.write_text('(module graph.entry)\n(import "graph.dependency" :as dep)\n'
+                         '(defn main [] (-> i64) (dep/value))\n')
+        dependency.write_text('(module graph.dependency)\n(defn value [] (-> i64) 42)\n')
+        graph_env = dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(consumer))
+        run(graph, entry, cwd=Path("/"), env=graph_env)
+        dependency.write_text('(module graph.dependency)\n(defn value [\n')
+        run(graph, entry, "invalid", cwd=Path("/"), env=graph_env)
+        run(graph, consumer / "missing.coil", "invalid", cwd=Path("/"), env=graph_env)
+        print("PASS: SDK source graph follows module identity and keeps read diagnostics", flush=True)
+
+        # The demo in src/examples/jit_expose: a metaprogram hands an application to a
+        # session, which type checks new code against it. Its output is its contract.
+        demo = work / "jit-expose-demo"
+        run(COMPILER, "build", ROOT / "src/examples/jit_expose/demo.coil", "-o", demo, *flags,
             env=dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS="src/examples"))
-        out = run(binary).stdout
+        out = run(demo).stdout
         for line in ("status 0", "calls = 1", "expects a reference to example.jit-expose.app.Point, got i64",
                      "call to undefined function 'no-such-function'", "the program reads 41"):
             assert line in out, (line, out)
-        return "jit_expose demo"
+        print("PASS: jit_expose demo", flush=True)
 
-    pending += [pool.submit(project_chain)]
-    pending += [pool.submit(jit_expose_demo)]
-    pending += [pool.submit(build_and_run, name) for name in fixtures]
-    try:
-        for future in concurrent.futures.as_completed(pending):
-            print(f"PASS: {future.result()}", flush=True)
-    finally:
-        pool.shutdown(wait=True, cancel_futures=True)
+    if failures:
+        raise SystemExit(f"jit sessions: FAILED ({', '.join(failures)}) in {time.monotonic() - started:.1f}s")
+    print(f"jit sessions: passed in {time.monotonic() - started:.1f}s")
 
-    # Importing the public JIT facade checks a large compiler graph. Keep this
-    # stack-depth regression serial so its memory does not overlap other hosts.
-    print(f"PASS: {build_and_run('jit_import_jit_facade')}", flush=True)
 
-    # A retained type-resolution record once borrowed names from the next
-    # resolve round's scratch arena. Source-link under ASan so the SDK itself
-    # is instrumented and the stale reflection lookup fails at the read.
-    reflected = work / "jit-nested-type-reflection"
-    run(COMPILER, "build", ROOT / "tests/compiler/features/jit_nested_type_reflection.coil",
-        "-o", reflected, "-O0", "--sanitize=address")
-    run(reflected, env=dict(TOOLCHAIN_ENV, ASAN_OPTIONS="detect_leaks=0"))
-    print("PASS: retained nested type reflection under AddressSanitizer", flush=True)
+if __name__ == "__main__":
+    main()
