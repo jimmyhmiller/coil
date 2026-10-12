@@ -56,7 +56,12 @@ coil test --no-run         # compile and link, run nothing
 ```
 
 By default, `coil test` looks for `*_test.coil` under `tests/`. All selected
-files compile into one test harness, so shared imports build once.
+files compile into one test harness, so shared imports build once. A project
+with no test files says so (`no test files found`) rather than reporting a
+pass, and a path selector that matches no file is an error. Runner options
+such as `--filter` and `--cases` work here too and reach every test file. At a
+workspace root, `coil test` runs each member's tests in turn and fails if any
+member fails.
 Tests inherit the project's configuration: dependencies, `[cc]`, `[link]`,
 target and metaprograms. `coil check` typechecks the test files as well as the
 entry.

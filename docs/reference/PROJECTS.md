@@ -185,9 +185,11 @@ apps/cli/src/main.coil            (module tools.cli.main) (import "tools.parser.
   `parser` owns `tools.parser.syntax`, and a module named exactly
   `tools.parser` is an error, reported at its path.
 - Members import each other with no dependency declarations.
-- `build`, `run`, `check`, `lint` and `fmt` at the root fan out over the
-  members that declare an `entry`. A member without one is a library, compiled
-  through whoever imports it.
+- `check`, `lint`, `fmt` and `test` at the root fan out over every member,
+  each run in the member's directory; `test` runs each member's own tests and
+  fails if any member's tests fail or do not compile. `build` and `run` fan out
+  over the members that declare an `entry`. A member without one is a library,
+  compiled through whoever imports it.
 - A `tests/` directory at the workspace root is indexed too, without being a
   package.
 

@@ -1279,6 +1279,31 @@ expect_out "Coil.toml:3: .*'members/gone' is not a directory" \
   sh -c "cd '$T/workspace' && '$COIL' check"
 mv "$T/workspace/Coil.toml.glob" "$T/workspace/Coil.toml"
 rm -rf "$T/workspace/members/notes"
+# `coil test` at the root runs every member's tests, a library's included, and a
+# member whose tests do not compile fails the run instead of being skipped.
+mkdir -p "$T/workspace/members/util/tests"
+cat > "$T/workspace/members/util/tests/math_test.coil" <<'EOF'
+(module demo.util.math-test)
+(import "demo.util.math" :use [answer])
+(deftest answer-is-forty-two (assert-eq (answer) 42))
+EOF
+ws_test=$(cd "$T/workspace" && "$COIL" test 2>&1); ws_test_rc=$?
+case "$ws_test" in
+  *"no test files found"*"test answer-is-forty-two ... ok"*"workspace test: 2/2 members ok"*)
+    [ "$ws_test_rc" = 0 ] && ok "workspace test runs every member's tests" \
+      || bad "workspace test runs every member's tests" "rc=$ws_test_rc" ;;
+  *) bad "workspace test runs every member's tests" "$ws_test" ;;
+esac
+expect_out "1 passed; 0 failed" "workspace test forwards runner options to members" \
+  sh -c "cd '$T/workspace' && '$COIL' test --filter=answer"
+mkdir -p "$T/workspace/members/app/tests"
+printf '(module demo.app.broken-test)\n(deftest broken (assert-eq (no-such-function) 1))\n' \
+  > "$T/workspace/members/app/tests/broken_test.coil"
+expect_rc 1 "workspace test fails when a member's tests do not compile" \
+  sh -c "cd '$T/workspace' && '$COIL' test"
+rm -rf "$T/workspace/members/app/tests"
+expect_rc 1 "a test path selector that matches nothing is not green" \
+  sh -c "cd '$T/workspace/members/util' && '$COIL' test no-such-path"
 
 echo "== manifest secondary Coil artifacts =="
 mkdir -p "$T/secondary-artifact/src/runtime"
