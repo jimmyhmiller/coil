@@ -593,6 +593,12 @@ null-load|null pointer dereference.*safety_checks.coil:48:
 null-field|null pointer dereference.*safety_checks.coil:51:
 memcpy|memcpy source and destination overlap.*safety_checks.coil:57:
 CASES
+  # A definition's signature declares names; it has no expressions to check. A
+  # parameter spelled like a checked operator, `(neg bool)`, used to be rewritten as a
+  # call to `neg`, so the program no longer compiled under coil.safety.
+  printf '(module safety-names)\n(defstruct Sign [(v i64)])\n(deftrait Flip [Self] (flip [(neg Self)] (-> Self)))\n(impl Flip Sign (flip [(neg Sign)] (-> Sign) (Sign :v (- 0 (.v neg)))))\n(defn pick [(neg bool) (x i64)] (-> i64) (if neg (- 0 x) x))\n(defn main [] (-> i64) (println "names: {} {}" (pick true 5) (.v (flip (Sign :v 7)))) 0)\n' > "$T/safety-names.coil"
+  expect_out "names: -5 -7" "safety: a parameter spelled like a checked operator is a declaration, not a call" \
+    "$COIL" run "$T/safety-names.coil" --use coil.safety
   # A panic report ends with the stack trace, which needs the frame records below.
   out=$("$T/safety-checks" index 2>&1)
   case "$out" in
