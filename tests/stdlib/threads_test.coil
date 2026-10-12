@@ -1,0 +1,184 @@
+(module stdlib-tests.threads)
+(import "coil.thread" :as thread)
+(import "coil.simd" :as v)
+(import "coil.alloc" :as alloc)
+(import "coil.atomic" :use [atomic-add atomic-load])
+(import "coil.sync" :as sync)
+(import "coil.time" :as time)
+(import "coil.primitive" :as primitive)
+
+; ==== available parallelism ====
+
+(deftest available-parallelism-is-at-least-one
+  (match (thread/available-parallelism)
+    (Ok [n] (assert (>= n 1)))
+    (Err [_] (assert false))))
+
+(deftest available-parallelism-is-a-plausible-cpu-count
+  (match (thread/available-parallelism)
+    (Ok [n] (assert (<= n 4096)))
+    (Err [_] (assert false))))
+
+; ==== native SIMD lane counts ====
+
+;; One native register's worth of lanes, of each lane size.
+(deftest native-lanes-fill-one-register
+  (let [bytes (v/native-vector-bytes)]
+    (assert (or (= bytes 0) (= bytes 16)))
+    (if (= bytes 0)
+        (assert-eq (v/native-lanes u8) 1)
+        (do
+          (assert-eq (v/native-lanes u8) bytes)
+          (assert-eq (v/native-lanes i16) (/ bytes 2))
+          (assert-eq (v/native-lanes f32) (/ bytes 4))
+          (assert-eq (v/native-lanes u64) (/ bytes 8))))))
+
+(deftest native-lanes-size-a-vector-type
+  (let [x (: (v/vsplat 7) (vec u8 (v/native-lanes u8)))]
+    (assert-eq (v/vextract x (- (v/native-lanes u8) 1)) 7)))
+
+; ==== threads sharing atomics, a mutex and an event ====
+
+;; Shared state for the workers: one atomic counter, and one plain counter that
+;; only a held mutex may touch. It lives on the heap so every thread sees one
+;; address.
+(defstruct Shared [(atomic i64) (plain i64) (lock sync/Mutex)])
+
+(const WORKERS 4)
+
+(const ROUNDS 20000)
+
+(defn bump [(arg (ptr i8))] (-> (ptr i8))
+  (let [shared (cast (ptr Shared) arg)]
+    (for _ (range 0 ROUNDS)
+      (atomic-add (field shared atomic) 1)
+      (match (sync/mutex-lock! (field shared lock))
+        (Ok [_]
+            (do
+              (set! (.plain shared) (+ (.plain shared) 1))
+              (sync/mutex-unlock! (field shared lock))))
+        (Err [_] (panic "mutex-lock! failed")))))
+  (cast (ptr i8) 0))
+
+;; Neither count is right unless the atomic and the mutex really synchronize.
+(deftest atomics-and-a-mutex-count-every-increment
+  (let [a (alloc/malloc-allocator)
+        shared
+          (alloc/box! a
+                      Shared
+                      (Shared
+                        :atomic 0
+                        :plain 0
+                        :lock (zeroed sync/Mutex)))
+        threads
+          (alloc/box! a
+                      (array thread/Thread 4)
+                      (zeroed (array thread/Thread 4)))]
+    (assert (ok? (sync/mutex-init (field shared lock))))
+    (for i (range 0 WORKERS)
+      (assert-eq (thread/thread-spawn (index threads i)
+                                      (fnptr-of bump)
+                                      (cast (ptr i8) shared))
+                 0))
+    (for i (range 0 WORKERS)
+      (assert-eq (thread/thread-join (index threads i)) 0))
+    (assert-eq (atomic-load (field shared atomic)) (* WORKERS ROUNDS))
+    (assert-eq (.plain shared) (* WORKERS ROUNDS))
+    (sync/mutex-destroy! (field shared lock))
+    (alloc/destroy a threads)
+    (alloc/destroy a shared)))
+
+(defn notify-later [(arg (ptr i8))] (-> (ptr i8))
+  (when-let [(Ok [pause]) (time/duration-millis 20)]
+    (time/sleep pause))
+  (sync/event-notify-all! (cast (ptr sync/Event) arg))
+  arg)
+
+;; A blocking wait returns when another thread notifies, with the next generation.
+(deftest an-event-wakes-a-waiter-on-another-thread
+  (let [(mut event) (zeroed sync/Event)
+        (mut worker) (zeroed thread/Thread)]
+    (assert (ok? (sync/event-init (mut event))))
+    (match (sync/event-generation (mut event))
+      (Err [_] (assert false))
+      (Ok [observed]
+          (assert-eq (thread/thread-spawn (mut worker)
+                                          (fnptr-of notify-later)
+                                          (cast (ptr i8) (mut event)))
+                     0)
+          (match (sync/event-wait! (mut event) observed)
+            (Ok [(sync/Notified [generation])]
+                (assert-eq generation (+ observed 1)))
+            (_ (assert false)))
+          (thread/thread-join (mut worker))))
+    (sync/event-destroy! (mut event))))
+
+(defn ok? [T E] [(r (Result T E))] (-> bool)
+  (match r (Ok [_] true) (Err [_] false)))
+
+; ==== events with timeouts, and Once ====
+
+(defn once-body [] (-> i64)
+  (let [calls (primitive/alloc-static i64)]
+    (store! calls (+ (load calls) 1))
+    (if (= (load calls) 1) 0 99)))
+
+(defn sync-main [] (-> i64)
+  (let [event (primitive/alloc-stack sync/Event)]
+    (match (sync/event-init event)
+      (Err [_] 1)
+      (Ok [_]
+          (match (sync/event-generation event)
+            (Err [_] 2)
+            (Ok [observed]
+                (match (time/duration-millis 1)
+                  (Err [_] 3)
+                  (Ok [short]
+                      (match (sync/event-wait-for! event observed short)
+                        (Err [_] 4)
+                        (Ok [first]
+                            (match first
+                              (sync/Notified [_] 5)
+                              (sync/Timeout []
+                                            (match (sync/event-notify-all! event)
+                                              (Err [_] 6)
+                                              (Ok [_]
+                                                  (match (sync/event-wait-for! event
+                                                                               observed
+                                                                               short)
+                                                    (Err [_] 7)
+                                                    (Ok [second]
+                                                        (let [result
+                                                                (match second
+                                                                  (sync/Timeout []
+                                                                                8)
+                                                                  (sync/Notified [generation]
+                                                                                 (if (= generation
+                                                                                        (+ observed
+                                                                                           1))
+                                                                                     0
+                                                                                     9)))]
+                                                          (sync/event-destroy! event)
+                                                          (if (!= result 0)
+                                                              result
+                                                              (let [once
+                                                                      (primitive/alloc-stack sync/Once)]
+                                                                (match (sync/once-init once)
+                                                                  (Err [_] 10)
+                                                                  (Ok [_]
+                                                                      (match (sync/once-call! once
+                                                                                              (primitive/fnptr-of once-body))
+                                                                        (Err [_]
+                                                                             11)
+                                                                        (Ok [_]
+                                                                            (match (sync/once-call! once
+                                                                                                    (primitive/fnptr-of once-body))
+                                                                              (Err [_]
+                                                                                   12)
+                                                                              (Ok [_]
+                                                                                  (do
+                                                                                    (sync/once-destroy! once)
+                                                                                    0))))))))))))))))))))))))))
+
+(deftest an-event-times-out-then-notifies-and-once-runs-once
+  (assert-eq (sync-main) 0))
