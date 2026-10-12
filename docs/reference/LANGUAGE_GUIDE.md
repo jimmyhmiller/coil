@@ -1645,7 +1645,9 @@ true
 | SIMD | `(vec T N)`, `(mask N)`, and `coil.simd`; see [SIMD.md](SIMD.md) |
 
 `load`, `store!`, `field`, `index`, `cast`, `sizeof`, `alignof`, `offsetof`, `zeroed`,
-`fnptr-of` and `call-ptr` are also available without the prefix. `coil lint --fix`
+`fnptr-of` and `call-ptr` are also available without the prefix. `(index p k)` steps
+a pointer by `k` elements; on a `(mut p)` local or parameter holding a pointer it
+steps the pointer the cell holds. `coil lint --fix`
 rewrites a `primitive/…` call that has an everyday spelling, such as those names or
 an operator (`iadd` on an `i64` is `+`), and then deletes the import if nothing else
 needs it. Null is
@@ -1671,3 +1673,6 @@ every use allows it and its type owns nothing (a cell never runs `Drop`).
 - Don't call `alloc-stack` in a loop, and never return a pointer to a local.
 - `call` is a built-in form, so no function can be named `call` (except the
   method of a `Callable` impl).
+- A built-in type's name (`i64`, `bool`, `void`, `never`, `Code`, …) can't name a
+  struct, sum or trait. `Option` and `Result` are ordinary definitions, and a
+  module's own definition of one shadows them there.
