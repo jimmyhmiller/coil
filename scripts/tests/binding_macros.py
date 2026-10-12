@@ -22,7 +22,7 @@ def run(arguments, *, environment=None, success=True, contains=None, input=None)
 
 for name in ("primitive", "public", "destructuring", "nested", "code", "ownership",
              "methods", "closure", "anonymous", "loop_macro", "declaration_bundle",
-             "order_views", "ignored_owner", "signatures", "match",
+             "order_views", "ignored_owner", "signatures", "match", "reload",
              "combined_libraries", "match_callable_shadow", "mut_leaf"):
     run(["run", FIX / f"{name}.coil"])
     print(f"PASS {name}", flush=True)

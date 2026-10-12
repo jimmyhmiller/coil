@@ -924,7 +924,7 @@ static, and the call inlines:
 ```
 
 `coil.var/Var` is a shared, updatable cell. A `Var` holding a function pointer is
-callable, so a program can swap the function it holds. `coil.closure/defclosure`
+callable; the REPL builds hot reload on it. `coil.closure/defclosure`
 generates a callable closure type with a captured environment.
 
 ## Memory and ownership

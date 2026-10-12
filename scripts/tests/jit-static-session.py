@@ -26,16 +26,16 @@ def run(*args, env=None, cwd=ROOT):
     return result
 
 
-def repl_redefinition_check():
-    # The terminal REPL has no policy for replacing live code: defining a name
-    # again is an error, and the accepted definition remains callable afterwards.
+def repl_signature_check():
+    # A rejected signature edit must not leave phase metadata dangling in the CLI's
+    # enclosing command scope. The accepted definition remains callable afterwards.
     repl = subprocess.run([str(COMPILER), "repl"], cwd=ROOT, text=True,
-        input="(defn f [] (-> i64) 7)\n(f)\n(defn f [] (-> i64) 8)\n(f)\n:quit\n",
+        input="(defn f [] (-> i64) 7)\n(f)\n(defn f [] (-> bool) true)\n(f)\n:quit\n",
         capture_output=True, timeout=120)
     assert repl.returncode == 0, (repl.returncode, repl.stdout, repl.stderr)
-    assert repl.stdout.count("7") == 2 and "8" not in repl.stdout, repl.stdout
-    assert "already exists" in repl.stderr, repl.stderr
-    return "the REPL refuses a redefinition and keeps the accepted definition"
+    assert repl.stdout.count("7") == 2, repl.stdout
+    assert "conflicting types for parameter" in repl.stderr, repl.stderr
+    return "rejected REPL signature edit keeps the accepted definition"
 
 
 with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
@@ -64,7 +64,7 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
         run(binary)
         return name
 
-    pending = [pool.submit(repl_redefinition_check)]
+    pending = [pool.submit(repl_signature_check)]
     pending += [pool.submit(source_linked, name)
                 for name in ("retained_compiler_context", "hygienic_inherent_calls")]
 
@@ -86,9 +86,9 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
         for flag in shlex.split(run(os.environ.get("LLVM_CONFIG", "llvm-config"),
                                    "--ldflags", "--libs", "--system-libs").stdout):
             flags += ["--link-flag", flag]
-    fixtures = ("derive_qualified_shape", "retained_heap", "jit_metadata_lifetime", "jit_type_lifetime", "jit_impl_lifetime", "jit_monomorph_report_lifetime", "jit_source_sharing", "jit_body_sharing", "jit_native_metadata_roots", "jit_static_session", "jit_static_lifetime", "jit_static_policy",
+    fixtures = ("derive_qualified_shape", "retained_heap", "jit_metadata_lifetime", "jit_type_lifetime", "jit_impl_lifetime", "jit_monomorph_report_lifetime", "jit_source_sharing", "jit_body_sharing", "jit_native_metadata_roots", "jit_repl_policy", "jit_repl_reclaim", "jit_static_session", "jit_static_lifetime", "jit_static_policy",
                 "jit_static_dynamic", "jit_static_isolation", "jit_single_form_proof", "jit_checked_baseline", "jit_env_values", "jit_deep_source", "jit_env_stale", "jit_env_stale_complete", "jit_env_native", "jit_live_checker", "jit_redefined_signature",
-                "jit_generation_tokens", "jit_reserved_tokens", "jit_frontend_policy", "jit_deferred_publication", "jit_repair_diagnostics", "jit_defalias_rebind", "jit_retire_declarations", "jit_retire_definitions", "host_environment", "jit_session_import_meta", "jit_retained_declarations", "jit_hidden_names", "jit_reader_keeps_type", "jit_session_imports", "jit_session_free", "jit_llvm_backend", "jit_const_across_submissions", "jit_const_generic_trait_method", "jit_meta_accepted_impl", "jit_meta_dependencies", "jit_meta_generator_later", "jit_shared_prelude", "jit_before_expand_const_replacement", "jit_before_expand_sum_replacement", "jit_qualified_names", "jit_entry_compile_time_code", "jit_import_tolerant_helper", "jit_cimport_header_change")
+                "jit_generation_tokens", "jit_reserved_tokens", "jit_frontend_policy", "jit_meta_pipeline", "jit_deferred_publication", "jit_repair_diagnostics", "jit_defalias_rebind", "jit_retire_declarations", "jit_retire_definitions", "host_environment", "jit_session_import_meta", "jit_retained_declarations", "jit_hidden_names", "jit_reader_keeps_type", "jit_session_imports", "jit_session_free", "jit_llvm_backend", "jit_repl_second_submission", "jit_repl_inline_edit", "jit_repl_impl_replace", "jit_const_across_submissions", "jit_repl_const_eval", "jit_const_generic_trait_method", "jit_meta_accepted_impl", "jit_meta_dependencies", "jit_meta_generator_later", "jit_shared_prelude", "jit_before_expand_const_replacement", "jit_before_expand_sum_replacement", "jit_qualified_names", "jit_entry_compile_time_code", "jit_generic_replacement", "jit_import_tolerant_helper", "jit_cimport_header_change")
     if sys.platform == "darwin":
         fixtures += ("jit_scratch_footprint",)
     # COIL_META_MAIN=1 in an embedding host: main-thread compiles run metaprograms
@@ -145,6 +145,25 @@ with tempfile.TemporaryDirectory(prefix=".coil-static-jit-", dir=ROOT) as raw:
             assert app.returncode == 0, (app.returncode, app.stdout, app.stderr)
             assert "Type :run" in app.stdout, (app.stdout, app.stderr)
             print("PASS: project app REPL compiles and launches in one JIT session", flush=True)
+        (dep / "src/live_color.coil").write_text(
+            '(module project-dependency.live-color)\n'
+            '(import "coil.repl")\n'
+            '(export value)\n'
+            '(defn value [] (-> i64) 41)\n'
+            '(defn __repl_vars [] (-> Code) (coil.repl/var-module))\n')
+        (project / "src/aot.coil").write_text(
+            '(module project-host.aot)\n'
+            '(import "project-dependency.live-color" :as color)\n'
+            '(defn main [] (-> i64) (- (color/value) 41))\n')
+        aot_binary = work / "repl-var-module-aot"
+        run(COMPILER, "build", project / "src/aot.coil", "-o", aot_binary, *flags,
+            cwd=project)
+        run(aot_binary, cwd=project)
+        binary = work / "jit-repl-import-var"
+        run(COMPILER, "build", ROOT / "tests/compiler/features/jit_repl_import_var.coil",
+            "-o", binary, *flags)
+        run(binary, cwd=project)
+        print("PASS: AOT and imported JIT modules share REPL Var lowering", flush=True)
         binary = work / "project-context"
         run(COMPILER, "build", ROOT / "tests/compiler/features/jit_project_context.coil",
             "-o", binary, *flags)
