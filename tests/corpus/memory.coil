@@ -1,0 +1,612 @@
+(module corpus.memory)
+;; Memory end to end: the allocators (malloc, arena, scratch, region, and a
+;; user-defined counting allocator), typed allocation and box!/destroy, allocator
+;; leases, Rc and Arc with weak references and allocator provenance, fixed and
+;; inline lists, atomics, globals (const, def tables, Var cells, static cells with
+;; initializers and sparse :elements), and caller-frame byte allocation.
+;;
+;; Each section prints what it computed and checks it; main returns the number
+;; of failed checks.
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use [malloc-allocator arena-allocator AllocRequest Allocator AllocatorLease])
+(import "coil.arraylist" :use [ArrayList al-new al-free!])
+(import "coil.scratch" :as scratch)
+(import "coil.region" :as region)
+(import "coil.leased-region" :as leased)
+(import "coil.rc" :as rc)
+(import "coil.arc" :as arc)
+(import "coil.fixedlist" :use [fixed-list inline-list InlineList capacity full? clear!])
+(import "coil.atomic" :use [atomic-add atomic-sub atomic-xchg atomic-cas atomic-load atomic-store])
+(import "coil.var" :use [var-static])
+(import "coil.str" :use [sv])
+(import "coil.slice" :use [subslice])
+
+;; ---------------------------------------------------------------- harness
+
+(defn failures [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+(defn check [(name (slice u8)) (got i64) (want i64)] (-> void)
+  (if (= got want)
+      (println "  {} = {}" name got)
+      (do (store! (failures) (+ (load (failures)) 1))
+          (println "  FAIL {} = {}, want {}" name got want))))
+
+(defn check-true [(name (slice u8)) (ok bool)] (-> void)
+  (check name (if ok 1 0) 1))
+
+(defn section [(title (slice u8))] (-> void)
+  (println "== {}" title))
+
+(defn request [(n i64) (alignment i64)] (-> AllocRequest)
+  (AllocRequest :type-id 0 :count n :bytes n :align alignment))
+
+(defn take-bytes [(a (dyn Allocator)) (n i64) (alignment i64)] (-> (ptr i8))
+  (match (alloc/raw-alloc a (request n alignment))
+    (Some [p] p)
+    (None [] (alloc/oom))))
+
+;; ---------------------------------------------------------------- a counting allocator
+
+(defstruct Counts
+  [(allocations i64)
+   (deallocations i64)
+   (live-bytes i64)
+   (retains i64)
+   (releases i64)])
+
+(impl Allocator Counts
+  (allocate [(self (ptr Counts)) (req (ref AllocRequest))] (-> (Option (ptr i8)))
+    (set! (.allocations self) (+ (.allocations self) 1))
+    (set! (.live-bytes self) (+ (.live-bytes self) (.bytes req)))
+    (alloc/malloc-allocate (load req)))
+  (resize [(self (ptr Counts)) (memory (ptr i8)) (old (ref AllocRequest)) (new (ref AllocRequest))]
+    (-> bool)
+    false)
+  (remap [(self (ptr Counts)) (memory (ptr i8)) (old (ref AllocRequest)) (new (ref AllocRequest))]
+    (-> (Option (ptr i8)))
+    (None))
+  (deallocate [(self (ptr Counts)) (memory (ptr i8)) (req (ref AllocRequest))] (-> i64)
+    (set! (.deallocations self) (+ (.deallocations self) 1))
+    (set! (.live-bytes self) (- (.live-bytes self) (.bytes req)))
+    (primitive/free memory)))
+
+(defn counts-retain [(raw (ptr i8))] (-> i64)
+  (let [c (cast (ptr Counts) raw)]
+    (set! (.retains c) (+ (.retains c) 1))
+    0))
+
+(defn counts-release [(raw (ptr i8))] (-> i64)
+  (let [c (cast (ptr Counts) raw)]
+    (set! (.releases c) (+ (.releases c) 1))
+    0))
+
+(defn counted-lease [(counts (ptr Counts))] (-> AllocatorLease)
+  (alloc/unsafe-allocator-lease-new (primitive/make-dyn Allocator counts)
+                                    (cast (ptr i8) counts)
+                                    (fnptr-of counts-retain)
+                                    (fnptr-of counts-release)))
+
+;; ---------------------------------------------------------------- malloc and typed allocation
+
+(defstruct Node [(value i64) (next (ptr Node))])
+
+(defn list-sum [(n (ptr Node))] (-> i64)
+  (let [(mut total) 0
+        (mut at) n]
+    (while (!= at (cast (ptr Node) 0))
+      (set! total (+ total (.value at)))
+      (set! at (.next at)))
+    total))
+
+(defn malloc-section [] (-> void)
+  (section "malloc, box! and typed allocation")
+  (let [heap (malloc-allocator)
+        c (alloc/box! heap Node (Node :value 3 :next (cast (ptr Node) 0)))
+        b (alloc/box! heap Node (Node :value 2 :next c))
+        a (alloc/box! heap Node (Node :value 1 :next b))]
+    (check "a boxed linked list" (list-sum a) 6)
+    (set! (.value b) 20)
+    (check "written through a box" (list-sum a) 24)
+    (alloc/destroy heap a)
+    (alloc/destroy heap b)
+    (alloc/destroy heap c))
+  (let [heap (malloc-allocator)]
+    (match (alloc/alloc [i64] heap 4)
+      (None [] (check "alloc" 0 1))
+      (Some [(mut xs)]
+        (for i (range 0 4) (set! (mut xs) i (* i i)))
+        (match (alloc/reallocate heap xs 8)
+          (None [] (check "reallocate" 0 1))
+          (Some [(mut ys)]
+            (for i (range 4 8) (set! (mut ys) i (* i i)))
+            (check "reallocate keeps the prefix" (get ys 3) 9)
+            (check "and grows" (fold (fn [acc v] (+ acc v)) 0 ys) 140)
+            (check "the new length" (len ys) 8)
+            (alloc/free heap ys))))))
+  (let [counts (primitive/alloc-static Counts)]
+    (store! counts (zeroed Counts))
+    (let [a (primitive/make-dyn Allocator counts)
+          (mut xs) (al-new [i64] a)]
+      (for i (range 0 100) (push! (mut xs) i))
+      (check "a list through a user allocator" (fold (fn [acc v] (+ acc v)) 0 xs) 4950)
+      (check-true "it allocated" (> (.allocations counts) 0))
+      (al-free! (mut xs))
+      (check "everything it allocated came back" (.live-bytes counts) 0)
+      (check "allocations equal deallocations" (- (.allocations counts) (.deallocations counts)) 0))))
+
+;; ---------------------------------------------------------------- arena, scratch, region
+
+(defn arena-section [] (-> void)
+  (section "arena, scratch and region")
+  (let [scratch-space (arena-allocator 4096)
+        (mut xs) (al-new [i64] scratch-space)]
+    (push! (mut xs) 1)
+    (push! (mut xs) 2)
+    (check "a list in an arena" (len xs) 2))
+  (let [ar (alloc/arena-new 256)
+        a (alloc/arena-view ar)
+        p (take-bytes a 16 8)
+        q (take-bytes a 16 8)]
+    (check "arena allocations are distinct" (if (!= p q) 1 0) 1)
+    (check "and bump forward" (- (cast i64 q) (cast i64 p)) 16)
+    (alloc/arena-release! ar))
+  (let [arena (primitive/alloc-stack scratch/ScratchArena)]
+    (scratch/scratch-init-with-cap arena (malloc-allocator) 256)
+    (let [a (scratch/scratch-allocator arena)
+          empty (scratch/scratch-mark arena)
+          first (take-bytes a 1 1)
+          mark (scratch/scratch-mark arena)]
+      (take-bytes a 1 64)
+      (check "scratch live after two" (scratch/scratch-live arena) 2)
+      (scratch/scratch-reset-to! arena mark)
+      (check "reset to a mark" (scratch/scratch-live arena) 1)
+      (take-bytes a 400 64)
+      (check "a segment beyond the initial cap" (scratch/scratch-live arena) 401)
+      (scratch/scratch-reset-to! arena mark)
+      (check "reset across segments" (scratch/scratch-live arena) 1)
+      (scratch/scratch-reset-to! arena empty)
+      (check "reset to empty" (scratch/scratch-live arena) 0)
+      (for i (range 0 16)
+        (take-bytes a 1024 128)
+        (scratch/scratch-reset! arena))
+      (check-true "reuse keeps the peak bounded" (< (scratch/scratch-peak arena) 4096))
+      (scratch/scratch-close! arena)
+      (check-true "closed" (scratch/scratch-closed? arena))))
+  (let [counts (primitive/alloc-static Counts)
+        scope (primitive/alloc-stack region/Region)]
+    (store! counts (zeroed Counts))
+    (region/region-init scope (primitive/make-dyn Allocator counts))
+    (let [a (region/region-allocator scope)
+          p (take-bytes a 13 8)
+          q (take-bytes a 29 8)
+          r (take-bytes a 64 16)]
+      (store! p (cast i8 42))
+      (let [live-before (.live-bytes counts)]
+        (alloc/raw-free a q (request 29 8))
+        (check-true "freeing one block returns it to the parent"
+                    (>= (- live-before (.live-bytes counts)) 29)))
+      (check-true "the others are still live" (> (.allocations counts) (.deallocations counts)))
+      (region/region-close! scope)
+      (check-true "closing frees the rest" (= (.allocations counts) (.deallocations counts)))
+      (check-true "and marks it closed" (region/region-closed? scope)))))
+
+;; ---------------------------------------------------------------- leases
+
+(defn retained-region-lease [] (-> AllocatorLease)
+  (match (leased/leased-region-new (alloc/malloc-allocator-lease))
+    (None [] (alloc/oom))
+    (Some [owner] (let [survivor (clone owner)] survivor))))
+
+(defn lease-section [] (-> void)
+  (section "allocator leases")
+  (let [lease (alloc/malloc-allocator-lease)
+        duplicate (clone lease)
+        req (request 8 8)]
+    (match (alloc/lease-raw-alloc duplicate req)
+      (None [] (check "lease allocation" 0 1))
+      (Some [memory]
+        (store! (cast (ptr i64) memory) 42)
+        (check "through a cloned lease" (load (cast (ptr i64) memory)) 42)
+        (alloc/lease-raw-free duplicate memory req))))
+  (let [lease (retained-region-lease)
+        req (request 8 8)]
+    (match (alloc/lease-raw-alloc lease req)
+      (None [] (check "a leased region outlives its creator" 0 1))
+      (Some [memory]
+        (store! (cast (ptr i64) memory) 7)
+        (check "a leased region outlives its creator" (load (cast (ptr i64) memory)) 7)
+        (alloc/lease-raw-free lease memory req))))
+  (let [counts (primitive/alloc-static Counts)]
+    (store! counts (zeroed Counts))
+    (let [lease (counted-lease counts)
+          other (clone lease)]
+      (check "cloning a lease retains it" (.retains counts) 1))
+    (check "dropping both releases twice" (.releases counts) 2)))
+
+;; ---------------------------------------------------------------- Rc and Arc
+
+(defn drops [] (-> (ptr i64)) (primitive/alloc-static i64))
+
+(defstruct Payload [(answer i64)])
+
+(impl Drop Payload
+  (drop [(self (mut Payload))] (-> void)
+    (store! (drops) (+ (load (drops)) 1))))
+
+(defn rc-lifecycle [] (-> i64)
+  (store! (drops) 0)
+  (block :rc
+    (let [weak (match (rc/rc-new (Payload :answer 20))
+                 (None [] (break :rc 100))
+                 (Some [owner]
+                   (let [other (clone owner)]
+                     (when (!= (rc/rc-strong-count owner) 2) (break :rc 101))
+                     (match (rc/rc-try-unwrap owner)
+                       (Ok [_] (break :rc 102))
+                       (Err [returned] (let [released returned] 0)))
+                     (when (!= (rc/rc-strong-count other) 1) (break :rc 103))
+                     (rc/rc-downgrade other))))]
+      (when (!= (load (drops)) 1) (break :rc 104))
+      (match (rc/weak-rc-upgrade weak)
+        (Some [_] 105)
+        (None [] 0)))))
+
+(defn arc-lifecycle [] (-> i64)
+  (store! (drops) 0)
+  (block :arc
+    (let [weak (match (arc/arc-new (Payload :answer 20))
+                 (None [] (break :arc 100))
+                 (Some [owner]
+                   (let [other (clone owner)]
+                     (when (!= (arc/arc-strong-count owner) 2) (break :arc 101))
+                     (match (arc/arc-try-unwrap owner)
+                       (Ok [_] (break :arc 102))
+                       (Err [returned] (let [released returned] 0)))
+                     (when (!= (arc/arc-strong-count other) 1) (break :arc 103))
+                     (arc/arc-downgrade other))))]
+      (when (!= (load (drops)) 1) (break :arc 104))
+      (match (arc/weak-upgrade weak)
+        (Some [_] 105)
+        (None [] 0)))))
+
+(defn rc-owner-apis [] (-> i64)
+  (store! (drops) 0)
+  (block :rc
+    (match (rc/rc-new (Payload :answer 10))
+      (None [] 100)
+      (Some [initial]
+        (let [(mut owner) (load initial)]
+          (match (rc/rc-get-mut (mut owner))
+            (None [] (break :rc 101))
+            (Some [value] (set! (.answer value) 20)))
+          (let [weak (rc/rc-downgrade owner)]
+            (match (rc/rc-get-mut (mut owner))
+              (None [] 0)
+              (Some [_] (break :rc 102))))
+          (match (rc/rc-get-mut (mut owner))
+            (None [] (break :rc 103))
+            (Some [_] 0))
+          (let [raw (rc/rc-into-raw owner)
+                adopted (rc/unsafe-rc-from-raw raw)]
+            (match (rc/rc-try-unwrap adopted)
+              (Err [_] 104)
+              (Ok [payload] (.answer payload)))))))))
+
+(defn arc-owner-apis [] (-> i64)
+  (store! (drops) 0)
+  (block :arc
+    (match (arc/arc-new (Payload :answer 10))
+      (None [] 100)
+      (Some [initial]
+        (let [(mut owner) (load initial)]
+          (match (arc/arc-get-mut (mut owner))
+            (None [] (break :arc 101))
+            (Some [value] (set! (.answer value) 20)))
+          (let [weak (arc/arc-downgrade owner)]
+            (match (arc/arc-get-mut (mut owner))
+              (None [] 0)
+              (Some [_] (break :arc 102))))
+          (let [raw (arc/arc-into-raw owner)
+                adopted (arc/unsafe-arc-from-raw raw)]
+            (match (arc/arc-try-unwrap adopted)
+              (Err [_] 104)
+              (Ok [payload] (.answer payload)))))))))
+
+(defstruct Tracked [(state (ptr Counts))])
+
+(impl Drop Tracked
+  (drop [(self (mut Tracked))] (-> void)
+    (let [s (.state self)] (set! (.retains s) (+ (.retains s) 100)))))
+
+(defn dead-weak [(lease AllocatorLease) (state (ptr Counts))] (-> (rc/WeakRc Tracked))
+  (match (rc/rc-new-in lease (Tracked :state state))
+    (None [] (alloc/oom))
+    (Some [owner]
+      (let [other (clone owner)]
+        (rc/rc-downgrade owner)))))
+
+(defstruct Leaf [(drops (ptr i64))])
+
+(impl Drop Leaf
+  (drop [(self (mut Leaf))] (-> void)
+    (let [d (.drops self)] (store! d (+ (load d) 1)))))
+
+;; The outer Arc and the inner Rc come from different leases; drop glue releases
+;; the inner owner before the outer block returns to its allocator.
+(defstruct Nest [(inner (rc/Rc Leaf))])
+
+(defn nested-provenance [(outer (ptr Counts)) (inner (ptr Counts)) (leaf-drops (ptr i64))] (-> i64)
+  (match (rc/rc-new-in (counted-lease inner) (Leaf :drops leaf-drops))
+    (None [] 100)
+    (Some [owned]
+      (match (arc/arc-new-in (counted-lease outer) (Nest :inner owned))
+        (None [] 101)
+        (Some [whole] (.answer (Payload :answer 0)))))))
+
+(defn rc-section [] (-> void)
+  (section "Rc and Arc")
+  (check "Rc: clone, try-unwrap, downgrade" (rc-lifecycle) 0)
+  (check "the Rc payload dropped once" (load (drops)) 1)
+  (check "Arc: clone, try-unwrap, downgrade" (arc-lifecycle) 0)
+  (check "the Arc payload dropped once" (load (drops)) 1)
+  (check "Rc get-mut, into-raw, from-raw" (rc-owner-apis) 20)
+  (check "Rc owner payload dropped once" (load (drops)) 1)
+  (check "Arc get-mut, into-raw, from-raw" (arc-owner-apis) 20)
+  (check "Arc owner payload dropped once" (load (drops)) 1)
+  (match (arc/arc-new (Payload :answer 42))
+    (None [] (check "arc-new" 0 1))
+    (Some [owner]
+      (let [other (clone owner)
+            weak (arc/arc-downgrade owner)]
+        (match (arc/weak-upgrade weak)
+          (None [] (check "a live weak upgrades" 0 1))
+          (Some [third] (check "a live weak upgrades" (.answer (arc/arc-borrow third)) 42))))))
+  (let [state (primitive/alloc-static Counts)]
+    (store! state (zeroed Counts))
+    (let [weak (dead-weak (counted-lease state) state)]
+      (check-true "a dead weak does not upgrade"
+                  (match (rc/weak-rc-upgrade weak) (None [] true) (Some [_] false))))
+    (check "Rc allocated once from its lease" (.allocations state) 1)
+    (check "and freed once" (.deallocations state) 1)
+    (check "the payload dropped once" (/ (.retains state) 100) 1)
+    (check "the lease released once" (.releases state) 1))
+  (let [outer (primitive/alloc-static Counts)
+        inner (primitive/alloc-static Counts)
+        leaf-drops (primitive/alloc-static i64)]
+    (store! outer (zeroed Counts))
+    (store! inner (zeroed Counts))
+    (store! leaf-drops 0)
+    (check "nested Arc of Rc" (nested-provenance outer inner leaf-drops) 0)
+    (check "outer block freed to its own allocator" (+ (* 10 (.allocations outer)) (.deallocations outer)) 11)
+    (check "inner block freed to its own allocator" (+ (* 10 (.allocations inner)) (.deallocations inner)) 11)
+    (check "both leases released" (+ (.releases outer) (.releases inner)) 2)
+    (check "the leaf dropped once" (load leaf-drops) 1)))
+
+;; ---------------------------------------------------------------- fixed lists
+
+(defstruct Light [(x f32) (radius f32)])
+(defstruct Renderer [(lights (InlineList Light 4)) (frame i64)])
+(defstruct Holder [(items (array i64 4)) (n i64)])
+
+(defn front [(h Holder)] (-> (slice i64))
+  (subslice (field h items) 0 2))
+
+(defn add-light! [(r (ptr Renderer)) (x f32)] (-> i64)
+  (push! (mut (.lights r)) (Light :x x :radius 2.0)))
+
+(defn fixed-section [] (-> void)
+  (section "fixed and inline lists")
+  (let [h (Holder :items [7 8 9 10] :n 2)
+        s (front h)]
+    (check "a slice of an array field" (+ (get s 0) (get s 1)) 15))
+  (let [(mut backing) [0 0 0 0 0]
+        (mut xs) (fixed-list (: (mut backing) (slice i64)))]
+    (push! (mut xs) 10)
+    (push! (mut xs) 20)
+    (push! (mut xs) 30)
+    (set! (mut xs) 1 25)
+    (check "fixed len" (len xs) 3)
+    (check "fixed capacity" (capacity xs) 5)
+    (check-true "not full" (not (full? xs)))
+    (check "fixed sum" (fold (fn [acc v] (+ acc v)) 0 xs) 65)
+    (check "pop" (match (pop! (mut xs)) (Some [v] v) (None [] -1)) 30)
+    (clear! (mut xs))
+    (check "cleared" (len xs) 0)
+    (check "the storage is the caller's" (get backing 1) 25))
+  (let [(mut local) (inline-list [i64 3])]
+    (push! (mut local) 5)
+    (push! (mut local) 6)
+    (push! (mut local) 7)
+    (check "inline list sum" (fold (fn [acc v] (+ acc v)) 0 local) 18)
+    (check-true "inline list full" (full? local)))
+  (let [(mut r) (Renderer :lights (inline-list [Light 4]) :frame 0)]
+    (add-light! (mut r) 1.5)
+    (add-light! (mut r) 2.5)
+    (check "an inline list as a struct field" (len (.lights r)) 2)
+    (check "its elements" (cast i64 (fold (fn [acc l] (+ acc (cast f64 (.x l)))) 0.0 (.lights r))) 4)))
+
+;; ---------------------------------------------------------------- atomics
+
+(defn atomics-section [] (-> void)
+  (section "atomics")
+  (let [heap (malloc-allocator)
+        cell (alloc/box! heap i64 100)]
+    (check "atomic-add returns the old value" (atomic-add cell 5) 100)
+    (check "after add" (atomic-load cell) 105)
+    (check "atomic-sub" (atomic-sub cell 30) 105)
+    (check "atomic-xchg" (atomic-xchg cell 999) 75)
+    (check "a CAS that hits" (atomic-cas cell 999 1) 999)
+    (check "after the hit" (atomic-load cell) 1)
+    (check "a CAS that misses" (atomic-cas cell 999 77) 1)
+    (check "after the miss" (atomic-load cell) 1)
+    (atomic-store cell 42)
+    (check "atomic-store" (atomic-load cell) 42)
+    (alloc/destroy heap cell)))
+
+;; ---------------------------------------------------------------- globals
+
+(defsum Ev (Coin) (Push) (Wait [(ms i64)]))
+(defstruct Span [(sec i64) (nsec i64)])
+(defstruct Op [(n i64) (f (fnptr c [i64] i64)) (tbl (array i64 3))])
+
+(defn twice [(x i64)] (-> i64) (* 2 x))
+(defn sq [(x i64)] (-> i64) (* x x))
+(defn inc [(x i64)] (-> i64) (+ x 1))
+
+(const TABLE-SIZE 16)
+(const XS [(twice 1) (twice 2)])
+(const ORIGIN (Span :sec 5 :nsec 0))
+
+(def WORKING-SET [1 2 1 3])
+(def TABLE [(Coin) (Push) (Wait :ms 7) (Coin)])
+(def DOUBLED [(twice 1) (twice 2) (twice 3)])
+(def PIECES [(sv "a") (sv "bc")])
+(def SPANS [(Span :nsec 9 :sec 1) (Span :sec 2 :nsec 8)])
+(def VIEW (: [10 20 30] (slice i64)))
+(def OPS [(fnptr-of twice) (fnptr-of inc)])
+(def OP (Op :tbl [7 8 9] :f (fnptr-of sq) :n (+ 1 2)))
+(def counter (var-static i64 (* 5 2)))
+(def GREETING c"hey")
+
+(defn ev-code [(e Ev)] (-> i64)
+  (match e (Coin [] 1) (Push [] 2) (Wait [ms] ms)))
+
+;; The def itself borrowed as a slice: it outlives this frame.
+(defn table [] (-> (slice Ev)) TABLE)
+
+(defn sum [(xs (slice i64))] (-> i64)
+  (fold (fn [acc x] (+ acc x)) 0 xs))
+
+(defn bump! [] (-> i64)
+  (set counter (+ (get counter) 1))
+  (get counter))
+
+(defn call-count [] (-> i64)
+  (let [c (primitive/alloc-static i64)]
+    (store! c (+ (load c) 1))
+    (load c)))
+
+(defstruct Triple [(a i32) (b i32) (c i32)])
+(defstruct Entry [(tag i32) (callback (fnptr c [] i64)) (tail i32)])
+(defstruct ExplicitTriple :layout explicit :size 24 :align 8
+  [(a i64 :at 0) (b i64 :at 8) (c i64 :at 16)])
+
+(defn answer [] (-> i64) 9)
+
+(defn triple [] (-> (ptr Triple))
+  (primitive/alloc-static Triple (Triple :a 1 :b 2 :c 3)))
+
+(defn entry [] (-> (ptr Entry))
+  (primitive/alloc-static Entry (Entry :tag 4 :callback (fnptr-of answer) :tail 5)))
+
+(defn explicit-triples [] (-> (ptr (array ExplicitTriple 2)))
+  (primitive/alloc-static (array ExplicitTriple 2)
+                          [(ExplicitTriple :a 1 :b 2 :c 3)
+                           (ExplicitTriple :a 4 :b 5 :c 6)]))
+
+;; Sparse statics: only the named elements are stored; the rest are zero.
+(defn sparse [] (-> (ptr (array i64 70000)))
+  (primitive/alloc-static (array i64 70000) :elements [(0 1) (69999 42)]))
+
+(defn sparse-nested [] (-> (ptr (array (array i64 1000) 2)))
+  (primitive/alloc-static (array (array i64 1000) 2) :elements [(1 (:elements [(999 73)]))]))
+
+(defn sparse-callbacks [] (-> (ptr (array (fnptr c [] i64) 1000)))
+  (primitive/alloc-static (array (fnptr c [] i64) 1000) :elements [(999 (fnptr-of answer))]))
+
+(defn globals-section [] (-> void)
+  (section "globals and static cells")
+  (check "a const" TABLE-SIZE 16)
+  (check "a const array computed with calls" (get XS 1) 4)
+  (check "a const struct" (+ (.sec ORIGIN) (.nsec ORIGIN)) 5)
+  (check "a def table borrowed as a slice" (fold (fn [acc e] (+ (* acc 10) (ev-code e))) 0 (table)) 1271)
+  (check "a def array" (sum WORKING-SET) 7)
+  (check "computed at compile time" (get DOUBLED 2) 6)
+  (check "string views in a def" (len (.raw (get PIECES 1))) 2)
+  (check "structs out of field order" (+ (.sec (get SPANS 0)) (.nsec (get SPANS 0))) 10)
+  (check "a def slice" (sum VIEW) 60)
+  (check "function pointers laid out by the linker" (+ (primitive/call-ptr (get OPS 0) 5) (primitive/call-ptr (get OPS 1) 5)) 16)
+  (check "a def struct with a fnptr field" (+ (.n OP) (primitive/call-ptr (.f OP) 4) (sum (.tbl OP))) 43)
+  (check "a C string def" (cast i64 (load GREETING)) 104)
+  (check "a Var cell" (bump!) 11)
+  (check "and again" (bump!) 12)
+  (call-count)
+  (call-count)
+  (check "a static cell persists across calls" (call-count) 3)
+  (let [p (triple)
+        before (.c p)]
+    (set! (.c p) (cast i32 6))
+    (check "a static with an initializer" (cast i64 before) 3)
+    (check "written and read back" (cast i64 (.c (triple))) 6))
+  (check "an initializer holding a fnptr" (primitive/call-ptr (.callback (entry))) 9)
+  (let [ea (primitive/index (cast (ptr ExplicitTriple) (explicit-triples)) 1)]
+    (check "an explicit-layout array static" (+ (.a ea) (.b ea) (.c ea)) 15))
+  (check "sparse first element" (get (load (sparse)) 0) 1)
+  (check "sparse last element" (get (load (sparse)) 69999) 42)
+  (check "sparse zero in between" (get (load (sparse)) 35000) 0)
+  (check "a nested sparse element" (get (get (load (sparse-nested)) 1) 999) 73)
+  (check "nested zeros" (get (get (load (sparse-nested)) 0) 999) 0)
+  (check "a sparse function pointer" (primitive/call-ptr (get (load (sparse-callbacks)) 999)) 9))
+
+;; ---------------------------------------------------------------- caller-frame bytes
+
+(extern memset :cc c [(ptr u8) i32 u64] (-> (ptr u8)))
+
+(defn disturb [] (-> i64)
+  (let [bytes (primitive/alloc-stack (array u8 1024))]
+    (memset (cast (ptr u8) bytes) 99 1024)
+    (cast i64 (load (cast (ptr u8) bytes)))))
+
+(defn frame-bytes [(count u64) (choose bool)] (-> i64)
+  (block :done
+    (let [first (primitive/alloc-stack-bytes count)
+          second (primitive/alloc-stack-bytes count)
+          slots (primitive/alloc-stack (array (ptr u8) 4))
+          branch (if choose
+                     (primitive/alloc-stack-bytes count)
+                     (primitive/alloc-stack-bytes (+ count (cast u64 1))))]
+      (when (= (cast u64 first) (cast u64 second)) (break :done 1))
+      (when (!= (& (cast i64 first) 15) 0) (break :done 2))
+      (when (!= (& (cast i64 second) 15) 0) (break :done 3))
+      (store! first (cast u8 21))
+      (store! second (cast u8 22))
+      (store! branch (cast u8 23))
+      (for i (range 0 4)
+        (let [bytes (primitive/alloc-stack-bytes (+ count (cast u64 i)))]
+          (store! (index (cast (ptr (ptr u8)) slots) i) bytes)
+          (store! bytes (cast u8 (+ i 30)))))
+      (when (!= (disturb) 99) (break :done 4))
+      (when (!= (load first) (cast u8 21)) (break :done 5))
+      (when (!= (load second) (cast u8 22)) (break :done 6))
+      (when (!= (load branch) (cast u8 23)) (break :done 7))
+      (for i (range 0 4)
+        (let [bytes (load (index (cast (ptr (ptr u8)) slots) i))]
+          (when (!= (load bytes) (cast u8 (+ i 30))) (break :done 8))
+          (when (!= (& (cast i64 bytes) 15) 0) (break :done 9))))
+      0)))
+
+(defn stack-section [] (-> void)
+  (section "caller-frame byte allocation")
+  ;; 64 calls of over 300 KiB each: frames must be released on return.
+  (let [(mut worst) 0]
+    (for i (range 0 64)
+      (let [r (frame-bytes (cast u64 65569) false)]
+        (when (> r worst) (set! worst r))))
+    (check "repeated large frames are released" worst 0))
+  (check "aligned, distinct, surviving a disturbing call" (frame-bytes (cast u64 33) true) 0)
+  (check "the other branch" (frame-bytes (cast u64 33) false) 0))
+
+;; ---------------------------------------------------------------- main
+
+(defn main [] (-> i64)
+  (store! (failures) 0)
+  (malloc-section)
+  (arena-section)
+  (lease-section)
+  (rc-section)
+  (fixed-section)
+  (atomics-section)
+  (globals-section)
+  (stack-section)
+  (println "memory: {} failures" (load (failures)))
+  (load (failures)))
