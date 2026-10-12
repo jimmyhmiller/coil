@@ -1577,8 +1577,9 @@ profile (`coil.lint.default`). Add opt-in lints with `--use`, for example
 ;; An ordinary comment; not documentation.
 ```
 
-A run of `;;;` lines directly above a definition is its documentation. `coil doc
-FILE` prints a module's documented API as Markdown, and checkers can read it with
+A run of `;;;` lines directly above a definition is its documentation, and one
+directly above `(module …)` documents the module. `coil doc FILE` prints a
+module's documented API as Markdown, and checkers can read it with
 `primitive/code-doc`.
 
 ## Tests

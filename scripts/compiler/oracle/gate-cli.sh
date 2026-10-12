@@ -4101,6 +4101,7 @@ echo "== doc comments (;;;): coil doc + the code-doc comptime op =="
 # FAILS on the seed (no `doc` subcommand, `code-doc` is an undefined function).
 mkdir -p "$T/docs"
 cat > "$T/docs/m.coil" <<'EOF'
+;;; Points and arithmetic on them.
 (module shapes)
 
 ;;; A point in 2D space.
@@ -4130,6 +4131,15 @@ expect_out '^# shapes'          "doc: prints the module name"           "$COIL" 
 expect_out 'Add two numbers together.' "doc: prints a fn doc"           "$COIL" doc "$T/docs/m.coil"
 expect_out 'Returns their sum.'        "doc: joins a multi-line doc"    "$COIL" doc "$T/docs/m.coil"
 expect_out 'A point in 2D space.'      "doc: documents a defstruct too" "$COIL" doc "$T/docs/m.coil"
+expect_out '^Points and arithmetic on them\.$' "doc: a ;;; block above (module …) is the module doc" \
+  "$COIL" doc "$T/docs/m.coil"
+printf ';;; Only the module is documented.\n(module bare)\n\n(defn f [] (-> i64) 0)\n' > "$T/docs/bare.coil"
+_bare=$("$COIL" doc "$T/docs/bare.coil" 2>&1)
+case "$_bare" in
+  *"Only the module is documented."*"no \`;;;\` doc comments"*) bad "doc: a documented module is not reported as undocumented" "$_bare" ;;
+  *"Only the module is documented."*) ok "doc: a documented module is not reported as undocumented" ;;
+  *) bad "doc: a documented module is not reported as undocumented" "$_bare" ;;
+esac
 # the signature is the HEADER only — the body must not leak into the docs
 expect_out '\(defn add \[\(a i64\) \(b i64\)\] \(-> i64\)\)' "doc: shows the signature without the body" \
   "$COIL" doc "$T/docs/m.coil"
