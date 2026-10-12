@@ -748,7 +748,8 @@
 
 (defn ty-is-scalar [(t (ptr Type))] (-> bool)
   (match (load t)
-    (TInt [_ _] true)
+    ; an integer wider than 64 bits lives in memory (see ty-wide-int?)
+    (TInt [bits _] (<= bits 64))
     (TBool [] true)
     (TPtr [_] true)
     (TRef [_ _] true)
@@ -786,6 +787,9 @@
   (let [k (av-kind av)
         t (primitive/alloc-stack Type)]
     (set! t (av-ty av))
+    (when (and (= k 1) (ty-wide-int? t))
+      (cga-fail "internal: a 128-bit integer read into one register")
+      0)
     (if (or (= k (primitive/cast i64 0))
             (= k (primitive/cast i64 2)))
         (a64-mov-imm! (mut (.asm g)) reg (av-v av))
@@ -1719,7 +1723,16 @@
                               (primitive/cast u8 (primitive/ishr n 8)))
                         0)
                     (= sz 4) (b-patch-u32! (mut buf) off n)
-                    :else (b-patch-u64! (mut buf) off n))))
+                    (= sz 8) (b-patch-u64! (mut buf) off n)
+                    ; a wide integer: the value and its sign extension
+                    :else
+                      (do
+                        (b-patch-u64! (mut buf) off n)
+                        (b-patch-u64! (mut buf) (primitive/iadd off 8) (if (< n 0) -1 0))))))
+      (EWideInt [_ lo hi _ _]
+                (do
+                  (b-patch-u64! (mut buf) off lo)
+                  (b-patch-u64! (mut buf) (primitive/iadd off 8) hi)))
       (EFloat [bits]
               (if (= (ty-size g t) 4)
                   (b-patch-u32! (mut buf) off (f64-bits->f32-bits bits))
@@ -2139,6 +2152,7 @@
     (EDefer [_ _] (do (cga-fail "a (defer …) region reached the backend before ownership elaboration lowered it") (primitive/zeroed AVal)))
     (EBracketCall [_ _ _ _] (do (cga-fail "a bracket call reached the backend before resolution chose its reading") (primitive/zeroed AVal)))
     (EInt [v] (mk-aval 0 v (TInt 64 true)))
+    (EWideInt [_ lo hi _ _] (emit-wide-literal! g lo hi))
     (EFloat [bits] (mk-aval 2 bits (TFloat 64)))
     (EBool [b] (mk-aval 0 (when b 1) (TBool)))
     (EStr [sv]
@@ -2642,6 +2656,8 @@
         t (primitive/alloc-stack Type)
         s (field g asm)]
     (set! t (av-ty av))
+    (if (ty-wide-int? t)
+        (emit-int-unary-wide! g op av t)
     (let [bits (match (load t) (TInt [n _] n) (_ 64))]
       (av-to-x! g av 9)
       (if (= op (primitive/cast i64 0))
@@ -2693,7 +2709,479 @@
       (emit-canon-int! g 9 bits (match (load t) (TInt [_ sg] sg) (_ false)))
       (let [slot (slot-for-ty! g t)]
         (emit-store-int! g 9 28 slot (ty-size g t))
-        (mk-aval 1 slot (av-ty av))))))
+        (mk-aval 1 slot (av-ty av)))))))
+
+; ---- integers wider than a register ----------------------------------------
+; An i128 or u128 (any width from 65 to 128 bits) lives in a 16-byte slot, low
+; word first, and is passed and returned as a 16-byte composite: an even
+; register pair, as AAPCS64 passes __int128. Arithmetic works on register
+; pairs (lo, hi); a width under 128 keeps its high word canonical, sign- or
+; zero-extended from the width, as narrower integers keep their register.
+; Division, and conversion to and from floats, call compiler-rt's helpers.
+
+(defn ty-wide-int? [(t (ptr Type))] (-> bool)
+  (match (load t) (TInt [bits _] (> bits 64)) (_ false)))
+
+(defn wide-bits [(t (ptr Type))] (-> i64)
+  (match (load t) (TInt [bits _] bits) (_ 128)))
+
+(defn wide-signed? [(t (ptr Type))] (-> bool)
+  (match (load t) (TInt [_ signed] signed) (_ false)))
+
+;;; Load the wide integer `av` into registers `lo` and `hi`. An immediate's high
+;;; word is its sign.
+(defn wide-to-x! [(g (ptr Cga)) (av AVal) (lo i64) (hi i64)] (-> i64)
+  (let [s (field g asm)]
+    (if (= (av-kind av) 1)
+        (do
+          (emit-load-int! g lo 28 (av-v av) 8 false)
+          (emit-load-int! g hi 28 (+ (av-v av) 8) 8 false))
+        (do
+          (a64-mov-imm! (mut s) lo (av-v av))
+          (a64-mov-imm! (mut s) hi (if (< (av-v av) 0) -1 0))))))
+
+;;; Keep the high word canonical for a width under 128 bits.
+(defn wide-canon! [(g (ptr Cga)) (t (ptr Type)) (hi i64)] (-> i64)
+  (let [bits (wide-bits t)]
+    (when (< bits 128) (emit-canon-int! g hi (- bits 64) (wide-signed? t)) 0)
+    0))
+
+;;; Store (`lo`, `hi`), canonical for `t`, into a fresh slot of type `t`.
+(defn wide-result! [(g (ptr Cga)) (t (ptr Type)) (lo i64) (hi i64)] (-> AVal)
+  (wide-canon! g t hi)
+  (let [slot (slot-for-ty! g t)]
+    (emit-store-int! g lo 28 slot 8)
+    (emit-store-int! g hi 28 (+ slot 8) 8)
+    (mk-aval 1 slot (load t))))
+
+;;; Store the bool in `reg` into a fresh slot.
+(defn wide-bool-result! [(g (ptr Cga)) (reg i64)] (-> AVal)
+  (let [slot (slot-new! g 8 8)]
+    (emit-store-int! g reg 28 slot 1)
+    (mk-aval 1 slot (TBool))))
+
+;;; Call the C function `name` (a compiler-rt helper); its arguments are in
+;;; place and its result comes back in x0/x1 or d0.
+(defn wide-call! [(g (ptr Cga)) (name (slice u8))] (-> i64)
+  (let [s (field g asm)
+        sym (g-runtime-sym! g name)]
+    (mobj-add-reloc! (mut (field g obj)) (load (field g text)) (a64-off (mut s)) sym (reloc-branch26) true 2)
+    (a64-w! (mut s) (a64-bl-raw))
+    0))
+
+;;; (rlo, rhi) = (lo, hi) << n, for n in 0..127, without branches.
+(defn wide-shl! [(g (ptr Cga)) (lo i64) (hi i64) (n i64) (rlo i64) (rhi i64)] (-> i64)
+  (let [s (field g asm)]
+    (a64-w! (mut s) (a64-lslv 13 hi n))         ; hi << (n mod 64)
+    (a64-w! (mut s) (a64-mvn-reg 14 n))         ; 63 - n, mod 64
+    (a64-w! (mut s) (a64-lsr-imm 15 lo 1))
+    (a64-w! (mut s) (a64-lsrv 15 15 14))        ; lo >> (64 - n), 0 when n = 0
+    (a64-w! (mut s) (a64-orr-reg 13 13 15))
+    (a64-w! (mut s) (a64-lslv 14 lo n))         ; lo << (n mod 64)
+    (a64-mov-imm! (mut s) 15 64)
+    (a64-w! (mut s) (a64-tst-reg n 15))
+    (a64-w! (mut s) (a64-csel rhi 14 13 (cond-ne)))
+    (a64-w! (mut s) (a64-csel rlo 31 14 (cond-ne)))
+    0))
+
+;;; (rlo, rhi) = (lo, hi) >> n for n in 0..127: arithmetic when `signed`.
+(defn wide-shr! [(g (ptr Cga)) (lo i64) (hi i64) (n i64) (signed bool) (rlo i64) (rhi i64)] (-> i64)
+  (let [s (field g asm)]
+    (a64-w! (mut s) (a64-lsrv 13 lo n))         ; lo >> (n mod 64)
+    (a64-w! (mut s) (a64-mvn-reg 14 n))
+    (a64-w! (mut s) (a64-lsl-imm 15 hi 1))
+    (a64-w! (mut s) (a64-lslv 15 15 14))        ; hi << (64 - n), 0 when n = 0
+    (a64-w! (mut s) (a64-orr-reg 13 13 15))
+    (a64-w! (mut s) (if signed (a64-asrv 14 hi n) (a64-lsrv 14 hi n)))
+    (if signed
+        (a64-w! (mut s) (a64-asr-imm 15 hi 63))
+        (a64-w! (mut s) (a64-mov-reg 15 31)))
+    (a64-mov-imm! (mut s) 12 64)
+    (a64-w! (mut s) (a64-tst-reg n 12))
+    (a64-w! (mut s) (a64-csel rlo 14 13 (cond-ne)))
+    (a64-w! (mut s) (a64-csel rhi 15 14 (cond-ne)))
+    0))
+
+;;; (rlo, rhi) = the high 128 bits of the unsigned 256-bit product of (alo, ahi)
+;;; and (blo, bhi). Uses x0-x7 and x15; the inputs survive.
+(defn wide-umulhi! [(g (ptr Cga)) (alo i64) (ahi i64) (blo i64) (bhi i64) (rlo i64) (rhi i64)] (-> i64)
+  (let [s (field g asm)]
+    ; partial products: a0b0 (only its high word matters), a0b1, a1b0, a1b1
+    (a64-w! (mut s) (a64-umulh 0 alo blo))      ; x0 = hi(a0b0)
+    (a64-w! (mut s) (a64-mul 1 alo bhi))        ; x1 = lo(a0b1)
+    (a64-w! (mut s) (a64-umulh 2 alo bhi))      ; x2 = hi(a0b1)
+    (a64-w! (mut s) (a64-mul 3 ahi blo))        ; x3 = lo(a1b0)
+    (a64-w! (mut s) (a64-umulh 4 ahi blo))      ; x4 = hi(a1b0)
+    (a64-w! (mut s) (a64-mul 5 ahi bhi))        ; x5 = lo(a1b1)
+    (a64-w! (mut s) (a64-umulh 6 ahi bhi))      ; x6 = hi(a1b1)
+    ; word 1: x0 + x1 + x3, its carries (0..2) into x7
+    (a64-w! (mut s) (a64-adds-reg 0 0 1))
+    (a64-w! (mut s) (a64-cset 7 (cond-hs)))
+    (a64-w! (mut s) (a64-adds-reg 0 0 3))
+    (a64-w! (mut s) (a64-cset 15 (cond-hs)))
+    (a64-w! (mut s) (a64-add-reg 7 7 15))
+    ; word 2: x5 + x2 + x4 + x7, carries into word 3: x6
+    (a64-w! (mut s) (a64-adds-reg 5 5 2))
+    (a64-w! (mut s) (a64-adc 6 6 31))
+    (a64-w! (mut s) (a64-adds-reg 5 5 4))
+    (a64-w! (mut s) (a64-adc 6 6 31))
+    (a64-w! (mut s) (a64-adds-reg rlo 5 7))
+    (a64-w! (mut s) (a64-adc rhi 6 31))
+    0))
+
+(defn emit-bin-wide! [(g (ptr Cga)) (op i64) (lav AVal) (rav AVal) (t (ptr Type))] (-> AVal)
+  (let [s (field g asm)
+        signed (wide-signed? t)
+        bits (wide-bits t)]
+    (cond
+      ; division and remainder: compiler-rt, (x0, x1) by (x2, x3)
+      (and (>= op 3) (<= op 6))
+        (do
+          (wide-to-x! g lav 0 1)
+          (wide-to-x! g rav 2 3)
+          (wide-call! g (cond (= op 3) (if signed "___divti3" "___udivti3")
+                              (= op 4) (if signed "___modti3" "___umodti3")
+                              (= op 5) "___udivti3"
+                              :else "___umodti3"))
+          (wide-result! g t 0 1))
+      ; signed multiply overflow: the magnitude of the product must reach no
+      ; further than 2^127 - 1, or 2^127 for a negative product
+      (and (= op 17) signed)
+        (do
+          (wide-to-x! g lav 9 10)
+          (wide-to-x! g rav 11 12)
+          (a64-w! (mut s) (a64-asr-imm 13 10 63))
+          (a64-w! (mut s) (a64-asr-imm 14 12 63))
+          (a64-w! (mut s) (a64-eor-reg 8 13 14))         ; -1 when the product is negative
+          (a64-w! (mut s) (a64-eor-reg 9 9 13))          ; |a|
+          (a64-w! (mut s) (a64-eor-reg 10 10 13))
+          (a64-w! (mut s) (a64-subs-reg 9 9 13))
+          (a64-w! (mut s) (a64-sbc 10 10 13))
+          (a64-w! (mut s) (a64-eor-reg 11 11 14))        ; |b|
+          (a64-w! (mut s) (a64-eor-reg 12 12 14))
+          (a64-w! (mut s) (a64-subs-reg 11 11 14))
+          (a64-w! (mut s) (a64-sbc 12 12 14))
+          (wide-umulhi! g 9 10 11 12 2 3)
+          (a64-w! (mut s) (a64-umulh 13 9 11))           ; low 128 bits of |a| |b|
+          (a64-w! (mut s) (a64-madd 13 9 12 13))
+          (a64-w! (mut s) (a64-madd 13 10 11 13))
+          (a64-w! (mut s) (a64-mul 14 9 11))
+          (a64-w! (mut s) (a64-orr-reg 2 2 3))           ; any high bits overflow
+          (a64-w! (mut s) (a64-cmp-imm 2 0))
+          (a64-w! (mut s) (a64-cset 2 (cond-ne)))
+          (a64-w! (mut s) (a64-lsr-imm 3 13 63))         ; so does bit 127 ...
+          (a64-mov-imm! (mut s) 4 (primitive/ishl 1 63))
+          (a64-w! (mut s) (a64-eor-reg 4 13 4))
+          (a64-w! (mut s) (a64-orr-reg 4 4 14))
+          (a64-w! (mut s) (a64-cmp-imm 4 0))
+          (a64-w! (mut s) (a64-cset 4 (cond-eq)))        ; ... unless the magnitude is 2^127
+          (a64-w! (mut s) (a64-and-reg 4 4 8))           ; and the product negative
+          (a64-mov-imm! (mut s) 5 1)
+          (a64-w! (mut s) (a64-eor-reg 4 4 5))
+          (a64-w! (mut s) (a64-and-reg 3 3 4))
+          (a64-w! (mut s) (a64-orr-reg 9 2 3))
+          (when (< bits 128)
+            ; overflowing the narrower width: the wrapped product changes when
+            ; canonicalized
+            (wide-to-x! g lav 10 11)
+            (wide-to-x! g rav 12 13)
+            (a64-w! (mut s) (a64-umulh 14 10 12))
+            (a64-w! (mut s) (a64-madd 14 10 13 14))
+            (a64-w! (mut s) (a64-madd 14 11 12 14))
+            (a64-w! (mut s) (a64-mov-reg 15 14))
+            (emit-canon-int! g 15 (- bits 64) true)
+            (a64-w! (mut s) (a64-cmp-reg 15 14))
+            (a64-w! (mut s) (a64-cset 10 (cond-ne)))
+            (a64-w! (mut s) (a64-orr-reg 9 9 10))
+            0)
+          (wide-bool-result! g 9))
+      :else
+        (do
+          (wide-to-x! g lav 9 10)
+          (wide-to-x! g rav 11 12)
+          (cond
+            (= op 0)
+              (do (a64-w! (mut s) (a64-adds-reg 9 9 11))
+                  (a64-w! (mut s) (a64-adc 10 10 12))
+                  (wide-result! g t 9 10))
+            (= op 1)
+              (do (a64-w! (mut s) (a64-subs-reg 9 9 11))
+                  (a64-w! (mut s) (a64-sbc 10 10 12))
+                  (wide-result! g t 9 10))
+            (= op 2)
+              (do (a64-w! (mut s) (a64-umulh 13 9 11))
+                  (a64-w! (mut s) (a64-madd 13 9 12 13))   ; + lo(a0 b1)
+                  (a64-w! (mut s) (a64-madd 13 10 11 13))  ; + lo(a1 b0)
+                  (a64-w! (mut s) (a64-mul 9 9 11))
+                  (wide-result! g t 9 13))
+            (= op 7)
+              (do (a64-w! (mut s) (a64-and-reg 9 9 11))
+                  (a64-w! (mut s) (a64-and-reg 10 10 12))
+                  (wide-result! g t 9 10))
+            (= op 8)
+              (do (a64-w! (mut s) (a64-orr-reg 9 9 11))
+                  (a64-w! (mut s) (a64-orr-reg 10 10 12))
+                  (wide-result! g t 9 10))
+            (= op 9)
+              (do (a64-w! (mut s) (a64-eor-reg 9 9 11))
+                  (a64-w! (mut s) (a64-eor-reg 10 10 12))
+                  (wide-result! g t 9 10))
+            ; shifts take the amount's low word, as the narrower widths take
+            ; the register's low bits
+            (= op 10)
+              (do (wide-shl! g 9 10 11 9 10) (wide-result! g t 9 10))
+            (= op 11)
+              (do (wide-shr! g 9 10 11 signed 9 10) (wide-result! g t 9 10))
+            (or (= op 12) (= op 13))
+              (if (!= bits 128)
+                  (do (cga-fail "rotating an integer of a width between 65 and 127 bits is not supported by the arm64 backend")
+                      (primitive/zeroed AVal))
+                  ; rotate by r = n mod 128: (x << r) | (x >> ((128 - r) mod 128)),
+                  ; which is x itself when r is 0
+                  (do
+                    (a64-mov-imm! (mut s) 13 127)
+                    (a64-w! (mut s) (a64-and-reg 11 11 13))   ; r
+                    (a64-mov-imm! (mut s) 13 128)
+                    (a64-w! (mut s) (a64-sub-reg 12 13 11))
+                    (a64-mov-imm! (mut s) 13 127)
+                    (a64-w! (mut s) (a64-and-reg 12 12 13))   ; (128 - r) mod 128
+                    ; rotl: left by r, right by 128 - r; rotr the other way
+                    (let [left (if (= op 12) 11 12)
+                          right (if (= op 12) 12 11)]
+                      (a64-w! (mut s) (a64-mov-reg 6 left))
+                      (a64-w! (mut s) (a64-mov-reg 7 right))
+                      (wide-shl! g 9 10 6 2 3)
+                      (wide-shr! g 9 10 7 false 4 5)
+                      (a64-w! (mut s) (a64-orr-reg 9 2 4))
+                      (a64-w! (mut s) (a64-orr-reg 10 3 5))
+                      (wide-result! g t 9 10))))
+            (= op 14)
+              (if (!= bits 128)
+                  (do (cga-fail "the high half of a product of integers between 65 and 127 bits is not supported by the arm64 backend")
+                      (primitive/zeroed AVal))
+                  (do
+                    (wide-umulhi! g 9 10 11 12 2 3)
+                    (when signed
+                      ; signed high half: subtract b when a < 0 and a when b < 0
+                      (a64-w! (mut s) (a64-asr-imm 13 10 63))
+                      (a64-w! (mut s) (a64-and-reg 14 11 13))
+                      (a64-w! (mut s) (a64-and-reg 15 12 13))
+                      (a64-w! (mut s) (a64-subs-reg 2 2 14))
+                      (a64-w! (mut s) (a64-sbc 3 3 15))
+                      (a64-w! (mut s) (a64-asr-imm 13 12 63))
+                      (a64-w! (mut s) (a64-and-reg 14 9 13))
+                      (a64-w! (mut s) (a64-and-reg 15 10 13))
+                      (a64-w! (mut s) (a64-subs-reg 2 2 14))
+                      (a64-w! (mut s) (a64-sbc 3 3 15))
+                      0)
+                    (wide-result! g t 2 3)))
+            (or (= op 15) (= op 16))
+              (do
+                (a64-w! (mut s) (if (= op 15) (a64-adds-reg 9 9 11) (a64-subs-reg 9 9 11)))
+                (a64-w! (mut s) (if (= op 15) (a64-adcs 10 10 12) (a64-sbcs 10 10 12)))
+                (if (= bits 128)
+                    (a64-w! (mut s) (a64-cset 9 (cond (and (= op 15) signed) 6         ; vs
+                                                      signed 6
+                                                      (= op 15) (cond-hs)
+                                                      :else (cond-lo))))
+                    (do
+                      ; the result overflows the width when canonicalizing changes it
+                      (a64-w! (mut s) (a64-mov-reg 13 10))
+                      (emit-canon-int! g 13 (- bits 64) signed)
+                      (a64-w! (mut s) (a64-cmp-reg 13 10))
+                      (a64-w! (mut s) (a64-cset 9 (cond-ne)))
+                      0))
+                (wide-bool-result! g 9))
+            (= op 17)
+              ; unsigned multiply overflow: a product of 128-bit factors overflows
+              ; when its high 128 bits are not zero
+              (do
+                (wide-umulhi! g 9 10 11 12 2 3)
+                (a64-w! (mut s) (a64-orr-reg 2 2 3))
+                (a64-w! (mut s) (a64-cmp-imm 2 0))
+                (a64-w! (mut s) (a64-cset 2 (cond-ne)))
+                (when (< bits 128)
+                  (a64-w! (mut s) (a64-umulh 13 9 11))
+                  (a64-w! (mut s) (a64-madd 13 9 12 13))
+                  (a64-w! (mut s) (a64-madd 13 10 11 13))
+                  (a64-w! (mut s) (a64-mov-reg 14 13))
+                  (emit-canon-int! g 14 (- bits 64) false)
+                  (a64-w! (mut s) (a64-cmp-reg 14 13))
+                  (a64-w! (mut s) (a64-cset 3 (cond-ne)))
+                  (a64-w! (mut s) (a64-orr-reg 2 2 3))
+                  0)
+                (wide-bool-result! g 2))
+            :else (do (cga-fail "unknown integer binary op") (primitive/zeroed AVal)))))))
+
+;;; Compare wide integers: 0 lt, 1 le, 2 gt, 3 ge, 4 eq, 5 ne.
+(defn emit-cmp-wide! [(g (ptr Cga)) (op i64) (lav AVal) (rav AVal) (t (ptr Type))] (-> AVal)
+  (let [s (field g asm)
+        signed (wide-signed? t)]
+    (wide-to-x! g lav 9 10)
+    (wide-to-x! g rav 11 12)
+    (if (>= op 4)
+        (do
+          (a64-w! (mut s) (a64-eor-reg 13 9 11))
+          (a64-w! (mut s) (a64-eor-reg 14 10 12))
+          (a64-w! (mut s) (a64-orr-reg 13 13 14))
+          (a64-w! (mut s) (a64-cmp-imm 13 0))
+          (a64-w! (mut s) (a64-cset 9 (if (= op 4) (cond-eq) (cond-ne)))))
+        ; the flags of a - b decide lt and ge; le and gt take those of b - a
+        (let [swap (or (= op 1) (= op 2))]
+          (if swap
+              (do (a64-w! (mut s) (a64-cmp-reg 11 9))
+                  (a64-w! (mut s) (a64-sbcs 31 12 10)))
+              (do (a64-w! (mut s) (a64-cmp-reg 9 11))
+                  (a64-w! (mut s) (a64-sbcs 31 10 12))))
+          (a64-w! (mut s)
+                  (a64-cset 9 (cond (or (= op 0) (= op 2)) (if signed (cond-lt) (cond-lo))
+                                    :else (if signed (cond-ge) (cond-hs)))))))
+    (wide-bool-result! g 9)))
+
+;;; Integer unary operations on wide integers: 0 not, 1 clz, 2 ctz, 3 popcount,
+;;; 4 bswap. A count is of the type's own width.
+(defn emit-int-unary-wide! [(g (ptr Cga)) (op i64) (av AVal) (t (ptr Type))] (-> AVal)
+  (let [s (field g asm)
+        bits (wide-bits t)]
+    (wide-to-x! g av 9 10)
+    (cond
+      (= op 0)
+        (do (a64-w! (mut s) (a64-mvn-reg 9 9))
+            (a64-w! (mut s) (a64-mvn-reg 10 10))
+            (wide-result! g t 9 10))
+      :else
+        (do
+          ; count the bits of the value as an unsigned number of its width
+          (when (< bits 128) (emit-canon-int! g 10 (- bits 64) false) 0)
+          (cond
+            (= op 1)
+              ; clz = hi != 0 ? clz(hi) : 64 + clz(lo), less the bits above the width
+              (do (a64-w! (mut s) (a64-clz 11 10))
+                  (a64-w! (mut s) (a64-clz 12 9))
+                  (a64-w! (mut s) (a64-add-imm 12 12 64))
+                  (a64-w! (mut s) (a64-cmp-imm 10 0))
+                  (a64-w! (mut s) (a64-csel 9 12 11 (cond-eq)))
+                  (when (< bits 128)
+                    (a64-w! (mut s) (a64-sub-imm 9 9 (- 128 bits)))
+                    0)
+                  (a64-w! (mut s) (a64-mov-reg 10 31))
+                  (wide-result! g t 9 10))
+            (= op 2)
+              ; ctz = lo != 0 ? ctz(lo) : 64 + ctz(hi), and the width for zero
+              (do (a64-w! (mut s) (a64-rbit 11 9))
+                  (a64-w! (mut s) (a64-clz 11 11))
+                  (a64-w! (mut s) (a64-rbit 12 10))
+                  (a64-w! (mut s) (a64-clz 12 12))
+                  (a64-w! (mut s) (a64-add-imm 12 12 64))
+                  (a64-w! (mut s) (a64-cmp-imm 9 0))
+                  (a64-w! (mut s) (a64-csel 11 12 11 (cond-eq)))
+                  (a64-w! (mut s) (a64-orr-reg 13 9 10))
+                  (a64-w! (mut s) (a64-cmp-imm 13 0))
+                  (a64-mov-imm! (mut s) 14 bits)
+                  (a64-w! (mut s) (a64-csel 9 14 11 (cond-eq)))
+                  (a64-w! (mut s) (a64-mov-reg 10 31))
+                  (wide-result! g t 9 10))
+            (= op 3)
+              ; popcount of each word, by the same SWAR steps as a 64-bit one
+              (do (wide-popcount-word! g 9)
+                  (wide-popcount-word! g 10)
+                  (a64-w! (mut s) (a64-add-reg 9 9 10))
+                  (a64-w! (mut s) (a64-mov-reg 10 31))
+                  (wide-result! g t 9 10))
+            :else
+              (if (!= bits 128)
+                  (do (cga-fail "byte-swapping an integer between 65 and 127 bits is not supported by the arm64 backend")
+                      (primitive/zeroed AVal))
+                  (do (a64-w! (mut s) (a64-rev 11 10))
+                      (a64-w! (mut s) (a64-rev 12 9))
+                      (wide-result! g t 11 12))))))))
+
+;;; reg = the number of set bits in reg (x13-x15 are scratch).
+(defn wide-popcount-word! [(g (ptr Cga)) (reg i64)] (-> i64)
+  (let [s (field g asm)]
+    (a64-w! (mut s) (a64-lsr-imm 13 reg 1))
+    (a64-mov-imm! (mut s) 14 0x5555555555555555)
+    (a64-w! (mut s) (a64-and-reg 13 13 14))
+    (a64-w! (mut s) (a64-sub-reg reg reg 13))
+    (a64-mov-imm! (mut s) 14 0x3333333333333333)
+    (a64-w! (mut s) (a64-and-reg 13 reg 14))
+    (a64-w! (mut s) (a64-lsr-imm reg reg 2))
+    (a64-w! (mut s) (a64-and-reg reg reg 14))
+    (a64-w! (mut s) (a64-add-reg reg reg 13))
+    (a64-w! (mut s) (a64-lsr-imm 13 reg 4))
+    (a64-w! (mut s) (a64-add-reg reg reg 13))
+    (a64-mov-imm! (mut s) 14 0x0f0f0f0f0f0f0f0f)
+    (a64-w! (mut s) (a64-and-reg reg reg 14))
+    (a64-w! (mut s) (a64-lsr-imm 13 reg 8))
+    (a64-w! (mut s) (a64-add-reg reg reg 13))
+    (a64-w! (mut s) (a64-lsr-imm 13 reg 16))
+    (a64-w! (mut s) (a64-add-reg reg reg 13))
+    (a64-w! (mut s) (a64-lsr-imm 13 reg 32))
+    (a64-w! (mut s) (a64-add-reg reg reg 13))
+    (a64-mov-imm! (mut s) 14 127)
+    (a64-w! (mut s) (a64-and-reg reg reg 14))
+    0))
+
+;;; A cast to or from a wide integer (`dt` the target).
+(defn emit-cast-wide! [(g (ptr Cga)) (dt (ptr Type)) (av AVal)] (-> AVal)
+  (let [s (field g asm)
+        st (primitive/alloc-stack Type)]
+    (set! st (av-ty av))
+    (cond
+      ; wide -> wide: the same bits, canonical for the target
+      (and (ty-wide-int? st) (ty-wide-int? dt))
+        (do (wide-to-x! g av 9 10) (wide-result! g dt 9 10))
+      ; float -> wide: compiler-rt, signedness of the target
+      (ty-is-float st)
+        (let [single (= (ty-float-bytes st) 4)
+              signed (wide-signed? dt)]
+          (av-to-d! g av 0)
+          (wide-call! g (cond (and single signed) "___fixsfti"
+                              single "___fixunssfti"
+                              signed "___fixdfti"
+                              :else "___fixunsdfti"))
+          (wide-result! g dt 0 1))
+      ; narrower int, bool or pointer -> wide: extend by the source's signedness
+      (ty-wide-int? dt)
+        (let [ssigned (match (load st) (TInt [_ sg] sg) (_ false))]
+          (av-to-x! g av 9)
+          (if ssigned
+              (a64-w! (mut s) (a64-asr-imm 10 9 63))
+              (a64-w! (mut s) (a64-mov-reg 10 31)))
+          (wide-result! g dt 9 10))
+      ; wide -> float: compiler-rt, signedness of the source
+      (ty-is-float dt)
+        (let [single (= (ty-float-bytes dt) 4)
+              signed (wide-signed? st)
+              slot (slot-for-ty! g dt)]
+          (wide-to-x! g av 0 1)
+          (wide-call! g (cond (and single signed) "___floattisf"
+                              single "___floatuntisf"
+                              signed "___floattidf"
+                              :else "___floatuntidf"))
+          (emit-store-fp! g 0 28 slot (ty-float-bytes dt))
+          (mk-aval 1 slot (load dt)))
+      ; wide -> narrower int, bool or pointer: the low word, canonical for the target
+      :else
+        (let [slot (slot-for-ty! g dt)]
+          (wide-to-x! g av 9 10)
+          (match (load dt)
+            (TInt [bits signed] (emit-canon-int! g 9 bits signed))
+            (TBool [] (do (a64-w! (mut s) (a64-orr-reg 9 9 10))
+                          (a64-w! (mut s) (a64-cmp-imm 9 0))
+                          (a64-w! (mut s) (a64-cset 9 (cond-ne)))))
+            (_ 0))
+          (emit-store-int! g 9 28 slot (ty-size g dt))
+          (mk-aval 1 slot (load dt))))))
+
+;;; A wide literal's bits in a fresh slot.
+(defn emit-wide-literal! [(g (ptr Cga)) (lo i64) (hi i64)] (-> AVal)
+  (let [s (field g asm)
+        t (primitive/alloc-stack Type)]
+    (set! t (TInt 128 true))
+    (a64-mov-imm! (mut s) 9 lo)
+    (a64-mov-imm! (mut s) 10 hi)
+    (wide-result! g t 9 10)))
 
 ; ---- arithmetic -------------------------------------------------------------
 (defn emit-bin [(g (ptr Cga)) (op i64) (lhs (ptr Expr)) (rhs (ptr Expr))] (-> AVal)
@@ -2705,6 +3193,8 @@
   (let [t (primitive/alloc-stack Type)
         s (field g asm)]
     (set! t (av-ty lav))
+    (if (ty-wide-int? t)
+        (emit-bin-wide! g op lav rav t)
     (if (ty-is-float t)
         ; float ops: 0 add 1 sub 2 mul 3 div 4 rem(unsupported)
         (let [fb (ty-float-bytes t)
@@ -2861,7 +3351,7 @@
             (set! outp outty)
             (let [slot (slot-for-ty! g outp)]
               (emit-store-int! g 9 28 slot (ty-size g outp))
-              (mk-aval 1 slot outty)))))))
+              (mk-aval 1 slot outty))))))))
 
 (defn emit-cmp [(g (ptr Cga)) (op i64) (lhs (ptr Expr)) (rhs (ptr Expr))] (-> AVal)
   (emit-cmp-av! g op (emit-expr g lhs) (emit-expr g rhs)))
@@ -2871,6 +3361,8 @@
   (let [t (primitive/alloc-stack Type)
         s (field g asm)]
     (set! t (av-ty lav))
+    (if (ty-wide-int? t)
+        (emit-cmp-wide! g op lav rav t)
     (if (ty-is-float t)
         ; float: ordered predicates. 0 lt->mi 1 le->ls 2 gt->gt 3 ge->ge 4 eq->eq 5 one
         (let [fty (unless (= (ty-float-bytes t) (primitive/cast i64 4)) 1)]
@@ -2915,7 +3407,7 @@
                                   :else (cond-ne))))
           (let [slot (slot-new! g 8 8)]
             (emit-store-int! g 9 28 slot 1)
-            (mk-aval 1 slot (TBool)))))))
+            (mk-aval 1 slot (TBool))))))))
 
 ; ---- control flow -----------------------------------------------------------
 ; ---- self-tail-call optimization ------------------------------------------
@@ -3131,6 +3623,8 @@
         s (field g asm)]
     (set! st (av-ty av))
     (set! dt t)
+    (if (or (ty-wide-int? st) (ty-wide-int? dt))
+        (emit-cast-wide! g dt av)
     (match t
       (TInt [dbits dsigned]
             (if (ty-is-float st)
@@ -3176,7 +3670,7 @@
          (let [slot (slot-for-ty! g dt)]
            (av-to-x! g av 9)
            (emit-store-int! g 9 28 slot 8)
-           (mk-aval 1 slot t))))))
+           (mk-aval 1 slot t)))))))
 
 ; ---- sums -------------------------------------------------------------------
 (defn emit-construct [(g (ptr Cga))

@@ -513,6 +513,9 @@ def interpreter(compiler: Path, live: bool, verbose: bool) -> int:
 def interpreter_in(compiler: Path, live: bool, verbose: bool, scratch: Path) -> int:
     base = ORACLE / "arm64"
     reference = base / "reference"
+    # Programs the interpreter refuses by design (it keeps every integer in one
+    # 64-bit cell): each must still be refused, with the diagnostic that says so.
+    refused = {line.split()[0]: line.split(None, 1)[1] for line in read_list(base / "interp-refused.txt")}
     failures = 0
     passed = 0
     for line in read_list(base / "corpus.txt"):
@@ -522,6 +525,16 @@ def interpreter_in(compiler: Path, live: bool, verbose: bool, scratch: Path) -> 
             parts.pop(0)
         source, *program_args = parts
         identity = source.replace("/", "_").replace(".", "_")
+        if source in refused:
+            result = subprocess.run([str(compiler), "interp", source, *program_args], cwd=ROOT,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, timeout=60)
+            if result.returncode != 0 and refused[source].encode() in result.stderr:
+                passed += 1
+            else:
+                failures += 1
+                print(f"FAIL interpreter refusal: {source} exit={result.returncode}")
+            continue
         interpreted = subprocess.run([str(compiler), "interp", source, *program_args], cwd=ROOT,
                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, timeout=60)

@@ -85,8 +85,12 @@ area 10
 | `(ptr T)`, `(slice T)`, `(array T N)`, `(fnptr c [Args…] R)` | |
 
 An integer literal takes its width from context. A literal that does not fit its
-type is a compile error. `(: EXPR TYPE)` states a type where context doesn't
-supply one:
+type is a compile error. One too big for an `i64`, up to 128 bits, needs that
+context: `(: 18446744073709551615 u64)`. A hex, octal or binary literal is a bit
+pattern, so `0xFFFFFFFFFFFFFFFF` fills an `i64` as `-1`. The 128-bit integers,
+`i128` and `u128`, are supported by the LLVM and arm64 backends; the x64 and wasm
+backends and `coil interp` refuse a program that computes with them.
+`(: EXPR TYPE)` states a type where context doesn't supply one:
 
 ```coil
 (module example.values)

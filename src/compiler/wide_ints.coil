@@ -1,0 +1,306 @@
+; src/compiler/wide_ints.coil — which functions of a monomorphized program
+; compute with an integer wider than 64 bits (i128, u128).
+;
+; The LLVM and arm64 backends implement them. The x64 and wasm backends and the
+; bytecode interpreter keep every integer in one 64-bit register or cell, so a
+; wider one would silently lose its high word. They refuse a program that
+; reaches such a function, naming it, instead; a function nothing reaches (the
+; standard library's i128 impls, in most programs) costs nothing.
+(module coil.compiler.wide_ints)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.control" :use *)
+(import "coil.compiler.ast" :use *)
+
+;;; The program's structs, sums, functions and externs by name, and the
+;;; nominal types already found to hold a wide integer or not.
+(defstruct WideScan
+  [(a (dyn Allocator))
+   (program (ptr Program))
+   (structs (HashMap (slice u8) i64))
+   (sums (HashMap (slice u8) i64))
+   (funcs (HashMap (slice u8) i64))
+   (externs (HashMap (slice u8) i64))
+   ; 1 wide, 0 not, -1 being decided (a recursive type through a pointer)
+   (nominal (HashMap (slice u8) i64))])
+
+(defn wide-scan-new [(a (dyn Allocator)) (mp (ptr Program))] (-> WideScan)
+  (let [(mut structs) (hm-new [(slice u8) i64] a (str-keyops-borrowed))
+        (mut sums) (hm-new [(slice u8) i64] a (str-keyops-borrowed))
+        (mut funcs) (hm-new [(slice u8) i64] a (str-keyops-borrowed))
+        (mut externs) (hm-new [(slice u8) i64] a (str-keyops-borrowed))]
+    (for [i 0 (len (load (.structs mp)))]
+      (set! (mut structs) (.name (al-elem [StructDef] (.structs mp) i)) i))
+    (for [i 0 (len (load (.sums mp)))]
+      (set! (mut sums) (.name (al-elem [SumDef] (.sums mp) i)) i))
+    (for [i 0 (len (load (.funcs mp)))]
+      (set! (mut funcs) (.name (al-elem [Func] (.funcs mp) i)) i))
+    (for [i 0 (len (load (.externs mp)))]
+      (set! (mut externs) (.name (al-elem [Extern] (.externs mp) i)) i))
+    (WideScan :a a :program mp :structs structs :sums sums :funcs funcs :externs externs
+              :nominal (hm-new [(slice u8) i64] a (str-keyops-borrowed)))))
+
+;;; Does a value of type `t` hold an integer wider than 64 bits anywhere in it:
+;;; itself, a field, an element, a pointee, a function pointer's signature?
+(defn wide-type? [(ws (ptr WideScan)) (t (ptr Type))] (-> bool)
+  (match (load t)
+    (TInt [bits _] (> bits 64))
+    (TPtr [inner] (wide-type? ws inner))
+    (TRef [_ inner] (wide-type? ws inner))
+    (TArray [inner _] (wide-type? ws inner))
+    (TSlice [inner] (wide-type? ws inner))
+    (TVec [inner _] (wide-type? ws inner))
+    (TFn [_ params ret] (or (wide-type-list? ws params) (wide-type? ws ret)))
+    (TStruct [name] (wide-nominal? ws name))
+    (_ false)))
+
+(defn wide-type-list? [(ws (ptr WideScan)) (ts (ptr (ArrayList Type)))] (-> bool)
+  (block :found
+    (for [i 0 (len (load ts))]
+      (when (wide-type? ws (al-elem [Type] ts i)) (break :found true)))
+    false))
+
+(defn wide-fields? [(ws (ptr WideScan)) (fs (ptr (ArrayList Field)))] (-> bool)
+  (block :found
+    (for [i 0 (len (load fs))]
+      (when (wide-type? ws (field (al-elem [Field] fs i) ty)) (break :found true)))
+    false))
+
+(defn wide-nominal? [(ws (ptr WideScan)) (name (slice u8))] (-> bool)
+  (match (get (.nominal ws) name)
+    ; a type reached again through itself adds nothing new
+    (Some [known] (= known 1))
+    (None []
+          (do
+            (set! (mut (.nominal ws)) name -1)
+            (let [mp (.program ws)
+                  wide (match (get (.structs ws) name)
+                         (Some [si] (wide-fields? ws (load (field (al-elem [StructDef] (.structs mp) si) fields))))
+                         (None []
+                               (match (get (.sums ws) name)
+                                 (Some [ui]
+                                       (let [vs (load (field (al-elem [SumDef] (.sums mp) ui) variants))]
+                                         (block :found
+                                           (for [k 0 (len (load vs))]
+                                             (when (wide-fields? ws (load (field (al-elem [Variant] vs k) fields)))
+                                               (break :found true)))
+                                           false)))
+                                 (None [] false))))]
+              (set! (mut (.nominal ws)) name (if wide 1 0))
+              wide)))))
+
+;;; Does the callable `name` take or return a wide integer?
+(defn wide-callee? [(ws (ptr WideScan)) (name (slice u8))] (-> bool)
+  (let [mp (.program ws)]
+    (match (get (.funcs ws) name)
+      (Some [fi]
+            (let [f (al-elem [Func] (.funcs mp) fi)]
+              (or (wide-type? ws (field f ret))
+                  (block :found
+                    (for [i 0 (len (load (.params f)))]
+                      (when (wide-type? ws (field (al-elem [Param] (.params f) i) ty)) (break :found true)))
+                    false))))
+      (None []
+            (match (get (.externs ws) name)
+              (Some [ei]
+                    (let [x (al-elem [Extern] (.externs mp) ei)]
+                      (or (wide-type? ws (field x ret)) (wide-type-list? ws (.params x)))))
+              (None [] false))))))
+
+;;; Does evaluating `e` touch a wide integer? Every value a function computes
+;;; with comes from a parameter, a call, a literal, a cast, storage it allocates
+;;; or names, or a constructor -- each of which names its type here.
+(defn wide-expr? [(ws (ptr WideScan)) (e (ptr Expr))] (-> bool)
+  (or (match (.kind e)
+        (EWideInt [_ _ _ _ _] true)
+        (ECast [ty _] (wide-type? ws (box! (.a ws) Type ty)))
+        (EZeroed [ty] (wide-type? ws (box! (.a ws) Type ty)))
+        (ERecordInit [ty] (wide-type? ws (box! (.a ws) Type ty)))
+        (EAlloc [_ ty _ _] (wide-type? ws (box! (.a ws) Type ty)))
+        (EMakeSlice [_ elem _] (wide-type? ws (box! (.a ws) Type elem)))
+        (ELlvmIr [result _ _] (wide-type? ws (box! (.a ws) Type result)))
+        (EConstruct [sum _ _] (wide-nominal? ws sum))
+        (ECall [func _ _] (wide-callee? ws func))
+        (EFnPtrOf [name] (wide-callee? ws name))
+        (EStaticRef [name]
+                    (let [cs (load (.consts (.program ws)))]
+                      (block :found
+                        (for [i 0 (len cs)]
+                          (let [cp (al-elem [Const] (.consts (.program ws)) i)]
+                            (when (= (.name cp) name)
+                              (break :found
+                                     (match (.ty cp)
+                                       (Some [ty] (wide-type? ws (box! (.a ws) Type ty)))
+                                       (None [] false))))))
+                        false)))
+        (_ false))
+      (wide-children? ws e)))
+
+(defn wide-list? [(ws (ptr WideScan)) (es (ptr (ArrayList Expr)))] (-> bool)
+  (block :found
+    (for [i 0 (len (load es))]
+      (when (wide-expr? ws (al-elem [Expr] es i)) (break :found true)))
+    false))
+
+(defn wide-children? [(ws (ptr WideScan)) (e (ptr Expr))] (-> bool)
+  (or (match (.kind e)
+        (EDynDispatch [_ _ _ _ params ret _ _]
+                      (or (wide-type-list? ws params) (wide-type? ws (box! (.a ws) Type ret))))
+        (_ false))
+      (let [kids (expr-kids (.a ws) e)]
+        (block :found
+          (for [i 0 (len kids)]
+            (when (wide-expr? ws (get kids i)) (break :found true)))
+          false))))
+
+(defn kid! [(out (mut (ArrayList (ptr Expr)))) (x (ptr Expr))] (-> i64)
+  (unless (= (primitive/cast i64 x) 0) (push! (mut out) x) 0)
+  0)
+
+(defn kids! [(out (mut (ArrayList (ptr Expr)))) (xs (ptr (ArrayList Expr)))] (-> i64)
+  (for [i 0 (len (load xs))] (push! (mut out) (al-elem [Expr] xs i)))
+  0)
+
+;;; The subexpressions of `e`, as a backend sees them after monomorphization.
+(defn expr-kids [(a (dyn Allocator)) (e (ptr Expr))] (-> (ArrayList (ptr Expr)))
+  (let [(mut out) (al-new [(ptr Expr)] a)]
+    (match (.kind e)
+      (ECall [_ _ args] (kids! (mut out) args))
+      (ECallPtr [fp args] (do (kid! (mut out) fp) (kids! (mut out) args)))
+      (EBin [_ l r] (do (kid! (mut out) l) (kid! (mut out) r)))
+      (ECmp [_ l r] (do (kid! (mut out) l) (kid! (mut out) r)))
+      (EIntUnary [_ x] (kid! (mut out) x))
+      (EIf [c t f] (do (kid! (mut out) c) (kid! (mut out) t) (kid! (mut out) f)))
+      (EDo [body] (kids! (mut out) body))
+      (ELet [binds body]
+            (do
+              (for [i 0 (len (load binds))]
+                (push! (mut out) (field (al-elem [Bind] binds i) value)))
+              (kids! (mut out) body)))
+      (ELoop [_ body] (kids! (mut out) body))
+      (EBreak [_ value] (match value (Some [v] (kid! (mut out) v)) (None [] 0)))
+      (EBorrow [_ p] (kid! (mut out) p))
+      (ESpillRef [x] (kid! (mut out) x))
+      (EMovePlace [x] (kid! (mut out) x))
+      (EField [p _] (kid! (mut out) p))
+      (ELoad [x] (kid! (mut out) x))
+      (EStore [p v] (do (kid! (mut out) p) (kid! (mut out) v)))
+      (EInitStore [p v] (do (kid! (mut out) p) (kid! (mut out) v)))
+      (EIndex [p i] (do (kid! (mut out) p) (kid! (mut out) i)))
+      (ECast [_ x] (kid! (mut out) x))
+      (EBitGet [p _] (kid! (mut out) p))
+      (EBitSet [p _ v] (do (kid! (mut out) p) (kid! (mut out) v)))
+      (EFree [x] (kid! (mut out) x))
+      (EAlloc [_ _ init _] (kid! (mut out) init))
+      (EMatch [scrut arms]
+              (do
+                (kid! (mut out) scrut)
+                (for [i 0 (len (load arms))]
+                  (push! (mut out) (field (al-elem [Arm] arms i) body)))))
+      (EConstruct [_ _ args] (kids! (mut out) args))
+      (ELlvmIr [_ args _] (kids! (mut out) args))
+      (EVector [_ _ _ args] (kids! (mut out) args))
+      (EMakeSlice [data _ _] (kid! (mut out) data))
+      (EStaticArray [_ items] (kids! (mut out) items))
+      (ECleanup [body cleanups] (do (kid! (mut out) body) (kids! (mut out) cleanups)))
+      (EMakeDyn [_ _ _ inner] (kid! (mut out) inner))
+      (EDynDispatch [_ _ _ _ _ _ recv args] (do (kid! (mut out) recv) (kids! (mut out) args)))
+      (_ 0))
+    out))
+
+;;; Does function `f` compute with an integer wider than 64 bits?
+(defn wide-func? [(ws (ptr WideScan)) (f (ptr Func))] (-> bool)
+  (or (wide-callee? ws (.name f))
+      (and (not (.declared f)) (wide-list? ws (.body f)))))
+
+;;; The diagnostic a backend without wide integers gives for `fname`.
+(defn wide-int-unsupported [(a (dyn Allocator)) (backend (slice u8)) (fname (slice u8))] (-> (slice u8))
+  (let [(mut sb) (sb-new a)]
+    (sb-push-str! (mut sb) "the ")
+    (sb-push-str! (mut sb) backend)
+    (sb-push-str! (mut sb) " does not support integers wider than 64 bits (i128, u128) yet, and '")
+    (sb-push-str! (mut sb) fname)
+    (sb-push-str! (mut sb) "' computes with one; build with the LLVM backend (the default) or --backend arm64")
+    (sb-str sb)))
+
+;;; The first function of `names` that computes with a wide integer, if any.
+(defn first-wide-func [(ws (ptr WideScan)) (names (ptr (ArrayList (slice u8))))] (-> (Option (slice u8)))
+  (block :found
+    (for [i 0 (len (load names))]
+      (let [name (get (load names) i)]
+        (match (get (.funcs ws) name)
+          (Some [fi]
+                (when (wide-func? ws (al-elem [Func] (.funcs (.program ws)) fi))
+                  (break :found (Some name))))
+          (None [] 0))))
+    (None [(slice u8)])))
+
+;;; The text after the last `.` of `name`.
+(defn last-component [(name (slice u8))] (-> (slice u8))
+  (let [(mut at) 0]
+    (for [k 0 (len name)]
+      (when (= (primitive/cast i64 (get name k)) 46) (set! at (+ k 1))))
+    (subslice name at (len name))))
+
+;;; The functions a program runs: from `main`, every exported entry and every
+;;; runtime def's initializer, through calls, function pointers and trait-object
+;;; vtables.
+(defn reachable-funcs [(ws (ptr WideScan))] (-> (ArrayList (slice u8)))
+  (let [a (.a ws)
+        mp (.program ws)
+        (mut out) (al-new [(slice u8)] a)
+        (mut seen) (hm-new [(slice u8) i64] a (str-keyops-borrowed))
+        (mut work) (al-new [(ptr Expr)] a)]
+    (for [i 0 (len (load (.funcs mp)))]
+      (let [nm (.name (al-elem [Func] (.funcs mp) i))]
+        (when (= (last-component nm) "main")
+          (reach-name! ws (mut out) (mut seen) nm)
+          0)))
+    (for [i 0 (len (load (.exports mp)))]
+      (reach-name! ws (mut out) (mut seen) (.name (al-elem [ExportC] (.exports mp) i))))
+    (for [i 0 (len (load (.consts mp)))]
+      (let [cp (al-elem [Const] (.consts mp) i)]
+        (when (.runtime cp) (reach-expr! ws (mut out) (mut seen) (field cp value)) 0)))
+    ; each function reached adds the names its body reaches
+    (let [(mut k) 0]
+      (while (< k (len out))
+        (match (get (.funcs ws) (get out k))
+          (Some [fi]
+                (let [f (al-elem [Func] (.funcs mp) fi)]
+                  (unless (.declared f)
+                    (for [j 0 (len (load (.body f)))]
+                      (reach-expr! ws (mut out) (mut seen) (al-elem [Expr] (.body f) j)))
+                    0)))
+          (None [] 0))
+        (set! k (+ k 1))))
+    out))
+
+(defn reach-name! [(ws (ptr WideScan))
+                   (out (mut (ArrayList (slice u8))))
+                   (seen (mut (HashMap (slice u8) i64)))
+                   (name (slice u8))] (-> i64)
+  (unless (hm-contains? seen name)
+    (set! (mut seen) name 1)
+    (push! (mut out) name)
+    0)
+  0)
+
+(defn reach-expr! [(ws (ptr WideScan))
+                   (out (mut (ArrayList (slice u8))))
+                   (seen (mut (HashMap (slice u8) i64)))
+                   (e (ptr Expr))] (-> i64)
+  (match (.kind e)
+    (ECall [func _ _] (reach-name! ws (mut out) (mut seen) func))
+    (EFnPtrOf [name] (reach-name! ws (mut out) (mut seen) name))
+    (EMakeDyn [_ _ methods _]
+              (for [i 0 (len (load methods))]
+                (reach-name! ws (mut out) (mut seen) (get (load methods) i))))
+    (_ 0))
+  (let [kids (expr-kids (.a ws) e)]
+    (for [i 0 (len kids)]
+      (reach-expr! ws (mut out) (mut seen) (get kids i))))
+  0)
