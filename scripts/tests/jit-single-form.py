@@ -81,8 +81,11 @@ for index, label in enumerate(("define caller", "evaluate caller", "redefine ori
         if stage == "parse":
             assert "replsession." + name not in retained, (label, stage, name)
     emitted = [name for stage, name in events if stage == "emit"]
-    implementations = [name for name in emitted if "@$proof-" in name]
+    implementations = [name for name in emitted if "@$proof-" in name and name.endswith("--impl")]
     assert len(implementations) == (1 if index in (2, 4) else 0), (label, implementations)
+    trampolines = [name for name in emitted
+                   if "@$proof-" in name and name.endswith("--typed-fnptr")]
+    assert len(trampolines) == (1 if index == 2 else 0), (label, trampolines)
     native = {name for name in emitted
               if not name.startswith("replsession.__coil_jit_entry_")}
     assert not native.intersection(emitted_before), (label, native.intersection(emitted_before))
