@@ -1967,16 +1967,15 @@
                                         0))))))))
                 (None []
                       (let [hn (sx-head-name items)]
-                        (if (and (= hn "match") (match-has-nested-variant? items))
+                        (if (and (= hn "match") (match-has-refutable-arm? items))
                             ; Rewrite the whole match, then expand what it became.
-                            (match (normalize-with-binding-macro "coil.binding.normalize-nested-match"
-                                                                 (load cur)
-                                                                 env
-                                                                 allfns
-                                                                 gs
-                                                                 gu
-                                                                 depth
-                                                                 (mut ls))
+                            (match (lower-refutable-match (load (load cur))
+                                                          env
+                                                          allfns
+                                                          gs
+                                                          gu
+                                                          depth
+                                                          (mut ls))
                               (Err [d] (break (Err [Sexp Diag] d)))
                               (Ok [rewritten] (do (set! cur (box-sexp a rewritten)) 0)))
                         (if (= hn "match")
@@ -8695,25 +8694,890 @@
                                 (ls (mut LS))] (-> (Result Sexp Diag))
   (normalize-with-binding-macro "coil.binding.normalize-match-arm" arm env allfns gs gu depth (mut ls)))
 
-;;; Does any arm of this `(match value arm…)` test a nested variant in a payload
-;;; position, `(V [(W [x])] …)`? Such a match is rewritten as a whole first.
-(defn match-has-nested-variant? [(items (ptr (ArrayList Sexp)))] (-> bool)
+;;; A literal pattern: an integer, float, string, `true`, `false`, or a `#\c`
+;;; character, which the reader leaves as a symbol.
+(defn match-literal-pattern? [(p Sexp)] (-> bool)
+  (let [tag (sx-tag p)]
+    (cond (or (= tag (primitive/cast i64 0))
+              (or (= tag (primitive/cast i64 1)) (= tag (primitive/cast i64 4))))
+            true
+          (= tag (primitive/cast i64 2))
+            (let [name (sx-sval p)]
+              (or (= name "true")
+                  (or (= name "false")
+                      (and (>= (len name) (primitive/cast i64 3))
+                           (and (= (primitive/cast i64 (get name 0)) (primitive/cast i64 35))
+                                (= (primitive/cast i64 (get name 1)) (primitive/cast i64 92)))))))
+          :else false)))
+
+;;; Can this payload pattern fail to match: a literal or a variant pattern,
+;;; `(V [patterns…])` or `(V)`, at any depth?
+(defn match-refutable-pattern? [(p Sexp)] (-> bool)
+  (let [tag (sx-tag p)]
+    (cond (match-literal-pattern? p) true
+          (= tag (primitive/cast i64 6))
+            (let [items (sx-items p)
+                  n (sx-len items)]
+              (if (and (>= n (primitive/cast i64 1))
+                       (and (= (sx-tag (sx-at items 0)) (primitive/cast i64 2))
+                            (or (= n (primitive/cast i64 1))
+                                (and (= n (primitive/cast i64 2))
+                                     (= (sx-tag (sx-at items 1)) (primitive/cast i64 7))))))
+                  true
+                  (let [(mut found) false]
+                    (for [i 1 n]
+                      (when (match-refutable-pattern? (sx-at items i))
+                        (set! found true)
+                        0))
+                    found)))
+          (= tag (primitive/cast i64 7))
+            (let [items (sx-items p)
+                  (mut found) false]
+              (for [i 0 (sx-len items)]
+                (when (match-refutable-pattern? (sx-at items i))
+                  (set! found true)
+                  0))
+              found)
+          :else false)))
+
+;;; Does any arm of this `(match value arm…)` refute: a literal arm, `(0 …)`, or
+;;; a refutable payload pattern, `(V [(W [x])] …)`, `(V [1] …)`? Such a match is
+;;; lowered as a whole first, by `lower-refutable-match`.
+(defn match-has-refutable-arm? [(items (ptr (ArrayList Sexp)))] (-> bool)
   (let [(mut found) false]
     (for [i 2 (sx-len items)]
       (let [arm (sx-at items i)]
-        (when (and (= (sx-tag arm) (primitive/cast i64 6))
-                   (and (>= (sx-len (sx-items arm)) (primitive/cast i64 2))
-                        (= (sx-tag (sx-at (sx-items arm) 1)) (primitive/cast i64 7))))
-          (let [pats (sx-items (sx-at (sx-items arm) 1))]
-            (for [j 0 (sx-len pats)]
-              (let [p (sx-at pats j)]
-                (when (and (= (sx-tag p) (primitive/cast i64 6))
-                           (and (>= (sx-len (sx-items p)) (primitive/cast i64 2))
-                                (= (sx-tag (sx-at (sx-items p) 1)) (primitive/cast i64 7))))
-                  (set! found true)
-                  0))))
-          0)))
+        (when (= (sx-tag arm) (primitive/cast i64 6))
+          (let [arm-items (sx-items arm)]
+            (when (>= (sx-len arm-items) (primitive/cast i64 1))
+              (when (match-literal-pattern? (sx-at arm-items 0))
+                (set! found true)
+                0)
+              (when (and (>= (sx-len arm-items) (primitive/cast i64 2))
+                         (= (sx-tag (sx-at arm-items 1)) (primitive/cast i64 7)))
+                (let [pats (sx-items (sx-at arm-items 1))]
+                  (for [j 0 (sx-len pats)]
+                    (when (match-refutable-pattern? (sx-at pats j))
+                      (set! found true)
+                      0))))
+              0)))
+        0))
     found))
+
+; ---- refutable match arms ------------------------------------------------------
+; A match with a refutable arm is lowered here, before its arms are expanded, to
+; ordinary single-level matches. This is the compiler's own work rather than a
+; library macro so that a program pays for it only where it matches refutably:
+; library macro code is expanded by every compilation that loads it.
+;
+; The arms form a pattern matrix, one row per arm, compiled to a decision tree
+; (Maranget, "Compiling pattern matching to good decision trees"): each node
+; tests one position, by a `match` on its variant or a chain of `=` tests on its
+; literals, and every row survives into the branches it can still match. A branch
+; exists for each variant some row names, and a catch-all holds the rows that
+; accept any value there. When no row accepts any value and the named variants
+; are not the whole sum, the generated `match` misses one and the checker's
+; ordinary exhaustiveness check reports it, with the types it alone knows; when
+; they are the whole sum, the checker drops the catch-all (see
+; `primitive/pattern-default`). Literals never cover their type, so a literal
+; position with no row that accepts any value is reported here.
+;
+; Names bind as in a plain arm, where a payload of a named value is a reference
+; to it rather than a copy. A name is the binder of its field in the generated
+; `match` when everything below that branch belongs to its own arm; otherwise its
+; leaf matches the field's parent again, binding the name there.
+;
+; A row that reaches no leaf can never match, which is an error. A row reached by
+; one leaf has its body placed there. A row reached by several (a `(_ …)` arm
+; below refutable ones, say) keeps a single copy of its body: those leaves break
+; out with the row's number, and the body runs after the tree, binding its names
+; from the scrutinee again.
+;
+; Every symbol the lowering writes comes from `coil.binding.match-vocabulary`, a
+; template, so it has a template's scope: `=` and `primitive/pattern-fail` mean
+; what they mean in coil.binding, whatever the matching module imports.
+
+;;; A name bound at a leaf: `pattern` matches `value`, which is field `field` of
+;;; `variant`'s `arity` fields in `parent`.
+(defstruct MatchBind
+  [(pattern Sexp) (value Sexp) (parent Sexp) (variant Sexp) (field i64) (arity i64)])
+
+(defstruct MatchTest [(value Sexp) (pattern Sexp)])
+
+;;; One arm in the matrix: the tests still to make and the names to bind.
+(defstruct MatchRow
+  [(idx i64) (tests (ptr (ArrayList MatchTest))) (binds (ptr (ArrayList MatchBind)))])
+
+(defsum MatchNode
+  (MatchLeaf [(idx i64) (binds (ptr (ArrayList MatchBind)))])
+  ; `rest` is the catch-all for variants no row names, when some row accepts any.
+  (MatchVariants [(value Sexp)
+                  (arms (ptr (ArrayList MatchBranch)))
+                  (rest (Option (ptr MatchNode)))])
+  ; `rest` is absent only when `true` and `false` are both keys.
+  (MatchLiterals [(value Sexp)
+                  (keys (ptr (ArrayList Sexp)))
+                  (subs (ptr (ArrayList (ptr MatchNode))))
+                  (rest (Option (ptr MatchNode)))]))
+
+(defstruct MatchBranch [(variant Sexp) (temps (ptr (ArrayList Sexp))) (sub (ptr MatchNode))])
+
+(defstruct MatchCx
+  [(a (dyn Allocator))
+   (form Sexp)
+   (vocab (ptr (ArrayList Sexp)))
+   (env (ptr ExpEnv))
+   (allfns (ptr (ArrayList (slice u8))))
+   (gs (ptr (ArrayList StructDef)))
+   (gu (ptr (ArrayList SumDef)))
+   (depth (ptr i64))])
+
+; Indices into the vocabulary, in coil.binding.match-vocabulary's order.
+(defn mv-match [] (-> i64) 0)
+(defn mv-let [] (-> i64) 1)
+(defn mv-if [] (-> i64) 2)
+(defn mv-do [] (-> i64) 3)
+(defn mv-block [] (-> i64) 4)
+(defn mv-break [] (-> i64) 5)
+(defn mv-eq [] (-> i64) 6)
+(defn mv-wild [] (-> i64) 7)
+(defn mv-fail [] (-> i64) 8)
+(defn mv-default [] (-> i64) 9)
+
+(defn mcx-word [(cx (ptr MatchCx)) (i i64)] (-> Sexp)
+  (sx-at (.vocab cx) i))
+
+(defn mcx-err [(cx (ptr MatchCx)) (msg (slice u8))] (-> Diag)
+  (stamp-call-site (derr msg) (.form cx)))
+
+(defn rm-list [(a (dyn Allocator)) (items (ArrayList Sexp))] (-> Sexp)
+  (sx-mklist (box-al [Sexp] a items)))
+
+(defn rm-vec [(a (dyn Allocator)) (items (ArrayList Sexp))] (-> Sexp)
+  (mk-sexp (KVec (box-al [Sexp] a items)) -1 -1))
+
+(defn rm-list2 [(a (dyn Allocator)) (x Sexp) (y Sexp)] (-> Sexp)
+  (let [(mut xs) (al-new [Sexp] a)]
+    (push! (mut xs) x)
+    (push! (mut xs) y)
+    (rm-list a (load xs))))
+
+(defn rm-list3 [(a (dyn Allocator)) (x Sexp) (y Sexp) (z Sexp)] (-> Sexp)
+  (let [(mut xs) (al-new [Sexp] a)]
+    (push! (mut xs) x)
+    (push! (mut xs) y)
+    (push! (mut xs) z)
+    (rm-list a (load xs))))
+
+(defn rm-list4 [(a (dyn Allocator)) (w Sexp) (x Sexp) (y Sexp) (z Sexp)] (-> Sexp)
+  (let [(mut xs) (al-new [Sexp] a)]
+    (push! (mut xs) w)
+    (push! (mut xs) x)
+    (push! (mut xs) y)
+    (push! (mut xs) z)
+    (rm-list a (load xs))))
+
+;;; An identifier as fresh as `primitive/fresh-identifier` makes one.
+(defn rm-fresh [(a (dyn Allocator)) (name (slice u8))] (-> Sexp)
+  (let [p (primitive/alloc-stack Sexp)]
+    (set! p (mk-sexp (KSym name) -1 -1))
+    (set! (.hyg p) (primitive/iadd (next-gensym) 1))
+    (set! (.horigin p) 2)
+    (set! (.hmod p) "")
+    (load p)))
+
+;;; A fresh block label.
+(defn rm-label [(a (dyn Allocator))] (-> Sexp)
+  (mk-sexp (KKw (sconcat a "$g" (dec->str a (next-gensym)))) -1 -1))
+
+(defn rm-sym-is? [(p Sexp) (name (slice u8))] (-> bool)
+  (and (= (sx-tag p) (primitive/cast i64 2)) (= (sx-sval p) name)))
+
+(defn rm-wild? [(p Sexp)] (-> bool) (rm-sym-is? p "_"))
+
+;;; The same lexical identifier: spelling and scope.
+(defn rm-same-ident? [(x Sexp) (y Sexp)] (-> bool)
+  (and (= (sx-tag x) (primitive/cast i64 2))
+       (and (= (sx-tag y) (primitive/cast i64 2))
+            (and (= (sx-sval x) (sx-sval y)) (= (sx-hyg x) (sx-hyg y))))))
+
+;;; Equal as data, the way patterns are compared: by spelling or value.
+(defn rm-datum-eq? [(x Sexp) (y Sexp)] (-> bool)
+  (and (= (sx-tag x) (sx-tag y))
+       (if (= (sx-tag x) (primitive/cast i64 0))
+           (= (sx-ival x) (sx-ival y))
+           (= (sx-sval x) (sx-sval y)))))
+
+(defn rm-literal? [(p Sexp)] (-> bool)
+  (and (match-literal-pattern? p) (!= (sx-tag p) (primitive/cast i64 1))))
+
+;;; `(Variant [patterns…])`, or `(Variant)` for a variant with no fields.
+(defn rm-variant? [(p Sexp)] (-> bool)
+  (and (= (sx-tag p) (primitive/cast i64 6))
+       (let [xs (sx-items p)
+             n (sx-len xs)]
+         (and (>= n (primitive/cast i64 1))
+              (and (= (sx-tag (sx-at xs 0)) (primitive/cast i64 2))
+                   (or (= n (primitive/cast i64 1))
+                       (and (= n (primitive/cast i64 2))
+                            (= (sx-tag (sx-at xs 1)) (primitive/cast i64 7)))))))))
+
+(defn rm-fields [(a (dyn Allocator)) (p Sexp)] (-> (ptr (ArrayList Sexp)))
+  (if (= (sx-len (sx-items p)) (primitive/cast i64 1))
+      (box-al [Sexp] a (al-new [Sexp] a))
+      (sx-items (sx-at (sx-items p) 1))))
+
+(defn rm-headed? [(p Sexp) (head (slice u8)) (n i64)] (-> bool)
+  (and (= (sx-tag p) (primitive/cast i64 6))
+       (and (= (sx-len (sx-items p)) n) (rm-sym-is? (sx-at (sx-items p) 0) head))))
+
+;;; `(as name pattern)`.
+(defn rm-as? [(p Sexp)] (-> bool)
+  (and (rm-headed? p "as" 3) (= (sx-tag (sx-at (sx-items p) 1)) (primitive/cast i64 2))))
+
+(defn rm-mut? [(p Sexp)] (-> bool) (rm-headed? p "mut" 2))
+
+;;; A plain name for the whole value.
+(defn rm-name? [(p Sexp)] (-> bool)
+  (and (= (sx-tag p) (primitive/cast i64 2)) (and (not (rm-wild? p)) (not (rm-literal? p)))))
+
+;;; Does the pattern bind a name anywhere?
+(defn rm-binds? [(a (dyn Allocator)) (p Sexp)] (-> bool)
+  (cond (or (rm-wild? p) (rm-literal? p)) false
+        (rm-variant? p)
+          (let [fields (rm-fields a p)
+                (mut found) false]
+            (for [i 0 (sx-len fields)]
+              (when (rm-binds? a (sx-at fields i)) (set! found true)))
+            found)
+        :else true))
+
+(defn rm-arm-head [(arm Sexp)] (-> Sexp)
+  (sx-at (sx-items arm) 0))
+
+(defn rm-body-start [(arm Sexp)] (-> i64)
+  (if (or (rm-wild? (rm-arm-head arm)) (match-literal-pattern? (rm-arm-head arm))) 1 2))
+
+;;; The arm's body forms; `(do)`, which yields no value, when it has none.
+(defn rm-arm-body [(cx (ptr MatchCx)) (arm Sexp)] (-> (ArrayList Sexp))
+  (let [a (.a cx)
+        items (sx-items arm)
+        (mut out) (al-new [Sexp] a)]
+    (for [i (rm-body-start arm) (sx-len items)] (push! (mut out) (sx-at items i)))
+    (when (= (len out) (primitive/cast i64 0))
+      (let [(mut empty) (al-new [Sexp] a)]
+        (push! (mut empty) (mcx-word cx (mv-do)))
+        (push! (mut out) (rm-list a (load empty))))
+      0)
+    (load out)))
+
+;;; File `pattern`, matched against `value`, as a test when it can fail and a
+;;; binding when it names the value; `_` needs neither.
+(defn rm-add-pattern! [(cx (ptr MatchCx))
+                       (tests (mut (ArrayList MatchTest)))
+                       (binds (mut (ArrayList MatchBind)))
+                       (value Sexp)
+                       (pattern Sexp)
+                       (prov MatchBind)] (-> (Result i64 Diag))
+  (let [bind (primitive/alloc-stack MatchBind)]
+    (set! bind prov)
+    (set! (.pattern bind) pattern)
+    (set! (.value bind) value)
+    (cond (rm-wild? pattern) (Ok [i64 Diag] 0)
+          (= (sx-tag pattern) (primitive/cast i64 1))
+            (Err [i64 Diag] (mcx-err cx "match: a float literal is not a pattern; compare it in the arm body instead"))
+          (= (sx-tag pattern) (primitive/cast i64 3))
+            (Err [i64 Diag] (mcx-err cx "match: a keyword is not a pattern"))
+          (or (rm-literal? pattern) (rm-variant? pattern))
+            (do (push! (mut tests) (MatchTest :value value :pattern pattern)) (Ok [i64 Diag] 0))
+          (rm-as? pattern)
+            (do
+              (set! (.pattern bind) (sx-at (sx-items pattern) 1))
+              (push! (mut binds) (load bind))
+              (rm-add-pattern! cx (mut tests) (mut binds) value (sx-at (sx-items pattern) 2) prov))
+          (and (!= (sx-tag pattern) (primitive/cast i64 2))
+               (and (not (rm-mut? pattern)) (match-refutable-pattern? pattern)))
+            (Err [i64 Diag] (mcx-err cx "match: a struct or sequence pattern cannot hold a variant or literal pattern; match that field in the arm body"))
+          :else (do (push! (mut binds) (load bind)) (Ok [i64 Diag] 0)))))
+
+(defn rm-test-at [(row (ptr MatchRow)) (value Sexp)] (-> i64)
+  (let [(mut at) -1]
+    (for [i 0 (len (load (.tests row)))]
+      (when (and (< (load at) (primitive/cast i64 0))
+                 (rm-same-ident? (.value (al-elem [MatchTest] (.tests row) i)) value))
+        (set! at i)))
+    (load at)))
+
+(defn rm-pattern-at [(row (ptr MatchRow)) (at i64)] (-> Sexp)
+  (.pattern (al-elem [MatchTest] (.tests row) at)))
+
+;;; What a pattern selects: a variant's name, or the literal itself.
+(defn rm-key [(p Sexp)] (-> Sexp)
+  (if (rm-variant? p) (sx-at (sx-items p) 0) p))
+
+;;; `row` with its test at `at` replaced by tests of `fields` against `temps`.
+(defn rm-specialize [(cx (ptr MatchCx))
+                     (row (ptr MatchRow))
+                     (at i64)
+                     (temps (ptr (ArrayList Sexp)))
+                     (fields (ptr (ArrayList Sexp)))
+                     (value Sexp)
+                     (variant Sexp)] (-> (Result MatchRow Diag))
+  (try (let [a (.a cx)
+             (mut tests) (al-new [MatchTest] a)
+             (mut binds) (al-new [MatchBind] a)]
+         (for b (iter (load (.binds row))) (push! (mut binds) b))
+         (for [i 0 (len (load (.tests row)))]
+           (if (= i at)
+               (for [k 0 (sx-len fields)]
+                 (try! (rm-add-pattern! cx
+                                        (mut tests)
+                                        (mut binds)
+                                        (sx-at temps k)
+                                        (sx-at fields k)
+                                        (MatchBind :pattern value
+                                                   :value value
+                                                   :parent value
+                                                   :variant variant
+                                                   :field k
+                                                   :arity (sx-len fields)))))
+               (push! (mut tests) (load (al-elem [MatchTest] (.tests row) i)))))
+         (Ok (MatchRow :idx (.idx row)
+                       :tests (box-al [MatchTest] a (load tests))
+                       :binds (box-al [MatchBind] a (load binds)))))))
+
+;;; The rows that can still match once `value` is `key`; with no key, once it is
+;;; none of the keys.
+(defn rm-select [(cx (ptr MatchCx))
+                 (rows (ptr (ArrayList MatchRow)))
+                 (value Sexp)
+                 (key (Option Sexp))
+                 (temps (ptr (ArrayList Sexp)))] (-> (Result (ptr (ArrayList MatchRow)) Diag))
+  (try (let [a (.a cx)
+             (mut out) (al-new [MatchRow] a)]
+         (for i (range 0 (len (load rows)))
+           (let [row (al-elem [MatchRow] rows i)
+                 at (rm-test-at row value)]
+             (if (< at (primitive/cast i64 0))
+                 (push! (mut out) (load row))
+                 (match key
+                   (Some [k]
+                         (let [pattern (rm-pattern-at row at)]
+                           (when (rm-datum-eq? (rm-key pattern) k)
+                             (let [fields (if (rm-variant? pattern)
+                                              (rm-fields a pattern)
+                                              (box-al [Sexp] a (al-new [Sexp] a)))]
+                               (when (!= (sx-len fields) (sx-len temps))
+                                 (break :try (Err (mcx-err cx "match: a variant is matched with different numbers of fields"))))
+                               (push! (mut out)
+                                      (try! (rm-specialize cx row at temps fields value k)))))
+                           0))
+                   (None [] 0)))))
+         (Ok (box-al [MatchRow] a (load out))))))
+
+;;; The distinct keys the rows test `value` against, in the order rows name them.
+(defn rm-keys [(cx (ptr MatchCx))
+               (rows (ptr (ArrayList MatchRow)))
+               (value Sexp)
+               (variants bool)] (-> (Result (ptr (ArrayList Sexp)) Diag))
+  (try (let [a (.a cx)
+             (mut keys) (al-new [Sexp] a)]
+         (for i (range 0 (len (load rows)))
+           (let [row (al-elem [MatchRow] rows i)
+                 at (rm-test-at row value)]
+             (when (>= at (primitive/cast i64 0))
+               (let [pattern (rm-pattern-at row at)
+                     (mut known) false]
+                 (when (!= (rm-variant? pattern) variants)
+                   (break :try (Err (mcx-err cx "match: one position is matched against both variants and literals"))))
+                 (for k (iter (load keys))
+                   (when (rm-datum-eq? k (rm-key pattern)) (set! known true)))
+                 (unless (load known) (push! (mut keys) (rm-key pattern)))
+                 0))))
+         (Ok (box-al [Sexp] a (load keys))))))
+
+(defn rm-has-key? [(keys (ptr (ArrayList Sexp))) (name (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (for k (iter (load keys)) (when (rm-sym-is? k name) (set! found true)))
+    found))
+
+;;; The decision tree for `rows`.
+(defn rm-compile [(cx (ptr MatchCx)) (rows (ptr (ArrayList MatchRow)))] (-> (Result (ptr MatchNode) Diag))
+  (try (let [a (.a cx)
+             row (al-elem [MatchRow] rows 0)]
+         (if (= (len (load (.tests row))) (primitive/cast i64 0))
+             (Ok (box! a MatchNode (MatchLeaf :idx (.idx row) :binds (.binds row))))
+             (let [value (.value (al-elem [MatchTest] (.tests row) 0))
+                   variants (rm-variant? (rm-pattern-at row 0))
+                   keys (try! (rm-keys cx rows value variants))
+                   none (box-al [Sexp] a (al-new [Sexp] a))
+                   rest-rows (try! (rm-select cx rows value (None [Sexp]) none))
+                   rest (if (= (len (load rest-rows)) (primitive/cast i64 0))
+                            (None [(ptr MatchNode)])
+                            (Some (try! (rm-compile cx rest-rows))))]
+               (if variants
+                   (let [(mut arms) (al-new [MatchBranch] a)]
+                     (for key (iter (load keys))
+                       (let [arity (let [(mut n) -1]
+                                     (for i (range 0 (len (load rows)))
+                                       (let [r (al-elem [MatchRow] rows i)
+                                             at (rm-test-at r value)]
+                                         (when (and (< (load n) (primitive/cast i64 0))
+                                                    (and (>= at (primitive/cast i64 0))
+                                                         (rm-datum-eq? (rm-key (rm-pattern-at r at)) key)))
+                                           (set! n (sx-len (rm-fields a (rm-pattern-at r at)))))))
+                                     (load n))
+                             (mut temps) (al-new [Sexp] a)]
+                         (for _ (range 0 arity) (push! (mut temps) (rm-fresh a "payload")))
+                         (let [temp-list (box-al [Sexp] a (load temps))
+                               spec (try! (rm-select cx rows value (Some key) temp-list))]
+                           (push! (mut arms)
+                                  (MatchBranch :variant key
+                                               :temps temp-list
+                                               :sub (try! (rm-compile cx spec)))))))
+                     (Ok (box! a MatchNode (MatchVariants :value value
+                                                          :arms (box-al [MatchBranch] a (load arms))
+                                                          :rest rest))))
+                   (let [bools (and (rm-has-key? keys "true")
+                                    (and (rm-has-key? keys "false")
+                                         (= (len (load keys)) (primitive/cast i64 2))))
+                         (mut subs) (al-new [(ptr MatchNode)] a)]
+                     (match rest
+                       (Some [_] 0)
+                       (None []
+                             (unless bools
+                               (break :try
+                                        (Err (mcx-err cx
+                                                      (if (or (rm-has-key? keys "true") (rm-has-key? keys "false"))
+                                                          "match: a boolean position needs both `true` and `false` arms, or an arm that accepts either"
+                                                          "match: literal patterns never cover every value of their type; add an arm for the values they leave out, such as (_ …)")))))
+                             0))
+                     (for key (iter (load keys))
+                       (push! (mut subs)
+                              (try! (rm-compile cx (try! (rm-select cx rows value (Some key) none))))))
+                     (Ok (box! a MatchNode (MatchLiterals :value value
+                                                          :keys keys
+                                                          :subs (box-al [(ptr MatchNode)] a (load subs))
+                                                          :rest rest))))))))))
+
+;;; Push the row of every leaf under `node`, with its bindings.
+(defn rm-leaves! [(node (ptr MatchNode)) (out (mut (ArrayList MatchNode)))] (-> i64)
+  (match (load node)
+    (MatchLeaf [_ _] (do (push! (mut out) (load node)) 0))
+    (MatchVariants [_ arms rest]
+                   (do
+                     (for i (range 0 (len (load arms)))
+                       (rm-leaves! (.sub (al-elem [MatchBranch] arms i)) (mut out)))
+                     (match rest (Some [r] (rm-leaves! r (mut out))) (None [] 0))))
+    (MatchLiterals [_ _ subs rest]
+                   (do
+                     (for i (range 0 (len (load subs))) (rm-leaves! (get (load subs) i) (mut out)))
+                     (match rest (Some [r] (rm-leaves! r (mut out))) (None [] 0))))))
+
+(defn rm-leaf-idx [(leaf MatchNode)] (-> i64)
+  (match leaf (MatchLeaf [idx _] idx) (_ -1)))
+
+(defn rm-leaf-binds [(leaf MatchNode)] (-> (ptr (ArrayList MatchBind)))
+  (match leaf (MatchLeaf [_ binds] binds) (_ (primitive/cast (ptr (ArrayList MatchBind)) 0))))
+
+(defn rm-count [(leaves (ptr (ArrayList MatchNode))) (idx i64)] (-> i64)
+  (let [(mut n) 0]
+    (for leaf (iter (load leaves)) (when (= (rm-leaf-idx leaf) idx) (set! n (+ (load n) 1))))
+    (load n)))
+
+;;; A renaming of temporaries to the names that became their binders.
+(defstruct MatchRename [(from Sexp) (to Sexp)])
+
+(defn rm-rename [(renames (ptr (ArrayList MatchRename))) (x Sexp)] (-> Sexp)
+  (let [(mut out) x]
+    (for r (iter (load renames)) (when (rm-same-ident? (.from r) x) (set! out (.to r))))
+    (load out)))
+
+(defn rm-check-names [(cx (ptr MatchCx)) (names (ptr (ArrayList Sexp)))] (-> (Result i64 Diag))
+  (let [(mut dup) false]
+    (for i (range 0 (len (load names)))
+      (for j (range (+ i 1) (len (load names)))
+        (when (rm-same-ident? (get (load names) i) (get (load names) j)) (set! dup true))))
+    (if (load dup)
+        (Err [i64 Diag] (mcx-err cx "binding: duplicate identifier in pattern"))
+        (Ok [i64 Diag] 0))))
+
+;;; The `let*` pairs that bind a struct or sequence pattern to `value`, from the
+;;; binding layer's own destructuring; their names go on `names`.
+(defn rm-destructure! [(cx (ptr MatchCx))
+                       (pattern Sexp)
+                       (value Sexp)
+                       (pairs (mut (ArrayList Sexp)))
+                       (names (mut (ArrayList Sexp)))
+                    (ls (mut LS))] (-> (Result i64 Diag))
+  (try (let [a (.a cx)
+             (mut binding) (al-new [Sexp] a)]
+         (push! (mut binding) pattern)
+         (push! (mut binding) value)
+         (let [out (try! (normalize-with-binding-macro "coil.binding.destructure"
+                                                       (box-sexp a (rm-vec a (load binding)))
+                                                       (.env cx)
+                                                       (.allfns cx)
+                                                       (.gs cx)
+                                                       (.gu cx)
+                                                       (.depth cx)
+                                                       (mut ls)))
+               items (sx-items out)]
+           (for i (range 0 (sx-len items))
+             (let [x (sx-at items i)]
+               (push! (mut pairs) x)
+               (when (= (% i 2) (primitive/cast i64 0))
+                 (push! (mut names) (if (rm-mut? x) (sx-at (sx-items x) 1) x))
+                 0)))
+           (Ok 0)))))
+
+;;; `(match value (variant [binders…] body) (_ (primitive/pattern-fail)))`: the
+;;; re-match of a value already known to be `variant`.
+(defn rm-rematch [(cx (ptr MatchCx)) (value Sexp) (variant Sexp) (binders (ptr (ArrayList Sexp))) (body Sexp)] (-> Sexp)
+  (let [a (.a cx)
+        (mut fail) (al-new [Sexp] a)]
+    (push! (mut fail) (mcx-word cx (mv-fail)))
+    (rm-list4 a
+              (mcx-word cx (mv-match))
+              value
+              (rm-list3 a variant (rm-vec a (load binders)) body)
+              (rm-list2 a (mcx-word cx (mv-wild)) (rm-list a (load fail))))))
+
+;;; `inner` with each of `aliases` bound by matching its parent again, so it binds
+;;; like a payload; one match binds every name in a distinct field of a parent.
+(defn rm-rebind [(cx (ptr MatchCx)) (aliases (ptr (ArrayList MatchBind))) (inner Sexp)] (-> Sexp)
+  (if (= (len (load aliases)) (primitive/cast i64 0))
+      inner
+      (let [a (.a cx)
+            first (get (load aliases) 0)
+            slots (box-al [Sexp] a (al-new [Sexp] a))
+            (mut rest) (al-new [MatchBind] a)]
+        (for _ (range 0 (.arity first)) (push! slots (mcx-word cx (mv-wild))))
+        (for b (iter (load aliases))
+          (if (and (rm-same-ident? (.parent b) (.parent first))
+                   (and (rm-datum-eq? (.variant b) (.variant first))
+                        (rm-wild? (get (load slots) (.field b)))))
+              (store! (al-elem [Sexp] slots (.field b)) (.pattern b))
+              (push! (mut rest) b)))
+        (rm-rematch cx
+                    (.parent first)
+                    (.variant first)
+                    slots
+                    (rm-rebind cx (box-al [MatchBind] a (load rest)) inner)))))
+
+;;; `body` (forms) with a leaf's bindings: a name that is its field's binder needs
+;;; nothing, another plain name is matched again, and `(mut name)` and struct or
+;;; sequence patterns bind as in `let`.
+(defn rm-bind-leaf [(cx (ptr MatchCx))
+                    (binds (ptr (ArrayList MatchBind)))
+                    (renames (ptr (ArrayList MatchRename)))
+                    (body (ArrayList Sexp))
+                    (ls (mut LS))] (-> (Result Sexp Diag))
+  (try (let [a (.a cx)
+             (mut pairs) (al-new [Sexp] a)
+             (mut names) (al-new [Sexp] a)
+             (mut aliases) (al-new [MatchBind] a)]
+         (for b (iter (load binds))
+           (let [value (rm-rename renames (.value b))
+                 pattern (.pattern b)]
+             (cond (rm-name? pattern)
+                     (do
+                       (push! (mut names) pattern)
+                       (unless (rm-same-ident? pattern value)
+                         (let [moved (primitive/alloc-stack MatchBind)]
+                           (set! moved b)
+                           (set! (.value moved) value)
+                           (set! (.parent moved) (rm-rename renames (.parent b)))
+                           (push! (mut aliases) (load moved))))
+                       0)
+                   (rm-mut? pattern)
+                     (do
+                       (push! (mut names) (sx-at (sx-items pattern) 1))
+                       (push! (mut pairs) pattern)
+                       (push! (mut pairs) value)
+                       0)
+                   :else (do (try! (rm-destructure! cx pattern value (mut pairs) (mut names) (mut ls))) 0))))
+         (try! (rm-check-names cx (box-al [Sexp] a (load names))))
+         (let [(mut form) (al-new [Sexp] a)]
+           (push! (mut form) (mcx-word cx (mv-let)))
+           (push! (mut form) (rm-vec a (load pairs)))
+           (for x (iter body) (push! (mut form) x))
+           (Ok (rm-rebind cx (box-al [MatchBind] a (load aliases)) (rm-list a (load form))))))))
+
+;;; The temporaries of `branch` that can be the binder of a name instead: when
+;;; every leaf below is one row's, and that row's only leaf (`all` is every leaf
+;;; of the tree), a field the row names with exactly one plain name. Returns the
+;;; binders and extends `renames`.
+(defn rm-binders [(cx (ptr MatchCx))
+                  (branch (ptr MatchBranch))
+                  (all (ptr (ArrayList MatchNode)))
+                  (renames (mut (ArrayList MatchRename)))] (-> (ptr (ArrayList Sexp)))
+  (let [a (.a cx)
+        (mut leaves) (al-new [MatchNode] a)
+        (mut out) (al-new [Sexp] a)]
+    (rm-leaves! (.sub branch) (mut leaves))
+    (let [idx (rm-leaf-idx (get leaves 0))
+          one-row (and (= (len leaves) (primitive/cast i64 1)) (= (rm-count all idx) (primitive/cast i64 1)))
+          binds (rm-leaf-binds (get leaves 0))]
+      (for temp (iter (load (.temps branch)))
+        (let [(mut uses) 0
+              (mut name) temp]
+          (when one-row
+            (for b (iter (load binds))
+              (when (rm-same-ident? (.value b) temp)
+                (set! uses (+ (load uses) 1))
+                (set! name (.pattern b)))))
+          (if (and (= (load uses) (primitive/cast i64 1)) (rm-name? (load name)))
+              (do
+                (push! (mut renames) (MatchRename :from temp :to (load name)))
+                (push! (mut out) (load name)))
+              (push! (mut out) temp))))
+      (box-al [Sexp] a (load out)))))
+
+;;; The tree as code. A leaf becomes its row's body when it is the row's only
+;;; leaf, and otherwise a break to the shared copy of the body.
+(defn rm-emit [(cx (ptr MatchCx))
+               (node (ptr MatchNode))
+               (arms (ptr (ArrayList Sexp)))
+               (leaves (ptr (ArrayList MatchNode)))
+               (shared Sexp)
+               (renames (ptr (ArrayList MatchRename)))
+                    (ls (mut LS))] (-> (Result Sexp Diag))
+  (try (let [a (.a cx)]
+         (match (load node)
+           (MatchLeaf [idx binds]
+                      (if (= (rm-count leaves idx) (primitive/cast i64 1))
+                          (rm-bind-leaf cx binds renames (rm-arm-body cx (get (load arms) idx)) (mut ls))
+                          (Ok (rm-list3 a (mcx-word cx (mv-break)) shared (sx-mkint idx)))))
+           (MatchVariants [value branches rest]
+                          (let [(mut form) (al-new [Sexp] a)]
+                            (push! (mut form) (mcx-word cx (mv-match)))
+                            (push! (mut form) (rm-rename renames value))
+                            (for i (range 0 (len (load branches)))
+                              (let [branch (al-elem [MatchBranch] branches i)
+                                    (mut inner) (al-new [MatchRename] a)]
+                                (for r (iter (load renames)) (push! (mut inner) r))
+                                (let [binders (rm-binders cx branch leaves (mut inner))]
+                                  (push! (mut form)
+                                         (rm-list3 a
+                                                   (.variant branch)
+                                                   (rm-vec a (load binders))
+                                                   (try! (rm-emit cx
+                                                                  (.sub branch)
+                                                                  arms
+                                                                  leaves
+                                                                  shared
+                                                                  (box-al [MatchRename] a (load inner))
+                                                                  (mut ls))))))))
+                            (match rest
+                              (Some [r]
+                                    ; The rows left for the variants no row names; the
+                                    ; checker drops this arm when the named ones are all.
+                                    (push! (mut form)
+                                           (rm-list2 a
+                                                     (mcx-word cx (mv-wild))
+                                                     (rm-list2 a
+                                                               (mcx-word cx (mv-default))
+                                                               (try! (rm-emit cx r arms leaves shared renames (mut ls)))))))
+                              (None [] 0))
+                            (Ok (rm-list a (load form)))))
+           (MatchLiterals [value keys subs rest]
+                          (let [n (len (load keys))
+                                (mut acc)
+                                  (match rest
+                                    (Some [r] (try! (rm-emit cx r arms leaves shared renames (mut ls))))
+                                    (None [] (try! (rm-emit cx (get (load subs) (- n 1)) arms leaves shared renames (mut ls)))))
+                                last (match rest (Some [_] (- n 1)) (None [] (- n 2)))]
+                            (for j (range 0 (+ last 1))
+                              (let [i (- last j)]
+                                (set! acc
+                                      (rm-list4 a
+                                                (mcx-word cx (mv-if))
+                                                (rm-list3 a
+                                                          (mcx-word cx (mv-eq))
+                                                          (rm-rename renames value)
+                                                          (get (load keys) i))
+                                                (try! (rm-emit cx (get (load subs) i) arms leaves shared renames (mut ls)))
+                                                (load acc)))))
+                            (Ok (load acc))))))))
+
+;;; `inner` with the names of the variant pattern `pattern`, known to match
+;;; `value`, bound as the binders of a match on `value`.
+(defn rm-project [(cx (ptr MatchCx))
+                  (value Sexp)
+                  (pattern Sexp)
+                  (names (mut (ArrayList Sexp)))
+                  (inner Sexp)
+                    (ls (mut LS))] (-> (Result Sexp Diag))
+  (try (let [a (.a cx)]
+         (if (not (rm-binds? a pattern))
+             (Ok inner)
+             (let [fields (rm-fields a pattern)
+                   binders (box-al [Sexp] a (al-new [Sexp] a))
+                   (mut body) inner]
+               (for k (range 0 (sx-len fields))
+                 (let [field (sx-at fields k)]
+                   (cond (rm-name? field) (do (push! (mut names) field) (push! binders field) 0)
+                         (not (rm-binds? a field)) (do (push! binders (mcx-word cx (mv-wild))) 0)
+                         (rm-as? field)
+                           (let [name (sx-at (sx-items field) 1)
+                                 sub (sx-at (sx-items field) 2)]
+                             (push! (mut names) name)
+                             (push! binders name)
+                             (if (rm-variant? sub)
+                                 (set! body (try! (rm-project cx name sub (mut names) (load body) (mut ls))))
+                                 (when (rm-binds? a sub)
+                                   (let [(mut pairs) (al-new [Sexp] a)]
+                                     (try! (rm-destructure! cx sub name (mut pairs) (mut names) (mut ls)))
+                                     (set! body (rm-list3 a (mcx-word cx (mv-let)) (rm-vec a (load pairs)) (load body))))))
+                             0)
+                         :else
+                           (let [temp (rm-fresh a "payload")]
+                             (push! binders temp)
+                             (if (rm-variant? field)
+                                 (set! body (try! (rm-project cx temp field (mut names) (load body) (mut ls))))
+                                 (let [(mut pairs) (al-new [Sexp] a)]
+                                   (if (rm-mut? field)
+                                       (do
+                                         (push! (mut names) (sx-at (sx-items field) 1))
+                                         (push! (mut pairs) field)
+                                         (push! (mut pairs) temp)
+                                         0)
+                                       (try! (rm-destructure! cx field temp (mut pairs) (mut names) (mut ls))))
+                                   (set! body (rm-list3 a (mcx-word cx (mv-let)) (rm-vec a (load pairs)) (load body)))))
+                             0))))
+               (Ok (rm-rematch cx value (sx-at (sx-items pattern) 0) binders (load body))))))))
+
+;;; Arm `idx`, whose leaves are shared, with its names bound from the scrutinee.
+(defn rm-shared-body [(cx (ptr MatchCx)) (arm Sexp) (scrutinee Sexp)
+                    (ls (mut LS))] (-> (Result Sexp Diag))
+  (try (let [a (.a cx)
+             (mut body) (al-new [Sexp] a)
+             (mut names) (al-new [Sexp] a)]
+         (push! (mut body) (mcx-word cx (mv-do)))
+         (for x (iter (rm-arm-body cx arm)) (push! (mut body) x))
+         (let [projected
+                 (if (= (rm-body-start arm) (primitive/cast i64 1))
+                     (rm-list a (load body))
+                     (try! (rm-project cx
+                                       scrutinee
+                                       (rm-list2 a (rm-arm-head arm) (sx-at (sx-items arm) 1))
+                                       (mut names)
+                                       (rm-list a (load body))
+                                       (mut ls))))]
+           (try! (rm-check-names cx (box-al [Sexp] a (load names))))
+           (Ok projected)))))
+
+;;; Lower `(match value arm…)` with a refutable arm (see above).
+(defn lower-refutable-match [(form Sexp)
+                             (env (ptr ExpEnv))
+                             (allfns (ptr (ArrayList (slice u8))))
+                             (gs (ptr (ArrayList StructDef)))
+                             (gu (ptr (ArrayList SumDef)))
+                             (depth (ptr i64))
+                             (ls (mut LS))] (-> (Result Sexp Diag))
+  (try (let [a (.a env)
+             vocab (sx-items (try! (normalize-with-binding-macro "coil.binding.match-vocabulary"
+                                                                 (box-sexp a form)
+                                                                 env
+                                                                 allfns
+                                                                 gs
+                                                                 gu
+                                                                 depth
+                                                                 (mut ls))))
+             cx (box! a MatchCx (MatchCx :a a :form form :vocab vocab :env env :allfns allfns
+                                         :gs gs :gu gu :depth depth))
+             items (sx-items form)
+             scrutinee (rm-fresh a "scrutinee")
+             arms (box-al [Sexp] a (al-new [Sexp] a))
+             (mut rows) (al-new [MatchRow] a)]
+         (for i (range 2 (sx-len items)) (push! arms (sx-at items i)))
+         (for i (range 0 (len (load arms)))
+           (let [arm (get (load arms) i)
+                 (mut tests) (al-new [MatchTest] a)]
+             (when (or (!= (sx-tag arm) (primitive/cast i64 6))
+                       (= (sx-len (sx-items arm)) (primitive/cast i64 0)))
+               (break :try (Err (mcx-err cx "match: expected an arm list"))))
+             (let [head (rm-arm-head arm)]
+               (cond (rm-wild? head) 0
+                     (match-literal-pattern? head)
+                       (do (push! (mut tests) (MatchTest :value scrutinee :pattern head)) 0)
+                     (and (= (sx-tag head) (primitive/cast i64 2))
+                          (and (>= (sx-len (sx-items arm)) (primitive/cast i64 2))
+                               (= (sx-tag (sx-at (sx-items arm) 1)) (primitive/cast i64 7))))
+                       (do
+                         (push! (mut tests)
+                                (MatchTest :value scrutinee
+                                           :pattern (rm-list2 a head (sx-at (sx-items arm) 1))))
+                         0)
+                     :else
+                       (break :try (Err (mcx-err cx "match: expected (Variant [patterns…] body…), (literal body…) or (_ body…)")))))
+             (push! (mut rows)
+                    (MatchRow :idx i
+                              :tests (box-al [MatchTest] a (load tests))
+                              :binds (box-al [MatchBind] a (al-new [MatchBind] a))))))
+         (let [tree (try! (rm-compile cx (box-al [MatchRow] a (load rows))))
+               (mut leaf-list) (al-new [MatchNode] a)]
+           (rm-leaves! tree (mut leaf-list))
+           (let [leaves (box-al [MatchNode] a (load leaf-list))
+                 (mut shared-rows) (al-new [i64] a)
+                 shared (rm-label a)
+                 done (rm-label a)
+                 chosen (rm-fresh a "arm")]
+             (for i (range 0 (len (load arms)))
+               (let [count (rm-count leaves i)]
+                 (when (= count (primitive/cast i64 0))
+                   (let [arm (get (load arms) i)
+                         (mut shown) (al-new [Sexp] a)]
+                     (for k (range 0 (rm-body-start arm)) (push! (mut shown) (sx-at (sx-items arm) k)))
+                     (push! (mut shown) (sx-sym "..."))
+                     (break :try
+                              (Err (mcx-err cx
+                                            (sconcat3 a
+                                                      "match: the arm "
+                                                      (sexp-display a (rm-list a (load shown)))
+                                                      " can never match: the arms before it already match every value it would"))))))
+                 (when (> count (primitive/cast i64 1)) (push! (mut shared-rows) i))
+                 0))
+             (let [body (try! (rm-emit cx tree arms leaves shared (box-al [MatchRename] a (al-new [MatchRename] a)) (mut ls)))
+                   (mut bind-scrutinee) (al-new [Sexp] a)]
+               (push! (mut bind-scrutinee) scrutinee)
+               (push! (mut bind-scrutinee) (sx-at items 1))
+               (let [out
+                       (if (= (len shared-rows) (primitive/cast i64 0))
+                           (rm-list3 a (mcx-word cx (mv-let)) (rm-vec a (load bind-scrutinee)) body)
+                           (let [n (len shared-rows)
+                                 (mut dispatch)
+                                   (try! (rm-shared-body cx (get (load arms) (get shared-rows (- n 1))) scrutinee (mut ls)))
+                                 (mut chosen-bind) (al-new [Sexp] a)]
+                             (for j (range 0 (- n 1))
+                               (let [idx (get shared-rows (- (- n 2) j))]
+                                 (set! dispatch
+                                       (rm-list4 a
+                                                 (mcx-word cx (mv-if))
+                                                 (rm-list3 a (mcx-word cx (mv-eq)) chosen (sx-mkint idx))
+                                                 (try! (rm-shared-body cx (get (load arms) idx) scrutinee (mut ls)))
+                                                 (load dispatch)))))
+                             (push! (mut chosen-bind) chosen)
+                             (push! (mut chosen-bind)
+                                    (rm-list3 a
+                                              (mcx-word cx (mv-block))
+                                              shared
+                                              (rm-list3 a (mcx-word cx (mv-break)) done body)))
+                             (rm-list3 a
+                                       (mcx-word cx (mv-let))
+                                       (rm-vec a (load bind-scrutinee))
+                                       (rm-list3 a
+                                                 (mcx-word cx (mv-block))
+                                                 done
+                                                 (rm-list3 a
+                                                           (mcx-word cx (mv-let))
+                                                           (rm-vec a (load chosen-bind))
+                                                           (load dispatch))))))
+                     outp (box-sexp a out)]
+                 ; Generated nodes take the match's own location.
+                 (stamp-expansion outp (sx-source form) (sx-lo form) (sx-hi form) (sx-ctxt form))
+                 (Ok (load outp)))))))))
 
 (defn normalize-with-binding-macro [(q (slice u8))
                                     (arm (ptr Sexp))

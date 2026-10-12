@@ -444,6 +444,99 @@ Use `defsum` for a closed set of shapes: states, messages, syntax trees, errors.
 When you add a variant, the compiler flags each `match` that misses it. Use a
 struct with an integer `kind` field only when you need a fixed binary layout.
 
+### Patterns
+
+An arm can test more than the outer variant. A payload position may hold another
+variant pattern, `(Err [(NotFound [path])] …)`, or a literal, `(Open [1] …)`, and
+a whole arm may be a literal: an integer, a character, a string, `true` or
+`false`. An arm whose patterns fail passes the value on to the next arm.
+
+```coil
+(module example.patterns)
+(import "coil.io" :as io :use [IoError])
+
+(defsum Cell (Open [(cost i64)]) (Wall))
+
+(defn describe [(c (Option Cell))] (-> (slice u8))
+  (match c
+    (Some [(Open [1])] "cheap")
+    (Some [(Open [n])] (if (> n 5) "dear" "fair"))
+    (Some [(Wall)] "blocked")
+    (None [] "off the map")))
+
+(defn digit [(n i64)] (-> (slice u8))
+  (match n
+    (0 "zero")
+    (1 "one")
+    (_ "many")))
+
+(defn errno [(e IoError)] (-> i64)
+  (match e
+    (Errno [code] code)
+    (_ -1)))
+
+(defn main [] (-> i64)
+  (println "{} {} {}" (describe (Some (Open 1))) (describe (Some (Wall))) (describe (None)))
+  (println "{} {}" (digit 0) (digit 7))
+  (match (Some 41)
+    (Some [(mut n)] (set! n (+ n 1)) (println "{}" n))
+    (None []))
+  (println "{}" (errno (io/Errno 2)))
+  0)
+```
+
+```output
+cheap blocked off the map
+zero many
+42
+2
+```
+
+- Exhaustiveness looks inside: the three `Some` arms above cover `Some` between
+  them, so `describe` needs no `(_ …)` arm. A missing case is an error naming the
+  variant no arm reaches, and an arm that earlier arms already cover is an error
+  too.
+- Literals never cover their type, so integers and strings need a `(_ …)` arm;
+  `true` and `false` together cover a `bool`. Floats are not patterns.
+- `(Wall)` is the nullary variant pattern, the same as `(Wall [])`.
+- `(mut n)` binds a mutable copy of the field, as it does in `let`; `(as e (Err
+  [x]))` names the whole value while testing it.
+- A variant of the scrutinee's own sum needs no import in a pattern: `errno`
+  matches `Errno` having imported only `IoError` (building one still takes the
+  qualified `io/Errno`).
+- Payload names bind as in any arm: a payload of a named value is a reference to
+  it, so a nested pattern moves nothing out of the scrutinee.
+- An arm may have no body, `(None [])`. It yields no value, so it is allowed only
+  where the match is used as a statement.
+
+`if-let`, `when-let` and `while-let` test one pattern against one value:
+
+```coil
+(module example.iflet)
+
+(defn port [(o (Option i64))] (-> i64)
+  (if-let [(Some [p]) o] p 8080))
+
+(defn main [] (-> i64)
+  (println "{} {}" (port (Some 80)) (port (None)))
+  (when-let [(Ok [n]) (: (Ok 3) (Result i64 i64))] (println "ok {}" n))
+  (let [(mut it) (range 0 4)
+        (mut sum) 0]
+    (while-let [(Some [x]) (next (mut it))] (set! sum (+ sum x)))
+    (println "{}" sum))
+  0)
+```
+
+```output
+80 8080
+ok 3
+6
+```
+
+Each is a `match` with that arm and a catch-all, so the pattern's names are in
+scope only where it matched. `when-let` yields 0 when the value does not match,
+like `when`, and `while-let` stops at the first value that does not.
+
 ### Option, Result and try
 
 `(Option T)` is `(Some v)` or `(None)`. `(Result T E)` is `(Ok v)` or `(Err e)`.
