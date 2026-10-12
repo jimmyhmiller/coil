@@ -835,6 +835,9 @@ true
   overlapping impls, neither more specific, at the first use of the overlap.
 - Bounds can constrain associated types: `[(I (Iterator i64))]` means "an iterator
   whose item is `i64`".
+- A trait can require others: `(deftrait Pet [Self] :requires [Animal] …)`. Every
+  impl of `Pet` must be accompanied by one of `Animal`, so a type parameter bounded
+  by `Pet` can call `Animal`'s methods and be passed where `Animal` is required.
 - A blanket impl implements a trait for every type that satisfies its bounds:
   `(impl [(T Hash Eq)] Key T …)`. Any other impl that accepts a type is more
   specific, so it wins. A trait can have one blanket impl, whose bounds can't
@@ -958,6 +961,9 @@ static, and the call inlines:
 ```output
 42
 ```
+
+A value whose type is a parameter bounded by `Callable` is called the same way:
+`(defn apply [(F (Callable i64 i64))] [(f F) (x i64)] (-> i64) (f x))`.
 
 `coil.var/Var` is a shared, updatable cell. A `Var` holding a function pointer is
 callable; the REPL builds hot reload on it. `coil.closure/defclosure`
