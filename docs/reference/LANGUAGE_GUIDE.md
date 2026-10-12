@@ -395,10 +395,43 @@ integer, `bool` or `Keyword`. It sizes arrays and makes types distinct:
 where the other is expected is a type error. Type positions don't compute:
 `(array T (+ N 1))` is not a type.
 
-An explicit generic argument can name a constant: with `(const LANES 4)`,
-`(width [(const LANES)])` is `(width [(const 4)])`. The constant's value must be
-written as an integer, `true`, `false` or a keyword (or come from a macro that
-expands to one), since generic arguments are read before compile-time code runs.
+An array length can name an integer constant instead, and the constant can be
+computed:
+
+```coil
+(module example.lengths)
+(defn fib [(n i64)] (-> i64) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+
+(const MAX-CODE-LEN 32)
+(const SLOTS (+ MAX-CODE-LEN 1))
+(const RING (fib 6))
+
+(defstruct Table [(counts (array u32 SLOTS)) (ring (array i64 RING))])
+
+(defn length [T (const N i64)] [(xs (array T N))] (-> i64) N)
+
+(defn main [] (-> i64)
+  (let [t (zeroed Table)]
+    (println "{} {} {}" (length (.counts t)) (length (.ring t)) (sizeof Table))
+    0))
+```
+
+```output
+33 8 200
+```
+
+Such a constant gets its value before the program's types are checked: folded
+from its initializer when that is integer arithmetic on literals and other
+constants, and otherwise by running the code it calls, as `RING` runs `fib`. Its
+value must be a non-negative integer. A constant computed from a type whose
+length is that same constant (`(const N (sizeof Big))` with `Big` holding an
+`(array u8 N)`) is a cycle, and an error that names the path.
+
+A generic argument can name a constant too: with `(const LANES 4)`,
+`(width [(const LANES)])` is `(width [(const 4)])` and `(Lanes (const LANES))` is
+`(Lanes 4)`. An integer constant may be computed, as for a length; a `bool` or
+keyword constant must be written as its value (or come from a macro that expands
+to one).
 
 ### Annotations
 
