@@ -1,13 +1,14 @@
 // Runs a Coil wasm32 module and checks its exports:
 //   node run.mjs module.wasm name=expected ...
-// The host supplies a bump allocator, write, strlen, and the imports
-// tests/wasm/wasm32.coil declares.
+// The host supplies a bump allocator, write, memcmp, strlen, atexit, the stack
+// protector's failure, and the imports tests/wasm/wasm32.coil declares.
 import fs from "node:fs";
 
 const [file, ...checks] = process.argv.slice(2);
 let instance;
 let heapTop = 0;
 let sunk = 0;
+const exitHandlers = [];
 let errno = 0;
 function errnoCell() { if (!errno) errno = malloc(4); return errno; }
 
@@ -39,6 +40,14 @@ const env = {
     process.stdout.write(Buffer.from(memory().buffer, Number(pointer), Number(length)));
     return length;
   },
+  memcmp: (a, b, n) => {
+    const bytes = new Uint8Array(memory().buffer);
+    for (let i = 0; i < Number(n); i++) {
+      const d = bytes[Number(a) + i] - bytes[Number(b) + i];
+      if (d !== 0) return d;
+    }
+    return 0;
+  },
   strlen: (pointer) => {
     const bytes = new Uint8Array(memory().buffer);
     let end = Number(pointer);
@@ -49,6 +58,10 @@ const env = {
   __error: () => errnoCell(),
   __errno_location: () => errnoCell(),
   abort: () => { throw new Error(`${file} aborted`); },
+  // A stack-protector canary that no longer matches (sspstrong, under --debug-checks).
+  __stack_chk_fail: () => { throw new Error(`${file}: stack smashing detected`); },
+  // Exit handlers run when the program is done, most recent first, as C runs them.
+  atexit: (handler) => { exitHandlers.push(handler); return 0; },
   js_get: () => ({ tag: 7 }),
   js_use: (reference) => reference.tag,
   sink: (pointer) => { sunk = Number(pointer); },
@@ -66,6 +79,9 @@ for (const check of checks) {
     console.error(`FAIL ${name}: returned ${actual}, expected ${expected}`);
     failed++;
   }
+}
+while (exitHandlers.length) {
+  instance.exports.__indirect_function_table.get(Number(exitHandlers.pop()))();
 }
 if (checks.includes("use_stack=5") && sunk === 0) {
   console.error("FAIL use_stack: the host never received the stack address");

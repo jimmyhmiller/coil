@@ -2,7 +2,8 @@
 """WebAssembly programs, built and run under node (tests/wasm/).
 
 - tests/wasm/wasm32.coil on wasm32, validated and run by tests/wasm/run.mjs,
-  which checks each export's result (see the program's header). The module must
+  which checks each export's result (see the program's header), and again built
+  under coil.safety. The module must
   export __stack_pointer, and its `write` import must be (i32, i32, i32) -> i32:
   size_t and ssize_t are 32-bit on wasm32.
 - tests/bootstrap/errno.coil on the native wasm backend (wasm64), run as a
@@ -72,6 +73,19 @@ def wasm32_program(coil: str, work: Path) -> None:
     print("ok   wasm32: layout, dyn returns, externref, shadow stack, aliased import, 32-bit size_t")
 
 
+def wasm32_safety(coil: str, work: Path) -> None:
+    """The same program under coil.safety: its checks, the debug allocator and the
+    stack protector all build for wasm32 and leave every result as it was."""
+    module = work / "wasm32-safety.wasm"
+    run([coil, "build", WASM / "wasm32.coil", "--target", "wasm32-unknown-unknown", "--use", "coil.safety",
+         "-o", module, "--quiet"], "build wasm32.coil --use coil.safety")
+    run(["wasm-tools", "validate", module], "validate wasm32-safety.wasm")
+    ran = run(["node", WASM / "run.mjs", module, *EXPECTED_EXPORTS], "run wasm32-safety.wasm", expect_ok=False)
+    if ran.returncode != 0:
+        raise Failed(f"wasm32-safety.wasm exports returned the wrong values:\n{ran.stdout}{ran.stderr[-3000:]}")
+    print("ok   wasm32 under coil.safety")
+
+
 def wasm64_errno(coil: str, work: Path) -> None:
     module = work / "errno.wasm"
     run([coil, "build", ROOT / "tests/bootstrap/errno.coil", "--backend", "wasm",
@@ -103,7 +117,7 @@ def main() -> int:
     if missing:
         print(f"FAIL wasm needs {' and '.join(missing)} on PATH (brew install node wasm-tools)")
         return 1
-    checks = [wasm32_program] if args.quick else [wasm32_program, wasm64_errno, externref_misuse]
+    checks = [wasm32_program] if args.quick else [wasm32_program, wasm32_safety, wasm64_errno, externref_misuse]
     failures = 0
     with tempfile.TemporaryDirectory(prefix="coil-wasm-", dir=os.environ.get("COIL_TEST_SCRATCH")) as raw:
         for check in checks:
