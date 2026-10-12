@@ -1,5 +1,14 @@
 # Compile-and-run metaprograms — built, default, and proven
 
+> **Where this lives now (2026-10-12).** This was the README of
+> `tests/metaprogramming/compile-and-run/`, kept as the design record. Its test
+> suite was folded into `scripts/tests/fast/meta.sh` (FAST's `meta` step): the
+> same-code proof is `tests/meta/samecode_test.coil` (trimmed to seven
+> computations; the compiler's-own-reader item compiled compiler source), and the
+> tower, addforms and identity transforms are `tests/meta/transforms_test.coil`.
+> The Mandelbrot GUI demo and the dylib-plugin steps described below were removed,
+> so the commands that name them no longer run.
+
 Run `python3 scripts/dev.py build full`, then
 `python3 scripts/dev.py test metaprogramming`. Together they cover the rebootstrap
 fixpoint, compiler gates, and every mechanism in this suite—including the
