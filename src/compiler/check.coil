@@ -334,6 +334,16 @@
     (set! (.t p) t)
     (load p)))
 
+;;; The value a synthesized expression yields: a place (a constructor's
+;;; storage, a reference) is read, anything else is itself.
+(defn place-as-value [(a (dyn Allocator)) (sp SynPair)] (-> EvalPair)
+  (let [e (.e sp)]
+    (match (load (.t sp))
+      (TRef [_ inner]
+            (mk-evalpair (mk-expr (ELoad e) (.lo e) (.hi e) (.source e) (.ctxt e))
+                         (load inner)))
+      (_ (mk-evalpair (load e) (load (.t sp)))))))
+
 (defn env-new [(a (dyn Allocator))] (-> (ptr (ArrayList EnvEntry)))
   (box-al [EnvEntry] a (al-new [EnvEntry] a)))
 
@@ -3421,19 +3431,331 @@
   (match (load o) (Some [t] t) (_ (TVoid))))
 
 (defn type-is-aggregate-static [(t (ptr Type))] (-> bool)
-  (match (load t) (TStruct [_] true) (TArray [_ _] true) (_ false)))
+  (match (load t) (TStruct [_] true) (TApp [_ _] true) (TArray [_ _] true) (_ false)))
 
-;;; A compile-time constant's value is checked with static spills (see
-;;; static-spill); a runtime `def`'s is an ordinary initializer.
+;;; A constant's value, and a `def`'s, is checked with static spills (see
+;;; static-spill): either may be computed at compile time and read back after
+;;; the frame that computed it is gone.
 (defn compute-const-entry [(a (dyn Allocator)) (cx (ptr Cx)) (cp (ptr Const))] (-> (Result EvalPair
                                                                                            Diag))
   (let [u (ast-unit-state)
-        static-values (not (.runtime cp))
-        saved (.const_value_depth u)]
-    (when static-values (set! (.const_value_depth u) (+ saved 1)) 0)
+        saved (.const_value_depth u)
+        ; Before checking: does the initializer itself ask for storage or an
+        ; address (`alloc-static`, `fnptr-of`, `fn`, a C string)?
+        linked (expr-names-link-address? a (field cp value) true)]
+    (set! (.const_value_depth u) (+ saved 1))
     (let [r (compute-const-entry-value a cx cp)]
       (set! (.const_value_depth u) saved)
-      r)))
+      (if (or (not (.runtime cp)) (.declared cp))
+          r
+          (try (let [ev (try! r)
+                     value (try! (def-initializer a cx (box-expr a (.e ev)) (box-type a (.t ev)) linked))]
+                 (Ok (mk-evalpair value (.t ev)))))))))
+
+;;; Does `e` hold an address only the linker knows: static storage's, a
+;;; function's, a C string's, another def's? `source` is true for an unchecked
+;;; initializer, where an anonymous fn asks for one too. In a checked tree an
+;;; allocation a let binds is not one: array literals allocate statics of their
+;;; own, which computing the value at compile time replaces.
+(defn expr-names-link-address? [(a (dyn Allocator)) (e (ptr Expr)) (source bool)] (-> bool)
+  (match (.kind e)
+    (EFnPtrOf [_] true)
+    (ECStr [_] true)
+    (EStaticRef [_] true)
+    (EAnonFn [_ _] true)
+    (EAlloc [storage _ _ _] (= storage 1))
+    (ELet [binds body]
+          (block :found
+            (for [i 0 (len (load binds))]
+              (let [value (field (al-elem [Bind] binds i) value)]
+                (when (match (.kind value)
+                        (EAlloc [_ _ init _]
+                                (if source
+                                    true
+                                    (and (!= (primitive/cast i64 init) 0)
+                                         (expr-names-link-address? a init source))))
+                        (_ (expr-names-link-address? a value source)))
+                  (break :found true))))
+            (for [i 0 (len (load body))]
+              (when (expr-names-link-address? a (al-elem [Expr] body i) source)
+                (break :found true)))
+            false))
+    (_ (let [(mut kids) (al-new [(ptr Expr)] a)]
+         (ownership-children! e (mut kids))
+         (block :found
+           (for [i 0 (len kids)]
+             (when (expr-names-link-address? a (get kids i) source)
+               (break :found true)))
+           false)))))
+
+;;; The first part of a checked initializer that is not a link-time constant,
+;;; or null when all of it is one: the shapes every backend lays into a
+;;; static's data. Literals, sums of them, function and static addresses, and
+;;; aggregates built field by field or element by element.
+(defn static-unlinkable-part [(cx (ptr Cx)) (e (ptr Expr))] (-> (ptr Expr))
+  (let [none (primitive/cast (ptr Expr) 0)]
+    (match (.kind e)
+      (EInt [_] none)
+      (EFloat [_] none)
+      (EBool [_] none)
+      (EStr [_] none)
+      (ECStr [_] none)
+      (EZeroed [_] none)
+      (ERecordInit [_] none)
+      (EFnPtrOf [_] none)
+      ; computed at compile time, before any backend sees it
+      (EComptime [_] none)
+      (EConstruct [_ _ args] (static-unlinkable-in cx args))
+      ; a variant's constructor, which checking leaves a call
+      (ECall [func _ args]
+             (if (= (primitive/cast i64 (vts-find cx func)) 0) e (static-unlinkable-in cx args)))
+      (EStaticArray [_ items] (static-unlinkable-in cx items))
+      (EAlloc [storage _ init _]
+              (cond (!= storage 1) e
+                    (= (primitive/cast i64 init) 0) none
+                    :else (static-unlinkable-part cx init)))
+      (EMakeSlice [data _ _] (static-unlinkable-part cx data))
+      (ELoad [inner] (static-unlinkable-part cx inner))
+      (ECast [ty inner]
+             (match ty
+               (TPtr [_] (match (.kind inner) (EInt [n] (if (= n 0) none e)) (_ e)))
+               (TFn [_ _ _]
+                    (match (.kind inner)
+                      (EInt [n] (if (= n 0) none e))
+                      (EFnPtrOf [_] none)
+                      (_ e)))
+               (TInt [_ _] (match (.kind inner) (EInt [_] none) (_ e)))
+               (TFloat [_] (match (.kind inner) (EFloat [_] none) (_ e)))
+               (_ e)))
+      (ELet [_ body]
+            (let [n (len (load body))]
+              (block :found
+                (for [i 0 n]
+                  (let [item (al-elem [Expr] body i)
+                        value
+                          (match (.kind item)
+                            (EStore [place value] (if (static-element-place? place) value item))
+                            (EInitStore [place value] (if (static-element-place? place) value item))
+                            ; the aggregate itself, after its elements
+                            (EVar [_] (if (= i (- n 1)) none item))
+                            (ELoad [inner]
+                                   (match (.kind inner)
+                                     (EVar [_] (if (= i (- n 1)) none item))
+                                     (_ item)))
+                            (_ item))]
+                    (unless (= (primitive/cast i64 value) 0)
+                      (let [part (if (= value item) item (static-unlinkable-part cx value))]
+                        (unless (= (primitive/cast i64 part) 0)
+                          (break :found part))
+                        0))
+                    0))
+                none)))
+      (_ e))))
+
+(defn static-unlinkable-in [(cx (ptr Cx)) (items (ptr (ArrayList Expr)))] (-> (ptr Expr))
+  (block :found
+    (for [i 0 (len (load items))]
+      (let [part (static-unlinkable-part cx (al-elem [Expr] items i))]
+        (unless (= (primitive/cast i64 part) 0) (break :found part))
+        0))
+    (primitive/cast (ptr Expr) 0)))
+
+;;; Is `place` a field of the aggregate being built, or an element of it at a
+;;; constant index?
+(defn static-element-place? [(place (ptr Expr))] (-> bool)
+  (match (.kind place)
+    (EField [base _] (match (.kind base) (EVar [_] true) (_ false)))
+    (EIndex [base index]
+            (and (match (.kind base) (EVar [_] true) (_ false))
+                 (match (.kind index) (EInt [_] true) (_ false))))
+    (_ false)))
+
+;;; A `def`'s initializer as its storage is laid out: a link-time constant as
+;;; it stands; otherwise its value computed at compile time. When the value
+;;; holds addresses -- `linked` says the source asked for one -- they stay for
+;;; the linker, and each part between them that is not yet a constant is
+;;; computed at compile time on its own.
+(defn def-initializer [(a (dyn Allocator)) (cx (ptr Cx)) (e (ptr Expr)) (t (ptr Type)) (linked bool)] (-> (Result Expr Diag))
+  (try (let [value (try! (if (or linked (expr-names-link-address? a e false))
+                             (static-link-parts a cx e)
+                             (Ok [Expr Diag] (computed-at-compile-time a cx e))))]
+         ; Built field by field or element by element, the value must be a
+         ; struct or an array: a let yielding anything else (a pointer to the
+         ; storage it binds) is not laid out from its stores.
+         (match (.kind (static-value-core value))
+           (ELet [_ _]
+                 (unless (type-is-aggregate-static t)
+                   (break :try (Err (static-link-diag a e)))))
+           (_ 0))
+         (Ok value))))
+
+;;; `e` under the reads that a static's value passes through.
+(defn static-value-core [(e Expr)] (-> Expr)
+  (match (.kind e)
+    (ELoad [inner] (static-value-core (load inner)))
+    (_ e)))
+
+;;; `e` as a constant: itself when it is one, and otherwise its value
+;;; computed at compile time.
+(defn computed-at-compile-time [(a (dyn Allocator)) (cx (ptr Cx)) (e (ptr Expr))] (-> Expr)
+  (if (= (primitive/cast i64 (static-unlinkable-part cx e)) 0)
+      (load e)
+      (mk-expr (EComptime e) (.lo e) (.hi e) (.source e) (.ctxt e))))
+
+(defn static-link-parts [(a (dyn Allocator)) (cx (ptr Cx)) (e (ptr Expr))] (-> (Result Expr Diag))
+  (try
+    (cond (= (primitive/cast i64 (static-unlinkable-part cx e)) 0) (Ok (load e))
+          (not (expr-names-link-address? a e false)) (Ok (computed-at-compile-time a cx e))
+          :else
+            (let [rebuilt (box-expr a (load e))]
+              (match (.kind e)
+                (EConstruct [sum variant args]
+                            (set! (.kind rebuilt) (EConstruct sum variant (try! (static-link-list a cx args)))))
+                (ECall [func targs args]
+                       (if (= (primitive/cast i64 (vts-find cx func)) 0)
+                           (break :try (Err (static-link-diag a e)))
+                           (set! (.kind rebuilt) (ECall func targs (try! (static-link-list a cx args))))))
+                (EStaticArray [indices items]
+                              (set! (.kind rebuilt) (EStaticArray indices (try! (static-link-list a cx items)))))
+                (EAlloc [storage ty init symbol]
+                        (set! (.kind rebuilt)
+                              (EAlloc :storage storage :ty ty :symbol symbol
+                                      :init (box-expr a (try! (static-link-parts a cx init))))))
+                (EMakeSlice [data elem n]
+                            (set! (.kind rebuilt) (EMakeSlice (box-expr a (try! (static-link-parts a cx data))) elem n)))
+                (ELoad [inner]
+                       (set! (.kind rebuilt) (ELoad (box-expr a (try! (static-link-parts a cx inner))))))
+                (ECast [ty inner]
+                       (set! (.kind rebuilt) (ECast ty (box-expr a (try! (static-link-parts a cx inner))))))
+                (ELet [binds body]
+                      (if (named-args-let? binds body)
+                          ; A constructor whose arguments were bound in source
+                          ; order: at link time there is no order, so each value
+                          ; goes straight into the store that reads it.
+                          (break :try (static-link-parts a cx (named-args-inlined a binds body)))
+                      (let [(mut out) (al-new [Expr] a)]
+                        (for [i 0 (len (load body))]
+                          (let [item (al-elem [Expr] body i)]
+                            (push! (mut out)
+                                   (match (.kind item)
+                                     (EStore [place value]
+                                             (if (static-element-place? place)
+                                                 (mk-expr (EStore place (box-expr a (try! (static-link-parts a cx value))))
+                                                          (.lo item) (.hi item) (.source item) (.ctxt item))
+                                                 (break :try (Err (static-link-diag a item)))))
+                                     (EInitStore [place value]
+                                                 (if (static-element-place? place)
+                                                     (mk-expr (EInitStore place (box-expr a (try! (static-link-parts a cx value))))
+                                                              (.lo item) (.hi item) (.source item) (.ctxt item))
+                                                     (break :try (Err (static-link-diag a item)))))
+                                     (_ (load item))))))
+                        (set! (.kind rebuilt) (ELet binds (box-al [Expr] a (load out)))))))
+                (_ (break :try (Err (static-link-diag a e)))))
+              ; what is left must now be laid out by the linker
+              (let [part (static-unlinkable-part cx rebuilt)]
+                (if (= (primitive/cast i64 part) 0)
+                    (Ok (load rebuilt))
+                    (Err (static-link-diag a part))))))))
+
+;;; Is this the let a constructor written out of declaration order binds its
+;;; arguments in (see named-source-binds), around the constructor itself?
+(defn named-args-let? [(binds (ptr (ArrayList Bind))) (body (ptr (ArrayList Expr)))] (-> bool)
+  (and (= (len (load body)) 1)
+       (> (len (load binds)) 0)
+       (block :found
+         (for [i 0 (len (load binds))]
+           (unless (named-temp-name? (.name (al-elem [Bind] binds i))) (break :found false)))
+         true)))
+
+;;; The constructor under a named-args let, with each store of an argument
+;;; temporary storing the argument's value instead.
+(defn named-args-inlined [(a (dyn Allocator)) (binds (ptr (ArrayList Bind))) (body (ptr (ArrayList Expr)))] (-> (ptr Expr))
+  (let [ctor (al-elem [Expr] body 0)]
+    (match (.kind ctor)
+      (ELoad [inner]
+             (box-expr a (mk-expr (ELoad (named-args-inlined-ctor a binds inner))
+                                  (.lo ctor) (.hi ctor) (.source ctor) (.ctxt ctor))))
+      (_ (named-args-inlined-ctor a binds ctor)))))
+
+(defn named-args-inlined-ctor [(a (dyn Allocator)) (binds (ptr (ArrayList Bind))) (ctor (ptr Expr))] (-> (ptr Expr))
+  (match (.kind ctor)
+    (ELet [cbinds cbody]
+          (let [(mut out) (al-new [Expr] a)]
+            (for [i 0 (len (load cbody))]
+              (let [item (al-elem [Expr] cbody i)
+                    value (static-store-value item)
+                    bound (if (= (primitive/cast i64 value) 0)
+                              (primitive/cast (ptr Expr) 0)
+                              (named-arg-bound binds value))]
+                (push! (mut out)
+                       (if (= (primitive/cast i64 bound) 0)
+                           (load item)
+                           (mk-expr (match (.kind item)
+                                      (EStore [place _] (EStore place bound))
+                                      (_ (EInitStore (static-store-place item) bound)))
+                                    (.lo item) (.hi item) (.source item) (.ctxt item))))))
+            (box-expr a (mk-expr (ELet cbinds (box-al [Expr] a (load out)))
+                                 (.lo ctor) (.hi ctor) (.source ctor) (.ctxt ctor)))))
+    (_ ctor)))
+
+;;; The value bound to the argument temporary `e` reads, or null.
+(defn named-arg-bound [(binds (ptr (ArrayList Bind))) (e (ptr Expr))] (-> (ptr Expr))
+  (let [name (match (.kind e)
+               (EVar [n] n)
+               (ELoad [inner] (match (.kind inner) (EVar [n] n) (_ "")))
+               (_ ""))]
+    (block :found
+      (for [i 0 (len (load binds))]
+        (let [b (al-elem [Bind] binds i)]
+          (when (and (!= (len name) 0) (= (.name b) name))
+            (break :found (owned-place-initializer (field b value))))))
+      (primitive/cast (ptr Expr) 0))))
+
+;;; The value a binding is initialized with: for one bind-owned-place! gave
+;;; its own slot, `(do (init-store slot value) slot)`, that value.
+(defn owned-place-initializer [(e (ptr Expr))] (-> (ptr Expr))
+  (match (.kind e)
+    (EDo [body]
+         (if (= (len (load body)) 2)
+             (match (.kind (al-elem [Expr] body 0))
+               (EInitStore [place value]
+                           (match (.kind place) (EVar [_] value) (_ e)))
+               (_ e))
+             e))
+    (_ e)))
+
+(defn static-link-list [(a (dyn Allocator)) (cx (ptr Cx)) (items (ptr (ArrayList Expr)))] (-> (Result (ptr (ArrayList Expr)) Diag))
+  (try (let [(mut out) (al-new [Expr] a)]
+         (for [i 0 (len (load items))]
+           (push! (mut out) (try! (static-link-parts a cx (al-elem [Expr] items i)))))
+         (Ok (box-al [Expr] a (load out))))))
+
+(defn static-link-diag [(a (dyn Allocator)) (part (ptr Expr))] (-> Diag)
+  (let [read (first-static-ref a part)]
+    (if (!= (primitive/cast i64 read) 0)
+        (derr-at-src (.source read) (.lo read) (.hi read)
+                     (match (.kind read)
+                       (EStaticRef [name]
+                                   (sconcat3 a
+                                             "a def's initializer cannot read the def '"
+                                             (unqualified-tail (display-ident name))
+                                             "': defs are laid out when the program is linked, before any of them holds a value; make it a const"))
+                       (_ "")))
+        (derr-at-src (.source part) (.lo part) (.hi part)
+                     "a def's value is laid out when the program is linked, because it holds an address (a function, a C string or static storage); this part of it is neither a constant nor computable on its own at compile time"))))
+
+;;; The first reference to a def inside `e`, or null.
+(defn first-static-ref [(a (dyn Allocator)) (e (ptr Expr))] (-> (ptr Expr))
+  (match (.kind e)
+    (EStaticRef [_] e)
+    (_ (let [(mut kids) (al-new [(ptr Expr)] a)]
+         (ownership-children! e (mut kids))
+         (block :found
+           (for [i 0 (len kids)]
+             (let [found (first-static-ref a (get kids i))]
+               (unless (= (primitive/cast i64 found) 0) (break :found found))
+               0))
+           (primitive/cast (ptr Expr) 0))))))
 
 (defn compute-const-entry-value [(a (dyn Allocator)) (cx (ptr Cx)) (cp (ptr Const))] (-> (Result EvalPair
                                                                                                  Diag))
@@ -3485,23 +3807,12 @@
                          (sconcat a "const " nm))
           (Err [d] (Err [EvalPair Diag] d))
           (Ok [sp0]
-              (let [sp (primitive/alloc-stack SynPair)]
-                (set! sp sp0)
-                (when (.runtime cp)
-                  (match (load (load (field sp t)))
-                    (TRef [_ inner]
-                          (do
-                            (set! (.e sp)
-                                  (box-expr a
-                                            (mk-expr (ELoad (.e sp))
-                                                     (.lo (load (field sp e)))
-                                                     (.hi (load (field sp e)))
-                                                     (.source (load (field sp e)))
-                                                     (.ctxt (load (field sp e))))))
-                            (set! (.t sp) inner)
-                            0))
-                    (_ 0))
-                  0)
+              (let [sp (primitive/alloc-stack SynPair)
+                    value (place-as-value a sp0)]
+                ; A constructor synthesizes to the place it builds; the
+                ; constant is that place's value.
+                (set! (.e sp) (box-expr a (.e value)))
+                (set! (.t sp) (box-type a (.t value)))
                 (match (.ty cp)
                   (Some [want]
                         (let [wt (box-type a want)
@@ -8268,8 +8579,40 @@
                        (store! pi (primitive/iadd (load pi) 1)))))
            (Ok (box-al [Expr] a (load out)))))))
 
+;;; Does evaluating each of `es` neither do anything nor depend on when it is
+;;; done, so that their order cannot be observed?
+(defn all-effect-free? [(cx (ptr Cx)) (es (ptr (ArrayList Expr)))] (-> bool)
+  (block :found
+    (for [i 0 (len (load es))]
+      (unless (effect-free? cx (al-elem [Expr] es i)) (break :found false)))
+    true))
+
+(defn effect-free? [(cx (ptr Cx)) (e (ptr Expr))] (-> bool)
+  (match (.kind e)
+    (EInt [_] true)
+    (EFloat [_] true)
+    (EBool [_] true)
+    (EStr [_] true)
+    (ECStr [_] true)
+    (EFnPtrOf [_] true)
+    (EZeroed [_] true)
+    (ERecordInit [_] true)
+    (ESizeOf [_] true)
+    (EAlignOf [_] true)
+    (EOffsetOf [_ _] true)
+    (EComptime [_] true)
+    (EConstruct [_ _ args] (all-effect-free? cx args))
+    ; a variant's constructor, which checking leaves a call
+    (ECall [func _ args]
+           (and (!= (primitive/cast i64 (vts-find cx func)) 0) (all-effect-free? cx args)))
+    (ECast [_ inner] (effect-free? cx inner))
+    (_ false)))
+
 (defn named-temp-name [(a (dyn Allocator)) (lo i64) (i i64)] (-> (slice u8))
   (sconcat3 a "$named-arg." (i64->str a lo) (sconcat a "." (i64->str a i))))
+
+(defn named-temp-name? [(name (slice u8))] (-> bool)
+  (and (>= (len name) 11) (= (subslice name 0 11) "$named-arg.")))
 
 (defn named-same-order? [(decl-names (ptr (ArrayList (slice u8))))
                          (source-names (ptr (ArrayList (slice u8))))
@@ -8461,10 +8804,14 @@
                      (TStruct name)
                      (TApp name out-args))
                decl-names (field-names a fields)]
-           (if (named-same-order? decl-names
-                                  source-names
-                                  0
-                                  (len (load decl-names)))
+           ; Arguments that do nothing when evaluated may as well be evaluated in
+           ; declaration order, which leaves a constant constructor in the shape
+           ; a static's initializer is laid out from.
+           (if (or (named-same-order? decl-names
+                                      source-names
+                                      0
+                                      (len (load decl-names)))
+                   (all-effect-free? cx checked))
                (let [source
                        (struct-constructor-source a
                                                   out-ty
@@ -14755,17 +15102,23 @@
                               ; The overlay-only name list is intentionally empty
                               ; after publication and cannot classify base hits.
                               (if (.runtime ce)
-                                  (ok-ep (mk-expr (ELoad (box-expr a
-                                                                   (mk-expr (EStaticRef name)
-                                                                            elo
-                                                                            ehi
-                                                                            esrc
-                                                                            ectxt)))
-                                                  elo
-                                                  ehi
-                                                  esrc
-                                                  ectxt)
-                                         (.ty ce))
+                                  (let [static (mk-expr (EStaticRef name) elo ehi esrc ectxt)
+                                        vt (box-type a (.ty ce))]
+                                    ; A struct or array def is an immutable place,
+                                    ; as a local of that type is: indexing it,
+                                    ; reading a field or borrowing it as a slice
+                                    ; addresses the static itself. Read as a value
+                                    ; it would be copied to the stack at every use,
+                                    ; and a slice of that copy dangles once the
+                                    ; frame that holds it returns.
+                                    (if (is-place-value-type vt cx)
+                                        (ok-ep static (TRef false vt))
+                                        (ok-ep (mk-expr (ELoad (box-expr a static))
+                                                        elo
+                                                        ehi
+                                                        esrc
+                                                        ectxt)
+                                               (load vt))))
                                   (if (or (is-literal-value (field ce value))
                                           ; A function pointer is a link-time
                                           ; constant: each use is the pointer.
@@ -14920,15 +15273,15 @@
                             r))
                    (Err [d] (err-ep d))
                    (Ok [sp0]
-                       (let [sp (primitive/alloc-stack SynPair)]
-                         (set! sp sp0)
-                         (ok-ep (mk-expr (EComptime (load (field sp e)))
+                       ; A constructor synthesizes to the place it builds, but
+                       ; the compile-time result is that place's value.
+                       (let [value (place-as-value a sp0)]
+                         (ok-ep (mk-expr (EComptime (box-expr a (.e value)))
                                          elo
                                          ehi
                                          esrc
                                          ectxt)
-                                (load (load (field sp
-                                                   t))))))))
+                                (.t value))))))
       ; Type ascription `(: value type)`: check `inner` against `ty` (so a stranded type
       ; arg can be supplied and any legal coercion applies), then LOWER it away — the
       ; result is the coerced inner value at `ty`, so no EAscribe node reaches mono/codegen.

@@ -943,6 +943,37 @@ module-level binding with static storage; it can't be assigned. For a mutable
 global, `def` a `Var` made by `var-static`, then read it with `get` and write it
 with `set`.
 
+A `def`'s initializer is also computed at compile time, so a table can be built
+with calls, and a struct or array `def` is read in place: indexing it, reading a
+field or borrowing it as a slice addresses the static itself, never a copy.
+Function pointers and C strings in a `def` are filled in by the linker. A `def`
+can't read another `def`; make the value it needs a `const`.
+
+```coil
+(module example.tables)
+(defsum Op (Push [(n i64)]) (Pop))
+
+(defn twice [(x i64)] (-> i64) (* 2 x))
+
+(def PROGRAM [(Push :n 1) (Push :n 2) (Pop)])
+(def SQUARES [(twice 1) (twice 2) (twice 3)])
+
+(defn program [] (-> (slice Op)) PROGRAM)
+
+(defn main [] (-> i64)
+  (for op (program)
+    (match op (Push [n] (println "push {}" n)) (Pop [] (println "pop"))))
+  (println "{}" (get SQUARES 2))
+  0)
+```
+
+```output
+push 1
+push 2
+pop
+6
+```
+
 ## Collections and iteration
 
 | Namespace and type | Traits |
