@@ -128,6 +128,11 @@ Use this format:
   once and a 10 s build again for an array of 32 structs. Aggregates live in
   memory in codegen (`cg-mem-ty?`, `emit-into`); only the C ABI's own register
   values may appear. Local only: CI does not run it.
+- **Changing how meta output is expanded?** Run `python3 scripts/dev.py test
+  self-build-memory --compiler <candidate>`. It self-builds the compiler at -O0
+  (about 4 GB, under a minute) and fails if expanding the meta output retains
+  more than 512 MiB, which re-expanding the whole program used to cost. Local
+  only: CI does not run it.
 - **Changing expansion, resolution or checking without meaning to change meaning?**
   Build a reference compiler from the commit before your change and run
   `python3 scripts/tests/pipeline-differential.py <reference> <candidate>`. It

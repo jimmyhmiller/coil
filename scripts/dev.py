@@ -420,6 +420,10 @@ def test(args: argparse.Namespace) -> None:
         # Local only, not in CI: run it before installing a codegen change.
         execute(sys.executable, "scripts/tests/aggregate-ir-scan.py", compiler,
                 *(["--all"] if args.all_sources else []))
+    elif args.suite == "self-build-memory":
+        # Local only, not in CI: a whole -O0 compiler self-build (about 4 GB).
+        # Run it when changing how meta output is expanded.
+        execute(sys.executable, "scripts/tests/self-build-expansion-memory.py", compiler)
     elif args.suite == "const-generics":
         execute(sys.executable, "tests/compiler/const_generic_test.py", "--compiler", compiler)
     elif args.suite == "field-access":
@@ -441,6 +445,7 @@ def test(args: argparse.Namespace) -> None:
         execute(sys.executable, "tests/compiler/extern_scoping_test.py", "--compiler", compiler)
         execute(sys.executable, "tests/compiler/features/authored_gensym_source_guard.py")
         execute(sys.executable, "tests/compiler/features/tagged_form_revision_guard.py")
+        execute(sys.executable, "tests/compiler/meta_suffix_test.py", "--compiler", compiler)
         execute(compiler, "run", "tests/metaprogramming/global_reference_identity.coil")
         execute(sys.executable, "scripts/tests/source-references.py", "--compiler", compiler)
         execute(compiler, "run", "tests/compiler/features/callable_void_return.coil")
@@ -1790,7 +1795,7 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=install)
 
     command = commands.add_parser("test", help="run a test suite")
-    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "update", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd", "const-generics", "field-access", "prop", "aggregates", "safety"), nargs="?", default="all")
+    command.add_argument("suite", choices=("all", "snapshots", "cli", "generated", "runtime", "http", "update", "wasm", "meta", "meta-entries", "interpreter", "metaprogramming", "core-providers", "modernize-fast", "simd", "const-generics", "field-access", "prop", "aggregates", "safety", "self-build-memory"), nargs="?", default="all")
     command.add_argument("--compiler", default="build/bin/coil")
     command.add_argument("--verbose", action="store_true")
     command.add_argument("--all-sources", action="store_true",
