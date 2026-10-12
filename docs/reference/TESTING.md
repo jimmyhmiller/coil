@@ -33,6 +33,60 @@ assertion prints the expression and its `file:line`, then aborts. Each test
 runs in its own process, so a failure or crash in one test doesn't stop the
 others.
 
+## Testing compile errors
+
+A macro that rejects bad input, or an API that should not type-check when
+misused, is tested by compiling the bad code and checking the diagnostic.
+`assert-compile-error` from `coil.test.compile` takes the text the diagnostics
+must contain (a string, or a vector of strings that must all appear) and the
+forms that must not compile:
+
+```coil
+(module example.compile-error-test)
+(import "coil.test.compile" :use [assert-compile-error compile-errors])
+(import "coil.result" :use [none?])
+
+(deftest adding-a-string-is-rejected
+  (assert-compile-error ["argument 2 to '+'" "has type (slice u8)"]
+    (defn total [] (-> i64)
+      (+ 1 "two"))))
+
+(deftest a-macro-error-is-the-diagnostic
+  (assert-compile-error "error: give it a positive count"
+    (import "coil.primitive" :as primitive)
+    (defn repeat-count [(n Code)] (-> Code)
+      (if (> (primitive/code-int n) 0)
+          n
+          (do (primitive/report n "give it a positive count") `0)))
+    (defn bad [] (-> i64)
+      (repeat-count -1))))
+
+(deftest good-code-has-no-errors
+  (assert (none? (compile-errors (defn fine [] (-> i64)
+                                   1)))))
+```
+
+The forms are not part of the test program. They are compiled while the test
+runs by the in-process compiler (`coil.jit`, so a test file that imports
+`coil.test.compile` links the compiler), as a submission of their own. They see
+the standard library and, inside a project, the project's modules, but nothing
+of the test file around them, so they carry their own imports. A test can be a
+whole module's worth of definitions, such as a macro and its misuse. The forms
+are still part of the test file's text, so they must read: an unbalanced
+bracket or an unterminated string is an error in the test file itself.
+
+Each form keeps the line and column it has in the test file, and diagnostics
+name the test file, so `--> tests/macro_test.coil:14:31` is the place in the
+test where the error was found. An expectation is any part of the diagnostic
+text: the message, or `"macro_test.coil:14:31"` to pin the location too. Every
+located diagnostic of the compile is there, a macro's `primitive/report` as well
+as each type error.
+
+A failure prints the expectation and what the compiler said, or that the forms
+compiled. `(compile-errors FORM…)` is the same compile as a value:
+`(Some text)` with the diagnostics (malloc'd, the caller's to free) when the
+forms do not compile, `(None)` when they do.
+
 ## Running tests
 
 ```sh

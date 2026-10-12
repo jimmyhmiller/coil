@@ -136,7 +136,9 @@ backend. `jit-session-new` finds the matching toolchain through `coil` on
 | `(jit-prepare! s SOURCE)`, `(jit-prepare-with-entry! s SOURCE ENTRY)` | 0 or nonzero | Compile without publishing |
 | `(jit-commit-prepared! s)`, `(jit-abort-prepared! s)` | | Publish or discard the prepared candidate |
 | `(jit-symbol-address s NAME)` | `(ptr i8)` | Address of an `export-c` symbol; null if absent |
-| `(jit-diagnostic s)`, `(jit-pending s)`, `(jit-status s)` | | Why the last submission failed; the pending candidate |
+| `(jit-diagnostic s)`, `(jit-pending s)`, `(jit-status s)` | | Why the last submission failed (every located diagnostic of its compile); the pending candidate |
+| `(jit-session-set-quiet! s true)` | 0 | Stop also writing diagnostics to stderr; `jit-diagnostic` still has them |
+| `(jit-session-set-source-name! s NAME)` | 0 | Name submitted source `NAME` in diagnostics instead of `<jit>` |
 | `(jit-reset! s)` | 0, or -1 | Release everything and start empty; -1 while leases are held |
 | `(jit-session-free! s)` | 0, or -1 | Reset, then free the session itself and null the handle; -1 while leases are held |
 | `(jit-session-new-with-options a OPTIONS)` | `(Result JitSession JitOptionsError)` | Create a session with a chosen backend and optimization level (below) |

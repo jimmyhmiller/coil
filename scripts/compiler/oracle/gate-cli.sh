@@ -6117,6 +6117,17 @@ for suite in tests/stdlib_parsers_test.coil tests/serde_test.coil tests/serde_op
              tests/unicode_props_test.coil tests/unicode_props_conformance_test.coil; do
   expect_rc 0 "coil test $suite passes" "$COIL" test "$suite"
 done
+# Compile-error tests (coil.test.compile) compile code while they run, in a quiet JIT
+# session: a passing run shows none of the diagnostics it checked.
+compile_error_out=$("$COIL" test tests/compile_error_test.coil 2>&1); compile_error_rc=$?
+[ "$compile_error_rc" = 0 ] \
+  && ok "coil test tests/compile_error_test.coil passes" \
+  || bad "coil test tests/compile_error_test.coil passes" "$compile_error_out"
+case "$compile_error_out" in
+  *"argument 2 to"*|*"undefined function"*)
+    bad "compile-error tests do not echo the diagnostics they check" "$compile_error_out" ;;
+  *) ok "compile-error tests do not echo the diagnostics they check" ;;
+esac
 
 # eprintln writes to stderr, println to stdout, each line whole.
 printf '(module eprint)\n(defn main [] (-> i64) (eprintln "err {}" 1) (println "out {}" 2) 0)\n' > "$T/eprint.coil"
