@@ -463,6 +463,26 @@ section_cross() {
         :else `30))
 (defn main [] (-> i64) (+ (arch-code) (os-code)))
 EOF
+  # A backend that cannot lower a program says so where the program asks for it,
+  # and exits 1: the x64 backend has no 128-bit integers.
+  cat > "$T/wide.coil" <<'EOF'
+(module wide-int)
+(defn main [] (-> i64)
+  (let [big (: 18446744073709551616 i128)]
+    (cast i64 (/ big (: 4294967296 i128)))))
+EOF
+  local wide wide_rc
+  wide=$("$COIL" build "$T/wide.coil" --backend x64 --target x86_64-unknown-linux-gnu -o "$T/wide-x64" 2>&1); wide_rc=$?
+  if [ "$wide_rc" = 1 ] && grep -q 'x64 backend does not support integers wider than 64 bits' <<<"$wide" \
+     && grep -qE -- '--> .*wide.coil:3:16' <<<"$wide"; then
+    ok "the x64 backend refuses a 128-bit integer at its location, exit 1"
+  else
+    bad "the x64 backend refuses a 128-bit integer at its location, exit 1" "exit $wide_rc: $wide"
+  fi
+  # coil.safety's fault handlers fold their signal ABI for the target, so a cross
+  # build need not run anything on this machine.
+  expect_rc 0 "coil.safety checks for another target" \
+    "$COIL" check "$T/seven.coil" --use coil.safety --target x86_64-pc-linux-gnu
   local triple want
   while read -r triple want; do
     [ "$triple" = host ] && triple=
