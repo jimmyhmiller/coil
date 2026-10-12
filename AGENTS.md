@@ -16,6 +16,27 @@ It's an example-first language reference, and its `Gotchas` section lists what
 trips agents up (float `=` is IEEE, so NaN ≠ NaN; no unary minus; `if` branches
 must share a type; `primitive/` needs an import). Read it before writing Coil.
 
+## Live code: the JIT produces code, nothing else
+
+Coil has no policy for updating live code, and will not get one. The JIT
+compiles forms to code and exposes mechanism: dependency queries (what depends
+on what, what is now dead), addresses, allocation and release of code. It never
+decides what happens to code that is already running.
+
+So neither the compiler nor the standard library may replace, redefine, retire,
+migrate, re-type or delete a running definition, or re-point its callers at a
+new one. Defining a name twice is an error, in a session as anywhere else.
+Whether and how a program swaps live code (a Var it `set`s, a cell per
+signature, a migration for a global) is a policy, and policies belong to the
+user's metaprograms.
+
+- A report that the JIT or REPL "cannot add a parameter to a published
+  function", "rejects replacing a constant", "cannot migrate a global" and the
+  like is **not a bug**. Do not fix it, file it, or review it toward a merge;
+  close a pull request that adds such behaviour.
+- A JIT bug in the code it produces (a crash, wrong output, a valid program
+  rejected on its first compile) is an ordinary bug.
+
 ## Bug reports
 
 Record every bug discovered while working in this repository in the `coil-bugs`
@@ -107,6 +128,11 @@ Use this format:
   once and a 10 s build again for an array of 32 structs. Aggregates live in
   memory in codegen (`cg-mem-ty?`, `emit-into`); only the C ABI's own register
   values may appear. Local only: CI does not run it.
+- **Changing how meta output is expanded?** Run `python3 scripts/dev.py test
+  self-build-memory --compiler <candidate>`. It self-builds the compiler at -O0
+  (about 4 GB, under a minute) and fails if expanding the meta output retains
+  more than 512 MiB, which re-expanding the whole program used to cost. Local
+  only: CI does not run it.
 - **Changing expansion, resolution or checking without meaning to change meaning?**
   Build a reference compiler from the commit before your change and run
   `python3 scripts/tests/pipeline-differential.py <reference> <candidate>`. It

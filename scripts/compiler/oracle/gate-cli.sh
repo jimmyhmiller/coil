@@ -4607,7 +4607,6 @@ fi
     # installed-toolchain execution gate below. Pulling it into this aggregate
     # namespace smoke would compile the entire compiler twice in parallel.
     [ "$ns" = "coil.jit" ] && continue
-    [ "$ns" = "coil.jit.reload" ] && continue
     i=$((i + 1))
     echo "(import \"$ns\" :as ns$i)"
   done < "$T/bundle/ns.txt"
@@ -5188,9 +5187,11 @@ EOF
     *) ok "ordinary programs do not link the compiler SDK" ;;
   esac
 
-  echo "== repl: multiline, Var redefinition, persistent state, and transactions =="
+  echo "== repl: multiline, static definitions, persistent state, and transactions =="
   python3 scripts/dev.py install --source "$COIL" --dest "$T/repl-prefix/bin/coil" >/dev/null 2>&1
   REPL_COIL="$T/repl-prefix/bin/coil"
+  # The REPL has no policy for replacing live code: a definition is static, a
+  # second one is refused, and earlier callers keep what they were compiled with.
   repl_out=$(printf '%s\n' \
     '(defn next [] (-> i64)' \
     '  (let [p (primitive/alloc-static i64)' \
@@ -5204,19 +5205,12 @@ EOF
     '(defn twice [(x i64)] (-> i64) (* x 3))' \
     '(next)' \
     '(four-times 10)' \
-    '(defn twice [(x f64)] (-> f64) (* x 4.0))' \
-    '(next)' \
-    '(four-times 10)' \
     ':q' | if [ "$HOST_OS" = Darwin ]; then PATH="$T/no-cc:$PATH" "$REPL_COIL" repl 2>&1; else "$REPL_COIL" repl 2>&1; fi)
   case "$repl_out" in
-    *'coil> 1'*'coil> 40'*'coil> 2'*'coil> 90'*'coil> 3'*'coil> 90'*) ok "repl preserves state and updates previously compiled callers" ;;
-    *) bad "repl preserves state and updates previously compiled callers" "$repl_out" ;;
+    *'coil> 1'*'coil> 40'*"static definition 'replsession.twice' already exists"*'coil> 2'*'coil> 40'*) ok "repl preserves state and refuses a redefinition" ;;
+    *) bad "repl preserves state and refuses a redefinition" "$repl_out" ;;
   esac
-  case "$repl_out" in
-    *"conflicting types for parameter 'T'"*) ok "repl reports the incompatible redefinition" ;;
-    *) bad "repl reports the incompatible redefinition" "$repl_out" ;;
-  esac
-  # An impl submitted again replaces the accepted one, as a function does.
+  # An impl submitted again is a duplicate, exactly as a function is.
   impl_out=$(printf '%s\n' \
     '(deftrait Hittable [Self] (hit [(self (ptr Self))] (-> i64)))' \
     '(defstruct Dummy [(id i32)])' \
@@ -5226,42 +5220,33 @@ EOF
     '(hit (cast (ptr Dummy) 0))' \
     ':q' | if [ "$HOST_OS" = Darwin ]; then PATH="$T/no-cc:$PATH" "$REPL_COIL" repl 2>&1; else "$REPL_COIL" repl 2>&1; fi)
   case "$impl_out" in
-    *"duplicate impl"*) bad "repl replaces an impl submitted again" "$impl_out" ;;
-    *'coil> 1'*'coil> 2'*) ok "repl replaces an impl submitted again" ;;
-    *) bad "repl replaces an impl submitted again" "$impl_out" ;;
+    *'coil> 1'*"duplicate impl"*'coil> 1'*) ok "repl refuses an impl submitted again" ;;
+    *) bad "repl refuses an impl submitted again" "$impl_out" ;;
   esac
 
-  # A REPL defn is published as a Var def, not a function; its :params carry the
-  # names, so named calls order their arguments exactly as for a function.
+  # Named calls order their arguments exactly as for a function in a file.
   repl_named_out=$(printf '%s\n' \
     '(defn sub [(a i64) (b i64)] (-> i64) (- a b))' \
     '(sub :a 10 :b 3)' \
     '(sub :b 3 :a 10)' \
-    '(defn sub [(a i64) (b i64)] (-> i64) (+ a b))' \
-    '(sub :b 3 :a 10)' \
     '(sub :c 1 :a 2)' \
     '(sub 1 2 3)' \
-    '(defn sub [(x i64) (y i64)] (-> i64) (- x y))' \
-    '(sub :b 3 :a 10)' \
     ':q' | "$REPL_COIL" repl 2>&1)
   case "$repl_named_out" in
-    *'coil> 7'*'coil> 7'*'coil> 13'*"has no parameter :c"*"expects 2 argument(s), got 3"*"different parameter names"*'coil> 13'*) ok "repl named calls reach Var-published functions" ;;
-    *) bad "repl named calls reach Var-published functions" "$repl_named_out" ;;
+    *'coil> 7'*'coil> 7'*"has no parameter :c"*"expects 2 args, got 3"*) ok "repl named calls order arguments" ;;
+    *) bad "repl named calls order arguments" "$repl_named_out" ;;
   esac
-  # A function pointer to a REPL function goes through its Var, so one taken
-  # before a redefinition reaches the new body; an anonymous `fn` in a REPL
+  # fnptr-of takes a REPL function's address; an anonymous `fn` in a REPL
   # expression works like anywhere else.
   repl_fnptr_out=$(printf '%s\n' \
     '(defn double [(x i64)] (-> i64) (* x 2))' \
     '(defn app [(f (fnptr c [i64] i64)) (x i64)] (-> i64) (f x))' \
     '(app (fnptr-of double) 21)' \
-    '(defn double [(x i64)] (-> i64) (* x 3))' \
-    '(app (primitive/fnptr-of double) 21)' \
     '(fold (fn [a b] (+ a b)) 0 (range 0 4))' \
     ':q' | "$REPL_COIL" repl 2>&1)
   case "$repl_fnptr_out" in
-    *'coil> 42'*'coil> 63'*'coil> 6'*) ok "repl fnptr-of reaches the current definition; anonymous fn works in an expression" ;;
-    *) bad "repl fnptr-of reaches the current definition; anonymous fn works in an expression" "$repl_fnptr_out" ;;
+    *'coil> 42'*'coil> 6'*) ok "repl fnptr-of takes a function's address; anonymous fn works in an expression" ;;
+    *) bad "repl fnptr-of takes a function's address; anonymous fn works in an expression" "$repl_fnptr_out" ;;
   esac
 
   repl_bound_out=$(printf '%s\n' \

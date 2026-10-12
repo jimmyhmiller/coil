@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bound frontend memory across repeated retained JIT replacements."""
+"""Bound frontend memory across repeated retained JIT submissions."""
 
 import argparse
 from collections import Counter
@@ -55,7 +55,7 @@ def source_for_replacements(count: int) -> str:
     return '\n'.join(lines) + '\n'
 
 
-def source_for_accepted(count: int, replace: bool, reader: bool = False) -> str:
+def source_for_accepted(count: int, reader: bool = False) -> str:
     lines = [
         '(module compiler.tests.jit-accepted-memory)',
         '(import "coil.alloc" :use [malloc-allocator])',
@@ -66,21 +66,14 @@ def source_for_accepted(count: int, replace: bool, reader: bool = False) -> str:
     if reader:
         lines.append('(when (!= (jit/jit-session-set-source-provider! (mut session) '
                      '"retained.memory-reader" "read-source" "" "") 0) (return-from :probe 6))')
-    if replace:
-        seed = '(import "coil.repl") (defn value [] (-> i64) 42)'
-        entry = '(coil.repl/publish)'
-    else:
-        seed = '(defn base [] (-> i64) 42)'
-        entry = '0'
     def submit(form: str, body: str, failure: int) -> None:
         lines.append('(when (!= (jit/jit-compile-with-entry! (mut session) '
                      + json.dumps(form) + ' ' + json.dumps(body) + ') 0) '
                      + f'(return-from :probe {failure}))')
-    submit(seed, entry, 1)
+    submit('(defn base [] (-> i64) 42)', '0', 1)
     for i in range(count):
-        submit('(defn value [] (-> i64) 42)' if replace else
-               f'(defn f{i} [] (-> i64) (base))', entry, 2)
-    submit('', '(if (= (' + ('value' if replace else f'f{count-1}') + ') 42) 0 99)', 3)
+        submit(f'(defn f{i} [] (-> i64) (base))', '0', 2)
+    submit('', f'(if (= (f{count-1}) 42) 0 99)', 3)
     lines += ['(when (!= (jit/jit-reset! (mut session)) 0) (return-from :probe 4))',
               '(when (!= (jit/jit-generation-count (mut session)) 0) (return-from :probe 5))',
               '0)))']
@@ -187,7 +180,7 @@ def main() -> None:
         # cached macro image hides recompilation of the accepted helper closure.
         cold_source = directory / 'cold.coil'
         cold_executable = directory / 'cold'
-        cold_source.write_text(source_for_accepted(3, False))
+        cold_source.write_text(source_for_accepted(3))
         run(compiler, 'build', str(cold_source), '-o', str(cold_executable), *unit_flags)
         cold = run(str(cold_executable), env=dict(environment, COIL_META_CACHE='0'))
         submissions = []
@@ -218,11 +211,11 @@ def main() -> None:
                             '(defn read-source [(context Code)] (-> Code)\n'
                             ' (p/code-read (p/code-str (p/code-nth context 2)) context))\n')
         environment['COIL_NAMESPACE_ROOTS'] = str(directory)
-        for replacement, reader in ((False, False), (True, False), (True, True)):
-            name = 'reader-replace' if reader else ('replace' if replacement else 'accepted')
+        for reader in (False, True):
+            name = 'accepted-with-reader' if reader else 'accepted'
             accepted = directory / (name + '.coil')
             executable = directory / name
-            accepted.write_text(source_for_accepted(count, replacement, reader))
+            accepted.write_text(source_for_accepted(count, reader))
             run(compiler, 'build', str(accepted), '-o', str(executable), *unit_flags)
             timed = run('/usr/bin/time', '-l' if sys.platform == 'darwin' else '-v',
                         str(executable), env=environment)
@@ -235,23 +228,10 @@ def main() -> None:
             body_live = bodies[10:-1]
             steady = retained[10:-1]
             live = payload[10:-1]
-            if replacement:
-                # Each republication moves the Var's versioned metadata root
-                # (coil.repl). Root bookkeeping alternates by a couple of bytes
-                # between submissions, exactly as in the schema-roots scenario
-                # below, so this holds it to the same bound: retaining a
-                # historical definition would add hundreds of bytes per submission.
-                assert max(live) - min(live) <= 64, (
-                    'identical replacement retained historical metadata', live)
-                # Address-order packing can change alignment gaps by a few bytes.
-                assert max(steady) - min(steady) <= 64, ('snapshot padding grew', steady)
-                assert max(body_live) - min(body_live) <= 64, (
-                    'identical replacement retained historical body blocks', body_live)
-            else:
-                assert steady[-1] - steady[0] < 4096 * len(steady), (
-                    'trivial definitions retained more than their metadata', steady)
-                assert body_live[-1] - body_live[0] < 4096 * len(body_live), (
-                    'trivial definitions retained more than their body storage', body_live)
+            assert steady[-1] - steady[0] < 4096 * len(steady), (
+                'trivial definitions retained more than their metadata', steady)
+            assert body_live[-1] - body_live[0] < 4096 * len(body_live), (
+                'trivial definitions retained more than their body storage', body_live)
             peak = peak_rss(timed.stderr)
             assert peak < 512 * 1024 * 1024, 'accepted compilation scratch accumulated'
             print(json.dumps({'scenario': name, 'submissions': count,
