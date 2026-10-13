@@ -19,9 +19,10 @@ name  = "hello"
 entry = "src/main.coil"
 ```
 
-`entry` defaults to `src/main.coil`. `main` returns an `i64`, which becomes the
-process exit code. `coil new` also writes a `.gitignore` covering `/build`
-(outputs) and `/.coil` (caches).
+`entry` is a file path, relative to `Coil.toml`, and defaults to `src/main.coil`;
+every command refuses one that names no file, a module name included. `main`
+returns an `i64`, which becomes the process exit code. `coil new` also writes a
+`.gitignore` covering `/build` (outputs) and `/.coil` (caches).
 
 ## Commands
 
