@@ -169,6 +169,22 @@ expect 0 "consumer" "a consumer compiles against the unit's interface"
 run "$W" ./consumer
 expect 0 "" "the consumer links the unit; state, generic statics, aggregates and impls behave"
 
+echo "== a flat package"
+# No src/ or tests/: the package directory is the source root, so project-wide
+# commands reach a module beside the entry, not only the entry itself.
+FLAT="$W/flat"
+mkdir -p "$FLAT"
+printf '[package]\nname = "flat"\nentry = "main.coil"\n' > "$FLAT/Coil.toml"
+printf '(module flat.main)\n(import "flat.util" :use [twice])\n(defn main [] (-> i64) (println "{}" (twice 21)) 0)\n' > "$FLAT/main.coil"
+printf '(module flat.util)\n(import "coil.args" :use [args-count])\n(defn twice [(x i64)] (-> i64) (+ (* x 2) (* 0 (args-count))))\n' > "$FLAT/util.coil"
+run "$FLAT" "$COIL" lint --fix
+case "$(cat "$FLAT/util.coil")" in
+  *args-count*) bad "lint --fix in a flat package migrates a module beside the entry" "$OUT $(cat "$FLAT/util.coil")" ;;
+  *) ok "lint --fix in a flat package migrates a module beside the entry" ;;
+esac
+run "$FLAT" "$COIL" run
+expect 0 "42" "the migrated flat package runs"
+
 echo "== workspace"
 WS="$W/workspace"
 run "$WS" "$COIL" check
