@@ -738,7 +738,7 @@ it returns for its body to decide.
 
 (impl Display Vec2
   (display-fmt [(v Vec2) (f (ptr Formatter))] (-> i64)
-    (fmt (formatter-writer f) "<{}, {}>" (.x v) (.y v))
+    (fmt (writer f) "<{}, {}>" (.x v) (.y v))
     0))
 
 (deftrait Area [Self]
@@ -880,7 +880,7 @@ true
 ; every Shape displays as its area; integers keep their own Display
 (impl [(T Shape)] Display T
   (display-fmt [(s T) (f (ptr Formatter))] (-> i64)
-    (fmt (formatter-writer f) "area {}" (area s))
+    (fmt (writer f) "area {}" (area s))
     0))
 
 (defn main [] (-> i64)

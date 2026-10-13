@@ -389,7 +389,8 @@ open(sys.argv[1], "w").write(
   # :use list, an alias, :use * with :rename, type arguments a method drops, a
   # constructor that needs its type imported, a binding that would capture the new
   # name, lines aligned with a call's arguments, a renamed function whose new name
-  # the file already calls, written qualified), and the program runs.
+  # the file already calls, written qualified, a name core provided with no import,
+  # a name reached through a module that re-exports its own), and the program runs.
   mkdir -p "$T/renamed/src"
   printf '[package]\nname = "renamed"\nentry = "src/main.coil"\n' > "$T/renamed/Coil.toml"
   cat > "$T/renamed/src/main.coil" <<'EOF'
@@ -398,6 +399,7 @@ open(sys.argv[1], "w").write(
 (import "coil.hashmap" :use [hm-new-scalar hm-put! hm-get hm-len hm-for hm-free!])
 (import "renamed.tally" :as tally)
 (import "renamed.size" :use [size])
+(import "renamed.show" :use [show])
 (import "coil.args" :use [args-count])
 
 (defn main [] (-> i64)
@@ -410,6 +412,7 @@ open(sys.argv[1], "w").write(
     (let [len (hm-len m)]
       (hm-for [k v m] (when (= k 9) (println "{} {} {} {} {}" (- (hm-len m) len) v (tally/total (mut m)) (size m) (+ (args-count) (count (range 0 3)))))))
     (hm-free! (mut m))
+    (show 4 2)
     0))
 EOF
   cat > "$T/renamed/src/tally.coil" <<'EOF'
@@ -433,6 +436,24 @@ EOF
 
 (defn size [(m (HashMap i64 i64))] (-> i64) (+ (hm-len m) (capacity m)))
 EOF
+  cat > "$T/renamed/src/show.coil" <<'EOF'
+(module renamed.show)
+(import "coil.debug" :as debug)
+(import "coil.io" :use [stdout])
+
+(defstruct Pair [(a i64) (b i64)])
+
+(impl Display Pair
+  (display-fmt [(p Pair) (f (ptr Formatter))] (-> i64)
+    (formatter-disarm! f)
+    (fmt (formatter-writer f) "{}/{}\n" (.a p) (.b p))
+    0))
+
+(defn show [(a i64) (b i64)] (-> i64)
+  (let [(mut f) (zeroed Formatter)]
+    (debug/formatter-init (mut f) (stdout))
+    (display-fmt (Pair :a a :b b) (mut f))))
+EOF
   expect_rc_out 1 "removed library names.*coil lint --fix" \
     "building a project that uses removed library names points at lint --fix" \
     sh -c "cd '$T/renamed' && '$COIL' build -o '$T/renamed-bin' </dev/null"
@@ -449,6 +470,7 @@ EOF
 (import "coil.hashmap" :use [for-entries HashMap])
 (import "renamed.tally" :as tally)
 (import "renamed.size" :use [size])
+(import "renamed.show" :use [show])
 (import "coil.args")
 
 (defn main [] (-> i64)
@@ -461,6 +483,7 @@ EOF
     (let [len (len m)]
       (for-entries [k v m] (when (= k 9) (println "{} {} {} {} {}" (- (Len::len m) len) v (tally/total (mut m)) (size m) (+ (coil.args/count) (count (range 0 3)))))))
     (free! (mut m))
+    (show 4 2)
     0))
 EOF
   cat > "$T/renamed-tally.want" <<'EOF'
@@ -484,14 +507,33 @@ EOF
 
 (defn size [(m (HashMap i64 i64))] (-> i64) (+ (len m) (cap m)))
 EOF
+  cat > "$T/renamed-show.want" <<'EOF'
+(module renamed.show)
+(import "coil.debug" :as debug)
+(import "coil.io" :use [stdout])
+
+(defstruct Pair [(a i64) (b i64)])
+
+(impl Display Pair
+  (display-fmt [(p Pair) (f (ptr Formatter))] (-> i64)
+    (disarm! f)
+    (fmt (writer f) "{}/{}\n" (.a p) (.b p))
+    0))
+
+(defn show [(a i64) (b i64)] (-> i64)
+  (let [(mut f) (zeroed Formatter)]
+    (debug/Formatter::init (mut f) (stdout))
+    (display-fmt (Pair :a a :b b) (mut f))))
+EOF
   local f migrated=1
-  for f in main tally size; do
+  for f in main tally size show; do
     cmp -s "$T/renamed-$f.want" "$T/renamed/src/$f.coil" \
       || { migrated=0; bad "lint --fix migrates removed library names in $f.coil" \
              "exit $rc: $(diff -u "$T/renamed-$f.want" "$T/renamed/src/$f.coil" | head -40) $(head -c 600 "$T/renamed.log")"; }
   done
   [ "$rc" = 0 ] && [ "$migrated" = 1 ] && ok "lint --fix migrates removed library names in every spelling"
   expect_out "^0 9 39 22 3$" "the migrated project runs" sh -c "cd '$T/renamed' && '$COIL' run"
+  expect_out "^4/2$" "the migrated project formats through its Display impl" sh -c "cd '$T/renamed' && '$COIL' run"
   (cd "$T/renamed" && "$COIL" lint --fix >/dev/null 2>&1); rc=$?
   cmp -s "$T/renamed-main.want" "$T/renamed/src/main.coil" && cmp -s "$T/renamed-tally.want" "$T/renamed/src/tally.coil" \
     && [ "$rc" = 0 ] && ok "lint --fix leaves migrated code alone" \
