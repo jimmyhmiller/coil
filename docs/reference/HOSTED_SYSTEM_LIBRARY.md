@@ -99,10 +99,13 @@ errno is captured immediately and remains authoritative.
 ## `coil.time`
 
 `Duration`, `Instant`, and `SystemTime` prevent mixing relative durations, monotonic
-deadlines, and adjustable wall time. Constructors accept seconds, milliseconds,
-microseconds, or nanoseconds and normalize to seconds plus `0 <= nsec < 1e9`.
+deadlines, and adjustable wall time. `Duration::seconds`, `Duration::millis`,
+`Duration::micros` and `Duration::nanos` construct one, and `(Duration::new sec nsec)`
+normalizes to seconds plus `0 <= nsec < 1e9`.
 
-Use `monotonic-now` and `deadline-after` for timeouts. `wall-now` is for timestamps.
+Use `monotonic-now` and `(Instant::from-now duration)` for timeouts; `(remaining
+deadline)` is what is left of one, and `(add instant duration)` moves an instant.
+`wall-now` is for timestamps. A `TimeError`'s `(code e)` is an errno-like number.
 `sleep` uses `nanosleep` and resumes the reported remainder after `EINTR`;
 `sleep-until` uses a monotonic deadline. The older `wall-now-ms` and
 `monotonic-now-ms` remain convenient compatibility functions.
