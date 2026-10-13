@@ -10,8 +10,13 @@ way and compares stdout and the exit status with tests/corpus/reference/:
 
 tests/corpus/corpus.txt lists the programs. After the file name come options:
 `safety` and `meta-interp` put a program in those lanes (`--all` runs every
-program there), `interp-refused=TEXT` and `x64-refused=TEXT` say that lane must
-refuse it (by design) with a diagnostic containing TEXT, `safety-fails=TEXT` records a known compiler bug that
+program there), `interp-refused=TEXT`, `x64-refused=TEXT` and
+`meta-interp-refused=TEXT` say that lane must refuse it (by design) with a
+diagnostic containing TEXT. The meta-interp lane always runs the programs it must
+refuse, even under --only: only the interpreted engine refuses them, so that
+refusal is what proves COIL_META_INTERP=1 selected it rather than the native
+engine, which runs every program and would pass the lane while testing nothing.
+`safety-fails=TEXT` records a known compiler bug that
 makes its coil.safety build fail with TEXT (the lane checks the failure is still
 that one, so fixing the bug turns it red until the marker goes), and everything
 after `--` is the program's argv.
@@ -75,7 +80,7 @@ def read_corpus() -> list[Program]:
                 program.safety = True
             elif option == "meta-interp":
                 program.meta_interp = True
-            elif option.startswith(("interp-refused=", "x64-refused=")):
+            elif option.startswith(("interp-refused=", "x64-refused=", "meta-interp-refused=")):
                 lane, text = option.split("=", 1)
                 program.refused[lane.removesuffix("-refused")] = text
             elif option.startswith("safety-fails="):
@@ -150,12 +155,16 @@ def run_program(compiler: str, program: Program, lane: str, scratch: Path) -> tu
 
 def corpus(compiler: str, lane: str, everything: bool, only: list[str] | None) -> int:
     programs = read_corpus()
+    proofs = [p for p in programs if lane in p.refused] if lane == "meta-interp" else []
+    if lane == "meta-interp" and not proofs:
+        raise SystemExit("corpus.txt: the meta-interp lane needs a program marked meta-interp-refused=, "
+                         "or nothing shows that COIL_META_INTERP=1 ran the interpreter")
     if only:
-        programs = [p for p in programs if p.stem in only]
+        programs = [p for p in programs if p.stem in only or p in proofs]
     if lane == "safety" and not everything:
         programs = [p for p in programs if p.safety]
     if lane == "meta-interp" and not everything:
-        programs = [p for p in programs if p.meta_interp]
+        programs = [p for p in programs if p.meta_interp or p in proofs]
     failures = 0
     with tempfile.TemporaryDirectory(prefix="coil-corpus-", dir=os.environ.get("COIL_TEST_SCRATCH")) as raw:
         scratch = Path(raw)

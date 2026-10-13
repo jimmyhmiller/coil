@@ -76,7 +76,7 @@ toolchain), and `$COIL_TEST_SCRATCH`, a directory the harness removes afterwards
 | Steps | What they run | Where |
 |---|---|---|
 | `examples/*` | the ten example packages: build, run six on their data, `coil test` each, arm64 tests for two, huffman under `coil.safety`, `fmt --check` | `scripts/tests/fast/examples.py`, `examples/` |
-| `corpus/*` | eight self-checking programs on arm64, LLVM and the interpreter, two under `coil.safety`, one with the interpreted metaprogram engine | `scripts/oracle.py corpus`, `tests/corpus/` |
+| `corpus/*` | eight self-checking programs on arm64, LLVM and the interpreter, two under `coil.safety`, three with the interpreted metaprogram engine | `scripts/oracle.py corpus`, `tests/corpus/` |
 | `diag/*` | compile errors (many per file), link errors, compiles that must stop and say so, byte-exact | `scripts/oracle.py diag`, `tests/diag/` |
 | `cli/*` | the command-line contract, one step per area | `scripts/tests/fast/cli.sh`, `tests/cli/` |
 | `projects` | one package using every `Coil.toml` feature, a workspace, a hermetic profile, prebuilt units | `scripts/tests/fast/projects.sh`, `tests/projects/` |
@@ -106,7 +106,10 @@ python3 scripts/oracle.py corpus bless --compiler <coil> [--only types_traits]
 `bless` writes a reference from the LLVM build only after checking that the
 arm64 build agrees with it. The lanes are `arm64`, `llvm`, `x64`, `interp`,
 `safety`, `meta-interp` and `opt3`; `--all` puts every program in the `safety`
-and `meta-interp` lanes. The LLVM-free and x64 bootstraps run the corpus on
+and `meta-interp` lanes. The `meta-interp` lane always includes the programs
+marked `meta-interp-refused=`: only the interpreted engine refuses them, so the
+refusal proves `COIL_META_INTERP=1` selected it and the lane is not silently
+running the native engine. The LLVM-free and x64 bootstraps run the corpus on
 their own backend.
 
 ### Diagnostics
