@@ -72,7 +72,7 @@ all or one bulk reset.
 
 ## The catch that had to be handled first — DONE
 
-`ar-resize` used to return `(None)` unconditionally. Look at what `al-reserve!` does with
+`ar-resize` used to return `(None)` unconditionally. Look at what an ArrayList's `reserve!` does with
 that (`src/stdlib/arraylist.coil`): it falls back to typed `alloc` + element-by-element copy, and
 **never frees the old block on an arena** (`ar-free` is a no-op). So an `ArrayList` that
 grew by doubling on an arena consumed `4 + 8 + 16 + … + n ≈ 2n` and stranded all of it.
@@ -102,17 +102,17 @@ choice rather than a workaround.
 
 ## Exhaustion is diagnosable — DONE
 
-`arena-allocate` returns `(None)` when full, typed `alloc` propagates it, and `al-reserve!`
+`arena-allocate` returns `(None)` when full, typed `alloc` propagates it, and `reserve!`
 finished with `(oom)` — which was `(defn oom [] (abort) 0)`, a **silent** `abort()`. A
 compiler that ran out of arena died with exit 134 and no message.
 
 `oom` now reports before aborting, through `oom-at (site, bytes)`:
 
 ```
-out of memory: arraylist al-reserve! failed to allocate 2048 bytes; the allocator is exhausted
+out of memory: arraylist reserve! failed to allocate 2048 bytes; the allocator is exhausted
 ```
 
-The three call sites (`al-reserve!`, `HashMap`'s `grow!`, `str-key-copy`) each name themselves and
+The three call sites (`ArrayList`'s `reserve!`, `HashMap`'s `grow!`, `str-key-copy`) each name themselves and
 pass the request size. `oom` with no site or size is still there for callers that have
 neither, but nothing in the tree uses it. Printing goes through a local `write(2)` and a
 hand-rolled decimal formatter rather than `io.coil`, so the reporting path adds no module
@@ -123,7 +123,7 @@ wall time — see [What it cost](#what-it-cost).
 
 The bug that motivated this — a silent exit-134 wasm64 build — turned out not to
 reproduce, and the allocation hypothesis behind it was disproved rather than confirmed:
-the compiler has no arena anywhere, so `al-reserve!` never leaves its `realloc` path. The
+the compiler has no arena anywhere, so `reserve!` never leaves its `realloc` path. The
 investigation is recorded in [wasm64-reserve-abort.md](../archive/wasm64-reserve-abort.md), and the
 `read-file` defect it was blocking is fixed.
 
@@ -172,7 +172,7 @@ A bulk-append primitive landed alongside step 2 because `loader.read-file` neede
 [wasm64-reserve-abort.md](../archive/wasm64-reserve-abort.md)):
 
 ```text
-(defn al-extend! [T] [(l (mut (ArrayList T))) (src (ptr T)) (n i64)] (-> i64)
+(extend! [(l (mut (ArrayList T))) (src (ptr T)) (n i64)] (-> i64)   ; a method of (ArrayList T)
 ```
 
 It reserves the whole run up front and `mem-copy`s it, instead of a call plus a capacity
@@ -258,7 +258,7 @@ means threading it through the whole resolver, which is step 5's job and not a l
 conversion. They are also process-lifetime by construction, which is the category this
 document already carved out as legitimately malloc. Left alone deliberately, not missed.
 
-(Both `-reset` functions overwrite their list with a fresh `al-new`, leaking the previous
+(Both `-reset` functions overwrite their list with a fresh `ArrayList::new`, leaking the previous
 backing buffer. Harmless today — reset runs once per compile and the process exits — and
 noted here because an arena would make it free.)
 
@@ -376,7 +376,7 @@ Binary size, which is a real cost and the only one:
 | | binary | vs HEAD |
 | --- | --- | --- |
 | HEAD (`77a5d8032`) | 2,004,864 B | |
-| + `ar-resize`, `al-extend!`, `read-file` | 2,031,440 B | +26.6 KB |
+| + `ar-resize`, `extend!`, `read-file` | 2,031,440 B | +26.6 KB |
 | + the `oom` message | 2,054,176 B | **+49.3 KB (+2.5%)** |
 
 The `oom` message adds ~23 KB to every program that imports `alloc.coil`, which is every
@@ -425,7 +425,7 @@ Corrected, `build src/compiler/main.coil -o /dev/null`, 15 paired runs each, inp
 | | median | paired vs previous | peak RSS |
 | --- | --- | --- | --- |
 | HEAD (`77a5d8032`), malloc root | 0.590s | — | 1045 MiB |
-| + `oom`, `ar-resize`, `al-extend!`, `read-file` | 0.570s | **-20 ms** (slower in 2/15) | 1044 MiB |
+| + `oom`, `ar-resize`, `extend!`, `read-file` | 0.570s | **-20 ms** (slower in 2/15) | 1044 MiB |
 | + arena root, `reader.coil` (this change) | 0.540s | **-30 ms** (faster in 12/15) | 1021 MiB |
 
 Cumulative against HEAD: **-40 ms median, -56 ms mean, faster in 11 of 15 pairs**, and

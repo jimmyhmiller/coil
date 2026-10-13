@@ -272,7 +272,7 @@ indentation."
 (module scope)
 (import \"coil.primitive\" :as primitive)
 (import \"coil.str\" :use *)
-(import \"coil.arraylist\" :use [al-new al-push!])
+(import \"coil.hashmap\" :use [HashMap for-entries])
 (import \"coil.slice\" :use * :exclude [slice-get])
 (import \"coil.io\" :as io :use * :rename [[write io-write] [read io-read]])
 "
@@ -284,9 +284,9 @@ indentation."
       (let ((str (cl-find "coil.str" imports :key #'coil-import-namespace
                           :test #'equal)))
         (should (eq (coil-import-use str) t)))
-      (let ((al (cl-find "coil.arraylist" imports :key #'coil-import-namespace
+      (let ((hm (cl-find "coil.hashmap" imports :key #'coil-import-namespace
                          :test #'equal)))
-        (should (equal (coil-import-use al) '("al-new" "al-push!"))))
+        (should (equal (coil-import-use hm) '("HashMap" "for-entries"))))
       (let ((slice (cl-find "coil.slice" imports :key #'coil-import-namespace
                             :test #'equal)))
         (should (equal (coil-import-exclude slice) '("slice-get"))))
@@ -309,7 +309,7 @@ indentation."
   (coil-test-with-buffer "\
 (module scope)
 (import \"coil.str\" :use *)
-(import \"coil.arraylist\" :use [al-new])
+(import \"coil.hashmap\" :use [HashMap])
 (import \"coil.slice\" :use * :exclude [slice-get])
 (import \"coil.primitive\" :as primitive)
 
@@ -317,8 +317,8 @@ indentation."
 "
     (let ((scope (coil-buffer-scope)))
       (should (assoc "str-concat" scope))       ; :use *
-      (should (assoc "al-new" scope))           ; named in :use
-      (should-not (assoc "al-elem" scope))      ; not named
+      (should (assoc "HashMap" scope))          ; named in :use
+      (should-not (assoc "for-entries" scope))  ; not named
       (should-not (assoc "slice-get" scope))    ; excluded
       (should (assoc "primitive/cast" scope))   ; alias-qualified
       (should (assoc "Point" scope))            ; defined here

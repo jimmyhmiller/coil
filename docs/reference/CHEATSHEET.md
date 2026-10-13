@@ -23,7 +23,7 @@ coil namespace coil.arraylist      # a library module's API
 ```coil
 (module example.cheatsheet)
 (import "coil.alloc" :use [malloc-allocator])
-(import "coil.arraylist" :use [al-new al-free!])
+(import "coil.arraylist" :use [ArrayList])
 
 (defstruct Point [(x i64) (y i64)])
 
@@ -40,13 +40,13 @@ coil namespace coil.arraylist      # a library module's API
 
 (defn main [] (-> i64)
   (let [(mut p) (Point :x 3 :y 4)
-        (mut xs) (al-new [i64] (malloc-allocator))]
+        (mut xs) (ArrayList::new [i64] (malloc-allocator))]
     (shift! (mut p) 1)
     (push! (mut xs) (area (Circle 1)))
     (push! (mut xs) (area (Square 2)))
     (for a xs (println "area {}" a))
     (println "norm2 {}" (norm2 p))
-    (al-free! (mut xs))
+    (free! (mut xs))
     0))
 ```
 

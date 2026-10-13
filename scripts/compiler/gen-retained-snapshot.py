@@ -346,7 +346,7 @@ def body(t):
             if key in ZERO_FIELDS:
                 fields+=[':'+name, '(p/zeroed '+render(field)+')'];continue
             if key in EMPTY_LISTS:
-                fields+=[':'+name, '(al-new ['+render(field[1])+'] (.destination g))'];continue
+                fields+=[':'+name, '(ArrayList::new ['+render(field[1])+'] (.destination g))'];continue
             if key in EMPTY_MAPS:
                 ops='(.ops '+expr+')'
                 walks.append(call('walk',('ptr','coil.hashmap.KeyOps'),ops))

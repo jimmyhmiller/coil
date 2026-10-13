@@ -28,7 +28,7 @@ Other references:
 ```coil
 (module example.tour)
 (import "coil.alloc" :use [malloc-allocator])
-(import "coil.arraylist" :use [al-new al-free!])
+(import "coil.arraylist" :use [ArrayList])
 
 (defstruct Point [(x i64) (y i64)])
 (derive Debug Point)
@@ -49,12 +49,12 @@ Other references:
 
 (defn main [] (-> i64)
   (let [p (Point :x 3 :y -4)
-        (mut areas) (al-new [i64] (malloc-allocator))]
+        (mut areas) (ArrayList::new [i64] (malloc-allocator))]
     (push! (mut areas) (area (Circle 2)))
     (push! (mut areas) (area (Rect :width 2 :height 5)))
     (println "{:?} is {} blocks away" p (manhattan p))
     (for a areas (println "area {}" a))
-    (al-free! (mut areas))
+    (free! (mut areas))
     0))
 ```
 
@@ -1008,7 +1008,7 @@ Coil has no garbage collector and no ambient heap. Storage is one of three kinds
 ```coil
 (module example.memory)
 (import "coil.alloc" :as alloc :use [malloc-allocator arena-allocator])
-(import "coil.arraylist" :use [ArrayList al-new al-free!])
+(import "coil.arraylist" :use [ArrayList])
 
 (defstruct Node [(value i64) (next (ptr Node))])
 
@@ -1020,15 +1020,15 @@ Coil has no garbage collector and no ambient heap. Storage is one of three kinds
 
   ; An arena frees everything at once when it is released.
   (let [scratch (arena-allocator 4096)
-        (mut xs) (al-new [i64] scratch)]
+        (mut xs) (ArrayList::new [i64] scratch)]
     (push! (mut xs) 1)
     (push! (mut xs) 2)
     (println "{} items" (len xs)))
 
-  (let [(mut ys) (al-new [i64] (malloc-allocator))]
+  (let [(mut ys) (ArrayList::new [i64] (malloc-allocator))]
     (push! (mut ys) 3)
     (println "{:?}" (pop! (mut ys)))
-    (al-free! (mut ys)))
+    (free! (mut ys)))
   0)
 ```
 
@@ -1187,7 +1187,7 @@ pop
 ```coil
 (module example.collections)
 (import "coil.alloc" :use [malloc-allocator])
-(import "coil.arraylist" :use [ArrayList al-free!])
+(import "coil.arraylist" :use [ArrayList])
 (import "coil.hashmap" :use [HashMap])
 (import "coil.collect" :use [collect])
 (import "coil.iter" :use [Indexed])
@@ -1213,7 +1213,7 @@ pop
       (Some [age] (println "7 -> {}" age))
       (None [] (println "missing")))
 
-    (al-free! (mut xs))
+    (free! (mut xs))
     (free! (mut ages))
     0))
 ```
@@ -1237,9 +1237,11 @@ evens=3 total=10
   it can be a struct field. `push!` onto a full one aborts in every build.
 - `HashMap` keys that are strings need key operations: `(str-keyops)` copies keys
   into the map, while `(str-keyops-borrowed)` borrows them.
-- Release an `ArrayList` from a general-purpose allocator with
-  `(al-free! (mut xs))`. A map's own operations are methods: `(contains? m k)`,
-  `(remove! (mut m) k)`, `(clear! (mut m))` and `(free! (mut m))`.
+- A collection's own operations are methods. A list has `(cap xs)`,
+  `(elem xs i)` (a pointer to the live element), `(reserve! (mut xs) n)`,
+  `(extend! (mut xs) p n)`, `(slice xs)`, `(into-slice (mut xs))`, `(clear! (mut xs))`
+  and `(free! (mut xs))`, which releases one from a general-purpose allocator. A map
+  has `(contains? m k)`, `(remove! (mut m) k)`, `(clear! (mut m))` and `(free! (mut m))`.
 
 ## Text and output
 
@@ -1334,7 +1336,7 @@ discarded.
 ; src/main.coil
 (module myapp.main)
 (import "myapp.geometry.shapes" :as shapes)    ; qualified: shapes/area
-(import "coil.arraylist" :use [ArrayList al-new])   ; selected names
+(import "coil.arraylist" :use [ArrayList])         ; selected names
 (import "coil.hashmap" :use *)                 ; everything
 (import "coil.io" :use * :exclude [print])     ; all but these
 (import "coil.fmt" :use * :rename [[fmt fmt-to]])

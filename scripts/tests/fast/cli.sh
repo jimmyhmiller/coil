@@ -912,9 +912,9 @@ section_debug_checks() {
     (cond (= mode "slice") (slice-get s 7)
           (= mode "subslice") (slice-len (subslice s 2 1))
           (= mode "list")
-            (let [(mut xs) (al-new [i64] (malloc-allocator))]
+            (let [(mut xs) (ArrayList::new [i64] (malloc-allocator))]
               (push! (mut xs) 7)
-              (al-get [i64] xs 3))
+              (get xs 3))
           :else 0))
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
   (args/args-set! argc argv)
@@ -923,7 +923,7 @@ EOF
   build "$T/dbg.coil" "$T/dbg-on" --debug-checks || return
   expect_crash 'slice-get index out of bounds' "--debug-checks catches a slice index out of bounds" "$T/dbg-on" slice
   expect_crash 'subslice out of range or lo>hi' "--debug-checks rejects a subslice with lo > hi" "$T/dbg-on" subslice
-  expect_crash 'ArrayList index out of bounds in al-get' "--debug-checks catches an ArrayList index out of bounds" "$T/dbg-on" list
+  expect_crash 'ArrayList index out of bounds in get' "--debug-checks catches an ArrayList index out of bounds" "$T/dbg-on" list
   # Off, the checks are not compiled in: the subslice keeps its (wrong) length.
   if build "$T/dbg.coil" "$T/dbg-off"; then
     "$T/dbg-off" subslice >/dev/null 2>&1
