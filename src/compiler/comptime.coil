@@ -7678,20 +7678,23 @@
                     (set! i (primitive/iadd (load i) 1)))))
         (load found))))
 
-(defn closure-trait-head-key [(a (dyn Allocator)) (name (slice u8))] (-> (slice u8))
+(defn closure-trait-head-key [(a (dyn Allocator)) (head (slice u8))] (-> (slice u8))
   ; Calls have already been qualified when collect-calls sees them, while methods
   ; inside a still-unchecked ImplDef retain their declaration's simple name. Trait
   ; identity disambiguates equal method names during checking; closure reachability
   ; only needs to retain the candidate family, so compare the shared simple head.
   ; An `Owner::method` head keeps its owner, reduced to its simple name so that
-  ; `coil.var.Var::new`, `var/Var::new` and `Var::new` are one head.
-  (match (str-find name "::")
-    (Some [at]
-      (sconcat3 a
-                "$trait-head$"
-                (after-last-qualifier (subslice [u8] name 0 at))
-                (subslice [u8] name at (len name))))
-    (None [] (sconcat a "$trait-head$" (after-last-dot name)))))
+  ; `coil.var.Var::new`, `var/Var::new` and `Var::new` are one head. A head a
+  ; macro template wrote carries its hygienic scope (`$scope7@coil.hashmap$valid?`),
+  ; which is not part of the name.
+  (let [name (scoped-ident-raw head)]
+    (match (str-find name "::")
+      (Some [at]
+        (sconcat3 a
+                  "$trait-head$"
+                  (after-last-qualifier (subslice [u8] name 0 at))
+                  (subslice [u8] name at (len name))))
+      (None [] (sconcat a "$trait-head$" (after-last-dot name))))))
 
 ;;; The wanted set of a closure calculation: the ordered names it returns, plus
 ;;; hash indexes of those names and their modules, so membership stays constant
@@ -7732,6 +7735,130 @@
             (sconcat a
                      "$"
                      (if (impl-is-trait ip) (impl-trait-name ip) "$inherent"))))
+
+;;; The wanted-set entry of method NAME of inherent impl IP, once it is retained.
+(defn closure-method-key [(a (dyn Allocator)) (ip (ptr ImplDef)) (name (slice u8))] (-> (slice u8))
+  (sconcat a "$kept$" (inherent-fn-name a ip name)))
+
+;;; Is method NAME of impl IP called: by its simple head, or as `Owner::NAME`?
+(defn closure-method-wanted? [(a (dyn Allocator))
+                              (index (ptr ClosureWanted))
+                              (ip (ptr ImplDef))
+                              (name (slice u8))] (-> bool)
+  (or (closure-wanted? index (closure-trait-head-key a name))
+      (closure-wanted? index
+                       (closure-trait-head-key a
+                                               (sconcat3 a
+                                                         (after-last-qualifier (impl-base-name a (field ip self_type)))
+                                                         "::"
+                                                         (after-last-dot name))))))
+
+;;; WANTED as a set, for the per-impl and per-method lookups of a sub-program.
+(defn closure-name-set [(a (dyn Allocator)) (wanted (ptr (ArrayList (slice u8))))] (-> (ptr (HashMap (slice u8) i64)))
+  (let [(mut set) (HashMap::new [(slice u8) i64] a (str-keyops-borrowed))]
+    (for name (iter (load wanted)) (set! (mut set) name 1))
+    (box! a (HashMap (slice u8) i64) (load set))))
+
+;;; Impl IP as a sub-program keeps it, or null when it keeps none of it. A trait
+;;; impl is kept whole. An inherent impl's methods are independent functions, so it
+;;; keeps the ones the closure retained (see closure-retain-methods!): one called method
+;;; of a large impl does not bring every other method and all they call.
+(defn closure-impl-kept [(a (dyn Allocator))
+                         (wanted (ptr (HashMap (slice u8) i64)))
+                         (ip (ptr ImplDef))] (-> (ptr ImplDef))
+  (cond (not (contains? (load wanted) (closure-impl-key a ip))) (primitive/cast (ptr ImplDef) 0)
+        (impl-is-trait ip) ip
+        :else
+          (let [(mut methods) (ArrayList::new [Func] a)]
+            (for method (iter (load (field ip methods)))
+              (when (contains? (load wanted) (closure-method-key a ip (.name method)))
+                (push! (mut methods) method)
+                0))
+            (if (= (len methods) 0)
+                (primitive/cast (ptr ImplDef) 0)
+                (let [copy (box! a ImplDef (load ip))]
+                  (set! (.methods copy) (box-al [Func] a (load methods)))
+                  copy)))))
+
+;;; Does a method of impl IP still call a macro (a function returning Code)? Its
+;;; body has not been expanded yet, and the expansion may call any method of IP.
+(defn closure-impl-calls-macro? [(a (dyn Allocator))
+                                 (p (ptr Program))
+                                 (names (ptr FnNames))
+                                 (ip (ptr ImplDef))] (-> bool)
+  (let [calls (box! a SBox (primitive/zeroed SBox))]
+    (set! (.items calls) (ArrayList::new [(slice u8)] a))
+    (for [mi 0 (len (load (load (field ip methods))))]
+      (cc-list (load (field (elem (load (field ip methods)) mi) body))
+               names
+               calls
+               (primitive/cast (ptr SBox) 0)))
+    (block :found
+      (for [i 0 (len (.items calls))]
+        (let [f (fn-names-func names p (get (.items calls) i))]
+          (when (and (!= (primitive/cast i64 f) 0)
+                     (match (.ret f) (TCode [] true) (_ false)))
+            (break :found true))))
+      false)))
+
+;;; Retain the methods of wanted impl IP that the calls seen so far reach; true
+;;; when that added any. A trait impl is retained whole, when it is first selected
+;;; (FRESH), and so is an inherent impl that is still unexpanded (WHOLE, see
+;;; closure-impl-calls-macro?). Any other inherent impl is retained method by
+;;; method: each one whose head is called joins, and later passes add the ones its
+;;; body (or anything else) calls. CHECKED also roots each retained method's
+;;; checked function.
+(defn closure-retain-methods! [(a (dyn Allocator))
+                               (names (ptr FnNames))
+                               (stackb (ptr SBox))
+                               (wantedb (ptr SBox))
+                               (trait-heads (ptr SBox))
+                               (index (ptr ClosureWanted))
+                               (ip (ptr ImplDef))
+                               (fresh bool)
+                               (whole bool)
+                               (checked bool)] (-> bool)
+  (let [trait (impl-is-trait ip)
+        (mut added) false]
+    (when (or fresh (not trait))
+      (for [mi 0 (len (load (load (field ip methods))))]
+        (let [method (elem (load (field ip methods)) mi)
+              name (.name method)
+              key (closure-method-key a ip name)]
+          (when (or trait
+                    (and (not (closure-wanted? index key))
+                         (or whole (closure-method-wanted? a index ip name))))
+            (unless trait
+              (closure-want! wantedb index key)
+              (set! added true)
+              0)
+            ; The checker may select a structural/primitive impl only after seeing
+            ; a generic bound. Make the selected method itself a closure root as
+            ; well as traversing its callees, so mono and native emission retain
+            ; the implementation they selected.
+            (unless (closure-wanted? index name)
+              (push! (mut (field stackb items)) name)
+              0)
+            ; The checked function of that method is named for its impl, not by the
+            ; label the unchecked ImplDef keeps. A generic body that calls `+` on its
+            ; parameter reaches the impl only once mono selects it, so the selected
+            ; impl's checked functions must be in the closure, or the specialization
+            ; calls one that was left out.
+            (when checked
+              (let [fname (if trait
+                              (tmfn a
+                                    (impl-trait-name ip)
+                                    (impl-mangle-key a (field ip self_type) (load (field ip type_params)))
+                                    name)
+                              (inherent-fn-name a ip name))]
+                (unless (closure-wanted? index fname)
+                  (push! (mut (field stackb items)) fname)
+                  0))
+              0)
+            (cc-list (load (field method body)) names stackb trait-heads))
+          0))
+      0)
+    added))
 
 (defn closure-mark-impl! [(a (dyn Allocator))
                           (p (ptr Program))
@@ -7780,11 +7907,6 @@
     (TArray [e _] (closure-mark-type-modules! e index))
     (_ 0))
   0)
-
-(defn closure-impl-selected? [(a (dyn Allocator))
-                              (wanted (ptr (ArrayList (slice u8))))
-                              (ip (ptr ImplDef))] (-> bool)
-  (set-contains wanted (closure-impl-key a ip)))
 
 (defn closure-impl-wanted? [(a (dyn Allocator))
                             (index (ptr ClosureWanted))
@@ -7972,62 +8094,24 @@
                   (loop (if (>= (load ii) ni)
                             (break)
                             (do
-                              (let [ip (elem is (load ii))]
-                                (when (and (= (get (load selected) (load ii))
-                                              (primitive/cast i64 0))
-                                           (closure-impl-wanted? a
-                                                                 index
-                                                                 ip))
-                                  (set! (mut selected) (load ii) 1)
-                                  (closure-mark-impl! a p wantedb ip index)
-                                  (store! added true)
-                                  (let [ms (load (field ip methods))
-                                        nm (len (load ms))
-                                        (mut mi) 0]
-                                    (loop (if (>= (load mi) nm)
-                                              (break)
-                                              (do
-                                                (let [method
-                                                        (elem ms
-                                                              (load mi))]
-                                                  ; The checker may select a
-                                                  ; structural/primitive impl only
-                                                  ; after seeing a generic bound.
-                                                  ; Make the selected method itself
-                                                  ; a closure root as well as
-                                                  ; traversing its callees, so mono
-                                                  ; and native emission retain the
-                                                  ; implementation they selected.
-                                                  (unless (closure-wanted? index
-                                                                        (load (field method
-                                                                                     name)))
-                                                    (push! (mut (field stackb
-                                                                       items))
-                                                           (load (field method
-                                                                        name))))
-                                                  ; The checked function of that method is named for its impl, not by the
-                                                  ; label the unchecked ImplDef keeps. A generic body that calls `+` on its
-                                                  ; parameter reaches the impl only once mono selects it, so the selected impl's
-                                                  ; checked functions must be in the closure, or the specialization calls one
-                                                  ; that was left out.
-                                                  (let [checked
-                                                          (if (impl-is-trait ip)
-                                                              (tmfn a
-                                                                    (impl-trait-name ip)
-                                                                    (impl-mangle-key a (field ip self_type) (load (field ip type_params)))
-                                                                    (load (field method name)))
-                                                              (inherent-fn-name a ip (load (field method name))))]
-                                                    (unless (closure-wanted? index checked)
-                                                      (push! (mut (field stackb items)) checked)
-                                                      0))
-                                                  (cc-list (load (field method
-                                                                        body))
-                                                           names
-                                                           stackb
-                                                           trait-heads))
-                                                (store! mi
-                                                        (primitive/iadd (load mi)
-                                                                        1))))))))
+                              (let [ip (elem is (load ii))
+                                    fresh (= (get (load selected) (load ii)) 0)]
+                                (when (and (or fresh (not (impl-is-trait ip)))
+                                           (closure-impl-wanted? a index ip))
+                                  (when fresh
+                                    (set! (mut selected)
+                                          (load ii)
+                                          (if (and (not (impl-is-trait ip))
+                                                   (closure-impl-calls-macro? a p names ip))
+                                              2
+                                              1))
+                                    (closure-mark-impl! a p wantedb ip index)
+                                    (store! added true))
+                                  (when (closure-retain-methods! a names stackb wantedb trait-heads index ip fresh
+                                                                 (= (get (load selected) (load ii)) 2)
+                                                                 true)
+                                    (store! added true)
+                                    0)))
                               (set! ii (primitive/iadd (load ii) 1)))))
                   (closure-drain! p names stackb wantedb trait-heads index)
                   (closure-mark-trait-heads! a wantedb trait-heads index)
@@ -8093,39 +8177,24 @@
                   (loop (if (>= (load ii) ni)
                             (break)
                             (do
-                              (let [ip (elem is (load ii))]
-                                (when (and (= (get (load selected) (load ii))
-                                              (primitive/cast i64 0))
-                                           (closure-impl-wanted? a
-                                                                 index
-                                                                 ip))
-                                  (set! (mut selected) (load ii) 1)
-                                  (closure-mark-impl! a p wantedb ip index)
-                                  (store! added true)
-                                  (let [ms (load (field ip methods))
-                                        nm (len (load ms))
-                                        (mut mi) 0]
-                                    (loop (if (>= (load mi) nm)
-                                              (break)
-                                              (do
-                                                (let [method
-                                                        (elem ms
-                                                              (load mi))]
-                                                  (unless (closure-wanted? index
-                                                                        (load (field method
-                                                                                     name)))
-                                                    (push! (mut (field stackb
-                                                                       items))
-                                                           (load (field method
-                                                                        name))))
-                                                  (cc-list (load (field method
-                                                                        body))
-                                                           names
-                                                           stackb
-                                                           trait-heads))
-                                                (store! mi
-                                                        (primitive/iadd (load mi)
-                                                                        1))))))))
+                              (let [ip (elem is (load ii))
+                                    fresh (= (get (load selected) (load ii)) 0)]
+                                (when (and (or fresh (not (impl-is-trait ip)))
+                                           (closure-impl-wanted? a index ip))
+                                  (when fresh
+                                    (set! (mut selected)
+                                          (load ii)
+                                          (if (and (not (impl-is-trait ip))
+                                                   (closure-impl-calls-macro? a p names ip))
+                                              2
+                                              1))
+                                    (closure-mark-impl! a p wantedb ip index)
+                                    (store! added true))
+                                  (when (closure-retain-methods! a names stackb wantedb trait-heads index ip fresh
+                                                                 (= (get (load selected) (load ii)) 2)
+                                                                 false)
+                                    (store! added true)
+                                    0)))
                               (set! ii (primitive/iadd (load ii) 1)))))
                   (closure-drain! p names stackb wantedb trait-heads index)
                   (closure-mark-trait-heads! a wantedb trait-heads index)
@@ -8251,16 +8320,12 @@
                 (set! i (primitive/iadd (load i) 1)))))
     (closure-keep-base-funcs! a wanted (mut keep))
     (let [is (load (field p impls))
-          ni (len (load is))
-          (mut ii) 0]
-      (loop (if (>= (load ii) ni)
-                (break)
-                (do
-                  (let [ip (elem is (load ii))]
-                    (when (closure-impl-selected? a wanted ip)
-                      (push! (mut keepi) (load ip))
-                      0))
-                  (set! ii (primitive/iadd (load ii) 1))))))
+          wanted-set (closure-name-set a wanted)]
+      (for [ii 0 (len (load is))]
+        (let [kept (closure-impl-kept a wanted-set (elem is ii))]
+          (unless (= (primitive/cast i64 kept) 0)
+            (push! (mut keepi) (load kept))
+            0))))
     (set! (.annotation_defs pp) (load (field p annotation_defs)))
     (set! (.conventions pp) (load (field p conventions)))
     (set! (.structs pp) (load (field p structs)))
@@ -8303,16 +8368,12 @@
                 (set! i (primitive/iadd (load i) 1)))))
     (closure-keep-base-funcs! a wanted (mut keep))
     (let [is (load (field p impls))
-          ni (len (load is))
-          (mut ii) 0]
-      (loop (if (>= (load ii) ni)
-                (break)
-                (do
-                  (let [ip (elem is (load ii))]
-                    (when (closure-impl-selected? a wanted ip)
-                      (push! (mut keepi) (load ip))
-                      0))
-                  (set! ii (primitive/iadd (load ii) 1))))))
+          wanted-set (closure-name-set a wanted)]
+      (for [ii 0 (len (load is))]
+        (let [kept (closure-impl-kept a wanted-set (elem is ii))]
+          (unless (= (primitive/cast i64 kept) 0)
+            (push! (mut keepi) (load kept))
+            0))))
     (set! (.annotation_defs pp) (load (field p annotation_defs)))
     (set! (.conventions pp) (load (field p conventions)))
     (set! (.structs pp) (load (field p structs)))
