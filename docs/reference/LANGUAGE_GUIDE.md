@@ -1299,8 +1299,8 @@ true
   `case-fold` apply a rune's simple (one-to-one) case mapping, and
   `string-to-lower`, `string-to-upper` and `string-case-fold` map any text into a
   new `String`. Compare case-folded text to ignore case.
-- `coil.temp` names temporary files: `(temp-path "name")` in a private per-process
-  directory, `(temp-sibling dest)` beside `dest` for writing and then renaming into
+- `coil.temp` names temporary files: `(temp/path "name")` in a private per-process
+  directory, `(temp/sibling dest)` beside `dest` for writing and then renaming into
   place. Both are removed when the process exits, and ones a killed process left are
   removed by the next process that makes a temporary.
 
