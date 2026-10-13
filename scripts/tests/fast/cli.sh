@@ -371,10 +371,18 @@ open(sys.argv[1], "w").write(
   printf '(module broken-project)\n(import "broken-dependency")\n(defn main [] (-> i64) (iadd 40 2))\n' > "$T/broken-project/src/main.coil"
   printf '(module broken-dependency)\n(defn broken [] (-> i64) missing)\n' > "$T/broken-project/src/dependency.coil"
   cp "$T/broken-project/src/main.coil" "$T/broken-main.orig"
-  (cd "$T/broken-project" && "$COIL" lint --fix >/dev/null 2>&1); rc=$?
+  local broken
+  broken=$(cd "$T/broken-project" && "$COIL" lint --fix 2>&1); rc=$?
   [ "$rc" != 0 ] && cmp -s "$T/broken-main.orig" "$T/broken-project/src/main.coil" \
     && ok "project lint --fix that cannot compile rolls back every file" \
     || bad "project lint --fix that cannot compile rolls back every file" "exit $rc"
+  # The preflight rewrote `iadd`, so the error to show is the rewritten program's
+  # (the dependency's unbound name), not `iadd`, which the file is put back to.
+  case "$broken" in
+    *"undefined function 'iadd'"*) bad "lint --fix reports why the preflight's rewrite does not compile" "$broken" ;;
+    *"rewritten program reported"*"unbound variable 'missing'"*) ok "lint --fix reports why the preflight's rewrite does not compile" ;;
+    *) bad "lint --fix reports why the preflight's rewrite does not compile" "$broken" ;;
+  esac
 
   # Standard-library names that were removed (src/compiler/api_renames.coil): a
   # build points at the migration, lint --fix rewrites every spelling of them (a
