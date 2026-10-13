@@ -17,7 +17,7 @@
 ;; alias, `coil.core' is implicit unless the buffer imports it explicitly, and
 ;; `:use *' / `:use [names]' / `:as' / `:exclude' / `:rename' are each
 ;; honoured.  Completing inside a file that imports `coil.str' as `s' offers
-;; `s/str-concat', and not `i64-keyops' from a namespace nobody imported.
+;; `s/concat', and not `i64-keyops' from a namespace nobody imported.
 
 ;;; Code:
 

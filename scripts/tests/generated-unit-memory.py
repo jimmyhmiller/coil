@@ -30,7 +30,7 @@ def provider_source(units: int) -> str:
         '(import "coil.str" :use *) (import "coil.slice" :use *) (import "coil.alloc" :use *) '
         '(import "coil.primitive" :as p) '
         '(defn sconcat [(a (dyn Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8)) '
-        '(match (str-concat a x y) (Some [v] v) (None [] (p/error "out of memory")))) '
+        '(match (concat a x y) (Some [v] v) (None [] (p/error "out of memory")))) '
         '(defn sconcat3 [(a (dyn Allocator)) (x (slice u8)) (y (slice u8)) (z (slice u8))] (-> (slice u8)) '
         '(sconcat a x (sconcat a y z))) '
         '(defn read-source [(context Code)] (-> Code) '

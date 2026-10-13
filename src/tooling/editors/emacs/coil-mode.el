@@ -131,7 +131,7 @@ this one binary."
     (modify-syntax-entry ?@ "'" table)
 
     ;; Symbol constituents.  Coil names are Lisp-liberal: `push!',
-    ;; `str-parse-int', `primitive/cast', `Type::method', `.field', `<=', `*'.
+    ;; `parse-int', `primitive/cast', `Type::method', `.field', `<=', `*'.
     (dolist (ch '(?- ?+ ?* ?/ ?= ?< ?> ?! ?? ?_ ?. ?: ?% ?& ?^ ?$))
       (modify-syntax-entry ch "_" table))
     table)

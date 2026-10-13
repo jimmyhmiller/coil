@@ -18,8 +18,8 @@ names), `f65ab9213` (trait methods + the undefined-reference check).
 (import "coil.control" :use *)        ; refer ALL of control's exported names
 (import "coil.slice"   :use [subslice sort])  ; refer just these
 (import "coil.io"      :as io)        ; qualified access only: (io/print …)
-(import "coil.str"     :use * :exclude [len])       ; all but these
-(import "coil.str"     :use * :rename [[len str-len]])  ; refer under a local name
+(import "coil.str"     :use * :exclude [trim])      ; all but these
+(import "coil.str"     :use * :rename [[trim strip]])  ; refer under a local name
 (export foo Bar)                          ; what THIS module exposes (default: all public)
 ```
 

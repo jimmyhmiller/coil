@@ -113,14 +113,14 @@ multiset half is there.
 | Property | Claim |
 |---|---|
 | `str-substr-halves-concat-to-whole` | cutting a string anywhere and concatenating the halves gives it back |
-| `str-equal-strings-hash-equally` | equal content ⇒ equal `str-hash` and `str-cmp = 0`, for strings that share no storage |
-| `str-cmp-is-antisymmetric-and-agrees-with-eq` | `sign(cmp a b) = -sign(cmp b a)`, and `cmp = 0` exactly when `str-eq` |
-| `str-find-returns-first-occurrence` | `str-find` finds the needle where it says, and there is no earlier occurrence — checked against an independent scan, on the `None` answers too |
+| `str-equal-strings-hash-equally` | equal content ⇒ equal `hash` and `cmp = 0`, for strings that share no storage |
+| `str-cmp-is-antisymmetric-and-agrees-with-eq` | `sign(cmp a b) = -sign(cmp b a)`, and `cmp = 0` exactly when `=` |
+| `str-find-returns-first-occurrence` | `find` finds the needle where it says, and there is no earlier occurrence — checked against an independent scan, on the `None` answers too |
 | `str-find-locates-an-embedded-needle` | the same law with a needle cut out of the haystack, so the search actually succeeds |
 | `str-starts-with-iff-found-at-zero` | `starts-with` is exactly "the first occurrence is at index 0" |
 | `str-trim-is-idempotent-and-tight` | trimming is idempotent, never grows, and leaves no whitespace at either end |
-| `str-parse-int-roundtrips-every-i64` | render then `str-parse-int` is the identity over the **whole** i64 range, `i64::MIN` included |
-| `str-parse-int-agrees-with-hand-parser` | `str-parse-int` accepts exactly `-?[0-9]+` and agrees with a hand-rolled parser on the value |
+| `str-parse-int-roundtrips-every-i64` | render then `parse-int` is the identity over the **whole** i64 range, `i64::MIN` included |
+| `str-parse-int-agrees-with-hand-parser` | `parse-int` accepts exactly `-?[0-9]+` and agrees with a hand-rolled parser on the value |
 | `str-parse-int-grammar-over-numeric-alphabet` | the same law, over strings drawn from `-0123456789x`, so the sign rules are actually reached |
 | `str-split-then-join-roundtrips` | splitting on a separator and rejoining with it reconstructs the original, empty pieces included |
 
@@ -135,7 +135,7 @@ digits or fewer: `coil.str` documents itself as having no overflow check, so
 past that the two parsers agree only on the wrap, which is not a law worth
 pinning. The accept/reject judgement is claimed for every input.
 
-The two `str-parse-int` grammar properties state the same law and differ only in
+The two `parse-int` grammar properties state the same law and differ only in
 where their strings come from, which is the point. Measured with a mutant that
 makes a lone `"-"` parse as `0`: the random-`(slice u8)` property catches it on
 6 seeds out of 12, and the alphabet-shaped one on 12 out of 12. A law is only as
@@ -155,7 +155,7 @@ collide never.
 | `hm-put-same-key-twice-overwrites` | the second value wins and `len` stays 1 — overwrite, not duplicate |
 | `hm-matches-model-under-put-remove-churn` | a random put/remove sequence agrees with an association list **after every single operation** |
 | `hm-for-visits-every-key-exactly-once` | iteration visits each live key exactly once with its current value, and nothing else, while the table carries tombstones |
-| `hm-string-keys-survive-their-buffers` | `str-keyops` deep-copies keys: lookups keep working after the caller's bytes are overwritten |
+| `hm-string-keys-survive-their-buffers` | `keyops` deep-copies keys: lookups keep working after the caller's bytes are overwritten |
 
 `hm-matches-model-under-put-remove-churn` is the highest-value property in the
 file. Tombstones, probe-chain repair and the rehash-in-place that clears them

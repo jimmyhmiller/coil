@@ -316,7 +316,7 @@ indentation."
 (defstruct Point [(x i64) (y i64)])
 "
     (let ((scope (coil-buffer-scope)))
-      (should (assoc "str-concat" scope))       ; :use *
+      (should (assoc "concat" scope))           ; :use *
       (should (assoc "HashMap" scope))          ; named in :use
       (should-not (assoc "for-entries" scope))  ; not named
       (should-not (assoc "subslice" scope))     ; excluded
@@ -327,9 +327,9 @@ indentation."
 (ert-deftest coil-test-lookup-resolves-an-explicit-namespace ()
   (skip-unless (coil-test--available-p))
   (coil-test-with-buffer "(module m)\n"
-    (let ((def (coil-lookup "coil.str/str-concat")))
+    (let ((def (coil-lookup "coil.str/concat")))
       (should def)
-      (should (equal (coil-def-name def) "str-concat"))
+      (should (equal (coil-def-name def) "concat"))
       (should (string-match-p "slice u8" (coil-def-signature def))))))
 
 

@@ -1236,8 +1236,8 @@ evens=3 total=10
   you provide (from an arena, say); `(InlineList::new [T N])` holds `N` elements
   itself, so it can be a struct field. `push!` onto a full one aborts in every
   build, `(full? xs)` says whether it would, and `(used xs)` is the filled prefix.
-- `HashMap` keys that are strings need key operations: `(str-keyops)` copies keys
-  into the map, while `(str-keyops-borrowed)` borrows them.
+- `HashMap` keys that are strings need key operations: coil.str's `(keyops)` copies
+  keys into the map, while `(keyops-borrowed)` borrows them.
 - A collection's own operations are methods. A list has `(cap xs)`,
   `(elem xs i)` (a pointer to the live element), `(reserve! (mut xs) n)`,
   `(extend! (mut xs) p n)`, `(slice xs)`, `(into-slice (mut xs))`, `(clear! (mut xs))`

@@ -87,7 +87,7 @@ Scope is namespace-aware in the Clojure sense: the buffer's own `(import …)`
 forms decide what is visible and under which name. `:use *`, `:use [names]`,
 `:as`, `:exclude` and `:rename` are each honoured, `coil.core` is implicit
 unless the buffer imports it explicitly, and local definitions shadow imported
-ones. A file that imports `coil.str` as `s` completes `s/str-concat`, and does
+ones. A file that imports `coil.str` as `s` completes `s/concat`, and does
 not offer `i64-keyops` from a namespace nobody imported.
 
 **Jump to definition** searches source rather than asking the compiler:
