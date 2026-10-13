@@ -47,7 +47,7 @@ word html
 | `(captures-at PATTERN HAYSTACK START)` | as `captures`, from byte offset START |
 | `(captures-iter PATTERN HAYSTACK)` | a `CapturesIter` over the groups of each match |
 
-`HAYSTACK` is a `(slice u8)`; pass `(string-view-bytes v)` for a `StringView`.
+`HAYSTACK` is a `(slice u8)`; pass `(bytes v)` for a `StringView`.
 
 A `Span` is the half-open byte range `[start, end)`: read it with `.start` and
 `.end`, `(span-len s)`, or `(span-bytes haystack s)`. `Captures` is
