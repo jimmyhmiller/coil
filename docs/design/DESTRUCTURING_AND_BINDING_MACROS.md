@@ -345,7 +345,7 @@ No special text scan of public `defn` should be necessary for correctness.
 
 Normalize public `defn` inside impl bodies at the declaration phase as well.
 Trait signatures, extern declarations, and `declare` have no body to destructure;
-keep their parameters simple. Library `defclosure`/`defarcclosure` generators
+keep their parameters simple. Library `defclosure` generators
 must eventually use the shared parameter normalizer where they inspect names,
 not index a pattern as if it were a symbol. Preserve their existing capture
 syntax; extending captures is outside this change.
@@ -384,7 +384,7 @@ Audit consumers by semantic role, not just global search-and-replace:
 - `src/compiler/prelude.coil` and new binding module: dependency layering,
   public reexports and the macro/helper implementations.
 - `src/stdlib/primitive.coil`: internal checked projection declarations as needed.
-- `src/stdlib/closure.coil`, transforms such as `arc_auto.coil`, generators,
+- `src/stdlib/closure.coil`, transforms, generators,
   linters, doc extraction, syntax dumpers, formatter rules, and editor support:
   distinguish original public syntax from normalized primitive syntax.
 

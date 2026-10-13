@@ -4,11 +4,9 @@
 superseded managed-declaration dialect has been removed.
 
 **Correction:** The earlier managed-declaration surface did not provide the
-requested ML-style transparent ARC experience and is no longer part of Coil. The
-definitive replacement requirements live in
-[`TRANSPARENT_AUTOMATIC_ARC.md`](TRANSPARENT_AUTOMATIC_ARC.md). The ownership,
-cleanup, allocator-lease, and `Arc` machinery in this document remains substrate
-for that work.
+requested ML-style transparent ARC experience and is no longer part of Coil. Its
+replacement, the `coil.arc.auto` transform, was removed as well (2026-10-13). The
+ownership, cleanup, allocator-lease, and `Arc` machinery in this document remains.
 
 ## Goal
 
@@ -268,9 +266,9 @@ from ownership APIs and move checking rather than lint alone.
 
 ## 6. Transparent ARC metaprogram
 
-The replacement is a compilation-unit transform over ordinary Coil source. Its
-design, source contract, allocator rules, and acceptance criteria are maintained
-in [`TRANSPARENT_AUTOMATIC_ARC.md`](TRANSPARENT_AUTOMATIC_ARC.md).
+The replacement was a compilation-unit transform over ordinary Coil source,
+`coil.arc.auto`. It was removed on 2026-10-13; this section records the design
+it followed.
 
 ### 6.1 Conservative first elaboration
 
