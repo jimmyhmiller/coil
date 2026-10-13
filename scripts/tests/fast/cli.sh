@@ -1048,13 +1048,13 @@ section_debug_allocator() {
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
   (args/init! argc argv)
   (let [mode (args/nth 1)
-        debug (debug-allocator-init (malloc-allocator))
-        a (debug-allocator-view debug)
+        debug (DebugAllocator::new (malloc-allocator))
+        a (view debug)
         p (unwrap-ptr [i64] (create [i64] a))]
     (store! p 1234)
     (cond (= mode "double-free") (do (destroy [i64] a p) (destroy [i64] a p) 0)
           (= mode "use-after-free") (do (destroy [i64] a p) (& (load p) 255))
-          :else (debug-allocator-deinit! debug))))
+          :else (deinit! debug))))
 EOF
   build "$T/dalloc.coil" "$T/dalloc" --debug-checks || return
   expect_crash 'double free in debug-allocator' "the debug allocator stops a double free" "$T/dalloc" double-free
