@@ -281,7 +281,7 @@ different faces."
                     "deftest" "impl"))
       (puthash head 'defun table))
     (dolist (head '("let" "when" "when-not" "unless" "while" "match" "for"
-                    "with-open" "hm-for"))
+                    "with-open" "for-entries"))
       (puthash head 1 table))
     (dolist (head '("do" "loop" "comptime" "defer"))
       (puthash head 0 table))
@@ -393,7 +393,7 @@ further, under its own name rather than beside it —
           indexed
             (if (= (primitive/cast i64 idx) 0)
                 (None [(slice u8)])
-                (hm-get [(slice u8) (slice u8)] (load idx) spelling))]"
+                (get (load idx) spelling))]"
   (let ((column (coil--column-at open))
         (scan (coil--scan-elements open indent-point)))
     (if (and (member (coil--bracket-owner open) coil-binding-forms)

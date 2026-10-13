@@ -1188,7 +1188,7 @@ pop
 (module example.collections)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.arraylist" :use [ArrayList al-free!])
-(import "coil.hashmap" :use [hm-new-scalar hm-free!])
+(import "coil.hashmap" :use [HashMap])
 (import "coil.collect" :use [collect])
 (import "coil.iter" :use [Indexed])
 
@@ -1197,7 +1197,7 @@ pop
 (defn main [] (-> i64)
   (let [a (malloc-allocator)
         (mut xs) (collect [(ArrayList i64)] a [5 2 8 1])
-        (mut ages) (hm-new-scalar [i64 i64] a)]
+        (mut ages) (HashMap::new-scalar [i64 i64] a)]
     (set! (mut xs) 0 50)
     (println "len={} first={} last={}" (len xs) (get xs 0) (get xs 3))
 
@@ -1214,7 +1214,7 @@ pop
       (None [] (println "missing")))
 
     (al-free! (mut xs))
-    (hm-free! (mut ages))
+    (free! (mut ages))
     0))
 ```
 
@@ -1238,7 +1238,8 @@ evens=3 total=10
 - `HashMap` keys that are strings need key operations: `(str-keyops)` copies keys
   into the map, while `(str-keyops-borrowed)` borrows them.
 - Release an `ArrayList` from a general-purpose allocator with
-  `(al-free! (mut xs))`. Remove a map entry with `hm-remove!`.
+  `(al-free! (mut xs))`. A map's own operations are methods: `(contains? m k)`,
+  `(remove! (mut m) k)`, `(clear! (mut m))` and `(free! (mut m))`.
 
 ## Text and output
 

@@ -88,7 +88,7 @@ forms decide what is visible and under which name. `:use *`, `:use [names]`,
 `:as`, `:exclude` and `:rename` are each honoured, `coil.core` is implicit
 unless the buffer imports it explicitly, and local definitions shadow imported
 ones. A file that imports `coil.str` as `s` completes `s/str-concat`, and does
-not offer `hm-put!` from a namespace nobody imported.
+not offer `i64-keyops` from a namespace nobody imported.
 
 **Jump to definition** searches source rather than asking the compiler:
 `coil namespace` reports signatures but no file or line, and searching also

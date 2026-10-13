@@ -112,7 +112,7 @@ compiler that ran out of arena died with exit 134 and no message.
 out of memory: arraylist al-reserve! failed to allocate 2048 bytes; the allocator is exhausted
 ```
 
-The three call sites (`al-reserve!`, `hm-grow!`, `str-key-copy`) each name themselves and
+The three call sites (`al-reserve!`, `HashMap`'s `grow!`, `str-key-copy`) each name themselves and
 pass the request size. `oom` with no site or size is still there for callers that have
 neither, but nothing in the tree uses it. Printing goes through a local `write(2)` and a
 hand-rolled decimal formatter rather than `io.coil`, so the reporting path adds no module
