@@ -87,7 +87,7 @@ HTTP/0.9 and HTTP/2.0 and returning error code 0 for empty input, and
   so the fuzzer's structural mutations — delete, repeat, splice an element or a
   subtree — have something to work on. Wrap each element a collection generator
   draws in a `SPAN-ELEM` span. Keep one byte-level property per parser as well
-  (`arb-bytes` draws the full 0–255 range; a `(slice u8)` argument is printable
+  (`bytes` draws the full 0–255 range; a `(slice u8)` argument is printable
   ASCII).
 - **Make failures readable.** A value drawn inside the body is not an argument, so
   a counterexample shows it only if you name it: `(note "label" EXPR)` or
