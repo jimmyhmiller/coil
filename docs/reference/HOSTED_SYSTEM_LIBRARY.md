@@ -63,8 +63,8 @@ They keep system code linear:
           cwd (try-or! (os/current-dir a) 1)
           (mut cwdp) (primitive/zeroed os/OwnedString)]
       (store! cwdp cwd)
-      (println "{}" (os/owned-string-slice cwd))
-      (os/owned-string-free a cwdp)
+      (println "{}" (slice cwd))
+      (os/OwnedString::free! a cwdp)
       0)))
 ```
 
@@ -80,18 +80,18 @@ error binder is used, the match contains domain logic and is deliberately untouc
 
 ## `coil.os`
 
-`env-get(allocator, name)` returns `Result (Option OwnedString) OsError`. The value is
-copied before returning and survives later environment changes. `env-set` supports an
-overwrite flag; `env-unset` succeeds for an absent variable. Empty names, names with
+`(os/get-env allocator name)` returns `Result (Option OwnedString) OsError`. The value
+is copied before returning and survives later environment changes. `set-env!` supports
+an overwrite flag; `unset-env!` succeeds for an absent variable. Empty names, names with
 `=`, and embedded NUL bytes are `InvalidInput`.
 
-`current-dir(allocator)` grows its buffer until `getcwd` succeeds; it does not assume
+`(os/current-dir allocator)` grows its buffer until `getcwd` succeeds; it does not assume
 `PATH_MAX`. `change-dir` borrows its input for the call. Environment and cwd mutation
 are process-global: applications must synchronize them with other threads.
 
-Every `OwnedString` records its allocation capacity. Store the returned value in a
-place and call `owned-string-free` with the same allocator. That operation clears the
-object and is idempotent for that object.
+Every `OwnedString` records its allocation capacity. `(slice s)` borrows its bytes.
+Store the returned value in a place and call `OwnedString::free!` with the same
+allocator. That operation clears the object and is idempotent for that object.
 
 `OsError` distinguishes `Syscall(code)`, `OutOfMemory`, and `InvalidInput`. Numeric
 errno is captured immediately and remains authoritative.
