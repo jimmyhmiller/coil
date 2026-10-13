@@ -388,9 +388,10 @@ open(sys.argv[1], "w").write(
     && ok "project lint --fix that cannot compile rolls back every file" \
     || bad "project lint --fix that cannot compile rolls back every file" "exit $rc"
   # The preflight rewrote `iadd`, so the error to show is the rewritten program's
-  # (the dependency's unbound name), not `iadd`, which the file is put back to.
+  # (the dependency's unbound name), not `iadd`, which the file is put back to; and
+  # a file put back is not named as fixed.
   case "$broken" in
-    *"undefined function 'iadd'"*) bad "lint --fix reports why the preflight's rewrite does not compile" "$broken" ;;
+    *"undefined function 'iadd'"*|*"fixed "*) bad "lint --fix reports why the preflight's rewrite does not compile" "$broken" ;;
     *"rewritten program reported"*"unbound variable 'missing'"*) ok "lint --fix reports why the preflight's rewrite does not compile" ;;
     *) bad "lint --fix reports why the preflight's rewrite does not compile" "$broken" ;;
   esac
@@ -401,7 +402,9 @@ open(sys.argv[1], "w").write(
   # constructor that needs its type imported, a binding that would capture the new
   # name, lines aligned with a call's arguments, a renamed function whose new name
   # the file already calls, written qualified, a name core provided with no import,
-  # a name reached through a module that re-exports its own), and the program runs.
+  # a name reached through a module that re-exports its own, a call in a template;
+  # quoted data and a template's symbol only a hand could rewrite are left as
+  # written), and the program runs.
   mkdir -p "$T/renamed/src"
   printf '[package]\nname = "renamed"\nentry = "src/main.coil"\n' > "$T/renamed/Coil.toml"
   cat > "$T/renamed/src/main.coil" <<'EOF'
@@ -446,6 +449,8 @@ EOF
 (import "coil.hashmap" :use * :rename [[hm-cap capacity]])
 
 (defn size [(m (HashMap i64 i64))] (-> i64) (+ (hm-len m) (capacity m)))
+
+(defn heads [(m Code)] (-> Code) `(do (hm-len ~m) (quote hm-len) hm-get))
 EOF
   cat > "$T/renamed/src/show.coil" <<'EOF'
 (module renamed.show)
@@ -517,6 +522,8 @@ EOF
 (import "coil.hashmap" :use *)
 
 (defn size [(m (HashMap i64 i64))] (-> i64) (+ (len m) (cap m)))
+
+(defn heads [(m Code)] (-> Code) `(do (len ~m) (quote hm-len) hm-get))
 EOF
   cat > "$T/renamed-show.want" <<'EOF'
 (module renamed.show)
