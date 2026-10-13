@@ -8,8 +8,12 @@
    compiler first), and parsed into the driver's allocator, so all of it stayed
    resident for the whole compile. A trivial entry is built alone, then as the
    member of a workspace whose root `src` is this checkout's src tree; the
-   second may exceed the first by no more than 32 MiB. Obsolete syntax outside
-   the members is not reported.
+   second may exceed the first by no more than 32 MiB. A process's peak
+   resident set only gains from noise (one sample of an identical build ran 20 MB
+   over the others), so a pair over the allowance is sampled again, interleaved,
+   up to SAMPLES times each, and the smallest peaks decide; a single pair made
+   the check fail while nothing had changed. Obsolete syntax outside the members
+   is not reported.
 
 2. Namespace discovery retains no source text from unimported files and no paths
    from irrelevant directory entries. Modules whose declaration follows a long
@@ -35,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cleanup_on_signal  # noqa: E402
 
 ALLOWANCE = 32 * 1024 * 1024
+SAMPLES = 3
 ENTRY = '(module scan.main)\n(defn main [] (-> i64) (println "hello") 0)\n'
 MiB = 1024 * 1024
 
@@ -67,10 +72,16 @@ def project_scan(compiler: str, work: Path) -> None:
     alone.mkdir()
     (alone / "main.coil").write_text(ENTRY)
 
-    standalone = peak_rss(compiler, ["build", "main.coil", "-o", work / "alone.out"], alone)
-    in_project = peak_rss(compiler, ["build", "app/main.coil", "-o", work / "project.out"], workspace)
+    standalones, in_projects = [], []
+    while len(standalones) < SAMPLES and (not standalones
+                                          or min(in_projects) - min(standalones) >= ALLOWANCE):
+        standalones.append(peak_rss(compiler, ["build", "main.coil", "-o", work / "alone.out"], alone))
+        in_projects.append(peak_rss(compiler, ["build", "app/main.coil", "-o", work / "project.out"],
+                                    workspace))
+    standalone, in_project = min(standalones), min(in_projects)
     growth = in_project - standalone
-    print(f"standalone {standalone} B; as a workspace member {in_project} B; growth {growth} B")
+    print(f"standalone {standalone} B; as a workspace member {in_project} B; growth {growth} B"
+          f" (smallest of {len(standalones)} samples each)")
     if growth >= ALLOWANCE:
         raise SystemExit("FAIL the pre-build scan read non-member source and kept it resident")
 
