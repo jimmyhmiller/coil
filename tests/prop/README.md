@@ -217,7 +217,7 @@ scalar too — that is the version whose counterexample you can read.
   association list for a map, a copy-and-push list for `extend!` — check against
   it after every operation. The model is allowed to be slow; it has to be
   obviously correct.
-- **Allocate from the case arena**, `(src-alloc (prop-src))`. The runner rewinds
+- **Allocate from the case arena**, `(src-alloc (source))`. The runner rewinds
   it between cases, so nothing in this file frees anything and nothing leaks.
 - **Prove the property can fail, by breaking the library on purpose.** Copy
   `src/` somewhere, introduce the bug you think the property catches, and run

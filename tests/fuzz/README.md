@@ -63,7 +63,7 @@ directory's `Coil.toml`. The script therefore runs the campaign in
 `build/fuzz/http-upstream/`, whose manifest links the archive, and the corpus
 persists there.
 
-These targets print their own inputs rather than using `prop-note`: replay with
+These targets print their own inputs rather than using `note`: replay with
 `HTTP_FUZZ_VERBOSE=1` to print a failing case's input and both traces, or
 `HTTP_FUZZ_SHOW=1` to print every input before it runs.
 
@@ -90,8 +90,8 @@ HTTP/0.9 and HTTP/2.0 and returning error code 0 for empty input, and
   (`arb-bytes` draws the full 0–255 range; a `(slice u8)` argument is printable
   ASCII).
 - **Make failures readable.** A value drawn inside the body is not an argument, so
-  a counterexample shows it only if you name it: `(prop-note "label" EXPR)` or
-  `(prop-draw T "label")`. A wrapper type with its own `Arbitrary` and `Debug`
+  a counterexample shows it only if you name it: `(note "label" EXPR)` or
+  `(draw-noted T "label")`. A wrapper type with its own `Arbitrary` and `Debug`
   impl works too, and prints best.
 - **Read `coverage.txt`.** After a campaign, `.coil/fuzz/<property>/coverage.txt`
   lists the functions it never entered. Code nothing reaches is code the target
