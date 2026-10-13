@@ -803,6 +803,26 @@ method with no such parameter as `Type::name`:
 10
 ```
 
+A free function with the method's name keeps every call it accepts. A call it
+rejects (wrong argument count, an argument that does not convert, an unmet bound)
+goes to the method of that name on the first argument's type, so a `count` method
+works although `coil.iter.count` is always in scope. When neither fits, the error
+is the function's, with a note on why the method did not fit either:
+
+```coil
+(module example.bag)
+(defstruct Bag [(items i64)])
+(impl Bag (count [(b Bag)] (-> i64) (.items b)))
+
+(defn main [] (-> i64)
+  (println "{} {}" (count (Bag :items 3)) (count (range 0 5)))
+  0)
+```
+
+```output
+3 5
+```
+
 A method from a trait with the same name is still reachable as `Trait::method`.
 `Type` and `Trait` are looked up as a type position looks them up, so the name
 must be in scope where the call is written: declared in the module, imported, or
