@@ -93,9 +93,9 @@ section_run() {
 (module run-argv)
 (import "coil.args" :as args)
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
-  (args/args-set! argc argv)
-  (for i (range 1 (args/args-count)) (println "[{}]" (args/args-nth i)))
-  (args/args-count))
+  (args/init! argc argv)
+  (for i (range 1 (args/count)) (println "[{}]" (args/nth i)))
+  (args/count))
 EOF
   local out rc
   out=$("$COIL" run "$T/argv.coil" -- -o child-output --backend nonexistent --use nope -g 2>&1); rc=$?
@@ -388,7 +388,8 @@ open(sys.argv[1], "w").write(
   # build points at the migration, lint --fix rewrites every spelling of them (a
   # :use list, an alias, :use * with :rename, type arguments a method drops, a
   # constructor that needs its type imported, a binding that would capture the new
-  # name, lines aligned with a call's arguments), and the program runs.
+  # name, lines aligned with a call's arguments, a renamed function whose new name
+  # the file already calls, written qualified), and the program runs.
   mkdir -p "$T/renamed/src"
   printf '[package]\nname = "renamed"\nentry = "src/main.coil"\n' > "$T/renamed/Coil.toml"
   cat > "$T/renamed/src/main.coil" <<'EOF'
@@ -397,6 +398,7 @@ open(sys.argv[1], "w").write(
 (import "coil.hashmap" :use [hm-new-scalar hm-put! hm-get hm-len hm-for hm-free!])
 (import "renamed.tally" :as tally)
 (import "renamed.size" :use [size])
+(import "coil.args" :use [args-count])
 
 (defn main [] (-> i64)
   (let [(mut m) (hm-new-scalar [i64 i64] (malloc-allocator))]
@@ -406,7 +408,7 @@ open(sys.argv[1], "w").write(
              (+ (match (hm-get m 2) (Some [v] v) (None [] 0))
                 (hm-len m)))
     (let [len (hm-len m)]
-      (hm-for [k v m] (when (= k 9) (println "{} {} {} {}" (- (hm-len m) len) v (tally/total (mut m)) (size m)))))
+      (hm-for [k v m] (when (= k 9) (println "{} {} {} {} {}" (- (hm-len m) len) v (tally/total (mut m)) (size m) (+ (args-count) (count (range 0 3)))))))
     (hm-free! (mut m))
     0))
 EOF
@@ -447,6 +449,7 @@ EOF
 (import "coil.hashmap" :use [for-entries HashMap])
 (import "renamed.tally" :as tally)
 (import "renamed.size" :use [size])
+(import "coil.args")
 
 (defn main [] (-> i64)
   (let [(mut m) (HashMap::new-scalar [i64 i64] (malloc-allocator))]
@@ -456,7 +459,7 @@ EOF
           (+ (match (get m 2) (Some [v] v) (None [] 0))
              (len m)))
     (let [len (len m)]
-      (for-entries [k v m] (when (= k 9) (println "{} {} {} {}" (- (Len::len m) len) v (tally/total (mut m)) (size m)))))
+      (for-entries [k v m] (when (= k 9) (println "{} {} {} {} {}" (- (Len::len m) len) v (tally/total (mut m)) (size m) (+ (coil.args/count) (count (range 0 3)))))))
     (free! (mut m))
     0))
 EOF
@@ -488,7 +491,7 @@ EOF
              "exit $rc: $(diff -u "$T/renamed-$f.want" "$T/renamed/src/$f.coil" | head -40) $(head -c 600 "$T/renamed.log")"; }
   done
   [ "$rc" = 0 ] && [ "$migrated" = 1 ] && ok "lint --fix migrates removed library names in every spelling"
-  expect_out "^0 9 39 22$" "the migrated project runs" sh -c "cd '$T/renamed' && '$COIL' run"
+  expect_out "^0 9 39 22 3$" "the migrated project runs" sh -c "cd '$T/renamed' && '$COIL' run"
   (cd "$T/renamed" && "$COIL" lint --fix >/dev/null 2>&1); rc=$?
   cmp -s "$T/renamed-main.want" "$T/renamed/src/main.coil" && cmp -s "$T/renamed-tally.want" "$T/renamed/src/tally.coil" \
     && [ "$rc" = 0 ] && ok "lint --fix leaves migrated code alone" \
@@ -925,8 +928,8 @@ section_debug_checks() {
               (get xs 3))
           :else 0))
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
-  (args/args-set! argc argv)
-  (exercise (args/args-nth 1) [10 20 30]))
+  (args/init! argc argv)
+  (exercise (args/nth 1) [10 20 30]))
 EOF
   build "$T/dbg.coil" "$T/dbg-on" --debug-checks || return
   expect_crash 'slice index out of bounds in get' "--debug-checks catches a slice index out of bounds" "$T/dbg-on" slice
@@ -985,8 +988,8 @@ section_debug_allocator() {
 (import "coil.alloc" :use *)
 (import "coil.debug-allocator" :use *)
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
-  (args/args-set! argc argv)
-  (let [mode (args/args-nth 1)
+  (args/init! argc argv)
+  (let [mode (args/nth 1)
         debug (debug-allocator-init (malloc-allocator))
         a (debug-allocator-view debug)
         p (unwrap-ptr [i64] (create [i64] a))]

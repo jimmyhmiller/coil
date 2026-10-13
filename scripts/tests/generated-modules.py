@@ -289,7 +289,7 @@ with tempfile.TemporaryDirectory(prefix="coil-generated-tests-", dir=os.environ.
     provider([("generated.value", layout_interface, layout_body + owner_transform)], facade_value)
     failure("check", "read-only generated-module interface")
 
-    provider([("generated.value", interface, '(module generated.value) (import "coil.args" :as args) (defn generated_value [] (-> i64) (args/args-count))')], facade_value)
+    provider([("generated.value", interface, '(module generated.value) (import "coil.args" :as args) (defn generated_value [] (-> i64) (args/count))')], facade_value)
     failure("check", "owns static storage")
     provider([("generated.value", interface, '(module generated.value) (defn generated_value [(x i64)] (-> i64) x)')], facade_value)
     failure("check", "generated_interface_check")
