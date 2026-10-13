@@ -299,8 +299,8 @@ begin/end event stream.
 | `COIL_META_JIT=0` | Run metaprograms from symbolized dylibs instead of in-memory code, so macOS `sample` and Instruments can name their frames |
 
 A program that needs its own thread stack size uses
-`coil.thread/thread-spawn-configured`, which takes explicit stack and guard
-sizes.
+`coil.thread/Thread::spawn-configured`, which takes explicit stack and guard
+sizes in a `ThreadConfig::new`.
 
 ## Troubleshooting sanitizer links
 

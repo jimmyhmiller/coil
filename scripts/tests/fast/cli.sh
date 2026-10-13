@@ -834,10 +834,10 @@ EOF
 (defn main [] (-> i64)
   (let [(mut counter) 0
         threads (primitive/alloc-stack (array Thread 2))]
-    (thread-spawn (index threads 0) (fnptr-of worker) (cast (ptr i8) (mut counter)))
-    (thread-spawn (index threads 1) (fnptr-of worker) (cast (ptr i8) (mut counter)))
-    (thread-join (index threads 0))
-    (thread-join (index threads 1))
+    (Thread::spawn (index threads 0) (fnptr-of worker) (cast (ptr i8) (mut counter)))
+    (Thread::spawn (index threads 1) (fnptr-of worker) (cast (ptr i8) (mut counter)))
+    (join (index threads 0))
+    (join (index threads 1))
     0))
 EOF
   if build "$T/tsan.coil" "$T/tsan" --sanitize=thread -O1; then
