@@ -135,6 +135,13 @@ EOF
   else
     bad "a coil.jit application builds from the installed toolchain" "$(tail -20 "$T/sdk.log")"
   fi
+  # Every build from the install loads the warmed unit, a second copy of the
+  # compiler that exports its own metaprogram callbacks. An interpreted macro must
+  # still call back into the compiler expanding it.
+  printf '(module interp-macro)\n(defn less-21 [(x Code)] (-> Code) `(- ~x 21))\n(defn main [] (-> i64) (less-21 21))\n' \
+    > "$T/sdk/interp-macro.coil"
+  expect_rc 0 "an interpreted macro (COIL_META_INTERP=1) expands with the warmed unit loaded" \
+    bash -c 'cd "$1" && COIL_META_INTERP=1 "$2" run interp-macro.coil --backend llvm' _ "$T/sdk" "$COIL"
   printf '(module plain)\n(defn main [] (-> i64) 0)\n' > "$T/sdk/plain.coil"
   (cd "$T/sdk" && "$COIL" emit-obj plain.coil -o plain.o) >/dev/null 2>&1
   local plain; plain=$(nm "$T/sdk/plain.o" 2>&1)
