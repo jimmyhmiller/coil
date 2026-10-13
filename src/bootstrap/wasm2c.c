@@ -574,6 +574,11 @@ int main(int argc, char **argv) {
                     break;
                 }
 
+                case 0x01: // table — the module exports its function table so a
+                           // host can call a function pointer the program hands it.
+                    fprintf(out, "void (**const %s_%s)(void) = t%" PRIu32 ";\n", mod, name, idx);
+                    break;
+
                 case 0x02:
                     fprintf(out, "uint8_t **const %s_%s = &m%" PRIu32 ";\n", mod, name, idx);
                     break;
