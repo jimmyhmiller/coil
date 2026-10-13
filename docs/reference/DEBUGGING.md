@@ -171,9 +171,9 @@ Record your own breadcrumbs with `coil.debug-runtime`; the most recent ones
 appear under `recent events` in the report:
 
 ```text
-(import "coil.debug-runtime" :use [debug-runtime-event! debug-runtime-set-event-capacity!])
-(debug-runtime-event! "loaded config")
-(debug-runtime-set-event-capacity! 64)     ; how many recent events to keep
+(import "coil.debug-runtime" :as debug-runtime)
+(debug-runtime/event! "loaded config")
+(debug-runtime/set-event-capacity! 64)     ; how many recent events to keep
 ```
 
 Set `COIL_CRASH_REPORT=/path/to/report` to also write the report to a file,
