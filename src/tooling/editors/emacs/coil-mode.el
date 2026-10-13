@@ -427,6 +427,23 @@ vector out at column forty.  A definition's body is two columns in from
 the form, however far its signature ran."
   (+ lisp-body-indent (coil--column-at (elt state 1))))
 
+(defun coil--method-form-p (open)
+  "Whether the list at OPEN is a method of an `impl' or a `deftrait'.
+A method is a form directly inside one of those whose first argument is
+its parameter vector, `(name [params] (-> R) body…)'.  The formatter lays
+it out as it does a `defn', its body two columns in from the method, not
+as a call whose arguments align under the first."
+  (save-excursion
+    (let ((outer (nth 1 (syntax-ppss open))))
+      (and outer
+           (eq (char-after outer) ?\()
+           (progn (goto-char (1+ outer))
+                  (looking-at "\\(?:impl\\|deftrait\\)\\_>"))
+           (progn (goto-char (1+ open))
+                  (ignore-errors (forward-sexp 1) t))
+           (progn (skip-chars-forward " \t\n")
+                  (eq (char-after) ?\[))))))
+
 (defun coil--indent-specform (count state indent-point)
   "Indent for a form with COUNT distinguished arguments before its body.
 Body forms always land two columns in from the form itself.  Emacs's
@@ -579,6 +596,7 @@ INDENT-POINT and STATE are as documented for that variable."
                     (point) (progn (forward-sexp 1) (point))))
              (spec (coil--indent-spec-for head)))
         (cond
+         ((coil--method-form-p open) (coil--indent-defform state))
          ((eq spec 'defun) (coil--indent-defform state))
          ((integerp spec) (coil--indent-specform spec state indent-point))
          ((member head coil-clause-forms)
