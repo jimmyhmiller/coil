@@ -16,7 +16,7 @@ names), `f65ab9213` (trait methods + the undefined-reference check).
 ```lisp
 (module myproject.app)                    ; convention: project-prefixed namespace
 (import "coil.control" :use *)        ; refer ALL of control's exported names
-(import "coil.slice"   :use [slice-for push])  ; refer just these
+(import "coil.slice"   :use [subslice sort])  ; refer just these
 (import "coil.io"      :as io)        ; qualified access only: (io/print …)
 (import "coil.str"     :use * :exclude [len])       ; all but these
 (import "coil.str"     :use * :rename [[len str-len]])  ; refer under a local name
@@ -82,9 +82,10 @@ head (`coil.control.for`) is hygiene-generated and trusted as already-resolved.
 The same scoping is mirrored in three places, by design: the canonical name resolver,
 the decision of which `(head …)` calls are macro calls, and **referential hygiene** — a
 symbol written in a macro template resolves in the *macro's* namespace (own defs + the
-macro's own `:use`d imports), not the use site. This is why `slice-for`'s generated
-`(for …)` becomes `coil.control.for` regardless of who calls `slice-for`, so a library's
-macros work without the user importing the library's dependencies.
+macro's own `:use`d imports), not the use site. This is why `coil.hashmap`'s
+`for-entries` generates a `(for …)` that becomes `coil.control.for` regardless of who calls
+`for-entries`, so a library's macros work without the user importing the library's
+dependencies.
 
 ## coil.core (the prelude)
 

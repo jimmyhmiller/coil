@@ -211,7 +211,7 @@ def ident_body(t):
         head=t[0]
         if head in ('ptr','ref','mut'): return push('(p/cast i64 value)')
         if head=='fnptr': return push('(p/cast i64 (p/cast (ptr i8) value))')
-        if head=='slice': return '(do '+push('(p/cast i64 (slice-data value))')+' '+push('(len value)')+' 0)'
+        if head=='slice': return '(do '+push('(p/cast i64 (data value))')+' '+push('(len value)')+' 0)'
         if head in ('dyn','array'): raise ValueError(('no identity for',t))
     head,mod,kind,params,tail=definition(t)
     if head=='coil.arraylist.ArrayList':
@@ -270,9 +270,9 @@ def body(t):
             return call('scan',inner,'value'),f'(p/cast {ty} (graph-address g (p/cast i64 value)))'
         if head=='slice':
             inner=t[1];ity=render(inner)
-            walk=f'''(do (graph-range! g (p/cast i64 (slice-data value)) (* (len value) (p/sizeof {ity})) (p/alignof {ity}))
-              (for [i 0 (len value)] {('0' if scalar(inner) else call('scan',inner,'(p/index (slice-data value) i)'))}) 0)'''
-            relocate=f'(slice-new [{ity}] (p/cast (ptr {ity}) (if (= (len value) 0) 0 (graph-address g (p/cast i64 (slice-data value))))) (len value))'
+            walk=f'''(do (graph-range! g (p/cast i64 (data value)) (* (len value) (p/sizeof {ity})) (p/alignof {ity}))
+              (for [i 0 (len value)] {('0' if scalar(inner) else call('scan',inner,'(p/index (data value) i)'))}) 0)'''
+            relocate=f'(slice::new [{ity}] (p/cast (ptr {ity}) (if (= (len value) 0) 0 (graph-address g (p/cast i64 (data value))))) (len value))'
             if inner=='u8': walk='(do (graph-mark-scope! g value) '+walk+' 0)'
             return walk,relocate
         if head=='array':raise ValueError(('inline array needs visitor',t))

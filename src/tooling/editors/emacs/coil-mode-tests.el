@@ -273,7 +273,7 @@ indentation."
 (import \"coil.primitive\" :as primitive)
 (import \"coil.str\" :use *)
 (import \"coil.hashmap\" :use [HashMap for-entries])
-(import \"coil.slice\" :use * :exclude [slice-get])
+(import \"coil.slice\" :use * :exclude [subslice])
 (import \"coil.io\" :as io :use * :rename [[write io-write] [read io-read]])
 "
     (let ((imports (coil-buffer-imports)))
@@ -289,7 +289,7 @@ indentation."
         (should (equal (coil-import-use hm) '("HashMap" "for-entries"))))
       (let ((slice (cl-find "coil.slice" imports :key #'coil-import-namespace
                             :test #'equal)))
-        (should (equal (coil-import-exclude slice) '("slice-get"))))
+        (should (equal (coil-import-exclude slice) '("subslice"))))
       (let ((io (cl-find "coil.io" imports :key #'coil-import-namespace
                          :test #'equal)))
         (should (equal (coil-import-alias io) "io"))
@@ -310,7 +310,7 @@ indentation."
 (module scope)
 (import \"coil.str\" :use *)
 (import \"coil.hashmap\" :use [HashMap])
-(import \"coil.slice\" :use * :exclude [slice-get])
+(import \"coil.slice\" :use * :exclude [subslice])
 (import \"coil.primitive\" :as primitive)
 
 (defstruct Point [(x i64) (y i64)])
@@ -319,7 +319,7 @@ indentation."
       (should (assoc "str-concat" scope))       ; :use *
       (should (assoc "HashMap" scope))          ; named in :use
       (should-not (assoc "for-entries" scope))  ; not named
-      (should-not (assoc "slice-get" scope))    ; excluded
+      (should-not (assoc "subslice" scope))     ; excluded
       (should (assoc "primitive/cast" scope))   ; alias-qualified
       (should (assoc "Point" scope))            ; defined here
       (should (equal (coil-def-kind (cdr (assoc "Point" scope))) "struct")))))

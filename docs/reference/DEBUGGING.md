@@ -50,8 +50,7 @@ It checks:
 - integer `+ - *` and negation for overflow (signed and unsigned), `/` and `%` for a
   zero divisor and for the minimum signed value divided by -1, and shifts by a
   negative amount or by the width or more;
-- `get`/`set!`/`slice-get`/`slice-set!`/`subslice` on a slice or array outside its
-  bounds;
+- `get`/`set!`/`subslice` on a slice or array outside its bounds;
 - an integer or float-to-integer `cast` whose value does not fit;
 - a `cast` to a pointer type whose address is not a multiple of the pointee's
   alignment. A zero address, the null pointer, passes, and so does a cast to a byte
@@ -106,15 +105,14 @@ collection such as `ArrayList` checks its own invariants too. Importing
 ## Runtime checks: `--debug-checks`
 
 ```text
-(import "coil.slice" :use [slice-get])
 (defn main [] (-> i64)
-  (let [xs [1 2 3]]
-    (slice-get xs 5)))
+  (let [xs (: [1 2 3] (slice i64))]
+    (get xs 5)))
 ```
 
 ```sh
 $ coil run oob.coil --debug-checks
-coil: invalid slice header or slice-get index out of bounds (--debug-checks)
+coil: invalid slice header or slice index out of bounds in get (--debug-checks)
 ```
 
 With the flag, the standard library checks its own invariants:

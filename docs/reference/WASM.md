@@ -21,17 +21,16 @@ The Coil side:
 
 ```text
 (module page)
-(import "coil.slice" :use [slice-data slice-len])
 
 ;;; Host functions: declared but never defined, so each becomes an `env.*` import.
 (extern js_log :cc c [(ptr u8) i32] (-> void))
 (extern js_document :cc c [] (-> externref))
 (extern js_set_title :cc c [externref (ptr u8) i32] (-> void))
 
-(defn text-len [(s (slice u8))] (-> i32) (cast i32 (slice-len s)))
+(defn text-len [(s (slice u8))] (-> i32) (cast i32 (len s)))
 
 (defn log [(s (slice u8))] (-> void)
-  (js_log (slice-data s) (text-len s)))
+  (js_log (data s) (text-len s)))
 
 (defn add [(a i32) (b i32)] (-> i32) (+ a b))
 (export-c [add :as "add"])
@@ -39,7 +38,7 @@ The Coil side:
 (defn main [] (-> i64)
   (log "hello from coil")
   (let [title "Coil page"]
-    (js_set_title (js_document) (slice-data title) (text-len title)))
+    (js_set_title (js_document) (data title) (text-len title)))
   0)
 ```
 
@@ -81,7 +80,7 @@ named `env.<name>`. The module imports only the host functions it calls, so
 unused declarations cost nothing.
 
 Strings and byte buffers cross as a pointer and a length into linear memory.
-Pass `(slice-data s)` and `(slice-len s)`, and decode on the JavaScript side
+Pass `(data s)` and `(len s)`, and decode on the JavaScript side
 with `TextDecoder`, as above. String literals and `alloc-static` storage live
 at fixed addresses in the module's memory and need no setup from JavaScript.
 

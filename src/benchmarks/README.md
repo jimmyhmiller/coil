@@ -44,7 +44,7 @@ a way the scalar micros never reveal.
 | file | what it stresses |
 |---|---|
 | `structcall` | a 3-field struct passed **by value** to a hot leaf fn (AAPCS64/SysV coercion) |
-| `slicesum` | a cache-resident `(slice i64)` indexed 200M times via `slice-get` (fat pointer + a generic accessor) vs C's raw `a[i&1023]` |
+| `slicesum` | a cache-resident `(slice i64)` indexed 200M times via `get` (fat pointer + a generic accessor) vs C's raw `a[i&1023]` |
 | `genreduce` | a **monomorphized generic** `gsum[T]` at `i64` vs a hand-written i64 loop |
 
 Coil has no loop keyword — iteration is **tail recursion**, which the optimizer turns
