@@ -402,9 +402,11 @@ open(sys.argv[1], "w").write(
   # constructor that needs its type imported, a binding that would capture the new
   # name, lines aligned with a call's arguments, a renamed function whose new name
   # the file already calls, written qualified, a name core provided with no import,
-  # a name reached through a module that re-exports its own, a call in a template;
-  # quoted data and a template's symbol only a hand could rewrite are left as
-  # written), and the program runs.
+  # a name reached through a module that re-exports its own, a call in a template,
+  # names a template writes fully dotted (`coil.hashmap.hm-len`) for the module
+  # that expands it, which it rewrites to spellings that need no import there
+  # either; quoted data and a template's symbol only a hand could rewrite are left
+  # as written), and the program runs, the template expanded in another module.
   mkdir -p "$T/renamed/src"
   printf '[package]\nname = "renamed"\nentry = "src/main.coil"\n' > "$T/renamed/Coil.toml"
   cat > "$T/renamed/src/main.coil" <<'EOF'
@@ -413,7 +415,7 @@ open(sys.argv[1], "w").write(
 (import "coil.hashmap" :use [hm-new-scalar hm-put! hm-get hm-len hm-for hm-free!])
 (import "renamed.tally" :as tally)
 (import "renamed.size" :use [size])
-(import "renamed.show" :use [show])
+(import "renamed.show" :use [show census])
 (import "coil.args" :use [args-count])
 
 (defn main [] (-> i64)
@@ -424,7 +426,7 @@ open(sys.argv[1], "w").write(
              (+ (match (hm-get m 2) (Some [v] v) (None [] 0))
                 (hm-len m)))
     (let [len (hm-len m)]
-      (hm-for [k v m] (when (= k 9) (println "{} {} {} {} {}" (- (hm-len m) len) v (tally/total (mut m)) (size m) (+ (args-count) (count (range 0 3)))))))
+      (hm-for [k v m] (when (= k 9) (println "{} {} {} {} {} {}" (- (hm-len m) len) v (tally/total (mut m)) (size m) (+ (args-count) (count (range 0 3))) (census m 4)))))
     (hm-free! (mut m))
     (show 4 2)
     0))
@@ -450,7 +452,7 @@ EOF
 
 (defn size [(m (HashMap i64 i64))] (-> i64) (+ (hm-len m) (capacity m)))
 
-(defn heads [(m Code)] (-> Code) `(do (hm-len ~m) (quote hm-len) hm-get))
+(defn heads [(m Code)] (-> Code) `(do (hm-len ~m) (quote hm-len) (quote coil.hashmap.hm-len) hm-get))
 EOF
   cat > "$T/renamed/src/show.coil" <<'EOF'
 (module renamed.show)
@@ -469,6 +471,14 @@ EOF
   (let [(mut f) (zeroed Formatter)]
     (debug/formatter-init (mut f) (stdout))
     (display-fmt (Pair :a a :b b) (mut f))))
+
+(defn census [(m Code) (k Code)] (-> Code)
+  `(let [len 1
+         (mut seen) (coil.hashmap.hm-new-scalar [i64 i64] (coil.alloc.malloc-allocator))]
+     (coil.hashmap.hm-for [key v ~m] (coil.hashmap.hm-put! (mut seen) key v))
+     (let [n (+ (coil.hashmap.hm-len seen) (if (coil.hashmap.hm-contains? seen ~k) len 0))]
+       (coil.hashmap.hm-free! (mut seen))
+       n)))
 EOF
   expect_rc_out 1 "removed library names.*coil lint --fix" \
     "building a project that uses removed library names points at lint --fix" \
@@ -486,7 +496,7 @@ EOF
 (import "coil.hashmap" :use [for-entries HashMap])
 (import "renamed.tally" :as tally)
 (import "renamed.size" :use [size])
-(import "renamed.show" :use [show])
+(import "renamed.show" :use [show census])
 (import "coil.args")
 
 (defn main [] (-> i64)
@@ -497,7 +507,7 @@ EOF
           (+ (match (get m 2) (Some [v] v) (None [] 0))
              (len m)))
     (let [len (len m)]
-      (for-entries [k v m] (when (= k 9) (println "{} {} {} {} {}" (- (Len::len m) len) v (tally/total (mut m)) (size m) (+ (coil.args/count) (count (range 0 3)))))))
+      (for-entries [k v m] (when (= k 9) (println "{} {} {} {} {} {}" (- (Len::len m) len) v (tally/total (mut m)) (size m) (+ (coil.args/count) (count (range 0 3))) (census m 4)))))
     (free! (mut m))
     (show 4 2)
     0))
@@ -523,7 +533,7 @@ EOF
 
 (defn size [(m (HashMap i64 i64))] (-> i64) (+ (len m) (cap m)))
 
-(defn heads [(m Code)] (-> Code) `(do (len ~m) (quote hm-len) hm-get))
+(defn heads [(m Code)] (-> Code) `(do (len ~m) (quote hm-len) (quote coil.hashmap.hm-len) hm-get))
 EOF
   cat > "$T/renamed-show.want" <<'EOF'
 (module renamed.show)
@@ -542,6 +552,14 @@ EOF
   (let [(mut f) (zeroed Formatter)]
     (debug/Formatter::init (mut f) (stdout))
     (display-fmt (Pair :a a :b b) (mut f))))
+
+(defn census [(m Code) (k Code)] (-> Code)
+  `(let [len 1
+         (mut seen) (coil.hashmap.HashMap::new-scalar [i64 i64] (coil.alloc.malloc-allocator))]
+     (coil.hashmap.for-entries [key v ~m] (set! (mut seen) key v))
+     (let [n (+ (Len::len seen) (if (contains? seen ~k) len 0))]
+       (free! (mut seen))
+       n)))
 EOF
   local f migrated=1
   for f in main tally size show; do
@@ -553,7 +571,7 @@ EOF
   # One run, two lines: the map arithmetic, then the Display impl's output.
   local ran
   ran=$(cd "$T/renamed" && "$COIL" run 2>&1); rc=$?
-  grep -qxF "0 9 39 22 3" <<<"$ran" && ok "the migrated project runs" \
+  grep -qxF "0 9 39 22 3 7" <<<"$ran" && ok "the migrated project runs" \
     || bad "the migrated project runs" "exit $rc: $ran"
   grep -qxF "4/2" <<<"$ran" && ok "the migrated project formats through its Display impl" \
     || bad "the migrated project formats through its Display impl" "exit $rc: $ran"
