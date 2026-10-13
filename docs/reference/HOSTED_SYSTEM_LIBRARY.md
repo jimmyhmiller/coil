@@ -126,23 +126,24 @@ same integer descriptor must be synchronized by the application.
 
 ## `coil.subprocess` and `coil.process`
 
-`spawn` takes an allocator, caller-owned `Child`, program, argument slice, and three
-stdio policies. Arguments exclude `argv[0]`; Coil sets it to the program. `execvp`
-performs PATH lookup, empty arguments are preserved, embedded NUL is rejected, and no
-shell is involved.
+`Child::spawn` takes an allocator, caller-owned `Child`, program, argument slice, and
+three stdio policies; `Child::spawn-with-options` adds a `SpawnOptions`
+(`SpawnOptions::new` for the defaults). Arguments exclude `argv[0]`; Coil sets it to
+the program. `execvp` performs PATH lookup, empty arguments are preserved, embedded
+NUL is rejected, and no shell is involved.
 
 The stdio policies are `inherit-stdio`, `null-stdio`, `pipe-stdio`, and
 `merge-stderr` (stderr only). Piped streams adapt to ordinary `coil.io` capabilities
-through `child-stdin-writer`, `child-stdout-reader`, and `child-stderr-reader`.
+through `Child::stdin-writer`, `Child::stdout-reader`, and `Child::stderr-reader`.
 
-Lifecycle is explicit:
+Lifecycle is explicit, through methods on the `Child`:
 
-1. `child-close-stdin` sends EOF without touching output streams.
-2. `child-try-wait` returns `None` while running; `child-wait` blocks and caches status.
-3. `child-wait-until` returns `Timeout` while leaving the child valid and running.
-4. `child-terminate` and `child-kill` only send a signal; the caller still waits.
-5. `child-kill-and-wait` is the forceful leak-free finalization path.
-6. `child-close` closes parent streams but returns `StillRunning` until the child has
+1. `close-stdin` sends EOF without touching output streams.
+2. `try-wait` returns `None` while running; `wait` blocks and caches status.
+3. `wait-until` returns `Timeout` while leaving the child valid and running.
+4. `terminate` and `kill` only send a signal; the caller still waits.
+5. `kill-and-wait` is the forceful leak-free finalization path.
+6. `close` closes parent streams but returns `StillRunning` until the child has
    been reaped. It never silently kills or detaches a child.
 
 `ExitStatus` distinguishes `Exited(code)` from `Signaled(signal)`. A missing
