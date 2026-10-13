@@ -938,16 +938,36 @@ EOF
     [ $? = 255 ] && ok "without --debug-checks no check is emitted (subslice length -1)" \
                  || bad "without --debug-checks no check is emitted" "want exit 255"
   fi
-  # The stack-return lint is a warning under --debug-checks and is not loaded without it.
+  # The stack-return and allocator lints warn under --debug-checks and are not
+  # loaded without it. The allocator lint finds a Region whose parent allocator is
+  # another Region's, by the declarations Region::new and `allocator` resolve to.
   cat > "$T/dangle.coil" <<'EOF'
 (module dangle)
+(import "coil.region" :as region)
+(import "coil.alloc" :use [malloc-allocator])
 (defn dangling [] (-> (ptr i64))
   (let [x (coil.primitive/alloc-stack i64)] (store! x 42) x))
-(defn main [] (-> i64) (load (dangling)))
+(defn nested [] (-> i64)
+  (match (region/Region::new (malloc-allocator))
+    (None [] 1)
+    (Some [outer]
+      (match (region/Region::new (allocator outer))
+        (None [] 0)
+        (Some [inner] (close! inner) 0))
+      (close! outer)
+      0)))
+(defn main [] (-> i64) (+ (load (dangling)) (nested)))
 EOF
-  expect_rc_out 0 'returns a pointer to a stack local' "--debug-checks warns on returning a pointer to a stack local" \
-    "$COIL" build "$T/dangle.coil" -o "$T/dangle-on" --debug-checks
   local out rc
+  out=$("$COIL" build "$T/dangle.coil" -o "$T/dangle-on" --debug-checks 2>&1); rc=$?
+  case "$rc:$out" in
+    0:*"returns a pointer to a stack local"*) ok "--debug-checks warns on returning a pointer to a stack local" ;;
+    *) bad "--debug-checks warns on returning a pointer to a stack local" "exit $rc: $out" ;;
+  esac
+  case "$rc:$out" in
+    0:*"Region is backed by another Region allocator"*"dangle.coil:10:34"*) ok "--debug-checks warns on a region whose parent is a region" ;;
+    *) bad "--debug-checks warns on a region whose parent is a region" "exit $rc: $out" ;;
+  esac
   out=$("$COIL" build "$T/dangle.coil" -o "$T/dangle-off" 2>&1); rc=$?
   if [ "$rc" = 0 ] && [ -x "$T/dangle-off" ]; then
     case "$out" in *"stack local"*) bad "the stack-return lint is off by default" "$out" ;;
