@@ -1347,6 +1347,7 @@ discarded.
 (import "coil.hashmap" :use *)                 ; everything
 (import "coil.io" :use * :exclude [print])     ; all but these
 (import "coil.fmt" :use * :rename [[fmt fmt-to]])
+(import "myapp.geometry.units" :use [Meters] :reexport) ; importers see Meters too
 ```
 
 - An import names a **namespace**, never a file. Coil indexes every `.coil` file
@@ -1359,6 +1360,11 @@ discarded.
 - Every module implicitly imports `coil.core` (`Option`, the traits, `println`,
   `when`, `for`…). An explicit `(import "coil.core" …)` replaces that implicit
   import, so you can exclude or shadow core names.
+- `:reexport` passes an import on to the module's own importers, as if the module
+  defined those names. It passes on exactly what the import refers: the `:use`
+  list, less `:exclude`, under each `:rename`'s new name. A `:reexport` with no
+  `:use` passes on every name of its module, although it refers none of them in the
+  module itself. A module's `(export …)` list limits re-exported names too.
 
 Two modules may declare the same C `extern`. A C symbol is global to the linker,
 but a declaration belongs to the module that wrote it: each module's calls are

@@ -12,7 +12,7 @@ needed a workaround here is a defect in the system rather than in the test. Two
 did; one is fixed and one is a documented cost:
 
 - `coil.prop.derive` was not reachable through `coil.prop`, so the `Arbitrary`
-  impl for `Rec` is written out by hand. `coil.prop` reexports it now, and
+  impl for `Rec` is written out by hand. `coil.prop` loads it now, and
   `(derive Arbitrary Rec)` would do; the hand-written impl stays because the
   override path is worth testing.
 - A hand-written `Debug` impl mentions `Writer`, which lives in `coil.io`, so

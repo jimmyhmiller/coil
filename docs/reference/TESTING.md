@@ -231,14 +231,17 @@ the generator's invariants in every shrunk value.
 
 `(import "coil.prop" :use *)` brings in what writing properties takes: these
 forms, `defprop`, `defprop-stateful`, `Arbitrary` and its helpers (`arb`,
-`bytes`, `string`, `int-range`, `list-n`, …), and the `draw-…` and `span-…`
-operations. Generator values are in `coil.prop.gen`, whose constructors are
-plain words (`int`, `map`, `filter`): import it `:as gen`, build with
-`(gen/int s 1 100)` or `(gen/list-of s g 1 8)`, and draw with `(draw g s)`. The engine
-itself (`coil.prop.source`'s tapes and spans, `coil.prop.runner`) is not
-re-exported; import those modules directly to work on it. `defprop` itself needs
-nothing else in scope, so `(import "coil.prop" :use [defprop])` is enough for a
-property that draws only its arguments.
+`bytes`, `string`, `int-range`, `list-n`, …), `Source` with the `draw-…` and
+`span-…` operations and the `SPAN-…` kinds, and the `src-…` size and fuel
+accessors a recursive generator needs. Generator values are in `coil.prop.gen`,
+whose constructors are plain words (`int`, `map`, `filter`): import it `:as gen`,
+build with `(gen/int s 1 100)` or `(gen/list-of s g 1 8)`, and draw with
+`(draw g s)`. The engine itself is not re-exported: the rest of
+`coil.prop.source` (tapes, replay, `source-new`), `coil.prop.runner`, and
+`coil.prop.stateful`'s machinery (`sm-new`, `sm-search`, …). Import those modules
+directly to work on it. `defprop` itself needs nothing else in scope, so
+`(import "coil.prop" :use [defprop])` is enough for a property that draws only its
+arguments.
 
 Values drawn by hand are not arguments, so a report shows them only if you
 note them:

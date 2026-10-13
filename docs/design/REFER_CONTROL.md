@@ -280,5 +280,5 @@ surfaces"), the `LANGUAGE_GUIDE.md` imports section, and `src/compiler/guide.coi
   the binary.
 - **Typo-checking `:exclude`/`:rename` names.** See §4: needs a name table that spans
   definitions, traits and methods, which does not exist in one place yet.
-- **`:exclude` on a `:reexport`.** A reexporting facade cannot currently narrow what it
-  republishes.
+- **`:exclude` on a `:reexport`.** Done: a reexport edge is a `Use`, so a facade
+  republishes exactly what its import refers (`:use` list, `:exclude`, `:rename`).
