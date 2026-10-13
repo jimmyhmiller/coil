@@ -107,6 +107,17 @@ EOF
   [ ! -e child-output ] && [ ! -e "$T/child-output" ] \
     && ok "a child's -o does not select the build output" \
     || bad "a child's -o does not select the build output" "child-output was written"
+
+  # The REPL: a definition, a call, a redefinition with the same signature
+  # (coil.repl's Var policy), and the call again. Each definition records what
+  # it reads in the session's dependency base.
+  out=$(printf '(defn sq [(x i64)] (-> i64) (* x x))\n(sq 7)\n(defn sq [(x i64)] (-> i64) (+ x x))\n(sq 7)\n:q\n' \
+          | "$COIL" repl 2>&1); rc=$?
+  if [ "$rc" = 0 ] && grep -qx "coil> 49" <<<"$out" && grep -qx "coil> 14" <<<"$out"; then
+    ok "the REPL defines, calls and redefines a function"
+  else
+    bad "the REPL defines, calls and redefines a function" "exit $rc: $out"
+  fi
 }
 
 # ---------------------------------------------------------------------------
