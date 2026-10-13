@@ -230,10 +230,13 @@ the generator's invariants in every shrunk value.
 | `(prop-draw T "label")` | Draw any `Arbitrary` type and note it, in one step |
 
 `(import "coil.prop" :use *)` brings in what writing properties takes: these
-forms, `defprop`, `defprop-stateful`, `Arbitrary` and its `arb-…` helpers, the
-`draw-…` and `span-…` operations, and generator values (`gen-…`). The engine
-itself (`coil.prop.source`'s tapes and spans, `coil.prop.runner`) is not
-re-exported; import those modules directly to work on it. `defprop` itself
+forms, `defprop`, `defprop-stateful`, `Arbitrary` and its `arb-…` helpers, and
+the `draw-…` and `span-…` operations. Generator values are in `coil.prop.gen`,
+whose constructors are plain words (`int`, `map`, `filter`): import it `:as gen`,
+build with `(gen/int s 1 100)` or `(gen/list-of s g 1 8)`, and draw with
+`(draw g s)`. The engine itself (`coil.prop.source`'s tapes and spans,
+`coil.prop.runner`) is not re-exported; import those modules directly to work on
+it. `defprop` itself
 needs nothing else in scope, so `(import "coil.prop" :use [defprop])` is enough
 for a property that draws only its arguments.
 
