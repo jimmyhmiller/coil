@@ -16,6 +16,7 @@
 (import "coil.compiler.orc" :use *)
 (import "coil.compiler.parser" :use [sconcat i64->str])
 (import "coil.compiler.loader" :use [cstr->slice ls-copy-list])
+(import "coil.compiler.jit" :use [jit-exit-register-owned jit-run-owned-exit-handlers!])
 
 (defstruct LLVMJitSym [(name (slice u8)) (addr (ptr i8)) (owner (ptr i8))])
 (defstruct LLVMJitGeneration
@@ -81,6 +82,76 @@
                     0))
                 (set! global (LLVMGetNextGlobal (load global))))))
     0))
+
+;;; Loaded code registers its exit handlers with the session, not with libc,
+;;; which would call them after the session released their code. A module that
+;;; declares `atexit` or `__cxa_atexit` gets its own internal definition, which
+;;; registers the handler in the name of `owner`, the submission's resource
+;;; tracker; the tracker's handlers run before its code is removed. The in-memory
+;;; loaders know which image a handler's code lies in; ORC does not say where it
+;;; put an object, so here the code that registered a handler owns it, as the
+;;; registering library does under libc.
+(defn llvm-jit-own-exit-registration! [(a (dyn Allocator)) (module (ptr i8))
+                                       (name (slice u8)) (params i64)
+                                       (with-arg i64) (owner i64)] (-> bool)
+  (let [f (LLVMGetNamedFunction module (str->cstr a name))]
+    (if (or (= (primitive/cast i64 f) 0)
+            (= (LLVMIsDeclaration f) (primitive/cast i32 0)))
+        true
+        (let [ctx (LLVMGetModuleContext module)
+              fnty (LLVMGlobalGetValueType f)
+              ret (LLVMGetReturnType fnty)
+              ptr-ty (LLVMPointerTypeInContext ctx (primitive/cast i32 0))
+              i32-ty (LLVMInt32TypeInContext ctx)
+              i64-ty (LLVMInt64TypeInContext ctx)
+              n (primitive/cast i64 (LLVMCountParamTypes fnty))
+              returns-void (= (LLVMGetTypeKind ret) (primitive/cast i32 0))
+              (mut types) (al-new [(ptr i8)] a)
+              (mut shaped) (and (= n params)
+                                (or returns-void (= (primitive/cast i64 ret) (primitive/cast i64 i32-ty))))]
+          (when (load shaped)
+            (for [i 0 n] (push! (mut types) (primitive/cast (ptr i8) 0)))
+            (LLVMGetParamTypes fnty (.data types))
+            (for [i 0 n]
+              (unless (= (primitive/cast i64 (get (load types) i)) (primitive/cast i64 ptr-ty))
+                (set! shaped false) 0))
+            0)
+          (if (not (load shaped))
+              (do
+                (print-str (stderr) "error: LLVM JIT: code declares `")
+                (print-str (stderr) name)
+                (print-str (stderr) "` with a signature other than C's, so its exit handlers cannot be kept with its code\n")
+                false)
+              (let [builder (LLVMCreateBuilderInContext ctx)
+                    (mut register-params) (al-new [(ptr i8)] a)
+                    (mut args) (al-new [(ptr i8)] a)]
+                (push! (mut register-params) ptr-ty)
+                (push! (mut register-params) ptr-ty)
+                (push! (mut register-params) i64-ty)
+                (push! (mut register-params) i64-ty)
+                (push! (mut args) (LLVMGetParam f (primitive/cast i32 0)))
+                (push! (mut args) (if (= with-arg 0)
+                                      (LLVMConstNull ptr-ty)
+                                      (LLVMGetParam f (primitive/cast i32 1))))
+                (push! (mut args) (LLVMConstInt i64-ty with-arg (primitive/cast i32 0)))
+                (push! (mut args) (LLVMConstInt i64-ty owner (primitive/cast i32 0)))
+                (LLVMPositionBuilderAtEnd builder (LLVMAppendBasicBlockInContext ctx f c"entry"))
+                (let [register-ty (LLVMFunctionType i32-ty (.data register-params) (primitive/cast i32 4) (primitive/cast i32 0))
+                      callee (LLVMConstIntToPtr
+                               (LLVMConstInt i64-ty
+                                             (primitive/cast i64 (primitive/cast (ptr i8) (primitive/fnptr-of jit-exit-register-owned)))
+                                             (primitive/cast i32 0))
+                               ptr-ty)
+                      result (LLVMBuildCall2 builder register-ty callee (.data args) (primitive/cast i32 4) c"")]
+                  (if returns-void (LLVMBuildRetVoid builder) (LLVMBuildRet builder result)))
+                (LLVMDisposeBuilder builder)
+                (LLVMSetLinkage f (primitive/cast i32 8))
+                true))))))
+
+(defn llvm-jit-own-exit-handlers! [(a (dyn Allocator)) (module (ptr i8)) (owner (ptr i8))] (-> bool)
+  (let [token (primitive/cast i64 owner)]
+    (and (llvm-jit-own-exit-registration! a module "atexit" 1 0 token)
+         (llvm-jit-own-exit-registration! a module "__cxa_atexit" 3 1 token))))
 
 (defn llvm-jit-required? [(state (ptr LLVMJitState)) (owner (ptr i8))] (-> bool)
   (block :found
@@ -162,6 +233,14 @@
             (mut reclaimed) 0
             n (len (.generations state))]
         (unless all (llvm-jit-mark-images! state) 0)
+        ; Every handler runs before any of the code it may call is removed.
+        (let [(mut i) n]
+          (while (> i 0)
+            (set! i (- i 1))
+            (let [generation (al-elem [LLVMJitGeneration] (field state generations) i)]
+              (when (or all (not (.marked generation)))
+                (jit-run-owned-exit-handlers! (primitive/cast i64 (.tracker generation)))
+                0))))
         (loop (if (>= (load read) n)
                   (break)
                   (let [generation
@@ -373,6 +452,8 @@
         status
           (block :candidate
             (llvm-jit-externalize-prior! module state)
+            (unless (llvm-jit-own-exit-handlers! scratch-a module tracker)
+              (codegen-dispose-module! module) (return-from :candidate 1))
             (unless (llvm-jit-verify module)
               (codegen-dispose-module! module) (return-from :candidate 1))
             (unless (llvm-jit-module-symbols! scratch-a module state jd (mut publications) (mut dependencies))
@@ -395,6 +476,7 @@
                     (primitive/call-ptr (primitive/cast (fnptr c [] i64) (primitive/cast (ptr i8) entry)))))))]
     (if (!= status 0)
       (do
+        (jit-run-owned-exit-handlers! (primitive/cast i64 tracker))
         (llvm-jit-demand! (LLVMOrcResourceTrackerRemove tracker))
         (LLVMOrcReleaseResourceTracker tracker)
         (llvm-jit-demand! (LLVMOrcJITDylibClear jd))
