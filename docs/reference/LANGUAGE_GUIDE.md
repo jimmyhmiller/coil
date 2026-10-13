@@ -1182,7 +1182,8 @@ pop
 | `coil.arraylist`: `(ArrayList T)` | `Len` `Get` `Set` `Push` `Pop` `Iterable` |
 | `coil.hashmap`: `(HashMap K V)` | `Len` `Get` (returns `Option`) `Set` `Iterable` (keys) |
 | `coil.fixedlist`: `(FixedList T)`, `(InlineList T N)` | `Len` `Get` `Set` `Push` `Pop` `Iterable` |
-| `coil.pvec`: `(PVec T)`, `coil.pmap`: `(PMap K V)` | persistent; `Len` `Clone` `Drop` |
+| `coil.pvec`: `(PVec T)` | persistent; `Len` `Clone` `Drop` |
+| `coil.pmap`: `(PMap K V)` | persistent; `Len` `Get` (returns `Option`) `Set` `Iterable` (pairs) `Clone` `Drop` |
 
 ```coil
 (module example.collections)
@@ -1243,6 +1244,9 @@ evens=3 total=10
   `(extend! (mut xs) p n)`, `(slice xs)`, `(into-slice (mut xs))`, `(clear! (mut xs))`
   and `(free! (mut xs))`, which releases one from a general-purpose allocator. A map
   has `(contains? m k)`, `(remove! (mut m) k)`, `(clear! (mut m))` and `(free! (mut m))`.
+- A persistent map is edited two ways. `(assoc m k v)` and `(dissoc m k)` return a
+  new map that shares storage with `m`, which stays as it was; `(set! (mut m) k v)`
+  and `(dissoc! (mut m) k)` edit `m` itself, in place where nothing else shares it.
 
 ## Text and output
 
