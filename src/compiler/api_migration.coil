@@ -1,0 +1,952 @@
+; Source migration for standard-library names that were removed when a namespace's
+; module-prefixed functions became methods and traits. The table of what was
+; removed, and how to add to it, is coil.compiler.api_renames; this is the rewrite.
+;
+; A program that still calls a removed name does not load, so this works on read
+; syntax, before loading: `prelint-run` in driver.coil applies the edits as part of
+; `coil lint --fix`, and breaking_changes.coil asks `ar-breaking?` so that building
+; such a project points at the fix.
+;
+; What the migration does with a file (`ar-migrate`): every spelling of an old name
+; (bare through `:use [names]`, `:use *` or `:rename`; `alias/name`; `module/name`)
+; is rewritten, and the lines aligned with a rewritten call's arguments move with
+; them. Old names leave `:use`, `:exclude` and `:rename` lists, a type a call needs
+; is added to the `:use` list it came through (or to a new import), and an import
+; left with nothing to bring in is deleted. A use it cannot rewrite (an old name
+; passed as a value, or called with named arguments) is a finding, and the file is
+; left for the author.
+(module coil.compiler.api_migration)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use [subslice])
+(import "coil.reader" :use *)
+(import "coil.compiler.parser" :use [sx-lo sx-hi box-al sconcat sconcat3])
+(import "coil.compiler.api_renames"
+        :use
+        [ApiRename
+         ApiChange
+         api-renames
+         api-rename-index
+         api-renamed-modules
+         api-rename-note])
+(import "coil.hashmap" :use [HashMap])
+(import "coil.str" :use [str-keyops-borrowed])
+(import "coil.compiler.generic_migration"
+        :use
+        [GmFile
+         GmImport
+         gm-read-file
+         gm-refers
+         gm-local-of
+         gm-names-contain?
+         gm-head
+         gm-count
+         gm-at
+         gm-text
+         gm-list?
+         gm-vec?
+         gm-sym?
+         gm-kw?
+         gm-find-slash])
+
+(defn ar-row [(i i64)] (-> ApiRename) (get (api-renames) i))
+
+; ---- results ----------------------------------------------------------------------
+
+;;; Replace source bytes [lo, hi) with `text`. `note` is the warning the preflight
+;;; prints for it, "" for an edit that only follows from another (a dropped type
+;;; argument vector, the re-indented lines of a call whose head changed length).
+(defstruct ArEdit [(lo i64) (hi i64) (text (slice u8)) (note (slice u8))])
+
+;;; A use of a removed name the migration cannot rewrite.
+(defstruct ArFinding [(lo i64) (message (slice u8))])
+
+(defstruct ArResult
+  [(edits (ptr (ArrayList ArEdit))) (findings (ptr (ArrayList ArFinding)))])
+
+; ---- one file -----------------------------------------------------------------------
+
+;;; A name a migrated call needs in scope: added to the `:use` list of import
+;;; `import`, or, when that is -1, brought in by a new import of `module`.
+(defstruct ArAdd [(import i64) (module (slice u8)) (name (slice u8))])
+
+;;; A rewritten call whose arguments moved by `delta` columns: its continuation lines
+;;; indented at least `col` (the old column of its first argument) move with them.
+(defstruct ArShift [(lo i64) (hi i64) (col i64) (delta i64)])
+
+;;; One enclosing form on the walk's path, and which of its children holds the node.
+(defstruct ArStep [(form (ptr Sexp)) (index i64)])
+
+;;; How a symbol reaches a removed name: the row, the import it comes through (an
+;;; index into the file's imports), the qualifier it was written with ("" when bare)
+;;; and the name after the qualifier.
+(defstruct ArRef [(row i64) (import i64) (qualifier (slice u8)) (local (slice u8))])
+
+(defstruct ArCx
+  [(a (dyn Allocator))
+   (src (slice u8))
+   (file (ptr GmFile))
+   ; names this file defines at top level: bare, they are its own and not the
+   ; removed ones, and a migrated call must not be captured by them
+   (own (ptr (ArrayList (slice u8))))
+   ; the imports of a module that lost names, and every local spelling (after any
+   ; qualifier) that could reach one of them: a symbol not in `spellings` is
+   ; answered without looking further
+   (renamed (ptr (ArrayList i64)))
+   (spellings (ptr (HashMap (slice u8) bool)))
+   ; the forms enclosing the node being walked, each with the index of the child
+   ; the walk is in
+   (path (ptr (ArrayList ArStep)))
+   ; per import: an old name was reached through it or listed in it
+   (touched (ptr (ArrayList bool)))
+   ; per import: after the rewrite, some symbol is still qualified through it
+   (referenced (ptr (ArrayList bool)))
+   (adds (ptr (ArrayList ArAdd)))
+   (shifts (ptr (ArrayList ArShift)))
+   (edits (ptr (ArrayList ArEdit)))
+   (findings (ptr (ArrayList ArFinding)))])
+
+(defn ar-import [(cx (ptr ArCx)) (i i64)] (-> (ptr GmImport))
+  (al-elem [GmImport] (.imports (.file cx)) i))
+
+(defn ar-import-count [(cx (ptr ArCx))] (-> i64)
+  (len (load (.imports (.file cx)))))
+
+(defn ar-edit! [(cx (ptr ArCx)) (lo i64) (hi i64) (text (slice u8)) (note (slice u8))] (-> i64)
+  (push! (.edits cx) (ArEdit :lo lo :hi hi :text text :note note))
+  0)
+
+(defn ar-finding! [(cx (ptr ArCx)) (at (ptr Sexp)) (message (slice u8))] (-> i64)
+  (push! (.findings cx) (ArFinding :lo (sx-lo (load at)) :message message))
+  0)
+
+(defn ar-mark! [(flags (ptr (ArrayList bool))) (i i64)] (-> i64)
+  (when (>= i 0) (store! (al-elem [bool] flags i) true) 0)
+  0)
+
+;;; The removed name TEXT denotes in this file, if any.
+(defn ar-resolve [(cx (ptr ArCx)) (text (slice u8))] (-> (Option ArRef))
+  (let [slash (gm-find-slash text)
+        (mut out) (None [ArRef])
+        (mut found) false]
+    (cond
+      (not (contains? (load (.spellings cx))
+                      (if (> slash 0) (subslice text (+ slash 1) (len text)) text)))
+        0
+      (> slash 0)
+        (let [q (subslice text 0 slash)
+              name (subslice text (+ slash 1) (len text))]
+          (for [k 0 (len (load (.renamed cx)))]
+            (let [i (get (load (.renamed cx)) k)
+                  imp (ar-import cx i)]
+              (when (and (not found)
+                         (or (= (.alias imp) q) (= (.module imp) q)))
+                (let [row (api-rename-index (.module imp) name)]
+                  (when (>= row 0)
+                    (set! out (Some (ArRef :row row :import i :qualifier q :local name)))
+                    (set! found true)
+                    0))
+                0))
+            0)
+          0)
+      (not (gm-names-contain? (.own cx) text))
+        (do
+          (for [k 0 (len (load (.renamed cx)))]
+            (let [i (get (load (.renamed cx)) k)
+                  imp (ar-import cx i)]
+              (when (not found)
+                (match (gm-refers imp text)
+                  (Some [exported]
+                        (let [row (api-rename-index (.module imp) exported)]
+                          (when (>= row 0)
+                            (set! out (Some (ArRef :row row :import i :qualifier "" :local text)))
+                            (set! found true)
+                            0)))
+                  (None [] 0))
+                0))
+            0)
+          0)
+      :else 0)
+    out))
+
+;;; A symbol survives the rewrite as TEXT: if it is qualified through an import, that
+;;; import is still needed.
+(defn ar-note-ref! [(cx (ptr ArCx)) (text (slice u8))] (-> i64)
+  (let [slash (gm-find-slash text)]
+    (when (> slash 0)
+      (let [q (subslice text 0 slash)]
+        (for [k 0 (len (load (.renamed cx)))]
+          (let [i (get (load (.renamed cx)) k)
+                imp (ar-import cx i)]
+            (when (or (= (.alias imp) q) (= (.module imp) q)) (ar-mark! (.referenced cx) i) 0))
+          0))
+      0))
+  0)
+
+;;; Does NAME occur in F anywhere but as the head of a list or a field name? A
+;;; binder, a parameter, or a value reference to NAME would capture a call written
+;;; `(NAME …)`; the field of `(field x NAME)` or `(.. x NAME)` binds nothing.
+(defn ar-mentions-nonhead? [(f (ptr Sexp)) (name (slice u8))] (-> bool)
+  (cond (gm-sym? f) (= (gm-text f) name)
+        (gm-list? f)
+          (let [h (gm-head f)
+                ; past the object of a field access come only field names
+                n (if (or (= h "field") (= h "primitive/field") (= h "..")
+                          (= h "offsetof") (= h "primitive/offsetof"))
+                      (if (> (gm-count f) 2) 2 (gm-count f))
+                      (gm-count f))
+                (mut found) false]
+            (for [i 0 n]
+              (let [child (gm-at f i)]
+                (when (and (not found)
+                           (or (> i 0) (not (gm-sym? child)))
+                           (ar-mentions-nonhead? child name))
+                  (set! found true)
+                  0))
+              0)
+            found)
+        (gm-vec? f)
+          (let [(mut found) false]
+            (for [i 0 (gm-count f)]
+              (when (and (not found) (ar-mentions-nonhead? (gm-at f i) name)) (set! found true) 0)
+              0)
+            found)
+        :else false))
+
+;;; Could a binding written before the node being walked, in a form enclosing it,
+;;; name NAME? A binder (a `let` or `for` vector, a parameter list, a pattern) comes
+;;; before the forms it scopes over, so only the children before the walk's own are
+;;; read. In a `let` vector an initializer sees only the binders before its own, so
+;;; only those are read, and an earlier sibling that scopes its own bindings (a `let`,
+;;; a `for`, a `match` …) binds nothing after it. This over-approximates: any other
+;;; mention counts, binding or not.
+(defn ar-path-binds? [(cx (ptr ArCx)) (name (slice u8))] (-> bool)
+  (let [path (.path cx)
+        (mut found) false]
+    (for [k 0 (len (load path))]
+      (let [step (get (load path) k)
+            f (.form step)
+            at (.index step)
+            ; an initializer of a `let`-style binding vector
+            init (and (gm-vec? f)
+                      (= (% at 2) 1)
+                      (> k 0)
+                      (let [up (get (load path) (- k 1))]
+                        (and (= (.index up) 1) (ar-let-head? (gm-head (.form up))))))]
+        (for [j 0 at]
+          (let [child (gm-at f j)]
+            (when (and (not found)
+                       (or (> j 0) (gm-vec? f) (not (gm-sym? child)))
+                       (or (not init) (= (% j 2) 0))
+                       (not (and init (= j (- at 1))))
+                       (not (ar-scoping-head? (gm-head child)))
+                       (ar-mentions-nonhead? child name))
+              (set! found true)
+              0))
+          0))
+      0)
+    found))
+
+;;; Forms whose bindings scope over their own body and end with it.
+(defn ar-scoping-head? [(h (slice u8))] (-> bool)
+  (or (ar-let-head? h)
+      (= h "for") (= h "fn") (= h "fn*") (= h "match") (= h "loop") (= h "while")
+      (= h "block") (= h "scope") (= h "try") (= h "do") (= h "when") (= h "unless")
+      (= h "if") (= h "cond") (= h "case")))
+
+;;; Forms whose second element is a vector of binder/initializer pairs.
+(defn ar-let-head? [(h (slice u8))] (-> bool)
+  (or (= h "let") (= h "let*") (= h "if-let") (= h "when-let") (= h "while-let")))
+
+;;; Could a call written `(NAME …)` here reach something other than the method its
+;;; receiver dispatches to: a binding around it, a definition of this file's, or a
+;;; name an import lists?
+(defn ar-captured? [(cx (ptr ArCx)) (name (slice u8))] (-> bool)
+  (let [(mut taken) (or (gm-names-contain? (.own cx) name) (ar-path-binds? cx name))]
+    (for [i 0 (ar-import-count cx)]
+      (let [imp (ar-import cx i)]
+        (cond
+          ; an explicit core import states core's names in full
+          (= (.module imp) "coil.core")
+            (match (gm-refers imp name) (Some [_] 0) (None [] (do (set! taken true) 0)))
+          (not (.use_all imp))
+            (match (gm-refers imp name) (Some [_] (do (set! taken true) 0)) (None [] 0))
+          :else 0))
+      0)
+    taken))
+
+(defn ar-import-of [(cx (ptr ArCx)) (module (slice u8)) (prefer i64)] (-> i64)
+  (if (and (>= prefer 0) (= (.module (ar-import cx prefer)) module))
+      prefer
+      (let [(mut at) -1]
+        (for [i 0 (ar-import-count cx)]
+          (when (and (< at 0) (= (.module (ar-import cx i)) module)) (set! at i) 0)
+          0)
+        at)))
+
+;;; The vector after KEY in an import form, or null.
+(defn ar-option-vector [(form (ptr Sexp)) (key (slice u8))] (-> (ptr Sexp))
+  (let [n (gm-count form)
+        (mut out) (primitive/cast (ptr Sexp) 0)]
+    (for [i 2 (- n 1)]
+      (let [k (gm-at form i)
+            v (gm-at form (+ i 1))]
+        (when (and (gm-kw? k) (= (gm-text k) key) (gm-vec? v)) (set! out v) 0))
+      0)
+    out))
+
+(defn ar-null? [(p (ptr Sexp))] (-> bool) (= (primitive/cast i64 p) 0))
+
+(defn ar-add! [(cx (ptr ArCx)) (import i64) (module (slice u8)) (name (slice u8))] (-> i64)
+  (let [(mut present) false]
+    (for [i 0 (len (load (.adds cx)))]
+      (let [x (get (load (.adds cx)) i)]
+        (when (and (= (.import x) import) (= (.module x) module) (= (.name x) name))
+          (set! present true)
+          0))
+      0)
+    (unless present (push! (.adds cx) (ArAdd :import import :module module :name name)) 0))
+  0)
+
+;;; How to write OWNER (a trait or type declared in HOME) for `OWNER::name` in a call
+;;; that reached its removed name through REF. `(None)` after a finding when no
+;;; spelling is available.
+(defn ar-owner-spelling [(cx (ptr ArCx))
+                         (at (ptr Sexp))
+                         (ref ArRef)
+                         (row ApiRename)
+                         (home (slice u8))
+                         (owner (slice u8))] (-> (Option (slice u8)))
+  (let [a (.a cx)
+        q (.qualifier ref)
+        spelled
+          (if (and (> (len q) 0) (= home (.module row)))
+              (sconcat3 a q "/" owner)
+              (let [j (ar-import-of cx home (.import ref))]
+                (if (>= j 0)
+                    (let [imp (ar-import cx j)]
+                      (match (gm-local-of imp owner)
+                        (Some [local] local)
+                        (None []
+                              (cond (> (len (.alias imp)) 0) (sconcat3 a (.alias imp) "/" owner)
+                                    (not (ar-null? (ar-option-vector (.form imp) "use")))
+                                      (do (ar-add! cx j home owner) owner)
+                                    :else (sconcat3 a home "/" owner)))))
+                    (if (= home "coil.core")
+                        owner
+                        (do (ar-add! cx -1 home owner) owner)))))]
+    (if (and (< (gm-find-slash spelled) 0) (gm-names-contain? (.own cx) spelled))
+        (do
+          (ar-finding! cx
+                       at
+                       (sconcat3 a
+                                 (sconcat3 a "`" (.old row) "` was removed from ")
+                                 (.module row)
+                                 (sconcat3 a
+                                           ", and this file defines its own `"
+                                           spelled
+                                           "`, so the replacement cannot name it bare; import the module with an alias and rewrite the call by hand")))
+          (None [(slice u8)]))
+        (Some spelled))))
+
+;;; The text that replaces the head of a call to a removed name, or `(None)` after a
+;;; finding.
+(defn ar-new-head [(cx (ptr ArCx)) (at (ptr Sexp)) (ref ArRef)] (-> (Option (slice u8)))
+  (let [a (.a cx)
+        row (ar-row (.row ref))
+        q (.qualifier ref)]
+    (match (.change row)
+      (Renamed [name]
+               (Some (cond (> (len q) 0) (sconcat3 a q "/" name)
+                           (= (.local ref) (.old row)) name
+                           ; reached through a `:rename`: the local name stays
+                           :else (.local ref))))
+      (TraitCall [home trait name]
+                 (if (ar-captured? cx name)
+                     (match (ar-owner-spelling cx at ref row home trait)
+                       (Some [o] (Some (sconcat3 a o "::" name)))
+                       (None [] (None [(slice u8)])))
+                     (Some name)))
+      (MethodCall [home type name]
+                  (if (ar-captured? cx name)
+                      (match (ar-owner-spelling cx at ref row home type)
+                        (Some [o] (Some (sconcat3 a o "::" name)))
+                        (None [] (None [(slice u8)])))
+                      (Some name)))
+      (TypeCall [home type name]
+                (match (ar-owner-spelling cx at ref row home type)
+                  (Some [o] (Some (sconcat3 a o "::" name)))
+                  (None [] (None [(slice u8)])))))))
+
+;;; A call `(OLD …)` to a removed name.
+(defn ar-call! [(cx (ptr ArCx)) (f (ptr Sexp)) (ref ArRef)] (-> i64)
+  (let [a (.a cx)
+        row (ar-row (.row ref))
+        head (gm-at f 0)
+        n (gm-count f)
+        renamed (match (.change row) (Renamed [_] true) (_ false))
+        drop (and (.drop-type-args row) (> n 1) (gm-vec? (gm-at f 1)))
+        first-arg (if drop 2 1)]
+    (ar-mark! (.touched cx) (.import ref))
+    (if (and (not renamed) (< first-arg n) (gm-kw? (gm-at f first-arg)))
+        (do
+          (ar-finding! cx
+                       head
+                       (sconcat3 a
+                                 (api-rename-note a row)
+                                 ", whose parameters are not the removed function's; this call names its arguments, so rewrite it by hand"
+                                 ""))
+          (ar-note-ref! cx (gm-text head))
+          (for [i 1 n] (ar-walk-child! cx f i) 0))
+        (match (ar-new-head cx head ref)
+          (Some [text]
+                (do
+                  (when (!= text (gm-text head))
+                    (ar-edit! cx (sx-lo (load head)) (sx-hi (load head)) text (api-rename-note a row))
+                    0)
+                  (ar-note-ref! cx text)
+                  (ar-shift! cx f head text drop first-arg)
+                  (when drop
+                    (let [v (gm-at f 1)]
+                      (if (> n 2)
+                          (ar-edit! cx (sx-lo (load v)) (sx-lo (load (gm-at f 2))) "" "")
+                          (ar-edit! cx (sx-hi (load head)) (sx-hi (load v)) "" "")))
+                    0)
+                  (for [i first-arg n] (ar-walk-child! cx f i) 0)))
+          (None []
+                (do
+                  (ar-note-ref! cx (gm-text head))
+                  (for [i 1 n] (ar-walk-child! cx f i) 0)))))
+    0))
+
+;;; Where the line holding byte AT starts.
+(defn ar-line-start [(src (slice u8)) (at i64)] (-> i64)
+  (let [(mut p) at]
+    (loop (if (and (> p 0) (!= (cast i64 (get src (- p 1))) 10)) (set! p (- p 1)) (break)))
+    p))
+
+(defn ar-column [(src (slice u8)) (at i64)] (-> i64) (- at (ar-line-start src at)))
+
+;;; Call F's head becomes TEXT (and its type arguments go when DROP): remember how
+;;; far its first argument moves, so the lines aligned with it can follow.
+(defn ar-shift! [(cx (ptr ArCx))
+                 (f (ptr Sexp))
+                 (head (ptr Sexp))
+                 (text (slice u8))
+                 (drop bool)
+                 (first-arg i64)] (-> i64)
+  (let [src (.src cx)]
+    (when (< first-arg (gm-count f))
+      (let [arg (sx-lo (load (gm-at f first-arg)))
+            ; where the first argument lands: the dropped vector's place, or its own
+            moved (if drop (sx-lo (load (gm-at f 1))) arg)
+            head-line (ar-line-start src (sx-lo (load head)))
+            grow (- (len text) (len (gm-text head)))
+            new-col (+ (ar-column src moved) (if (= (ar-line-start src moved) head-line) grow 0))
+            old-col (ar-column src arg)
+            delta (- new-col old-col)]
+        (when (!= delta 0)
+          (push! (.shifts cx)
+                 (ArShift :lo (sx-lo (load f)) :hi (sx-hi (load f)) :col old-col :delta delta))
+          0))
+      0))
+  0)
+
+;;; The lines that start inside a shifted call, outside strings, each with the sum of
+;;; the shifts that move it, as indentation edits. A line some other edit already
+;;; rewrites (a dropped vector that ended a line) is left to that edit.
+(defn ar-shift-edits! [(cx (ptr ArCx))] (-> i64)
+  (let [a (.a cx)
+        src (.src cx)
+        lines (box-al [i64] a (al-new [i64] a))
+        moves (box-al [i64] a (al-new [i64] a))]
+    (for [k 0 (len (load (.shifts cx)))]
+      (let [sh (get (load (.shifts cx)) k)
+            (mut p) (.lo sh)
+            (mut in-string) false
+            (mut in-comment) false]
+        (loop
+          (if (>= p (.hi sh))
+              (break)
+              (let [c (cast i64 (get src p))]
+                (cond in-comment (do (when (= c 10) (set! in-comment false) 0) 0)
+                      in-string
+                        (cond (= c 92) (do (set! p (+ p 1)) 0)
+                              (= c 34) (do (set! in-string false) 0)
+                              :else 0)
+                      (= c 59) (do (set! in-comment true) 0)
+                      (= c 34) (do (set! in-string true) 0)
+                      (and (= c 35) (< (+ p 1) (len src)) (= (cast i64 (get src (+ p 1))) 92))
+                        (do (set! p (+ p 2)) 0)
+                      :else 0)
+                (when (and (= c 10) (not in-string) (< (+ p 1) (.hi sh)))
+                  (let [ls (+ p 1)
+                        (mut k2) 0]
+                    (loop (if (and (< (+ ls k2) (len src)) (= (cast i64 (get src (+ ls k2))) 32))
+                              (set! k2 (+ k2 1))
+                              (break)))
+                    (when (and (>= k2 (.col sh))
+                               (< (+ ls k2) (len src))
+                               (!= (cast i64 (get src (+ ls k2))) 10))
+                      (let [(mut found) -1]
+                        (for [i 0 (len (load lines))]
+                          (when (= (get (load lines) i) ls) (set! found i) 0)
+                          0)
+                        (if (< found 0)
+                            (do (push! lines ls) (push! moves (.delta sh)) 0)
+                            (do
+                              (store! (al-elem [i64] moves found) (+ (get (load moves) found) (.delta sh)))
+                              0)))
+                      0))
+                  0)
+                (set! p (+ p 1))))))
+      0)
+    (for [i 0 (len (load lines))]
+      (let [ls (get (load lines) i)
+            delta (get (load moves) i)
+            (mut covered) false
+            (mut indent) 0]
+        (for [k 0 (len (load (.edits cx)))]
+          (let [e (get (load (.edits cx)) k)]
+            (when (and (<= (.lo e) ls) (< ls (.hi e))) (set! covered true) 0))
+          0)
+        (loop (if (and (< (+ ls indent) (len src)) (= (cast i64 (get src (+ ls indent))) 32))
+                  (set! indent (+ indent 1))
+                  (break)))
+        (unless covered
+          (cond (> delta 0)
+                  (let [(mut pad) ""]
+                    (for [k 0 delta] (set! pad (sconcat a pad " ")) 0)
+                    (ar-edit! cx ls ls pad ""))
+                (< delta 0)
+                  (ar-edit! cx ls (+ ls (if (< indent (- delta)) indent (- delta))) "" "")
+                :else 0)
+          0))
+      0)
+    0))
+
+;;; A symbol anywhere but a call head.
+(defn ar-value! [(cx (ptr ArCx)) (s (ptr Sexp))] (-> i64)
+  (let [a (.a cx)
+        text (gm-text s)]
+    (match (ar-resolve cx text)
+      (Some [ref]
+            (let [row (ar-row (.row ref))]
+              (ar-mark! (.touched cx) (.import ref))
+              (match (.change row)
+                (Renamed [_]
+                         (match (ar-new-head cx s ref)
+                           (Some [new]
+                                 (do
+                                   (when (!= new text)
+                                     (ar-edit! cx (sx-lo (load s)) (sx-hi (load s)) new (api-rename-note a row))
+                                     0)
+                                   (ar-note-ref! cx new)))
+                           (None [] (ar-note-ref! cx text))))
+                (_ (do
+                     (ar-finding! cx
+                                  s
+                                  (sconcat3 a
+                                            (api-rename-note a row)
+                                            ", which a call reaches through its receiver; here the old name is used as a value, so rewrite it by hand"
+                                            ""))
+                     (ar-note-ref! cx text))))))
+      (None [] (ar-note-ref! cx text)))))
+
+;;; Walk child I of F, with F on the path.
+(defn ar-walk-child! [(cx (ptr ArCx)) (f (ptr Sexp)) (i i64)] (-> i64)
+  (push! (.path cx) (ArStep :form f :index i))
+  (ar-walk! cx (gm-at f i))
+  (pop! (.path cx))
+  0)
+
+(defn ar-walk! [(cx (ptr ArCx)) (f (ptr Sexp))] (-> i64)
+  (cond (gm-list? f)
+          (let [n (gm-count f)]
+            (when (> n 0)
+              (let [head (gm-at f 0)]
+                (if (gm-sym? head)
+                    (match (ar-resolve cx (gm-text head))
+                      (Some [ref] (ar-call! cx f ref))
+                      (None []
+                            (do
+                              (ar-note-ref! cx (gm-text head))
+                              (for [i 1 n] (ar-walk-child! cx f i) 0)
+                              0)))
+                    (do (for [i 0 n] (ar-walk-child! cx f i) 0) 0)))
+              0)
+            0)
+        (gm-vec? f) (do (for [i 0 (gm-count f)] (ar-walk-child! cx f i) 0) 0)
+        (gm-sym? f) (ar-value! cx f)
+        :else 0))
+
+; ---- imports ---------------------------------------------------------------------------
+
+;;; The text of vector V with item i replaced by `texts[i]`, or dropped where that is
+;;; "", and `extra` appended. The separators and comments before each kept item stay.
+;;; "" when nothing is left.
+(defn ar-vector-text [(a (dyn Allocator))
+                      (src (slice u8))
+                      (v (ptr Sexp))
+                      (texts (ptr (ArrayList (slice u8))))
+                      (extra (ptr (ArrayList (slice u8))))] (-> (slice u8))
+  (let [n (gm-count v)
+        lo (sx-lo (load v))
+        hi (sx-hi (load v))
+        (mut out) "["
+        (mut any) false]
+    (for [i 0 n]
+      (let [t (get (load texts) i)
+            item (gm-at v i)]
+        (when (> (len t) 0)
+          (let [gap (if any
+                        (subslice src (sx-hi (load (gm-at v (- i 1)))) (sx-lo (load item)))
+                        (subslice src (+ lo 1) (sx-lo (load (gm-at v 0)))))]
+            (set! out (sconcat3 a out gap t))
+            (set! any true))
+          0))
+      0)
+    (for [i 0 (len (load extra))]
+      (set! out (sconcat3 a out (if any " " "") (get (load extra) i)))
+      (set! any true)
+      0)
+    (if (not any)
+        ""
+        (sconcat3 a
+                  out
+                  (if (> n 0) (subslice src (sx-hi (load (gm-at v (- n 1)))) (- hi 1)) "")
+                  "]"))))
+
+;;; The `:use` (or `:exclude`) vector of an import of MODULE without its removed
+;;; names; a Renamed one becomes its new name. `extra` are names to add.
+(defn ar-names-text [(cx (ptr ArCx))
+                     (module (slice u8))
+                     (v (ptr Sexp))
+                     (rename-to-new bool)
+                     (extra (ptr (ArrayList (slice u8))))] (-> (slice u8))
+  (let [a (.a cx)
+        texts (box-al [(slice u8)] a (al-new [(slice u8)] a))
+        present (box-al [(slice u8)] a (al-new [(slice u8)] a))
+        n (gm-count v)]
+    (for [i 0 n]
+      (let [item (gm-at v i)
+            text (subslice (.src cx) (sx-lo (load item)) (sx-hi (load item)))
+            row (if (gm-sym? item) (api-rename-index module (gm-text item)) -1)
+            t (if (< row 0)
+                  text
+                  (match (.change (ar-row row))
+                    (Renamed [name]
+                             (if (and rename-to-new (not (gm-names-contain? present name))) name ""))
+                    (_ "")))]
+        (push! texts t)
+        (when (> (len t) 0) (push! present t) 0))
+      0)
+    (let [more (box-al [(slice u8)] a (al-new [(slice u8)] a))]
+      (for [i 0 (len (load extra))]
+        (let [x (get (load extra) i)]
+          (unless (gm-names-contain? present x) (push! more x) (push! present x) 0))
+        0)
+      (ar-vector-text a (.src cx) v texts more))))
+
+;;; The `:rename` vector of an import of MODULE: a pair renaming a removed name goes,
+;;; or, for a Renamed one, renames the new name instead.
+(defn ar-renames-text [(cx (ptr ArCx)) (module (slice u8)) (v (ptr Sexp))] (-> (slice u8))
+  (let [a (.a cx)
+        src (.src cx)
+        texts (box-al [(slice u8)] a (al-new [(slice u8)] a))]
+    (for [i 0 (gm-count v)]
+      (let [pair (gm-at v i)
+            text (subslice src (sx-lo (load pair)) (sx-hi (load pair)))
+            from (if (and (gm-vec? pair) (= (gm-count pair) 2) (gm-sym? (gm-at pair 0)))
+                     (gm-at pair 0)
+                     (primitive/cast (ptr Sexp) 0))
+            row (if (ar-null? from) -1 (api-rename-index module (gm-text from)))]
+        (push! texts
+               (if (< row 0)
+                   text
+                   (match (.change (ar-row row))
+                     (Renamed [name]
+                              (sconcat3 a
+                                        (subslice src (sx-lo (load pair)) (sx-lo (load from)))
+                                        name
+                                        (subslice src (sx-hi (load from)) (sx-hi (load pair)))))
+                     (_ "")))))
+      0)
+    (ar-vector-text a src v texts (box-al [(slice u8)] a (al-new [(slice u8)] a)))))
+
+;;; The byte range that deletes form F: its whole line when nothing else is on it
+;;; but blanks and a trailing comment, else just the form.
+(defn ar-form-range [(src (slice u8)) (f (ptr Sexp))] (-> (array i64 2))
+  (let [lo (sx-lo (load f))
+        hi (sx-hi (load f))
+        n (len src)
+        (mut start) lo
+        (mut end) hi]
+    (loop (if (and (> start 0)
+                   (let [c (cast i64 (get src (- start 1)))] (or (= c 32) (= c 9))))
+              (set! start (- start 1))
+              (break)))
+    (when (or (= start 0) (= (cast i64 (get src (- start 1))) 10))
+      (loop (if (and (< end n)
+                     (let [c (cast i64 (get src end))] (or (= c 32) (= c 9))))
+                (set! end (+ end 1))
+                (break)))
+      (when (and (< end n) (= (cast i64 (get src end)) 59))
+        (loop (if (and (< end n) (!= (cast i64 (get src end)) 10)) (set! end (+ end 1)) (break)))
+        0)
+      0)
+    (if (and (or (= start 0) (= (cast i64 (get src (- start 1))) 10))
+             (or (= end n) (= (cast i64 (get src end)) 10)))
+        [start (if (< end n) (+ end 1) end)]
+        [lo hi])))
+
+;;; Rewrite or delete import I once the walk has decided what the file still needs.
+(defn ar-import-edit! [(cx (ptr ArCx)) (i i64)] (-> i64)
+  (let [a (.a cx)
+        src (.src cx)
+        imp (ar-import cx i)
+        form (.form imp)
+        module (.module imp)
+        extra (box-al [(slice u8)] a (al-new [(slice u8)] a))
+        n (gm-count form)
+        use-v (ar-option-vector form "use")
+        exclude-v (ar-option-vector form "exclude")
+        rename-v (ar-option-vector form "rename")
+        note (sconcat3 a "the import names what " module " no longer has")]
+    (for [k 0 (len (load (.adds cx)))]
+      (let [x (get (load (.adds cx)) k)]
+        (when (= (.import x) i) (push! extra (.name x)) 0))
+      0)
+    (let [use-text (if (ar-null? use-v) "" (ar-names-text cx module use-v true extra))
+          exclude-text (if (ar-null? exclude-v) "" (ar-names-text cx module exclude-v false (box-al [(slice u8)] a (al-new [(slice u8)] a))))
+          rename-text (if (ar-null? rename-v) "" (ar-renames-text cx module rename-v))
+          changed (or (and (not (ar-null? use-v))
+                           (!= use-text (subslice src (sx-lo (load use-v)) (sx-hi (load use-v)))))
+                      (and (not (ar-null? exclude-v))
+                           (!= exclude-text (subslice src (sx-lo (load exclude-v)) (sx-hi (load exclude-v)))))
+                      (and (not (ar-null? rename-v))
+                           (!= rename-text (subslice src (sx-lo (load rename-v)) (sx-hi (load rename-v))))))
+          touched (or changed (get (load (.touched cx)) i))
+          needed (or (.use_all imp)
+                     (> (len use-text) 0)
+                     (> (len rename-text) 0)
+                     (get (load (.referenced cx)) i)
+                     (.reexport imp))]
+      (cond (not touched) 0
+            (not needed)
+              (let [r (ar-form-range src form)]
+                (ar-edit! cx (get r 0) (get r 1) "" note))
+            changed
+              ; Rebuild the form from its own text: each kept element after the gap
+              ; that preceded it, an emptied option without its keyword.
+              (let [(mut out) (subslice src (sx-lo (load form)) (sx-hi (load (gm-at form 0))))
+                    (mut j) 1]
+                (loop (if (>= j n)
+                          (break)
+                          (let [el (gm-at form j)
+                                gap (subslice src (sx-hi (load (gm-at form (- j 1)))) (sx-lo (load el)))
+                                v (if (< (+ j 1) n) (gm-at form (+ j 1)) (primitive/cast (ptr Sexp) 0))
+                                vtext (cond (= v use-v) use-text
+                                            (= v exclude-v) exclude-text
+                                            (= v rename-v) rename-text
+                                            :else "")
+                                option (and (gm-kw? el)
+                                            (not (ar-null? v))
+                                            (or (= v use-v) (= v exclude-v) (= v rename-v)))]
+                            (cond (and option (= (len vtext) 0)) (set! j (+ j 2))
+                                  option
+                                    (do
+                                      (set! out
+                                            (sconcat3 a
+                                                      out
+                                                      (sconcat a gap (ar-text-of src el))
+                                                      (sconcat a
+                                                               (subslice src (sx-hi (load el)) (sx-lo (load v)))
+                                                               vtext)))
+                                      (set! j (+ j 2)))
+                                  :else
+                                    (do
+                                      (set! out (sconcat3 a out gap (ar-text-of src el)))
+                                      (set! j (+ j 1)))))))
+                (ar-edit! cx
+                          (sx-lo (load form))
+                          (sx-hi (load form))
+                          (sconcat a
+                                    out
+                                    (subslice src (sx-hi (load (gm-at form (- n 1)))) (sx-hi (load form))))
+                          note))
+            :else 0))
+    0))
+
+(defn ar-text-of [(src (slice u8)) (p (ptr Sexp))] (-> (slice u8))
+  (subslice src (sx-lo (load p)) (sx-hi (load p))))
+
+;;; Imports of modules the file did not import, for names a migrated call needs. They
+;;; go after `(module …)`, or first when there is none.
+(defn ar-new-imports-edit! [(cx (ptr ArCx))] (-> i64)
+  (let [a (.a cx)
+        modules (box-al [(slice u8)] a (al-new [(slice u8)] a))
+        (mut lines) ""]
+    (for [k 0 (len (load (.adds cx)))]
+      (let [x (get (load (.adds cx)) k)]
+        (when (and (< (.import x) 0) (not (gm-names-contain? modules (.module x))))
+          (push! modules (.module x))
+          0))
+      0)
+    (for [m 0 (len (load modules))]
+      (let [module (get (load modules) m)
+            (mut names) ""]
+        (for [k 0 (len (load (.adds cx)))]
+          (let [x (get (load (.adds cx)) k)]
+            (when (and (< (.import x) 0) (= (.module x) module))
+              (set! names (sconcat3 a names (if (> (len names) 0) " " "") (.name x)))
+              0))
+          0)
+        (set! lines
+              (sconcat3 a
+                        lines
+                        (if (> (len lines) 0) "\n" "")
+                        (sconcat3 a "(import \"" module (sconcat3 a "\" :use [" names "])")))))
+      0)
+    (when (> (len lines) 0)
+      (let [forms (.forms (.file cx))
+            note "a migrated call needs a name this file does not import"
+            (mut at) -1]
+        (for [i 0 (len (load forms))]
+          (when (and (< at 0) (= (gm-head (al-elem [Sexp] forms i)) "module"))
+            (set! at (sx-hi (load (al-elem [Sexp] forms i))))
+            0)
+          0)
+        (if (>= at 0)
+            (ar-edit! cx at at (sconcat a "\n" lines) note)
+            (ar-edit! cx 0 0 (sconcat a lines "\n") note)))
+      0)
+    0))
+
+;;; Order EDITS by descending start, as `lint-apply` takes them.
+(defn ar-sort-desc! [(edits (ptr (ArrayList ArEdit)))] (-> i64)
+  (for [i 1 (len (load edits))]
+    (let [(mut j) i]
+      (loop
+        (if (<= j 0)
+            (break)
+            (let [x (get (load edits) (- j 1))
+                  y (get (load edits) j)]
+              (if (or (> (.lo x) (.lo y)) (and (= (.lo x) (.lo y)) (>= (.hi x) (.hi y))))
+                  (break)
+                  (do
+                    (store! (al-elem [ArEdit] edits j) x)
+                    (store! (al-elem [ArEdit] edits (- j 1)) y)
+                    (set! j (- j 1))))))))
+    0)
+  0)
+
+;;; Which names does the file define at top level?
+(defn ar-own-names [(a (dyn Allocator)) (forms (ptr (ArrayList Sexp)))] (-> (ptr (ArrayList (slice u8))))
+  (let [out (box-al [(slice u8)] a (al-new [(slice u8)] a))]
+    (for [i 0 (len (load forms))]
+      (let [f (al-elem [Sexp] forms i)
+            h (gm-head f)]
+        (when (and (or (= h "defn") (= h "defn*") (= h "defmacro") (= h "def") (= h "const")
+                       (= h "defstruct") (= h "defsum") (= h "deftrait") (= h "defalias")
+                       (= h "extern") (= h "declare"))
+                   (> (gm-count f) 1)
+                   (gm-sym? (gm-at f 1)))
+          (push! out (gm-text (gm-at f 1)))
+          0))
+      0)
+    out))
+
+(defn ar-false-flags [(a (dyn Allocator)) (n i64)] (-> (ptr (ArrayList bool)))
+  (let [out (box-al [bool] a (al-new [bool] a))]
+    (for [i 0 n] (push! out false) 0)
+    out))
+
+;;; The imports of a module that lost names (one of MODULES), as indices.
+(defn ar-renamed-imports [(a (dyn Allocator))
+                          (file (ptr GmFile))
+                          (modules (ptr (ArrayList (slice u8))))] (-> (ptr (ArrayList i64)))
+  (let [out (box-al [i64] a (al-new [i64] a))]
+    (for [i 0 (len (load (.imports file)))]
+      (when (gm-names-contain? modules (.module (al-elem [GmImport] (.imports file) i)))
+        (push! out i)
+        0)
+      0)
+    out))
+
+;;; Every name after its qualifier that could reach a removed name in this file: the
+;;; removed names of the modules RENAMED imports, and the local names their
+;;; `:rename`s give. Every symbol of the file is looked up here, so it is a set.
+(defn ar-spellings [(a (dyn Allocator))
+                    (file (ptr GmFile))
+                    (renamed (ptr (ArrayList i64)))] (-> (ptr (HashMap (slice u8) bool)))
+  (let [out (box! a (HashMap (slice u8) bool) (HashMap::new [(slice u8) bool] a (str-keyops-borrowed)))
+        imported (box-al [(slice u8)] a (al-new [(slice u8)] a))
+        rows (api-renames)]
+    (for [k 0 (len (load renamed))]
+      (let [imp (al-elem [GmImport] (.imports file) (get (load renamed) k))]
+        (push! imported (.module imp))
+        (for [j 0 (len (load (.renames imp)))]
+          (set! out (.to (get (load (.renames imp)) j)) true)
+          0))
+      0)
+    (for [r 0 (len rows)]
+      (when (gm-names-contain? imported (.module (get rows r)))
+        (set! out (.old (get rows r)) true)
+        0)
+      0)
+    out))
+
+;;; The migration of one read file: its edits in descending source order, and the
+;;; uses of removed names it cannot rewrite.
+(defn ar-migrate [(a (dyn Allocator)) (forms (ptr (ArrayList Sexp))) (src (slice u8))] (-> ArResult)
+  (let [file (primitive/alloc-stack GmFile)
+        edits (box-al [ArEdit] a (al-new [ArEdit] a))
+        findings (box-al [ArFinding] a (al-new [ArFinding] a))]
+    (store! file (gm-read-file a forms))
+    ; A removed name is reachable only through an import of its module.
+    (let [renamed (ar-renamed-imports a file (api-renamed-modules a))]
+      (when (> (len (load renamed)) 0)
+        (let [n (len (load (.imports file)))
+              cx (primitive/alloc-stack ArCx)]
+          (store! cx
+                  (ArCx :a a
+                        :src src
+                        :file file
+                        :own (ar-own-names a forms)
+                        :path (box-al [ArStep] a (al-new [ArStep] a))
+                        :touched (ar-false-flags a n)
+                        :referenced (ar-false-flags a n)
+                        :adds (box-al [ArAdd] a (al-new [ArAdd] a))
+                        :renamed renamed
+                        :spellings (ar-spellings a file renamed)
+                        :shifts (box-al [ArShift] a (al-new [ArShift] a))
+                        :edits edits
+                        :findings findings))
+          (for [i 0 (len (load forms))]
+            (let [f (al-elem [Sexp] forms i)
+                  h (gm-head f)]
+              (unless (or (= h "import") (= h "module") (= h "export"))
+                (ar-walk! cx f)
+                0))
+            0)
+          (ar-shift-edits! cx)
+          (for [k 0 (len (load renamed))]
+            (ar-import-edit! cx (get (load renamed) k))
+            0)
+          (ar-new-imports-edit! cx)
+          (ar-sort-desc! edits)
+          (for [k 1 (len (load edits))]
+            (when (> (.hi (get (load edits) k)) (.lo (get (load edits) (- k 1))))
+              (panic "coil.compiler.api_migration: overlapping edits at byte {}"
+                     (.lo (get (load edits) k))))
+            0)
+          0)
+        0))
+    (ArResult :edits edits :findings findings)))
+
+;;; Does this source use a name the table says was removed?
+(defn ar-breaking? [(a (dyn Allocator)) (forms (ptr (ArrayList Sexp))) (src (slice u8))] (-> bool)
+  (let [r (ar-migrate a forms src)]
+    (or (> (len (load (.edits r))) 0) (> (len (load (.findings r))) 0))))

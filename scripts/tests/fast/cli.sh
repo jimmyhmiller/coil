@@ -375,6 +375,125 @@ open(sys.argv[1], "w").write(
   [ "$rc" != 0 ] && cmp -s "$T/broken-main.orig" "$T/broken-project/src/main.coil" \
     && ok "project lint --fix that cannot compile rolls back every file" \
     || bad "project lint --fix that cannot compile rolls back every file" "exit $rc"
+
+  # Standard-library names that were removed (src/compiler/api_renames.coil): a
+  # build points at the migration, lint --fix rewrites every spelling of them (a
+  # :use list, an alias, :use * with :rename, type arguments a method drops, a
+  # constructor that needs its type imported, a binding that would capture the new
+  # name, lines aligned with a call's arguments), and the program runs.
+  mkdir -p "$T/renamed/src"
+  printf '[package]\nname = "renamed"\nentry = "src/main.coil"\n' > "$T/renamed/Coil.toml"
+  cat > "$T/renamed/src/main.coil" <<'EOF'
+(module renamed.main)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.hashmap" :use [hm-new-scalar hm-put! hm-get hm-len hm-for hm-free!])
+(import "renamed.tally" :as tally)
+(import "renamed.size" :use [size])
+
+(defn main [] (-> i64)
+  (let [(mut m) (hm-new-scalar [i64 i64] (malloc-allocator))]
+    (for i (range 0 5) (hm-put! [i64 i64] (mut m) i (* i i)))
+    (hm-put! (mut m)
+             9
+             (+ (match (hm-get m 2) (Some [v] v) (None [] 0))
+                (hm-len m)))
+    (let [len (hm-len m)]
+      (hm-for [k v m] (when (= k 9) (println "{} {} {} {}" (- (hm-len m) len) v (tally/total (mut m)) (size m)))))
+    (hm-free! (mut m))
+    0))
+EOF
+  cat > "$T/renamed/src/tally.coil" <<'EOF'
+(module renamed.tally)
+(import "coil.hashmap" :as hm)
+(import "coil.alloc" :use [malloc-allocator])
+
+(defn total [(m (mut (hm/HashMap i64 i64)))] (-> i64)
+  (let [(mut seen) (hm/hm-new [i64 i64] (malloc-allocator) (hm/i64-keyops))
+        (mut sum) 0]
+    (hm/hm-for [k v m]
+      (unless (hm/hm-contains? [i64 i64] seen k)
+        (hm/hm-put! (mut seen) k 1)
+        (set! sum (+ sum v))))
+    (hm/hm-free! (mut seen))
+    sum))
+EOF
+  cat > "$T/renamed/src/size.coil" <<'EOF'
+(module renamed.size)
+(import "coil.hashmap" :use * :rename [[hm-cap capacity]])
+
+(defn size [(m (HashMap i64 i64))] (-> i64) (+ (hm-len m) (capacity m)))
+EOF
+  expect_rc_out 1 "removed library names.*coil lint --fix" \
+    "building a project that uses removed library names points at lint --fix" \
+    sh -c "cd '$T/renamed' && '$COIL' build -o '$T/renamed-bin' </dev/null"
+  expect_rc_out 1 "has no 'hm-new'; \`hm-new\` was removed from coil.hashmap; it is \`HashMap::new\`" \
+    "an error naming a removed library name says what replaced it" \
+    "$COIL" check "$T/renamed/src/tally.coil"
+  expect_rc_out 1 "undefined function 'hm-len'; \`hm-len\` was removed from coil.hashmap; it is \`len\`" \
+    "a call to a removed library name says what replaced it" \
+    "$COIL" check "$T/renamed/src/size.coil"
+  (cd "$T/renamed" && "$COIL" lint --fix >"$T/renamed.log" 2>&1); rc=$?
+  cat > "$T/renamed-main.want" <<'EOF'
+(module renamed.main)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.hashmap" :use [for-entries HashMap])
+(import "renamed.tally" :as tally)
+(import "renamed.size" :use [size])
+
+(defn main [] (-> i64)
+  (let [(mut m) (HashMap::new-scalar [i64 i64] (malloc-allocator))]
+    (for i (range 0 5) (set! (mut m) i (* i i)))
+    (set! (mut m)
+          9
+          (+ (match (get m 2) (Some [v] v) (None [] 0))
+             (len m)))
+    (let [len (len m)]
+      (for-entries [k v m] (when (= k 9) (println "{} {} {} {}" (- (Len::len m) len) v (tally/total (mut m)) (size m)))))
+    (free! (mut m))
+    0))
+EOF
+  cat > "$T/renamed-tally.want" <<'EOF'
+(module renamed.tally)
+(import "coil.hashmap" :as hm)
+(import "coil.alloc" :use [malloc-allocator])
+
+(defn total [(m (mut (hm/HashMap i64 i64)))] (-> i64)
+  (let [(mut seen) (hm/HashMap::new [i64 i64] (malloc-allocator) (hm/i64-keyops))
+        (mut sum) 0]
+    (hm/for-entries [k v m]
+      (unless (contains? seen k)
+        (set! (mut seen) k 1)
+        (set! sum (+ sum v))))
+    (free! (mut seen))
+    sum))
+EOF
+  cat > "$T/renamed-size.want" <<'EOF'
+(module renamed.size)
+(import "coil.hashmap" :use *)
+
+(defn size [(m (HashMap i64 i64))] (-> i64) (+ (len m) (cap m)))
+EOF
+  local f migrated=1
+  for f in main tally size; do
+    cmp -s "$T/renamed-$f.want" "$T/renamed/src/$f.coil" \
+      || { migrated=0; bad "lint --fix migrates removed library names in $f.coil" \
+             "exit $rc: $(diff -u "$T/renamed-$f.want" "$T/renamed/src/$f.coil" | head -40) $(head -c 600 "$T/renamed.log")"; }
+  done
+  [ "$rc" = 0 ] && [ "$migrated" = 1 ] && ok "lint --fix migrates removed library names in every spelling"
+  expect_out "^0 9 39 22$" "the migrated project runs" sh -c "cd '$T/renamed' && '$COIL' run"
+  (cd "$T/renamed" && "$COIL" lint --fix >/dev/null 2>&1); rc=$?
+  cmp -s "$T/renamed-main.want" "$T/renamed/src/main.coil" && cmp -s "$T/renamed-tally.want" "$T/renamed/src/tally.coil" \
+    && [ "$rc" = 0 ] && ok "lint --fix leaves migrated code alone" \
+    || bad "lint --fix leaves migrated code alone" "exit $rc: $(cat "$T/renamed/src/main.coil")"
+
+  # A removed name it cannot rewrite is reported, and its file is left as it was.
+  printf '(module value-use)\n(import "coil.hashmap" :use [hm-get])\n(defn f [] (-> i64) (let [g (fnptr-of hm-get [i64 i64])] 0))\n' > "$T/value-use.coil"
+  cp "$T/value-use.coil" "$T/value-use.orig"
+  expect_rc_out 1 "hm-get.*used as a value" "lint --fix reports a removed name it cannot rewrite" \
+    "$COIL" lint "$T/value-use.coil" --fix
+  cmp -s "$T/value-use.orig" "$T/value-use.coil" \
+    && ok "a file with a removed name it cannot rewrite is left as it was" \
+    || bad "a file with a removed name it cannot rewrite is left as it was" "$(cat "$T/value-use.coil")"
 }
 
 # ---------------------------------------------------------------------------

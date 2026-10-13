@@ -177,6 +177,13 @@ Use this format:
   it, and the build exports
   `COIL_STRICT_BUNDLE=1` so the in-repo fallback is a hard error instead of a silent
   success.
+- **Renaming a stdlib API?** Add rows to `API-RENAMES` in
+  `src/compiler/api_renames.coil`, one per removed public name (its header gives
+  the row format). That table is all there is to change: `coil lint --fix` then
+  rewrites code that uses the old names (the preflight in
+  `src/compiler/api_migration.coil`), `coil build` in such a project points at it,
+  and the resolver's errors name the replacement. Delete any `coil.lint.modernize`
+  rule for a name you remove.
 - `src/examples/*.coil` — one idea each (`sums`, `hashmap`, `references`, `lisp`, …).
 - Dialects (Scheme, Brainfuck), applications (clox, CHIP-8, Space Invaders, Wasm),
   and research transforms (GC dialects, httptap) live in the separate
