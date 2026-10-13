@@ -152,7 +152,7 @@ the compiled engine now.
 ## THE TOWER IS BUILT: macro bodies call macros
 
 A metaprogram body may now use `when`/`cond`/`try!`/`fmt`/… for its OWN control
-flow and logging (`tower_test.coil`, `tower_fmt_test.coil` — run.sh mechanism 4).
+flow and logging. `tests/corpus/comptime.coil` exercises it on every corpus lane.
 
 The core design problem was never recursion bookkeeping — it is that **a call to
 a Code-signature function inside a metaprogram body is ambiguous**. `(cond-arms
@@ -185,8 +185,7 @@ make their whole enclosing defn unparseable (the tolerant resolve skips it), so
 recovery is demand-driven: a skipped defn is recovered when its raw signature is
 Code-shaped (it IS a metaprogram) or when the sub-check fails on a call to it (a
 metaprogram needs it) — the compiler's own harmlessly-unparseable
-`try`/`block :label` call sites stay untouched. `mandelbrot.coil` uses the
-classic `msg` macro directly in its metaprogram; `tower_msg_test.coil` pins it.
+`try`/`block :label` call sites stay untouched.
 A call that fails to parse only inside a macro use one of its arguments holds is
 not the base case; that inner use is, and the outer call is judged as above.
 
