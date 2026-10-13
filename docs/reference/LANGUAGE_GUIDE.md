@@ -673,12 +673,11 @@ like `when`, and `while-let` stops at the first value that does not.
 ### Option, Result and try
 
 `(Option T)` is `(Some v)` or `(None)`. `(Result T E)` is `(Ok v)` or `(Err e)`.
-Both are ambient. Inside `(try …)`, `(try! r)` unwraps an `Ok` or returns the
-`Err`, and `(try? o)` does the same for `Option`:
+Both are ambient, and so are `try` and its forms. Inside `(try …)`, `(try! r)`
+unwraps an `Ok` or returns the `Err`, and `(try? o)` does the same for `Option`:
 
 ```coil
 (module example.parsing)
-(import "coil.try" :use [try try!])
 
 (defsum ParseError (Empty) (NotADigit [(at i64)]))
 
@@ -716,7 +715,10 @@ empty
 ```
 
 A nested variant pattern such as `(Err [(NotADigit [at])] …)` matches only when
-the inner variant does; otherwise matching moves on to the next arm. `coil.result`
+the inner variant does; otherwise matching moves on to the next arm. The rest of
+`coil.try` is ambient as well: `(try-or! r fallback)` yields the `Ok` value or
+leaves the enclosing `try` with `fallback`, and `some-or!` and `ensure!` do the
+same for an `Option` and a condition. `coil.result`
 has the combinators: `unwrap-or`, `opt-map`, `res-map`, `map-err`,
 `and-then`, `ok-or`, `some?`, `ok?`. The predicates borrow their argument; the
 others consume it, so an owner passes through: `(map-err r (fn [e] (Wrapped e)))`
