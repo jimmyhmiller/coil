@@ -532,8 +532,13 @@ EOF
              "exit $rc: $(diff -u "$T/renamed-$f.want" "$T/renamed/src/$f.coil" | head -40) $(head -c 600 "$T/renamed.log")"; }
   done
   [ "$rc" = 0 ] && [ "$migrated" = 1 ] && ok "lint --fix migrates removed library names in every spelling"
-  expect_out "^0 9 39 22 3$" "the migrated project runs" sh -c "cd '$T/renamed' && '$COIL' run"
-  expect_out "^4/2$" "the migrated project formats through its Display impl" sh -c "cd '$T/renamed' && '$COIL' run"
+  # One run, two lines: the map arithmetic, then the Display impl's output.
+  local ran
+  ran=$(cd "$T/renamed" && "$COIL" run 2>&1); rc=$?
+  grep -qxF "0 9 39 22 3" <<<"$ran" && ok "the migrated project runs" \
+    || bad "the migrated project runs" "exit $rc: $ran"
+  grep -qxF "4/2" <<<"$ran" && ok "the migrated project formats through its Display impl" \
+    || bad "the migrated project formats through its Display impl" "exit $rc: $ran"
   (cd "$T/renamed" && "$COIL" lint --fix >/dev/null 2>&1); rc=$?
   cmp -s "$T/renamed-main.want" "$T/renamed/src/main.coil" && cmp -s "$T/renamed-tally.want" "$T/renamed/src/tally.coil" \
     && [ "$rc" = 0 ] && ok "lint --fix leaves migrated code alone" \
