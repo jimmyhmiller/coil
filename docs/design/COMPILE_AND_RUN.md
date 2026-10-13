@@ -163,11 +163,16 @@ condition is a bool, not Code). Nothing syntactic distinguishes them.
 The shipped rule is **type-directed, with the checker as the only judge**
 (expander.coil `stage3-round` + `tower-*`): expand-stage3 checks the metaprogram
 sub-program; when the check rejects it AT a macro-headed call form (its diag
-spans exactly the call — i.e. a non-Code argument reached a Code-signature
-function), that one call is expanded at definition time, deepest-first, and the
+spans the call or one of its arguments — i.e. a non-Code argument reached a
+Code-signature function), that one call is expanded at definition time, and the
 sub-program is re-resolved and re-checked to a fixpoint (64-round cap). Calls
 whose arguments all typecheck as Code never fail that way and remain function
-calls, so `cond-arms`-style recursion is untouched. A program whose sub-check
+calls, so `cond-arms`-style recursion is untouched. A rejection deeper inside an
+argument that holds another macro use (`` (f (let [y `x] y)) ``) does not judge the
+outer call: the inner use is expanded first, and the next check judges the outer
+call by the type of what it expanded to. The outer call's written form is kept
+(`written-calls` in expander.coil), so a call that does turn out to be a macro
+use still receives its arguments as written. A program whose sub-check
 passes first try — every previously-valid program — pays nothing. Expanded
 bodies are mirrored back into the main form list (index-aligned, value-identical
 where nothing fired) so the authoritative check sees them too, and residual
@@ -182,6 +187,8 @@ Code-shaped (it IS a metaprogram) or when the sub-check fails on a call to it (a
 metaprogram needs it) — the compiler's own harmlessly-unparseable
 `try`/`block :label` call sites stay untouched. `mandelbrot.coil` uses the
 classic `msg` macro directly in its metaprogram; `tower_msg_test.coil` pins it.
+A call that fails to parse only inside a macro use one of its arguments holds is
+not the base case; that inner use is, and the outer call is judged as above.
 
 Definition-time expansion currently runs on the interpreter (the engine for that
 stratum isn't built yet at that point) — so a macro USED inside another macro's

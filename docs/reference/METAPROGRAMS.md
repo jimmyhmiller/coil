@@ -405,6 +405,10 @@ metaprogram's own body expand at definition time, type-directedly — a call to 
 Code-signature function whose arguments all typecheck as Code stays a FUNCTION
 call (passing code values, e.g. cond-arms' recursion); one with non-Code
 arguments is surface syntax and is expanded, with the checker as the only judge.
+An argument that is itself a macro use is read by its expansion's type:
+`` (f (let [y `x] y)) `` is a call to `f` with a Code value, while in
+`(when (let [n (count)] (> n 1)) …)` the `let` is bool, so `when` is expanded, and
+receives its arguments as written, not the expanded `let`.
 Staging is lazy and per-qual: an engine miss stages that macro on demand, and a macro
 that cannot be staged is a hard error rather than a silent fallback.
 
