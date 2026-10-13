@@ -1067,11 +1067,11 @@ EOF
 section_crash() {
   cat > "$T/crash.coil" <<'EOF'
 (module crash-report)
-(import "coil.crash" :use *)
+(import "coil.crash" :as crash)
 (extern raise :cc c [i32] (-> i32))
 (defn main [] (-> i64)
-  (crash-install!)
-  (crash-event! "before deliberate abort")
+  (crash/install!)
+  (crash/event! "before deliberate abort")
   (raise 6)
   0)
 EOF
