@@ -520,7 +520,7 @@ module a function that returns the environment of some modules as text:
 …
 (let [text (environment)]
   (jit-session-set-environment! (mut session) text)
-  (env/environment-free! text))
+  (env/free! text))
 ```
 
 The last argument is a list of qualified names, so everything in a module is
@@ -544,7 +544,7 @@ types only. What the text holds:
   one must find it handed over where the session uses it.
 
 The program owns the text the function returns and releases it with
-`coil.jit.environment/environment-free!`. None of this is required: a metaprogram can
+`coil.jit.environment/free!`. None of this is required: a metaprogram can
 build the text itself from `meta/declaration`, `meta/definition-source`,
 `meta/module-header`, `meta/module-impls` and `meta/source`, and `meta/source`
 renders any form as text, so what it learns can be written to a file with `coil.fs`
