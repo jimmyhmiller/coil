@@ -60,7 +60,7 @@ A step fails when:
   before running anything and kills a process that tries one.
 
 The tier fails when any step fails or the serial wall time passes the tier's
-limit. `COIL_BUDGET_SCALE` multiplies every budget and limit; CI uses 1.5.
+limit. `COIL_BUDGET_SCALE` multiplies every budget and limit; CI uses 2.5.
 
 To change a budget, re-baseline on a quiet machine and review the diff like code:
 `python3 scripts/dev.py test fast --compiler <coil> --rebaseline 3` sets each to
@@ -156,7 +156,7 @@ whose prefix holds the warmed unit; `dev.py install --source build/bin/coil
 ## CI
 
 The `full` job builds the compiler with `build full`, then runs FAST against it
-(`COIL_BUDGET_SCALE=1.5`), and three COMPREHENSIVE slices with `--only`: the
+(`COIL_BUDGET_SCALE=2.5`), and three COMPREHENSIVE slices with `--only`: the
 updater, the JIT and generated units (after a private install), and SIMD. The
 `linux` job runs the SIMD slice; the `llvm-free` job's bootstrap runs the corpus
 on arm64. The rest of COMPREHENSIVE runs locally.
