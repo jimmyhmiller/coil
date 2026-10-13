@@ -14,7 +14,9 @@
 #     second increment, none of which reaches the runtime binary;
 #   * transforms and checkers: macros inside macro bodies, a transform that adds
 #     a definition running beside the identity transform, the same code run at
-#     compile time and at run time, and a checker keyed on binding identity.
+#     compile time and at run time, and a checker keyed on binding identity;
+#   * lint --fix against a concurrent editor: a checker that edits its target
+#     mid-analysis, whose edit must survive the run.
 #
 # Usage: scripts/tests/fast/meta.sh        (compiler from $COIL, else `coil`)
 set -uo pipefail
@@ -136,5 +138,25 @@ if [ "$rc" != 0 ] && [ "$uses" = 2 ]; then
 else
   bad "checker: binding identity tells a shadowed local from its namesake" "exit $rc, $uses errors (want 2): $out"
 fi
+
+# A file edited while lint --fix analyses it is the editor's. The rule appends a
+# line to its target during the analysis (tests/meta/concurrent_edit_rule.coil);
+# the preflight has already rewritten the target's removed name by then, so both
+# the round's write and putting the run back must leave the file alone. (The
+# target is written here: a removed name in tests/ would make every build of
+# this repository offer the migration.)
+mkdir -p "$WORK/race"
+cp $M/concurrent_edit_rule.coil "$WORK/race/"
+printf '(module mt.concurrent-edit-target)\n(import "coil.primitive" :as primitive)\n(import "coil.args" :use [args-count])\n\n(defn main [] (-> i64)\n  (primitive/imul (args-count) 1))\n' \
+  > "$WORK/race/concurrent_edit_target.coil"
+out=$(cd "$WORK/race" && "$COIL" lint concurrent_edit_target.coil --use mt.concurrent-edit-rule --fix 2>&1); rc=$?
+raced=$(cat "$WORK/race/concurrent_edit_target.coil")
+case "$rc|$out|$raced" in
+  *"fixed "*) bad "lint --fix leaves a file edited during its analysis to the editor" "exit $rc, it claims the file: $out" ;;
+  "2|"*"left untouched: concurrent_edit_target.coil"*"|"*"(count)"*"; edited meanwhile"*)
+    ok "lint --fix leaves a file edited during its analysis to the editor" ;;
+  *) bad "lint --fix leaves a file edited during its analysis to the editor" "exit $rc: $out
+$raced" ;;
+esac
 
 if [ "$fail" = 0 ]; then echo "meta: PASS"; else echo "meta: FAILED"; exit 1; fi
