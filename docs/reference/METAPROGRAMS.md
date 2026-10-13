@@ -309,21 +309,22 @@ New API this project added (all shipped):
   fixpoint. Use it only when one traversal is the complete rewrite.
 - **`(primitive/code-decl NODE)` → a declaration record**, read from that authoritative checked
   program. Every record begins `(decl MODULE KIND QUALIFIED-NAME)`. Functions continue
-  with `[PARAM-TYPE…] RET`; structs, sums, traits, consts, and externs need no additional
-  fields. The qualified name is the exact identity selected by resolution rather than
-  the spelling used at the call site, including through aliases and import renames. The
-  other possible results are `:unresolved` and `:ambiguous`. **Pass a resolved
+  with `[PARAM-TYPE…] RET`. A method's record reads the same with KIND `method`, then
+  adds OWNER-TYPE, the type of the impl the checker chose, and for a trait method the
+  trait; its MODULE is the module that declares that type (`coil.arraylist` for a method
+  of `(ArrayList T)`), and empty for a type no module declares (`i64`, `(ptr T)`).
+  Structs, sums, traits, consts, and externs need no additional fields. The qualified
+  name is the exact identity selected by resolution rather than the spelling used at the
+  call site, including through aliases and import renames. The other possible results
+  are `:unresolved` and `:ambiguous`. **Pass a resolved
   REFERENCE node and it resolves to the EXACT entity** the checker picked (via node
   identity), unambiguous even when the simple name lives in several modules. This covers
   every resolved reference: **function calls, function-pointer refs (`fnptr-of`), and
   variant constructions** (which resolve to the owning sum). A bare symbol falls back to
-  a name-based lookup (which reports `:ambiguous` on a cross-module name clash). Demos:
-  `dup_app.coil` (two modules both defining `probe`; each call resolves to the right one),
-  `refpolicy_bad.coil` (a `fnptr-of` to a pointer-returning function, never called),
-  `variantcheck_test.coil` (a `(Jus 5)` construction resolves to its sum), and
-  `typecheck_test.coil` (a **type reference** `wb/Box` resolves to the right module even
-  though `Box` is defined in both `wa` and `wb`). So calls, fn-ptrs, variants, AND named
-  types all resolve exactly.
+  a name-based lookup (which reports `:ambiguous` on a cross-module name clash). A type
+  reference such as `wb/Box` resolves to its module too, even when `Box` is defined in
+  several. `tests/meta/run_code_main_decls.coil` lists the records of a module's method
+  calls.
 - **`(primitive/model-status)` → `:complete`, `:partial`, or `:none`** — whether the
   model the transform is reading is of a program that fully checks, one that partly
   checks, or no model at all. A transform that must only see valid programs checks
