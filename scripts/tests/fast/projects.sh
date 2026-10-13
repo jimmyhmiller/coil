@@ -168,6 +168,11 @@ run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" build consumer.coil -
 expect 0 "consumer" "a consumer compiles against the unit's interface"
 run "$W" ./consumer
 expect 0 "" "the consumer links the unit; state, generic statics, aggregates and impls behave"
+# The interface declares only the module's own exports, so a re-export would be
+# lost on the way to a consumer: build-unit says so instead.
+printf '(module pfunit.facade)\n(import "pfunit.mathlib" :use [add] :reexport)\n(defn twice [(x i64)] (-> i64) (add x x))\n' > "$W/units/facade.coil"
+run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" build-unit facade.coil -o "$W/facade-unit"
+expect 1 "a unit's interface cannot carry a re-export" "build-unit refuses a module that re-exports another"
 
 echo "== a flat package"
 # No src/ or tests/: the package directory is the source root, so project-wide
