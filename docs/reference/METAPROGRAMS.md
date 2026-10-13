@@ -146,11 +146,11 @@ and `O_TRUNC` on Linux), and it selects them with
 ;; template binder. A bare `O_CREAT` in the template would carry this module's
 ;; definition context and the program's own reference could not see it, so the
 ;; name is declared through the explicit context removal.
-(defn fs--explicit-public-name [(name Code)] (-> Code)
+(defn explicit-public-name [(name Code)] (-> Code)
   (primitive/syntax->datum name))
 (defn gen-open-flags [] (-> Code)
-  `(do (const ~(fs--explicit-public-name `O_CREAT) ~(os-pick `64 `512))
-       (const ~(fs--explicit-public-name `O_TRUNC) ~(os-pick `512 `1024))))
+  `(do (const ~(explicit-public-name `O_CREAT) ~(os-pick `64 `512))
+       (const ~(explicit-public-name `O_TRUNC) ~(os-pick `512 `1024))))
 (meta (gen-open-flags))
 ```
 
