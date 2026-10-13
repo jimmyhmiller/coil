@@ -175,7 +175,7 @@ A bulk-append primitive landed alongside step 2 because `loader.read-file` neede
 (extend! [(l (mut (ArrayList T))) (src (ptr T)) (n i64)] (-> i64)   ; a method of (ArrayList T)
 ```
 
-It reserves the whole run up front and `mem-copy`s it, instead of a call plus a capacity
+It reserves the whole run up front and `mem/copy`s it, instead of a call plus a capacity
 test per element.
 
 ## What the arena actually bought
