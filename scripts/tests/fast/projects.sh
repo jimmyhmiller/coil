@@ -180,10 +180,13 @@ run "$W" ./consumer
 expect 0 "" "the consumer links the unit; state, generic statics, aggregates and impls behave"
 # A module that re-exports another's names builds as a unit, and its consumer sees
 # the re-exported names, under the names the import gives them, and nothing more.
+# With no export list, every name the module declares is public through the unit
+# as from source: one its `meta` generates, a C function, a generic sum's
+# variants, a derive generator, and functions keep their parameter names.
 run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" build-unit facade.coil -o "$W/facade-unit"
 expect 0 "unit.o" "build-unit builds a module that re-exports another"
 run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" build facade_consumer.coil --unit "$W/facade-unit" -o "$W/facade-consumer"
-expect 0 "facade-consumer" "a consumer of a re-exporting unit reaches the re-exported names"
+expect 0 "facade-consumer" "a consumer of a re-exporting unit reaches the re-exported names and every name the module declares"
 run "$W" ./facade-consumer
 expect 0 "" "the re-exported names behave as they do from source"
 printf '(module pfunit.facade-leak)\n(import "pfunit.facade" :use *)\n(defn excluded [] (-> i64) (bump!))\n(defn renamed [] (-> i64) (combine (Point :x 1 :y 2)))\n(defn main [] (-> i64) 0)\n' > "$W/units/facade_leak.coil"
