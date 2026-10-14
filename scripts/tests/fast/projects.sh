@@ -11,7 +11,8 @@
 #               a library member, a directory the members glob skips, a
 #               dependency of the workspace's (with C source) and one of a member's.
 #   hermetic/   the hermetic standard-library profile with a core provider.
-#   units/      a module built ahead of time with build-unit, and its consumer.
+#   units/      modules built ahead of time with build-unit (one re-exports the
+#               other's names), and their consumers.
 #
 # The fixture is copied to a scratch directory first; the tree is never written.
 # The compiler is $COIL (default: `coil` on PATH). Exit status 0 only if every
@@ -177,11 +178,20 @@ run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" build consumer.coil -
 expect 0 "consumer" "a consumer compiles against the unit's interface"
 run "$W" ./consumer
 expect 0 "" "the consumer links the unit; state, generic statics, aggregates and impls behave"
-# The interface declares only the module's own exports, so a re-export would be
-# lost on the way to a consumer: build-unit says so instead.
-printf '(module pfunit.facade)\n(import "pfunit.mathlib" :use [add] :reexport)\n(defn twice [(x i64)] (-> i64) (add x x))\n' > "$W/units/facade.coil"
+# A module that re-exports another's names builds as a unit, and its consumer sees
+# the re-exported names, under the names the import gives them, and nothing more.
 run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" build-unit facade.coil -o "$W/facade-unit"
-expect 1 "a unit's interface cannot carry a re-export" "build-unit refuses a module that re-exports another"
+expect 0 "unit.o" "build-unit builds a module that re-exports another"
+run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" build facade_consumer.coil --unit "$W/facade-unit" -o "$W/facade-consumer"
+expect 0 "facade-consumer" "a consumer of a re-exporting unit reaches the re-exported names"
+run "$W" ./facade-consumer
+expect 0 "" "the re-exported names behave as they do from source"
+printf '(module pfunit.facade-leak)\n(import "pfunit.facade" :use *)\n(defn excluded [] (-> i64) (bump!))\n(defn renamed [] (-> i64) (combine (Point :x 1 :y 2)))\n(defn main [] (-> i64) 0)\n' > "$W/units/facade_leak.coil"
+run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" check facade_leak.coil --unit "$W/facade-unit"
+case "$RC:$OUT" in
+  1:*"undefined function 'bump!'"*"undefined function 'combine'"*) ok "a re-exporting unit passes on nothing its re-export excludes or renames away" ;;
+  *) bad "a re-exporting unit passes on nothing its re-export excludes or renames away" "exit $RC: $OUT" ;;
+esac
 
 echo "== a flat package"
 # No src/ or tests/: the package directory is the source root, so project-wide
