@@ -147,15 +147,18 @@ metaprograms, forwards to the unit's own compiled methods, so carrying it never
 pulls the module's imports into the interface. A generic impl or derive the
 module writes is copied as source, and so is a constant: it is computed again
 where the interface is compiled, calling the unit's own compiled functions. A
-`:reexport` import is carried as written, so a consumer sees exactly the names
+runtime `def` stays in the unit's object and the interface declares it, so the
+unit and its consumers share its one copy: a `Var` the consumer sets is the one
+the unit's functions read. A `:reexport` import is carried as written, so a consumer sees exactly the names
 it passes on from source; the re-exported module is compiled by the consumer
 (from source, or as its own unit), like any module the interface names. A unit
 has no process entry: the module's `main` is an ordinary function, public as
 `engine/main` exactly as when the module is imported from source, and the
 consumer's own `main` stays its entry.
 `build-unit` refuses a module whose metaprograms generate a public generic
-function, macro, computed constant or generic impl, and one that registers a
-checker or transform, rather than ship an interface that silently lacks them.
+function, macro, computed constant or generic impl, one with a `def` that
+carries annotations (`:params`), and one that registers a checker or transform,
+rather than ship an interface that silently lacks them.
 
 To build and use a unit by hand:
 

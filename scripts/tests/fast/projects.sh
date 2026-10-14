@@ -177,7 +177,7 @@ unit_key=$(cat "$W/mathlib-unit/unit.key" 2>&1)
 run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" build consumer.coil --unit "$W/mathlib-unit" -o "$W/consumer"
 expect 0 "consumer" "a consumer compiles against the unit's interface"
 run "$W" ./consumer
-expect 0 "" "the consumer links the unit; state, generic statics, aggregates and impls behave"
+expect 0 "" "the consumer links the unit; state, a def it shares, generic statics, aggregates and impls behave"
 # A module that re-exports another's names builds as a unit, and its consumer sees
 # the re-exported names, under the names the import gives them, and nothing more.
 # With no export list, every name the module declares is public through the unit
