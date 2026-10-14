@@ -275,6 +275,16 @@ section_check() {
     *) bad "check: the error points at its line and column" "$out" ;; esac
   rm -f "$T/seven.o" "$T/seven"
   expect_rc 0 "check: a good program exits 0" "$COIL" check "$T/seven.coil"
+  # Every compile expands the library's metaprograms in tower generations, each of
+  # which resolves and checks the whole metaprogram closure again. A function or a
+  # method whose body nests macros converges inside one generation; when methods
+  # could not, the generic slice `=` alone held a trivial program for seven.
+  local generations
+  out=$(COIL_TRACE=1 "$COIL" check "$T/seven.coil" 2>&1); rc=$?
+  generations=$(grep -c 'coil-trace begin frontend.expand.round.resolve' <<<"$out")
+  [ "$rc" = 0 ] && [ "$generations" -ge 1 ] && [ "$generations" -le 12 ] \
+    && ok "check: a trivial program expands the library in at most 12 tower generations" \
+    || bad "check: a trivial program expands the library in at most 12 tower generations" "exit $rc, $generations generations"
   [ ! -e "$T/seven.o" ] && [ ! -e "$T/seven" ] && ok "check writes no object or executable" \
     || bad "check writes no object or executable" "$(ls "$T")"
   expect_rc 0 "build -o /dev/null checks a good program" "$COIL" build "$T/seven.coil" -o /dev/null
