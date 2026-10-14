@@ -61,7 +61,7 @@ layout() {
 }
 
 allns() {
-  expect_rc 0 "the stdlib manifest matches src/stdlib" python3 scripts/compiler/gen-stdlib-manifest.py --check
+  expect_rc 0 "the stdlib manifest and API-REEXPORTS match src/stdlib" python3 scripts/compiler/gen-stdlib-manifest.py --check
   "$COIL" namespaces > "$T/ns.txt" 2>/dev/null
   python3 scripts/compiler/gen-stdlib-manifest.py --print-namespaces > "$T/ns-want.txt"
   if diff -u "$T/ns-want.txt" "$T/ns.txt" > "$T/ns.diff" 2>&1; then

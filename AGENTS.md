@@ -183,7 +183,9 @@ Use this format:
   rewrites code that uses the old names (the preflight in
   `src/compiler/api_migration.coil`), `coil build` in such a project points at it,
   and the resolver's errors name the replacement. Delete any `coil.lint.modernize`
-  rule for a name you remove.
+  rule for a name you remove. Changing a library module's `:reexport` import
+  means rerunning `python3 scripts/compiler/gen-stdlib-manifest.py`, which
+  regenerates the table's `API-REEXPORTS` from the library's imports.
 - `src/examples/*.coil` — one idea each (`sums`, `hashmap`, `references`, `lisp`, …).
 - Dialects (Scheme, Brainfuck), applications (clox, CHIP-8, Space Invaders, Wasm),
   and research transforms (GC dialects, httptap) live in the separate
