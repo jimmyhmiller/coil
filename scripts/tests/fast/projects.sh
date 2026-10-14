@@ -182,8 +182,9 @@ expect 0 "" "the consumer links the unit; state, generic statics, aggregates and
 # the re-exported names, under the names the import gives them, and nothing more.
 # With no export list, every name the module declares is public through the unit
 # as from source: one its `meta` generates, a C function, a generic sum's
-# variants, a derive generator, constants, and functions keep their parameter
-# names.
+# variants, a derive generator, constants, its `main` (an ordinary function in a
+# unit, never a second process entry beside the consumer's), and functions keep
+# their parameter names.
 run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" build-unit facade.coil -o "$W/facade-unit"
 expect 0 "unit.o" "build-unit builds a module that re-exports another"
 run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" build facade_consumer.coil --unit "$W/facade-unit" -o "$W/facade-consumer"

@@ -7,7 +7,9 @@
   export __stack_pointer, and its `write` import must be (i32, i32, i32) -> i32:
   size_t and ssize_t are 32-bit on wasm32.
 - tests/bootstrap/errno.coil on the native wasm backend (wasm64), run as a
-  standalone program: errno set by the host is the errno Coil reads.
+  standalone program: errno set by the host is the errno Coil reads. Then a
+  program importing it: the module exports the program's own `main`, not the
+  imported module's (`bootstrap_errno.main`, an ordinary function there).
 - the externref misuse files: every way of putting a host reference in linear
   memory is a located checker error, never a compiler abort.
 
@@ -93,6 +95,22 @@ def wasm64_errno(coil: str, work: Path) -> None:
     run(["wasm-tools", "validate", "--features=memory64", module], "validate errno.wasm")
     run(["node", ROOT / "src/tooling/wasm-host/run-standalone.mjs", module], "run errno.wasm")
     print("ok   wasm64: errno round-trips between the host and Coil")
+    entry = work / "entry.coil"
+    entry.write_text('(module wasm_entry)\n(import "bootstrap_errno" :as errno-test)\n'
+                     '(defn main [] (-> i64) (+ 7 (errno-test/main)))\n')
+    module = work / "entry.wasm"
+    env = {**os.environ, "COIL_NAMESPACE_ROOTS": str(ROOT / "tests/bootstrap")}
+    built = subprocess.run([coil, "build", entry, "--backend", "wasm", "--target", "wasm64-unknown-unknown",
+                            "-o", module, "--quiet"], cwd=ROOT, env=env, capture_output=True, text=True,
+                           timeout=120, stdin=subprocess.DEVNULL)
+    if built.returncode != 0:
+        raise Failed(f"build entry.coil (wasm64): exit {built.returncode}\n{built.stdout[-3000:]}{built.stderr[-3000:]}")
+    ran = run(["node", ROOT / "src/tooling/wasm-host/run-standalone.mjs", module], "run entry.wasm",
+              expect_ok=False)
+    if ran.returncode != 7:
+        raise Failed(f"entry.wasm must run its own main (exit 7), got exit {ran.returncode}: "
+                     f"an imported module's main is not the program entry\n{ran.stdout}{ran.stderr[-3000:]}")
+    print("ok   wasm64: the program's own main is the entry, not an imported module's")
 
 
 def externref_misuse(coil: str, work: Path) -> None:

@@ -149,7 +149,10 @@ module writes is copied as source, and so is a constant: it is computed again
 where the interface is compiled, calling the unit's own compiled functions. A
 `:reexport` import is carried as written, so a consumer sees exactly the names
 it passes on from source; the re-exported module is compiled by the consumer
-(from source, or as its own unit), like any module the interface names.
+(from source, or as its own unit), like any module the interface names. A unit
+has no process entry: the module's `main` is an ordinary function, public as
+`engine/main` exactly as when the module is imported from source, and the
+consumer's own `main` stays its entry.
 `build-unit` refuses a module whose metaprograms generate a public generic
 function, macro, computed constant or generic impl, and one that registers a
 checker or transform, rather than ship an interface that silently lacks them.
