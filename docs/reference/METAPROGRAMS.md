@@ -229,7 +229,10 @@ New API this project added (all shipped):
   `:unknown`, or `:ambiguous`; a local lacking a unique checked identity contains
   `:unknown` or `:ambiguous` instead of an ID. `meta/source-binding NODE` is strict
   occurrence lookup: a newly constructed symbol never acquires a binding from its
-  spelling. Source queries outside this lint phase return `:unavailable`.
+  spelling. Source queries outside this lint phase return `:unavailable`. The
+  evidence covers the files the user wrote, which are the only ones a fix can
+  edit: a bundled library module has no reference records, and a binding asked
+  of its syntax is `:unknown`.
 
   `meta/references-through IMPORT` selects references resolved through that
   import's facade. `meta/reference-import` and `meta/reference-exported-name`

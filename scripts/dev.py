@@ -268,6 +268,7 @@ def install(args: argparse.Namespace) -> None:
     print(f"installed {source} -> {destination}")
     if not args.no_warm_unit:
         warm_jit_unit(destination, libdir)
+        warm_lint_profile(destination, libdir)
     report_installed(destination)
 
 
@@ -304,6 +305,28 @@ def warm_jit_unit(compiler: Path, libdir: Path) -> None:
     else:
         print("note: could not warm the coil.jit unit; the first coil.jit build will build it")
         shutil.rmtree(out, ignore_errors=True)
+
+
+def warm_lint_profile(compiler: Path, libdir: Path) -> None:
+    """Prebuild the standard lint profile beside the library.
+
+    `coil lint` runs the checkers of coil.lint.default; compiling them and the
+    library they import was most of what a small lint cost. The compiler keeps
+    them compiled as a native image at `<lib>/coil/lint-profile` (the directory
+    `lint-profile-dir` in driver.coil names) and builds a missing or stale one on
+    the first lint. Installing builds it, so no lint pays for that. Run from an
+    empty directory: the build must not index the caller's sources. Best-effort.
+    """
+    out = libdir / "lint-profile"
+    with tempfile.TemporaryDirectory(prefix="coil-lint-profile-") as cwd:
+        result = subprocess.run(
+            [str(compiler), "build-lint-profile", str(out)],
+            cwd=cwd, capture_output=True, text=True,
+        )
+    if result.returncode == 0:
+        print(f"warmed lint profile -> {out}")
+    else:
+        print("note: could not warm the lint profile; the first coil lint will build it")
 
 
 def report_installed(destination: Path) -> None:
@@ -552,7 +575,7 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--variant", choices=("full", "nollvm", "linux", "nollvm-linux", "x64"),
                          default="full", help="bootstrap variant used with --build")
     command.add_argument("--no-warm-unit", action="store_true",
-                         help="skip prebuilding the coil.jit unit (the first coil.jit build then builds it)")
+                         help="skip prebuilding the coil.jit unit and the lint profile (the first coil.jit build or lint then builds it)")
     command.add_argument("--allow-downgrade", action="store_true",
                          help="install even when the installed compiler was built from a newer commit")
     command.set_defaults(func=install)

@@ -5334,8 +5334,7 @@
   (let [cache (lint-profile-reg-box)]
     (if (!= (.init cache) (primitive/cast i64 0))
         (Some (.reg cache))
-        (let [w (stderr)
-              ; The command owns the cached registry and its backing arena across
+        (let [; The command owns the cached registry and its backing arena across
               ; lint passes. Teardown happens after the last pass, not each facade.
               arena
                 (box! (unit-allocator)
@@ -5349,33 +5348,314 @@
                 (unit-resource! (primitive/cast (ptr i8) arena)
                                 (fnptr-of driver-release-scratch))
               ra (allocator arena)
-              rules-src "(module coil-lint-rules)\n(defn main [] (-> i64) 0)\n"
-              rules (primitive/alloc-stack LS)
-              (mut result) (None [CheckerReg])]
-          (ls-init! (mut rules) ra)
-          (set! (.srccount rules) 1)
-          (register-source! (mut rules) "<lint rules>" rules-src)
-          (match (read-all ra rules-src 0)
-            (Err [d] (report-diag w (mut rules) d))
-            (Ok [forms]
-                (do
-                  (namespace-index-build! (mut rules))
-                  (load-program (mut rules)
-                                (prepend-selected-uses ra (mut rules) forms 1)
-                                cwd)
-                  (if (ls-err? (mut rules))
-                      (report-diag w (mut rules) (.loaderr rules))
-                      (match (expand-stage3 (mut rules))
-                        (Err [d] (report-diag w (mut rules) d))
-                        (Ok [_]
-                            (match (run-transforms-and-check ra (mut rules))
-                              (Err [d] (report-check-diags w (mut rules) d))
-                              (Ok [_]
-                                  (let [reg (checker-reg-save)]
-                                    (set! (.reg cache) reg)
-                                    (set! (.init cache) 1)
-                                    (set! result (Some reg)))))))))))
-          (load result)))))
+              found
+                (match (lint-profile-prebuilt ra)
+                  (Some [reg] (Some reg))
+                  (None []
+                        (let [rules (primitive/alloc-stack LS)]
+                          (match (lint-profile-compile ra (mut rules) cwd)
+                            (None [] (None [CheckerReg]))
+                            (Some [_] (Some (checker-reg-save)))))))]
+          (match found
+            (Some [reg]
+                  (do
+                    (set! (.reg cache) reg)
+                    (set! (.init cache) 1)
+                    0))
+            (None [] 0))
+          found))))
+
+;;; Compile the built-in lint profile from source into RULES: a program that
+;;; imports coil.lint.default, expanded and checked. Its checked program, with the
+;;; profile's registrations left in the checker registry; None, the diagnostic
+;;; reported, when it does not compile.
+(defn lint-profile-compile [(ra (dyn Allocator))
+                            (rules (mut LS))
+                            (cwd (slice u8))] (-> (Option (ptr Program)))
+  (let [w (stderr)
+        rules-src "(module coil-lint-rules)\n(defn main [] (-> i64) 0)\n"
+        (mut result) (None [(ptr Program)])]
+    (ls-init! (mut rules) ra)
+    (set! (.srccount rules) 1)
+    (register-source! (mut rules) "<lint rules>" rules-src)
+    (match (read-all ra rules-src 0)
+      (Err [d] (report-diag w (mut rules) d))
+      (Ok [forms]
+          (do
+            (namespace-index-build! (mut rules))
+            (load-program (mut rules)
+                          (prepend-selected-uses ra (mut rules) forms 1)
+                          cwd)
+            (if (ls-err? (mut rules))
+                (report-diag w (mut rules) (.loaderr rules))
+                (match (expand-stage3 (mut rules))
+                  (Err [d] (report-diag w (mut rules) d))
+                  (Ok [_]
+                      (match (run-transforms-and-check ra (mut rules))
+                        (Err [d] (report-check-diags w (mut rules) d))
+                        (Ok [cp] (do (set! result (Some cp)) 0)))))))))
+    (load result)))
+
+; ---- the built-in lint profile, prebuilt ---------------------------------------
+; Compiling coil.lint.default and everything it imports is most of what a small
+; `coil lint` costs, and it is the same work every time: the profile is toolchain
+; code, not the application's. It is kept as a checker profile (artifact_provider):
+; the checkers compiled into one native image, rebuilt when this compiler or any
+; source the profile was compiled from changes. A command that finds it fresh
+; loads the image; one that does not builds it first, in a child that compiles
+; the profile as if no project were involved, and compiles it in process only
+; when no profile can be kept or built.
+
+;;; Where this compiler keeps its lint profile: beside an installed library,
+;;; `<prefix>/lib/coil/lint-profile` (`dev.py install` builds it there); for any
+;;; other compiler -- a candidate or stage binary of a checkout -- beside the
+;;; binary, `<binary>.lint-profile`, so compilers that share a checkout never
+;;; replace each other's.
+(defn lint-profile-dir [(a (dyn Allocator))] (-> (slice u8))
+  (let [layout (stdlib-layout a)]
+    (if (= (.kind layout) STDLIB-INSTALLED)
+        (path-join a (dirname (.libs layout)) "lint-profile")
+        (sconcat a (self-command-path a) ".lint-profile"))))
+
+;;; The profile is built in isolation (see spawn-lint-profile-build!), so nothing
+;;; about the command that loads it changes what it is.
+(const LINT-PROFILE-OPTIONS "")
+
+;;; Whether this compiler runs metaprograms as native code it can load from an
+;;; image: not the interpreter (COIL_META_INTERP=1 asks for it to be exercised)
+;;; and not a wasm host.
+(defn lint-profile-native? [] (-> bool)
+  (not (or (meta-interp-requested?) (or (meta-wasm-active?) (wasm-sandbox?)))))
+
+;;; The prebuilt profile's registry, built first when it is missing or stale.
+;;; None when this compiler cannot keep one; the caller then compiles the profile.
+(defn lint-profile-prebuilt [(a (dyn Allocator))] (-> (Option CheckerReg))
+  (if (not (lint-profile-native?))
+      (None [CheckerReg])
+      (let [span (tr/span-begin "lint.profile-open")
+            dir (lint-profile-dir a)
+            loaded
+              (match (artifact/profile-open a dir LINT-PROFILE-OPTIONS)
+                (Ok [p] (Some p))
+                (Err [_]
+                     (if (lint-profile-build! a dir)
+                         (match (artifact/profile-open a dir LINT-PROFILE-OPTIONS)
+                           (Ok [p] (Some p))
+                           (Err [d]
+                                (do
+                                  (ps (stderr) "note: the lint profile just built does not load (")
+                                  (ps (stderr) (.msg d))
+                                  (ps (stderr) "); compiling its checkers from source\n")
+                                  (None [artifact/LoadedProfile]))))
+                         (None [artifact/LoadedProfile]))))]
+        (tr/span-end span)
+        (match loaded
+          (None [] (None [CheckerReg]))
+          (Some [p] (Some (lint-profile-install! a (box! a artifact/LoadedProfile p))))))))
+
+;;; Build the profile into DIR. False, with nothing printed, when there is nowhere
+;;; to keep one (DIR's directory is not writable) or this compiler cannot emit a
+;;; native image; false with a note when building it failed.
+(defn lint-profile-build! [(a (dyn Allocator)) (dir (slice u8))] (-> bool)
+  (if (or (= (.isset (meta-build-box)) (primitive/cast i64 0))
+          (!= (access (to-cstr a (dirname dir)) 2) (primitive/cast i32 0)))
+      false
+      (do
+        (when (.on (lint-progress))
+          (ps (stderr) "lint: building the lint profile into ")
+          (ps (stderr) dir)
+          (wb (stderr) 10)
+          0)
+        (if (= (spawn-lint-profile-build! a dir) (primitive/cast i64 0))
+            true
+            (do
+              (ps (stderr)
+                  "note: could not build the lint profile; compiling its checkers from source\n")
+              false)))))
+
+;;; `coil build-lint-profile DIR` in a child, as if no project were involved: the
+;;; variables a project command publishes are unset for it, and it runs in this
+;;; process's temporary directory, so it indexes no sources of its own.
+(defn spawn-lint-profile-build! [(a (dyn Allocator)) (dir (slice u8))] (-> i64)
+  (let [prior-cwd (sconcat a (cwd-slice a) "")
+        names (split a (shipped-unit-isolated-vars) " ")
+        (mut saved) (ArrayList::new [(slice u8)] a)]
+    (for [i 0 (len (load names))]
+      (let [nm (to-cstr a (get (load names) i))]
+        (push! (mut saved) (unit-env-copy a nm))
+        (unsetenv nm)
+        0)
+      0)
+    (let [rc
+            (try (let [; Not DIR's directory: an installed library's holds the
+                       ; library's own sources.
+                       here (try-or! (temp/dir) 1)
+                       _ (try-or! (os/change-dir a here) 1)]
+                   (let [(mut args) (ArrayList::new [(slice u8)] a)]
+                     (push! (mut args) (self-command-path a))
+                     (push! (mut args) "build-lint-profile")
+                     (push! (mut args) dir)
+                     (wait-code (spawn-wait a (load args))))))]
+      (match (os/change-dir a prior-cwd) (_ 0))
+      (for [i 0 (len (load names))]
+        (unit-env-restore! a
+                           (to-cstr a (get (load names) i))
+                           (get (load saved) i))
+        0)
+      rc)))
+
+;;; A loaded profile as the checker registry a compiled one leaves: its entries
+;;; join the metaprogram engine, and the program the registry names them in
+;;; declares each one -- its body is in the image.
+(defn lint-profile-install! [(a (dyn Allocator))
+                             (p (ptr artifact/LoadedProfile))] (-> CheckerReg)
+  (let [m (.metadata p)
+        engine (meta-engine)
+        o (primitive/alloc-stack Out)
+        _out (init-out o a)
+        program (out->program o a)
+        (mut precheckers) (ArrayList::new [(slice u8)] a)
+        (mut checkers) (ArrayList::new [(slice u8)] a)
+        allfns (box! a SBox (zeroed SBox))
+        gs (box! a SBoxStruct (zeroed SBoxStruct))
+        gu (box! a SBoxSum (zeroed SBoxSum))]
+    (when (= (primitive/cast i64 (load (field engine entries))) (primitive/cast i64 0))
+      (store! (field engine entries) (box-al [MEEntry] a (ArrayList::new [MEEntry] a)))
+      0)
+    (for [i 0 (len (load (.entries m)))]
+      (let [entry (elem (.entries m) i)]
+        (if (= (.phase entry) 0)
+            (push! (mut precheckers) (.name entry))
+            (push! (mut checkers) (.name entry)))
+        (push! (mut (load (field program funcs)))
+               (lint-profile-entry-func a (.name entry)))
+        (push! (mut (load (field engine entries)))
+               (MEEntry :name (.name entry)
+                 :fp (get (load (.fps p)) i)
+                 :registry (.registry m)
+                 :symbol (.symbol entry)
+                 :modbytes ""
+                 :interpcx (primitive/cast (ptr i8) 0))))
+      0)
+    (set! (.active engine) 1)
+    (set! (.items allfns) (load (.names m)))
+    (set! (.items gs) (ArrayList::new [StructDef] a))
+    (set! (.items gu) (ArrayList::new [SumDef] a))
+    (CheckerReg
+      :active 1
+      :precheckers (box-al [(slice u8)] a (load precheckers))
+      :checkers (box-al [(slice u8)] a (load checkers))
+      :semtx-once (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+      :semtx (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+      :posttx (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+      :checked program
+      :macros (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+      :comptime (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+      :expanded (ArrayList::new [TaggedForm] a)
+      :allfns allfns
+      :gs gs
+      :gu gu)))
+
+;;; A checker as the profile's program declares it: `(declare NAME [(modules Code)]
+;;; (-> Code))`.
+(defn lint-profile-entry-func [(a (dyn Allocator)) (name (slice u8))] (-> Func)
+  (let [(mut params) (ArrayList::new [Param] a)]
+    (push! (mut params)
+           (Param :name "modules"
+             :ty (TCode)
+             :bid 0
+             :owned_type (primitive/cast (ptr Type) 0)
+             :positional_only false))
+    (Func :name name
+      :type_params (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+      :bounds (box-al [Bound] a (ArrayList::new [Bound] a))
+      :cc ""
+      :annotations (box-al [Annotation] a (ArrayList::new [Annotation] a))
+      :params (box-al [Param] a (load params))
+      :ret (TCode)
+      :body (box-al [Expr] a (ArrayList::new [Expr] a))
+      :macro_variadic false
+      :lo -1
+      :hi -1
+      :source -1
+      :ctxt 0
+      :declared true)))
+
+;;; `coil build-lint-profile DIR`: compile coil.lint.default and publish it as a
+;;; checker profile at DIR, replacing a stale one. What `coil lint` runs, in a
+;;; child, when its profile is missing or stale, and `dev.py install` to build an
+;;; installed toolchain's.
+(defn build-lint-profile-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (block :command
+         (when (!= (primitive/cast i64 argc) 3)
+           (ps (stderr) "usage: coil build-lint-profile DIRECTORY\n")
+           (return-from :command 2))
+         (when (or (not (lint-profile-native?))
+                   (= (.isset (meta-build-box)) (primitive/cast i64 0)))
+           (ps (stderr)
+               "error: a lint profile is a native image; this compiler cannot build one\n")
+           (return-from :command 1))
+         (cli-use-add "coil.lint.default")
+         (run-dump-on-big-stack a
+                                ""
+                                (cwd-slice a)
+                                (from-cstr (load (index argv 2)))
+                                (fnptr-of build-lint-profile-render))))
+
+; The mode-3 dump-fn of build-lint-profile: PATH is the profile's directory.
+(defn build-lint-profile-render [(a (dyn Allocator))
+                                 (src (slice u8))
+                                 (cwd (slice u8))
+                                 (path (slice u8))] (-> i64)
+  (let [prior (.artifact_inputs (loader-unit-state))
+        _track
+          (set! (.artifact_inputs (loader-unit-state))
+                (box-al [LoaderArtifactInput]
+                        a
+                        (ArrayList::new [LoaderArtifactInput] a)))
+        rules (primitive/alloc-stack LS)
+        rc
+          (match (lint-profile-compile a (mut rules) cwd)
+            (None [] 1)
+            (Some [cp]
+                  (let [reg (checker-reg-save)
+                        (mut entries) (ArrayList::new [artifact-wire/ProfileEntry] a)]
+                    (if (or (> (len (load (.semtx-once reg))) 0)
+                            (or (> (len (load (.semtx reg))) 0)
+                                (> (len (load (.posttx reg))) 0)))
+                        (do
+                          (ps (stderr)
+                              "error: the lint profile registers transforms; a checker profile holds only checkers\n")
+                          1)
+                        (do
+                          (for [i 0 (len (load (.precheckers reg)))]
+                            (push! (mut entries)
+                                   (artifact-wire/ProfileEntry :name (get (load (.precheckers reg)) i)
+                                     :symbol ""
+                                     :phase 0))
+                            0)
+                          (for [i 0 (len (load (.checkers reg)))]
+                            (push! (mut entries)
+                                   (artifact-wire/ProfileEntry :name (get (load (.checkers reg)) i)
+                                     :symbol ""
+                                     :phase 1))
+                            0)
+                          (match (artifact/profile-build a
+                                                         rules
+                                                         cp
+                                                         "coil.lint.default"
+                                                         (box-al [artifact-wire/ProfileEntry]
+                                                                 a
+                                                                 (load entries))
+                                                         (box-al [(slice u8)]
+                                                                 a
+                                                                 (.items (.allfns reg)))
+                                                         LINT-PROFILE-OPTIONS
+                                                         path)
+                            (Err [d] (do (report-diag (stderr) (mut rules) d) 1))
+                            (Ok [_] 0)))))))]
+    (set! (.artifact_inputs (loader-unit-state)) prior)
+    rc))
 
 ;;; One analysis's memory: everything it allocates goes when the analysis ends.
 ;;; A segmented bump arena, as every compilation unit uses. It was a
@@ -5481,6 +5761,7 @@
     (if (ls-err? (mut target))
         (lint-report-diag w (mut target) (.loaderr target))
         (let [_source-facts (source-facts-start!)
+              _source-scope (lint-source-facts-scope! ta (mut target))
               _source-view (source-view-discard!)
               authored
                 (tower-snapshot ta
@@ -5537,6 +5818,32 @@
                                                                      d))
                                               (Ok [_] (set! result 1))))))))))))))))))
     (load result)))
+
+;;; What an analysis records source facts about (source-facts-scope!): the files
+;;; the user wrote -- a source whose name is not a synthetic `<…>` one, as
+;;; `code-from-user?` decides -- and the modules their forms belong to.
+(defn lint-source-facts-scope! [(a (dyn Allocator)) (target (mut LS))] (-> i64)
+  (let [(mut sources) (ArrayList::new [bool] a)
+        (mut modules) (ArrayList::new [(slice u8)] a)]
+    (for [i 0 (len (.sources target))]
+      (let [name (.name (elem (field target sources) i))]
+        (push! (mut sources)
+               (and (> (len name) 0) (!= (get name 0) (primitive/cast u8 60)))))
+      0)
+    (for [i 0 (len (.out target))]
+      (let [tf (elem (field target out) i)
+            sid (sx-source (load (field tf form)))]
+        (when (and (>= sid 0)
+                   (and (< sid (len (load sources))) (get (load sources) sid)))
+          (match (.module tf)
+            (Some [m]
+                  (unless (set-contains (mut modules) m) (push! (mut modules) m))
+                  0)
+            (None [] 0))
+          0))
+      0)
+    (source-facts-scope! (box-al [bool] a (load sources))
+                         (box-al [(slice u8)] a (load modules)))))
 
 ; The next target must not inherit this semantic model even though its arena
 ; is about to be released. Clear every global index that can contain a pointer
@@ -25591,6 +25898,7 @@ Pipeline stage dumps (for debugging the compiler itself), each <file.coil>
                                    1))
                   (= sub "build-provider") (build-provider-cmd a argc argv)
                   (= sub "build-unit") (build-unit-cmd a argc argv)
+                  (= sub "build-lint-profile") (build-lint-profile-cmd a argc argv)
                   (= sub "namespaces") (do (ps (stdout) (stdlib-namespaces)) 0)
                   (= sub "doc")
                     (doc-cmd a

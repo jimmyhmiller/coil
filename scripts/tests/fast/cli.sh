@@ -376,7 +376,26 @@ open(sys.argv[1], "w").write(
   else
     bad "lint --diff prints the fix and writes nothing" "--diff changed the file"
   fi
-  "$COIL" lint "$T/probe.coil" --fix >/dev/null 2>&1; rc=$?
+  # The standard profile's checkers are kept compiled beside the compiler (beside
+  # an installed library, else beside the binary), built by the first lint that
+  # finds none; later lints load it instead of compiling coil.lint.default.
+  local profile fix_out
+  if [ -d "$(dirname "$COIL")/../lib/coil/stdlib" ]; then
+    profile="$(dirname "$COIL")/../lib/coil/lint-profile"
+  else
+    profile="$COIL.lint-profile"
+  fi
+  fix_out=$("$COIL" lint "$T/probe.coil" --fix --verbose 2>&1); rc=$?
+  case "$fix_out" in
+    *"building the lint profile"*) bad "lint loads the lint profile an earlier lint built" "$fix_out" ;;
+    *"lint: analysis 1"*)
+      if [ -f "$profile/metadata" ]; then
+        ok "lint loads the lint profile an earlier lint built"
+      else
+        bad "lint loads the lint profile an earlier lint built" "no profile at $profile"
+      fi ;;
+    *) bad "lint loads the lint profile an earlier lint built" "exit $rc: $fix_out" ;;
+  esac
   local fixed
   fixed=$(cat "$T/probe.coil")
   case "$fixed" in
