@@ -1368,6 +1368,10 @@ discarded.
 - Every name an `(export …)` list gives must be one the module defines (a
   definition its macros generate counts) or re-exports. A name it only imports
   is an error there: an import passes a name on only with `:reexport`.
+- An unknown name that a module you could import defines and exports gets a
+  hint naming that module and the import to add, such as
+  `(import "coil.prop.stateful" :use [sm-new])`, or the alias to write it
+  through when the module is imported without `:use` naming it.
 
 Two modules may declare the same C `extern`. A C symbol is global to the linker,
 but a declaration belongs to the module that wrote it: each module's calls are
