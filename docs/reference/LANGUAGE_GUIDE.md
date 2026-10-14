@@ -1365,6 +1365,9 @@ discarded.
   list, less `:exclude`, under each `:rename`'s new name. A `:reexport` with no
   `:use` passes on every name of its module, although it refers none of them in the
   module itself. A module's `(export …)` list limits re-exported names too.
+- Every name an `(export …)` list gives must be one the module defines (a
+  definition its macros generate counts) or re-exports. A name it only imports
+  is an error there: an import passes a name on only with `:reexport`.
 
 Two modules may declare the same C `extern`. A C symbol is global to the linker,
 but a declaration belongs to the module that wrote it: each module's calls are
