@@ -102,8 +102,17 @@ expect 0 "-9223372036854775807" "a release build wraps on overflow"
 echo "== app: profiles, install"
 run "$APP" "$COIL" build --profile safe
 expect 0 "build/safe/pfapp" "--profile safe builds into build/safe"
+# A build of one named file scans only that file for removed names, not the whole
+# project: a file it never imports is not its business (and scanning every file
+# made each such build in a large project pay for parsing all of it).
+printf '(module pfapp.legacy-note)\n(import "coil.hashmap" :use [hm-len])\n' > "$APP/src/legacy_note.coil"
 run "$APP" "$COIL" build --profile safe src/main.coil
+rm -f "$APP/src/legacy_note.coil"
 expect 0 "wrote build/safe/main" "--profile safe builds a named file into build/safe too"
+case "$OUT" in
+  *"removed library names"*) bad "a named-file build scans only that file for removed names" "$OUT" ;;
+  *) ok "a named-file build scans only that file for removed names" ;;
+esac
 run "$APP" ./build/safe/pfapp overflow
 [ "$RC" -ge 128 ] && case "$OUT" in *"panic: integer overflow"*) true ;; *) false ;; esac \
   && ok "the safe profile's coil.safety traps the overflow" \
