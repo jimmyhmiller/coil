@@ -366,15 +366,23 @@ open(sys.argv[1], "w").write(
     "    (if (primitive/icmp-ge (primitive/load x) 2) 0 1)))\n")
 ' "$T/probe.coil"
   cp "$T/probe.coil" "$T/probe.orig"
-  local diff_out rc
+  # --diff analyses its rewrites in memory: it never opens the file to write, so
+  # even the modification time stays (one in the past, so a write in the same
+  # second still shows).
+  touch -t 202001020304 "$T/probe.coil"
+  local diff_out rc mtime_before mtime_after
+  mtime_before=$(stat -c %Y "$T/probe.coil" 2>/dev/null || stat -f %m "$T/probe.coil")
   diff_out=$("$COIL" lint "$T/probe.coil" --diff 2>&1); rc=$?
-  if cmp -s "$T/probe.orig" "$T/probe.coil"; then
+  mtime_after=$(stat -c %Y "$T/probe.coil" 2>/dev/null || stat -f %m "$T/probe.coil")
+  if ! cmp -s "$T/probe.orig" "$T/probe.coil"; then
+    bad "lint --diff prints the fix and writes nothing" "--diff changed the file"
+  elif [ -z "$mtime_before" ] || [ "$mtime_before" != "$mtime_after" ]; then
+    bad "lint --diff prints the fix and writes nothing" "--diff wrote the file: its mtime went from '$mtime_before' to '$mtime_after'"
+  else
     case "$diff_out" in
       *"+"*"(set! x 2)"*) ok "lint --diff prints the fix and writes nothing" ;;
       *) bad "lint --diff prints the fix and writes nothing" "exit $rc, no (set! x 2) in the diff: $(head -c 600 <<<"$diff_out")" ;;
     esac
-  else
-    bad "lint --diff prints the fix and writes nothing" "--diff changed the file"
   fi
   # The standard profile's checkers are kept compiled beside the compiler (beside
   # an installed library, else beside the binary), built by the first lint that

@@ -146,19 +146,21 @@ fi
 
 # A file edited while lint --fix analyses it is the editor's. The rule appends a
 # line to its target during the analysis (tests/meta/concurrent_edit_rule.coil);
-# the preflight has already rewritten the target's removed name by then, so both
-# the round's write and putting the run back must leave the file alone. (The
-# target is written here: a removed name in tests/ would make every build of
-# this repository offer the migration.)
+# the preflight has already proposed a rewrite of the target's removed name by
+# then, in memory, so the one write that ends the run must leave the file as the
+# editor left it: the original text and the appended line. (The target is
+# written here: a removed name in tests/ would make every build of this
+# repository offer the migration.)
 mkdir -p "$WORK/race"
 cp $M/concurrent_edit_rule.coil "$WORK/race/"
 printf '(module mt.concurrent-edit-target)\n(import "coil.primitive" :as primitive)\n(import "coil.args" :use [args-count])\n\n(defn main [] (-> i64)\n  (primitive/imul (args-count) 1))\n' \
   > "$WORK/race/concurrent_edit_target.coil"
 out=$(cd "$WORK/race" && "$COIL" lint concurrent_edit_target.coil --use mt.concurrent-edit-rule --fix 2>&1); rc=$?
 raced=$(cat "$WORK/race/concurrent_edit_target.coil")
+case "$raced" in *"(count)"*) rc="wrote its rewrite, exit $rc" ;; esac
 case "$rc|$out|$raced" in
   *"fixed "*) bad "lint --fix leaves a file edited during its analysis to the editor" "exit $rc, it claims the file: $out" ;;
-  "2|"*"left untouched: concurrent_edit_target.coil"*"|"*"(count)"*"; edited meanwhile"*)
+  "2|"*"left untouched: concurrent_edit_target.coil"*"|"*"(args-count)"*"; edited meanwhile"*)
     ok "lint --fix leaves a file edited during its analysis to the editor" ;;
   *) bad "lint --fix leaves a file edited during its analysis to the editor" "exit $rc: $out
 $raced" ;;

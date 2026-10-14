@@ -207,19 +207,19 @@ printf '[package]\nname = "flat"\nentry = "main.coil"\n' > "$FLAT/Coil.toml"
 printf '(module flat.main)\n(import "flat.util" :use [twice])\n(defn main [] (-> i64) (println "{}" (twice 21)) 0)\n' > "$FLAT/main.coil"
 printf '(module flat.util)\n(import "coil.args" :use [args-count])\n(defn twice [(x i64)] (-> i64) (+ (* x 2) (* 0 (args-count))))\n' > "$FLAT/util.coil"
 # A removed name the migration cannot rewrite stops the whole project: every file
-# is put back, the run says why, and it names no file as fixed.
+# is left as it was, the run says why, and it names no file as fixed.
 printf '(module flat.legacy)\n(import "coil.hashmap" :use [hm-get])\n(defn f [] (-> i64) (let [g (fnptr-of hm-get [i64 i64])] 0))\n' > "$FLAT/legacy.coil"
 cp "$FLAT/util.coil" "$W/flat-util.orig"
 run "$FLAT" "$COIL" lint --fix
 if [ "$RC" = 1 ] && cmp -s "$W/flat-util.orig" "$FLAT/util.coil"; then
   case "$OUT" in
     *"fixed "*) bad "lint --fix that cannot migrate a file names none as fixed" "$OUT" ;;
-    *"legacy.coil:3: error: "*"error: lint --fix put every file back as it was: the uses of removed names reported above as errors"*)
-      ok "lint --fix that cannot migrate a file puts every file back and says why" ;;
-    *) bad "lint --fix that cannot migrate a file puts every file back and says why" "$OUT" ;;
+    *"legacy.coil:3: error: "*"error: lint --fix wrote nothing: the uses of removed names reported above as errors"*)
+      ok "lint --fix that cannot migrate a file writes nothing and says why" ;;
+    *) bad "lint --fix that cannot migrate a file writes nothing and says why" "$OUT" ;;
   esac
 else
-  bad "lint --fix that cannot migrate a file puts every file back and says why" "exit $RC: $OUT $(cat "$FLAT/util.coil")"
+  bad "lint --fix that cannot migrate a file writes nothing and says why" "exit $RC: $OUT $(cat "$FLAT/util.coil")"
 fi
 rm "$FLAT/legacy.coil"
 run "$FLAT" "$COIL" lint --fix
