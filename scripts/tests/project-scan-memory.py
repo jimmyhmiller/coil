@@ -20,6 +20,18 @@
    comment, many long-named files and many empty directories are added beside an
    entry, and the frontend's live load arena may grow only by a bounded amount.
 
+3. A tested program's (meta …) output is expanded on its own. `coil test` and a
+   project `check` register the test runner, an after-expand transform. Its
+   output used to be all new forms, so the check after meta elaboration
+   re-parsed the whole program, and any after-expand transform sent meta output
+   through a second expansion of the whole program: checking a statemachine
+   example whose test imports coil.jit (the whole compiler, without a prebuilt
+   unit) peaked at 5.8 GB, 1.4 GB of it these two. A package whose meta output
+   an after-expand transform of its own rewrites is checked under COIL_TRACE:
+   meta elaboration runs no stage 3 rounds and its final parse costs at most an
+   eighth of its first; then its test must pass, which needs the transform to
+   have seen the meta output.
+
 Usage: project-scan-memory.py [COMPILER] [--full]
   COMPILER defaults to $COIL. The default sizes the index check at about 2,000
   directory entries (FAST); --full uses 16,000 files and 8,000 directories.
@@ -101,6 +113,86 @@ def project_scan(compiler: str, work: Path) -> None:
     print("ok   the pre-build scan reads only the members and lets go")
 
 
+MAGIC = """(module app.magic)
+(import "coil.primitive" :as primitive)
+
+(defn magic-call? [(f Code)] (-> bool)
+  (and (primitive/code-list? f) (= (len f) 1) (= (get f 0) `magic)))
+
+(defn mentions-magic? [(f Code)] (-> bool)
+  (or (magic-call? f) (any? (fn [child] (mentions-magic? child)) f)))
+
+(defn rewrite [(f Code)] (-> Code)
+  (cond (magic-call? f) `43
+        (mentions-magic? f)
+          (let [(mut kids) (primitive/code-list-new)]
+            (for child f (push! (mut kids) (rewrite child)))
+            (primitive/code-list-like f `(~@kids)))
+        :else f))
+
+(defn desugar-magic [(modules Code)] (-> Code)
+  (let [(mut out) (primitive/code-list-new)]
+    (for m modules (push! (mut out) (rewrite m)))
+    `(~@out)))
+
+(transform desugar-magic :phase after-expand)
+"""
+META_MAIN = """(module app.main)
+(import "coil.primitive" :as primitive)
+(import "app.magic")
+(defn gen-answer [] (-> Code)
+  `(defn ~(primitive/syntax->datum `answer) [] (-> i64) (~(primitive/syntax->datum `magic))))
+(meta (gen-answer))
+(defn main [] (-> i64) (println "{} {}" (answer) (magic)) 0)
+"""
+META_TEST = """(module app.main-test)
+(import "app.main" :use [answer])
+(deftest the-transform-saw-the-meta-output (assert-eq 43 (answer)))
+"""
+
+
+def meta_output(compiler: str, work: Path) -> None:
+    package = work / "meta"
+    (package / "src").mkdir(parents=True)
+    (package / "tests").mkdir()
+    (package / "Coil.toml").write_text('[package]\nname = "app"\nentry = "src/main.coil"\n')
+    (package / "src" / "magic.coil").write_text(MAGIC)
+    (package / "src" / "main.coil").write_text(META_MAIN)
+    (package / "tests" / "main_test.coil").write_text(META_TEST)
+    env = {**os.environ, "COIL_TRACE": "1"}
+    result = subprocess.run([compiler, "check"], cwd=package, env=env, text=True,
+                            capture_output=True)
+    if result.returncode != 0:
+        raise SystemExit(f"FAIL check of the meta package: exit {result.returncode}\n"
+                         f"{result.stdout}{result.stderr[-4000:]}")
+    inside, rounds, parses, last_parse = False, 0, [], False
+    for line in result.stderr.splitlines():
+        if line == "coil-trace begin frontend.check.meta-elaboration":
+            inside = True
+        elif line.startswith("coil-trace end frontend.check.meta-elaboration "):
+            inside = False
+        elif inside and line == "coil-trace begin frontend.expand.stage3-rounds":
+            rounds += 1
+        elif inside and line.startswith("coil-trace end frontend.resolve.parse "):
+            last_parse = True
+        elif inside and last_parse and line.startswith("coil-trace count semantic.form-parse-bytes "):
+            parses.append(int(line.split()[-1]))
+            last_parse = False
+    if len(parses) < 2:
+        raise SystemExit(f"FAIL expected meta elaboration to parse at least twice, saw {parses}:\n"
+                         f"{result.stderr[-4000:]}")
+    print(f"meta elaboration: {rounds} stage 3 rounds; first parse {parses[0]} B, final {parses[-1]} B")
+    if rounds:
+        raise SystemExit("FAIL meta output went through a second expansion of the whole program")
+    if parses[-1] * 8 > parses[0]:
+        raise SystemExit("FAIL the check after meta elaboration re-parsed the program")
+    test = subprocess.run([compiler, "test"], cwd=package, text=True, capture_output=True)
+    if test.returncode != 0 or "1 passed" not in test.stdout:
+        raise SystemExit(f"FAIL test of the meta package: exit {test.returncode}\n"
+                         f"{test.stdout}{test.stderr[-4000:]}")
+    print("ok   a tested program's meta output is expanded on its own, and transformed")
+
+
 def load_arena_bytes(compiler: str, root: Path, source: Path, output: Path) -> int:
     env = os.environ.copy()
     env.pop("COIL_READERS", None)
@@ -176,6 +268,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="coil-project-scan-",
                                      dir=os.environ.get("COIL_TEST_SCRATCH")) as directory:
         project_scan(compiler, Path(directory))
+        meta_output(compiler, Path(directory))
         namespace_index(compiler, Path(directory) / "index", args.full)
     print("project scan memory: PASS")
     return 0
