@@ -135,10 +135,10 @@ EOF
   else
     bad "a coil.jit application builds from the installed toolchain" "$(tail -20 "$T/sdk.log")"
   fi
-  # Every build from the install loads the warmed unit, a second copy of the
+  # A build that imports coil.jit loads the warmed unit, a second copy of the
   # compiler that exports its own metaprogram callbacks. An interpreted macro must
   # still call back into the compiler expanding it.
-  printf '(module interp-macro)\n(defn less-21 [(x Code)] (-> Code) `(- ~x 21))\n(defn main [] (-> i64) (less-21 21))\n' \
+  printf '(module interp-macro)\n(import "coil.jit" :use [jit-backend])\n(defn less-21 [(x Code)] (-> Code) `(- ~x 21))\n(defn main [] (-> i64) (less-21 21))\n' \
     > "$T/sdk/interp-macro.coil"
   expect_rc 0 "an interpreted macro (COIL_META_INTERP=1) expands with the warmed unit loaded" \
     bash -c 'cd "$1" && COIL_META_INTERP=1 "$2" run interp-macro.coil --backend llvm' _ "$T/sdk" "$COIL"
@@ -149,6 +149,25 @@ EOF
     *"No such file"*|"") bad "an ordinary program links no compiler SDK" "emit-obj produced nothing: $plain" ;;
     *repl-session-new*) bad "an ordinary program links no compiler SDK" "unexpected SDK symbol" ;;
     *) ok "an ordinary program links no compiler SDK" ;;
+  esac
+  # Only a build that imports coil.jit looks at the unit: deciding that it is fresh
+  # hashes the whole compiler and the binary, and using it loads its dylib, which
+  # every command (`--version`, `fmt`, a plain build) used to pay at startup.
+  local loaded plain_loads
+  if [ "$HOST_OS" = Darwin ]; then
+    loaded=$(cd "$T/sdk" && DYLD_PRINT_LIBRARIES=1 "$COIL" build interp-macro.coil -o interp-macro 2>&1)
+    plain_loads=$(cd "$T/sdk" && DYLD_PRINT_LIBRARIES=1 "$COIL" build plain.coil -o plain 2>&1)
+  else
+    loaded=$(cd "$T/sdk" && LD_DEBUG=files "$COIL" build interp-macro.coil -o interp-macro 2>&1)
+    plain_loads=$(cd "$T/sdk" && LD_DEBUG=files "$COIL" build plain.coil -o plain 2>&1)
+  fi
+  case "$loaded" in
+    *coil.compiler.jit_api/unit.*) ok "a build that imports coil.jit loads the warmed unit" ;;
+    *) bad "a build that imports coil.jit loads the warmed unit" "$(printf '%s\n' "$loaded" | tail -5)" ;;
+  esac
+  case "$plain_loads" in
+    *coil.compiler.jit_api/unit.*) bad "a build that does not import coil.jit leaves the unit alone" "it loaded the unit" ;;
+    *) ok "a build that does not import coil.jit leaves the unit alone" ;;
   esac
 }
 
