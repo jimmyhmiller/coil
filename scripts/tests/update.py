@@ -8,6 +8,7 @@ import http.server
 import json
 import os
 import platform
+import socketserver
 import ssl
 import subprocess
 import sys
@@ -24,6 +25,16 @@ def phase(what: str) -> None:
     """Report progress with the elapsed time, so a step killed at its budget
     shows how far it got and where the time went."""
     print(f"update test: {time.monotonic() - STARTED:6.2f}s {what}", flush=True)
+
+
+class LoopbackServer(http.server.ThreadingHTTPServer):
+    """HTTPServer.server_bind names the server with socket.getfqdn, a reverse DNS
+    lookup of the bound address; on a CI runner that lookup took 35 s, every run.
+    A loopback test server is named by its address."""
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def archive(root: Path, label: str) -> tuple[bytes, str]:
@@ -89,7 +100,7 @@ def main() -> None:
             def log_message(self, *_: object) -> None:
                 pass
 
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server = LoopbackServer(("127.0.0.1", 0), Handler)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(cert, key)
         server.socket = context.wrap_socket(server.socket, server_side=True)

@@ -6,8 +6,19 @@ whole body cannot see the first fragment before the last one is sent. That is wh
 separates real streaming from replaying a buffered body through several callbacks.
 """
 
+import socketserver
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+class LoopbackServer(ThreadingHTTPServer):
+    """HTTPServer.server_bind names the server with socket.getfqdn, a reverse DNS
+    lookup of the bound address; on a CI runner that lookup took 35 s. A loopback
+    test server is named by its address."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 # One fragment per flush, with a gap between them. The gap has to be comfortably longer
 # than the client's measurement noise while keeping the suite fast.
@@ -133,4 +144,4 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(("127.0.0.1", 38474), Handler).serve_forever()
+    LoopbackServer(("127.0.0.1", 38474), Handler).serve_forever()

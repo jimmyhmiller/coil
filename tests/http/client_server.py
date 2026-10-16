@@ -1,4 +1,15 @@
+import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+class LoopbackServer(ThreadingHTTPServer):
+    """HTTPServer.server_bind names the server with socket.getfqdn, a reverse DNS
+    lookup of the bound address; on a CI runner that lookup took 35 s. A loopback
+    test server is named by its address."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -16,4 +27,4 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-ThreadingHTTPServer(("127.0.0.1", 38473), Handler).serve_forever()
+LoopbackServer(("127.0.0.1", 38473), Handler).serve_forever()
