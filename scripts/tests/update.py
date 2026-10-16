@@ -14,7 +14,16 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 from pathlib import Path
+
+STARTED = time.monotonic()
+
+
+def phase(what: str) -> None:
+    """Report progress with the elapsed time, so a step killed at its budget
+    shows how far it got and where the time went."""
+    print(f"update test: {time.monotonic() - STARTED:6.2f}s {what}", flush=True)
 
 
 def archive(root: Path, label: str) -> tuple[bytes, str]:
@@ -47,6 +56,7 @@ def main() -> None:
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                         "-days", "1", "-keyout", key, "-out", cert, "-config", config],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        phase("certificate generated")
         artifacts = {}
         for index in (1, 2):
             data, digest = archive(root, f"release-{index}")
@@ -61,6 +71,7 @@ def main() -> None:
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:
+                phase(f"server: GET {self.path}")
                 if self.headers.get("Authorization") != "Bearer private-test-token":
                     self.send_error(401)
                     return
@@ -84,6 +95,7 @@ def main() -> None:
         server.socket = context.wrap_socket(server.socket, server_side=True)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        phase(f"server listening on port {server.server_port}")
         try:
             environment = os.environ.copy()
             environment.update({"HOME": str(root / "home"), "COIL_UPDATE_CA_FILE": str(cert),
@@ -91,6 +103,7 @@ def main() -> None:
             for index in (1, 2):
                 environment["COIL_UPDATE_URL"] = f"https://localhost:{server.server_port}/coil/v1/channels/manifest-{index}.json"
                 subprocess.run([compiler, "update"], env=environment, check=True)
+                phase(f"update {index} finished")
                 current = root / "home/.local/bin/coil"
                 assert subprocess.check_output([current], text=True).strip() == f"release-{index}"
             subprocess.run([compiler, "update", "--rollback"], env=environment, check=True)
