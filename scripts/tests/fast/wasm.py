@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -56,19 +55,127 @@ def run(command: list, label: str, expect_ok: bool = True) -> subprocess.Complet
     return result
 
 
+VALUE_TYPES = {0x7F: "i32", 0x7E: "i64", 0x7D: "f32", 0x7C: "f64", 0x7B: "v128",
+               0x70: "funcref", 0x6F: "externref"}
+
+
+class Module:
+    """The function types, imports and exports of a wasm binary, read from the
+    binary itself. The text `wasm-tools print` writes is not a stable interface:
+    1.261 started printing each import's signature inline, which a pattern over
+    the text took for a missing import."""
+
+    def __init__(self, data: bytes) -> None:
+        if data[:8] != b"\0asm\x01\0\0\0":
+            raise Failed("not a version-1 wasm binary")
+        self.data = data
+        self.types: list[tuple[list[str], list[str]]] = []
+        self.imports: list[tuple[str, str, int | None]] = []  # (module, name, function type)
+        self.exports: list[str] = []
+        at = 8
+        while at < len(data):
+            section = data[at]
+            self.at = at + 1
+            size = self.uleb()
+            body, at = self.at, self.at + size
+            if section == 1:
+                self.read_types()
+            elif section == 2:
+                self.read_imports()
+            elif section == 7:
+                self.read_exports()
+            if section in (1, 2, 7) and self.at != at:
+                raise Failed(f"section {section} is {size} bytes but its contents end at {self.at - body}")
+
+    def uleb(self) -> int:
+        value, shift = 0, 0
+        while True:
+            byte = self.data[self.at]
+            self.at += 1
+            value |= (byte & 0x7F) << shift
+            shift += 7
+            if not byte & 0x80:
+                return value
+
+    def name(self) -> str:
+        size = self.uleb()
+        text = self.data[self.at:self.at + size].decode("utf-8")
+        self.at += size
+        return text
+
+    def value_type(self) -> str:
+        code = self.data[self.at]
+        self.at += 1
+        if code not in VALUE_TYPES:
+            raise Failed(f"value type 0x{code:02x} is not one this check reads")
+        return VALUE_TYPES[code]
+
+    def limits(self) -> None:
+        flags = self.uleb()
+        self.uleb()
+        if flags & 1:
+            self.uleb()
+        if flags & 8:  # custom page size
+            self.uleb()
+
+    def read_types(self) -> None:
+        for _ in range(self.uleb()):
+            if self.data[self.at] != 0x60:
+                raise Failed(f"type form 0x{self.data[self.at]:02x} is not a plain function type")
+            self.at += 1
+            params = [self.value_type() for _ in range(self.uleb())]
+            results = [self.value_type() for _ in range(self.uleb())]
+            self.types.append((params, results))
+
+    def read_imports(self) -> None:
+        for _ in range(self.uleb()):
+            module, name = self.name(), self.name()
+            kind = self.data[self.at]
+            self.at += 1
+            if kind == 0:
+                self.imports.append((module, name, self.uleb()))
+                continue
+            if kind == 1:
+                self.value_type()
+                self.limits()
+            elif kind == 2:
+                self.limits()
+            elif kind == 3:
+                self.value_type()
+                self.at += 1  # mutability
+            elif kind == 4:
+                self.at += 1  # tag attribute
+                self.uleb()
+            else:
+                raise Failed(f"import kind {kind} is not one this check reads")
+            self.imports.append((module, name, None))
+
+    def read_exports(self) -> None:
+        for _ in range(self.uleb()):
+            self.exports.append(self.name())
+            self.at += 1  # kind
+            self.uleb()
+
+    def import_signature(self, module: str, name: str) -> str | None:
+        for imported in self.imports:
+            if imported[:2] == (module, name) and imported[2] is not None:
+                params, results = self.types[imported[2]]
+                return f"({', '.join(params)}) -> ({', '.join(results)})"
+        return None
+
+
 def wasm32_program(coil: str, work: Path) -> None:
     module = work / "wasm32.wasm"
     run([coil, "build", WASM / "wasm32.coil", "--target", "wasm32-unknown-unknown", "-o", module, "--quiet"],
         "build wasm32.coil")
     run(["wasm-tools", "validate", module], "validate wasm32.wasm")
-    printed = run(["wasm-tools", "print", module], "print wasm32.wasm").stdout
-    if '(export "__stack_pointer"' not in printed:
+    binary = Module(module.read_bytes())
+    if "__stack_pointer" not in binary.exports:
         raise Failed("wasm32.wasm does not export __stack_pointer, so a host longjmp cannot restore SP")
-    write = re.search(r'\(import "env" "write" \(func \(;\d+;\) \(type (\d+)\)\)\)', printed)
-    signature = write and re.search(r"\(type \(;" + write.group(1) + r";\) \(func ([^\n]*)\)\)", printed)
-    if not signature or signature.group(1) != "(param i32 i32 i32) (result i32)":
+    signature = binary.import_signature("env", "write")
+    if signature != "(i32, i32, i32) -> (i32)":
         raise Failed("on wasm32, write must be (i32 fd, i32 ptr, i32 size_t) -> i32 ssize_t; got "
-                     + (signature.group(1) if signature else "no write import"))
+                     + (signature or "no write import"))
     ran = run(["node", WASM / "run.mjs", module, *EXPECTED_EXPORTS], "run wasm32.wasm", expect_ok=False)
     if ran.returncode != 0:
         raise Failed(f"wasm32.wasm exports returned the wrong values:\n{ran.stdout}{ran.stderr[-3000:]}")
