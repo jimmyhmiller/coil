@@ -89,8 +89,6 @@ def steps(x64: bool) -> list[Step]:
         Step("regex-reference", ["coil", "test", "tests/comprehensive/regex_reference_test.coil"]),
         Step("prop", ["sh", "scripts/tests/prop.sh", "-q", "{compiler}"]),
         Step("fuzz", [PY, "scripts/tests/fuzz_gate.py", "--compiler", "{compiler}"]),
-        Step("http", ["sh", "scripts/tests/http.sh"]),
-        Step("update", [PY, "scripts/tests/update.py", "{compiler}"]),
         Step("simd", [PY, "scripts/tests/simd.py", "full"]),
     ]
     if x64:

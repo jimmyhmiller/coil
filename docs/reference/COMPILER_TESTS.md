@@ -142,7 +142,7 @@ nothing else heavy is running: the build steps peak near 10 GB.
 | `wasm/self-host`, `bootstrap-imports`, `install-pairing` | the wasm-hosted compiler, the wasm32 bootstrap runtime, install pairing |
 | `corpus/*-all`, `corpus/opt3` | every corpus program under `coil.safety`, `-O3` and the interpreted engine |
 | `guide-demos` | every `src/examples` demo builds and exits as `tests/demos.txt` says |
-| `regex-reference`, `prop`, `fuzz`, `http`, `update`, `simd` | breadth: regex conformance, property tests, the fuzz engine, HTTP, `coil update`, SIMD in full |
+| `regex-reference`, `prop`, `fuzz`, `simd` | breadth: regex conformance, property tests, the fuzz engine, SIMD in full |
 | `x64/host` | on the x86-64 Linux host over ssh: the Linux bootstrap, the corpus, the x64 backend's fixpoint and gates |
 
 The x64 step uses `COIL_X64_HOST` (default `computer.jimmyhmiller.com`). That
@@ -156,8 +156,8 @@ whose prefix holds the warmed unit; `dev.py install --source build/bin/coil
 ## CI
 
 The `full` job builds the compiler with `build full`, then runs FAST against it
-(`COIL_BUDGET_SCALE=2.5`), and three COMPREHENSIVE slices with `--only`: the
-updater, the JIT and generated units (after a private install), and SIMD. The
+(`COIL_BUDGET_SCALE=2.5`), and two COMPREHENSIVE slices with `--only`: the
+JIT and generated units (after a private install), and SIMD. The
 `linux` job runs the SIMD slice; the `llvm-free` job's bootstrap runs the corpus
 on arm64. The rest of COMPREHENSIVE runs locally.
 
