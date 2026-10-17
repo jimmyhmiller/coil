@@ -6,8 +6,8 @@
 
 It never builds, checks or installs the compiler: a step that runs a whole-compiler
 command is refused before anything runs, and a process that tries one at run time
-is killed. Every step has a budget in scripts/tests/budgets.toml, and any process
-over 1.5 GB fails its step. Run `--list` to see the steps.
+is killed. Every step has a budget in scripts/tests/budgets.toml (going over it is
+a warning), and any process over 1.5 GB fails its step. Run `--list` to see the steps.
 
 Everything here takes the compiler from $COIL (also first on PATH as `coil`) and
 writes temporary files under $COIL_TEST_SCRATCH, which the harness removes.

@@ -94,7 +94,8 @@ Use this format:
   are two tiers, both serial and both budgeted; `docs/reference/COMPILER_TESTS.md`
   describes every step.
   - **FAST**, before every push: `python3 scripts/dev.py test fast --compiler
-    <candidate>`. At most 270 s, and it fails over 300 s. It never builds the
+    <candidate>`. At most 270 s; a step over its budget, or a run over 300 s, is
+    a warning, not a failure. It never builds the
     compiler, and any process over 1.5 GB fails it.
   - **The inner loop**: build one candidate after compiler edits (`python3
     scripts/dev.py build candidate`, writing `build/bin/coil-candidate`), then

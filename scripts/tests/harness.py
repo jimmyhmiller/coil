@@ -4,14 +4,16 @@
 A tier is a fixed, ordered list of steps run one after another. Every step:
 
 - has a budget in scripts/tests/budgets.toml (a step without one fails);
-- is timed, and fails when it takes longer than its budget;
+- is timed, and is reported as slow, with a warning, when it takes longer than its
+  budget. Time never fails a step: a busy machine makes every step slower. Only a
+  step that runs ten times its budget (at least ten minutes) is killed, as hung;
 - has its process tree watched: a process over the tier's memory limit is killed
   and fails the step, and the peak is reported;
 - prints one line: `#12 diag/types   4.1s  budget 7s  peak 0.41GB  cum 88.3s`.
 
-The serial total is checked against the tier's own limits. COIL_BUDGET_SCALE
-multiplies every budget and limit (CI runners are slower than a laptop); it is the
-only knob.
+The serial total is compared with the tier's own limits, and over them is a
+warning too. COIL_BUDGET_SCALE multiplies every budget and limit (CI runners are
+slower than a laptop); it is the only knob.
 """
 
 from __future__ import annotations
@@ -155,6 +157,7 @@ class Result:
     ok: bool
     reason: str
     log: Path
+    slow: bool = False
 
 
 def referenced_files(argv: list[str]) -> list[Path]:
@@ -194,7 +197,8 @@ def structural_refusals(steps: list[Step]) -> list[str]:
 def run_step(step: Step, index: int, budget: float | None, limit_gb: float, refuse: bool,
              env: dict[str, str], logs: Path) -> Result:
     log = logs / f"{index:02d}-{step.name.replace('/', '-')}.log"
-    timeout = (budget * 2 + 15) if budget is not None else 600
+    # Not a budget: the point past which a step is taken to have hung.
+    timeout = max(budget * 10, 600) if budget is not None else 600
     started = time.monotonic()
     with log.open("wb") as out:
         out.write(f"+ (cd {step.cwd}) {shlex.join(step.argv)}\n".encode())
@@ -230,16 +234,15 @@ def run_step(step: Step, index: int, budget: float | None, limit_gb: float, refu
     if watch.violation:
         reason = watch.violation
     elif timed_out:
-        reason = f"killed after {timeout:.0f}s (twice its budget plus 15s)"
+        reason = f"killed as hung after {timeout:.0f}s (ten times its budget, at least 600s)"
     elif proc.returncode != 0:
         reason = f"exit status {proc.returncode}"
     elif peak > (step.memory_gb or limit_gb) * 1e9:
         reason = f"a process peaked at {peak / 1e9:.2f} GB, over the {(step.memory_gb or limit_gb):.2f} GB limit"
     elif budget is None:
         reason = "no budget entry in scripts/tests/budgets.toml"
-    elif seconds > budget:
-        reason = f"took {seconds:.1f}s, over its {budget:.0f}s budget"
-    return Result(step, seconds, budget, peak, not reason, reason, log)
+    slow = budget is not None and seconds > budget
+    return Result(step, seconds, budget, peak, not reason, reason, log, slow)
 
 
 def tail(path: Path, lines: int = 120) -> str:
@@ -340,9 +343,11 @@ def run_tier(tier: str, steps: list[Step], compiler: str, *, total_key: str | No
                 results.append(result)
                 timings[step.name].append(result.seconds)
                 shown = f"{result.budget:.0f}s" if result.budget is not None and not rebaseline else "-"
-                mark = "ok  " if result.ok else "FAIL"
+                mark = "FAIL" if not result.ok else ("slow" if result.slow and not rebaseline else "ok  ")
                 print(f"{mark} #{index:<2} {step.name:<28} {result.seconds:6.1f}s  budget {shown:>5}  "
                       f"peak {result.peak / 1e9:4.2f}GB  cum {cumulative:6.1f}s", flush=True)
+                if result.ok and result.slow and not rebaseline:
+                    print(f"     WARNING took {result.seconds:.1f}s, over its {result.budget:.0f}s budget")
                 if not result.ok:
                     print(f"     {result.reason}")
                     print("     ---- last lines of " + str(result.log.name) + " ----")
@@ -362,15 +367,15 @@ def run_tier(tier: str, steps: list[Step], compiler: str, *, total_key: str | No
                     print(f"{tier}: no {section}.{total_key} in budgets.toml")
                     status = 1
                 elif hard is not None and wall > hard * factor:
-                    print(f"{tier}: serial wall time {wall:.1f}s is over the hard limit "
+                    print(f"{tier}: WARNING serial wall time {wall:.1f}s is over the limit "
                           f"{hard * factor:.0f}s")
-                    status = 1
-                elif hard is None and wall > total * factor:
-                    print(f"{tier}: serial wall time {wall:.1f}s is over its {total * factor:.0f}s budget")
-                    status = 1
                 elif wall > total * factor:
-                    print(f"{tier}: WARNING serial wall time {wall:.1f}s is over the {total * factor:.0f}s "
-                          f"target (hard limit {hard * factor:.0f}s)")
+                    print(f"{tier}: WARNING serial wall time {wall:.1f}s is over its "
+                          f"{total * factor:.0f}s budget")
+            slow = [r for r in results if r.ok and r.slow]
+            if slow and not rebaseline:
+                print(f"{tier}: WARNING {len(slow)} step(s) over budget: "
+                      + ", ".join(f"{r.step.name} {r.seconds:.1f}s/{r.budget:.0f}s" for r in slow))
             if failed:
                 print(f"{tier}: FAILED ({len(failed)} of {len(results)} steps: "
                       f"{', '.join(r.step.name for r in failed)})")

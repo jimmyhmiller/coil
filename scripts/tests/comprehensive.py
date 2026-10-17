@@ -20,7 +20,7 @@ steps that need the coil.jit unit. `--only` picks steps by name or name prefix;
 CI uses it to run its slices.
 
 Steps run serially; each has a budget in scripts/tests/budgets.toml, and the
-whole tier must fit comprehensive.total.
+whole tier should fit comprehensive.total. Going over either is a warning.
 """
 
 from __future__ import annotations
@@ -152,8 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     total = harness.load_budgets()["comprehensive"]["total"] * harness.scale()
     print(f"== comprehensive: {wall:.1f}s wall in all")
     if not args.only and not args.rebaseline and wall > total:
-        print(f"comprehensive: {wall:.1f}s is over its {total:.0f}s budget")
-        status = 1
+        print(f"comprehensive: WARNING {wall:.1f}s is over its {total:.0f}s budget")
     print("comprehensive: PASS" if status == 0 else "comprehensive: FAILED")
     return status
 

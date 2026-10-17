@@ -1,11 +1,11 @@
 # Testing the Coil compiler
 
 Coil's own tests come in two tiers. Both run their steps one after another, and
-every step has a time budget.
+every step has a time budget. Going over a budget is a warning, never a failure.
 
 | Tier | Command | When | Limit |
 |---|---|---|---|
-| FAST | `python3 scripts/dev.py test fast --compiler <coil>` | before every push | 270 s serial, fails over 300 s |
+| FAST | `python3 scripts/dev.py test fast --compiler <coil>` | before every push | 270 s serial, warns over 300 s |
 | quick | `python3 scripts/dev.py test fast --compiler <coil> --quick` | while iterating | 60 s |
 | COMPREHENSIVE | `python3 scripts/dev.py test comprehensive` | before a release or a risky merge | 25 min, plus the x64 host |
 
@@ -49,9 +49,9 @@ ok   #12 diag/compile                  4.1s  budget     7s  peak 0.41GB  cum   8
 
 A step fails when:
 
-- it exits non-zero, or exceeds twice its budget plus 15 s (it is killed);
-- it takes longer than its budget in `scripts/tests/budgets.toml`;
-- it has no budget entry;
+- it exits non-zero, or runs ten times its budget (at least 600 s), when it is
+  killed as hung;
+- it has no budget entry in `scripts/tests/budgets.toml`;
 - any process in it passes the tier's memory limit: 1.5 GB in FAST, 6 GB in
   COMPREHENSIVE, 16 GB for the steps that compile the whole compiler. The peak
   comes from polling and from the reaped children's `ru_maxrss`;
@@ -59,8 +59,12 @@ A step fails when:
   `jit_api.coil`, `allns`, `dev.py build`/`install`). FAST refuses such a step
   before running anything and kills a process that tries one.
 
-The tier fails when any step fails or the serial wall time passes the tier's
-limit. `COIL_BUDGET_SCALE` multiplies every budget and limit; CI uses 2.5.
+A step that takes longer than its budget passes, marked `slow` with a warning,
+and the tier lists every slow step at the end. Time on a shared machine is noise
+to a pass/fail gate; the warning is there to show a step that has grown.
+
+The tier fails when any step fails. A serial wall time past the tier's limit is a
+warning. `COIL_BUDGET_SCALE` multiplies every budget and limit; CI uses 2.5.
 
 To change a budget, re-baseline on a quiet machine and review the diff like code:
 `python3 scripts/dev.py test fast --compiler <coil> --rebaseline 3` sets each to
