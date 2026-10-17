@@ -111,7 +111,8 @@ using it pays that layout at each level; it is still correct. `code-copy` and
   string's byte values; `(primitive/bytes->str LIST)` → the inverse (list of ints → string).
 - **Reflect on types:** `code-type-shape` safely classifies a type as `struct`,
   `sum`, or `unknown`; `code-type-traits` lists the traits a type implements (their
-  qualified names, generic impls included) — ask it of a type as `type-of` reports
+  qualified names, generic impls included when their bounds hold, so
+  `(Option S)` lists Debug only when `S` has it) — ask it of a type as `type-of` reports
   it, in a checker or semantic transform, where the checked program exists;
   `code-field-count/name/kind/type`, `code-variant-*`
   (including `code-variant-field-name`/`-type`, which reflect a variant's

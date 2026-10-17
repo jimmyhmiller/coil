@@ -184,6 +184,9 @@ first multiple of 7: 7
   `while`, `loop` with `(break value)` and `(continue)`, and labelled
   `(block :name … (return-from :name value))` cover everything else.
 - There is no `return`; a function's value is its last expression.
+- `(comment …)` discards its body, which is read but never resolved or run: a
+  place to keep forms you send to the REPL one at a time. It is `(do)` wherever it
+  stands, at top level or in an expression.
 
 A form whose value nothing uses is a statement, so `when`, loops, and `if` or
 `match` arms of different types all work in a `void` function.

@@ -23,8 +23,20 @@ coil> (double :x 3)
 ```
 
 Forms may span lines; the prompt changes until the brackets balance. A result
-prints through `Debug` if its type implements it, otherwise `Display`,
-otherwise the REPL says it cannot print that type yet.
+prints through `Debug` if its type implements it, otherwise `Display`. A type
+with neither prints from its structure, the way `(derive Debug T)` would print
+it, with each part that has its own `Debug` or `Display` printed through that:
+
+```text
+coil> (defstruct Point [(x i64) (y i64) (next (ptr Point))])
+coil> (Point :x 1 :y 2 :next (cast (ptr Point) 0))
+(Point :x 1 :y 2 :next #<(ptr Point) 0x0>)
+```
+
+A pointer prints its address and is not followed, and a type with no visible
+structure prints as `#<T>`. Nothing is derived: the program gains no impl, so
+you can still write `(derive Debug Point)` later. `coil.repl`, the REPL's
+metaprogram, does this printing.
 
 | Command | Does |
 |---|---|
