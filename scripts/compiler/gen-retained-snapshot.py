@@ -235,6 +235,9 @@ OPAQUE_FIELDS={('coil.compiler.loader.LS','code_session_state'),
                ('coil.compiler.loader.LS','persistent_checked'),
                ('coil.compiler.loader.LS','persistent_dependencies'),
                ('coil.compiler.loader.LS','persistent_declarations'),
+               # A cross build's host twin. Retained sessions compile for the
+               # host, so it is null in every LS a snapshot copies.
+               ('coil.compiler.loader.LS','host_stage'),
                ('coil.compiler.check.Cx','sig_base'),
                ('coil.compiler.check.Cx','const_base'),
                ('coil.compiler.resolve.DefEntry','base'),

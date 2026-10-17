@@ -129,8 +129,9 @@ using it pays that layout at each level; it is still correct. `code-copy` and
 `(primitive/target-arch)` and `(primitive/target-os)` are nullary code ops that answer for the
 platform being **compiled for** — read from the resolved `--target` triple, not
 probed from the machine running the compiler. `target-arch` yields
-`aarch64`/`x86_64`/`wasm32`/`wasm64`; `target-os` yields `linux`/`darwin`/`wasm`.
-Both fall back to the host when no `--target` is given.
+`aarch64`/`x86_64`/`wasm32`/`wasm64`/`riscv32`; `target-os` yields
+`linux`/`darwin`/`wasm`/`none` (`none` is bare metal, a `*-none` triple). Both
+answer for the host when no `--target` is given.
 
 That distinction is the whole point, and it is easy to get wrong: a platform
 constant folded at compile time from a *runtime* probe silently records the
@@ -159,6 +160,30 @@ so the flags stay true compile-time literals (no runtime branch at any use) and
 are still right under cross-compilation. FAST's `cli/cross` step pins this by
 checking the folded `(target-arch)`/`(target-os)` choice across `--target` values,
 which is the only place the property is observable — a cross-built binary never runs on the builder.
+
+### Code that runs inside the compiler
+
+Macros, `(meta …)` generators, transforms and checkers run inside the compiler,
+on the machine building the program, so in a cross build they are compiled for
+that machine, the **host**, as Rust compiles proc macros and Racket keeps
+phases apart. The questions answer for **the code being produced at that
+moment**:
+
+- **The program's own code** answers for `--target`.
+- **A function a macro calls while it runs** was compiled for the host, so its
+  body's platform choices (an `os-pick` constant, a `freestanding-or`, the width
+  of `usize`) are the host's. A macro that opens a file gets the host's `O_CREAT`.
+- **A macro or generator asking `target-os` itself, as it runs,** gets the
+  platform of the code it is producing: `--target` while it expands or generates
+  the program, so `gen-open-flags` above emits the target's flags.
+
+So a generator that produces per-platform definitions asks when it runs, as
+`gen-open-flags` does (its `os-pick` calls receive Code values, so they are
+ordinary calls made at run time); one that called an ordinary helper which had
+already baked in a choice would get the host's answer. When `--target` is the
+host's own platform, all of this is one expansion and nothing changes. FAST's
+`cli/cross` step checks each case with a target whose OS differs from the
+builder's.
 
 New API this project added (all shipped):
 

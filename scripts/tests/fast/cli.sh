@@ -764,6 +764,50 @@ x86_64-pc-linux-gnu 3 10
 x86_64-apple-macosx11.0.0 3 20
 aarch64-unknown-linux-gnu 2 10
 EOF
+  # Code that runs inside the compiler is compiled for the machine running it.
+  # A cross build expands it separately from the program: a function a macro
+  # calls answers for the host, the program's own copy for the target, and a
+  # (meta …) generator asking at run time gets the program's target.
+  cat > "$T/stages.coil" <<'EOF'
+(module stages)
+(import "coil.primitive" :as primitive)
+(defn here-os [] (-> Code) (let [t (primitive/code-str (primitive/target-os))] `~t))
+(defn os-name [] (-> (slice u8)) (here-os))
+(defn macro-saw [] (-> Code) (let [t (primitive/code-str (os-name))] `~t))
+(defn macro-view [] (-> (slice u8)) (macro-saw))
+(defn gen-views [] (-> Code)
+  (let [direct (primitive/code-str (primitive/target-os))
+        via (primitive/code-str (os-name))]
+    `(do (defn ~(primitive/syntax->datum `generated-direct) [] (-> (slice u8)) ~direct)
+         (defn ~(primitive/syntax->datum `generated-via) [] (-> (slice u8)) ~via))))
+(meta (gen-views))
+(defn main [] (-> i64) 0)
+EOF
+  local other host_os other_os stages
+  if [ "$HOST_OS" = Darwin ]; then
+    other=x86_64-pc-linux-gnu; host_os=darwin; other_os=linux
+  else
+    other=x86_64-apple-macosx11.0.0; host_os=linux; other_os=darwin
+  fi
+  stages=$("$COIL" expand "$T/stages.coil" --target "$other" 2>&1)
+  local fn want
+  while read -r fn want; do
+    case "$stages" in
+      *"(defn* $fn [] (-> (slice u8)) \"$want\")"*) ok "a cross build: $fn answers for $want" ;;
+      *) bad "a cross build: $fn answers for $want" "$stages" ;;
+    esac
+  done <<EOF
+os-name $other_os
+macro-view $host_os
+generated-direct $other_os
+generated-via $host_os
+EOF
+  # A macro failing in a bare-metal build reports, like anywhere else: its
+  # helpers run on the host, where a failure has stderr.
+  printf '(module stage-panic)\n(defn bad [] (-> Code) (panic "this macro was given bad input"))\n(defn f [] (-> i64) (bad))\n' \
+    > "$T/stage-panic.coil"
+  expect_out "panic: this macro was given bad input" "a macro's panic in a bare-metal build is reported" \
+    "$COIL" check "$T/stage-panic.coil" --target aarch64-unknown-none
 }
 
 # ---------------------------------------------------------------------------
