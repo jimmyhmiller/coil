@@ -147,6 +147,7 @@ nothing else heavy is running: the build steps peak near 10 GB.
 | `corpus/*-all`, `corpus/opt3` | every corpus program under `coil.safety`, `-O3` and the interpreted engine |
 | `guide-demos` | every `src/examples` demo builds and exits as `tests/demos.txt` says |
 | `regex-reference`, `prop`, `fuzz`, `simd` | breadth: regex conformance, property tests, the fuzz engine, SIMD in full |
+| `freestanding` | every `src/examples/freestanding` program links bare-metal (aarch64, riscv32, ESP32-C3) with `ld.lld --gc-sections` and no undefined symbols, then boots under QEMU; needs `brew install lld qemu` |
 | `x64/host` | on the x86-64 Linux host over ssh: the Linux bootstrap, the corpus, the x64 backend's fixpoint and gates |
 
 The x64 step uses `COIL_X64_HOST` (default `computer.jimmyhmiller.com`). That

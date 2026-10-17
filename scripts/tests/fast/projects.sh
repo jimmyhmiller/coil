@@ -280,6 +280,28 @@ magic=$(head -c 4 "$W/hermetic.wasm" 2>/dev/null | od -An -tx1 | tr -d ' \n')
 [ "$RC" = 0 ] && [ "$magic" = 0061736d ] \
   && ok "a project build honors --target wasm32" \
   || bad "project --target wasm32" "exit $RC, magic '$magic': $OUT"
+# A failed hermetic assertion stops at a trap instruction: brk (SIGTRAP) on arm64,
+# ud2 (SIGILL) on x86_64. It once stored through null, which the optimizer treated
+# as unreachable and deleted together with the check, so the program ran on. The
+# operand is a volatile load so the optimizer cannot see the assertion fail.
+cat > "$W/hermetic/src/main.coil" <<'EOF'
+(module pfhermetic.main)
+(import "coil.primitive" :as primitive)
+
+(defn opaque-zero [] (-> i64)
+  (primitive/llvm-ir i64 [(primitive/alloc-static i64)] "%v = load volatile i64, ptr $0
+ret i64 %v"))
+
+(defn main [] (-> i64)
+  (assert-eq (opaque-zero) (platform-answer))
+  0)
+EOF
+run "$W" "$COIL" run hermetic
+case "$RC:$OUT" in
+  133:*SIGTRAP*|132:*SIGILL*) ok "a failed hermetic assertion traps" ;;
+  *) bad "a failed hermetic assertion traps" "exit $RC: $OUT" ;;
+esac
+cp "$W/hermetic-main.coil" "$W/hermetic/src/main.coil"
 
 [ "$FAIL" = 0 ] && echo "projects: PASS" || echo "projects: FAIL"
 exit "$FAIL"

@@ -78,6 +78,7 @@ HERMETIC_NAMESPACES = {
     "coil.control",
     "coil.derive",
     "coil.dyn",
+    "coil.fail",
     "coil.iter",
     "coil.match",
     "coil.primitive",

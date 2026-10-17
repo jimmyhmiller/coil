@@ -90,6 +90,8 @@ def steps(x64: bool) -> list[Step]:
         Step("prop", ["sh", "scripts/tests/prop.sh", "-q", "{compiler}"]),
         Step("fuzz", [PY, "scripts/tests/fuzz_gate.py", "--compiler", "{compiler}"]),
         Step("simd", [PY, "scripts/tests/simd.py", "full"]),
+        # Bare-metal images link with no undefined symbols and run under QEMU.
+        Step("freestanding", [PY, "scripts/tests/freestanding.py", "--compiler", "{compiler}"]),
     ]
     if x64:
         result.append(Step("x64/host", [PY, "scripts/tests/x64-host.py", "--host", X64_HOST],

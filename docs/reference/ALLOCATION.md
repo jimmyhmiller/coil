@@ -121,6 +121,12 @@ dependency to `alloc.coil` and stays usable from anywhere the allocator is.
 It costs ~23 KB of binary in every program that imports `alloc.coil`, and no measurable
 wall time — see [What it cost](#what-it-cost).
 
+On a target with no operating system (a `*-none` triple) there is no `write` and no
+`abort`. There `oom-at`, `capacity-exceeded-at` and `debug-fail-at` call the handler the
+program installed with `coil.fail/set-handler!`, with `out of memory` and the site, and
+then trap; the hosted report above is not compiled in. See
+`src/examples/freestanding/fail.coil`.
+
 The bug that motivated this — a silent exit-134 wasm64 build — turned out not to
 reproduce, and the allocation hypothesis behind it was disproved rather than confirmed:
 the compiler has no arena anywhere, so `reserve!` never leaves its `realloc` path. The

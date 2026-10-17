@@ -200,6 +200,7 @@
    (reset_func (ptr i8))
    (arch i64)  ; 0 = x86_64, 1 = aarch64, 2 = wasm32, 3 = riscv32
    (mach_o bool)  ; Mach-O (Apple) => asm symbols carry a leading `_`
+   (freestanding bool)  ; no OS: no write(2) to report with, no abort(3) to stop
    (sanitizer i64)  ; 0=off, 1=ASan, 2=TSan, 3=MSan, 4=UBSan checks
    (debug_checks bool)
    (a (dyn Allocator))])
@@ -902,6 +903,13 @@
   (or (match (find triple "apple") (Some [x0] true) (None [] false))
       (match (find triple "darwin") (Some [x1] true) (None [] false))
       (match (find triple "macosx") (Some [x2] true) (None [] false))))
+
+; ELF target? LLVM gives every triple ELF that is not Mach-O, wasm or COFF.
+(defn triple-elf [(triple (slice u8))] (-> bool)
+  (not (or (triple-mach-o triple)
+           (or (starts-with triple "wasm")
+               (or (match (find triple "windows") (Some [_] true) (None [] false))
+                   (match (find triple "uefi") (Some [_] true) (None [] false)))))))
 
 ; the name to use when referencing a global symbol from inline asm.
 (defn cg-asm-sym [(cg (ptr Cg)) (name (slice u8))] (-> (slice u8))
@@ -5629,12 +5637,95 @@
             0))
     (None [] 0)))
 
+; A triple with no operating system: bare metal, where no C library exists.
+(defn triple-freestanding [(triple (slice u8))] (-> bool)
+  (match (find triple "-none") (Some [_] true) (None [] false)))
+
+; On a target with no C library the optimizer must not turn code into libc calls
+; it was not written with: a byte-scanning loop into `strlen`, a copy loop into
+; `memcpy`, a `printf` into `puts`. "no-builtins" on every definition is what
+; clang's -ffreestanding sets. LLVM still lowers its own memory intrinsics to
+; memcpy, memmove, memset and memcmp, which freestanding C requires the
+; environment to provide as well.
+(defn cg-set-freestanding! [(module (ptr i8)) (triple (slice u8))] (-> i64)
+  (when (triple-freestanding triple)
+    (let [(mut f) (LLVMGetFirstFunction module)]
+      (loop (if (= (primitive/cast i64 (load f)) 0)
+                (break)
+                (do
+                  (when (= (LLVMIsDeclaration (load f)) (primitive/cast i32 0))
+                    (LLVMAddTargetDependentFunctionAttr (load f)
+                                                        c"no-builtins"
+                                                        c"")
+                    0)
+                  (set! f (LLVMGetNextFunction (load f))))))
+      0)
+    0)
+  0)
+
+;;; Whether `--gc-sections` may group `g` on its own: a definition the object
+;;; file emits (not a declaration, an `available_externally` copy, a `common`
+;;; symbol or an `appending` llvm.* table) that no comdat already claims.
+(defn llvm-groupable? [(g (ptr i8))] (-> bool)
+  (let [linkage (LLVMGetLinkage g)]
+    (and (= (LLVMIsDeclaration g) (primitive/cast i32 0))
+         (and (= (primitive/cast i64 (LLVMGetComdat g)) 0)
+              (not (or (= linkage (primitive/cast i32 1))  ; available_externally
+                       (or (= linkage (primitive/cast i32 7))  ; appending
+                           (= linkage (primitive/cast i32 14)))))))))  ; common
+
+;;; Put `g` in a comdat of its own. An unnamed global is named first: the
+;;; comdat's name is its section group's signature symbol.
+(defn llvm-group-definition! [(module (ptr i8)) (g (ptr i8))] (-> i64)
+  (when (= (len (from-cstr (LLVMGetValueName g))) 0)
+    (LLVMSetValueName2 g c"coil.anon" 9)
+    0)
+  (let [comdat (LLVMGetOrInsertComdat module (LLVMGetValueName g))]
+    (LLVMSetComdatSelectionKind comdat 3)  ; nodeduplicate
+    (LLVMSetComdat g comdat))
+  0)
+
+;;; `ld --gc-sections` discards an ELF object one section at a time, so it can
+;;; drop a definition only when nothing else shares its section. This gives every
+;;; definition its own `nodeduplicate` comdat, which ELF lowers to a section group
+;;; holding the definition's own uniquely named section -- of the kind LLVM picks,
+;;; so a relocated constant still lands in .data.rel.ro under PIC -- together with
+;;; its jump tables. It is what -ffunction-sections -fdata-sections arrange through
+;;; TargetOptions, which the C API cannot reach. Without it an object is one
+;;; .text, one .rodata and one .data, and the first use of any of them keeps every
+;;; stdlib definition coil.core brings in, with the libc each one calls: a
+;;; freestanding image cannot link. A nodeduplicate group is never merged with
+;;; another object's, so symbol resolution is unchanged. Run after optimization,
+;;; just before an object is emitted, so it also covers the globals passes create
+;;; (switch tables, merged constants).
+(defn llvm-group-definitions! [(module (ptr i8)) (triple (slice u8))] (-> i64)
+  (when (triple-elf triple)
+    (let [(mut f) (LLVMGetFirstFunction module)]
+      (loop (if (= (primitive/cast i64 (load f)) 0)
+                (break)
+                (do
+                  (when (llvm-groupable? (load f))
+                    (llvm-group-definition! module (load f)))
+                  (set! f (LLVMGetNextFunction (load f)))))))
+    (let [(mut g) (LLVMGetFirstGlobal module)]
+      (loop (if (= (primitive/cast i64 (load g)) 0)
+                (break)
+                (do
+                  (when (and (llvm-groupable? (load g))
+                             (not (starts-with (from-cstr (LLVMGetValueName (load g)))
+                                               "llvm.")))
+                    (llvm-group-definition! module (load g)))
+                  (set! g (LLVMGetNextGlobal (load g)))))))
+    0)
+  0)
+
 (defn codegen-session-finish! [(s (ptr CodegenSession))] (-> (ptr i8))
   (if (not (.open s))
       (primitive/cast (ptr i8) 0)
       (let [cg (.cg s)
             module (.module cg)]
         (cg-set-frame-pointers! module (from-cstr (.triple s)))
+        (cg-set-freestanding! module (from-cstr (.triple s)))
         (LLVMDisposeBuilder (.builder cg))
         (LLVMDisposeTargetData (.td cg))
         (LLVMDisposeTargetMachine (.machine s))
@@ -5779,6 +5870,7 @@
         (set! (.reset_func cgp) (primitive/cast (ptr i8) 0))
         (set! (.arch cgp) (arch-from-triple (from-cstr triple)))
         (set! (.mach_o cgp) (triple-mach-o (from-cstr triple)))
+        (set! (.freestanding cgp) (triple-freestanding (from-cstr triple)))
         (set! (.sanitizer cgp) sanitizer)
         (set! (.debug_checks cgp) debug-checks)
         (set! (.a cgp) a)
@@ -6543,11 +6635,15 @@
         c"generic-rv32"
         c"generic")))
 
+; Bare-metal aarch64 starts with the MMU off, where all memory is Device memory
+; and every unaligned access faults, so a `-none` object must not merge narrow
+; accesses into wider unaligned ones. (Linux and Darwin enable unaligned access.)
 (defn llvm-cpu-features [(triple (ptr i8))] (-> (ptr i8))
   (let [s (from-cstr triple)]
-    (if (match (find s "riscv32") (Some [_] true) (None [] false))
-        c"+m,+c"
-        c"")))
+    (cond (match (find s "riscv32") (Some [_] true) (None [] false)) c"+m,+c"
+          (and (starts-with s "aarch64") (triple-freestanding s))
+            c"+strict-align"
+          :else c"")))
 
 (defn llvm-reloc-model [(triple (ptr i8))] (-> i32)
   (let [s (from-cstr triple)]
@@ -7396,6 +7492,50 @@
                                                             (len name))
                            val))
 
+;;; End the current block with a failure the compiler inserted: write the
+;;; `n`-byte message `global` to stderr and abort, or, on a target with no OS,
+;;; stop at a trap instruction (the message has nowhere to go).
+(defn cg-build-hard-fail! [(cg (ptr Cg)) (global (ptr i8)) (n i64)] (-> i64)
+  (let [a (.a cg)
+        b (cg-bld cg)
+        void-fn (LLVMFunctionType (LLVMVoidTypeInContext (cg-ctx cg))
+                                  (carr a (ArrayList::new [(ptr i8)] a))
+                                  0
+                                  0)
+        stop-name (if (.freestanding cg) c"llvm.trap" c"abort")
+        existing (LLVMGetNamedFunction (load (field cg module)) stop-name)
+        stop
+          (if (= (primitive/cast i64 existing) 0)
+              (LLVMAddFunction (load (field cg module)) stop-name void-fn)
+              existing)]
+    (unless (.freestanding cg)
+      ; write(2) takes and returns the target's size_t/ssize_t, 32 bits on wasm32
+      (let [(mut wp) (ArrayList::new [(ptr i8)] a)
+            sizety (LLVMIntPtrTypeInContext (cg-ctx cg) (.td cg))]
+        (push! (mut wp) (LLVMInt32TypeInContext (cg-ctx cg)))
+        (push! (mut wp) (LLVMPointerTypeInContext (cg-ctx cg) 0))
+        (push! (mut wp) sizety)
+        (let [wty (LLVMFunctionType sizety (carr a (load wp)) 3 0)
+              oldw (LLVMGetNamedFunction (load (field cg module)) c"write")
+              wf
+                (if (= (primitive/cast i64 oldw) 0)
+                    (LLVMAddFunction (load (field cg module)) c"write" wty)
+                    oldw)
+              (mut wa) (ArrayList::new [(ptr i8)] a)]
+          (push! (mut wa) (LLVMConstInt (cg-i32t cg) 2 0))
+          (push! (mut wa) global)
+          (push! (mut wa) (LLVMConstInt sizety n 0))
+          (LLVMBuildCall2 b wty wf (carr a (load wa)) 3 (cg-bl cg "fail.write"))
+          0)))
+    (LLVMBuildCall2 b
+                    (LLVMGlobalGetValueType stop)
+                    stop
+                    (carr a (ArrayList::new [(ptr i8)] a))
+                    0
+                    c"")
+    (LLVMBuildUnreachable b)
+    0))
+
 ; UBSan is normally inserted by Clang's source-language frontend; LLVM has no
 ; general `ubsan` IR pass. Coil therefore emits the operation checks it defines
 ; as invalid directly during lowering. A failing check is self-contained and
@@ -7436,40 +7576,7 @@
         (LLVMSetInitializer global bytes)
         (LLVMSetGlobalConstant global 1)
         (LLVMSetLinkage global 9)
-        ; write(2) takes and returns the target's size_t/ssize_t, 32 bits on wasm32
-        (let [(mut wp) (ArrayList::new [(ptr i8)] a)
-              sizety (LLVMIntPtrTypeInContext (cg-ctx cg) (.td cg))]
-          (push! (mut wp) (LLVMInt32TypeInContext (cg-ctx cg)))
-          (push! (mut wp) (LLVMPointerTypeInContext (cg-ctx cg) 0))
-          (push! (mut wp) sizety)
-          (let [wty (LLVMFunctionType sizety (carr a (load wp)) 3 0)
-                oldw (LLVMGetNamedFunction (load (field cg module)) c"write")
-                wf
-                  (if (= (primitive/cast i64 oldw) 0)
-                      (LLVMAddFunction (load (field cg module)) c"write" wty)
-                      oldw)
-                (mut wa) (ArrayList::new [(ptr i8)] a)]
-            (push! (mut wa) (LLVMConstInt (cg-i32t cg) 2 0))
-            (push! (mut wa) global)
-            (push! (mut wa) (LLVMConstInt sizety (len full) 0))
-            (LLVMBuildCall2 b
-                            wty
-                            wf
-                            (carr a (load wa))
-                            3
-                            (cg-bl cg "ubsan.write"))))
-        (let [olda (LLVMGetNamedFunction (load (field cg module)) c"abort")
-              aty
-                (LLVMFunctionType (LLVMVoidTypeInContext (cg-ctx cg))
-                                  (carr a (ArrayList::new [(ptr i8)] a))
-                                  0
-                                  0)
-              af
-                (if (= (primitive/cast i64 olda) 0)
-                    (LLVMAddFunction (load (field cg module)) c"abort" aty)
-                    olda)]
-          (LLVMBuildCall2 b aty af (carr a (ArrayList::new [(ptr i8)] a)) 0 c"")
-          (LLVMBuildUnreachable b)))
+        (cg-build-hard-fail! cg global (len full)))
       (LLVMPositionBuilderAtEnd b good)
       0))
   0)
@@ -7620,66 +7727,13 @@
         (LLVMSetInitializer global bytes)
         (LLVMSetGlobalConstant global 1)
         (LLVMSetLinkage global 9)
-        ; write(2) takes and returns the target's size_t/ssize_t, 32 bits on wasm32
-        (let [(mut write-params) (ArrayList::new [(ptr i8)] a)
-              sizety (LLVMIntPtrTypeInContext (cg-ctx cg) (.td cg))]
-          (push! (mut write-params) (LLVMInt32TypeInContext (cg-ctx cg)))
-          (push! (mut write-params) (LLVMPointerTypeInContext (cg-ctx cg) 0))
-          (push! (mut write-params) sizety)
-          (let [write-ty
-                  (LLVMFunctionType sizety (carr a (load write-params)) 3 0)
-                found-write
-                  (LLVMGetNamedFunction (load (field cg module)) c"write")
-                write-fn
-                  (if (= (primitive/cast i64 found-write) 0)
-                      (LLVMAddFunction (load (field cg module))
-                                       c"write"
-                                       write-ty)
-                      found-write)
-                (mut write-args) (ArrayList::new [(ptr i8)] a)]
-            (push! (mut write-args)
-                   (LLVMConstInt (LLVMInt32TypeInContext (cg-ctx cg)) 2 0))
-            (push! (mut write-args) global)
-            (push! (mut write-args) (LLVMConstInt sizety (len message) 0))
-            (LLVMBuildCall2 b
-                            write-ty
-                            write-fn
-                            (carr a (load write-args))
-                            3
-                            (cg-bl cg "indirect.report"))))
-        (let [existing (LLVMGetNamedFunction (load (field cg module)) c"abort")
-              abort-fn
-                (if (= (primitive/cast i64 existing) 0)
-                    (LLVMAddFunction (load (field cg module))
-                                     c"abort"
-                                     (LLVMFunctionType (LLVMVoidTypeInContext (cg-ctx cg))
-                                                       (carr (.a cg)
-                                                             (ArrayList::new [(ptr i8)]
-                                                                             (.a cg)))
-                                                       0
-                                                       0))
-                    existing)]
-          (LLVMBuildCall2 b
-                          (LLVMGlobalGetValueType abort-fn)
-                          abort-fn
-                          (carr (.a cg)
-                                (ArrayList::new [(ptr i8)] (.a cg)))
-                          0
-                          c"")
-          (LLVMBuildUnreachable b)))
+        (cg-build-hard-fail! cg global (len message)))
       (LLVMPositionBuilderAtEnd b good)
       0))
   0)
 
 (defn cg-add-function [(cg (ptr Cg)) (name (ptr i8)) (fnty (ptr i8))] (-> (ptr i8))
   (let [f (LLVMAddFunction (load (field cg module)) name fnty)]
-    (when (= (.arch cg) (primitive/cast i64 3))
-      (LLVMSetSection f
-                      (to-cstr (.a cg)
-                               (sconcat (.a cg)
-                                        ".text."
-                                        (from-cstr name))))
-      0)
     (let [san (.sanitizer cg)]
       (when (= san (primitive/cast i64 1))
         (LLVMAddAttributeAtIndex f
