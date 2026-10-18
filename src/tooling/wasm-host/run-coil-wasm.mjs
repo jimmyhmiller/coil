@@ -270,7 +270,8 @@ function hostUnsetenv(namePtr) {
 // Node fds are small ints; use them directly. 0/1/2 are std streams.
 function doOpen(pathPtr, flags) {
   const path = cstr(pathPtr);
-  // O_RDONLY=0, O_WRONLY=1, O_RDWR=2, O_CREAT=0x200(mac), O_TRUNC=0x400(mac)
+  // Flags use the wasm host interface's numbering (docs/reference/WASM.md): the
+  // access mode is the low two bits; 'w' creates and truncates.
   const acc = flags & 3;
   let mode = acc === 0 ? 'r' : acc === 1 ? 'w' : 'r+';
   try { return fs.openSync(path, mode); }

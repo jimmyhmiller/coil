@@ -235,8 +235,37 @@ uint32_t env_memcmp(uint64_t a, uint64_t b, uint64_t n) {
 }
 uint64_t env_strlen(uint64_t p) { return (uint64_t)strlen(hoststr(p)); }
 
-// ---- file / directory I/O (guest O_* constants == host's; same OS) ----
-uint32_t env_open(uint64_t path, uint32_t flags, uint64_t mode) { return (uint32_t)open(hoststr(path), (int)flags, (mode_t)mode); }
+// ---- file / directory I/O ----
+// The guest numbers open(2) flags and clock ids as Coil's wasm host interface does
+// (Darwin's numbering; docs/reference/WASM.md). Translate them to this host's, and
+// refuse a bit or id the interface does not define rather than pass it through.
+enum {
+    WASM_O_ACCMODE = 3, WASM_O_APPEND = 0x8, WASM_O_NOFOLLOW = 0x100,
+    WASM_O_CREAT = 0x200, WASM_O_TRUNC = 0x400, WASM_O_EXCL = 0x800,
+    WASM_O_DIRECTORY = 0x100000, WASM_O_CLOEXEC = 0x1000000,
+};
+static int native_open_flags(uint32_t flags, int *out) {
+    static const struct { uint32_t wasm; int native; } bits[] = {
+        { WASM_O_APPEND, O_APPEND }, { WASM_O_NOFOLLOW, O_NOFOLLOW },
+        { WASM_O_CREAT, O_CREAT }, { WASM_O_TRUNC, O_TRUNC }, { WASM_O_EXCL, O_EXCL },
+        { WASM_O_DIRECTORY, O_DIRECTORY }, { WASM_O_CLOEXEC, O_CLOEXEC },
+    };
+    uint32_t acc = flags & WASM_O_ACCMODE;
+    if (acc == 3) return -1;
+    int native = acc == 0 ? O_RDONLY : acc == 1 ? O_WRONLY : O_RDWR;
+    uint32_t rest = flags & ~(uint32_t)WASM_O_ACCMODE;
+    for (size_t i = 0; i < sizeof bits / sizeof bits[0]; i++) {
+        if (rest & bits[i].wasm) { native |= bits[i].native; rest &= ~bits[i].wasm; }
+    }
+    if (rest != 0) return -1;
+    *out = native;
+    return 0;
+}
+uint32_t env_open(uint64_t path, uint32_t flags, uint64_t mode) {
+    int native;
+    if (native_open_flags(flags, &native) != 0) { errno = EINVAL; return (uint32_t)-1; }
+    return (uint32_t)open(hoststr(path), native, (mode_t)mode);
+}
 uint32_t env_creat(uint64_t path, uint32_t mode) {
     return (uint32_t)open(hoststr(path), O_CREAT | O_WRONLY | O_TRUNC, (mode_t)mode);
 }
@@ -305,8 +334,14 @@ uint32_t env_getuid(void) { return (uint32_t)getuid(); }
 uint32_t env_kill(uint32_t pid, uint32_t sig) { return (uint32_t)kill((pid_t)(int32_t)pid, (int)sig); }
 uint32_t env_fchmod(uint32_t fd, uint32_t mode) { return (uint32_t)fchmod((int)fd, (mode_t)mode); }
 uint32_t env_clock_gettime(uint32_t clock_id, uint64_t out) {
+    clockid_t native;
+    switch (clock_id) {
+    case 0: native = CLOCK_REALTIME; break;
+    case 6: native = CLOCK_MONOTONIC; break;
+    default: errno = EINVAL; return (uint32_t)-1;
+    }
     struct timespec ts;
-    int rc = clock_gettime((clockid_t)clock_id, &ts);
+    int rc = clock_gettime(native, &ts);
     if (rc == 0) {
         int64_t sec = (int64_t)ts.tv_sec;
         int64_t nsec = (int64_t)ts.tv_nsec;

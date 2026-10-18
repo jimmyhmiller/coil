@@ -808,6 +808,16 @@ EOF
     > "$T/stage-panic.coil"
   expect_out "panic: this macro was given bad input" "a macro's panic in a bare-metal build is reported" \
     "$COIL" check "$T/stage-panic.coil" --target aarch64-unknown-none
+  # Per-OS choices name every OS they support. Bare metal loads the modules every
+  # program does (coil.safety's included), refuses one that needs an OS by name,
+  # and an OS nothing names is an error at the choice rather than the host's.
+  expect_rc 0 "coil.safety checks for bare metal" \
+    "$COIL" check "$T/seven.coil" --use coil.safety --target riscv32-unknown-none-elf
+  printf '(module uses-fs)\n(import "coil.fs" :as fs)\n(defn main [] (-> i64) 0)\n' > "$T/uses-fs.coil"
+  expect_rc_out 1 'fs.coil> needs an operating system, and a bare-metal' "a bare-metal program cannot load coil.fs" \
+    "$COIL" check "$T/uses-fs.coil" --target aarch64-unknown-none
+  expect_rc_out 1 "none for the target's operating system, .freebsd." "an OS no choice names is an error, not the host's" \
+    "$COIL" check "$T/seven.coil" --target x86_64-unknown-freebsd
 }
 
 # ---------------------------------------------------------------------------

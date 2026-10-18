@@ -130,20 +130,25 @@ using it pays that layout at each level; it is still correct. `code-copy` and
 platform being **compiled for** — read from the resolved `--target` triple, not
 probed from the machine running the compiler. `target-arch` yields
 `aarch64`/`x86_64`/`wasm32`/`wasm64`/`riscv32`; `target-os` yields
-`linux`/`darwin`/`wasm`/`none` (`none` is bare metal, a `*-none` triple). Both
-answer for the host when no `--target` is given.
+`linux`/`darwin`/`wasm`/`none` (`none` is bare metal, a `*-none` triple), or
+the triple's own OS field for an OS Coil does not know. Both answer for the host
+when no `--target` is given.
 
 That distinction is the whole point, and it is easy to get wrong: a platform
 constant folded at compile time from a *runtime* probe silently records the
 build host, so cross-compiling bakes in the wrong answer. `src/stdlib/fs.coil` is the
 worked example — its `open()` flags differ per OS (512 is `O_CREAT` on darwin
-and `O_TRUNC` on Linux), and it selects them with
+and `O_TRUNC` on Linux), and it selects them with `coil.os`'s `os-pick`, which
+takes one form per operating system (Linux, Darwin, wasm) and has no default: a
+target it was not given a form for is a compile error at the choice, instead of
+silently getting another OS's numbers. (`os-pick-with-none` adds a fourth form for
+bare metal, and a top-level `(os/requires-os)` makes a whole module an error to
+load there, as Rust has no `std::fs` on a `*-none` target.)
 
 ```coil
 (import "coil.primitive" :as primitive)
+(import "coil.os" :as os)
 
-(defn os-pick [(linux Code) (darwin Code)] (-> Code)
-  (if (primitive/code-eq (primitive/target-os) `linux) linux darwin))
 ;; A generated const the surrounding PROGRAM refers to is a published name, not a
 ;; template binder. A bare `O_CREAT` in the template would carry this module's
 ;; definition context and the program's own reference could not see it, so the
@@ -151,8 +156,8 @@ and `O_TRUNC` on Linux), and it selects them with
 (defn explicit-public-name [(name Code)] (-> Code)
   (primitive/syntax->datum name))
 (defn gen-open-flags [] (-> Code)
-  `(do (const ~(explicit-public-name `O_CREAT) ~(os-pick `64 `512))
-       (const ~(explicit-public-name `O_TRUNC) ~(os-pick `512 `1024))))
+  `(do (const ~(explicit-public-name `O_CREAT) ~(os/os-pick `64 `512 `512))
+       (const ~(explicit-public-name `O_TRUNC) ~(os/os-pick `512 `1024 `1024))))
 (meta (gen-open-flags))
 ```
 
