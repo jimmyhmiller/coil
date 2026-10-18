@@ -4145,7 +4145,13 @@
    (closure (ptr (ArrayList (slice u8))))
    (checked (ptr Program))
    (semantic_workspace (ptr SemanticWorkspaceSlot))
-   (semantic_audit (ptr SemanticAudit))])
+   (semantic_audit (ptr SemanticAudit))
+   ; The modules the program leaves to the host, and their forms (see
+   ; `host-stage-leave!`). Null until the first generation decides.
+   (host_modules (ptr (ArrayList (slice u8))))
+   (host_forms (ptr (ArrayList TaggedForm)))
+   ; The form ids of the program's declarations of the definitions in host_forms.
+   (host_declarations (ptr (ArrayList i64)))])
 
 ;;; A semantic workspace for compiling S's code for the host: a form parsed for
 ;;; the host (a 64-bit `usize`, say) must never be the cached parse the program's
@@ -4175,13 +4181,30 @@
         (set! (.host_stage s) (primitive/cast (ptr i8) hs))
         hs)))
 
+;;; Is ID one of IDS?
+(defn form-id-in? [(ids (ptr (ArrayList i64))) (id i64)] (-> bool)
+  (block :found
+    (for [i 0 (len (load ids))]
+      (when (= (get (load ids) i) id) (break :found true)))
+    false))
+
 ;;; A host twin of S for one stage-3 run: S's tables, a copy of its forms, and the
 ;;; host stage's workspace. The copies are new forms: an identity shared with the
 ;;; program's would let the two workspaces' cached parses stand in for each other.
 (defn host-twin [(s (mut LS)) (hs (ptr HostStage))] (-> (ptr LS))
   (let [a (.a s)
         h (box! a LS (load s))
-        forms (tower-snapshot a (box-al [TaggedForm] a (.out s)) (len (.out s)))]
+        left? (!= (primitive/cast i64 (.host_forms hs)) 0)
+        (mut all) (ArrayList::new [TaggedForm] a)
+        _program (for [i 0 (len (.out s))]
+                   (let [tf (elem (field s out) i)]
+                     (unless (and left? (form-id-in? (.host_declarations hs) (.form_id tf)))
+                       (push! (mut all) (load tf)))))
+        _left (when left?
+                (for [i 0 (len (load (.host_forms hs)))]
+                  (push! (mut all) (get (load (.host_forms hs)) i)))
+                0)
+        forms (tower-snapshot a (box-al [TaggedForm] a (load all)) (len (load all)))]
     (for [i 0 (len (load forms))]
       (let [tf (elem forms i)]
         (set! (.form_id tf) (next-form-id))
@@ -4258,6 +4281,315 @@
         (push! (mut out) (load tf))))
     (box-al [TaggedForm] a (load out))))
 
+; ── what a cross build's program leaves to the host ──────────────────────────
+; The program holds only what can run on its target, but code running inside the
+; compiler reaches modules the target cannot have: a macro that writes a linker
+; script through `coil.fs` while the program is built for bare metal. Such a module
+; is the twin's alone, as Rust builds a proc macro's dependencies only for the host
+; and Racket instantiates a `for-syntax` import only at phase 1. Coil infers the
+; phase from where an import is used. A name in the body of a compile-time
+; definition refers at compile time, unless it is inside a quasiquote template,
+; where it is part of the code the definition produces; a name anywhere else,
+; including a compile-time definition's signature, refers at run time. The program
+; loads an import some name uses at run time, and one no name uses at all (an
+; import for its registrations or impls). A compile-time definition whose body uses
+; a module left to the host is a `declare` in the program: the twin defines it.
+
+;;; How a module's code uses one of its imports.
+(defstruct ImportUse [(runtime bool) (compile bool)])
+
+(defn import-use-mark! [(uses (mut (HashMap (slice u8) ImportUse)))
+                        (target (slice u8))
+                        (runtime bool)] (-> i64)
+  (match (get uses target)
+    (None [] (do (set! (mut uses) target (ImportUse :runtime runtime :compile (not runtime))) 0))
+    (Some [old]
+          (do (set! (mut uses)
+                    target
+                    (ImportUse :runtime (or (.runtime old) runtime)
+                               :compile (or (.compile old) (not runtime))))
+              0))))
+
+;;; Note in USES each import of IMP that NAME, a symbol in its module's code, can
+;;; refer to: the alias or module before a `/`, or an import that refers the name.
+(defn import-use-note! [(uses (mut (HashMap (slice u8) ImportUse)))
+                        (imp (ptr ModImports))
+                        (name (slice u8))
+                        (runtime bool)] (-> i64)
+  (let [slash (find-slash name)
+        prefix (if (>= slash 0) (subslice name 0 slash) "")]
+    (for [i 0 (len (.aliases imp))]
+      (let [al (elem (field imp aliases) i)]
+        (when (and (>= slash 0) (or (= (.alias al) prefix) (= (.target al) prefix)))
+          (import-use-mark! (mut uses) (.target al) runtime))))
+    (for [i 0 (len (.uses imp))]
+      (let [u (elem (field imp uses) i)]
+        (when (if (>= slash 0)
+                  (= (.target u) prefix)
+                  (match (use-refers u name) (Some [_] true) (None [] false)))
+          (import-use-mark! (mut uses) (.target u) runtime))))
+    0))
+
+;;; Note every name in NODE. DEPTH counts the quasiquote templates around it, and
+;;; COMPILE is true in the body of a compile-time definition.
+(defn import-uses-walk! [(uses (mut (HashMap (slice u8) ImportUse)))
+                         (imp (ptr ModImports))
+                         (node Sexp)
+                         (depth i64)
+                         (compile bool)] (-> i64)
+  (let [tag (sx-tag node)]
+    (cond (= tag 2) (import-use-note! (mut uses) imp (sx-sval node) (or (not compile) (> depth 0)))
+          (or (= tag 6) (= tag 7))
+            (let [items (sx-items node)
+                  head (if (= tag 6) (sx-head-name items) "")
+                  inner (cond (or (= head "quasiquote") (= head "quote")) (+ depth 1)
+                              (and (> depth 0) (or (= head "unquote") (= head "unquote-splicing")))
+                                (- depth 1)
+                              :else depth)]
+              (for [i 0 (sx-len items)]
+                (import-uses-walk! (mut uses) imp (sx-at items i) inner compile))
+              0)
+          :else 0)))
+
+;;; The qualified name of F when it is a compile-time definition the program can
+;;; declare.
+(defn host-declarable-name [(a (dyn Allocator))
+                            (tf (ptr TaggedForm))
+                            (declarable (ptr (HashMap (slice u8) bool)))] (-> (Option (slice u8)))
+  (match (source-defn-name-of (field tf form))
+    (None [] (None [(slice u8)]))
+    (Some [n]
+          (let [q (qualify-name a n (.module tf))]
+            (match (get (load declarable) q)
+              (Some [_] (Some q))
+              (None [] (None [(slice u8)])))))))
+
+;;; Note how form TF uses its module's imports IMP. In a compile-time definition
+;;; DECLARABLE names, what follows the `(-> R)` is the body.
+(defn form-import-uses! [(a (dyn Allocator))
+                         (uses (mut (HashMap (slice u8) ImportUse)))
+                         (imp (ptr ModImports))
+                         (tf (ptr TaggedForm))
+                         (declarable (ptr (HashMap (slice u8) bool)))] (-> i64)
+  (match (host-declarable-name a tf declarable)
+    (None [] (import-uses-walk! (mut uses) imp (load (field tf form)) 0 false))
+    (Some [_]
+          (let [items (sx-items (load (field tf form)))
+                (mut body) false]
+            (for [i 0 (sx-len items)]
+              (let [item (sx-at items i)]
+                (import-uses-walk! (mut uses) imp item 0 (load body))
+                (when (and (> i 0) (is-arrow-form (elem items i)))
+                  (set! body true)
+                  0)))
+            0))))
+
+;;; The compile-time definitions of HS the program can declare: every one but a
+;;; generic, which has no single definition to declare.
+(defn host-declarable [(a (dyn Allocator)) (hs (ptr HostStage))] (-> (ptr (HashMap (slice u8) bool)))
+  (let [p (.checked hs)
+        (mut generic) (HashMap::new [(slice u8) bool] a (keyops))
+        (mut out) (HashMap::new [(slice u8) bool] a (keyops))]
+    (for [i 0 (len (load (load (field p funcs))))]
+      (let [fp (elem (load (field p funcs)) i)]
+        (when (> (len (load (load (field fp type_params)))) 0)
+          (set! (mut generic) (.name fp) true)
+          0)))
+    (for [i 0 (len (load (.compile_time hs)))]
+      (let [q (get (load (.compile_time hs)) i)]
+        (when (match (get (load generic) q) (Some [_] false) (None [] true))
+          (set! (mut out) q true)
+          0)))
+    (box! a (HashMap (slice u8) bool) (load out))))
+
+(defn module-include! [(included (mut (HashMap (slice u8) bool)))
+                       (work (mut (ArrayList (slice u8))))
+                       (m (slice u8))] (-> i64)
+  (match (get included m)
+    (Some [_] 0)
+    (None [] (do (set! (mut included) m true) (push! (mut work) m) 0))))
+
+;;; The modules of S's program that a cross build leaves to the host, by the rule
+;;; above. DECLARABLE names the compile-time definitions the program can declare.
+(defn host-only-modules [(s (mut LS)) (declarable (ptr (HashMap (slice u8) bool)))] (-> (ptr (ArrayList (slice u8))))
+  (let [a (.a s)
+        forms (box-al [TaggedForm] a (.out s))
+        (mut entries) (HashMap::new [(slice u8) i64] a (keyops))
+        (mut imported) (HashMap::new [(slice u8) bool] a (keyops))
+        ; Each module in the order its first form appears, and the indexes of its forms.
+        (mut present) (ArrayList::new [(slice u8)] a)
+        (mut module-forms) (ArrayList::new [(ArrayList i64)] a)
+        (mut present-at) (HashMap::new [(slice u8) i64] a (keyops))
+        (mut compile-time) (HashMap::new [(slice u8) bool] a (keyops))
+        (mut included) (HashMap::new [(slice u8) bool] a (keyops))
+        (mut work) (ArrayList::new [(slice u8)] a)
+        (mut out) (ArrayList::new [(slice u8)] a)]
+    (for [i 0 (len (load forms))]
+      (let [tf (elem forms i)
+            f (field tf form)]
+        (match (.module tf)
+          (None [] 0)
+          (Some [m]
+                (do
+                  (when (match (get (load present-at) m) (Some [_] false) (None [] true))
+                    (set! (mut present-at) m (len (load present)))
+                    (push! (mut present) m)
+                    (push! (mut module-forms) (ArrayList::new [i64] a))
+                    0)
+                  (match (get (load present-at) m)
+                    (Some [j] (do (push! (elem (mut module-forms) j) i) 0))
+                    (None [] 0))
+                  (when (match (host-declarable-name a tf declarable) (Some [_] true) (None [] false))
+                    (set! (mut compile-time) m true)
+                    0)
+                  ; Registrations act on the program whether or not a name uses them.
+                  (when (or (is-register-derive-form f) (or (is-checker-form f) (is-transform-form f)))
+                    (module-include! (mut included) (mut work) m))
+                  0)))))
+    (for [k 0 (len (.imports s))]
+      (let [e (elem (field s imports) k)
+            imp (field e imp)]
+        (set! (mut entries) (.name e) k)
+        (for [i 0 (len (.aliases imp))]
+          (set! (mut imported) (.target (elem (field imp aliases) i)) true))
+        (for [i 0 (len (.uses imp))]
+          (set! (mut imported) (.target (elem (field imp uses) i)) true))
+        (for [i 0 (len (.reexports imp))]
+          (set! (mut imported) (.target (elem (field imp reexports) i)) true))
+        (when (> (len (.target (field imp core))) 0)
+          (module-include! (mut included) (mut work) (.target (field imp core))))))
+    ; Roots: what no module imports (the modules the build was asked for), the
+    ; entry module, and the providers of core.
+    (for [i 0 (len (load present))]
+      (let [m (get (load present) i)]
+        (when (match (get (load imported) m) (Some [_] false) (None [] true))
+          (module-include! (mut included) (mut work) m))))
+    (for [k 0 (len (.imports s))]
+      (let [m (.name (elem (field s imports) k))]
+        (when (match (get (load imported) m) (Some [_] false) (None [] true))
+          (module-include! (mut included) (mut work) m))))
+    (when (> (len (.entry_module s)) 0)
+      (module-include! (mut included) (mut work) (.entry_module s)))
+    (for [i 0 (len (.core_declared_modules s))]
+      (module-include! (mut included) (mut work) (get (.core_declared_modules s) i)))
+    (loop
+      (match (pop! (mut work))
+        (None [] (break))
+        (Some [m]
+        (match (get (load entries) m)
+          (None [] 0)
+          (Some [k]
+                (let [imp (field (elem (field s imports) k) imp)
+                      (mut uses) (HashMap::new [(slice u8) ImportUse] a (keyops))
+                      scan (match (get (load compile-time) m) (Some [_] true) (None [] false))]
+                  (when scan
+                    (match (get (load present-at) m)
+                      (None [] 0)
+                      (Some [j]
+                            (let [own (elem (mut module-forms) j)]
+                              (for [i 0 (len (load own))]
+                                (form-import-uses! a (mut uses) imp (elem forms (get (load own) i)) declarable))
+                              0))))
+                  (for [i 0 (len (.reexports imp))]
+                    (module-include! (mut included) (mut work) (.target (elem (field imp reexports) i))))
+                  (for [i 0 (len (.aliases imp))]
+                    (let [t (.target (elem (field imp aliases) i))]
+                      (when (or (not scan) (match (get (load uses) t) (Some [u] (.runtime u)) (None [] true)))
+                        (module-include! (mut included) (mut work) t))))
+                  (for [i 0 (len (.uses imp))]
+                    (let [t (.target (elem (field imp uses) i))]
+                      (when (or (not scan) (match (get (load uses) t) (Some [u] (.runtime u)) (None [] true)))
+                        (module-include! (mut included) (mut work) t))))
+                  0))))))
+    (for [i 0 (len (load present))]
+      (let [m (get (load present) i)]
+        (when (match (get (load included) m) (Some [_] false) (None [] true))
+          (push! (mut out) m)
+          0)))
+    (box-al [(slice u8)] a (load out))))
+
+;;; The import table of module M in S.
+(defn module-imports-of [(s (mut LS)) (m (slice u8))] (-> (Option (ptr ModImports)))
+  (block :found
+    (for [k 0 (len (.imports s))]
+      (let [e (elem (field s imports) k)]
+        (when (= (.name e) m)
+          (break :found (Some (field e imp))))))
+    (None [(ptr ModImports)])))
+
+;;; Does compile-time definition TF use one of MODULES?
+(defn uses-host-module? [(a (dyn Allocator))
+                         (imp (ptr ModImports))
+                         (tf (ptr TaggedForm))
+                         (declarable (ptr (HashMap (slice u8) bool)))
+                         (modules (ptr (ArrayList (slice u8))))] (-> bool)
+  (let [(mut uses) (HashMap::new [(slice u8) ImportUse] a (keyops))]
+    (form-import-uses! a (mut uses) imp tf declarable)
+    (block :found
+      (for [i 0 (len (load modules))]
+        (when (match (get (load uses) (get (load modules) i)) (Some [_] true) (None [] false))
+          (break :found true)))
+      false)))
+
+;;; The program's `(declare NAME … (-> R))` of compile-time definition F.
+(defn host-declaration [(a (dyn Allocator)) (f (ptr Sexp))] (-> Sexp)
+  (let [items (sx-items (load f))
+        (mut out) (ArrayList::new [Sexp] a)
+        (mut done) false]
+    (push! (mut out) (traversed-sexp (KSym "declare") (elem items 0)))
+    (for [i 1 (sx-len items)]
+      (unless (load done)
+        (push! (mut out) (sx-at items i))
+        (when (is-arrow-form (elem items i))
+          (set! done true)
+          0)
+        0))
+    (traversed-sexp (KList (box-al [Sexp] a (load out))) f)))
+
+;;; In a cross build's first stage-3 generation, leave to the host what the program
+;;; cannot hold: the forms of every module only compile-time code uses move to HS,
+;;; and a compile-time definition that uses one becomes a declaration. The twin of
+;;; every later generation gets the forms back in place of the declarations.
+(defn host-stage-leave! [(s (mut LS)) (hs (ptr HostStage))] (-> i64)
+  (when (= (primitive/cast i64 (.host_modules hs)) 0)
+    (let [a (.a s)
+          declarable (host-declarable a hs)
+          modules (host-only-modules (mut s) declarable)
+          (mut kept) (ArrayList::new [TaggedForm] a)
+          (mut left) (ArrayList::new [TaggedForm] a)
+          (mut declared) (ArrayList::new [i64] a)]
+      (set! (.host_modules hs) modules)
+      (when (> (len (load modules)) 0)
+        (for [i 0 (len (.out s))]
+          (let [tf (elem (field s out) i)]
+            (cond (match (.module tf) (Some [m] (set-contains modules m)) (None [] false))
+                    (push! (mut left) (load tf))
+                  (match (host-declarable-name a tf declarable)
+                    (None [] false)
+                    (Some [_]
+                          (match (.module tf)
+                            (None [] false)
+                            (Some [m]
+                                  (match (module-imports-of (mut s) m)
+                                    (None [] false)
+                                    (Some [imp] (uses-host-module? a imp tf declarable modules)))))))
+                    (let [d (primitive/alloc-stack TaggedForm)]
+                      (push! (mut left) (load tf))
+                      (set! d (load tf))
+                      (set! (.form d) (host-declaration a (field tf form)))
+                      (set! (.form_id d) (next-form-id))
+                      (set! (.revision d) 0)
+                      (set! (.cached_shape d) 0)
+                      (push! (mut declared) (.form_id d))
+                      (push! (mut kept) (load d)))
+                  :else (push! (mut kept) (load tf)))))
+        (set! (.out s) (load kept))
+        0)
+      (set! (.host_forms hs) (box-al [TaggedForm] a (load left)))
+      (set! (.host_declarations hs) (box-al [i64] a (load declared)))
+      0))
+  0)
+
 ;;; Stage 3 of a cross build: the host twin's stage 3, with every target question
 ;;; answering for the host, then the program's expansion against the twin's
 ;;; engine, answering for the target.
@@ -4284,7 +4616,9 @@
             (set-cli-sources (field s sources))
             (match host-result
               (Err [d] (Err [i64 Diag] d))
-              (Ok [_] (expand-program-against-host! (mut s) hs excluded exclude-closure)))))))
+              (Ok [_]
+                  (do (host-stage-leave! (mut s) hs)
+                      (expand-program-against-host! (mut s) hs excluded exclude-closure))))))))
 
 ;;; The program's half of a cross build's stage 3: expand it for the target,
 ;;; invoking the host twin's engine for every macro.

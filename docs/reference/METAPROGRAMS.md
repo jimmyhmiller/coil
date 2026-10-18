@@ -190,6 +190,28 @@ host's own platform, all of this is one expansion and nothing changes. FAST's
 `cli/cross` step checks each case with a target whose OS differs from the
 builder's.
 
+A cross build's program also leaves out what only the compiler's code uses, so a
+macro can write a linker script through `coil.fs` while the program is built for
+bare metal, where `coil.fs` cannot load. Coil infers the phase of each import
+from where its names appear:
+
+- in the **body of a compile-time definition** (one whose signature takes or
+  returns `Code`), outside any quasiquote template, a name is used **at compile
+  time**;
+- **everywhere else** a name is used **at run time**: ordinary definitions,
+  top-level forms, a compile-time definition's signature, and every template,
+  since a template is code the macro puts in the program.
+
+The program loads an import that some name uses at run time, and one that no
+name uses at all (an import for its registrations or impls). An import used only
+at compile time is loaded by the host stage alone, and a compile-time definition
+that uses one becomes a `declare` in the program. The phase belongs to the
+module, so a macro module whose template names `fs/…` keeps `coil.fs` in the
+program, and a bare-metal build of it is refused. Two shapes stay in the program
+because they cannot be declared or seen: a generic compile-time definition, and
+an ordinary helper (no `Code` in its signature) that a macro calls. Keep such
+code's OS calls in the macro's own body.
+
 New API this project added (all shipped):
 
 - **`(primitive/report NODE MSG)`** — a located compile-time **error** at `NODE`. It **collects**:

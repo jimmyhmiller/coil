@@ -838,6 +838,36 @@ EOF
   printf '(module uses-fs)\n(import "coil.fs" :as fs)\n(defn main [] (-> i64) 0)\n' > "$T/uses-fs.coil"
   expect_rc_out 1 'fs.coil> needs an operating system, and a bare-metal' "a bare-metal program cannot load coil.fs" \
     "$COIL" check "$T/uses-fs.coil" --target aarch64-unknown-none
+  # A module only macro bodies use is the host's: a bare-metal program can use a
+  # macro that writes a file through coil.fs. A macro whose template calls coil.fs
+  # puts the call in the program, so that program is refused.
+  mkdir -p "$T/phase"
+  cat > "$T/phase/write_note.coil" <<'EOF'
+(module write_note)
+(import "coil.primitive" :as primitive)
+(import "coil.fs" :as fs)
+(import "coil.meta" :use [expansion-allocator])
+(defn write-note [(path Code)] (-> Code)
+  (match (fs/write-file (expansion-allocator) (primitive/code-str path) "hello\n")
+    (Ok [_] `(do))
+    (Err [_] (primitive/error "write-note: could not write the file"))))
+EOF
+  cat > "$T/phase/exists_call.coil" <<'EOF'
+(module exists_call)
+(import "coil.fs" :as fs)
+(defn exists-call [(path Code)] (-> Code)
+  `(fs/exists? (expansion-allocator) ~path))
+EOF
+  printf '(module firmware)\n(import "write_note" :use [write-note])\n(write-note "%s")\n(defn answer [] (-> i64) 42)\n' \
+    "$T/phase/note.txt" > "$T/phase/firmware.coil"
+  rm -f "$T/phase/note.txt"
+  expect_rc 0 "a bare-metal program uses a macro that writes a file through coil.fs" \
+    "$COIL" check "$T/phase/firmware.coil" --target riscv32-unknown-none-elf
+  [ -f "$T/phase/note.txt" ] && ok "the bare-metal build's macro wrote its file" \
+                              || bad "the bare-metal build's macro wrote its file" "no $T/phase/note.txt"
+  printf '(module probe)\n(import "exists_call" :use [exists-call])\n(defn f [] (-> bool) (exists-call "x"))\n' > "$T/phase/probe.coil"
+  expect_rc_out 1 'fs.coil> needs an operating system' "a macro template calling coil.fs keeps it in a bare-metal program" \
+    "$COIL" check "$T/phase/probe.coil" --target riscv32-unknown-none-elf
   expect_rc_out 1 "none for the target's operating system, .freebsd." "an OS no choice names is an error, not the host's" \
     "$COIL" check "$T/seven.coil" --target x86_64-unknown-freebsd
 }
