@@ -1153,8 +1153,11 @@ with `set`.
 A `def`'s initializer is also computed at compile time, so a table can be built
 with calls, and a struct or array `def` is read in place: indexing it, reading a
 field or borrowing it as a slice addresses the static itself, never a copy.
-Function pointers and C strings in a `def` are filled in by the linker. A `def`
-can't read another `def`; make the value it needs a `const`.
+That static is read-only, so the optimizer folds loads from it (an MMIO
+descriptor's address becomes an immediate), and writing it through a slice or
+pointer is undefined behavior. Function pointers and C strings in a `def` are
+filled in by the linker. A `def` can't read another `def`; make the value it
+needs a `const`.
 
 ```coil
 (module example.tables)
