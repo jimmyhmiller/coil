@@ -167,6 +167,38 @@ printf '(module pfpath-import)\n\n(import "app/src/main.coil" :use *)\n\n(defn m
 run "$W" "$COIL" check path-import.coil
 expect 1 "import paths are not supported" "an import naming a file path is rejected"
 
+echo "== run passes program arguments through"
+# A project `run` hands the program exactly the argv after `--`: no second shell
+# to split `two words` or run what `;` and `$(…)` name. The plain package runs in
+# this process; the one with C sources still builds through a child command.
+for variant in plain cc; do
+  ARGV="$W/argv-$variant"
+  mkdir -p "$ARGV/src" "$ARGV/native"
+  printf '[package]\nname = "pfargv"\n' > "$ARGV/Coil.toml"
+  if [ "$variant" = cc ]; then
+    printf 'long pfargv_one(void) { return 1; }\n' > "$ARGV/native/one.c"
+    printf '\n[cc]\nsources = ["native/one.c"]\n' >> "$ARGV/Coil.toml"
+  fi
+  printf '\n[run]\nargs = ["from manifest", "x;y"]\n' >> "$ARGV/Coil.toml"
+  cat > "$ARGV/src/main.coil" <<'EOF'
+(module pfargv.main)
+(import "coil.str" :use [from-cstr])
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (for [i 1 (cast i64 argc)] (println "[{}]" (from-cstr (load (index argv i)))))
+  0)
+EOF
+  run "$ARGV" "$COIL" run -- "a(b)" "two words" '$(echo injected)' ""
+  want=$(printf '[a(b)]\n[two words]\n[$(echo injected)]\n[]')
+  [ "$RC" = 0 ] && [ "$OUT" = "$want" ] \
+    && ok "run ($variant) passes each program argument through unchanged" \
+    || bad "run ($variant) passes each program argument through unchanged" "exit $RC: $OUT"
+  run "$ARGV" "$COIL" run
+  want=$(printf '[from manifest]\n[x;y]')
+  [ "$RC" = 0 ] && [ "$OUT" = "$want" ] \
+    && ok "run ($variant) passes the manifest's [run] args through unchanged" \
+    || bad "run ($variant) passes the manifest's [run] args through unchanged" "exit $RC: $OUT"
+done
+
 echo "== units: build-unit and a consumer"
 run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" build-unit mathlib.coil -o "$W/mathlib-unit"
 expect 0 "unit.o" "build-unit writes an interface and an object"
