@@ -292,6 +292,7 @@ begin/end event stream.
 | `COIL_CC=PATH` | C driver used to link (and to link sanitized builds) |
 | `LLVM_CONFIG=PATH` | Which `llvm-config` names the clang used for sanitizer builds |
 | `COIL_TRACE=1` | Compiler phase timings and memory events |
+| `COIL_TRACE_PHASES=1` | In a cross build, list each module and function left to the build machine and why every other module is in the program |
 | `COIL_MTRACE=rounds\|forms\|diff\|mem` | Trace metaprogram transform rounds; `mem` prints per-metaprogram allocation |
 | `COIL_META_ARENA=0\|poison` | Disable per-expansion metaprogram arenas, or fill released arena memory with `0xDD` |
 | `COIL_WORKER_STACK_SIZE`, `COIL_WORKER_GUARD_SIZE` | Compiler worker-thread stack and guard size, in bytes |

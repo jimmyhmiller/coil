@@ -191,26 +191,40 @@ host's own platform, all of this is one expansion and nothing changes. FAST's
 builder's.
 
 A cross build's program also leaves out what only the compiler's code uses, so a
-macro can write a linker script through `coil.fs` while the program is built for
-bare metal, where `coil.fs` cannot load. Coil infers the phase of each import
-from where its names appear:
+macro or generator can read and write files through `coil.fs` while the program is
+built for bare metal, where `coil.fs` cannot load. Coil works out the phase of
+every use from the source:
 
-- in the **body of a compile-time definition** (one whose signature takes or
-  returns `Code`), outside any quasiquote template, a name is used **at compile
-  time**;
-- **everywhere else** a name is used **at run time**: ordinary definitions,
-  top-level forms, a compile-time definition's signature, and every template,
-  since a template is code the macro puts in the program.
+- the program's own code, ordinary definitions and top-level forms, is **phase 0**;
+- the **body of a compile-time definition** (one whose signature takes or returns
+  `Code`) runs in the compiler, **phase 1**, and so does every function it calls;
+- a **quasiquote template** holds code being produced, one phase earlier: a
+  template in a macro is phase 0, code for the program.
 
-The program loads an import that some name uses at run time, and one that no
-name uses at all (an import for its registrations or impls). An import used only
-at compile time is loaded by the host stage alone, and a compile-time definition
-that uses one becomes a `declare` in the program. The phase belongs to the
-module, so a macro module whose template names `fs/…` keeps `coil.fs` in the
-program, and a bare-metal build of it is refused. Two shapes stay in the program
-because they cannot be declared or seen: a generic compile-time definition, and
-an ordinary helper (no `Code` in its signature) that a macro calls. Keep such
-code's OS calls in the macro's own body.
+The program loads the modules phase-0 code names, every module the build was
+asked for, and an import nothing names (one kept for its registrations or impls).
+A function only compile-time code calls stays out of the program when it names
+something the program does not have, so a macro's helpers may call `coil.fs` too,
+and a macro whose template names `fs/…` keeps `coil.fs` out until a program uses
+that macro. A bare-metal build that does need an OS module says which use brought
+it in:
+
+```
+error: <bundled fs.coil> needs an operating system, …; `coil.fs` is in the
+program because a template in `probe.exists-call` uses `fs/exists?` at run time
+```
+
+`COIL_TRACE_PHASES=1` prints, for a cross build, each module and function left to
+the host and why every other module is in the program. The phases are inferred,
+so a macro that builds a name from a string (`code-symbol`) instead of writing it
+gets a resolve error in a cross build rather than the module it meant.
+
+A generator can use what another generates: one that calls `fs/write-file` needs
+the `O_CREAT` `coil.fs`'s own generator produces. The generators run as one
+program when they check as one; otherwise each that checks on its own runs first,
+the program is expanded with its output, and the rest run after. FAST's
+`cli/cross` step and COMPREHENSIVE's `freestanding` step (`build_time.coil`, run
+under QEMU) check these cases.
 
 New API this project added (all shipped):
 

@@ -88,6 +88,7 @@ def aarch64(coil: str, tools: dict[str, str], work: Path) -> int:
         "uart": "PL011 via typed registers",
         "arena": "stdlib arena on bare metal: 42",
         "fail": "fatal: out of memory at box!",
+        "build_time": "baked at build time",
     }
     failures = 0
     for name, want in programs.items():

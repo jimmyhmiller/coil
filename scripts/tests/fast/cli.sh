@@ -838,23 +838,23 @@ EOF
   printf '(module uses-fs)\n(import "coil.fs" :as fs)\n(defn main [] (-> i64) 0)\n' > "$T/uses-fs.coil"
   expect_rc_out 1 'fs.coil> needs an operating system, and a bare-metal' "a bare-metal program cannot load coil.fs" \
     "$COIL" check "$T/uses-fs.coil" --target aarch64-unknown-none
-  # A module only macro bodies use is the host's: a bare-metal program can use a
-  # macro that writes a file through coil.fs. A macro whose template calls coil.fs
-  # puts the call in the program, so that program is refused.
+  # What only compile-time code uses is the host's: a bare-metal program can use a
+  # macro that writes a file through coil.fs, by way of a helper, beside a macro
+  # whose template calls coil.fs that the program does not use. A program that
+  # uses that template is refused, told which use brought coil.fs in.
   mkdir -p "$T/phase"
   cat > "$T/phase/write_note.coil" <<'EOF'
 (module write_note)
 (import "coil.primitive" :as primitive)
 (import "coil.fs" :as fs)
 (import "coil.meta" :use [expansion-allocator])
+(import "coil.alloc" :use [Allocator Allocator-dyn])
+(defn write-text [(a (dyn Allocator)) (path (slice u8)) (text (slice u8))] (-> bool)
+  (match (fs/write-file a path text) (Ok [_] true) (Err [_] false)))
 (defn write-note [(path Code)] (-> Code)
-  (match (fs/write-file (expansion-allocator) (primitive/code-str path) "hello\n")
-    (Ok [_] `(do))
-    (Err [_] (primitive/error "write-note: could not write the file"))))
-EOF
-  cat > "$T/phase/exists_call.coil" <<'EOF'
-(module exists_call)
-(import "coil.fs" :as fs)
+  (if (write-text (expansion-allocator) (primitive/code-str path) "hello\n")
+      `(do)
+      (primitive/error "write-note: could not write the file")))
 (defn exists-call [(path Code)] (-> Code)
   `(fs/exists? (expansion-allocator) ~path))
 EOF
@@ -865,9 +865,28 @@ EOF
     "$COIL" check "$T/phase/firmware.coil" --target riscv32-unknown-none-elf
   [ -f "$T/phase/note.txt" ] && ok "the bare-metal build's macro wrote its file" \
                               || bad "the bare-metal build's macro wrote its file" "no $T/phase/note.txt"
-  printf '(module probe)\n(import "exists_call" :use [exists-call])\n(defn f [] (-> bool) (exists-call "x"))\n' > "$T/phase/probe.coil"
-  expect_rc_out 1 'fs.coil> needs an operating system' "a macro template calling coil.fs keeps it in a bare-metal program" \
+  printf '(module probe)\n(import "write_note" :use [exists-call])\n(defn f [] (-> bool) (exists-call "x"))\n' > "$T/phase/probe.coil"
+  expect_rc_out 1 'is in the program because a template in .write_note.exists-call. uses .fs/exists\?. at run time' \
+    "a macro template calling coil.fs keeps it in a bare-metal program, and says so" \
     "$COIL" check "$T/phase/probe.coil" --target riscv32-unknown-none-elf
+  # A (meta …) generator reads a file on the build machine; it needs the O_CREAT
+  # and directory constants coil.fs's own generators produce, so they run first.
+  printf 'abc' > "$T/phase/data.txt"
+  cat > "$T/phase/sized.coil" <<'EOF'
+(module sized)
+(import "coil.primitive" :as primitive)
+(import "coil.fs" :as fs)
+(import "coil.meta" :use [expansion-allocator])
+(defn gen-size [(path (slice u8))] (-> Code)
+  (match (fs/read-file (expansion-allocator) path)
+    (Ok [text] `(defn ~(primitive/syntax->datum `data-size) [] (-> i64) ~(primitive/cast i64 (len text))))
+    (Err [_] (primitive/error "gen-size: could not read the file"))))
+EOF
+  printf '(module sized_main)\n(import "sized" :use [gen-size])\n(meta (gen-size "%s"))\n(defn main [] (-> i64) (data-size))\n' \
+    "$T/phase/data.txt" > "$T/phase/sized_main.coil"
+  expect_rc 3 "a generator reads a file with coil.fs" "$COIL" run "$T/phase/sized_main.coil"
+  expect_out '\(defn\* data-size \[\] \(-> i64\) 3\)' "a bare-metal program's generator reads a file with coil.fs" \
+    "$COIL" expand "$T/phase/sized_main.coil" --target riscv32-unknown-none-elf
   expect_rc_out 1 "none for the target's operating system, .freebsd." "an OS no choice names is an error, not the host's" \
     "$COIL" check "$T/seven.coil" --target x86_64-unknown-freebsd
 }

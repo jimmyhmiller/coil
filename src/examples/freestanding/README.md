@@ -10,6 +10,7 @@ python3 scripts/dev.py example freestanding              # hello.coil
 python3 scripts/dev.py example freestanding uart         # typed-register PL011 driver
 python3 scripts/dev.py example freestanding arena        # the stdlib arena, bare metal
 python3 scripts/dev.py example freestanding fail         # a failure reported over the UART
+python3 scripts/dev.py example freestanding build_time   # text a macro read from a file while building
 python3 scripts/dev.py example freestanding-riscv32
 python3 scripts/dev.py example esp32c3 --build-only
 ```
@@ -39,6 +40,12 @@ itself. What the toolchain guarantees:
   one that prints `fatal: out of memory at box!`; without a handler the program
   stops at the trap instruction. `--debug-runtime` and `--sanitize=undefined`
   checks trap the same way.
+- **Compile-time code runs on the build machine.** Macros, `(meta …)` generators
+  and transforms run while the image is built, with the build machine's OS, so
+  they can use `coil.fs` and friends; what only they use is never compiled for
+  the target (see "Code that runs inside the compiler" in
+  `docs/reference/METAPROGRAMS.md`). A module the image itself uses at run time
+  that needs an OS is refused, with the use that brought it in.
 - **No unaligned accesses on aarch64.** A `*-none` aarch64 object is built with
   `+strict-align`: the programs run with the MMU off, where all memory is Device
   memory and any unaligned access faults.
@@ -74,3 +81,5 @@ the program reaches.
 - `arena.coil` imports `coil.alloc` and allocates with `box!` from
   `arena-over-buffer`, the stdlib arena over a caller-provided static buffer.
 - `fail.coil` installs a `coil.fail` handler and exhausts a 64-byte arena.
+- `build_time.coil` prints `build_time.txt`, which its `baked-text` macro read
+  with `coil.fs` while the image was compiled.
