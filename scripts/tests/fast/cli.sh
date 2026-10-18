@@ -177,6 +177,9 @@ section_usage() {
     expect_rc_out 2 "option '$cmd' requires a value" "a trailing $cmd without its value is a usage error" \
       "$COIL" build "$T/seven.coil" "$cmd"
   done
+  expect_rc_out 1 "cannot write .*/no-such-dir/seven.: the directory .*/no-such-dir. does not exist" \
+    "build -o into a missing directory says so before compiling" \
+    "$COIL" build "$T/seven.coil" -o "$T/no-such-dir/seven"
   expect_rc_out 1 "unsupported --target 'bogus-triple'" "an unknown --target is rejected and named" \
     "$COIL" build "$T/seven.coil" --target bogus-triple -o "$T/bogus"
 
@@ -281,6 +284,10 @@ section_new_project() {
   expect_rc 0 "the scaffold checks" bash -c 'cd "$1/proj" && "$2" check' _ "$T" "$COIL"
   expect_rc 0 "the scaffold lints clean" bash -c 'cd "$1/proj" && "$2" lint' _ "$T" "$COIL"
   expect_rc 0 "the scaffold passes its own coil verify" bash -c 'cd "$1/proj" && "$2" verify' _ "$T" "$COIL"
+  # `[build] out` is the executable's path from Coil.toml; its directory is made.
+  printf '\n[build]\nout = "dist/bin/app"\n' >> "$T/proj/Coil.toml"
+  expect_rc_out 0 '^doubled total: 42$' "[build] out puts the executable at its path" \
+    bash -c 'cd "$1/proj" && "$2" build --quiet && ./dist/bin/app' _ "$T" "$COIL"
 }
 
 # ---------------------------------------------------------------------------
@@ -431,6 +438,21 @@ open(sys.argv[1], "w").write(
     *) bad "lint --fix rewrites to the modern spellings" "exit $rc: $(head -c 600 <<<"$fixed")" ;;
   esac
   expect_rc 0 "the fixed file checks" "$COIL" check "$T/probe.coil"
+  # A stack cell's initializer took its type from the cell; the local it becomes
+  # keeps that type, or `[…]` would be an i64 array read through a u32 pointer.
+  printf '%s' '(module lint-cell-probe)
+(import "coil.primitive" :as primitive)
+(defn main [] (-> i64)
+  (let [h (primitive/alloc-stack (array u32 2))
+        hp (primitive/cast (ptr u32) h)]
+    (store! h [0x11111111 0x22222222])
+    (if (= (load (primitive/index hp 1)) 0x22222222) 0 1)))
+' > "$T/cell.coil"
+  "$COIL" lint "$T/cell.coil" --fix >/dev/null 2>&1
+  case "$(cat "$T/cell.coil")" in
+    *"(mut h)"*) expect_rc 0 "lint --fix keeps a stack cell's element type in the local" "$COIL" run "$T/cell.coil" ;;
+    *) bad "lint --fix keeps a stack cell's element type in the local" "not rewritten: $(cat "$T/cell.coil")" ;;
+  esac
 
   # A fix that does not compile is rolled back byte for byte, across the project.
   mkdir -p "$T/broken-project/src"

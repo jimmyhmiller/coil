@@ -42,6 +42,12 @@ submitted again. `coil repl` uses it.
 
 Record every bug discovered while working in this repository in the `coil-bugs`
 pad. This section defines the required report format.
+
+**The pad holds open bugs only.** When you fix a bug, delete its cell
+(`pad rm -n coil-bugs <id>`) as part of delivering the fix. Do not retitle it
+FIXED or RESOLVED, or append an "update", and leave it there; the commit message
+is the record. A cell that turns out not to be a bug is deleted too.
+
 Give each report its own descriptive Markdown title and put the report's supporting
 information inside an HTML `<details>` block. Include enough information to
 reproduce and investigate the problem: observed behavior, expected behavior,

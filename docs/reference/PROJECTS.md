@@ -96,7 +96,7 @@ programs under `exclude` so they are neither indexed nor linted.
 
 ```toml
 [build]
-out = "build/app"          # override the executable path
+out = "build/app"          # the executable's path from Coil.toml, in every profile
 optimization = 2           # default -O level; an explicit -O flag wins
 target = "wasm32-unknown-unknown"
 debug = true               # same as passing --debug
