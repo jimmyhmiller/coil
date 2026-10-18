@@ -610,8 +610,9 @@ process checks the implicit prelude once, the first time a session of a given
 configuration compiles (about 350 ms), and every later session and every reset
 session builds on that shared, read-only state: its first compile takes about
 30 ms, a later one a few milliseconds. Sessions still get their own native code
-and their own prelude statics. A session that loaded a project, uses a source
-provider, or is checked-only checks the prelude itself. Native code is owned separately: retiring metadata does not unmap
+and their own prelude statics. A session that loaded a project or is
+checked-only checks the prelude itself. A source provider's session shares the
+prelude too; the provider is compiled once, beside it, when it is set. Native code is owned separately: retiring metadata does not unmap
 code that a published pointer may still call, and `jit-reset!` releases both.
 Source text is kept only while live metadata refers to it.
 
