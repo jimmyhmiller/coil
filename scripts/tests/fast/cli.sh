@@ -453,6 +453,37 @@ open(sys.argv[1], "w").write(
     *"(mut h)"*) expect_rc 0 "lint --fix keeps a stack cell's element type in the local" "$COIL" run "$T/cell.coil" ;;
     *) bad "lint --fix keeps a stack cell's element type in the local" "not rewritten: $(cat "$T/cell.coil")" ;;
   esac
+  # A cast of a literal its type holds is an ascription, or the literal itself (in
+  # the author's spelling) for the literal's own type; a cast that truncates stays.
+  printf '%s' '(module lint-literal-cast-probe)
+(import "coil.primitive" :as primitive)
+(defn main [] (-> i64)
+  (let [a (primitive/cast u32 126)
+        b (cast i64 0x7f)
+        c (cast f64 1.5)
+        d (primitive/cast u8 -1)]
+    (println "{} {} {} {}" a b c d)
+    0))
+' > "$T/literal-cast.coil"
+  "$COIL" lint "$T/literal-cast.coil" --fix >/dev/null 2>&1
+  case "$(cat "$T/literal-cast.coil")" in
+    *"a (: 126 u32)"*"b 0x7f"*"c 1.5"*"d (primitive/cast u8 -1)"*)
+      expect_rc_out 0 "^126 127 1.5 255$" "lint --fix drops the cast of a literal its type holds" \
+        "$COIL" run "$T/literal-cast.coil" ;;
+    *) bad "lint --fix drops the cast of a literal its type holds" "$(cat "$T/literal-cast.coil")" ;;
+  esac
+  # The void-`free` preflight is for C's one-argument `free`. coil.alloc's
+  # `(free [T] a memory)` returns an i64, and a branch ending in it needs nothing.
+  printf '%s' '(module lint-alloc-free-probe)
+(import "coil.alloc" :use [free Allocator])
+(defn release [(a (dyn Allocator)) (s (slice u8)) (keep bool)] (-> i64)
+  (if keep
+      0
+      (do
+        (free [u8] a s))))
+(defn main [] (-> i64) 0)
+' > "$T/alloc-free.coil"
+  expect_rc 0 "lint analyses a branch that ends in coil.alloc's free" "$COIL" lint "$T/alloc-free.coil"
 
   # A fix that does not compile is rolled back byte for byte, across the project.
   mkdir -p "$T/broken-project/src"

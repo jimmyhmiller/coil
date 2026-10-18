@@ -111,6 +111,10 @@ at the first place it does, and so does the interpreted metaprogram engine
 `(cast T x)` converts between integers, floats and pointers. Between `f64` and an
 integer it converts the *number* (truncating); it never reinterprets bits.
 
+A literal needs no cast: write `(: 126 u32)`, not `(cast u32 126)`. The ascription
+refuses a literal its type cannot hold, where a cast would keep its low bits, and
+`coil lint --fix` rewrites the one to the other.
+
 Floats compare with IEEE `=`: NaN equals nothing, not even itself, and `-0.0`
 equals `0.0`. So `(= x x)` is false for a NaN `x`, and `!=` is true whenever either
 side is NaN.

@@ -49,13 +49,13 @@ def decision_tree(items: list[tuple[int, int, int]], default: int, indent: int =
     if len(items) == 1:
         lo, hi, value = items[0]
         if lo == hi:
-            return f"{pad}(if (= cp (cast i64 {lo})) {value} {default})"
-        return f"{pad}(if (and (>= cp (cast i64 {lo})) (<= cp (cast i64 {hi}))) {value} {default})"
+            return f"{pad}(if (= cp {lo}) {value} {default})"
+        return f"{pad}(if (and (>= cp {lo}) (<= cp {hi})) {value} {default})"
     middle = len(items) // 2
     pivot = items[middle][0]
     left = decision_tree(items[:middle], default, indent + 2)
     right = decision_tree(items[middle:], default, indent + 2)
-    return f"{pad}(if (< cp (cast i64 {pivot}))\n{left}\n{right})"
+    return f"{pad}(if (< cp {pivot})\n{left}\n{right})"
 
 
 def emit_function(name: str, items: list[tuple[int, int, int]], default: int) -> str:
