@@ -583,7 +583,7 @@ def parser() -> argparse.ArgumentParser:
     command = commands.add_parser(
         "test", help="run a test tier: fast (pre-push) or comprehensive (release)",
         description="Run a test tier. Options after the tier go to its harness: "
-                    "--quick, --only NAME, --list, --verbose, --rebaseline N, --no-x64.")
+                    "--quick, --only NAME, --list, --verbose, --no-x64.")
     command.add_argument("suite", choices=("fast", "comprehensive"))
     command.add_argument("--compiler", default=None,
                          help="the compiler to test (fast: default build/bin/coil; "

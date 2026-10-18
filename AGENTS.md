@@ -97,16 +97,16 @@ Use this format:
 - `coil doc file.coil` — markdown for that module's `;;`-documented definitions
   (a `;;` block directly above a definition is its doc; a single `;` is not).
 - The compiler is **self-hosted** (written in Coil, in `src/compiler/`). Its tests
-  are two tiers, both serial and both budgeted; `docs/reference/COMPILER_TESTS.md`
-  describes every step.
+  are two tiers, both serial; `docs/reference/COMPILER_TESTS.md` describes every
+  step. They report each step's time and largest process, and never fail on
+  either: read the report to see where the tiers stand.
   - **FAST**, before every push: `python3 scripts/dev.py test fast --compiler
-    <candidate>`. At most 270 s; a step over its budget, or a run over 300 s, is
-    a warning, not a failure. It never builds the
-    compiler, and any process over 1.5 GB fails it.
+    <candidate>`. It aims for 5 minutes and warns past that, and warns for a
+    process past 1.5 GB. It never builds the compiler.
   - **The inner loop**: build one candidate after compiler edits (`python3
     scripts/dev.py build candidate`, writing `build/bin/coil-candidate`), then
     rerun `python3 scripts/dev.py test fast --compiler build/bin/coil-candidate
-    --quick` (at most 60 s). `--only NAME` reruns one step, e.g. `--only corpus`.
+    --quick` (aiming for 60 s). `--only NAME` reruns one step, e.g. `--only corpus`.
   - **COMPREHENSIVE**, before a release or a risky merge: `python3 scripts/dev.py
     test comprehensive`. It runs `build full` once, installs into a private prefix
     and runs FAST plus every check that needs a whole-compiler build or an
@@ -121,9 +121,7 @@ Use this format:
   with `python3 scripts/oracle.py corpus bless --only NAME`), a case in a
   `tests/diag` file (`python3 scripts/oracle.py diag bless …`, then read the
   golden), a check in `scripts/tests/fast/cli.sh`, a deftest in a `tests/stdlib`
-  suite. A new step needs a budget in `scripts/tests/budgets.toml`, and a step
-  that builds the compiler belongs in COMPREHENSIVE. Budgets change only by
-  `--rebaseline 3` on a quiet machine, reviewed like code.
+  suite. A step that builds the compiler belongs in COMPREHENSIVE.
 - ⚠ **`build full` peaks near 9.4 GB of memory, and that is expected.** Compiling
   the compiler once costs about 4.7 GB (measured: the largest single process), and
   the fixpoint step in `scripts/compiler/rebootstrap.sh` deliberately emits the

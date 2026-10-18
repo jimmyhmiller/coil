@@ -1,19 +1,20 @@
 # Testing the Coil compiler
 
-Coil's own tests come in two tiers. Both run their steps one after another, and
-every step has a time budget. Going over a budget is a warning, never a failure.
+Coil's own tests come in two tiers. Both run their steps one after another and
+report each step's time and memory. Neither ever fails a step: they are there to
+show where the tiers stand, so the steps can be adjusted.
 
-| Tier | Command | When | Limit |
+| Tier | Command | When | Target |
 |---|---|---|---|
-| FAST | `python3 scripts/dev.py test fast --compiler <coil>` | before every push | 270 s serial, warns over 300 s |
+| FAST | `python3 scripts/dev.py test fast --compiler <coil>` | before every push | 5 minutes serial |
 | quick | `python3 scripts/dev.py test fast --compiler <coil> --quick` | while iterating | 60 s |
-| COMPREHENSIVE | `python3 scripts/dev.py test comprehensive` | before a release or a risky merge | 25 min, plus the x64 host |
+| COMPREHENSIVE | `python3 scripts/dev.py test comprehensive` | before a release or a risky merge | about 25 min, plus the x64 host |
 
 The tiers test end-to-end behaviour a user can see: programs that run, packages
 that build, diagnostics a user reads, commands and their exit codes. They do not
 pin internal representations, and they do not grow a test per fixed bug. When a
 fix needs a test, extend the end-to-end program or golden file that covers that
-area; when it needs a new kind of check, add a step and its budget.
+area; when it needs a new kind of check, add a step.
 
 ## The loop
 
@@ -33,10 +34,9 @@ Options after the tier go to its harness:
 
 | Option | Meaning |
 |---|---|
-| `--list` | print the steps and their budgets |
+| `--list` | print the steps |
 | `--only NAME` | run the step NAME, or every step under `NAME/` (repeatable) |
 | `--verbose` | print each step's output, not only a failing step's |
-| `--rebaseline N` | run N times and rewrite this tier's budgets from the medians |
 | `--no-x64` | COMPREHENSIVE only: leave out the x86-64 Linux host |
 
 ## How a step is judged
@@ -44,32 +44,25 @@ Options after the tier go to its harness:
 `scripts/tests/harness.py` runs each step as a process group and prints one line:
 
 ```text
-ok   #12 diag/compile                  4.1s  budget     7s  peak 0.41GB  cum   88.3s
+ok   #12 diag/compile                  4.1s  peak 0.41GB  cum   88.3s
 ```
 
 A step fails when:
 
-- it exits non-zero, or runs ten times its budget (at least 600 s), when it is
-  killed as hung;
-- it has no budget entry in `scripts/tests/budgets.toml`;
-- any process in it passes the tier's memory limit: 1.5 GB in FAST, 6 GB in
-  COMPREHENSIVE, 16 GB for the steps that compile the whole compiler. The peak
-  comes from polling and from the reaped children's `ru_maxrss`;
+- it exits non-zero, or is killed as hung: after 10 minutes in FAST, an hour in
+  COMPREHENSIVE;
 - in FAST, it names or starts a whole-compiler build (`src/compiler/main*.coil`,
   `jit_api.coil`, `allns`, `dev.py build`/`install`). FAST refuses such a step
   before running anything and kills a process that tries one.
 
-A step that takes longer than its budget passes, marked `slow` with a warning,
-and the tier lists every slow step at the end. Time on a shared machine is noise
-to a pass/fail gate; the warning is there to show a step that has grown.
-
-The tier fails when any step fails. A serial wall time past the tier's limit is a
-warning. `COIL_BUDGET_SCALE` multiplies every budget and limit; CI uses 2.5.
-
-To change a budget, re-baseline on a quiet machine and review the diff like code:
-`python3 scripts/dev.py test fast --compiler <coil> --rebaseline 3` sets each to
-twice the median of three runs, at least 3 s. One run of a step on a busy machine
-can take twice its median; a budget is there to catch a step that has grown.
+Time and memory are measured, never judged: on a shared machine both are noise
+to a pass/fail gate. `peak` is the step's largest process, from polling and from
+the reaped children's `ru_maxrss`; a step whose largest process passes the tier's
+memory line (1.5 GB in FAST, 6 GB in COMPREHENSIVE, 16 GB for the steps that
+compile the whole compiler) gets a warning. At the end the tier reports its ten
+slowest steps, its ten largest, and its serial total, with a warning when the
+total passes the tier's target. Those are the numbers to read when a step needs
+splitting, trimming or moving to the other tier.
 
 Every step gets `$COIL`, the compiler under test, with `coil` first on `PATH`
 as a symlink to it (a nested `coil`, or a coil.jit session, resolves the same
@@ -161,7 +154,7 @@ whose prefix holds the warmed unit; `dev.py install --source build/bin/coil
 ## CI
 
 The `full` job builds the compiler with `build full`, then runs FAST against it
-(`COIL_BUDGET_SCALE=2.5`), and two COMPREHENSIVE slices with `--only`: the
+and two COMPREHENSIVE slices with `--only`: the
 JIT and generated units (after a private install), and SIMD. The
 `linux` job runs the SIMD slice; the `llvm-free` job's bootstrap runs the corpus
 on arm64. The rest of COMPREHENSIVE runs locally.

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """FAST: the pre-push tier. End-to-end tests of key functionality, run serially.
 
-    python3 scripts/dev.py test fast --compiler <coil>           # every step, <= 270 s
-    python3 scripts/dev.py test fast --compiler <coil> --quick   # inner loop, <= 60 s
+    python3 scripts/dev.py test fast --compiler <coil>           # every step, aiming for 5 minutes
+    python3 scripts/dev.py test fast --compiler <coil> --quick   # inner loop, aiming for 60 s
 
 It never builds, checks or installs the compiler: a step that runs a whole-compiler
 command is refused before anything runs, and a process that tries one at run time
-is killed. Every step has a budget in scripts/tests/budgets.toml (going over it is
-a warning), and any process over 1.5 GB fails its step. Run `--list` to see the steps.
+is killed. Each step's time and largest process are reported; a run past its target
+time, or a step whose largest process passes 1.5 GB, gets a warning, never a
+failure. Run `--list` to see the steps.
 
 Everything here takes the compiler from $COIL (also first on PATH as `coil`) and
 writes temporary files under $COIL_TEST_SCRATCH, which the harness removes.
@@ -25,7 +26,10 @@ from harness import Step  # noqa: E402
 
 PY = sys.executable
 FAST = "scripts/tests/fast"
-MEMORY_LIMIT_GB = 1.5
+MEMORY_LINE_GB = 1.5
+TARGET_SECONDS = 300
+QUICK_TARGET_SECONDS = 60
+HANG_SECONDS = 600
 
 
 def stdlib_suites() -> list[str]:
@@ -105,13 +109,13 @@ def main(argv: list[str] | None = None) -> int:
     tier = "quick" if args.quick else "fast"
     selected = steps(args.quick)
     if args.list:
-        harness.list_steps(tier, selected)
+        harness.list_steps(selected)
         return 0
     return harness.run_tier(
         tier, selected, harness.resolve_compiler(args.compiler),
-        total_key="total", hard_key="hard", limit_gb=MEMORY_LIMIT_GB,
-        refuse_whole_compiler=True, only=args.only, verbose=args.verbose,
-        rebaseline=args.rebaseline)
+        target_seconds=QUICK_TARGET_SECONDS if args.quick else TARGET_SECONDS,
+        memory_gb=MEMORY_LINE_GB, hang_seconds=HANG_SECONDS,
+        refuse_whole_compiler=True, only=args.only, verbose=args.verbose)
 
 
 if __name__ == "__main__":

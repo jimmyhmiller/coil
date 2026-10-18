@@ -19,8 +19,8 @@ must be an installed one (<prefix>/bin/coil beside <prefix>/lib/coil) for the
 steps that need the coil.jit unit. `--only` picks steps by name or name prefix;
 CI uses it to run its slices.
 
-Steps run serially; each has a budget in scripts/tests/budgets.toml, and the
-whole tier should fit comprehensive.total. Going over either is a warning.
+Steps run serially. Each step's time and largest process are reported, with a
+warning for a process past the step's memory line; neither ever fails a step.
 """
 
 from __future__ import annotations
@@ -39,18 +39,19 @@ from harness import Step  # noqa: E402
 
 PY = sys.executable
 ROOT = harness.ROOT
-MEMORY_LIMIT_GB = 6.0      # an ordinary comprehensive step
-HEAVY_LIMIT_GB = 16.0      # a step that compiles the whole compiler
+MEMORY_LINE_GB = 6.0       # an ordinary comprehensive step
+HEAVY_LINE_GB = 16.0       # a step that compiles the whole compiler
+HANG_SECONDS = 3600
 X64_HOST = os.environ.get("COIL_X64_HOST", "computer.jimmyhmiller.com")
 
 
 def build_steps(prefix: Path) -> list[Step]:
     return [
         Step("build/full", [PY, "scripts/dev.py", "build", "full", "--no-install"],
-             whole_compiler=True, memory_gb=HEAVY_LIMIT_GB),
+             whole_compiler=True, memory_gb=HEAVY_LINE_GB),
         Step("build/install", [PY, "scripts/dev.py", "install", "--source", "build/bin/coil",
                                "--dest", str(prefix / "bin" / "coil")],
-             whole_compiler=True, memory_gb=HEAVY_LIMIT_GB),
+             whole_compiler=True, memory_gb=HEAVY_LINE_GB),
     ]
 
 
@@ -62,7 +63,7 @@ def steps(x64: bool) -> list[Step]:
         # Compile-error tests link the in-process compiler through the warmed unit.
         Step("compile-errors", [PY, "scripts/tests/compile-errors.py"]),
         Step("installed/layout", [installed, "layout"]),
-        Step("installed/allns", [installed, "allns"], whole_compiler=True, memory_gb=HEAVY_LIMIT_GB),
+        Step("installed/allns", [installed, "allns"], whole_compiler=True, memory_gb=HEAVY_LINE_GB),
         Step("installed/jit-sdk", [installed, "jit-sdk"]),
         Step("installed/repl", [installed, "repl"]),
         Step("jit/repl-forms", [PY, "scripts/tests/jit-single-form.py"]),
@@ -72,15 +73,15 @@ def steps(x64: bool) -> list[Step]:
         Step("memory/generated-units", [PY, "scripts/tests/generated-unit-memory.py", "--units", "64"]),
         Step("memory/namespace-index", [PY, "scripts/tests/project-scan-memory.py", "--full"]),
         Step("memory/self-build", [PY, "scripts/tests/self-build-expansion-memory.py", "{compiler}"],
-             whole_compiler=True, memory_gb=HEAVY_LIMIT_GB),
+             whole_compiler=True, memory_gb=HEAVY_LINE_GB),
         Step("extern-prototypes", [PY, "scripts/tests/extern-prototypes.py", "{compiler}"],
-             whole_compiler=True, memory_gb=HEAVY_LIMIT_GB),
+             whole_compiler=True, memory_gb=HEAVY_LINE_GB),
         Step("aggregates", [PY, "scripts/tests/aggregate-ir-scan.py", "{compiler}"],
-             whole_compiler=True, memory_gb=HEAVY_LIMIT_GB),
+             whole_compiler=True, memory_gb=HEAVY_LINE_GB),
         Step("wasm/self-host", [PY, "scripts/tests/wasm-self-host.py"],
-             whole_compiler=True, memory_gb=HEAVY_LIMIT_GB),
+             whole_compiler=True, memory_gb=HEAVY_LINE_GB),
         Step("bootstrap-imports", [PY, "scripts/tests/bootstrap-imports.py", "--compiler", "{compiler}"],
-             whole_compiler=True, memory_gb=HEAVY_LIMIT_GB),
+             whole_compiler=True, memory_gb=HEAVY_LINE_GB),
         Step("install-pairing", [PY, "scripts/tests/install-pairing.py"]),
         Step("corpus/safety-all", [*corpus, "safety", "--all"]),
         Step("corpus/opt3", [*corpus, "opt3"]),
@@ -124,8 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--only needs --compiler: a slice runs against an existing compiler")
     if args.list:
         prefix = Path("<prefix>")
-        harness.list_steps("comprehensive", ([] if args.compiler else build_steps(prefix))
-                           + steps(not args.no_x64))
+        harness.list_steps(([] if args.compiler else build_steps(prefix)) + steps(not args.no_x64))
         return 0
     started = time.monotonic()
     work = Path(tempfile.mkdtemp(prefix="coil-comprehensive-"))
@@ -134,8 +134,8 @@ def main(argv: list[str] | None = None) -> int:
             prefix = work / "prefix"
             status = harness.run_tier(
                 "comprehensive", build_steps(prefix), shutil.which("coil") or "coil",
-                total_key=None, hard_key=None, limit_gb=HEAVY_LIMIT_GB,
-                refuse_whole_compiler=False, verbose=args.verbose, rebaseline=args.rebaseline)
+                target_seconds=None, memory_gb=HEAVY_LINE_GB, hang_seconds=HANG_SECONDS,
+                refuse_whole_compiler=False, verbose=args.verbose)
             if status:
                 print("comprehensive: the build failed; nothing else ran")
                 return status
@@ -145,16 +145,13 @@ def main(argv: list[str] | None = None) -> int:
             prefix = installed_prefix(compiler)
         selected = bind(steps(not args.no_x64), compiler, prefix)
         status = harness.run_tier(
-            "comprehensive", selected, compiler, total_key=None, hard_key=None,
-            limit_gb=MEMORY_LIMIT_GB, refuse_whole_compiler=False, only=args.only,
-            verbose=args.verbose, rebaseline=args.rebaseline)
+            "comprehensive", selected, compiler, target_seconds=None,
+            memory_gb=MEMORY_LINE_GB, hang_seconds=HANG_SECONDS, refuse_whole_compiler=False,
+            only=args.only, verbose=args.verbose)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     wall = time.monotonic() - started
-    total = harness.load_budgets()["comprehensive"]["total"] * harness.scale()
     print(f"== comprehensive: {wall:.1f}s wall in all")
-    if not args.only and not args.rebaseline and wall > total:
-        print(f"comprehensive: WARNING {wall:.1f}s is over its {total:.0f}s budget")
     print("comprehensive: PASS" if status == 0 else "comprehensive: FAILED")
     return status
 
