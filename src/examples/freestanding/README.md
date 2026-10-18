@@ -77,9 +77,80 @@ the program reaches.
   `.bss` and a `{write-fn, ctx}` value over the UART.
 - `uart.coil` drives the PL011 properly, polling the flag register's TXFF bit,
   with the registers declared as typed bitfields by `coil.mmio`'s `defmmio-reg`
-  macro. The library is a macro over `llvm-ir` volatile loads and stores.
+  macro. Explicit `read!` / `write!` trait calls use typed volatile loads and
+  stores; dot access decodes a saved snapshot.
 - `arena.coil` imports `coil.alloc` and allocates with `box!` from
   `arena-over-buffer`, the stdlib arena over a caller-provided static buffer.
 - `fail.coil` installs a `coil.fail` handler and exhausts a 64-byte arena.
 - `build_time.coil` prints `build_time.txt`, which its `baked-text` macro read
   with `coil.fs` while the image was compiled.
+
+## MMIO register descriptions and snapshots
+
+`coil.mmio` keeps hardware access explicit. A declaration generates a descriptor,
+a snapshot type, computed snapshot fields, and the permitted I/O trait impls:
+
+```coil
+(import "coil.mmio" :as mmio)
+
+(mmio/defmmio-reg GPIO_IN
+  :address 0x6000403C :type u32 :read-only
+  [(boot-button :bit 9)
+   (mode :bits [12 3])])
+
+(let [gpio (mmio/read! GPIO_IN)]
+  (.boot-button gpio)) ; bool; no additional hardware read
+```
+
+`:type` is `u8`, `u16`, `u32`, or `u64`; the access mode is `:read-only`,
+`:write-only`, or `:read-write`. `:bit` produces a boolean field; `:bits` takes
+`[offset width]` and produces a field of the register's unsigned type. Overlapping
+fields are allowed as alternate views. Offsets and widths must be literal
+integers within the register. Literal addresses must be nonnegative and aligned
+to the register width; expression addresses are the caller's responsibility.
+
+`GPIO_IN` has type `GPIO_IN-Register`, whose `address` field is a `(ptr u32)`.
+`read!` performs exactly one volatile load and returns `GPIO_IN-Snapshot`.
+Its `.bits` field contains the raw value. Computed fields operate only on this
+snapshot, even if hardware changes afterward. Put `read!` inside a polling loop
+to refresh it on every iteration.
+
+A writable register accepts its unsigned raw type:
+
+```coil
+(mmio/defmmio-reg UART_DATA
+  :address 0x09000000 :type u32 :write-only [])
+
+(mmio/write! UART_DATA (: 65 u32))
+```
+
+`write!` performs one volatile store. It does not accept a snapshot implicitly,
+implement read-modify-write, preserve reserved bits, acknowledge interrupts, or
+supply CPU/device memory barriers. Choose the raw write value and any required
+barriers according to the hardware manual. Reading can itself have hardware side
+effects, such as consuming FIFO data or clearing status.
+
+The generated descriptor and snapshot types are ordinary structs. A descriptor
+can be stored in a peripheral struct or passed to a helper; constructing one with
+another pointer supports relocated instances and memory-backed tests. The caller
+must ensure that pointer is valid and naturally aligned for the declared width.
+
+### Migrating the previous API
+
+Migration is manual: the generated accessor names and their bitfield declarations
+are not represented by the static API rename table used by `coil lint --fix`.
+The old declaration is rejected with a migration diagnostic.
+
+- `(defmmio-reg REG address [(flag offset 1)])` becomes
+  `(defmmio-reg REG :address address :type u32 :read-only [(flag :bit offset)])`.
+  Choose `:read-write` or `:write-only` for registers that support those operations.
+- `(REG-read)` becomes `(.bits (mmio/read! REG))` when the caller needs the raw
+  integer, or `(mmio/read! REG)` when it needs a snapshot.
+- `(REG-write value)` becomes `(mmio/write! REG value)`.
+- `(REG-flag)` becomes `(.flag (mmio/read! REG))`. A `:bit` field is now `bool`,
+  so replace numeric comparisons with boolean conditions. To preserve a numeric
+  one-bit field instead, declare `(flag :bits [offset 1])`.
+- `(field offset width)` becomes `(field :bits [offset width])` for wider fields.
+
+Keep separate reads when migrating separate old getter calls; combining them
+into one snapshot changes when hardware is read and should be a deliberate edit.

@@ -1,56 +1,151 @@
-; Memory-mapped I/O device registers as a typed bitfield — a PURE MACRO. The §7
-; capstone: "expressiveness through macros" at its hardest domain (hardware device
-; registers), with ZERO core feature. `defmmio-reg` takes a register spec (name,
-; MMIO address, and named bit-fields) and GENERATES — entirely via the macro system —
-; a volatile-load reader, a volatile-store writer, and a shift+mask getter per field,
-; over typed volatile memory operations + `iand`/`ishr`/`ishl` primitives.
-;
-;   (defmmio-reg UARTFR 150994968        ; 0x09000018 — PL011 flag register
-;     [(rxfe 4 1) (txff 5 1)])           ; (field, bit-offset, width)
-; expands to:
-;   UARTFR-read  []        -> i32        ; volatile load the 32-bit register
-;   UARTFR-write [(v i32)] -> i64        ; volatile store
-;   UARTFR-rxfe  []        -> i32        ; (read >> 4) & 1
-;   UARTFR-txff  []        -> i32        ; (read >> 5) & 1
 (module coil.mmio)
 (import "coil.primitive" :as primitive)
 
-;;; one shift+mask getter per field. The mask `(1 << width) - 1`
-;;; is emitted as ordinary code (LLVM const-folds it), so no macro-time bit ops.
-;;; Built with a growable Code list, not `(~getter ~@(self …)): splicing the
-;;; recursion's result re-copies the suffix per field, which is quadratic in the
-;;; field count (docs/design/META_MEMORY.md).
-(defn defmmio--fields [(name Code) (read-name Code) (fields Code) (i i64)] (-> Code)
+;;; A readable register. Reading performs one volatile load and returns a snapshot.
+;;; Volatile accesses are not CPU/device memory barriers.
+(deftrait Readable [Self Value]
+  (read! [(register Self)] (-> Value)))
+
+;;; A writable register. Writing performs one volatile store of the raw value.
+;;; No implicit read-modify-write, reserved-bit handling, or snapshot conversion.
+(deftrait Writable [Self Value]
+  (write! [(register Self) (value Value)] (-> i64)))
+
+(defn mmio-name [(name Code) (suffix (slice u8))] (-> Code)
+  ; hygiene: generated register API types intentionally enter the caller namespace.
+  (primitive/syntax->datum (primitive/code-symbol name suffix)))
+
+(defn mmio-width [(type Code)] (-> i64)
+  (cond (= type `u8) 8
+        (= type `u16) 16
+        (= type `u32) 32
+        (= type `u64) 64
+        :else
+          (do
+            (primitive/error "defmmio-reg: :type must be u8, u16, u32 or u64")
+            0)))
+
+(defn mmio-fields [(snapshot Code) (type Code) (fields Code)] (-> Code)
   (let [out (primitive/code-list-new)
-        (mut k) i]
-    (loop (if (= (load k) (primitive/code-count fields))
+        bits (mmio-width type)
+        (mut i) 0]
+    (if (not (primitive/code-vector? fields))
+        (primitive/error "defmmio-reg: expected a vector of field declarations")
+        0)
+    (loop (if (= i (primitive/code-count fields))
               (break)
-              (let [[fname offset width] (primitive/code-nth fields (load k))]
-                (do
-                  (primitive/code-list-push! out
-                                             ; Register API names intentionally live in the caller's
-                                             ; declaration namespace; context removal is the protocol.
-                                             ; hygiene: field accessors intentionally enter the caller-visible register API.
-                                             `(defn ~(primitive/syntax->datum (primitive/code-symbol name
-                                                                                                     "-"
-                                                                                                     fname)) [] (-> u32)
-                                                (primitive/iand (primitive/ishr (~read-name)
-                                                                                ~offset)
-                                                                (primitive/isub (primitive/ishl 1
-                                                                                                ~width)
-                                                                                1))))
-                  (set! k (primitive/iadd (load k) 1))))))
+              (let [field (primitive/code-nth fields i)
+                    n
+                      (if (primitive/code-list? field)
+                          (primitive/code-count field)
+                          0)]
+                (if (or (not (primitive/code-list? field)) (not (= n 3)))
+                    (primitive/error "defmmio-reg: expected (name :bit offset) or (name :bits [offset width])")
+                    0)
+                (let [[name kind spec] field
+                      offset
+                        (if (= kind `:bit)
+                            spec
+                            (if (and (= kind `:bits)
+                                     (primitive/code-vector? spec)
+                                     (= (primitive/code-count spec) 2))
+                                (primitive/code-nth spec 0)
+                                (do
+                                  (primitive/error "defmmio-reg: invalid field specification")
+                                  `0)))
+                      width (if (= kind `:bit) `1 (primitive/code-nth spec 1))]
+                  (if (or (not (primitive/code-sym? name)) (= name `bits))
+                      (primitive/error "defmmio-reg: field must be an identifier other than bits")
+                      0)
+                  (if (not (and (primitive/code-int? offset)
+                                (primitive/code-int? width)))
+                      (primitive/error "defmmio-reg: field offset and width must be integer literals")
+                      0)
+                  (let [lo (primitive/code-int offset)
+                        size (primitive/code-int width)
+                        (mut j) 0]
+                    (if (or (< lo 0)
+                            (<= size 0)
+                            (> size bits)
+                            (> lo (- bits size)))
+                        (primitive/error "defmmio-reg: field is outside the register width")
+                        0)
+                    (loop (if (= j i)
+                              (break)
+                              (do
+                                (if (= name
+                                       (primitive/code-nth (primitive/code-nth fields
+                                                                               j)
+                                                           0))
+                                    (primitive/error "defmmio-reg: duplicate field name")
+                                    0)
+                                (set! j (+ j 1)))))
+                    (let [target (primitive/fresh-identifier "mmio-snapshot")
+                          key (primitive/code-symbol ":" name)
+                          value
+                            `(primitive/iand (primitive/ishr (.bits ~target)
+                                                             ~offset)
+                                             (primitive/ishr (primitive/cast ~type
+                                                                             -1)
+                                                             ~(- bits size)))
+                          result (if (= kind `:bit) `bool type)
+                          body
+                            (if (= kind `:bit)
+                                `(not (= ~value (: 0 ~type)))
+                                value)]
+                      (primitive/code-list-push! out
+                                                 `(impl FieldGet (Field ~snapshot
+                                                                        ~key)
+                                                    (get-field [(self (Field ~snapshot
+                                                                             ~key))
+                                                                (~target ~snapshot)]
+                                                      (-> ~result)
+                                                      ~body))))))
+                (set! i (+ i 1)))))
     (primitive/code-list-done out)))
 
-(defn defmmio-reg [(name Code) (addr Code) (fields Code)] (-> Code)
-  (let [; hygiene: register read/write declarations intentionally enter the caller namespace.
-        read-name (primitive/syntax->datum (primitive/code-symbol name "-read"))
-        write-name
-          (primitive/syntax->datum (primitive/code-symbol name "-write"))]
+;;; Declare a fixed-address register and computed snapshot fields:
+;;; (defmmio-reg GPIO_IN :address 0x6000403C :type u32 :read-only
+;;;   [(boot-button :bit 9) (mode :bits [12 3])])
+;;; Generates GPIO_IN-Register (address: ptr u32), GPIO_IN-Snapshot (bits: u32),
+;;; and GPIO_IN, a descriptor. Access is :read-only, :write-only or :read-write.
+;;; (.boot-button (read! GPIO_IN)) is bool; .mode is u32. .bits is the raw snapshot.
+;;; Aliased fields may overlap. No computed snapshot setters are generated.
+(defn defmmio-reg [(name Code) & (options Code)] (-> Code)
+  (if (not (= (primitive/code-count options) 6))
+      (primitive/error "defmmio-reg: expected NAME :address ADDRESS :type TYPE ACCESS [FIELDS]; migrate old readers to (read! NAME), writers to (write! NAME value), and getters to (.field (read! NAME))")
+      0)
+  (let [[address-key address type-key type access fields] options
+        register (mmio-name name "-Register")
+        snapshot (mmio-name name "-Snapshot")
+        bits (mmio-width type)
+        readable (or (= access `:read-only) (= access `:read-write))
+        writable (or (= access `:write-only) (= access `:read-write))]
+    (if (not (and (= address-key `:address) (= type-key `:type)))
+        (primitive/error "defmmio-reg: expected :address ADDRESS :type TYPE")
+        0)
+    (if (not (or readable writable))
+        (primitive/error "defmmio-reg: access must be :read-only, :write-only or :read-write")
+        0)
+    (if (primitive/code-int? address)
+        (if (or (< (primitive/code-int address) 0)
+                (not (= (% (primitive/code-int address) (/ bits 8)) 0)))
+            (primitive/error "defmmio-reg: address must be nonnegative and naturally aligned")
+            0)
+        0)
     `(do
-       ; Registers are UNSIGNED (u32), so field extraction uses a logical shift.
-       (defn ~read-name [] (-> u32)
-         (primitive/volatile-load u32 (primitive/cast (ptr u32) ~addr)))
-       (defn ~write-name [(v u32)] (-> i64)
-         (primitive/volatile-store! (primitive/cast (ptr u32) ~addr) v))
-       ~@(defmmio--fields name read-name fields 0))))
+       (defstruct ~register [(address (ptr ~type))])
+       (defstruct ~snapshot [(bits ~type)])
+       (def ~name (~register :address (primitive/cast (ptr ~type) ~address)))
+       ~@(if readable
+             `((impl Readable ~register
+                 (read! [(reg ~register)] (-> ~snapshot)
+                   (~snapshot
+                     :bits (primitive/volatile-load ~type (.address reg))))))
+             `())
+       ~@(if writable
+             `((impl Writable ~register
+                 (write! [(reg ~register) (value ~type)] (-> i64)
+                   (primitive/volatile-store! (.address reg) value))))
+             `())
+       ~@(mmio-fields snapshot type fields))))
