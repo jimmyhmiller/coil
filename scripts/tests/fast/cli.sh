@@ -943,14 +943,16 @@ EOF
     "$COIL" check "$T/seven.coil" --target x86_64-unknown-freebsd
   # RISC-V :shim conventions: a Coil body behind one whose argument registers are
   # the C ones swapped assembles, and coil.arch.riscv's inlined CSR operations
-  # leave the instruction in their caller rather than a call.
+  # leave the instruction in their caller rather than a call: a named small mask
+  # is the instruction's operand, and an operation with no result, under a
+  # convention with no :ret, leaves its argument register unchanged.
   cat > "$T/rv-shim.coil" <<'EOF'
 (module rv-shim)
 (import "coil.primitive" :as primitive)
 (import "coil.arch.riscv" :as riscv)
 (defcc swapped :params [a1 a0] :ret a1 :clobber [t0 t1 t2 a0 a1 a2 a3 a4 a5 a6 a7 t3 t4 t5 t6] :lower shim)
 (defn sub2 :cc swapped [(a u32) (b u32)] (-> u32) (- a b))
-(defn quiet! [] (-> void) (riscv/clear-mstatus! 8))
+(defn quiet! [] (-> void) (riscv/clear-mstatus! 8) (riscv/clear-mstatus-mie!))
 (defn main [] (-> i64) (quiet!) (primitive/cast i64 (sub2 (riscv/read-mhartid) 3)))
 EOF
   expect_rc 0 "a :shim convention's trampoline assembles for RISC-V" \
@@ -961,12 +963,12 @@ EOF
   case "$rv_ir" in
     *"target datalayout"*)
       case "$rv_quiet" in
-        *'".insn 0x30053073"'*)
+        *'".insn 0x30053073", "{x10},~{memory}"'*'".insn 0x30047073", "~{memory}"'*)
           case "$rv_quiet" in
-            *'@"coil.arch.riscv.clear-mstatus!"'*|*"auipc"*) bad "an inlined CSR operation is its instruction, not a call" "$rv_quiet" ;;
+            *'@"coil.arch.riscv.clear-mstatus'*|*"auipc"*) bad "an inlined CSR operation is its instruction, not a call" "$rv_quiet" ;;
             *) ok "an inlined CSR operation is its instruction, not a call" ;;
           esac ;;
-        *) bad "an inlined CSR operation is its instruction, not a call" "no csrc in: $rv_quiet" ;;
+        *) bad "an inlined CSR operation is its instruction, not a call" "no csrc then csrci in: $rv_quiet" ;;
       esac ;;
     *) bad "an inlined CSR operation is its instruction, not a call" "emit-ir failed: $rv_ir" ;;
   esac

@@ -48,8 +48,10 @@ Pass `--build-only` to produce these artifacts without starting QEMU:
 - `coil.arch.riscv`: named CSR reads, writes, and bit sets and clears, `wfi`,
   `mret` and `enter!`, as machine-code functions whose RV32 instructions the
   library encodes. All but `enter!` are inlined, so a caller holds the
-  instruction itself. Nothing RISC-V-specific is built into the compiler, and
-  the firmware has no inline assembly.
+  instruction itself. The fields of `mstatus`, `mie` and `mip` are named, so
+  `(clear-mstatus-mie!)` masks interrupts with one `csrci mstatus, 8`. Nothing
+  RISC-V-specific is built into the compiler, and the firmware has no inline
+  assembly.
 - UART output through the ESP32-C3 UART0 FIFO/status MMIO registers. The boot
   proof no longer calls an ESP ROM output routine.
 - A direct-boot linker layout for IROM, DROM, SRAM, global pointer, and stack.
