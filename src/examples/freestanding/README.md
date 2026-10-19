@@ -50,10 +50,17 @@ itself. What the toolchain guarantees:
   `+strict-align`: the programs run with the MMU off, where all memory is Device
   memory and any unaligned access faults.
 
-What the program still supplies, as in freestanding C: LLVM lowers large copies
-and zeroing to `memcpy`, `memmove`, `memset` and `memcmp`, and on targets without
-the hardware to `compiler-rt` helpers (`__divdi3`, soft-float such as `__adddf3`
-on rv32imc). A program that needs them links compiler-rt or provides them.
+- **The memory functions come with the object.** LLVM lowers a large copy or
+  zeroing to `memcpy`, `memmove`, `memset` or `memcmp`, so a `*-none` object
+  defines all four, `weak`, as Rust's `compiler_builtins` and Zig's `compiler_rt`
+  do. They copy a byte at a time. A definition of the program's own, or one from a
+  C library it links, wins; `--gc-sections` drops the ones nothing calls.
+  `riscv32/answer.coil` checks them.
+
+What the program still supplies: on targets without the hardware, LLVM lowers
+some arithmetic to `compiler-rt` helpers (`__divdi3`, soft-float such as
+`__adddf3` on rv32imc). A program that needs them links compiler-rt or provides
+them.
 
 ## How an image is built
 
