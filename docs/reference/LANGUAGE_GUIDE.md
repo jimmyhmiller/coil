@@ -1880,10 +1880,23 @@ which share its userland), `Wasm` (a wasm module's host) or `BareMetal` (a
   function is those bytes, then the target's return instruction unless it
   returns `never`. Its `:cc` is the contract. Arguments arrive where the
   convention puts them and the result leaves there; a `:lower shim` convention
-  pins them to registers of your choosing.
+  pins them to registers of your choosing. Machine code may change only the
+  registers its convention's `:clobber` names. An ordinary body under a `:shim`
+  convention is compiled for C and reached through a trampoline, so that
+  convention's `:clobber` must name every register a C function may change; the
+  checker lists any it leaves out.
+- Under a `:lower shim` convention, `:inline (Always)` or `:inline (Hint)` puts
+  the bytes in each caller instead of a call. The convention is still the
+  contract: the caller puts the arguments in `:params`, reads the result from
+  `:ret`, and expects every register in `:clobber`, and `:ret`, to have changed.
+  The bytes must not depend on being called: no return of their own, no use of
+  the return address, and the stack pointer left as they found it. Under any
+  other convention, `:inline` on machine code is an error, because nothing
+  says which registers the bytes touch.
 - ARCH is checked against the target, so bytes for another architecture are an
   error where they are written. A module of one architecture's machine code, such
-  as `coil.arch.riscv` (control and status registers, `wfi!`, `mret!`, `enter!`),
+  as `coil.arch.riscv` (control and status registers, read, written, and with
+  bits set or cleared in one instruction; `wfi!`, `mret!`, `enter!`),
   compiles only for that architecture: import it from code a `match` chose for it.
 - The bytes must be whole instructions (4 bytes each on AArch64, 2 or 4 on
   RISC-V). A call is assumed to read and write any memory. WebAssembly and the
