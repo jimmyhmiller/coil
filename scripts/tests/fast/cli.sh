@@ -326,6 +326,19 @@ section_check() {
   # conflicting case, another register class, is a diag golden).
   printf '(module extern-width)\n(import "coil.fs" :as fs)\n(extern mkdir :cc c [(ptr i8) i32] (-> i32))\n(defn main [] (-> i64) (mkdir c"/nonexistent-coil-dir/x" 448) 0)\n' > "$T/extern-width.coil"
   expect_rc 0 "an extern may redeclare a library symbol with another integer width" "$COIL" check "$T/extern-width.coil"
+  # A module's imports govern its own code wherever that code is: an impl method,
+  # a constant's value, a static assertion's condition. None of their names says
+  # which module it is, and reading one off the entry file let a module's
+  # `:exclude` reach the library's impls and miss its own constants.
+  printf '(module refer-impls)\n(import "coil.core" :use * :exclude [=])\n(defn main [] (-> i64) 0)\n' > "$T/refer-impls.coil"
+  expect_rc 0 "check: a module's :exclude does not reach another module's impl methods" \
+    "$COIL" check "$T/refer-impls.coil"
+  printf '(module refer-assert)\n(import "coil.core" :use * :exclude [<])\n(static-assert (< 1 2) "excluded")\n(defn main [] (-> i64) 0)\n' > "$T/refer-assert.coil"
+  expect_rc_out 1 "trait method '<' is not in scope" "check: an excluded operator is not in scope in a static assertion" \
+    "$COIL" check "$T/refer-assert.coil"
+  printf '(module refer-length)\n(import "coil.primitive" :as primitive)\n(import "coil.core" :use * :exclude [<])\n(const N (if (< 1 2) 3 4))\n(defstruct Buf [(xs (array i64 N))])\n(defn main [] (-> i64) (primitive/cast i64 (primitive/sizeof Buf)))\n' > "$T/refer-length.coil"
+  expect_rc_out 1 "trait method '<' is not in scope" "check: an excluded operator is not in scope in an array length's constant" \
+    "$COIL" check "$T/refer-length.coil"
 }
 
 # ---------------------------------------------------------------------------
