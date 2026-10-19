@@ -8,7 +8,8 @@
 #     diagnostics for a wrong input count or a target that does not exist;
 #   * hygiene in both directions: identifiers that must connect (quote, a shared
 #     fresh identifier, an alias-qualified template name, a semantic transform's
-#     own binder) and ones that must not (three captures reported in one run),
+#     own binder, the trait a `derive` names) and ones that must not (three
+#     captures reported in one run, a module's own trait named like core's),
 #     plus a checker suggestion whose replacement must not capture once it is
 #     flattened into source text;
 #   * staged metacompilation: a staged entry whose native result resumes into a
@@ -87,6 +88,13 @@ expect "run: a target that is neither a file nor a namespace" 1 'no such file' "
 
 # ---- hygiene -------------------------------------------------------------------
 expect "hygiene: identifiers that must connect do" 42 '' "$COIL" run $M/hygiene_identity.coil
+
+# A module's own `Eq` is its own trait, not core's: deriving it asks for a deriver
+# of that trait, and none is registered.
+printf '(module mt.own-eq)\n(deftrait Eq [Self] (same? [(a Self) (b Self)] (-> bool)))\n(defstruct P [(x i64)])\n(derive Eq P)\n(defn main [] (-> i64) 0)\n' \
+  > "$WORK/own_eq.coil"
+expect "hygiene: a module's own trait named like core's is not core's" 1 \
+  "no deriver is registered for trait 'mt.own-eq.Eq'" "$COIL" check "$WORK/own_eq.coil"
 
 out=$("$COIL" check $M/hygiene_capture.coil 2>&1); rc=$?
 case "$rc|$out" in
