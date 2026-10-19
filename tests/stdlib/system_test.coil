@@ -866,6 +866,175 @@
 (deftest run-honors-cancellation-after-the-child-closes-its-output
   (assert-eq (closed-output-run true) 0))
 
+; Each way of giving a child a stream: piped stdin and stdout, stderr merged into
+; stdout, and stderr inherited from this process. A program that does not exist
+; fails the spawn with its errno.
+
+(defn sh-args [(args (ptr (array (slice u8) 2))) (script (slice u8))] (-> (slice (slice u8)))
+  (store! (primitive/index args 0) "-c")
+  (store! (primitive/index args 1) script)
+  (slice::new [(slice u8)] (primitive/cast (ptr (slice u8)) args) 2))
+
+;;; Whether a wait ended with the child exiting 0.
+(defn exited-zero? [(status (Result subprocess/ExitStatus subprocess/SubprocessError))] (-> bool)
+  (match status
+    (Ok [done]
+        (match done
+          (subprocess/Exited [code] (= code 0))
+          (subprocess/Signaled [_] false)))
+    (Err [_] false)))
+
+(defn missing-program-run [] (-> i64)
+  (let [child (primitive/alloc-stack subprocess/Child)
+        args (primitive/alloc-stack (array (slice u8) 2))]
+    (match (subprocess/Child::spawn (alloc/malloc-allocator)
+                                    child
+                                    "coil-no-such-program"
+                                    (subslice (sh-args args "") 0 0)
+                                    (subprocess/null-stdio)
+                                    (subprocess/null-stdio)
+                                    (subprocess/null-stdio))
+      (Err [e] (if (= e (subprocess/SpawnFailed 2)) 0 1))  ; ENOENT
+      (Ok [_] 2))))
+
+(defn merged-streams-run [] (-> i64)
+  (let [child (primitive/alloc-stack subprocess/Child)
+        args (primitive/alloc-stack (array (slice u8) 2))
+        buffer (primitive/alloc-stack (array u8 64))
+        (mut n) 0]
+    (match (subprocess/Child::spawn (alloc/malloc-allocator)
+                                    child
+                                    "/bin/sh"
+                                    (sh-args args "cat; echo err >&2")
+                                    (subprocess/pipe-stdio)
+                                    (subprocess/pipe-stdio)
+                                    (subprocess/merge-stderr))
+      (Err [_] 10)
+      (Ok [_]
+          (do
+            (io/write (.stdin-fd child)
+                      (primitive/cast (ptr i8) (data "in\n"))
+                      (primitive/cast isize 3))
+            (subprocess/Child::close-stdin child)
+            (loop (let [got
+                          (primitive/cast i64
+                                          (io/read (.stdout-fd child)
+                                                   (primitive/cast (ptr i8)
+                                                                   (primitive/index buffer n))
+                                                   (primitive/cast isize (- 64 n))))]
+                    (if (<= got 0) (break) (set! n (+ n got)))))
+            (let [out (slice::new [u8] (primitive/cast (ptr u8) buffer) n)
+                  status (subprocess/Child::wait child)]
+              (subprocess/Child::close child)
+              (cond (!= out "in\nerr\n") 11
+                    (not (exited-zero? status)) 12
+                    :else 0)))))))
+
+(defn inherited-stream-run [] (-> i64)
+  (let [child (primitive/alloc-stack subprocess/Child)
+        args (primitive/alloc-stack (array (slice u8) 2))]
+    ; `:` redirected to fd 2 fails unless the child has fd 2 open
+    (match (subprocess/Child::spawn (alloc/malloc-allocator)
+                                    child
+                                    "/bin/sh"
+                                    (sh-args args ": >&2")
+                                    (subprocess/null-stdio)
+                                    (subprocess/null-stdio)
+                                    (subprocess/inherit-stdio))
+      (Err [_] 20)
+      (Ok [_]
+          (let [status (subprocess/Child::wait child)]
+            (subprocess/Child::close child)
+            (if (exited-zero? status) 0 21))))))
+
+(deftest spawn-pipes-merges-and-inherits-streams-and-reports-a-missing-program
+  (assert-eq (missing-program-run) 0)
+  (assert-eq (merged-streams-run) 0)
+  (assert-eq (inherited-stream-run) 0))
+
+; A child has the descriptors its own spawn gives it and no others, even while other
+; threads are making pipes for children of their own. A pipe end another spawn has
+; open in this process, inherited by such a child, kept that spawn from seeing EOF
+; until the unrelated child exited. A child started alone first gives the count of
+; descriptors any child has here. The race is narrow, so this is a stress test: the
+; fork-based spawn it was written against failed it in two of three runs at 16
+; threads of 150 children, under load.
+
+(const FD-WORKERS 12)
+
+(const FD-ROUNDS 60)
+
+;;; How many descriptors `ls /dev/fd` lists in a child `run` starts, or -1.
+(defn child-fd-count [] (-> i64)
+  (let [args (primitive/alloc-stack (array (slice u8) 1))
+        result (primitive/alloc-stack subprocess/RunResult)]
+    (store! (primitive/index args 0) "/dev/fd")
+    (match (time/Duration::seconds 10)
+      (Err [_] -1)
+      (Ok [timeout]
+          (match (time/Instant::from-now timeout)
+            (Err [_] -1)
+            (Ok [deadline]
+                (match (time/Duration::millis 50)
+                  (Err [_] -1)
+                  (Ok [grace]
+                      (match (subprocess/run (alloc/malloc-allocator)
+                                             result
+                                             (subprocess/RunOptions::new "ls"
+                                                                         (slice::new [(slice u8)]
+                                                                                     (primitive/cast (ptr (slice u8))
+                                                                                                     args)
+                                                                                     1)
+                                                                         ""
+                                                                         4096
+                                                                         4096
+                                                                         (Some deadline)
+                                                                         (primitive/cast (ptr cancellation/Cancellation)
+                                                                                         0)
+                                                                         grace))
+                        (Err [_] -1)
+                        (Ok [_]
+                            (let [(mut lines) 0]
+                              (for c (load (field result stdout))
+                                (when (= c (: 10 u8)) (set! lines (+ lines 1))))
+                              (subprocess/RunResult::free (alloc/malloc-allocator)
+                                                          result)
+                              lines)))))))))))
+
+(defstruct FdWorker [(alone i64) (wrong i64)])
+
+(defn count-child-fds [(arg (ptr i8))] (-> (ptr i8))
+  (let [w (primitive/cast (ptr FdWorker) arg)]
+    (for _ (range 0 FD-ROUNDS)
+      (unless (= (child-fd-count) (.alone w))
+        (store! (field w wrong) (+ (.wrong w) 1))))
+    arg))
+
+(deftest children-started-at-once-get-only-their-own-descriptors
+  (let [a (alloc/malloc-allocator)
+        alone (child-fd-count)
+        workers
+          (alloc/box! a
+                      (array FdWorker FD-WORKERS)
+                      (zeroed (array FdWorker FD-WORKERS)))
+        threads
+          (alloc/box! a
+                      (array thread/Thread FD-WORKERS)
+                      (zeroed (array thread/Thread FD-WORKERS)))]
+    (assert (> alone 0))
+    (for i (range 0 FD-WORKERS)
+      (store! (field (index workers i) alone) alone)
+      (assert-eq (thread/Thread::spawn (index threads i)
+                                       (fnptr-of count-child-fds)
+                                       (primitive/cast (ptr i8) (index workers i)))
+                 0))
+    (for i (range 0 FD-WORKERS)
+      (assert-eq (thread/Thread::join (index threads i)) 0))
+    (for i (range 0 FD-WORKERS)
+      (assert-eq (.wrong (index workers i)) 0))
+    (alloc/destroy a threads)
+    (alloc/destroy a workers)))
+
 ; ==== TCP sockets ====
 
 (defn tcp-cloexec? [(fd i32)] (-> bool)
