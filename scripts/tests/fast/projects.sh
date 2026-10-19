@@ -199,6 +199,60 @@ EOF
     || bad "run ($variant) passes the manifest's [run] args through unchanged" "exit $RC: $OUT"
 done
 
+echo "== a [project] pointer"
+# A Coil.toml holding only `[project] path` makes every project command beside it
+# work on the package it names. The command is still the one typed beside it: its
+# paths are read from there, and `run` starts the program there.
+P="$W/pointer"
+mkdir -p "$P/app/src" "$P/app/tests" "$P/test"
+printf '[project]\npath = "app"\n' > "$P/Coil.toml"
+printf '[package]\nname = "pfptr"\n' > "$P/app/Coil.toml"
+printf 'sample\n' > "$P/test/sample.txt"
+cat > "$P/app/src/main.coil" <<'EOF'
+(module pfptr.main)
+(import "coil.str" :use [from-cstr])
+(extern access :cc c [(ptr i8) i32] (-> i32))
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (for [i 1 (cast i64 argc)]
+    (println "[{}] {}"
+             (from-cstr (load (index argv i)))
+             (if (= (access (load (index argv i)) 0) 0) "found" "missing")))
+  0)
+EOF
+printf '(module pfptr.main-test)\n(deftest pointer-test (assert-eq 1 1))\n' > "$P/app/tests/main_test.coil"
+run "$P" "$COIL" run -- test/sample.txt
+expect 0 "[test/sample.txt] found" "run beside a pointer runs its package, starting the program where it was typed"
+run "$W" "$COIL" run pointer -- pointer/test/sample.txt
+expect 0 "[pointer/test/sample.txt] found" "run DIR follows a pointer in DIR and starts the program where it was typed"
+run "$P" "$COIL" build
+[ "$RC" = 0 ] && case "$OUT" in *"wrote /"*"/pointer/app/build/release/pfptr"*) true ;; *) false ;; esac \
+  && ok "build beside a pointer builds the package and names the output absolutely" \
+  || bad "build beside a pointer" "exit $RC: $OUT"
+run "$P" "$COIL" build app/src/main.coil -o pfptr-here
+[ "$RC" = 0 ] && [ -x "$P/pfptr-here" ] \
+  && ok "a named file and -o beside a pointer are read from where the command was typed" \
+  || bad "paths beside a pointer" "exit $RC: $OUT"
+run "$P" "$COIL" check
+expect 0 "" "check beside a pointer checks the package"
+run "$P" "$COIL" test
+expect 0 "pointer-test" "test beside a pointer runs the package's tests"
+printf '[project]\npath = "app"\n\n[build]\nout = "x"\n' > "$P/Coil.toml"
+run "$P" "$COIL" check
+expect 1 "Coil.toml:4: a Coil.toml with [project] only points at another directory" "a pointer with another section is a located error"
+printf '[project]\npath = "test"\n' > "$P/Coil.toml"
+run "$P" "$COIL" check
+expect 1 "[project] path './test' has no Coil.toml" "a pointer at a directory with no Coil.toml is an error"
+mkdir -p "$W/pointer2"
+printf '[project]\npath = "../pointer"\n' > "$W/pointer2/Coil.toml"
+printf '[project]\npath = "app"\n' > "$P/Coil.toml"
+run "$W/pointer2" "$COIL" check
+expect 1 "is another [project] pointer" "a pointer at another pointer is an error"
+mkdir -p "$W/ptrdep/src"
+printf '[package]\nname = "pfptrdep"\n\n[dependencies]\nptr = { path = "../pointer" }\n' > "$W/ptrdep/Coil.toml"
+printf '(module pfptrdep.main)\n(defn main [] (-> i64) 0)\n' > "$W/ptrdep/src/main.coil"
+run "$W/ptrdep" "$COIL" check
+expect 1 "is a [project] pointer, not a package" "a dependency on a pointer is an error naming the package"
+
 echo "== units: build-unit and a consumer"
 run "$W/units" env COIL_NAMESPACE_ROOTS="$W/units" "$COIL" build-unit mathlib.coil -o "$W/mathlib-unit"
 expect 0 "unit.o" "build-unit writes an interface and an object"
@@ -291,6 +345,8 @@ run "$WS" ./members/cli/build/release/cli
 expect 0 "cli 7 area 21 version 2" "a member's program calls into a library member, the workspace's dependency and its C code, and its own dependency"
 run "$WS/members/cli" "$COIL" run src/main.coil
 expect 0 "cli 7 area 21 version 2" "a member's file, run from its directory, compiles inside the workspace with both dependencies"
+run "$WS" "$COIL" run
+expect 0 "cli 7 area 21 version 2" "run fans out over the members with an entry"
 run "$WS" "$COIL" test
 expect 0 "workspace test: 2/2 members ok" "test runs every member's tests"
 cp "$WS/Coil.toml" "$W/Coil.workspace.toml"

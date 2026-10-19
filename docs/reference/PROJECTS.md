@@ -27,9 +27,10 @@ returns an `i64`, which becomes the process exit code. `coil new` also writes a
 ## Commands
 
 Every project command reads the same `Coil.toml`. `coil run`, `build` and `check`
-also accept a project directory, `coil run .` or `coil run ../other`: that is
-`cd DIR && coil run`, so a relative path in any other argument is read from DIR.
-A directory with no `Coil.toml` is an error, not a project.
+also accept a project directory, `coil run .` or `coil run ../other`. The command
+runs in DIR, but it is still the command you typed where you stand: a relative path
+in any other argument is read from your directory, and `run` starts the program
+there. A directory with no `Coil.toml` is an error, not a project.
 
 ```sh
 coil run                    # build and run the package; args after -- go to the program
@@ -59,6 +60,7 @@ inputs and metaprograms as a bare `coil build`, and writes
 |---|---|---|
 | `[package]` | `name`, `entry`, `source-roots`, `exclude`, `casefold` | What the package is and where its source lives |
 | `[workspace]` | `name`, `members` | A root that groups several packages (replaces `[package]`) |
+| `[project]` | `path` | Point this directory at a package or workspace in another one (the only section) |
 | `[dependencies]` | `NAME = { path … }` or `{ git … }` | Other Coil packages |
 | `[build]` | `out`, `optimization`, `target`, `debug` | Defaults for the package executable |
 | `[profile.NAME]` | `inherits`, `optimization`, `debug`, `debug-checks`, `use` | A named build configuration (`--profile NAME`) |
@@ -171,6 +173,28 @@ A unit links only into a build that uses the same backend (`--backend`); a
 mismatch is an error that names both. The installed toolchain ships `coil.jit`
 as a prebuilt unit, which is why importing it builds quickly.
 
+## A project in a subdirectory
+
+When the package lives in a subdirectory, say `app/`, a `Coil.toml` beside it
+that holds only a `[project]` section points there:
+
+```toml
+[project]
+path = "app"
+```
+
+Every project command run in that directory (`run`, `build`, `check`, `test`,
+`fmt`, `lint`, `verify`, `install`) works on the package in `app/`, exactly as
+`coil run app` does. The command is still the one you typed: a relative path in
+it is read from where you typed it, `run` starts the program there, and an output
+is reported by its absolute path. `coil test` selectors that are not `.coil`
+files still match paths inside the package.
+
+`path` names a directory with its own `Coil.toml`, a package or a workspace. The
+pointing file can have no other section, and nothing beside it is part of the
+project. A pointer may not point at another pointer, be a dependency, or be a
+workspace member; name the package it points at instead.
+
 ## Workspaces
 
 A repository with several packages declares a workspace root instead of a
@@ -205,7 +229,9 @@ apps/cli/src/main.coil            (module tools.cli.main) (import "tools.parser.
   each run in the member's directory; `test` runs each member's own tests and
   fails if any member's tests fail or do not compile. `build` and `run` fan out
   over the members that declare an `entry`. A member without one is a library,
-  compiled through whoever imports it.
+  compiled through whoever imports it. Each member gets the command line as you
+  typed it at the root: its paths are read from the root, and `run` passes the
+  program arguments after `--` and starts each program in the root.
 - A `tests/` directory at the workspace root is indexed too, without being a
   package.
 
