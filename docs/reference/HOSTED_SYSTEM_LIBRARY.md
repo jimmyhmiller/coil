@@ -128,33 +128,52 @@ same integer descriptor must be synchronized by the application.
 
 `Child::spawn` takes an allocator, caller-owned `Child`, program, argument slice, and
 three stdio policies; `Child::spawn-with-options` adds a `SpawnOptions`
-(`SpawnOptions::new` for the defaults). Arguments exclude `argv[0]`; Coil sets it to
-the program. `execvp` performs PATH lookup, empty arguments are preserved, embedded
-NUL is rejected, and no shell is involved.
+(`SpawnOptions::new` for the defaults: the current directory, and the child in this
+process's group). Arguments exclude `argv[0]`; Coil sets it to the program. A program
+without a slash is looked up on PATH, empty arguments are preserved, embedded NUL is
+rejected, and no shell is involved.
+
+A child is started with `posix_spawnp`, never `fork`, so spawning is safe from any
+number of threads at once. What the child gets is the same on Linux and macOS, and is
+what Python's and Java's children get:
+
+- the current environment, `set-env!` included;
+- its three standard streams as the policies say, and **no other descriptor** of this
+  process: not one this library opened, and not one other code opened without
+  close-on-exec. (On Linux that last part needs glibc 2.34; with an older C library
+  only close-on-exec descriptors are kept from the child, and every descriptor this
+  library opens is one.)
+- no blocked signals, whatever the spawning thread blocks, as with Rust and Go.
 
 The stdio policies are `inherit-stdio`, `null-stdio`, `pipe-stdio`, and
-`merge-stderr` (stderr only). Piped streams adapt to ordinary `coil.io` capabilities
+`merge-stderr` (stderr only; for stdin or stdout the spawn is `InvalidCommand`). Piped streams adapt to ordinary `coil.io` capabilities
 through `Child::stdin-writer`, `Child::stdout-reader`, and `Child::stderr-reader`.
 
 Lifecycle is explicit, through methods on the `Child`:
 
 1. `close-stdin` sends EOF without touching output streams.
 2. `try-wait` returns `None` while running; `wait` blocks and caches status.
-3. `wait-until` returns `Timeout` while leaving the child valid and running.
+3. `wait-until` returns `Timeout` while leaving the child valid and running. It
+   sleeps until the system reports the exit (a pidfd on Linux, a kqueue on macOS),
+   and only where neither is available asks on a 1–50 ms backoff, as Python does.
 4. `terminate` and `kill` only send a signal; the caller still waits.
 5. `kill-and-wait` is the forceful leak-free finalization path.
 6. `close` closes parent streams but returns `StillRunning` until the child has
    been reaped. It never silently kills or detaches a child.
 
-`ExitStatus` distinguishes `Exited(code)` from `Signaled(signal)`. A missing
-executable is reported synchronously as `SpawnFailed`, using a close-on-exec child
-error pipe rather than pretending it exited with code 127.
+`ExitStatus` distinguishes `Exited(code)` from `Signaled(signal)`, and compares with
+`=`. A missing or non-executable program is reported synchronously as `SpawnFailed`
+with its errno, rather than as a child that exited with code 127.
 
-The current POSIX implementation performs only async-signal-safe setup between
-`fork` and `exec`. Pipe creation plus close-on-exec setup is not yet an atomic portable
-operation across Linux and macOS, so concurrent spawning from multiple threads is not
-claimed as safe in this release. A future platform shim or `posix_spawn` backend can
-remove that limitation without changing the public lifecycle.
+`run` spawns with stdin from `/dev/null`, captures stdout and stderr up to their
+limits, and waits for the exit as `wait-until` does, so a run costs what a spawn and
+a wait cost.
+
+Every descriptor the library makes is close-on-exec: pipes (`os/pipe-cloexec`), files
+`coil.fs` opens whatever the flags say (as Rust's `File::open` does), sockets, and the
+wakeup pipes of cancellations and signal subscriptions. Linux sets the flag as it
+makes the descriptor; macOS has no such call for pipes and sockets, which is why a
+child is also handed only the descriptors its spawn names.
 
 `coil.process` provides `id`, `parent-id`, and typed `send-signal`. It also re-exports
 the public `coil.subprocess` surface, so both `process/id` and `process/Child` work
@@ -167,9 +186,9 @@ between `os` process facts and `subprocess` command lifecycle.
 The stable surface intentionally leaves these staged rather than underspecified:
 
 - multi-fd selector registration and bounded simultaneous `communicate`;
-- child cwd and environment replacement/overlay;
-- atomic multithread-safe spawning backend;
-- process groups, sessions, resource usage, and priorities;
+- child environment replacement/overlay, and handing a child descriptors beyond its
+  standard streams (Python's `pass_fds`);
+- sessions, resource usage, and priorities;
 - Windows implementations and explicit shell helpers.
 
 These are extensions of the organization above, not reasons for applications to own
@@ -181,8 +200,9 @@ The behaviour is tested by `tests/stdlib/system_test.coil` (FAST's `stdlib/syste
 step): owned environment lookup and mutation, cwd change and restore, monotonic
 time, readable pipes and selectors (`hosted-env-cwd-time-pipes-and-selectors`),
 `run` with bounded capture, deadlines and cancellation (including after the child
-closes its output), close-on-exec cancellation wakeups, TCP and Unix sockets, and
-subscribed signals. The private re-export rejection is a golden in
+closes its output), each stdio policy, a child's descriptors and signal mask,
+`wait-until`, close-on-exec files, cancellation wakeups, signal subscriptions and
+TCP and Unix sockets, and subscribed signals. The private re-export rejection is a golden in
 `tests/diag/compile/names.coil`. Earlier focused files for exact argv bytes,
 hosted line I/O, the facade's qualified re-exports and the Result-flow lint were
 run by no gate and were deleted in the test restructure of 2026-10-12.
@@ -195,7 +215,6 @@ python3 scripts/dev.py test fast --compiler build/bin/coil-candidate --only stdl
 python3 scripts/dev.py test fast --compiler build/bin/coil-candidate
 ```
 
-The current POSIX backend is exercised on macOS. Linux uses the same public API and
-target-selected errno/clock constants, but Linux runtime CI remains a release follow-up.
-Concurrent multithreaded spawn is also explicitly deferred until pipe creation and
-close-on-exec setup can be atomic on every supported POSIX target.
+FAST runs the suite on the machine it runs on. CI's Linux job builds the compiler but
+does not run this suite, so the Linux-only paths (pidfd, `pipe2`, `closefrom`) are
+exercised only where FAST runs on Linux.

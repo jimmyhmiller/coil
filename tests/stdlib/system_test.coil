@@ -138,7 +138,11 @@
 (deftest a-file-opens-from-a-slice-path
   (let [a (malloc-allocator)]
     (match (fs/open-file a "src/stdlib/fs.coil" fs/O_RDONLY 0)
-      (Ok [f] (let [(mut file) f] (fs/File::close (mut file)) (assert true)))
+      (Ok [f]
+          (let [(mut file) f]
+            ; close-on-exec although the flags do not ask for it
+            (assert (cloexec? (primitive/cast i32 (fs/File::fd (mut file)))))
+            (fs/File::close (mut file))))
       (Err [_] (assert false)))
     (match (fs/open-file a "/nonexistent/coil-test" fs/O_RDONLY 0)
       (Err [(Errno [code])] (assert-eq code 2))
@@ -868,7 +872,7 @@
 
 ; Each way of giving a child a stream: piped stdin and stdout, stderr merged into
 ; stdout, and stderr inherited from this process. A program that does not exist
-; fails the spawn with its errno.
+; fails the spawn with its errno, and only stderr can merge into stdout.
 
 (defn sh-args [(args (ptr (array (slice u8) 2))) (script (slice u8))] (-> (slice (slice u8)))
   (store! (primitive/index args 0) "-c")
@@ -947,22 +951,30 @@
             (subprocess/Child::close child)
             (if (exited-zero? status) 0 21))))))
 
+(defn merged-stdout-run [] (-> i64)
+  (let [child (primitive/alloc-stack subprocess/Child)
+        args (primitive/alloc-stack (array (slice u8) 2))]
+    (match (subprocess/Child::spawn (alloc/malloc-allocator)
+                                    child
+                                    "/bin/sh"
+                                    (sh-args args "")
+                                    (subprocess/null-stdio)
+                                    (subprocess/merge-stderr)
+                                    (subprocess/null-stdio))
+      (Err [e] (if (= e (subprocess/InvalidCommand)) 0 30))
+      (Ok [_] 31))))
+
 (deftest spawn-pipes-merges-and-inherits-streams-and-reports-a-missing-program
   (assert-eq (missing-program-run) 0)
+  (assert-eq (merged-stdout-run) 0)
   (assert-eq (merged-streams-run) 0)
   (assert-eq (inherited-stream-run) 0))
 
-; A child has the descriptors its own spawn gives it and no others, even while other
-; threads are making pipes for children of their own. A pipe end another spawn has
-; open in this process, inherited by such a child, kept that spawn from seeing EOF
-; until the unrelated child exited. A child started alone first gives the count of
-; descriptors any child has here. The race is narrow, so this is a stress test: the
-; fork-based spawn it was written against failed it in two of three runs at 16
-; threads of 150 children, under load.
-
-(const FD-WORKERS 12)
-
-(const FD-ROUNDS 60)
+; A child gets its standard streams and no other descriptor of this process, as
+; Python's and Java's do: not one this library opened, which is close-on-exec, and
+; not one opened without the flag, which the spawn closes. A pipe end another
+; thread's spawn had open, inherited by such a child, kept that spawn from seeing
+; EOF until the unrelated child exited.
 
 ;;; How many descriptors `ls /dev/fd` lists in a child `run` starts, or -1.
 (defn child-fd-count [] (-> i64)
@@ -1001,43 +1013,122 @@
                                                           result)
                               lines)))))))))))
 
-(defstruct FdWorker [(alone i64) (wrong i64)])
+(deftest a-child-gets-only-its-standard-streams
+  (let [before (child-fd-count)
+        ; opened without close-on-exec, as code outside this library may
+        null (os/open c"/dev/null" (: 0 i32) 0)
+        fds (primitive/alloc-stack (array i32 2))]
+    (assert (> before 0))
+    (assert (>= null (: 0 i32)))
+    (assert (not (cloexec? null)))
+    (assert-eq (os/pipe (primitive/cast (ptr i32) fds)) (: 0 i32))
+    (assert-eq (child-fd-count) before)
+    (os/close null)
+    (os/close (load (primitive/index fds 0)))
+    (os/close (load (primitive/index fds 1)))))
 
-(defn count-child-fds [(arg (ptr i8))] (-> (ptr i8))
-  (let [w (primitive/cast (ptr FdWorker) arg)]
-    (for _ (range 0 FD-ROUNDS)
-      (unless (= (child-fd-count) (.alone w))
-        (store! (field w wrong) (+ (.wrong w) 1))))
-    arg))
+; A child starts with no signals blocked, as Rust's and Go's do, whatever the
+; thread that started it blocks: a shell that sends itself SIGTERM dies of it.
 
-(deftest children-started-at-once-get-only-their-own-descriptors
-  (let [a (alloc/malloc-allocator)
-        alone (child-fd-count)
-        workers
-          (alloc/box! a
-                      (array FdWorker FD-WORKERS)
-                      (zeroed (array FdWorker FD-WORKERS)))
-        threads
-          (alloc/box! a
-                      (array thread/Thread FD-WORKERS)
-                      (zeroed (array thread/Thread FD-WORKERS)))]
-    (assert (> alone 0))
-    (for i (range 0 FD-WORKERS)
-      (store! (field (index workers i) alone) alone)
-      (assert-eq (thread/Thread::spawn (index threads i)
-                                       (fnptr-of count-child-fds)
-                                       (primitive/cast (ptr i8) (index workers i)))
-                 0))
-    (for i (range 0 FD-WORKERS)
-      (assert-eq (thread/Thread::join (index threads i)) 0))
-    (for i (range 0 FD-WORKERS)
-      (assert-eq (.wrong (index workers i)) 0))
-    (alloc/destroy a threads)
-    (alloc/destroy a workers)))
+(extern pthread_sigmask :cc c [i32 (ptr i8) (ptr i8)] (-> i32))
+
+(extern sigaddset :cc c [(ptr i8) i32] (-> i32))
+
+(deftest a-child-starts-with-no-signals-blocked
+  (let [saved (primitive/alloc-stack (array u64 16))  ; a sigset_t: 128 bytes in glibc
+        blocked (primitive/alloc-stack (array u64 16))
+        set-mask (os/os-pick (: 2 i32) (: 3 i32) (: 3 i32))  ; SIG_SETMASK
+        child (primitive/alloc-stack subprocess/Child)
+        args (primitive/alloc-stack (array (slice u8) 2))]
+    (assert-eq (pthread_sigmask set-mask
+                                (primitive/cast (ptr i8) 0)
+                                (primitive/cast (ptr i8) saved))
+               (: 0 i32))
+    (store! blocked (load saved))
+    (assert-eq (sigaddset (primitive/cast (ptr i8) blocked) (: 15 i32)) (: 0 i32))
+    (assert-eq (pthread_sigmask set-mask
+                                (primitive/cast (ptr i8) blocked)
+                                (primitive/cast (ptr i8) 0))
+               (: 0 i32))
+    (let [spawned (subprocess/Child::spawn (alloc/malloc-allocator)
+                                           child
+                                           "/bin/sh"
+                                           (sh-args args "kill -TERM $$; exit 0")
+                                           (subprocess/null-stdio)
+                                           (subprocess/null-stdio)
+                                           (subprocess/null-stdio))]
+      (pthread_sigmask set-mask
+                       (primitive/cast (ptr i8) saved)
+                       (primitive/cast (ptr i8) 0))
+      (match spawned
+        (Err [_] (assert false))
+        (Ok [_]
+            (do
+              (match (subprocess/Child::wait child)
+                (Ok [status]
+                    (match status
+                      (subprocess/Signaled [signal] (assert-eq signal 15))
+                      (subprocess/Exited [_] (assert false))))
+                (Err [_] (assert false)))
+              (subprocess/Child::close child)
+              0))))))
+
+; A wait with a deadline ends when the child exits, told so by the system, or at
+; the deadline with the child still running.
+
+(defn wait-until-in [(child (ptr subprocess/Child)) (ms i64)] (-> (Result subprocess/ExitStatus subprocess/SubprocessError))
+  (match (time/Duration::millis ms)
+    (Err [_] (Err (subprocess/Timeout)))
+    (Ok [d]
+        (match (time/Instant::from-now d)
+          (Err [_] (Err (subprocess/Timeout)))
+          (Ok [deadline] (subprocess/Child::wait-until child deadline))))))
+
+(deftest a-wait-until-a-deadline-sees-the-exit-or-times-out
+  (let [child (primitive/alloc-stack subprocess/Child)
+        args (primitive/alloc-stack (array (slice u8) 2))]
+    (match (subprocess/Child::spawn (alloc/malloc-allocator)
+                                    child
+                                    "/bin/sh"
+                                    (sh-args args "sleep 10")
+                                    (subprocess/null-stdio)
+                                    (subprocess/null-stdio)
+                                    (subprocess/null-stdio))
+      (Err [_] (assert false))
+      (Ok [_]
+          (do
+            (assert (= (wait-until-in child 20) (Err (subprocess/Timeout))))
+            (match (subprocess/Child::kill-and-wait child)
+              (Ok [status]
+                  (match status
+                    (subprocess/Signaled [signal] (assert-eq signal 9))
+                    (subprocess/Exited [_] (assert false))))
+              (Err [_] (assert false)))
+            (subprocess/Child::close child)
+            0)))
+    (match (subprocess/Child::spawn (alloc/malloc-allocator)
+                                    child
+                                    "/bin/sh"
+                                    (sh-args args "exit 3")
+                                    (subprocess/null-stdio)
+                                    (subprocess/null-stdio)
+                                    (subprocess/null-stdio))
+      (Err [_] (assert false))
+      (Ok [_]
+          (do
+            (match (wait-until-in child 10000)
+              (Ok [status]
+                  (match status
+                    (subprocess/Exited [code] (assert-eq code 3))
+                    (subprocess/Signaled [_] (assert false))))
+              (Err [_] (assert false)))
+            (subprocess/Child::close child)
+            0)))))
 
 ; ==== TCP sockets ====
 
-(defn tcp-cloexec? [(fd i32)] (-> bool)
+;;; Is descriptor `fd` close-on-exec?
+(defn cloexec? [(fd i32)] (-> bool)
   (= (primitive/iand (os/fcntl fd 1) 1) 1))
 
 (defn tcp-timeout-code [] (-> Code)
@@ -1100,11 +1191,11 @@
                                                                  (= (primitive/cast i64
                                                                                     (load input))
                                                                     42)
-                                                                 (tcp-cloexec? (load (field listener
+                                                                 (cloexec? (load (field listener
                                                                                             fd)))
-                                                                 (tcp-cloexec? (load (field client
+                                                                 (cloexec? (load (field client
                                                                                             fd)))
-                                                                 (tcp-cloexec? (load (field server
+                                                                 (cloexec? (load (field server
                                                                                             fd))))
                                                             (if timeout-ok 0 9)
                                                             8)]
@@ -1287,7 +1378,8 @@
                                                               1))
       (Err [_] 1)
       (Ok [_]
-          (do
+          (let [cloexec (and (cloexec? (load (field subscription read-fd)))
+                             (cloexec? (load (field subscription write-fd))))]
             (os/kill (os/getpid) 10)
             (match (time/Duration::seconds 1)
               (Err [_] 2)
@@ -1307,7 +1399,7 @@
                           (match (read subscription)
                             (Err [_] 4)
                             (Ok [number]
-                                (let [result (if (= number 10) 0 5)]
+                                (let [result (cond (not cloexec) 6 (= number 10) 0 :else 5)]
                                   (close! subscription)
                                   result)))))))))))))
 
