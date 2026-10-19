@@ -400,12 +400,13 @@ New API this project added (all shipped):
   reference such as `wb/Box` resolves to its module too, even when `Box` is defined in
   several. `tests/meta/run_code_main_decls.coil` lists the records of a module's method
   calls.
-- **`(primitive/model-status)` → `:complete`, `:partial`, or `:none`** — whether the
-  model the transform is reading is of a program that fully checks, one that partly
-  checks, or no model at all. A transform that must only see valid programs checks
-  for `:complete`.
-- **`(primitive/check-error NODE)` → the checker's message, or `:none`** — the error
-  located exactly at NODE in a partial model. A dialect transform uses it to find the
+- **`(primitive/model-status)` → a `primitive/ModelStatus`**: `(ModelComplete)`,
+  `(ModelPartial)` or `(NoModel)` — whether the model the transform is reading is of
+  a program that fully checks, one that partly checks, or no model at all. A
+  transform that must only see valid programs matches `primitive/ModelComplete`.
+- **`(primitive/check-error NODE)` → a `primitive/CheckOutcome`**: `(FailsAt MESSAGE)`
+  with the checker's message, a string, for the error located exactly at NODE in a
+  partial model, or `(ChecksClean)`. A dialect transform uses it to find the
   expressions that do not check yet, and why, and rewrite exactly those; together with
   `type-of` on their subexpressions it can make type-directed rewrites of code that is
   not valid Coil until rewritten.

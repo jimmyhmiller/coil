@@ -14,7 +14,8 @@
 #   * staged metacompilation: a staged entry whose native result resumes into a
 #     second increment, none of which reaches the runtime binary;
 #   * transforms and checkers: macros inside macro bodies, a transform that adds
-#     a definition running beside the identity transform, the same code run at
+#     a definition running beside the identity transform (and checks the model
+#     status and check errors it reads before and after), the same code run at
 #     compile time and at run time, and a checker keyed on binding identity;
 #   * lint --fix against a concurrent editor: a checker that edits its target
 #     mid-analysis, whose edit must survive the run.
