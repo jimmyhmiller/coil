@@ -44,7 +44,7 @@ except where noted):
   skipped on ELF (DWARF lives in the executable).
 - **`codegen.coil`** — **real x86-64 bug fix**: the SysV classifier's `abi-flatten`
   re-derived field offsets by natural alignment, mis-placing every field of a
-  `:layout packed`/`:layout explicit` struct (packed `{u8 i64}` put `b` at offset 8
+  `:layout (layout/Packed)`/`:layout (layout/Explicit)` struct (packed `{u8 i64}` put `b` at offset 8
   in a 9-byte struct and aborted the build). Flattening now walks the struct's REAL
   layout (`abi-flatten-cs`: `LLVMOffsetOfElement` for LC/packed bodies, declared
   `:at` offsets for explicit ones). Invisible on arm64 (AAPCS64 never flattens

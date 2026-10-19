@@ -326,6 +326,21 @@ section_check() {
   # conflicting case, another register class, is a diag golden).
   printf '(module extern-width)\n(import "coil.fs" :as fs)\n(extern mkdir :cc c [(ptr i8) i32] (-> i32))\n(defn main [] (-> i64) (mkdir c"/nonexistent-coil-dir/x" 448) 0)\n' > "$T/extern-width.coil"
   expect_rc 0 "an extern may redeclare a library symbol with another integer width" "$COIL" check "$T/extern-width.coil"
+  # A struct's :layout is a coil.layout.Layout value; each mistake is its own
+  # compile, since the first one stops it.
+  local layout_case
+  while IFS='|' read -r layout_case want; do
+    printf '(module layout-case)\n(import "coil.layout" :as layout)\n%s\n(defn main [] (-> i64) 0)\n' "$layout_case" > "$T/layout-case.coil"
+    expect_rc_out 1 "$want" "check: $layout_case" "$COIL" check "$T/layout-case.coil"
+  done <<'EOF'
+(defstruct S :layout packed [(a u8)])|:layout packed is now a coil.layout.Layout value
+(defstruct S :layout (layout/Align 3) [(a u8)])|:layout takes a coil.layout.Layout
+(defstruct S :layout (layout/Packed) [(a :bits 3)])|field 'a' is a bitfield, and only a \(layout/Bits\) struct has them
+(defstruct S :layout (layout/Bits) [(a :bits 3) (b u8)])|field 'b' of a \(layout/Bits\) struct must be a bitfield
+(defstruct S :backing u8 [(a u8)])|:backing applies to a \(layout/Bits\) struct
+(defstruct S :layout (layout/Packed) :size 8 [(a u8)])|:size and :align apply to a \(layout/Explicit\) struct
+(defsum Mine (Packed))\n(defstruct S :layout (Packed) [(a u8)])|:layout value has type layout-case.Mine but expected coil.layout.Layout
+EOF
 }
 
 # ---------------------------------------------------------------------------
@@ -1003,7 +1018,7 @@ section_cimport() {
 (callback (fnptr c [(ptr i8)] void))
 (chain (fnptr c [i8] (fnptr c [f64] i32)))
 (extern coil_get_loader :cc c [] (-> (fnptr c [(ptr i8) (ptr i32)] (ptr u8))))
-(defstruct coil_uninspectable :layout explicit
+(defstruct coil_uninspectable :layout (coil.layout.Explicit)
 EOF
     expect_rc 0 "the generated bindings check" "$COIL" check "$T/expressions.coil"
   fi
@@ -1034,16 +1049,23 @@ typedef struct { int width; int height; } ReproSize;
 ReproSize repro_size_value(int width, int height);
 typedef union { char bytes[128]; long long wide; } ReproState;
 void repro_state(ReproState *state);
+typedef struct { unsigned low : 3; unsigned high : 5; } ReproBits;
+void repro_bits(ReproBits *bits);
 EOF
   "$COIL" cimport "$T/anon.h" -o "$T/anon.coil" >/dev/null 2>&1
   local anon
   anon=$(cat "$T/anon.coil" 2>/dev/null)
   case "$anon" in
-    *"(defstruct ReproSize [(width i32) (height i32)])"*"(defstruct ReproState :layout explicit :size 128 :align 8 [])"*|\
-    *"(defstruct ReproState :layout explicit :size 128 :align 8 [])"*"(defstruct ReproSize [(width i32) (height i32)])"*)
+    *"(defstruct ReproSize [(width i32) (height i32)])"*"(defstruct ReproState :layout (coil.layout.Explicit) :size 128 :align 8 [])"*|\
+    *"(defstruct ReproState :layout (coil.layout.Explicit) :size 128 :align 8 [])"*"(defstruct ReproSize [(width i32) (height i32)])"*)
       ok "cimport names anonymous records by their typedef" ;;
     *) bad "cimport names anonymous records by their typedef" "$anon" ;;
   esac
+  case "$anon" in
+    *"(defstruct ReproBits :layout (coil.layout.Bits) :backing i32 ["*) ok "cimport lays a bitfield struct out as (coil.layout.Bits)" ;;
+    *) bad "cimport lays a bitfield struct out as (coil.layout.Bits)" "$anon" ;;
+  esac
+  expect_rc 0 "the generated layout bindings check" "$COIL" check "$T/anon.coil"
 
   # :use selects single enumerators and nothing else.
   printf 'enum { COIL_POLL_IN = 1, COIL_POLL_OUT = 4 };\nenum coil_color { COIL_RED, COIL_BLUE = 7 };\n' > "$T/enums.h"

@@ -49,32 +49,33 @@ can't silently pass one where the other is expected.
 9. (extension) **Sum-type tag & niche placement** — where the discriminant
    goes, and niche encodings (`Option<ptr>` is pointer-sized).
 
-## Two tiers, mirroring `:native` vs `:shim`
+## Two tiers, mirroring native vs shim conventions
 
-### Tier 1 — layout *strategies* (the common cases; the `:native` analog)
+### Tier 1 — layout *strategies* (the common cases; the `(cc/Native …)` analog)
 
 ```lisp
-(defstruct Point  :layout c        [(x :i64) (y :i64)])     ; target C ABI layout
-(defstruct Blob   :layout packed   [(tag :i8) (val :i64)])  ; no padding
-(defstruct Line   :layout (align 64) [(a :i64) (b :i64)])   ; cache-line aligned
+(import "coil.layout" :as layout)
+(defstruct Point  :layout (layout/C)        [(x i64) (y i64)])    ; target C ABI layout
+(defstruct Blob   :layout (layout/Packed)   [(tag i8) (val i64)])  ; no padding
+(defstruct Line   :layout (layout/Align 64) [(a i64) (b i64)])     ; cache-line aligned
 ```
 
-- `:c` (default) — natural alignment + padding per the target C ABI. Lowers to a
+- `(layout/C)` (default) — natural alignment + padding per the target C ABI. Lowers to a
   normal LLVM struct; the data layout *is* the C layout. Use for FFI.
-- `:packed` — zero padding. Lowers to an LLVM packed struct `<{…}>`; field
+- `(layout/Packed)` — zero padding. Lowers to an LLVM packed struct `<{…}>`; field
   loads/stores use align-1.
-- `(align N)` — force whole-struct alignment; applied at `alloc`/global and on
+- `(layout/Align N)` — force whole-struct alignment; applied at `alloc`/global and on
   loads/stores.
 
 These compose with generics: the strategy is re-applied per instantiation.
 
-### Tier 2 — `:explicit` (total control; the `:shim` analog)
+### Tier 2 — `(layout/Explicit)` (total control; the `(cc/Shim)` analog)
 
 Every field states its offset; the struct states size and alignment. The
 compiler verifies and emits a realization that hits those bytes exactly.
 
 ```lisp
-(defstruct Elf64Header :layout explicit :size 64 :align 8
+(defstruct Elf64Header :layout (layout/Explicit) :size 64 :align 8
   [(magic    (array i8 4) :at 0)
    (class    :i8          :at 4)
    (encoding :i8          :at 5)
@@ -93,7 +94,7 @@ compiler verifies and emits a realization that hits those bytes exactly.
 ### Bitfields
 
 ```lisp
-(defstruct ControlReg :layout bits :backing i32
+(defstruct ControlReg :layout (layout/Bits) :backing i32
   [(enable   :bits 1)      ; bit 0; numeric widths are unsigned
    (mode     :bits i3)     ; signed bits 1–3
    (channel  :bits 4)      ; bits 4–7
@@ -116,8 +117,8 @@ compiler verifies and emits a realization that hits those bytes exactly.
 ;; per-target layout, exactly like per-arch defcc — macros branch on the target
 (defn defword [(name Code)] (-> Code)
   (if (= (target-pointer-width) 64)
-      `(defstruct ~name :layout c [(lo :i64) ...])
-      `(defstruct ~name :layout c [(lo :i32) ...])))
+      `(defstruct ~name :layout (layout/C) [(lo i64) ...])
+      `(defstruct ~name :layout (layout/C) [(lo i32) ...])))
 ```
 
 ## Access semantics (the one genuinely new rule)
