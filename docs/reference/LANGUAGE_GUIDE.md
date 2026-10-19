@@ -1825,7 +1825,10 @@ every use allows it and its type owns nothing (a cell never runs `Drop`).
 `X86_64`, `Aarch64`, `Riscv32`, `Wasm32` or `Wasm64`. It is a compile-time
 question, asked in a macro, and the macro chooses what to expand to with a
 `match`. A `match` that leaves an architecture out is an error, so every target
-is a choice someone made.
+is a choice someone made. `(target-os)` is the operating system, a
+`coil.core.Os`: `Linux`, `Darwin` (macOS, and iOS, tvOS, watchOS and visionOS,
+which share its userland), `Wasm` (a wasm module's host) or `BareMetal` (a
+`*-none` triple).
 
 ```coil
 (module example.target)
@@ -1841,6 +1844,16 @@ is a choice someone made.
 
 (const POINTER-BITS (pointer-bits))
 
+; Darwin numbers O_CREAT 512; Linux, 64
+(defn o-creat [] (-> Code)
+  (match (target-os)
+    (Darwin [] `512)
+    (Linux [] `64)
+    (Wasm [] `512)
+    (BareMetal [] (primitive/error "bare metal has no files"))))
+
+(const O-CREAT (o-creat))
+
 ; add x0, x0, x1 on AArch64; lea rax, [rdi+rsi] on x86-64
 (defn define-add [(name Code)] (-> Code)
   (match (target-arch)
@@ -1855,12 +1868,12 @@ is a choice someone made.
 (define-add add)
 
 (defn main [] (-> i64)
-  (println "{} {}" POINTER-BITS (add 40 2))
+  (println "{} {} {}" POINTER-BITS (add 40 2) (> O-CREAT 0))
   0)
 ```
 
 ```output
-64 42
+64 42 true
 ```
 
 - `(primitive/machine-code ARCH BYTE…)` is the whole body of a `defn`: the
@@ -1875,7 +1888,9 @@ is a choice someone made.
 - The bytes must be whole instructions (4 bytes each on AArch64, 2 or 4 on
   RISC-V). A call is assumed to read and write any memory. WebAssembly and the
   bytecode interpreter run no machine code.
-- `(arch-name arch)` spells an architecture as a target triple does.
+- `(arch-name arch)` spells an architecture as a target triple does, and
+  `(os-name os)` an operating system (`none` for bare metal). `coil.os`'s
+  `os-pick` takes a form each for Linux, Darwin and wasm, and refuses bare metal.
 
 ## Gotchas
 

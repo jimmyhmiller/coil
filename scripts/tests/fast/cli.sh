@@ -766,12 +766,25 @@ section_cross() {
                               || bad "a cross build links an x86_64 executable" "exit $rc: $out" ;;
       *) bad "a cross build links an x86_64 Mach-O executable" "exit $rc: $out / $kind" ;;
     esac
+    # An Apple embedded target links against its own platform's SDK, not the
+    # host's macOS defaults.
+    if xcrun --sdk iphonesimulator --show-sdk-path >/dev/null 2>&1; then
+      out=$("$COIL" build "$T/seven.coil" -o "$T/simseven" --target arm64-apple-ios18.0-simulator 2>&1); rc=$?
+      kind=$(vtool -show-build "$T/simseven" 2>&1)
+      case "$kind" in
+        *IOSSIMULATOR*) [ "$rc" = 0 ] && ok "an iOS simulator build links for the iOS simulator platform" \
+                                      || bad "an iOS simulator build links for the iOS simulator platform" "exit $rc: $out" ;;
+        *) bad "an iOS simulator build links for the iOS simulator platform" "exit $rc: $out / $kind" ;;
+      esac
+    else
+      echo "  (skip: no iOS simulator SDK)"
+    fi
   else
     echo "  (skip: cross-linking a Mach-O slice needs the macOS toolchain)"
   fi
   # (target-arch) and (target-os) answer for the target, so a compile-time choice
   # on them folds to the target's constant: an exhaustive match on the typed
-  # coil.core.Arch, and a comparison of target-os's symbol.
+  # coil.core.Arch and coil.core.Os.
   cat > "$T/target.coil" <<'EOF'
 (module target-folding)
 (import "coil.primitive" :as primitive)
@@ -783,9 +796,11 @@ section_cross() {
     (Riscv32 [] `4)
     (Wasm64 [] `5)))
 (defn os-code [] (-> Code)
-  (cond (= (primitive/target-os) `linux) `10
-        (= (primitive/target-os) `darwin) `20
-        :else `30))
+  (match (target-os)
+    (Linux [] `10)
+    (Darwin [] `20)
+    (Wasm [] `30)
+    (BareMetal [] `40)))
 (defn main [] (-> i64) (+ (arch-code) (os-code)))
 EOF
   # A backend that cannot lower a program says so where the program asks for it,
@@ -818,8 +833,10 @@ host $([ "$HOST_OS" = Darwin ] && echo "2 20" || echo "3 10")
 wasm32-unknown-unknown 1 30
 x86_64-pc-linux-gnu 3 10
 x86_64-apple-macosx11.0.0 3 20
+arm64-apple-ios18.0 2 20
+arm64-apple-ios18.0-simulator 2 20
 aarch64-unknown-linux-gnu 2 10
-riscv32-unknown-none-elf 4 30
+riscv32-unknown-none-elf 4 40
 EOF
   # Code that runs inside the compiler is compiled for the machine running it.
   # A cross build expands it separately from the program: a function a macro
@@ -922,7 +939,7 @@ EOF
   expect_rc 3 "a generator reads a file with coil.fs" "$COIL" run "$T/phase/sized_main.coil"
   expect_out '\(defn\* data-size \[\] \(-> i64\) 3\)' "a bare-metal program's generator reads a file with coil.fs" \
     "$COIL" expand "$T/phase/sized_main.coil" --target riscv32-unknown-none-elf
-  expect_rc_out 1 "none for the target's operating system, .freebsd." "an OS no choice names is an error, not the host's" \
+  expect_rc_out 1 "coil.core.Os does not name: freebsd" "an OS coil.core.Os does not name is an error, not the host's" \
     "$COIL" check "$T/seven.coil" --target x86_64-unknown-freebsd
 }
 

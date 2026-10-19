@@ -126,15 +126,18 @@ using it pays that layout at each level; it is still correct. `code-copy` and
 - **Fail / branch:** `error` (abort expansion with a message), `target-arch`,
   `target-os`.
 
-`(target-arch)` and `(primitive/target-os)` answer for the platform being
+`(target-arch)` and `(target-os)` answer for the platform being
 **compiled for** — read from the resolved `--target` triple, not probed from the
 machine running the compiler. `target-arch` is a `coil.core` function returning
 the sum `coil.core.Arch` (`X86_64`, `Aarch64`, `Riscv32`, `Wasm32`, `Wasm64`),
 so a choice is an exhaustive `match` and an architecture it leaves out is an
-error; `arch-name` spells one as a triple does. `target-os` is a nullary code op
-yielding `linux`/`darwin`/`wasm`/`none` (`none` is bare metal, a `*-none`
-triple), or the triple's own OS field for an OS Coil does not know. Both answer
-for the host when no `--target` is given.
+error; `arch-name` spells one as a triple does. `target-os` returns the sum
+`coil.core.Os` (`Linux`, `Darwin`, `Wasm`, `BareMetal`; an Apple embedded triple
+such as `arm64-apple-ios18.0` is `Darwin`, a `*-none` triple is `BareMetal`), and
+`os-name` spells one. A triple whose OS `Os` does not name is an error where a
+macro asks. Both answer for the host when no `--target` is given; the
+primitives beneath them, `primitive/target-arch` and `primitive/target-os`,
+yield the same answers as symbols.
 
 That distinction is the whole point, and it is easy to get wrong: a platform
 constant folded at compile time from a *runtime* probe silently records the
