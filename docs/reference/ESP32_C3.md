@@ -37,7 +37,7 @@ Pass `--build-only` to produce these artifacts without starting QEMU:
   `generic-rv32`, features `+m,+c`, static relocation, and ILP32 aggregate ABI
   classification.
 - RV32 pointer-sized layouts and per-function sections for dead-code removal.
-- A real `:lower reset` calling-convention lowering. It publishes `_start` in
+- A real `:lower (cc/Reset)` calling-convention lowering (`coil.cc.Reset`). It publishes `_start` in
   `.text.entry` and guarantees the final transfer out of reset code is a tail
   transfer.
 - Typed linker-symbol addresses, and `coil.arch.riscv/enter!`, which sets the

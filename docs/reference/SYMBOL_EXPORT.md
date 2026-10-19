@@ -220,7 +220,7 @@ existing C-ABI type-checking machinery used for `extern` and
 struct-by-value — that:
 
 1. **Calling convention is C.** The function must use the `c` convention (or a `defcc`
-   whose lowering is `:native` C). A `:shim`/custom-cc function can't be a C export
+   whose lowering is `(coil.cc.Native (coil.cc.C))`). A `coil.cc.Shim`/custom-cc function can't be a C export
    (its ABI isn't the C one). Default-cc functions either must be declared `:cc c` or
    the export errors with a fix-it.
 2. **Types are C-representable.** Parameters and return type must each be one of:

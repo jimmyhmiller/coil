@@ -1879,14 +1879,15 @@ which share its userland), `Wasm` (a wasm module's host) or `BareMetal` (a
 - `(primitive/machine-code ARCH BYTE…)` is the whole body of a `defn`: the
   function is those bytes, then the target's return instruction unless it
   returns `never`. Its `:cc` is the contract. Arguments arrive where the
-  convention puts them and the result leaves there; a `:lower shim` convention
-  pins them to registers of your choosing, and one with no `:ret` carries only
-  functions that return `void` or `never`. Machine code may change only the
-  registers its convention's `:clobber` names. An ordinary body under a `:shim`
-  convention is compiled for C and reached through a trampoline, so that
+  convention puts them and the result leaves there; a `:lower (cc/Shim)`
+  convention (`coil.cc` imported `:as cc`) pins them to registers of your
+  choosing, and one with no `:ret` carries only functions that return `void` or
+  `never`. Machine code may change only the registers its convention's
+  `:clobber` names. An ordinary body under a `(cc/Shim)` convention is compiled
+  for C and reached through a trampoline, so that
   convention's `:clobber` must name every register a C function may change; the
   checker lists any it leaves out.
-- Under a `:lower shim` convention, `:inline (Always)` or `:inline (Hint)` puts
+- Under a `(cc/Shim)` convention, `:inline (Always)` or `:inline (Hint)` puts
   the bytes in each caller instead of a call. The convention is still the
   contract: the caller puts the arguments in `:params`, reads the result from
   `:ret`, and expects every register in `:clobber`, and `:ret`, to have changed.
