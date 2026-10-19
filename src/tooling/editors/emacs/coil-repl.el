@@ -70,9 +70,15 @@ seeing the form that ran is usually worth the line."
 (defconst coil-repl-prompt-regexp "^\\(?:coil> \\|\\.\\.\\.\\.> \\)"
   "The REPL's prompts: top level, and the continuation of an open form.")
 
-(defconst coil-repl--result-terminator "\\(?:\\`\\|\n\\)coil> \\'"
+(defconst coil-repl--result-terminator
+  "\\(?:\\`\\|\n\\)\\(?:\\.\\.\\.\\.> \\)*coil> \\'"
   "A top-level prompt at the very end of the accumulated output.
-Its arrival is what ends the in-flight request.")
+Its arrival is what ends the in-flight request.  A multi-line form leaves
+one `....> ' per continuation line in front of it, and a form that prints
+nothing — an `impl' answers with no `; ok' — puts the prompt on that same
+line rather than a fresh one: `....> ....> coil> '.  Requiring a newline
+there left the request open, and every later answer was then handed to the
+request before it.")
 
 
 ;;; ---------------------------------------------------------------------------

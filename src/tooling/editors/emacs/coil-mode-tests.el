@@ -79,6 +79,24 @@
         (funcall (nth 1 pending) 'older)
         (should (equal reported '(newer)))))))
 
+;; A multi-line form that prints nothing answers `....> ....> coil> ', the
+;; prompt on the continuation line.  It must still end its request, or every
+;; later answer goes to the request before it and is shown nowhere.
+(ert-deftest coil-test-silent-multi-line-form-ends-its-request ()
+  (let* ((answers nil)
+         (request (lambda (text)
+                    (coil-request-create
+                     :text text
+                     :callback (lambda (r) (push (coil-result-output r) answers)))))
+         (coil--connection
+          (coil-connection-create
+           :pending (list (funcall request "(impl Pair\n  (new [] (-> Pair)\n    (Pair :left 0 :right 0)))")
+                          (funcall request "(+ 1 2)")))))
+    (coil--preoutput-filter "....> ....> coil> ")
+    (coil--preoutput-filter "3\r\ncoil> ")
+    (should (equal answers '("3" "")))
+    (should (null (coil-connection-pending coil--connection)))))
+
 (ert-deftest coil-test-indent-definition-body ()
   "A definition's body is two columns in, however long its signature ran."
   (should (equal (coil-test--reindent "\
