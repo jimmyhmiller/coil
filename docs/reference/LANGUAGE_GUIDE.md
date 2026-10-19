@@ -1592,8 +1592,11 @@ Checkers run after type checking, so they can ask what the compiler decided:
 
 - `(primitive/type-of node)` is the inferred type.
 - `(primitive/code-decl call)` is exactly which definition or impl method a call
-  resolved to, even among same-named functions in several modules. Pass the whole
-  call node, not its head symbol.
+  resolved to, even among same-named functions in several modules, a
+  `primitive/DeclAnswer`: `(Declared MODULE KIND NAME SIGNATURE)` with a
+  `primitive/DeclKind` such as `(FunctionDecl)` or `(MethodDecl)`, or
+  `(DeclUnresolved)` or `(DeclAmbiguous)`. Pass the whole call node, not its head
+  symbol.
 - `(primitive/binding-of ref)` identifies a local binding, which distinguishes
   shadowed names.
 - `(primitive/resolve-at node name)` is what the symbol `name` would denote if it

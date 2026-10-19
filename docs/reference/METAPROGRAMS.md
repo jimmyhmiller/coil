@@ -389,23 +389,26 @@ New API this project added (all shipped):
   same checked program and its output still receives the authoritative strict
   resolve/typecheck, but Coil does not execute it a second time to prove a
   fixpoint. Use it only when one traversal is the complete rewrite.
-- **`(primitive/code-decl NODE)` → a declaration record**, read from that authoritative checked
-  program. Every record begins `(decl MODULE KIND QUALIFIED-NAME)`. Functions continue
-  with `[PARAM-TYPE…] RET`. A method's record reads the same with KIND `method`, then
-  adds OWNER-TYPE, the type of the impl the checker chose, and for a trait method the
-  trait; its MODULE is the module that declares that type (`coil.arraylist` for a method
-  of `(ArrayList T)`), and empty for a type no module declares (`i64`, `(ptr T)`).
-  Structs, sums, traits, consts, and externs need no additional fields. The qualified
-  name is the exact identity selected by resolution rather than the spelling used at the
-  call site, including through aliases and import renames. The other possible results
-  are `:unresolved` and `:ambiguous`. **Pass a resolved
+- **`(primitive/code-decl NODE)` → a `primitive/DeclAnswer`**, read from that
+  authoritative checked program: `(Declared MODULE KIND QUALIFIED-NAME SIGNATURE)`,
+  KIND a `primitive/DeclKind` — `(FunctionDecl)`, `(MethodDecl)`, `(StructDecl)`,
+  `(SumDecl)`, `(VariantDecl)` for a construction, `(TraitDecl)`, `(ConstDecl)`,
+  `(ExternDecl)` or `(PrimitiveDecl)`. A function's SIGNATURE is
+  `([PARAM-TYPE…] RET)`. A method's reads the same, then adds OWNER-TYPE, the type of
+  the impl the checker chose, and for a trait method the trait; its MODULE is the
+  module that declares that type (`coil.arraylist` for a method of `(ArrayList T)`),
+  and empty for a type no module declares (`i64`, `(ptr T)`). The other kinds have an
+  empty SIGNATURE. The qualified name is the exact identity selected by resolution
+  rather than the spelling used at the call site, including through aliases and
+  import renames. The other answers are `(DeclUnresolved)` and `(DeclAmbiguous)`.
+  **Pass a resolved
   REFERENCE node and it resolves to the EXACT entity** the checker picked (via node
   identity), unambiguous even when the simple name lives in several modules. This covers
   every resolved reference: **function calls, function-pointer refs (`fnptr-of`), and
-  variant constructions** (which resolve to the owning sum). A bare symbol falls back to
-  a name-based lookup (which reports `:ambiguous` on a cross-module name clash). A type
+  variant constructions** (which resolve to the variant, in its sum's module). A bare symbol falls back to
+  a name-based lookup (which answers `(DeclAmbiguous)` on a cross-module name clash). A type
   reference such as `wb/Box` resolves to its module too, even when `Box` is defined in
-  several. `tests/meta/run_code_main_decls.coil` lists the records of a module's method
+  several. `tests/meta/run_code_main_decls.coil` lists the answers for a module's method
   calls.
 - **`(primitive/model-status)` → a `primitive/ModelStatus`**: `(ModelComplete)`,
   `(ModelPartial)` or `(NoModel)` — whether the model the transform is reading is of
