@@ -341,11 +341,13 @@ New API this project added (all shipped):
   record's head must be its name symbol"*. `tests/meta/safe_dialect.coil`
   shows the shape.
 - **Phase selection.** The two-item registrations keep their semantic behavior: they
-  run after expansion and have access to the checked model. Add `:phase before-expand`
-  to run on the loaded surface syntax instead: `(checker raw-depth :phase
-  before-expand)` or `(transform surface-pass :phase before-expand)`. Syntax transforms
+  run after expansion and have access to the checked model. A phase is a value of
+  `coil.phase.Phase`, written under `(import "coil.phase" :as phase)`. Add
+  `:phase (phase/BeforeExpand)` to run on the loaded surface syntax instead:
+  `(checker raw-depth :phase (phase/BeforeExpand))` or `(transform surface-pass :phase
+  (phase/BeforeExpand))`. Syntax transforms
   reach a fixpoint before syntax checkers run; their output then undergoes normal macro
-  expansion. A transform may instead use `(transform lower :phase after-expand)` to
+  expansion. A transform may instead use `(transform lower :phase (phase/AfterExpand))` to
   see the result of ordinary macro expansion exactly once, before resolution and
   typechecking. Its output goes directly into the semantic pipeline and is not expanded
   again, so it must not rely on newly emitted macro calls. Semantic reflection is empty

@@ -92,6 +92,7 @@ with tempfile.TemporaryDirectory(prefix="coil-generated-tests-", dir=os.environ.
     semantic_path = directory / "semantic-use.coil"
     semantic_path.write_text('''(module generated.semantic-use)
       (import "coil.primitive" :as p)
+      (import "coil.phase" :as phase)
       (defn semantic-base [(context Code)] (-> Code) `21)
       (defn inspect-forms [(forms Code)] (-> i64)
         (if (= (p/code-count forms) 0) 0
@@ -106,7 +107,7 @@ with tempfile.TemporaryDirectory(prefix="coil-generated-tests-", dir=os.environ.
         (if (= (p/code-count modules) 0) `0
           (do (inspect-forms (p/code-rest (p/code-nth modules 0)))
               (inspect-modules (p/code-rest modules)))))
-      (checker inspect-modules :phase before-expand)
+      (checker inspect-modules :phase (phase/BeforeExpand))
       (export semantic-base)
     ''')
     semantic_state = (state[0], state[1], state[2].replace('i64 21)', 'i64 (semantic-base `0))'))
@@ -258,12 +259,13 @@ with tempfile.TemporaryDirectory(prefix="coil-generated-tests-", dir=os.environ.
 
     # A per-unit transform may inspect the unit and leave imported declarations
     # alone; a before-expand transform must not alter another unit's interface.
-    identity_transform = '(defn identity-transform [(modules Code)] (-> Code) `(do ~@modules)) (transform identity-transform :phase before-expand) '
+    identity_transform = '(import "coil.phase" :as phase) (defn identity-transform [(modules Code)] (-> Code) `(do ~@modules)) (transform identity-transform :phase (phase/BeforeExpand)) '
     typed_interface = interface.replace("(export generated_value)", "(defstruct Sample [(value i64)]) (export Sample generated_value)")
     typed_body = '(module generated.value) (defn generated_value [] (-> i64) (let [sample (Sample :value 42)] (.value sample)))'
     layout_interface = typed_interface.replace("[(value i64)]", "[(value i64) (padding i64)]")
     layout_body = typed_body.replace("(Sample :value 42)", "(Sample :value 42 :padding 17)")
     owner_transform = '''
+    (import "coil.phase" :as phase)
     (defn change-layout [(forms Code)] (-> Code)
       (if (= (primitive/code-count forms) 0) `()
         (let [f (primitive/code-nth forms 0)]
@@ -282,7 +284,7 @@ with tempfile.TemporaryDirectory(prefix="coil-generated-tests-", dir=os.environ.
           `((~(primitive/code-nth m 0) ~@(change-layout (primitive/code-rest m)))
             ~@(change-owned-modules (primitive/code-rest modules))))))
     (defn owner-layout-transform [(modules Code)] (-> Code) `(do ~@(change-owned-modules modules)))
-    (transform owner-layout-transform :phase after-expand)
+    (transform owner-layout-transform :phase (phase/AfterExpand))
     '''
     provider([("generated.value", layout_interface, layout_body + identity_transform)], facade_value)
     invoke("run", "--quiet", expected=42)

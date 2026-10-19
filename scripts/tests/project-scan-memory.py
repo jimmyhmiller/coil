@@ -115,6 +115,7 @@ def project_scan(compiler: str, work: Path) -> None:
 
 MAGIC = """(module app.magic)
 (import "coil.primitive" :as primitive)
+(import "coil.phase" :as phase)
 
 (defn magic-call? [(f Code)] (-> bool)
   (and (primitive/code-list? f) (= (len f) 1) (= (get f 0) `magic)))
@@ -135,7 +136,7 @@ MAGIC = """(module app.magic)
     (for m modules (push! (mut out) (rewrite m)))
     `(~@out)))
 
-(transform desugar-magic :phase after-expand)
+(transform desugar-magic :phase (phase/AfterExpand))
 """
 META_MAIN = """(module app.main)
 (import "coil.primitive" :as primitive)

@@ -1671,7 +1671,8 @@ A module that does `(import "myapp.inc")` can now write `(inc (inc 40))`.
 Transforms run until the program stops changing, and Coil type-checks the program
 again after each round. A transform may receive code that doesn't type-check yet;
 that is how `inc` becomes valid. Checkers run afterwards, once.
-`:phase before-expand` runs a checker or transform on the source before macro
+`:phase (phase/BeforeExpand)`, a `coil.phase.Phase` value under `(import
+"coil.phase" :as phase)`, runs a checker or transform on the source before macro
 expansion; see [METAPROGRAMS.md](METAPROGRAMS.md) for phases, `transform-once`, and
 the full reflection API.
 

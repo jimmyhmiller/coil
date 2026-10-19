@@ -345,6 +345,16 @@ section_check() {
 (defsum T :inline (Always) (A))|annotation ':inline' applies to functions, not types
 (import "coil.jit.lifetime")\n(defsum T :jit/retain 1 (A))|annotation ':jit/retain' value
 EOF
+  # A registration's :phase is a coil.phase.Phase value, resolved where it is
+  # written; any spelling of it works and nothing else does.
+  printf '(module phase-case)\n(import "coil.phase" :as p)\n(defn pass [(m Code)] (-> Code) `(do ~@m))\n(transform pass :phase (p/BeforeExpand))\n(defn main [] (-> i64) 7)\n' > "$T/phase-alias.coil"
+  expect_rc 7 "a transform's :phase may be written through any alias of coil.phase" "$COIL" run "$T/phase-alias.coil"
+  printf '(module phase-case)\n(defn pass [(m Code)] (-> Code) `(do ~@m))\n(transform pass :phase before-expand)\n(defn main [] (-> i64) 0)\n' > "$T/phase-old.coil"
+  expect_rc_out 1 "transform: :phase takes a coil.phase.Phase" "a :phase that is not a coil.phase.Phase is an error" \
+    "$COIL" check "$T/phase-old.coil"
+  printf '(module phase-case)\n(import "coil.phase" :as phase)\n(defn lint [(m Code)] (-> Code) `0)\n(checker lint :phase (phase/AfterExpand))\n(defn main [] (-> i64) 0)\n' > "$T/phase-checker.coil"
+  expect_rc_out 1 "checker: a checker's :phase is \\(phase/BeforeExpand\\), or none" "a checker runs before expansion or on the checked program" \
+    "$COIL" check "$T/phase-checker.coil"
   # A module's imports govern its own code wherever that code is: an impl method,
   # a constant's value, a static assertion's condition. None of their names says
   # which module it is, and reading one off the entry file let a module's
