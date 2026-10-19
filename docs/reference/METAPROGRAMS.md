@@ -295,33 +295,38 @@ New API this project added (all shipped):
   typechecks.
 - **Authored references in lint profiles.** `coil.meta` joins original source
   syntax to resolver evidence, including macro heads before expansion. In a
-  semantic checker loaded with `coil lint --use`, `meta/source-modules` returns
-  original module records, `meta/imports MODULE` returns editable import records,
-  and `meta/references MODULE` returns authored reference occurrences. Use
-  `meta/reference-node`, `meta/reference-role`, and `meta/reference-binding` to
-  read a reference. Bindings are `(global QUALIFIED-NAME)`, `(local ID)`,
-  `:unknown`, or `:ambiguous`; a local lacking a unique checked identity contains
-  `:unknown` or `:ambiguous` instead of an ID. `meta/source-binding NODE` is strict
-  occurrence lookup: a newly constructed symbol never acquires a binding from its
-  spelling. Source queries outside this lint phase return `:unavailable`. The
-  evidence covers the files the user wrote, which are the only ones a fix can
-  edit: a bundled library module has no reference records, and a binding asked
-  of its syntax is `:unknown`.
+  semantic checker loaded with `coil lint --use`, `meta/source-modules` answers
+  original module records, `meta/imports MODULE` editable import records, and
+  `meta/references MODULE` authored reference occurrences, each as a
+  `primitive/SourceView`: `(SourceIs RECORDS)`, or `(SourceUnavailable)` outside
+  this lint phase. Use `meta/reference-node`, `meta/reference-role`, and
+  `meta/reference-binding` to read a reference. A binding is a
+  `primitive/SourceBinding`: `(BindsGlobal QUALIFIED-NAME)`, `(BindsLocal ID)`,
+  `(LocalUnknown)` or `(LocalAmbiguous)` for a local lacking a unique checked
+  identity, `(BindingUnknown)`, or `(BindingAmbiguous)`. `meta/source-binding NODE`
+  is strict occurrence lookup: a newly constructed symbol never acquires a binding
+  from its spelling. The evidence covers the files the user wrote, which are the
+  only ones a fix can edit: a bundled library module has no reference records, and
+  a binding asked of its syntax is `(BindingUnknown)`.
 
   `meta/references-through IMPORT` selects references resolved through that
   import's facade. `meta/reference-import` and `meta/reference-exported-name`
   preserve that route separately from canonical ownership, including renames and
-  reexports. `meta/import-node` and `meta/import-target` expose the declaration
-  and its resolved module namespace.
+  reexports, as `(Some NAME)` when the reference resolved through an import and
+  `(None)` when it did not. `meta/import-node` and `meta/import-target` expose the
+  declaration and its resolved module namespace.
 
-  `meta/qualify-import IMPORT ALIAS MODE` produces `(edits (edit NODE REPLACEMENT) …)`
-  or `(refused "reason")`. MODE is `` `strict `` or `` `assume-no-shadow ``: strict
+  `meta/qualify-import IMPORT ALIAS MODE` answers a `primitive/ImportPlan`:
+  `(PlanEdits EDITS)`, EDITS a list of `(edit NODE REPLACEMENT)`, or
+  `(PlanRefused "reason")`. MODE is `` `strict `` or `` `assume-no-shadow ``: strict
   refuses when a quasiquote template names something the import supplies, since
   nothing records how a template's bare name binds; `assume-no-shadow` rewrites
   those names as references to the import, which is right unless the template binds
   the same spelling itself. `coil.lint.import-aliases` selects it with
-  `--lint-param coil.lint.import-aliases.assume-no-shadow=true`. `meta/suggest-edits PLAN MESSAGE` submits the entire
-  plan as a coordinated lint suggestion group; writing still requires `--fix`.
+  `--lint-param coil.lint.import-aliases.assume-no-shadow=true`. `meta/suggest-edits EDITS MESSAGE` submits a
+  plan's edits as one coordinated lint suggestion group and answers a
+  `primitive/Suggestion`, `(Suggested)` or `(SuggestionRefused)`; writing still
+  requires `--fix`.
   Qualification refuses incomplete evidence, alias conflicts, names inspected by
   macros, repeated imports of one module, and imports that reexport their target.
   Inert quoted data is excluded. Generic type occurrences whose identity cannot

@@ -719,6 +719,33 @@ EOF
   cmp -s "$T/value-use.orig" "$T/value-use.coil" \
     && ok "a file with a removed name it cannot rewrite is left as it was" \
     || bad "a file with a removed name it cannot rewrite is left as it was" "$(cat "$T/value-use.coil")"
+
+  # The authored-source view (coil.meta's source-modules, imports, references and
+  # their bindings): import-aliases plans a qualification and suggests it as one
+  # group, and unused tells an import a reference resolved through from one
+  # nothing did.
+  printf '(module star-probe)\n(import "coil.str" :use *)\n(defn main [] (-> i64)\n  (if (starts-with "hello" "he") 0 1))\n' > "$T/star-probe.coil"
+  diff_out=$("$COIL" lint "$T/star-probe.coil" --use coil.lint.import-aliases --diff 2>&1); rc=$?
+  case "$diff_out" in
+    *'+(import "coil.str" :as str)'*'+  (if (str/starts-with "hello" "he") 0 1))'*)
+      ok "import-aliases qualifies a wildcard import's references" ;;
+    *) bad "import-aliases qualifies a wildcard import's references" "exit $rc: $diff_out" ;;
+  esac
+  mkdir -p "$T/unused-imports/ui"
+  printf '[package]\nname = "ui"\nentry = "ui/main.coil"\nsource-roots = ["."]\n' > "$T/unused-imports/Coil.toml"
+  printf '(module ui.h)\n(defn f [] (-> i64) 1)\n(defn g [] (-> i64) 2)\n' > "$T/unused-imports/ui/h.coil"
+  printf '(module ui.k)\n(defn kk [] (-> i64) 3)\n' > "$T/unused-imports/ui/k.coil"
+  printf '(module ui.main)\n(import "ui.h" :use [f g])\n(import "ui.k" :as k)\n(defn main [] (-> i64) (f))\n' > "$T/unused-imports/ui/main.coil"
+  local out
+  out=$(cd "$T/unused-imports" && "$COIL" lint ui/main.coil --use coil.lint.unused 2>&1); rc=$?
+  case "$out" in
+    *"refers to this imported name"*"ui/main.coil:2:24"*"binds nothing the module refers to"*"ui/main.coil:3:1"*)
+      case "$out" in
+        *"ui/main.coil:2:22"*) bad "unused reports the imports nothing resolved through" "the used name f was reported: $out" ;;
+        *) ok "unused reports the imports nothing resolved through" ;;
+      esac ;;
+    *) bad "unused reports the imports nothing resolved through" "exit $rc: $out" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
