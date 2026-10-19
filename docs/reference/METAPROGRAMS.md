@@ -109,11 +109,13 @@ using it pays that layout at each level; it is still correct. `code-copy` and
 - **Bytes ↔ names:** `(primitive/int->str N)` → the integer's decimal as a `(slice u8)`, so a
   name minted from a counter/index is one call; `(primitive/str-bytes S)` → a Code list of a
   string's byte values; `(primitive/bytes->str LIST)` → the inverse (list of ints → string).
-- **Reflect on types:** `code-type-shape` safely classifies a type as `struct`,
-  `sum`, or `unknown`; `code-type-traits` lists the traits a type implements (their
-  qualified names, generic impls included when their bounds hold, so
-  `(Option S)` lists Debug only when `S` has it) — ask it of a type as `type-of` reports
-  it, in a checker or semantic transform, where the checked program exists;
+- **Reflect on types:** `code-type-shape` safely classifies a type, answering a
+  `primitive/TypeShape`: `(StructShape)`, `(SumShape)` or `(UnknownShape)`;
+  `code-type-traits` answers a `primitive/Traits`, `(TraitsAre NAMES)` with the
+  traits a type implements (their qualified names, generic impls included when
+  their bounds hold, so `(Option S)` lists Debug only when `S` has it) — ask it of a
+  type as `type-of` reports it, in a checker or semantic transform, where the
+  checked program exists, and it answers `(TraitsUnknown)` anywhere else;
   `code-field-count/name/kind/type`, `code-variant-*`
   (including `code-variant-field-name`/`-type`, which reflect a variant's
   PAYLOAD fields by `(SUM VARIANT-INDEX FIELD-INDEX)` — the type comes back
