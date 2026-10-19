@@ -377,7 +377,7 @@ New API this project added (all shipped):
   failing expression gets an internal error type, every error is recorded (a failure
   caused only by an earlier one is not reported again), and all subexpressions that
   do not depend on a failure keep their real types and resolutions. Only nodes the
-  checker could not establish answer `:unknown`/`:unresolved`; an expression whose
+  checker could not establish answer `(TypeUnknown)`/`(DeclUnresolved)`; an expression whose
   own type depends on a failed child, such as `(.x (.origin r))` when `.origin` fails,
   gets its type once a fixpoint round has rewritten that child. When resolution itself fails
   there is no model and the transform rewrites purely syntactically (e.g.
@@ -420,8 +420,9 @@ New API this project added (all shipped):
   expressions that do not check yet, and why, and rewrite exactly those; together with
   `type-of` on their subexpressions it can make type-directed rewrites of code that is
   not valid Coil until rewritten.
-- **`(primitive/type-of NODE)` → the expression's inferred type** as `Code` (e.g. `i64`,
-  `(ptr i64)`), or `:unknown`. This is the type the real type-checker inferred, not
+- **`(primitive/type-of NODE)` → the expression's inferred type**, a
+  `primitive/TypeAnswer`: `(TypeIs TYPE)` with TYPE as `Code` (e.g. `i64`,
+  `(ptr i64)`), or `(TypeUnknown)`. This is the type the real type-checker inferred, not
   syntax — a call `(getf)` reports `f64` because `getf` returns `f64`. Demo:
   `tests/meta/nofloat.coil` bans floating-point-typed expressions.
 - **`(primitive/code-file NODE)` → the source file name** of a node, and **`(primitive/code-from-user? NODE)`
