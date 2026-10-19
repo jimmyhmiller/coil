@@ -428,11 +428,16 @@ New API this project added (all shipped):
   macro's expansion (in a checker, a transform or compiled code) it is an error.
 - **Asking the compiler about the program.** A checker or transform can ask the
   compiler what the program is, for instance to describe it to another unit (a JIT
-  session inside the program, say). `coil.meta` wraps each query:
+  session inside the program, say). `coil.meta` wraps each query, and each answers
+  a `primitive/ProgramAnswer`: `(Answer VALUE)`, `(NotInProgram)` for a name the
+  program does not define, or `(NoProgram)` where there is no checked program;
+  `(meta/answered ANSWER)` is VALUE, or a compile error for the other two.
   `(meta/modules)` lists every module, the library's included;
   `(meta/definitions M)` lists M's definitions as qualified symbols;
-  `(meta/definition-kind NAME)` is `:function`, `:macro`, `:generic`, `:def`,
-  `:const`, `:struct`, `:sum`, `:trait`, `:alias` or `:extern`;
+  `(meta/definition-kind NAME)` answers a `primitive/KindAnswer`, `(KindIs KIND)`
+  with a `primitive/DefinitionKind` — `(Function)`, `(Macro)`, `(Generic)`,
+  `(Def)`, `(Const)`, `(Struct)`, `(Sum)`, `(Trait)`, `(Alias)` or `(Extern)` — or
+  `(KindNotInProgram)` or `(KindNoProgram)`;
   `(meta/declaration NAME)` is the form that declares NAME to another unit: a
   `declare` of a function's exact signature (an aggregate parameter is spelled
   `(ref T)`, as `fnptr-of` types it) or of a `def`'s storage, a record or sum with
@@ -441,7 +446,7 @@ New API this project added (all shipped):
   `(meta/module-header M)` and `(meta/module-impls M)` are its
   `module`/`import`/`export` and `impl`/`derive` forms; `(meta/annotations NAME)`
   is the `:key value` pairs NAME's `defn` or `def` carries, as one list (empty if
-  it has none, `:unresolved` if the program has no such definition), which is how
+  it has none), which is how
   a transform finds the definitions an annotation marks; `(meta/toolchain)` names
   the compiler and target the declarations assume; `(meta/source CODE)` renders any
   form as text. `(meta/embed-text MODULES HOST NAME TEXT)` adds a function `(NAME)`
