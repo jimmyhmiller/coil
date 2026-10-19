@@ -73,7 +73,7 @@ allns() {
     echo '(module allns)'
     i=0
     while read -r ns; do
-      case "$ns" in ""|coil.core|coil.jit|coil.jit.reload) continue ;; esac
+      case "$ns" in ""|coil.core|coil.jit|coil.jit.reload|coil.arch.*) continue ;; esac
       i=$((i + 1))
       echo "(import \"$ns\" :as ns$i)"
     done < "$T/ns.txt"
@@ -83,6 +83,19 @@ allns() {
   [ "$count" -ge 40 ] && ok "$count namespaces to import" || bad "a plausible namespace list" "got $count"
   expect_rc 0 "every advertised namespace compiles from the install, outside the checkout" \
     bash -c 'cd "$1" && env -u COIL_NAMESPACE_ROOTS "$2" check allns.coil' _ "$T" "$COIL"
+  # An architecture's own module is machine code for that architecture, which a
+  # build for any other refuses, so it is checked in a build for its own.
+  local arch_ns triple
+  while read -r arch_ns; do
+    case "$arch_ns" in
+      coil.arch.riscv) triple=riscv32-unknown-none-elf ;;
+      coil.arch.*) bad "a target to check $arch_ns for" "name its triple in installed-toolchain.sh"; continue ;;
+      *) continue ;;
+    esac
+    printf '(module archns)\n(import "%s" :as arch)\n(defn main [] (-> i64) 0)\n' "$arch_ns" > "$T/archns.coil"
+    expect_rc 0 "$arch_ns compiles from the install for $triple" \
+      bash -c 'cd "$1" && env -u COIL_NAMESPACE_ROOTS "$2" check archns.coil --target "$3"' _ "$T" "$COIL" "$triple"
+  done < "$T/ns.txt"
 }
 
 jit_sdk() {

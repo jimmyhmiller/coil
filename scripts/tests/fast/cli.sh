@@ -770,15 +770,18 @@ section_cross() {
     echo "  (skip: cross-linking a Mach-O slice needs the macOS toolchain)"
   fi
   # (target-arch) and (target-os) answer for the target, so a compile-time choice
-  # on them folds to the target's constant.
+  # on them folds to the target's constant: an exhaustive match on the typed
+  # coil.core.Arch, and a comparison of target-os's symbol.
   cat > "$T/target.coil" <<'EOF'
 (module target-folding)
 (import "coil.primitive" :as primitive)
 (defn arch-code [] (-> Code)
-  (cond (= (primitive/target-arch) `wasm32) `1
-        (= (primitive/target-arch) `aarch64) `2
-        (= (primitive/target-arch) `x86_64) `3
-        :else `4))
+  (match (target-arch)
+    (Wasm32 [] `1)
+    (Aarch64 [] `2)
+    (X86_64 [] `3)
+    (Riscv32 [] `4)
+    (Wasm64 [] `5)))
 (defn os-code [] (-> Code)
   (cond (= (primitive/target-os) `linux) `10
         (= (primitive/target-os) `darwin) `20
@@ -816,6 +819,7 @@ wasm32-unknown-unknown 1 30
 x86_64-pc-linux-gnu 3 10
 x86_64-apple-macosx11.0.0 3 20
 aarch64-unknown-linux-gnu 2 10
+riscv32-unknown-none-elf 4 30
 EOF
   # Code that runs inside the compiler is compiled for the machine running it.
   # A cross build expands it separately from the program: a function a macro

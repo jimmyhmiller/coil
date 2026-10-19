@@ -40,12 +40,14 @@ Pass `--build-only` to produce these artifacts without starting QEMU:
 - A real `:lower reset` calling-convention lowering. It publishes `_start` in
   `.text.entry` and guarantees the final transfer out of reset code is a tail
   transfer.
-- Typed linker-symbol addresses and writes to the RISC-V `sp` and `gp` registers.
+- Typed linker-symbol addresses, and `coil.arch.riscv/enter!`, which sets the
+  RISC-V `sp` and `gp` registers and jumps to the runtime entry.
 - Coil startup loops that copy `.data` from flash and clear `.bss` in SRAM.
 - Typed volatile load/store and sequentially-consistent fence operations; the
   MMIO register macro no longer embeds LLVM IR.
-- Directly encoded RV32 helpers for named CSR reads/writes, `wfi`, and `mret`.
-  These are machine words emitted by Coil's code generator, not inline assembly.
+- `coil.arch.riscv`: named CSR reads and writes, `wfi`, `mret` and `enter!`, as
+  machine-code functions whose RV32 instructions the library encodes. Nothing
+  RISC-V-specific is built into the compiler, and there is no inline assembly.
 - UART output through the ESP32-C3 UART0 FIFO/status MMIO registers. The boot
   proof no longer calls an ESP ROM output routine.
 - A direct-boot linker layout for IROM, DROM, SRAM, global pointer, and stack.

@@ -73,7 +73,7 @@ toolchain), and `$COIL_TEST_SCRATCH`, a directory the harness removes afterwards
 | Steps | What they run | Where |
 |---|---|---|
 | `examples/*` | the ten example packages: build, run six on their data, `coil test` each, arm64 tests for two, huffman under `coil.safety`, `fmt --check` | `scripts/tests/fast/examples.py`, `examples/` |
-| `corpus/*` | eight self-checking programs on arm64, LLVM and the interpreter, two under `coil.safety`, three with the interpreted metaprogram engine | `scripts/oracle.py corpus`, `tests/corpus/` |
+| `corpus/*` | nine self-checking programs on arm64, LLVM and the interpreter (which refuses the machine-code one), two under `coil.safety`, three with the interpreted metaprogram engine | `scripts/oracle.py corpus`, `tests/corpus/` |
 | `diag/*` | compile errors (many per file), link errors, compiles that must stop and say so, byte-exact | `scripts/oracle.py diag`, `tests/diag/` |
 | `cli/*` | the command-line contract, one step per area | `scripts/tests/fast/cli.sh`, `tests/cli/` |
 | `projects` | one package using every `Coil.toml` feature, a workspace, a hermetic profile, prebuilt units | `scripts/tests/fast/projects.sh`, `tests/projects/` |

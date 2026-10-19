@@ -126,13 +126,15 @@ using it pays that layout at each level; it is still correct. `code-copy` and
 - **Fail / branch:** `error` (abort expansion with a message), `target-arch`,
   `target-os`.
 
-`(primitive/target-arch)` and `(primitive/target-os)` are nullary code ops that answer for the
-platform being **compiled for** — read from the resolved `--target` triple, not
-probed from the machine running the compiler. `target-arch` yields
-`aarch64`/`x86_64`/`wasm32`/`wasm64`/`riscv32`; `target-os` yields
-`linux`/`darwin`/`wasm`/`none` (`none` is bare metal, a `*-none` triple), or
-the triple's own OS field for an OS Coil does not know. Both answer for the host
-when no `--target` is given.
+`(target-arch)` and `(primitive/target-os)` answer for the platform being
+**compiled for** — read from the resolved `--target` triple, not probed from the
+machine running the compiler. `target-arch` is a `coil.core` function returning
+the sum `coil.core.Arch` (`X86_64`, `Aarch64`, `Riscv32`, `Wasm32`, `Wasm64`),
+so a choice is an exhaustive `match` and an architecture it leaves out is an
+error; `arch-name` spells one as a triple does. `target-os` is a nullary code op
+yielding `linux`/`darwin`/`wasm`/`none` (`none` is bare metal, a `*-none`
+triple), or the triple's own OS field for an OS Coil does not know. Both answer
+for the host when no `--target` is given.
 
 That distinction is the whole point, and it is easy to get wrong: a platform
 constant folded at compile time from a *runtime* probe silently records the
