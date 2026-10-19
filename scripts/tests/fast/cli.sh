@@ -345,6 +345,14 @@ section_check() {
 (defsum T :inline (Always) (A))|annotation ':inline' applies to functions, not types
 (import "coil.jit.lifetime")\n(defsum T :jit/retain 1 (A))|annotation ':jit/retain' value
 EOF
+  # A register's :access is a coil.mmio.Access, decided by what its constructor
+  # names, not by how it is spelled.
+  printf '(module mmio-case)\n(import "coil.mmio" :as mmio)\n(defsum Mine (ReadOnly))\n(mmio/defmmio-reg R :address 0 :type u32 :access (ReadOnly) [])\n(defn main [] (-> i64) 0)\n' > "$T/mmio-own.coil"
+  expect_rc_out 1 "defmmio-reg: :access takes a coil.mmio.Access" "an :access constructor of another sum is refused" \
+    "$COIL" check "$T/mmio-own.coil"
+  printf '(module mmio-case)\n(import "coil.mmio" :as mmio)\n(mmio/defmmio-reg R :address 0 :type u32 :read-only [])\n(defn main [] (-> i64) 0)\n' > "$T/mmio-old.coil"
+  expect_rc_out 1 "defmmio-reg: expected NAME :address ADDRESS :type TYPE :access ACCESS" "the old access keyword names the :access option" \
+    "$COIL" check "$T/mmio-old.coil"
   # A registration's :phase is a coil.phase.Phase value, resolved where it is
   # written; any spelling of it works and nothing else does.
   printf '(module phase-case)\n(import "coil.phase" :as p)\n(defn pass [(m Code)] (-> Code) `(do ~@m))\n(transform pass :phase (p/BeforeExpand))\n(defn main [] (-> i64) 7)\n' > "$T/phase-alias.coil"

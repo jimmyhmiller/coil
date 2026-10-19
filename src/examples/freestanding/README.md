@@ -101,7 +101,7 @@ a snapshot type, computed snapshot fields, and the permitted I/O trait impls:
 (import "coil.mmio" :as mmio)
 
 (mmio/defmmio-reg GPIO_IN
-  :address 0x6000403C :type u32 :read-only
+  :address 0x6000403C :type u32 :access (mmio/ReadOnly)
   [(boot-button :bit 9)
    (mode :bits [12 3])])
 
@@ -109,8 +109,8 @@ a snapshot type, computed snapshot fields, and the permitted I/O trait impls:
   (.boot-button gpio)) ; bool; no additional hardware read
 ```
 
-`:type` is `u8`, `u16`, `u32`, or `u64`; the access mode is `:read-only`,
-`:write-only`, or `:read-write`. `:bit` produces a boolean field; `:bits` takes
+`:type` is `u8`, `u16`, `u32`, or `u64`; `:access` is a `coil.mmio.Access`:
+`(mmio/ReadOnly)`, `(mmio/WriteOnly)`, or `(mmio/ReadWrite)`. `:bit` produces a boolean field; `:bits` takes
 `[offset width]` and produces a field of the register's unsigned type. Overlapping
 fields are allowed as alternate views. Offsets and widths must be literal
 integers within the register. Literal addresses must be nonnegative and aligned
@@ -126,7 +126,7 @@ A writable register accepts its unsigned raw type:
 
 ```coil
 (mmio/defmmio-reg UART_DATA
-  :address 0x09000000 :type u32 :write-only [])
+  :address 0x09000000 :type u32 :access (mmio/WriteOnly) [])
 
 (mmio/write! UART_DATA (: 65 u32))
 ```
@@ -149,8 +149,8 @@ are not represented by the static API rename table used by `coil lint --fix`.
 The old declaration is rejected with a migration diagnostic.
 
 - `(defmmio-reg REG address [(flag offset 1)])` becomes
-  `(defmmio-reg REG :address address :type u32 :read-only [(flag :bit offset)])`.
-  Choose `:read-write` or `:write-only` for registers that support those operations.
+  `(defmmio-reg REG :address address :type u32 :access (mmio/ReadOnly) [(flag :bit offset)])`.
+  Choose `(mmio/ReadWrite)` or `(mmio/WriteOnly)` for registers that support those operations.
 - `(REG-read)` becomes `(.bits (mmio/read! REG))` when the caller needs the raw
   integer, or `(mmio/read! REG)` when it needs a snapshot.
 - `(REG-write value)` becomes `(mmio/write! REG value)`.
