@@ -8,7 +8,9 @@
 #     diagnostics for a wrong input count or a target that does not exist;
 #   * hygiene in both directions: identifiers that must connect (quote, a shared
 #     fresh identifier, an alias-qualified template name, a semantic transform's
-#     own binder) and ones that must not (three captures reported in one run),
+#     own binder, the trait a `derive` names, a reflected type) and ones that
+#     must not (three captures reported in one run, a module's own trait named
+#     like core's, a reflected type of a module not imported),
 #     plus a checker suggestion whose replacement must not capture once it is
 #     flattened into source text;
 #   * staged metacompilation: a staged entry whose native result resumes into a
@@ -87,6 +89,23 @@ expect "run: a target that is neither a file nor a namespace" 1 'no such file' "
 
 # ---- hygiene -------------------------------------------------------------------
 expect "hygiene: identifiers that must connect do" 42 '' "$COIL" run $M/hygiene_identity.coil
+
+# A module's own `Eq` is its own trait, not core's: deriving it asks for a deriver
+# of that trait, and none is registered.
+printf '(module mt.own-eq)\n(deftrait Eq [Self] (same? [(a Self) (b Self)] (-> bool)))\n(defstruct P [(x i64)])\n(derive Eq P)\n(defn main [] (-> i64) 0)\n' \
+  > "$WORK/own_eq.coil"
+expect "hygiene: a module's own trait named like core's is not core's" 1 \
+  "no deriver is registered for trait 'mt.own-eq.Eq'" "$COIL" check "$WORK/own_eq.coil"
+
+# A type a metaprogram reflects on is found in the scope it was written in, not
+# by its last segment: a struct of a module that is not imported is not in scope.
+mkdir -p "$WORK/refl"
+printf '(module reflhidden)\n(defstruct Pt [(a i64) (b i64) (c i64)])\n' > "$WORK/refl/reflhidden.coil"
+printf '(module reflapp)\n(import "reflhidden" :as h)\n(import "coil.primitive" :as primitive)\n(defn nfields [(t Code)] (-> Code) `~(primitive/code-field-count t))\n(defn main [] (-> i64) (nfields Pt))\n' \
+  > "$WORK/refl/reflapp.coil"
+expect "hygiene: a reflected type of a module not imported is not in scope" 1 \
+  "'Pt' names no struct or sum in scope in module 'reflapp'; reflhidden.Pt is not imported there" \
+  "$COIL" check "$WORK/refl/reflapp.coil"
 
 out=$("$COIL" check $M/hygiene_capture.coil 2>&1); rc=$?
 case "$rc|$out" in

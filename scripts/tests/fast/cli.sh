@@ -345,6 +345,25 @@ section_check() {
 (defsum T :inline (Always) (A))|annotation ':inline' applies to functions, not types
 (import "coil.jit.lifetime")\n(defsum T :jit/retain 1 (A))|annotation ':jit/retain' value
 EOF
+  # A module's imports govern its own code wherever that code is: an impl method,
+  # a constant's value, a static assertion's condition. None of their names says
+  # which module it is, and reading one off the entry file let a module's
+  # `:exclude` reach the library's impls and miss its own constants.
+  printf '(module refer-impls)\n(import "coil.core" :use * :exclude [=])\n(defn main [] (-> i64) 0)\n' > "$T/refer-impls.coil"
+  expect_rc 0 "check: a module's :exclude does not reach another module's impl methods" \
+    "$COIL" check "$T/refer-impls.coil"
+  printf '(module refer-assert)\n(import "coil.core" :use * :exclude [<])\n(static-assert (< 1 2) "excluded")\n(defn main [] (-> i64) 0)\n' > "$T/refer-assert.coil"
+  expect_rc_out 1 "trait method '<' is not in scope" "check: an excluded operator is not in scope in a static assertion" \
+    "$COIL" check "$T/refer-assert.coil"
+  printf '(module refer-length)\n(import "coil.primitive" :as primitive)\n(import "coil.core" :use * :exclude [<])\n(const N (if (< 1 2) 3 4))\n(defstruct Buf [(xs (array i64 N))])\n(defn main [] (-> i64) (primitive/cast i64 (primitive/sizeof Buf)))\n' > "$T/refer-length.coil"
+  expect_rc_out 1 "trait method '<' is not in scope" "check: an excluded operator is not in scope in an array length's constant" \
+    "$COIL" check "$T/refer-length.coil"
+  # `(make-dyn Trait p)` names a trait in scope, not any trait of that last name.
+  mkdir -p "$T/dyn-scope"
+  printf '(module dynshapes)\n(export Show show)\n(deftrait Show [Self] (show [(a (ptr Self))] (-> i64)))\n' > "$T/dyn-scope/dynshapes.coil"
+  printf '(module dynapp)\n(import "dynshapes" :as p)\n(import "coil.primitive" :as primitive)\n(defstruct Point [(x i64)])\n(impl p/Show Point (show [(a (ptr Point))] (-> i64) 5))\n(defn main [] (-> i64) (p/show (primitive/make-dyn Show (primitive/alloc-static Point))))\n' > "$T/dyn-scope/dynapp.coil"
+  expect_rc_out 1 "make-dyn: unknown trait 'Show'" "check: make-dyn's trait is one in scope, not one that shares its name" \
+    "$COIL" check "$T/dyn-scope/dynapp.coil"
 }
 
 # ---------------------------------------------------------------------------
