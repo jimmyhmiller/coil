@@ -1463,7 +1463,10 @@ again
 
 Inside a macro, `primitive/code-field-count`, `code-field-name`, `code-field-type`,
 `code-variant-count`, `code-variant-name` and `code-trait-method-*` describe a type
-named by a Code symbol. `derive` is built from them.
+named by a Code symbol. `derive` is built from them. The symbol names what it names
+where it was written: `p/Shape` through that module's import, a bare `Shape` its own
+type or one it imports with `:use`. A type of a module it does not import is not in
+scope, whatever it is called.
 
 ### Custom derives
 
@@ -1500,7 +1503,10 @@ z
 
 Unquoting an ordinary value, as in `` `~i `` or a string, makes it a literal in the
 generated code. A `defderive` has a `struct` arm, a `sum` arm, or both, and
-deriving for a shape it lacks is an error at the `derive`.
+deriving for a shape it lacks is an error at the `derive`. A `defderive` registers
+the trait its name means in its own module, and a `derive` asks for the trait its
+name means where the `derive` is written, so a module's own trait named `Eq` is its
+own and not core's.
 
 ## Metaprograms: lints and transforms
 

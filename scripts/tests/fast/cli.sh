@@ -339,6 +339,12 @@ section_check() {
   printf '(module refer-length)\n(import "coil.primitive" :as primitive)\n(import "coil.core" :use * :exclude [<])\n(const N (if (< 1 2) 3 4))\n(defstruct Buf [(xs (array i64 N))])\n(defn main [] (-> i64) (primitive/cast i64 (primitive/sizeof Buf)))\n' > "$T/refer-length.coil"
   expect_rc_out 1 "trait method '<' is not in scope" "check: an excluded operator is not in scope in an array length's constant" \
     "$COIL" check "$T/refer-length.coil"
+  # `(make-dyn Trait p)` names a trait in scope, not any trait of that last name.
+  mkdir -p "$T/dyn-scope"
+  printf '(module dynshapes)\n(export Show show)\n(deftrait Show [Self] (show [(a (ptr Self))] (-> i64)))\n' > "$T/dyn-scope/dynshapes.coil"
+  printf '(module dynapp)\n(import "dynshapes" :as p)\n(import "coil.primitive" :as primitive)\n(defstruct Point [(x i64)])\n(impl p/Show Point (show [(a (ptr Point))] (-> i64) 5))\n(defn main [] (-> i64) (p/show (primitive/make-dyn Show (primitive/alloc-static Point))))\n' > "$T/dyn-scope/dynapp.coil"
+  expect_rc_out 1 "make-dyn: unknown trait 'Show'" "check: make-dyn's trait is one in scope, not one that shares its name" \
+    "$COIL" check "$T/dyn-scope/dynapp.coil"
 }
 
 # ---------------------------------------------------------------------------
