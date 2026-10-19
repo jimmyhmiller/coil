@@ -974,7 +974,7 @@ EOF
     "$COIL" expand "$T/phase/sized_main.coil" --target riscv32-unknown-none-elf
   expect_rc_out 1 "coil.core.Os does not name: freebsd" "an OS coil.core.Os does not name is an error, not the host's" \
     "$COIL" check "$T/seven.coil" --target x86_64-unknown-freebsd
-  # RISC-V :shim conventions: a Coil body behind one whose argument registers are
+  # RISC-V (cc/Shim) conventions: a Coil body behind one whose argument registers are
   # the C ones swapped assembles, and coil.arch.riscv's inlined CSR operations
   # leave the instruction in their caller rather than a call: a named small mask
   # is the instruction's operand, and an operation with no result, under a
@@ -983,12 +983,13 @@ EOF
 (module rv-shim)
 (import "coil.primitive" :as primitive)
 (import "coil.arch.riscv" :as riscv)
-(defcc swapped :params [a1 a0] :ret a1 :clobber [t0 t1 t2 a0 a1 a2 a3 a4 a5 a6 a7 t3 t4 t5 t6] :lower shim)
+(import "coil.cc" :as cc)
+(defcc swapped :params [a1 a0] :ret a1 :clobber [t0 t1 t2 a0 a1 a2 a3 a4 a5 a6 a7 t3 t4 t5 t6] :lower (cc/Shim))
 (defn sub2 :cc swapped [(a u32) (b u32)] (-> u32) (- a b))
 (defn quiet! [] (-> void) (riscv/clear-mstatus! 8) (riscv/clear-mstatus-mie!))
 (defn main [] (-> i64) (quiet!) (primitive/cast i64 (sub2 (riscv/read-mhartid) 3)))
 EOF
-  expect_rc 0 "a :shim convention's trampoline assembles for RISC-V" \
+  expect_rc 0 "a (cc/Shim) convention's trampoline assembles for RISC-V" \
     "$COIL" emit-obj "$T/rv-shim.coil" -o "$T/rv-shim.o" --target riscv32-unknown-none-elf
   local rv_ir rv_quiet
   rv_ir=$("$COIL" emit-ir "$T/rv-shim.coil" --target riscv32-unknown-none-elf 2>&1)
