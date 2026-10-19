@@ -109,11 +109,13 @@ using it pays that layout at each level; it is still correct. `code-copy` and
 - **Bytes ↔ names:** `(primitive/int->str N)` → the integer's decimal as a `(slice u8)`, so a
   name minted from a counter/index is one call; `(primitive/str-bytes S)` → a Code list of a
   string's byte values; `(primitive/bytes->str LIST)` → the inverse (list of ints → string).
-- **Reflect on types:** `code-type-shape` safely classifies a type as `struct`,
-  `sum`, or `unknown`; `code-type-traits` lists the traits a type implements (their
-  qualified names, generic impls included when their bounds hold, so
-  `(Option S)` lists Debug only when `S` has it) — ask it of a type as `type-of` reports
-  it, in a checker or semantic transform, where the checked program exists;
+- **Reflect on types:** `code-type-shape` safely classifies a type, answering a
+  `primitive/TypeShape`: `(StructShape)`, `(SumShape)` or `(UnknownShape)`;
+  `code-type-traits` answers a `primitive/Traits`, `(TraitsAre NAMES)` with the
+  traits a type implements (their qualified names, generic impls included when
+  their bounds hold, so `(Option S)` lists Debug only when `S` has it) — ask it of a
+  type as `type-of` reports it, in a checker or semantic transform, where the
+  checked program exists, and it answers `(TraitsUnknown)` anywhere else;
   `code-field-count/name/kind/type`, `code-variant-*`
   (including `code-variant-field-name`/`-type`, which reflect a variant's
   PAYLOAD fields by `(SUM VARIANT-INDEX FIELD-INDEX)` — the type comes back
@@ -293,33 +295,38 @@ New API this project added (all shipped):
   typechecks.
 - **Authored references in lint profiles.** `coil.meta` joins original source
   syntax to resolver evidence, including macro heads before expansion. In a
-  semantic checker loaded with `coil lint --use`, `meta/source-modules` returns
-  original module records, `meta/imports MODULE` returns editable import records,
-  and `meta/references MODULE` returns authored reference occurrences. Use
-  `meta/reference-node`, `meta/reference-role`, and `meta/reference-binding` to
-  read a reference. Bindings are `(global QUALIFIED-NAME)`, `(local ID)`,
-  `:unknown`, or `:ambiguous`; a local lacking a unique checked identity contains
-  `:unknown` or `:ambiguous` instead of an ID. `meta/source-binding NODE` is strict
-  occurrence lookup: a newly constructed symbol never acquires a binding from its
-  spelling. Source queries outside this lint phase return `:unavailable`. The
-  evidence covers the files the user wrote, which are the only ones a fix can
-  edit: a bundled library module has no reference records, and a binding asked
-  of its syntax is `:unknown`.
+  semantic checker loaded with `coil lint --use`, `meta/source-modules` answers
+  original module records, `meta/imports MODULE` editable import records, and
+  `meta/references MODULE` authored reference occurrences, each as a
+  `primitive/SourceView`: `(SourceIs RECORDS)`, or `(SourceUnavailable)` outside
+  this lint phase. Use `meta/reference-node`, `meta/reference-role`, and
+  `meta/reference-binding` to read a reference. A binding is a
+  `primitive/SourceBinding`: `(BindsGlobal QUALIFIED-NAME)`, `(BindsLocal ID)`,
+  `(LocalUnknown)` or `(LocalAmbiguous)` for a local lacking a unique checked
+  identity, `(BindingUnknown)`, or `(BindingAmbiguous)`. `meta/source-binding NODE`
+  is strict occurrence lookup: a newly constructed symbol never acquires a binding
+  from its spelling. The evidence covers the files the user wrote, which are the
+  only ones a fix can edit: a bundled library module has no reference records, and
+  a binding asked of its syntax is `(BindingUnknown)`.
 
   `meta/references-through IMPORT` selects references resolved through that
   import's facade. `meta/reference-import` and `meta/reference-exported-name`
   preserve that route separately from canonical ownership, including renames and
-  reexports. `meta/import-node` and `meta/import-target` expose the declaration
-  and its resolved module namespace.
+  reexports, as `(Some NAME)` when the reference resolved through an import and
+  `(None)` when it did not. `meta/import-node` and `meta/import-target` expose the
+  declaration and its resolved module namespace.
 
-  `meta/qualify-import IMPORT ALIAS MODE` produces `(edits (edit NODE REPLACEMENT) …)`
-  or `(refused "reason")`. MODE is `` `strict `` or `` `assume-no-shadow ``: strict
+  `meta/qualify-import IMPORT ALIAS MODE` answers a `primitive/ImportPlan`:
+  `(PlanEdits EDITS)`, EDITS a list of `(edit NODE REPLACEMENT)`, or
+  `(PlanRefused "reason")`. MODE is `` `strict `` or `` `assume-no-shadow ``: strict
   refuses when a quasiquote template names something the import supplies, since
   nothing records how a template's bare name binds; `assume-no-shadow` rewrites
   those names as references to the import, which is right unless the template binds
   the same spelling itself. `coil.lint.import-aliases` selects it with
-  `--lint-param coil.lint.import-aliases.assume-no-shadow=true`. `meta/suggest-edits PLAN MESSAGE` submits the entire
-  plan as a coordinated lint suggestion group; writing still requires `--fix`.
+  `--lint-param coil.lint.import-aliases.assume-no-shadow=true`. `meta/suggest-edits EDITS MESSAGE` submits a
+  plan's edits as one coordinated lint suggestion group and answers a
+  `primitive/Suggestion`, `(Suggested)` or `(SuggestionRefused)`; writing still
+  requires `--fix`.
   Qualification refuses incomplete evidence, alias conflicts, names inspected by
   macros, repeated imports of one module, and imports that reexport their target.
   Inert quoted data is excluded. Generic type occurrences whose identity cannot
@@ -372,7 +379,7 @@ New API this project added (all shipped):
   failing expression gets an internal error type, every error is recorded (a failure
   caused only by an earlier one is not reported again), and all subexpressions that
   do not depend on a failure keep their real types and resolutions. Only nodes the
-  checker could not establish answer `:unknown`/`:unresolved`; an expression whose
+  checker could not establish answer `(TypeUnknown)`/`(DeclUnresolved)`; an expression whose
   own type depends on a failed child, such as `(.x (.origin r))` when `.origin` fails,
   gets its type once a fixpoint round has rewritten that child. When resolution itself fails
   there is no model and the transform rewrites purely syntactically (e.g.
@@ -384,35 +391,40 @@ New API this project added (all shipped):
   same checked program and its output still receives the authoritative strict
   resolve/typecheck, but Coil does not execute it a second time to prove a
   fixpoint. Use it only when one traversal is the complete rewrite.
-- **`(primitive/code-decl NODE)` → a declaration record**, read from that authoritative checked
-  program. Every record begins `(decl MODULE KIND QUALIFIED-NAME)`. Functions continue
-  with `[PARAM-TYPE…] RET`. A method's record reads the same with KIND `method`, then
-  adds OWNER-TYPE, the type of the impl the checker chose, and for a trait method the
-  trait; its MODULE is the module that declares that type (`coil.arraylist` for a method
-  of `(ArrayList T)`), and empty for a type no module declares (`i64`, `(ptr T)`).
-  Structs, sums, traits, consts, and externs need no additional fields. The qualified
-  name is the exact identity selected by resolution rather than the spelling used at the
-  call site, including through aliases and import renames. The other possible results
-  are `:unresolved` and `:ambiguous`. **Pass a resolved
+- **`(primitive/code-decl NODE)` → a `primitive/DeclAnswer`**, read from that
+  authoritative checked program: `(Declared MODULE KIND QUALIFIED-NAME SIGNATURE)`,
+  KIND a `primitive/DeclKind` — `(FunctionDecl)`, `(MethodDecl)`, `(StructDecl)`,
+  `(SumDecl)`, `(VariantDecl)` for a construction, `(TraitDecl)`, `(ConstDecl)`,
+  `(ExternDecl)` or `(PrimitiveDecl)`. A function's SIGNATURE is
+  `([PARAM-TYPE…] RET)`. A method's reads the same, then adds OWNER-TYPE, the type of
+  the impl the checker chose, and for a trait method the trait; its MODULE is the
+  module that declares that type (`coil.arraylist` for a method of `(ArrayList T)`),
+  and empty for a type no module declares (`i64`, `(ptr T)`). The other kinds have an
+  empty SIGNATURE. The qualified name is the exact identity selected by resolution
+  rather than the spelling used at the call site, including through aliases and
+  import renames. The other answers are `(DeclUnresolved)` and `(DeclAmbiguous)`.
+  **Pass a resolved
   REFERENCE node and it resolves to the EXACT entity** the checker picked (via node
   identity), unambiguous even when the simple name lives in several modules. This covers
   every resolved reference: **function calls, function-pointer refs (`fnptr-of`), and
-  variant constructions** (which resolve to the owning sum). A bare symbol falls back to
-  a name-based lookup (which reports `:ambiguous` on a cross-module name clash). A type
+  variant constructions** (which resolve to the variant, in its sum's module). A bare symbol falls back to
+  a name-based lookup (which answers `(DeclAmbiguous)` on a cross-module name clash). A type
   reference such as `wb/Box` resolves to its module too, even when `Box` is defined in
-  several. `tests/meta/run_code_main_decls.coil` lists the records of a module's method
+  several. `tests/meta/run_code_main_decls.coil` lists the answers for a module's method
   calls.
-- **`(primitive/model-status)` → `:complete`, `:partial`, or `:none`** — whether the
-  model the transform is reading is of a program that fully checks, one that partly
-  checks, or no model at all. A transform that must only see valid programs checks
-  for `:complete`.
-- **`(primitive/check-error NODE)` → the checker's message, or `:none`** — the error
-  located exactly at NODE in a partial model. A dialect transform uses it to find the
+- **`(primitive/model-status)` → a `primitive/ModelStatus`**: `(ModelComplete)`,
+  `(ModelPartial)` or `(NoModel)` — whether the model the transform is reading is of
+  a program that fully checks, one that partly checks, or no model at all. A
+  transform that must only see valid programs matches `primitive/ModelComplete`.
+- **`(primitive/check-error NODE)` → a `primitive/CheckOutcome`**: `(FailsAt MESSAGE)`
+  with the checker's message, a string, for the error located exactly at NODE in a
+  partial model, or `(ChecksClean)`. A dialect transform uses it to find the
   expressions that do not check yet, and why, and rewrite exactly those; together with
   `type-of` on their subexpressions it can make type-directed rewrites of code that is
   not valid Coil until rewritten.
-- **`(primitive/type-of NODE)` → the expression's inferred type** as `Code` (e.g. `i64`,
-  `(ptr i64)`), or `:unknown`. This is the type the real type-checker inferred, not
+- **`(primitive/type-of NODE)` → the expression's inferred type**, a
+  `primitive/TypeAnswer`: `(TypeIs TYPE)` with TYPE as `Code` (e.g. `i64`,
+  `(ptr i64)`), or `(TypeUnknown)`. This is the type the real type-checker inferred, not
   syntax — a call `(getf)` reports `f64` because `getf` returns `f64`. Demo:
   `tests/meta/nofloat.coil` bans floating-point-typed expressions.
 - **`(primitive/code-file NODE)` → the source file name** of a node, and **`(primitive/code-from-user? NODE)`
@@ -427,11 +439,16 @@ New API this project added (all shipped):
   macro's expansion (in a checker, a transform or compiled code) it is an error.
 - **Asking the compiler about the program.** A checker or transform can ask the
   compiler what the program is, for instance to describe it to another unit (a JIT
-  session inside the program, say). `coil.meta` wraps each query:
+  session inside the program, say). `coil.meta` wraps each query, and each answers
+  a `primitive/ProgramAnswer`: `(Answer VALUE)`, `(NotInProgram)` for a name the
+  program does not define, or `(NoProgram)` where there is no checked program;
+  `(meta/answered ANSWER)` is VALUE, or a compile error for the other two.
   `(meta/modules)` lists every module, the library's included;
   `(meta/definitions M)` lists M's definitions as qualified symbols;
-  `(meta/definition-kind NAME)` is `:function`, `:macro`, `:generic`, `:def`,
-  `:const`, `:struct`, `:sum`, `:trait`, `:alias` or `:extern`;
+  `(meta/definition-kind NAME)` answers a `primitive/KindAnswer`, `(KindIs KIND)`
+  with a `primitive/DefinitionKind` — `(Function)`, `(Macro)`, `(Generic)`,
+  `(Def)`, `(Const)`, `(Struct)`, `(Sum)`, `(Trait)`, `(Alias)` or `(Extern)` — or
+  `(KindNotInProgram)` or `(KindNoProgram)`;
   `(meta/declaration NAME)` is the form that declares NAME to another unit: a
   `declare` of a function's exact signature (an aggregate parameter is spelled
   `(ref T)`, as `fnptr-of` types it) or of a `def`'s storage, a record or sum with
@@ -440,7 +457,7 @@ New API this project added (all shipped):
   `(meta/module-header M)` and `(meta/module-impls M)` are its
   `module`/`import`/`export` and `impl`/`derive` forms; `(meta/annotations NAME)`
   is the `:key value` pairs NAME's `defn` or `def` carries, as one list (empty if
-  it has none, `:unresolved` if the program has no such definition), which is how
+  it has none), which is how
   a transform finds the definitions an annotation marks; `(meta/toolchain)` names
   the compiler and target the declarations assume; `(meta/source CODE)` renders any
   form as text. `(meta/embed-text MODULES HOST NAME TEXT)` adds a function `(NAME)`
