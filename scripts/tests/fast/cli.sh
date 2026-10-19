@@ -753,6 +753,17 @@ EOF
     "$COIL" emit-obj "$T/invalid.coil" -o "$T/invalid.o"
   [ "$(cat "$T/invalid.o")" = sentinel ] && ok "a failed emit-obj leaves the existing output untouched" \
     || bad "a failed emit-obj leaves the existing output untouched" "the destination was replaced"
+
+  # llvm-ir text is only ever IR: a body spelled like one of the compiler's own
+  # operations reaches LLVM's parser, not that operation.
+  cat > "$T/spelled.coil" <<'EOF'
+(module spelled.op)
+(import "coil.primitive" :as primitive)
+(defn f [] (-> i64) (primitive/llvm-ir i64 [] "coil.mem.fence"))
+(defn main [] (-> i64) (f))
+EOF
+  expect_rc_out 1 'llvm-ir: could not parse IR' "an llvm-ir body naming a compiler operation is parsed as IR" \
+    "$COIL" emit-obj "$T/spelled.coil" -o "$T/spelled.o"
 }
 
 # ---------------------------------------------------------------------------

@@ -251,7 +251,9 @@
 
 ; a parsed inline-LLVM-IR body (see ELlvmIr): the raw text + the arg types,
 ; interpreted at runtime against the VM's real memory. `result` is the IR's $ret.
-(defstruct IIr [(body (slice u8)) (argtys (ArrayList Type)) (result Type)])
+; `intrinsic` is the EIntrinsic it runs instead of text, for those the
+; interpreter carries out at run time.
+(defstruct IIr [(body (slice u8)) (argtys (ArrayList Type)) (result Type) (intrinsic (Option Intrinsic))])
 
 ; the interpreter context: the mono'd program + compiled functions + layouts.
 ;;; A runtime `def`'s static storage: allocated and initialized once, on its
@@ -812,11 +814,12 @@
 
 (defn compile-linked-call [(fb (ptr FB)) (fp (ptr Expr)) (args (ptr (ArrayList Expr)))] (-> (Option Type))
   (match (.kind fp)
-    (ELlvmIr [ty operands body]
-      (if (and (= (len (load operands)) 0) (starts-with body "coil.arch.linker-address:"))
+    (EIntrinsic [op ty operands]
+      (match op
+        (ILinkerAddress [symbol]
         (match ty
           (TFn [cc params ret]
-            (let [cx (.cx fb) a (.a cx) symbol (subslice body 25 (len body))
+            (let [cx (.cx fb) a (.a cx)
                   name (sconcat3 a "!linked:" symbol (ty-str a (box-type a ty)))]
               ; A constant linker-address call is a direct extern call. Intern
               ; its complete signature, then use the interpreter's normal FFI
@@ -827,8 +830,8 @@
                           :variadic false :ret (load ret)
                           :span_source -1 :params_lo 0 :params_hi 0 :ret_lo 0 :ret_hi 0)))
               (Some (compile-call fb name args))))
-          (_ (None)))
-        (None)))
+          (_ (None))))
+        (_ (None))))
     (_ (None))))
 
 (defn compile-call [(fb (ptr FB))
@@ -1520,15 +1523,11 @@
                     (set! (.term fb) (load allterm))
                     (load rty)))))
       (ELlvmIr [result args body]
-               (if (= body "coil.mem.alloc-stack-bytes")
-                 (do
-                   (compile-expr fb (ial-at [Expr] args 0))
-                   (femit fb 46 0 0 0)  ; ALLOCDYN
-                   result)
-                 (let [n (len (load args))
+               (let [n (len (load args))
                        (mut i) 0
                        ir0 (primitive/alloc-stack IIr)]
                    (set! (.body ir0) body)
+                   (set! (.intrinsic ir0) (None [Intrinsic]))
                    (set! (.argtys ir0) (ArrayList::new [Type] a))
                    (set! (.result ir0) result)
                    ; compile args FIRST (nested llvm-ir may register its own IIrs), then
@@ -1547,7 +1546,38 @@
                    (let [iri (len (.irs cx))]
                      (push! (mut (.irs cx)) (load ir0))
                      (femit fb 40 iri n 0))
-                   result)))
+                   result))
+      (EIntrinsic [op result args]
+                  (match op
+                    (IStackBytes []
+                                 (do
+                                   (compile-expr fb (ial-at [Expr] args 0))
+                                   (femit fb 46 0 0 0)  ; ALLOCDYN
+                                   result))
+                    (_ (let [n (len (load args))
+                       (mut i) 0
+                       ir0 (primitive/alloc-stack IIr)]
+                   (set! (.body ir0) "")
+                   (set! (.intrinsic ir0) (Some op))
+                   (set! (.argtys ir0) (ArrayList::new [Type] a))
+                   (set! (.result ir0) result)
+                   ; compile args FIRST (nested llvm-ir may register its own IIrs), then
+                   ; register this body and read the index back — capturing it before the
+                   ; args would use the nested body's slot instead.
+                   (loop (if (>= (load i) n)
+                             (break)
+                             (do
+                               (let [t
+                                       (compile-expr fb
+                                                     (ial-at [Expr]
+                                                             args
+                                                             (load i)))]
+                                 (push! (mut (.argtys ir0)) t))
+                               (set! i (primitive/iadd (load i) 1)))))
+                   (let [iri (len (.irs cx))]
+                     (push! (mut (.irs cx)) (load ir0))
+                     (femit fb 40 iri n 0))
+                   result))))
       (EOffsetOf [t fname]
                  (match t
                    (TStruct [nm]
@@ -5021,29 +5051,51 @@
         :else (do (idie "volatile-store!: unsupported scalar size") 0)))
 
 ; run a whole IR body; returns the result cell.
+;;; Run an intrinsic the interpreter carries out itself. Alias accesses are
+;;; plain ones here: the interpreter reorders no memory access.
+(defn ir-run-intrinsic [(cx (ptr Interp))
+                        (irp (ptr IIr))
+                        (op Intrinsic)
+                        (args (ptr i64))] (-> i64)
+  (match op
+    (IVolatileLoad [] (ir-read-scalar cx irp args "volatile-load"))
+    (IAliasLoad [] (ir-read-scalar cx irp args "alias-load"))
+    (IVolatileStore [] (ir-write-scalar cx irp args "volatile-store!"))
+    (IAliasStore [] (ir-write-scalar cx irp args "alias-store!"))
+    ; the interpreter runs on one thread
+    (IFence [] 0)
+    (ILinkerAddress [symbol]
+                    (do
+                      (idie2 "the bytecode interpreter reaches a linker symbol only by calling it, and this program takes the address of " symbol)
+                      0))
+    (IStackBytes [] (do (idie "alloc-stack-bytes is compiled to ALLOCDYN, never run as IR (interpreter bug)") 0))
+    (_ (do
+         (idie "the bytecode interpreter runs no machine code, and this program calls a machine-code function")
+         0))))
+
+(defn ir-read-scalar [(cx (ptr Interp)) (irp (ptr IIr)) (args (ptr i64)) (what (slice u8))] (-> i64)
+  (let [(mut type) (.result irp)]
+    (when (ty-is-agg (mut type))
+      (idie2 what ": expected a scalar"))
+    (volatile-read-cell (load args)
+                        (isize-of cx (mut type))
+                        (signed-of (mut type)))))
+
+(defn ir-write-scalar [(cx (ptr Interp)) (irp (ptr IIr)) (args (ptr i64)) (what (slice u8))] (-> i64)
+  (let [(mut type) (get (.argtys irp) 1)]
+    (when (ty-is-agg (mut type))
+      (idie2 what ": expected a scalar"))
+    (volatile-write-cell (load args)
+                         (load (primitive/index args 1))
+                         (isize-of cx (mut type)))))
+
 (defn ir-run [(cx (ptr Interp))
               (irp (ptr IIr))
               (args (ptr i64))
               (fm (ptr FrameMem))] (-> i64)
-  (cond (machine-code-body? (.body irp))
-          (do
-            (idie "the bytecode interpreter runs no machine code, and this program calls a machine-code function")
-            0)
-        (= (.body irp) "coil.mem.volatile-load")
-          (let [(mut type) (.result irp)]
-            (when (ty-is-agg (mut type))
-              (idie "volatile-load: expected a scalar"))
-            (volatile-read-cell (load args)
-                                (isize-of cx (mut type))
-                                (signed-of (mut type))))
-        (= (.body irp) "coil.mem.volatile-store")
-          (let [(mut type) (get (.argtys irp) 1)]
-            (when (ty-is-agg (mut type))
-              (idie "volatile-store!: expected a scalar"))
-            (volatile-write-cell (load args)
-                                 (load (primitive/index args 1))
-                                 (isize-of cx (mut type))))
-        :else
+  (match (.intrinsic irp)
+    (Some [op] (ir-run-intrinsic cx irp op args))
+    (None []
           ; Everything the run allocates (its name table, parsed types, token lists) is
           ; scratch that dies with it; a per-run arena keeps runs from growing the
           ; interpreter's allocator and from sharing it across threads.
@@ -5090,7 +5142,7 @@
                         0)))
             (unless (load donep) (idie "llvm-ir: body did not ret"))
             (close! (mut arena))
-            (load retvalp))))
+            (load retvalp)))))
 
 ; ============================ the VM ========================================
 ; A call's operand stack, grown by doubling when an expression nests deeper
