@@ -326,8 +326,9 @@ section_check() {
   # conflicting case, another register class, is a diag golden).
   printf '(module extern-width)\n(import "coil.fs" :as fs)\n(extern mkdir :cc c [(ptr i8) i32] (-> i32))\n(defn main [] (-> i64) (mkdir c"/nonexistent-coil-dir/x" 448) 0)\n' > "$T/extern-width.coil"
   expect_rc 0 "an extern may redeclare a library symbol with another integer width" "$COIL" check "$T/extern-width.coil"
-  # A struct's :layout is a coil.layout.Layout value; each mistake is its own
-  # compile, since the first one stops it.
+  # A struct's :layout is a coil.layout.Layout value, and a type's annotations
+  # are checked as a function's are; each mistake is its own compile, since the
+  # first one stops it.
   local layout_case
   while IFS='|' read -r layout_case want; do
     printf '(module layout-case)\n(import "coil.layout" :as layout)\n%s\n(defn main [] (-> i64) 0)\n' "$layout_case" > "$T/layout-case.coil"
@@ -340,6 +341,9 @@ section_check() {
 (defstruct S :backing u8 [(a u8)])|:backing applies to a \(layout/Bits\) struct
 (defstruct S :layout (layout/Packed) :size 8 [(a u8)])|:size and :align apply to a \(layout/Explicit\) struct
 (defsum Mine (Packed))\n(defstruct S :layout (Packed) [(a u8)])|:layout value has type layout-case.Mine but expected coil.layout.Layout
+(defstruct S :does/not-exist true [(a u8)])|unknown annotation ':does/not-exist'
+(defsum T :inline (Always) (A))|annotation ':inline' applies to functions, not types
+(import "coil.jit.lifetime")\n(defsum T :jit/retain 1 (A))|annotation ':jit/retain' value
 EOF
 }
 
@@ -364,6 +368,9 @@ section_fmt() {
   out=$(printf '(defn width [] (-> bool) (or (= 1 1) (= 2 2) (= 3 3) (= 4 4) (= 5 5)))\n' | "$COIL" fmt --width 40 - 2>&1)
   case "$out" in *$'\n      (= 2 2)\n'*) ok "fmt --width sets the line width" ;; *) bad "fmt --width sets the line width" "$out" ;; esac
   expect_rc 2 "fmt --width 0 is rejected" "$COIL" fmt --width 0 "$T/seven.coil"
+  out=$(printf '(defsum TheLongName :jit/retain false (AlphaVariant [(first i64) (second i64)]) (Gamma))\n' | "$COIL" fmt --width 40 - 2>&1)
+  case "$out" in "(defsum TheLongName :jit/retain false"$'\n'*) ok "fmt keeps a defsum's annotation pairs on its head line" ;;
+    *) bad "fmt keeps a defsum's annotation pairs on its head line" "$out" ;; esac
 
   cp "$T/messy1.coil" "$T/write.coil"
   "$COIL" fmt --write "$T/write.coil" >/dev/null 2>&1
