@@ -9,8 +9,8 @@ compiler support, exactly like `coil.derive`'s `Eq`/`Hash`.
 > `derive-serde-sum`, `derive-serialize`, and `derive-deserialize` entry points
 > described below have been retired. Use `(derive Serialize Deserialize T)`;
 > configured derives use option-bearing trait specs, for example
-> `(derive (Serialize (rename-all :camelCase)) (Deserialize (rename-all
-> :camelCase)) T)`. `defsum-serde` remains because it defines a type as well as
+> `(derive (Serialize (rename-all (CamelCase))) (Deserialize (rename-all
+> (CamelCase))) T)`. `defsum-serde` remains because it defines a type as well as
 > its codec implementations.
 
 Shipped modules (all bundled):
@@ -206,7 +206,7 @@ generic field type as its bare head symbol — `Option`, not `(Option E)` — so
 derived code recovers the payload type from the slot via `coil.serde.opt-none!`;
 the variant path's new ops return structured, canonically-qualified types.)
 
-The full option set is implemented: `(rename-all :camelCase|:snake_case|:kebab-case)`,
+The full option set is implemented: `(rename-all STYLE)`, STYLE a `coil.serde.RenameStyle` (`(CamelCase)`, `(SnakeCase)` or `(KebabCase)`),
 `(deny-unknown)` (opt-in; the default skips unknown input fields), and per-field
 `(field NAME (rename "…") (default EXPR) (skip) (skip-serializing)
 (skip-deserializing) (with ser-fn de-fn) (boxed))`. Unknown option names are a
@@ -221,7 +221,7 @@ pointee from `de-alloc` on decode (recursive types round-trip).
 
 (defstruct User [(name (slice u8)) (age u8) (email (slice u8)) (score f64)])
 (derive-serde User
-  (rename-all :camelCase)
+  (rename-all (CamelCase))
   (field email (rename "emailAddress"))
   (field score (default 0.0)))
 
@@ -452,7 +452,7 @@ test restructure of 2026-10-12; the variant-reflection harness step went then.
    (retries i64)
    (secret  (slice u8))])
 (derive-serde Config
-  (rename-all :camelCase)                ; maxRetries below is post-rename-all
+  (rename-all (CamelCase))                ; maxRetries below is post-rename-all
   (field port    (default 8080))         ; absent on decode -> 8080
   (field retries (rename "maxRetries") (default 3))
   (field secret  (skip)))                ; never written, never read
