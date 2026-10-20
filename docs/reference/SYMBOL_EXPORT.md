@@ -219,9 +219,9 @@ An exported function is a C ABI boundary, so the checker enforces — reusing th
 existing C-ABI type-checking machinery used for `extern` and
 struct-by-value — that:
 
-1. **Calling convention is C.** The function must use the `c` convention (or a `defcc`
-   whose lowering is `(coil.cc.Native (coil.cc.C))`). A `coil.cc.Shim`/custom-cc function can't be a C export
-   (its ABI isn't the C one). Default-cc functions either must be declared `:cc c` or
+1. **Calling convention is C.** The function must use coil.cc's C convention,
+   `(cc/C)`. A `(cc/Shim)` or other custom-convention function can't be a C export
+   (its ABI isn't the C one). Default-cc functions either must be declared `:cc (cc/C)` or
    the export errors with a fix-it.
 2. **Types are C-representable.** Parameters and return type must each be one of:
    scalars (`iN`/`f32`/`f64`/`bool`), a pointer (`(ptr T)`), a C-string (`(ptr i8)`),
@@ -317,7 +317,7 @@ that makes "Coil as a C library" pleasant rather than possible.
 
 ## Open questions
 
-- **Default convention for export.** Require an explicit `:cc c` on the `defn`, or let
+- **Default convention for export.** Require an explicit `:cc (cc/C)` on the `defn`, or let
   `export-c` *coerce* a default-cc function to the C ABI at the boundary (it already
   has C-compatible types)? Leaning: coerce, since the type check already proves it's
   C-callable — but a `:shim`/non-C cc is always an error.

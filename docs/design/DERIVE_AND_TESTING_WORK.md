@@ -267,7 +267,7 @@ stops there.
 
 3. **Better error for the pointer-hook footgun.** Every hook must take pointers:
    a struct-typed parameter compiles to `(ref T)`, which does not match the
-   `(fnptr c [T] …)` slot. This is called out in the module header, which means
+   `(fnptr (cc/C) [T] …)` slot. This is called out in the module header, which means
    it is known to bite. The failure surfaces as a type mismatch on a mangled
    `fnptr` type; `defprop-stateful` should catch it and say which hook and what
    the signature must be.

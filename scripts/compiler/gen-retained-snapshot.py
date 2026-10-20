@@ -49,6 +49,16 @@ for path in list((ROOT/'src/compiler').glob('*.coil'))+list((ROOT/'src/stdlib').
     for name,form in own.items(): definitions[module+'.'+name]=(module,form)
 
 PRIMITIVES={'i8','i16','i32','i64','u8','u16','u32','u64','isize','usize','f32','f64','bool','void','never','Code','CodeBuilder'}
+def qualify_cc(cc,mod):
+    """A fnptr type's convention, fully qualified: `(cc/C)` under MOD's
+    `(import "coil.cc" :as cc)` is `(coil.cc.C)`."""
+    if not isinstance(cc,(tuple,list)): return cc
+    alias,_,leaf=cc[0].partition('/')
+    if not leaf: raise SystemExit(f'{mod}: fnptr convention {cc} is not alias-qualified')
+    for f in modules[mod][1]:
+        if len(f)>=4 and f[2]==':as' and f[3]==alias:
+            return '('+f[1].strip('"')+'.'+leaf+')'
+    raise SystemExit(f'{mod}: no import binds the alias {alias} of fnptr convention {cc}')
 def resolve(name,mod,params):
     if name in params:return params[name]
     if name.lstrip(':') in PRIMITIVES:return name.lstrip(':')
@@ -75,7 +85,7 @@ def qualify(t,mod,params):
     if isinstance(t,str):return resolve(t,mod,params)
     head=t[0]
     if head in ('ptr','ref','mut','slice','array','dyn','fnptr'):
-        if head=='fnptr':return ('fnptr',t[1],tuple(qualify(x,mod,params) for x in t[2]),qualify(t[3],mod,params))
+        if head=='fnptr':return ('fnptr',qualify_cc(t[1],mod),tuple(qualify(x,mod,params) for x in t[2]),qualify(t[3],mod,params))
         if head=='array':return ('array',qualify(t[1],mod,params),str(t[2]))
         return (head,qualify(t[1],mod,params))
     return (resolve(head,mod,params),)+tuple(qualify(x,mod,params) for x in t[1:])
@@ -475,7 +485,7 @@ wrappers+='(defn scan-func! [(g (ptr Graph)) (root (ptr coil.compiler.ast.Func))
 wrappers+='(defn scan-const-entry! [(g (ptr Graph)) (root (ptr coil.compiler.check.ConstEntry))] (-> i64) ('+ident('coil.compiler.check.ConstEntry')+'-scan g root))\n'
 wrappers+='(defn scan-const! [(g (ptr Graph)) (root (ptr coil.compiler.ast.Const))] (-> i64) ('+ident('coil.compiler.ast.Const')+'-scan g root))\n'
 # The walk a sealed root of each kind is recorded with.
-wrappers+='(defn artifact-scan [(kind i64)] (-> (fnptr c [(ptr Graph) (ptr i8)] i64)) (cond '+' '.join(
+wrappers+='(defn artifact-scan [(kind i64)] (-> (fnptr (coil.cc.C) [(ptr Graph) (ptr i8)] i64)) (cond '+' '.join(
     '(= kind '+str(k)+') (p/fnptr-of '+ident(t)+'-scan-erased)' for k,t in sorted(ARTIFACT_KINDS.items()))+' :else (do (abort) (p/fnptr-of '+ident(ARTIFACT_KINDS[1])+'-scan-erased))))\n'
 identity_output=[]; k=0
 while k<len(ident_queue):
@@ -485,8 +495,8 @@ while k<len(ident_queue):
 def dispatch(name,result,pick):
     return '(defn '+name+' [(kind i64)] (-> '+result+') (cond '+' '.join(
         '(= kind '+str(kind)+') '+pick(record) for record,kind in sorted(SEALED_RECORDS.items(),key=lambda e:e[1]))+' :else (do (abort) '+pick(min(SEALED_RECORDS.items(),key=lambda e:e[1])[0])+')))\n'
-wrappers+=dispatch('chunk-walk','(fnptr c [(ptr Graph) (ptr i8)] i64)',lambda r:'(p/fnptr-of '+ident(r)+'-walk-erased)')
-wrappers+=dispatch('chunk-identify','(fnptr c [(ptr (ArrayList i64)) (ptr i8) i64] i64)',lambda r:'(p/fnptr-of '+ident(r)+'-chunk-identify)')
+wrappers+=dispatch('chunk-walk','(fnptr (coil.cc.C) [(ptr Graph) (ptr i8)] i64)',lambda r:'(p/fnptr-of '+ident(r)+'-walk-erased)')
+wrappers+=dispatch('chunk-identify','(fnptr (coil.cc.C) [(ptr (ArrayList i64)) (ptr i8) i64] i64)',lambda r:'(p/fnptr-of '+ident(r)+'-chunk-identify)')
 wrappers+=dispatch('chunk-stride','i64',lambda r:'(p/sizeof '+render(r)+')')
 result=header+imports+'\n'+''.join(output)+''.join(identity_output)+type_names+wrappers
 target=ROOT/'src/compiler/retained_snapshot.coil'

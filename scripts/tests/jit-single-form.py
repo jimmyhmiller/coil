@@ -98,7 +98,7 @@ print("PASS: default Var redefinition updates old callers without compiling acce
 dynamic = """(import "coil.var" :use [var-static])
 (defn* double [(x i64)] (-> i64) (* x 2))
 (defn* triple [(x i64)] (-> i64) (* x 3))
-(def hot (var-static (fnptr c [i64] i64) (primitive/fnptr-of double)))
+(def hot (var-static (fnptr (coil.cc.C) [i64] i64) (primitive/fnptr-of double)))
 (hot 10)
 (set hot (primitive/fnptr-of triple))
 (hot 10)

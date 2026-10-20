@@ -15,7 +15,7 @@ needs to decode events and redraw its footer while the provider is still generat
 
 (defstruct BodySink
   [(context (ptr i8))
-   (consume (fnptr c [(ptr u8) i64 (ptr i8)] i64))])
+   (consume (fnptr (cc/C) [(ptr u8) i64 (ptr i8)] i64))])
 
 (defstruct StreamingResponse
   [(status i64) (headers (slice Header)) (stopped bool)])
@@ -31,7 +31,7 @@ valid only for the duration of each `consume` call.
 ### Why `i64` rather than a `BodyFlow` sum
 
 The original sketch had `consume` return a two-variant sum. `consume` is a
-`(fnptr c …)` — it crosses a C ABI boundary, where a `defsum` return has no guaranteed
+`(fnptr (cc/C) …)` — it crosses a C ABI boundary, where a `defsum` return has no guaranteed
 representation (compare gotcha 19: a struct-typed `defn` parameter compiles to `(ref T)`,
 so it cannot match a C callback signature). Two named constants are unambiguous at that
 boundary and read the same at the call site. The sink is called from Coil, but keeping the

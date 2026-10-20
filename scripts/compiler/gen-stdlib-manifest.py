@@ -75,6 +75,7 @@ HERMETIC_NAMESPACES = {
     "coil.assert.hermetic",
     "coil.async",
     "coil.atomic",
+    "coil.cc",
     "coil.control",
     "coil.derive",
     "coil.dyn",

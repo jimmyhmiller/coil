@@ -446,7 +446,7 @@ stdlib = "hermetic"
 Only the environment-free namespaces are admitted: `coil.primitive`,
 `coil.control`, `coil.try`, `coil.result`, `coil.match`, `coil.iter`,
 `coil.derive`, `coil.dyn`, `coil.var`, `coil.async`, `coil.atomic`,
-`coil.simd`, `coil.fail` and `coil.assert.hermetic`. Importing anything else
+`coil.simd`, `coil.cc`, `coil.fail` and `coil.assert.hermetic`. Importing anything else
 is an error, anywhere in the program. So are native dependencies and `[link]`
 inputs. A failed assertion prints nothing: it calls the handler the program
 installed with `coil.fail/set-handler!`, if any, and traps. `stdlib = "full"`

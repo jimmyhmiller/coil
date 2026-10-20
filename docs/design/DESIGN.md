@@ -318,12 +318,12 @@ pointers plus an opaque `ctx`, threaded explicitly:
 
 ```lisp
 (defstruct Allocator
-  [(alloc  (fnptr c [(ptr i8) :i64 :i64] (Option (ptr i8))))            ; (ctx,len,align)
-   (resize (fnptr c [(ptr i8) (ptr i8) :i64 :i64 :i64] (Option (ptr i8))))
-   (free   (fnptr c [(ptr i8) (ptr i8) :i64 :i64] :i64))
+  [(alloc  (fnptr (cc/C) [(ptr i8) :i64 :i64] (Option (ptr i8))))            ; (ctx,len,align)
+   (resize (fnptr (cc/C) [(ptr i8) (ptr i8) :i64 :i64 :i64] (Option (ptr i8))))
+   (free   (fnptr (cc/C) [(ptr i8) (ptr i8) :i64 :i64] :i64))
    (ctx    (ptr i8))])
 (defstruct Writer
-  [(write-fn (fnptr c [(ptr i8) (ptr i8) :i64] (Result :i64 IoError)))  ; (ctx,bytes,len)
+  [(write-fn (fnptr (cc/C) [(ptr i8) (ptr i8) :i64] (Result :i64 IoError)))  ; (ctx,bytes,len)
    (ctx      (ptr i8))])
 ```
 
@@ -723,7 +723,7 @@ Lowering: `add` → `ccc` function; `add-fast` → `naked` thunk marshalling
   code + closure struct + new/call/free from one line — closures as a library,
   not a language feature. Remaining: the `nest`-register convention so the env is
   threaded out-of-band.
-- **`extern` + C interop — ✅ done.** `(extern name :cc c [types] (-> ret))`
+- **`extern` + C interop — ✅ done.** `(extern name :cc (cc/C) [types] (-> ret))`
   declares a foreign function's convention + signature; calls are type-checked
   and the symbol is resolved at link time. Pointers are region-less, so they
   cross the boundary unchanged (any pointer matches a pointer parameter,

@@ -359,7 +359,7 @@ Coil's most-specific-impl-wins rule gives it to us with no extra machinery.
 **The values** — for the per-call-site control that a trait cannot express:
 
 ```lisp
-(defstruct Gen [T] [(run (fnptr c [(ptr Source) (ptr i8)] T)) (env (ptr i8))])
+(defstruct Gen [T] [(run (fnptr (cc/C) [(ptr Source) (ptr i8)] T)) (env (ptr i8))])
 
 (gen/int      (range-between 1 100))
 (gen/vec-of   [i64] (gen/int (range-between 0 9)) (range-between 1 32))

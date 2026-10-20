@@ -112,6 +112,7 @@ values.
 
 ```coil
 (module example.jit-basics)
+(import "coil.cc" :as cc)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.jit" :use *)
 
@@ -122,7 +123,7 @@ values.
        (defn answer [] (-> i64) (+ (base) 2))
        (export-c [answer :as \"demo_answer\"])")
     (let [address (jit-symbol-address (mut session) "demo_answer")
-          answer (cast (fnptr c [] i64) address)]
+          answer (cast (fnptr (cc/C) [] i64) address)]
       (println "answer = {}" (call-ptr answer)))
     (jit-reset! (mut session))
     0))
@@ -196,6 +197,7 @@ A session publishes runtime code through one of two backends:
 
 ```coil
 (module example.jit-optimized)
+(import "coil.cc" :as cc)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.jit" :use *)
 
@@ -211,7 +213,7 @@ A session publishes runtime code through one of two backends:
                  (for i (range 0 n) (set! total (+ total i)))
                  total))
              (export-c [sum-to :as \"sum_to\"])")
-          (let [sum-to (cast (fnptr c [i64] i64) (jit-symbol-address (mut s) "sum_to"))]
+          (let [sum-to (cast (fnptr (cc/C) [i64] i64) (jit-symbol-address (mut s) "sum_to"))]
             (println "{}" (sum-to 1000000)))
           (jit-session-free! (mut s))
           0))

@@ -80,7 +80,7 @@ build() {
 }
 
 printf '(defn main [] (-> i64) 7)\n' > "$T/seven.coil"
-printf '(extern abort :cc c [] (-> void))\n(defn main [] (-> i64) (abort) 0)\n' > "$T/abort.coil"
+printf '(extern abort :cc (coil.cc.C) [] (-> void))\n(defn main [] (-> i64) (abort) 0)\n' > "$T/abort.coil"
 printf '(defn main [] (-> i64) (bad-fn 3))\n' > "$T/broken.coil"
 
 # ---------------------------------------------------------------------------
@@ -324,7 +324,7 @@ section_check() {
     "$COIL" emit-obj "$T/seven.coil" -o "$unwritable.o"
   # A user extern may redeclare a library C symbol with another integer width (the
   # conflicting case, another register class, is a diag golden).
-  printf '(module extern-width)\n(import "coil.fs" :as fs)\n(extern mkdir :cc c [(ptr i8) i32] (-> i32))\n(defn main [] (-> i64) (mkdir c"/nonexistent-coil-dir/x" 448) 0)\n' > "$T/extern-width.coil"
+  printf '(module extern-width)\n(import "coil.fs" :as fs)\n(extern mkdir :cc (coil.cc.C) [(ptr i8) i32] (-> i32))\n(defn main [] (-> i64) (mkdir c"/nonexistent-coil-dir/x" 448) 0)\n' > "$T/extern-width.coil"
   expect_rc 0 "an extern may redeclare a library symbol with another integer width" "$COIL" check "$T/extern-width.coil"
   # A struct's :layout is a coil.layout.Layout value, and a type's annotations
   # are checked as a function's are; each mistake is its own compile, since the
@@ -1087,9 +1087,9 @@ section_cimport() {
 (const COIL_OR_OPTION 260)
 (const COIL_CAST_OPTION 512)
 (array u8 37)
-(callback (fnptr c [(ptr i8)] void))
-(chain (fnptr c [i8] (fnptr c [f64] i32)))
-(extern coil_get_loader :cc c [] (-> (fnptr c [(ptr i8) (ptr i32)] (ptr u8))))
+(callback (fnptr (coil.cc.C) [(ptr i8)] void))
+(chain (fnptr (coil.cc.C) [i8] (fnptr (coil.cc.C) [f64] i32)))
+(extern coil_get_loader :cc (coil.cc.C) [] (-> (fnptr (coil.cc.C) [(ptr i8) (ptr i32)] (ptr u8))))
 (defstruct coil_uninspectable :layout (coil.layout.Explicit)
 EOF
     expect_rc 0 "the generated bindings check" "$COIL" check "$T/expressions.coil"
@@ -1221,7 +1221,7 @@ EOF
 (defstruct Pair [(a i64) (b i64)])
 (defn callback [(value Pair)] (-> i64) (.a value))
 (export-c [callback :as "callback_c"])
-(extern callback_c :cc c [Pair] (-> i64))
+(extern callback_c :cc (coil.cc.C) [Pair] (-> i64))
 (defn main [] (-> i64) 0)
 EOF
   expect_rc_out 1 "export-c defines C symbol 'callback_c'" "an extern colliding with a struct-by-value export is explained" \
@@ -1462,7 +1462,7 @@ section_crash() {
   cat > "$T/crash.coil" <<'EOF'
 (module crash-report)
 (import "coil.crash" :as crash)
-(extern raise :cc c [i32] (-> i32))
+(extern raise :cc (coil.cc.C) [i32] (-> i32))
 (defn main [] (-> i64)
   (crash/install!)
   (crash/event! "before deliberate abort")

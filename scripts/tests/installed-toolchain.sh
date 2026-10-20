@@ -124,9 +124,9 @@ jit_sdk() {
   cat > "$T/sdk/c-externs.coil" <<'EOF'
 (module jit-c-externs)
 (import "coil.jit" :use [jit-backend])
-(extern access :cc c [(ptr i8) i32] (-> i32))
-(extern strlen :cc c [(ptr i8)] (-> u64))
-(extern write :cc c [i32 (ptr i8) u64] (-> i64))
+(extern access :cc (coil.cc.C) [(ptr i8) i32] (-> i32))
+(extern strlen :cc (coil.cc.C) [(ptr i8)] (-> u64))
+(extern write :cc (coil.cc.C) [i32 (ptr i8) u64] (-> i64))
 (defn main [] (-> i64)
   (if (and (= (access c"/" 0) 0) (= (strlen c"four") 4)) 0 1))
 EOF

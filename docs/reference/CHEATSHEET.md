@@ -72,7 +72,7 @@ norm2 32
 ```
 
 Types: `i8`…`i64`, `u8`…`u64`, `f32`, `f64`, `bool`, `(ptr T)`, `(slice T)`,
-`(array T N)`, `(fnptr c [Args…] R)`. Strings are UTF-8 `(slice u8)`; `c"text"`
+`(array T N)`, `(fnptr (cc/C) [Args…] R)`. Strings are UTF-8 `(slice u8)`; `c"text"`
 is a C `(ptr i8)`.
 
 ## Expressions

@@ -23,9 +23,9 @@ The Coil side:
 (module page)
 
 ;;; Host functions: declared but never defined, so each becomes an `env.*` import.
-(extern js_log :cc c [(ptr u8) i32] (-> void))
-(extern js_document :cc c [] (-> externref))
-(extern js_set_title :cc c [externref (ptr u8) i32] (-> void))
+(extern js_log :cc (cc/C) [(ptr u8) i32] (-> void))
+(extern js_document :cc (cc/C) [] (-> externref))
+(extern js_set_title :cc (cc/C) [externref (ptr u8) i32] (-> void))
 
 (defn text-len [(s (slice u8))] (-> i32) (cast i32 (len s)))
 
@@ -75,7 +75,7 @@ and `externref`. An `i64` appears in JavaScript as a `BigInt`.
 
 ## Calling JavaScript
 
-An `extern … :cc c` that is declared but never defined becomes an import
+An `extern … :cc (cc/C)` that is declared but never defined becomes an import
 named `env.<name>`. The module imports only the host functions it calls, so
 unused declarations cost nothing.
 

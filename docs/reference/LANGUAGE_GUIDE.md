@@ -82,7 +82,7 @@ area 10
 | Strings: `(slice u8)`, UTF-8, static storage | `"hello\n"`, `"\x1f603;"` |
 | C strings: `(ptr i8)`, NUL-terminated | `c"hello"` |
 | Keywords: `Keyword`; `{}` and `{:?}` print one as written | `:fast` |
-| `(ptr T)`, `(slice T)`, `(array T N)`, `(fnptr c [Args…] R)` | |
+| `(ptr T)`, `(slice T)`, `(array T N)`, `(fnptr (cc/C) [Args…] R)` | |
 
 An integer literal takes its width from context. A literal that does not fit its
 type is a compile error. One too big for an `i64`, up to 128 bits, needs that
@@ -294,7 +294,7 @@ A function that does not return declares `(-> never)`, and its body must end in
 something that does not return either: a panic, another `never` call, or a `loop`
 with no `break`. `never` is only a return type; a parameter, field or binding
 can't have it. A C function that does not return can be declared the same way,
-`(extern abort :cc c [] (-> never))`.
+`(extern abort :cc (cc/C) [] (-> never))`.
 
 ### Destructuring
 
@@ -328,13 +328,14 @@ can't have it. A C function that does not return can be declared the same way,
 
 ```coil
 (module example.functions)
+(import "coil.cc" :as cc)
 (defn move [(x i64) (dx i64) (scale i64)] (-> i64)
   (+ x (* dx scale)))
 
 (defn largest [(T Ord)] [(a T) (b T)] (-> T)
   (if (> a b) a b))
 
-(defn apply-twice [(f (fnptr c [i64] i64)) (x i64)] (-> i64)
+(defn apply-twice [(f (fnptr (cc/C) [i64] i64)) (x i64)] (-> i64)
   (f (f x)))
 
 (defn main [] (-> i64)
@@ -369,7 +370,7 @@ can't have it. A C function that does not return can be declared the same way,
   expected and they are inferred from it. Inside a generic function the type
   arguments may be its own type parameters, `(fnptr-of hash-key [K])`, and an
   anonymous function there may use them too.
-- A `c` function pointer that takes a struct or sum by value, `(fnptr c [Point]
+- A C function pointer that takes a struct or sum by value, `(fnptr (cc/C) [Point]
   i64)`, passes it by value as C does. A Coil function takes it by reference, so
   `fnptr-of` or `(fn …)` reaches it through a by-value entry, also when inference
   supplies the pointer type: `(sort xs (fnptr-of by-rank))` with `by-rank` over
@@ -1710,9 +1711,10 @@ and its file is left as it was.
 
 ```coil
 (module example.ffi)
+(import "coil.cc" :as cc)
 
-(extern strlen :cc c [(ptr i8)] (-> u64))
-(extern qsort :cc c [(ptr i8) u64 u64 (fnptr c [(ptr i64) (ptr i64)] i32)] (-> void))
+(extern strlen :cc (cc/C) [(ptr i8)] (-> u64))
+(extern qsort :cc (cc/C) [(ptr i8) u64 u64 (fnptr (cc/C) [(ptr i64) (ptr i64)] i32)] (-> void))
 
 (defn compare [(a (ptr i64)) (b (ptr i64))] (-> i32)
   (cond (< (load a) (load b)) -1
@@ -1730,8 +1732,12 @@ and its file is left as it was.
 1 3 5 9 / 4
 ```
 
-- `(extern name :cc c [ArgTypes…] (-> R))` declares a C function; `...` marks
+- `(extern name :cc (cc/C) [ArgTypes…] (-> R))` declares a C function; `...` marks
   varargs. `:as "symbol"` binds a different linker name.
+- A calling convention is a value of `coil.cc.NativeCc`, `(cc/C)`, `(cc/Fast)`,
+  `(cc/Cold)`, `(cc/Tail)` or `(cc/SwiftTail)`, under `(import "coil.cc" :as cc)`,
+  or the name of a `defcc` that pins arguments to registers with `:lower (cc/Shim)`.
+  A function or extern that names none uses `(cc/C)`.
 - Structs and floats cross the C ABI by value in both directions.
 - `(cast (ptr T) (mut x))` gives C a raw pointer to a local.
 - A Coil function passed to C as a callback is `(fnptr-of f)`. If the callback takes
@@ -1856,6 +1862,7 @@ which share its userland), `Wasm` (a wasm module's host) or `BareMetal` (a
 
 ```coil
 (module example.target)
+(import "coil.cc" :as cc)
 (import "coil.primitive" :as primitive)
 
 (defn pointer-bits [] (-> Code)
@@ -1882,10 +1889,10 @@ which share its userland), `Wasm` (a wasm module's host) or `BareMetal` (a
 (defn define-add [(name Code)] (-> Code)
   (match (target-arch)
     (Aarch64 []
-             `(defn ~name :cc c [(a i64) (b i64)] (-> i64)
+             `(defn ~name :cc (cc/C) [(a i64) (b i64)] (-> i64)
                 (primitive/machine-code (Aarch64) 0x00 0x00 0x01 0x8b)))
     (X86_64 []
-            `(defn ~name :cc c [(a i64) (b i64)] (-> i64)
+            `(defn ~name :cc (cc/C) [(a i64) (b i64)] (-> i64)
                (primitive/machine-code (X86_64) 0x48 0x8d 0x04 0x37)))
     (_ (primitive/error "add has machine code for aarch64 and x86_64"))))
 

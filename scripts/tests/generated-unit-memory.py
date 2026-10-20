@@ -37,7 +37,7 @@ def provider_source(units: int) -> str:
         f'(let [a (meta/expansion-allocator)] (for [i 0 {units}] '
         '(let [index (p/int->str i) name (sconcat a "generated.memory.unit" index) '
         'symbol (sconcat a "value" index) declaration (sconcat3 a "(module " name ") ") '
-        'interface (sconcat a declaration (sconcat3 a "(extern " symbol " :cc c [] (-> i64)) ")) '
+        'interface (sconcat a declaration (sconcat3 a "(extern " symbol " :cc (coil.cc.C) [] (-> i64)) ")) '
         'exported (sconcat a interface (sconcat3 a "(export " symbol ")")) '
         'body (sconcat a declaration (sconcat a (sconcat3 a "(defn " symbol " [] (-> i64) ") (sconcat a index ")")))] '
         '(meta/generated-unit! name exported body)) 0)) '

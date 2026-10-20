@@ -211,7 +211,7 @@ printf 'sample\n' > "$P/test/sample.txt"
 cat > "$P/app/src/main.coil" <<'EOF'
 (module pfptr.main)
 (import "coil.str" :use [from-cstr])
-(extern access :cc c [(ptr i8) i32] (-> i32))
+(extern access :cc (coil.cc.C) [(ptr i8) i32] (-> i32))
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
   (for [i 1 (cast i64 argc)]
     (println "[{}] {}"

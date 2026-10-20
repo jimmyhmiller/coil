@@ -73,12 +73,12 @@ with tempfile.TemporaryDirectory(prefix="coil-generated-tests-", dir=os.environ.
 
     state = (
         "generated.state",
-        "(module generated.state) (extern generated_cell :cc c [] (-> (ptr i64))) (export generated_cell)",
+        "(module generated.state) (extern generated_cell :cc (coil.cc.C) [] (-> (ptr i64))) (export generated_cell)",
         "(module generated.state) (defn generated_cell [] (-> (ptr i64)) (primitive/alloc-static i64 21))",
     )
     consumer = (
         "generated.consumer",
-        "(module generated.consumer) (extern generated_answer :cc c [] (-> i64)) (export generated_answer)",
+        "(module generated.consumer) (extern generated_answer :cc (coil.cc.C) [] (-> i64)) (export generated_answer)",
         '(module generated.consumer) (import "generated.state" :as state) '
         '(defn generated_answer [] (-> i64) (let [cell (state/generated_cell)] '
         '(primitive/store! cell (* (primitive/load cell) 2)) (primitive/load cell)))',
@@ -132,11 +132,11 @@ with tempfile.TemporaryDirectory(prefix="coil-generated-tests-", dir=os.environ.
     # and every owner. A process-per-unit implementation cannot pass this probe.
     identity_helper = directory / "compiler-identity.coil"
     identity_helper.write_text('(module generated.compiler-identity) '
-        '(import "coil.primitive" :as p) (extern getpid :cc c [] (-> i32)) '
+        '(import "coil.primitive" :as p) (extern getpid :cc (coil.cc.C) [] (-> i32)) '
         '(defn compiling-pid [(context Code)] (-> Code) '
         '(p/code-read (p/int->str (cast i64 (getpid))) context)) (export compiling-pid)')
     identities = [(f"generated.identity{i}",
-        f"(module generated.identity{i}) (extern identity{i} :cc c [] (-> i64)) (export identity{i})",
+        f"(module generated.identity{i}) (extern identity{i} :cc (coil.cc.C) [] (-> i64)) (export identity{i})",
         f'(module generated.identity{i}) (import "generated.compiler-identity" :as identity) '
         f'(defn identity{i} [] (-> i64) (identity/compiling-pid `0))') for i in range(3)]
     identity_facade = '(module generated.facade) (import "generated.compiler-identity" :as identity) '
@@ -173,7 +173,7 @@ with tempfile.TemporaryDirectory(prefix="coil-generated-tests-", dir=os.environ.
     run(["cc", "-c", str(native_source), "-o", str(native_object)])
     run(["ar", "rcs", str(native_dir / "libgeneratednative.a"), str(native_object)])
     entry.write_text('(module generated.imported-entry) (import "generated.facade" :as facade) '
-                     '(extern generated_native_value :cc c [] (-> i64)) '
+                     '(extern generated_native_value :cc (coil.cc.C) [] (-> i64)) '
                      '(defn main [] (-> i64) (if (= (facade/answer) 42) (generated_native_value) 1))')
     original_manifest = manifest.read_text()
     manifest_text = original_manifest + ('[link] # section comment\nlibs = [\n "generatednative",\n]\n'
@@ -186,11 +186,11 @@ with tempfile.TemporaryDirectory(prefix="coil-generated-tests-", dir=os.environ.
     entry.unlink()
     returned_callback = ("generated.returned-callback",
         '(module generated.returned-callback) '
-        '(extern generated_get_callback :cc c [] (-> (fnptr c [] void))) '
+        '(extern generated_get_callback :cc (coil.cc.C) [] (-> (fnptr (coil.cc.C) [] void))) '
         '(export generated_get_callback)',
         '(module generated.returned-callback) '
         '(defn callback [] (-> void) (do)) '
-        '(defn generated_get_callback [] (-> (fnptr c [] void)) (primitive/fnptr-of callback))')
+        '(defn generated_get_callback [] (-> (fnptr (coil.cc.C) [] void)) (primitive/fnptr-of callback))')
     provider([returned_callback], '(module generated.facade) '
              '(import "coil.primitive" :as primitive) '
              '(import "generated.returned-callback" :as callback) '
@@ -221,13 +221,13 @@ with tempfile.TemporaryDirectory(prefix="coil-generated-tests-", dir=os.environ.
         '(module generated.shared-types)')
     identity = ("generated.identity",
         '(module generated.identity) (import "generated.shared-types") '
-        '(extern generated_identity :cc c [generated.shared-types.Pair] (-> generated.shared-types.Pair)) '
+        '(extern generated_identity :cc (coil.cc.C) [generated.shared-types.Pair] (-> generated.shared-types.Pair)) '
         '(export generated_identity)',
         '(module generated.identity) (defn generated_identity [(value generated.shared-types.Pair)] '
         '(-> generated.shared-types.Pair) value)')
     shared_consumer = ("generated.shared-consumer",
         '(module generated.shared-consumer) (import "generated.shared-types") '
-        '(extern shared_answer :cc c [] (-> i64)) (export shared_answer)',
+        '(extern shared_answer :cc (coil.cc.C) [] (-> i64)) (export shared_answer)',
         '(module generated.shared-consumer) (import "generated.identity" :as peer) '
         '(defn shared_answer [] (-> i64) '
         '(let [value (peer/generated_identity (load (generated.shared-types.Pair :value 42)))] (.value value)))')
@@ -248,7 +248,7 @@ with tempfile.TemporaryDirectory(prefix="coil-generated-tests-", dir=os.environ.
     interpreted = environment | {"COIL_META_INTERP": "1"}
     invoke("run", "--quiet", expected=42, env=interpreted)
 
-    interface = "(module generated.value) (extern generated_value :cc c [] (-> i64)) (export generated_value)"
+    interface = "(module generated.value) (extern generated_value :cc (coil.cc.C) [] (-> i64)) (export generated_value)"
     facade_value = '(module generated.facade) (import "generated.value" :as value) (defn main [] (-> i64) (value/generated_value))'
     body = '(module generated.value) (defn twice [(x Code)] (-> Code) `(* ~x 2)) (defn generated_value [] (-> i64) (twice 21))'
     # A macro runs inside the unit, and the build's configuration reaches it.
@@ -305,13 +305,13 @@ with tempfile.TemporaryDirectory(prefix="coil-generated-tests-", dir=os.environ.
     failure("check", "interface must declare")
 
     aliased = ("generated.aliased",
-        '(module generated.aliased) (extern safe_answer :as "generated_native_answer" :cc c [] (-> i64)) (export safe_answer)',
+        '(module generated.aliased) (extern safe_answer :as "generated_native_answer" :cc (coil.cc.C) [] (-> i64)) (export safe_answer)',
         '(module generated.aliased) (defn safe_answer [] (-> i64) 42)')
     alias_facade = '(module generated.facade) (import "generated.aliased" :as api) (defn main [] (-> i64) (api/safe_answer))'
     provider([aliased], alias_facade)
     invoke("run", "--backend", "llvm", "--quiet", expected=42)
     conflicting_alias = ("generated.conflicting-alias",
-        '(module generated.conflicting-alias) (extern different_binding :cc c :as "generated_native_answer" [] (-> i64)) (export different_binding)',
+        '(module generated.conflicting-alias) (extern different_binding :cc (coil.cc.C) :as "generated_native_answer" [] (-> i64)) (export different_binding)',
         '(module generated.conflicting-alias) (defn different_binding [] (-> i64) 0)')
     provider([aliased, conflicting_alias], alias_facade)
     failure("check", "different generated-module owner")

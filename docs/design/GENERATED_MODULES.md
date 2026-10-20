@@ -11,7 +11,7 @@ return `Code` and existing non-partitioned programs keep their compilation model
 (meta/generated-unit!
   "generated.answer"
   "(module generated.answer)
-   (extern generated_answer :cc c [] (-> i64))
+   (extern generated_answer :cc (cc/C) [] (-> i64))
    (export generated_answer)"
   "(module generated.answer)
    (defn generated_answer [] (-> i64) 42)")
@@ -23,7 +23,7 @@ submitted in any order: all interfaces are registered before implementations
 compile. Imports inside interfaces have the stricter ordering rule below.
 
 An interface contains its module declaration, concrete `defstruct`/`defsum`
-declarations, `export` declarations, and explicit `extern NAME :cc c` signatures.
+declarations, `export` declarations, and explicit `extern NAME :cc (cc/C)` signatures.
 An extern may include `:as "c_symbol"` to separate its safe Coil binding from the
 native entry name. Ownership is checked by the actual linker name, including
 collisions between differently named bindings. Generated exports retain the
