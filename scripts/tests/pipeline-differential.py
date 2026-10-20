@@ -39,10 +39,15 @@ def dump(compiler, command, path):
     env = {**os.environ, "COIL_NAMESPACE_ROOTS": "src:tests:scripts", "COIL_STRICT_BUNDLE": "0"}
     result = subprocess.run([str(compiler), command, str(path)], cwd=ROOT, env=env,
                             capture_output=True, timeout=900)
-    return result.stdout + b"\n--stderr--\n" + result.stderr
+    if result.returncode not in (0, 1):
+        raise RuntimeError(
+            f"{compiler} {command} {path}: abnormal exit {result.returncode}\n"
+            + result.stderr.decode(errors="replace")[:2000])
+    return (f"--status--{result.returncode}\n".encode()
+            + result.stdout + b"\n--stderr--\n" + result.stderr)
 
 
-def compare(reference, candidate, path):
+def compare(reference, candidate, path, output_dir=None):
     problems = []
     for command in DUMPS:
         old = dump(reference, command, path)
@@ -52,8 +57,18 @@ def compare(reference, candidate, path):
             new_lines = new.split(b"\n")
             line = next((i for i, (x, y) in enumerate(zip(old_lines, new_lines)) if x != y),
                         min(len(old_lines), len(new_lines)))
-            show = lambda lines: lines[line][:200].decode(errors="replace") if line < len(lines) else "<end>"
-            problems.append(f"{path.relative_to(ROOT)} {command} line {line + 1}\n"
+            old_line = old_lines[line] if line < len(old_lines) else b""
+            new_line = new_lines[line] if line < len(new_lines) else b""
+            column = next((i for i, (x, y) in enumerate(zip(old_line, new_line)) if x != y),
+                          min(len(old_line), len(new_line)))
+            show = lambda lines: (lines[line][max(0, column - 80):column + 120].decode(errors="replace")
+                                  if line < len(lines) else "<end>")
+            if output_dir is not None:
+                base = output_dir / path.relative_to(ROOT)
+                base.parent.mkdir(parents=True, exist_ok=True)
+                Path(str(base) + f".{command}.reference.txt").write_bytes(old)
+                Path(str(base) + f".{command}.candidate.txt").write_bytes(new)
+            problems.append(f"{path.relative_to(ROOT)} {command} line {line + 1}, byte {column + 1}\n"
                             f"  reference: {show(old_lines)}\n  candidate: {show(new_lines)}")
     return problems
 
@@ -63,6 +78,7 @@ def main():
     parser.add_argument("reference")
     parser.add_argument("candidate")
     parser.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) // 2))
+    parser.add_argument("--output-dir", type=Path, help="preserve both raw dumps for every mismatch")
     args = parser.parse_args()
     reference = Path(args.reference).resolve()
     candidate = Path(args.candidate).resolve()
@@ -92,7 +108,7 @@ def main():
         shutil.copy2(candidate, paired_candidate)
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
             for problems in pool.map(
-                    lambda path: compare(paired_reference, paired_candidate, path), files):
+                    lambda path: compare(paired_reference, paired_candidate, path, args.output_dir), files):
                 failures.extend(problems)
     for problem in failures:
         print(f"DIFF {problem}")
