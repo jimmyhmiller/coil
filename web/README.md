@@ -33,7 +33,7 @@ fast first load and a slow one.
 ## How it fits together
 
 `coil-worker.js` is a browser port of `src/tooling/wasm-host/run-coil-wasm.mjs`: the
-same 64 `env.*` imports and the same reclaiming allocator (a plain bump allocator
+same `env.*` imports and the same reclaiming allocator (a plain bump allocator
 leaks catastrophically — the interpreter mallocs a 1 MiB frame per `vm-exec` and frees
 it on return). Node's `fs` becomes `vfs.js`; node's streams become captured output.
 
@@ -58,16 +58,17 @@ Two things about that filesystem are load-bearing and easy to get wrong:
   it cannot find its own standard library.
 - **`access(2)` must answer for directories too**, for the same walk.
 
-## `env.system`
+## Wall 1
 
-`loader.coil` builds its namespace index by shelling out to `find` and reading the
-listing. There is no shell in a tab, so the worker emulates *that one command* against
-the VFS and throws on anything else rather than returning a success status it did not
-earn. `COIL_NAMESPACE_ROOTS` is pinned to `/work`, so the index covers the user's file
-and nothing else.
+The loader enumerates source files itself (`opendir`/`readdir`, which the worker
+serves from the VFS), so nothing on the playground's path runs a command:
+`system`, `posix_spawnp` and `waitpid`, like `mmap`, `mprotect`, `dlopen`, `dlsym`
+and `pthread_create`, are loud traps. `check` and `interp` never reach them.
+`COIL_NAMESPACE_ROOTS` is pinned to `/work`, so the index covers the user's file and
+nothing else.
 
-Everything else behind Wall 1 — `mmap`, `mprotect`, `dlopen`, `dlsym`,
-`pthread_create` — stays a loud trap. `check` and `interp` never reach them.
+The libc pieces that must match C exactly, `printf`'s formatting and a fused `fma`,
+are `hostlib.js`, shared with the Node hosts in `src/tooling/wasm-host`.
 
 ## The two ways to run a program
 

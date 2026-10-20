@@ -20,6 +20,7 @@
 // program's memory and function table, so C can call back through a Coil
 // function pointer.
 import fs from 'node:fs';
+import { fusedMultiplyAdd } from '../../../web/hostlib.js';
 
 const argv = process.argv.slice(2);
 const clibPaths = [];
@@ -56,8 +57,8 @@ for (const [name, f] of Object.entries({
   round: (x) => { const t = Math.trunc(x); return Math.abs(x - t) >= 0.5 ? t + Math.sign(x) : t; },
   // nearbyint in the default rounding mode: halfway cases to even
   nearbyint: (x) => { const f = Math.floor(x); const d = x - f; return d > 0.5 || (d === 0.5 && f % 2 !== 0) ? f + 1 : (d === 0 ? x : f); },
-  // JS has no fused multiply-add: this rounds twice, so exact-rounding tests need a real libm
-  fma: (x, y, z) => x * y + z,
+  // rounded once, as a fused multiply-add is (web/hostlib.js)
+  fma: (x, y, z) => fusedMultiplyAdd(x, y, z, 53, -1074),
   copysign: (x, y) => (Math.sign(y) < 0 || Object.is(y, -0) ? -Math.abs(x) : Math.abs(x)),
   sin: Math.sin, cos: Math.cos, tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,
   atan2: Math.atan2, sinh: Math.sinh, cosh: Math.cosh, tanh: Math.tanh, exp: Math.exp,
@@ -69,6 +70,8 @@ for (const [name, f] of Object.entries({
   libm[name] = f;
   libm[name + 'f'] = (...a) => Math.fround(f(...a));
 }
+// fmaf rounds once to f32; rounding the f64 fma again could round twice.
+libm.fmaf = (x, y, z) => Math.fround(fusedMultiplyAdd(x, y, z, 24, -149));
 
 const known = {
   ...libm,

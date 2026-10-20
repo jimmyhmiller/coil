@@ -162,8 +162,12 @@ try {
   check('browser run', false, e.message);
 } finally {
   ws?.close();
+  // Chrome keeps writing its profile while it shuts down; remove it once it has exited.
+  const exited = chrome.exitCode !== null || chrome.signalCode !== null
+    ? Promise.resolve() : new Promise((resolve) => chrome.once('exit', resolve));
   chrome.kill();
   server.kill();
+  await exited;
   rmSync(profile, { recursive: true, force: true });
 }
 

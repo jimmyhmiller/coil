@@ -8,6 +8,7 @@
 //   e.g.  node ... run-coil-wasm.mjs /tmp/coilc.wasm check /tmp/wtest.coil
 import fs from 'node:fs';
 import { execSync } from 'node:child_process';
+import { formatC, fusedMultiplyAdd, vaReader, wasmOpenFlags } from '../../../web/hostlib.js';
 
 const [wasmPath, ...coilArgs] = process.argv.slice(2);
 if (!wasmPath) { console.error('usage: run-coil-wasm.mjs <wasm> <coil-args...>'); process.exit(2); }
@@ -191,49 +192,6 @@ function hostMkdtemp(templatePtr) {
   }
 }
 
-// fma/fmaf round a*b+c ONCE. JavaScript has no fused operation and a*b+c rounds
-// twice, so compute the exact value as an integer scaled by a power of two and
-// round that to `precision` significant bits, with `minExponent` the exponent of
-// the smallest subnormal.
-function exactParts(x) {
-  const view = new DataView(new ArrayBuffer(8));
-  view.setFloat64(0, x, true);
-  const bits = view.getBigUint64(0, true);
-  const exponent = Number((bits >> 52n) & 0x7ffn);
-  const fraction = bits & 0xfffffffffffffn;
-  const mantissa = exponent === 0 ? fraction : fraction | (1n << 52n);
-  const scale = exponent === 0 ? -1074 : exponent - 1075;
-  return { mantissa: bits >> 63n ? -mantissa : mantissa, scale };
-}
-function fusedMultiplyAdd(a, b, c, precision, minExponent) {
-  if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(c)) return a * b + c;
-  const pa = exactParts(a), pb = exactParts(b), pc = exactParts(c);
-  let m1 = pa.mantissa * pb.mantissa, e1 = pa.scale + pb.scale;
-  let m2 = pc.mantissa, e2 = pc.scale;
-  const e = Math.min(e1, e2);
-  let m = (m1 << BigInt(e1 - e)) + (m2 << BigInt(e2 - e));
-  if (m === 0n) {
-    // An exact zero sum is -0 only when both addends are -0 or negative zeros.
-    const productNegative = (Object.is(a * b, -0) || a * b < 0);
-    const cNegative = Object.is(c, -0) || c < 0;
-    return productNegative && cNegative ? -0 : 0;
-  }
-  const negative = m < 0n;
-  if (negative) m = -m;
-  const bitLength = m.toString(2).length;
-  const shift = Math.max(bitLength - precision, minExponent - e);
-  let q = m, qe = e;
-  if (shift > 0) {
-    const s = BigInt(shift);
-    q = m >> s;
-    const rest = m - (q << s), half = 1n << (s - 1n);
-    if (rest > half || (rest === half && (q & 1n) === 1n)) q += 1n;
-    qe = e + shift;
-  }
-  const magnitude = Number(q) * Math.pow(2, qe);
-  return negative ? -magnitude : magnitude;
-}
-
 // libc environment bridge. Keep returned strings alive for the process lifetime,
 // matching getenv's contract closely enough for the compiler's namespace setup.
 const hostEnv = new Map(Object.entries(process.env));
@@ -268,14 +226,24 @@ function hostUnsetenv(namePtr) {
 
 // ---- file descriptors ------------------------------------------------------
 // Node fds are small ints; use them directly. 0/1/2 are std streams.
-function doOpen(pathPtr, flags) {
-  const path = cstr(pathPtr);
-  // Flags use the wasm host interface's numbering (docs/reference/WASM.md): the
-  // access mode is the low two bits; 'w' creates and truncates.
-  const acc = flags & 3;
-  let mode = acc === 0 ? 'r' : acc === 1 ? 'w' : 'r+';
-  try { return fs.openSync(path, mode); }
-  catch { return -1; }
+// open(2): the flags in the host interface's numbering (docs/reference/WASM.md),
+// translated to this host's; the mode is the variadic argument, read only when
+// the flags create a file, as libc's open reads it.
+function doOpen(pathPtr, flags, va) {
+  const f = wasmOpenFlags(flags);
+  if (f === null) { dv().setInt32(Number(hostErrno()), 22, true); return -1; }   // EINVAL
+  const c = fs.constants;
+  let native = f.access === 'read' ? c.O_RDONLY : f.access === 'write' ? c.O_WRONLY : c.O_RDWR;
+  if (f.append) native |= c.O_APPEND;
+  if (f.nofollow) native |= c.O_NOFOLLOW;
+  if (f.create) native |= c.O_CREAT;
+  if (f.truncate) native |= c.O_TRUNC;
+  if (f.exclusive) native |= c.O_EXCL;
+  if (f.directory) native |= c.O_DIRECTORY;
+  // Node opens every descriptor close-on-exec, so O_CLOEXEC needs no bit.
+  const mode = f.create ? Number(vaReader(dv, va)(4)) : 0o666;
+  try { return fs.openSync(cstr(pathPtr), native, mode); }
+  catch (e) { return hostFail(e); }
 }
 function doRead(fd, ptr, len) {
   len = Number(len);
@@ -405,39 +373,25 @@ function meta_run_ct(bytesPtr, len, thunkSymPtr, statusSymPtr, kind, cell) {
   return st;
 }
 
-// ---- minimal snprintf(buf,size,fmt,arg) — one conversion -------------------
-function snprintf(bufPtr, size, fmtPtr, arg) {
-  const fmt = cstr(fmtPtr);
-  let out = fmt.replace(/%l?l?[dizu]/,(m)=>String(BigInt.asIntN(64,BigInt(arg))))
-               .replace(/%l?l?[xX]/,(m)=>BigInt.asUintN(64,BigInt(arg)).toString(16))
-               .replace(/%s/,()=>cstr(arg))
-               .replace(/%c/,()=>String.fromCharCode(Number(arg)&0xff))
-               .replace(/%p/,()=>'0x'+BigInt.asUintN(64,BigInt(arg)).toString(16));
-  const b = Buffer.from(out + '\0','utf8');
-  const n = Math.min(b.length, Number(size));
-  writeBytes(bufPtr, b.subarray(0, n));
-  return b.length - 1;                            // chars that would have been written
+// ---- printf family: over the guest's va_list buffer (web/hostlib.js) --------
+function byteString(ptr) {                        // a C string as bytes, one char each
+  const m = u8(); let e = Number(ptr), text = '';
+  while (m[e] !== 0) e++;
+  for (let i = Number(ptr); i < e; i++) text += String.fromCharCode(m[i]);
+  return text;
 }
-
-// minimal printf-family formatter over an argument list (BigInt cells): handles the
-// integer/string/char/hex/pointer conversions a metaprogram would use. %f-family is
-// approximated from the raw i64 bit-pattern reinterpreted as a double.
-function fmtc(fmt, args) {
-  let i = 0;
-  return fmt.replace(/%l?l?[dioux%csfgpX]/g, (m) => {
-    if (m === '%%') return '%';
-    const a = args[i++] ?? 0n;
-    const c = m[m.length - 1];
-    if (c === 'd' || c === 'i') return String(BigInt.asIntN(64, BigInt(a)));
-    if (c === 'u' || c === 'o') return String(BigInt.asUintN(64, BigInt(a)));
-    if (c === 'x') return BigInt.asUintN(64, BigInt(a)).toString(16);
-    if (c === 'X') return BigInt.asUintN(64, BigInt(a)).toString(16).toUpperCase();
-    if (c === 'p') return '0x' + BigInt.asUintN(64, BigInt(a)).toString(16);
-    if (c === 'c') return String.fromCharCode(Number(a) & 0xff);
-    if (c === 's') return cstr(a);
-    if (c === 'f' || c === 'g') { const dv2 = new DataView(new ArrayBuffer(8)); dv2.setBigUint64(0, BigInt.asUintN(64, BigInt(a)), true); return String(dv2.getFloat64(0, true)); }
-    return m;
-  });
+function formatted(fmtPtr, va) {
+  return Buffer.from(formatC(byteString(fmtPtr), vaReader(dv, va), byteString), 'latin1');
+}
+function snprintf(bufPtr, size, fmtPtr, va) {
+  const out = formatted(fmtPtr, va);
+  const n = Number(size);
+  if (n > 0) {
+    const w = Math.min(out.length, n - 1);
+    writeBytes(bufPtr, out.subarray(0, w));
+    u8()[Number(bufPtr) + w] = 0;
+  }
+  return out.length;
 }
 
 const env = {
@@ -506,8 +460,11 @@ const env = {
   putchar:(c)=>{ process.stdout.write(Buffer.from([Number(c)&0xff])); return Number(c)&0xff; },
   putc:(c,_s)=>{ process.stdout.write(Buffer.from([Number(c)&0xff])); return Number(c)&0xff; },
   puts:(p)=>{ process.stdout.write(cstr(p)+'\n'); return 1; },
-  printf:(fmtPtr,...a)=>{ const s=fmtc(cstr(fmtPtr),a); process.stdout.write(s); return s.length; },
-  dprintf:(fd,fmtPtr,...a)=>{ const s=fmtc(cstr(fmtPtr),a); doWrite(Number(fd),0n,0n); (Number(fd)===2?process.stderr:process.stdout).write(s); return s.length; },
+  printf:(fmtPtr,va)=>{ const out=formatted(fmtPtr,va); process.stdout.write(out); return out.length; },
+  dprintf:(fd,fmtPtr,va)=>{ const out=formatted(fmtPtr,va); fd=Number(fd);
+    if (fd===1) process.stdout.write(out); else if (fd===2) process.stderr.write(out);
+    else { try { fs.writeSync(fd, out); } catch (e) { return hostFail(e); } }
+    return out.length; },
   calloc:(n,sz)=>{ const total=BigInt(n)*BigInt(sz); const p=malloc(total===0n?1n:total); u8().fill(0,Number(p),Number(p)+Number(total)); return p; },
   atoi:(p)=>{ const v=parseInt(cstr(p),10); return isNaN(v)?0:(v|0); },
   strcmp:(a,b)=>{ const sa=cstr(a),sb=cstr(b); return sa<sb?-1:(sa>sb?1:0); },

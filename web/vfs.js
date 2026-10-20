@@ -49,6 +49,7 @@ export class Vfs {
   constructor(base, cwd = '/work') {
     this.base = base;
     this.overlay = new Map();
+    this.dirs = new Set([cwd]);    // directories made empty: mkdir, mkdtemp
     this.cwd = cwd;
     this.fds = new Map();          // fd -> {path, pos, data, writing}
     this.nextFd = 3;               // 0/1/2 are the std streams
@@ -66,13 +67,49 @@ export class Vfs {
     return this.overlay.has(path) || this.base.has(path);
   }
 
-  // A directory exists if anything lives under it. The compiler probes candidate
-  // library directories this way while walking up from argv[0].
+  // A directory exists if it was made or anything lives under it. The compiler
+  // probes candidate library directories this way while walking up from argv[0].
   isDir(path) {
+    if (path === '/' || this.dirs.has(path)) return true;
     const prefix = path.endsWith('/') ? path : path + '/';
+    for (const d of this.dirs) if (d.startsWith(prefix)) return true;
     for (const p of this.overlay.keys()) if (p.startsWith(prefix)) return true;
     for (const p of this.base.keys()) if (p.startsWith(prefix)) return true;
     return false;
+  }
+
+  // The names directly in directory PATH, with whether each is a directory.
+  list(path) {
+    const prefix = path === '/' ? '/' : path + '/';
+    const entries = new Map();
+    const add = (p, dir) => {
+      if (!p.startsWith(prefix)) return;
+      const rest = p.slice(prefix.length);
+      if (rest === '') return;
+      const slash = rest.indexOf('/');
+      const name = slash < 0 ? rest : rest.slice(0, slash);
+      entries.set(name, entries.get(name) || dir || slash >= 0);
+    };
+    for (const p of this.base.keys()) add(p, false);
+    for (const p of this.overlay.keys()) add(p, false);
+    for (const d of this.dirs) add(d, true);
+    return [...entries].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([name, dir]) => ({ name, dir }));
+  }
+
+  // 0, or the errno (Darwin's numbering, as the guest's libc) mkdir(2) fails with.
+  mkdir(path) {
+    if (this.exists(path) || this.isDir(path)) return 17;          // EEXIST
+    const parent = path.slice(0, path.lastIndexOf('/')) || '/';
+    if (!this.isDir(parent)) return 2;                             // ENOENT
+    this.dirs.add(path);
+    return 0;
+  }
+
+  rmdir(path) {
+    if (!this.isDir(path)) return this.exists(path) ? 20 : 2;     // ENOTDIR, ENOENT
+    if (this.list(path).length) return 66;                         // ENOTEMPTY
+    this.dirs.delete(path);
+    return 0;
   }
 
   paths() {
@@ -84,8 +121,14 @@ export class Vfs {
     return this.overlay;
   }
 
-  open(path, { write = false, truncate = false } = {}) {
+  // An fd, or -errno. WRITE handles append to the file's contents; CREATE and
+  // EXCLUSIVE are O_CREAT and O_EXCL.
+  open(path, { write = false, truncate = false, create = write, exclusive = false } = {}) {
     if (write) {
+      if (this.isDir(path)) return -21;                            // EISDIR
+      const present = this.exists(path);
+      if (present && exclusive) return -17;                        // EEXIST
+      if (!present && !create) return -2;                          // ENOENT
       const existing = truncate ? null : this.read(path);
       const data = existing ? Array.from(existing) : [];
       const fd = this.nextFd++;
@@ -97,7 +140,7 @@ export class Vfs {
     // the standard library. Fail it and the compiler cannot find its own library.
     let data = this.read(path);
     if (data === null) {
-      if (!this.isDir(path)) return -1;
+      if (!this.isDir(path)) return -2;                            // ENOENT
       data = new Uint8Array(0);
     }
     const fd = this.nextFd++;

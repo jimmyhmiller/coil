@@ -91,18 +91,18 @@ def main() -> int:
 
     (out / "coilc.wasm").write_bytes(wasm.read_bytes())
     (out / "coil-fs.bin").write_bytes(pack(files))
-    for name in ("index.html", "coil-worker.js", "vfs.js"):
+    for name in ("index.html", "coil-worker.js", "vfs.js", "hostlib.js"):
         shutil.copy2(WEB / name, out / name)
 
-    for name in ("coilc.wasm", "coil-fs.bin", "coil-worker.js", "vfs.js", "index.html"):
+    for name in ("coilc.wasm", "coil-fs.bin", "coil-worker.js", "vfs.js", "hostlib.js", "index.html"):
         compress(out / name)
 
     print(f"staged {len(files)} Coil sources into {out}")
-    for name in ("coilc.wasm", "coil-fs.bin", "index.html", "coil-worker.js", "vfs.js"):
+    for name in ("coilc.wasm", "coil-fs.bin", "index.html", "coil-worker.js", "vfs.js", "hostlib.js"):
         report(out / name)
 
     total_br = sum((out / n).with_suffix(Path(n).suffix + ".br").stat().st_size
-                   for n in ("coilc.wasm", "coil-fs.bin", "index.html", "coil-worker.js", "vfs.js")
+                   for n in ("coilc.wasm", "coil-fs.bin", "index.html", "coil-worker.js", "vfs.js", "hostlib.js")
                    if (out / n).with_suffix(Path(n).suffix + ".br").exists())
     if total_br:
         print(f"  total over the wire (brotli): {human(total_br)}")

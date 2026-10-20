@@ -1,6 +1,6 @@
 // coil-worker.js — the Coil compiler, running as wasm, in a Web Worker.
 //
-// A browser port of src/tooling/wasm-host/run-coil-wasm.mjs. Same 64 `env.*` imports,
+// A browser port of src/tooling/wasm-host/run-coil-wasm.mjs. The same `env.*` imports,
 // same reclaiming allocator; node's `fs` becomes the in-memory Vfs and node's streams
 // become captured output. Everything runs off the main thread because a compile is
 // synchronous from wasm's point of view and would otherwise freeze the page.
@@ -11,6 +11,7 @@
 // an already-compiled Module is cheap; recompiling 3.4 MB is not.
 
 import { Vfs, unpack, normalize } from './vfs.js';
+import { formatC, fusedMultiplyAdd, vaReader, wasmOpenFlags } from './hostlib.js';
 
 const PAGE = 65536;
 const enc = new TextEncoder();
@@ -77,6 +78,26 @@ class Run {
     return p;
   }
 
+  // posix_memalign: 0 with the block's address at OUT, or EINVAL. A block aligned
+  // past the allocator's 16 bytes is carved fresh from the heap, with its size
+  // header before it like any other, so free() bins it as usual.
+  memalign(out, alignment, size) {
+    alignment = BigInt(alignment); size = BigInt(size);
+    if (alignment < 8n || (alignment & (alignment - 1n)) !== 0n) return 22;
+    let p;
+    if (alignment <= 16n) {
+      p = this.malloc(size);
+    } else {
+      size = this.alignUp(size <= 0n ? 1n : size, 16n);
+      p = this.alignUp(this.heap + 16n, alignment);
+      this.heap = p + size;
+      this.ensure(this.heap);
+      this.dv().setBigUint64(Number(p - 8n), size, true);
+    }
+    this.dv().setBigUint64(Number(out), p, true);
+    return 0;
+  }
+
   free(ptr) {
     ptr = BigInt(ptr);
     if (ptr < 16n || ptr >= this.heap) return;
@@ -132,36 +153,6 @@ class Run {
 }
 
 // ---------------------------------------------------------------------------
-// `system` — the ONE host command the compiler shells out for.
-//
-// loader.coil builds its namespace index by running `find` and reading the listing.
-// There is no shell here, so emulate exactly that command against the Vfs and refuse
-// anything else loudly rather than returning a success status we did not earn.
-function emulateSystem(run, cmd) {
-  const m = cmd.match(
-    /^find\s+(.*?)\s+-name\s+'\.\?\*'\s+-prune\s+-o\s+-type\s+f\s+-name\s+'\*\.coil'\s+-print\s+>\s+'([^']*)'\s*$/);
-  if (!m) {
-    throw new Error(
-      `env.system: the browser host emulates only loader.coil's namespace-index \`find\`; ` +
-      `refusing to fake a result for: ${cmd}`);
-  }
-  const roots = [...m[1].matchAll(/'([^']*)'/g)].map((x) => x[1]);
-  const dest = m[2];
-  const lines = [];
-  for (const root of roots) {                    // duplicate roots list twice, as find does
-    const prefix = root.endsWith('/') ? root : root + '/';
-    for (const p of run.vfs.paths()) {
-      if (!p.startsWith(prefix) || !p.endsWith('.coil')) continue;
-      const rest = p.slice(prefix.length);
-      if (rest.split('/').some((part) => part.startsWith('.'))) continue;  // -name '.?*' -prune
-      lines.push(p);
-    }
-  }
-  run.vfs.writeFile(dest, lines.length ? lines.join('\n') + '\n' : '');
-  return 0;
-}
-
-// ---------------------------------------------------------------------------
 
 function makeEnv(run) {
   const vfs = run.vfs;
@@ -169,11 +160,72 @@ function makeEnv(run) {
     throw new Error(`WALL1: env.${name} — native execution (JIT/dlopen/subprocess) is not available in the browser`);
   };
 
-  const doOpen = (pathPtr, flags) => {
-    const path = normalize(run.cstr(pathPtr), CWD);
-    const acc = Number(flags) & 3;
-    if (acc === 0) return vfs.open(path);
-    return vfs.open(path, { write: true, truncate: acc === 1 });
+  // A path the guest passed, made absolute against the working directory.
+  const pathAt = (ptr) => normalize(run.cstr(ptr), vfs.cwd);
+  // Fail a call with errno CODE (the guest libc's numbering: Darwin's).
+  const fail = (code, result = -1) => {
+    if (run.errnoPtr === 0n) run.errnoPtr = run.malloc(4n);
+    run.dv().setInt32(Number(run.errnoPtr), code, true);
+    return result;
+  };
+  const fdOrFail = (fd) => (fd < 0 ? fail(-fd) : fd);
+
+  // open(2); its mode, the variadic argument, means nothing to the VFS.
+  const doOpen = (pathPtr, flags, _va) => {
+    const f = wasmOpenFlags(flags);
+    if (f === null) return fail(22);                               // EINVAL
+    if (f.access === 'readwrite') throw new Error('vfs: open(O_RDWR) is not supported');
+    const path = pathAt(pathPtr);
+    if (f.directory && !vfs.isDir(path)) return fail(vfs.exists(path) ? 20 : 2);
+    if (f.access === 'read') return fdOrFail(vfs.open(path));
+    return fdOrFail(vfs.open(path, { write: true, truncate: f.truncate, create: f.create, exclusive: f.exclusive }));
+  };
+
+  // Directory streams over the VFS, each entry in the Darwin dirent layout the
+  // wasm64 loader reads: d_type at byte 20, the NUL-terminated name at 21.
+  const dirs = new Map();
+  let nextDir = 1n;
+  const opendir = (p) => {
+    const path = pathAt(p);
+    if (!vfs.isDir(path)) return fail(vfs.exists(path) ? 20 : 2, 0n);
+    const entries = [{ name: '.', dir: true }, { name: '..', dir: true }, ...vfs.list(path)];
+    const handle = nextDir++;
+    dirs.set(handle, { entries, next: 0, buf: 0n });
+    return handle;
+  };
+  const readdir = (handle) => {
+    const d = dirs.get(BigInt(handle));
+    if (!d) return fail(9, 0n);                                    // EBADF
+    if (d.next >= d.entries.length) return 0n;
+    const entry = d.entries[d.next++];
+    const name = enc.encode(entry.name + '\0');
+    if (d.buf !== 0n) run.free(d.buf);
+    d.buf = run.malloc(BigInt(21 + name.length));
+    run.u8().fill(0, Number(d.buf), Number(d.buf) + 21);
+    run.u8()[Number(d.buf) + 20] = entry.dir ? 4 : 8;              // DT_DIR, DT_REG
+    run.writeBytes(d.buf + 21n, name);
+    return d.buf;
+  };
+  const closedir = (handle) => {
+    const d = dirs.get(BigInt(handle));
+    if (!d) return fail(9);
+    if (d.buf !== 0n) run.free(d.buf);
+    dirs.delete(BigInt(handle));
+    return 0;
+  };
+  let tempCounter = 0;
+  const mkdtemp = (templatePtr) => {
+    const template = run.cstr(templatePtr);
+    if (!template.endsWith('XXXXXX')) return fail(22, 0n);
+    for (;;) {
+      const suffix = (tempCounter++).toString(36).padStart(6, '0').slice(-6);
+      const made = template.slice(0, -6) + suffix;
+      const code = vfs.mkdir(normalize(made, vfs.cwd));
+      if (code === 17) continue;
+      if (code !== 0) return fail(code, 0n);
+      run.writeBytes(templatePtr, enc.encode(made + '\0'));
+      return templatePtr;
+    }
   };
 
   const doRead = (fd, ptr, len) => {
@@ -195,27 +247,19 @@ function makeEnv(run) {
 
   const writeText = (fd, s) => { run.emit(Number(fd), enc.encode(s)); return s.length; };
 
-  // printf-family over a BigInt argument list.
-  const fmtc = (fmt, args) => {
-    let i = 0;
-    return fmt.replace(/%l?l?[dioux%csfgpX]/g, (mm) => {
-      if (mm === '%%') return '%';
-      const a = args[i++] ?? 0n;
-      const c = mm[mm.length - 1];
-      if (c === 'd' || c === 'i') return String(BigInt.asIntN(64, BigInt(a)));
-      if (c === 'u' || c === 'o') return String(BigInt.asUintN(64, BigInt(a)));
-      if (c === 'x') return BigInt.asUintN(64, BigInt(a)).toString(16);
-      if (c === 'X') return BigInt.asUintN(64, BigInt(a)).toString(16).toUpperCase();
-      if (c === 'p') return '0x' + BigInt.asUintN(64, BigInt(a)).toString(16);
-      if (c === 'c') return String.fromCharCode(Number(a) & 0xff);
-      if (c === 's') return run.cstr(a);
-      if (c === 'f' || c === 'g') {
-        const d = new DataView(new ArrayBuffer(8));
-        d.setBigUint64(0, BigInt.asUintN(64, BigInt(a)), true);
-        return String(d.getFloat64(0, true));
-      }
-      return mm;
-    });
+  // The printf family, over the guest's va_list buffer at VA (web/hostlib.js).
+  // Text is bytes here: the format and %s arguments are read as bytes and the
+  // result is written as bytes, as libc's printf does.
+  const byteString = (ptr) => {
+    const m = run.u8();
+    let e = Number(ptr), text = '';
+    while (m[e] !== 0) e++;
+    for (let i = Number(ptr); i < e; i++) text += String.fromCharCode(m[i]);
+    return text;
+  };
+  const fmtc = (fmtPtr, va) => {
+    const text = formatC(byteString(fmtPtr), vaReader(() => run.dv(), va), byteString);
+    return Uint8Array.from(text, (c) => c.charCodeAt(0));
   };
 
   // ---- metaprogram side-modules -------------------------------------------
@@ -270,6 +314,7 @@ function makeEnv(run) {
   const env = {
     // allocation
     malloc: (n) => run.malloc(n),
+    posix_memalign: (out, alignment, size) => run.memalign(out, alignment, size),
     realloc: (p, n) => run.realloc(p, n),
     calloc: (n, sz) => {
       const total = BigInt(n) * BigInt(sz);
@@ -281,8 +326,8 @@ function makeEnv(run) {
     memset: (s, c, n) => { run.u8().fill(Number(c) & 0xff, Number(s), Number(s) + Number(n)); return s; },
     memcmp: (a, b, n) => {
       const m = run.u8(); a = Number(a); b = Number(b); n = Number(n);
-      for (let i = 0; i < n; i++) { const d = m[a + i] - m[b + i]; if (d) return BigInt(Math.sign(d)); }
-      return 0n;
+      for (let i = 0; i < n; i++) { const d = m[a + i] - m[b + i]; if (d) return Math.sign(d); }
+      return 0;
     },
 
     // file io
@@ -290,36 +335,48 @@ function makeEnv(run) {
     read: doRead,
     write: doWrite,
     close: (fd) => { if (Number(fd) > 2) vfs.close(Number(fd)); return 0; },
-    creat: (p, _mode) => BigInt(vfs.open(normalize(run.cstr(p), CWD), { write: true, truncate: true })),
+    creat: (p, _mode) => fdOrFail(vfs.open(pathAt(p), { write: true, truncate: true })),
     // access(2) answers for DIRECTORIES too. Stdlib discovery walks up from argv[0]
     // probing for `lib/coil/stdlib`, and a file-only existence check fails every
     // candidate -- the compiler then reports that it cannot find its own library.
-    access: (p) => { const path = normalize(run.cstr(p), CWD); return (vfs.exists(path) || vfs.isDir(path)) ? 0 : -1; },
-    unlink: (p) => vfs.unlink(normalize(run.cstr(p), CWD)),
+    access: (p) => { const path = pathAt(p); return (vfs.exists(path) || vfs.isDir(path)) ? 0 : fail(2); },
+    unlink: (p) => (vfs.unlink(pathAt(p)) === 0 ? 0 : fail(2)),
     rename: (a, b) => {
-      const from = normalize(run.cstr(a), CWD), to = normalize(run.cstr(b), CWD);
+      const from = pathAt(a), to = pathAt(b);
       const d = vfs.read(from);
-      if (d === null) return -1;
+      if (d === null) return fail(2);
       vfs.writeFile(to, d); vfs.unlink(from); return 0;
     },
     realpath: (p, outPtr) => {
-      const path = normalize(run.cstr(p), CWD);
-      if (!vfs.exists(path) && !vfs.isDir(path)) return 0n;
+      const path = pathAt(p);
+      if (!vfs.exists(path) && !vfs.isDir(path)) return fail(2, 0n);
       run.writeBytes(outPtr, enc.encode(path + '\0'));
       return outPtr;
     },
     // The node host fakes FILE* as the fd number; keep that so fwrite/fclose match.
     fopen: (p, mode) => {
-      const path = normalize(run.cstr(p), CWD);
+      const path = pathAt(p);
       const m = run.cstr(mode);
       const fd = m.includes('w') ? vfs.open(path, { write: true, truncate: true }) : vfs.open(path);
-      return fd < 0 ? 0n : BigInt(fd);
+      return fd < 0 ? fail(-fd, 0n) : BigInt(fd);
     },
     fclose: (f) => { if (Number(f) > 2) vfs.close(Number(f)); return 0; },
     fwrite: (ptr, sz, nm, f) => { doWrite(Number(f), ptr, BigInt(Number(sz) * Number(nm))); return BigInt(nm); },
-    opendir: () => 0n,
-    closedir: () => 0,
-    getcwd: (b) => { run.writeBytes(b, enc.encode(CWD + '\0')); return b; },
+    opendir, readdir, closedir, mkdtemp,
+    mkdir: (p, _mode) => { const code = vfs.mkdir(pathAt(p)); return code ? fail(code) : 0; },
+    rmdir: (p) => { const code = vfs.rmdir(pathAt(p)); return code ? fail(code) : 0; },
+    chdir: (p) => {
+      const path = pathAt(p);
+      if (!vfs.isDir(path)) return fail(vfs.exists(path) ? 20 : 2);
+      vfs.cwd = path;
+      return 0;
+    },
+    getcwd: (b, size) => {
+      const bytes = enc.encode(vfs.cwd + '\0');
+      if (bytes.length > Number(size)) return fail(34, 0n);         // ERANGE
+      run.writeBytes(b, bytes);
+      return b;
+    },
     isatty: () => 0,
     atexit: () => 0,
     getpid: () => 1,
@@ -384,12 +441,15 @@ function makeEnv(run) {
       if (endptr && Number(endptr) !== 0) run.dv().setBigUint64(Number(endptr), BigInt(Number(nptr) + consumed), true);
       return v;
     },
-    snprintf: (bufPtr, size, fmtPtr, arg) => {
-      const out = fmtc(run.cstr(fmtPtr), [arg]);
-      const b = enc.encode(out + '\0');
-      const n = Math.min(b.length, Number(size));
-      run.writeBytes(bufPtr, b.subarray(0, n));
-      return b.length - 1;
+    snprintf: (bufPtr, size, fmtPtr, va) => {
+      const out = fmtc(fmtPtr, va);
+      const n = Number(size);
+      if (n > 0) {
+        const w = Math.min(out.length, n - 1);
+        run.writeBytes(bufPtr, out.subarray(0, w));
+        run.u8()[Number(bufPtr) + w] = 0;
+      }
+      return out.length;
     },
     sqrt: (x) => Math.sqrt(x), pow: (x, y) => Math.pow(x, y),
     fmod: (x, y) => x % y, fmodf: (x, y) => Math.fround(Math.fround(x) % Math.fround(y)),
@@ -402,6 +462,10 @@ function makeEnv(run) {
     nearbyintf:(x)=>{ const r=Math.round(x); return Math.fround((Math.abs(x%1)===0.5&&r%2!==0)?r-1:r); },
     copysignf:(x,y)=>{ const d=new DataView(new ArrayBuffer(4)); d.setFloat32(0,y); return Math.fround((d.getUint8(0)&0x80)?-Math.abs(x):Math.abs(x)); },
     fabsf:(x)=>Math.fround(Math.abs(x)),
+    sqrtf:(x)=>Math.fround(Math.sqrt(x)), floorf:(x)=>Math.fround(Math.floor(x)),
+    ceilf:(x)=>Math.fround(Math.ceil(x)), truncf:(x)=>Math.fround(Math.trunc(x)),
+    fma:(a,b,c)=>fusedMultiplyAdd(a,b,c,53,-1074),
+    fmaf:(a,b,c)=>Math.fround(fusedMultiplyAdd(a,b,c,24,-149)),
     sin:Math.sin, cos:Math.cos, tan:Math.tan, asin:Math.asin, acos:Math.acos, atan:Math.atan,
     atan2:Math.atan2, sinh:Math.sinh, cosh:Math.cosh, tanh:Math.tanh, exp:Math.exp,
     exp2:(x)=>Math.pow(2,x), log:Math.log, log2:Math.log2, log10:Math.log10,
@@ -419,8 +483,8 @@ function makeEnv(run) {
     putchar: (c) => { run.emit(1, new Uint8Array([Number(c) & 0xff])); return Number(c) & 0xff; },
     putc: (c) => { run.emit(1, new Uint8Array([Number(c) & 0xff])); return Number(c) & 0xff; },
     puts: (p) => writeText(1, run.cstr(p) + '\n'),
-    printf: (fmtPtr, ...a) => writeText(1, fmtc(run.cstr(fmtPtr), a)),
-    dprintf: (fd, fmtPtr, ...a) => writeText(Number(fd), fmtc(run.cstr(fmtPtr), a)),
+    printf: (fmtPtr, va) => { const out = fmtc(fmtPtr, va); run.emit(1, out); return out.length; },
+    dprintf: (fd, fmtPtr, va) => { const out = fmtc(fmtPtr, va); run.emit(Number(fd), out); return out.length; },
 
     // process
     abort: () => { throw new Error('env.abort() called'); },
@@ -472,7 +536,9 @@ function makeEnv(run) {
     // Wall 1 stays a hard trap in the browser: there is no JIT, no dylib, no shell.
     mmap: trap('mmap'), munmap: trap('munmap'), mprotect: trap('mprotect'),
     dlopen: trap('dlopen'), dlsym: trap('dlsym'), dlerror: trap('dlerror'),
-    system: (cmdPtr) => emulateSystem(run, run.cstr(cmdPtr)),
+    dladdr: trap('dladdr'), dlclose: trap('dlclose'),
+    posix_spawnp: trap('posix_spawnp'), waitpid: trap('waitpid'),
+    system: trap('system'),
   };
 
   return env;
