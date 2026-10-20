@@ -820,6 +820,28 @@ EOF
     bad "build --lib makes an archive a C program links" "build --lib or cc failed"
   fi
 
+  # LLVM global/attribute spellings inside user bytes are data, not references.
+  cat > "$T/normalize-data.coil" <<'EOF_COIL'
+(module cli.normalize.data)
+(extern puts [(ptr i8)] (-> i32))
+(defn main [] (-> i64)
+  (puts c"@g.9|@str.9|@cstr.9|@__coil_llvm_ir_9|#9")
+  0)
+EOF_COIL
+  local llvm_bin normalized_out
+  llvm_bin=$("${LLVM_CONFIG:-llvm-config}" --bindir)
+  if "$COIL" emit-ir "$T/normalize-data.coil" --meta-opt=0 -O0 > "$T/normalize-data.ll" 2> "$T/normalize-data.err" \
+     && [ -s "$T/normalize-data.ll" ]; then
+    normalized_out=$("$llvm_bin/lli" "$T/normalize-data.ll" 2>&1); rc=$?
+    if [ "$rc" = 0 ] && [ "$normalized_out" = '@g.9|@str.9|@cstr.9|@__coil_llvm_ir_9|#9' ]; then
+      ok "normalized LLVM preserves global/attribute lookalikes inside quoted user data"
+    else
+      bad "normalized LLVM preserves quoted user data" "exit $rc: $normalized_out"
+    fi
+  else
+    bad "normalized LLVM preserves quoted user data" "emit-ir failed: $(cat "$T/normalize-data.err")"
+  fi
+
   # The LLVM verifier rejecting a module is a clean error, and the old output survives.
   cat > "$T/invalid.coil" <<'EOF'
 (module invalid.module)
