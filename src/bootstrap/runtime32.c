@@ -7,9 +7,10 @@
 // differ — most pointer/size params narrow to uint32_t — and are copied
 // verbatim from the prototypes wasm2c emits at the top of the generated
 // coilc32.c (a size_t/ssize_t/isize param is i32 on wasm32, an i64 param stays
-// uint64_t). Everything else — the bump+free-list allocator, the printf
-// family, the FS/thread shims — is identical logic, since MEM+off is a valid
-// host pointer regardless of the offset's width.
+// uint64_t). Everything else — the bump+free-list allocator, the FS/thread
+// shims — is identical logic, since MEM+off is a valid host pointer regardless
+// of the offset's width. The variadic imports and open(2)'s flags are
+// guest_varargs.h, shared with runtime.c.
 //
 // Built by build32.sh:  cc coilc32.c runtime32.c -o coil-bootstrap32 -lm
 
@@ -148,61 +149,11 @@ static uint64_t rt_realloc(uint64_t ptr, uint64_t size) {
     return np;
 }
 
-// ---------------------------------------------------------------------------
-// printf family (one variadic arg; identical to runtime.c).
-// ---------------------------------------------------------------------------
 #include "errno_bridge.h"
 uint32_t env___error(void) { return (uint32_t)guest_errno_address(); }
 
-static size_t fmt_one(char *out, size_t cap, const char *fmt, uint64_t arg) {
-    size_t o = 0;
-    int used = 0;
-    #define PUT(ch) do { if (o + 1 < cap) out[o] = (ch); o++; } while (0)
-    for (const char *p = fmt; *p; ) {
-        if (*p != '%') { PUT(*p); p++; continue; }
-        const char *start = p++;
-        if (*p == '%') { PUT('%'); p++; continue; }
-        while (*p == 'l' || *p == 'h' || *p == 'z' || *p == 'j' || *p == 't') p++;
-        char conv = *p ? *p++ : 0;
-        char tmp[64];
-        int n = 0;
-        uint64_t a = used ? 0 : arg;
-        used = 1;
-        switch (conv) {
-            case 'd': case 'i':
-                n = snprintf(tmp, sizeof tmp, "%lld", (long long)(int64_t)a); break;
-            case 'u':
-                n = snprintf(tmp, sizeof tmp, "%llu", (unsigned long long)a); break;
-            case 'x':
-                n = snprintf(tmp, sizeof tmp, "%llx", (unsigned long long)a); break;
-            case 'X':
-                n = snprintf(tmp, sizeof tmp, "%llX", (unsigned long long)a); break;
-            case 'o':
-                n = snprintf(tmp, sizeof tmp, "%llo", (unsigned long long)a); break;
-            case 'c':
-                n = snprintf(tmp, sizeof tmp, "%c", (int)a); break;
-            case 'p':
-                n = snprintf(tmp, sizeof tmp, "%p", (void *)(uintptr_t)a); break;
-            case 'f': case 'F': case 'g': case 'G': case 'e': case 'E': {
-                double d; memcpy(&d, &a, 8);
-                char f2[3] = { '%', conv, 0 };
-                n = snprintf(tmp, sizeof tmp, f2, d); break;
-            }
-            case 's': {
-                const char *s = hoststr((uint32_t)a);
-                for (const char *q = s; *q; q++) PUT(*q);
-                continue;
-            }
-            default:
-                for (const char *q = start; q < p; q++) PUT(*q);
-                continue;
-        }
-        for (int i = 0; i < n; i++) PUT(tmp[i]);
-    }
-    if (cap) out[o < cap ? o : cap - 1] = 0;
-    #undef PUT
-    return o;
-}
+#define GUEST_POINTER_BYTES 4
+#include "guest_varargs.h"
 
 // ===========================================================================
 // env.* imports — signatures MUST match the prototypes in coilc32.c.
@@ -226,7 +177,7 @@ uint32_t env_memcmp(uint32_t a, uint32_t b, uint32_t n) {
 uint32_t env_strlen(uint32_t p) { return (uint32_t)strlen(hoststr(p)); }
 
 // ---- file / directory I/O ----
-uint32_t env_open(uint32_t path, uint32_t flags, uint32_t mode) { return (uint32_t)open(hoststr(path), (int)flags, (mode_t)mode); }
+uint32_t env_open(uint32_t path, uint32_t flags, uint32_t va) { return (uint32_t)guest_open(hoststr(path), flags, va); }
 uint32_t env_creat(uint32_t path, uint32_t mode) {
     return (uint32_t)open(hoststr(path), O_CREAT | O_WRONLY | O_TRUNC, (mode_t)mode);
 }
@@ -379,29 +330,10 @@ double env_strtod(uint32_t nptr, uint32_t endptr) {
 }
 
 // ---- printf family ----
-uint32_t env_printf(uint32_t fmt, uint32_t arg) {
-    char buf[8192];
-    size_t n = fmt_one(buf, sizeof buf, hoststr(fmt), arg);
-    size_t w = n < sizeof buf - 1 ? n : sizeof buf - 1;
-    fwrite(buf, 1, w, stdout);
-    return (uint32_t)n;
-}
-uint32_t env_dprintf(uint32_t fd, uint32_t fmt, uint32_t arg) {
-    char buf[8192];
-    size_t n = fmt_one(buf, sizeof buf, hoststr(fmt), arg);
-    size_t w = n < sizeof buf - 1 ? n : sizeof buf - 1;
-    write((int)fd, buf, w);
-    return (uint32_t)n;
-}
-uint32_t env_snprintf(uint32_t buf, uint64_t size, uint32_t fmt, uint32_t arg) {
-    char tmp[8192];
-    size_t n = fmt_one(tmp, sizeof tmp, hoststr(fmt), arg);
-    if (size) {
-        size_t w = n < (size_t)size - 1 ? n : (size_t)size - 1;
-        memcpy(MEM + buf, tmp, w);
-        MEM[buf + w] = 0;
-    }
-    return (uint32_t)n;
+uint32_t env_printf(uint32_t fmt, uint32_t va) { return guest_printf(hoststr(fmt), va); }
+uint32_t env_dprintf(uint32_t fd, uint32_t fmt, uint32_t va) { return guest_dprintf((int)fd, hoststr(fmt), va); }
+uint32_t env_snprintf(uint32_t buf, uint64_t size, uint32_t fmt, uint32_t va) {
+    return (uint32_t)guest_format(size ? (char *)(MEM + buf) : NULL, (size_t)size, hoststr(fmt), va);
 }
 uint32_t env_putchar(uint32_t c) { return (uint32_t)putchar((int)(c & 0xff)); }
 uint32_t env_puts(uint32_t p) { return (uint32_t)puts(hoststr(p)); }

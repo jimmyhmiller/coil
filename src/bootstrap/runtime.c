@@ -154,65 +154,11 @@ static uint64_t rt_realloc(uint64_t ptr, uint64_t size) {
     return np;
 }
 
-// ---------------------------------------------------------------------------
-// printf-family: the module's printf/dprintf/snprintf imports take EXACTLY one
-// variadic argument (fixed wasm signature), so a format has at most one
-// value-consuming conversion. We format literals + %% ourselves and delegate
-// each real conversion to host snprintf (byte-identical to native libc); %s
-// reads its string straight out of linear memory.
-// ---------------------------------------------------------------------------
 #include "errno_bridge.h"
 uint64_t env___error(void) { return guest_errno_address(); }
 
-static size_t fmt_one(char *out, size_t cap, const char *fmt, uint64_t arg) {
-    size_t o = 0;
-    int used = 0;
-    #define PUT(ch) do { if (o + 1 < cap) out[o] = (ch); o++; } while (0)
-    for (const char *p = fmt; *p; ) {
-        if (*p != '%') { PUT(*p); p++; continue; }
-        const char *start = p++;                 // at conversion after '%'
-        if (*p == '%') { PUT('%'); p++; continue; }
-        while (*p == 'l' || *p == 'h' || *p == 'z' || *p == 'j' || *p == 't') p++;
-        char conv = *p ? *p++ : 0;
-        char tmp[64];
-        int n = 0;
-        uint64_t a = used ? 0 : arg;             // only the first conversion has the arg
-        used = 1;
-        switch (conv) {
-            case 'd': case 'i':
-                n = snprintf(tmp, sizeof tmp, "%lld", (long long)(int64_t)a); break;
-            case 'u':
-                n = snprintf(tmp, sizeof tmp, "%llu", (unsigned long long)a); break;
-            case 'x':
-                n = snprintf(tmp, sizeof tmp, "%llx", (unsigned long long)a); break;
-            case 'X':
-                n = snprintf(tmp, sizeof tmp, "%llX", (unsigned long long)a); break;
-            case 'o':
-                n = snprintf(tmp, sizeof tmp, "%llo", (unsigned long long)a); break;
-            case 'c':
-                n = snprintf(tmp, sizeof tmp, "%c", (int)a); break;
-            case 'p':
-                n = snprintf(tmp, sizeof tmp, "%p", (void *)(uintptr_t)a); break;
-            case 'f': case 'F': case 'g': case 'G': case 'e': case 'E': {
-                double d; memcpy(&d, &a, 8);
-                char f2[3] = { '%', conv, 0 };
-                n = snprintf(tmp, sizeof tmp, f2, d); break;
-            }
-            case 's': {                          // string lives in linear memory
-                const char *s = hoststr(a);
-                for (const char *q = s; *q; q++) PUT(*q);
-                p = p; continue;                 // handled inline
-            }
-            default:                             // unknown: echo verbatim
-                for (const char *q = start; q < p; q++) PUT(*q);
-                continue;
-        }
-        for (int i = 0; i < n; i++) PUT(tmp[i]);
-    }
-    if (cap) out[o < cap ? o : cap - 1] = 0;
-    #undef PUT
-    return o;                                    // length excluding NUL
-}
+#define GUEST_POINTER_BYTES 8
+#include "guest_varargs.h"
 
 // ===========================================================================
 // env.* imports
@@ -236,35 +182,11 @@ uint32_t env_memcmp(uint64_t a, uint64_t b, uint64_t n) {
 uint64_t env_strlen(uint64_t p) { return (uint64_t)strlen(hoststr(p)); }
 
 // ---- file / directory I/O ----
-// The guest numbers open(2) flags and clock ids as Coil's wasm host interface does
-// (Darwin's numbering; docs/reference/WASM.md). Translate them to this host's, and
-// refuse a bit or id the interface does not define rather than pass it through.
-enum {
-    WASM_O_ACCMODE = 3, WASM_O_APPEND = 0x8, WASM_O_NOFOLLOW = 0x100,
-    WASM_O_CREAT = 0x200, WASM_O_TRUNC = 0x400, WASM_O_EXCL = 0x800,
-    WASM_O_DIRECTORY = 0x100000, WASM_O_CLOEXEC = 0x1000000,
-};
-static int native_open_flags(uint32_t flags, int *out) {
-    static const struct { uint32_t wasm; int native; } bits[] = {
-        { WASM_O_APPEND, O_APPEND }, { WASM_O_NOFOLLOW, O_NOFOLLOW },
-        { WASM_O_CREAT, O_CREAT }, { WASM_O_TRUNC, O_TRUNC }, { WASM_O_EXCL, O_EXCL },
-        { WASM_O_DIRECTORY, O_DIRECTORY }, { WASM_O_CLOEXEC, O_CLOEXEC },
-    };
-    uint32_t acc = flags & WASM_O_ACCMODE;
-    if (acc == 3) return -1;
-    int native = acc == 0 ? O_RDONLY : acc == 1 ? O_WRONLY : O_RDWR;
-    uint32_t rest = flags & ~(uint32_t)WASM_O_ACCMODE;
-    for (size_t i = 0; i < sizeof bits / sizeof bits[0]; i++) {
-        if (rest & bits[i].wasm) { native |= bits[i].native; rest &= ~bits[i].wasm; }
-    }
-    if (rest != 0) return -1;
-    *out = native;
-    return 0;
-}
-uint32_t env_open(uint64_t path, uint32_t flags, uint64_t mode) {
-    int native;
-    if (native_open_flags(flags, &native) != 0) { errno = EINVAL; return (uint32_t)-1; }
-    return (uint32_t)open(hoststr(path), native, (mode_t)mode);
+// The guest numbers clock ids as Coil's wasm host interface does (Darwin's
+// numbering; docs/reference/WASM.md); env_clock_gettime translates them, and
+// guest_varargs.h translates open(2)'s flags.
+uint32_t env_open(uint64_t path, uint32_t flags, uint64_t va) {
+    return (uint32_t)guest_open(hoststr(path), flags, va);
 }
 uint32_t env_creat(uint64_t path, uint32_t mode) {
     return (uint32_t)open(hoststr(path), O_CREAT | O_WRONLY | O_TRUNC, (mode_t)mode);
@@ -415,29 +337,10 @@ double env_strtod(uint64_t nptr, uint64_t endptr) {
 }
 
 // ---- printf family ----
-uint32_t env_printf(uint64_t fmt, uint64_t arg) {
-    char buf[8192];
-    size_t n = fmt_one(buf, sizeof buf, hoststr(fmt), arg);
-    size_t w = n < sizeof buf - 1 ? n : sizeof buf - 1;
-    fwrite(buf, 1, w, stdout);
-    return (uint32_t)n;
-}
-uint32_t env_dprintf(uint32_t fd, uint64_t fmt, uint64_t arg) {
-    char buf[8192];
-    size_t n = fmt_one(buf, sizeof buf, hoststr(fmt), arg);
-    size_t w = n < sizeof buf - 1 ? n : sizeof buf - 1;
-    write((int)fd, buf, w);
-    return (uint32_t)n;
-}
-uint32_t env_snprintf(uint64_t buf, uint64_t size, uint64_t fmt, uint64_t arg) {
-    char tmp[8192];
-    size_t n = fmt_one(tmp, sizeof tmp, hoststr(fmt), arg);   // full length (excl NUL)
-    if (size) {
-        size_t w = n < (size_t)size - 1 ? n : (size_t)size - 1;
-        memcpy(MEM + buf, tmp, w);
-        MEM[buf + w] = 0;
-    }
-    return (uint32_t)n;
+uint32_t env_printf(uint64_t fmt, uint64_t va) { return guest_printf(hoststr(fmt), va); }
+uint32_t env_dprintf(uint32_t fd, uint64_t fmt, uint64_t va) { return guest_dprintf((int)fd, hoststr(fmt), va); }
+uint32_t env_snprintf(uint64_t buf, uint64_t size, uint64_t fmt, uint64_t va) {
+    return (uint32_t)guest_format(size ? (char *)(MEM + buf) : NULL, (size_t)size, hoststr(fmt), va);
 }
 uint32_t env_putchar(uint32_t c) { return (uint32_t)putchar((int)(c & 0xff)); }
 uint32_t env_puts(uint64_t p) { return (uint32_t)puts(hoststr(p)); }

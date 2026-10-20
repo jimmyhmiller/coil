@@ -24,6 +24,20 @@ static uint64_t guest_vector(const uint64_t *items, size_t count) {
     memset(MEM + offset + count * 8, 0, 8);
     return offset;
 }
+// A variadic call's argument buffer, as the guest lays it out: each argument at
+// its natural size and alignment, little-endian.
+typedef struct { uint8_t bytes[128]; size_t used; } guest_args;
+static void guest_arg(guest_args *va, uint64_t value, unsigned size) {
+    va->used = (va->used + size - 1) & ~(size_t)(size - 1);
+    for (unsigned i = 0; i < size; i++) va->bytes[va->used + i] = (uint8_t)(value >> (8 * i));
+    va->used += size;
+}
+static uint64_t guest_args_place(const guest_args *va) {
+    uint64_t offset = rt_malloc(va->used);
+    memcpy(MEM + offset, va->bytes, va->used);
+    return offset;
+}
+static uint64_t guest_double(double d) { uint64_t bits; memcpy(&bits, &d, 8); return bits; }
 int main(void) {
     wasm_init(); g_brk = g_cap = test_heap_base;
     errno = EACCES;
@@ -115,7 +129,44 @@ int main(void) {
     memcpy(&result, MEM + status, 4);
     assert(WIFEXITED(result) && WEXITSTATUS(result) == 6);
     assert(env_dladdr(123, out) == 0);
+
+    // Variadic imports read their arguments from the guest's buffer.
+    guest_args va = {0};
+    guest_arg(&va, 3, 4);                                 // the * precision, an int
+    guest_arg(&va, guest_double(1234.5), 8);
+    guest_arg(&va, (uint64_t)-42, 8);                     // a long
+    guest_arg(&va, guest_string("text"), 8);
+    guest_arg(&va, 0x1ff, 4);                             // an int printed as %hhd
+    guest_arg(&va, guest_double(2.25), 8);
+    uint64_t formatted = rt_malloc(128);
+    uint64_t length = env_snprintf(formatted, 128,
+        guest_string("%.*e|%ld|%-6s|%hhd|%5.1f%%"), guest_args_place(&va));
+    char expected[128];
+    snprintf(expected, sizeof expected, "%.*e|%ld|%-6s|%hhd|%5.1f%%",
+             3, 1234.5, -42L, "text", (signed char)0x1ff, 2.25);
+    assert(length == strlen(expected) && !strcmp(hoststr(formatted), expected));
+    va = (guest_args){0};
+    guest_arg(&va, guest_string("abcdef"), 8);
+    assert(env_snprintf(formatted, 4, guest_string("%s"), guest_args_place(&va)) == 6
+           && !strcmp(hoststr(formatted), "abc"));
+
+    // open(2)'s mode is its variadic argument, read when the flags create a file.
+    uint64_t made = guest_string("/tmp/coil-bootstrap-runtime-XXXXXX");
+    assert(env_mkdtemp(made) == made);
+    char created[4096];
+    snprintf(created, sizeof created, "%s/created", hoststr(made));
+    va = (guest_args){0};
+    guest_arg(&va, 0640, 4);
+    mode_t saved_mask = umask(0);
+    int created_fd = (int32_t)env_open(guest_string(created), 0x1 | 0x200 | 0x400, guest_args_place(&va));
+    umask(saved_mask);
+    assert(created_fd >= 0); close(created_fd);
+    struct stat created_stat;
+    assert(stat(created, &created_stat) == 0 && (created_stat.st_mode & 0777) == 0640);
+    int read_fd = (int32_t)env_open(guest_string(created), 0, 0);
+    assert(read_fd >= 0); close(read_fd);
+    assert(unlink(created) == 0 && env_rmdir(made) == 0);
     free(test_memory);
-    puts("bootstrap runtime: aligned reuse, relocation, environment, directory I/O, and process marshalling passed");
+    puts("bootstrap runtime: aligned reuse, relocation, environment, directory I/O, process marshalling, variadic imports and open modes passed");
     return 0;
 }
