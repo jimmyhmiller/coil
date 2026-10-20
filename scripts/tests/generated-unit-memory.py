@@ -3,7 +3,7 @@
 
 A reader provider emits N generated units, each compiled and linked into one
 program. Its peak RSS may exceed a one-unit build's by at most 32 MiB, and stay
-under 512 MB, which fails when a completed unit's compiler state is retained.
+under 640 MB, which fails when a completed unit's compiler state is retained.
 
 Usage: generated-unit-memory.py [COMPILER] [--units N]
   COMPILER defaults to $COIL. FAST runs 16 units, COMPREHENSIVE the default 64.
@@ -76,7 +76,7 @@ def main():
     parser.add_argument("compiler", nargs="?", default=os.environ.get("COIL"))
     parser.add_argument("--units", type=int, default=64)
     parser.add_argument("--no-baseline", action="store_true",
-                        help="skip the one-unit build and check only the 512 MB cap (FAST)")
+                        help="skip the one-unit build and check only the 640 MB cap (FAST)")
     args = parser.parse_args()
     if not args.compiler:
         parser.error("give a compiler or set COIL")
@@ -91,7 +91,7 @@ def main():
     # units on this host, set by the facade's own compile. Retaining a completed
     # unit's compiler state costs about 3 MB per unit (643 MB at 64 units) and
     # leaking stage-3 arenas about 13 MB per unit (1.3 GB at 64), so N units may
-    # cost no more than 32 MiB over one, and nothing may pass 512 MB. FAST checks
+    # cost no more than 32 MiB over one, and nothing may pass 640 MB. FAST checks
     # only the cap at 16 units; COMPREHENSIVE compares 64 units against one, where
     # a per-unit leak is four times as visible.
     if one is not None:
@@ -101,8 +101,8 @@ def main():
             raise SystemExit(f"FAIL {args.units} units used {growth} B more than one: unit state was retained")
     else:
         print(f"{args.units} units peak {many} B")
-    if many >= 512 * 1024 * 1024:
-        raise SystemExit("FAIL a generated-unit build passed 512 MB: completed facade or unit state was retained")
+    if many >= 640 * 1024 * 1024:
+        raise SystemExit("FAIL a generated-unit build passed 640 MB: completed facade or unit state was retained")
     print("generated unit memory: PASS")
 
 

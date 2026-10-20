@@ -51,7 +51,7 @@ can't silently pass one where the other is expected.
 
 ## Two tiers, mirroring native vs shim conventions
 
-### Tier 1 — layout *strategies* (the common cases; the `(cc/Native …)` analog)
+### Tier 1 — layout *strategies* (the common cases; the `:cc (cc/Fast)` analog)
 
 ```lisp
 (import "coil.layout" :as layout)
