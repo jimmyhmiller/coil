@@ -530,6 +530,8 @@ SEMANTIC_NAMES={
  ('coil.compiler.ast.ExprKind','EConstruct'):{'sum'},
  ('coil.compiler.ast.ExprKind','EDynDispatch'):{'dyn_struct','vtable_struct'},
  ('coil.compiler.ast.ExprKind','EMakeDyn'):{'dyn_struct','vtable_struct'},
+ # a calling convention, by its qualified identity
+ ('coil.compiler.ast.CcRef','CcResolved'):{'identity'},
 }
 def dep_body(t):
     if scalar(t) or t=='coil.reader.Sexp':return '0'
