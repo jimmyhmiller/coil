@@ -88,6 +88,13 @@ expect_stdout "run: a method's declaration record names its type's module, gener
 
 expect "run: a target that is neither a file nor a namespace" 1 'no such file' "$COIL" run hello
 
+# Source output preserves binary strings and names derived from fresh scopes.
+if with_stdin '(fresh-source-example)' "$COIL" run $M/source_roundtrip.coil >"$WORK/source-roundtrip.coil" 2>"$WORK/source-roundtrip.err"; then
+  expect "run: emitted source preserves bytes and derived fresh identities" 42 '' "$COIL" run "$WORK/source-roundtrip.coil"
+else
+  bad "run: emitted source preserves bytes and derived fresh identities" "$(cat "$WORK/source-roundtrip.err")"
+fi
+
 # ---- hygiene -------------------------------------------------------------------
 expect "hygiene: identifiers that must connect do" 42 '' "$COIL" run $M/hygiene_identity.coil
 
