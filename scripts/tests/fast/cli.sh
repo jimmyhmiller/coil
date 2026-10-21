@@ -768,41 +768,67 @@ EOF
       ok "import-aliases qualifies a wildcard import's references" ;;
     *) bad "import-aliases qualifies a wildcard import's references" "exit $rc: $diff_out" ;;
   esac
+  # coil.lint.unused judges nothing by spelling: every question goes to the
+  # compiler's declaration graph, resolved references and checked types. One
+  # program covers each tier, both directions.
   mkdir -p "$T/unused-imports/ui"
   printf '[package]\nname = "ui"\nentry = "ui/main.coil"\nsource-roots = ["."]\n' > "$T/unused-imports/Coil.toml"
   printf '(module ui.h)\n(defn f [] (-> i64) 1)\n(defn g [] (-> i64) 2)\n' > "$T/unused-imports/ui/h.coil"
   printf '(module ui.k)\n(defn kk [] (-> i64) 3)\n' > "$T/unused-imports/ui/k.coil"
-  # Lines 5-10 are the definitions tier. `dead` is named after a local in the rule's
-  # own module, which `--use` loads into the program it analyses: a toolchain
-  # module's names must not keep a user definition alive. `ping`/`pong` keep only
-  # each other alive; `used` is reached from main and `tested-only` from a test.
+  # a macro reaches its helper only through its expansion; an unused macro is dead
+  printf '%s\n' '(module ui.m)' '(defn twice [(x Code)] (-> Code) `(+ ~x (mhelp)))' \
+    '(defn mhelp [] (-> i64) 1)' '(defn dead-macro [(x Code)] (-> Code) x)' > "$T/unused-imports/ui/m.coil"
+  # a dialect is a single import: nothing refers to it, its checker is its use
+  printf '%s\n' '(module ui.d)' '(defn d-check [(m Code)] (-> Code) `0)' '(checker d-check)' > "$T/unused-imports/ui/d.coil"
+  # Lines 7-12 are the definitions tier. `dead` is named after a local in the rule's
+  # own module, which `--use` loads into the program it analyses. `ping`/`pong` keep
+  # only each other alive; `used` is reached from main and `tested-only` from a test.
+  # Line 14: nothing constructs `Box`, so it and its arm go; line 16: `k2` is never read.
   printf '%s\n' '(module ui.main)' '(import "ui.h" :use [f g])' '(import "ui.k" :as k)' \
-    '(defn main [] (-> i64) (+ (f) (used)))' \
+    '(import "ui.m" :use [twice])' '(import "ui.d")' \
+    '(defn main [] (-> i64) (+ (f) (used) (shape-size) (twice 1)))' \
     '(defn dead [] (-> i64) 1)' \
     '(defn ping [(n i64)] (-> i64) (if (> n 0) (pong (- n 1)) 0))' \
     '(defn pong [(n i64)] (-> i64) (if (> n 0) (ping (- n 1)) 1))' \
     '(defn used [] (-> i64) 2)' \
     '(defn tested-only [] (-> i64) 3)' \
-    '(deftest tested-only-is-three (assert (= (tested-only) 3)))' > "$T/unused-imports/ui/main.coil"
+    '(deftest tested-only-is-three (assert (= (tested-only) 3)))' \
+    '(defsum Shape (Dot) (Box [(w i64)]))' \
+    '(defn shape-size [] (-> i64)' \
+    '  (let [k1 (Dot) k2 7]' \
+    '    (match k1 (Dot [] 0) (Box [w] w))))' > "$T/unused-imports/ui/main.coil"
   local out
   out=$(cd "$T/unused-imports" && "$COIL" lint ui/main.coil --use coil.lint.unused 2>&1); rc=$?
   case "$out" in
     *"refers to this imported name"*"ui/main.coil:2:24"*"binds nothing the module refers to"*"ui/main.coil:3:1"*)
       case "$out" in
-        *"ui/main.coil:2:22"*) bad "unused reports the imports nothing resolved through" "the used name f was reported: $out" ;;
+        *"ui/main.coil:2:22"*|*"ui/main.coil:4:1"*|*"ui/main.coil:5:1"*)
+          bad "unused reports the imports nothing resolved through" "a used import was reported: $out" ;;
         *) ok "unused reports the imports nothing resolved through" ;;
       esac ;;
     *) bad "unused reports the imports nothing resolved through" "exit $rc: $out" ;;
   esac
   local defs="" line
-  for line in 4 5 6 7 8 9; do
+  for line in 6 7 8 9 10 11 12 14; do
     case "$out" in *"ui/main.coil:$line:1"*) defs="$defs $line" ;; esac
   done
   case "$out" in
-    *"nothing reachable from this program's roots refers to this"*)
-      [ "$defs" = " 5 6 7" ] && ok "unused reports dead definitions and keeps live and test-only ones" \
-        || bad "unused reports dead definitions and keeps live and test-only ones" "want lines 5 6 7, got$defs: $out" ;;
+    *"nothing reachable from this program's roots refers to this"*"ui/m.coil:4:1"*)
+      case "$out" in
+        *"ui/m.coil:2:1"*|*"ui/m.coil:3:1"*|*"ui/d.coil:2:1"*)
+          bad "unused reports dead definitions and keeps live and test-only ones" "a live macro, its helper or a checker was reported: $out" ;;
+        *) [ "$defs" = " 7 8 9" ] && ok "unused reports dead definitions and keeps live and test-only ones" \
+             || bad "unused reports dead definitions and keeps live and test-only ones" "want lines 7 8 9, got$defs: $out" ;;
+      esac ;;
     *) bad "unused reports dead definitions and keeps live and test-only ones" "exit $rc: $out" ;;
+  esac
+  case "$out" in
+    *"nothing constructs this variant"*"ui/main.coil:13:21"*"this arm cannot run"*"ui/main.coil:16:26"*"this binding is never read"*"ui/main.coil:15:18"*)
+      case "$out" in
+        *"ui/main.coil:15:9"*) bad "unused reports unconstructed variants and unread bindings" "the read binding k1 was reported: $out" ;;
+        *) ok "unused reports unconstructed variants and unread bindings" ;;
+      esac ;;
+    *) bad "unused reports unconstructed variants and unread bindings" "exit $rc: $out" ;;
   esac
 }
 

@@ -1,13 +1,11 @@
 (module coil.lint.unused)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc)
-(import "coil.slice" :use *)
+(import "coil.slice" :use [subslice])
 (import "coil.str" :use *)
 (import "coil.arraylist" :use *)
 (import "coil.hashmap" :use *)
-(import "coil.io" :use *)
 (import "coil.meta" :as meta)
-(import "coil.cc" :as cc)
 
 ; Dead-code elimination for SOURCE. Every top-level definition the program cannot
 ; reach from its roots is reported, and `coil lint --fix` deletes it outright,
@@ -27,33 +25,35 @@
 ; indent where a `let` binding used to be. The formatter closes those; nothing else
 ; needs to.
 ;
-; ── the analysis ───────────────────────────────────────────────────────────────
-; Reachability over a name graph, not a per-definition "is this name mentioned
-; anywhere" count. The distinction matters: a mention-counting pass keeps every
-; recursive function alive on its own recursive call, and keeps a pair of mutually
-; recursive dead functions alive on each other. Marking from roots does not.
+; ── every judgement is the compiler's ──────────────────────────────────────────
+; Nothing here decides what a name refers to. A spelling is not an identity: two
+; modules may both define `helper`, a local may share a global's name, a library
+; may define the same name as the program. So every question is put to the
+; compiler, which answers with what it resolved:
 ;
-; A node is a BARE name — the symbol with any `alias/` qualifier stripped — so a
-; definition and every way of referring to it across modules collapse to one node.
-; That deliberately over-approximates: two modules that both define `helper` share a
-; node, and a local variable named after a global marks that global used. Both errors
-; run in the KEEP direction, which is the only direction a deleting tool may err in.
+;   * definitions — the declaration graph (`meta/dependencies`): calls, function
+;     pointers, types, traits, constants, globals, conventions and macro
+;     expansions, all by qualified name;
+;   * roots — `main`, the tests, and what each module uses outside its own
+;     declarations (`meta/module-uses`): its exports, `export-c`s, impls,
+;     assertions, `meta` forms, registered checkers and transforms, and top-level
+;     macro calls;
+;   * variants — the constructions the checker resolved;
+;   * imports — the references that resolved through them, and the declarations
+;     the module depends on;
+;   * `let` bindings — the local each binder introduces and the locals each read
+;     resolves to (`meta/source-binding`);
+;   * fields — the checked type of every access.
 ;
-; ROOTS are `main` plus every name mentioned by a top-level form that is not itself a
-; named definition — `impl`, `meta`, `static-assert`, and, the one that carries the
-; policy, `export` / `export-c`. Nothing special is needed to make an export a root:
-; the export form names the thing, so walking it marks the name.
+; Only the user's own modules are judged: the ones `meta/source-modules` holds the
+; authored source of. Everything else is the toolchain, which this program can
+; neither see into nor delete from.
 ;
 ; ── EXECUTABLE OR LIBRARY ──────────────────────────────────────────────────────
-; That is not enough on its own, because in Coil `export` is optional and a module
-; without one exposes EVERYTHING (docs/reference/NAMESPACING.md: "default: all
-; public"). Read literally, "explicit exports are the roots" would mean a module that
-; declares no exports has no roots — and linting `src/compiler/astdump.coil` on its
-; own proposed deleting 110 of its definitions, every one of them called from the
-; compiler that this compilation unit does not contain.
-;
-; So the unit's SHAPE decides, which is the same distinction the language already
-; makes with `main`:
+; In Coil `export` is optional and a module without one exposes EVERYTHING
+; (docs/reference/NAMESPACING.md: "default: all public"). So the unit's SHAPE
+; decides what is a root, the same distinction the language already makes with
+; `main`:
 ;
 ;   * The program defines `main` — it is an EXECUTABLE. Its modules are that
 ;     program's private implementation, nothing outside links against them, and
@@ -67,921 +67,575 @@
 ; executable reading (root only `main` and explicit exports — this is what to use to
 ; clean out a library's own internals, when you know who the callers are), `public`
 ; forces the library reading, and the default `auto` picks by the rule above.
-;
-; The program's own modules are scanned, but not the toolchain's (`ul-toolchain-module?`
-; says why), and only forms in the user's own files are ever proposed for deletion —
-; `code-from-user?` here, and the compiler's own filter in `cop-record-fix` behind it.
-; Struct fields are the exception: their uses are collected across the whole program,
-; library included, because a field is reached by type rather than by name.
 
-;;; One top-level definition, and the slice of `edges` holding the names its body
-;;; mentions. `next` chains definitions that share a bare name (different modules may).
-(defstruct UlDef
-  [(name (slice u8))
-   (mi i64)
-   (fi i64)
-   (estart i64)
-   (ecount i64)
-   (next i64)])
+;;; A set of qualified names.
+(defn ul-names [(a (dyn alloc/Allocator))] (-> (HashMap (slice u8) i64))
+  (HashMap::new [(slice u8) i64] a (keyops)))
 
-(defstruct UlState
-  [(defs (ptr (ArrayList UlDef)))
-   (edges (ptr (ArrayList (slice u8))))
-   (byname (ptr (HashMap (slice u8) i64)))
-   (roots (ptr (ArrayList (slice u8))))
-   (reach (ptr (HashMap (slice u8) i64)))])
+;;; VALUE of a program query, or the empty list when the program has none.
+(defn ul-answer [(answer primitive/ProgramAnswer)] (-> Code)
+  (match answer
+    (primitive/Answer [value] value)
+    (_ `())))
 
-; ── names ──────────────────────────────────────────────────────────────────────
+;;; The authored records of the user's own modules, `(MODULE FORM…)`: the ones
+;;; whose forms the compiler says the user wrote. The toolchain's records are
+;;; there too, and nothing in them is this program's to judge. Empty outside
+;;; `coil lint`, where no source model is kept.
+(defn ul-sources [] (-> Code)
+  (match (meta/source-modules)
+    (primitive/SourceIs [records]
+      (let [(mut out) (primitive/code-list-new)]
+        (for record (iter records)
+          (when (meta/user-module? record) (push! (mut out) record) 0))
+        (primitive/code-list-done (load out))))
+    (primitive/SourceUnavailable [] `())))
 
-;;; The last `/`-separated component: `alias/foo`, `coil.alloc/foo` and `foo` all name
-;;; the node `foo`. Qualifiers vary with the importer's spelling, bare names do not.
-(defn ul-bare [(s (slice u8))] (-> (slice u8))
-  (let [n (len s)
-        (mut cut) 0
-        (mut i) 0]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (when (= (primitive/cast i64 (get s (load i)))
-                         47)
-                  (store! cut (primitive/iadd (load i) 1))
-                  0)
-                (set! i (primitive/iadd (load i) 1)))))
-    (subslice s (load cut) n)))
-
-(defn ul-head-is? [(f Code) (name Code)] (-> bool)
-  (if (primitive/code-list? f)
-      (if (> (len f) 0)
-          (= (get f 0) name)
-          false)
-      false))
-
-;;; The symbol at index `i`, as text, or "" when that element is not a symbol.
-(defn ul-name-at [(f Code) (i i64)] (-> (slice u8))
-  (if (> (len f) i)
-      (let [e (get f i)]
-        (if (primitive/code-sym? e) (primitive/code-sym e) ""))
-      ""))
-
-; ── walking: what does a form MENTION? ─────────────────────────────────────────
-; Every symbol counts as a mention except the ones that are the definition being
-; introduced: a form must not keep itself alive. That is why each definition head
-; gets its own walk instead of one generic recursion — the positions to skip are the
-; binder positions, and only the grammar knows where those are.
-(defn ul-mention! [(st (ptr UlState)) (s Code)] (-> i64)
-  (when (primitive/code-sym? s)
-    (let [txt (primitive/code-sym s)]
-      (push! [(slice u8)] (load (field st edges)) (ul-bare txt))
-      ; `Type::method` mentions `Type`
-      (let [owner (ul-method-owner txt)]
-        (when (> (len owner) 0)
-          (push! [(slice u8)] (load (field st edges)) (ul-bare owner))
-          0)))
-    0)
-  0)
-
-;;; The `Type` (or `Trait`, or `alias/Type`) of a `Type::method` head, or "" when
-;;; the symbol has no `::`.
-(defn ul-method-owner [(s (slice u8))] (-> (slice u8))
-  (match (find s "::")
-    (Some [at] (subslice s 0 at))
-    (None [] "")))
-
-(defn ul-walk [(st (ptr UlState)) (f Code)] (-> i64)
-  (if (primitive/code-list? f)
-      (ul-walk-kids st f 0 (len f))
-      (if (primitive/code-vector? f)
-          (ul-walk-kids st f 0 (len f))
-          (ul-mention! st f))))
-
-(defn ul-walk-kids [(st (ptr UlState)) (f Code) (i i64) (n i64)] (-> i64)
-  (do (for item (iter (primitive/code-slice f i n)) (ul-walk st item)) 0))
-
-;;; A binder vector `[(name Type) …]`: the names are being INTRODUCED, the types are
-;;; mentions. Anything else in the vector (a generic parameter list `[K V]`) is walked
-;;; whole — treating `K` as a mention only ever keeps something alive.
-(defn ul-walk-binders [(st (ptr UlState)) (v Code) (i i64) (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice v i n))
-      (let [b item]
-        (if (primitive/code-list? b)
-            (if (> (len b) 1) (ul-walk-kids st b 1 (len b)) (ul-walk st b))
-            (ul-walk st b))))
-    0))
-
-;;; `(V)` / `(V [(f T) …])` — a sum variant introduces its own name and its payload
-;;; field names, and mentions the payload types.
-(defn ul-walk-variant [(st (ptr UlState)) (v Code)] (-> i64)
-  (if (primitive/code-list? v)
-      (ul-walk-variant-kids st v 1 (len v))
-      0))
-
-(defn ul-walk-variant-kids [(st (ptr UlState)) (v Code) (i i64) (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice v i n))
-      (let [e item]
-        (if (primitive/code-vector? e)
-            (ul-walk-binders st e 0 (len e))
-            (ul-walk st e))))
-    0))
-
-(defn ul-walk-variants [(st (ptr UlState)) (f Code) (i i64) (n i64)] (-> i64)
-  (do
-    (for item (iter (primitive/code-slice f i n)) (ul-walk-variant st item))
-    0))
-
-;;; `defstruct` tail: each vector is either a field list or a generic parameter list.
-(defn ul-walk-struct-tail [(st (ptr UlState)) (f Code) (i i64) (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice f i n))
-      (let [e item]
-        (if (primitive/code-vector? e)
-            (ul-walk-binders st e 0 (len e))
-            (ul-walk st e))))
-    0))
-
-;;; Record every name a top-level form mentions, skipping the name it defines.
-;;; Returns nothing; the caller reads `edges` between the marks it took.
-(defn ul-scan-form [(st (ptr UlState)) (f Code)] (-> i64)
-  (let [n (len f)]
-    (cond (ul-head-is? f `defsum) (do (ul-walk-variants st f 2 n) 0)
-          (ul-head-is? f `defstruct) (do (ul-walk-struct-tail st f 2 n) 0)
-          (ul-head-is? f `deftrait)
-          ; each method spec `(name [params] (-> R))` introduces the method name
-          (do (ul-walk-variants st f 2 n) 0) :else
-          ; defn / const / extern: element 1 is the name, the rest is ordinary code
-          (do (ul-walk-kids st f 2 n) 0))))
-
-; ── classifying a top-level form ───────────────────────────────────────────────
-
-;;; The name a form defines, or "" when the form defines nothing deletable.
-;;;
-;;; `defcc` and `defannotation` are named but excluded: a convention is named in a
-;;; `:cc` keyword and an annotation in its own keyword syntax, neither of which is a
-;;; symbol this walk can see, so they would always look unreachable.
-;;;
-;;; A `defn` returning `Code` is excluded too, and for a sharper reason: checkers run
-;;; on the EXPANDED program, where a macro's call sites have already been replaced by
-;;; what they expanded into. A macro is therefore mentioned nowhere by the time this
-;;; rule looks, and would be deleted out of a file that uses it on every line.
-(defn ul-defined-name [(f Code)] (-> (slice u8))
-  (if (primitive/code-list? f)
-      (if (> (len f) 1)
-          (cond (or (ul-head-is? f `defn) (ul-head-is? f `defn*))
-                  (if (ul-macro? f) "" (ul-name-at f 1))
-                (ul-head-is? f `const) (ul-name-at f 1)
-                (ul-head-is? f `extern) (ul-name-at f 1)
-                (ul-head-is? f `defstruct) (ul-name-at f 1)
-                (ul-head-is? f `defsum) (ul-name-at f 1)
-                (ul-head-is? f `deftrait) (ul-name-at f 1)
-                :else "")
-          "")
-      ""))
-
-;;; Index of the `(-> RET)` element, or -1.
-(defn ul-arrow-idx [(f Code) (i i64) (n i64)] (-> i64)
-  (if (>= i n)
-      -1
-      (if (ul-head-is? (get f i) `->)
-          i
-          (ul-arrow-idx f (primitive/iadd i 1) n))))
-
-(defn ul-macro? [(f Code)] (-> bool)
-  (let [ai (ul-arrow-idx f 0 (len f))]
-    (if (< ai 0)
-        false
-        (let [arrow (get f ai)]
-          (if (> (len arrow) 1)
-              (= (get arrow 1) `Code)
-              false)))))
-
-; ── building the graph ─────────────────────────────────────────────────────────
-(defn ul-add-def! [(st (ptr UlState))
-                   (name (slice u8))
-                   (mi i64)
-                   (fi i64)
-                   (estart i64)
-                   (ecount i64)] (-> i64)
-  (let [d (primitive/alloc-stack UlDef)
-        idx (len (load (load (field st defs))))]
-    (set! (.name d) name)
-    (set! (.mi d) mi)
-    (set! (.fi d) fi)
-    (set! (.estart d) estart)
-    (set! (.ecount d) ecount)
-    (set! (.next d)
-          (match (get (load (load (field st byname))) name)
-            (Some [prev] prev)
-            (None [] -1)))
-    (push! [UlDef] (load (field st defs)) (load d))
-    (set! (load (field st byname)) name idx)
-    0))
-
-(defn ul-collect-form [(st (ptr UlState)) (m Code) (mi i64) (fi i64)] (-> i64)
-  (let [f (get m fi)]
-    ; `import` binds names, it does not use them; walking it would make every
-    ; `:use [a b]` item look referenced from the import alone.
-    (if (ul-head-is? f `import)
-        0
-        (let [start (len (load (load (field st edges))))
-              name (ul-defined-name f)]
-          (if (= (len name) 0)
-              (do (ul-walk st f) (ul-roots-from! st start))
-              (let [count
-                      (do
-                        (ul-scan-form st f)
-                        (primitive/isub (len (load (load (field st edges))))
-                                        start))]
-                (ul-add-def! st name mi fi start count)
-                ; A sum is referred to by its VARIANTS at least as often as by its own
-                ; name — `(Red)` names no sum anywhere. Each variant therefore gets its
-                ; own node over the same edge range, so constructing a variant both
-                ; keeps the sum alive and marks the payload types it mentions.
-                (if (ul-head-is? f `defsum)
-                    (ul-alias-variants! st f 2 (len f) mi fi start count)
-                    0)))))))
-
-(defn ul-alias-variants! [(st (ptr UlState))
-                          (f Code)
-                          (i i64)
-                          (n i64)
-                          (mi i64)
-                          (fi i64)
-                          (start i64)
-                          (count i64)] (-> i64)
-  (if (>= i n)
-      0
-      (do
-        (let [v (get f i)]
-          (if (primitive/code-list? v)
-              (let [vn (ul-name-at v 0)]
-                (if (= (len vn) 0) 0 (ul-add-def! st vn mi fi start count)))
-              0))
-        (ul-alias-variants! st f (primitive/iadd i 1) n mi fi start count))))
-
-;;; Everything a non-definition top-level form mentions is a root.
-(defn ul-roots-from! [(st (ptr UlState)) (start i64)] (-> i64)
-  (let [n (len (load (load (field st edges))))
-        (mut i) start]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (push! [(slice u8)]
-                       (load (field st roots))
-                       (get (load (load (field st edges))) (load i)))
-                (set! i (primitive/iadd (load i) 1)))))
-    0))
-
-(defn ul-collect-module [(st (ptr UlState)) (m Code) (mi i64) (fi i64) (n i64)] (-> i64)
-  (if (>= fi n)
-      0
-      (do
-        (ul-collect-form st m mi fi)
-        (ul-collect-module st m mi (primitive/iadd fi 1) n))))
-
-(defn ul-collect [(st (ptr UlState)) (ms Code) (mi i64) (n i64)] (-> i64)
-  (if (>= mi n)
-      0
-      (do
-        (let [m (get ms mi)]
-          (unless (ul-toolchain-module? m)
-            (ul-collect-module st m mi 1 (len m))))
-        (ul-collect st ms (primitive/iadd mi 1) n))))
-
-;;; Is `m` a module of the toolchain itself: the bundled library, the prelude, a core
-;;; provider? Those were written without knowing this program, so no symbol in them
-;;; can be a reference to one of its definitions, and every name one mentions that
-;;; matches a user definition is a coincidence of spelling. The analysis skips them.
-;;;
-;;; It used to walk them, which made each such coincidence a KEEP: a dead user `len`,
-;;; `handler` or `parse` was kept alive by the library's own, and the program being
-;;; linted includes the rule modules `--use` loaded, so a dead `dead` was kept alive by
-;;; a local in this very file. Everything the toolchain does reach in user code goes
-;;; through a root already: `main`, an `impl`, a test, an export.
-(defn ul-toolchain-module? [(m Code)] (-> bool)
-  (block :found
-    (for f (iter (primitive/code-slice m 1 (len m)))
-      (let [file (primitive/code-file f)]
-        (when (> (len file) 0)
-          (return-from
-            :found
-              (or (starts-with file "<bundled ")
-                  (starts-with file "<core-provider ")
-                  (= file "<prelude>"))))))
-    false))
-
-; ── marking ────────────────────────────────────────────────────────────────────
-; A worklist over `roots`, which doubles as the queue: names discovered while
-; expanding a definition are pushed onto the same list the loop is walking.
-(defn ul-mark [(st (ptr UlState))] (-> i64)
-  (let [(mut i) 0]
-    (loop (if (>= (load i) (len (load (load (field st roots)))))
-              (break)
-              (do
-                (let [nm (get (load (load (field st roots))) (load i))]
-                  (match (get (load (load (field st reach))) nm)
-                    (Some [_] 0)
-                    (None []
-                          (do
-                            (set! (load (field st reach)) nm 1)
-                            (ul-expand st
-                                       (match (get (load (load (field st byname)))
-                                                   nm)
-                                         (Some [d] d)
-                                         (None [] -1)))))))
-                (set! i (primitive/iadd (load i) 1)))))
-    0))
-
-;;; Enqueue everything the definitions named by this node mention.
-(defn ul-expand [(st (ptr UlState)) (di i64)] (-> i64)
-  (if (< di 0)
-      0
-      (let [d (primitive/alloc-stack UlDef)]
-        (set! d (get (load (load (field st defs))) di))
-        (let [start (.estart d)
-              stop (primitive/iadd start (.ecount d))
-              (mut i) start]
-          (loop (if (>= (load i) stop)
-                    (break)
-                    (do
-                      (push! [(slice u8)]
-                             (load (field st roots))
-                             (get (load (load (field st edges))) (load i)))
-                      (set! i (primitive/iadd (load i) 1))))))
-        (ul-expand st (.next d)))))
-
-; ── reporting ──────────────────────────────────────────────────────────────────
-(defn ul-reachable? [(st (ptr UlState)) (name (slice u8))] (-> bool)
-  (match (get (load (load (field st reach))) name)
-    (Some [_] true)
-    (None [] false)))
-
-;;; A form survives if ANY of the nodes it owns was marked — its own name, or, for a
-;;; sum, any of its variant names.
-(defn ul-form-reachable? [(st (ptr UlState)) (f Code) (name (slice u8))] (-> bool)
-  (if (ul-reachable? st name)
-      true
-      (if (ul-head-is? f `defsum)
-          (ul-any-variant-reachable? st f 2 (len f))
-          false)))
-
-(defn ul-any-variant-reachable? [(st (ptr UlState)) (f Code) (i i64) (n i64)] (-> bool)
-  (if (>= i n)
-      false
-      (let [v (get f i)
-            vn (if (primitive/code-list? v) (ul-name-at v 0) "")]
-        (if (ul-reachable? st vn)
-            true
-            (ul-any-variant-reachable? st f (primitive/iadd i 1) n)))))
-
-(defn ul-report-form [(st (ptr UlState)) (m Code) (fi i64)] (-> i64)
-  (let [f (get m fi)
-        name (ul-defined-name f)]
-    (if (= (len name) 0)
-        0
-        (if (primitive/code-from-user? f)
-            (if (ul-form-reachable? st f name)
-                0
-                (do
-                  (primitive/delete (ul-authored-form (get m 0) f name)
-                                    "unused: nothing reachable from this program's roots refers to this")
-                  0))
-            0))))
-
-;;; The form the author wrote for the definition `f` of `name` in `module`. `defn` is
-;;; a macro, so the program a checker sees holds what it expanded into, and deleting
-;;; that would delete no source; the authored form is in the compiler's record of the
-;;; module's source. `f` itself when there is no such record (outside `coil lint`) or
-;;; no authored form defines `name` there.
-(defn ul-authored-form [(module Code) (f Code) (name (slice u8))] (-> Code)
-  (if (not (primitive/code-macro? f))
-      f
-      (block :found
-        (match (meta/source-modules)
-          (primitive/SourceIs [sources]
-            (for record (iter sources)
-              (when (and (primitive/code-list? record) (> (len record) 0) (= (get record 0) module))
-                (for form (iter (primitive/code-slice record 1 (len record)))
-                  (when (and (primitive/code-list? form) (= (ul-defined-name form) name))
-                    (return-from :found form))))))
-          (primitive/SourceUnavailable [] 0))
-        f)))
-
-(defn ul-report-module [(st (ptr UlState)) (m Code) (fi i64) (n i64)] (-> i64)
-  (if (>= fi n)
-      0
-      (do
-        (ul-report-form st m fi)
-        (ul-report-module st m (primitive/iadd fi 1) n))))
-
-(defn ul-report [(st (ptr UlState)) (ms Code) (mi i64) (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice ms mi n))
-      (let [m item] (ul-report-module st m 1 (len m))))
-    0))
-
-; ── executable or library ──────────────────────────────────────────────────────
-(defn ul-defines-main? [(m Code) (i i64) (n i64)] (-> bool)
-  (if (>= i n)
-      false
-      (let [f (get m i)]
-        (if (or (ul-head-is? f `defn) (ul-head-is? f `defn*))
-            (if (= (ul-name-at f 1) "main")
-                true
-                (ul-defines-main? m (primitive/iadd i 1) n))
-            (ul-defines-main? m (primitive/iadd i 1) n)))))
-
-(defn ul-program-has-main? [(ms Code) (i i64) (n i64)] (-> bool)
-  (if (>= i n)
-      false
-      (let [m (get ms i)]
-        (if (ul-defines-main? m 1 (len m))
-            true
-            (ul-program-has-main? ms (primitive/iadd i 1) n)))))
-
-(defn ul-module-has-export? [(m Code) (i i64) (n i64)] (-> bool)
-  (if (>= i n)
-      false
-      (if (ul-head-is? (get m i) `export)
-          true
-          (ul-module-has-export? m (primitive/iadd i 1) n))))
-
-;;; The library reading: a module that declares no export list exposes every name it
-;;; defines, so every one of them is a root.
-(defn ul-root-public [(st (ptr UlState)) (ms Code) (i i64) (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice ms i n))
-      (let [m item]
-        (if (ul-module-has-export? m 1 (len m))
-            0
-            (ul-root-module st m 1 (len m)))))
-    0))
-
-(defn ul-root-module [(st (ptr UlState)) (m Code) (i i64) (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice m i n))
-      (let [nm (ul-defined-name item)]
-        (if (= (len nm) 0)
-            0
-            (do (push! [(slice u8)] (load (field st roots)) nm) 0))))
-    0))
-
-;;; Every test entry point is a root. The prefix IS the contract: `coil test` finds
-;;; its suites by scanning for it, so a `coil-test$…` function is called by the
-;;; harness the way `main` is called by the runtime — from outside the program text.
-(defn ul-root-tests [(st (ptr UlState)) (ms Code) (i i64) (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice ms i n))
-      (let [m item] (ul-root-tests-module st m 1 (len m))))
-    0))
-
-(defn ul-root-tests-module [(st (ptr UlState)) (m Code) (i i64) (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice m i n))
-      (let [nm (ul-defined-name item)]
-        (if (starts-with nm "coil-test$")
-            (do (push! [(slice u8)] (load (field st roots)) nm) 0)
-            0)))
-    0))
-
-;;; `auto` (default) reads the shape; `exports` and `public` pin it.
-(defn ul-root-everything? [(ms Code)] (-> bool)
-  (let [mode (primitive/lint-param "unused-roots" "auto")]
-    (cond (= mode "exports") false
-          (= mode "public") true
-          :else (not (ul-program-has-main? ms 0 (len ms))))))
-
-; ── unused imports ─────────────────────────────────────────────────────────────
-; A separate pass, because an import is used or not used WITHIN ONE MODULE, while a
-; definition is used or not used by the whole program. It needs the per-module
-; picture the reachability pass deliberately throws away.
-;
-; Two ways to spell a use, and one that cannot be judged at all:
-;   `:as alias`   — used when `alias/` appears as a qualifier somewhere in the module
-;   `:use [a b]`  — used when one of the named items appears
-;   `:use *`      — NEVER touched. The names arrive unqualified, so a mention is
-;                   indistinguishable from a mention of anything else with that name.
-;
-; The expanded program shows no trace of a MACRO: its call sites have become what it
-; expanded into. So the compiler's record of authored references, which includes
-; macro heads, is consulted too: a name counts as used when either the expanded
-; program mentions it or an authored reference resolved through the import.
-;
-; And one thing an import carries that no mention records: AMBIENT declarations. A
-; trait impl is in scope wherever its module is loaded, so `(import "coil.str" :as str)`
-; can be what makes `(= a b)` compile on slices while `str/` appears nowhere. Same for
-; a module registering a checker or a calling convention — the "a dialect is a single
-; import" idiom is exactly an import with no mentions. So before proposing to remove
-; one, the imported module is inspected: if it holds any top-level form that is not a
-; plain named definition, the import stays.
-
-;;; Every bare name and every `qual/` prefix mentioned in one module, and, per
-;;; imported namespace, the names that unqualified authored references resolved
-;;; through an import of it (keyed `namespace name`).
-(defstruct UlLocal
-  [(names (ptr (HashMap (slice u8) i64)))
-   (quals (ptr (HashMap (slice u8) i64)))
-   (through (ptr (HashMap (slice u8) i64)))])
-
-;;; The key under which `through` records `name` used through namespace `ns`.
-(defn ul-through-key [(a (dyn alloc/Allocator)) (ns (slice u8)) (name (slice u8))] (-> (slice u8))
+;;; `MODULE.NAME`, the qualified identity of NAME declared in MODULE.
+(defn ul-qualify [(a (dyn alloc/Allocator)) (module (slice u8)) (name (slice u8))] (-> (slice u8))
   (let [(mut sb) (StrBuf::new a)]
-    (push-str! (mut sb) ns)
-    (push-str! (mut sb) " ")
+    (push-str! (mut sb) module)
+    (push-str! (mut sb) ".")
     (push-str! (mut sb) name)
     (str sb)))
 
-;;; Record the module's authored references that resolved through an import. A
-;;; qualified one, `alias/name`, uses the `:as` alias; an unqualified one uses the
-;;; `:use` binding of its exported name. Outside `coil lint` the compiler keeps no
-;;; such record, and nothing is added.
-(defn ul-note-references! [(lo (ptr UlLocal)) (a (dyn alloc/Allocator)) (module Code)] (-> i64)
-  (match (meta/references module)
-    (primitive/SourceIs [refs]
-      (for r (iter refs)
-        (let [node (meta/reference-node r)
-              spelled (cond (primitive/code-sym? node) node
-                            (and (primitive/code-list? node) (> (len node) 0)) (get node 0)
-                            :else `())]
-          (match (meta/reference-import r)
-            (Some [via]
-              (when (primitive/code-sym? spelled)
-                (let [qual (ul-qual (primitive/code-sym spelled))]
-                  (cond (> (len qual) 0) (set! (load (field lo quals)) qual 1)
-                        :else
-                          (match (meta/reference-exported-name r)
-                            (Some [exported]
-                              (set! (load (field lo through))
-                                    (ul-through-key a (primitive/code-sym via)
-                                                    (ul-bare (primitive/code-sym exported)))
-                                    1))
-                            (None [] 0))))))
-            (None [] 0)))))
-    (primitive/SourceUnavailable [] 0))
-  0)
+;;; The module part of the qualified name Q: everything before its last `.`.
+(defn ul-module-of [(q (slice u8))] (-> (slice u8))
+  (let [(mut cut) -1]
+    (for [i 0 (len q)]
+      (when (= (primitive/cast i64 (get q i)) 46) (set! cut i) 0))
+    (if (< cut 0) "" (subslice q 0 cut))))
 
-;;; A QUALIFIED mention uses the `:as` alias; an UNQUALIFIED one uses whatever
-;;; `:use [...]` binding put the bare name in scope. They are recorded separately
-;;; because they answer different questions, and conflating them made
-;;; `(import "x" :use [helper])` look used by an unrelated `x/helper` call.
-(defn ul-local-note! [(lo (ptr UlLocal)) (s Code)] (-> i64)
-  (when (primitive/code-sym? s)
-    (ul-local-note-text! lo (primitive/code-sym s))
-    ; `Type::method` uses the import that brings `Type` into scope
-    (let [owner (ul-method-owner (primitive/code-sym s))]
-      (when (> (len owner) 0) (ul-local-note-text! lo owner) 0))
-    0)
-  0)
+(defn ul-sym-text [(c Code)] (-> (slice u8))
+  (if (primitive/code-sym? c) (primitive/code-sym c) ""))
 
-(defn ul-local-note-text! [(lo (ptr UlLocal)) (txt (slice u8))] (-> i64)
-  (let [q (ul-qual txt)]
-    (if (= (len q) 0)
-        (do (set! (load (field lo names)) txt 1) 0)
-        (do (set! (load (field lo quals)) q 1) 0))))
+;;; The head symbol of the list F, or "" (a vector has no head).
+(defn ul-head-text [(f Code)] (-> (slice u8))
+  (if (and (primitive/code-list? f) (not (primitive/code-vector? f)) (> (len f) 0))
+      (ul-sym-text (get f 0))
+      ""))
 
-;;; The part before the last `/`, or "" when the symbol is unqualified.
-(defn ul-qual [(s (slice u8))] (-> (slice u8))
-  (let [n (len s)
-        (mut cut) -1
-        (mut i) 0]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (when (= (primitive/cast i64 (get s (load i)))
-                         47)
-                  (store! cut (load i))
-                  0)
-                (set! i (primitive/iadd (load i) 1)))))
-    (if (< (load cut) 0) "" (subslice s 0 (load cut)))))
+;;; The name a top-level authored form declares: its first symbol after the head,
+;;; past a generic parameter vector. "" when it has none.
+(defn ul-form-name [(f Code)] (-> (slice u8))
+  (cond (not (and (primitive/code-list? f) (> (len f) 1))) ""
+        (primitive/code-sym? (get f 1)) (primitive/code-sym (get f 1))
+        (and (> (len f) 2) (primitive/code-vector? (get f 1))) (ul-sym-text (get f 2))
+        :else ""))
 
-(defn ul-local-walk [(lo (ptr UlLocal)) (f Code)] (-> i64)
-  (if (primitive/code-list? f)
-      (if (ul-head-is? f `import)
-          0  ; an import BINDS these names; it does not use them
-          (ul-local-kids lo f 0 (len f)))
-      (if (primitive/code-vector? f)
-          (ul-local-kids lo f 0 (len f))
-          (ul-local-note! lo f))))
+;;; The struct or sum a checked type names through any number of `ptr`/`mut`/`ref`
+;;; wrappers, qualified: `ui.P` for `(ref ui.P)`, `coil.arraylist.ArrayList` for
+;;; `(coil.arraylist.ArrayList i64)`.
+(defn ul-nominal-of [(t Code)] (-> (slice u8))
+  (cond (primitive/code-sym? t) (primitive/code-sym t)
+        (and (primitive/code-list? t) (= (len t) 2)
+             (or (= (ul-head-text t) "ptr") (= (ul-head-text t) "mut") (= (ul-head-text t) "ref")))
+          (ul-nominal-of (get t 1))
+        (and (primitive/code-list? t) (> (len t) 0)) (ul-head-text t)
+        :else ""))
 
-(defn ul-local-kids [(lo (ptr UlLocal)) (f Code) (i i64) (n i64)] (-> i64)
-  (do (for item (iter (primitive/code-slice f i n)) (ul-local-walk lo item)) 0))
+;;; The global a symbol resolved to, as written, or "".
+(defn ul-global [(node Code)] (-> (slice u8))
+  (match (meta/source-binding node)
+    (primitive/BindsGlobal [q] (primitive/code-sym q))
+    (_ "")))
 
-(defn ul-has? [(m (ptr (HashMap (slice u8) i64))) (k (slice u8))] (-> bool)
-  (match (get (load m) k)
-    (Some [_] true)
-    (None [] false)))
-
-;;; The element after keyword `kw`, or a nil Code when the import does not carry it.
-(defn ul-import-arg [(f Code) (kw Code) (i i64) (n i64)] (-> Code)
-  (if (>= (primitive/iadd i 1) n)
-      `()
-      (if (= (get f i) kw)
-          (get f (primitive/iadd i 1))
-          (ul-import-arg f kw (primitive/iadd i 1) n))))
-
-(defn ul-import-has-kw? [(f Code) (kw Code) (i i64) (n i64)] (-> bool)
-  (if (>= i n)
-      false
-      (if (= (get f i) kw)
-          true
-          (ul-import-has-kw? f kw (primitive/iadd i 1) n))))
-
-;;; Does the module named `ns` declare anything an import brings in AMBIENTLY — an
-;;; `impl`, a convention, an annotation, a generator, a registration? Anything that is
-;;; not a plain named definition, an import or an export counts, because a mention of
-;;; it is not a symbol this walk could ever have seen.
-(defn ul-ns-ambient? [(ms Code) (ns (slice u8)) (i i64) (n i64)] (-> bool)
-  (if (>= i n)
-      true  ; namespace not in the program: assume the worst and keep the import
-      (let [m (get ms i)]
-        (if (= (ul-name-at m 0) ns)
-            (ul-module-ambient? m 1 (len m))
-            (ul-ns-ambient? ms ns (primitive/iadd i 1) n)))))
-
-(defn ul-module-ambient? [(m Code) (i i64) (n i64)] (-> bool)
-  (if (>= i n)
-      false
-      (let [f (get m i)]
-        (if (or (ul-plain-decl? f) (ul-own-impl? m f))
-            (ul-module-ambient? m (primitive/iadd i 1) n)
-            true))))
-
-;;; Is `f` an impl of a trait, or for a type, that module `m` itself defines? Such
-;;; an impl brings in nothing ambient. Using it takes a value of the type, or a call
-;;; of the trait's method, and either is a mention of `m` or comes from a module
-;;; that has loaded `m` already, with or without this import. Only an impl of
-;;; someone else's trait for someone else's type, like coil.str's `Eq` for
-;;; `(slice u8)`, is in scope through the import alone.
-(defn ul-own-impl? [(m Code) (f Code)] (-> bool)
-  (and (ul-head-is? f `impl)
-       (let [k (if (and (> (len f) 1) (primitive/code-vector? (get f 1))) 2 1)
-             inherent (or (<= (len f) (+ k 1)) (ul-method-form? (get f (+ k 1))))]
-         (if inherent
-             (ul-defines-head? m (get f k))
-             (or (ul-defines-head? m (get f k)) (ul-defines-head? m (get f (+ k 1))))))))
-
-;;; Does `m` define the type or trait `t` names (`Name` or `(Name args…)`)?
-(defn ul-defines-head? [(m Code) (t Code)] (-> bool)
-  (let [head (cond (primitive/code-sym? t) t
-                   (and (primitive/code-list? t) (> (len t) 0)) (get t 0)
-                   :else `())]
-    (and (primitive/code-sym? head)
-         (ul-module-defines? m (ul-bare (primitive/code-sym head))))))
-
-;;; `(name [params…] …)`: an impl's method, not a type.
-(defn ul-method-form? [(f Code)] (-> bool)
-  (and (primitive/code-list? f)
-       (> (len f) 1)
-       (primitive/code-sym? (get f 0))
-       (or (primitive/code-vector? (get f 1)) (primitive/code-keyword? (get f 1)))))
-
-(defn ul-module-defines? [(m Code) (name (slice u8))] (-> bool)
-  (block :found
-    (for f (iter (primitive/code-slice m 1 (len m)))
-      (when (= (ul-defined-name f) name) (return-from :found true)))
-    false))
-
-(defn ul-plain-decl? [(f Code)] (-> bool)
-  (if (> (len (ul-defined-name f)) 0)
-      true
-      (if (ul-head-is? f `import)
-          true
-          (if (ul-head-is? f `export)
-              true
-              ; a macro is a `defn` too — `ul-defined-name` declines to name it, but
-              ; it is still reached by an ordinary qualified call
-              (or (ul-head-is? f `defn) (ul-head-is? f `defn*))))))
-
-;;; Is this import referred to? Also answers "yes, keep it" for the shapes this pass
-;;; declines to judge at all.
-(defn ul-import-live? [(a (dyn alloc/Allocator)) (f Code) (lo (ptr UlLocal))] (-> bool)
-  (let [n (len f)
-        use-spec (ul-import-arg f `:use 1 n)
-        alias (ul-import-arg f `:as 1 n)
-        target (ul-import-target f)]
-    (cond
-      ; `:reexport` publishes the names to the module's importers; using them here
-      ; was never the point
-      (ul-import-has-kw? f `:reexport 1 n) true
-      ; `:use [a b]` — live if any named item is mentioned, or if an alias alongside
-      ; it is used as a qualifier
-      (primitive/code-vector? use-spec)
-        (or (ul-use-list-used? a use-spec lo target 0 (len use-spec))
-            (ul-alias-live? alias lo))
-      ; `:use *` — names arrive unqualified and cannot be attributed
-      (ul-import-has-kw? f `:use 1 n) true
-      (primitive/code-sym? alias) (ul-alias-live? alias lo)
-      ; neither `:as` nor `:use`: a shape this pass does not model
-      :else true)))
-
-(defn ul-import-target [(f Code)] (-> (slice u8))
-  (if (> (len f) 1) (primitive/code-str (get f 1)) ""))
-
-(defn ul-alias-live? [(alias Code) (lo (ptr UlLocal))] (-> bool)
-  (if (primitive/code-sym? alias)
-      (ul-has? (load (field lo quals)) (primitive/code-sym alias))
-      false))
-
-;;; Is the `:use` item `e` of an import of `target` used?
-(defn ul-use-item-used? [(a (dyn alloc/Allocator)) (e Code) (lo (ptr UlLocal)) (target (slice u8))] (-> bool)
-  (if (primitive/code-sym? e)
-      (let [name (ul-bare (primitive/code-sym e))]
-        (or (ul-has? (load (field lo names)) name)
-            (ul-has? (load (field lo through)) (ul-through-key a target name))))
-      true))  ; not a plain name: a shape this pass does not model
-
-(defn ul-use-list-used? [(a (dyn alloc/Allocator)) (v Code) (lo (ptr UlLocal)) (target (slice u8)) (i i64) (n i64)] (-> bool)
-  (if (>= i n)
-      false
-      (if (ul-use-item-used? a (get v i) lo target)
-          true
-          (ul-use-list-used? a v lo target (primitive/iadd i 1) n))))
-
-;;; In an import that is used, the `:use` names that are not: each is deleted from
-;;; the list on its own.
-(defn ul-report-use-items [(a (dyn alloc/Allocator)) (f Code) (lo (ptr UlLocal))] (-> i64)
-  (let [n (len f)
-        use-spec (ul-import-arg f `:use 1 n)
-        target (ul-import-target f)]
-    (when (and (primitive/code-vector? use-spec)
-               (not (ul-import-has-kw? f `:reexport 1 n)))
-      (for e (iter use-spec)
-        (unless (ul-use-item-used? a e lo target)
-          (ul-delete-alone e "unused: nothing in the module refers to this imported name"))))
-    0))
-
-;;; Delete `node` as a fix of its own. Whether an import is needed never depends on
-;;; another deletion, so one that cannot be applied must not hold the rest back, and
-;;; the rest must not hold it back.
+;;; Delete NODE as a fix of its own: one that cannot be applied must not hold the
+;;; rest back, and the rest must not hold it back.
 (defn ul-delete-alone [(node Code) (message (slice u8))] (-> i64)
   (primitive/suggest-transaction)
   (primitive/delete node message)
   (primitive/suggest-transaction)
   0)
 
-(defn ul-report-import [(a (dyn alloc/Allocator)) (f Code) (lo (ptr UlLocal)) (ms Code)] (-> i64)
-  (if (not (primitive/code-from-user? f))
-      0
-      (let [target (ul-import-target f)]
-        (cond
-          (ul-import-live? a f lo) (ul-report-use-items a f lo)
-          (ul-ns-ambient? ms target 0 (len ms)) 0
-          :else (ul-delete-alone f "unused: this import binds nothing the module refers to")))))
+; ── the program ────────────────────────────────────────────────────────────────
 
-(defn ul-imports-module [(a (dyn alloc/Allocator)) (ms Code) (m Code) (lo (ptr UlLocal)) (i i64) (n i64)] (-> i64)
-  (if (>= i n)
-      0
-      (do
-        (let [f (get m i)]
-          (if (ul-head-is? f `import) (ul-report-import a f lo ms) 0))
-        (ul-imports-module a ms m lo (primitive/iadd i 1) n))))
-
-(defn ul-imports [(ms Code) (a (dyn alloc/Allocator)) (mi i64) (n i64)] (-> i64)
-  (if (>= mi n)
-      0
-      (do
-        (let [m (get ms mi)
-              lo (primitive/alloc-stack UlLocal)
-              names (primitive/alloc-stack (HashMap (slice u8) i64))
-              quals (primitive/alloc-stack (HashMap (slice u8) i64))
-              through (primitive/alloc-stack (HashMap (slice u8) i64))]
-          (set! names (HashMap::new [(slice u8) i64] a (keyops)))
-          (set! quals (HashMap::new [(slice u8) i64] a (keyops)))
-          (set! through (HashMap::new [(slice u8) i64] a (keyops)))
-          (set! (.names lo) names)
-          (set! (.quals lo) quals)
-          (set! (.through lo) through)
-          (ul-local-kids lo m 1 (len m))
-          (ul-note-references! lo a (get m 0))
-          (ul-imports-module a ms m lo 1 (len m)))
-        (ul-imports ms a (primitive/iadd mi 1) n))))
-
-; ── unused let bindings ────────────────────────────────────────────────────────
-; `(let [k v …] body…)` where `k` is never read. Two conditions, and the second is
-; the one that decides how much of this is safe to do at all:
-;
-;   * `k` is not mentioned in the body, nor in any LATER initializer in the same
-;     vector (`let` binds sequentially, so `k` is in scope for those).
-;   * `v` cannot have an effect. A binding is only dead weight if evaluating its
-;     initializer was pointless; `(let [x (write! …)] …)` still has to run the write.
-;     Purity is not decidable here, so this asks for a syntactic PROOF from a small
-;     whitelist — a literal, another name, a stack/static reservation, a size query,
-;     a cast or field projection of something already proven pure — and refuses
-;     everything else. An unrecognised call is assumed to have effects.
-;
-; The binding is two adjacent nodes and both go, as two deletions of the same round.
-(defn ul-binder-name [(b Code)] (-> (slice u8))
-  (if (primitive/code-sym? b)
-      (primitive/code-sym b)
-      ; `(mut i)` — a mutable binding still introduces one name
-      (if (primitive/code-list? b)
-          (if (> (len b) 1) (ul-name-at b 1) "")
-          "")))
-
-;;; Is `name` mentioned anywhere in `f`?
-(defn ul-mentions? [(f Code) (name (slice u8))] (-> bool)
-  (if (primitive/code-sym? f)
-      (= (ul-bare (primitive/code-sym f)) name)
-      (if (primitive/code-list? f)
-          (ul-mentions-kids? f name 0 (len f))
-          (if (primitive/code-vector? f)
-              (ul-mentions-kids? f name 0 (len f))
-              false))))
-
-(defn ul-mentions-kids? [(f Code) (name (slice u8)) (i i64) (n i64)] (-> bool)
-  (if (>= i n)
-      false
-      (if (ul-mentions? (get f i) name)
-          true
-          (ul-mentions-kids? f name (primitive/iadd i 1) n))))
-
-;;; Evaluating this expression provably cannot do anything but produce a value.
-(defn ul-pure? [(e Code)] (-> bool)
-  (if (primitive/code-list? e)
-      (if (= (len e) 0)
-          true
-          (ul-pure-call? e))
-      true))  ; a literal, a symbol, a keyword, a vector of them
-
-(defn ul-pure-call? [(e Code)] (-> bool)
-  (cond ; a reservation, not a computation: dropping it frees the slot
-        (ul-head-is? e `alloc/stack) true
-        (ul-head-is? e `alloc/static) true
-        (ul-head-is? e `primitive/alloc-stack) true
-        (ul-head-is? e `primitive/alloc-static) true
-        ; compile-time queries
-        (ul-head-is? e `sizeof) true
-        (ul-head-is? e `alignof) true
-        (ul-head-is? e `offsetof) true
-        ; value projections, pure when what they project from is
-        (ul-head-is? e `primitive/cast) (ul-pure-args? e 2 (len e))
-        (ul-head-is? e `field) (ul-pure? (get e 1))
-        (ul-head-is? e `primitive/field) (ul-pure? (get e 1))
-        (ul-head-is? e `load) (ul-pure-args? e 1 (len e))
-        (ul-head-is? e `primitive/load) (ul-pure-args? e 1 (len e))
-        ; anything else is a call, and a call is assumed to have effects
-        :else false))
-
-(defn ul-pure-args? [(e Code) (i i64) (n i64)] (-> bool)
-  (if (>= i n)
-      true
-      (if (ul-pure? (get e i))
-          (ul-pure-args? e (primitive/iadd i 1) n)
-          false)))
-
-;;; Is `name` read after position `i` in the binding vector, or in the body?
-(defn ul-bound-read? [(f Code) (v Code) (name (slice u8)) (i i64)] (-> bool)
-  (if (ul-mentions-kids? v name (primitive/iadd i 2) (len v))
-      true
-      (ul-mentions-kids? f name 2 (len f))))
-
-(defn ul-scan-let [(f Code) (v Code) (i i64) (n i64)] (-> i64)
-  (if (>= (primitive/iadd i 1) n)
-      0
-      (do
-        (let [b (get v i)
-              init (get v (primitive/iadd i 1))
-              name (ul-binder-name b)]
-          (when (and (> (len name) 0)
-                     (ul-authored? b)
-                     (ul-authored? init)
-                     (not (ul-bound-read? f v name i))
-                     (ul-pure? init))
-            (primitive/delete b "unused: this binding is never read")
-            (primitive/delete init "unused: this binding is never read")))
-        (ul-scan-let f v (primitive/iadd i 2) n))))
-
-; `let` is a macro, and so are `for`, `match` and everything else that binds, so
-; every binding in the expanded program came out of an expansion. What tells the
-; author's own binding from one a macro made up is its NODES: in `(let [k v] …)`
-; both `k` and `v` are what the author wrote, while `for _` and a `_` inside a
-; nested pattern expand into bindings of names and values the macro generated.
-; Only a binding whose name and value were both written by hand is judged.
-(defn ul-authored? [(node Code)] (-> bool)
-  (not (primitive/code-macro? node)))
-
-(defn ul-lets [(f Code)] (-> i64)
-  (when (primitive/code-list? f)
-    (when (and (or (ul-head-is? f `let) (ul-head-is? f `let*)) (> (len f) 1))
-      (let [v (get f 1)]
-        (when (primitive/code-vector? v) (ul-scan-let f v 0 (len v)))))
-    (for item (iter f) (ul-lets item)))
-  (when (primitive/code-vector? f)
-    (for item (iter f) (ul-lets item)))
+;;; The user's modules, and every definition they declare, by qualified name.
+(defn ul-own! [(sources Code)
+               (modules (mut (HashMap (slice u8) i64)))
+               (owned (mut (HashMap (slice u8) i64)))] (-> i64)
+  (for record (iter sources)
+    (let [m (get record 0)]
+      (set! (mut modules) (primitive/code-sym m) 1)
+      (for d (iter (ul-answer (meta/definitions m)))
+        (set! (mut owned) (primitive/code-sym d) 1))))
   0)
 
-(defn ul-lets-program [(ms Code)] (-> i64)
-  (for m (iter ms)
-    (for f (iter (primitive/code-slice m 1 (len m)))
-      (when (primitive/code-from-user? f) (ul-lets f))))
+;;; Does module M declare an `export` list?
+(defn ul-has-export-list? [(m Code)] (-> bool)
+  (block :found
+    (for f (iter (ul-answer (meta/module-header m)))
+      (when (= (ul-head-text f) "export") (return-from :found true)))
+    false))
+
+;;; The executable reading roots `main` and the explicit exports; the library
+;;; reading roots every definition of a module without an export list. `auto`
+;;; (default) reads the shape; `exports` and `public` pin it.
+(defn ul-library? [(probe Code)] (-> bool)
+  (let [mode (primitive/lint-param "unused-roots" "auto")]
+    (cond (= mode "exports") false
+          (= mode "public") true
+          :else (match (meta/definition-kind `main)
+                  (primitive/KindIs [_] false)
+                  (_ true)))))
+
+; ── definitions ────────────────────────────────────────────────────────────────
+; Marking from roots over the compiler's declaration graph. A pair of mutually
+; recursive dead functions keep each other alive under a mention count; from the
+; roots, neither is reached.
+;
+; ROOTS: `main`; every test, which `coil test` calls from outside the program the
+; way the runtime calls `main` — `deftest` and `defprop` mint `coil-test$NAME`
+; (assert.coil, prop.coil) and the harness finds them by that prefix; and what
+; each user module uses at top level (`meta/module-uses`). Without the tests a
+; whole-project run proposed deleting a function and the only test of it in the
+; same round, which compiles precisely because both halves went.
+;
+; Marking expands the user's own names and the roots. A library declaration never
+; depends on one of the program's, so the toolchain's part of the graph is left
+; unwalked.
+
+(defn ul-root! [(name (slice u8)) (queue (mut (HashMap (slice u8) i64)))] (-> i64)
+  (set! (mut queue) name 1)
+  0)
+
+(defn ul-roots! [(sources Code)
+                 (owned (mut (HashMap (slice u8) i64)))
+                 (library bool)
+                 (roots (mut (HashMap (slice u8) i64)))] (-> i64)
+  (match (meta/definition-kind `main)
+    (primitive/KindIs [_] (ul-root! "main" (mut roots)))
+    (_ 0))
+  (for name (iter owned)
+    (match (find name "coil-test$")
+      (Some [_] (ul-root! name (mut roots)))
+      (None [] 0)))
+  (for record (iter sources)
+    (let [m (get record 0)]
+      (for u (iter (ul-answer (meta/module-uses m)))
+        (ul-root! (primitive/code-sym u) (mut roots)))
+      (when (and library (not (ul-has-export-list? m)))
+        (for d (iter (ul-answer (meta/definitions m)))
+          (ul-root! (primitive/code-sym d) (mut roots))))
+      0))
+  0)
+
+;;; Mark everything reachable from ROOTS into LIVE.
+(defn ul-mark! [(probe Code)
+                (a (dyn alloc/Allocator))
+                (modules (mut (HashMap (slice u8) i64)))
+                (owned (mut (HashMap (slice u8) i64)))
+                (roots (mut (HashMap (slice u8) i64)))
+                (live (mut (HashMap (slice u8) i64)))] (-> i64)
+  (let [(mut queue) (ArrayList::new [(slice u8)] a)
+        (mut at) 0]
+    (for r (iter roots)
+      (unless (contains? live r)
+        (set! (mut live) r 1)
+        (push! (mut queue) r) 0))
+    (loop
+      (when (>= at (len queue)) (break))
+      (let [name (get queue at)]
+        (set! at (+ at 1))
+        (for d (iter (ul-answer (meta/dependencies (primitive/code-symbol name))))
+          (let [dn (primitive/code-sym d)]
+            (when (and (not (contains? live dn))
+                       (or (contains? owned dn) (contains? modules (ul-module-of dn))))
+              (set! (mut live) dn 1)
+              (push! (mut queue) dn) 0)))))
+    0))
+
+;;; A core form that declares the name after its head. `do` is walked into: a macro
+;;; splices several definitions into one.
+(defn ul-defining? [(f Code)] (-> bool)
+  (let [h (ul-head-text f)]
+    (or (= h "defn*") (= h "defstruct") (= h "defsum") (= h "deftrait") (= h "const")
+        (= h "def") (= h "extern") (= h "defalias") (= h "declare"))))
+
+;;; Where F was written: its file, line and column. A definition a macro made is
+;;; written where the macro was called, so this is the call the author wrote.
+(defn ul-position [(f Code) (a (dyn alloc/Allocator))] (-> (slice u8))
+  (let [(mut sb) (StrBuf::new a)]
+    (push-str! (mut sb) (primitive/code-file f))
+    (push-str! (mut sb) ":")
+    (push-i64! (mut sb) (primitive/code-line f))
+    (push-str! (mut sb) ":")
+    (push-i64! (mut sb) (primitive/code-col f))
+    (str sb)))
+
+;;; Sort each definition the expanded form F makes in MODULE by where it was
+;;; written: DEAD when the program owns it and did not reach it, LIVE otherwise.
+(defn ul-place-definitions! [(f Code)
+                             (module (slice u8))
+                             (a (dyn alloc/Allocator))
+                             (owned (mut (HashMap (slice u8) i64)))
+                             (live (mut (HashMap (slice u8) i64)))
+                             (dead-at (mut (HashMap (slice u8) i64)))
+                             (live-at (mut (HashMap (slice u8) i64)))] (-> i64)
+  (cond (= (ul-head-text f) "do")
+          (do (for e (iter (primitive/code-slice f 1 (len f)))
+                (ul-place-definitions! e module a (mut owned) (mut live) (mut dead-at) (mut live-at)))
+              0)
+        (ul-defining? f)
+          (let [q (ul-qualify a module (ul-form-name f))
+                at (ul-position f a)]
+            (if (and (contains? owned q) (not (contains? live q)))
+                (set! (mut dead-at) at 1)
+                (set! (mut live-at) at 1))
+            0)
+        :else 0))
+
+;;; Delete each authored form whose definitions the program owns and none of which
+;;; it reached. The names come from the expanded program, where every definition is
+;;; a core form whatever macro wrote it, and the form deleted is the one the author
+;;; wrote at the same place: a `defn`, or the call of a macro that defined it.
+(defn ul-report-definitions [(modules Code)
+                             (sources Code)
+                             (a (dyn alloc/Allocator))
+                             (user (mut (HashMap (slice u8) i64)))
+                             (owned (mut (HashMap (slice u8) i64)))
+                             (live (mut (HashMap (slice u8) i64)))] (-> i64)
+  (let [(mut dead-at) (ul-names a)
+        (mut live-at) (ul-names a)]
+    (for m (iter modules)
+      (let [module (ul-sym-text (get m 0))]
+        (when (contains? user module)
+          (for f (iter (primitive/code-slice m 1 (len m)))
+            (ul-place-definitions! f module a (mut owned) (mut live) (mut dead-at) (mut live-at)))
+          0)))
+    (for record (iter sources)
+      (for f (iter (primitive/code-slice record 1 (len record)))
+        (let [at (ul-position f a)]
+          (when (and (contains? dead-at at) (not (contains? live-at at))
+                     (primitive/code-from-user? f))
+            (primitive/delete f "unused: nothing reachable from this program's roots refers to this")
+            0)))))
+  0)
+
+; ── unused sum variants ────────────────────────────────────────────────────────
+; A variant nothing ever CONSTRUCTS, together with the `match` arms that handle it.
+;
+; The declaration graph cannot tell the two apart — a `match` that handles a
+; variant depends on it exactly as a construction does — so this asks for
+; constructions alone. An authored construction is a reference the compiler
+; resolved to the variant; a pattern is no reference at all. A construction a macro
+; generated is a call the checker resolved to the variant (`code-decl`), asked only
+; of generated code and never of a pattern.
+;
+; Deleting the variant alone would leave arms referring to a variant that no longer
+; exists, so the arms go with it. That is not a behaviour change: an arm for a variant
+; nothing constructs cannot run, and exhaustiveness still holds over what remains.
+; An arm is matched to its variant through the checked type of the `match`'s
+; scrutinee, which names the sum and so the module its variants are declared in.
+;
+; SKIPPED ENTIRELY under the library reading. A library's variants are its API — its
+; callers construct them and are not present to be seen.
+
+(defn ul-construction-role? [(role Code)] (-> bool)
+  (or (= role `:call) (= role `:value) (= role `:fnptr)))
+
+;;; Authored constructions: references in the user's modules that resolved to a
+;;; declaration as a value or call.
+(defn ul-authored-constructions! [(sources Code) (built (mut (HashMap (slice u8) i64)))] (-> i64)
+  (for record (iter sources)
+    (match (meta/references (get record 0))
+      (primitive/SourceIs [refs]
+        (for r (iter refs)
+          (when (ul-construction-role? (meta/reference-role r))
+            (let [q (ul-global (meta/reference-node r))]
+              (when (> (len q) 0) (set! (mut built) q 1) 0)))
+          0))
+      (primitive/SourceUnavailable [] 0)))
+  0)
+
+;;; Generated constructions in F: a generated call the checker resolved to a
+;;; variant. A `match` arm's pattern is not walked, nor a `defsum`'s declarations.
+(defn ul-generated-constructions! [(f Code) (built (mut (HashMap (slice u8) i64)))] (-> i64)
+  (when (or (primitive/code-list? f) (primitive/code-vector? f))
+    (let [head (ul-head-text f)]
+      (cond (= head "defsum") 0
+            (and (= head "match") (> (len f) 1))
+              (do
+                (ul-generated-constructions! (get f 1) (mut built))
+                (for arm (iter (primitive/code-slice f 2 (len f)))
+                  (if (and (primitive/code-list? arm) (> (len arm) 0))
+                      (for e (iter (primitive/code-slice arm 1 (len arm)))
+                        (ul-generated-constructions! e (mut built)))
+                      0))
+                0)
+              :else
+              (do
+                (when (and (primitive/code-list? f) (primitive/code-macro? f))
+                  (match (primitive/code-decl f)
+                    (primitive/Declared [_ kind name _]
+                      (match kind
+                        (primitive/VariantDecl [] (do (set! (mut built) (primitive/code-sym name) 1) 0))
+                        (_ 0)))
+                    (_ 0))
+                  0)
+                (for e (iter f) (ul-generated-constructions! e (mut built)))
+                0))))
+  0)
+
+;;; Delete every arm of a `match` in F that handles a variant in DEAD.
+(defn ul-dead-arms [(f Code) (a (dyn alloc/Allocator)) (dead (mut (HashMap (slice u8) i64)))] (-> i64)
+  (when (or (primitive/code-list? f) (primitive/code-vector? f))
+    (when (and (= (ul-head-text f) "match") (> (len f) 1))
+      (match (primitive/type-of (get f 1))
+        (primitive/TypeIs [t]
+          (let [module (ul-module-of (ul-nominal-of t))]
+            (for arm (iter (primitive/code-slice f 2 (len f)))
+              (let [v (ul-head-text arm)]
+                (when (and (> (len v) 0) (> (len module) 0)
+                           (contains? dead (ul-qualify a module v)))
+                  (primitive/delete arm "unused: nothing constructs this variant, so this arm cannot run")
+                  0)))))
+        (primitive/TypeUnknown [] 0))
+      0)
+    (for e (iter f) (ul-dead-arms e a (mut dead))))
+  0)
+
+(defn ul-variants [(modules Code)
+                   (sources Code)
+                   (a (dyn alloc/Allocator))
+                   (user (mut (HashMap (slice u8) i64)))
+                   (live (mut (HashMap (slice u8) i64)))] (-> i64)
+  (let [(mut built) (ul-names a)
+        (mut dead) (ul-names a)]
+    (ul-authored-constructions! sources (mut built))
+    (for m (iter modules)
+      (when (contains? user (ul-sym-text (get m 0)))
+        (for f (iter (primitive/code-slice m 1 (len m))) (ul-generated-constructions! f (mut built))))
+      0)
+    (for record (iter sources)
+      (let [module (primitive/code-sym (get record 0))]
+        (for f (iter (primitive/code-slice record 1 (len record)))
+          ; a sum keeps its last variant: an empty `defsum` is a different type, not
+          ; a smaller one; and a sum that is going takes its variants with it
+          (when (and (= (ul-head-text f) "defsum") (> (len f) 3)
+                     (primitive/code-from-user? f)
+                     (contains? live (ul-qualify a module (ul-form-name f))))
+            (for v (iter (primitive/code-slice f 2 (len f)))
+              ; a generic sum's parameter vector `[T]` is no variant
+              (let [vn (if (primitive/code-vector? v) "" (ul-head-text v))]
+                (when (> (len vn) 0)
+                  (let [q (ul-qualify a module vn)]
+                    (unless (contains? built q)
+                      (primitive/delete v "unused: nothing constructs this variant")
+                      (set! (mut dead) q 1) 0)))
+                0)))
+          0)))
+    (for m (iter modules)
+      (when (contains? user (ul-sym-text (get m 0)))
+        (for f (iter (primitive/code-slice m 1 (len m)))
+          (when (primitive/code-from-user? f) (ul-dead-arms f a (mut dead)) 0)))
+      0))
+  0)
+
+; ── unused imports ─────────────────────────────────────────────────────────────
+; An import is used when the module refers to something through it, or depends on
+; something its module declares, or the import itself does something:
+;
+;   * a reference resolved through it — the compiler records the facade every
+;     authored reference went through (`meta/references-through`);
+;   * a dependency of one of the module's definitions, or of its top-level uses, on
+;     a declaration of the imported module — that covers what no reference names:
+;     an impl's method (a trait call, an `=` on slices), a convention, a macro's
+;     expansion;
+;   * an AMBIENT effect: the imported module registers a checker or transform, or
+;     does anything else at top level beyond publishing its exports and impls —
+;     "a dialect is a single import" is exactly an import nothing refers to.
+;
+; A `:use [a b]` item is used when a reference resolved through the import under
+; its exported name, or the module depends on the declaration it names. An import
+; that `:reexport`s publishes its names to the module's importers, and using them
+; here was never the point, so it is never judged.
+
+;;; Everything module M's definitions and top-level uses depend on.
+(defn ul-module-dependencies! [(m Code) (deps (mut (HashMap (slice u8) i64)))] (-> i64)
+  (for u (iter (ul-answer (meta/module-uses m)))
+    (set! (mut deps) (primitive/code-sym u) 1)
+    (for d (iter (ul-answer (meta/dependencies u))) (set! (mut deps) (primitive/code-sym d) 1)))
+  (for n (iter (ul-answer (meta/definitions m)))
+    (for d (iter (ul-answer (meta/dependencies n))) (set! (mut deps) (primitive/code-sym d) 1)))
+  0)
+
+;;; Does the module T do anything at top level beyond publishing its exports and
+;;; providing impls: a use of one of its own definitions that its export list does
+;;; not explain — a registered checker or transform, an assertion, a top-level
+;;; macro call.
+(defn ul-ambient? [(t Code) (a (dyn alloc/Allocator))] (-> bool)
+  (let [module (primitive/code-sym t)
+        (mut exported) (ul-names a)
+        (mut declared) (ul-names a)]
+    (for f (iter (ul-answer (meta/module-header t)))
+      (when (= (ul-head-text f) "export")
+        (for n (iter (primitive/code-slice f 1 (len f)))
+          (when (primitive/code-sym? n)
+            (set! (mut exported) (ul-qualify a module (primitive/code-sym n)) 1) 0)))
+      0)
+    (for d (iter (ul-answer (meta/definitions t)))
+      (set! (mut declared) (primitive/code-sym d) 1))
+    (block :found
+      (for u (iter (ul-answer (meta/module-uses t)))
+        (let [q (primitive/code-sym u)]
+          (when (and (contains? declared q) (not (contains? exported q)))
+            (return-from :found true))))
+      false)))
+
+;;; Does the module depend on something T declares or provides?
+(defn ul-depends-on-module? [(t Code) (deps (mut (HashMap (slice u8) i64)))] (-> bool)
+  (let [module (primitive/code-sym t)]
+    (block :found
+      (for d (iter deps)
+        (when (= (ul-module-of d) module) (return-from :found true)))
+      (for u (iter (ul-answer (meta/module-uses t)))
+        (when (contains? deps (primitive/code-sym u)) (return-from :found true)))
+      false)))
+
+;;; The element after keyword KW in import form F, or `()`.
+(defn ul-import-arg [(f Code) (kw Code)] (-> Code)
+  (block :found
+    (for [i 1 (- (len f) 1)]
+      (when (= (get f i) kw) (return-from :found (get f (+ i 1)))))
+    `()))
+
+(defn ul-import-has? [(f Code) (kw Code)] (-> bool)
+  (block :found
+    (for e (iter f) (when (= e kw) (return-from :found true)))
+    false))
+
+;;; The exported names references resolved under through IMPORT.
+(defn ul-through-names! [(import Code) (through (mut (HashMap (slice u8) i64)))] (-> i64)
+  (match (meta/references-through import)
+    (primitive/SourceIs [refs]
+      (for r (iter refs)
+        (set! (mut through) "" 1)
+        (match (meta/reference-exported-name r)
+          (Some [n] (do (set! (mut through) (primitive/code-sym n) 1) 0))
+          (None [] 0)))
+      0)
+    (primitive/SourceUnavailable [] 0))
+  0)
+
+(defn ul-report-import [(import Code)
+                        (a (dyn alloc/Allocator))
+                        (deps (mut (HashMap (slice u8) i64)))] (-> i64)
+  (let [node (meta/import-node import)
+        target (meta/import-target import)
+        module (primitive/code-sym target)
+        use-spec (ul-import-arg node `:use)
+        (mut through) (ul-names a)]
+    (ul-through-names! import (mut through))
+    (unless (or (not (primitive/code-from-user? node)) (ul-import-has? node `:reexport))
+      (if (or (> (len through) 0) (ul-depends-on-module? target (mut deps)) (ul-ambient? target a))
+          ; used: drop the `:use` items that are not
+          (when (primitive/code-vector? use-spec)
+            (for e (iter use-spec)
+              (when (primitive/code-sym? e)
+                (let [n (primitive/code-sym e)]
+                  (unless (or (contains? through n) (contains? deps (ul-qualify a module n)))
+                    (ul-delete-alone e "unused: nothing in the module refers to this imported name"))))
+              0)
+            0)
+          (ul-delete-alone node "unused: this import binds nothing the module refers to"))
+      0))
+  0)
+
+(defn ul-imports [(sources Code) (a (dyn alloc/Allocator))] (-> i64)
+  (for record (iter sources)
+    (let [m (get record 0)
+          (mut deps) (ul-names a)]
+      (ul-module-dependencies! m (mut deps))
+      (match (meta/imports m)
+        (primitive/SourceIs [imports]
+          (for import (iter imports) (ul-report-import import a (mut deps))))
+        (primitive/SourceUnavailable [] 0))))
+  0)
+
+; ── unused let bindings ────────────────────────────────────────────────────────
+; `(let [k v …] body…)` where nothing reads `k`. Two conditions, and the second is
+; the one that decides how much of this is safe to do at all:
+;
+;   * No read resolves to the local `k` introduces. The compiler answers both: the
+;     binder's identity, and the identity each authored read resolved to, so a
+;     shadowing `k` or a global named `k` is a different local, not a read.
+;   * `v` cannot have an effect. A binding is only dead weight if evaluating its
+;     initializer was pointless; `(let [x (write! …)] …)` still has to run the write.
+;     Purity is not decidable here, so this asks for a PROOF from a small whitelist
+;     — a literal, a local, a stack/static reservation, a size query, a cast or a
+;     field or load of something already proven pure — and refuses everything else.
+;     A call is assumed to have effects. The whitelist is of primitives, by the
+;     qualified name the head resolved to.
+;
+; The binding is two adjacent nodes and both go, as two deletions of the same round.
+
+(defn ul-pure-primitive? [(q (slice u8))] (-> bool)
+  (or (= q "coil.primitive.alloc-stack") (= q "coil.primitive.alloc-static")
+      (= q "coil.primitive.sizeof") (= q "coil.primitive.alignof")
+      (= q "coil.primitive.offsetof") (= q "coil.primitive.cast")
+      (= q "coil.primitive.field") (= q "coil.primitive.load")))
+
+;;; Evaluating E provably cannot do anything but produce a value.
+(defn ul-pure? [(e Code)] (-> bool)
+  (cond (not (primitive/code-list? e)) true
+        (= (len e) 0) true
+        :else
+          (let [head (get e 0)
+                spelled (ul-sym-text head)]
+            (cond
+              ; `(.field e)`: a field read, pure when its base is
+              (and (> (len spelled) 1) (= (primitive/cast i64 (get spelled 0)) 46) (= (len e) 2))
+                (ul-pure? (get e 1))
+              (ul-pure-primitive? (ul-global head))
+                (block :all
+                  (for x (iter (primitive/code-slice e 1 (len e)))
+                    (unless (ul-pure? x) (return-from :all false)))
+                  true)
+              :else false))))
+
+;;; The local identity BINDER introduces, or "" when the compiler recorded none.
+(defn ul-binder-id [(binder Code)] (-> (slice u8))
+  (let [name (cond (primitive/code-sym? binder) binder
+                   (and (primitive/code-list? binder) (= (len binder) 2)) (get binder 1)
+                   :else `())]
+    (if (primitive/code-sym? name)
+        (match (meta/source-binding name)
+          (primitive/BindsLocal [id] (meta/source id))
+          (_ ""))
+        "")))
+
+(defn ul-let? [(f Code)] (-> bool)
+  (and (primitive/code-list? f) (> (len f) 1) (primitive/code-vector? (get f 1))
+       (or (= (ul-global (get f 0)) "coil.binding.let") (= (ul-head-text f) "let*"))))
+
+(defn ul-lets [(f Code) (reads (mut (HashMap (slice u8) i64)))] (-> i64)
+  (when (or (primitive/code-list? f) (primitive/code-vector? f))
+    (when (ul-let? f)
+      (let [v (get f 1)]
+        (for [i 0 (/ (len v) 2)]
+          (let [b (get v (* i 2))
+                init (get v (+ (* i 2) 1))
+                id (ul-binder-id b)]
+            (when (and (> (len id) 0) (not (contains? reads id)) (ul-pure? init))
+              (primitive/delete b "unused: this binding is never read")
+              (primitive/delete init "unused: this binding is never read")
+              0)))))
+    (for e (iter f) (ul-lets e (mut reads))))
+  0)
+
+(defn ul-lets-program [(sources Code) (a (dyn alloc/Allocator))] (-> i64)
+  (for record (iter sources)
+    (let [(mut reads) (ul-names a)]
+      (match (meta/references (get record 0))
+        (primitive/SourceIs [refs]
+          (for r (iter refs)
+            (match (meta/reference-binding r)
+              (primitive/BindsLocal [id] (do (set! (mut reads) (meta/source id) 1) 0))
+              (_ 0))))
+        (primitive/SourceUnavailable [] 0))
+      (for f (iter (primitive/code-slice record 1 (len record)))
+        (when (primitive/code-from-user? f) (ul-lets f (mut reads)) 0))))
   0)
 
 ; ── unused struct fields ───────────────────────────────────────────────────────
@@ -995,8 +649,8 @@
 ; deliberately heavier than anywhere else in this file, and a field is deleted only
 ; when the layout provably belongs to Coil alone:
 ;
-;   * The struct is never named by an `extern` declaration. That is the syntactic
-;     edge across which a layout stops being ours to change.
+;   * No `extern` depends on the struct. That is the edge across which a layout
+;     stops being ours to change.
 ;   * The struct is never either end of a POINTER CAST. This is the guard the other
 ;     ones do not imply, and `src/apps/clox` is why it exists. It does C-style
 ;     struct inheritance: every heap object begins with an `(obj Obj)` header, and
@@ -1005,16 +659,14 @@
 ;     dead in all eight object types; deleting it compiled cleanly and took the VM
 ;     from 246 passing tests to 246 failing ones. A struct that is cast through is a
 ;     struct whose layout something is relying on.
-;   * `type-of` resolved the base of EVERY `(field … name)` in the program. One
-;     unresolved base and the name is treated as used in every struct, because an
-;     unattributed read is indistinguishable from a read of this one.
+;   * The checker typed the base of EVERY field access in the program. One access
+;     it could not type might be of any struct, so then no field is judged at all.
 ;   * A `cimport`ed struct is generated, not written, so `cop-record-fix` refuses to
 ;     edit it before any of this is consulted.
 ;
-; The named-constructor syntax `(Moved :x 1 :y 2)` names fields by keyword rather
-; than by symbol, which this walk could not see. It does not have to: checkers run
-; after expansion, by which point the construction is field stores, and those are
-; exactly the `(field …)` forms counted here.
+; Uses are collected across the WHOLE program — bundled code included, which reads
+; the user's structs through generic and derived helpers — and keyed by the
+; struct's qualified name, so two modules' `P` are two structs.
 ;
 ; Even with all of that, this pass is OFF unless you ask for it:
 ; `--lint-param unused-fields=on`. The guards above are a list of the layout
@@ -1024,521 +676,119 @@
 ; Every other deletion in this file is checked by the compiler before it is kept;
 ; this one is not, so it is the one you opt into.
 
-;;; `(ptr Live)` / `(mut Live)` / `Live` -> `Live`; anything else -> "".
-;;;
-;;; The last component is what comes back, because the two ends of this comparison
-;;; are spelled differently: `type-of` answers with the type's FULLY QUALIFIED name
-;;; (`fieldtest.P`), while the `defstruct` being judged is named by its bare `P`. Left
-;;; unreconciled, no field use ever matched the struct that owned it and every field
-;;; in the program looked dead.
-;;; The `ul-type-name` of the type the checker inferred for F; "" when it inferred
-;;; none.
-(defn ul-inferred-type-name [(f Code)] (-> (slice u8))
-  (match (primitive/type-of f)
-    (primitive/TypeIs [t] (ul-type-name t))
-    (primitive/TypeUnknown [] "")))
 
-(defn ul-type-name [(t Code)] (-> (slice u8))
-  (if (primitive/code-sym? t)
-      (ul-last-component (primitive/code-sym t))
-      (if (primitive/code-list? t)
-          (if (= (len t) 2)
-              (ul-type-name (get t 1))
-              "")
-          "")))
+;;; `Struct/field`, a key no qualified name can collide with.
+(defn ul-field-key [(a (dyn alloc/Allocator)) (struct (slice u8)) (field (slice u8))] (-> (slice u8))
+  (let [(mut sb) (StrBuf::new a)]
+    (push-str! (mut sb) struct)
+    (push-str! (mut sb) "/")
+    (push-str! (mut sb) field)
+    (str sb)))
 
-;;; After the last `/` or `.` — a type name is qualified with either.
-(defn ul-last-component [(s (slice u8))] (-> (slice u8))
-  (let [n (len s)
-        (mut cut) 0
-        (mut i) 0]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (let [c (primitive/cast i64 (get s (load i)))]
-                  (when (or (= c 47)
-                            (= c 46))
-                    (store! cut (primitive/iadd (load i) 1))
-                    0))
-                (set! i (primitive/iadd (load i) 1)))))
-    (subslice s (load cut) n)))
+;;; Record what F reads: field uses as `Struct/field`, cast-through structs by
+;;; name, and "" when an access's base has no checked type. A quasiquoted template
+;;; is data, not code — its expansions are typed where they land — so only what is
+;;; outside every template, or unquoted back out of one, is read. DEPTH counts the
+;;; templates F is inside.
+(defn ul-fields-walk [(f Code) (depth i64) (a (dyn alloc/Allocator)) (uses (mut (HashMap (slice u8) i64)))] (-> i64)
+  (let [head (ul-head-text f)]
+    (cond (and (= depth 0) (= head "quote")) 0
+          (= head "quasiquote")
+            (do (for e (iter f) (ul-fields-walk e (+ depth 1) a (mut uses))) 0)
+          (and (> depth 0) (or (= head "unquote") (= head "unquote-splicing")))
+            (do (for e (iter f) (ul-fields-walk e (- depth 1) a (mut uses))) 0)
+          (> depth 0)
+            (do (when (or (primitive/code-list? f) (primitive/code-vector? f))
+                  (for e (iter f) (ul-fields-walk e depth a (mut uses))))
+                0)
+          :else (ul-field-uses! f a (mut uses)))))
 
-;;; Record a use of field `fname`, attributed to struct `sname` — or, when the base
-;;; type did not resolve, to every struct at once via the unattributed set.
-(defn ul-field-use! [(lo (ptr UlLocal)) (sname (slice u8)) (fname (slice u8))] (-> i64)
-  (if (= (len fname) 0)
-      0
-      (if (= (len sname) 0)
-          (do (set! (load (field lo names)) fname 1) 0)
-          (do (set! (load (field lo quals)) (ul-field-key sname fname) 1) 0))))
+(defn ul-field-uses! [(f Code) (a (dyn alloc/Allocator)) (uses (mut (HashMap (slice u8) i64)))] (-> i64)
+  (when (or (primitive/code-list? f) (primitive/code-vector? f))
+    (when (and (primitive/code-list? f) (> (len f) 1))
+      (let [head (ul-head-text f)
+            accessor (and (= (len f) 2) (> (len head) 1) (= (primitive/cast i64 (get head 0)) 46))]
+        (cond accessor (ul-field-use! (get f 1) (subslice head 1 (len head)) a (mut uses))
+              (and (> (len f) 2) (or (= head "field") (= head "primitive/field")))
+                (ul-field-use! (get f 1) (ul-sym-text (get f 2)) a (mut uses))
+              (and (> (len f) 2) (or (= head "offsetof") (= head "primitive/offsetof")))
+                (match (primitive/type-of (get f 1))
+                  (primitive/TypeIs [t] (do (set! (mut uses) (ul-field-key a (ul-nominal-of t) (ul-sym-text (get f 2))) 1) 0))
+                  (primitive/TypeUnknown [] (do (set! (mut uses) "" 1) 0)))
+              (and (> (len f) 2) (or (= head "cast") (= head "primitive/cast")))
+                (do
+                  (match (primitive/type-of f)
+                    (primitive/TypeIs [t] (do (set! (mut uses) (ul-nominal-of t) 1) 0))
+                    (primitive/TypeUnknown [] 0))
+                  (match (primitive/type-of (get f 2))
+                    (primitive/TypeIs [t] (do (set! (mut uses) (ul-nominal-of t) 1) 0))
+                    (primitive/TypeUnknown [] 0))
+                  0)
+              :else 0)))
+    (for e (iter f) (ul-fields-walk e 0 a (mut uses))))
+  0)
 
-;;; `Struct/field` — the same shape a qualified symbol has, which is why the same map
-;;; can hold it: no bare field name can collide with one.
-(defn ul-field-key [(sname (slice u8)) (fname (slice u8))] (-> (slice u8))
-  (let [a (alloc/malloc-allocator)]
-    (match (concat a sname "/")
-      (None [] (ul-oom))
-      (Some [prefix]
-            (match (concat a prefix fname)
-              (None [] (ul-oom))
-              (Some [key] key))))))
+(defn ul-field-use! [(base Code) (field (slice u8)) (a (dyn alloc/Allocator))
+                     (uses (mut (HashMap (slice u8) i64)))] (-> i64)
+  (match (primitive/type-of base)
+    (primitive/TypeIs [t] (do (set! (mut uses) (ul-field-key a (ul-nominal-of t) field) 1) 0))
+    (primitive/TypeUnknown [] (do (set! (mut uses) "" 1) 0))))
 
-;;; Out of memory while building a key. There is no value to return that would not be
-;;; a WRONG one — any fallback string collides with some real key and marks the wrong
-;;; field live — so this stops instead of guessing.
-;;;
-;;; ⚠ `(primitive/error …)` is the natural way to say this and CANNOT be used here.
-;;; Only functions with `Code` in their signature become part of the metaprogram
-;;; sub-program; every other helper in this module, this one included, is compiled as
-;;; ordinary runtime code, where a comptime-only op is "code operation 9 reached mono
-;;; (compiler bug)" for anyone who merely IMPORTS the namespace. libc's `abort` says
-;;; the same thing in a way that survives being compiled.
-(extern abort :cc (cc/C) [] (-> void))
+;;; Does an `extern` depend on the struct Q?
+(defn ul-crosses-abi? [(q Code)] (-> bool)
+  (block :found
+    (for d (iter (ul-answer (meta/dependents q)))
+      (match (meta/definition-kind d)
+        (primitive/KindIs [k] (match k (primitive/Extern [] (return-from :found true)) (_ 0)))
+        (_ 0)))
+    false))
 
-(defn ul-oom [] (-> (slice u8))
-  (write-line (stderr) "coil.lint.unused: out of memory building a field key")
-  (abort)
-  "")
-
-(defn ul-fields-walk [(lo (ptr UlLocal)) (f Code)] (-> i64)
-  (if (primitive/code-list? f)
-      (do (ul-fields-note! lo f) (ul-fields-kids lo f 0 (len f)))
-      (if (primitive/code-vector? f)
-          (ul-fields-kids lo f 0 (len f))
-          0)))
-
-;;; Compared on the BARE head name, not on a quoted symbol. `field` reaches a checker
-;;; spelled however the expansion that produced it spelled it — `field`,
-;;; `primitive/field`, or module-qualified — and matching one spelling silently
-;;; recorded no field uses at all, which made every field look dead.
-(defn ul-head-name [(f Code)] (-> (slice u8))
-  (if (> (len f) 0)
-      (let [h (get f 0)]
-        (if (primitive/code-sym? h) (ul-bare (primitive/code-sym h)) ""))
-      ""))
-
-;;; The ACCESSOR spelling of a field read, `(.name e)`. Two things hid it: it is a
-;;; two-element list, so the `field`/`offsetof` shapes below (which need three)
-;;; returned early, and `ul-head-name` runs the head through `ul-bare`, which
-;;; strips everything up to the last `.` -- so `.x` arrived here already looking
-;;; like a plain `x`. Every field a program reads through an accessor therefore
-;;; looked dead.
-;;;
-;;; That went unnoticed until field_syntax_lint began rewriting `(load (field p
-;;; x))` into `(.x p)`: with both lints on, the first --fix round rewrote the
-;;; reads and the next one deleted the fields those reads were reaching, so the
-;;; round stopped compiling and the whole fix was reverted.
-(defn ul-raw-head [(f Code)] (-> (slice u8))
-  (if (> (len f) 0)
-      (let [h (get f 0)]
-        (if (primitive/code-sym? h) (primitive/code-sym h) ""))
-      ""))
-
-(defn ul-accessor-name [(f Code)] (-> (slice u8))
-  (if (= (len f) 2)
-      (let [h (ul-raw-head f)]
-        (if (and (> (len h) 1)
-                 (= (primitive/cast i64 (get h 0)) 46))
-            (subslice h 1 (len h))
-            ""))
-      ""))
-
-(defn ul-fields-note! [(lo (ptr UlLocal)) (f Code)] (-> i64)
-  (let [head (ul-head-name f)
-        acc (ul-accessor-name f)]
-    (if (= head "cast")
-        (ul-note-cast! lo f)
-        (if (> (len acc) 0)
-            ;; an unresolved base type records the name unattributed, which marks it
-            ;; live for every struct -- the conservative direction
-            (ul-field-use! lo
-                           (ul-inferred-type-name (get f 1))
-                           acc)
-            (if (< (len f) 3)
-                0
-                (cond (= head "field")
-                        (ul-field-use! lo
-                                       (ul-inferred-type-name (get f 1))
-                                       (ul-name-at f 2))
-                      (= head "offsetof")
-                        (ul-field-use! lo
-                                       (ul-type-name (get f 1))
-                                       (ul-name-at f 2))
-                      :else 0))))))
-
-;;; `(cast (ptr S) e)` — both S and whatever `e` already pointed at have their layouts
-;;; tied together by this cast. Record each as layout-critical.
-(defn ul-note-cast! [(lo (ptr UlLocal)) (f Code)] (-> i64)
-  (if (< (len f) 3)
-      0
-      (do
-        (ul-note-pointee! lo (get f 1))
-        (match (primitive/type-of (get f 2))
-          (primitive/TypeIs [t] (ul-note-pointee! lo t))
-          (primitive/TypeUnknown [] 0)))))
-
-;;; If `t` is `(ptr S)` / `(mut S)`, mark S.
-(defn ul-note-pointee! [(lo (ptr UlLocal)) (t Code)] (-> i64)
-  (if (primitive/code-list? t)
-      (if (= (len t) 2)
-          (let [head (ul-head-name t)]
-            (if (or (= head "ptr") (= head "mut"))
-                (let [s (ul-type-name (get t 1))]
-                  (if (= (len s) 0) 0 (do (set! (load (field lo quals)) s 1) 0)))
-                0))
-          0)
+(defn ul-fields [(modules Code) (sources Code) (a (dyn alloc/Allocator))] (-> i64)
+  (when (= (primitive/lint-param "unused-fields" "off") "on")
+    (let [(mut uses) (ul-names a)]
+      (for m (iter modules)
+        (for f (iter (primitive/code-slice m 1 (len m)))
+          (ul-fields-walk f 0 a (mut uses))))
+      (unless (contains? uses "")
+        (for record (iter sources)
+          (let [module (primitive/code-sym (get record 0))]
+            (for f (iter (primitive/code-slice record 1 (len record)))
+              (when (and (= (ul-head-text f) "defstruct") (primitive/code-from-user? f))
+                (let [q (ul-qualify a module (ul-form-name f))]
+                  (unless (or (contains? uses q) (ul-crosses-abi? (primitive/code-symbol q)))
+                    (for v (iter f)
+                      ; a one-field struct keeps its field: an empty `defstruct` is a
+                      ; different type, not a smaller one
+                      (when (and (primitive/code-vector? v) (> (len v) 1))
+                        (for b (iter v)
+                          (when (and (primitive/code-list? b) (> (len b) 0) (primitive/code-sym? (get b 0)))
+                            (unless (contains? uses (ul-field-key a q (primitive/code-sym (get b 0))))
+                              (primitive/delete b "unused: this field is never read or written")
+                              0)
+                            0))
+                        0))
+                    0)))
+                0))))
       0))
-
-;;; Recorded by `ul-note-pointee!` under the struct's bare name, which cannot collide
-;;; with the `Struct/field` keys sharing the map.
-(defn ul-layout-critical? [(lo (ptr UlLocal)) (sname (slice u8))] (-> bool)
-  (ul-has? (load (field lo quals)) sname))
-
-(defn ul-fields-kids [(lo (ptr UlLocal)) (f Code) (i i64) (n i64)] (-> i64)
-  (do (for item (iter (primitive/code-slice f i n)) (ul-fields-walk lo item)) 0))
-
-;;; Is this struct named by an `extern` anywhere? Then its layout crosses to C and is
-;;; not ours to change.
-(defn ul-struct-is-abi? [(ms Code) (sname (slice u8)) (i i64) (n i64)] (-> bool)
-  (if (>= i n)
-      false
-      (let [m (get ms i)]
-        (if (ul-module-externs? m sname 1 (len m))
-            true
-            (ul-struct-is-abi? ms sname (primitive/iadd i 1) n)))))
-
-(defn ul-module-externs? [(m Code) (sname (slice u8)) (i i64) (n i64)] (-> bool)
-  (if (>= i n)
-      false
-      (let [f (get m i)]
-        (if (ul-head-is? f `extern)
-            (if (ul-mentions? f sname)
-                true
-                (ul-module-externs? m sname (primitive/iadd i 1) n))
-            (ul-module-externs? m sname (primitive/iadd i 1) n)))))
-
-(defn ul-report-fields [(ms Code) (lo (ptr UlLocal)) (f Code)] (-> i64)
-  (let [sname (ul-name-at f 1)]
-    (if (= (len sname) 0)
-        0
-        (if (ul-layout-critical? lo sname)
-            0
-            (if (ul-struct-is-abi? ms sname 0 (len ms))
-                0
-                (ul-field-vectors ms lo f sname 2 (len f)))))))
-
-(defn ul-field-vectors [(ms Code)
-                        (lo (ptr UlLocal))
-                        (f Code)
-                        (sname (slice u8))
-                        (i i64)
-                        (n i64)] (-> i64)
-  (if (>= i n)
-      0
-      (do
-        (let [v (get f i)]
-          (if (primitive/code-vector? v)
-              (ul-field-each lo v sname 0 (len v))
-              0))
-        (ul-field-vectors ms lo f sname (primitive/iadd i 1) n))))
-
-;;; A one-field struct keeps its field: an empty `defstruct` is a different type, not
-;;; a smaller one.
-(defn ul-field-each [(lo (ptr UlLocal))
-                     (v Code)
-                     (sname (slice u8))
-                     (i i64)
-                     (n i64)] (-> i64)
-  (if (>= i n)
-      0
-      (do
-        (if (<= n 1)
-            0
-            (let [b (get v i)]
-              (if (primitive/code-list? b)
-                  (let [fname (ul-name-at b 0)]
-                    (if (= (len fname) 0)
-                        0
-                        (if (ul-has? (load (field lo names)) fname)
-                            0
-                            (if (ul-has? (load (field lo quals))
-                                         (ul-field-key sname fname))
-                                0
-                                (do
-                                  (primitive/delete b
-                                                    "unused: this field is never read or written")
-                                  0)))))
-                  0)))
-        (ul-field-each lo v sname (primitive/iadd i 1) n))))
-
-(defn ul-fields-module [(ms Code) (lo (ptr UlLocal)) (m Code) (i i64) (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice m i n))
-      (let [f item]
-        (if (ul-head-is? f (quasiquote defstruct))
-            (if (primitive/code-from-user? f) (ul-report-fields ms lo f) 0)
-            0)))
-    0))
-
-(defn ul-fields-program [(ms Code) (lo (ptr UlLocal)) (i i64) (n i64)] (-> i64)
-  (if (>= i n)
-      0
-      (do
-        (let [m (get ms i)]
-          (ul-fields-module ms lo m 1 (len m)))
-        (ul-fields-program ms lo (primitive/iadd i 1) n))))
-
-;;; Collect field uses across the WHOLE program — including bundled code, which reads
-;;; the user's structs through generic and derived helpers — then judge.
-(defn ul-fields [(ms Code) (a (dyn alloc/Allocator))] (-> i64)
-  (if (!= (primitive/lint-param "unused-fields" "off") "on")
-      0
-      (let [lo (primitive/alloc-stack UlLocal)
-            names (primitive/alloc-stack (HashMap (slice u8) i64))
-            quals (primitive/alloc-stack (HashMap (slice u8) i64))]
-        (set! names (HashMap::new [(slice u8) i64] a (keyops)))
-        (set! quals (HashMap::new [(slice u8) i64] a (keyops)))
-        (set! (.names lo) names)
-        (set! (.quals lo) quals)
-        (ul-fields-kids lo ms 0 (len ms))
-        (ul-fields-program ms lo 0 (len ms)))))
-
-; ── unused sum variants ────────────────────────────────────────────────────────
-; A variant nothing ever CONSTRUCTS, together with the `match` arms that handle it.
-;
-; The distinction that makes this possible is pattern versus construction. `match`
-; survives expansion, so every arm head is a live symbol by the time a checker looks,
-; and a plain mention count therefore says every variant of every matched sum is used
-; — a variant is named by the very code that exists only to handle it. Counting only
-; NON-pattern occurrences asks the question that matters: does anything ever make one?
-;
-; Deleting the variant alone would leave arms referring to a variant that no longer
-; exists, so the arms go with it. That is not a behaviour change: an arm for a variant
-; nothing constructs cannot run, and exhaustiveness still holds over what remains.
-; Both edits are ordinary node deletions, and if the enclosing `defn` is being deleted
-; too the containment filter in `lint-edits` drops these in favour of the wider one.
-;
-; SKIPPED ENTIRELY under the library reading. A library's variants are its API — its
-; callers construct them and are not present to be seen — so "nothing here builds one"
-; means nothing at all. Under the executable reading nothing outside links against
-; these modules, so it means what it says.
-
-;;; Record every mention EXCEPT a `match` arm head, which is a pattern.
-(defn ul-ctor-walk [(lo (ptr UlLocal)) (f Code)] (-> i64)
-  (if (primitive/code-list? f)
-      (if (ul-match-form? f)
-          (do
-            (ul-ctor-walk lo (get f 1))
-            (ul-ctor-arms lo f 2 (len f)))
-          ; the `defsum` INTRODUCES these names; counting them would make every
-          ; variant its own constructor and the pass could never fire
-          (if (ul-head-is? f `defsum)
-              (ul-ctor-decls lo f 2 (len f))
-              (ul-ctor-kids lo f 0 (len f))))
-      (if (primitive/code-vector? f)
-          (ul-ctor-kids lo f 0 (len f))
-          (do
-            (when (primitive/code-sym? f)
-              (set! (load (field lo names)) (ul-bare (primitive/code-sym f)) 1)
-              0)
-            0))))
-
-(defn ul-match-form? [(f Code)] (-> bool)
-  (if (>= (len f) 2) (= (ul-head-name f) "match") false))
-
-;;; A variant declaration `(V [(f T) …])` introduces `V` and its field names; only
-;;; the payload TYPES are mentions.
-(defn ul-ctor-decls [(lo (ptr UlLocal)) (f Code) (i i64) (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice f i n))
-      (let [v item]
-        (if (primitive/code-list? v) (ul-ctor-payload lo v 1 (len v)) 0)))
-    0))
-
-(defn ul-ctor-payload [(lo (ptr UlLocal)) (v Code) (i i64) (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice v i n))
-      (let [e item]
-        (if (primitive/code-vector? e)
-            (ul-ctor-binders lo e 0 (len e))
-            (ul-ctor-walk lo e))))
-    0))
-
-(defn ul-ctor-binders [(lo (ptr UlLocal)) (v Code) (i i64) (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice v i n))
-      (let [b item]
-        (if (primitive/code-list? b)
-            (ul-ctor-kids lo b 1 (len b))
-            (ul-ctor-walk lo b))))
-    0))
-
-(defn ul-ctor-kids [(lo (ptr UlLocal)) (f Code) (i i64) (n i64)] (-> i64)
-  (do (for item (iter (primitive/code-slice f i n)) (ul-ctor-walk lo item)) 0))
-
-;;; An arm is `(Variant [binds] body…)`; element 0 is the pattern and is skipped.
-(defn ul-ctor-arms [(lo (ptr UlLocal)) (f Code) (i i64) (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice f i n))
-      (let [arm item]
-        (if (primitive/code-list? arm)
-            (ul-ctor-kids lo arm 1 (len arm))
-            (ul-ctor-walk lo arm))))
-    0))
-
-;;; Delete every arm handling a variant in the dead set (`quals`).
-(defn ul-arm-walk [(lo (ptr UlLocal)) (f Code)] (-> i64)
-  (if (primitive/code-list? f)
-      (do
-        (if (ul-match-form? f) (ul-dead-arms lo f 2 (len f)) 0)
-        (ul-arm-kids lo f 0 (len f)))
-      (if (primitive/code-vector? f)
-          (ul-arm-kids lo f 0 (len f))
-          0)))
-
-(defn ul-arm-kids [(lo (ptr UlLocal)) (f Code) (i i64) (n i64)] (-> i64)
-  (do (for item (iter (primitive/code-slice f i n)) (ul-arm-walk lo item)) 0))
-
-(defn ul-dead-arms [(lo (ptr UlLocal)) (f Code) (i i64) (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice f i n))
-      (let [arm item]
-        (if (primitive/code-list? arm)
-            (let [h (ul-name-at arm 0)]
-              (if (= (len h) 0)
-                  0
-                  (if (ul-has? (load (field lo quals)) (ul-bare h))
-                      (do
-                        (primitive/delete arm
-                                          "unused: nothing constructs this variant, so this arm cannot run")
-                        0)
-                      0)))
-            0)))
-    0))
-
-;;; A sum keeps its last variant: an empty `defsum` is a different type, not a
-;;; smaller one — the same reason a one-field struct keeps its field.
-(defn ul-report-variants [(st (ptr UlState)) (lo (ptr UlLocal)) (f Code)] (-> i64)
-  (let [n (len f)]
-    (if (<= n 3)
-        0
-        (if (not (ul-form-reachable? st f (ul-name-at f 1)))
-            0  ; the whole sum is going; no need to report its parts
-            (ul-variant-each st lo f 2 n)))))
-
-(defn ul-variant-each [(st (ptr UlState))
-                       (lo (ptr UlLocal))
-                       (f Code)
-                       (i i64)
-                       (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice f i n))
-      (let [v item]
-        (if (primitive/code-list? v)
-            (let [vn (ul-name-at v 0)]
-              (if (= (len vn) 0)
-                  0
-                  (if (ul-has? (load (field lo names)) vn)
-                      0
-                      (do
-                        (primitive/delete v
-                                          "unused: nothing constructs this variant")
-                        (set! (load (field lo quals)) vn 1)
-                        0))))
-            0)))
-    0))
-
-(defn ul-variants-module [(st (ptr UlState))
-                          (lo (ptr UlLocal))
-                          (m Code)
-                          (i i64)
-                          (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice m i n))
-      (let [f item]
-        (if (ul-head-is? f (quasiquote defsum))
-            (if (primitive/code-from-user? f) (ul-report-variants st lo f) 0)
-            0)))
-    0))
-
-(defn ul-variants-scan [(st (ptr UlState))
-                        (lo (ptr UlLocal))
-                        (ms Code)
-                        (i i64)
-                        (n i64)] (-> i64)
-  (do
-    (for item
-      (iter (primitive/code-slice ms i n))
-      (let [m item] (ul-variants-module st lo m 1 (len m))))
-    0))
-
-(defn ul-variants [(st (ptr UlState))
-                   (ms Code)
-                   (a (dyn alloc/Allocator))
-                   (root-all bool)] (-> i64)
-  (if root-all
-      0
-      (let [lo (primitive/alloc-stack UlLocal)
-            names (primitive/alloc-stack (HashMap (slice u8) i64))
-            dead (primitive/alloc-stack (HashMap (slice u8) i64))]
-        (set! names (HashMap::new [(slice u8) i64] a (keyops)))
-        (set! dead (HashMap::new [(slice u8) i64] a (keyops)))
-        (set! (.names lo) names)
-        (set! (.quals lo) dead)
-        ; a toolchain module constructs only its own sums' variants; one sharing a
-        ; bare name with a user variant is no construction of it
-        (for m (iter ms)
-          (unless (ul-toolchain-module? m) (ul-ctor-walk lo m)))
-        (ul-variants-scan st lo ms 0 (len ms))
-        (ul-arm-kids lo ms 0 (len ms)))))
+  0)
 
 ; ── the checker ────────────────────────────────────────────────────────────────
 (defn unused-code [(modules Code)] (-> Code)
   (let [a (alloc/malloc-allocator)
-        st (primitive/alloc-stack UlState)
-        defs (primitive/alloc-stack (ArrayList UlDef))
-        edges (primitive/alloc-stack (ArrayList (slice u8)))
-        byname (primitive/alloc-stack (HashMap (slice u8) i64))
-        roots (primitive/alloc-stack (ArrayList (slice u8)))
-        reach (primitive/alloc-stack (HashMap (slice u8) i64))]
-    (store! defs (ArrayList::new [UlDef] a))
-    (store! edges (ArrayList::new [(slice u8)] a))
-    (store! byname (HashMap::new [(slice u8) i64] a (keyops)))
-    (store! roots (ArrayList::new [(slice u8)] a))
-    (store! reach (HashMap::new [(slice u8) i64] a (keyops)))
-    (store! (field st defs) defs)
-    (store! (field st edges) edges)
-    (store! (field st byname) byname)
-    (store! (field st roots) roots)
-    (store! (field st reach) reach)
-    (ul-collect st modules 0 (len modules))
-    ; the entry point is a root by definition — nothing in the program names it
-    (push! [(slice u8)] roots "main")
-    ; …and so is every TEST. `deftest` and `defprop` mint `coil-test$NAME`
-    ; (assert.coil:77, prop.coil:123), which `coil test` discovers by that prefix
-    ; exactly as the linker discovers `main`. Nothing in the program CALLS them, so
-    ; without this they are unreachable — and worse, so is everything they are the
-    ; only caller of. A whole-project run then proposed deleting a function and the
-    ; test covering it in the same round, which compiles cleanly precisely because
-    ; both halves went, so the `--fix` loop's revert-on-broken could not catch it.
-    (ul-root-tests st modules 0 (len modules))
-    (if (ul-root-everything? modules)
-        (ul-root-public st modules 0 (len modules))
-        0)
-    (ul-mark st)
-    (ul-report st modules 0 (len modules))
-    (ul-variants st modules a (ul-root-everything? modules))
-    (ul-imports modules a 0 (len modules))
-    (ul-lets-program modules)
-    (ul-fields modules a)
+        sources (ul-sources)
+        library (ul-library? `main)
+        (mut user) (ul-names a)
+        (mut owned) (ul-names a)
+        (mut roots) (ul-names a)
+        (mut live) (ul-names a)]
+    (ul-own! sources (mut user) (mut owned))
+    (ul-roots! sources (mut owned) library (mut roots))
+    (ul-mark! `main a (mut user) (mut owned) (mut roots) (mut live))
+    (ul-report-definitions modules sources a (mut user) (mut owned) (mut live))
+    (unless library (ul-variants modules sources a (mut user) (mut live)) 0)
+    (ul-imports sources a)
+    (ul-lets-program sources a)
+    (ul-fields modules sources a)
     `0))
 
 (checker unused-code)
