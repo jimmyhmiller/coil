@@ -830,6 +830,14 @@ EOF
       esac ;;
     *) bad "unused reports unconstructed variants and unread bindings" "exit $rc: $out" ;;
   esac
+  # coil.core's typed target-arch is no legacy spelling for the preflight to rewrite
+  printf '%s\n' '(module arch-probe)' '(defn arm? [(c Code)] (-> Code) (match (target-arch) (Aarch64 [] `true) (_ `false)))' \
+    '(defn main [] (-> i64) (if (arm? 0) 0 1))' > "$T/arch-probe.coil"
+  out=$("$COIL" lint "$T/arch-probe.coil" 2>&1); rc=$?
+  case "$out" in
+    *"legacy metal"*|*"lint stopped"*) bad "lint leaves coil.core's target-arch alone" "exit $rc: $out" ;;
+    *) [ $rc -eq 0 ] && ok "lint leaves coil.core's target-arch alone" || bad "lint leaves coil.core's target-arch alone" "exit $rc: $out" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
