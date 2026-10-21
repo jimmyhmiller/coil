@@ -772,7 +772,18 @@ EOF
   printf '[package]\nname = "ui"\nentry = "ui/main.coil"\nsource-roots = ["."]\n' > "$T/unused-imports/Coil.toml"
   printf '(module ui.h)\n(defn f [] (-> i64) 1)\n(defn g [] (-> i64) 2)\n' > "$T/unused-imports/ui/h.coil"
   printf '(module ui.k)\n(defn kk [] (-> i64) 3)\n' > "$T/unused-imports/ui/k.coil"
-  printf '(module ui.main)\n(import "ui.h" :use [f g])\n(import "ui.k" :as k)\n(defn main [] (-> i64) (f))\n' > "$T/unused-imports/ui/main.coil"
+  # Lines 5-10 are the definitions tier. `dead` is named after a local in the rule's
+  # own module, which `--use` loads into the program it analyses: a toolchain
+  # module's names must not keep a user definition alive. `ping`/`pong` keep only
+  # each other alive; `used` is reached from main and `tested-only` from a test.
+  printf '%s\n' '(module ui.main)' '(import "ui.h" :use [f g])' '(import "ui.k" :as k)' \
+    '(defn main [] (-> i64) (+ (f) (used)))' \
+    '(defn dead [] (-> i64) 1)' \
+    '(defn ping [(n i64)] (-> i64) (if (> n 0) (pong (- n 1)) 0))' \
+    '(defn pong [(n i64)] (-> i64) (if (> n 0) (ping (- n 1)) 1))' \
+    '(defn used [] (-> i64) 2)' \
+    '(defn tested-only [] (-> i64) 3)' \
+    '(deftest tested-only-is-three (assert (= (tested-only) 3)))' > "$T/unused-imports/ui/main.coil"
   local out
   out=$(cd "$T/unused-imports" && "$COIL" lint ui/main.coil --use coil.lint.unused 2>&1); rc=$?
   case "$out" in
@@ -782,6 +793,16 @@ EOF
         *) ok "unused reports the imports nothing resolved through" ;;
       esac ;;
     *) bad "unused reports the imports nothing resolved through" "exit $rc: $out" ;;
+  esac
+  local defs="" line
+  for line in 4 5 6 7 8 9; do
+    case "$out" in *"ui/main.coil:$line:1"*) defs="$defs $line" ;; esac
+  done
+  case "$out" in
+    *"nothing reachable from this program's roots refers to this"*)
+      [ "$defs" = " 5 6 7" ] && ok "unused reports dead definitions and keeps live and test-only ones" \
+        || bad "unused reports dead definitions and keeps live and test-only ones" "want lines 5 6 7, got$defs: $out" ;;
+    *) bad "unused reports dead definitions and keeps live and test-only ones" "exit $rc: $out" ;;
   esac
 }
 
