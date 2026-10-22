@@ -107,6 +107,8 @@ OVERRIDES={
  ('coil.compiler.metaengine.MEEntry','interpcx'):('ptr','coil.compiler.interp.Interp'),
 }
 NULL_FIELDS={('coil.compiler.loader.LS','parent'),
+ # A lazy body belongs to the resolve that left it unparsed (resolve.coil).
+ ('coil.compiler.ast.Func','lazy'),
  ('coil.compiler.check.Cx','anon_outer_env'),
  ('coil.compiler.check.Cx','ownership_subst')}
 # Source refactoring evidence belongs to one lint analysis, not a retained
@@ -123,7 +125,8 @@ EMPTY_LISTS={
 EMPTY_MAPS={
  ('coil.compiler.check.Cx','synth_cache'),
  ('coil.compiler.resolve.SemanticWorkspace','revision_heads'),
- ('coil.compiler.resolve.SemanticWorkspace','failed_parses')}
+ ('coil.compiler.resolve.SemanticWorkspace','failed_parses'),
+ ('coil.compiler.resolve.SemanticWorkspace','lazy_headers')}
 
 # Name -> position tables whose keys are BORROWED from the records they index (each
 # key is the very name that record holds). Their slot arrays are entered as one node
