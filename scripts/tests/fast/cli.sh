@@ -931,6 +931,24 @@ EOF
 EOF
   expect_rc_out 1 'llvm-ir: could not parse IR' "an llvm-ir body naming a compiler operation is parsed as IR" \
     "$COIL" emit-obj "$T/spelled.coil" -o "$T/spelled.o"
+
+  # A named struct reaches an llvm-ir helper as itself: spelled by name, defined
+  # at the helper's top with the structs inside it, and not merged with another
+  # struct of its shape (coil.iter.Range is also { i64, i64 }).
+  cat > "$T/named-ir.coil" <<'EOF'
+(module named.ir)
+(import "coil.primitive" :as primitive)
+(defstruct Empty [])
+(defstruct Pt [(x i64) (y i64)])
+(defstruct Box2 [(a Pt) (b (array Pt 2))])
+(defn pt [] (-> Pt) (Pt :x 1 :y 30))
+(defn main [] (-> i64)
+  (+ (primitive/llvm-ir i64 [(zeroed Empty)] "ret i64 7")
+     (primitive/llvm-ir i64 [(pt)] "%y = extractvalue $t0 $0, 1\n ret i64 %y")
+     (primitive/llvm-ir i64 [(zeroed Box2) (pt)] "%y = extractvalue $t0 $0, 1, 0, 1\n ret i64 %y")))
+EOF
+  expect_rc 37 "an llvm-ir operand of a named struct type is that struct" \
+    "$COIL" run --backend llvm "$T/named-ir.coil"
 }
 
 # ---------------------------------------------------------------------------
