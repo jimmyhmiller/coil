@@ -967,6 +967,14 @@ section_cross() {
                               || bad "a cross build links an x86_64 executable" "exit $rc: $out" ;;
       *) bad "a cross build links an x86_64 Mach-O executable" "exit $rc: $out / $kind" ;;
     esac
+    # Apple's ar drops an ELF member with a warning and exits 0; a Linux --lib
+    # archive is written by llvm-ar and holds the object.
+    out=$("$COIL" build "$T/seven.coil" --lib -o "$T/xseven.a" --target x86_64-unknown-linux-gnu 2>&1); rc=$?
+    if [ "$rc" = 0 ] && LC_ALL=C grep -aq "$(printf '\177ELF')" "$T/xseven.a"; then
+      ok "a cross --lib build archives its ELF object"
+    else
+      bad "a cross --lib build archives its ELF object" "exit $rc: $out"
+    fi
     # An Apple embedded target links against its own platform's SDK, not the
     # host's macOS defaults.
     if xcrun --sdk iphonesimulator --show-sdk-path >/dev/null 2>&1; then

@@ -255,7 +255,10 @@ Exports are only useful if the output is something C can link. Add output modes 
 driver (today: executable from `coil build`, object from `coil emit-obj`):
 
 - `coil build --lib libfoo.a` — a **static archive** of the object (no `main` required;
-  exports are the public symbols).
+  exports are the public symbols). The host `ar` writes it; a `--target` whose objects
+  are not Mach-O, built on macOS, is archived with the `llvm-ar` beside the compiler's
+  LLVM, since Apple's `ar` leaves such a member out. An archive missing any object is
+  a failed build.
 - `coil build --shared libfoo.{dylib,so}` — a **shared library** (drives `cc -shared`;
   exported symbols are the dynamic surface; the rest stay internal/hidden, which also
   helps load time).
