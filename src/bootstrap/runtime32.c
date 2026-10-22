@@ -190,6 +190,18 @@ uint32_t env_memcmp(uint32_t a, uint32_t b, uint32_t n) {
     return (uint32_t)(int32_t)(r < 0 ? -1 : (r > 0 ? 1 : 0));
 }
 uint32_t env_strlen(uint32_t p) { return (uint32_t)strlen(hoststr(p)); }
+// The host's description of errno CODE, copied into guest memory once per code
+// (os.coil's errno-message reads it as a C string).
+static uint32_t g_strerror_text[256];
+uint32_t env_strerror(uint32_t code) {
+    if (code < 256 && g_strerror_text[code]) return g_strerror_text[code];
+    const char *text = strerror((int)code);
+    size_t n = strlen(text) + 1;
+    uint32_t p = (uint32_t)rt_malloc(n);
+    memcpy(MEM + p, text, n);
+    if (code < 256) g_strerror_text[code] = p;
+    return p;
+}
 
 // ---- file / directory I/O ----
 uint32_t env_open(uint32_t path, uint32_t flags, uint32_t va) { return (uint32_t)guest_open(hoststr(path), flags, va); }

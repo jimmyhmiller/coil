@@ -195,6 +195,18 @@ uint32_t env_memcmp(uint64_t a, uint64_t b, uint64_t n) {
     return (uint32_t)(int32_t)(r < 0 ? -1 : (r > 0 ? 1 : 0));
 }
 uint64_t env_strlen(uint64_t p) { return (uint64_t)strlen(hoststr(p)); }
+// The host's description of errno CODE, copied into guest memory once per code
+// (os.coil's errno-message reads it as a C string).
+static uint64_t g_strerror_text[256];
+uint64_t env_strerror(uint32_t code) {
+    if (code < 256 && g_strerror_text[code]) return g_strerror_text[code];
+    const char *text = strerror((int)code);
+    size_t n = strlen(text) + 1;
+    uint64_t p = (uint64_t)rt_malloc(n);
+    memcpy(MEM + p, text, n);
+    if (code < 256) g_strerror_text[code] = p;
+    return p;
+}
 
 // ---- file / directory I/O ----
 // The guest numbers clock ids as Coil's wasm host interface does (Darwin's
