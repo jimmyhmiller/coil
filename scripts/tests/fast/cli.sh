@@ -1774,6 +1774,18 @@ EOF
   else
     bad "coil test in a project runs the tests" "exit $rc: $out"
   fi
+  # Two test files that declare one module: the second's tests were dropped.
+  mkdir -p "$T/dupmod/tests"
+  printf '[package]\nname = "dupmod"\n' > "$T/dupmod/Coil.toml"
+  printf '(module dupmod.shared)\n(deftest first-one (assert-eq 1 1))\n' > "$T/dupmod/tests/first_test.coil"
+  printf '(module dupmod.shared)\n(deftest second-one (assert-eq 2 2))\n' > "$T/dupmod/tests/second_test.coil"
+  out=$(cd "$T/dupmod" && "$COIL" test 2>&1); rc=$?
+  case "$rc:$out" in
+    0:*) bad "coil test refuses two test files that declare one module" "exit 0: $out" ;;
+    *first_test.coil*second_test.coil*"both declare (module dupmod.shared)"*)
+      ok "coil test refuses two test files that declare one module" ;;
+    *) bad "coil test refuses two test files that declare one module" "exit $rc: $out" ;;
+  esac
 
   printf '(module eprint)\n(defn main [] (-> i64) (eprintln "err {}" 1) (println "out {}" 2) 0)\n' > "$T/eprint.coil"
   build "$T/eprint.coil" "$T/eprint" || return
