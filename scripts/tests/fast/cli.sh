@@ -1721,11 +1721,21 @@ EOF
   printf '(module tproj.lib)\n(defn helper [] (-> i64) 7)\n' > "$T/proj/src/lib.coil"
   printf '(module tproj.main)\n(import "tproj.lib" :as lib)\n(defn main [] (-> i64) (println "APP MAIN") (lib/helper))\n' > "$T/proj/src/main.coil"
   printf '(module tproj.lib-test)\n(import "tproj.lib" :as lib)\n(import "tproj.main" :as app)\n(deftest helper-works (assert-eq (lib/helper) 7))\n' > "$T/proj/tests/lib_test.coil"
+  # A test file that is also a program (its own main, which a test calls), and
+  # a test file with no (module …) in a subdirectory: both run in the harness.
+  mkdir -p "$T/proj/tests/sub"
+  printf '(module tproj.mixed-test)\n(defn main [] (-> i64) (println "OWN MAIN") 3)\n(deftest calls-own-main (assert-eq (main) 3))\n' > "$T/proj/tests/mixed_test.coil"
+  printf '(deftest headerless (assert-eq 1 1))\n' > "$T/proj/tests/sub/plain_test.coil"
+  out=$("$COIL" test "$T/proj/tests/mixed_test.coil" 2>&1); rc=$?
+  case "$rc:$out" in
+    0:*"1 passed; 0 failed"*) ok "coil test of a file with its own main runs its tests" ;;
+    *) bad "coil test of a file with its own main runs its tests" "exit $rc: $out" ;;
+  esac
   out=$(cd "$T/proj" && "$COIL" test 2>&1); rc=$?
   if [ "$rc" = 0 ]; then
     case "$out" in
       *"APP MAIN"*) bad "coil test in a project runs the tests, not the app's main" "$out" ;;
-      *"1 passed; 0 failed"*) ok "coil test in a project runs the tests, not the app's main" ;;
+      *"3 passed; 0 failed"*) ok "coil test in a project runs the tests, not the app's main" ;;
       *) bad "coil test in a project runs the tests" "$out" ;;
     esac
   else
