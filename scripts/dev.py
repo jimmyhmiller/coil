@@ -270,8 +270,11 @@ def install(args: argparse.Namespace) -> None:
     toolchain_stamp.stamp_path(destination).write_text(stamp)
     print(f"installed {source} -> {destination}")
     if not args.no_warm_unit:
-        warm_jit_unit(destination, libdir)
+        # Compile-time units first: every later build links them, and before
+        # they exist each one finds the previous compiler's and rebuilds them,
+        # one module at a time.
         build_ct_units(destination, libdir / "ct-units")
+        warm_jit_unit(destination, libdir)
         warm_lint_profile(destination, libdir)
     report_installed(destination)
 
