@@ -463,6 +463,10 @@ EOF
   expect_rc 0 "...and the reader accepts that file" "$COIL" check "$T/chars.coil"
   printf '(defn g [] (-> i64)\n  (+ 1 2)\n' > "$T/open.coil"
   expect_rc_out 0 '^  \(\+ 1 2\)\)$' "balance still closes a missing )" "$COIL" balance "$T/open.coil"
+  # A line that closes a form itself is inside it, however far left it starts:
+  # indentation must not close the [ that this `status 2]` ends.
+  printf '(defn f [] (-> i64)\n  (match x\n    (None [] (let [node 1\n                  status 2]\n      (if (= status 0) 1 2))))\n' > "$T/letvec.coil"
+  expect_rc_out 0 '^                  status 2\]\)$' "balance leaves a line's own ] to the [ it closes" "$COIL" balance "$T/letvec.coil"
 
   printf '(defn c [] (-> i64) 1)\n' | "$COIL" fmt - >&- 2>/dev/null
   [ $? = 1 ] && ok "fmt - exits 1 when its output cannot be written" \
