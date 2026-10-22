@@ -175,6 +175,21 @@ uint64_t env_calloc(uint64_t n, uint64_t sz) {
     return p;
 }
 uint64_t env_memset(uint64_t s, uint64_t c, uint64_t n) { memset(MEM + s, (int)c, (size_t)n); return s; }
+
+// ---- compiler-rt ----
+// The low 128 bits of A * B, written through RET. wasm has no 128-bit multiply,
+// so LLVM calls this for an i128 product and for the overflow test of a 64-bit
+// one, which it recognises in `(/ (* a b) a)` checks.
+void env___multi3(uint64_t ret, uint64_t a_lo, uint64_t a_hi, uint64_t b_lo, uint64_t b_hi) {
+    uint64_t a0 = a_lo & 0xffffffffu, a1 = a_lo >> 32;
+    uint64_t b0 = b_lo & 0xffffffffu, b1 = b_lo >> 32;
+    uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+    uint64_t mid = (p00 >> 32) + (p01 & 0xffffffffu) + (p10 & 0xffffffffu);
+    uint64_t lo = (p00 & 0xffffffffu) | (mid << 32);
+    uint64_t hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32) + a_lo * b_hi + a_hi * b_lo;
+    memcpy(MEM + ret, &lo, 8);
+    memcpy(MEM + ret + 8, &hi, 8);
+}
 uint32_t env_memcmp(uint64_t a, uint64_t b, uint64_t n) {
     int r = memcmp(MEM + a, MEM + b, (size_t)n);
     return (uint32_t)(int32_t)(r < 0 ? -1 : (r > 0 ? 1 : 0));
