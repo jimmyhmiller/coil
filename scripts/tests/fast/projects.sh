@@ -391,5 +391,34 @@ case "$RC:$OUT" in
 esac
 cp "$W/hermetic-main.coil" "$W/hermetic/src/main.coil"
 
+echo "== no stdlib"
+# `stdlib = false` with a platform package supplying its own copies of the
+# binding macros and the modules they need. The macros start the metaprogram
+# engine, whose shim joins this universe: it must import nothing the universe
+# lacks, or every import table of the program was silently emptied.
+NS="$W/nostdlib"
+mkdir -p "$NS/app/src" "$NS/platform/src/coil/binding" "$NS/platform/src/platform"
+cp "$ROOT/src/stdlib/binding.coil" "$ROOT/src/stdlib/cc.coil" "$ROOT/src/stdlib/primitive.coil" "$NS/platform/src/coil/"
+cp "$ROOT/src/stdlib/binding_runtime.coil" "$NS/platform/src/coil/binding/runtime.coil"
+printf '[package]\nname = "platform"\n' > "$NS/platform/Coil.toml"
+cat > "$NS/platform/src/platform/prelude.coil" <<'EOF'
+(module platform.prelude)
+(import "coil.primitive" :as primitive)
+(import "coil.binding" :use [let fn defn] :reexport)
+(defsum Keyword (KeywordValue [(name (slice u8))]))
+(defsum InlinePolicy (Always) (Hint) (Never))
+(def store! primitive/store!)
+EOF
+printf '[package]\nname = "app"\n\n[language]\nstdlib = false\nprelude = "platform.prelude"\n\n[dependencies]\nplatform = { path = "../platform" }\n' > "$NS/app/Coil.toml"
+cat > "$NS/app/src/main.coil" <<'EOF'
+(module main)
+(import "coil.cc" :as cc)
+(extern abort :cc (cc/C) [] (-> never))
+(defn main [] (-> i32) (let [x (: 7 i32)] x))
+EOF
+run "$NS/app" "$COIL" build -o "$W/nostdlib-app"
+if [ "$RC" = 0 ]; then "$W/nostdlib-app"; RC=$?; OUT="ran"; fi
+expect 7 "" "a stdlib = false prelude with its own coil.binding builds a program that names (cc/C)"
+
 [ "$FAIL" = 0 ] && echo "projects: PASS" || echo "projects: FAIL"
 exit "$FAIL"
