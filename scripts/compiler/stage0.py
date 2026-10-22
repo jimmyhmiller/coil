@@ -72,8 +72,24 @@ def run(compiler: Path, arguments: list[str]) -> int:
                               env=environment).returncode
 
 
+# Flags whose value is a path. The compiler runs in the temporary directory, so a
+# relative path the caller wrote is made absolute against the caller's cwd.
+PATH_FLAGS = {"-o", "--emit-header", "--reader-artifact", "--root",
+              "--test-roots-file", "--fuzz-dir"}
+
+
+def absolute_paths(flags: list[str]) -> list[str]:
+    out: list[str] = []
+    for index, flag in enumerate(flags):
+        if index > 0 and flags[index - 1] in PATH_FLAGS:
+            flag = str(Path(flag).absolute())
+        out.append(flag)
+    return out
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 4:
         raise SystemExit("usage: stage0.py COMPILER COMMAND SOURCE [FLAGS...]")
     command, source, *flags = sys.argv[2:]
-    raise SystemExit(run(Path(sys.argv[1]), [command, str(Path(source).resolve()), *flags]))
+    raise SystemExit(run(Path(sys.argv[1]),
+                         [command, str(Path(source).resolve()), *absolute_paths(flags)]))
