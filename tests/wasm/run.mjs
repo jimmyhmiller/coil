@@ -72,6 +72,23 @@ const env = {
 if (instance.exports.__heap_base) heapTop = Number(instance.exports.__heap_base.value);
 
 let failed = 0;
+const select = instance.exports.externref_select;
+const left = {side: "left"}, right = {side: "right"};
+if (typeof select !== "function") {
+  console.error("FAIL externref_select: export missing");
+  failed++;
+} else {
+  for (const [condition, a, b, expected] of [
+    [1, left, right, left], [0, left, right, right],
+    [1, null, right, null], [0, left, undefined, undefined],
+  ]) {
+    if (select(condition, a, b) !== expected) {
+      console.error("FAIL externref_select: reference identity changed");
+      failed++;
+    }
+  }
+}
+
 for (const check of checks) {
   const [name, expected] = check.split("=");
   const actual = instance.exports[name]?.(...(name === "use_stack" ? [5n] : []));

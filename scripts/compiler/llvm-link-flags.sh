@@ -58,16 +58,17 @@ case "$MODE" in
   dynamic)
     # Coil's interpreter uses libm directly (`floor`, `fmod`, ...). macOS folds
     # those symbols into libSystem, while ELF linkers require an explicit -lm.
-    emit "-L$LIBDIR" -lLLVM -lm
+    # Source-built Darwin LLVM uses an @rpath install name too. Keep the chosen
+    # library discoverable on both platforms, including outside Homebrew.
+    emit "-L$LIBDIR" -lLLVM -lm "-Wl,-rpath,$LIBDIR"
     if [ "$(uname -s)" != Darwin ]; then
       # Load libLLVM from LIBDIR, the LLVM this compiler was linked against. The
       # compiler finds its matching clang (sanitizer and coil.jit links) beside
       # the library the loader reports for an LLVM symbol. Without an rpath the
       # loader takes the library through its cache instead: on Debian that is
       # /usr/lib/x86_64-linux-gnu/libLLVM.so.21.1, which has no bin/clang
-      # beside it, and every such link fails. A Homebrew dylib's install name
-      # is already its absolute path.
-      emit "-Wl,-rpath,$LIBDIR" -lstdc++ -lpthread -ldl
+      # beside it, and every such link fails.
+      emit -lstdc++ -lpthread -ldl
     fi
     ;;
   static)

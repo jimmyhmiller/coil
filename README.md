@@ -185,3 +185,6 @@ focused section.
 Focused programs in [`src/examples`](src/examples) demonstrate features such as
 sum types, traits, generics, macros, allocators, layouts, closures, C interop,
 WebAssembly, and collections.
+
+For compiler builds, see [LLVM toolchain setup](docs/LLVM_TOOLCHAIN.md), including
+the LLVM 23.1.3 reference-select encoding patch required by WebAssembly programs.
