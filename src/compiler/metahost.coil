@@ -7,18 +7,19 @@
 ; and dispatched to comptime.coil's own `code-op` with the same CtCtx the
 ; interpreter would have used — including its runtime errors, verbatim.
 ;
-; A failing op (the interpreter's Err) records the Diag in MetaHostBox and
-; terminates the METAPROGRAM THREAD via pthread_exit — never the pipeline thread.
-; The engine (metaengine in expander.coil) always runs a compiled metaprogram on
-; its own thread, joins it, and turns a recorded Diag into the ordinary
-; expand-macro Err, so `(primitive/error ...)`/bad-op behavior is byte-identical to the
-; interpreter's from the pipeline's point of view.
+; A failing op (the interpreter's Err) records the Diag in MetaHostBox and leaves
+; the metaprogram through the guard its call was made under (meta-host-call-guarded).
+; The engine (metaengine) turns a recorded Diag into the ordinary expand-macro Err,
+; so `(primitive/error ...)`/bad-op behavior is byte-identical to the interpreter's
+; from the pipeline's point of view.
 (module coil.compiler.metahost)
 (import "coil.primitive" :as primitive)
 (import "coil.compiler.unit_state" :use *)
 
 (defstruct MetaHostUnitState
-  [(host MetaHostBox) (abort MetaAbortHook) (arguments ArgPool)])
+  [(host MetaHostBox) (arguments ArgPool)
+   ; the innermost guarded metaprogram call (meta-host-call-guarded)
+   (guard (ptr MetaGuard))])
 
 (defn metahost-unit-state-cell [] (-> (ptr (ptr MetaHostUnitState)))
   (primitive/alloc-static (ptr MetaHostUnitState)))
@@ -53,12 +54,11 @@
 (import "coil.compiler.ffi" :use *)
 (import "coil.cc" :as cc)
 
-(extern pthread_exit :cc (cc/C) [(ptr i8)] (-> void))
 
 ; ---- per-call context ---------------------------------------------------------
 ; Set by the engine immediately before invoking a compiled metaprogram entry, read
-; by every callback below (the callbacks run on the metaprogram thread while the
-; engine blocks in pthread_join, so the stack-allocated CtCtx stays alive).
+; by every callback below (the callbacks run inside that call, so the
+; stack-allocated CtCtx stays alive).
 (defstruct MetaHostBox
   [(cx (ptr CtCtx))
    (registry (ptr (ArrayList (ptr Sexp))))
@@ -114,36 +114,83 @@
         (None [Diag])
         (Some (.err b)))))
 
-; A persistent metaprogram worker normally signals completion after an entry
-; returns. `(primitive/error ...)` exits that pthread from inside this module, so
-; it cannot reach the normal signal. The engine installs this tiny wakeup hook for
-; the duration of a worker call; null means the historical one-shot path.
-(defstruct MetaAbortHook [(fp (ptr i8)) (ctx (ptr i8))])
-
-(defn meta-abort-hook [] (-> (ptr MetaAbortHook))
-  (field (metahost-unit-state) abort))
-
-(defn meta-host-abort-hook! [(fp (ptr i8)) (ctx (ptr i8))] (-> i64)
-  (let [h (meta-abort-hook)]
-    (set! (.fp h) fp)
-    (set! (.ctx h) ctx)
-    0))
-
-(defn meta-host-signal-abort [] (-> i64)
-  (let [h (meta-abort-hook)
-        fp (load (field h fp))]
-    (when (!= (primitive/cast i64 fp) 0)
-      (primitive/call-ptr (primitive/cast (fnptr (cc/C) [(ptr i8)] i64) fp)
-                          (load (field h ctx)))
-      0)
-    0))
-
 ; A compiler bug in the boundary itself (unset context, impossible shapes) must be
 ; LOUD and immediate — never a metaprogram-level diagnostic.
 (defn mh-bug [(msg (slice u8))] (-> i64)
   (fmt (stderr) "metahost: {} (compiler bug)\n" msg)
   (abort)
   0)
+
+;;; ---- running a metaprogram on the calling thread ------------------------------
+;;; A metaprogram runs on the thread that expands, with the compiler's deep stack
+;;; (the driver runs every compilation on one). A failure (`mh-halt`) leaves it
+;;; through the guard its call was made under: `me-guarded` keeps the registers
+;;; the C convention preserves, the stack pointer and the return address in a
+;;; MetaGuard and calls FN with ARG; `me-escape` puts them back and returns 1 from
+;;; that call, as if FN had returned. Nothing the metaprogram's frames hold needs
+;;; releasing: its storage is the compilation's. Every call used to go to a worker
+;;; thread and back, and waking a thread blocked on a condition variable took
+;;; longer than most macros ran: 7% of checking src/compiler.
+(defstruct MetaGuard [(saved (array i64 21)) (prev (ptr MetaGuard)) (depth i64)])
+
+(defn define-meta-guarded [(name Code)] (-> Code)
+  (match (target-arch)
+    (Aarch64 []
+      `(defn ~name :cc (cc/C) [(f (ptr i8)) (arg (ptr i8)) (guard (ptr MetaGuard))] (-> i64)
+             (primitive/machine-code (Aarch64)
+              0x53 0x50 0x00 0xa9 0x55 0x58 0x01 0xa9 0x57 0x60 0x02 0xa9 0x59 0x68 0x03 0xa9
+              0x5b 0x70 0x04 0xa9 0x5d 0x78 0x05 0xa9 0xe9 0x03 0x00 0x91 0x49 0x30 0x00 0xf9
+              0x48 0xa4 0x06 0x6d 0x4a 0xac 0x07 0x6d 0x4c 0xb4 0x08 0x6d 0x4e 0xbc 0x09 0x6d
+              0xf3 0x03 0x02 0xaa 0xe9 0x03 0x00 0xaa 0xe0 0x03 0x01 0xaa 0x20 0x01 0x3f 0xd6
+              0x7e 0x2e 0x40 0xf9 0x73 0x02 0x40 0xf9 0x00 0x00 0x80 0xd2)))
+    (X86_64 []
+      `(defn ~name :cc (cc/C) [(f (ptr i8)) (arg (ptr i8)) (guard (ptr MetaGuard))] (-> i64)
+             (primitive/machine-code (X86_64)
+              0x48 0x89 0x1a 0x48 0x89 0x6a 0x08 0x4c 0x89 0x62 0x10 0x4c 0x89 0x6a 0x18 0x4c
+              0x89 0x72 0x20 0x4c 0x89 0x7a 0x28 0x48 0x8d 0x44 0x24 0x08 0x48 0x89 0x42 0x30
+              0x48 0x8b 0x04 0x24 0x48 0x89 0x42 0x38 0x48 0x89 0xd3 0x48 0x89 0xf8 0x48 0x89
+              0xf7 0x48 0x83 0xec 0x08 0xff 0xd0 0x48 0x83 0xc4 0x08 0x48 0x8b 0x1b 0x31 0xc0)))
+    ; a host without them (wasm) runs metaprograms another way
+    (_ `(defn ~name :cc (cc/C) [(f (ptr i8)) (arg (ptr i8)) (guard (ptr MetaGuard))] (-> i64)
+          (mh-bug "no guarded metaprogram calls on this host")))))
+
+(defn define-meta-escape [(name Code)] (-> Code)
+  (match (target-arch)
+    (Aarch64 []
+      `(defn ~name :cc (cc/C) [(guard (ptr MetaGuard))] (-> never)
+             (primitive/machine-code (Aarch64)
+              0x13 0x50 0x40 0xa9 0x15 0x58 0x41 0xa9 0x17 0x60 0x42 0xa9 0x19 0x68 0x43 0xa9
+              0x1b 0x70 0x44 0xa9 0x1d 0x78 0x45 0xa9 0x09 0x30 0x40 0xf9 0x3f 0x01 0x00 0x91
+              0x08 0xa4 0x46 0x6d 0x0a 0xac 0x47 0x6d 0x0c 0xb4 0x48 0x6d 0x0e 0xbc 0x49 0x6d
+              0x20 0x00 0x80 0xd2 0xc0 0x03 0x5f 0xd6)))
+    (X86_64 []
+      `(defn ~name :cc (cc/C) [(guard (ptr MetaGuard))] (-> never)
+             (primitive/machine-code (X86_64)
+              0x48 0x8b 0x1f 0x48 0x8b 0x6f 0x08 0x4c 0x8b 0x67 0x10 0x4c 0x8b 0x6f 0x18 0x4c
+              0x8b 0x77 0x20 0x4c 0x8b 0x7f 0x28 0x48 0x8b 0x67 0x30 0xb8 0x01 0x00 0x00 0x00
+              0xff 0x67 0x38)))
+    (_ `(defn ~name :cc (cc/C) [(guard (ptr MetaGuard))] (-> never)
+          (abort)))))
+
+(define-meta-guarded me-guarded)
+(define-meta-escape me-escape)
+
+(defn meta-guard-top [] (-> (ptr (ptr MetaGuard)))
+  (field (metahost-unit-state) guard))
+
+;;; Run FN (a C function of one pointer) with ARG under a guard: false when it
+;;; returned, true when a metaprogram it ran failed (`meta-host-err` says why).
+(defn meta-host-call-guarded [(f (ptr i8)) (arg (ptr i8))] (-> bool)
+  (let [g (primitive/alloc-stack MetaGuard)
+        top (meta-guard-top)]
+    (set! (.prev g) (load top))
+    ; the argument lists are a stack: a failure leaves the depth it failed at
+    (set! (.depth g) (.depth (arg-pool)))
+    (store! top g)
+    (let [escaped (me-guarded f arg g)]
+      (store! top (.prev g))
+      (set! (.depth (arg-pool)) (.depth g))
+      (!= escaped 0))))
 
 ; A metaprogram-level failure: exactly what the interpreter would have returned as
 ; Err. Record it and end the metaprogram thread; the engine reports it identically.
@@ -166,12 +213,12 @@
               (fmt (stderr) "error: {}\n" (load (field d msg)))
               (exit 1)
               0)
-            (do
+            (let [g (load (meta-guard-top))]
               (set! (.err b) d)
               (set! (.errset b) 1)
-              (meta-host-signal-abort)
-              (pthread_exit (primitive/cast (ptr i8) 1))
-              0)))))
+              (when (= (primitive/cast i64 g) 0)
+                (mh-bug "a metaprogram failed outside a guarded call"))
+              (me-escape g))))))
 
 (defn mh-cx [] (-> (ptr CtCtx))
   (let [b (meta-host-box)
@@ -261,9 +308,8 @@
 ; A metaprogram's argument lists are strictly LIFO. metalower nests the builder
 ; chain — (mp-op-h OP (mp-arg-i (mp-arg-c (mp-arg-new) X) 0)) — so if evaluating X
 ; runs a nested op, that op's list is created AND consumed entirely before the outer
-; list is filled any further. And exactly one metaprogram runs at a time
-; (meta-engine-invoke is a pthread_create immediately followed by pthread_join), so
-; one process-wide stack of reusable lists is enough; no per-thread state needed.
+; list is filled any further. And exactly one metaprogram runs at a time, so one
+; process-wide stack of reusable lists is enough; no per-thread state needed.
 ;
 ; Reusing them matters because no code op takes more than three arguments (nothing in
 ; comptime.coil reads past `cv-get args 2`), so the growable list never actually grew
