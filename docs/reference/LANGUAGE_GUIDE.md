@@ -92,6 +92,10 @@ pattern, so `0xFFFFFFFFFFFFFFFF` fills an `i64` as `-1`. The 128-bit integers,
 backends and `coil interp` refuse a program that computes with them, with an error
 at the first place it does, and so does the interpreted metaprogram engine
 (`COIL_META_INTERP=1`) for a macro or `comptime` that computes with them.
+A string's escapes are `\n \t \r \0 \" \\` and `\xHEX;`, hex digits closed by
+`;` naming a Unicode scalar (written as UTF-8; in a `c"…"` string at most one
+byte). Any other escape is an error.
+
 `(: EXPR TYPE)` states a type where context doesn't supply one:
 
 ```coil
