@@ -56,9 +56,29 @@ authored program the view already did), and stored with it:
 | `meta/imports M` | module | its authored imports |
 | `meta/binders M` | module | its `let` binders: identity, binder form, value |
 | `meta/reference-form REF` | occurrence | the form the reference heads: the call, or the match arm |
+| `meta/forms-headed M HEAD` | module + head | its forms headed by core syntax (`or`, `if`), or by a name that resolves to nothing |
+| `meta/path NODE` / `meta/enclosing NODE` | occurrence | the forms around NODE, outermost first, each with the index toward NODE |
 
 Match patterns are references now, with role `:pattern`, so a variant's
 constructions and its matchers are told apart by role, not by walking `match`.
+
+A rule starts from what it is about and asks about that form. The default lint
+profile is written this way: field-syntax starts from the calls of `store!`,
+`load` and `field`; named-constructor from the constructions of each variant
+with three or more fields; modernize's `or` rule from `forms-headed M or`; the
+stack-cell rule from each `alloc-stack` and the `let` two steps up its path.
+
+Every authored node answers the checked program's questions — `type-of`,
+`resolve-at`, `binding-of` — through the checked node with its span. `type-of`
+answers the type a literal or an operation on literals took from its context,
+so a rule does not carry context types down a walk. `resolve-at` answers for a
+spelling the parser takes as a primitive (`zeroed` is coil.primitive.zeroed),
+from the parser's own spelling index.
+
+A role is what the last parse of an occurrence recorded. A macro call is parsed
+before it expands, and `(let [x (or a b)] x)` then reads as a call with type
+arguments `[x (or a b)]`; the parse of the expansion takes `or` as core syntax
+and clears that `:type`.
 
 From the checked program, built on first use:
 
@@ -68,9 +88,14 @@ From the checked program, built on first use:
 | `meta/definition-form NAME` | the authored form that defines NAME (the `defn`, or the macro call that wrote it) |
 | `meta/field-uses STRUCT` | the fields of STRUCT the program reads, writes or takes the offset of |
 | `meta/cast-structs` | the structs some pointer cast converts to or from |
+| `meta/definitions-of-kind KIND` | every definition of that kind (the program's sums, say), from the table of that kind |
 
 Field uses and casts are recorded by the checker as it checks, the way it already
 records each local read.
+
+The facts are recorded wherever a checker runs: `coil lint`, and a build whose
+program registers a checker (`--use`, `--debug-checks`). A build without one
+records nothing.
 
 ## The boundary
 
