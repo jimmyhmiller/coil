@@ -6,6 +6,13 @@
 #define COIL_OR_OPTION (COIL_BASE_OPTION | 4)
 #define COIL_CAST_OPTION ((int)0x200)
 
+/* A macro binds by its C type: a pointer, a function pointer among them, as a
+   typed def; a floating-point expression not at all, rather than as an integer. */
+typedef void (*coil_handler)(int);
+#define COIL_HANDLER_IGNORE ((coil_handler)1)
+#define COIL_NO_TEXT ((const char *)0)
+#define COIL_HALF (1.0 / 2)
+
 struct coil_fixed_array {
   unsigned char bytes[37];
 };

@@ -1259,6 +1259,9 @@ section_cimport() {
     done <<'EOF'
 (const COIL_OR_OPTION 260)
 (const COIL_CAST_OPTION 512)
+(def COIL_HANDLER_IGNORE (cast (fnptr (coil.cc.C) [i32] void) (cast (ptr i8) 1)))
+(def COIL_NO_TEXT (cast (ptr i8) 0))
+macro COIL_HALF — a double expression, not an integer constant
 (array u8 37)
 (callback (fnptr (coil.cc.C) [(ptr i8)] void))
 (chain (fnptr (coil.cc.C) [i8] (fnptr (coil.cc.C) [f64] i32)))
@@ -1286,6 +1289,17 @@ EOF
       r)))
 EOF
   expect_rc 12 "a program sorts through qsort cimported from stdlib.h" "$COIL" run "$T/sort.coil"
+
+  # SIG_IGN is a function pointer, and a handler `signal` accepts.
+  cat > "$T/ignore.coil" <<'EOF'
+(module system-signal)
+(cimport "signal.h" :use [signal raise SIG_IGN SIGINT])
+(defn main [] (-> i64)
+  (signal SIGINT SIG_IGN)
+  (raise SIGINT)
+  7)
+EOF
+  expect_rc 7 "SIG_IGN from signal.h ignores a signal" "$COIL" run "$T/ignore.coil"
 
   # An anonymous record is named by its typedef; one whose fields cannot be spelled
   # stays opaque at clang's layout.
