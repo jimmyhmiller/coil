@@ -41,7 +41,7 @@ cmake -S "$LLVM_SOURCE/llvm" -B "$LLVM_SOURCE/build" -G Ninja \
   -DCMAKE_INSTALL_PREFIX="$LLVM_PREFIX" \
   -DCMAKE_INSTALL_NAME_DIR="$LLVM_PREFIX/lib"
 cmake --build "$LLVM_SOURCE/build" --target LLVM clang llvm-config compiler-rt --parallel 8
-cmake --build "$LLVM_SOURCE/build" --target install-LLVM install-clang install-llvm-config install-compiler-rt
+cmake --build "$LLVM_SOURCE/build" --target install-LLVM install-clang install-clang-cpp install-clang-resource-headers install-llvm-config install-llvm-headers install-compiler-rt
 LLVM_CONFIG="$LLVM_PREFIX/bin/llvm-config" python3 scripts/dev.py build candidate
 python3 scripts/dev.py test fast --compiler build/bin/coil-candidate
 ```
