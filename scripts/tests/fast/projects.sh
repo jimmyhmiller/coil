@@ -349,6 +349,17 @@ run "$WS" "$COIL" run
 expect 0 "cli 7 area 21 version 2" "run fans out over the members with an entry"
 run "$WS" "$COIL" test
 expect 0 "workspace test: 2/2 members ok" "test runs every member's tests"
+run "$WS" "$COIL" test --suite text
+expect 0 "workspace test: 1/1 members ok" "test --suite runs in the members that declare the suite"
+case "$OUT" in *"members/cli (declares none of the selected test suites)"*) ok "test --suite says which members it skipped" ;;
+  *) bad "test --suite says which members it skipped" "$OUT" ;; esac
+run "$WS" "$COIL" test --suite nope
+expect 2 "unknown test suite 'nope': no member of this workspace declares it" "a suite no member declares is an error"
+cp "$WS/Coil.toml" "$W/Coil.workspace.toml"
+printf '[test.suites.text]\nroots = ["members/util/tests"]\n' >> "$WS/Coil.toml"
+run "$WS" "$COIL" test
+expect 1 "[test.suites.text] is in a workspace manifest" "a workspace manifest's own test suite is an error, not ignored"
+cp "$W/Coil.workspace.toml" "$WS/Coil.toml"
 cp "$WS/Coil.toml" "$W/Coil.workspace.toml"
 printf '[workspace]\nname = "projfix"\nmembers = ["members/cli", "members/notes"]\n' > "$WS/Coil.toml"
 run "$WS" "$COIL" check

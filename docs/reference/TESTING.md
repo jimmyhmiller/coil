@@ -116,7 +116,10 @@ with no test files says so (`no test files found`) rather than reporting a
 pass, and a path selector that matches no file is an error. Runner options
 such as `--filter` and `--cases` work here too and reach every test file. At a
 workspace root, `coil test` runs each member's tests in turn and fails if any
-member fails.
+member fails. `--suite NAME` there runs in the members that declare `NAME` and
+skips the rest; a name no member declares is an error. Suites belong to the
+members: a workspace's own `Coil.toml` cannot declare `[test]` or
+`[test.suites.…]`.
 Tests inherit the project's configuration: dependencies, `[cc]`, `[link]`,
 target and metaprograms. `coil check` typechecks the test files as well as the
 entry.
