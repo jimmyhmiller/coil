@@ -207,11 +207,16 @@ def main() -> None:
             live = payload[10:-1]
             if replacement:
                 # Each republication moves the Var's versioned metadata root
-                # (coil.repl); its bookkeeping alternates by a couple of bytes.
-                # Retaining a historical definition would add hundreds per submission.
+                # (coil.repl). The counts alternate by exactly 40 bytes, one
+                # loader Source record: a submission's source takes the first
+                # free slot while the previous one is still live, so the live
+                # slot leapfrogs and every other revision keeps one retired
+                # (empty) slot below it. Source ids are stable, so the slot cannot
+                # be compacted away. Retaining a historical definition would add
+                # hundreds per submission.
                 assert max(live) - min(live) <= 64, (
                     'identical replacement retained historical metadata', live)
-                # Address-order packing can change alignment gaps by a few bytes.
+                # The same 40-byte slot, in the snapshot's total.
                 assert max(steady) - min(steady) <= 64, ('snapshot padding grew', steady)
                 assert max(body_live) - min(body_live) <= 64, (
                     'identical replacement retained historical body blocks', body_live)
