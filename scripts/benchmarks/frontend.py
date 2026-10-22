@@ -42,7 +42,7 @@ PHASES = [
     "frontend.load", "lint.target-load", "frontend.expand", "lint.target-expand",
     "frontend.expand.stage3-rounds", "frontend.expand.round.run-expand",
     "frontend.transforms-and-check", "lint.target-check", "frontend.check.typecheck",
-    "frontend.monomorphize",
+    "frontend.monomorphize", "lint.source-view",
 ]
 
 def run(compiler, name, scratch):
