@@ -122,16 +122,20 @@ EOF
   # A value whose type has neither Debug nor Display prints from its structure
   # (coil.repl's print transform), also inside `Option`, whose Debug impl needs
   # Debug of its parameter. `comment` prints nothing, and println's value stays
-  # unprinted.
+  # unprinted. A function taking a sum by value is published under the
+  # by-reference fnptr type its implementation has.
   out=$(printf '%s\n' '(defsum S (A [(n i64)]) (B))' \
           '(defstruct P [(x i64) (s S) (p (ptr i64))])' \
           '(P :x 1 :s (A 2) :p (cast (ptr i64) 0))' \
+          '(defn s-value [(s S)] (-> i64) (match s (A [n] n) (B [] 0)))' \
+          '(s-value (A 5))' \
           '(Some [(A 3) (B)])' \
           '(comment (not defined here))' \
           '(println "hi")' ':q' \
           | "$COIL" repl 2>&1); rc=$?
   if [ "$rc" = 0 ] && grep -qx "coil> (P :x 1 :s (A :n 2) :p #<(ptr i64) 0x0>)" <<<"$out" \
      && grep -qx "coil> (Some :val \[(A :n 3) (B)\])" <<<"$out" \
+     && grep -qx "coil> 5" <<<"$out" \
      && grep -q "coil> hi$" <<<"$out" && ! grep -q "error\|(Ok" <<<"$out"; then
     ok "the REPL prints a value whose type has no Debug from its structure"
   else
