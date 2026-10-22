@@ -453,6 +453,17 @@ EOF
 )
   [ "$out" = "rc 0 in 156000 out 155999 same" ] && ok "fmt - reads and writes non-blocking pipes whole" \
     || bad "fmt - reads and writes non-blocking pipes whole" "$out"
+  # balance: a form with a ( at column 0 inside it is clean when the file as a
+  # whole balances; character literals end where the reader ends them; and a
+  # missing ) is still found.
+  printf '(defn f [(x i64)] (-> i64)\n  (+ x\n(let [c 3]\n  c)))\n' > "$T/col0.coil"
+  expect_rc 0 "balance accepts a ( at column 0 inside a form" "$COIL" balance --check "$T/col0.coil"
+  printf '(defn q [] (-> i64) (if (= #\\" #\\() #\\) #\\]))\n(defn r [] (-> i64) (+ \\( #\\\xc3\xa9 \\\xc3\xa9))\n' > "$T/chars.coil"
+  expect_rc 0 "balance lexes \\c and #\\c character literals as the reader does" "$COIL" balance --check "$T/chars.coil"
+  expect_rc 0 "...and the reader accepts that file" "$COIL" check "$T/chars.coil"
+  printf '(defn g [] (-> i64)\n  (+ 1 2)\n' > "$T/open.coil"
+  expect_rc_out 0 '^  \(\+ 1 2\)\)$' "balance still closes a missing )" "$COIL" balance "$T/open.coil"
+
   printf '(defn c [] (-> i64) 1)\n' | "$COIL" fmt - >&- 2>/dev/null
   [ $? = 1 ] && ok "fmt - exits 1 when its output cannot be written" \
     || bad "fmt - exits 1 when its output cannot be written" "wrong exit status"
