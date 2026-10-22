@@ -37,6 +37,7 @@ cmake -S "$LLVM_SOURCE/llvm" -B "$LLVM_SOURCE/build" -G Ninja \
   -DLLVM_BUILD_LLVM_DYLIB=ON -DLLVM_LINK_LLVM_DYLIB=ON \
   -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
   -DLLVM_ENABLE_PROJECTS=clang -DLLVM_ENABLE_RUNTIMES=compiler-rt \
+  -DCLANG_USE_XCSELECT=ON \
   -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON -DCOMPILER_RT_INCLUDE_TESTS=OFF \
   -DCMAKE_INSTALL_PREFIX="$LLVM_PREFIX" \
   -DCMAKE_INSTALL_NAME_DIR="$LLVM_PREFIX/lib"
@@ -45,6 +46,11 @@ cmake --build "$LLVM_SOURCE/build" --target install-LLVM install-clang install-c
 LLVM_CONFIG="$LLVM_PREFIX/bin/llvm-config" python3 scripts/dev.py build candidate
 python3 scripts/dev.py test fast --compiler build/bin/coil-candidate
 ```
+
+On macOS, `CLANG_USE_XCSELECT` lets Clang discover the selected Xcode SDK at
+runtime, including for sanitizer links. This avoids baking a versioned SDK path
+into the toolchain. It requires a macOS SDK providing `xcselect.h` and
+`xcselect_host_sdk_path`.
 
 Assertions stay enabled: the compiler must honor LLVM's API preconditions.
 The existing wasm end-to-end test validates both reference-select branches,
