@@ -82,8 +82,8 @@ case "$rc|$out|$sem_err" in
   *) bad "run: a semantic checker fails the run, located in the loaded file" "exit $rc, stdout [$out], stderr: $sem_err" ;;
 esac
 
-expect_stdout "run: a method's declaration record names its type's module, generic or not" \
-  '((coil.arraylist coil.arraylist.new) (coil.arraylist coil.arraylist.push!) (mt_runcmmethods mt_runcmmethods.peek) (coil.arraylist coil.arraylist.free!) (mt_runcmmethods mt_runcmmethods.value))' \
+expect_stdout "run: a method's declaration record names its type's module, generic or not; a binding list declares nothing" \
+  '((coil.arraylist coil.arraylist.new) (coil.alloc coil.alloc.malloc-allocator) (coil.arraylist coil.arraylist.push!) (mt_runcmmethods mt_runcmmethods.peek) (coil.arraylist coil.arraylist.free!) (mt_runcmmethods mt_runcmmethods.use-pipe) (mt_runcmmethods mt_runcmmethods.value))' \
   "$COIL" run $M/run_code_main_decls.coil $M/run_code_main_methods.coil
 
 expect "run: a target that is neither a file nor a namespace" 1 'no such file' "$COIL" run hello

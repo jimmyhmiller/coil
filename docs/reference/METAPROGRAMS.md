@@ -409,7 +409,9 @@ New API this project added (all shipped):
   identity), unambiguous even when the simple name lives in several modules. This covers
   every resolved reference: **function calls, function-pointer refs (`fnptr-of`), and
   variant constructions** (which resolve to the variant, in its sum's module). A bare symbol falls back to
-  a name-based lookup (which answers `(DeclAmbiguous)` on a cross-module name clash). A type
+  a name-based lookup (which answers `(DeclAmbiguous)` on a cross-module name clash); a list
+  the checker did not resolve does not, so a binding such as `(open bool)` in a field or
+  parameter list answers `(DeclUnresolved)` rather than naming whatever `open` is. A type
   reference such as `wb/Box` resolves to its module too, even when `Box` is defined in
   several. `tests/meta/run_code_main_decls.coil` lists the answers for a module's method
   calls.
