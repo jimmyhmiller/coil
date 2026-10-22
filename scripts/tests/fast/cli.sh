@@ -339,6 +339,10 @@ section_check() {
 (defstruct S :layout (layout/Packed) [(a :bits 3)])|field 'a' is a bitfield, and only a \(layout/Bits\) struct has them
 (defstruct S :layout (layout/Bits) [(a :bits 3) (b u8)])|field 'b' of a \(layout/Bits\) struct must be a bitfield
 (defstruct S :backing u8 [(a u8)])|:backing applies to a \(layout/Bits\) struct
+(defstruct S [(x i64) (s S)])|struct 'layout-case.S' contains itself by value \(layout-case.S -> layout-case.S\)
+(defsum S (A [(x (array S 2))]) (B))|sum 'layout-case.S' contains itself by value
+(defstruct A [(b B)]) (defstruct B [(c (array C 2))]) (defsum C (One [(a A)]) (Two))|contains itself by value \(layout-case.A -> layout-case.B -> layout-case.C -> layout-case.A\)
+(defstruct G [T] [(v T)]) (defstruct H [(g (G H))])|struct 'layout-case.H' contains itself by value
 (defstruct S :layout (layout/Packed) :size 8 [(a u8)])|:size and :align apply to a \(layout/Explicit\) struct
 (defsum Mine (Packed))\n(defstruct S :layout (Packed) [(a u8)])|:layout value has type layout-case.Mine but expected coil.layout.Layout
 (defstruct S :does/not-exist true [(a u8)])|unknown annotation ':does/not-exist'
