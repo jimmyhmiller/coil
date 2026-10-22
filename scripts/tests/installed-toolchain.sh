@@ -224,12 +224,15 @@ repl() {
     *"--> <repl>:1:1"*"1 | (doubled-total 3)"*) ok "repl locates an error in the submitted expression" ;;
     *) bad "repl locates an error in the submitted expression" "$out" ;;
   esac
+  # A type with neither Debug nor Display prints from its structure, and gains no
+  # impl by it: deriving Debug afterwards is not a redefinition.
   out=$(repl_session \
     '(defstruct Point [(x i64) (y i64)])' '(derive Debug Point)' '(Point :x 10 :y 20)' \
-    '(defstruct Hidden [(x i64)])' '(Hidden :x 1)')
+    '(defstruct Hidden [(x i64)])' '(Hidden :x 1)' '(derive Debug Hidden)' '(Hidden :x 2)')
   case "$out" in
-    *"(Point :x 10 :y 20)"*"implements neither Debug nor Display"*) ok "repl prints values with Debug and explains unprintable ones" ;;
-    *) bad "repl prints values with Debug and explains unprintable ones" "$out" ;;
+    *error*) bad "repl prints values with Debug, and others from their structure" "$out" ;;
+    *"(Point :x 10 :y 20)"*"(Hidden :x 1)"*"(Hidden :x 2)"*) ok "repl prints values with Debug, and others from their structure" ;;
+    *) bad "repl prints values with Debug, and others from their structure" "$out" ;;
   esac
 }
 
