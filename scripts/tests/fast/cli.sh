@@ -841,8 +841,10 @@ EOF
   printf '[package]\nname = "ui"\nentry = "ui/main.coil"\nsource-roots = ["."]\n' > "$T/unused-imports/Coil.toml"
   printf '(module ui.h)\n(defn f [] (-> i64) 1)\n(defn g [] (-> i64) 2)\n' > "$T/unused-imports/ui/h.coil"
   printf '(module ui.k)\n(defn kk [] (-> i64) 3)\n' > "$T/unused-imports/ui/k.coil"
-  # a macro reaches its helper only through its expansion; an unused macro is dead
-  printf '%s\n' '(module ui.m)' '(defn twice [(x Code)] (-> Code) `(+ ~x (mhelp)))' \
+  # a macro reaches its helper only through its expansion; an unused macro is dead;
+  # an import only a template names is used (the expansion resolves through it)
+  printf '%s\n' '(module ui.m)' '(import "coil.primitive" :as primitive)' '(import "ui.k" :use [kk])' \
+    '(defn twice [(x Code)] (-> Code) `(primitive/iadd ~x (+ (mhelp) (kk))))' \
     '(defn mhelp [] (-> i64) 1)' '(defn dead-macro [(x Code)] (-> Code) x)' > "$T/unused-imports/ui/m.coil"
   # a dialect is a single import: nothing refers to it, its checker is its use
   printf '%s\n' '(module ui.d)' '(defn d-check [(m Code)] (-> Code) `0)' '(checker d-check)' > "$T/unused-imports/ui/d.coil"
@@ -879,10 +881,12 @@ EOF
     case "$out" in *"ui/main.coil:$line:1"*) defs="$defs $line" ;; esac
   done
   case "$out" in
-    *"nothing reachable from this program's roots refers to this"*"ui/m.coil:4:1"*)
+    *"nothing reachable from this program's roots refers to this"*"ui/m.coil:6:1"*)
       case "$out" in
-        *"ui/m.coil:2:1"*|*"ui/m.coil:3:1"*|*"ui/d.coil:2:1"*)
+        *"ui/m.coil:4:1"*|*"ui/m.coil:5:1"*|*"ui/d.coil:2:1"*)
           bad "unused reports dead definitions and keeps live and test-only ones" "a live macro, its helper or a checker was reported: $out" ;;
+        *"ui/m.coil:2:1"*|*"ui/m.coil:3:"*|*"needs coil.primitive"*)
+          bad "unused reports dead definitions and keeps live and test-only ones" "an import only a template names was reported: $out" ;;
         *) [ "$defs" = " 7 8 9" ] && ok "unused reports dead definitions and keeps live and test-only ones" \
              || bad "unused reports dead definitions and keeps live and test-only ones" "want lines 7 8 9, got$defs: $out" ;;
       esac ;;
