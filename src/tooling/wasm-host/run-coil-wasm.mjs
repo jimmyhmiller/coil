@@ -398,6 +398,14 @@ const env = {
   // allocation
   malloc, realloc, free: (p)=>{ hostFree(p); return 0n; }, memset:(s,c,n)=>{u8().fill(Number(c)&0xff,Number(s),Number(s)+Number(n));return s;},
   posix_memalign:hostPosixMemalign,
+  // compiler-rt: the low 128 bits of A * B through RET (src/bootstrap/runtime.c);
+  // LLVM calls it for an i128 product and a 64-bit multiply's overflow test.
+  __multi3:(ret,alo,ahi,blo,bhi)=>{
+    const M=(1n<<64n)-1n, w=(lo,hi)=>(BigInt.asUintN(64,hi)<<64n)|BigInt.asUintN(64,lo);
+    const p=BigInt.asUintN(128,w(alo,ahi)*w(blo,bhi));
+    dv().setBigUint64(Number(ret),p&M,true);
+    dv().setBigUint64(Number(ret)+8,p>>64n,true);
+  },
   memcmp:(a,b,n)=>{const m=u8();a=Number(a);b=Number(b);n=Number(n);for(let i=0;i<n;i++){const d=m[a+i]-m[b+i];if(d)return Math.sign(d);}return 0;},
   // file io
   open: doOpen, read: doRead, write: doWrite, close:(fd)=>{ if(fd>2){try{fs.closeSync(fd);}catch{}} return 0; },
