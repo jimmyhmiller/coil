@@ -10,6 +10,10 @@
 (import "coil.compiler.digest" :as hash)
 (import "coil.compiler.ffi" :use *)
 (import "coil.compiler.parser" :use [sconcat])
+(import "coil.hashmap" :use *)
+(import "coil.os" :as os)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
 
 (defn artifact-error [(message (slice u8))] (-> Diag)
   (Diag
@@ -147,3 +151,137 @@
                      0))))
            0)
          (Ok [i64 Diag] 0)))
+;; ---- inputs of what a process loads once -------------------------------------
+;; A compile-time unit or shipped unit is loaded into a process once and never
+;; unloaded, so its inputs need checking once per process too; the units a
+;; program loads share most of them (the coil.jit units read every compiler
+;; source). Each file is hashed the first time any of them asks.
+(defstruct LoadOnceDigests [(init bool) (digests (HashMap (slice u8) (slice u8)))])
+
+(defn artifact-file-digest-once [(path (slice u8))] (-> (Result (slice u8) Diag))
+  (let [m (p/alloc-static LoadOnceDigests)
+        a (malloc-allocator)]
+    (unless (.init m)
+      (set! (.digests m) (HashMap::new [(slice u8) (slice u8)] a (keyops)))
+      (set! (.init m) true)
+      0)
+    (match (get (.digests m) path)
+      (Some [d] (Ok [(slice u8) Diag] d))
+      (None []
+        (match (artifact-file-digest a path)
+          (Err [d] (Err [(slice u8) Diag] d))
+          (Ok [d] (do (set! (mut (.digests m)) (sconcat a path "") d)
+                      (Ok [(slice u8) Diag] d))))))))
+
+;; ---- the compiler's identity ---------------------------------------------------
+;; An artifact is current only for the compiler that built it. That compiler is
+;; named by the content hash its linker recorded in its own image -- Mach-O's
+;; LC_UUID, ELF's GNU build-id -- read from memory: hashing the 7 MB binary cost
+;; every process that loads an artifact ~40 ms. A binary linked without one is
+;; hashed.
+(defstruct CompilerIdentity [(known bool) (id (slice u8))])
+
+(defn compiler-identity [(a (dyn Allocator)) (binary (slice u8))] (-> (Result (slice u8) Diag))
+  (let [cell (p/alloc-static CompilerIdentity)]
+    (if (.known cell)
+        (Ok [(slice u8) Diag] (.id cell))
+        (let [linked (image-build-id (malloc-allocator))
+              found (if (> (len linked) 0)
+                        (Ok [(slice u8) Diag] (sconcat (malloc-allocator) "build-id:" linked))
+                        (artifact-file-digest (malloc-allocator) binary))]
+          (match found
+            (Err [d] (Err [(slice u8) Diag] d))
+            (Ok [id] (do (set! (.id cell) id)
+                         (set! (.known cell) true)
+                         (Ok [(slice u8) Diag] id))))))))
+
+(defn hex-bytes [(a (dyn Allocator)) (bytes (ptr u8)) (n i64)] (-> (slice u8))
+  (let [digits "0123456789abcdef"
+        (mut text) (StrBuf::new a)]
+    (for [i 0 n]
+      (let [byte (cast i64 (load (index bytes i)))]
+        (push! (mut text) (get digits (p/ishr byte 4)))
+        (push! (mut text) (get digits (p/iand byte 15))))
+      0)
+    (str (load (mut text)))))
+
+(defn read-u32 [(at (ptr u8))] (-> i64)
+  (cast i64 (load (cast (ptr u32) at))))
+
+(defn read-u64 [(at (ptr u8))] (-> i64)
+  (cast i64 (load (cast (ptr u64) at))))
+
+;; The LC_UUID of the Mach-O image whose 64-bit header is at HEADER.
+(defn macho-uuid [(a (dyn Allocator)) (header (ptr u8))] (-> (slice u8))
+  (if (or (= (cast i64 header) 0) (!= (read-u32 header) 0xfeedfacf))
+      ""
+      (let [ncmds (read-u32 (index header 16))
+            (mut at) 32
+            (mut found) ""]
+        (for [i 0 ncmds]
+          (let [cmd (index header (load at))]
+            (when (and (= (read-u32 cmd) 0x1b) (= (len (load found)) 0))
+              (set! found (hex-bytes a (index cmd 8) 16))
+              0)
+            (set! at (+ (load at) (read-u32 (index cmd 4)))))
+          0)
+        (load found))))
+
+;; The GNU build-id among the notes of the ELF executable whose PHNUM program
+;; headers are at PHDR.
+(defn elf-build-id [(a (dyn Allocator)) (phdr u64) (phnum u64)] (-> (slice u8))
+  (let [headers (cast (ptr u8) phdr)
+        n (cast i64 phnum)
+        (mut bias) 0
+        (mut found) ""]
+    (unless (= (cast i64 phdr) 0)
+      ;; PT_PHDR says where the headers were linked; where they are says how far
+      ;; a position-independent executable moved.
+      (for [i 0 n]
+        (let [h (index headers (* i 56))]
+          (when (= (read-u32 h) 6)
+            (set! bias (- (cast i64 phdr) (read-u64 (index h 16))))
+            0))
+        0)
+      (for [i 0 n]
+        (let [h (index headers (* i 56))]
+          (when (and (= (read-u32 h) 4) (= (len (load found)) 0))
+            (let [start (+ (load bias) (read-u64 (index h 16)))
+                  end (+ start (read-u64 (index h 40)))
+                  (mut at) start]
+              (loop (if (> (+ (load at) 12) end) (break) 0)
+                (let [note (cast (ptr u8) (load at))
+                      namesz (read-u32 note)
+                      descsz (read-u32 (index note 4))
+                      kind (read-u32 (index note 8))
+                      name-at (+ (load at) 12)
+                      desc-at (+ name-at (p/iand (+ namesz 3) -4))]
+                  (when (and (= kind 3)
+                             (and (= namesz 4)
+                                  (= (read-u32 (cast (ptr u8) name-at)) 0x00554e47)))
+                    (set! found (hex-bytes a (cast (ptr u8) desc-at) descsz))
+                    (break))
+                  (set! at (+ desc-at (p/iand (+ descsz 3) -4)))))
+              0))
+          0))
+      0)
+    (load found)))
+
+;; This compiler's own image's build id, as hex; "" when it has none.
+;; hygiene: each branch declares the same names; strip the quote context so the
+;; module resolves the selected declarations by their plain names.
+(defn image-build-id-abi [] (-> Code)
+  (os/os-pick
+    `(do
+       (extern ~(p/syntax->datum `getauxval) :cc (cc/C) [u64] (-> u64))
+       (defn ~(p/syntax->datum `image-build-id) [(a (dyn Allocator))] (-> (slice u8))
+         ;; AT_PHDR, AT_PHNUM
+         (elf-build-id a (getauxval (: 3 u64)) (getauxval (: 5 u64)))))
+    `(do
+       (extern ~(p/syntax->datum `_dyld_get_image_header) :cc (cc/C) [u32] (-> (ptr u8)))
+       (defn ~(p/syntax->datum `image-build-id) [(a (dyn Allocator))] (-> (slice u8))
+         (macho-uuid a (_dyld_get_image_header (: 0 u32)))))
+    `(defn ~(p/syntax->datum `image-build-id) [(a (dyn Allocator))] (-> (slice u8))
+       "")))
+
+(meta (image-build-id-abi))

@@ -39,6 +39,20 @@ compile-time function the program has is a declaration
 (`stage3-all-prebuilt?`), its closure is declarations alone and no image is
 built.
 
+## Opening a unit is not loading its image
+
+Opening a unit reads its metadata and checks it current; that is all its
+declarations need. Its image is loaded the first time code in it is: when one
+of its macros first runs (the engine resolves an entry with no address through
+`me-entry-fp`), or before the compilation builds a metaprogram that links one
+of its functions (`ct-unit-link`). Hello world opens 28 units and loads 13.
+
+What a unit is checked against is cheap to know: the compiler is named by the
+content hash its linker recorded (Mach-O `LC_UUID`, ELF build-id;
+`compiler-identity`), read from memory instead of hashing the 7 MB binary in
+every process, and each input file is hashed once per process however many units
+read it (`artifact-file-digest-once`).
+
 ## What makes one image serve every compilation
 
 A unit is loaded once per process, `RTLD_GLOBAL`, and serves every compilation
@@ -68,11 +82,11 @@ them beside the binary (`<binary>.ct-units`) and never builds them on demand:
 
 | workload | wall | instructions | peak |
 |---|---|---|---|
-| hello | -54% | -48% | -41% |
-| calc | -50% | -44% | -38% |
-| statemachine | -36% | -30% | -33% |
-| compiler check | -41% | -50% | -8% |
-| compiler lint | -10% | -28% | -5% |
+| hello | -66% | -64% | -41% |
+| calc | -65% | -56% | -39% |
+| statemachine | -53% | -39% | -34% |
+| compiler check | -43% | -52% | -8% |
+| compiler lint | -22% | -29% | -5% |
 
 (including the checker/resolver fixes of 33f493de and cefb8a51.)
 
