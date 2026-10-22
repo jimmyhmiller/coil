@@ -107,6 +107,7 @@ OVERRIDES={
  ('coil.compiler.metaengine.MEEntry','interpcx'):('ptr','coil.compiler.interp.Interp'),
 }
 NULL_FIELDS={('coil.compiler.loader.LS','parent'),
+             ('coil.compiler.check.Cx','impl_keys'),
  # A lazy body belongs to the resolve that left it unparsed (resolve.coil).
  ('coil.compiler.ast.Func','lazy'),
  ('coil.compiler.check.Cx','anon_outer_env'),
