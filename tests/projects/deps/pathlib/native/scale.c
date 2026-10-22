@@ -1,1 +1,2 @@
-long pathlib_scale(long x) { return x * 2; }
+#include "scale.h"
+long pathlib_scale(long x) { return x * PATHLIB_FACTOR; }
