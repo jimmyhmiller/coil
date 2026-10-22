@@ -456,8 +456,12 @@ def bootstrap(args: argparse.Namespace) -> None:
 
 
 def benchmark(args: argparse.Namespace) -> None:
-    script = "python3 scripts/dev.py benchmark runtime" if args.kind == "runtime" else "python3 scripts/dev.py benchmark compile-scale"
-    execute(script, *args.names)
+    script = {
+        "runtime": ["bash", "scripts/benchmarks/run.sh"],
+        "compile-scale": ["bash", "scripts/benchmarks/compile_scale.sh"],
+        "frontend": ["python3", "scripts/benchmarks/frontend.py"],
+    }[args.kind]
+    execute(*script, *args.names)
 
 
 def example(args: argparse.Namespace) -> None:
@@ -597,8 +601,8 @@ def parser() -> argparse.ArgumentParser:
     command.set_defaults(func=bootstrap)
 
     command = commands.add_parser("benchmark", help="run benchmarks")
-    command.add_argument("kind", choices=("runtime", "compile-scale"), nargs="?", default="runtime")
-    command.add_argument("names", nargs="*")
+    command.add_argument("kind", choices=("runtime", "compile-scale", "frontend"), nargs="?", default="runtime")
+    command.add_argument("names", nargs=argparse.REMAINDER)
     command.set_defaults(func=benchmark)
 
     command = commands.add_parser("example", help="build an example application")
