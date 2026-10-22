@@ -119,6 +119,18 @@ EOF
     bad "the REPL defines, calls and redefines a function" "exit $rc: $out"
   fi
 
+  # Every top-level definition, multi-line ones included, is compiled into the
+  # session and answered `; ok`, not just the `(def…` heads.
+  out=$(printf '%s\n' '(defstruct Pair [(left i64) (right i64)])' '(impl Pair' '  (new [] (-> Pair)' \
+          '    (Pair :left 4 :right 0)))' '(defalias P Pair)' '(.left (P::new))' ':q' \
+          | "$COIL" repl 2>&1); rc=$?
+  if [ "$rc" = 0 ] && [ "$(grep -c '; ok$' <<<"$out")" = 3 ] && grep -qx "coil> 4" <<<"$out" \
+     && ! grep -q "error" <<<"$out"; then
+    ok "the REPL answers impl and defalias with ; ok"
+  else
+    bad "the REPL answers impl and defalias with ; ok" "exit $rc: $out"
+  fi
+
   # A value whose type has neither Debug nor Display prints from its structure
   # (coil.repl's print transform), also inside `Option`, whose Debug impl needs
   # Debug of its parameter. `comment` prints nothing, and println's value stays
