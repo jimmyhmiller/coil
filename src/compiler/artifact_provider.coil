@@ -22,6 +22,10 @@
 (import "coil.compiler.mono" :use *)
 (import "coil.compiler.metalower" :use *)
 (import "coil.compiler.metaengine" :use *)
+(import "coil.compiler.metahost" :use [meta-vtable])
+(import "coil.cc" :as cc)
+(import "coil.hashmap" :use *)
+(import "coil.compiler.trace" :as tr)
 (import "coil.compiler.expander" :use *)
 (import "coil.compiler.ffi" :use *)
 (import "coil.compiler.artifact_identity" :use *)
@@ -30,9 +34,21 @@
 
 ;; Host image compatibility is additionally pinned by the digest of the running
 ;; compiler binary. Native images are executable plugins and must be trusted in
-;; the same way as the source provider used to construct them.
+;; the same way as the source provider used to construct them. The binary does
+;; not change under a running process, and hashing all of it is not free: a
+;; program that loads many compile-time units asks once per unit. Computed once.
+(defstruct ProviderSdk [(known bool) (digest (slice u8))])
+
 (defn provider-sdk [(a (dyn Allocator))] (-> (Result (slice u8) Diag))
-  (artifact-file-digest a (self-command-path a)))
+  (let [cell (p/alloc-static ProviderSdk)]
+    (if (.known cell)
+        (Ok [(slice u8) Diag] (.digest cell))
+        (match (artifact-file-digest (malloc-allocator) (self-command-path a))
+          (Err [d] (Err [(slice u8) Diag] d))
+          (Ok [d]
+              (do (set! (.digest cell) d)
+                  (set! (.known cell) true)
+                  (Ok [(slice u8) Diag] d)))))))
 
 (defn provider-host [] (-> (slice u8))
   (if (me-host-linux?) "native-linux" "native-darwin"))
@@ -99,6 +115,7 @@
                  path
                    (cond (or (= display "<read setup>")
                              (= display "<lint rules>")
+                             (= display "<ct-unit setup>")
                              (= display "<cli-use>")
                              (= display "<metashim>")
                              (starts-with display "<core-provider "))
@@ -731,3 +748,317 @@
                (push! (mut fps) fp))
              0)
            (Ok (LoadedProfile :metadata m :fps (box-al [(ptr i8)] a (load fps))))))))
+
+;; ---- compile-time units ------------------------------------------------------
+;; A library module's compile-time code compiled once (artifact_wire's
+;; CtUnitMetadata): its macros as engine entries, and every function only
+;; compile-time code reaches exported under its own name, which a program
+;; declares instead of compiling. A unit is loaded into a process once, globally,
+;; so a metaprogram any compilation in it builds links its declarations to the
+;; unit's code; its quoted syntax carries no position of the build's (see
+;; ct-unit-sanitize!), so the one image serves every compilation alike.
+
+(defstruct LoadedCtUnit
+  [(metadata (ptr CtUnitMetadata))
+   ;; The native entry of each of `metadata`'s entries, in order.
+   (fps (ptr (ArrayList (ptr i8))))])
+
+(defn ct-unit-key [(a (dyn Allocator)) (m (ptr CtUnitMetadata))] (-> (slice u8))
+  (let [(mut names) (StrBuf::new a)]
+    (for [i 0 (len (load (.entries m)))]
+      (let [entry (elem (.entries m) i)]
+        (push-str! (mut names) "entry ")
+        (push-str! (mut names) (.name entry))
+        (push-str! (mut names) " ")
+        (push-str! (mut names) (.symbol entry))
+        (push-str! (mut names) "\n"))
+      0)
+    (for [i 0 (len (load (.exports m)))]
+      (let [export (elem (.exports m) i)]
+        (push-str! (mut names) "export ")
+        (push-str! (mut names) (.name export))
+        (push-str! (mut names) " ")
+        (push-str! (mut names) (.declaration export))
+        (push-str! (mut names) "\n"))
+      0)
+    (artifact-key a
+                  (sconcat a "coil-ct-unit-v1 " (.module m))
+                  (str (load names))
+                  (.sdk m)
+                  (.host m)
+                  (.target m)
+                  (.options m)
+                  (.inputs m))))
+
+;; Quoted syntax with no position of its own. A position names a source and an
+;; expansion of the build's numbering, which no compilation that loads the unit
+;; shares; without one, a macro's output takes the position of the call that
+;; expanded it (expander.coil, stamp-expansion), as everything else it builds does.
+(defn ct-unit-sanitize! [(s (ptr Sexp))] (-> i64)
+  (set! (.source s) -1)
+  (set! (.lo s) -1)
+  (set! (.hi s) -1)
+  (set! (.ctxt s) 0)
+  (when (or (= (sx-tag (load s)) 6) (= (sx-tag (load s)) 7))
+    (let [xs (sx-items (load s))]
+      (for [i 0 (len (load xs))] (ct-unit-sanitize! (elem xs i)) 0))
+    0)
+  0)
+
+;; LOWERED's program, monomorphized and pruned to what the entries and EXPORTS
+;; reach, with every entry and export public under its own name. An entry is not
+;; published as `coil_mp_<i>` too: that symbol is only another name for the same
+;; function, and the unit's macros are called as functions by other compile-time
+;; code as often as they are expanded, so the name a declaration links is the one
+;; the engine looks up.
+(defn ct-unit-image-program [(a (dyn Allocator))
+                             (lowered (ptr MLOut))
+                             (entries (ptr (ArrayList (slice u8))))
+                             (exports (ptr (ArrayList (slice u8))))] (-> (Result (ptr Program) Diag))
+  (try (let [mp (try! (monomorphize a (.prog lowered)))]
+         (set! (.impls mp) (box-al [ImplDef] a (ArrayList::new [ImplDef] a)))
+         (let [(mut seeds) (ArrayList::new [(slice u8)] a)
+               (mut functions) (ArrayList::new [Func] a)
+               (mut public) (ArrayList::new [(slice u8)] a)]
+           (for [i 0 (len (load entries))] (push! (mut seeds) (get (load entries) i)) 0)
+           (for [i 0 (len (load exports))] (push! (mut seeds) (get (load exports) i)) 0)
+           (push! (mut seeds) "coil.compiler.metashim.mp-init")
+           (let [wanted (closure-funcs mp (mut seeds) a)]
+             (for [i 0 (len (load (.restricted lowered)))]
+               (let [site (elem (.restricted lowered) i)]
+                 (when (set-contains wanted (.name site))
+                   (return-from :try (Err [(ptr Program) Diag] (.diag site)))))
+               0)
+             (for [i 0 (len (load (.funcs mp)))]
+               (let [function (elem (.funcs mp) i)]
+                 (when (set-contains wanted (.name function))
+                   (push! (mut functions) (load function))
+                   (when (set-contains exports (.name function))
+                     (push! (mut public) (.name function))
+                     0)
+                   0))
+               0)
+             (set! (.funcs mp) (box-al [Func] a (load functions)))
+             (for [i 0 (len (load entries))]
+               (let [name (get (load entries) i)]
+                 (unless (set-contains (mut public) name) (push! (mut public) name) 0))
+               0)
+             (let [(mut kept) (ArrayList::new [ExportC] a)]
+               (for [i 0 (len (load (.exports mp)))]
+                 (let [e (elem (.exports mp) i)]
+                   (when (= (.name e) "coil.compiler.metashim.mp-init") (push! (mut kept) (load e)) 0))
+                 0)
+               (set! (.exports mp) (box-al [ExportC] a (load kept))))
+             (set! (.unit_exports mp) (box-al [(slice u8)] a (load public)))
+             (set! (.unit_build mp) true)))
+         (sort-mono-program a mp)
+         (Ok mp))))
+
+;; Compile module MODULE's compile-time code, of SETUP's settled program
+;; CHECKED, into a unit published at DESTINATION: ENTRIES its macros, EXPORTS its
+;; functions with their declarations. The current semantic maps must be CHECKED's.
+(defn ct-unit-build [(a (dyn Allocator))
+                     (setup (ptr LS))
+                     (checked (ptr Program))
+                     (module (slice u8))
+                     (entries (ptr (ArrayList (slice u8))))
+                     (exports (ptr (ArrayList CtUnitExport)))
+                     (options (slice u8))
+                     (destination (slice u8))] (-> (Result (slice u8) Diag))
+  (try (let [prepared (try! (prepare-meta-program a (mut setup) checked))
+             m (box! a CtUnitMetadata (zeroed CtUnitMetadata))
+             (mut prior) (zeroed SemMapsSnap)
+             (mut names) (ArrayList::new [(slice u8)] a)]
+         (for [i 0 (len (load exports))] (push! (mut names) (.name (elem exports i))) 0)
+         (sem-maps-save (mut prior))
+         (sem-maps-restore (.maps prepared))
+         (let [lowered (metalower-program a (.program prepared) entries)]
+           (sem-maps-restore (mut prior))
+           (let [mo (try! lowered)
+                 (mut named) (ArrayList::new [ProfileEntry] a)
+                 (mut sources) (ArrayList::new [(slice u8)] a)]
+             ; each entry is published under its own name (ct-unit-image-program)
+             (for [i 0 (len (load entries))]
+               (let [name (get (load entries) i)]
+                 (push! (mut named) (ProfileEntry :name name :symbol name :phase 1)))
+               0)
+             (for [i 0 (len (.sources setup))]
+               (push! (mut sources) (.name (elem (field setup sources) i)))
+               0)
+             (for [i 0 (len (load (.registry mo)))]
+               (ct-unit-sanitize! (get (load (.registry mo)) i))
+               0)
+             (set! (.module m) module)
+             (set! (.sdk m) (try! (provider-sdk a)))
+             (set! (.host m) (provider-host))
+             (set! (.target m) (provider-target a))
+             (set! (.options m) options)
+             (set! (.inputs m) (try! (provider-inputs a setup)))
+             (set! (.entries m) (box-al [ProfileEntry] a (load named)))
+             (set! (.exports m) exports)
+             (set! (.sources m) (box-al [(slice u8)] a (load sources)))
+             (set! (.expansions m) (box-al [Expansion] a (ArrayList::new [Expansion] a)))
+             (set! (.registry m) (.registry mo))
+             (set! (.key m) (ct-unit-key a m))
+             (sem-maps-restore (.maps prepared))
+             (let [result
+                     (match (ct-unit-image-program a mo entries (box-al [(slice u8)] a (load names)))
+                       (Err [d] (Err [(slice u8) Diag] d))
+                       (Ok [mp]
+                           (let [directory
+                                   (match (temp/sibling destination)
+                                     (Ok [p] p)
+                                     (Err [e] (return-from :try (Err [(slice u8) Diag] (artifact-error (text e))))))]
+                             (when (!= (fs/make-dir (to-cstr a directory) 448) (: 0 i32))
+                               (return-from :try
+                                              (Err [(slice u8) Diag]
+                                                   (artifact-error "cannot create the compile-time unit's staging directory"))))
+                             (let [published (ct-unit-publish-stage a m mp directory destination)]
+                               (temp/remove! directory)
+                               published))))]
+               (sem-maps-restore (mut prior))
+               result))))))
+
+(defn ct-unit-publish-stage [(a (dyn Allocator))
+                             (m (ptr CtUnitMetadata))
+                             (mp (ptr Program))
+                             (directory (slice u8))
+                             (destination (slice u8))] (-> (Result (slice u8) Diag))
+  (try (do
+         (set! (.image_digest m) (try! (provider-emit-image a mp directory)))
+         (try! (artifact-validate-inputs a (.inputs m)))
+         (let [bytes (try! (wire-put-ct-unit a m))]
+           (match (fs/write-file a (sconcat a directory "/metadata") bytes)
+             (Err [_]
+                  (return-from :try
+                                 (Err [(slice u8) Diag]
+                                      (artifact-error "cannot write compile-time unit metadata"))))
+             (Ok [_] 0)))
+         (when (= (access (to-cstr a destination) 0) (: 0 i32))
+           (match (temp/sibling destination)
+             (Err [e] (return-from :try (Err [(slice u8) Diag] (artifact-error (text e)))))
+             (Ok [aside]
+                 (when (= (rename (to-cstr a destination) (to-cstr a aside)) (: 0 i32))
+                   (temp/remove! aside)
+                   0)))
+           0)
+         (if (= (rename (to-cstr a directory) (to-cstr a destination)) (: 0 i32))
+             (Ok [(slice u8) Diag] destination)
+             (Err [(slice u8) Diag] (artifact-error "cannot publish the compile-time unit"))))))
+
+;; The units this process has loaded, by directory. A unit is loaded once and
+;; never unloaded: its code serves every compilation the process runs.
+(defstruct CtUnitTable
+  [(init bool)
+   (dirs (ArrayList (slice u8)))
+   (units (ArrayList (ptr LoadedCtUnit)))
+   ;; Input digests this process has computed, by path: a program loads many
+   ;; units, and their inputs overlap.
+   (digests (HashMap (slice u8) (slice u8)))])
+
+(defn ct-unit-table [] (-> (ptr CtUnitTable))
+  (let [t (p/alloc-static CtUnitTable)]
+    (unless (.init t)
+      (set! (.dirs t) (ArrayList::new [(slice u8)] (malloc-allocator)))
+      (set! (.units t) (ArrayList::new [(ptr LoadedCtUnit)] (malloc-allocator)))
+      (set! (.digests t) (HashMap::new [(slice u8) (slice u8)] (malloc-allocator) (keyops)))
+      (set! (.init t) true)
+      0)
+    t))
+
+(defn ct-unit-validate-inputs [(inputs (ptr (ArrayList ArtifactInput)))] (-> (Result i64 Diag))
+  (let [t (ct-unit-table)
+        a (malloc-allocator)]
+    (block :validate
+      (for [i 0 (len (load inputs))]
+        (let [item (elem inputs i)
+              actual
+                (match (get (.digests t) (.path item))
+                  (Some [d] d)
+                  (None []
+                    (match (artifact-file-digest a (.path item))
+                      (Err [d] (break :validate (Err [i64 Diag] d)))
+                      (Ok [d] (do (set! (mut (.digests t)) (.path item) d) d)))))]
+          (unless (= actual (.digest item))
+            (break :validate
+                   (Err [i64 Diag]
+                        (artifact-error (sconcat a "stale compile-time unit; changed input: " (.path item))))))
+          0))
+      (Ok [i64 Diag] 0))))
+
+;; The unit at DIRECTORY, loaded into this process the first time it is asked
+;; for, when it is this compiler's for OPTIONS and every input is unchanged.
+(defn ct-unit-open [(directory (slice u8)) (options (slice u8))] (-> (Result (ptr LoadedCtUnit) Diag))
+  (let [t (ct-unit-table)]
+    (match (block :known
+             (for [i 0 (len (.dirs t))]
+               (when (= (get (.dirs t) i) directory) (break :known (Some (get (.units t) i)))))
+             (None [(ptr LoadedCtUnit)]))
+      (Some [u] (Ok [(ptr LoadedCtUnit) Diag] u))
+      (None []
+        (match (ct-unit-load directory options)
+          (Err [d] (Err [(ptr LoadedCtUnit) Diag] d))
+          (Ok [u]
+              (do
+                (push! (mut (.dirs t)) (sconcat (malloc-allocator) directory ""))
+                (push! (mut (.units t)) u)
+                (Ok [(ptr LoadedCtUnit) Diag] u))))))))
+
+(defn ct-unit-load [(directory (slice u8)) (options (slice u8))] (-> (Result (ptr LoadedCtUnit) Diag))
+  (let [a (malloc-allocator)]
+    (try (let [bytes (try! (provider-read-bytes a (sconcat a directory "/metadata")))
+               m (try! (wire-ct-unit a bytes))
+               image (sconcat3 a directory "/image" (me-dylib-ext))]
+           (unless (and (= (.host m) (provider-host))
+                        (and (= (.target m) (provider-target a))
+                             (= (.options m) options)))
+             (return-from :try
+                            (Err [(ptr LoadedCtUnit) Diag]
+                                 (artifact-error "stale compile-time unit: host, target or configuration differs"))))
+           (unless (= (.sdk m) (try! (provider-sdk a)))
+             (return-from :try
+                            (Err [(ptr LoadedCtUnit) Diag]
+                                 (artifact-error "stale compile-time unit: another compiler built it"))))
+           (unless (= (.key m) (ct-unit-key a m))
+             (return-from :try
+                            (Err [(ptr LoadedCtUnit) Diag]
+                                 (artifact-error "compile-time unit identity does not match its metadata"))))
+           (let [span (tr/span-begin "ct-units.validate")
+                 checked (ct-unit-validate-inputs (.inputs m))]
+             (tr/span-end span)
+             (try! checked))
+           (unless (= (.image_digest m) (let [span (tr/span-begin "ct-units.image-digest")
+                                                d (artifact-file-digest a image)]
+                                            (tr/span-end span)
+                                            (try! d)))
+             (return-from :try
+                            (Err [(ptr LoadedCtUnit) Diag]
+                                 (artifact-error "compile-time unit native image digest mismatch"))))
+           (try! (provider-registry-adopt! (.registry m) 0 0))
+           ;; RTLD_NOW | RTLD_GLOBAL: a metaprogram built later links its
+           ;; declarations to the exported functions by name
+           (let [span (tr/span-begin "ct-units.dlopen")
+                 handle (dlopen (to-cstr a image) (if (me-host-linux?) 258 10))
+                 _span (tr/span-end span)]
+             (when (= (cast i64 handle) 0)
+               (return-from :try
+                              (Err [(ptr LoadedCtUnit) Diag]
+                                   (artifact-error "cannot load the compile-time unit's image"))))
+             (let [init (dlsym handle (to-cstr a "coil_mp_init"))]
+               (when (= (cast i64 init) 0)
+                 (return-from :try
+                                (Err [(ptr LoadedCtUnit) Diag]
+                                     (artifact-error "compile-time unit image has no coil_mp_init"))))
+               (call-ptr (cast (fnptr (cc/C) [(ptr i8) (ptr i8)] i64) init)
+                         (meta-vtable)
+                         (cast (ptr i8) (.registry m))))
+             (let [(mut fps) (ArrayList::new [(ptr i8)] a)]
+               (for [i 0 (len (load (.entries m)))]
+                 (let [fp (dlsym handle (to-cstr a (.symbol (elem (.entries m) i))))]
+                   (when (= (cast i64 fp) 0)
+                     (return-from :try
+                                    (Err [(ptr LoadedCtUnit) Diag]
+                                         (artifact-error "compile-time unit entry symbol missing"))))
+                   (push! (mut fps) fp))
+                 0)
+               (Ok (box! a LoadedCtUnit (LoadedCtUnit :metadata m :fps (box-al [(ptr i8)] a (load fps)))))))))))

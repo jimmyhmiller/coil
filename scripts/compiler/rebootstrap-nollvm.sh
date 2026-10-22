@@ -86,3 +86,10 @@ DEST="${1:-build/bin/coil-nollvm}"
 mkdir -p "$(dirname "$DEST")"
 cp "$S2" "$DEST"
 echo "=== VERIFIED LLVM-free compiler installed -> $DEST ==="
+# The units its library's compile-time code is linked from (driver.coil,
+# ct-unit-root): programs and the gates compile against them, as an installed
+# toolchain does. A seed refresh, whose binary compiles no programs, skips them.
+if [ "${COIL_SKIP_UNITS:-0}" != 1 ]; then
+  python3 scripts/dev.py ct-units --compiler "$DEST" \
+    || { echo "building compile-time units FAILED"; exit 1; }
+fi

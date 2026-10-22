@@ -126,6 +126,13 @@ mkdir -p "$(dirname "$DEST")"
 cp "$S2" "$DEST"
 printf '%s\n' "$TOOLCHAIN_STAMP" > "$DEST.toolchain"
 echo "=== VERIFIED self-host compiler installed -> $DEST ==="
+# The units its library's compile-time code is linked from (driver.coil,
+# ct-unit-root): programs and the gates compile against them, as an installed
+# toolchain does. A seed refresh, whose binary compiles no programs, skips them.
+if [ "${COIL_SKIP_UNITS:-0}" != 1 ]; then
+  python3 scripts/dev.py ct-units --compiler "$DEST" \
+    || { echo "building compile-time units FAILED"; exit 1; }
+fi
 if [ "${COIL_SKIP_INSTALL:-0}" = 1 ]; then
   echo "=== user-level install skipped (COIL_SKIP_INSTALL=1) ==="
 else
