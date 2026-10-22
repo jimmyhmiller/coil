@@ -28,9 +28,11 @@
    example whose test imports coil.jit (the whole compiler, without a prebuilt
    unit) peaked at 5.8 GB, 1.4 GB of it these two. A package whose meta output
    an after-expand transform of its own rewrites is checked under COIL_TRACE:
-   meta elaboration runs no stage 3 rounds and its final parse costs at most an
-   eighth of its first; then its test must pass, which needs the transform to
-   have seen the meta output.
+   meta elaboration runs no stage 3 rounds, and its final resolve parses in full
+   only what its first left unparsed (the generators' resolve parses a function
+   down to its signature unless their code reaches it) plus at most an eighth
+   more for the meta output; then its test must pass, which needs the transform
+   to have seen the meta output.
 
 Usage: project-scan-memory.py [COMPILER] [--full]
   COMPILER defaults to $COIL. The default sizes the index check at about 2,000
@@ -166,7 +168,8 @@ def meta_output(compiler: str, work: Path) -> None:
     if result.returncode != 0:
         raise SystemExit(f"FAIL check of the meta package: exit {result.returncode}\n"
                          f"{result.stdout}{result.stderr[-4000:]}")
-    inside, rounds, parses, last_parse = False, 0, [], False
+    # (forms parsed in full, forms parsed down to their signatures) per resolve
+    inside, rounds, parses = False, 0, []
     for line in result.stderr.splitlines():
         if line == "coil-trace begin frontend.check.meta-elaboration":
             inside = True
@@ -174,18 +177,19 @@ def meta_output(compiler: str, work: Path) -> None:
             inside = False
         elif inside and line == "coil-trace begin frontend.expand.stage3-rounds":
             rounds += 1
-        elif inside and line.startswith("coil-trace end frontend.resolve.parse "):
-            last_parse = True
-        elif inside and last_parse and line.startswith("coil-trace count semantic.form-parse-bytes "):
-            parses.append(int(line.split()[-1]))
-            last_parse = False
+        elif inside and line.startswith("coil-trace count semantic.form-full-parses "):
+            parses.append([int(line.split()[-1]), 0])
+        elif inside and parses and line.startswith("coil-trace count semantic.form-lazy-parses "):
+            parses[-1][1] = int(line.split()[-1])
     if len(parses) < 2:
-        raise SystemExit(f"FAIL expected meta elaboration to parse at least twice, saw {parses}:\n"
+        raise SystemExit(f"FAIL expected meta elaboration to resolve at least twice, saw {parses}:\n"
                          f"{result.stderr[-4000:]}")
-    print(f"meta elaboration: {rounds} stage 3 rounds; first parse {parses[0]} B, final {parses[-1]} B")
+    (first, left), (final, _) = parses[0], parses[-1]
+    print(f"meta elaboration: {rounds} stage 3 rounds; first resolve parsed {first} forms and left"
+          f" {left} unparsed, final parsed {final}")
     if rounds:
         raise SystemExit("FAIL meta output went through a second expansion of the whole program")
-    if parses[-1] * 8 > parses[0]:
+    if final > left + first // 8:
         raise SystemExit("FAIL the check after meta elaboration re-parsed the program")
     test = subprocess.run([compiler, "test"], cwd=package, text=True, capture_output=True)
     if test.returncode != 0 or "1 passed" not in test.stdout:
