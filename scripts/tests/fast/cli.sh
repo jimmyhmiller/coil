@@ -423,6 +423,40 @@ section_fmt() {
   printf '(defn c [] (-> i64) 1)\n' | "$COIL" fmt --write - >/dev/null 2>&1
   [ $? = 2 ] && ok "fmt --write - is a usage error" || bad "fmt --write - is a usage error" "wrong exit status"
 
+  # Ruby's Open3 hands a child O_NONBLOCK pipe ends. A parent slow to feed the
+  # input and slow to drain the output must still get all of it: EAGAIN is not
+  # end of input, and a refused write is retried. A write that fails is an exit 1.
+  out=$(python3 - "$COIL" <<'EOF' 2>&1
+import fcntl, os, subprocess, sys, time
+coil = sys.argv[1]
+src = b"(defn f [] (-> i64)\n  1)\n\n" * 6000
+in_r, in_w = os.pipe(); out_r, out_w = os.pipe()
+for fd in (in_r, out_w):
+    fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+p = subprocess.Popen([coil, "fmt", "-"], stdin=in_r, stdout=out_w)
+os.close(in_r); os.close(out_w)
+time.sleep(0.1)
+view = memoryview(src)
+while view:
+    n = os.write(in_w, view[:16384]); view = view[n:]
+    time.sleep(0.005)
+os.close(in_w)
+time.sleep(0.2)
+out = b""
+while True:
+    chunk = os.read(out_r, 65536)
+    if not chunk: break
+    out += chunk
+rc = p.wait()
+print("rc", rc, "in", len(src), "out", len(out), "same" if out == src[:-1] else "differs")
+EOF
+)
+  [ "$out" = "rc 0 in 156000 out 155999 same" ] && ok "fmt - reads and writes non-blocking pipes whole" \
+    || bad "fmt - reads and writes non-blocking pipes whole" "$out"
+  printf '(defn c [] (-> i64) 1)\n' | "$COIL" fmt - >&- 2>/dev/null
+  [ $? = 1 ] && ok "fmt - exits 1 when its output cannot be written" \
+    || bad "fmt - exits 1 when its output cannot be written" "wrong exit status"
+
   out=$(printf '(defn width [] (-> bool) (or (= 1 1) (= 2 2) (= 3 3) (= 4 4) (= 5 5)))\n' | "$COIL" fmt --width 40 - 2>&1)
   case "$out" in *$'\n      (= 2 2)\n'*) ok "fmt --width sets the line width" ;; *) bad "fmt --width sets the line width" "$out" ;; esac
   expect_rc 2 "fmt --width 0 is rejected" "$COIL" fmt --width 0 "$T/seven.coil"

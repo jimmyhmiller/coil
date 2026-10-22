@@ -48,6 +48,8 @@
         read-line
         OwnedBytes
         read-line-alloc
+        read-to-end
+        fd-retry?
         stdin
         BufferedReader
         BufferedInput
@@ -167,15 +169,54 @@
         (Ok [_] (write-byte w (primitive/cast u8 (- 48 (primitive/irem n 10))))))))
 
 ; ---- backends ----
+; An fd Reader or Writer is a blocking stream, whatever the descriptor's own mode:
+; a caller handed a descriptor some other process made non-blocking (Ruby's Open3
+; and Node do this to pipes) still reads to the end and writes everything. Without
+; that, EAGAIN read as end of input and a write error went unseen, and `coil fmt -`
+; under such a parent printed a truncated file and exited 0.
+(defstruct FdWait [(fd i32) (events i16) (revents i16)])
+
+;;; Wait, without a time limit, until `fd` is ready for `events` (poll's POLLIN 1,
+;;; POLLOUT 4); `poll` is found with dlsym through `handle`, the C library's
+;;; RTLD_DEFAULT, as `os/errno-cell` finds its accessor. False if it cannot wait.
+(defn poll-one [(fd i32) (events i16) (handle (ptr i8))] (-> bool)
+  (let [entry (primitive/alloc-stack FdWait)
+        poll (os/dlsym-cached (primitive/alloc-static (ptr i8)) c"poll" handle)]
+    (store! (field entry fd) fd)
+    (store! (field entry events) events)
+    (store! (field entry revents) (: 0 i16))
+    (if (= (primitive/cast i64 poll) 0)
+        false
+        (let [rc (primitive/call-ptr (primitive/cast (fnptr (cc/C) [(ptr FdWait) i64 i32] i32) poll)
+                                     entry
+                                     1
+                                     (: -1 i32))]
+          ; an interrupted wait is retried by the caller's retried call
+          (or (>= rc (: 0 i32)) (= (os/errno) 4))))))
+
+;;; Whether a read or write of `fd` that failed with errno `code` should be made
+;;; again: it was interrupted (EINTR), or the descriptor is non-blocking and not
+;;; ready (EAGAIN), in which case this first waits until it is ready for `events`.
+(defn fd-retry? [(fd i32) (code i64) (events i16)] (-> bool)
+  (cond (= code 4) true
+        (= code (os/os-pick-with-none 11 35 35 35))
+          (os/os-pick-with-none (poll-one fd events (primitive/cast (ptr i8) 0))
+                                (poll-one fd events (primitive/cast (ptr i8) -2))
+                                false
+                                false)
+        :else false))
+
 ;;; fd-backed: the ctx pointer *is* the file descriptor (int<->ptr cast).
 (defn write-fd [(ctx (ptr i8)) (buf (ptr i8)) (len i64)] (-> (Result i64
                                                                         IoError))
-  (let [n
-          (primitive/cast i64
-                            (write (primitive/cast i32 ctx)
-                                   buf
-                                   (primitive/cast isize len)))]
-    (if (< n 0) (Err (Errno (os/errno))) (Ok n))))
+  (let [fd (primitive/cast i32 ctx)]
+    (block :done
+      (loop (let [n (primitive/cast i64 (write fd buf (primitive/cast isize len)))]
+              (if (>= n 0)
+                  (return-from :done (Ok n))
+                  (let [code (os/errno)]
+                    (unless (fd-retry? fd code (: 4 i16))
+                      (return-from :done (Err (Errno code)))))))))))
 
 ;;; null sink: discards everything, always succeeds.
 (defn write-null [(ctx (ptr i8)) (buf (ptr i8)) (len i64)] (-> (Result i64
@@ -527,14 +568,38 @@
                                                      (primitive/iadd (load len)
                                                                      1))))))))))))))
 
+;;; fd-backed, and blocking like `write-fd`.
 (defn read-fd [(ctx (ptr i8)) (buf (ptr i8)) (len i64)] (-> (Result i64
                                                                        IoError))
-  (let [n
-          (primitive/cast i64
-                            (read (primitive/cast i32 ctx)
-                                  buf
-                                  (primitive/cast isize len)))]
-    (if (< n 0) (Err (Errno (os/errno))) (Ok n))))
+  (let [fd (primitive/cast i32 ctx)]
+    (block :done
+      (loop (let [n (primitive/cast i64 (read fd buf (primitive/cast isize len)))]
+              (if (>= n 0)
+                  (return-from :done (Ok n))
+                  (let [code (os/errno)]
+                    (unless (fd-retry? fd code (: 1 i16))
+                      (return-from :done (Err (Errno code)))))))))))
+
+;;; Read `r` to its end into allocator-owned storage (free it with
+;;; `OwnedBytes::free`). Empty input is `(Ok …)` with no bytes, not `Eof`.
+(defn read-to-end [(a (dyn alloc/Allocator)) (r (ptr Reader))] (-> (Result OwnedBytes IoError))
+  (let [(mut data) (primitive/cast (ptr i8) 0)
+        (mut len) 0
+        (mut capacity) 0
+        run 65536]
+    (block :done
+      (loop
+        (unless (grow-line a (mut data) (mut capacity) (+ len run) 9223372036854775807)
+          (return-from :done (Err (OutOfMemory))))
+        (match (read-some r (primitive/index (load data) len) (- capacity len))
+          (Err [e]
+               (do
+                 (when (> capacity 0) (alloc/free [i8] a (slice::new (load data) capacity)))
+                 (return-from :done (Err e))))
+          (Ok [n]
+              (if (<= n 0)
+                  (return-from :done (Ok (make-owned-bytes (load data) len capacity)))
+                  (set! len (+ len n)))))))))
 
 (impl Reader
   ;;; caller-owned, for the same reason as `Writer::from-fd`.
