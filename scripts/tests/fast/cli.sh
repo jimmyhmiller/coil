@@ -1582,6 +1582,34 @@ EOF
   expect_crash 'slice index out of bounds in get' "--debug-checks catches a slice index out of bounds" "$T/dbg-on" slice
   expect_crash 'subslice out of range or lo>hi' "--debug-checks rejects a subslice with lo > hi" "$T/dbg-on" subslice
   expect_crash 'ArrayList index out of bounds in get' "--debug-checks catches an ArrayList index out of bounds" "$T/dbg-on" list
+  # An indirect call into code no loaded image owns -- what a JIT hands out --
+  # passes the call-target check: it is non-null and aligned, and executable.
+  local jit_body=""
+  if [ "$HOST_OS-$HOST_ARCH" = Darwin-arm64 ]; then
+    jit_body='(extern pthread_jit_write_protect_np :cc (cc/C) [i32] (-> void))
+(extern sys_icache_invalidate :cc (cc/C) [(ptr u8) u64] (-> void))
+(defn make-code [] (-> (ptr u8))
+  (let [code (mmap (cast (ptr u8) 0) 16384 7 6146 -1 0)
+        words (cast (ptr u32) code)]
+    (pthread_jit_write_protect_np 0)
+    (store! words (cast u32 1384121664))
+    (store! (index words 1) (cast u32 3596551104))
+    (pthread_jit_write_protect_np 1)
+    (sys_icache_invalidate code 8)
+    code))'
+  elif [ "$HOST_OS-$HOST_ARCH" = Linux-x86_64 ]; then
+    jit_body='(defn make-code [] (-> (ptr u8))
+  (let [code (mmap (cast (ptr u8) 0) 4096 7 34 -1 0)]
+    (for [i 0 6] (store! (index code i) (get [(cast u8 184) (cast u8 42) (cast u8 0) (cast u8 0) (cast u8 0) (cast u8 195)] i)))
+    code))'
+  fi
+  if [ -n "$jit_body" ]; then
+    printf '%s\n' '(module jit-target)' '(import "coil.cc" :as cc)' \
+      '(extern mmap :cc (cc/C) [(ptr u8) u64 i32 i32 i32 i64] (-> (ptr u8)))' "$jit_body" \
+      '(defn main [] (-> i64) (call-ptr (cast (fnptr (cc/C) [] i64) (make-code))))' > "$T/jit-target.coil"
+    build "$T/jit-target.coil" "$T/jit-target" --debug-checks \
+      && expect_rc 42 "--debug-checks calls into executable memory no loaded image owns" "$T/jit-target"
+  fi
   # Off, the checks are not compiled in: the subslice keeps its (wrong) length.
   if build "$T/dbg.coil" "$T/dbg-off"; then
     "$T/dbg-off" subslice >/dev/null 2>&1
