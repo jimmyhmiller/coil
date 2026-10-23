@@ -198,6 +198,10 @@ section_usage() {
     "$COIL" build "$T/seven.coil" -o "$T/no-such-dir/seven"
   expect_rc_out 1 "unsupported --target 'bogus-triple'" "an unknown --target is rejected and named" \
     "$COIL" build "$T/seven.coil" --target bogus-triple -o "$T/bogus"
+  expect_rc_out 1 "Coil's WebAssembly targets are wasm32-unknown-unknown" "a wasm triple naming a system interface is rejected" \
+    "$COIL" build "$T/seven.coil" --target wasm32-wasi -o "$T/wasi.wasm"
+  expect_rc 0 "--target wasm32 alone builds a WebAssembly module" \
+    "$COIL" build "$T/seven.coil" --target wasm32 -o "$T/bare.wasm"
 
   # Flags are position-independent: Unix order, and flags before the file.
   rm -f "$T/a" "$T/a.o"
