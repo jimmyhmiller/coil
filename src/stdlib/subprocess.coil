@@ -87,13 +87,19 @@
    (status-code i64)])
 
 ;;; `cwd` is a borrowed NUL-terminated path valid through spawn-with-options.
-(defstruct SpawnOptions [(cwd (ptr i8)) (new-process-group bool)])
+;;; `pass-fds` is a borrowed allowlist of open descriptors >= 3. These alone
+;;; survive in addition to stdio; their close-on-exec flags in the parent stay
+;;; unchanged. Keep the descriptors open until spawn returns.
+(defstruct SpawnOptions
+  [(cwd (ptr i8)) (new-process-group bool) (pass-fds (slice i32))])
 
 (impl SpawnOptions
   (new [] (-> SpawnOptions)
     (let [options (primitive/alloc-stack SpawnOptions)]
       (store! (field options cwd) (primitive/cast (ptr i8) 0))
       (store! (field options new-process-group) false)
+      (store! (field options pass-fds)
+              (slice::new [i32] (primitive/cast (ptr i32) 0) 0))
       (load options))))
 
 (defn inherit-stdio [] (-> Stdio)
@@ -229,6 +235,8 @@
 
 (extern posix_spawn_file_actions_destroy :cc (cc/C) [(ptr i8)] (-> i32))
 
+(extern posix_spawn_file_actions_addclose :cc (cc/C) [(ptr i8) i32] (-> i32))
+
 (extern posix_spawn_file_actions_adddup2 :cc (cc/C) [(ptr i8) i32 i32] (-> i32))
 
 ;;; `posix_spawn_file_actions_addopen`, declared with the target's `mode_t` (u32 on
@@ -290,15 +298,19 @@
 ;;; which every descriptor this library opens is (`os/pipe-cloexec`, `coil.fs`,
 ;;; `coil.socket`); a descriptor other code opened without the flag then reaches
 ;;; the child too. On Darwin, spawn-flags already closes the rest.
-(defn spawn-close-the-rest! [(actions (ptr i8))] (-> i32)
-  (os/os-pick (let [closefrom (os/dlsym-cached (primitive/alloc-static (ptr i8))
-                                               c"posix_spawn_file_actions_addclosefrom_np"
-                                               (primitive/cast (ptr i8) 0))]
+(defn spawn-close-the-rest! [(actions (ptr i8)) (first i32)] (-> i32)
+  (os/os-pick (let [closefrom
+                      (os/dlsym-cached (primitive/alloc-static (ptr i8))
+                                       c"posix_spawn_file_actions_addclosefrom_np"
+                                       (primitive/cast (ptr i8) 0))]
                 (if (= (primitive/cast i64 closefrom) 0)
                     (: 0 i32)
-                    (primitive/call-ptr (primitive/cast (fnptr (cc/C) [(ptr i8) i32] i32) closefrom)
+                    (primitive/call-ptr (primitive/cast (fnptr (cc/C)
+                                                               [(ptr i8) i32]
+                                                               i32)
+                                                        closefrom)
                                         actions
-                                        (: 3 i32))))
+                                        first)))
               (: 0 i32)
               (: 0 i32)))
 
@@ -317,6 +329,45 @@
                                       actions
                                       fd)
                   (: 0 i32))))
+
+(defn pass-fds-error [(fds (slice i32))] (-> i32)
+  (block :done
+    (for fd fds
+      (when (< fd 3) (return-from :done (: 22 i32)))
+      (when (< (os/fcntl fd 1) 0) (return-from :done (: 9 i32))))
+    (: 0 i32)))
+
+(defn passed-fd? [(fds (slice i32)) (fd i32)] (-> bool)
+  (let [(mut found) false]
+    (for item fds (when (= item fd) (set! found true)))
+    (load found)))
+
+;;; Preserve the allowlist and close every other descriptor. Linux closes holes
+;;; below its largest entry before closefrom; Darwin closes unnamed descriptors.
+(defn spawn-pass-fds! [(actions (ptr i8)) (fds (slice i32))] (-> i32)
+  (block
+    :done
+      (let [(mut highest) (: 2 i32)]
+        (for fd fds
+          (when (< fd 3) (return-from :done (: 22 i32)))
+          (when (< (os/fcntl fd 1) 0) (return-from :done (: 9 i32)))
+          (let [error (spawn-inherit! actions fd)]
+            (when (!= error 0) (return-from :done error)))
+          (when (> fd (load highest)) (set! highest fd)))
+        (os/os-pick (for [index 3 (+ (primitive/cast i64 (load highest)) 1)]
+                      (let [fd (primitive/cast i32 index)]
+                        (when (and (not (passed-fd? fds fd))
+                                   (>= (os/fcntl fd 1) 0))
+                          (let [error
+                                  (posix_spawn_file_actions_addclose actions fd)]
+                            (when (!= error 0) (return-from :done error))))))
+                    0
+                    0)
+        (spawn-close-the-rest! actions
+                               (primitive/cast i32
+                                               (+ (primitive/cast i64
+                                                                  (load highest))
+                                                  1))))))
 
 ;;; The file action that gives the child `target` under `policy`, or an errno.
 (defn spawn-redirect! [(actions (ptr i8))
@@ -368,7 +419,7 @@
                  (first-error (spawn-redirect! actions stdin-policy stdin-pipe 0 true)
                               (first-error (spawn-redirect! actions stdout-policy stdout-pipe 1 false)
                                            (first-error (spawn-redirect! actions stderr-policy stderr-pipe 2 false)
-                                                        (first-error (spawn-close-the-rest! actions)
+                                                        (first-error (spawn-pass-fds! actions (.pass-fds options))
                                                                      (first-error (posix_spawnattr_setflags attr
                                                                                                             (primitive/cast i16 flags))
                                                                                   (first-error (sigemptyset signals)
@@ -410,7 +461,7 @@
   ;;; subprocess default. Inputs are borrowed only until this call returns.
   ;;;
   ;;; The child gets the current environment, its three standard streams as the
-  ;;; policies say and no other descriptor of this process, and starts with no
+  ;;; policies say and the descriptors named in `options.pass-fds`, and starts with no
   ;;; signals blocked. `MergeStdout` for stdin or stdout is `InvalidCommand`; a
   ;;; program that cannot be started, missing or not executable, is
   ;;; `SpawnFailed` with the errno.
@@ -434,6 +485,11 @@
           (init-pair stdout-pipe)
           (init-pair stderr-pipe)
           (block :done
+                 ;; Validate before allocating pipes: a closed requested fd must
+                 ;; not become valid merely because a new stdio pipe reuses it.
+                 (let [error (pass-fds-error (.pass-fds options))]
+                   (when (!= error 0)
+                     (return-from :done (Err (SpawnFailed (primitive/cast i64 error))))))
                  (let [error
                          (if (stdio-piped? stdin-policy) (make-pipe stdin-pipe) 0)]
                    (if (!= error 0)
@@ -1039,6 +1095,7 @@
                           (let [child (primitive/alloc-stack Child)
                                 spawn-settings
                                   (primitive/alloc-stack SpawnOptions)]
+                            (store! spawn-settings (SpawnOptions::new))
                             (store! (field spawn-settings cwd) cwd)
                             (store! (field spawn-settings new-process-group)
                                     true)
