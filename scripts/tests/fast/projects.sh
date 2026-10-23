@@ -359,6 +359,8 @@ cp "$WS/Coil.toml" "$W/Coil.workspace.toml"
 printf '[test.suites.text]\nroots = ["members/util/tests"]\n' >> "$WS/Coil.toml"
 run "$WS" "$COIL" test
 expect 1 "[test.suites.text] is in a workspace manifest" "a workspace manifest's own test suite is an error, not ignored"
+run "$WS" "$COIL" check
+expect 0 "members ok" "a workspace manifest's test suite stops only coil test"
 cp "$W/Coil.workspace.toml" "$WS/Coil.toml"
 cp "$WS/Coil.toml" "$W/Coil.workspace.toml"
 printf '[workspace]\nname = "projfix"\nmembers = ["members/cli", "members/notes"]\n' > "$WS/Coil.toml"
