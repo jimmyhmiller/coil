@@ -179,6 +179,7 @@ EOF
   if build "$T/tail.coil" "$T/tail" -O0; then
     expect_rc 42 "-O0 tail calls that pass a pointer or never return run in constant stack" "$T/tail"
   fi
+  expect_rc 42 "the interpreter runs those tail calls in constant stack too" "$COIL" interp "$T/tail.coil"
   if [ "$HOST_ARCH" = arm64 ] && build "$T/tail.coil" "$T/tail-arm64" --backend arm64; then
     expect_rc 42 "the arm64 backend runs a never-returning self tail call as a jump" "$T/tail-arm64"
   fi
