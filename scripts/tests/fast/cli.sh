@@ -153,6 +153,35 @@ EOF
   else
     bad "the REPL prints a value whose type has no Debug from its structure" "exit $rc: $out"
   fi
+
+  # Tail calls a million deep at -O0, where no optimizer rescues a plain call:
+  # one passes a pointer it read through its incoming pointer, one never returns
+  # (the checker follows its call with a loop). A frame per call overflows the
+  # stack long before either finishes.
+  cat > "$T/tail.coil" <<'EOF'
+(module run-tail)
+(import "coil.cc" :as cc)
+(extern exit :cc (cc/C) [i32] (-> never))
+(extern malloc :cc (cc/C) [u64] (-> (ptr u8)))
+(defstruct Node [(next (ptr Node))])
+(defn walk :cc (cc/Tail) [(p (ptr Node)) (count i64)] (-> i64)
+  (if (= (cast i64 p) 0) count (walk (.next p) (+ count 1))))
+(defn descend [(n i64) (code i32)] (-> never)
+  (if (= n 0) (exit code) (descend (- n 1) code)))
+(defn main [] (-> i64)
+  (let [(mut head) (cast (ptr Node) 0)]
+    (for _ (range 0 1000000)
+      (let [n (cast (ptr Node) (malloc 8))]
+        (set! (.next n) head)
+        (set! head n)))
+    (descend 1000000 (if (= (walk head 0) 1000000) 42 1))))
+EOF
+  if build "$T/tail.coil" "$T/tail" -O0; then
+    expect_rc 42 "-O0 tail calls that pass a pointer or never return run in constant stack" "$T/tail"
+  fi
+  if [ "$HOST_ARCH" = arm64 ] && build "$T/tail.coil" "$T/tail-arm64" --backend arm64; then
+    expect_rc 42 "the arm64 backend runs a never-returning self tail call as a jump" "$T/tail-arm64"
+  fi
 }
 
 # ---------------------------------------------------------------------------
