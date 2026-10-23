@@ -436,6 +436,14 @@ EOF
   printf '(module dynapp)\n(import "dynshapes" :as p)\n(import "coil.primitive" :as primitive)\n(defstruct Point [(x i64)])\n(impl p/Show Point (show [(a (ptr Point))] (-> i64) 5))\n(defn main [] (-> i64) (p/show (primitive/make-dyn Show (primitive/alloc-static Point))))\n' > "$T/dyn-scope/dynapp.coil"
   expect_rc_out 1 "make-dyn: unknown trait 'Show'" "check: make-dyn's trait is one in scope, not one that shares its name" \
     "$COIL" check "$T/dyn-scope/dynapp.coil"
+  # The forms an imported file has before its (module …) keep bare names; a
+  # defalias among them calls the function it names.
+  mkdir -p "$T/prefix-alias"
+  printf '(defn global-helper [] (-> i64) 42)\n(defalias local global-helper)\n(defn leaked [] (-> i64) (local))\n(module dep)\n(defn unused [] (-> i64) 0)\n' > "$T/prefix-alias/other.coil"
+  printf '(module app)\n(import "dep")\n(defn main [] (-> i64) (leaked))\n' > "$T/prefix-alias/main.coil"
+  if build "$T/prefix-alias/main.coil" "$T/prefix-alias/app"; then
+    expect_rc 42 "a defalias before an imported file's (module …) calls its target" "$T/prefix-alias/app"
+  fi
 }
 
 # ---------------------------------------------------------------------------
