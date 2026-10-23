@@ -144,9 +144,9 @@
       (unless (= (primitive/cast i64 msg) 0) (LLVMDisposeMessage msg) 0)
       (if failed 0 1))))
 
-; One independently-owned LLVM partition. The coordinator reparses the complete
-; module into a fresh context and prunes it; concurrent workers therefore never
-; share an LLVMContext, Module, pass options, or TargetMachine.
+; One independently-owned LLVM partition: a context and module of its own, so
+; concurrent workers never share an LLVMContext, Module, pass options, or
+; TargetMachine.
 (defstruct LLVMPartitionJob
   [(context (ptr i8))
    (module (ptr i8))
@@ -175,24 +175,68 @@
     0)
   0)
 
-(defn llvm-declare-function! [(fn (ptr i8))] (-> i64)
-  (let [(mut bb) (LLVMGetFirstBasicBlock fn)]
-    (loop (if (= (primitive/cast i64 (load bb)) 0)
-              (break)
-              (let [next (LLVMGetNextBasicBlock (load bb))]
-                (LLVMDeleteBasicBlock (load bb))
-                (set! bb next)))))
-  0)
+; Copy the attributes at one index (-1 the function, 0 the result, k parameter k).
+(defn llvm-copy-attributes! [(a (dyn Allocator))
+                             (from (ptr i8))
+                             (to (ptr i8))
+                             (index i32)] (-> i64)
+  (let [n (primitive/cast i64 (LLVMGetAttributeCountAtIndex from index))]
+    (when (> n 0)
+      (let [stack (primitive/alloc-stack (array (ptr i8) 64))
+            attrs
+              (if (<= n 64)
+                  (primitive/cast (ptr (ptr i8)) stack)
+                  (match (alloc-bytes a (primitive/imul n 8) 8)
+                    (Some [s] (primitive/cast (ptr (ptr i8)) (primitive/cast (ptr i8) (data s))))
+                    (None []
+                          (do
+                            (ps (stderr) "codegen: out of memory copying LLVM attributes\n")
+                            (exit 1)
+                            (primitive/cast (ptr (ptr i8)) stack)))))]
+        (LLVMGetAttributesAtIndex from index attrs)
+        (for [k 0 n]
+          (LLVMAddAttributeAtIndex to index (load (index attrs k))))
+        0))
+    0))
 
-(defn llvm-prune-partition! [(part (ptr i8)) (partition i64)] (-> i64)
+; A definition another partition owns becomes a declaration here without its
+; body ever being read. Its body is still unread bitcode, so there are no blocks
+; to delete, and LLVM counts it as a definition until it is materialized or
+; deleted. A fresh declaration of the same type, calling convention and
+; attributes takes over its uses -- including those in bodies not read yet, which
+; the reader resolves through value handles -- and the definition is deleted.
+(defn llvm-declare-unread-function! [(a (dyn Allocator))
+                                     (module (ptr i8))
+                                     (fn (ptr i8))] (-> i64)
+  (let [name (to-cstr a (from-cstr (LLVMGetValueName fn)))
+        decl (LLVMAddFunction module c"" (LLVMGlobalGetValueType fn))
+        params (primitive/cast i64 (LLVMCountParams fn))
+        section (LLVMGetSection fn)]
+    (LLVMSetFunctionCallConv decl (LLVMGetFunctionCallConv fn))
+    (LLVMSetVisibility decl (LLVMGetVisibility fn))
+    (LLVMSetUnnamedAddress decl (LLVMGetUnnamedAddress fn))
+    (LLVMSetAlignment decl (LLVMGetAlignment fn))
+    (unless (= (primitive/cast i64 section) 0) (LLVMSetSection decl section) 0)
+    (for [k -1 (+ params 1)]
+      (llvm-copy-attributes! a fn decl (primitive/cast i32 k)))
+    (LLVMReplaceAllUsesWith fn decl)
+    (LLVMDeleteFunction fn)
+    (LLVMSetValueName2 decl name (len (from-cstr name)))
+    0))
+
+; `part` is a lazily loaded copy of the whole module: every body is still unread.
+; Turn each definition another partition owns into a declaration, so that only
+; this partition's own bodies are ever read.
+(defn llvm-prune-partition! [(a (dyn Allocator)) (part (ptr i8)) (partition i64)] (-> i64)
   (let [(mut fn) (LLVMGetFirstFunction part)]
+    ; a replacement declaration goes to the end of the list, and is skipped there
     (loop (if (= (primitive/cast i64 (load fn)) 0)
               (break)
               (let [next (LLVMGetNextFunction (load fn))]
                 (when (= (LLVMIsDeclaration (load fn)) (: 0 i32))
                   (llvm-promote-local! (load fn))
                   (when (!= (llvm-partition-index (load fn)) partition)
-                    (llvm-declare-function! (load fn))
+                    (llvm-declare-unread-function! a part (load fn))
                     0))
                 (set! fn next))))
     ; A global initializer is its definition. Exactly one partition retains it;
@@ -214,6 +258,37 @@
                       0))
                   (set! global next)))))
     0))
+
+; One partition of the whole module's bitcode, in a fresh context. The module is
+; read lazily -- globals, declarations and constants, but no function bodies --
+; pruned, and then linked into an empty module, which reads exactly the bodies
+; this partition defines. Parsing the whole module eight times instead was most
+; of the partitioning time, and every context kept the constants of all eight.
+(defn llvm-load-partition [(a (dyn Allocator))
+                           (bitcode (ptr i8))
+                           (partition i64)] (-> (ptr i8))
+  (let [context (LLVMContextCreate)
+        ; the lazy module owns this view of the shared bytes, not the bytes
+        view
+          (LLVMCreateMemoryBufferWithMemoryRange (LLVMGetBufferStart bitcode)
+                                                 (LLVMGetBufferSize bitcode)
+                                                 c"partition"
+                                                 (: 0 i32))
+        (mut lazy-out) (primitive/cast (ptr i8) 0)]
+    (when (!= (LLVMGetBitcodeModuleInContext2 context view (mut lazy-out))
+              (: 0 i32))
+      (ps (stderr) "codegen: could not parse LLVM partition bitcode\n")
+      (exit 1)
+      0)
+    (let [lazy lazy-out
+          part (LLVMModuleCreateWithNameInContext c"partition" context)]
+      (llvm-prune-partition! a lazy partition)
+      ; consumes `lazy`
+      (when (!= (LLVMLinkModules2 part lazy) (: 0 i32))
+        (ps (stderr) "codegen: could not read LLVM partition bodies\n")
+        (exit 1)
+        0)
+      part)))
 
 (defn llvm-partition-worker [(raw (ptr i8))] (-> (ptr i8))
   (let [job (primitive/cast (ptr LLVMPartitionJob) raw)
@@ -305,6 +380,8 @@
                          (obj-prefix (ptr i8))
                          (triple (ptr i8))
                          (tm (ptr i8))] (-> i64)
+  ; Disposes `m` (and its context) once its bitcode is written; the caller must not.
+  ;
   ; Inline across the whole module before partitioning: a call whose callee hashes
   ; into another partition can never be inlined afterwards.
   ;
@@ -331,25 +408,18 @@
           split-span (tr/span-begin "backend.parallel.partition")
           complete-bitcode (LLVMWriteBitcodeToMemoryBuffer m)
           (mut i) 0]
-      ; Parse and prune serially, but into a fresh context per partition. The
-      ; worker receives exclusive ownership of that context+module pair; no LLVM
-      ; object crosses between workers once optimization starts.
+      ; Nothing reads the whole module after this; its bitcode is the source now.
+      (codegen-dispose-module! m)
+      ; Load serially, into a fresh context per partition: LLVM's bitcode reader
+      ; is not safe beside a pass pipeline running on another thread, even in
+      ; another context. The worker receives exclusive ownership of that
+      ; context+module pair; no LLVM object crosses between workers.
       (loop (if (>= (load i) 8)
                 (break)
                 (let [job (index jobs (load i))
-                      context (LLVMContextCreate)
-                      (mut module-out) (primitive/cast (ptr i8) 0)]
-                  (when (!= (LLVMParseBitcodeInContext2 context
-                                                        complete-bitcode
-                                                        (mut module-out))
-                            (: 0 i32))
-                    (ps (stderr)
-                        "codegen: could not parse LLVM partition bitcode\n")
-                    (exit 1)
-                    0)
-                  (llvm-prune-partition! module-out (load i))
-                  (set! (.context job) context)
-                  (set! (.module job) module-out)
+                      part (llvm-load-partition a complete-bitcode (load i))]
+                  (set! (.context job) (LLVMGetModuleContext part))
+                  (set! (.module job) part)
                   (set! (.path job) (llvm-partition-path a obj-prefix (load i)))
                   (set! (.triple job) triple)
                   (set! (.cpu job) (llvm-cpu triple))
@@ -533,6 +603,8 @@
               triple-override)
         (mut targetout) (zeroed (ptr i8))
         (mut errout) (zeroed (ptr i8))
+        ; the parallel -O3 path disposes `m` itself, as soon as it has its bitcode
+        (mut m-disposed) false
         result
           (block :compile
                  (unless (= (verify-module! m "after lowering") 1)
@@ -604,6 +676,7 @@
                                            1)
                                   (return-from :emit 0))
                                 (when parallel
+                                  (set! m-disposed true)
                                   (return-from :emit
                                                  (emit-parallel-o3! a
                                                                     m
@@ -655,7 +728,7 @@
                      (LLVMDisposeTargetMachine tm)
                      0)
                    emitted))]
-    (codegen-dispose-module! m)
+    (unless (load m-disposed) (codegen-dispose-module! m) 0)
     (when (= (primitive/cast i64 triple-override) 0)
       (LLVMDisposeMessage triple)
       0)
