@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/utsname.h>
 #include <math.h>
 #include <fcntl.h>
 #include <time.h>
@@ -195,6 +196,15 @@ uint32_t env_memcmp(uint64_t a, uint64_t b, uint64_t n) {
     return (uint32_t)(int32_t)(r < 0 ? -1 : (r > 0 ? 1 : 0));
 }
 uint64_t env_strlen(uint64_t p) { return (uint64_t)strlen(hoststr(p)); }
+// uname(2) for the guest: the host's struct, in the host's layout, which is
+// the one comptime.coil's native-arch-str reads for the OS it reports.
+uint32_t env_uname(uint64_t buf) {
+    struct utsname u;
+    if (uname(&u) != 0) return (uint32_t)-1;
+    memcpy(MEM + buf, &u, sizeof u);
+    return 0;
+}
+
 // The host's description of errno CODE, copied into guest memory once per code
 // (os.coil's errno-message reads it as a C string).
 static uint64_t g_strerror_text[256];
