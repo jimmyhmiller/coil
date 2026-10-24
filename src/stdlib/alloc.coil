@@ -241,26 +241,29 @@
 ;;; Each `request` specialization owns one static byte. Its address is stable and
 ;;; unique for the life of the process, making it a process-local identity for T.
 ;;; IDs are for diagnostics and allocator policy only; they must never be serialized.
-(defn request [T] [(count i64)] (-> (Option AllocRequest))
-  (let [size (primitive/sizeof T)]
-    (if (or (<= count 0)
-            (or (<= size 0) (> count (primitive/idiv 9223372036854775807 size))))
-        (None)
-        (Some (AllocRequest
-                :type-id (primitive/cast i64 (primitive/alloc-static i8))
-                :count count
-                :bytes (primitive/imul count size)
-                :align (primitive/alignof T))))))
-
+;;; T's identity: the address of a static cell each instantiation has its own of.
+;;; Zero-sized types never produce an allocation request, but they still have a
+;;; useful nonzero identity for reflection and diagnostics.
 (defn type-id [T] [] (-> i64)
-  ; Ask the canonical request specialization rather than minting a second token.
-  (match (request [T] 1)
-    (Some [r]
-          (let [(mut request) r]
-            (.type-id request)))
-    ; Zero-sized types never produce an allocation request, but they still have a
-    ; useful nonzero identity for reflection and diagnostics.
-    (None [] (primitive/cast i64 (primitive/alloc-static i8)))))
+  (primitive/cast i64 (primitive/alloc-static i8)))
+
+;;; The typed functions below are thin: each instantiation passes T's identity,
+;;; size and alignment to one of these, which never inline back into them. With the
+;;; whole body per instantiation, the allocator was a sixth of the compiler's own
+;;; LLVM module -- hundreds of copies differing only in two constants. Rust splits
+;;; RawVec's growth into a non-generic `finish_grow` for the same reason.
+(defn sized-request :inline (Never) [(type-id i64) (size i64) (align i64) (count i64)] (-> (Option AllocRequest))
+  (if (or (<= count 0)
+          (or (<= size 0) (> count (primitive/idiv 9223372036854775807 size))))
+      (None)
+      (Some (AllocRequest
+              :type-id type-id
+              :count count
+              :bytes (primitive/imul count size)
+              :align align))))
+
+(defn request [T] [(count i64)] (-> (Option AllocRequest))
+  (sized-request (type-id [T]) (primitive/sizeof T) (primitive/alignof T) count))
 
 (defn bytes-request [(count i64) (align i64)] (-> (Option AllocRequest))
   (if (or (<= count 0)
@@ -275,16 +278,17 @@
 
 ;;; Typed allocation is the default API. Even `[u8]` has a real type ID; only the
 ;;; explicitly byte-oriented API below sends ID 0.
-(defn alloc [T] [(a (dyn Allocator)) (count i64)] (-> (Option (slice T)))
+(defn sized-alloc :inline (Never) [(a (dyn Allocator)) (type-id i64) (size i64) (align i64) (count i64)] (-> (Option (ptr i8)))
   (if (= count 0)
-      (Some (slice::new (primitive/cast (ptr T) 0) 0))
-      (match (request [T] count)
+      (Some (primitive/cast (ptr i8) 0))
+      (match (sized-request type-id size align count)
         (None [] (None))
-        (Some [r]
-              (match (raw-alloc a r)
-                (None [] (None))
-                (Some [p]
-                      (Some (slice::new (primitive/cast (ptr T) p) count))))))))
+        (Some [r] (raw-alloc a r)))))
+
+(defn alloc [T] [(a (dyn Allocator)) (count i64)] (-> (Option (slice T)))
+  (match (sized-alloc a (type-id [T]) (primitive/sizeof T) (primitive/alignof T) count)
+    (None [] (None))
+    (Some [p] (Some (slice::new (primitive/cast (ptr T) p) count)))))
 
 (defn alloc-bytes [(a (dyn Allocator)) (count i64) (align i64)] (-> (Option (slice u8)))
   (if (= count 0)
@@ -311,16 +315,20 @@
                  (primitive/cast (ptr T) 0)))
     (Some [p] p)))
 
+(defn sized-free :inline (Never) [(a (dyn Allocator)) (memory (ptr i8)) (n i64) (type-id i64) (size i64) (align i64)] (-> i64)
+  (if (= n 0)
+      0
+      (match (sized-request type-id size align n)
+        (None [] 0)
+        (Some [r] (raw-free a memory r)))))
+
 (defn free [T] [(a (dyn Allocator)) (memory (slice T))] (-> i64)
-  (let [n (len memory)]
-    (if (= n 0)
-        0
-        (match (request [T] n)
-          (None [] 0)
-          (Some [r]
-                (raw-free a
-                          (primitive/cast (ptr i8) (data memory))
-                          r))))))
+  (sized-free a
+              (primitive/cast (ptr i8) (data memory))
+              (len memory)
+              (type-id [T])
+              (primitive/sizeof T)
+              (primitive/alignof T)))
 
 (defn free-bytes [(a (dyn Allocator)) (memory (slice u8)) (align i64)] (-> i64)
   (let [n (len memory)]
@@ -333,76 +341,92 @@
                           (primitive/cast (ptr i8) (data memory))
                           r))))))
 
+;;; RESIZE-ONLY says whether this is `resize` (in place or not at all) or `remap`
+;;; (the allocator may move the block). Answers the block's new address.
+(defn sized-resize :inline (Never) [(a (dyn Allocator))
+                                    (memory (ptr i8))
+                                    (old-count i64)
+                                    (new-count i64)
+                                    (type-id i64)
+                                    (size i64)
+                                    (align i64)
+                                    (resize-only bool)] (-> (Option (ptr i8)))
+  (if (= new-count 0)
+      (do
+        (sized-free a memory old-count type-id size align)
+        (Some (primitive/cast (ptr i8) 0)))
+      (if (= old-count 0)
+          (sized-alloc a type-id size align new-count)
+          (match (sized-request type-id size align old-count)
+            (None [] (None))
+            (Some [old]
+                  (match (sized-request type-id size align new-count)
+                    (None [] (None))
+                    (Some [new]
+                          (if resize-only
+                              (if (raw-resize a memory old new) (Some memory) (None))
+                              (raw-remap a memory old new)))))))))
+
 (defn resize [T] [(a (dyn Allocator)) (memory (slice T)) (new-count i64)] (-> (Option (slice T)))
-  (let [old-count (len memory)]
-    (if (= new-count 0)
-        (do
-          (free [T] a memory)
-          (Some (slice::new (primitive/cast (ptr T) 0) 0)))
-        (if (= old-count 0)
-            (alloc [T] a new-count)
-            (match (request [T] old-count)
-              (None [] (None))
-              (Some [old]
-                    (match (request [T] new-count)
-                      (None [] (None))
-                      (Some [new]
-                            (if (raw-resize a
-                                            (primitive/cast (ptr i8)
-                                                            (data memory))
-                                            old
-                                            new)
-                                (Some (slice::new (data memory) new-count))
-                                (None))))))))))
+  (match (sized-resize a
+                       (primitive/cast (ptr i8) (data memory))
+                       (len memory)
+                       new-count
+                       (type-id [T])
+                       (primitive/sizeof T)
+                       (primitive/alignof T)
+                       true)
+    (None [] (None))
+    (Some [p] (Some (slice::new (primitive/cast (ptr T) p) new-count)))))
 
 (defn remap [T] [(a (dyn Allocator)) (memory (slice T)) (new-count i64)] (-> (Option (slice T)))
-  (let [old-count (len memory)]
-    (if (= new-count 0)
-        (do
-          (free [T] a memory)
-          (Some (slice::new (primitive/cast (ptr T) 0) 0)))
-        (if (= old-count 0)
-            (alloc [T] a new-count)
-            (match (request [T] old-count)
-              (None [] (None))
-              (Some [old]
-                    (match (request [T] new-count)
-                      (None [] (None))
-                      (Some [new]
-                            (match (raw-remap a
-                                              (primitive/cast (ptr i8)
-                                                              (data memory))
-                                              old
-                                              new)
-                              (None [] (None))
-                              (Some [p]
-                                    (Some (slice::new (primitive/cast (ptr T) p)
-                                                      new-count))))))))))))
+  (match (sized-resize a
+                       (primitive/cast (ptr i8) (data memory))
+                       (len memory)
+                       new-count
+                       (type-id [T])
+                       (primitive/sizeof T)
+                       (primitive/alignof T)
+                       false)
+    (None [] (None))
+    (Some [p] (Some (slice::new (primitive/cast (ptr T) p) new-count)))))
 
-;;; Guaranteed-growth convenience: remap when possible, otherwise allocate, copy, free.
-(defn reallocate [T] [(a (dyn Allocator)) (memory (slice T)) (new-count i64)] (-> (Option (slice T)))
-  (match (remap [T] a memory new-count)
+(defn sized-reallocate :inline (Never) [(a (dyn Allocator))
+                                        (memory (ptr i8))
+                                        (old-count i64)
+                                        (new-count i64)
+                                        (type-id i64)
+                                        (size i64)
+                                        (align i64)] (-> (Option (ptr i8)))
+  (match (sized-resize a memory old-count new-count type-id size align false)
     (Some [m] (Some m))
     (None []
-          (match (alloc [T] a new-count)
+          (match (sized-alloc a type-id size align new-count)
             (None [] (None))
             (Some [next]
                   (do
                     (let [(mut i) 0
-                          n
-                            (if (< (len memory) new-count)
-                                (len memory)
-                                new-count)]
+                          n (primitive/imul (if (< old-count new-count) old-count new-count) size)]
                       (loop (if (>= (load i) n)
                                 (break)
                                 (do
-                                  (store! (primitive/index (data next)
-                                                           (load i))
-                                          (load (primitive/index (data memory)
-                                                                 (load i))))
+                                  (store! (primitive/index next (load i))
+                                          (load (primitive/index memory (load i))))
                                   (store! i (primitive/iadd (load i) 1))))))
-                    (free [T] a memory)
+                    (sized-free a memory old-count type-id size align)
                     (Some next)))))))
+
+;;; Guaranteed-growth convenience: remap when possible, otherwise allocate, copy, free.
+(defn reallocate [T] [(a (dyn Allocator)) (memory (slice T)) (new-count i64)] (-> (Option (slice T)))
+  (match (sized-reallocate a
+                           (primitive/cast (ptr i8) (data memory))
+                           (len memory)
+                           new-count
+                           (type-id [T])
+                           (primitive/sizeof T)
+                           (primitive/alignof T))
+    (None [] (None))
+    (Some [p] (Some (slice::new (primitive/cast (ptr T) p) new-count)))))
 
 ;;; Allocate and initialize one value. `box!` is the intentional hard-fail spelling
 ;;; used by code paths that cannot recover from OOM.
