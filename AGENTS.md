@@ -122,15 +122,15 @@ Use this format:
   `tests/diag` file (`python3 scripts/oracle.py diag bless …`, then read the
   golden), a check in `scripts/tests/fast/cli.sh`, a deftest in a `tests/stdlib`
   suite. A step that builds the compiler belongs in COMPREHENSIVE.
-- ⚠ **`build full` peaks near 9.4 GB of memory, and that is expected.** Compiling
-  the compiler once costs about 4.7 GB (measured: the largest single process), and
+- ⚠ **`build full` peaks near 5.3 GB of memory, and that is expected.** Compiling
+  the compiler once costs about 2.7 GB (measured: the largest single process), and
   the fixpoint step in `scripts/compiler/rebootstrap.sh` deliberately emits the
   stage 2 and stage 3 objects at the same time, so two such compiles are live at
-  once. It is the same on untouched `main` (9.38 and 9.33 GB on two runs, 2026-10-04).
-  The install step that follows (`build full` without `--no-install`, or
-  `dev.py install`) warms the `coil.jit` unit with `coil build-unit jit_api.coil`,
-  which compiles the whole compiler at -O3 in a single process; measured once at
-  about 9.9 GB on 2026-10-04, not measured on untouched `main`. Do not run anything
+  once (5.33 GB for the whole process tree, install included, 2026-10-24; it was
+  9.4 GB on 2026-10-04). The install step that follows (`build full` without
+  `--no-install`, or `dev.py install`) warms the `coil.jit` unit with
+  `coil build-unit jit_api.coil`, which compiles the whole compiler at -O3 in a
+  single process; it stayed under that same peak. Do not run anything
   else heavy beside either, and give them a memory cap when you run them in the
   background. A candidate built by `build candidate` is heavier still per
   compile than the installed compiler (the all-namespaces check needs about 10 GB
