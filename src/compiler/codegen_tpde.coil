@@ -1,10 +1,11 @@
 ; src/compiler/codegen_tpde.coil — the tpde backend: mono Program -> CIR -> tpde.
 ;
 ; Lowers the same monomorphized Program as codegen_a64.coil (whose lowering
-; decisions it mirrors: sum layout {i32 tag, payload at 8}, slices {ptr,i64},
-; AAPCS64 for every call) into CIR, the SSA IR of the tpde package
-; (~/Documents/Code/projects/coil-tpde), one function at a time, and compiles
-; each with tpde's single-pass register allocator into arm64 code.
+; decisions it mirrors: sum layout {i32 tag, payload at 8}, slices {ptr,i64})
+; into CIR, the SSA IR of the tpde package (~/Documents/Code/projects/coil-tpde),
+; one function at a time, and compiles each with tpde's single-pass register
+; allocator into arm64 code (AAPCS64), or for an x86_64 target into x86-64 code
+; (System V, classified as codegen_x64.coil does; a Mach-O x86-64 object).
 ;
 ; Values: a scalar (an integer up to 128 bits, float, bool or pointer) is an SSA
 ; value, integers kept extended to 64 bits from their width (codegen_a64's
@@ -43,6 +44,7 @@
 (import "coil.compiler.float_math" :use *)
 (import "coil.compiler.trace" :as tr)
 (import "coil.compiler.codegen_tpde_ir" :as tir)
+(import "coil.compiler.comptime" :use [target-arch-str])
 (import "coil.atomic" :as atomic)
 (import "coil.thread" :use [Thread ThreadConfig])
 (import "coil.cc" :as cc)
@@ -53,6 +55,8 @@
 (import "tpde.asm" :as tasm)
 (import "tpde.buf" :as tbuf)
 (import "tpde.a64.enc" :as enc)
+(import "tpde.x64.enc" :as xenc)
+(import "tpde.x64" :as xtpde)
 
 (extern cgtpde.write :as "write" [i32 (ptr i8) isize] (-> isize))
 (extern cgtpde.getenv :as "getenv" [(ptr i8)] (-> (ptr i8)))
@@ -136,6 +140,7 @@
    ; tl-abi-info's memo, by struct index
    (abi-cache (ArrayList AbiInfo))
    (abi-known (ArrayList bool))
+   (x64 bool)  ; x86-64 (System V) rather than arm64 (AAPCS64)
    (stats bool)  ; COIL_TPDE_STATS: count and time the phases
    (stat-funcs i64)
    (stat-vals i64)
@@ -365,25 +370,108 @@
           (set! (mut (.tsym-mobj tl)) (i64-of t) m)
           t))))
 
-;;; codegen_a64's ABI classification, remembered per struct: a struct's class
+;;; The System V classification (codegen_x64's g-abi-info), in codegen_a64's
+;;; AbiInfo: class 0 integer scalar, 1 float scalar, 2 one eightbyte, 3 two,
+;;; 4 MEMORY, 6 empty. For classes 2 and 3 the eightbytes' classes (1
+;;; INTEGER, 2 SSE) are kept in `hfa_n` and `hfa_bits`, which on arm64 are 0
+;;; for these classes (INTEGER).
+(defn sysv-merge [(x i64) (y i64)] (-> i64)
+  (cond (or (= x 1) (= y 1)) 1 (or (= x 2) (= y 2)) 2 :else 0))
+
+;;; Paint each byte `t` covers (at `base`) with its class.
+(defn sysv-paint! [(g (ptr Cga)) (t (ptr Type)) (base i64) (bytes (mut (ArrayList i64)))] (-> void)
+  (match (load t)
+    (TFloat [bits] (sysv-fill! (mut bytes) base (/ bits 8) 2))
+    (TArray [et cnt]
+            (let [esz (ty-size g et)]
+              (for i (range 0 (extent-value cnt)) (sysv-paint! g et (+ base (* i esz)) (mut bytes)))))
+    (TStruct [nm]
+             (let [si (g-struct-idx g nm)]
+               (if (>= si 0)
+                   (let [fs (load (field (struct-at (field g layouts) si) fields))]
+                     (for i (range 0 (len (load fs)))
+                       (sysv-paint! g (field (elem fs i) ty) (+ base (g-field-off g si i)) (mut bytes))))
+                   ; a sum: tag and payload words, all INTEGER
+                   (sysv-fill! (mut bytes) base (ty-size g t) 1))))
+    (_ (sysv-fill! (mut bytes) base (ty-size g t) 1))))
+
+(defn sysv-fill! [(bytes (mut (ArrayList i64))) (base i64) (n i64) (cls i64)] (-> void)
+  (for i (range base (+ base n))
+    (when (< i (len bytes)) (set! (mut bytes) i (sysv-merge (get bytes i) cls)))))
+
+;;; The class of the eightbyte at `lo`; one of padding only is INTEGER.
+(defn sysv-eightbyte [(bytes (ptr (ArrayList i64))) (lo i64) (size i64)] (-> i64)
+  (let [(mut c) 0]
+    (for i (range lo (if (< (+ lo 8) size) (+ lo 8) size))
+      (set! c (sysv-merge c (get (load bytes) i))))
+    (if (= c 0) 1 c)))
+
+(defn sysv-info [(g (ptr Cga)) (t (ptr Type))] (-> AbiInfo)
+  (let [(mut r) (mk-abi-scalar)]
+    (if (ty-is-scalar t)
+        (set! (.cls r) (if (ty-is-float t) 1 0))
+        (let [sz (ty-size g t)]
+          (if (> sz 16)
+              (set! (.cls r) 4)
+              (let [(mut bytes) (ArrayList::new [i64] (malloc-allocator))]
+                (extend-zeroed! (mut bytes) sz)
+                (sysv-paint! g t 0 (mut bytes))
+                (set! (.hfa_n r) (sysv-eightbyte (mut bytes) 0 sz))
+                (cond (= sz 0) (set! (.cls r) 6)
+                      (<= sz 8) (set! (.cls r) 2)
+                      :else (do (set! (.cls r) 3)
+                                (set! (.hfa_bits r) (sysv-eightbyte (mut bytes) 8 sz))))
+                (free! (mut bytes))))))
+    r))
+
+(defn tl-abi-info-raw [(tl (ptr Tl)) (t (ptr Type))] (-> AbiInfo)
+  (if (.x64 tl) (sysv-info (.g tl) t) (g-abi-info (.g tl) t)))
+
+;;; Eightbyte `j` (0 or 1) of a class 2/3 aggregate is SSE (System V only).
+(defn eb-sse? [(info AbiInfo) (j i64)] (-> bool)
+  (= (if (= j 0) (abi-hfa-n info) (abi-hfa-bits info)) 2))
+
+;;; The CIR type of eightbyte `j`, `n` bytes of it used.
+(defn eb-cty [(info AbiInfo) (j i64) (n i64)] (-> i64)
+  (cond (not (eb-sse? info j)) cir/T-I64 (<= n 4) cir/T-F32 :else cir/T-F64))
+
+;;; Load / store eightbyte `j` (`n` bytes at `off`) as its CIR type.
+(defn eb-load [(tl (ptr Tl)) (p u32) (info AbiInfo) (j i64) (off i64) (n i64)] (-> u32)
+  (if (eb-sse? info j)
+      (let [(mut ft) (if (<= n 4) (TFloat 32) (TFloat 64))] (load-scalar tl p off (mut ft)))
+      (load-bytes tl p off n)))
+
+(defn eb-store [(tl (ptr Tl)) (p u32) (info AbiInfo) (j i64) (off i64) (v u32) (n i64)] (-> void)
+  (if (eb-sse? info j)
+      (let [(mut ft) (if (<= n 4) (TFloat 32) (TFloat 64))] (store-scalar tl p off v (mut ft)))
+      (store-bytes tl p off v n)))
+
+;;; A class 3 aggregate's first-part flags: a group of two, mixed when its
+;;; eightbytes are in different register banks.
+(defn pair-flags [(info AbiInfo)] (-> u32)
+  (| (group-flags 1) (if (= (eb-sse? info 0) (eb-sse? info 1)) (: 0 u32) cir/AF-MIXED)))
+
+(defn hi-bytes [(sz i64)] (-> i64) (if (>= (- sz 8) 8) 8 (- sz 8)))
+
+;;; The ABI classification, remembered per struct: a struct's class
 ;;; walks its fields, and the same few structs are passed at most calls.
 (defn tl-abi-info [(tl (ptr Tl)) (t (ptr Type))] (-> AbiInfo)
   (match (load t)
     (TStruct [nm]
              (let [si (g-struct-idx (.g tl) nm)]
                (if (< si 0)
-                   (g-abi-info (.g tl) t)
+                   (tl-abi-info-raw tl t)
                    (do
                      (when (>= si (len (.abi-known tl)))
                        (extend-zeroed! (mut (.abi-known tl)) (- (+ si 1) (len (.abi-known tl))))
                        (extend-zeroed! (mut (.abi-cache tl)) (- (+ si 1) (len (.abi-cache tl)))))
                      (if (get (.abi-known tl) si)
                          (get (.abi-cache tl) si)
-                         (let [info (g-abi-info (.g tl) t)]
+                         (let [info (tl-abi-info-raw tl t)]
                            (set! (mut (.abi-cache tl)) si info)
                            (set! (mut (.abi-known tl)) si true)
                            info))))))
-    (_ (g-abi-info (.g tl) t))))
+    (_ (tl-abi-info-raw tl t))))
 
 ; ============================ scopes =========================================
 
@@ -1507,15 +1595,18 @@
         (do (push-arg! tl (mut args) (mut flags) (scalar tl tv) (| vf (narrow-arg-flags tl (mut t) false))) 0)
       (wide? (mut t)) (do (push-arg! tl (mut args) (mut flags) (scalar tl tv) vf) 0)
       (= cls 2)
-        (do (push-arg! tl (mut args) (mut flags) (load-bytes tl (place tl tv) 0 (tsize tl (mut t))) vf) 0)
+        (do (push-arg! tl (mut args) (mut flags) (eb-load tl (place tl tv) info 0 0 (tsize tl (mut t))) vf) 0)
       (= cls 3)
         (let [p (place tl tv)
               sz (tsize tl (mut t))
-              lo (load-bytes tl p 0 8)
-              hi (load-bytes tl p 8 (if (>= (- sz 8) 8) 8 (- sz 8)))]
-          (push-arg! tl (mut args) (mut flags) lo (| vf (group-flags 1)))
+              lo (eb-load tl p info 0 0 8)
+              hi (eb-load tl p info 1 8 (hi-bytes sz))]
+          (push-arg! tl (mut args) (mut flags) lo (| vf (pair-flags info)))
           (push-arg! tl (mut args) (mut flags) hi vf)
           0)
+      (.x64 tl)
+        ; MEMORY: tpde copies the aggregate onto the stack
+        (do (push-arg! tl (mut args) (mut flags) (place tl tv) (| vf (cir/af-byval (tsize tl (mut t))))) 0)
       (= cls 5)
         (let [p (place tl tv)
               hn (abi-hfa-n info)
@@ -1571,8 +1662,9 @@
       (or retvoid (= rcls 4) (= rcls 6)) 0
       (or (= rcls 0) (= rcls 1)) (push! (mut (.call-rts tl)) (primitive/cast u8 (tl-cty (mut rt))))
       (wide? (mut rt)) (push! (mut (.call-rts tl)) (primitive/cast u8 cir/T-I128))
-      (= rcls 2) (push! (mut (.call-rts tl)) (primitive/cast u8 cir/T-I64))
-      (= rcls 3) (do (push! (mut (.call-rts tl)) (primitive/cast u8 cir/T-I64)) (push! (mut (.call-rts tl)) (primitive/cast u8 cir/T-I64)))
+      (= rcls 2) (push! (mut (.call-rts tl)) (primitive/cast u8 (eb-cty retinfo 0 (tsize tl (mut rt)))))
+      (= rcls 3) (do (push! (mut (.call-rts tl)) (primitive/cast u8 (eb-cty retinfo 0 8)))
+                     (push! (mut (.call-rts tl)) (primitive/cast u8 (eb-cty retinfo 1 (hi-bytes (tsize tl (mut rt)))))))
       (= rcls 5) (for j (range 0 (abi-hfa-n retinfo))
                    (push! (mut (.call-rts tl)) (primitive/cast u8 (if (= (abi-hfa-bits retinfo) 32) cir/T-F32 cir/T-F64))))
       :else 0)
@@ -1593,9 +1685,9 @@
           (let [s (new-slot tl (mut rt))
                 sz (tsize tl (mut rt))]
             (cond
-              (= rcls 2) (store-bytes tl s 0 c sz)
-              (= rcls 3) (do (store-bytes tl s 0 c 8)
-                             (store-bytes tl s 8 (cir/call-result (.f tl) c 1) (if (>= (- sz 8) 8) 8 (- sz 8))))
+              (= rcls 2) (eb-store tl s retinfo 0 0 c sz)
+              (= rcls 3) (do (eb-store tl s retinfo 0 0 c 8)
+                             (eb-store tl s retinfo 1 8 (cir/call-result (.f tl) c 1) (hi-bytes sz)))
               :else (let [lb (/ (abi-hfa-bits retinfo) 8)
                           ft (if (= lb 4) (TFloat 32) (TFloat 64))]
                       (for j (range 0 (abi-hfa-n retinfo))
@@ -1653,7 +1745,8 @@
 
 ;;; A register named by a :shim convention.
 (defn shim-reg [(tl (ptr Tl)) (r (slice u8))] (-> i64)
-  (cond (or (= r "lr") (= r "x30")) 30
+  (cond (>= (x86-gpr-num r) 0) (x86-gpr-num r)
+        (or (= r "lr") (= r "x30")) 30
         (or (= r "fp") (= r "x29")) 29
         (and (> (len r) 1) (= (get r 0) #\x)) (str->i64 (subslice r 1 (len r)))
         :else (tl-fail (sconcat (.a tl) "tpde: unsupported :shim register " r))))
@@ -1697,6 +1790,32 @@
 ;;; the convention's registers into the C argument registers, call __impl, and
 ;;; move x0 into the convention's return register.
 (defn tl-shim-trampoline! [(tl (ptr Tl)) (sig (ptr GSig)) (impl-tsym u32) (tsym u32)] (-> void)
+  (if (.x64 tl) (tl-shim-trampoline-x64! tl sig impl-tsym tsym) (tl-shim-trampoline-a64! tl sig impl-tsym tsym)))
+
+(defn rb [(x i64)] (-> u8) (primitive/cast u8 x))
+
+;;; x86-64: push rbp (rsp is then 16-byte aligned), push the convention's
+;;; registers and pop them into the System V argument registers (any
+;;; permutation), call __impl, move rax into the return register.
+(defn tl-shim-trampoline-x64! [(tl (ptr Tl)) (sig (ptr GSig)) (impl-tsym u32) (tsym u32)] (-> void)
+  (let [ta (.ta tl)
+        text (tasm/sect-buf ta tasm/SEC-TEXT)
+        start (.len (load text))
+        regs (load (field sig shimregs))
+        nr (len (load regs))]
+    (xenc/push! text (rb 5))
+    (xenc/mov-rr! text true (rb 5) (rb 4))
+    (for j (range 0 nr) (xenc/push! text (rb (get (load regs) j))))
+    (for k (range 0 nr) (xenc/pop! text (xtpde/gp-arg-reg (u32-of (- (- nr 1) k)))))
+    (tasm/reloc! ta tasm/SEC-TEXT (+ (.len (load text)) 1) impl-tsym tasm/R-PLT32 0)
+    (xenc/call32! text 0)
+    (when (!= (.shimret sig) 0)
+      (xenc/mov-rr! text true (rb (.shimret sig)) (rb 0)))
+    (xenc/pop! text (rb 5))
+    (xenc/ret! text)
+    (tasm/sym-def! ta tsym tasm/SEC-TEXT start (- (.len (load text)) start))))
+
+(defn tl-shim-trampoline-a64! [(tl (ptr Tl)) (sig (ptr GSig)) (impl-tsym u32) (tsym u32)] (-> void)
   (let [ta (.ta tl)
         text (tasm/sect-buf ta tasm/SEC-TEXT)
         start (.len (load text))
@@ -1775,18 +1894,22 @@
               ; C callers extend narrow arguments to 32 bits only
               (bind! tl (.name prm) (tv-s (canon tl v t) (load t))))
           (= cls 2)
-            (let [v (cir/arg! fp cir/T-I64 false)
+            (let [sz (tsize tl t)
+                  v (cir/arg! fp (eb-cty info 0 sz) false)
                   s (new-slot tl t)]
-              (store-bytes tl s 0 v (tsize tl t))
+              (eb-store tl s info 0 0 v sz)
               (bind! tl (.name prm) (tv-p s (load t))))
           (= cls 3)
-            (let [lo (cir/arg-flagged! fp cir/T-I64 false (group-flags 1))
-                  hi (cir/arg! fp cir/T-I64 false)
-                  s (new-slot tl t)
-                  sz (tsize tl t)]
-              (store-bytes tl s 0 lo 8)
-              (store-bytes tl s 8 hi (if (>= (- sz 8) 8) 8 (- sz 8)))
+            (let [sz (tsize tl t)
+                  lo (cir/arg-flagged! fp (eb-cty info 0 8) false (pair-flags info))
+                  hi (cir/arg! fp (eb-cty info 1 (hi-bytes sz)) false)
+                  s (new-slot tl t)]
+              (eb-store tl s info 0 0 lo 8)
+              (eb-store tl s info 1 8 hi (hi-bytes sz))
               (bind! tl (.name prm) (tv-p s (load t))))
+          (.x64 tl)
+            ; MEMORY: the copy the caller put on the stack
+            (bind! tl (.name prm) (tv-p (cir/arg-flagged! fp cir/T-I64 false (cir/af-byval (tsize tl t))) (load t)))
           (= cls 5)
             (let [hn (abi-hfa-n info)
                   lb (/ (abi-hfa-bits info) 8)
@@ -1814,15 +1937,16 @@
       (= rcls 4)
         (do (memcpy tl (.sret tl) (place tl tv) (tsize tl (mut rt)))
             (open! tl)
-            (cir/ret0! fp))
+            ; System V returns the sret pointer in rax
+            (if (.x64 tl) (cir/ret1! fp (.sret tl)) (cir/ret0! fp)))
       :else
         (let [p (place tl tv)
               sz (tsize tl (mut rt))
               (mut vals) (ArrayList::new [u32] (.a tl))]
           (cond
-            (= rcls 2) (push! (mut vals) (load-bytes tl p 0 sz))
-            (= rcls 3) (do (push! (mut vals) (load-bytes tl p 0 8))
-                           (push! (mut vals) (load-bytes tl p 8 (if (>= (- sz 8) 8) 8 (- sz 8)))))
+            (= rcls 2) (push! (mut vals) (eb-load tl p (.retinfo tl) 0 0 sz))
+            (= rcls 3) (do (push! (mut vals) (eb-load tl p (.retinfo tl) 0 0 8))
+                           (push! (mut vals) (eb-load tl p (.retinfo tl) 1 8 (hi-bytes sz))))
             :else (let [info (.retinfo tl)
                         lb (/ (abi-hfa-bits info) 8)
                         ft (if (= lb 4) (TFloat 32) (TFloat 64))]
@@ -1888,7 +2012,8 @@
               start (.len (load text))
               bytes (load (.bytes (.code j)))]
           (for i (range 0 (len bytes)) (tbuf/emit8! text (get bytes i)))
-          (when (func-machine-code-returns? (.fd j)) (tbuf/emit32! text (: 0xD65F03C0 u32)))
+          (when (func-machine-code-returns? (.fd j))
+            (if (.x64 tl) (tbuf/emit8! text (: 0xC3 u8)) (tbuf/emit32! text (: 0xD65F03C0 u32))))
           (tasm/sym-def! ta (.tsym j) tasm/SEC-TEXT start (- (.len (load text)) start)))
         (let [c (.c tl)
               stats (.stats tl)
@@ -2001,7 +2126,7 @@
 
 ;;; A machine-code function: its bytes, then a return unless it never returns.
 (defn tl-machine-code-func! [(tl (ptr Tl)) (p (ptr Pipe)) (fd (ptr Func)) (code MachineCodeBody)] (-> void)
-  (match (machine-code-target-error (.a tl) (.name fd) (.arch code) "aarch64")
+  (match (machine-code-target-error (.a tl) (.name fd) (.arch code) (if (.x64 tl) "x86_64" "aarch64"))
     (Some [message] (tl-fail (sconcat3 (.a tl) "codegen: " message " (checker bug)")))
     (None [] 0))
   (let [j (pipe-claim p)
@@ -2052,7 +2177,15 @@
         text (tasm/sect-buf ta tasm/SEC-TEXT)
         tconst (tasm/sect-buf ta tasm/SEC-CONST)
         textbuf (mobj-sect-buf (mut (.obj g)) (.text g))
+        ; x86-64: tpde aligns functions to 16 within its text
+        _ (when (.x64 tl) (b-align! (mut textbuf) 16) (mobj-sect-align-at-least! (mut (.obj g)) (.text g) 4))
         text-base (len (load textbuf))]
+    ; x86-64 Mach-O addends are implicit: in the relocated field
+    (when (.x64 tl)
+      (for i (range 0 (len (.relocs (load ta))))
+        (let [r (get (.relocs (load ta)) i)]
+          (when (and (!= (.addend r) 0) (!= (.kind r) tasm/R-ABS64))
+            (tbuf/patch32! text (.off r) (primitive/cast u32 (.addend r)))))))
     (b-bytes! (mut textbuf) (tbuf/as-slice text))
     ; tpde's own constants go to the const section
     (let [cbuf (mobj-sect-buf (mut (.obj g)) (.constsec g))]
@@ -2087,8 +2220,11 @@
       (let [r (get (.relocs (load ta)) i)
             msym (get (.tsym-mobj tl) (i64-of (.sym r)))
             k (primitive/cast i64 (.kind r))
-            rtype (case k 0 (reloc-branch26) 1 (reloc-page21) 2 (reloc-pageoff12) 3 (reloc-got-load-page21) 4 (reloc-got-load-pageoff12) (reloc-unsigned))
-            pcrel (or (= k 0) (= k 1) (= k 3))
+            ; x86-64: X86_64_RELOC_BRANCH / SIGNED / GOT_LOAD / UNSIGNED
+            rtype (if (.x64 tl)
+                      (case k 7 2 6 1 8 3 0)
+                      (case k 0 (reloc-branch26) 1 (reloc-page21) 2 (reloc-pageoff12) 3 (reloc-got-load-page21) 4 (reloc-got-load-pageoff12) (reloc-unsigned)))
+            pcrel (if (.x64 tl) (!= k 5) (or (= k 0) (= k 1) (= k 3)))
             ln (if (= k 5) 3 2)]
         (when (!= (.sect r) tasm/SEC-TEXT) (tl-fail "tpde: relocation outside the text section"))
         (mobj-add-reloc! (mut (.obj g)) (.text g) (+ text-base (.off r)) msym rtype pcrel ln)))))
@@ -2171,8 +2307,10 @@
         tap (cast (ptr tasm/Asm) (mut ta))
         (mut fn) (cir/Func::new)
         fnp (cast (ptr cir/Func) (mut fn))
-        (mut c) (tcore/Compiler::new [cir/Func] fnp tap tcore/ARCH-A64)
+        x64 (= (target-arch-str) "x86_64")
+        (mut c) (tcore/Compiler::new [cir/Func] fnp tap (if x64 tcore/ARCH-X64 tcore/ARCH-A64))
         (mut tl) (zeroed Tl)]
+    (set! (.x64 tl) x64)
     (set! (.g tl) g)
     (set! (.a tl) a)
     (set! (.f tl) fnp)
@@ -2212,7 +2350,7 @@
         (for i (range 0 (len (load fs)))
           (let [fd (al-at [Func] fs i)]
             (unless (.declared fd)
-              (if (and (>= i lo) (< i hi))
+              (if (or (.x64 tlp) (and (>= i lo) (< i hi)))
                   (do (when names? (eprintln "tpde[{}] {}" i (.name fd)))
                       (match (func-machine-code fd)
                         (Some [code] (tl-machine-code-func! tlp pp fd code))
@@ -2236,7 +2374,7 @@
 (defn cgtpde-build-object [(a (dyn Allocator)) (mp (ptr Program)) (objpath (ptr i8))] (-> i64)
   (let [(mut o) (cgtpde-build-mobj a mp)
         t0 (ticks)
-        bytes (macho-write (mut o))
+        bytes (if (= (target-arch-str) "x86_64") (macho-write-x64 (mut o)) (macho-write (mut o)))
         t1 (ticks)
         fd (fs/create-file objpath 420)]
     (set! (cga64-last-needs-curl-cell)
