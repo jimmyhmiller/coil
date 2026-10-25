@@ -6189,6 +6189,155 @@ equal:
       (close! work)
       module)))
 
+;;; One partition of a program lowered into several modules, each in a context
+;;; of its own. Its session stays open from codegen-partition-open to
+;;; codegen-partition-finish!, so bodies can be added to it in stages.
+;;; `open_functions` and `open_globals` are what the session had already defined
+;;; before any body was lowered: every partition's session defines those same
+;;; statics and export thunks. `copies` names what codegen-partition-import! made
+;;; this partition depend on another partition to define.
+(defstruct CgPartition
+  [(session (ptr CodegenSession))
+   (work (ptr scratch/ScratchArena))
+   (module (ptr i8))
+   (open_functions (ArrayList (ptr i8)))
+   (open_globals (ArrayList (ptr i8)))
+   (copies (ArrayList (slice u8)))])
+
+;;; Open a session that declares the whole program, as codegen-module's does, so
+;;; a body lowered into it may call or take the address of any function. `a`
+;;; holds the partition's lists; the session's tables live in its own arena.
+(defn codegen-partition-open [(a (dyn Allocator))
+                              (p (ptr Program))
+                              (triple-override (ptr i8))
+                              (sanitizer i64)
+                              (debug-checks bool)] (-> CgPartition)
+  (let [work (box! a scratch/ScratchArena (zeroed scratch/ScratchArena))]
+    (scratch/ScratchArena::init-with-capacity work
+      (retained-heap/compiler-scratch-parent) 65536)
+    (let [session (codegen-session-open (allocator work) p triple-override sanitizer debug-checks)
+          module (.module (.cg session))
+          (mut open-functions) (ArrayList::new [(ptr i8)] a)
+          (mut open-globals) (ArrayList::new [(ptr i8)] a)]
+      (let [(mut fn) (LLVMGetFirstFunction module)]
+        (loop (if (= (primitive/cast i64 (load fn)) 0)
+                  (break)
+                  (do
+                    (when (= (LLVMIsDeclaration (load fn)) (: 0 i32))
+                      (push! (mut open-functions) (load fn)))
+                    (set! fn (LLVMGetNextFunction (load fn)))))))
+      (let [(mut global) (LLVMGetFirstGlobal module)]
+        (loop (if (= (primitive/cast i64 (load global)) 0)
+                  (break)
+                  (do
+                    (when (= (LLVMIsDeclaration (load global)) (: 0 i32))
+                      (push! (mut open-globals) (load global)))
+                    (set! global (LLVMGetNextGlobal (load global)))))))
+      (CgPartition
+        :session session
+        :work work
+        :module module
+        :open_functions (load open-functions)
+        :open_globals (load open-globals)
+        :copies (ArrayList::new [(slice u8)] a)))))
+
+;;; Lower the bodies of `which` (indices into the program's functions), the
+;;; functions this partition defines.
+(defn codegen-partition-lower! [(part (ptr CgPartition))
+                                (p (ptr Program))
+                                (which (slice i64))] (-> i64)
+  (let [cg (.cg (.session part))
+        fs (load (field p funcs))]
+    (for [k 0 (len which)]
+      (let [i (get which k)
+            fp (elem fs i)
+            fname (.name fp)
+            function (cg-func cg fname)]
+        (cg-at! (.source fp) (.lo fp) (.hi fp) 0)
+        (unless (.declared fp)
+          (cg-emit-func-body cg fp function (cg-shim-find cg fname)))
+        0))
+    (cg-site-clear!)
+    0))
+
+;;; Whether a function another partition defines may also be lowered here, as an
+;;; `available_externally` copy its callers can inline: an ordinary Coil body.
+(defn cg-importable? [(cg (ptr Cg)) (f (ptr Func)) (function (ptr i8))] (-> bool)
+  (and (not (.declared f))
+       (and (= (primitive/cast i64 (cg-shim-find cg (.name f))) 0)
+            (and (match (func-machine-code f) (Some [_] false) (None [] true))
+                 (!= function (.reset_func cg))))))
+
+;;; Give this partition a copy of every function another partition defines that
+;;; it calls or references and that is small -- `weights` at most `limit`, a
+;;; weight per function the caller chooses -- or always inlined, and so on for what the copies
+;;; reference. A whole-program inliner would have inlined such a callee across the
+;;; boundary; the copy lets this partition's own inliner do it. The copy is
+;;; `available_externally`: the owner's definition is the one that is linked, and
+;;; LLVM drops the copy once its calls are inlined. A state cell the copied body
+;;; makes is the owner's cell, so the copy only declares it.
+(defn codegen-partition-import! [(part (ptr CgPartition))
+                                 (p (ptr Program))
+                                 (owner (slice i64))
+                                 (partition i64)
+                                 (weights (slice i64))
+                                 (limit i64)] (-> i64)
+  (let [cg (.cg (.session part))
+        a (.a cg)
+        module (.module part)
+        fs (load (field p funcs))
+        n (len (load fs))
+        before (LLVMGetLastGlobal module)
+        (mut imported) (ArrayList::new [bool] a)
+        (mut added) 1]
+    (for [i 0 n] (push! (mut imported) false))
+    (loop (if (= (load added) 0)
+              (break)
+              (do
+                (set! added 0)
+                (for [i 0 n]
+                  (let [fp (elem fs i)]
+                    (when (and (!= (get owner i) partition)
+                               (and (>= (get owner i) 0)
+                                    (not (get (load imported) i))))
+                      (let [function (cg-func cg (.name fp))]
+                        (when (and (!= (primitive/cast i64 function) 0)
+                                   (and (!= (LLVMIsDeclaration function) (: 0 i32))
+                                        (and (!= (primitive/cast i64 (LLVMGetFirstUse function)) 0)
+                                             (and (or (<= (get weights i) limit)
+                                                      (func-inline-always? fp))
+                                                  (cg-importable? cg fp function)))))
+                          (set! (mut imported) i true)
+                          (cg-at! (.source fp) (.lo fp) (.hi fp) 0)
+                          (cg-emit-func-body cg fp function (primitive/cast (ptr CgShim) 0))
+                          (LLVMSetLinkage function (: 1 i32))  ; available_externally
+                          (push! (mut (.copies part)) (from-cstr (LLVMGetValueName function)))
+                          (set! added (+ (load added) 1))
+                          0))
+                      0)
+                    0)))))
+    (cg-site-clear!)
+    (let [(mut global) (if (= (primitive/cast i64 before) 0)
+                           (LLVMGetFirstGlobal module)
+                           (LLVMGetNextGlobal before))]
+      (loop (if (= (primitive/cast i64 (load global)) 0)
+                (break)
+                (do
+                  (when (and (= (LLVMIsGlobalConstant (load global)) (: 0 i32))
+                             (!= (primitive/cast i64 (LLVMGetInitializer (load global))) 0))
+                    (LLVMSetInitializer (load global) (primitive/cast (ptr i8) 0))
+                    (LLVMSetLinkage (load global) (: 0 i32))
+                    (push! (mut (.copies part)) (from-cstr (LLVMGetValueName (load global))))
+                    0)
+                  (set! global (LLVMGetNextGlobal (load global)))))))
+    0))
+
+;;; Close the partition's session; its module is then complete.
+(defn codegen-partition-finish! [(part (ptr CgPartition))] (-> i64)
+  (codegen-session-finish! (.session part))
+  (close! (.work part))
+  0)
+
 ; A module returned by codegen-module exclusively owns its fresh context.
 ; Execution-engine callers transfer this ownership into their generation;
 ; object/inspection callers release it immediately after consuming the module.
