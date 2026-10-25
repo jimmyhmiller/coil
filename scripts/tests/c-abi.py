@@ -67,6 +67,12 @@ def main() -> int:
             libs[native] = work / f"lib-{native}.o"
             run([coil, "emit-obj", FIXTURE / "lib.coil", "--backend", native, "-o", libs[native]],
                 f"emit lib.coil ({native})")
+        # the tpde backend targets arm64 Mach-O
+        tpde = native == "arm64"
+        if tpde:
+            libs["tpde"] = work / "lib-tpde.o"
+            run([coil, "emit-obj", FIXTURE / "lib.coil", "--backend", "tpde", "-o", libs["tpde"]],
+                "emit lib.coil (tpde)")
 
         variants = [("llvm -O0", ["-O0"], "llvm"),
                     ("llvm -O2 + ASan", ["-O2", "--sanitize=address"], "llvm")]
@@ -76,6 +82,10 @@ def main() -> int:
                          (f"llvm program + {native} lib", ["-O2"], native)]
         else:
             print("note: no native backend runs on this host; native and cross-backend variants skipped")
+        if tpde:
+            variants += [("tpde", ["--backend", "tpde"], "tpde"),
+                         ("tpde program + llvm lib", ["--backend", "tpde"], "llvm"),
+                         ("llvm program + tpde lib", ["-O2"], "tpde")]
         for index, (label, flags, lib) in enumerate(variants):
             executable = work / f"abi-{index}"
             run([coil, "build", FIXTURE / "abi.coil", *flags, "--link-flag", c_object,

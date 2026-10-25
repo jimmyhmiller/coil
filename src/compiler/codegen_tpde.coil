@@ -43,6 +43,8 @@
 (import "coil.compiler.float_math" :use *)
 (import "coil.compiler.trace" :as tr)
 (import "coil.compiler.codegen_tpde_ir" :as tir)
+(import "coil.atomic" :as atomic)
+(import "coil.thread" :use [Thread ThreadConfig])
 (import "coil.cc" :as cc)
 (import "tpde.cir" :as cir)
 (import "tpde.cir.adaptor")
@@ -55,6 +57,8 @@
 (extern cgtpde.write :as "write" [i32 (ptr i8) isize] (-> isize))
 (extern cgtpde.getenv :as "getenv" [(ptr i8)] (-> (ptr i8)))
 (extern cgtpde.atol :as "atol" [(ptr i8)] (-> i64))
+(extern cgtpde.ticks :as "mach_absolute_time" [] (-> u64))
+(defn ticks [] (-> i64) (primitive/cast i64 (cgtpde.ticks)))
 
 ;;; COIL_TPDE_BISECT=LO:HI compiles only functions LO <= index < HI with tpde
 ;;; and the rest with codegen_a64, in one object: a debugging aid for finding a
@@ -86,6 +90,12 @@
    (resty Type)
    (has-res bool)])
 
+(defstruct PBind [(name (slice u8)) (key u64)])
+
+;;; A slot of the promotion table: EAlloc node -> escaped. Slots of another
+;;; function's generation are empty, so starting a function clears nothing.
+(defstruct AllocSlot [(key u64) (escaped bool) (gen u32)])
+
 (defstruct Tl
   [(g (ptr Cga))
    (a (dyn Allocator))
@@ -95,7 +105,9 @@
    (env (ArrayList TBind))
    (loops (ArrayList TLoop))
    ; EAlloc node address -> the slot escapes (false: promotable)
-   (allocs (HashMap u64 bool))
+   (allocs (ArrayList AllocSlot))
+   (alloc-gen u32)
+   (alloc-count i64)
    ; MObj symbol -> tpde symbol (NONE until mirrored)
    (sym-map (ArrayList u32))
    (tsym-mobj (ArrayList i64))
@@ -108,7 +120,31 @@
    (inline-depth i64)
    (selfname (slice u8))
    ; compiled functions: (MObj symbol, tpde symbol)
-   (defined (ArrayList i64))])
+   (defined (ArrayList i64))
+   ; reused operand lists of tl-emit-call and tl-runtime-call (cir/call!
+   ; copies them; a list per call was most of the lowering's allocation)
+   (call-args (ArrayList u32))
+   (call-flags (ArrayList u32))
+   (call-rts (ArrayList u8))
+   (rt-args (ArrayList u32))
+   (rt-flags (ArrayList u32))
+   (rt-rts (ArrayList u8))
+   ; the promotion scan's scope stack
+   (penv (ArrayList PBind))
+   (prof-repeat i64)  ; COIL_TPDE_PROFILE_REPEAT: extra compiles per function
+   (prof-lower-repeat i64)  ; COIL_TPDE_PROFILE_LOWER: extra lowerings per function
+   ; tl-abi-info's memo, by struct index
+   (abi-cache (ArrayList AbiInfo))
+   (abi-known (ArrayList bool))
+   (stats bool)  ; COIL_TPDE_STATS: count and time the phases
+   (stat-funcs i64)
+   (stat-vals i64)
+   (stat-insts i64)
+   (stat-blocks i64)
+   (stat-ops i64)
+   (stat-cand i64)
+   (t-lower i64)
+   (t-compile i64)])
 
 (defn tl-fail [(msg (slice u8))] (-> never)
   (cga-fail msg)
@@ -329,17 +365,44 @@
           (set! (mut (.tsym-mobj tl)) (i64-of t) m)
           t))))
 
+;;; codegen_a64's ABI classification, remembered per struct: a struct's class
+;;; walks its fields, and the same few structs are passed at most calls.
+(defn tl-abi-info [(tl (ptr Tl)) (t (ptr Type))] (-> AbiInfo)
+  (match (load t)
+    (TStruct [nm]
+             (let [si (g-struct-idx (.g tl) nm)]
+               (if (< si 0)
+                   (g-abi-info (.g tl) t)
+                   (do
+                     (when (>= si (len (.abi-known tl)))
+                       (extend-zeroed! (mut (.abi-known tl)) (- (+ si 1) (len (.abi-known tl))))
+                       (extend-zeroed! (mut (.abi-cache tl)) (- (+ si 1) (len (.abi-cache tl)))))
+                     (if (get (.abi-known tl) si)
+                         (get (.abi-cache tl) si)
+                         (let [info (g-abi-info (.g tl) t)]
+                           (set! (mut (.abi-cache tl)) si info)
+                           (set! (mut (.abi-known tl)) si true)
+                           info))))))
+    (_ (g-abi-info (.g tl) t))))
+
 ; ============================ scopes =========================================
 
 (defn bind! [(tl (ptr Tl)) (name (slice u8)) (tv TV)] (-> void)
   (push! (mut (.env tl)) (TBind :name name :tv tv)))
+
+;;; Name equality, rejecting on the length and first byte before comparing.
+(defn name= [(a (slice u8)) (b (slice u8))] (-> bool)
+  (let [n (len a)]
+    (and (= n (len b))
+         (or (= n 0)
+             (and (= (get a 0) (get b 0)) (= a b))))))
 
 (defn lookup [(tl (ptr Tl)) (name (slice u8))] (-> (Option TV))
   (let [(mut i) (- (len (.env tl)) 1)]
     (block :found
       (while (>= i 0)
         (let [b (al-at [TBind] (field tl env) i)]
-          (when (= (.name b) name) (return-from :found (Some (.tv b)))))
+          (when (name= (.name b) name) (return-from :found (Some (.tv b)))))
         (set! i (- i 1)))
       (None))))
 
@@ -351,20 +414,72 @@
 ; through `(do (init-store (var S) v) (var S))`. Any use of its name other than
 ; as the address of a load or store escapes it.
 
-(defstruct PBind [(name (slice u8)) (key u64)])
+
+;; ---- the promotion table ----
+
+(defn allocs-home [(tl (ptr Tl)) (k u64)] (-> i64)
+  (& (primitive/cast i64 (>> (* k (: 0x9E3779B97F4A7C15 u64)) (: 32 u64))) (- (len (.allocs tl)) 1)))
+
+;;; 1 escaped, 0 promotable, -1 never seen in this function.
+(defn allocs-get [(tl (ptr Tl)) (k u64)] (-> i64)
+  (if (= (len (.allocs tl)) 0)
+      -1
+      (let [gen (.alloc-gen tl)
+            mask (- (len (.allocs tl)) 1)
+            (mut i) (allocs-home tl k)]
+        (block :found
+          (while (= (.gen (get (.allocs tl) i)) gen)
+            (let [sl (get (.allocs tl) i)]
+              (when (= (.key sl) k) (return-from :found (if (.escaped sl) 1 0))))
+            (set! i (& (+ i 1) mask)))
+          -1))))
+
+(defn allocs-put! [(tl (ptr Tl)) (k u64) (escaped bool)] (-> void)
+  (let [gen (.alloc-gen tl)
+        mask (- (len (.allocs tl)) 1)
+        (mut i) (allocs-home tl k)]
+    (while (and (= (.gen (get (.allocs tl) i)) gen) (!= (.key (get (.allocs tl) i)) k))
+      (set! i (& (+ i 1) mask)))
+    (let [sl (elem (mut (.allocs tl)) i)]
+      (when (!= (.gen sl) gen) (set! (.alloc-count tl) (+ (.alloc-count tl) 1)))
+      (set! (.key sl) k)
+      (set! (.escaped sl) escaped)
+      (set! (.gen sl) gen))))
+
+(defn allocs-set! [(tl (ptr Tl)) (k u64) (escaped bool)] (-> void)
+  (when (>= (* (+ (.alloc-count tl) 1) 2) (len (.allocs tl)))
+    (let [gen (.alloc-gen tl)
+          old (len (.allocs tl))
+          (mut live) (ArrayList::new [AllocSlot] (.a tl))]
+      (for i (range 0 old)
+        (let [sl (get (.allocs tl) i)] (when (= (.gen sl) gen) (push! (mut live) sl))))
+      (extend-zeroed! (mut (.allocs tl)) (if (= old 0) 64 old))
+      (for i (range 0 (len (.allocs tl))) (set! (.gen (elem (mut (.allocs tl)) i)) (: 0 u32)))
+      (set! (.alloc-count tl) 0)
+      (for i (range 0 (len live))
+        (let [sl (get live i)] (allocs-put! tl (.key sl) (.escaped sl))))))
+  (allocs-put! tl k escaped))
+
+;;; Forget the previous function's promotion decisions.
+(defn allocs-reset! [(tl (ptr Tl))] (-> void)
+  (set! (.alloc-count tl) 0)
+  (set! (.alloc-gen tl) (+ (.alloc-gen tl) (: 1 u32)))
+  (when (= (.alloc-gen tl) (: 0 u32))
+    (for i (range 0 (len (.allocs tl))) (set! (.gen (elem (mut (.allocs tl)) i)) (: 0 u32)))
+    (set! (.alloc-gen tl) (: 1 u32))))
 
 (defn scan-lookup [(env (ptr (ArrayList PBind))) (name (slice u8))] (-> u64)
   (let [(mut i) (- (len (load env)) 1)]
     (block :found
       (while (>= i 0)
         (let [b (get (load env) i)]
-          (when (= (.name b) name) (return-from :found (.key b))))
+          (when (name= (.name b) name) (return-from :found (.key b))))
         (set! i (- i 1)))
       (: 0 u64))))
 
 (defn scan-escape! [(tl (ptr Tl)) (env (ptr (ArrayList PBind))) (name (slice u8))] (-> void)
   (let [k (scan-lookup env name)]
-    (when (!= k (: 0 u64)) (set! (mut (.allocs tl)) k true))))
+    (when (!= k (: 0 u64)) (allocs-set! tl k true))))
 
 ;; The candidate a binding's value makes the name stand for, or 0.
 (defn scan-bind-key [(tl (ptr Tl)) (env (ptr (ArrayList PBind))) (e (ptr Expr))] (-> u64)
@@ -372,7 +487,7 @@
     (EAlloc [storage t _init _sym]
             (if (and (or (= storage 0) (= storage 3)) (let [(mut tt) t] (tl-scalar? (mut tt))))
                 (let [k (primitive/cast u64 e)]
-                  (unless (contains? (.allocs tl) k) (set! (mut (.allocs tl)) k false))
+                  (when (< (allocs-get tl k) 0) (allocs-set! tl k false))
                   k)
                 (: 0 u64)))
     (EDo [body]
@@ -408,27 +523,16 @@
     (ELoad [inner] (scan-addr! tl env inner))
     (EStore [p v] (do (scan-addr! tl env p) (scan! tl env v)))
     (EInitStore [p v] (do (scan-addr! tl env p) (scan! tl env v)))
-    (ELet [binds body]
-          (let [mark (len (load env))]
-            (for i (range 0 (len (load binds)))
-              (let [b (al-at [Bind] binds i)
-                    v (field b value)
-                    alias-do (match (.kind v) (EDo [_] true) (_ false))]
-                (if alias-do
-                    (match (.kind v) (EDo [body] (scan-do-body! tl env body)) (_ 0))
-                    (scan! tl env v))
-                (let [k (if (.mutable b) (: 0 u64) (scan-bind-key tl env v))]
-                  (push! env (PBind :name (.name b) :key k)))))
-            (scan-list! tl env body)
-            (set! (.len env) mark)))
+    (ELet [binds body] (scan-let! tl env binds body 0))
     (EMatch [scrut arms]
             (do (scan! tl env scrut)
                 (for i (range 0 (len (load arms)))
                   (let [arm (al-at [Arm] arms i)
                         mark (len (load env))
                         binds (load (field arm binds))]
-                    (for j (range 0 (len (load binds)))
-                      (push! env (PBind :name (get (load binds) j) :key (: 0 u64))))
+                    (when (> mark 0)
+                      (for j (range 0 (len (load binds)))
+                        (push! env (PBind :name (get (load binds) j) :key (: 0 u64)))))
                     (scan! tl env (field arm body))
                     (set! (.len env) mark)))
                 0))
@@ -462,10 +566,50 @@
     (EAlloc [_ _ init _] (if (!= (primitive/cast i64 init) 0) (scan! tl env init) 0))
     (_ 0)))
 
+(defn scan-let! [(tl (ptr Tl)) (env (ptr (ArrayList PBind))) (binds (ptr (ArrayList Bind))) (body (ptr (ArrayList Expr))) (start i64)] (-> void)
+  (let [mark (len (load env))]
+    (for i (range start (len (load binds)))
+      (let [b (al-at [Bind] binds i)
+            v (field b value)
+            alias-do (match (.kind v) (EDo [_] true) (_ false))]
+        (if alias-do
+            (match (.kind v) (EDo [body] (scan-do-body! tl env body)) (_ 0))
+            (scan! tl env v))
+        (let [k (if (.mutable b) (: 0 u64) (scan-bind-key tl env v))]
+          ; env holds nothing until the first candidate: only a name
+          ; shadowing one needs recording
+          (when (or (!= k (: 0 u64)) (> (len (load env)) 0))
+            (push! env (PBind :name (.name b) :key k))))))
+    (scan-list! tl env body)
+    (set! (.len env) mark)))
+
+;;; Whether `e` is an EAlloc a let could promote that no scan has seen yet.
+(defn fresh-candidate? [(tl (ptr Tl)) (e (ptr Expr))] (-> bool)
+  (match (.kind e)
+    (EAlloc [storage t _init _sym]
+            (and (or (= storage 0) (= storage 3))
+                 (< (allocs-get tl (primitive/cast u64 e)) 0)
+                 (let [(mut tt) t] (tl-scalar? (mut tt)))))
+    (_ false)))
+
+;;; The promotion scan runs lazily, from the first let that binds a candidate,
+;;; over that let's scope: a name is visible only there, so its escapes are too.
+;;; The scan also decides every candidate nested in the scope, so a nested let
+;;; finds its candidates seen and scans nothing. Functions without candidates
+;;; (four in five in the compiler) are not scanned at all.
+(defn scan-let-lazily! [(tl (ptr Tl)) (binds (ptr (ArrayList Bind))) (body (ptr (ArrayList Expr)))] (-> void)
+  (let [n (len (load binds))]
+    (block :found
+      (for i (range 0 n)
+        (let [b (al-at [Bind] binds i)]
+          (when (and (not (.mutable b)) (fresh-candidate? tl (field b value)))
+            (clear! (mut (.penv tl)))
+            (scan-let! tl (cast (ptr (ArrayList PBind)) (mut (.penv tl))) binds body i)
+            (return-from :found 0))))
+      0)))
+
 (defn promotable? [(tl (ptr Tl)) (e (ptr Expr))] (-> bool)
-  (match (get (.allocs tl) (primitive/cast u64 e))
-    (Some [escaped] (not escaped))
-    (None [] false)))
+  (= (allocs-get tl (primitive/cast u64 e)) 0))
 
 ; ============================ expressions ====================================
 
@@ -510,6 +654,7 @@
       (_ (tl-expr-rest tl e)))))
 
 (defn tl-let [(tl (ptr Tl)) (binds (ptr (ArrayList Bind))) (body (ptr (ArrayList Expr))) (tail bool)] (-> TV)
+  (scan-let-lazily! tl binds body)
   (let [mark (scope-mark tl)]
     (block :binds
       (for i (range 0 (len (load binds)))
@@ -749,16 +894,16 @@
 ;;; A call to a C runtime function of one or two pointer/integer arguments.
 (defn tl-runtime-call [(tl (ptr Tl)) (name (slice u8)) (a0 u32) (a1 u32) (rty i64)] (-> u32)
   (let [sym (tl-sym tl (g-runtime-sym! (.g tl) name))
-        (mut args) (ArrayList::new [u32] (.a tl))
-        (mut flags) (ArrayList::new [u32] (.a tl))
-        (mut rts) (ArrayList::new [u8] (.a tl))]
-    (push! (mut args) a0)
-    (push! (mut flags) (: 0 u32))
-    (when (!= a1 (none32)) (push! (mut args) a1) (push! (mut flags) (: 0 u32)))
-    (when (!= rty cir/T-VOID) (push! (mut rts) (primitive/cast u8 rty)))
+        _ (clear! (mut (.rt-args tl)))
+        _ (clear! (mut (.rt-flags tl)))
+        _ (clear! (mut (.rt-rts tl)))]
+    (push! (mut (.rt-args tl)) a0)
+    (push! (mut (.rt-flags tl)) (: 0 u32))
+    (when (!= a1 (none32)) (push! (mut (.rt-args tl)) a1) (push! (mut (.rt-flags tl)) (: 0 u32)))
+    (when (!= rty cir/T-VOID) (push! (mut (.rt-rts tl)) (primitive/cast u8 rty)))
     (open! tl)
-    (cir/call! (.f tl) sym (none32) (cast (ptr (ArrayList u32)) (mut args)) (cast (ptr (ArrayList u32)) (mut flags))
-               (cast (ptr (ArrayList u8)) (mut rts)) false)))
+    (cir/call! (.f tl) sym (none32) (cast (ptr (ArrayList u32)) (mut (.rt-args tl))) (cast (ptr (ArrayList u32)) (mut (.rt-flags tl)))
+               (cast (ptr (ArrayList u8)) (mut (.rt-rts tl))) false)))
 
 ; ---- arithmetic ----
 
@@ -1337,16 +1482,29 @@
 (defn group-flags [(remaining i64)] (-> u32) (<< (u32-of remaining) (: 16 u32)))
 
 ;;; Lower one argument TV of type t to CIR arguments.
+;;; The C size of a narrow integer argument (Apple packs stack arguments at
+;;; it), and for a parameter (`incoming`) its signedness: one that arrives on
+;;; the stack is loaded extended from that size.
+(defn narrow-arg-flags [(tl (ptr Tl)) (t (ptr Type)) (incoming bool)] (-> u32)
+  (match (load t)
+    (TInt [bits sg]
+          (if (< bits 64)
+              (| (cir/af-size (tsize tl t))
+                 (if (and incoming sg) (u32-of (| cir/AF-SEXT bits)) (: 0 u32)))
+              (: 0 u32)))
+    (TBool [] (cir/af-size 1))
+    (_ (: 0 u32))))
+
 (defn lower-arg! [(tl (ptr Tl)) (args (mut (ArrayList u32))) (flags (mut (ArrayList u32))) (tv TV) (variadic bool)] (-> void)
   (let [g (.g tl)
         (mut t) (.ty tv)
-        info (g-abi-info g (mut t))
+        info (tl-abi-info tl (mut t))
         cls (abi-cls info)
         vf (if variadic cir/AF-VARIADIC (: 0 u32))]
     (cond
       (= cls 6) 0
       (or (= cls 0) (= cls 1))
-        (do (push-arg! tl (mut args) (mut flags) (scalar tl tv) vf) 0)
+        (do (push-arg! tl (mut args) (mut flags) (scalar tl tv) (| vf (narrow-arg-flags tl (mut t) false))) 0)
       (wide? (mut t)) (do (push-arg! tl (mut args) (mut flags) (scalar tl tv) vf) 0)
       (= cls 2)
         (do (push-arg! tl (mut args) (mut flags) (load-bytes tl (place tl tv) 0 (tsize tl (mut t))) vf) 0)
@@ -1396,32 +1554,32 @@
         nparams (len (load params))
         (mut rt) ret
         retvoid (ret-void? (mut rt))
-        retinfo (if retvoid (mk-abi-scalar) (g-abi-info g (mut rt)))
+        retinfo (if retvoid (mk-abi-scalar) (tl-abi-info tl (mut rt)))
         rcls (if retvoid -1 (abi-cls retinfo))
-        (mut args) (ArrayList::new [u32] a)
-        (mut flags) (ArrayList::new [u32] a)
-        (mut rts) (ArrayList::new [u8] a)
+        _ (clear! (mut (.call-args tl)))
+        _ (clear! (mut (.call-flags tl)))
+        _ (clear! (mut (.call-rts tl)))
         sret-slot (if (= rcls 4) (new-slot tl (mut rt)) (none32))]
     (when (= rcls 4)
-      (push-arg! tl (mut args) (mut flags) sret-slot cir/AF-SRET))
+      (push-arg! tl (mut (.call-args tl)) (mut (.call-flags tl)) sret-slot cir/AF-SRET))
     (for i (range 0 nargs)
       (let [tv0 (get (load tvs) i)
             tv (if (< i nparams) (by-value-arg tl (get (load params) i) tv0) tv0)]
-        (lower-arg! tl (mut args) (mut flags) tv (>= i nparams))))
+        (lower-arg! tl (mut (.call-args tl)) (mut (.call-flags tl)) tv (>= i nparams))))
     ; result types
     (cond
       (or retvoid (= rcls 4) (= rcls 6)) 0
-      (or (= rcls 0) (= rcls 1)) (push! (mut rts) (primitive/cast u8 (tl-cty (mut rt))))
-      (wide? (mut rt)) (push! (mut rts) (primitive/cast u8 cir/T-I128))
-      (= rcls 2) (push! (mut rts) (primitive/cast u8 cir/T-I64))
-      (= rcls 3) (do (push! (mut rts) (primitive/cast u8 cir/T-I64)) (push! (mut rts) (primitive/cast u8 cir/T-I64)))
+      (or (= rcls 0) (= rcls 1)) (push! (mut (.call-rts tl)) (primitive/cast u8 (tl-cty (mut rt))))
+      (wide? (mut rt)) (push! (mut (.call-rts tl)) (primitive/cast u8 cir/T-I128))
+      (= rcls 2) (push! (mut (.call-rts tl)) (primitive/cast u8 cir/T-I64))
+      (= rcls 3) (do (push! (mut (.call-rts tl)) (primitive/cast u8 cir/T-I64)) (push! (mut (.call-rts tl)) (primitive/cast u8 cir/T-I64)))
       (= rcls 5) (for j (range 0 (abi-hfa-n retinfo))
-                   (push! (mut rts) (primitive/cast u8 (if (= (abi-hfa-bits retinfo) 32) cir/T-F32 cir/T-F64))))
+                   (push! (mut (.call-rts tl)) (primitive/cast u8 (if (= (abi-hfa-bits retinfo) 32) cir/T-F32 cir/T-F64))))
       :else 0)
     (open! tl)
     (let [c (cir/call! (.f tl) (if (= sym (none32)) (none32) (tl-sym tl (i64-of sym))) fnp
-                       (cast (ptr (ArrayList u32)) (mut args)) (cast (ptr (ArrayList u32)) (mut flags))
-                       (cast (ptr (ArrayList u8)) (mut rts)) tail)]
+                       (cast (ptr (ArrayList u32)) (mut (.call-args tl))) (cast (ptr (ArrayList u32)) (mut (.call-flags tl)))
+                       (cast (ptr (ArrayList u8)) (mut (.call-rts tl))) tail)]
       (when tail (set! (.terminated tl) true))
       (cond
         tail (tv-none)
@@ -1478,6 +1636,7 @@
     (when (< si 0) (tl-fail (sconcat (.a tl) "call to unknown function: " func)))
     (let [sig (al-at [GSig] (field g sigs) si)
           (mut tvs) (ArrayList::new [TV] (.a tl))]
+      (reserve! (mut tvs) (len (load args)))
       (block :args
         (for i (range 0 (len (load args)))
           (push! (mut tvs) (tl-expr tl (elem args i)))
@@ -1537,7 +1696,7 @@
 ;;; The trampoline a :shim function with a Coil body is reached through: move
 ;;; the convention's registers into the C argument registers, call __impl, and
 ;;; move x0 into the convention's return register.
-(defn tl-shim-trampoline! [(tl (ptr Tl)) (sig (ptr GSig))] (-> void)
+(defn tl-shim-trampoline! [(tl (ptr Tl)) (sig (ptr GSig)) (impl-tsym u32) (tsym u32)] (-> void)
   (let [ta (.ta tl)
         text (tasm/sect-buf ta tasm/SEC-TEXT)
         start (.len (load text))
@@ -1549,16 +1708,13 @@
       (tbuf/emit32! text (enc/stp-x-pre (u32-of (get (load regs) j)) (: 31 u32) (: 31 u32) -16)))
     (for k (range 0 nr)
       (tbuf/emit32! text (enc/ldp-x-post (u32-of (- (- nr 1) k)) (: 31 u32) (: 31 u32) 16)))
-    (tasm/reloc! ta tasm/SEC-TEXT (.len (load text)) (tl-sym tl (.implsym sig)) tasm/R-BRANCH26 0)
+    (tasm/reloc! ta tasm/SEC-TEXT (.len (load text)) impl-tsym tasm/R-BRANCH26 0)
     (tbuf/emit32! text (enc/bl 0))
     (when (!= (.shimret sig) 0)
       (tbuf/emit32! text (enc/mov-reg true (u32-of (.shimret sig)) (: 0 u32))))
     (tbuf/emit32! text (enc/ldp-x-post (: 29 u32) (: 30 u32) (: 31 u32) 16))
     (tbuf/emit32! text (enc/ret))
-    (let [tsym (tl-sym tl (.symidx sig))]
-      (tasm/sym-def! ta tsym tasm/SEC-TEXT start (- (.len (load text)) start))
-      (push! (mut (.defined tl)) (.symidx sig))
-      (push! (mut (.defined tl)) (i64-of tsym)))))
+    (tasm/sym-def! ta tsym tasm/SEC-TEXT start (- (.len (load text)) start))))
 
 (defn tl-leaf-inline? [(tl (ptr Tl)) (sig (ptr GSig))] (-> bool)
   (let [fd (load (field sig func))]
@@ -1591,6 +1747,7 @@
     (match t
       (TFn [_cc params ret]
            (let [(mut tvs) (ArrayList::new [TV] (.a tl))]
+             (reserve! (mut tvs) (len (load args)))
              (for i (range 0 (len (load args)))
                (push! (mut tvs) (tl-expr tl (elem args i))))
              (tl-emit-call tl (none32) (scalar tl fptv) params false (load ret) (cast (ptr (ArrayList TV)) (mut tvs)) false)))
@@ -1608,13 +1765,13 @@
     (for i (range 0 (len (load ps)))
       (let [prm (elem ps i)
             t (field prm ty)
-            info (g-abi-info g t)
+            info (tl-abi-info tl t)
             cls (abi-cls info)]
         (cond
           (= cls 6) (bind! tl (.name prm) (tv-p (new-slot-bytes tl 1 1) (load t)))
           (wide? t) (bind! tl (.name prm) (tv-s (cir/arg! fp cir/T-I128 false) (load t)))
           (or (= cls 0) (= cls 1))
-            (let [v (cir/arg! fp (tl-cty t) false)]
+            (let [v (cir/arg-flagged! fp (tl-cty t) false (narrow-arg-flags tl t true))]
               ; C callers extend narrow arguments to 32 bits only
               (bind! tl (.name prm) (tv-s (canon tl v t) (load t))))
           (= cls 2)
@@ -1677,62 +1834,213 @@
     0))
 
 ;;; Lower and compile one Coil function.
-(defn tl-func! [(tl (ptr Tl)) (fd (ptr Func))] (-> void)
+(defn tl-sig [(tl (ptr Tl)) (fd (ptr Func))] (-> (ptr GSig))
   (let [g (.g tl)
-        fp (.f tl)
         si (g-sig-idx g (.name fd))]
     (when (< si 0) (tl-fail (sconcat (.a tl) "tpde: unregistered function " (.name fd))))
-    (let [sig (al-at [GSig] (field g sigs) si)]
-      (cir/reset! fp (.name fd))
-      (clear! (mut (.env tl)))
-      (clear! (mut (.loops tl)))
-      (clear! (mut (.allocs tl)))
-      (set! (.fd tl) fd)
-      (set! (.retty tl) (.ret fd))
-      (let [(mut rt) (.ret fd)]
-        (set! (.retinfo tl) (if (ret-void? (mut rt)) (mk-abi-scalar) (g-abi-info g (mut rt)))))
-      (set! (.sret tl) (none32))
-      (set! (.terminated tl) false)
-      (set! (.tailok tl) false)
-      (set! (.inline-depth tl) 0)
-      (set! (.selfname tl) (.name fd))
-      ; which stack slots become SSA variables
-      (let [(mut penv) (ArrayList::new [PBind] (.a tl))]
-        (scan-list! tl (cast (ptr (ArrayList PBind)) (mut penv)) (load (field fd body))))
-      (let [entry (cir/new-block! fp)]
-        (cir/set-block! fp entry)
-        (cir/seal! fp entry))
-      (tl-params! tl fd)
-      (let [r (tl-body-tail tl (load (field fd body)) true)]
-        (unless (.terminated tl) (tl-return! tl r)))
-      (when (not (cir/terminated? fp)) (cir/unreachable! fp))
-      (cir/finish! fp)
-      ; a :shim function's body is its __impl; the Coil name is the trampoline
-      (let [msym (if (.shim sig) (.implsym sig) (.symidx sig))
-            tsym (tl-sym tl msym)]
-        (unless (isel/compile! (.c tl) tsym)
-          (tl-fail (sconcat (.a tl) "tpde: failed to compile " (.name fd))))
-        (push! (mut (.defined tl)) msym)
-        (push! (mut (.defined tl)) (i64-of tsym)))
-      (when (.shim sig) (tl-shim-trampoline! tl sig)))))
+    (al-at [GSig] (field g sigs) si)))
+
+;;; Lower `fd` into the current CIR function, (.f tl).
+(defn tl-func-lower! [(tl (ptr Tl)) (fd (ptr Func))] (-> void)
+  (let [fp (.f tl)
+        stats (.stats tl)
+        t1 (if stats (ticks) 0)]
+    (for _ (range 0 (.prof-lower-repeat tl)) (tl-lower-func! tl fd))
+    (tl-lower-func! tl fd)
+    (cir/finish! fp)
+    (when stats
+      (set! (.t-lower tl) (+ (.t-lower tl) (- (ticks) t1)))
+      (set! (.stat-funcs tl) (+ (.stat-funcs tl) 1))
+      (set! (.stat-vals tl) (+ (.stat-vals tl) (len (.values (load fp)))))
+      (set! (.stat-insts tl) (+ (.stat-insts tl) (len (.insts (load fp)))))
+      (set! (.stat-blocks tl) (+ (.stat-blocks tl) (len (.blocks (load fp)))))
+      (set! (.stat-ops tl) (+ (.stat-ops tl) (len (.operands (load fp))))))))
+
+; ---- jobs ----
+; Lowering (AST to CIR) and compiling (CIR to machine code) are a pipeline: the
+; backend thread lowers function i+1 while a second thread compiles function
+; i. A job is everything the compiling side needs, so that it touches nothing
+; of the lowering side's: its CIR function, its tpde symbols (made by the
+; lowering side), and for a machine-code function the bytes. Jobs are compiled
+; in submission order, so the object is the same as compiling serially.
+
+(const JOB-COMPILE 0)
+(const JOB-MACHINE-CODE 1)
+(const JOB-STOP 2)
+
+(defstruct Job
+  [(kind i64)
+   (fd (ptr Func))
+   (fp (ptr cir/Func))
+   (sig (ptr GSig))
+   ; the symbol the code defines; a :shim function's body is its __impl and
+   ; `tramp` the Coil name, its trampoline (else NONE)
+   (tsym u32)
+   (tramp u32)
+   (code MachineCodeBody)
+   ; 1 from submission until the compiling side is done with it
+   (state i64)])
+
+(defn job-run! [(tl (ptr Tl)) (j (ptr Job))] (-> void)
+  (let [ta (.ta tl)]
+    (if (= (.kind j) JOB-MACHINE-CODE)
+        (let [text (tasm/sect-buf ta tasm/SEC-TEXT)
+              start (.len (load text))
+              bytes (load (.bytes (.code j)))]
+          (for i (range 0 (len bytes)) (tbuf/emit8! text (get bytes i)))
+          (when (func-machine-code-returns? (.fd j)) (tbuf/emit32! text (: 0xD65F03C0 u32)))
+          (tasm/sym-def! ta (.tsym j) tasm/SEC-TEXT start (- (.len (load text)) start)))
+        (let [c (.c tl)
+              stats (.stats tl)
+              t3 (if stats (ticks) 0)]
+          (tcore/set-adaptor! c (.fp j))
+          (for _ (range 0 (.prof-repeat tl)) (isel/compile! c (.tsym j)))
+          (unless (isel/compile! c (.tsym j))
+            (tl-fail (sconcat (malloc-allocator) "tpde: failed to compile " (.name (.fd j)))))
+          (when stats (set! (.t-compile tl) (+ (.t-compile tl) (- (ticks) t3))))
+          (when (!= (.tramp j) (none32)) (tl-shim-trampoline! tl (.sig j) (.tsym j) (.tramp j)))))))
+
+;;; The ring of jobs between the two sides. A slot's `state` is 1 from
+;;; submission until the compiling side is done with it; both sides spin on it
+;;; (yielding when it takes a while) since each is busy nearly all the time
+;;; and a wakeup per function cost more than the overlap gained.
+(defstruct Pipe
+  [(tl (ptr Tl))
+   (jobs (ArrayList Job))
+   ; next slot the lowering side fills, and the compiling side takes
+   (head i64)
+   (tail i64)
+   (threaded bool)
+   (thread Thread)])
+
+(extern cgtpde.sched-yield :as "sched_yield" [] (-> i32))
+
+(defn pipe-slot [(p (ptr Pipe)) (i i64)] (-> (ptr Job)) (elem (mut (.jobs p)) i))
+
+;;; Wait until the slot's state is `want`.
+(defn job-await [(j (ptr Job)) (want i64)] (-> void)
+  (let [(mut spins) 0]
+    (while (!= (atomic/read (field j state)) want)
+      (set! spins (+ spins 1))
+      (when (> spins 64) (cgtpde.sched-yield)))))
+
+(defn compile-thread-entry [(arg (ptr i8))] (-> (ptr i8))
+  (let [p (primitive/cast (ptr Pipe) arg)
+        n (len (.jobs p))]
+    (block :done
+      (loop
+        (let [j (pipe-slot p (.tail p))]
+          (job-await j 1)
+          (when (= (.kind j) JOB-STOP) (return-from :done 0))
+          (job-run! (.tl p) j)
+          (atomic/store (field j state) 0)
+          (set! (.tail p) (% (+ (.tail p) 1) n)))))
+    (primitive/cast (ptr i8) 0)))
+
+;;; The slot the next job goes in, once the compiling side is done with it.
+(defn pipe-claim [(p (ptr Pipe))] (-> (ptr Job))
+  (let [j (pipe-slot p (.head p))]
+    (when (.threaded p) (job-await j 0))
+    j))
+
+;;; Hand the claimed slot over (or, serially, run it now).
+(defn pipe-submit! [(p (ptr Pipe)) (j (ptr Job))] (-> void)
+  (if (.threaded p)
+      (atomic/store (field j state) 1)
+      (job-run! (.tl p) j))
+  (set! (.head p) (% (+ (.head p) 1) (len (.jobs p)))))
+
+(defn pipe-start! [(p (ptr Pipe)) (tl (ptr Tl)) (threaded bool)] (-> void)
+  (set! (.tl p) tl)
+  (set! (.head p) 0)
+  (set! (.tail p) 0)
+  (set! (.threaded p) false)
+  (set! (.jobs p) (ArrayList::new [Job] (.a tl)))
+  (for i (range 0 (if threaded 8 1))
+    (push! (mut (.jobs p))
+           (Job :kind JOB-COMPILE :fd (primitive/cast (ptr Func) 0)
+                :fp (if (= i 0) (.f tl) (box! (.a tl) cir/Func (cir/Func::new)))
+                :sig (primitive/cast (ptr GSig) 0) :tsym (none32) :tramp (none32)
+                :code (zeroed MachineCodeBody) :state 0)))
+  (when threaded
+    (tasm/share! (.ta tl))
+    (set! (.threaded p)
+          (= (Thread::spawn-configured (field p thread) (fnptr-of compile-thread-entry)
+                                       (primitive/cast (ptr i8) p) (ThreadConfig::new 67108864 -1))
+             (: 0 i32)))))
+
+(defn pipe-finish! [(p (ptr Pipe))] (-> void)
+  (when (.threaded p)
+    (let [j (pipe-claim p)]
+      (set! (.kind j) JOB-STOP)
+      (pipe-submit! p j))
+    (Thread::join (field p thread))
+    0))
+
+;;; Lower `fd` and queue it for compiling.
+(defn tl-func! [(tl (ptr Tl)) (p (ptr Pipe)) (fd (ptr Func))] (-> void)
+  (let [j (pipe-claim p)
+        sig (tl-sig tl fd)
+        msym (if (.shim sig) (.implsym sig) (.symidx sig))
+        tsym (tl-sym tl msym)]
+    (set! (.f tl) (.fp j))
+    (tl-func-lower! tl fd)
+    (push! (mut (.defined tl)) msym)
+    (push! (mut (.defined tl)) (i64-of tsym))
+    (set! (.kind j) JOB-COMPILE)
+    (set! (.fd j) fd)
+    (set! (.sig j) sig)
+    (set! (.tsym j) tsym)
+    (set! (.tramp j) (none32))
+    (when (.shim sig)
+      (let [tramp (tl-sym tl (.symidx sig))]
+        (set! (.tramp j) tramp)
+        (push! (mut (.defined tl)) (.symidx sig))
+        (push! (mut (.defined tl)) (i64-of tramp))))
+    (pipe-submit! p j)))
 
 ;;; A machine-code function: its bytes, then a return unless it never returns.
-(defn tl-machine-code-func! [(tl (ptr Tl)) (fd (ptr Func)) (code MachineCodeBody)] (-> void)
+(defn tl-machine-code-func! [(tl (ptr Tl)) (p (ptr Pipe)) (fd (ptr Func)) (code MachineCodeBody)] (-> void)
   (match (machine-code-target-error (.a tl) (.name fd) (.arch code) "aarch64")
     (Some [message] (tl-fail (sconcat3 (.a tl) "codegen: " message " (checker bug)")))
     (None [] 0))
+  (let [j (pipe-claim p)
+        sig (tl-sig tl fd)
+        tsym (tl-sym tl (.symidx sig))]
+    (push! (mut (.defined tl)) (.symidx sig))
+    (push! (mut (.defined tl)) (i64-of tsym))
+    (set! (.kind j) JOB-MACHINE-CODE)
+    (set! (.fd j) fd)
+    (set! (.sig j) sig)
+    (set! (.tsym j) tsym)
+    (set! (.tramp j) (none32))
+    (set! (.code j) code)
+    (pipe-submit! p j)))
+
+;;; Lower `fd`'s body to CIR (not yet finished).
+(defn tl-lower-func! [(tl (ptr Tl)) (fd (ptr Func))] (-> void)
   (let [g (.g tl)
-        si (g-sig-idx g (.name fd))
-        sig (al-at [GSig] (field g sigs) si)
-        text (tasm/sect-buf (.ta tl) tasm/SEC-TEXT)
-        start (.len (load text))
-        bytes (load (.bytes code))]
-    (for i (range 0 (len bytes)) (tbuf/emit8! text (get bytes i)))
-    (when (func-machine-code-returns? fd) (tbuf/emit32! text (: 0xD65F03C0 u32)))
-    (let [tsym (tl-sym tl (.symidx sig))]
-      (tasm/sym-def! (.ta tl) tsym tasm/SEC-TEXT start (- (.len (load text)) start))
-      (push! (mut (.defined tl)) (.symidx sig))
-      (push! (mut (.defined tl)) (i64-of tsym)))))
+        fp (.f tl)]
+    (cir/reset! fp (.name fd))
+    (clear! (mut (.env tl)))
+    (clear! (mut (.loops tl)))
+    (allocs-reset! tl)
+    (set! (.fd tl) fd)
+    (set! (.retty tl) (.ret fd))
+    (let [(mut rt) (.ret fd)]
+      (set! (.retinfo tl) (if (ret-void? (mut rt)) (mk-abi-scalar) (tl-abi-info tl (mut rt)))))
+    (set! (.sret tl) (none32))
+    (set! (.terminated tl) false)
+    (set! (.tailok tl) false)
+    (set! (.inline-depth tl) 0)
+    (set! (.selfname tl) (.name fd))
+    (let [entry (cir/new-block! fp)]
+      (cir/set-block! fp entry)
+      (cir/seal! fp entry))
+    (tl-params! tl fd)
+    (let [r (tl-body-tail tl (load (field fd body)) true)]
+      (unless (.terminated tl) (tl-return! tl r)))
+    (when (not (cir/terminated? fp)) (cir/unreachable! fp))))
 
 ; ============================ the module =====================================
 
@@ -1753,7 +2061,7 @@
       (let [const-base (len (load cbuf))]
         (b-bytes! (mut cbuf) (tbuf/as-slice tconst))
         ; map every tpde symbol to a MObj one
-        (for i (range 0 (len (.syms (load ta))))
+        (for i (range 0 (i64-of (tasm/sym-count ta)))
           (while (< (len (.tsym-mobj tl)) (+ i 1)) (push! (mut (.tsym-mobj tl)) -1))
           (when (< (get (.tsym-mobj tl) i) 0)
             (let [s (tasm/sym-at ta (u32-of i))]
@@ -1795,6 +2103,7 @@
     (set! (.program g) mp0)
     (set! (.sigs g) (ArrayList::new [GSig] a))
     (set! (.sig_index g) (HashMap::new [(slice u8) i64] a (keyops)))
+    (set! (.sig_memo g) (ArrayList::new [NameMemo] a))  ; unused until registration ends
     (set! (.unit_export_index g) (HashMap::new [(slice u8) bool] a (keyops-borrowed)))
     (set! (.export_symbol_index g) (HashMap::new [(slice u8) (slice u8)] a (keyops-borrowed)))
     (for [i 0 (len (load (.unit_exports mp0)))]
@@ -1809,6 +2118,7 @@
     (set! (.obj g) (mobj-new a))
     (set! (.asm g) (asm-new a))
     (set! (.strs g) (ArrayList::new [GStr] a))
+    (set! (.str_index g) (HashMap::new [(slice u8) i64] a (keyops)))
     (set! (.statics g) (ArrayList::new [GStatic] a))
     (set! (.nglob g) 0)
     (set! (.nstatic g) 0)
@@ -1846,13 +2156,17 @@
       (g-register-types! g mp)
       (g-eval-asserts! g mp)
       (g-register-sigs! g mp)
+      ; sig_index is final now: memoize its lookups from here on
+      (set! (.sig_memo g) (name-memo-new (.a g)))
       (g-declare-statics! g mp)
       (set! (.program g) mp)
       g)))
 
 (defn cgtpde-build-mobj [(a (dyn Allocator)) (mp (ptr Program))] (-> MObj)
   ; the module-level setup is codegen_a64's (signatures, statics, strings)
-  (let [g (tl-module-setup! a mp)
+  (let [t-setup0 (ticks)
+        g (tl-module-setup! a mp)
+        t-setup (- (ticks) t-setup0)
         (mut ta) (tasm/Asm::new)
         tap (cast (ptr tasm/Asm) (mut ta))
         (mut fn) (cir/Func::new)
@@ -1866,41 +2180,71 @@
     (set! (.ta tl) tap)
     (set! (.env tl) (ArrayList::new [TBind] a))
     (set! (.loops tl) (ArrayList::new [TLoop] a))
-    (set! (.allocs tl) (HashMap::new-scalar [u64 bool] a))
+    (set! (.allocs tl) (ArrayList::new [AllocSlot] a))
+    (set! (.alloc-gen tl) (: 1 u32))
     (set! (.sym-map tl) (ArrayList::new [u32] a))
     (set! (.tsym-mobj tl) (ArrayList::new [i64] a))
     (set! (.defined tl) (ArrayList::new [i64] a))
+    (set! (.call-args tl) (ArrayList::new [u32] a))
+    (set! (.penv tl) (ArrayList::new [PBind] a))
+    (set! (.abi-cache tl) (ArrayList::new [AbiInfo] a))
+    (set! (.abi-known tl) (ArrayList::new [bool] a))
+    (let [r (cgtpde.getenv c"COIL_TPDE_PROFILE_REPEAT")]
+      (set! (.prof-repeat tl) (if (= (primitive/cast i64 r) 0) 0 (cgtpde.atol r))))
+    (set! (.stats tl) (!= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_STATS")) 0))
+    (let [r (cgtpde.getenv c"COIL_TPDE_PROFILE_LOWER")]
+      (set! (.prof-lower-repeat tl) (if (= (primitive/cast i64 r) 0) 0 (cgtpde.atol r))))
+    (set! (.call-flags tl) (ArrayList::new [u32] a))
+    (set! (.call-rts tl) (ArrayList::new [u8] a))
+    (set! (.rt-args tl) (ArrayList::new [u32] a))
+    (set! (.rt-flags tl) (ArrayList::new [u32] a))
+    (set! (.rt-rts tl) (ArrayList::new [u8] a))
     (let [tlp (cast (ptr Tl) (mut tl))
+          (mut pipe) (zeroed Pipe)
+          pp (cast (ptr Pipe) (mut pipe))
           span (tr/span-begin "backend.tpde-functions")
           fs (load (field (.program g) funcs))]
+      (pipe-start! pp tlp (= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_SERIAL")) 0))
       (let [br (bisect-range)
             lo (get br 0)
-            hi (get br 1)]
+            hi (get br 1)
+            names? (!= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_NAMES")) 0)]
         (for i (range 0 (len (load fs)))
           (let [fd (al-at [Func] fs i)]
             (unless (.declared fd)
               (if (and (>= i lo) (< i hi))
-                  (match (func-machine-code fd)
-                    (_ (when (!= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_NAMES")) 0)
-                         (eprintln "tpde[{}] {}" i (.name fd)))
-                       (match (func-machine-code fd)
-                    (Some [code] (tl-machine-code-func! tlp fd code))
-                    (None [] (tl-func! tlp fd)))))
-                  (do (emit-func! g fd) 0))))))
+                  (do (when names? (eprintln "tpde[{}] {}" i (.name fd)))
+                      (match (func-machine-code fd)
+                        (Some [code] (tl-machine-code-func! tlp pp fd code))
+                        (None [] (tl-func! tlp pp fd))))
+                  (do (emit-func! g fd) 0)))))
+        (pipe-finish! pp))
       (tr/span-end span)
+      (when (!= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_STATS")) 0)
+        (eprintln "tpde: {} functions, {} values, {} insts, {} blocks, {} operands"
+                  (.stat-funcs tlp) (.stat-vals tlp) (.stat-insts tlp) (.stat-blocks tlp) (.stat-ops tlp))
+        ; mach ticks are 1/24 us on Apple silicon
+        (eprintln "tpde: lower {}us compile {}us" (/ (.t-lower tlp) 24) (/ (.t-compile tlp) 24)))
       ; codegen_a64's functions (bisection only) come first in the text
-      (b-bytes! (mut (mobj-sect-buf (mut (.obj g)) (.text g))) (slice (.buf (.asm g))))
-      (tl-merge! tlp))
+      (let [t-merge0 (ticks)]
+        (b-bytes! (mut (mobj-sect-buf (mut (.obj g)) (.text g))) (slice (.buf (.asm g))))
+        (tl-merge! tlp)
+        (when (!= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_STATS")) 0)
+          (eprintln "tpde: module setup {}us merge {}us" (/ t-setup 24) (/ (- (ticks) t-merge0) 24)))))
     (.obj g)))
 
 (defn cgtpde-build-object [(a (dyn Allocator)) (mp (ptr Program)) (objpath (ptr i8))] (-> i64)
   (let [(mut o) (cgtpde-build-mobj a mp)
+        t0 (ticks)
         bytes (macho-write (mut o))
+        t1 (ticks)
         fd (fs/create-file objpath 420)]
     (set! (cga64-last-needs-curl-cell)
           (mobj-references-undefined? (mut o) (cga64-probe-name a "_curl_easy_" "init")))
     (set! (cga64-last-needs-llvm-cell)
           (mobj-references-undefined? (mut o) (cga64-probe-name a "_LLVMGetDefault" "TargetTriple")))
+    (when (!= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_STATS")) 0)
+      (eprintln "tpde: macho-write {}us probes {}us" (/ (- t1 t0) 24) (/ (- (ticks) t1) 24)))
     (when (< fd 0) (cga-fail "cannot create object file"))
     (let [total (len (load bytes))
           (mut off) 0]
