@@ -1,0 +1,1727 @@
+; src/compiler/codegen_tpde.coil — the tpde backend: mono Program -> CIR -> tpde.
+;
+; Lowers the same monomorphized Program as codegen_a64.coil (whose lowering
+; decisions it mirrors: sum layout {i32 tag, payload at 8}, slices {ptr,i64},
+; AAPCS64 for every call) into CIR, the SSA IR of the tpde package
+; (~/Documents/Code/projects/coil-tpde), one function at a time, and compiles
+; each with tpde's single-pass register allocator into arm64 code.
+;
+; Values: a scalar (an integer up to 128 bits, float, bool or pointer) is an SSA
+; value, integers kept extended to 64 bits from their width (codegen_a64's
+; container invariant). An aggregate is a place: the address of private storage
+; (value semantics: loads and copies snapshot it).
+;
+; SSA construction is Braun et al.'s, on the fly: a stack slot the checker made
+; for a mutable local (`alloc stack`) whose address is only ever loaded from or
+; stored to becomes a CIR variable (`promotable-allocs!` decides before
+; lowering); the rest stay stack slots.
+;
+; Module data -- signatures, statics, strings, vtables -- is laid out by
+; codegen_a64's machinery into its MObj; tpde contributes the text section and
+; its relocations, merged into that MObj (`tl-merge!`) and written by macho.coil.
+(module coil.compiler.codegen_tpde)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.io" :use *)
+(import "coil.fs" :as fs)
+(import "coil.control" :use *)
+(import "coil.mem" :use *)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.parser" :use *)
+(import "coil.compiler.a64" :use [al-at b-align! b-bytes! b-u64! asm-new])
+(import "coil.compiler.dwarf" :use [DwTy DwFn DwVar DwLineEv])
+(import "coil.mem" :use [f64-bits])
+(import "coil.compiler.layoutdb" :use *)
+(import "coil.compiler.macho" :use *)
+(import "coil.compiler.codegen_a64" :use *)
+(import "coil.compiler.vector_scalar" :use *)
+(import "coil.compiler.float_math" :use *)
+(import "coil.compiler.trace" :as tr)
+(import "coil.compiler.codegen_tpde_ir" :as tir)
+(import "coil.cc" :as cc)
+(import "tpde.cir" :as cir)
+(import "tpde.cir.adaptor")
+(import "tpde.cir.a64" :as isel)
+(import "tpde.core" :as tcore)
+(import "tpde.asm" :as tasm)
+(import "tpde.buf" :as tbuf)
+
+(extern cgtpde.write :as "write" [i32 (ptr i8) isize] (-> isize))
+(extern cgtpde.close :as "close" [i32] (-> i32))
+
+; ============================ state ==========================================
+
+; kind: 0 scalar SSA value, 1 place (address of an aggregate), 2 nothing,
+; 3 a promoted slot: `v` is its CIR variable, `ty` the slot's element type
+(defstruct TV [(kind i64) (v u32) (ty Type)])
+
+(defstruct TBind [(name (slice u8)) (tv TV)])
+
+(defstruct TLoop
+  [(label (Option (slice u8)))
+   (head u32)
+   (exit u32)
+   (resvar u32)
+   (reskind i64)
+   (resty Type)
+   (has-res bool)])
+
+(defstruct Tl
+  [(g (ptr Cga))
+   (a (dyn Allocator))
+   (f (ptr cir/Func))
+   (c (ptr (tcore/Compiler cir/Func)))
+   (ta (ptr tasm/Asm))
+   (env (ArrayList TBind))
+   (loops (ArrayList TLoop))
+   ; EAlloc node address -> the slot escapes (false: promotable)
+   (allocs (HashMap u64 bool))
+   ; MObj symbol -> tpde symbol (NONE until mirrored)
+   (sym-map (ArrayList u32))
+   (tsym-mobj (ArrayList i64))
+   (fd (ptr Func))
+   (retty Type)
+   (retinfo AbiInfo)
+   (sret u32)
+   (terminated bool)
+   (tailok bool)
+   (inline-depth i64)
+   (selfname (slice u8))
+   ; compiled functions: (MObj symbol, tpde symbol)
+   (defined (ArrayList i64))])
+
+(defn tl-fail [(msg (slice u8))] (-> never)
+  (cga-fail msg)
+  (abort))
+
+(defn none32 [] (-> u32) (cir/none))
+(defn u32-of [(x i64)] (-> u32) (primitive/cast u32 x))
+(defn i64-of [(x u32)] (-> i64) (primitive/cast i64 x))
+
+(defn tv-s [(v u32) (ty Type)] (-> TV) (TV :kind 0 :v v :ty ty))
+(defn tv-p [(v u32) (ty Type)] (-> TV) (TV :kind 1 :v v :ty ty))
+(defn tv-none [] (-> TV) (TV :kind 2 :v (none32) :ty (TVoid)))
+(defn i64t [] (-> Type) (TInt 64 true))
+
+(defn box-ty [(tl (ptr Tl)) (t Type)] (-> (ptr Type)) (box-type (.a tl) t))
+
+; ============================ types ==========================================
+
+(defn wide? [(t (ptr Type))] (-> bool)
+  (match (load t) (TInt [bits _] (> bits 64)) (_ false)))
+
+;;; Scalar for this backend: codegen_a64's scalars plus integers up to 128 bits.
+(defn tl-scalar? [(t (ptr Type))] (-> bool)
+  (or (ty-is-scalar t) (wide? t)))
+
+;;; The CIR type of a scalar Coil type (-1 for aggregates and void).
+(defn tl-cty [(t (ptr Type))] (-> i64)
+  (match (load t)
+    (TInt [bits _] (if (> bits 64) cir/T-I128 cir/T-I64))
+    (TBool [] cir/T-I64)
+    (TFloat [bits] (if (= bits 32) cir/T-F32 cir/T-F64))
+    (TPtr [_] cir/T-I64)
+    (TRef [_ _] cir/T-I64)
+    (TFn [_ _ _] cir/T-I64)
+    (TNever [] cir/T-I64)
+    (_ -1)))
+
+(defn ty-void? [(t (ptr Type))] (-> bool)
+  (match (load t) (TVoid [] true) (TNever [] false) (_ false)))
+
+(defn int-bits [(t (ptr Type))] (-> i64)
+  (match (load t) (TInt [bits _] bits) (TBool [] 1) (_ 64)))
+
+(defn int-signed? [(t (ptr Type))] (-> bool)
+  (match (load t) (TInt [_ sg] sg) (TBool [] false) (_ true)))
+
+;;; Bytes a scalar occupies in memory (1/2/4/8/16).
+(defn scalar-bytes [(tl (ptr Tl)) (t (ptr Type))] (-> i64)
+  (match (load t)
+    (TInt [bits _] (cond (<= bits 8) 1 (<= bits 16) 2 (<= bits 32) 4 (<= bits 64) 8 :else 16))
+    (TBool [] 1)
+    (TFloat [bits] (/ bits 8))
+    (_ 8)))
+
+(defn tsize [(tl (ptr Tl)) (t (ptr Type))] (-> i64) (ty-size (.g tl) t))
+(defn talign [(tl (ptr Tl)) (t (ptr Type))] (-> i64) (ty-align (.g tl) t))
+
+; ============================ CIR emission ===================================
+
+(defn f [(tl (ptr Tl))] (-> (ptr cir/Func)) (.f tl))
+
+;;; Make sure instructions have an open block: after a terminator, code goes to
+;;; a fresh block no branch reaches.
+(defn open! [(tl (ptr Tl))] (-> void)
+  (when (cir/terminated? (.f tl))
+    (let [b (cir/new-block! (.f tl))]
+      (cir/set-block! (.f tl) b))))
+
+(defn iconst [(tl (ptr Tl)) (v i64)] (-> u32) (cir/iconst! (.f tl) v))
+(defn op1 [(tl (ptr Tl)) (op i64) (ty i64) (a u32) (imm i64) (imm2 i64)] (-> u32)
+  (open! tl) (cir/op1! (.f tl) op ty a imm imm2))
+(defn op2 [(tl (ptr Tl)) (op i64) (ty i64) (a u32) (b u32) (imm i64) (imm2 i64)] (-> u32)
+  (open! tl) (cir/op2! (.f tl) op ty a b imm imm2))
+(defn op3 [(tl (ptr Tl)) (op i64) (ty i64) (a u32) (b u32) (c u32) (imm i64) (imm2 i64)] (-> u32)
+  (open! tl) (cir/op3! (.f tl) op ty a b c imm imm2))
+
+(defn sym-val [(tl (ptr Tl)) (mobj-sym i64)] (-> u32)
+  (cir/sym! (.f tl) (tl-sym tl mobj-sym) 0))
+
+(defn new-slot [(tl (ptr Tl)) (t (ptr Type))] (-> u32)
+  (cir/alloca! (.f tl) (tsize tl t) (talign tl t)))
+
+(defn new-slot-bytes [(tl (ptr Tl)) (size i64) (align i64)] (-> u32)
+  (cir/alloca! (.f tl) size align))
+
+(defn addi [(tl (ptr Tl)) (p u32) (off i64)] (-> u32)
+  (if (= off 0) p (op1 tl cir/OP-ADDI cir/T-I64 p off 0)))
+
+;;; Canonicalize an integer result to its type's width and signedness.
+(defn canon [(tl (ptr Tl)) (v u32) (t (ptr Type))] (-> u32)
+  (match (load t)
+    (TInt [bits sg]
+          (if (< bits 64)
+              (op1 tl (if sg cir/OP-SEXT cir/OP-ZEXT) cir/T-I64 v bits 0)
+              v))
+    (_ v)))
+
+(defn load-scalar [(tl (ptr Tl)) (p u32) (off i64) (t (ptr Type))] (-> u32)
+  (open! tl)
+  (cir/load-mem! (.f tl) (tl-cty t) p off (scalar-bytes tl t) (int-signed? t)))
+
+(defn store-scalar [(tl (ptr Tl)) (p u32) (off i64) (v u32) (t (ptr Type))] (-> void)
+  (open! tl)
+  (cir/store-mem! (.f tl) p v off (scalar-bytes tl t))
+  0)
+
+(defn memcpy [(tl (ptr Tl)) (dst u32) (src u32) (n i64)] (-> void)
+  (when (> n 0)
+    (open! tl)
+    (when (> n isel/INLINE-COPY-MAX) (set! (.has-calls (.f tl)) true))
+    (cir/op2! (.f tl) cir/OP-MEMCPY cir/T-VOID dst src n 0))
+  0)
+
+(defn memzero [(tl (ptr Tl)) (dst u32) (n i64)] (-> void)
+  (when (> n 0)
+    (open! tl)
+    (when (> n isel/INLINE-COPY-MAX) (set! (.has-calls (.f tl)) true))
+    (cir/op1! (.f tl) cir/OP-MEMZERO cir/T-VOID dst n 0))
+  0)
+
+;;; Store / load exactly `n` (1, 2, 4, 8) bytes, zero-extending on load.
+(defn store-n [(tl (ptr Tl)) (p u32) (off i64) (v u32) (n i64)] (-> void)
+  (open! tl)
+  (cir/store-mem! (.f tl) p v off n)
+  0)
+
+(defn load-n [(tl (ptr Tl)) (p u32) (off i64) (n i64)] (-> u32)
+  (open! tl)
+  (cir/load-mem! (.f tl) cir/T-I64 p off n false))
+
+;;; A load of `n` (1..8) bytes zero-extended, from loads of 4, 2 and 1 bytes.
+(defn load-bytes [(tl (ptr Tl)) (p u32) (off i64) (n i64)] (-> u32)
+  (if (or (= n 1) (= n 2) (= n 4) (= n 8))
+      (do (open! tl) (cir/load-mem! (.f tl) cir/T-I64 p off n false))
+      (let [(mut acc) (none32)
+            (mut o) 0]
+        (for chunk [4 2 1]
+          (while (>= (- n o) chunk)
+            (open! tl)
+            (let [part (cir/load-mem! (.f tl) cir/T-I64 p (+ off o) chunk false)
+                  sh (if (= o 0) part (op2 tl cir/OP-SHL cir/T-I64 part (iconst tl (* o 8)) 0 0))]
+              (set! acc (if (= acc (none32)) sh (op2 tl cir/OP-OR cir/T-I64 acc sh 0 0))))
+            (set! o (+ o chunk))))
+        acc)))
+
+;;; A store of the low `n` (1..8) bytes of `v`.
+(defn store-bytes [(tl (ptr Tl)) (p u32) (off i64) (v u32) (n i64)] (-> void)
+  (if (or (= n 1) (= n 2) (= n 4) (= n 8))
+      (do (open! tl) (cir/store-mem! (.f tl) p v off n) 0)
+      (let [(mut o) 0]
+        (for chunk [4 2 1]
+          (while (>= (- n o) chunk)
+            (let [part (if (= o 0) v (op2 tl cir/OP-LSHR cir/T-I64 v (iconst tl (* o 8)) 0 0))]
+              (open! tl)
+              (cir/store-mem! (.f tl) p part (+ off o) chunk))
+            (set! o (+ o chunk))))
+        0)))
+
+; ============================ values =========================================
+
+;;; The SSA value of a scalar TV.
+(defn scalar [(tl (ptr Tl)) (tv TV)] (-> u32)
+  (cond (= (.kind tv) 0) (.v tv)
+        (= (.kind tv) 1)
+          (let [(mut t) (.ty tv)] (load-scalar tl (.v tv) 0 (mut t)))
+        :else (iconst tl 0)))
+
+;;; The address of a TV's value: a place as is, a scalar spilled to a new slot.
+(defn place [(tl (ptr Tl)) (tv TV)] (-> u32)
+  (if (= (.kind tv) 1)
+      (.v tv)
+      (let [(mut t) (.ty tv)
+            s (new-slot tl (mut t))]
+        (when (= (.kind tv) 0) (store-scalar tl s 0 (.v tv) (mut t)))
+        s)))
+
+;;; Store a TV of any type at `p + off`.
+(defn store-tv [(tl (ptr Tl)) (p u32) (off i64) (tv TV)] (-> void)
+  (let [(mut t) (.ty tv)]
+    (cond (= (.kind tv) 2) 0
+          (tl-scalar? (mut t)) (store-scalar tl p off (scalar tl tv) (mut t))
+          :else (memcpy tl (addi tl p off) (.v tv) (tsize tl (mut t)))))
+  0)
+
+;;; A private copy of an aggregate TV (value semantics); scalars as they are.
+(defn snapshot [(tl (ptr Tl)) (tv TV)] (-> TV)
+  (let [(mut t) (.ty tv)]
+    (if (and (= (.kind tv) 1) (not (tl-scalar? (mut t))))
+        (let [s (new-slot tl (mut t))]
+          (memcpy tl s (.v tv) (tsize tl (mut t)))
+          (tv-p s (.ty tv)))
+        tv)))
+
+;;; A TV for a value of type `t` stored at `p` (scalars load, aggregates copy).
+(defn read-at [(tl (ptr Tl)) (p u32) (off i64) (t Type)] (-> TV)
+  (let [(mut tt) t]
+    (if (tl-scalar? (mut tt))
+        (tv-s (load-scalar tl p off (mut tt)) t)
+        (let [s (new-slot tl (mut tt))]
+          (memcpy tl s (addi tl p off) (tsize tl (mut tt)))
+          (tv-p s t)))))
+
+; ============================ symbols ========================================
+
+;;; The tpde symbol mirroring MObj symbol `m`.
+(defn tl-sym [(tl (ptr Tl)) (m i64)] (-> u32)
+  (when (>= m (len (.sym-map tl)))
+    (for _ (range (len (.sym-map tl)) (+ m 1)) (push! (mut (.sym-map tl)) (none32))))
+  (let [have (get (.sym-map tl) m)]
+    (if (!= have (none32))
+        have
+        (let [ms (al-at [MSym] (field (field (.g tl) obj) syms) m)
+              t (if (= (.sect ms) 0)
+                    (tasm/sym-add-undef! (.ta tl) "" (: 1 u8))
+                    (tasm/sym-add-def! (.ta tl) "" -2 0 0 (: 1 u8)))]
+          (set! (mut (.sym-map tl)) m t)
+          (while (< (len (.tsym-mobj tl)) (+ (i64-of t) 1)) (push! (mut (.tsym-mobj tl)) -1))
+          (set! (mut (.tsym-mobj tl)) (i64-of t) m)
+          t))))
+
+; ============================ scopes =========================================
+
+(defn bind! [(tl (ptr Tl)) (name (slice u8)) (tv TV)] (-> void)
+  (push! (mut (.env tl)) (TBind :name name :tv tv)))
+
+(defn lookup [(tl (ptr Tl)) (name (slice u8))] (-> (Option TV))
+  (let [(mut i) (- (len (.env tl)) 1)]
+    (block :found
+      (while (>= i 0)
+        (let [b (al-at [TBind] (field tl env) i)]
+          (when (= (.name b) name) (return-from :found (Some (.tv b)))))
+        (set! i (- i 1)))
+      (None))))
+
+(defn scope-mark [(tl (ptr Tl))] (-> i64) (len (.env tl)))
+(defn scope-pop! [(tl (ptr Tl)) (mark i64)] (-> void) (set! (.len (.env tl)) mark))
+
+; ============================ promotion pre-pass ============================
+; A candidate is an `alloc stack` of a scalar bound by a let, directly or
+; through `(do (init-store (var S) v) (var S))`. Any use of its name other than
+; as the address of a load or store escapes it.
+
+(defstruct PBind [(name (slice u8)) (key u64)])
+
+(defn scan-lookup [(env (ptr (ArrayList PBind))) (name (slice u8))] (-> u64)
+  (let [(mut i) (- (len (load env)) 1)]
+    (block :found
+      (while (>= i 0)
+        (let [b (get (load env) i)]
+          (when (= (.name b) name) (return-from :found (.key b))))
+        (set! i (- i 1)))
+      (: 0 u64))))
+
+(defn scan-escape! [(tl (ptr Tl)) (env (ptr (ArrayList PBind))) (name (slice u8))] (-> void)
+  (let [k (scan-lookup env name)]
+    (when (!= k (: 0 u64)) (set! (mut (.allocs tl)) k true))))
+
+;; The candidate a binding's value makes the name stand for, or 0.
+(defn scan-bind-key [(tl (ptr Tl)) (env (ptr (ArrayList PBind))) (e (ptr Expr))] (-> u64)
+  (match (.kind e)
+    (EAlloc [storage t _init _sym]
+            (if (and (or (= storage 0) (= storage 3)) (let [(mut tt) t] (tl-scalar? (mut tt))))
+                (let [k (primitive/cast u64 e)]
+                  (unless (contains? (.allocs tl) k) (set! (mut (.allocs tl)) k false))
+                  k)
+                (: 0 u64)))
+    (EDo [body]
+         (let [n (len (load body))]
+           (if (= n 0)
+               (: 0 u64)
+               (match (.kind (elem body (- n 1)))
+                 (EVar [nm] (scan-lookup env nm))
+                 (_ (: 0 u64))))))
+    (_ (: 0 u64))))
+
+(defn scan-list! [(tl (ptr Tl)) (env (ptr (ArrayList PBind))) (xs (ptr (ArrayList Expr)))] (-> void)
+  (for i (range 0 (len (load xs))) (scan! tl env (elem xs i))))
+
+;; Visit a load/store address: a bare name is not an escape.
+(defn scan-addr! [(tl (ptr Tl)) (env (ptr (ArrayList PBind))) (p (ptr Expr))] (-> void)
+  (match (.kind p)
+    (EVar [_] 0)
+    (_ (do (scan! tl env p) 0))))
+
+(defn scan-do-body! [(tl (ptr Tl)) (env (ptr (ArrayList PBind))) (body (ptr (ArrayList Expr)))] (-> void)
+  ; the alias form's trailing (var S) is the binding's value, not an escape
+  (let [n (len (load body))]
+    (for i (range 0 n)
+      (let [e (elem body i)]
+        (if (and (= i (- n 1)) (match (.kind e) (EVar [_] true) (_ false)))
+            0
+            (scan! tl env e))))))
+
+(defn scan! [(tl (ptr Tl)) (env (ptr (ArrayList PBind))) (e (ptr Expr))] (-> void)
+  (match (.kind e)
+    (EVar [nm] (scan-escape! tl env nm))
+    (ELoad [inner] (scan-addr! tl env inner))
+    (EStore [p v] (do (scan-addr! tl env p) (scan! tl env v)))
+    (EInitStore [p v] (do (scan-addr! tl env p) (scan! tl env v)))
+    (ELet [binds body]
+          (let [mark (len (load env))]
+            (for i (range 0 (len (load binds)))
+              (let [b (al-at [Bind] binds i)
+                    v (field b value)
+                    alias-do (match (.kind v) (EDo [_] true) (_ false))]
+                (if alias-do
+                    (match (.kind v) (EDo [body] (scan-do-body! tl env body)) (_ 0))
+                    (scan! tl env v))
+                (let [k (if (.mutable b) (: 0 u64) (scan-bind-key tl env v))]
+                  (push! env (PBind :name (.name b) :key k)))))
+            (scan-list! tl env body)
+            (set! (.len env) mark)))
+    (EMatch [scrut arms]
+            (do (scan! tl env scrut)
+                (for i (range 0 (len (load arms)))
+                  (let [arm (al-at [Arm] arms i)
+                        mark (len (load env))
+                        binds (load (field arm binds))]
+                    (for j (range 0 (len (load binds)))
+                      (push! env (PBind :name (get (load binds) j) :key (: 0 u64))))
+                    (scan! tl env (field arm body))
+                    (set! (.len env) mark)))
+                0))
+    (EBin [_ l r] (do (scan! tl env l) (scan! tl env r) 0))
+    (ECmp [_ l r] (do (scan! tl env l) (scan! tl env r) 0))
+    (EIntUnary [_ x] (scan! tl env x))
+    (EIf [c t el] (do (scan! tl env c) (scan! tl env t) (scan! tl env el) 0))
+    (EDo [body] (scan-list! tl env body))
+    (ECall [_ _ args] (scan-list! tl env args))
+    (ECallPtr [fp args] (do (scan! tl env fp) (scan-list! tl env args) 0))
+    (EField [p _] (scan! tl env p))
+    (EAccessorField [p _] (scan! tl env p))
+    (EIndex [p i] (do (scan! tl env p) (scan! tl env i) 0))
+    (ECast [_ x] (scan! tl env x))
+    (EBorrow [_ p] (scan! tl env p))
+    (ESpillRef [x] (scan! tl env x))
+    (EBitGet [p _] (scan! tl env p))
+    (EBitSet [p _ v] (do (scan! tl env p) (scan! tl env v) 0))
+    (EFree [x] (scan! tl env x))
+    (EFnPtrOf [_] 0)
+    (ELoop [_ body] (scan-list! tl env body))
+    (EBreak [_ v] (match v (Some [x] (scan! tl env x)) (None [] 0)))
+    (ELlvmIr [_ args _] (scan-list! tl env args))
+    (EIntrinsic [_ _ args] (scan-list! tl env args))
+    (EVector [_ _ _ args] (scan-list! tl env args))
+    (EConstruct [_ _ args] (scan-list! tl env args))
+    (EMakeDyn [_ _ _ x] (scan! tl env x))
+    (EDynDispatch [dc] (do (scan! tl env (.recv dc)) (scan-list! tl env (.args dc)) 0))
+    (ECleanup [b cs] (do (scan! tl env b) (scan-list! tl env cs) 0))
+    (EMakeSlice [d _ _] (scan! tl env d))
+    (EAlloc [_ _ init _] (if (!= (primitive/cast i64 init) 0) (scan! tl env init) 0))
+    (_ 0)))
+
+(defn promotable? [(tl (ptr Tl)) (e (ptr Expr))] (-> bool)
+  (match (get (.allocs tl) (primitive/cast u64 e))
+    (Some [escaped] (not escaped))
+    (None [] false)))
+
+; ============================ expressions ====================================
+
+(defn tl-body [(tl (ptr Tl)) (body (ptr (ArrayList Expr)))] (-> TV)
+  (let [n (len (load body))
+        (mut last) (tv-s (iconst tl 0) (i64t))]
+    (block :done
+      (for i (range 0 n)
+        (when (.terminated tl) (return-from :done 0))
+        (set! last (tl-expr tl (elem body i))))
+      0)
+    last))
+
+;; A body whose last expression is in tail position.
+(defn tl-body-tail [(tl (ptr Tl)) (body (ptr (ArrayList Expr))) (tail bool)] (-> TV)
+  (let [n (len (load body))
+        (mut last) (tv-s (iconst tl 0) (i64t))]
+    (block :done
+      (for i (range 0 n)
+        (when (.terminated tl) (return-from :done 0))
+        (when (and tail (= i (- n 1))) (set! (.tailok tl) true))
+        (set! last (tl-expr tl (elem body i))))
+      0)
+    last))
+
+(defn tl-stmts [(tl (ptr Tl)) (body (ptr (ArrayList Expr)))] (-> void)
+  (block :done
+    (for i (range 0 (len (load body)))
+      (when (.terminated tl) (return-from :done 0))
+      (tl-expr tl (elem body i)))
+    0))
+
+;;; Tail position is consumed on entry, as in codegen_a64's emit-expr.
+(defn tl-expr [(tl (ptr Tl)) (e (ptr Expr))] (-> TV)
+  (let [tail (.tailok tl)]
+    (set! (.tailok tl) false)
+    (match (.kind e)
+      (EIf [cnd thn els] (tl-if tl cnd thn els tail))
+      (ECall [func _targs args] (tl-call-named tl func args tail))
+      (EDo [body] (tl-body-tail tl body tail))
+      (ELet [binds body] (tl-let tl binds body tail))
+      (_ (tl-expr-rest tl e)))))
+
+(defn tl-let [(tl (ptr Tl)) (binds (ptr (ArrayList Bind))) (body (ptr (ArrayList Expr))) (tail bool)] (-> TV)
+  (let [mark (scope-mark tl)]
+    (block :binds
+      (for i (range 0 (len (load binds)))
+        (when (.terminated tl) (return-from :binds 0))
+        (let [b (al-at [Bind] binds i)
+              tv (tl-expr tl (field b value))]
+          (if (.mutable b)
+              ; a stable slot, and the name is a pointer to it
+              (let [(mut t) (.ty tv)
+                    s (new-slot tl (mut t))]
+                (store-tv tl s 0 tv)
+                (bind! tl (.name b) (tv-s s (TPtr (box-ty tl (.ty tv))))))
+              (bind! tl (.name b) tv))))
+      0)
+    (let [r (tl-body-tail tl body tail)]
+      (scope-pop! tl mark)
+      r)))
+
+(defn tl-expr-rest [(tl (ptr Tl)) (e (ptr Expr))] (-> TV)
+  (match (.kind e)
+    (EInt [v] (tv-s (iconst tl v) (i64t)))
+    (EWideInt [_ lo hi _ _] (tv-s (cir/const! (.f tl) cir/T-I128 (primitive/cast u64 lo) (primitive/cast u64 hi)) (TInt 128 true)))
+    (EFloat [bits] (tv-s (cir/const! (.f tl) cir/T-F64 (primitive/cast u64 bits) (: 0 u64)) (TFloat 64)))
+    (EBool [b] (tv-s (iconst tl (if b 1 0)) (TBool)))
+    (EStr [sv]
+          (let [sym (g-intern-str! (.g tl) sv true)
+                s (new-slot-bytes tl 16 8)]
+            (store-n tl s 0 (sym-val tl sym) 8)
+            (store-n tl s 8 (iconst tl (len sv)) 8)
+            (tv-p s (TSlice (box-ty tl (TInt 8 false))))))
+    (ECStr [sv]
+           (let [sym (g-intern-str! (.g tl) sv true)]
+             (tv-s (sym-val tl sym) (TPtr (box-ty tl (TInt 8 true))))))
+    (EVar [name]
+          (match (lookup tl name)
+            (Some [tv] tv)
+            (None [] (tl-fail (sconcat (.a tl) "tpde: unbound variable: " name)))))
+    (EZeroed [t] (tl-zeroed tl t))
+    (ERecordInit [t] (tl-zeroed tl t))
+    (EBorrow [_m p] (tl-addr-of tl (tl-expr tl p)))
+    (ESpillRef [inner]
+               (let [tv (tl-expr tl inner)
+                     (mut t) (.ty tv)]
+                 (tv-s (place tl tv) (TPtr (box-ty tl (.ty tv))))))
+    (ECleanup [body cleanups]
+              (let [r (tl-expr tl body)
+                    r2 (snapshot tl r)]
+                (tl-stmts tl cleanups)
+                r2))
+    (EBin [op lhs rhs] (tl-bin tl op (tl-expr tl lhs) (tl-expr tl rhs)))
+    (ECmp [op lhs rhs] (tl-cmp tl op (tl-expr tl lhs) (tl-expr tl rhs)))
+    (EIntUnary [op inner] (tl-int-unary tl op (tl-expr tl inner)))
+    (ELoop [label body] (tl-loop tl label body))
+    (EBreak [label value] (tl-break tl label value))
+    (EContinue [label]
+               (let [li (tl-loop-index tl label)
+                     lp (al-at [TLoop] (field tl loops) li)]
+                 (open! tl)
+                 (cir/br! (.f tl) (.head lp))
+                 (set! (.terminated tl) true)
+                 (tv-none)))
+    (ECallPtr [fp args] (tl-call-ptr tl fp args false))
+    (EAlloc [storage t init symbol] (tl-alloc tl e storage t init symbol))
+    (EAccessorField [p fname] (tl-field tl (tl-expr tl p) fname))
+    (EField [p fname] (tl-field tl (tl-expr tl p) fname))
+    (ELoad [inner] (tl-load tl (tl-expr tl inner)))
+    (EStore [p val] (tl-store tl (tl-expr tl p) (tl-expr tl val)))
+    (EInitStore [p val] (tl-store tl (tl-expr tl p) (tl-expr tl val)))
+    (EIndex [p idx] (tl-index tl (tl-expr tl p) (tl-expr tl idx)))
+    (ECast [t inner] (tl-cast tl t (tl-expr tl inner)))
+    (ESizeOf [t] (let [(mut tp) t] (tv-s (iconst tl (tsize tl (mut tp))) (i64t))))
+    (EAlignOf [t] (let [(mut tp) t] (tv-s (iconst tl (talign tl (mut tp))) (i64t))))
+    (EOffsetOf [t fname]
+               (match t
+                 (TStruct [nm]
+                          (let [si (g-struct-idx (.g tl) nm)]
+                            (tv-s (iconst tl (g-field-off (.g tl) si (g-field-idx (.g tl) si fname))) (i64t))))
+                 (_ (tl-fail "offset-of on non-struct type"))))
+    (EFree [inner]
+           (let [v (scalar tl (tl-expr tl inner))]
+             (tl-runtime-call tl "_free" v (none32) cir/T-VOID)
+             (tv-s (iconst tl 0) (i64t))))
+    (EConstruct [sum variant args] (tl-construct tl sum variant args))
+    (EMatch [scrut arms] (tl-match tl scrut arms))
+    (EFnPtrOf [name0]
+              (let [name (g-fnptr-target (.g tl) name0)
+                    si (g-sig-idx (.g tl) name)]
+                (when (< si 0) (tl-fail (sconcat (.a tl) "fnptr-of unknown function: " name)))
+                (let [sig (al-at [GSig] (field (.g tl) sigs) si)]
+                  (tv-s (sym-val tl (.symidx sig))
+                        (TFn :cc (cc-c) :params (load (field sig params)) :ret (box-ty tl (.ret sig)))))))
+    (EBitGet [p fname] (tl-bitget tl p fname))
+    (EBitSet [p fname val] (tl-bitset tl p fname val))
+    (ELlvmIr [result args body] (tir/tl-llvmir tl result args body))
+    (EIntrinsic [op result args] (tl-intrinsic tl op result args))
+    (EVector [op result types args]
+             (let [a (.a tl)
+                   mark (scope-mark tl)
+                   (mut values) (ArrayList::new [TV] a)]
+               (for i (range 0 (len (load args)))
+                 (push! (mut values) (tl-expr tl (elem args i))))
+               (for i (range 0 (len (load args)))
+                 (bind! tl (vs-argument-name a i) (get values i)))
+               (let [lowered (match (scalarize-vector a op (box-ty tl result) types)
+                               (Ok [expr] expr)
+                               (Err [d] (let [diag d] (tl-fail (.msg diag)))))
+                     v (tl-expr tl (box-expr a lowered))]
+                 (scope-pop! tl mark)
+                 v)))
+    (EMakeDyn [ds vt methods inner] (tl-make-dyn tl ds vt methods inner))
+    (EDynDispatch [dc] (tl-dyn-dispatch tl dc))
+    (EStaticRef [name]
+                (let [si (g-static-idx (.g tl) name)]
+                  (when (< si 0) (tl-fail (sconcat (.a tl) "static-ref references an unknown def: " name)))
+                  (let [st (al-at [GStatic] (field (.g tl) statics) si)]
+                    (tv-s (sym-val tl (.symidx st)) (TPtr (box-ty tl (.ty st)))))))
+    (EMakeSlice [data elem n]
+                (let [dv (scalar tl (tl-expr tl data))
+                      s (new-slot-bytes tl 16 8)]
+                  (store-n tl s 0 dv 8)
+                  (store-n tl s 8 (iconst tl (extent-value n)) 8)
+                  (tv-p s (TSlice (box-ty tl elem)))))
+    (_ (tl-fail "tpde: unsupported expression reached the backend"))))
+
+(defn tl-zeroed [(tl (ptr Tl)) (t Type)] (-> TV)
+  (let [(mut tp) t]
+    (if (tl-scalar? (mut tp))
+        (let [ct (tl-cty (mut tp))]
+          (tv-s (cir/const! (.f tl) ct (: 0 u64) (: 0 u64)) t))
+        (let [s (new-slot tl (mut tp))]
+          (memzero tl s (tsize tl (mut tp)))
+          (tv-p s t)))))
+
+;;; The address a borrow yields: a place's address, a pointer as is, a scalar
+;;; spilled (a promoted slot cannot be borrowed: the pre-pass ruled that out).
+(defn tl-addr-of [(tl (ptr Tl)) (tv TV)] (-> TV)
+  (cond (= (.kind tv) 3) (tl-fail "tpde: borrow of a promoted local (pre-pass bug)")
+        :else tv))
+
+; ---- memory ----
+
+(defn pointee [(tl (ptr Tl)) (tv TV)] (-> Type)
+  (let [(mut t) (.ty tv)] (ty-pointee (mut t))))
+
+(defn tl-load [(tl (ptr Tl)) (ptv TV)] (-> TV)
+  (if (= (.kind ptv) 3)
+      (do (open! tl) (tv-s (cir/use-var! (.f tl) (.v ptv)) (.ty ptv)))
+      (let [pt (pointee tl ptv)]
+        (read-at tl (scalar tl ptv) 0 pt))))
+
+(defn tl-store [(tl (ptr Tl)) (ptv TV) (vtv TV)] (-> TV)
+  (if (= (.kind ptv) 3)
+      (let [(mut t) (.ty ptv)]
+        (open! tl)
+        (cir/def-var! (.f tl) (.v ptv) (coerce-scalar tl (scalar tl vtv) (.ty vtv) (.ty ptv)))
+        (tv-s (iconst tl 0) (i64t)))
+      (let [p (scalar tl ptv)
+            pt (pointee tl ptv)
+            (mut ptt) pt]
+        (if (tl-scalar? (mut ptt))
+            (store-scalar tl p 0 (coerce-scalar tl (scalar tl vtv) (.ty vtv) pt) (mut ptt))
+            (when (!= (.kind vtv) 2)
+              (memcpy tl p (.v vtv) (tsize tl (mut ptt)))
+              0))
+        (tv-s (iconst tl 0) (i64t)))))
+
+;;; A scalar stored into a slot of type `to`: the representation only changes
+;;; between I64 and I128 (a narrow literal stored into a wide integer).
+(defn coerce-scalar [(tl (ptr Tl)) (v u32) (from Type) (to Type)] (-> u32)
+  (let [(mut ft) from (mut tt) to
+        fc (tl-cty (mut ft))
+        tc (tl-cty (mut tt))]
+    (cond (= fc tc) v
+          (and (= tc cir/T-I128) (= fc cir/T-I64))
+            (op1 tl (if (int-signed? (mut ft)) cir/OP-SEXT cir/OP-ZEXT) cir/T-I128 v 64 0)
+          (and (= tc cir/T-I64) (= fc cir/T-I128)) (op1 tl cir/OP-LO cir/T-I64 v 0 0)
+          :else v)))
+
+(defn tl-field [(tl (ptr Tl)) (ptv TV) (fname (slice u8))] (-> TV)
+  (let [pt (pointee tl ptv)]
+    (match pt
+      (TStruct [nm]
+               (let [si (g-struct-idx (.g tl) nm)]
+                 (when (< si 0) (tl-fail (sconcat (.a tl) "field access on non-struct: " nm)))
+                 (let [fi (g-field-idx (.g tl) si fname)
+                       off (g-field-off (.g tl) si fi)
+                       fty (.ty (al-at [Field] (load (field (struct-at (field (.g tl) layouts) si) fields)) fi))]
+                   (tv-s (addi tl (scalar tl ptv) off) (TPtr (box-ty tl fty))))))
+      (_ (tl-fail "field access through non-struct pointer")))))
+
+(defn tl-index [(tl (ptr Tl)) (ptv TV) (itv TV)] (-> TV)
+  (let [pt (pointee tl ptv)
+        (mut ep) (match pt (TArray [elem _n] (load elem)) (_ pt))
+        esz (tsize tl (mut ep))
+        p (scalar tl ptv)
+        i (scalar tl itv)]
+    (tv-s (if (const-int? tl i)
+              (addi tl p (* (const-val tl i) esz))
+              (op2 tl cir/OP-PTRADD cir/T-I64 p i esz 0))
+          (TPtr (box-ty tl ep)))))
+
+(defn const-int? [(tl (ptr Tl)) (v u32)] (-> bool)
+  (= (primitive/cast i64 (.op (cir/val (.f tl) v))) cir/OP-CONST))
+(defn const-val [(tl (ptr Tl)) (v u32)] (-> i64) (.imm (cir/val (.f tl) v)))
+
+(defn tl-alloc [(tl (ptr Tl)) (e (ptr Expr)) (storage i64) (t Type) (init (ptr Expr)) (symbol (Option (slice u8)))] (-> TV)
+  (let [(mut tp) t]
+    (cond
+      (and (or (= storage 0) (= storage 3)) (promotable? tl e))
+        (let [ct (tl-cty (mut tp))
+              var (cir/new-var! (.f tl) ct)]
+          (open! tl)
+          ; a fresh slot starts zeroed in codegen_a64; uninitialized reads are UB,
+          ; so starting at zero is the same
+          (cir/def-var! (.f tl) var (cir/const! (.f tl) ct (: 0 u64) (: 0 u64)))
+          (TV :kind 3 :v var :ty t))
+      (or (= storage 0) (= storage 3))
+        (tv-s (new-slot tl (mut tp)) (TPtr (box-ty tl t)))
+      (= storage 2)
+        (let [p (tl-runtime-call tl "_malloc" (iconst tl (tsize tl (mut tp))) (none32) cir/T-I64)]
+          (tv-s p (TPtr (box-ty tl t))))
+      :else
+        (let [g (.g tl)
+              sym (match symbol
+                    (Some [name] (g-public-zero-global! g name (tsize tl (mut tp)) (talign tl (mut tp))))
+                    (None [] (g-zero-global! g (tsize tl (mut tp)) (talign tl (mut tp)))))
+              ms (al-at [MSym] (field (field g obj) syms) sym)]
+          (when (!= (primitive/cast i64 init) 0)
+            (g-static-write! g (mut tp) init (.sect ms) (.off ms))
+            0)
+          (tv-s (sym-val tl sym) (TPtr (box-ty tl t)))))))
+
+;;; A call to a C runtime function of one or two pointer/integer arguments.
+(defn tl-runtime-call [(tl (ptr Tl)) (name (slice u8)) (a0 u32) (a1 u32) (rty i64)] (-> u32)
+  (let [sym (tl-sym tl (g-runtime-sym! (.g tl) name))
+        (mut args) (ArrayList::new [u32] (.a tl))
+        (mut flags) (ArrayList::new [u32] (.a tl))
+        (mut rts) (ArrayList::new [u8] (.a tl))]
+    (push! (mut args) a0)
+    (push! (mut flags) (: 0 u32))
+    (when (!= a1 (none32)) (push! (mut args) a1) (push! (mut flags) (: 0 u32)))
+    (when (!= rty cir/T-VOID) (push! (mut rts) (primitive/cast u8 rty)))
+    (open! tl)
+    (cir/call! (.f tl) sym (none32) (cast (ptr (ArrayList u32)) (mut args)) (cast (ptr (ArrayList u32)) (mut flags))
+               (cast (ptr (ArrayList u8)) (mut rts)) false)))
+
+; ---- arithmetic ----
+
+(defn fp-type? [(t (ptr Type))] (-> bool) (match (load t) (TFloat [_] true) (_ false)))
+
+(defn tl-bin [(tl (ptr Tl)) (op i64) (l TV) (r TV)] (-> TV)
+  (let [(mut t) (.ty l)
+        a (scalar tl l)
+        b (coerce-scalar tl (scalar tl r) (.ty r) (.ty l))]
+    (if (fp-type? (mut t))
+        (let [ct (tl-cty (mut t))]
+          (if (= op 4)
+              ; frem: libm fmod(f)
+              (let [sym (tl-sym tl (g-runtime-sym! (.g tl) (if (= ct cir/T-F32) "_fmodf" "_fmod")))
+                    (mut args) (ArrayList::new [u32] (.a tl))
+                    (mut flags) (ArrayList::new [u32] (.a tl))
+                    (mut rts) (ArrayList::new [u8] (.a tl))]
+                (push! (mut args) a) (push! (mut args) b)
+                (push! (mut flags) (: 0 u32)) (push! (mut flags) (: 0 u32))
+                (push! (mut rts) (primitive/cast u8 ct))
+                (open! tl)
+                (tv-s (cir/call! (.f tl) sym (none32) (cast (ptr (ArrayList u32)) (mut args)) (cast (ptr (ArrayList u32)) (mut flags))
+                                 (cast (ptr (ArrayList u8)) (mut rts)) false)
+                      (.ty l)))
+              (tv-s (op2 tl (case op 0 cir/OP-FADD 1 cir/OP-FSUB 2 cir/OP-FMUL cir/OP-FDIV) ct a b 0 0) (.ty l))))
+        (let [signed (int-signed? (mut t))
+              bits (int-bits (mut t))
+              ct (if (wide? (mut t)) cir/T-I128 cir/T-I64)]
+          (cond
+            (>= op 15)
+              (tv-s (op2 tl (case op 15 cir/OP-ADDO 16 cir/OP-SUBO cir/OP-MULO) cir/T-I64 a b bits (if signed 1 0)) (TBool))
+            (= op 14) (tv-s (mulhi tl a b bits signed (mut t)) (.ty l))
+            :else
+              (let [cop (case op
+                          0 cir/OP-ADD 1 cir/OP-SUB 2 cir/OP-MUL
+                          3 (if signed cir/OP-SDIV cir/OP-UDIV)
+                          4 (if signed cir/OP-SREM cir/OP-UREM)
+                          5 cir/OP-UDIV 6 cir/OP-UREM
+                          7 cir/OP-AND 8 cir/OP-OR 9 cir/OP-XOR
+                          10 cir/OP-SHL
+                          11 (if signed cir/OP-ASHR cir/OP-LSHR)
+                          12 cir/OP-ROTL
+                          cir/OP-ROTR)
+                    bv (if (and (= ct cir/T-I128) (or (= op 10) (= op 11) (= op 12) (= op 13)))
+                           b
+                           b)
+                    v (op2 tl cop ct a bv (if (or (= op 12) (= op 13)) bits 0) 0)]
+                (when (and (= ct cir/T-I128) (or (= cop cir/OP-SDIV) (= cop cir/OP-UDIV) (= cop cir/OP-SREM) (= cop cir/OP-UREM)))
+                  (set! (.has-calls (.f tl)) true))
+                (tv-s (canon tl v (mut t)) (.ty l))))))))
+
+;; The high bits of the full product: for 64 bits smulh/umulh, else the
+;; product shifted right by the width.
+(defn mulhi [(tl (ptr Tl)) (a u32) (b u32) (bits i64) (signed bool) (t (ptr Type))] (-> u32)
+  (if (= bits 64)
+      (op2 tl (if signed cir/OP-SMULH cir/OP-UMULH) cir/T-I64 a b 0 0)
+      (let [lo (op2 tl cir/OP-MUL cir/T-I64 a b 0 0)
+            hi (op2 tl (if signed cir/OP-SMULH cir/OP-UMULH) cir/T-I64 a b 0 0)
+            l2 (op2 tl cir/OP-LSHR cir/T-I64 lo (iconst tl bits) 0 0)
+            h2 (op2 tl cir/OP-SHL cir/T-I64 hi (iconst tl (- 64 bits)) 0 0)]
+        (canon tl (op2 tl cir/OP-OR cir/T-I64 l2 h2 0 0) t))))
+
+(defn icmp-pred [(op i64) (signed bool)] (-> i64)
+  (case op
+    0 (if signed cir/P-SLT cir/P-ULT)
+    1 (if signed cir/P-SLE cir/P-ULE)
+    2 (if signed cir/P-SGT cir/P-UGT)
+    3 (if signed cir/P-SGE cir/P-UGE)
+    4 cir/P-EQ
+    cir/P-NE))
+
+(defn tl-cmp [(tl (ptr Tl)) (op i64) (l TV) (r TV)] (-> TV)
+  (let [(mut t) (.ty l)
+        a (scalar tl l)
+        b (coerce-scalar tl (scalar tl r) (.ty r) (.ty l))]
+    (if (fp-type? (mut t))
+        (tv-s (op2 tl cir/OP-FCMP cir/T-I64 a b
+                   (case op 0 cir/F-OLT 1 cir/F-OLE 2 cir/F-OGT 3 cir/F-OGE 4 cir/F-OEQ cir/F-ONE) 0)
+              (TBool))
+        (tv-s (op2 tl cir/OP-ICMP cir/T-I64 a b (icmp-pred op (int-signed? (mut t))) 0) (TBool)))))
+
+(defn tl-int-unary [(tl (ptr Tl)) (op i64) (tv TV)] (-> TV)
+  (let [(mut t) (.ty tv)
+        v (scalar tl tv)
+        bits (int-bits (mut t))
+        ct (if (wide? (mut t)) cir/T-I128 cir/T-I64)]
+    (if (= ct cir/T-I128)
+        (tv-s (int-unary128 tl op v (mut t)) (.ty tv))
+        (tv-s (canon tl (case op
+                          0 (op1 tl cir/OP-NOT ct v 0 0)
+                          1 (op1 tl cir/OP-CLZ ct v bits 0)
+                          2 (op1 tl cir/OP-CTZ ct v bits 0)
+                          3 (op1 tl cir/OP-POPCNT ct v bits 0)
+                          (op1 tl cir/OP-BSWAP ct v bits 0))
+                     (mut t))
+              (.ty tv)))))
+
+;; 128-bit not/clz/ctz/popcount/bswap through the two halves.
+(defn int-unary128 [(tl (ptr Tl)) (op i64) (v u32) (t (ptr Type))] (-> u32)
+  (if (= op 0)
+      (op1 tl cir/OP-NOT cir/T-I128 v 0 0)
+      (let [lo (op1 tl cir/OP-LO cir/T-I64 v 0 0)
+            hi (op1 tl cir/OP-HI cir/T-I64 v 0 0)]
+        (cond
+          (= op 1) ; clz = hi != 0 ? clz(hi) : 64 + clz(lo)
+            (let [ch (op1 tl cir/OP-CLZ cir/T-I64 hi 64 0)
+                  cl (op2 tl cir/OP-ADD cir/T-I64 (op1 tl cir/OP-CLZ cir/T-I64 lo 64 0) (iconst tl 64) 0 0)
+                  z (op2 tl cir/OP-ICMP cir/T-I64 hi (iconst tl 0) cir/P-EQ 0)]
+              (op1 tl cir/OP-ZEXT cir/T-I128 (op3 tl cir/OP-SELECT cir/T-I64 z cl ch 0 0) 64 0))
+          (= op 2)
+            (let [cl (op1 tl cir/OP-CTZ cir/T-I64 lo 64 0)
+                  ch (op2 tl cir/OP-ADD cir/T-I64 (op1 tl cir/OP-CTZ cir/T-I64 hi 64 0) (iconst tl 64) 0 0)
+                  z (op2 tl cir/OP-ICMP cir/T-I64 lo (iconst tl 0) cir/P-EQ 0)]
+              (op1 tl cir/OP-ZEXT cir/T-I128 (op3 tl cir/OP-SELECT cir/T-I64 z ch cl 0 0) 64 0))
+          (= op 3)
+            (op1 tl cir/OP-ZEXT cir/T-I128
+                 (op2 tl cir/OP-ADD cir/T-I64 (op1 tl cir/OP-POPCNT cir/T-I64 lo 64 0) (op1 tl cir/OP-POPCNT cir/T-I64 hi 64 0) 0 0)
+                 64 0)
+          :else
+            (op2 tl cir/OP-PAIR cir/T-I128 (op1 tl cir/OP-BSWAP cir/T-I64 hi 64 0) (op1 tl cir/OP-BSWAP cir/T-I64 lo 64 0) 0 0)))))
+
+(defn tl-cast [(tl (ptr Tl)) (t Type) (tv TV)] (-> TV)
+  (let [(mut st) (.ty tv)
+        (mut dt) t
+        v (scalar tl tv)
+        sc (tl-cty (mut st))
+        dc (tl-cty (mut dt))]
+    (match t
+      (TInt [dbits dsigned]
+            (cond
+              (fp-type? (mut st))
+                (if (= dc cir/T-I128)
+                    (tl-fail "tpde: float to 128-bit integer cast")
+                    (let [w (if (<= dbits 32) 32 64)
+                          r (op1 tl (if dsigned cir/OP-FPTOSI cir/OP-FPTOUI) cir/T-I64 v w 0)]
+                      (tv-s (canon tl r (mut dt)) t)))
+              (= dc cir/T-I128)
+                (if (= sc cir/T-I128)
+                    (tv-s (canon128 tl v dbits dsigned) t)
+                    (tv-s (canon128 tl (op1 tl (if (int-signed? (mut st)) cir/OP-SEXT cir/OP-ZEXT) cir/T-I128 v 64 0) dbits dsigned) t))
+              (= sc cir/T-I128)
+                (tv-s (canon tl (op1 tl cir/OP-LO cir/T-I64 v 0 0) (mut dt)) t)
+              :else (tv-s (canon tl v (mut dt)) t)))
+      (TFloat [dbits]
+              (let [dct (if (= dbits 32) cir/T-F32 cir/T-F64)]
+                (cond
+                  (fp-type? (mut st))
+                    (tv-s (cond (= sc dct) v
+                                (= dct cir/T-F64) (op1 tl cir/OP-FPEXT dct v 0 0)
+                                :else (op1 tl cir/OP-FPTRUNC dct v 0 0))
+                          t)
+                  (= sc cir/T-I128) (tl-fail "tpde: 128-bit integer to float cast")
+                  :else (tv-s (op1 tl (if (int-signed? (mut st)) cir/OP-SITOFP cir/OP-UITOFP) dct v 0 0) t))))
+      (TBool [] (tv-s (op2 tl cir/OP-ICMP cir/T-I64 v (iconst tl 0) cir/P-NE 0) t))
+      (_ (tv-s (if (= sc cir/T-I128) (op1 tl cir/OP-LO cir/T-I64 v 0 0) v) t)))))
+
+;; Canonicalize an I128 to `bits` (no-op at 128).
+(defn canon128 [(tl (ptr Tl)) (v u32) (bits i64) (signed bool)] (-> u32)
+  (if (>= bits 128)
+      v
+      (let [sh (iconst tl (- 128 bits))
+            l (op2 tl cir/OP-SHL cir/T-I128 v sh 0 0)]
+        (op2 tl (if signed cir/OP-ASHR cir/OP-LSHR) cir/T-I128 l sh 0 0))))
+
+; ---- control flow ----
+
+;; A merge variable for branch results: scalars by value, places by address.
+(defstruct Merge [(var u32) (kind i64) (ty Type) (has bool)])
+
+(defn merge-new [] (-> Merge) (Merge :var (none32) :kind 2 :ty (TVoid) :has false))
+
+(defn merge-add! [(tl (ptr Tl)) (m (mut Merge)) (tv TV)] (-> void)
+  (when (!= (.kind tv) 2)
+    (when (not (.has m))
+      (set! (.has m) true)
+      (set! (.kind m) (if (= (.kind tv) 3) 0 (.kind tv)))
+      (set! (.ty m) (.ty tv))
+      (let [(mut t) (.ty tv)]
+        (set! (.var m) (cir/new-var! (.f tl) (if (= (.kind m) 1) cir/T-I64 (tl-cty (mut t)))))))
+    (open! tl)
+    (if (= (.kind m) 1)
+        (do (set! (.frame-escapes (.f tl)) true)
+            (cir/def-var! (.f tl) (.var m) (place tl tv)))
+        (cir/def-var! (.f tl) (.var m) (coerce-scalar tl (scalar tl tv) (.ty tv) (.ty m)))))
+  0)
+
+(defn merge-result [(tl (ptr Tl)) (m Merge)] (-> TV)
+  (if (not (.has m))
+      (tv-s (iconst tl 0) (i64t))
+      (TV :kind (.kind m) :v (cir/use-var! (.f tl) (.var m)) :ty (.ty m))))
+
+(defn tl-if [(tl (ptr Tl)) (cnd (ptr Expr)) (thn (ptr Expr)) (els (ptr Expr)) (tail bool)] (-> TV)
+  (let [c (scalar tl (tl-expr tl cnd))]
+    (if (.terminated tl)
+        (tv-none)
+        (let [fp (.f tl)
+              tb (cir/new-block! fp)
+              eb (cir/new-block! fp)
+              mb (cir/new-block! fp)
+              (mut m) (merge-new)]
+          (open! tl)
+          (cir/condbr! fp c tb eb)
+          (cir/seal! fp tb)
+          (cir/seal! fp eb)
+          (cir/set-block! fp tb)
+          (set! (.tailok tl) tail)
+          (let [tv1 (tl-expr tl thn)
+                t1 (.terminated tl)]
+            (when (not t1)
+              (merge-add! tl (mut m) tv1)
+              (open! tl)
+              (cir/br! fp mb))
+            (set! (.terminated tl) false)
+            (cir/set-block! fp eb)
+            (set! (.tailok tl) tail)
+            (let [tv2 (tl-expr tl els)
+                  t2 (.terminated tl)]
+              (when (not t2)
+                (merge-add! tl (mut m) tv2)
+                (open! tl)
+                (cir/br! fp mb))
+              (cir/seal! fp mb)
+              (cir/set-block! fp mb)
+              (set! (.terminated tl) (and t1 t2))
+              (if (.terminated tl) (tv-none) (merge-result tl m))))))))
+
+(defn tl-loop-index [(tl (ptr Tl)) (label (Option (slice u8)))] (-> i64)
+  (let [n (len (.loops tl))]
+    (match label
+      (None [] (if (= n 0) (do (tl-fail "break/continue outside a loop") 0) (- n 1)))
+      (Some [want]
+            (let [(mut i) (- n 1)]
+              (block :found
+                (while (>= i 0)
+                  (match (.label (al-at [TLoop] (field tl loops) i))
+                    (Some [have] (when (= have want) (return-from :found i)))
+                    (None [] 0))
+                  (set! i (- i 1)))
+                (tl-fail (sconcat (.a tl) "no such loop label: " want))))))))
+
+(defn tl-loop [(tl (ptr Tl)) (label (Option (slice u8))) (body (ptr (ArrayList Expr)))] (-> TV)
+  (let [fp (.f tl)
+        head (cir/new-block! fp)
+        exit (cir/new-block! fp)]
+    (open! tl)
+    (cir/br! fp head)
+    (cir/set-block! fp head)
+    (push! (mut (.loops tl)) (TLoop :label label :head head :exit exit :resvar (none32) :reskind 2 :resty (TVoid) :has-res false))
+    (tl-stmts tl body)
+    (when (not (.terminated tl))
+      (open! tl)
+      (cir/br! fp head))
+    (cir/seal! fp head)
+    (let [lp (get (.loops tl) (- (len (.loops tl)) 1))]
+      (pop! (mut (.loops tl)))
+      (cir/seal! fp exit)
+      (cir/set-block! fp exit)
+      (if (.has-res lp)
+          (do (set! (.terminated tl) false)
+              (if (= (.resvar lp) (none32))
+                  (tv-s (iconst tl 0) (i64t))
+                  (TV :kind (.reskind lp) :v (cir/use-var! fp (.resvar lp)) :ty (.resty lp))))
+          (do (set! (.terminated tl) true)
+              (tv-none))))))
+
+(defn tl-break [(tl (ptr Tl)) (label (Option (slice u8))) (value (Option (ptr Expr)))] (-> TV)
+  (if (.terminated tl)
+      (tv-none)
+      (let [tv (match value
+                 (Some [ve] (tl-expr tl ve))
+                 (None [] (tv-s (iconst tl 0) (i64t))))]
+        (if (.terminated tl)
+            (tv-none)
+            (let [li (tl-loop-index tl label)
+                  lp (al-at [TLoop] (field tl loops) li)]
+              (set! (.has-res lp) true)
+              (when (!= (.kind tv) 2)
+                (when (= (.resvar lp) (none32))
+                  (let [k (if (= (.kind tv) 3) 0 (.kind tv))
+                        (mut t) (.ty tv)]
+                    (set! (.reskind lp) k)
+                    (set! (.resty lp) (.ty tv))
+                    (set! (.resvar lp) (cir/new-var! (.f tl) (if (= k 1) cir/T-I64 (tl-cty (mut t)))))))
+                (open! tl)
+                (if (= (.reskind lp) 1)
+                    (do (set! (.frame-escapes (.f tl)) true)
+                        (cir/def-var! (.f tl) (.resvar lp) (place tl tv)))
+                    (cir/def-var! (.f tl) (.resvar lp) (coerce-scalar tl (scalar tl tv) (.ty tv) (.resty lp)))))
+              (open! tl)
+              (cir/br! (.f tl) (.exit lp))
+              (set! (.terminated tl) true)
+              (tv-none))))))
+
+; ---- sums ----
+
+(defn tl-construct [(tl (ptr Tl)) (sum (slice u8)) (variant (slice u8)) (args (ptr (ArrayList Expr)))] (-> TV)
+  (let [g (.g tl)
+        su (g-sum-idx g sum)]
+    (when (< su 0) (tl-fail (sconcat (.a tl) "construct of unknown sum: " sum)))
+    (let [vidx (g-variant-idx g su variant)
+          (mut sumty) (TStruct sum)
+          s (new-slot tl (mut sumty))
+          vs (load (field (sum-at (field g layouts) su) variants))
+          vfields (load (field (al-at [Variant] vs vidx) fields))]
+      (store-n tl s 0 (iconst tl vidx) 4)
+      (for i (range 0 (len (load args)))
+        (let [tv (tl-expr tl (elem args i))
+              off (g-natural-off g vfields i)]
+          (store-tv tl s (+ 8 off) tv)))
+      (tv-p s (TStruct sum)))))
+
+(defn tl-match [(tl (ptr Tl)) (scrut (ptr Expr)) (arms (ptr (ArrayList Arm)))] (-> TV)
+  (let [g (.g tl)
+        a (.a tl)
+        stv (tl-expr tl scrut)
+        (mut t) (.ty stv)
+        borrowed (match t (TPtr [inner] (match (load inner) (TStruct [_] true) (_ false))) (_ false))
+        sumname (match t
+                  (TStruct [nm] nm)
+                  (TPtr [inner] (match (load inner) (TStruct [nm] nm) (_ "")))
+                  (_ ""))
+        su (g-sum-idx g sumname)]
+    (when (< su 0) (tl-fail (sconcat a "match on non-sum: " sumname)))
+    (let [base (if borrowed (scalar tl stv) (place tl stv))
+          vs (load (field (sum-at (field g layouts) su) variants))
+          narms (len (load arms))
+          ncases (if (arms-have-wildcard arms) (- narms 1) narms)
+          fp (.f tl)
+          tag (load-n tl base 0 4)
+          (mut blocks) (ArrayList::new [u32] a)
+          (mut vals) (ArrayList::new [u64] a)
+          (mut tgts) (ArrayList::new [u32] a)
+          mb (cir/new-block! fp)
+          (mut m) (merge-new)
+          (mut anylive) false]
+      (for i (range 0 narms) (push! (mut blocks) (cir/new-block! fp)))
+      (for i (range 0 ncases)
+        (let [arm (al-at [Arm] arms i)
+              vidx (g-variant-idx g su (.variant arm))
+              (mut dup) false]
+          ; the first arm for a variant wins
+          (for j (range 0 (len vals)) (when (= (get vals j) (primitive/cast u64 vidx)) (set! dup true)))
+          (unless dup
+            (push! (mut vals) (primitive/cast u64 vidx))
+            (push! (mut tgts) (get blocks i)))))
+      (let [default (if (= ncases narms) (cir/new-block! fp) (get blocks ncases))]
+        (open! tl)
+        (cir/switch! fp tag default (cast (ptr (ArrayList u64)) (mut vals)) (cast (ptr (ArrayList u32)) (mut tgts)))
+        (for i (range 0 narms) (cir/seal! fp (get blocks i)))
+        (when (= ncases narms)
+          (cir/seal! fp default)
+          (cir/set-block! fp default)
+          (cir/unreachable! fp)))
+      (for i (range 0 narms)
+        (let [arm (al-at [Arm] arms i)
+              vidx (if (>= i ncases) 0 (g-variant-idx g su (.variant arm)))
+              vfields (load (field (al-at [Variant] vs vidx) fields))
+              mark (scope-mark tl)]
+          (cir/set-block! fp (get blocks i))
+          (set! (.terminated tl) false)
+          (let [binds (load (field arm binds))]
+            (for j (range 0 (len (load binds)))
+              (let [fty (.ty (al-at [Field] vfields j))
+                    foff (g-natural-off g vfields j)
+                    bname (get (load binds) j)]
+                (if (and borrowed (starts-with bname "$match.ref."))
+                    (bind! tl bname (tv-s (addi tl base (+ 8 foff)) (TPtr (box-ty tl fty))))
+                    (bind! tl bname (read-at tl base (+ 8 foff) fty))))))
+          (let [btv (tl-expr tl (field arm body))]
+            (scope-pop! tl mark)
+            (unless (.terminated tl)
+              (merge-add! tl (mut m) btv)
+              (set! anylive true)
+              (open! tl)
+              (cir/br! fp mb)))))
+      (cir/seal! fp mb)
+      (cir/set-block! fp mb)
+      (if anylive
+          (do (set! (.terminated tl) false) (merge-result tl m))
+          (do (set! (.terminated tl) true) (tv-none))))))
+
+; ---- bit structs ----
+
+(defn tl-bitget [(tl (ptr Tl)) (p (ptr Expr)) (fname (slice u8))] (-> TV)
+  (let [ptv (tl-expr tl p)
+        pt (pointee tl ptv)]
+    (match pt
+      (TStruct [nm]
+               (let [(mut low) (zeroed i64) (mut width) (zeroed i64) (mut signed) (zeroed bool) (mut back) (zeroed i64)]
+                 (g-bits-info (.g tl) nm fname (mut low) (mut width) (mut signed) (mut back))
+                 (let [wb (bits-window! (mut low) (mut back))
+                       addr (addi tl (scalar tl ptv) wb)
+                       w (load-bytes tl addr 0 (/ back 8))
+                       sh (if (> low 0) (op2 tl cir/OP-LSHR cir/T-I64 w (iconst tl low) 0 0) w)
+                       v (if (< width 64) (op1 tl (if signed cir/OP-SEXT cir/OP-ZEXT) cir/T-I64 sh width 0) sh)]
+                   (tv-s v (if (= width 1) (TBool) (TInt width signed))))))
+      (_ (tl-fail "bit-get through non-struct pointer")))))
+
+(defn tl-bitset [(tl (ptr Tl)) (p (ptr Expr)) (fname (slice u8)) (val (ptr Expr))] (-> TV)
+  (let [ptv (tl-expr tl p)
+        vtv (tl-expr tl val)
+        pt (pointee tl ptv)]
+    (match pt
+      (TStruct [nm]
+               (let [(mut low) (zeroed i64) (mut width) (zeroed i64) (mut signed) (zeroed bool) (mut back) (zeroed i64)]
+                 (g-bits-info (.g tl) nm fname (mut low) (mut width) (mut signed) (mut back))
+                 (let [wb (bits-window! (mut low) (mut back))
+                       addr (addi tl (scalar tl ptv) wb)
+                       nbytes (/ back 8)
+                       w (load-bytes tl addr 0 nbytes)
+                       fieldmask (if (>= width 64) -1 (- (<< 1 width) 1))
+                       cleared (op2 tl cir/OP-AND cir/T-I64 w (iconst tl (^ (<< fieldmask low) -1)) 0 0)
+                       vm (op2 tl cir/OP-AND cir/T-I64 (scalar tl vtv) (iconst tl fieldmask) 0 0)
+                       vs (if (> low 0) (op2 tl cir/OP-SHL cir/T-I64 vm (iconst tl low) 0 0) vm)
+                       nw (op2 tl cir/OP-OR cir/T-I64 cleared vs 0 0)]
+                   (store-bytes tl addr 0 nw nbytes)
+                   vtv)))
+      (_ (tl-fail "bit-set through non-struct pointer")))))
+
+; ---- intrinsics ----
+
+(defn tl-intrinsic [(tl (ptr Tl)) (op Intrinsic) (result Type) (args (ptr (ArrayList Expr)))] (-> TV)
+  (match op
+    (IStackBytes []
+                 (let [n (scalar tl (tl-expr tl (elem args 0)))]
+                   (set! (.has-dynamic-alloca (.f tl)) true)
+                   (tv-s (op1 tl cir/OP-DYNALLOCA cir/T-I64 n 16 0) result)))
+    (IVolatileLoad [] (tl-load tl (tl-expr tl (elem args 0))))
+    (IAliasLoad [] (tl-load tl (tl-expr tl (elem args 0))))
+    (IVolatileStore [] (tl-store tl (tl-expr tl (elem args 0)) (tl-expr tl (elem args 1))))
+    (IAliasStore [] (tl-store tl (tl-expr tl (elem args 0)) (tl-expr tl (elem args 1))))
+    (IFence [] (do (open! tl) (cir/op0! (.f tl) cir/OP-FENCE cir/T-VOID 0 0) (tv-s (iconst tl 0) (i64t))))
+    (ILinkerAddress [symbol]
+                    (let [sym (mobj-add-sym! (mut (.obj (.g tl))) (g-mangle (.g tl) symbol) 0 0 true)]
+                      (tv-s (sym-val tl sym) result)))
+    (_ (tl-fail "codegen: machine-code outside a machine-code function (checker bug)"))))
+
+; ---- trait objects ----
+
+(defn tl-make-dyn [(tl (ptr Tl)) (ds (slice u8)) (_vt (slice u8)) (methods (ptr (ArrayList (slice u8)))) (inner (ptr Expr))] (-> TV)
+  (let [g (.g tl)
+        a (.a tl)
+        buf (mobj-sect-buf (mut (.obj g)) (.datasec g))]
+    (b-align! (mut buf) 8)
+    (let [vtoff (len (load buf))
+          nm (sconcat a "l_vtable." (i64->str a (.nglob g)))]
+      (set! (.nglob g) (+ (.nglob g) 1))
+      (for i (range 0 (len (load methods)))
+        (let [mnm (get (load methods) i)
+              msi (g-sig-idx g mnm)]
+          (when (< msi 0) (tl-fail (sconcat a "make-dyn: unknown method " mnm)))
+          (mobj-add-reloc! (mut (.obj g)) (.datasec g) (len (load buf))
+                           (.symidx (al-at [GSig] (field g sigs) msi)) (reloc-unsigned) false 3)
+          (b-u64! (mut buf) 0)))
+      (let [vtsym (mobj-add-sym! (mut (.obj g)) nm (.datasec g) vtoff false)
+            iv (scalar tl (tl-expr tl inner))
+            s (new-slot-bytes tl 16 8)]
+        (store-n tl s 0 iv 8)
+        (store-n tl s 8 (sym-val tl vtsym) 8)
+        (tv-p s (TStruct ds))))))
+
+(defn tl-dyn-dispatch [(tl (ptr Tl)) (dc (ptr DynCall))] (-> TV)
+  (let [a (.a tl)
+        rtv (tl-expr tl (.recv dc))
+        r (place tl rtv)
+        data (load-n tl r 0 8)
+        vt (load-n tl r 8 8)
+        fnp (load-n tl vt (* (.method_index dc) 8) 8)
+        (mut ptys) (ArrayList::new [Type] a)
+        (mut tvs) (ArrayList::new [TV] a)]
+    (push! (mut ptys) (TPtr (box-ty tl (TInt 8 true))))
+    (for i (range 0 (len (load (.params dc))))
+      (push! (mut ptys) (get (load (.params dc)) i)))
+    (push! (mut tvs) (tv-s data (TPtr (box-ty tl (TInt 8 true)))))
+    (for i (range 0 (len (load (.args dc))))
+      (push! (mut tvs) (tl-expr tl (elem (.args dc) i))))
+    (tl-emit-call tl (none32) fnp (box-al [Type] a (load ptys)) false (.ret dc) (box-al [TV] a (load tvs)) false)))
+
+; ============================ calls ==========================================
+
+(defn ret-void? [(t (ptr Type))] (-> bool) (match (load t) (TVoid [] true) (_ false)))
+
+;;; CIR argument flags and values for one call argument per AAPCS64 (Apple).
+(defn push-arg! [(tl (ptr Tl)) (args (mut (ArrayList u32))) (flags (mut (ArrayList u32))) (v u32) (fl u32)] (-> void)
+  (push! (mut args) v)
+  (push! (mut flags) fl))
+
+(defn group-flags [(remaining i64)] (-> u32) (<< (u32-of remaining) (: 16 u32)))
+
+;;; Lower one argument TV of type t to CIR arguments.
+(defn lower-arg! [(tl (ptr Tl)) (args (mut (ArrayList u32))) (flags (mut (ArrayList u32))) (tv TV) (variadic bool)] (-> void)
+  (let [g (.g tl)
+        (mut t) (.ty tv)
+        info (g-abi-info g (mut t))
+        cls (abi-cls info)
+        vf (if variadic cir/AF-VARIADIC (: 0 u32))]
+    (cond
+      (= cls 6) 0
+      (or (= cls 0) (= cls 1))
+        (do (push-arg! tl (mut args) (mut flags) (scalar tl tv) vf) 0)
+      (wide? (mut t)) (do (push-arg! tl (mut args) (mut flags) (scalar tl tv) vf) 0)
+      (= cls 2)
+        (do (push-arg! tl (mut args) (mut flags) (load-bytes tl (place tl tv) 0 (tsize tl (mut t))) vf) 0)
+      (= cls 3)
+        (let [p (place tl tv)
+              sz (tsize tl (mut t))
+              lo (load-bytes tl p 0 8)
+              hi (load-bytes tl p 8 (if (>= (- sz 8) 8) 8 (- sz 8)))]
+          (push-arg! tl (mut args) (mut flags) lo (| vf (group-flags 1)))
+          (push-arg! tl (mut args) (mut flags) hi vf)
+          0)
+      (= cls 5)
+        (let [p (place tl tv)
+              hn (abi-hfa-n info)
+              lb (/ (abi-hfa-bits info) 8)
+              ft (if (= lb 4) (TFloat 32) (TFloat 64))]
+          (for j (range 0 hn)
+            (let [(mut ftt) ft]
+              (push-arg! tl (mut args) (mut flags) (load-scalar tl p (* j lb) (mut ftt))
+                         (| vf (if variadic (: 0 u32) (group-flags (- (- hn j) 1)))))))
+          0)
+      :else
+        ; indirect: a private copy, passed by address
+        (let [cp (new-slot tl (mut t))]
+          (memcpy tl cp (place tl tv) (tsize tl (mut t)))
+          (set! (.frame-escapes (.f tl)) true)
+          (push-arg! tl (mut args) (mut flags) cp vf)
+          0))))
+
+;;; A by-value aggregate parameter given a pointer (codegen_a64's
+;;; g-pass-places-by-value!): pass what it points at.
+(defn by-value-arg [(tl (ptr Tl)) (pt Type) (tv TV)] (-> TV)
+  (let [(mut ptt) pt
+        (mut at) (.ty tv)]
+    (if (and (not (tl-scalar? (mut ptt)))
+             (match at (TPtr [_] true) (TRef [_ _] true) (_ false)))
+        (tv-p (scalar tl tv) pt)
+        tv)))
+
+;;; Emit a call: `sym` (a MObj symbol) or the pointer value `fnp`. Returns the
+;;; result TV per the return class.
+(defn tl-emit-call [(tl (ptr Tl)) (sym u32) (fnp u32) (params (ptr (ArrayList Type))) (variadic bool) (ret Type)
+                    (tvs (ptr (ArrayList TV))) (tail bool)] (-> TV)
+  (let [g (.g tl)
+        a (.a tl)
+        nargs (len (load tvs))
+        nparams (len (load params))
+        (mut rt) ret
+        retvoid (ret-void? (mut rt))
+        retinfo (if retvoid (mk-abi-scalar) (g-abi-info g (mut rt)))
+        rcls (if retvoid -1 (abi-cls retinfo))
+        (mut args) (ArrayList::new [u32] a)
+        (mut flags) (ArrayList::new [u32] a)
+        (mut rts) (ArrayList::new [u8] a)
+        sret-slot (if (= rcls 4) (new-slot tl (mut rt)) (none32))]
+    (when (= rcls 4)
+      (push-arg! tl (mut args) (mut flags) sret-slot cir/AF-SRET))
+    (for i (range 0 nargs)
+      (let [tv0 (get (load tvs) i)
+            tv (if (< i nparams) (by-value-arg tl (get (load params) i) tv0) tv0)]
+        (lower-arg! tl (mut args) (mut flags) tv (>= i nparams))))
+    ; result types
+    (cond
+      (or retvoid (= rcls 4) (= rcls 6)) 0
+      (or (= rcls 0) (= rcls 1)) (push! (mut rts) (primitive/cast u8 (tl-cty (mut rt))))
+      (wide? (mut rt)) (push! (mut rts) (primitive/cast u8 cir/T-I128))
+      (= rcls 2) (push! (mut rts) (primitive/cast u8 cir/T-I64))
+      (= rcls 3) (do (push! (mut rts) (primitive/cast u8 cir/T-I64)) (push! (mut rts) (primitive/cast u8 cir/T-I64)))
+      (= rcls 5) (for j (range 0 (abi-hfa-n retinfo))
+                   (push! (mut rts) (primitive/cast u8 (if (= (abi-hfa-bits retinfo) 32) cir/T-F32 cir/T-F64))))
+      :else 0)
+    (open! tl)
+    (let [c (cir/call! (.f tl) (if (= sym (none32)) (none32) (tl-sym tl (i64-of sym))) fnp
+                       (cast (ptr (ArrayList u32)) (mut args)) (cast (ptr (ArrayList u32)) (mut flags))
+                       (cast (ptr (ArrayList u8)) (mut rts)) tail)]
+      (when tail (set! (.terminated tl) true))
+      (cond
+        tail (tv-none)
+        retvoid (tv-s (iconst tl 0) (i64t))
+        (= rcls 4) (tv-p sret-slot ret)
+        (= rcls 6) (tv-p (new-slot-bytes tl 1 1) ret)
+        (wide? (mut rt)) (tv-s c ret)
+        (= rcls 0) (tv-s (canon tl c (mut rt)) ret)
+        (= rcls 1) (tv-s c ret)
+        :else
+          (let [s (new-slot tl (mut rt))
+                sz (tsize tl (mut rt))]
+            (cond
+              (= rcls 2) (store-bytes tl s 0 c sz)
+              (= rcls 3) (do (store-bytes tl s 0 c 8)
+                             (store-bytes tl s 8 (cir/call-result (.f tl) c 1) (if (>= (- sz 8) 8) 8 (- sz 8))))
+              :else (let [lb (/ (abi-hfa-bits retinfo) 8)
+                          ft (if (= lb 4) (TFloat 32) (TFloat 64))]
+                      (for j (range 0 (abi-hfa-n retinfo))
+                        (let [(mut ftt) ft]
+                          (store-scalar tl s (* j lb) (cir/call-result (.f tl) c j) (mut ftt))))
+                      0))
+            (tv-p s ret))))))
+
+;; Whether two signatures lower to the same CIR shape (the musttail rule).
+(defn same-scalar-type? [(tl (ptr Tl)) (x (ptr Type)) (y (ptr Type))] (-> bool)
+  (let [cx (tl-cty x) cy (tl-cty y)]
+    (and (>= cx 0) (= cx cy)
+         (match (load x)
+           (TInt [bx _] (match (load y) (TInt [by _] (= bx by)) (_ false)))
+           (TBool [] (match (load y) (TBool [] true) (_ false)))
+           (_ true)))))
+
+(defn tail-callable? [(tl (ptr Tl)) (sig (ptr GSig))] (-> bool)
+  (let [fd (.fd tl)
+        ps (load (field sig params))
+        fps (load (field fd params))
+        (mut ok) (and (not (.variadic sig)) (not (.shim sig)) (= (len (.inline_code sig)) 0)
+                      (= (len (load ps)) (len (load fps))))]
+    (when ok
+      (let [(mut r1) (.ret sig) (mut r2) (.ret fd)
+            v1 (ret-void? (mut r1)) v2 (ret-void? (mut r2))]
+        (set! ok (or (and v1 v2) (and (not v1) (not v2) (same-scalar-type? tl (mut r1) (mut r2))))))
+      (for i (range 0 (len (load ps)))
+        (when ok
+          (let [(mut p1) (get (load ps) i)
+                (mut p2) (.ty (al-at [Param] fps i))]
+            (set! ok (same-scalar-type? tl (mut p1) (mut p2)))))))
+    ok))
+
+(defn tl-call-named [(tl (ptr Tl)) (func (slice u8)) (args (ptr (ArrayList Expr))) (tail bool)] (-> TV)
+  (let [g (.g tl)
+        si (g-sig-idx g func)]
+    (when (< si 0) (tl-fail (sconcat (.a tl) "call to unknown function: " func)))
+    (let [sig (al-at [GSig] (field g sigs) si)
+          (mut tvs) (ArrayList::new [TV] (.a tl))]
+      (block :args
+        (for i (range 0 (len (load args)))
+          (push! (mut tvs) (tl-expr tl (elem args i)))
+          (when (.terminated tl) (return-from :args 0)))
+        0)
+      (cond
+        (.terminated tl) (tv-none)
+        (tl-leaf-inline? tl sig) (tl-leaf-inline tl sig (cast (ptr (ArrayList TV)) (mut tvs)))
+        (.shim sig) (tl-fail (sconcat (.a tl) "tpde: :shim conventions are not supported yet: " func))
+        :else
+          (let [t (and tail (tail-callable? tl sig))]
+            (tl-emit-call tl (u32-of (.symidx sig)) (none32) (load (field sig params)) (.variadic sig) (.ret sig)
+                          (cast (ptr (ArrayList TV)) (mut tvs)) t))))))
+
+(defn tl-leaf-inline? [(tl (ptr Tl)) (sig (ptr GSig))] (-> bool)
+  (let [fd (load (field sig func))]
+    (if (or (= (primitive/cast i64 fd) 0)
+            (match (.inline_policy sig) (Some [(Always)] false) (_ true))
+            (>= (.inline-depth tl) 16)
+            (= (.name fd) (.selfname tl)))
+        false
+        (let [ps (load (field fd params))
+              (mut ok) (tl-scalar? (field fd ret))]
+          (for i (range 0 (len (load ps)))
+            (unless (tl-scalar? (field (elem ps i) ty)) (set! ok false)))
+          (and ok (g-leaf-inline-body? fd))))))
+
+(defn tl-leaf-inline [(tl (ptr Tl)) (sig (ptr GSig)) (tvs (ptr (ArrayList TV)))] (-> TV)
+  (let [fd (load (field sig func))
+        ps (load (field fd params))
+        mark (scope-mark tl)]
+    (for i (range 0 (len (load ps)))
+      (bind! tl (.name (elem ps i)) (get (load tvs) i)))
+    (set! (.inline-depth tl) (+ (.inline-depth tl) 1))
+    (let [r (tl-expr tl (elem (load (field fd body)) 0))]
+      (set! (.inline-depth tl) (- (.inline-depth tl) 1))
+      (scope-pop! tl mark)
+      r)))
+
+(defn tl-call-ptr [(tl (ptr Tl)) (fp (ptr Expr)) (args (ptr (ArrayList Expr))) (tail bool)] (-> TV)
+  (let [fptv (tl-expr tl fp)
+        (mut t) (.ty fptv)]
+    (match t
+      (TFn [_cc params ret]
+           (let [(mut tvs) (ArrayList::new [TV] (.a tl))]
+             (for i (range 0 (len (load args)))
+               (push! (mut tvs) (tl-expr tl (elem args i))))
+             (tl-emit-call tl (none32) (scalar tl fptv) params false (load ret) (cast (ptr (ArrayList TV)) (mut tvs)) false)))
+      (_ (tl-fail "call-ptr on non-fnptr value")))))
+
+; ============================ functions ======================================
+
+;;; Lower one function's parameters to CIR arguments and bindings.
+(defn tl-params! [(tl (ptr Tl)) (fd (ptr Func))] (-> void)
+  (let [g (.g tl)
+        fp (.f tl)
+        ps (load (field fd params))]
+    (when (= (abi-cls (.retinfo tl)) 4)
+      (set! (.sret tl) (cir/arg! fp cir/T-I64 true)))
+    (for i (range 0 (len (load ps)))
+      (let [prm (elem ps i)
+            t (field prm ty)
+            info (g-abi-info g t)
+            cls (abi-cls info)]
+        (cond
+          (= cls 6) (bind! tl (.name prm) (tv-p (new-slot-bytes tl 1 1) (load t)))
+          (wide? t) (bind! tl (.name prm) (tv-s (cir/arg! fp cir/T-I128 false) (load t)))
+          (or (= cls 0) (= cls 1))
+            (let [v (cir/arg! fp (tl-cty t) false)]
+              ; C callers extend narrow arguments to 32 bits only
+              (bind! tl (.name prm) (tv-s (canon tl v t) (load t))))
+          (= cls 2)
+            (let [v (cir/arg! fp cir/T-I64 false)
+                  s (new-slot tl t)]
+              (store-bytes tl s 0 v (tsize tl t))
+              (bind! tl (.name prm) (tv-p s (load t))))
+          (= cls 3)
+            (let [lo (cir/arg-flagged! fp cir/T-I64 false (group-flags 1))
+                  hi (cir/arg! fp cir/T-I64 false)
+                  s (new-slot tl t)
+                  sz (tsize tl t)]
+              (store-bytes tl s 0 lo 8)
+              (store-bytes tl s 8 hi (if (>= (- sz 8) 8) 8 (- sz 8)))
+              (bind! tl (.name prm) (tv-p s (load t))))
+          (= cls 5)
+            (let [hn (abi-hfa-n info)
+                  lb (/ (abi-hfa-bits info) 8)
+                  ft (if (= lb 4) (TFloat 32) (TFloat 64))
+                  s (new-slot tl t)]
+              (for j (range 0 hn)
+                (let [(mut ftt) ft
+                      v (cir/arg-flagged! fp (tl-cty (mut ftt)) false (group-flags (- (- hn j) 1)))]
+                  (store-scalar tl s (* j lb) v (mut ftt))))
+              (bind! tl (.name prm) (tv-p s (load t))))
+          :else
+            ; indirect: the caller's private copy
+            (bind! tl (.name prm) (tv-p (cir/arg! fp cir/T-I64 false) (load t))))))))
+
+(defn tl-return! [(tl (ptr Tl)) (tv TV)] (-> void)
+  (let [fp (.f tl)
+        (mut rt) (.retty tl)
+        rcls (abi-cls (.retinfo tl))]
+    (open! tl)
+    (cond
+      (ret-void? (mut rt)) (cir/ret0! fp)
+      (wide? (mut rt)) (cir/ret1! fp (coerce-scalar tl (scalar tl tv) (.ty tv) (.retty tl)))
+      (or (= rcls 0) (= rcls 1)) (cir/ret1! fp (coerce-scalar tl (scalar tl tv) (.ty tv) (.retty tl)))
+      (= rcls 6) (cir/ret0! fp)
+      (= rcls 4)
+        (do (memcpy tl (.sret tl) (place tl tv) (tsize tl (mut rt)))
+            (open! tl)
+            (cir/ret0! fp))
+      :else
+        (let [p (place tl tv)
+              sz (tsize tl (mut rt))
+              (mut vals) (ArrayList::new [u32] (.a tl))]
+          (cond
+            (= rcls 2) (push! (mut vals) (load-bytes tl p 0 sz))
+            (= rcls 3) (do (push! (mut vals) (load-bytes tl p 0 8))
+                           (push! (mut vals) (load-bytes tl p 8 (if (>= (- sz 8) 8) 8 (- sz 8)))))
+            :else (let [info (.retinfo tl)
+                        lb (/ (abi-hfa-bits info) 8)
+                        ft (if (= lb 4) (TFloat 32) (TFloat 64))]
+                    (for j (range 0 (abi-hfa-n info))
+                      (let [(mut ftt) ft]
+                        (push! (mut vals) (load-scalar tl p (* j lb) (mut ftt)))))))
+          (open! tl)
+          (cir/ret! fp (cast (ptr (ArrayList u32)) (mut vals)))))
+    0))
+
+;;; Lower and compile one Coil function.
+(defn tl-func! [(tl (ptr Tl)) (fd (ptr Func))] (-> void)
+  (let [g (.g tl)
+        fp (.f tl)
+        si (g-sig-idx g (.name fd))]
+    (when (< si 0) (tl-fail (sconcat (.a tl) "tpde: unregistered function " (.name fd))))
+    (let [sig (al-at [GSig] (field g sigs) si)]
+      (when (.shim sig) (tl-fail (sconcat (.a tl) "tpde: :shim conventions are not supported yet: " (.name fd))))
+      (cir/reset! fp (.name fd))
+      (clear! (mut (.env tl)))
+      (clear! (mut (.loops tl)))
+      (clear! (mut (.allocs tl)))
+      (set! (.fd tl) fd)
+      (set! (.retty tl) (.ret fd))
+      (let [(mut rt) (.ret fd)]
+        (set! (.retinfo tl) (if (ret-void? (mut rt)) (mk-abi-scalar) (g-abi-info g (mut rt)))))
+      (set! (.sret tl) (none32))
+      (set! (.terminated tl) false)
+      (set! (.tailok tl) false)
+      (set! (.inline-depth tl) 0)
+      (set! (.selfname tl) (.name fd))
+      ; which stack slots become SSA variables
+      (let [(mut penv) (ArrayList::new [PBind] (.a tl))]
+        (scan-list! tl (cast (ptr (ArrayList PBind)) (mut penv)) (load (field fd body))))
+      (let [entry (cir/new-block! fp)]
+        (cir/set-block! fp entry)
+        (cir/seal! fp entry))
+      (tl-params! tl fd)
+      (let [r (tl-body-tail tl (load (field fd body)) true)]
+        (unless (.terminated tl) (tl-return! tl r)))
+      (when (not (cir/terminated? fp)) (cir/unreachable! fp))
+      (cir/finish! fp)
+      (let [tsym (tl-sym tl (.symidx sig))]
+        (unless (isel/compile! (.c tl) tsym)
+          (tl-fail (sconcat (.a tl) "tpde: failed to compile " (.name fd))))
+        (push! (mut (.defined tl)) (.symidx sig))
+        (push! (mut (.defined tl)) (i64-of tsym))))))
+
+;;; A machine-code function: its bytes, then a return unless it never returns.
+(defn tl-machine-code-func! [(tl (ptr Tl)) (fd (ptr Func)) (code MachineCodeBody)] (-> void)
+  (match (machine-code-target-error (.a tl) (.name fd) (.arch code) "aarch64")
+    (Some [message] (tl-fail (sconcat3 (.a tl) "codegen: " message " (checker bug)")))
+    (None [] 0))
+  (let [g (.g tl)
+        si (g-sig-idx g (.name fd))
+        sig (al-at [GSig] (field g sigs) si)
+        text (tasm/sect-buf (.ta tl) tasm/SEC-TEXT)
+        start (.len (load text))
+        bytes (load (.bytes code))]
+    (for i (range 0 (len bytes)) (tbuf/emit8! text (get bytes i)))
+    (when (func-machine-code-returns? fd) (tbuf/emit32! text (: 0xD65F03C0 u32)))
+    (let [tsym (tl-sym tl (.symidx sig))]
+      (tasm/sym-def! (.ta tl) tsym tasm/SEC-TEXT start (- (.len (load text)) start))
+      (push! (mut (.defined tl)) (.symidx sig))
+      (push! (mut (.defined tl)) (i64-of tsym)))))
+
+; ============================ the module =====================================
+
+;;; Move tpde's text, constants, symbols and relocations into the MObj.
+(defn tl-merge! [(tl (ptr Tl))] (-> void)
+  (let [g (.g tl)
+        a (.a tl)
+        ta (.ta tl)
+        text (tasm/sect-buf ta tasm/SEC-TEXT)
+        tconst (tasm/sect-buf ta tasm/SEC-CONST)
+        textbuf (mobj-sect-buf (mut (.obj g)) (.text g))
+        text-base (len (load textbuf))]
+    (b-bytes! (mut textbuf) (tbuf/as-slice text))
+    ; tpde's own constants go to the const section
+    (let [cbuf (mobj-sect-buf (mut (.obj g)) (.constsec g))]
+      (b-align! (mut cbuf) 16)
+      (mobj-sect-align-at-least! (mut (.obj g)) (.constsec g) 4)
+      (let [const-base (len (load cbuf))]
+        (b-bytes! (mut cbuf) (tbuf/as-slice tconst))
+        ; map every tpde symbol to a MObj one
+        (for i (range 0 (len (.syms (load ta))))
+          (while (< (len (.tsym-mobj tl)) (+ i 1)) (push! (mut (.tsym-mobj tl)) -1))
+          (when (< (get (.tsym-mobj tl) i) 0)
+            (let [s (tasm/sym-at ta (u32-of i))]
+              (cond
+                (= (.sect s) tasm/SEC-CONST)
+                  (set! (mut (.tsym-mobj tl)) i
+                        (mobj-add-sym! (mut (.obj g)) (sconcat a "l_tpde." (i64->str a i)) (.constsec g) (+ const-base (.off s)) false))
+                :else
+                  ; a runtime function tpde calls (memcpy, __divti3, ...)
+                  (let [(mut name) ""]
+                    (for k (range 0 (len (.rt-names (load ta))))
+                      (when (= (get (.rt-syms (load ta)) k) (u32-of i)) (set! name (get (.rt-names (load ta)) k))))
+                    (set! (mut (.tsym-mobj tl)) i (g-runtime-sym! g (sconcat a "_" name))))))))))
+    ; functions tpde defined
+    (let [n (/ (len (.defined tl)) 2)]
+      (for k (range 0 n)
+        (let [m (get (.defined tl) (* k 2))
+              t (get (.defined tl) (+ (* k 2) 1))
+              s (tasm/sym-at ta (u32-of t))]
+          (mobj-set-sym! (mut (.obj g)) m (.text g) (+ text-base (.off s))))))
+    ; relocations
+    (for i (range 0 (len (.relocs (load ta))))
+      (let [r (get (.relocs (load ta)) i)
+            msym (get (.tsym-mobj tl) (i64-of (.sym r)))
+            k (primitive/cast i64 (.kind r))
+            rtype (case k 0 (reloc-branch26) 1 (reloc-page21) 2 (reloc-pageoff12) 3 (reloc-got-load-page21) 4 (reloc-got-load-pageoff12) (reloc-unsigned))
+            pcrel (or (= k 0) (= k 1) (= k 3))
+            ln (if (= k 5) 3 2)]
+        (when (!= (.sect r) tasm/SEC-TEXT) (tl-fail "tpde: relocation outside the text section"))
+        (mobj-add-reloc! (mut (.obj g)) (.text g) (+ text-base (.off r)) msym rtype pcrel ln)))))
+
+
+;;; codegen_a64's module-level setup (cga64-build-mobj up to function
+;;; emission): signatures, layouts, statics, export thunks. The returned Cga's
+;;; `program` is the program functions are emitted from (thunks included).
+(defn tl-module-setup! [(a (dyn Allocator)) (mp0 (ptr Program))] (-> (ptr Cga))
+  (let [g (box! a Cga (zeroed Cga))]
+    (set! (.a g) a)
+    (set! (.program g) mp0)
+    (set! (.sigs g) (ArrayList::new [GSig] a))
+    (set! (.sig_index g) (HashMap::new [(slice u8) i64] a (keyops)))
+    (set! (.unit_export_index g) (HashMap::new [(slice u8) bool] a (keyops-borrowed)))
+    (set! (.export_symbol_index g) (HashMap::new [(slice u8) (slice u8)] a (keyops-borrowed)))
+    (for [i 0 (len (load (.unit_exports mp0)))]
+      (set! (mut (.unit_export_index g)) (get (load (.unit_exports mp0)) i) true))
+    (for [i 0 (len (load (.exports mp0)))]
+      (let [e (elem (.exports mp0) i)]
+        (unless (contains? (.export_symbol_index g) (.name e))
+          (match (.symbol e)
+            (Some [symbol] (set! (mut (.export_symbol_index g)) (.name e) symbol))
+            (None [] 0)))))
+    (set! (.spec_names g) (HashMap::new [(slice u8) bool] a (keyops)))
+    (set! (.obj g) (mobj-new a))
+    (set! (.asm g) (asm-new a))
+    (set! (.strs g) (ArrayList::new [GStr] a))
+    (set! (.statics g) (ArrayList::new [GStatic] a))
+    (set! (.nglob g) 0)
+    (set! (.nstatic g) 0)
+    (set! (.loops g) (ArrayList::new [GLoop] a))
+    (set! (.env g) (gscope-nil a))
+    (set! (.outfixes g) (ArrayList::new [OutFix] a))
+    (set! (.retty g) (TInt 64 true))
+    (set! (.dwtys g) (ArrayList::new [DwTy] a))
+    (set! (.dwfns g) (ArrayList::new [DwFn] a))
+    (set! (.dwvars g) (ArrayList::new [DwVar] a))
+    (set! (.dwevs g) (ArrayList::new [DwLineEv] a))
+    (set! (.dwcursrc g) -1)
+    (set! (.dwcurlo g) -1)
+    (set! (.convs g) (load (field mp0 conventions)))
+    (set! (.text g) (mobj-add-sect! (mut (.obj g)) "__TEXT" "__text" 2 2147484672))
+    (set! (.constsec g) (mobj-add-sect! (mut (.obj g)) "__TEXT" "__const" 3 0))
+    (set! (.datasec g) (mobj-add-sect! (mut (.obj g)) "__DATA" "__data" 3 0))
+    (let [thunks (export-c-thunks a mp0)
+          mp (box! a Program (load mp0))]
+      (unless (= (len thunks) 0)
+        (let [(mut funcs) (ArrayList::new [Func] a)]
+          (for f (load (.funcs mp)) (push! (mut funcs) f))
+          (for f thunks (push! (mut funcs) f))
+          (set! (.funcs mp) (box! a (ArrayList Func) (load funcs))))
+        (for i (range 0 (len (load (.exports mp))))
+          (let [e (elem (.exports mp) i)]
+            (when (export-c-needs-thunk? e)
+              (match (g-export-c-sym g (.name e))
+                (Some [symbol]
+                      (remove! (mut (.export_symbol_index g)) (.name e))
+                      (when (.published e)
+                        (set! (mut (.export_symbol_index g)) (export-c-thunk-name a (.name e)) symbol)
+                        0))
+                (None [] 0))))))
+      (g-register-types! g mp)
+      (g-eval-asserts! g mp)
+      (g-register-sigs! g mp)
+      (g-declare-statics! g mp)
+      (set! (.program g) mp)
+      g)))
+
+(defn cgtpde-build-mobj [(a (dyn Allocator)) (mp (ptr Program))] (-> MObj)
+  ; the module-level setup is codegen_a64's (signatures, statics, strings)
+  (let [g (tl-module-setup! a mp)
+        (mut ta) (tasm/Asm::new)
+        tap (cast (ptr tasm/Asm) (mut ta))
+        (mut fn) (cir/Func::new)
+        fnp (cast (ptr cir/Func) (mut fn))
+        (mut c) (tcore/Compiler::new [cir/Func] fnp tap tcore/ARCH-A64)
+        (mut tl) (zeroed Tl)]
+    (set! (.g tl) g)
+    (set! (.a tl) a)
+    (set! (.f tl) fnp)
+    (set! (.c tl) (cast (ptr (tcore/Compiler cir/Func)) (mut c)))
+    (set! (.ta tl) tap)
+    (set! (.env tl) (ArrayList::new [TBind] a))
+    (set! (.loops tl) (ArrayList::new [TLoop] a))
+    (set! (.allocs tl) (HashMap::new-scalar [u64 bool] a))
+    (set! (.sym-map tl) (ArrayList::new [u32] a))
+    (set! (.tsym-mobj tl) (ArrayList::new [i64] a))
+    (set! (.defined tl) (ArrayList::new [i64] a))
+    (let [tlp (cast (ptr Tl) (mut tl))
+          span (tr/span-begin "backend.tpde-functions")
+          fs (load (field (.program g) funcs))]
+      (for i (range 0 (len (load fs)))
+        (let [fd (al-at [Func] fs i)]
+          (unless (.declared fd)
+            (match (func-machine-code fd)
+              (Some [code] (tl-machine-code-func! tlp fd code))
+              (None [] (tl-func! tlp fd))))))
+      (tr/span-end span)
+      (tl-merge! tlp))
+    (.obj g)))
+
+(defn cgtpde-build-object [(a (dyn Allocator)) (mp (ptr Program)) (objpath (ptr i8))] (-> i64)
+  (let [(mut o) (cgtpde-build-mobj a mp)
+        bytes (macho-write (mut o))
+        fd (fs/create-file objpath 420)]
+    (set! (cga64-last-needs-curl-cell)
+          (mobj-references-undefined? (mut o) (cga64-probe-name a "_curl_easy_" "init")))
+    (set! (cga64-last-needs-llvm-cell)
+          (mobj-references-undefined? (mut o) (cga64-probe-name a "_LLVMGetDefault" "TargetTriple")))
+    (when (< fd 0) (cga-fail "cannot create object file"))
+    (let [total (len (load bytes))
+          (mut off) 0]
+      (while (< off total)
+        (let [wrote (cgtpde.write (primitive/cast i32 fd)
+                                  (primitive/cast (ptr i8) (index (data (slice (load bytes))) off))
+                                  (primitive/cast isize (- total off)))]
+          (when (<= wrote 0) (cga-fail "object write failed"))
+          (set! off (+ off (primitive/cast i64 wrote))))))
+    (cgtpde.close (primitive/cast i32 fd))
+    0))
