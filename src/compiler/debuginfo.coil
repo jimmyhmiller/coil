@@ -1,0 +1,173 @@
+; src/compiler/debuginfo.coil — the backend-neutral half of debug info.
+;
+; Every backend describes a program to the debugger with the same records
+; (dwarf.coil's DwTy / DwFn / DwVar / DwLineEv): the types of its values, its
+; functions, their variables and where each lives, and which source position
+; each stretch of code belongs to. What differs per backend is only where code
+; and variables end up, so a backend reports code offsets and frame offsets and
+; leaves the rest here:
+;
+;   - `dbg-ty-of!` turns a Coil type into a DwTy index, from the shared
+;     LayoutDb (sizes, field offsets, sum layouts), so every backend describes a
+;     type the same way;
+;   - dwarf.coil's `dw-build!` serializes the records as DWARF for the native
+;     backends (arm64, x64, tpde); the LLVM backend hands the same records to
+;     LLVM's DIBuilder instead (codegen.coil).
+;
+; Types: integers, bools and floats are base types; pointers, references and
+; function pointers are pointers (a function pointer to void); slices are
+; {data, len}; arrays are arrays; a struct with C layout is a struct; a packed
+; bit struct is an unsigned integer of its backing width; a sum is a struct of
+; its tag (an enumeration of the variant names, at 0) and a union of the
+; variants' payloads (each a struct of the variant's fields, at 8). Anything
+; else (vectors, unknown layouts) has no type, and a variable of it is not
+; described: no entry is better than a wrong one.
+(module coil.compiler.debuginfo)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.layoutdb" :use *)
+(import "coil.compiler.dwarf" :use [DwTy DwField])
+(import "coil.compiler.parser" :use [sconcat i64->str])
+
+;;; The type table every backend fills: the DwTy entries and an index from each
+;;; type's rendered name to its entry.
+(defstruct DbgTypes
+  [(tys (ArrayList DwTy))
+   (index (HashMap (slice u8) i64))
+   ; where a type's name is rendered to be looked up (a hit allocates nothing)
+   (scratch (ArrayList u8))])
+
+(defn dbg-types-new [(a (dyn Allocator))] (-> DbgTypes)
+  (DbgTypes :tys (ArrayList::new [DwTy] a) :index (HashMap::new [(slice u8) i64] a (keyops))
+            :scratch (ArrayList::new [u8] a)))
+
+(defn push-bytes! [(b (mut (ArrayList u8))) (s (slice u8))] (-> void)
+  (for i (range 0 (len s)) (push! (mut b) (get s i))))
+
+(defn push-dec! [(b (mut (ArrayList u8))) (v i64)] (-> void)
+  (when (>= v 10) (push-dec! (mut b) (/ v 10)))
+  (push! (mut b) (primitive/cast u8 (+ 48 (% v 10)))))
+
+;;; Append a type's DIE name, the key it is found by.
+(defn dbg-key! [(b (mut (ArrayList u8))) (t (ptr Type))] (-> void)
+  (match (load t)
+    (TInt [bits sg] (do (push-bytes! (mut b) (if sg "i" "u")) (push-dec! (mut b) bits)))
+    (TBool [] (push-bytes! (mut b) "bool"))
+    (TFloat [bits] (do (push-bytes! (mut b) "f") (push-dec! (mut b) bits)))
+    (TPtr [inner] (do (push-bytes! (mut b) "*") (dbg-key! (mut b) inner)))
+    (TRef [_m inner] (do (push-bytes! (mut b) "*") (dbg-key! (mut b) inner)))
+    (TFn [_ _ _] (push-bytes! (mut b) "fnptr"))
+    (TSlice [elem] (do (push-bytes! (mut b) "slice$") (dbg-key! (mut b) elem)))
+    (TStruct [nm] (push-bytes! (mut b) nm))
+    (TArray [elem n-extent]
+            (do (push-bytes! (mut b) "arr") (push-dec! (mut b) (extent-value n-extent))
+                (push-bytes! (mut b) "$") (dbg-key! (mut b) elem)))
+    (_ (push-bytes! (mut b) "?"))))
+
+(defn dbg-entry [(a (dyn Allocator)) (kind i64) (name (slice u8)) (size i64) (enc i64) (to i64)] (-> DwTy)
+  (DwTy :kind kind :name name :size size :enc enc :to to :fields (ArrayList::new [DwField] a) :count 0 :off 0))
+
+;;; Add `e` under `name`; its index.
+(defn dbg-add! [(dt (ptr DbgTypes)) (name (slice u8)) (e DwTy)] (-> i64)
+  (let [i (len (.tys dt))]
+    (push! (mut (.tys dt)) e)
+    (set! (mut (.index dt)) name i)
+    i))
+
+(defn dbg-field [(name (slice u8)) (ti i64) (off i64)] (-> DwField)
+  (DwField :name name :tyidx ti :off off))
+
+;;; The DwTy index for `t`, adding it (and what it refers to) on first use, or
+;;; -1 when it is not described.
+(defn dbg-ty-of! [(dt (ptr DbgTypes)) (db (ptr LayoutDb)) (a (dyn Allocator)) (t (ptr Type))] (-> i64)
+  (clear! (mut (.scratch dt)))
+  (dbg-key! (mut (.scratch dt)) t)
+  (match (get (.index dt) (slice (.scratch dt)))
+    (Some [hit] hit)
+    (None []
+      ; a new type: its own copy of the name (looking up its parts reuses scratch)
+      (let [nm (sconcat a (slice (.scratch dt)) "")]
+        (match (load t)
+          (TInt [bits sg] (dbg-add! dt nm (dbg-entry a 0 nm (size db t) (if sg 5 7) -1)))
+          (TBool [] (dbg-add! dt nm (dbg-entry a 0 nm 1 2 -1)))
+          (TFloat [bits] (dbg-add! dt nm (dbg-entry a 0 nm (/ bits 8) 4 -1)))
+          (TPtr [inner] (let [ti (dbg-ty-of! dt db a inner)] (dbg-add! dt nm (dbg-entry a 1 nm 8 0 ti))))
+          (TRef [_m inner] (let [ti (dbg-ty-of! dt db a inner)] (dbg-add! dt nm (dbg-entry a 1 nm 8 0 ti))))
+          (TFn [_ _ _] (dbg-add! dt nm (dbg-entry a 1 nm 8 0 -1)))
+          (TSlice [elem]
+                  (let [(mut ep) (TPtr elem)
+                        pi (dbg-ty-of! dt db a (mut ep))
+                        (mut lt) (TInt 64 true)
+                        li (dbg-ty-of! dt db a (mut lt))
+                        (mut e) (dbg-entry a 2 nm 16 0 -1)]
+                    (push! (mut (.fields e)) (dbg-field "data" pi 0))
+                    (push! (mut (.fields e)) (dbg-field "len" li 8))
+                    (dbg-add! dt nm e)))
+          (TArray [elem n-extent]
+                  (let [ei (dbg-ty-of! dt db a elem)]
+                    (if (< ei 0)
+                        -1
+                        (let [(mut e) (dbg-entry a 3 nm (size db t) 0 ei)]
+                          (set! (.count e) (extent-value n-extent))
+                          (dbg-add! dt nm e)))))
+          (TStruct [snm]
+                   (let [si (struct-index db snm)]
+                     (if (>= si 0)
+                         (dbg-struct! dt db a nm si)
+                         (let [su (sum-index db snm)]
+                           (if (>= su 0) (dbg-sum! dt db a nm su t) -1)))))
+          (_ -1))))))
+
+(defn dbg-struct! [(dt (ptr DbgTypes)) (db (ptr LayoutDb)) (a (dyn Allocator)) (nm (slice u8)) (si i64)] (-> i64)
+  (let [sp (struct-at db si)]
+    (match (.layout sp)
+      (LC []
+          ; the entry first: a field may point back at the struct
+          (let [idx (dbg-add! dt nm (dbg-entry a 2 nm (.size sp) 0 -1))
+                fs (load (field sp fields))]
+            (for i (range 0 (len (load fs)))
+              (let [fp (elem fs i)
+                    fi (dbg-ty-of! dt db a (field fp ty))]
+                (when (>= fi 0)
+                  (push! (mut (.fields (elem (mut (.tys dt)) idx)))
+                         (dbg-field (.name fp) fi (field-offset db si i))))))
+            idx))
+      (LBits [backing _o] (dbg-add! dt nm (dbg-entry a 0 nm (/ backing 8) 7 -1)))
+      (_ -1))))
+
+;;; A sum: {tag: an enumeration of the variant names; payload: a union of the
+;;; variants with fields, each a struct of them at their natural offsets}.
+(defn dbg-sum! [(dt (ptr DbgTypes)) (db (ptr LayoutDb)) (a (dyn Allocator)) (nm (slice u8)) (su i64) (t (ptr Type))] (-> i64)
+  (let [sp (sum-at db su)
+        vs (load (field sp variants))
+        idx (dbg-add! dt nm (dbg-entry a 2 nm (size db t) 0 -1))
+        tagnm (sconcat a nm ".tag")
+        (mut tag) (dbg-entry a 4 tagnm 4 0 -1)]
+    (for vi (range 0 (len (load vs))) (push! (mut (.fields tag)) (dbg-field (.name (elem vs vi)) -1 vi)))
+    (let [ti (dbg-add! dt tagnm tag)
+          unm (sconcat a nm ".payload")
+          (mut u) (dbg-entry a 5 unm (- (size db t) 8) 0 -1)]
+      (push! (mut (.fields (elem (mut (.tys dt)) idx))) (dbg-field "tag" ti 0))
+      (for vi (range 0 (len (load vs)))
+        (let [v (elem vs vi)
+              vfs (load (field v fields))]
+          (when (> (len (load vfs)) 0)
+            (let [vnm (sconcat a nm (sconcat a "." (.name v)))
+                  (mut ve) (dbg-entry a 2 vnm (fields-bytes db vfs) 0 -1)]
+              (for fi (range 0 (len (load vfs)))
+                (let [fp (elem vfs fi)
+                      fti (dbg-ty-of! dt db a (field fp ty))]
+                  (when (>= fti 0)
+                    (push! (mut (.fields ve)) (dbg-field (.name fp) fti (natural-offset db vfs fi))))))
+              (let [vti (dbg-add! dt vnm ve)]
+                (push! (mut (.fields u)) (dbg-field (.name v) vti 0)))))))
+      (when (> (len (.fields u)) 0)
+        (let [uti (dbg-add! dt unm u)]
+          (push! (mut (.fields (elem (mut (.tys dt)) idx))) (dbg-field "payload" uti 8))))
+      idx)))

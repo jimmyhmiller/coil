@@ -35,7 +35,8 @@
 (import "coil.compiler.ast" :use *)
 (import "coil.compiler.parser" :use *)
 (import "coil.compiler.a64" :use [al-at b-align! b-bytes! b-u64! asm-new])
-(import "coil.compiler.dwarf" :use [DwTy DwFn DwVar DwLineEv])
+(import "coil.compiler.dwarf" :use [DwTy DwFn DwVar DwLineEv DwInc DwOut dw-inc-new dw-inc-fn! dw-inc-finish!])
+(import "coil.compiler.debuginfo" :use *)
 (import "coil.mem" :use [f64-bits])
 (import "coil.compiler.layoutdb" :use *)
 (import "coil.compiler.macho" :use *)
@@ -76,6 +77,7 @@
           (while (and (!= (load (index v k)) (: 58 i8)) (!= (load (index v k)) (: 0 i8))) (set! k (+ k 1)))
           [lo (if (= (load (index v k)) (: 0 i8)) 0x7FFFFFFFFFFFFFFF (cgtpde.atol (index v (+ k 1))))]))))
 (extern cgtpde.close :as "close" [i32] (-> i32))
+(extern cgtpde.memchr :as "memchr" [(ptr u8) i32 usize] (-> (ptr u8)))
 
 ; ============================ state ==========================================
 
@@ -141,6 +143,34 @@
    (abi-cache (ArrayList AbiInfo))
    (abi-known (ArrayList bool))
    (x64 bool)  ; x86-64 (System V) rather than arm64 (AAPCS64)
+   ; ---- debug info (`dbg`), see "debug info" below. The lowering side owns
+   ; dw-vars (the function's variables: `slot` is its stack slot's alloca
+   ; ordinal, `start`/`end` debug mark ids), dw-var-extra (the byte offset into
+   ; that slot) and dbg-shadow (a promoted variable's shadow slot, by CIR
+   ; variable); they travel to the compiling side in the function's Job.
+   (dbg bool)
+   (dw-vars (ArrayList DwVar))
+   (dw-var-extra (ArrayList i64))
+   (dbg-shadow (ArrayList u32))
+   ; the function's debug frame: one stack slot holding every shadow slot
+   ; (NONE until the first), and its size so far
+   (dbg-frame u32)
+   (dbg-frame-size i64)
+   ; the source line the instructions are attributed to: its source and byte
+   ; range (a row is recorded where the line changes)
+   (dbg-cur-src i64)
+   (dbg-line-lo i64)
+   (dbg-texts (ptr (ArrayList (slice u8))))
+   ; dw-ty-of!'s memo by type identity (see dbg-ty)
+   (dbg-ty-keys (ArrayList u64))
+   (dbg-ty-vals (ArrayList i64))
+   ; the compiling side's: the DWARF it encodes function by function, and its
+   ; scratch list of a function's rows
+   (dwinc DwInc)
+   (dw-evs (ArrayList DwLineEv))
+   ; instruction -> code offset of the marked ones, -1 elsewhere
+   (inst-off (ArrayList i64))
+   (text-base i64)
    (stats bool)  ; COIL_TPDE_STATS: count and time the phases
    (stat-funcs i64)
    (stat-vals i64)
@@ -149,7 +179,8 @@
    (stat-ops i64)
    (stat-cand i64)
    (t-lower i64)
-   (t-compile i64)])
+   (t-compile i64)
+   (t-dwarf i64)])
 
 (defn tl-fail [(msg (slice u8))] (-> never)
   (cga-fail msg)
@@ -473,6 +504,228 @@
                            info))))))
     (_ (tl-abi-info-raw tl t))))
 
+; ============================ debug info =====================================
+; DWARF for tpde (on by default; codegen_a64's records and writer). A source
+; position is packed into a CIR location: (source + 1) << 40 | byte offset.
+;
+; Variables live in registers that change, so each one the debugger shows
+; also has a shadow stack slot: binding a variable stores its value there and
+; every assignment to a promoted variable stores again, so the slot always
+; holds the current value, while reads stay in registers. A variable already
+; in memory (a stack slot, an aggregate's private storage) is described where
+; it is, and a place reached through a pointer by a slot holding the pointer.
+; A variable whose value is an address in the frame is described as that
+; address (frame base + offset) rather than stored: storing it would make the
+; frame's address escape, which turns off tail calls. One that is not a fixed
+; offset in the frame is not described.
+
+(defn dbg-loc [(src i64) (lo i64)] (-> u64)
+  (| (<< (primitive/cast u64 (+ src 1)) (: 40 u64)) (primitive/cast u64 lo)))
+
+;;; Names the debugger shows: not the checker's temporaries ($…) or the slot
+;;; half of a mutable local (x.slot; x itself is shown).
+(defn dbg-name? [(name (slice u8))] (-> bool)
+  (let [n (len name)]
+    (and (> n 0) (!= (get name 0) #\$)
+         (not (and (>= n 5) (= (subslice name (- n 5) n) ".slot"))))))
+
+;;; The ordinal of alloca `v` in the function's allocas (cir/alloca! keeps it).
+(defn alloca-ordinal [(tl (ptr Tl)) (v u32)] (-> i64)
+  (i64-of (.next (cir/val (.f tl) v))))
+
+;;; Whether `e` is the checker's binding of a mutable local `name`: the
+;;; address of `name.slot`, after its initializing store.
+(defn mutable-local-expr? [(e (ptr Expr)) (name (slice u8))] (-> bool)
+  (match (.kind e)
+    (EDo [body]
+         (let [n (len (load body))]
+           (and (> n 0)
+                (match (.kind (elem body (- n 1)))
+                  (EVar [v] (and (= (len v) (+ (len name) 5)) (= (subslice v 0 (len name)) name)
+                                 (= (subslice v (len name) (len v)) ".slot")))
+                  (_ false)))))
+    (_ false)))
+
+;;; If `v` is a stack slot's address (an alloca plus constant offsets): the
+;;; alloca's ordinal and the offset; else (-1, 0).
+(defn frame-slot-of [(tl (ptr Tl)) (v u32)] (-> (array i64 2))
+  (let [f (.f tl)
+        b (cir/addr-base f v)]
+    (if (= (primitive/cast i64 (.op (cir/val f b))) cir/OP-ALLOCA)
+        [(alloca-ordinal tl b) (cir/addr-off f v 0)]
+        [-1 0])))
+
+;;; A shadow slot for a value of type `t`, holding `v` from here on: its
+;;; offset in the debug frame (one stack slot per function, sized when the
+;;; function is lowered: fewer slots for the compiler to place).
+(defn dbg-shadow-new [(tl (ptr Tl)) (t Type) (v u32)] (-> i64)
+  (let [(mut tt) t
+        al (talign tl (mut tt))
+        off (& (+ (.dbg-frame-size tl) (- al 1)) (- 0 al))]
+    (when (= (.dbg-frame tl) (none32)) (set! (.dbg-frame tl) (new-slot-bytes tl 8 16)))
+    (set! (.dbg-frame-size tl) (+ off (tsize tl (mut tt))))
+    (store-scalar tl (.dbg-frame tl) off v (mut tt))
+    off))
+
+;;; A shadow slot's offset without storing to it yet.
+(defn dbg-shadow-reserve [(tl (ptr Tl)) (t Type)] (-> i64)
+  (let [(mut tt) t
+        al (talign tl (mut tt))
+        off (& (+ (.dbg-frame-size tl) (- al 1)) (- 0 al))]
+    (when (= (.dbg-frame tl) (none32)) (set! (.dbg-frame tl) (new-slot-bytes tl 8 16)))
+    (set! (.dbg-frame-size tl) (+ off (tsize tl (mut tt))))
+    off))
+
+;;; Give the debug frame its final size.
+(defn dbg-frame-close! [(tl (ptr Tl))] (-> void)
+  (when (!= (.dbg-frame tl) (none32))
+    (set! (.imm (cir/val (.f tl) (.dbg-frame tl))) (if (< (.dbg-frame-size tl) 8) 8 (.dbg-frame-size tl)))))
+
+;;; Attribute the instructions made from here on to the line of `lo` in
+;;; source `src`: a new position only when no newline lies between it and the
+;;; last one (lowering needs no line table: the encoding stage builds them).
+(defn dbg-at! [(tl (ptr Tl)) (src i64) (lo i64)] (-> void)
+  (let [last (.dbg-line-lo tl)]
+    (unless (and (= src (.dbg-cur-src tl)) (= lo last))
+      (if (and (= src (.dbg-cur-src tl)) (< src (len (load (.dbg-texts tl))))
+               (no-newline? (get (load (.dbg-texts tl)) src) (if (< lo last) lo last) (if (< lo last) last lo)))
+          (when (< lo last)
+            ; an earlier column on the same line: still that line
+            (set! (.dbg-line-lo tl) lo))
+          (do (set! (.dbg-cur-src tl) src)
+              (set! (.dbg-line-lo tl) lo)
+              (cir/set-loc! (.f tl) (dbg-loc src lo)))))))
+
+(defn no-newline? [(text (slice u8)) (a i64) (b i64)] (-> bool)
+  (or (>= a b) (> b (len text))
+      (= (primitive/cast i64 (cgtpde.memchr (index (data text) a) (: 10 i32) (primitive/cast usize (- b a)))) 0)))
+
+;;; A 64-bit structural hash of a type (0: not hashed, look it up), for
+;;; dbg-ty's memo. A struct is hashed by its name's bytes, so equal types hash
+;;; alike wherever mono boxed them.
+(defn mix [(h u64) (x u64)] (-> u64) (* (^ h x) (: 0x100000001B3 u64)))
+
+(defn ty-identity [(t (ptr Type))] (-> u64)
+  (do
+    (match (load t)
+      (TInt [bits sg] (mix (: 1 u64) (| (<< (primitive/cast u64 bits) (: 1 u64)) (if sg (: 1 u64) (: 0 u64)))))
+      (TBool [] (: 2 u64))
+      (TFloat [bits] (mix (: 3 u64) (primitive/cast u64 bits)))
+      (TPtr [inner] (let [h (ty-identity inner)] (if (= h (: 0 u64)) h (mix (: 4 u64) h))))
+      (TRef [_m inner] (let [h (ty-identity inner)] (if (= h (: 0 u64)) h (mix (: 4 u64) h))))
+      (TSlice [elem] (let [h (ty-identity elem)] (if (= h (: 0 u64)) h (mix (: 6 u64) h))))
+      (TStruct [nm]
+               (let [(mut h) (: 0xcbf29ce484222325 u64)]
+                 (for i (range 0 (len nm)) (set! h (mix h (primitive/cast u64 (get nm i)))))
+                 (mix h (: 7 u64))))
+      (_ (: 0 u64)))))
+
+(const DBG-TY-MEMO 4096)
+
+;;; dw-ty-of! through a direct-mapped memo: most variables have one of a few
+;;; types, and rendering a type's name to look it up was most of describing a
+;;; variable.
+(defn dbg-ty [(tl (ptr Tl)) (t (ptr Type))] (-> i64)
+  (let [k (ty-identity t)]
+    (if (= k (: 0 u64))
+        (dw-ty-of! (.g tl) t)
+        (let [h (primitive/cast i64 (& (^ (^ k (>> k (: 17 u64))) (>> k (: 31 u64))) (: 4095 u64)))]
+          (when (= (len (.dbg-ty-keys tl)) 0)
+            (extend-zeroed! (mut (.dbg-ty-keys tl)) DBG-TY-MEMO)
+            (extend-zeroed! (mut (.dbg-ty-vals tl)) DBG-TY-MEMO))
+          (if (= (get (.dbg-ty-keys tl) h) k)
+              (get (.dbg-ty-vals tl) h)
+              (let [ti (dw-ty-of! (.g tl) t)]
+                (set! (mut (.dbg-ty-keys tl)) h k)
+                (set! (mut (.dbg-ty-vals tl)) h ti)
+                ti))))))
+
+(defn dbg-var! [(tl (ptr Tl)) (name (slice u8)) (t Type) (ordinal i64) (extra i64) (indirect bool) (param bool)
+                (src i64) (lo i64)] (-> void)
+  (dbg-var-at! tl name t ordinal extra indirect false param src lo))
+
+;;; `addr`: the variable is the slot's address itself (see DwVar).
+(defn dbg-var-at! [(tl (ptr Tl)) (name (slice u8)) (t Type) (ordinal i64) (extra i64) (indirect bool) (addr bool)
+                   (param bool) (src i64) (lo i64)] (-> void)
+  (let [(mut tt) t
+        ti (dbg-ty tl (mut tt))]
+    (when (and (>= ti 0) (>= ordinal 0) (not (.terminated tl)))
+      (open! tl)
+      (push! (mut (.dw-vars tl))
+             (DwVar :name name :tyidx ti :slot ordinal :indirect indirect :param param :source src :lo lo
+                    ; a local comes into scope here (its value is stored)
+                    :start (if param -1 (primitive/cast i64 (cir/dbg-mark! (.f tl)))) :end -1 :addr addr))
+      (push! (mut (.dw-var-extra tl)) extra)
+      0)))
+
+;;; Describe a binding of `name` to `tv` (a parameter when `param`).
+(defn dbg-bind! [(tl (ptr Tl)) (name (slice u8)) (tv TV) (param bool) (src i64) (lo i64) (value (ptr Expr))] (-> void)
+  (when (and (.dbg tl) (not (.terminated tl)) (>= src 0) (>= lo 0) (dbg-name? name))
+    (open! tl)
+    (let [f (.f tl)
+          k (.kind tv)]
+      (cond
+        (= k 3)
+          ; a promoted variable: one shadow slot per CIR variable, which
+          ; tl-store keeps current
+          (let [var (i64-of (.v tv))]
+            (while (<= (len (.dbg-shadow tl)) var) (push! (mut (.dbg-shadow tl)) (none32)))
+            (when (= (get (.dbg-shadow tl) var) (none32))
+              ; the value this block gave it (just initialized, as a rule);
+              ; reading it from elsewhere would search predecessors and could
+              ; add phis, so then the next assignment fills the slot
+              (let [cur (cir/lookup-def f (.v tv) (.cur (load f)))]
+                (set! (mut (.dbg-shadow tl)) var
+                      (u32-of (if (= cur (none32)) (dbg-shadow-reserve tl (.ty tv)) (dbg-shadow-new tl (.ty tv) cur))))))
+            (dbg-var! tl name (.ty tv) (alloca-ordinal tl (.dbg-frame tl)) (i64-of (get (.dbg-shadow tl) var))
+                      false param src lo))
+        (= k 0)
+          (if (cir/frame-derived? f (.v tv))
+              ; a mutable local's name is the address of its slot
+              (match (.ty tv)
+                (TPtr [inner]
+                      (let [fs (frame-slot-of tl (.v tv))]
+                        (when (>= (get fs 0) 0)
+                          (if (and (!= (primitive/cast i64 value) 0) (mutable-local-expr? value name))
+                              (dbg-var! tl name (load inner) (get fs 0) (get fs 1) false param src lo)
+                              ; another address in the frame (an aggregate's
+                              ; storage): described as that address
+                              (dbg-var-at! tl name (.ty tv) (get fs 0) (get fs 1) false true param src lo)))))
+                (_ 0))
+              (let [off (dbg-shadow-new tl (.ty tv) (.v tv))]
+                (dbg-var! tl name (.ty tv) (alloca-ordinal tl (.dbg-frame tl)) off false param src lo)))
+        (= k 1)
+          (let [fs (frame-slot-of tl (.v tv))]
+            (cond
+              (>= (get fs 0) 0) (dbg-var! tl name (.ty tv) (get fs 0) (get fs 1) false param src lo)
+              (not (cir/frame-derived? f (.v tv)))
+                (let [off (dbg-shadow-new tl (i64t) (.v tv))]
+                  (dbg-var! tl name (.ty tv) (alloca-ordinal tl (.dbg-frame tl)) off true param src lo))
+              :else 0))
+        :else 0))
+    0))
+
+;;; An assignment to promoted variable `var`: keep its shadow slot current.
+(defn dbg-assigned! [(tl (ptr Tl)) (var u32) (t Type) (v u32)] (-> void)
+  (when (.dbg tl)
+    (let [vi (i64-of var)]
+      (when (and (< vi (len (.dbg-shadow tl))) (!= (get (.dbg-shadow tl) vi) (none32)))
+        (let [(mut tt) t] (store-scalar tl (.dbg-frame tl) (i64-of (get (.dbg-shadow tl) vi)) v (mut tt)))))))
+
+;;; The let's locals, the variables its bindings made ([first, hi)), go out of
+;;; scope here. (Those of lets nested in its body ended at their own ends:
+;;; scanning them again made deep nesting quadratic.)
+(defn dbg-scope-end! [(tl (ptr Tl)) (first i64) (hi i64)] (-> void)
+  (when (and (.dbg tl) (< first hi) (not (.terminated tl)))
+    (let [(mut any) false]
+      (for v (range first hi) (when (< (.end (elem (mut (.dw-vars tl)) v)) 0) (set! any true)))
+      (when any
+        (open! tl)
+        (let [id (primitive/cast i64 (cir/dbg-mark! (.f tl)))]
+          (for v (range first hi)
+            (let [dv (elem (mut (.dw-vars tl)) v)]
+              (when (< (.end dv) 0) (set! (.end dv) id)))))))))
+
 ; ============================ scopes =========================================
 
 (defn bind! [(tl (ptr Tl)) (name (slice u8)) (tv TV)] (-> void)
@@ -734,6 +987,9 @@
 (defn tl-expr [(tl (ptr Tl)) (e (ptr Expr))] (-> TV)
   (let [tail (.tailok tl)]
     (set! (.tailok tl) false)
+    ; an inlined callee's code keeps its call site's position
+    (when (and (.dbg tl) (= (.inline-depth tl) 0) (>= (.source e) 0) (>= (.lo e) 0))
+      (dbg-at! tl (.source e) (.lo e)))
     (match (.kind e)
       (EIf [cnd thn els] (tl-if tl cnd thn els tail))
       (ECall [func _targs args] (tl-call-named tl func args tail))
@@ -743,7 +999,8 @@
 
 (defn tl-let [(tl (ptr Tl)) (binds (ptr (ArrayList Bind))) (body (ptr (ArrayList Expr))) (tail bool)] (-> TV)
   (scan-let-lazily! tl binds body)
-  (let [mark (scope-mark tl)]
+  (let [mark (scope-mark tl)
+        dbg-first (len (.dw-vars tl))]
     (block :binds
       (for i (range 0 (len (load binds)))
         (when (.terminated tl) (return-from :binds 0))
@@ -754,10 +1011,16 @@
               (let [(mut t) (.ty tv)
                     s (new-slot tl (mut t))]
                 (store-tv tl s 0 tv)
-                (bind! tl (.name b) (tv-s s (TPtr (box-ty tl (.ty tv))))))
-              (bind! tl (.name b) tv))))
+                (bind! tl (.name b) (tv-s s (TPtr (box-ty tl (.ty tv)))))
+                (when (.dbg tl)
+                  (dbg-var! tl (.name b) (.ty tv) (alloca-ordinal tl s) 0 false false
+                            (.source (.value b)) (.lo (.value b)))))
+              (do (bind! tl (.name b) tv)
+                  (dbg-bind! tl (.name b) tv false (.source (.value b)) (.lo (.value b)) (field b value))))))
       0)
-    (let [r (tl-body-tail tl body tail)]
+    (let [dbg-hi (len (.dw-vars tl))
+          r (tl-body-tail tl body tail)]
+      (dbg-scope-end! tl dbg-first dbg-hi)
       (scope-pop! tl mark)
       r)))
 
@@ -897,7 +1160,9 @@
   (if (= (.kind ptv) 3)
       (let [(mut t) (.ty ptv)]
         (open! tl)
-        (cir/def-var! (.f tl) (.v ptv) (coerce-scalar tl (scalar tl vtv) (.ty vtv) (.ty ptv)))
+        (let [v (coerce-scalar tl (scalar tl vtv) (.ty vtv) (.ty ptv))]
+          (cir/def-var! (.f tl) (.v ptv) v)
+          (dbg-assigned! tl (.v ptv) (.ty ptv) v))
         (tv-s (iconst tl 0) (i64t)))
       (let [p (scalar tl ptv)
             pt (pointee tl ptv)
@@ -2002,8 +2267,55 @@
    (tsym u32)
    (tramp u32)
    (code MachineCodeBody)
+   ; debug info: the function and its variables, from the lowering side
+   (dfn DwFn)
+   (dvars (ArrayList DwVar))
+   (dextra (ArrayList i64))
+   ; and what compiling it recorded, for the encoding stage
+   (drows (ArrayList u64))
+   (dmarks (ArrayList u64))
+   (dallocas (ArrayList i64))
    ; 1 from submission until the compiling side is done with it
    (state i64)])
+
+;;; The encoding stage, after a function compiled: its variables' frame
+;;; offsets and scope ranges from what compiling recorded, its line rows, and
+;;; then its DWARF, encoded now (the functions arrive in text order).
+(defn dbg-encode! [(tl (ptr Tl)) (j (ptr Job))] (-> void)
+  (let [df (field j dfn)
+        fstart (.textoff df)
+        allocas (.dallocas j)
+        marks (.dmarks j)
+        rows (.drows j)
+        mask40 (- (<< (: 1 u64) (: 40 u64)) (: 1 u64))
+        mi (.mark-insts (load (.fp j)))]
+    (while (< (len (.inst-off tl)) (i64-of (cir/value-count (.fp j)))) (push! (mut (.inst-off tl)) -1))
+    (for i (range 0 (/ (len marks) 2))
+      (set! (mut (.inst-off tl)) (primitive/cast i64 (get marks (* i 2))) (primitive/cast i64 (get marks (+ (* i 2) 1)))))
+    (for v (range 0 (len (.dvars j)))
+      (let [dv (elem (mut (.dvars j)) v)]
+        (set! (.slot dv) (+ (get allocas (.slot dv)) (get (.dextra j) v)))
+        (when (>= (.start dv) 0) (set! (.start dv) (mark-off tl mi (.start dv))))
+        (when (>= (.end dv) 0) (set! (.end dv) (mark-off tl mi (.end dv))))))
+    (for i (range 0 (/ (len marks) 2))
+      (set! (mut (.inst-off tl)) (primitive/cast i64 (get marks (* i 2))) -1))
+    ; the entry maps to the defn; the first row after it ends the prologue
+    (clear! (mut (.dw-evs tl)))
+    (push! (mut (.dw-evs tl)) (DwLineEv :textoff fstart :source (.source df) :lo (.lo df) :pe false))
+    (for r (range 0 (/ (len rows) 2))
+      (let [off (primitive/cast i64 (get rows (* r 2)))
+            loc (get rows (+ (* r 2) 1))]
+        (push! (mut (.dw-evs tl))
+               (DwLineEv :textoff (if (< off fstart) fstart off)
+                         :source (- (primitive/cast i64 (>> loc (: 40 u64))) 1)
+                         :lo (primitive/cast i64 (& loc mask40)) :pe (= r 0)))))
+    (dw-inc-fn! (cast (ptr DwInc) (mut (.dwinc tl))) df (field j dvars) (cast (ptr (ArrayList DwLineEv)) (mut (.dw-evs tl))))))
+
+;;; The code offset of debug mark `id`: of the instruction it marks (-1 when
+;;; none followed or it was not compiled: the scope runs to the end).
+(defn mark-off [(tl (ptr Tl)) (mi (ArrayList u32)) (id i64)] (-> i64)
+  (let [inst (get mi id)]
+    (if (= inst (none32)) -1 (get (.inst-off tl) (i64-of inst)))))
 
 (defn job-run! [(tl (ptr Tl)) (j (ptr Job))] (-> void)
   (let [ta (.ta tl)]
@@ -2022,6 +2334,17 @@
           (for _ (range 0 (.prof-repeat tl)) (isel/compile! c (.tsym j)))
           (unless (isel/compile! c (.tsym j))
             (tl-fail (sconcat (malloc-allocator) "tpde: failed to compile " (.name (.fd j)))))
+          (when (.dbg tl)
+            ; what the encoding stage needs: the Compiler moves on
+            (let [sy (tasm/sym-at ta (.tsym j))]
+              (set! (.textoff (.dfn j)) (.off sy))
+              (set! (.len (.dfn j)) (.size sy)))
+            (clear! (mut (.drows j)))
+            (clear! (mut (.dmarks j)))
+            (clear! (mut (.dallocas j)))
+            (for r (.dbg-rows (load c)) (push! (mut (.drows j)) r))
+            (for m (.dbg-marks (load c)) (push! (mut (.dmarks j)) m))
+            (for o (.dbg-allocas (load c)) (push! (mut (.dallocas j)) o)))
           (when stats (set! (.t-compile tl) (+ (.t-compile tl) (- (ticks) t3))))
           (when (!= (.tramp j) (none32)) (tl-shim-trampoline! tl (.sig j) (.tsym j) (.tramp j)))))))
 
@@ -2036,7 +2359,13 @@
    (head i64)
    (tail i64)
    (threaded bool)
-   (thread Thread)])
+   (thread Thread)
+   ; debug info: a third stage, encoding each compiled function's DWARF on
+   ; its own thread (slot state 2 between compiling and it)
+   (dbg bool)
+   (dthreaded bool)
+   (dtail i64)
+   (dthread Thread)])
 
 (extern cgtpde.sched-yield :as "sched_yield" [] (-> i32))
 
@@ -2056,11 +2385,34 @@
       (loop
         (let [j (pipe-slot p (.tail p))]
           (job-await j 1)
-          (when (= (.kind j) JOB-STOP) (return-from :done 0))
+          (when (= (.kind j) JOB-STOP)
+            (when (.dthreaded p) (atomic/store (field j state) 2))
+            (return-from :done 0))
           (job-run! (.tl p) j)
-          (atomic/store (field j state) 0)
+          ; with no encoding thread, encode here
+          (when (and (.dbg p) (not (.dthreaded p))) (job-encode! (.tl p) j))
+          (atomic/store (field j state) (if (.dthreaded p) 2 0))
           (set! (.tail p) (% (+ (.tail p) 1) n)))))
     (primitive/cast (ptr i8) 0)))
+
+(defn dwarf-thread-entry [(arg (ptr i8))] (-> (ptr i8))
+  (let [p (primitive/cast (ptr Pipe) arg)
+        n (len (.jobs p))]
+    (block :done
+      (loop
+        (let [j (pipe-slot p (.dtail p))]
+          (job-await j 2)
+          (when (= (.kind j) JOB-STOP) (return-from :done 0))
+          (job-encode! (.tl p) j)
+          (atomic/store (field j state) 0)
+          (set! (.dtail p) (% (+ (.dtail p) 1) n)))))
+    (primitive/cast (ptr i8) 0)))
+
+(defn job-encode! [(tl (ptr Tl)) (j (ptr Job))] (-> void)
+  (when (= (.kind j) JOB-COMPILE)
+    (let [t4 (if (.stats tl) (ticks) 0)]
+      (dbg-encode! tl j)
+      (when (.stats tl) (set! (.t-dwarf tl) (+ (.t-dwarf tl) (- (ticks) t4)))))))
 
 ;;; The slot the next job goes in, once the compiling side is done with it.
 (defn pipe-claim [(p (ptr Pipe))] (-> (ptr Job))
@@ -2072,13 +2424,17 @@
 (defn pipe-submit! [(p (ptr Pipe)) (j (ptr Job))] (-> void)
   (if (.threaded p)
       (atomic/store (field j state) 1)
-      (job-run! (.tl p) j))
+      (do (job-run! (.tl p) j)
+          (when (.dbg p) (job-encode! (.tl p) j))))
   (set! (.head p) (% (+ (.head p) 1) (len (.jobs p)))))
 
 (defn pipe-start! [(p (ptr Pipe)) (tl (ptr Tl)) (threaded bool)] (-> void)
   (set! (.tl p) tl)
   (set! (.head p) 0)
   (set! (.tail p) 0)
+  (set! (.dtail p) 0)
+  (set! (.dbg p) (.dbg tl))
+  (set! (.dthreaded p) false)
   (set! (.threaded p) false)
   (set! (.jobs p) (ArrayList::new [Job] (.a tl)))
   (for i (range 0 (if threaded 8 1))
@@ -2086,13 +2442,34 @@
            (Job :kind JOB-COMPILE :fd (primitive/cast (ptr Func) 0)
                 :fp (if (= i 0) (.f tl) (box! (.a tl) cir/Func (cir/Func::new)))
                 :sig (primitive/cast (ptr GSig) 0) :tsym (none32) :tramp (none32)
-                :code (zeroed MachineCodeBody) :state 0)))
+                :code (zeroed MachineCodeBody)
+                :dfn (zeroed DwFn) :dvars (ArrayList::new [DwVar] (malloc-allocator))
+                :dextra (ArrayList::new [i64] (malloc-allocator))
+                :drows (ArrayList::new [u64] (malloc-allocator)) :dmarks (ArrayList::new [u64] (malloc-allocator))
+                :dallocas (ArrayList::new [i64] (malloc-allocator)) :state 0)))
   (when threaded
     (tasm/share! (.ta tl))
+    ; the encoding thread first: the compiling one reads `dthreaded` from its
+    ; first job on
+    (set! (.dthreaded p)
+          (and (.dbg p)
+               (= (Thread::spawn-configured (field p dthread) (fnptr-of dwarf-thread-entry)
+                                            (primitive/cast (ptr i8) p) (ThreadConfig::new 8388608 -1))
+                  (: 0 i32))))
     (set! (.threaded p)
           (= (Thread::spawn-configured (field p thread) (fnptr-of compile-thread-entry)
                                        (primitive/cast (ptr i8) p) (ThreadConfig::new 67108864 -1))
-             (: 0 i32)))))
+             (: 0 i32)))
+    (when (and (.dthreaded p) (not (.threaded p)))
+      ; serial after all: stop the encoding thread
+      (let [j (pipe-slot p 0)]
+        (set! (.kind j) JOB-STOP)
+        (atomic/store (field j state) 2)
+        (Thread::join (field p dthread))
+        (set! (.kind j) JOB-COMPILE)
+        (atomic/store (field j state) 0)
+        (set! (.dthreaded p) false)))
+    0))
 
 (defn pipe-finish! [(p (ptr Pipe))] (-> void)
   (when (.threaded p)
@@ -2100,6 +2477,7 @@
       (set! (.kind j) JOB-STOP)
       (pipe-submit! p j))
     (Thread::join (field p thread))
+    (when (.dthreaded p) (Thread::join (field p dthread)))
     0))
 
 ;;; Lower `fd` and queue it for compiling.
@@ -2110,6 +2488,18 @@
         tsym (tl-sym tl msym)]
     (set! (.f tl) (.fp j))
     (tl-func-lower! tl fd)
+    (when (.dbg tl)
+      ; the code offsets come from compiling (dbg-encode!)
+      (set! (.dfn j) (DwFn :name (.name fd) :symidx (i64-of tsym) :source (if (< (.source fd) 0) 0 (.source fd))
+                           :lo (if (< (.lo fd) 0) 0 (.lo fd)) :textoff 0 :len 0 :slotbytes 0
+                           :varlo 0 :varhi (len (.dw-vars tl))))
+      ; the job takes the lists (the encoding stage only edits them in place),
+      ; and lowering goes on with the job's old ones
+      (let [vs (.dvars j) xs (.dextra j)]
+        (set! (.dvars j) (.dw-vars tl))
+        (set! (.dextra j) (.dw-var-extra tl))
+        (set! (.dw-vars tl) vs)
+        (set! (.dw-var-extra tl) xs)))
     (push! (mut (.defined tl)) msym)
     (push! (mut (.defined tl)) (i64-of tsym))
     (set! (.kind j) JOB-COMPILE)
@@ -2163,8 +2553,22 @@
       (cir/set-block! fp entry)
       (cir/seal! fp entry))
     (tl-params! tl fd)
+    (when (.dbg tl)
+      (clear! (mut (.dw-vars tl)))
+      (clear! (mut (.dw-var-extra tl)))
+      (clear! (mut (.dbg-shadow tl)))
+      (set! (.dbg-frame tl) (none32))
+      (set! (.dbg-frame-size tl) 0)
+      (set! (.dbg-cur-src tl) -1)
+      (let [ps (load (field fd params))]
+        (for i (range 0 (len (load ps)))
+          (let [prm (elem ps i)]
+            (match (lookup tl (.name prm))
+              (Some [tv] (dbg-bind! tl (.name prm) tv true (.source fd) (.lo fd) (primitive/cast (ptr Expr) 0)))
+              (None [] 0))))))
     (let [r (tl-body-tail tl (load (field fd body)) true)]
       (unless (.terminated tl) (tl-return! tl r)))
+    (when (.dbg tl) (dbg-frame-close! tl))
     (when (not (cir/terminated? fp)) (cir/unreachable! fp))))
 
 ; ============================ the module =====================================
@@ -2179,7 +2583,8 @@
         textbuf (mobj-sect-buf (mut (.obj g)) (.text g))
         ; x86-64: tpde aligns functions to 16 within its text
         _ (when (.x64 tl) (b-align! (mut textbuf) 16) (mobj-sect-align-at-least! (mut (.obj g)) (.text g) 4))
-        text-base (len (load textbuf))]
+        text-base (len (load textbuf))
+        _ (set! (.text-base tl) text-base)]
     ; x86-64 Mach-O addends are implicit: in the relocated field
     (when (.x64 tl)
       (for i (range 0 (len (.relocs (load ta))))
@@ -2262,7 +2667,7 @@
     (set! (.env g) (gscope-nil a))
     (set! (.outfixes g) (ArrayList::new [OutFix] a))
     (set! (.retty g) (TInt 64 true))
-    (set! (.dwtys g) (ArrayList::new [DwTy] a))
+    (set! (.dwtypes g) (dbg-types-new a))
     (set! (.dwfns g) (ArrayList::new [DwFn] a))
     (set! (.dwvars g) (ArrayList::new [DwVar] a))
     (set! (.dwevs g) (ArrayList::new [DwLineEv] a))
@@ -2298,7 +2703,20 @@
       (set! (.program g) mp)
       g)))
 
-(defn cgtpde-build-mobj [(a (dyn Allocator)) (mp (ptr Program))] (-> MObj)
+;;; Finish the DWARF the compiling side encoded: the types, and the sections.
+(defn tl-emit-dwarf! [(tl (ptr Tl)) (paths (ptr (ArrayList (slice u8))))] (-> void)
+  (let [g (.g tl)
+        t0 (ticks)
+        dw (dw-inc-finish! (cast (ptr DwInc) (mut (.dwinc tl))) paths (field (field g dwtypes) tys)
+                           (len (load (mobj-sect-buf (mut (.obj g)) (.text g)))))]
+    (mobj-add-sym! (mut (.obj g)) "ltmp0" (.text g) 0 false)
+    (g-add-dwarf-sections! g dw)
+    (when (.stats tl)
+      (eprintln "tpde: dwarf {} types, finished in {}us" (len (.tys (.dwtypes g))) (/ (- (ticks) t0) 24)))
+    0))
+
+(defn cgtpde-build-mobj [(a (dyn Allocator)) (mp (ptr Program)) (mainpath (slice u8)) (compdir (slice u8))
+                         (paths (ptr (ArrayList (slice u8)))) (texts (ptr (ArrayList (slice u8)))) (emit-dwarf bool)] (-> MObj)
   ; the module-level setup is codegen_a64's (signatures, statics, strings)
   (let [t-setup0 (ticks)
         g (tl-module-setup! a mp)
@@ -2311,6 +2729,22 @@
         (mut c) (tcore/Compiler::new [cir/Func] fnp tap (if x64 tcore/ARCH-X64 tcore/ARCH-A64))
         (mut tl) (zeroed Tl)]
     (set! (.x64 tl) x64)
+    ; bisection mixes in codegen_a64's code, which tpde's DWARF does not describe
+    (set! (.dbg tl) (and emit-dwarf (= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_BISECT")) 0)))
+    (set! (.debug c) (.dbg tl))
+    (set! (.dw-vars tl) (ArrayList::new [DwVar] a))
+    (set! (.dw-var-extra tl) (ArrayList::new [i64] a))
+    (set! (.dbg-shadow tl) (ArrayList::new [u32] a))
+    (set! (.dbg-texts tl) texts)
+    (set! (.dbg-ty-keys tl) (ArrayList::new [u64] a))
+    (set! (.dbg-ty-vals tl) (ArrayList::new [i64] a))
+    ; the compiling thread grows these: not the (single-threaded) arena
+    (set! (.dw-evs tl) (ArrayList::new [DwLineEv] (malloc-allocator)))
+    (set! (.inst-off tl) (ArrayList::new [i64] (malloc-allocator)))
+    (when (.dbg tl)
+      (let [t0 (ticks)]
+        (set! (.dwinc tl) (dw-inc-new (malloc-allocator) mainpath compdir texts (if x64 6 29) 0))
+        (when (!= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_STATS")) 0) (eprintln "tpde: dwarf setup {}us ({} sources)" (/ (- (ticks) t0) 24) (len (load texts))))))
     (set! (.g tl) g)
     (set! (.a tl) a)
     (set! (.f tl) fnp)
@@ -2362,17 +2796,23 @@
         (eprintln "tpde: {} functions, {} values, {} insts, {} blocks, {} operands"
                   (.stat-funcs tlp) (.stat-vals tlp) (.stat-insts tlp) (.stat-blocks tlp) (.stat-ops tlp))
         ; mach ticks are 1/24 us on Apple silicon
-        (eprintln "tpde: lower {}us compile {}us" (/ (.t-lower tlp) 24) (/ (.t-compile tlp) 24)))
+        (eprintln "tpde: lower {}us compile {}us dwarf {}us" (/ (.t-lower tlp) 24)
+                  (/ (.t-compile tlp) 24) (/ (.t-dwarf tlp) 24)))
       ; codegen_a64's functions (bisection only) come first in the text
       (let [t-merge0 (ticks)]
         (b-bytes! (mut (mobj-sect-buf (mut (.obj g)) (.text g))) (slice (.buf (.asm g))))
         (tl-merge! tlp)
+        (when (.dbg tlp)
+          (let [span (tr/span-begin "backend.tpde-dwarf")]
+            (tl-emit-dwarf! tlp paths)
+            (tr/span-end span)))
         (when (!= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_STATS")) 0)
           (eprintln "tpde: module setup {}us merge {}us" (/ t-setup 24) (/ (- (ticks) t-merge0) 24)))))
     (.obj g)))
 
-(defn cgtpde-build-object [(a (dyn Allocator)) (mp (ptr Program)) (objpath (ptr i8))] (-> i64)
-  (let [(mut o) (cgtpde-build-mobj a mp)
+(defn cgtpde-build-object [(a (dyn Allocator)) (mp (ptr Program)) (objpath (ptr i8)) (mainpath (slice u8)) (compdir (slice u8))
+                           (paths (ptr (ArrayList (slice u8)))) (texts (ptr (ArrayList (slice u8)))) (emit-dwarf bool)] (-> i64)
+  (let [(mut o) (cgtpde-build-mobj a mp mainpath compdir paths texts emit-dwarf)
         t0 (ticks)
         bytes (if (= (target-arch-str) "x86_64") (macho-write-x64 (mut o)) (macho-write (mut o)))
         t1 (ticks)
