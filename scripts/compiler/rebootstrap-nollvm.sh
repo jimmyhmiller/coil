@@ -33,7 +33,9 @@ S1="$RUN_DIR/coil-nl1"; S2="$RUN_DIR/coil-nl2"
 # Scope the namespace scan: a seed that predates the loader's hidden-directory
 # prune would otherwise index stray tree copies (e.g. .claude/worktrees/*) and
 # report every namespace as declared twice.
-export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts}"
+# ../coil-tpde/src is the tpde backend's package (Coil.toml [dependencies] tpde),
+# which explicit roots would otherwise leave out.
+export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts:../coil-tpde/src}"
 # In-repo, an import of a `coil.*` namespace that is missing from the bundled
 # stdlib manifest still resolves via the namespace scan above, so the build stays
 # green while the shipped compiler cannot serve it (this is how coil.socket,
