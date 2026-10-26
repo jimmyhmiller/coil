@@ -40,6 +40,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 STDLIB = ROOT / "src" / "stdlib"
 SDK = ROOT / "src" / "compiler"
+# The tpde backend's package (Coil.toml: tpde = { path = "../coil-tpde" }), which
+# the compiler imports; installed beside the SDK as compiler/tpde/.
+TPDE = (ROOT / ".." / "coil-tpde" / "src" / "tpde").resolve()
 PRELUDE = ROOT / "src" / "compiler" / "prelude.coil"
 TARGET = ROOT / "src" / "compiler" / "stdlib_manifest.coil"
 RENAMES = ROOT / "src" / "compiler" / "api_renames.coil"
@@ -141,7 +144,19 @@ def collect_sdk() -> list[tuple[str, str]]:
         # the SDK facade. Keep the first namespace mapping deterministically.
         if name not in out:
             out[name] = path.relative_to(SDK).as_posix()
+    for path in sorted(TPDE.rglob("*.coil")):
+        name = declared_module(path.read_text())
+        if name is not None and name not in out:
+            out[name] = "tpde/" + path.relative_to(TPDE).as_posix()
     return sorted(out.items())
+
+
+def sdk_file_list() -> list[str]:
+    """Every file shipped under <lib>/compiler/, relative to it."""
+    if not TPDE.is_dir():
+        sys.exit(f"error: no coil-tpde checkout at {TPDE} (scripts/native/fetch-tpde.sh)")
+    return sorted([p.relative_to(SDK).as_posix() for p in SDK.rglob("*.coil")]
+                  + ["tpde/" + p.relative_to(TPDE).as_posix() for p in TPDE.rglob("*.coil")])
 
 
 def public_namespaces(entries: list[tuple[str, str]]) -> list[str]:
@@ -198,9 +213,7 @@ def render(entries: list[tuple[str, str]], sdk_entries: list[tuple[str, str]]) -
     add('        ""))')
     add("")
     add("(defn sdk-manifest-file? [(name (slice u8))] (-> bool)")
-    sdk_files = sorted(
-        p.relative_to(SDK).as_posix() for p in SDK.rglob("*.coil")
-    )
+    sdk_files = sdk_file_list()
     body = [f'(= name "compiler/{fn}") true' for fn in sdk_files]
     add("  (cond " + "\n        ".join(body))
     add("        false))")
