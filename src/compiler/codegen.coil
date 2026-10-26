@@ -29,6 +29,8 @@
 (import "coil.compiler.layoutdb" :use *)
 (import "coil.compiler.vector" :use *)
 (import "coil.compiler.float_math" :use [f64-bits->f32-bits])
+(import "coil.compiler.debuginfo" :use [DbgTypes dbg-types-new dbg-ty-of! dbg-name?])
+(import "coil.compiler.dwarf" :use [DwTy DwField dw-line-starts dw-linecol])
 
 (defstruct Tv [(val (ptr i8)) (ty Type)])
 
@@ -216,6 +218,20 @@
    (freestanding bool)  ; no OS: no write(2) to report with, no abort(3) to stop
    (sanitizer i64)  ; 0=off, 1=ASan, 2=TSan, 3=MSan, 4=UBSan checks
    (debug_checks bool)
+   ; ---- debug info (cg-debug-req, set by the object build): the DIBuilder, its
+   ; compile unit, a DIFile and the line starts of each source, the function
+   ; being emitted (subprogram, source, last location), the shared type table
+   ; (debuginfo.coil) and each type's metadata
+   (di (ptr i8))
+   (di_cu (ptr i8))
+   (di_files (ArrayList (ptr i8)))
+   (di_lines (ArrayList (ptr (ArrayList i64))))
+   (di_texts (ptr (ArrayList (slice u8))))
+   (di_sp (ptr i8))
+   (di_src i64)
+   (di_last i64)
+   (di_types DbgTypes)
+   (di_md (ArrayList (ptr i8)))
    ; Where each name sits in the lists above, kept by the functions that append
    ; to them: every call looks its callee up, so a scan made lowering quadratic.
    (index CgIndex)
@@ -1588,6 +1604,7 @@
   (let [cell (cg-site-cell)
         saved (load cell)]
     (cg-at! (.source e) (.lo e) (.hi e) (.ctxt e))
+    (when (!= (primitive/cast i64 (.di_sp cg)) 0) (cg-di-at! cg (.source e) (.lo e)))
     (let [tv (emit-expr-here cg e scp)]
       (store! cell saved)
       tv)))
@@ -2205,6 +2222,7 @@
               (do
                 (let [bp (elem binds (load i))
                       tv (emit-expr cg (field bp value) (load s))]
+                  (cg-di-bind! cg (.name bp) tv (field bp value) 0)
                   (set! s
                         (scope-put a (load s) (.name bp) (tv-val tv) (tv-ty tv))))
                 (set! i (primitive/iadd (load i) 1)))))
@@ -2374,6 +2392,7 @@
                                     (mk-tv (.at dest) (TPtr (box-type a t)))))
                           (_ (cg-bug "codegen: the named return slot is not an alloc")))
                         (emit-expr cg (field bp value) (load s)))]
+              (cg-di-bind! cg (.name bp) tv (field bp value) 0)
               (set! s (scope-put a (load s) (.name bp) (tv-val tv) (tv-ty tv)))))
           (for [i 0 (- n 1)]
             (unless (cg-terminated cg)
@@ -5576,6 +5595,7 @@
                                                    0)))
       (None []))
     (cg-pos cg entry)
+    (cg-di-func-begin! cg f function)
     (let [params (load (field f params))
           np (len (load params))
           (mut scp) (scope-nil a)
@@ -5638,6 +5658,7 @@
                                                 0))
                                     (_ 0))
                                   ; the reassembled slot holds the value
+                                  (cg-di-bind! cg pname (mk-tv slot pty) (primitive/cast (ptr Expr) 0) (+ (load i) 1))
                                   (set! scp
                                         (scope-put a (load scp) pname slot pty))))
                       (AAIndirect [sa]
@@ -5647,6 +5668,7 @@
                                                         (primitive/cast i32
                                                                         (load idx)))]
                                     (set! idx (primitive/iadd (load idx) 1))
+                                    (cg-di-bind! cg pname (mk-tv ptr pty) (primitive/cast (ptr Expr) 0) (+ (load i) 1))
                                     (set! scp
                                           (scope-put a (load scp) pname ptr pty))))
                       (AAScalar []
@@ -5661,6 +5683,7 @@
                                   ; an array of a plain LLVM signature arrives as a
                                   ; first-class value; give it storage
                                   (let [pv (cg-tv-of-ssa cg v pty)]
+                                    (cg-di-bind! cg pname pv (primitive/cast (ptr Expr) 0) (+ (load i) 1))
                                     (set! scp
                                           (scope-put a
                                                      (load scp)
@@ -5697,6 +5720,7 @@
                          (field f ret)
                          scp))))))
   (cg-settle-pointer-tail-calls! cg function)
+  (cg-di-func-end! cg)
   0)
 
 ; One function's body into FUNCTION, the LLVM function its Coil name declared.
@@ -6182,7 +6206,9 @@ equal:
     (scratch/ScratchArena::init-with-capacity work
       (retained-heap/compiler-scratch-parent) 65536)
     (let [session (codegen-session-open (allocator work) p triple-override sanitizer debug-checks)
+          _di (cg-di-init! (.cg session))
           _bodies (cg-emit-bodies (.cg session) p)
+          _dif (cg-di-finish! (.cg session))
           module (codegen-session-finish! session)]
       (tr/count "backend.llvm.workspace-live-bytes" (.live work))
       (tr/count "backend.llvm.workspace-total-bytes" (.total work))
@@ -9202,3 +9228,227 @@ equal:
 ; so the self-host's LLVMPrintModuleToString text matches the normalized reference.
 ; Faithful, function-for-function port. Families: 0=g 1=str 2=cstr 3=llvmir.
 ; Categories: 0=type 1=global 2=declare 3=define 4=misc.
+
+; ======================== debug info (DIBuilder) ============================
+; The LLVM backend's half of debuginfo.coil's shared model: the same type
+; table (dbg-ty-of!) and the same source positions, handed to LLVM's DIBuilder,
+; which writes the DWARF. On when the object build asks (cg-debug-req, set from
+; -g by main.coil's build-ir-program).
+;
+; Lines: the builder's location follows each expression of the function's own
+; source (a DILocation's line is in its scope's file), changing only when the
+; line or column does. Variables: a binding's value gets storage the debugger
+; reads (`llvm.dbg.declare`): a mutable local's slot, an aggregate's storage, or
+; otherwise a shadow alloca the value is stored to; SROA turns these into
+; dbg.value at -O1 and up.
+
+(defstruct CgDebugReq
+  [(on bool)
+   (mainpath (slice u8))
+   (compdir (slice u8))
+   (paths (ptr (ArrayList (slice u8))))
+   (texts (ptr (ArrayList (slice u8))))])
+
+(defn cg-debug-req [] (-> (ptr CgDebugReq))
+  (primitive/alloc-static CgDebugReq))
+
+(defn cg-di-null [] (-> (ptr i8)) (primitive/cast (ptr i8) 0))
+
+(defn cg-di-init! [(cg (ptr Cg))] (-> i64)
+  (let [req (cg-debug-req)
+        a (.a cg)]
+    (set! (.di cg) (cg-di-null))
+    (set! (.di_sp cg) (cg-di-null))
+    (when (.on req)
+      (let [di (LLVMCreateDIBuilder (.module cg))
+            mainpath (.mainpath req)
+            compdir (.compdir req)
+            file (LLVMDIBuilderCreateFile di (data mainpath) (len mainpath) (data compdir) (len compdir))
+            producer "coil"]
+        (set! (.di cg) di)
+        (set! (.di_cu cg)
+              (LLVMDIBuilderCreateCompileUnit di (: 1 i32) file (data producer) (len producer) (: 0 i32)
+                                              (data "") 0 (: 0 i32) (data "") 0 (: 1 i32) (: 0 i32) (: 0 i32) (: 0 i32)
+                                              (data "") 0 (data "") 0))
+        (set! (.di_files cg) (ArrayList::new [(ptr i8)] a))
+        (set! (.di_lines cg) (ArrayList::new [(ptr (ArrayList i64))] a))
+        (set! (.di_texts cg) (.texts req))
+        (for i (range 0 (len (load (.paths req))))
+          (let [pth (get (load (.paths req)) i)]
+            (push! (mut (.di_files cg)) (LLVMDIBuilderCreateFile di (data pth) (len pth) (data compdir) (len compdir)))
+            (push! (mut (.di_lines cg)) (primitive/cast (ptr (ArrayList i64)) 0))))
+        (set! (.di_types cg) (dbg-types-new a))
+        (set! (.di_md cg) (ArrayList::new [(ptr i8)] a))
+        (let [k1 "Debug Info Version"
+              k2 "Dwarf Version"
+              i32t (LLVMInt32TypeInContext (cg-ctx cg))]
+          (LLVMAddModuleFlag (.module cg) (: 1 i32) (data k1) (len k1)
+                             (LLVMValueAsMetadata (LLVMConstInt i32t (primitive/cast i64 (LLVMDebugMetadataVersion)) 0)))
+          (LLVMAddModuleFlag (.module cg) (: 1 i32) (data k2) (len k2)
+                             (LLVMValueAsMetadata (LLVMConstInt i32t 4 0))))
+        0))
+    0))
+
+(defn cg-di-finish! [(cg (ptr Cg))] (-> i64)
+  (when (!= (primitive/cast i64 (.di cg)) 0)
+    (LLVMDIBuilderFinalize (.di cg))
+    (LLVMDisposeDIBuilder (.di cg))
+    (set! (.di cg) (cg-di-null)))
+  0)
+
+;;; (line << 20 | column) of byte `lo` in source `src`; 0 if unknown.
+(defn cg-di-linecol [(cg (ptr Cg)) (src i64) (lo i64)] (-> i64)
+  (if (or (< src 0) (>= src (len (.di_lines cg))))
+      0
+      (do
+        (when (= (primitive/cast i64 (get (.di_lines cg) src)) 0)
+          (set! (mut (.di_lines cg)) src (dw-line-starts (.a cg) (get (load (.di_texts cg)) src))))
+        (dw-linecol (get (.di_lines cg) src) lo))))
+
+;;; The subprogram for `f`, and the builder's first location (its defn).
+(defn cg-di-func-begin! [(cg (ptr Cg)) (f (ptr Func)) (function (ptr i8))] (-> i64)
+  (set! (.di_sp cg) (cg-di-null))
+  (when (and (!= (primitive/cast i64 (.di cg)) 0) (>= (.source f) 0) (< (.source f) (len (.di_files cg))))
+    (let [di (.di cg)
+          file (get (.di_files cg) (.source f))
+          lc (cg-di-linecol cg (.source f) (if (< (.lo f) 0) 0 (.lo f)))
+          line (primitive/cast i32 (>> lc 20))
+          (mut nlen) 0
+          lname (LLVMGetValueName2 function (mut nlen))
+          sty (LLVMDIBuilderCreateSubroutineType di file (primitive/cast (ptr (ptr i8)) 0) (: 0 i32) (: 0 i32))
+          sp (LLVMDIBuilderCreateFunction di file (data (.name f)) (len (.name f)) lname nlen file line sty
+                                          (: 0 i32) (: 1 i32) line (: 0 i32) (: 0 i32))]
+      (LLVMSetSubprogram function sp)
+      (set! (.di_sp cg) sp)
+      (set! (.di_src cg) (.source f))
+      (set! (.di_last cg) -1)
+      (cg-di-set-loc! cg lc)))
+  0)
+
+;;; Instructions after the function carry no location (another function's
+;;; would point at the wrong subprogram).
+(defn cg-di-func-end! [(cg (ptr Cg))] (-> i64)
+  (when (!= (primitive/cast i64 (.di cg)) 0)
+    (LLVMSetCurrentDebugLocation2 (cg-bld cg) (cg-di-null))
+    (set! (.di_sp cg) (cg-di-null)))
+  0)
+
+(defn cg-di-loc [(cg (ptr Cg)) (lc i64)] (-> (ptr i8))
+  (LLVMDIBuilderCreateDebugLocation (cg-ctx cg) (primitive/cast i32 (>> lc 20)) (primitive/cast i32 (& lc 1048575))
+                                    (.di_sp cg) (cg-di-null)))
+
+(defn cg-di-set-loc! [(cg (ptr Cg)) (lc i64)] (-> i64)
+  (when (!= lc (.di_last cg))
+    (set! (.di_last cg) lc)
+    (LLVMSetCurrentDebugLocation2 (cg-bld cg) (cg-di-loc cg lc)))
+  0)
+
+(defn cg-di-at! [(cg (ptr Cg)) (src i64) (lo i64)] (-> i64)
+  (when (and (= src (.di_src cg)) (>= lo 0))
+    (cg-di-set-loc! cg (cg-di-linecol cg src lo)))
+  0)
+
+;;; The metadata for type `ti` of the shared table.
+(defn cg-di-type [(cg (ptr Cg)) (ti i64)] (-> (ptr i8))
+  (let [tys (.tys (.di_types cg))]
+    (while (< (len (.di_md cg)) (len tys)) (push! (mut (.di_md cg)) (cg-di-null)))
+    (if (!= (primitive/cast i64 (get (.di_md cg) ti)) 0)
+        (get (.di_md cg) ti)
+        (let [di (.di cg)
+              e (get tys ti)
+              nm (.name e)
+              k (.kind e)
+              file (get (.di_files cg) (.di_src cg))
+              bits (* (.size e) 8)
+              a (.a cg)
+              md
+                (cond
+                  (= k 0) (LLVMDIBuilderCreateBasicType di (data nm) (len nm) bits (primitive/cast i32 (.enc e)) (: 0 i32))
+                  (= k 1) (LLVMDIBuilderCreatePointerType di (if (< (.to e) 0) (cg-di-null) (cg-di-type cg (.to e)))
+                                                          64 (: 0 i32) (: 0 i32) (data nm) (len nm))
+                  (= k 3) (let [(mut subs) (ArrayList::new [(ptr i8)] a)]
+                            (push! (mut subs) (LLVMDIBuilderGetOrCreateSubrange di 0 (.count e)))
+                            (LLVMDIBuilderCreateArrayType di bits (: 0 i32) (cg-di-type cg (.to e)) (carr a subs) (: 1 i32)))
+                  (= k 4) (let [(mut els) (ArrayList::new [(ptr i8)] a)]
+                            (for f (.fields e)
+                              (push! (mut els) (LLVMDIBuilderCreateEnumerator di (data (.name f)) (len (.name f)) (.off f) (: 1 i32))))
+                            (LLVMDIBuilderCreateEnumerationType di (.di_cu cg) (data nm) (len nm) file (: 0 i32) bits (: 0 i32)
+                                                                (carr a els) (primitive/cast i32 (len els)) (cg-di-null)))
+                  :else
+                    ; a struct or union: a placeholder first, as a member may
+                    ; point back at it
+                    (let [tmp (LLVMDIBuilderCreateReplaceableCompositeType
+                                di (if (= k 5) (: 0x17 i32) (: 0x13 i32)) (data nm) (len nm) (.di_cu cg) file (: 0 i32) (: 0 i32)
+                                bits (: 0 i32) (: 0 i32) (data "") 0)
+                          (mut els) (ArrayList::new [(ptr i8)] a)]
+                      (set! (mut (.di_md cg)) ti tmp)
+                      (for f (.fields e)
+                        (let [fmd (cg-di-type cg (.tyidx f))
+                              fbits (* (.size (get tys (.tyidx f))) 8)]
+                          (push! (mut els) (LLVMDIBuilderCreateMemberType di tmp (data (.name f)) (len (.name f)) file (: 0 i32)
+                                                                          fbits (: 0 i32) (* (.off f) 8) (: 0 i32) fmd))))
+                      (let [real (if (= k 5)
+                                     (LLVMDIBuilderCreateUnionType di (.di_cu cg) (data nm) (len nm) file (: 0 i32) bits (: 0 i32)
+                                                                   (: 0 i32) (carr a els) (primitive/cast i32 (len els)) (: 0 i32)
+                                                                   (data "") 0)
+                                     (LLVMDIBuilderCreateStructType di (.di_cu cg) (data nm) (len nm) file (: 0 i32) bits (: 0 i32)
+                                                                    (: 0 i32) (cg-di-null) (carr a els) (primitive/cast i32 (len els))
+                                                                    (: 0 i32) (cg-di-null) (data "") 0))]
+                        (LLVMMetadataReplaceAllUsesWith tmp real)
+                        real)))]
+          (set! (mut (.di_md cg)) ti md)
+          md))))
+
+;;; Whether `e` binds a mutable local `name`: `(do (init-store name.slot …) name.slot)`.
+(defn cg-di-mutable-local? [(e (ptr Expr)) (name (slice u8))] (-> bool)
+  (and (!= (primitive/cast i64 e) 0)
+       (match (.kind e)
+         (EDo [body]
+              (let [n (len (load body))]
+                (and (> n 0)
+                     (match (.kind (elem body (- n 1)))
+                       (EVar [v] (and (= (len v) (+ (len name) 5)) (= (subslice v 0 (len name)) name)
+                                      (= (subslice v (len name) (len v)) ".slot")))
+                       (_ false)))))
+         (_ false))))
+
+;;; Describe a binding of `name` to `tv` (`argno` > 0: that parameter).
+(defn cg-di-bind! [(cg (ptr Cg)) (name (slice u8)) (tv Tv) (value (ptr Expr)) (argno i64)] (-> i64)
+  (when (and (!= (primitive/cast i64 (.di_sp cg)) 0) (dbg-name? name) (not (cg-terminated cg)))
+    (let [a (.a cg)
+          b (cg-bld cg)
+          v (tv-val tv)
+          (mut t) (tv-ty tv)
+          mutable (and (cg-di-mutable-local? value name) (!= (primitive/cast i64 (LLVMIsAAllocaInst v)) 0))]
+      (match (if mutable
+                 (match t (TPtr [inner] (Some (load inner))) (_ (None [Type])))
+                 (Some t))
+        (Some [vt]
+              (let [(mut vtt) vt
+                    ti (dbg-ty-of! (field cg di_types) (field cg layouts) a (mut vtt))]
+                (when (>= ti 0)
+                  (let [mem (and (not mutable) (cg-mem-ty? cg (mut vtt)))
+                        alloca? (!= (primitive/cast i64 (LLVMIsAAllocaInst v)) 0)
+                        ; the storage the variable is described by, and whether
+                        ; it holds a pointer to the value
+                        storage (cond mutable v
+                                      (and mem alloca?) v
+                                      :else (let [sl (cg-entry-alloca cg (LLVMTypeOf v) (cg-bl cg (sconcat a name ".dbg")))]
+                                              (LLVMBuildStore b v sl)
+                                              sl))
+                        deref (and mem (not alloca?))
+                        file (get (.di_files cg) (.di_src cg))
+                        line (primitive/cast i32 (>> (.di_last cg) 20))
+                        ty (cg-di-type cg ti)
+                        var (if (> argno 0)
+                                (LLVMDIBuilderCreateParameterVariable (.di cg) (.di_sp cg) (data name) (len name)
+                                                                      (primitive/cast i32 argno) file line ty (: 1 i32) (: 0 i32))
+                                (LLVMDIBuilderCreateAutoVariable (.di cg) (.di_sp cg) (data name) (len name) file line ty
+                                                                 (: 1 i32) (: 0 i32) (: 0 i32)))
+                        (mut ops) (: 6 u64)  ; DW_OP_deref
+                        ex (LLVMDIBuilderCreateExpression (.di cg) (mut ops) (if deref 1 0))]
+                    (LLVMDIBuilderInsertDeclareRecordAtEnd (.di cg) storage var ex (cg-di-loc cg (.di_last cg))
+                                                           (LLVMGetInsertBlock b))
+                    0))))
+        (None [] 0))))
+  0)
