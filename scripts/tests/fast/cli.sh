@@ -1466,9 +1466,11 @@ section_debuginfo() {
   if [ "$HOST_OS" != Darwin ] || ! command -v dsymutil >/dev/null 2>&1; then
     echo "  (skip: -g with dsymutil and lldb is checked on the macOS host)"; return
   fi
+  # Xcode's lldb, whose debugserver is signed to launch a process; Homebrew's
+  # (CI installs it) cannot launch one on a runner and hangs.
   local lldb
-  lldb=$(command -v lldb || true)
-  [ -x /opt/homebrew/opt/llvm/bin/lldb ] && lldb=/opt/homebrew/opt/llvm/bin/lldb
+  lldb=$(xcrun -f lldb 2>/dev/null || command -v lldb || true)
+  [ -z "$lldb" ] && [ -x /opt/homebrew/opt/llvm/bin/lldb ] && lldb=/opt/homebrew/opt/llvm/bin/lldb
   printf '%s\n' '(module dbgl)' \
     '(defn checkpoint [(value i64)] (-> i64)' \
     '  (let [sum (+ value 1)' \
@@ -1482,10 +1484,19 @@ section_debuginfo() {
   if [ -z "$lldb" ]; then bad "lldb is available" "no lldb on PATH"; return; fi
   # The object is gone, so lldb must read the .dSYM.
   local bp after
-  bp=$("$lldb" -b "$T/dbgl" -o "breakpoint set --file dbgl.coil --line 6" 2>&1)
+  bp=$(timeout -k 5 60 "$lldb" -b "$T/dbgl" -o "breakpoint set --file dbgl.coil --line 6" 2>&1)
   if grep -qE 'Breakpoint 1: where = .*dbgl\.coil:6:' <<<"$bp"; then ok "lldb sets a breakpoint by source line from the .dSYM"
   else bad "lldb sets a breakpoint by source line from the .dSYM" "$(grep -iE 'breakpoint|pending' <<<"$bp" | head -3)"; fi
-  after=$(timeout 60 "$lldb" -b "$T/dbgl" -o "b dbgl.checkpoint" -o run -o "thread step-over" -o "thread step-over" \
+  # The rest stops a running program, which a host may not allow a debugger
+  # (a CI runner without developer mode): say so rather than hang.
+  local probe
+  probe=$(timeout -k 5 30 "$lldb" -b "$T/dbgl" -o run -o kill 2>&1)
+  if ! grep -q "Process [0-9]* launched" <<<"$probe"; then
+    echo "  (skip: lldb cannot launch a process on this host: $(grep -iE 'error|launch' <<<"$probe" | head -1))"
+    pkill -f "$T/dbg" 2>/dev/null
+    return
+  fi
+  after=$(timeout -k 5 60 "$lldb" -b "$T/dbgl" -o "b dbgl.checkpoint" -o run -o "thread step-over" -o "thread step-over" \
           -o "frame variable sum value" -o kill 2>&1)
   case "$after" in
     *"sum = 42"*"value = 41"*|*"value = 41"*"sum = 42"*) ok "lldb shows a parameter and a local after its initializer" ;;
@@ -1511,13 +1522,14 @@ section_debuginfo() {
     case $label in *x86-64*) arch -x86_64 /usr/bin/true 2>/dev/null || continue ;; esac
     # shellcheck disable=SC2086
     "$COIL" build "$T/dbgv.coil" $flags -o "$T/dbgv" >/dev/null 2>&1
-    out=$(timeout 60 "$lldb" -b "$T/dbgv" -o "breakpoint set --file dbgv.coil --line 8" -o run \
+    out=$(timeout -k 5 60 "$lldb" -b "$T/dbgv" -o "breakpoint set --file dbgv.coil --line 8" -o run \
           -o "frame variable" -o "p *pt" -o kill 2>&1)
     case "$out" in
       *"dbgv.coil:8"*"value = 41"*"sum = 42"*"twice = 84"*"tag = dbgv.Sq"*"s = 7"*"x = 1"*)
         ok "debug info ($label): a line breakpoint, parameters, locals, a sum and a struct" ;;
       *) bad "debug info ($label): a line breakpoint, parameters, locals, a sum and a struct" "$(tail -12 <<<"$out")" ;;
     esac
+    pkill -f "$T/dbgv" 2>/dev/null
     rm -rf "$T/dbgv" "$T/dbgv.dSYM"
   done
   "$COIL" build "$T/dbgv.coil" --backend tpde -g0 -o "$T/dbgv" >/dev/null 2>&1
