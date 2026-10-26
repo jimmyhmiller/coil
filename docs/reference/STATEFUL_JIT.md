@@ -33,6 +33,10 @@ coil> (Point :x 1 :y 2 :next (cast (ptr Point) 0))
 (Point :x 1 :y 2 :next #<(ptr Point) 0x0>)
 ```
 
+`coil repl --backend tpde` compiles each submission with the tpde backend
+instead of the host's default (`native` on macOS arm64); `--backend native` and
+`--backend llvm` name the others (see [Backends](#backends-and-optimization)).
+
 A pointer prints its address and is not followed, and a type with no visible
 structure prints as `#<T>`. Nothing is derived: the program gains no impl, so
 you can still write `(derive Debug Point)` later. `coil.repl`, the REPL's
@@ -185,11 +189,12 @@ imported by name like one on disk.
 
 ### Backends and optimization
 
-A session publishes runtime code through one of two backends:
+A session publishes runtime code through one of three backends:
 
 | Backend | Hosts | Compiles | Generated code |
 |---|---|---|---|
 | `(Native)` | macOS arm64 (the default there) | fast, about 5 ms for a small submission | unoptimized; roughly `-O0` or slower |
+| `(Tpde)` | macOS arm64 | as fast as `Native` | unoptimized, but several times faster than `Native`'s or LLVM `-O0`'s |
 | `(Llvm)` | macOS arm64, Linux x86-64 (the default there) | slower, and more so as `opt-level` rises | LLVM's `default<ON>` pipeline, like an AOT `-ON` build |
 
 `jit-session-new` uses the host's default at level 0. To choose, pass a
@@ -229,7 +234,7 @@ runtime code, and the level applies only to runtime code. The session keeps its
 backend and level across `jit-reset!`; `(jit-session-backend s)` reports the
 backend, and `JitBackend` implements `Eq` and `Debug`. The options are refused with `(Err …)`, before anything is created,
 when the host lacks the backend (`UnsupportedBackend`) or `opt-level` is
-outside 0–3 or nonzero for `Native` (`InvalidOptLevel`);
+outside 0–3 or nonzero for `Native` or `Tpde` (`InvalidOptLevel`);
 `jit-options-error-message` describes either.
 
 On an Apple M-series machine, a benchmark that generates, parses and hashes
@@ -242,7 +247,17 @@ On an Apple M-series machine, a benchmark that generates, parses and hashes
 | `Llvm`, level 2 | 42 ms | 599 ms | 296 ms | 651 ms |
 | AOT `coil build -O3` | 46 ms | 600 ms | 296 ms | |
 
-Later small submissions cost about 15 ms with either backend. Pick `Llvm` at
+`Tpde` compiles in about the time `Native` does, since the front end dominates
+a submission, and its code is several times faster. An integer loop (10⁹
+iterations) and a floating-point one (3·10⁸), same machine:
+
+| | integer | float | a warm compile of both | a one-function submission |
+|---|---|---|---|---|
+| `Native` | 3835 ms | 3197 ms | 58 ms | 26 ms |
+| `Tpde` | 670 ms | 697 ms | 59 ms | 26 ms |
+| `Llvm`, level 0 | 3005 ms | 2289 ms | | 26 ms |
+
+Later small submissions cost about 15 ms with any backend. Pick `Llvm` at
 level 2 for code whose run time matters more than its compile time.
 
 ### Calling compiled code

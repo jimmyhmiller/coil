@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Prove single-form compilation and default Var policy through the real REPL."""
+"""Prove single-form compilation and default Var policy through the real REPL.
+
+    jit-single-form.py COMPILER [REPL-ARGS...]   (e.g. --backend tpde)
+"""
 from collections import Counter
 from pathlib import Path
 import os
@@ -11,6 +14,8 @@ raw_compiler = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("COIL")
 if not raw_compiler:
     raise SystemExit("usage: jit-single-form.py COMPILER (or set $COIL)")
 compiler = Path(raw_compiler).resolve()
+# Further arguments go to `coil repl`: comprehensive runs this again with tpde.
+repl_args = sys.argv[2:]
 source = """(defn proof-old [] (-> i64) 7)
 (defn proof-new [] (-> i64) (+ (proof-old) 1))
 (proof-new)
@@ -23,7 +28,7 @@ source = """(defn proof-old [] (-> i64) 7)
 (proof-new)
 :quit
 """
-run = subprocess.run([str(compiler), "repl"], input=source, cwd=ROOT,
+run = subprocess.run([str(compiler), "repl", *repl_args], input=source, cwd=ROOT,
                      env=dict(os.environ, COIL_JIT_TRACE="1"),
                      capture_output=True, text=True, timeout=120)
 assert run.returncode == 0, (run.returncode, run.stdout, run.stderr)
@@ -104,7 +109,7 @@ dynamic = """(import "coil.var" :use [var-static])
 (hot 10)
 :quit
 """
-run = subprocess.run([str(compiler), "repl"], input=dynamic, cwd=ROOT,
+run = subprocess.run([str(compiler), "repl", *repl_args], input=dynamic, cwd=ROOT,
                      capture_output=True, text=True, timeout=120)
 assert run.returncode == 0, (run.returncode, run.stdout, run.stderr)
 assert "error:" not in run.stderr, run.stderr
@@ -137,7 +142,7 @@ source = """(defn f [] (-> i64) 15)
 (f)
 :quit
 """
-run = subprocess.run([str(compiler), "repl"], input=source, cwd=ROOT,
+run = subprocess.run([str(compiler), "repl", *repl_args], input=source, cwd=ROOT,
                      capture_output=True, text=True, timeout=120)
 assert run.returncode == 0 and "error:" not in run.stderr, (run.stdout, run.stderr)
 for value in (15, 17, 18, 42, 2, 120, 3, 4):
@@ -155,7 +160,7 @@ source = """(defn once [] (-> Code) (if (= (primitive/code-count (primitive/code
 (later)
 :quit
 """
-run = subprocess.run([str(compiler), "repl"], input=source, cwd=ROOT,
+run = subprocess.run([str(compiler), "repl", *repl_args], input=source, cwd=ROOT,
                      capture_output=True, text=True, timeout=120)
 assert run.returncode == 0 and "error:" not in run.stderr, (run.stdout, run.stderr)
 assert "coil> 8\n" in run.stdout and "coil> 9\n" in run.stdout, run.stdout

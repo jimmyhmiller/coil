@@ -67,6 +67,9 @@ def steps(x64: bool) -> list[Step]:
         Step("installed/jit-sdk", [installed, "jit-sdk"]),
         Step("installed/repl", [installed, "repl"]),
         Step("jit/repl-forms", [PY, "scripts/tests/jit-single-form.py"]),
+        # The tpde JIT backend exists where the native one does: macOS arm64.
+        *([Step("jit/repl-forms-tpde", [PY, "scripts/tests/jit-single-form.py", "{compiler}", "--backend", "tpde"])]
+          if sys.platform == "darwin" and os.uname().machine == "arm64" else []),
         Step("jit/sessions", [PY, "scripts/tests/jit-static-session.py"]),
         Step("jit/session-memory", [PY, "scripts/tests/jit-session-memory.py"]),
         Step("generated/modules", [PY, "scripts/tests/generated-modules.py"]),
