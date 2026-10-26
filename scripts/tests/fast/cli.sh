@@ -1522,6 +1522,16 @@ section_debuginfo() {
     case $label in *x86-64*) arch -x86_64 /usr/bin/true 2>/dev/null || continue ;; esac
     # shellcheck disable=SC2086
     "$COIL" build "$T/dbgv.coil" $flags -o "$T/dbgv" >/dev/null 2>&1
+    # A CI runner's VM hangs launching an x86-64 program under lldb (and what it
+    # leaves hangs later steps): there, only the line table is read.
+    if [ "${CI:-}" = true ] && [[ $label == *x86-64* ]]; then
+      out=$(timeout -k 5 60 "$lldb" -b "$T/dbgv" -o "breakpoint set --file dbgv.coil --line 8" 2>&1)
+      if grep -qE 'Breakpoint 1: where = .*dbgv\.coil:8:' <<<"$out"; then
+        ok "debug info ($label): a line breakpoint (CI: not run under Rosetta)"
+      else bad "debug info ($label): a line breakpoint" "$(tail -4 <<<"$out")"; fi
+      rm -rf "$T/dbgv" "$T/dbgv.dSYM"
+      continue
+    fi
     out=$(timeout -k 5 60 "$lldb" -b "$T/dbgv" -o "breakpoint set --file dbgv.coil --line 8" -o run \
           -o "frame variable" -o "p *pt" -o kill 2>&1)
     case "$out" in
