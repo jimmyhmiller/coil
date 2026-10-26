@@ -5,7 +5,7 @@ corpus: tests/corpus/*.coil are a handful of large, self-checking programs, each
 covering one area of the language. Every lane builds or runs each program its own
 way and compares stdout and the exit status with tests/corpus/reference/:
 
-    python3 scripts/oracle.py corpus arm64|llvm|x64|interp|safety|meta-interp|opt3 [--all] [--compiler C]
+    python3 scripts/oracle.py corpus arm64|llvm|x64|tpde|interp|safety|meta-interp|opt3 [--all] [--compiler C]
     python3 scripts/oracle.py corpus bless [--compiler C]     # rewrite the references (LLVM lane)
 
 tests/corpus/corpus.txt lists the programs. After the file name come options:
@@ -45,7 +45,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "tests" / "corpus"
 DIAG = ROOT / "tests" / "diag"
 DIAG_SETS = ("compile", "link", "no-hang")
-LANES = ("arm64", "llvm", "x64", "interp", "safety", "meta-interp", "opt3")
+LANES = ("arm64", "llvm", "x64", "tpde", "interp", "safety", "meta-interp", "opt3")
 BUILD_TIMEOUT = 120
 RUN_TIMEOUT = 30
 
@@ -98,6 +98,7 @@ def lane_build_flags(lane: str) -> list[str]:
         "arm64": ["--backend", "arm64"],
         "meta-interp": ["--backend", "arm64"],
         "x64": ["--backend", "x64"],
+        "tpde": ["--backend", "tpde"],
         "llvm": [],
         "safety": ["--use", "coil.safety"],
         "opt3": ["-O3"],

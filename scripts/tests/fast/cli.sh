@@ -1491,6 +1491,37 @@ section_debuginfo() {
     *"sum = 42"*"value = 41"*|*"value = 41"*"sum = 42"*) ok "lldb shows a parameter and a local after its initializer" ;;
     *) bad "lldb shows a parameter and a local after its initializer" "$(tail -8 <<<"$after")" ;;
   esac
+  # Every macOS backend describes the same program the same way (the shared
+  # model, src/compiler/debuginfo.coil): arm64 and tpde by default, LLVM with
+  # -g, tpde for x86-64 too (run under Rosetta). Lines, parameters, locals,
+  # a struct behind a pointer, a sum.
+  printf '%s\n' '(module dbgv)' \
+    '(defstruct Pt [(x i64) (y i64)])' \
+    '(defsum Sh (Sq [(s i64)]) (Nil))' \
+    '(defn checkpoint [(value i64) (pt Pt)] (-> i64)' \
+    '  (let [sum (+ value 1)' \
+    '        twice (* sum 2)' \
+    '        sh (Sq 7)]' \
+    '    (+ (+ sum twice) (+ (.x pt) (match sh (Sq [s] s) (Nil [] 0))))))' \
+    '(defn main [] (-> i64) (checkpoint 41 (Pt :x 1 :y 2)))' > "$T/dbgv.coil"
+  local variant label flags out
+  for variant in "arm64 by default|--backend arm64" "tpde by default|--backend tpde" \
+                 "LLVM -g|--backend llvm -g -O0" "tpde x86-64|--backend tpde --target x86_64-apple-macosx11.0.0"; do
+    label=${variant%%|*}; flags=${variant#*|}
+    case $label in *x86-64*) arch -x86_64 /usr/bin/true 2>/dev/null || continue ;; esac
+    # shellcheck disable=SC2086
+    "$COIL" build "$T/dbgv.coil" $flags -o "$T/dbgv" >/dev/null 2>&1
+    out=$(timeout 60 "$lldb" -b "$T/dbgv" -o "breakpoint set --file dbgv.coil --line 8" -o run \
+          -o "frame variable" -o "p *pt" -o kill 2>&1)
+    case "$out" in
+      *"dbgv.coil:8"*"value = 41"*"sum = 42"*"twice = 84"*"tag = dbgv.Sq"*"s = 7"*"x = 1"*)
+        ok "debug info ($label): a line breakpoint, parameters, locals, a sum and a struct" ;;
+      *) bad "debug info ($label): a line breakpoint, parameters, locals, a sum and a struct" "$(tail -12 <<<"$out")" ;;
+    esac
+    rm -rf "$T/dbgv" "$T/dbgv.dSYM"
+  done
+  "$COIL" build "$T/dbgv.coil" --backend tpde -g0 -o "$T/dbgv" >/dev/null 2>&1
+  [ ! -d "$T/dbgv.dSYM" ] && ok "-g0 turns the default debug info off" || bad "-g0 turns the default debug info off" "$T/dbgv.dSYM exists"
 }
 
 # ---------------------------------------------------------------------------

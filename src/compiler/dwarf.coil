@@ -15,6 +15,7 @@
 (import "coil.arraylist" :use *)
 (import "coil.io" :use *)
 (import "coil.control" :use *)
+(import "coil.hashmap" :use *)
 (import "coil.compiler.a64" :use *)
 
 ; box an ArrayList on the heap (parser.coil has box-al; kept local to avoid
@@ -53,59 +54,60 @@
                     (do (b-u8! (mut b) (primitive/ior byte 128)) 0)))))
     0))
 
+;; The bytes sleb! writes for `v`.
+(defn sleb-size [(v0 i64)] (-> i64)
+  (let [(mut v) v0 (mut n) 1]
+    (while (not (or (and (>= v -64) (< v 64))))
+      (set! v (>> v 7))
+      (set! n (+ n 1)))
+    n))
+
 ; ---- string table (dedup by content) ----------------------------------------
 (defstruct DwStr [(s (slice u8)) (off i64)])
 
-(defstruct DwStrs [(items (ArrayList DwStr)) (buf (ArrayList u8))])
+; a string's offset in the table, found by hash (a linear scan made a
+; compiler-sized object's DWARF take most of a second)
+(defstruct DwStrs [(index (HashMap (slice u8) i64)) (buf (ArrayList u8))])
 
 (defn dwstrs-new [(a (dyn Allocator))] (-> DwStrs)
-  (let [p (primitive/alloc-stack DwStrs)]
-    (set! (.items p) (ArrayList::new [DwStr] a))
-    (set! (.buf p) (ArrayList::new [u8] a))
-    (load p)))
+  ; the names outlive the build: borrowed keys, not copies
+  (DwStrs :index (HashMap::new [(slice u8) i64] a (keyops-borrowed)) :buf (ArrayList::new [u8] a)))
 
 (defn dwstr! [(t (ptr DwStrs)) (s (slice u8))] (-> i64)
-  (let [n (len (.items t))
-        (mut i) 0
-        (mut found) -1]
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (when (= (load (field (al-at [DwStr] (field t items) (load i))
-                                      s))
-                         s)
-                  (store! found
-                          (load (field (al-at [DwStr] (field t items) (load i))
-                                       off))))
-                (set! i (primitive/iadd (load i) 1)))))
-    (if (>= (load found) 0)
-        (load found)
-        (let [off (len (.buf t))
-              e (primitive/alloc-stack DwStr)]
-          (b-bytes! (mut (.buf t)) s)
-          (b-u8! (mut (.buf t)) 0)
-          (set! (.s e) s)
-          (set! (.off e) off)
-          (push! (mut (.items t)) (load e))
-          off))))
+  (match (get (.index t) s)
+    (Some [off] off)
+    (None []
+      (let [off (len (.buf t))]
+        (b-bytes! (mut (.buf t)) s)
+        (b-u8! (mut (.buf t)) 0)
+        (set! (mut (.index t)) s off)
+        off))))
 
 ; ---- per-source line starts --------------------------------------------------
 ; linestarts[k] = byte offset where line k+1 begins; lookup by binary-free scan
 ; is O(lines) — fine (dozens of lookups per file are cached by monotonicity in
 ; the line program builder, which walks events in offset order per source).
+;;; Line starts by memchr: a byte loop over every source made this a few ms of
+;;; each build once debug info was on by default.
+(extern dw.memchr :as "memchr" [(ptr u8) i32 usize] (-> (ptr u8)))
+
 (defn dw-line-starts [(a (dyn Allocator)) (text (slice u8))] (-> (ptr (ArrayList i64)))
+  (dw-box-al [i64] a (dw-line-list a text)))
+
+(defn dw-line-list [(a (dyn Allocator)) (text (slice u8))] (-> (ArrayList i64))
   (let [(mut ls) (ArrayList::new [i64] a)
         n (len text)
+        base (primitive/cast i64 (data text))
         (mut i) 0]
     (push! (mut ls) 0)
-    (loop (if (>= (load i) n)
-              (break)
-              (do
-                (when (= (primitive/cast i64 (get text (load i)))
-                         10)
-                  (push! (mut ls) (primitive/iadd (load i) 1)))
-                (set! i (primitive/iadd (load i) 1)))))
-    (dw-box-al [i64] a (load ls))))
+    (while (< i n)
+      (let [hit (dw.memchr (index (data text) i) (: 10 i32) (primitive/cast usize (- n i)))]
+        (if (= (primitive/cast i64 hit) 0)
+            (set! i n)
+            (let [at (- (primitive/cast i64 hit) base)]
+              (push! (mut ls) (+ at 1))
+              (set! i (+ at 1))))))
+    ls))
 
 ; (line, col) both 1-based; returned packed line<<20|col.
 (defn dw-linecol [(ls (ptr (ArrayList i64))) (off i64)] (-> i64)
@@ -134,7 +136,9 @@
 
 ; type entries (closure precomputed by the backend, offsets assigned here):
 ; kind 0 = base (name, enc, size); 1 = pointer (to, -1 = void*);
-; 2 = struct (name, size, fields); 3 = array (to = elem, count)
+; 2 = struct (name, size, fields); 3 = array (to = elem, count);
+; 4 = enumeration (name, size, fields: the enumerators, value in `off`);
+; 5 = union (name, size, fields: members at offset 0)
 (defstruct DwField [(name (slice u8)) (tyidx i64) (off i64)])
 
 (defstruct DwTy
@@ -170,7 +174,16 @@
    ; initializer to the end of its scope. start < 0 is a parameter, live for
    ; the whole function; end < 0 means "to the end of the function".
    (start i64)
-   (end i64)])
+   (end i64)
+   ; the variable IS the address frame base + slot (its value is not stored
+   ; anywhere): DW_OP_fbreg off, DW_OP_stack_value
+   (addr bool)
+   ; DwInc only: a location list from the compiler's own placement: `slot`
+   ; is the value's index in the function's sampled locations (dw-inc-fn!)
+   (loclist bool)
+   ; a constant: DW_OP_consts cval, DW_OP_stack_value
+   (cst bool)
+   (cval i64)])
 
 (defstruct DwLineEv [(textoff i64) (source i64) (lo i64) (pe bool)])
 
@@ -182,7 +195,9 @@
    (info (ptr (ArrayList u8)))
    (line (ptr (ArrayList u8)))
    (strs (ptr (ArrayList u8)))
-   (relocs (ptr (ArrayList DwReloc)))])
+   (relocs (ptr (ArrayList DwReloc)))
+   ; __debug_loc (empty unless location lists were written)
+   (loc (ptr (ArrayList u8)))])
 
 ; ---- the fixed abbreviation table -------------------------------------------
 (defn dw-abbrev-bytes [(a (dyn Allocator))] (-> (ptr (ArrayList u8)))
@@ -333,6 +348,52 @@
     (uleb! (mut b) 7)  ; high_pc data8 (length)
     (uleb! (mut b) 0)
     (uleb! (mut b) 0)
+    ; 13: enumeration_type, children
+    (uleb! (mut b) 13)
+    (uleb! (mut b) 4)
+    (b-u8! (mut b) 1)
+    (uleb! (mut b) 3)
+    (uleb! (mut b) 14)
+    (uleb! (mut b) 11)
+    (uleb! (mut b) 11)  ; byte_size data1
+    (uleb! (mut b) 0)
+    (uleb! (mut b) 0)
+    ; 14: enumerator
+    (uleb! (mut b) 14)
+    (uleb! (mut b) 40)
+    (b-u8! (mut b) 0)
+    (uleb! (mut b) 3)
+    (uleb! (mut b) 14)
+    (uleb! (mut b) 28)
+    (uleb! (mut b) 6)  ; const_value data4
+    (uleb! (mut b) 0)
+    (uleb! (mut b) 0)
+    ; 15: union_type, children
+    (uleb! (mut b) 15)
+    (uleb! (mut b) 23)
+    (b-u8! (mut b) 1)
+    (uleb! (mut b) 3)
+    (uleb! (mut b) 14)
+    (uleb! (mut b) 11)
+    (uleb! (mut b) 5)  ; byte_size data2
+    (uleb! (mut b) 0)
+    (uleb! (mut b) 0)
+    ; 16: variable whose location is a location list
+    (uleb! (mut b) 16)
+    (uleb! (mut b) 52)
+    (b-u8! (mut b) 0)
+    (uleb! (mut b) 3)
+    (uleb! (mut b) 14)
+    (uleb! (mut b) 58)
+    (uleb! (mut b) 15)
+    (uleb! (mut b) 59)
+    (uleb! (mut b) 6)
+    (uleb! (mut b) 73)
+    (uleb! (mut b) 19)
+    (uleb! (mut b) 2)
+    (uleb! (mut b) 23)  ; location sec_offset
+    (uleb! (mut b) 0)
+    (uleb! (mut b) 0)
     (uleb! (mut b) 0)  ; end of abbrevs
     (dw-box-al [u8] a (load b))))
 
@@ -342,11 +403,12 @@
     (cond (= k 0) 7
           (= k 1)
             (if (< (load (field e to)) 0) 1 5)
-          (= k 2)
+          (or (= k 2) (= k 5))
             (primitive/iadd 8
                             (primitive/imul 11
                                             (len (load (field e
                                                               fields)))))
+          (= k 4) (+ 7 (* 9 (len (.fields e))))  ; header 6, enumerators 9, null 1
           :else 15)))  ; array: 5 + subrange 9 + null 1
 
 ; record a DWARF address relocation: an 8-byte UNSIGNED fixup at `off` bytes into
@@ -362,6 +424,97 @@
     (set! (.off r) off)
     (set! (.symidx r) 0)
     (push! (mut relocs) (load r))
+    0))
+
+;;; The type DIEs, at the offsets already assigned in their `off`.
+(defn dw-write-types! [(info (mut (ArrayList u8))) (strs (ptr DwStrs)) (tys (ptr (ArrayList DwTy)))] (-> void)
+  (let [nty (len (load tys))]
+        (let [(mut i) 0]
+          (loop (if (>= (load i) nty)
+                    (break)
+                    (do
+                      (let [e (al-at [DwTy] tys (load i))
+                            k (.kind e)]
+                        (cond (= k 0)
+                                (do
+                                  (uleb! (mut info) 3)
+                                  (b-u32! (mut info)
+                                          (dwstr! strs (load (field e name))))
+                                  (b-u8! (mut info) (load (field e enc)))
+                                  (b-u8! (mut info) (load (field e size)))
+                                  0)
+                              (= k 1)
+                                (if (< (load (field e to))
+                                       0)
+                                    (uleb! (mut info) 5)
+                                    (do
+                                      (uleb! (mut info) 4)
+                                      (b-u32! (mut info)
+                                              (load (field (al-at [DwTy]
+                                                                  tys
+                                                                  (load (field e
+                                                                               to)))
+                                                           off)))
+                                      0))
+                              (= k 4)
+                                (do
+                                  (uleb! (mut info) 13)
+                                  (b-u32! (mut info) (dwstr! strs (.name e)))
+                                  (b-u8! (mut info) (.size e))
+                                  (for j (range 0 (len (.fields e)))
+                                    (let [f (al-at [DwField] (field e fields) j)]
+                                      (uleb! (mut info) 14)
+                                      (b-u32! (mut info) (dwstr! strs (.name f)))
+                                      (b-u32! (mut info) (.off f))))
+                                  (uleb! (mut info) 0)
+                                  0)
+                              (or (= k 2) (= k 5))
+                                (do
+                                  (uleb! (mut info) (if (= k 5) 15 8))
+                                  (b-u32! (mut info)
+                                          (dwstr! strs (load (field e name))))
+                                  (b-u16! (mut info) (load (field e size)))
+                                  (let [nf (len (load (field e fields)))
+                                        (mut j) 0]
+                                    (loop (if (>= (load j) nf)
+                                              (break)
+                                              (do
+                                                (let [f
+                                                        (al-at [DwField]
+                                                               (field e fields)
+                                                               (load j))]
+                                                  (uleb! (mut info) 9)
+                                                  (b-u32! (mut info)
+                                                          (dwstr! strs
+                                                                  (load (field f
+                                                                               name))))
+                                                  (b-u32! (mut info)
+                                                          (load (field (al-at [DwTy]
+                                                                              tys
+                                                                              (load (field f
+                                                                                           tyidx)))
+                                                                       off)))
+                                                  (b-u16! (mut info)
+                                                          (load (field f off))))
+                                                (store! j
+                                                        (primitive/iadd (load j)
+                                                                        1))))))
+                                  (uleb! (mut info) 0)
+                                  0)
+                              :else  ; array
+                                (do
+                                  (uleb! (mut info) 10)
+                                  (b-u32! (mut info)
+                                          (load (field (al-at [DwTy]
+                                                              tys
+                                                              (load (field e
+                                                                           to)))
+                                                       off)))
+                                  (uleb! (mut info) 11)
+                                  (b-u64! (mut info) (load (field e count)))
+                                  (uleb! (mut info) 0)
+                                  0)))
+                      (set! i (primitive/iadd (load i) 1))))))
     0))
 
 ; ============================ the builder ====================================
@@ -389,7 +542,11 @@
         (mut relocs) (ArrayList::new [DwReloc] a)
         nty (len (load tys))
         nfn (len (load fns))
-        nsrc (len (load paths))]
+        nsrc (len (load paths))
+        _ (reserve! (mut info) (+ (+ (* nty 24) (* nfn 48)) (* (len (load vars)) 40)))
+        _ (reserve! (mut line) (+ 256 (* (len (load evs)) 6)))
+        (mut open-ends) (ArrayList::new [i64] a)
+        (mut open-starts) (ArrayList::new [i64] a)]
     ; Every DWARF address (the CU low_pc, each subprogram low_pc, the line program's
     ; set_address) carries an 8-byte UNSIGNED RELOCATION targeting the __text SECTION,
     ; with the inline value the offset WITHIN __text (the addend) — exactly clang's
@@ -436,80 +593,7 @@
         (b-u64! (mut info) 0)
         (b-u64! (mut info) textlen)
         ; type DIEs
-        (let [(mut i) 0]
-          (loop (if (>= (load i) nty)
-                    (break)
-                    (do
-                      (let [e (al-at [DwTy] tys (load i))
-                            k (.kind e)]
-                        (cond (= k 0)
-                                (do
-                                  (uleb! (mut info) 3)
-                                  (b-u32! (mut info)
-                                          (dwstr! strs (load (field e name))))
-                                  (b-u8! (mut info) (load (field e enc)))
-                                  (b-u8! (mut info) (load (field e size)))
-                                  0)
-                              (= k 1)
-                                (if (< (load (field e to))
-                                       0)
-                                    (uleb! (mut info) 5)
-                                    (do
-                                      (uleb! (mut info) 4)
-                                      (b-u32! (mut info)
-                                              (load (field (al-at [DwTy]
-                                                                  tys
-                                                                  (load (field e
-                                                                               to)))
-                                                           off)))
-                                      0))
-                              (= k 2)
-                                (do
-                                  (uleb! (mut info) 8)
-                                  (b-u32! (mut info)
-                                          (dwstr! strs (load (field e name))))
-                                  (b-u16! (mut info) (load (field e size)))
-                                  (let [nf (len (load (field e fields)))
-                                        (mut j) 0]
-                                    (loop (if (>= (load j) nf)
-                                              (break)
-                                              (do
-                                                (let [f
-                                                        (al-at [DwField]
-                                                               (field e fields)
-                                                               (load j))]
-                                                  (uleb! (mut info) 9)
-                                                  (b-u32! (mut info)
-                                                          (dwstr! strs
-                                                                  (load (field f
-                                                                               name))))
-                                                  (b-u32! (mut info)
-                                                          (load (field (al-at [DwTy]
-                                                                              tys
-                                                                              (load (field f
-                                                                                           tyidx)))
-                                                                       off)))
-                                                  (b-u16! (mut info)
-                                                          (load (field f off))))
-                                                (store! j
-                                                        (primitive/iadd (load j)
-                                                                        1))))))
-                                  (uleb! (mut info) 0)
-                                  0)
-                              :else  ; array
-                                (do
-                                  (uleb! (mut info) 10)
-                                  (b-u32! (mut info)
-                                          (load (field (al-at [DwTy]
-                                                              tys
-                                                              (load (field e
-                                                                           to)))
-                                                       off)))
-                                  (uleb! (mut info) 11)
-                                  (b-u64! (mut info) (load (field e count)))
-                                  (uleb! (mut info) 0)
-                                  0)))
-                      (set! i (primitive/iadd (load i) 1))))))
+        (dw-write-types! (mut info) strs tys)
         ; subprogram DIEs
         (let [(mut i) 0]
           (loop (if (>= (load i) nfn)
@@ -537,9 +621,9 @@
                         ; unavailable instead of reading the slot's stale bytes.
                         ; Later lets nest inside earlier ones, so the blocks are
                         ; kept on a stack and closed once a range is not inside.
-                        (let [(mut open-ends) (ArrayList::new [i64] a)
-                              (mut open-starts) (ArrayList::new [i64] a)
-                              fnend (+ (.textoff f) (.len f))]
+                        (clear! (mut open-ends))
+                        (clear! (mut open-starts))
+                        (let [fnend (+ (.textoff f) (.len f))]
                           (for v (range (.varlo f) (.varhi f))
                             (let [vp (al-at [DwVar] vars v)
                                   vls (get (load lstarts) (.source vp))
@@ -569,13 +653,13 @@
                               (uleb! (mut info) (primitive/iadd (.source vp) 1))
                               (b-u32! (mut info) (primitive/ishr vlc 20))
                               (b-u32! (mut info) (.off (al-at [DwTy] tys (.tyidx vp))))
-                              ; location: fbreg <sleb> [deref]
-                              (let [(mut ex) (ArrayList::new [u8] a)]
-                                (b-u8! (mut ex) 145)  ; DW_OP_fbreg
-                                (sleb! (mut ex) fboff)
-                                (when (.indirect vp) (b-u8! (mut ex) 6))  ; DW_OP_deref
-                                (uleb! (mut info) (len (load ex)))
-                                (b-bytes! (mut info) (slice (load ex))))))
+                              ; location: fbreg <sleb> [deref | stack_value]
+                              (uleb! (mut info) (+ (+ 1 (sleb-size fboff))
+                                                   (if (or (.indirect vp) (.addr vp)) 1 0)))
+                              (b-u8! (mut info) 145)  ; DW_OP_fbreg
+                              (sleb! (mut info) fboff)
+                              (when (.indirect vp) (b-u8! (mut info) 6))  ; DW_OP_deref
+                              (when (.addr vp) (b-u8! (mut info) 159))))  ; DW_OP_stack_value
                           (for _ open-ends (uleb! (mut info) 0)))
                         (uleb! (mut info) 0))  ; end subprogram children
                       (set! i (primitive/iadd (load i) 1))))))
@@ -676,4 +760,345 @@
           (set! (.line out) (dw-box-al [u8] a (load line)))
           (set! (.strs out) (dw-box-al [u8] a (.buf strs)))
           (set! (.relocs out) (dw-box-al [DwReloc] a (load relocs)))
+          (set! (.loc out) (dw-box-al [u8] a (ArrayList::new [u8] a)))
           out)))))
+
+; ============================ the incremental builder ========================
+; dw-build! serializes everything at the end. For a backend that compiles
+; functions on another thread (tpde), DwInc lets that thread encode each
+; function's subprogram DIE, variables and line rows right after compiling it,
+; in text order, so that only the type DIEs are left for the end:
+;
+;   dw-inc-new!  the CU header and DIE (patched at the end)
+;   dw-inc-fn!   one function: its DIE and its rows (the line program carries a
+;                DW_LNE_set_address per function, so a fragment depends only on
+;                the state the previous one left)
+;   dw-inc-finish! the type DIEs after the functions (DIE references are
+;                CU-relative, so types may follow their users), the type
+;                references patched, the line program's header put in front
+;
+; One string table serves both: the functions' names are added during
+; compilation, the types' at the end, so it must only be used by one thread at
+; a time (the compiling one, then, after joining it, the finishing one).
+
+(defstruct DwInc
+  [(a (dyn Allocator))
+   (strs DwStrs)
+   (info (ArrayList u8))
+   (prog (ArrayList u8))  ; the line program, without its header
+   (loc (ArrayList u8))   ; __debug_loc
+   ; dw-inc-fn!'s scratch: the sampled locations bucketed by value
+   (lk-start (ArrayList i64))
+   (lk-items (ArrayList i64))
+   (relocs (ArrayList DwReloc))
+   ; (offset in info, type index) of every type reference to patch
+   (typatch (ArrayList i64))
+   ; each source's line starts, made when a function from it is encoded
+   (texts (ptr (ArrayList (slice u8))))
+   (lstarts (ArrayList (ArrayList i64)))  ; empty until made
+   (open-ends (ArrayList i64))
+   (open-starts (ArrayList i64))
+   (fbreg i64)
+   (fbbias i64)
+   (hipc-off i64)
+   ; the line program's state
+   (curoff i64)
+   (curfile i64)
+   (curline i64)])
+
+(defn dw-inc-new [(a (dyn Allocator)) (mainpath (slice u8)) (compdir (slice u8)) (texts (ptr (ArrayList (slice u8))))
+                  (fbreg i64) (fbbias i64)] (-> DwInc)
+  (let [(mut d) (DwInc :a a :strs (dwstrs-new a) :info (ArrayList::new [u8] a) :prog (ArrayList::new [u8] a)
+                       :loc (ArrayList::new [u8] a) :lk-start (ArrayList::new [i64] a) :lk-items (ArrayList::new [i64] a)
+                       :relocs (ArrayList::new [DwReloc] a) :typatch (ArrayList::new [i64] a)
+                       :texts texts :lstarts (ArrayList::new [(ArrayList i64)] a)
+                       :open-ends (ArrayList::new [i64] a) :open-starts (ArrayList::new [i64] a)
+                       :fbreg fbreg :fbbias fbbias :hipc-off 0 :curoff 0 :curfile 1 :curline 1)
+        strs (cast (ptr DwStrs) (mut (.strs d)))]
+    (for i (range 0 (len (load texts)))
+      (push! (mut (.lstarts d)) (ArrayList::new [i64] a)))
+    ; CU header (length patched) and DIE, as dw-build! writes them
+    (b-u32! (mut (.info d)) 0)
+    (b-u16! (mut (.info d)) 4)
+    (b-u32! (mut (.info d)) 0)
+    (b-u8! (mut (.info d)) 8)
+    (uleb! (mut (.info d)) 1)
+    (b-u32! (mut (.info d)) (dwstr! strs "coil"))
+    (b-u16! (mut (.info d)) 2)
+    (b-u32! (mut (.info d)) (dwstr! strs mainpath))
+    (b-u32! (mut (.info d)) (dwstr! strs compdir))
+    (b-u32! (mut (.info d)) 0)
+    (dw-reloc! (mut (.relocs d)) 1 (len (.info d)) 0)
+    (b-u64! (mut (.info d)) 0)
+    (set! (.hipc-off d) (len (.info d)))
+    (b-u64! (mut (.info d)) 0)
+    d))
+
+;;; Source `src`'s line starts.
+(defn dw-inc-lines [(d (ptr DwInc)) (src i64)] (-> (ptr (ArrayList i64)))
+  ; (a made table has at least the first line's start)
+  (when (= (len (get (.lstarts d) src)) 0)
+    (set! (mut (.lstarts d)) src (dw-line-list (.a d) (get (load (.texts d)) src))))
+  (elem (mut (.lstarts d)) src))
+
+;;; A type reference (ref4) to type `ti`, patched by dw-inc-finish!.
+(defn dw-inc-tyref! [(d (ptr DwInc)) (ti i64)] (-> void)
+  (push! (mut (.typatch d)) (len (.info d)))
+  (push! (mut (.typatch d)) ti)
+  (b-u32! (mut (.info d)) 0)
+  0)
+
+;;; Function `f`, its variables `vars` (DwVar slots as frame offsets, start /
+;;; end as text offsets) and its line rows, in text order.
+(defn dw-inc-fn! [(d (ptr DwInc)) (f (ptr DwFn)) (vars (ptr (ArrayList DwVar))) (evs (ptr (ArrayList DwLineEv)))
+                  (locs (ptr (ArrayList u64)))] (-> void)
+  (dw-inc-bucket! d vars locs)
+  (let [strs (cast (ptr DwStrs) (mut (.strs d)))
+        ls (dw-inc-lines d (.source f))
+        lc (dw-linecol ls (.lo f))
+        fnend (+ (.textoff f) (.len f))]
+    ; ---- the subprogram
+    (uleb! (mut (.info d)) 2)
+    (b-u32! (mut (.info d)) (dwstr! strs (.name f)))
+    (uleb! (mut (.info d)) (+ (.source f) 1))
+    (b-u32! (mut (.info d)) (>> lc 20))
+    (dw-reloc! (mut (.relocs d)) 1 (len (.info d)) 0)
+    (b-u64! (mut (.info d)) (.textoff f))
+    (b-u64! (mut (.info d)) (.len f))
+    (uleb! (mut (.info d)) 1)
+    (b-u8! (mut (.info d)) (+ 80 (.fbreg d)))
+    (clear! (mut (.open-ends d)))
+    (clear! (mut (.open-starts d)))
+    (for v (range 0 (len (load vars)))
+      (let [vp (elem vars v)
+            vls (dw-inc-lines d (.source vp))
+            vlc (dw-linecol vls (.lo vp))
+            fboff (- (.slot vp) (+ (.fbbias d) (.slotbytes f)))
+            scoped (and (not (.param vp)) (>= (.start vp) 0))
+            vstart (if scoped (.start vp) (.textoff f))
+            vend (if (and scoped (>= (.end vp) 0)) (.end vp) fnend)]
+        ; lexical blocks as dw-build! nests them
+        (while (and (> (len (.open-ends d)) 0)
+                    (or (not scoped)
+                        (< vstart (get (.open-starts d) (- (len (.open-starts d)) 1)))
+                        (> vend (get (.open-ends d) (- (len (.open-ends d)) 1)))))
+          (uleb! (mut (.info d)) 0)
+          (pop! (mut (.open-ends d)))
+          (pop! (mut (.open-starts d))))
+        (when scoped
+          (uleb! (mut (.info d)) 12)
+          (dw-reloc! (mut (.relocs d)) 1 (len (.info d)) 0)
+          (b-u64! (mut (.info d)) vstart)
+          (b-u64! (mut (.info d)) (if (> vend vstart) (- vend vstart) 0))
+          (push! (mut (.open-starts d)) vstart)
+          (push! (mut (.open-ends d)) vend))
+        (uleb! (mut (.info d)) (cond (.loclist vp) 16 (.param vp) 6 :else 7))
+        (b-u32! (mut (.info d)) (dwstr! strs (.name vp)))
+        (uleb! (mut (.info d)) (+ (.source vp) 1))
+        (b-u32! (mut (.info d)) (>> vlc 20))
+        (dw-inc-tyref! d (.tyidx vp))
+        (cond
+          (.loclist vp)
+            (do (b-u32! (mut (.info d)) (len (.loc d)))
+                (dw-inc-loclist! d locs (.slot vp) (.indirect vp) (.textoff f) vend))
+          (.cst vp)
+            (do (uleb! (mut (.info d)) (+ 2 (sleb-size (.cval vp))))
+                (b-u8! (mut (.info d)) 17)  ; DW_OP_consts
+                (sleb! (mut (.info d)) (.cval vp))
+                (b-u8! (mut (.info d)) 159))  ; DW_OP_stack_value
+          :else
+            (do (uleb! (mut (.info d)) (+ (+ 1 (sleb-size fboff)) (if (or (.indirect vp) (.addr vp)) 1 0)))
+                (b-u8! (mut (.info d)) 145)
+                (sleb! (mut (.info d)) fboff)
+                (when (.indirect vp) (b-u8! (mut (.info d)) 6))
+                (when (.addr vp) (b-u8! (mut (.info d)) 159))))))
+    (for _ (.open-ends d) (uleb! (mut (.info d)) 0))
+    (uleb! (mut (.info d)) 0)
+    ; ---- its rows: from DW_LNE_set_address of its start
+    (b-u8! (mut (.prog d)) 0)
+    (uleb! (mut (.prog d)) 9)
+    (b-u8! (mut (.prog d)) 2)
+    (dw-reloc! (mut (.relocs d)) 2 (len (.prog d)) 0)
+    (b-u64! (mut (.prog d)) (.textoff f))
+    (set! (.curoff d) (.textoff f))
+    (for i (range 0 (len (load evs)))
+      (let [e (elem evs i)
+            els (dw-inc-lines d (.source e))
+            elc (dw-linecol els (.lo e))
+            file (+ (.source e) 1)
+            line (>> elc 20)]
+        (when (!= file (.curfile d))
+          (b-u8! (mut (.prog d)) 4)
+          (uleb! (mut (.prog d)) file)
+          (set! (.curfile d) file))
+        (b-u8! (mut (.prog d)) 5)
+        (uleb! (mut (.prog d)) (& elc 1048575))
+        (when (!= line (.curline d))
+          (b-u8! (mut (.prog d)) 3)
+          (sleb! (mut (.prog d)) (- line (.curline d)))
+          (set! (.curline d) line))
+        (when (!= (.textoff e) (.curoff d))
+          (b-u8! (mut (.prog d)) 2)
+          (uleb! (mut (.prog d)) (- (.textoff e) (.curoff d)))
+          (set! (.curoff d) (.textoff e)))
+        (when (.pe e) (b-u8! (mut (.prog d)) 10))
+        (b-u8! (mut (.prog d)) 1)))
+    0))
+
+;;; Bucket `locs` ((value index, offset, location) triples, in offset order)
+;;; by value: lk-items holds each value's triple indexes from lk-start[k].
+(defn dw-inc-bucket! [(d (ptr DwInc)) (vars (ptr (ArrayList DwVar))) (locs (ptr (ArrayList u64)))] (-> void)
+  (let [n (/ (len (load locs)) 3)
+        (mut nk) 0]
+    (for v (range 0 (len (load vars)))
+      (let [vp (elem vars v)]
+        (when (and (.loclist vp) (>= (.slot vp) nk)) (set! nk (+ (.slot vp) 1)))))
+    (for i (range 0 n)
+      (let [k (primitive/cast i64 (get (load locs) (* i 3)))] (when (>= k nk) (set! nk (+ k 1)))))
+    (clear! (mut (.lk-start d)))
+    (clear! (mut (.lk-items d)))
+    (for _ (range 0 (+ nk 1)) (push! (mut (.lk-start d)) 0))
+    (for i (range 0 n)
+      (let [k (primitive/cast i64 (get (load locs) (* i 3)))]
+        (set! (mut (.lk-start d)) (+ k 1) (+ (get (.lk-start d) (+ k 1)) 1))))
+    (for k (range 0 nk) (set! (mut (.lk-start d)) (+ k 1) (+ (get (.lk-start d) (+ k 1)) (get (.lk-start d) k))))
+    (for _ (range 0 n) (push! (mut (.lk-items d)) 0))
+    ; fill, keeping offset order within each value
+    (let [(mut fillp) (ArrayList::new [i64] (.a d))]
+      (for k (range 0 nk) (push! (mut fillp) (get (.lk-start d) k)))
+      (for i (range 0 n)
+        (let [k (primitive/cast i64 (get (load locs) (* i 3)))]
+          (set! (mut (.lk-items d)) (get fillp k) i)
+          (set! (mut fillp) k (+ (get fillp k) 1))))
+      (free! (mut fillp)))))
+
+;;; A location's DWARF expression: a register (its contents, or with
+;;; `indirect` the memory it points at) or a frame slot.
+(defn dw-inc-locexpr! [(d (ptr DwInc)) (b (mut (ArrayList u8))) (l u64) (indirect bool)] (-> void)
+  (let [kind (>> l (: 56 u64))]
+    (if (= kind (: 1 u64))
+        (let [r (primitive/cast i64 (& l (: 0xFF u64)))
+              dr (dw-dwarf-reg (.fbreg d) r)]
+          (if indirect
+              (if (< dr 32) (do (b-u8! (mut b) (+ 112 dr)) (sleb! (mut b) 0))
+                  (do (b-u8! (mut b) 146) (uleb! (mut b) dr) (sleb! (mut b) 0)))
+              (if (< dr 32) (b-u8! (mut b) (+ 80 dr))
+                  (do (b-u8! (mut b) 144) (uleb! (mut b) dr)))))
+        (let [off (- (primitive/cast i64 (primitive/cast i32 (primitive/cast u32 (& l (: 0xFFFFFFFF u64))))) (.fbbias d))]
+          (b-u8! (mut b) 145)
+          (sleb! (mut b) off)
+          (when indirect (b-u8! (mut b) 6))))
+    0))
+
+;;; A tpde register as a DWARF register number: arm64 (frame base x29) x0-x30
+;;; are 0-30 and v0-v31 64-95; x86-64 (frame base rbp) has its own order for
+;;; the GPRs (rax rdx rcx rbx rsi rdi rbp rsp r8-r15), xmm0-15 at 17-32.
+(defn dw-dwarf-reg [(fbreg i64) (r i64)] (-> i64)
+  (if (= fbreg 29)
+      (if (>= r 32) (+ 64 (- r 32)) r)
+      (if (>= r 32)
+          (+ 17 (- r 32))
+          (case r 0 0 1 2 2 1 3 3 4 7 5 6 6 4 7 5 r))))
+
+;;; Value `k`'s location list into __debug_loc: an entry from each sampled
+;;; location to the next (the last to `fend`), none where it had none.
+(defn dw-inc-loclist! [(d (ptr DwInc)) (locs (ptr (ArrayList u64))) (k i64) (indirect bool) (fstart i64) (fend i64)] (-> void)
+  (when (< (+ k 1) (len (.lk-start d)))
+    (let [lo (get (.lk-start d) k)
+          hi (get (.lk-start d) (+ k 1))
+          (mut ex) (ArrayList::new [u8] (.a d))]
+      (for j (range lo hi)
+        (let [i (get (.lk-items d) j)
+              l (get (load locs) (+ (* i 3) 2))
+              begin (primitive/cast i64 (get (load locs) (+ (* i 3) 1)))
+              end (if (< (+ j 1) hi)
+                      (primitive/cast i64 (get (load locs) (+ (* (get (.lk-items d) (+ j 1)) 3) 1)))
+                      fend)]
+          (when (and (!= l (: 0 u64)) (> end begin))
+            (clear! (mut ex))
+            (dw-inc-locexpr! d (mut ex) l indirect)
+            (b-u64! (mut (.loc d)) begin)
+            (b-u64! (mut (.loc d)) end)
+            (b-u16! (mut (.loc d)) (len ex))
+            (b-bytes! (mut (.loc d)) (slice ex)))))
+      (free! (mut ex))))
+  (b-u64! (mut (.loc d)) 0)
+  (b-u64! (mut (.loc d)) 0)
+  0)
+
+;;; The types after the functions, the references to them patched, the line
+;;; program behind its header; `textlen` ends the CU's range and the program.
+;;; `oa` holds the result's boxes and the parts made here (the line program,
+;;; the abbreviations); its info, strings, relocations and location lists are
+;;; the encoder's own buffers, valid until dw-inc-free!.
+(defn dw-inc-finish! [(d (ptr DwInc)) (paths (ptr (ArrayList (slice u8)))) (tys (ptr (ArrayList DwTy))) (textlen i64)
+                      (oa (dyn Allocator))] (-> (ptr DwOut))
+  (let [a oa
+        strs (cast (ptr DwStrs) (mut (.strs d)))
+        (mut off) (len (.info d))]
+    (for i (range 0 (len (load tys)))
+      (let [e (elem tys i)]
+        (set! (.off e) off)
+        (set! off (+ off (dw-ty-size e)))))
+    (dw-write-types! (mut (.info d)) strs tys)
+    (uleb! (mut (.info d)) 0)  ; end of the CU's children
+    (for i (range 0 (/ (len (.typatch d)) 2))
+      (let [at (get (.typatch d) (* i 2))
+            ti (get (.typatch d) (+ (* i 2) 1))]
+        (b-patch-u32! (mut (.info d)) at (.off (elem tys ti)))))
+    (b-patch-u64! (mut (.info d)) (.hipc-off d) textlen)
+    (b-patch-u32! (mut (.info d)) 0 (- (len (.info d)) 4))
+    ; ---- the line program: header, then the rows
+    (let [(mut line) (ArrayList::new [u8] a)]
+      (b-u32! (mut line) 0)
+      (b-u16! (mut line) 4)
+      (b-u32! (mut line) 0)
+      (let [hdrstart (len line)]
+        (for byte [1 1 1 251 14 13 0 1 1 1 1 0 0 0 1 0 0 1] (b-u8! (mut line) byte))
+        (b-u8! (mut line) 0)  ; no include_directories
+        (for i (range 0 (len (load paths)))
+          (b-bytes! (mut line) (get (load paths) i))
+          (b-u8! (mut line) 0)
+          (uleb! (mut line) 0)
+          (uleb! (mut line) 0)
+          (uleb! (mut line) 0))
+        (b-u8! (mut line) 0)
+        (b-patch-u32! (mut line) 6 (- (len line) hdrstart))
+        (let [pbase (len line)]
+          (b-bytes! (mut line) (slice (.prog d)))
+          (when (> textlen (.curoff d))
+            (b-u8! (mut line) 2)
+            (uleb! (mut line) (- textlen (.curoff d))))
+          (b-u8! (mut line) 0)
+          (uleb! (mut line) 1)
+          (b-u8! (mut line) 1)
+          (b-patch-u32! (mut line) 0 (- (len line) 4))
+          ; the program's relocations move behind the header
+          (for i (range 0 (len (.relocs d)))
+            (let [r (elem (mut (.relocs d)) i)]
+              (when (= (.sect r) 2) (set! (.off r) (+ (.off r) pbase)))))))
+      (let [out (box! a DwOut (primitive/zeroed DwOut))]
+        (set! (.abbrev out) (dw-abbrev-bytes a))
+        (set! (.info out) (dw-box-al [u8] a (.info d)))
+        (set! (.line out) (dw-box-al [u8] a line))
+        (set! (.strs out) (dw-box-al [u8] a (.buf (.strs d))))
+        (set! (.relocs out) (dw-box-al [DwReloc] a (.relocs d)))
+        (set! (.loc out) (dw-box-al [u8] a (.loc d)))
+        out))))
+
+;;; Release the encoder (and with it the buffers dw-inc-finish!'s result
+;;; shares).
+(defn dw-inc-free! [(d (ptr DwInc))] (-> void)
+  (free! (mut (.index (.strs d))))
+  (free! (mut (.buf (.strs d))))
+  (free! (mut (.info d)))
+  (free! (mut (.prog d)))
+  (free! (mut (.loc d)))
+  (free! (mut (.lk-start d)))
+  (free! (mut (.lk-items d)))
+  (free! (mut (.relocs d)))
+  (free! (mut (.typatch d)))
+  (for i (range 0 (len (.lstarts d))) (free! (mut (elem (mut (.lstarts d)) i))))
+  (free! (mut (.lstarts d)))
+  (free! (mut (.open-ends d)))
+  (free! (mut (.open-starts d))))

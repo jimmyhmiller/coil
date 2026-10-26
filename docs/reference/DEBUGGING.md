@@ -15,8 +15,21 @@ the sanitizer runtime won't link.
 | Integer overflow, division by zero, bad shifts | `--sanitize=undefined` |
 | A crash with no clue where | `--debug-runtime` |
 | A C function writing outside its out-parameter | `coil.checked-ffi` |
+| You want to step through it in `lldb`/`gdb` | debug info: on by default with `--backend tpde` or `--backend arm64`, `-g` otherwise (below) |
 
 All of these flags work on `build`, `run`, `check` and `test`.
+
+## Stepping in a debugger: debug info
+
+`--backend tpde` and `--backend arm64` emit DWARF by default: line
+breakpoints, stepping, backtraces, parameters, locals and their types (structs,
+sums, slices) in `lldb` and `gdb`. The LLVM backend emits it with `-g`
+(`--backend llvm -g`); `-g` alone picks the native arm64 backend. `-g0` turns
+the default off. On macOS the build gathers `<exe>.dSYM` beside the
+executable. See `DEBUGINFO_DWARF.md` for how each backend finds variables.
+
+    coil build app.coil -o app --backend tpde
+    lldb ./app -o "breakpoint set --file app.coil --line 12" -o run -o "frame variable"
 
 ## Safety checks: `coil.safety`
 
