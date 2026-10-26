@@ -9,6 +9,11 @@ compiler (and, for the LLVM backend, libLLVM) — in three flavors:
 | **LLVM-free** | `python3 scripts/dev.py build nollvm` | just `cc` | Native backend for the host |
 | Full | `python3 scripts/dev.py build full` | `cc` + LLVM 21 | LLVM + native backends |
 
+The compiler includes the tpde backend, whose package
+([coil-tpde](https://github.com/jimmyhmiller/coil-tpde)) is a path dependency
+checked out beside this one, at `../coil-tpde`. `scripts/native/fetch-tpde.sh`
+checks it out at the commit `scripts/native/tpde.rev` pins (CI runs it).
+
 Both commands select the host implementation automatically: macOS/ARM64 uses the
 Mach-O bootstrap and Linux/x86-64 uses the ELF bootstrap. The explicit `linux` and
 `nollvm-linux` variants remain available for automation but are not required for
