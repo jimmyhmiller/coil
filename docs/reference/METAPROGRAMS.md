@@ -271,11 +271,7 @@ New API this project added (all shipped):
   a section banner (a run of six or more punctuation characters, i.e. `; ==== … ====`),
   which introduces everything below it rather than the one definition underneath.
   `suggest`'s refusal to drop a comment is waived here, because dropping it is the
-  point. The bundled user: **`coil.lint.unused`** (`src/stdlib/lints/unused.coil`),
-  whole-program dead-code elimination for source — reachability over the
-  compiler's declaration graph from `main`, the tests and `meta/module-uses`,
-  deleting to a fixpoint. It is deliberately NOT in `coil.lint.default`; run it with
-  `coil lint FILE --use coil.lint.unused --fix`.
+  point.
 - **`(primitive/code-macro? NODE)` → bool** — true for a node the expander produced. Checkers run
   on the EXPANDED program, so every `cond`/`when`/`case` the author wrote is already
   nested `if`s by the time a rule sees it; this is how a rule about `if` tells the two

@@ -64,9 +64,6 @@ what it holds.
   names, is rejected, and the working definition stays.
 - A failed submission changes nothing. `alloc-static` storage from accepted
   submissions survives later ones.
-- Each implementation is its `Var`'s metadata root (`:jit/root`, versioned by
-  `primitive/code-session-submission`), so `jit-reclaim-retired!` frees the
-  implementations a `Var` no longer holds and keeps the one it does.
 - A generic function can be redefined too. It has no single function pointer
   to swap, so new uses specialize the new template, while code compiled earlier
   keeps the specialization it already bound.
@@ -418,63 +415,20 @@ while something accepted still calls it (`jit-reclaim-retired!` frees it once
 nothing does). Retiring something that is not there has no effect. One
 submission may bind a given name only once.
 
-## Letting generated code go
-
-Metaprograms that generate a new implementation per edit would otherwise keep
-every old version's compiler metadata alive. Mark generated concrete
-definitions so they stop being metadata roots once published:
-
-```text
-(import "coil.jit.lifetime")
-(defn implementation :jit/retain false [] (-> i64) 27)
-```
-
-The native code stays callable through any pointer you hold. The compiler
-metadata survives only while something retained still depends on it: a
-caller, an initializer, a generic, a function that names a type anywhere in
-its body, or a type that holds it in a field. That holds however long ago the
-reader was accepted. A retired declaration depends on nothing. The annotation is
-rejected on generic and `Code`-returning functions.
-
-Records and sums accept `:jit/retain false` too, before their field or
-variant list. Their impls do not keep them alive by themselves: an impl
-selected by a retired type is dropped along with it, so a migration impl from
-`Old` to `New` does not keep `Old` alive.
-
-### Versioned roots
-
-A generated schema that must stay constructible until its next revision can be
-kept alive through a versioned root:
-
-```text
-(defstruct Physical1 :jit/retain false [(value i64)])
-(defn descriptor1 :jit/retain false :jit/root 1 :jit/root-version 1
-  [] (-> Physical1) (Physical1 :value 7))
-```
-
-A later submission defines `Physical2` and `descriptor2` with the same root ID
-and a larger version. Only the newest descriptor is a root, and its
-dependencies stay alive; the older version's are released unless something
-else needs them. IDs are scoped to the module. Duplicate updates of one root
-in a submission, stale versions, non-positive values, and root annotations
-without `:jit/retain false` are errors. A rejected candidate does not advance
-a root.
-
 ## Checked states as values
 
 A session can hand out compiler states as values. A checked-only session
 (`jit-checked-session-new`) serves tools like a live type checker that never run
 code. A session that runs code does too: `jit-env-current` is the running
 program's state, and a check against it is never compiled to native code or
-published. So a client can ask what an edit depends on before submitting it.
+published.
 
 | Call | Does |
 |---|---|
 | `(jit-env-empty)` | The state to build the first one on |
 | `(jit-env-check s BASE SOURCE)` | Check SOURCE against BASE; returns a new state. BASE is unchanged |
 | `(jit-env-valid? E)` | False for the empty state and for a failed check (see `jit-diagnostic`) |
-| `(jit-env-defines? s E NAME)`, `(jit-env-live-function allocator s E …)` | Query a state |
-| `(jit-env-stale-count s E)`, `(jit-env-stale-name s E I)` | Earlier definitions that depend on something this check changed |
+| `(jit-env-defines? s E NAME)` | Query a state |
 | `(jit-env-definition-source s E NAME)` | A definition's own source text |
 | `(jit-env-release! s E)` | Release a state; any order |
 
@@ -487,27 +441,8 @@ what the name meant (`retire-defn`, `retire-struct`, `retire-alias`, and the
 other retire forms above) and defines the name again. How it names its
 definitions over time is up to the client.
 
-A check reports the earlier functions and constants that depend on what it
-changed. It does not recheck them, refuse the edit, or replace anything. A
-definition depends on a change when it reaches, directly or through an accepted
-definition that holds it by value:
-
-- a name that now points at a different definition (`defalias`), whatever kind
-  of definition: function, struct, sum, constant, `def`, macro or generic;
-- a declaration that was retired (whether or not the same check defines the
-  name again);
-- a name its module did not define, which a new definition in that module now
-  captures (it had been reached through an import, `coil.core`, or a trait
-  method).
-
-A definition marked `:jit/retain false` is released once nothing uses it, so it
-stops being reported. `tests/jit/env_stale_complete.coil`
-lists the expected set for each kind of edit.
-
 `jit-reset!` refuses while any state is held. Source that stages session state
-cannot be checked as a value. `tests/jit/live_checker.coil` is
-a complete client that names its own versions; `jit_env_native.coil` checks
-against a running session.
+cannot be checked as a value.
 
 ## The program a session runs in
 
@@ -621,26 +556,13 @@ generation gave it.
 
 ## Memory and tracing
 
-Each accepted submission replaces one compact graph of live compiler metadata
-and frees the compiler's scratch memory, so accepted compilations do not
-accumulate. Scratch segments of 1 MiB and more are page mappings returned to
-the system when freed, so a host does not stay large after a compile. The
-process checks the implicit prelude once, the first time a session of a given
-configuration compiles (about 350 ms), and every later session and every reset
-session builds on that shared, read-only state: its first compile takes about
-30 ms, a later one a few milliseconds. Sessions still get their own native code
-and their own prelude statics. A session that loaded a project or is
-checked-only checks the prelude itself. A source provider's session shares the
-prelude too; the provider is compiled once, beside it, when it is set. Native code is owned separately: retiring metadata does not unmap
-code that a published pointer may still call, and `jit-reset!` releases both.
-Source text is kept only while live metadata refers to it.
+Each accepted submission keeps the memory its compilation allocated, and the
+next submission builds on it directly, so a session grows with every accepted
+edit. Native code is owned separately: `jit-reset!` releases both.
 
 | Variable | Shows |
 |---|---|
-| `COIL_JIT_TRACE=1` | Per-submission events on stderr: parsed declarations, checked and emitted function bodies (including nested units), the retained catalog, and retained byte counts |
-| `COIL_JIT_TRACE_MEMORY=1` | With the above, a census of retained record types |
-| `COIL_JIT_PROTECT=1` | Make accepted metadata read-only. A stray store faults at the store (SIGBUS on macOS, SIGSEGV on Linux) instead of corrupting a later edit. A checking mode: it costs a mapping per block |
-| `COIL_TRACE=1` | Compiler phase timings, including the snapshot's scratch arenas |
+| `COIL_JIT_TRACE=1` | Per-submission events on stderr: parsed declarations, and checked and emitted function bodies (including nested units) |
+| `COIL_TRACE=1` | Compiler phase timings |
 
-To find the writer behind a `COIL_JIT_PROTECT` fault, run the program under
-`lldb --batch -o run -o bt`.
+

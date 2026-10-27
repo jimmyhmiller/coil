@@ -117,10 +117,6 @@ jit_sdk() {
   if [ "$HOST_OS" = Linux ]; then
     link=(--link-flag "-L$("${LLVM_CONFIG:-llvm-config}" --libdir)" --link-flag -lLLVM --link-flag -lm)
   fi
-  cp tests/jit/checked_baseline.coil "$T/sdk/live-ir.coil"
-  expect_rc 0 "a live-IR consumer links the warmed unit and runs" \
-    bash -c 'cd "$1" && "$2" build live-ir.coil --backend llvm -o live-ir "${@:3}" && PATH="$(dirname "$2"):$PATH" ./live-ir' \
-    _ "$T/sdk" "$COIL" ${link[@]+"${link[@]}"}
   cat > "$T/sdk/c-externs.coil" <<'EOF'
 (module jit-c-externs)
 (import "coil.jit" :use [jit-backend])
