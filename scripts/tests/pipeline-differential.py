@@ -40,7 +40,9 @@ def dump(compiler, command, path):
     result = subprocess.run([str(compiler), command, str(path)], cwd=ROOT, env=env,
                             capture_output=True, timeout=900)
     required = (ROOT / "src/compiler/main.coil", ROOT / "src/examples/jit_sdk.coil")
-    if path in required and (result.returncode != 0 or not result.stdout.startswith(b"(conventions")):
+    if path in required and (result.returncode != 0
+                             or not result.stdout.startswith(b"(conventions")
+                             or b"error:" in result.stderr):
         raise RuntimeError(
             f"{compiler} {command} {path}: required input did not produce a checked program "
             f"(exit {result.returncode})\n" + (result.stdout + result.stderr).decode(errors="replace")[:2000])
@@ -101,8 +103,9 @@ def main():
         # Use one source snapshot for both binaries and private unit caches: CT
         # artifacts are compiler-specific, so a shared cache makes them rebuild
         # each other's units on every alternating invocation.
-        sdk = prefix / "sdk"
+        sdk = prefix / "sources/compiler"
         shutil.copytree(ROOT / "src/compiler", sdk)
+        (sdk.parent / "stdlib").symlink_to(ROOT / "src/stdlib", target_is_directory=True)
         tpde = (ROOT / "../coil-tpde/src/tpde").resolve()
         if not (sdk / "tpde").exists():
             if not tpde.is_dir():
