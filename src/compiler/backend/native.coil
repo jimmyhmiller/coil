@@ -1,0 +1,331 @@
+;;; Architecture-independent values and metadata operations for slot-based
+;;; native lowering. Registers, instructions, ABI and object emission remain
+;;; target policy. A context is a borrowed view of the target's existing state.
+(module coil.compiler.native)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.arraylist" :use *)
+(import "coil.control" :use *)
+(import "coil.str" :use *)
+(import "coil.slice" :use *)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.parser" :use [const-overflow-test])
+(import "coil.compiler.layoutdb" :use *)
+
+(deftrait ConstantErrors [Self]
+  (native-user-fail [(self Self) (message (slice u8))] (-> i64)))
+
+(deftrait NativeErrors [Self]
+  :requires
+  [ConstantErrors]
+  (native-fail [(self Self) (message (slice u8))] (-> i64))
+  (native-fail2 [(self Self) (message (slice u8)) (what (slice u8))] (-> i64)))
+
+(defstruct NativeContext [D]
+  [(a (dyn Allocator))
+   (layouts (ptr LayoutDb))
+   (frame (ptr i64))
+   (loops (ptr (ArrayList GLoop)))
+   (errors D)])
+
+(defstruct GLoop
+  [(label (Option (slice u8)))
+   (contlabel i64)
+   (breaklabel i64)
+   (resslot i64)
+   (resty Type)
+   (has_res bool)])
+
+; Interned string literal and runtime static cell.
+(defstruct GStr [(s (slice u8)) (symidx i64)])
+
+(defstruct GStatic [(name (slice u8)) (ty Type) (symidx i64)])
+
+; AVal's kind is 0 for an integer/pointer immediate, 1 for a by-value stack
+; slot, and 2 for immediate floating-point bits. No target register is stored.
+(defstruct AVal [(kind i64) (v i64) (ty Type)])
+
+(defsum GScope
+  (GNil [])
+  (GBind [(name (slice u8)) (av AVal) (rest (ptr GScope))]))
+
+(defstruct GCEval [(v i64) (uns bool)])
+
+(defn mk-aval [(kind i64) (v i64) (ty Type)] (-> AVal)
+  (AVal
+    :kind kind
+    :v v
+    :ty ty))
+
+(defn av-kind [(x AVal)] (-> i64)
+  (let [(mut p) (: x AVal)] (.kind p)))
+
+(defn av-v [(x AVal)] (-> i64)
+  (let [(mut p) (: x AVal)] (.v p)))
+
+(defn av-ty [(x AVal)] (-> Type)
+  (let [(mut p) (: x AVal)] (.ty p)))
+
+(defn gscope-nil [(a (dyn Allocator))] (-> (ptr GScope))
+  (box! a GScope (GNil)))
+
+(defn gscope-put [(a (dyn Allocator))
+                  (s (ptr GScope))
+                  (name (slice u8))
+                  (av AVal)] (-> (ptr GScope))
+  (box! a
+        GScope
+        (GBind
+          :name name
+          :av av
+          :rest s)))
+
+(defn gscope-get [(s (ptr GScope)) (name (slice u8))] (-> (Option AVal))
+  (match (load s)
+    (GNil [] (None [AVal]))
+    (GBind [n av rest] (if (= n name) (Some [AVal] av) (gscope-get rest name)))))
+
+(defn g-last-component [(nm (slice u8))] (-> (slice u8))
+  (let [n (len nm)
+        (mut dot) -1]
+    (for [i 0 n]
+      (when (= (primitive/cast i64 (get nm i))
+               46)
+        (set! dot i)))
+    (if (>= (load dot) 0)
+        (subslice nm (primitive/iadd (load dot) 1) n)
+        nm)))
+
+(defn ty-is-float [(t (ptr Type))] (-> bool)
+  (match (load t) (TFloat [_] true) (_ false)))
+
+(defn ty-float-bytes [(t (ptr Type))] (-> i64)
+  (match (load t) (TFloat [bits] (/ bits 8)) (_ 8)))
+
+(defn mk-gcev [(v i64) (u bool)] (-> GCEval)
+  (GCEval :v v :uns u))
+
+(defn gcev-v [(c GCEval)] (-> i64)
+  (let [(mut p) (: c GCEval)] (.v p)))
+
+(defn gcev-u [(c GCEval)] (-> bool)
+  (let [(mut p) (: c GCEval)] (.uns p)))
+
+(defn g-const-cmp [(op i64) (l i64) (lu bool) (r i64) (ru bool)] (-> GCEval)
+  (let [b
+          (cond (or lu ru)
+                  (let [lx (primitive/cast u64 l)
+                        rx (primitive/cast u64 r)]
+                    (cond (= op 0) (< lx rx)
+                          (= op 1) (<= lx rx)
+                          (= op 2) (> lx rx)
+                          (= op 3) (>= lx rx)
+                          (= op 4) (= lx rx)
+                          :else (!= lx rx)))
+                (= op 0) (< l r)
+                (= op 1) (<= l r)
+                (= op 2) (> l r)
+                (= op 3) (>= l r)
+                (= op 4) (= l r)
+                :else (!= l r))]
+    (mk-gcev (when b 1) false)))
+
+(defn slot-new! [(D NativeErrors)] [(g (ref (NativeContext D)))
+                                    (size i64)
+                                    (align i64)] (-> i64)
+  ; every slot is 8-aligned and 8-rounded (16 for 16-aligned types): stores of
+  ; full x-words into small slots can never clobber a neighbor.
+  (let [al (if (< align 8) 8 align)
+        sz
+          (primitive/imul (/ (primitive/iadd (if (< size
+                                                    1)
+                                                 1
+                                                 size)
+                                             7)
+                             8)
+                          8)
+        off
+          (primitive/imul (/ (primitive/iadd (load (.frame g))
+                                             (primitive/isub al 1))
+                             al)
+                          al)]
+    (store! (.frame g) (primitive/iadd off sz))
+    off))
+
+(defn g-loop-index [(D NativeErrors)] [(g (ref (NativeContext D)))
+                                       (label (Option (slice u8)))] (-> i64)
+  (let [n (len (load (.loops g)))]
+    (match label
+      (None []
+            (do
+              (when (= n 0)
+                (native-fail (.errors g) "break/continue outside a loop"))
+              (primitive/isub n 1)))
+      (Some [want]
+            (let [(mut i) (primitive/isub n 1)
+                  (mut r) -1]
+              (loop (if (< (load i) 0)
+                        (break)
+                        (do
+                          (match (.label (layout-at [GLoop]
+                                                    (.loops g)
+                                                    (load i)))
+                            (None [] 0)
+                            (Some [have]
+                                  (when (and (< (load r) 0)
+                                             (= have want))
+                                    (set! r (load i))
+                                    0)))
+                          (set! i (primitive/isub (load i) 1)))))
+              (when (< (load r) 0)
+                (native-fail2 (.errors g) "no such loop label: " want))
+              (load r))))))
+
+(defn g-bits-info [(D NativeErrors)] [(g (ref (NativeContext D)))
+                                      (nm (slice u8))
+                                      (fname (slice u8))
+                                      (lowp (ptr i64))
+                                      (widthp (ptr i64))
+                                      (signedp (ptr bool))
+                                      (backp (ptr i64))] (-> i64)
+  (let [si (struct-index (.layouts g) nm)]
+    (when (< si 0)
+      (native-fail2 (.errors g) "bit access on unknown struct: " nm))
+    (let [e (struct-at (.layouts g) si)]
+      (match (.layout e)
+        (LBits [backing offs]
+               (let [fi (field-number (.layouts g) si fname)]
+                 (set! lowp (get (load offs) fi))
+                 (set! backp backing)
+                 (match (.ty (layout-at [Field] (load (field e fields)) fi))
+                   (TInt [bits sg] (do (set! widthp bits) (set! signedp sg) 0))
+                   (TBool [] (do (set! widthp 1) (set! signedp false) 0))
+                   (_ (native-fail (.errors g)
+                                   "bit-struct field with non-int type")))))
+        (_ (native-fail2 (.errors g) "bit access on non-bits struct: " nm))))))
+
+(defn g-const-eval [(D NativeErrors)] [(g (ref (NativeContext D)))
+                                       (e (ptr Expr))] (-> GCEval)
+  (let [a (.a g)]
+    (match (.kind e)
+      (EInt [v] (mk-gcev v false))
+      (EBool [b] (mk-gcev (when b 1) false))
+      (EIf [c thn els]
+           (if (!= (gcev-v (g-const-eval g c)) 0)
+               (g-const-eval g thn)
+               (g-const-eval g els)))
+      (ESizeOf [t] (mk-gcev (size (.layouts g) (box-type a t)) false))
+      (EAlignOf [t] (mk-gcev (align (.layouts g) (box-type a t)) false))
+      (EOffsetOf [t fname]
+                 (match t
+                   (TStruct [nm]
+                            (let [si (struct-index (.layouts g) nm)]
+                              (when (< si 0)
+                                (native-fail2 (.errors g)
+                                              "offset-of on unknown struct: "
+                                              nm))
+                              (mk-gcev (field-offset (.layouts g)
+                                                     si
+                                                     (field-number (.layouts g)
+                                                                   si
+                                                                   fname))
+                                       false)))
+                   (_ (do
+                        (native-user-fail (.errors g)
+                                          "static-assert: offset-of on non-struct")
+                        (mk-gcev 0 false)))))
+      (ECast [t inner]
+             (mk-gcev (gcev-v (g-const-eval g inner))
+                      (match t (TInt [bits s] (not s)) (_ false))))
+      (EBin [op lhs rhs]
+            (let [lc (g-const-eval g lhs)
+                  rc (g-const-eval g rhs)]
+              (g-const-bin (.errors g)
+                           op
+                           (gcev-v lc)
+                           (gcev-u lc)
+                           (gcev-v rc)
+                           (gcev-u rc))))
+      (ECmp [op lhs rhs]
+            (let [lc (g-const-eval g lhs)
+                  rc (g-const-eval g rhs)]
+              (g-const-cmp op (gcev-v lc) (gcev-u lc) (gcev-v rc) (gcev-u rc))))
+      (_ (do
+           (native-user-fail (.errors g)
+                             "static-assert: only int literals, sizeof/alignof/offsetof, casts, arithmetic and comparisons are allowed")
+           (mk-gcev 0 false))))))
+
+(defn g-const-bin [(D ConstantErrors)] [(errors D)
+                                        (op i64)
+                                        (l i64)
+                                        (lu bool)
+                                        (r i64)
+                                        (ru bool)] (-> GCEval)
+  (let [uns (or lu ru)]
+    (mk-gcev (cond (= op 0) (primitive/iadd l r)
+                   (= op 1) (primitive/isub l r)
+                   (= op 2) (primitive/imul l r)
+                   (= op 7) (& l r)
+                   (= op 8) (| l r)
+                   (= op 9) (^ l r)
+                   (= op 10) (<< l r)
+                   (= op 11)
+                     (if uns
+                         (primitive/cast i64
+                                         (>> (primitive/cast u64 l)
+                                             (primitive/cast u64 r)))
+                         (>> l r))
+                   (= op 3)
+                     (if (= r 0)
+                         (do
+                           (native-user-fail errors
+                                             "static-assert: divide/mod by zero")
+                           0)
+                         (if uns (primitive/udiv l r) (/ l r)))
+                   (= op 4)
+                     (if (= r 0)
+                         (do
+                           (native-user-fail errors
+                                             "static-assert: divide/mod by zero")
+                           0)
+                         (if uns (primitive/urem l r) (% l r)))
+                   (= op 5)
+                     (if (= r 0)
+                         (do
+                           (native-user-fail errors
+                                             "static-assert: divide/mod by zero")
+                           0)
+                         (primitive/udiv l r))
+                   (>= op 15) (const-overflow-test op l r uns)
+                   (>= op 12)
+                     (do
+                       (native-user-fail errors
+                                         "static-assert: a rotate or high multiply does not fold")
+                       0)
+                   (= r 0)
+                     (do
+                       (native-user-fail errors
+                                         "static-assert: divide/mod by zero")
+                       0)
+                   :else (primitive/urem l r))
+             uns)))
+
+(defn ty-int-info [(t (ptr Type))
+                   (bytesp (ptr i64))
+                   (signedp (ptr bool))] (-> i64)
+  (match (load t)
+    (TInt [bits sg]
+          (do
+            (set! bytesp
+                  (if (<= bits 8)
+                      1
+                      (if (<= bits 16)
+                          2
+                          (if (<= bits
+                                  32)
+                              4
+                              8))))
+            (set! signedp sg)
+            0))
+    (TBool [] (do (set! bytesp 1) (set! signedp false) 0))
+    (_ (do (set! bytesp 8) (set! signedp false) 0))))
