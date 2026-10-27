@@ -371,6 +371,22 @@ def splice(current: str, generated: str, target: Path = TARGET, begin: str = BEG
     return current[:start] + generated + current[stop + len(end) :]
 
 
+def same_generated_forms(before: str, after: str, begin: str, end: str) -> bool:
+    """Compare generated table tokens, preserving delimiters and string bytes.
+
+    Formatting/comments are trivia; every other token is part of the generated
+    contract. These regions contain ordinary forms, symbols and string literals,
+    not reader extensions. Keep lists and vectors distinct (read_forms, which is
+    intentionally sufficient only for import discovery, does not).
+    """
+    def tokens(source: str) -> list[str]:
+        region = source[source.index(begin) + len(begin):source.index(end)]
+        return [match.group() for match in re.finditer(
+            r'"(?:\\.|[^"\\])*"|;[^\n]*|[()\[\]{}]|[^\s()\[\]{};"]+', region)
+            if not match.group().startswith(";")]
+    return tokens(before) == tokens(after)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--check", action="store_true", help="exit 1 if out of date; write nothing")
@@ -393,14 +409,17 @@ def main() -> int:
     renames_updated = splice(renames_current, render_reexports(collect_reexports(entries)),
                              RENAMES, REEXPORTS_BEGIN, REEXPORTS_END)
 
-    if current == updated and renames_current == renames_updated:
+    manifest_fresh = same_generated_forms(current, updated, BEGIN, END)
+    reexports_fresh = same_generated_forms(renames_current, renames_updated,
+                                          REEXPORTS_BEGIN, REEXPORTS_END)
+    if manifest_fresh and reexports_fresh:
         if args.check:
             print(f"ok: {TARGET.relative_to(ROOT)} manifest is up to date")
             print(f"ok: {RENAMES.relative_to(ROOT)} API-REEXPORTS is up to date")
         return 0
 
     if args.check:
-        if current != updated:
+        if not manifest_fresh:
             rel = TARGET.relative_to(ROOT)
             print(f"error: {rel} is out of date with src/stdlib/", file=sys.stderr)
             print(
@@ -411,7 +430,7 @@ def main() -> int:
                 "      python3 scripts/compiler/gen-stdlib-manifest.py",
                 file=sys.stderr,
             )
-        if renames_current != renames_updated:
+        if not reexports_fresh:
             rel = RENAMES.relative_to(ROOT)
             print(f"error: {rel}'s API-REEXPORTS is out of date with src/stdlib/", file=sys.stderr)
             print(
@@ -423,8 +442,9 @@ def main() -> int:
             )
         return 1
 
-    for path, before, after in ((TARGET, current, updated), (RENAMES, renames_current, renames_updated)):
-        if before != after:
+    for path, fresh, after in ((TARGET, manifest_fresh, updated),
+                               (RENAMES, reexports_fresh, renames_updated)):
+        if not fresh:
             path.write_text(after)
             print(f"wrote {path.relative_to(ROOT)}")
     return 0

@@ -527,7 +527,7 @@ EOF
 
   # Comments: one right after `(` moves in front of the list; one between a
   # binding and its value stays in that binding. The program still means the same.
-  printf '(module fmtcomments)\n(defn main [] (-> i64)\n  (let [x 1\n        v\n        ; between name and value\n        [1 2]\n        w [; inside\n           3]]\n    (; before the head\n     if (= x 1) (+ x (get v 1) (get w 0)) 0)))\n' > "$T/comments.coil"
+  printf '(module fmtcomments)\n(defn main [] (-> i64)\n  (let [x 1\n        v\n        ; between name and value\n        [1 2]\n        w [; inside\n           3] ; final binding\n        ]\n    (; before the head\n     if (= x 1) (+ x (get v 1) (get w 0)) 0) ; final body\n  ))\n' > "$T/comments.coil"
   "$COIL" fmt --write "$T/comments.coil" >/dev/null 2>&1
   expect_rc 6 "fmt keeps a list that starts with a comment a program" "$COIL" run "$T/comments.coil"
   local text
