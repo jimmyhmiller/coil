@@ -1,0 +1,165 @@
+; src/compiler/frontend/assert_fold.coil — self-host Coil compiler: inlining the
+; operator calls in a static assertion's condition so a backend can fold it.
+
+(module coil.compiler.assert_fold)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.parser" :use [box-al])
+
+; ---- static-assert conditions: inline operator calls -------------------------
+; A static assertion's condition is checked as ordinary code, so `(< n 8)` is a
+; call of the trait method the checker selected, `coil.core.Ord$i64$<`. The
+; backends fold a condition built from literals, sizes, casts, arithmetic,
+; comparisons and `if`, so a call of a function marked `:inline (Always)` whose
+; body is one such expression is replaced here by that body, the call's
+; arguments put for its parameters. No function is recognized by its name: the
+; prelude's operator impls are inlined because their declarations say to be.
+
+;;; How many calls deep an assertion's condition is inlined.
+(defn assert-inline-depth [] (-> i64) 16)
+
+;;; The functions a condition's calls may be inlined from: a program's concrete
+;;; functions and their index by name.
+(defstruct InlineSource
+  [(a (dyn Allocator))
+   (funcs (ptr (ArrayList Func)))
+   (index (ptr (HashMap (slice u8) i64)))])
+
+;;; The function NAME in `src`, or null.
+(defn inline-source-func [(src (ptr InlineSource)) (name (slice u8))] (-> (ptr Func))
+  (match (get (load (.index src)) name)
+    (Some [i] (elem (.funcs src) i))
+    (None [] (primitive/cast (ptr Func) 0))))
+
+;;; Is E made only of what substitution copies: literals, sizes, variables, and
+;;; the operators, conditionals, loads and calls a condition folds or inlines?
+;;; Nothing in it binds a name, so every variable is a parameter or a global.
+(defn assert-inlinable? [(e (ptr Expr))] (-> bool)
+  (match (.kind e)
+    (EInt [_] true)
+    (EBool [_] true)
+    ; a literal argument of a call the fold does not reach, such as the message
+    ; of the failure a checked operation's untaken branch reports
+    (EStr [_] true)
+    (EVar [_] true)
+    (ESizeOf [_] true)
+    (EAlignOf [_] true)
+    (EOffsetOf [_ _] true)
+    (ECast [_ inner] (assert-inlinable? inner))
+    (ELoad [inner] (assert-inlinable? inner))
+    (ESpillRef [inner] (assert-inlinable? inner))
+    (EBin [_ l r] (and (assert-inlinable? l) (assert-inlinable? r)))
+    (ECmp [_ l r] (and (assert-inlinable? l) (assert-inlinable? r)))
+    (EIf [c t f] (and (assert-inlinable? c) (and (assert-inlinable? t) (assert-inlinable? f))))
+    ; how a call that never returns is lowered, `(do (fail! …) (loop))`: the
+    ; branch a checked operation fails in, which the fold takes only when the
+    ; assertion's own arithmetic overflows
+    (EDo [es]
+      (block :all
+        (for [i 0 (len (load es))]
+          (unless (assert-inlinable? (elem es i)) (break :all false)))
+        true))
+    (ELoop [_ es] (= (len (load es)) 0))
+    (ECall [_ _ args]
+      (block :all
+        (for [i 0 (len (load args))]
+          (unless (assert-inlinable? (elem args i)) (break :all false)))
+        true))
+    (_ false)))
+
+;;; The body expression a call of F with N arguments inlines to, or null when F
+;;; is not to be inlined so.
+(defn assert-inline-body [(f (ptr Func)) (n i64)] (-> (ptr Expr))
+  (let [none (primitive/cast (ptr Expr) 0)]
+    (cond (= (primitive/cast i64 f) 0) none
+          (not (match (func-inline-policy f)
+                 (Some [policy] (match policy (Always [] true) (_ false)))
+                 (None [] false)))
+            none
+          (or (!= (len (load (load (field f params)))) n)
+              (!= (len (load (load (field f body)))) 1))
+            none
+          (not (assert-inlinable? (elem (load (field f body)) 0))) none
+          :else (elem (load (field f body)) 0))))
+
+(defn assert-rebuilt [(e (ptr Expr)) (kind ExprKind)] (-> Expr)
+  (mk-expr kind (.lo e) (.hi e) (.source e) (.ctxt e)))
+
+;;; A copy of E with each parameter of F replaced by the argument at its
+;;; position in ARGS. A load of a spilled argument is the value spilled.
+(defn assert-subst [(a (dyn Allocator)) (e (ptr Expr)) (f (ptr Func)) (args (ptr (ArrayList Expr)))] (-> Expr)
+  (match (.kind e)
+    (EVar [name]
+      (let [ps (load (field f params))
+            at (block :found
+                 (for [i 0 (len (load ps))]
+                   (when (= (.name (elem ps i)) name) (break :found i)))
+                 -1)]
+        (if (< at 0) (load e) (get (load args) at))))
+    (ECast [ty inner] (assert-rebuilt e (ECast ty (box-expr a (assert-subst a inner f args)))))
+    (ELoad [inner]
+      (let [sub (assert-subst a inner f args)]
+        (match (.kind sub)
+          (ESpillRef [value] (load value))
+          (_ (assert-rebuilt e (ELoad (box-expr a sub)))))))
+    (ESpillRef [inner] (assert-rebuilt e (ESpillRef (box-expr a (assert-subst a inner f args)))))
+    (EBin [op l r]
+      (assert-rebuilt e (EBin op (box-expr a (assert-subst a l f args)) (box-expr a (assert-subst a r f args)))))
+    (ECmp [op l r]
+      (assert-rebuilt e (ECmp op (box-expr a (assert-subst a l f args)) (box-expr a (assert-subst a r f args)))))
+    (EIf [c t x]
+      (assert-rebuilt e (EIf (box-expr a (assert-subst a c f args))
+                             (box-expr a (assert-subst a t f args))
+                             (box-expr a (assert-subst a x f args)))))
+    (ECall [func targs cargs]
+      (let [(mut out) (ArrayList::new [Expr] a)]
+        (for [i 0 (len (load cargs))]
+          (push! (mut out) (assert-subst a (elem cargs i) f args)))
+        (assert-rebuilt e (ECall func targs (box-al [Expr] a (load out))))))
+    (_ (load e))))
+
+;;; E with each call of an inlinable function (`assert-inline-body`) replaced by
+;;; its body, DEPTH calls deep so far.
+(defn assert-inline [(src (ptr InlineSource)) (e (ptr Expr)) (depth i64)] (-> Expr)
+  (let [a (.a src)]
+    (match (.kind e)
+      (ECall [func targs args]
+        (let [(mut inlined) (ArrayList::new [Expr] a)]
+          (for [i 0 (len (load args))]
+            (push! (mut inlined) (assert-inline src (elem args i) depth)))
+          (let [given (box-al [Expr] a (load inlined))
+                f (inline-source-func src func)
+                body (if (< depth (assert-inline-depth))
+                         (assert-inline-body f (len (load given)))
+                         (primitive/cast (ptr Expr) 0))]
+            (if (= (primitive/cast i64 body) 0)
+                (assert-rebuilt e (ECall func targs given))
+                ; The inlined body stands where the call was written.
+                (let [r (assert-inline src (box-expr a (assert-subst a body f given)) (+ depth 1))]
+                  (assert-rebuilt e (.kind r)))))))
+      (ECast [ty inner] (assert-rebuilt e (ECast ty (box-expr a (assert-inline src inner depth)))))
+      (ELoad [inner] (assert-rebuilt e (ELoad (box-expr a (assert-inline src inner depth)))))
+      (ESpillRef [inner] (assert-rebuilt e (ESpillRef (box-expr a (assert-inline src inner depth)))))
+      (EBin [op l r]
+        (assert-rebuilt e (EBin op (box-expr a (assert-inline src l depth)) (box-expr a (assert-inline src r depth)))))
+      (ECmp [op l r]
+        (assert-rebuilt e (ECmp op (box-expr a (assert-inline src l depth)) (box-expr a (assert-inline src r depth)))))
+      (EIf [c t x]
+        (assert-rebuilt e (EIf (box-expr a (assert-inline src c depth))
+                               (box-expr a (assert-inline src t depth))
+                               (box-expr a (assert-inline src x depth)))))
+      (_ (load e)))))
+
+;;; ASSERTS with their conditions' inlinable calls inlined (see above).
+(defn assert-inline-calls [(src (ptr InlineSource)) (asserts (ptr (ArrayList StaticAssert)))] (-> (ptr (ArrayList StaticAssert)))
+  (let [a (.a src)
+        (mut out) (ArrayList::new [StaticAssert] a)]
+    (for [i 0 (len (load asserts))]
+      (let [ap (elem asserts i)
+            (mut na) (load ap)]
+        (set! (.cnd na) (assert-inline src (field ap cnd) 0))
+        (push! (mut out) (load na))))
+    (box-al [StaticAssert] a (load out))))

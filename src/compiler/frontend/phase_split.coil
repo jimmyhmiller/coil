@@ -1,0 +1,396 @@
+; src/compiler/frontend/phase_split.coil — self-host Coil compiler: which
+; definitions exist only at compile time, and dropping them from a runtime program.
+; Runs after checking and before monomorphization.
+
+(module coil.compiler.phase_split)
+(import "coil.compiler.large_pages" :as large-pages)
+(import "coil.primitive" :as primitive)
+(import "coil.scratch" :as scratch)
+(import "coil.alloc" :use *)
+(import "coil.str" :use *)
+(import "coil.slice" :use [subslice])
+(import "coil.result" :use [none?])
+(import "coil.reader" :use [Diag])
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.expr_children" :use [ChildVisitor visit-child! any-child?])
+(import "coil.compiler.comptime" :use [cc-list FnNames prog-fn-names closure-base-func])
+(import "coil.compiler.parser" :use [box-al derr-at-src sconcat sconcat3])
+(import "coil.compiler.resolve" :use [SBox])
+
+;;; Whether a value of this type can exist only at compile time: it is `Code`, or is
+;;; built from a type that is. `nominals` names the structs and sums already known to
+;;; be such (see `phase-only-nominals`), so that holding a `Code` in a field, or a
+;;; struct that does, counts the same as mentioning `Code` directly. Neither this test
+;;; nor its twin for function signatures used to look through a nominal type: a struct
+;;; with a `Code` field was correctly left out of the runtime layouts, a helper taking
+;;; a pointer to it was not recognized as compile-time code, and codegen then met a
+;;; struct nobody had laid out and aborted.
+(defn phase-only-type? [(t (ptr Type)) (nominals (ptr (HashMap (slice u8) i64)))] (-> bool)
+  (match (load t)
+    (TCode [] true)
+    (TCodeBuilder [] true)
+    (TStruct [name] (contains? (load nominals) name))
+    (TPtr [inner] (phase-only-type? inner nominals))
+    (TRef [_ inner] (phase-only-type? inner nominals))
+    (TArray [inner _] (phase-only-type? inner nominals))
+    (TSlice [inner] (phase-only-type? inner nominals))
+    (TVec [inner _] (phase-only-type? inner nominals))
+    (TFn [_ params ret]
+         (or (phase-only-types? params 0 (len (load params)) nominals)
+             (phase-only-type? ret nominals)))
+    (TApp [name args]
+          (or (contains? (load nominals) name)
+              (phase-only-types? args 0 (len (load args)) nominals)))
+    (_ false)))
+
+(defn phase-only-types? [(types (ptr (ArrayList Type)))
+                              (i i64)
+                              (n i64)
+                              (nominals (ptr (HashMap (slice u8) i64)))] (-> bool)
+  (if (>= i n)
+      false
+      (or (phase-only-type? (elem types i) nominals)
+          (phase-only-types? types (primitive/iadd i 1) n nominals))))
+
+(defn phase-only-fields? [(fields (ptr (ArrayList Field)))
+                               (nominals (ptr (HashMap (slice u8) i64)))] (-> bool)
+  (let [n (len (load fields))
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) n))
+              (break)
+              (do
+                (when (phase-only-type? (field (elem fields
+                                                          (load i))
+                                                    ty)
+                                             nominals)
+                  (store! found true)
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
+(defn phase-only-variants? [(variants (ptr (ArrayList Variant)))
+                                 (nominals (ptr (HashMap (slice u8) i64)))] (-> bool)
+  (let [n (len (load variants))
+        (mut i) 0
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) n))
+              (break)
+              (do
+                (when (phase-only-fields? (load (field (elem variants
+                                                                  (load i))
+                                                            fields))
+                                               nominals)
+                  (store! found true)
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
+;;; The structs and sums of `p` whose values can exist only at compile time, by name.
+;;; Found to a fixed point, because such a type may hold another rather than `Code`
+;;; itself. A generic definition is in the set when its own fields say so; an
+;;; instantiation with a compile-time argument is caught at the use by the type test.
+(defn phase-only-nominals [(a (dyn Allocator)) (p (ptr Program))] (-> (ptr (HashMap (slice u8) i64)))
+  (let [found (box! a
+                    (HashMap (slice u8) i64)
+                    (HashMap::new [(slice u8) i64] a (keyops-borrowed)))]
+    (loop
+      (let [before (len (load found))]
+        (for [i 0 (len (load (.structs p)))]
+          (let [sp (elem (.structs p) i)]
+            (unless (contains? (load found) (.name sp))
+              (when (phase-only-fields? (load (field sp fields)) found)
+                (set! found (.name sp) 0)
+                0)
+              0)))
+        (for [i 0 (len (load (.sums p)))]
+          (let [sp (elem (.sums p) i)]
+            (unless (contains? (load found) (.name sp))
+              (when (phase-only-variants? (load (field sp variants)) found)
+                (set! found (.name sp) 0)
+                0)
+              0)))
+        (when (= before (len (load found))) (break))))
+    found))
+
+; ---- post-check Code definition drop ----
+; Comptime-only functions (a `Code`/`CodeBuilder` parameter or return — macros,
+; generators, code helpers, and their trait impl methods) have no runtime
+; representation and are dropped after check, before mono. A trait mutator takes
+; `(mut Code)` or `(mut CodeBuilder)`; the checked impl keeps that as TRef while its
+; synthesized dispatch wrapper uses TPtr. Code can also be nested in a result such
+; as `(Option Code)` (Iterator.next is the canonical case). Walk every compound type:
+; a runtime signature cannot contain a comptime-only value at any depth.
+(defn func-has-code [(fp (ptr Func)) (nominals (ptr (HashMap (slice u8) i64)))] (-> bool)
+  (let [rt (primitive/alloc-stack Type)]
+    (set! rt (.ret fp))
+    (if (phase-only-type? rt nominals)
+        true
+        (let [ps (load (field fp params))
+              n (len ps)
+              (mut i) 0
+              (mut found) false]
+          (loop (if (or (load found) (>= (load i) n))
+                    (break)
+                    (do
+                      (let [pp (elem ps (load i))
+                            pt (primitive/alloc-stack Type)]
+                        (set! pt (.ty pp))
+                        (when (phase-only-type? pt nominals) (store! found true) 0))
+                      (set! i (primitive/iadd (load i) 1)))))
+          (load found)))))
+
+; A Code-signed entry may delegate ordinary computation to helpers whose own
+; signatures contain no Code. Those helpers are still comptime-only when their
+; checked bodies contain Code operations, quotes, or explicit comptime nodes.
+; Find those bodies before mono, then close the set backwards over callers so a
+; runtime-shaped wrapper cannot retain a call to a function removed at the phase
+; boundary.
+;;; Looks for a node that only compile-time code holds.
+(defstruct CodeNodeSearch [])
+
+(impl ChildVisitor CodeNodeSearch
+  (visit-child! [(v (mut CodeNodeSearch)) (child (ptr Expr))] (-> bool)
+    (expr-has-code-node? child)))
+
+;;; Whether E holds a Code operation, a quote, or a compile-time node anywhere.
+(defn expr-has-code-node? [(e (ptr Expr))] (-> bool)
+  (match (.kind e)
+    (EComptime [_] true)
+    (EQuote [_] true)
+    (ECodeOp [_ _] true)
+    (EQuasi [_] true)
+    (_ (let [(mut search) (primitive/zeroed CodeNodeSearch)]
+         (any-child? (mut search) e)))))
+
+(defn func-body-has-code-node? [(fp (ptr Func))] (-> bool)
+  (block :found
+    (for [i 0 (len (load (.body fp)))]
+      (when (expr-has-code-node? (elem (.body fp) i)) (break :found true)))
+    false))
+
+(defn code-phase-func-names [(a (dyn Allocator))
+                             (p (ptr Program))] (-> (ptr (ArrayList (slice u8))))
+  (let [(mut cause) (HashMap::new [(slice u8) (slice u8)] a (keyops-borrowed))]
+    (code-phase-funcs a p (mut cause))))
+
+;;; A runtime root — `main`, an `export-c` function, or `extra` — that reaches
+;;; compile-time code, with the function at the end of that chain. Dropping such a
+;;; root silently would leave only a missing symbol at link or publication.
+(defstruct CompileTimeRoot [(root (ptr Func)) (seed (slice u8)) (why (slice u8))])
+
+;;; Why `name` is compile-time code in its own right, phrased after "which".
+(defn code-phase-reason [(a (dyn Allocator)) (p (ptr Program)) (name (slice u8))] (-> (slice u8))
+  (let [nominals (phase-only-nominals a p)
+        (mut why) "takes or returns Code"]
+    (for [i 0 (len (load (.funcs p)))]
+      (let [fp (elem (.funcs p) i)]
+        (when (= (.name fp) name)
+          (set! why (cond (func-has-code fp nominals) "takes or returns Code"
+                          (func-body-has-code-node? fp)
+                            "uses Code, a quote, or a compile-time-only operation such as primitive/error"
+                          :else "uses a type that exists only at compile time"))
+          0)))
+    why))
+
+(defn compile-time-root-of [(a (dyn Allocator))
+                             (wa (dyn Allocator))
+                             (p (ptr Program))
+                             (extra (slice u8))
+                             (cause (ptr (HashMap (slice u8) (slice u8))))]
+  (-> (Option CompileTimeRoot))
+  (let [(mut found) (None [CompileTimeRoot])]
+    (for [i 0 (len (load (.funcs p)))]
+      (let [f (elem (.funcs p) i)
+            name (.name f)]
+        (when (and (none? found)
+                   (and (contains? (load cause) name)
+                        (or (= name "main")
+                            (or (and (> (len extra) 0) (= name extra))
+                                (exported-c? p name)))))
+          (let [(mut at) name]
+            (loop
+              (match (get (load cause) at)
+                (None [] (break))
+                (Some [callee]
+                  (if (= (len callee) 0) (break) (set! at callee)))))
+            ; The root is borrowed from p; diagnostic text outlives the graph.
+            (set! found (Some (CompileTimeRoot :root f
+              :seed (sconcat a "" at) :why (sconcat a "" (code-phase-reason wa p at)))))))))
+    found))
+
+;;; The runtime root that reaches compile-time code, or, when there is none,
+;;; `drop-code-funcs` done. Both answers come from one classification of the
+;;; program's functions, which walks every body; classifying for each separately
+;;; did that walk twice.
+(defn drop-code-funcs-unless-root [(a (dyn Allocator)) (p (ptr Program)) (extra (slice u8))]
+  (-> (Option CompileTimeRoot))
+  (let [(mut work) (primitive/zeroed scratch/ScratchArena)
+        _init (scratch/ScratchArena::init-with-capacity (mut work)
+                   (large-pages/compiler-scratch-parent) 65536)
+        wa (allocator (mut work))
+        (mut cause) (HashMap::new [(slice u8) (slice u8)] wa (keyops-borrowed))
+        dropped (code-phase-funcs wa p (mut cause))
+        found (compile-time-root-of a wa p extra (mut cause))]
+    (when (none? found)
+      (drop-funcs-named! a wa p dropped)
+      0)
+    (close! (mut work))
+    (when (none? found)
+      (drop-code-impls a p)
+      0)
+    found))
+
+(defn exported-c? [(p (ptr Program)) (name (slice u8))] (-> bool)
+  (let [(mut hit) false]
+    (for [i 0 (len (load (.exports p)))]
+      (when (= (.name (elem (.exports p) i)) name) (set! hit true)))
+    hit))
+
+(defn jit-entry-name? [(name (slice u8))] (-> bool)
+  (let [marker "__coil_jit_entry_" (mut hit) false]
+    (for [i 0 (+ (- (len name) (len marker)) 1)]
+      (when (= (subslice name i (+ i (len marker))) marker) (set! hit true)))
+    hit))
+
+;;; The diagnostic for a runtime root that reaches compile-time code.
+(defn compile-time-root-diag [(a (dyn Allocator)) (r CompileTimeRoot)] (-> Diag)
+  (let [root (.root r)
+        ; A retained session's transaction entry is synthetic; call it that.
+        subject (if (jit-entry-name? (.name root))
+                    "the entry"
+                    (sconcat3 a "'" (.name root) "'"))
+        what (if (= (.name root) (.seed r))
+                 (sconcat3 a subject " " (.why r))
+                 (sconcat a
+                   (sconcat a subject " reaches '")
+                   (sconcat3 a (.seed r) "', which " (.why r))))
+        msg (sconcat a what
+              ", so it exists only while compiling and cannot run; call compile-time code from a macro or metaprogram, not from runtime code")]
+    (derr-at-src (.source root) (.lo root) (.hi root) msg)))
+
+;;; Functions that exist only at compile time. `cause` maps each to the callee
+;;; that pulled it in, or to "" for a function that mentions Code itself.
+(defn code-phase-funcs [(a (dyn Allocator))
+                        (p (ptr Program))
+                        (cause (mut (HashMap (slice u8) (slice u8))))] (-> (ptr (ArrayList (slice u8))))
+  ; Seeds are functions that mention Code; every transitive caller of one is
+  ; dropped too. Calls are collected once and propagated over reverse edges.
+  (let [fs (load (field p funcs))
+        names (prog-fn-names p a)
+        nominals (phase-only-nominals a p)
+        (mut work) (ArrayList::new [(ptr Func)] a)
+        (mut queued) (HashMap::new [(slice u8) i64] a (keyops-borrowed))
+        (mut dropped) (ArrayList::new [(slice u8)] a)
+        (mut dropped-index) (HashMap::new [(slice u8) i64] a (keyops-borrowed))
+        ; callee name -> index of its latest (caller, next) link
+        (mut first-link) (HashMap::new [(slice u8) i64] a (keyops-borrowed))
+        (mut link-caller) (ArrayList::new [i64] a)
+        (mut link-next) (ArrayList::new [i64] a)]
+    (for [i 0 (len (load fs))]
+      (let [fp (elem fs i)]
+        (push! (mut work) fp)
+        (unless (contains? queued (.name fp)) (set! (mut queued) (.name fp) i))))
+    (let [(mut i) 0]
+      (loop (if (>= i (len work)) (break)
+        (let [fp (get work i)
+              calls (box! a SBox (primitive/zeroed SBox))]
+          (when (or (func-has-code fp nominals)
+                    (func-body-has-code-node? fp))
+            (unless (contains? dropped-index (load (field fp name)))
+              (set! (mut dropped-index) (load (field fp name)) 0)
+              (set! (mut cause) (load (field fp name)) "")
+              (push! (mut dropped) (load (field fp name))) 0)
+            0)
+          (set! (.items calls) (ArrayList::new [(slice u8)] a))
+          (cc-list (load (field fp body)) names calls (primitive/cast (ptr SBox) 0))
+          (for [j 0 (len (.items calls))]
+            (let [callee (get (.items calls) j)]
+              ; A retained session's submission reaches functions an earlier
+              ; submission accepted, which are not in `p`. They are classified the
+              ; same way as the walk reaches them: code that reaches an accepted
+              ; Code function is compile-time code too.
+              (unless (contains? queued callee)
+                (match (closure-base-func callee)
+                  (Some [accepted]
+                    (when (= (len (load (.type_params accepted))) 0)
+                      (set! (mut queued) callee (len work))
+                      (push! (mut work) accepted)))
+                  (None [] 0)))
+              (push! (mut link-caller) i)
+              (push! (mut link-next) (match (get first-link callee) (Some [at] at) (None [] -1)))
+              (set! (mut first-link) callee (- (len link-caller) 1))))
+          (set! i (+ i 1))))))
+    (let [(mut next) 0]
+      (loop (if (>= (load next) (len dropped)) (break)
+        (let [name (get dropped (load next))
+              (mut link) (match (get first-link name) (Some [at] at) (None [] -1))]
+          (set! next (+ (load next) 1))
+          (loop (if (< (load link) 0) (break)
+            (let [caller (get work (get link-caller (load link)))
+                  caller-name (load (field caller name))]
+              (unless (contains? dropped-index caller-name)
+                (set! (mut dropped-index) caller-name 0)
+                (set! (mut cause) caller-name name)
+                (push! (mut dropped) caller-name) 0)
+              (set! link (get link-next (load link))))))))))
+    (box-al [(slice u8)] a (load dropped))))
+
+(defn drop-code-impls [(a (dyn Allocator)) (p (ptr Program))] (-> i64)
+  (let [(mut work) (primitive/zeroed scratch/ScratchArena)
+        _init (scratch/ScratchArena::init-with-capacity (mut work)
+                   (large-pages/compiler-scratch-parent) 65536)
+        nominals (phase-only-nominals (allocator (mut work)) p)
+        is (load (field p impls))
+        n (len (load is))
+        (mut out) (ArrayList::new [ImplDef] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [ip (elem is (load i))]
+                  (unless (phase-only-type? (field ip self_type) nominals)
+                    (push! (mut out) (load ip))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (set! (.impls p) (box-al [ImplDef] a (load out)))
+    (close! (mut work))
+    0))
+
+(defn drop-code-funcs [(a (dyn Allocator)) (p (ptr Program))] (-> i64)
+  ; The reverse call graph and per-function type-reference sets are temporary.
+  ; Only filtered declarations survive; their bodies still belong to `p`.
+  (let [(mut work) (primitive/zeroed scratch/ScratchArena)
+        _init (scratch/ScratchArena::init-with-capacity (mut work)
+                   (large-pages/compiler-scratch-parent) 65536)
+        wa (allocator (mut work))]
+    (drop-funcs-named! a wa p (code-phase-func-names wa p))
+    (close! (mut work))
+    ; This function is the final runtime boundary. Metaprogram dylibs call
+    ; monomorphize directly and still need Code trait impls for dispatch; only
+    ; programs that have dropped their Code functions may drop those impls too.
+    (drop-code-impls a p)
+    0))
+
+;;; Remove the functions named in `dropped` from `p`; `wa` holds the temporary index.
+(defn drop-funcs-named! [(a (dyn Allocator))
+                         (wa (dyn Allocator))
+                         (p (ptr Program))
+                         (dropped (ptr (ArrayList (slice u8))))] (-> i64)
+  (let [fs (load (field p funcs))
+        n (len (load fs))
+        (mut dropped-index) (HashMap::new [(slice u8) i64] wa (keyops-borrowed))
+        (mut out) (ArrayList::new [Func] a)
+        (mut i) 0]
+    (for [j 0 (len (load dropped))]
+      (set! (mut dropped-index) (get (load dropped) j) 0))
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [fp (elem fs (load i))]
+                  (unless (contains? dropped-index (load (field fp name)))
+                    (push! (mut out) (load fp))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (set! (.funcs p) (box-al [Func] a (load out)))
+    0))

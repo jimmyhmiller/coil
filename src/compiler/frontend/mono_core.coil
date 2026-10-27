@@ -1,0 +1,698 @@
+; src/compiler/frontend/mono_core.coil — self-host Coil compiler: the
+; specializer's state (the program's generic definitions, the instances asked
+; for, the definitions produced) and the specialization of types.
+
+(module coil.compiler.mono_core)
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.alloc" :use *)
+(import "coil.result" :use *)
+(import "coil.str" :use *)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.io" :use *)
+(import "coil.control" :use *)
+(import "coil.try" :use *)
+(import "coil.reader" :use *)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.check" :use *)
+(import "coil.compiler.parser" :use *)
+(import "coil.compiler.resolve" :use *)
+(import "coil.compiler.mono_subst" :use *)
+(import "coil.compiler.name_sort" :use [Named def-name])
+
+;;; ---- the specializer's state -----------------------------------------------
+
+;;; The program's generic definitions by name, and the sum each variant belongs
+;;; to. A later definition of a name stands for it, as in the program's order.
+(defstruct Templates
+  [(funcs (HashMap (slice u8) (ptr Func)))
+   (structs (HashMap (slice u8) (ptr StructDef)))
+   (sums (HashMap (slice u8) (ptr SumDef)))
+   (variant-sum (HashMap (slice u8) (slice u8)))])
+
+;;; A generic type: a struct or a sum.
+(defsum GenericType
+  (GenericStruct [(def (ptr StructDef))])
+  (GenericSum [(def (ptr SumDef))]))
+
+;;; Instances of one kind waiting to be specialized: their indices among the
+;;; origins, in the order they were first asked for.
+(defstruct Worklist
+  [(pending (ArrayList i64))
+   (next i64)
+   ; every instance asked for, and every definition a reused program brings
+   (queued (HashMap (slice u8) i64))])
+
+;;; Definitions in the order they were produced, indexed by name. A definition
+;;; under a name already present replaces it where it stands, so the table never
+;;; holds two definitions of one name.
+(defstruct DefTable [T]
+  [(items (ArrayList T))
+   (index (HashMap (slice u8) i64))])
+
+;;; Whether the function body being specialized has been through ownership
+;;; elaboration. A concrete function is elaborated before specialization; a
+;;; generic instance's body is specialized once Unelaborated, elaborated, and
+;;; specialized again (see `drain` and `adjust-generic-call-abi!`).
+(defsum OwnershipStage (Unelaborated) (Elaborated))
+
+(defstruct MonoCtx
+  [(a (dyn Allocator))
+   (templates Templates)
+   ; every instance asked for, in the order asked, and its index by instance name
+   (origins (ArrayList MonoOrigin))
+   (origin-index (HashMap (slice u8) i64))
+   ; types are specialized before functions: see `drain`
+   (struct-work Worklist)
+   (sum-work Worklist)
+   (func-work Worklist)
+   (structs (DefTable StructDef))
+   (sums (DefTable SumDef))
+   (funcs (DefTable Func))
+   ; the checked program's environment, in which each instance's ownership is
+   ; elaborated once its type parameters are concrete
+   (ownership_cx (ptr Cx))
+   ; the program's impls and their index by (trait, implementing type), for the
+   ; trait calls whose receiver was a type parameter
+   (impls (ptr (ArrayList ImplDef)))
+   (trait_impl_idx (HashMap (slice u8) (ptr ImplBucket)))
+   (trait_uses (ArrayList MonoTraitUse))
+   (trait_use_index (HashMap TraitUseKey i64))
+   ; the function whose body is being specialized: the caller a trait use is
+   ; recorded against
+   (caller (slice u8))
+   ; functions a reused program already defines
+   (retained_funcs (HashMap (slice u8) i64))
+   ; structs and sums whose values exist only at compile time
+   ; (`phase-only-nominals`); they get no runtime layout
+   (phase_only (ptr (HashMap (slice u8) i64)))
+   ; the by-value C entries of generic instances a function pointer reaches
+   ; (`instance-c-entry!`), one per instance; added to the program's exports
+   (instance_entries (DefTable ExportC))
+   (stage OwnershipStage)])
+
+(impl Named ExportC (def-name [(d (ptr ExportC))] (-> (slice u8)) (.name d)))
+
+(defn worklist-new [(a (dyn Allocator))] (-> Worklist)
+  (Worklist :pending (ArrayList::new [i64] a)
+            :next 0
+            :queued (HashMap::new [(slice u8) i64] a (keyops))))
+
+(defn def-table-new [T] [(a (dyn Allocator))] (-> (DefTable T))
+  (DefTable :items (ArrayList::new [T] a)
+            :index (HashMap::new [(slice u8) i64] a (keyops))))
+
+;;; The definition named NAME in TABLE.
+(defn def-table-find [(T Named)] [(table (ptr (DefTable T))) (name (slice u8))] (-> (Option (ptr T)))
+  (match (get (.index table) name)
+    (Some [at] (Some (elem (field table items) at)))
+    (None [] (None [(ptr T)]))))
+
+;;; Put DEF in TABLE: in place of the definition of its name, or after the rest.
+(defn def-table-put! [(T Named)] [(table (ptr (DefTable T))) (def T)] (-> i64)
+  (let [(mut held) def
+        name (def-name (mut held))]
+    (match (get (.index table) name)
+      (Some [at] (do (set! (mut (field table items)) at def) 0))
+      (None []
+            (do (set! (mut (field table index)) name (len (.items table)))
+                (push! (mut (field table items)) def)
+                0)))
+    0))
+
+;;; ---- the program's generic definitions ------------------------------------
+
+;;; P's generic definitions, and the sum each of its variants belongs to.
+(defn templates-of [(a (dyn Allocator)) (p (ptr Program))] (-> (Result Templates Diag))
+  (try (let [(mut t) (Templates :funcs (HashMap::new [(slice u8) (ptr Func)] a (keyops))
+                                :structs (HashMap::new [(slice u8) (ptr StructDef)] a (keyops))
+                                :sums (HashMap::new [(slice u8) (ptr SumDef)] a (keyops))
+                                :variant-sum (HashMap::new [(slice u8) (slice u8)] a (keyops)))]
+         (for [i 0 (len (load (.funcs p)))]
+           (let [f (elem (.funcs p) i)]
+             (when (> (len (load (.type_params f))) 0)
+               (set! (mut (field t funcs)) (.name f) f))
+             0))
+         (for [i 0 (len (load (.structs p)))]
+           (let [s (elem (.structs p) i)]
+             (when (> (len (load (.type_params s))) 0)
+               (set! (mut (field t structs)) (.name s) s))
+             0))
+         (for [i 0 (len (load (.sums p)))]
+           (let [s (elem (.sums p) i)]
+             (when (> (len (load (.type_params s))) 0)
+               (set! (mut (field t sums)) (.name s) s))
+             (for [j 0 (len (load (.variants s)))]
+               (let [v (.name (elem (.variants s) j))]
+                 (when (contains? (.variant-sum t) v)
+                   (break :try (Err [Templates Diag]
+                                    (derr (sconcat3 a "variant '" v "' is declared in two sum types")))))
+                 (set! (mut (field t variant-sum)) v (.name s))))
+             0))
+         (Ok [Templates Diag] (load t)))))
+
+(defn generic-func [(m (ptr MonoCtx)) (name (slice u8))] (-> (Option (ptr Func)))
+  (get (.funcs (field m templates)) name))
+
+(defn generic-type [(m (ptr MonoCtx)) (name (slice u8))] (-> (Option GenericType))
+  (match (get (.structs (field m templates)) name)
+    (Some [s] (Some (GenericStruct s)))
+    (None []
+          (match (get (.sums (field m templates)) name)
+            (Some [s] (Some (GenericSum s)))
+            (None [] (None [GenericType]))))))
+
+(defn generic-sum [(m (ptr MonoCtx)) (name (slice u8))] (-> (Option (ptr SumDef)))
+  (get (.sums (field m templates)) name))
+
+;;; The sum the variant NAME belongs to.
+(defn variant-sum [(m (ptr MonoCtx)) (name (slice u8))] (-> (Option (slice u8)))
+  (get (.variant-sum (field m templates)) name))
+
+(defn type-param-count [(params (ptr (ArrayList (slice u8))))] (-> i64)
+  (len (load params)))
+
+;;; "<what> expects N type arguments, got M".
+(defn arity-err [(a (dyn Allocator)) (what (slice u8)) (n i64) (m i64)] (-> Diag)
+  (derr (sconcat a
+                 (sconcat3 a what " expects " (i64->str a n))
+                 (sconcat a " type arguments, got " (i64->str a m)))))
+
+;;; ---- the instances asked for -----------------------------------------------
+
+;;; Record that the instance MANGLED is generic NAME at ARGS, unless it is known
+;;; already; its index among the origins.
+(defn record-origin! [(m (ptr MonoCtx))
+                      (kind InstanceKind)
+                      (mangled (slice u8))
+                      (name (slice u8))
+                      (args (ptr (ArrayList Type)))] (-> i64)
+  (match (get (.origin-index m) mangled)
+    (Some [at] at)
+    (None []
+          (let [at (len (.origins m))]
+            (push! (mut (field m origins))
+                   (MonoOrigin :kind kind
+                               :generated mangled
+                               :source name
+                               :args args
+                               :trait_name ""
+                               :impl_source ""))
+            (set! (mut (field m origin-index)) mangled at)
+            at))))
+
+;;; Where the instance MANGLED came from, when it is one.
+(defn instance-origin [(m (ptr MonoCtx)) (mangled (slice u8))] (-> (Option (ptr MonoOrigin)))
+  (match (get (.origin-index m) mangled)
+    (Some [at] (Some (elem (field m origins) at)))
+    (None [] (None [(ptr MonoOrigin)]))))
+
+;;; Record that the instance MANGLED is a method of TRAIT's impl IMPL-SOURCE.
+(defn mark-trait-instance! [(m (ptr MonoCtx))
+                            (mangled (slice u8))
+                            (trait-name (slice u8))
+                            (impl-source (slice u8))] (-> i64)
+  (match (instance-origin m mangled)
+    (Some [origin]
+          (do (set! (.trait_name origin) trait-name)
+              (set! (.impl_source origin) impl-source)
+              0))
+    (None [] 0)))
+
+(defn worklist-of [(m (ptr MonoCtx)) (kind InstanceKind)] (-> (ptr Worklist))
+  (match kind
+    (FuncInstance [] (field m func-work))
+    (StructInstance [] (field m struct-work))
+    (SumInstance [] (field m sum-work))))
+
+;;; Ask for generic NAME's instance at ARGS: record where it comes from and queue
+;;; it, once. The instance's name.
+(defn request-instance! [(m (ptr MonoCtx))
+                         (kind InstanceKind)
+                         (name (slice u8))
+                         (args (ptr (ArrayList Type)))] (-> (slice u8))
+  (let [mangled (mangle (.a m) name args)
+        at (record-origin! m kind mangled name args)
+        work (worklist-of m kind)]
+    (unless (contains? (.queued work) mangled)
+      (set! (mut (field work queued)) mangled 0)
+      (push! (mut (field work pending)) at)
+      0)
+    mangled))
+
+;;; Mark NAME as defined already, so it is never queued.
+(defn mark-queued! [(m (ptr MonoCtx)) (kind InstanceKind) (name (slice u8))] (-> i64)
+  (set! (mut (field (worklist-of m kind) queued)) name 0)
+  0)
+
+;;; The next instance WORK holds, by its index among the origins.
+(defn next-instance! [(work (ptr Worklist))] (-> (Option i64))
+  (if (< (.next work) (len (.pending work)))
+      (let [at (get (.pending work) (.next work))]
+        (set! (.next work) (+ (.next work) 1))
+        (Some at))
+      (None [i64])))
+
+;;; A trait use's identity: which caller calls which method of which impl. The
+;;; instance it reached is not part of it.
+(defstruct TraitUseKey
+  [(caller (slice u8)) (trait (slice u8)) (impl (slice u8)) (method (slice u8))])
+
+(defn trait-use-key [(use MonoTraitUse)] (-> TraitUseKey)
+  (TraitUseKey :caller (.caller_source use)
+               :trait (.trait_name use)
+               :impl (.impl_source use)
+               :method (.method_name use)))
+
+(defn hash-mix [(h i64) (s (slice u8))] (-> i64)
+  (primitive/ixor (primitive/imul h 1099511628211) (key-hash s)))
+
+(defn trait-use-key-hash [(slot (ptr i8)) (n i64)] (-> i64)
+  (let [k (primitive/cast (ptr TraitUseKey) slot)]
+    (hash-mix (hash-mix (hash-mix (key-hash (.caller k)) (.trait k)) (.impl k)) (.method k))))
+
+(defn trait-use-key-eq [(x (ptr i8)) (y (ptr i8)) (n i64)] (-> bool)
+  (let [l (primitive/cast (ptr TraitUseKey) x)
+        r (primitive/cast (ptr TraitUseKey) y)]
+    (and (= (.caller l) (.caller r))
+         (= (.trait l) (.trait r))
+         (= (.impl l) (.impl r))
+         (= (.method l) (.method r)))))
+
+;;; Keys are the names' own storage, which outlives specialization.
+(defn trait-use-keyops [] (-> (ptr KeyOps))
+  (primitive/alloc-static KeyOps
+                          (KeyOps :hash (primitive/fnptr-of trait-use-key-hash)
+                                  :eq (primitive/fnptr-of trait-use-key-eq)
+                                  :size (primitive/sizeof TraitUseKey)
+                                  :copy (primitive/zeroed (fnptr (cc/C) [(ptr (dyn Allocator)) (ptr i8)] i64))
+                                  :free (primitive/zeroed (fnptr (cc/C) [(ptr (dyn Allocator)) (ptr i8)] i64))
+                                  :owns 0)))
+
+;;; Record that the function being specialized calls METHOD of TRAIT through the
+;;; impl IMPL-SOURCE, as GENERATED, once per caller.
+(defn trait-use-record! [(m (ptr MonoCtx))
+                         (trait-name (slice u8))
+                         (impl-source (slice u8))
+                         (method-name (slice u8))
+                         (generated (slice u8))] (-> i64)
+  (let [use (MonoTraitUse :caller_source (.caller m)
+                          :trait_name trait-name
+                          :impl_source impl-source
+                          :method_name method-name
+                          :generated_artifact generated)]
+    (add-trait-use! m use)))
+
+;;; USE, unless the same caller already records the same call.
+(defn add-trait-use! [(m (ptr MonoCtx)) (use MonoTraitUse)] (-> i64)
+  (let [key (trait-use-key use)]
+    (unless (contains? (.trait_use_index m) key)
+      (set! (mut (field m trait_use_index)) key (len (.trait_uses m)))
+      (push! (mut (field m trait_uses)) use)
+      0)
+    0))
+
+;;; ---- generic types as the checker knows them --------------------------------
+
+;;; A struct or sum instance as the generic application it instantiates,
+;;; `ArrayList__OldRecord` as `(ArrayList OldRecord)`: the form an impl pattern is
+;;; written in. The arguments stay as specialized.
+(defn instance-application [(m (ptr MonoCtx)) (t Type)] (-> Type)
+  (match t
+    (TStruct [name]
+             (match (instance-origin m name)
+               (Some [origin] (TApp (.source origin) (.args origin)))
+               (None [] t)))
+    (_ t)))
+
+;;; T with every struct or sum instance in it, however deep, as the generic
+;;; application it instantiates. Ownership elaboration runs in the checked
+;;; program's environment, which knows how `(Arc T)` is dropped but has no
+;;; declaration named `Arc__Payload`: that name exists only in specialization's
+;;; output. The generic shape lets the shared ownership machinery select the
+;;; generic Drop impl and inspect generic fields.
+(defn ownership-semantic-type [(m (ptr MonoCtx)) (t (ptr Type))] (-> Type)
+  (let [a (.a m)]
+    (match (load t)
+      (TStruct [name]
+               (match (instance-origin m name)
+                 (Some [origin] (TApp (.source origin) (ownership-semantic-type-list m (.args origin))))
+                 (None [] (load t))))
+      (TPtr [inner] (TPtr (box-type a (ownership-semantic-type m inner))))
+      (TRef [mutable inner] (TRef mutable (box-type a (ownership-semantic-type m inner))))
+      (TArray [inner count] (TArray (box-type a (ownership-semantic-type m inner)) count))
+      (TSlice [inner] (TSlice (box-type a (ownership-semantic-type m inner))))
+      (TVec [inner count] (TVec (box-type a (ownership-semantic-type m inner)) count))
+      (TApp [name args] (TApp name (ownership-semantic-type-list m args)))
+      (_ (load t)))))
+
+(defn ownership-semantic-type-list [(m (ptr MonoCtx)) (xs (ptr (ArrayList Type)))] (-> (ptr (ArrayList Type)))
+  (let [(mut out) (ArrayList::new [Type] (.a m))]
+    (for [i 0 (len (load xs))]
+      (push! (mut out) (ownership-semantic-type m (elem xs i))))
+    (box-al [Type] (.a m) (load out))))
+
+;;; MAP with each binding in its generic shape: the checker's recorded node types
+;;; name the instance's type parameters, and ownership elaboration of the
+;;; instance must decide Drop for the types its nodes really have.
+(defn ownership-instance-subst [(m (ptr MonoCtx)) (map (ptr (ArrayList SubstEntry)))] (-> (ptr (ArrayList SubstEntry)))
+  (let [out (subst-new (.a m))]
+    (for [i 0 (len (load map))]
+      (let [e (elem map i)]
+        (subst-bind! out (.name e) (ownership-semantic-type m (field e ty)))))
+    out))
+
+;;; Whether a value of type T, specialized by MAP, owns what it holds.
+(defn instance-affine? [(m (ptr MonoCtx)) (t (ptr Type)) (map (ptr (ArrayList SubstEntry)))] (-> (Result bool Diag))
+  (try (let [a (.a m)
+             concrete (box-type a (try! (resolve-ty m t map)))]
+         (Ok [bool Diag] (type-is-affine a (load (field m ownership_cx))
+                                         (box-type a (ownership-semantic-type m concrete)))))))
+
+;;; ---- impls -----------------------------------------------------------------
+
+;;; The first impl of TR for the type BASE.
+(defn impl-lookup [(m (ptr MonoCtx)) (tr (slice u8)) (base (slice u8))] (-> (ptr ImplDef))
+  (let [bucket (impl-index-get (field m trait_impl_idx) (impl-index-key (.a m) tr base))]
+    (if (= (primitive/cast i64 bucket) 0)
+        (primitive/cast (ptr ImplDef) 0)
+        (elem (load (field m impls)) (get (.items bucket) 0)))))
+
+;;; The most specific impl of TR whose pattern accepts RECV, or null. This is
+;;; `check.coil::impl-select-indexed` over the program's impls: the one rule that
+;;; type-checked the program, not a second one free to disagree with it.
+(defn impl-lookup-sel [(a (dyn Allocator)) (m (ptr MonoCtx)) (tr (slice u8)) (recv (ptr Type))] (-> (ptr ImplDef))
+  (let [selection (impl-select-indexed a
+                                       (.ownership_cx m)
+                                       (load (field m impls))
+                                       (impl-index-get (field m trait_impl_idx)
+                                                       (impl-index-key a tr (type-impl-name a recv)))
+                                       (impl-index-get (field m trait_impl_idx)
+                                                       (impl-index-key a tr BLANKET-IMPL-KEY))
+                                       tr
+                                       recv)]
+    (.ip selection)))
+
+;;; The dispatch key of a trait call whose Self resolved to the concrete T:
+;;; `parser.coil::impl-base-name`, the one definition.
+(defn mono-impl-name [(a (dyn Allocator)) (t (ptr Type))] (-> (Option (slice u8)))
+  (let [n (impl-base-name a t)]
+    (if (= (len n) 0) (None [(slice u8)]) (Some n))))
+
+;;; ---- the runaway guard -----------------------------------------------------
+;;; A generic that recurses on a WRAPPED version of its own argument (T -> (Box T)
+;;; -> (Box (Box T)) -> …) never reaches a fixpoint: every round mints a type the
+;;; worklist has never seen, so it would queue forever, silently. Identical
+;;; (name, args) are queued once, and constant arguments are only ever literals
+;;; copied from source (type positions never compute), so an unbounded run must
+;;; grow the type term. Real code never nests types anywhere near these limits.
+
+(defn ty-depth [(t (ptr Type))] (-> i64)
+  (match (load t)
+    (TPtr [i] (+ 1 (ty-depth i)))
+    (TRef [_ i] (+ 1 (ty-depth i)))
+    (TArray [e _] (+ 1 (ty-depth e)))
+    (TSlice [e] (+ 1 (ty-depth e)))
+    (TVec [e _] (+ 1 (ty-depth e)))
+    (TApp [_ args] (+ 1 (ty-list-depth args)))
+    (TFn [_ _ r] (+ 1 (ty-depth r)))
+    (TConst [_] 1)
+    (TInt [_ _] 1)
+    (TFloat [_] 1)
+    (TBool [] 1)
+    (TVoid [] 1)
+    (TStruct [_] 1)
+    (TNever [] 1)
+    (TError [] 1)
+    (TCode [] 1)
+    (TCodeBuilder [] 1)
+    (TExternRef [] 1)))
+
+(defn ty-list-depth [(xs (ptr (ArrayList Type)))] (-> i64)
+  (let [(mut deepest) 0]
+    (for [i 0 (len (load xs))]
+      (let [d (ty-depth (elem xs i))]
+        (when (> d deepest) (set! deepest d))
+        0))
+    deepest))
+
+(defn mono-depth-limit [] (-> i64) 64)
+
+(defn mono-name-limit [] (-> i64) 512)
+
+;;; The instance ORIGIN, when its type term has grown too big. Two views of one
+;;; thing: depth catches growth still shaped as a term, (Box (Box (Box …))); the
+;;; name catches growth after substitution, which is the case that actually fires,
+;;; since (Box T) becomes a struct whose NAME carries the nesting
+;;; (Box__Box__i64), so its term depth stays 1 while the name grows without bound.
+(defn runaway-check [(a (dyn Allocator)) (what (slice u8)) (origin (ptr MonoOrigin))] (-> (Result i64 Diag))
+  (if (or (> (ty-list-depth (.args origin)) (mono-depth-limit))
+          (> (len (.generated origin)) (mono-name-limit)))
+      (Err [i64 Diag] (mono-runaway-diag a what (.source origin) (.generated origin)))
+      (Ok [i64 Diag] 0)))
+
+;;; The growth shown rather than asserted: the instance name spells the nesting
+;;; out, which is what makes the mistake obvious. Truncated: at depth 64 it is
+;;; thousands of characters.
+(defn mono-runaway-diag [(a (dyn Allocator))
+                         (what (slice u8))
+                         (nm (slice u8))
+                         (mng (slice u8))] (-> Diag)
+  (let [shown (if (> (len mng) 100) (sconcat a (subslice mng 0 100) " …") mng)]
+    (derr (sconcat3 a
+                    (sconcat3 a
+                              "monomorphization: "
+                              what
+                              (sconcat3 a
+                                        " '"
+                                        nm
+                                        "' is being instantiated with an ever-growing type, so it never reaches a fixpoint. A generic that recurses on a WRAPPED version of its own argument (T -> (Box T) -> (Box (Box T)) -> …) mints a type nobody has seen every round and instantiates forever. Last instantiation: "))
+                    shown
+                    ""))))
+
+;;; ---- specializing types ----------------------------------------------------
+
+;;; A part of a definition that specializes into zero or more of itself, onto
+;;; OUT: a type pack `$pack` splices its element types, a parameter of pack type
+;;; its indexed parameters.
+(deftrait Specialize [Self]
+  (specialize-into! [(item (ptr Self))
+                     (m (ptr MonoCtx))
+                     (map (ptr (ArrayList SubstEntry)))
+                     (out (ptr (ArrayList Self)))] (-> (Result i64 Diag))))
+
+;;; XS, each part specialized by MAP.
+(defn specialize-list [(T Specialize)]
+    [(m (ptr MonoCtx)) (xs (ptr (ArrayList T))) (map (ptr (ArrayList SubstEntry)))]
+    (-> (Result (ptr (ArrayList T)) Diag))
+  (try (let [(mut out) (ArrayList::new [T] (.a m))]
+         (for [i 0 (len (load xs))]
+           (try! (specialize-into! (elem xs i) m map (mut out))))
+         (Ok [(ptr (ArrayList T)) Diag] (box-al [T] (.a m) (load out))))))
+
+(impl Specialize Type
+  (specialize-into! [(item (ptr Type))
+                     (m (ptr MonoCtx))
+                     (map (ptr (ArrayList SubstEntry)))
+                     (out (ptr (ArrayList Type)))] (-> (Result i64 Diag))
+    (try (let [t (try! (resolve-ty m item map))]
+           (match t
+             (TApp [name elems]
+                   (if (= name "$pack")
+                       (do (for [j 0 (len (load elems))]
+                             (push! [Type] out (get (load elems) j)))
+                           0)
+                       (do (push! [Type] out t) 0)))
+             (_ (do (push! [Type] out t) 0)))
+           (Ok [i64 Diag] 0)))))
+
+(impl Specialize Field
+  (specialize-into! [(item (ptr Field))
+                     (m (ptr MonoCtx))
+                     (map (ptr (ArrayList SubstEntry)))
+                     (out (ptr (ArrayList Field)))] (-> (Result i64 Diag))
+    (try (let [t (try! (resolve-ty m (field item ty) map))]
+           (push! [Field] out (Field :name (.name item) :ty t))
+           (Ok [i64 Diag] 0)))))
+
+(impl Specialize Variant
+  (specialize-into! [(item (ptr Variant))
+                     (m (ptr MonoCtx))
+                     (map (ptr (ArrayList SubstEntry)))
+                     (out (ptr (ArrayList Variant)))] (-> (Result i64 Diag))
+    (try (let [fields (try! (specialize-list [Field] m (.fields item) map))]
+           (push! [Variant] out (Variant :name (.name item) :fields fields))
+           (Ok [i64 Diag] 0)))))
+
+;;; A parameter of pack type, `(xs T...)`, is one parameter per element,
+;;; `xs$0 xs$1 …`. A parameter that may own keeps its owner type when, at these
+;;; arguments, the type owns.
+(impl Specialize Param
+  (specialize-into! [(item (ptr Param))
+                     (m (ptr MonoCtx))
+                     (map (ptr (ArrayList SubstEntry)))
+                     (out (ptr (ArrayList Param)))] (-> (Result i64 Diag))
+    (try (let [a (.a m)
+               t (try! (resolve-ty m (field item ty) map))]
+           (match t
+             (TApp [name elems]
+                   (if (= name "$pack")
+                       (do (for [j 0 (len (load elems))]
+                             (push! [Param] out (param-of (indexed-name a (dots-base (.name item)) j)
+                                                         (get (load elems) j)
+                                                         0)))
+                           0)
+                       (do (push! [Param] out (try! (specialize-param m item t map))) 0)))
+             (_ (do (push! [Param] out (try! (specialize-param m item t map))) 0)))
+           (Ok [i64 Diag] 0)))))
+
+;;; A parameter named NAME of type TY that owns nothing.
+(defn param-of [(name (slice u8)) (ty Type) (bid i64)] (-> Param)
+  (Param :name name
+         :ty ty
+         :bid bid
+         :owned_type (primitive/cast (ptr Type) 0)
+         :positional_only false))
+
+;;; PARAM at type TY, already specialized. Its owner type, the checked semantic
+;;; type, is kept only when it owns at these arguments.
+(defn specialize-param [(m (ptr MonoCtx)) (param (ptr Param)) (ty Type) (map (ptr (ArrayList SubstEntry)))] (-> (Result Param Diag))
+  (try (let [a (.a m)
+             (mut out) (param-of (.name param) ty (.bid param))]
+         (set! (.positional_only out) (.positional_only param))
+         (unless (= (primitive/cast i64 (.owned_type param)) 0)
+           (let [owner (box-type a (try! (resolve-ty m (.owned_type param) map)))
+                 semantic (box-type a (ownership-semantic-type m owner))]
+             (when (type-is-affine a (load (field m ownership_cx)) semantic)
+               (set! (.owned_type out) semantic))
+             0))
+         (Ok [Param Diag] (load out)))))
+
+;;; Type arguments, one per declared parameter: a pack argument stays one `$pack`.
+(defn resolve-ty-args [(m (ptr MonoCtx))
+                       (xs (ptr (ArrayList Type)))
+                       (map (ptr (ArrayList SubstEntry)))] (-> (Result (ptr (ArrayList Type)) Diag))
+  (try (let [(mut out) (ArrayList::new [Type] (.a m))]
+         (for [i 0 (len (load xs))]
+           (push! (mut out) (try! (resolve-ty m (elem xs i) map))))
+         (Ok [(ptr (ArrayList Type)) Diag] (box-al [Type] (.a m) (load out))))))
+
+;;; T with MAP's type parameters substituted, and each generic application it
+;;; names replaced by its instance, which is queued.
+(defn resolve-ty [(m (ptr MonoCtx)) (t (ptr Type)) (map (ptr (ArrayList SubstEntry)))] (-> (Result Type Diag))
+  (try (let [a (.a m)]
+         (match (load t)
+           (TInt [bits signed] (Ok [Type Diag] (TInt bits signed)))
+           (TFloat [bits] (Ok [Type Diag] (TFloat bits)))
+           (TBool [] (Ok [Type Diag] (TBool)))
+           (TVoid [] (Ok [Type Diag] (TVoid)))
+           (TNever [] (Ok [Type Diag] (TNever)))
+           (TCode [] (Ok [Type Diag] (TCode)))
+           (TCodeBuilder [] (Ok [Type Diag] (TCodeBuilder)))
+           (TExternRef [] (Ok [Type Diag] (TExternRef)))
+           (TConst [_] (Ok [Type Diag] (load t)))
+           (TPtr [inner] (Ok [Type Diag] (TPtr (box-type a (try! (resolve-ty m inner map))))))
+           (TRef [mutable inner]
+                 (Ok [Type Diag] (TRef mutable (box-type a (try! (resolve-ty m inner map))))))
+           (TSlice [elem] (Ok [Type Diag] (TSlice (box-type a (try! (resolve-ty m elem map))))))
+           (TArray [elem n]
+                   (let [e (try! (resolve-ty m elem map))]
+                     (Ok [Type Diag] (TArray (box-type a e) (try! (resolve-extent m n map true))))))
+           (TVec [elem n]
+                 (let [e (try! (resolve-ty m elem map))]
+                   (Ok [Type Diag] (TVec (box-type a e) (try! (resolve-extent m n map false))))))
+           (TFn [cc params ret]
+                (let [ps (try! (specialize-list [Type] m params map))
+                      r (try! (resolve-ty m ret map))]
+                  (Ok [Type Diag] (TFn :cc (CcResolved (cc-identity cc))
+                                       :params ps
+                                       :ret (box-type a (never-returns-void r))))))
+           (TStruct [name]
+                    (match (subst-find map name)
+                      (Some [concrete] (Ok [Type Diag] concrete))
+                      (None [] (Ok [Type Diag] (TStruct name)))))
+           (TApp [name args] (resolve-ty-app m name args map))
+           (TError []
+                   (Err [Type Diag]
+                        (derr "mono: an untyped expression's type reached specialization (compiler bug)")))))))
+
+;;; `(NAME ARGS…)`: a type pack, or a generic type's instance.
+(defn resolve-ty-app [(m (ptr MonoCtx))
+                      (name (slice u8))
+                      (args (ptr (ArrayList Type)))
+                      (map (ptr (ArrayList SubstEntry)))] (-> (Result Type Diag))
+  (try (let [a (.a m)]
+         (cond (= name "$pack-var")
+                 (match (subst-find map (type-struct-name (elem args 0)))
+                   (Some [v] (Ok [Type Diag] v))
+                   (None [] (Err [Type Diag] (derr "internal: unbound type pack during monomorphization"))))
+               (= name "$pack") (resolve-pack m args map)
+               :else
+                 (let [rargs (try! (specialize-list [Type] m args map))]
+                   (match (generic-type m name)
+                     (None [] (Err [Type Diag] (derr (sconcat3 a "unknown generic type '" name "'"))))
+                     (Some [g]
+                           (let [arity (generic-type-arity g)]
+                             (if (= arity (len (load rargs)))
+                                 (Ok [Type Diag] (TStruct (request-instance! m (generic-type-kind g) name rargs)))
+                                 (Err [Type Diag]
+                                      (arity-err a (sconcat3 a "generic type '" name "'") arity (len (load rargs)))))))))))))
+
+(defn generic-type-kind [(g GenericType)] (-> InstanceKind)
+  (match g
+    (GenericStruct [_] (StructInstance))
+    (GenericSum [_] (SumInstance))))
+
+(defn generic-type-arity [(g GenericType)] (-> i64)
+  (match g
+    (GenericStruct [s] (type-param-count (.type_params s)))
+    (GenericSum [s] (type-param-count (.type_params s)))))
+
+;;; A concrete type pack, `$pack [A B …]`, with its element types specialized. In
+;;; a generic body one may name the body's own type parameters -- the argument
+;;; list of a function pointer `(fnptr (cc/C) [T] R)` called there -- and a pack
+;;; variable among them stands for its whole pack, spliced in place.
+(defn resolve-pack [(m (ptr MonoCtx)) (elems (ptr (ArrayList Type))) (map (ptr (ArrayList SubstEntry)))] (-> (Result Type Diag))
+  (try (let [a (.a m)
+             (mut out) (ArrayList::new [Type] a)]
+         (for [i 0 (len (load elems))]
+           (let [e (elem elems i)
+                 r (try! (resolve-ty m e map))]
+             (match (load e)
+               (TApp [var _]
+                     (match r
+                       (TApp [name spliced]
+                             (if (and (= var "$pack-var") (= name "$pack"))
+                                 (do (for [j 0 (len (load spliced))]
+                                       (push! (mut out) (get (load spliced) j)))
+                                     0)
+                                 (do (push! (mut out) r) 0)))
+                       (_ (do (push! (mut out) r) 0))))
+               (_ (do (push! (mut out) r) 0)))
+             0))
+         (Ok [Type Diag] (TApp "$pack" (box-al [Type] a (load out)))))))
+
+;;; A specialized extent is a literal: positive for a vector's width, and for an
+;;; array's length (ZERO) not negative.
+(defn resolve-extent [(m (ptr MonoCtx)) (n Extent) (map (ptr (ArrayList SubstEntry))) (zero bool)] (-> (Result Extent Diag))
+  (try (let [resolved (try! (resolve-ty m (box-type (.a m) (extent-type n)) map))
+             not-integer (derr "array length or vector width must specialize to an integer")]
+         (match resolved
+           (TConst [v]
+                   (match v
+                     (ConstInt [k]
+                               (cond (> k 0) (Ok [Extent Diag] (FixedExtent k))
+                                     (and zero (= k 0)) (Ok [Extent Diag] (FixedExtent k))
+                                     zero (Err [Extent Diag] (derr "array length cannot be negative"))
+                                     :else (Err [Extent Diag] (derr "vector width must be positive"))))
+                     (_ (Err [Extent Diag] not-integer))))
+           (_ (Err [Extent Diag] not-integer))))))
+
+;;; A function declared `(-> never)` returns nothing, as a void one does; the
+;;; checker followed each call of one with a loop that never exits, so nothing
+;;; after specialization reads a value of type never from a call. Backends see
+;;; only the void signature.
+(defn never-returns-void [(t Type)] (-> Type)
+  (match t (TNever [] (TVoid)) (_ t)))

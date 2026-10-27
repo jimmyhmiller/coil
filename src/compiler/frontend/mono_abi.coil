@@ -1,0 +1,410 @@
+; src/compiler/frontend/mono_abi.coil — self-host Coil compiler: reconciling a
+; generic body's argument ABI and ownership with the concrete types an instance
+; gives it.
+;
+; The checker decides how each argument is passed (`ESpillRef`, `EMovePlace`,
+; `ELoad`) before a generic parameter's representation is known, so it gives such
+; a parameter value ABI. Specialization knows the representation, and rewrites
+; the arguments of the calls it specializes to match the callee it chose.
+
+(module coil.compiler.mono_abi)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.result" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.control" :use *)
+(import "coil.try" :use *)
+(import "coil.reader" :use *)
+(import "coil.compiler.unit_state" :use [core-name? core-name-prefix?])
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.check" :use *)
+(import "coil.compiler.expr_children" :use [expr-children!])
+(import "coil.compiler.parser" :use *)
+(import "coil.compiler.resolve" :use *)
+(import "coil.compiler.mono_subst" :use *)
+(import "coil.compiler.mono_core" :use *)
+(import "coil.compiler.name_sort" :use [Named def-name])
+
+(defn place-type? [(t (ptr Type))] (-> bool)
+  (match (load t)
+    (TRef [_ _] true)
+    (TPtr [_] true)
+    (_ false)))
+
+;;; Pass ARG as an address: a load passes the place loaded, a value is spilled.
+(defn pass-by-address! [(a (dyn Allocator)) (arg (ptr Expr))] (-> i64)
+  (match (.kind arg)
+    (ELoad [place] (set! (.kind arg) (.kind place)))
+    (ESpillRef [_] 0)
+    (_ (set! (.kind arg) (ESpillRef (box-expr a (load arg))))))
+  0)
+
+;;; ---- owner parameters -------------------------------------------------------
+
+;;; A generic `T` parameter is checked with value ABI because its representation
+;;; is unknown. When an instance makes it an owning aggregate, keep that external
+;;; ABI but move the argument at once into the owning slot that drop elaboration
+;;; and the instance's body expect: BODY, wrapped in a `let` of one slot per such
+;;; parameter, with each use of the parameter reading its slot.
+(defn materialize-generic-owner-params [(m (ptr MonoCtx))
+                                        (params (ptr (ArrayList Param)))
+                                        (body (ptr (ArrayList Expr)))] (-> (ptr (ArrayList Expr)))
+  (let [a (.a m)
+        (mut binds) (ArrayList::new [Bind] a)
+        (mut owners) (ArrayList::new [(slice u8)] a)]
+    (for [i 0 (len (load params))]
+      (let [pp (elem params i)
+            owner-type (.owned_type pp)]
+        (when (and (!= (primitive/cast i64 owner-type) 0)
+                   (match (.ty pp)
+                     (TStruct [_] true)
+                     (TApp [_ _] true)
+                     (TArray [_ _] true)
+                     (_ false)))
+          (let [name (.name pp)
+                raw-name (sconcat a "$owned.in." name)
+                slot-name (sconcat a "$owned.slot." name)
+                (mut init) (ArrayList::new [Expr] a)]
+            (set! (.name pp) raw-name)
+            (set! (.owned_type pp) (primitive/cast (ptr Type) 0))
+            ; storage 3: the compiler-generated owning slot the checker gives a
+            ; concrete owner parameter
+            (push! (mut binds)
+                   (mk-bind slot-name false
+                            (mk-expr (EAlloc :symbol (None)
+                                             :storage 3
+                                             :ty (load owner-type)
+                                             :init (primitive/cast (ptr Expr) 0))
+                                     -1 -1 -1 0)))
+            (push! (mut init)
+                   (mk-expr (EInitStore (box-expr a (mk-expr (EVar slot-name) -1 -1 -1 0))
+                                        (box-expr a (mk-expr (EVar raw-name) -1 -1 -1 0)))
+                            -1 -1 -1 0))
+            (push! (mut init) (mk-expr (EVar slot-name) -1 -1 -1 0))
+            (let [(mut owner) (mk-bind name false (mk-expr (EDo (box-al [Expr] a (load init))) -1 -1 -1 0))]
+              (set! (.bid owner) (.bid pp))
+              (set! (.owned_type owner) owner-type)
+              (push! (mut binds) (load owner)))
+            (push! (mut owners) name)
+            0))))
+    (if (= (len binds) 0)
+        body
+        (let [(mut inner) (ArrayList::new [Expr] a)
+              (mut wrapped) (ArrayList::new [Expr] a)]
+          ; The body was checked with each such parameter a VALUE; its name now
+          ; denotes the owning slot, so every use reads the slot, as a concrete
+          ; owner parameter's uses do.
+          (for [k 0 (len owners)]
+            (for [j 0 (len (load body))]
+              (owner-param-uses-load! a (elem body j) (get owners k))))
+          (if (= (len (load body)) 0)
+              (push! (mut inner) (mk-expr (EDo (box-al [Expr] a (ArrayList::new [Expr] a))) -1 -1 -1 0))
+              (for [j 0 (len (load body))]
+                (push! (mut inner) (get (load body) j))))
+          (push! (mut wrapped)
+                 (mk-expr (ELet (box-al [Bind] a (load binds)) (box-al [Expr] a (load inner)))
+                          -1 -1 -1 0))
+          (box-al [Expr] a (load wrapped))))))
+
+;;; Rewrite each use of the variable NAME in E to a load of it, except where a
+;;; binding inside E shadows it.
+(defn owner-param-uses-load! [(a (dyn Allocator)) (e (ptr Expr)) (name (slice u8))] (-> i64)
+  (match (.kind e)
+    (EVar [n]
+          (when (= n name)
+            (set! (.kind e) (ELoad (box-expr a (load e))))
+            0))
+    (ELet [binds body]
+          (let [(mut shadowed) false]
+            (for [i 0 (len (load binds))]
+              (unless shadowed
+                (let [bp (elem binds i)]
+                  (owner-param-uses-load! a (field bp value) name)
+                  (when (= (.name bp) name) (set! shadowed true))
+                  0)))
+            (unless shadowed
+              (for [i 0 (len (load body))]
+                (owner-param-uses-load! a (elem body i) name)))
+            0))
+    (EMatch [scrut arms]
+            (do
+              (owner-param-uses-load! a scrut name)
+              (for [i 0 (len (load arms))]
+                (let [arm (elem arms i)]
+                  (unless (block :binds
+                            (for [j 0 (len (load (.binds arm)))]
+                              (when (= (get (load (.binds arm)) j) name) (break :binds true)))
+                            false)
+                    (owner-param-uses-load! a (field arm body) name))
+                  0))
+              0))
+    ; a lifted function's body is its own
+    (EAnonFn [_ _] 0)
+    (_ (let [(mut kids) (ArrayList::new [(ptr Expr)] a)]
+         (expr-children! e (mut kids))
+         (for [i 0 (len kids)]
+           (owner-param-uses-load! a (get kids i) name))
+         0)))
+  0)
+
+;;; The type argument of the `take!` whose result E is, through the forms that
+;;; pass a value on, or null.
+(defn take-owner-type [(e (ptr Expr))] (-> (ptr Type))
+  (let [none (primitive/cast (ptr Type) 0)]
+    (match (.kind e)
+      (ECall [func type-args _]
+             (if (and (or (core-name? func "take!") (core-name-prefix? func "take!__"))
+                      (> (len (load type-args)) 0))
+                 (elem type-args 0)
+                 none))
+      (EDo [items] (take-owner-type-first items))
+      (EDefer [_ items] (take-owner-type-first items))
+      (EStore [_ value] (take-owner-type value))
+      (EInitStore [_ value] (take-owner-type value))
+      (ESpillRef [value] (take-owner-type value))
+      (_ none))))
+
+(defn take-owner-type-first [(items (ptr (ArrayList Expr)))] (-> (ptr Type))
+  (block :found
+    (for [i 0 (len (load items))]
+      (let [t (take-owner-type (elem items i))]
+        (when (!= (primitive/cast i64 t) 0) (break :found t))))
+    (primitive/cast (ptr Type) 0)))
+
+;;; ---- arguments of specialized calls ----------------------------------------
+
+;;; The arguments of a variant's construction, which the checker passed with the
+;;; call ABI while variants were still calls: a construction stores field
+;;; VALUES. A moved place is loaded, and a spilled aggregate is the expression
+;;; that was spilled.
+(defn move-args-to-values! [(args (ptr (ArrayList Expr)))] (-> i64)
+  (for [i 0 (len (load args))]
+    (let [arg (elem args i)]
+      (match (.kind arg)
+        (EMovePlace [place] (set! (.kind arg) (ELoad place)))
+        (ESpillRef [value] (set! (.kind arg) (.kind value)))
+        (_ 0))
+      0))
+  0)
+
+;;; The arguments of a call of an ordinary function: a moved place is passed as
+;;; itself.
+(defn move-args-to-places! [(args (ptr (ArrayList Expr)))] (-> i64)
+  (for [i 0 (len (load args))]
+    (let [arg (elem args i)]
+      (match (.kind arg)
+        (EMovePlace [place] (set! (.kind arg) (.kind place)))
+        (_ 0))
+      0))
+  0)
+
+;;; A trait call survives to specialization only when its receiver was a type
+;;; parameter, so its arguments were checked against the TRAIT method's declared
+;;; parameters. Reconcile them with the implementing method's own signature. A
+;;; parameter the trait spells by value over its own type parameters (`Self`, or
+;;; an extra such as a state machine's `Event`) has no known representation
+;;; before substitution, so the checker gave it VALUE ABI; the implementing method
+;;; takes it as `(ref T)` when T is a plain aggregate (Coil's implicit immutable
+;;; reference) or when the impl borrows an owner the trait would let it consume.
+;;; Either way the callee needs an address. Without this the instance hands an
+;;; aggregate VALUE to a pointer parameter: the LLVM backend spills it on some
+;;; call paths and fails module verification on others, and the native backends
+;;; pass the aggregate's first word as the address.
+(defn adjust-trait-call-abi! [(m (ptr MonoCtx))
+                              (td (ptr TraitDef))
+                              (impl-fn (slice u8))
+                              (impl-targs (ptr (ArrayList Type)))
+                              (method (slice u8))
+                              (args (ptr (ArrayList Expr)))] (-> (Result i64 Diag))
+  (try (let [a (.a m)
+             cx (load (field m ownership_cx))]
+         (when (= (primitive/cast i64 td) 0) (break :try (Ok [i64 Diag] 0)))
+         (let [tm (trait-method-find td method)
+               sg (sig-find cx impl-fn)]
+           (when (= (primitive/cast i64 tm) 0) (break :try (Ok [i64 Diag] 0)))
+           (when (= (primitive/cast i64 sg) 0)
+             (break :try (Err [i64 Diag]
+                              (derr (sconcat3 a "mono: no signature for the implementing method '" impl-fn
+                                              "' of a trait call (compiler bug)")))))
+           (let [tps (load (field tm params))
+                 ips (load (field sg params))
+                 no-tps (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+                 ; A generic impl's signature names its own type parameters;
+                 ; whether such a parameter is passed by reference is known only
+                 ; for the instance this call selected.
+                 binds (subst-new a)]
+             (for [k 0 (len (load (field sg type_params)))]
+               (when (< k (len (load impl-targs)))
+                 (subst-insert! binds (get (load (field sg type_params)) k) (elem impl-targs k))
+                 0))
+             (for [i 0 (len (load args))]
+               (when (and (< i (len (load tps))) (< i (len (load ips))))
+                 (let [declared (field (elem tps i) ty)
+                       concrete (box-type a (subst-apply a (elem ips i) binds))
+                       lowered (box-type a (param-ref-type cx concrete no-tps))]
+                   (when (and (not (place-type? declared))
+                              (match (load lowered) (TRef [_ _] true) (_ false)))
+                     (pass-by-address! a (elem args i)))
+                   0)))
+             (Ok [i64 Diag] 0))))))
+
+;;; The arguments NARGS of a call of GF's instance at RTARGS. FRESH is true when
+;;; the call is being specialized now, so its arguments are as the checker left
+;;; them; false when an earlier pass already specialized it.
+(defn adjust-generic-call-abi! [(m (ptr MonoCtx))
+                                (gf (ptr Func))
+                                (rtargs (ptr (ArrayList Type)))
+                                (nargs (ptr (ArrayList Expr)))
+                                (fresh bool)] (-> (Result i64 Diag))
+  (try (let [a (.a m)
+             params (load (field gf params))
+             ; whether a parameter owns depends on the arguments only where it may
+             smap (if (block :owner
+                        (for [i 0 (len (load params))]
+                          (when (!= (primitive/cast i64 (.owned_type (elem params i))) 0) (break :owner true)))
+                        false)
+                      (subst-map a (load (field gf type_params)) rtargs)
+                      (primitive/cast (ptr (ArrayList SubstEntry)) 0))
+             n (if (< (len (load params)) (len (load nargs))) (len (load params)) (len (load nargs)))
+             elaborated (match (.stage m) (Elaborated [] true) (Unelaborated [] false))]
+         (for [i 0 n]
+           (let [pp (elem params i)
+                 arg (elem nargs i)
+                 owner-type (.owned_type pp)
+                 by-address (place-type? (field pp ty))
+                 ; `(Option T)` may own, but this instance may be Copy: then
+                 ; nothing moved, and the argument is a value however spelled
+                 instance-owns (and (!= (primitive/cast i64 owner-type) 0)
+                                    (match (instance-affine? m owner-type smap)
+                                      (Ok [owns] owns)
+                                      (Err [_] true)))]
+             (match (.kind arg)
+               (EMovePlace [place]
+                           (set! (.kind arg) (if by-address (.kind place) (ELoad place))))
+               (_ 0))
+             ; Only a fresh call sees its arguments as checked; a call specialized
+             ; before sees them already passed by address.
+             (when (and fresh (!= (primitive/cast i64 owner-type) 0) (not instance-owns) by-address)
+               (pass-by-address! a arg))
+             ; An owned argument's place ABI is lowered once, on the argument as
+             ; ownership elaboration left it. A non-generic function was elaborated
+             ; before specialization; a generic instance is elaborated between its
+             ; two passes, so its first pass leaves the argument alone. Elaboration
+             ; reads an argument as the checker wrote it, `(load place)`: given the
+             ; bare place instead, it took a place with no variable at its root
+             ; (the slot of a constructor) for an rvalue and spilled it, so the
+             ; callee got the address of a pointer to the value.
+             (when (and instance-owns elaborated by-address)
+               (match (.kind arg)
+                 (ELoad [place] (set! (.kind arg) (.kind place)))
+                 ; Checked non-generic calls already spill aggregate rvalues when
+                 ; the callee takes an owning place.
+                 (ESpillRef [_] 0)
+                 ; Elaboration already rewrote a moved local, parameter or part
+                 ; of one from `load place` to the place itself: do not spill
+                 ; that pointer a second time.
+                 (EVar [_] 0)
+                 (EField [_ _] 0)
+                 (EIndex [_ _] 0)
+                 (_ (set! (.kind arg) (ESpillRef (box-expr a (load arg))))))
+               0)
+             0))
+         (Ok [i64 Diag] 0))))
+
+;;; Register the signature of GF's instance MNG at RTARGS with the checker's
+;;; environment as soon as a call of it is specialized. Ownership elaboration of
+;;; an instance runs while the worklist is still being drained, and a caller
+;;; elaborated before its callee must still tell an owning parameter from a
+;;; borrow. The environment knows only the generic name: looking up the instance
+;;; there would otherwise silently treat every argument as non-consuming.
+(defn register-monomorphized-call-sig! [(m (ptr MonoCtx))
+                                        (gf (ptr Func))
+                                        (rtargs (ptr (ArrayList Type)))
+                                        (mng (slice u8))] (-> (Result i64 Diag))
+  (try (let [cx (load (field m ownership_cx))]
+         (unless (= (primitive/cast i64 (sig-find cx mng)) 0)
+           (break :try (Ok [i64 Diag] 0)))
+         (let [a (.a m)
+               smap (subst-map a (load (field gf type_params)) rtargs)
+               ps (load (field gf params))
+               (mut types) (ArrayList::new [Type] a)
+               (mut names) (ArrayList::new [(slice u8)] a)]
+           (for [i 0 (len (load ps))]
+             (let [pp (elem ps i)
+                   semantic (if (= (primitive/cast i64 (.owned_type pp)) 0) (field pp ty) (.owned_type pp))]
+               (push! (mut types) (try! (resolve-ty m semantic smap)))
+               (push! (mut names) (.name pp))))
+           (let [params (box-al [Type] a (load types))]
+             (push! (mut (.sigs cx))
+                    (Sig :name mng
+                         :type_params (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+                         :bounds (box-al [Bound] a (ArrayList::new [Bound] a))
+                         :param_names (box-al [(slice u8)] a (load names))
+                         :params params
+                         :ret (try! (resolve-ty m (field gf ret) smap))
+                         :is_extern false
+                         :variadic false
+                         :cc (cc-identity (.cc gf))
+                         :fnptr_ok false
+                         :fnptr_params params)))
+           (sig-index-put! cx mng)
+           (Ok [i64 Diag] 0)))))
+
+;;; Record the by-value C entry of instance MNG of GF, when the function
+;;; pointer's type takes by value a struct or sum that the instance takes by
+;;; reference. A parameter declared as a bare type parameter is taken by value by
+;;; the instance as well, so the pointer is to the instance itself; a struct
+;;; parameter of a lifted anonymous function is taken by reference, and so is one
+;;; that may own (`(Option T)`): the pointer takes it by value, the body by its
+;;; place. Those are reached through the entry.
+(defn instance-c-entry! [(m (ptr MonoCtx))
+                         (gf (ptr Func))
+                         (rtargs (ptr (ArrayList Type)))
+                         (mng (slice u8))] (-> (Result i64 Diag))
+  (try (let [a (.a m)
+             cx (.ownership_cx m)
+             sg (sig-find cx (.name gf))
+             tparams (load (field gf type_params))
+             smap (subst-map a tparams rtargs)
+             params (load (field gf params))
+             (mut surface) (ArrayList::new [Type] a)
+             (mut needed) false]
+         (for [i 0 (len (load params))]
+           (let [pp (elem params i)
+                 owner (.owned_type pp)
+                 bare-param (match (load (field pp ty))
+                              (TStruct [n] (set-contains tparams n))
+                              (_ false))
+                 ; A parameter that may own is a struct or sum the pointer takes by
+                 ; value (`(Option T)`), and the body by reference: resolved, it is
+                 ; an instantiated aggregate whatever its arguments are.
+                 owned-aggregate (and (not bare-param)
+                                      (!= (primitive/cast i64 owner) 0)
+                                      (match (load owner)
+                                        (TStruct [_] true)
+                                        (TApp [_ _] true)
+                                        (_ false)))
+                 declared (try! (resolve-ty m (field pp ty) smap))
+                 shown (cond owned-aggregate (try! (resolve-ty m owner smap))
+                             (and (!= (primitive/cast i64 sg) 0)
+                                  (< i (len (load (.fnptr_params sg)))))
+                               (try! (resolve-ty m (elem (.fnptr_params sg) i) smap))
+                             :else declared)
+                 by-reference (match declared (TRef [_ _] true) (TPtr [_] true) (_ false))]
+             (when (or owned-aggregate
+                       (and by-reference (by-value-c-entry-param? cx (box-type a shown))))
+               (set! needed true))
+             (push! (mut surface) shown)))
+         (when (and needed (none? (def-table-find [ExportC] (field m instance_entries) mng)))
+           (def-table-put! [ExportC] (field m instance_entries)
+                           (ExportC :name mng
+                                    :symbol (Some (sconcat a mng ".c"))
+                                    :params (box-al [Type] a (load surface))
+                                    :published false
+                                    :lo (.lo gf)
+                                    :hi (.hi gf)
+                                    :source (.source gf)
+                                    :ctxt (.ctxt gf))))
+         (Ok [i64 Diag] 0))))
