@@ -28,6 +28,12 @@
          ty-float-bytes mk-gcev gcev-v gcev-u g-const-cmp slot-new! g-loop-index
          g-bits-info g-const-eval g-const-bin ty-int-info GNil GBind]
         :reexport)
+(import "coil.compiler.native"
+        :use
+        [IrContext ir-lane-av ir-as-unsigned ir-force-unsigned-ty
+         ir-icmp-scalar! ir-fcmp-scalar! ir-extend-op! ir-floatconv! ir-value
+         ir-lit-vec! ir-value-adv! ir-parse-type]
+        :reexport)
 (import "coil.compiler.native" :as native)
 (import "coil.compiler.text" :as text)
 (import "coil.primitive" :as primitive)
@@ -4587,36 +4593,6 @@
   (-> (ptr (ArrayList (slice u8))))
   (irs/tokenize a line))
 
-; All state for one inline-IR invocation. Syntax reads stay interleaved with
-; value resolution and allocation; helpers borrow this context and its original
-; mutable environment rather than reconstructing a parameter bundle per call.
-; The environment pointer addresses emit-llvmir's stack cell; this context is
-; borrowed synchronously and never escapes that invocation.
-(defstruct IrContext
-  [(g (ptr Cga))
-   (envp (ptr (ptr GScope)))
-   (avsp (ptr (ArrayList AVal)))
-   (argtysp (ptr (ArrayList Type)))
-   (result Type)])
-
-; parse an IR type token in the context of (result type, arg types).
-; tokp = index of the first token of the type; returns the Type and advances
-; *tokp past it. Handles $ret/$tN/i1/i8/i16/i32/i64/float/double/ptr and
-; "{ ... }" / "< N x T >" forms (mapped to synthetic Coil types).
-(defn ir-parse-type [(irctx (ref IrContext))
-                     (toks (ptr (ArrayList (slice u8))))
-                     (tokp (ptr i64))] (-> Type)
-  (let [g (.g irctx)
-        result (.result irctx)
-        argtys (.argtysp irctx)]
-    (let [context
-            (irs/TypeContext
-              :allocator (.a g)
-              :result result
-              :arguments argtys
-              :errors (zeroed Arm64IrErrors))]
-      (irs/read-type context toks tokp))))
-
 ; aggregate element info for extractvalue/insertvalue: given the agg type and
 ; element index, produce (offset, element type).
 (defn ir-agg-elem [(g (ptr Cga)) (t (ptr Type)) (idx i64) (offp (ptr i64))]
@@ -4641,54 +4617,6 @@
          (cga-fail "llvm-ir: extract/insert on unsupported aggregate")
          (TInt 64 true)))))
 
-; resolve a VALUE token: %name (env), $N (arg), integer literal, undef/zeroinitializer.
-(defn ir-value [(irctx (ref IrContext))
-                (env (ptr GScope))
-                (tk (slice u8))
-                (t Type)] (-> AVal)
-  (let [g (.g irctx)
-        avs (.avsp irctx)]
-    (let [(mut tp)
-            (: t
-               Type)]
-      (cond (= (primitive/cast i64 (get tk 0)) 37)  ; %
-              (match (gscope-get env tk)
-                (Some [av] av)
-                (None []
-                      (do
-                        (cga-fail2 "llvm-ir: undefined value " tk)
-                        (mk-aval 0 0 (TInt 64 true)))))
-            (= (primitive/cast i64 (get tk 0)) 36)  ; $N
-              (get (load avs) (str->i64 (subslice tk 1 (len tk))))
-            (or (= tk "undef") (= tk "poison"))
-              (mk-aval 1
-                       (slot-for-ty! g
-                                     (mut tp))
-                       t)
-            ; fresh, uninitialized slot (poison is a stricter undef; a fresh
-            ; garbage slot is a valid choice for both here)
-            (= tk "zeroinitializer")
-              (let [slot
-                      (slot-for-ty! g
-                                    (mut tp))]
-                (emit-zero! g
-                            slot
-                            (ty-size g
-                                     (mut tp)))
-                (mk-aval 1 slot t))
-            (= tk "true") (mk-aval 0 1 t)
-            ; i1 literal, e.g. inside a <...> mask
-            (= tk "false") (mk-aval 0 0 t)
-            (ty-is-float (mut tp))  ; float literal, e.g. `float 1.0` inside a <...> literal
-              ; kind-2 immediates are always f64-shaped, same as EFloat's own
-              ; AVal construction above — narrowing to f32 (if needed) happens
-              ; the same way any other f64 kind-2 immediate narrows.
-              (mk-aval 2 (f64-bits (str->f64 tk)) (TFloat 64))
-            :else  ; integer literal (also covers negative)
-              ; av-slot! sign-extends an immediate across a slot wider than 8 bytes
-              ; (the i128 marker type), so a literal needs no special case here.
-              (mk-aval 0 (str->i64 tk) t)))))
-
 ; shufflevector's <N x i32> mask: either `zeroinitializer` (all N indices 0,
 ; i.e. a splat) or an explicit `<i32 IDX0, i32 IDX1, ...>` literal. Indices
 ; are always compile-time-known integer literals in the corpus (never a
@@ -4702,72 +4630,6 @@
   (-> (ptr (ArrayList i64)))
   (irs/read-mask a (zeroed Arm64IrErrors) toks tokp n))
 
-; an inline vector-constant literal: `< TY V0, TY V1, ... >`, tokp on entry
-; pointing at "<". Used pervasively as an operand throughout the corpus (icmp/
-; select/shl/or/fadd comparands and shuffle index masks) — always homogeneous,
-; always plain per-element literals (never %name/$N).
-(defn ir-lit-vec! [(irctx (ref IrContext))
-                   (toks (ptr (ArrayList (slice u8))))
-                   (tokp (ptr i64))
-                   (t Type)] (-> AVal)
-  (let [g (.g irctx)
-        envp (.envp irctx)]
-    (set! tokp (primitive/iadd (load tokp) 1))  ; skip "<"
-    (match t
-      (TVec [elemp lanes]
-            (let [lb (ty-size g elemp)
-                  (mut tp)
-                    (: t
-                       Type)
-                  (mut k) 0]
-              (let [dslot
-                      (slot-for-ty! g
-                                    (mut tp))]
-                (loop (if (>= (load k) (extent-value lanes))
-                          (break)
-                          (do
-                            (let [ety (ir-parse-type irctx toks tokp)
-                                  eav0
-                                    (ir-value irctx
-                                              (load envp)
-                                              (get (load toks) (load tokp))
-                                              ety)
-                                  ; float literals always resolve as f64 kind-2
-                                  ; immediates (matching EFloat's own AVal
-                                  ; convention) — narrow to the element's actual
-                                  ; declared width/type before storing.
-                                  eav (emit-cast-av! g ety eav0)]
-                              (set! tokp (primitive/iadd (load tokp) 1))
-                              (emit-store-av-at! g
-                                                 eav
-                                                 (primitive/iadd dslot
-                                                                 (primitive/imul (load k)
-                                                                                 lb))))
-                            (set! k (primitive/iadd (load k) 1)))))
-                (set! tokp (primitive/iadd (load tokp) 1))
-                ; skip ">"
-                (mk-aval 1 dslot t))))
-      (_ (do
-           (cga-fail "llvm-ir: vector literal on non-vector type")
-           (mk-aval 0 0 t))))))
-
-; resolve a value token at the current stream position, advancing tokp past
-; it — either a single token (the common case, same as ir-value) or a whole
-; inline vector literal (ir-lit-vec!, several tokens). Every op below that
-; parses a VALUE (as opposed to a plain SSA-name binding target) uses this
-; instead of ir-value directly, so `<i32 1, i32 2, ...>`-shaped operands work
-; anywhere a %name/$N/undef/zeroinitializer/integer-literal would.
-(defn ir-value-adv! [(irctx (ref IrContext))
-                     (toks (ptr (ArrayList (slice u8))))
-                     (tokp (ptr i64))
-                     (t Type)] (-> AVal)
-  (let [envp (.envp irctx)]
-    (if (= (get (load toks) (load tokp)) "<")
-        (ir-lit-vec! irctx toks tokp t)
-        (let [av (ir-value irctx (load envp) (get (load toks) (load tokp)) t)]
-          (set! tokp (primitive/iadd (load tokp) 1))
-          av))))
-
 ; bind an SSA name to a value in the llvm-ir line interpreter's environment.
 (defn ir-bind! [(g (ptr Cga))
                 (envp (ptr (ptr GScope)))
@@ -4775,53 +4637,6 @@
                 (av AVal)] (-> i64)
   (set! envp (gscope-put (.a g) (load envp) name av))
   0)
-
-; a "view" AVal onto lane k of a (vec elemty n) value already resident in a
-; slot: same frame, offset by k*lb. Reuses the scalar AVal-level ops (cmp/bin/
-; cast) unchanged, one lane at a time — the same scalarization convention as
-; `emit-vec-fbin!` below, generalized to every op that needs it.
-(defn ir-lane-av [(g (ptr Cga))
-                  (vecav AVal)
-                  (k i64)
-                  (elemty Type)
-                  (lb i64)] (-> AVal)
-  (mk-aval 1
-           (primitive/iadd (av-slot! g vecav) (primitive/imul k lb))
-           elemty))
-
-; reinterpret an AVal's type as unsigned, for llvm-ir ops (icmp ult/.../uitofp)
-; whose predicate/opcode carries signedness that ir-parse-type's tokens never
-; do (every parsed int type token is TInt _ true — see ir-parse-type above).
-(defn ir-as-unsigned [(av AVal)] (-> AVal)
-  (let [(mut t) (av-ty av)]
-    (match t
-      (TInt [bits _] (mk-aval (av-kind av) (av-v av) (TInt bits false)))
-      (_ av))))
-
-; scalar icmp: maps the llvm predicate onto emit-cmp-av!'s op codes (0 lt, 1
-; le, 2 gt, 3 ge, 4 eq, else ne), forcing the unsigned reading emit-cmp-av!
-; can't otherwise reach (it derives signedness from the operand TYPE, but
-; icmp's predicate carries it instead).
-(defn ir-icmp-scalar! [(g (ptr Cga)) (pred (slice u8)) (lav AVal) (rav AVal)]
-  (-> AVal)
-  (cond (= pred "eq") (emit-cmp-av! g 4 lav rav)
-        (= pred "ne") (emit-cmp-av! g 5 lav rav)
-        (= pred "slt") (emit-cmp-av! g 0 lav rav)
-        (= pred "sle") (emit-cmp-av! g 1 lav rav)
-        (= pred "sgt") (emit-cmp-av! g 2 lav rav)
-        (= pred "sge") (emit-cmp-av! g 3 lav rav)
-        (= pred "ult")
-          (emit-cmp-av! g 0 (ir-as-unsigned lav) (ir-as-unsigned rav))
-        (= pred "ule")
-          (emit-cmp-av! g 1 (ir-as-unsigned lav) (ir-as-unsigned rav))
-        (= pred "ugt")
-          (emit-cmp-av! g 2 (ir-as-unsigned lav) (ir-as-unsigned rav))
-        (= pred "uge")
-          (emit-cmp-av! g 3 (ir-as-unsigned lav) (ir-as-unsigned rav))
-        :else
-          (do
-            (cga-fail2 "llvm-ir: unsupported icmp predicate: " pred)
-            (mk-aval 0 0 (TBool)))))
 
 ; i128 (our synthetic 16-byte TSlice blob) only supports eq/ne, via a plain
 ; 16-byte memory compare — nothing in the corpus needs an ordered i128 compare.
@@ -4845,23 +4660,6 @@
     (let [slot (slot-new! (native-context g) 8 8)]
       (emit-store-int! g 9 28 slot 1)
       (mk-aval 1 slot (TBool)))))
-
-; scalar fcmp: maps the llvm predicate onto emit-cmp-av!'s float op codes (0
-; olt, 1 ole, 2 ogt, 3 oge, 4 oeq, 5 one). Only the ordered predicates are
-; supported — nothing in the corpus needs an unordered (u*) or ord/uno compare.
-(defn ir-fcmp-scalar! [(g (ptr Cga)) (pred (slice u8)) (lav AVal) (rav AVal)]
-  (-> AVal)
-  (cond (= pred "oeq") (emit-cmp-av! g 4 lav rav)
-        (= pred "one") (emit-cmp-av! g 5 lav rav)
-        (= pred "olt") (emit-cmp-av! g 0 lav rav)
-        (= pred "ole") (emit-cmp-av! g 1 lav rav)
-        (= pred "ogt") (emit-cmp-av! g 2 lav rav)
-        (= pred "oge") (emit-cmp-av! g 3 lav rav)
-        :else
-          (do
-            (cga-fail2 "llvm-ir: unsupported fcmp predicate (only ordered oeq/one/olt/ole/ogt/oge supported): "
-                       pred)
-            (mk-aval 0 0 (TBool)))))
 
 ; branch-free select on values ≤8 bytes (scalar, or one vector lane): blend
 ; the raw bits of `aav`/`bav` by `maskav` (0/1) sign-extended to all-0s/all-1s.
@@ -4891,9 +4689,6 @@
                  slot
                  t)))))
 
-(defn ir-force-unsigned-ty [(t Type)] (-> Type)
-  (match t (TInt [bits _] (TInt bits false)) (_ t)))
-
 ; sext of a REAL narrow int (e.g. sext i8 to i32) is just emit-cast-av!'s
 ; ordinary int/int path — ir-parse-type marks every int token signed, so it
 ; already sign-extends correctly from the container's own sign bit. But
@@ -4921,85 +4716,6 @@
       (_ (do
            (cga-fail "llvm-ir: sext from i1 to a non-integer type")
            (mk-aval 0 0 dstty))))))
-
-; shared core for sext/zext/trunc.
-(defn ir-extend-op! [(g (ptr Cga))
-                     (srcty Type)
-                     (srcav0 AVal)
-                     (dstty Type)
-                     (zext bool)
-                     (sext bool)] (-> AVal)
-  (match dstty
-    (TVec [delemp lanes]
-          (let [selemp (match srcty (TVec [e _] (load e)) (_ (load srcty)))
-                boolsrc (match selemp (TBool [] true) (_ false))
-                slb (ty-size g (box-type (.a g) selemp))
-                dlb (ty-size g delemp)
-                (mut dtp) (: dstty Type)]
-            (let [dslot (slot-for-ty! g (mut dtp))]
-              (for [k 0 (extent-value lanes)]
-                (let [lelem0 (ir-lane-av g srcav0 k selemp slb)
-                      rav
-                        (cond (and sext boolsrc)
-                                (ir-sext-bool! g lelem0 (load delemp))
-                              zext
-                                (emit-cast-av! g
-                                               (load delemp)
-                                               (ir-as-unsigned lelem0))
-                              :else
-                                (emit-cast-av! g
-                                               (load delemp)
-                                               (load lelem0)))]
-                  (emit-copy! g
-                              (primitive/iadd dslot
-                                              (primitive/imul k
-                                                              dlb))
-                              (av-slot! g rav)
-                              dlb)))
-              (mk-aval 1 dslot dstty))))
-    (_ (let [boolsrc (match srcty (TBool [] true) (_ false))]
-         (cond (and sext boolsrc) (ir-sext-bool! g (load srcav0) dstty)
-               zext (emit-cast-av! g dstty (ir-as-unsigned srcav0))
-               :else (emit-cast-av! g dstty (load srcav0)))))))
-
-; shared core for fptosi/fptoui/sitofp/uitofp/fptrunc/fpext: also reuses
-; emit-cast-av!, overriding signedness the same way ir-extend-op! does
-; (uitofp forces the source unsigned; fptoui forces the destination unsigned).
-(defn ir-floatconv! [(g (ptr Cga))
-                     (srcty Type)
-                     (srcav0 AVal)
-                     (dstty0 Type)
-                     (unsignedsrc bool)
-                     (unsigneddst bool)] (-> AVal)
-  (match dstty0
-    (TVec [delemp0 lanes]
-          (let [selemp (match srcty (TVec [e _] (load e)) (_ (load srcty)))
-                slb (ty-size g (box-type (.a g) selemp))
-                delemty
-                  (if unsigneddst
-                      (ir-force-unsigned-ty (load delemp0))
-                      (load delemp0))
-                dlb (ty-size g (box-type (.a g) delemty))
-                (mut dtp)
-                  (fixed-vec (box-type (.a g) delemty) (extent-value lanes))]
-            (let [dslot (slot-for-ty! g (mut dtp))]
-              (for [k 0 (extent-value lanes)]
-                (let [lelem0 (ir-lane-av g srcav0 k selemp slb)
-                      lelem
-                        (if unsignedsrc
-                            (ir-as-unsigned lelem0)
-                            (load lelem0))
-                      rav (emit-cast-av! g delemty lelem)]
-                  (emit-copy! g
-                              (primitive/iadd dslot
-                                              (primitive/imul k
-                                                              dlb))
-                              (av-slot! g rav)
-                              dlb)))
-              (mk-aval 1 dslot dtp))))
-    (_ (let [dstty (if unsigneddst (ir-force-unsigned-ty dstty0) (load dstty0))
-             srcav (if unsignedsrc (ir-as-unsigned srcav0) (load srcav0))]
-         (emit-cast-av! g dstty srcav)))))
 
 ; copy `bytes` between a raw pointer (register `addrreg`, offset from 0) and a
 ; frame slot, chunked in ≤8-byte pieces. Generalizes emit-load-from-mem!/
@@ -5117,48 +4833,9 @@
                    (result Type)
                    (args (ptr (ArrayList Expr)))
                    (body (slice u8))] (-> AVal)
-  (let [a (.a g)
-        (mut avs) (ArrayList::new [AVal] a)
-        (mut argtys) (ArrayList::new [Type] a)
-        n (len (load args))]
-    (for [i 0 n]
-      (let [av (emit-expr g (al-at [Expr] args i))]
-        (push! (mut avs) av)
-        (push! (mut argtys) (av-ty av))))
-    (let [avsp (box-al [AVal] a (load avs))
-          argtysp (box-al [Type] a (load argtys))
-          (mut envp) (gscope-nil a)
-          irctx
-            (IrContext
-              :g g
-              :envp (primitive/cast (ptr (ptr GScope)) (mut envp))
-              :avsp avsp
-              :argtysp argtysp
-              :result result)
-          (mut retp) (mk-aval 0 0 (TInt 64 true))
-          (mut donep) false
-          blen (len body)
-          (mut pos) 0]
-      (loop (if (>= (load pos) blen)
-                (break)
-                (do
-                  (let [(mut eol) (load pos)]
-                    (loop (if (or (>= (load eol) blen)
-                                  (= (primitive/cast i64
-                                                     (get body
-                                                          (load eol)))
-                                     10))
-                              (break)
-                              (set! eol (primitive/iadd (load eol) 1))))
-                    (let [line (subslice body (load pos) (load eol))]
-                      (set! pos (primitive/iadd (load eol) 1))
-                      (unless (= (len line) 0)
-                        (if donep
-                            (cga-fail2 "llvm-ir: code after ret: " line)
-                            (emit-ir-line! irctx (mut retp) (mut donep) line)))))
-                  0)))
-      (unless donep (cga-fail "llvm-ir: body did not ret"))
-      retp)))
+  (let [frame (primitive/alloc-stack (IrContext Cga))]
+    (store! frame (IrContext :g g :inputs (zeroed native/IrInputs)))
+    (native/lower-ir! frame result args body)))
 
 ; per-lane float op over vector slots: op 0 add, 1 sub, 2 mul.
 (defn emit-vec-fbin! [(g (ptr Cga))
@@ -5196,13 +4873,13 @@
     0))
 
 ; one line of the inline-IR subset. Sets *donep and *retp on `ret`.
-(defn emit-ir-line! [(irctx (ref IrContext))
+(defn emit-ir-line! [(irctx (ptr (IrContext Cga)))
                      (retp (ptr AVal))
                      (donep (ptr bool))
                      (line (slice u8))] (-> i64)
   (let [g (.g irctx)
-        envp (.envp irctx)
-        result (.result irctx)]
+        envp (.envp (field irctx inputs))
+        result (.result (field irctx inputs))]
     (let [a (.a g)
           s (field g asm)
           toks (ir-tokens a line)
@@ -5733,14 +5410,14 @@
                                                                   (mut masktp))]
                                               (for [k 0 (extent-value lanes)]
                                                 (let [bav
-                                                        (ir-icmp-scalar! g
+                                                        (ir-icmp-scalar! irctx
                                                                          pred
-                                                                         (ir-lane-av g
+                                                                         (ir-lane-av irctx
                                                                                      lav
                                                                                      k
                                                                                      (load elemp)
                                                                                      lb)
-                                                                         (ir-lane-av g
+                                                                         (ir-lane-av irctx
                                                                                      rav
                                                                                      k
                                                                                      (load elemp)
@@ -5773,7 +5450,7 @@
                                     (_ (ir-bind! g
                                                  envp
                                                  t0
-                                                 (ir-icmp-scalar! g
+                                                 (ir-icmp-scalar! irctx
                                                                   pred
                                                                   lav
                                                                   rav)))))))
@@ -5797,14 +5474,14 @@
                                                                   (mut masktp))]
                                               (for [k 0 (extent-value lanes)]
                                                 (let [bav
-                                                        (ir-fcmp-scalar! g
+                                                        (ir-fcmp-scalar! irctx
                                                                          pred
-                                                                         (ir-lane-av g
+                                                                         (ir-lane-av irctx
                                                                                      lav
                                                                                      k
                                                                                      (load elemp)
                                                                                      lb)
-                                                                         (ir-lane-av g
+                                                                         (ir-lane-av irctx
                                                                                      rav
                                                                                      k
                                                                                      (load elemp)
@@ -5829,7 +5506,7 @@
                                     (_ (ir-bind! g
                                                  envp
                                                  t0
-                                                 (ir-fcmp-scalar! g
+                                                 (ir-fcmp-scalar! irctx
                                                                   pred
                                                                   lav
                                                                   rav)))))))
@@ -5864,17 +5541,17 @@
                                                 (for [k 0 (extent-value lanes)]
                                                   (let [rav
                                                           (ir-select-blend! g
-                                                                            (ir-lane-av g
+                                                                            (ir-lane-av irctx
                                                                                         condav
                                                                                         k
                                                                                         (TBool)
                                                                                         1)
-                                                                            (ir-lane-av g
+                                                                            (ir-lane-av irctx
                                                                                         aav
                                                                                         k
                                                                                         (load elemp)
                                                                                         lb)
-                                                                            (ir-lane-av g
+                                                                            (ir-lane-av irctx
                                                                                         bav
                                                                                         k
                                                                                         (load elemp)
@@ -5914,7 +5591,7 @@
                                   (ir-bind! g
                                             envp
                                             t0
-                                            (ir-extend-op! g
+                                            (ir-extend-op! irctx
                                                            srcty
                                                            srcav
                                                            dstty
@@ -5940,7 +5617,7 @@
                                   (ir-bind! g
                                             envp
                                             t0
-                                            (ir-floatconv! g
+                                            (ir-floatconv! irctx
                                                            srcty
                                                            srcav
                                                            dstty
@@ -5977,12 +5654,12 @@
                                                 (let [rlv
                                                         (emit-bin-av! g
                                                                       binop
-                                                                      (ir-lane-av g
+                                                                      (ir-lane-av irctx
                                                                                   lav
                                                                                   k
                                                                                   (load elemp)
                                                                                   lb)
-                                                                      (ir-lane-av g
+                                                                      (ir-lane-av irctx
                                                                                   rav
                                                                                   k
                                                                                   (load elemp)
@@ -6076,7 +5753,7 @@
                                               (av-to-x! g baseav 9)
                                               (for [k 0 (extent-value lanes)]
                                                 (av-to-x! g
-                                                          (ir-lane-av g
+                                                          (ir-lane-av irctx
                                                                       idxav
                                                                       k
                                                                       (load ielemp)
@@ -6130,14 +5807,14 @@
 ; A scalar float math intrinsic (src/compiler/backend/float_math.coil), `tokp` at the
 ; callee: `fsqrt`/`fabs`/`frint*`/`fmadd`/`fmin`/`fmax` where the ISA has the
 ; operation, otherwise a call to the libm function of the same meaning.
-(defn emit-ir-float-math! [(irctx (ref IrContext))
+(defn emit-ir-float-math! [(irctx (ptr (IrContext Cga)))
                            (toks (ptr (ArrayList (slice u8))))
                            (tokp (ptr i64))
                            (t0 (slice u8))
                            (rty Type)
                            (fi FloatIntrinsic)] (-> i64)
   (let [g (.g irctx)
-        envp (.envp irctx)]
+        envp (.envp (field irctx inputs))]
     (let [a (.a g)
           s (field g asm)
           fb (/ (.bits fi) 8)
@@ -6179,12 +5856,12 @@
         (ir-bind! g envp t0 (mk-aval 1 slot rty))))))
 
 ; intrinsic calls: @llvm.fma.v4f32 and @llvm.vector.reduce.fadd.v4f32
-(defn emit-ir-call! [(irctx (ref IrContext))
+(defn emit-ir-call! [(irctx (ptr (IrContext Cga)))
                      (toks (ptr (ArrayList (slice u8))))
                      (t0 (slice u8))
                      (line (slice u8))] (-> i64)
   (let [g (.g irctx)
-        envp (.envp irctx)]
+        envp (.envp (field irctx inputs))]
     (let [a (.a g)
           s (field g asm)
           (mut tokp) 3]
@@ -6428,7 +6105,7 @@
                                                                     (mut rtp))]
                                                 (for [k 0 (extent-value lanes)]
                                                   (av-to-x! g
-                                                            (ir-lane-av g
+                                                            (ir-lane-av irctx
                                                                         maskav
                                                                         k
                                                                         (TBool)
@@ -6442,7 +6119,7 @@
                                                                     9
                                                                     lfalse)
                                                     (av-to-x! g
-                                                              (ir-lane-av g
+                                                              (ir-lane-av irctx
                                                                           ptrsav
                                                                           k
                                                                           (TPtr (box-type a
@@ -7416,3 +7093,23 @@
         (push! (mut (.dwvars g))
                v)
         0))))
+
+(defn native-lowering-allocator [(g (ptr Cga))] (-> (dyn Allocator))
+  (.a g))
+
+(native/implement-lowering (IrContext Cga)
+                           [[lowering-inputs :inputs]
+                            [lowering-allocator native-lowering-allocator]
+                            [lowering-fail cga-fail :static]
+                            [lowering-fail2 cga-fail2 :static]
+                            [lowering-size ty-size]
+                            [lowering-type-slot slot-for-ty!]
+                            [lowering-value-slot av-slot!]
+                            [lowering-copy emit-copy!]
+                            [lowering-cast emit-cast-av!]
+                            [lowering-sext-bool ir-sext-bool!]
+                            [lowering-compare emit-cmp-av!]
+                            [lowering-zero emit-zero!]
+                            [lowering-store emit-store-av-at!]
+                            [lowering-expression emit-expr]
+                            [lowering-ir-line emit-ir-line! :frame]])

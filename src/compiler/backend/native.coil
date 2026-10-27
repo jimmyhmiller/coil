@@ -9,7 +9,9 @@
 (import "coil.str" :use *)
 (import "coil.slice" :use *)
 (import "coil.compiler.ast" :use *)
-(import "coil.compiler.parser" :use [const-overflow-test])
+(import "coil.compiler.parser" :use [const-overflow-test box-al])
+(import "coil.mem" :use [f64-bits])
+(import "coil.compiler.ir_syntax" :as irs)
 (import "coil.compiler.layoutdb" :use *)
 
 (deftrait ConstantErrors [Self]
@@ -329,3 +331,438 @@
             0))
     (TBool [] (do (set! bytesp 1) (set! signedp false) 0))
     (_ (do (set! bytesp 8) (set! signedp false) 0))))
+
+;;; A lowering invocation owns its SSA inputs and borrows a target machine.
+;;; The interface statically selects target operations without erasing the state.
+(deftrait NativeLowering [Self]
+  (lowering-inputs [(g (ptr Self))] (-> (ptr IrInputs)))
+  (lowering-allocator [(g (ptr Self))] (-> (dyn Allocator)))
+  (lowering-fail [(g (ptr Self)) (message (slice u8))] (-> i64))
+  (lowering-fail2 [(g (ptr Self)) (message (slice u8)) (what (slice u8))]
+    (-> i64))
+  (lowering-size [(g (ptr Self)) (t (ptr Type))] (-> i64))
+  (lowering-type-slot [(g (ptr Self)) (t (ptr Type))] (-> i64))
+  (lowering-value-slot [(g (ptr Self)) (av AVal)] (-> i64))
+  (lowering-copy [(g (ptr Self)) (dst i64) (src i64) (size i64)] (-> i64))
+  (lowering-cast [(g (ptr Self)) (t Type) (av AVal)] (-> AVal))
+  (lowering-sext-bool [(g (ptr Self)) (av AVal) (dstty Type)] (-> AVal))
+  (lowering-compare [(g (ptr Self)) (op i64) (lav AVal) (rav AVal)] (-> AVal))
+  (lowering-zero [(g (ptr Self)) (dst i64) (size i64)] (-> i64))
+  (lowering-store [(g (ptr Self)) (av AVal) (dst i64)] (-> i64))
+  (lowering-expression [(g (ptr Self)) (e (ptr Expr))] (-> AVal))
+  (lowering-ir-line [(irctx (ptr Self))
+                     (retp (ptr AVal))
+                     (donep (ptr bool))
+                     (line (slice u8))] (-> i64)))
+
+; The environment cell belongs to lower-ir!; sessions and input views are used
+; synchronously and must not escape that call.
+(defstruct IrInputs
+  [(envp (ptr (ptr GScope)))
+   (avsp (ptr (ArrayList AVal)))
+   (argtysp (ptr (ArrayList Type)))
+   (result Type)])
+
+(defstruct IrContext [G] [(g (ptr G)) (inputs IrInputs)])
+
+(defstruct NativeIrErrors [R] [(g (ptr R))])
+
+(impl [(R NativeLowering)] irs/IrErrors (NativeIrErrors R)
+  (ir-error [(self (NativeIrErrors R)) (message (slice u8)) (token (slice u8))]
+    (-> i64)
+    (lowering-fail2 (.g self) message token)))
+
+;;; A delegate forwards the machine pointer unless marked :frame or :static.
+;;; The :inputs getter exposes only this invocation's own SSA input storage.
+(defn implement-lowering [(target Code) (delegates Code)] (-> Code)
+  (let [methods (primitive/code-list-new)
+        count (primitive/code-trait-method-count `NativeLowering)]
+    (unless (primitive/icmp-eq (primitive/code-count delegates) count)
+      (primitive/error "implement-lowering: one delegate is required for each operation"))
+    (for [i 0 count]
+      (let [entry (primitive/code-nth delegates i)
+            name (primitive/code-trait-method-name `NativeLowering i)
+            params (primitive/code-list-new)
+            args (primitive/code-list-new)
+            arity (primitive/code-trait-arity `NativeLowering i)
+            mode
+              (if (primitive/icmp-eq (primitive/code-count entry) 3)
+                  (primitive/code-nth entry 2)
+                  `:machine)
+            receiver (primitive/fresh-identifier "receiver")]
+        (unless (and (primitive/code-vector? entry)
+                     (or (primitive/icmp-eq (primitive/code-count entry) 2)
+                         (primitive/icmp-eq (primitive/code-count entry) 3))
+                     (primitive/code-eq (primitive/code-nth entry 0) name)
+                     (or (primitive/code-eq mode `:machine)
+                         (primitive/code-eq mode `:static)
+                         (primitive/code-eq mode `:frame)))
+          (primitive/error "implement-lowering: invalid or out-of-order delegate"))
+        (for [j 0 arity]
+          (let [arg
+                  (if (primitive/icmp-eq j 0)
+                      receiver
+                      (primitive/fresh-identifier "argument"))
+                type
+                  (if (primitive/icmp-eq j 0)
+                      `(ptr ~target)
+                      (primitive/code-trait-param-type `NativeLowering i j))]
+            (primitive/code-list-push! params `(~arg ~type))
+            (unless (and (primitive/icmp-eq j 0)
+                         (primitive/code-eq mode `:static))
+              (primitive/code-list-push! args
+                                         (if (and (primitive/icmp-eq j 0)
+                                                  (primitive/code-eq mode
+                                                                     `:machine))
+                                             `(.g ~arg)
+                                             arg)))))
+        (primitive/code-list-push! methods
+                                   `(~name [~@(primitive/code-list-done params)]
+                                       (-> ~(primitive/code-trait-ret-type `NativeLowering
+                                                                           i))
+                                       ~(if (primitive/code-eq (primitive/code-nth entry
+                                                                                   1)
+                                                               `:inputs)
+                                            `(field ~receiver inputs)
+                                            `(~(primitive/code-nth entry 1) ~@(primitive/code-list-done args)))))))
+    `(impl NativeLowering ~target ~@(primitive/code-list-done methods))))
+
+; a "view" AVal onto lane k of a (vec elemty n) value already resident in a
+; slot: same frame, offset by k*lb. Reuses the scalar AVal-level ops (cmp/bin/
+; cast) unchanged, one lane at a time — the same scalarization convention as
+; `emit-vec-fbin!` below, generalized to every op that needs it.
+(defn ir-lane-av [(R NativeLowering)] [(g (ptr R))
+                                       (vecav AVal)
+                                       (k i64)
+                                       (elemty Type)
+                                       (lb i64)] (-> AVal)
+  (mk-aval 1
+           (primitive/iadd (lowering-value-slot g vecav) (primitive/imul k lb))
+           elemty))
+
+; reinterpret an AVal's type as unsigned, for llvm-ir ops (icmp ult/.../uitofp)
+; whose predicate/opcode carries signedness that ir-parse-type's tokens never
+; do (every parsed int type token is TInt _ true — see ir-parse-type above).
+(defn ir-as-unsigned [(av AVal)] (-> AVal)
+  (let [(mut t) (av-ty av)]
+    (match t
+      (TInt [bits _] (mk-aval (av-kind av) (av-v av) (TInt bits false)))
+      (_ av))))
+
+(defn ir-force-unsigned-ty [(t Type)] (-> Type)
+  (match t (TInt [bits _] (TInt bits false)) (_ t)))
+
+; scalar icmp: maps the llvm predicate onto emit-cmp-av!'s op codes (0 lt, 1
+; le, 2 gt, 3 ge, 4 eq, else ne), forcing the unsigned reading emit-cmp-av!
+; can't otherwise reach (it derives signedness from the operand TYPE, but
+; icmp's predicate carries it instead).
+(defn ir-icmp-scalar! [(R NativeLowering)] [(g (ptr R))
+                                            (pred (slice u8))
+                                            (lav AVal)
+                                            (rav AVal)]
+  (-> AVal)
+  (cond (= pred "eq") (lowering-compare g 4 lav rav)
+        (= pred "ne") (lowering-compare g 5 lav rav)
+        (= pred "slt") (lowering-compare g 0 lav rav)
+        (= pred "sle") (lowering-compare g 1 lav rav)
+        (= pred "sgt") (lowering-compare g 2 lav rav)
+        (= pred "sge") (lowering-compare g 3 lav rav)
+        (= pred "ult")
+          (lowering-compare g 0 (ir-as-unsigned lav) (ir-as-unsigned rav))
+        (= pred "ule")
+          (lowering-compare g 1 (ir-as-unsigned lav) (ir-as-unsigned rav))
+        (= pred "ugt")
+          (lowering-compare g 2 (ir-as-unsigned lav) (ir-as-unsigned rav))
+        (= pred "uge")
+          (lowering-compare g 3 (ir-as-unsigned lav) (ir-as-unsigned rav))
+        :else
+          (do
+            (lowering-fail2 g "llvm-ir: unsupported icmp predicate: " pred)
+            (mk-aval 0 0 (TBool)))))
+
+; scalar fcmp: maps the llvm predicate onto emit-cmp-av!'s float op codes (0
+; olt, 1 ole, 2 ogt, 3 oge, 4 oeq, 5 one). Only the ordered predicates are
+; supported — nothing in the corpus needs an unordered (u*) or ord/uno compare.
+(defn ir-fcmp-scalar! [(R NativeLowering)] [(g (ptr R))
+                                            (pred (slice u8))
+                                            (lav AVal)
+                                            (rav AVal)]
+  (-> AVal)
+  (cond (= pred "oeq") (lowering-compare g 4 lav rav)
+        (= pred "one") (lowering-compare g 5 lav rav)
+        (= pred "olt") (lowering-compare g 0 lav rav)
+        (= pred "ole") (lowering-compare g 1 lav rav)
+        (= pred "ogt") (lowering-compare g 2 lav rav)
+        (= pred "oge") (lowering-compare g 3 lav rav)
+        :else
+          (do
+            (lowering-fail2 g
+                            "llvm-ir: unsupported fcmp predicate (only ordered oeq/one/olt/ole/ogt/oge supported): "
+                            pred)
+            (mk-aval 0 0 (TBool)))))
+
+; shared core for sext/zext/trunc.
+; zext retypes the source unsigned; sext/trunc retain the parsed signed type.
+; The i1-to-integer 0/-1 case delegates to the target's boolean sign extension.
+(defn ir-extend-op! [(R NativeLowering)] [(g (ptr R))
+                                          (srcty Type)
+                                          (srcav0 AVal)
+                                          (dstty Type)
+                                          (zext bool)
+                                          (sext bool)] (-> AVal)
+  (match dstty
+    (TVec [delemp lanes]
+          (let [selemp (match srcty (TVec [e _] (load e)) (_ (load srcty)))
+                boolsrc (match selemp (TBool [] true) (_ false))
+                slb (lowering-size g (box-type (lowering-allocator g) selemp))
+                dlb (lowering-size g delemp)
+                (mut dtp) (: dstty Type)]
+            (let [dslot (lowering-type-slot g (mut dtp))]
+              (for [k 0 (extent-value lanes)]
+                (let [lelem0 (ir-lane-av g srcav0 k selemp slb)
+                      rav
+                        (cond (and sext boolsrc)
+                                (lowering-sext-bool g lelem0 (load delemp))
+                              zext
+                                (lowering-cast g
+                                               (load delemp)
+                                               (ir-as-unsigned lelem0))
+                              :else
+                                (lowering-cast g
+                                               (load delemp)
+                                               (load lelem0)))]
+                  (lowering-copy g
+                                 (primitive/iadd dslot
+                                                 (primitive/imul k
+                                                                 dlb))
+                                 (lowering-value-slot g rav)
+                                 dlb)))
+              (mk-aval 1 dslot dstty))))
+    (_ (let [boolsrc (match srcty (TBool [] true) (_ false))]
+         (cond (and sext boolsrc) (lowering-sext-bool g (load srcav0) dstty)
+               zext (lowering-cast g dstty (ir-as-unsigned srcav0))
+               :else (lowering-cast g dstty (load srcav0)))))))
+
+; shared core for fptosi/fptoui/sitofp/uitofp/fptrunc/fpext: also reuses
+; emit-cast-av!, overriding signedness the same way ir-extend-op! does
+; (uitofp forces the source unsigned; fptoui forces the destination unsigned).
+(defn ir-floatconv! [(R NativeLowering)] [(g (ptr R))
+                                          (srcty Type)
+                                          (srcav0 AVal)
+                                          (dstty0 Type)
+                                          (unsignedsrc bool)
+                                          (unsigneddst bool)] (-> AVal)
+  (match dstty0
+    (TVec [delemp0 lanes]
+          (let [selemp (match srcty (TVec [e _] (load e)) (_ (load srcty)))
+                slb (lowering-size g (box-type (lowering-allocator g) selemp))
+                delemty
+                  (if unsigneddst
+                      (ir-force-unsigned-ty (load delemp0))
+                      (load delemp0))
+                dlb (lowering-size g (box-type (lowering-allocator g) delemty))
+                (mut dtp)
+                  (fixed-vec (box-type (lowering-allocator g) delemty)
+                             (extent-value lanes))]
+            (let [dslot (lowering-type-slot g (mut dtp))]
+              (for [k 0 (extent-value lanes)]
+                (let [lelem0 (ir-lane-av g srcav0 k selemp slb)
+                      lelem
+                        (if unsignedsrc
+                            (ir-as-unsigned lelem0)
+                            (load lelem0))
+                      rav (lowering-cast g delemty lelem)]
+                  (lowering-copy g
+                                 (primitive/iadd dslot
+                                                 (primitive/imul k
+                                                                 dlb))
+                                 (lowering-value-slot g rav)
+                                 dlb)))
+              (mk-aval 1 dslot dtp))))
+    (_ (let [dstty (if unsigneddst (ir-force-unsigned-ty dstty0) (load dstty0))
+             srcav (if unsignedsrc (ir-as-unsigned srcav0) (load srcav0))]
+         (lowering-cast g dstty srcav)))))
+
+; resolve a VALUE token: %name (env), $N (arg), integer literal, undef/zeroinitializer.
+(defn ir-value [(R NativeLowering)] [(irctx (ptr R))
+                                     (env (ptr GScope))
+                                     (tk (slice u8))
+                                     (t Type)] (-> AVal)
+  (let [g irctx
+        avs (.avsp (lowering-inputs irctx))]
+    (let [(mut tp)
+            (: t
+               Type)]
+      (cond (= (primitive/cast i64 (get tk 0)) 37)  ; %
+              (match (gscope-get env tk)
+                (Some [av] av)
+                (None []
+                      (do
+                        (lowering-fail2 g "llvm-ir: undefined value " tk)
+                        (mk-aval 0 0 (TInt 64 true)))))
+            (= (primitive/cast i64 (get tk 0)) 36)  ; $N
+              (get (load avs)
+                   (irs/integer (NativeIrErrors :g g) (subslice tk 1 (len tk))))
+            (or (= tk "undef") (= tk "poison"))
+              (mk-aval 1
+                       (lowering-type-slot g
+                                           (mut tp))
+                       t)
+            ; fresh, uninitialized slot (poison is a stricter undef; a fresh
+            ; garbage slot is a valid choice for both here)
+            (= tk "zeroinitializer")
+              (let [slot
+                      (lowering-type-slot g
+                                          (mut tp))]
+                (lowering-zero g
+                               slot
+                               (lowering-size g
+                                              (mut tp)))
+                (mk-aval 1 slot t))
+            (= tk "true") (mk-aval 0 1 t)
+            ; i1 literal, e.g. inside a <...> mask
+            (= tk "false") (mk-aval 0 0 t)
+            (ty-is-float (mut tp))  ; float literal, e.g. `float 1.0` inside a <...> literal
+              ; kind-2 immediates are always f64-shaped, same as EFloat's own
+              ; ordinary AVal construction — narrowing to f32 (if needed) happens
+              ; the same way any other f64 kind-2 immediate narrows.
+              (mk-aval 2
+                       (f64-bits (irs/floating (NativeIrErrors :g g) tk))
+                       (TFloat 64))
+            :else  ; integer literal (also covers negative)
+              ; av-slot! sign-extends an immediate across a slot wider than 8 bytes
+              ; (the i128 marker type), so a literal needs no special case here.
+              (mk-aval 0 (irs/integer (NativeIrErrors :g g) tk) t)))))
+
+; an inline vector-constant literal: `< TY V0, TY V1, ... >`, tokp on entry
+; pointing at "<". Used pervasively as an operand throughout the corpus (icmp/
+; select/shl/or/fadd comparands and shuffle index masks) — always homogeneous,
+; always plain per-element literals (never %name/$N).
+(defn ir-lit-vec! [(R NativeLowering)] [(irctx (ptr R))
+                                        (toks (ptr (ArrayList (slice u8))))
+                                        (tokp (ptr i64))
+                                        (t Type)] (-> AVal)
+  (let [g irctx
+        envp (.envp (lowering-inputs irctx))]
+    (set! tokp (primitive/iadd (load tokp) 1))  ; skip "<"
+    (match t
+      (TVec [elemp lanes]
+            (let [lb (lowering-size g elemp)
+                  (mut tp)
+                    (: t
+                       Type)
+                  (mut k) 0]
+              (let [dslot
+                      (lowering-type-slot g
+                                          (mut tp))]
+                (loop (if (>= (load k) (extent-value lanes))
+                          (break)
+                          (do
+                            (let [ety (ir-parse-type irctx toks tokp)
+                                  eav0
+                                    (ir-value irctx
+                                              (load envp)
+                                              (get (load toks) (load tokp))
+                                              ety)
+                                  ; float literals always resolve as f64 kind-2
+                                  ; immediates (matching EFloat's own AVal
+                                  ; convention) — narrow to the element's actual
+                                  ; declared width/type before storing.
+                                  eav (lowering-cast g ety eav0)]
+                              (set! tokp (primitive/iadd (load tokp) 1))
+                              (lowering-store g
+                                              eav
+                                              (primitive/iadd dslot
+                                                              (primitive/imul (load k)
+                                                                              lb))))
+                            (set! k (primitive/iadd (load k) 1)))))
+                (set! tokp (primitive/iadd (load tokp) 1))
+                ; skip ">"
+                (mk-aval 1 dslot t))))
+      (_ (do
+           (lowering-fail g "llvm-ir: vector literal on non-vector type")
+           (mk-aval 0 0 t))))))
+
+; resolve a value token at the current stream position, advancing tokp past
+; it — either a single token (the common case, same as ir-value) or a whole
+; inline vector literal (ir-lit-vec!, several tokens). Every op below that
+; parses a VALUE (as opposed to a plain SSA-name binding target) uses this
+; instead of ir-value directly, so `<i32 1, i32 2, ...>`-shaped operands work
+; anywhere a %name/$N/undef/zeroinitializer/integer-literal would.
+(defn ir-value-adv! [(R NativeLowering)] [(irctx (ptr R))
+                                          (toks (ptr (ArrayList (slice u8))))
+                                          (tokp (ptr i64))
+                                          (t Type)] (-> AVal)
+  (let [envp (.envp (lowering-inputs irctx))]
+    (if (= (get (load toks) (load tokp)) "<")
+        (ir-lit-vec! irctx toks tokp t)
+        (let [av (ir-value irctx (load envp) (get (load toks) (load tokp)) t)]
+          (set! tokp (primitive/iadd (load tokp) 1))
+          av))))
+
+; parse an IR type token in the context of (result type, arg types).
+; tokp = index of the first token of the type; returns the Type and advances
+; *tokp past it. Handles $ret/$tN/i1/i8/i16/i32/i64/float/double/ptr and
+; "{ ... }" / "< N x T >" forms (mapped to synthetic Coil types).
+(defn ir-parse-type [(R NativeLowering)] [(irctx (ptr R))
+                                          (toks (ptr (ArrayList (slice u8))))
+                                          (tokp (ptr i64))] (-> Type)
+  (let [g irctx
+        result (.result (lowering-inputs irctx))
+        argtys (.argtysp (lowering-inputs irctx))]
+    (let [context
+            (irs/TypeContext
+              :allocator (lowering-allocator g)
+              :result result
+              :arguments argtys
+              :errors (NativeIrErrors :g g))]
+      (irs/read-type context toks tokp))))
+
+(defn lower-ir! [(R NativeLowering)] [(g (ptr R))
+                                      (result Type)
+                                      (args (ptr (ArrayList Expr)))
+                                      (body (slice u8))] (-> AVal)
+  (let [a (lowering-allocator g)
+        (mut avs) (ArrayList::new [AVal] a)
+        (mut argtys) (ArrayList::new [Type] a)
+        n (len (load args))]
+    (for [i 0 n]
+      (let [av (lowering-expression g (layout-at [Expr] args i))]
+        (push! (mut avs) av)
+        (push! (mut argtys) (av-ty av))))
+    (let [avsp (box-al [AVal] a (load avs))
+          argtysp (box-al [Type] a (load argtys))
+          (mut envp) (gscope-nil a)
+          irctx
+            (do
+              (store! (lowering-inputs g)
+                      (IrInputs
+                        :envp (primitive/cast (ptr (ptr GScope)) (mut envp))
+                        :avsp avsp
+                        :argtysp argtysp
+                        :result result))
+              g)
+          (mut retp) (mk-aval 0 0 (TInt 64 true))
+          (mut donep) false
+          blen (len body)
+          (mut pos) 0]
+      (loop (if (>= (load pos) blen)
+                (break)
+                (do
+                  (let [(mut eol) (load pos)]
+                    (loop (if (or (>= (load eol) blen)
+                                  (= (primitive/cast i64
+                                                     (get body
+                                                          (load eol)))
+                                     10))
+                              (break)
+                              (set! eol (primitive/iadd (load eol) 1))))
+                    (let [line (subslice body (load pos) (load eol))]
+                      (set! pos (primitive/iadd (load eol) 1))
+                      (unless (= (len line) 0)
+                        (if donep
+                            (lowering-fail2 g "llvm-ir: code after ret: " line)
+                            (lowering-ir-line irctx (mut retp) (mut donep) line)))))
+                  0)))
+      (unless donep (lowering-fail g "llvm-ir: body did not ret"))
+      retp)))
