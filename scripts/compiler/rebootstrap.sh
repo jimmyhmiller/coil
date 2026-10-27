@@ -36,12 +36,6 @@ SEED=bootstrap/seeds/native/coil-seed
 # ../coil-tpde/src is the tpde backend's package (Coil.toml [dependencies] tpde),
 # which explicit roots would otherwise leave out.
 export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts:../coil-tpde/src}"
-# In-repo, an import of a `coil.*` namespace that is missing from the bundled
-# stdlib manifest still resolves via the namespace scan above, so the build stays
-# green while the shipped compiler cannot serve it (this is how coil.socket,
-# coil.sync, coil.region, coil.signals and coil.cancellation went unreachable).
-# Strict mode makes that fallback a hard error during the bootstrap.
-export COIL_STRICT_BUNDLE="${COIL_STRICT_BUNDLE:-1}"
 # Stage compilers land in /tmp; give /tmp the toolchain library they resolve against.
 . scripts/compiler/stage-lib.sh
 

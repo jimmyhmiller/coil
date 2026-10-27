@@ -169,15 +169,9 @@ Use this format:
   `<prefix>/lib/coil/stdlib`, and a compiler finds its library by walking up from
   its own location (then from the working directory, which is why a stage compiler
   in `/tmp` still uses this checkout). Compilation reports where it searched if the library is missing; there is no
-  environment variable that redirects it. **Adding or renaming a
-  file here means regenerating the manifest:**
-  `python3 scripts/compiler/gen-stdlib-manifest.py`. The manifest in
-  `src/compiler/frontend/stdlib_manifest.coil` lists which modules are the library's; in-repo
-  a missing entry still resolves through the namespace scan, so nothing fails locally
-  and the namespace ships unreachable. COMPREHENSIVE's `installed/allns` step checks
-  it, and the build exports
-  `COIL_STRICT_BUNDLE=1` so the in-repo fallback is a hard error instead of a silent
-  success.
+  environment variable that redirects it. The library's modules are the `.coil`
+  files in that directory (`src/compiler/frontend/stdlib_manifest.coil` reads them);
+  nothing else lists them.
 - **Renaming a stdlib API?** Add rows to `API-RENAMES` in
   `src/compiler/migrate/api_renames.coil`, one per removed public name (its header gives
   the row format). That table is all there is to change: `coil lint --fix` then
@@ -185,8 +179,7 @@ Use this format:
   `src/compiler/migrate/api_migration.coil`), `coil build` in such a project points at it,
   and the resolver's errors name the replacement. Delete any `coil.lint.modernize`
   rule for a name you remove. Changing a library module's `:reexport` import
-  means rerunning `python3 scripts/compiler/gen-stdlib-manifest.py`, which
-  regenerates the table's `API-REEXPORTS` from the library's imports.
+  means changing its row in `API-REEXPORTS` beside it.
 - `src/examples/*.coil` — one idea each (`sums`, `hashmap`, `references`, `lisp`, …).
 - Dialects (Scheme, Brainfuck), applications (clox, CHIP-8, Space Invaders, Wasm),
   and research transforms (GC dialects, httptap) live in the separate

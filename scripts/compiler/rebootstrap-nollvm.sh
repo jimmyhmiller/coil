@@ -36,12 +36,6 @@ S1="$RUN_DIR/coil-nl1"; S2="$RUN_DIR/coil-nl2"
 # ../coil-tpde/src is the tpde backend's package (Coil.toml [dependencies] tpde),
 # which explicit roots would otherwise leave out.
 export COIL_NAMESPACE_ROOTS="${COIL_NAMESPACE_ROOTS:-src:tests:scripts:../coil-tpde/src}"
-# In-repo, an import of a `coil.*` namespace that is missing from the bundled
-# stdlib manifest still resolves via the namespace scan above, so the build stays
-# green while the shipped compiler cannot serve it (this is how coil.socket,
-# coil.sync, coil.region, coil.signals and coil.cancellation went unreachable).
-# Strict mode makes that fallback a hard error for the whole build and its gates.
-export COIL_STRICT_BUNDLE="${COIL_STRICT_BUNDLE:-1}"
 
 . scripts/compiler/select-stage0.sh
 # CI must never paper over a stale committed seed; see select_stage0.
