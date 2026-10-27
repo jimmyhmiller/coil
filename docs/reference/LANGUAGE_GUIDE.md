@@ -6,8 +6,7 @@ allocators, and a macro system that is ordinary Coil run at compile time. The
 compiler is written in Coil.
 
 Each section opens with a program you can run with `coil run FILE.coil`, followed
-by the output it prints. `scripts/docs/check-guide-examples.py` compiles and runs
-every complete program here; run it after you change an example.
+by the output it prints.
 
 ⚠ marks a trap. [Gotchas](#gotchas) collects them all.
 
@@ -15,11 +14,11 @@ Other references:
 
 | Topic | Where |
 |---|---|
-| Projects, `Coil.toml`, dependencies, workspaces | [PROJECTS.md](PROJECTS.md) · `coil guide project` |
-| `coil test`, property tests, fuzzing | [TESTING.md](TESTING.md) · `coil guide testing` |
-| Debug checks, sanitizers, debugging allocators | [DEBUGGING.md](DEBUGGING.md) · `coil guide debugging` |
-| The REPL and the in-process JIT | [STATEFUL_JIT.md](STATEFUL_JIT.md) · `coil guide jit` |
-| WebAssembly | [WASM.md](WASM.md) · `coil guide wasm` |
+| Projects, `Coil.toml`, dependencies, workspaces | [PROJECTS.md](PROJECTS.md) |
+| `coil test`, property tests, fuzzing | [TESTING.md](TESTING.md) |
+| Debug checks, sanitizers, debugging allocators | [DEBUGGING.md](DEBUGGING.md) |
+| The REPL and the in-process JIT | [STATEFUL_JIT.md](STATEFUL_JIT.md) |
+| WebAssembly | [WASM.md](WASM.md) |
 | Metaprogram details | [METAPROGRAMS.md](METAPROGRAMS.md) |
 | One namespace's API | `coil namespace coil.arraylist` |
 

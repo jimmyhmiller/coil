@@ -523,43 +523,6 @@ scope under the right local name, and the language's own vocabulary."
           (view-mode 1)))
       (pop-to-buffer buffer))))
 
-;;;###autoload
-(defun coil-guide (topic)
-  "Look up TOPIC in the compiler's own language guide (`coil guide')."
-  (interactive
-   (list (completing-read "Coil guide topic (empty for the cheatsheet): "
-                          (coil--guide-topics) nil nil
-                          (coil-symbol-at-point))))
-  (let* ((text (if (string-empty-p topic)
-                   (coil--run "cheatsheet")
-                 (or (coil--run "guide" topic)
-                     (coil--run "guide" "--search" topic))))
-         (buffer (get-buffer-create "*coil-guide*")))
-    (unless text (user-error "The guide had nothing for `%s'" topic))
-    (with-current-buffer buffer
-      (let ((inhibit-read-only t))
-        (erase-buffer)
-        (insert text)
-        (goto-char (point-min))
-        (view-mode 1)))
-    (pop-to-buffer buffer)))
-
-(defvar coil--guide-topics nil)
-
-(defun coil--guide-topics ()
-  "The guide's topic names, scraped from its own index."
-  (or coil--guide-topics
-      (setq coil--guide-topics
-            (let ((text (coil--run "guide")))
-              (when text
-                (let ((topics nil) (start 0))
-                  (while (string-match "^ +\\([a-z][a-z0-9-]+\\)\\(?: +\\|$\\)"
-                                       text start)
-                    (push (match-string 1 text) topics)
-                    (setq start (match-end 0)))
-                  (nreverse topics)))))))
-
-
 ;;; ---------------------------------------------------------------------------
 ;;; xref
 ;;;

@@ -2,8 +2,7 @@
 
 Coil is a typed, ahead-of-time compiled language with Lisp syntax. Forms are
 `(operation argument…)`, and the last expression of a body is its value.
-`coil guide TOPIC` prints one section of the language guide; `coil guide` lists
-the topics.
+[LANGUAGE_GUIDE.md](LANGUAGE_GUIDE.md) is the complete reference.
 
 ## Commands
 

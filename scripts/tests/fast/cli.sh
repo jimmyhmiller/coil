@@ -261,18 +261,6 @@ assert re.fullmatch(r"coil [^\s()]+(?: \(commit [0-9a-f]+, \d{4}-\d{2}-\d{2}(?:,
     expect_out "usage: coil $c" "$c --help documents itself" "$COIL" "$c" --help
   done
 
-  expect_out '^  tests[[:space:]]+deftest' "guide: no topic prints the topic index" "$COIL" guide
-  expect_out '^## Tests$' "guide: a topic prints its own section" "$COIL" guide tests
-  expect_out 'defstruct Point' "guide: a topic alias resolves" "$COIL" guide struct
-  expect_out 'zeroed T' "guide --search returns a contextual excerpt" "$COIL" guide --search zeroed
-  expect_rc_out 1 'Closest topics:' "guide: an unknown topic is an error with suggestions" "$COIL" guide testt
-  local all
-  all=$("$COIL" guide --all 2>&1)
-  case "$all" in
-    '# The Coil Language'*"## Gotchas"*) ok "guide --all prints the whole reference" ;;
-    *) bad "guide --all prints the whole reference" "$(head -3 <<<"$all")" ;;
-  esac
-
   mkdir -p "$T/docs"
   cat > "$T/docs/m.coil" <<'EOF'
 ;;; Points and arithmetic on them.

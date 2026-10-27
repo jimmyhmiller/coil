@@ -751,8 +751,6 @@ rewrite valid Coil into something that no longer reads."
     (define-key map (kbd "C-c C-d a")   #'coil-apropos)
     (define-key map (kbd "C-c C-d C-n") #'coil-doc-namespace)
     (define-key map (kbd "C-c C-d n")   #'coil-doc-namespace)
-    (define-key map (kbd "C-c C-d C-g") #'coil-guide)
-    (define-key map (kbd "C-c C-d g")   #'coil-guide)
 
     ;; Tests
     (define-key map (kbd "C-c C-t C-t") #'coil-test-run-at-point)
@@ -789,7 +787,6 @@ rewrite valid Coil into something that no longer reads."
     ["Documentation"         coil-doc-symbol]
     ["Apropos"               coil-apropos]
     ["Namespace"             coil-doc-namespace]
-    ["Language guide"        coil-guide]
     "--"
     ["Run test at point"     coil-test-run-at-point]
     ["Run file tests"        coil-test-run-file]
@@ -822,7 +819,6 @@ rewrite valid Coil into something that no longer reads."
 (autoload 'coil-doc-symbol "coil-doc" "Documentation for a name." t)
 (autoload 'coil-apropos "coil-doc" "Search definitions in scope." t)
 (autoload 'coil-doc-namespace "coil-doc" "Show a whole namespace." t)
-(autoload 'coil-guide "coil-doc" "Look a topic up in the language guide." t)
 (autoload 'coil-eldoc-function "coil-doc" "Eldoc for Coil.")
 (autoload 'coil-completion-at-point "coil-doc" "Completion for Coil.")
 (autoload 'coil-xref-backend "coil-doc" "The xref backend for Coil.")

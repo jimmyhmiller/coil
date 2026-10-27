@@ -49,7 +49,6 @@ needs that many, so eval-region sits on `C-c C-x` instead.
 | `C-c C-d C-d` | documentation for the name at point |
 | `C-c C-d C-a` | apropos across everything in scope |
 | `C-c C-d C-n` | show a whole namespace |
-| `C-c C-d C-g` | look a topic up in `coil guide` |
 | `C-c C-t C-t` | run the test point is inside |
 | `C-c C-t C-n` | run every test in this file |
 | `C-c C-t C-p` | run the project's test suites |

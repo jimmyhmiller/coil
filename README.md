@@ -166,21 +166,9 @@ in its function parameters, keeping dependencies visible and replaceable.
 
 ## Learn the language
 
-Start with the short [`docs/reference/CHEATSHEET.md`](docs/reference/CHEATSHEET.md):
-
-```sh
-coil cheatsheet
-```
-
-The complete reference is available in
-[`docs/reference/LANGUAGE_GUIDE.md`](docs/reference/LANGUAGE_GUIDE.md):
-
-```sh
-coil guide --all
-```
-
-Run `coil guide` for the compact topic index, or `coil guide <topic>` for a
-focused section.
+Start with the short [`docs/reference/CHEATSHEET.md`](docs/reference/CHEATSHEET.md).
+The complete reference is
+[`docs/reference/LANGUAGE_GUIDE.md`](docs/reference/LANGUAGE_GUIDE.md).
 
 Focused programs in [`src/examples`](src/examples) demonstrate features such as
 sum types, traits, generics, macros, allocators, layouts, closures, C interop,
