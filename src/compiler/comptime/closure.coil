@@ -1,0 +1,1255 @@
+; src/compiler/comptime/closure.coil — self-host Coil compiler: which functions, impls and externs a metaprogram's sub-program needs, and that
+; sub-program (the closure of its generator over the program it runs in).
+
+(module coil.compiler.closure)
+(import "coil.primitive" :as primitive)
+(import "coil.compiler.unit_state" :use *)
+(import "coil.compiler.ffi" :as ffi)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.mem" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+
+(import "coil.io" :use *)
+(import "coil.control" :use *)
+(import "coil.try" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.compiler.mtrace" :use *)
+(import "coil.compiler.trace" :as tr)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.codeop" :use *)
+(import "coil.compiler.program_query" :as pq)
+(import "coil.compiler.ctval" :use *)  ; CtVal / EnvBind / CtCtx — the value model, now on its own
+
+(import "coil.compiler.check" :use *)
+(import "coil.compiler.expander" :use *)
+(import "coil.compiler.loader" :use *)
+(import "coil.compiler.diag" :as diag)  ; locate-source: line/col by the source's line-start table
+(import "coil.compiler.parser" :use *)
+(import "coil.reader" :use *)
+(import "coil.compiler.resolve" :use *)
+(import "coil.cc" :as cc)
+(import "coil.compiler.comptime" :use *)
+
+;;; The names a call may be resolved against: the program's functions, its impl
+;;; method heads and its externs. It is asked one question -- is this callee one of
+;;; them -- once per call site in every body a closure reaches, so it answers from an
+;;; index. As a bare list scanned per question, that was the largest single cost of
+;;; keeping a retained session current: every edit re-asks it of the whole program.
+;;;
+;;; `index` maps each name to where the first function of that name sits in the
+;;; function list the set was built from, or to -1 for a name that is not a function
+;;; there (a method head, an extern). `fn-names-func` answers from it.
+(defstruct FnNames
+  [(items (ArrayList (slice u8)))
+   (index (HashMap (slice u8) i64))
+   ; The program the positions refer to and how many functions it had. A set is
+   ; built for one closure computation, over a program nothing changes meanwhile;
+   ; the count catches a set that outlived that, and the scan then answers.
+   (program (ptr Program))
+   (functions i64)])
+
+(defn fn-names-new [(a (dyn Allocator))] (-> (ptr FnNames))
+  (box! a
+        FnNames
+        (FnNames :items (ArrayList::new [(slice u8)] a)
+                 :index (HashMap::new [(slice u8) i64] a (keyops-borrowed))
+                 :program (primitive/cast (ptr Program) 0)
+                 :functions 0)))
+
+;;; Add `name`, which must outlive the set: its bytes are not copied. `position` is
+;;; its place in the function list, or -1. The first position recorded for a name
+;;; stands, as the first function of a name is the one a lookup finds.
+(defn fn-names-add! [(names (ptr FnNames)) (name (slice u8)) (position i64)] (-> i64)
+  (push! (mut (.items names)) name)
+  (unless (contains? (.index names) name)
+    (set! (mut (.index names)) name position)
+    0)
+  0)
+
+(defn fn-names-has? [(names (ptr FnNames)) (name (slice u8))] (-> bool)
+  (or (contains? (.index names) name)
+      (match (closure-base-func name) (Some [_] true) (None [] false))))
+
+;;; The first function named `name` in `p`, or null: what `prog-fn-find` answers,
+;;; from the index when `names` was built from `p` as it now stands, and from the
+;;; scan otherwise.
+(defn fn-names-func [(names (ptr FnNames)) (p (ptr Program)) (name (slice u8))] (-> (ptr Func))
+  (let [found (fn-names-func-local names p name)]
+    (if (!= (primitive/cast i64 found) 0)
+        found
+        (match (closure-base-func name)
+          (Some [function] function)
+          (None [] (primitive/cast (ptr Func) 0))))))
+
+(defn fn-names-func-local [(names (ptr FnNames)) (p (ptr Program)) (name (slice u8))] (-> (ptr Func))
+  (let [fs (load (field p funcs))]
+    (if (and (= (.program names) p) (= (.functions names) (len (load fs))))
+        (match (get (.index names) name)
+          (None [] (primitive/cast (ptr Func) 0))
+          (Some [position]
+                (if (< position 0)
+                    (primitive/cast (ptr Func) 0)
+                    (let [candidate (elem fs position)]
+                      (if (= (.name candidate) name)
+                          candidate
+                          (prog-fn-find p name))))))
+        (prog-fn-find p name))))
+
+(defn cc-push! [(out (ptr SBox))
+                (names (ptr FnNames))
+                (func (slice u8))] (-> i64)
+  (when (fn-names-has? names func) (push! (mut (field out items)) func) 0))
+
+;;; Record the trait-method heads a call may select. A known function is direct
+;;; evidence for impls of its name. `Trait::method`, and a callable value called as
+;;; `(f x)` (which is `Callable::call`), name no function. They are recorded as
+;;; `Trait::method` and retain only structural impls such as Callable on a function
+;;; pointer, whose receiver has no owning module to establish reachability.
+(defn cc-push-trait-head! [(heads (ptr SBox))
+                           (names (ptr FnNames))
+                           (func (slice u8))] (-> i64)
+  (cond (fn-names-has? names func) (push! (mut (field heads items)) func)
+        (some? (find func "::")) (push! (mut (field heads items)) func)
+        :else
+          ; Neither a function nor `Owner::method`: a local callable value, or a
+          ; method of an inherent impl such as `(get cell)` on a `Var`. The checker
+          ; decides which; keep both candidate families.
+          (do (push! (mut (field heads items)) func)
+              (push! (mut (field heads items)) "Callable::call")))
+  0)
+
+(defn cc-list [(es (ptr (ArrayList Expr)))
+               (names (ptr FnNames))
+               (out (ptr SBox))
+               (trait-heads (ptr SBox))] (-> i64)
+  (let [n (len (load es))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (collect-calls (elem es (load i))
+                               names
+                               out
+                               trait-heads)
+                (set! i (primitive/iadd (load i) 1))))))
+  0)
+
+(defn cc-opt [(o (Option (ptr Expr)))
+              (names (ptr FnNames))
+              (out (ptr SBox))
+              (trait-heads (ptr SBox))] (-> i64)
+  (match o (Some [e] (collect-calls e names out trait-heads)) (None [] 0)))
+
+(defn cc-binds [(bs (ptr (ArrayList Bind)))
+                (names (ptr FnNames))
+                (out (ptr SBox))
+                (trait-heads (ptr SBox))] (-> i64)
+  (let [n (len (load bs))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (collect-calls (field (elem bs (load i)) value)
+                               names
+                               out
+                               trait-heads)
+                (set! i (primitive/iadd (load i) 1))))))
+  0)
+
+(defn cc-arms [(as (ptr (ArrayList Arm)))
+               (names (ptr FnNames))
+               (out (ptr SBox))
+               (trait-heads (ptr SBox))] (-> i64)
+  (let [n (len (load as))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (collect-calls (field (elem as (load i)) body)
+                               names
+                               out
+                               trait-heads)
+                (set! i (primitive/iadd (load i) 1))))))
+  0)
+
+(defn cc-quasi-list [(items (ptr (ArrayList Quasi)))
+                     (names (ptr FnNames))
+                     (out (ptr SBox))
+                     (trait-heads (ptr SBox))] (-> i64)
+  (let [n (len (load items))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (cc-quasi (elem items (load i))
+                          names
+                          out
+                          trait-heads)
+                (set! i (primitive/iadd (load i) 1))))))
+  0)
+
+(defn cc-quasi [(q (ptr Quasi))
+                (names (ptr FnNames))
+                (out (ptr SBox))
+                (trait-heads (ptr SBox))] (-> i64)
+  (match (load q)
+    (QUnquote [e] (collect-calls e names out trait-heads))
+    (QSplice [e] (collect-calls e names out trait-heads))
+    (QList [items] (cc-quasi-list items names out trait-heads))
+    (QVector [items] (cc-quasi-list items names out trait-heads))
+    (_ 0)))
+
+(defn collect-calls [(e (ptr Expr))
+                     (names (ptr FnNames))
+                     (out (ptr SBox))
+                     (trait-heads (ptr SBox))] (-> i64)
+  (match (.kind e)
+    (ECall [func ta args]
+           (do
+             (cc-push! out names func)
+             ; Ordinary calls can still name trait-method functions before the
+             ; checker rewrites them to ETraitCall (notably Code-returning macros).
+             ; Record them as impl-selection evidence; EMakeDyn deliberately does
+             ; not, because its method list is only a concrete vtable reference.
+             (when (!= (primitive/cast i64 trait-heads) 0)
+               (cc-push-trait-head! trait-heads names func))
+             (cc-list args names out trait-heads)))
+    ; A function reached ONLY through `fnptr-of` is just as reachable as one that is
+    ; called: `malloc-allocator` builds its vtable with (primitive/fnptr-of ma-alloc) and never
+    ; calls ma-alloc directly. Missing this leaves the target out of the comptime
+    ; sub-program and checking it fails with "fnptr-of unknown function".
+    ; `(Type :field value …)` before checking lowers it. Its head is a constructor
+    ; (or a named-argument function call) and its arguments are ordinary
+    ; expressions that may call anything.
+    (ENamedCall [func ta names-list args]
+                (do
+                  (cc-push! out names func)
+                  (when (!= (primitive/cast i64 trait-heads) 0)
+                    (cc-push-trait-head! trait-heads names func))
+                  (cc-list args names out trait-heads)))
+    (EFnPtrOf [name] (cc-push! out names name))
+    (EFnPtrInst [name _] (cc-push! out names name))
+    (EAlloc [_ _ init _]
+      (unless (= (primitive/cast i64 init) 0)
+        (collect-calls init names out trait-heads) 0))
+    (EBorrow [m place] (collect-calls place names out trait-heads))
+    (ESpillRef [x] (collect-calls x names out trait-heads))
+    (EIntUnary [_ x] (collect-calls x names out trait-heads))
+    (ELoad [x] (collect-calls x names out trait-heads))
+    (EFree [x] (collect-calls x names out trait-heads))
+    (EComptime [x] (collect-calls x names out trait-heads))
+    (EErase [tn inner] (collect-calls inner names out trait-heads))
+    ; Vtable entries are function-pointer references just like EFnPtrOf. A
+    ; closure that keeps the constructor must keep every method it installs;
+    ; otherwise native emission sees the EMakeDyn but not its relocated symbols.
+    (EMakeDyn [ds vs ms inner]
+              (do
+                (for [i 0 (len (load ms))]
+                  (cc-push! out names (get (load ms) i)))
+                (collect-calls inner names out trait-heads)))
+    (EDynDispatch [dc] (let [ds (.dyn_struct dc) vs (.vtable_struct dc) mi (.method_index dc) cc (.cc dc) ps (.params dc) r (.ret dc) recv (.recv dc) args (.args dc)]
+                  (do
+                    (collect-calls recv names out trait-heads)
+                    (cc-list args names out trait-heads))))
+    (ECast [ty x] (collect-calls x names out trait-heads))
+    (EAscribe [ty x] (collect-calls x names out trait-heads))
+    (EPattern [pattern-op ty x pattern-index]
+              (do
+                ; Checking selects Code or slice helpers after the staging closure has
+                ; been discovered. Keep both candidate edges until that selection.
+                (when (or (= pattern-op 0) (= pattern-op 4))
+                  (cc-push! out names "coil.binding.runtime.check-struct"))
+                (when (= pattern-op 5)
+                  (cc-push! out names "coil.binding.runtime.match-fail"))
+                (when (and (> pattern-op 0) (< pattern-op 4))
+                  (cc-push! out
+                            names
+                            (cond (= pattern-op 1)
+                                    "coil.binding.runtime.require-code"
+                                  (= pattern-op 2)
+                                    "coil.binding.runtime.code-nth"
+                                  :else "coil.binding.runtime.code-rest"))
+                  (cc-push! out
+                            names
+                            (cond (= pattern-op 1)
+                                    "coil.binding.runtime.require-slice"
+                                  (= pattern-op 2)
+                                    "coil.binding.runtime.slice-nth"
+                                  :else "coil.binding.runtime.slice-rest")))
+                (collect-calls x names out trait-heads)))
+    (EBin [op l r]
+          (do
+            (collect-calls l names out trait-heads)
+            (collect-calls r names out trait-heads)))
+    (ECmp [op l r]
+          (do
+            (collect-calls l names out trait-heads)
+            (collect-calls r names out trait-heads)))
+    (EIf [c t el]
+         (do
+           (collect-calls c names out trait-heads)
+           (collect-calls t names out trait-heads)
+           (collect-calls el names out trait-heads)))
+    (EDo [es] (cc-list es names out trait-heads))
+    (EDefer [c es]
+            (do
+              (collect-calls c names out trait-heads)
+              (cc-list es names out trait-heads)))
+    ; Ownership elaboration's output calls functions too: drop glue and the
+    ; cleanups of defers.
+    (ECleanup [body cleanups]
+              (do
+                (collect-calls body names out trait-heads)
+                (cc-list cleanups names out trait-heads)))
+    (EMovePlace [x] (collect-calls x names out trait-heads))
+    (EMakeSlice [data _ _] (collect-calls data names out trait-heads))
+    (EArrayLit [es] (cc-list es names out trait-heads))
+    (EStaticArray [_ es] (cc-list es names out trait-heads))
+    (ELoop [lbl es] (cc-list es names out trait-heads))
+    (EBreak [lbl v] (cc-opt v names out trait-heads))
+    (ELet [bs body]
+          (do
+            (cc-binds bs names out trait-heads)
+            (cc-list body names out trait-heads)))
+    (EField [p fn] (collect-calls p names out trait-heads))
+    (EAccessorField [p fn] (collect-calls p names out trait-heads))
+    (EBitGet [p fn] (collect-calls p names out trait-heads))
+    (EStore [p v]
+            (do
+              (collect-calls p names out trait-heads)
+              (collect-calls v names out trait-heads)))
+    (EInitStore [p v]
+                (do
+                  (collect-calls p names out trait-heads)
+                  (collect-calls v names out trait-heads)))
+    (EIndex [p idx]
+            (do
+              (collect-calls p names out trait-heads)
+              (collect-calls idx names out trait-heads)))
+    (EBitSet [p fn v]
+             (do
+               (collect-calls p names out trait-heads)
+               (collect-calls v names out trait-heads)))
+    (EConstruct [sm vr args] (cc-list args names out trait-heads))
+    (ECodeOp [op args] (cc-list args names out trait-heads))
+    ; Generic trait calls are resolved only after closure selection, in mono. Keep
+    ; the method head reachable here so closure-impl-wanted? retains the candidate
+    ; impl and metalower can give its erased Code receiver a dispatchable name.
+    (ETraitCall [tn m stp args]
+                (do
+                  (cc-push! out names m)
+                  (when (!= (primitive/cast i64 trait-heads) 0)
+                    (cc-push! trait-heads names m))
+                  (cc-list args names out trait-heads)))
+    (ELlvmIr [r args body] (cc-list args names out trait-heads))
+    (EIntrinsic [_ _ args] (cc-list args names out trait-heads))
+    (EVector [_ _ _ args] (cc-list args names out trait-heads))
+    (ECallPtr [fp args]
+              (do
+                (collect-calls fp names out trait-heads)
+                (cc-list args names out trait-heads)))
+    (EMatch [scrut arms]
+            (do
+              (collect-calls scrut names out trait-heads)
+              (cc-arms arms names out trait-heads)))
+    (EFieldMeta [meta ty idx] (collect-calls idx names out trait-heads))
+    (EFieldIndex [ty nm] (collect-calls nm names out trait-heads))
+    (EQuasi [q]
+            (let [qp (primitive/alloc-stack Quasi)]
+              (set! qp q)
+              (cc-quasi qp names out trait-heads)))
+    ; A source anonymous function (a constant's value, before the check lifts
+    ; it) calls what its body calls.
+    (EAnonFn [_ body] (cc-list body names out trait-heads))
+    (_ 0)))
+
+(defn prog-fn-names [(p (ptr Program)) (a (dyn Allocator))] (-> (ptr FnNames))
+  (let [fs (load (field p funcs))
+        n (len (load fs))
+        out (fn-names-new a)
+        (mut i) 0]
+    (set! (.program out) p)
+    (set! (.functions out) n)
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (fn-names-add! out (.name (elem fs (load i))) (load i))
+                (set! i (primitive/iadd (load i) 1)))))
+    ; Keep method heads in the call-name universe too. They have no ordinary
+    ; Func entry yet, but seeing one in a reachable body tells closure selection
+    ; which structural/primitive impl families can actually dispatch.
+    (let [is (load (field p impls))
+          ni (len (load is))
+          (mut ii) 0]
+      (loop (if (>= (load ii) ni)
+                (break)
+                (do
+                  (let [ip (elem is (load ii))
+                        ms (load (field ip methods))
+                        nm (len (load ms))
+                        (mut mi) 0]
+                    (loop (if (>= (load mi) nm)
+                              (break)
+                              (do
+                                ; This list is queried only for membership. A
+                                ; duplicate does not change its meaning, while
+                                ; probing the growing function list here made
+                                ; construction quadratic in methods x functions.
+                                (let [method-name
+                                        (.name (elem ms (load mi)))]
+                                  (fn-names-add! out method-name -1)
+                                  ; A resolved call uses the lexical module of
+                                  ; the trait method (`coil.fmt.display-fmt`),
+                                  ; while an unchecked ImplDef still stores only
+                                  ; its declaration label (`display-fmt`). Keep
+                                  ; both spellings in the membership universe so
+                                  ; collect-calls does not discard the call before
+                                  ; trait-family normalization can see it.
+                                  (when (impl-is-trait ip)
+                                    (let [tm
+                                            (before-last-dot (impl-trait-name ip))]
+                                      (when (> (len tm) 0)
+                                        (fn-names-add! out
+                                                       (sconcat3 a tm "." method-name)
+                                                       -1)))))
+                                (set! mi (primitive/iadd (load mi) 1))))))
+                  (set! ii (primitive/iadd (load ii) 1))))))
+    ; Externs participate in reachability too. Closure sub-programs used to retain
+    ; every extern in the application, and the in-memory object builder consequently
+    ; emitted every one as an undefined symbol even when the selected macro never
+    ; referenced it.
+    (let [es (load (field p externs))
+          ne (len (load es))
+          (mut ei) 0]
+      (loop (if (>= (load ei) ne)
+                (break)
+                (do
+                  (fn-names-add! out (.name (elem es (load ei))) -1)
+                  (set! ei (primitive/iadd (load ei) 1))))))
+    ; Constructing a struct or sum value makes its type, and so its module,
+    ; reachable: a macro that builds a `Cell` and calls its inherent methods needs
+    ; that module's impls even though it calls no function defined there.
+    (for i (range 0 (len (load (field p structs))))
+      (fn-names-add! out (.name (elem (load (field p structs)) i)) -1))
+    (for i (range 0 (len (load (field p sums))))
+      (fn-names-add! out (.name (elem (load (field p sums)) i)) -1))
+    out))
+
+;;; The function lists `prog-fn-find` indexed last, each by its program, buffer
+;;; and length: the expander asks for a macro's function at every expansion, and
+;;; a scan of every function per call was quadratic in a program's macro calls.
+;;; The tower asks of several programs in turn (the whole program, a closure, a
+;;; probe), so a few are kept; the least recently built one makes room. A list
+;;; that grew, moved or belongs to another program is indexed afresh, and every
+;;; answer is checked against the function it names.
+(defstruct ProgFnIndex
+  [(ready bool)
+   (program i64)
+   (buf i64)
+   (count i64)
+   (first (HashMap (slice u8) i64))])
+
+(defstruct ProgFnIndexes [(slots (array ProgFnIndex 8)) (next i64)])
+
+(defn prog-fn-indexes [] (-> (ptr ProgFnIndexes))
+  (primitive/alloc-static ProgFnIndexes))
+
+(defn prog-fn-index-for [(p (ptr Program)) (fs (ptr (ArrayList Func)))] (-> (ptr ProgFnIndex))
+  (let [ixs (prog-fn-indexes)
+        n (len (load fs))
+        slots (primitive/cast (ptr ProgFnIndex) (field ixs slots))]
+    (block :found
+      (for [k 0 8]
+        (let [ix (primitive/index slots k)]
+          (when (and (.ready ix)
+                     (and (= (.program ix) (primitive/cast i64 p))
+                          (and (= (.buf ix) (primitive/cast i64 (.data fs)))
+                               (= (.count ix) n))))
+            (break :found ix))))
+      (let [ix (primitive/index slots (.next ixs))]
+        (set! (.next ixs) (% (+ (.next ixs) 1) 8))
+        (if (.ready ix)
+            (clear! (mut (.first ix)))
+            (do (set! (.first ix) (HashMap::new [(slice u8) i64] (malloc-allocator) (keyops)))
+                (set! (.ready ix) true)))
+        (for [i 0 n]
+          ; the first function of a name answers, as the scan's did
+          (unless (contains? (.first ix) (.name (elem fs i)))
+            (set! (mut (.first ix)) (.name (elem fs i)) i)
+            0))
+        (set! (.program ix) (primitive/cast i64 p))
+        (set! (.buf ix) (primitive/cast i64 (.data fs)))
+        (set! (.count ix) n)
+        ix))))
+
+(defn prog-fn-find [(p (ptr Program)) (name (slice u8))] (-> (ptr Func))
+  (let [fs (load (field p funcs))
+        n (len (load fs))]
+    (if (< n 32)
+        (prog-fn-scan fs name)
+        (let [ix (prog-fn-index-for p fs)]
+          (match (get (.first ix) name)
+            (Some [i]
+              (if (and (< i n) (= (.name (elem fs i)) name))
+                  (elem fs i)
+                  ; renamed in place: answer by scanning, as before
+                  (prog-fn-scan fs name)))
+            ; a program built where an indexed one lived can have its buffer and
+            ; length: a miss is checked, and a function the index lacks rebuilds it
+            (None []
+              (let [found (prog-fn-scan fs name)]
+                (unless (= (primitive/cast i64 found) 0)
+                  (set! (.count ix) -1)
+                  0)
+                found)))))))
+
+(defn prog-fn-scan [(fs (ptr (ArrayList Func))) (name (slice u8))] (-> (ptr Func))
+  (block :found
+    (for [i 0 (len (load fs))]
+      (when (= (.name (elem fs i)) name) (break :found (elem fs i))))
+    (primitive/cast (ptr Func) 0)))
+
+(defn closure-trait-head-key [(a (dyn Allocator)) (head (slice u8))] (-> (slice u8))
+  ; Calls have already been qualified when collect-calls sees them, while methods
+  ; inside a still-unchecked ImplDef retain their declaration's simple name. Trait
+  ; identity disambiguates equal method names during checking; closure reachability
+  ; only needs to retain the candidate family, so compare the shared simple head.
+  ; An `Owner::method` head keeps its owner, reduced to its simple name so that
+  ; `coil.var.Var::new`, `var/Var::new` and `Var::new` are one head. A head a
+  ; macro template wrote carries its hygienic scope (`$scope7@coil.hashmap$valid?`),
+  ; which is not part of the name.
+  (let [name (scoped-ident-raw head)]
+    (match (find name "::")
+      (Some [at]
+        (sconcat3 a
+                  "$trait-head$"
+                  (after-last-qualifier (subslice [u8] name 0 at))
+                  (subslice [u8] name at (len name))))
+      (None [] (sconcat a "$trait-head$" (after-last-dot name))))))
+
+;;; The wanted set of a closure calculation: the ordered names it returns, plus
+;;; hash indexes of those names and their modules, so membership stays constant
+;;; time as the closure grows to a whole program.
+(defstruct ClosureWanted [(names (HashMap (slice u8) i64)) (modules (HashMap (slice u8) i64))
+                          (heads-done i64)])
+
+(defn closure-wanted-new [(a (dyn Allocator))] (-> (ptr ClosureWanted))
+  (let [w (box! a ClosureWanted (primitive/zeroed ClosureWanted))]
+    (set! (.names w) (HashMap::new [(slice u8) i64] a (keyops-borrowed)))
+    (set! (.modules w) (HashMap::new [(slice u8) i64] a (keyops-borrowed)))
+    w))
+
+(defn closure-wanted? [(index (ptr ClosureWanted)) (name (slice u8))] (-> bool)
+  (contains? (.names index) name))
+
+(defn closure-want! [(wanted (ptr SBox)) (index (ptr ClosureWanted)) (name (slice u8))] (-> i64)
+  (unless (closure-wanted? index name)
+    (set! (mut (.names index)) name 1)
+    (set! (mut (.modules index)) (before-last-dot name) 1)
+    (push! (mut (field wanted items)) name)
+    0)
+  0)
+
+(defn closure-mark-trait-heads! [(a (dyn Allocator))
+                                 (wanted (ptr SBox))
+                                 (trait-heads (ptr SBox))
+                                 (index (ptr ClosureWanted))] (-> i64)
+  (for [i (.heads-done index) (len (.items trait-heads))]
+    (closure-want! wanted index (closure-trait-head-key a (get (.items trait-heads) i))))
+  (set! (.heads-done index) (len (.items trait-heads)))
+  0)
+
+(defn closure-impl-key [(a (dyn Allocator)) (ip (ptr ImplDef))] (-> (slice u8))
+  (sconcat3 a
+            "$impl$"
+            (impl-base-name a (field ip self_type))
+            (sconcat a
+                     "$"
+                     (if (impl-is-trait ip) (impl-trait-name ip) "$inherent"))))
+
+;;; The wanted-set entry of method NAME of inherent impl IP, once it is retained.
+(defn closure-method-key [(a (dyn Allocator)) (ip (ptr ImplDef)) (name (slice u8))] (-> (slice u8))
+  (sconcat a "$kept$" (inherent-fn-name a ip name)))
+
+;;; Is method NAME of impl IP called: by its simple head, or as `Owner::NAME`?
+(defn closure-method-wanted? [(a (dyn Allocator))
+                              (index (ptr ClosureWanted))
+                              (ip (ptr ImplDef))
+                              (name (slice u8))] (-> bool)
+  (or (closure-wanted? index (closure-trait-head-key a name))
+      (closure-wanted? index
+                       (closure-trait-head-key a
+                                               (sconcat3 a
+                                                         (after-last-qualifier (impl-base-name a (field ip self_type)))
+                                                         "::"
+                                                         (after-last-dot name))))))
+
+;;; WANTED as a set, for the per-impl and per-method lookups of a sub-program.
+(defn closure-name-set [(a (dyn Allocator)) (wanted (ptr (ArrayList (slice u8))))] (-> (ptr (HashMap (slice u8) i64)))
+  (let [(mut set) (HashMap::new [(slice u8) i64] a (keyops-borrowed))]
+    (for name (iter (load wanted)) (set! (mut set) name 1))
+    (box! a (HashMap (slice u8) i64) (load set))))
+
+;;; Impl IP as a sub-program keeps it, or null when it keeps none of it. A trait
+;;; impl is kept whole. An inherent impl's methods are independent functions, so it
+;;; keeps the ones the closure retained (see closure-retain-methods!): one called method
+;;; of a large impl does not bring every other method and all they call.
+(defn closure-impl-kept [(a (dyn Allocator))
+                         (wanted (ptr (HashMap (slice u8) i64)))
+                         (ip (ptr ImplDef))] (-> (ptr ImplDef))
+  (cond (not (contains? (load wanted) (closure-impl-key a ip))) (primitive/cast (ptr ImplDef) 0)
+        (impl-is-trait ip) ip
+        :else
+          (let [(mut methods) (ArrayList::new [Func] a)]
+            (for method (iter (load (field ip methods)))
+              (when (contains? (load wanted) (closure-method-key a ip (.name method)))
+                (push! (mut methods) method)
+                0))
+            (if (= (len methods) 0)
+                (primitive/cast (ptr ImplDef) 0)
+                (let [copy (box! a ImplDef (load ip))]
+                  (set! (.methods copy) (box-al [Func] a (load methods)))
+                  copy)))))
+
+;;; Does a method of impl IP still call a macro (a function returning Code)? Its
+;;; body has not been expanded yet, and the expansion may call any method of IP.
+(defn closure-impl-calls-macro? [(a (dyn Allocator))
+                                 (p (ptr Program))
+                                 (names (ptr FnNames))
+                                 (ip (ptr ImplDef))] (-> bool)
+  (let [calls (box! a SBox (primitive/zeroed SBox))]
+    (set! (.items calls) (ArrayList::new [(slice u8)] a))
+    (for [mi 0 (len (load (load (field ip methods))))]
+      (cc-list (load (field (elem (load (field ip methods)) mi) body))
+               names
+               calls
+               (primitive/cast (ptr SBox) 0)))
+    (block :found
+      (for [i 0 (len (.items calls))]
+        (let [f (fn-names-func names p (get (.items calls) i))]
+          (when (and (!= (primitive/cast i64 f) 0)
+                     (match (.ret f) (TCode [] true) (_ false)))
+            (break :found true))))
+      false)))
+
+;;; Retain the methods of wanted impl IP that the calls seen so far reach; true
+;;; when that added any. A trait impl is retained whole, when it is first selected
+;;; (FRESH), and so is an inherent impl that is still unexpanded (WHOLE, see
+;;; closure-impl-calls-macro?). Any other inherent impl is retained method by
+;;; method: each one whose head is called joins, and later passes add the ones its
+;;; body (or anything else) calls. CHECKED also roots each retained method's
+;;; checked function.
+(defn closure-retain-methods! [(a (dyn Allocator))
+                               (names (ptr FnNames))
+                               (stackb (ptr SBox))
+                               (wantedb (ptr SBox))
+                               (trait-heads (ptr SBox))
+                               (index (ptr ClosureWanted))
+                               (ip (ptr ImplDef))
+                               (fresh bool)
+                               (whole bool)
+                               (checked bool)] (-> bool)
+  (let [trait (impl-is-trait ip)
+        (mut added) false]
+    (when (or fresh (not trait))
+      (for [mi 0 (len (load (load (field ip methods))))]
+        (let [method (elem (load (field ip methods)) mi)
+              name (.name method)
+              key (closure-method-key a ip name)]
+          (when (or trait
+                    (and (not (closure-wanted? index key))
+                         (or whole (closure-method-wanted? a index ip name))))
+            (unless trait
+              (closure-want! wantedb index key)
+              (set! added true)
+              0)
+            ; The checker may select a structural/primitive impl only after seeing
+            ; a generic bound. Make the selected method itself a closure root as
+            ; well as traversing its callees, so mono and native emission retain
+            ; the implementation they selected.
+            (unless (closure-wanted? index name)
+              (push! (mut (field stackb items)) name)
+              0)
+            ; The checked function of that method is named for its impl, not by the
+            ; label the unchecked ImplDef keeps. A generic body that calls `+` on its
+            ; parameter reaches the impl only once mono selects it, so the selected
+            ; impl's checked functions must be in the closure, or the specialization
+            ; calls one that was left out.
+            (when checked
+              (let [fname (if trait
+                              (tmfn a
+                                    (impl-trait-name ip)
+                                    (impl-mangle-key a (field ip self_type) (load (field ip type_params)))
+                                    name)
+                              (inherent-fn-name a ip name))]
+                (unless (closure-wanted? index fname)
+                  (push! (mut (field stackb items)) fname)
+                  0))
+              0)
+            (cc-list (load (field method body)) names stackb trait-heads))
+          0))
+      0)
+    added))
+
+(defn closure-mark-impl! [(a (dyn Allocator))
+                          (p (ptr Program))
+                          (wanted (ptr SBox))
+                          (ip (ptr ImplDef))
+                          (index (ptr ClosureWanted))] (-> i64)
+  (closure-want! wanted index (closure-impl-key a ip))
+  ; A selected impl makes its owner type reachable, so that type's module now
+  ; counts for its other impls: retaining `coil.alloc`'s inherent `Var::new`
+  ; must also let `coil.var`'s own `get`/`set` in.
+  (let [base (impl-base-name a (field ip self_type))
+        owner (before-last-dot base)]
+    (unless (= (len owner) 0)
+      (set! (mut (.modules index)) owner 1)
+      0)
+    ; So are the types its values hold: a derived `Eq` on a sum compares each
+    ; payload through that payload type's own `Eq`, which lives in its module.
+    (for [i 0 (len (load (field p structs)))]
+      (let [sd (elem (load (field p structs)) i)]
+        (when (= (.name sd) base)
+          (closure-mark-field-modules! (.fields sd) index)
+          0)))
+    (for [i 0 (len (load (field p sums)))]
+      (let [sd (elem (load (field p sums)) i)]
+        (when (= (.name sd) base)
+          (for [v 0 (len (load (.variants sd)))]
+            (closure-mark-field-modules! (.fields (elem (.variants sd) v)) index))
+          0))))
+  0)
+
+(defn closure-mark-field-modules! [(fields (ptr (ArrayList Field)))
+                                   (index (ptr ClosureWanted))] (-> i64)
+  (for [i 0 (len (load fields))]
+    (closure-mark-type-modules! (field (elem fields i) ty) index))
+  0)
+
+(defn closure-mark-type-modules! [(t (ptr Type)) (index (ptr ClosureWanted))] (-> i64)
+  (match (load t)
+    (TStruct [n] (let [m (before-last-dot n)]
+                   (unless (= (len m) 0) (set! (mut (.modules index)) m 1) 0)))
+    (TApp [n args] (do (let [m (before-last-dot n)]
+                         (unless (= (len m) 0) (set! (mut (.modules index)) m 1) 0))
+                       (for [i 0 (len (load args))]
+                         (closure-mark-type-modules! (elem args i) index))
+                       0))
+    (TArray [e _] (closure-mark-type-modules! e index))
+    (_ 0))
+  0)
+
+;;; The wanted-set entry of trait TR as a bound some wanted function holds.
+(defn closure-bound-trait-key [(a (dyn Allocator)) (tr (slice u8))] (-> (slice u8))
+  (closure-trait-head-key a (sconcat a tr "::")))
+
+(defn closure-impl-wanted? [(a (dyn Allocator))
+                            (index (ptr ClosureWanted))
+                            (ip (ptr ImplDef))] (-> bool)
+  (let [m (before-last-dot (impl-base-name a (field ip self_type)))
+        ms (load (field ip methods))
+        n (len (load ms))
+        (mut i) 0
+        ; an impl of a trait a wanted function is bounded by is reached as if
+        ; a method of it were called
+        (mut called) (and (impl-is-trait ip)
+                          (closure-wanted? index (closure-bound-trait-key a (impl-trait-name ip))))]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (when (closure-wanted? index
+                                    (closure-trait-head-key a
+                                                            (load (field (elem ms
+                                                                               (load i))
+                                                                         name))))
+                  (store! called true)
+                  (break))
+                (set! i (primitive/iadd (load i) 1)))))
+    ; Primitive and structural targets have no owning source module. Their
+    ; methods may not appear as direct calls until trait selection during the
+    ; scratch check, so retain those impls unconditionally. Source-owned impls
+    ; remain restricted to a reachable method and owner module.
+    ; An explicit `Type::method` head names an inherent impl directly, whichever
+    ; module defines it (an inherent impl may extend a type from another module).
+    ; With no owning module, a qualified head keeps only an impl on a structural
+    ; receiver: `(ptr adder)` belongs to adder's module and waits for it.
+    (cond (and (not (impl-is-trait ip)) (closure-qualified-head-wanted? a index ip)) true
+          (= (len m) 0)
+            (or (load called)
+                (and (not (type-names-nominal? (field ip self_type) (load (field ip type_params))))
+                     (closure-qualified-head-wanted? a index ip)))
+          :else (and (or (load called) (closure-qualified-head-wanted? a index ip))
+                     (contains? (.modules index) m)))))
+
+;;; Whether `t` names a nominal (struct or sum) type anywhere inside it, other than
+;;; the impl's own type parameters and compiler pack markers. `(ptr adder)` does, so
+;;; a Callable impl on it is owned by adder's module even though its head is `ptr`.
+(defn type-names-nominal? [(t (ptr Type)) (params (ptr (ArrayList (slice u8))))] (-> bool)
+  (match (load t)
+    (TStruct [n] (not (or (set-contains params n) (closure-name-prefix? n "$"))))
+    (TApp [n args]
+          (if (closure-name-prefix? n "$")
+              (types-name-nominal? args params)
+              (not (set-contains params n))))
+    (TPtr [e] (type-names-nominal? e params))
+    (TRef [_ e] (type-names-nominal? e params))
+    (TSlice [e] (type-names-nominal? e params))
+    (TArray [e _] (type-names-nominal? e params))
+    (TVec [e _] (type-names-nominal? e params))
+    (TFn [_ ps r] (or (types-name-nominal? ps params) (type-names-nominal? r params)))
+    (_ false)))
+
+(defn types-name-nominal? [(ts (ptr (ArrayList Type))) (params (ptr (ArrayList (slice u8))))] (-> bool)
+  (let [(mut found) false]
+    (for i (range 0 (len (load ts)))
+      (when (type-names-nominal? (elem ts i) params) (set! found true)))
+    (load found)))
+
+(defn closure-name-prefix? [(s (slice u8)) (prefix (slice u8))] (-> bool)
+  (and (>= (len s) (len prefix)) (= (subslice s 0 (len prefix)) prefix)))
+
+;;; Whether a `Trait::method` call (see cc-push-trait-head!) names a method of this
+;;; trait impl, or a `Type::method` call names a method of this inherent impl.
+(defn closure-qualified-head-wanted? [(a (dyn Allocator))
+                                      (index (ptr ClosureWanted))
+                                      (ip (ptr ImplDef))] (-> bool)
+  (let [owner (if (impl-is-trait ip)
+                  (after-last-dot (impl-trait-name ip))
+                  (after-last-qualifier (impl-base-name a (field ip self_type))))
+        (mut found) false]
+    (for entry (iter (load (field ip methods)))
+      (let [method entry
+            head (sconcat3 a owner "::" (after-last-dot (.name method)))]
+        (when (closure-wanted? index (closure-trait-head-key a head))
+          (set! found true))))
+    (load found)))
+
+(defn closure-drain! [(p (ptr Program))
+                      (names (ptr FnNames))
+                      (stackb (ptr SBox))
+                      (wantedb (ptr SBox))
+                      (trait-heads (ptr SBox))
+                      (index (ptr ClosureWanted))] (-> i64)
+  (loop (if (= (len (.items stackb)) 0)
+            (break)
+            (do
+              (let [sl (.items stackb)
+                    top (len sl)
+                    nm (get sl (primitive/isub top 1))]
+                (set! (.len (.items stackb)) (primitive/isub top 1))
+                (unless (closure-wanted? index nm)
+                  (closure-want! wantedb index nm)
+                  (let [f (fn-names-func names p nm)]
+                    ; a body the tower's resolve left unparsed is parsed now; one
+                    ; that does not parse is skipped, as an unparsed definition is
+                    (unless (or (= (primitive/cast i64 f) 0) (not (lazy-body-force! f)))
+                      (cc-push-bound-heads! p (load (field f bounds)) trait-heads)
+                      (cc-list (load (field f body)) names stackb trait-heads))))))))
+  0)
+
+;;; A call of a generic function is checked against its bounds, so the impls that
+;;; satisfy them are needed even when no method of theirs is called: `(h 3)` with
+;;; `h [(T Hash)]` needs Hash's impl for i64. Every bounded trait, and every
+;;; supertrait those require (an impl is accepted only beside its supertraits'
+;;; impls), becomes a trait head of its own (`Trait::`, see closure-bound-trait-key),
+;;; and so does each of their methods.
+(defn cc-push-bound-heads! [(p (ptr Program))
+                            (bounds (ptr (ArrayList Bound)))
+                            (heads (ptr SBox))] (-> i64)
+  (unless (= (primitive/cast i64 bounds) 0)
+    (for [i 0 (len (load bounds))]
+      (let [bp (elem bounds i)]
+        (unless (= (primitive/cast i64 (.traits bp)) 0)
+          (for [k 0 (len (load (.traits bp)))]
+            (cc-push-trait-heads! p (.name (elem (.traits bp) k)) heads 0))
+          0))))
+  0)
+
+(defn cc-push-trait-heads! [(p (ptr Program)) (tr (slice u8)) (heads (ptr SBox)) (depth i64)] (-> i64)
+  (let [ts (load (field p traits))]
+    ; a supertrait cycle is refused when traits are checked; the depth only keeps
+    ; this walk finite on the way there
+    (when (< depth (len (load ts)))
+      (for [i 0 (len (load ts))]
+        (let [td (elem ts i)]
+          (when (= (.name td) tr)
+            ; the trait itself: a trait with no methods is still a bound
+            (push! (mut (field heads items)) (sconcat (unit-allocator) tr "::"))
+            (for [m 0 (len (load (.methods td)))]
+              (push! (mut (field heads items))
+                     (sconcat3 (unit-allocator) tr "::" (.name (elem (.methods td) m)))))
+            (for [r 0 (len (load (.requires td)))]
+              (cc-push-trait-heads! p (get (load (.requires td)) r) heads (+ depth 1)))
+            0)))
+      0))
+  0)
+
+(defn closure-funcs-known [(p (ptr Program))
+                           (names (ptr FnNames))
+                           (seeds (ptr (ArrayList (slice u8))))
+                           (a (dyn Allocator))] (-> (ptr (ArrayList (slice u8))))
+  (let [stackb (box! a SBox (primitive/zeroed SBox))
+        wantedb (box! a SBox (primitive/zeroed SBox))
+        trait-heads (box! a SBox (primitive/zeroed SBox))
+        index (closure-wanted-new a)]
+    (set! (.items stackb) (ArrayList::new [(slice u8)] a))
+    (set! (.items wantedb) (ArrayList::new [(slice u8)] a))
+    (set! (.items trait-heads) (ArrayList::new [(slice u8)] a))
+    (let [ns (len (load seeds))
+          (mut si) 0]
+      (loop (if (>= (load si) ns)
+                (break)
+                (do
+                  (push! (mut (.items stackb)) (get (load seeds) (load si)))
+                  (set! si (primitive/iadd (load si) 1))))))
+    ; Match closure-subprogram's roots: compile-time constants need their
+    ; callees, but runtime defs and their initializers belong to the target.
+    ; Seeding runtime initializers here can pull target Var callers into a
+    ; metaprogram object that deliberately contains no runtime static cells.
+    (let [cs (load (field p consts))
+          nc (len (load cs))
+          (mut ci) 0]
+      (loop (if (>= (load ci) nc)
+                (break)
+                (do
+                  (let [definition (elem cs (load ci))]
+                    (unless (.runtime definition)
+                      (collect-calls (field definition value) names stackb trait-heads) 0))
+                  (set! ci (primitive/iadd (load ci) 1))))))
+    (closure-drain! p names stackb wantedb trait-heads index)
+    (closure-mark-trait-heads! a wantedb trait-heads index)
+    ; Module reachability can grow through an impl body, so repeat to a bounded
+    ; fixpoint. Re-seeding an already-wanted callee is harmless.
+    (let [is (load (field p impls))
+          ni (len (load is))
+          (mut selected) (ArrayList::new [i64] a)
+          (mut init) 0
+          (mut pass) 0]
+      (loop (if (>= (load init) ni)
+                (break)
+                (do
+                  (push! (mut selected) 0)
+                  (set! init (primitive/iadd (load init) 1)))))
+      (loop (if (> (load pass) ni)
+                (break)
+                (let [(mut ii) 0
+                      (mut added) false]
+                  (loop (if (>= (load ii) ni)
+                            (break)
+                            (do
+                              (let [ip (elem is (load ii))
+                                    fresh (= (get (load selected) (load ii)) 0)]
+                                (when (and (or fresh (not (impl-is-trait ip)))
+                                           (closure-impl-wanted? a index ip))
+                                  (when fresh
+                                    (set! (mut selected)
+                                          (load ii)
+                                          (if (and (not (impl-is-trait ip))
+                                                   (closure-impl-calls-macro? a p names ip))
+                                              2
+                                              1))
+                                    (closure-mark-impl! a p wantedb ip index)
+                                    (store! added true))
+                                  (when (closure-retain-methods! a names stackb wantedb trait-heads index ip fresh
+                                                                 (= (get (load selected) (load ii)) 2)
+                                                                 true)
+                                    (store! added true)
+                                    0)))
+                              (set! ii (primitive/iadd (load ii) 1)))))
+                  (closure-drain! p names stackb wantedb trait-heads index)
+                  (closure-mark-trait-heads! a wantedb trait-heads index)
+                  (unless (load added) (break))
+                  (set! pass (primitive/iadd (load pass) 1)))))
+      0)
+    (field wantedb items)))
+
+(defn closure-funcs [(p (ptr Program))
+                     (seeds (ptr (ArrayList (slice u8))))
+                     (a (dyn Allocator))] (-> (ptr (ArrayList (slice u8))))
+  (closure-funcs-known p (prog-fn-names p a) seeds a))
+
+; ---- pruned closure (macro STAGING, interp deletion step 5 Phase B) ---------------
+; closure-funcs minus the impl-method and const-value seeding: only the seeds'
+; transitive callees ride along. Used by the per-qual staging prepass, where the
+; whole point is that closure-funcs' unconditional impl/const seeding drags in
+; functions whose bodies still hold unexpanded macro calls (a slice `get`'s
+; dbg-get) and poisons every check. Measured 2026-07-21: with this pruning,
+; 100% of the compiler's own macro quals and 99.6% of the corpus's check standalone.
+; NAMES is `(prog-fn-names p …)`: a caller staging many quals against one
+; program builds it once.
+(defn closure-funcs-pruned [(p (ptr Program))
+                            (names (ptr FnNames))
+                            (seeds (ptr (ArrayList (slice u8))))
+                            (a (dyn Allocator))] (-> (ptr (ArrayList (slice u8))))
+  (let [stackb (box! a SBox (primitive/zeroed SBox))
+        wantedb (box! a SBox (primitive/zeroed SBox))
+        trait-heads (box! a SBox (primitive/zeroed SBox))
+        index (closure-wanted-new a)]
+    (set! (.items stackb) (ArrayList::new [(slice u8)] a))
+    (set! (.items wantedb) (ArrayList::new [(slice u8)] a))
+    (set! (.items trait-heads) (ArrayList::new [(slice u8)] a))
+    (let [ns (len (load seeds))
+          (mut si) 0]
+      (loop (if (>= (load si) ns)
+                (break)
+                (do
+                  (push! (mut (.items stackb)) (get (load seeds) (load si)))
+                  (set! si (primitive/iadd (load si) 1))))))
+    (closure-drain! p names stackb wantedb trait-heads index)
+    (closure-mark-trait-heads! a wantedb trait-heads index)
+    ; Generic operators in an otherwise pruned macro closure are selected only
+    ; during the scratch check. Retain their reachable impl methods before that
+    ; check so both signatures and bodies survive. An impl body can expose another
+    ; trait head (Debug commonly delegates to Display), so selection must reach a
+    ; fixpoint just like the ordinary closure calculation. Application impls stay
+    ; excluded unless both their method head and owning module are reachable.
+    (let [is (load (field p impls))
+          ni (len (load is))
+          (mut selected) (ArrayList::new [i64] a)
+          (mut init) 0
+          (mut pass) 0]
+      (loop (if (>= (load init) ni)
+                (break)
+                (do
+                  (push! (mut selected) 0)
+                  (set! init (primitive/iadd (load init) 1)))))
+      (loop (if (> (load pass) ni)
+                (break)
+                (let [(mut ii) 0
+                      (mut added) false]
+                  (loop (if (>= (load ii) ni)
+                            (break)
+                            (do
+                              (let [ip (elem is (load ii))
+                                    fresh (= (get (load selected) (load ii)) 0)]
+                                (when (and (or fresh (not (impl-is-trait ip)))
+                                           (closure-impl-wanted? a index ip))
+                                  (when fresh
+                                    (set! (mut selected)
+                                          (load ii)
+                                          (if (and (not (impl-is-trait ip))
+                                                   (closure-impl-calls-macro? a p names ip))
+                                              2
+                                              1))
+                                    (closure-mark-impl! a p wantedb ip index)
+                                    (store! added true))
+                                  (when (closure-retain-methods! a names stackb wantedb trait-heads index ip fresh
+                                                                 (= (get (load selected) (load ii)) 2)
+                                                                 false)
+                                    (store! added true)
+                                    0)))
+                              (set! ii (primitive/iadd (load ii) 1)))))
+                  (closure-drain! p names stackb wantedb trait-heads index)
+                  (closure-mark-trait-heads! a wantedb trait-heads index)
+                  (unless (load added) (break))
+                  (set! pass (primitive/iadd (load pass) 1)))))
+      0)
+    (field wantedb items)))
+
+; A later-phase Code entry (currently a reader provider) may call same-module
+; helpers as ordinary runtime functions, including mixed-signature adapters such as
+; `(Code, slice u8) -> Code`. Reserve that module-local call graph from definition-
+; time staging, but stop at module boundaries so imported APIs still receive normal
+; macro expansion (for example coil.control.scope).
+(defn closure-module-funcs-pruned [(p (ptr Program))
+                                   (seeds (ptr (ArrayList (slice u8))))
+                                   (a (dyn Allocator))] (-> (ptr (ArrayList (slice u8))))
+  (let [names (prog-fn-names p a)
+        stackb (box! a SBox (primitive/zeroed SBox))
+        wantedb (box! a SBox (primitive/zeroed SBox))
+        (mut owner-modules) (ArrayList::new [(slice u8)] a)]
+    (set! (.items stackb) (ArrayList::new [(slice u8)] a))
+    (set! (.items wantedb) (ArrayList::new [(slice u8)] a))
+    (let [ns (len (load seeds))
+          (mut si) 0]
+      (loop (if (>= (load si) ns)
+                (break)
+                (do
+                  (let [seed (get (load seeds) (load si))
+                        owner (before-last-dot seed)]
+                    (push! (mut (.items stackb)) seed)
+                    (unless (set-contains (mut owner-modules) owner)
+                      (push! (mut owner-modules) owner)))
+                  (set! si (primitive/iadd (load si) 1))))))
+    ; A later-phase provider owns its whole implementation module. Code-signed
+    ; siblings that are not statically reachable from the entry can still be
+    ; selected dynamically by the provider, and—more importantly—must never be
+    ; executed as definition-time macros against their own declaration syntax.
+    ; Every sibling in the provider module is reserved. Imported libraries are
+    ; not swept wholesale, but helpers statically reachable from those siblings
+    ; belong to the same later-phase computation and must follow it across the
+    ; module boundary.
+    (for [ni 0 (len (.items names))]
+      (let [nm (get (.items names) ni)]
+        (when (set-contains (mut owner-modules) (before-last-dot nm))
+          (unless (set-contains (field wantedb items) nm)
+            (push! (mut (field wantedb items)) nm)
+            0)
+          0))
+      0)
+    (loop (if (= (len (.items stackb)) 0)
+              (break)
+              (let [sl (.items stackb)
+                    top (len sl)
+                    nm (get sl (primitive/isub top 1))]
+                (set! (.len (.items stackb)) (primitive/isub top 1))
+                (when (not (set-contains (field wantedb items) nm))
+                  (push! (mut (field wantedb items)) nm)
+                  (let [f (fn-names-func names p nm)]
+                    (when (and (!= (primitive/cast i64 f) 0) (lazy-body-force! f))
+                      (cc-list (load (field f body))
+                               names
+                               stackb
+                               (primitive/cast (ptr SBox) 0))
+                      0))))))
+    (field wantedb items)))
+
+; Keep only extern declarations that a reachable body calls or takes the address of.
+; `prog-fn-names` includes extern names, so `collect-calls` puts those references in
+; `wanted` alongside ordinary functions.
+(defn closure-externs [(p (ptr Program))
+                       (wanted (ptr (ArrayList (slice u8))))
+                       (a (dyn Allocator))] (-> (ptr (ArrayList Extern)))
+  (let [es (load (field p externs))
+        n (len (load es))
+        (mut keep) (ArrayList::new [Extern] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [ep (elem es (load i))]
+                  (when (set-contains wanted (load (field ep name)))
+                    (push! (mut keep) (load ep))
+                    0))
+                (set! i (primitive/iadd (load i) 1)))))
+    (box-al [Extern] a (load keep))))
+
+;;; Add the accepted checked body of every wanted function `p` lacks. A
+;;; retained session's candidate program carries only what it re-checked.
+(defn closure-keep-base-funcs! [(a (dyn Allocator))
+                                (wanted (ptr (ArrayList (slice u8))))
+                                (keep (mut (ArrayList Func)))] (-> i64)
+  (unless (and (= (cast i64 (closure-parent)) 0) (= (cast i64 (closure-meta-parent)) 0))
+    (let [(mut kept) (HashMap::new [(slice u8) i64] a (keyops-borrowed))]
+      (for i (range 0 (len (load keep)))
+        (set! (mut kept) (.name (elem keep i)) 1))
+      (for name (iter (load wanted))
+        (unless (contains? kept name)
+          (match (closure-base-func name)
+            (Some [function] (push! (mut keep) (load function)))
+            (None [] 0))))))
+  0)
+
+(defn closure-subprogram-pruned [(p (ptr Program))
+                                 (wanted (ptr (ArrayList (slice u8))))
+                                 (a (dyn Allocator))] (-> (ptr Program))
+  (let [pp (box! a Program (primitive/zeroed Program))
+        fs (load (field p funcs))
+        n (len (load fs))
+        (mut keep) (ArrayList::new [Func] a)
+        (mut keepi) (ArrayList::new [ImplDef] a)
+        wanted-set (closure-name-set a wanted)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [fp (elem fs (load i))]
+                  (when (and (set-contains wanted (load (field fp name)))
+                             (lazy-body-force! fp))
+                    (push! (mut keep) (load fp))
+                    0))
+                (set! i (primitive/iadd (load i) 1)))))
+    (closure-keep-base-funcs! a wanted (mut keep))
+    (let [is (load (field p impls))]
+      (for [ii 0 (len (load is))]
+        (let [kept (closure-impl-kept a wanted-set (elem is ii))]
+          (unless (= (primitive/cast i64 kept) 0)
+            (push! (mut keepi) (load kept))
+            0))))
+    (set! (.annotation_defs pp) (load (field p annotation_defs)))
+    (set! (.conventions pp) (load (field p conventions)))
+    (set! (.externs pp) (closure-externs p wanted a))
+    (set! (.funcs pp) (box-al [Func] a (load keep)))
+    (set! (.asserts pp) (box-al [StaticAssert] a (ArrayList::new [StaticAssert] a)))
+    (set! (.consts pp) (box-al [Const] a (ArrayList::new [Const] a)))
+    (set! (.impls pp) (box-al [ImplDef] a (load keepi)))
+    (set! (.metas pp) (box-al [Expr] a (ArrayList::new [Expr] a)))
+    (set! (.exports pp) (box-al [ExportC] a (ArrayList::new [ExportC] a)))
+    (set! (.function_abis pp) (load (field p function_abis)))
+    (set! (.unit_exports pp) (load (field p unit_exports)))
+    (set! (.unit_build pp) (.unit_build p))
+    (set! (.retirements pp) (.retirements p))
+    (set! (.retired_functions pp) (.retired_functions p))
+    (set! (.structs pp) (load (field p structs)))
+    (set! (.sums pp) (load (field p sums)))
+    (set! (.traits pp) (load (field p traits)))
+    (set! (.aliases pp) (load (field p aliases)))
+    ; A pre-expansion context still lacks the types pending macro calls declare,
+    ; so leave out the structs and sums that name one, and their impls
+    ; (reflection keeps seeing them in the context itself).
+    (drop-undeclared-type-dependents! a pp)
+    pp))
+
+(defn closure-subprogram [(p (ptr Program))
+                          (wanted (ptr (ArrayList (slice u8))))
+                          (a (dyn Allocator))] (-> (ptr Program))
+  (let [pp (box! a Program (primitive/zeroed Program))
+        fs (load (field p funcs))
+        n (len (load fs))
+        (mut keep) (ArrayList::new [Func] a)
+        (mut keepi) (ArrayList::new [ImplDef] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [fp (elem fs (load i))]
+                  (when (and (set-contains wanted (load (field fp name)))
+                             (lazy-body-force! fp))
+                    (push! (mut keep) (load fp))
+                    0))
+                (set! i (primitive/iadd (load i) 1)))))
+    (closure-keep-base-funcs! a wanted (mut keep))
+    (let [is (load (field p impls))
+          wanted-set (closure-name-set a wanted)]
+      (for [ii 0 (len (load is))]
+        (let [kept (closure-impl-kept a wanted-set (elem is ii))]
+          (unless (= (primitive/cast i64 kept) 0)
+            (push! (mut keepi) (load kept))
+            0))))
+    (set! (.annotation_defs pp) (load (field p annotation_defs)))
+    (set! (.conventions pp) (load (field p conventions)))
+    (set! (.structs pp) (load (field p structs)))
+    (set! (.sums pp) (load (field p sums)))
+    (set! (.externs pp) (closure-externs p wanted a))
+    (set! (.funcs pp) (box-al [Func] a (load keep)))
+    (set! (.asserts pp) (box-al [StaticAssert] a (ArrayList::new [StaticAssert] a)))
+    ; Runtime defs belong to the target program, never to the executable
+    ; metaprogram closure. In particular their initializers may themselves
+    ; contain macro calls which have not been expanded yet.
+    (let [cs (load (field p consts))
+          (mut keepc) (ArrayList::new [Const] a)]
+      (for [ci 0 (len (load cs))]
+        (let [cp (elem cs ci)]
+          (unless (.runtime cp)
+            (push! (mut keepc) (load cp))
+            0)))
+      (set! (.consts pp) (box-al [Const] a (load keepc))))
+    (set! (.traits pp) (load (field p traits)))
+    (set! (.impls pp) (box-al [ImplDef] a (load keepi)))
+    (set! (.metas pp) (box-al [Expr] a (ArrayList::new [Expr] a)))
+    (set! (.exports pp) (box-al [ExportC] a (ArrayList::new [ExportC] a)))
+    (set! (.function_abis pp) (load (field p function_abis)))
+    (set! (.unit_exports pp) (load (field p unit_exports)))
+    (set! (.unit_build pp) (.unit_build p))
+    (set! (.aliases pp) (load (field p aliases)))
+    (set! (.retirements pp) (.retirements p))
+    (set! (.retired_functions pp) (.retired_functions p))
+    ; A pre-expansion context still lacks the types pending macro calls declare,
+    ; so leave out the structs and sums that name one, and their impls
+    ; (reflection keeps seeing them in the context itself).
+    (drop-undeclared-type-dependents! a pp)
+    pp))

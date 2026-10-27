@@ -139,7 +139,7 @@ The pipeline already passes `a (dyn Allocator)` nearly everywhere; the sites tha
 it call `malloc-allocator` directly:
 
 ```
-resolve.coil 38   comptime.coil 24   codelib.coil 9   loader.coil 7
+resolve.coil 38   comptime.coil 24   loader.coil 7
 metahost.coil 6   ast.coil 6         expander.coil 3  driver.coil 3   reader.coil 1
 ```
 

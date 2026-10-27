@@ -1,0 +1,2844 @@
+; src/compiler/comptime/codeop_host.coil — self-host Coil compiler: the host side of the compile-time code operations. A compiled
+; metaprogram calls back through metahost with an operation (codeop.coil) and its
+; arguments; `code-op` answers it from the compiler's state.
+
+(module coil.compiler.codeop_host)
+(import "coil.primitive" :as primitive)
+(import "coil.compiler.unit_state" :use *)
+(import "coil.compiler.ffi" :as ffi)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.mem" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+
+(import "coil.io" :use *)
+(import "coil.control" :use *)
+(import "coil.try" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.compiler.mtrace" :use *)
+(import "coil.compiler.trace" :as tr)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.codeop" :use *)
+(import "coil.compiler.program_query" :as pq)
+(import "coil.compiler.ctval" :use *)  ; CtVal / EnvBind / CtCtx — the value model, now on its own
+
+(import "coil.compiler.check" :use *)
+(import "coil.compiler.expander" :use *)
+(import "coil.compiler.loader" :use *)
+(import "coil.compiler.diag" :as diag)  ; locate-source: line/col by the source's line-start table
+(import "coil.compiler.parser" :use *)
+(import "coil.reader" :use *)
+(import "coil.compiler.resolve" :use *)
+(import "coil.cc" :as cc)
+(import "coil.compiler.comptime" :use *)
+
+;;; The references TABLE files under KEY, as a list built for the asker.
+(defn source-index-references [(a (dyn Allocator))
+                               (table (ptr (HashMap (slice u8) (ptr (ArrayList i64)))))
+                               (key (slice u8))] (-> Sexp)
+  (let [(mut out) (ArrayList::new [Sexp] a)
+        all (sx-items (.source_references (comptime-unit-state)))]
+    (match (get (load table) key)
+      (Some [items]
+        (reserve! (mut out) (len (load items)))
+        (for [i 0 (len (load items))]
+          (push! (mut out) (sx-at all (get (load items) i)))
+          0))
+      (None [] 0))
+    (sx-mklist (box-al [Sexp] a (load out)))))
+
+;;; What TABLE files under KEY, as a list: the stored list itself, or an empty one.
+(defn source-index-list [(a (dyn Allocator))
+                         (table (ptr (HashMap (slice u8) (ptr (ArrayList Sexp)))))
+                         (key (slice u8))] (-> Sexp)
+  (match (get (load table) key)
+    (Some [items] (sx-mklist items))
+    (None [] (sx-mklist (box-al [Sexp] a (ArrayList::new [Sexp] a))))))
+
+;;; V's variant as a number.
+(defn ct-tag [(v CtVal)] (-> i64)
+  (match v
+    (CInt [n] 0)
+    (CBool [b] 1)
+    (CFloat [x] 2)
+    (CStr [s] 3)
+    (CCode [f] 4)
+    (CStruct [a b] 5)
+    (CArray [a b] 6)
+    (CSlice [a b] 9)
+    (CSum [a b] 7)
+    (CRef [c] 8)
+    (CWideInt [_ _ _] 10)))
+
+(defn cint-of [(v CtVal)] (-> i64)
+  (match v
+    (CInt [n] n)
+    (CBool [b] 0)
+    (CFloat [x] 0)
+    (CStr [s] 0)
+    (CCode [f] 0)
+    (CStruct [a b] 0)
+    (CArray [a b] 0)
+    (CSlice [a b] 0)
+    (CSum [a b] 0)
+    (CRef [c] 0)
+    ; every reader asks ct-tag first; a wide value read as an i64 is a bug
+    (CWideInt [_ _ _] (unimplemented "comptime: a 128-bit value read as a 64-bit integer"))))
+
+; Append "in <metaprogram>" to a comptime error when one is executing. The bare
+; message names neither the macro nor the form, and its location is the point the
+; engine was ENTERED from — a module's import line — so it reads as though the
+; user's file is at fault when the bug is inside a macro they cannot see. One
+; word fixes that, and it is the single most useful word in the message.
+(defn ct-in-meta [(a (dyn Allocator)) (msg (slice u8))] (-> (slice u8))
+  (let [who (mtrace-current)]
+    (if (= (len who) 0)
+        msg
+        (sconcat3 a msg ", raised inside metaprogram " who))))
+
+(defn lint-param-get [(key (slice u8)) (fallback (slice u8))] (-> (slice u8))
+  (let [params (lint-params)
+        (mut i) (primitive/isub (len (load params)) 1)
+        (mut out) fallback]
+    (loop (if (< (load i) 0)
+              (break)
+              (let [p (get (load params) (load i))]
+                (if (= (.key p) key)
+                    (do (set! out (.value p)) (break))
+                    (set! i (primitive/isub (load i) 1))))))
+    (load out)))
+
+(defn cop-lint-param [(args (ptr (ArrayList CtVal)))] (-> (Result CtVal Diag))
+  (match (cv-get args 0)
+    (None []
+          (Err [CtVal Diag]
+               (derr "lint-param: expects (primitive/lint-param KEY DEFAULT)")))
+    (Some [key]
+          (match (cv-get args 1)
+            (None []
+                  (Err [CtVal Diag]
+                       (derr "lint-param: expects (primitive/lint-param KEY DEFAULT)")))
+            (Some [fallback]
+                  (if (and (is-cstr key) (is-cstr fallback))
+                      (Ok [CtVal Diag]
+                          (CStr (lint-param-get (cstr-of key)
+                                                (cstr-of fallback))))
+                      (Err [CtVal Diag]
+                           (derr "lint-param: KEY and DEFAULT must be strings"))))))))
+
+(defn warn-push [(d Diag)] (-> i64)
+  (push! (warn-list) d)
+  0)
+
+(defn diag-err-bump [] (-> i64)
+  (let [_ (warn-list)
+        b (warn-box)]
+    (set! (.errs b) (primitive/iadd (.errs b) 1))
+    0))
+
+; `(primitive/code-line NODE)` — the 1-based source LINE of a node's span, so a macro (e.g.
+; src/stdlib/assert.coil) can bake `file:line` into the code it emits, matching the span
+; machinery diag.coil's `locate-source` uses. Same source table as `code-file-of` (set once
+; before expansion/checkers run); 0 when the node has no known source.
+(defn code-line-of [(node Sexp)] (-> i64)
+  (let [b (src-box)
+        lst (load (field b lst))]
+    (unless (= (primitive/cast i64 lst) 0)
+      (let [sid (sx-source node)]
+        (unless (or (< sid 0) (>= sid (len (load lst))))
+          (let [sp (primitive/alloc-stack Source)]
+            (store! sp (get (load lst) sid))
+            (.line (diag/locate-source sp (sx-lo node)))))))))
+
+; `(primitive/code-col NODE)` — the 1-based source COLUMN of a node's span (chars since the last
+; newline before `lo`). Mirrors code-line; together they give `file:line:col` for a node.
+(defn code-col-of [(node Sexp)] (-> i64)
+  (let [b (src-box)
+        lst (load (field b lst))]
+    (unless (= (primitive/cast i64 lst) 0)
+      (let [sid (sx-source node)]
+        (unless (or (< sid 0) (>= sid (len (load lst))))
+          (let [sp (primitive/alloc-stack Source)]
+            (store! sp (get (load lst) sid))
+            (.col (diag/locate-source sp (sx-lo node)))))))))
+
+; `(primitive/code-doc NODE)` — the `;;;` doc comment written above NODE, or "" if it has none
+; (including any macro-generated node, which has no source of its own).
+(defn code-doc-of [(node Sexp)] (-> (slice u8))
+  (let [b (src-box)
+        lst (load (field b lst))]
+    (if (= (primitive/cast i64 lst) 0)
+        ""
+        (let [sid (sx-source node)]
+          (if (or (< sid 0) (>= sid (len (load lst))))
+              ""
+              (let [sp (primitive/alloc-stack Source)]
+                (set! sp (get (load lst) sid))
+                (ct-doc-at (unit-allocator) (.text sp) (sx-lo node))))))))
+
+; Is `x` the very node `form` is, or one of its nodes? A rule that replaces a form
+; with a piece of it -- `(cast i64 5)` with its `5` -- hands `suggest` the author's
+; own node with no quasiquote around it, so nothing marked it transported (hflags
+; bit 0) and `sug-verbatim` would reprint it rather than keep its bytes. Identity is
+; the node id together with the source and span: ids are unique only within one
+; identity domain, and a rule's own template atom carries the rule's source.
+(defn sug-node-of? [(x Sexp) (form Sexp)] (-> bool)
+  (or (and (!= (sx-node-id x) 0)
+           (= (sx-node-id x) (sx-node-id form))
+           (= (sx-source x) (sx-source form))
+           (= (sx-lo x) (sx-lo form))
+           (= (sx-hi x) (sx-hi form)))
+      (and (code-node-listish? form)
+           (block :found
+             (for [i 0 (code-node-len form)]
+               (when (sug-node-of? x (code-node-at form i)) (break :found true)))
+             false))))
+
+; `(primitive/warn NODE MSG)`, `(primitive/suggest NODE MSG REPLACEMENT)` and
+; `(primitive/delete NODE MSG)`. All three record a located, non-fatal warning at
+; NODE — that half is identical, so it is written once — and the latter two additionally
+; record the fix they propose: a rewrite, or the node's removal.
+(defn cop-warn-or-suggest [(a (dyn Allocator))
+                           (op ReportOp)
+                           (args (ptr (ArrayList CtVal)))] (-> (Result CtVal
+                                                                       Diag))
+  (let [fixing (match op (Suggest [] true) (_ false))
+        deleting (match op (Delete [] true) (_ false))
+        nm (cond fixing "suggest" deleting "delete" :else "warn")
+        usage
+          (cond fixing
+                  "suggest: expects (primitive/suggest NODE MSG REPLACEMENT), REPLACEMENT a Code value"
+                deleting "delete: expects (primitive/delete NODE MSG)"
+                :else "warn: expects (primitive/warn NODE MSG)")
+        repl
+          (if fixing
+              (match (cv-get args 2)
+                (None [] (None [Sexp]))
+                (Some [rv]
+                      (if (is-ccode rv) (Some (ccode-of rv)) (None [Sexp]))))
+              (None [Sexp]))]
+    (if (and fixing (not (some? [Sexp] repl)))
+        (Err [CtVal Diag] (derr usage))
+        (match (cv-get args 0)
+          (None [] (Err [CtVal Diag] (derr usage)))
+          (Some [nodev]
+                (if (not (is-ccode nodev))
+                    (Err [CtVal Diag]
+                         (derr (sconcat a nm ": first arg must be a Code node")))
+                    (match (cv-get args 1)
+                      (None [] (Err [CtVal Diag] (derr usage)))
+                      (Some [msgv]
+                            (if (not (is-cstr msgv))
+                                (Err [CtVal Diag]
+                                     (derr (sconcat a
+                                                    nm
+                                                    ": message must be a string")))
+                                (let [node (ccode-of nodev)
+                                      d (primitive/alloc-stack Diag)
+                                      di (len (load (warn-list)))]
+                                  (set! (.lo d) (sx-lo node))
+                                  (set! (.hi d) (sx-hi node))
+                                  ; malloc, not `a`: the warn list outlives the
+                                  ; expansion arena `a` may be (COIL_META_ARENA)
+                                  (set! (.msg d)
+                                        (sconcat (unit-allocator)
+                                                 "warning: "
+                                                 (cstr-of msgv)))
+                                  (set! (.source d) (sx-source node))
+                                  (set! (.ctxt d) 0)
+                                  (warn-push (load d))
+                                  ; a delete carries no replacement, so `node` stands in
+                                  ; for the unused `repl` slot rather than widening the
+                                  ; record with an Option nobody reads.
+                                  (if deleting
+                                      (cop-record-fix node
+                                                      node
+                                                      (cstr-of msgv)
+                                                      di
+                                                      1)
+                                      (match repl
+                                        (None [] 0)
+                                        (Some [r]
+                                              (cop-record-fix node
+                                                              ; a template's own list is never one
+                                                              (if (and (!= (sx-horigin r) 1)
+                                                                       (sug-node-of? r node))
+                                                                  (sexp-transported r)
+                                                                  r)
+                                                              (cstr-of msgv)
+                                                              di
+                                                              0))))
+                                  (Ok [CtVal Diag] (CInt 0))))))))))))
+
+(defn sem-model-status [] (-> i64)
+  (let [b (sem-model-box)] (if (= (.init b) 0) 0 (.status b))))
+
+;;; The diagnostic located exactly at NODE's source span in the current model.
+(defn sem-model-error-at [(node Sexp)] (-> (Option (slice u8)))
+  (let [b (sem-model-box)]
+    (block :found
+      (when (or (= (.init b) 0) (= (primitive/cast i64 (.diags b)) 0)) (break :found (None [(slice u8)])))
+      (when (or (< (sx-source node) 0) (< (sx-lo node) 0)) (break :found (None [(slice u8)])))
+      (for [i 0 (len (load (.diags b)))]
+        (let [d (elem (.diags b) i)]
+          (when (and (= (.source d) (sx-source node))
+                     (and (= (.lo d) (sx-lo node)) (= (.hi d) (sx-hi node))))
+            (break :found (Some (.msg d))))))
+      (None [(slice u8)]))))
+
+;;; `(primitive/code-call-site)`: the macro call being expanded.
+(defn cop-call-site [(args (ptr (ArrayList CtVal)))] (-> (Result CtVal Diag))
+  (let [cell (macro-call-site-cell)]
+    (cond (> (len (load args)) 0)
+            (Err [CtVal Diag] (derr "code-call-site: expects no arguments: (primitive/code-call-site)"))
+          (= (.present cell) 0)
+            (Err [CtVal Diag] (derr "code-call-site: there is no call site outside a macro's expansion"))
+          :else (Ok [CtVal Diag] (CCode (.node cell))))))
+
+(defn macro-call-lookup [(node-id i64)] (-> bool)
+  (let [b (macro-call-box)]
+    (if (or (<= node-id 0)
+            (= (.init b) 0))
+        false
+        (match (get (load (load (field b index))) node-id)
+          (Some [v] v)
+          (None [] false)))))
+
+;;; `(primitive/resolve-at NODE NAME)`: what NAME would denote if it were written as
+;;; a call head at NODE, a coil.primitive.Resolution. The local half is the
+;;; resolver's own scope at NODE (ast.coil, ScopeAtBox); the global half is the
+;;; resolver's call-head lookup, so the answer is the one compiling it would give.
+(defn cop-resolve-at [(op CodeOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (let [usage "resolve-at: expects (primitive/resolve-at NODE NAME), NAME a symbol"]
+    (match (cv-get args 0)
+      (None [] (Err [CtVal Diag] (derr usage)))
+      (Some [node]
+        (match (cv-get args 1)
+          (None [] (Err [CtVal Diag] (derr usage)))
+          (Some [namec]
+            (if (or (not (is-ccode node))
+                    (or (not (is-ccode namec)) (!= (sx-tag (ccode-of namec)) 2)))
+                (Err [CtVal Diag] (derr usage))
+                (answer op (resolve-at-answer (.a cx) (ccode-of node) (sx-sval (ccode-of namec))) cx))))))))
+
+(defn resolve-at-answer [(a (dyn Allocator)) (node Sexp) (name (slice u8))] (-> CtVal)
+  (let [b (sem-model-box)
+        cx (.checker b)]
+    (match (scope-at-lookup (source-checked-id (sx-node-id node) (sx-source node)
+                                               (sx-lo node) (sx-hi node) (sx-ctxt node)))
+      (None [] (answer0 a "ResolutionUnknown"))
+      (Some [at]
+        (cond (scope-binds? (.tip at) name) (answer0 a "ResolvesLocal")
+              (or (= (primitive/cast i64 (.declarations b)) 0) (= (primitive/cast i64 cx) 0))
+                (answer0 a "ResolutionUnknown")
+              :else
+                (let [m (scope-module-at (.module at))]
+                  ; a spelling the parser takes as a primitive is that primitive
+                  (match (source-primitive-at m name)
+                    (Some [q] (answer1 a "ResolvesTo" (sym-value q)))
+                    (None []
+                      (match (resolve-call-head-in a m (.imports b) (.exports b) (.declarations b) name)
+                        (Err [_] (answer0 a "ResolvesNothing"))
+                        (Ok [q]
+                          (cond (!= (primitive/cast i64 (sig-find cx q)) 0) (answer1 a "ResolvesTo" (sym-value q))
+                                ; A `T::method` head comes back with its qualifier
+                                ; resolved, which names no function: ask for the method.
+                                (and (!= q name) (none? (find q "::"))) (answer1 a "ResolvesTo" (sym-value q))
+                                :else
+                                  (match (head-trait-method a cx q m)
+                                    (None [] (answer0 a "ResolvesNothing"))
+                                    (Some [me]
+                                      (answer1 a "ResolvesTo"
+                                               (sym-value (sconcat3 a (before-last-dot (.trait me)) "." (.name me)))))))))))))))))
+
+;;; ---- describing the program to another unit (program_query.coil) ------------
+;;;
+;;; code-source CODE: the source text of a form.
+;;; program-modules: every module of the program.
+;;; module-definitions MODULE: MODULE's definitions, qualified.
+;;; definition-kind NAME: a coil.primitive.DefinitionKind.
+;;; definition-declaration NAME: the form declaring NAME to another unit.
+;;; module-header MODULE: `(module M)` and its import and export forms.
+;;; module-impls MODULE: its `impl` and `derive` forms.
+;;; program-toolchain: `(toolchain :compiler "<digest>" :target "<arch>-<os>")`.
+;;; definition-annotations NAME: a function's or `def`'s `:key value` pairs, as
+;;;     one list; empty for a definition that carries none.
+;;; definition-source NAME: the form that defines NAME, as written.
+;;; definitions-of-kind KIND: every definition definition-kind calls KIND, a
+;;;     DefinitionKind variant's name as a symbol.
+;;; Names are qualified symbols. A query answers with coil.primitive.ProgramAnswer
+;;; (definition-kind with KindAnswer): NotInProgram for something the program does
+;;; not define, NoProgram with no compiled program to ask.
+(defn program-model [] (-> (Option pq/ProgramModel))
+  (let [b (sem-model-box)]
+    (if (or (= (.init b) 0) (= (primitive/cast i64 (.prog b)) 0))
+        (None [pq/ProgramModel])
+        (let [facts (program-facts)]
+          (Some (pq/ProgramModel :program (.prog b)
+                                 :checker (.checker b) :declarations (.declarations b)
+                                 :forms (.forms b) :retained (.retained b)
+                                 :sources (.lst (src-box))
+                                 :defining (.defining facts)
+                                 :retained_defining (.retained_defining facts)))))))
+
+;;; The program facts of the current semantic model, brought up to date.
+(defn program-facts [] (-> (ptr ProgramFacts))
+  (let [b (sem-model-box)
+        facts (field (comptime-unit-state) program_facts)
+        a (unit-allocator)
+        fs (.forms b)
+        fn (if (= (primitive/cast i64 fs) 0) 0 (len (load fs)))
+        rs (.retained b)
+        rn (if (= (primitive/cast i64 rs) 0) 0 (len (load rs)))
+        resolutions (res-map-list)]
+    (when (or (= (primitive/cast i64 (.defining facts)) 0)
+              (!= (primitive/cast i64 (.forms facts)) (primitive/cast i64 fs))
+              (!= (.forms_n facts) fn))
+      (set! (.defining facts) (pq/defining-forms-index a fs))
+      (set! (.forms facts) fs)
+      (set! (.forms_n facts) fn)
+      0)
+    (when (or (= (primitive/cast i64 (.retained_defining facts)) 0)
+              (!= (primitive/cast i64 (.retained facts)) (primitive/cast i64 rs))
+              (!= (.retained_n facts) rn))
+      (set! (.retained_defining facts) (pq/retained-defining-index a rs))
+      (set! (.retained facts) rs)
+      (set! (.retained_n facts) rn)
+      0)
+    (when (or (= (primitive/cast i64 (.resolved facts)) 0)
+              (!= (.resolved_n facts) (len (load resolutions))))
+      (let [counts (box! a (HashMap (slice u8) i64) (HashMap::new [(slice u8) i64] a (keyops)))]
+        (for e (iter (load resolutions))
+          (set! counts (.name e)
+                (+ 1 (match (get (load counts) (.name e)) (Some [n] n) (None [] 0)))))
+        (set! (.resolved facts) counts)
+        (set! (.resolved_n facts) (len (load resolutions))))
+      0)
+    facts))
+
+(defn sym-list [(a (dyn Allocator)) (names (ArrayList (slice u8)))] (-> Sexp)
+  (let [(mut items) (ArrayList::new [Sexp] a)]
+    (for n (iter names) (push! (mut items) (mk-sexp (KSym n) -1 -1)))
+    (mk-sexp (KList (box-al [Sexp] a (load items))) -1 -1)))
+
+;;; The forms of TEXT, which program_query rendered.
+(defn forms-of [(a (dyn Allocator)) (what (slice u8)) (text (slice u8))] (-> (Result Sexp Diag))
+  (match (read-all a text -1)
+    (Err [d] (Err [Sexp Diag] (derr (sconcat3 a what ": internal: rendered source does not read: " (.msg d)))))
+    (Ok [forms] (Ok [Sexp Diag] (mk-sexp (KList forms) -1 -1)))))
+
+;;; The qualified symbol a program query's first argument names.
+(defn query-name [(a (dyn Allocator)) (op CodeOp) (args (ptr (ArrayList CtVal)))] (-> (Result (slice u8) Diag))
+  (match (cv-get args 0)
+    (Some [v]
+          (if (and (is-ccode v) (= (sx-tag (ccode-of v)) 2))
+              (Ok [(slice u8) Diag] (sx-sval (ccode-of v)))
+              (Err [(slice u8) Diag] (derr (sconcat a (codeop-name op) ": expects a qualified symbol")))))
+    (None [] (Err [(slice u8) Diag] (derr (sconcat a (codeop-name op) ": expects a qualified symbol"))))))
+
+;;; NAME's declaration, source or annotations, as TEXT reads: the first form when
+;;; FIRST, else all of them.
+(defn query-forms [(a (dyn Allocator)) (op CodeOp) (text (Result (slice u8) (slice u8))) (first bool)] (-> (Result CtVal Diag))
+  (try
+    (match text
+      (Err [msg] (Err [CtVal Diag] (derr (sconcat3 a (codeop-name op) ": " msg))))
+      (Ok [source]
+          (let [forms (try! (forms-of a (codeop-name op) source))]
+            (Ok [CtVal Diag]
+                (answer1 a "Answer" (CCode (if first (get (load (sx-items forms)) 0) forms)))))))))
+
+(defn cop-program-query [(op CodeOp) (q ProgramOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (try
+    (let [a (.a cx)]
+      (match (program-model)
+        (None []
+              (answer op (answer0 a (match q (DefinitionKindOf [] "KindNoProgram") (_ "NoProgram"))) cx))
+        (Some [model0]
+              (let [model (primitive/alloc-stack pq/ProgramModel)]
+                (set! model model0)
+                (answer op
+                        (match q
+                          (ProgramModules [] (answer1 a "Answer" (CCode (sym-list a (pq/program-modules a model)))))
+                          (DefinitionsOfKind []
+                                             (answer1 a "Answer"
+                                                      (CCode (sym-list a (pq/definitions-of-kind a model (try! (query-name a op args)))))))
+                          (ModuleDefinitions []
+                                             (match (pq/module-definitions a model (try! (query-name a op args)))
+                                               (None [] (answer0 a "NotInProgram"))
+                                               (Some [names] (answer1 a "Answer" (CCode (sym-list a names))))))
+                          (DefinitionKindOf []
+                                            (match (pq/definition-kind model (try! (query-name a op args)))
+                                              (None [] (answer0 a "KindNotInProgram"))
+                                              (Some [k] (answer1 a "KindIs" (answer0 a (definition-kind-variant k))))))
+                          (DefinitionDeclaration []
+                                                 (let [name (try! (query-name a op args))]
+                                                   (match (pq/definition-kind model name)
+                                                     (None [] (answer0 a "NotInProgram"))
+                                                     (Some [_] (try! (query-forms a op (pq/definition-declaration a model name) true))))))
+                          (DefinitionSource []
+                                            (let [name (try! (query-name a op args))]
+                                              (match (pq/definition-kind model name)
+                                                (None [] (answer0 a "NotInProgram"))
+                                                (Some [_] (try! (query-forms a op (pq/definition-source a model name) true))))))
+                          (DefinitionAnnotations []
+                                                 (let [name (try! (query-name a op args))]
+                                                   (match (pq/definition-kind model name)
+                                                     (None [] (answer0 a "NotInProgram"))
+                                                     (Some [_] (try! (query-forms a op (pq/definition-annotations a model name) false))))))
+                          (ModuleHeader []
+                                        (answer1 a "Answer"
+                                                 (CCode (try! (forms-of a "module-header"
+                                                                        (pq/module-header a model (try! (query-name a op args))))))))
+                          (ModuleImpls []
+                                       (answer1 a "Answer"
+                                                (CCode (try! (forms-of a "module-impls"
+                                                                       (pq/module-impls a model (try! (query-name a op args)))))))))
+                        cx)))))))
+
+;;; A source query's answer when there is no source view. Asking whether there is
+;;; one builds it (source-view-ready?), so a query asks before it reads the view.
+(defn source-unavailable [(a (dyn Allocator)) (op CodeOp) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (answer op (answer0 a "SourceUnavailable") cx))
+
+(defn source-is [(a (dyn Allocator)) (op CodeOp) (list Sexp) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (answer op (answer1 a "SourceIs" (CCode list)) cx))
+
+;;; The source view's list at LIST, for a query that takes no arguments.
+(defn source-list-query [(a (dyn Allocator)) (op CodeOp) (list (ptr Sexp)) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))]
+  (-> (Result CtVal Diag))
+  (cond (!= (len (load args)) 0)
+          (Err [CtVal Diag] (derr (sconcat a (op-label op) ": expects no arguments")))
+        (not (source-view-ready?)) (source-unavailable a op cx)
+        :else (source-is a op (load list) cx)))
+
+(defn cop-source [(op CodeOp) (s SourceOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (let [state (comptime-unit-state)
+        a (.a cx)]
+    (match s
+      (SourceModules [] (source-list-query a op (field state source_modules) args cx))
+      (SourceReferences [] (source-list-query a op (field state source_references) args cx))
+      (SourceImports [] (source-list-query a op (field state source_imports) args cx))
+      (SourceBindingOf []
+                       (match (cv-get args 0)
+                         (Some [v]
+                               (if (and (is-ccode v) (= (len (load args)) 1))
+                                   (answer op
+                                           (if (not (source-view-ready?))
+                                               (answer0 a "BindingUnknown")
+                                               (match (get (.source_occurrences state) (source-occurrence-key a (ccode-of v)))
+                                                 (Some [occurrence] (source-binding-answer a (.binding occurrence)))
+                                                 (None [] (answer0 a "BindingUnknown"))))
+                                           cx)
+                                   (Err [CtVal Diag] (derr "source-binding: expects one Code node"))))
+                         (None [] (Err [CtVal Diag] (derr "source-binding: expects one Code node")))))
+      (QualifyImport [] (cop-qualify-import op args cx))
+      (SuggestEdits [] (cop-suggest-edits op args cx)))))
+
+;;; The module or name a program-facts query asks about, which it needs.
+(defn facts-name [(a (dyn Allocator)) (op CodeOp) (name (slice u8))] (-> (Result (slice u8) Diag))
+  (if (= (len name) 0)
+      (Err [(slice u8) Diag] (derr (sconcat a (op-label op) ": expects a symbol")))
+      (Ok [(slice u8) Diag] name)))
+
+;;; Whether the program facts a use query reads were recorded.
+(defn facts-unavailable? [] (-> bool)
+  (or (not (source-view-ready?)) (not (.storage_open (source-facts)))))
+
+;;; The indexed queries of the source view and the checked program
+;;; (docs/design/PROGRAM_FACTS.md). Each is a lookup the size of its answer.
+;;;
+;;; code-module-references MODULE   its authored references
+;;; code-import-references IMPORT   the references that resolved through IMPORT,
+;;;                                 a `code-source-imports` record
+;;; code-references-to TARGET       references to TARGET: a qualified symbol, or a
+;;;                                 local's identity (an integer)
+;;; code-module-binders MODULE      its `let` binders, `(binder MODULE NAME ID FORM VALUE)`
+;;; code-module-imports MODULE      its authored imports
+;;; code-reference-form REF         the form the reference heads
+;;; code-definition-form NAME       the authored form that defines NAME
+;;; code-resolved-uses NAME         how many checked uses resolve to NAME
+;;; code-field-uses STRUCT          the fields of STRUCT the program uses
+;;; code-cast-structs               the structs a pointer cast converts
+;;; code-path NODE                  `((FORM INDEX) …)`: the authored forms around
+;;;                                 NODE, outermost first, each with the index of
+;;;                                 the next step
+;;; code-module-forms MODULE HEAD   MODULE's authored forms headed by the core
+;;;                                 syntax HEAD
+(defn cop-facts [(op CodeOp) (f FactsOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (try
+    (let [a (.a cx)
+          state (comptime-unit-state)
+          index (field state source_index)
+          arg (match (cv-get args 0)
+                (Some [v] (if (is-ccode v) (Some (ccode-of v)) (None [Sexp])))
+                (None [] (None [Sexp])))
+          name (match arg
+                 (Some [c] (cond (= (sx-tag c) 2) (sx-sval c)
+                                 (= (sx-tag c) 0) (sconcat a "#" (i64->str a (sx-ival c)))
+                                 :else ""))
+                 (None [] ""))]
+      (match f
+        (ModuleReferences []
+                          (let [n (try! (facts-name a op name))]
+                            (if (not (source-view-ready?)) (source-unavailable a op cx) (source-is a op (source-index-references a (field index by_module) n) cx))))
+        (ImportReferences []
+                          (if (not (source-view-ready?))
+                              (source-unavailable a op cx)
+                              (source-is a op
+                                         (source-index-references
+                                           a (field index by_import)
+                                           (match arg
+                                             (Some [import]
+                                                   (if (and (= (sx-tag import) 6) (>= (sx-len (sx-items import)) 4))
+                                                       (sconcat3 a (sx-sval (sx-at (sx-items import) 1)) " "
+                                                                 (sx-sval (sx-at (sx-items import) 3)))
+                                                       ""))
+                                             (None [] "")))
+                                         cx)))
+        (ReferencesTo []
+                      (let [n (try! (facts-name a op name))]
+                        (if (not (source-view-ready?)) (source-unavailable a op cx) (source-is a op (source-index-references a (field index by_target) n) cx))))
+        (ModuleBinders []
+                       (let [n (try! (facts-name a op name))]
+                         (if (not (source-view-ready?)) (source-unavailable a op cx) (source-is a op (source-index-list a (field index binders) n) cx))))
+        (ModuleImports []
+                       (let [n (try! (facts-name a op name))]
+                         (if (not (source-view-ready?)) (source-unavailable a op cx) (source-is a op (source-index-list a (field index imports) n) cx))))
+        (ReferenceForm []
+                       (answer op
+                               (if (not (source-view-ready?))
+                                   (answer0 a "NoProgram")
+                                   (match arg
+                                     (Some [ref]
+                                           (let [node (if (and (= (sx-tag ref) 6) (> (sx-len (sx-items ref)) 2)
+                                                               (= (sx-head-name (sx-items ref)) "reference"))
+                                                          (sx-at (sx-items ref) 2)
+                                                          ref)]
+                                             (match (get (.forms index) (source-occurrence-key a node))
+                                               (Some [form] (answer1 a "Answer" (CCode form)))
+                                               (None [] (answer0 a "NotInProgram")))))
+                                     (None [] (answer0 a "NotInProgram"))))
+                               cx))
+        (DefinitionForm []
+                        (answer op
+                                (match (program-model)
+                                  (None [] (answer0 a "NoProgram"))
+                                  (Some [model0]
+                                        (let [model (primitive/alloc-stack pq/ProgramModel)]
+                                          (set! model model0)
+                                          (let [form (pq/defining-form a model name)]
+                                            (if (or (= (primitive/cast i64 form) 0) (not (source-view-ready?)))
+                                                (answer0 a "NotInProgram")
+                                                (match (get (.written index) (source-written-key a (sx-source (load form)) (sx-lo (load form))))
+                                                  (Some [written] (answer1 a "Answer" (CCode written)))
+                                                  (None [] (answer0 a "NotInProgram"))))))))
+                                cx))
+        (ResolvedUses []
+                      (answer op
+                              (if (= (primitive/cast i64 (sem-model)) 0)
+                                  (answer0 a "NoProgram")
+                                  (answer1 a "Answer"
+                                           (CCode (mk-sexp (KInt (match (get (load (.resolved (program-facts))) name)
+                                                                   (Some [n] n)
+                                                                   (None [] 0)))
+                                                           -1 -1))))
+                              cx))
+        (FieldUses []
+                   (answer op
+                           (if (facts-unavailable?)
+                               (answer0 a "NoProgram")
+                               (let [(mut items) (ArrayList::new [Sexp] a)]
+                                 (match (get (.field_uses (source-facts)) name)
+                                   (Some [fields] (for fd (iter (load fields)) (push! (mut items) (sx-sym fd))))
+                                   (None [] 0))
+                                 (answer1 a "Answer" (CCode (sx-mklist (box-al [Sexp] a (load items)))))))
+                           cx))
+        (CastStructs []
+                     (answer op
+                             (if (facts-unavailable?)
+                                 (answer0 a "NoProgram")
+                                 (let [(mut items) (ArrayList::new [Sexp] a)]
+                                   (for st (iter (.cast_structs (source-facts))) (push! (mut items) (sx-sym st)))
+                                   (answer1 a "Answer" (CCode (sx-mklist (box-al [Sexp] a (load items)))))))
+                             cx))
+        (CodePath []
+                  (answer op
+                          (if (not (source-view-ready?))
+                              (answer0 a "NoProgram")
+                              (match arg
+                                (Some [node]
+                                      (let [(mut path) (ArrayList::new [Enclosing] a)]
+                                        (if (and (source-path index node (mut path)) (> (len path) 0))
+                                            (let [(mut steps) (ArrayList::new [Sexp] a)]
+                                              (for step (iter path)
+                                                (let [(mut pair) (ArrayList::new [Sexp] a)]
+                                                  (push! (mut pair) (.form step))
+                                                  (push! (mut pair) (mk-sexp (KInt (.index step)) -1 -1))
+                                                  (push! (mut steps) (sx-mklist (box-al [Sexp] a (load pair))))))
+                                              (answer1 a "Answer" (CCode (sx-mklist (box-al [Sexp] a (load steps))))))
+                                            (answer0 a "NotInProgram"))))
+                                (None [] (answer0 a "NotInProgram"))))
+                          cx))
+        (ModuleForms []
+                     (match (cv-get args 1)
+                       (Some [hv]
+                             (if (and (is-ccode hv) (= (sx-tag (ccode-of hv)) 2) (> (len name) 0))
+                                 (if (not (source-view-ready?))
+                                     (source-unavailable a op cx)
+                                     (source-is a op
+                                                (source-index-list a (field index by_head)
+                                                                   (sconcat3 a name " " (sx-sval (ccode-of hv))))
+                                                cx))
+                                 (Err [CtVal Diag] (derr "module-forms: expects a module and a head, both symbols"))))
+                       (None [] (Err [CtVal Diag] (derr "module-forms: expects a module and a head, both symbols")))))))))
+
+;;; K's variant in coil.primitive.DefinitionKind, by name, for its answer.
+(defn definition-kind-variant [(k primitive/DefinitionKind)] (-> (slice u8))
+  (pq/definition-kind-name k))
+
+;;; `(primitive/code-macro-of NODE)`: the macro whose expansion produced NODE. A
+;;; node's context names its expansion, and the expansion records the macro.
+(defn cop-macro-of [(op CodeOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (match (cv-get args 0)
+    (None [] (Err [CtVal Diag] (derr "code-macro-of: expects (primitive/code-macro-of NODE)")))
+    (Some [nodev]
+      (if (not (is-ccode nodev))
+          (Err [CtVal Diag] (derr "code-macro-of: expects a Code node"))
+          (let [a (.a cx)
+                ctxt (sx-ctxt (ccode-of nodev))
+                table (.expansions cx)]
+            (answer op
+                    (cond (= ctxt 0) (answer0 a "Handwritten")
+                          (or (= (primitive/cast i64 table) 0) (> ctxt (len (load table))))
+                            (answer0 a "ProvenanceUnknown")
+                          :else
+                            (let [name (.macro_name (elem table (- ctxt 1)))]
+                              ; A slot the provenance prune freed names nothing.
+                              (if (= (len name) 0)
+                                  (answer0 a "ProvenanceUnknown")
+                                  (answer1 a "ExpandedBy" (sym-value name)))))
+                    cx))))))
+
+;;; `(primitive/code-alias-of NODE)`: the `defalias` the reference NODE resolves
+;;; through. The scope is the resolver's own at NODE, as for `resolve-at`, and the
+;;; lookup is the one qualification performs.
+(defn cop-alias-of [(op CodeOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (let [usage "code-alias-of: expects (primitive/code-alias-of NODE), NODE a symbol or a call"]
+    (match (cv-get args 0)
+      (None [] (Err [CtVal Diag] (derr usage)))
+      (Some [nodev]
+        (if (not (is-ccode nodev))
+            (Err [CtVal Diag] (derr usage))
+            (let [node (ccode-of nodev)
+                  spelled
+                    (cond (= (sx-tag node) 2) (Some (sx-sval node))
+                          (and (= (sx-tag node) 6)
+                               (and (> (sx-len (sx-items node)) 0)
+                                    (= (sx-tag (sx-at (sx-items node) 0)) 2)))
+                            (Some (sx-sval (sx-at (sx-items node) 0)))
+                          :else (None [(slice u8)]))]
+              (match spelled
+                (None [] (Err [CtVal Diag] (derr usage)))
+                (Some [name]
+                  (let [b (sem-model-box)
+                        a (.a cx)]
+                    (answer op
+                            (match (scope-at-lookup (sx-node-id node))
+                              (None [] (answer0 a "AliasUnknown"))
+                              (Some [at]
+                                (cond (scope-binds? (.tip at) name) (answer0 a "NoAlias")
+                                      (= (primitive/cast i64 (.declarations b)) 0) (answer0 a "AliasUnknown")
+                                      :else
+                                        (match (resolve-alias-in a (scope-module-at (.module at))
+                                                 (.imports b) (.exports b) (.declarations b) name)
+                                          (None [] (answer0 a "NoAlias"))
+                                          (Some [alias] (answer1 a "ThroughAlias" (sym-value alias)))))))
+                            cx))))))))))
+
+(defn cop-binding-of [(args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal
+                                                                                   Diag))
+  (match (cv-get args 0)
+    (Some [v]
+          (if (is-ccode v)
+              (Ok [CtVal Diag] (CInt (bind-map-lookup (source-checked-node (ccode-of v)))))
+              (Err [CtVal Diag] (derr "binding-of: expects a Code node"))))
+    (None []
+          (Err [CtVal Diag]
+               (derr "binding-of: expects (primitive/binding-of NODE)")))))
+
+(defn cop-type-of [(op CodeOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal
+                                                                                          Diag))
+  (let [a (.a cx)]
+    (match (cv-get args 0)
+      (None []
+            (Err [CtVal Diag]
+                 (derr "type-of: expects (primitive/type-of NODE)")))
+      (Some [nodev]
+            (if (not (is-ccode nodev))
+                (Err [CtVal Diag] (derr "type-of: expects a Code node"))
+                (let [node (ccode-of nodev)]
+                  (answer op
+                          (match (let [id (source-checked-id (sx-node-id node) (sx-source node)
+                                                             (sx-lo node) (sx-hi node) (sx-ctxt node))]
+                                   (match (source-context-type id)
+                                     (Some [t] (Some t))
+                                     (None [] (type-map-lookup id))))
+                            (None [] (answer0 a "TypeUnknown"))
+                            (Some [t] (answer1 a "TypeIs" (CCode (ty->sexp a (box-type a t))))))
+                          cx)))))))
+
+; If the query was module-qualified (`mod.name`, no alias slash), the module part.
+(defn decl-qual-module [(q (slice u8))] (-> (slice u8))
+  (if (>= (find-slash q) 0) "" (before-last-dot q)))
+
+; Does an authoritative qualified name match the queried simple name (+ optional module)?
+(defn cp-name-match [(qname (slice u8))
+                     (simple (slice u8))
+                     (wantmod (slice u8))] (-> bool)
+  (and (= (after-last-dot qname) simple)
+       (or (= (len wantmod) 0)
+           (= (before-last-dot qname) wantmod))))
+
+; The symbol a Code node names: a bare symbol is itself; a call/list uses its head.
+(defn decl-node-name [(a (dyn Allocator)) (node Sexp)] (-> (slice u8))
+  (if (= (sx-tag node) 2)
+      (lexical-name a node)
+      (if (= (sx-tag node) 6)
+          (let [it (sx-items node)]
+            (if (>= (sx-len it) 1)
+                (let [h (sx-at it 0)]
+                  (if (= (sx-tag h) 2) (lexical-name a h) ""))
+                ""))
+          "")))
+
+; The params-vector `[T…]` of a function's signature, as Code.
+(defn fn-params-vec [(a (dyn Allocator)) (fp (ptr Func))] (-> Sexp)
+  (let [ps (load (field fp params))
+        n (len (load ps))
+        (mut items) (ArrayList::new [Sexp] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (push! (mut items)
+                       (ty->sexp a (field (elem ps (load i)) ty)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (mk-sexp (KVec (box-al [Sexp] a (load items))) -1 -1)))
+
+;;; What `code-decl` answers a node resolved to: the module that declares it, its
+;;; kind, its exact qualified name, and for a function or method its signature.
+;;; Canonical identity is the name the checker resolved, so semantic tools never
+;;; reconstruct a binding from its authored spelling. `code-decl` answers it as
+;;; coil.primitive.DeclAnswer's `(Declared MODULE KIND NAME SIGNATURE)`.
+(defstruct DeclRecord
+  [(module (slice u8)) (kind primitive/DeclKind) (name (slice u8)) (signature Sexp)])
+
+(defn decl-record [(a (dyn Allocator)) (module (slice u8)) (kind primitive/DeclKind)
+                   (name (slice u8)) (signature (ArrayList Sexp))] (-> DeclRecord)
+  (DeclRecord :module module :kind kind :name name
+              :signature (mk-sexp (KList (box-al [Sexp] a signature)) -1 -1)))
+
+;;; A function's signature: `([PARAM-TYPE…] RET)`.
+(defn fn-decl-record [(a (dyn Allocator)) (fp (ptr Func))] (-> DeclRecord)
+  (let [(mut items) (ArrayList::new [Sexp] a)]
+    (push! (mut items) (fn-params-vec a fp))
+    (push! (mut items) (ty->sexp a (field fp ret)))
+    (decl-record a (before-last-dot (.name fp)) (primitive/FunctionDecl) (.name fp) (load items))))
+
+;;; A struct, sum, trait, const or extern: no signature.
+(defn kind-decl-record [(a (dyn Allocator))
+                        (module (slice u8))
+                        (kind primitive/DeclKind)
+                        (qname (slice u8))] (-> DeclRecord)
+  (decl-record a module kind qname (ArrayList::new [Sexp] a)))
+
+; Dedicated AST primitives are not Program functions. Give their checked source
+; nodes a declaration record so semantic tools need not trust surface spelling.
+(defn primitive-decl-record [(a (dyn Allocator)) (qualified (slice u8))] (-> DeclRecord)
+  (decl-record a (before-last-dot qualified) (primitive/PrimitiveDecl) qualified
+               (ArrayList::new [Sexp] a)))
+
+; A variant construction names the exact qualified variant the checker selected,
+; in the module of the sum that owns it.
+(defn variant-decl-record [(a (dyn Allocator))
+                           (sumq (slice u8))
+                           (variantq (slice u8))] (-> DeclRecord)
+  (decl-record a (before-last-dot sumq) (primitive/VariantDecl) variantq (ArrayList::new [Sexp] a)))
+
+;;; K's variant in coil.primitive.DeclKind, by name, for its answer.
+(defn decl-kind-variant [(k primitive/DeclKind)] (-> (slice u8))
+  (match k
+    (primitive/FunctionDecl [] "FunctionDecl")
+    (primitive/MethodDecl [] "MethodDecl")
+    (primitive/StructDecl [] "StructDecl")
+    (primitive/SumDecl [] "SumDecl")
+    (primitive/VariantDecl [] "VariantDecl")
+    (primitive/TraitDecl [] "TraitDecl")
+    (primitive/ConstDecl [] "ConstDecl")
+    (primitive/ExternDecl [] "ExternDecl")
+    (primitive/PrimitiveDecl [] "PrimitiveDecl")))
+
+(defn decl-answer [(a (dyn Allocator)) (r DeclRecord)] (-> CtVal)
+  (let [(mut fields) (ArrayList::new [CtVal] a)]
+    (push! (mut fields) (sym-value (.module r)))
+    (push! (mut fields) (answer0 a (decl-kind-variant (.kind r))))
+    (push! (mut fields) (sym-value (.name r)))
+    (push! (mut fields) (CCode (.signature r)))
+    (answer-value a "Declared" (load fields))))
+
+; Search the checked Program for a FUNCTION by simple name (+ optional module).
+; status 0 found (fn set), 1 none, 2 ambiguous.
+(defstruct CpFn [(status i64) (fn (ptr Func))])
+
+(defn declaration-index-add! [(index (mut (HashMap (slice u8) i64)))
+                               (name (slice u8)) (position i64)] (-> i64)
+  (let [next (match (get index name)
+                (None [] position)
+                (Some [first] (if (< first 0) first (- (- 0 first) 1))))]
+    (set! (mut index) name next)
+    0))
+
+(defn function-decl-index [(p (ptr Program))] (-> (ptr FunctionDeclIndex))
+  (let [b (field (comptime-unit-state) function_decls)
+        fs (load (field p funcs))]
+    (when (or (= (.init b) 0)
+              (or (!= (.program b) p) (!= (.count b) (len fs))))
+      (let [a (sem-maps-allocator)]
+        (set! (.exact b) (HashMap::new [(slice u8) i64] a (keyops-borrowed)))
+        (set! (.simple b) (HashMap::new [(slice u8) i64] a (keyops-borrowed)))
+        (set! (.qualified b) (HashMap::new [(slice u8) i64] a (keyops-borrowed)))
+        (for [i 0 (len fs)]
+          (let [name (.name (elem fs i))
+                simple (after-last-dot name)]
+            (unless (contains? (.exact b) name)
+              (set! (mut (.exact b)) name i) 0)
+            (declaration-index-add! (mut (.qualified b)) name i)
+            (declaration-index-add! (mut (.simple b)) simple i)))
+        (set! (.program b) p)
+        (set! (.count b) (len fs))
+        (set! (.init b) 1))
+      0)
+    b))
+
+(defn cp-find-fn [(p (ptr Program)) (simple (slice u8)) (wantmod (slice u8))] (-> CpFn)
+  (let [b (function-decl-index p)
+        r (primitive/alloc-stack CpFn)
+        found (if (= (len wantmod) 0)
+                  (get (.simple b) simple)
+                  (get (.qualified b)
+                          (sconcat (unit-allocator) (sconcat (unit-allocator) wantmod ".") simple)))]
+    (set! (.fn r) (primitive/cast (ptr Func) 0))
+    (set! (.status r) 1)
+    (match found
+      (Some [i]
+        (let [position (if (< i 0) (- (- 0 i) 1) i)]
+          (set! (.fn r) (elem (.funcs p) position))
+          (set! (.status r) (if (< i 0) 2 0))))
+      (None [] 0))
+    (load r)))
+
+; Find a function by its EXACT fully-qualified name (what resolution recorded).
+(defn cp-find-fn-exact [(p (ptr Program)) (qname (slice u8))] (-> (ptr Func))
+  (match (get (.exact (function-decl-index p)) qname)
+    (Some [i] (elem (.funcs p) i))
+    (None [] (primitive/cast (ptr Func) 0))))
+
+; The qualified name of the SUM that owns a variant whose qualified name is `qname`,
+; or "" if none. (Variant constructions resolve their ECall.func to the variant.)
+(defn cp-sum-of-variant [(p (ptr Program)) (qname (slice u8))] (-> (slice u8))
+  (let [sums (load (field p sums))
+        n (len sums)
+        (mut i) 0
+        (mut r) ""]
+    (loop (if (or (> (len (load r)) 0) (>= (load i) n))
+              (break)
+              (do
+                (let [sd (elem sums (load i))
+                      vs (load (field sd variants))
+                      nv (len vs)
+                      (mut j) 0]
+                  (loop (if (>= (load j) nv)
+                            (break)
+                            (do
+                              (when (= (load (field (elem vs
+                                                          (load j))
+                                                    name))
+                                       qname)
+                                (store! r (load (field sd name)))
+                                (break))
+                              (set! j (primitive/iadd (load j) 1))))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (load r)))
+
+; A resolved decl: found=false → not in cp (caller falls back to name-based lookup).
+(defstruct CpDecl [(found bool) (rec DeclRecord)])
+
+;;; A method's signature: `([PARAM-TYPE…] RET OWNER-TYPE [TRAIT])`.
+;;;
+;;; It begins exactly like a function's signature, so a tool that treats calls
+;;; uniformly can ignore the difference. MODULE is
+;;; the module that declares the type the impl is for, `coil.arraylist` for an impl
+;;; on `(ArrayList T)`, which is where a selector like `myapp.jobs/*` expects to find
+;;; the type's methods; it is empty for a type no module declares (`i64`,
+;;; `(ptr T)`). QUALIFIED-NAME is that module and the method's own name. OWNER-TYPE is the type the selected impl is for; TRAIT
+;;; is present only for a trait method and names the trait, so the pair identifies
+;;; the impl the checker chose.
+(defn method-decl-record [(a (dyn Allocator)) (im (ptr ImplDef)) (fp (ptr Func))] (-> DeclRecord)
+  (let [(mut items) (ArrayList::new [Sexp] a)
+        ; From the type's declared name, not its printed form: `(coil.arraylist.ArrayList
+        ; T)` printed and cut at its last dot gave the module `(coil.arraylist`.
+        module (before-last-dot (impl-base-name a (field im self_type)))]
+    (push! (mut items) (fn-params-vec a fp))
+    (push! (mut items) (ty->sexp a (field fp ret)))
+    (push! (mut items) (ty->sexp a (field im self_type)))
+    (when (impl-is-trait im)
+      (push! (mut items) (sx-sym (impl-trait-name im)))
+      0)
+    (decl-record a module (primitive/MethodDecl)
+                 (if (= (len module) 0)
+                     (decl-simple-name (.name fp))
+                     (sconcat3 a module "." (decl-simple-name (.name fp))))
+                 (load items))))
+
+;;; The same record for a call whose receiver is a type parameter: the trait's own
+;;; declaration, with the trait's Self parameter where the owning type would be,
+;;; since which type that is depends on how the enclosing function is specialised.
+(defn trait-method-decl-record [(a (dyn Allocator))
+                                (td (ptr TraitDef))
+                                (tm (ptr TraitMethod))] (-> DeclRecord)
+  (let [(mut items) (ArrayList::new [Sexp] a)
+        (mut params) (ArrayList::new [Sexp] a)
+        module (before-last-dot (.name td))]
+    (for [i 0 (len (load (.params tm)))]
+      (push! (mut params) (ty->sexp a (field (elem (load (field tm params)) i) ty))))
+    (push! (mut items) (mk-sexp (KVec (box-al [Sexp] a (load params))) -1 -1))
+    (push! (mut items) (ty->sexp a (field tm ret)))
+    (push! (mut items) (sx-sym (.self_param td)))
+    (push! (mut items) (sx-sym (.name td)))
+    (decl-record a module (primitive/MethodDecl)
+                 (if (= (len module) 0)
+                     (decl-simple-name (.name tm))
+                     (sconcat3 a module "." (decl-simple-name (.name tm))))
+                 (load items))))
+
+(defn variant-owner [(qname (slice u8))] (-> (slice u8))
+  (let [b (variant-owner-box)]
+    (if (= (.init b) 0)
+        ""
+        (match (get (load (load (field b index))) qname)
+          (Some [sumq] sumq)
+          (None [] "")))))
+
+; Build the decl record for the entity whose EXACT qualified name resolution recorded.
+; Searches functions, then struct/sum/trait/const/extern, then sum variants.
+(defn cp-find-exact-decl [(a (dyn Allocator))
+                          (p (ptr Program))
+                          (qname (slice u8))] (-> CpDecl)
+  (let [r (primitive/alloc-stack CpDecl)
+        sumq (variant-owner qname)
+        ; A checked program also lists each impl method as a function under its
+        ; resolved name. Asked for as a method first, so that it is reported as the
+        ; method it is, with its type and trait, not as a function of that name.
+        fn
+          (if (or (> (len sumq) 0)
+                  (contains? (load (method-decl-index p)) qname))
+              (primitive/cast (ptr Func) 0)
+              (cp-find-fn-exact p qname))]
+    (set! (.found r) false)
+    (if (> (len sumq) 0)
+        (do
+          (set! (.found r) true)
+          (set! (.rec r) (variant-decl-record a sumq qname))
+          0)
+        (if (!= (primitive/cast i64 fn) 0)
+            (do
+              (set! (.found r) true)
+              (set! (.rec r) (fn-decl-record a fn))
+              0)
+          (if (contains? (load (method-decl-index p)) qname)
+            (let [at (match (get (load (method-decl-index p)) qname) (Some [v] v) (None [] 0))]
+              (set! (.found r) true)
+              (set! (.rec r)
+                    (if (>= at 0)
+                        (let [im (elem (load (field p impls)) (primitive/idiv at 65536))]
+                          (method-decl-record a
+                                              im
+                                              (elem (load (field im methods))
+                                                    (primitive/irem at 65536))))
+                        (let [code (primitive/isub (primitive/isub 0 at) 1)
+                              td (elem (load (field p traits)) (primitive/idiv code 65536))]
+                          (trait-method-decl-record a
+                                                    td
+                                                    (elem (load (field td methods))
+                                                          (primitive/irem code 65536))))))
+              0)
+            (let [kinds (kind-decl-index p)]
+              (match (get (.exact kinds) qname)
+                (Some [i]
+                  (let [e (elem (.items kinds) i)]
+                    (set! (.found r) true)
+                    (set! (.rec r) (kind-decl-record a (before-last-dot qname) (.kind e) qname))
+                    0))
+                (None [] 0))
+              (unless (load (field r found))
+                (let [sq (cp-sum-of-variant p qname)]  ; variant construction → its sum
+                  (when (> (len sq) 0)
+                    (store! (field r found) true)
+                    (store! (field r rec) (variant-decl-record a sq qname))
+                    0)))))))
+    (load r)))
+
+(defn nk-push [(dst (ptr (ArrayList NamedKind)))
+               (name (slice u8))
+               (kind primitive/DeclKind)] (-> i64)
+  (let [e (primitive/alloc-stack NamedKind)]
+    (set! (.name e) name)
+    (set! (.kind e) kind)
+    (push! dst (load e))
+    0))
+
+; Collect every struct/sum/trait/const/extern as a (qualified-name, kind) pair.
+; Kind records also belong to a publication: repeated negative code-decl
+; queries must not allocate and rescan all type/constant/extern declarations.
+(defn kind-decl-index [(p (ptr Program))] (-> (ptr KindDeclIndex))
+  (let [b (field (comptime-unit-state) kind_decls)]
+    (when (or (= (.init b) 0) (!= (.program b) p))
+      (let [a (sem-maps-allocator)
+            items (cp-kind-decls-build a p)]
+        (set! (.items b) items)
+        (set! (.exact b) (HashMap::new [(slice u8) i64] a (keyops-borrowed)))
+        (for [i 0 (len (load items))]
+          (let [name (.name (elem items i))]
+            (unless (contains? (.exact b) name)
+              (set! (mut (.exact b)) name i) 0)))
+        (set! (.program b) p)
+        (set! (.init b) 1))
+      0)
+    b))
+
+(defn cp-kind-decls [(a (dyn Allocator)) (p (ptr Program))] (-> (ptr (ArrayList NamedKind)))
+  (.items (kind-decl-index p)))
+
+(defn cp-kind-decls-build [(a (dyn Allocator)) (p (ptr Program))] (-> (ptr (ArrayList NamedKind)))
+  (let [(mut out) (ArrayList::new [NamedKind] a)
+        ss (load (field p structs))
+        sums (load (field p sums))
+        tr (load (field p traits))
+        cs (load (field p consts))
+        ex (load (field p externs))
+        (mut i) 0]
+    (set! i 0)
+    (loop (if (>= (load i) (len ss))
+              (break)
+              (do
+                (nk-push (mut out)
+                         (.name (elem ss (load i)))
+                         (primitive/StructDecl))
+                (set! i (primitive/iadd (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (len sums))
+              (break)
+              (do
+                (nk-push (mut out)
+                         (.name (elem sums (load i)))
+                         (primitive/SumDecl))
+                (set! i (primitive/iadd (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (len tr))
+              (break)
+              (do
+                (nk-push (mut out)
+                         (.name (elem tr (load i)))
+                         (primitive/TraitDecl))
+                (set! i (primitive/iadd (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (len cs))
+              (break)
+              (do
+                (nk-push (mut out)
+                         (.name (elem cs (load i)))
+                         (primitive/ConstDecl))
+                (set! i (primitive/iadd (load i) 1)))))
+    (set! i 0)
+    (loop (if (>= (load i) (len ex))
+              (break)
+              (do
+                (nk-push (mut out)
+                         (.name (elem ex (load i)))
+                         (primitive/ExternDecl))
+                (set! i (primitive/iadd (load i) 1)))))
+    (box-al [NamedKind] a (load out))))
+
+(defn cop-decl [(op CodeOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal
+                                                                             Diag))
+  (let [a (.a cx)
+        p (sem-model)]
+    (match (cv-get args 0)
+      (None []
+            (Err [CtVal Diag]
+                 (derr "code-decl: expects (primitive/code-decl NODE)")))
+      (Some [nodev]
+            (if (not (is-ccode nodev))
+                (Err [CtVal Diag] (derr "code-decl: expects a Code node"))
+                (if (= (primitive/cast i64 p) 0)
+                    (answer op (answer0 a "DeclUnresolved") cx)
+                    ; EXACT path first: if this node is a reference the checker resolved — an
+                    ; expression ref (call, fn-ptr, variant) via its node id, or a TYPE ref via
+                    ; its (module, raw-name) → use the recorded qualified name. No ambiguity,
+                    ; cross-module correct.
+                    ; A list the checker recorded no resolution for is not a
+                    ; reference by its head's spelling: `(open bool)` in a field
+                    ; or parameter list is a binding, not a call of `open`. Only
+                    ; a type application such as `(ArrayList T)` answers through
+                    ; its head, which resolves in its module as a type; the
+                    ; value and by-name lookups are for bare symbols.
+                    (let [node (ccode-of nodev)
+                          is-list (= (sx-tag node) 6)
+                          rq0 (res-map-lookup (source-checked-node node))
+                          source-module (src-mod-lookup (sx-source node))
+                          raw-name (decl-node-name a node)
+                          value-rq (if is-list "" (value-res-lookup source-module raw-name))
+                          rqn
+                            (if (> (len rq0) 0)
+                                rq0
+                                (if (> (len value-rq) 0)
+                                    value-rq
+                                    (type-res-lookup source-module raw-name)))
+                          rd (primitive/alloc-stack CpDecl)]
+                      (set! rd
+                            (if (or (= rqn "coil.primitive.cast")
+                                    (or (= rqn "coil.primitive.field")
+                                      (or (= rqn "coil.primitive.load")
+                                          (= rqn "coil.primitive.store!"))))
+                                (let [z (primitive/alloc-stack CpDecl)]
+                                  (set! (.found z) true)
+                                  (set! (.rec z) (primitive-decl-record a rqn))
+                                  (load z))
+                                (if (and (> (len rqn) 0)
+                                         (not (= rqn "$unresolved")))
+                                    (let [found (cp-find-exact-decl a p rqn)]
+                                      found)
+                                    (let [z (primitive/alloc-stack CpDecl)]
+                                      (set! (.found z) false)
+                                      (load z)))))
+                      (if (= rqn "$unresolved")
+                          (answer op (answer0 a "DeclUnresolved") cx)
+                          (if (.found rd)
+                              (answer op (decl-answer a (.rec rd)) cx)
+                              (let [nm (if is-list "" (decl-node-name a (ccode-of nodev)))]
+                                (if (= (len nm) 0)
+                                    (answer op (answer0 a "DeclUnresolved") cx)
+                                    (let [simple (decl-simple-name nm)
+                                          wantmod (decl-qual-module nm)
+                                          fr (primitive/alloc-stack CpFn)]
+                                      (set! fr (cp-find-fn p simple wantmod))
+                                      (if (= (.status fr)
+                                             2)
+                                          (answer op (answer0 a "DeclAmbiguous") cx)
+                                          (if (= (.status fr)
+                                                 0)
+                                              (answer op (decl-answer a (fn-decl-record a (load (field fr fn)))) cx)
+                                              ; not a function — scan the kind-only declarations
+                                              (let [nks (cp-kind-decls a p)
+                                                    (mut cnt) 0
+                                                    (mut first) (None [NamedKind])]
+                                                (for [i 0 (len (load nks))]
+                                                  (let [e (elem nks i)]
+                                                    (when (cp-name-match (.name e) simple wantmod)
+                                                      (when (= (load cnt) 0) (set! first (Some (load e))) 0)
+                                                      (set! cnt (+ (load cnt) 1))
+                                                      0)))
+                                                (match (load first)
+                                                  (None [] (answer op (answer0 a "DeclUnresolved") cx))
+                                                  (Some [e]
+                                                    (if (> (load cnt) 1)
+                                                        (answer op (answer0 a "DeclAmbiguous") cx)
+                                                        (answer op
+                                                                (decl-answer a (kind-decl-record a (before-last-dot (.name e)) (.kind e) (.name e)))
+                                                                cx)))))))))))))))))))
+
+(defn type-kind-tag [(t Type) (cx (ptr CtCtx))] (-> i64)
+  (match t
+    (TInt [b s] 0)
+    (TFloat [b] 1)
+    (TBool [] 2)
+    (TStruct [n]
+             (if (!= (primitive/cast i64 (ct-struct-find cx n))
+                     0)
+                 3
+                 (if (!= (primitive/cast i64 (ct-sum-find cx n))
+                         0)
+                     4
+                     8)))
+    (TApp [n a]
+          (if (!= (primitive/cast i64 (ct-struct-find cx n))
+                  0)
+              3
+              (if (!= (primitive/cast i64 (ct-sum-find cx n))
+                      0)
+                  4
+                  8)))
+    (TPtr [i] 5)
+    (TRef [m i] 5)
+    (TArray [e k] 6)
+    (TSlice [e] 7)
+    (_ 8)))
+
+;;; The import and export tables a reflected name is resolved against: every
+;;; module's, while macros expand. A context with none (a comptime fold) resolves
+;;; only the resolver's recorded answers, exact declaration names, and the
+;;; writing module's own declarations.
+(defn ct-imports [(cx (ptr CtCtx))] (-> (ptr (ArrayList ImpEntry)))
+  (if (= (primitive/cast i64 (.all_imports cx)) 0)
+      (box-al [ImpEntry] (.a cx) (ArrayList::new [ImpEntry] (.a cx)))
+      (.all_imports cx)))
+
+(defn ct-exports [(cx (ptr CtCtx))] (-> (ptr (ArrayList ExpEntry)))
+  (if (= (primitive/cast i64 (.all_exports cx)) 0)
+      (box-al [ExpEntry] (.a cx) (ArrayList::new [ExpEntry] (.a cx)))
+      (.all_exports cx)))
+
+;;; A struct or sum CX sees whose name ends in the segment SPELLED, or "": what a
+;;; diagnostic about a name not in scope can point at.
+(defn ct-type-named-elsewhere [(cx (ptr CtCtx)) (spelled (slice u8))] (-> (slice u8))
+  (let [leaf (after-last-qualifier spelled)]
+    (block :found
+      (let [ss (ct-structs-visible cx)]
+        (unless (= (primitive/cast i64 ss) 0)
+          (for [i 0 (len (load ss))]
+            (when (= (after-last-dot (.name (elem ss i))) leaf) (break :found (.name (elem ss i)))))
+          0))
+      (let [us (ct-sums-visible cx)]
+        (unless (= (primitive/cast i64 us) 0)
+          (for [i 0 (len (load us))]
+            (when (= (after-last-dot (.name (elem us i))) leaf) (break :found (.name (elem us i)))))
+          0))
+      (let [p (sem-model)]
+        (unless (= (primitive/cast i64 p) 0)
+          (for [i 0 (len (load (load (field p structs))))]
+            (let [sd (elem (load (field p structs)) i)]
+              (when (= (after-last-dot (.name sd)) leaf) (break :found (.name sd)))))
+          (for [i 0 (len (load (load (field p sums))))]
+            (let [ud (elem (load (field p sums)) i)]
+              (when (= (after-last-dot (.name ud)) leaf) (break :found (.name ud)))))
+          0))
+      "")))
+
+;;; "'X' names no WHAT in scope in module 'M'".
+(defn ct-not-in-scope-msg [(a (dyn Allocator)) (spelled (slice u8)) (what (slice u8)) (module (Option (slice u8)))] (-> (slice u8))
+  (sconcat3 a
+            (sconcat3 a "comptime: '" spelled "' names no ")
+            what
+            (match module
+              (Some [m] (sconcat3 a " in scope in module '" m "'"))
+              (None [] " in scope here"))))
+
+;;; The struct or sum the type symbol NODE names where it was written: the
+;;; resolver's recorded answer for that spelling in that module when it names
+;;; one, a declaration whose exact name it is (a generated one keeps its lexical
+;;; key), or what `resolve-type-ref` finds in scope there.
+(defn ct-resolve-type-ref [(cx (ptr CtCtx)) (node Sexp)] (-> (Result (slice u8) Diag))
+  (let [a (.a cx)
+        raw (lexical-name a node)
+        module (ct-node-module node)
+        recorded (type-res-lookup (match module (Some [m] m) (None [] "")) raw)]
+    ; A recorded answer that names no declaration is the resolver's "not found",
+    ; given before a macro declared the type; it does not settle the question.
+    (cond (and (> (len recorded) 0) (ct-type-declared? cx recorded)) (Ok [(slice u8) Diag] recorded)
+          (ct-type-declared? cx raw) (Ok [(slice u8) Diag] raw)
+          :else
+            (match (resolve-type-ref (sx-sval node) module cx (ct-imports cx) (ct-exports cx) a)
+              (Err [d] (Err [(slice u8) Diag] d))
+              (Ok [found]
+                  (match found
+                    (Some [q] (Ok [(slice u8) Diag] q))
+                    (None []
+                          (let [msg (ct-not-in-scope-msg a (sx-sval node) "struct or sum" module)
+                                elsewhere (ct-type-named-elsewhere cx (sx-sval node))]
+                            (Err [(slice u8) Diag]
+                                 (derr (if (= elsewhere "")
+                                           msg
+                                           (sconcat3 a msg "; " (sconcat a elsewhere " is not imported there")))))))))))))
+
+;;; The trait the symbol NODE names where it was written, for reflection.
+(defn ct-resolve-trait-ref [(cx (ptr CtCtx)) (node Sexp)] (-> (Result (slice u8) Diag))
+  (let [module (ct-node-module node)]
+    (match (resolve-trait-ref (sx-sval node) module cx (ct-imports cx) (ct-exports cx) (.a cx))
+      (Err [d] (Err [(slice u8) Diag] d))
+      (Ok [found]
+          (match found
+            (Some [q] (Ok [(slice u8) Diag] q))
+            (None [] (Err [(slice u8) Diag] (derr (ct-not-in-scope-msg (.a cx) (sx-sval node) "trait" module)))))))))
+
+;;; The sum declaring the variant the symbol NODE names where it was written.
+(defn ct-resolve-variant-ref [(cx (ptr CtCtx)) (node Sexp)] (-> (Result (ptr SumDef) Diag))
+  (let [module (ct-node-module node)]
+    (match (resolve-variant-ref (sx-sval node) module cx (ct-imports cx) (ct-exports cx) (.a cx))
+      (Err [d] (Err [(ptr SumDef) Diag] d))
+      (Ok [found]
+          (match found
+            (Some [q] (Ok [(ptr SumDef) Diag] (ct-variant-sum cx q)))
+            (None [] (Err [(ptr SumDef) Diag] (derr (ct-not-in-scope-msg (.a cx) (sx-sval node) "variant" module)))))))))
+
+;;; `(primitive/code-variant-ref NODE)`: the variant the constructor symbol NODE
+;;; names where it was written, through that module's imports and aliases, as a
+;;; VariantRef.
+(defn cop-variant-ref [(op CodeOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (match (code-symnode args)
+    (None [] (Err [CtVal Diag] (derr "code-variant-ref: expects (primitive/code-variant-ref SYMBOL)")))
+    (Some [node]
+          (match (resolve-variant-ref (sx-sval node) (ct-node-module node) cx (ct-imports cx) (ct-exports cx) (.a cx))
+            (Err [d] (Err [CtVal Diag] d))
+            (Ok [found]
+                (answer op
+                        (match found
+                          (Some [q] (answer1 (.a cx) "NamesVariant" (CCode (sx-sym q))))
+                          (None [] (answer0 (.a cx) "NamesNoVariant")))
+                        cx))))))
+
+;;; `(primitive/code-type-ref NODE)`: the struct or sum the type symbol NODE names
+;;; where it was written, as a TypeRef. A type with no declaration (`i64`, a type
+;;; parameter) names none.
+(defn cop-type-ref [(op CodeOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (match (code-symnode args)
+    (None [] (Err [CtVal Diag] (derr "code-type-ref: expects (primitive/code-type-ref SYMBOL)")))
+    (Some [node]
+          (let [a (.a cx)
+                raw (lexical-name a node)
+                module (ct-node-module node)
+                recorded (type-res-lookup (match module (Some [m] m) (None [] "")) raw)
+                found (cond (and (> (len recorded) 0) (ct-type-declared? cx recorded)) (Ok [(Option (slice u8)) Diag] (Some recorded))
+                            (ct-type-declared? cx raw) (Ok [(Option (slice u8)) Diag] (Some raw))
+                            :else (resolve-type-ref (sx-sval node) module cx (ct-imports cx) (ct-exports cx) a))]
+            (match found
+              (Err [d] (Err [CtVal Diag] d))
+              (Ok [q]
+                  (answer op
+                          (match q
+                            (Some [name] (answer1 a "NamesType" (CCode (sx-sym name))))
+                            (None [] (answer0 a "NamesNoType")))
+                          cx)))))))
+
+;;; The first argument as a Code symbol, for code-variant-sum and code-trait-*.
+(defn code-symnode [(args (ptr (ArrayList CtVal)))] (-> (Option Sexp))
+  (match (cv-get args 0)
+    (Some [v]
+          (if (and (is-ccode v) (= (sx-tag (ccode-of v)) 2))
+              (Some (ccode-of v))
+              (None [Sexp])))
+    (None [] (None [Sexp]))))
+
+;;; Argument I of a code operation, or MISSING as the error when there is none.
+(defn op-arg [(args (ptr (ArrayList CtVal))) (i i64) (missing (slice u8))] (-> (Result CtVal Diag))
+  (match (cv-get args i)
+    (Some [v] (Ok [CtVal Diag] v))
+    (None [] (Err [CtVal Diag] (derr missing)))))
+
+;;; Argument I as an integer, or ERR as the error when it is missing or not one.
+(defn op-int [(args (ptr (ArrayList CtVal))) (i i64) (err (slice u8))] (-> (Result i64 Diag))
+  (match (cv-get args i)
+    (Some [v] (if (= (ct-tag v) 0) (Ok [i64 Diag] (cint-of v)) (Err [i64 Diag] (derr err))))
+    (None [] (Err [i64 Diag] (derr err)))))
+
+;;; I, when it indexes COUNT items; "comptime: WHAT index I out of range" when not.
+(defn op-in-range [(a (dyn Allocator)) (i i64) (count i64) (what (slice u8))] (-> (Result i64 Diag))
+  (if (or (< i 0) (>= i count))
+      (Err [i64 Diag] (derr (sconcat3 a (sconcat3 a "comptime: " what " index ") (i64->str a i) " out of range")))
+      (Ok [i64 Diag] i)))
+
+;;; Argument I as a Code node, with the errors every location query gives.
+(defn op-node [(a (dyn Allocator)) (args (ptr (ArrayList CtVal))) (op CodeOp)] (-> (Result Sexp Diag))
+  (let [name (codeop-name op)]
+    (match (cv-get args 0)
+      (Some [v]
+            (if (is-ccode v)
+                (Ok [Sexp Diag] (ccode-of v))
+                (Err [Sexp Diag] (derr (sconcat a name ": expects a Code node")))))
+      (None [] (Err [Sexp Diag] (derr (sconcat3 a (sconcat3 a name ": expects (primitive/" name) " NODE)" "")))))))
+
+;;; OP's name without its `code-` prefix, as its diagnostics spell it.
+(defn op-label [(op CodeOp)] (-> (slice u8))
+  (let [name (codeop-name op)]
+    (if (starts-with name "code-") (subslice [u8] name 5 (len name)) name)))
+
+(defn cop-concat-finish [(as-symbol bool) (name (slice u8)) (errf (Option Diag))] (-> (Result CtVal
+                                                                                              Diag))
+  (match errf
+    (Some [d] (Err [CtVal Diag] d))
+    (None []
+          (if as-symbol
+              (let [p (primitive/alloc-stack Sexp)]
+                (set! p
+                      (if (and (> (len name) 0)
+                               (= (primitive/cast i64 (get name 0)) 58))
+                          (mk-sexp (KKw (subslice [u8] name 1 (len name)))
+                                   -1
+                                   -1)
+                          (sx-sym name)))
+                ; Datum construction has no lexical context. A negative marker
+                ; keeps it distinct from source syntax until an explicit context
+                ; operation classifies it.
+                (set! (.hyg p) -1)
+                (set! (.horigin p) 3)
+                (Ok [CtVal Diag] (CCode (load p))))
+              (Ok [CtVal Diag] (CStr name))))))
+
+(defn concat-one! [(a (dyn Allocator))
+                   (buf (mut (ArrayList u8)))
+                   (v CtVal)
+                   (tg i64)] (-> (Option Diag))
+  (cond (= tg 3)
+          (do (append-bytes! (mut buf) (cstr-of v)) (None [Diag]))
+        (= tg 0)
+          (do (append-bytes! (mut buf) (i64->str a (cint-of v))) (None [Diag]))
+        (= tg 4)
+          (let [c (ccode-of v)
+                ctg (sx-tag c)]
+            ; A symbol or string is its text, and so is a keyword, without
+            ; the colon: `(code-str :initial)` is "initial".
+            (cond (or (= ctg 2)
+                      (= ctg 3)
+                      (= ctg 4))
+                    (do (append-bytes! (mut buf) (sx-sval c)) (None [Diag]))
+                  (= ctg 0)
+                    (do
+                      (append-bytes! (mut buf) (i64->str a (sx-ival c)))
+                      (None [Diag]))
+                  (or (= ctg 6)
+                      (= ctg 7))
+                    (let [m (inst-node-mangle a c)]
+                      (if (= m "")
+                          (Some (derr "comptime: code-symbol/str part is not a nameable type (expected a symbol, string, int, or instantiation (Gen …))"))
+                          (do (append-bytes! (mut buf) m) (None [Diag]))))
+                  :else
+                    (Some (derr (sconcat a
+                                         "comptime: code-symbol/str part must be a symbol, keyword, string, int or instantiation, got "
+                                         (cond (= ctg 1) "a float"
+                                               (= ctg 5) (sconcat3 a "the C string c\"" (sx-sval c) "\"")
+                                               :else "another kind of Code"))))))
+        :else
+          (Some (derr (sconcat a
+                               "comptime: code-symbol/str part must be a string, int or Code, got "
+                               (cond (= tg 1) "a bool"
+                                     (= tg 2) "a float"
+                                     :else "an aggregate value"))))))
+
+(defn concat-into! [(args (ptr (ArrayList CtVal)))
+                    (i i64)
+                    (n i64)
+                    (a (dyn Allocator))
+                    (buf (mut (ArrayList u8)))] (-> (Option Diag))
+  (if (>= i n)
+      (None [Diag])
+      (let [v (get (load args) i)]
+        (match (concat-one! a (mut buf) v (ct-tag v))
+          (Some [d] (Some d))
+          (None [] (concat-into! args (primitive/iadd i 1) n a (mut buf)))))))
+
+;;; `code-symbol` when AS-SYMBOL, else `code-str`: the arguments' text, joined.
+(defn cop-concat [(as-symbol bool) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal
+                                                                                                Diag))
+  (let [a (.a cx)
+        (mut buf) (ArrayList::new [u8] a)
+        e (concat-into! args 0 (len (load args)) a (mut buf))]
+    (cop-concat-finish as-symbol (slice (load buf)) e)))
+
+; ---- scope-bearing identifier operations ----------------------------------
+(defn ct-ident-name [(v CtVal)] (-> (Result (slice u8) Diag))
+  (cond (= (ct-tag v) 3) (Ok (cstr-of v))
+        (is-ccode v)
+          (let [s (ccode-of v)
+                tg (sx-tag s)]
+            (if (or (= tg 2) (= tg 4))
+                (Ok (sx-sval s))
+                (Err (derr "identifier name must be a string or symbol Code"))))
+        :else (Err (derr "identifier name must be a string or symbol Code"))))
+
+(defn ident-copy-with [(a (dyn Allocator))
+                       (orig Sexp)
+                       (name (slice u8))
+                       (hyg i64)] (-> Sexp)
+  (let [p (box! a Sexp (primitive/zeroed Sexp))]
+    (set! p orig)
+    (set! (.kind p) (KSym name))
+    (set! (.hyg p) hyg)
+    (set! (.node-id p) (next-node-id))
+    (load p)))
+
+; substitute type-parameter symbols in a type Code tree with the given arg forms:
+; `(ptr T)` with T->i64 becomes `(ptr i64)`. The engine of GENERIC REFLECTION —
+; `code-field-type` on an instantiation `(Gen A B)` reports concrete field types.
+(defn subst-type-code [(node Sexp)
+                       (params (ptr (ArrayList (slice u8))))
+                       (targs (ptr (ArrayList Sexp)))] (-> Sexp)
+  (let [tg (sx-tag node)]
+    (if (= tg 2)
+        (let [nm (sx-sval node)
+              np (len (load params))
+              nt (len (load targs))
+              (mut idx) -1
+              (mut i) 0]
+          (loop (if (or (>= (load idx) 0) (>= (load i) np))
+                    (break)
+                    (do
+                      (when (and (= (get (load params) (load i)) nm)
+                                 (< (load i) nt))
+                        (store! idx (load i)))
+                      (set! i (primitive/iadd (load i) 1)))))
+          (if (>= (load idx) 0)
+              (get (load targs) (load idx))
+              node))
+        (if (or (= tg 6) (= tg 7))
+            (let [a (unit-allocator)
+                  items (sx-items node)
+                  n (sx-len items)
+                  (mut xs) (ArrayList::new [Sexp] a)
+                  (mut i) 0]
+              (loop (if (>= (load i) n)
+                        (break)
+                        (do
+                          (push! (mut xs)
+                                 (subst-type-code (sx-at items (load i))
+                                                  params
+                                                  targs))
+                          (set! i (primitive/iadd (load i) 1)))))
+              (mk-sexp (if (= tg 7)
+                           (KVec (box-al [Sexp] a (load xs)))
+                           (KList (box-al [Sexp] a (load xs))))
+                       -1
+                       -1))
+            node))))
+
+;;; The registration for TRAIT (a qualified name), or null.
+(defn derive-reg-find [(trait (slice u8))
+                       (impb (ptr (ArrayList ImpEntry)))
+                       (expb (ptr (ArrayList ExpEntry)))
+                       (a (dyn Allocator))] (-> (Result (ptr DeriveEnt) Diag))
+  (match (derive-reg-settle! impb expb a)
+    (Some [d] (Err [(ptr DeriveEnt) Diag] d))
+    (None [] (Ok [(ptr DeriveEnt) Diag] (derive-reg-settled trait)))))
+
+;;; The module whose scope the symbol NODE was written in: its hygiene module when
+;;; a macro template wrote it (None for a fresh identifier, which names nothing
+;;; global), else the module its source belongs to (None when that is unknown).
+(defn ct-node-module [(node Sexp)] (-> (Option (slice u8)))
+  (if (> (sx-hyg node) 0)
+      (let [m (sx-hmod node)]
+        (if (= (len m) 0) (None [(slice u8)]) (Some m)))
+      (let [m (src-mod-lookup (sx-source node))]
+        (if (= (len m) 0) (None [(slice u8)]) (Some m)))))
+
+;;; The trait the type argument at IDX names where it was written: its qualified
+;;; name, None when no trait of that spelling is in scope there.
+(defn ct-trait-arg [(args (ptr (ArrayList CtVal))) (idx i64) (cx (ptr CtCtx))] (-> (Result (Option (slice u8)) Diag))
+  (match (cv-get args idx)
+    (None [] (Err [(Option (slice u8)) Diag] (derr "code-deriver: expects (primitive/code-deriver TRAIT TYPE) with two type symbols")))
+    (Some [v]
+          (if (or (not (is-ccode v)) (!= (sx-tag (ccode-of v)) 2))
+              (Err [(Option (slice u8)) Diag] (derr "code-deriver: expects (primitive/code-deriver TRAIT TYPE) with two type symbols"))
+              (if (or (= (primitive/cast i64 (.all_imports cx)) 0)
+                      (= (primitive/cast i64 (.all_exports cx)) 0))
+                  (Err [(Option (slice u8)) Diag] (derr "code-deriver: a trait is resolved only while macros expand"))
+                  (let [node (ccode-of v)]
+                    (resolve-trait-ref (sx-sval node) (ct-node-module node) (primitive/cast (ptr CtCtx) 0)
+                                       (.all_imports cx) (.all_exports cx) (.a cx))))))))
+
+;;; The type symbol a reflection op's argument IDX names: `Node`, or the head of
+;;; the instantiation `(Gen A B)`, whose arguments are pushed onto TARGS unless it
+;;; is null. None when the argument is neither.
+(defn refl-type-node [(args (ptr (ArrayList CtVal))) (idx i64) (targs (ptr (ArrayList Sexp)))] (-> (Option Sexp))
+  (match (cv-get args idx)
+    (None [] (None [Sexp]))
+    (Some [v]
+          (if (not (is-ccode v))
+              (None [Sexp])
+              (let [node (ccode-of v)
+                    tg (sx-tag node)]
+                (cond (and (or (= tg 6) (= tg 7))
+                           (and (>= (sx-len (sx-items node)) 1)
+                                (= (sx-tag (sx-at (sx-items node) 0)) 2)))
+                        (do (unless (= (primitive/cast i64 targs) 0)
+                              (for [i 1 (sx-len (sx-items node))]
+                                (push! [Sexp] targs (sx-at (sx-items node) i)))
+                              0)
+                            (Some (sx-at (sx-items node) 0)))
+                      (= tg 2) (Some node)
+                      :else (None [Sexp])))))))
+
+;;; Was the derive target written as a bare name, `Pair`, rather than `(Pair T)`?
+(defn derive-target-bare? [(args (ptr (ArrayList CtVal)))] (-> bool)
+  (match (cv-get args 1)
+    (Some [v] (and (is-ccode v) (= (sx-tag (ccode-of v)) 2)))
+    (None [] false)))
+
+;;; The type-parameter count of the struct SD or the sum UD (0 when both are null).
+(defn derive-target-type-params [(sd (ptr StructDef)) (ud (ptr SumDef))] (-> i64)
+  (cond (!= (primitive/cast i64 sd) 0) (len (load (load (field sd type_params))))
+        (!= (primitive/cast i64 ud) 0) (len (load (load (field ud type_params))))
+        :else 0))
+
+;;; `(primitive/code-deriver TRAIT TYPE)` — the registered deriver for TRAIT,
+;;; already chosen for TYPE's shape.
+;;;
+;;; Taking the TYPE as well as the trait is what keeps `code-struct?`/`code-sum?`
+;;; out of the language: the compiler already knows which shape `TYPE` is, so the
+;;; arm choice and the diagnostic for a missing arm both live here, in one place,
+;;; instead of being re-derived by every `derive` implementation.
+(defn cop-deriver [(args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal
+                                                                                Diag))
+  (match (ct-trait-arg args 0 cx)
+    (Err [d] (Err [CtVal Diag] d))
+    (Ok [found]
+        (match found
+          (Some [trait] (cop-deriver-for trait args cx))
+          (None []
+                (Err [CtVal Diag]
+                     (derr (sconcat3 (.a cx)
+                                     "derive: '"
+                                     (sx-sval (ccode-of (get (load args) 0)))
+                                     "' does not name a trait in scope here"))))))))
+
+;;; `cop-deriver` once its trait argument has resolved to TRAIT.
+(defn cop-deriver-for [(trait (slice u8)) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal
+                                                                                                        Diag))
+  (let [a (.a cx)]
+    (match (derive-reg-find trait (ct-imports cx) (ct-exports cx) a)
+      (Err [d] (Err [CtVal Diag] d))
+      (Ok [ent]
+          (cond (= (primitive/cast i64 ent) 0)
+                  (Err [CtVal Diag]
+                       (derr (sconcat3 a
+                                       "derive: no deriver is registered for trait '"
+                                       trait
+                                       "' — declare one with (defderive …), and check that the module declaring it is imported here")))
+                :else
+                  (match (refl-type-node args 1 (primitive/cast (ptr (ArrayList Sexp)) 0))
+                    (None []
+                          (Err [CtVal Diag]
+                               (derr "code-deriver: expects (primitive/code-deriver TRAIT TYPE) with two type symbols")))
+                    (Some [node]
+                          (match (ct-resolve-type-ref cx node)
+                            (Err [d] (Err [CtVal Diag] d))
+                            (Ok [tname]
+                                (let [sd (ct-struct-find cx tname)
+                                      ud (ct-sum-find cx tname)]
+                                  (cond (and (derive-target-bare? args)
+                                             (> (derive-target-type-params sd ud) 0))
+                                          (Err [CtVal Diag]
+                                               (derr (sconcat3 a
+                                                               "derive: '"
+                                                               tname
+                                                               "' is generic; name its parameters, as in (derive Trait (Type T))")))
+                                        (!= (primitive/cast i64 sd) 0)
+                                          (if (= (.arm_struct ent) "")
+                                              (Err [CtVal Diag]
+                                                   (derr (sconcat3 a
+                                                                   "derive: trait '"
+                                                                   trait
+                                                                   "' has no deriver for structs (its registration declares no `struct` arm); write the impl by hand")))
+                                              (Ok [CtVal Diag] (CCode (sx-sym (.arm_struct ent)))))
+                                        (!= (primitive/cast i64 ud) 0)
+                                          (if (= (.arm_sum ent) "")
+                                              (Err [CtVal Diag]
+                                                   (derr (sconcat3 a
+                                                                   "derive: trait '"
+                                                                   trait
+                                                                   "' has no deriver for sums (its registration declares no `sum` arm); write the impl by hand")))
+                                              (Ok [CtVal Diag] (CCode (sx-sym (.arm_sum ent)))))
+                                        :else
+                                          (Err [CtVal Diag]
+                                               (derr (sconcat3 a
+                                                               "derive: '"
+                                                               tname
+                                                               "' is neither a struct nor a sum"))))))))))))))
+
+;;; The struct or sum arg0 of a reflection op names: a type symbol `Node` or the
+;;; head of an instantiation `(Gen A B)`, whose type-argument forms are pushed
+;;; onto TARGS. "" when arg0 is neither form; an error when it names nothing in
+;;; scope where it was written.
+(defn refl-type-inst [(cx (ptr CtCtx)) (args (ptr (ArrayList CtVal)))
+                      (targs (ptr (ArrayList Sexp)))] (-> (Result (slice u8) Diag))
+  (match (refl-type-node args 0 targs)
+    (None [] (Ok [(slice u8) Diag] ""))
+    (Some [node] (ct-resolve-type-ref cx node))))
+
+;;; The struct a code-field-* operation names, with any instantiation's arguments
+;;; pushed onto TARGS.
+(defn reflected-struct [(cx (ptr CtCtx)) (args (ptr (ArrayList CtVal))) (targs (ptr (ArrayList Sexp)))]
+  (-> (Result (ptr StructDef) Diag))
+  (try
+    (let [a (.a cx)
+          tname (try! (refl-type-inst cx args targs))]
+      (when (= tname "")
+        (break :try
+               (Err [(ptr StructDef) Diag]
+                    (derr (match (cv-get args 0)
+                            (None []
+                                  "comptime: code-field-* expects a type symbol or instantiation (Gen …); received no value")
+                            (Some [v]
+                                  (if (is-ccode v)
+                                      (sconcat a
+                                               "comptime: code-field-* expects a type symbol or instantiation (Gen …); received "
+                                               (sexp-display a (ccode-of v)))
+                                      "comptime: code-field-* expects a type symbol or instantiation (Gen …); received a non-Code value")))))))
+      (let [sd (ct-struct-find cx tname)]
+        (if (= (primitive/cast i64 sd) 0)
+            (Err [(ptr StructDef) Diag]
+                 (derr (sconcat3 a "comptime: '" tname
+                                 "' is not a struct (primitive/field reflection needs a struct; sums unsupported)")))
+            (Ok [(ptr StructDef) Diag] sd))))))
+
+;;; The field of SD that argument 1 indexes.
+(defn struct-field-arg [(a (dyn Allocator)) (sd (ptr StructDef)) (args (ptr (ArrayList CtVal)))] (-> (Result (ptr Field) Diag))
+  (try
+    (let [fields (load (field sd fields))
+          i (try! (op-int args 1 "comptime: code-field-* index must be an integer"))]
+      (Ok [(ptr Field) Diag] (elem fields (try! (op-in-range a i (len (load fields)) "field")))))))
+
+;;; FP's type as Code, with an instantiation's arguments TARGS applied.
+(defn field-type-code [(params (ptr (ArrayList (slice u8)))) (fp (ptr Field)) (targs (ptr (ArrayList Sexp)))] (-> Sexp)
+  (if (> (len (load targs)) 0)
+      (subst-type-code (type->code (field fp ty)) params targs)
+      (type->code (field fp ty))))
+
+(defn cop-field [(op FieldOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (try
+    (let [a (.a cx)
+          targs (box-al [Sexp] a (ArrayList::new [Sexp] a))
+          sd (try! (reflected-struct cx args targs))
+          params (load (field sd type_params))]
+      (match op
+        (FieldCount [] (Ok [CtVal Diag] (CInt (len (load (field sd fields))))))
+        (FieldName [] (Ok [CtVal Diag] (CCode (sx-sym (.name (try! (struct-field-arg a sd args)))))))
+        ; substituted when an instantiation was given
+        (FieldKind []
+                   (let [ftyp (field (try! (struct-field-arg a sd args)) ty)]
+                     (if (= (len (load targs)) 0)
+                         (Ok [CtVal Diag] (CInt (type-kind-tag (load ftyp) cx)))
+                         (match (parse-type a (subst-type-code (type->code ftyp) params targs))
+                           (Ok [st] (Ok [CtVal Diag] (CInt (type-kind-tag st cx))))
+                           (Err [d] (Ok [CtVal Diag] (CInt (type-kind-tag (load ftyp) cx))))))))
+        ; the complete type syntax: the type's name alone would drop the arguments
+        ; of a field such as `(ArrayList i64)`, which a structural deriver needs to
+        ; select a policy for the field's actual type
+        (FieldType [] (Ok [CtVal Diag] (CCode (field-type-code params (try! (struct-field-arg a sd args)) targs))))
+        ; a nominal type answers with its qualified name, a structural one (a
+        ; pointer, function pointer or vector) with its complete syntax
+        (FieldQType []
+                    (let [fp (try! (struct-field-arg a sd args))]
+                      (if (> (len (load targs)) 0)
+                          (Ok [CtVal Diag] (CCode (field-type-code params fp targs)))
+                          (Ok [CtVal Diag]
+                              (match (load (field fp ty))
+                                (TStruct [n] (CCode (sx-sym n)))
+                                (TApp [n ar] (CCode (sx-sym n)))
+                                (_ (CCode (type->code (field fp ty)))))))))))))
+
+;;; The sum a code-variant-* operation names, with any instantiation's arguments
+;;; pushed onto TARGS.
+(defn reflected-sum [(cx (ptr CtCtx)) (args (ptr (ArrayList CtVal))) (targs (ptr (ArrayList Sexp)))]
+  (-> (Result (ptr SumDef) Diag))
+  (try
+    (let [arg (try! (refl-type-inst cx args targs))]
+      (when (= arg "")
+        (break :try (Err [(ptr SumDef) Diag] (derr "comptime: code-variant-* expects a symbol"))))
+      (let [sd (ct-sum-find cx arg)]
+        (if (= (primitive/cast i64 sd) 0)
+            (Err [(ptr SumDef) Diag] (derr (sconcat3 (.a cx) "comptime: '" arg "' is not a known sum")))
+            (Ok [(ptr SumDef) Diag] sd))))))
+
+;;; The variant of SD that argument 1 indexes.
+(defn sum-variant-arg [(a (dyn Allocator)) (sd (ptr SumDef)) (args (ptr (ArrayList CtVal)))] (-> (Result (ptr Variant) Diag))
+  (try
+    (let [variants (load (field sd variants))
+          i (try! (op-int args 1 "comptime: code-variant-* index must be an integer"))]
+      (Ok [(ptr Variant) Diag] (elem variants (try! (op-in-range a i (len (load variants)) "variant")))))))
+
+;;; The payload field of VP that argument 2 indexes.
+(defn variant-field-arg [(a (dyn Allocator)) (vp (ptr Variant)) (args (ptr (ArrayList CtVal)))] (-> (Result (ptr Field) Diag))
+  (try
+    (let [fv (try! (op-arg args 2 "comptime: code-variant-field-* takes (SUM VARIANT-INDEX FIELD-INDEX)"))]
+      (if (!= (ct-tag fv) 0)
+          (Err [(ptr Field) Diag] (derr "comptime: code-variant-field-* field index must be an integer"))
+          (let [fields (load (field vp fields))]
+            (Ok [(ptr Field) Diag]
+                (elem fields (try! (op-in-range a (cint-of fv) (len (load fields)) "variant field")))))))))
+
+(defn cop-variant [(op VariantOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (try
+    (let [a (.a cx)
+          targs (box-al [Sexp] a (ArrayList::new [Sexp] a))]
+      (match op
+        (VariantSum []
+                    (match (code-symnode args)
+                      (None [] (Err [CtVal Diag] (derr "comptime: code-variant-* expects a symbol")))
+                      (Some [node] (Ok [CtVal Diag] (CCode (sx-sym (.name (try! (ct-resolve-variant-ref cx node)))))))))
+        (VariantCount []
+                      (Ok [CtVal Diag] (CInt (len (load (field (try! (reflected-sum cx args targs)) variants))))))
+        (VariantName []
+                     (let [vp (try! (sum-variant-arg a (try! (reflected-sum cx args targs)) args))]
+                       (Ok [CtVal Diag] (CCode (sx-sym (after-last-dot (.name vp)))))))
+        ; the name as STORED, fully qualified, so generated code resolves under any
+        ; import style
+        (VariantQName []
+                      (let [vp (try! (sum-variant-arg a (try! (reflected-sum cx args targs)) args))]
+                        (Ok [CtVal Diag] (CCode (sx-sym (.name vp))))))
+        (VariantFields []
+                       (let [vp (try! (sum-variant-arg a (try! (reflected-sum cx args targs)) args))]
+                         (Ok [CtVal Diag] (CInt (len (load (field vp fields)))))))
+        (VariantFieldName []
+                          (let [vp (try! (sum-variant-arg a (try! (reflected-sum cx args targs)) args))
+                                fp (try! (variant-field-arg a vp args))]
+                            (Ok [CtVal Diag] (CCode (sx-sym (.name fp))))))
+        ; the structured type, with the reflected sum's arguments applied
+        (VariantFieldType []
+                          (let [sd (try! (reflected-sum cx args targs))
+                                vp (try! (sum-variant-arg a sd args))
+                                fp (try! (variant-field-arg a vp args))]
+                            (Ok [CtVal Diag] (CCode (field-type-code (load (field sd type_params)) fp targs)))))))))
+
+;;; The trait a code-trait-* operation names.
+(defn reflected-trait [(cx (ptr CtCtx)) (args (ptr (ArrayList CtVal)))] (-> (Result (ptr TraitDef) Diag))
+  (try
+    (match (code-symnode args)
+      (None [] (Err [(ptr TraitDef) Diag] (derr "comptime: code-trait-* expects a trait symbol")))
+      (Some [node]
+            (let [tname (try! (ct-resolve-trait-ref cx node))
+                  td (ct-trait-find cx tname)]
+              (if (= (primitive/cast i64 td) 0)
+                  (Err [(ptr TraitDef) Diag] (derr (sconcat3 (.a cx) "comptime: '" tname "' is not a known trait")))
+                  (Ok [(ptr TraitDef) Diag] td)))))))
+
+;;; The method of TD that argument 1 indexes.
+(defn trait-method-arg [(a (dyn Allocator)) (td (ptr TraitDef)) (args (ptr (ArrayList CtVal)))] (-> (Result (ptr TraitMethod) Diag))
+  (try
+    (let [methods (load (field td methods))
+          i (try! (op-int args 1 "comptime: code-trait-* method index must be an integer"))]
+      (Ok [(ptr TraitMethod) Diag] (elem methods (try! (op-in-range a i (len (load methods)) "trait method")))))))
+
+;;; The parameter of M that argument 2 indexes.
+(defn trait-param-arg [(a (dyn Allocator)) (m (ptr TraitMethod)) (args (ptr (ArrayList CtVal)))] (-> (Result (ptr Param) Diag))
+  (try
+    (let [params (load (field m params))
+          i (try! (op-int args 2 "comptime: code-trait-param-* needs a method index and a param index"))]
+      (Ok [(ptr Param) Diag] (elem params (try! (op-in-range a i (len (load params)) "trait param")))))))
+
+(defn cop-trait [(op TraitOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (try
+    (let [a (.a cx)
+          td (try! (reflected-trait cx args))]
+      (match op
+        (TraitMethodCount [] (Ok [CtVal Diag] (CInt (len (load (field td methods))))))
+        (TraitMethodName []
+                         (let [m (try! (trait-method-arg a td args))]
+                           (Ok [CtVal Diag] (CCode (sx-sym (.name m))))))
+        (TraitArity []
+                    (let [m (try! (trait-method-arg a td args))]
+                      (Ok [CtVal Diag] (CInt (len (load (field m params)))))))
+        (TraitRetType []
+                      (let [m (try! (trait-method-arg a td args))]
+                        (Ok [CtVal Diag] (CCode (type->code (field m ret))))))
+        (TraitParamName []
+                        (let [p (try! (trait-param-arg a (try! (trait-method-arg a td args)) args))]
+                          (Ok [CtVal Diag] (CCode (sx-sym (.name p))))))
+        (TraitParamType []
+                        (let [p (try! (trait-param-arg a (try! (trait-method-arg a td args)) args))]
+                          (Ok [CtVal Diag] (CCode (type->code (field p ty))))))))))
+
+(defn cop-hygiene [(op HygieneOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (try
+    (let [a (.a cx)]
+      (match op
+        (FreshIdentifier []
+                         (let [name (try! (ct-ident-name (try! (op-arg args 0 "fresh-identifier: expects a display name"))))
+                               s (mk-sexp (KSym name) -1 -1)
+                               p (primitive/alloc-stack Sexp)]
+                           (set! p s)
+                           (let [scope (primitive/iadd (next-gensym) 1)]
+                             (set! (.hyg p) scope)
+                             (set! (.horigin p) 2)
+                             ; Fresh lexical identity is deliberately module-neutral.
+                             ; Definition-site module context belongs to template
+                             ; literals, not generated binders that may be transported
+                             ; into a target.
+                             (set! (.hmod p) (no-hmod)))
+                           (Ok [CtVal Diag] (CCode (load p)))))
+        (DatumToSyntax []
+                       (let [pv (try! (op-arg args 0 "datum->syntax: expects prototype and name"))
+                             nv (try! (op-arg args 1 "datum->syntax: expects prototype and name"))]
+                         (when (not (is-ccode pv))
+                           (break :try (Err [CtVal Diag] (derr "datum->syntax: prototype must be Code"))))
+                         (let [proto (ccode-of pv)
+                               p (primitive/alloc-stack Sexp)]
+                           (set! p (ident-copy-with a proto (try! (ct-ident-name nv)) (sx-hyg proto)))
+                           ; A derived name keeps the fresh scope of its prototype.
+                           ; Source emission must rename it with that identity too.
+                           (set! (.horigin p) (if (= (sx-horigin proto) 2) 2 4))
+                           (Ok [CtVal Diag] (CCode (load p))))))
+        (SyntaxToDatum []
+                       (let [iv (try! (op-arg args 0 "syntax->datum: expects identifier Code"))]
+                         (if (not (and (is-ccode iv) (= (sx-tag (ccode-of iv)) 2)))
+                             (Err [CtVal Diag] (derr "syntax->datum: expects identifier Code"))
+                             (let [p (primitive/alloc-stack Sexp)]
+                               (set! p (ident-copy-with a (ccode-of iv) (sx-sval (ccode-of iv)) 0))
+                               (set! (.hmod p) (no-hmod))
+                               (set! (.horigin p) 5)
+                               (Ok [CtVal Diag] (CCode (load p)))))))
+        ; free equality follows a canonical definition-site global even across
+        ; separate template evaluations
+        (FreeIdentifierEq [] (identifier-eq args true))
+        ; bound equality is exact lexical identity
+        (BoundIdentifierEq [] (identifier-eq args false))))))
+
+(defn identifier-eq [(args (ptr (ArrayList CtVal))) (free bool)] (-> (Result CtVal Diag))
+  (try
+    (let [xv (try! (op-arg args 0 "identifier equality expects two arguments"))
+          yv (try! (op-arg args 1 "identifier equality expects two arguments"))]
+      (if (not (and (is-ccode xv) (is-ccode yv)
+                    (= (sx-tag (ccode-of xv)) 2) (= (sx-tag (ccode-of yv)) 2)))
+          (Err [CtVal Diag] (derr "identifier equality expects two identifier Code values"))
+          (let [x (ccode-of xv)
+                y (ccode-of yv)
+                same-scope (= (sx-hyg x) (sx-hyg y))]
+            (Ok [CtVal Diag]
+                (CBool (and (= (sx-sval x) (sx-sval y))
+                            (if free
+                                (or same-scope (and (> (len (sx-hmod x)) 0) (= (sx-hmod x) (sx-hmod y))))
+                                same-scope)))))))))
+
+;;; `(code-type-traits TYPE)`: the traits TYPE implements, as a list of their
+;;; qualified names. TYPE is a type as `type-of` reports it. A trait counts when
+;;; the checker would accept a use of it at TYPE: an impl is selected and its
+;;; bounds hold there (`impl-holds?`). A generic impl such as `(impl [T] Eq (ptr T))`
+;;; covers every pointer, and `(impl [(T Debug)] Debug (Option T))` covers
+;;; `(Option S)` only when S has Debug. Reads the checked program, so it answers
+;;; `:unresolved` where there is none (a macro expanding before checking).
+(defn cop-type-traits [(op CodeOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (let [a (.a cx)
+        p (sem-model)
+        checker (.checker (sem-model-box))]
+    (match (cv-get args 0)
+      (None [] (Err [CtVal Diag] (derr "code-type-traits: expects (primitive/code-type-traits TYPE)")))
+      (Some [v]
+        (cond (not (is-ccode v))
+                (Err [CtVal Diag] (derr "code-type-traits: expects a type as Code"))
+              (or (= (primitive/cast i64 p) 0)
+                  (= (primitive/cast i64 checker) 0))
+                (answer op (answer0 a "TraitsUnknown") cx)
+              :else
+                ; TYPE names its types qualified, as type-of reports them, so the
+                ; lexical context a template gave them has nothing to add, and
+                ; parsed with it a quasiquoted `coil.core.Option` named no type.
+                (match (parse-type a (stage-datum-sexp a (ccode-of v)))
+                  (Err [d] (Err [CtVal Diag] d))
+                  (Ok [t]
+                    (let [tp (box-type a t)
+                          impls (load (field p impls))
+                          (mut names) (ArrayList::new [(slice u8)] a)
+                          (mut items) (ArrayList::new [Sexp] a)]
+                      (for [i 0 (len (load impls))]
+                        (let [im (elem impls i)]
+                          (when (impl-is-trait im)
+                            (let [name (impl-trait-name im)
+                                  (mut seen) false]
+                              (for [j 0 (len names)]
+                                (when (= (get names j) name) (set! seen true)))
+                              (unless seen
+                                (push! (mut names) name)
+                                (when (impl-holds? a checker name tp)
+                                  (push! (mut items) (sx-sym name))
+                                  0)
+                                0)))))
+                      (answer op
+                              (answer1 a "TraitsAre"
+                                       (CCode (mk-sexp (KList (box-al [Sexp] a (load items))) -1 -1)))
+                              cx)))))))))
+
+(defn cop-type-shape [(op CodeOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal
+                                                                                             Diag))
+  (let [a (.a cx)]
+    (match (refl-type-node args 0 (primitive/cast (ptr (ArrayList Sexp)) 0))
+      (None []
+            (Err [CtVal Diag]
+                 (derr "comptime: code-type-shape expects a type symbol or instantiation (Gen …)")))
+      (Some [node]
+            ; A name that is no struct or sum in scope (`i64`, a type parameter, a
+            ; type of a module not imported) has an unknown shape.
+            (answer op
+                    (match (ct-resolve-type-ref cx node)
+                      (Err [_] (answer0 a "UnknownShape"))
+                      (Ok [tname]
+                          (cond (!= (primitive/cast i64 (ct-struct-find cx tname)) 0) (answer0 a "StructShape")
+                                (!= (primitive/cast i64 (ct-sum-find cx tname)) 0) (answer0 a "SumShape")
+                                :else (answer0 a "UnknownShape"))))
+                    cx)))))
+
+(defn cop-strbytes [(args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal
+                                                                                 Diag))
+  (let [a (.a cx)]
+    (match (cv-get args 0)
+      (None [] (Err [CtVal Diag] (derr "comptime: str-bytes expects a string")))
+      (Some [v]
+            (let [ok
+                    (or (is-cstr v)
+                        (and (is-ccode v)
+                             (= (sx-tag (ccode-of v)) 4)))]
+              (if (not ok)
+                  (Err [CtVal Diag]
+                       (derr "comptime: str-bytes expects a string"))
+                  (let [s (if (is-cstr v) (cstr-of v) (sx-sval (ccode-of v)))
+                        n (len s)
+                        (mut xs) (ArrayList::new [Sexp] a)
+                        (mut i) 0]
+                    (loop (if (>= (load i) n)
+                              (break)
+                              (do
+                                (push! (mut xs)
+                                       (sx-mkint (primitive/cast i64
+                                                                 (get s
+                                                                      (load i)))))
+                                (set! i (primitive/iadd (load i) 1)))))
+                    (Ok [CtVal Diag]
+                        (CCode (sx-mklist (box-al [Sexp] a (load xs))))))))))))
+
+(defn cop-bytestostr [(args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal
+                                                                                   Diag))
+  (let [a (.a cx)]
+    (match (cv-get args 0)
+      (None [] (Err [CtVal Diag] (derr "comptime: bytes->str expects a list")))
+      (Some [v]
+            (let [islist
+                    (and (is-ccode v)
+                         (let [tg (sx-tag (ccode-of v))]
+                           (or (= tg 6)
+                               (= tg 7))))]
+              (if (not islist)
+                  (Err [CtVal Diag]
+                       (derr "comptime: bytes->str expects a list"))
+                  (let [items (sx-items (ccode-of v))
+                        n (sx-len items)
+                        (mut buf) (ArrayList::new [u8] a)
+                        (mut errf) (None [Diag])
+                        (mut i) 0]
+                    (loop (if (or (diag-some? (load errf)) (>= (load i) n))
+                              (break)
+                              (do
+                                (let [it (sx-at items (load i))]
+                                  (if (= (sx-tag it) 0)
+                                      (do
+                                        (push! (mut buf)
+                                               (primitive/cast u8 (sx-ival it)))
+                                        0)
+                                      (do
+                                        (set! errf
+                                              (Some (derr "comptime: bytes->str list must be all ints")))
+                                        0)))
+                                (set! i (primitive/iadd (load i) 1)))))
+                    (match (load errf)
+                      (Some [d] (Err [CtVal Diag] d))
+                      (None []
+                            (Ok [CtVal Diag]
+                                (CCode (sx-mkstr (slice (load buf))))))))))))))
+
+; op 38 — int->str: an integer (or int Code) to its decimal (slice u8), so name
+; generation from a counter/index is a one-liner instead of round-tripping bytes->str.
+(defn cop-inttostr [(args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal
+                                                                                 Diag))
+  (let [a (.a cx)]
+    (match (cv-get args 0)
+      (None []
+            (Err [CtVal Diag] (derr "comptime: int->str expects an integer")))
+      (Some [v]
+            (if (= (ct-tag v) 0)
+                (Ok [CtVal Diag] (CStr (i64->str a (cint-of v))))
+                (if (and (is-ccode v)
+                         (= (sx-tag (ccode-of v)) 0))
+                    (Ok [CtVal Diag] (CStr (i64->str a (sx-ival (ccode-of v)))))
+                    (Err [CtVal Diag]
+                         (derr "comptime: int->str expects an integer"))))))))
+
+;;; Compilation-scoped opaque Code handles (ops 71/72). Native phase programs —
+;;; staged-metacompilation entries such as compiled Scheme transformers — need to
+;;; retain exact syntax nodes inside their own tagged data structures, but Code
+;;; intentionally has no runtime representation. A checked table index crosses
+;;; that boundary without exposing an arena pointer or letting an arbitrary
+;;; integer become one. The boxed node lives in the INVOCATION's allocator, so a
+;;; handle is valid for the expansion that made it — keeping one across
+;;; invocations is the same use-after-reset any borrowed Code suffers, and
+;;; COIL_META_ARENA=poison makes it loud.
+(defn code-opaque-items [] (-> (ptr (array i64 1048576)))
+  (let [cell (field (comptime-unit-state) opaque_items)]
+    (when (= (primitive/cast i64 (load cell)) 0)
+      ; Only indices below opaque_count are read; each is written before it is
+      ; published. Avoid an eight-megabyte aggregate initializer on the stack.
+      (match (alloc [i64] (unit-allocator) 1048576)
+        (Some [items]
+              (set! cell
+                    (primitive/cast (ptr (array i64 1048576))
+                                    (data items))))
+        (None [] (oom-at c"opaque Code registry" 8388608)))
+      0)
+    (load cell)))
+
+(defn code-opaque-count [] (-> (ptr i64))
+  (field (comptime-unit-state) opaque_count))
+
+(defn code-opaque-add [(a (dyn Allocator)) (code Sexp)] (-> i64)
+  (let [i (load (code-opaque-count))]
+    (if (>= i 1048576)
+        0
+        (do
+          (set! (primitive/index (code-opaque-items) i)
+                (primitive/cast i64 (box-sexp a code)))
+          (set! (code-opaque-count) (+ i 1))
+          (+ i 1)))))
+
+(defn code-opaque-get [(handle i64)] (-> (ptr Sexp))
+  (let [i (- handle 1)
+        n (load (code-opaque-count))]
+    (if (or (< i 0) (>= i n))
+        (primitive/cast (ptr Sexp) 0)
+        (primitive/cast (ptr Sexp)
+                        (load (primitive/index (code-opaque-items) i))))))
+
+;;; Run code operation OP on ARGS, for a compiled metaprogram calling back through
+;;; metahost. Each family has its handler, and each handler matches its family
+;;; exhaustively.
+(defn code-op [(op CodeOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (when (and (.observing (source-facts))
+             (match (.spelling (codeop-spec op)) (Observes [] true) (Transparent [] false)))
+    (for value (load args)
+      (when (is-ccode value) (source-observe! (ccode-of value)) 0)) 0)
+  (match op
+    (ReadOps [o] (cop-read o args cx))
+    (MakeOps [o] (cop-make o args cx))
+    (ConvertOps [o] (cop-convert o args cx))
+    (HygieneOps [o] (cop-hygiene o args cx))
+    (FieldOps [o] (cop-field o args cx))
+    (VariantOps [o] (cop-variant o args cx))
+    (TraitOps [o] (cop-trait o args cx))
+    (TypeOps [o] (cop-type op o args cx))
+    (SemanticOps [o] (cop-semantic op o args cx))
+    (ProgramOps [o] (cop-program-query op o args cx))
+    (SourceOps [o] (cop-source op o args cx))
+    (FactsOps [o] (cop-facts op o args cx))
+    (ReportOps [o] (cop-report o args cx))
+    (LocationOps [o] (cop-location o args cx))
+    (SessionOps [o] (cop-session o args cx))
+    (BuildModeOps [o] (cop-build-mode o cx))))
+
+(defn cop-read [(op ReadOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (try
+    (let [a (.a cx)
+          code (try! (op-code args 0 "comptime: code op expects a Code value"))
+          tg (sx-tag code)]
+      (match op
+        (CodeListP [] (Ok [CtVal Diag] (CBool (code-node-listish? code))))
+        (CodeSymP [] (Ok [CtVal Diag] (CBool (= tg 2))))
+        (CodeIntP [] (Ok [CtVal Diag] (CBool (= tg 0))))
+        (CodeKeywordP [] (Ok [CtVal Diag] (CBool (= tg 3))))
+        (CodeVectorP [] (Ok [CtVal Diag] (CBool (= tg 7))))
+        (CodeFloatP [] (Ok [CtVal Diag] (CBool (= tg 1))))
+        (CodeStringP [] (Ok [CtVal Diag] (CBool (= tg 4))))
+        (CodeCount []
+                   (if (code-node-listish? code)
+                       (Ok [CtVal Diag] (CInt (code-node-len code)))
+                       (Err [CtVal Diag] (derr (ct-in-meta a "comptime: code-count expects a list/vector")))))
+        (CodeNth []
+                 (let [i (try! (op-int args 1 "comptime: code-nth index must be an integer"))]
+                   (cond (not (code-node-listish? code))
+                           (Err [CtVal Diag] (derr (ct-in-meta a "comptime: code-nth expects a list/vector")))
+                         (or (< i 0) (>= i (code-node-len code)))
+                           (Err [CtVal Diag]
+                                (derr (sconcat3 a "comptime: code-nth index " (i64->str a i) " out of range")))
+                         :else (Ok [CtVal Diag] (CCode (code-node-at code i))))))
+        (CodeSym []
+                 (if (= tg 2)
+                     (Ok [CtVal Diag] (CStr (sx-sval code)))
+                     (Err [CtVal Diag] (derr "comptime: code-sym expects a symbol"))))
+        (CodeInt []
+                 (if (= tg 0)
+                     (Ok [CtVal Diag] (CInt (sx-ival code)))
+                     (Err [CtVal Diag] (derr "comptime: code-int expects an integer"))))
+        (CodeFloatBits []
+                       (if (= tg 1)
+                           (Ok [CtVal Diag] (CInt (sx-ival code)))
+                           (Err [CtVal Diag] (derr "comptime: code-float-bits expects a float literal"))))
+        (CodeKeywordName []
+                         (if (= tg 3)
+                             (Ok [CtVal Diag] (CStr (sx-sval code)))
+                             (Err [CtVal Diag] (derr "code-keyword-name: expected a keyword"))))
+        ; an O(1) VIEW of the tail, not a copy: cdr-recursion over an n-form list
+        ; used to allocate n²/2 nodes this way (docs/design/META_MEMORY.md phase 5)
+        (CodeRest []
+                  (if (code-node-listish? code)
+                      (let [n (code-node-len code)]
+                        (Ok [CtVal Diag] (CCode (code-node-window code (if (> n 0) 1 0) n))))
+                      (Err [CtVal Diag] (derr "comptime: code-rest expects a list"))))
+        (CodeEq []
+                (let [other (try! (op-code args 1 "comptime: code-eq expects two Code values"))]
+                  (Ok [CtVal Diag] (CBool (sexp-eq code other)))))))))
+
+(defn cop-make [(op MakeOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (try
+    (let [a (.a cx)]
+      (match op
+        (Gensym []
+                (let [scope (primitive/iadd (next-gensym) 1)
+                      p (primitive/alloc-stack Sexp)]
+                  (set! p (sx-sym (sconcat a "$g" (i64->str a scope))))
+                  (set! (.hyg p) scope)
+                  (set! (.horigin p) 2)
+                  ; `gensym` is the anonymous-spelling form of fresh-identifier and
+                  ; obeys the same module-neutral rule.
+                  (set! (.hmod p) (no-hmod))
+                  (Ok [CtVal Diag] (CCode (load p)))))
+        (CodeSymbol [] (cop-concat true args cx))
+        (CodeStr [] (cop-concat false args cx))
+        (CodeListNew []
+                     (if (= (len (load args)) 0)
+                         (Ok [CtVal Diag] (CCode (sx-mklist (box-al [Sexp] a (ArrayList::new [Sexp] a)))))
+                         (Err [CtVal Diag] (derr "code-list-new: expects no arguments"))))
+        (CodeListPush []
+                      (let [lv (try! (op-arg args 0 "code-list-push!: expects two arguments"))
+                            vv (try! (op-arg args 1 "code-list-push!: expects two arguments"))]
+                        (cond (not (and (is-ccode lv) (is-ccode vv)))
+                                (Err [CtVal Diag] (derr "code-list-push!: expects two Code values"))
+                              (!= (sx-tag (ccode-of lv)) 6)
+                                (Err [CtVal Diag] (derr "code-list-push!: first argument must be a Code list"))
+                              :else
+                                (let [list (ccode-of lv)]
+                                  (push! [Sexp] (sx-items list) (ccode-of vv))
+                                  (Ok [CtVal Diag] (CCode list))))))
+        ; freeze a builder into Code: the same node at run time; the
+        ; TCodeBuilder/TCode split in the checker is the point
+        ; (docs/design/META_MEMORY.md phase 4)
+        (CodeListDone []
+                      (let [lv (try! (op-arg args 0 "code-list-done: expects one argument"))]
+                        (if (is-ccode lv)
+                            (Ok [CtVal Diag] (CCode (ccode-of lv)))
+                            (Err [CtVal Diag] (derr "code-list-done: expects a Code builder")))))
+        ; replace children but keep the original container's source and hygiene
+        ; context: the declaration-safe counterpart to constructing a fresh list
+        (CodeListLike []
+                      (let [pv (try! (op-arg args 0 "code-list-like: expects two Code arguments"))
+                            iv (try! (op-arg args 1 "code-list-like: expects two Code arguments"))]
+                        (cond (not (and (is-ccode pv) (is-ccode iv)))
+                                (Err [CtVal Diag] (derr "code-list-like: expects two Code values"))
+                              (not (and (code-node-listish? (ccode-of pv)) (code-node-listish? (ccode-of iv))))
+                                (Err [CtVal Diag] (derr "code-list-like: expects two lists/vectors"))
+                              :else
+                                (let [proto (ccode-of pv)
+                                      items (ccode-of iv)
+                                      pp (box-sexp a proto)
+                                      (mut kids) (ArrayList::new [Sexp] a)]
+                                  ; read through the shared accessors: a view or a
+                                  ; joined list has no items array of its own
+                                  (for [i 0 (code-node-len items)] (push! (mut kids) (code-node-at items i)))
+                                  ; the prototype decides list or vector; only the
+                                  ; children are replaced
+                                  (Ok [CtVal Diag]
+                                      (CCode (mk-sexp-src (if (= (sx-tag proto) 7)
+                                                              (KVec (box-al [Sexp] a (load kids)))
+                                                              (KList (box-al [Sexp] a (load kids))))
+                                                          pp)))))))
+        ; an O(1) view of [lo, hi) of a list or vector (docs/design/META_MEMORY.md phase 5)
+        (CodeSlice []
+                   (let [usage "code-slice: expects (primitive/code-slice CODE LO HI)"
+                         code (try! (op-code args 0 usage))
+                         lo (try! (op-int args 1 usage))
+                         hi (try! (op-int args 2 usage))]
+                     (cond (not (code-node-listish? code))
+                             (Err [CtVal Diag] (derr "code-slice: expects a list/vector"))
+                           (or (< lo 0) (or (> hi (code-node-len code)) (> lo hi)))
+                             (Err [CtVal Diag] (derr "code-slice: bounds out of range"))
+                           :else (Ok [CtVal Diag] (CCode (code-node-window code lo hi))))))
+        ; THE deep copy, named as one: fresh structure and string payloads in the
+        ; engine allocator, views flattened
+        (CodeCopy []
+                  (let [cv (try! (op-arg args 0 "code-copy: expects one Code argument"))]
+                    (if (is-ccode cv)
+                        (let [sp (primitive/alloc-stack Sexp)]
+                          (store! sp (ccode-of cv))
+                          (Ok [CtVal Diag] (CCode (sexp-own-into a sp))))
+                        (Err [CtVal Diag] (derr "code-copy: expects a Code value")))))
+        ; an explicit O(n+m) build of a fresh list from two listish values, sharing
+        ; their elements as every list constructor does
+        (CodeConcat []
+                    (let [xv (try! (op-arg args 0 "code-concat: expects two Code arguments"))
+                          yv (try! (op-arg args 1 "code-concat: expects two Code arguments"))]
+                      (cond (not (and (is-ccode xv) (is-ccode yv)))
+                              (Err [CtVal Diag] (derr "code-concat: expects two Code values"))
+                            (not (and (code-node-listish? (ccode-of xv)) (code-node-listish? (ccode-of yv))))
+                              (Err [CtVal Diag] (derr "code-concat: expects two lists/vectors"))
+                            :else
+                              (let [x (ccode-of xv)
+                                    y (ccode-of yv)
+                                    (mut xs) (ArrayList::new [Sexp] a)]
+                                (for [i 0 (code-node-len x)] (push! (mut xs) (code-node-at x i)))
+                                (for [j 0 (code-node-len y)] (push! (mut xs) (code-node-at y j)))
+                                (Ok [CtVal Diag] (CCode (sx-mklist (box-al [Sexp] a (load xs)))))))))
+        (CodeRead []
+                  (let [usage "code-read: expects a string or string Code and reader-config Code"
+                        sv (try! (op-arg args 0 usage))
+                        mv (try! (op-arg args 1 usage))]
+                    (if (and (or (is-cstr sv) (and (is-ccode sv) (= (sx-tag (ccode-of sv)) 4)))
+                             (and (is-ccode mv) (= (sx-tag (ccode-of mv)) 6)))
+                        (code-read a sv (ccode-of mv))
+                        (Err [CtVal Diag] (derr usage)))))
+        ; Code to a compilation-scoped handle (see code-opaque-items)
+        (CodeOpaque []
+                    (let [cv (try! (op-arg args 0 "code-opaque: expects one Code argument"))]
+                      (if (not (is-ccode cv))
+                          (Err [CtVal Diag] (derr "code-opaque: expects a Code value"))
+                          (let [handle (code-opaque-add a (ccode-of cv))]
+                            (if (= handle 0)
+                                (Err [CtVal Diag] (derr "code-opaque: compilation handle table exhausted"))
+                                (Ok [CtVal Diag] (CInt handle)))))))
+        ; a handle to the exact Code node it named
+        (CodeFromOpaque []
+                        (let [node (code-opaque-get (try! (op-int args 0 "code-from-opaque: expects an opaque Code handle")))]
+                          (if (= (primitive/cast i64 node) 0)
+                              (Err [CtVal Diag] (derr "code-from-opaque: invalid or expired Code handle"))
+                              (Ok [CtVal Diag] (CCode (load node))))))))))
+
+(defn cop-convert [(op ConvertOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (match op
+    (StrBytes [] (cop-strbytes args cx))
+    (BytesToStr [] (cop-bytestostr args cx))
+    (IntToStr [] (cop-inttostr args cx))
+    (CodeSource []
+                (match (cv-get args 0)
+                  (Some [v] (if (is-ccode v)
+                                (Ok [CtVal Diag] (CStr (sexp-display (.a cx) (ccode-of v))))
+                                (Err [CtVal Diag] (derr "code-source: expects a Code form"))))
+                  (None [] (Err [CtVal Diag] (derr "code-source: expects (primitive/code-source CODE)")))))))
+
+(defn cop-type [(op CodeOp) (o TypeOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (match o
+    (TypeShapeOf [] (cop-type-shape op args cx))
+    (TypeTraits [] (cop-type-traits op args cx))
+    (Deriver [] (cop-deriver args cx))
+    (VariantRefOf [] (cop-variant-ref op args cx))
+    (TypeRefOf [] (cop-type-ref op args cx))
+    (Exported []
+              (try
+                (let [usage "comptime: code-exported? expects two Code values"
+                      nv (try! (op-arg args 0 usage))
+                      mv (try! (op-arg args 1 usage))]
+                  (cond (not (and (is-ccode nv) (is-ccode mv)))
+                          (Err [CtVal Diag] (derr usage))
+                        (not (and (= (sx-tag (ccode-of nv)) 2) (= (sx-tag (ccode-of mv)) 2)))
+                          (Err [CtVal Diag] (derr "comptime: code-exported? expects name and module symbols"))
+                        :else
+                          (Ok [CtVal Diag]
+                              (CBool (explicitly-exported? cx (sx-sval (ccode-of nv)) (sx-sval (ccode-of mv)))))))))))
+
+(defn cop-semantic [(op CodeOp) (o SemanticOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (let [a (.a cx)]
+    (match o
+      (Decl [] (cop-decl op args cx))
+      (TypeOf [] (cop-type-of op args cx))
+      (BindingOf [] (cop-binding-of args cx))
+      (ResolveAt [] (cop-resolve-at op args cx))
+      (MacroOf [] (cop-macro-of op args cx))
+      (AliasOf [] (cop-alias-of op args cx))
+      ; a CheckOutcome: the checker's message located at NODE
+      (CheckError []
+                  (match (cv-get args 0)
+                    (Some [nodev]
+                          (if (not (is-ccode nodev))
+                              (Err [CtVal Diag] (derr "check-error: expects a Code node"))
+                              (answer op
+                                      (match (sem-model-error-at (ccode-of nodev))
+                                        (Some [msg] (answer1 a "FailsAt" (CCode (sx-mkstr msg))))
+                                        (None [] (answer0 a "ChecksClean")))
+                                      cx)))
+                    (None [] (Err [CtVal Diag] (derr "check-error: expects (primitive/check-error NODE)")))))
+      (ModelStatusOf []
+                     (let [status (sem-model-status)]
+                       (answer op
+                               (answer0 a (cond (= status 2) "ModelComplete"
+                                                (= status 1) "ModelPartial"
+                                                :else "NoModel"))
+                               cx))))))
+
+(defn cop-report [(op ReportOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (match op
+    (Fail []
+          (match (cv-get args 0)
+            (Some [v]
+                  (if (is-cstr v)
+                      ; a copy: the message is the caller's string, and the
+                      ; diagnostic is printed after the caller is gone
+                      (Err [CtVal Diag] (derr (sconcat (unit-allocator) (cstr-of v) "")))
+                      (Err [CtVal Diag] (derr "error: message must be a string"))))
+            (None [] (Err [CtVal Diag] (derr "error: message must be a string")))))
+    (Report [] (cop-report-at args))
+    (Warn [] (cop-warn-or-suggest (.a cx) op args))
+    (Suggest [] (cop-warn-or-suggest (.a cx) op args))
+    (Delete [] (cop-warn-or-suggest (.a cx) op args))
+    (LintParamOf [] (cop-lint-param args))
+    ; later suggestions form a new transaction (see sug-begin-group!)
+    (SuggestTransaction [] (Ok [CtVal Diag] (CInt (sug-begin-group!))))))
+
+;;; `(primitive/report NODE MSG)`: an error located at NODE, recorded without
+;;; stopping the expansion.
+(defn cop-report-at [(args (ptr (ArrayList CtVal)))] (-> (Result CtVal Diag))
+  (try
+    (let [usage "report: expects (primitive/report NODE MSG)"
+          nodev (try! (op-arg args 0 usage))]
+      (when (not (is-ccode nodev))
+        (break :try (Err [CtVal Diag] (derr "report: first arg must be a Code node"))))
+      (let [msgv (try! (op-arg args 1 usage))]
+        (if (not (is-cstr msgv))
+            (Err [CtVal Diag] (derr "report: message must be a string"))
+            (let [node (ccode-of nodev)
+                  d (primitive/alloc-stack Diag)]
+              (store! (field d lo) (sx-lo node))
+              (store! (field d hi) (sx-hi node))
+              ; malloc, not `a`: the warn list outlives the expansion arena
+              (store! (field d msg) (sconcat (unit-allocator) "error: " (cstr-of msgv)))
+              (store! (field d source) (sx-source node))
+              (store! (field d ctxt) 0)
+              (warn-push (load d))
+              (diag-err-bump)
+              (Ok [CtVal Diag] (CInt 0))))))))
+
+(defn cop-location [(op LocationOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (try
+    (let [a (.a cx)
+          whole (LocationOps op)]
+      (match op
+        (CodeFile [] (Ok [CtVal Diag] (CStr (code-file-of (try! (op-node a args whole))))))
+        (CodeLine [] (Ok [CtVal Diag] (CInt (code-line-of (try! (op-node a args whole))))))
+        (CodeSrc [] (Ok [CtVal Diag] (CStr (code-src-of (try! (op-node a args whole))))))
+        (CodeCol [] (Ok [CtVal Diag] (CInt (code-col-of (try! (op-node a args whole))))))
+        (CodeDoc [] (Ok [CtVal Diag] (CStr (code-doc-of (try! (op-node a args whole))))))
+        (FromUser [] (Ok [CtVal Diag] (CBool (code-from-user-node? (try! (op-node a args whole))))))
+        ; a macro produced it rather than a human typing it
+        (IsMacro [] (Ok [CtVal Diag] (CBool (!= (sx-ctxt (try! (op-node a args whole))) 0))))
+        (IsMacroCall [] (Ok [CtVal Diag] (CBool (macro-call-lookup (sx-node-id (try! (op-node a args whole)))))))
+        (CallSite [] (cop-call-site args))))))
+
+;;; The retained session a code operation reads, or the error outside one.
+(defn code-session-of [(cx (ptr CtCtx))] (-> (Result (ptr CodeSessionState) Diag))
+  (let [raw (load (field cx code_session_state))]
+    (if (= (primitive/cast i64 raw) 0)
+        (Err [(ptr CodeSessionState) Diag]
+             (derr "retained Code state is only available inside a compiler SDK session"))
+        (Ok [(ptr CodeSessionState) Diag] (primitive/cast (ptr CodeSessionState) raw)))))
+
+;;; NAME's answer: a copy of the session's STORED value when it HAS one, else the
+;;; default the caller passed.
+(defn session-stored-or [(a (dyn Allocator))
+                         (name (slice u8))
+                         (has bool)
+                         (stored (ptr Sexp))
+                         (args (ptr (ArrayList CtVal)))] (-> (Result CtVal Diag))
+  (match (cv-get args 0)
+    (None [] (Err [CtVal Diag] (derr (sconcat a name ": expects one default Code value"))))
+    (Some [fallback]
+          (cond (not (is-ccode fallback)) (Err [CtVal Diag] (derr (sconcat a name ": default must be Code")))
+                has (Ok [CtVal Diag] (CCode (sexp-own-into a stored)))
+                :else (Ok [CtVal Diag] fallback)))))
+
+(defn cop-session [(op SessionOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (try
+    (let [a (.a cx)
+          raw (load (field cx code_session_state))]
+      (match op
+        (SessionActive [] (Ok [CtVal Diag] (CBool (!= (primitive/cast i64 raw) 0))))
+        ; this compilation's number in its session (it only grows), or 0 outside
+        ; a retained session
+        (SessionSubmission []
+                           (Ok [CtVal Diag]
+                               (CInt (if (= (primitive/cast i64 raw) 0)
+                                         0
+                                         (.submission (primitive/cast (ptr CodeSessionState) raw))))))
+        (SessionState []
+                      (let [state (try! (code-session-of cx))]
+                        (session-stored-or a "code-session-state" (.has_accepted state) (field state accepted) args)))
+        (SessionRejectedState []
+                              (let [state (try! (code-session-of cx))]
+                                (session-stored-or a "code-session-rejected-state" (.has_rejected state)
+                                                   (field state rejected) args)))
+        (SessionStagedState []
+                            (let [state (try! (code-session-of cx))]
+                              (session-stored-or a "code-session-staged-state" (.has_staged state)
+                                                 (field state staged) args)))
+        (SessionMonomorphs []
+                           (let [state (try! (code-session-of cx))]
+                             (if (.has_accepted_monomorphs state)
+                                 (Ok [CtVal Diag] (CCode (sexp-own-into a (field state accepted_monomorphs))))
+                                 (let [(mut empty) (ArrayList::new [Sexp] a)]
+                                   (push! (mut empty) (sx-sym "monomorph-artifacts"))
+                                   (Ok [CtVal Diag] (CCode (sx-mklist (box-al [Sexp] a (load empty)))))))))
+        (SessionCondition []
+                          (let [state (try! (code-session-of cx))
+                                kind (try! (op-arg args 0 "code-session-condition!: expects one integer condition kind"))]
+                            (match kind
+                              (CInt [value]
+                                    (if (<= value 0)
+                                        (Err [CtVal Diag] (derr "code-session-condition!: condition kind must be positive"))
+                                        (do
+                                          (set! (.pending_condition_kind state) value)
+                                          (Ok [CtVal Diag] (CInt 0)))))
+                              (_ (Err [CtVal Diag] (derr "code-session-condition!: condition kind must be an integer"))))))
+        (SessionStage []
+                      (let [state (try! (code-session-of cx))
+                            value (try! (op-arg args 0 "code-session-stage!: expects one Code value"))]
+                        (if (not (is-ccode value))
+                            (Err [CtVal Diag] (derr "code-session-stage!: value must be Code"))
+                            (do
+                              (reset! (field state staged_arena))
+                              (let [source (primitive/alloc-stack Sexp)]
+                                (set! source (ccode-of value))
+                                (set! (.staged state) (sexp-own-into (allocator (field state staged_arena)) source)))
+                              (set! (.has_staged state) true)
+                              (Ok [CtVal Diag] (CInt 0))))))))))
+
+(defn cop-build-mode [(op BuildModeOp) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (match op
+    (TargetArch [] (Ok [CtVal Diag] (CCode (sx-sym (target-arch-str)))))
+    (TargetOs [] (Ok [CtVal Diag] (CCode (sx-sym (target-os-str)))))
+    (DebugChecks [] (Ok [CtVal Diag] (CBool (debug-checks-on?))))
+    (ProgramToolchain [] (Ok [CtVal Diag] (CCode (toolchain-form (.a cx)))))))
+
+;;; Read the loader's explicit export table during syntax transformation. Missing
+;;; metadata returns false: this query authorizes a rewrite, so uncertainty must
+;;; preserve the original identifier for ordinary resolution to diagnose.
+(defn explicitly-exported? [(cx (ptr CtCtx)) (name (slice u8)) (m (slice u8))] (-> bool)
+  (let [xs (load (field cx qexports))
+        n
+          (if (= (primitive/cast i64 xs) 0)
+              0
+              (len (load xs)))
+        (mut i) 0
+        (mut result) false]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [e (elem xs (load i))]
+                (when (= (load (field e name)) m)
+                  (store! result (set-contains (field e names) name))
+                  (break))
+                (set! i (primitive/iadd (load i) 1)))))
+    (load result)))
+
+(defn source-binding-answer [(a (dyn Allocator)) (fact SourceBindingFact)] (-> CtVal)
+  (match fact
+    (FactGlobal [name] (answer1 a "BindsGlobal" (sym-value name)))
+    (FactLocal [id] (answer1 a "BindsLocal" (CCode (sx-mkint id))))
+    (FactLocalUnknown [] (answer0 a "LocalUnknown"))
+    (FactLocalAmbiguous [] (answer0 a "LocalAmbiguous"))
+    (FactUnknown [] (answer0 a "BindingUnknown"))
+    (FactAmbiguous [] (answer0 a "BindingAmbiguous"))))
+
+;;; The node id the compiler worked on for NODE: its own, or, for an authored node a
+;;; macro rebuilt, its expanded twin's (ast.coil, source-checked-id).
+(defn source-checked-node [(node Sexp)] (-> i64)
+  (source-checked-id (sx-node-id node) (sx-source node) (sx-lo node) (sx-hi node) (sx-ctxt node)))
+
+;;; MODULE's authored record, as a list of zero or one records.
+(defn source-module-records [(a (dyn Allocator)) (module (slice u8))] (-> (ArrayList Sexp))
+  (let [(mut out) (ArrayList::new [Sexp] a)]
+    (match (get (.modules (field (comptime-unit-state) source_index)) module)
+      (Some [record] (push! (mut out) record))
+      (None [] 0))
+    out))
+
+(defn source-plan-refused [(a (dyn Allocator)) (reason (slice u8))] (-> (Result Sexp (slice u8)))
+  (Err [Sexp (slice u8)] reason))
+
+(defn source-alias-valid? [(alias (slice u8))] (-> bool)
+  (let [(mut valid) (> (len alias) 0)]
+    (for [i 0 (len alias)]
+      (let [b (primitive/cast i64 (get alias i))
+            letter (or (and (>= b 65) (<= b 90)) (and (>= b 97) (<= b 122)))]
+        (unless (or letter (= b 95)
+                    (and (> i 0) (or (= b 46) (or (= b 45) (and (>= b 48) (<= b 57))))))
+          (set! valid false) 0)))
+    (load valid)))
+
+(defn source-qualified-import [(a (dyn Allocator)) (form Sexp) (alias Sexp)] (-> Sexp)
+  (let [items (sx-items form)
+        (mut out) (ArrayList::new [Sexp] a)
+        (mut i) 2]
+    (push! (mut out) (sx-at items 0))
+    (push! (mut out) (sx-at items 1))
+    (push! (mut out) (mk-sexp (KKw "as") -1 -1))
+    (push! (mut out) alias)
+    (while (< (load i) (sx-len items))
+      (let [part (sx-at items (load i))
+            key (if (= (sx-tag part) 3) (sx-sval part) "")]
+        (if (or (= key "as") (or (= key "use") (or (= key "exclude") (= key "rename"))))
+            (set! i (+ (load i) 2))
+            (do (push! (mut out) part) (set! i (+ (load i) 1))))))
+    (sx-mklist (box-al [Sexp] a (load out)))))
+
+;;; The edits that qualify the import RECORD's references through ALIAS-NODE, as a
+;;; list of `(edit NODE REPLACEMENT)`, or why there are none.
+(defn source-qualify-import [(a (dyn Allocator)) (record Sexp) (alias-node Sexp) (assume-free bool)] (-> (Result Sexp (slice u8)))
+  (block :done
+    (let [state (comptime-unit-state)]
+      (unless (source-view-ready?)
+        (return-from :done (source-plan-refused a "authored source model is unavailable")))
+      (unless (and (= (sx-tag record) 6)
+                   (and (= (sx-head-name (sx-items record)) "source-import")
+                        (= (sx-len (sx-items record)) 4)))
+        (return-from :done (source-plan-refused a "expected an import record from imports")))
+      (unless (and (= (sx-tag alias-node) 2) (source-alias-valid? (sx-sval alias-node)))
+        (return-from :done (source-plan-refused a "alias must start with a letter or underscore and contain letters, digits, underscores, hyphens or dots")))
+      (let [parts (sx-items record)
+            module (sx-sval (sx-at parts 1))
+            form (sx-at parts 2)
+            target (sx-sval (sx-at parts 3))
+            alias (sx-sval alias-node)
+            imp (imports-find (.source_import_table state) module)
+            (mut recognized) false
+            (mut matching) 0
+            (mut old-alias) target
+            (mut spec) (UNames (empty-names a))
+            (mut exclude) (empty-names a)
+            (mut renames) (empty-renames a)
+            (mut reexport) false]
+        (for item (load (sx-items (source-index-list a (field (field state source_index) imports) module)))
+          (let [items (sx-items item)]
+            (when (and (= (sx-sval (sx-at items 1)) module)
+                       (= (sx-sval (sx-at items 3)) target))
+              (set! matching (+ (load matching) 1)) 0)
+            (when (and (= (source-occurrence-key a (sx-at items 2)) (source-occurrence-key a form))
+                       (sexp-eq item record))
+              (set! recognized true) 0)))
+        (unless (and (load recognized) (= (load matching) 1))
+          (return-from :done (source-plan-refused a "import is stale or its module has multiple imports of this target")))
+        (unless (and (= (sx-ctxt form) 0) (code-from-user-node? form))
+          (return-from :done (source-plan-refused a "import has no editable authored source")))
+        (when (= (primitive/cast i64 imp) 0)
+          (return-from :done (source-plan-refused a "import environment is unavailable")))
+        (for existing (.aliases (.imp imp))
+          (when (and (= (.alias existing) alias) (!= (.target existing) target))
+            (return-from :done (source-plan-refused a "alias is already bound to another module"))))
+        (let [items (sx-items form) (mut i) 2]
+          (while (< (load i) (sx-len items))
+            (let [part (sx-at items (load i))
+                  key (if (= (sx-tag part) 3) (sx-sval part) "")]
+              (cond (= key "as")
+                      (do (set! old-alias (sx-sval (sx-at items (+ (load i) 1))))
+                          (set! i (+ (load i) 2)))
+                    (= key "use")
+                      (let [names (sx-at items (+ (load i) 1))]
+                        (set! spec (if (= (sx-tag names) 7)
+                                       (UNames (collect-syms a (sx-items names))) (UAll)))
+                        (set! i (+ (load i) 2)))
+                    (= key "exclude")
+                      (do (set! exclude (collect-syms a (sx-items (sx-at items (+ (load i) 1)))))
+                          (set! i (+ (load i) 2)))
+                    (= key "rename")
+                      (do (set! renames (collect-renames a (sx-items (sx-at items (+ (load i) 1)))))
+                          (set! i (+ (load i) 2)))
+                    (= key "reexport") (do (set! reexport true) (set! i (+ (load i) 1)))
+                    :else (set! i (+ (load i) 1))))))
+        ; A reexport publishes bare names as part of this module's interface.
+        ; Keep it explicit until qualification has an export-preserving plan.
+        (when (load reexport)
+          (return-from :done (source-plan-refused a "reexported imports require preserving the public export surface")))
+        (let [use (box! a Use (mk-use a target (load spec) (load exclude) (load renames)))
+              (mut edits) (ArrayList::new [Sexp] a)]
+          (let [replacement (source-qualified-import a form alias-node)]
+            (unless (sexp-eq form replacement)
+              (push! (mut edits) (source-plan-edit a form replacement)) 0))
+          (set! (.source_coverage_template state) false)
+          (set! (.source_assume_free state) assume-free)
+          (for m (source-module-records a module)
+            (when (= (sx-sval (sx-at (sx-items m) 0)) module)
+              (let [forms (sx-items m)]
+                (for [i 1 (sx-len forms)]
+                  (unless (source-import-coverage? a (sx-at forms i) 0 use (load old-alias) (.source_export_table state))
+                    (let [unknown (.source_coverage_unknown state)
+                          where (sconcat a (code-file-of unknown) (sconcat a ":" (i64->str a (code-line-of unknown))))]
+                      (return-from :done
+                        (source-plan-refused a
+                          (if (.source_coverage_template state)
+                              (sconcat a (sconcat3 a "a quasiquote template names '" (sx-sval unknown) "' at ")
+                                (sconcat a where "; code a template generates resolves its names where the macro is defined, which an edit cannot see"))
+                              (sconcat3 a "source binding is incomplete for '" (sx-sval unknown) (sconcat a "' at " where))))))))) 0))
+          (when assume-free
+            (for m (source-module-records a module)
+              (when (= (sx-sval (sx-at (sx-items m) 0)) module)
+                (let [forms (sx-items m)]
+                  (for [i 1 (sx-len forms)]
+                    (unless (source-template-edits! a (sx-at forms i) 0 use (load old-alias)
+                                                    (.source_export_table state) alias (mut edits))
+                      (return-from :done
+                        (source-plan-refused a
+                          (sconcat a "a template name has no editable authored source: "
+                                    (sx-sval (.source_coverage_unknown state)))))))))))
+          (for ref (load (sx-items (source-index-references a (field (field state source_index) by_import)
+                                                      (sconcat3 a module " " target))))
+            (let [ref-parts (sx-items ref)
+                  ref-module (sx-sval (sx-at ref-parts 1))
+                  node (sx-at ref-parts 2)
+                  routed (> (sx-len ref-parts) 4)]
+              (when (= ref-module module)
+                (when (and routed (= (sx-sval (sx-at ref-parts 4)) target))
+                  (when (source-observed? node)
+                    (return-from :done (source-plan-refused a "a macro inspected the spelling of an affected identifier")))
+                  (unless (and (= (sx-ctxt node) 0) (code-from-user-node? node))
+                    (return-from :done (source-plan-refused a "a reference has no editable authored source")))
+                  (let [replacement (sx-sym (sconcat3 a alias "/" (sx-sval (sx-at ref-parts 5))))]
+                    (unless (= (sx-sval node) (sx-sval replacement))
+                      (push! (mut edits) (source-plan-edit a node replacement)) 0))) 0)))
+          (Ok [Sexp (slice u8)] (sx-mklist (box-al [Sexp] a (load edits)))))))))
+
+(defn import-plan-answer [(a (dyn Allocator)) (plan (Result Sexp (slice u8)))] (-> CtVal)
+  (match plan
+    (Ok [edits] (answer1 a "PlanEdits" (CCode edits)))
+    (Err [reason] (answer1 a "PlanRefused" (CCode (mk-sexp (KStr reason) -1 -1))))))
+
+(defn cop-qualify-import [(op CodeOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (let [usage "qualify-import: expects an import record, an alias symbol and a mode, `strict or `assume-no-shadow"]
+    (if (!= (len (load args)) 3)
+        (Err [CtVal Diag] (derr usage))
+        (let [record (get (load args) 0) alias (get (load args) 1) mode (get (load args) 2)]
+          (if (and (is-ccode record) (and (is-ccode alias) (is-ccode mode)))
+              (let [m (ccode-of mode)]
+                (cond (and (= (sx-tag m) 2) (= (sx-sval m) "strict"))
+                        (answer op (import-plan-answer (.a cx) (source-qualify-import (.a cx) (ccode-of record) (ccode-of alias) false)) cx)
+                      (and (= (sx-tag m) 2) (= (sx-sval m) "assume-no-shadow"))
+                        (answer op (import-plan-answer (.a cx) (source-qualify-import (.a cx) (ccode-of record) (ccode-of alias) true)) cx)
+                      :else (Err [CtVal Diag] (derr usage))))
+              (Err [CtVal Diag] (derr usage)))))))
+
+(defn cop-suggest-edits [(op CodeOp) (args (ptr (ArrayList CtVal))) (cx (ptr CtCtx))] (-> (Result CtVal Diag))
+  (try (do
+    (unless (= (len (load args)) 2)
+      (break :try (Err [CtVal Diag] (derr "suggest-edits: expects the edits of a plan and a message"))))
+    (let [planv (get (load args) 0) msg (get (load args) 1)]
+      (unless (and (is-ccode planv) (is-cstr msg))
+        (break :try (Err [CtVal Diag] (derr "suggest-edits: expects Code and string"))))
+      (let [plan (ccode-of planv)]
+        (unless (= (sx-tag plan) 6)
+          (break :try (Err [CtVal Diag] (derr "suggest-edits: expects a list of (edit NODE REPLACEMENT)"))))
+        (let [items (sx-items plan)]
+          ; Validate every member before publishing any member of the group.
+          (for [i 0 (sx-len items)]
+            (let [edit (sx-at items i)]
+              (unless (and (= (sx-tag edit) 6)
+                           (and (= (sx-len (sx-items edit)) 3) (= (sx-head-name (sx-items edit)) "edit")))
+                (break :try (Err [CtVal Diag] (derr "suggest-edits: malformed edit plan"))))
+              (let [node (sx-at (sx-items edit) 1)]
+                (unless (and (= (sx-ctxt node) 0) (and (code-from-user-node? node) (not (rule-src? (sx-source node)))))
+                  (break :try (answer op (answer0 (.a cx) "SuggestionRefused") cx))))))
+          (sug-begin-group!)
+          (for [i 0 (sx-len items)]
+            (let [edit (sx-items (sx-at items i)) (mut call-args) (ArrayList::new [CtVal] (.a cx))]
+              (push! (mut call-args) (CCode (sx-at edit 1)))
+              (push! (mut call-args) msg)
+              (push! (mut call-args) (CCode (sx-at edit 2)))
+              (try! (cop-warn-or-suggest (.a cx) (Suggest) (box-al [CtVal] (.a cx) (load call-args))))))
+          (sug-begin-group!)
+          (answer op (answer0 (.a cx) "Suggested") cx)))))))

@@ -1,0 +1,866 @@
+; src/compiler/comptime/fold.coil — self-host Coil compiler: the comptime fold pass, which replaces each `(comptime E)` in a
+; checked body with the literal E evaluates to.
+
+(module coil.compiler.fold)
+(import "coil.primitive" :as primitive)
+(import "coil.compiler.unit_state" :use *)
+(import "coil.compiler.ffi" :as ffi)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.mem" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+
+(import "coil.io" :use *)
+(import "coil.control" :use *)
+(import "coil.try" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.compiler.mtrace" :use *)
+(import "coil.compiler.trace" :as tr)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.codeop" :use *)
+(import "coil.compiler.program_query" :as pq)
+(import "coil.compiler.ctval" :use *)  ; CtVal / EnvBind / CtCtx — the value model, now on its own
+
+(import "coil.compiler.check" :use *)
+(import "coil.compiler.expander" :use *)
+(import "coil.compiler.loader" :use *)
+(import "coil.compiler.diag" :as diag)  ; locate-source: line/col by the source's line-start table
+(import "coil.compiler.parser" :use *)
+(import "coil.reader" :use *)
+(import "coil.compiler.resolve" :use *)
+(import "coil.cc" :as cc)
+(import "coil.compiler.comptime" :use *)
+
+; The FOLD pass walks every checked function body (and static-assert cond) and replaces each
+; `(comptime E)` node with the literal E evaluates to, which the compiled
+; metaprogram engine computes through the registered fold hook (a literal or a
+; fieldless variant needs no engine). Implemented as an IN-PLACE mutating walk (like
+; qualify-expr): non-comptime nodes are recursed but left byte-identical, so the
+; pass is a NO-OP for comptime-free programs (the exhaustive IR corpus + bootstrap
+; stay unchanged); only `(comptime …)` nodes — currently a hard mono error — get
+; folded. build_value reconstructs the literal-back (scalars → literals, a sum →
+; a variant call, a struct/array → an imperative alloc+store+load).
+; NB: CtVal (a sum) is threaded BY POINTER through this mutual recursion — a
+; by-value aggregate into recursion miscompiles (musttail TCE failure).
+(defn build-content [(a (dyn Allocator))
+                     (vp (ptr CtVal))
+                     (lo i64)
+                     (hi i64)
+                     (src i64)
+                     (ctxt i64)
+                     (cx (ptr CtCtx))] (-> (Result Expr
+                                                   Diag))
+  (match (load vp)
+    ; wrap the cross-recursion in a let so the call is NOT in tail position — a
+    ; musttail'd aggregate-returning mutual tail call fails LLVM's TCE.
+    (CInt [n] (let [r (build-value a vp lo hi src ctxt cx)] r))
+    (CWideInt [_ _ _] (let [r (build-value a vp lo hi src ctxt cx)] r))
+    (CBool [b] (let [r (build-value a vp lo hi src ctxt cx)] r))
+    (CFloat [x] (let [r (build-value a vp lo hi src ctxt cx)] r))
+    (CStr [s] (let [r (build-value a vp lo hi src ctxt cx)] r))
+    (CCode [f] (let [r (build-value a vp lo hi src ctxt cx)] r))
+    (CRef [cell] (let [r (build-content a cell lo hi src ctxt cx)] r))
+    (CSum [variant fields]
+          ; pre-mono, a sum value is a call to the variant name
+          (let [nf (len (load fields))
+                (mut args) (ArrayList::new [Expr] a)
+                (mut i) 0
+                (mut errf) (None [Diag])]
+            (loop (if (or (diag-some? (load errf)) (>= (load i) nf))
+                      (break)
+                      (do
+                        (match (build-value a
+                                            (new-cell (cell-value (get (load fields)
+                                                                       (load i))))
+                                            lo
+                                            hi
+                                            src
+                                            ctxt
+                                            cx)
+                          (Err [d] (do (set! errf (Some d)) 0))
+                          (Ok [ev] (do (push! (mut args) ev) 0)))
+                        (set! i (primitive/iadd (load i) 1)))))
+            (match (load errf)
+              (Some [d] (Err [Expr Diag] d))
+              (None []
+                    (Ok [Expr Diag]
+                        (mk-expr (ECall
+                                   :func variant
+                                   :type_args (box-items-type a)
+                                   :args (box-al [Expr] a (load args)))
+                                 lo
+                                 hi
+                                 src
+                                 ctxt))))))
+    (CStruct [name fields]
+             (let [sd (ct-struct-find cx name)]
+               (if (= (primitive/cast i64 sd) 0)
+                   (Err [Expr Diag]
+                        (derr (sconcat3 a "comptime: unknown struct '" name "'")))
+                   (let [n (.gensym cx)
+                         _b (set! (.gensym cx) (primitive/iadd n 1))
+                         t (sconcat a "$ct" (i64->str a n))
+                         sfs (load (field sd fields))
+                         nfl (len (load sfs))
+                         (mut body) (ArrayList::new [Expr] a)
+                         (mut i) 0
+                         (mut errf) (None [Diag])]
+                     (loop (if (or (diag-some? (load errf)) (>= (load i) nfl))
+                               (break)
+                               (do
+                                 (match (build-value a
+                                                     (new-cell (cell-value (get (load fields)
+                                                                                (load i))))
+                                                     lo
+                                                     hi
+                                                     src
+                                                     ctxt
+                                                     cx)
+                                   (Err [d] (do (set! errf (Some d)) 0))
+                                   (Ok [ev]
+                                       (let [fname
+                                               (.name (elem sfs
+                                                            (load i)))
+                                             fld
+                                               (mk-expr (EField (box-expr a
+                                                                          (mk-expr (EVar t)
+                                                                                   lo
+                                                                                   hi
+                                                                                   src
+                                                                                   ctxt))
+                                                                fname)
+                                                        lo
+                                                        hi
+                                                        src
+                                                        ctxt)]
+                                         (do
+                                           (push! (mut body)
+                                                  (mk-expr (EInitStore (box-expr a
+                                                                                 fld)
+                                                                       (box-expr a
+                                                                                 ev))
+                                                           lo
+                                                           hi
+                                                           src
+                                                           ctxt))
+                                           0))))
+                                 (set! i (primitive/iadd (load i) 1)))))
+                     (match (load errf)
+                       (Some [d] (Err [Expr Diag] d))
+                       (None []
+                             (do
+                               (push! (mut body)
+                                      (mk-expr (ELoad (box-expr a
+                                                                (mk-expr (EVar t)
+                                                                         lo
+                                                                         hi
+                                                                         src
+                                                                         ctxt)))
+                                               lo
+                                               hi
+                                               src
+                                               ctxt))
+                               (let [(mut binds) (ArrayList::new [Bind] a)
+                                     bp (primitive/alloc-stack Bind)]
+                                 (set! (.name bp) t)
+                                 (set! (.mutable bp) false)
+                                 (set! (.bid bp) 0)
+                                 (set! (.owned_type bp)
+                                       (primitive/cast (ptr Type) 0))
+                                 (set! (.value bp)
+                                       (mk-expr (EAlloc
+                                                  :symbol (None)
+                                                  :storage 0
+                                                  :ty (TStruct name)
+                                                  :init
+                                                    (primitive/cast (ptr Expr)
+                                                                    0))
+                                                lo
+                                                hi
+                                                src
+                                                ctxt))
+                                 (push! (mut binds) (load bp))
+                                 (Ok [Expr Diag]
+                                     (mk-expr (ELet (box-al [Bind]
+                                                            a
+                                                            (load binds))
+                                                    (box-al [Expr]
+                                                            a
+                                                            (load body)))
+                                              lo
+                                              hi
+                                              src
+                                              ctxt))))))))))
+    ; A slice's elements live in static storage the literal owns: the value may
+    ; outlive any frame it is used in. The slice points at that storage.
+    (CSlice [elem cells]
+            (let [nc (len (load cells))
+                  (mut indices) (ArrayList::new [i64] a)
+                  (mut items) (ArrayList::new [Expr] a)
+                  (mut errf) (None [Diag])]
+              (for [i 0 nc]
+                (unless (diag-some? (load errf))
+                  (match (build-value a
+                                      (new-cell (cell-value (get (load cells) i)))
+                                      lo hi src ctxt cx)
+                    (Err [d] (do (set! errf (Some d)) 0))
+                    (Ok [ev] (do (push! (mut indices) i) (push! (mut items) ev) 0)))
+                  0))
+              (match (load errf)
+                (Some [d] (Err [Expr Diag] d))
+                (None []
+                      (let [storage
+                              (mk-expr (EAlloc
+                                         :storage 1
+                                         :ty (TArray (box-type a elem) (FixedExtent nc))
+                                         :init (box-expr a
+                                                         (mk-expr (EStaticArray (box-al [i64] a (load indices))
+                                                                                (box-al [Expr] a (load items)))
+                                                                  lo hi src ctxt))
+                                         :symbol (None [(slice u8)]))
+                                       lo hi src ctxt)]
+                        (Ok [Expr Diag]
+                            (mk-expr (EMakeSlice :data (box-expr a storage)
+                                                 :elem elem
+                                                 :len (FixedExtent nc))
+                                     lo hi src ctxt)))))))
+    (CArray [elem cells]
+            (let [n (.gensym cx)
+                  _b (set! (.gensym cx) (primitive/iadd n 1))
+                  t (sconcat a "$ct" (i64->str a n))
+                  nc (len (load cells))
+                  (mut body) (ArrayList::new [Expr] a)
+                  (mut i) 0
+                  (mut errf) (None [Diag])]
+              (loop (if (or (diag-some? (load errf)) (>= (load i) nc))
+                        (break)
+                        (do
+                          (match (build-value a
+                                              (new-cell (cell-value (get (load cells)
+                                                                         (load i))))
+                                              lo
+                                              hi
+                                              src
+                                              ctxt
+                                              cx)
+                            (Err [d] (do (set! errf (Some d)) 0))
+                            (Ok [ev]
+                                (let [idxe
+                                        (mk-expr (EIndex (box-expr a
+                                                                   (mk-expr (EVar t)
+                                                                            lo
+                                                                            hi
+                                                                            src
+                                                                            ctxt))
+                                                         (box-expr a
+                                                                   (mk-expr (EInt (load i))
+                                                                            lo
+                                                                            hi
+                                                                            src
+                                                                            ctxt)))
+                                                 lo
+                                                 hi
+                                                 src
+                                                 ctxt)]
+                                  (do
+                                    (push! (mut body)
+                                           (mk-expr (EInitStore (box-expr a
+                                                                          idxe)
+                                                                (box-expr a ev))
+                                                    lo
+                                                    hi
+                                                    src
+                                                    ctxt))
+                                    0))))
+                          (set! i (primitive/iadd (load i) 1)))))
+              (match (load errf)
+                (Some [d] (Err [Expr Diag] d))
+                (None []
+                      (do
+                        (push! (mut body)
+                               (mk-expr (ELoad (box-expr a
+                                                         (mk-expr (EVar t)
+                                                                  lo
+                                                                  hi
+                                                                  src
+                                                                  ctxt)))
+                                        lo
+                                        hi
+                                        src
+                                        ctxt))
+                        (let [(mut binds) (ArrayList::new [Bind] a)
+                              bp (primitive/alloc-stack Bind)]
+                          (set! (.name bp) t)
+                          (set! (.mutable bp) false)
+                          (set! (.bid bp) 0)
+                          (set! (.owned_type bp) (primitive/cast (ptr Type) 0))
+                          (set! (.value bp)
+                                (mk-expr (EAlloc
+                                           :symbol (None)
+                                           :storage 0
+                                           :ty (fixed-array (box-type a elem) nc)
+                                           :init (primitive/cast (ptr Expr) 0))
+                                         lo
+                                         hi
+                                         src
+                                         ctxt))
+                          (push! (mut binds) (load bp))
+                          (Ok [Expr Diag]
+                              (mk-expr (ELet (box-al [Bind] a (load binds))
+                                             (box-al [Expr] a (load body)))
+                                       lo
+                                       hi
+                                       src
+                                       ctxt))))))))))
+
+(defn build-value [(a (dyn Allocator))
+                   (vp (ptr CtVal))
+                   (lo i64)
+                   (hi i64)
+                   (src i64)
+                   (ctxt i64)
+                   (cx (ptr CtCtx))] (-> (Result Expr
+                                                 Diag))
+  (match (load vp)
+    (CInt [n] (Ok [Expr Diag] (mk-expr (EInt n) lo hi src ctxt)))
+    ; a wide integer keeps its type: an i128's arithmetic is not a u128's
+    (CWideInt [t wlo whi]
+              (Ok [Expr Diag]
+                  (mk-expr (ECast t (box-expr a (mk-expr (EWideInt :neg false :lo wlo :hi whi :radix true :text "")
+                                                         lo hi src ctxt)))
+                           lo hi src ctxt)))
+    (CBool [b] (Ok [Expr Diag] (mk-expr (EBool b) lo hi src ctxt)))
+    (CFloat [x]
+            (Ok [Expr Diag] (mk-expr (EFloat (f64-bits x)) lo hi src ctxt)))
+    (CStr [s] (Ok [Expr Diag] (mk-expr (EStr s) lo hi src ctxt)))
+    (CCode [f]
+           (Err [Expr Diag]
+                (derr "comptime: a Code value can't be used as a runtime value (it's only meaningful at compile time)")))
+    (CRef [cell] (let [r (build-content a cell lo hi src ctxt cx)] r))
+    (CStruct [nm fs] (let [r (build-content a vp lo hi src ctxt cx)] r))
+    (CArray [el cs] (let [r (build-content a vp lo hi src ctxt cx)] r))
+    (CSlice [el cs] (let [r (build-content a vp lo hi src ctxt cx)] r))
+    (CSum [vn fs] (let [r (build-content a vp lo hi src ctxt cx)] r))))
+
+(defn fold-expr-list [(es (ptr (ArrayList Expr))) (cx (ptr CtCtx))] (-> (Result i64
+                                                                                Diag))
+  (let [n (len (load es))
+        (mut i) 0
+        (mut err) (primitive/zeroed Diag)
+        (mut failed) false]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (match (fold-expr (elem es (load i)) cx)
+                  (Err [d] (do (set! err d) (set! failed true) (break)))
+                  (Ok [_] 0))
+                (set! i (primitive/iadd (load i) 1)))))
+    (if (load failed) (Err (load err)) (Ok [i64 Diag] 0))))
+
+(defn fold-bind-list [(binds (ptr (ArrayList Bind))) (cx (ptr CtCtx))] (-> (Result i64
+                                                                                   Diag))
+  (let [n (len (load binds))
+        (mut i) 0
+        (mut err) (primitive/zeroed Diag)
+        (mut failed) false]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (match (fold-expr (field (elem binds (load i)) value)
+                                  cx)
+                  (Err [d] (do (set! err d) (set! failed true) (break)))
+                  (Ok [_] 0))
+                (set! i (primitive/iadd (load i) 1)))))
+    (if (load failed) (Err (load err)) (Ok [i64 Diag] 0))))
+
+(defn fold-arm-list [(arms (ptr (ArrayList Arm))) (cx (ptr CtCtx))] (-> (Result i64
+                                                                                Diag))
+  (let [n (len (load arms))
+        (mut i) 0
+        (mut err) (primitive/zeroed Diag)
+        (mut failed) false]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (match (fold-expr (field (elem arms (load i)) body) cx)
+                  (Err [d] (do (set! err d) (set! failed true) (break)))
+                  (Ok [_] 0))
+                (set! i (primitive/iadd (load i) 1)))))
+    (if (load failed) (Err (load err)) (Ok [i64 Diag] 0))))
+
+(defn fold-quasi-list [(items (ptr (ArrayList Quasi))) (cx (ptr CtCtx))] (-> (Result i64
+                                                                                     Diag))
+  (let [n (len (load items))
+        (mut i) 0
+        (mut err) (primitive/zeroed Diag)
+        (mut failed) false]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (match (fold-quasi (elem items (load i)) cx)
+                  (Err [d] (do (set! err d) (set! failed true) (break)))
+                  (Ok [_] 0))
+                (set! i (primitive/iadd (load i) 1)))))
+    (if (load failed) (Err (load err)) (Ok [i64 Diag] 0))))
+
+(defn fold-quasi [(qp (ptr Quasi)) (cx (ptr CtCtx))] (-> (Result i64 Diag))
+  (match (load qp)
+    (QLit [_] (Ok [i64 Diag] 0))
+    (QUnquote [e] (fold-expr e cx))
+    (QSplice [e] (fold-expr e cx))
+    (QList [items] (fold-quasi-list items cx))
+    (QVector [items] (fold-quasi-list items cx))))
+
+; Checked literal constants are already materialized values. Routing them through
+; the native comptime hook built, linked and dlopen'd a dedicated dylib for every
+; `(const NAME 1)` / string / bool in the graph. Preserve the outer node's source
+; metadata and copy only the value kind in place.
+(defn fold-direct-literal! [(dst (ptr Expr)) (src (ptr Expr))] (-> bool)
+  (match (.kind src)
+    (EInt [_] (do (set! (.kind dst) (.kind src)) true))
+    (EFloat [_] (do (set! (.kind dst) (.kind src)) true))
+    (EBool [_] (do (set! (.kind dst) (.kind src)) true))
+    (EStr [_] (do (set! (.kind dst) (.kind src)) true))
+    (ECStr [_] (do (set! (.kind dst) (.kind src)) true))
+    (_ false)))
+
+;;; A sum variant with no fields is likewise already a value: there is nothing to
+;;; evaluate, and what evaluating it would hand back is fully determined. Build that
+;;; through `build-value`, the same path a value read back from the engine takes, so
+;;; the node ends up exactly as it would have.
+;;;
+;;; This is not a corner. `:inline (Always)` is such an expression, the annotation on
+;;; every SIMD and `Callable` method, and each one used to cost a program of its own:
+;;; monomorphize, emit, and under the interpreted engine link and `dlopen` a dylib.
+;;; One build of `src/examples/simd.coil` did that 129 times, 38 of its 39 seconds.
+(defn fold-fieldless-variant! [(dst (ptr Expr)) (src (ptr Expr)) (cx (ptr CtCtx))] (-> bool)
+  (let [a (.a cx)
+        spelled (match (.kind src)
+                  (ECall [func type-args args]
+                         (if (and (= (len (load args)) 0) (= (len (load type-args)) 0)) func ""))
+                  (EConstruct [_ variant args] (if (= (len (load args)) 0) variant ""))
+                  (_ ""))
+        (mut known) ""]
+    (when (and (> (len spelled) 0) (!= (primitive/cast i64 (.sums cx)) 0))
+      (let [sums (ct-sums-visible cx)]
+        (for [i 0 (len (load sums))]
+          (let [variants (.variants (elem sums i))]
+            (for [j 0 (len (load variants))]
+              (let [v (elem variants j)]
+                (when (and (= (.name v) spelled) (= (len (load (.fields v))) 0))
+                  (set! known (.name v))
+                  0))))))
+      0)
+    (if (= (len (load known)) 0)
+        false
+        (match (build-value a
+                            (new-cell (CSum (load known)
+                                            (box-al [(ptr CtVal)] a (ArrayList::new [(ptr CtVal)] a))))
+                            (.lo dst)
+                            (.hi dst)
+                            (.source dst)
+                            (.ctxt dst)
+                            cx)
+          (Ok [built] (let [(mut value) built] (set! (.kind dst) (.kind value)) true))
+          (Err [_] false)))))
+
+(defn fold-expr [(ep (ptr Expr)) (cx (ptr CtCtx))] (-> (Result i64 Diag))
+  (let [a (.a cx)]
+    (try (do
+           (match (load (field ep kind))
+             (EArrayLit [items] (try! (fold-expr-list items cx)))
+             (EStaticArray [_ items] (try! (fold-expr-list items cx)))
+             (EAnonFn [_ body] (try! (fold-expr-list body cx)))
+             (ECleanup [body cleanups]
+                       (do
+                         (try! (fold-expr body cx))
+                         (try! (fold-expr-list cleanups cx))))
+             (EMakeSlice [data _ _] (try! (fold-expr data cx)))
+             (EComptime [inner]
+                        ; Splice the value back IN PLACE, keeping this node's span. A literal
+                        ; or a fieldless variant folds directly; anything else goes to the
+                        ; compiled metaprogram engine through the registered hook.
+                        (if (or (fold-direct-literal! ep inner)
+                                (fold-fieldless-variant! ep inner cx))
+                            0
+                            (let [lo (load (field ep lo))
+                                  hi (load (field ep hi))
+                                  hk (ct-fold-hook)]
+                              ; the compiled engine is THE comptime evaluator (the tree-walking
+                              ; interpreter is gone — decision 7). A hook decline (null) is a
+                              ; located hard error; an unregistered hook means this compiler build
+                              ; cannot evaluate comptime at all and says so.
+                              (if (= (load (field hk isset))
+                                     0)
+                                  (return-from :try
+                                                 (Err (derr-at lo
+                                                               hi
+                                                               "comptime: this compiler build has no comptime engine registered (compiler bug)")))
+                                  (let [r
+                                          (primitive/call-ptr (load (field hk
+                                                                           fp))
+                                                              a
+                                                              inner
+                                                              cx)]
+                                    (if (= (primitive/cast i64 r)
+                                           0)
+                                        (return-from :try
+                                                       (Err (derr-at-src (.source ep)
+                                                                         lo
+                                                                         hi
+                                                                         "comptime: this expression's value cannot be materialized as a compile-time literal")))
+                                        (match (load (primitive/cast (ptr (Result Expr
+                                                                                  Diag))
+                                                                     r))
+                                          (Err [d2] (return-from :try (Err d2)))
+                                          (Ok [lit]
+                                              (do
+                                                (store! (field ep kind)
+                                                        (load (field (box-expr a
+                                                                               lit)
+                                                                     kind)))
+                                                0)))))))))
+             (EInt [_] 0)
+             (EWideInt [_ _ _ _ _] 0)
+             (EFloat [_] 0)
+             (EBool [_] 0)
+             (EStr [_] 0)
+             (ECStr [_] 0)
+             (EVar [_] 0)
+             (EZeroed [_] 0)
+             (ERecordInit [_] 0)
+             (ESizeOf [_] 0)
+             (EAlignOf [_] 0)
+             (EOffsetOf [_ _] 0)
+             (EFnPtrOf [_] 0)
+             (EAlloc [_ _ init symbol]
+                     (if (= (primitive/cast i64 init) 0)
+                         0
+                         (do (try! (fold-expr init cx)) 0)))
+             (EContinue [_] 0)
+             (EQuote [_] 0)
+             (EStaticRef [_] 0)
+             (ETraitCall [_ _ _ _] 0)
+             (ETypeQuery [_ _] 0)
+             (EConstParam [_ _] 0)
+             (EBorrow [mu place] (do (try! (fold-expr place cx)) 0))
+             (ESpillRef [x] (do (try! (fold-expr x cx)) 0))
+             (EMovePlace [x] (do (try! (fold-expr x cx)) 0))
+             (EIntUnary [_ x] (do (try! (fold-expr x cx)) 0))
+             (ELoad [x] (do (try! (fold-expr x cx)) 0))
+             (EFree [x] (do (try! (fold-expr x cx)) 0))
+             (EErase [tn x] (do (try! (fold-expr x cx)) 0))
+             (EMakeDyn [ds vt ms inner] (do (try! (fold-expr inner cx)) 0))
+             (EDynDispatch [dc] (let [ds (.dyn_struct dc) vt (.vtable_struct dc) mi (.method_index dc) cc (.cc dc) ps (.params dc) rt (.ret dc) recv (.recv dc) args (.args dc)]
+                           (do
+                             (try! (fold-expr recv cx))
+                             (try! (fold-expr-list args cx))
+                             0)))
+             (ECast [t x] (do (try! (fold-expr x cx)) 0))
+             (EAscribe [t x] (do (try! (fold-expr x cx)) 0))
+             (EPattern [pattern-op t x pattern-index]
+                       (do (try! (fold-expr x cx)) 0))
+             (EBin [op l r]
+                   (do (try! (fold-expr l cx)) (try! (fold-expr r cx)) 0))
+             (ECmp [op l r]
+                   (do (try! (fold-expr l cx)) (try! (fold-expr r cx)) 0))
+             (EIf [c t e]
+                  (do
+                    (try! (fold-expr c cx))
+                    (try! (fold-expr t cx))
+                    (try! (fold-expr e cx))
+                    0))
+             (EDo [body] (do (try! (fold-expr-list body cx)) 0))
+             (EDefer [cleanup body]
+                     (do (try! (fold-expr cleanup cx)) (try! (fold-expr-list body cx)) 0))
+             (EBracketCall [_ _ args vector]
+                           (do (try! (fold-expr-list args cx)) (try! (fold-expr vector cx)) 0))
+             (EFnPtrInst [_ _] 0)
+             (ELoop [label body] (do (try! (fold-expr-list body cx)) 0))
+             (EBreak [label value]
+                     (do
+                       (match value
+                         (Some [vp] (try! (fold-expr vp cx)))
+                         (None [] 0))
+                       0))
+             (ELet [binds body]
+                   (do
+                     (try! (fold-bind-list binds cx))
+                     (try! (fold-expr-list body cx))
+                     0))
+             (ECall [func type_args args]
+                    (do (try! (fold-expr-list args cx)) 0))
+             (ENamedCall [func type_args names args]
+                         (do (try! (fold-expr-list args cx)) 0))
+             (EField [p fname] (do (try! (fold-expr p cx)) 0))
+             (EAccessorField [p fname]
+                             (do
+                               (try! (fold-expr p cx))
+                               (set! (.kind ep) (EField p fname))
+                               0))
+             (EStore [p val]
+                     (do (try! (fold-expr p cx)) (try! (fold-expr val cx)) 0))
+             (EInitStore [p val]
+                         (do
+                           (try! (fold-expr p cx))
+                           (try! (fold-expr val cx))
+                           0))
+             (EIndex [p idx]
+                     (do (try! (fold-expr p cx)) (try! (fold-expr idx cx)) 0))
+             (EBitGet [p fname] (do (try! (fold-expr p cx)) 0))
+             (EBitSet [p fname val]
+                      (do (try! (fold-expr p cx)) (try! (fold-expr val cx)) 0))
+             (EConstruct [sum variant args]
+                         (do (try! (fold-expr-list args cx)) 0))
+             (EMatch [scrut arms]
+                     (do
+                       (try! (fold-expr scrut cx))
+                       (try! (fold-arm-list arms cx))
+                       0))
+             (ECallPtr [fp args]
+                       (do
+                         (try! (fold-expr fp cx))
+                         (try! (fold-expr-list args cx))
+                         0))
+             (ELlvmIr [result args body] (do (try! (fold-expr-list args cx)) 0))
+             (EIntrinsic [_ _ args] (do (try! (fold-expr-list args cx)) 0))
+             (EVector [_ _ _ args] (do (try! (fold-expr-list args cx)) 0))
+             (ECodeOp [op args] (do (try! (fold-expr-list args cx)) 0))
+             (EQuasi [q]
+                     ; Folding reaches the unquoted expressions through the template's
+                     ; pointers and never changes the template value itself, so there is
+                     ; nothing to write back into this node.
+                     (do
+                       (let [qp (primitive/alloc-stack Quasi)]
+                         (store! qp q)
+                         (try! (fold-quasi qp cx)))
+                       0))
+             (EFieldMeta [meta t idx] (do (try! (fold-expr idx cx)) 0))
+             (EFieldIndex [t nm] (do (try! (fold-expr nm cx)) 0)))
+           (Ok [i64 Diag] 0)))))
+
+; Build the comptime CtCtx from a checked Program (mirrors fold_program's ctx).
+(defn mk-ctctx [(checked (ptr Program)) (a (dyn Allocator))] (-> (ptr CtCtx))
+  (let [cx (box! a CtCtx (primitive/zeroed CtCtx))]
+    (set! (.a cx) a)
+    (set! (.fns cx) (load (field checked funcs)))
+    (set! (.structs cx) (load (field checked structs)))
+    (set! (.sums cx) (load (field checked sums)))
+    (set! (.traits cx) (load (field checked traits)))
+    (set! (.fuel cx) 50000000)
+    (set! (.depth cx) 0)
+    (set! (.gensym cx) 0)
+    (set! (.qmodule cx) (None [(slice u8)]))
+    (set! (.module_fns cx) (primitive/cast (ptr (ArrayList (slice u8))) 0))
+    (set! (.qimports cx) (primitive/cast (ptr ModImports) 0))
+    (set! (.qexports cx) (primitive/cast (ptr (ArrayList ExpEntry)) 0))
+    (set! (.prog cx) checked)
+    (set! (.expansions cx) (primitive/cast (ptr (ArrayList Expansion)) 0))
+    cx))
+
+; A template needs folding only where an unquoted expression does: quoted syntax
+; holds nothing to evaluate. Mutually recursive with `fold-needed?`.
+(defn fold-quasi-needed? [(q Quasi)] (-> bool)
+  (match q
+    (QLit [_] false)
+    (QUnquote [e] (fold-needed? e))
+    (QSplice [e] (fold-needed? e))
+    (QList [items] (fold-quasi-list-needed? items))
+    (QVector [items] (fold-quasi-list-needed? items))))
+
+(defn fold-quasi-list-needed? [(items (ptr (ArrayList Quasi)))] (-> bool)
+  (let [(mut i) 0
+        (mut yes) false]
+    (loop (if (or (load yes) (>= (load i) (len (load items))))
+              (break)
+              (do
+                (when (fold-quasi-needed? (load (elem items (load i))))
+                  (set! yes true)
+                  0)
+                (set! i (+ (load i) 1)))))
+    (load yes)))
+
+; A cheap, conservative post-substitution test. Const replacement happens in
+; finish before fold-program, so this sees EComptime introduced by a constant as
+; well as one authored in the function. `true` is the safe fallback: an AST form
+; omitted here merely takes the ordinary fold walk; it can never skip a fold.
+(defn fold-list-needed? [(xs (ptr (ArrayList Expr)))] (-> bool)
+  (let [(mut i) 0
+        (mut yes) false]
+    (loop (if (or (load yes) (>= (load i) (len (load xs))))
+              (break)
+              (do
+                (when (fold-needed? (elem xs (load i)))
+                  (set! yes true)
+                  0)
+                (set! i (+ (load i) 1)))))
+    (load yes)))
+
+(defn fold-binds-needed? [(xs (ptr (ArrayList Bind)))] (-> bool)
+  (let [(mut i) 0
+        (mut yes) false]
+    (loop (if (or (load yes) (>= (load i) (len (load xs))))
+              (break)
+              (do
+                (when (fold-needed? (field (elem xs (load i)) value))
+                  (set! yes true)
+                  0)
+                (set! i (+ (load i) 1)))))
+    (load yes)))
+
+(defn fold-arms-needed? [(xs (ptr (ArrayList Arm)))] (-> bool)
+  (let [(mut i) 0
+        (mut yes) false]
+    (loop (if (or (load yes) (>= (load i) (len (load xs))))
+              (break)
+              (do
+                (when (fold-needed? (field (elem xs (load i)) body))
+                  (set! yes true)
+                  0)
+                (set! i (+ (load i) 1)))))
+    (load yes)))
+
+(defn fold-needed? [(e (ptr Expr))] (-> bool)
+  (match (.kind e)
+    (EComptime [_] true)
+    (EArrayLit [xs] (fold-list-needed? xs))
+    (EStaticArray [_ xs] (fold-list-needed? xs))
+    (ECleanup [body cleanups]
+              (or (fold-needed? body) (fold-list-needed? cleanups)))
+    (EMakeSlice [data _ _] (fold-needed? data))
+    (EAlloc [_ _ init symbol]
+            (if (= (primitive/cast i64 init) 0) false (fold-needed? init)))
+    (EBorrow [_ x] (fold-needed? x))
+    (ESpillRef [x] (fold-needed? x))
+    (EMovePlace [x] (fold-needed? x))
+    (EIntUnary [_ x] (fold-needed? x))
+    (ELoad [x] (fold-needed? x))
+    (EFree [x] (fold-needed? x))
+    (EErase [_ x] (fold-needed? x))
+    (EMakeDyn [_ _ _ x] (fold-needed? x))
+    (EDynDispatch [dc] (let [recv (.recv dc) args (.args dc)]
+                  (or (fold-needed? recv) (fold-list-needed? args))))
+    (ECast [_ x] (fold-needed? x))
+    (EAscribe [_ x] (fold-needed? x))
+    (EPattern [pattern-op _ x pattern-index] (fold-needed? x))
+    (EBin [_ l r] (or (fold-needed? l) (fold-needed? r)))
+    (ECmp [_ l r] (or (fold-needed? l) (fold-needed? r)))
+    (EIf [c t f] (or (fold-needed? c) (or (fold-needed? t) (fold-needed? f))))
+    (EDo [xs] (fold-list-needed? xs))
+    (EDefer [c xs] (or (fold-needed? c) (fold-list-needed? xs)))
+    (ELoop [_ xs] (fold-list-needed? xs))
+    (EBreak [_ v] (match v (Some [x] (fold-needed? x)) (None [] false)))
+    (ELet [bs xs] (or (fold-binds-needed? bs) (fold-list-needed? xs)))
+    (ECall [_ _ xs] (fold-list-needed? xs))
+    (ENamedCall [_ _ _ xs] (fold-list-needed? xs))
+    (EField [x _] (fold-needed? x))
+    (EAccessorField [x _] (fold-needed? x))
+    (EStore [p v] (or (fold-needed? p) (fold-needed? v)))
+    (EInitStore [p v] (or (fold-needed? p) (fold-needed? v)))
+    (EIndex [p i] (or (fold-needed? p) (fold-needed? i)))
+    (EBitGet [p _] (fold-needed? p))
+    (EBitSet [p _ v] (or (fold-needed? p) (fold-needed? v)))
+    (EConstruct [_ _ xs] (fold-list-needed? xs))
+    (EMatch [x arms] (or (fold-needed? x) (fold-arms-needed? arms)))
+    (ECallPtr [f xs] (or (fold-needed? f) (fold-list-needed? xs)))
+    (ECodeOp [_ xs] (fold-list-needed? xs))
+    (ELlvmIr [_ xs _] (fold-list-needed? xs))
+    (EIntrinsic [_ _ xs] (fold-list-needed? xs))
+    (EVector [_ _ _ xs] (fold-list-needed? xs))
+    (EFieldMeta [_ _ i] (fold-needed? i))
+    (EFieldIndex [_ i] (fold-needed? i))
+    ; Quasiquote may contain unquotes with arbitrary expressions. It is rare in
+    ; runtime output, so retain the full fold rather than duplicate its walker.
+    (EQuasi [q] (fold-quasi-needed? q))
+    (EInt [_] false)
+    (EWideInt [_ _ _ _ _] false)
+    (EFloat [_] false)
+    (EBool [_] false)
+    (EStr [_] false)
+    (ECStr [_] false)
+    (EVar [_] false)
+    (EZeroed [_] false)
+    (ERecordInit [_] false)
+    (ESizeOf [_] false)
+    (EAlignOf [_] false)
+    (EOffsetOf [_ _] false)
+    (EFnPtrOf [_] false)
+    (EContinue [_] false)
+    (EQuote [_] false)
+    (EStaticRef [_] false)
+    (ETraitCall [_ _ _ _] false)
+    (ETypeQuery [_ _] false)
+    (_ true)))
+
+; fold_program: fold every function body (int place) and every static-assert cond.
+(defn fold-program [(checked (ptr Program))
+                    (asserts (ptr (ArrayList StaticAssert)))
+                    (a (dyn Allocator))] (-> (Result i64
+                                                     Diag))
+  (let [cx (mk-ctctx checked a)
+        fns (load (field checked funcs))
+        nf (len (load fns))
+        (mut i) 0
+        (mut err) (primitive/zeroed Diag)
+        (mut failed) false]
+    (loop (if (>= (load i) nf)
+              (break)
+              (do
+                (let [fp (elem fns (load i))
+                      anns (load (field fp annotations))
+                      an (len (load anns))
+                      (mut ai) 0]
+                  (loop (if (>= (load ai) an)
+                            (break)
+                            (do
+                              (match (fold-expr (field (elem anns
+                                                             (load ai))
+                                                       value)
+                                                cx)
+                                (Err [d]
+                                     (do
+                                       (set! err d)
+                                       (set! failed true)
+                                       (break)))
+                                (Ok [_] 0))
+                              (set! ai (primitive/iadd (load ai) 1)))))
+                  (when (load failed) (break))
+                  (when (fold-list-needed? (load (field fp body)))
+                    (match (fold-expr-list (load (field fp body))
+                                           cx)
+                      (Err [d] (do (set! err d) (set! failed true) (break)))
+                      (Ok [_] 0))
+                    0))
+                (set! i (primitive/iadd (load i) 1)))))
+    ; A runtime `def` initializer is lowered as a link-time constant, so a
+    ; `(comptime …)` inside it is folded here like one in a function body.
+    (unless (load failed)
+      (let [cs (load (field checked consts))]
+        (for [ci 0 (len (load cs))]
+          (let [cp (elem cs ci)]
+            (when (and (.runtime cp) (not (load failed)))
+              (match (fold-expr (field cp value) cx)
+                (Err [d] (do (set! err d) (set! failed true) 0))
+                (Ok [_] 0)))
+            0)))
+      0)
+    (if (load failed)
+        (Err (load err))
+        (let [na (len (load asserts))
+              (mut j) 0
+              (mut e2) (primitive/zeroed Diag)
+              (mut f2) false]
+          (loop (if (>= (load j) na)
+                    (break)
+                    (do
+                      (match (fold-expr (field (elem asserts
+                                                     (load j))
+                                               cnd)
+                                        cx)
+                        (Err [d] (do (set! e2 d) (set! f2 true) (break)))
+                        (Ok [_] 0))
+                      (set! j (primitive/iadd (load j) 1)))))
+          (if (load f2) (Err [i64 Diag] (load e2)) (Ok [i64 Diag] 0))))))
