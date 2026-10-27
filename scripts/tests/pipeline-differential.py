@@ -25,23 +25,42 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 DUMPS = ("dump-checked", "dump-mono")
+COMPILER = ROOT / "src/compiler/main.coil"
 
 
 def corpus():
-    files = [ROOT / "src/compiler/main.coil"]
+    files = [COMPILER]
     for pattern in ("src/examples/*.coil", "tests/corpus/*.coil", "tests/diag/*/*.coil",
                     "tests/stdlib/*.coil"):
         files.extend(sorted(ROOT.glob(pattern)))
     return files
 
 
+def namespace_roots():
+    # The roots scripts/compiler/stage0.py builds the compiler with: its own
+    # sources, so a reference compiler whose bundled manifest predates a new
+    # compiler module still finds it, and the tpde backend, which the compiler
+    # imports from its package beside this checkout (Coil.toml).
+    roots = ["src", "tests", "scripts", "src/compiler", "src/stdlib"]
+    tpde = (ROOT / "../coil-tpde/src").resolve()
+    if tpde.is_dir():
+        roots.append(str(tpde))
+    return ":".join(roots)
+
+
 def dump(compiler, command, path):
-    env = {**os.environ, "COIL_NAMESPACE_ROOTS": "src:tests:scripts", "COIL_STRICT_BUNDLE": "0"}
+    env = {**os.environ, "COIL_NAMESPACE_ROOTS": namespace_roots(), "COIL_STRICT_BUNDLE": "0"}
     result = subprocess.run([str(compiler), command, str(path)], cwd=ROOT, env=env,
                             capture_output=True, timeout=900)
     if result.returncode not in (0, 1):
         raise RuntimeError(
             f"{compiler} {command} {path}: abnormal exit {result.returncode}\n"
+            + result.stderr.decode(errors="replace")[:2000])
+    # Two compilers that both fail to load the compiler agree on nothing but the
+    # failure; the comparison the corpus leads with would never run.
+    if path == COMPILER and result.returncode != 0:
+        raise RuntimeError(
+            f"{compiler} {command} {path}: the compiler does not check\n"
             + result.stderr.decode(errors="replace")[:2000])
     return (f"--status--{result.returncode}\n".encode()
             + result.stdout + b"\n--stderr--\n" + result.stderr)
@@ -73,6 +92,30 @@ def compare(reference, candidate, path, output_dir=None):
     return problems
 
 
+def pair_with_checkout(prefix, compiler):
+    """COMPILER installed into PREFIX against this checkout's source tree.
+
+    A compiler in another worktree otherwise discovers that worktree's stdlib
+    beside its own binary, and the comparison would measure two libraries as
+    well as two compilers. Each compiler gets a prefix of its own all the same:
+    the compile-time units a compiler builds and caches under its prefix belong
+    to that binary, and a second compiler loading them fails their digest check.
+    """
+    bindir = prefix / "bin"
+    library = prefix / "lib/coil"
+    bindir.mkdir(parents=True)
+    library.mkdir(parents=True)
+    (library / "stdlib").symlink_to(ROOT / "src/stdlib", target_is_directory=True)
+    (library / "compiler").symlink_to(ROOT / "src/compiler", target_is_directory=True)
+    (library / "prelude.coil").symlink_to(ROOT / "src/compiler/prelude.coil")
+    native = ROOT / "build/bin/native"
+    if native.is_dir():
+        (bindir / "native").symlink_to(native, target_is_directory=True)
+    paired = bindir / "coil"
+    shutil.copy2(compiler, paired)
+    return paired
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("reference")
@@ -84,28 +127,11 @@ def main():
     candidate = Path(args.candidate).resolve()
     files = corpus()
     failures = []
-    # A compiler in another worktree otherwise discovers that worktree's stdlib
-    # beside its own binary. The comparison would then measure two libraries as
-    # well as two compilers, and report hundreds of unrelated differences after
-    # a prelude edit. Pair both binaries with this checkout's same source tree.
     build_root = ROOT / "build"
     build_root.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="pipeline-diff-", dir=build_root) as directory:
-        prefix = Path(directory)
-        bindir = prefix / "bin"
-        library = prefix / "lib/coil"
-        bindir.mkdir()
-        library.mkdir(parents=True)
-        (library / "stdlib").symlink_to(ROOT / "src/stdlib", target_is_directory=True)
-        (library / "compiler").symlink_to(ROOT / "src/compiler", target_is_directory=True)
-        (library / "prelude.coil").symlink_to(ROOT / "src/compiler/prelude.coil")
-        native = ROOT / "build/bin/native"
-        if native.is_dir():
-            (bindir / "native").symlink_to(native, target_is_directory=True)
-        paired_reference = bindir / "coil-reference"
-        paired_candidate = bindir / "coil-candidate"
-        shutil.copy2(reference, paired_reference)
-        shutil.copy2(candidate, paired_candidate)
+        paired_reference = pair_with_checkout(Path(directory) / "reference", reference)
+        paired_candidate = pair_with_checkout(Path(directory) / "candidate", candidate)
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
             for problems in pool.map(
                     lambda path: compare(paired_reference, paired_candidate, path, args.output_dir), files):
