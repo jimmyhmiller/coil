@@ -66,7 +66,7 @@ APP="$W/app"
 
 echo "== app: build, artifacts and dependencies"
 run "$APP" "$COIL" build
-expect 0 "wrote build/release/pfapp" "a bare build builds the package and its artifacts"
+expect 0 "wrote build/release/pfapp" "a bare build builds the package and its artifacts (src/banner.coil, a header-less script, declares no module)"
 [ -x "$APP/build/tools/tool" ] && [ -f "$APP/build/runtime.o" ] \
   && ok "the executable and object artifacts are written where the manifest says" \
   || bad "artifact outputs" "$(ls -R "$APP/build" 2>&1)"

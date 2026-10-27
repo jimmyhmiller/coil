@@ -430,6 +430,11 @@ EOF
   printf '(module refer-length)\n(import "coil.primitive" :as primitive)\n(import "coil.core" :use * :exclude [<])\n(const N (if (< 1 2) 3 4))\n(defstruct Buf [(xs (array i64 N))])\n(defn main [] (-> i64) (primitive/cast i64 (primitive/sizeof Buf)))\n' > "$T/refer-length.coil"
   expect_rc_out 1 "trait method '<' is not in scope" "check: an excluded operator is not in scope in an array length's constant" \
     "$COIL" check "$T/refer-length.coil"
+  # A malformed :rename is the author's mistake, reported at the import; it used
+  # to abort the compiler (and with it a REPL session) with no location.
+  printf '(module bad-rename)\n(import "coil.io" :use [println] :rename [println out])\n(defn main [] (-> i64) 0)\n' > "$T/bad-rename.coil"
+  expect_rc_out 1 "import: :rename expects \\[\\[from to\\] …\\] — each entry is a two-symbol vector" \
+    "check: a malformed :rename is a located error" "$COIL" check "$T/bad-rename.coil"
   # `(make-dyn Trait p)` names a trait in scope, not any trait of that last name.
   mkdir -p "$T/dyn-scope"
   printf '(module dynshapes)\n(export Show show)\n(deftrait Show [Self] (show [(a (ptr Self))] (-> i64)))\n' > "$T/dyn-scope/dynshapes.coil"
