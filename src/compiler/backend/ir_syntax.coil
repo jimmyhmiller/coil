@@ -1,0 +1,147 @@
+;;; Syntax shared by consumers of the straight-line inline LLVM-IR subset.
+;;; Execution and machine lowering remain with each backend. Diagnostics are a
+;;; policy parameter so native and interpreted callers keep their own failures.
+(module coil.compiler.ir_syntax)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.control" :use *)
+(import "coil.compiler.ast" :use *)
+
+(deftrait IrErrors [Self]
+  (ir-error [(self Self) (message (slice u8)) (token (slice u8))] (-> i64)))
+
+;;; Separate punctuation from words; spaces, tabs, and commas separate tokens.
+;;; The caller supplies one line, already separated from the instruction body.
+(defn tokenize [(a (dyn Allocator)) (line (slice u8))]
+  (-> (ptr (ArrayList (slice u8))))
+  (let [(mut out) (ArrayList::new [(slice u8)] a)
+        (mut start) -1
+        n (len line)]
+    (for [i 0 n]
+      (let [c (p/cast i64 (get line i))
+            separator (or (= c 32) (= c 9) (= c 44))
+            punctuation
+              (or (= c 123)
+                  (= c 125)
+                  (= c 40)
+                  (= c 41)
+                  (= c 60)
+                  (= c 62))]
+        (if (or separator punctuation)
+            (do
+              (when (>= (load start) 0)
+                (push! (mut out) (subslice line (load start) i)))
+              (when punctuation (push! (mut out) (subslice line i (+ i 1))))
+              (set! start -1))
+            (when (< (load start) 0) (set! start i)))))
+    (when (>= (load start) 0)
+      (push! (mut out) (subslice line (load start) n)))
+    (box! a (ArrayList (slice u8)) (load out))))
+
+;;; Plain decimal tokens, with the same wrapping accumulation as IR immediates.
+(defn integer [(D IrErrors)] [(errors D) (text (slice u8))] (-> i64)
+  (let [n (len text)
+        negative (and (> n 0) (= (get text 0) (: 45 u8)))
+        (mut value) 0]
+    (for [i (when negative 1) n]
+      (let [c (p/cast i64 (get text i))]
+        (if (or (< c 48) (> c 57))
+            (ir-error errors "not an integer token: " text)
+            (set! value (p/iadd (p/imul (load value) 10) (p/isub c 48))))))
+    (if negative (p/isub 0 (load value)) (load value))))
+
+;;; Decimal floating literals. This subset does not accept exponent notation.
+(defn floating [(D IrErrors)] [(errors D) (text (slice u8))] (-> f64)
+  (let [n (len text)
+        negative (and (> n 0) (= (get text 0) (: 45 u8)))
+        (mut whole) 0
+        (mut fraction) 0.0
+        (mut divisor) 1.0
+        (mut fractional) false]
+    (for [i (when negative 1) n]
+      (let [c (p/cast i64 (get text i))]
+        (cond (= c 46) (set! fractional true)
+              (or (< c 48) (> c 57))
+                (ir-error errors "llvm-ir: not a float token: " text)
+              (load fractional)
+                (do
+                  (set! divisor (* (load divisor) 10.0))
+                  (set! fraction
+                        (+ (load fraction)
+                           (/ (p/cast f64 (p/isub c 48)) (load divisor)))))
+              :else (set! whole (p/iadd (p/imul (load whole) 10) (p/isub c 48))))))
+    (let [value (+ (p/cast f64 (load whole)) (load fraction))]
+      (if negative (- 0.0 value) value))))
+
+;;; The placeholders in an inline-IR signature refer to its declared result
+;;; and argument types, independent of the execution backend.
+(defstruct TypeContext [D]
+  [(allocator (dyn Allocator))
+   (result Type)
+   (arguments (ptr (ArrayList Type)))
+   (errors D)])
+
+(defn read-type [(D IrErrors)] [(context (ref (TypeContext D)))
+                                (tokens (ptr (ArrayList (slice u8))))
+                                (position (ptr i64))] (-> Type)
+  (let [a (.allocator context)
+        errors (.errors context)
+        token (get (load tokens) (load position))]
+    (set! position (p/iadd (load position) 1))
+    (cond (= token "$ret") (.result context)
+          (= token "i64") (TInt 64 true)
+          (= token "i32") (TInt 32 true)
+          (= token "i16") (TInt 16 true)
+          (= token "i8") (TInt 8 true)
+          ; The supported i128 operations use an opaque 16-byte, 8-aligned pair.
+          (= token "i128") (TSlice (box-type a (TInt 8 true)))
+          (= token "i1") (TBool)
+          (= token "ptr") (TPtr (box-type a (TInt 8 true)))
+          (= token "float") (TFloat 32)
+          (= token "double") (TFloat 64)
+          (= token "{")
+            (let [first (read-type context tokens position)
+                  second (read-type context tokens position)]
+              (set! position (p/iadd (load position) 1))
+              ; cmpxchg's {T, i1} uses the same pair representation.
+              (TSlice (box-type a first)))
+          (= token "<")
+            (let [width (get (load tokens) (load position))]
+              (set! position (p/iadd (load position) 2))
+              (let [element (read-type context tokens position)]
+                (set! position (p/iadd (load position) 1))
+                (fixed-vec (box-type a element) (integer errors width))))
+          (and (>= (len token) 3)
+               (= (get token 0) (: 36 u8))
+               (= (get token 1) (: 116 u8)))
+            (get (load (.arguments context))
+                 (integer errors (subslice token 2 (len token))))
+          :else
+            (do
+              (ir-error errors "llvm-ir: unsupported type token: " token)
+              (TInt 64 true)))))
+
+;;; Read a constant shufflevector mask, advancing over its complete literal.
+(defn read-mask [(D IrErrors)] [(a (dyn Allocator))
+                                (errors D)
+                                (tokens (ptr (ArrayList (slice u8))))
+                                (position (ptr i64))
+                                (n i64)]
+  (-> (ptr (ArrayList i64)))
+  (let [(mut out) (ArrayList::new [i64] a)]
+    (if (= (get (load tokens) (load position)) "zeroinitializer")
+        (do
+          (set! position (p/iadd (load position) 1))
+          (for [i 0 n] (push! (mut out) 0)))
+        (do
+          (set! position (p/iadd (load position) 1))
+          (for [i 0 n]
+            (set! position (p/iadd (load position) 1))
+            (push! (mut out)
+                   (integer errors (get (load tokens) (load position))))
+            (set! position (p/iadd (load position) 1)))
+          (set! position (p/iadd (load position) 1))))
+    (box! a (ArrayList i64) (load out))))
