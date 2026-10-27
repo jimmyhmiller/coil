@@ -96,10 +96,10 @@ There are two defects:
 
 1. LLVM control-flow emission generates a return whose LLVM value type disagrees with the declared
    function result. The suspicious area is `emit-loop`/function-body sequencing in
-   `src/compiler/codegen.coil`: after a nested-loop-heavy expression, the following expressions are
+   `src/compiler/backend/codegen.coil`: after a nested-loop-heavy expression, the following expressions are
    not represented on the affected exit path.
 2. The LLVM driver does not call `LLVMVerifyModule` before `LLVMRunPasses` or
-   `LLVMTargetMachineEmitToFile`. `LLVMVerifyModule` is declared in `src/compiler/ffi.coil` but has
+   `LLVMTargetMachineEmitToFile`. `LLVMVerifyModule` is declared in `src/compiler/support/ffi.coil` but has
    no call site. Consequently an internal code-generation error reaches LLVM's fatal path instead
    of becoming a located Coil compiler diagnostic.
 

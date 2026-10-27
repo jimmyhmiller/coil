@@ -38,7 +38,7 @@ def render(t):
     return '('+' '.join(map(render,t))+')'
 
 modules={}; definitions={}
-for path in list((ROOT/'src/compiler').glob('*.coil'))+list((ROOT/'src/stdlib').glob('*.coil')):
+for path in list((ROOT/'src/compiler').rglob('*.coil'))+list((ROOT/'src/stdlib').glob('*.coil')):
     if path.name in ('guide.coil','retained_snapshot.coil'): continue
     forms=read(path.read_text())
     module=next((f[1] for f in forms if isinstance(f,list) and len(f)>1 and f[0]=='module'),None)
@@ -503,7 +503,7 @@ wrappers+=dispatch('chunk-walk','(fnptr (coil.cc.C) [(ptr Graph) (ptr i8)] i64)'
 wrappers+=dispatch('chunk-identify','(fnptr (coil.cc.C) [(ptr (ArrayList i64)) (ptr i8) i64] i64)',lambda r:'(p/fnptr-of '+ident(r)+'-chunk-identify)')
 wrappers+=dispatch('chunk-stride','i64',lambda r:'(p/sizeof '+render(r)+')')
 result=header+imports+'\n'+''.join(output)+''.join(identity_output)+type_names+wrappers
-target=ROOT/'src/compiler/retained_snapshot.coil'
+target=ROOT/'src/compiler/retained/retained_snapshot.coil'
 if '--check' in sys.argv:
     if not target.exists() or target.read_text()!=result:
         raise SystemExit('retained metadata visitors are stale; run scripts/compiler/gen-retained-snapshot.py')
@@ -587,7 +587,7 @@ for name,t in zip(('program!','struct!','sum!','func!','const!','trait!','extern
     dep_wrappers+='(defn '+name.replace('!', '-value!')+' [(refs (mut (HashMap (slice u8) i64))) (seen (mut (HashMap GraphKey i64))) (value '+render(t)+')] (-> i64) ('+dep_ident(t)+' (mut refs) (mut seen) value))\n'
     dep_wrappers+='(defn '+name+' [(refs (mut (HashMap (slice u8) i64))) (seen (mut (HashMap GraphKey i64))) (value (ptr '+render(t)+'))] (-> i64) ('+dep_ident(t)+' (mut refs) (mut seen) (load value)))\n'
 dep_result=dep_header+'\n'.join('(import "'+m+'")' for m in sorted(dep_used) if m!='coil.core')+'\n'+''.join(dep_output)+dep_wrappers
-dep_target=ROOT/'src/compiler/type_references.coil'
+dep_target=ROOT/'src/compiler/retained/type_references.coil'
 if '--check' in sys.argv:
     if not dep_target.exists() or dep_target.read_text()!=dep_result:
         raise SystemExit('type dependency visitors are stale; run scripts/compiler/gen-retained-snapshot.py')

@@ -2,7 +2,7 @@
 # Object-writer gate for the x86-64 backend: elf.coil must emit an object that
 # the SYSTEM toolchain accepts, not merely one that looks right.
 #
-# src/compiler/elf_selftest.coil hand-assembles
+# src/compiler/selftest/elf_selftest.coil hand-assembles
 #     int main(void) { puts("elf ok"); return 42; }
 # and writes it through elf.coil. Here we:
 #   1. check readelf can parse it and reports the right class/type/machine;
@@ -33,7 +33,7 @@ check() {  # check <description> <condition-output> <expected-substring>
   fi
 }
 
-"$BIN" run src/compiler/elf_selftest.coil -- "$OBJ" >/dev/null || {
+"$BIN" run src/compiler/selftest/elf_selftest.coil -- "$OBJ" >/dev/null || {
   echo "GATE FAIL: elf_selftest.coil did not run"; exit 2; }
 [ -f "$OBJ" ] || { echo "GATE FAIL: no object written"; exit 2; }
 

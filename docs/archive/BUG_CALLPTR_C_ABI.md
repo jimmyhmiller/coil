@@ -41,7 +41,7 @@ as the control.
 `emit-callptr` never applies C-ABI argument lowering. It builds the call from
 the raw parameter types:
 
-`src/compiler/codegen.coil:1153-1160`
+`src/compiler/backend/codegen.coil:1153-1160`
 
 ```
 (defn emit-callptr [(cg (ptr Cg)) (fp (ptr Expr)) (args …) (scp (ptr Scope))] (-> Tv)

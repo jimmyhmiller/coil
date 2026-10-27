@@ -24,7 +24,7 @@ makes rendering a **trait**, `Display`, and gives variadic macros that dispatch 
 
 `impl Display Code` required lifting a restriction: `Code` was bucketed with
 `void/ref/never/externref` as "can't carry an impl" in the single dispatch-key source of
-truth, `src/compiler/parser.coil::impl-base-name`. Adding `(TCode [] "code")` there fixes
+truth, `src/compiler/frontend/parser.coil::impl-base-name`. Adding `(TCode [] "code")` there fixes
 it everywhere (check/mono delegate to that one function). It is safe because a
 `Display`-for-`Code` method takes a `Code` param, so it is comptime-only and already
 dropped before mono by `drop-code-funcs`. Verified with a full `scripts/compiler/rebootstrap.sh`

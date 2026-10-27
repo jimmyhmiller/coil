@@ -38,7 +38,7 @@ doesn't stack with it. That's the rule to copy.
 ## 2. Where Coil is today
 
 `(import "ns" :as a)`, `:use *`, `:use [names]`, `:reexport` — parsed in `process-import`
-(`src/compiler/loader.coil:874`) into `ModImports { aliases, uses, reexports }`
+(`src/compiler/frontend/loader.coil:874`) into `ModImports { aliases, uses, reexports }`
 (`loader.coil:60-70`). `:as`-only already means qualified-only, so half of "import only
 qualified things" exists.
 
@@ -267,7 +267,7 @@ The mechanism refactor was verified inert before any syntax was added —
 ## 7. Docs
 
 `docs/reference/NAMESPACING.md` (new §"Opting out of core" and §"One rule, four
-surfaces"), the `LANGUAGE_GUIDE.md` imports section, and `src/compiler/guide.coil`
+surfaces"), the `LANGUAGE_GUIDE.md` imports section, and `src/compiler/cli/guide.coil`
 (regenerated via `scripts/docs/gen-guide.py`).
 
 ---

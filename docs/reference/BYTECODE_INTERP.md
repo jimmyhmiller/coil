@@ -1,6 +1,6 @@
 # The Coil Bytecode Interpreter
 
-`src/compiler/interp.coil` is a bytecode interpreter for the self-hosted Coil
+`src/compiler/comptime/interp.coil` is a bytecode interpreter for the self-hosted Coil
 compiler. It consumes the **same monomorphized `Program`** the native backends
 consume — the output of `parse -> resolve -> check -> mono` — compiles each
 mono'd function to a compact stack-bytecode ISA, and executes it on a small VM
@@ -187,7 +187,7 @@ the body, so a `for`-macro's top-of-loop increment still runs (matching C `for`)
 
 ### Native calls (AArch64 macOS, x86-64 Linux)
 
-`src/compiler/native_call.coil` calls C functions whose signature is known only
+`src/compiler/comptime/native_call.coil` calls C functions whose signature is known only
 at run time, the way libffi does:
 
 - **Outgoing.** An `extern` call resolves its C symbol with `dlsym` in this

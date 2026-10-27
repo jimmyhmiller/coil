@@ -8,21 +8,21 @@ about *why* (debug backend, DWARF always on, compile speed over code quality)
 applies here unchanged.
 
 ## Files
-- `src/compiler/x64.coil` — x86-64 instruction encoder. Pure: composes REX /
+- `src/compiler/object/x64.coil` — x86-64 instruction encoder. Pure: composes REX /
   ModRM / SIB / displacement bytes into a plain byte buffer; label+fixup
   management for branches.
-- `src/compiler/elf.coil` — ELF64 `ET_REL` writer: sections, `.rela.*`
+- `src/compiler/object/elf.coil` — ELF64 `ET_REL` writer: sections, `.rela.*`
   relocations (`R_X86_64_64`, `PC32`, `PLT32`), symbol table with the
   local-before-global ordering ELF requires, string tables.
-- `src/compiler/dwarf.coil` — **shared** with the arm64 backend; the frame-base
+- `src/compiler/object/dwarf.coil` — **shared** with the arm64 backend; the frame-base
   register and slot bias are now parameters (`fbreg`/`fbbias`) rather than
   hardcoded to x29.
-- `src/compiler/codegen_x64.coil` — the lowering: mono `Program` → code + data +
+- `src/compiler/backend/codegen_x64.coil` — the lowering: mono `Program` → code + data +
   relocs + DWARF. Mirrors `codegen_a64.coil` function for function, so the two
   can be diffed against each other.
 - `src/compiler/main_x64.coil` — the LLVM-free entry point (the `main_a64.coil`
   equivalent): omits `codegen.coil`/`normalize.coil` entirely.
-- `src/compiler/x64_selftest.coil` — the encoder's verification harness.
+- `src/compiler/selftest/x64_selftest.coil` — the encoder's verification harness.
 
 ## What differs from the arm64 backend
 Everything not listed here is deliberately identical.

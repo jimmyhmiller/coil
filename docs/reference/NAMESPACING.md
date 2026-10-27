@@ -72,7 +72,7 @@ In order:
 5. Otherwise: for a **call**, a hard "undefined function" error (see gating below);
    for other positions, left bare for a later pass.
 
-Steps 3 and 4 both go through one predicate, `use-refers` in `src/compiler/loader.coil`,
+Steps 3 and 4 both go through one predicate, `use-refers` in `src/compiler/frontend/loader.coil`,
 which is where `:use`/`:exclude`/`:rename` are interpreted. Core sits at step 4 rather
 than step 3, so an explicitly `:use`d module still shadows core.
 

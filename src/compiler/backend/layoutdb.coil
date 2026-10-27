@@ -1,0 +1,723 @@
+; src/compiler/backend/layoutdb.coil — one source of truth for runtime type layout.
+
+(module coil.compiler.layoutdb)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.io" :use *)
+(import "coil.control" :use *)
+(import "coil.compiler.ast" :use *)
+
+; The consumers used to have four copies of these records and of every algorithm
+; below. Backend state now owns one LayoutDb; ABI classification remains backend-
+; specific, but ordinary size/alignment/offset questions cannot drift.
+(defstruct LayoutStruct
+  [(name (slice u8))
+   (fields (ptr (ArrayList Field)))
+   (layout Layout)
+   (size i64)
+   (align i64)
+   (offsets (ArrayList i64))])
+
+(defstruct LayoutSum
+  [(name (slice u8))
+   (variants (ptr (ArrayList Variant)))
+   (words i64)])
+
+;;; A direct-mapped memo in front of a name-keyed map, indexed by the address
+;;; of the name's bytes: the same type name is looked up from the same AST
+;;; string over and over. A hit is checked against the whole name, so a reused
+;;; address can only miss.
+(defstruct NameMemo [(key (slice u8)) (owner i64) (val i64)])
+
+(const NAME-MEMO-SLOTS 1024)
+
+(defn name-memo-new [(a (dyn Allocator))] (-> (ArrayList NameMemo))
+  (let [(mut xs) (ArrayList::new [NameMemo] a)]
+    (extend-zeroed! (mut xs) NAME-MEMO-SLOTS)
+    xs))
+
+(defn name-memo-slot [(xs (ptr (ArrayList NameMemo))) (name (slice u8))] (-> (ptr NameMemo))
+  (let [p (primitive/cast i64 (data name))
+        h (^ (^ (>> p 3) (>> p 12)) (len name))]
+    (elem xs (& h (- NAME-MEMO-SLOTS 1)))))
+
+(defn name-memo-hit? [(m (ptr NameMemo)) (name (slice u8))] (-> bool)
+  (and (> (len name) 0) (= (.key m) name)))
+
+(defstruct LayoutDb
+  [(a (dyn Allocator))
+   (owner (slice u8))
+   (word_bytes i64)
+   (sum_word_bytes i64)
+   (structs (ArrayList LayoutStruct))
+   (sums (ArrayList LayoutSum))
+   (struct_idx (HashMap (slice u8) i64))
+   (sum_idx (HashMap (slice u8) i64))
+   (struct_memo (ArrayList NameMemo))
+   (sum_memo (ArrayList NameMemo))
+   ; field and variant names, with the struct or sum as `owner`
+   (field_memo (ArrayList NameMemo))
+   (variant_memo (ArrayList NameMemo))])
+
+(defn layout-fail [(db (ptr LayoutDb)) (msg (slice u8))] (-> i64)
+  (print-str (stderr) (.owner db))
+  (print-str (stderr) ": ")
+  (print-str (stderr) msg)
+  (write-byte (stderr) (: 10 u8))
+  (abort)
+  0)
+
+(defn layout-fail2 [(db (ptr LayoutDb)) (msg (slice u8)) (what (slice u8))] (-> i64)
+  (print-str (stderr) (.owner db))
+  (print-str (stderr) ": ")
+  (print-str (stderr) msg)
+  (print-str (stderr) what)
+  (write-byte (stderr) (: 10 u8))
+  (abort)
+  0)
+
+(defn layout-round-up [(n i64) (a i64)] (-> i64)
+  (primitive/imul (primitive/idiv (primitive/iadd n (primitive/isub a 1)) a) a))
+
+(defn layout-align8 [(n i64)] (-> i64)
+  (layout-round-up n 8))
+
+; Fixed vectors reserve a power-of-two allocation size. For example <3 x i32>
+; has twelve payload bytes but occupies sixteen bytes in an array or aggregate.
+; Using twelve for either size or alignment overlaps its next LLVM field.
+(defn layout-vector-bytes [(payload i64)] (-> i64)
+  (let [(mut bytes) 1]
+    (loop (if (>= (load bytes) payload) (break) (set! bytes (* (load bytes) 2))))
+    (load bytes)))
+
+; A slice is emitted as LLVM's ordinary `{ptr, i64}` aggregate. Its alignment is
+; therefore the greater of pointer and length alignment, and its size includes
+; any tail padding required by that alignment. In particular wasm32 uses a
+; 16-byte, 8-aligned slice rather than the unpadded 12-byte field sum.
+(defn layout-slice-align [(db (ptr LayoutDb))] (-> i64)
+  (if (> (.word_bytes db) 8) (.word_bytes db) 8))
+
+(defn layout-slice-size [(db (ptr LayoutDb))] (-> i64)
+  (layout-round-up (primitive/iadd (.word_bytes db) 8) (layout-slice-align db)))
+
+;;; A backend that works a bit field in one 64-bit register reaches a field of
+;;; a wider backing through the 64-bit window holding it; the parser keeps each
+;;; such field inside one 64-bit word. The window is that word, moved down to
+;;; end at the backing's last byte when the word runs past it (a u96's high
+;;; word is its bytes 4..11). Returns the window's byte offset and rebases the
+;;; field's low bit and the backing to the window; a backing of 64 bits or less
+;;; is its own window.
+(defn bits-window! [(lowp (ptr i64)) (backp (ptr i64))] (-> i64)
+  (let [low (load lowp)
+        back (load backp)]
+    (if (<= back 64)
+        0
+        (let [word (primitive/imul (primitive/idiv low 64) 8)
+              last (primitive/isub (primitive/idiv back 8) 8)
+              wb (if (< word last) word last)]
+          (store! lowp (primitive/isub low (primitive/imul wb 8)))
+          (store! backp 64)
+          wb))))
+
+(defn layout-at [T] [(xs (ptr (ArrayList T))) (i i64)] (-> (ptr T))
+  (primitive/index (load (field xs data)) i))
+
+(impl LayoutDb
+  ; Build all nominal entries first, then sum payload sizes, then struct layouts
+  ; in dependency order. No receiver means construction is explicitly qualified.
+  (new [(a (dyn Allocator))
+        (mp (ptr Program))
+        (owner (slice u8))
+        (word-bytes i64)
+        (sum-word-bytes i64)]
+       (-> LayoutDb)
+       (let [db (primitive/alloc-stack LayoutDb)]
+         (set! (.a db) a)
+         (set! (.owner db) owner)
+         (set! (.word_bytes db) word-bytes)
+         (set! (.sum_word_bytes db) sum-word-bytes)
+         (set! (.structs db) (ArrayList::new [LayoutStruct] a))
+         (set! (.sums db) (ArrayList::new [LayoutSum] a))
+         (set! (.struct_idx db) (HashMap::new [(slice u8) i64] a (keyops)))
+         (set! (.sum_idx db) (HashMap::new [(slice u8) i64] a (keyops)))
+         (set! (.struct_memo db) (name-memo-new a))
+         (set! (.sum_memo db) (name-memo-new a))
+         (set! (.field_memo db) (name-memo-new a))
+         (set! (.variant_memo db) (name-memo-new a))
+         (let [ss (load (field mp structs))
+               n (len (load ss))
+               (mut i) 0]
+           (loop (if (>= (load i) n)
+                     (break)
+                     (do
+                       (let [sd (layout-at [StructDef] ss (load i))
+                             e (primitive/alloc-stack LayoutStruct)]
+                         (set! (.name e) (.name sd))
+                         (set! (.fields e) (load (field sd fields)))
+                         (set! (.layout e) (.layout sd))
+                         (set! (.size e) 0)
+                         (set! (.align e) 1)
+                         (set! (.offsets e) (ArrayList::new [i64] a))
+                         (set! (mut (.struct_idx db))
+                               (.name e)
+                               (load i))
+                         (push! (mut (.structs db)) (load e)))
+                       (set! i (primitive/iadd (load i) 1))))))
+         (let [ss (load (field mp sums))
+               n (len (load ss))
+               (mut i) 0]
+           (loop (if (>= (load i) n)
+                     (break)
+                     (do
+                       (let [sd (layout-at [SumDef] ss (load i))
+                             e (primitive/alloc-stack LayoutSum)]
+                         (set! (.name e) (.name sd))
+                         (set! (.variants e) (load (field sd variants)))
+                         (set! (.words e) 0)
+                         (set! (mut (.sum_idx db))
+                               (.name e)
+                               (load i))
+                         (push! (mut (.sums db)) (load e)))
+                       (set! i (primitive/iadd (load i) 1))))))
+         (let [n (len (.sums db))
+               (mut i) 0]
+           (loop (if (>= (load i) n)
+                     (break)
+                     (do
+                       (let [e (layout-at [LayoutSum] (field db sums) (load i))]
+                         (set! (.words e)
+                               (sum-words db (load (field e variants)))))
+                       (set! i (primitive/iadd (load i) 1))))))
+         (compute-struct-layouts! db)
+         (load db)))
+
+  (struct-index [(db (ptr LayoutDb)) (name (slice u8))]
+                (-> i64)
+                (let [m (name-memo-slot (field db struct_memo) name)]
+                  (if (name-memo-hit? m name)
+                      (.val m)
+                      (match (get (.struct_idx db) name)
+                        (Some [i] (do (set! (.key m) name) (set! (.val m) i) i))
+                        (None [] -1)))))
+
+  (sum-index [(db (ptr LayoutDb)) (name (slice u8))]
+             (-> i64)
+             (let [m (name-memo-slot (field db sum_memo) name)]
+               (if (name-memo-hit? m name)
+                   (.val m)
+                   (match (get (.sum_idx db) name)
+                     (Some [i] (do (set! (.key m) name) (set! (.val m) i) i))
+                     (None [] -1)))))
+
+  (struct-at [(db (ptr LayoutDb)) (i i64)]
+             (-> (ptr LayoutStruct))
+             (layout-at [LayoutStruct] (field db structs) i))
+
+  (sum-at [(db (ptr LayoutDb)) (i i64)]
+          (-> (ptr LayoutSum))
+          (layout-at [LayoutSum] (field db sums) i))
+
+  (size [(db (ptr LayoutDb)) (t (ptr Type))]
+        (-> i64)
+        (match (load t)
+          (TInt [bits _s]
+                (cond (<= bits 8) 1
+                      (<= bits 16) 2
+                      (<= bits 32) 4
+                      (<= bits 64) 8
+                      ; i128 and u128 are 16 bytes, 16-aligned, as C's __int128
+                      (<= bits 128) 16
+                      :else (layout-fail db "integers wider than 128 bits have no layout")))
+          (TFloat [bits] (primitive/idiv bits 8))
+          (TBool [] 1)
+          (TVoid [] (layout-fail db "size on void"))
+          (TConst [_] (layout-fail db "generic constant argument reached runtime layout"))
+          (TPtr [_] (.word_bytes db))
+          (TRef [_ _] (.word_bytes db))
+          (TFn [_ _ _] (.word_bytes db))
+          (TNever [] (.word_bytes db))
+          (TError [] (.word_bytes db))
+          (TArray [elem n-extent]
+            (let [n (extent-value n-extent)] (primitive/imul (size db elem) n)))
+          (TSlice [_] (layout-slice-size db))
+          (TVec [elem n] (layout-vector-bytes (primitive/imul (size db elem) (extent-value n))))
+          (TStruct [name]
+                   (let [si (struct-index db name)]
+                     (if (>= si 0)
+                         (.size (struct-at db si))
+                         (let [su (sum-index db name)]
+                           (if (>= su 0)
+                               (primitive/imul (.sum_word_bytes db)
+                                               (primitive/iadd 1
+                                                               (.words (sum-at db
+                                                                               su))))
+                               (layout-fail2 db "unknown nominal type: " name))))))
+          (TApp [_ _]
+                (layout-fail db
+                             "generic type reached layout after monomorphization"))
+          (TCode [] (layout-fail db "Code reached runtime layout"))
+          (TCodeBuilder []
+                        (layout-fail db "CodeBuilder reached runtime layout"))
+          (TExternRef [] (layout-fail db "externref reached native layout"))))
+
+  (align [(db (ptr LayoutDb)) (t (ptr Type))]
+         (-> i64)
+         (match (load t)
+           (TInt [bits _s]
+                 (cond (<= bits 8) 1
+                       (<= bits 16) 2
+                       (<= bits 32) 4
+                       (<= bits 64) 8
+                       (<= bits 128) 16
+                       :else (layout-fail db "integers wider than 128 bits have no layout")))
+           (TFloat [bits] (primitive/idiv bits 8))
+           (TBool [] 1)
+           (TVoid [] (layout-fail db "align on void"))
+           (TConst [_] (layout-fail db "generic constant argument reached runtime layout"))
+           (TPtr [_] (.word_bytes db))
+           (TRef [_ _] (.word_bytes db))
+           (TFn [_ _ _] (.word_bytes db))
+           (TNever [] (.word_bytes db))
+           (TError [] (.word_bytes db))
+           (TArray [elem _n] (align db elem))
+           (TSlice [_] (layout-slice-align db))
+           (TVec [elem n] (layout-vector-bytes (primitive/imul (size db elem) (extent-value n))))
+           (TStruct [name]
+                    (let [si (struct-index db name)]
+                      (if (>= si 0)
+                          (.align (struct-at db si))
+                          (if (>= (sum-index db name) 0)
+                              (.sum_word_bytes db)
+                              (layout-fail2 db "unknown nominal type: " name)))))
+           (TApp [_ _]
+                 (layout-fail db
+                              "generic type reached layout after monomorphization"))
+           (TCode [] (layout-fail db "Code reached runtime layout"))
+           (TCodeBuilder []
+                         (layout-fail db "CodeBuilder reached runtime layout"))
+           (TExternRef [] (layout-fail db "externref reached native layout"))))
+
+  (field-offset [(db (ptr LayoutDb)) (si i64) (fi i64)]
+                (-> i64)
+                (get (.offsets (struct-at db si)) fi))
+
+  (field-number [(db (ptr LayoutDb)) (si i64) (name (slice u8))]
+                (-> i64)
+                (let [m (name-memo-slot (field db field_memo) name)]
+                  (if (and (name-memo-hit? m name) (= (.owner m) si))
+                      (.val m)
+                      (let [fi (field-number-scan db si name)]
+                        (set! (.key m) name)
+                        (set! (.owner m) si)
+                        (set! (.val m) fi)
+                        fi))))
+
+  (field-number-scan [(db (ptr LayoutDb)) (si i64) (name (slice u8))]
+                (-> i64)
+                (let [fs (load (field (struct-at db si) fields))
+                      n (len (load fs))
+                      (mut i) 0
+                      (mut found) -1]
+                  (loop (if (>= (load i) n)
+                            (break)
+                            (do
+                              (when (= (load (field (layout-at [Field]
+                                                               fs
+                                                               (load i))
+                                                    name))
+                                       name)
+                                (store! found (load i))
+                                (break))
+                              (set! i (primitive/iadd (load i) 1)))))
+                  (when (< (load found) 0)
+                    (layout-fail2 db "no such field: " name))
+                  (load found)))
+
+  (variant-number [(db (ptr LayoutDb)) (su i64) (name (slice u8))]
+                  (-> i64)
+                  (let [m (name-memo-slot (field db variant_memo) name)]
+                    (if (and (name-memo-hit? m name) (= (.owner m) su))
+                        (.val m)
+                        (let [vi (variant-number-scan db su name)]
+                          (set! (.key m) name)
+                          (set! (.owner m) su)
+                          (set! (.val m) vi)
+                          vi))))
+
+  (variant-number-scan [(db (ptr LayoutDb)) (su i64) (name (slice u8))]
+                  (-> i64)
+                  (let [vs (load (field (sum-at db su) variants))
+                        n (len (load vs))
+                        (mut i) 0
+                        (mut found) -1]
+                    (loop (if (>= (load i) n)
+                              (break)
+                              (do
+                                (when (= (load (field (layout-at [Variant]
+                                                                 vs
+                                                                 (load i))
+                                                      name))
+                                         name)
+                                  (store! found (load i))
+                                  (break))
+                                (set! i (primitive/iadd (load i) 1)))))
+                    (when (< (load found) 0)
+                      (layout-fail2 db "no such variant: " name))
+                    (load found)))
+
+  ; Conservative SUM PAYLOAD sizing. Each field occupies an 8-byte-rounded
+  ; region, matching LLVM's [words x i64] payload representation.
+  (type-bytes [(db (ptr LayoutDb)) (t (ptr Type))]
+              (-> i64)
+              (match (load t)
+                ; An integer occupies its storage size, not its bit width rounded to
+                ; bytes: a u24 is four bytes, so (array u24 100) in a payload is 400.
+                (TInt [_ _] (size db t))
+                (TFloat [bits] (primitive/idiv bits 8))
+                (TBool [] 1)
+                (TConst [_] (layout-fail db "generic constant argument reached runtime layout"))
+                (TPtr [_] (.word_bytes db))
+                (TRef [_ _] (.word_bytes db))
+                (TFn [_ _ _] (.word_bytes db))
+                (TNever [] (.word_bytes db))
+                (TError [] (.word_bytes db))
+                (TArray [elem n-extent]
+                  (let [n (extent-value n-extent)] (primitive/imul (type-bytes db elem) n)))
+                (TSlice [_] (layout-slice-size db))
+                (TVec [elem n] (layout-vector-bytes (primitive/imul (size db elem) (extent-value n))))
+                (TStruct [name]
+                         (let [si (struct-index db name)]
+                           (if (>= si 0)
+                               (let [e (struct-at db si)
+                                     fs (load (field e fields))
+                                     base (fields-bytes db fs)]
+                                 (match (.layout e)
+                                   ; fields at the offsets written, in at least :size bytes
+                                   (LExplicit [offs user-size _]
+                                              (let [(mut most) base]
+                                                (for [i 0 (len (load fs))]
+                                                  (let [end (primitive/iadd (get (load offs) i)
+                                                                            (type-bytes db (field (layout-at [Field] fs i) ty)))]
+                                                    (when (> end (load most)) (set! most end) 0)))
+                                                (match user-size
+                                                  (Some [n] (when (> n (load most)) (set! most n) 0))
+                                                  (None [] 0))
+                                                (load most)))
+                                   (LBits [backing _]
+                                          (let [bytes (primitive/idiv backing 8)]
+                                            (if (> bytes base) bytes base)))
+                                   (LAligned [forced] (layout-round-up base forced))
+                                   (_ base)))
+                               (let [su (sum-index db name)]
+                                 (if (>= su 0)
+                                     (primitive/imul (.sum_word_bytes db)
+                                                     (primitive/iadd 1
+                                                                     (sum-words db
+                                                                                (load (field (sum-at db
+                                                                                                     su)
+                                                                                             variants)))))
+                                     (layout-fail2 db
+                                                   "type-bytes: unknown nominal "
+                                                   name))))))
+                (TVoid [] (layout-fail db "type-bytes on void"))
+                (TApp [_ _] (layout-fail db "type-bytes on generic type"))
+                (TCode [] (layout-fail db "type-bytes on Code"))
+                (TCodeBuilder [] (layout-fail db "type-bytes on CodeBuilder"))
+                (TExternRef [] (layout-fail db "type-bytes on externref"))))
+
+  (sum-words [(db (ptr LayoutDb)) (variants (ptr (ArrayList Variant)))]
+             (-> i64)
+             (let [(mut best) 0]
+               (for [vi 0 (len (load variants))]
+                 (let [total (fields-bytes db (load (field (layout-at [Variant] variants vi) fields)))]
+                   (when (> total (load best)) (store! best total) 0)))
+               (primitive/idiv (primitive/iadd (load best)
+                                               (primitive/isub (.sum_word_bytes db)
+                                                               1))
+                               (.sum_word_bytes db))))
+
+  ; Conservative bytes for fields laid out one after another, as a variant's
+  ; payload or a C struct places them: at least their natural layout, which
+  ; each field's 8-byte-rounded region covers until a field is aligned past 8
+  ; (an i128 after an i8 starts at 16).
+  (fields-bytes [(db (ptr LayoutDb)) (fs (ptr (ArrayList Field)))]
+                (-> i64)
+                (let [(mut rounded) 0
+                      (mut off) 0
+                      (mut most-align) 1]
+                  (for [i 0 (len (load fs))]
+                    (let [ft (field (layout-at [Field] fs i) ty)
+                          bytes (type-bytes db ft)
+                          a (early-align db ft)]
+                      (set! rounded (primitive/iadd (load rounded) (layout-align8 bytes)))
+                      (set! off (primitive/iadd (layout-round-up (load off) a) bytes))
+                      (when (> a (load most-align)) (set! most-align a) 0)))
+                  (let [natural (layout-round-up (load off) (load most-align))]
+                    (if (> natural (load rounded)) natural (load rounded)))))
+
+  ; A type's alignment before struct layouts are computed (they wait for the
+  ; sums' payload sizes): what compute-one-struct! will decide.
+  (early-align [(db (ptr LayoutDb)) (t (ptr Type))]
+               (-> i64)
+               (match (load t)
+                 (TArray [elem _] (early-align db elem))
+                 (TStruct [name]
+                          (let [si (struct-index db name)]
+                            (if (< si 0)
+                                (align db t)
+                                (let [e (struct-at db si)
+                                      fs (load (field e fields))
+                                      (mut most) 1]
+                                  (for [i 0 (len (load fs))]
+                                    (let [a (early-align db (field (layout-at [Field] fs i) ty))]
+                                      (when (> a (load most)) (set! most a) 0)))
+                                  (match (.layout e)
+                                    (LBits [backing _] (primitive/idiv backing 8))
+                                    (LPacked [] 1)
+                                    (LExplicit [_ _ user-align] (if (> user-align 0) user-align 1))
+                                    (LAligned [forced] (if (> forced (load most)) forced (load most)))
+                                    (_ (load most)))))))
+                 (_ (align db t))))
+
+  (natural-offset [(db (ptr LayoutDb)) (fs (ptr (ArrayList Field))) (fi i64)]
+                  (-> i64)
+                  (let [(mut i) 0
+                        (mut off) 0
+                        (mut result) -1]
+                    (loop (if (> (load i) fi)
+                              (break)
+                              (do
+                                (let [ft
+                                        (field (layout-at [Field] fs (load i))
+                                               ty)
+                                      a (align db ft)]
+                                  (set! off (layout-round-up (load off) a))
+                                  (when (= (load i) fi)
+                                    (store! result (load off))
+                                    0)
+                                  (set! off
+                                        (primitive/iadd (load off) (size db ft))))
+                                (set! i (primitive/iadd (load i) 1)))))
+                    (load result)))
+
+  (natural-layout! [(db (ptr LayoutDb)) (si i64)]
+                   (-> i64)
+                   (let [e (struct-at db si)
+                         fs (load (field e fields))
+                         nf (len (load fs))
+                         (mut off) 0
+                         (mut max-align) 1
+                         (mut i) 0]
+                     (loop (if (>= (load i) nf)
+                               (break)
+                               (do
+                                 (let [ft
+                                         (field (layout-at [Field] fs (load i))
+                                                ty)
+                                       a
+                                         (match (load ft)
+                                           (TCode []
+                                                  (layout-fail2 db
+                                                                "Code reached runtime layout in struct: "
+                                                                (.name e)))
+                                           (TCodeBuilder []
+                                                         (layout-fail2 db
+                                                                       "CodeBuilder reached runtime layout in struct: "
+                                                                       (.name e)))
+                                           (_ (align db ft)))]
+                                   (when (> a (load max-align))
+                                     (store! max-align a))
+                                   (set! off (layout-round-up (load off) a))
+                                   (push! (mut (.offsets e)) (load off))
+                                   (set! off
+                                         (primitive/iadd (load off)
+                                                         (size db ft))))
+                                 (set! i (primitive/iadd (load i) 1)))))
+                     (set! (.align e) (load max-align))
+                     (set! (.size e)
+                           (layout-round-up (load off) (load max-align)))
+                     0))
+
+  (compute-one-struct! [(db (ptr LayoutDb)) (si i64)]
+                       (-> i64)
+                       (let [e (struct-at db si)
+                             fs (load (field e fields))
+                             nf (len (load fs))]
+                         (match (.layout e)
+                           (LayoutWritten [_ _]
+                                          (panic "layout: struct '{}' is laid out before its :layout is decided" (.name e)))
+                           (LBits [backing _offs]
+                                  (do
+                                    (set! (.size e) (primitive/idiv backing 8))
+                                    (set! (.align e) (primitive/idiv backing 8))
+                                    0))
+                           (LExplicit [offs user-size user-align]
+                                      (do
+                                        (let [(mut max-end) 0
+                                              (mut i) 0]
+                                          (loop (if (>= (load i) nf)
+                                                    (break)
+                                                    (do
+                                                      (let [end
+                                                              (primitive/iadd (get (load offs)
+                                                                                   (load i))
+                                                                              (size db
+                                                                                    (field (layout-at [Field]
+                                                                                                      fs
+                                                                                                      (load i))
+                                                                                           ty)))]
+                                                        (when (> end
+                                                                 (load max-end))
+                                                          (store! max-end end)))
+                                                      (set! i
+                                                            (primitive/iadd (load i)
+                                                                            1)))))
+                                          (set! (.size e)
+                                                (match user-size
+                                                  (Some [n]
+                                                        (if (> n (load max-end))
+                                                            n
+                                                            (load max-end)))
+                                                  (None [] (load max-end))))
+                                          (set! (.align e)
+                                                (if (> user-align
+                                                       0)
+                                                    user-align
+                                                    1))
+                                          (let [(mut i) 0]
+                                            (loop (if (>= (load i) nf)
+                                                      (break)
+                                                      (do
+                                                        (push! (mut (.offsets e))
+                                                               (get (load offs)
+                                                                    (load i)))
+                                                        (set! i
+                                                              (primitive/iadd (load i)
+                                                                              1)))))))
+                                        0))
+                           (LPacked []
+                                    (do
+                                      (let [(mut off) 0
+                                            (mut i) 0]
+                                        (loop (if (>= (load i) nf)
+                                                  (break)
+                                                  (do
+                                                    (push! (mut (.offsets e))
+                                                           (load off))
+                                                    (set! off
+                                                          (primitive/iadd (load off)
+                                                                          (size db
+                                                                                (field (layout-at [Field]
+                                                                                                  fs
+                                                                                                  (load i))
+                                                                                       ty))))
+                                                    (set! i
+                                                          (primitive/iadd (load i)
+                                                                          1)))))
+                                        (set! (.size e) (load off))
+                                        (set! (.align e) 1))
+                                      0))
+                           (LAligned [forced]
+                                     (do
+                                       (natural-layout! db si)
+                                       (when (> forced (load (field e align)))
+                                         (store! (field e
+                                                        align)
+                                                 forced))
+                                       (set! (.size e)
+                                             (layout-round-up (.size e)
+                                                              (.align e)))
+                                       0))
+                           (LC [] (natural-layout! db si)))))
+
+  (type-ready? [(db (ptr LayoutDb)) (t (ptr Type)) (done (mut (ArrayList i64)))]
+               (-> bool)
+               (match (load t)
+                 (TStruct [name]
+                          (let [si (struct-index db name)]
+                            (if (>= si 0)
+                                (= (get (load done) si)
+                                   1)
+                                true)))
+                 (TArray [elem _n] (type-ready? db elem (mut done)))
+                 (TVec [elem _n] (type-ready? db elem (mut done)))
+                 (_ true)))
+
+  (struct-ready? [(db (ptr LayoutDb)) (si i64) (done (mut (ArrayList i64)))]
+                 (-> bool)
+                 (let [fs (load (field (struct-at db si) fields))
+                       nf (len (load fs))
+                       (mut i) 0
+                       (mut ready) true]
+                   (loop (if (>= (load i) nf)
+                             (break)
+                             (do
+                               (when (not (type-ready? db
+                                                       (field (layout-at [Field]
+                                                                         fs
+                                                                         (load i))
+                                                              ty)
+                                                       (mut done)))
+                                 (store! ready false))
+                               (set! i (primitive/iadd (load i) 1)))))
+                   (load ready)))
+
+  (compute-struct-layouts! [(db (ptr LayoutDb))]
+                           (-> i64)
+                           (let [n (len (.structs db))
+                                 (mut done) (ArrayList::new [i64] (.a db))
+                                 (mut i) 0]
+                             (loop (if (>= (load i) n)
+                                       (break)
+                                       (do
+                                         (push! (mut done) 0)
+                                         (set! i (primitive/iadd (load i) 1)))))
+                             (let [(mut pass) 0]
+                               (loop (if (>= (load pass) (primitive/iadd n 1))
+                                         (break)
+                                         (do
+                                           (let [(mut si) 0
+                                                 (mut all-done) true]
+                                             (loop (if (>= (load si) n)
+                                                       (break)
+                                                       (do
+                                                         (when (= (get (load done)
+                                                                       (load si))
+                                                                  0)
+                                                           (if (struct-ready? db
+                                                                              (load si)
+                                                                              (mut done))
+                                                               (do
+                                                                 (compute-one-struct! db
+                                                                                      (load si))
+                                                                 (set! (mut done)
+                                                                       (load si)
+                                                                       1))
+                                                               (store! all-done
+                                                                       false)))
+                                                         (set! si
+                                                               (primitive/iadd (load si)
+                                                                               1)))))
+                                             (when (load all-done) (break)))
+                                           (set! pass
+                                                 (primitive/iadd (load pass) 1))))))
+                             (let [(mut si) 0]
+                               (loop (if (>= (load si) n)
+                                         (break)
+                                         (do
+                                           (when (= (get (load done)
+                                                         (load si))
+                                                    0)
+                                             (layout-fail2 db
+                                                           "struct layout cycle at "
+                                                           (load (field (struct-at db
+                                                                                   (load si))
+                                                                        name))))
+                                           (set! si
+                                                 (primitive/iadd (load si) 1))))))
+                             0)))

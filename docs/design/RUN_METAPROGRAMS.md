@@ -109,7 +109,7 @@ nothing about *how it runs*.
 
 ## Why `expand-macro` is the whole runner
 
-`expand-macro` (`src/compiler/expander.coil:755`) already contains the entire
+`expand-macro` (`src/compiler/frontend/expander.coil:755`) already contains the entire
 invocation contract that the branch runner re-implemented (worse) below it:
 
 - **the expansion arena** (META_MEMORY phase 3/6, default on): created per

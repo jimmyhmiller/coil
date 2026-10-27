@@ -1,6 +1,6 @@
 # Bootstrapping Coil
 
-The Coil compiler is self-hosted (`src/compiler/*.coil`) and bootstraps from committed
+The Coil compiler is self-hosted (`src/compiler/`) and bootstraps from committed
 seeds, so a fresh checkout rebuilds a fully verified compiler with nothing but a C
 compiler (and, for the LLVM backend, libLLVM) — in three flavors:
 

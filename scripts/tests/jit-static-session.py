@@ -204,10 +204,10 @@ def main() -> None:
         if not os.environ.get("COIL_TEST_JIT_UNIT"):
             run(COMPILER, "build-unit", ROOT / "src/compiler/jit_api.coil", "-o", unit,
                 "--backend", "llvm", "-O3", "--quiet", timeout=1200)
-        # Diagnostic labels such as <bundled compiler/check.coil> must not hide
+        # Diagnostic labels such as <bundled compiler/frontend/check.coil> must not hide
         # actual compiler or library dependencies from the prebuilt-unit cache.
         sources = (unit / "unit.sources").read_text()
-        for name in ("compiler/check.coil", "compiler/resolve.coil", "stdlib/var.coil"):
+        for name in ("compiler/frontend/check.coil", "compiler/frontend/resolve.coil", "stdlib/var.coil"):
             assert name in sources, (name, sources)
         # Hosts are a few lines around calls into the -O3 unit, which does all the
         # JIT work, so they are built at -O0.

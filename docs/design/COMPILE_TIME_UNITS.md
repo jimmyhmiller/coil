@@ -3,7 +3,7 @@
 ## The problem
 
 Before a macro call expands, the macro has to be compiled, with every function
-it calls. Stage 3 of expansion (`stage3-round`, src/compiler/expander.coil)
+it calls. Stage 3 of expansion (`stage3-round`, src/compiler/frontend/expander.coil)
 does that from source in every compilation: resolve the whole program, take
 every Code-signed function and its closure, check it, expand the macro calls the
 check rejects, and go round again. Almost all of that closure is the standard

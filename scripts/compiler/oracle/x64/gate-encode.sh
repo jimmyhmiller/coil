@@ -2,7 +2,7 @@
 # Encoder gate for the x86-64 backend: every instruction x64.coil emits must be
 # byte-identical to what a real assembler produces for the same mnemonic.
 #
-# src/compiler/x64_selftest.coil prints one case per line as
+# src/compiler/selftest/x64_selftest.coil prints one case per line as
 #     <hex>TAB<AT&T assembly>
 # We feed the assembly column to llvm-mc --show-encoding and diff its bytes
 # against the hex column. A mismatch is a hand-encoding bug in x64.coil.
@@ -21,7 +21,7 @@ MC=${LLVM_MC:-llvm-mc}
 command -v "$MC" >/dev/null 2>&1 || { echo "GATE FAIL: no llvm-mc (set LLVM_MC=/path/to/llvm-mc)"; exit 2; }
 
 CASES=$(mktemp); trap 'rm -f "$CASES" "$CASES.asm" "$CASES.mc" "$CASES.bin"' EXIT
-"$BIN" run src/compiler/x64_selftest.coil > "$CASES" || {
+"$BIN" run src/compiler/selftest/x64_selftest.coil > "$CASES" || {
   echo "GATE FAIL: x64_selftest.coil did not run"; exit 2; }
 
 # Assemble every mnemonic in ONE llvm-mc invocation (per-line would be ~180

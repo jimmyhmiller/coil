@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate src/compiler/guide.coil from the language reference Markdown.
+"""Generate src/compiler/cli/guide.coil from the language reference Markdown.
 
 `coil guide` and `coil cheatsheet` print embedded copies of their reference
-documents. They live in src/compiler/guide.coil as string constants so the
+documents. They live in src/compiler/cli/guide.coil as string constants so the
 compiled binary is self-contained (works from the global install, no repo
 needed). This script keeps them in sync with the Markdown sources.
 
@@ -177,7 +177,7 @@ for canonical, _, _, _, fragments in TOPICS:
     topic_fragment_rows.append((canonical, "\n".join(keys) + "\n"))
 
 out = (
-    "; src/compiler/guide.coil — GENERATED from docs/reference/*.md.\n"
+    "; src/compiler/cli/guide.coil — GENERATED from docs/reference/*.md.\n"
     "; Do not edit by hand; regenerate with: python3 scripts/docs/gen-guide.py\n"
     "(module coil.compiler.guide)\n\n"
     "(defn guide-text [] (-> (slice u8))\n  \"" + coil_escape(GUIDE) + "\")\n\n"
@@ -193,5 +193,5 @@ out = (
     + "(defn guide-topic-names [] (-> (slice u8))\n  \"" + coil_escape("\n".join(row[0] for row in TOPICS) + "\n") + "\")\n\n"
     "(defn cheatsheet-text [] (-> (slice u8))\n  \"" + coil_escape(CHEATSHEET) + "\")\n"
 )
-open(os.path.join(ROOT, "src/compiler/guide.coil"), "w").write(out)
-print(f"wrote src/compiler/guide.coil ({len(out)} bytes) from docs/reference/*.md")
+open(os.path.join(ROOT, "src/compiler/cli/guide.coil"), "w").write(out)
+print(f"wrote src/compiler/cli/guide.coil ({len(out)} bytes) from docs/reference/*.md")

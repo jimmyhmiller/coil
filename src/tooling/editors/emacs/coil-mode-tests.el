@@ -234,8 +234,8 @@ left."
 
 (defvar coil-test-indent-corpus
   '("src/stdlib/str.coil" "src/stdlib/arraylist.coil" "src/stdlib/hashmap.coil"
-    "src/stdlib/json.coil" "src/stdlib/fs.coil" "src/compiler/ast.coil"
-    "src/compiler/diag.coil")
+    "src/stdlib/json.coil" "src/stdlib/fs.coil" "src/compiler/frontend/ast.coil"
+    "src/compiler/frontend/diag.coil")
   "Files, relative to a compiler checkout, to check indentation against.")
 
 (defcustom coil-test-indent-budget 0.02

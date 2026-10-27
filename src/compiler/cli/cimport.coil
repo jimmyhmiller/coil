@@ -1,0 +1,3553 @@
+; src/compiler/cli/cimport.coil — `coil cimport` written IN Coil (self-hosted).
+;
+; Generate Coil FFI
+; bindings (externs + defstructs + consts) from a C header by walking clang's
+; JSON AST. Coil NEVER hand-rolls a C parser — clang does the real parsing; this
+; walks its machine-readable AST. THE CARDINAL (unchanged): refuse unmappable
+; constructs with a clear skip — NEVER emit a silent-wrong binding.
+;
+; Coverage mirrors the reference: functions, scalars, pointers, structs, unions
+; (→ :layout (coil.layout.Explicit), overlapping storage), bitfield structs (all-bitfield, one
+; storage unit → :layout (coil.layout.Bits) :backing iN), typedefs (clang desugaring), enums
+; (type → integer width; constants → `const`), and object-like `#define` integer
+; AND float constants (a second `clang -dM` pass; floats emitted verbatim).
+;
+; Run standalone via the self-hosted compiler:
+;   coil build src/compiler/cli/cimport.coil -o /tmp/cimport <llvm-link-flags>
+;   /tmp/cimport <header.h>          # bindings printed to stdout
+; A `(module cimport)` so it can be imported into the self-hosted compiler `:as ci`
+; (its internal names stay module-local; only cimport-cli/cimport-header are called).
+; `src/compiler/cli/cimport_main.coil` wraps it as a standalone `main` for the gate.
+(module coil.compiler.cimport)
+(import "coil.primitive" :as primitive)
+
+; Bundled stdlib module names (bare), matching the compiler's own imports, so when
+; this module is pulled into the compiler they share ONE module identity (no dual
+; src/stdlib/alloc-vs-alloc `Allocator` type).
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.control" :use *)
+(import "coil.compiler.ffi" :use [realpath-rooted unlink exit])
+(import "coil.compiler.artifact_identity" :as artifact-id)
+(import "coil.scratch" :as scratch)
+(import "coil.temp" :as temp)
+(import "coil.io" :as io)
+(import "coil.cc" :as cc)
+
+; ---- externs (libc: subprocess + file IO + stdout). Externs are global C symbols
+; (not namespaced); these signatures MATCH the compiler's ffi.coil/io.coil so the
+; duplicate declarations coincide harmlessly when imported into the compiler. -----
+(extern system :cc (cc/C) [(ptr i8)] (-> i32))
+
+(extern open :cc (cc/C) [(ptr i8) i32 ...] (-> i32))
+
+(extern read :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
+
+(extern close :cc (cc/C) [i32] (-> i32))
+
+(extern write :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
+
+(extern fopen :cc (cc/C) [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(extern fwrite :cc (cc/C) [(ptr i8) i64 i64 (ptr i8)] (-> i64))
+
+(extern fclose :cc (cc/C) [(ptr i8)] (-> i32))
+
+
+; ============================ small helpers =================================
+
+; A slice → NUL-terminated C string (fresh allocation).
+(defn s->cstr [(a (dyn Allocator)) (s (slice u8))] (-> (ptr i8))
+  (let [n (len s)
+        buf
+          (primitive/cast (ptr i8)
+                          (data (match (alloc-bytes a
+                                                    (primitive/iadd n 1)
+                                                    1)
+                                  (Some [s] s)
+                                  (None []
+                                        (do
+                                          (oom-at c"compiler allocation"
+                                                  (primitive/iadd n 1))
+                                          (slice::new (primitive/cast (ptr u8)
+                                                                      0)
+                                                      0))))))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (set! (primitive/index buf (load i))
+                      (primitive/cast i8 (get s (load i))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (set! (primitive/index buf n) (: 0 i8))
+    buf))
+
+; Read a whole file into a (slice u8) (empty slice if it won't open).
+(defn slurp [(a (dyn Allocator)) (path (ptr i8))] (-> (Result (slice u8) (slice u8)))
+  (let [fd (open path 0)]
+    (if (< fd (: 0 i32))
+        (Err (cat a "cimport: cannot read " (from-cstr path)))
+        (match (alloc-bytes a 65536 1)
+          (None [] (do (close fd) (Err "cimport: out of memory reading a clang result")))
+          (Some [chunk]
+                (let [buf (primitive/cast (ptr i8) (data chunk))
+                      (mut bytes) (ArrayList::new [u8] a)
+                      (mut failed) false]
+                  (loop (let [n (read (primitive/cast i32 fd) buf 65536)]
+                          (cond (< n 0) (do (set! failed true) (break))
+                                (= n 0) (break)
+                                :else (extend! (mut bytes) (primitive/cast (ptr u8) buf) (cast i64 n)))))
+                  (close fd)
+                  (if failed
+                      (Err (cat a "cimport: read failed on " (from-cstr path)))
+                      (Ok (slice (load bytes))))))))))
+
+; Write a slice to stdout.
+(defn emit [(s (slice u8))] (-> i64)
+  (write 1
+         (primitive/cast (ptr i8) (data s))
+         (primitive/cast isize (len s)))
+  0)
+
+(defn ewrite [(s (slice u8))] (-> i64)
+  (write 2
+         (primitive/cast (ptr i8) (data s))
+         (primitive/cast isize (len s)))
+  0)
+
+; Write a slice to a file (truncating). Returns 0 on success, -1 on open failure.
+(defn write-file [(a (dyn Allocator)) (path (slice u8)) (content (slice u8))] (-> (Result i64 (slice u8)))
+  (let [f (fopen (s->cstr a path) (s->cstr a "w"))]
+    (if (= (primitive/cast i64 f) 0)
+        (Err (cat a "cimport: cannot create " path))
+        (let [wrote (fwrite (primitive/cast (ptr i8) (data content)) 1 (len content) f)
+              closed (fclose f)]
+          ; a short write or a failed close (ENOSPC shows up at either) leaves a
+          ; truncated file that clang would read as a different program
+          (if (or (!= (cast i64 wrote) (len content)) (!= (cast i64 closed) 0))
+              (Err (cat a "cimport: could not write " path))
+              (Ok 0))))))
+
+; concat is fallible only on OOM; unwrap to the left operand as a fallback.
+(defn cat [(a (dyn Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
+  (match (concat a x y) (Some [s] s) (None [] x)))
+
+(defn cat3 [(a (dyn Allocator)) (x (slice u8)) (y (slice u8)) (z (slice u8))] (-> (slice u8))
+  (match (concat3 a x y z) (Some [s] s) (None [] x)))
+
+(defn ws-byte? [(c u8)] (-> bool)
+  (or (= c (: 32 u8))
+      (or (= c (: 9 u8))
+          (or (= c (: 10 u8)) (= c (: 13 u8))))))
+
+; Trim leading + trailing ASCII whitespace.
+(defn trim [(s (slice u8))] (-> (slice u8))
+  (let [n (len s)
+        (mut lo) 0
+        (mut hi) n]
+    (loop (if (and (< (load lo) (load hi)) (ws-byte? (get s (load lo))))
+              (set! lo (primitive/iadd (load lo) 1))
+              (break)))
+    (loop (if (and (< (load lo) (load hi))
+                   (ws-byte? (get s (primitive/isub (load hi) 1))))
+              (set! hi (primitive/isub (load hi) 1))
+              (break)))
+    (subslice [u8] s (load lo) (load hi))))
+
+(defn ends-with [(s (slice u8)) (suf (slice u8))] (-> bool)
+  (let [n (len s)
+        m (len suf)]
+    (if (> m n) false (= (subslice [u8] s (primitive/isub n m) n) suf))))
+
+; Index of the first byte `b` at/after `from`, or -1.
+(defn index-of [(s (slice u8)) (b u8) (from i64)] (-> i64)
+  (let [n (len s)
+        (mut i) from
+        (mut r) -1]
+    (loop (if (>= (load i) n)
+              (break)
+              (if (= (get s (load i)) b)
+                  (do (set! r (load i)) (break))
+                  (set! i (primitive/iadd (load i) 1)))))
+    (load r)))
+
+(defn has-byte? [(s (slice u8)) (b u8)] (-> bool)
+  (>= (index-of s b 0) 0))
+
+; Remove EVERY occurrence of `pat` from `s` (for `const `/`volatile `/`restrict `).
+(defn remove-all [(a (dyn Allocator)) (s (slice u8)) (pat (slice u8))] (-> (slice u8))
+  (let [m (len pat)]
+    (if (= m 0)
+        s
+        (let [(mut out) (StrBuf::new a)
+              n (len s)
+              (mut i) 0]
+          (loop (if (>= (load i) n)
+                    (break)
+                    (if (and (<= (primitive/iadd (load i) m) n)
+                             (= (subslice [u8]
+                                          s
+                                          (load i)
+                                          (primitive/iadd (load i) m))
+                                pat))
+                        (set! i (primitive/iadd (load i) m))
+                        (do
+                          (push! (mut out) (get s (load i)))
+                          (set! i (primitive/iadd (load i) 1))))))
+          (str (load out))))))
+
+; Basename: everything after the last '/'.
+(defn basename [(s (slice u8))] (-> (slice u8))
+  (let [n (len s)
+        (mut cut) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (when (= (get s (load i)) (: 47 u8))
+                  (store! cut
+                          (primitive/iadd (load i) 1)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (subslice [u8] s (load cut) n)))
+
+; i64 → decimal text.
+(defn i64->dec [(a (dyn Allocator)) (n i64)] (-> (slice u8))
+  (if (= n 0)
+      "0"
+      (let [(mut neg) false
+            (mut v) n
+            (mut tmp) (ArrayList::new [u8] a)]
+        (when (< (load v) 0)
+          (store! neg true)
+          (store! v (primitive/isub 0 (load v)))
+          0)
+        (loop (if (= (load v) 0)
+                  (break)
+                  (do
+                    (push! [u8]
+                           (mut tmp)
+                           (primitive/cast u8
+                                           (primitive/iadd 48
+                                                           (primitive/irem (load v)
+                                                                           10))))
+                    (set! v (primitive/idiv (load v) 10)))))
+        (let [(mut out) (StrBuf::new a)
+              len (len (load tmp))]
+          (when (load neg) (push! (mut out) (: 45 u8)))
+          (let [(mut k) len]
+            (loop (if (<= (load k) 0)
+                      (break)
+                      (do
+                        (push! (mut out)
+                               (get (load tmp)
+                                    (primitive/isub (load k) 1)))
+                        (set! k (primitive/isub (load k) 1))))))
+          (str (load out))))))
+
+; Parse a non-negative decimal from `s`; returns -1 on any non-digit.
+(defn parse-dec [(s (slice u8))] (-> i64)
+  (let [n (len s)
+        (mut v) 0
+        (mut i) 0
+        (mut ok) (> n 0)]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (get s (load i))]
+                (if (and (>= c (: 48 u8))
+                         (<= c (: 57 u8)))
+                    (do
+                      (set! v
+                            (primitive/iadd (primitive/imul (load v) 10)
+                                            (primitive/cast i64
+                                                            (primitive/isub c
+                                                                            (: 48 u8)))))
+                      (set! i (primitive/iadd (load i) 1)))
+                    (do (set! ok false) (break))))))
+    (if (load ok) (load v) -1)))
+
+; ============================ JSON value model ==============================
+(defsum Json
+  (JNull [])
+  (JBool [(b i64)])
+  (JNum [(n i64)])
+  (JStr [(s (slice u8))])
+  (JArr [(a (ptr (ArrayList Json)))])
+  (JObj [(o (ptr (HashMap (slice u8) Json)))]))
+
+(defstruct P [(src (slice u8)) (pos i64) (alc (dyn Allocator))])
+
+(defn p-peek [(p (ptr P))] (-> i64)
+  (if (>= (.pos p) (len (.src p)))
+      -1
+      (primitive/cast i64 (get (.src p) (.pos p)))))
+
+(defn p-adv [(p (ptr P))] (-> i64)
+  (set! (.pos p) (primitive/iadd (.pos p) 1))
+  0)
+
+(defn j-ws? [(c i64)] (-> bool)
+  (or (= c 32)
+      (or (= c 10)
+          (or (= c 9) (= c 13)))))
+
+(defn j-skip-ws [(p (ptr P))] (-> i64)
+  (loop (if (j-ws? (p-peek p)) (p-adv p) (break)))
+  0)
+
+(defn j-digit? [(c i64)] (-> bool)
+  (and (>= c 48) (<= c 57)))
+
+(defn j-eat [(p (ptr P)) (len i64)] (-> i64)
+  (for [i 0 len] (p-adv p))
+  0)
+
+; Parse a JSON string into a (slice u8) VIEW; skips escape pairs so an escaped
+; quote can't desync the scanner (we never read a field whose value is escaped).
+(defn j-string [(p (ptr P))] (-> (slice u8))
+  (p-adv p)
+  (let [start (.pos p)]
+    (loop (let [c (p-peek p)]
+            (cond (= c 34) (break)
+                  (= c 92) (do (p-adv p) (p-adv p))
+                  ; backslash: skip 2
+                  (< c 0) (break)
+                  :else (p-adv p))))
+    (let [s (subslice [u8] (.src p) start (.pos p))]
+      (p-adv p)
+      s)))
+
+; A number token → JNum of its integer part; consumes any fractional/exponent
+; tail so a stray float can't desync (clang AST numbers we read are integers).
+(defn j-number [(p (ptr P))] (-> Json)
+  (let [(mut neg) 0
+        (mut v) 0]
+    (when (= (p-peek p) 45) (store! neg 1) (p-adv p))
+    (loop (let [c (p-peek p)]
+            (if (j-digit? c)
+                (do
+                  (set! v
+                        (primitive/iadd (primitive/imul (load v) 10)
+                                        (primitive/isub c 48)))
+                  (p-adv p))
+                (break))))
+    (loop (let [c (p-peek p)]  ; swallow . / digits / e / +/-
+            (if (or (= c 46)
+                    (or (= c 101)
+                        (or (= c 69)
+                            (or (= c 43)
+                                (or (= c 45) (j-digit? c))))))
+                (p-adv p)
+                (break))))
+    (JNum (if (= (load neg) 1)
+              (primitive/isub 0 (load v))
+              (load v)))))
+
+(defn j-value [(p (ptr P))] (-> Json)
+  (j-skip-ws p)
+  (let [c (p-peek p)]
+    (cond (= c 110) (do (j-eat p 4) (JNull))
+          (= c 116) (do (j-eat p 4) (JBool 1))
+          (= c 102) (do (j-eat p 5) (JBool 0))
+          (= c 34) (JStr (j-string p))
+          (= c 91) (j-array p)
+          (= c 123) (j-object p)
+          :else (j-number p))))
+
+(defn j-array [(p (ptr P))] (-> Json)
+  (p-adv p)
+  (let [arr
+          (box! (load (field p alc))
+                (ArrayList Json)
+                (ArrayList::new [Json] (load (field p alc))))]
+    (j-skip-ws p)
+    (if (= (p-peek p) 93)
+        (p-adv p)
+        (loop (push! [Json] arr (j-value p))
+          (j-skip-ws p)
+          (if (= (p-peek p) 44)
+              (p-adv p)
+              (do (p-adv p) (break)))))
+    (JArr arr)))
+
+(defn j-object [(p (ptr P))] (-> Json)
+  (p-adv p)
+  (let [obj
+          (box! (load (field p alc))
+                (HashMap (slice u8) Json)
+                (HashMap::new [(slice u8) Json] (load (field p alc)) (keyops)))]
+    (j-skip-ws p)
+    (if (= (p-peek p) 125)
+        (p-adv p)
+        (loop (j-skip-ws p)
+          (let [key (j-string p)]
+            (j-skip-ws p)
+            (p-adv p)  ; ':'
+            (set! obj key (j-value p)))
+          (j-skip-ws p)
+          (if (= (p-peek p) 44)
+              (p-adv p)
+              (do (p-adv p) (break)))))
+    (JObj obj)))
+
+(defn json-parse [(a (dyn Allocator)) (src (slice u8))] (-> Json)
+  (let [p (primitive/alloc-stack P)]
+    (set! (.src p) src)
+    (set! (.pos p) 0)
+    (set! (.alc p) a)
+    (j-value p)))
+
+; ---- accessors -------------------------------------------------------------
+(defn jget [(j Json) (k (slice u8))] (-> Json)
+  (match j
+    (JObj [o] (match (get (load o) k) (Some [v] v) (None [] (JNull))))
+    (_ (JNull))))
+
+(defn jstr [(j Json)] (-> (Option (slice u8)))
+  (match j (JStr [s] (Some s)) (_ (None [(slice u8)]))))
+
+(defn jgets [(j Json) (k (slice u8))] (-> (Option (slice u8)))
+  (jstr (jget j k)))
+
+(defn jstr-or [(o (Option (slice u8))) (d (slice u8))] (-> (slice u8))
+  (match o (Some [s] s) (None [] d)))
+
+(defn jkind [(j Json)] (-> (slice u8))
+  (jstr-or (jgets j "kind") ""))
+
+(defn jname [(j Json)] (-> (slice u8))
+  (jstr-or (jgets j "name") "<anonymous>"))
+
+(defn jbool-true? [(j Json) (k (slice u8))] (-> bool)
+  (match (jget j k) (JBool [b] (= b 1)) (_ false)))
+
+(defn jinner [(j Json)] (-> (Option (ptr (ArrayList Json))))
+  (match (jget j "inner")
+    (JArr [a] (Some a))
+    (_ (None [(ptr (ArrayList Json))]))))
+
+; ============================ resolution tables =============================
+(defstruct Ctx
+  [(typedefs (ptr (HashMap (slice u8) (slice u8))))
+   (enums (ptr (HashMap (slice u8) (slice u8))))])
+
+; ============================ type mapping ==================================
+;;; Remove every `__attribute__((…))` clause. GNU attributes such as noreturn
+;;; appear in clang's spelled function types and carry no ABI information.
+(defn remove-attributes [(a (dyn Allocator)) (s (slice u8))] (-> (slice u8))
+  (let [pat "__attribute__"
+        m (len pat)
+        n (len s)
+        (mut out) (StrBuf::new a)
+        (mut i) 0]
+    (while (< i n)
+      (let [open (+ i m)]
+        (if (and (<= open n)
+                 (= (subslice [u8] s i open) pat)
+                 (< open n)
+                 (= (cast i64 (get s open)) 40))
+            (let [close (matching-paren s open)]
+              (if (< close 0)
+                  (do (push! (mut out) (get s i)) (set! i (+ i 1)))
+                  (set! i (+ close 1))))
+            (do (push! (mut out) (get s i)) (set! i (+ i 1))))))
+    (str (load out))))
+
+(defn normalize [(a (dyn Allocator)) (c (slice u8))] (-> (slice u8))
+  (trim (remove-all a
+                    (remove-all a
+                                (remove-all a
+                                            (remove-all a
+                                                        (remove-all a
+                                                                    (remove-all a
+                                                                                (trim (remove-attributes a c))
+                                                                                "const")
+                                                                    "volatile")
+                                                        "restrict")
+                                            "_Nonnull")
+                                "_Nullable")
+                    "_Null_unspecified")))
+
+(defn scalar [(s (slice u8))] (-> (Option (slice u8)))
+  (cond (or (= s "char") (= s "signed char")) (Some "i8")
+        (= s "unsigned char") (Some "u8")
+        (or (= s "short") (= s "short int")) (Some "i16")
+        (or (= s "unsigned short") (= s "unsigned short int")) (Some "u16")
+        (or (= s "int") (or (= s "signed int") (= s "signed"))) (Some "i32")
+        (or (= s "unsigned int") (= s "unsigned")) (Some "u32")
+        (or (= s "long") (= s "long int")) (Some "i64")
+        (or (= s "unsigned long")
+            (or (= s "unsigned long int") (= s "long unsigned int")))
+          (Some "u64")
+        (= s "short unsigned int") (Some "u16")
+        (= s "long long unsigned int") (Some "u64")
+        (or (= s "long long") (= s "long long int")) (Some "i64")
+        (or (= s "unsigned long long") (= s "unsigned long long int"))
+          (Some "u64")
+        (= s "float") (Some "f32")
+        (= s "double") (Some "f64")
+        (or (= s "_Bool") (= s "bool")) (Some "u8")
+        :else (None [(slice u8)])))
+
+; ============================ C declarator parsing ==========================
+; clang spells every type as a base followed by an abstract declarator: `int *`,
+; `char [37]`, `void (*)(int)`, `void (*[4])(int)`, and even
+; `int (*(*)(char))(double)` — a pointer to a function taking char that returns
+; a pointer to a function taking double that returns int. A declarator reads
+; inside-out, so the only way to map one without guessing is to parse it into a
+; tree and render the tree. A bare function type is legal only at the top of an
+; extern's own signature; everywhere else C (and Coil) want the pointer to it.
+(defsum CType
+  (CBase [(coil (slice u8))])
+  (CPtr [(inner (ptr CType))])
+  (CArr [(inner (ptr CType)) (count i64)])
+  (CFn [(ret (ptr CType)) (params (ptr (ArrayList CType))) (variadic bool)]))
+
+(defn ctype-box [(a (dyn Allocator)) (t CType)] (-> (ptr CType))
+  (box! a CType t))
+
+; Index of the ')' matching the '(' at `open`, or -1 when unbalanced.
+(defn matching-paren [(s (slice u8)) (open i64)] (-> i64)
+  (let [n (len s)
+        (mut depth) 0
+        (mut i) open
+        (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0))
+              (break)
+              (let [c (primitive/cast i64 (get s (load i)))]
+                (when (= c 40)
+                  (store! depth (primitive/iadd (load depth) 1))
+                  0)
+                (when (= c 41)
+                  (store! depth (primitive/isub (load depth) 1))
+                  (when (= (load depth) 0)
+                    (store! found (load i))
+                    0)
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
+; Split at the commas that are not nested inside () or [] — a parameter list
+; whose parameters are themselves function pointers has commas at depth 1.
+(defn split-top-commas [(a (dyn Allocator)) (s (slice u8))] (-> (ptr (ArrayList (slice u8))))
+  (let [out (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))
+        n (len s)
+        (mut depth) 0
+        (mut lo) 0
+        (mut i) 0]
+    (loop (if (> (load i) n)
+              (break)
+              (do
+                (if (= (load i) n)
+                    (do
+                      (push! [(slice u8)]
+                             out
+                             (trim (subslice [u8] s (load lo) n)))
+                      0)
+                    (let [c (primitive/cast i64 (get s (load i)))]
+                      (cond (or (= c 40)
+                                (= c 91))
+                              (do
+                                (store! depth (primitive/iadd (load depth) 1))
+                                0)
+                            (or (= c 41)
+                                (= c 93))
+                              (do
+                                (store! depth (primitive/isub (load depth) 1))
+                                0)
+                            (and (= c 44)
+                                 (= (load depth) 0))
+                              (do
+                                (push! [(slice u8)]
+                                       out
+                                       (trim (subslice [u8]
+                                                       s
+                                                       (load lo)
+                                                       (load i))))
+                                (store! lo (primitive/iadd (load i) 1))
+                                0)
+                            :else 0)))
+                (set! i (primitive/iadd (load i) 1)))))
+    out))
+
+; A type in parameter position: C passes arrays and functions as pointers, and
+; clang's ParmVarDecl types are already adjusted that way — except when the
+; array hides behind a typedef (`va_list` on x86_64 is `__va_list_tag[1]`).
+(defn ctype-decay [(a (dyn Allocator)) (t (ptr CType))] (-> (ptr CType))
+  (match (load t)
+    (CArr [inner _] (ctype-box a (CPtr inner)))
+    (CFn [_ _ _] (ctype-box a (CPtr t)))
+    (_ t)))
+
+; The base of a type: what is left once every declarator has been peeled away.
+(defn map-base [(a (dyn Allocator))
+                (s (slice u8))
+                (ctx (ptr Ctx))
+                (depth i64)] (-> (Result (ptr CType) (slice u8)))
+  (match (scalar s)
+    (Some [m] (Ok (ctype-box a (CBase m))))
+    (None []
+          (cond (= s "void") (Ok (ctype-box a (CBase "void")))
+                (or (= s "struct")
+                    (or (= s "union")
+                        (or (contains-str? s "(anonymous")
+                            (contains-str? s "(unnamed"))))
+                  (Err (cat3 a "anonymous C aggregate type '" s "'"))
+                (starts-with s "struct ")
+                  (Ok (ctype-box a
+                                 (CBase (trim (subslice [u8] s 7 (len s))))))
+                (starts-with s "union ")
+                  (Ok (ctype-box a
+                                 (CBase (trim (subslice [u8] s 6 (len s))))))
+                (starts-with s "enum ")
+                  (let [tag (trim (subslice [u8] s 5 (len s)))]
+                    (match (get (load (field ctx enums)) tag)
+                      (Some [t] (Ok (ctype-box a (CBase t))))
+                      (None [] (Ok (ctype-box a (CBase "i32"))))))
+                ; clang's own va_list record. It is never emitted as a struct; a
+                ; va_list reaches a binding only as the pointer a parameter decays to.
+                (= s "__va_list_tag") (Ok (ctype-box a (CBase "__va_list_tag")))
+                :else
+                  (match (get (load (field ctx typedefs)) s)
+                    (Some [under]
+                          (parse-c-type a under ctx (primitive/iadd depth 1)))
+                    (None []
+                          (Err (cat3 a "unsupported C type '" s "'"))))))))
+
+(defn parse-c-type [(a (dyn Allocator))
+                    (c (slice u8))
+                    (ctx (ptr Ctx))
+                    (depth i64)] (-> (Result (ptr CType) (slice u8)))
+  (if (> depth 64)
+      (Err (cat3 a "typedef chain too deep resolving '" c "' (cycle?)"))
+      (let [s (normalize a c)
+            p (index-of s (: 40 u8) 0)]
+        (cond (or (contains-str? s "(anonymous") (contains-str? s "(unnamed"))
+                (Err (cat3 a "anonymous C aggregate type '" s "'"))
+              ; `base (declarator)…`: the base is everything before the first paren.
+              (>= p 0)
+                (match (parse-c-type a
+                                     (trim (subslice [u8] s 0 p))
+                                     ctx
+                                     (primitive/iadd depth 1))
+                  (Err [e] (Err e))
+                  (Ok [base]
+                      (parse-declarator a
+                                        base
+                                        (subslice [u8] s p (len s))
+                                        ctx
+                                        depth)))
+              (ends-with s "]")
+                (let [lb (index-of s (: 91 u8) 0)]
+                  (if (< lb 0)
+                      (Err (cat3 a "unsupported C array type '" s "'"))
+                      (match (parse-c-type a
+                                           (trim (subslice [u8] s 0 lb))
+                                           ctx
+                                           (primitive/iadd depth 1))
+                        (Err [e] (Err e))
+                        (Ok [base]
+                            (apply-suffixes a
+                                            base
+                                            (subslice [u8] s lb (len s))
+                                            ctx
+                                            depth)))))
+              (ends-with s "*")
+                (match (parse-c-type a
+                                     (trim (subslice [u8]
+                                                     s
+                                                     0
+                                                     (primitive/isub (len s) 1)))
+                                     ctx
+                                     (primitive/iadd depth 1))
+                  (Err [e] (Err e))
+                  (Ok [inner] (Ok (ctype-box a (CPtr inner)))))
+              :else (map-base a s ctx depth)))))
+
+; `text` is an abstract declarator applied to `t`: leading stars, then either a
+; parenthesised inner declarator followed by suffixes, or bare suffixes.
+(defn parse-declarator [(a (dyn Allocator))
+                        (t (ptr CType))
+                        (text0 (slice u8))
+                        (ctx (ptr Ctx))
+                        (depth i64)] (-> (Result (ptr CType) (slice u8)))
+  (let [text1 (trim text0)
+        n (len text1)
+        (mut cur) t
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (primitive/cast i64 (get text1 (load i)))]
+                (cond (= c 42)
+                        (do
+                          (store! cur (ctype-box a (CPtr (load cur))))
+                          (set! i (primitive/iadd (load i) 1)))
+                      (ws-byte? (primitive/cast u8 c))
+                        (set! i (primitive/iadd (load i) 1))
+                      :else (break)))))
+    (let [text (subslice [u8] text1 (load i) n)]
+      (if (and (> (len text) 0)
+               (= (primitive/cast i64 (get text 0)) 40))
+          (let [close (matching-paren text 0)]
+            (if (< close 0)
+                (Err (cat3 a "unbalanced C declarator '" text0 "'"))
+                (let [inner (trim (subslice [u8] text 1 close))
+                      after
+                        (subslice [u8] text (primitive/iadd close 1) (len text))
+                      lead
+                        (if (> (len inner) 0)
+                            (primitive/cast i64 (get inner 0))
+                            0)]
+                  ; `(*…)`, `((…))`, `([…])` group an inner declarator; anything
+                  ; else inside the parens is a parameter list.
+                  (if (or (= lead 42)
+                          (or (= lead 40)
+                              (= lead 91)))
+                      (match (apply-suffixes a (load cur) after ctx depth)
+                        (Err [e] (Err e))
+                        (Ok [outer] (parse-declarator a outer inner ctx depth)))
+                      (apply-suffixes a (load cur) text ctx depth)))))
+          (apply-suffixes a (load cur) text ctx depth)))))
+
+; The `[N]` and `(params)` suffixes of a declarator apply right to left:
+; `int [4][5]` is an array of 4 arrays of 5.
+(defn apply-suffixes [(a (dyn Allocator))
+                      (t (ptr CType))
+                      (text (slice u8))
+                      (ctx (ptr Ctx))
+                      (depth i64)] (-> (Result (ptr CType) (slice u8)))
+  (let [n (len text)
+        (mut kinds) (ArrayList::new [i64] a)
+        (mut bodies) (ArrayList::new [(slice u8)] a)
+        (mut err) (None [(slice u8)])
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (primitive/cast i64 (get text (load i)))]
+                (cond (ws-byte? (primitive/cast u8 c))
+                        (set! i (primitive/iadd (load i) 1))
+                      (= c 91)
+                        (let [rb (index-of text (: 93 u8) (load i))]
+                          (if (< rb 0)
+                              (do
+                                (store! err
+                                        (Some (cat3 a
+                                                    "unbalanced C array type '"
+                                                    text
+                                                    "'")))
+                                (break))
+                              (do
+                                (push! (mut kinds) 1)
+                                (push! (mut bodies)
+                                       (trim (subslice [u8]
+                                                       text
+                                                       (primitive/iadd (load i)
+                                                                       1)
+                                                       rb)))
+                                (set! i (primitive/iadd rb 1)))))
+                      (= c 40)
+                        (let [rp (matching-paren text (load i))]
+                          (if (< rp 0)
+                              (do
+                                (store! err
+                                        (Some (cat3 a
+                                                    "unbalanced C declarator '"
+                                                    text
+                                                    "'")))
+                                (break))
+                              (do
+                                (push! (mut kinds) 2)
+                                (push! (mut bodies)
+                                       (trim (subslice [u8]
+                                                       text
+                                                       (primitive/iadd (load i)
+                                                                       1)
+                                                       rp)))
+                                (set! i (primitive/iadd rp 1)))))
+                      :else
+                        (do
+                          (store! err
+                                  (Some (cat3 a
+                                              "unsupported C declarator '"
+                                              text
+                                              "'")))
+                          (break))))))
+    (match (load err)
+      (Some [e] (Err e))
+      (None []
+            (let [m (len (load kinds))
+                  (mut cur) t
+                  (mut fail) (None [(slice u8)])
+                  (mut k) (primitive/isub m 1)]
+              (loop (if (or (< (load k) 0)
+                            (match (load fail) (Some [_] true) (None [] false)))
+                        (break)
+                        (let [body (get (load bodies) (load k))]
+                          (if (= (get (load kinds) (load k))
+                                 1)
+                              (let [count (parse-dec body)]
+                                (if (< count 0)
+                                    (store! fail
+                                            (Some (cat3 a
+                                                        "non-constant C array bound in '"
+                                                        text
+                                                        "'")))
+                                    (store! cur
+                                            (ctype-box a
+                                                       (CArr (load cur) count)))))
+                              (match (parse-params a body ctx depth)
+                                (Err [e] (store! fail (Some e)))
+                                (Ok [ps]
+                                    (store! cur
+                                            (ctype-box a
+                                                       (CFn (load cur)
+                                                            ps
+                                                            (params-variadic? body)))))))
+                          (set! k (primitive/isub (load k) 1)))))
+              (match (load fail)
+                (Some [e] (Err e))
+                (None [] (Ok (load cur)))))))))
+
+(defn params-variadic? [(body (slice u8))] (-> bool)
+  (contains-str? body "..."))
+
+; A C parameter list: `void` and `` are both empty, `...` marks a variadic tail,
+; and each remaining entry is a full type that decays like a C parameter.
+(defn parse-params [(a (dyn Allocator))
+                    (body (slice u8))
+                    (ctx (ptr Ctx))
+                    (depth i64)] (-> (Result (ptr (ArrayList CType)) (slice u8)))
+  (let [out (box! a (ArrayList CType) (ArrayList::new [CType] a))
+        parts (split-top-commas a body)
+        n (len (load parts))
+        (mut err) (None [(slice u8)])
+        (mut i) 0]
+    (unless (or (= (trim body) "") (= (trim body) "void"))
+      (loop (if (>= (load i) n)
+                (break)
+                (let [part (get (load parts) (load i))]
+                  (unless (= part "...")
+                    (match (parse-c-type a part ctx (primitive/iadd depth 1))
+                      (Err [e] (do (store! err (Some e)) 0))
+                      (Ok [t]
+                          (do (push! [CType] out (load (ctype-decay a t))) 0))))
+                  (if (match (load err) (Some [_] true) (None [] false))
+                      (break)
+                      (set! i (primitive/iadd (load i) 1))))))
+      0)
+    (match (load err)
+      (Some [e] (Err e))
+      (None [] (Ok out)))))
+
+; Render a parsed type as Coil source. `ret` marks return position, the one
+; place `void` is a type. Anything the tree can express but Coil cannot spell is
+; refused here, by name, so the binding is skipped rather than approximated.
+(defn render-ctype [(a (dyn Allocator))
+                    (t (ptr CType))
+                    (ret bool)] (-> (Result (slice u8) (slice u8)))
+  (match (load t)
+    (CBase [c]
+           (cond (= c "void")
+                   (if ret (Ok "void") (Err "void is not a value type"))
+                 (= c "__va_list_tag")
+                   (Err "va_list storage outside a parameter (its layout is platform-specific)")
+                 :else (Ok c)))
+    (CPtr [inner]
+          (match (load inner)
+            (CBase [c]
+                   (if (or (= c "void") (= c "__va_list_tag"))
+                       (Ok "(ptr i8)")
+                       (Ok (cat3 a "(ptr " c ")"))))
+            (CFn [r ps variadic]
+                 (if variadic
+                     (Err "variadic function pointer (a Coil fnptr type cannot spell ...)")
+                     (render-fnptr a r ps)))
+            (_ (match (render-ctype a inner false)
+                 (Ok [x] (Ok (cat3 a "(ptr " x ")")))
+                 (Err [e] (Err e))))))
+    (CArr [inner count]
+          (match (load inner)
+            (CFn [_ _ _] (Err "array of functions"))
+            (_ (match (render-ctype a inner false)
+                 (Ok [x]
+                     (Ok (cat3 a
+                               (cat3 a "(array " x " ")
+                               (i64->dec a count)
+                               ")")))
+                 (Err [e] (Err e))))))
+    (CFn [_ _ _] (Err "a function type is only a value behind a pointer"))))
+
+(defn render-fnptr [(a (dyn Allocator))
+                    (r (ptr CType))
+                    (ps (ptr (ArrayList CType)))] (-> (Result (slice u8)
+                                                              (slice u8)))
+  (let [(mut b) (StrBuf::new a)
+        n (len (load ps))
+        (mut err) (None [(slice u8)])
+        (mut i) 0]
+    (push-str! (mut b) "(fnptr (coil.cc.C) [")
+    (loop (if (>= (load i) n)
+              (break)
+              (let [p (elem ps (load i))]
+                (match (render-ctype a p false)
+                  (Err [e] (do (store! err (Some e)) (break)))
+                  (Ok [x]
+                      (do
+                        (when (> (load i) 0)
+                          (push-str! (mut b) " ")
+                          0)
+                        (push-str! (mut b) x)
+                        (set! i (primitive/iadd (load i) 1))))))))
+    (match (load err)
+      (Some [e] (Err e))
+      (None []
+            (match (render-ctype a r true)
+              (Err [e] (Err e))
+              (Ok [rt]
+                  (do
+                    (push-str! (mut b) "] ")
+                    (push-str! (mut b) rt)
+                    (push-str! (mut b) ")")
+                    (Ok (str (load b))))))))))
+
+(defn map-type [(a (dyn Allocator)) (c (slice u8)) (ctx (ptr Ctx))] (-> (Result (slice u8)
+                                                                                (slice u8)))
+  (match (parse-c-type a c ctx 0)
+    (Err [e] (Err e))
+    (Ok [t] (render-ctype a t false))))
+
+; A parameter: the same mapping after C's array/function-to-pointer decay.
+(defn map-param [(a (dyn Allocator)) (c (slice u8)) (ctx (ptr Ctx))] (-> (Result (slice u8)
+                                                                                 (slice u8)))
+  (match (parse-c-type a c ctx 0)
+    (Err [e] (Err e))
+    (Ok [t] (render-ctype a (ctype-decay a t) false))))
+
+(defn map-return [(a (dyn Allocator)) (c (slice u8)) (ctx (ptr Ctx))] (-> (Result (slice u8)
+                                                                                  (slice u8)))
+  (match (parse-c-type a c ctx 0)
+    (Err [e] (Err e))
+    (Ok [t] (render-ctype a t true))))
+
+; size + align (bytes) of a mapped scalar/pointer type; None for aggregates.
+(defstruct SzAl [(size i64) (align i64)])
+
+(defn scalar-size-align [(t (slice u8))] (-> (Option SzAl))
+  (cond (or (starts-with t "(ptr") (starts-with t "(fnptr"))
+          (Some (mk-szal 8 8))
+        (or (= t "i8") (= t "u8")) (Some (mk-szal 1 1))
+        (or (= t "i16") (= t "u16")) (Some (mk-szal 2 2))
+        (or (= t "i32") (or (= t "u32") (= t "f32"))) (Some (mk-szal 4 4))
+        (or (= t "i64") (or (= t "u64") (= t "f64"))) (Some (mk-szal 8 8))
+        :else (None [SzAl])))
+
+(defn mk-szal [(sz i64) (al i64)] (-> SzAl)
+  (let [r (primitive/alloc-stack SzAl)]
+    (set! (.size r) sz)
+    (set! (.align r) al)
+    (load r)))
+
+; ============================ decl → binding ================================
+(defn function-extern [(a (dyn Allocator)) (d Json) (ctx (ptr Ctx))] (-> (Result (slice u8)
+                                                                                 (slice u8)))
+  (match (jgets d "name")
+    (None [] (Err "no name"))
+    (Some [name]
+          (let [(mut ps) (StrBuf::new a)
+                (mut first) true
+                (mut err) (None [(slice u8)])]
+            (match (jinner d)
+              (None [] 0)
+              (Some [inner]
+                    (let [(mut i) 0
+                          n (len (load inner))]
+                      (loop (if (>= (load i) n)
+                                (break)
+                                (let [p (get (load inner) (load i))]
+                                  (when (= (jkind p) "ParmVarDecl")
+                                    (match (jgets (jget p "type") "qualType")
+                                      (None []
+                                            (do
+                                              (store! err
+                                                      (Some "a parameter has no type"))
+                                              (break)))
+                                      (Some [ty]
+                                            (match (map-param a ty ctx)
+                                              (Err [e]
+                                                   (do
+                                                     (store! err (Some e))
+                                                     (break)))
+                                              (Ok [mt]
+                                                  (do
+                                                    (if (load first)
+                                                        (do
+                                                          (store! first false)
+                                                          0)
+                                                        (push-str! (mut ps)
+                                                                   " "))
+                                                    (push-str! (mut ps) mt)))))))
+                                  (set! i (primitive/iadd (load i) 1))))))))
+            (match (load err)
+              (Some [e] (Err e))
+              (None []
+                    (match (jgets (jget d "type") "qualType")
+                      (None [] (Err "no function type"))
+                      (Some [qt]
+                            ; The declaration's own type is a function type. Its
+                            ; return type is whatever the declarator leaves
+                            ; behind — for `R (*f(P))(Q)` that is a pointer to a
+                            ; function, which the old "text before the first
+                            ; paren" shortcut misread as a bare `R`.
+                            (match (parse-c-type a qt ctx 0)
+                              (Err [e] (Err e))
+                              (Ok [ft]
+                                  (match (load ft)
+                                    (CFn [rt _ variadic]
+                                         (match (render-ctype a rt true)
+                                           (Err [e] (Err e))
+                                           (Ok [ret]
+                                               (let [psstr (str (load ps))
+                                                     psfull
+                                                       (if variadic
+                                                           (if (> (len psstr)
+                                                                  0)
+                                                               (cat3 a
+                                                                     psstr
+                                                                     " "
+                                                                     "...")
+                                                               "...")
+                                                           psstr)]
+                                                 (Ok (cat3 a
+                                                           (cat3 a
+                                                                 "(extern "
+                                                                 name
+                                                                 (cat3 a
+                                                                       " :cc (coil.cc.C) ["
+                                                                       psfull
+                                                                       "] (-> "))
+                                                           ret
+                                                           "))\n"))))))
+                                    (_ (Err (cat3 a
+                                                  "declaration type '"
+                                                  qt
+                                                  "' is not a function type"))))))))))))))
+
+; A RecordDecl → (Ok (Some text)) emitted / (Ok (None)) skip-silently (fwd/anon) /
+; (Err reason) refuse-with-note. Unions map to :layout (coil.layout.Explicit) (every field :at 0).
+(defn has-any-bitfield [(d Json)] (-> bool)
+  (match (jinner d)
+    (None [] false)
+    (Some [inner]
+          (let [(mut i) 0
+                n (len (load inner))
+                (mut r) false]
+            (loop (if (>= (load i) n)
+                      (break)
+                      (let [f (get (load inner) (load i))]
+                        (if (and (= (jkind f) "FieldDecl")
+                                 (jbool-true? f "isBitfield"))
+                            (do (set! r true) (break))
+                            (set! i (primitive/iadd (load i) 1))))))
+            (load r)))))
+
+; An all-bitfield struct in one storage unit → :layout (coil.layout.Bits) :backing iN. Refuses
+; mixed/multi-unit/differing-width (needs clang record layout)
+(defn bitfield-defstruct [(a (dyn Allocator)) (d Json) (ctx (ptr Ctx))] (-> (Result (Option (slice u8))
+                                                                                    (slice u8)))
+  (let [name (jstr-or (jgets d "name") "")
+        (mut out) (StrBuf::new a)
+        (mut first) true
+        (mut backing) -1
+        (mut sum) 0
+        (mut err) (None [(slice u8)])]
+    (match (jinner d)
+      (None [] 0)
+      (Some [inner]
+            (let [(mut i) 0
+                  n (len (load inner))]
+              (loop (if (>= (load i) n)
+                        (break)
+                        (let [f (get (load inner) (load i))]
+                          (when (= (jkind f) "FieldDecl")
+                            (if (not (jbool-true? f "isBitfield"))
+                                (do
+                                  (store! err
+                                          (Some "mixed bitfield and normal fields (packed layout — Phase 2+ — needs record layout)"))
+                                  (break))
+                                (match (jgets f "name")
+                                  (None []
+                                        (do
+                                          (store! err
+                                                  (Some "an unnamed bitfield (padding — Phase 2+)"))
+                                          (break)))
+                                  (Some [fname]
+                                        (let [width (find-value f)]
+                                          (if (= width
+                                                 -9999999999)
+                                              (do
+                                                (store! err
+                                                        (Some "a bitfield with no foldable width"))
+                                                (break))
+                                              (match (jgets (jget f "type")
+                                                            "qualType")
+                                                (None []
+                                                      (do
+                                                        (store! err
+                                                                (Some "a field has no type"))
+                                                        (break)))
+                                                (Some [fty]
+                                                      (match (map-type a
+                                                                       fty
+                                                                       ctx)
+                                                        (Err [e]
+                                                             (do
+                                                               (store! err
+                                                                       (Some e))
+                                                               (break)))
+                                                        (Ok [mt]
+                                                            (match (scalar-size-align mt)
+                                                              (None []
+                                                                    (do
+                                                                      (store! err
+                                                                              (Some "a bitfield of non-scalar type (Phase 2+)"))
+                                                                      (break)))
+                                                              (Some [sa]
+                                                                    (let [bits
+                                                                            (primitive/imul (szal-size sa)
+                                                                                            8)]
+                                                                      (if (and (>= (load backing)
+                                                                                   0)
+                                                                               (!= (load backing)
+                                                                                   bits))
+                                                                          (do
+                                                                            (store! err
+                                                                                    (Some "bitfields of differing storage widths (Phase 2+ — needs record layout)"))
+                                                                            (break))
+                                                                          (do
+                                                                            (store! backing
+                                                                                    bits)
+                                                                            (store! sum
+                                                                                    (primitive/iadd (load sum)
+                                                                                                    width))
+                                                                            (if (load first)
+                                                                                (do
+                                                                                  (store! first
+                                                                                          false)
+                                                                                  0)
+                                                                                (push-str! (mut out)
+                                                                                           " "))
+                                                                            (push-str! (mut out)
+                                                                                       (cat3 a
+                                                                                             (cat3 a
+                                                                                                   "("
+                                                                                                   fname
+                                                                                                   " :bits ")
+                                                                                             (cat3 a
+                                                                                                   (if (and (> (len mt)
+                                                                                                               0)
+                                                                                                            (= (get mt
+                                                                                                                    0)
+                                                                                                               (: 105 u8)))
+                                                                                                       "i"
+                                                                                                       "u")
+                                                                                                   (i64->dec a
+                                                                                                             width)
+                                                                                                   "")
+                                                                                             ")")))))))))))))))))
+                          (set! i (primitive/iadd (load i) 1))))))))
+    (match (load err)
+      (Some [e] (Err e))
+      (None []
+            (if (< (load backing) 0)
+                (Err "empty bitfield struct")
+                (if (> (load sum) (load backing))
+                    (Err "bitfields span multiple storage units (packed layout — Phase 2+ — needs record layout)")
+                    (Ok (Some (cat3 a
+                                    (cat3 a
+                                          (cat3 a
+                                                "(defstruct "
+                                                name
+                                                " :layout (coil.layout.Bits) :backing i")
+                                          (i64->dec a (load backing))
+                                          " [")
+                                    (str (load out))
+                                    "])\n")))))))))
+
+(defn record-defstruct [(a (dyn Allocator)) (d Json) (ctx (ptr Ctx))] (-> (Result (Option (slice u8))
+                                                                                  (slice u8)))
+  (let [is-union (= (jstr-or (jgets d "tagUsed") "") "union")]
+    (match (jgets d "name")
+      (None [] (Ok (None [(slice u8)])))
+      (Some [name]
+            (if (not (jbool-true? d "completeDefinition"))
+                (Ok (None [(slice u8)]))
+                (if (has-any-bitfield d)
+                    (if is-union
+                        (Err "union with a bitfield member (Phase 2+ — needs record layout)")
+                        (bitfield-defstruct a d ctx))
+                    (let [(mut fields) (StrBuf::new a)
+                          (mut first) true
+                          (mut max-size) 0
+                          (mut max-align) 1
+                          (mut err) (None [(slice u8)])]
+                      (match (jinner d)
+                        (None [] 0)
+                        (Some [inner]
+                              (let [(mut i) 0
+                                    n (len (load inner))]
+                                (loop (if (>= (load i) n)
+                                          (break)
+                                          (let [f (get (load inner) (load i))]
+                                            (when (= (jkind f) "FieldDecl")
+                                              (if (jbool-true? f "isBitfield")
+                                                  (do
+                                                    (store! err
+                                                            (Some (if is-union
+                                                                      "union with a bitfield member (Phase 2+ — needs record layout)"
+                                                                      "contains a bitfield (packed layout — Phase 2+ — needs record layout)")))
+                                                    (break))
+                                                  (match (jgets f "name")
+                                                    (None []
+                                                          (do
+                                                            (store! err
+                                                                    (Some "an unnamed field (anon struct/union)"))
+                                                            (break)))
+                                                    (Some [fname]
+                                                          (match (jgets (jget f
+                                                                              "type")
+                                                                        "qualType")
+                                                            (None []
+                                                                  (do
+                                                                    (store! err
+                                                                            (Some "a field has no type"))
+                                                                    (break)))
+                                                            (Some [fty]
+                                                                  (match (map-type a
+                                                                                   fty
+                                                                                   ctx)
+                                                                    (Err [e]
+                                                                         (do
+                                                                           (store! err
+                                                                                   (Some e))
+                                                                           (break)))
+                                                                    (Ok [mt]
+                                                                        (if is-union
+                                                                            (match (scalar-size-align mt)
+                                                                              (None []
+                                                                                    (do
+                                                                                      (store! err
+                                                                                              (Some (cat3 a
+                                                                                                          (cat3 a
+                                                                                                                "union member '"
+                                                                                                                fname
+                                                                                                                "' has aggregate type '")
+                                                                                                          mt
+                                                                                                          "' (Phase 2 — needs record layout)")))
+                                                                                      (break)))
+                                                                              (Some [sa]
+                                                                                    (do
+                                                                                      (when (> (szal-size sa)
+                                                                                               (load max-size))
+                                                                                        (store! max-size
+                                                                                                (szal-size sa)))
+                                                                                      (when (> (szal-align sa)
+                                                                                               (load max-align))
+                                                                                        (store! max-align
+                                                                                                (szal-align sa)))
+                                                                                      (if (load first)
+                                                                                          (do
+                                                                                            (store! first
+                                                                                                    false)
+                                                                                            0)
+                                                                                          (push-str! (mut fields)
+                                                                                                     " "))
+                                                                                      (push-str! (mut fields)
+                                                                                                 (cat3 a
+                                                                                                       (cat3 a
+                                                                                                             "("
+                                                                                                             fname
+                                                                                                             " ")
+                                                                                                       mt
+                                                                                                       " :at 0)")))))
+                                                                            (do
+                                                                              (if (load first)
+                                                                                  (do
+                                                                                    (store! first
+                                                                                            false)
+                                                                                    0)
+                                                                                  (push-str! (mut fields)
+                                                                                             " "))
+                                                                              (push-str! (mut fields)
+                                                                                         (cat3 a
+                                                                                               (cat3 a
+                                                                                                     "("
+                                                                                                     fname
+                                                                                                     " ")
+                                                                                               mt
+                                                                                               ")"))))))))))))
+                                            (set! i (primitive/iadd (load i) 1))))))))
+                      (match (load err)
+                        (Some [e] (Err e))
+                        (None []
+                              (if is-union
+                                  (let [algn (load max-align)
+                                        size
+                                          (primitive/imul (primitive/idiv (primitive/iadd (load max-size)
+                                                                                          (primitive/isub algn
+                                                                                                          1))
+                                                                          algn)
+                                                          algn)]
+                                    (Ok (Some (cat3 a
+                                                    (cat3 a
+                                                          (cat3 a
+                                                                "(defstruct "
+                                                                name
+                                                                " :layout (coil.layout.Explicit) :size ")
+                                                          (i64->dec a size)
+                                                          (cat3 a
+                                                                " :align "
+                                                                (i64->dec a
+                                                                          algn)
+                                                                " ["))
+                                                    (str (load fields))
+                                                    "])\n"))))
+                                  (Ok (Some (cat3 a
+                                                  (cat3 a
+                                                        "(defstruct "
+                                                        name
+                                                        " [")
+                                                  (str (load fields))
+                                                  "])\n")))))))))))))
+
+; SzAl is returned by value; read its fields through a stack copy.
+(defn szal-size [(sa SzAl)] (-> i64)
+  (let [p (primitive/alloc-stack SzAl)] (set! p sa) (.size p)))
+
+(defn szal-align [(sa SzAl)] (-> i64)
+  (let [p (primitive/alloc-stack SzAl)] (set! p sa) (.align p)))
+
+;;; Does any enumerator of enum declaration `d` appear in `names`?
+(defn enum-selects? [(d Json) (names (ptr (ArrayList (slice u8))))] (-> bool)
+  (match (jinner d)
+    (None [] false)
+    (Some [inner]
+          (let [(mut found) false]
+            (for c (load inner)
+              (when (= (jkind c) "EnumConstantDecl")
+                (match (jgets c "name")
+                  (Some [cname] (when (selected-name? names true cname) (set! found true)))
+                  (None [] 0))))
+            found))))
+
+;;; The enum's constants as `(const …)` lines. With `only` set, just the
+;;; enumerators `names` selects (`:use [ARD_POLLIN]` from an anonymous enum);
+;;; values still count through every enumerator.
+(defn enum-consts [(a (dyn Allocator))
+                   (d Json)
+                   (seen (ptr (HashMap (slice u8) i64)))
+                   (names (ptr (ArrayList (slice u8))))
+                   (only bool)] (-> (Result (slice u8)
+                                            (slice u8)))
+  (let [(mut out) (StrBuf::new a)
+        (mut next) 0
+        (mut err) (None [(slice u8)])]
+    (match (jinner d)
+      (None [] 0)
+      (Some [inner]
+            (let [(mut i) 0
+                  n (len (load inner))]
+              (loop (if (>= (load i) n)
+                        (break)
+                        (let [c (get (load inner) (load i))]
+                          (when (= (jkind c) "EnumConstantDecl")
+                            (match (jgets c "name")
+                              (None []
+                                    (do
+                                      (store! err
+                                              (Some "an unnamed enumerator"))
+                                      (break)))
+                              (Some [cname]
+                                    (let [ev (enumerator-value c)
+                                          has-init (has-inner c)]
+                                      ; ev == sentinel means "no foldable integer initializer":
+                                      ; with an initializer present → refuse; without → running counter.
+                                      (if (and (= ev
+                                                  -9999999999)
+                                               has-init)
+                                          (do
+                                            (store! err
+                                                    (Some (cat3 a
+                                                                "enumerator '"
+                                                                cname
+                                                                "' has a non-integer value")))
+                                            (break))
+                                          (let [value
+                                                  (if (= ev
+                                                         -9999999999)
+                                                      (load next)
+                                                      ev)
+                                                skey (cat a "const:" cname)]  ; SAME keyspace as the #define pass
+                                            (do
+                                              (store! next
+                                                      (primitive/iadd value 1))
+                                              (match (if (and only (not (selected-name? names true cname)))
+                                                         (Some 1)
+                                                         (get (load seen) skey))
+                                                (Some [_] 0)
+                                                (None []
+                                                      (do
+                                                        (set! seen skey 1)
+                                                        (push-str! (mut out)
+                                                                   (cat3 a
+                                                                         (cat3 a
+                                                                               "(const "
+                                                                               cname
+                                                                               " ")
+                                                                         (i64->dec a
+                                                                                   value)
+                                                                         ")\n"))))))))))))
+                          (set! i (primitive/iadd (load i) 1))))))))
+    (match (load err) (Some [e] (Err e)) (None [] (Ok (str (load out)))))))
+
+(defn has-inner [(j Json)] (-> bool)
+  (match (jinner j) (Some [_] true) (None [] false)))
+
+; The folded integer value of an enumerator initializer; -9999999999 = "none".
+(defn enumerator-value [(c Json)] (-> i64)
+  (match (jinner c)
+    (None [] -9999999999)
+    (Some [inner]
+          (let [(mut i) 0
+                n (len (load inner))
+                (mut r) -9999999999]
+            (loop (if (>= (load i) n)
+                      (break)
+                      (let [v (find-value (get (load inner) (load i)))]
+                        (if (= v -9999999999)
+                            (set! i (primitive/iadd (load i) 1))
+                            (do
+                              (set! r v)
+                              (break))))))
+            (load r)))))
+
+; Recursive: first foldable integer "value" string in a node subtree.
+(defn find-value [(node Json)] (-> i64)
+  (match (jgets node "value")
+    (Some [vs]
+          (let [d (parse-signed vs)]
+            (if (= d -9999999999)
+                (find-value-children node)
+                d)))
+    (None [] (find-value-children node))))
+
+(defn find-value-children [(node Json)] (-> i64)
+  (match (jinner node)
+    (None [] -9999999999)
+    (Some [inner]
+          (let [(mut i) 0
+                n (len (load inner))
+                (mut r) -9999999999]
+            (loop (if (>= (load i) n)
+                      (break)
+                      (let [v (find-value (get (load inner) (load i)))]
+                        (if (= v -9999999999)
+                            (set! i (primitive/iadd (load i) 1))
+                            (do
+                              (set! r v)
+                              (break))))))
+            (load r)))))
+
+; Parse an optionally-signed decimal; -9999999999 sentinel on failure.
+(defn parse-signed [(s (slice u8))] (-> i64)
+  (if (= (len s) 0)
+      -9999999999
+      (if (= (get s 0) (: 45 u8))
+          (let [d (parse-dec (subslice [u8] s 1 (len s)))]
+            (if (< d 0) -9999999999 (primitive/isub 0 d)))
+          (let [d (parse-dec s)]
+            (if (< d 0) -9999999999 d)))))
+
+; ============================ table collection =============================
+(defn collect-types [(a (dyn Allocator)) (top (ArrayList Json)) (ctx (ptr Ctx))] (-> i64)
+  (let [(mut i) 0
+        n (len top)]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [d (get top (load i))]
+                (if (= (jkind d) "TypedefDecl")
+                    (match (jgets d "name")
+                      (None [] 0)
+                      (Some [name]
+                            (match (jgets (jget d "type") "qualType")
+                              (None [] 0)
+                              (Some [under]
+                                    (do
+                                      (set! (load (field ctx typedefs))
+                                            name
+                                            under)
+                                      0)))))
+                    (when (= (jkind d) "EnumDecl")
+                      (match (jgets d "name")
+                        (None [] 0)
+                        (Some [name]
+                              (let [ty
+                                      (match (jgets (jget d
+                                                          "fixedUnderlyingType")
+                                                    "qualType")
+                                        (None [] "i32")
+                                        (Some [q]
+                                              (try (let [t
+                                                           (try-or! (map-type a
+                                                                              q
+                                                                              ctx)
+                                                                    "i32")]
+                                                     t))))]
+                                (do (set! (load (field ctx enums)) name ty) 0))))))
+                (set! i (primitive/iadd (load i) 1)))))
+    0))
+
+; Clang spells size_t and ptrdiff_t through predefined typedefs (`__size_t`,
+; `__ptrdiff_t`, `__signed_size_t`) that no header declares. Their definitions
+; are the target's __SIZE_TYPE__ and __PTRDIFF_TYPE__ macros.
+(defn seed-predefined-typedefs [(a (dyn Allocator)) (macros (slice u8)) (ctx (ptr Ctx))]
+  (-> i64)
+  (for line (iter (load (each-line a macros)))
+    (match (parse-define line)
+      (Some [d]
+            (cond (= (def-name d) "__SIZE_TYPE__")
+                    (do
+                      (seed-typedef! ctx "__size_t" (def-body d))
+                      (seed-typedef! ctx
+                                     "__signed_size_t"
+                                     (trim (remove-all a (def-body d) "unsigned"))))
+                  (= (def-name d) "__PTRDIFF_TYPE__")
+                    (seed-typedef! ctx "__ptrdiff_t" (def-body d))
+                  :else 0))
+      (None [] 0)))
+  0)
+
+(defn seed-typedef! [(ctx (ptr Ctx)) (name (slice u8)) (under (slice u8))] (-> i64)
+  (match (get (load (field ctx typedefs)) name)
+    (Some [_] 0)
+    (None [] (do (set! (load (field ctx typedefs)) name under) 0))))
+
+; ============================ #define pass =================================
+
+; Parse a "#define NAME body" line → Some(name,body); None for function-like/malformed.
+(defstruct Define [(name (slice u8)) (body (slice u8))])
+
+(defn parse-define [(line (slice u8))] (-> (Option Define))
+  (if (not (starts-with line "#define "))
+      (None [Define])
+      (let [rest (subslice [u8] line 8 (len line))
+            n (len rest)
+            (mut k) 0]
+        (loop (if (>= (load k) n)
+                  (break)
+                  (let [c (get rest (load k))]
+                    (if (or (and (>= c (: 48 u8))
+                                 (<= c (: 57 u8)))
+                            (or (and (>= c (: 65 u8))
+                                     (<= c (: 90 u8)))
+                                (or (and (>= c (: 97 u8))
+                                         (<= c (: 122 u8)))
+                                    (= c (: 95 u8)))))
+                        (set! k (primitive/iadd (load k) 1))
+                        (break)))))
+        (let [name (subslice [u8] rest 0 (load k))
+              after (subslice [u8] rest (load k) n)]
+          (if (or (= (load k) 0)
+                  (and (> (len after) 0)
+                       (= (get after 0) (: 40 u8))))
+              (None [Define])
+              (let [d (primitive/alloc-stack Define)]
+                (set! (.name d) name)
+                (set! (.body d) (trim after))
+                (Some (load d))))))))
+
+; Strip a trailing float suffix (f/F/l/L).
+(defn strip-float-suffix [(s (slice u8))] (-> (slice u8))
+  (let [(mut hi) (len s)]
+    (loop (if (<= (load hi) 0)
+              (break)
+              (let [c (get s (primitive/isub (load hi) 1))]
+                (if (or (= c (: 102 u8))
+                        (or (= c (: 70 u8))
+                            (or (= c (: 108 u8))
+                                (= c
+                                   (: 76 u8)))))
+                    (set! hi (primitive/isub (load hi) 1))
+                    (break)))))
+    (subslice [u8] s 0 (load hi))))
+
+; Chars valid in a decimal float literal, at most one '.' — an approximate f64-parse
+; validation (real headers only carry clean literals).
+(defn float-valid? [(s (slice u8))] (-> bool)
+  (let [n (len s)
+        (mut i) 0
+        (mut dots) 0
+        (mut ok) (> n 0)]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (get s (load i))]
+                (cond (and (>= c (: 48 u8))
+                           (<= c (: 57 u8)))
+                        (store! i
+                                (primitive/iadd (load i) 1))
+                      (= c (: 46 u8))
+                        (do
+                          (store! dots (primitive/iadd (load dots) 1))
+                          (store! i
+                                  (primitive/iadd (load i) 1)))
+                      (or (= c (: 101 u8))
+                          (or (= c (: 69 u8))
+                              (or (= c (: 43 u8))
+                                  (= c
+                                     (: 45 u8)))))
+                        (store! i (primitive/iadd (load i) 1))
+                      :else (do (store! ok false) (break))))))
+    (and (load ok) (<= (load dots) 1))))
+
+; A float #define body → its verbatim literal text (suffix stripped, `.0` appended
+; if it degenerated to an integer).
+(defn float-literal [(a (dyn Allocator)) (b (slice u8))] (-> (Option (slice u8)))
+  (let [s (strip-float-suffix b)]
+    (if (not (float-valid? s))
+        (None [(slice u8)])
+        (if (or (has-byte? s (: 46 u8))
+                (or (has-byte? s (: 101 u8))
+                    (has-byte? s (: 69 u8))))
+            (Some s)
+            (Some (cat a s ".0"))))))
+
+; Interpret a #define body as an integer OR float literal → its coil text.
+; Strings / identifiers / expressions → None (skip).
+(defn c-literal [(a (dyn Allocator)) (body (slice u8))] (-> (Option (slice u8)))
+  (let [b (trim body)]
+    (if (= (len b) 0)
+        (None [(slice u8)])
+        (if (float-ish? b)
+            (float-literal a b)
+            (let [(mut neg) false
+                  (mut digits) b]
+              (when (= (get b 0) (: 45 u8))
+                (store! neg true)
+                (store! digits (trim (subslice [u8] b 1 (len b))))
+                0)
+              (when (and (> (len (load digits)) 0)
+                         (= (get (load digits) 0) (: 43 u8)))
+                (store! digits
+                        (subslice [u8] (load digits) 1 (len (load digits))))
+                0)
+              (let [ds (strip-int-suffix (load digits))
+                    mag (parse-int-radix ds)]
+                (if (= mag -9999999999)
+                    (None [(slice u8)])
+                    (Some (i64->dec a
+                                    (if (load neg) (primitive/isub 0 mag) mag))))))))))
+
+; A float literal: has '.' or exponent and no 0x prefix (matches the reference test).
+(defn float-ish? [(b (slice u8))] (-> bool)
+  (if (starts-with b "0x")
+      false
+      (or (has-byte? b (: 46 u8))
+          (or (has-byte? b (: 101 u8))
+              (has-byte? b (: 69 u8))))))
+
+(defn strip-int-suffix [(s (slice u8))] (-> (slice u8))
+  (let [(mut hi) (len s)]
+    (loop (if (<= (load hi) 0)
+              (break)
+              (let [c (get s (primitive/isub (load hi) 1))]
+                (if (or (= c (: 117 u8))
+                        (or (= c (: 85 u8))
+                            (or (= c (: 108 u8))
+                                (= c
+                                   (: 76 u8)))))
+                    (set! hi (primitive/isub (load hi) 1))
+                    (break)))))
+    (subslice [u8] s 0 (load hi))))
+
+; Parse decimal / 0x-hex / 0-octal magnitude; -9999999999 on failure.
+(defn parse-int-radix [(s (slice u8))] (-> i64)
+  (let [n (len s)]
+    (cond (= n 0) -9999999999
+          (and (> n 2)
+               (and (= (get s 0) (: 48 u8))
+                    (or (= (get s 1) (: 120 u8))
+                        (= (get s 1)
+                           (: 88 u8)))))
+            (parse-hex (subslice [u8] s 2 n))
+          (and (> n 1)
+               (= (get s 0) (: 48 u8)))
+            (parse-oct s)
+          :else
+            (let [d (parse-dec s)]
+              (if (< d 0) -9999999999 d)))))
+
+(defn parse-hex [(s (slice u8))] (-> i64)
+  (let [n (len s)
+        (mut v) 0
+        (mut i) 0
+        (mut ok) (> n 0)]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (get s (load i))
+                    (mut dv) -1]
+                (cond (and (>= c (: 48 u8))
+                           (<= c (: 57 u8)))
+                        (store! dv
+                                (primitive/cast i64
+                                                (primitive/isub c
+                                                                (: 48 u8))))
+                      (and (>= c (: 97 u8))
+                           (<= c (: 102 u8)))
+                        (store! dv
+                                (primitive/iadd 10
+                                                (primitive/cast i64
+                                                                (primitive/isub c
+                                                                                (: 97 u8)))))
+                      (and (>= c (: 65 u8))
+                           (<= c (: 70 u8)))
+                        (store! dv
+                                (primitive/iadd 10
+                                                (primitive/cast i64
+                                                                (primitive/isub c
+                                                                                (: 65 u8)))))
+                      :else 0)
+                (if (< (load dv) 0)
+                    (do (set! ok false) (break))
+                    (do
+                      (set! v
+                            (primitive/iadd (primitive/imul (load v) 16)
+                                            (load dv)))
+                      (set! i (primitive/iadd (load i) 1)))))))
+    (if (load ok) (load v) -9999999999)))
+
+(defn parse-oct [(s (slice u8))] (-> i64)
+  (let [n (len s)
+        (mut v) 0
+        (mut i) 0
+        (mut ok) (> n 0)]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [c (get s (load i))]
+                (if (and (>= c (: 48 u8))
+                         (<= c (: 55 u8)))
+                    (do
+                      (set! v
+                            (primitive/iadd (primitive/imul (load v) 8)
+                                            (primitive/cast i64
+                                                            (primitive/isub c
+                                                                            (: 48 u8)))))
+                      (set! i (primitive/iadd (load i) 1)))
+                    (do (set! ok false) (break))))))
+    (if (load ok) (load v) -9999999999)))
+
+; ============================ clang subprocess =============================
+
+; ---- what a process keeps between cimports ----------------------------------
+;;; The text of one clang run and the content digest of every file it read.
+(defstruct CimportMemo [(text (slice u8)) (inputs (ArrayList artifact-id/ArtifactInput))])
+
+;;; Process-owned, malloc storage. `coil lint --fix` loads a program once per
+;;; analysis and a program can import one header many ways; each of these was a
+;;; process spawn per cimport.
+;;;  - `sdk`: the `xcrun` answer (`sdk-known` once asked), which cannot change.
+;;;  - `baselines`: the predefined-macro dump per working directory and flags.
+;;;  - `scratch`: every scratch path `tmp-path` handed out since the last cleanup.
+;;;  - `loads`, `arena`, `headers`: the header memos of the load in progress (see
+;;;    CimportHeaderMemo), kept in `arena` while `loads` is above zero.
+(defstruct CimportProcess
+  [(ready bool)
+   (sdk-known bool)
+   (sdk (slice u8))
+   (baselines (HashMap (slice u8) CimportMemo))
+   (scratch (ArrayList (slice u8)))
+   (loads i64)
+   (arena scratch/ScratchArena)
+   (headers (HashMap (slice u8) (ptr CimportHeaderMemo)))])
+
+(defn cimport-process-cell [] (-> (ptr CimportProcess))
+  (primitive/alloc-static CimportProcess))
+
+(defn cimport-process [] (-> (ptr CimportProcess))
+  (let [cell (cimport-process-cell)]
+    (unless (.ready cell)
+      (set! (.baselines cell) (HashMap::new [(slice u8) CimportMemo] (malloc-allocator) (keyops)))
+      (set! (.scratch cell) (ArrayList::new [(slice u8)] (malloc-allocator)))
+      (set! (.ready cell) true)
+      0)
+    cell))
+
+;;; What one load keeps of a header's clang work, per working directory, header and
+;;; flags. None of it depends on the `:use` list, and a program imports one header
+;;; many ways — async-rust-debugger imports its platform header eleven times and the
+;;; Mach header (a 25 MB AST) five — so each of those dumped the macros, dumped the
+;;; AST and folded the same expressions again.
+;;;  - `macros`, `ast`: the header's `-dM` dump and JSON AST, once dumped.
+;;;  - `deps`: every file those runs read, once a run has listed them.
+;;;  - `folds`: each expression folded so far, and its value (None: it does not
+;;;    fold to an integer).
+;;;  - `types`: each expression typed so far, and its C type (None: it is no
+;;;    expression with a type a struct member can have).
+;;; A load reads each header once, as it reads each source file once; the loader's
+;;; own cache, which checks digests, is what carries results to the next load.
+(defstruct CimportHeaderMemo
+  [(macros (Option (slice u8)))
+   (ast (Option (slice u8)))
+   (deps (Option (ptr (ArrayList (slice u8)))))
+   (folds (HashMap (slice u8) (Option i64)))
+   (types (HashMap (slice u8) (Option (slice u8))))])
+
+;;; A load is starting: until the matching `cimport-load-end!`, cimports keep their
+;;; header memos. Loads nest (a namespace set loads the entry program inside it), so
+;;; this counts them.
+(defn cimport-load-begin! [] (-> i64)
+  (let [cell (cimport-process)]
+    (when (= (.loads cell) 0)
+      (scratch/ScratchArena::init-with-capacity (field cell arena) (malloc-allocator) 1048576)
+      (set! (.headers cell)
+            (HashMap::new [(slice u8) (ptr CimportHeaderMemo)]
+                          (allocator (field cell arena))
+                          (keyops)))
+      0)
+    (set! (.loads cell) (+ (.loads cell) 1))
+    0))
+
+;;; The outermost load is over: its header memos go with it.
+(defn cimport-load-end! [] (-> i64)
+  (let [cell (cimport-process)]
+    (when (<= (.loads cell) 0)
+      (ewrite "internal error: cimport-load-end! without a matching cimport-load-begin!\n")
+      (abort)
+      0)
+    (set! (.loads cell) (- (.loads cell) 1))
+    (when (= (.loads cell) 0)
+      (close! (field cell arena))
+      0)
+    0))
+
+;;; The memo for header ABS under FLAGS (already through `clang-flags`) in the
+;;; current working directory, or null outside a load.
+(defn header-memo [(a (dyn Allocator)) (abs (slice u8)) (flags (slice u8))] (-> (ptr CimportHeaderMemo))
+  (let [cell (cimport-process)]
+    (if (= (.loads cell) 0)
+        (primitive/cast (ptr CimportHeaderMemo) 0)
+        (let [key (cat3 a (cat3 a (abspath a ".") "\n" abs) "\n" flags)]
+          (match (get (.headers cell) key)
+            (Some [memo] memo)
+            (None []
+              (let [m (allocator (field cell arena))
+                    memo (box! m CimportHeaderMemo
+                               (CimportHeaderMemo :macros (None [(slice u8)])
+                                                  :ast (None [(slice u8)])
+                                                  :deps (None [(ptr (ArrayList (slice u8)))])
+                                                  :folds (HashMap::new [(slice u8) (Option i64)] m (keyops))
+                                                  :types (HashMap::new [(slice u8) (Option (slice u8))] m (keyops))))]
+                (set! (mut (.headers cell)) key memo)
+                memo)))))))
+
+(defn header-memo? [(memo (ptr CimportHeaderMemo))] (-> bool)
+  (!= (primitive/cast i64 memo) 0))
+
+;;; Where a load's memos keep what they own.
+(defn memo-allocator [] (-> (dyn Allocator))
+  (allocator (field (cimport-process) arena)))
+
+;;; Record DEPS as the files MEMO's header reads, the first time they are known.
+(defn memo-note-deps! [(memo (ptr CimportHeaderMemo)) (deps (ptr (ArrayList (slice u8))))] (-> i64)
+  (when (and (header-memo? memo) (none? (.deps memo)))
+    (let [m (memo-allocator)
+          (mut kept) (ArrayList::new [(slice u8)] m)]
+      (for path (load deps) (push! (mut kept) (cat m path "")))
+      (set! (.deps memo) (Some (box! m (ArrayList (slice u8)) (load kept))))))
+  0)
+
+; The scratch file for `tag`, "cimport-<tag>.txt" in this process's coil.temp
+; directory (so a cimport that dies leaves nothing for long), recorded for
+; `cimport-cleanup!`, which removes it as soon as the import is done.
+(defn tmp-path [(a (dyn Allocator)) (tag (slice u8))] (-> (slice u8))
+  (let [dir (match (temp/dir)
+              (Ok [d] d)
+              (Err [e]
+                (do (io/print-str (io/stderr) "error: cimport: ")
+                    (io/write-line (io/stderr) (text e))
+                    (exit 1)
+                    "")))
+        path (cat3 a (cat3 a dir "/cimport-" tag) ".txt" "")
+        cell (cimport-process)]
+    (unless (block :seen
+              (for known (.scratch cell) (when (= known path) (break :seen true)))
+              false)
+      (push! (mut (.scratch cell)) (sconcat-malloc path))
+      0)
+    path))
+
+(defn sconcat-malloc [(s (slice u8))] (-> (slice u8))
+  (cat (malloc-allocator) s ""))
+
+; Remove every scratch file this process made. There are eleven `tmp-path` call
+; sites across clang invocations, constant folding and ABI probing, each with
+; several failure exits, so unlinking at each one reliably misses paths -- and it
+; did: 4,611 of these were left in /tmp. Every one of them is named by `tmp-path`,
+; which records it, so removing what it recorded is complete. (This was a
+; `rm -f /tmp/coil-cimport-<pid>-*` through the shell: a process spawn after
+; every cimport.)
+(defn cimport-cleanup! [(a (dyn Allocator))] (-> i64)
+  (let [cell (cimport-process)]
+    (for path (.scratch cell)
+      (unlink (s->cstr a path))
+      (free [u8] (malloc-allocator) path))
+    (clear! (mut (.scratch cell))))
+  0)
+
+;;; Digests of the files at PATHS, in malloc storage; None when one cannot be read,
+;;; since a result generated from it could never be shown fresh again.
+(defn cimport-inputs [(a (dyn Allocator)) (paths (ptr (ArrayList (slice u8))))] (-> (Option (ArrayList artifact-id/ArtifactInput)))
+  (block :done
+    (let [m (malloc-allocator)
+          (mut digests) (ArrayList::new [(slice u8)] a)]
+      (for path (load paths)
+        (match (artifact-id/artifact-file-digest a path)
+          (Ok [digest] (push! (mut digests) digest))
+          (Err [_] (return-from :done (None [(ArrayList artifact-id/ArtifactInput)])))))
+      (let [(mut inputs) (ArrayList::new [artifact-id/ArtifactInput] m)]
+        (for [i 0 (len (load paths))]
+          (push! (mut inputs)
+                 (artifact-id/ArtifactInput :path (cat m (get (load paths) i) "")
+                                            :digest (cat m (get digests i) ""))))
+        (Some (load inputs))))))
+
+;;; Does every file in INPUTS still hold the bytes it was digested with?
+(defn cimport-inputs-fresh? [(a (dyn Allocator)) (inputs (ArrayList artifact-id/ArtifactInput))] (-> bool)
+  (block :done
+    (for input inputs
+      (match (artifact-id/artifact-file-digest a (.path input))
+        (Ok [digest] (unless (= digest (.digest input)) (return-from :done false)))
+        (Err [_] (return-from :done false))))
+    true))
+
+(defn cimport-inputs-free! [(inputs (ArrayList artifact-id/ArtifactInput))] (-> i64)
+  (let [m (malloc-allocator)
+        (mut owned) inputs]
+    (for input owned
+      (free [u8] m (.path input))
+      (free [u8] m (.digest input)))
+    (free! (mut owned)))
+  0)
+
+; Run a clang command that writes stdout to `outfile`; returns exit status.
+(defn run-cmd [(a (dyn Allocator)) (cmd (slice u8))] (-> i32)
+  (system (s->cstr a cmd)))
+
+; Add the active Darwin SDK when the caller did not select a sysroot. Command-line
+; clang normally discovers this through its driver installation, but headers from
+; the Xcode/CLT SDK are not in /usr/include. xcrun is absent on non-Darwin hosts,
+; so a failed lookup deliberately leaves the flags unchanged.
+(defn clang-flags [(a (dyn Allocator)) (flags (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (if (or (contains-str? flags "-isysroot") (contains-str? flags "--sysroot"))
+      (Ok flags)
+      (match (sdk-path a)
+        (Err [e] (Err e))
+        (Ok [sdk]
+            (Ok (if (= (len sdk) 0)
+                    flags
+                    (cat3 a flags " -isysroot '" (cat a sdk "'"))))))))
+
+;;; The active SDK's path, or "" where there is none; asked of `xcrun` once per
+;;; process. It was asked on every clang command line, three or four times per
+;;; cimport.
+(defn sdk-path [(a (dyn Allocator))] (-> (Result (slice u8) (slice u8)))
+  (let [cell (cimport-process)]
+    (if (.sdk-known cell)
+        (Ok (.sdk cell))
+        (let [out (tmp-path a "sdk")
+              cmd
+                (cat a
+                     "xcrun --sdk macosx --show-sdk-path > '"
+                     (cat a out "' 2>/dev/null"))
+              found
+                (if (!= (run-cmd a cmd) (: 0 i32))
+                    (Ok [(slice u8) (slice u8)] "")
+                    (match (slurp a (s->cstr a out))
+                      (Err [e] (Err [(slice u8) (slice u8)] e))
+                      (Ok [text] (Ok [(slice u8) (slice u8)] (trim text)))))]
+          (match found
+            (Err [e] (Err e))
+            (Ok [sdk]
+                (set! (.sdk cell) (sconcat-malloc sdk))
+                (set! (.sdk-known cell) true)
+                (Ok (.sdk cell))))))))
+
+; A header name is not itself a clang translation unit: `clang pthread.h`
+; addresses a file in the current directory and never performs include search.
+; Compile a tiny wrapper so both SDK headers and caller-provided -I headers use
+; clang's normal lookup rules.
+(defn include-source [(a (dyn Allocator)) (header (slice u8)) (tag (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (let [src (tmp-path a tag)]
+    (match (write-file a src (cat3 a "#include \"" header "\"\n"))
+      (Err [e] (Err e))
+      (Ok [_] (Ok src)))))
+
+; clang JSON AST of `header` → parsed Json: the top-level TranslationUnitDecl, or
+; the first declaration an `-ast-dump-filter` in `flags` selects.
+(defn run-clang-ast [(a (dyn Allocator)) (header (slice u8)) (flags (slice u8))] (-> (Result Json
+                                                                                             (slice u8)))
+  (match (run-clang-ast-text a header flags)
+    (Err [e] (Err e))
+    (Ok [txt] (Ok (json-parse a txt)))))
+
+;;; `run-clang-ast`'s JSON, unparsed.
+(defn run-clang-ast-text [(a (dyn Allocator)) (header (slice u8)) (flags (slice u8))] (-> (Result (slice u8)
+                                                                                                  (slice u8)))
+  (let [out (tmp-path a "ast")
+        err (tmp-path a "ast-err")
+        cmd
+          (cat3 a
+                (cat3 a
+                      "clang -Xclang -ast-dump=json -fsyntax-only"
+                      flags
+                      " -x c '")
+                (cat3 a header "' > '" out)
+                (cat3 a "' 2> '" err "'"))
+        rc (run-cmd a cmd)]
+    (if (!= rc (: 0 i32))
+        (match (slurp a (s->cstr a err))
+          (Err [e] (Err e))
+          (Ok [text]
+              (let [detail (trim text)]
+                (if (= (len detail) 0)
+                    (Err "clang failed to parse the header")
+                    (Err (cat a "clang failed to parse the header:\n" detail))))))
+        (match (slurp a (s->cstr a out))
+          (Err [e] (Err e))
+          (Ok [txt]
+              (if (= (len txt) 0)
+                  (Err "clang produced no AST")
+                  (Ok txt)))))))
+
+;;; The prerequisites a clang `-MMD` depfile names: everything after the first
+;;; `target:`, with `\\` line continuations joined and `\ ` read as a space.
+(defn depfile-prerequisites [(a (dyn Allocator)) (text (slice u8))] (-> (ptr (ArrayList (slice u8))))
+  (let [out (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))
+        n (len text)
+        (mut i) 0
+        (mut past-target) false
+        (mut word) (StrBuf::new a)]
+    (while (< i n)
+      (let [c (get text i)]
+        (cond (and (= c #\\) (< (+ i 1) n) (= (get text (+ i 1)) #\newline))
+                (set! i (+ i 2))
+              (and (= c #\\) (< (+ i 1) n) (= (get text (+ i 1)) #\space))
+                (do (push! (mut word) #\space) (set! i (+ i 2)))
+              (or (= c #\space) (= c #\tab) (= c #\newline) (= c #\return))
+                (do
+                  (when (and past-target (> (len (str word)) 0))
+                    (push! out (str word)))
+                  (set! word (StrBuf::new a))
+                  (set! i (+ i 1)))
+              (and (= c #\:) (not past-target)
+                   (or (>= (+ i 1) n) (= (get text (+ i 1)) #\space) (= (get text (+ i 1)) #\newline)))
+                (do (set! past-target true) (set! word (StrBuf::new a)) (set! i (+ i 1)))
+              :else (do (push! (mut word) c) (set! i (+ i 1))))))
+    (when (and past-target (> (len (str word)) 0))
+      (push! out (str word)))
+    out))
+
+;;; Every file clang reads to compile HEADER with FLAGS: the prerequisites of a
+;;; `-M` depfile for the same wrapper translation unit the AST dump compiles,
+;;; minus that wrapper itself, which is a scratch file of this run. What these
+;;; files hold is everything a cimport of HEADER is generated from, so a caller
+;;; that records their digests knows exactly when a generated result goes stale.
+;;; A load that already ran clang over HEADER knows them (see CimportHeaderMemo):
+;;; a `:probe-only` cimport's fold lists them, and that was a `clang -M` per cimport.
+(defn cimport-deps [(a (dyn Allocator)) (header (slice u8)) (flags (slice u8))] (-> (Result (ptr (ArrayList (slice u8)))
+                                                                                             (slice u8)))
+  (try
+   (let [flags (try! (clang-flags a flags))
+         abs (abspath a header)
+         memo (header-memo a abs flags)]
+     (match (if (header-memo? memo) (.deps memo) (None [(ptr (ArrayList (slice u8)))]))
+       (Some [known]
+         (let [deps (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))]
+           (for path (load known) (push! deps path))
+           (Ok deps)))
+       (None []
+         (let [input (try! (include-source a abs "deps-input"))
+               out (tmp-path a "deps")
+               err (tmp-path a "deps-err")
+               cmd (cat3 a
+                         (cat3 a "clang -M -MT coil-cimport -x c" flags " '")
+                         (cat3 a input "' -MF '" out)
+                         (cat3 a "' > /dev/null 2> '" err "'"))]
+           (if (!= (run-cmd a cmd) (: 0 i32))
+               (Err (cat a "clang could not list the header's dependencies:\n" (trim (try! (slurp a (s->cstr a err))))))
+               (let [deps (try! (depfile-inputs a out input))]
+                 (memo-note-deps! memo deps)
+                 (Ok deps)))))))))
+
+;;; The flags that make a clang run also write the files it reads to DEPFILE.
+(defn depfile-flags [(a (dyn Allocator)) (depfile (slice u8))] (-> (slice u8))
+  (cat3 a " -MD -MT coil-cimport -MF '" depfile "'"))
+
+;;; What clang read for INPUT, from the DEPFILE it wrote: its prerequisites minus
+;;; INPUT itself, which is a scratch file of this run (or /dev/null).
+(defn depfile-inputs [(a (dyn Allocator)) (depfile (slice u8)) (input (slice u8))] (-> (Result (ptr (ArrayList (slice u8)))
+                                                                                                 (slice u8)))
+  (try
+   (let [all (depfile-prerequisites a (try! (slurp a (s->cstr a depfile))))
+         deps (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))]
+     (for path (load all) (unless (= path input) (push! deps path)))
+     (Ok deps))))
+
+;;; clang -dM macro dump of the translation unit INPUT (a wrapper including a
+;;; header, or /dev/null for the predefined macros alone).
+(defn dump-macros-of [(a (dyn Allocator))
+                      (input (slice u8))
+                      (tag (slice u8))
+                      (flags (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (let [out (tmp-path a tag)
+        err (tmp-path a (cat a tag "-err"))
+        cmd (cat3 a
+                  (cat3 a "clang -dM -E -x c" flags " '")
+                  (cat3 a input "' > '" out)
+                  (cat3 a "' 2> '" err "'"))]
+    (if (!= (run-cmd a cmd) (: 0 i32))
+        (match (slurp a (s->cstr a err))
+          (Err [e] (Err e))
+          (Ok [detail]
+              (Err (cat a "clang could not list the header's macros:\n" (trim detail)))))
+        (slurp a (s->cstr a out)))))
+
+;;; The `-dM` dump of INPUT, the wrapper including MEMO's header: dumped once per
+;;; load (see CimportHeaderMemo).
+(defn header-macros [(a (dyn Allocator))
+                     (memo (ptr CimportHeaderMemo))
+                     (input (slice u8))
+                     (flags (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (try
+   (match (if (header-memo? memo) (.macros memo) (None [(slice u8)]))
+     (Some [text] (Ok text))
+     (None []
+       (let [text (try! (dump-macros-of a input "hdr" flags))]
+         (when (header-memo? memo)
+           (set! (.macros memo) (Some (cat (memo-allocator) text "")))
+           0)
+         (Ok text))))))
+
+;;; The JSON AST of INPUT, the wrapper including MEMO's header, parsed into A, also
+;;; pushing onto DEPS every file the dump read. Dumped once per load (see
+;;; CimportHeaderMemo); each cimport parses its own copy, since generating from one
+;;; names its anonymous records in place.
+(defn header-ast [(a (dyn Allocator))
+                  (memo (ptr CimportHeaderMemo))
+                  (input (slice u8))
+                  (flags (slice u8))
+                  (deps (ptr (ArrayList (slice u8))))] (-> (Result Json (slice u8)))
+  (try
+   (match (if (header-memo? memo) (.ast memo) (None [(slice u8)]))
+     (Some [text]
+       (match (.deps memo)
+         (Some [known] (for path (load known) (push! deps path)))
+         (None [] 0))
+       (Ok (json-parse a text)))
+     (None []
+       (let [depfile (tmp-path a "ast-deps")
+             text (try! (run-clang-ast-text a input (cat a flags (depfile-flags a depfile))))
+             read (try! (depfile-inputs a depfile input))]
+         (for path (load read) (push! deps path))
+         (when (header-memo? memo)
+           (memo-note-deps! memo read)
+           (set! (.ast memo) (Some (cat (memo-allocator) text "")))
+           0)
+         (Ok (json-parse a text)))))))
+
+;;; The macros an empty translation unit predefines under FLAGS: what a header's
+;;; own dump is read against. It depends on nothing but the flags, the working
+;;; directory they resolve in and whatever files they force in (`-include`), so a
+;;; process keeps it per flags and directory while those files are unchanged; it
+;;; was one clang run per cimport.
+(defn baseline-macros [(a (dyn Allocator)) (flags (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (try
+   (let [cell (cimport-process)
+         key (cat3 a (abspath a ".") "\n" flags)]
+     (match (get (.baselines cell) key)
+       (Some [memo] (if (cimport-inputs-fresh? a (.inputs memo))
+                        (Ok (.text memo))
+                        (baseline-macros-run a cell key flags)))
+       (None [] (baseline-macros-run a cell key flags))))))
+
+(defn baseline-macros-run [(a (dyn Allocator))
+                           (cell (ptr CimportProcess))
+                           (key (slice u8))
+                           (flags (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (try
+     (let [depfile (tmp-path a "base-deps")
+           text (try! (dump-macros-of a "/dev/null" "base" (cat a flags (depfile-flags a depfile))))
+           deps (try! (depfile-inputs a depfile "/dev/null"))]
+       (match (cimport-inputs a deps)
+         (None [] (Ok text))
+         (Some [inputs]
+             (let [m (malloc-allocator)]
+               (match (get (.baselines cell) key)
+                 (Some [old]
+                     (free [u8] m (.text old))
+                     (cimport-inputs-free! (.inputs old)))
+                 (None [] 0))
+               (set! (mut (.baselines cell)) key (CimportMemo :text (cat m text "") :inputs inputs))
+               (Ok text)))))))
+
+; ============================ line iteration ===============================
+(defn each-line [(a (dyn Allocator)) (text (slice u8))] (-> (ptr (ArrayList (slice u8))))
+  (let [lines (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))
+        n (len text)
+        (mut start) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (when (= (get text (load i)) (: 10 u8))
+                  (push! [(slice u8)]
+                         lines
+                         (subslice [u8] text (load start) (load i)))
+                  (store! start (primitive/iadd (load i) 1)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (unless (> (load start) (load i))
+      (when (< (load start) n)
+        (push! [(slice u8)] lines (subslice [u8] text (load start) n))))
+    lines))
+
+; ============================ driver =======================================
+(defn same-file [(file (slice u8)) (header (slice u8))] (-> bool)
+  (or (= file header) (= (basename file) (basename header))))
+
+(defn contains-str? [(hay (slice u8)) (needle (slice u8))] (-> bool)
+  (match (find hay needle) (Some [_] true) (None [] false)))
+
+; A system/SDK/toolchain header (by path) whose decls we DON'T emit — vs the
+; target header + the project's own (e.g. -I…) includes, which we DO emit. This
+; is what lets a wrapper header (`#include "dispextern.h"` with the build's -I/-D)
+; bring the project's structs through, while <stdio.h> etc. stay out.
+(defn sys-path? [(f (slice u8))] (-> bool)
+  (or (contains-str? f "/usr/")
+      (or (contains-str? f ".sdk")
+          (or (contains-str? f "/src/stdlib/clang")
+              (or (contains-str? f "/Library/Developer")
+                  (contains-str? f "/Applications/Xcode"))))))
+
+; Emit a decl from file `f` if it's the target header OR a non-system header.
+(defn emit-file? [(f (slice u8)) (header (slice u8))] (-> bool)
+  (or (same-file f header) (not (sys-path? f))))
+
+; Which file included which, from clang's `includedFrom` on each file's first
+; declaration. Collected before emission because a header's first declaration
+; can follow those of the headers it includes.
+(defn collect-includers [(a (dyn Allocator)) (top (ArrayList Json))]
+  (-> (ptr (HashMap (slice u8) (slice u8))))
+  (let [m (box! a (HashMap (slice u8) (slice u8)) (HashMap::new [(slice u8) (slice u8)] a (keyops)))]
+    (for d (iter top)
+      (let [loc (jget d "loc")]
+        (match (jgets loc "file")
+          (Some [f]
+                (match (jgets (jget loc "includedFrom") "file")
+                  (Some [g] (set! m f g))
+                  (None [] 0)))
+          (None [] 0))))
+    m))
+
+; A system header is often a thin wrapper: macOS <stdlib.h> declares qsort and
+; abs in <_stdlib.h>, which it includes. So a file reached from the requested
+; header through system headers only is part of the requested API. A project
+; header's own system includes stay out: their includer is not a system header.
+(defn header-scope? [(includers (ptr (HashMap (slice u8) (slice u8))))
+                     (header (slice u8))
+                     (f (slice u8))] (-> bool)
+  (let [(mut at) f
+        (mut depth) 0]
+    (loop
+      (cond (same-file at header) (break true)
+            (> depth 64) (break false)
+            :else
+              (match (get includers at)
+                (Some [g]
+                      (if (sys-path? g)
+                          (do (set! at g) (set! depth (+ depth 1)) (continue))
+                          (break false)))
+                (None [] (break false)))))))
+
+(defn selected-name? [(names (ptr (ArrayList (slice u8))))
+                      (selecting bool)
+                      (name (slice u8))] (-> bool)
+  (if (not selecting)
+      true
+      (let [(mut i) 0
+            n (len (load names))
+            (mut found) false]
+        (loop (if (or (>= (load i) n) (load found))
+                  (break)
+                  (do
+                    (when (= (get (load names) (load i)) name)
+                      (store! found true)
+                      0)
+                    (set! i (primitive/iadd (load i) 1)))))
+        (load found))))
+
+; A forward declaration has no layout to lower, but it still introduces a real C
+; type that may appear behind pointers in the declarations we emit.  Retain that
+; nominal identity as an empty Coil struct only when Clang did not also give us a
+; complete definition.  (Headers commonly forward-declare a record before defining
+; it, and emitting the placeholder in that case would hide the real fields.)
+;;; `typedef struct { … } div_t;` declares a record with no name and a typedef
+;;; that owns it. Name each such record after its typedef, so the struct is
+;;; emitted under the name the header's functions use.
+(defn name-anonymous-records! [(a (dyn Allocator)) (top (ArrayList Json))] (-> i64)
+  (let [owners
+          (box! a (HashMap (slice u8) (slice u8)) (HashMap::new [(slice u8) (slice u8)] a (keyops)))]
+    (for d (iter top)
+      (when (= (jkind d) "TypedefDecl")
+        (match (jinner d)
+          (Some [inner]
+                (for t (iter (load inner))
+                  ; Clang 22 puts ownership on RecordType; Clang 21 puts
+                  ; the owned declaration on its ElaboratedType wrapper.
+                  (let [decl (if (and (= (jkind t) "RecordType")
+                                     (jbool-true? t "isTagOwned"))
+                                 (jget t "decl")
+                                 (jget t "ownedTagDecl"))]
+                    (when (and (= (jkind decl) "RecordDecl")
+                               (= (jstr-or (jgets decl "name") "") ""))
+                      (match (jgets decl "id")
+                        (Some [id] (do (set! owners id (jname d)) 0))
+                        (None [] 0))))))
+          (None [] 0))))
+    (for d (iter top)
+      (when (and (= (jkind d) "RecordDecl") (= (jstr-or (jgets d "name") "") ""))
+        (match (jgets d "id")
+          (Some [id]
+                (match (get owners id)
+                  (Some [name]
+                        (match d
+                          (JObj [o]
+                                (do (set! o "name" (JStr name))
+                                    (set! o "coilTypedefName" (JBool 1))
+                                    0))
+                          (_ 0)))
+                  (None [] 0)))
+          (None [] 0))))
+    0))
+
+;;; A record the caller did not select is held back: it is emitted only if an
+;;; emitted declaration needs it (see emit-needed-records!).
+(defn record-out! [(structs (mut StrBuf))
+                   (deferred (ptr (HashMap (slice u8) (slice u8))))
+                   (defer? bool)
+                   (name (slice u8))
+                   (text (slice u8))] (-> i64)
+  (if defer?
+      (do (set! deferred name text) 0)
+      (do (push-str! (mut structs) text) 0)))
+
+(defn name-byte? [(c u8)] (-> bool)
+  (let [n (cast i64 c)]
+    (not (or (= n 32) (= n 40) (= n 41) (= n 91) (= n 93) (= n 10)))))
+
+;;; Whether `text` mentions `name` as a whole token.
+(defn mentions-name? [(text (slice u8)) (name (slice u8))] (-> bool)
+  (let [n (len text)
+        m (len name)
+        (mut i) 0]
+    (loop
+      (cond (> (+ i m) n) (break false)
+            (and (= (subslice [u8] text i (+ i m)) name)
+                 (or (= i 0) (not (name-byte? (get text (- i 1)))))
+                 (or (= (+ i m) n) (not (name-byte? (get text (+ i m))))))
+              (break true)
+            :else (do (set! i (+ i 1)) (continue))))))
+
+;;; Emit every deferred record that the emitted structs and externs mention,
+;;; to a fixpoint: a selected `stat` pulls in the `timespec` its fields use.
+(defn emit-needed-records! [(a (dyn Allocator))
+                            (structs (mut StrBuf))
+                            (deferred (ptr (HashMap (slice u8) (slice u8))))
+                            (externs (slice u8))] (-> i64)
+  (let [(mut changed) true]
+    (while (load changed)
+      (set! changed false)
+      (let [text (cat a (str (load structs)) externs)
+            (mut found) (ArrayList::new [(slice u8)] a)]
+        (for name (iter deferred)
+          (when (mentions-name? text name) (push! (mut found) name)))
+        (for name (iter found)
+          (match (get deferred name)
+            (Some [t]
+                  (do
+                    (push-str! (mut structs) t)
+                    (remove! deferred name)
+                    (set! changed true)
+                    0))
+            (None [] 0))))))
+  0)
+
+(defn collect-complete-records [(a (dyn Allocator))
+                                (top (ArrayList Json))] (-> (ptr (HashMap (slice u8)
+                                                                          i64)))
+  (let [out
+          (box! a
+                (HashMap (slice u8) i64)
+                (HashMap::new [(slice u8) i64] a (keyops)))
+        (mut i) 0
+        n (len top)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [d (get top (load i))]
+                  (when (and (= (jkind d) "RecordDecl")
+                             (jbool-true? d "completeDefinition"))
+                    (match (jgets d "name")
+                      (Some [name] (do (set! out name 1) 0))
+                      (None [] 0)))
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    out))
+
+(defn cimport-header-use [(a (dyn Allocator))
+                          (header (slice u8))
+                          (flags (slice u8))
+                          (names (ptr (ArrayList (slice u8))))
+                          (selecting bool)] (-> (Result (slice u8) (slice u8)))
+  (cimport-header-generate a
+                           header
+                           flags
+                           names
+                           selecting
+                           (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))))
+
+;;; `cimport-header-use`, also pushing onto DEPS every file clang read to generate
+;;; the bindings: what they are generated from, so a caller that records their
+;;; digests knows when the bindings go stale. The AST run lists them as it reads
+;;; them; a separate `clang -M` was one more process per cimport.
+(defn cimport-header-generate [(a (dyn Allocator))
+                               (header (slice u8))
+                               (flags (slice u8))
+                               (names (ptr (ArrayList (slice u8))))
+                               (selecting bool)
+                               (deps (ptr (ArrayList (slice u8))))] (-> (Result (slice u8) (slice u8)))
+  (try
+   (let [flags (try! (clang-flags a flags))
+        abs (abspath a header)
+        memo (header-memo a abs flags)
+        input (try! (include-source a abs "input"))
+        base-macros (try! (baseline-macros a flags))
+        header-macros (try! (header-macros a memo input flags))]
+    (match (header-ast a memo input flags deps)
+      (Err [e] (Err e))
+      (Ok [ast]
+          (let [top
+                  (match (jinner ast)
+                    (Some [t] t)
+                    (None [] (box! a (ArrayList Json) (ArrayList::new [Json] a))))
+                tdefs
+                  (box! a
+                        (HashMap (slice u8) (slice u8))
+                        (HashMap::new [(slice u8) (slice u8)] a (keyops)))
+                enms
+                  (box! a
+                        (HashMap (slice u8) (slice u8))
+                        (HashMap::new [(slice u8) (slice u8)] a (keyops)))
+                complete-records
+                  (do
+                    (name-anonymous-records! a (load top))
+                    (collect-complete-records a (load top)))
+                ctx (primitive/alloc-stack Ctx)]
+            (set! (.typedefs ctx) tdefs)
+            (set! (.enums ctx) enms)
+            (collect-types a (load top) ctx)
+            (seed-predefined-typedefs a base-macros ctx)
+            (let [layouts (try! (opaque-record-layouts a header flags top ctx))
+                  (mut structs) (StrBuf::new a)
+                  (mut externs) (StrBuf::new a)
+                  (mut consts) (StrBuf::new a)
+                  (mut skipped) (ArrayList::new [(slice u8)] a)
+                  seen
+                    (box! a
+                          (HashMap (slice u8) i64)
+                          (HashMap::new [(slice u8) i64] a (keyops)))
+                  (mut from-header) false
+                  includers (collect-includers a (load top))
+                  deferred
+                    (box! a
+                          (HashMap (slice u8) (slice u8))
+                          (HashMap::new [(slice u8) (slice u8)] a (keyops)))
+                  (mut i) 0
+                  n (len (load top))]
+              (loop (if (>= (load i) n)
+                        (break)
+                        (let [d (get (load top) (load i))]
+                          (match (jgets (jget d "loc") "file")
+                            (Some [f]
+                                  (do
+                                    (set! from-header
+                                          (or (emit-file? f header)
+                                              (header-scope? includers header f)))
+                                    0))
+                            (None [] 0))
+                          ; Records from included system headers are ABI dependencies of
+                          ; public typedefs (pthread and socket headers rely on this).
+                          ; Other declaration kinds remain scoped to the requested
+                          ; header's API (see header-scope?) or the project's headers,
+                          ; unless selected by name, so cimport does not expose an
+                          ; entire SDK API.
+                          (let [k (jkind d)]
+                            (unless (or (and (not (load from-header))
+                                             (not (= k "RecordDecl"))
+                                             ; A name the caller selected is
+                                             ; wanted wherever it is declared.
+                                             (not (and selecting
+                                                       (selected-name? names
+                                                                       selecting
+                                                                       (jname d)))))
+                                        (and (= k "FunctionDecl")
+                                             (not (selected-name? names
+                                                                  selecting
+                                                                  (jname d))))
+                                        ; an enum is wanted for its own name or for
+                                        ; any enumerator the caller selected
+                                        (and (= k "EnumDecl")
+                                             (not (selected-name? names selecting (jname d)))
+                                             (not (enum-selects? d names))))
+                              (cond (= k "FunctionDecl")
+                                      (let [key (cat a "fn:" (jname d))]
+                                        (match (get (load seen) key)
+                                          (Some [_] 0)
+                                          (None []
+                                                (do
+                                                  (set! seen key 1)
+                                                  (match (function-extern a
+                                                                          d
+                                                                          ctx)
+                                                    (Ok [s]
+                                                        (push-str! (mut externs)
+                                                                   s))
+                                                    (Err [why]
+                                                         (push! [(slice u8)]
+                                                                (mut skipped)
+                                                                (cat3 a
+                                                                      "fn "
+                                                                      (jname d)
+                                                                      (cat a
+                                                                           " — "
+                                                                           why)))))))))
+                                    (= k "RecordDecl")
+                                      (match (record-defstruct a d ctx)
+                                        (Ok [opt]
+                                            (match opt
+                                              (Some [s]
+                                                    (let [key
+                                                            (cat a
+                                                                 "struct:"
+                                                                 (jname d))]
+                                                      (match (get (load seen)
+                                                                  key)
+                                                        (Some [_] 0)
+                                                        (None []
+                                                              (do
+                                                                (set! seen
+                                                                      key
+                                                                      1)
+                                                                (record-out! (mut structs) deferred (and selecting (not (selected-name? names selecting (jname d)))) (jname d)
+                                                                              s))))))
+                                              (None []
+                                                    (match (get (load complete-records)
+                                                                (jname d))
+                                                      (Some [_] 0)
+                                                      (None []
+                                                            (let [key
+                                                                    (cat a
+                                                                         "struct:"
+                                                                         (jname d))]
+                                                              (match (get (load seen)
+                                                                          key)
+                                                                (Some [_] 0)
+                                                                (None []
+                                                                      (do
+                                                                        (set! seen
+                                                                              key
+                                                                              1)
+                                                                        (record-out! (mut structs) deferred (and selecting (not (selected-name? names selecting (jname d)))) (jname d)
+                                                                                      (cat3 a
+                                                                                            "(defstruct "
+                                                                                            (jname d)
+                                                                                            " [])\n")))))))))))
+                                        (Err [why]
+                                             (let [key
+                                                     (cat a "struct:" (jname d))]
+                                               (match (get (load seen) key)
+                                                 (Some [_] 0)
+                                                 (None []
+                                                       (do
+                                                         (set! seen key 1)
+                                                         (let [opaque
+                                                                 (opaque-record-defstruct a
+                                                                                          layouts
+                                                                                          d)]
+                                                           (if (> (len opaque)
+                                                                  0)
+                                                               (record-out! (mut structs) deferred (and selecting (not (selected-name? names selecting (jname d)))) (jname d)
+                                                                             opaque)
+                                                               (unless (and selecting
+                                                                            (not (selected-name? names
+                                                                                                 selecting
+                                                                                                 (jname d))))
+                                                                (push! [(slice u8)]
+                                                                      (mut skipped)
+                                                                      (cat3 a
+                                                                            "struct "
+                                                                            (jname d)
+                                                                            (cat a
+                                                                                 " — "
+                                                                                 why))))))))))))
+                                    (= k "EnumDecl")
+                                      (match (enum-consts a
+                                                          d
+                                                          seen
+                                                          names
+                                                          (and selecting
+                                                               (not (selected-name? names selecting (jname d)))))
+                                        (Ok [s] (push-str! (mut consts) s))
+                                        (Err [why]
+                                             (push! [(slice u8)]
+                                                    (mut skipped)
+                                                    (cat3 a
+                                                          "enum "
+                                                          (jname d)
+                                                          (cat a " — " why)))))
+                                    :else 0)))
+                          (set! i (primitive/iadd (load i) 1)))))
+              (emit-needed-records! a (mut structs) deferred (str (load externs)))
+              ; #define pass
+              (let [baseline (each-line a base-macros)
+                    bset
+                      (box! a
+                            (HashMap (slice u8) i64)
+                            (HashMap::new [(slice u8) i64] a (keyops)))]
+                (let [(mut bi) 0
+                      bn (len (load baseline))]
+                  (loop (if (>= (load bi) bn)
+                            (break)
+                            (do
+                              (match (parse-define (get (load baseline)
+                                                        (load bi)))
+                                (Some [d] (do (set! bset (def-name d) 1) 0))
+                                (None [] 0))
+                              (set! bi (primitive/iadd (load bi) 1))))))
+                (let [hlines (each-line a header-macros)
+                      (mut defs) (ArrayList::new [Define] a)
+                      (mut pdefs) (ArrayList::new [Define] a)]
+                  (let [(mut unfolded) (ArrayList::new [(slice u8)] a)
+                        (mut hi) 0
+                        hn (len (load hlines))]
+                    (loop (if (>= (load hi) hn)
+                              (break)
+                              (do
+                                (match (parse-define (get (load hlines)
+                                                          (load hi)))
+                                  (Some [d]
+                                        (when (selected-name? names
+                                                              selecting
+                                                              (def-name d))
+                                          (match (get (load bset) (def-name d))
+                                            (Some [_] 0)
+                                            (None []
+                                                  (match (c-literal a
+                                                                    (def-body d))
+                                                    (Some [v]
+                                                          (push! [Define]
+                                                                 (mut defs)
+                                                                 (mk-define (def-name d)
+                                                                            v)))
+                                                    (None []
+                                                          ; Clang, not a handwritten C evaluator, resolves aliases,
+                                                          ; casts and integer expressions from real system headers.
+                                                          ; Folded together below.
+                                                          (push! (mut unfolded) (def-name d))))))))
+                                  (None [] 0))
+                                (set! hi (primitive/iadd (load hi) 1)))))
+                    ; Each one's C type decides how it binds (macro-kind): an integer
+                    ; folds to a const, a pointer to a typed def. Folding every one as
+                    ; an integer made SIG_IGN `(const SIG_IGN 1)`, which no `signal`
+                    ; call accepts.
+                    (let [types (try! (type-batch a abs flags (mut unfolded)))
+                          (mut ints) (ArrayList::new [(slice u8)] a)
+                          (mut ptrs) (ArrayList::new [(slice u8)] a)
+                          (mut ptr-types) (ArrayList::new [(slice u8)] a)]
+                      (for k (range 0 (len unfolded))
+                        (let [name (get unfolded k)]
+                          (match (get (load types) k)
+                            ; clang gave it no type a member can have: the fold
+                            ; decides, as it did for every macro before
+                            (None [] (push! (mut ints) name))
+                            (Some [cty]
+                                  (match (macro-kind a cty ctx)
+                                    (MacroInt [] (push! (mut ints) name))
+                                    (MacroPtr [coil]
+                                              (do (push! (mut ptrs) name)
+                                                  (push! (mut ptr-types) coil)))
+                                    (MacroSkip [why]
+                                               (push! [(slice u8)]
+                                                      (mut skipped)
+                                                      (cat3 a "macro " name (cat a " — " why)))))))))
+                      (let [values (try! (fold-batch a abs flags (mut ints)))]
+                        (for k (range 0 (len ints))
+                          (match (get (load values) k)
+                            (Some [v] (push! [Define] (mut defs) (mk-define (get ints k) (i64->dec a v))))
+                            (None [] 0))))
+                      (let [addresses (try! (fold-batch a abs flags (mut ptrs)))]
+                        (for k (range 0 (len ptrs))
+                          (match (get (load addresses) k)
+                            (Some [v]
+                                  (push! [Define]
+                                         (mut pdefs)
+                                         (mk-define (get ptrs k)
+                                                    ; an integer casts to a pointer; a
+                                                    ; function pointer is cast from one
+                                                    (if (starts-with (get ptr-types k) "(fnptr")
+                                                        (cat3 a
+                                                              (cat3 a "(cast " (get ptr-types k) " (cast (ptr i8) ")
+                                                              (i64->dec a v)
+                                                              "))")
+                                                        (cat3 a
+                                                              (cat3 a "(cast " (get ptr-types k) " ")
+                                                              (i64->dec a v)
+                                                              ")")))))
+                            (None []
+                                  (push! [(slice u8)]
+                                         (mut skipped)
+                                         (cat3 a "macro " (get ptrs k) " — a pointer that is not a constant address"))))))))
+                  (sort-defines (mut defs))
+                  (sort-defines (mut pdefs))
+                  (for d (load pdefs)
+                    (let [key (cat a "const:" (def-name d))]
+                      (match (get (load seen) key)
+                        (Some [_] 0)
+                        (None []
+                              (do
+                                (set! seen key 1)
+                                (push-str! (mut consts)
+                                           (cat3 a
+                                                 (cat3 a "(def " (def-name d) " ")
+                                                 (def-body d)
+                                                 ")\n")))))))
+                  (let [(mut di) 0
+                        dn (len (load defs))]
+                    (loop (if (>= (load di) dn)
+                              (break)
+                              (let [d (get (load defs) (load di))
+                                    key (cat a "const:" (def-name d))]
+                                (match (get (load seen) key)
+                                  (Some [_] 0)
+                                  (None []
+                                        (do
+                                          (set! seen key 1)
+                                          (push-str! (mut consts)
+                                                     (cat3 a
+                                                           (cat3 a
+                                                                 "(const "
+                                                                 (def-name d)
+                                                                 " ")
+                                                           (def-body d)
+                                                           ")\n")))))
+                                (set! di (primitive/iadd (load di) 1)))))))
+                ; assemble output
+                (let [(mut body) (StrBuf::new a)]
+                  (push-str! (mut body)
+                             (cat3 a
+                                   "; Generated by `coil cimport "
+                                   header
+                                   "` — DO NOT EDIT.\n"))
+                  (push-str! (mut body)
+                             "; A clang-parsed C binding (real header import). Audit before trusting the ABI.\n")
+                  (push-str! (mut body) "(module cbindings)\n(import \"coil.layout\")\n\n")
+                  (let [ns (len (load skipped))]
+                    (when (> ns 0)
+                      (push-str! (mut body)
+                                 "; SKIPPED (unmappable — left out rather than emit a wrong binding):\n")
+                      (let [(mut si) 0]
+                        (loop (if (>= (load si) ns)
+                                  (break)
+                                  (do
+                                    (push-str! (mut body)
+                                               (cat3 a
+                                                     ";   "
+                                                     (get (load skipped)
+                                                          (load si))
+                                                     "\n"))
+                                    (store! si (primitive/iadd (load si) 1))))))
+                      (push-str! (mut body) "\n")))
+                  (let [cs (str (load consts))]
+                    (do
+                      (push-str! (mut body) cs)
+                      (when (> (len cs) 0)
+                        (push-str! (mut body) "\n"))))
+                  (let [ss (str (load structs))]
+                    (do
+                      (push-str! (mut body) ss)
+                      (when (> (len ss) 0)
+                        (push-str! (mut body) "\n"))))
+                  (push-str! (mut body) (str (load externs)))
+                  ; surface skips on stderr too (not part of the file)
+                  (let [ns (len (load skipped))
+                        (mut si) 0]
+                    (loop (if (>= (load si) ns)
+                              (break)
+                              (do
+                                (ewrite (cat3 a
+                                              "cimport: SKIPPED (unmappable) — "
+                                              (get (load skipped) (load si))
+                                              "\n"))
+                                (set! si (primitive/iadd (load si) 1))))))
+                  (Ok (str (load body))))))))))))
+
+(defn cimport-header [(a (dyn Allocator))
+                      (header (slice u8))
+                      (flags (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (cimport-header-use a
+                      header
+                      flags
+                      (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))
+                      false))
+
+(defn def-name [(d Define)] (-> (slice u8))
+  (let [p (primitive/alloc-stack Define)] (set! p d) (.name p)))
+
+(defn def-body [(d Define)] (-> (slice u8))
+  (let [p (primitive/alloc-stack Define)] (set! p d) (.body p)))
+
+(defn mk-define [(name (slice u8)) (body (slice u8))] (-> Define)
+  (let [d (primitive/alloc-stack Define)]
+    (set! (.name d) name)
+    (set! (.body d) body)
+    (load d)))
+
+; insertion sort by (name, body), lexicographic's sort+dedup.
+(defn sort-defines [(defs (mut (ArrayList Define)))] (-> i64)
+  (let [n (len (load defs))
+        (mut i) 1]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [(mut j) (load i)]
+                (loop (if (<= (load j) 0)
+                          (break)
+                          (let [aD (get (load defs) (primitive/isub (load j) 1))
+                                bD (get (load defs) (load j))]
+                            (if (define-lt bD aD)
+                                (do
+                                  (set! (mut defs)
+                                        (primitive/isub (load j) 1)
+                                        bD)
+                                  (set! (mut defs) (load j) aD)
+                                  (set! j (primitive/isub (load j) 1)))
+                                (break)))))
+                (set! i (primitive/iadd (load i) 1)))))
+    0))
+
+(defn define-lt [(x Define) (y Define)] (-> bool)
+  (let [c (cmp (def-name x) (def-name y))]
+    (if (< c 0)
+        true
+        (if (> c 0)
+            false
+            (< (cmp (def-body x) (def-body y))
+               0)))))
+
+; Generate bindings for `header` → write to `out` file (Some) or stdout (None).
+; ============================ probe (compute ABI VALUES) ====================
+; The toolchain as a value oracle: evaluate C integer expressions / bitfield
+; positions with the REAL flags, emit each as a `(const …)`. Tiers, cheapest first:
+;   0 = expression: fold via `enum … : long long { n = (long long)(EXPR) }` read
+;       from the AST (no link); if it isn't constant, compile+link+run a printf.
+;   1 = bitfield:   clang -fdump-record-layouts gives byte:startbit-endbit.
+(defstruct Probe
+  [(name (slice u8))
+   (kind i64)
+   (expr (slice u8))
+   (sname (slice u8))
+   (fname (slice u8))])
+
+(defn probe-list-new [(a (dyn Allocator))] (-> (ptr (ArrayList Probe)))
+  (box! a (ArrayList Probe) (ArrayList::new [Probe] a)))
+
+(defn probe-push! [(a (dyn Allocator))
+                   (lst (ptr (ArrayList Probe)))
+                   (name (slice u8))
+                   (kind i64)
+                   (expr (slice u8))
+                   (sname (slice u8))
+                   (fname (slice u8))] (-> i64)
+  (let [p (primitive/alloc-stack Probe)]
+    (set! (.name p) name)
+    (set! (.kind p) kind)
+    (set! (.expr p) expr)
+    (set! (.sname p) sname)
+    (set! (.fname p) fname)
+    (push! [Probe] lst (load p))
+    0))
+
+(defn pget [(p Probe) (which i64)] (-> (slice u8))
+  (let [q (primitive/alloc-stack Probe)]
+    (set! q p)
+    (cond (= which 0) (load (field q name))
+          (= which 1) (load (field q expr))
+          (= which 2) (load (field q sname))
+          :else (load (field q fname)))))
+
+(defn pkind [(p Probe)] (-> i64)
+  (let [q (primitive/alloc-stack Probe)] (set! q p) (.kind q)))
+
+(defn abspath [(a (dyn Allocator)) (header (slice u8))] (-> (slice u8))
+  (let [buf (primitive/cast (ptr i8) (primitive/alloc-stack (array u8 4096)))
+        r (realpath-rooted (s->cstr a header) buf)]
+    (if (= (primitive/cast i64 r) 0)
+        header
+        (cat a (from-cstr r) ""))))
+
+; put every EnumConstantDecl's folded value into `m` (used for the probe enum).
+(defn ee-one [(a (dyn Allocator)) (d Json) (m (ptr (HashMap (slice u8) i64)))] (-> i64)
+  (unless (not (= (jkind d) "EnumDecl"))
+    (match (jinner d)
+      (None [] 0)
+      (Some [inner]
+            (let [(mut k) 0
+                  nk (len (load inner))]
+              (loop (if (>= (load k) nk)
+                        (break)
+                        (do
+                          (let [c (get (load inner) (load k))]
+                            (when (= (jkind c) "EnumConstantDecl")
+                              (let [v (enumerator-value c)]
+                                (when (!= v -9999999999)
+                                  (set! m (jname c) v)
+                                  0))))
+                          (store! k (primitive/iadd (load k) 1)))))
+              0)))))
+
+;;; The clang source lines an error diagnostic in `stderr` names in file `cf`.
+(defn fold-error-lines [(a (dyn Allocator)) (cf (slice u8)) (stderr (slice u8))] (-> (ptr (HashMap i64 bool)))
+  (let [lines (box! a (HashMap i64 bool) (HashMap::new-scalar [i64 bool] a))
+        prefix (cat a cf ":")]
+    (for line (load (each-line a stderr))
+      (when (and (starts-with line prefix) (contains-str? line ": error:"))
+        (let [rest (subslice line (len prefix) (len line))
+              (mut n) 0
+              (mut i) 0]
+          (while (and (< i (len rest))
+                      (>= (cast i64 (get rest i)) 48)
+                      (<= (cast i64 (get rest i)) 57))
+            (set! n (+ (* n 10) (- (cast i64 (get rest i)) 48)))
+            (set! i (+ i 1)))
+          (when (> i 0) (set! lines n true)))))
+    lines))
+
+;;; Fold every expression in `exprs` to an integer: the result maps an
+;;; expression's index to its value, and an index that did not fold is absent.
+;;; During a load each header keeps what its expressions folded to (see
+;;; CimportHeaderMemo), so only expressions it has not seen reach clang: imports of
+;;; one header with different `:use` lists, and its layout probes, ask for many of
+;;; the same ones.
+(defn fold-batch [(a (dyn Allocator))
+                  (abs (slice u8))
+                  (flags (slice u8))
+                  (exprs (ptr (ArrayList (slice u8))))] (-> (Result (ptr (HashMap i64 i64)) (slice u8)))
+  (try
+   (let [memo (header-memo a abs flags)]
+     (if (not (header-memo? memo))
+         (Ok (.values (try! (fold-batch-run a abs flags exprs ""))))
+         (let [out (box! a (HashMap i64 i64) (HashMap::new-scalar [i64 i64] a))
+               (mut unknown) (ArrayList::new [(slice u8)] a)
+               (mut at) (ArrayList::new [i64] a)]
+           (for i (range 0 (len (load exprs)))
+             (let [e (get (load exprs) i)]
+               (match (get (.folds memo) e)
+                 (Some [known] (match known (Some [v] (set! out i v)) (None [] 0)))
+                 (None [] (push! (mut unknown) e) (push! (mut at) i)))))
+           (when (> (len unknown) 0)
+             (let [depfile (if (none? (.deps memo)) (tmp-path a "fold-deps") "")
+                   run (try! (fold-batch-run a abs flags (mut unknown) depfile))]
+               (for k (range 0 (len unknown))
+                 (let [v (get (load (.values run)) k)]
+                   (set! (mut (.folds memo)) (get unknown k) v)
+                   (match v (Some [x] (set! out (get at k) x)) (None [] 0))))
+               ; Only a run that compiled read the whole header; a header that does
+               ; not parse leaves its dependencies to `cimport-deps`, which fails.
+               (when (and (> (len depfile) 0) (.clean run))
+                 (match (depfile-inputs a depfile (.source run))
+                   (Ok [deps] (memo-note-deps! memo deps))
+                   (Err [_] 0)))
+               0))
+           (Ok out))))))
+
+;;; One `fold-batch` pass through clang: the values, the scratch translation unit it
+;;; compiled, and whether its last clang run compiled without error.
+(defstruct FoldRun [(values (ptr (HashMap i64 i64))) (source (slice u8)) (clean bool)])
+
+;;; Fold every expression in `exprs` with one clang run: each is one enumerator on
+;;; its own line. An expression that is not an integer constant (a string, a type,
+;;; an unknown name) fails only its own line; those lines are dropped and the rest
+;;; retried, so the pass takes a clang run or two however many expressions there
+;;; are. It used to be one clang run per macro -- 655 of them for <unistd.h>. Each
+;;; run also writes the files it read to DEPFILE, unless that is "".
+(defn fold-batch-run [(a (dyn Allocator))
+                      (abs (slice u8))
+                      (flags (slice u8))
+                      (exprs (ptr (ArrayList (slice u8))))
+                      (depfile (slice u8))] (-> (Result FoldRun (slice u8)))
+  (try
+   (let [out (box! a (HashMap i64 i64) (HashMap::new-scalar [i64 i64] a))
+        cf (tmp-path a "foldbatch")
+        run-flags (cat3 a
+                        flags
+                        " -ferror-limit=0 -Xclang -ast-dump-filter=__coilprobes"
+                        (if (> (len depfile) 0) (depfile-flags a depfile) ""))
+        (mut live) (ArrayList::new [i64] a)
+        (mut done) false
+        (mut clean) false]
+    (for i (range 0 (len (load exprs))) (push! (mut live) i))
+    (while (and (not done) (> (len live) 0))
+      (let [(mut sb) (StrBuf::new a)]
+        ; line 1: the include; line 2: the enum head; enumerator k on line 3 + k
+        (push-str! (mut sb) "#include \"")
+        (push-str! (mut sb) abs)
+        (push-str! (mut sb) "\"\nenum __coilprobes : long long {\n")
+        (for k (range 0 (len live))
+          (let [i (get live k)]
+            (push-str! (mut sb) "__v")
+            (push-str! (mut sb) (i64->dec a i))
+            (push-str! (mut sb) "=(long long)(")
+            (push-str! (mut sb) (get (load exprs) i))
+            (push-str! (mut sb) "),\n")))
+        (push-str! (mut sb) "};\n")
+        (try! (write-file a cf (str (load sb))))
+        ; Only the probe enum is dumped. The full AST of the header behind it is
+        ; what every other declaration costs, and a batch needs none of it: for
+        ; <mach/mach.h> that was 25 MB of JSON per batch, parsed and kept.
+        (match (run-clang-ast a cf run-flags)
+          (Ok [ast]
+              (let [m (box! a (HashMap (slice u8) i64) (HashMap::new [(slice u8) i64] a (keyops)))]
+                (ee-one a ast m)
+                (for i live
+                  (match (get (load m) (cat a "__v" (i64->dec a i)))
+                    (Some [v] (set! out i v))
+                    (None [] 0)))
+                (set! done true)
+                (set! clean true)))
+          (Err [detail]
+               (let [bad (fold-error-lines a cf detail)
+                     (mut kept) (ArrayList::new [i64] a)]
+                 (for k (range 0 (len live))
+                   (match (get (load bad) (+ k 3))
+                     (Some [_] 0)
+                     (None [] (push! (mut kept) (get live k)))))
+                 ; No error named one of our lines (the header itself does not
+                 ; parse with these flags): nothing here can fold.
+                 (if (= (len kept) (len live))
+                     (set! done true)
+                     (set! live kept)))))))
+    (Ok (FoldRun :values out :source cf :clean clean)))))
+
+; tier 0a: fold ONE expression via a single-member long-long enum; sentinel if it
+; isn't a constant expression (clang errors) → caller falls to tier 0b.
+(defn probe-fold-one [(a (dyn Allocator))
+                      (abs (slice u8))
+                      (flags (slice u8))
+                      (expr (slice u8))] (-> (Result i64 (slice u8)))
+  (let [(mut exprs) (ArrayList::new [(slice u8)] a)]
+    (push! (mut exprs) expr)
+    (match (fold-batch a abs flags (mut exprs))
+      (Err [e] (Err e))
+      (Ok [values] (Ok (match (get (load values) 0) (Some [x] x) (None [] -9999999999)))))))
+
+;;; The C type of every expression in `exprs`, as clang spells it with typedefs
+;;; seen through: the result maps an expression's index to its type, and an index
+;;; that has none is absent. Memoized per header as `fold-batch` is.
+(defn type-batch [(a (dyn Allocator))
+                  (abs (slice u8))
+                  (flags (slice u8))
+                  (exprs (ptr (ArrayList (slice u8))))] (-> (Result (ptr (HashMap i64 (slice u8))) (slice u8)))
+  (try
+   (let [memo (header-memo a abs flags)]
+     (if (not (header-memo? memo))
+         (Ok (try! (type-batch-run a abs flags exprs)))
+         (let [out (box! a (HashMap i64 (slice u8)) (HashMap::new-scalar [i64 (slice u8)] a))
+               (mut unknown) (ArrayList::new [(slice u8)] a)
+               (mut at) (ArrayList::new [i64] a)]
+           (for i (range 0 (len (load exprs)))
+             (let [e (get (load exprs) i)]
+               (match (get (.types memo) e)
+                 (Some [known] (match known (Some [t] (set! out i t)) (None [] 0)))
+                 (None [] (push! (mut unknown) e) (push! (mut at) i)))))
+           (when (> (len unknown) 0)
+             (let [m (memo-allocator)
+                   run (try! (type-batch-run a abs flags (mut unknown)))]
+               (for k (range 0 (len unknown))
+                 (match (get (load run) k)
+                   (Some [t]
+                     (do (set! (mut (.types memo)) (cat m (get unknown k) "") (Some (cat m t "")))
+                         (set! out (get at k) t)))
+                   (None []
+                     (set! (mut (.types memo)) (cat m (get unknown k) "") (None [(slice u8)])))))
+               0))
+           (Ok out))))))
+
+;;; One clang run of `type-batch`: each expression is the type of one member of a
+;;; probe struct, `__typeof__((E)) __tK;`, on its own line, so the whole batch is
+;;; one declaration the dump filter selects. A line clang rejects (not an
+;;; expression, or a type no member can have: a function, void, an incomplete
+;;; struct) is dropped and the rest retried, as `fold-batch-run` does.
+(defn type-batch-run [(a (dyn Allocator))
+                      (abs (slice u8))
+                      (flags (slice u8))
+                      (exprs (ptr (ArrayList (slice u8))))] (-> (Result (ptr (HashMap i64 (slice u8))) (slice u8)))
+  (try
+   (let [out (box! a (HashMap i64 (slice u8)) (HashMap::new-scalar [i64 (slice u8)] a))
+         cf (tmp-path a "typebatch")
+         run-flags (cat a flags " -ferror-limit=0 -Xclang -ast-dump-filter=__coilprobes")
+         (mut live) (ArrayList::new [i64] a)
+         (mut done) false]
+     (for i (range 0 (len (load exprs))) (push! (mut live) i))
+     (while (and (not done) (> (len live) 0))
+       (let [(mut sb) (StrBuf::new a)]
+         ; line 1: the include; line 2: the struct head; member k on line 3 + k
+         (push-str! (mut sb) "#include \"")
+         (push-str! (mut sb) abs)
+         (push-str! (mut sb) "\"\nstruct __coilprobes {\n")
+         (for k (range 0 (len live))
+           (let [i (get live k)]
+             (push-str! (mut sb) "__typeof__((")
+             (push-str! (mut sb) (get (load exprs) i))
+             (push-str! (mut sb) ")) __t")
+             (push-str! (mut sb) (i64->dec a i))
+             (push-str! (mut sb) ";\n")))
+         (push-str! (mut sb) "};\n")
+         (try! (write-file a cf (str (load sb))))
+         (match (run-clang-ast a cf run-flags)
+           (Ok [ast]
+               (do
+                 (match (jinner ast)
+                   (None [] 0)
+                   (Some [fields]
+                     (for f (load fields)
+                       (when (and (= (jkind f) "FieldDecl") (starts-with (jname f) "__t"))
+                         (let [ty (jget f "type")
+                               spelled (jstr-or (jgets ty "desugaredQualType")
+                                                (jstr-or (jgets ty "qualType") ""))
+                               i (parse-dec (subslice (jname f) 3 (len (jname f))))]
+                           (when (and (>= i 0) (> (len spelled) 0))
+                             (set! out i spelled)
+                             0))))))
+                 (set! done true)))
+           (Err [detail]
+                (let [bad (fold-error-lines a cf detail)
+                      (mut kept) (ArrayList::new [i64] a)]
+                  (for k (range 0 (len live))
+                    (match (get (load bad) (+ k 3))
+                      (Some [_] 0)
+                      (None [] (push! (mut kept) (get live k)))))
+                  (if (= (len kept) (len live))
+                      (set! done true)
+                      (set! live kept)))))))
+     (Ok out))))
+
+;;; What a macro whose value is not a literal binds as, by its C type: an integer
+;;; constant folded as before, a pointer (a function pointer included) as a typed
+;;; `def` built by casting its folded address, or nothing, with the reason.
+(defsum MacroKind
+  (MacroInt)
+  (MacroPtr [(coil-type (slice u8))])
+  (MacroSkip [(why (slice u8))]))
+
+(defn macro-kind [(a (dyn Allocator)) (cty (slice u8)) (ctx (ptr Ctx))] (-> MacroKind)
+  (match (parse-c-type a cty ctx 0)
+    (Err [e] (MacroSkip e))
+    (Ok [t]
+        (match (load t)
+          ; an integer, an enum, a bool: the fold decides (a struct value does
+          ; not fold, and is left out as before)
+          (CBase [c]
+                 (cond (or (= c "f32") (= c "f64"))
+                         (MacroSkip (cat3 a "a " cty " expression, not an integer constant"))
+                       (= c "void") (MacroSkip "a void expression, not a value")
+                       :else (MacroInt)))
+          (CPtr [_]
+                (match (render-ctype a t false)
+                  (Ok [coil] (MacroPtr coil))
+                  (Err [e] (MacroSkip e))))
+          (_ (MacroSkip (cat3 a "a value of type " cty ", not an integer or a pointer")))))))
+
+;;; A record's ABI size and alignment, as clang folded them.
+(defstruct RecordLayout [(size i64) (align i64)])
+
+;;; The C spelling of record D's type: `struct NAME`, `union NAME`, or the typedef
+;;; that names an untagged one.
+(defn record-c-type [(a (dyn Allocator)) (d Json)] (-> (slice u8))
+  ; A record with no tag of its own is named after the typedef that owns it
+  ; (name-anonymous-records!), and C reaches it only through that typedef:
+  ; `union __mbstate_t` names no type, so its layout never folded and the record
+  ; was skipped.
+  (if (jbool-true? d "coilTypedefName")
+      (jname d)
+      (cat a
+           (if (= (jstr-or (jgets d "tagUsed") "struct") "union") "union " "struct ")
+           (jname d))))
+
+;;; The size and alignment of every top-level record in TOP that record-defstruct
+;;; cannot lay out field by field, folded in ONE clang run for the whole header and
+;;; keyed by record name; a record whose size does not fold is absent. They were
+;;; folded one record at a time, and every run re-read the entire header: the Mach
+;;; headers have dozens of such records, so one cimport cost dozens of full parses.
+(defn opaque-record-layouts [(a (dyn Allocator))
+                             (header (slice u8))
+                             (flags (slice u8))
+                             (top (ptr (ArrayList Json)))
+                             (ctx (ptr Ctx))] (-> (Result (ptr (HashMap (slice u8) RecordLayout))
+                                                          (slice u8)))
+  (try
+   (let [out (box! a
+                   (HashMap (slice u8) RecordLayout)
+                   (HashMap::new [(slice u8) RecordLayout] a (keyops)))
+         queued (box! a (HashMap (slice u8) i64) (HashMap::new [(slice u8) i64] a (keyops)))
+         (mut names) (ArrayList::new [(slice u8)] a)
+         (mut exprs) (ArrayList::new [(slice u8)] a)]
+     (for d (load top)
+       (when (= (jkind d) "RecordDecl")
+         (match (record-defstruct a d ctx)
+           (Ok [_] 0)
+           (Err [_]
+                (match (get (load queued) (jname d))
+                  (Some [_] 0)
+                  (None []
+                        (let [cty (record-c-type a d)]
+                          (set! queued (jname d) 1)
+                          (push! (mut names) (jname d))
+                          (push! (mut exprs) (cat3 a "sizeof(" cty ")"))
+                          (push! (mut exprs) (cat3 a "_Alignof(" cty ")"))
+                          0)))))
+         0))
+     (when (> (len names) 0)
+       (let [values (try! (fold-batch a (abspath a header) flags (mut exprs)))]
+         (for [k 0 (len names)]
+           (match (get (load values) (* 2 k))
+             (None [] 0)
+             (Some [size]
+                   (match (get (load values) (+ (* 2 k) 1))
+                     (None [] 0)
+                     (Some [align]
+                           (do
+                             (set! out (get names k) (RecordLayout :size size :align align))
+                             0))))))
+         0))
+     (Ok out))))
+
+;;; Record D as an opaque `defstruct` of its folded size and alignment, or "" when
+;;; LAYOUTS has no positive size for it. When fields cannot be represented safely,
+;;; this keeps the C value's ABI storage but deliberately exposes no fields: the
+;;; caller-owned opaque-value contract needed by pthread types and by records
+;;; containing implementation-only members.
+(defn opaque-record-defstruct [(a (dyn Allocator))
+                               (layouts (ptr (HashMap (slice u8) RecordLayout)))
+                               (d Json)] (-> (slice u8))
+  (let [name (jname d)]
+    (match (get (load layouts) name)
+      (None [] "")
+      (Some [l]
+            (if (<= (.size l) 0)
+                ""
+                (cat3 a
+                      (cat3 a
+                            (cat3 a "(defstruct " name " :layout (coil.layout.Explicit) :size ")
+                            (i64->dec a (.size l))
+                            (cat3 a " :align " (i64->dec a (.align l)) " ["))
+                      ""
+                      "])\n"))))))
+
+; tier 0b: compile+link+run a printf of the expression (for non-constant values,
+; e.g. a global's link-time address). `link` = extra linker args (objects/libs).
+(defn probe-run [(a (dyn Allocator))
+                 (abs (slice u8))
+                 (flags (slice u8))
+                 (expr (slice u8))
+                 (link (slice u8))] (-> (Result i64 (slice u8)))
+  (let [(mut prog) (StrBuf::new a)]
+    (push-str! (mut prog) "#include \"")
+    (push-str! (mut prog) abs)
+    (push-str! (mut prog) "\"\n#include <stdio.h>\n")
+    (push-str! (mut prog) "int main(void){printf(\"%lld\\n\",(long long)(")
+    (push-str! (mut prog) expr)
+    (push-str! (mut prog) "));return 0;}\n")
+    (let [cf (tmp-path a "probec")
+          exe (tmp-path a "probeexe")
+          outf (tmp-path a "probeout")]
+      (match (write-file a cf (str (load prog)))
+        (Err [e] (Err e))
+        (Ok [_]
+            (let [(mut cc) (StrBuf::new a)]
+              ; -x c applies to the generated source; -x none resets so the linked objects
+              ; (link args) are detected by extension, not compiled as C.
+              (push-str! (mut cc) "clang")
+              (push-str! (mut cc) flags)
+              (push-str! (mut cc) " -x c '")
+              (push-str! (mut cc) cf)
+              (push-str! (mut cc) "' -x none ")
+              (push-str! (mut cc) link)
+              (push-str! (mut cc) " -o '")
+              (push-str! (mut cc) exe)
+              (push-str! (mut cc) "' 2>/dev/null")
+              ; An expression that does not compile has no runtime value either:
+              ; that is the documented "PROBE FAILED" outcome, not an error.
+              (if (!= (run-cmd a (str (load cc))) (: 0 i32))
+                  (Ok -9999999999)
+                  (let [(mut rc) (StrBuf::new a)]
+                    (push-str! (mut rc) "'")
+                    (push-str! (mut rc) exe)
+                    (push-str! (mut rc) "' > '")
+                    (push-str! (mut rc) outf)
+                    (push-str! (mut rc) "' 2>/dev/null")
+                    (if (!= (run-cmd a (str (load rc))) (: 0 i32))
+                        (Err (cat a "cimport: the runtime probe for " expr))
+                        (match (slurp a (s->cstr a outf))
+                          (Err [e] (Err e))
+                          (Ok [text] (Ok (parse-signed (trim text))))))))))))))
+
+; last whitespace-token of a slice.
+(defn last-token [(s (slice u8))] (-> (slice u8))
+  (let [t (trim s)
+        n (len t)
+        (mut cut) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (when (ws-byte? (get t (load i)))
+                  (store! cut (primitive/iadd (load i) 1)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (subslice [u8] t (load cut) n)))
+
+; parse a `-fdump-record-layouts` dump for a bitfield field; emit
+; (const NAME_byte B)(const NAME_bit s)(const NAME_width w), or "" if not found.
+(defn parse-layout-field [(a (dyn Allocator))
+                          (dump (slice u8))
+                          (name (slice u8))
+                          (fname (slice u8))] (-> (slice u8))
+  (let [lines (each-line a dump)
+        (mut i) 0
+        n (len (load lines))
+        (mut out) (StrBuf::new a)
+        (mut done) false]
+    (loop (if (or (>= (load i) n) (load done))
+              (break)
+              (do
+                (let [line (get (load lines) (load i))
+                      bar (index-of line (: 124 u8) 0)]  ; '|'
+                  (when (>= bar 0)
+                    (let [left (trim (subslice [u8] line 0 bar))
+                          right
+                            (subslice [u8]
+                                      line
+                                      (primitive/iadd bar 1)
+                                      (len line))
+                          colon (index-of left (: 58 u8) 0)]  ; ':'
+                      (when (and (>= colon 0)
+                                 (= (last-token right) fname))
+                        (let [byte (subslice [u8] left 0 colon)
+                              rest
+                                (subslice [u8]
+                                          left
+                                          (primitive/iadd colon 1)
+                                          (len left))
+                              dash (index-of rest (: 45 u8) 0)]  ; '-'
+                          (when (>= dash 0)
+                            (let [sbit
+                                    (parse-signed (subslice [u8] rest 0 dash))
+                                  ebit
+                                    (parse-signed (subslice [u8]
+                                                            rest
+                                                            (primitive/iadd dash
+                                                                            1)
+                                                            (len rest)))]
+                              (push-str! (mut out)
+                                         (cat3 a
+                                               (cat3 a
+                                                     "(const "
+                                                     name
+                                                     "_byte ")
+                                               (trim byte)
+                                               ")\n"))
+                              (push-str! (mut out)
+                                         (cat3 a
+                                               (cat3 a
+                                                     "(const "
+                                                     name
+                                                     "_bit ")
+                                               (i64->dec a sbit)
+                                               ")\n"))
+                              (push-str! (mut out)
+                                         (cat3 a
+                                               (cat3 a
+                                                     "(const "
+                                                     name
+                                                     "_width ")
+                                               (i64->dec a
+                                                         (primitive/iadd (primitive/isub ebit
+                                                                                         sbit)
+                                                                         1))
+                                               ")\n"))
+                              (store! done true)
+                              0)))))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (str (load out))))
+
+(defn probe-bits [(a (dyn Allocator))
+                  (abs (slice u8))
+                  (flags (slice u8))
+                  (name (slice u8))
+                  (sname (slice u8))
+                  (fname (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (let [(mut force) (StrBuf::new a)]
+    (push-str! (mut force) "#include \"")
+    (push-str! (mut force) abs)
+    (push-str! (mut force) "\"\n")
+    (push-str! (mut force) sname)
+    (push-str! (mut force) " __coil_force;\n")
+    (let [cf (tmp-path a "force")
+          outf (tmp-path a "layout")]
+      (match (write-file a cf (str (load force)))
+        (Err [e] (Err e))
+        (Ok [_]
+            (let [(mut cc) (StrBuf::new a)]
+              (push-str! (mut cc) "clang -Xclang -fdump-record-layouts -x c")
+              (push-str! (mut cc) flags)
+              (push-str! (mut cc) " -c '")
+              (push-str! (mut cc) cf)
+              (push-str! (mut cc) "' -o /dev/null > '")
+              (push-str! (mut cc) outf)
+              (push-str! (mut cc) "' 2>&1")
+              (if (!= (run-cmd a (str (load cc))) (: 0 i32))
+                  (match (slurp a (s->cstr a outf))
+                    (Err [e] (Err e))
+                    (Ok [detail]
+                        (Err (cat3 a "clang could not lay out " sname (cat a ":\n" (trim detail))))))
+                  (match (slurp a (s->cstr a outf))
+                    (Err [e] (Err e))
+                    (Ok [text] (Ok (parse-layout-field a text name fname)))))))))))
+
+; Emit `(const …)` for every probe (routing each to the cheapest tier). "" if none.
+(defn cimport-probe [(a (dyn Allocator))
+                     (header (slice u8))
+                     (flags (slice u8))
+                     (probes (ptr (ArrayList Probe)))
+                     (link (slice u8))] (-> (Result (slice u8) (slice u8)))
+  (try
+   (let [flags (try! (clang-flags a flags))
+        n (len (load probes))]
+    (if (= n 0)
+        (Ok "")
+        (let [abs (abspath a header)
+              folded
+                (let [(mut exprs) (ArrayList::new [(slice u8)] a)]
+                  (for i (range 0 n)
+                    (let [p (get (load probes) i)]
+                      (push! (mut exprs) (if (= (pkind p) 1) "0" (pget p 1)))))
+                  (try! (fold-batch a abs flags (mut exprs))))
+              (mut out) (StrBuf::new a)
+              (mut i) 0]
+          (loop (if (>= (load i) n)
+                    (break)
+                    (do
+                      (let [p (get (load probes) (load i))]
+                        (if (= (pkind p) 1)
+                            (push-str! (mut out)
+                                       (try! (probe-bits a
+                                                         abs
+                                                         flags
+                                                         (pget p 0)
+                                                         (pget p 2)
+                                                         (pget p 3))))
+                            (let [nm (pget p 0)
+                                  e (pget p 1)
+                                  v0
+                                    (match (get (load folded) (load i))
+                                      (Some [value] value)
+                                      (None [] -9999999999))
+                                  v
+                                    (if (!= v0 -9999999999)
+                                        v0
+                                        (try! (probe-run a abs flags e link)))]
+                              (if (!= v -9999999999)
+                                  (push-str! (mut out)
+                                             (cat3 a
+                                                   (cat3 a "(const " nm " ")
+                                                   (i64->dec a v)
+                                                   ")\n"))
+                                  (push-str! (mut out)
+                                             (cat3 a
+                                                   "; PROBE FAILED (not constant, and no runtime link): "
+                                                   nm
+                                                   "\n"))))))
+                      (set! i (primitive/iadd (load i) 1)))))
+          (Ok (str (load out))))))))
+
+(defn cimport-run [(a (dyn Allocator))
+                   (header (slice u8))
+                   (out (Option (slice u8)))
+                   (flags (slice u8))] (-> i64)
+  (let [r
+          (match (cimport-header a header flags)
+            (Err [e] (do (ewrite (cat3 a "error: " e "\n")) 1))
+            (Ok [body]
+                (match out
+                  (None [] (do (emit body) 0))
+                  (Some [o]
+                        (match (write-file a o body)
+                          (Err [e] (do (ewrite (cat3 a "error: " e "\n")) 1))
+                          (Ok [_] (do (emit (cat3 a "wrote " o "\n")) 0)))))))]
+    (cimport-cleanup! a)
+    r))
+
+; CLI entry shared by the standalone tool (base=1: `cimport <hdr>`) and the
+; compiler subcommand (base=2: `coil cimport <hdr>`). Parses the header at
+; argv[base], an optional `-o <out>`, and any other args as clang flags
+; (`-I…`, `-D…`, …) forwarded to the clang invocation.
+(defn cimport-cli [(a (dyn Allocator))
+                   (argc i32)
+                   (argv (ptr (ptr i8)))
+                   (base i64)] (-> i64)
+  (if (< (primitive/cast i64 argc) (primitive/iadd base 1))
+      (do
+        (ewrite "usage: cimport <header.h> [-o out.coil] [clang flags…]\n")
+        1)
+      (let [header (from-cstr (load (primitive/index argv base)))
+            (mut out) (None [(slice u8)])
+            (mut flags) (StrBuf::new a)
+            (mut i) (primitive/iadd base 1)]
+        (loop (if (>= (load i) (primitive/cast i64 argc))
+                  (break)
+                  (let [arg (from-cstr (load (primitive/index argv (load i))))]
+                    (if (and (< (primitive/iadd (load i) 1)
+                                (primitive/cast i64 argc))
+                             (= arg "-o"))
+                        (do
+                          (set! out
+                                (Some (from-cstr (load (primitive/index argv
+                                                                          (primitive/iadd (load i)
+                                                                                          1))))))
+                          (set! i (primitive/iadd (load i) 2))
+                          0)
+                        (do
+                          (push-str! (mut flags) " ")
+                          (push-str! (mut flags) arg)
+                          (set! i (primitive/iadd (load i) 1))
+                          0)))))
+        (cimport-run a header (load out) (str (load flags))))))
+

@@ -2,7 +2,7 @@
 # Give /tmp the toolchain layout that a stage compiler built into /tmp will look for.
 #
 # A compiler resolves the standard library by walking up from its own location and
-# then from the working directory (src/compiler/loader.coil, find-stdlib-layout!).
+# then from the working directory (src/compiler/frontend/loader.coil, find-stdlib-layout!).
 # The bootstrap builds its stages as /tmp/coil-rb1, /tmp/coil-rl2, … and the gates
 # run them from their own temporary directories, so neither anchor reaches this
 # checkout. Treating /tmp as the prefix — /tmp/lib/coil is its library — makes every

@@ -3,7 +3,7 @@
 
 WHY THIS IS SAFE TO DO INCREMENTALLY
 ------------------------------------
-The shipping recognizer (`ct-doc-line-body`, src/compiler/comptime.coil) requires
+The shipping recognizer (`ct-doc-line-body`, src/compiler/comptime/comptime.coil) requires
 two semicolons and then SKIPS the rest of the run, so `;;;` is already a valid doc
 comment today.  Migrating a tree therefore changes nothing about how the current
 compiler reads it.  Only the final recognizer flip -- requiring three semicolons --

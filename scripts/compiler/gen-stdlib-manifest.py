@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate the stdlib manifest tables in src/compiler/stdlib_manifest.coil.
+"""Regenerate the stdlib manifest tables in src/compiler/frontend/stdlib_manifest.coil.
 
 The three tables (`stdlib-namespaces`, `stdlib-file-for-namespace`,
 `stdlib-manifest-file?`) are three views of ONE fact: which files under
@@ -16,12 +16,12 @@ The same goes for one fact the migration of removed standard-library names needs
 which library modules re-export another's names (`(import "FROM" … :reexport)`),
 and which names they pass on. `coil lint --fix` works on read syntax, before any
 module loads, so it cannot ask the loader; the API-REEXPORTS table in
-src/compiler/api_renames.coil is generated here from the modules' own imports
+src/compiler/migrate/api_renames.coil is generated here from the modules' own imports
 instead of being a hand-kept copy of their `:use` lists. Only the manifest is generated; the library TEXT is not in the
 compiler at all -- it is installed as files beside the binary and read from
 there (loader.coil), which is what keeps compiler and library one version.
 
-This mirrors scripts/docs/gen-guide.py, which generates src/compiler/guide.coil
+This mirrors scripts/docs/gen-guide.py, which generates src/compiler/cli/guide.coil
 from the language reference the same way.
 
 Usage:
@@ -44,8 +44,8 @@ SDK = ROOT / "src" / "compiler"
 # the compiler imports; installed beside the SDK as compiler/tpde/.
 TPDE = (ROOT / ".." / "coil-tpde" / "src" / "tpde").resolve()
 PRELUDE = ROOT / "src" / "compiler" / "prelude.coil"
-TARGET = ROOT / "src" / "compiler" / "stdlib_manifest.coil"
-RENAMES = ROOT / "src" / "compiler" / "api_renames.coil"
+TARGET = ROOT / "src" / "compiler" / "frontend" / "stdlib_manifest.coil"
+RENAMES = ROOT / "src" / "compiler" / "migrate" / "api_renames.coil"
 
 BEGIN = ";; BEGIN GENERATED -- regenerate with scripts/compiler/gen-stdlib-manifest.py"
 END = ";; END GENERATED"
@@ -96,7 +96,7 @@ HERMETIC_NAMESPACES = {
 def declared_module(text: str) -> str | None:
     """The file's `(module NAME)` header.
 
-    Mirrors `namespace-declared-module` in src/compiler/loader.coil: a module
+    Mirrors `namespace-declared-module` in src/compiler/frontend/loader.coil: a module
     declaration may follow an arbitrarily long license/design comment, so skip
     `;` comments and whitespace rather than reading a fixed prefix.
     """
@@ -313,7 +313,7 @@ def collect_reexports(entries: list[tuple[str, str]]) -> list[tuple[str, str, li
                 if key in f:
                     sys.exit(
                         f"error: {where}: the re-export of {target[1]} has {key}, which API-REEXPORTS\n"
-                        "  (src/compiler/api_renames.coil) cannot describe; teach it first"
+                        "  (src/compiler/migrate/api_renames.coil) cannot describe; teach it first"
                     )
             if ":use" in f:
                 spec = f[f.index(":use") + 1]
@@ -325,7 +325,7 @@ def collect_reexports(entries: list[tuple[str, str]]) -> list[tuple[str, str, li
                 if not names:
                     sys.exit(
                         f"error: {where}: {ns} re-exports all of {target[1]} and has an export list,\n"
-                        "  which narrows what it re-exports; API-REEXPORTS (src/compiler/api_renames.coil)\n"
+                        "  which narrows what it re-exports; API-REEXPORTS (src/compiler/migrate/api_renames.coil)\n"
                         "  cannot describe that; teach it first"
                     )
                 names = [x for x in names if x in export_list]

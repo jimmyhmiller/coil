@@ -25,11 +25,11 @@ On macOS a build that emits DWARF gathers `<exe>.dSYM` next to the executable
 
 ## One model, every backend
 
-`src/compiler/debuginfo.coil` holds what does not depend on the backend: the
+`src/compiler/backend/debuginfo.coil` holds what does not depend on the backend: the
 translation of Coil types to debug types over the shared `LayoutDb`
 (`dbg-ty-of!`), and which names a debugger is shown (`dbg-name?`: not the
 checker's `$` temporaries, not the `x.slot` half of a mutable local).
-`src/compiler/dwarf.coil` turns the records (functions, variables, line rows,
+`src/compiler/object/dwarf.coil` turns the records (functions, variables, line rows,
 types) into `__debug_info` / `__debug_line` / `__debug_str` / `__debug_abbrev`
 (and `__debug_loc`) for the native backends; the LLVM backend hands the same
 records to LLVM's DIBuilder (`codegen.coil`, "debug info").

@@ -136,9 +136,9 @@ note: in expansion of macro `newderive.derive`
 
 Three sites splice exactly one level. Make the walk transitive:
 
-- `do-produced` — `src/compiler/expander.coil:3088`
-- `unpack-do` — `src/compiler/expander.coil:2825`
-- the transform-output splice — `src/compiler/expander.coil:2575`
+- `do-produced` — `src/compiler/frontend/expander.coil:3088`
+- `unpack-do` — `src/compiler/frontend/expander.coil:2825`
+- the transform-output splice — `src/compiler/frontend/expander.coil:2575`
 
 **② `code-struct?` / `code-sum?` codeops — required to retire the `-sum` suffixes.**
 

@@ -54,7 +54,7 @@ expression.
 
 ## Why it happens
 
-`expand-calls` (`src/compiler/expander.coil`) is a flat pre-pass over raw `Sexp`. For
+`expand-calls` (`src/compiler/frontend/expander.coil`) is a flat pre-pass over raw `Sexp`. For
 any list node it looks up element 0 in a **global** macro table and rewrites if it hits.
 It has no grammar knowledge, so it cannot tell a parameter list from a call; and
 `resolve-macro` takes `(head, module, macros, impb, expb, allocator)` — there is no

@@ -1,0 +1,679 @@
+; src/compiler/backend/codegen_tpde_ir.coil — the `llvm-ir` subset for the tpde backend.
+;
+; The same straight-line subset codegen_a64.coil's emit-ir-line! interprets
+; (see docs/reference/ARM64_BACKEND.md, "The llvm-ir escape hatch"), lowered to
+; CIR: slices and small structs as places with insertvalue/extractvalue,
+; atomics, casts, integer and float arithmetic, compares, select, GEP, the scalar
+; float intrinsics of float_math.coil, and vectors lane by lane through memory.
+; Anything else is a hard error naming the line.
+(module coil.compiler.codegen_tpde_ir)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.control" :use *)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.parser" :use *)
+(import "coil.compiler.a64" :use [al-at])
+(import "coil.mem" :use [f64-bits])
+(import "coil.compiler.layoutdb" :use *)
+(import "coil.compiler.codegen_a64" :use *)
+(import "coil.compiler.float_math" :use *)
+(import "coil.compiler.codegen_tpde" :as tl :use [Tl TV])
+(import "tpde.cir" :as cir)
+
+(defstruct IrBind [(name (slice u8)) (tv TV)])
+
+(defstruct Ir
+  [(tl (ptr Tl))
+   (args (ptr (ArrayList TV)))
+   (argtys (ptr (ArrayList Type)))
+   (result Type)
+   (env (ArrayList IrBind))
+   (toks (ptr (ArrayList (slice u8))))
+   (pos i64)
+   (line (slice u8))
+   (ret TV)
+   (done bool)])
+
+(defn fail [(ir (ptr Ir)) (msg (slice u8))] (-> never)
+  (tl/tl-fail (sconcat3 (.a (.tl ir)) "llvm-ir (tpde): " msg (sconcat (.a (.tl ir)) ": " (.line ir)))))
+
+(defn tok [(ir (ptr Ir))] (-> (slice u8))
+  (if (>= (.pos ir) (len (load (.toks ir)))) "" (get (load (.toks ir)) (.pos ir))))
+(defn next! [(ir (ptr Ir))] (-> (slice u8))
+  (let [t (tok ir)] (set! (.pos ir) (+ (.pos ir) 1)) t))
+(defn skip! [(ir (ptr Ir)) (word (slice u8))] (-> void)
+  (when (= (tok ir) word) (set! (.pos ir) (+ (.pos ir) 1))))
+(defn expect! [(ir (ptr Ir)) (word (slice u8))] (-> void)
+  (if (= (tok ir) word) (set! (.pos ir) (+ (.pos ir) 1)) (fail ir (sconcat (.a (.tl ir)) "expected " word))))
+
+(defn tla [(ir (ptr Ir))] (-> (dyn Allocator)) (.a (.tl ir)))
+(defn tlp [(ir (ptr Ir))] (-> (ptr Tl)) (.tl ir))
+
+; ---- types ----
+
+(defn parse-type [(ir (ptr Ir))] (-> Type)
+  (let [a (tla ir)
+        t (next! ir)]
+    (cond (= t "$ret") (.result ir)
+          (= t "i64") (TInt 64 true)
+          (= t "i32") (TInt 32 true)
+          (= t "i16") (TInt 16 true)
+          (= t "i8") (TInt 8 true)
+          (= t "i128") (TInt 128 true)
+          (= t "i1") (TBool)
+          (= t "ptr") (TPtr (box-type a (TInt 8 true)))
+          (= t "float") (TFloat 32)
+          (= t "double") (TFloat 64)
+          (= t "void") (TVoid)
+          (= t "{")
+            (let [t0 (parse-type ir)
+                  t1 (parse-type ir)]
+              (expect! ir "}")
+              ; a {T, i1}/{ptr, i64} pair: element 0 at 0, element 1 at 8
+              (TSlice (box-type a t0)))
+          (= t "<")
+            (let [n (str->i64 (next! ir))]
+              (expect! ir "x")
+              (let [e (parse-type ir)]
+                (expect! ir ">")
+                (fixed-vec (box-type a e) n)))
+          (and (>= (len t) 3) (= (get t 0) #\$) (= (get t 1) #\t))
+            (get (load (.argtys ir)) (str->i64 (subslice t 2 (len t))))
+          :else (fail ir (sconcat a "unsupported type " t)))))
+
+(defn vec-info [(t (ptr Type))] (-> i64)
+  (match (load t) (TVec [_ n] (extent-value n)) (_ 0)))
+(defn vec-elem [(t (ptr Type))] (-> Type)
+  (match (load t) (TVec [e _] (load e)) (_ (load t))))
+
+; ---- values ----
+
+(defn lookup [(ir (ptr Ir)) (name (slice u8))] (-> TV)
+  (let [(mut i) (- (len (.env ir)) 1)]
+    (block :found
+      (while (>= i 0)
+        (let [b (get (.env ir) i)]
+          (when (= (.name b) name) (return-from :found (.tv b))))
+        (set! i (- i 1)))
+      (fail ir (sconcat (tla ir) "undefined value " name)))))
+
+(defn bind! [(ir (ptr Ir)) (name (slice u8)) (tv TV)] (-> void)
+  (push! (mut (.env ir)) (IrBind :name name :tv tv)))
+
+(defn const-of [(ir (ptr Ir)) (t Type) (lo u64)] (-> TV)
+  (let [(mut tt) t
+        ct (tl/tl-cty (mut tt))]
+    (tl/tv-s (cir/const! (.f (load (tlp ir))) ct lo (: 0 u64)) t)))
+
+;;; A value operand of type t at the cursor (advancing past it).
+(defn value! [(ir (ptr Ir)) (t Type)] (-> TV)
+  (let [tk (tok ir)
+        tp (tlp ir)
+        (mut tt) t]
+    (cond
+      (= tk "<") (vec-literal! ir t)
+      :else
+        (do
+          (next! ir)
+          (cond
+            (= (get tk 0) #\%) (lookup ir tk)
+            (= (get tk 0) #\$) (get (load (.args ir)) (str->i64 (subslice tk 1 (len tk))))
+            (or (= tk "undef") (= tk "poison") (= tk "zeroinitializer"))
+              (if (tl/tl-scalar? (mut tt))
+                  (const-of ir t (: 0 u64))
+                  (let [s (tl/new-slot tp (mut tt))]
+                    (when (= tk "zeroinitializer") (tl/memzero tp s (tl/tsize tp (mut tt))))
+                    (tl/tv-p s t)))
+            (= tk "true") (const-of ir t (: 1 u64))
+            (= tk "false") (const-of ir t (: 0 u64))
+            (= tk "null") (const-of ir t (: 0 u64))
+            (tl/fp-type? (mut tt))
+              (let [d (str->f64 tk)]
+                (match t
+                  (TFloat [32] (const-of ir t (primitive/cast u64 (f32-bits (primitive/cast f32 d)))))
+                  (_ (const-of ir t (primitive/cast u64 (f64-bits d))))))
+            :else (const-of ir t (primitive/cast u64 (str->i64 tk))))))))
+
+(defn f32-bits [(x f32)] (-> i64)
+  (let [(mut v) x]
+    (primitive/cast i64 (load (primitive/cast (ptr u32) (mut v))))))
+
+;;; `< T v0, T v1, ... >`
+(defn vec-literal! [(ir (ptr Ir)) (t Type)] (-> TV)
+  (expect! ir "<")
+  (let [tp (tlp ir)
+        (mut tt) t
+        n (vec-info (mut tt))
+        et (vec-elem (mut tt))
+        (mut ett) et
+        lb (tl/tsize tp (mut ett))
+        s (tl/new-slot tp (mut tt))]
+    (for k (range 0 n)
+      (let [lt (parse-type ir)
+            v (value! ir lt)]
+        (tl/store-tv tp s (* k lb) (cast-scalar ir v et))))
+    (expect! ir ">")
+    (tl/tv-p s t)))
+
+;; Reinterpret a scalar literal/value as type t (float width, int width).
+(defn cast-scalar [(ir (ptr Ir)) (v TV) (t Type)] (-> TV)
+  (let [(mut vt) (.ty v) (mut tt) t
+        tp (tlp ir)]
+    (cond (and (tl/fp-type? (mut vt)) (tl/fp-type? (mut tt))) (tl/tl-cast tp t v)
+          :else (TV :kind (.kind v) :v (.v v) :ty t))))
+
+;; Lane k of a vector TV as a scalar TV.
+(defn lane [(ir (ptr Ir)) (v TV) (k i64)] (-> TV)
+  (let [tp (tlp ir)
+        (mut vt) (.ty v)
+        et (vec-elem (mut vt))
+        (mut ett) et
+        lb (tl/tsize tp (mut ett))]
+    (tl/read-at tp (tl/place tp v) (* k lb) et)))
+
+; ---- lines ----
+
+(defn tl-llvmir [(tlp (ptr Tl)) (result Type) (args (ptr (ArrayList Expr))) (body (slice u8))] (-> TV)
+  (let [a (.a tlp)
+        (mut tvs) (ArrayList::new [TV] a)
+        (mut tys) (ArrayList::new [Type] a)]
+    (for i (range 0 (len (load args)))
+      (let [tv (tl/tl-expr tlp (elem args i))]
+        (push! (mut tvs) tv)
+        (push! (mut tys) (.ty tv))))
+    (let [(mut ir) (Ir :tl tlp :args (box-al [TV] a (load tvs)) :argtys (box-al [Type] a (load tys))
+                       :result result :env (ArrayList::new [IrBind] a)
+                       :toks (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a)) :pos 0 :line ""
+                       :ret (tl/tv-none) :done false)
+          irp (cast (ptr Ir) (mut ir))
+          n (len body)
+          (mut pos) 0]
+      (while (< pos n)
+        (let [(mut eol) pos]
+          (while (and (< eol n) (!= (get body eol) (: 10 u8))) (set! eol (+ eol 1)))
+          (let [line (subslice body pos eol)]
+            (set! pos (+ eol 1))
+            (when (> (len line) 0)
+              (when (.done ir) (fail irp "code after ret"))
+              (set! (.line ir) line)
+              (set! (.toks ir) (ir-tokens a line))
+              (set! (.pos ir) 0)
+              (line! irp)))))
+      (unless (.done ir) (fail irp "body did not ret"))
+      (.ret ir))))
+
+(defn line! [(ir (ptr Ir))] (-> void)
+  (let [first (tok ir)
+        tp (tlp ir)]
+    (cond
+      (= first "declare") 0
+      (= first "ret")
+        (do (next! ir)
+            (if (= (tok ir) "void")
+                (set! (.ret ir) (tl/tv-s (tl/iconst tp 0) (TInt 64 true)))
+                (let [t (parse-type ir)]
+                  (set! (.ret ir) (value! ir t))))
+            (set! (.done ir) true))
+      (= first "unreachable")
+        (do (tl/open! tp)
+            (cir/unreachable! (.f tp))
+            (set! (.terminated tp) true)
+            (set! (.ret ir) (tl/tv-none))
+            (set! (.done ir) true))
+      (= first "store") (do (next! ir) (store-line! ir))
+      (= first "fence") (do (tl/open! tp) (cir/op0! (.f tp) cir/OP-FENCE cir/T-VOID 0 0) 0)
+      (= first "call") (do (call-line! ir) 0)
+      (= (get first 0) #\%)
+        (do (next! ir)
+            (expect! ir "=")
+            (bind! ir first (instr! ir)))
+      :else (fail ir "unsupported line"))
+    0))
+
+(defn store-line! [(ir (ptr Ir))] (-> void)
+  (let [tp (tlp ir)
+        atomic (= (tok ir) "atomic")]
+    (skip! ir "atomic")
+    (skip! ir "volatile")
+    (let [t (parse-type ir)
+          v (value! ir t)
+          pt (parse-type ir)
+          p (value! ir pt)
+          (mut tt) t]
+      (if atomic
+          (do (tl/open! tp)
+              (cir/op2! (.f tp) cir/OP-ATOMIC-STORE cir/T-VOID (tl/scalar tp p) (tl/scalar tp v) 0 (tl/scalar-bytes tp (mut tt)))
+              0)
+          (do (tl/store-tv tp (tl/scalar tp p) 0 v) 0)))))
+
+(defn int-op [(name (slice u8))] (-> i64)
+  (cond (= name "add") cir/OP-ADD (= name "sub") cir/OP-SUB (= name "mul") cir/OP-MUL
+        (= name "and") cir/OP-AND (= name "or") cir/OP-OR (= name "xor") cir/OP-XOR
+        (= name "shl") cir/OP-SHL (= name "lshr") cir/OP-LSHR (= name "ashr") cir/OP-ASHR
+        (= name "sdiv") cir/OP-SDIV (= name "udiv") cir/OP-UDIV
+        (= name "srem") cir/OP-SREM (= name "urem") cir/OP-UREM
+        :else -1))
+
+(defn float-op [(name (slice u8))] (-> i64)
+  (cond (= name "fadd") cir/OP-FADD (= name "fsub") cir/OP-FSUB (= name "fmul") cir/OP-FMUL
+        (= name "fdiv") cir/OP-FDIV :else -1))
+
+(defn skip-flags! [(ir (ptr Ir))] (-> void)
+  (loop
+    (let [t (tok ir)]
+      (if (or (= t "nsw") (= t "nuw") (= t "exact") (= t "disjoint") (= t "fast") (= t "nnan") (= t "ninf")
+              (= t "nsz") (= t "arcp") (= t "contract") (= t "afn") (= t "reassoc") (= t "inbounds") (= t "nuw"))
+          (next! ir)
+          (break)))))
+
+;; An integer of IR width `bits` viewed unsigned (zero-extended).
+(defn zext-view [(ir (ptr Ir)) (v u32) (t (ptr Type))] (-> u32)
+  (let [bits (tl/int-bits t)]
+    (if (< bits 64) (tl/op1 (tlp ir) cir/OP-ZEXT cir/T-I64 v bits 0) v)))
+
+(defn scalar-binop [(ir (ptr Ir)) (opn (slice u8)) (t Type) (a TV) (b TV)] (-> TV)
+  (let [tp (tlp ir)
+        (mut tt) t
+        fo (float-op opn)]
+    (cond
+      (>= fo 0) (tl/tv-s (tl/op2 tp fo (tl/tl-cty (mut tt)) (tl/scalar tp a) (tl/scalar tp b) 0 0) t)
+      (= opn "frem") (tl/tl-bin tp 4 (TV :kind (.kind a) :v (.v a) :ty t) b)
+      :else
+        (let [op (int-op opn)
+              ct (tl/tl-cty (mut tt))
+              unsigned (or (= op cir/OP-LSHR) (= op cir/OP-UDIV) (= op cir/OP-UREM))
+              x (if unsigned (zext-view ir (tl/scalar tp a) (mut tt)) (tl/scalar tp a))
+              y (if unsigned (zext-view ir (tl/scalar tp b) (mut tt)) (tl/scalar tp b))]
+          (when (< op 0) (fail ir (sconcat (tla ir) "unsupported op " opn)))
+          (match t
+            (TBool [] (tl/tv-s (tl/op2 tp cir/OP-AND cir/T-I64 (tl/op2 tp op ct x y 0 0) (tl/iconst tp 1) 0 0) t))
+            (_ (tl/tv-s (tl/canon tp (tl/op2 tp op ct x y 0 0) (mut tt)) t)))))))
+
+;; Apply f lane-wise for a vector type, or once for a scalar.
+(defn binop! [(ir (ptr Ir)) (opn (slice u8))] (-> TV)
+  (skip-flags! ir)
+  (let [tp (tlp ir)
+        t (parse-type ir)
+        a (value! ir t)
+        b (value! ir t)
+        (mut tt) t
+        n (vec-info (mut tt))]
+    (if (= n 0)
+        (scalar-binop ir opn t a b)
+        (let [et (vec-elem (mut tt))
+              (mut ett) et
+              lb (tl/tsize tp (mut ett))
+              s (tl/new-slot tp (mut tt))]
+          (for k (range 0 n)
+            (tl/store-tv tp s (* k lb) (scalar-binop ir opn et (lane ir a k) (lane ir b k))))
+          (tl/tv-p s t)))))
+
+(defn icmp-pred [(p (slice u8))] (-> i64)
+  (cond (= p "eq") cir/P-EQ (= p "ne") cir/P-NE (= p "slt") cir/P-SLT (= p "sle") cir/P-SLE
+        (= p "sgt") cir/P-SGT (= p "sge") cir/P-SGE (= p "ult") cir/P-ULT (= p "ule") cir/P-ULE
+        (= p "ugt") cir/P-UGT (= p "uge") cir/P-UGE :else -1))
+
+(defn fcmp-pred [(p (slice u8))] (-> i64)
+  (cond (= p "oeq") cir/F-OEQ (= p "one") cir/F-ONE (= p "olt") cir/F-OLT (= p "ole") cir/F-OLE
+        (= p "ogt") cir/F-OGT (= p "oge") cir/F-OGE (= p "une") cir/F-UNE (= p "ueq") cir/F-UEQ
+        (= p "ord") cir/F-ORD (= p "uno") cir/F-UNO (= p "ult") cir/F-ULT (= p "ule") cir/F-ULE
+        (= p "ugt") cir/F-UGT (= p "uge") cir/F-UGE :else -1))
+
+(defn scalar-cmp [(ir (ptr Ir)) (float bool) (pred i64) (t Type) (a TV) (b TV)] (-> TV)
+  (let [tp (tlp ir)
+        (mut tt) t]
+    (if float
+        (tl/tv-s (tl/op2 tp cir/OP-FCMP cir/T-I64 (tl/scalar tp a) (tl/scalar tp b) pred 0) (TBool))
+        (let [unsigned (or (= pred cir/P-ULT) (= pred cir/P-ULE) (= pred cir/P-UGT) (= pred cir/P-UGE))
+              x (if unsigned (zext-view ir (tl/scalar tp a) (mut tt)) (tl/scalar tp a))
+              y (if unsigned (zext-view ir (tl/scalar tp b) (mut tt)) (tl/scalar tp b))]
+          (tl/tv-s (tl/op2 tp cir/OP-ICMP (if (tl/wide? (mut tt)) cir/T-I64 cir/T-I64) x y pred 0) (TBool))))))
+
+(defn cmp! [(ir (ptr Ir)) (float bool)] (-> TV)
+  (skip-flags! ir)
+  (let [tp (tlp ir)
+        pn (next! ir)
+        pred (if float (fcmp-pred pn) (icmp-pred pn))
+        t (parse-type ir)
+        a (value! ir t)
+        b (value! ir t)
+        (mut tt) t
+        n (vec-info (mut tt))]
+    (when (< pred 0) (fail ir (sconcat (tla ir) "unsupported predicate " pn)))
+    (if (= n 0)
+        (scalar-cmp ir float pred t a b)
+        (let [et (vec-elem (mut tt))
+              (mut mt) (fixed-vec (box-type (tla ir) (TBool)) n)
+              s (tl/new-slot tp (mut mt))]
+          (for k (range 0 n)
+            (tl/store-tv tp s k (scalar-cmp ir float pred et (lane ir a k) (lane ir b k))))
+          (tl/tv-p s mt)))))
+
+(defn select! [(ir (ptr Ir))] (-> TV)
+  (let [tp (tlp ir)
+        ct (parse-type ir)
+        c (value! ir ct)
+        t (parse-type ir)
+        a (value! ir t)
+        t2 (parse-type ir)
+        b (value! ir t)
+        (mut tt) t
+        n (vec-info (mut tt))]
+    (if (= n 0)
+        (let [(mut t3) t]
+          (if (tl/tl-scalar? (mut t3))
+              (tl/tv-s (tl/op3 tp cir/OP-SELECT (tl/tl-cty (mut t3)) (tl/scalar tp c) (tl/scalar tp a) (tl/scalar tp b) 0 0) t)
+              (tl/tv-s (tl/op3 tp cir/OP-SELECT cir/T-I64 (tl/scalar tp c) (tl/place tp a) (tl/place tp b) 0 0) t)))
+        ; a vector mask: lane-wise
+        (let [et (vec-elem (mut tt))
+              (mut ett) et
+              lb (tl/tsize tp (mut ett))
+              s (tl/new-slot tp (mut tt))]
+          (for k (range 0 n)
+            (let [ck (lane ir c k)
+                  ak (lane ir a k)
+                  bk (lane ir b k)]
+              (tl/store-tv tp s (* k lb)
+                           (tl/tv-s (tl/op3 tp cir/OP-SELECT (tl/tl-cty (mut ett)) (tl/scalar tp ck) (tl/scalar tp ak) (tl/scalar tp bk) 0 0) et))))
+          (tl/tv-p s t)))))
+
+(defn cast! [(ir (ptr Ir)) (opn (slice u8))] (-> TV)
+  (let [tp (tlp ir)
+        st (parse-type ir)
+        v (value! ir st)
+        _to (do (expect! ir "to") 0)
+        dt (parse-type ir)
+        (mut stt) st
+        (mut dtt) dt
+        n (vec-info (mut dtt))]
+    (if (> n 0)
+        (if (= opn "bitcast")
+            (let [s (tl/new-slot tp (mut dtt))]
+              (tl/store-tv tp s 0 (TV :kind (.kind v) :v (.v v) :ty st))
+              (tl/tv-p s dt))
+            (let [et (vec-elem (mut dtt))
+                  (mut ett) et
+                  set0 (vec-elem (mut stt))
+                  lb (tl/tsize tp (mut ett))
+                  s (tl/new-slot tp (mut dtt))]
+              (for k (range 0 n)
+                (tl/store-tv tp s (* k lb) (scalar-cast ir opn set0 et (lane ir v k))))
+              (tl/tv-p s dt)))
+        (scalar-cast ir opn st dt v))))
+
+(defn scalar-cast [(ir (ptr Ir)) (opn (slice u8)) (st Type) (dt Type) (v TV)] (-> TV)
+  (let [tp (tlp ir)
+        (mut stt) st
+        (mut dtt) dt
+        x (tl/scalar tp (TV :kind (.kind v) :v (.v v) :ty st))]
+    (cond
+      (or (= opn "inttoptr") (= opn "ptrtoint")) (tl/tv-s x dt)
+      (= opn "bitcast")
+        (cond (and (tl/fp-type? (mut stt)) (not (tl/fp-type? (mut dtt))))
+                (tl/tv-s (tl/canon tp (tl/op1 tp cir/OP-BITCAST cir/T-I64 x 0 0) (mut dtt)) dt)
+              (and (not (tl/fp-type? (mut stt))) (tl/fp-type? (mut dtt)))
+                (tl/tv-s (tl/op1 tp cir/OP-BITCAST (tl/tl-cty (mut dtt)) x 0 0) dt)
+              (tl/tl-scalar? (mut stt)) (tl/tv-s x dt)
+              :else (tl/read-at tp (tl/place tp v) 0 dt))
+      (= opn "sext")
+        (match st
+          ; i1 is 0/1: sign extension is negation
+          (TBool [] (tl/tv-s (tl/canon tp (tl/op1 tp cir/OP-NEG cir/T-I64 x 0 0) (mut dtt)) dt))
+          (_ (tl/tl-cast tp dt (TV :kind 0 :v x :ty st))))
+      (= opn "zext")
+        (tl/tl-cast tp dt (TV :kind 0 :v (zext-view ir x (mut stt)) :ty (TInt 64 false)))
+      (= opn "trunc")
+        (match dt
+          (TBool [] (tl/tv-s (tl/op2 tp cir/OP-AND cir/T-I64 x (tl/iconst tp 1) 0 0) dt))
+          (_ (tl/tl-cast tp dt (TV :kind 0 :v x :ty st))))
+      (= opn "fptosi") (tl/tl-cast tp (match dt (TInt [b _] (TInt b true)) (_ dt)) (TV :kind 0 :v x :ty st))
+      (= opn "fptoui") (tl/tl-cast tp (match dt (TInt [b _] (TInt b false)) (_ dt)) (TV :kind 0 :v x :ty st))
+      (= opn "sitofp") (tl/tl-cast tp dt (TV :kind 0 :v x :ty st))
+      (= opn "uitofp") (tl/tl-cast tp dt (TV :kind 0 :v (zext-view ir x (mut stt)) :ty (TInt 64 false)))
+      (or (= opn "fptrunc") (= opn "fpext")) (tl/tl-cast tp dt (TV :kind 0 :v x :ty st))
+      :else (fail ir (sconcat (tla ir) "unsupported cast " opn)))))
+
+(defn agg-elem [(ir (ptr Ir)) (t (ptr Type)) (idx i64) (offp (ptr i64))] (-> Type)
+  (ir-agg-elem (.g (load (tlp ir))) t idx offp))
+
+(defn instr! [(ir (ptr Ir))] (-> TV)
+  (let [tp (tlp ir)
+        a (tla ir)
+        opn (next! ir)]
+    (cond
+      (or (>= (int-op opn) 0) (>= (float-op opn) 0) (= opn "frem")) (binop! ir opn)
+      (= opn "fneg")
+        (let [t (parse-type ir)
+              v (value! ir t)
+              (mut tt) t]
+          (tl/tv-s (tl/op1 tp cir/OP-FNEG (tl/tl-cty (mut tt)) (tl/scalar tp v) 0 0) t))
+      (= opn "icmp") (cmp! ir false)
+      (= opn "fcmp") (cmp! ir true)
+      (= opn "select") (select! ir)
+      (or (= opn "bitcast") (= opn "inttoptr") (= opn "ptrtoint") (= opn "sext") (= opn "zext") (= opn "trunc")
+          (= opn "fptosi") (= opn "fptoui") (= opn "sitofp") (= opn "uitofp") (= opn "fptrunc") (= opn "fpext"))
+        (cast! ir opn)
+      (= opn "insertvalue")
+        (let [at (parse-type ir)
+              agg (value! ir at)
+              et (parse-type ir)
+              v (value! ir et)
+              idx (str->i64 (next! ir))
+              (mut att) at
+              (mut off) 0
+              s (tl/new-slot tp (mut att))]
+          (agg-elem ir (mut att) idx (mut off))
+          (when (= (.kind agg) 1) (tl/memcpy tp s (.v agg) (tl/tsize tp (mut att))))
+          (tl/store-tv tp s off v)
+          (tl/tv-p s at))
+      (= opn "extractvalue")
+        (let [at (parse-type ir)
+              agg (value! ir at)
+              idx (str->i64 (next! ir))
+              (mut att) at
+              (mut off) 0
+              et (agg-elem ir (mut att) idx (mut off))]
+          (tl/read-at tp (tl/place tp agg) off et))
+      (= opn "atomicrmw")
+        (let [_v (do (skip! ir "volatile") 0)
+              op (next! ir)
+              pt (parse-type ir)
+              p (value! ir pt)
+              t (parse-type ir)
+              v (value! ir t)
+              (mut tt) t
+              code (cond (= op "add") 0 (= op "sub") 1 (= op "and") 2 (= op "or") 3 (= op "xor") 4
+                         (= op "xchg") 5 (= op "max") 6 (= op "min") 7 (= op "umax") 8 (= op "umin") 9
+                         :else (fail ir (sconcat a "unsupported atomicrmw " op)))]
+          (tl/tv-s (tl/op2 tp cir/OP-ATOMIC-RMW cir/T-I64 (tl/scalar tp p) (tl/scalar tp v) code (tl/scalar-bytes tp (mut tt))) t))
+      (= opn "cmpxchg")
+        (let [_w (do (skip! ir "weak") 0)
+              pt (parse-type ir)
+              p (value! ir pt)
+              t (parse-type ir)
+              e (value! ir t)
+              t2 (parse-type ir)
+              nv (value! ir t)
+              (mut tt) t
+              ev (tl/scalar tp e)
+              old (tl/op3 tp cir/OP-CMPXCHG cir/T-I64 (tl/scalar tp p) ev (tl/scalar tp nv) 0 (tl/scalar-bytes tp (mut tt)))
+              ok (tl/op2 tp cir/OP-ICMP cir/T-I64 old ev cir/P-EQ 0)
+              s (tl/new-slot-bytes tp 16 8)]
+          (tl/store-scalar tp s 0 old (mut tt))
+          (tl/store-n tp s 8 ok 8)
+          (tl/tv-p s (TSlice (box-type a t))))
+      (= opn "load")
+        (let [atomic (= (tok ir) "atomic")
+              _a (do (skip! ir "atomic") 0)
+              _v (do (skip! ir "volatile") 0)
+              t (parse-type ir)
+              pt (parse-type ir)
+              p (value! ir pt)
+              (mut tt) t]
+          (if atomic
+              (tl/tv-s (tl/op1 tp cir/OP-ATOMIC-LOAD cir/T-I64 (tl/scalar tp p) 0 (tl/scalar-bytes tp (mut tt))) t)
+              (tl/read-at tp (tl/scalar tp p) 0 t)))
+      (= opn "getelementptr")
+        (let [_i (do (skip-flags! ir) 0)
+              et (parse-type ir)
+              pt (parse-type ir)
+              p (value! ir pt)
+              it (parse-type ir)
+              idx (value! ir it)
+              (mut ett) et
+              esz (tl/tsize tp (mut ett))]
+          (tl/tv-s (tl/op2 tp cir/OP-PTRADD cir/T-I64 (tl/scalar tp p) (tl/scalar tp idx) esz 0) pt))
+      (= opn "insertelement")
+        (let [vt (parse-type ir)
+              v (value! ir vt)
+              et (parse-type ir)
+              e (value! ir et)
+              it (parse-type ir)
+              idx (value! ir it)
+              (mut vtt) vt
+              ve (vec-elem (mut vtt))
+              (mut vett) ve
+              lb (tl/tsize tp (mut vett))
+              s (tl/new-slot tp (mut vtt))]
+          (when (= (.kind v) 1) (tl/memcpy tp s (.v v) (tl/tsize tp (mut vtt))))
+          (let [k (tl/scalar tp idx)]
+            (if (tl/const-int? tp k)
+                (tl/store-tv tp s (* (tl/const-val tp k) lb) (cast-scalar ir e ve))
+                (tl/store-tv tp (tl/op2 tp cir/OP-PTRADD cir/T-I64 s k lb 0) 0 (cast-scalar ir e ve))))
+          (tl/tv-p s vt))
+      (= opn "extractelement")
+        (let [vt (parse-type ir)
+              v (value! ir vt)
+              it (parse-type ir)
+              idx (value! ir it)
+              (mut vtt) vt
+              ve (vec-elem (mut vtt))
+              (mut vett) ve
+              lb (tl/tsize tp (mut vett))
+              k (tl/scalar tp idx)]
+          (if (tl/const-int? tp k)
+              (lane ir v (tl/const-val tp k))
+              (tl/read-at tp (tl/op2 tp cir/OP-PTRADD cir/T-I64 (tl/place tp v) k lb 0) 0 ve)))
+      (= opn "shufflevector")
+        (let [vt (parse-type ir)
+              x (value! ir vt)
+              vt2 (parse-type ir)
+              y (value! ir vt)
+              mt (parse-type ir)
+              (mut mtt) mt
+              (mut vtt) vt
+              n-in (vec-info (mut vtt))
+              n-out (vec-info (mut mtt))
+              mask (ir-shuffle-mask! a (.toks ir) (field ir pos) n-out)
+              ve (vec-elem (mut vtt))
+              (mut vett) ve
+              lb (tl/tsize tp (mut vett))
+              (mut ot) (fixed-vec (box-type a ve) n-out)
+              s (tl/new-slot tp (mut ot))]
+          (for k (range 0 n-out)
+            (let [m (get (load mask) k)]
+              (when (>= m 0)
+                (tl/store-tv tp s (* k lb) (if (< m n-in) (lane ir x m) (lane ir y (- m n-in)))))))
+          (tl/tv-p s ot))
+      (= opn "call") (do (set! (.pos ir) (- (.pos ir) 1)) (call-line! ir))
+      :else (fail ir (sconcat a "unsupported instruction " opn)))))
+
+;;; `call T @callee(T a, ...)`, the value (or nothing for void).
+(defn call-line! [(ir (ptr Ir))] (-> TV)
+  (let [tp (tlp ir)
+        a (tla ir)]
+    (expect! ir "call")
+    (skip-flags! ir)
+    (let [rt (parse-type ir)
+          callee (next! ir)
+          (mut args) (ArrayList::new [TV] a)]
+      (expect! ir "(")
+      (while (and (!= (tok ir) ")") (< (.pos ir) (len (load (.toks ir)))))
+        (let [t (parse-type ir)]
+          (push! (mut args) (value! ir t))))
+      (expect! ir ")")
+      (intrinsic-call! ir rt callee (cast (ptr (ArrayList TV)) (mut args))))))
+
+(defn intrinsic-call! [(ir (ptr Ir)) (rt Type) (callee (slice u8)) (args (ptr (ArrayList TV)))] (-> TV)
+  (let [tp (tlp ir)
+        a (tla ir)
+        (mut rtt) rt]
+    (cond
+      (= callee "@llvm.trap")
+        (do (tl/open! tp)
+            (cir/unreachable! (.f tp))
+            (set! (.terminated tp) true)
+            (tl/tv-none))
+      (starts-with callee "@llvm.ctpop.") (tl/tl-int-unary tp 3 (get (load args) 0))
+      (starts-with callee "@llvm.ctlz.") (tl/tl-int-unary tp 1 (get (load args) 0))
+      (starts-with callee "@llvm.cttz.") (tl/tl-int-unary tp 2 (get (load args) 0))
+      (starts-with callee "@llvm.bswap.") (tl/tl-int-unary tp 4 (get (load args) 0))
+      (starts-with callee "@llvm.vector.reduce.fadd.")
+        (let [acc0 (get (load args) 0)
+              v (get (load args) 1)
+              (mut vt) (.ty v)
+              n (vec-info (mut vt))
+              (mut acc) acc0]
+          (for k (range 0 n)
+            (set! acc (scalar-binop ir "fadd" rt acc (lane ir v k))))
+          acc)
+      (> (vec-info (mut rtt)) 0)
+        ; a vector form of a scalar float intrinsic: lane-wise
+        (let [n (vec-info (mut rtt))
+              et (vec-elem (mut rtt))
+              (mut ett) et
+              lb (tl/tsize tp (mut ett))
+              suffix (if (= (tl/tsize tp (mut ett)) 4) ".f32" ".f64")
+              dot (last-dot callee)
+              scalar-callee (sconcat a (subslice callee 0 dot) suffix)
+              s (tl/new-slot tp (mut rtt))]
+          (for k (range 0 n)
+            (let [(mut lanes) (ArrayList::new [TV] a)]
+              (for j (range 0 (len (load args)))
+                (push! (mut lanes) (lane ir (get (load args) j) k)))
+              (tl/store-tv tp s (* k lb) (intrinsic-call! ir et scalar-callee (cast (ptr (ArrayList TV)) (mut lanes))))))
+          (tl/tv-p s rt))
+      :else
+        (match (float-intrinsic callee)
+          (Some [fi]
+                (let [ct (if (= (.bits fi) 32) cir/T-F32 cir/T-F64)
+                      x (tl/scalar tp (get (load args) 0))]
+                  (match (.op fi)
+                    (FloatSqrt [] (tl/tv-s (tl/op1 tp cir/OP-FSQRT ct x 0 0) rt))
+                    (FloatAbs [] (tl/tv-s (tl/op1 tp cir/OP-FABS ct x 0 0) rt))
+                    (FloatFloor [] (tl/tv-s (tl/op1 tp cir/OP-FRINT ct x 2 0) rt))
+                    (FloatCeil [] (tl/tv-s (tl/op1 tp cir/OP-FRINT ct x 1 0) rt))
+                    (FloatTrunc [] (tl/tv-s (tl/op1 tp cir/OP-FRINT ct x 3 0) rt))
+                    (FloatRound [] (tl/tv-s (tl/op1 tp cir/OP-FRINT ct x 4 0) rt))
+                    (FloatRoundEven [] (tl/tv-s (tl/op1 tp cir/OP-FRINT ct x 0 0) rt))
+                    (FloatFma [] (tl/tv-s (tl/op3 tp cir/OP-FMA ct x (tl/scalar tp (get (load args) 1)) (tl/scalar tp (get (load args) 2)) 0 0) rt))
+                    (FloatMinimum [] (tl/tv-s (tl/op2 tp cir/OP-FMIN ct x (tl/scalar tp (get (load args) 1)) 0 0) rt))
+                    (FloatMaximum [] (tl/tv-s (tl/op2 tp cir/OP-FMAX ct x (tl/scalar tp (get (load args) 1)) 0 0) rt))
+                    (_ (libm-call! ir rt (sconcat a "_" (.libm fi)) args)))))
+          (None [] (fail ir (sconcat a "unsupported call " callee)))))))
+
+(defn last-dot [(s (slice u8))] (-> i64)
+  (let [(mut i) (- (len s) 1)]
+    (while (and (> i 0) (!= (get s i) #\.)) (set! i (- i 1)))
+    i))
+
+(defn libm-call! [(ir (ptr Ir)) (rt Type) (name (slice u8)) (args (ptr (ArrayList TV)))] (-> TV)
+  (let [tp (tlp ir)
+        a (tla ir)
+        (mut rtt) rt
+        sym (tl/tl-sym tp (g-runtime-sym! (.g tp) name))
+        (mut vals) (ArrayList::new [u32] a)
+        (mut flags) (ArrayList::new [u32] a)
+        (mut rts) (ArrayList::new [u8] a)]
+    (for i (range 0 (len (load args)))
+      (push! (mut vals) (tl/scalar tp (get (load args) i)))
+      (push! (mut flags) (: 0 u32)))
+    (push! (mut rts) (primitive/cast u8 (tl/tl-cty (mut rtt))))
+    (tl/open! tp)
+    (tl/tv-s (cir/call! (.f tp) sym (cir/none) (cast (ptr (ArrayList u32)) (mut vals)) (cast (ptr (ArrayList u32)) (mut flags))
+                        (cast (ptr (ArrayList u8)) (mut rts)) false)
+             rt)))

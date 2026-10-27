@@ -676,7 +676,7 @@ open(sys.argv[1], "w").write(
     *) bad "lint --fix reports why the preflight's rewrite does not compile" "$broken" ;;
   esac
 
-  # Standard-library names that were removed (src/compiler/api_renames.coil): a
+  # Standard-library names that were removed (src/compiler/migrate/api_renames.coil): a
   # build points at the migration, lint --fix rewrites every spelling of them (a
   # :use list, an alias, :use * with :rename, type arguments a method drops, a
   # constructor that needs its type imported, a binding that would capture the new
@@ -1503,7 +1503,7 @@ section_debuginfo() {
     *) bad "lldb shows a parameter and a local after its initializer" "$(tail -8 <<<"$after")" ;;
   esac
   # Every macOS backend describes the same program the same way (the shared
-  # model, src/compiler/debuginfo.coil): arm64 and tpde by default, LLVM with
+  # model, src/compiler/backend/debuginfo.coil): arm64 and tpde by default, LLVM with
   # -g, tpde for x86-64 too (run under Rosetta). Lines, parameters, locals,
   # a struct behind a pointer, a sum.
   printf '%s\n' '(module dbgv)' \

@@ -8,14 +8,14 @@ quality is secondary, and compile speed is primary (target: ≥10× faster than 
 LLVM backend end-to-end).
 
 ## Files
-- `src/compiler/a64.coil` — AArch64 instruction encoder. Pure: appends u32
+- `src/compiler/object/a64.coil` — AArch64 instruction encoder. Pure: appends u32
   instructions to a code buffer; label/fixup management for branches.
-- `src/compiler/macho.coil` — Mach-O `MH_OBJECT` writer: sections, relocations
+- `src/compiler/object/macho.coil` — Mach-O `MH_OBJECT` writer: sections, relocations
   (`BRANCH26`, `PAGE21`, `PAGEOFF12`, `UNSIGNED`), symbol table, string table.
-- `src/compiler/dwarf.coil` — DWARF v4 emitters: `__debug_line` (per-expression
+- `src/compiler/object/dwarf.coil` — DWARF v4 emitters: `__debug_line` (per-expression
   rows), `__debug_abbrev`/`__debug_info` (CU, subprograms, params/locals),
   `__debug_str`.
-- `src/compiler/codegen_a64.coil` — the lowering: mono `Program` → code+data+
+- `src/compiler/backend/codegen_a64.coil` — the lowering: mono `Program` → code+data+
   relocs+DWARF. Mirrors `codegen.coil`'s `emit-expr` structure and semantics
   (the LLVM backend is the behavioral spec) but emits machine code.
 - `src/compiler/main.coil` — `build <file> -o out --backend arm64` plumbs the
@@ -82,7 +82,7 @@ substitution it parses each line and lowers structurally:
   keeps results bit-identical to the LLVM backend's, which is what the
   runtime corpus gate compares — see `codegen_a64.coil`'s `emit-vec-fbin!`).
 - scalar float math intrinsics (`@llvm.<op>.f32` / `.f64`, the operations
-  `coil.math` is written over; the table is `src/compiler/float_math.coil`) →
+  `coil.math` is written over; the table is `src/compiler/backend/float_math.coil`) →
   `fsqrt`, `fabs`, `frintm`/`frintp`/`frintz`/`frinta`/`frintn`, `fmadd`, and
   `fmin`/`fmax` for `minimum`/`maximum`; `copysign` and the transcendentals call
   the libm function (`sinf`, `atan2`, …). `roundeven` calls C99 `nearbyint`,

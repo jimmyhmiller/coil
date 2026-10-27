@@ -373,13 +373,13 @@ bridge compiler.
 
 Audit consumers by semantic role, not just global search-and-replace:
 
-- `src/compiler/parser.coil`: primitive dispatch, simple parameter parsing,
+- `src/compiler/frontend/parser.coil`: primitive dispatch, simple parameter parsing,
   built-in definition guards, internal projection parsing.
-- `src/compiler/expander.coil`: binder traversal, staged declaration expansion,
+- `src/compiler/frontend/expander.coil`: binder traversal, staged declaration expansion,
   macro discovery, primitive-generated heads, hygiene and metadata transport.
-- `src/compiler/loader.coil` and `resolve.coil`: declaration/name indexing,
+- `src/compiler/frontend/loader.coil` and `resolve.coil`: declaration/name indexing,
   type-head resolution, exports and imports, normalized declaration visibility.
-- `src/compiler/check.coil`: anonymous contextual typing, exact constructor type
+- `src/compiler/frontend/check.coil`: anonymous contextual typing, exact constructor type
   checks, indexed views, named-call labels, ownership and diagnostics.
 - `src/compiler/prelude.coil` and new binding module: dependency layering,
   public reexports and the macro/helper implementations.

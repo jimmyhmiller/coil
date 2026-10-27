@@ -357,7 +357,7 @@ today regresses.
 ## NEXT STEPS (ordered — resume here)
 
 1. **Commit Phase 1b** (the comptime-UB guard). Implemented and verified, sitting uncommitted in
-   `src/compiler/comptime_eval.coil`. It is a standalone bug fix and stands on its own merit
+   `src/compiler/comptime/comptime_eval.coil`. It is a standalone bug fix and stands on its own merit
    whether or not the deletion proceeds.
 2. **Refresh the nollvm seed** as its own commit, so `rebootstrap-nollvm.sh` works from a clean
    checkout again. Independent of the deletion; currently masks real nollvm verification behind

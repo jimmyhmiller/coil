@@ -8,7 +8,7 @@ if the abort comes back, start from [If it returns](#if-it-returns).
 
 ## What was originally reported
 
-Patching `src/compiler/loader.coil` so `read-file` sized its output list up front instead
+Patching `src/compiler/frontend/loader.coil` so `read-file` sized its output list up front instead
 of pushing one byte at a time, rebuilding the compiler, then:
 
 ```

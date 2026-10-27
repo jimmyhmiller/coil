@@ -39,19 +39,19 @@ command -v "$LLVM_CONFIG" >/dev/null 2>&1 || {
 # reports somewhere else.
 LIBDIR="${COIL_LLVM_LIBDIR:-$("$LLVM_CONFIG" --libdir)}"
 
-# the components the Coil backend actually calls into (see src/compiler/ffi.coil):
+# the components the Coil backend actually calls into (see src/compiler/support/ffi.coil):
 # IR construction + the three targets it can emit for + the O3 pass pipeline.
 COMPONENTS="core target analysis passes executionengine mcjit orcjit jitlink aarch64 x86 riscv webassembly"
 
 emit() { for f in "$@"; do printf -- '--link-flag %s ' "$f"; done; }
 
 # The LLVM C entry points the shipped coil.jit unit reaches and the compiler's own
-# code never calls, declared in ONE place: src/compiler/orc.coil, the typed C
+# code never calls, declared in ONE place: src/compiler/jit/orc.coil, the typed C
 # boundary to LLVM's object linker. Derived rather than listed here so the two
 # cannot drift as that boundary grows.
 jit_boundary_symbols() {
   sed -n 's/^(extern \(LLVM[A-Za-z0-9_]*\).*/\1/p' \
-    "$(dirname "$0")/../../src/compiler/orc.coil" | sort -u
+    "$(dirname "$0")/../../src/compiler/jit/orc.coil" | sort -u
 }
 
 case "$MODE" in
