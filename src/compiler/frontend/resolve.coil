@@ -1,23 +1,12 @@
 ; src/compiler/frontend/resolve.coil — self-host Coil compiler, resolve module.
 
 (module coil.compiler.resolve)
-(import "coil.compiler.retained_heap" :as retained-heap)
 (import "coil.primitive" :as primitive)
 (import "coil.compiler.unit_state" :use *)
 
 (defstruct ResolveUnitState
   [(implementations ImplQualBox)
    (memo ResMemo)
-   (dependency_owner (slice u8))
-   (dependency_init bool)
-   ; dependency_reads and every set in it are allocated here, not by the unit, so
-   ; a command that runs many compilations in one unit can drop them
-   ; (dependency-reads-reset!). Opened on first use; closed with the unit.
-   (dependency_arena (ptr scratch/ScratchArena))
-   (macro_dependencies_init bool)
-   (macro_dependencies (HashMap i64 (ptr MacroDependencyList)))
-   (dependency_reads (HashMap (slice u8) (ptr (HashMap (slice u8) i64))))
-   (resolving_dependencies (ptr (HashMap (slice u8) i64)))
    ; While `alias_capture` is set, the qualified alias the last selected
    ; declaration was reached through, or "" (`resolve-alias-in`).
    (alias_capture bool)
@@ -53,8 +42,6 @@
 (import "coil.control" :use *)
 (import "coil.try" :use *)
 (import "coil.compiler.ast" :use *)
-(import "coil.compiler.resolution_base" :as resbase)
-(import "coil.compiler.declaration_base" :as declbase)
 (import "coil.compiler.astdump" :use *)
 (import "coil.compiler.check" :use *)
 (import "coil.compiler.loader" :use *)
@@ -97,10 +84,7 @@
 ; lookup falls back to the scan, which keeps the index a pure optimisation: delete the
 ; build call and the compiler still resolves identically, only slower.
 (defstruct DefEntry
-  [(module (slice u8)) (defs Defs) (idx (HashMap (slice u8) i64)) (built i64)
-   ; Accepted names live outside the relocating snapshot. `idx` is only this
-   ; candidate's overlay; zero is a tombstone for a retired declaration.
-   (base (ptr declbase/DeclarationBase))])
+  [(module (slice u8)) (defs Defs) (idx (HashMap (slice u8) i64)) (built i64)])
 
 ; A form revision is semantic input identity, not an ArrayList position. `node-id`
 ; identifies the authored/generated root and `shape` changes whenever expansion
@@ -218,19 +202,6 @@
           (set! (.unit_entry ws) false)
           (set! (.value slot) (primitive/cast (ptr i8) ws))
           ws))))
-
-;;; A completed compilation never resolves one of its cached form revisions
-;;; again. A later incremental compilation reads the accepted declaration table
-;;; and persistent resolution bases, then records its own revisions in a fresh
-;;; workspace. Drop the completed parser/resolver cache before publication so
-;;; accepted source syntax is not copied into every subsequent snapshot.
-(defn semantic-discard-revisions! [(s (mut LS))] (-> i64)
-  (let [ws (semantic-workspace (mut s)) a (.owner (load (field s semantic_workspace)))]
-    (set! (.resolved_revisions ws) (ArrayList::new [ResolvedRevision] a))
-    (set! (.revision_heads ws) (HashMap::new [i64 i64] a (i64-keyops)))
-    (set! (.failed_parses ws) (HashMap::new [i64 i64] a (i64-keyops)))
-    (set! (.lazy_headers ws) (HashMap::new [i64 (ptr LazyHeader)] a (i64-keyops)))
-    0))
 
 (defn semantic-adopt-form! [(ws (ptr SemanticWorkspace)) (tf (ptr TaggedForm))] (-> i64)
   ; Positive ids originate outside the workspace (loader or a native
@@ -884,7 +855,7 @@
 (defn hint-catalog-build [(a (dyn Allocator))] (-> (ptr (ArrayList HintModule)))
   (let [out (box! a (ArrayList HintModule) (ArrayList::new [HintModule] a))
         work (primitive/alloc-stack scratch/ScratchArena)]
-    (scratch/ScratchArena::init-with-capacity work (retained-heap/compiler-scratch-parent) 65536)
+    (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
     (when (bundled-stdlib-enabled? a)
       (let [layout (stdlib-layout a)
             libs (.libs layout)
@@ -1184,10 +1155,7 @@
 (defn defs-mask [(e (ptr DefEntry)) (name (slice u8))] (-> i64)
   (match (get (.idx e) name)
     (Some [mask] mask)
-    (None []
-      (match (declbase/declaration-base-get (.base e) (.module e) name)
-        (Some [mask] mask)
-        (None [] 0)))))
+    (None [] 0)))
 
 ; The mask spelled by this entry's current legacy declaration lists, without
 ; consulting its accepted base. Publication uses this for names changed or
@@ -1257,274 +1225,10 @@
               (set! (mut seen) key 0)))))
       (Ok [i64 Diag] 0))))
 
-; Drop alias pairs whose qualified target was pruned from the retained
-; declarations, and every shadowed pair after a name's winning pair.
-(defn defs-prune-aliases! [(a (dyn Allocator)) (e (ptr DefEntry))
-                           (names (HashMap (slice u8) i64))] (-> i64)
-  (let [pairs (field (field e defs) aliases)
-        (mut kept) (ArrayList::new [(slice u8)] a)]
-    (for [i 0 (/ (len (load pairs)) 2)]
-      (let [name (get (load pairs) (* i 2))
-            target (get (load pairs) (+ (* i 2) 1))]
-        (unless (or (>= (defs-alias-index (mut kept) name) 0)
-                    (contains? names (sconcat3 a (.module e) "." target)))
-          (push! (mut kept) name)
-          (push! (mut kept) target)
-          0)))
-    (set! (.aliases (.defs e)) (load kept))
-    (for [i 0 (/ (len (load pairs)) 2)]
-      (let [name (get (load pairs) (* i 2))]
-        (when (< (defs-alias-index (field (field e defs) aliases) name) 0)
-          (defs-index-refresh-name! e name) 0)))
-    0))
-
-; The declaration name that NAME denotes in module entry E: its alias target,
-; or NAME itself. Aliases do not chain; a target must be a real declaration.
-(defstruct MacroDependency [(source i64) (lo i64) (hi i64) (name (slice u8))])
-(defstruct MacroDependencyList [(calls (ArrayList MacroDependency)) (sorted bool)])
-
-(defn dependency-macro-sift! [(list (ptr MacroDependencyList)) (start i64) (count i64)] (-> i64)
-  (let [(mut root) start saved (primitive/alloc-stack MacroDependency)]
-    (loop
-      (when (>= root (/ count 2)) (break))
-      (let [(mut child) (+ (* root 2) 1)]
-        (when (and (< (+ child 1) count)
-                   (< (.lo (get (.calls list) child)) (.lo (get (.calls list) (+ child 1)))))
-          (set! child (+ child 1)) 0)
-        (when (>= (.lo (get (.calls list) root)) (.lo (get (.calls list) child))) (break))
-        (store! saved (get (.calls list) root))
-        (store! (elem (field list calls) root) (get (.calls list) child))
-        (store! (elem (field list calls) child) (load saved))
-        (set! root child)))
-    0))
-
-;;; In-place heapsort keeps the expansion index portable and bounded in memory.
-(defn dependency-macro-sort! [(list (ptr MacroDependencyList))] (-> i64)
-  (let [n (len (.calls list)) (mut root) (/ n 2) (mut end) n
-        saved (primitive/alloc-stack MacroDependency)]
-    (loop (when (<= root 0) (break))
-      (set! root (- root 1)) (dependency-macro-sift! list root n))
-    (loop (when (<= end 1) (break))
-      (set! end (- end 1))
-      (store! saved (get (.calls list) 0))
-      (store! (elem (field list calls) 0) (get (.calls list) end))
-      (store! (elem (field list calls) end) (load saved))
-      (dependency-macro-sift! list 0 end))
-    0))
-
-(defn dependency-macro-record! [(node Sexp) (name (slice u8))] (-> i64)
-  (let [state (resolve-unit-state) a (unit-allocator)]
-    (when (and (>= (sx-source node) 0) (>= (sx-lo node) 0))
-      (unless (.macro_dependencies_init state)
-        (set! (.macro_dependencies state) (HashMap::new [i64 (ptr MacroDependencyList)] a (i64-keyops)))
-        (set! (.macro_dependencies_init state) true) 0)
-      (let [list (match (get (.macro_dependencies state) (sx-source node))
-                    (Some [list] list)
-                    (None [] (let [list (box! a MacroDependencyList
-                                         (MacroDependencyList :calls (ArrayList::new [MacroDependency] a) :sorted false))]
-                               (set! (mut (.macro_dependencies state)) (sx-source node) list) list)))]
-        (push! (mut (.calls list))
-          (MacroDependency :source (sx-source node) :lo (sx-lo node) :hi (sx-hi node) :name (sconcat a name "")))
-        (set! (.sorted list) false)) 0)
-    0))
-
-(defn dependency-function-reads! [(f (ptr Func)) (out (mut (HashMap (slice u8) i64)))] (-> i64)
-  (dependency-reads! (.name f) (mut out))
-  (let [state (resolve-unit-state)]
-    (when (.macro_dependencies_init state)
-      (match (get (.macro_dependencies state) (.source f))
-        (None [] 0)
-        (Some [list]
-          (unless (.sorted list)
-            (dependency-macro-sort! list)
-            (set! (.sorted list) true) 0)
-          (let [(mut low) 0 (mut high) (len (.calls list))]
-            (loop
-              (when (>= low high) (break))
-              (let [mid (+ low (/ (- high low) 2))]
-                (if (< (.lo (get (.calls list) mid)) (.lo f))
-                    (set! low (+ mid 1)) (set! high mid))))
-            (for [i low (len (.calls list))]
-              (let [call (elem (field list calls) i)]
-                (when (> (.lo call) (.hi f)) (break))
-                (when (<= (.hi call) (.hi f)) (set! (mut out) (.name call) 0) 0)))) 0)) 0)
-    0))
-
-(defn dependency-arena-release [(p (ptr i8))] (-> i64)
-  (close! (primitive/cast (ptr scratch/ScratchArena) p)))
-
-;;; Where the dependency tables are allocated (see ResolveUnitState).
-(defn dependency-allocator [] (-> (dyn Allocator))
-  (let [state (resolve-unit-state)]
-    (when (= (primitive/cast i64 (.dependency_arena state)) 0)
-      (let [arena (box! (unit-allocator) scratch/ScratchArena (primitive/zeroed scratch/ScratchArena))]
-        (scratch/ScratchArena::init-with-capacity arena (retained-heap/compiler-scratch-parent) 65536)
-        (unit-resource! (primitive/cast (ptr i8) arena) (primitive/fnptr-of dependency-arena-release))
-        (set! (.dependency_arena state) arena))
-      0)
-    (allocator (.dependency_arena state))))
-
-(defn dependency-reads-init! [] (-> i64)
-  (let [state (resolve-unit-state)]
-    (unless (.dependency_init state)
-      (set! (.dependency_reads state)
-        (HashMap::new [(slice u8) (ptr (HashMap (slice u8) i64))] (dependency-allocator) (keyops)))
-      (set! (.dependency_init state) true) 0))
-  0)
-
-;;; Forget every definition's recorded reads and release their storage. For a
-;;; command that analyses the same program again from scratch in one unit
-;;; (`lint --fix`): each analysis re-records every definition, and the sets it
-;;; replaced stayed in the unit until it ended.
-(defn dependency-reads-reset! [] (-> i64)
-  (let [state (resolve-unit-state)]
-    (set! (.dependency_init state) false)
-    (set! (.dependency_owner state) "")
-    (unless (= (primitive/cast i64 (.dependency_arena state)) 0)
-      (reset! (.dependency_arena state))
-      0))
-  0)
-
-(defn dependency-owner-enter! [(name (slice u8)) (reset bool)] (-> i64)
-  (let [state (resolve-unit-state)]
-    (set! (.dependency_owner state) name)
-    (when (and reset (.dependency_init state))
-      (remove! (mut (.dependency_reads state)) name) 0)
-    (dependency-reads-init!)
-    (unless (dependency-current? name)
-      (set! (mut (.dependency_reads state)) name
-        (box! (dependency-allocator) (HashMap (slice u8) i64)
-          (HashMap::new [(slice u8) i64] (dependency-allocator) (keyops)))) 0)
-    0))
-
-(defn dependency-current? [(name (slice u8))] (-> bool)
-  (let [state (resolve-unit-state)]
-    (and (.dependency_init state)
-         (contains? (.dependency_reads state) name))))
-
-(defn dependency-reads! [(owner (slice u8)) (out (mut (HashMap (slice u8) i64)))] (-> i64)
-  (let [state (resolve-unit-state)]
-    (when (.dependency_init state)
-      (match (get (.dependency_reads state) owner)
-        (None [] 0)
-        (Some [names]
-          (for [i 0 (.cap (load names))]
-            (let [entry (primitive/index (.slots (load names)) i)]
-              (when (= (.state entry) 1) (set! (mut out) (.key entry) 0) 0))) 0)) 0)
-    0))
-
-;;; What MODULE uses outside any of its declarations — its exports, `export-c`s,
-;;; `static-assert`s, `meta` forms, impl methods and metaprogram registrations — is
-;;; recorded as the reads of this owner. It holds a space, so no qualified
-;;; declaration name is ever the same key.
-(defn module-uses-key [(module (slice u8))] (-> (slice u8))
-  (sconcat (dependency-allocator) "module " module))
-
-;;; Make MODULE itself the owner of the reads that follow; answers the owner to
-;;; restore with `dependency-owner-leave!`.
-(defn module-owner-enter! [(module (slice u8))] (-> (slice u8))
-  (let [previous (.dependency_owner (resolve-unit-state))]
-    (dependency-owner-enter! (module-uses-key module) false)
-    previous))
-
-(defn dependency-owner-leave! [(previous (slice u8))] (-> i64)
-  (set! (.dependency_owner (resolve-unit-state)) previous)
-  0)
-
-;;; Record that MODULE itself uses the declaration NAME.
-(defn module-use-record! [(module (slice u8)) (name (slice u8))] (-> i64)
-  (let [previous (module-owner-enter! module)]
-    (dependency-record! name)
-    (dependency-owner-leave! previous)))
-
-;;; Add what MODULE uses outside its declarations to OUT: the reads recorded for it,
-;;; and every macro called in one of its sources outside all of FUNCS. A `defn` or
-;;; `deftest` call spans exactly the function it makes, so only a call no function
-;;; contains is the module's own: a top-level macro call, or one in an impl, a
-;;; constant or an assertion.
-(defn module-uses! [(module (slice u8))
-                    (funcs (ptr (ArrayList Func)))
-                    (out (mut (HashMap (slice u8) i64)))] (-> i64)
-  (dependency-reads! (module-uses-key module) (mut out))
-  (let [state (resolve-unit-state)]
-    (when (.macro_dependencies_init state)
-      (let [a (dependency-allocator)
-            ; each source's function spans, sorted by start; functions never nest
-            (mut spans) (HashMap::new [i64 (ptr (ArrayList Func))] a (i64-keyops))]
-        (for f (iter (load funcs))
-          (when (= (src-mod-lookup (.source f)) module)
-            (let [list (match (get spans (.source f))
-                         (Some [l] l)
-                         (None [] (let [l (box! a (ArrayList Func) (ArrayList::new [Func] a))]
-                                    (set! (mut spans) (.source f) l)
-                                    l)))]
-              (push! list f)) 0))
-        (for source (iter (.macro_dependencies state))
-          (when (= (src-mod-lookup source) module)
-            (let [fs (match (get spans source)
-                       (Some [l] (do (sort-by-lo! l) l))
-                       (None [] (primitive/cast (ptr (ArrayList Func)) 0)))
-                  calls (match (get (.macro_dependencies state) source)
-                          (Some [list] (.calls list))
-                          (None [] (ArrayList::new [MacroDependency] a)))]
-              (for call (iter calls)
-                (unless (span-contained? fs (.lo call) (.hi call))
-                  (set! (mut out) (.name call) 0) 0)))
-            0)))
-      0)
-    0))
-
-(defn sort-by-lo! [(fs (ptr (ArrayList Func)))] (-> i64)
-  (for [i 1 (len (load fs))]
-    (let [value (get (load fs) i) (mut j) i]
-      (loop
-        (when (or (<= j 0) (<= (.lo (get (load fs) (- j 1))) (.lo value))) (break))
-        (store! (elem fs j) (get (load fs) (- j 1)))
-        (set! j (- j 1)))
-      (store! (elem fs j) value)))
-  0)
-
-;;; Does a function in FS, sorted by start, contain the span LO..HI?
-(defn span-contained? [(fs (ptr (ArrayList Func))) (lo i64) (hi i64)] (-> bool)
-  (if (= (primitive/cast i64 fs) 0)
-      false
-      (let [(mut low) 0 (mut high) (len (load fs))]
-        ; the last function starting at or before LO
-        (loop
-          (when (>= low high) (break))
-          (let [mid (+ low (/ (- high low) 2))]
-            (if (<= (.lo (get (load fs) mid)) lo) (set! low (+ mid 1)) (set! high mid))))
-        (and (> low 0) (>= (.hi (get (load fs) (- low 1))) hi)))))
-
-(defn dependency-record! [(name (slice u8))] (-> i64)
-  (let [state (resolve-unit-state) owner (.dependency_owner state)]
-    (when (and (> (len owner) 0) (has-dot name))
-      (dependency-reads-init!)
-      (let [names (match (get (.dependency_reads state) owner)
-                    (Some [names] names)
-                    (None [] (let [names (box! (dependency-allocator) (HashMap (slice u8) i64)
-                                            (HashMap::new [(slice u8) i64] (dependency-allocator) (keyops)))]
-                               (set! (mut (.dependency_reads state)) owner names) names)))]
-        (set! names name 0)) 0)
-    0))
-
-;;; A bare NAME the module does not define: whatever answers it (an import,
-;;; coil.core, or the checker's method dispatch), a definition of NAME in the module
-;;; itself would capture it. The reader reads that absent name too, so that defining
-;;; it later stales the reader (a negative lookup).
-(defn dependency-capture-shadow! [(c (ptr Ctx)) (name (slice u8))] (-> i64)
-  (let [capture (.resolving_dependencies (resolve-unit-state))]
-    (unless (= (primitive/cast i64 capture) 0)
-      (set! capture (qualify-in-module (.a (res-memo)) (.m c) name) 0) 0)
-    0))
-
 ; Called only for a selected declaration, never while probing possible imports.
 (defn defs-resolved-target [(e (ptr DefEntry)) (name (slice u8))] (-> (slice u8))
   (let [target (defs-target e name)
-        state (resolve-unit-state)
-        capture (.resolving_dependencies state)]
-    (when (and (!= target name) (!= (primitive/cast i64 capture) 0))
-      (set! capture (qualify-in-module (.a (res-memo)) (.module e) name) 0) 0)
+        state (resolve-unit-state)]
     (when (and (!= target name) (.alias_capture state))
       (set! (.alias_seen state) (qualify-in-module (.a (res-memo)) (.module e) name)) 0)
     target))
@@ -1633,8 +1337,6 @@
           0)
         (let [e (table-find table m)]
           (unless (= (primitive/cast i64 e) 0)
-            (unless (= (.base e) (declbase/declaration-no-base))
-              (panic "module-own-public-names: {} has a retained session's declarations; build-unit compiles without one" m))
             (for [kind 0 7]
               (let [names (defs-set (field e defs) kind)]
                 (for [k 0 (len (load names))] (public-name-add! out (get (load names) k)) 0))
@@ -1715,9 +1417,6 @@
       ; so it is in the table if it declares anything.
       (let [e (table-find table m)]
         (unless (= (primitive/cast i64 e) 0)
-          ; Its own lists hold every name only when no accepted base sits under them.
-          (unless (= (.base e) (declbase/declaration-no-base))
-            (panic "module-public-names: {} has a retained session's declarations; build-unit compiles without one" m))
           (for [kind 0 7]
             (let [names (defs-set (field e defs) kind)]
               (for [k 0 (len (load names))] (reexport-add-name! out (get (load names) k)) 0))
@@ -2019,7 +1718,7 @@
 ; built for the site that raised it, and reusing one would misreport the second site.
 ; The memo is scoped to a resolve pass and its declaration/import/export context.
 ; Macro expansion can change that environment without changing the module name.
-(defstruct ResolutionAnswer [(target (slice u8)) (reads (ptr (HashMap (slice u8) i64)))])
+(defstruct ResolutionAnswer [(target (slice u8))])
 
 (defstruct ResMemo
   [(mod (slice u8))
@@ -2083,34 +1782,14 @@
       (set! (.exports rm) (primitive/cast (ptr i8) (.exp c))))
     (let [mp (res-memo-map rm kind)]
       (match (get (load mp) name)
-        (Some [hit]
-          (resolution-answer-record! hit)
-          (Ok [(slice u8) Diag] (.target hit)))
+        (Some [hit] (Ok [(slice u8) Diag] (.target hit)))
         (None []
-          (let [state (resolve-unit-state)
-                previous (.resolving_dependencies state)
-                reads (box! (unit-allocator) (HashMap (slice u8) i64)
-                        (HashMap::new [(slice u8) i64] (unit-allocator) (keyops)))
-                _capture (set! (.resolving_dependencies state) reads)
-                result (resolve-uncached c name kind)]
-            (set! (.resolving_dependencies state) previous)
-            (match result
-              (Err [d] (Err [(slice u8) Diag] d))
-              (Ok [unaliased]
-                (set! (.resolving_dependencies state) reads)
-                (let [q (qualified-alias-target c unaliased)
-                      answer (ResolutionAnswer :target q :reads reads)]
-                  (set! (.resolving_dependencies state) previous)
-                  (set! (mut mp) name answer)
-                  (resolution-answer-record! answer)
-                  (Ok [(slice u8) Diag] q))))))))))
-
-(defn resolution-answer-record! [(answer ResolutionAnswer)] (-> i64)
-  (dependency-record! (.target answer))
-  (for [i 0 (.cap (load (.reads answer)))]
-    (let [entry (primitive/index (.slots (load (.reads answer))) i)]
-      (when (= (.state entry) 1) (dependency-record! (.key entry)) 0)))
-  0)
+          (match (resolve-uncached c name kind)
+            (Err [d] (Err [(slice u8) Diag] d))
+            (Ok [unaliased]
+              (let [q (qualified-alias-target c unaliased)]
+                (set! (mut mp) name (ResolutionAnswer :target q))
+                (Ok [(slice u8) Diag] q)))))))))
 
 ; A fully qualified `module.name` spelling bypasses module-local lookup. When
 ; that module declares `name` as an alias, the reference denotes its target.
@@ -2263,7 +1942,6 @@
                    (defs-has? tf kind name))
               (Ok [(slice u8) Diag] (qualify-in-module a m (defs-resolved-target tf name)))
               (match (do
-                       (dependency-capture-shadow! c name)
                        (if (!= (primitive/cast i64 imp) 0)
                          (resolve-use c imp name kind)
                          (Ok [(Option (slice u8)) Diag] (None [(slice u8)]))))
@@ -4608,19 +4286,8 @@
              (load ok)))
     (_ false)))
 
-; The SIGNATURE (name, cc, bounds, param/return types). An error here is FATAL: an
-; unqualified name or a bad type corrupts the shared tables the checker reads, so
-; continuing past it cascades. These abort the pipeline as before.
-(defn dependency-function-owner [(c (ptr Ctx)) (f (ptr Func))] (-> (slice u8))
-  (if (and (= (.name f) "main") (and (not (rs-sig-is-code? f)) (main-stays-bare? (.m c))))
-      "main" (qualify-in-module (.a c) (.m c) (.name f))))
-
 (defn qualify-func-sig [(c (ptr Ctx)) (fp (ptr Func))] (-> (Result i64 Diag))
-  (let [state (resolve-unit-state) previous (.dependency_owner state)
-        _owner (dependency-owner-enter! (dependency-function-owner c fp) true)
-        result (qualify-func-sig-inner c fp)]
-    (set! (.dependency_owner state) previous)
-    result))
+  (qualify-func-sig-inner c fp))
 
 (defn qualify-func-sig-inner [(c (ptr Ctx)) (fp (ptr Func))] (-> (Result i64 Diag))
   (let [a (.a c)
@@ -4651,11 +4318,7 @@
 ; so q-funcs collects it and moves on, and the checker skips this body while keeping
 ; the (already-resolved) signature. `fname` names the enclosing function in any error.
 (defn qualify-func-body [(c (ptr Ctx)) (fp (ptr Func))] (-> (Result i64 Diag))
-  (let [state (resolve-unit-state) previous (.dependency_owner state)
-        _owner (dependency-owner-enter! (dependency-function-owner c fp) false)
-        result (qualify-func-body-inner c fp)]
-    (set! (.dependency_owner state) previous)
-    result))
+  (qualify-func-body-inner c fp))
 
 (defn qualify-func-body-inner [(c (ptr Ctx)) (fp (ptr Func))] (-> (Result i64 Diag))
   (let [tps (load (field fp type_params))]
@@ -4690,11 +4353,7 @@
 
 (defn qualify-one-struct [(c (ptr Ctx)) (sp (ptr StructDef))] (-> (Result i64
                                                                           Diag))
-  (let [state (resolve-unit-state) previous (.dependency_owner state)
-        _owner (dependency-owner-enter! (qualify-in-module (.a c) (.m c) (.name sp)) true)
-        result (qualify-one-struct-inner c sp)]
-    (set! (.dependency_owner state) previous)
-    result))
+  (qualify-one-struct-inner c sp))
 
 (defn qualify-one-struct-inner [(c (ptr Ctx)) (sp (ptr StructDef))] (-> (Result i64
                                                                           Diag))
@@ -4735,11 +4394,7 @@
     (if (load failed) (Err (load err)) (Ok [i64 Diag] 0))))
 
 (defn qualify-one-sum [(c (ptr Ctx)) (sp (ptr SumDef))] (-> (Result i64 Diag))
-  (let [state (resolve-unit-state) previous (.dependency_owner state)
-        _owner (dependency-owner-enter! (qualify-in-module (.a c) (.m c) (.name sp)) true)
-        result (qualify-one-sum-inner c sp)]
-    (set! (.dependency_owner state) previous)
-    result))
+  (qualify-one-sum-inner c sp))
 
 (defn qualify-one-sum-inner [(c (ptr Ctx)) (sp (ptr SumDef))] (-> (Result i64 Diag))
   (let [a (.a c)
@@ -4821,11 +4476,7 @@
                          (kp (ptr Const))
                          (empty (ptr (ArrayList (slice u8))))] (-> (Result i64
                                                                            Diag))
-  (let [state (resolve-unit-state) previous (.dependency_owner state)
-        _owner (dependency-owner-enter! (qualify-in-module (.a c) (.m c) (.name kp)) true)
-        result (qualify-one-const-inner c kp empty)]
-    (set! (.dependency_owner state) previous)
-    result))
+  (qualify-one-const-inner c kp empty))
 
 (defn qualify-one-const-inner [(c (ptr Ctx))
                          (kp (ptr Const))
@@ -4902,19 +4553,11 @@
 ;;; read it. A trait's type parameter is bound by the trait, so whatever the module
 ;;; later declares under its name, the trait's meaning stays the same.
 (defn resolve-unread [(c (ptr Ctx)) (name (slice u8)) (kind i64)] (-> (Result (slice u8) Diag))
-  (let [state (resolve-unit-state) previous (.dependency_owner state)]
-    (set! (.dependency_owner state) "")
-    (let [result (resolve c name kind)]
-      (set! (.dependency_owner state) previous)
-      result)))
+  (resolve c name kind))
 
 (defn qualify-one-trait [(c (ptr Ctx)) (tp (ptr TraitDef))] (-> (Result i64
                                                                         Diag))
-  (let [state (resolve-unit-state) previous (.dependency_owner state)
-        _owner (dependency-owner-enter! (qualify-in-module (.a c) (.m c) (.name tp)) true)
-        result (qualify-one-trait-inner c tp)]
-    (set! (.dependency_owner state) previous)
-    result))
+  (qualify-one-trait-inner c tp))
 
 (defn qualify-one-trait-inner [(c (ptr Ctx)) (tp (ptr TraitDef))] (-> (Result i64
                                                                         Diag))
@@ -5005,16 +4648,11 @@
               (break)
               (do
                 (let [fp (elem ms (load i))]
-                  (let [state (resolve-unit-state) previous (.dependency_owner state)
-                        name (if (impl-is-trait ip)
+                  (let [name (if (impl-is-trait ip)
                                  (tmfn (.a c) (impl-trait-name ip)
                                    (impl-mangle-key (.a c) (field ip self_type) (.type_params ip)) (.name fp))
                                  (inherent-fn-name (.a c) ip (.name fp)))
-                        _owner (dependency-owner-enter! name true)
                         result (qualify-impl-method c fp (.type_params fp))]
-                    (set! (.dependency_owner state) previous)
-                    ; nothing names an impl's method; the impl is the module's use of it
-                    (module-use-record! (.m c) name)
                     (match result
                     (Err [d] (do (set! err d) (set! failed true) (break)))
                     (Ok [_] 0))))
@@ -5344,13 +4982,6 @@
       0)
     (if (load failed) (Err [i64 Diag] (load failure))
         (do
-          (unless (= (primitive/cast i64 (.aliases p)) 0)
-            (for ad (iter (load (.aliases p)))
-              (let [state (resolve-unit-state) previous (.dependency_owner state)
-                    name (qualify-in-module a (.m c) (.name ad))]
-                (dependency-owner-enter! name true)
-                (dependency-record! (qualify-in-module a (.m c) (.target ad)))
-                (set! (.dependency_owner state) previous))) 0)
           (Ok [i64 Diag] 0)))))
 
 (defn q-module-level [(c (ptr Ctx))
@@ -5360,17 +4991,6 @@
            (try! (q-asserts c p empty))
            (try! (q-metas c p empty))
            (Ok 0))))
-
-;;; The names the module's `export` list publishes are uses of the module's own
-;;; declarations by whoever imports it.
-(defn module-exports-record! [(c (ptr Ctx))] (-> i64)
-  (unless (= (primitive/cast i64 (.exp c)) 0)
-    (for entry (iter (load (.exp c)))
-      (when (= (.name entry) (.m c))
-        (for name (iter (.names entry))
-          (module-use-record! (.m c) (qualify-in-module (dependency-allocator) (.m c) name)))
-        0)))
-  0)
 
 (defn qualify-program [(c (ptr Ctx)) (p (ptr Program))] (-> (Result i64 Diag))
   (let [empty (empty-strs (.a c))]
@@ -5393,13 +5013,7 @@
            (try! (q-sums c p))
            (try! (q-convs c p))
            (try! (q-externs c p empty))
-           ; What the module does at top level, outside its declarations, reads as
-           ; the module's own uses (`module-uses!`).
-           (let [previous (module-owner-enter! (.m c))
-                 result (q-module-level c p empty)]
-             (dependency-owner-leave! previous)
-             (try! result))
-           (module-exports-record! c)
+           (try! (q-module-level c p empty))
            (try! (q-consts c p empty))
            (try! (q-traits c p))
            (try! (q-impls c p empty))
@@ -5700,7 +5314,6 @@
           ; no index yet — `defs-has?` scans until build-deftable builds one
           (set! (.built e) 0)
           (set! (.idx e) (HashMap::new [(slice u8) i64] a (keyops)))
-          (set! (.base e) (declbase/declaration-no-base))
           (push! (mut (.items tb)) (load e))
           (elem (field tb items) n)))))
 
@@ -5852,23 +5465,7 @@
                      prog)
     (.defs (elem (field tb items) 0))))
 
-(defn defs-index-overlay-kinds! [(e (ptr DefEntry)) (d (ptr Defs))] (-> i64)
-  (for [kind 0 7]
-    (defs-index-kind! e (defs-set d kind) (defs-kind-bit kind)))
-  0)
-
-(defn defs-index-overlay-aliases! [(e (ptr DefEntry)) (d (ptr Defs))] (-> i64)
-  (let [pairs (field d aliases)]
-    (for [i 0 (/ (len (load pairs)) 2)]
-      (let [name (get (load pairs) (* i 2))
-            target (get (load pairs) (+ (* i 2) 1))]
-        (when (= (defs-alias-index pairs name) (* i 2))
-          (set! (mut (.idx e)) name (defs-mask e target)) 0))))
-  0)
-
-(defn build-deftable [(a (dyn Allocator)) (parsed (ptr (ArrayList ParsedForm)))
-                       (base (ptr declbase/DeclarationBase))
-                       (removed (ptr (ArrayList (slice u8))))]
+(defn build-deftable [(a (dyn Allocator)) (parsed (ptr (ArrayList ParsedForm)))]
   (-> (ptr (ArrayList DefEntry)))
   (let [tb (box! a TBox (primitive/zeroed TBox))
         n (len (load parsed))
@@ -5886,52 +5483,16 @@
                                         (None [] "")))]
                     (merge-defs! (mut (.defs de)) (field pf defs))))
                 (set! i (primitive/iadd (load i) 1)))))
-    ; Every module is filled now. With no accepted base this is an ordinary full
-    ; compile and the local indexes are complete. A retained candidate indexes
-    ; only fresh forms and reads every unchanged name through the immutable base.
+    ; Every module is filled now, so the indexes are complete.
     (let [ne (len (.items tb))
           (mut k) 0]
       (loop (if (>= (load k) ne)
                 (break)
                 (do
                   (let [entry (elem (field tb items) (load k))]
-                    (set! (.base entry) base)
                     (set! (.built entry) 1)
-                    (when (= base (declbase/declaration-no-base))
-                      (defs-index-build! a entry) 0))
+                    (defs-index-build! a entry))
                   (set! k (primitive/iadd (load k) 1))))))
-    (unless (= base (declbase/declaration-no-base))
-      ; A retired name is absent from the merged declarations but still present in
-      ; the base. Its overlay entry is what the module declares now (nothing, or
-      ; whatever this submission defines under that name below).
-      (for [i 0 (/ (len (load removed)) 2)]
-        (let [entry (table-getc a tb (get (load removed) (* i 2)))
-              name (get (load removed) (+ (* i 2) 1))]
-          (when (= (.base entry) (declbase/declaration-no-base))
-            (set! (.base entry) base) (set! (.built entry) 1) 0)
-          (set! (mut (.idx entry)) name (defs-local-mask entry name))))
-      (for [i 0 n]
-        (let [pf (elem parsed i)]
-          ; `fresh` means this particular resolve round had to clone/requalify
-          ; the form. A cached form from the current submission is still an
-          ; overlay relative to the accepted base; inherited catalog rows are
-          ; identified by their sentinel entry index instead. A skipped
-          ; declaration belongs to this submission despite lacking a body.
-          (when (or (>= (.entry_index pf) 0) (<= (.entry_index pf) -2))
-            (defs-index-overlay-kinds!
-              (table-find (field tb items)
-                (match (.module pf) (Some [m] m) (None [] "")))
-              (field pf defs)) 0)))
-      ; Aliases may precede their targets in source order. Resolve their kind
-      ; after every declaration in the submission has entered the overlay.
-      (for [i 0 n]
-        (let [pf (elem parsed i)]
-          (when (or (>= (.entry_index pf) 0) (<= (.entry_index pf) -2))
-            (defs-index-overlay-aliases!
-              (table-find (field tb items)
-                (match (.module pf) (Some [m] m) (None [] "")))
-              (field pf defs)) 0)))
-      0)
     (field tb items)))
 
 (defn def-names-equal? [(a (ptr (ArrayList (slice u8))))
@@ -7043,36 +6604,6 @@
           (elem (mut cache)
                 (primitive/isub (len (load cache)) 1))))))
 
-; Build the declaration view for an incremental epoch. A changed universe gets
-; fresh mutable Programs cloned from each revision's immutable parser snapshot;
-; the parser itself is never re-entered. Canonical syntax node-ids remain shared with
-; the loader so checker/type-of side tables join the same semantic nodes.
-;;; Cached resolutions of a retired alias or trait name are not inherited.
-(defn semantic-inherit-resolution! [(parent (ptr LS)) (rs (ptr (ArrayList Retirement)))] (-> i64)
-  (unless (= (primitive/cast i64 parent) 0)
-    (let [state (.resolution_state parent)]
-      (unless (= (primitive/cast i64 state) 0)
-        (when (!= (.init (.type_refs state)) 0)
-          (let [items (.lst (.type_refs state))]
-            (for [i 0 (len (load items))]
-              (let [e (elem items i)]
-                (unless (retired-leaf? rs (.raw e))
-                  (type-res-record (.module e) (.raw e) (.qual e)) 0)))))
-        (when (!= (.init (.value_refs state)) 0)
-          (let [items (.lst (.value_refs state))]
-            (for [i 0 (len (load items))]
-              (let [e (elem items i)]
-                (unless (retired-leaf? rs (.raw e))
-                  (value-res-record (.module e) (.raw e) (.qual e)) 0)))))
-        (when (!= (.init (.source_modules state)) 0)
-          (let [items (.lst (.source_modules state))]
-            (for [i 0 (len (load items))]
-              (let [e (elem items i)]
-                (src-mod-record (.source e) (.module e))))))
-        0))
-    0)
-  0)
-
 ;;; Names a changed declaration universe can re-resolve differently.
 ;;;
 ;;; A cached revision's qualification depends only on the declarations its syntax
@@ -7234,13 +6765,11 @@
         has-table (.has_declaration_table ws)
         comparison-work (primitive/alloc-stack scratch/ScratchArena)
         _comparison-init
-          (scratch/ScratchArena::init-with-capacity comparison-work (retained-heap/compiler-scratch-parent) 65536)
+          (scratch/ScratchArena::init-with-capacity comparison-work (malloc-allocator) 65536)
         comparison-a (allocator comparison-work)
-        (mut no-removed) (ArrayList::new [(slice u8)] comparison-a)
-        (mut removed) (retired-declaration-names comparison-a parsed parent)
         comparison
           (if has-table
-              (build-deftable comparison-a parsed (declbase/declaration-no-base) (mut no-removed))
+              (build-deftable comparison-a parsed)
               (primitive/cast (ptr (ArrayList DefEntry)) 0))
         same
           (and has-table (deftables-equal? (load (field ws declaration_table)) comparison))
@@ -7252,12 +6781,7 @@
         table
           (if same
               (load (field ws declaration_table))
-              (build-deftable owner parsed
-                (if (= (primitive/cast i64 parent) 0)
-                  (declbase/declaration-no-base)
-                  (primitive/cast (ptr declbase/DeclarationBase)
-                    (.persistent_declarations parent)))
-                (mut removed)))
+              (build-deftable owner parsed))
         changed-lengths (changed-name-lengths (mut changed))]
     (tr/count "semantic.declaration-table-reused" (if same 1 0))
     (unless same
@@ -7313,10 +6837,11 @@
       (value-res-reset)
       (src-mod-reset)
       (scope-at-reset)
-      (set! (.resolution_base (ast-unit-state))
-        (if (= (primitive/cast i64 parent) 0)
-          (resbase/resolution-no-base)
-          (.resolution_base (.resolution_state parent))))
+      (set! (.resolution_parent (ast-unit-state))
+        (if (or (= (primitive/cast i64 parent) 0)
+                (= (.resolution_state parent) (ast-unit-state)))
+          (primitive/cast (ptr AstUnitState) 0)
+          (.resolution_state parent)))
       (let [nf (len (load out-forms))
             (mut fi) 0]
         (loop (if (>= (load fi) nf)
@@ -7619,7 +7144,7 @@
              (derr "internal compiler error: a form probe ran before any resolve built its declaration table"))
         (let [bindings-work (primitive/alloc-stack scratch/ScratchArena)
               _bindings-init
-                (scratch/ScratchArena::init-with-capacity bindings-work (retained-heap/compiler-scratch-parent) 65536)
+                (scratch/ScratchArena::init-with-capacity bindings-work (malloc-allocator) 65536)
               bindings-a (allocator bindings-work)
               bindings-ls (primitive/alloc-stack LS)
               shared-ls (primitive/alloc-stack LS)
@@ -7759,15 +7284,6 @@
 (defn name-retirement? [(r (ptr Retirement))] (-> bool)
   (not (or (= (.kind r) 2) (= (.kind r) 3))))
 
-;;; Does any retirement of a declaration by name name LEAF, in any module?
-(defn retired-leaf? [(rs (ptr (ArrayList Retirement))) (name (slice u8))] (-> bool)
-  (let [leaf (name-leaf name)]
-    (block :found
-      (for [i 0 (len (load rs))]
-        (let [r (elem rs i)]
-          (when (and (name-retirement? r) (= (.name r) leaf)) (break :found true))))
-      false)))
-
 ;;; The variant names of MODULE's sum NAME in PARENT, unqualified.
 (defn retired-variant-names [(a (dyn Allocator)) (parent (ptr Program))
                              (module (slice u8)) (name (slice u8))] (-> (ArrayList (slice u8)))
@@ -7853,38 +7369,6 @@
         (set! (.methods out) (load methods))
         0))
     (load out)))
-
-;;; The names this submission's retirements remove from the parent's
-;;; declarations, as flat module/name pairs. A retained candidate reads every name
-;;; it does not declare through the accepted declaration base, so each of these
-;;; must be written into the candidate's overlay or it would still resolve.
-(defn retired-declaration-names [(a (dyn Allocator)) (parsed (ptr (ArrayList ParsedForm)))
-                                 (parent (ptr LS))] (-> (ArrayList (slice u8)))
-  (let [(mut out) (ArrayList::new [(slice u8)] a)]
-    (unless (= (primitive/cast i64 parent) 0)
-      (let [rs (submission-retirements a parsed)
-            (mut any) false]
-        (for [i 0 (len (load rs))]
-          (when (name-retirement? (elem rs i)) (set! any true) 0))
-        (when (load any)
-          (let [table (.declaration_table (semantic-workspace (mut parent)))]
-            (for [i 0 (len (load table))]
-              (let [entry (elem table i)
-                    module (.module entry)
-                    kept (primitive/alloc-stack Defs)]
-                (store! kept (retire-declarations a module (field entry defs) rs (.checked parent)))
-                (for [kind 0 7]
-                  (for name (iter (load (defs-set (field entry defs) kind)))
-                    (unless (set-contains (defs-set kept kind) name)
-                      (push! (mut out) module) (push! (mut out) name) 0)))
-                (let [pairs (field (field entry defs) aliases)]
-                  (for [j 0 (/ (len (load pairs)) 2)]
-                    (let [name (get (load pairs) (* j 2))]
-                      (when (< (defs-alias-index (field kept aliases) name) 0)
-                        (push! (mut out) module) (push! (mut out) name) 0)))))))
-          0))
-      0)
-    out))
 
 (defn impl-patterns-equal? [(a (dyn Allocator)) (x (ptr ImplDef)) (y (ptr ImplDef))] (-> bool)
   (and (pat-matches? a (field x self_type) (load (field x type_params)) (field y self_type))
@@ -8492,7 +7976,7 @@
         ; tower generation, at about 0.4 KB per top-level form each time.
         parsed-work (primitive/alloc-stack scratch/ScratchArena)
         _parsed-init
-          (scratch/ScratchArena::init-with-capacity parsed-work (retained-heap/compiler-scratch-parent) 65536)]
+          (scratch/ScratchArena::init-with-capacity parsed-work (malloc-allocator) 65536)]
     (store! (resolve-entry-cell)
             (let [ws (semantic-workspace (mut s))]
               ; An LS without an entry of its own (a definition-time tower's)
@@ -8556,7 +8040,7 @@
         parse-span (tr/span-begin "frontend.resolve.parse")
         bindings-work (primitive/alloc-stack scratch/ScratchArena)
         _bindings-init
-          (scratch/ScratchArena::init-with-capacity bindings-work (retained-heap/compiler-scratch-parent) 65536)
+          (scratch/ScratchArena::init-with-capacity bindings-work (malloc-allocator) 65536)
         bindings-a (allocator bindings-work)
         bindings-ls (primitive/alloc-stack LS)
         saved-bindings (load (primitive-bindings-box))

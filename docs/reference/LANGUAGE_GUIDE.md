@@ -409,16 +409,13 @@ integer, `bool` or `Keyword`. It sizes arrays and makes types distinct:
 where the other is expected is a type error. Type positions don't compute:
 `(array T (+ N 1))` is not a type.
 
-An array length can name an integer constant instead, and the constant can be
-computed:
+An array length can name an integer constant instead:
 
 ```coil
 (module example.lengths)
-(defn fib [(n i64)] (-> i64) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
-
 (const MAX-CODE-LEN 32)
 (const SLOTS (+ MAX-CODE-LEN 1))
-(const RING (fib 6))
+(const RING (- SLOTS 25))
 
 (defstruct Table [(counts (array u32 SLOTS)) (ring (array i64 RING))])
 
@@ -434,16 +431,13 @@ computed:
 33 8 200
 ```
 
-Such a constant gets its value before the program's types are checked: folded
-from its initializer when that is integer arithmetic on literals and other
-constants, and otherwise by running the code it calls, as `RING` runs `fib`. Its
-value must be a non-negative integer. A constant computed from a type whose
-length is that same constant (`(const N (sizeof Big))` with `Big` holding an
-`(array u8 N)`) is a cycle, and an error that names the path.
+Such a constant gets its value before the program's types are checked, folded
+from its initializer, which must be integer arithmetic on literals and other
+constants. Its value must be a non-negative integer.
 
 A generic argument can name a constant too: with `(const LANES 4)`,
 `(width [(const LANES)])` is `(width [(const 4)])` and `(Lanes (const LANES))` is
-`(Lanes 4)`. An integer constant may be computed, as for a length; a `bool` or
+`(Lanes 4)`. An integer constant folds as for a length; a `bool` or
 keyword constant must be written as its value (or come from a macro that expands
 to one).
 
@@ -1639,32 +1633,6 @@ These answers are sums declared in `coil.primitive`, so a checker matches on the
 ```
 - `(primitive/code-doc node)` is a definition's `;;;` documentation.
 
-Dependency queries in `coil.meta` read the same checked model, including earlier
-accepted definitions in a JIT session. `(meta/dependencies NAME)` and
-`(meta/dependents NAME)` return direct edges; `(meta/dependency-closure NAME)` and
-`(meta/dependent-closure NAME)` follow all reachable edges. Pass a fully qualified
-Code symbol (for example, `` `myapp.math.add ``) or a checked reference node. The
-result is a `primitive/ProgramAnswer`: `(Answer NAMES)` with a sorted Code list of
-fully qualified declaration names, `(NotInProgram)` for a declaration the model
-does not have, or `(NoProgram)` without one; `(meta/answered ANSWER)` takes NAMES
-where an answer is required. Cycles terminate and
-closure results exclude the queried declaration itself. In a partial model,
-answers describe the dependencies the compiler could establish.
-
-Edges describe declaration use: calls, function pointers, generic templates,
-nominal types (including nested fields), traits, aliases, constants, globals,
-calling conventions and macro expansion. They report dependencies, not whether a
-particular edit requires recompilation. The queries never compile, replace, or
-retire code.
-
-Some uses belong to no declaration. `(meta/module-uses MODULE)` answers, the same
-way, the declarations a module uses outside all of its own: what its `export`
-list and `export-c`s name, its impls' methods, what its `static-assert`s and
-`meta` forms read, the functions its `checker` and `transform` registrations
-name, and the macros it calls at top level. With `main` and the tests, these are
-where a program's uses begin, so a reachability analysis starts from them —
-`coil.lint.unused` does.
-
 ### A transform
 
 This transform defines a tiny dialect: `(inc e)` means `(+ e 1)`. It rebuilds only
@@ -1709,7 +1677,7 @@ the full reflection API.
 
 The bundled lints are in `coil.lint.*`. Plain `coil lint` applies the default
 profile (`coil.lint.default`). Add opt-in lints with `--use`, for example
-`coil.lint.no-star-imports`, `coil.lint.unused` and `coil.lint.allocator`.
+`coil.lint.no-star-imports` and `coil.lint.allocator`.
 
 `coil lint --fix` also migrates code written against standard-library names that
 have since been removed, before it analyses anything, since such code no longer
