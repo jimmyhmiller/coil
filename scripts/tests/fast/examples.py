@@ -25,7 +25,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 EXAMPLES = ROOT / "examples"
-PACKAGES = ("calc", "config", "huffman", "kvserver", "logscan", "lru", "mandelbrot",
+PACKAGES = ("calc", "config", "huffman", "logscan", "lru", "mandelbrot",
             "pathfind", "statemachine", "wordfreq")
 # Test files FAST leaves to COMPREHENSIVE: they need the coil.jit unit.
 NEEDS_JIT_UNIT = {"statemachine": ["machine_test", "runner_test"]}

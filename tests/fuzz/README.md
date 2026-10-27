@@ -19,8 +19,6 @@ you run on purpose, locally, not on every change.
 | `reader_fuzz.coil` | `coil.reader` (the compiler's own reader) | arbitrary and reader-shaped text read sanely under three configs, span sanity, print→read round trip, integer and `\uHEX` oracles, deep nesting |
 | `text_fuzz.coil` | `coil.unicode.grapheme`, `coil.str` | UAX #29 segmentation against an independent model, UTF-8 validation, formatting/parsing/search/split/trim against naive references, String/StrBuf/map models |
 | `serde_fuzz.coil` | `coil.serde.msgpack`, `coil.serde.sexp`, `coil.serde.derive`, `coil.serde.value` | round trips of derived records and sums, differentials against deliberately unusual (but valid) encoders, raw/structured/mutated documents that must re-encode to the same value, truncation, derive options |
-| `http_fuzz.coil` | `coil.http.parser` (the llhttp port), `coil.http.server` | split invariance over generated pipelines and raw bytes, pause/resume transparency, exact round trips of well-formed requests and responses, `parse-request` round trip and `consumed`, strict-mode violations refused |
-| `http_upstream_fuzz.coil` | the same, against upstream C llhttp 9.4.3 | callback-for-callback differential (trace, errno, error offset, reason, `finish`) over raw bytes and generated streams, any lenient flags and chunking; pause schedules, `on_headers_complete` results and injected callback errors; `parse-request` against `scripts/native/llhttp_shim.c` |
 | `collections_fuzz.coil` | `coil.hashmap`, `coil.arraylist`, `coil.pvec`, `coil.pmap`, allocators | model-based operation sequences, persistence of every version, allocator block integrity, leak and double-drop accounting |
 
 Between them the first campaigns found (and the tree now fixes): a stack overflow
@@ -34,45 +32,6 @@ skipped fields, stack overflow on deep nesting, quadratic map decoding, a bare
 tag that swallowed the next value, trailing bytes accepted, malformed floats
 accepted; and two compiler ownership bugs (generic locals wrapping `T` never
 dropped, stores through `(mut T)` not dropping the old value).
-
-## The HTTP targets
-
-`http_fuzz.coil` needs only the standard library:
-
-```sh
-coil fuzz tests/fuzz/http_fuzz.coil --time 300 --jobs 4 --sanitize=address
-```
-
-`http_upstream_fuzz.coil` links upstream C llhttp, so it needs the oracle
-archive `scripts/native/build-llhttp.sh` builds (the same one the llhttp
-differential test uses). That script downloads the checksum-pinned llhttp 9.4.3
-source and runs `npm`, so it needs the network once; the archive lands in
-`build/bin/native/llhttp/<arch>-<os>/libllhttp.a` and is reused after that. It
-contains upstream's state machine and API, `scripts/native/llhttp_shim.c`, and
-`tests/fuzz/native/http_fuzz_trace.c`, which drives upstream over the same
-chunks, pauses and callback results as the Coil side and writes the same trace.
-
-```sh
-scripts/tests/http-upstream-fuzz.sh --time 300 --jobs 4 [--sanitize=address]
-coil test tests/fuzz/http_upstream_fuzz.coil \
-  --link-flag build/bin/native/llhttp/arm64-macos/libllhttp.a
-```
-
-`coil fuzz` has no `--link-flag`; it takes link inputs from the working
-directory's `Coil.toml`. The script therefore runs the campaign in
-`build/fuzz/http-upstream/`, whose manifest links the archive, and the corpus
-persists there.
-
-These targets print their own inputs rather than using `note`: replay with
-`HTTP_FUZZ_VERBOSE=1` to print a failing case's input and both traces, or
-`HTTP_FUZZ_SHOW=1` to print every input before it runs.
-
-These targets found, and the tree fixes: Content-Length and chunk sizes of 2^63
-and more read before the buffer (a signed length compare in the generated
-parser), an infinite loop on NUL in a relaxed header value (inherited from
-upstream llhttp; see `scripts/llhttp/README.md`), `parse-request` misreporting
-HTTP/0.9 and HTTP/2.0 and returning error code 0 for empty input, and
-`coil emit-ir` rewriting `"#0"` inside string constants.
 
 ## Writing a target
 

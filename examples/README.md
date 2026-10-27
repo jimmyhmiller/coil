@@ -9,7 +9,6 @@ problem and is meant to be read as an example of idiomatic Coil.
 | [`config`](config) | Loads, validates and re-serializes a JSON server config | `coil.serde` derives, error sums, collecting every validation problem |
 | [`wordfreq`](wordfreq) | Word frequencies across UTF-8 text files | `coil.args`, `coil.str` runes, `coil.unicode`, string-keyed `HashMap`, `Drop` |
 | [`logscan`](logscan) | Access-log report: status classes, routes, bots, latency percentiles | Compile-time `coil.regex`, `coil.io`'s buffered line reader |
-| [`kvserver`](kvserver) | HTTP/1.1 key-value store | `coil.http.server` over sockets, a pure request handler, keep-alive |
 | [`lru`](lru) | Generic LRU cache in front of a slow store | Generics, trait bounds, index-linked lists, `defprop-stateful` |
 | [`pathfind`](pathfind) | A* and Dijkstra through weighted grid mazes | Generic heap over `Ord`, typed parse errors, property tests |
 | [`huffman`](huffman) | Huffman file compressor/decompressor | Exact-width integers, bit I/O, canonical codes, a binary format |
