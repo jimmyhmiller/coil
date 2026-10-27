@@ -39,6 +39,11 @@ def dump(compiler, command, path):
     env = {**os.environ, "COIL_NAMESPACE_ROOTS": "src:tests:scripts", "COIL_STRICT_BUNDLE": "0"}
     result = subprocess.run([str(compiler), command, str(path)], cwd=ROOT, env=env,
                             capture_output=True, timeout=900)
+    required = (ROOT / "src/compiler/main.coil", ROOT / "src/examples/jit_sdk.coil")
+    if path in required and (result.returncode != 0 or not result.stdout.startswith(b"(conventions")):
+        raise RuntimeError(
+            f"{compiler} {command} {path}: required input did not produce a checked program "
+            f"(exit {result.returncode})\n" + (result.stdout + result.stderr).decode(errors="replace")[:2000])
     if result.returncode not in (0, 1):
         raise RuntimeError(
             f"{compiler} {command} {path}: abnormal exit {result.returncode}\n"
@@ -92,23 +97,45 @@ def main():
     build_root.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="pipeline-diff-", dir=build_root) as directory:
         prefix = Path(directory)
-        bindir = prefix / "bin"
-        library = prefix / "lib/coil"
-        bindir.mkdir()
-        library.mkdir(parents=True)
-        (library / "stdlib").symlink_to(ROOT / "src/stdlib", target_is_directory=True)
-        (library / "compiler").symlink_to(ROOT / "src/compiler", target_is_directory=True)
-        (library / "prelude.coil").symlink_to(ROOT / "src/compiler/prelude.coil")
-        native = ROOT / "build/bin/native"
-        if native.is_dir():
-            (bindir / "native").symlink_to(native, target_is_directory=True)
-        paired_reference = bindir / "coil-reference"
-        paired_candidate = bindir / "coil-candidate"
-        shutil.copy2(reference, paired_reference)
-        shutil.copy2(candidate, paired_candidate)
+        # Match the installed SDK layout, including the separate TPDE package.
+        # Use one source snapshot for both binaries and private unit caches: CT
+        # artifacts are compiler-specific, so a shared cache makes them rebuild
+        # each other's units on every alternating invocation.
+        sdk = prefix / "sdk"
+        shutil.copytree(ROOT / "src/compiler", sdk)
+        tpde = (ROOT / "../coil-tpde/src/tpde").resolve()
+        if not (sdk / "tpde").exists():
+            if not tpde.is_dir():
+                raise RuntimeError(f"compiler SDK dependency not found: {tpde}")
+            shutil.copytree(tpde, sdk / "tpde")
+
+        def pair(binary, name):
+            bindir = prefix / name / "bin"
+            library = prefix / name / "lib/coil"
+            bindir.mkdir(parents=True)
+            library.mkdir(parents=True)
+            (library / "stdlib").symlink_to(ROOT / "src/stdlib", target_is_directory=True)
+            (library / "compiler").symlink_to(sdk, target_is_directory=True)
+            (library / "prelude.coil").symlink_to(ROOT / "src/compiler/prelude.coil")
+            native = ROOT / "build/bin/native"
+            if native.is_dir():
+                (bindir / "native").symlink_to(native, target_is_directory=True)
+            executable = bindir / "coil"
+            shutil.copy2(binary, executable)
+            return executable
+
+        paired_reference = pair(reference, "reference")
+        paired_candidate = pair(candidate, "candidate")
+        required = {ROOT / "src/compiler/main.coil", ROOT / "src/examples/jit_sdk.coil"}
+        # Fail before queuing the remaining corpus if the paired installation
+        # cannot check either required input.
+        for path in files:
+            if path in required:
+                failures.extend(compare(paired_reference, paired_candidate, path, args.output_dir))
+        remaining = [path for path in files if path not in required]
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
             for problems in pool.map(
-                    lambda path: compare(paired_reference, paired_candidate, path, args.output_dir), files):
+                    lambda path: compare(paired_reference, paired_candidate, path, args.output_dir), remaining):
                 failures.extend(problems)
     for problem in failures:
         print(f"DIFF {problem}")
