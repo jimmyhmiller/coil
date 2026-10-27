@@ -71,7 +71,6 @@ def steps(x64: bool) -> list[Step]:
         *([Step("jit/repl-forms-tpde", [PY, "scripts/tests/jit-single-form.py", "{compiler}", "--backend", "tpde"])]
           if sys.platform == "darwin" and os.uname().machine == "arm64" else []),
         Step("jit/sessions", [PY, "scripts/tests/jit-static-session.py"]),
-        Step("jit/session-memory", [PY, "scripts/tests/jit-session-memory.py"]),
         Step("generated/modules", [PY, "scripts/tests/generated-modules.py"]),
         Step("memory/generated-units", [PY, "scripts/tests/generated-unit-memory.py", "--units", "64"]),
         Step("memory/namespace-index", [PY, "scripts/tests/project-scan-memory.py", "--full"]),

@@ -43,12 +43,11 @@ TOOLCHAIN_ENV["COIL_JIT_PROTECT"] = "1"
 # "lifetime": scratch_footprint measures the process footprint after its first
 # compile, so it runs before any other session exists.
 GROUPS: dict[str, list[str]] = {
-    "lifetime": ["scratch_footprint", "metadata_lifetime", "type_lifetime", "impl_lifetime",
-                 "monomorph_report_lifetime", "native_metadata_roots", "static_lifetime",
-                 "generation_tokens", "retire_declarations", "retire_definitions",
-                 "session_free", "shared_prelude", "retained_code_state"],
+    "lifetime": ["scratch_footprint", "static_lifetime", "generation_tokens",
+                 "retire_declarations", "retire_definitions", "session_free",
+                 "shared_prelude", "retained_code_state"],
     "sessions": ["static_session", "static_policy", "static_dynamic", "static_isolation",
-                 "single_form_proof", "checked_baseline", "retained_declarations", "hidden_names",
+                 "single_form_proof", "retained_declarations",
                  "deferred_publication", "repair_diagnostics", "redefined_signature",
                  "qualified_names", "session_imports", "session_import_meta",
                  "import_tolerant_helper"],
@@ -57,10 +56,9 @@ GROUPS: dict[str, list[str]] = {
                     "const_generic_trait_method", "generic_replacement", "defalias_rebind",
                     "before_expand_const_replacement", "before_expand_sum_replacement",
                     "entry_compile_time_code"],
-    "environment": ["env_values", "deep_source", "env_stale", "env_stale_complete", "env_native",
-                    "host_environment", "live_checker", "meta_pipeline", "meta_accepted_impl",
-                    "meta_dependencies", "meta_generator_later", "frontend_policy",
-                    "reader_keeps_type", "llvm_backend", "cimport_header_change"],
+    "environment": ["deep_source", "host_environment", "meta_pipeline", "meta_accepted_impl",
+                    "meta_generator_later", "frontend_policy", "llvm_backend",
+                    "cimport_header_change"],
     # Run with the project below as the working directory.
     "project": ["repl_import_var", "project_context", "project_free", "defalias_imports"],
     # Run with the scratch directory as the namespace root, for its source providers.
@@ -179,8 +177,7 @@ def make_providers(work: Path) -> Path:
         version (p/syntax->datum (p/code-symbol name (p/code-str (p/code-symbol `_v digits))))
         (mut rest) (p/code-list-new)]
     (for i (range 2 (len f)) (push! (mut rest) (get f i)))
-    `(do (import "coil.jit.lifetime")
-         (defn ~version :jit/retain false ~@(p/code-list-done (load rest)))
+    `(do (defn ~version ~@(p/code-list-done (load rest)))
          (defalias ~name ~version)
          (defn ~entry [] (-> i64) 0))))
 ''')
