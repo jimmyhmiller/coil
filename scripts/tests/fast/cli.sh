@@ -108,6 +108,22 @@ EOF
     && ok "a child's -o does not select the build output" \
     || bad "a child's -o does not select the build output" "child-output was written"
 
+  # `-o OUT` puts the executable at OUT and runs it from there; the user's OUT stays.
+  rm -f "$T/run-out"
+  expect_rc 7 "run -o OUT builds OUT and runs it" "$COIL" run "$T/seven.coil" -o "$T/run-out"
+  [ -x "$T/run-out" ] && ok "run -o keeps the executable it was asked for" \
+                      || bad "run -o keeps the executable it was asked for" "$T/run-out is missing"
+  # An unknown `:` command is its own error, not the last submission's again.
+  out=$(printf '(+ 1 "a")\n:foo\n' | "$COIL" repl 2>&1 >/dev/null); rc=$?
+  case "$out" in
+    *"argument 2 to '+'"*"error: unknown JIT session command"*)
+      case "$out" in
+        *"argument 2 to '+'"*"argument 2 to '+'"*) bad "repl: an unknown command reports itself, not the previous failure" "$out" ;;
+        *) ok "repl: an unknown command reports itself, not the previous failure" ;;
+      esac ;;
+    *) bad "repl: an unknown command reports itself, not the previous failure" "exit $rc: $out" ;;
+  esac
+
   # The REPL: a definition, a call, a redefinition with the same signature
   # (coil.repl's Var policy), and the call again. Each definition records what
   # it reads in the session's dependency base.
@@ -206,6 +222,8 @@ section_usage() {
     expect_rc_out 1 "no such file: '.*nope.coil'" "$cmd: a missing file is an error that names it" \
       "$COIL" "$cmd" "$T/nope.coil"
   done
+  expect_rc_out 1 'usage: coil emit-obj' "emit-obj with no file is a usage error" \
+    bash -c 'cd "$1" && "$2" emit-obj' _ "$T" "$COIL"
   expect_rc_out 1 'is a directory, not a source file' "build: a directory is not a source file" \
     "$COIL" build "$T" -o "$T/dir-out"
   expect_rc 2 "fmt --check: a missing file is an error, not 'unformatted'" "$COIL" fmt --check "$T/nope.coil"
@@ -328,6 +346,18 @@ section_new_project() {
   [ "$rc" != 0 ] && cmp -s "$T/mine.coil" "$T/proj/src/main.coil" \
     && ok "new refuses to overwrite an existing project" \
     || bad "new refuses to overwrite an existing project" "exit $rc, src/main.coil now: $(head -3 "$T/proj/src/main.coil")"
+  # A one-character name is a directory like any other.
+  out=$(cd "$T" && "$COIL" new z 2>&1); rc=$?
+  [ "$rc" = 0 ] && [ -f "$T/z/Coil.toml" ] && [ -f "$T/z/.gitignore" ] && [ -f "$T/z/src/main.coil" ] \
+    && ok "new scaffolds a project with a one-character name" \
+    || bad "new scaffolds a project with a one-character name" "exit $rc: $out"
+  # A scaffold that could not be written is not reported as created.
+  mkdir -p "$T/readonly" && chmod 555 "$T/readonly"
+  out=$(cd "$T/readonly" && "$COIL" new p 2>&1); rc=$?
+  chmod 755 "$T/readonly"
+  [ "$rc" != 0 ] && case "$out" in *created*) false ;; *"error:"*) true ;; *) false ;; esac \
+    && ok "new fails, without claiming success, when it cannot write the project" \
+    || bad "new fails when it cannot write the project" "exit $rc: $out"
   cp "$T/scaffold.coil" "$T/proj/src/main.coil"
   expect_rc_out 0 '^doubled total: 42$' "the scaffold runs" bash -c 'cd "$1/proj" && "$2" run' _ "$T" "$COIL"
   expect_rc 0 "the scaffold is fmt-clean" bash -c 'cd "$1/proj" && "$2" fmt --check' _ "$T" "$COIL"
@@ -556,6 +586,31 @@ EOF
   case "$text" in *"v"*"; between name and value"*"[1 2]"*"w"*) ok "fmt keeps a comment inside its binding" ;;
     *) bad "fmt keeps a comment inside its binding" "$text" ;; esac
   expect_rc 0 "fmt of those comments is idempotent" "$COIL" fmt --check "$T/comments.coil"
+
+  # A closing delimiter after a comment starts its own line, and a comment right
+  # after an opening bracket inside a form lays out the same on a second pass.
+  printf '(module fmtclose)\n(defn main [] (-> i64)\n  (do\n    7 ; the closer is not part of this comment\n  ))\n' > "$T/closer.coil"
+  "$COIL" fmt --write "$T/closer.coil" >/dev/null 2>&1
+  expect_rc 7 "fmt keeps a closing delimiter out of a trailing comment" "$COIL" run "$T/closer.coil"
+  expect_rc 0 "...and that layout is a fixpoint" "$COIL" fmt --check "$T/closer.coil"
+  printf '(module fmtlead)\n(def TABLE\n  [; first section\n   1 2])\n(defn main [] (-> i64) (get TABLE 1))\n' > "$T/lead.coil"
+  "$COIL" fmt --write "$T/lead.coil" >/dev/null 2>&1
+  expect_rc 0 "fmt of a comment after [ in a def is a fixpoint after one pass" "$COIL" fmt --check "$T/lead.coil"
+  expect_rc 2 "...and the program still means the same" "$COIL" run "$T/lead.coil"
+
+  # balance's filter output is its result: a clean file it cannot write fails.
+  printf '(defn f [] 42)\n' > "$T/clean.coil"
+  COIL_BALANCE_LOG=0 "$COIL" balance "$T/clean.coil" >&- 2>/dev/null
+  [ $? = 1 ] && ok "balance exits 1 when an unchanged file cannot be written" \
+    || bad "balance exits 1 when an unchanged file cannot be written" "wrong exit status"
+  # Every run appends its outcome, a refusal included.
+  mkdir -p "$T/balance-home"
+  printf '(a [b))\n' > "$T/refused.coil"
+  HOME="$T/balance-home" COIL_BALANCE_LOG=1 "$COIL" balance "$T/refused.coil" >/dev/null 2>&1
+  local log
+  log=$(cat "$T/balance-home/.coil/balance-log.jsonl" 2>&1)
+  case "$log" in *'"outcome":"refused","cause":"mismatch"'*) ok "balance logs a refusal with its cause" ;;
+    *) bad "balance logs a refusal with its cause" "$log" ;; esac
 
   local base
   for base in layout vertical_spacing; do
