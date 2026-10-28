@@ -46,6 +46,10 @@ struct coil_uninspectable {
 #define COIL_MOST_NEGATIVE -9223372036854775808
 #define COIL_INT64_MIN INT64_MIN
 
+/* -9999999999 is a value like any other. */
+#define COIL_ONCE_A_SENTINEL -9999999999
+enum coil_wide { COIL_WIDE_NEGATIVE = -9999999999LL };
+
 /* Names that merely contain a qualifier word are names. */
 typedef int coil_constant_t;
 coil_constant_t coil_get_constant(void);

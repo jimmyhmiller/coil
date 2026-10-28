@@ -1438,6 +1438,8 @@ macro COIL_HALF — a double expression, not an integer constant
 (defstruct coil_uninspectable :layout (coil.layout.Explicit)
 (const COIL_MOST_NEGATIVE -9223372036854775808)
 (const COIL_INT64_MIN -9223372036854775808)
+(const COIL_ONCE_A_SENTINEL -9999999999)
+(const COIL_WIDE_NEGATIVE -9999999999)
 (extern coil_get_constant :cc (coil.cc.C) [] (-> i32))
 (extern coil_use_area :cc (coil.cc.C) [(ptr coil_restricted_area)] (-> void))
 EOF
