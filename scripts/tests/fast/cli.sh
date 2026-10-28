@@ -1027,6 +1027,20 @@ EOF
        (if (p/icmp-eq (negative) minus) 100 0)
        (if (p/icmp-eq (p/load BIG) minus) 1000 0))))
 EOF
+  # tpde names each symbol it imports once, however many modules declare it
+  # (the library declares write, abort and others in several modules).
+  printf '%s\n' '(module objlib.plain)' '(defn answer [] (-> i64) 42)' > "$T/plain.coil"
+  local syms undefined dups
+  if "$COIL" emit-obj "$T/plain.coil" --backend tpde -o "$T/plain.o" >/dev/null 2>&1; then
+    syms=$(nm "$T/plain.o" 2>&1)
+    undefined=$(awk '$1 == "U" { print $2 }' <<<"$syms")
+    dups=$(sort <<<"$undefined" | uniq -d)
+    if [ -n "$undefined" ] && [ -z "$dups" ]; then ok "a tpde object imports each undefined symbol once"
+    else bad "a tpde object imports each undefined symbol once" "duplicates: $dups (undefined: $(wc -l <<<"$undefined"))"; fi
+  else
+    bad "a tpde object imports each undefined symbol once" "emit-obj --backend tpde failed"
+  fi
+
   local opt
   for opt in -O0 -O2; do
     expect_rc 87 "a literal wider than 128 bits keeps its value ($opt; 1111 mod 256)" \
