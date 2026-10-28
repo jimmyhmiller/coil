@@ -4,7 +4,8 @@
 ; {ptr,i64}, as layoutdb.coil lays them out) into CIR, the SSA IR of the tpde package (vendored at src/compiler/tpde),
 ; one function at a time, and compiles each with tpde's single-pass register
 ; allocator into arm64 code (AAPCS64), or for an x86_64 target into x86-64 code
-; (System V, classified as codegen_x64.coil does; a Mach-O x86-64 object).
+; (System V, classified as codegen_x64.coil does; a Mach-O object for Darwin, ELF
+; for Linux).
 ;
 ; Values: a scalar (an integer up to 128 bits, float, bool or pointer) is an SSA
 ; value, integers kept extended to 64 bits from their width (the native
@@ -18,7 +19,8 @@
 ;
 ; Module data -- signatures, statics, strings, vtables -- is laid out by
 ; native_module.coil into its MObj; tpde contributes the text section and
-; its relocations, merged into that MObj (`tl-merge!`) and written by macho.coil.
+; its relocations, merged into that MObj (`tl-merge!`) and written by macho.coil,
+; or for Linux read as an ELF object (`tl-elf-object`) and written by elf.coil.
 (module coil.compiler.codegen_tpde)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :as alloc :use *)
@@ -44,7 +46,12 @@
 (import "coil.compiler.float_math" :use *)
 (import "coil.compiler.trace" :as tr)
 (import "coil.compiler.codegen_tpde_ir" :as tir)
-(import "coil.compiler.comptime" :use [target-arch-str])
+(import "coil.compiler.comptime" :use [target-arch-str target-os-str])
+(import "coil.compiler.elf" :use [EObj ESym eobj-new eobj-add-sect! eobj-add-sym! eobj-add-weak-sym!
+                                  eobj-add-reloc! eobj-sect-buf eobj-mark-nonexec-stack! elf-write
+                                  r-x86-64-64 r-x86-64-32 r-x86-64-pc32 r-x86-64-plt32
+                                  r-x86-64-gotpcrel r-x86-64-rex-gotpcrelx
+                                  sht-progbits shf-alloc shf-write shf-execinstr])
 (import "coil.atomic" :as atomic)
 (import "coil.thread" :use [Thread ThreadConfig])
 (import "coil.cc" :as cc)
@@ -382,7 +389,8 @@
 
 ; ============================ symbols ========================================
 
-;;; The tpde symbol mirroring MObj symbol `m`.
+;;; The tpde symbol mirroring MObj symbol `m`, with its binding: the x86-64
+;;; code takes the address of a global symbol through the GOT (load-sym-addr!).
 (defn tl-sym [(tl (ptr Tl)) (m i64)] (-> u32)
   (when (>= m (len (.sym-map tl)))
     (for _ (range (len (.sym-map tl)) (+ m 1)) (push! (mut (.sym-map tl)) (none32))))
@@ -390,9 +398,10 @@
     (if (!= have (none32))
         have
         (let [ms (al-at [MSym] (field (field (.g tl) obj) syms) m)
+              binding (cond (not (.ext ms)) (: 0 u8) (.weak ms) (: 2 u8) :else (: 1 u8))
               t (if (= (.sect ms) 0)
                     (tasm/sym-add-undef! (.ta tl) "" (: 1 u8))
-                    (tasm/sym-add-def! (.ta tl) "" -2 0 0 (: 1 u8)))]
+                    (tasm/sym-add-def! (.ta tl) "" -2 0 0 binding))]
           (set! (mut (.sym-map tl)) m t)
           (while (< (len (.tsym-mobj tl)) (+ (i64-of t) 1)) (push! (mut (.tsym-mobj tl)) -1))
           (set! (mut (.tsym-mobj tl)) (i64-of t) m)
@@ -2656,6 +2665,11 @@
     (set! (.tailok tl) false)
     (set! (.inline-depth tl) 0)
     (set! (.selfname tl) (.name fd))
+    ; the function native_module's static cells are named after (g-zero-global!):
+    ; repl_static.<function>.<ordinal>, weak in a generic's instantiation, so
+    ; every unit that instantiates it names the same cell
+    (set! (.selfname g) (.name fd))
+    (set! (.nstatic g) 0)
     (let [entry (cir/new-block! fp)]
       (cir/set-block! fp entry)
       (cir/seal! fp entry))
@@ -2931,11 +2945,148 @@
   (when (.dbg tl) (dw-inc-free! (cast (ptr DwInc) (mut (.dwinc tl)))))
   0)
 
+; ============================ ELF (Linux x86-64) =============================
+;
+; The module is built as a MObj in Mach-O's terms: section names, symbols
+; spelled with the C `_` prefix, and x86-64 relocations as X86_64_RELOC_* with
+; their addends implicit in the relocated field (the form macho-write-x64
+; writes). For a Linux target that MObj is read as an ELF object: the same
+; sections, symbols and relocations, in ELF's spelling.
+
+;;; The ELF section Mach-O section `s` of the module becomes. Read-only data
+;;; with relocations is .data.rel.ro, as a C compiler places it: the dynamic
+;;; linker writes those pointers, which a PIE cannot do in .rodata.
+(defn elf-sect-name [(a (dyn Allocator)) (s (ptr MSect)) (relocated bool)] (-> (slice u8))
+  (let [seg (.segname s)
+        nm (.sectname s)]
+    (cond (and (= seg "__TEXT") (= nm "__text")) ".text"
+          (and (= seg "__TEXT") (= nm "__const")) (if relocated ".data.rel.ro" ".rodata")
+          (and (= seg "__DATA") (= nm "__data")) ".data"
+          ; a static of its own (g-static-sect!)
+          (and (= seg "__DATA") (starts-with nm "__coil_big")) (sconcat a ".data." (subslice nm 2 (len nm)))
+          (and (= seg "__DWARF") (starts-with nm "__debug_")) (sconcat a "." (subslice nm 2 (len nm)))
+          :else (tl-fail (sconcat a "tpde: no ELF section for the Mach-O section "
+                                  (sconcat3 a seg "," nm))))))
+
+;;; Whether MObj symbol `s` is an assembler temporary: Mach-O spells a local
+;;; label the linker may drop with an `l` (l_cstr.N, l_tpde.N, ltmp0), ELF with
+;;; `.L`.
+(defn temp-sym? [(s (ptr MSym))] (-> bool)
+  (and (not (.ext s)) (> (.sect s) 0) (starts-with (.name s) "l")))
+
+;;; The ELF spelling of a MObj symbol: the C name, without Mach-O's `_`, or an
+;;; assembler temporary's `.L` name. Every external or undefined MObj symbol has
+;;; the prefix (g-mangle and the runtime names add it).
+(defn elf-sym-name [(a (dyn Allocator)) (s (ptr MSym))] (-> (slice u8))
+  (let [nm (.name s)]
+    (cond (starts-with nm "_") (subslice nm 1 (len nm))
+          (temp-sym? s) (sconcat a ".L" (subslice nm 1 (len nm)))
+          :else (tl-fail (sconcat a "tpde: a symbol in neither the C nor the temporary spelling: " nm)))))
+
+;;; The little-endian field of 2^`ln` bytes at `off` of `buf`, sign-extended.
+(defn field-read [(buf (ptr (ArrayList u8))) (off i64) (ln i64)] (-> i64)
+  (let [n (<< 1 ln)
+        (mut v) 0]
+    (for k (range 0 n)
+      (set! v (| v (<< (primitive/cast i64 (get (load buf) (+ off k))) (* 8 k)))))
+    (if (= n 4)
+        (if (!= (& v 0x80000000) 0) (| v (primitive/cast i64 0xFFFFFFFF00000000)) v)
+        v)))
+
+(defn field-clear! [(buf (ptr (ArrayList u8))) (off i64) (ln i64)] (-> void)
+  (for k (range 0 (<< 1 ln)) (set! (mut buf) (+ off k) (: 0 u8))))
+
+;;; The ELF relocation for an X86_64_RELOC_* one, with its explicit addend from
+;;; the field's implicit one. Mach-O measures a pc-relative field's value from
+;;; the end of the field, ELF from its start: the addend loses the field's 4
+;;; bytes. GOT_LOAD is a `movq` of a GOT entry, which the linker may relax to
+;;; `lea`, exactly what REX_GOTPCRELX says.
+(defn elf-reloc [(r (ptr MReloc)) (implicit i64)] (-> (array i64 2))
+  (let [t (.rtype r)
+        pc (.pcrel r)
+        ln (.len r)]
+    (cond (and (= t 0) (not pc) (= ln 3)) [(r-x86-64-64) implicit]
+          (and (= t 0) (not pc) (= ln 2)) [(r-x86-64-32) implicit]
+          (and (= t 1) pc (= ln 2)) [(r-x86-64-pc32) (- implicit 4)]
+          (and (= t 2) pc (= ln 2)) [(r-x86-64-plt32) (- implicit 4)]
+          (and (= t 3) pc (= ln 2)) [(r-x86-64-rex-gotpcrelx) (- implicit 4)]
+          (and (= t 4) pc (= ln 2)) [(r-x86-64-gotpcrel) (- implicit 4)]
+          :else (tl-fail "tpde: an x86-64 relocation with no ELF equivalent"))))
+
+;;; The ELF64 x86-64 relocatable object MObj `o` is (see above). Section and
+;;; symbol numbering carry over: ELF section ordinal k is MObj section k, ELF
+;;; symbol i is MObj symbol i; a section relocation (a negative MObj symbol,
+;;; the DWARF's references to __text) targets a local symbol at the section's
+;;; start, added after them.
+(defn tl-elf-object [(a (dyn Allocator)) (o (mut MObj))] (-> EObj)
+  (let [(mut e) (eobj-new a)
+        nsect (len (.sects o))
+        ; per section: whether it is the code, and whether relocations land in it
+        (mut textsect) (ArrayList::new [bool] a)
+        (mut relocated) (ArrayList::new [bool] a)
+        ; per section: the symbol at its start, or -1
+        (mut starts) (ArrayList::new [i64] a)]
+    (for k (range 0 nsect)
+      (push! (mut relocated) false)
+      (push! (mut starts) -1))
+    (for i (range 0 (len (.relocs o)))
+      (set! (mut relocated) (- (.sect (al-at [MReloc] (field o relocs) i)) 1) true))
+    (for k (range 0 nsect)
+      (let [s (al-at [MSect] (field o sects) k)
+            nm (elf-sect-name a s (get relocated k))
+            exec (= nm ".text")
+            debug (starts-with nm ".debug_")
+            flags (cond exec (| (shf-alloc) (shf-execinstr))
+                        debug 0
+                        (= nm ".rodata") (shf-alloc)
+                        :else (| (shf-alloc) (shf-write)))
+            ord (eobj-add-sect! (mut e) nm (<< 1 (.align s)) (sht-progbits) flags)]
+        (push! (mut textsect) exec)
+        (b-bytes! (mut (eobj-sect-buf (mut e) ord)) (slice (.buf s)))))
+    (for i (range 0 (len (.syms o)))
+      (let [s (al-at [MSym] (field o syms) i)
+            nm (elf-sym-name a s)
+            j (if (and (.ext s) (.weak s))
+                  (eobj-add-weak-sym! (mut e) nm (.sect s) (.off s))
+                  (eobj-add-sym! (mut e) nm (.sect s) (.off s) (.ext s)))]
+        (when (and (> (.sect s) 0) (get textsect (- (.sect s) 1)) (not (temp-sym? s)))
+          (set! (.isfunc (al-at [ESym] (field e syms) j)) true))))
+    (for i (range 0 (len (.relocs o)))
+      (let [r (al-at [MReloc] (field o relocs) i)
+            buf (eobj-sect-buf (mut e) (.sect r))
+            implicit (field-read buf (.off r) (.len r))
+            er (elf-reloc r implicit)
+            sym (if (>= (.sym r) 0)
+                    (.sym r)
+                    (let [ord (- 0 (.sym r))]
+                      (when (< (get starts (- ord 1)) 0)
+                        (set! (mut starts) (- ord 1)
+                              (eobj-add-sym! (mut e) (sconcat a ".Lsect." (i64->str a ord)) ord 0 false)))
+                      (get starts (- ord 1))))]
+        (field-clear! buf (.off r) (.len r))
+        (eobj-add-reloc! (mut e) (.sect r) (.off r) sym (get er 0) (get er 1))))
+    ; without it the linker gives the whole program an executable stack
+    (eobj-mark-nonexec-stack! (mut e))
+    e))
+
+;;; Whether the target's object file is ELF (x86-64 Linux) rather than Mach-O
+;;; (Darwin). tpde writes no other format.
+(defn tl-elf-target? [(a (dyn Allocator))] (-> bool)
+  (let [arch (target-arch-str)
+        os (target-os-str)]
+    (cond (= os "darwin") false
+          (and (= os "linux") (= arch "x86_64")) true
+          :else (tl-fail (sconcat a "tpde: no object format for the target "
+                                  (sconcat3 a arch "-" os))))))
+
 (defn cgtpde-build-object [(a (dyn Allocator)) (mp (ptr Program)) (objpath (ptr i8)) (mainpath (slice u8)) (compdir (slice u8))
                            (paths (ptr (ArrayList (slice u8)))) (texts (ptr (ArrayList (slice u8)))) (emit-dwarf bool)] (-> i64)
-  (let [(mut o) (cgtpde-build-mobj a mp mainpath compdir paths texts emit-dwarf)
+  (let [elf (tl-elf-target? a)
+        (mut o) (cgtpde-build-mobj a mp mainpath compdir paths texts emit-dwarf)
         t0 (ticks)
-        bytes (if (= (target-arch-str) "x86_64") (macho-write-x64 (mut o)) (macho-write (mut o)))
+        bytes (cond elf (let [(mut e) (tl-elf-object a (mut o))] (elf-write (mut e)))
+                    (= (target-arch-str) "x86_64") (macho-write-x64 (mut o))
+                    :else (macho-write (mut o)))
         t1 (ticks)
         fd (fs/create-file objpath 420)]
     (set! (native-last-needs-curl-cell)
@@ -2943,7 +3094,7 @@
     (set! (native-last-needs-llvm-cell)
           (mobj-references-undefined? (mut o) (native-probe-name a "_LLVMGetDefault" "TargetTriple")))
     (when (!= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_STATS")) 0)
-      (eprintln "tpde: macho-write {}us probes {}us" (- t1 t0) (- (ticks) t1)))
+      (eprintln "tpde: object write {}us probes {}us" (- t1 t0) (- (ticks) t1)))
     (when (< fd 0) (cga-fail "cannot create object file"))
     (let [total (len (load bytes))
           (mut off) 0]
