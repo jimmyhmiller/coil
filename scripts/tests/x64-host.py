@@ -5,10 +5,10 @@
 
 Copies this working tree's tracked files to the host, then there: bootstraps the
 LLVM Linux compiler from the committed seed (no install), runs the runtime corpus
-on it with the LLVM and tpde backends and the C ABI checks, self-hosts through
-the native x64 backend (fixpoint, the corpus on `--backend x64`, the SysV C ABI
-against gcc, the encoder against llvm-mc), and checks the ELF output. The host
-needs LLVM 21, a C compiler, python3 and node.
+on it with the LLVM backend and the C ABI checks, self-hosts through the native
+backend, tpde (fixpoint, the corpus on `--backend x64`, the SysV C ABI against
+gcc, the encoder against llvm-mc), bootstraps the LLVM-free Linux compiler, and
+checks the ELF writer. The host needs LLVM 21, a C compiler, python3 and node.
 
 When the host is unreachable this fails and says so: an x64 run that silently
 did nothing would read as a pass. Run `dev.py test comprehensive --no-x64` to
@@ -35,12 +35,12 @@ echo "== bootstrap the LLVM Linux compiler (no install)"
 COIL_SKIP_INSTALL=1 python3 scripts/dev.py build linux
 echo "== runtime corpus on Linux, LLVM backend"
 python3 scripts/oracle.py corpus llvm --compiler build/bin/coil
-echo "== runtime corpus on Linux, tpde backend (ELF)"
-python3 scripts/oracle.py corpus tpde --compiler build/bin/coil
-echo "== the C ABI on Linux: LLVM, x64 and tpde, each against the others"
+echo "== the C ABI on Linux: LLVM and tpde, each against the other"
 python3 scripts/tests/c-abi.py --compiler build/bin/coil
-echo "== self-host through the x64 backend: fixpoint, corpus, C ABI, encoder"
+echo "== self-host through tpde: fixpoint, corpus, C ABI, encoder"
 python3 scripts/dev.py build x64
+echo "== the LLVM-free Linux bootstrap"
+python3 scripts/dev.py build nollvm-linux
 echo "== ELF output"
 scripts/compiler/oracle/x64/gate-elf.sh build/bin/coil-x64
 echo "x64 host: PASS"

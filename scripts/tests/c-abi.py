@@ -7,8 +7,9 @@ results abi.coil calls through raw addresses. It is built
 
   - by LLVM at -O0, and at -O2 under AddressSanitizer (which traps a read past
     an exact-size C object or a store past a coerced aggregate's slot);
-  - by the host's native backend (arm64 on Apple silicon, x64 on x86-64), and
-    by tpde (arm64 and x86-64 Mach-O on Apple silicon, x86-64 ELF on Linux);
+  - by the host's native backend, tpde (`--backend arm64` on Apple silicon,
+    `--backend x64` on x86-64 Linux), and on Apple silicon by tpde for x86-64
+    Mach-O, run under Rosetta;
   - across backends: a native program linking an LLVM-built lib.o, and an LLVM
     program linking a native lib.o, so both must agree where each result travels.
 
@@ -68,13 +69,6 @@ def main() -> int:
             libs[native] = work / f"lib-{native}.o"
             run([coil, "emit-obj", FIXTURE / "lib.coil", "--backend", native, "-o", libs[native]],
                 f"emit lib.coil ({native})")
-        # the tpde backend targets arm64 Mach-O, x86-64 Mach-O (run under
-        # Rosetta) with --target, and x86-64 ELF on Linux
-        tpde = native == "arm64" or (native == "x64" and sys.platform.startswith("linux"))
-        if tpde:
-            libs["tpde"] = work / "lib-tpde.o"
-            run([coil, "emit-obj", FIXTURE / "lib.coil", "--backend", "tpde", "-o", libs["tpde"]],
-                "emit lib.coil (tpde)")
         x64_target = ["--target", "x86_64-apple-macosx11.0.0"]
         rosetta = native == "arm64" and subprocess.run(["arch", "-x86_64", "/usr/bin/true"],
                                           capture_output=True).returncode == 0
@@ -96,10 +90,6 @@ def main() -> int:
                          (f"llvm program + {native} lib", ["-O2"], native)]
         else:
             print("note: no native backend runs on this host; native and cross-backend variants skipped")
-        if tpde:
-            variants += [("tpde", ["--backend", "tpde"], "tpde"),
-                         ("tpde program + llvm lib", ["--backend", "tpde"], "llvm"),
-                         ("llvm program + tpde lib", ["-O2"], "tpde")]
         if rosetta:
             variants += [("tpde x86-64", ["--backend", "tpde", *x64_target], "tpde-x64"),
                          ("tpde x86-64 program + llvm lib", ["--backend", "tpde", *x64_target], "llvm-x64"),

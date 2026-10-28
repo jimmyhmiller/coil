@@ -15,7 +15,7 @@
 # The result is re-verified from source on every run, three independent ways, so a
 # stale/tampered seed cannot slip through:
 #   * NO-LLVM : ldd proves stage2 links no libLLVM
-#   * FIXPOINT: stage2.o == stage3.o byte-identical (the x64 backend is deterministic)
+#   * FIXPOINT: stage2.o == stage3.o byte-identical (tpde is deterministic)
 #   * GATE    : the runtime corpus (tests/corpus) on --backend x64 matches its
 #               blessed references.
 #
@@ -67,9 +67,9 @@ stage0_check "$STAGE0" "$SEED" "$SRC" "${S1FLAGS[@]}" || exit 1
 
 echo "=== stage1: stage0 builds the LLVM-free compiler ==="
 stage0_compat_run "$STAGE0" build "$PWD/$SRC" -o "$S1" ${STAGE0_BUILD_FLAGS[@]+"${STAGE0_BUILD_FLAGS[@]}"} "${S1FLAGS[@]}" || { echo "stage1 FAILED"; exit 1; }
-echo "=== stage2: stage1 rebuilds it with the x64 backend ==="
+echo "=== stage2: stage1 rebuilds it with tpde ==="
 "$S1" build "$SRC" -o "$S2" || { echo "stage2 FAILED"; exit 1; }
-echo "=== stage3: stage2 rebuilds it with the x64 backend ==="
+echo "=== stage3: stage2 rebuilds it with tpde ==="
 "$S2" build "$SRC" -o "$S3" || { echo "stage3 FAILED"; exit 1; }
 
 echo "=== NO-LLVM: stage2 must link no libLLVM ==="

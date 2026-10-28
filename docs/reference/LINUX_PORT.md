@@ -57,8 +57,9 @@ Linux:
 
 - COMPREHENSIVE's `x64/host` step (`scripts/tests/x64-host.py`, run from a Mac over
   ssh) bootstraps on the Linux host, runs the runtime corpus on the LLVM backend
-  (`python3 scripts/oracle.py corpus llvm`), then self-hosts through the x64 backend
-  and runs its gates (see `X64_BACKEND.md`).
+  (`python3 scripts/oracle.py corpus llvm`), then self-hosts through the native
+  backend, tpde, runs its gates (see `X64_BACKEND.md`), and bootstraps the
+  LLVM-free Linux compiler.
 - CI's `linux` job builds with `dev.py build linux` and runs the SIMD slice of
   COMPREHENSIVE.
 - `python3 scripts/dev.py test fast --compiler build/bin/coil` runs on Linux too;

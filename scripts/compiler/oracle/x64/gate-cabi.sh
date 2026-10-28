@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# C-ABI gate for the x86-64 backend: the SysV eightbyte rules, checked against
-# a real gcc-compiled translation unit.
+# C-ABI gate for the native backend (tpde) on x86-64 Linux: the SysV eightbyte
+# rules, checked against a real gcc-compiled translation unit.
 #
 # Why this gate exists and the corpus cannot replace it. For calls between Coil
-# functions this backend passes aggregates BY POINTER, so the eightbyte
+# functions the backend passes aggregates BY POINTER, so the eightbyte
 # classification — which register a struct's halves travel in, when the whole
 # thing spills to the stack, how a mixed int/float struct splits — is only ever
 # exercised at the C boundary. A Coil-only test cannot reach it. So here the
@@ -192,8 +192,8 @@ run_one() {  # run_one <label> <backend-args...>
   else echo "  FAIL — $label (exit $rc)"; printf '%s\n' "$out" | head -6; fail=$((fail+1)); fi
 }
 
-# The x64 backend is what this gate protects.
-run_one "x64 backend   <-> gcc" --backend x64
+# The native backend is what this gate protects.
+run_one "tpde (x64)    <-> gcc" --backend x64
 
 # The LLVM backend is the CONTROL: it must agree with gcc too, which is what
 # proves the expected values above are right and not merely self-consistent.

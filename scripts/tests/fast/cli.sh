@@ -1015,16 +1015,32 @@ EOF
 section_cross() {
   if [ "$HOST_OS" = Darwin ]; then
     local out rc kind
-    out=$("$COIL" build "$T/seven.coil" -o "$T/xseven" --target x86_64-apple-macosx11.0.0 2>&1); rc=$?
+    # comptime code runs in the compiler, so it is compiled for this machine
+    # whatever the target is
+    cat > "$T/xseven.coil" <<'EOF'
+(module xseven)
+(defn sq [(n i64)] (-> i64) (* n n))
+(def K (comptime (sq 7)))
+(defn main [] (-> i64) (- K 42))
+EOF
+    out=$("$COIL" build "$T/xseven.coil" -o "$T/xseven" --target x86_64-apple-macosx11.0.0 2>&1); rc=$?
     kind=$(file "$T/xseven" 2>&1)
     case "$kind" in
-      *x86_64*) [ "$rc" = 0 ] && ok "a cross build links an x86_64 Mach-O executable" \
-                              || bad "a cross build links an x86_64 executable" "exit $rc: $out" ;;
-      *) bad "a cross build links an x86_64 Mach-O executable" "exit $rc: $out / $kind" ;;
+      *x86_64*) [ "$rc" = 0 ] && ok "a cross build with comptime links an x86_64 Mach-O executable" \
+                              || bad "a cross build with comptime links an x86_64 Mach-O executable" "exit $rc: $out" ;;
+      *) bad "a cross build with comptime links an x86_64 Mach-O executable" "exit $rc: $out / $kind" ;;
     esac
+    out=$("$COIL" build "$T/xseven.coil" -o "$T/xseven-tpde" --backend x64 --target x86_64-apple-macosx11.0.0 2>&1); rc=$?
+    if [ "$rc" = 0 ] && arch -x86_64 /usr/bin/true 2>/dev/null; then
+      arch -x86_64 "$T/xseven-tpde"; rc=$?
+      [ "$rc" = 7 ] && ok "--backend x64 cross build with comptime runs under Rosetta" \
+                    || bad "--backend x64 cross build with comptime runs under Rosetta" "exit $rc"
+    elif [ "$rc" != 0 ]; then
+      bad "--backend x64 cross build with comptime runs under Rosetta" "exit $rc: $out"
+    fi
     # Apple's ar drops an ELF member with a warning and exits 0; a Linux --lib
     # archive is written by llvm-ar and holds the object.
-    out=$("$COIL" build "$T/seven.coil" --lib -o "$T/xseven.a" --target x86_64-unknown-linux-gnu 2>&1); rc=$?
+    out=$("$COIL" build "$T/xseven.coil" --lib -o "$T/xseven.a" --target x86_64-unknown-linux-gnu 2>&1); rc=$?
     if [ "$rc" = 0 ] && LC_ALL=C grep -aq "$(printf '\177ELF')" "$T/xseven.a"; then
       ok "a cross --lib build archives its ELF object"
     else
@@ -1068,7 +1084,7 @@ section_cross() {
 (defn main [] (-> i64) (+ (arch-code) (os-code)))
 EOF
   # A backend that cannot lower a program says so where the program asks for it,
-  # and exits 1: the x64 backend has no 128-bit integers.
+  # and exits 1: the wasm backend has no 128-bit integers.
   cat > "$T/wide.coil" <<'EOF'
 (module wide-int)
 (defn main [] (-> i64)
@@ -1076,12 +1092,12 @@ EOF
     (cast i64 (/ big (: 4294967296 i128)))))
 EOF
   local wide wide_rc
-  wide=$("$COIL" build "$T/wide.coil" --backend x64 --target x86_64-unknown-linux-gnu -o "$T/wide-x64" 2>&1); wide_rc=$?
-  if [ "$wide_rc" = 1 ] && grep -q 'x64 backend does not support integers wider than 64 bits' <<<"$wide" \
+  wide=$("$COIL" build "$T/wide.coil" --backend wasm --target wasm64-unknown-unknown -o "$T/wide.wasm" 2>&1); wide_rc=$?
+  if [ "$wide_rc" = 1 ] && grep -q 'wasm backend does not support integers wider than 64 bits' <<<"$wide" \
      && grep -qE -- '--> .*wide.coil:3:16' <<<"$wide"; then
-    ok "the x64 backend refuses a 128-bit integer at its location, exit 1"
+    ok "the wasm backend refuses a 128-bit integer at its location, exit 1"
   else
-    bad "the x64 backend refuses a 128-bit integer at its location, exit 1" "exit $wide_rc: $wide"
+    bad "the wasm backend refuses a 128-bit integer at its location, exit 1" "exit $wide_rc: $wide"
   fi
   # coil.safety's fault handlers fold their signal ABI for the target, so a cross
   # build need not run anything on this machine.

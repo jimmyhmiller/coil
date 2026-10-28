@@ -5,14 +5,14 @@ functions, parameters and locals, and their types. What is on by default:
 
 | Backend | Debug info | How a variable is found |
 |---|---|---|
-| `--backend tpde` (arm64, x86-64) | **by default** | parameters and mutable variables: a shadow slot; immutable `let`s: location lists from the register allocator |
-| `--backend arm64` | **by default** | its stack slot (every value has one) |
+| native: `--backend tpde`, `arm64`, `x64` | **by default** | parameters and mutable variables: a shadow slot; immutable `let`s: location lists from the register allocator |
 | LLVM (`coil build`, `-O…`) | with `-g` (`--backend llvm -g`) | `llvm.dbg.declare` on its storage |
-| `--backend x64` (ELF) | with `-g` | its stack slot |
 
 `-g0` (or `--no-debug`) turns the default off. `-g` with no `--backend` still
-picks the native debug backend (`--backend arm64` on Apple silicon), which
-never optimizes; `-g` with a named backend keeps it.
+picks the native backend (`--backend arm64` on Apple silicon, `x64` on x86-64
+Linux), which never optimizes; `-g` with a named backend keeps it. Under `-g`
+the native backend also keeps every function's debug frame, so a parameter
+stays visible after its last use.
 
     coil build src/examples/fib.coil -o /tmp/fib --backend tpde
     lldb /tmp/fib
@@ -83,7 +83,7 @@ clang's Mach-O scheme. Location list entries are relative to the CU's base and
 need none. Without the relocations `dsymutil` rejects the object ("No valid
 relocations found. Skipping.").
 
-On ELF (`--backend x64`, and tpde for Linux x86-64) the same addresses are
+On ELF (the native backend for Linux x86-64) the same addresses are
 `R_X86_64_64` relocations against a symbol at the start of `.text`, and the
 linker resolves them; there is no separate gathering step.
 
@@ -91,13 +91,13 @@ linker resolves them; there is no separate gathering step.
 
 - Function-name breakpoints need the module-qualified name (`app.add`).
 - tpde's line rows are per line (the column is that of the line's first
-  expression); the native arm64 backend's are per expression.
+  expression).
 - tpde describes a variable whose value is an address into the frame as that
-  address (a pointer), as the arm64 backend does; `p *q` shows the value.
+  address (a pointer); `p *q` shows the value.
 - No lexical blocks in the LLVM backend: every local is visible in its whole
   function.
 
 Gated in FAST's `cli/debuginfo` step (`scripts/tests/fast/cli.sh`): a line
-breakpoint from the `.dSYM` alone, and on each macOS backend (arm64 and tpde by
-default, LLVM with `-g`, tpde for x86-64 under Rosetta) parameters, locals, a
+breakpoint from the `.dSYM` alone, and on each macOS backend (tpde by default,
+LLVM with `-g`, tpde for x86-64 under Rosetta) parameters, locals, a
 sum and a struct at a line breakpoint; `-g0` gathers nothing.

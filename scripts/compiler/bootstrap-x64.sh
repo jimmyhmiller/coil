@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Self-host the compiler THROUGH THE NATIVE x86-64 BACKEND, and prove it.
+# Self-host the compiler THROUGH THE NATIVE BACKEND (tpde) ON x86-64 LINUX, and
+# prove it.
 #
-# The x86-64 sibling of the arm64 bootstrap. Three independent checks, because
-# "it compiled" is not evidence that a backend is correct:
+# The x86-64 sibling of the arm64 bootstrap. Independent checks, because "it
+# compiled" is not evidence that a backend is correct:
 #
-#   FIXPOINT : stage2.o == stage3.o byte-identical. A compiler built by the x64
-#              backend, rebuilding itself with the x64 backend, must land on the
+#   FIXPOINT : stage2.o == stage3.o byte-identical. A compiler built by tpde for
+#              x86-64, rebuilding itself the same way, must land on the
 #              same bytes. This catches nondeterminism and most miscompiles of
 #              the compiler's own code — a subtly wrong stage2 almost never
 #              reproduces itself exactly.
@@ -14,11 +15,11 @@
 #   CABI     : struct passing/returning agrees with a gcc-compiled object. The
 #              eightbyte rules only bite at the C boundary (internal calls pass
 #              aggregates by pointer), so this is the only check that reaches
-#              them — and the bug that broke the first self-host lived here.
+#              them.
 #   ENCODE   : every instruction the encoder emits still matches llvm-mc.
 #
 # stage1 comes from whatever compiler you point at (default build/bin/coil, the
-# LLVM-backed build) — only stages 2 and 3 go through the x64 backend.
+# LLVM-backed build) — only stages 2 and 3 go through `--backend x64`, tpde.
 #
 # Usage: scripts/compiler/bootstrap-x64.sh [install-dest]   (default dest: build/bin/coil-x64)
 #        STAGE0=/path/to/coil scripts/compiler/bootstrap-x64.sh

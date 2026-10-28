@@ -10,9 +10,8 @@ way and compares stdout and the exit status with tests/corpus/reference/:
 
 tests/corpus/corpus.txt lists the programs. After the file name come options:
 `safety` and `meta-interp` put a program in those lanes (`--all` runs every
-program there), `interp-refused=TEXT`, `x64-refused=TEXT` and
-`meta-interp-refused=TEXT` say that lane must refuse it (by design) with a
-diagnostic containing TEXT. The meta-interp lane always runs the programs it must
+program there), `interp-refused=TEXT` and `meta-interp-refused=TEXT` say that
+lane must refuse it (by design) with a diagnostic containing TEXT. The meta-interp lane always runs the programs it must
 refuse, even under --only: only the interpreted engine refuses them, so that
 refusal is what proves COIL_META_INTERP=1 selected it rather than the native
 engine, which runs every program and would pass the lane while testing nothing.
@@ -80,7 +79,7 @@ def read_corpus() -> list[Program]:
                 program.safety = True
             elif option == "meta-interp":
                 program.meta_interp = True
-            elif option.startswith(("interp-refused=", "x64-refused=", "meta-interp-refused=")):
+            elif option.startswith(("interp-refused=", "meta-interp-refused=")):
                 lane, text = option.split("=", 1)
                 program.refused[lane.removesuffix("-refused")] = text
             elif option.startswith("safety-fails="):
@@ -96,7 +95,7 @@ def read_corpus() -> list[Program]:
 def lane_build_flags(lane: str) -> list[str]:
     return {
         "arm64": ["--backend", "arm64"],
-        "meta-interp": ["--backend", "arm64"],
+        "meta-interp": ["--backend", "tpde"],
         "x64": ["--backend", "x64"],
         "tpde": ["--backend", "tpde"],
         "llvm": [],

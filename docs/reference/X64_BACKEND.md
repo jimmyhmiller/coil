@@ -1,190 +1,75 @@
-# The x86-64 backend (selfhost, zero-deps)
+# x86-64 code generation
 
-A third backend for the **self-hosted** Coil compiler (`src/compiler/`), written
-in Coil, that lowers the monomorphized `Program` directly to x86-64 machine code
-in an **ELF** object — no LLVM anywhere in the path. It is a debug backend: DWARF
-always on, compile speed over code quality. It was written as the Linux sibling of
-a slot-per-value arm64 emitter that tpde has since replaced
-(`docs/reference/ARM64_BACKEND.md`); it stays the native Linux backend until tpde
-writes ELF.
+All x86-64 code the compiler emits without LLVM comes from the **tpde backend**,
+the same one that writes arm64 code (`docs/reference/ARM64_BACKEND.md`): `--backend
+x64` (tpde for an x86-64 target; `--backend tpde` follows whatever the target is),
+the native default and `-g` on an x86-64 Linux host, compile-time units,
+metaprograms built in memory, and the LLVM-free Linux compiler
+(`src/compiler/main_x64.coil`). For Linux it writes an ELF object; for an x86-64
+Darwin target, a Mach-O one. It replaced a slot-per-value x86-64 emitter
+(`codegen_x64.coil`, deleted).
+
+`--backend x64` with a target that is not x86-64, like `--backend arm64` with one
+that is not arm64, is an error rather than code for another machine.
 
 ## Files
-- `src/compiler/object/x64.coil` — x86-64 instruction encoder. Pure: composes REX /
-  ModRM / SIB / displacement bytes into a plain byte buffer; label+fixup
-  management for branches.
+- `src/compiler/backend/codegen_tpde.coil` — the lowering (see the arm64 page).
+  For x86-64 it classifies by System V: an aggregate of up to 16 bytes travels
+  per eightbyte (INTEGER dominating SSE within one), a larger one in memory, and a
+  result over 16 bytes through a hidden pointer. `tl-elf-object` turns the
+  Mach-O-shaped module it builds into ELF: no `_` symbol prefix, `.L` names for
+  temporaries, explicit RELA addends, relocated constants in `.data.rel.ro`, and
+  DWARF relocations against a symbol at the start of `.text`. `cgtpde-build-eobj`
+  hands that object back in memory.
+- `src/compiler/tpde/x64.coil`, `src/compiler/tpde/cir/x64.coil` — tpde's x86-64
+  layer. The address of a symbol that is not local to the object is loaded from
+  its GOT entry (`R_X86_64_REX_GOTPCRELX`), so a shared object can be linked from
+  it; the linker relaxes the load when the symbol turns out local.
 - `src/compiler/object/elf.coil` — ELF64 `ET_REL` writer: sections, `.rela.*`
-  relocations (`R_X86_64_64`, `PC32`, `PLT32`), symbol table with the
-  local-before-global ordering ELF requires, string tables.
-- `src/compiler/object/dwarf.coil` — **shared** with the arm64 backend; the frame-base
-  register and slot bias are now parameters (`fbreg`/`fbbias`) rather than
-  hardcoded to x29.
-- `src/compiler/backend/codegen_x64.coil` — the lowering: mono `Program` → code + data +
-  relocs + DWARF. It mirrored the deleted arm64 emitter function for function.
-- `src/compiler/main_x64.coil` — the LLVM-free entry point (the `main_a64.coil`
-  equivalent): omits `codegen.coil`/`normalize.coil` entirely.
-- `src/compiler/selftest/x64_selftest.coil` — the encoder's verification harness.
+  relocations, weak symbols, the local-before-global symbol order ELF requires.
+- `src/compiler/jit/jit_elf.coil` — maps an in-memory ELF object into this
+  process for metaprograms and comptime: far-call stubs for symbols out of
+  `rel32` reach, and a GOT for the relocations that name one.
+- `src/compiler/object/x64.coil` — the x86-64 instruction encoder the loader's
+  stubs, `native_call.coil` and the ELF self-test use.
 
-## What differs from the arm64 backend
-Everything not listed here is deliberately identical.
-
-- **Registers.** `rbx` is the slot base (callee-saved, so it survives calls with
-  no save/restore around each one), `rbp` the frame pointer, `rax`/`r10`/`r11`
-  the scratch set. The scratch set is small and explicit because several x86
-  instructions pin registers: `idiv` uses `rdx:rax`, variable shifts read `cl`,
-  `cmpxchg` compares against `rax`.
-- **The ABI is SysV AMD64, not AAPCS64.** There is no HFA rule; instead each
-  aggregate ≤16 bytes is classified per *eightbyte* (INTEGER dominates SSE
-  within a group), >16 bytes goes in memory, and a >16-byte return uses a
-  hidden pointer in `rdi` (also returned in `rax`). Variadic calls must set
-  `al` to the number of SSE registers used.
-- **Object format is ELF.** Symbols carry no leading underscore (that is a
-  Mach-O convention). Symbol order is a hard requirement, not a convention:
-  every local must precede every global, with `.symtab`'s `sh_info` marking the
-  boundary — a linker rejects the object otherwise. Debug sections carry REAL
-  relocations against `.text`, unlike the Mach-O path where section-relative
-  addresses plus ld64's debug map do the work.
-- **Stack alignment.** SysV wants `rsp ≡ 0 (mod 16)` at every `call`. Entry is
-  `8 (mod 16)`, and the prologue does an ODD number of pushes (`rbp`, `rbx`), so
-  the frame subtraction is `8 (mod 16)`. Getting this wrong does not fault at
-  the call site — it faults deep inside libc, in a `movaps`.
-- **`frem` is a libm call.** SSE has no remainder instruction, so `frem` lowers
-  to `fmod`/`fmodf` and the driver appends `-lm` for this backend.
-- **Fixed-width patchable instructions.** The frame size is only known after the
-  body is emitted, so the prologue emits `sub rsp, imm32` and
-  `lea rbx, [rsp+disp32]` at their maximum width and patches the immediates in
-  place. A shorter encoding chosen up front would have to move code to widen.
-  `alloc-stack-bytes` moves `rsp` down by the 16-rounded count at run time and
-  hands out the bytes above the outgoing-args area, through another such `lea`;
-  `leave` undoes it on return.
-- **`:shim` conventions** name x86-64 registers (`rdi`, `r10`, …). An arm64 `xN`
-  name is a hard error with the same per-arch diagnostic the LLVM backend gives
-  for the reverse case, rather than silently picking the same-numbered register.
-
-## The `llvm-ir` escape hatch
-Mirrors `docs/reference/ARM64_BACKEND.md`'s section of the same name —
-`codegen_x64.coil` ported the identical op subset op-for-op (`bitcast`,
-`icmp`/`fcmp`, `select`, `sext`/`zext`/`trunc`, float↔int conversions,
-bitwise/shift/div/rem, plain load/store, `getelementptr`,
-`@llvm.masked.gather.v4i8.v4p0`, `@llvm.sqrt.v4f32`, general
-`shufflevector`, and inline vector-constant/float/i128 literal support), and
-that document's description of the subset and its scope edges (i128 is
-eq/ne-only; `getelementptr`/`masked.gather` cover the exact shapes a real
-external SIMD project needed) applies here unchanged. Verified against the
-LLVM backend the same way: byte-for-byte on a per-op test program shared by both
-native backends' corpora (removed in the test restructure of 2026-10-12) and on
-the project that motivated the expansion.
-
-The scalar float math intrinsics `coil.math` uses are lowered differently: SSE2
-has `sqrtss`/`sqrtsd`, and IEEE `minimum`/`maximum` is an inline sequence
-(`minss`/`maxss` differ on NaN and signed zero); everything else, rounding
-included, since SSE2 has no rounding instruction, calls the libm function.
+## What differs from arm64
+- **The ABI is System V AMD64.** No HFA rule; eightbyte classification as above.
+  Variadic calls set `al` to the number of vector registers used.
+- **Object format is ELF.** Symbols carry no leading underscore, every local
+  symbol precedes every global one, and debug sections carry real relocations,
+  which the linker resolves (no debug map, no `dsymutil`).
+- **`frem` is a libm call** (`fmod`/`fmodf`); the driver links `-lm` on Linux.
 
 ## Gates
-The scripts are in `scripts/compiler/oracle/x64/`. They run on an x86-64 Linux
-host: `python3 scripts/dev.py build x64` runs them after its fixpoint, and so does
-COMPREHENSIVE's `x64/host` step (`scripts/tests/x64-host.py`), which also runs
-`gate-elf.sh`.
-- `gate-encode.sh` — every instruction the encoder can emit is diffed against
-  **llvm-mc**, an independent assembler. 108 cases covering the encoding edge
-  cases: `r8`–`r15` in each operand position, `rsp`/`r12` as a memory base
-  (forces SIB), `rbp`/`r13` as a base (cannot use mod=00), the disp8/disp32
-  boundaries, byte registers 4–7 (which need a bare REX to not mean `ah`/`ch`/
-  `dh`/`bh`), and the immediate-size ladder. A handful of encoders deliberately
-  emit a wider-than-canonical form (the patchable ones); those are marked
-  `#wide` and verified by disassembling them back instead.
-  *Teeth: swapping the `sub` opcode for `add` is caught immediately.*
-- `gate-elf.sh` — hand-assembles `int main(){puts("elf ok");return 42;}`,
-  writes it through `elf.coil`, then **links it with `cc` and runs it**. Also
-  checks readelf's view and that the link produces no warnings (a missing
-  `.note.GNU-stack` silently gives the whole program an executable stack).
-  *Teeth: a wrong `sh_info` makes the real linker reject the object.*
-- `python3 scripts/oracle.py corpus x64` — builds the runtime corpus (`tests/corpus`,
-  eight self-checking programs) with `--backend x64`, runs each, and compares
-  stdout and the exit status with the references, which record the LLVM and arm64
-  backends' agreed behaviour. Runtime equality, not IR equality, is the contract
-  between backends.
-- `gate-cabi.sh` — the SysV eightbyte rules, differentially against **gcc**.
-  This gate exists because the corpus structurally cannot reach those rules:
-  for Coil-to-Coil calls this backend passes aggregates BY POINTER (same as
-  arm64), so struct classification only happens at the C boundary. Here a
-  gcc-compiled translation unit is the callee, and every field carries a
-  distinct prime weight — the first draft summed them evenly, which meant a
-  backend that swapped two arguments still produced the right total.
-  *Teeth: this is where the bug that broke the first self-host attempt lived.*
-- `python3 scripts/dev.py build x64` — the finale: stage2/stage3 through the x64
-  backend, **stage2.o == stage3.o byte-identical**, and the x64-built compiler
-  itself passes the corpus.
-- `python3 scripts/dev.py build nollvm-linux` — builds `main_x64.coil` and proves
-  with `ldd` that the result links no libLLVM (only libc + libm).
+They run on an x86-64 Linux host: COMPREHENSIVE's `x64/host` step
+(`scripts/tests/x64-host.py`) runs all of them.
+- `python3 scripts/dev.py build x64` (`scripts/compiler/bootstrap-x64.sh`):
+  stage 2 and stage 3 through `--backend x64`, **stage2.o == stage3.o
+  byte-identical**, the corpus on the tpde-built compiler, `gate-cabi.sh` and
+  `gate-encode.sh`.
+- `python3 scripts/dev.py build nollvm-linux` builds `main_x64.coil`, proves with
+  `ldd` that it links no libLLVM, reaches the same fixpoint, and runs the corpus.
+- `python3 scripts/oracle.py corpus x64` builds the runtime corpus with
+  `--backend x64` and compares each program's output and exit status with the
+  references the LLVM build blessed.
+- `scripts/tests/c-abi.py` links tpde and LLVM objects together and against C.
+- `scripts/compiler/oracle/x64/gate-cabi.sh` — the System V eightbyte rules,
+  differentially against **gcc**: the callee is compiled by gcc and every field
+  carries a distinct prime weight, so swapping two arguments changes the answer.
+  Calls between Coil functions pass aggregates by pointer, so only the C
+  boundary reaches these rules.
+- `scripts/compiler/oracle/x64/gate-encode.sh` — every instruction the encoder
+  emits, diffed against **llvm-mc**.
+- `scripts/compiler/oracle/x64/gate-elf.sh` — a hand-assembled program written
+  through `elf.coil`, linked with `cc` and run, plus readelf's view of it.
 
-## Results (2026-07-28, Strix Halo x86-64 host)
-Same compiler binary, LLVM backend vs `--backend x64`, end-to-end `build`
-including the `cc` link:
-
-| input                             | LLVM     | x64      | speedup   |
-|-----------------------------------|----------|----------|-----------|
-| `src/compiler/main.coil` (~15k lines w/ libs) | 21.25 s | **1.61 s** | **13.2×** |
-| `src/examples/json.coil`              | 129 ms   | 58 ms    | 2.2×      |
-
-The ≥10× target the arm64 backend set is beaten on the input that matters.
-Small programs are bound by the shared `cc`-link and process floor.
-
-## Status
-- [x] x86-64 encoder, 108/108 cases byte-identical to llvm-mc.
-- [x] ELF64 writer; generated objects link with `cc` and run.
-- [x] Full lowering: 57/57 behavioral corpus, including the adversarial ABI
-      stress, narrow/odd-width integers, NaN-aware float comparisons, atomics,
-      6-arg variadics + fnptr tables, deep recursion, 8-variant sums, bitfields.
-- [x] DWARF always on: gdb resolves breakpoints by name, prints parameters and
-      locals with correct values, and renders structs through pointers.
-- [x] Self-hosting: `bootstrap-x64.sh` — fixpoint byte-identical, and the
-      x64-built compiler passes the corpus.
-- [x] LLVM-free build: `main_x64.coil` links only libc+libm, self-hosts to a
-      byte-identical fixpoint, and passes the corpus.
-- [ ] (future) direct executable emission, to drop the `cc` link floor.
-
-## Bugs the gates caught (a sampler, since each argues for a gate)
-- `mov %rax,(%rax)` — `emit-copy-to-mem!` used its scratch register as both the
-  destination pointer and the value temp. This one bug accounted for 20 of the
-  23 initial corpus failures; the copy helpers now defend against the aliasing.
-- `setb` for ordered `<` — an unordered SSE compare sets CF=ZF=PF=1, so `b`/`be`
-  answer TRUE for NaN. `OLT`/`OLE` now swap the operands and use `a`/`ae`, the
-  only conditions that are false when unordered.
-- A 16-byte aggregate spilled to the stack was passed as ONE eightbyte by the
-  caller and read as TWO by the callee. Invisible to the corpus; it only
-  surfaced when the x64-built compiler tried to compile something, because
-  `run-pipeline` takes several slices past the sixth argument.
-- Arm64 register numbers (`9`, `10`, `11`) leaking through the port as x86
-  `r9`/`r10`/`r11`.
-- A `>16B` struct passed to a C function went by POINTER rather than as a stack
-  copy. AAPCS64 really does pass those indirectly, so the arm64 code this was
-  ported from was correct — the SysV rule is different, and the port inherited
-  the wrong one. Fixing it needed an explicit `isc` flag on the signature:
-  dyn-dispatch signatures also declare aggregate params by value while passing
-  references, so the two cases cannot be told apart from the types alone.
-
-## An LLVM-backend bug this work surfaced — and fixed
-Writing `gate-cabi.sh` exposed a real bug in the OTHER backend. `codegen.coil`
-classified a by-value aggregate purely from its type, so a `{double,double}`
-always became two separate `double` parameters. SysV does not work that way:
-an aggregate is passed in registers only if enough are still free at its
-position, and otherwise the WHOLE thing goes in memory — it never half-spills.
-With seven doubles ahead of it the callee read `qx=5, qy=0` instead of
-`qx=3, qy=5`. Verified three ways: gcc alone said 418, the coil LLVM path said
-357, the x64 backend said 418.
-
-`c-signature` now tracks integer and SSE register consumption across the
-parameter list (counting the sret pointer, scalars, and each aggregate's
-eightbytes) and demotes an `ACDirect` aggregate to `byval` when either file
-would overflow — which is exactly what clang emits. The accounting is x86-only:
-AArch64's `ACDirect` coercion is a single slot whose HFA/size rules the
-classifier already handles, and cross-compiled arm64 IR is unchanged
-(`[2 x double]`, as before).
-
-The fix changed no existing program's output: `gate-full` is still byte-exact
-across all 60 IR snapshots, because the demotion only triggers in the
-register-exhausted case that nothing in the corpus reached. `gate-cabi.sh` now
-covers both sides of that boundary — `c_p2_fits`/`c_f2_fits` land exactly in
-the last free registers and must stay in them, while `c_p2_over`/`c_mix_over`
-must demote. Reverting the fix trips checks 4, 14 and 16 (SSE, INTEGER and
-mixed-class exhaustion) while the `_fits` cases stay green.
+## An LLVM-backend bug the x86-64 work surfaced
+`codegen.coil` classified a by-value aggregate purely from its type, so a
+`{double,double}` always became two separate `double` parameters. System V passes
+an aggregate in registers only if enough are still free at its position, and
+otherwise the whole thing goes in memory; it never half-spills. `c-signature`
+now tracks integer and SSE register consumption across the parameter list and
+demotes an aggregate to `byval` when either file would overflow, as clang does.
+`gate-cabi.sh` covers both sides of that boundary (`c_p2_fits`/`c_f2_fits` stay
+in the last free registers, `c_p2_over`/`c_mix_over` must demote).

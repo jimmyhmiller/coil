@@ -15,7 +15,7 @@ register-allocated code.
   one function at a time, then tpde → machine code. It mirrors the LLVM backend's
   lowering decisions (sum layout `{i32 tag, payload at 8}`, slices `{ptr, i64}`,
   divergence, AAPCS64 at every call); `codegen.coil` stays the behavioral spec.
-  For an x86-64 Mach-O target it writes System V code instead.
+  For an x86-64 target it writes System V code instead (`X64_BACKEND.md`).
 - `src/compiler/backend/codegen_tpde_ir.coil` — the `llvm-ir` escape hatch (below).
 - `src/compiler/backend/native_module.coil` — the module layer the lowering runs
   on: signatures, layouts and their natural C offsets (which compile-time readback

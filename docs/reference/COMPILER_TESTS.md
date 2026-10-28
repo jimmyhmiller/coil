@@ -107,7 +107,8 @@ and `meta-interp` lanes. The `meta-interp` lane always includes the programs
 marked `meta-interp-refused=`: only the interpreted engine refuses them, so the
 refusal proves `COIL_META_INTERP=1` selected it and the lane is not silently
 running the native engine. The LLVM-free and x64 bootstraps run the corpus on
-their own backend.
+the native backend, tpde. The `arm64`, `x64` and `tpde` lanes all compile with
+tpde: `arm64` and `x64` name it for one architecture, `tpde` for the target's.
 
 ### Diagnostics
 
@@ -141,7 +142,7 @@ nothing else heavy is running: the build steps peak near 10 GB.
 | `guide-demos` | every `src/examples` demo builds and exits as `tests/demos.txt` says |
 | `regex-reference`, `prop`, `fuzz`, `simd` | breadth: regex conformance, property tests, the fuzz engine, SIMD in full |
 | `freestanding` | every `src/examples/freestanding` program links bare-metal (aarch64, riscv32, ESP32-C3) with `ld.lld --gc-sections` and no undefined symbols, then boots under QEMU; needs `brew install lld qemu` |
-| `x64/host` | on the x86-64 Linux host over ssh: the Linux bootstrap, the corpus on LLVM and tpde (ELF), the C ABI checks, the x64 backend's fixpoint and gates |
+| `x64/host` | on the x86-64 Linux host over ssh: the Linux bootstrap, the corpus on LLVM, the C ABI checks, tpde's x86-64 fixpoint and gates, the LLVM-free Linux bootstrap |
 
 The x64 step uses `COIL_X64_HOST` (default `computer.jimmyhmiller.com`). That
 host may be unreachable; the step then fails and says so, rather than passing
