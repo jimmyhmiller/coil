@@ -38,14 +38,9 @@ def corpus():
 
 def namespace_roots():
     # The roots scripts/compiler/stage0.py builds the compiler with: its own
-    # sources, so a reference compiler whose bundled manifest predates a new
-    # compiler module still finds it, and the tpde backend, which the compiler
-    # imports from its package beside this checkout (Coil.toml).
-    roots = ["src", "tests", "scripts", "src/compiler", "src/stdlib"]
-    tpde = (ROOT / "../coil-tpde/src").resolve()
-    if tpde.is_dir():
-        roots.append(str(tpde))
-    return ":".join(roots)
+    # sources (the vendored tpde package included), so a reference compiler whose
+    # bundled manifest predates a new compiler module still finds it.
+    return ":".join(["src", "tests", "scripts", "src/compiler", "src/stdlib"])
 
 
 def dump(compiler, command, path):

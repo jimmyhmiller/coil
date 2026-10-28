@@ -1,0 +1,992 @@
+; SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+; SPDX-FileCopyrightText: 2026 Jimmy Miller
+; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+; Ported to Coil from TPDE (commit 9779acf) and modified; see NOTICE.
+;;; The AArch64 part of the compiler (TPDE's CompilerA64), for Apple platforms:
+;;; AAPCS64 with Apple's stack packing and variadics, x18 reserved, the frame
+;;; pointer always set up when there is a frame.
+;;;
+;;; Registers: GP x0–x30 are 0–30 (31 is SP), FP/SIMD v0–v31 are 32–63. x16 is
+;;; the permanent scratch (large offsets, constants); x17 addresses incoming
+;;; stack arguments in the prologue.
+;;;
+;;; Frame: [fp, 0] holds fp/lr, then the callee-saved registers, then spill
+;;; slots, all at positive offsets from fp (= sp after the prologue). The
+;;; prologue is reserved as nops, written in `finish-func!` once the used
+;;; callee-saved registers are known, and the unused tail is cut out.
+(module tpde.a64)
+(import "coil.primitive" :as primitive)
+(import "tpde.core"
+        :as
+        core
+        :use
+        [Compiler ValuePart CCAssignment CCState Scratch Jump Fixup])
+(import "tpde.adaptor" :use [IRAdaptor])
+(import "tpde.a64.enc" :as e)
+(import "tpde.asm" :as asm :use [Asm Reloc])
+(import "tpde.buf" :as buf)
+
+; jump kinds 0–13 are the condition codes
+(const J-EQ 0)
+
+(const J-NE 1)
+
+(const J-CS 2)
+
+(const J-CC 3)
+
+(const J-MI 4)
+
+(const J-PL 5)
+
+(const J-VS 6)
+
+(const J-VC 7)
+
+(const J-HI 8)
+
+(const J-LS 9)
+
+(const J-GE 10)
+
+(const J-LT 11)
+
+(const J-GT 12)
+
+(const J-LE 13)
+
+(const J-JMP 16)
+
+(const J-CBZ 17)
+
+(const J-CBNZ 18)
+
+(const J-TBZ 19)
+
+(const J-TBNZ 20)
+
+; fixup kinds
+(const FX-BR 0)
+
+(const FX-COND 1)
+
+(const FX-TEST 2)
+
+(const FX-TABLE 200)
+
+(const X16 16)
+
+(const X17 17)
+
+(defn u [(x i64)] (-> u32)
+  (primitive/cast u32 x))
+
+(defn r5 [(r u8)] (-> u32)
+  (& (cast u32 r) (: 31 u32)))
+
+(defn gp? [(r u8)] (-> bool)
+  (< r (: 32 u8)))
+
+(defn bit [(r i64)] (-> u64)
+  (<< (: 1 u64) (cast u64 r)))
+
+(defn callee-saved [] (-> u64)
+  ; x19–x28, v8–v15
+  (| (: 0x1FF80000 u64) (<< (: 0xFF u64) (: 40 u64))))
+
+(defn allocatable [] (-> u64)
+  ; everything but x16, x17, x18 (Apple platform register), x29 (fp), sp
+  (& (: 0xFFFFFFFFFFFFFFFF u64)
+     (^ (| (bit 16) (bit 17) (bit 18) (bit 29) (bit 31))
+        (: 0xFFFFFFFFFFFFFFFF u64))))
+
+(defn arg-regs [] (-> u64)
+  ; x0–x8, v0–v7
+  (| (: 0x1FF u64) (<< (: 0xFF u64) (: 32 u64))))
+
+(defn emit! [A] [(c (ptr (Compiler A))) (inst u32)] (-> void)
+  (buf/emit32! (.text c) inst))
+
+(defn off [A] [(c (ptr (Compiler A)))] (-> u32)
+  (cast u32 (.len (load (.text c)))))
+
+(defn align-up [(v u32) (a u32)] (-> u32)
+  (& (+ v (- a (: 1 u32))) (^ (- a (: 1 u32)) (: 0xFFFFFFFF u32))))
+
+; ============================ calling convention ============================
+
+(defn assign-arg! [(st (ptr CCState)) (cca (mut CCAssignment))] (-> void)
+  (cond (.byval cca)
+          (let [a (if (< (.align cca) (: 8 u32)) (: 8 u32) (.align cca))]
+            (set! (.nsaa st) (align-up (.nsaa st) a))
+            (set! (.stack-off cca) (.nsaa st))
+            (set! (.nsaa st) (+ (.nsaa st) (.size cca))))
+        (.sret cca) (set! (.reg cca) (: 8 u8))
+        (and (.apple st) (.in-variadic st))
+          ; Apple: every variadic argument goes on the stack in 8-byte slots
+          (let [slot
+                  (if (> (.size cca) (: 8 u32))
+                      (align-up (.size cca) (: 8 u32))
+                      (: 8 u32))
+                a (if (> (.align cca) (: 8 u32)) (.align cca) (: 8 u32))]
+            (set! (.nsaa st) (align-up (.nsaa st) a))
+            (set! (.stack-off cca) (.nsaa st))
+            (set! (.nsaa st) (+ (.nsaa st) slot)))
+        (= (.bank cca) (: 0 u8))
+          (do
+            (when (> (.align cca) (: 8 u32))
+              (set! (.ngrn st) (align-up (.ngrn st) (: 2 u32))))
+            (if (< (+ (.ngrn st) (cast u32 (.consecutive cca))) (: 8 u32))
+                (do
+                  (set! (.reg cca) (cast u8 (.ngrn st)))
+                  (set! (.ngrn st) (+ (.ngrn st) (: 1 u32))))
+                (do
+                  (set! (.ngrn st) (: 8 u32))
+                  (stack-slot! st (mut cca)))))
+        :else
+          (if (< (+ (.nsrn st) (cast u32 (.consecutive cca))) (: 8 u32))
+              (do
+                (set! (.reg cca) (cast u8 (+ (: 32 u32) (.nsrn st))))
+                (set! (.nsrn st) (+ (.nsrn st) (: 1 u32))))
+              (do
+                (set! (.nsrn st) (: 8 u32))
+                (stack-slot! st (mut cca))))))
+
+;; A named argument on the stack: Apple packs it at its natural alignment,
+;; standard AAPCS64 uses 8-byte slots.
+(defn stack-slot! [(st (ptr CCState)) (cca (mut CCAssignment))] (-> void)
+  (when (and (.apple st)
+             (!= (.abi-size cca) (: 0 u32))
+             (< (.abi-size cca) (.size cca)))
+    ; a narrow integer: its slot (and the load or store) is its own size
+    (set! (.size cca) (.abi-size cca))
+    (set! (.align cca) (.abi-size cca)))
+  (if (.apple st)
+      (let [a (if (> (.align cca) (.size cca)) (.align cca) (.size cca))]
+        (set! (.nsaa st) (align-up (.nsaa st) (if (< a (: 1 u32)) (: 1 u32) a)))
+        (set! (.stack-off cca) (.nsaa st))
+        (set! (.nsaa st) (+ (.nsaa st) (.size cca))))
+      (let [a (if (< (.align cca) (: 8 u32)) (: 8 u32) (.align cca))]
+        (set! (.nsaa st) (align-up (.nsaa st) a))
+        (set! (.stack-off cca) (.nsaa st))
+        (set! (.nsaa st) (+ (.nsaa st) (align-up (.size cca) (: 8 u32)))))))
+
+(defn assign-ret! [(st (ptr CCState)) (cca (mut CCAssignment))] (-> void)
+  (if (= (.bank cca) (: 0 u8))
+      (do
+        (when (> (.align cca) (: 8 u32))
+          (set! (.ret-ngrn st) (align-up (.ret-ngrn st) (: 2 u32))))
+        (set! (.reg cca) (cast u8 (.ret-ngrn st)))
+        (set! (.ret-ngrn st) (+ (.ret-ngrn st) (: 1 u32))))
+      (do
+        (set! (.reg cca) (cast u8 (+ (: 32 u32) (.ret-nsrn st))))
+        (set! (.ret-nsrn st) (+ (.ret-nsrn st) (: 1 u32))))))
+
+; ============================ memory access =================================
+
+(defn mat-x16! [A] [(c (ptr (Compiler A))) (v u64)] (-> void)
+  (materialize-gp! c (: 16 u8) v)
+  (core/mark-clobbered! c (: 16 u8)))
+
+;;; Load `size` bytes from [base + off] into dst (GP or FP).
+(defn load-off! [A] [(c (ptr (Compiler A)))
+                     (dst u8)
+                     (base u8)
+                     (off i64)
+                     (size u32)
+                     (sext bool)] (-> void)
+  (let [d (r5 dst)
+        b (r5 base)]
+    (if (or (e/uimm-ok? off (cast i64 size)) (e/simm9-ok? off))
+        (emit! c
+               (if (gp? dst)
+                   (e/ldr-gp d b off size sext)
+                   (e/ldr-fp d b off size)))
+        (do
+          (mat-x16! c (cast u64 off))
+          (emit! c
+                 (if (gp? dst)
+                     (e/ldr-gp-reg d b (: 16 u32) size sext false)
+                     (e/ldr-fp-reg d b (: 16 u32) size false)))))))
+
+;;; Store `size` bytes of src to [base + off].
+(defn store-off! [A] [(c (ptr (Compiler A)))
+                      (base u8)
+                      (off i64)
+                      (src u8)
+                      (size u32)] (-> void)
+  (let [s (r5 src)
+        b (r5 base)]
+    (if (or (e/uimm-ok? off (cast i64 size)) (e/simm9-ok? off))
+        (emit! c (if (gp? src) (e/str-gp s b off size) (e/str-fp s b off size)))
+        (do
+          (mat-x16! c (cast u64 off))
+          (emit! c
+                 (if (gp? src)
+                     (e/str-gp-reg s b (: 16 u32) size false)
+                     (e/str-fp-reg s b (: 16 u32) size false)))))))
+
+(defn spill-reg! [A] [(c (ptr (Compiler A))) (r u8) (off i32) (size u32)]
+  (-> void)
+  (store-off! c (: 29 u8) (cast i64 off) r size))
+
+(defn load-from-stack! [A] [(c (ptr (Compiler A)))
+                            (r u8)
+                            (off i32)
+                            (size u32)
+                            (sext bool)] (-> void)
+  (load-off! c r (: 29 u8) (cast i64 off) size sext))
+
+;;; dst = base + off
+(defn add-imm-any! [A] [(c (ptr (Compiler A))) (dst u8) (base u8) (off i64)]
+  (-> void)
+  (cond (= off 0) (when (!= dst base) (emit! c (e/mov-sp (r5 dst) (r5 base))))
+        (e/addsub-imm? off) (emit! c (e/add-imm true (r5 dst) (r5 base) off))
+        (e/addsub-imm? (- 0 off))
+          (emit! c (e/sub-imm true (r5 dst) (r5 base) (- 0 off)))
+        :else
+          (do
+            (mat-x16! c (cast u64 off))
+            (emit! c
+                   (e/add-ext true
+                              (r5 dst)
+                              (r5 base)
+                              (: 16 u32)
+                              (: 3 u32)
+                              (: 0 u32))))))
+
+(defn load-stack-var-addr! [A] [(c (ptr (Compiler A))) (dst u8) (off i32)]
+  (-> void)
+  (add-imm-any! c dst (: 29 u8) (cast i64 off)))
+
+;;; dst = &sym + addend. Undefined symbols go through the GOT.
+(defn load-sym-addr! [A] [(c (ptr (Compiler A)))
+                          (dst u8)
+                          (sym u32)
+                          (addend i64)] (-> void)
+  (let [a (.asm c)
+        s (asm/sym-at a sym)
+        d (r5 dst)]
+    (if (= (.sect s) -1)
+        (do
+          (asm/reloc! a asm/SEC-TEXT (cast i64 (off c)) sym asm/R-GOT-PAGE21 0)
+          (emit! c (e/adrp d 0))
+          (asm/reloc! a
+                      asm/SEC-TEXT
+                      (cast i64 (off c))
+                      sym
+                      asm/R-GOT-PAGEOFF12
+                      0)
+          (emit! c (e/ldr-gp d d 0 (: 8 u32) false))
+          (when (!= addend 0) (add-imm-any! c dst dst addend)))
+        (do
+          (asm/reloc! a asm/SEC-TEXT (cast i64 (off c)) sym asm/R-PAGE21 0)
+          (emit! c (e/adrp d 0))
+          (asm/reloc! a asm/SEC-TEXT (cast i64 (off c)) sym asm/R-PAGEOFF12 0)
+          (emit! c (e/add-imm true d d 0))
+          (when (!= addend 0) (add-imm-any! c dst dst addend))))))
+
+(defn mov! [A] [(c (ptr (Compiler A))) (dst u8) (src u8) (size u32)] (-> void)
+  (when (!= dst src)
+    (cond (and (gp? dst) (gp? src))
+            (emit! c (e/mov-reg (> size (: 4 u32)) (r5 dst) (r5 src)))
+          (and (not (gp? dst)) (not (gp? src)))
+            (emit! c (e/mov-v (r5 dst) (r5 src)))
+          (gp? dst)
+            (emit! c (e/fmov-to-gp (> size (: 4 u32)) (r5 dst) (r5 src)))
+          :else (emit! c (e/fmov-from-gp (> size (: 4 u32)) (r5 dst) (r5 src))))))
+
+(defn materialize-gp! [A] [(c (ptr (Compiler A))) (dst u8) (v u64)] (-> void)
+  (let [(mut words) [(: 0 u32) (: 0 u32) (: 0 u32) (: 0 u32)]
+        n (e/mov-const (cast (ptr u32) (mut words)) (r5 dst) v)]
+    (for i (range 0 n) (emit! c (get words i)))))
+
+(defn materialize-const! [A] [(c (ptr (Compiler A)))
+                              (c0 u64)
+                              (c1 u64)
+                              (bank u8)
+                              (size u32)
+                              (dst u8)] (-> void)
+  (if (= bank (: 0 u8))
+      (materialize-gp! c
+                       dst
+                       (if (< size (: 8 u32))
+                           (& c0
+                              (- (<< (: 1 u64) (cast u64 (* size (: 8 u32))))
+                                 (: 1 u64)))
+                           c0))
+      (let [d (r5 dst)]
+        (cond (and (= c0 (: 0 u64)) (or (<= size (: 8 u32)) (= c1 (: 0 u64))))
+                (emit! c (e/movi-zero d))
+              (<= size (: 8 u32))
+                (let [dbl (= size (: 8 u32))
+                      imm (e/fp-imm8 c0 dbl)]
+                  (if (>= imm 0)
+                      (emit! c (e/fmov-imm dbl d imm))
+                      (do
+                        (mat-x16! c (if dbl c0 (& c0 (: 0xFFFFFFFF u64))))
+                        (emit! c (e/fmov-from-gp dbl d (: 16 u32))))))
+              :else
+                (let [(mut data) [c0 c1]
+                      sym
+                        (asm/const-data! (.asm c)
+                                         (cast (ptr u8) (mut data))
+                                         16
+                                         16)]
+                  (asm/reloc! (.asm c)
+                              asm/SEC-TEXT
+                              (cast i64 (off c))
+                              sym
+                              asm/R-PAGE21
+                              0)
+                  (emit! c (e/adrp (: 16 u32) 0))
+                  (asm/reloc! (.asm c)
+                              asm/SEC-TEXT
+                              (cast i64 (off c))
+                              sym
+                              asm/R-PAGEOFF12
+                              0)
+                  (emit! c (e/ldr-fp d (: 16 u32) 0 (: 16 u32)))
+                  (core/mark-clobbered! c (: 16 u8)))))))
+
+(defn intext! [A] [(c (ptr (Compiler A)))
+                   (dst u8)
+                   (src u8)
+                   (sign bool)
+                   (from u32)
+                   (to u32)] (-> void)
+  (let [w (<= to (: 32 u32))]
+    (if sign
+        (emit! c (e/sbfx (not w) (r5 dst) (r5 src) (: 0 u32) from))
+        (emit! c (e/ubfx (not w) (r5 dst) (r5 src) (: 0 u32) from)))))
+
+; ============================ jumps =========================================
+
+(defn invert-jump [(j Jump)] (-> Jump)
+  (let [k (.kind j)]
+    (cond (< k (: 14 u8))
+            (Jump
+              :kind (^ k (: 1 u8))
+              :reg (.reg j)
+              :is32 (.is32 j)
+              :bit (.bit j))
+          (= k (: 17 u8))
+            (Jump
+              :kind (: 18 u8)
+              :reg (.reg j)
+              :is32 (.is32 j)
+              :bit (.bit j))
+          (= k (: 18 u8))
+            (Jump
+              :kind (: 17 u8)
+              :reg (.reg j)
+              :is32 (.is32 j)
+              :bit (.bit j))
+          (= k (: 19 u8))
+            (Jump
+              :kind (: 20 u8)
+              :reg (.reg j)
+              :is32 (.is32 j)
+              :bit (.bit j))
+          (= k (: 20 u8))
+            (Jump
+              :kind (: 19 u8)
+              :reg (.reg j)
+              :is32 (.is32 j)
+              :bit (.bit j))
+          :else j)))
+
+(defn cbz-jump [(nz bool) (r u8) (is32 bool)] (-> Jump)
+  (Jump
+    :kind (if nz (: 18 u8) (: 17 u8))
+    :reg r
+    :is32 is32
+    :bit (: 0 u8)))
+
+(defn tbz-jump [(nz bool) (r u8) (b u8)] (-> Jump)
+  (Jump
+    :kind (if nz (: 20 u8) (: 19 u8))
+    :reg r
+    :is32 false
+    :bit b))
+
+(defn raw-jump! [A] [(c (ptr (Compiler A))) (j Jump) (label u32)] (-> void)
+  (let [pending (core/label-pending? c label)
+        here (off c)
+        dist
+          (if pending
+              0
+              (- (cast i64 (core/label-offset c label)) (cast i64 here)))
+        words (/ dist 4)
+        k (.kind j)]
+    (cond (= k (: 16 u8))
+            (do
+              (emit! c (e/b words))
+              (when pending (core/label-ref! c label here (: 0 u8))))
+          (or (= k (: 17 u8)) (= k (: 18 u8)))
+            (if (>= dist (- 0 (* 1024 1024)))
+                (do
+                  (emit! c
+                         (if (= k (: 17 u8))
+                             (e/cbz (not (.is32 j)) (r5 (.reg j)) words)
+                             (e/cbnz (not (.is32 j)) (r5 (.reg j)) words)))
+                  (when pending (cond-ref! c label here (: 1 u8))))
+                (do
+                  (emit! c
+                         (if (= k (: 17 u8))
+                             (e/cbnz (not (.is32 j)) (r5 (.reg j)) 2)
+                             (e/cbz (not (.is32 j)) (r5 (.reg j)) 2)))
+                  (emit! c (e/b (- words 1)))))
+          (or (= k (: 19 u8)) (= k (: 20 u8)))
+            (if (>= dist (- 0 (* 32 1024)))
+                (do
+                  (emit! c
+                         (if (= k (: 19 u8))
+                             (e/tbz (r5 (.reg j)) (cast u32 (.bit j)) words)
+                             (e/tbnz (r5 (.reg j)) (cast u32 (.bit j)) words)))
+                  (when pending (cond-ref! c label here (: 2 u8))))
+                (do
+                  (emit! c
+                         (if (= k (: 19 u8))
+                             (e/tbnz (r5 (.reg j)) (cast u32 (.bit j)) 2)
+                             (e/tbz (r5 (.reg j)) (cast u32 (.bit j)) 2)))
+                  (emit! c (e/b (- words 1)))))
+          :else
+            (if (>= dist (- 0 (* 1024 1024)))
+                (do
+                  (emit! c (e/b-cond (cast u32 k) words))
+                  (when pending (cond-ref! c label here (: 1 u8))))
+                (do
+                  (emit! c (e/b-cond (cast u32 (^ k (: 1 u8))) 2))
+                  (emit! c (e/b (- words 1))))))))
+
+; ---- veneers ----
+; A forward conditional branch reaches 1 MiB (tbz: 32 KiB). While any is
+; unresolved, `maybe-veneer!` (called between instructions) emits, before the
+; first of them could go out of range, an island of `b` slots jumped over by a
+; `b`; a branch that turns out too short is routed through a slot.
+
+(const TBZ-MAX 32768)
+
+(const COND-MAX 1048576)
+
+; no single instruction may emit more than this between checks
+(const VENEER-MARGIN 8192)
+
+(defn cond-ref! [A] [(c (ptr (Compiler A))) (label u32) (at u32) (kind u8)]
+  (-> void)
+  (core/label-ref! c label at kind)
+  (when (= (.pending-since c) (core/none)) (set! (.pending-since c) at))
+  (if (= kind (: 2 u8))
+      (set! (.unresolved-test c) (+ (.unresolved-test c) (: 1 u32)))
+      (set! (.unresolved-cond c) (+ (.unresolved-cond c) (: 1 u32)))))
+
+(defn maybe-veneer! [A] [(c (ptr (Compiler A)))] (-> void)
+  (let [n (+ (.unresolved-cond c) (.unresolved-test c))]
+    (when (> n (: 0 u32))
+      (let [max (if (> (.unresolved-test c) (: 0 u32)) TBZ-MAX COND-MAX)
+            size (* 4 (+ (cast i64 n) 1))
+            reach (- (- max VENEER-MARGIN) size)]
+        (when (> (- (cast i64 (off c)) (cast i64 (.pending-since c))) reach)
+          (emit! c (e/b (+ (cast i64 n) 1)))
+          (push! (mut (.veneers c)) (off c))
+          (for _ (range 0 (cast i64 n)) (emit! c (: 0 u32)))
+          (set! (.unresolved-cond c) (: 0 u32))
+          (set! (.unresolved-test c) (: 0 u32))
+          (set! (.pending-since c) (core/none)))))))
+
+;; The next free veneer slot after `at`, or NONE.
+(defn veneer-slot! [A] [(c (ptr (Compiler A))) (at u32)] (-> u32)
+  (block :found
+    (for i (range 0 (len (.veneers c)))
+      (let [v (get (.veneers c) i)]
+        (when (> v at)
+          (set! (mut (.veneers c)) i (+ v (: 4 u32)))
+          (return-from :found v))))
+    (core/none)))
+
+(defn apply-fixup! [A] [(c (ptr (Compiler A))) (at u32) (target u32) (kind u8)]
+  (-> void)
+  (let [t (.text c)
+        o (cast i64 at)
+        delta (- (cast i64 target) o)
+        inst (buf/read32 t o)]
+    (cond (= kind (: 0 u8))
+            (do
+              (when (or (>= delta 0x8000000) (< delta -0x8000000))
+                (core/fatal "branch out of range"))
+              (buf/patch32! t
+                            o
+                            (| (& inst (: 0xFC000000 u32))
+                               (& (u (/ delta 4)) (: 0x3FFFFFF u32)))))
+          (or (= kind (: 1 u8)) (= kind (: 2 u8)))
+            (let [limit (if (= kind (: 1 u8)) COND-MAX TBZ-MAX)
+                  d
+                    (if (< delta limit)
+                        delta
+                        (let [slot (veneer-slot! c at)]
+                          (when (= slot (core/none))
+                            (core/fatal "conditional branch out of range without a veneer"))
+                          (buf/patch32! t
+                                        (cast i64 slot)
+                                        (e/b (/ (- (cast i64 target)
+                                                   (cast i64 slot))
+                                                4)))
+                          (- (cast i64 slot) o)))]
+              (if (= kind (: 1 u8))
+                  (buf/patch32! t
+                                o
+                                (| (& inst (: 0xFF00001F u32))
+                                   (<< (& (u (/ d 4)) (: 0x7FFFF u32))
+                                       (: 5 u32))))
+                  (buf/patch32! t
+                                o
+                                (| (& inst (: 0xFFF8001F u32))
+                                   (<< (& (u (/ d 4)) (: 0x3FFF u32)) (: 5 u32))))))
+          :else (buf/patch32! t o (u delta)))))
+
+;;; A register for a fixed assignment: callee-saved when the function calls,
+;;; otherwise caller-saved first.
+(defn select-fixed-reg [A] [(c (ptr (Compiler A))) (bank u8) (size u32)] (-> u8)
+  (if (and (= bank (: 1 u8)) (> size (: 8 u32)))
+      (core/no-reg)
+      (let [all (: 0xFFFFFFFFFFFFFFFF u64)
+            mask
+              (& (core/bank-regs bank)
+                 (^ (if (.leaf-tail-calls c) (: 0 u64) (| (bit 0) (bit 1))) all))
+            free (& (.allocatable c) (^ (.used c) all))
+            csr (callee-saved)
+            ; a leaf with tail calls: caller-saved registers no argument uses,
+            ; then argument registers (a terminator moves them aside, see
+            ; core/term-begin!), then callee-saved ones
+            p0
+              (if (.leaf-tail-calls c)
+                  (& free (^ csr all) mask (^ (arg-regs) all))
+                  (: 0 u64))
+            possible
+              (cond (not (.is-leaf c)) (& free csr mask)
+                    (!= p0 (: 0 u64)) p0
+                    :else
+                      (let [p (& free (^ csr all) mask)]
+                        (if (!= p (: 0 u64)) p (& free csr mask))))]
+        (if (= possible (: 0 u64))
+            (core/no-reg)
+            (cast u8 (primitive/ctz possible))))))
+
+; ============================ prologue / epilogue ===========================
+
+(defn start-func! [A] [(c (ptr (Compiler A)))] (-> void)
+  (clear! (mut (.ret-offs c)))
+  (clear! (mut (.tail-stubs c)))
+  (clear! (mut (.veneers c)))
+  (set! (.unresolved-cond c) (: 0 u32))
+  (set! (.unresolved-test c) (: 0 u32))
+  (set! (.pending-since c) (core/none))
+  (set! (.reloc-start c) (len (.relocs (load (.asm c)))))
+  (set! (.call-stack-adjust-off c) (core/none)))
+
+; all callee-saved registers get a save slot: 10 GP + 8 FP
+(const CSR-SAVE-BYTES 144)
+
+; worst case: 9 STP/STR words for saves + sub + stp + mov
+(const PROLOGUE-ALLOC 48)
+
+(defn prologue-begin! [(A IRAdaptor)] [(c (ptr (Compiler A)))] (-> void)
+  (set! (.func-start-off c) (off c))
+  (set! (.frame-size c) (+ (: 16 u32) (: 144 u32)))
+  (set! (.prologue-alloc c) (: 48 u32))
+  (for _ (range 0 12) (emit! c (e/nop)))
+  (set! (.arg-stack-add-off c) (core/none))
+  (when (cur-is-vararg? (.ad c))
+    (core/fatal "variadic function definitions are not supported")))
+
+(defn prologue-end! [(A IRAdaptor)] [(c (ptr (Compiler A)))] (-> void)
+  0)
+
+(defn prologue-assign-arg-part! [A] [(c (ptr (Compiler A)))
+                                     (vp (mut ValuePart))
+                                     (cca (mut CCAssignment))] (-> void)
+  (if (!= (.reg cca) (core/no-reg))
+      (do
+        (core/vp-set-value-reg! c (mut vp) (.reg cca))
+        (set! (.allocatable c) (| (.allocatable c) (bit (cast i64 (.reg cca))))))
+      (let [dst (core/vp-alloc-reg! c (mut vp))]
+        (when (= (.arg-stack-add-off c) (core/none))
+          (set! (.arg-stack-add-off c) (off c))
+          (set! (.arg-stack-add-reg c) (: 17 u8))
+          (emit! c (e/add-imm true (: 17 u32) (: 31 u32) 0)))
+        (if (.byval cca)
+            (add-imm-any! c dst (: 17 u8) (cast i64 (.stack-off cca)))
+            (load-off! c
+                       dst
+                       (: 17 u8)
+                       (cast i64 (.stack-off cca))
+                       (.size cca)
+                       (!= (& (.int-ext cca) (: 0x80 u8)) (: 0 u8)))))))
+
+(defn gen-epilog! [A] [(c (ptr (Compiler A)))] (-> void)
+  (push! (mut (.ret-offs c)) (off c))
+  (emit! c (e/nop)))
+
+(defn csr-list [(saved u64)] (-> u64)
+  saved)
+
+;; Write the register save/restore sequence (stores when `save`) to `out`.
+(defn csr-seq! [A] [(c (ptr (Compiler A)))
+                    (saved u64)
+                    (save bool)
+                    (base u32)
+                    (out (ptr buf/Buf))] (-> void)
+  (let [(mut m) saved
+        (mut last) (core/no-reg)
+        (mut fo) 16]
+    (while (!= m (: 0 u64))
+      (let [r (core/ctz64 m)]
+        (set! m (& m (- m (: 1 u64))))
+        (if (= last (core/no-reg))
+            (set! last r)
+            (if (= (core/bank-of last) (core/bank-of r))
+                (do
+                  (buf/emit32! out
+                               (if (gp? r)
+                                   (if save
+                                       (e/stp-x (r5 last) (r5 r) base fo)
+                                       (e/ldp-x (r5 last) (r5 r) base fo))
+                                   (if save
+                                       (e/stp-d (r5 last) (r5 r) base fo)
+                                       (e/ldp-d (r5 last) (r5 r) base fo))))
+                  (set! fo (+ fo 16))
+                  (set! last (core/no-reg)))
+                (do
+                  (buf/emit32! out
+                               (if save
+                                   (e/str-gp (r5 last) base fo (: 8 u32))
+                                   (e/ldr-gp (r5 last) base fo (: 8 u32) false)))
+                  (set! fo (+ fo 8))
+                  (set! last r))))))
+    (when (!= last (core/no-reg))
+      (buf/emit32! out
+                   (if (gp? last)
+                       (if save
+                           (e/str-gp (r5 last) base fo (: 8 u32))
+                           (e/ldr-gp (r5 last) base fo (: 8 u32) false))
+                       (if save
+                           (e/str-fp (r5 last) base fo (: 8 u32))
+                           (e/ldr-fp (r5 last) base fo (: 8 u32))))))))
+
+(defn emit-epilogue! [A] [(c (ptr (Compiler A)))
+                          (saved u64)
+                          (frame u32)
+                          (needs-frame bool)] (-> void)
+  (when (.has-dynamic-alloca c) (emit! c (e/mov-sp (: 31 u32) (: 29 u32))))
+  (let [(mut epi) (buf/Buf::new)
+        ep (cast (ptr buf/Buf) (mut epi))]
+    (csr-seq! c saved false (: 31 u32) ep)
+    (for i (range 0 (/ (.len epi) 4)) (emit! c (buf/read32 ep (* i 4))))
+    (buf/buf-free! ep))
+  (when needs-frame
+    (if (<= frame (: 0x1f8 u32))
+        (emit! c
+               (e/ldp-x-post (: 29 u32) (: 30 u32) (: 31 u32) (cast i64 frame)))
+        (do
+          (emit! c (e/ldp-x (: 29 u32) (: 30 u32) (: 31 u32) 0))
+          (emit! c (e/add-imm true (: 31 u32) (: 31 u32) (cast i64 frame)))))))
+
+;;; A tail call after the arguments were added: branch to a per-site stub that
+;;; runs the epilogue and jumps to `sym` (NONE: to x16).
+(defn tail-jump! [A] [(c (ptr (Compiler A))) (sym u32)] (-> void)
+  (set! (.generated-call c) true)
+  (let [l (core/label-create! c)]
+    (push! (mut (.tail-stubs c))
+           (| (<< (cast u64 l) (: 32 u64)) (cast u64 sym)))
+    (raw-jump! c (core/jmp) l)))
+
+(defn finish-func! [A] [(c (ptr (Compiler A))) (sym u32)] (-> void)
+  (let [t (.text c)
+        saved (& (.clobbered c) (callee-saved))
+        f0 (align-up (.frame-size c) (: 16 u32))
+        frame (if (> f0 (: 4095 u32)) (align-up f0 (: 4096 u32)) f0)
+        needs-frame
+          (or (.frame-used c)
+              (.generated-call c)
+              (.has-dynamic-alloca c)
+              (!= saved (: 0 u64))
+              (!= (& (.clobbered c) (bit 30)) (: 0 u64)))
+        start (.func-start-off c)
+        (mut pro) (buf/Buf::new)
+        pp (cast (ptr buf/Buf) (mut pro))]
+    (when (>= frame (: 0x1000000 u32)) (core/fatal "stack frame too large"))
+    (when needs-frame
+      (if (<= frame (: 0x1f8 u32))
+          (do
+            (buf/emit32! pp
+                         (e/stp-x-pre (: 29 u32)
+                                      (: 30 u32)
+                                      (: 31 u32)
+                                      (- 0 (cast i64 frame))))
+            (buf/emit32! pp (e/mov-sp (: 29 u32) (: 31 u32))))
+          (do
+            (buf/emit32! pp
+                         (e/sub-imm true (: 31 u32) (: 31 u32) (cast i64 frame)))
+            (buf/emit32! pp (e/stp-x (: 29 u32) (: 30 u32) (: 31 u32) 0))
+            (buf/emit32! pp (e/mov-sp (: 29 u32) (: 31 u32)))))
+      (csr-seq! c saved true (: 31 u32) pp))
+    (let [pro-size (cast u32 (.len pro))]
+      (for i (range 0 (/ (.len pro) 4))
+        (buf/patch32! t (+ (cast i64 start) (* i 4)) (buf/read32 pp (* i 4))))
+      ; incoming stack arguments are above the frame
+      (when (!= (.arg-stack-add-off c) (core/none))
+        (buf/patch32! t
+                      (cast i64 (.arg-stack-add-off c))
+                      (if needs-frame
+                          (e/add-imm true
+                                     (: 17 u32)
+                                     (: 31 u32)
+                                     (cast i64 frame))
+                          (e/mov-sp (: 17 u32) (: 31 u32)))))
+      ; returns branch to the single epilogue at the end
+      (when (> (len (.ret-offs c)) 0)
+        (let [last (get (.ret-offs c) (- (len (.ret-offs c)) 1))]
+          (when (= last (- (off c) (: 4 u32)))
+            (set! (.len t) (- (.len t) 4))
+            (pop! (mut (.ret-offs c)))))
+        (for i (range 0 (len (.ret-offs c)))
+          (let [ro (get (.ret-offs c) i)]
+            (buf/patch32! t
+                          (cast i64 ro)
+                          (e/b (/ (- (cast i64 (off c)) (cast i64 ro)) 4)))))
+        (emit-epilogue! c saved frame needs-frame)
+        (emit! c (e/ret)))
+      ; tail calls: each site branches to its own epilogue + jump
+      (for i (range 0 (len (.tail-stubs c)))
+        (let [ts (get (.tail-stubs c) i)
+              label (cast u32 (>> ts (: 32 u64)))
+              sym (cast u32 (& ts (: 0xFFFFFFFF u64)))]
+          (core/label-place! c label)
+          (emit-epilogue! c saved frame needs-frame)
+          (if (= sym (core/none))
+              (emit! c (e/br (: 16 u32)))
+              (do
+                (asm/reloc! (.asm c)
+                            asm/SEC-TEXT
+                            (cast i64 (off c))
+                            sym
+                            asm/R-BRANCH26
+                            0)
+                (emit! c (e/b 0))))))
+      ; cut the unused prologue space and shift everything after it
+      (let [cut-at (+ start pro-size)
+            cut (- (.prologue-alloc c) pro-size)]
+        (when (> cut (: 0 u32))
+          (buf/cut! t (cast i64 cut-at) (cast i64 cut))
+          (shift-after! c cut-at cut)))
+      (asm/sym-def! (.asm c)
+                    sym
+                    asm/SEC-TEXT
+                    (cast i64 start)
+                    (- (cast i64 (off c)) (cast i64 start)))
+      (buf/buf-free! pp))))
+
+;; Labels, fixups and relocations past `at` move down by `n` bytes.
+(defn shift-after! [A] [(c (ptr (Compiler A))) (at u32) (n u32)] (-> void)
+  (core/debug-shift! c at n)
+  (for i (range 0 (len (.label-offs c)))
+    (let [o (get (.label-offs c) i)]
+      (when (and (!= o (core/none)) (>= o at))
+        (set! (mut (.label-offs c)) i (- o n)))))
+  (for i (range 0 (len (.fixups c)))
+    (let [fx (elem (mut (.fixups c)) i)]
+      (when (>= (.off fx) at) (set! (.off fx) (- (.off fx) n)))))
+  (for i (range 0 (len (.veneers c)))
+    (let [v (get (.veneers c) i)]
+      (when (>= v at) (set! (mut (.veneers c)) i (- v n)))))
+  (let [a (.asm c)]
+    (for i (range (.reloc-start c) (len (.relocs a)))
+      (let [r (elem (mut (.relocs a)) i)]
+        (when (and (= (.sect r) asm/SEC-TEXT) (>= (.off r) (cast i64 at)))
+          (set! (.off r) (- (.off r) (cast i64 n))))))))
+
+; ============================ calls =========================================
+
+;;; Start a call sequence.
+(defn call-begin! [A] [(c (ptr (Compiler A))) (apple bool)] (-> void)
+  (set! (.cc c) (core/cc-new apple))
+  (set! (.call-stack-adjust-off c) (core/none)))
+
+(defn set-stack-used! [A] [(c (ptr (Compiler A)))] (-> void)
+  (when (= (.call-stack-adjust-off c) (core/none))
+    (set! (.call-stack-adjust-off c) (off c))
+    (emit! c (e/nop))))
+
+(defn add-arg-stack! [A] [(c (ptr (Compiler A)))
+                          (vp (mut ValuePart))
+                          (cca (mut CCAssignment))
+                          (ext bool)
+                          (sign bool)
+                          (bits u32)] (-> void)
+  (set-stack-used! c)
+  (let [r (core/vp-cur-reg-or-load! c (mut vp))]
+    (if ext
+        (do
+          (intext! c (: 17 u8) r sign bits (: 64 u32))
+          (store-off! c
+                      (: 31 u8)
+                      (cast i64 (.stack-off cca))
+                      (: 17 u8)
+                      (if (< (.size cca) (: 4 u32)) (: 4 u32) (.size cca))))
+        (store-off! c (: 31 u8) (cast i64 (.stack-off cca)) r (.size cca)))))
+
+(defn add-arg-byval! [A] [(c (ptr (Compiler A)))
+                          (vp (mut ValuePart))
+                          (cca (mut CCAssignment))] (-> void)
+  (let [p (core/vp-load-to-reg! c (mut vp))
+        (mut s) (core/scratch-new)
+        tmp (core/scratch-alloc-gp! c (mut s))
+        size (cast i64 (.size cca))
+        base (cast i64 (.stack-off cca))
+        (mut o) 0]
+    (set-stack-used! c)
+    (while (>= (- size o) 8)
+      (load-off! c tmp p o (: 8 u32) false)
+      (store-off! c (: 31 u8) (+ base o) tmp (: 8 u32))
+      (set! o (+ o 8)))
+    (when (>= (- size o) 4)
+      (load-off! c tmp p o (: 4 u32) false)
+      (store-off! c (: 31 u8) (+ base o) tmp (: 4 u32))
+      (set! o (+ o 4)))
+    (when (>= (- size o) 2)
+      (load-off! c tmp p o (: 2 u32) false)
+      (store-off! c (: 31 u8) (+ base o) tmp (: 2 u32))
+      (set! o (+ o 2)))
+    (when (>= (- size o) 1)
+      (load-off! c tmp p o (: 1 u32) false)
+      (store-off! c (: 31 u8) (+ base o) tmp (: 1 u32)))
+    (core/scratch-reset! c (mut s))))
+
+(defn stack-sub [A] [(c (ptr (Compiler A)))] (-> u32)
+  (let [n (.nsaa (.cc c))]
+    (align-up n (if (< n (: 0x1000 u32)) (: 16 u32) (: 0x1000 u32)))))
+
+;; Before the branch-and-link: patch the stack adjustment, evict the clobbered
+;; registers and FP values wider than the callee-saved low halves.
+(defn call-prepare! [A] [(c (ptr (Compiler A))) (arg-regs u64) (keep u64)]
+  (-> u32)
+  (let [sub
+          (if (= (.call-stack-adjust-off c) (core/none))
+              (: 0 u32)
+              (stack-sub c))]
+    (when (!= (.call-stack-adjust-off c) (core/none))
+      (buf/patch32! (.text c)
+                    (cast i64 (.call-stack-adjust-off c))
+                    (e/sub-imm true (: 31 u32) (: 31 u32) (cast i64 sub))))
+    (core/call-evict-clobbered! c (| arg-regs keep))
+    (let [(mut m) (& (.used c) (core/bank-regs (: 1 u8)) (callee-saved))]
+      (while (!= m (: 0 u64))
+        (let [r (core/ctz64 m)]
+          (set! m (& m (- m (: 1 u64))))
+          (when (and (!= (core/reg-local c r) (core/none))
+                     (> (core/p-size (core/ap c
+                                              (core/reg-local c r)
+                                              (core/reg-part c r)))
+                        (: 8 u32)))
+            (core/evict-reg! c r)))))
+    sub))
+
+(defn call-finish! [A] [(c (ptr (Compiler A))) (sub u32) (arg-regs u64)]
+  (-> void)
+  (when (> sub (: 0 u32))
+    (emit! c (e/add-imm true (: 31 u32) (: 31 u32) (cast i64 sub))))
+  (core/call-done! c arg-regs))
+
+;;; Call a symbol after the arguments were added.
+(defn call-sym! [A] [(c (ptr (Compiler A))) (sym u32) (arg-regs u64)] (-> void)
+  (let [sub (call-prepare! c arg-regs (: 0 u64))]
+    (asm/reloc! (.asm c) asm/SEC-TEXT (cast i64 (off c)) sym asm/R-BRANCH26 0)
+    (emit! c (e/bl 0))
+    (call-finish! c sub arg-regs)))
+
+;;; Call through a function pointer part.
+(defn call-indirect! [A] [(c (ptr (Compiler A)))
+                          (target (mut ValuePart))
+                          (arg-regs u64)] (-> void)
+  (let [salvage (core/vp-can-salvage? c (cast (ptr ValuePart) (mut target)))
+        keep
+          (if salvage
+              (bit (cast i64
+                         (core/vp-cur-reg-unlocked c
+                                                   (cast (ptr ValuePart)
+                                                         (mut target)))))
+              (: 0 u64))
+        sub (call-prepare! c arg-regs keep)]
+    (if salvage
+        (emit! c (e/blr (r5 (core/vp-salvage! c (mut target)))))
+        (do
+          (core/vp-reload-into! c (mut target) (: 16 u8) (: 8 u32))
+          (emit! c (e/blr (: 16 u32)))))
+    (core/vp-reset! c (mut target))
+    (call-finish! c sub arg-regs)))
+
+; ============================ switch ========================================
+
+(defn switch-cmp! [A] [(c (ptr (Compiler A)))
+                       (cmp u8)
+                       (tmp u8)
+                       (v u64)
+                       (is32 bool)] (-> void)
+  (if (e/addsub-imm? (cast i64 v))
+      (emit! c (e/cmp-imm (not is32) (r5 cmp) (cast i64 v)))
+      (do
+        (materialize-gp! c tmp v)
+        (emit! c (e/cmp-reg (not is32) (r5 cmp) (r5 tmp))))))
+
+(defn switch-cmpeq! [A] [(c (ptr (Compiler A)))
+                         (label u32)
+                         (cmp u8)
+                         (tmp u8)
+                         (v u64)
+                         (is32 bool)] (-> void)
+  (switch-cmp! c cmp tmp v is32)
+  (raw-jump! c (core/jump (: 0 u8)) label))
+
+(defn switch-binary-step! [A] [(c (ptr (Compiler A)))
+                               (label u32)
+                               (gt u32)
+                               (cmp u8)
+                               (tmp u8)
+                               (v u64)
+                               (is32 bool)] (-> void)
+  (switch-cmpeq! c label cmp tmp v is32)
+  (raw-jump! c (core/jump (: 8 u8)) gt))
+
+;;; Bounds check, then an indirect branch through an inline table of 32-bit
+;;; entries, each relative to its own address. Returns the table offset.
+(defn switch-jump-table! [A] [(c (ptr (Compiler A)))
+                              (default u32)
+                              (cmp u8)
+                              (tmp u8)
+                              (lo u64)
+                              (hi u64)
+                              (is32 bool)] (-> u32)
+  (when (> lo (: 0 u64))
+    (if (e/addsub-imm? (cast i64 lo))
+        (emit! c (e/sub-imm (not is32) (r5 cmp) (r5 cmp) (cast i64 lo)))
+        (do
+          (materialize-gp! c tmp lo)
+          (emit! c (e/sub-reg (not is32) (r5 cmp) (r5 cmp) (r5 tmp))))))
+  (switch-cmp! c cmp tmp (- hi lo) is32)
+  (raw-jump! c (core/jump (: 8 u8)) default)
+  (emit! c (e/adr (r5 tmp) 20))
+  (emit! c
+         (e/add-ext true
+                    (r5 tmp)
+                    (r5 tmp)
+                    (r5 cmp)
+                    (if is32 (: 2 u32) (: 3 u32))
+                    (: 2 u32)))
+  (emit! c (e/ldr-gp (r5 cmp) (r5 tmp) 0 (: 4 u32) true))
+  (emit! c (e/add-reg true (r5 tmp) (r5 tmp) (r5 cmp)))
+  (emit! c (e/br (r5 tmp)))
+  (let [table (off c)
+        n (cast i64 (+ (- hi lo) (: 1 u64)))]
+    (for _ (range 0 n) (emit! c (: 0 u32)))
+    table))

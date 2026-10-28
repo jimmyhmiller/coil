@@ -65,12 +65,8 @@ def run(compiler: Path, arguments: list[str]) -> int:
         # stage-zero compiler is missing from its bundled manifest, and only the
         # namespace scan can find it (COIL_STRICT_BUNDLE=0 permits that fallback;
         # every module the bundle does name still resolves through the bundle).
+        # src/compiler holds the vendored tpde package (src/compiler/tpde) too.
         roots = [ROOT / "src/compiler", ROOT / "src/stdlib"]
-        # The tpde backend's package (Coil.toml [dependencies] tpde), which the
-        # old stage zero cannot read from the workspace manifest.
-        tpde = (ROOT / "../coil-tpde/src").resolve()
-        if tpde.is_dir():
-            roots.append(tpde)
         environment["COIL_NAMESPACE_ROOTS"] = ":".join(str(r) for r in roots)
         environment["COIL_STRICT_BUNDLE"] = "0"
         # The old stage zero cannot interpret the current workspace manifest.

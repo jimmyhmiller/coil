@@ -159,9 +159,8 @@ def install_library(prefix: Path) -> Path:
     # out of stdlib/ so ordinary programs never discover or link compiler modules.
     sdk_staged = libdir / "compiler.incoming"
     shutil.rmtree(sdk_staged, ignore_errors=True)
+    # The tpde backend's package (tpde.*) is vendored in src/compiler/tpde.
     shutil.copytree(ROOT / "src" / "compiler", sdk_staged)
-    # The tpde backend's package, which the compiler SDK imports (tpde.*).
-    shutil.copytree(ROOT.parent / "coil-tpde" / "src" / "tpde", sdk_staged / "tpde")
     sdk_live = libdir / "compiler"
     sdk_previous = libdir / "compiler.previous"
     shutil.rmtree(sdk_previous, ignore_errors=True)

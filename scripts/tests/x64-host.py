@@ -3,8 +3,7 @@
 
     scripts/tests/x64-host.py [--host HOST]      (default $COIL_X64_HOST or computer.jimmyhmiller.com)
 
-Copies this working tree's tracked files to the host (and ../coil-tpde's, the
-tpde backend's package, beside them), then there: bootstraps the
+Copies this working tree's tracked files to the host, then there: bootstraps the
 LLVM Linux compiler from the committed seed (no install), runs the runtime corpus
 on it, self-hosts through the native x64 backend (fixpoint, the corpus on
 `--backend x64`, the SysV C ABI against gcc, the encoder against llvm-mc), and
@@ -76,14 +75,9 @@ def main() -> int:
               f"({(probe.stdout + probe.stderr).strip()[:300]}); run with --no-x64 to leave it out")
         return 1
     remote = f"coil-comprehensive-x64-{uuid.uuid4().hex[:8]}"
-    tpde = (ROOT / "../coil-tpde").resolve()
-    if not (tpde / ".git").exists():
-        print(f"FAIL no coil-tpde checkout at {tpde} (scripts/native/fetch-tpde.sh)")
+    if not copy_tree(args.host, ROOT, f"{remote}/coil"):
+        print(f"FAIL could not copy {ROOT} to the x64 host")
         return 1
-    for tree, name in ((ROOT, "coil"), (tpde, "coil-tpde")):
-        if not copy_tree(args.host, tree, f"{remote}/{name}"):
-            print(f"FAIL could not copy {tree} to the x64 host")
-            return 1
     try:
         result = ssh(args.host, "bash -c " + shlex.quote(REMOTE_SCRIPT.format(dir=remote)), timeout=1800)
         return 0 if result.returncode == 0 else 1

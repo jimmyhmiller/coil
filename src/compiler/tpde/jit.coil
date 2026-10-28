@@ -1,0 +1,369 @@
+; SPDX-FileCopyrightText: 2026 Jimmy Miller
+; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+;;; Run what tpde compiled, in this process: an Asm loaded into executable
+;;; memory, its symbols resolved and its relocations applied, without an
+;;; object file or a linker. (TPDE has the same in tpde-llvm's JIT mapper.)
+;;;
+;;;   (let [img (jit-load asm x64? resolver ctx)]   ; Ok JitImage / Err message
+;;;     (jit-addr img sym)                          ; a symbol's address
+;;;     (jit-find img asm "name")                   ; or by name
+;;;     (jit-free! img))
+;;;
+;;; Layout, one mapping: the text, then a stub per undefined branch target
+;;; (they live anywhere in the process, out of a branch's reach), then on a
+;;; page boundary the data sections (constants, strings, data, zero-fill) and
+;;; a GOT entry per symbol a GOT relocation names. The text pages become
+;;; read-execute and the instruction cache is invalidated; the data stays
+;;; writable. The Asm is not changed and may be freed afterwards.
+;;;
+;;; Undefined symbols are resolved by the client's resolver (name bytes and
+;;; length, the client's context; 0 for unknown), or by dlsym in the process.
+;;;
+;;; Relocations: arm64 BRANCH26 (bl/b; to a stub when undefined), PAGE21 and
+;;; GOT_PAGE21 (adrp), PAGEOFF12 (add, or a load/store whose immediate is
+;;; scaled by its access size) and GOT_PAGEOFF12 (ldr of the entry), ABS64;
+;;; x86-64 PLT32 (call/jmp; to a stub when undefined), PCREL32 and GOTPCREL32
+;;; (disp32 at the end of the instruction), ABS64 and ABS32.
+(module tpde.jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+(import "tpde.buf" :as buf :use [Buf])
+(import "tpde.asm" :as asm :use [Asm Section Symbol Reloc])
+
+(extern jit.mmap
+        :as
+        "mmap"
+        :cc
+        (cc/C)
+        [(ptr u8) i64 i32 i32 i32 i64]
+        (-> (ptr u8)))
+
+(extern jit.munmap :as "munmap" :cc (cc/C) [(ptr u8) i64] (-> i32))
+
+(extern jit.mprotect :as "mprotect" :cc (cc/C) [(ptr u8) i64 i32] (-> i32))
+
+(extern jit.dlsym :as "dlsym" :cc (cc/C) [(ptr i8) (ptr i8)] (-> (ptr u8)))
+
+;;; A loaded image: the mapping, and each symbol's address (0 if none).
+(defstruct JitImage
+  [(base (ptr u8))
+   (size i64)
+   (addrs (ArrayList i64))])
+
+;;; Resolves an undefined symbol: (context, name bytes, name length) ->
+;;; address, 0 if unknown.
+(defstruct JitResolver
+  [(f (ptr i8))  ; the function, (fnptr (cc/C) [(ptr i8) (ptr u8) i64] (ptr u8))
+   (ctx (ptr i8))
+   (some bool)])
+
+(defn no-resolver [] (-> JitResolver)
+  (JitResolver
+    :f (primitive/cast (ptr i8) 0)
+    :ctx (primitive/cast (ptr i8) 0)
+    :some false))
+
+(defn resolver [(f (fnptr (cc/C) [(ptr i8) (ptr u8) i64] (ptr u8)))
+                (ctx (ptr i8))] (-> JitResolver)
+  (JitResolver
+    :f (primitive/cast (ptr i8) f)
+    :ctx ctx
+    :some true))
+
+(const PAGE 16384)  ; the largest page size of a supported host
+
+(const STUB-A64 16)  ; ldr x16, #8; br x16; .quad target
+
+(const STUB-X64 14)  ; jmp [rip+0]; .quad target
+
+(defn align-up [(v i64) (al i64)] (-> i64)
+  (& (+ v (- al 1)) (- 0 al)))
+
+(defn at [(base (ptr u8)) (off i64)] (-> (ptr u8))
+  (primitive/index base off))
+
+(defn rd32 [(p (ptr u8))] (-> i64)
+  (primitive/cast i64 (load (primitive/cast (ptr u32) p))))
+
+(defn wr32 [(p (ptr u8)) (v i64)] (-> void)
+  (store! (primitive/cast (ptr u32) p) (primitive/cast u32 v)))
+
+(defn wr64 [(p (ptr u8)) (v i64)] (-> void)
+  (store! (primitive/cast (ptr i64) p) v))
+
+(defn fits [(v i64) (bits i64)] (-> bool)
+  (let [lim (<< 1 (- bits 1))] (and (>= v (- 0 lim)) (< v lim))))
+
+;;; An undefined symbol's address: the resolver's, else dlsym's (the name as
+;;; C knows it).
+(defn resolve-undef [(r JitResolver) (name (slice u8))] (-> i64)
+  (let [(mut v) 0]
+    (when (.some r)
+      (set! v
+            (primitive/cast i64
+                            (call-ptr (primitive/cast (fnptr (cc/C)
+                                                             [(ptr i8)
+                                                              (ptr u8)
+                                                              i64]
+                                                             (ptr u8))
+                                                      (.f r))
+                                      (.ctx r)
+                                      (data name)
+                                      (len name)))))
+    (when (and (= v 0) (> (len name) 0))
+      (let [(mut z) (ArrayList::new [u8] (malloc-allocator))]
+        (for i (range 0 (len name)) (push! (mut z) (get name i)))
+        (push! (mut z) (: 0 u8))
+        (set! v
+              (primitive/cast i64
+                              (jit.dlsym (primitive/cast (ptr i8) -2)
+                                         (primitive/cast (ptr i8)
+                                                         (data (slice z))))))
+        ; Linux's RTLD_DEFAULT is 0
+        (when (= v 0)
+          (set! v
+                (primitive/cast i64
+                                (jit.dlsym (primitive/cast (ptr i8) 0)
+                                           (primitive/cast (ptr i8)
+                                                           (data (slice z)))))))
+        (free! (mut z))))
+    v))
+
+(defn jit-err [(msg (slice u8))] (-> (Result JitImage (slice u8)))
+  (Err [JitImage (slice u8)] msg))
+
+;;; Load `a` (code for x86-64 when `x64`, else arm64).
+(defn jit-load [(a (ptr Asm)) (x64 bool) (r JitResolver)]
+  (-> (Result JitImage (slice u8)))
+  (block
+    :load
+      (let [al (malloc-allocator)
+            nsym (primitive/cast i64 (asm/sym-count a))
+            nrel (len (.relocs a))
+            ; which symbols need a stub (an undefined branch target) or a GOT entry
+            (mut stub-of) (ArrayList::new [i64] al)
+            (mut got-of) (ArrayList::new [i64] al)
+            (mut nstub) 0
+            (mut ngot) 0]
+        (extend-zeroed! (mut stub-of) nsym)
+        (extend-zeroed! (mut got-of) nsym)
+        (for i (range 0 nrel)
+          (let [rl (get (.relocs a) i)
+                k (primitive/cast i64 (.kind rl))
+                si (primitive/cast i64 (.sym rl))
+                undef (< (.sect (asm/sym-at a (.sym rl))) 0)]
+            (when (and undef
+                       (or (= k asm/R-BRANCH26) (= k asm/R-PLT32))
+                       (= (get stub-of si) 0))
+              (set! nstub (+ nstub 1))
+              (set! (mut stub-of) si nstub))
+            (when (and (or (= k asm/R-GOT-PAGE21)
+                           (= k asm/R-GOT-PAGEOFF12)
+                           (= k asm/R-GOTPCREL32))
+                       (= (get got-of si) 0))
+              (set! ngot (+ ngot 1))
+              (set! (mut got-of) si ngot))))
+        ; ---- layout: text and stubs, then (a page on) the data sections and the GOT
+        (let [(mut starts) (ArrayList::new [i64] al)
+              text (asm/sect-at a asm/SEC-TEXT)
+              stub-size (if x64 STUB-X64 STUB-A64)
+              stubs-at (align-up (.len (.data text)) 16)
+              text-end (+ stubs-at (* nstub stub-size))
+              (mut off) (align-up text-end PAGE)]
+          (push! (mut starts) 0)
+          (for s (range 1 asm/SEC-COUNT)
+            (let [sec (asm/sect-at a s)]
+              (set! off (align-up off (<< 1 (.align sec))))
+              (push! (mut starts) off)
+              (set! off
+                    (+ off
+                       (if (= s asm/SEC-BSS) (.zsize sec) (.len (.data sec)))))))
+          (let [got-at (align-up off 8)
+                total (align-up (+ got-at (* ngot 8)) PAGE)
+                ; MAP_PRIVATE | MAP_ANON: macOS's, else Linux's
+                base0
+                  (jit.mmap (primitive/cast (ptr u8) 0)
+                            total
+                            (: 3 i32)
+                            (: 0x1002 i32)
+                            (: -1 i32)
+                            0)
+                base
+                  (if (= (primitive/cast i64 base0) -1)
+                      (jit.mmap (primitive/cast (ptr u8) 0)
+                                total
+                                (: 3 i32)
+                                (: 0x22 i32)
+                                (: -1 i32)
+                                0)
+                      base0)
+                b (primitive/cast i64 base)]
+            (when (= b -1)
+              (return-from :load (jit-err "tpde jit: mmap failed")))
+            ; ---- contents (the mapping is zeroed: bss needs nothing)
+            (for s (range 0 asm/SEC-COUNT)
+              (unless (= s asm/SEC-BSS)
+                (let [d (asm/sect-buf a s)]
+                  (for i (range 0 (.len d))
+                    (store! (at base (+ (get starts s) i))
+                            (load (buf/buf-at d i)))))))
+            ; ---- symbol addresses
+            (let [(mut addrs) (ArrayList::new [i64] al)]
+              (for i (range 0 nsym)
+                (let [sy (asm/sym-at a (primitive/cast u32 i))
+                      sc (.sect sy)]
+                  (push! (mut addrs)
+                         (cond (and (>= sc 0) (< sc asm/SEC-COUNT))
+                                 (+ b (+ (get starts sc) (.off sy)))
+                               (= sc -1) (resolve-undef r (.name sy))
+                               :else 0))))
+              ; an undefined symbol nobody provides is an error only if used
+              ; ---- stubs and GOT entries
+              (for si (range 0 nsym)
+                (let [tgt (get addrs si)
+                      sn (get stub-of si)
+                      gn (get got-of si)]
+                  (when (and (> sn 0) (= tgt 0))
+                    (free! (mut addrs))
+                    (jit.munmap base total)
+                    (return-from
+                      :load
+                        (jit-err (cat "tpde jit: undefined symbol "
+                                      (.name (asm/sym-at a
+                                                         (primitive/cast u32 si)))))))
+                  (when (> sn 0)
+                    (let [p (at base (+ stubs-at (* (- sn 1) stub-size)))]
+                      (if x64
+                          (do
+                            (store! p (: 0xFF u8))
+                            (store! (at p 1) (: 0x25 u8))
+                            (wr32 (at p 2) 0)
+                            (wr64 (at p 6) tgt))
+                          (do
+                            (wr32 p 0x58000050)
+                            (wr32 (at p 4) 0xD61F0200)
+                            (wr64 (at p 8) tgt)))))
+                  (when (> gn 0) (wr64 (at base (+ got-at (* (- gn 1) 8))) tgt))))
+              ; ---- relocations
+              (for i (range 0 nrel)
+                (let [rl (get (.relocs a) i)
+                      k (primitive/cast i64 (.kind rl))
+                      si (primitive/cast i64 (.sym rl))
+                      p (at base (+ (get starts (.sect rl)) (.off rl)))
+                      pa (primitive/cast i64 p)
+                      sn (get stub-of si)
+                      gn (get got-of si)
+                      s
+                        (if (> sn 0)
+                            (+ b (+ stubs-at (* (- sn 1) stub-size)))
+                            (get addrs si))
+                      g (+ b (+ got-at (* (- gn 1) 8)))
+                      v (+ s (.addend rl))
+                      ins (rd32 p)]
+                  (when (= (get addrs si) 0)
+                    (free! (mut addrs))
+                    (jit.munmap base total)
+                    (return-from
+                      :load
+                        (jit-err (cat "tpde jit: undefined symbol "
+                                      (.name (asm/sym-at a (.sym rl)))))))
+                  (cond (= k asm/R-BRANCH26)
+                          (let [d (- v pa)]
+                            (unless (fits d 28)
+                              (return-from
+                                :load (jit-err "tpde jit: branch out of range")))
+                            (wr32 p
+                                  (| (& ins 0xFC000000) (& (>> d 2) 0x3FFFFFF))))
+                        (or (= k asm/R-PAGE21) (= k asm/R-GOT-PAGE21))
+                          (let [t (if (= k asm/R-GOT-PAGE21) g v)
+                                d (>> (- (& t (- 0 4096)) (& pa (- 0 4096))) 12)]
+                            (unless (fits d 21)
+                              (return-from
+                                :load (jit-err "tpde jit: adrp out of range")))
+                            (wr32 p
+                                  (| (& ins 0x9F00001F)
+                                     (| (<< (& d 3) 29)
+                                        (<< (& (>> d 2) 0x7FFFF) 5)))))
+                        (or (= k asm/R-PAGEOFF12) (= k asm/R-GOT-PAGEOFF12))
+                          (let [t (if (= k asm/R-GOT-PAGEOFF12) g v)
+                                lo (& t 0xFFF)
+                                ; a load/store (unsigned offset) scales its immediate
+                                ldst (= (& ins 0x3B000000) 0x39000000)
+                                sh
+                                  (cond (not ldst) 0
+                                        (and (!= (& ins 0x04000000) 0)
+                                             (!= (& ins 0x00800000) 0)
+                                             (= (>> ins 30) 0))
+                                          4
+                                        :else (>> ins 30))]
+                            (wr32 p
+                                  (| (& ins 0xFFC003FF)
+                                     (<< (& (>> lo sh) 0xFFF) 10))))
+                        (= k asm/R-ABS64) (wr64 p v)
+                        (= k asm/R-ABS32)
+                          (do
+                            (unless (and (>= v 0) (< v 0x100000000))
+                              (return-from
+                                :load (jit-err "tpde jit: ABS32 out of range")))
+                            (wr32 p v))
+                        (or (= k asm/R-PCREL32) (= k asm/R-PLT32))
+                          (let [d (- v (+ pa 4))]
+                            (unless (fits d 32)
+                              (return-from
+                                :load (jit-err "tpde jit: rel32 out of range")))
+                            (wr32 p d))
+                        (= k asm/R-GOTPCREL32)
+                          (wr32 p (- (+ g (.addend rl)) (+ pa 4)))
+                        :else
+                          (return-from
+                            :load (jit-err "tpde jit: unknown relocation")))))
+              (free! (mut stub-of))
+              (free! (mut got-of))
+              (free! (mut starts))
+              ; ---- text read-execute
+              (let [tsize (align-up text-end PAGE)]
+                (when (> tsize 0)
+                  (unless (= (jit.mprotect base tsize (: 5 i32)) (: 0 i32))
+                    (jit.munmap base total)
+                    (return-from :load (jit-err "tpde jit: mprotect failed")))
+                  (icache-invalidate base text-end)))
+              (Ok [JitImage (slice u8)]
+                  (JitImage
+                    :base base
+                    :size total
+                    :addrs addrs))))))))
+
+;;; arm64 needs the instruction cache told about new code (x86-64 does not).
+(defn icache-invalidate [(p (ptr u8)) (n i64)] (-> void)
+  (let [f (jit.dlsym (primitive/cast (ptr i8) -2) c"sys_icache_invalidate")]
+    (when (!= (primitive/cast i64 f) 0)
+      (call-ptr (primitive/cast (fnptr (cc/C) [(ptr u8) i64] void) f) p n))))
+
+;;; Symbol `sym`'s address in the image (0 if it has none).
+(defn jit-addr [(img (ptr JitImage)) (sym u32)] (-> (ptr u8))
+  (primitive/cast (ptr u8) (get (.addrs img) (primitive/cast i64 sym))))
+
+;;; The address of the symbol named `name` (0 if none).
+(defn jit-find [(img (ptr JitImage)) (a (ptr Asm)) (name (slice u8))]
+  (-> (ptr u8))
+  (let [(mut r) (primitive/cast (ptr u8) 0)]
+    (for i (range 0 (primitive/cast i64 (asm/sym-count a)))
+      (when (and (= (primitive/cast i64 r) 0)
+                 (= (.name (asm/sym-at a (primitive/cast u32 i))) name))
+        (set! r (jit-addr img (primitive/cast u32 i)))))
+    r))
+
+;;; Unmap the image (its code must not be running).
+(defn jit-free! [(img (ptr JitImage))] (-> void)
+  (jit.munmap (.base img) (.size img))
+  (free! (mut (.addrs img))))
+
+(defn cat [(x (slice u8)) (y (slice u8))] (-> (slice u8))
+  (let [(mut b) (Buf::new)
+        bp (cast (ptr Buf) (mut b))]
+    (buf/emit-slice! bp x)
+    (buf/emit-slice! bp y)
+    (buf/as-slice bp)))

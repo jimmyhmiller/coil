@@ -1,0 +1,2868 @@
+; SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+; SPDX-FileCopyrightText: 2026 Jimmy Miller
+; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+; Ported to Coil from TPDE (commit 9779acf) and modified; see NOTICE.
+;;; The architecture-independent compiler: TPDE's CompilerBase, ValuePart,
+;;; RegisterFile, ValueAssignment and ScratchReg, in one module.
+;;;
+;;; One function at a time, in the analyzer's block layout, each instruction is
+;;; compiled once. Every value has an *assignment*: per part a register (maybe),
+;;; a stack slot (maybe) and the remaining reference count from liveness. A
+;;; value's registers and slot are freed after its last use, or at the end of its
+;;; live range when that is a loop (`delay-free`). Registers are not tracked per
+;;; block: before a branch to a block that is not compiled next, live values are
+;;; spilled (`spill-before-branch!`). Single-part values that live across blocks
+;;; may get a *fixed* register for their whole life.
+;;;
+;;; There is no RAII: a `ValuePart`/`ValueRef`/`Scratch` must be reset
+;;; explicitly (`vp-reset!`, `vr-reset!`, `scratch-reset!`); a missed reset leaks
+;;; a register lock, which `check-block-end!` reports.
+;;;
+;;; The architecture is a runtime field; the few hooks the core needs
+;;; (`arch-…`) dispatch on it to `tpde.a64` (or `tpde.x64`).
+(module tpde.core)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [unwrap-or])
+(import "tpde.adaptor" :use [IRAdaptor invalid-ref])
+(import "tpde.analyzer" :as an :use [Analyzer LivenessInfo Loop])
+(import "tpde.codegen" :as cg :use [IRCompiler])
+(import "tpde.asm" :as asm :use [Asm])
+(import "tpde.buf" :as buf :use [Buf])
+(import "tpde.a64" :as a64)
+(import "tpde.x64" :as x64)
+
+(const ARCH-A64 0)
+
+(const ARCH-X64 1)
+
+(const NO-REG 255)
+
+(const NONE 0xFFFFFFFF)
+
+(const GP 0)
+
+(const FPB 1)
+
+(defn none [] (-> u32)
+  (: 0xFFFFFFFF u32))
+
+(defn no-reg [] (-> u8)
+  (: 255 u8))
+
+(defn bit [(r u8)] (-> u64)
+  (<< (: 1 u64) (cast u64 r)))
+
+(defn bank-of [(r u8)] (-> u8)
+  (>> r (: 5 u8)))
+
+(defn bank-regs [(bank u8)] (-> u64)
+  (<< (: 0xFFFFFFFF u64) (cast u64 (* (cast u32 bank) (: 32 u32)))))
+
+(defn i64-of [(x u32)] (-> i64)
+  (cast i64 x))
+
+(defn u32-of [(x i64)] (-> u32)
+  (cast u32 x))
+
+(defn ctz64 [(x u64)] (-> u8)
+  (cast u8 (primitive/ctz x)))
+
+(defn fail [(msg (slice u8))] (-> bool)
+  (eprintln "tpde: {}" msg)
+  false)
+
+(defn fatal [(msg (slice u8))] (-> never)
+  (panic "tpde: {}" msg))
+
+; ============================ assignments ===================================
+; A part is 16 bits: |15|14 13 12|11|10|9|8|7 6 5|4 3 2 1 0|
+;                    |  |  size  |RV|  |M|F| bank |  reg    |
+; RV register valid, M modified (the stack slot is stale), F fixed assignment.
+; !RV+M uninitialized; RV+M dirty register; !RV+!M only on the stack; RV+!M both.
+
+(const VA-LIVE 1)
+
+(const VA-PENDING-FREE 2)
+
+(const VA-VARIABLE-REF 4)
+
+(const VA-STACK-VARIABLE 8)
+
+(const VA-DELAY-FREE 16)
+
+(defstruct VA
+  ; offset from the frame pointer of the spill slot (or stack variable); 0 is none
+  [(frame-off i32)
+   ; for a non-stack variable ref: custom data
+   (var-data u32)
+   (part-count u32)
+   (refs u32)
+   (next-delayed u32)
+   (max-part-size u32)
+   (flags u8)
+   (p0 u16)
+   (p1 u16)
+   ; parts from 2 on live in `ext-parts` from here
+   (pext u32)])
+
+(defn p-reg [(p u16)] (-> u8)
+  (cast u8 (& p (: 0xFF u16))))
+
+(defn p-bank [(p u16)] (-> u8)
+  (cast u8 (& (>> p (: 5 u16)) (: 7 u16))))
+
+(defn p-fixed? [(p u16)] (-> bool)
+  (!= (& p (: 0x100 u16)) (: 0 u16)))
+
+(defn p-modified? [(p u16)] (-> bool)
+  (!= (& p (: 0x200 u16)) (: 0 u16)))
+
+(defn p-reg-valid? [(p u16)] (-> bool)
+  (!= (& p (: 0x800 u16)) (: 0 u16)))
+
+(defn p-stack-valid? [(p u16)] (-> bool)
+  (= (& p (: 0x200 u16)) (: 0 u16)))
+
+(defn p-size [(p u16)] (-> u32)
+  (<< (: 1 u32) (cast u32 (& (>> p (: 12 u16)) (: 7 u16)))))
+
+(defn p-with [(p u16) (mask u16) (on bool)] (-> u16)
+  (if on (| p mask) (& p (^ mask (: 0xFFFF u16)))))
+
+(defn p-set-reg [(p u16) (r u8)] (-> u16)
+  (| (& p (: 0xFF00 u16)) (cast u16 r)))
+
+(defn p-set-bank [(p u16) (b u8)] (-> u16)
+  (| (& p (: 0xFF1F u16)) (<< (cast u16 b) (: 5 u16))))
+
+(defn p-set-size [(p u16) (size u32)] (-> u16)
+  (| (& p (: 0x8FFF u16)) (<< (cast u16 (primitive/ctz size)) (: 12 u16))))
+
+; ============================ value parts ===================================
+
+(const VP-TEMP 0)
+
+(const VP-VALUE 1)
+
+;;; A reference to one part of a value, a constant, a symbol address, or a
+;;; temporary register (TPDE's ValuePart). `reg` is the locked (or owned)
+;;; register, NO-REG when none.
+(defstruct ValuePart
+  [(kind u8)
+   (reg u8)
+   (owned bool)
+   (is-const bool)
+   (is-sym bool)
+   (bank u8)
+   (size u32)
+   (local u32)
+   (part u32)
+   (c0 u64)
+   (c1 u64)])
+
+(defn vp-empty [(bank u8)] (-> ValuePart)
+  (ValuePart
+    :kind (: 0 u8)
+    :reg (no-reg)
+    :owned false
+    :is-const false
+    :is-sym false
+    :bank bank
+    :size (: 8 u32)
+    :local (none)
+    :part (: 0 u32)
+    :c0 (: 0 u64)
+    :c1 (: 0 u64)))
+
+(defn vp-const [(c0 u64) (c1 u64) (size u32) (bank u8)] (-> ValuePart)
+  (ValuePart
+    :kind (: 0 u8)
+    :reg (no-reg)
+    :owned false
+    :is-const true
+    :is-sym false
+    :bank bank
+    :size size
+    :local (none)
+    :part (: 0 u32)
+    :c0 c0
+    :c1 c1))
+
+(defn vp-sym [(sym u32) (addend i64)] (-> ValuePart)
+  (ValuePart
+    :kind (: 0 u8)
+    :reg (no-reg)
+    :owned false
+    :is-const false
+    :is-sym true
+    :bank (: 0 u8)
+    :size (: 8 u32)
+    :local (none)
+    :part (: 0 u32)
+    :c0 (cast u64 sym)
+    :c1 (cast u64 addend)))
+
+(defn vp-value [(local u32) (part u32) (owned bool)] (-> ValuePart)
+  (ValuePart
+    :kind (: 1 u8)
+    :reg (no-reg)
+    :owned owned
+    :is-const false
+    :is-sym false
+    :bank (: 0 u8)
+    :size (: 0 u32)
+    :local local
+    :part part
+    :c0 (: 0 u64)
+    :c1 (: 0 u64)))
+
+;;; A reference to a whole value (TPDE's ValueRef). mode: 0 unowned, 1
+;;; ref-counted, 2 owned (this is the last use), 4 special (constant/symbol).
+(defstruct ValueRef [(mode u8) (local u32) (value u32)])
+
+;;; A temporary register that is neither spillable nor evictable.
+(defstruct Scratch [(reg u8)])
+
+(defn scratch-new [] (-> Scratch)
+  (Scratch :reg (no-reg)))
+
+; ============================ calling conventions ===========================
+
+;;; How one argument (or return) part is passed. Filled in by the assigner:
+;;; `reg` (NO-REG for the stack) and `stack-off`.
+(defstruct CCAssignment
+  [(reg u8)
+   ; this and the next N parts go to consecutive registers, or the stack
+   (consecutive u8)
+   (sret bool)
+   ; copy `size` bytes from the pointer into the stack slot
+   (byval bool)
+   ; extend: bit 7 signed, low bits the source width
+   (int-ext u8)
+   (align u32)
+   (bank u8)
+   (size u32)
+   ; the C size of an integer argument held in a wider part (0: the part's):
+   ; Apple packs stack arguments at their natural size
+   (abi-size u32)
+   ; System V: the group's other part is in the other bank (see AF-MIXED)
+   (mixed bool)
+   (stack-off u32)])
+
+;;; Argument flags bits 24..26: log2 of the argument's C size plus one (0: the
+;;; part's own size). See `tpde.cir`'s AF-SIZE.
+(defn arg-flags-size [(flags u32)] (-> u32)
+  (let [code (& (>> flags (: 24 u32)) (: 7 u32))]
+    (if (= code (: 0 u32)) (: 0 u32) (<< (: 1 u32) (- code (: 1 u32))))))
+
+(defn cca-new [] (-> CCAssignment)
+  (CCAssignment
+    :reg (no-reg)
+    :consecutive (: 0 u8)
+    :sret false
+    :byval false
+    :int-ext (: 0 u8)
+    :align (: 1 u32)
+    :bank (: 255 u8)
+    :size (: 0 u32)
+    :abi-size (: 0 u32)
+    :mixed false
+    :stack-off (: 0 u32)))
+
+;;; AAPCS64 argument assignment, with Apple's variant (`apple`): stack arguments
+;;; packed at their natural alignment, variadic arguments always on the stack in
+;;; 8-byte slots.
+(defstruct CCState
+  [(ngrn u32)
+   (nsrn u32)
+   (nsaa u32)
+   (ret-ngrn u32)
+   (ret-nsrn u32)
+   (apple bool)
+   ; set by the instruction selector while it adds the variadic arguments
+   (in-variadic bool)
+   ; x86-64: arguments that must follow onto the stack (a split group), and
+   ; whether any argument was variadic (the callee gets al = XMM arguments)
+   (must-stack u32)
+   (vararg bool)])
+
+(defn cc-new [(apple bool)] (-> CCState)
+  (CCState
+    :ngrn (: 0 u32)
+    :nsrn (: 0 u32)
+    :nsaa (: 0 u32)
+    :ret-ngrn (: 0 u32)
+    :ret-nsrn (: 0 u32)
+    :apple apple
+    :in-variadic false
+    :must-stack (: 0 u32)
+    :vararg false))
+
+; ============================ the compiler ==================================
+
+(defstruct Fixup [(label u32) (off u32) (kind u8)])
+
+(defstruct DynSlot [(size u32) (slot i32)])
+
+(defstruct Compiler [A]
+  [(ad (ptr A))
+   (an (Analyzer A))
+   (arch u8)
+   (asm (ptr Asm))
+   (text (ptr Buf))
+   ; ---- per function
+   (cur-func u32)
+   (cur-block-idx u32)
+   (vas (ArrayList VA))
+   (ext-parts (ArrayList u16))
+   (fixed-count-gp u32)
+   (fixed-count-fp u32)
+   (variable-ref-list u32)
+   (delayed-free (ArrayList u32))
+   ; ---- register file
+   (allocatable u64)
+   (used u64)
+   (clobbered u64)
+   (locks (array u8 64))
+   (reg-local (array u32 64))
+   (reg-part (array u32 64))
+   ; ---- stack frame
+   (frame-size u32)
+   (free-lists (array (ArrayList i32) 5))
+   (dyn-free (ArrayList DynSlot))
+   (has-dynamic-alloca bool)
+   (is-leaf bool)
+   ; a leaf with tail calls: fixed registers avoid the argument registers
+   (leaf-tail-calls bool)
+   (generated-call bool)
+   (frame-used bool)
+   ; the function being compiled, and the label after its prologue: a self
+   ; tail call with its arguments in registers jumps there (a loop)
+   (cur-sym u32)
+   (body-label u32)
+   (generating-branch bool)
+   ; ---- labels
+   (block-labels (ArrayList u32))
+   (label-offs (ArrayList u32))
+   (fixups (ArrayList Fixup))
+   ; ---- module
+   (func-syms (ArrayList u32))
+   ; ---- arm64 state
+   (func-start-off u32)
+   (prologue-alloc u32)
+   (arg-stack-add-off u32)
+   (arg-stack-add-reg u8)
+   (ret-offs (ArrayList u32))
+   (reg-save-frame-off u32)
+   (scalar-arg-count u32)
+   (vec-arg-count u32)
+   (cc CCState)
+   (call-stack-adjust-off u32)
+   (reloc-start i64)
+   ; veneer islands for out-of-range conditional branches (arm64)
+   (veneers (ArrayList u32))
+   (unresolved-cond u32)
+   (unresolved-test u32)
+   (pending-since u32)
+   ; tail calls: label << 32 | symbol (NONE: through x16), stubs emitted at the end
+   (tail-stubs (ArrayList u64))
+   (no-fixed bool)
+   ; while moving values into a block's PHIs: that block (else NONE)
+   (phi-block-idx u32)
+   ; a leaf with tail calls: the register the argument being assigned arrives
+   ; in, offered as its fixed register (else NO-REG)
+   (fixed-hint u8)
+   ; between term-begin! and term-end!: the fixed registers as the terminator
+   ; found them (see term-begin!)
+   (terminating bool)
+   (term-snap (ArrayList u64))
+   ; ---- debug info, when `debug`: (code offset, inst-loc) pairs where the
+   ; source position changes, (instruction, code offset) pairs of the
+   ; instructions inst-marked? names (debug-mark!), and each static alloca's
+   ; frame offset (as load-stack-var-addr! takes it), all for the function
+   ; just compiled
+   (debug bool)
+   (dbg-rows (ArrayList u64))
+   (dbg-marks (ArrayList u64))
+   (dbg-allocas (ArrayList i64))
+   (dbg-last-loc u64)
+   ; values whose locations the client wants (set before compiling), the
+   ; last location seen of each, and (index, code offset, location) triples
+   ; where one changed, sampled at every row: where a debugger stops, the
+   ; location is exact (debug-value-loc's encoding; 0 for none)
+   (dbg-track (ArrayList u32))
+   (dbg-track-last (ArrayList u64))
+   (dbg-locs (ArrayList u64))])
+
+(impl [A] (Compiler A)
+  (new [(ad (ptr A)) (a (ptr Asm)) (arch u8)] (-> (Compiler A))
+    (let [al (malloc-allocator)
+          (mut c) (zeroed (Compiler A))]
+      (set! (.ad c) ad)
+      (set! (.an c) (Analyzer::new [A] ad))
+      (set! (.arch c) arch)
+      (set! (.asm c) a)
+      (set! (.text c) (asm/sect-buf a asm/SEC-TEXT))
+      (set! (.vas c) (ArrayList::new [VA] al))
+      (set! (.ext-parts c) (ArrayList::new [u16] al))
+      (set! (.delayed-free c) (ArrayList::new [u32] al))
+      (for i (range 0 5)
+        (set! (mut (.free-lists c)) i (ArrayList::new [i32] al)))
+      (set! (.dyn-free c) (ArrayList::new [DynSlot] al))
+      (set! (.block-labels c) (ArrayList::new [u32] al))
+      (set! (.label-offs c) (ArrayList::new [u32] al))
+      (set! (.fixups c) (ArrayList::new [Fixup] al))
+      (set! (.func-syms c) (ArrayList::new [u32] al))
+      (set! (.ret-offs c) (ArrayList::new [u32] al))
+      (set! (.veneers c) (ArrayList::new [u32] al))
+      (set! (.tail-stubs c) (ArrayList::new [u64] al))
+      (set! (.term-snap c) (ArrayList::new [u64] al))
+      (set! (.dbg-rows c) (ArrayList::new [u64] al))
+      (set! (.dbg-marks c) (ArrayList::new [u64] al))
+      (set! (.dbg-allocas c) (ArrayList::new [i64] al))
+      (set! (.dbg-track c) (ArrayList::new [u32] al))
+      (set! (.dbg-track-last c) (ArrayList::new [u64] al))
+      (set! (.dbg-locs c) (ArrayList::new [u64] al))
+      (set! (.cc c) (cc-new true))
+      (set! (.variable-ref-list c) (none))
+      (set! (.phi-block-idx c) (none))
+      c)))
+
+;;; Release everything the compiler (and its analyzer) allocated; it is not
+;;; used again. (The adaptor and the assembler are the client's.)
+(defn compiler-free! [A] [(c (ptr (Compiler A)))] (-> void)
+  (an/analyzer-free! (mut (.an c)))
+  (free! (mut (.vas c)))
+  (free! (mut (.ext-parts c)))
+  (free! (mut (.delayed-free c)))
+  (for i (range 0 5) (free! (free-list c i)))
+  (free! (mut (.dyn-free c)))
+  (free! (mut (.block-labels c)))
+  (free! (mut (.label-offs c)))
+  (free! (mut (.fixups c)))
+  (free! (mut (.func-syms c)))
+  (free! (mut (.ret-offs c)))
+  (free! (mut (.veneers c)))
+  (free! (mut (.tail-stubs c)))
+  (free! (mut (.term-snap c)))
+  (free! (mut (.dbg-rows c)))
+  (free! (mut (.dbg-marks c)))
+  (free! (mut (.dbg-allocas c)))
+  (free! (mut (.dbg-track c)))
+  (free! (mut (.dbg-track-last c)))
+  (free! (mut (.dbg-locs c))))
+
+;;; Point the compiler (and its analyzer) at another IR instance: a client
+;;; that keeps several functions in flight switches between them.
+(defn set-adaptor! [A] [(c (ptr (Compiler A))) (ad (ptr A))] (-> void)
+  (set! (.ad c) ad)
+  (set! (.ad (.an c)) ad))
+
+(defn text-off [A] [(c (ptr (Compiler A)))] (-> u32)
+  (u32-of (.len (load (.text c)))))
+
+(defn emit! [A] [(c (ptr (Compiler A))) (inst u32)] (-> void)
+  (buf/emit32! (.text c) inst))
+
+; ---- register file ----
+
+(defn reg-used? [A] [(c (ptr (Compiler A))) (r u8)] (-> bool)
+  (!= (& (.used c) (bit r)) (: 0 u64)))
+
+(defn reg-fixed? [A] [(c (ptr (Compiler A))) (r u8)] (-> bool)
+  (> (get (.locks c) (cast i64 r)) (: 0 u8)))
+
+(defn reg-local [A] [(c (ptr (Compiler A))) (r u8)] (-> u32)
+  (get (.reg-local c) (cast i64 r)))
+
+(defn reg-part [A] [(c (ptr (Compiler A))) (r u8)] (-> u32)
+  (get (.reg-part c) (cast i64 r)))
+
+(defn mark-clobbered! [A] [(c (ptr (Compiler A))) (r u8)] (-> void)
+  (set! (.clobbered c) (| (.clobbered c) (bit r))))
+
+(defn mark-used! [A] [(c (ptr (Compiler A))) (r u8) (local u32) (part u32)]
+  (-> void)
+  (set! (.used c) (| (.used c) (bit r)))
+  (set! (mut (.reg-local c)) (cast i64 r) local)
+  (set! (mut (.reg-part c)) (cast i64 r) part))
+
+(defn update-reg-assignment! [A] [(c (ptr (Compiler A)))
+                                  (r u8)
+                                  (local u32)
+                                  (part u32)] (-> void)
+  (set! (mut (.reg-local c)) (cast i64 r) local)
+  (set! (mut (.reg-part c)) (cast i64 r) part))
+
+(defn unmark-used! [A] [(c (ptr (Compiler A))) (r u8)] (-> void)
+  (set! (.used c) (& (.used c) (^ (bit r) (: 0xFFFFFFFFFFFFFFFF u64)))))
+
+(defn set-lock! [A] [(c (ptr (Compiler A))) (r u8) (n u8)] (-> void)
+  (set! (mut (.locks c)) (cast i64 r) n))
+
+(defn mark-fixed! [A] [(c (ptr (Compiler A))) (r u8)] (-> void)
+  (set-lock! c r (: 1 u8)))
+
+(defn unmark-fixed! [A] [(c (ptr (Compiler A))) (r u8)] (-> void)
+  (set-lock! c r (: 0 u8)))
+
+(defn inc-lock! [A] [(c (ptr (Compiler A))) (r u8)] (-> void)
+  (set-lock! c r (+ (get (.locks c) (cast i64 r)) (: 1 u8))))
+
+(defn dec-lock! [A] [(c (ptr (Compiler A))) (r u8)] (-> bool)
+  (let [n (- (get (.locks c) (cast i64 r)) (: 1 u8))]
+    (set-lock! c r n)
+    (= n (: 0 u8))))
+
+(defn find-first-free [A] [(c (ptr (Compiler A))) (bank u8) (exclude u64)]
+  (-> u8)
+  (let [free
+          (& (.allocatable c)
+             (^ (.used c) (: 0xFFFFFFFFFFFFFFFF u64))
+             (bank-regs bank))
+        sel (& free (^ exclude (: 0xFFFFFFFFFFFFFFFF u64)))]
+    (if (= sel (: 0 u64)) (no-reg) (ctz64 sel))))
+
+(defn find-first-nonfixed [A] [(c (ptr (Compiler A))) (bank u8) (exclude u64)]
+  (-> u8)
+  (let [(mut m) (& (.used c) (bank-regs bank))]
+    (block :found
+      (while (!= m (: 0 u64))
+        (let [r (ctz64 m)]
+          (set! m (& m (- m (: 1 u64))))
+          (when (and (not (reg-fixed? c r)) (= (& exclude (bit r)) (: 0 u64)))
+            (return-from :found r))))
+      (no-reg))))
+
+; ---- assignment access ----
+
+(defn va-at [A] [(c (ptr (Compiler A))) (local u32)] (-> (ptr VA))
+  (elem (mut (.vas c)) (i64-of local)))
+
+(defn va-live? [(v (ptr VA))] (-> bool)
+  (!= (& (.flags v) (: 1 u8)) (: 0 u8)))
+
+(defn va-flag? [(v (ptr VA)) (f u8)] (-> bool)
+  (!= (& (.flags v) f) (: 0 u8)))
+
+(defn va-set-flag! [(v (ptr VA)) (f u8) (on bool)] (-> void)
+  (set! (.flags v) (if on (| (.flags v) f) (& (.flags v) (^ f (: 0xFF u8))))))
+
+(defn va-var-ref? [(v (ptr VA))] (-> bool)
+  (va-flag? v (: 4 u8)))
+
+(defn part-get [A] [(c (ptr (Compiler A))) (v (ptr VA)) (part u32)] (-> u16)
+  (cond (= part (: 0 u32)) (.p0 v)
+        (= part (: 1 u32)) (.p1 v)
+        :else (get (.ext-parts c) (i64-of (+ (.pext v) (- part (: 2 u32)))))))
+
+(defn part-set! [A] [(c (ptr (Compiler A))) (v (ptr VA)) (part u32) (x u16)]
+  (-> void)
+  (cond (= part (: 0 u32)) (set! (.p0 v) x)
+        (= part (: 1 u32)) (set! (.p1 v) x)
+        :else
+          (set! (mut (.ext-parts c))
+                (i64-of (+ (.pext v) (- part (: 2 u32))))
+                x)))
+
+(defn ap [A] [(c (ptr (Compiler A))) (local u32) (part u32)] (-> u16)
+  (part-get c (va-at c local) part))
+
+(defn ap-set! [A] [(c (ptr (Compiler A))) (local u32) (part u32) (x u16)]
+  (-> void)
+  (part-set! c (va-at c local) part x))
+
+(defn ap-update! [A] [(c (ptr (Compiler A)))
+                      (local u32)
+                      (part u32)
+                      (mask u16)
+                      (on bool)] (-> void)
+  (ap-set! c local part (p-with (ap c local part) mask on)))
+
+(defn ap-set-reg! [A] [(c (ptr (Compiler A))) (local u32) (part u32) (r u8)]
+  (-> void)
+  (ap-set! c local part (p-set-reg (ap c local part) r)))
+
+(defn ap-set-reg-valid! [A] [(c (ptr (Compiler A)))
+                             (local u32)
+                             (part u32)
+                             (on bool)] (-> void)
+  (ap-update! c local part (: 0x800 u16) on))
+
+(defn ap-set-modified! [A] [(c (ptr (Compiler A)))
+                            (local u32)
+                            (part u32)
+                            (on bool)] (-> void)
+  (ap-update! c local part (: 0x200 u16) on))
+
+(defn ap-set-fixed! [A] [(c (ptr (Compiler A)))
+                         (local u32)
+                         (part u32)
+                         (on bool)] (-> void)
+  (ap-update! c local part (: 0x100 u16) on))
+
+(defn ap-part-off [A] [(c (ptr (Compiler A))) (local u32) (part u32)] (-> i32)
+  (cast i32 (* (.max-part-size (va-at c local)) part)))
+
+(defn ap-frame-off [A] [(c (ptr (Compiler A))) (local u32) (part u32)] (-> i32)
+  (+ (.frame-off (va-at c local)) (ap-part-off c local part)))
+
+(defn fixed-count [A] [(c (ptr (Compiler A))) (bank u8)] (-> u32)
+  (if (= bank (: 0 u8)) (.fixed-count-gp c) (.fixed-count-fp c)))
+
+(defn fixed-count-add! [A] [(c (ptr (Compiler A))) (bank u8) (d i64)] (-> void)
+  (if (= bank (: 0 u8))
+      (set! (.fixed-count-gp c) (u32-of (+ (i64-of (.fixed-count-gp c)) d)))
+      (set! (.fixed-count-fp c) (u32-of (+ (i64-of (.fixed-count-fp c)) d)))))
+
+(defn liveness [A] [(c (ptr (Compiler A))) (local u32)] (-> (ptr LivenessInfo))
+  (an/liveness-info (cast (ptr (Analyzer A)) (mut (.an c))) local))
+
+(defn val-local [(A IRAdaptor)] [(c (ptr (Compiler A))) (v u32)] (-> u32)
+  (val-local-idx (.ad c) v))
+
+; ---- stack slots ----
+
+(defn free-list [A] [(c (ptr (Compiler A))) (i i64)] (-> (ptr (ArrayList i32)))
+  (index (cast (ptr (ArrayList i32)) (mut (.free-lists c))) i))
+
+(defn free-list-idx [(size u32)] (-> i64)
+  (if (= size (: 1 u32)) 0 (- 32 (cast i64 (primitive/clz (- size (: 1 u32)))))))
+
+(defn frame-negative? [A] [(c (ptr (Compiler A)))] (-> bool)
+  (= (.arch c) (: 1 u8)))
+
+(defn x64? [A] [(c (ptr (Compiler A)))] (-> bool)
+  (= (.arch c) (: 1 u8)))
+
+;;; A static stack slot of `size` bytes (16-byte aligned beyond 16), as an
+;;; offset from the frame pointer. 0 is never a slot.
+(defn allocate-stack-slot! [A] [(c (ptr (Compiler A))) (size0 u32)] (-> i32)
+  (set! (.frame-used c) true)
+  (block :slot
+    (when (= size0 (: 0 u32)) (return-from :slot (: 0 i32)))
+    (let [(mut size) size0
+          (mut align-bits) 4]
+      (if (<= size (: 16 u32))
+          (let [fli (free-list-idx size)
+                fl (free-list c fli)]
+            (set! size (<< (: 1 u32) (u32-of fli)))
+            (set! align-bits fli)
+            (when (> (len (load fl)) 0)
+              (return-from :slot (unwrap-or (pop! fl) (: 0 i32)))))
+          (do
+            (set! size (& (+ size (: 15 u32)) (: 0xFFFFFFF0 u32)))
+            (for i (range 0 (len (.dyn-free c)))
+              (let [d (get (.dyn-free c) i)]
+                (when (= (.size d) size)
+                  (let [last (- (len (.dyn-free c)) 1)]
+                    (set! (mut (.dyn-free c)) i (get (.dyn-free c) last))
+                    (pop! (mut (.dyn-free c))))
+                  (return-from :slot (.slot d)))))))
+      ; align the frame, keeping the padding as free slots
+      (loop (let [tz
+                    (if (= (.frame-size c) (: 0 u32))
+                        32
+                        (cast i64 (primitive/ctz (.frame-size c))))]
+              (when (>= tz align-bits) (break))
+              (let [chunk (<< (: 1 u32) (u32-of tz))
+                    s
+                      (if (frame-negative? c)
+                          (- (: 0 i32) (cast i32 (+ (.frame-size c) chunk)))
+                          (cast i32 (.frame-size c)))]
+                (push! (free-list c tz) s)
+                (set! (.frame-size c) (+ (.frame-size c) chunk)))))
+      (let [slot (.frame-size c)]
+        (set! (.frame-size c) (+ (.frame-size c) size))
+        (if (frame-negative? c)
+            (- (: 0 i32) (cast i32 (+ slot size)))
+            (cast i32 slot))))))
+
+(defn free-stack-slot! [A] [(c (ptr (Compiler A))) (slot i32) (size u32)]
+  (-> void)
+  (cond (= size (: 0 u32)) 0
+        (<= size (: 16 u32))
+          (do (push! (free-list c (free-list-idx size)) slot) 0)
+        :else
+          (do
+            (push! (mut (.dyn-free c))
+                   (DynSlot
+                     :size (& (+ size (: 15 u32)) (: 0xFFFFFFF0 u32))
+                     :slot slot))
+            0)))
+
+; ---- assignments: create and free ----
+
+(defn alloc-ext-parts! [A] [(c (ptr (Compiler A))) (n u32)] (-> u32)
+  (let [at (u32-of (len (.ext-parts c)))]
+    (extend-zeroed! (mut (.ext-parts c)) (i64-of n))
+    at))
+
+(defn init-assignment! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                   (value u32)
+                                                   (local u32)] (-> void)
+  (let [ad (.ad c)
+        count (val-part-count ad value)
+        v (va-at c local)]
+    (set! (.frame-off v) (: 0 i32))
+    (set! (.var-data v) (: 0 u32))
+    (set! (.part-count v) count)
+    (set! (.pext v)
+          (if (> count (: 2 u32))
+              (alloc-ext-parts! c (- count (: 2 u32)))
+              (: 0 u32)))
+    (set! (.flags v) (: 1 u8))
+    (let [(mut maxsize) (: 0 u32)]
+      (for pi (range 0 (i64-of count))
+        (let [part (u32-of pi)
+              size (val-part-size ad value part)
+              bank (val-part-bank ad value part)
+              p (p-set-size (p-set-bank (: 0x200 u16) bank) size)]
+          (part-set! c v part p)
+          (when (> size maxsize) (set! maxsize size))))
+      (set! (.max-part-size v) maxsize))
+    (let [lv (load (liveness c local))
+          ; A PHI is first assigned in a predecessor, where TPDE judges it by
+          ; the predecessor's loop: a loop header's PHI then competes with
+          ; every definition in the loop and rarely gets a register, so the
+          ; loop's variable went through its stack slot on every iteration.
+          ; Judge a PHI by its own block's loop instead (liveness is still
+          ; measured from here: a merge block's PHI dies in that block).
+          at
+            (if (and (!= (.phi-block-idx c) (none)) (val-phi? ad value))
+                (.phi-block-idx c)
+                (.cur-block-idx c))]
+      ; a single-part value live beyond this block may get a fixed register
+      (when (= count (: 1 u32))
+        (let [bank (p-bank (.p0 v))
+              cur-loop
+                (an/loop-at (cast (ptr (Analyzer A)) (mut (.an c)))
+                            (an/block-loop-idx (cast (ptr (Analyzer A))
+                                                     (mut (.an c)))
+                                               at))
+              limit (fixed-limit c bank)
+              (mut try)
+                (and (> (.last lv) (.cur-block-idx c))
+                     (< (+ (.definitions-in-childs cur-loop)
+                           (fixed-count c bank))
+                        limit))]
+          (when (force-fixed? ad value)
+            (set! try (< (fixed-count c bank) limit)))
+          (when (or (not (allow-fixed? ad value))
+                    (and (.no-fixed c) (not (force-fixed? ad value))))
+            (set! try false))
+          (when try
+            (let [h (.fixed-hint c)
+                  r
+                    (if (and (!= h (no-reg))
+                             (not (reg-used? c h))
+                             (!= (& (bank-regs bank) (bit h)) (: 0 u64))
+                             (arch-fixed-ok? c h))
+                        h
+                        (arch-select-fixed-reg c
+                                               (p-bank (.p0 v))
+                                               (p-size (.p0 v))))]
+              (when (and (!= r (no-reg)) (not (reg-used? c r)))
+                (set! (.p0 v)
+                      (p-with (p-with (p-set-reg (.p0 v) r) (: 0x800 u16) true)
+                              (: 0x100 u16)
+                              true))
+                (mark-used! c r local (: 0 u32))
+                (inc-lock! c r)
+                (mark-clobbered! c r)
+                (fixed-count-add! c bank 1))))))
+      (set! (.refs v) (.ref-count lv))
+      (va-set-flag! v (: 16 u8) (.last-full lv)))))
+
+(defn free-assignment! [A] [(c (ptr (Compiler A))) (local u32)] (-> void)
+  (let [v (va-at c local)
+        count (.part-count v)]
+    (for pi (range 0 (i64-of count))
+      (let [part (u32-of pi)
+            p (part-get c v part)]
+        (cond (p-fixed? p)
+                (let [r (p-reg p)]
+                  (fixed-count-add! c (p-bank p) -1)
+                  (unmark-fixed! c r)
+                  (unmark-used! c r))
+              (p-reg-valid? p) (unmark-used! c (p-reg p))
+              :else 0)))
+    (when (and (not (va-var-ref? v)) (!= (.frame-off v) (: 0 i32)))
+      (free-stack-slot! c (.frame-off v) (* (.part-count v) (.max-part-size v))))
+    (set! (.flags v) (: 0 u8))))
+
+;;; The reference count reached zero: free now, or at the end of the live range.
+(defn release-assignment! [A] [(c (ptr (Compiler A))) (local u32)] (-> void)
+  (let [v (va-at c local)]
+    (if (not (va-flag? v (: 16 u8)))
+        (free-assignment! c local)
+        (let [last (.last (load (liveness c local)))]
+          (set! (.next-delayed v) (get (.delayed-free c) (i64-of last)))
+          (va-set-flag! v (: 2 u8) true)
+          (set! (mut (.delayed-free c)) (i64-of last) local)))))
+
+(defn init-variable-ref! [A] [(c (ptr (Compiler A))) (local u32) (data u32)]
+  (-> void)
+  (let [v (va-at c local)]
+    (set! (.frame-off v) (: 0 i32))
+    (set! (.var-data v) data)
+    (set! (.part-count v) (: 1 u32))
+    (set! (.max-part-size v) (: 8 u32))
+    (set! (.flags v) (: 5 u8))
+    (set! (.refs v) (: 0 u32))
+    (set! (.next-delayed v) (.variable-ref-list c))
+    (set! (.p0 v) (p-set-size (p-set-bank (: 0x200 u16) (: 0 u8)) (: 8 u32)))
+    (set! (.variable-ref-list c) local)))
+
+;;; Make `local` a stack variable at frame offset `off`.
+(defn init-stack-variable! [A] [(c (ptr (Compiler A))) (local u32) (off i32)]
+  (-> void)
+  (init-variable-ref! c local (: 0 u32))
+  (let [v (va-at c local)]
+    (va-set-flag! v (: 8 u8) true)
+    (set! (.frame-off v) off)))
+
+; ---- spilling and eviction ----
+
+(defn reload-to-reg! [A] [(c (ptr (Compiler A)))
+                          (dst u8)
+                          (local u32)
+                          (part u32)] (-> void)
+  (let [v (va-at c local)]
+    (cond (not (va-var-ref? v))
+            (arch-load-from-stack! c
+                                   dst
+                                   (ap-frame-off c local part)
+                                   (p-size (part-get c v part))
+                                   false)
+          (va-flag? v (: 8 u8)) (arch-load-stack-var-addr! c dst (.frame-off v))
+          :else (fatal "variable reference without stack slot"))))
+
+(defn allocate-spill-slot! [A] [(c (ptr (Compiler A))) (local u32)] (-> void)
+  (let [v (va-at c local)]
+    (when (= (.frame-off v) (: 0 i32))
+      (set! (.frame-off v)
+            (allocate-stack-slot! c (* (.part-count v) (.max-part-size v)))))))
+
+(defn spill! [A] [(c (ptr (Compiler A))) (local u32) (part u32)] (-> void)
+  (let [v (va-at c local)
+        p (part-get c v part)]
+    (when (and (not (p-stack-valid? p)) (not (va-var-ref? v)))
+      (allocate-spill-slot! c local)
+      (arch-spill-reg! c (p-reg p) (ap-frame-off c local part) (p-size p))
+      (ap-set-modified! c local part false))))
+
+(defn evict-part! [A] [(c (ptr (Compiler A))) (local u32) (part u32)] (-> void)
+  (let [r (p-reg (ap c local part))]
+    (spill! c local part)
+    (ap-set-reg-valid! c local part false)
+    (unmark-used! c r)))
+
+(defn evict-reg! [A] [(c (ptr (Compiler A))) (r u8)] (-> void)
+  (when (= (reg-local c r) (none)) (fatal "evicting a temporary register"))
+  (evict-part! c (reg-local c r) (reg-part c r)))
+
+;;; Free `r` for an argument: move the value in it to a free register no
+;;; argument uses, or, when there is none (or the value is fixed or locked to
+;;; `r`), spill it. TPDE always spills; at a tail call, or for an argument the
+;;; next one displaces, that was a store and a reload where a move does.
+(defn evict-reg-for-arg! [A] [(c (ptr (Compiler A))) (r u8)] (-> void)
+  (let [local (reg-local c r)
+        part (reg-part c r)]
+    (cond (and (.terminating c) (!= local (none)) (p-fixed? (ap c local part)))
+            ; a terminator's: move the fixed value aside (term-end! puts it back)
+            (let [p (ap c local part)
+                  all (: 0xFFFFFFFFFFFFFFFF u64)
+                  free
+                    (& (.allocatable c)
+                       (^ (.used c) all)
+                       (bank-regs (p-bank p)))
+                  pref (& free (^ (arch-arg-regs c) all))
+                  nr
+                    (if (!= pref (: 0 u64))
+                        (ctz64 pref)
+                        (if (!= free (: 0 u64)) (ctz64 free) (no-reg)))]
+              (if (= nr (no-reg))
+                  (evict-reg! c r)
+                  (do
+                    (arch-mov! c nr r (p-size p))
+                    (unmark-used! c r)
+                    (unmark-fixed! c r)
+                    (mark-used! c nr local part)
+                    (mark-fixed! c nr)
+                    (mark-clobbered! c nr)
+                    (ap-set-reg! c local part nr))))
+          (or (= local (none)) (reg-fixed? c r) (p-fixed? (ap c local part)))
+            (evict-reg! c r)
+          :else
+            (let [p (ap c local part)
+                  all (: 0xFFFFFFFFFFFFFFFF u64)
+                  free
+                    (& (.allocatable c)
+                       (^ (.used c) all)
+                       (bank-regs (p-bank p))
+                       (^ (arch-arg-regs c) all))]
+              (if (= free (: 0 u64))
+                  (evict-reg! c r)
+                  (let [nr (ctz64 free)]
+                    (arch-mov! c nr r (p-size p))
+                    (unmark-used! c r)
+                    (mark-used! c nr local part)
+                    (mark-clobbered! c nr)
+                    (ap-set-reg! c local part nr)))))))
+
+;;; A terminator (a return or tail call, or a call then a return) may move or
+;;; spill fixed values to free the registers its operands go in; nothing after
+;;; it in the block uses them, and the blocks compiled next are reached from
+;;; elsewhere with the fixed values where they were. term-begin! records the
+;;; fixed registers (register, part descriptor, value, part); term-end!, after
+;;; the terminator, forgets what it left in registers and puts them back.
+(defn term-begin! [A] [(c (ptr (Compiler A)))] (-> void)
+  (clear! (mut (.term-snap c)))
+  (set! (.terminating c) true)
+  (let [(mut m) (.used c)]
+    (while (!= m (: 0 u64))
+      (let [r (ctz64 m)
+            local (reg-local c r)]
+        (set! m (& m (- m (: 1 u64))))
+        (when (and (reg-fixed? c r) (!= local (none)))
+          (let [part (reg-part c r)]
+            (push! (mut (.term-snap c))
+                   (| (<< (cast u64 local) (: 32 u64))
+                      (<< (cast u64 part) (: 24 u64))
+                      (<< (cast u64 (ap c local part)) (: 8 u64))
+                      (cast u64 r)))))))))
+
+(defn term-end! [A] [(c (ptr (Compiler A)))] (-> void)
+  (set! (.terminating c) false)
+  (for r (range 0 64)
+    (let [rr (cast u8 r)]
+      (when (or (reg-used? c rr) (reg-fixed? c rr))
+        (unmark-used! c rr)
+        (unmark-fixed! c rr))))
+  (for i (range 0 (len (.term-snap c)))
+    (let [e (get (.term-snap c) i)
+          local (cast u32 (>> e (: 32 u64)))
+          part (cast u32 (& (>> e (: 24 u64)) (: 0xFF u64)))
+          desc (cast u16 (& (>> e (: 8 u64)) (: 0xFFFF u64)))
+          r (cast u8 (& e (: 0xFF u64)))]
+      ; not if the terminator was its last use
+      (when (va-live? (va-at c local))
+        (ap-set! c local part desc)
+        (mark-used! c r local part)
+        (mark-fixed! c r)))))
+
+(defn free-reg! [A] [(c (ptr (Compiler A))) (r u8)] (-> void)
+  (let [local (reg-local c r)
+        part (reg-part c r)]
+    (ap-set-reg-valid! c local part false)
+    (unmark-used! c r)))
+
+(defn select-reg-evict! [A] [(c (ptr (Compiler A))) (bank u8)] (-> u8)
+  (let [(mut cand) (no-reg)
+        (mut max-score) (: 0 u32)
+        (mut m) (& (.used c) (bank-regs bank))]
+    (block :scan
+      (while (!= m (: 0 u64))
+        (let [r (ctz64 m)]
+          (set! m (& m (- m (: 1 u64))))
+          (when (not (reg-fixed? c r))
+            (let [local (reg-local c r)
+                  part (reg-part c r)
+                  v (va-at c local)
+                  p (part-get c v part)]
+              (when (va-var-ref? v)
+                (set! cand r)
+                (return-from :scan 0))
+              (let [lv (load (liveness c local))
+                    dist (- (.last lv) (.cur-block-idx c))
+                    refs (if (va-flag? v (: 2 u8)) (: 0 u32) (.refs v))
+                    score
+                      (| (if (p-stack-valid? p) (: 0x80000000 u32) (: 0 u32))
+                         (<< (if (< dist (: 0x8000 u32))
+                                 (- (: 0x8000 u32) dist)
+                                 (: 0 u32))
+                             (: 16 u32))
+                         (if (< refs (: 0xFFFF u32))
+                             (- (: 0x10000 u32) refs)
+                             (: 1 u32)))]
+                (when (> score max-score)
+                  (set! cand r)
+                  (set! max-score score)))))))
+      0)
+    (when (= cand (no-reg)) (fatal "ran out of registers"))
+    (evict-reg! c cand)
+    cand))
+
+;;; A free register of `bank`, evicting a value if needed.
+(defn select-reg! [A] [(c (ptr (Compiler A))) (bank u8)] (-> u8)
+  (let [r (find-first-free c bank (: 0 u64))]
+    (if (!= r (no-reg)) r (select-reg-evict! c bank))))
+
+; ---- scratch registers ----
+
+(defn scratch-alloc! [A] [(c (ptr (Compiler A))) (s (mut Scratch)) (bank u8)]
+  (-> u8)
+  (if (!= (.reg s) (no-reg))
+      (.reg s)
+      (let [r (select-reg! c bank)]
+        (mark-used! c r (none) (: 0 u32))
+        (mark-clobbered! c r)
+        (mark-fixed! c r)
+        (set! (.reg s) r)
+        r)))
+
+(defn scratch-alloc-gp! [A] [(c (ptr (Compiler A))) (s (mut Scratch))] (-> u8)
+  (scratch-alloc! c (mut s) (: 0 u8)))
+
+(defn scratch-alloc-specific! [A] [(c (ptr (Compiler A)))
+                                   (s (mut Scratch))
+                                   (r u8)] (-> u8)
+  (scratch-reset! c (mut s))
+  (when (reg-used? c r) (evict-reg! c r))
+  (mark-used! c r (none) (: 0 u32))
+  (mark-clobbered! c r)
+  (mark-fixed! c r)
+  (set! (.reg s) r)
+  r)
+
+(defn scratch-reset! [A] [(c (ptr (Compiler A))) (s (mut Scratch))] (-> void)
+  (when (!= (.reg s) (no-reg))
+    (unmark-fixed! c (.reg s))
+    (unmark-used! c (.reg s))
+    (set! (.reg s) (no-reg))))
+
+; ---- value parts ----
+
+(defn vp-has-reg? [(vp (ptr ValuePart))] (-> bool)
+  (!= (.reg vp) (no-reg)))
+
+(defn vp-assigned? [(vp (ptr ValuePart))] (-> bool)
+  (= (.kind vp) (: 1 u8)))
+
+(defn vp-bank [A] [(c (ptr (Compiler A))) (vp (ptr ValuePart))] (-> u8)
+  (if (vp-assigned? vp) (p-bank (ap c (.local vp) (.part vp))) (.bank vp)))
+
+(defn vp-size [A] [(c (ptr (Compiler A))) (vp (ptr ValuePart))] (-> u32)
+  (if (vp-assigned? vp) (p-size (ap c (.local vp) (.part vp))) (.size vp)))
+
+(defn vp-cur-reg [(vp (ptr ValuePart))] (-> u8)
+  (.reg vp))
+
+;;; The register holding the part right now, even if unlocked, or NO-REG.
+(defn vp-cur-reg-unlocked [A] [(c (ptr (Compiler A))) (vp (ptr ValuePart))]
+  (-> u8)
+  (cond (vp-has-reg? vp) (.reg vp)
+        (vp-assigned? vp)
+          (let [p (ap c (.local vp) (.part vp))]
+            (if (p-reg-valid? p) (p-reg p) (no-reg)))
+        :else (no-reg)))
+
+;;; Whether the part has a fixed register for its whole life.
+(defn vp-fixed? [A] [(c (ptr (Compiler A))) (vp (ptr ValuePart))] (-> bool)
+  (and (vp-assigned? vp) (p-fixed? (ap c (.local vp) (.part vp)))))
+
+(defn vp-in-reg? [A] [(c (ptr (Compiler A))) (vp (ptr ValuePart)) (r u8)]
+  (-> bool)
+  (= (vp-cur-reg-unlocked c vp) r))
+
+;;; Whether the part is a stack variable (an alloca), so that its address is
+;;; the frame pointer plus `vp-stack-var-off`.
+(defn vp-stack-var? [A] [(c (ptr (Compiler A))) (vp (ptr ValuePart))] (-> bool)
+  (and (vp-assigned? vp) (va-flag? (va-at c (.local vp)) (: 8 u8))))
+
+(defn vp-stack-var-off [A] [(c (ptr (Compiler A))) (vp (ptr ValuePart))]
+  (-> i32)
+  (.frame-off (va-at c (.local vp))))
+
+(defn vp-lock! [A] [(c (ptr (Compiler A))) (vp (mut ValuePart))] (-> void)
+  (let [r (p-reg (ap c (.local vp) (.part vp)))]
+    (inc-lock! c r)
+    (set! (.reg vp) r)))
+
+(defn vp-unlock! [A] [(c (ptr (Compiler A))) (vp (mut ValuePart))] (-> void)
+  (when (vp-has-reg? (cast (ptr ValuePart) (mut vp)))
+    (dec-lock! c (.reg vp))
+    (set! (.reg vp) (no-reg))))
+
+(defn materialize! [A] [(c (ptr (Compiler A))) (vp (ptr ValuePart)) (dst u8)]
+  (-> void)
+  (if (.is-sym vp)
+      (arch-load-sym-addr! c dst (cast u32 (.c0 vp)) (cast i64 (.c1 vp)))
+      (arch-materialize-const! c (.c0 vp) (.c1 vp) (.bank vp) (.size vp) dst)))
+
+(defn vp-alloc-impl! [A] [(c (ptr (Compiler A)))
+                          (vp (mut ValuePart))
+                          (reload bool)] (-> u8)
+  (block
+    :done
+      (let [bank
+              (if (vp-assigned? (cast (ptr ValuePart) (mut vp)))
+                  (let [p (ap c (.local vp) (.part vp))]
+                    (when (p-reg-valid? p)
+                      (vp-lock! c (mut vp))
+                      (return-from :done (.reg vp)))
+                    (p-bank p))
+                  (.bank vp))
+            r (select-reg! c bank)]
+        (mark-clobbered! c r)
+        (if (vp-assigned? (cast (ptr ValuePart) (mut vp)))
+            (do
+              (mark-used! c r (.local vp) (.part vp))
+              (mark-fixed! c r)
+              (set! (.reg vp) r)
+              (ap-set! c
+                       (.local vp)
+                       (.part vp)
+                       (p-with (p-set-reg (ap c (.local vp) (.part vp)) r)
+                               (: 0x800 u16)
+                               true))
+              (when reload (reload-to-reg! c r (.local vp) (.part vp))))
+            (do
+              (mark-used! c r (none) (: 0 u32))
+              (mark-fixed! c r)
+              (set! (.reg vp) r)
+              (set! (.owned vp) true)
+              (when reload (materialize! c (cast (ptr ValuePart) (mut vp)) r))))
+        r)))
+
+;;; Allocate and lock a register without loading the value.
+(defn vp-alloc-reg! [A] [(c (ptr (Compiler A))) (vp (mut ValuePart))] (-> u8)
+  (vp-alloc-impl! c (mut vp) false))
+
+;;; Allocate, fill and lock a register (reloading or materializing).
+(defn vp-load-to-reg! [A] [(c (ptr (Compiler A))) (vp (mut ValuePart))] (-> u8)
+  (vp-alloc-impl! c (mut vp) true))
+
+(defn vp-cur-reg-or-load! [A] [(c (ptr (Compiler A))) (vp (mut ValuePart))]
+  (-> u8)
+  (if (vp-has-reg? (cast (ptr ValuePart) (mut vp)))
+      (.reg vp)
+      (vp-alloc-impl! c (mut vp) true)))
+
+(defn vp-cur-reg-or-alloc! [A] [(c (ptr (Compiler A))) (vp (mut ValuePart))]
+  (-> u8)
+  (if (vp-has-reg? (cast (ptr ValuePart) (mut vp)))
+      (.reg vp)
+      (vp-alloc-impl! c (mut vp) false)))
+
+(defn vp-can-salvage? [A] [(c (ptr (Compiler A))) (vp (ptr ValuePart))]
+  (-> bool)
+  (if (not (vp-assigned? vp))
+      (and (.owned vp) (vp-has-reg? vp))
+      (and (.owned vp) (p-reg-valid? (ap c (.local vp) (.part vp))))))
+
+(defn vp-salvage-keep-used! [A] [(c (ptr (Compiler A))) (vp (mut ValuePart))]
+  (-> u8)
+  (if (not (vp-assigned? (cast (ptr ValuePart) (mut vp))))
+      (let [r (.reg vp)]
+        (unmark-fixed! c r)
+        (set! (.reg vp) (no-reg))
+        r)
+      (let [p (ap c (.local vp) (.part vp))
+            r (p-reg p)]
+        (vp-unlock! c (mut vp))
+        (when (p-fixed? p)
+          (dec-lock! c r)
+          (fixed-count-add! c (p-bank p) -1))
+        (ap-set! c
+                 (.local vp)
+                 (.part vp)
+                 (p-with (p-with p (: 0x800 u16) false) (: 0x100 u16) false))
+        r)))
+
+;;; Take the part's register (requires vp-can-salvage?).
+(defn vp-salvage! [A] [(c (ptr (Compiler A))) (vp (mut ValuePart))] (-> u8)
+  (let [r (vp-salvage-keep-used! c (mut vp))]
+    (unmark-used! c r)
+    r))
+
+;;; Copy the value into `dst`, which the caller owns.
+(defn vp-reload-into! [A] [(c (ptr (Compiler A)))
+                           (vp (mut ValuePart))
+                           (dst u8)
+                           (size0 u32)] (-> u8)
+  (cond (or (.is-const vp) (.is-sym vp))
+          (materialize! c (cast (ptr ValuePart) (mut vp)) dst)
+        (not (vp-assigned? (cast (ptr ValuePart) (mut vp))))
+          (arch-mov! c dst (.reg vp) (if (= size0 (: 0 u32)) (: 8 u32) size0))
+        :else
+          (let [p (ap c (.local vp) (.part vp))]
+            (cond (vp-has-reg? (cast (ptr ValuePart) (mut vp)))
+                    (arch-mov! c dst (.reg vp) (p-size p))
+                  (p-reg-valid? p) (arch-mov! c dst (p-reg p) (p-size p))
+                  :else (reload-to-reg! c dst (.local vp) (.part vp)))))
+  (mark-clobbered! c dst)
+  dst)
+
+(defn vp-reset! [A] [(c (ptr (Compiler A))) (vp (mut ValuePart))] (-> void)
+  (let [r (.reg vp)]
+    (when (!= r (no-reg))
+      (if (.owned vp)
+          (do
+            (if (vp-assigned? (cast (ptr ValuePart) (mut vp)))
+                (let [p (ap c (.local vp) (.part vp))]
+                  (ap-set! c
+                           (.local vp)
+                           (.part vp)
+                           (p-with (p-with p (: 0x800 u16) false)
+                                   (: 0x100 u16)
+                                   false))
+                  (set-lock! c r (: 0 u8))
+                  (when (p-fixed? p) (fixed-count-add! c (p-bank p) -1)))
+                (unmark-fixed! c r))
+            (unmark-used! c r))
+          (when (vp-assigned? (cast (ptr ValuePart) (mut vp))) (dec-lock! c r)))
+      (set! (.reg vp) (no-reg)))))
+
+;;; Allocate a specific register for the part, evicting what is there, and
+;;; (when `reload`) move or reload the value into it.
+(defn vp-alloc-specific-impl! [A] [(c (ptr (Compiler A)))
+                                   (vp (mut ValuePart))
+                                   (r u8)
+                                   (reload bool)] (-> u8)
+  (block :done
+    (when (vp-assigned? (cast (ptr ValuePart) (mut vp)))
+      (let [p (ap c (.local vp) (.part vp))]
+        (when (and (p-reg-valid? p) (= (p-reg p) r))
+          (vp-lock! c (mut vp))
+          (return-from :done r))))
+    (when (reg-used? c r) (evict-reg! c r))
+    (mark-clobbered! c r)
+    (if (vp-assigned? (cast (ptr ValuePart) (mut vp)))
+        (let [p (ap c (.local vp) (.part vp))
+              old (if (p-reg-valid? p) (p-reg p) (no-reg))]
+          (mark-used! c r (.local vp) (.part vp))
+          (ap-set! c
+                   (.local vp)
+                   (.part vp)
+                   (p-with (p-set-reg p r) (: 0x800 u16) true))
+          (vp-lock! c (mut vp))
+          (when reload
+            (if (!= old (no-reg))
+                (do (arch-mov! c r old (p-size p)) (unmark-used! c old))
+                (reload-to-reg! c r (.local vp) (.part vp)))))
+        (do
+          (mark-used! c r (none) (: 0 u32))
+          (mark-fixed! c r)
+          (when reload
+            (if (vp-has-reg? (cast (ptr ValuePart) (mut vp)))
+                (do
+                  (arch-mov! c r (.reg vp) (: 8 u32))
+                  (unmark-fixed! c (.reg vp))
+                  (unmark-used! c (.reg vp)))
+                (materialize! c (cast (ptr ValuePart) (mut vp)) r)))
+          (set! (.reg vp) r)
+          (set! (.owned vp) true)))
+    r))
+
+(defn vp-alloc-specific! [A] [(c (ptr (Compiler A)))
+                              (vp (mut ValuePart))
+                              (r u8)] (-> u8)
+  (vp-alloc-specific-impl! c (mut vp) r false))
+
+(defn vp-load-to-specific! [A] [(c (ptr (Compiler A)))
+                                (vp (mut ValuePart))
+                                (r u8)] (-> u8)
+  (vp-alloc-specific-impl! c (mut vp) r true))
+
+;;; Set the part's value from another part, taking its register when possible.
+(defn vp-set-value! [A] [(c (ptr (Compiler A)))
+                         (dst (mut ValuePart))
+                         (src (mut ValuePart))] (-> void)
+  (block :done
+    (when (not (vp-assigned? (cast (ptr ValuePart) (mut dst))))
+      (when (not (vp-assigned? (cast (ptr ValuePart) (mut src))))
+        (vp-reset! c (mut dst))
+        (set! dst (load (cast (ptr ValuePart) (mut src))))
+        (set! (.reg src) (no-reg))
+        (return-from :done 0))
+      (when (not (vp-can-salvage? c (cast (ptr ValuePart) (mut src))))
+        (let [r (vp-alloc-reg! c (mut dst))]
+          (vp-reload-into! c (mut src) r (: 0 u32))
+          (vp-reset! c (mut src)))
+        (return-from :done 0))
+      (vp-reset! c (mut dst))
+      (let [r (vp-salvage-keep-used! c (mut src))]
+        (set! (.reg dst) r)
+        (set! (.owned dst) true)
+        (mark-fixed! c r)
+        (update-reg-assignment! c r (none) (: 0 u32)))
+      (return-from :done 0))
+    (let [p (ap c (.local dst) (.part dst))]
+      (when (or (p-fixed? p)
+                (not (vp-can-salvage? c (cast (ptr ValuePart) (mut src)))))
+        (let [r (vp-alloc-reg! c (mut dst))]
+          (vp-reload-into! c (mut src) r (p-size p))
+          (vp-reset! c (mut src))
+          (vp-unlock! c (mut dst))
+          (ap-set-reg-valid! c (.local dst) (.part dst) true)
+          (ap-set-modified! c (.local dst) (.part dst) true))
+        (return-from :done 0))
+      (when (p-reg-valid? p)
+        (vp-unlock! c (mut dst))
+        (unmark-used! c (p-reg p)))
+      (let [r (vp-salvage-keep-used! c (mut src))]
+        (update-reg-assignment! c r (.local dst) (.part dst))
+        (ap-set! c
+                 (.local dst)
+                 (.part dst)
+                 (p-with (p-with (p-set-reg (ap c (.local dst) (.part dst)) r)
+                                 (: 0x800 u16)
+                                 true)
+                         (: 0x200 u16)
+                         true))))
+    0))
+
+;;; Set the part's value from a scratch register, taking the register.
+(defn vp-set-value-scratch! [A] [(c (ptr (Compiler A)))
+                                 (dst (mut ValuePart))
+                                 (s (mut Scratch))] (-> void)
+  (let [r (.reg s)]
+    (if (not (vp-assigned? (cast (ptr ValuePart) (mut dst))))
+        (do
+          (set! (.reg dst) r)
+          (set! (.owned dst) true)
+          (set! (.reg s) (no-reg)))
+        (let [p (ap c (.local dst) (.part dst))]
+          (if (p-fixed? p)
+              (do
+                (arch-mov! c (p-reg p) r (p-size p))
+                (scratch-reset! c (mut s)))
+              (do
+                (unmark-fixed! c r)
+                (update-reg-assignment! c r (.local dst) (.part dst))
+                (ap-set! c
+                         (.local dst)
+                         (.part dst)
+                         (p-with (p-with (p-set-reg p r) (: 0x800 u16) true)
+                                 (: 0x200 u16)
+                                 true))
+                (set! (.reg s) (no-reg))))))))
+
+;;; Set the part's value to a register the value already sits in (an argument
+;;; or a call result). No register may be locked.
+(defn vp-set-value-reg! [A] [(c (ptr (Compiler A)))
+                             (dst (mut ValuePart))
+                             (r u8)] (-> void)
+  (if (not (vp-assigned? (cast (ptr ValuePart) (mut dst))))
+      (do
+        (set! (.reg dst) r)
+        (set! (.owned dst) true)
+        (mark-used! c r (none) (: 0 u32))
+        (mark-fixed! c r))
+      (let [p (ap c (.local dst) (.part dst))]
+        (if (p-fixed? p)
+            (do
+              (when (!= (p-reg p) r) (arch-mov! c (p-reg p) r (p-size p)))
+              (ap-set! c
+                       (.local dst)
+                       (.part dst)
+                       (p-with (p-with p (: 0x800 u16) true) (: 0x200 u16) true)))
+            (do
+              (mark-used! c r (.local dst) (.part dst))
+              (mark-clobbered! c r)
+              (ap-set! c
+                       (.local dst)
+                       (.part dst)
+                       (p-with (p-with (p-set-reg p r) (: 0x800 u16) true)
+                               (: 0x200 u16)
+                               true)))))))
+
+(defn vp-set-modified! [A] [(c (ptr (Compiler A))) (vp (ptr ValuePart))]
+  (-> void)
+  (ap-set-modified! c (.local vp) (.part vp) true))
+
+;;; Allocate the result register, reusing `src`'s if it is in its last use.
+(defn vp-alloc-try-reuse! [A] [(c (ptr (Compiler A)))
+                               (dst (mut ValuePart))
+                               (src (mut ValuePart))] (-> u8)
+  (block :done
+    (when (or (not (vp-assigned? (cast (ptr ValuePart) (mut dst))))
+              (not (p-reg-valid? (ap c (.local dst) (.part dst)))))
+      (when (vp-can-salvage? c (cast (ptr ValuePart) (mut src)))
+        (vp-set-value! c (mut dst) (mut src))
+        (when (vp-assigned? (cast (ptr ValuePart) (mut dst)))
+          (vp-lock! c (mut dst)))
+        (return-from :done (.reg dst))))
+    (vp-alloc-reg! c (mut dst))))
+
+;;; Move into a temporary register (reusing the part's when owned).
+(defn vp-into-temporary! [A] [(c (ptr (Compiler A))) (vp (mut ValuePart))]
+  (-> ValuePart)
+  (let [(mut res) (vp-empty (vp-bank c (cast (ptr ValuePart) (mut vp))))]
+    (if (or (.is-const vp) (.is-sym vp))
+        (do
+          (set! res (load (cast (ptr ValuePart) (mut vp))))
+          (vp-load-to-reg! c (mut res))
+          res)
+        (do
+          (vp-set-value! c (mut res) (mut vp))
+          (when (not (vp-has-reg? (cast (ptr ValuePart) (mut res))))
+            (vp-load-to-reg! c (mut res)))
+          res))))
+
+(defn vp-into-scratch! [A] [(c (ptr (Compiler A))) (vp (mut ValuePart))]
+  (-> Scratch)
+  (let [(mut s) (scratch-new)]
+    (if (vp-can-salvage? c (cast (ptr ValuePart) (mut vp)))
+        (scratch-alloc-specific! c (mut s) (vp-salvage! c (mut vp)))
+        (vp-reload-into! c
+                         (mut vp)
+                         (scratch-alloc! c
+                                         (mut s)
+                                         (vp-bank c
+                                                  (cast (ptr ValuePart)
+                                                        (mut vp))))
+                         (: 0 u32)))
+    (vp-reset! c (mut vp))
+    s))
+
+; ---- value references ----
+
+(defn val-ref! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A))) (v u32)]
+  (-> ValueRef)
+  (if (!= (val-kind (.ad c) v) (: 0 u8))
+      (ValueRef
+        :mode (: 4 u8)
+        :local (none)
+        :value v)
+      (let [local (val-local c v)
+            va (va-at c local)
+            mode
+              (cond (va-var-ref? va) (: 0 u8)
+                    (and (<= (.refs va) (: 1 u32))
+                         (not (va-flag? va (: 16 u8))))
+                      (: 2 u8)
+                    :else (: 1 u8))]
+        (when (not (va-live? va))
+          (eprintln "tpde: value {} ({}) used before its definition"
+                    v
+                    (inst-name (.ad c) v))
+          (fatal "use of a value before its definition"))
+        (ValueRef
+          :mode mode
+          :local local
+          :value v))))
+
+(defn result-ref! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A))) (v u32)]
+  (-> ValueRef)
+  (let [local (val-local c v)
+        va (va-at c local)]
+    (when (not (va-live? va)) (init-assignment! c v local))
+    (let [va2 (va-at c local)
+          mode
+            (cond (va-var-ref? va2) (: 0 u8)
+                  (and (<= (.refs va2) (: 1 u32))
+                       (not (va-flag? va2 (: 16 u8))))
+                    (: 2 u8)
+                  :else (: 1 u8))]
+      (ValueRef
+        :mode mode
+        :local local
+        :value v))))
+
+(defn vr-owned? [(vr (ptr ValueRef))] (-> bool)
+  (= (.mode vr) (: 2 u8)))
+
+(defn vr-special? [(vr (ptr ValueRef))] (-> bool)
+  (= (.mode vr) (: 4 u8)))
+
+(defn vr-disown! [(vr (mut ValueRef))] (-> void)
+  (when (< (.mode vr) (: 4 u8)) (set! (.mode vr) (: 0 u8))))
+
+(defn vr-part-count [A] [(c (ptr (Compiler A))) (vr (ptr ValueRef))] (-> u32)
+  (.part-count (va-at c (.local vr))))
+
+(defn vr-part [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                          (vr (ptr ValueRef))
+                                          (part u32)] (-> ValuePart)
+  (if (vr-special? vr)
+      (let [ad (.ad c)
+            v (.value vr)]
+        (if (= (val-kind ad v) (: 2 u8))
+            (vp-sym (val-sym ad c v) (val-sym-addend ad v))
+            (vp-const (val-const-word ad v part (: 0 u32))
+                      (val-const-word ad v part (: 1 u32))
+                      (val-part-size ad v part)
+                      (val-part-bank ad v part))))
+      (vp-value (.local vr) part (vr-owned? vr))))
+
+(defn vr-part-unowned [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                  (vr (ptr ValueRef))
+                                                  (part u32)] (-> ValuePart)
+  (let [(mut p) (vr-part c vr part)]
+    (set! (.owned p) false)
+    p))
+
+(defn vr-reset! [A] [(c (ptr (Compiler A))) (vr (mut ValueRef))] (-> void)
+  (when (or (= (.mode vr) (: 1 u8)) (= (.mode vr) (: 2 u8)))
+    (set! (.mode vr) (: 0 u8))
+    (let [v (va-at c (.local vr))]
+      (set! (.refs v) (- (.refs v) (: 1 u32)))
+      (when (= (.refs v) (: 0 u32))
+        (release-assignment! c (.local vr))))))
+
+;;; Make `dst` take over `src`'s assignment (registers and slot); src must be in
+;;; its last use with the same part layout.
+(defn result-ref-alias! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                    (dst u32)
+                                                    (src (mut ValueRef))]
+  (-> ValueRef)
+  (let [local (val-local c dst)
+        sl (.local src)
+        sv (load (va-at c sl))
+        count (.part-count sv)]
+    (set! (va-at c local) sv)
+    (for pi (range 0 (i64-of count))
+      (let [p (ap c local (u32-of pi))]
+        (when (p-reg-valid? p)
+          (update-reg-assignment! c (p-reg p) local (u32-of pi)))))
+    (let [lv (load (liveness c local))
+          v (va-at c local)]
+      (va-set-flag! v (: 16 u8) (.last-full lv))
+      (set! (.refs v) (.ref-count lv)))
+    (set! (.flags (va-at c sl)) (: 0 u8))
+    (set! (.mode src) (: 0 u8))
+    (result-ref! c dst)))
+
+;;; Make `dst` a stack variable at `base`'s stack offset plus `off`.
+(defn result-ref-stack-slot! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                         (dst u32)
+                                                         (base-off i32)
+                                                         (off i32)]
+  (-> ValueRef)
+  (let [local (val-local c dst)]
+    (init-stack-variable! c local (+ base-off off))
+    (ValueRef
+      :mode (: 0 u8)
+      :local local
+      :value dst)))
+
+;;; Convenience: a reference and its only part.
+(defstruct Single [(vr ValueRef) (vp ValuePart)])
+
+(defn val-ref-single! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                  (v u32)] (-> Single)
+  (let [(mut vr) (val-ref! c v)]
+    (Single :vr vr :vp (vr-part c (cast (ptr ValueRef) (mut vr)) (: 0 u32)))))
+
+(defn result-ref-single! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                     (v u32)] (-> Single)
+  (let [(mut vr) (result-ref! c v)]
+    (Single :vr vr :vp (vr-part c (cast (ptr ValueRef) (mut vr)) (: 0 u32)))))
+
+(defn single-reset! [A] [(c (ptr (Compiler A))) (s (mut Single))] (-> void)
+  (vp-reset! c (mut (.vp s)))
+  (vr-reset! c (mut (.vr s))))
+
+; ---- labels ----
+
+(defn label-create! [A] [(c (ptr (Compiler A)))] (-> u32)
+  (let [l (u32-of (len (.label-offs c)))]
+    (push! (mut (.label-offs c)) (none))
+    l))
+
+(defn label-pending? [A] [(c (ptr (Compiler A))) (l u32)] (-> bool)
+  (= (get (.label-offs c) (i64-of l)) (none)))
+
+(defn label-offset [A] [(c (ptr (Compiler A))) (l u32)] (-> u32)
+  (get (.label-offs c) (i64-of l)))
+
+(defn label-place! [A] [(c (ptr (Compiler A))) (l u32)] (-> void)
+  (set! (mut (.label-offs c)) (i64-of l) (text-off c)))
+
+(defn label-ref! [A] [(c (ptr (Compiler A))) (l u32) (off u32) (kind u8)]
+  (-> void)
+  (push! (mut (.fixups c))
+         (Fixup
+           :label l
+           :off off
+           :kind kind)))
+
+; ---- branches ----
+
+;;; Spill values that a later block needs, before a branch. Returns the
+;;; registers to free once the branch is generated (release-spilled-regs!).
+(defn spill-before-branch! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                       (force bool)] (-> u64)
+  (block
+    :out
+      (let [ad (.ad c)
+            an (cast (ptr (Analyzer A)) (mut (.an c)))
+            cur (an/block-ref an (.cur-block-idx c))
+            (mut earliest) (none)
+            (mut must-spill) force]
+        (when (not must-spill)
+          (let [(mut next-is-succ) false
+                (mut next-multi) false
+                nsucc (block-succ-count ad cur)]
+            (for si (range 0 (i64-of nsucc))
+              (let [succ (block-succ ad cur (u32-of si))
+                    sidx (an/block-idx an succ)]
+                (if (= sidx (+ (.cur-block-idx c) (: 1 u32)))
+                    (do
+                      (set! next-is-succ true)
+                      (when (an/block-has-multiple-incoming? an succ)
+                        (set! next-multi true)))
+                    (when (and (> sidx (.cur-block-idx c)) (< sidx earliest))
+                      (set! earliest sidx)))))
+            (set! must-spill (or (not next-is-succ) next-multi))
+            (when (and (= nsucc (: 1 u32)) (not must-spill))
+              (return-from :out (: 0 u64)))))
+        (let [(mut release) (: 0 u64)
+              (mut m) (.used c)]
+          (while (!= m (: 0 u64))
+            (let [r (ctz64 m)]
+              (set! m (& m (- m (: 1 u64))))
+              (let [local (reg-local c r)]
+                (when (!= local (none))
+                  (let [part (reg-part c r)
+                        v (va-at c local)
+                        p (part-get c v part)]
+                    (when (not (p-fixed? p))
+                      (when must-spill (set! release (| release (bit r))))
+                      (when (and (p-modified? p) (not (va-var-ref? v)))
+                        (let [lv (load (liveness c local))]
+                          (when (and (> (.last lv) (.cur-block-idx c))
+                                     (or must-spill (<= earliest (.last lv))))
+                            (spill! c local part))))))))))
+          release))))
+
+(defn release-spilled-regs! [A] [(c (ptr (Compiler A))) (regs u64)] (-> void)
+  (let [(mut m) (& regs (.used c))]
+    (while (!= m (: 0 u64))
+      (let [r (ctz64 m)]
+        (set! m (& m (- m (: 1 u64))))
+        (when (not (reg-fixed? c r)) (free-reg! c r))))))
+
+;;; After a return: forget every non-fixed register.
+(defn release-regs-after-return! [A] [(c (ptr (Compiler A)))] (-> void)
+  (let [(mut m) (.used c)]
+    (while (!= m (: 0 u64))
+      (let [r (ctz64 m)]
+        (set! m (& m (- m (: 1 u64))))
+        (when (not (reg-fixed? c r)) (free-reg! c r))))))
+
+(defn next-block [A] [(c (ptr (Compiler A)))] (-> u32)
+  (+ (.cur-block-idx c) (: 1 u32)))
+
+(defn branch-needs-split? [(A IRAdaptor)] [(c (ptr (Compiler A))) (target u32)]
+  (-> bool)
+  (an/block-has-phis? (cast (ptr (Analyzer A)) (mut (.an c))) target))
+
+;;; Jump kinds shared by every architecture; the rest are per architecture.
+(const J-JMP 16)
+
+(defstruct Jump [(kind u8) (reg u8) (is32 bool) (bit u8)])
+
+(defn jump [(kind u8)] (-> Jump)
+  (Jump
+    :kind kind
+    :reg (no-reg)
+    :is32 false
+    :bit (: 0 u8)))
+
+(defn jmp [] (-> Jump)
+  (jump (: 16 u8)))
+
+(defn generate-branch-to-block! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                            (j Jump)
+                                                            (target u32)
+                                                            (needs-split bool)
+                                                            (last-inst bool)]
+  (-> void)
+  (let [an (cast (ptr (Analyzer A)) (mut (.an c)))
+        tidx (an/block-idx an target)
+        tlabel (get (.block-labels c) (i64-of tidx))]
+    (if (not needs-split)
+        (do
+          (move-to-phi-nodes! c tidx)
+          (when (or (not last-inst) (!= tidx (next-block c)))
+            (arch-raw-jump! c j tlabel)))
+        (let [tmp (label-create! c)]
+          (arch-raw-jump! c (arch-invert-jump c j) tmp)
+          (move-to-phi-nodes! c tidx)
+          (arch-raw-jump! c (jmp) tlabel)
+          (label-place! c tmp)))))
+
+(defn generate-uncond-branch! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                          (target u32)]
+  (-> void)
+  (let [spilled (spill-before-branch! c false)]
+    (set! (.generating-branch c) true)
+    (generate-branch-to-block! c (jmp) target false true)
+    (set! (.generating-branch c) false)
+    (release-spilled-regs! c spilled)))
+
+(defn generate-cond-branch! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                        (j Jump)
+                                                        (t u32)
+                                                        (f u32)] (-> void)
+  (let [an (cast (ptr (Analyzer A)) (mut (.an c)))
+        next (an/block-ref an (next-block c))
+        t-split (branch-needs-split? c t)
+        f-split (branch-needs-split? c f)
+        spilled (spill-before-branch! c false)]
+    (set! (.generating-branch c) true)
+    (cond (or (= next t) (and (!= next f) t-split))
+            (do
+              (generate-branch-to-block! c
+                                         (arch-invert-jump c j)
+                                         f
+                                         f-split
+                                         false)
+              (generate-branch-to-block! c (jmp) t false true))
+          (= next f)
+            (do
+              (generate-branch-to-block! c j t t-split false)
+              (generate-branch-to-block! c (jmp) f false true))
+          :else
+            (do
+              (generate-branch-to-block! c j t false false)
+              (generate-branch-to-block! c (jmp) f false true)))
+    (set! (.generating-branch c) false)
+    (release-spilled-regs! c spilled)))
+
+; ---- switch ----
+
+(defstruct Case [(value u64) (block u32)])
+
+(defn switch-range! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                (cases (ptr (ArrayList Case)))
+                                                (labels (ptr (ArrayList u32)))
+                                                (begin i64)
+                                                (end i64)
+                                                (cmp u8)
+                                                (tmp u8)
+                                                (is32 bool)
+                                                (default-label u32)] (-> void)
+  (let [n (- end begin)]
+    (if (<= n 4)
+        (do
+          (for i (range begin end)
+            (arch-switch-cmpeq! c
+                                (get (load labels) i)
+                                cmp
+                                tmp
+                                (.value (get (load cases) i))
+                                is32))
+          (arch-raw-jump! c (jmp) default-label))
+        (let [lo (.value (get (load cases) begin))
+              hi (.value (get (load cases) (- end 1)))
+              range (+ (- hi lo) (: 1 u64))]
+          (if (and (!= range (: 0 u64))
+                   (< (/ range (cast u64 n)) (: 8 u64))
+                   (< range (: 0x100000 u64)))
+              (let [table
+                      (arch-switch-jump-table! c
+                                               default-label
+                                               cmp
+                                               tmp
+                                               lo
+                                               hi
+                                               is32)]
+                ; table: index of the first label slot in (.jt-labels); fill them
+                (for i (range 0 (cast i64 range))
+                  (set-jt-label! c table i default-label))
+                (for i (range begin end)
+                  (set-jt-label! c
+                                 table
+                                 (cast i64 (- (.value (get (load cases) i)) lo))
+                                 (get (load labels) i))))
+              (let [half (/ n 2)
+                    hv (.value (get (load cases) (+ begin half)))
+                    gt (label-create! c)]
+                (arch-switch-binary-step! c
+                                          (get (load labels) (+ begin half))
+                                          gt
+                                          cmp
+                                          tmp
+                                          hv
+                                          is32)
+                (switch-range! c
+                               cases
+                               labels
+                               begin
+                               (+ begin half)
+                               cmp
+                               tmp
+                               is32
+                               default-label)
+                (label-place! c gt)
+                (switch-range! c
+                               cases
+                               labels
+                               (+ begin (+ half 1))
+                               end
+                               cmp
+                               tmp
+                               is32
+                               default-label)))))))
+
+;;; A multi-way branch on the low `width` bits of `cond` (a GP scratch). The
+;;; cases must be sorted by value, each value at most once.
+(defn generate-switch! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                   (cond (mut Scratch))
+                                                   (width u32)
+                                                   (default u32)
+                                                   (cases (ptr (ArrayList Case)))]
+  (-> void)
+  (let [an (cast (ptr (Analyzer A)) (mut (.an c)))
+        cmp (.reg cond)
+        is32 (<= width (: 32 u32))
+        dst-width (if is32 (: 32 u32) (: 64 u32))]
+    (when (and (!= width dst-width) (< width (: 64 u32)))
+      (arch-intext! c cmp cmp false width dst-width))
+    (let [(mut tmp-s) (scratch-new)
+          tmp (scratch-alloc-gp! c (mut tmp-s))
+          spilled (spill-before-branch! c false)
+          (mut labels) (ArrayList::new [u32] (malloc-allocator))
+          (mut stubs) (ArrayList::new [Case] (malloc-allocator))]
+      (set! (.generating-branch c) true)
+      (for i (range 0 (len (load cases)))
+        (let [target (.block (get (load cases) i))
+              tidx (an/block-idx an target)]
+          (if (an/block-has-phis? an target)
+              (let [l (label-create! c)]
+                (push! (mut labels) l)
+                (push! (mut stubs) (Case :value (cast u64 l) :block target)))
+              (push! (mut labels) (get (.block-labels c) (i64-of tidx))))))
+      (let [default-label (label-create! c)]
+        (switch-range! c
+                       cases
+                       (cast (ptr (ArrayList u32)) (mut labels))
+                       0
+                       (len (load cases))
+                       cmp
+                       tmp
+                       is32
+                       default-label)
+        (label-place! c default-label)
+        (generate-branch-to-block! c (jmp) default false false)
+        (for i (range 0 (len stubs))
+          (let [s (get stubs i)]
+            (label-place! c (cast u32 (.value s)))
+            (generate-branch-to-block! c (jmp) (.block s) false false))))
+      (set! (.generating-branch c) false)
+      (release-spilled-regs! c spilled)
+      (scratch-reset! c (mut tmp-s))
+      (free! (mut labels))
+      (free! (mut stubs)))))
+
+; jump tables are emitted inline by the architecture; a table is a run of
+; label-relative words at known offsets, patched at function end.
+(defstruct JTEntry [(off u32) (base u32) (label u32)])
+
+(defn set-jt-label! [A] [(c (ptr (Compiler A))) (table u32) (i i64) (label u32)]
+  (-> void)
+  ; table is the text offset of the table; each entry is 4 bytes, relative to the table
+  (push! (mut (.fixups c))
+         (Fixup
+           :label label
+           :off (+ table (u32-of (* i 4)))
+           :kind (: 200 u8))))
+
+; ---- PHI moves ----
+
+(defstruct PhiNode
+  [(phi u32) (incoming u32) (phi-local u32) (incoming-phi-local u32) (refs u32)])
+
+;; A scratch for PHI moves that may evict (and later restore) a non-fixed value.
+(defstruct PhiScratch
+  [(reg u8) (backed-up bool) (was-modified bool) (part u32) (local u32)])
+
+(defn phis-new [] (-> PhiScratch)
+  (PhiScratch
+    :reg (no-reg)
+    :backed-up false
+    :was-modified false
+    :part (: 0 u32)
+    :local (none)))
+
+(defn phis-reset! [A] [(c (ptr (Compiler A))) (s (mut PhiScratch))] (-> void)
+  (when (!= (.reg s) (no-reg))
+    (unmark-fixed! c (.reg s))
+    (unmark-used! c (.reg s))
+    (when (.backed-up s)
+      (let [v (va-at c (.local s))]
+        (when (va-live? v)
+          (when (not (va-var-ref? v))
+            (arch-load-from-stack! c
+                                   (.reg s)
+                                   (ap-frame-off c (.local s) (.part s))
+                                   (p-size (part-get c v (.part s)))
+                                   false))
+          (ap-set! c
+                   (.local s)
+                   (.part s)
+                   (p-with (p-with (p-set-reg (ap c (.local s) (.part s))
+                                              (.reg s))
+                                   (: 0x800 u16)
+                                   true)
+                           (: 0x200 u16)
+                           (.was-modified s)))
+          (mark-used! c (.reg s) (.local s) (.part s))))
+      (set! (.backed-up s) false))
+    (set! (.reg s) (no-reg))))
+
+(defn phis-alloc! [A] [(c (ptr (Compiler A))) (s (mut PhiScratch)) (bank u8)]
+  (-> u8)
+  (block :done
+    (when (and (!= (.reg s) (no-reg)) (= (bank-of (.reg s)) bank))
+      (return-from :done (.reg s)))
+    (when (!= (.reg s) (no-reg)) (phis-reset! c (mut s)))
+    (let [(mut r) (find-first-free c bank (: 0 u64))]
+      (when (= r (no-reg))
+        (set! r (find-first-nonfixed c bank (: 0 u64)))
+        (when (= r (no-reg)) (fatal "ran out of registers for PHI moves"))
+        (set! (.backed-up s) true)
+        (set! (.local s) (reg-local c r))
+        (set! (.part s) (reg-part c r))
+        (let [v (va-at c (.local s))
+              p (part-get c v (.part s))]
+          (set! (.was-modified s) (p-modified? p))
+          (when (and (not (p-stack-valid? p)) (not (va-var-ref? v)))
+            (allocate-spill-slot! c (.local s))
+            (arch-spill-reg! c
+                             r
+                             (ap-frame-off c (.local s) (.part s))
+                             (p-size p))
+            (ap-set-modified! c (.local s) (.part s) false))
+          (ap-set-reg-valid! c (.local s) (.part s) false)
+          (unmark-used! c r)))
+      (mark-used! c r (none) (: 0 u32))
+      (mark-clobbered! c r)
+      (mark-fixed! c r)
+      (set! (.reg s) r)
+      r)))
+
+(defn move-to-phi! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                               (s (mut PhiScratch))
+                                               (phi u32)
+                                               (incoming u32)] (-> void)
+  (let [(mut phi-vr) (result-ref! c phi)
+        (mut val-vr) (val-ref! c incoming)]
+    (when (!= phi incoming)
+      (let [count (vr-part-count c (cast (ptr ValueRef) (mut phi-vr)))
+            pl (.local phi-vr)]
+        (for pi (range 0 (i64-of count))
+          (let [part (u32-of pi)
+                pp (ap c pl part)
+                (mut vp) (vr-part c (cast (ptr ValueRef) (mut val-vr)) part)]
+            (if (p-fixed? pp)
+                (let [r (vp-cur-reg-unlocked c (cast (ptr ValuePart) (mut vp)))]
+                  (if (!= r (no-reg))
+                      (arch-mov! c (p-reg pp) r (p-size pp))
+                      (vp-reload-into! c (mut vp) (p-reg pp) (: 0 u32))))
+                (let [(mut r)
+                        (vp-cur-reg-unlocked c (cast (ptr ValuePart) (mut vp)))]
+                  (when (= r (no-reg))
+                    (set! r
+                          (phis-alloc! c
+                                       (mut s)
+                                       (vp-bank c
+                                                (cast (ptr ValuePart) (mut vp)))))
+                    (vp-reload-into! c (mut vp) r (: 0 u32)))
+                  (allocate-spill-slot! c pl)
+                  (arch-spill-reg! c r (ap-frame-off c pl part) (p-size pp))
+                  (ap-set-modified! c pl part false)))
+            (vp-reset! c (mut vp))))))
+    (vr-reset! c (mut val-vr))
+    (vr-reset! c (mut phi-vr))))
+
+(defn find-node [(nodes (ptr (ArrayList PhiNode))) (local u32)] (-> i64)
+  ; nodes are sorted by phi-local
+  (let [(mut lo) 0
+        (mut hi) (len (load nodes))]
+    (while (< lo hi)
+      (let [mid (/ (+ lo hi) 2)]
+        (if (< (.phi-local (get (load nodes) mid)) local)
+            (set! lo (+ mid 1))
+            (set! hi mid))))
+    (if (and (< lo (len (load nodes)))
+             (= (.phi-local (get (load nodes) lo)) local))
+        lo
+        -1)))
+
+(defn move-to-phi-nodes! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                     (target-idx u32)] (-> void)
+  (let [an (cast (ptr (Analyzer A)) (mut (.an c)))]
+    (when (an/block-has-phis? an (an/block-ref an target-idx))
+      (move-to-phi-nodes-impl! c target-idx))))
+
+(defn move-to-phi-nodes-impl! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                          (target-idx u32)]
+  (-> void)
+  (set! (.phi-block-idx c) target-idx)
+  (move-to-phi-nodes-into! c target-idx)
+  (set! (.phi-block-idx c) (none)))
+
+(defn move-to-phi-nodes-into! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                          (target-idx u32)]
+  (-> void)
+  (let [ad (.ad c)
+        an (cast (ptr (Analyzer A)) (mut (.an c)))
+        target (an/block-ref an target-idx)
+        cur (an/block-ref an (.cur-block-idx c))
+        nphis (block-phi-count ad target)
+        (mut s) (phis-new)]
+    (if (= nphis (: 1 u32))
+        (let [phi (block-phi ad target (: 0 u32))]
+          (move-to-phi! c (mut s) phi (phi-incoming-val-for-block ad phi cur)))
+        (let [(mut nodes) (ArrayList::new [PhiNode] (malloc-allocator))]
+          (for i (range 0 (i64-of nphis))
+            (let [phi (block-phi ad target (u32-of i))]
+              (push! (mut nodes)
+                     (PhiNode
+                       :phi phi
+                       :incoming (phi-incoming-val-for-block ad phi cur)
+                       :phi-local (val-local c phi)
+                       :incoming-phi-local (none)
+                       :refs (: 0 u32)))))
+          ; sort by phi-local (insertion sort; PHI counts are small)
+          (for i (range 1 (len nodes))
+            (let [x (get nodes i)
+                  (mut j) i]
+              (while (and (> j 0)
+                          (> (.phi-local (get nodes (- j 1))) (.phi-local x)))
+                (set! (mut nodes) j (get nodes (- j 1)))
+                (set! j (- j 1)))
+              (set! (mut nodes) j x)))
+          (let [np (cast (ptr (ArrayList PhiNode)) (mut nodes))
+                (mut all-zero) true]
+            (for i (range 0 (len nodes))
+              (let [n (get nodes i)]
+                (when (and (val-phi? ad (.incoming n))
+                           (!= (.incoming n) (.phi n)))
+                  (let [il (val-local c (.incoming n))
+                        k (find-node np il)]
+                    (when (and (>= k 0) (= (.phi (get nodes k)) (.incoming n)))
+                      (set! (.incoming-phi-local (elem (mut nodes) i)) il)
+                      (set! (.refs (elem (mut nodes) k))
+                            (+ (.refs (get nodes k)) (: 1 u32)))
+                      (set! all-zero false))))))
+            (if all-zero
+                (for i (range 0 (len nodes))
+                  (let [n (get nodes i)]
+                    (move-to-phi! c (mut s) (.phi n) (.incoming n))))
+                (move-phi-cycles! c np (mut s))))
+          (free! (mut nodes))))
+    (phis-reset! c (mut s))))
+
+;; PHIs that read other PHIs of the same block: move in dependency order, and
+;; break cycles through a temporary.
+(defn move-phi-cycles! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                   (np (ptr (ArrayList PhiNode)))
+                                                   (s (mut PhiScratch))]
+  (-> void)
+  (let [nodes np
+        n (len (load nodes))
+        (mut ready) (ArrayList::new [i64] (malloc-allocator))
+        (mut waiting) (ArrayList::new [bool] (malloc-allocator))
+        (mut handled) 0
+        (mut tmp-parts) (: 0 u32)
+        (mut tmp-slot) (: 0 i32)
+        (mut tmp-slot-size) (: 0 u32)
+        (mut tmp-val) (none)
+        (mut t1) (phis-new)
+        (mut t2) (phis-new)]
+    (for i (range 0 n)
+      (push! (mut waiting) (> (.refs (get (load nodes) i)) (: 0 u32)))
+      (when (= (.refs (get (load nodes) i)) (: 0 u32)) (push! (mut ready) i)))
+    (while (!= handled n)
+      (when (= (len ready) 0)
+        ; break a cycle: save the first waiting PHI's current value
+        (let [(mut cur) -1]
+          (for i (range 0 n)
+            (when (and (< cur 0) (get waiting i)) (set! cur i)))
+          (let [phi (.phi (get (load nodes) cur))
+                (mut phi-vr) (val-ref! c phi)
+                pl (.local phi-vr)
+                count (vr-part-count c (cast (ptr ValueRef) (mut phi-vr)))]
+            (set! tmp-parts count)
+            (set! tmp-val phi)
+            (if (> count (: 2 u32))
+                (do
+                  (set! tmp-slot-size (* count (.max-part-size (va-at c pl))))
+                  (set! tmp-slot (allocate-stack-slot! c tmp-slot-size))
+                  (for pi (range 0 (i64-of count))
+                    (let [part (u32-of pi)
+                          p (ap c pl part)
+                          off (+ tmp-slot (ap-part-off c pl part))]
+                      (if (p-reg-valid? p)
+                          (arch-spill-reg! c (p-reg p) off (p-size p))
+                          (let [r (phis-alloc! c (mut t1) (p-bank p))]
+                            (arch-load-from-stack! c
+                                                   r
+                                                   (ap-frame-off c pl part)
+                                                   (p-size p)
+                                                   false)
+                            (arch-spill-reg! c r off (p-size p)))))))
+                (do
+                  (let [(mut vp)
+                          (vr-part c
+                                   (cast (ptr ValueRef) (mut phi-vr))
+                                   (: 0 u32))
+                        r
+                          (phis-alloc! c
+                                       (mut t1)
+                                       (vp-bank c
+                                                (cast (ptr ValuePart) (mut vp))))]
+                    (vp-reload-into! c (mut vp) r (: 0 u32))
+                    (vp-reset! c (mut vp)))
+                  (when (= count (: 2 u32))
+                    (let [(mut vp)
+                            (vr-part c
+                                     (cast (ptr ValueRef) (mut phi-vr))
+                                     (: 1 u32))
+                          r
+                            (phis-alloc! c
+                                         (mut t2)
+                                         (vp-bank c
+                                                  (cast (ptr ValuePart)
+                                                        (mut vp))))]
+                      (vp-reload-into! c (mut vp) r (: 0 u32))
+                      (vp-reset! c (mut vp))))))
+            ; this use stands for the read of the PHI by the node that reads the temporary
+            (vr-reset! c (mut phi-vr))
+            (set! (.refs (elem nodes cur)) (: 0 u32))
+            (push! (mut ready) cur)
+            (set! (mut waiting) cur false))))
+      (let [(mut ri) 0]
+        (while (< ri (len ready))
+          (set! handled (+ handled 1))
+          (let [cur (get ready ri)
+                node (get (load nodes) cur)
+                phi (.phi node)
+                inc (.incoming node)]
+            (cond (= inc phi)
+                    (let [(mut a) (val-ref! c inc)
+                          (mut b) (val-ref! c phi)]
+                      (vr-reset! c (mut a))
+                      (vr-reset! c (mut b)))
+                  (= inc tmp-val)
+                    (do
+                      (move-from-tmp-phi! c
+                                          phi
+                                          tmp-parts
+                                          tmp-slot
+                                          (mut t1)
+                                          (mut t2))
+                      (when (> tmp-parts (: 2 u32))
+                        (free-stack-slot! c tmp-slot tmp-slot-size))
+                      (set! tmp-val (none)))
+                  :else
+                    (do
+                      (move-to-phi! c (mut s) phi inc)
+                      (when (!= (.incoming-phi-local node) (none))
+                        (let [k (find-node nodes (.incoming-phi-local node))]
+                          (set! (.refs (elem nodes k))
+                                (- (.refs (get (load nodes) k)) (: 1 u32)))
+                          (when (= (.refs (get (load nodes) k)) (: 0 u32))
+                            (push! (mut ready) k)
+                            (set! (mut waiting) k false)))))))
+          (set! ri (+ ri 1))))
+      (clear! (mut ready)))
+    (phis-reset! c (mut t1))
+    (phis-reset! c (mut t2))
+    (free! (mut ready))
+    (free! (mut waiting))))
+
+(defn move-from-tmp-phi! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                     (target-phi u32)
+                                                     (count u32)
+                                                     (slot i32)
+                                                     (t1 (mut PhiScratch))
+                                                     (t2 (mut PhiScratch))]
+  (-> void)
+  (let [(mut vr) (result-ref! c target-phi)
+        pl (.local vr)]
+    (if (<= count (: 2 u32))
+        (let [p (ap c pl (: 0 u32))]
+          (if (p-fixed? p)
+              (arch-mov! c (p-reg p) (.reg t1) (p-size p))
+              (do
+                (allocate-spill-slot! c pl)
+                (arch-spill-reg! c
+                                 (.reg t1)
+                                 (ap-frame-off c pl (: 0 u32))
+                                 (p-size p))
+                (ap-set-modified! c pl (: 0 u32) false)))
+          (when (= count (: 2 u32))
+            (let [p1 (ap c pl (: 1 u32))]
+              (arch-spill-reg! c
+                               (.reg t2)
+                               (ap-frame-off c pl (: 1 u32))
+                               (p-size p1))
+              (ap-set-modified! c pl (: 1 u32) false))))
+        (for pi (range 0 (i64-of count))
+          (let [part (u32-of pi)
+                p (ap c pl part)
+                r (phis-alloc! c (mut t1) (p-bank p))]
+            (allocate-spill-slot! c pl)
+            (arch-load-from-stack! c
+                                   r
+                                   (+ slot (ap-part-off c pl part))
+                                   (p-size p)
+                                   false)
+            (arch-spill-reg! c r (ap-frame-off c pl part) (p-size p))
+            (ap-set-modified! c pl part false))))
+    (vr-reset! c (mut vr))))
+
+; ---- calls: argument and result plumbing ----
+
+;;; Move an argument part into its assigned register (or stack slot via the
+;;; architecture). Resets vp.
+(defn call-add-arg-part! [A] [(c (ptr (Compiler A)))
+                              (vp (mut ValuePart))
+                              (cca (mut CCAssignment))
+                              (arg-regs (mut u64))] (-> void)
+  (when (and (not (.byval cca)) (= (.bank cca) (: 255 u8)))
+    (set! (.bank cca) (vp-bank c (cast (ptr ValuePart) (mut vp))))
+    (set! (.size cca) (vp-size c (cast (ptr ValuePart) (mut vp)))))
+  (arch-assign-arg! c (mut cca))
+  (let [needs-ext (!= (.int-ext cca) (: 0 u8))
+        ext-sign (!= (& (.int-ext cca) (: 0x80 u8)) (: 0 u8))
+        ext-bits (cast u32 (& (.int-ext cca) (: 0x7F u8)))]
+    (cond (.byval cca)
+            (do
+              (arch-add-arg-byval! c (mut vp) (mut cca))
+              (vp-reset! c (mut vp)))
+          (= (.reg cca) (no-reg))
+            (do
+              (arch-add-arg-stack! c
+                                   (mut vp)
+                                   (mut cca)
+                                   needs-ext
+                                   ext-sign
+                                   ext-bits)
+              (vp-reset! c (mut vp)))
+          :else
+            (let [r (.reg cca)]
+              (if (vp-in-reg? c (cast (ptr ValuePart) (mut vp)) r)
+                  (do
+                    (if (vp-can-salvage? c (cast (ptr ValuePart) (mut vp)))
+                        (vp-salvage! c (mut vp))
+                        (evict-reg-for-arg! c r))
+                    (when needs-ext
+                      (arch-intext! c r r ext-sign ext-bits (: 64 u32))))
+                  (do
+                    (when (reg-used? c r) (evict-reg-for-arg! c r))
+                    (cond (vp-can-salvage? c (cast (ptr ValuePart) (mut vp)))
+                            (let [src (vp-salvage! c (mut vp))]
+                              (if needs-ext
+                                  (arch-intext! c
+                                                r
+                                                src
+                                                ext-sign
+                                                ext-bits
+                                                (: 64 u32))
+                                  (arch-mov! c r src (.size cca))))
+                          (and needs-ext (.is-const vp))
+                            (let [v (.c0 vp)
+                                  ext (ext-const v ext-bits ext-sign)]
+                              (arch-materialize-const! c
+                                                       ext
+                                                       (: 0 u64)
+                                                       (.bank cca)
+                                                       (: 8 u32)
+                                                       r))
+                          :else
+                            (do
+                              (vp-reload-into! c (mut vp) r (: 0 u32))
+                              (when needs-ext
+                                (arch-intext! c
+                                              r
+                                              r
+                                              ext-sign
+                                              ext-bits
+                                              (: 64 u32)))))))
+              (vp-reset! c (mut vp))
+              (mark-clobbered! c r)
+              (set! (.allocatable c)
+                    (& (.allocatable c) (^ (bit r) (: 0xFFFFFFFFFFFFFFFF u64))))
+              (set! arg-regs (| arg-regs (bit r)))))))
+
+(defn ext-const [(v u64) (bits u32) (signed bool)] (-> u64)
+  (if (>= bits (: 64 u32))
+      v
+      (let [sh (cast u64 (- (: 64 u32) bits))]
+        (if signed
+            (cast u64 (>> (cast i64 (<< v sh)) (cast i64 sh)))
+            (>> (<< v sh) sh)))))
+
+;;; Before the call instruction: evict caller-saved registers in use except the
+;;; argument registers (and `keep`).
+;;; Before a tail call: nothing runs after it in this function, so nothing is
+;;; evicted, and fixed registers keep their values for the blocks after it.
+(defn tail-call-prepare! [A] [(c (ptr (Compiler A)))] (-> void)
+  0)
+
+(defn call-evict-clobbered! [A] [(c (ptr (Compiler A))) (keep u64)] (-> void)
+  (set! (.generated-call c) true)
+  (let [clobbered (^ (arch-callee-saved c) (: 0xFFFFFFFFFFFFFFFF u64))
+        (mut m) (& (.used c) clobbered (^ keep (: 0xFFFFFFFFFFFFFFFF u64)))]
+    (while (!= m (: 0 u64))
+      (let [r (ctz64 m)]
+        (set! m (& m (- m (: 1 u64))))
+        (evict-reg! c r)
+        (mark-clobbered! c r)))))
+
+;;; After the call: let the argument registers be allocated again.
+(defn call-done! [A] [(c (ptr (Compiler A))) (arg-regs u64)] (-> void)
+  (set! (.allocatable c) (| (.allocatable c) arg-regs)))
+
+;;; Bind the next return part to vp (call results).
+(defn call-add-ret-part! [A] [(c (ptr (Compiler A)))
+                              (vp (mut ValuePart))
+                              (cca (mut CCAssignment))] (-> void)
+  (set! (.bank cca) (vp-bank c (cast (ptr ValuePart) (mut vp))))
+  (set! (.size cca) (vp-size c (cast (ptr ValuePart) (mut vp))))
+  (arch-assign-ret! c (mut cca))
+  (vp-set-value-reg! c (mut vp) (.reg cca)))
+
+;;; Move a return part into its register (function returns). Resets vp.
+(defn ret-add-part! [A] [(c (ptr (Compiler A)))
+                         (vp (mut ValuePart))
+                         (cca (mut CCAssignment))
+                         (ret-regs (mut u64))] (-> void)
+  (set! (.bank cca) (vp-bank c (cast (ptr ValuePart) (mut vp))))
+  (set! (.size cca) (vp-size c (cast (ptr ValuePart) (mut vp))))
+  (arch-assign-ret! c (mut cca))
+  (let [r (.reg cca)
+        needs-ext (!= (.int-ext cca) (: 0 u8))
+        ext-sign (!= (& (.int-ext cca) (: 0x80 u8)) (: 0 u8))
+        ext-bits (cast u32 (& (.int-ext cca) (: 0x7F u8)))]
+    (if (vp-in-reg? c (cast (ptr ValuePart) (mut vp)) r)
+        (do
+          (if (vp-can-salvage? c (cast (ptr ValuePart) (mut vp)))
+              (vp-salvage! c (mut vp))
+              (evict-reg! c r))
+          (when needs-ext (arch-intext! c r r ext-sign ext-bits (: 64 u32))))
+        (do
+          (when (reg-used? c r)
+            ; a fixed value in a leaf with tail calls: moved aside (term-end!)
+            (if (and (.leaf-tail-calls c) (reg-fixed? c r))
+                (evict-reg-for-arg! c r)
+                (evict-reg! c r)))
+          (if (vp-can-salvage? c (cast (ptr ValuePart) (mut vp)))
+              (let [src (vp-salvage! c (mut vp))]
+                (if needs-ext
+                    (arch-intext! c r src ext-sign ext-bits (: 64 u32))
+                    (arch-mov! c r src (.size cca))))
+              (do
+                (vp-reload-into! c (mut vp) r (: 0 u32))
+                (when needs-ext
+                  (arch-intext! c r r ext-sign ext-bits (: 64 u32)))))))
+    (vp-reset! c (mut vp))
+    (mark-clobbered! c r)
+    (set! (.allocatable c)
+          (& (.allocatable c) (^ (bit r) (: 0xFFFFFFFFFFFFFFFF u64))))
+    (set! ret-regs (| ret-regs (bit r)))))
+
+;;; Finish a return: epilogue, and forget the registers.
+(defn ret-finish! [A] [(c (ptr (Compiler A))) (ret-regs u64)] (-> void)
+  (set! (.allocatable c) (| (.allocatable c) ret-regs))
+  (arch-gen-epilog! c)
+  (release-regs-after-return! c))
+
+;;; Return a whole value (all parts in registers).
+(defn ret-value! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A))) (v u32)]
+  (-> u64)
+  (let [(mut vr) (val-ref! c v)
+        count
+          (if (vr-special? (cast (ptr ValueRef) (mut vr)))
+              (val-part-count (.ad c) v)
+              (vr-part-count c (cast (ptr ValueRef) (mut vr))))
+        (mut regs) (: 0 u64)]
+    (arch-cc-reset! c)
+    (for pi (range 0 (i64-of count))
+      (let [(mut vp) (vr-part c (cast (ptr ValueRef) (mut vr)) (u32-of pi))
+            (mut cca) (cca-new)]
+        (ret-add-part! c (mut vp) (mut cca) (mut regs))))
+    (vr-reset! c (mut vr))
+    regs))
+
+; ---- the per-function driver ----
+
+(defn check-block-end! [A] [(c (ptr (Compiler A)))] (-> void)
+  (let [(mut m) (.used c)]
+    (while (!= m (: 0 u64))
+      (let [r (ctz64 m)]
+        (set! m (& m (- m (: 1 u64))))
+        (let [local (reg-local c r)]
+          (when (= local (none))
+            (fatal "temporary register live across a block boundary"))
+          (let [p (ap c local (reg-part c r))]
+            (when (or (not (p-reg-valid? p)) (!= (p-reg p) r))
+              (fatal "register file out of sync"))
+            (when (and (reg-fixed? c r) (not (p-fixed? p)))
+              (fatal "locked register at block end (missing reset)"))))))))
+
+(defn compile-block! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                 (b u32)
+                                                 (bidx u32)] (-> bool)
+  (block :blk
+    (set! (.cur-block-idx c) bidx)
+    (label-place! c (get (.block-labels c) (i64-of bidx)))
+    (let [ad (.ad c)
+          n (block-inst-count ad b)]
+      (for i (range 0 (i64-of n))
+        (let [inst (block-inst ad b (u32-of i))]
+          (when (and (.debug c) (inst-marked? ad inst))
+            (debug-mark! c (i64-of inst)))
+          (when (not (inst-fused? ad inst))
+            (when (.debug c)
+              (let [l (inst-loc ad inst)]
+                (when (and (!= l (: 0 u64)) (!= l (.dbg-last-loc c)))
+                  (push! (mut (.dbg-rows c)) (cast u64 (text-off c)))
+                  (push! (mut (.dbg-rows c)) l)
+                  (set! (.dbg-last-loc c) l)
+                  (debug-sample! c))))
+            (when (not (compile-inst! ad c inst))
+              (eprintln "tpde: failed to compile instruction {}"
+                        (inst-name ad inst))
+              (return-from :blk false))
+            (arch-maybe-veneer! c)))))
+    (check-block-end! c)
+    (let [(mut e) (get (.delayed-free c) (i64-of bidx))]
+      (while (!= e (none))
+        (let [next (.next-delayed (va-at c e))]
+          (free-assignment! c e)
+          (set! e next))))
+    true))
+
+;;; Compile the function the adaptor's `func-at` index names. `sym` is its
+;;; symbol.
+(defn compile-func! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                (f u32)
+                                                (sym u32)] (-> bool)
+  (block
+    :fn
+      (let [ad (.ad c)]
+        (when (not (switch-func ad f)) (return-from :fn false))
+        (set! (.cur-func c) f)
+        (an/switch-func! (mut (.an c)) f)
+        (for i (range 0 5) (clear! (free-list c i)))
+        (clear! (mut (.dyn-free c)))
+        (set! (.frame-size c) (: 0 u32))
+        (set! (.has-dynamic-alloca c) (cur-has-dynamic-alloca? ad))
+        (set! (.is-leaf c) (not (cur-may-emit-calls? ad)))
+        (set! (.leaf-tail-calls c) (and (.is-leaf c) (cur-has-tail-calls? ad)))
+        (set! (.generated-call c) false)
+        (set! (.frame-used c) false)
+        (set! (.fixed-hint c) (no-reg))
+        (set! (.terminating c) false)
+        (clear! (mut (.dbg-rows c)))
+        (clear! (mut (.dbg-marks c)))
+        (clear! (mut (.dbg-allocas c)))
+        (set! (.dbg-last-loc c) (: 0 u64))
+        (clear! (mut (.dbg-locs c)))
+        (clear! (mut (.dbg-track-last c)))
+        (for _ (range 0 (len (.dbg-track c)))
+          (push! (mut (.dbg-track-last c)) (: 0 u64)))
+        (set! (.fixed-count-gp c) (: 0 u32))
+        (set! (.fixed-count-fp c) (: 0 u32))
+        (let [nvals (len (.liveness (.an c)))]
+          (when (< (len (.vas c)) nvals)
+            (extend-zeroed! (mut (.vas c)) (- nvals (len (.vas c)))))
+          (for i (range 0 (+ (i64-of (cur-highest-val-idx ad)) 1))
+            (set! (.flags (elem (mut (.vas c)) i)) (: 0 u8))))
+        (clear! (mut (.ext-parts c)))
+        (set! (.variable-ref-list c) (none))
+        (clear! (mut (.delayed-free c)))
+        (let [nb (len (.block-layout (.an c)))]
+          (for _ (range 0 nb) (push! (mut (.delayed-free c)) (none)))
+          (set! (.cur-block-idx c)
+                (an/block-idx (cast (ptr (Analyzer A)) (mut (.an c)))
+                              (cur-entry-block ad)))
+          (set! (.used c) (: 0 u64))
+          (set! (.clobbered c) (: 0 u64))
+          (for i (range 0 64) (set! (mut (.locks c)) i (: 0 u8)))
+          (set! (.generating-branch c) false)
+          (clear! (mut (.label-offs c)))
+          (clear! (mut (.fixups c)))
+          (clear! (mut (.block-labels c)))
+          (arch-start-func! c)
+          (for _ (range 0 nb) (push! (mut (.block-labels c)) (label-create! c))))
+        (set! (.allocatable c) (arch-allocatable c))
+        (arch-cc-reset! c)
+        (let [arg-regs (arch-arg-regs c)]
+          (set! (.allocatable c)
+                (& (.allocatable c) (^ arg-regs (: 0xFFFFFFFFFFFFFFFF u64))))
+          (arch-prologue-begin! c)
+          (set! (.cur-sym c) sym)
+          (set! (.body-label c) (label-create! c))
+          (label-place! c (.body-label c))
+          (for i (range 0 (i64-of (cur-arg-count ad)))
+            (prologue-assign-arg! c (u32-of i) (cur-arg ad (u32-of i))))
+          (arch-prologue-end! c)
+          (set! (.allocatable c) (| (.allocatable c) arg-regs)))
+        ; static allocas get stack slots
+        (for i (range 0 (i64-of (cur-static-alloca-count ad)))
+          (let [v (cur-static-alloca ad (u32-of i))
+                size (val-alloca-size ad v)
+                align (val-alloca-align ad v)
+                align2 (if (< align (: 1 u32)) (: 1 u32) align)
+                rounded
+                  (& (+ size (- align2 (: 1 u32)))
+                     (^ (- align2 (: 1 u32)) (: 0xFFFFFFFF u32)))
+                slot
+                  (allocate-stack-slot-aligned! c
+                                                (if (= rounded (: 0 u32))
+                                                    (: 1 u32)
+                                                    rounded)
+                                                align2)]
+            (push! (mut (.dbg-allocas c)) (cast i64 slot))
+            (init-stack-variable! c (val-local c v) slot)))
+        (when (not (begin-func! ad c f)) (return-from :fn false))
+        (let [nb (len (.block-layout (.an c)))]
+          (for i (range 0 nb)
+            (let [b (get (.block-layout (.an c)) i)]
+              (when (not (compile-block! c b (u32-of i)))
+                (eprintln "tpde: failed to compile block {} of {}"
+                          (block-name ad b)
+                          (func-link-name ad f))
+                (return-from :fn false)))))
+        ; variable refs are freed with the function
+        (let [(mut e) (.variable-ref-list c)]
+          (while (!= e (none))
+            (let [v (va-at c e)
+                  next (.next-delayed v)]
+              (set! (.flags v) (: 0 u8))
+              (set! e next))))
+        (arch-finish-func! c sym)
+        (resolve-fixups! c)
+        true)))
+
+;;; A slot for an alloca of `size` bytes aligned to `align` (≤ 16).
+(defn allocate-stack-slot-aligned! [A] [(c (ptr (Compiler A)))
+                                        (size u32)
+                                        (align u32)] (-> i32)
+  (if (> size (: 16 u32))
+      (allocate-stack-slot! c size)
+      ; small: round to a power of two at least the alignment
+      (let [(mut s) (: 1 u32)]
+        (while (< s size) (set! s (* s (: 2 u32))))
+        (while (< s align) (set! s (* s (: 2 u32))))
+        (allocate-stack-slot! c s))))
+
+(defn prologue-assign-arg! [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                                       (idx u32)
+                                                       (arg u32)] (-> void)
+  (let [ad (.ad c)
+        _ (set! (.fixed-hint c) (arg-reg-hint c idx arg))
+        (mut vr) (result-ref! c arg)
+        _ (set! (.fixed-hint c) (no-reg))]
+    (cond (cur-arg-byval? ad idx)
+            (let [(mut cca) (cca-new)]
+              (set! (.byval cca) true)
+              (set! (.align cca) (cur-arg-byval-align ad idx))
+              (set! (.size cca) (cur-arg-byval-size ad idx))
+              (arch-assign-arg! c (mut cca))
+              (let [(mut vp)
+                      (vr-part c (cast (ptr ValueRef) (mut vr)) (: 0 u32))]
+                (arch-prologue-assign-arg-part! c (mut vp) (mut cca))
+                (vp-reset! c (mut vp))))
+          (cur-arg-sret? ad idx)
+            (let [(mut cca) (cca-new)]
+              (set! (.sret cca) true)
+              (set! (.bank cca) (: 0 u8))
+              (set! (.size cca) (: 8 u32))
+              (arch-assign-arg! c (mut cca))
+              (let [(mut vp)
+                      (vr-part c (cast (ptr ValueRef) (mut vr)) (: 0 u32))]
+                (arch-prologue-assign-arg-part! c (mut vp) (mut cca))
+                (vp-reset! c (mut vp))))
+          :else
+            (let [count (vr-part-count c (cast (ptr ValueRef) (mut vr)))
+                  flags (cur-arg-flags ad idx)
+                  group (& (>> flags (: 16 u32)) (: 0xFF u32))]
+              (for pi (range 0 (i64-of count))
+                (let [(mut vp)
+                        (vr-part c (cast (ptr ValueRef) (mut vr)) (u32-of pi))
+                      (mut cca) (cca-new)
+                      remaining (+ (- (- count (u32-of pi)) (: 1 u32)) group)]
+                  (set! (.consecutive cca)
+                        (cast u8
+                              (if (> remaining (: 255 u32))
+                                  (: 255 u32)
+                                  remaining)))
+                  (set! (.bank cca) (vp-bank c (cast (ptr ValuePart) (mut vp))))
+                  (set! (.size cca) (vp-size c (cast (ptr ValuePart) (mut vp))))
+                  (set! (.align cca)
+                        (if (and (= pi 0) (> count (: 1 u32)))
+                            (* (.size cca) count)
+                            (.size cca)))
+                  (set! (.abi-size cca) (arg-flags-size flags))
+                  (set! (.mixed cca) (!= (& flags (: 0x1000 u32)) (: 0 u32)))
+                  (when (!= (& flags (: 0x80 u32)) (: 0 u32))
+                    (set! (.int-ext cca) (: 0x80 u8)))
+                  (arch-assign-arg! c (mut cca))
+                  (arch-prologue-assign-arg-part! c (mut vp) (mut cca))
+                  (vp-reset! c (mut vp))))))
+    (vr-reset! c (mut vr))))
+
+;;; In a leaf with tail calls, the register a single-part argument arrives in:
+;;; fixed there, a self tail call (a loop) needs no moves for it. The
+;;; assignment is worked out on a copy of the convention state.
+(defn arg-reg-hint [(A IRAdaptor IRCompiler)] [(c (ptr (Compiler A)))
+                                               (idx u32)
+                                               (arg u32)] (-> u8)
+  (let [ad (.ad c)]
+    (if (or (not (.leaf-tail-calls c))
+            (cur-arg-byval? ad idx)
+            (cur-arg-sret? ad idx)
+            (!= (val-part-count ad arg) (: 1 u32)))
+        (no-reg)
+        (let [saved (.cc c)
+              flags (cur-arg-flags ad idx)
+              group (& (>> flags (: 16 u32)) (: 0xFF u32))
+              (mut cca) (cca-new)]
+          (set! (.consecutive cca) (cast u8 group))
+          (set! (.bank cca) (val-part-bank ad arg (: 0 u32)))
+          (set! (.size cca) (val-part-size ad arg (: 0 u32)))
+          (set! (.align cca) (.size cca))
+          (set! (.abi-size cca) (arg-flags-size flags))
+          (set! (.mixed cca) (!= (& flags (: 0x1000 u32)) (: 0 u32)))
+          (arch-assign-arg! c (mut cca))
+          (set! (.cc c) saved)
+          (.reg cca)))))
+
+;;; Where value `v` is now: (1 << 56 | register), (2 << 56 | its frame
+;;; offset as a u32), or 0 (not computed yet, or dead).
+(defn debug-value-loc [(A IRAdaptor)] [(c (ptr (Compiler A))) (v u32)] (-> u64)
+  (let [local (val-local c v)]
+    (if (>= (i64-of local) (len (.vas c)))
+        (: 0 u64)
+        (let [va (va-at c local)]
+          (if (or (not (va-live? va))
+                  (va-var-ref? va)
+                  (!= (.part-count va) (: 1 u32)))
+              (: 0 u64)
+              (let [p (.p0 va)]
+                (cond (p-reg-valid? p)
+                        (| (<< (: 1 u64) (: 56 u64)) (cast u64 (p-reg p)))
+                      (and (!= (.frame-off va) (: 0 i32)) (p-stack-valid? p))
+                        (| (<< (: 2 u64) (: 56 u64))
+                           (cast u64 (cast u32 (.frame-off va))))
+                      :else (: 0 u64))))))))
+
+;;; At a row: note each tracked value whose location changed.
+(defn debug-sample! [(A IRAdaptor)] [(c (ptr (Compiler A)))] (-> void)
+  (for k (range 0 (len (.dbg-track c)))
+    (let [l (debug-value-loc c (get (.dbg-track c) k))]
+      (when (!= l (get (.dbg-track-last c) k))
+        (set! (mut (.dbg-track-last c)) k l)
+        (push! (mut (.dbg-locs c)) (cast u64 k))
+        (push! (mut (.dbg-locs c)) (cast u64 (text-off c)))
+        (push! (mut (.dbg-locs c)) l)))))
+
+;;; Record mark `id` (a marked instruction) at the current code offset.
+(defn debug-mark! [A] [(c (ptr (Compiler A))) (id i64)] (-> void)
+  (push! (mut (.dbg-marks c)) (cast u64 id))
+  (push! (mut (.dbg-marks c)) (cast u64 (text-off c))))
+
+;;; Code from `at` moved down by `n` bytes (the prologue's unused space was
+;;; cut): so do the debug rows and marks after it.
+(defn debug-shift! [A] [(c (ptr (Compiler A))) (at u32) (n u32)] (-> void)
+  (let [at64 (cast u64 at)
+        n64 (cast u64 n)]
+    (for i (range 0 (/ (len (.dbg-rows c)) 2))
+      (let [o (get (.dbg-rows c) (* i 2))]
+        (when (>= o at64) (set! (mut (.dbg-rows c)) (* i 2) (- o n64)))))
+    (for i (range 0 (/ (len (.dbg-marks c)) 2))
+      (let [o (get (.dbg-marks c) (+ (* i 2) 1))]
+        (when (>= o at64) (set! (mut (.dbg-marks c)) (+ (* i 2) 1) (- o n64)))))
+    (for i (range 0 (/ (len (.dbg-locs c)) 3))
+      (let [o (get (.dbg-locs c) (+ (* i 3) 1))]
+        (when (>= o at64) (set! (mut (.dbg-locs c)) (+ (* i 3) 1) (- o n64)))))))
+
+(defn resolve-fixups! [A] [(c (ptr (Compiler A)))] (-> void)
+  (for i (range 0 (len (.fixups c)))
+    (let [fx (get (.fixups c) i)
+          target (label-offset c (.label fx))]
+      (when (= target (none)) (fatal "branch to an unplaced label"))
+      (arch-apply-fixup! c (.off fx) target (.kind fx))))
+  (clear! (mut (.fixups c))))
+
+; ============================ architecture hooks ============================
+
+(defn arch-spill-reg! [A] [(c (ptr (Compiler A))) (r u8) (off i32) (size u32)]
+  (-> void)
+  (if (x64? c) (x64/spill-reg! c r off size) (a64/spill-reg! c r off size)))
+
+(defn arch-load-from-stack! [A] [(c (ptr (Compiler A)))
+                                 (r u8)
+                                 (off i32)
+                                 (size u32)
+                                 (sext bool)] (-> void)
+  (if (x64? c)
+      (x64/load-from-stack! c r off size sext)
+      (a64/load-from-stack! c r off size sext)))
+
+(defn arch-load-stack-var-addr! [A] [(c (ptr (Compiler A))) (r u8) (off i32)]
+  (-> void)
+  (if (x64? c)
+      (x64/load-stack-var-addr! c r off)
+      (a64/load-stack-var-addr! c r off)))
+
+(defn arch-load-sym-addr! [A] [(c (ptr (Compiler A)))
+                               (r u8)
+                               (sym u32)
+                               (addend i64)] (-> void)
+  (if (x64? c)
+      (x64/load-sym-addr! c r sym addend)
+      (a64/load-sym-addr! c r sym addend)))
+
+(defn arch-mov! [A] [(c (ptr (Compiler A))) (dst u8) (src u8) (size u32)]
+  (-> void)
+  (if (x64? c) (x64/mov! c dst src size) (a64/mov! c dst src size)))
+
+(defn arch-materialize-const! [A] [(c (ptr (Compiler A)))
+                                   (c0 u64)
+                                   (c1 u64)
+                                   (bank u8)
+                                   (size u32)
+                                   (dst u8)] (-> void)
+  (if (x64? c)
+      (x64/materialize-const! c c0 c1 bank size dst)
+      (a64/materialize-const! c c0 c1 bank size dst)))
+
+(defn arch-intext! [A] [(c (ptr (Compiler A)))
+                        (dst u8)
+                        (src u8)
+                        (sign bool)
+                        (from u32)
+                        (to u32)] (-> void)
+  (if (x64? c)
+      (x64/intext! c dst src sign from to)
+      (a64/intext! c dst src sign from to)))
+
+(defn arch-raw-jump! [A] [(c (ptr (Compiler A))) (j Jump) (label u32)] (-> void)
+  (if (x64? c) (x64/raw-jump! c j label) (a64/raw-jump! c j label)))
+
+(defn arch-invert-jump [A] [(c (ptr (Compiler A))) (j Jump)] (-> Jump)
+  (if (x64? c) (x64/invert-jump j) (a64/invert-jump j)))
+
+(defn arch-fixed-ok? [A] [(c (ptr (Compiler A))) (r u8)] (-> bool)
+  ; x86-64: rax, rcx and rdx are instructions' fixed operands (TPDE's mask)
+  (if (x64? c) (> r (: 2 u8)) true))
+
+(defn arch-select-fixed-reg [A] [(c (ptr (Compiler A))) (bank u8) (size u32)]
+  (-> u8)
+  (if (x64? c)
+      (x64/select-fixed-reg c bank size)
+      (a64/select-fixed-reg c bank size)))
+
+(defn fixed-limit [A] [(c (ptr (Compiler A))) (bank u8)] (-> u32)
+  (if (= bank (: 0 u8)) (: 5 u32) (: 6 u32)))
+
+(defn arch-callee-saved [A] [(c (ptr (Compiler A)))] (-> u64)
+  (if (x64? c) (x64/callee-saved) (a64/callee-saved)))
+
+(defn arch-allocatable [A] [(c (ptr (Compiler A)))] (-> u64)
+  (if (x64? c) (x64/allocatable) (a64/allocatable)))
+
+(defn arch-arg-regs [A] [(c (ptr (Compiler A)))] (-> u64)
+  (if (x64? c) (x64/arg-regs) (a64/arg-regs)))
+
+(defn arch-cc-reset! [A] [(c (ptr (Compiler A)))] (-> void)
+  (set! (.cc c) (cc-new true)))
+
+(defn arch-assign-arg! [A] [(c (ptr (Compiler A))) (cca (mut CCAssignment))]
+  (-> void)
+  (if (x64? c)
+      (x64/assign-arg! (cast (ptr CCState) (mut (.cc c))) (mut cca))
+      (a64/assign-arg! (cast (ptr CCState) (mut (.cc c))) (mut cca))))
+
+(defn arch-assign-ret! [A] [(c (ptr (Compiler A))) (cca (mut CCAssignment))]
+  (-> void)
+  (if (x64? c)
+      (x64/assign-ret! (cast (ptr CCState) (mut (.cc c))) (mut cca))
+      (a64/assign-ret! (cast (ptr CCState) (mut (.cc c))) (mut cca))))
+
+(defn arch-add-arg-byval! [A] [(c (ptr (Compiler A)))
+                               (vp (mut ValuePart))
+                               (cca (mut CCAssignment))] (-> void)
+  (if (x64? c)
+      (x64/add-arg-byval! c (mut vp) (mut cca))
+      (a64/add-arg-byval! c (mut vp) (mut cca))))
+
+(defn arch-add-arg-stack! [A] [(c (ptr (Compiler A)))
+                               (vp (mut ValuePart))
+                               (cca (mut CCAssignment))
+                               (ext bool)
+                               (sign bool)
+                               (bits u32)] (-> void)
+  (if (x64? c)
+      (x64/add-arg-stack! c (mut vp) (mut cca) ext sign bits)
+      (a64/add-arg-stack! c (mut vp) (mut cca) ext sign bits)))
+
+(defn arch-gen-epilog! [A] [(c (ptr (Compiler A)))] (-> void)
+  (if (x64? c) (x64/gen-epilog! c) (a64/gen-epilog! c)))
+
+(defn arch-start-func! [A] [(c (ptr (Compiler A)))] (-> void)
+  (if (x64? c) (x64/start-func! c) (a64/start-func! c)))
+
+(defn arch-prologue-begin! [(A IRAdaptor)] [(c (ptr (Compiler A)))] (-> void)
+  (if (x64? c) (x64/prologue-begin! c) (a64/prologue-begin! c)))
+
+(defn arch-prologue-end! [(A IRAdaptor)] [(c (ptr (Compiler A)))] (-> void)
+  (if (x64? c) (x64/prologue-end! c) (a64/prologue-end! c)))
+
+(defn arch-prologue-assign-arg-part! [A] [(c (ptr (Compiler A)))
+                                          (vp (mut ValuePart))
+                                          (cca (mut CCAssignment))] (-> void)
+  (if (x64? c)
+      (x64/prologue-assign-arg-part! c (mut vp) (mut cca))
+      (a64/prologue-assign-arg-part! c (mut vp) (mut cca))))
+
+(defn arch-finish-func! [A] [(c (ptr (Compiler A))) (sym u32)] (-> void)
+  (if (x64? c) (x64/finish-func! c sym) (a64/finish-func! c sym)))
+
+(defn arch-maybe-veneer! [A] [(c (ptr (Compiler A)))] (-> void)
+  (if (x64? c) (x64/maybe-veneer! c) (a64/maybe-veneer! c)))
+
+(defn arch-apply-fixup! [A] [(c (ptr (Compiler A)))
+                             (off u32)
+                             (target u32)
+                             (kind u8)] (-> void)
+  (if (x64? c)
+      (x64/apply-fixup! c off target kind)
+      (a64/apply-fixup! c off target kind)))
+
+(defn arch-switch-cmpeq! [A] [(c (ptr (Compiler A)))
+                              (label u32)
+                              (cmp u8)
+                              (tmp u8)
+                              (v u64)
+                              (is32 bool)] (-> void)
+  (if (x64? c)
+      (x64/switch-cmpeq! c label cmp tmp v is32)
+      (a64/switch-cmpeq! c label cmp tmp v is32)))
+
+(defn arch-switch-binary-step! [A] [(c (ptr (Compiler A)))
+                                    (label u32)
+                                    (gt u32)
+                                    (cmp u8)
+                                    (tmp u8)
+                                    (v u64)
+                                    (is32 bool)] (-> void)
+  (if (x64? c)
+      (x64/switch-binary-step! c label gt cmp tmp v is32)
+      (a64/switch-binary-step! c label gt cmp tmp v is32)))
+
+(defn arch-switch-jump-table! [A] [(c (ptr (Compiler A)))
+                                   (default u32)
+                                   (cmp u8)
+                                   (tmp u8)
+                                   (lo u64)
+                                   (hi u64)
+                                   (is32 bool)] (-> u32)
+  (if (x64? c)
+      (x64/switch-jump-table! c default cmp tmp lo hi is32)
+      (a64/switch-jump-table! c default cmp tmp lo hi is32)))

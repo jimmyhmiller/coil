@@ -69,7 +69,7 @@ debugger can read without slowing the program:
 Cost, against `-g0`: none on most benchmarks; about 15% on call-heavy code
 with many parameters (`prop_bench`, still 0.84× LLVM -O0's run time).
 Compile time: debug info is encoded on its own thread, and tpde stays ≥10×
-faster than LLVM -O0 (`../coil-tpde/docs/BENCH.md`).
+faster than LLVM -O0 (`src/compiler/tpde/docs/BENCH.md`).
 
 ## Relocations (the part that makes `dsymutil` work)
 
