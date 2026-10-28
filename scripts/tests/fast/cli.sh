@@ -1428,6 +1428,62 @@ EOF
 EOF
   expect_rc_out 1 "export-c defines C symbol 'callback_c'" "an extern colliding with a struct-by-value export is explained" \
     "$COIL" check "$T/collide.coil"
+
+  # A header for what C can say about a program's types, compiled as C and as
+  # C++: function-pointer declarators, an aligned struct, a struct reached only
+  # through a pointer field, a private sum behind a pointer (an opaque tag), two
+  # modules' structs of one name, and names that are C or C++ keywords.
+  mkdir -p "$T/hdr2"
+  printf '(module a)\n(export Thing)\n(defstruct Thing [(x i64)])\n' > "$T/hdr2/a.coil"
+  printf '(module b)\n(export Thing)\n(defstruct Thing [(y i64)])\n' > "$T/hdr2/b.coil"
+  cat > "$T/hdr2/main.coil" <<'EOF'
+(module app)
+(import "coil.cc" :as cc)
+(import "coil.layout" :as l)
+(import "a" :as a)
+(import "b" :as b)
+(defstruct Child [(x i64)])
+(defsum Hidden (Empty) (Value [(n i64)]))
+(defstruct Parent [(child (ptr Child)) (hidden (ptr Hidden)) (callback (fnptr (cc/C) [i64] i64))])
+(defstruct Box :layout (l/Align 16) [(x i8)])
+(defstruct class [(switch i64)])
+(defn pick [(f (fnptr (cc/C) [i64] i64))] (-> (fnptr (cc/C) [i64] i64)) f)
+(defn call-parent [(p Parent)] (-> i64) (let [f (.callback p)] (f 21)))
+(defn hidden [(p (ptr Hidden))] (-> (ptr Hidden)) p)
+(defn box-align [(p (ptr Box))] (-> i64) (alignof Box))
+(defn klass [(p (ptr class))] (-> i64) (.switch p))
+(defn first [(p (ptr a/Thing))] (-> i64) (.x p))
+(defn second [(p (ptr b/Thing))] (-> i64) (.y p))
+(export-c pick [call-parent :as "call_parent"] hidden [box-align :as "box_align"] klass first second)
+EOF
+  cat > "$T/hdr2/use.c" <<'EOF'
+#include "main.h"
+static int64_t twice(int64_t n) { return n * 2; }
+int main(void) {
+    Parent p = { 0, 0, twice };
+    class_ k = { .switch_ = 5 };
+    a_Thing at = { .x = 1 };
+    b_Thing bt = { .y = 2 };
+    return (pick(twice)(1) == 2 && call_parent(p) == 42 && hidden((Hidden *)0) == (Hidden *)0
+            && box_align((Box *)0) == _Alignof(Box) && sizeof(Box) == 16
+            && klass(&k) == 5 && first(&at) == 1 && second(&bt) == 2) ? 0 : 1;
+}
+EOF
+  out=$(cd "$T/hdr2" && "$COIL" cheader main.coil -o main.h 2>&1); rc=$?
+  if [ "$rc" = 0 ] && [ -f "$T/hdr2/main.h" ]; then
+    expect_rc 0 "cheader's header compiles as C" cc -x c -fsyntax-only -Wno-pragma-once-outside-header "$T/hdr2/main.h"
+    expect_rc 0 "cheader's header compiles as C++" c++ -x c++ -fsyntax-only -Wno-pragma-once-outside-header "$T/hdr2/main.h"
+    if (cd "$T/hdr2" && "$COIL" emit-obj main.coil -o main.o >/dev/null 2>&1 && cc use.c main.o -o use 2>/dev/null); then
+      expect_rc 0 "a C program agrees with the header on every type's layout" "$T/hdr2/use"
+    else
+      bad "a C program agrees with the header on every type's layout" "emit-obj or cc failed"
+    fi
+  else
+    bad "cheader describes pointers, alignment, sums, namesakes and keywords" "exit $rc: $out"
+  fi
+  expect_rc_out 1 "cannot write" "cheader fails when its output cannot be written" \
+    bash -c 'cd "$1/hdr2" && "$2" cheader main.coil -o missing/main.h' _ "$T" "$COIL"
+  [ ! -e "$T/hdr2/missing" ] && ok "...and writes nothing" || bad "...and writes nothing" "missing/ exists"
 }
 
 # ---------------------------------------------------------------------------

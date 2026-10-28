@@ -279,7 +279,17 @@ The export manifest is exactly the information a C header needs, so:
   - a `typedef struct { … } Point;` for each `:c` struct/array reachable from an
     exported signature, at its real field layout (Coil already knows it — `LAYOUT.md`);
   - a prototype per exported function, with the C symbol and the C types, in the same
-    order Coil lowers them.
+    order Coil lowers them;
+  - a struct reached only through a pointer, a sum or an `:explicit`/`:bits` struct, as
+    an opaque `typedef struct T T;`: a pointer to it is all C needs, and C cannot
+    describe its storage;
+  - an aligned struct with `__attribute__((__aligned__(N)))`, and function pointers as
+    C declarators (`int64_t (*f)(int64_t)`).
+- Names are C identifiers that compile as C and as C++: a type or field named like a
+  C or C++ keyword gets a trailing `_` (`class` → `class_`), and two types sharing a
+  name (`a.Thing`, `b.Thing`) are spelled from their qualified names (`a_Thing`). A
+  name with no C spelling, or an exported symbol that is not a C identifier, is an
+  error rather than a header that does not compile.
 - This is the inverse of `coil cimport` (which reads a C header → Coil `extern`s): here
   Coil *writes* the header. Round-tripping `cimport`(`cheader`(lib)) should reproduce
   the signatures.
