@@ -250,6 +250,10 @@ section_usage() {
     "$COIL" build "$T/seven.coil" --target wasm32-wasi -o "$T/wasi.wasm"
   expect_rc 0 "--target wasm32 alone builds a WebAssembly module" \
     "$COIL" build "$T/seven.coil" --target wasm32 -o "$T/bare.wasm"
+  mkdir -p "$T/locked" && chmod 555 "$T/locked"
+  expect_rc_out 1 "cannot write .*locked/" "a WebAssembly module that cannot be written is an error naming it" \
+    "$COIL" build "$T/seven.coil" --target wasm32 -o "$T/locked/bare.wasm"
+  chmod 755 "$T/locked"
 
   # Flags are position-independent: Unix order, and flags before the file.
   rm -f "$T/a" "$T/a.o"
