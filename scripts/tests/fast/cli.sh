@@ -1571,6 +1571,23 @@ section_debuginfo() {
   done
   "$COIL" build "$T/dbgv.coil" --backend tpde -g0 -o "$T/dbgv" >/dev/null 2>&1
   [ ! -d "$T/dbgv.dSYM" ] && ok "-g0 turns the default debug info off" || bad "-g0 turns the default debug info off" "$T/dbgv.dSYM exists"
+
+  # A library macro's output is located at its template whether the macro runs
+  # from a compile-time unit or from source: the line tables agree row for row.
+  local dwarfdump units lines0 lines1
+  dwarfdump=$("${LLVM_CONFIG:-llvm-config}" --bindir)/llvm-dwarfdump
+  for units in 0 1; do
+    COIL_CT_UNITS=$units "$COIL" emit-obj "$ROOT/src/examples/references.coil" --backend tpde -g \
+      -o "$T/units$units.o" >/dev/null 2>&1
+  done
+  lines0=$("$dwarfdump" --debug-line "$T/units0.o" 2>/dev/null | grep '^0x')
+  lines1=$("$dwarfdump" --debug-line "$T/units1.o" 2>/dev/null | grep '^0x')
+  if [ -n "$lines0" ] && [ "$lines0" = "$lines1" ]; then
+    ok "compile-time units keep a library macro's template lines"
+  else
+    bad "compile-time units keep a library macro's template lines" \
+      "$(diff <(printf '%s\n' "$lines0") <(printf '%s\n' "$lines1") | head -8)"
+  fi
 }
 
 # ---------------------------------------------------------------------------
