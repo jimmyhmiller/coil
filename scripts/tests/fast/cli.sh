@@ -435,6 +435,16 @@ EOF
   printf '(module bad-rename)\n(import "coil.io" :use [println] :rename [println out])\n(defn main [] (-> i64) 0)\n' > "$T/bad-rename.coil"
   expect_rc_out 1 "import: :rename expects \\[\\[from to\\] …\\] — each entry is a two-symbol vector" \
     "check: a malformed :rename is a located error" "$COIL" check "$T/bad-rename.coil"
+  # A definition inside an expression means an earlier form lost its `)`, and the
+  # error says so at the swallowed definition; `def` and `defannotation` once
+  # read as calls of undefined functions.
+  printf '(module swallowed)\n(defn main [] (-> i64)\n  (+ 1 2)\n  (def answer 42)\n  0)\n' > "$T/swallowed.coil"
+  expect_rc_out 1 "'def answer' is a top-level definition, but it appears inside an expression" \
+    "check: a definition swallowed by a missing ) is reported as one" "$COIL" check "$T/swallowed.coil"
+  # A backend name is one of the backends, never a typo that builds with LLVM.
+  printf '(module backend-typo)\n(defn main [] (-> i64) 0)\n' > "$T/backend-typo.coil"
+  expect_rc_out 1 "unknown backend 'arm46': expected llvm, arm64, x64, wasm or tpde" \
+    "build: an unknown --backend is an error" "$COIL" build "$T/backend-typo.coil" -o "$T/backend-typo" --backend arm46
   # `(make-dyn Trait p)` names a trait in scope, not any trait of that last name.
   mkdir -p "$T/dyn-scope"
   printf '(module dynshapes)\n(export Show show)\n(deftrait Show [Self] (show [(a (ptr Self))] (-> i64)))\n' > "$T/dyn-scope/dynshapes.coil"
