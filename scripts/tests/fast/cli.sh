@@ -1132,6 +1132,19 @@ EOF
     elif [ "$rc" != 0 ]; then
       bad "--backend x64 cross build with comptime runs under Rosetta" "exit $rc: $out"
     fi
+    # The macOS version a --target names is the executable's deployment minimum.
+    out=$("$COIL" build "$T/seven.coil" -o "$T/seven13" --target arm64-apple-macosx13.0.0 2>&1); rc=$?
+    kind=$(vtool -show-build "$T/seven13" 2>&1)
+    case "$kind" in
+      *"minos 13.0"*) [ "$rc" = 0 ] && ok "--target arm64-apple-macosx13.0.0 links an executable for macOS 13.0" \
+                                    || bad "--target arm64-apple-macosx13.0.0 links an executable for macOS 13.0" "exit $rc: $out" ;;
+      *) bad "--target arm64-apple-macosx13.0.0 links an executable for macOS 13.0" "exit $rc: $out / $kind" ;;
+    esac
+    # This host's linker makes no Linux executable: said before compiling, not
+    # discovered by ld on the object afterwards.
+    expect_rc_out 1 "cannot link a x86_64-unknown-linux-gnu executable on this macOS host" \
+      "a Linux executable is refused on a macOS host, naming what can be built" \
+      "$COIL" build "$T/xseven.coil" -o "$T/xseven-linux" --target x86_64-unknown-linux-gnu
     # Apple's ar drops an ELF member with a warning and exits 0; a Linux --lib
     # archive is written by llvm-ar and holds the object.
     out=$("$COIL" build "$T/xseven.coil" --lib -o "$T/xseven.a" --target x86_64-unknown-linux-gnu 2>&1); rc=$?
