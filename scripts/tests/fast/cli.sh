@@ -732,6 +732,21 @@ open(sys.argv[1], "w").write(
     *"(mut h)"*) expect_rc 0 "lint --fix keeps a stack cell's element type in the local" "$COIL" run "$T/cell.coil" ;;
     *) bad "lint --fix keeps a stack cell's element type in the local" "not rewritten: $(cat "$T/cell.coil")" ;;
   esac
+  # A comment the rewrite cannot place inside the new form goes after it on its
+  # own line, ahead of the closers that follow the form on its last line.
+  printf '%s' '(module lint-cell-comment)
+(import "coil.primitive" :as primitive)
+(defn main [] (-> i64)
+  (let [out (primitive/alloc-stack i64)]
+    (primitive/store! out 7)
+    ; the result
+    (primitive/load out)))
+' > "$T/cell-comment.coil"
+  "$COIL" lint "$T/cell-comment.coil" --fix >/dev/null 2>&1
+  case "$(cat "$T/cell-comment.coil")" in
+    *"(mut out)"*"; the result"*) expect_rc 7 "lint --fix keeps a carried comment off the closers after it" "$COIL" run "$T/cell-comment.coil" ;;
+    *) bad "lint --fix keeps a carried comment off the closers after it" "not rewritten: $(cat "$T/cell-comment.coil")" ;;
+  esac
   # A cast of a literal its type holds is an ascription, or the literal itself (in
   # the author's spelling) for the literal's own type; a cast that truncates stays.
   printf '%s' '(module lint-literal-cast-probe)
@@ -986,6 +1001,33 @@ EOF
     *'+(import "coil.str" :as str)'*'+  (if (str/starts-with "hello" "he") 0 1))'*)
       ok "import-aliases qualifies a wildcard import's references" ;;
     *) bad "import-aliases qualifies a wildcard import's references" "exit $rc: $diff_out" ;;
+  esac
+  # `(total [x 2])` reads as type arguments or an array value until resolution
+  # chooses; its head is a call either way, so the source view binds it.
+  mkdir -p "$T/bracket-call/b"
+  printf '[package]\nname = "b"\nentry = "b/main.coil"\nsource-roots = ["."]\n' > "$T/bracket-call/Coil.toml"
+  printf '(module b.h)\n(defn total [(v (array i64 2))] (-> i64) (+ (get v 0) (get v 1)))\n' > "$T/bracket-call/b/h.coil"
+  printf '(module b.main)\n(import "b.h" :use *)\n(defn main [] (-> i64) (let [x 1] (total [x 2])))\n' > "$T/bracket-call/b/main.coil"
+  diff_out=$(cd "$T/bracket-call" && "$COIL" lint b/main.coil --use coil.lint.import-aliases --diff 2>&1); rc=$?
+  case "$diff_out" in
+    *'+(import "b.h" :as h)'*'(h/total [x 2])'*) ok "import-aliases qualifies a call whose first argument is an array naming a local" ;;
+    *) bad "import-aliases qualifies a call whose first argument is an array naming a local" "exit $rc: $diff_out" ;;
+  esac
+  # A store through a pointer a field holds is not an assignment to the field.
+  printf '%s' '(module store-through-field)
+(import "coil.primitive" :as primitive)
+(defstruct Box [(slot (ptr i64))])
+(defn main [] (-> i64)
+  (let [cell (primitive/alloc-static i64)
+        b (Box :slot cell)]
+    (primitive/store! (.slot b) 7)
+    (primitive/load cell)))
+' > "$T/store-field.coil"
+  diff_out=$("$COIL" lint "$T/store-field.coil" --diff 2>&1); rc=$?
+  case "$diff_out" in
+    *"(set! (.slot b) 7)"*|*"did not compile"*) bad "lint does not turn a store through a field's pointer into a field assignment" "exit $rc: $diff_out" ;;
+    *) [ "$rc" = 0 ] && ok "lint does not turn a store through a field's pointer into a field assignment" \
+         || bad "lint does not turn a store through a field's pointer into a field assignment" "exit $rc: $diff_out" ;;
   esac
   local out
   # coil.core's typed target-arch is no legacy spelling for the preflight to rewrite
