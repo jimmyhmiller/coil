@@ -281,6 +281,10 @@ section_usage() {
     "$COIL" build "$T/seven.coil" --target wasm32-wasi -o "$T/wasi.wasm"
   expect_rc 0 "--target wasm32 alone builds a WebAssembly module" \
     "$COIL" build "$T/seven.coil" --target wasm32 -o "$T/bare.wasm"
+  mkdir -p "$T/locked" && chmod 555 "$T/locked"
+  expect_rc_out 1 "cannot write .*locked/" "a WebAssembly module that cannot be written is an error naming it" \
+    "$COIL" build "$T/seven.coil" --target wasm32 -o "$T/locked/bare.wasm"
+  chmod 755 "$T/locked"
 
   # Flags are position-independent: Unix order, and flags before the file.
   rm -f "$T/a" "$T/a.o"
@@ -590,6 +594,12 @@ EOF
     case "$out" in *"$want"*) ok "expand prints $want" ;; *) bad "expand prints $want" "$out" ;; esac
   done
   expect_rc 97 "a def of #\\a or true is a value" "$COIL" run "$T/expand.coil"
+  # `(def NAME TARGET)` aliases a primitive; one naming anything else is an
+  # error at the def, not "unbound variable" at a use (or nothing at all).
+  printf '(module alias-probe)\n(defn foo [] (-> i64) 3)\n(def w nope)\n(def v foo)\n(defn main [] (-> i64) 0)\n' > "$T/alias.coil"
+  expect_rc_out 1 "alias.coil:3:1" "a def alias naming nothing is reported at the def" "$COIL" check "$T/alias.coil"
+  printf '(module alias-probe)\n(defn foo [] (-> i64) 3)\n(def v foo)\n(defn main [] (-> i64) (v))\n' > "$T/alias2.coil"
+  expect_rc_out 1 "def: 'foo' names no primitive operation" "a def alias naming a function says to use defalias" "$COIL" check "$T/alias2.coil"
   printf '(defn* f [()] (-> i64) 1)\n(deftrait T [Self] (m [()] (-> i64)))\n(defn main [] (-> i64) 1)\n' > "$T/empty-param.coil"
   expect_rc_out 1 'parameter must be \(name :type\): `\(\)` names nothing' "an empty () parameter is a located error, not a crash" \
     "$COIL" check "$T/empty-param.coil"
@@ -840,6 +850,26 @@ open(sys.argv[1], "w").write(
   case "$(cat "$T/cell-comment.coil")" in
     *"(mut out)"*"; the result"*) expect_rc 7 "lint --fix keeps a carried comment off the closers after it" "$COIL" run "$T/cell-comment.coil" ;;
     *) bad "lint --fix keeps a carried comment off the closers after it" "not rewritten: $(cat "$T/cell-comment.coil")" ;;
+  esac
+  # A comment after a node on its line is about that node: it stays after the
+  # node's rewrite, in its own branch, not in front of the next node kept.
+  printf '%s' '(module lint-trailing)
+(import "coil.primitive" :as primitive)
+(defn pick [(c bool)] (-> i64)
+  (let [out (primitive/alloc-stack i64)]
+    (if c
+        (primitive/store! out 1)  ; the true branch
+        (primitive/store! out 2))  ; the false branch
+    (primitive/load out)))
+(defn main [] (-> i64) (+ (pick true) (* 10 (pick false))))
+' > "$T/trailing.coil"
+  "$COIL" lint "$T/trailing.coil" --fix >/dev/null 2>&1
+  local trailing
+  trailing=$(cat "$T/trailing.coil")
+  case "$trailing" in
+    *"(mut out)"*"1)  ; the true branch"*"2))  ; the false branch"*)
+      expect_rc 21 "lint --fix keeps a trailing comment after the node it trails" "$COIL" run "$T/trailing.coil" ;;
+    *) bad "lint --fix keeps a trailing comment after the node it trails" "$trailing" ;;
   esac
   # A cast of a literal its type holds is an ascription, or the literal itself (in
   # the author's spelling) for the literal's own type; a cast that truncates stays.
@@ -1584,6 +1614,8 @@ macro COIL_HALF — a double expression, not an integer constant
 (defstruct coil_uninspectable :layout (coil.layout.Explicit)
 (const COIL_MOST_NEGATIVE -9223372036854775808)
 (const COIL_INT64_MIN -9223372036854775808)
+(const COIL_ONCE_A_SENTINEL -9999999999)
+(const COIL_WIDE_NEGATIVE -9999999999)
 (extern coil_get_constant :cc (coil.cc.C) [] (-> i32))
 (extern coil_use_area :cc (coil.cc.C) [(ptr coil_restricted_area)] (-> void))
 EOF
