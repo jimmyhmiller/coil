@@ -2,10 +2,11 @@
 
 A third backend for the **self-hosted** Coil compiler (`src/compiler/`), written
 in Coil, that lowers the monomorphized `Program` directly to x86-64 machine code
-in an **ELF** object — no LLVM anywhere in the path. It is the Linux sibling of
-the arm64 backend (`docs/reference/ARM64_BACKEND.md`), and everything that document says
-about *why* (debug backend, DWARF always on, compile speed over code quality)
-applies here unchanged.
+in an **ELF** object — no LLVM anywhere in the path. It is a debug backend: DWARF
+always on, compile speed over code quality. It was written as the Linux sibling of
+a slot-per-value arm64 emitter that tpde has since replaced
+(`docs/reference/ARM64_BACKEND.md`); it stays the native Linux backend until tpde
+writes ELF.
 
 ## Files
 - `src/compiler/object/x64.coil` — x86-64 instruction encoder. Pure: composes REX /
@@ -18,8 +19,7 @@ applies here unchanged.
   register and slot bias are now parameters (`fbreg`/`fbbias`) rather than
   hardcoded to x29.
 - `src/compiler/backend/codegen_x64.coil` — the lowering: mono `Program` → code + data +
-  relocs + DWARF. Mirrors `codegen_a64.coil` function for function, so the two
-  can be diffed against each other.
+  relocs + DWARF. It mirrored the deleted arm64 emitter function for function.
 - `src/compiler/main_x64.coil` — the LLVM-free entry point (the `main_a64.coil`
   equivalent): omits `codegen.coil`/`normalize.coil` entirely.
 - `src/compiler/selftest/x64_selftest.coil` — the encoder's verification harness.

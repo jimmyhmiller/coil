@@ -157,7 +157,7 @@ custom symbol like `start`) keeps *everything* external. That works but is blunt
 
 `extern` lets Coil **import** a C symbol. This feature is the mirror: **export** a Coil
 function *as* a C symbol, with the same ABI rigor Coil already applies to `extern` and
-struct-by-value (the ABI classifier in `codegen.coil` / `codegen_a64.coil`).
+struct-by-value (the ABI classifier in `codegen.coil` / `native_module.coil`).
 
 ## The core rule (linkage)
 

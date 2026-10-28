@@ -1,0 +1,1530 @@
+; src/compiler/backend/native_module.coil — the native module layer: what the
+; tpde backend (codegen_tpde.coil) compiles functions into. Signatures, layouts and
+; their natural C offsets (compile-time readback walks them), statics and their
+; initializers, export-c thunks, AAPCS64 argument classification, string interning,
+; runtime symbols, DWARF types, the `llvm-ir` line tokenizer, and the Mach-O
+; object. It is what remains of the arm64 backend, whose slot-per-value expression
+; emitter tpde replaced.
+(module coil.compiler.native_module)
+(import "coil.primitive" :as primitive)
+(import "coil.compiler.vector_scalar" :use *)
+(import "coil.compiler.float_math" :use *)
+(import "coil.compiler.unit_state" :use *)
+
+(defstruct NativeUnitState
+  [(curl bool) (llvm bool)])
+
+(defn native-unit-state-cell [] (-> (ptr (ptr NativeUnitState)))
+  (primitive/alloc-static (ptr NativeUnitState)))
+
+(defn native-unit-state [] (-> (ptr NativeUnitState))
+  (let [p (load (native-unit-state-cell))]
+    (if (= (primitive/cast i64 p) 0) (primitive/alloc-static NativeUnitState) p)))
+
+(defn native-unit-bind! [(next (ptr NativeUnitState))] (-> (ptr NativeUnitState))
+  (let [prior (native-unit-state)]
+    (set! (native-unit-state-cell) next)
+    prior))
+
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.io" :use *)
+(import "coil.fs" :as fs)
+(import "coil.control" :use *)
+(import "coil.mem" :use *)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.parser" :use *)
+(import "coil.compiler.layoutdb" :use *)
+(import "coil.compiler.a64" :use *)
+(import "coil.compiler.macho" :use *)
+(import "coil.compiler.dwarf" :use *)
+(import "coil.compiler.debuginfo" :use *)
+(import "coil.compiler.mtrace" :as mtr)
+(import "coil.compiler.trace" :as tr)
+(import "coil.cc" :as cc)
+
+; file-writing externs; the object file is created with coil.fs's `create-file`
+(extern cga64.write [i32 (ptr i8) isize] (-> isize))  ; C write's fd is int (i32); matches io/cimport write (isize=i64 native, i32 wasm)
+
+(extern cga64.close [i32] (-> i32))  ; C `close(int?)` returns int, not long — matches ffi.close/cimport.close (return is discarded)
+
+(extern cga64.exit [i32] (-> void))
+
+; ============================ state ==========================================
+(defstruct GSig  ; one callable (function or extern)
+  [(name (slice u8))
+   (params (ptr (ArrayList Type)))
+   (ret Type)
+   (variadic bool)
+   (symidx i64)
+   (shim bool)
+   (implsym i64)  ; :shim conventions (trampoline realization)
+   (shimregs (ptr (ArrayList i64)))
+   (shimret i64)
+   ; an inlined machine-code function's bytes, which its call sites hold in
+   ; place of the call; empty for a call
+   (inline_code (slice u8))
+   (func (ptr Func))
+   (inline_policy (Option InlinePolicy))])
+
+(defstruct GStr [(s (slice u8)) (symidx i64)])  ; interned string literal
+
+(defstruct GStatic [(name (slice u8)) (ty Type) (symidx i64)])
+
+(defstruct Cga
+  [(a (dyn Allocator))
+   (program (ptr Program))
+   (layouts LayoutDb)
+   (sigs (ArrayList GSig))  ; funcs + externs, keyed by name
+   (sig_index (HashMap (slice u8) i64))
+   (sig_memo (ArrayList NameMemo))  ; layoutdb's name memo in front of sig_index
+   ; These are immutable declaration views for one codegen run. Indexing them
+   ; once avoids an O(functions x exports) signature-registration pass.
+   (unit_export_index (HashMap (slice u8) bool))
+   (export_symbol_index (HashMap (slice u8) (slice u8)))
+   ; Names mono generated from a generic or a trait impl: a static cell inside
+   ; one is emitted as a weak external definition, one per program across
+   ; units (the LLVM backend's weak_odr). See codegen.coil Cg.spec_names.
+   (spec_names (HashMap (slice u8) bool))
+   (obj MObj)
+   (text i64)
+   (constsec i64)
+   (datasec i64)  ; section ordinals
+   (strs (ArrayList GStr))  ; interned EStr/ECStr globals
+   (str_index (HashMap (slice u8) i64))  ; tagged content -> symidx of `strs`
+   (statics (ArrayList GStatic))
+   (nglob i64)  ; g.N counter
+   (nstatic i64)  ; stable alloc-static ordinal within the current function
+   (selfname (slice u8))  ; the function whose alloc-static cells are being laid out
+   (dwtypes DbgTypes)
+   (convs (ptr (ArrayList Convention)))])
+
+; hard error helper — no silent fallbacks anywhere in this backend.
+(extern cga.exit :as "exit" :cc (cc/C) [i32] (-> void))
+
+;;; A program this backend cannot compile -- a feature it does not lower, or an
+;;; invariant an earlier stage broke -- ends the compile with a diagnostic and exit
+;;; status 1, as the LLVM backend's cg-fail does, never with an abort and a core dump.
+(defn cga-fail [(msg (slice u8))] (-> i64)
+  (print-str (stderr) "error: arm64 backend: ")
+  (print-str (stderr) msg)
+  (write-byte (stderr) (: 10 u8))
+  (mtr/mtrace-mem-report-once!)
+  (cga.exit (: 1 i32))
+  0)
+
+(defn cga-fail2 [(msg (slice u8)) (what (slice u8))] (-> i64)
+  (cga-fail (sconcat (alloc/malloc-allocator) msg what)))
+
+; ---- shared type layout ----------------------------------------------------
+(defn g-struct-idx [(g (ptr Cga)) (name (slice u8))] (-> i64)
+  (struct-index (field g layouts) name))
+
+(defn g-sum-idx [(g (ptr Cga)) (name (slice u8))] (-> i64)
+  (sum-index (field g layouts) name))
+
+(defn g-sig-idx [(g (ptr Cga)) (name (slice u8))] (-> i64)
+  (if (= (len (.sig_memo g)) 0)
+      (match (get (.sig_index g) name) (Some [index] index) (None [] -1))
+  (let [m (name-memo-slot (field g sig_memo) name)]
+    (if (name-memo-hit? m name)
+        (.val m)
+        (match (get (.sig_index g) name)
+          (Some [index] (do (set! (.key m) name) (set! (.val m) index) index))
+          (None [] -1))))))
+
+(defn ty-align [(g (ptr Cga)) (t (ptr Type))] (-> i64)
+  (align (field g layouts) t))
+
+(defn ty-size [(g (ptr Cga)) (t (ptr Type))] (-> i64)
+  (size (field g layouts) t))
+
+(defn g-field-off [(g (ptr Cga)) (si i64) (fi i64)] (-> i64)
+  (field-offset (field g layouts) si fi))
+
+(defn g-field-idx [(g (ptr Cga)) (si i64) (name (slice u8))] (-> i64)
+  (field-number (field g layouts) si name))
+
+(defn g-field-ty [(g (ptr Cga)) (si i64) (fi i64)] (-> (ptr Type))
+  (field (al-at [Field]
+                (load (field (al-at [StructDef]
+                                    (load (field (.program g) structs))
+                                    si)
+                             fields))
+                fi)
+         ty))
+
+(defn g-natural-off [(g (ptr Cga)) (fields (ptr (ArrayList Field))) (fi i64)] (-> i64)
+  (natural-offset (field g layouts) fields fi))
+
+(defn g-variant-idx [(g (ptr Cga)) (su i64) (name (slice u8))] (-> i64)
+  (variant-number (field g layouts) su name))
+
+(defn g-register-types! [(g (ptr Cga)) (mp (ptr Program))] (-> i64)
+  (set! (.layouts g) (LayoutDb::new (.a g) mp "cga64" 8 8))
+  0)
+
+(defn g-mangle [(g (ptr Cga)) (nm (slice u8))] (-> (slice u8))
+  (sconcat (.a g) "_" nm))
+
+; the C symbol a function is exported under, or None. Mirrors codegen.coil's
+; cg-export-find: an (export-c …) entry pins the function's public symbol. On this
+; AAPCS64-native backend no thunk is needed — the function itself is emitted under
+; this symbol with external linkage (see g-register-sigs!). ExportC.symbol is always
+; Some by codegen time (check.coil fills the default bare-name symbol when :as is
+; omitted).
+; A name this unit publishes for other units to `declare` and link against.
+(defn g-unit-export? [(g (ptr Cga)) (name (slice u8))] (-> bool)
+  (contains? (.unit_export_index g) name))
+
+;;; The function a `fnptr-of` names: a function with a by-value C entry is pointed
+;;; at through its thunk, whose `c` signature takes the structs by value as the
+;;; pointer's type says.
+(defn g-fnptr-target [(g (ptr Cga)) (name (slice u8))] (-> (slice u8))
+  (let [thunk (export-c-thunk-name (.a g) name)]
+    (if (>= (g-sig-idx g thunk) 0) thunk name)))
+
+(defn g-export-c-sym [(g (ptr Cga)) (name (slice u8))] (-> (Option (slice u8)))
+  (get (.export_symbol_index g) name))
+
+; register every extern + func as a GSig with a Mach-O symbol.
+(defn g-register-sigs! [(g (ptr Cga)) (mp (ptr Program))] (-> i64)
+  (let [origins (load (field mp mono_origins))]
+    (for [k 0 (len (load origins))]
+      (set! (mut (.spec_names g))
+            (.generated (elem origins k))
+            true)
+      0))
+  (let [es (load (field mp externs))
+        n (len (load es))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [ed (al-at [Extern] es (load i))
+                      ; A symbol this program defines is not an undefined import: the
+                      ; extern is bound to that definition once the functions are registered.
+                      sym
+                        (match (export-c-interposer mp (extern-link-name ed))
+                          (Some [_] -1)
+                          (None []
+                                (mobj-add-sym! (mut (.obj g))
+                                               (g-mangle g
+                                                         (extern-link-name ed))
+                                               0
+                                               0
+                                               true)))
+                      (mut e) (zeroed GSig)]
+                  (set! (.name e)
+                        (.name ed))
+                  (set! (.params e)
+                        (load (field ed params)))
+                  (set! (.ret e)
+                        (.ret ed))
+                  (set! (.variadic e)
+                        (.variadic ed))
+                  (set! (.symidx e)
+                        sym)
+                  (set! (.shim e)
+                        false)
+                  (set! (.implsym e)
+                        -1)
+                  (set! (.shimregs e)
+                        (box-al [i64]
+                                (.a g)
+                                (ArrayList::new [i64]
+                                                (.a g))))
+                  (set! (.shimret e)
+                        0)
+                  (set! (.func e)
+                        (primitive/cast (ptr Func) 0))
+                  (set! (.inline_policy e)
+                        (None))
+                  ; duplicate extern declarations across modules are expected; keep the first
+                  (when (< (g-sig-idx g (.name ed))
+                           0)
+                    (push! (mut (.sigs g))
+                           e)
+                    (set! (mut (.sig_index g))
+                          (.name ed)
+                          (primitive/isub (len (.sigs g)) 1))
+                    0))
+                (set! i (primitive/iadd (load i) 1))))))
+  (let [fs (load (field mp funcs))
+        n (len (load fs))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [fd (al-at [Func] fs (load i))
+                      expsym (g-export-c-sym g (.name fd))
+                      ; an exported function is emitted directly under its C symbol with
+                      ; external linkage; otherwise the mangled Coil name, external only
+                      ; for a program's main (a unit has no process entry) and for a
+                      ; name this unit publishes for other units.
+                      ext
+                        (or (and (not (.unit_build mp)) (= (.name fd) "main"))
+                            (match expsym (Some [s] true) (None [] false))
+                            (g-unit-export? g (.name fd)))
+                      symname (match expsym (Some [s] s) (None [] (.name fd)))
+                      ; A `declare`d function has no body here: another unit's
+                      ; object defines it. Register it the way an extern is
+                      ; registered, undefined and external, so a call becomes a
+                      ; relocation the linker resolves.
+                      sym
+                        (if (.declared fd)
+                            (mobj-add-sym! (mut (.obj g))
+                                           (g-mangle g symname)
+                                           0
+                                           0
+                                           true)
+                            (mobj-add-sym! (mut (.obj g))
+                                           (g-mangle g symname)
+                                           (.text g)
+                                           0
+                                           ext))
+                      (mut ptys) (ArrayList::new [Type] (.a g))
+                      (mut e) (zeroed GSig)]
+                  (let [ps (load (field fd params))
+                        np (len (load ps))
+                        (mut j) 0]
+                    (loop (if (>= (load j) np)
+                              (break)
+                              (do
+                                (push! (mut ptys)
+                                       (.ty (al-at [Param] ps (load j))))
+                                (set! j (primitive/iadd (load j) 1))))))
+                  (set! (.name e)
+                        (.name fd))
+                  (set! (.params e)
+                        (box-al [Type] (.a g) (load ptys)))
+                  (set! (.ret e)
+                        (.ret fd))
+                  (set! (.variadic e)
+                        false)
+                  (set! (.symidx e)
+                        sym)
+                  (set! (.shim e)
+                        false)
+                  (set! (.implsym e)
+                        -1)
+                  (set! (.shimregs e)
+                        (box-al [i64]
+                                (.a g)
+                                (ArrayList::new [i64]
+                                                (.a g))))
+                  (set! (.shimret e)
+                        0)
+                  (set! (.func e)
+                        fd)
+                  (set! (.inline_policy e)
+                        (func-inline-policy fd))
+                  ; a :shim-convention function is realized as <name>__impl + trampoline
+                  (let [ci (g-conv-idx g (cc-identity (.cc fd)))]
+                    (when (>= ci 0)
+                      (match (.lowering (al-at [Convention]
+                                               (load (field g convs))
+                                               ci))
+                        (LShim []
+                               (let [cv
+                                       (al-at [Convention]
+                                              (load (field g convs))
+                                              ci)
+                                     (mut regs) (ArrayList::new [i64] (.a g))
+                                     prs (load (field cv params))
+                                     npr (len (load prs))
+                                     (mut j) 0]
+                                 (loop (if (>= (load j) npr)
+                                           (break)
+                                           (do
+                                             (push! (mut regs)
+                                                    (g-parse-xreg g
+                                                                  (get (load prs)
+                                                                       (load j))))
+                                             (set! j
+                                                   (primitive/iadd (load j) 1)))))
+                                 (set! (.shim e)
+                                       true)
+                                 (set! (.shimregs e)
+                                       (box-al [i64]
+                                               (.a g)
+                                               (load regs)))
+                                 (set! (.shimret e)
+                                       (match (.ret cv)
+                                         (Some [r] (g-parse-xreg g r))
+                                         (None [] 0)))
+                                 (g-check-shim-clobbers! g cv)
+                                 (set! (.inline_code e) (g-inline-machine-code g fd))
+                                 ; machine code is the Coil-named symbol itself:
+                                 ; it has no __impl and no trampoline
+                                 (set! (.implsym e)
+                                       (match (func-machine-code fd)
+                                         (Some [_] -1)
+                                         (None []
+                                               (mobj-add-sym! (mut (.obj g))
+                                                              (g-mangle g
+                                                                        (sconcat (.a g)
+                                                                                 (.name fd)
+                                                                                 "__impl"))
+                                                              (.text g)
+                                                              0
+                                                              false))))
+                                 0))
+                        (LNative [_] 0)
+                        (LReset [] 0)
+                        (LowerWritten [_] (panic "codegen: convention '{}' was never resolved" (cc-identity (.cc fd)))))))
+                  (push! (mut (.sigs g))
+                         e)
+                  (set! (mut (.sig_index g))
+                        (.name fd)
+                        (primitive/isub (len (.sigs g)) 1)))
+                (set! i (primitive/iadd (load i) 1))))))
+
+  ; Bind each interposed extern to the function that defines its symbol. The
+  ; extern keeps its own declared signature, as any extern does.
+  (for i
+    (range 0 (len (load (field mp externs))))
+    (let [ed (al-at [Extern] (load (field mp externs)) i)]
+      (match (export-c-interposer mp (extern-link-name ed))
+        (Some [fname]
+              (let [ei (g-sig-idx g (.name ed))
+                    fi (g-sig-idx g fname)]
+                (when (or (< ei 0) (< fi 0))
+                  (cga-fail2 "extern bound to an exported function that has no signature: "
+                             (.name ed)))
+                (set! (.symidx (al-at [GSig] (field g sigs) ei))
+                      (.symidx (al-at [GSig] (field g sigs) fi)))))
+        (None [] 0))))
+  0)
+
+(defn g-conv-idx [(g (ptr Cga)) (nm (slice u8))] (-> i64)
+  (let [cs (load (field g convs))
+        n (len (load cs))
+        (mut i) 0
+        (mut r) -1]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (when (= (.name (al-at [Convention] cs (load i)))
+                         nm)
+                  (set! r (load i)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (load r)))
+
+; A :shim convention cannot clobber the stack pointer: nothing could find the
+; frame afterwards.
+(defn g-check-shim-clobbers! [(g (ptr Cga)) (cv (ptr Convention))] (-> i64)
+  (let [cl (load (field cv clobber))]
+    (for j (range 0 (len (load cl)))
+      (let [r (get (load cl) j)]
+        (when (= r "sp")
+          (cga-fail2 "a shim convention cannot clobber the stack pointer: " r))))
+    0))
+
+; The bytes FD's call sites hold in place of a call, for machine code its
+; callers inline; else empty.
+(defn g-inline-machine-code [(g (ptr Cga)) (fd (ptr Func))] (-> (slice u8))
+  (match (func-machine-code fd)
+    (Some [code]
+          (if (func-machine-code-inlined? fd)
+              (slice (load (.bytes code)))
+              ""))
+    (None [] "")))
+
+; An x86-64 GPR name -> its number, or -1. The tpde backend lays out x86-64
+; modules with this file's machinery; the checker validated the names for the
+; target, so an x86 name only reaches here when targeting x86-64.
+(defn x86-gpr-num [(r (slice u8))] (-> i64)
+  (cond (= r "rax") 0 (= r "rcx") 1 (= r "rdx") 2 (= r "rbx") 3 (= r "rsp") 4
+        (= r "rbp") 5 (= r "rsi") 6 (= r "rdi") 7 (= r "r8") 8 (= r "r9") 9
+        (= r "r10") 10 (= r "r11") 11 (= r "r12") 12 (= r "r13") 13
+        (= r "r14") 14 (= r "r15") 15
+        :else -1))
+
+; "x20" -> 20 (shim conventions name GPRs as xN; validated by the checker)
+(defn g-parse-xreg [(g (ptr Cga)) (r (slice u8))] (-> i64)
+  (if (>= (x86-gpr-num r) 0)
+      ; rsp and rbp hold the frame; r11 is tpde's scratch register
+      (if (or (= r "rsp") (= r "rbp") (= r "r11"))
+          (cga-fail2 "shim register collides with backend-reserved registers: " r)
+          (x86-gpr-num r))
+  (if (or (= r "lr") (= r "x30"))
+      30
+      (if (!= (primitive/cast i64 (get r 0)) 120)
+          (cga-fail2 "shim register is not an x-register: " r)
+          (let [v (str->i64 (subslice r 1 (len r)))]
+            (if (or (>= v 28)
+                    (and (>= v 16)
+                         (<= v 17)))
+                (cga-fail2 "shim register collides with backend-reserved registers: "
+                           r)
+                v))))))
+
+; set a defined symbol's section offset once known (function start / global).
+(defn mobj-set-sym! [(o (ptr MObj)) (idx i64) (sect i64) (off i64)] (-> i64)
+  (let [sp (al-at [MSym] (field o syms) idx)]
+    (set! (.sect sp) sect)
+    (set! (.off sp) off)
+    0))
+
+; is a type an int-like scalar (lives in x regs)? floats live in d/s.
+(defn ty-is-float [(t (ptr Type))] (-> bool)
+  (match (load t) (TFloat [_] true) (_ false)))
+
+(defn ty-is-scalar [(t (ptr Type))] (-> bool)
+  (match (load t)
+    ; an integer wider than 64 bits lives in memory (see ty-wide-int?)
+    (TInt [bits _] (<= bits 64))
+    (TBool [] true)
+    (TPtr [_] true)
+    (TRef [_ _] true)
+    (TFn [_ _ _] true)
+    (TNever [] true)
+    (TFloat [_] true)
+    (TStruct [nm] false)
+    (_ false)))
+
+; ============================ ABI classification =============================
+; classes: 0 = int-like scalar (x reg), 1 = float scalar (d/s reg),
+;          2 = aggregate <= 8B (one x reg), 3 = aggregate <= 16B (x pair),
+;          4 = aggregate > 16B (indirect), 5 = HFA (hfa_n regs of hfa_bits)
+(defstruct AbiInfo [(cls i64) (hfa_n i64) (hfa_bits i64)])
+
+; HFA walk: count uniform float leaves; returns leaf count or -1 (not an HFA).
+; bitsp receives the leaf width. Mirrors abi-hfa in codegen.coil.
+(defn g-hfa-walk [(g (ptr Cga)) (t (ptr Type)) (bitsp (ptr i64))] (-> i64)
+  (match (load t)
+    (TFloat [bits]
+            (if (= (load bitsp) 0)
+                (do (set! bitsp bits) 1)
+                (if (= (load bitsp) bits) 1 -1)))
+    (TArray [elem n-extent]
+            (let [n (extent-value n-extent)]
+              (let [inner (g-hfa-walk g elem bitsp)]
+                (if (< inner 0)
+                    -1
+                    (primitive/imul inner n)))))
+    (TStruct [nm]
+             (let [si (g-struct-idx g nm)]
+               (if (< si 0)
+                   -1
+                   (g-hfa-walk-record g si bitsp))))
+    (_ -1)))
+
+; Count a record's distinct float storage groups. Explicit-layout records from
+; cimport are just as ABI-visible as natural C layouts. Equal-offset fields are
+; union alternatives: they must agree on the float width and contribute the
+; largest alternative, rather than being counted twice. This mirrors the LLVM
+; backend's abi-hfa-walk-record.
+(defn g-hfa-walk-record [(g (ptr Cga))
+                         (si i64)
+                         (bitsp (ptr i64))] (-> i64)
+  (let [fs (load (field (struct-at (field g layouts) si) fields))
+        positions (primitive/alloc-stack (array i64 4))
+        sizes (primitive/alloc-stack (array i64 4))
+        (mut groups) 0
+        (mut total) 0
+        (mut ok) true]
+    (for [i 0 (len (load fs))]
+      (when (load ok)
+        (let [part
+                (g-hfa-walk g
+                            (field (al-at [Field] fs i) ty)
+                            bitsp)]
+          (if (< part 0)
+              (set! ok false)
+              (when (> part 0)
+                (let [offset (field-offset (field g layouts) si i)
+                      (mut group) -1]
+                  (for [j 0 (load groups)]
+                    (when (= (load (index positions j)) offset)
+                      (set! group j)
+                      0)
+                    0)
+                  (if (= (load group) -1)
+                      (if (= (load groups) 4)
+                          (set! ok false)
+                          (do
+                            (set! group (load groups))
+                            (set! groups (primitive/iadd (load groups) 1))
+                            (set! (index positions (load group))
+                                  offset)
+                            (set! (index sizes (load group)) 0)
+                            0))
+                      0)
+                  (when (load ok)
+                    (let [prior (load (index sizes (load group)))]
+                      (when (> part prior)
+                        (set! total
+                              (primitive/iadd (load total)
+                                              (primitive/isub part prior)))
+                        (set! (index sizes (load group)) part)
+                        0))
+                    (when (> (load total) 4)
+                      (set! ok false)
+                      0)
+                    0))))
+          0))
+      0)
+    (if (load ok) (load total) -1)))
+
+(defn g-abi-info [(g (ptr Cga)) (t (ptr Type))] (-> AbiInfo)
+  (let [(mut r) (zeroed AbiInfo)]
+    (set! (.hfa_n r)
+          0)
+    (set! (.hfa_bits r)
+          0)
+    (if (ty-is-scalar t)
+        (do
+          (set! (.cls r)
+                (if (ty-is-float t) (do 1) 0))
+          0)
+        (let [(mut bitsp) 0]
+          (let [hn
+                  (g-hfa-walk g
+                              t
+                              (mut bitsp))]
+            (if (and (>= hn 1)
+                     (<= hn 4))
+                (do
+                  (set! (.cls r)
+                        5)
+                  (set! (.hfa_n r)
+                        hn)
+                  (set! (.hfa_bits r)
+                        bitsp)
+                  0)
+                (let [sz (ty-size g t)]
+                  (if (<= sz 8)
+                      ; an empty struct is class 6: C passes and returns nothing for it
+                      (do
+                        (set! (.cls r)
+                              (if (= sz 0) 6 2))
+                        0)
+                      (if (<= sz 16)
+                          (do
+                            (set! (.cls r)
+                                  3)
+                            0)
+                          (do
+                            (set! (.cls r)
+                                  4)
+                            0))))))))
+    r))
+
+(defn abi-cls [(x AbiInfo)] (-> i64)
+  (let [(mut p) (: x AbiInfo)] (.cls p)))
+
+(defn abi-hfa-n [(x AbiInfo)] (-> i64)
+  (let [(mut p) (: x AbiInfo)] (.hfa_n p)))
+
+(defn abi-hfa-bits [(x AbiInfo)] (-> i64)
+  (let [(mut p) (: x AbiInfo)] (.hfa_bits p)))
+
+(defn mk-abi-scalar [] (-> AbiInfo)
+  (AbiInfo
+    :cls 0
+    :hfa_n 0
+    :hfa_bits 0))
+
+; ============================ globals / strings ==============================
+; intern an EStr/ECStr payload as a private const-section global; returns symidx.
+; `nul` appends a trailing NUL (ECStr); EStr arrays are exactly the bytes.
+(defn g-intern-str! [(g (ptr Cga)) (sv (slice u8)) (nul bool)] (-> i64)
+  ; dedup exact (content, nul) pairs: entries are keyed by the content behind a
+  ; 1-byte kind prefix (0=str,1=cstr). A hash index, not a scan of `strs`: the
+  ; scan was quadratic and a quarter of the tpde backend's time on the compiler.
+  (let [a (.a g)
+        (mut tagged) (StrBuf::new a)]
+    (push! (mut tagged) (primitive/cast u8 (when nul 1)))
+    (push-str! (mut tagged) sv)
+    (let [key (str (load tagged))]
+      (match (get (.str_index g) key)
+        (Some [sym] sym)
+        (None []
+          (let [buf (mobj-sect-buf (mut (.obj g)) (.constsec g))
+                off (len (load buf))
+                nm (sconcat a (if nul "l_cstr." "l_str.") (i64->str a (.nglob g)))]
+            (set! (.nglob g) (primitive/iadd (.nglob g) 1))
+            (b-bytes! (mut buf) sv)
+            (when nul (b-u8! (mut buf) 0))
+            (let [sym (mobj-add-sym! (mut (.obj g)) nm (.constsec g) off false)
+                  (mut e) (zeroed GStr)]
+              (set! (.s e) key)
+              (set! (.symidx e) sym)
+              (push! (mut (.strs g)) e)
+              (set! (mut (.str_index g)) key sym)
+              sym)))))))
+
+; a zero-initialized global in __data; returns symidx.
+;;; The data section a static of `size` bytes lives in. Statics of 1 MiB and more
+;;; (a sparse `:elements` array is mostly holes) each get a section of their own,
+;;; filled once at their exact size. Appended to the shared __data buffer they
+;;; regrew it, and each outgrown copy stayed in the compilation arena: a program
+;;; with 28 MB of such arrays cost this backend over 100 MB.
+(defn g-static-sect! [(g (ptr Cga)) (size i64) (align i64)] (-> i64)
+  (if (< size 1048576)
+      ; A static aligned past the section's 8 bytes -- a 32-aligned struct --
+      ; lands at an aligned offset, which is aligned in memory only if the
+      ; section is too: it was 8-aligned, and such a static was misaligned
+      ; whenever the statics before it moved the section's placement.
+      (do (mobj-sect-align-at-least! (mut (.obj g)) (.datasec g)
+                                     (g-align-log2 (if (< align 8) 8 align)))
+          (.datasec g))
+      (mobj-add-sect! (mut (.obj g))
+                      "__DATA"
+                      (sconcat (.a g)
+                               "__coil_big"
+                               (i64->str (.a g) (len (.sects (.obj g)))))
+                      (g-align-log2 (if (< align 8)
+                                        8
+                                        align))
+                      0)))
+
+(defn g-align-log2 [(align i64)] (-> i64)
+  (let [(mut n) 0]
+    (while (< (<< 1 n) align) (set! n (+ n 1)))
+    n))
+
+(defn g-zero-global! [(g (ptr Cga)) (size i64) (align i64)] (-> i64)
+  (let [a (.a g)
+        sect (g-static-sect! g size align)
+        buf (mobj-sect-buf (mut (.obj g)) sect)]
+    (b-align! (mut buf) (if (< align 8) 8 align))
+    (let [off (len (load buf))
+          nm
+            (sconcat a
+                     "repl_static."
+                     (sconcat a
+                              (.selfname g)
+                              (sconcat a "." (i64->str a (.nstatic g)))))]
+      (set! (.nglob g) (primitive/iadd (.nglob g) 1))
+      (set! (.nstatic g) (primitive/iadd (.nstatic g) 1))
+      (b-zeros! (mut buf) size)
+      ; A cell inside a generic instantiation is one per program: every unit
+      ; that instantiates the generic defines it, weak, and the linker keeps
+      ; one. A concrete function's cell stays local to the unit that owns it.
+      ; Both carry the platform's symbol prefix, like every other symbol this
+      ; backend emits, so an LLVM-built object and an arm64-built one name the
+      ; same cell the same way and the linker can merge them.
+      (if (contains? (.spec_names g)
+                     (.selfname g))
+          (mobj-add-weak-sym! (mut (.obj g)) (g-mangle g nm) sect off)
+          (mobj-add-sym! (mut (.obj g)) (g-mangle g nm) sect off false)))))
+
+(defn g-named-zero-global! [(g (ptr Cga))
+                            (name (slice u8))
+                            (size i64)
+                            (align i64)] (-> i64)
+  (let [sect (g-static-sect! g size align)
+        buf (mobj-sect-buf (mut (.obj g)) sect)]
+    (b-align! (mut buf) (if (< align 8) 8 align))
+    (let [off (len (load buf))]
+      (b-zeros! (mut buf) size)
+      (mobj-add-sym! (mut (.obj g)) name sect off false))))
+
+; Public static storage uses the target's C spelling and participates in normal
+; native linking. It is the storage itself, never a pointer-valued proxy.
+(defn g-public-zero-global! [(g (ptr Cga))
+                             (name (slice u8))
+                             (size i64)
+                             (align i64)] (-> i64)
+  (let [native-name (g-mangle g name)
+        symbols (field (field g obj) syms)]
+    (for [i 0 (len (.sigs g))]
+      (let [signature (al-at [GSig] (field g sigs) i)
+            symbol (al-at [MSym] symbols (.symidx signature))]
+        (when (= (.name symbol) native-name)
+          (g-user-fail (sconcat (.a g)
+                                "static storage conflicts with function symbol: "
+                                name))
+          0))
+      0)
+    (for [i 0 (len (load symbols))]
+      (let [symbol (al-at [MSym] symbols i)]
+        (when (and (= (.name symbol) native-name) (!= (.sect symbol) 0))
+          (g-user-fail (sconcat (.a g) "duplicate static storage symbol: " name))
+          0))
+      0)
+    (let [sect (g-static-sect! g size align)
+          buf (mobj-sect-buf (mut (.obj g)) sect)]
+      (b-align! (mut buf) (if (< align 8) 8 align))
+      (let [off (len (load buf))]
+        (b-zeros! (mut buf) size)
+        (mobj-add-sym! (mut (.obj g)) native-name sect off true)))))
+
+(defn g-static-idx [(g (ptr Cga)) (name (slice u8))] (-> i64)
+  (let [n (len (.statics g))
+        (mut i) 0
+        (mut found) -1]
+    (loop (if (or (>= (load i) n) (>= (load found) 0))
+              (break)
+              (do
+                (when (= (.name (al-at [GStatic] (field g statics) (load i)))
+                         name)
+                  (set! found (load i))
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
+;;; Write the integer `n`, of type `t`, at `off` in data section `sect`.
+(defn g-static-write-int! [(g (ptr Cga)) (t (ptr Type)) (n i64) (sect i64) (off i64)] (-> i64)
+  (let [buf (mobj-sect-buf (mut (.obj g)) sect)
+        sz (ty-size g t)]
+    (cond (= sz 1) (set! (mut buf) off (primitive/cast u8 n))
+          (= sz 2)
+            (do
+              (set! (mut buf) off (primitive/cast u8 n))
+              (set! (mut buf)
+                    (primitive/iadd off 1)
+                    (primitive/cast u8 (>> n 8)))
+              0)
+          (= sz 4) (b-patch-u32! (mut buf) off n)
+          (= sz 8) (b-patch-u64! (mut buf) off n)
+          ; a wide integer: the value and its sign extension
+          :else
+            (do
+              (b-patch-u64! (mut buf) off n)
+              (b-patch-u64! (mut buf) (primitive/iadd off 8) (if (< n 0) -1 0))))))
+
+;;; Write a link-time constant of type `t` at `off` in data section `sect`.
+(defn g-static-write! [(g (ptr Cga))
+                       (t (ptr Type))
+                       (e (ptr Expr))
+                       (sect i64)
+                       (off i64)] (-> i64)
+  (let [buf (mobj-sect-buf (mut (.obj g)) sect)]
+    (match (.kind e)
+      (EInt [n] (g-static-write-int! g t n sect off))
+      ; A constant integer expression (`(sizeof K)`, arithmetic on constants), as
+      ; the LLVM backend folds it.
+      (ESizeOf [_] (g-static-write-int! g t (gcev-v (g-const-eval g e)) sect off))
+      (EAlignOf [_] (g-static-write-int! g t (gcev-v (g-const-eval g e)) sect off))
+      (EOffsetOf [_ _] (g-static-write-int! g t (gcev-v (g-const-eval g e)) sect off))
+      (EBin [_ _ _] (g-static-write-int! g t (gcev-v (g-const-eval g e)) sect off))
+      (ECmp [_ _ _] (g-static-write-int! g t (gcev-v (g-const-eval g e)) sect off))
+      (EWideInt [_ lo hi _ _]
+                (do
+                  (b-patch-u64! (mut buf) off lo)
+                  (b-patch-u64! (mut buf) (primitive/iadd off 8) hi)))
+      (EFloat [bits]
+              (if (= (ty-size g t) 4)
+                  (b-patch-u32! (mut buf) off (f64-bits->f32-bits bits))
+                  (b-patch-u64! (mut buf) off bits)))
+      (EBool [v] (set! (mut buf) off (primitive/cast u8 (when v 1))))
+      ; A (slice u8) literal: a relocated pointer to NUL-terminated bytes, then
+      ; the length, the same layout emit-expr builds for an expression literal.
+      (EStr [sv]
+            (do
+              (mobj-add-reloc! (mut (.obj g))
+                               sect
+                               off
+                               (g-intern-str! g sv true)
+                               (reloc-unsigned)
+                               false
+                               3)
+              (b-patch-u64! (mut buf) (primitive/iadd off 8) (len sv))))
+      ; A C string literal: the relocated pointer alone.
+      (ECStr [sv]
+             (mobj-add-reloc! (mut (.obj g))
+                              sect
+                              off
+                              (g-intern-str! g sv true)
+                              (reloc-unsigned)
+                              false
+                              3))
+      ; A sum: the i32 tag, then each payload field at its natural offset in the
+      ; variant, after the 8-byte tag word (emit-construct's layout).
+      (EConstruct [sum variant args]
+                  (let [su (g-sum-idx g sum)]
+                    (when (< su 0)
+                      (cga-fail2 "def initializer: unknown sum " sum))
+                    (let [vidx (g-variant-idx g su variant)
+                          vs
+                            (load (field (sum-at (field g layouts) su) variants))
+                          vfields (field (al-at [Variant] vs vidx) fields)]
+                      (b-patch-u32! (mut buf) off vidx)
+                      (for [i 0 (len (load args))]
+                        (g-static-write! g
+                                         (field (al-at [Field] (load vfields) i)
+                                                ty)
+                                         (al-at [Expr] args i)
+                                         sect
+                                         (primitive/iadd (primitive/iadd off 8)
+                                                         (g-natural-off g
+                                                                        (load vfields)
+                                                                        i))))
+                      0)))
+      (EZeroed [_] 0)
+      (ERecordInit [_] 0)
+      (EStaticArray [indices items]
+                    (match (load t)
+                      (TArray [elem _]
+                              (do
+                                (for [i 0 (len (load items))]
+                                  (g-static-write! g
+                                                   elem
+                                                   (al-at [Expr] items i)
+                                                   sect
+                                                   (+ off
+                                                      (* (get (load indices) i)
+                                                         (ty-size g elem))))
+                                  0)
+                                0))
+                      (_ (cga-fail "static :elements requires an array allocation"))))
+      (EFnPtrOf [name0]
+                (let [name (g-fnptr-target g name0)
+                      si (g-sig-idx g name)]
+                  (when (< si 0)
+                    (cga-fail2 "def initializer: unknown function " name))
+                  (mobj-add-reloc! (mut (.obj g))
+                                   sect
+                                   off
+                                   (.symidx (al-at [GSig] (field g sigs) si))
+                                   (reloc-unsigned)
+                                   false
+                                   3)))
+      (EAlloc [storage ty init symbol]
+              (if (!= storage 1)
+                  (cga-fail "def initializer: only alloc-static storage is a link-time constant")
+                  (let [tp (box-type (.a g) ty)
+                        sym
+                          (match symbol
+                            (Some [name]
+                                  (g-public-zero-global! g
+                                                         name
+                                                         (ty-size g tp)
+                                                         (ty-align g tp)))
+                            (None []
+                                  (g-zero-global! g
+                                                  (ty-size g tp)
+                                                  (ty-align g tp))))
+                        ms (al-at [MSym] (field (field g obj) syms) sym)]
+                    (when (!= (primitive/cast i64 init) 0)
+                      (g-static-write! g tp init (.sect ms) (.off ms))
+                      0)
+                    (mobj-add-reloc! (mut (.obj g))
+                                     sect
+                                     off
+                                     sym
+                                     (reloc-unsigned)
+                                     false
+                                     3))))
+      ; A slice: its data pointer (a nested static the value points into),
+      ; then its length.
+      (EMakeSlice [data elem len]
+                  (do
+                    (g-static-write! g
+                                     (box-type (.a g)
+                                               (TPtr (box-type (.a g) elem)))
+                                     data
+                                     sect
+                                     off)
+                    ; the nested write may have grown the buffers: look it up again
+                    (let [after (mobj-sect-buf (mut (.obj g)) sect)]
+                      (b-patch-u64! (mut after)
+                                    (primitive/iadd off 8)
+                                    (extent-value len)))
+                    0))
+      (ECast [_ inner] (g-static-write! g t inner sect off))
+      (ELoad [inner] (g-static-write! g t inner sect off))
+      (ELet [_ body]
+            (match (load t)
+              (TStruct [name]
+                       (let [si (g-struct-idx g name)]
+                         (when (< si 0)
+                           (cga-fail2 "def initializer: unknown struct " name))
+                         (for [i 0 (len (load body))]
+                           (let [item (al-at [Expr] body i)
+                                 place (static-store-place item)]
+                             (if (= (primitive/cast i64 place) 0)
+                                 (if (static-body-result? body i)
+                                     0
+                                     (cga-fail "def initializer: expected a materialized aggregate"))
+                                 (match (.kind place)
+                                   (EField [_ fname]
+                                           (let [fi (g-field-idx g si fname)]
+                                             (when (< fi 0)
+                                               (cga-fail2 "def initializer: unknown field " fname))
+                                             (g-static-write! g
+                                                              (g-field-ty g si fi)
+                                                              (static-store-value item)
+                                                              sect
+                                                              (primitive/iadd off (g-field-off g si fi)))))
+                                   (_ (cga-fail "def initializer: a store that is not to a field of the aggregate"))))))
+                         0))
+              (TArray [elem count-extent]
+                (let [count (extent-value count-extent)]
+                      (do
+                        (for [i 0 (len (load body))]
+                          (let [store (al-at [Expr] body i)
+                                place (static-store-place store)]
+                            (if (= (primitive/cast i64 place) 0)
+                                (if (static-body-result? body i)
+                                    0
+                                    (cga-fail "def initializer: expected a materialized array"))
+                                (match (.kind place)
+                                  (EIndex [_ index]
+                                          (match (.kind index)
+                                            (EInt [item]
+                                                  (if (or (< item 0) (>= item count))
+                                                      (cga-fail "alloc-static initializer: array index is out of bounds")
+                                                      (g-static-write! g
+                                                                       elem
+                                                                       (static-store-value store)
+                                                                       sect
+                                                                       (primitive/iadd off
+                                                                                       (primitive/imul item (ty-size g elem))))))
+                                            (_ (cga-fail "alloc-static initializer: array index is not constant"))))
+                                  (_ (cga-fail "def initializer: a store that is not to an element of the array"))))))
+                        0)))
+              (_ (cga-fail "def initializer: materialized aggregate has the wrong type"))))
+      (_ (cga-fail "def initializer is not a link-time constant")))))
+
+(defn g-declare-statics! [(g (ptr Cga)) (p (ptr Program))] (-> i64)
+  (let [cs (load (field p consts))]
+    (for [i 0 (len (load cs))]
+      (let [cp (elem cs i)]
+        (when (.runtime cp)
+          (match (.ty cp)
+            (None [] (cga-fail "internal: checked def has no type"))
+            (Some [ty]
+                  (let [tp (box-type (.a g) ty)
+                        ; The C spelling, as the LLVM backend names it, so storage
+                        ; one unit defines is the symbol another declares.
+                        symname
+                          (g-mangle g (sconcat (.a g) "coil_def." (.name cp)))
+                        sym
+                          (if (.declared cp)
+                              ; Another unit defines it: an undefined symbol,
+                              ; addressed through the GOT (emit-sym-addr!).
+                              (mobj-add-sym! (mut (.obj g)) symname 0 0 true)
+                              (g-named-zero-global! g
+                                                    symname
+                                                    (ty-size g tp)
+                                                    (ty-align g tp)))
+                        (mut st) (zeroed GStatic)]
+                    ; Storage this program publishes for other units is external.
+                    (when (and (not (.declared cp))
+                               (g-unit-export? g (.name cp)))
+                      (set! (.ext (al-at [MSym] (field (field g obj) syms) sym))
+                            true)
+                      0)
+                    (set! (.name st)
+                          (.name cp))
+                    (set! (.ty st)
+                          ty)
+                    (set! (.symidx st)
+                          sym)
+                    (push! (mut (.statics g))
+                           st)
+                    (let [ms (al-at [MSym] (field (field g obj) syms) sym)]
+                      ; Include the concrete outer type in nested alloc-static
+                      ; identity. A full-source replacement may legally change a
+                      ; def's signature; its new Var must not reuse the old
+                      ; signature's cell merely because the public name matches.
+                      (set! (.selfname g)
+                            (match ty
+                              (TStruct [tn]
+                                       (sconcat (.a g)
+                                                (.name cp)
+                                                (sconcat (.a g) "." tn)))
+                              (_ (.name cp))))
+                      (set! (.nstatic g) 0)
+                      (unless (.declared cp)
+                        (g-static-write! g
+                                         tp
+                                         (field cp value)
+                                         (.sect ms)
+                                         (.off ms))
+                        0)))))
+          0)))
+    0))
+
+; pointee type of a TPtr/TRef value
+(defn ty-pointee [(t (ptr Type))] (-> Type)
+  (match (load t)
+    (TPtr [inner] (load inner))
+    (TRef [_m inner] (load inner))
+    (_ (do (cga-fail "load/store through a non-pointer") (TInt 64 true)))))
+
+; lazily-declared runtime symbols (malloc/free used by EAlloc heap / EFree).
+(defn g-runtime-sym! [(g (ptr Cga)) (nm (slice u8))] (-> i64)
+  (let [n (len (.syms (.obj g)))
+        (mut i) 0
+        (mut r) -1]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (when (= (.name (al-at [MSym]
+                                       (field (field g obj) syms)
+                                       (load i)))
+                         nm)
+                  (set! r (load i)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (if (>= (load r) 0)
+        (load r)
+        (mobj-add-sym! (mut (.obj g)) nm 0 0 true))))
+
+; ---- integers wider than a register ----------------------------------------
+; An i128 or u128 (any width from 65 to 128 bits) lives in a 16-byte slot, low
+; word first, and is passed and returned as a 16-byte composite: an even
+; register pair, as AAPCS64 passes __int128. Arithmetic works on register
+; pairs (lo, hi); a width under 128 keeps its high word canonical, sign- or
+; zero-extended from the width, as narrower integers keep their register.
+; Division, and conversion to and from floats, call compiler-rt's helpers.
+
+; ---- named calls ------------------------------------------------------------
+(defn g-leaf-inline-body? [(fd (ptr Func))] (-> bool)
+  (let [body (load (field fd body))]
+    (if (not (= (len (load body)) 1))
+        false
+        ; These nodes cannot redirect caller control flow or introduce lexical
+        ; cleanup. They cover the core Always wrappers (numeric primitives and
+        ; the callable-value trampoline) without pretending to be a general AST
+        ; inliner.
+        (match (.kind (elem body 0))
+          (EBin [_ _ _] true)
+          (ECmp [_ _ _] true)
+          (EIntUnary [_ _] true)
+          (ECast [_ _] true)
+          (ECallPtr [_ _] true)
+          (_ false)))))
+
+; ---- bit-struct access --------------------------------------------------------
+; layout info for a bit-struct: backing width + per-field low-bit offsets.
+(defn g-bits-info [(g (ptr Cga))
+                   (nm (slice u8))
+                   (fname (slice u8))
+                   (lowp (ptr i64))
+                   (widthp (ptr i64))
+                   (signedp (ptr bool))
+                   (backp (ptr i64))] (-> i64)
+  (let [si (g-struct-idx g nm)]
+    (when (< si 0)
+      (cga-fail2 "bit access on unknown struct: " nm))
+    (let [e (struct-at (field g layouts) si)]
+      (match (.layout e)
+        (LBits [backing offs]
+               (let [fi (g-field-idx g si fname)]
+                 (set! lowp (get (load offs) fi))
+                 (set! backp backing)
+                 (match (.ty (al-at [Field] (load (field e fields)) fi))
+                   (TInt [bits sg] (do (set! widthp bits) (set! signedp sg) 0))
+                   (TBool [] (do (set! widthp 1) (set! signedp false) 0))
+                   (_ (cga-fail "bit-struct field with non-int type")))))
+        (_ (cga-fail2 "bit access on non-bits struct: " nm))))))
+
+; parse a (possibly negative) plain-decimal float token — llvm-ir literals
+; (`<float 0.0, float 1.0, ...>`). The corpus never uses exponents, so a small
+; hand-rolled parser avoids pulling in an extra `extern strtod` declaration
+; that would collide with the one other modules already link in (gotcha:
+; extern decls aren't deduped across modules).
+(defn str->f64 [(s (slice u8))] (-> f64)
+  (let [n (len s)
+        neg
+          (and (> n 0)
+               (= (primitive/cast i64 (get s 0)) 45))
+        (mut i) (when neg 1)
+        (mut ip) 0
+        (mut fp) 0.0
+        (mut fdiv) 1.0
+        (mut infrac) false]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [c (primitive/cast i64 (get s (load i)))]
+                  (cond (= c 46) (set! infrac true)
+                        (or (< c 48)
+                            (> c 57))
+                          (cga-fail2 "llvm-ir: not a float token: " s)
+                        (load infrac)
+                          (do
+                            (set! fdiv (* (load fdiv) 10.0))
+                            (set! fp
+                                  (+ (load fp)
+                                     (/ (cast f64 (primitive/isub c 48))
+                                        (load fdiv)))))
+                        :else
+                          (set! ip
+                                (primitive/iadd (primitive/imul (load ip) 10)
+                                                (primitive/isub c 48)))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (let [v (+ (cast f64 (load ip)) (load fp))] (if neg (- 0.0 v) v))))
+
+; parse a (possibly negative) decimal integer token — llvm-ir literals.
+(defn str->i64 [(s (slice u8))] (-> i64)
+  (let [n (len s)
+        neg
+          (and (> n 0)
+               (= (primitive/cast i64 (get s 0)) 45))
+        (mut i) (when neg 1)
+        (mut v) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [c (primitive/cast i64 (get s (load i)))]
+                  (if (or (< c 48)
+                          (> c 57))
+                      (cga-fail2 "not an integer token: " s)
+                      (set! v
+                            (primitive/iadd (primitive/imul (load v) 10)
+                                            (primitive/isub c 48)))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (if neg (primitive/isub 0 (load v)) (load v))))
+
+; ============================ inline LLVM-IR subset ==========================
+; The corpus' (primitive/llvm-ir ...) bodies are straight-line SSA — no control flow, no
+; phi (verified inventory: slice/atomic/simd/mmio helpers). We lower them
+; structurally. Anything outside the implemented subset is a HARD ERROR that
+; prints the offending line.
+
+; tokenizer: split on whitespace and commas; '{', '}', '<', '>' self-delimit.
+(defn ir-tokens [(a (dyn Allocator)) (line (slice u8))] (-> (ptr (ArrayList (slice u8))))
+  (let [(mut toks) (ArrayList::new [(slice u8)] a)
+        n (len line)
+        (mut i) 0
+        (mut start) -1]
+    (loop (if (>= (load i) n)
+              (do
+                (when (>= (load start) 0)
+                  (push! (mut toks) (subslice line (load start) n)))
+                (break))
+              (do
+                (let [c (primitive/cast i64 (get line (load i)))]
+                  (if (or (= c 32)
+                          (= c 9)
+                          (= c 44))
+                      (do
+                        (when (>= (load start) 0)
+                          (push! (mut toks)
+                                 (subslice line (load start) (load i)))
+                          0)
+                        (set! start -1)
+                        0)
+                      (if (or (= c 123)
+                              (= c 125)
+                              (= c 40)
+                              (= c 41)
+                              (= c 60)
+                              (= c 62))
+                          (do
+                            (when (>= (load start) 0)
+                              (push! (mut toks)
+                                     (subslice line (load start) (load i)))
+                              0)
+                            (push! (mut toks)
+                                   (subslice line
+                                             (load i)
+                                             (primitive/iadd (load i) 1)))
+                            (set! start -1)
+                            0)
+                          (do
+                            (when (< (load start) 0)
+                              (set! start (load i)))
+                            0))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (box-al [(slice u8)] a (load toks))))
+
+; aggregate element info for extractvalue/insertvalue: given the agg type and
+; element index, produce (offset, element type).
+(defn ir-agg-elem [(g (ptr Cga)) (t (ptr Type)) (idx i64) (offp (ptr i64))] (-> Type)
+  (match (load t)
+    (TSlice [elem]
+            (if (= idx 0)
+                (do (set! offp 0) (TPtr elem))
+                (do (set! offp 8) (TInt 64 true))))
+    (TStruct [nm]
+             (let [si (g-struct-idx g nm)]
+               (when (< si 0)
+                 (cga-fail2 "llvm-ir: extract from unknown struct " nm))
+               (set! offp (g-field-off g si idx))
+               (.ty (al-at [Field]
+                           (load (field (struct-at (field g
+                                                          layouts)
+                                                   si)
+                                        fields))
+                           idx))))
+    (_ (do
+         (cga-fail "llvm-ir: extract/insert on unsupported aggregate")
+         (TInt 64 true)))))
+
+; shufflevector's <N x i32> mask: either `zeroinitializer` (all N indices 0,
+; i.e. a splat) or an explicit `<i32 IDX0, i32 IDX1, ...>` literal. Indices
+; are always compile-time-known integer literals in the corpus (never a
+; %name), so this reads them straight off the token stream rather than
+; building a runtime AVal — much simpler than indirecting through a register
+; per lane.
+(defn ir-shuffle-mask! [(a (dyn Allocator))
+                        (toks (ptr (ArrayList (slice u8))))
+                        (tokp (ptr i64))
+                        (n i64)] (-> (ptr (ArrayList i64)))
+  (let [(mut out) (ArrayList::new [i64] a)]
+    (if (= (get (load toks) (load tokp)) "zeroinitializer")
+        (do
+          (set! tokp (primitive/iadd (load tokp) 1))
+          (let [(mut k) 0]
+            (loop (if (>= (load k) n)
+                      (break)
+                      (do
+                        (push! (mut out) 0)
+                        (set! k (primitive/iadd (load k) 1)))))))
+        (do
+          (set! tokp (primitive/iadd (load tokp) 1))  ; skip "<"
+          (let [(mut k) 0]
+            (loop (if (>= (load k) n)
+                      (break)
+                      (do
+                        (set! tokp (primitive/iadd (load tokp) 1))  ; skip "i32"
+                        (push! (mut out)
+                               (str->i64 (get (load toks) (load tokp))))
+                        (set! tokp (primitive/iadd (load tokp) 1))
+                        (set! k (primitive/iadd (load k) 1)))))
+            (set! tokp (primitive/iadd (load tokp) 1)))))  ; skip ">"
+    (box-al [i64] a (load out))))
+
+; ============================ static asserts =================================
+; faithful port of codegen.coil const-eval (LLVM size/align/offset queries
+; replaced by this backend's own layout — same natural-layout answers).
+(defstruct GCEval [(v i64) (uns bool)])
+
+(defn mk-gcev [(v i64) (u bool)] (-> GCEval)
+  (GCEval :v v :uns u))
+
+(defn gcev-v [(c GCEval)] (-> i64)
+  (let [(mut p) (: c GCEval)] (.v p)))
+
+(defn gcev-u [(c GCEval)] (-> bool)
+  (let [(mut p) (: c GCEval)] (.uns p)))
+
+(defn g-user-fail [(msg (slice u8))] (-> i64)
+  (let [w (stderr)]
+    (print-str w "error: ")
+    (print-str w msg)
+    (write-byte w (: 10 u8))
+    (cga64.exit (: 1 i32))
+    0))
+
+(defn g-const-bin [(op i64) (l i64) (lu bool) (r i64) (ru bool)] (-> GCEval)
+  (let [uns (or lu ru)]
+    (mk-gcev (cond (= op 0) (primitive/iadd l r)
+                   (= op 1) (primitive/isub l r)
+                   (= op 2) (primitive/imul l r)
+                   (= op 7) (& l r)
+                   (= op 8) (| l r)
+                   (= op 9) (^ l r)
+                   (= op 10) (<< l r)
+                   (= op 11)
+                     (if uns
+                         (primitive/cast i64
+                                         (>> (primitive/cast u64 l)
+                                             (primitive/cast u64 r)))
+                         (>> l r))
+                   (= op 3)
+                     (if (= r 0)
+                         (do
+                           (g-user-fail "static-assert: divide/mod by zero")
+                           0)
+                         (if uns (primitive/udiv l r) (/ l r)))
+                   (= op 4)
+                     (if (= r 0)
+                         (do
+                           (g-user-fail "static-assert: divide/mod by zero")
+                           0)
+                         (if uns (primitive/urem l r) (% l r)))
+                   (= op 5)
+                     (if (= r 0)
+                         (do
+                           (g-user-fail "static-assert: divide/mod by zero")
+                           0)
+                         (primitive/udiv l r))
+                   (>= op 15) (const-overflow-test op l r uns)
+                   (>= op 12)
+                     (do (g-user-fail "static-assert: a rotate or high multiply does not fold") 0)
+                   (= r 0)
+                     (do (g-user-fail "static-assert: divide/mod by zero") 0)
+                   :else (primitive/urem l r))
+             uns)))
+
+(defn g-const-cmp [(op i64) (l i64) (lu bool) (r i64) (ru bool)] (-> GCEval)
+  (let [b
+          (cond (or lu ru)
+                  (let [lx (primitive/cast u64 l)
+                        rx (primitive/cast u64 r)]
+                    (cond (= op 0) (< lx rx)
+                          (= op 1) (<= lx rx)
+                          (= op 2) (> lx rx)
+                          (= op 3) (>= lx rx)
+                          (= op 4) (= lx rx)
+                          :else (!= lx rx)))
+                (= op 0) (< l r)
+                (= op 1) (<= l r)
+                (= op 2) (> l r)
+                (= op 3) (>= l r)
+                (= op 4) (= l r)
+                :else (!= l r))]
+    (mk-gcev (when b 1) false)))
+
+(defn g-const-eval [(g (ptr Cga)) (e (ptr Expr))] (-> GCEval)
+  (let [a (.a g)]
+    (match (.kind e)
+      (EInt [v] (mk-gcev v false))
+      (EBool [b] (mk-gcev (when b 1) false))
+      (EIf [c thn els]
+           (if (!= (gcev-v (g-const-eval g c)) 0)
+               (g-const-eval g thn)
+               (g-const-eval g els)))
+      (ESizeOf [t] (mk-gcev (ty-size g (box-type a t)) false))
+      (EAlignOf [t] (mk-gcev (ty-align g (box-type a t)) false))
+      (EOffsetOf [t fname]
+                 (match t
+                   (TStruct [nm]
+                            (let [si (g-struct-idx g nm)]
+                              (when (< si 0)
+                                (cga-fail2 "offset-of on unknown struct: " nm))
+                              (mk-gcev (g-field-off g
+                                                    si
+                                                    (g-field-idx g si fname))
+                                       false)))
+                   (_ (do
+                        (g-user-fail "static-assert: offset-of on non-struct")
+                        (mk-gcev 0 false)))))
+      (ECast [t inner]
+             (mk-gcev (gcev-v (g-const-eval g inner))
+                      (match t (TInt [bits s] (not s)) (_ false))))
+      (EBin [op lhs rhs]
+            (let [lc (g-const-eval g lhs)
+                  rc (g-const-eval g rhs)]
+              (g-const-bin op (gcev-v lc) (gcev-u lc) (gcev-v rc) (gcev-u rc))))
+      (ECmp [op lhs rhs]
+            (let [lc (g-const-eval g lhs)
+                  rc (g-const-eval g rhs)]
+              (g-const-cmp op (gcev-v lc) (gcev-u lc) (gcev-v rc) (gcev-u rc))))
+      (_ (do
+           (g-user-fail "static-assert: only int literals, sizeof/alignof/offsetof, casts, arithmetic and comparisons are allowed")
+           (mk-gcev 0 false))))))
+
+(defn g-eval-asserts! [(g (ptr Cga)) (mp (ptr Program))] (-> i64)
+  (let [asserts (load (field mp asserts))
+        n (len (load asserts))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [sa (al-at [StaticAssert] asserts (load i))]
+                  (when (= (gcev-v (g-const-eval g (field sa cnd)))
+                           0)
+                    (let [w (stderr)]
+                      (print-str w "error: static assertion failed: ")
+                      (print-str w (.msg sa))
+                      (write-byte w (: 10 u8))
+                      (cga64.exit (: 1 i32))
+                      0)))
+                (set! i (primitive/iadd (load i) 1))))))
+  0)
+
+;;; Add built DWARF (`dw`) to the MObj as __DWARF sections, with the __text
+;;; section relocations dsymutil needs.
+(defn g-add-dwarf-sections! [(g (ptr Cga)) (dw (ptr DwOut))] (-> i64)
+  (let [dbgattr 33554432
+              sline
+                (mobj-add-sect! (mut (.obj g))
+                                "__DWARF"
+                                "__debug_line"
+                                0
+                                dbgattr)
+              sinfo
+                (mobj-add-sect! (mut (.obj g))
+                                "__DWARF"
+                                "__debug_info"
+                                0
+                                dbgattr)
+              sabbr
+                (mobj-add-sect! (mut (.obj g))
+                                "__DWARF"
+                                "__debug_abbrev"
+                                0
+                                dbgattr)
+              sstr
+                (mobj-add-sect! (mut (.obj g))
+                                "__DWARF"
+                                "__debug_str"
+                                0
+                                dbgattr)]
+          (b-bytes! (mut (mobj-sect-buf (mut (field g obj)) sline))
+                    (slice (load (load (field dw
+                                              line)))))
+          (b-bytes! (mut (mobj-sect-buf (mut (field g obj)) sinfo))
+                    (slice (load (load (field dw
+                                              info)))))
+          (b-bytes! (mut (mobj-sect-buf (mut (field g obj)) sabbr))
+                    (slice (load (load (field dw
+                                              abbrev)))))
+          (b-bytes! (mut (mobj-sect-buf (mut (field g obj)) sstr))
+                    (slice (load (load (field dw
+                                              strs)))))
+          ; location lists (tpde's), offsets relative to the CU's base: no relocations
+          (when (> (len (load (.loc (load dw)))) 0)
+            (let [sloc (mobj-add-sect! (mut (.obj g)) "__DWARF" "__debug_loc" 0 dbgattr)]
+              (b-bytes! (mut (mobj-sect-buf (mut (field g obj)) sloc)) (slice (load (.loc (load dw)))))))
+          (let [rl (load (field dw relocs))
+                nr (len (load rl))
+                (mut i) 0]
+            (loop (if (>= (load i) nr)
+                      (break)
+                      (do
+                        (let [r (al-at [DwReloc] rl (load i))]
+                          ; a SECTION reloc targeting __text (negative sym = -(section ordinal),
+                          ; r_extern=0 in the writer) — clang's Mach-O DWARF scheme, the one dsymutil
+                          ; relocates per-function via the debug map.
+                          (mobj-add-reloc! (mut (.obj g))
+                                           (if (= (.sect r)
+                                                  1)
+                                               sinfo
+                                               sline)
+                                           (.off r)
+                                           (primitive/isub 0
+                                                           (.text g))
+                                           (reloc-unsigned)
+                                           false
+                                           3))
+                        (set! i (primitive/iadd (load i) 1)))))))
+  0)
+
+; serialize a built object to disk — the AOT path.
+(defn native-last-needs-curl-cell [] (-> (ptr bool))
+  (field (native-unit-state) curl))
+
+(defn native-last-needs-llvm-cell [] (-> (ptr bool))
+  (field (native-unit-state) llvm))
+
+(defn native-last-needs-curl? [] (-> bool)
+  (load (native-last-needs-curl-cell)))
+
+(defn native-last-needs-llvm? [] (-> bool)
+  (load (native-last-needs-llvm-cell)))
+
+(defn native-probe-name [(a (dyn Allocator))
+                        (left (slice u8))
+                        (right (slice u8))] (-> (slice u8))
+  (let [(mut b) (ArrayList::new [u8] a)]
+    (b-bytes! (mut b) left)
+    (b-bytes! (mut b) right)
+    (slice (load b))))
+
+; ============================ DWARF collection ===============================
+; rendered, memo-stable name for a type's DIE
+
+
+; type -> DwTy index, or -1 when we deliberately don't describe it (sums,
+; fnptrs, vecs, non-C struct layouts — mirrors the DI-type policy:
+; never a wrong type).
+
+;; A type's DwTy index (debuginfo.coil's shared translation), or -1.
+(defn dw-ty-of! [(g (ptr Cga)) (t (ptr Type))] (-> i64)
+  (dbg-ty-of! (field g dwtypes) (field g layouts) (.a g) t))
+

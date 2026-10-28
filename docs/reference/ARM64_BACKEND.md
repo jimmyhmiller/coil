@@ -1,62 +1,37 @@
-# The arm64 backend (selfhost, zero-deps)
+# arm64 code generation
 
-A second backend for the **self-hosted** Coil compiler (`src/compiler/`), written
-in Coil, that lowers the monomorphized `Program` directly to AArch64 machine code
-in a Mach-O object — no LLVM anywhere in the path. It is the **debug backend**:
-DWARF (line tables + subprograms + frame variables) is always on, generated-code
-quality is secondary, and compile speed is primary (target: ≥10× faster than the
-LLVM backend end-to-end).
+All arm64 code the compiler emits comes from the **tpde backend**: `--backend
+arm64` (and its alias `--backend tpde`), the native default and `-g`, compile-time
+units, metaprograms built in memory, the JIT and `coil repl`, and the LLVM-free
+compiler (`src/compiler/main_a64.coil`). It lowers the monomorphized `Program` to
+CIR, an SSA IR, and compiles each function with tpde's single-pass register
+allocator into AArch64 code in a Mach-O object — no LLVM anywhere in the path. It
+replaced a slot-per-value emitter (`codegen_a64.coil`'s expression lowering,
+deleted), which tpde outran by an order of magnitude at -O0 while producing
+register-allocated code.
 
 ## Files
-- `src/compiler/object/a64.coil` — AArch64 instruction encoder. Pure: appends u32
-  instructions to a code buffer; label/fixup management for branches.
-- `src/compiler/object/macho.coil` — Mach-O `MH_OBJECT` writer: sections, relocations
-  (`BRANCH26`, `PAGE21`, `PAGEOFF12`, `UNSIGNED`), symbol table, string table.
-- `src/compiler/object/dwarf.coil` — DWARF v4 emitters: `__debug_line` (per-expression
-  rows), `__debug_abbrev`/`__debug_info` (CU, subprograms, params/locals),
-  `__debug_str`.
-- `src/compiler/backend/codegen_a64.coil` — the lowering: mono `Program` → code+data+
-  relocs+DWARF. Mirrors `codegen.coil`'s `emit-expr` structure and semantics
-  (the LLVM backend is the behavioral spec) but emits machine code.
-- `src/compiler/main.coil` — `build <file> -o out --backend arm64` plumbs the
-  same pipeline into the new backend. The object is written under `/tmp`, passed
-  to the linker driver with a direct argv-based spawn, and removed after linking;
-  `coil build -o <out>` leaves only `<out>`.
-
-## Code generation model (deliberately naive — it's a debug backend)
-- **Everything lives in fp-relative stack slots.** Each expression result is
-  materialized into a fresh entry-frame slot; each `let` binding gets a stable
-  named slot for its whole scope. No register allocation, no liveness. This is
-  what makes precise DWARF frame-variables trivial: every binding has one
-  fp-relative location for its lifetime.
-- Scratch regs: x8–x15 (int/ptr), d0–d7/v16.. (float/vec) — used only within a
-  single expression's emission, never across statements.
-- Frame: `stp x29,x30,[sp,#-16]!; mov x29,sp`, then `sp -= frame` through a
-  `movz/movk` x16 (any frame the 48-bit address space can hold) and `x28 = sp +
-  outbytes`, all back-patched after the function body is emitted. fp chain
-  intact everywhere → lldb backtraces work without eh_frame. The epilogue
-  restores sp from x29, so `alloc-stack-bytes` simply moves sp down at run time
-  and hands out the bytes above the outgoing-args area (another back-patched
-  `sp + outbytes`).
-- Aggregates are slot-resident by value; copies are inline `ldr/str` loops
-  (small) or `memcpy` calls (large).
-- **One calling convention: AAPCS64 (Apple)** for both internal functions and
-  externs — reuses the `abi-classify-aapcs64` classifier already ported in
-  `codegen.coil`. Small structs ≤16B in x-pairs (HFA in v-regs), >16B indirect
-  via x8 (sret) / caller copy. Named arguments past the registers use Apple's
-  packed stack layout: a scalar at its natural size and alignment (an i32 takes
-  4 bytes), each float of an HFA at the float's alignment, other aggregates in
-  8-byte-aligned words; a 16-aligned composite starts at an even register.
-  Variadic calls: Apple rule — anonymous args go on the stack in 8-byte slots,
-  a struct over 16 bytes as a pointer to a copy. `(vec f32 4)` internally passes
-  in q-regs.
-- Sum construct/match, slices, EIf/ELoop divergence discipline, entry-alloca
-  discipline: all mirror `codegen.coil` exactly (see the lowering spec that
-  file embodies; tag = i32 variant index at offset 0, payload = `[words x i64]`).
+- `src/compiler/backend/codegen_tpde.coil` — the lowering: mono `Program` → CIR,
+  one function at a time, then tpde → machine code. It mirrors the LLVM backend's
+  lowering decisions (sum layout `{i32 tag, payload at 8}`, slices `{ptr, i64}`,
+  divergence, AAPCS64 at every call); `codegen.coil` stays the behavioral spec.
+  For an x86-64 Mach-O target it writes System V code instead.
+- `src/compiler/backend/codegen_tpde_ir.coil` — the `llvm-ir` escape hatch (below).
+- `src/compiler/backend/native_module.coil` — the module layer the lowering runs
+  on: signatures, layouts and their natural C offsets (which compile-time readback
+  walks), statics and their initializers, `export-c` thunks, AAPCS64 argument
+  classification, string interning, DWARF types, and the Mach-O object.
+- `src/compiler/tpde/` — the tpde package, vendored from
+  [coil-tpde](https://github.com/jimmyhmiller/coil-tpde) (`NOTICE` names the commit):
+  CIR, the analyzer, the compiler core, the arm64 and x86-64 layers, the assembler
+  and the object writers.
+- `src/compiler/object/macho.coil`, `src/compiler/object/dwarf.coil` — the Mach-O
+  writer and the DWARF emitters.
 
 ## The `llvm-ir` escape hatch
 The corpus' inline-IR surface is finite and straight-line (no control flow, no
-phi). The backend contains a small IR-subset lowerer: after `$N/$tN/$ret`
+phi). `codegen_tpde_ir.coil` lowers a small IR subset, with the line tokenizer
+and operand helpers of `native_module.coil`: after `$N/$tN/$ret`
 substitution it parses each line and lowers structurally:
 - `insertvalue`/`extractvalue` on `{ptr,i64}`-shaped aggregates (slices) and
   cmpxchg results; `undef`/`poison`; `ret`.
@@ -80,7 +55,7 @@ substitution it parses each line and lowers structurally:
   `@llvm.vector.reduce.fadd.v4f32`, `@llvm.sqrt.v4f32`,
   `@llvm.masked.gather.v4i8.v4p0`) → NEON, all scalarized lane-by-lane (this
   keeps results bit-identical to the LLVM backend's, which is what the
-  runtime corpus gate compares — see `codegen_a64.coil`'s `emit-vec-fbin!`).
+  runtime corpus gate compares).
 - scalar float math intrinsics (`@llvm.<op>.f32` / `.f64`, the operations
   `coil.math` is written over; the table is `src/compiler/backend/float_math.coil`) →
   `fsqrt`, `fabs`, `frintm`/`frintp`/`frintz`/`frinta`/`frintn`, `fmadd`, and
@@ -103,87 +78,26 @@ compiling. A per-op test file (`llvm-ir-ops.coil`) covered every op above until
 the test restructure of 2026-10-12 removed it; the ops are now exercised only
 where the corpus and SIMD tests reach them.
 
-## DWARF (always on)
-DWARF v4: CU (language C, not-optimized),
-one `DW_TAG_subprogram` per function at its `defn` line with linkage name,
-per-expression line rows from Expr spans (skip spans from other sources),
-`DW_TAG_formal_parameter`/`DW_TAG_variable` with `DW_OP_fbreg` locations
-(frame base = x29), base/pointer/struct/array/slice DI types. DWARF lives in
-the `.o`; the linker's debug map makes lldb find it (same as `clang -g` without
-dsymutil).
+## Debug info
+On by default for native builds (`-g0` / `--no-debug` turn it off): line rows per
+expression, a subprogram per function, parameters and locals. A value's location
+follows tpde's register placement as a location list, or a debug shadow slot in
+the function's frame. A leaf that needs no other stack slot drops that frame —
+setting one up in every small leaf cost `prop_bench` 75% — so its parameters are
+visible only while live. Under `-g` every function keeps its frame, and a
+parameter stays visible after its last use. Mach-O convention: the debug sections
+carry no relocations; the linker's debug map, or the `.dSYM` that `build -g`
+gathers, lets lldb find them.
 
 ## Gates (behavioral — runtime equality, not IR equality)
-The arm64 backend is held to the LLVM backend's behaviour by the runtime corpus
-(`tests/corpus`, see `docs/reference/COMPILER_TESTS.md`): eight self-checking
-programs whose references were blessed only where the arm64 and LLVM builds
-agree. They cover narrow-width wraparound and signed division, NaN-aware float
-comparison and f32 rounding, ABI stress (stack arguments, every AAPCS64 struct
-class, HFAs, sret), large aggregate copies, labelled break and continue, odd-width
-bitfields, variadic snprintf and qsort callbacks, deep recursion, nested sums,
-atomics and static globals.
+arm64 code is held to the LLVM backend's behaviour by the runtime corpus
+(`tests/corpus`, see `docs/reference/COMPILER_TESTS.md`): self-checking programs
+whose references were blessed only where the arm64 and LLVM builds agree.
 - `python3 scripts/oracle.py corpus arm64 --compiler <bin>` builds each program
   with `--backend arm64`, runs it, and compares stdout and the exit status with
   the reference. FAST runs it as `corpus/arm64`; the LLVM-free bootstrap gates on it.
-- `python3 scripts/oracle.py corpus bless --compiler <bin>` rewrites the references,
-  refusing any program whose arm64 and LLVM builds disagree.
 - `scripts/tests/c-abi.py` (FAST `c-abi`) links arm64 and LLVM objects together
   and against C.
-- lldb: FAST's `cli/debuginfo` step sets a breakpoint by line and reads a
-  variable from a `-g` build.
-- The finale: the arm64-built self-host compiler must itself pass the runtime
-  corpus (it is a working compiler), and `bench` compile-time comparison
-  must show ≥10× vs the LLVM backend on both a small program and
-  `src/compiler/main.coil`.
-
-## Results (2026-07-01, M-series host, hyperfine, warm)
-Same compiler binary (`coil-self`, O3-built stage1), LLVM backend vs
-`--backend arm64`, end-to-end `build` including the `cc` link:
-
-| input                              | LLVM (O3) | arm64    | speedup |
-|------------------------------------|-----------|----------|---------|
-| `src/compiler/main.coil` (whole compiler, ~15k lines w/ libs) | 7.995 s | **0.467 s** | **17.1×** |
-| `src/examples/json.coil`               | 89.4 ms   | 52.9 ms  | 1.7×    |
-| `src/examples/fib.coil`                | 55.4 ms   | 51.4 ms  | 1.1×    |
-
-The ≥10× target is beaten on the input that matters (the compiler itself).
-Small programs are bound by the shared `cc`-link + process floor (~45 ms);
-the compile phase itself is uniformly far faster (the arm64 backend emits the
-whole self-host compiler's code in ~50 ms after the 0.4 s frontend — faster
-than merely *printing* the LLVM IR takes on the LLVM path).
-
-Generated-code quality trade-off (expected for a debug backend): the
-arm64-built compiler runs the full pipeline ~12× slower than the O3 build
-(5.5 s vs 0.47 s building main.coil). Shipping config: build the compiler
-once with the LLVM backend, iterate with the arm64 backend.
-
-## Status / progress log
-- [x] Architecture survey, lowering spec, llvm-ir + extern + DWARF inventories.
-- [x] Behavioral snapshot harness (now `python3 scripts/oracle.py corpus arm64`).
-- [x] a64 encoder (llvm-mc-verified) + spike: fib → .o → link → runs (exit 55).
-- [x] Mach-O writer (BRANCH26/PAGE21/PAGEOFF12/UNSIGNED relocs, symbol permutation).
-- [x] Full Expr lowering: **42/42 behavioral corpus gate** (sums/match, slices,
-      strings, closures, hashmaps, json, lisp, dyn dispatch, fnptr/callptr,
-      casts, arbitrary-width ints incl. u2, floats, bitfield structs, explicit
-      layouts, AAPCS64 struct-by-value + variadic + sret, atomics via LSE
-      (ldaddal/swpal/casal/ldar/stlr), vectors scalarized per-lane (exact IEEE),
-      threads through pthread fnptrs). Gate teeth proven: caught 12 segfaults
-      (copy-helper reg clobber + inverted tail conditions) and a u2-width
-      miscompile before passing.
-- [x] DWARF v4 always-on (debug backend): CU with address range, subprograms
-      at defn lines, per-expression line rows with prologue_end, params/locals
-      as DW_OP_fbreg over x29 (mut vars via deref; `.slot` internals hidden),
-      DI types for scalars/pointers/structs/slices/arrays (sums omitted — never
-      a wrong type). Mach-O convention: debug sections carry NO relocations
-      (section-relative addresses; ld64 debug map + lldb translate).
-      debugger checks: name+file:line breakpoints land post-prologue at
-      source lines, `frame variable` shows typed values, `p *p` renders
-      structs, slices render as {data,len}.
-- [x] Self-host-via-arm64 bootstrap + oracle gates (`python3 scripts/dev.py build full`):
-      stage2/stage3 pass gate-full; stage2.o == stage3.o byte-identical.
-- [x] :shim conventions natively (trampoline + register-constrained call
-      sites) + frem-via-fmod — `everything.coil` and `shim.coil` compile and run
-      correctly (the self-host LLVM backend cannot build them): corpus gate now
-      **44/44**.
-- [x] 10× bench report (see Results above: 17.1× on the compiler itself).
-- [ ] (future) direct executable emission + ad-hoc codesign to drop the `cc`
-      link and its ~45 ms floor on small programs.
+- FAST's `cli/debuginfo` step sets a breakpoint by line in a `-g` build and reads a
+  parameter and a local; `cli/run` checks that a never-returning self tail call is
+  a jump, a million deep.

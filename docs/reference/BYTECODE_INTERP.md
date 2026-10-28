@@ -28,7 +28,7 @@ in compiled code, because they *are* the same operations on the same memory.
 
 ## Value model
 
-A VM value is a single `i64` cell, mirroring codegen_a64's `AVal`:
+A VM value is a single `i64` cell, as the native backends' values were:
 
 | Coil value        | cell contents                                             |
 |-------------------|-----------------------------------------------------------|
@@ -103,7 +103,7 @@ instruction indices after the body is emitted (`resolve-labels`).
 Compilation is single-pass and type-directed: `compile-expr` emits an
 expression's code (leaving exactly one value on the operand stack unless the path
 diverged) and **returns its static `Type`** — the direct analogue of
-codegen_a64's `emit-expr` returning an `AVal`. Types flow upward so arithmetic
+a native backend's expression emitter returning its value. Types flow upward so arithmetic
 opcodes know int-vs-float, width, and signedness.
 
 | op | name         | operands                     | effect |
@@ -166,7 +166,7 @@ one cell per symbol, and a second definition is the same error a link reports.
 - `mode`: 0 = integer, 1 = `f32`, 2 = `f64`.
 - integer `BIN` `signbits` (`c`) packs `signed | (bits << 1)` so the result can be
   canonicalized to width `bits` afterward.
-- `BIN` op codes match codegen_a64's `emit-bin`: `0 add 1 sub 2 mul 3 div 4 rem
+- `BIN` op codes match the native backends' binary operators: `0 add 1 sub 2 mul 3 div 4 rem
   5 udiv 6 urem 7 and 8 or 9 xor 10 shl 11 shr`. Signed vs unsigned div/rem/shr
   chosen from the type's signedness.
 - `CMP` op codes: `0 lt 1 le 2 gt 3 ge 4 eq 5 ne`. Unsigned integer comparisons
@@ -175,7 +175,7 @@ one cell per symbol, and a second definition is the same error a link reports.
 ### Control flow and divergence
 
 `compile-expr` tracks a `term` (terminated) flag on the builder, mirroring
-codegen_a64's `terminated`. `break`/`continue` set it; `EIf` merges the flags of
+the native backends' `terminated`. `break`/`continue` set it; `EIf` merges the flags of
 its branches; sequence compilation stops emitting after a terminated statement
 (dead code). Each non-diverging path pushes exactly one value, so the operand
 stack stays balanced at control-flow joins. Loops allocate a hidden result local:
