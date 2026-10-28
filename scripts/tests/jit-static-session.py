@@ -61,6 +61,8 @@ GROUPS: dict[str, list[str]] = {
                     "cimport_header_change"],
     # Run with the project below as the working directory.
     "project": ["repl_import_var", "project_context", "project_free", "defalias_imports"],
+    # Run in a directory whose Coil.toml has an unknown key.
+    "broken-project": ["project_manifest_error"],
     # Run with the scratch directory as the namespace root, for its source providers.
     "providers": ["static_no_replay", "static_reader", "designated_entry_revisions"],
     # COIL_META_MAIN=1 changes how every compile in the process runs metaprograms.
@@ -150,6 +152,21 @@ def make_project(work: Path) -> Path:
     return project
 
 
+def make_broken_project(work: Path) -> Path:
+    project = work / "broken-project"
+    project.mkdir()
+    (project / "Coil.toml").write_text('[package]\nname = "broken"\nentrypoint = "main.coil"\n')
+    return project
+
+
+def broken_manifest_checks(project: Path) -> None:
+    terminal = subprocess.run([str(COMPILER), "repl"], cwd=project, text=True, input=":quit\n",
+        capture_output=True, timeout=120, env=TOOLCHAIN_ENV)
+    assert terminal.returncode == 1, (terminal.returncode, terminal.stdout, terminal.stderr)
+    assert "error: Coil.toml:3: unknown key 'entrypoint'" in terminal.stderr, (terminal.stdout, terminal.stderr)
+    print("PASS: the terminal REPL reports a malformed manifest and exits 1", flush=True)
+
+
 def make_providers(work: Path) -> Path:
     providers = work / "providers"
     providers.mkdir()
@@ -216,8 +233,10 @@ def main() -> None:
         build_env = dict(TOOLCHAIN_ENV, COIL_NAMESPACE_ROOTS=str(FIXTURES))
 
         project = make_project(work)
+        broken = make_broken_project(work)
         providers = make_providers(work)
         terminal_repl_checks(project)
+        broken_manifest_checks(broken)
         # A module that opts into the REPL's Var lowering builds ahead of time too.
         aot_binary = work / "repl-var-module-aot"
         run(COMPILER, "build", project / "src/aot.coil", "-o", aot_binary, *flags, cwd=project)
@@ -239,6 +258,8 @@ def main() -> None:
                 env["COIL_NAMESPACE_ROOTS"] = SESSION_ROOTS[group]
             if group == "project":
                 cwd = project
+            if group == "broken-project":
+                cwd = broken
             if group == "providers":
                 env["COIL_NAMESPACE_ROOTS"] = str(providers)
                 args = [providers / "dependency.coil"]
