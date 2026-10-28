@@ -1302,6 +1302,10 @@ evens=3 total=10
   An inline list owns its elements: it drops the ones it holds, and only those,
   and its operations borrow it, so pass `(used xs)` where a function takes a
   collection by value.
+- A map's `(get m k)` copies the value it finds, as a list's `get` does, so for a
+  value that owns something it is refused: `(get-ptr m k)` gives `(Some p)`, a
+  pointer to the value where it lies, valid until the map is next edited.
+  `(for-entries [k v (mut m)] …)` lends each key and value.
 - `HashMap` keys that are strings need key operations: coil.str's `(keyops)` copies
   keys into the map, while `(keyops-borrowed)` borrows them.
 - A collection's own operations are methods. A list has `(cap xs)`,
