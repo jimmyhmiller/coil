@@ -154,6 +154,37 @@ EOF
     bad "the REPL prints a value whose type has no Debug from its structure" "exit $rc: $out"
   fi
 
+  # A Code-signed main is a metaprogram run whatever annotations it carries. The
+  # source it prints keeps two fresh identifiers apart, and stdin it reads is a
+  # registered source whether it is named `-` or implied.
+  printf '(module run-annotated)\n(defannotation :flag bool)\n(defn main :flag true [] (-> Code) (quote (value 42)))\n' > "$T/annotated-main.coil"
+  out=$("$COIL" run "$T/annotated-main.coil" 2>&1); rc=$?
+  [ "$rc" = 0 ] && [ "$out" = "(value 42)" ] && ok "run: an annotated Code-signed main is a metaprogram run" \
+    || bad "run: an annotated Code-signed main is a metaprogram run" "exit $rc: $out"
+  cat > "$T/fresh-main.coil" <<'EOF'
+(module fresh-runner)
+(import "coil.primitive" :as p)
+(defn main [] (-> Code)
+  (let [x (p/fresh-identifier "tmp") y (p/fresh-identifier "tmp")]
+    `(do (module generated)
+         (defn main [] (-> i64) (let [~x 1 ~y 2] (+ ~x ~y))))))
+EOF
+  if "$COIL" run "$T/fresh-main.coil" > "$T/fresh-generated.coil" 2>&1; then
+    expect_rc 3 "run: a Code main's printed source keeps fresh identifiers apart" "$COIL" run "$T/fresh-generated.coil"
+  else
+    bad "run: a Code main's printed source keeps fresh identifiers apart" "$(cat "$T/fresh-generated.coil")"
+  fi
+  cat > "$T/stdin-main.coil" <<'EOF'
+(module stdin-reflection)
+(import "coil.primitive" :as p)
+(defn main [(input Code)] (-> Code)
+  (let [node (p/code-nth input 0)]
+    `(at ~(p/code-file node) ~(p/code-line node) ~(p/code-col node))))
+EOF
+  out=$(printf '\n  hello' | "$COIL" run "$T/stdin-main.coil" 2>&1); rc=$?
+  [ "$rc" = 0 ] && [ "$out" = '(at "/dev/stdin" 2 3)' ] && ok "run: implied stdin is a source to code-file and code-line" \
+    || bad "run: implied stdin is a source to code-file and code-line" "exit $rc: $out"
+
   # Tail calls a million deep at -O0, where no optimizer rescues a plain call:
   # one passes a pointer it read through its incoming pointer, one never returns
   # (the checker follows its call with a loop). A frame per call overflows the
@@ -403,7 +434,63 @@ section_check() {
 (defsum Mine (Packed))\n(defstruct S :layout (Packed) [(a u8)])|:layout value has type layout-case.Mine but expected coil.layout.Layout
 (defstruct S :does/not-exist true [(a u8)])|unknown annotation ':does/not-exist'
 (defsum T :inline (Always) (A))|annotation ':inline' applies to functions, not types
+(defstruct S :layout (layout/Align (+ 8 8)) [(a u8)])|:layout takes a coil.layout.Layout
+(def X [1 2 3]) (def Y X) (defn use-y [] (-> i64) (get Y 1))|a def's initializer cannot read the def 'X'
+(defn mk [] (-> (slice i64)) (let [k 3] [1 2 k]))|returns a slice of an array literal that this call's frame holds
+(const target (helper)) (defn helper [] (-> i64) target) (defn stage [] (-> Code) `(do ~target)) (defn use-it [] (-> i64) (stage))|this compile-time value depends on itself
 EOF
+  # Code has no runtime layout: a runtime function asking for it is compile-time
+  # code, and a runtime entry that reaches it is a located error.
+  printf '(module code-size)\n(defn main [] (-> i64) (sizeof Code))\n' > "$T/code-size.coil"
+  expect_rc_out 1 "names a type that exists only at compile time" "build: a runtime layout query of Code is a located error" \
+    "$COIL" build "$T/code-size.coil" -o "$T/code-size"
+  # With no bundled library, a registered transform needs nothing from the
+  # language's prelude: the compiler's own runtime support names its primitives.
+  mkdir -p "$T/no-stdlib/src"
+  cp "$ROOT/src/stdlib/primitive.coil" "$ROOT/src/stdlib/cc.coil" "$ROOT/src/stdlib/phase.coil" "$T/no-stdlib/src/"
+  printf '[package]\nname = "nostd"\nentry = "src/a.coil"\nsource-roots = ["src"]\n\n[language]\nstdlib = false\nprelude = "tiny.core"\n' > "$T/no-stdlib/Coil.toml"
+  printf '(module tiny.core)\n(import "coil.primitive" :use * :reexport)\n(defn* answer [] (-> i64) 42)\n' > "$T/no-stdlib/src/tiny.coil"
+  printf '(module nostd.a)\n(import "coil.phase" :as phase)\n(defn* keep [(program Code)] (-> Code) program)\n(transform keep :phase (phase/AfterExpand))\n(defn* main [] (-> i64) (answer))\n' > "$T/no-stdlib/src/a.coil"
+  out=$(cd "$T/no-stdlib" && "$COIL" run 2>&1); rc=$?
+  [ "$rc" = 42 ] && ok "a transform runs in a program with no bundled library" \
+    || bad "a transform runs in a program with no bundled library" "exit $rc: $out"
+  # A prelude that re-exports coil.primitive makes its primitives every module's.
+  printf '(module tiny.core)\n(import "coil.primitive" :use * :reexport)\n(defn* answer [] (-> i64) 42)\n' > "$T/no-stdlib/src/tiny.coil"
+  printf '(module nostd.a)\n(defn* main [] (-> i64) (let* [cell (alloc-static i64)] (store! cell 40) (iadd (load cell) 2)))\n' > "$T/no-stdlib/src/a.coil"
+  out=$(cd "$T/no-stdlib" && "$COIL" run 2>&1); rc=$?
+  [ "$rc" = 42 ] && ok "a prelude's re-exported primitives are ambient" \
+    || bad "a prelude's re-exported primitives are ambient" "exit $rc: $out"
+  # A defcc's :lower is a constructor as written; a call there is refused with
+  # the defcc's own message, not as a call to an undefined function.
+  printf '(module defcc-case)\n(import "coil.cc" :as cc)\n(defn pick [] (-> cc/Lowering) (cc/Shim))\n(defcc mine :params [x0] :ret x0 :lower (pick))\n(defn main [] (-> i64) 0)\n' > "$T/defcc-call.coil"
+  expect_rc_out 1 ":lower takes a coil.cc.Lowering" "check: a call in a defcc's :lower is refused as not a constructor" \
+    "$COIL" check "$T/defcc-call.coil"
+  # A primitive the module defines may be in its explicit export list, and its
+  # importers call it.
+  mkdir -p "$T/prim-export"
+  printf '(module primlib)\n(export add)\n(defprimitive add :iadd)\n' > "$T/prim-export/primlib.coil"
+  printf '(module primapp)\n(import "primlib" :as p)\n(defn main [] (-> i64) (p/add 40 2))\n' > "$T/prim-export/primapp.coil"
+  expect_rc 42 "a module's explicit export list names a primitive it defines" "$COIL" run "$T/prim-export/primapp.coil"
+  # A facade passes a primitive on through `:reexport` as it passes on a
+  # function, renamed or not, and may name it in its export list.
+  printf '(module primfacade)\n(export add)\n(import "primlib" :use [add] :reexport)\n' > "$T/prim-export/primfacade.coil"
+  printf '(module primuser)\n(import "primfacade" :as f)\n(import "primfacade" :use [add] :rename [[add plus]])\n(defn main [] (-> i64) (plus (f/add 30 10) 2))\n' > "$T/prim-export/primuser.coil"
+  expect_rc 42 "a primitive re-exported through a facade reaches its importers" "$COIL" run "$T/prim-export/primuser.coil"
+  # Reflection reads a type where the argument was written: an alias-qualified
+  # macro argument in one of several modules of one file.
+  printf '(module model) (export Point) (defstruct Point [(x i64) (y i64)])\n(module lib) (export inspect) (defstruct Point [(wrong i64)])\n(import "coil.primitive" :as p)\n(defn inspect [(type Code)] (-> Code) (if (= (p/code-field-count type) 2) (quote 42) (quote 0)))\n(module app) (import "model" :as m) (import "lib" :use [inspect])\n(defn answer [] (-> i64) (inspect m/Point))\n' > "$T/refl-modules.coil"
+  expect_rc 0 "reflection resolves a macro argument in the module of the form that wrote it" \
+    "$COIL" build "$T/refl-modules.coil" --lib -o "$T/refl-modules.a"
+  # A file that declares the prelude's module is this compilation's prelude: with
+  # compile-time units off, nothing defines the core macros twice.
+  expect_rc 0 "check: the prelude's own source checks with compile-time units off" \
+    env COIL_CT_UNITS=0 "$COIL" check "$ROOT/src/compiler/prelude.coil"
+  # A macro may generate an import of a module nothing had loaded yet.
+  mkdir -p "$T/gen-import"
+  printf '(module defs)\n(export answer)\n(defn answer [] (-> i64) 42)\n' > "$T/gen-import/defs.coil"
+  printf '(module gen-import)\n(defn generate [] (-> Code) (quote (import "defs" :use [answer])))\n(generate)\n(defn main [] (-> i64) (answer))\n' > "$T/gen-import/main.coil"
+  expect_rc 42 "a macro-generated import loads a module nothing had loaded" \
+    "$COIL" run "$T/gen-import/main.coil"
   # A register's :access is a coil.mmio.Access, decided by what its constructor
   # names, not by how it is spelled.
   printf '(module mmio-case)\n(import "coil.mmio" :as mmio)\n(defsum Mine (ReadOnly))\n(mmio/defmmio-reg R :address 0 :type u32 :access (ReadOnly) [])\n(defn main [] (-> i64) 0)\n' > "$T/mmio-own.coil"
@@ -1018,6 +1105,11 @@ EOF
 
 # ---------------------------------------------------------------------------
 section_cross() {
+  # A module's own definition shadows a core macro of the same name under any
+  # target: a cross build expands the program's runtime definitions as written.
+  printf '(module xshadow)\n(defn scope [(n i64)] (-> i64) (+ n 1))\n(defn main [] (-> i32) (cast i32 (scope 41)))\n' > "$T/xshadow.coil"
+  expect_rc 0 "a module's own function shadows a core macro in a cross build" \
+    "$COIL" emit-obj "$T/xshadow.coil" --target x86_64-unknown-linux-gnu -o "$T/xshadow.o"
   if [ "$HOST_OS" = Darwin ]; then
     local out rc kind
     # comptime code runs in the compiler, so it is compiled for this machine
@@ -1195,7 +1287,7 @@ EOF
 (defn exists-call [(path Code)] (-> Code)
   `(fs/exists? (expansion-allocator) ~path))
 EOF
-  printf '(module firmware)\n(import "write_note" :use [write-note])\n(write-note "%s")\n(defn answer [] (-> i64) 42)\n' \
+  printf '(module firmware)\n(import "write_note" :use [write-note])\n(write-note "%s")\n(defn* answer [] (-> i64) 42)\n' \
     "$T/phase/note.txt" > "$T/phase/firmware.coil"
   rm -f "$T/phase/note.txt"
   expect_rc 0 "a bare-metal program uses a macro that writes a file through coil.fs" \

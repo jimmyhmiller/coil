@@ -47,7 +47,17 @@
    (const_value_depth i64)
    (source_facts SourceFacts)
    (source_import_origins (HashMap (slice u8) SourceImportOrigin))
-   (source_import_origins_ready bool)])
+   (source_import_origins_ready bool)
+   ; Nonzero while an `alloc-static` initializer is checked. Every backend lays a
+   ; static aggregate down from the stores its body makes to each element or
+   ; field (see `static-store-place`), so an array literal there stores its
+   ; elements one by one instead of copying a nested constant in whole.
+   (static_init_depth i64)
+   ; The `comptime` sites whose value is being computed, innermost last: folding
+   ; one runs the functions its expression reaches, and folds THEIR sites first.
+   ; Meeting a site already on this stack is a value that depends on itself
+   ; (see fold-comptime!). Null until the first fold.
+   (comptime_folding (ptr (ArrayList i64)))])
 
 (defn ast-unit-state-cell [] (-> (ptr (ptr AstUnitState)))
   (primitive/alloc-static (ptr AstUnitState)))
@@ -1592,12 +1602,23 @@
   (get (load (load (field (core-decl-box) ctxts))) i))
 
 ; ── source-id → module-name map (so a node's module is known at query time) ───
-(defstruct SrcModEntry [(source i64) (module (slice u8))])
+;;; One top-level form's module: SOURCE and the span [LO, HI) it covers. A file may
+;;; declare several modules, so the module of a node is the one of the form that
+;;; holds it (`src-mod-lookup-at`).
+(defstruct SrcModEntry [(source i64) (module (slice u8)) (lo i64) (hi i64)])
 
 (defstruct SrcModBox
   [(init i64)
    (lst (ptr (ArrayList SrcModEntry)))
-   (arena scratch/ScratchArena)])
+   (arena scratch/ScratchArena)
+   ; The module names `lst` records, as a set, and how many of its entries the
+   ; set has taken in (`src-mod-declared?`).
+   (modules (HashMap (slice u8) i64))
+   (modules_synced i64)
+   ; Per source, the module its first form records, and the sources whose forms
+   ; record more than one module; synced with `modules`.
+   (first_module (HashMap i64 (slice u8)))
+   (multi_module (HashMap i64 i64))])
 
 (defn src-mod-box [] (-> (ptr SrcModBox))
   (field (ast-unit-state) source_modules))
@@ -1614,10 +1635,53 @@
                     (primitive/zeroed (ArrayList SrcModEntry))))
       (store! (load (field b lst))
               (ArrayList::new [SrcModEntry] (allocator (field b arena))))
+      (src-mod-modules-reset! b)
       (store! (field b init) 1)
       (res-indexes-invalidate!)
       0)
     (load (field b lst))))
+
+(defn src-mod-modules-reset! [(b (ptr SrcModBox))] (-> i64)
+  (set! (.modules b) (HashMap::new [(slice u8) i64] (allocator (field b arena)) (keyops)))
+  (set! (.first_module b) (HashMap::new [i64 (slice u8)] (allocator (field b arena)) (scalar-keyops [i64])))
+  (set! (.multi_module b) (HashMap::new [i64 i64] (allocator (field b arena)) (scalar-keyops [i64])))
+  (set! (.modules_synced b) 0)
+  0)
+
+;;; Take the entries recorded since the last sync into the module set and the
+;;; per-source tables.
+(defn src-mod-modules-sync! [] (-> i64)
+  (let [lst (src-mod-list)
+        b (src-mod-box)
+        n (len (load lst))]
+    (when (< n (.modules_synced b)) (src-mod-modules-reset! b) 0)
+    (for [i (.modules_synced b) n]
+      (let [e (elem lst i)]
+        (set! (mut (.modules b)) (.module e) 1)
+        (match (get (.first_module b) (.source e))
+          (None [] (set! (mut (.first_module b)) (.source e) (.module e)))
+          (Some [m] (unless (= m (.module e)) (set! (mut (.multi_module b)) (.source e) 1) 0)))
+        0))
+    (set! (.modules_synced b) n)
+    0))
+
+;;; The module of the node at offset POS of SOURCE: the module of the top-level
+;;; form whose span holds it, when the source declares several; else the source's.
+(defn src-mod-lookup-at [(source i64) (pos i64)] (-> (slice u8))
+  (src-mod-modules-sync!)
+  (let [b (src-mod-box)]
+    (if (and (>= pos 0) (contains? (.multi_module b) source))
+        (let [lst (src-mod-list)
+              (mut found) ""]
+          (for [i 0 (len (load lst))]
+            (let [e (elem lst i)]
+              (when (and (= (.source e) source)
+                         (and (<= (.lo e) pos) (< pos (.hi e))))
+                (set! found (.module e))
+                0)
+              0))
+          (if (> (len found) 0) found (src-mod-lookup source)))
+        (src-mod-lookup source))))
 
 (defn src-mod-reset [] (-> i64)
   (let [_ (src-mod-list)
@@ -1625,17 +1689,49 @@
     (reset! (field b arena))
     (set! (load (field b lst))
           (ArrayList::new [SrcModEntry] (allocator (field b arena))))
+    (src-mod-modules-reset! b)
     (res-indexes-invalidate!)
     0))
+
+;;; Whether this compilation, or the one it builds on, declares the module M.
+(defn src-mod-declared? [(m (slice u8))] (-> bool)
+  (let [b (src-mod-box)]
+    (src-mod-modules-sync!)
+    (or (contains? (.modules b) m)
+        (let [parent (.resolution_parent (ast-unit-state))]
+          (and (!= (primitive/cast i64 parent) 0)
+               (let [prior (ast-unit-bind! parent)
+                     found (src-mod-declared? m)]
+                 (ast-unit-bind! prior)
+                 found))))))
+
+;;; The module the qualified definition name NAME belongs to. A definition's own
+;;; name may hold a dot -- `q.join-abi` in module `mc15` is `mc15.q.join-abi` --
+;;; so the module is the longest prefix ending at a dot that names a declared
+;;; module, and the part before the last dot only for a name no declared module
+;;; prefixes. "" for a name with no dot.
+(defn definition-module [(name (slice u8))] (-> (slice u8))
+  (let [(mut best) -1
+        (mut last) -1]
+    (for [i 0 (len name)]
+      (when (= (primitive/cast i64 (get name i)) 46)
+        (set! last i)
+        (when (src-mod-declared? (subslice name 0 i)) (set! best i) 0)
+        0))
+    (cond (>= best 0) (subslice name 0 best)
+          (>= last 0) (subslice name 0 last)
+          :else "")))
 
 ;;; The module name is copied, as `type-res-record` copies its names: callers hand
 ;;; over a name from their own arena (a lint analysis's, freed when it ends), and
 ;;; this list lives as long as the unit.
-(defn src-mod-record [(source i64) (module (slice u8))] (-> i64)
+(defn src-mod-record [(source i64) (lo i64) (hi i64) (module (slice u8))] (-> i64)
   (unless (< source 0)
     (let [lst (src-mod-list)
           e (primitive/alloc-stack SrcModEntry)]
       (store! (field e source) source)
+      (store! (field e lo) lo)
+      (store! (field e hi) hi)
       (store! (field e module)
               (res-own-name (allocator (field (src-mod-box) arena)) module))
       (push! lst (load e))
@@ -2807,7 +2903,7 @@
 (defn source-primitive-head! [(head Sexp) (opcode (slice u8))] (-> i64)
   (when (and (.enabled (source-facts)) (source-facts-source? (.source head)))
     (let [module (if (and (> (.hyg head) 0) (> (len (hmod-name (.hmod head))) 0))
-                       (hmod-name (.hmod head)) (src-mod-lookup (.source head)))
+                       (hmod-name (.hmod head)) (src-mod-lookup-at (.source head) (.lo head)))
           raw (match (.kind head) (KSym [name] name) (_ ""))]
       (match (get (.primitives (source-facts)) (source-name-probe module raw 7))
         (None [] 0)
