@@ -13,6 +13,10 @@
 #      a wrong exit code.
 #   5. check the link produced no warnings (a missing .note.GNU-stack silently
 #      gives the whole program an executable stack).
+#   6. link two objects tpde wrote with debug info and verify the result: a
+#      linker concatenates their debug sections, so each object's offsets into
+#      .debug_str, .debug_line and .debug_abbrev must be relocated, or the
+#      second compile unit reads the first one's strings and lines.
 #
 # Usage: scripts/compiler/oracle/x64/gate-elf.sh <coil-binary>
 set -uo pipefail
@@ -76,6 +80,39 @@ else
                         || { echo "  FAIL — program printed '$out'"; fail=$((fail+1)); }
   [ "$rc" = 42 ] && echo "  ok   — program exited 42" \
                  || { echo "  FAIL — program exited $rc, want 42"; fail=$((fail+1)); }
+fi
+
+# ---- 6. two objects with debug info, linked ----
+cat > "$WORK/gelib.coil" <<'EOF'
+(module gelib)
+(defn gelib-add [(a i64) (b i64)] (-> i64) (+ a b))
+(export-c [gelib-add :as "gelib_add"])
+EOF
+cat > "$WORK/gemain.coil" <<'EOF'
+(module gemain)
+(extern gelib_add [i64 i64] (-> i64))
+(defn main [] (-> i64) (gelib_add 40 2))
+EOF
+DWARFDUMP="$(llvm-config --bindir 2>/dev/null)/llvm-dwarfdump"
+[ -x "$DWARFDUMP" ] || DWARFDUMP=$(command -v llvm-dwarfdump-21 || command -v llvm-dwarfdump || true)
+if "$BIN" emit-obj "$WORK/gelib.coil" --backend x64 -g -o "$WORK/gelib.o" >/dev/null 2>&1 \
+   && "$BIN" emit-obj "$WORK/gemain.coil" --backend x64 -g -o "$WORK/gemain.o" >/dev/null 2>&1 \
+   && cc "$WORK/gemain.o" "$WORK/gelib.o" -o "$WORK/ge" 2>/dev/null; then
+  "$WORK/ge"; rc=$?
+  [ "$rc" = 42 ] && echo "  ok   — two tpde objects with debug info link and run" \
+                 || { echo "  FAIL — the two-object program exited $rc, want 42"; fail=$((fail+1)); }
+  if [ -z "$DWARFDUMP" ]; then
+    echo "  FAIL — no llvm-dwarfdump to verify the linked debug info"; fail=$((fail+1))
+  else
+    verify=$("$DWARFDUMP" --verify "$WORK/ge" 2>&1); vrc=$?
+    [ "$vrc" = 0 ] && echo "  ok   — llvm-dwarfdump --verify accepts the linked debug info" \
+                   || { echo "  FAIL — llvm-dwarfdump --verify:"; printf '%s\n' "$verify" | head -5; fail=$((fail+1)); }
+    units=$("$DWARFDUMP" --debug-info "$WORK/ge" 2>&1 | grep -A3 DW_TAG_compile_unit | grep DW_AT_name)
+    check "the first unit names its file"  "$units" "gemain.coil"
+    check "the second unit names its file" "$units" "gelib.coil"
+  fi
+else
+  echo "  FAIL — could not build or link the two-object program"; fail=$((fail+1))
 fi
 
 echo
