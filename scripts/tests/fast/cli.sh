@@ -1609,6 +1609,8 @@ ptr-index|pointer arithmetic overflow.*safety_checks.coil:110:
 memcpy-null|null pointer dereference.*safety_checks.coil:111:
 unreachable|entered unreachable code.*safety_checks.coil:112:
 stack|diagnosis: stack-overflow guard fault
+slice-set|index out of bounds: index 5, len 4.*safety_checks.coil:114:
+slice-init|index out of bounds: index 6, len 4.*safety_checks.coil:115:
 align|misaligned pointer: address [0-9]+ is not a multiple of 8.*safety_checks.coil:45:
 null-load|null pointer dereference.*safety_checks.coil:48:
 null-field|null pointer dereference.*safety_checks.coil:51:

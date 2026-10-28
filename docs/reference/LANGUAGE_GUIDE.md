@@ -377,8 +377,7 @@ can't have it. A C function that does not return can be declared the same way,
 - A C function pointer that takes a struct or sum by value, `(fnptr (cc/C) [Point]
   i64)`, passes it by value as C does. A Coil function takes it by reference, so
   `fnptr-of` or `(fn …)` reaches it through a by-value entry, also when inference
-  supplies the pointer type: `(sort xs (fnptr-of by-rank))` with `by-rank` over
-  `Point`s.
+  supplies the pointer type.
 
 ### Compile-time value parameters
 
@@ -1120,6 +1119,10 @@ closing a.txt
   the read is done. A `match` on a temporary consumes it: each arm owns what it
   binds, and a `_` arm owns the whole value.
 - Stores through a raw `(ptr T)` never drop the old value.
+- `(set! (mut xs) i v)` on an array or slice replaces element `i`: the old
+  element is dropped once `v` is in place. `(init! (mut xs) i v)` writes a slot
+  that holds no value yet (fresh storage, or one whose value has moved out) and
+  drops nothing.
 - Escape hatches: `(forget x)`, `(manually-drop x)`, `(take! (mut x))`.
 
 `coil.rc` (`Rc`, `WeakRc`) and `coil.arc` (atomic `Arc`, `Weak`) are reference-counted
