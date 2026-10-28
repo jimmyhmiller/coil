@@ -594,12 +594,12 @@ EOF
     case "$out" in *"$want"*) ok "expand prints $want" ;; *) bad "expand prints $want" "$out" ;; esac
   done
   expect_rc 97 "a def of #\\a or true is a value" "$COIL" run "$T/expand.coil"
-  # `(def NAME TARGET)` aliases a primitive; one naming anything else is an
-  # error at the def, not "unbound variable" at a use (or nothing at all).
+  # `(def NAME TARGET)` aliases a primitive; any other def is a value, so one
+  # naming nothing, or a function, is an error at the def.
   printf '(module alias-probe)\n(defn foo [] (-> i64) 3)\n(def w nope)\n(def v foo)\n(defn main [] (-> i64) 0)\n' > "$T/alias.coil"
-  expect_rc_out 1 "alias.coil:3:1" "a def alias naming nothing is reported at the def" "$COIL" check "$T/alias.coil"
+  expect_rc_out 1 "alias.coil:3:8" "a def naming nothing is reported at the def" "$COIL" check "$T/alias.coil"
   printf '(module alias-probe)\n(defn foo [] (-> i64) 3)\n(def v foo)\n(defn main [] (-> i64) (v))\n' > "$T/alias2.coil"
-  expect_rc_out 1 "def: 'foo' names no primitive operation" "a def alias naming a function says to use defalias" "$COIL" check "$T/alias2.coil"
+  expect_rc_out 1 "'foo' is a function, not a value: \\(fnptr-of foo\\) is its address, and \\(defalias NAME FUNCTION\\)" "a def naming a function says it is one" "$COIL" check "$T/alias2.coil"
   printf '(defn* f [()] (-> i64) 1)\n(deftrait T [Self] (m [()] (-> i64)))\n(defn main [] (-> i64) 1)\n' > "$T/empty-param.coil"
   expect_rc_out 1 'parameter must be \(name :type\): `\(\)` names nothing' "an empty () parameter is a located error, not a crash" \
     "$COIL" check "$T/empty-param.coil"
