@@ -465,6 +465,16 @@ EOF
   printf '(module model) (export Point) (defstruct Point [(x i64) (y i64)])\n(module lib) (export inspect) (defstruct Point [(wrong i64)])\n(import "coil.primitive" :as p)\n(defn inspect [(type Code)] (-> Code) (if (= (p/code-field-count type) 2) (quote 42) (quote 0)))\n(module app) (import "model" :as m) (import "lib" :use [inspect])\n(defn answer [] (-> i64) (inspect m/Point))\n' > "$T/refl-modules.coil"
   expect_rc 0 "reflection resolves a macro argument in the module of the form that wrote it" \
     "$COIL" build "$T/refl-modules.coil" --lib -o "$T/refl-modules.a"
+  # A file that declares the prelude's module is this compilation's prelude: with
+  # compile-time units off, nothing defines the core macros twice.
+  expect_rc 0 "check: the prelude's own source checks with compile-time units off" \
+    env COIL_CT_UNITS=0 "$COIL" check "$ROOT/src/compiler/prelude.coil"
+  # A macro may generate an import of a module nothing had loaded yet.
+  mkdir -p "$T/gen-import"
+  printf '(module defs)\n(export answer)\n(defn answer [] (-> i64) 42)\n' > "$T/gen-import/defs.coil"
+  printf '(module gen-import)\n(defn generate [] (-> Code) (quote (import "defs" :use [answer])))\n(generate)\n(defn main [] (-> i64) (answer))\n' > "$T/gen-import/main.coil"
+  expect_rc 42 "a macro-generated import loads a module nothing had loaded" \
+    "$COIL" run "$T/gen-import/main.coil"
   # A register's :access is a coil.mmio.Access, decided by what its constructor
   # names, not by how it is spelled.
   printf '(module mmio-case)\n(import "coil.mmio" :as mmio)\n(defsum Mine (ReadOnly))\n(mmio/defmmio-reg R :address 0 :type u32 :access (ReadOnly) [])\n(defn main [] (-> i64) 0)\n' > "$T/mmio-own.coil"
