@@ -1384,6 +1384,10 @@ macro COIL_HALF — a double expression, not an integer constant
 (chain (fnptr (coil.cc.C) [i8] (fnptr (coil.cc.C) [f64] i32)))
 (extern coil_get_loader :cc (coil.cc.C) [] (-> (fnptr (coil.cc.C) [(ptr i8) (ptr i32)] (ptr u8))))
 (defstruct coil_uninspectable :layout (coil.layout.Explicit)
+(const COIL_MOST_NEGATIVE -9223372036854775808)
+(const COIL_INT64_MIN -9223372036854775808)
+(extern coil_get_constant :cc (coil.cc.C) [] (-> i32))
+(extern coil_use_area :cc (coil.cc.C) [(ptr coil_restricted_area)] (-> void))
 EOF
     expect_rc 0 "the generated bindings check" "$COIL" check "$T/expressions.coil"
   fi
