@@ -116,12 +116,13 @@ def main() -> int:
                 problems.append(f"{name} must return through sret: {signature and signature.group(0)}")
         if re.search(r"\bret %cabi\.types\.S\d", ir):
             problems.append("a sum is returned as a first-class LLVM aggregate")
-        # Two words, or an HFA of up to four floats, return in registers as the
-        # ABI's coerced value; any other array goes through sret.
+        # Two words, or an HFA of up to four floats or short vectors, return in
+        # registers as the ABI's coerced value (an export thunk relays the one its
+        # callee returned); any other array goes through sret.
         for found in re.finditer(r"\bret \[(\d+) x ([^\]]+)\] %([\w.]+)", ir):
             count, element, value = int(found.group(1)), found.group(2), found.group(3)
-            hfa = element in ("float", "double") and count <= 4
-            if not hfa and not value.startswith("abi.ret.coerce"):
+            hfa = (element in ("float", "double") or re.fullmatch(r"<\d+ x \w+>", element)) and count <= 4
+            if not hfa and not value.startswith(("abi.ret.coerce", "thunk.call")):
                 problems.append(f"an array is returned as a first-class LLVM aggregate: {found.group(0)}")
         for name, forced in (("walk", False), ("spin", True)):
             body = re.search(r'define[^\n]*@"?cabi\.main\.' + name + r'"?\([^\n]*\)[^\n{]*\{(.*?)\n\}', ir, re.S)

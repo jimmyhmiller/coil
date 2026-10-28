@@ -3,6 +3,7 @@
    HFAs, stack-passed arguments in both directions, and symbols bound through
    explicit linker names. Each check function returns 0, or the number of the
    first case that failed. */
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -148,3 +149,76 @@ long alias_data __asm__(SYM("alias.data$1")) = 20;
 extern long coil_named_data;
 long *native_named_address(void) { return &coil_named_data; }
 long native_named_increment(void) { return ++coil_named_data; }
+
+/* ---- narrow scalars, variadic promotions, padded and vector aggregates, one
+        function under two C symbols, a reference result ---- */
+/* Apple AArch64 and x86-64 callers extend a narrow argument to 32 bits, and a
+   callee its narrow result: these read the value at 32 bits and trust it. */
+int64_t s8_echo(int8_t x) { return x; }
+int64_t u8_echo(uint8_t x) { return x; }
+int64_t s16_echo(int16_t x) { return x; }
+int64_t bool_echo(_Bool x) { return x ? 7 : 3; }
+int8_t coil_s8_negate(int8_t);
+int8_t coil_pub8(void);
+int64_t coil_pub8_via_extern(void);
+
+/* `...` arguments arrive promoted: int for narrower integers and bool, double for
+   float. KINDS names each one: i an int, d a double. */
+int64_t c_varargs(const char *kinds, ...) {
+  va_list ap;
+  int64_t acc = 0;
+  va_start(ap, kinds);
+  for (const char *k = kinds; *k; ++k) {
+    int64_t v = *k == 'd' ? (int64_t)(va_arg(ap, double) * 2) : (int64_t)va_arg(ap, int);
+    acc = acc * 1000 + v + 500;
+  }
+  va_end(ap);
+  return acc;
+}
+
+/* Alignment padding keeps an aggregate from being homogeneous (no HFA), and a
+   second eightbyte of padding only is not passed at all (System V). */
+typedef struct __attribute__((aligned(16))) { double x; } Pad16;
+typedef struct __attribute__((aligned(32))) { double x, y; } Pad32;
+typedef struct __attribute__((aligned(16))) { double x; } PadIn;
+typedef struct { PadIn i; double y; } PadNest;
+Pad16 coil_pad16(Pad16, int64_t);
+Pad32 coil_pad32(Pad32);
+PadNest coil_pad_nest(PadNest);
+/* Short vectors: AAPCS64 passes up to four of one size in vector registers (an
+   HVA); System V passes an 8-byte one as SSE. */
+typedef float F32x4 __attribute__((vector_size(16)));
+typedef float F32x2 __attribute__((vector_size(8)));
+typedef struct { F32x4 a, b; } Hva2;
+typedef struct { F32x2 a; } Hva1;
+Hva2 coil_hva_swap(Hva2);
+int64_t coil_hva_first(Hva1, int64_t);
+/* One function exported under two symbols shares its state; so does one
+   exported through a by-value thunk. */
+int64_t coil_bump_one(void);
+int64_t coil_bump_two(void);
+Pair coil_swap_one(Pair);
+Pair coil_swap_two(Pair);
+static int32_t ref_target = 42;
+int32_t *c_ref_result(void) { return &ref_target; }
+
+int64_t c_scalar_check(void) {
+  if (coil_s8_negate(14) != -14) return 1;
+  if (coil_pub8() != -14) return 2;
+  if (coil_pub8_via_extern() != 42) return 3;
+  Pad16 p16 = coil_pad16((Pad16){40}, 1);
+  if (p16.x != 42) return 4;
+  Pad32 p32 = coil_pad32((Pad32){1, 2});
+  if (p32.x != 2 || p32.y != 1) return 5;
+  PadNest pn = coil_pad_nest((PadNest){{5}, 6});
+  if (pn.i.x != 6 || pn.y != 5) return 6;
+  Hva2 h = coil_hva_swap((Hva2){{1, 2, 3, 4}, {5, 6, 7, 8}});
+  if (h.a[0] != 5 || h.a[3] != 8 || h.b[0] != 1 || h.b[3] != 4) return 7;
+  if (coil_hva_first((Hva1){{3, 4}}, 9) != 309) return 8;
+  int64_t first = coil_bump_one();
+  if (coil_bump_two() != first + 1 || coil_bump_one() != first + 2) return 9;
+  Pair q = coil_swap_two((Pair){1, 2});
+  Pair r = coil_swap_one((Pair){3, 4});
+  if (q.a != 2 || q.b != 1 || r.a != 4 || r.b != 3) return 10;
+  return 0;
+}

@@ -31,7 +31,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 WASM = ROOT / "tests" / "wasm"
 EXPECTED_EXPORTS = ("arraylist_record=6", "dyn_aggregate_return=42", "externref_roundtrip=7",
-                    "use_stack=5", "aliased=42")
+                    "use_stack=5", "aliased=42", "aliased_too=42")
 EXTERNREF_ERRORS = {
     "externref_misuse.coil": ("cast target: externref cannot be behind a pointer or reference",
                               "type ascription: externref cannot be an array, slice or vec element",
