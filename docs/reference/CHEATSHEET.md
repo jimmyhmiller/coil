@@ -87,6 +87,8 @@ is a C `(ptr i8)`.
 (match v (Some [x] x) (None [] 0))   ; exhaustive; (_ …) catches the rest
 (Point :x 1 :y 2)   (.x p)   (set! (.x p) 5)   (Circle 3)
 (len xs) (get xs i) (set! (mut xs) i v) (push! (mut xs) v) (pop! (mut xs))
+(at xs i) (for (ref x) xs …)       ; lend an element; get/for copy, so not an owner
+(move-out! (mut xs) i) (init! (mut xs) i v)   ; take an element out, fill an empty slot
 (println "{} {:?} {:.2}" a b f)
 (cast i64 f)   (: 200 u8)
 ```

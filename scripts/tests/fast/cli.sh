@@ -442,6 +442,13 @@ section_check() {
   printf '(module const-move)\n(defstruct Owner [(value i64)])\n(impl Drop Owner (drop [(self (mut Owner))] (-> void) 0))\n(defn consume [(o Owner)] (-> i64) (.value o))\n(const TWICE (let [o (Owner :value 1)] (consume o) (consume o)))\n(defn main [] (-> i64) TWICE)\n' > "$T/const-move.coil"
   expect_rc_out 1 "in 'const const-move.TWICE': use of moved value 'o'" \
     "check: a constant's initializer moves an owner once" "$COIL" check "$T/const-move.coil"
+  # A generic body that copies an element out of a slice is refused at the
+  # instance whose element type owns something, at the read.
+  printf '(module element-copy)\n(defstruct Owner [(value i64)])\n(impl Drop Owner (drop [(self (mut Owner))] (-> void) 0))\n(defn count-all [T] [(xs (slice T))] (-> i64) (let [(mut n) 0] (for x xs (set! n (+ n 1))) n))\n(defn main [] (-> i64) (let [os [(Owner :value 1)]] (count-all os)))\n' > "$T/element-copy.coil"
+  expect_rc_out 1 "in 'element-copy.count-all__element-copy.Owner': this reads a element-copy.Owner by value" \
+    "build: a generic copy of an owning element is refused at its instance" "$COIL" build "$T/element-copy.coil" -o "$T/element-copy"
+  expect_rc_out 1 "element-copy.coil:4:64" \
+    "build: the refusal points at the generic body's read" "$COIL" build "$T/element-copy.coil" -o "$T/element-copy"
   # A struct's :layout is a coil.layout.Layout value, and a type's annotations
   # are checked as a function's are; each mistake is its own compile, since the
   # first one stops it.
@@ -1955,6 +1962,7 @@ unreachable|entered unreachable code.*safety_checks.coil:112:
 stack|diagnosis: stack-overflow guard fault
 slice-set|index out of bounds: index 5, len 4.*safety_checks.coil:114:
 slice-init|index out of bounds: index 6, len 4.*safety_checks.coil:115:
+slice-at|index out of bounds: index 7, len 4.*safety_checks.coil:116:
 align|misaligned pointer: address [0-9]+ is not a multiple of 8.*safety_checks.coil:45:
 null-load|null pointer dereference.*safety_checks.coil:48:
 null-field|null pointer dereference.*safety_checks.coil:51:
