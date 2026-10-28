@@ -1098,8 +1098,11 @@ closing a.txt
   parameter that takes an owner by value. Pass `x` to move it, or `(clone x)`.
 - A generic parameter is an owner exactly when its instance is: `(o (Option T))`
   consumes an `(Option File)` and copies an `(Option i64)`, as `(x T)` does.
-- An owner may move out of a `block` or `try` when every way out of it moves the
-  owner: its end, each `return-from`, each `try!` that fails.
+- An owner may move out of a `block`, `try` or `loop` when every way out of it
+  moves the owner: a block's end, each `break` or `return-from`, each `try!` that
+  fails. A loop must start each iteration with what it began with. A path that
+  leaves -- a `break`, a `(-> never)` call -- never reaches the code after it, so
+  what it moved does not count where the paths join.
 - A trait that takes `Self` by value lets an implementation consume an owner. An
   implementation that only reads it may borrow instead, by spelling that struct,
   sum or array parameter `(ref T)`: with `(impl Len Bag (len [(b (ref Bag))] (-> i64)
@@ -1111,6 +1114,11 @@ closing a.txt
   reverse field order. Drops run on every exit path: fall-through, `break`,
   `return-from`, and reassignment.
 - Coil drops a call result that nothing receives at the end of its statement.
+  The operands evaluated before one that leaves, such as the `(make)` in
+  `(f (make) (break 0))`, are dropped the same way: `f` never receives them.
+- A temporary lent to a call, or whose field is read, lives until the call or
+  the read is done. A `match` on a temporary consumes it: each arm owns what it
+  binds, and a `_` arm owns the whole value.
 - Stores through a raw `(ptr T)` never drop the old value.
 - Escape hatches: `(forget x)`, `(manually-drop x)`, `(take! (mut x))`.
 
