@@ -486,6 +486,40 @@ EOF
   printf '(module dynapp)\n(import "dynshapes" :as p)\n(import "coil.primitive" :as primitive)\n(defstruct Point [(x i64)])\n(impl p/Show Point (show [(a (ptr Point))] (-> i64) 5))\n(defn main [] (-> i64) (p/show (primitive/make-dyn Show (primitive/alloc-static Point))))\n' > "$T/dyn-scope/dynapp.coil"
   expect_rc_out 1 "make-dyn: unknown trait 'Show'" "check: make-dyn's trait is one in scope, not one that shares its name" \
     "$COIL" check "$T/dyn-scope/dynapp.coil"
+  # `coil expand` prints the program as source: a float, an escaped string and the
+  # most negative integer read back as written. A def whose value the parser reads
+  # as a literal (`true`, `#\a`) is a value, not an alias to a definition.
+  printf '(module ex)\n(def x 1.5)\n(def m -9223372036854775808)\n(def s "a\\nb\\"q")\n(def y #\\a)\n(def t true)\n(import "coil.primitive" :as primitive)\n(defn main [] (-> i64) (if t (primitive/cast i64 y) 0))\n' > "$T/expand.coil"
+  out=$("$COIL" expand "$T/expand.coil" 2>&1)
+  local want
+  for want in '(def x 1.5)' '(def m -9223372036854775808)' '(def s "a\nb\"q")' '(def y #\a)' '(def t true)'; do
+    case "$out" in *"$want"*) ok "expand prints $want" ;; *) bad "expand prints $want" "$out" ;; esac
+  done
+  expect_rc 97 "a def of #\\a or true is a value" "$COIL" run "$T/expand.coil"
+  printf '(defn* f [()] (-> i64) 1)\n(deftrait T [Self] (m [()] (-> i64)))\n(defn main [] (-> i64) 1)\n' > "$T/empty-param.coil"
+  expect_rc_out 1 'parameter must be \(name :type\): `\(\)` names nothing' "an empty () parameter is a located error, not a crash" \
+    "$COIL" check "$T/empty-param.coil"
+  # Each stage dump loads the program as check does, sibling modules included,
+  # and fails exactly when its stage does.
+  mkdir -p "$T/dumps"
+  printf '(module imp.lib)\n(export f)\n(defn f [] (-> i64) 3)\n' > "$T/dumps/lib.coil"
+  printf '(module imp.main)\n(import "imp.lib" :as l)\n(defn main [] (-> i64) (l/f))\n' > "$T/dumps/main.coil"
+  printf '(module m)\n(import "nope.mod" :as n)\n(defn main [] (-> i64) 0)\n' > "$T/dumps-missing.coil"
+  printf '(module te)\n(defn main [] (-> i64) "x")\n' > "$T/dumps-type.coil"
+  printf '(defn main [] (-> i64) (\n' > "$T/dumps-read.coil"
+  local stage got
+  got=""
+  for stage in load expand hygiene resolved checked mono; do
+    "$COIL" dump-$stage "$T/dumps/main.coil" >/dev/null 2>&1; got="$got $stage:$?"
+    "$COIL" dump-$stage "$T/dumps-missing.coil" >/dev/null 2>&1; got="$got $?"
+    "$COIL" dump-$stage "$T/dumps-type.coil" >/dev/null 2>&1; got="$got $?"
+    "$COIL" dump-$stage "$T/dumps-read.coil" >/dev/null 2>&1; got="$got $?"
+  done
+  [ "$got" = " load:0 1 0 1 expand:0 1 0 1 hygiene:0 1 0 1 resolved:0 1 0 1 checked:0 1 1 1 mono:0 1 1 1" ] \
+    && ok "stage dumps load as check does and fail exactly when their stage fails" \
+    || bad "stage dumps load as check does and fail exactly when their stage fails" "stage:good missing-import type-error read-error =$got"
+  expect_rc 1 "dump-read fails on a read error" "$COIL" dump-read "$T/dumps-read.coil"
+  expect_rc 1 "dump-ast fails on a form the parser rejects" "$COIL" dump-ast "$T/dumps/main.coil"
   # The forms an imported file has before its (module …) keep bare names; a
   # defalias among them calls the function it names.
   mkdir -p "$T/prefix-alias"
