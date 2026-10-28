@@ -1299,6 +1299,9 @@ evens=3 total=10
   you provide (from an arena, say); `(InlineList::new [T N])` holds `N` elements
   itself, so it can be a struct field. `push!` onto a full one aborts in every
   build, `(full? xs)` says whether it would, and `(used xs)` is the filled prefix.
+  An inline list owns its elements: it drops the ones it holds, and only those,
+  and its operations borrow it, so pass `(used xs)` where a function takes a
+  collection by value.
 - `HashMap` keys that are strings need key operations: coil.str's `(keyops)` copies
   keys into the map, while `(keyops-borrowed)` borrows them.
 - A collection's own operations are methods. A list has `(cap xs)`,
