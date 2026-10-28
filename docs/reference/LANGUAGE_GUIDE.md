@@ -377,8 +377,7 @@ can't have it. A C function that does not return can be declared the same way,
 - A C function pointer that takes a struct or sum by value, `(fnptr (cc/C) [Point]
   i64)`, passes it by value as C does. A Coil function takes it by reference, so
   `fnptr-of` or `(fn …)` reaches it through a by-value entry, also when inference
-  supplies the pointer type: `(sort xs (fnptr-of by-rank))` with `by-rank` over
-  `Point`s.
+  supplies the pointer type.
 
 ### Compile-time value parameters
 
