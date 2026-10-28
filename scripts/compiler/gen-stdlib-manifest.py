@@ -362,6 +362,39 @@ def splice(current: str, generated: str, target: Path = TARGET, begin: str = BEG
     return current[:start] + generated + current[stop + len(end) :]
 
 
+def generated_names(text: str, table: str) -> set[str]:
+    """The quoted names a generated `(= name "...")` cond table in TEXT lists."""
+    start = text.find(f"(defn {table} ")
+    if start < 0:
+        return set()
+    stop = text.find("\n(defn ", start + 1)
+    body = text[start:stop if stop >= 0 else len(text)]
+    return set(re.findall(r'\(= name "([^"]*)"\)', body))
+
+
+def stale_tables(current: str,
+                 entries: list[tuple[str, str]],
+                 sdk_entries: list[tuple[str, str]]) -> list[str]:
+    """What differs between the manifest in CURRENT and the trees it describes."""
+    lines: list[str] = []
+    checks = (
+        ("src/stdlib/ file", "stdlib-manifest-file?", {fn for _, fn in entries}),
+        ("src/stdlib/ namespace", "stdlib-file-for-namespace", {ns for ns, _ in entries}),
+        ("src/compiler/ (SDK) file", "sdk-manifest-file?", {f"compiler/{fn}" for fn in sdk_file_list()}),
+        ("src/compiler/ (SDK) namespace", "sdk-file-for-namespace", {ns for ns, _ in sdk_entries}),
+    )
+    for what, table, wanted in checks:
+        listed = generated_names(current, table)
+        for name in sorted(wanted - listed):
+            lines.append(f"{what} not in the manifest: {name}")
+        for name in sorted(listed - wanted):
+            lines.append(f"{what} in the manifest but gone: {name}")
+    if not lines:
+        lines.append("the generated text differs from what the generator renders "
+                     "(a declared module or the generator itself changed)")
+    return lines
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--check", action="store_true", help="exit 1 if out of date; write nothing")
@@ -393,9 +426,13 @@ def main() -> int:
     if args.check:
         if current != updated:
             rel = TARGET.relative_to(ROOT)
-            print(f"error: {rel} is out of date with src/stdlib/", file=sys.stderr)
+            print(f"error: {rel} is out of date", file=sys.stderr)
+            # Say which tree changed: the region lists the standard library AND the
+            # compiler SDK modules, and blaming src/stdlib/ for a new compiler module
+            # sends the reader looking for a change that is not there.
+            for line in stale_tables(current, entries, collect_sdk()):
+                print(f"  {line}", file=sys.stderr)
             print(
-                "  a stdlib file was added, removed, or renamed without regenerating the manifest.\n"
                 "  Left unfixed, the namespace is unreachable from an installed compiler (in-repo\n"
                 "  it still resolves via the source-tree scan, which is why this needs a gate).\n"
                 "  Fix with:\n"
