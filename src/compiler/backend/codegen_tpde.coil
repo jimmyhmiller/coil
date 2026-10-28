@@ -299,6 +299,21 @@
   (cir/store-mem! (.f tl) p v off (scalar-bytes tl t))
   0)
 
+;;; The CIR type of one member of a homogeneous aggregate whose members are
+;;; BITS wide: an f32 or f64 (HFA), or a 64- or 128-bit short vector (HVA),
+;;; which travels in a SIMD register like a float of its width.
+(defn hfa-cty [(bits i64)] (-> i64)
+  (cond (= bits 32) cir/T-F32 (= bits 64) cir/T-F64 :else cir/T-V128))
+
+(defn hfa-load [(tl (ptr Tl)) (p u32) (off i64) (bits i64)] (-> u32)
+  (open! tl)
+  (cir/load-mem! (.f tl) (hfa-cty bits) p off (/ bits 8) false))
+
+(defn hfa-store [(tl (ptr Tl)) (p u32) (off i64) (v u32) (bits i64)] (-> void)
+  (open! tl)
+  (cir/store-mem! (.f tl) p v off (/ bits 8))
+  0)
+
 (defn memcpy [(tl (ptr Tl)) (dst u32) (src u32) (n i64)] (-> void)
   (when (> n 0)
     (open! tl)
@@ -427,6 +442,13 @@
 (defn sysv-paint! [(g (ptr Cga)) (t (ptr Type)) (base i64) (bytes (mut (ArrayList i64)))] (-> void)
   (match (load t)
     (TFloat [bits] (sysv-fill! (mut bytes) base (/ bits 8) 2))
+    ; a vector of one eightbyte is SSE; a wider one is SSE then SSEUP, which
+    ; this classification (two independent eightbytes) cannot express
+    (TVec [_ _]
+          (let [sz (ty-size g t)]
+            (when (> sz 8)
+              (tl-fail "System V ABI: an aggregate holding a vector wider than one eightbyte needs SSEUP classification, which is not supported"))
+            (sysv-fill! (mut bytes) base sz 2)))
     (TArray [et cnt]
             (let [esz (ty-size g et)]
               (for i (range 0 (extent-value cnt)) (sysv-paint! g et (+ base (* i esz)) (mut bytes)))))
@@ -444,12 +466,16 @@
   (for i (range base (+ base n))
     (when (< i (len bytes)) (set! (mut bytes) i (sysv-merge (get bytes i) cls)))))
 
-;;; The class of the eightbyte at `lo`; one of padding only is INTEGER.
+;;; The class of the eightbyte at `lo`: 0 (NO_CLASS) when it holds only padding.
 (defn sysv-eightbyte [(bytes (ptr (ArrayList i64))) (lo i64) (size i64)] (-> i64)
   (let [(mut c) 0]
     (for i (range lo (if (< (+ lo 8) size) (+ lo 8) size))
       (set! c (sysv-merge c (get (load bytes) i))))
-    (if (= c 0) 1 c)))
+    c))
+
+;;; NO_CLASS where an eightbyte must still travel (an aggregate with no data at
+;;; all) goes as INTEGER.
+(defn sysv-or-integer [(c i64)] (-> i64) (if (= c 0) 1 c))
 
 (defn sysv-info [(g (ptr Cga)) (t (ptr Type))] (-> AbiInfo)
   (let [(mut r) (mk-abi-scalar)]
@@ -460,14 +486,31 @@
               (set! (.cls r) 4)
               (let [(mut bytes) (ArrayList::new [i64] (malloc-allocator))]
                 (extend-zeroed! (mut bytes) sz)
-                (sysv-paint! g t 0 (mut bytes))
-                (set! (.hfa_n r) (sysv-eightbyte (mut bytes) 0 sz))
-                (cond (= sz 0) (set! (.cls r) 6)
-                      (<= sz 8) (set! (.cls r) 2)
-                      :else (do (set! (.cls r) 3)
-                                (set! (.hfa_bits r) (sysv-eightbyte (mut bytes) 8 sz))))
+                ; A vector parameter of its own (no C function takes one: export-c
+                ; refuses it) travels between Coil functions as integer words; one
+                ; inside an aggregate is classified as C classifies it.
+                (if (match (load t) (TVec [_ _] (> sz 8)) (_ false))
+                    (sysv-fill! (mut bytes) 0 sz 1)
+                    (sysv-paint! g t 0 (mut bytes)))
+                (let [lo (sysv-eightbyte (mut bytes) 0 sz)
+                      hi (if (> sz 8) (sysv-eightbyte (mut bytes) 8 sz) 0)]
+                  (set! (.hfa_n r) (sysv-or-integer lo))
+                  (cond (= sz 0) (set! (.cls r) 6)
+                        (<= sz 8) (set! (.cls r) 2)
+                        ; a second eightbyte of padding only (as an explicit
+                        ; alignment adds) is NO_CLASS: not passed at all
+                        (and (= hi 0) (!= lo 0)) (set! (.cls r) 2)
+                        (and (= lo 0) (!= hi 0))
+                          (tl-fail "System V ABI: an aggregate whose first eightbyte holds no data is not supported")
+                        :else (do (set! (.cls r) 3)
+                                  (set! (.hfa_bits r) (sysv-or-integer hi)))))
                 (free! (mut bytes))))))
     r))
+
+;;; The bytes of a class 2 aggregate's one eightbyte that hold it: all of an
+;;; aggregate of 8 bytes or fewer, the first 8 of one whose second eightbyte is
+;;; padding.
+(defn eb0-bytes [(sz i64)] (-> i64) (if (> sz 8) 8 sz))
 
 (defn tl-abi-info-raw [(tl (ptr Tl)) (t (ptr Type))] (-> AbiInfo)
   (if (.x64 tl) (sysv-info (.g tl) t) (g-abi-info (.g tl) t)))
@@ -1949,8 +1992,29 @@
     (TBool [] (cir/af-size 1))
     (_ (: 0 u32))))
 
-(defn lower-arg! [(tl (ptr Tl)) (args (mut (ArrayList u32))) (flags (mut (ArrayList u32))) (tv TV) (variadic bool)] (-> void)
+;;; Does an AAPCS64 aggregate of 9 to 16 bytes travel as one i128 rather than as
+;;; two words? When it is 16-aligned (Clang's coercion), which places it as an
+;;; i128: at an even register on standard AAPCS64, and 16-aligned on the stack.
+;;; (A variadic one is two words on Apple, where every variadic argument is.)
+(defn pair-as-i128? [(tl (ptr Tl)) (t (ptr Type))] (-> bool)
+  (and (not (.x64 tl)) (>= (talign tl t) 16)))
+
+;;; A scalar passed through `...` gets C's default argument promotions: a float
+;;; narrower than double widens to double, and a bool or an integer narrower than
+;;; `int` travels as its canonical (extended) 64-bit value, with no narrow size,
+;;; since the callee reads it with `va_arg(ap, int)`.
+(defn variadic-promote [(tl (ptr Tl)) (tv TV)] (-> TV)
+  (match (.ty tv)
+      ; only an f32 is narrower than double here: tl-cty holds every other float as F64
+      (TFloat [bits]
+              (if (= bits 32)
+                  (tv-s (op1 tl cir/OP-FPEXT cir/T-F64 (scalar tl tv) 0 0) (TFloat 64))
+                  tv))
+      (_ tv)))
+
+(defn lower-arg! [(tl (ptr Tl)) (args (mut (ArrayList u32))) (flags (mut (ArrayList u32))) (tv0 TV) (variadic bool)] (-> void)
   (let [g (.g tl)
+        tv (if variadic (variadic-promote tl tv0) tv0)
         (mut t) (.ty tv)
         info (tl-abi-info tl (mut t))
         cls (abi-cls info)
@@ -1958,10 +2022,15 @@
     (cond
       (= cls 6) 0
       (or (= cls 0) (= cls 1))
-        (do (push-arg! tl (mut args) (mut flags) (scalar tl tv) (| vf (narrow-arg-flags tl (mut t) false))) 0)
+        (do (push-arg! tl (mut args) (mut flags) (scalar tl tv) (| vf (if variadic (: 0 u32) (narrow-arg-flags tl (mut t) false)))) 0)
       (wide? (mut t)) (do (push-arg! tl (mut args) (mut flags) (scalar tl tv) vf) 0)
       (= cls 2)
-        (do (push-arg! tl (mut args) (mut flags) (eb-load tl (place tl tv) info 0 0 (tsize tl (mut t))) vf) 0)
+        (do (push-arg! tl (mut args) (mut flags) (eb-load tl (place tl tv) info 0 0 (eb0-bytes (tsize tl (mut t)))) vf) 0)
+      (and (= cls 3) (not variadic) (pair-as-i128? tl (mut t)))
+        (let [p (place tl tv)]
+          (open! tl)
+          (push-arg! tl (mut args) (mut flags) (cir/load-mem! (.f tl) cir/T-I128 p 0 16 false) vf)
+          0)
       (= cls 3)
         (let [p (place tl tv)
               sz (tsize tl (mut t))
@@ -1976,12 +2045,11 @@
       (= cls 5)
         (let [p (place tl tv)
               hn (abi-hfa-n info)
-              lb (/ (abi-hfa-bits info) 8)
-              ft (if (= lb 4) (TFloat 32) (TFloat 64))]
+              bits (abi-hfa-bits info)
+              lb (/ bits 8)]
           (for j (range 0 hn)
-            (let [(mut ftt) ft]
-              (push-arg! tl (mut args) (mut flags) (load-scalar tl p (* j lb) (mut ftt))
-                         (| vf (if variadic (: 0 u32) (group-flags (- (- hn j) 1)))))))
+            (push-arg! tl (mut args) (mut flags) (hfa-load tl p (* j lb) bits)
+                       (| vf (if variadic (: 0 u32) (group-flags (- (- hn j) 1))))))
           0)
       :else
         ; indirect: a private copy, passed by address
@@ -2027,11 +2095,11 @@
       (or retvoid (= rcls 4) (= rcls 6)) 0
       (or (= rcls 0) (= rcls 1)) (push! (mut (.call-rts tl)) (primitive/cast u8 (tl-cty (mut rt))))
       (wide? (mut rt)) (push! (mut (.call-rts tl)) (primitive/cast u8 cir/T-I128))
-      (= rcls 2) (push! (mut (.call-rts tl)) (primitive/cast u8 (eb-cty retinfo 0 (tsize tl (mut rt)))))
+      (= rcls 2) (push! (mut (.call-rts tl)) (primitive/cast u8 (eb-cty retinfo 0 (eb0-bytes (tsize tl (mut rt))))))
       (= rcls 3) (do (push! (mut (.call-rts tl)) (primitive/cast u8 (eb-cty retinfo 0 8)))
                      (push! (mut (.call-rts tl)) (primitive/cast u8 (eb-cty retinfo 1 (hi-bytes (tsize tl (mut rt)))))))
       (= rcls 5) (for j (range 0 (abi-hfa-n retinfo))
-                   (push! (mut (.call-rts tl)) (primitive/cast u8 (if (= (abi-hfa-bits retinfo) 32) cir/T-F32 cir/T-F64))))
+                   (push! (mut (.call-rts tl)) (primitive/cast u8 (hfa-cty (abi-hfa-bits retinfo)))))
       :else 0)
     (open! tl)
     (let [c (cir/call! (.f tl) (if (= sym (none32)) (none32) (tl-sym tl (i64-of sym))) fnp
@@ -2050,14 +2118,13 @@
           (let [s (new-slot tl (mut rt))
                 sz (tsize tl (mut rt))]
             (cond
-              (= rcls 2) (eb-store tl s retinfo 0 0 c sz)
+              (= rcls 2) (eb-store tl s retinfo 0 0 c (eb0-bytes sz))
               (= rcls 3) (do (eb-store tl s retinfo 0 0 c 8)
                              (eb-store tl s retinfo 1 8 (cir/call-result (.f tl) c 1) (hi-bytes sz)))
-              :else (let [lb (/ (abi-hfa-bits retinfo) 8)
-                          ft (if (= lb 4) (TFloat 32) (TFloat 64))]
+              :else (let [bits (abi-hfa-bits retinfo)
+                          lb (/ bits 8)]
                       (for j (range 0 (abi-hfa-n retinfo))
-                        (let [(mut ftt) ft]
-                          (store-scalar tl s (* j lb) (cir/call-result (.f tl) c j) (mut ftt))))
+                        (hfa-store tl s (* j lb) (cir/call-result (.f tl) c j) bits))
                       0))
             (tv-p s ret))))))
 
@@ -2268,10 +2335,16 @@
               ; C callers extend narrow arguments to 32 bits only
               (bind! tl (.name prm) (tv-s (canon tl v t) (load t))))
           (= cls 2)
-            (let [sz (tsize tl t)
+            (let [sz (eb0-bytes (tsize tl t))
                   v (cir/arg! fp (eb-cty info 0 sz) false)
                   s (new-slot tl t)]
               (eb-store tl s info 0 0 v sz)
+              (bind! tl (.name prm) (tv-p s (load t))))
+          (and (= cls 3) (pair-as-i128? tl t))
+            (let [v (cir/arg! fp cir/T-I128 false)
+                  s (new-slot tl t)]
+              (open! tl)
+              (cir/store-mem! fp s v 0 16)
               (bind! tl (.name prm) (tv-p s (load t))))
           (= cls 3)
             (let [sz (tsize tl t)
@@ -2286,13 +2359,12 @@
             (bind! tl (.name prm) (tv-p (cir/arg-flagged! fp cir/T-I64 false (cir/af-byval (tsize tl t))) (load t)))
           (= cls 5)
             (let [hn (abi-hfa-n info)
-                  lb (/ (abi-hfa-bits info) 8)
-                  ft (if (= lb 4) (TFloat 32) (TFloat 64))
+                  bits (abi-hfa-bits info)
+                  lb (/ bits 8)
                   s (new-slot tl t)]
               (for j (range 0 hn)
-                (let [(mut ftt) ft
-                      v (cir/arg-flagged! fp (tl-cty (mut ftt)) false (group-flags (- (- hn j) 1)))]
-                  (store-scalar tl s (* j lb) v (mut ftt))))
+                (let [v (cir/arg-flagged! fp (hfa-cty bits) false (group-flags (- (- hn j) 1)))]
+                  (hfa-store tl s (* j lb) v bits)))
               (bind! tl (.name prm) (tv-p s (load t))))
           :else
             ; indirect: the caller's private copy
@@ -2318,15 +2390,14 @@
               sz (tsize tl (mut rt))
               (mut vals) (ArrayList::new [u32] (.a tl))]
           (cond
-            (= rcls 2) (push! (mut vals) (eb-load tl p (.retinfo tl) 0 0 sz))
+            (= rcls 2) (push! (mut vals) (eb-load tl p (.retinfo tl) 0 0 (eb0-bytes sz)))
             (= rcls 3) (do (push! (mut vals) (eb-load tl p (.retinfo tl) 0 0 8))
                            (push! (mut vals) (eb-load tl p (.retinfo tl) 1 8 (hi-bytes sz))))
             :else (let [info (.retinfo tl)
-                        lb (/ (abi-hfa-bits info) 8)
-                        ft (if (= lb 4) (TFloat 32) (TFloat 64))]
+                        bits (abi-hfa-bits info)
+                        lb (/ bits 8)]
                     (for j (range 0 (abi-hfa-n info))
-                      (let [(mut ftt) ft]
-                        (push! (mut vals) (load-scalar tl p (* j lb) (mut ftt)))))))
+                      (push! (mut vals) (hfa-load tl p (* j lb) bits)))))
           (open! tl)
           (cir/ret! fp (cast (ptr (ArrayList u32)) (mut vals)))))
     0))
@@ -2780,6 +2851,7 @@
     (set! (.sig_memo g) (ArrayList::new [NameMemo] a))  ; unused until registration ends
     (set! (.unit_export_index g) (HashMap::new [(slice u8) bool] a (keyops-borrowed)))
     (set! (.export_symbol_index g) (HashMap::new [(slice u8) (slice u8)] a (keyops-borrowed)))
+    (set! (.export_aliases g) (ArrayList::new [ExportAlias] a))
     (for [i 0 (len (load (.unit_exports mp0)))]
       (set! (mut (.unit_export_index g)) (get (load (.unit_exports mp0)) i) true))
     (for [i 0 (len (load (.exports mp0)))]
@@ -2820,6 +2892,7 @@
       (g-register-types! g mp)
       (g-eval-asserts! g mp)
       (g-register-sigs! g mp)
+      (g-register-export-aliases! g mp)
       ; sig_index is final now: memoize its lookups from here on
       (set! (.sig_memo g) (name-memo-new (.a g)))
       (g-declare-statics! g mp)
@@ -2938,6 +3011,7 @@
                   (.t-compile tlp) (.t-dwarf tlp)))
       (let [t-merge0 (ticks)]
         (tl-merge! tlp)
+        (g-place-export-aliases! g)
         (when (.dbg tlp)
           (let [span (tr/span-begin "backend.tpde-dwarf")]
             (tl-emit-dwarf! tlp paths)

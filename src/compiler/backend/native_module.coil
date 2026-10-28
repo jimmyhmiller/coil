@@ -75,6 +75,8 @@
 
 (defstruct GStatic [(name (slice u8)) (ty Type) (symidx i64)])
 
+(defstruct ExportAlias [(alias i64) (target i64)])
+
 (defstruct Cga
   [(a (dyn Allocator))
    (program (ptr Program))
@@ -86,6 +88,10 @@
    ; once avoids an O(functions x exports) signature-registration pass.
    (unit_export_index (HashMap (slice u8) bool))
    (export_symbol_index (HashMap (slice u8) (slice u8)))
+   ; Every further C symbol a function is exported under (`(export-c [f :as "a"]
+   ; [f :as "b"])`): the alias's MObj symbol and the symbol of the function it
+   ; names, whose address the alias takes once the function is placed.
+   (export_aliases (ArrayList ExportAlias))
    ; Names mono generated from a generic or a trait impl: a static cell inside
    ; one is emitted as a weak external definition, one per program across
    ; units (the LLVM backend's weak_odr). See codegen.coil Cg.spec_names.
@@ -190,6 +196,37 @@
 
 (defn g-export-c-sym [(g (ptr Cga)) (name (slice u8))] (-> (Option (slice u8)))
   (get (.export_symbol_index g) name))
+
+;;; A function exported under more than one C symbol is defined under the first
+;;; (export_symbol_index); each other published symbol is an external alias of it,
+;;; placed at the function's address by `g-place-export-aliases!`. A struct-taking
+;;; function is exported through its thunk, so the thunk is what an alias names.
+(defn g-register-export-aliases! [(g (ptr Cga)) (mp (ptr Program))] (-> i64)
+  (for [i 0 (len (load (.exports mp)))]
+    (let [e (elem (.exports mp) i)
+          target (if (export-c-needs-thunk? e) (export-c-thunk-name (.a g) (.name e)) (.name e))]
+      (match (.symbol e)
+        (Some [symbol]
+              (when (and (.published e)
+                         (match (g-export-c-sym g target)
+                           (Some [primary] (!= primary symbol))
+                           (None [] false)))
+                (let [si (g-sig-idx g target)]
+                  (when (< si 0)
+                    (cga-fail2 "export-c: no definition for an exported function: " target))
+                  (push! (mut (.export_aliases g))
+                         (ExportAlias :alias (mobj-add-sym! (mut (.obj g)) (g-mangle g symbol) (.text g) 0 true)
+                                      :target (.symidx (al-at [GSig] (field g sigs) si)))))))
+        (None [] 0))))
+  0)
+
+;;; Give each export alias the section and offset of the function it names.
+(defn g-place-export-aliases! [(g (ptr Cga))] (-> i64)
+  (for [i 0 (len (.export_aliases g))]
+    (let [ea (get (.export_aliases g) i)
+          t (al-at [MSym] (field (field g obj) syms) (.target ea))]
+      (mobj-set-sym! (mut (.obj g)) (.alias ea) (.sect t) (.off t))))
+  0)
 
 ; register every extern + func as a GSig with a Mach-O symbol.
 (defn g-register-sigs! [(g (ptr Cga)) (mp (ptr Program))] (-> i64)
@@ -494,17 +531,23 @@
 ;          4 = aggregate > 16B (indirect), 5 = HFA (hfa_n regs of hfa_bits)
 (defstruct AbiInfo [(cls i64) (hfa_n i64) (hfa_bits i64)])
 
-; HFA walk: count uniform float leaves; returns leaf count or -1 (not an HFA).
-; bitsp receives the leaf width. Mirrors abi-hfa in codegen.coil.
-(defn g-hfa-walk [(g (ptr Cga)) (t (ptr Type)) (bitsp (ptr i64))] (-> i64)
+; HFA walk: count uniform float leaves, or uniform short-vector leaves (an
+; AAPCS64 HVA: vectors of 8 or 16 bytes, one size, whatever their lanes); returns
+; the leaf count or -1 (not homogeneous). bitsp receives the leaf width, and
+; vecp whether the leaves are vectors (a float and a vector of one width are not
+; one base). Mirrors abi-hfa in codegen.coil.
+(defn g-hfa-walk [(g (ptr Cga)) (t (ptr Type)) (bitsp (ptr i64)) (vecp (ptr bool))] (-> i64)
   (match (load t)
-    (TFloat [bits]
-            (if (= (load bitsp) 0)
-                (do (set! bitsp bits) 1)
-                (if (= (load bitsp) bits) 1 -1)))
+    (TFloat [bits] (g-hfa-leaf bitsp vecp bits false))
+    (TVec [el _]
+          (let [sz (ty-size g t)]
+            (if (or (match (load el) (TBool [] true) (_ false))
+                    (and (!= sz 8) (!= sz 16)))
+                -1
+                (g-hfa-leaf bitsp vecp (* sz 8) true))))
     (TArray [elem n-extent]
             (let [n (extent-value n-extent)]
-              (let [inner (g-hfa-walk g elem bitsp)]
+              (let [inner (g-hfa-walk g elem bitsp vecp)]
                 (if (< inner 0)
                     -1
                     (primitive/imul inner n)))))
@@ -512,8 +555,15 @@
              (let [si (g-struct-idx g nm)]
                (if (< si 0)
                    -1
-                   (g-hfa-walk-record g si bitsp))))
+                   (g-hfa-walk-record g si bitsp vecp))))
     (_ -1)))
+
+; One leaf of BITS width (a vector when VEC): the first sets the base, any
+; other must match it.
+(defn g-hfa-leaf [(bitsp (ptr i64)) (vecp (ptr bool)) (bits i64) (vec bool)] (-> i64)
+  (cond (= (load bitsp) 0) (do (set! bitsp bits) (set! vecp vec) 1)
+        (and (= (load bitsp) bits) (= (load vecp) vec)) 1
+        :else -1))
 
 ; Count a record's distinct float storage groups. Explicit-layout records from
 ; cimport are just as ABI-visible as natural C layouts. Equal-offset fields are
@@ -522,7 +572,8 @@
 ; backend's abi-hfa-walk-record.
 (defn g-hfa-walk-record [(g (ptr Cga))
                          (si i64)
-                         (bitsp (ptr i64))] (-> i64)
+                         (bitsp (ptr i64))
+                         (vecp (ptr bool))] (-> i64)
   (let [fs (load (field (struct-at (field g layouts) si) fields))
         positions (primitive/alloc-stack (array i64 4))
         sizes (primitive/alloc-stack (array i64 4))
@@ -534,7 +585,8 @@
         (let [part
                 (g-hfa-walk g
                             (field (al-at [Field] fs i) ty)
-                            bitsp)]
+                            bitsp
+                            vecp)]
           (if (< part 0)
               (set! ok false)
               (when (> part 0)
@@ -583,13 +635,18 @@
           (set! (.cls r)
                 (if (ty-is-float t) (do 1) 0))
           0)
-        (let [(mut bitsp) 0]
+        (let [(mut bitsp) 0
+              (mut vecp) false]
           (let [hn
                   (g-hfa-walk g
                               t
-                              (mut bitsp))]
+                              (mut bitsp)
+                              (mut vecp))]
+            ; the members must fill the aggregate: padding, as an explicit
+            ; alignment adds, disqualifies it (Clang's isHomogeneousAggregate)
             (if (and (>= hn 1)
-                     (<= hn 4))
+                     (<= hn 4)
+                     (= (* hn (/ (load bitsp) 8)) (ty-size g t)))
                 (do
                   (set! (.cls r)
                         5)

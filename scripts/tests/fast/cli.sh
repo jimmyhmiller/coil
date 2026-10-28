@@ -1101,6 +1101,29 @@ EOF
 EOF
   expect_rc 37 "an llvm-ir operand of a named struct type is that struct" \
     "$COIL" run --backend llvm "$T/named-ir.coil"
+
+  # A literal wider than i64 keeps its value in a type wider than 128 bits: a
+  # positive one is not sign-extended from bit 127, and a negative one below
+  # -2^127 is not the 128-bit pattern of its magnitude.
+  cat > "$T/wide-literal.coil" <<'EOF'
+(module wide.literal)
+(import "coil.primitive" :as p)
+(def BIG (p/alloc-static i256 -340282366920938463463374607431768211455))
+(defn positive [] (-> u256) 340282366920938463463374607431768211455)
+(defn negative [] (-> i256) -340282366920938463463374607431768211455)
+(defn main [] (-> i64)
+  (let [all-ones (p/isub (p/ishl (: 1 u256) 128) (: 1 u256))
+        minus (p/isub (: 0 i256) (p/isub (p/ishl (: 1 i256) 128) (: 1 i256)))]
+    (+ (if (p/icmp-eq (p/ishr (positive) 128) (: 0 u256)) 1 0)
+       (if (p/icmp-eq (positive) all-ones) 10 0)
+       (if (p/icmp-eq (negative) minus) 100 0)
+       (if (p/icmp-eq (p/load BIG) minus) 1000 0))))
+EOF
+  local opt
+  for opt in -O0 -O2; do
+    expect_rc 87 "a literal wider than 128 bits keeps its value ($opt; 1111 mod 256)" \
+      "$COIL" run --backend llvm "$opt" "$T/wide-literal.coil"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -1520,6 +1543,32 @@ EOF
 EOF
   expect_rc_out 1 "export-c defines C symbol 'callback_c'" "an extern colliding with a struct-by-value export is explained" \
     "$COIL" check "$T/collide.coil"
+
+  # A C symbol the program's own functions define is not another declaration's:
+  # neither an export-c nor an extern may name it.
+  cat > "$T/export-main.coil" <<'EOF'
+(module export-main)
+(defn helper [] (-> i32) 7)
+(export-c [helper :as "main"])
+(defn main [] (-> i32) 42)
+EOF
+  expect_rc_out 1 "export-c: 'export-main.helper' would define C symbol 'main', which the program's function 'main' already defines" \
+    "an export-c of the C symbol main beside the program's main is explained" "$COIL" check "$T/export-main.coil"
+  cat > "$T/extern-main.coil" <<'EOF'
+(module extern-main)
+(extern forbidden :as "main" [] (-> i32))
+(defn main [] (-> i32) 42)
+EOF
+  expect_rc_out 1 "extern 'extern-main.forbidden' declares C symbol 'main', which the program's own function 'main' defines" \
+    "an extern of the C symbol of the program's main is explained" "$COIL" check "$T/extern-main.coil"
+  cat > "$T/extern-defn.coil" <<'EOF'
+(module extern-defn)
+(extern h :as "extern-defn.helper" [] (-> i32))
+(defn helper [] (-> i32) 7)
+(defn main [] (-> i32) (+ (helper) (h)))
+EOF
+  expect_rc_out 1 "declares C symbol 'extern-defn.helper', which the program's own function 'extern-defn.helper' defines" \
+    "an extern of a Coil function's own symbol is explained" "$COIL" check "$T/extern-defn.coil"
 }
 
 # ---------------------------------------------------------------------------
