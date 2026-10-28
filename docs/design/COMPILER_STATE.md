@@ -1,6 +1,6 @@
 # Compiler state that is trivial to keep, copy and save
 
-Status: in progress (steps 0 and 1 done). Written 2026-10-28.
+Status: in progress (steps 0–2 done, step 3's cut done; its deletions, and steps 4–6, remain). Written 2026-10-28.
 
 ## The problem
 
@@ -199,8 +199,72 @@ the same series (`refresh-seed.sh all` plus the Linux pair).
   become data. Known ones: `Func.lazy (ptr i8)` becomes the form's source range,
   `MEEntry`'s loaded fields move out of the entry. Each is fixed in this step.
 - Nothing calls the derived functions yet. *Behaviour-preserving.* Seed refresh.
+- Done. The derive copies an enumeration (a sum whose variants carry nothing)
+  as a value, so `CodeOp`'s operation sums and `NativeCc` need no impl of their
+  own. `Func.lazy` is `(field lazy (skip))`: a lazy body belongs to the resolve
+  that left it unparsed. Only Persist's layout-free impls were added, so no seed
+  refresh was needed beyond the one that taught stage zero `coil.persist`.
 
 ### Step 3 — the `Env`, and the cut
+
+**What was built** (`src/compiler/frontend/env.coil`):
+
+- `Env` holds one `LS` (the loader lists both layers read), an `AcceptedLayer`
+  for the application and one for the metaprogram environment (functions index,
+  checked `Program`, signatures, constants, live semantic maps, declaration
+  table), the resolution registries, the metaprogram entries (each naming its
+  build's quasiquote registry by index, `registries`), the native program as
+  declarations only, and the identity counters.
+- A compile reads an `Env` through `env-view`: an `LS`, `Cx` and `AstUnitState`
+  whose fields point into the `Env` and whose own parent links are null, so every
+  existing reader of "the state this builds on" works unchanged, one level deep.
+- Accept builds the flat accepted state (`env-of`: the revision's lists, its
+  checker's signatures and constants over the base's, its maps' live entries, the
+  registries merged) and copies it out (`env-hold`). Then the unit is left: its
+  arena and every resource except the executable images and interpreters its
+  metaprograms were loaded as, which become the session's.
+- Envs live in pools. An `Env` built on another goes into its pool with
+  `persist-clone-sharing`, which reuses every record the base already has there,
+  so an accept copies what is new plus the list buffers that changed. Once a pool
+  is twice the size of its last full copy, the next `Env` is copied whole into a
+  new pool and the old pool is freed with its last `Env`.
+- An interpreter context owns an arena holding a copy of the program it
+  interprets (it compiles functions from it lazily).
+
+**Leaks found on the way**, each predating this work and each per submission:
+the arm64 runner took its codegen scratch from the session's allocator, which
+under `coil repl` is a bump arena (~1.3 MB a submission); the expander's
+top-level form pool kept its newest 256 KB segment past the unit; the terminal
+read each input from the process arena.
+
+**Measured** (`repl-growth.py`, one-line `defn` and call submissions, macOS arm64):
+
+| | main before step 0 | now |
+|---|---|---|
+| RSS after 30 submissions | 1,337 MB (+48 MB a submission) | 71 MB |
+| RSS after 200 submissions | (not run: it would pass 9 GB) | 95–115 MB |
+| what grows per submission | the whole arena (17–32 MB) | `Env` ~33 KB, JIT code and its bookkeeping ~64 KB |
+| median submission | 15 ms | 21–23 ms |
+| accept (`jit.accept.env`) | — | 4–5 ms, 9 ms on a compaction |
+
+The resident-size slope `repl-growth.py` reports (~200 KB/submission over 400)
+includes the pool's compaction sawtooth; the `Env`'s own size after each
+compaction grows 33 KB per submission, and the rest is the JIT's code.
+
+**What remains of step 3:**
+
+- Time. Accept still copies every list buffer of the flat state (the maps' history
+  alone is ~50k entries). Making the compile's tables extend the `Env`'s (a check
+  that records only new facts over the `Env`'s maps instead of copying them first,
+  `sem-maps-inherit!`) removes most of it, and is the same change step 5 needs.
+- The deletions. The `Env` replaced the revision chain (`CompilerRevision.parent`,
+  `holds`, `accepted-ast`, `accepted-engine`, retain/release), but the frontend
+  still builds each compile's working state by copying the `Env` view (the
+  `merge-*` copiers, `semantic-inherit-program!`, `sem-maps-inherit!`, the
+  depth-one parent fallbacks). Those go when the compile reads the `Env` in place.
+  `src/compiler` is net +660 lines after the cut (env.coil is 593 of them); the
+  −1,000 target is not met yet.
+- The gate bound in FAST (`repl-growth.py` reports only).
 
 - Define `Env` as one struct holding the persistent fields of the table above,
   deriving `Persist`. Each table records its length when a compile starts.
@@ -262,13 +326,13 @@ what persists, all of it goes. Measured on main `eb6b3493`:
 | Where | What | Lines today | Fate |
 |---|---|---|---|
 | `loader.coil` | `ls-inherit!`, the `LS.parent` walk in `ls-function` and other readers (35 sites), `retained_inherited`, `meta_environment`, `checker_context`, `semantic_maps`, `checked_functions` fields and their plumbing | ~70 in named defs, plus field plumbing | deleted |
-| `resolve.coil` | `semantic-inherit-program!`, `semantic-inherit-declarations!`, `semantic-merge-submission!`, `semantic-freshen-node-ids!`, `merge-into`, `merge-defs!`, and the 14 `merge-*` copiers (`funcs`, `structs`, `sums`, `externs`, `consts`, `unretired-consts`, `traits`, `impls`, `exports`, `aliases`, `asserts`, `metas`, `convs`, `annotation-defs`) | ~330 | deleted |
+| `resolve.coil` | `semantic-inherit-program!`, `semantic-inherit-declarations!`, `semantic-merge-submission!`'s redefinition check over the chain, and the inheritance use of the `merge-*` copiers. Not `merge-into`, `merge-defs!` or `semantic-freshen-node-ids!`: they serve every resolve (`funcs`, `structs`, `sums`, `externs`, `consts`, `unretired-consts`, `traits`, `impls`, `exports`, `aliases`, `asserts`, `metas`, `convs`, `annotation-defs`) | ~330 | deleted |
 | `resolve.coil` | the rest of the `semantic-*` layer (49 defs, 1,443 lines): the parts that exist to carry state between revisions | part of 1,443 | deleted or reduced to reads of the `Env`; what serves lint's semantic model stays |
-| `check.coil` | `copy-funcs`, `retained-impl?`, `retained-impl-methods!`, `setup-retained`, `setup-retained-sigs`, `inherit-trait-method-annotations!`, `prior_cx` (7 sites) | ~190 | deleted |
+| `check.coil` | `retained-impl?`, `retained-impl-methods!`, `setup-retained-sigs`' accepted-signature skip, `prior_cx` (7 sites). Not `copy-funcs` or `inherit-trait-method-annotations!`: both serve every check, not inheritance | ~150 | deleted |
 | `comptime.coil` | `sem-maps-inherit!`, `sem-maps-inherit-under!`, `SemMapsSnap` save/restore by value (10 defs) | ~135 | deleted; facts are read from the `Env` |
-| `ast.coil` | `AstUnitState.resolution_parent` and its six readers | ~40 | deleted |
+| `ast.coil` | `AstUnitState.resolution_parent` and its four readers | ~40 | deleted |
 | `metaengine.coil` | `MetaEngine.inherited`, `meta-engine-forget-inherited!`, per-candidate `MEEntry` copying | ~60 | deleted |
-| `driver.coil` | `CompilerRevision.parent`, `holds`, `compiler-revision-retain!`/`-release!`/`-retain-accepted!`, `compiler-revision-enter!`'s copying of providers and engine entries, the hide-entry/hide-declaration bookkeeping that exists because old state stays reachable, `reset-inherited-test-project-env!` | a large part of the 1,570 lines of revision and session code | deleted; what remains is a session holding an `Env` |
+| `driver.coil` | `CompilerRevision.parent`, `holds`, `accepted-ast`, `accepted-engine`, `compiler-revision-retain!`/`-release!` (done), `compiler-revision-enter!`'s copying of providers and engine entries, the hide-entry/hide-declaration bookkeeping that exists because old state stays reachable | a large part of the 1,570 lines of revision and session code | deleted; what remains is a session holding an `Env` |
 | `expander.coil` | the second full resolve+check per submission (`install-transform-model!` when no transform is registered), `merge-checked-read-programs` | ~300 with the pass it drives | deleted in step 5 |
 
 What is added: the `Persist` derive in the stdlib (~1,200 lines with its tests, and

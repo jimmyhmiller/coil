@@ -7,7 +7,9 @@
 Submits N forms, alternating a new `defn` and a call to it, and samples the
 REPL's resident set and the wall time of each submission once its answer is
 printed. Reports the slope of each over the second half of the run (the first
-half includes warm-up: the first call of each kind JIT-links library code).
+half includes warm-up: the first call of each kind JIT-links library code). The
+resident-size slope is that of the least resident size in each window of 16
+submissions, which steps over the compaction of the session's state.
 
 It fails only on what is asked: `--max-rss-slope-kb` and `--max-time-slope-ms`
 bound the slopes. `--rss-cap-mb` stops the run (and fails) before a growing
@@ -94,11 +96,16 @@ def main() -> int:
         proc.wait()
 
     half = len(rss) // 2
-    rss_slope = slope([float(r) for r in rss[half:]])
+    # The session's state lives in a pool that is compacted every few
+    # submissions, so resident size is a sawtooth. Its floor -- the least of
+    # each window of submissions -- is what the session keeps.
+    window = 16
+    floors = [float(min(rss[i:i + window])) for i in range(half, len(rss) - window + 1, window)]
+    rss_slope = slope(floors) / window if len(floors) > 1 else slope([float(r) for r in rss[half:]])
     time_slope = slope(times[half:])
     print(f"submissions: {len(rss)}")
     print(f"rss: first {rss[0] // 1024} MB, last {rss[-1] // 1024} MB, "
-          f"slope {rss_slope:.0f} KB/submission (second half)")
+          f"slope {rss_slope:.0f} KB/submission (floor of each {window} submissions, second half)")
     print(f"time: first {times[0]:.1f} ms, median {sorted(times)[len(times) // 2]:.1f} ms, "
           f"last {times[-1]:.1f} ms, slope {time_slope:.2f} ms/submission (second half)")
     failed = False
