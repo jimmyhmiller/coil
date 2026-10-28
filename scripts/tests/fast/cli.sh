@@ -1089,6 +1089,11 @@ EOF
 
 # ---------------------------------------------------------------------------
 section_cross() {
+  # A module's own definition shadows a core macro of the same name under any
+  # target: a cross build expands the program's runtime definitions as written.
+  printf '(module xshadow)\n(defn scope [(n i64)] (-> i64) (+ n 1))\n(defn main [] (-> i32) (cast i32 (scope 41)))\n' > "$T/xshadow.coil"
+  expect_rc 0 "a module's own function shadows a core macro in a cross build" \
+    "$COIL" emit-obj "$T/xshadow.coil" --target x86_64-unknown-linux-gnu -o "$T/xshadow.o"
   if [ "$HOST_OS" = Darwin ]; then
     local out rc kind
     # comptime code runs in the compiler, so it is compiled for this machine
