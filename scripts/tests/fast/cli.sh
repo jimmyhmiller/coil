@@ -449,6 +449,12 @@ EOF
   out=$(cd "$T/no-stdlib" && "$COIL" run 2>&1); rc=$?
   [ "$rc" = 42 ] && ok "a transform runs in a program with no bundled library" \
     || bad "a transform runs in a program with no bundled library" "exit $rc: $out"
+  # A prelude that re-exports coil.primitive makes its primitives every module's.
+  printf '(module tiny.core)\n(import "coil.primitive" :use * :reexport)\n(defn* answer [] (-> i64) 42)\n' > "$T/no-stdlib/src/tiny.coil"
+  printf '(module nostd.a)\n(defn* main [] (-> i64) (let* [cell (alloc-static i64)] (store! cell 40) (iadd (load cell) 2)))\n' > "$T/no-stdlib/src/a.coil"
+  out=$(cd "$T/no-stdlib" && "$COIL" run 2>&1); rc=$?
+  [ "$rc" = 42 ] && ok "a prelude's re-exported primitives are ambient" \
+    || bad "a prelude's re-exported primitives are ambient" "exit $rc: $out"
   # A defcc's :lower is a constructor as written; a call there is refused with
   # the defcc's own message, not as a call to an undefined function.
   printf '(module defcc-case)\n(import "coil.cc" :as cc)\n(defn pick [] (-> cc/Lowering) (cc/Shim))\n(defcc mine :params [x0] :ret x0 :lower (pick))\n(defn main [] (-> i64) 0)\n' > "$T/defcc-call.coil"
@@ -460,6 +466,11 @@ EOF
   printf '(module primlib)\n(export add)\n(defprimitive add :iadd)\n' > "$T/prim-export/primlib.coil"
   printf '(module primapp)\n(import "primlib" :as p)\n(defn main [] (-> i64) (p/add 40 2))\n' > "$T/prim-export/primapp.coil"
   expect_rc 42 "a module's explicit export list names a primitive it defines" "$COIL" run "$T/prim-export/primapp.coil"
+  # A facade passes a primitive on through `:reexport` as it passes on a
+  # function, renamed or not, and may name it in its export list.
+  printf '(module primfacade)\n(export add)\n(import "primlib" :use [add] :reexport)\n' > "$T/prim-export/primfacade.coil"
+  printf '(module primuser)\n(import "primfacade" :as f)\n(import "primfacade" :use [add] :rename [[add plus]])\n(defn main [] (-> i64) (plus (f/add 30 10) 2))\n' > "$T/prim-export/primuser.coil"
+  expect_rc 42 "a primitive re-exported through a facade reaches its importers" "$COIL" run "$T/prim-export/primuser.coil"
   # Reflection reads a type where the argument was written: an alias-qualified
   # macro argument in one of several modules of one file.
   printf '(module model) (export Point) (defstruct Point [(x i64) (y i64)])\n(module lib) (export inspect) (defstruct Point [(wrong i64)])\n(import "coil.primitive" :as p)\n(defn inspect [(type Code)] (-> Code) (if (= (p/code-field-count type) 2) (quote 42) (quote 0)))\n(module app) (import "model" :as m) (import "lib" :use [inspect])\n(defn answer [] (-> i64) (inspect m/Point))\n' > "$T/refl-modules.coil"
