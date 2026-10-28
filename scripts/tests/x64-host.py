@@ -5,7 +5,7 @@
 
 Copies this working tree's tracked files to the host, then there: bootstraps the
 LLVM Linux compiler from the committed seed (no install), runs the runtime corpus
-on it with the LLVM backend and the C ABI checks, self-hosts through the native
+on it with the LLVM backend, the C ABI checks and the SIMD tests, self-hosts through the native
 backend, tpde (fixpoint, the corpus on `--backend x64`, the SysV C ABI against
 gcc, the encoder against llvm-mc), bootstraps the LLVM-free Linux compiler, and
 checks the ELF writer. The host needs LLVM 21, a C compiler, python3 and node.
@@ -37,6 +37,8 @@ echo "== runtime corpus on Linux, LLVM backend"
 python3 scripts/oracle.py corpus llvm --compiler build/bin/coil
 echo "== the C ABI on Linux: LLVM and tpde, each against the other"
 python3 scripts/tests/c-abi.py --compiler build/bin/coil
+echo "== SIMD semantics and differential tests, as CI's Linux job runs them"
+python3 scripts/tests/comprehensive.py --compiler build/bin/coil --only simd
 echo "== self-host through tpde: fixpoint, corpus, C ABI, encoder"
 python3 scripts/dev.py build x64
 echo "== the LLVM-free Linux bootstrap"
