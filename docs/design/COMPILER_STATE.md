@@ -1,6 +1,6 @@
 # Compiler state that is trivial to keep, copy and save
 
-Status: in progress (step 0 done). Written 2026-10-28.
+Status: in progress (steps 0 and 1 done). Written 2026-10-28.
 
 ## The problem
 
@@ -64,8 +64,9 @@ runner.
 Every type stored in an `Env` derives `Persist`, a new derive alongside `Clone`,
 `Serialize` and `Deserialize`. For a type T it generates:
 
-- `persist-clone [(x (ptr T)) (a (dyn Allocator))] (-> T)`: a deep copy into A;
-- `Serialize` and `Deserialize` impls, through `coil.serde` (msgpack for saving).
+- `persist-clone [(x (ref T)) (a (dyn Allocator))] (-> T)`: a deep copy into A;
+- `Serialize` and `Deserialize` impls, through `coil.serde` (msgpack for saving),
+  added in step 4 where saving needs them.
 
 What makes this the whole mechanism is how `Persist` treats fields:
 
@@ -79,6 +80,12 @@ What makes this the whole mechanism is how `Persist` treats fields:
 
 So **the derive is the enforcement**: a persistent record cannot hold an opaque
 pointer, a function pointer or a shared reference, because it would not compile.
+
+A field that belongs to the computation that built a record rather than to the
+record (a memo, a lazily parsed body's resolve context) is declared so with
+`(derive (Persist (field NAME (skip))) T)`: the copy holds it zeroed. The accept
+path is responsible for anything such a field would have produced (step 3 forces
+a kept function's lazy body before copying it).
 
 Persistent data must be **trees**. Records refer to other declarations **by
 qualified name or ID**, never by pointer. Coil's declarations already do this: a
@@ -172,14 +179,13 @@ the same series (`refresh-seed.sh all` plus the Linux pair).
   as an owned box; the derive for structs and sums, generated through the same
   reflection `coil.derive` and `coil.serde.derive` use. The refusals in the table
   above are located compile errors naming the field.
-- `Persist` implies `Serialize` and `Deserialize` (derived alongside; existing
-  serde impls are reused for leaves). The `HashMap` serde impl, which today
-  handles only `(slice u8)` keys, is generalized.
-- The debug-build cycle guard.
-- Tests: a `tests/stdlib` suite that round-trips recursive sums and nested
-  containers through `persist-clone` and msgpack, checks the copy shares no memory
-  with the original (free the original, read the copy under `COIL_JIT_PROTECT`-style
-  poisoning), and checks each refusal's diagnostic. ~1,200 lines with tests.
+- The debug-build cycle guard, and `(field NAME (skip))`.
+- Tests: `tests/stdlib/persist_test.coil` copies recursive sums and every owning
+  container and checks the copy shares no memory with the original (it overwrites
+  every value of the original, then reads the copy); `cli/check` checks each
+  refusal's diagnostic and `cli/debug-checks` the cycle guard.
+- Done: `src/stdlib/persist.coil` is 324 lines, the suite 142. Serialization moved
+  to step 4, where saving first needs it.
 
 ### Step 2 — derive `Persist` on the compiler's records
 
@@ -219,6 +225,9 @@ the same series (`refresh-seed.sh all` plus the Linux pair).
 
 ### Step 4 — save and load
 
+- `(derive Persist T)` also derives `Serialize` and `Deserialize` through
+  `coil.serde`, reusing its impls for leaves; `(ptr T)` fields are boxes, and the
+  `HashMap` serde impl, which today handles only `(slice u8)` keys, is generalized.
 - `coil.jit` gains `jit-env-save` and `jit-env-load` (derived msgpack of the
   `Env`, with the toolchain digest in a header; a mismatched digest is a clear error).
 - Tests: save → load → save is byte-identical; a session loaded from a file accepts

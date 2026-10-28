@@ -1,0 +1,324 @@
+;;; Deep copies of owned data into an allocator: `(derive Persist T)`.
+;;;
+;;;   (import "coil.persist" :use *)
+;;;   (defsum Tree (Leaf [(v i64)]) (Node [(l (ptr Tree)) (r (ptr Tree))]))
+;;;   (derive Persist Tree)
+;;;   (persist-clone tree a)   ; a Tree sharing no memory with `tree`
+;;;
+;;; A type that derives Persist owns everything it reaches: a slice owns its
+;;; elements, a `(ptr T)` owns the T it points to, an `ArrayList`, `HashMap` or
+;;; `Option` owns its contents. `persist-clone` copies all of it into the
+;;; allocator it is given, so the copy outlives whatever memory the original lives
+;;; in. That is the whole mechanism for keeping a value past the arena that built
+;;; it: no walker is written per type.
+;;;
+;;; What cannot be owned is refused where the derive is written, naming the
+;;; field: an opaque pointer (`(ptr i8)`, `(ptr u8)`, `(ptr void)`), a `dyn`, a
+;;; `fnptr`, a borrow (`ref`, `mut`), and shared ownership (`Rc`, `Arc`). Such a
+;;; field has to become data before its type can persist.
+;;;
+;;; A field that belongs to the computation that built the value, not to the
+;;; value, is left out of the copy, which holds it zeroed:
+;;;
+;;;   (derive (Persist (field memo (skip))) Entry)
+;;;
+;;; Persistent data must be trees. Two fields pointing at one value are copied
+;;; twice, which is correct for values. A cycle would never finish; under
+;;; --debug-checks the copy stops at the first pointer it re-enters.
+(module coil.persist)
+(import "coil.primitive" :as primitive)
+(import "coil.derive" :use [derive-impl derive-type-param?] :reexport)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.control" :use *)
+
+(export Persist PersistCx persist-into persist-clone persist-pointee)
+
+;;; Where a copy goes: the allocator, and under --debug-checks the addresses of
+;;; the pointers being copied, outermost first, to find a cycle.
+(defstruct PersistCx [(alc (dyn Allocator)) (path (ArrayList i64))])
+
+;;; A type whose values can be deep-copied into an allocator. Derive it.
+(deftrait Persist [Self]
+  (persist-into [(self (ref Self)) (cx (ptr PersistCx))] (-> Self)))
+
+;;; A copy of X that shares no memory with it, allocated from A.
+(defn persist-clone [(T Persist)] [(x (ref T)) (a (dyn Allocator))] (-> T)
+  (let [(mut cx) (PersistCx :alc a :path (ArrayList::new [i64] (malloc-allocator)))
+        out (persist-into x (mut cx))]
+    (free! (mut (.path cx)))
+    out))
+
+;;; The T a pointer owns, copied: a `(ptr T)` passes as the `(ref T)` this takes.
+(defn persist-pointee [(T Persist)] [(x (ref T)) (cx (ptr PersistCx))] (-> T)
+  (persist-into x cx))
+
+(defn persist--alloc-one [T] [(cx (ptr PersistCx))] (-> (ptr T))
+  (match (create [T] (.alc cx)) (Some [p] p) (None [] (oom))))
+
+(defn persist--alloc-n [T] [(cx (ptr PersistCx)) (n i64)] (-> (slice T))
+  (match (alloc [T] (.alc cx) n) (Some [s] s) (None [] (oom))))
+
+;;; Under --debug-checks: refuse to enter pointer P again while copying what it
+;;; points to.
+(defn persist--enter [(cx Code) (p Code)] (-> Code)
+  (if (primitive/debug-checks?)
+      `(let [address (primitive/cast i64 ~p)]
+         (for [i 0 (len (.path ~cx))]
+           (when (= (get (.path ~cx) i) address)
+             (debug-fail-at c"persist-clone: a pointer reaches itself while it is copied; persistent data must be trees")))
+         (push! (mut (.path ~cx)) address))
+      `0))
+
+(defn persist--leave [(cx Code)] (-> Code)
+  (if (primitive/debug-checks?)
+      `(pop! (mut (.path ~cx)))
+      `0))
+
+; ---- scalars: copied ---------------------------------------------------------
+(defn persist--scalar-impls [& (types Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 0 (primitive/code-count types)]
+      (let [t (primitive/code-nth types i)]
+        (primitive/code-list-push! out
+                                   `(impl Persist ~t
+                                      (persist-into [(self (ref ~t)) (cx (ptr PersistCx))] (-> ~t)
+                                        self)))))
+    `(do ~@(primitive/code-list-done out))))
+
+(persist--scalar-impls i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool)
+
+; ---- owned memory ------------------------------------------------------------
+;;; A `(ptr T)` owns one T. A null pointer stays null.
+(impl [(T Persist)] Persist (ptr T)
+  (persist-into [(self (ref (ptr T))) (cx (ptr PersistCx))] (-> (ptr T))
+    (let [p (load self)]
+      (if (= (primitive/cast i64 p) 0)
+          p
+          (let [out (persist--alloc-one [T] cx)]
+            (persist--enter cx p)
+            (store! out (persist-pointee [T] p cx))
+            (persist--leave cx)
+            out)))))
+
+;;; A slice owns its elements. An empty slice stays empty and allocates nothing.
+(impl [(T Persist)] Persist (slice T)
+  (persist-into [(self (ref (slice T))) (cx (ptr PersistCx))] (-> (slice T))
+    (let [n (len self)]
+      (if (= n 0)
+          (slice::new (primitive/cast (ptr T) 0) 0)
+          (let [(mut out) (persist--alloc-n [T] cx n)]
+            (for [i 0 n]
+              (init! (mut out) i (persist-into (at self i) cx)))
+            out)))))
+
+;;; A list owns its elements; the copy holds exactly them and grows in the
+;;; allocator it was copied into.
+(impl [(T Persist)] Persist (ArrayList T)
+  (persist-into [(self (ref (ArrayList T))) (cx (ptr PersistCx))] (-> (ArrayList T))
+    (let [n (len self)
+          (mut out) (ArrayList::new [T] (.alc cx))]
+      (reserve! (mut out) n)
+      (for [i 0 n]
+        (push! (mut out) (persist-into (at self i) cx)))
+      out)))
+
+;;; A map owns its keys and values, and keeps its key operations (static code).
+;;; A map whose operations own their keys copies each key itself on insert.
+(impl [(K Persist) (V Persist)] Persist (HashMap K V)
+  (persist-into [(self (ref (HashMap K V))) (cx (ptr PersistCx))] (-> (HashMap K V))
+    (let [ops (load (field self ops))
+          owns (owns? ops)
+          (mut out) (HashMap::new [K V] (.alc cx) ops)]
+      (for-entries [k v self]
+        (set! (mut out)
+              (if owns (load k) (persist-into k cx))
+              (persist-into v cx)))
+      out)))
+
+(impl [(T Persist)] Persist (Option T)
+  (persist-into [(self (ref (Option T))) (cx (ptr PersistCx))] (-> (Option T))
+    (match self
+      (None [] (None [T]))
+      (Some [v] (Some [T] (persist-into v cx))))))
+
+(impl [(T Persist) (E Persist)] Persist (Result T E)
+  (persist-into [(self (ref (Result T E))) (cx (ptr PersistCx))] (-> (Result T E))
+    (match self
+      (Ok [v] (Ok [T E] (persist-into v cx)))
+      (Err [e] (Err [T E] (persist-into e cx))))))
+
+; ---- the derive ----------------------------------------------------------------
+(defn persist--scalar? [(ty Code)] (-> bool)
+  (and (primitive/code-sym? ty)
+       (or (primitive/code-eq ty `i8) (primitive/code-eq ty `i16)
+           (primitive/code-eq ty `i32) (primitive/code-eq ty `i64)
+           (primitive/code-eq ty `u8) (primitive/code-eq ty `u16)
+           (primitive/code-eq ty `u32) (primitive/code-eq ty `u64)
+           (primitive/code-eq ty `f32) (primitive/code-eq ty `f64)
+           (primitive/code-eq ty `bool))))
+
+;;; Whether a reflected type name is a trait object: reflection spells
+;;; `(dyn Allocator)` as the struct the compiler represents it with,
+;;; `coil.alloc.Allocator-dyn`.
+(defn persist--dyn-name? [(name (slice u8))] (-> bool)
+  (let [n (len name)]
+    (and (> n 4) (= (subslice name (- n 4) n) "-dyn"))))
+
+;;; Why a field of type TY cannot be owned, or "" when it can. Looks through
+;;; type arguments: `(ArrayList (ptr i8))` is refused for its elements.
+(defn persist--refusal [(ty Code)] (-> (slice u8))
+  (if (not (primitive/code-list? ty))
+      (cond (primitive/code-eq ty `coil.rc.Rc) "shared ownership has no single owner to copy"
+            (primitive/code-eq ty `coil.arc.Arc) "shared ownership has no single owner to copy"
+            (persist--dyn-name? (primitive/code-str ty)) "a dyn is code and state the copy cannot see into"
+            :else "")
+      (let [n (primitive/code-count ty)
+            head (if (> n 0) (primitive/code-nth ty 0) `())]
+        (cond (= n 0) ""
+              (primitive/code-eq head `dyn) "a dyn is code and state the copy cannot see into"
+              (primitive/code-eq head `fnptr) "a function pointer is process state, not data"
+              (primitive/code-eq head `ref) "a borrow does not own what it points to"
+              (primitive/code-eq head `mut) "a borrow does not own what it points to"
+              (and (primitive/code-eq head `ptr)
+                   (= n 2)
+                   (let [inner (primitive/code-nth ty 1)]
+                     (or (primitive/code-eq inner `i8)
+                         (primitive/code-eq inner `u8)
+                         (primitive/code-eq inner `void))))
+                "an opaque pointer does not say what it owns"
+              :else
+                (let [(mut why) ""]
+                  (for [i 0 n]
+                    (when (= (len (load why)) 0)
+                      (store! why (persist--refusal (primitive/code-nth ty i)))))
+                  (load why))))))
+
+;;; Type syntax as it is written: `(ptr i8)`.
+(defn persist--type-text [(ty Code)] (-> (slice u8))
+  (if (primitive/code-list? ty)
+      (let [(mut text) "("]
+        (for [i 0 (primitive/code-count ty)]
+          (store! text (if (= i 0)
+                           (primitive/code-str (load text) (persist--type-text (primitive/code-nth ty i)))
+                           (primitive/code-str (load text) " " (persist--type-text (primitive/code-nth ty i))))))
+        (primitive/code-str (load text) ")"))
+      (let [name (primitive/code-str ty)]
+        (if (persist--dyn-name? name)
+            (primitive/code-str "(dyn " (subslice name 0 (- (len name) 4)) ")")
+            name))))
+
+(defn persist--check [(tname Code) (fname Code) (ty Code)] (-> i64)
+  (let [why (persist--refusal ty)]
+    (if (= (len why) 0)
+        0
+        (primitive/code-int
+          (primitive/error (primitive/code-str "derive Persist: field '" fname "' of "
+                                               tname " has type " (persist--type-text ty) ": " why
+                                               "; make it data"))))))
+
+;;; The copy of the value in PLACE, of type TY.
+(defn persist--value [(tname Code) (ty Code) (place Code) (cx Code)] (-> Code)
+  (if (and (persist--scalar? ty) (not (derive-type-param? tname ty)))
+      `(load ~place)
+      `(persist-into ~place ~cx)))
+
+;;; The fields OPTS skips, after checking each option names a field of TNAME.
+;;; An option is `(field NAME (skip))`.
+(defn persist--skips [(tname Code) (opts Code)] (-> Code)
+  (let [out (primitive/code-list-new)
+        n (primitive/code-field-count tname)]
+    (for [i 0 (primitive/code-count opts)]
+      (let [o (primitive/code-nth opts i)]
+        (unless (and (primitive/code-list? o)
+                     (= (primitive/code-count o) 3)
+                     (primitive/code-eq (primitive/code-nth o 0) `field)
+                     (primitive/code-list? (primitive/code-nth o 2))
+                     (= (primitive/code-count (primitive/code-nth o 2)) 1)
+                     (primitive/code-eq (primitive/code-nth (primitive/code-nth o 2) 0) `skip))
+          (primitive/error "derive Persist: an option is (field NAME (skip))"))
+        (let [(mut found) false]
+          (for [k 0 n]
+            (when (primitive/code-eq (primitive/code-field-name tname k) (primitive/code-nth o 1))
+              (store! found true)))
+          (unless (load found)
+            (primitive/error (primitive/code-str "derive Persist: " tname " has no field '"
+                                                 (primitive/code-nth o 1) "' to skip"))))
+        (primitive/code-list-push! out (primitive/code-nth o 1))))
+    (primitive/code-list-done out)))
+
+(defn persist--skipped? [(skips Code) (fname Code)] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (primitive/code-count skips)]
+      (when (primitive/code-eq (primitive/code-nth skips i) fname)
+        (store! found true)))
+    (load found)))
+
+(defn persist--struct [(tname Code) (opts Code)] (-> Code)
+  (let [self (primitive/fresh-identifier "self")
+        cx (primitive/fresh-identifier "cx")
+        n (primitive/code-field-count tname)
+        skips (persist--skips tname opts)
+        args (primitive/code-list-new)]
+    (for [i 0 n]
+      (let [fname (primitive/code-field-name tname i)
+            ty (primitive/code-field-type tname i)]
+        (primitive/code-list-push! args (primitive/code-symbol ":" fname))
+        (if (persist--skipped? skips fname)
+            (primitive/code-list-push! args `(zeroed ~ty))
+            (do (persist--check tname fname ty)
+                (primitive/code-list-push! args (persist--value tname ty `(field ~self ~fname) cx))))))
+    (let [fields (primitive/code-list-done args)
+          ctor (if (primitive/code-list? tname)
+                   `(~(primitive/code-nth tname 0) [~@(persist--targs tname)] ~@fields)
+                   `(~tname ~@fields))]
+      (derive-impl `Persist
+                   tname
+                   `((persist-into [(~self (ref ~tname)) (~cx (ptr PersistCx))] (-> ~tname)
+                       ~ctor))))))
+
+(defn persist--targs [(tname Code)] (-> Code)
+  (let [out (primitive/code-list-new)]
+    (for [i 1 (primitive/code-count tname)]
+      (primitive/code-list-push! out (primitive/code-nth tname i)))
+    (primitive/code-list-done out)))
+
+(defn persist--sum [(tname Code)] (-> Code)
+  (let [self (primitive/fresh-identifier "self")
+        cx (primitive/fresh-identifier "cx")
+        arms (primitive/code-list-new)]
+    (for [vi 0 (primitive/code-variant-count tname)]
+      (let [vq (primitive/code-variant-qname tname vi)
+            nf (primitive/code-variant-fields tname vi)
+            binds (primitive/code-list-new)
+            values (primitive/code-list-new)]
+        (for [fi 0 nf]
+          (let [fname (primitive/code-variant-field-name tname vi fi)
+                ty (primitive/code-variant-field-type tname vi fi)
+                b (primitive/fresh-identifier (primitive/code-symbol "persist$" fname))]
+            (persist--check tname fname ty)
+            (primitive/code-list-push! binds b)
+            (primitive/code-list-push! values (if (and (persist--scalar? ty)
+                                                       (not (derive-type-param? tname ty)))
+                                                  b
+                                                  `(persist-into ~b ~cx)))))
+        (let [bs (primitive/code-list-done binds)
+              vs (primitive/code-list-done values)]
+          (primitive/code-list-push! arms
+                                     `(~vq [~@bs]
+                                        ~(if (primitive/code-list? tname)
+                                             `(~vq [~@(persist--targs tname)] ~@vs)
+                                             `(~vq ~@vs)))))))
+    (derive-impl `Persist
+                 tname
+                 `((persist-into [(~self (ref ~tname)) (~cx (ptr PersistCx))] (-> ~tname)
+                     (match ~self ~@(primitive/code-list-done arms)))))))
+
+(defderive Persist
+           (struct [tname & opts] (persist--struct tname opts))
+           (sum [tname & opts]
+                (if (> (primitive/code-count opts) 0)
+                    (primitive/error "derive Persist: (field NAME (skip)) applies to a struct's fields")
+                    (persist--sum tname))))

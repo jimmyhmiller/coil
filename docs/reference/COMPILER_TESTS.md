@@ -83,7 +83,7 @@ toolchain), and `$COIL_TEST_SCRATCH`, a directory the harness removes afterwards
 | `readers` | reader-provider projects and provider artifacts | `scripts/tests/fast/readers.sh`, `tests/readers/` |
 | `meta` | code->code programs, hygiene both ways, lint suggestions, staged entries, transforms | `scripts/tests/fast/meta.sh`, `tests/meta/` |
 | `simd` | the SIMD differential on both backends and the vectorized codegen check | `scripts/tests/simd.py fast`, `tests/simd/` |
-| `stdlib/*` | six deftest suites over the standard library | `tests/stdlib/` |
+| `stdlib/*` | seven deftest suites over the standard library | `tests/stdlib/` |
 
 The quick tier is the corpus on arm64 and LLVM, the compile diagnostics and the
 compiles that must stop, `coil run` and `coil fmt`, the tests of two example

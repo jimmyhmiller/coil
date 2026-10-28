@@ -632,6 +632,17 @@ EOF
   if build "$T/prefix-alias/main.coil" "$T/prefix-alias/app"; then
     expect_rc 42 "a defalias before an imported file's (module …) calls its target" "$T/prefix-alias/app"
   fi
+  # `(derive Persist T)` refuses, at the derive and naming the field, what a deep
+  # copy cannot own.
+  local persist_field
+  for persist_field in "(ptr i8)|an opaque pointer" "(dyn Allocator)|a dyn is code" \
+                       "(fnptr (cc/C) [i64] i64)|a function pointer" "(Option (Rc i64))|shared ownership" \
+                       "(ArrayList (ptr u8))|an opaque pointer"; do
+    printf '(module refuse)\n(import "coil.alloc" :use *)\n(import "coil.cc" :as cc)\n(import "coil.rc" :use [Rc])\n(import "coil.arraylist" :use *)\n(import "coil.persist" :use *)\n(defstruct Held [(name (slice u8)) (f %s)])\n(derive Persist Held)\n(defn main [] (-> i64) 0)\n' \
+      "${persist_field%%|*}" > "$T/refuse.coil"
+    expect_rc_out 1 "field 'f' of Held has type .*: ${persist_field#*|}" \
+      "derive Persist refuses a field of type ${persist_field%%|*}" "$COIL" check "$T/refuse.coil"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -2107,6 +2118,21 @@ EOF
     build "$T/jit-target.coil" "$T/jit-target" --debug-checks \
       && expect_rc 42 "--debug-checks calls into executable memory no loaded image owns" "$T/jit-target"
   fi
+  # A deep copy that re-enters a pointer it is copying stops under --debug-checks.
+  cat > "$T/ring.coil" <<'EOF'
+(module ring)
+(import "coil.alloc" :use *)
+(import "coil.persist" :use *)
+(defsum Ring (End) (Link [(next (ptr Ring))]))
+(derive Persist Ring)
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        r (box! a Ring (End))]
+    (store! r (Link r))
+    (match (load (persist-clone r a)) (Link [_] 0) (End [] 1))))
+EOF
+  build "$T/ring.coil" "$T/ring" --debug-checks \
+    && expect_crash 'persist-clone: a pointer reaches itself' "--debug-checks stops a deep copy at a cycle" "$T/ring"
   # Off, the checks are not compiled in: the subslice keeps its (wrong) length.
   if build "$T/dbg.coil" "$T/dbg-off"; then
     "$T/dbg-off" subslice >/dev/null 2>&1
