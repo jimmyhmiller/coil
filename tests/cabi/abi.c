@@ -34,6 +34,9 @@ int64_t tri_callee(double, double, double, double, double, double, double, doubl
 int64_t call_pack(void);
 int64_t around_empty(int64_t, Empty, int64_t);
 int64_t call_empty(void);
+__int128 wide_mid(int64_t, __int128, int64_t);
+int64_t call_wide_mid(void);
+__int128 wide_mid_c(int64_t a, __int128 x, int64_t b) { return x + a * 10 + b; }
 int64_t empty_c(int64_t a, Empty e, int64_t b) { (void)e; return a * 10 + b; }
 int64_t pack_c(int32_t a, int32_t b, int32_t c, int32_t d, int32_t e, int32_t f, int32_t g, int32_t h,
                int8_t i, int16_t j, int32_t k, int64_t l) {
@@ -54,6 +57,8 @@ int64_t c_calls_exports(void) {
   if (call_pack() != 4321) return 8;
   if (around_empty(3, e, 4) != 304) return 9;
   if (call_empty() != 56) return 10;
+  if (wide_mid(1, ((__int128)7 << 64) | 9, 2) != (((__int128)7 << 64) | 21)) return 11;
+  if (call_wide_mid() != 7043) return 12;
   return 0;
 }
 
