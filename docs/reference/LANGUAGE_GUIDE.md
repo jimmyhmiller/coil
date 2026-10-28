@@ -1299,6 +1299,13 @@ evens=3 total=10
   you provide (from an arena, say); `(InlineList::new [T N])` holds `N` elements
   itself, so it can be a struct field. `push!` onto a full one aborts in every
   build, `(full? xs)` says whether it would, and `(used xs)` is the filled prefix.
+  An inline list owns its elements: it drops the ones it holds, and only those,
+  and its operations borrow it, so pass `(used xs)` where a function takes a
+  collection by value.
+- A map's `(get m k)` copies the value it finds, as a list's `get` does, so for a
+  value that owns something it is refused: `(get-ptr m k)` gives `(Some p)`, a
+  pointer to the value where it lies, valid until the map is next edited.
+  `(for-entries [k v (mut m)] …)` lends each key and value.
 - `HashMap` keys that are strings need key operations: coil.str's `(keyops)` copies
   keys into the map, while `(keyops-borrowed)` borrows them.
 - A collection's own operations are methods. A list has `(cap xs)`,
@@ -1306,6 +1313,10 @@ evens=3 total=10
   `(extend! (mut xs) p n)`, `(slice xs)`, `(into-slice (mut xs))`, `(clear! (mut xs))`
   and `(free! (mut xs))`, which releases one from a general-purpose allocator. A map
   has `(contains? m k)`, `(remove! (mut m) k)`, `(clear! (mut m))` and `(free! (mut m))`.
+- A list or map owns the values it holds: replacing one with `set!` drops the old
+  value, `remove!` drops the key and value it takes out, and `clear!` and `free!`
+  drop everything left. A list or map is released by `free!`, not at the end of
+  its scope, so one never freed keeps its values too.
 - A persistent collection is edited two ways. `(assoc m k v)` and `(dissoc m k)`
   return a new map that shares storage with `m`, which stays as it was, and
   `(conj v x)`, `(assoc v i x)` and `(pop v)` do the same for a vector; the `!`
