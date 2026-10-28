@@ -757,6 +757,26 @@ open(sys.argv[1], "w").write(
     *"(mut out)"*"; the result"*) expect_rc 7 "lint --fix keeps a carried comment off the closers after it" "$COIL" run "$T/cell-comment.coil" ;;
     *) bad "lint --fix keeps a carried comment off the closers after it" "not rewritten: $(cat "$T/cell-comment.coil")" ;;
   esac
+  # A comment after a node on its line is about that node: it stays after the
+  # node's rewrite, in its own branch, not in front of the next node kept.
+  printf '%s' '(module lint-trailing)
+(import "coil.primitive" :as primitive)
+(defn pick [(c bool)] (-> i64)
+  (let [out (primitive/alloc-stack i64)]
+    (if c
+        (primitive/store! out 1)  ; the true branch
+        (primitive/store! out 2))  ; the false branch
+    (primitive/load out)))
+(defn main [] (-> i64) (+ (pick true) (* 10 (pick false))))
+' > "$T/trailing.coil"
+  "$COIL" lint "$T/trailing.coil" --fix >/dev/null 2>&1
+  local trailing
+  trailing=$(cat "$T/trailing.coil")
+  case "$trailing" in
+    *"(mut out)"*"1)  ; the true branch"*"2))  ; the false branch"*)
+      expect_rc 21 "lint --fix keeps a trailing comment after the node it trails" "$COIL" run "$T/trailing.coil" ;;
+    *) bad "lint --fix keeps a trailing comment after the node it trails" "$trailing" ;;
+  esac
   # A cast of a literal its type holds is an ascription, or the literal itself (in
   # the author's spelling) for the literal's own type; a cast that truncates stays.
   printf '%s' '(module lint-literal-cast-probe)
