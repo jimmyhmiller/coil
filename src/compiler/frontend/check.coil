@@ -20,6 +20,7 @@
 (import "coil.compiler.ast" :use *)
 (import "coil.compiler.codeop" :use *)
 (import "coil.compiler.expr_children" :use [expr-children!])
+(import "coil.compiler.diverge" :use [diverges? exprs-diverge? operand-pure? operand-statement hoist-diverging-operand])
 (import "coil.compiler.astdump" :use *)
 (import "coil.compiler.comptime" :use *)
 (import "coil.compiler.closure" :use *)
@@ -3676,11 +3677,60 @@
     (set! (.const_value_depth u) (+ saved 1))
     (let [r (compute-const-entry-value a cx cp)]
       (set! (.const_value_depth u) saved)
-      (if (or (not (.runtime cp)) (.declared cp))
+      (if (.declared cp)
           r
           (try (let [ev (try! r)
-                     value (try! (def-initializer a cx (box-expr a (.e ev)) (box-type a (.t ev)) linked))]
-                 (Ok (mk-evalpair value (.t ev)))))))))
+                     owned (try! (ownership-check-const-value a cx cp ev))]
+                 (if (not (.runtime cp))
+                     (Ok owned)
+                     (let [value (try! (def-initializer a cx (box-expr a (.e owned)) (box-type a (.t owned)) linked))]
+                       (Ok (mk-evalpair value (.t owned)))))))))))
+
+;;; A constant's initializer is a body of its own, and gets the ownership check a
+;;; function's body does, reported against the constant: its owners are dropped,
+;;; and one that moves twice is an error there. A `const` is computed afresh at
+;;; each use, which copies the checked value into the function that uses it, and
+;;; that function's own elaboration places the drops in its copy: here the value
+;;; is only checked, in a copy, so it is not elaborated twice. A `def`'s value is
+;;; computed once, from the value itself, so the value is elaborated here.
+(defn ownership-check-const-value [(a (dyn Allocator))
+                                   (cx (ptr Cx))
+                                   (cp (ptr Const))
+                                   (ev EvalPair)] (-> (Result EvalPair Diag))
+  (let [value (primitive/alloc-stack Expr)]
+    (set! value (.e ev))
+    (if (or (not (.validate_anon_ownership cx)) (is-literal-value value))
+        (Ok [EvalPair Diag] ev)
+        (let [(mut body) (ArrayList::new [Expr] a)
+              fp (primitive/alloc-stack Func)
+              saved-bounds (.cur_bounds cx)]
+          (push! (mut body)
+                 (if (.runtime cp)
+                     (load value)
+                     (semantic-clone-expr a value)))
+          (set! fp (primitive/zeroed Func))
+          (set! (.name fp) (sconcat a "const " (.name cp)))
+          (set! (.type_params fp) (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a)))
+          (set! (.bounds fp) (box-al [Bound] a (ArrayList::new [Bound] a)))
+          (set! (.cc fp) (cc-c))
+          (set! (.annotations fp) (box-al [Annotation] a (ArrayList::new [Annotation] a)))
+          (set! (.params fp) (box-al [Param] a (ArrayList::new [Param] a)))
+          (set! (.ret fp) (.t ev))
+          (set! (.body fp) (box-al [Expr] a (load body)))
+          (set! (.lo fp) (.lo (.e ev)))
+          (set! (.hi fp) (.hi (.e ev)))
+          (set! (.source fp) (.source (.e ev)))
+          (set! (.ctxt fp) (.ctxt (.e ev)))
+          (set! (.lazy fp) (primitive/cast (ptr i8) 0))
+          (set! (.cur_bounds cx) (ArrayList::new [Bound] a))
+          (let [checked (ownership-check-func a cx fp)]
+            (set! (.cur_bounds cx) saved-bounds)
+            (match checked
+              (Err [d] (Err [EvalPair Diag] d))
+              (Ok [_] (Ok [EvalPair Diag]
+                          (if (.runtime cp)
+                              (mk-evalpair (get (load (.body fp)) 0) (.t ev))
+                              ev)))))))))
 
 ;;; Does `e` hold an address only the linker knows: static storage's, a
 ;;; function's, a C string's, another def's? `source` is true for an unchecked
@@ -5991,6 +6041,17 @@
                                 (Ok [temporary] temporary)
                                 (Err [temporary] (break :try (Err temporary)))))
                        (store! i (+ (load i) 1)))))
+           ; an element that leaves means the array is never built: no slot of it
+           ; may hold the elements before it, which are values nothing receives
+           (let [ops (expr-ptrs a (mut checked))
+                 leaving (first-diverging-ptr ops)]
+             (when (>= leaving 0)
+               (break :try
+                      (ok-ep (operands-up-to-leaving a ops leaving lo hi src ctxt)
+                             (if (and (expected-some? expected)
+                                      (= (type-tag expected) 8))
+                                 (TSlice (box-type a (load elem-ty)))
+                                 (fixed-array (box-type a (load elem-ty)) n))))))
            (let [aty (fixed-array (box-type a (load elem-ty)) n)
                  nm (sconcat a "$arraylit" (i64->str a lo))
                  static-nm (sconcat a "$arraylit.const" (i64->str a lo))
@@ -6874,7 +6935,7 @@
             (_ false)))))
 
 (defn type-is-affine [(a (dyn Allocator)) (cx (ptr Cx)) (t (ptr Type))] (-> bool)
-  (or (type-needs-drop a cx t)
+  (or (type-known-affine? a cx t)
       (match (load t)
         ; An unconstrained generic is not implicitly copyable. Bounds can prove
         ; Copy, otherwise ownership is deferred until concrete substitution.
@@ -6884,6 +6945,16 @@
                       (= (primitive/cast i64 (sum-find cx name))
                          0)
                       (not (ownership-bound-has cx t (core-name "Copy")))))
+        (_ false))))
+
+;;; Is `t` an owner by what its definition says: it has drop glue, or it is a
+;;; `ManuallyDrop`, which moves like an owner and drops nothing. Unlike
+;;; `type-is-affine` it never takes a name it does not know for an
+;;; unconstrained type parameter -- a specialized instance's struct, which an
+;;; instance's callee signature names, is such a name.
+(defn type-known-affine? [(a (dyn Allocator)) (cx (ptr Cx)) (t (ptr Type))] (-> bool)
+  (or (type-needs-drop a cx t)
+      (match (load t)
         (TApp [name _] (core-name? name "ManuallyDrop"))
         (_ false))))
 
@@ -10077,11 +10148,18 @@
                  (if (= np 0)
                      (TStruct name)
                      (TApp name out-args))
-               decl-names (field-names a fields)]
+               decl-names (field-names a fields)
+               in-source-order (source-ordered-args a decl-names source-names checked)
+               leaving (first-diverging-ptr in-source-order)]
            ; Arguments that do nothing when evaluated may as well be evaluated in
            ; declaration order, which leaves a constant constructor in the shape
            ; a static's initializer is laid out from.
-           (if (or (named-same-order? decl-names
+           (cond
+             ; an argument that leaves means the struct is never built: no field
+             ; may hold the arguments before it, which are values nothing receives
+             (>= leaving 0)
+             (ok-ep (operands-up-to-leaving a in-source-order leaving lo hi src ctxt) out-ty)
+             (or (named-same-order? decl-names
                                       source-names
                                       0
                                       (len (load decl-names)))
@@ -10096,6 +10174,7 @@
                                                   src
                                                   ctxt)]
                  (synth-rechecked a source mark expected env cx tps fname))
+             :else
                (let [binds
                        (named-source-binds a decl-names source-names checked lo)
                      vars
@@ -13971,7 +14050,9 @@
                        (cx (ptr Cx))
                        (tps (ptr (ArrayList (slice u8))))
                        (fname (slice u8))
-                       (borrow-kind i64)] (-> (Result i64 Diag))
+                       (borrow-kind i64)
+                       (rest (ptr Expr))
+                       (rest-ty (ptr Type))] (-> (Result i64 Diag))
   (let [narms (len (load arms))
         (mut i) 0
         (mut err) (primitive/zeroed Diag)
@@ -14142,6 +14223,23 @@
                                                       (env-insert! env name ty)
                                                       0)))
                                           (store! k (primitive/iadd (load k) 1)))))
+                              ; The catch-all of a match that owns its scrutinee
+                              ; owns whatever variant it is left, as a variant's
+                              ; arm owns that variant's payload.
+                              (when (and wild (!= (primitive/cast i64 rest) 0))
+                                (bind-owned-place! a
+                                                   (sconcat a "$match.rest." (i64->str a (next-bid)))
+                                                   false
+                                                   (load rest)
+                                                   rest-ty
+                                                   true
+                                                   (mut owner-binds)
+                                                   env
+                                                   (.lo (field arm body))
+                                                   (.hi (field arm body))
+                                                   (.source (field arm body))
+                                                   (.ctxt (field arm body)))
+                                0)
                               (if (expected-some? expected)
                                   (match (check-to a
                                                    (field arm body)
@@ -14330,7 +14428,27 @@
                        metab
                          (box-al [(ptr (ArrayList (slice u8)))]
                                  a
-                                 (ArrayList::new [(ptr (ArrayList (slice u8)))] a))]
+                                 (ArrayList::new [(ptr (ArrayList (slice u8)))] a))
+                       ; A match on a value, not on a borrowed place, consumes it:
+                       ; each arm owns what it binds. A catch-all binds nothing, so
+                       ; the value it is left is kept in a slot of its own, which
+                       ; that arm owns.
+                       sum-ty (box-type a (load st))
+                       rest-slot
+                         (if (and (= (load borrow-kind) 0)
+                                  (arms-have-wildcard arms)
+                                  (binding-may-own? a cx sum-ty))
+                             (Some (sconcat a "$match.scrut." (i64->str a (next-bid))))
+                             (None [(slice u8)]))
+                       rest
+                         (match rest-slot
+                           (Some [slot]
+                                 (box-expr a
+                                           (mk-expr (ELoad (box-expr a (mk-expr (EVar slot) elo ehi esrc ectxt)))
+                                                    elo ehi esrc ectxt)))
+                           (None [] (primitive/cast (ptr Expr) 0)))
+                       scrutinee
+                         (if (= (primitive/cast i64 rest) 0) (load se) rest)]
                    (try! (match-arms-loop a
                                           arms
                                           variants
@@ -14345,7 +14463,9 @@
                                           cx
                                           tps
                                           fname
-                                          (load borrow-kind)))
+                                          (load borrow-kind)
+                                          rest
+                                          sum-ty))
                    (when (and (not (arms-have-wildcard arms))
                               (not (= (len (load covered))
                                       (len (load variants)))))
@@ -14367,11 +14487,15 @@
                                                                                   covered))
                                                    " not covered")))))
                    (if (expected-some? expected)
-                       (ok-ep (mk-expr (EMatch (load se) checked)
-                                       elo
-                                       ehi
-                                       esrc
-                                       ectxt)
+                       (ok-ep (match-with-rest-slot a
+                                                    rest-slot
+                                                    sum-ty
+                                                    (load (load se))
+                                                    (mk-expr (EMatch scrutinee checked)
+                                                             elo
+                                                             ehi
+                                                             esrc
+                                                             ectxt))
                               (load expected))
                        (let [outl (box-al [Expr] a (ArrayList::new [Expr] a))
                              t
@@ -14380,16 +14504,50 @@
                                                      outl
                                                      fname
                                                      "match arms"))]
-                         (ok-ep (mk-expr (EMatch (load se)
-                                                 (build-newarms a
-                                                                metav
-                                                                metab
-                                                                outl))
-                                         elo
-                                         ehi
-                                         esrc
-                                         ectxt)
+                         (ok-ep (match-with-rest-slot a
+                                                      rest-slot
+                                                      sum-ty
+                                                      (load (load se))
+                                                      (mk-expr (EMatch scrutinee
+                                                                       (build-newarms a
+                                                                                      metav
+                                                                                      metab
+                                                                                      outl))
+                                                               elo
+                                                               ehi
+                                                               esrc
+                                                               ectxt))
                                 t)))))))))))
+
+;;; The match `m`, evaluating its scrutinee `value` into the slot `rest-slot`
+;;; names first when it has one (see synth-match).
+(defn match-with-rest-slot [(a (dyn Allocator))
+                            (rest-slot (Option (slice u8)))
+                            (sum-ty (ptr Type))
+                            (value Expr)
+                            (m Expr)] (-> Expr)
+  (match rest-slot
+    (None [] m)
+    (Some [slot]
+          (let [lo (.lo m) hi (.hi m) src (.source m) ctxt (.ctxt m)
+                (mut binds) (ArrayList::new [Bind] a)
+                (mut body) (ArrayList::new [Expr] a)]
+            (push! (mut binds)
+                   (mk-bind slot
+                            false
+                            (mk-expr (EAlloc
+                                       :symbol (None)
+                                       :storage 3
+                                       :ty (erase-refs a sum-ty)
+                                       :init (primitive/cast (ptr Expr) 0))
+                                     lo hi src ctxt)))
+            (push! (mut body)
+                   (mk-expr (EInitStore (box-expr a (mk-expr (EVar slot) lo hi src ctxt))
+                                        (box-expr a value))
+                            lo hi src ctxt))
+            (push! (mut body) m)
+            (mk-expr (ELet (box-al [Bind] a (load binds)) (box-al [Expr] a (load body)))
+                     lo hi src ctxt)))))
 
 ;;; A lowered match ends in `(_ (primitive/pattern-default body))` for the
 ;;; variants its other arms do not name. When they name every variant of the
@@ -18079,6 +18237,56 @@
                                (load (load (field mp
                                                   t))))))))))))))
 
+;;; What runs of a constructor whose operand at `leaving` (in evaluation order)
+;;; does not finish: the operands before it, each a statement whose value nothing
+;;; receives, then the one that leaves. The constructor keeps its type: its
+;;; context still expects one, and never sees the value.
+(defn operands-up-to-leaving [(a (dyn Allocator))
+                              (ops (ptr (ArrayList (ptr Expr))))
+                              (leaving i64)
+                              (lo i64)
+                              (hi i64)
+                              (src i64)
+                              (ctxt i64)] (-> Expr)
+  (let [(mut body) (ArrayList::new [Expr] a)]
+    (for [j 0 (primitive/iadd leaving 1)]
+      (let [op (get (load ops) j)]
+        (unless (and (< j leaving) (operand-pure? op))
+          (push! (mut body) (load (if (< j leaving) (operand-statement op) op)))
+          0)))
+    (mk-expr (EDo (box-al [Expr] a (load body))) lo hi src ctxt)))
+
+;;; The position of the first of the checked expressions `es` that does not
+;;; finish, or -1.
+(defn first-diverging-ptr [(es (ptr (ArrayList (ptr Expr))))] (-> i64)
+  (let [(mut found) -1]
+    (for [i 0 (len (load es))]
+      (when (and (< (load found) 0) (diverges? (get (load es) i)))
+        (set! found i)
+        0))
+    (load found)))
+
+;;; Each checked expression of `es`, in order.
+(defn expr-ptrs [(a (dyn Allocator)) (es (ptr (ArrayList Expr)))] (-> (ptr (ArrayList (ptr Expr))))
+  (let [(mut out) (ArrayList::new [(ptr Expr)] a)]
+    (for [i 0 (len (load es))]
+      (push! (mut out) (elem es i)))
+    (box-al [(ptr Expr)] a (load out))))
+
+;;; A constructor's checked arguments, held in declaration order, in the order
+;;; the source wrote them, which is the order they are evaluated in.
+(defn source-ordered-args [(a (dyn Allocator))
+                           (decl-names (ptr (ArrayList (slice u8))))
+                           (source-names (ptr (ArrayList (slice u8))))
+                           (checked (ptr (ArrayList Expr)))] (-> (ptr (ArrayList (ptr Expr))))
+  (let [(mut out) (ArrayList::new [(ptr Expr)] a)]
+    (for [i 0 (len (load source-names))]
+      (let [di (name-index decl-names (get (load source-names) i))]
+        (when (>= di 0)
+          (push! (mut out) (elem checked di))
+          0)))
+    (box-al [(ptr Expr)] a (load out))))
+
 ;;; A call whose type is never -- of a function declared `(-> never)` -- is
 ;;; followed by a loop that never exits. The loop is what every later pass reads
 ;;; as an expression that does not yield, the way a `break` or a breakless loop
@@ -18691,9 +18899,12 @@
    ; Number of owners live outside the loop. Exiting to this loop drops every
    ; currently-live owner at an index greater than or equal to this depth.
    (owner_depth i64)
-   ; For a block (`block*`, a loop its body always leaves), the owner states at
-   ; each break to it; null for a loop that iterates.
-   (block_exits (ptr (ArrayList (ptr (ArrayList MoveState)))))])
+   ; The states of the owners from outside the loop at each break that leaves it.
+   ; After the loop they are as every break left them.
+   (exits (ptr (ArrayList (ptr (ArrayList MoveState)))))
+   ; Those owners' states as the loop began, which every iteration must begin
+   ; with again: a `continue` and the end of the body return there.
+   (entry (ptr (ArrayList MoveState)))])
 
 ;;; Is this checked loop a `block*`: a body that is one break to its own label,
 ;;; so it runs once and every way out of it is a break to it?
@@ -18706,11 +18917,11 @@
                  (_ false)))
          (None [] false))))
 
-;;; The block frame a break to `label` leaves, or null when that is a loop's.
-(defn ownership-block-exits [(loops (ptr (ArrayList OwnershipLoop)))
-                             (label (Option (slice u8)))] (-> (ptr (ArrayList (ptr (ArrayList MoveState)))))
+;;; The loop frame a break or continue to `label` reaches, or null outside one.
+(defn ownership-loop-frame [(loops (ptr (ArrayList OwnershipLoop)))
+                            (label (Option (slice u8)))] (-> (ptr OwnershipLoop))
   (let [(mut i) (primitive/isub (len (load loops)) 1)
-        (mut found) (primitive/cast (ptr (ArrayList (ptr (ArrayList MoveState)))) 0)]
+        (mut found) (primitive/cast (ptr OwnershipLoop) 0)]
     (loop (if (< (load i) 0)
               (break)
               (let [lp (elem loops (load i))]
@@ -18720,7 +18931,7 @@
                             (match (.label lp)
                               (Some [have] (= want have))
                               (None [] false))))
-                    (do (set! found (.block_exits lp)) (break))
+                    (do (set! found lp) (break))
                     (set! i (primitive/isub (load i) 1))))))
     (load found)))
 
@@ -19739,23 +19950,6 @@
       (Some [d] (Err [(ptr (ArrayList Expr)) Diag] d))
       (None [] (Ok (box-al [Expr] a (load out)))))))
 
-(defn ownership-expr-exits? [(e (ptr Expr))] (-> bool)
-  (match (.kind e)
-    (EBreak [_ _] true)
-    (EContinue [_] true)
-    (EDo [body]
-         (let [tail (al-last-expr body)]
-           (and (!= (primitive/cast i64 tail) 0)
-                (ownership-expr-exits? tail))))
-    (ECleanup [body _] (ownership-expr-exits? body))
-    (EDefer [_ body]
-            (let [tail (al-last-expr body)]
-              (and (!= (primitive/cast i64 tail) 0)
-                   (ownership-expr-exits? tail))))
-    (EIf [_ thn els]
-         (and (ownership-expr-exits? thn) (ownership-expr-exits? els)))
-    (_ false)))
-
 (defn ownership-wrap-tail-cleanup! [(a (dyn Allocator))
                                     (body (ptr (ArrayList Expr)))
                                     (cleanups (ptr (ArrayList Expr)))
@@ -19784,29 +19978,32 @@
                             source
                             ctxt)))
           (let [tail (elem body (primitive/isub n 1))]
-            (unless (ownership-expr-exits? tail)
+            ; a tail that does not finish leaves no way out of the end: its exits
+            ; ran their own cleanups
+            (unless (diverges? tail)
               (let [saved (box-expr a (load tail))]
                 (set! (.kind tail) (ECleanup saved cleanups)))
               0))))
     0)
   0)
 
-(defn ownership-loop-owner-depth [(loops (ptr (ArrayList OwnershipLoop)))
-                                  (label (Option (slice u8)))] (-> i64)
-  (let [(mut i) (primitive/isub (len (load loops)) 1)
-        (mut found) -1]
-    (loop (if (< (load i) 0)
-              (break)
-              (let [lp (elem loops (load i))]
-                (if (match label
-                      (None [] true)
-                      (Some [want]
-                            (match (.label lp)
-                              (Some [have] (= want have))
-                              (None [] false))))
-                    (do (set! found (.owner_depth lp)) (break))
-                    (set! i (primitive/isub (load i) 1))))))
-    (load found)))
+;;; After a loop or block the owners from outside it are as each break that left
+;;; it left them, so the breaks must agree. With no break, nothing follows it.
+(defn ownership-join-exits! [(a (dyn Allocator))
+                             (states (ptr (ArrayList MoveState)))
+                             (exits (ptr (ArrayList (ptr (ArrayList MoveState)))))
+                             (fname (slice u8))
+                             (reason (slice u8))] (-> (Result i64 Diag))
+  (try (do
+         (for [i 1 (len (load exits))]
+           (try! (ownership-require-same-states a
+                                                (get (load exits) 0)
+                                                (get (load exits) i)
+                                                fname
+                                                reason)))
+         (when (> (len (load exits)) 0)
+           (move-states-merge! states (get (load exits) 0)))
+         (Ok [i64 Diag] 0))))
 
 (defn ownership-wrap-exit! [(a (dyn Allocator))
                             (cx (ptr Cx))
@@ -19967,8 +20164,13 @@
              rs (move-states-clone states)]
          (try! (ownership-walk-expr a cx left ls loops fname consumes))
          (try! (ownership-walk-expr a cx right rs loops fname consumes))
-         (try! (ownership-require-same-states a ls rs fname "between branches"))
-         (move-states-merge! states ls)
+         ; A branch that does not finish never reaches the join; what it moved
+         ; is settled at the exit it takes.
+         (cond (diverges? left) (move-states-merge! states rs)
+               (diverges? right) (move-states-merge! states ls)
+               :else (do
+                       (try! (ownership-require-same-states a ls rs fname "between branches"))
+                       (move-states-merge! states ls)))
          (Ok [i64 Diag] 0))))
 
 ;;; The callee's parameter types at this call: its generic parameters replaced by
@@ -20080,13 +20282,12 @@
                                                       consume)))
                        ; Preserve an explicit distinction between a consumed place
                        ; and an aggregate value. Mono resolves this marker against
-                       ; the callee's actual ABI after generic substitution.
+                       ; the callee's actual ABI after generic substitution. Every
+                       ; affine parameter takes its owner as a place
+                       ; (param-ref-type), whether or not dropping it does
+                       ; anything: a `ManuallyDrop` is consumed by address too.
                        (when (and consume
-                                  (< (load i) np)
-                                  (type-needs-drop a
-                                                   cx
-                                                   (elem params
-                                                         (load i))))
+                                  (type-known-affine? a cx (elem params (load i))))
                          (match (.kind arg)
                            (ELoad [place]
                                   (when (!= (primitive/cast i64
@@ -20117,89 +20318,159 @@
                      (store! i (primitive/iadd (load i) 1)))))
          (Ok [i64 Diag] 0))))
 
-; A ref/mut argument synthesized from an owning rvalue is represented as
-; `ESpillRef(rvalue)`. The spill gives codegen an address, but by itself has no
-; lexical owner and therefore no Drop cleanup. Materialize the same owned-place
-; pair used by checked `let` bindings around the complete call expression. The
-; call result is preserved by ECleanup while the temporary is destroyed after
-; the borrow ends.
-(defn ownership-bind-owned-spill! [(a (dyn Allocator))
-                                   (cx (ptr Cx))
-                                   (anchor (ptr Expr))
-                                   (arg (ptr Expr))
-                                   (index i64)
-                                   (binds (ptr (ArrayList Bind)))
-                                   (states (ptr (ArrayList MoveState)))] (-> bool)
-  (match (.kind arg)
-    (ESpillRef [inner]
-               (if (or (!= (primitive/cast i64 (ownership-root-state inner states))
-                           0)
-                       (not (ownership-expr-needs-drop a cx inner)))
-                   false
-                   (match (ownership-expr-type a cx inner)
-                     (None [] false)
-                     (Some [owner-type]
-                           (let [name
-                                   (sconcat a
-                                            (sconcat a
-                                                     "$borrow.temp."
-                                                     (i64->str a (.node-id anchor)))
-                                            (sconcat a "." (i64->str a index)))
-                                 slot (sconcat a name ".slot")
-                                 bid (next-bid)
-                                 ownerp (box-type a owner-type)
-                                 (mut init) (ArrayList::new [Expr] a)]
-                             (push! [Bind]
-                                    binds
-                                    (mk-bind slot
-                                             false
-                                             (mk-expr (EAlloc
-                                                        :symbol (None)
-                                                        :storage 3
-                                                        :ty owner-type
-                                                        :init
-                                                          (primitive/cast (ptr Expr) 0))
-                                                      (.lo arg)
-                                                      (.hi arg)
-                                                      (.source arg)
-                                                      (.ctxt arg))))
-                             (push! [Expr]
-                                    (mut init)
-                                    (mk-expr (EStore (box-expr a
-                                                               (mk-expr (EVar slot)
-                                                                        (.lo arg)
-                                                                        (.hi arg)
-                                                                        (.source arg)
-                                                                        (.ctxt arg)))
-                                                     (box-expr a (load inner)))
-                                             (.lo arg)
-                                             (.hi arg)
-                                             (.source arg)
-                                             (.ctxt arg)))
-                             (push! [Expr]
-                                    (mut init)
-                                    (mk-expr (EVar slot)
-                                             (.lo arg)
-                                             (.hi arg)
-                                             (.source arg)
-                                             (.ctxt arg)))
-                             (let [owner (primitive/alloc-stack Bind)]
-                               (set! owner
-                                     (mk-bind name
-                                              false
-                                              (mk-expr (EDo (box-al [Expr]
-                                                                    a
-                                                                    (load init)))
-                                                       (.lo arg)
-                                                       (.hi arg)
-                                                       (.source arg)
-                                                       (.ctxt arg))))
-                               (set! (.bid owner) bid)
-                               (set! (.owned_type owner) ownerp)
-                               (push! [Bind] binds (load owner)))
-                             (set! (.kind arg) (EVar name))
-                             true)))))
-    (_ false)))
+; A temporary that a call borrows, or whose field is read, must live until the
+; borrow ends: the end of the call, or the read. Two kinds of expression make one.
+; A ref/mut argument synthesized from an owning rvalue is `ESpillRef(rvalue)`: the
+; spill gives codegen an address, but by itself has no lexical owner and therefore
+; no Drop cleanup. A let that builds an owner and yields that owner's place -- a
+; constructor, `(let [x …] x)` -- has one, but its scope ends with the let, so the
+; owner would be dropped before the borrow of its place is used, and a callee
+; would read, or write, a dropped value. Either becomes the owned-place pair
+; checked `let` bindings use, around the complete call expression (or read): the
+; temporary's value moves into a frame slot that an owner holds, the borrow takes
+; that slot's place, and the owner is destroyed after the borrow ends. The call
+; result is preserved by ECleanup.
+
+;;; The type of the owner a let builds and yields the place of, or null.
+(defn ownership-let-place-owner [(e (ptr Expr))] (-> (ptr Type))
+  (let [none (primitive/cast (ptr Type) 0)]
+    (match (.kind e)
+      (ELet [binds body]
+            (let [tail (al-last-expr body)]
+              (if (= (primitive/cast i64 tail) 0)
+                  none
+                  (match (.kind tail)
+                    (EVar [name]
+                          (let [(mut found) none]
+                            (for [i 0 (len (load binds))]
+                              (let [bp (elem binds i)]
+                                (when (and (= (.name bp) name)
+                                           (!= (primitive/cast i64 (.owned_type bp)) 0))
+                                  (set! found (.owned_type bp))
+                                  0)))
+                            (load found)))
+                    (_ none)))))
+      (_ none))))
+
+;;; The temporary a place expression `e` lends or reads through, or null: a spill,
+;;; or an owner-building let whose place is borrowed or projected (`projected`).
+;;; Such a let read whole is the owner's value moving out, which ends its scope.
+(defn ownership-temporary-place [(e (ptr Expr)) (projected bool)] (-> (ptr Expr))
+  (match (.kind e)
+    (EField [p _] (ownership-temporary-place p true))
+    (EIndex [p _] (ownership-temporary-place p true))
+    (EBorrow [_ p] (ownership-temporary-place p true))
+    (ELoad [inner] (ownership-temporary-place inner projected))
+    (ESpillRef [_] e)
+    (ELet [_ _]
+          (if (and projected
+                   (!= (primitive/cast i64 (ownership-let-place-owner e)) 0))
+              e
+              (primitive/cast (ptr Expr) 0)))
+    (_ (primitive/cast (ptr Expr) 0))))
+
+;;; Bind the temporary `temp` under `anchor` as an owned place in `binds`, and
+;;; put that place where the temporary was. False when it owns nothing to drop.
+(defn ownership-bind-temporary! [(a (dyn Allocator))
+                                 (cx (ptr Cx))
+                                 (anchor (ptr Expr))
+                                 (temp (ptr Expr))
+                                 (index i64)
+                                 (binds (ptr (ArrayList Bind)))
+                                 (states (ptr (ArrayList MoveState)))] (-> bool)
+  (let [none (None [(ptr Expr)])
+        ; what moves into the slot, and the owner's type
+        value
+          (match (.kind temp)
+            (ESpillRef [inner]
+                       (if (or (!= (primitive/cast i64 (ownership-root-state inner states))
+                                   0)
+                               (not (ownership-expr-needs-drop a cx inner)))
+                           none
+                           (Some inner)))
+            (ELet [_ _]
+                  (let [owner (ownership-let-place-owner temp)]
+                    (if (or (= (primitive/cast i64 owner) 0)
+                            (not (type-needs-drop a cx owner)))
+                        none
+                        (Some (box-expr a
+                                        (mk-expr (ELoad (box-expr a (load temp)))
+                                                 (.lo temp)
+                                                 (.hi temp)
+                                                 (.source temp)
+                                                 (.ctxt temp)))))))
+            (_ none))
+        owner-type
+          (match (.kind temp)
+            (ESpillRef [inner] (ownership-expr-type a cx inner))
+            (_ (let [owner (ownership-let-place-owner temp)]
+                 (if (= (primitive/cast i64 owner) 0) (None [Type]) (Some (load owner))))))]
+    (match value
+      (None [] false)
+      (Some [moved]
+            (match owner-type
+              (None [] false)
+              (Some [ty]
+                    (let [name
+                            (sconcat a
+                                     (sconcat a
+                                              "$borrow.temp."
+                                              (i64->str a (.node-id anchor)))
+                                     (sconcat a "." (i64->str a index)))
+                          slot (sconcat a name ".slot")
+                          bid (next-bid)
+                          ownerp (box-type a ty)
+                          (mut init) (ArrayList::new [Expr] a)]
+                      (push! [Bind]
+                             binds
+                             (mk-bind slot
+                                      false
+                                      (mk-expr (EAlloc
+                                                 :symbol (None)
+                                                 :storage 3
+                                                 :ty ty
+                                                 :init
+                                                   (primitive/cast (ptr Expr) 0))
+                                               (.lo temp)
+                                               (.hi temp)
+                                               (.source temp)
+                                               (.ctxt temp))))
+                      (push! [Expr]
+                             (mut init)
+                             (mk-expr (EStore (box-expr a
+                                                        (mk-expr (EVar slot)
+                                                                 (.lo temp)
+                                                                 (.hi temp)
+                                                                 (.source temp)
+                                                                 (.ctxt temp)))
+                                              moved)
+                                      (.lo temp)
+                                      (.hi temp)
+                                      (.source temp)
+                                      (.ctxt temp)))
+                      (push! [Expr]
+                             (mut init)
+                             (mk-expr (EVar slot)
+                                      (.lo temp)
+                                      (.hi temp)
+                                      (.source temp)
+                                      (.ctxt temp)))
+                      (let [owner (primitive/alloc-stack Bind)]
+                        (set! owner
+                              (mk-bind name
+                                       false
+                                       (mk-expr (EDo (box-al [Expr]
+                                                             a
+                                                             (load init)))
+                                                (.lo temp)
+                                                (.hi temp)
+                                                (.source temp)
+                                                (.ctxt temp))))
+                        (set! (.bid owner) bid)
+                        (set! (.owned_type owner) ownerp)
+                        (push! [Bind] binds (load owner)))
+                      (set! (.kind temp) (EVar name))
+                      true)))))))
 
 ; Wrap `e` in the let that owns the temporaries `binds` introduced, so each is
 ; destroyed once `e` has finished with it.
@@ -20222,33 +20493,26 @@
   (let [(mut binds) (ArrayList::new [Bind] a)
         (mut changed) false]
     (for [i 0 (len (load args))]
-      (when (ownership-bind-owned-spill! a cx call (elem args i) i (mut binds) states)
-        (set! changed true)
-        0))
+      (let [temp (ownership-temporary-place (elem args i) false)]
+        (when (and (!= (primitive/cast i64 temp) 0)
+                   (ownership-bind-temporary! a cx call temp i (mut binds) states))
+          (set! changed true)
+          0)))
     (when (load changed)
       (ownership-wrap-in-binds! a call (mut binds)))
     (load changed)))
 
-; The spilled struct value under a `.field` read, if any: `(.x (.origin (f)))`
-; checks to loads and field projections over `ESpillRef(f)`.
-(defn ownership-field-read-spill [(e (ptr Expr))] (-> (ptr Expr))
-  (match (.kind e)
-    (EField [p _] (ownership-field-read-spill p))
-    (ELoad [inner] (ownership-field-read-spill inner))
-    (ESpillRef [_] e)
-    (_ (primitive/cast (ptr Expr) 0))))
-
-; A field read from an owning temporary gives the temporary a lexical owner, the
-; same pair a borrowed call argument gets, so it is destroyed after the read.
+; A field read from a temporary gives the temporary a lexical owner, the same
+; pair a borrowed call argument gets, so it is destroyed after the read.
 (defn ownership-wrap-field-read-temporary! [(a (dyn Allocator))
                                             (cx (ptr Cx))
                                             (e (ptr Expr))
                                             (states (ptr (ArrayList MoveState)))] (-> bool)
-  (let [spill (ownership-field-read-spill e)]
-    (if (= (primitive/cast i64 spill) 0)
+  (let [temp (ownership-temporary-place e false)]
+    (if (= (primitive/cast i64 temp) 0)
         false
         (let [(mut binds) (ArrayList::new [Bind] a)]
-          (if (ownership-bind-owned-spill! a cx e spill 0 (mut binds) states)
+          (if (ownership-bind-temporary! a cx e temp 0 (mut binds) states)
               (do (ownership-wrap-in-binds! a e (mut binds)) true)
               false)))))
 
@@ -20355,6 +20619,9 @@
 (defn ownership-discard-result! [(a (dyn Allocator))
                                  (cx (ptr Cx))
                                  (e (ptr Expr))] (-> i64)
+  (if (diverges? e)
+    ; no value: control leaves before there is one to discard
+    0
   (match (.kind e)
     (EDo [items]
          (if (> (len (load items)) 0)
@@ -20392,7 +20659,7 @@
     (ETraitCall [_ _ _ _] (ownership-discard-fresh-owner! a cx e))
     (EDynDispatch [_] (ownership-discard-fresh-owner! a cx e))
     (EConstruct [_ _ _] (ownership-discard-fresh-owner! a cx e))
-    (_ 0)))
+    (_ 0))))
 
 (defn ownership-discard-fresh-owner! [(a (dyn Allocator))
                                       (cx (ptr Cx))
@@ -20474,12 +20741,27 @@
                            (fname (slice u8))
                            (tail-consumes bool)
                            (tail-discarded bool)] (-> (Result i64 Diag))
+  ; Control never reaches the forms after one that does not finish: they move,
+  ; drop and exit nothing, so they are not part of the body.
+  (ownership-drop-unreachable! items)
   (let [n (len (load items))]
     (for [i 0 n]
       (when (or tail-discarded (< (primitive/iadd i 1) n))
         (ownership-discard-result! a cx (elem items i))
         0))
     (ownership-walk-list a cx items states loops fname tail-consumes)))
+
+(defn ownership-drop-unreachable! [(items (ptr (ArrayList Expr)))] (-> i64)
+  (let [(mut cut) -1]
+    (for [i 0 (len (load items))]
+      (when (and (< (load cut) 0) (diverges? (elem items i)))
+        (set! cut (primitive/iadd i 1))
+        0))
+    (when (>= (load cut) 0)
+      (while (> (len (load items)) (load cut))
+        (pop! [Expr] items))
+      0)
+    0))
 
 ; Ownership is tracked per binding, so an owner can move only as a whole binding
 ; or as an rvalue. Loading one out of a reference, or out of a field or element of
@@ -20839,6 +21121,11 @@
                            (fname (slice u8))
                            (consumes bool)] (-> (Result i64 Diag))
   (try (do
+         ; An operand that does not finish ends the expression that would
+         ; consume it, as a binding whose value does not ends its let: what runs
+         ; is the operands before it, each a statement whose value nothing
+         ; receives, then that one.
+         (set! (.kind e) (hoist-diverging-operand a (.kind e)))
          (when consumes
            (try! (ownership-require-movable a cx e states fname))
            (try! (ownership-consume-root! a e states fname))
@@ -21130,23 +21417,26 @@
                                  (break)
                                  (do
                                    (ownership-unshadow-arm! a (elem arms (load i)) states)
-                                   (let [branch (move-states-clone states)]
+                                   (let [branch (move-states-clone states)
+                                         arm-body (field (elem arms (load i)) body)]
                                      (try! (ownership-walk-expr a
                                                                 cx
-                                                                (field (elem arms
-                                                                             (load i))
-                                                                       body)
+                                                                arm-body
                                                                 branch
                                                                 loops
                                                                 fname
                                                                 consumes))
-                                     (if (= (load i) 0)
-                                         (store! first branch)
-                                         (try! (ownership-require-same-states a
-                                                                              (load first)
-                                                                              branch
-                                                                              fname
-                                                                              "between match arms"))))
+                                     ; an arm that does not finish never reaches
+                                     ; the join
+                                     (unless (diverges? arm-body)
+                                       (if (= (primitive/cast i64 (load first)) 0)
+                                           (store! first branch)
+                                           (try! (ownership-require-same-states a
+                                                                                (load first)
+                                                                                branch
+                                                                                fname
+                                                                                "between match arms")))
+                                       0))
                                    (store! i (primitive/iadd (load i) 1)))))
                        (when (!= (primitive/cast i64 (load first))
                                  0)
@@ -21175,28 +21465,29 @@
                         frame (primitive/alloc-stack OwnershipLoop)]
                     (set! (.label frame) label)
                     (set! (.owner_depth frame) (len (load states)))
-                    (set! (.block_exits frame) exits)
+                    (set! (.exits frame) exits)
+                    (set! (.entry frame) states)
                     (push! [OwnershipLoop] loops (load frame))
                     (try! (ownership-walk-body a cx body inside loops fname false true))
                     (pop! [OwnershipLoop] loops)
-                    (for [i 1 (len (load exits))]
-                      (try! (ownership-require-same-states a
-                                                           (get (load exits) 0)
-                                                           (get (load exits) i)
-                                                           fname
-                                                           (sconcat3 a
-                                                                     "between the exits of block :"
-                                                                     (label-val label)
-                                                                     ""))))
-                    (when (> (len (load exits)) 0)
-                      (move-states-merge! states (get (load exits) 0)))
+                    (try! (ownership-join-exits! a states exits fname
+                                                 (sconcat3 a
+                                                           "between the exits of block :"
+                                                           (label-val label)
+                                                           "")))
                     (Ok [i64 Diag] 0))
-                  (let [iteration (move-states-clone states)
+                  ; A loop that iterates: the end of its body and each `continue`
+                  ; begin the next iteration, which must find the owners from
+                  ; outside as the loop did; each break leaves it, and after the
+                  ; loop those owners are as the breaks left them.
+                  (let [exits (box-al [(ptr (ArrayList MoveState))] (.alc loops)
+                                      (ArrayList::new [(ptr (ArrayList MoveState))] (.alc loops)))
+                        iteration (move-states-clone states)
                         frame (primitive/alloc-stack OwnershipLoop)]
                     (set! (.label frame) label)
                     (set! (.owner_depth frame) (len (load states)))
-                    (set! (.block_exits frame)
-                          (primitive/cast (ptr (ArrayList (ptr (ArrayList MoveState)))) 0))
+                    (set! (.exits frame) exits)
+                    (set! (.entry frame) states)
                     (push! [OwnershipLoop] loops (load frame))
                     (try! (ownership-walk-body a
                                                cx
@@ -21207,11 +21498,17 @@
                                                false
                                                true))
                     (pop! [OwnershipLoop] loops)
-                    (try! (ownership-require-same-states a
-                                                         states
-                                                         iteration
-                                                         fname
-                                                         "across a loop iteration"))
+                    (unless (exprs-diverge? body)
+                      (try! (ownership-require-same-states a
+                                                           states
+                                                           iteration
+                                                           fname
+                                                           "across a loop iteration"))
+                      0)
+                    (try! (ownership-join-exits! a states exits fname
+                                                 (match label
+                                                   (Some [l] (sconcat a "between the exits of loop :" l))
+                                                   (None [] "between the exits of a loop"))))
                     (Ok [i64 Diag] 0))))
            (EBreak [label value]
                    (do
@@ -21225,24 +21522,27 @@
                                                         fname
                                                         true)))
                        (None [] 0))
-                     (let [depth (ownership-loop-owner-depth loops label)]
-                       (when (>= depth 0)
-                         (try! (ownership-wrap-exit! a cx e states depth fname))
-                         0))
-                     (let [exits (ownership-block-exits loops label)]
-                       (unless (= (primitive/cast i64 exits) 0)
-                         ; only the owners from outside the block: the exit drops
-                         ; the rest, and nothing after the block can see them
+                     (let [frame (ownership-loop-frame loops label)]
+                       (unless (= (primitive/cast i64 frame) 0)
+                         (try! (ownership-wrap-exit! a cx e states (.owner_depth frame) fname))
+                         ; only the owners from outside the loop: the exit drops
+                         ; the rest, and nothing after the loop can see them
                          (push! [(ptr (ArrayList MoveState))]
-                                exits
-                                (move-states-prefix states (ownership-loop-owner-depth loops label)))
+                                (.exits frame)
+                                (move-states-prefix states (.owner_depth frame)))
                          0))
                      (Ok [i64 Diag] 0)))
            (EContinue [label]
                       (do
-                        (let [depth (ownership-loop-owner-depth loops label)]
-                          (when (>= depth 0)
-                            (try! (ownership-wrap-exit! a cx e states depth fname))
+                        (let [frame (ownership-loop-frame loops label)]
+                          (unless (= (primitive/cast i64 frame) 0)
+                            (try! (ownership-wrap-exit! a cx e states (.owner_depth frame) fname))
+                            ; the next iteration begins as the loop did
+                            (try! (ownership-require-same-states a
+                                                                 (.entry frame)
+                                                                 (move-states-prefix states (.owner_depth frame))
+                                                                 fname
+                                                                 "across a loop iteration"))
                             0))
                         (Ok [i64 Diag] 0)))
            (ELlvmIr [_ args _]

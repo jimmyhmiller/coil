@@ -376,6 +376,11 @@ section_check() {
   # conflicting case, another register class, is a diag golden).
   printf '(module extern-width)\n(import "coil.fs" :as fs)\n(extern mkdir :cc (coil.cc.C) [(ptr i8) i32] (-> i32))\n(defn main [] (-> i64) (mkdir c"/nonexistent-coil-dir/x" 448) 0)\n' > "$T/extern-width.coil"
   expect_rc 0 "an extern may redeclare a library symbol with another integer width" "$COIL" check "$T/extern-width.coil"
+  # A constant's initializer is checked for ownership as a body is, and reported
+  # against the constant (a constant's error stops the compile, so it is its own).
+  printf '(module const-move)\n(defstruct Owner [(value i64)])\n(impl Drop Owner (drop [(self (mut Owner))] (-> void) 0))\n(defn consume [(o Owner)] (-> i64) (.value o))\n(const TWICE (let [o (Owner :value 1)] (consume o) (consume o)))\n(defn main [] (-> i64) TWICE)\n' > "$T/const-move.coil"
+  expect_rc_out 1 "in 'const const-move.TWICE': use of moved value 'o'" \
+    "check: a constant's initializer moves an owner once" "$COIL" check "$T/const-move.coil"
   # A struct's :layout is a coil.layout.Layout value, and a type's annotations
   # are checked as a function's are; each mistake is its own compile, since the
   # first one stops it.
