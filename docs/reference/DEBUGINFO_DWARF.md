@@ -83,6 +83,10 @@ clang's Mach-O scheme. Location list entries are relative to the CU's base and
 need none. Without the relocations `dsymutil` rejects the object ("No valid
 relocations found. Skipping.").
 
+On ELF (`--backend x64`, and tpde for Linux x86-64) the same addresses are
+`R_X86_64_64` relocations against a symbol at the start of `.text`, and the
+linker resolves them; there is no separate gathering step.
+
 ## Gaps
 
 - Function-name breakpoints need the module-qualified name (`app.add`).

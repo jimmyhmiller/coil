@@ -101,8 +101,8 @@ python3 scripts/oracle.py corpus bless --compiler <coil> [--only types_traits]
 ```
 
 `bless` writes a reference from the LLVM build only after checking that the
-arm64 build agrees with it. The lanes are `arm64`, `llvm`, `x64`, `interp`,
-`safety`, `meta-interp` and `opt3`; `--all` puts every program in the `safety`
+arm64 build agrees with it. The lanes are `arm64`, `llvm`, `x64`, `tpde`,
+`interp`, `safety`, `meta-interp` and `opt3`; `--all` puts every program in the `safety`
 and `meta-interp` lanes. The `meta-interp` lane always includes the programs
 marked `meta-interp-refused=`: only the interpreted engine refuses them, so the
 refusal proves `COIL_META_INTERP=1` selected it and the lane is not silently
@@ -141,7 +141,7 @@ nothing else heavy is running: the build steps peak near 10 GB.
 | `guide-demos` | every `src/examples` demo builds and exits as `tests/demos.txt` says |
 | `regex-reference`, `prop`, `fuzz`, `simd` | breadth: regex conformance, property tests, the fuzz engine, SIMD in full |
 | `freestanding` | every `src/examples/freestanding` program links bare-metal (aarch64, riscv32, ESP32-C3) with `ld.lld --gc-sections` and no undefined symbols, then boots under QEMU; needs `brew install lld qemu` |
-| `x64/host` | on the x86-64 Linux host over ssh: the Linux bootstrap, the corpus, the x64 backend's fixpoint and gates |
+| `x64/host` | on the x86-64 Linux host over ssh: the Linux bootstrap, the corpus on LLVM and tpde (ELF), the C ABI checks, the x64 backend's fixpoint and gates |
 
 The x64 step uses `COIL_X64_HOST` (default `computer.jimmyhmiller.com`). That
 host may be unreachable; the step then fails and says so, rather than passing
