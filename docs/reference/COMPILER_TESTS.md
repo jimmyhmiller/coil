@@ -79,7 +79,7 @@ toolchain), and `$COIL_TEST_SCRATCH`, a directory the harness removes afterwards
 | `projects` | one package using every `Coil.toml` feature, a workspace, a hermetic profile, prebuilt units | `scripts/tests/fast/projects.sh`, `tests/projects/` |
 | `c-abi` | aggregates across the C ABI both ways, five build configurations, extern aliases | `scripts/tests/c-abi.py`, `tests/cabi/` |
 | `wasm` | wasm32 and wasm64 programs under node, validated | `scripts/tests/fast/wasm.py`, `tests/wasm/` |
-| `memory/*` | generated units and the namespace index stay within their memory bounds | `scripts/tests/generated-unit-memory.py`, `project-scan-memory.py` |
+| `memory/*` | generated units and the namespace index stay within their memory bounds; the REPL's resident set and time per submission are reported | `scripts/tests/generated-unit-memory.py`, `project-scan-memory.py`, `repl-growth.py` |
 | `readers` | reader-provider projects and provider artifacts | `scripts/tests/fast/readers.sh`, `tests/readers/` |
 | `meta` | code->code programs, hygiene both ways, lint suggestions, staged entries, transforms | `scripts/tests/fast/meta.sh`, `tests/meta/` |
 | `simd` | the SIMD differential on both backends and the vectorized codegen check | `scripts/tests/simd.py fast`, `tests/simd/` |

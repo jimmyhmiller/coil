@@ -87,6 +87,8 @@ def steps(quick: bool) -> list[Step]:
         # Generated units, the namespace index and reader providers stay bounded.
         Step("memory/generated-units", [PY, "scripts/tests/generated-unit-memory.py", "--units", "16", "--no-baseline"]),
         Step("memory/project-scan", [PY, "scripts/tests/project-scan-memory.py"]),
+        # REPL resident set and time per submission (reported, not yet bounded).
+        Step("memory/repl-growth", [PY, "scripts/tests/repl-growth.py", "--submissions", "30"]),
         Step("readers", [f"{FAST}/readers.sh"]),
         # Macros, transforms, checkers and hygiene.
         Step("meta", [f"{FAST}/meta.sh"]),
