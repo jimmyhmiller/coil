@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #include <spawn.h>
 #include <sys/wait.h>
+#include <sched.h>
 
 // ---- module interface (defined in the generated coilc.c) -------------------
 extern uint8_t **const wasm_memory;          // &m0 : the linear-memory buffer
@@ -196,6 +197,12 @@ uint32_t env_memcmp(uint64_t a, uint64_t b, uint64_t n) {
     return (uint32_t)(int32_t)(r < 0 ? -1 : (r > 0 ? 1 : 0));
 }
 uint64_t env_strlen(uint64_t p) { return (uint64_t)strlen(hoststr(p)); }
+uint64_t env_atol(uint64_t p) { return (uint64_t)(int64_t)atol(hoststr(p)); }
+// The guest address of the first byte C in the N bytes at P, or 0.
+uint64_t env_memchr(uint64_t p, uint32_t c, uint64_t n) {
+    const uint8_t *hit = memchr(MEM + p, (int)c, (size_t)n);
+    return hit ? (uint64_t)(hit - MEM) : 0;
+}
 // uname(2) for the guest: the host's struct, in the host's layout, which is
 // the one comptime.coil's native-arch-str reads for the OS it reports.
 uint32_t env_uname(uint64_t buf) {
@@ -235,6 +242,7 @@ uint64_t env_write(uint32_t fd, uint64_t ptr, uint64_t len) {
     return (uint64_t)(int64_t)write((int)fd, MEM + ptr, (size_t)len);
 }
 uint32_t env_close(uint32_t fd) { if (fd > 2) close((int)fd); return 0; }
+uint32_t env_dup2(uint32_t from, uint32_t to) { return (uint32_t)dup2((int)from, (int)to); }
 uint32_t env_access(uint64_t path, uint32_t mode) { return (uint32_t)access(hoststr(path), (int)mode); }
 uint64_t env_mkdtemp(uint64_t path) { return mkdtemp(hoststr(path)) ? path : 0; }
 uint32_t env_mkstemp(uint64_t path) { return (uint32_t)mkstemp(hoststr(path)); }
@@ -498,6 +506,8 @@ uint64_t env_pthread_self(void) { return 1; }
 uint32_t env_pthread_mutex_init(uint64_t a, uint64_t b) { (void)a; (void)b; return 0; }
 uint32_t env_pthread_mutex_lock(uint64_t a) { (void)a; return 0; }
 uint32_t env_pthread_mutex_unlock(uint64_t a) { (void)a; return 0; }
+uint32_t env_pthread_mutex_destroy(uint64_t a) { (void)a; return 0; }
+uint32_t env_sched_yield(void) { return (uint32_t)sched_yield(); }
 uint32_t env_pthread_cond_init(uint64_t a, uint64_t b) { (void)a; (void)b; return 0; }
 uint32_t env_pthread_cond_signal(uint64_t a) { (void)a; return 0; }
 uint32_t env_pthread_cond_wait(uint64_t a, uint64_t b) { (void)a; (void)b; return 0; }
