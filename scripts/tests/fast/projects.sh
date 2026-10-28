@@ -199,6 +199,55 @@ EOF
     || bad "run ($variant) passes the manifest's [run] args through unchanged" "exit $RC: $OUT"
 done
 
+echo "== native C sources and providers"
+# A native object is reused only for the same compile: reordering flags (the last
+# -D wins) is a different one. Source names Make spells with escapes (# and $)
+# still have their inputs recorded.
+N="$W/native-order"
+mkdir -p "$N/src"
+printf '[package]\nname = "pfnative"\nentry = "src/main.coil"\n\n[cc]\nsources = ["native#one.c", "native$two.c"]\nflags = ["-Wno-macro-redefined", "-DVALUE=1", "-DVALUE=42"]\n' > "$N/Coil.toml"
+printf '(module pfnative.main)\n(extern native_answer [] (-> i64))\n(extern native_zero [] (-> i64))\n(defn main [] (-> i64) (+ (native_answer) (native_zero)))\n' > "$N/src/main.coil"
+printf 'long long native_answer(void) { return VALUE; }\n' > "$N/native#one.c"
+printf 'long long native_zero(void) { return 0; }\n' > "$N/native\$two.c"
+run "$N" "$COIL" build -o program --quiet
+run "$N" ./program
+expect 42 "" "C sources whose names Make escapes (# and \$) build"
+replace "$N/Coil.toml" '"-DVALUE=1", "-DVALUE=42"' '"-DVALUE=42", "-DVALUE=1"'
+run "$N" "$COIL" build -o program --quiet
+run "$N" ./program
+expect 1 "" "reordering C flags recompiles the native object"
+
+# A provider's whole command is captured and checked: a quoted value may hold
+# commas, and a provider that fails when its flags are asked for stops the build.
+P="$W/native-provider"
+mkdir -p "$P/src"
+printf '(module pfprov.main)\n(defn main [] (-> i64) 42)\n' > "$P/src/main.coil"
+printf '[package]\nname = "pfprov"\nentry = "src/main.coil"\n\n[native-dependencies]\nrpath = { flags-command = "echo -Wl,-rpath,/opt/pfprov/lib" }\n' > "$P/Coil.toml"
+run "$P" "$COIL" build -o program --quiet
+run "$P" ./program
+expect 42 "" "a provider command with commas in its quoted value runs whole"
+printf '[package]\nname = "pfprov"\nentry = "src/main.coil"\n\n[native-dependencies]\nlate = { flags-command = "if test -e asked; then exit 9; fi; touch asked; echo -lm" }\n' > "$P/Coil.toml"
+rm -f "$P/program"
+run "$P" "$COIL" build -o program --quiet
+expect 1 "native dependency 'late' flags-command failed" "a provider that fails when its flags are asked for stops the build"
+[ ! -e "$P/program" ] && ok "...and nothing is linked" || bad "...and nothing is linked" "program was written"
+
+# A dependency package's provider: every line a command sequence prints is a
+# linker argument, not just the last command's.
+D="$W/native-dep"
+mkdir -p "$D/src" "$D/dep/dep" "$D/native"
+printf '(module dep.api)\n(export answer)\n(extern native_answer [] (-> i64))\n(defn answer [] (-> i64) (native_answer))\n' > "$D/dep/dep/api.coil"
+printf '(module app.main)\n(import "dep.api" :as dep)\n(defn main [] (-> i64) (dep/answer))\n' > "$D/src/main.coil"
+printf 'long long native_answer(void) { return 42; }\n' > "$D/native/native.c"
+(cd "$D/native" && cc -c native.c -o native.o && ar rcs libexample.a native.o) \
+  || bad "the dependency's native archive builds" "cc or ar failed"
+run "$D" env COIL_NAMESPACE_ROOTS=src:dep "$COIL" build src/main.coil -o program --quiet \
+  --dep-name 1:dep --dep-package "1:$D/dep" \
+  --dep-native-command "1:printf '%s\\n' native/libexample.a; printf '%s\\n' -lm"
+expect 0 "" "a dependency provider's command sequence builds"
+run "$D" ./program
+expect 42 "" "...and links every argument it printed"
+
 echo "== a [project] pointer"
 # A Coil.toml holding only `[project] path` makes every project command beside it
 # work on the package it names. The command is still the one typed beside it: its

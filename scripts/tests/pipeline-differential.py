@@ -13,11 +13,18 @@ src/examples, the runtime corpus (tests/corpus), the diagnostic inputs
 (tests/diag) and the stdlib suites (tests/stdlib), in sorted order. Both dumps
 must match, including their error output when a file does not check. A
 mismatch prints the file, the dump, and the first differing line.
+
+Hygiene numbers its syntax contexts and generated `$scopeN@` names in the order
+it allocates them, and a meaning-preserving change (a cache) can allocate in
+another order. Two dumps that are equal once each is renumbered in order of first
+appearance (zero, the authored context, stays zero) name the same contexts, and
+count as equal; they are reported as such, not as differences.
 """
 from pathlib import Path
 import argparse
 import concurrent.futures
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,6 +50,20 @@ def namespace_roots():
     return ":".join(["src", "tests", "scripts", "src/compiler", "src/stdlib"])
 
 
+def failure_report(result):
+    """What a rejected dump said: all of stderr, then the dump's own `(error …)`
+    nodes, which a stage dump writes in place of the program on stdout. The rest
+    of stdout (a program dump runs to tens of megabytes) only its first lines."""
+    stderr = result.stderr.decode(errors="replace")
+    stdout = result.stdout.decode(errors="replace")
+    errors = re.findall(r'\(error@[^"]*"(?:[^"\\]|\\.)*"\)', stdout)
+    parts = [f"stderr ({len(result.stderr)} bytes):\n{stderr[-4000:] if stderr else '(empty)'}"]
+    if errors:
+        parts.append("stdout error nodes:\n" + "\n".join(errors[:20]))
+    parts.append(f"stdout ({len(result.stdout)} bytes) begins:\n{stdout[:600]}")
+    return "\n".join(parts)
+
+
 def dump(compiler, command, path):
     env = {**os.environ, "COIL_NAMESPACE_ROOTS": namespace_roots(), "COIL_STRICT_BUNDLE": "0"}
     result = subprocess.run([str(compiler), command, str(path)], cwd=ROOT, env=env,
@@ -50,23 +71,50 @@ def dump(compiler, command, path):
     if result.returncode not in (0, 1):
         raise RuntimeError(
             f"{compiler} {command} {path}: abnormal exit {result.returncode}\n"
-            + result.stderr.decode(errors="replace")[:2000])
+            + failure_report(result))
     # Two compilers that both fail to load the compiler agree on nothing but the
-    # failure; the comparison the corpus leads with would never run.
-    if path == COMPILER and result.returncode != 0:
+    # failure; the comparison the corpus leads with would never run. A dump that
+    # exits 0 while reporting an error is no program either.
+    if path == COMPILER and (result.returncode != 0 or re.search(rb"(^|\n)error: ", result.stderr)):
         raise RuntimeError(
             f"{compiler} {command} {path}: the compiler does not check\n"
-            + result.stderr.decode(errors="replace")[:2000])
+            + failure_report(result))
     return (f"--status--{result.returncode}\n".encode()
             + result.stdout + b"\n--stderr--\n" + result.stderr)
 
 
+NODE_CONTEXT = re.compile(rb"(@-?\d+:-?\d+:-?\d+:)(-?\d+)")
+SCOPE_NAME = re.compile(rb"\$scope(\d+)@")
+
+
+def renumber_hygiene(text):
+    """TEXT with its syntax contexts and `$scopeN@` names renumbered by first
+    appearance: a bijection, so two dumps equal after it name the same contexts."""
+    contexts, scopes = {b"0": b"0"}, {}
+
+    def context(m):
+        key = m.group(2)
+        if key not in contexts:
+            contexts[key] = str(len(contexts)).encode()
+        return m.group(1) + contexts[key]
+
+    def scope(m):
+        key = m.group(1)
+        if key not in scopes:
+            scopes[key] = str(len(scopes)).encode()
+        return b"$scope" + scopes[key] + b"@"
+
+    return SCOPE_NAME.sub(scope, NODE_CONTEXT.sub(context, text))
+
+
 def compare(reference, candidate, path, output_dir=None):
-    problems = []
+    problems, renumbered = [], []
     for command in DUMPS:
         old = dump(reference, command, path)
         new = dump(candidate, command, path)
-        if old != new:
+        if old != new and renumber_hygiene(old) == renumber_hygiene(new):
+            renumbered.append(f"{path.relative_to(ROOT)} {command}")
+        elif old != new:
             old_lines = old.split(b"\n")
             new_lines = new.split(b"\n")
             line = next((i for i, (x, y) in enumerate(zip(old_lines, new_lines)) if x != y),
@@ -84,7 +132,7 @@ def compare(reference, candidate, path, output_dir=None):
                 Path(str(base) + f".{command}.candidate.txt").write_bytes(new)
             problems.append(f"{path.relative_to(ROOT)} {command} line {line + 1}, byte {column + 1}\n"
                             f"  reference: {show(old_lines)}\n  candidate: {show(new_lines)}")
-    return problems
+    return problems, renumbered
 
 
 def pair_with_checkout(prefix, compiler):
@@ -121,19 +169,23 @@ def main():
     reference = Path(args.reference).resolve()
     candidate = Path(args.candidate).resolve()
     files = corpus()
-    failures = []
+    failures, renumbered = [], []
     build_root = ROOT / "build"
     build_root.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="pipeline-diff-", dir=build_root) as directory:
         paired_reference = pair_with_checkout(Path(directory) / "reference", reference)
         paired_candidate = pair_with_checkout(Path(directory) / "candidate", candidate)
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            for problems in pool.map(
+            for problems, renumbers in pool.map(
                     lambda path: compare(paired_reference, paired_candidate, path, args.output_dir), files):
                 failures.extend(problems)
+                renumbered.extend(renumbers)
     for problem in failures:
         print(f"DIFF {problem}")
-    print(f"{len(files)} files, {len(files) * len(DUMPS)} dumps, {len(failures)} differ")
+    for same in renumbered:
+        print(f"RENUMBERED {same}: equal once hygiene contexts are renumbered")
+    print(f"{len(files)} files, {len(files) * len(DUMPS)} dumps, {len(failures)} differ"
+          + (f", {len(renumbered)} equal up to hygiene numbering" if renumbered else ""))
     return 1 if failures else 0
 
 

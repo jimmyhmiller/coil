@@ -108,6 +108,22 @@ EOF
     && ok "a child's -o does not select the build output" \
     || bad "a child's -o does not select the build output" "child-output was written"
 
+  # `-o OUT` puts the executable at OUT and runs it from there; the user's OUT stays.
+  rm -f "$T/run-out"
+  expect_rc 7 "run -o OUT builds OUT and runs it" "$COIL" run "$T/seven.coil" -o "$T/run-out"
+  [ -x "$T/run-out" ] && ok "run -o keeps the executable it was asked for" \
+                      || bad "run -o keeps the executable it was asked for" "$T/run-out is missing"
+  # An unknown `:` command is its own error, not the last submission's again.
+  out=$(printf '(+ 1 "a")\n:foo\n' | "$COIL" repl 2>&1 >/dev/null); rc=$?
+  case "$out" in
+    *"argument 2 to '+'"*"error: unknown JIT session command"*)
+      case "$out" in
+        *"argument 2 to '+'"*"argument 2 to '+'"*) bad "repl: an unknown command reports itself, not the previous failure" "$out" ;;
+        *) ok "repl: an unknown command reports itself, not the previous failure" ;;
+      esac ;;
+    *) bad "repl: an unknown command reports itself, not the previous failure" "exit $rc: $out" ;;
+  esac
+
   # The REPL: a definition, a call, a redefinition with the same signature
   # (coil.repl's Var policy), and the call again. Each definition records what
   # it reads in the session's dependency base.
@@ -237,6 +253,8 @@ section_usage() {
     expect_rc_out 1 "no such file: '.*nope.coil'" "$cmd: a missing file is an error that names it" \
       "$COIL" "$cmd" "$T/nope.coil"
   done
+  expect_rc_out 1 'usage: coil emit-obj' "emit-obj with no file is a usage error" \
+    bash -c 'cd "$1" && "$2" emit-obj' _ "$T" "$COIL"
   expect_rc_out 1 'is a directory, not a source file' "build: a directory is not a source file" \
     "$COIL" build "$T" -o "$T/dir-out"
   expect_rc 2 "fmt --check: a missing file is an error, not 'unformatted'" "$COIL" fmt --check "$T/nope.coil"
@@ -359,6 +377,18 @@ section_new_project() {
   [ "$rc" != 0 ] && cmp -s "$T/mine.coil" "$T/proj/src/main.coil" \
     && ok "new refuses to overwrite an existing project" \
     || bad "new refuses to overwrite an existing project" "exit $rc, src/main.coil now: $(head -3 "$T/proj/src/main.coil")"
+  # A one-character name is a directory like any other.
+  out=$(cd "$T" && "$COIL" new z 2>&1); rc=$?
+  [ "$rc" = 0 ] && [ -f "$T/z/Coil.toml" ] && [ -f "$T/z/.gitignore" ] && [ -f "$T/z/src/main.coil" ] \
+    && ok "new scaffolds a project with a one-character name" \
+    || bad "new scaffolds a project with a one-character name" "exit $rc: $out"
+  # A scaffold that could not be written is not reported as created.
+  mkdir -p "$T/readonly" && chmod 555 "$T/readonly"
+  out=$(cd "$T/readonly" && "$COIL" new p 2>&1); rc=$?
+  chmod 755 "$T/readonly"
+  [ "$rc" != 0 ] && case "$out" in *created*) false ;; *"error:"*) true ;; *) false ;; esac \
+    && ok "new fails, without claiming success, when it cannot write the project" \
+    || bad "new fails when it cannot write the project" "exit $rc: $out"
   cp "$T/scaffold.coil" "$T/proj/src/main.coil"
   expect_rc_out 0 '^doubled total: 42$' "the scaffold runs" bash -c 'cd "$1/proj" && "$2" run' _ "$T" "$COIL"
   expect_rc 0 "the scaffold is fmt-clean" bash -c 'cd "$1/proj" && "$2" fmt --check' _ "$T" "$COIL"
@@ -543,6 +573,40 @@ EOF
   printf '(module dynapp)\n(import "dynshapes" :as p)\n(import "coil.primitive" :as primitive)\n(defstruct Point [(x i64)])\n(impl p/Show Point (show [(a (ptr Point))] (-> i64) 5))\n(defn main [] (-> i64) (p/show (primitive/make-dyn Show (primitive/alloc-static Point))))\n' > "$T/dyn-scope/dynapp.coil"
   expect_rc_out 1 "make-dyn: unknown trait 'Show'" "check: make-dyn's trait is one in scope, not one that shares its name" \
     "$COIL" check "$T/dyn-scope/dynapp.coil"
+  # `coil expand` prints the program as source: a float, an escaped string and the
+  # most negative integer read back as written. A def whose value the parser reads
+  # as a literal (`true`, `#\a`) is a value, not an alias to a definition.
+  printf '(module ex)\n(def x 1.5)\n(def m -9223372036854775808)\n(def s "a\\nb\\"q")\n(def y #\\a)\n(def t true)\n(import "coil.primitive" :as primitive)\n(defn main [] (-> i64) (if t (primitive/cast i64 y) 0))\n' > "$T/expand.coil"
+  out=$("$COIL" expand "$T/expand.coil" 2>&1)
+  local want
+  for want in '(def x 1.5)' '(def m -9223372036854775808)' '(def s "a\nb\"q")' '(def y #\a)' '(def t true)'; do
+    case "$out" in *"$want"*) ok "expand prints $want" ;; *) bad "expand prints $want" "$out" ;; esac
+  done
+  expect_rc 97 "a def of #\\a or true is a value" "$COIL" run "$T/expand.coil"
+  printf '(defn* f [()] (-> i64) 1)\n(deftrait T [Self] (m [()] (-> i64)))\n(defn main [] (-> i64) 1)\n' > "$T/empty-param.coil"
+  expect_rc_out 1 'parameter must be \(name :type\): `\(\)` names nothing' "an empty () parameter is a located error, not a crash" \
+    "$COIL" check "$T/empty-param.coil"
+  # Each stage dump loads the program as check does, sibling modules included,
+  # and fails exactly when its stage does.
+  mkdir -p "$T/dumps"
+  printf '(module imp.lib)\n(export f)\n(defn f [] (-> i64) 3)\n' > "$T/dumps/lib.coil"
+  printf '(module imp.main)\n(import "imp.lib" :as l)\n(defn main [] (-> i64) (l/f))\n' > "$T/dumps/main.coil"
+  printf '(module m)\n(import "nope.mod" :as n)\n(defn main [] (-> i64) 0)\n' > "$T/dumps-missing.coil"
+  printf '(module te)\n(defn main [] (-> i64) "x")\n' > "$T/dumps-type.coil"
+  printf '(defn main [] (-> i64) (\n' > "$T/dumps-read.coil"
+  local stage got
+  got=""
+  for stage in load expand hygiene resolved checked mono; do
+    "$COIL" dump-$stage "$T/dumps/main.coil" >/dev/null 2>&1; got="$got $stage:$?"
+    "$COIL" dump-$stage "$T/dumps-missing.coil" >/dev/null 2>&1; got="$got $?"
+    "$COIL" dump-$stage "$T/dumps-type.coil" >/dev/null 2>&1; got="$got $?"
+    "$COIL" dump-$stage "$T/dumps-read.coil" >/dev/null 2>&1; got="$got $?"
+  done
+  [ "$got" = " load:0 1 0 1 expand:0 1 0 1 hygiene:0 1 0 1 resolved:0 1 0 1 checked:0 1 1 1 mono:0 1 1 1" ] \
+    && ok "stage dumps load as check does and fail exactly when their stage fails" \
+    || bad "stage dumps load as check does and fail exactly when their stage fails" "stage:good missing-import type-error read-error =$got"
+  expect_rc 1 "dump-read fails on a read error" "$COIL" dump-read "$T/dumps-read.coil"
+  expect_rc 1 "dump-ast fails on a form the parser rejects" "$COIL" dump-ast "$T/dumps/main.coil"
   # The forms an imported file has before its (module …) keep bare names; a
   # defalias among them calls the function it names.
   mkdir -p "$T/prefix-alias"
@@ -644,6 +708,31 @@ EOF
     *) bad "fmt keeps a comment inside its binding" "$text" ;; esac
   expect_rc 0 "fmt of those comments is idempotent" "$COIL" fmt --check "$T/comments.coil"
 
+  # A closing delimiter after a comment starts its own line, and a comment right
+  # after an opening bracket inside a form lays out the same on a second pass.
+  printf '(module fmtclose)\n(defn main [] (-> i64)\n  (do\n    7 ; the closer is not part of this comment\n  ))\n' > "$T/closer.coil"
+  "$COIL" fmt --write "$T/closer.coil" >/dev/null 2>&1
+  expect_rc 7 "fmt keeps a closing delimiter out of a trailing comment" "$COIL" run "$T/closer.coil"
+  expect_rc 0 "...and that layout is a fixpoint" "$COIL" fmt --check "$T/closer.coil"
+  printf '(module fmtlead)\n(def TABLE\n  [; first section\n   1 2])\n(defn main [] (-> i64) (get TABLE 1))\n' > "$T/lead.coil"
+  "$COIL" fmt --write "$T/lead.coil" >/dev/null 2>&1
+  expect_rc 0 "fmt of a comment after [ in a def is a fixpoint after one pass" "$COIL" fmt --check "$T/lead.coil"
+  expect_rc 2 "...and the program still means the same" "$COIL" run "$T/lead.coil"
+
+  # balance's filter output is its result: a clean file it cannot write fails.
+  printf '(defn f [] 42)\n' > "$T/clean.coil"
+  COIL_BALANCE_LOG=0 "$COIL" balance "$T/clean.coil" >&- 2>/dev/null
+  [ $? = 1 ] && ok "balance exits 1 when an unchanged file cannot be written" \
+    || bad "balance exits 1 when an unchanged file cannot be written" "wrong exit status"
+  # Every run appends its outcome, a refusal included.
+  mkdir -p "$T/balance-home"
+  printf '(a [b))\n' > "$T/refused.coil"
+  HOME="$T/balance-home" COIL_BALANCE_LOG=1 "$COIL" balance "$T/refused.coil" >/dev/null 2>&1
+  local log
+  log=$(cat "$T/balance-home/.coil/balance-log.jsonl" 2>&1)
+  case "$log" in *'"outcome":"refused","cause":"mismatch"'*) ok "balance logs a refusal with its cause" ;;
+    *) bad "balance logs a refusal with its cause" "$log" ;; esac
+
   local base
   for base in layout vertical_spacing; do
     "$COIL" fmt "tests/cli/fmt/${base}_input.coil" > "$T/$base.got" 2>&1
@@ -729,6 +818,21 @@ open(sys.argv[1], "w").write(
   case "$(cat "$T/cell.coil")" in
     *"(mut h)"*) expect_rc 0 "lint --fix keeps a stack cell's element type in the local" "$COIL" run "$T/cell.coil" ;;
     *) bad "lint --fix keeps a stack cell's element type in the local" "not rewritten: $(cat "$T/cell.coil")" ;;
+  esac
+  # A comment the rewrite cannot place inside the new form goes after it on its
+  # own line, ahead of the closers that follow the form on its last line.
+  printf '%s' '(module lint-cell-comment)
+(import "coil.primitive" :as primitive)
+(defn main [] (-> i64)
+  (let [out (primitive/alloc-stack i64)]
+    (primitive/store! out 7)
+    ; the result
+    (primitive/load out)))
+' > "$T/cell-comment.coil"
+  "$COIL" lint "$T/cell-comment.coil" --fix >/dev/null 2>&1
+  case "$(cat "$T/cell-comment.coil")" in
+    *"(mut out)"*"; the result"*) expect_rc 7 "lint --fix keeps a carried comment off the closers after it" "$COIL" run "$T/cell-comment.coil" ;;
+    *) bad "lint --fix keeps a carried comment off the closers after it" "not rewritten: $(cat "$T/cell-comment.coil")" ;;
   esac
   # A cast of a literal its type holds is an ascription, or the literal itself (in
   # the author's spelling) for the literal's own type; a cast that truncates stays.
@@ -985,6 +1089,33 @@ EOF
       ok "import-aliases qualifies a wildcard import's references" ;;
     *) bad "import-aliases qualifies a wildcard import's references" "exit $rc: $diff_out" ;;
   esac
+  # `(total [x 2])` reads as type arguments or an array value until resolution
+  # chooses; its head is a call either way, so the source view binds it.
+  mkdir -p "$T/bracket-call/b"
+  printf '[package]\nname = "b"\nentry = "b/main.coil"\nsource-roots = ["."]\n' > "$T/bracket-call/Coil.toml"
+  printf '(module b.h)\n(defn total [(v (array i64 2))] (-> i64) (+ (get v 0) (get v 1)))\n' > "$T/bracket-call/b/h.coil"
+  printf '(module b.main)\n(import "b.h" :use *)\n(defn main [] (-> i64) (let [x 1] (total [x 2])))\n' > "$T/bracket-call/b/main.coil"
+  diff_out=$(cd "$T/bracket-call" && "$COIL" lint b/main.coil --use coil.lint.import-aliases --diff 2>&1); rc=$?
+  case "$diff_out" in
+    *'+(import "b.h" :as h)'*'(h/total [x 2])'*) ok "import-aliases qualifies a call whose first argument is an array naming a local" ;;
+    *) bad "import-aliases qualifies a call whose first argument is an array naming a local" "exit $rc: $diff_out" ;;
+  esac
+  # A store through a pointer a field holds is not an assignment to the field.
+  printf '%s' '(module store-through-field)
+(import "coil.primitive" :as primitive)
+(defstruct Box [(slot (ptr i64))])
+(defn main [] (-> i64)
+  (let [cell (primitive/alloc-static i64)
+        b (Box :slot cell)]
+    (primitive/store! (.slot b) 7)
+    (primitive/load cell)))
+' > "$T/store-field.coil"
+  diff_out=$("$COIL" lint "$T/store-field.coil" --diff 2>&1); rc=$?
+  case "$diff_out" in
+    *"(set! (.slot b) 7)"*|*"did not compile"*) bad "lint does not turn a store through a field's pointer into a field assignment" "exit $rc: $diff_out" ;;
+    *) [ "$rc" = 0 ] && ok "lint does not turn a store through a field's pointer into a field assignment" \
+         || bad "lint does not turn a store through a field's pointer into a field assignment" "exit $rc: $diff_out" ;;
+  esac
   local out
   # coil.core's typed target-arch is no legacy spelling for the preflight to rewrite
   printf '%s\n' '(module arch-probe)' '(defn arm? [(c Code)] (-> Code) (match (target-arch) (Aarch64 [] `true) (_ `false)))' \
@@ -1158,6 +1289,19 @@ EOF
     elif [ "$rc" != 0 ]; then
       bad "--backend x64 cross build with comptime runs under Rosetta" "exit $rc: $out"
     fi
+    # The macOS version a --target names is the executable's deployment minimum.
+    out=$("$COIL" build "$T/seven.coil" -o "$T/seven13" --target arm64-apple-macosx13.0.0 2>&1); rc=$?
+    kind=$(vtool -show-build "$T/seven13" 2>&1)
+    case "$kind" in
+      *"minos 13.0"*) [ "$rc" = 0 ] && ok "--target arm64-apple-macosx13.0.0 links an executable for macOS 13.0" \
+                                    || bad "--target arm64-apple-macosx13.0.0 links an executable for macOS 13.0" "exit $rc: $out" ;;
+      *) bad "--target arm64-apple-macosx13.0.0 links an executable for macOS 13.0" "exit $rc: $out / $kind" ;;
+    esac
+    # This host's linker makes no Linux executable: said before compiling, not
+    # discovered by ld on the object afterwards.
+    expect_rc_out 1 "cannot link a x86_64-unknown-linux-gnu executable on this macOS host" \
+      "a Linux executable is refused on a macOS host, naming what can be built" \
+      "$COIL" build "$T/xseven.coil" -o "$T/xseven-linux" --target x86_64-unknown-linux-gnu
     # Apple's ar drops an ELF member with a warning and exits 0; a Linux --lib
     # archive is written by llvm-ar and holds the object.
     out=$("$COIL" build "$T/xseven.coil" --lib -o "$T/xseven.a" --target x86_64-unknown-linux-gnu 2>&1); rc=$?
@@ -1397,6 +1541,10 @@ macro COIL_HALF — a double expression, not an integer constant
 (chain (fnptr (coil.cc.C) [i8] (fnptr (coil.cc.C) [f64] i32)))
 (extern coil_get_loader :cc (coil.cc.C) [] (-> (fnptr (coil.cc.C) [(ptr i8) (ptr i32)] (ptr u8))))
 (defstruct coil_uninspectable :layout (coil.layout.Explicit)
+(const COIL_MOST_NEGATIVE -9223372036854775808)
+(const COIL_INT64_MIN -9223372036854775808)
+(extern coil_get_constant :cc (coil.cc.C) [] (-> i32))
+(extern coil_use_area :cc (coil.cc.C) [(ptr coil_restricted_area)] (-> void))
 EOF
     expect_rc 0 "the generated bindings check" "$COIL" check "$T/expressions.coil"
   fi
@@ -1569,6 +1717,61 @@ EOF
 EOF
   expect_rc_out 1 "declares C symbol 'extern-defn.helper', which the program's own function 'extern-defn.helper' defines" \
     "an extern of a Coil function's own symbol is explained" "$COIL" check "$T/extern-defn.coil"
+  # A header for what C can say about a program's types, compiled as C and as
+  # C++: function-pointer declarators, an aligned struct, a struct reached only
+  # through a pointer field, a private sum behind a pointer (an opaque tag), two
+  # modules' structs of one name, and names that are C or C++ keywords.
+  mkdir -p "$T/hdr2"
+  printf '(module a)\n(export Thing)\n(defstruct Thing [(x i64)])\n' > "$T/hdr2/a.coil"
+  printf '(module b)\n(export Thing)\n(defstruct Thing [(y i64)])\n' > "$T/hdr2/b.coil"
+  cat > "$T/hdr2/main.coil" <<'EOF'
+(module app)
+(import "coil.cc" :as cc)
+(import "coil.layout" :as l)
+(import "a" :as a)
+(import "b" :as b)
+(defstruct Child [(x i64)])
+(defsum Hidden (Empty) (Value [(n i64)]))
+(defstruct Parent [(child (ptr Child)) (hidden (ptr Hidden)) (callback (fnptr (cc/C) [i64] i64))])
+(defstruct Box :layout (l/Align 16) [(x i8)])
+(defstruct class [(switch i64)])
+(defn pick [(f (fnptr (cc/C) [i64] i64))] (-> (fnptr (cc/C) [i64] i64)) f)
+(defn call-parent [(p Parent)] (-> i64) (let [f (.callback p)] (f 21)))
+(defn hidden [(p (ptr Hidden))] (-> (ptr Hidden)) p)
+(defn box-align [(p (ptr Box))] (-> i64) (alignof Box))
+(defn klass [(p (ptr class))] (-> i64) (.switch p))
+(defn first [(p (ptr a/Thing))] (-> i64) (.x p))
+(defn second [(p (ptr b/Thing))] (-> i64) (.y p))
+(export-c pick [call-parent :as "call_parent"] hidden [box-align :as "box_align"] klass first second)
+EOF
+  cat > "$T/hdr2/use.c" <<'EOF'
+#include "main.h"
+static int64_t twice(int64_t n) { return n * 2; }
+int main(void) {
+    Parent p = { 0, 0, twice };
+    class_ k = { .switch_ = 5 };
+    a_Thing at = { .x = 1 };
+    b_Thing bt = { .y = 2 };
+    return (pick(twice)(1) == 2 && call_parent(p) == 42 && hidden((Hidden *)0) == (Hidden *)0
+            && box_align((Box *)0) == _Alignof(Box) && sizeof(Box) == 16
+            && klass(&k) == 5 && first(&at) == 1 && second(&bt) == 2) ? 0 : 1;
+}
+EOF
+  out=$(cd "$T/hdr2" && "$COIL" cheader main.coil -o main.h 2>&1); rc=$?
+  if [ "$rc" = 0 ] && [ -f "$T/hdr2/main.h" ]; then
+    expect_rc 0 "cheader's header compiles as C" cc -x c -fsyntax-only -Wno-pragma-once-outside-header "$T/hdr2/main.h"
+    expect_rc 0 "cheader's header compiles as C++" c++ -x c++ -fsyntax-only -Wno-pragma-once-outside-header "$T/hdr2/main.h"
+    if (cd "$T/hdr2" && "$COIL" emit-obj main.coil -o main.o >/dev/null 2>&1 && cc use.c main.o -o use 2>/dev/null); then
+      expect_rc 0 "a C program agrees with the header on every type's layout" "$T/hdr2/use"
+    else
+      bad "a C program agrees with the header on every type's layout" "emit-obj or cc failed"
+    fi
+  else
+    bad "cheader describes pointers, alignment, sums, namesakes and keywords" "exit $rc: $out"
+  fi
+  expect_rc_out 1 "cannot write" "cheader fails when its output cannot be written" \
+    bash -c 'cd "$1/hdr2" && "$2" cheader main.coil -o missing/main.h' _ "$T" "$COIL"
+  [ ! -e "$T/hdr2/missing" ] && ok "...and writes nothing" || bad "...and writes nothing" "missing/ exists"
 }
 
 # ---------------------------------------------------------------------------

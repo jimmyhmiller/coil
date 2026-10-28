@@ -40,4 +40,16 @@ struct coil_uninspectable {
   long state;
 };
 
+/* The most negative 64-bit value, written as a literal and reached through
+   <stdint.h>: its magnitude alone does not fit an i64. */
+#include <stdint.h>
+#define COIL_MOST_NEGATIVE -9223372036854775808
+#define COIL_INT64_MIN INT64_MIN
+
+/* Names that merely contain a qualifier word are names. */
+typedef int coil_constant_t;
+coil_constant_t coil_get_constant(void);
+struct coil_restricted_area { int x; };
+void coil_use_area(const struct coil_restricted_area *restrict area);
+
 #endif
