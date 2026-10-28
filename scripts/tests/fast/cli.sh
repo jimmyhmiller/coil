@@ -1257,6 +1257,40 @@ EOF
        (if (p/icmp-eq (negative) minus) 100 0)
        (if (p/icmp-eq (p/load BIG) minus) 1000 0))))
 EOF
+  # tpde names each symbol it imports once, however many modules declare it
+  # (the library declares write, abort and others in several modules).
+  printf '%s\n' '(module objlib.plain)' '(defn answer [] (-> i64) 42)' > "$T/plain.coil"
+  local syms undefined dups
+  if "$COIL" emit-obj "$T/plain.coil" --backend tpde -o "$T/plain.o" >/dev/null 2>&1; then
+    syms=$(nm "$T/plain.o" 2>&1)
+    undefined=$(awk '$1 == "U" { print $2 }' <<<"$syms")
+    dups=$(sort <<<"$undefined" | uniq -d)
+    if [ -n "$undefined" ] && [ -z "$dups" ]; then ok "a tpde object imports each undefined symbol once"
+    else bad "a tpde object imports each undefined symbol once" "duplicates: $dups (undefined: $(wc -l <<<"$undefined"))"; fi
+  else
+    bad "a tpde object imports each undefined symbol once" "emit-obj --backend tpde failed"
+  fi
+
+  # An object imports only what it relocates against: a compile-time unit's
+  # helpers, which a library module declares when its unit is loaded, are not
+  # undefined symbols of a runtime object, on Mach-O or ELF.
+  local target units imports0 imports1
+  for target in "" "--target x86_64-unknown-linux-gnu"; do
+    for units in 0 1; do
+      # shellcheck disable=SC2086
+      COIL_CT_UNITS=$units "$COIL" emit-obj "$ROOT/src/examples/references.coil" --backend tpde $target \
+        -o "$T/imports$units.o" >/dev/null 2>&1
+    done
+    imports0=$(nm "$T/imports0.o" 2>/dev/null | awk '$1 == "U" { print $2 }' | sort)
+    imports1=$(nm "$T/imports1.o" 2>/dev/null | awk '$1 == "U" { print $2 }' | sort)
+    if [ -n "$imports0" ] && [ "$imports0" = "$imports1" ]; then
+      ok "compile-time units add no undefined symbols to a tpde object ${target:-(Mach-O)}"
+    else
+      bad "compile-time units add no undefined symbols to a tpde object ${target:-(Mach-O)}" \
+        "$(diff <(printf '%s\n' "$imports0") <(printf '%s\n' "$imports1") | head -8)"
+    fi
+  done
+
   local opt
   for opt in -O0 -O2; do
     expect_rc 87 "a literal wider than 128 bits keeps its value ($opt; 1111 mod 256)" \
@@ -1864,6 +1898,23 @@ section_debuginfo() {
   done
   "$COIL" build "$T/dbgv.coil" --backend tpde -g0 -o "$T/dbgv" >/dev/null 2>&1
   [ ! -d "$T/dbgv.dSYM" ] && ok "-g0 turns the default debug info off" || bad "-g0 turns the default debug info off" "$T/dbgv.dSYM exists"
+
+  # A library macro's output is located at its template whether the macro runs
+  # from a compile-time unit or from source: the line tables agree row for row.
+  local dwarfdump units lines0 lines1
+  dwarfdump=$("${LLVM_CONFIG:-llvm-config}" --bindir)/llvm-dwarfdump
+  for units in 0 1; do
+    COIL_CT_UNITS=$units "$COIL" emit-obj "$ROOT/src/examples/references.coil" --backend tpde -g \
+      -o "$T/units$units.o" >/dev/null 2>&1
+  done
+  lines0=$("$dwarfdump" --debug-line "$T/units0.o" 2>/dev/null | grep '^0x')
+  lines1=$("$dwarfdump" --debug-line "$T/units1.o" 2>/dev/null | grep '^0x')
+  if [ -n "$lines0" ] && [ "$lines0" = "$lines1" ]; then
+    ok "compile-time units keep a library macro's template lines"
+  else
+    bad "compile-time units keep a library macro's template lines" \
+      "$(diff <(printf '%s\n' "$lines0") <(printf '%s\n' "$lines1") | head -8)"
+  fi
 }
 
 # ---------------------------------------------------------------------------
