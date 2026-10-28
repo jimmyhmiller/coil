@@ -38,8 +38,16 @@ directly as width macros. Inside a generic definition `N` is also an `i64` value
 
 Widths need not be powers of two. Numeric vector storage is padded to the next
 power-of-two byte size, but vector memory operations access exactly N lanes.
-Do not assume that a logical mask's in-memory representation is a portable ABI.
-Use scalar pointers at C boundaries and `mask->bits` for mask serialization.
+
+A mask in memory (a `(mask N)` field, array element or local) packs its lanes
+one bit each: lane i is bit i%8 of byte i/8, and it occupies ceil(N/8) bytes
+padded to the next power of two, aligned to that size, so `(sizeof (mask 12))`
+is 2 and `(sizeof (mask 64))` is 8. This layout is the same on every backend
+(LLVM, tpde for arm64 and x86-64, the interpreter), so a struct holding a mask
+can pass through memory between objects built by different backends. Bits past
+lane N-1 are padding. A mask is not a C type: the vector memory operations
+(`vloadu` and the like) take numeric lanes only, and `mask->bits`/`bits->mask`
+convert a mask to and from an integer for a C boundary or for serialization.
 
 ## Operations
 
