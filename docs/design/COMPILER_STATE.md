@@ -297,6 +297,28 @@ compaction grows 33 KB per submission, and the rest is the JIT's code.
 - Tests: save → load → save is byte-identical; a session loaded from a file accepts
   further submissions that use its earlier definitions; a mismatched toolchain is
   refused. ~300 lines.
+- Done, differently from the first bullet. Saving is part of the `Persist`
+  derive, not of `coil.serde`: `persist-write` and `persist-read` walk the same
+  fields `persist-into` does, writing each in declaration order with no names or
+  types, so the bytes are tied to the build that wrote them (which the header's
+  toolchain digest already requires). It is faster than a self-describing format
+  and needs no second derive on every compiler type. A map is written as its
+  slot table, tombstones included, so a loaded map is the same table and saves
+  the same bytes; an enumeration as its variant's position (its bytes include
+  padding). The derive's `persist-read` takes a `(ref Self)` only to choose the
+  impl and returns the value: trait dispatch reads a `(ptr X)` argument as the
+  `(ptr T)` impl, so an out-pointer cannot name its own type.
+- `jit-env-save` / `jit-env-load` (`env-save` / `env-load` in `env.coil`):
+  `coil saved compiler state 1`, the toolchain digest and the target, then the
+  `Env`. Its metaprogram entries are not saved: they name code the saving process
+  loaded (the library's macros among them, in every state), and a compile on the
+  loaded state stages each one it calls again from the definition the state
+  keeps. Measured: 200 checked submissions save to 8.6 MB in 4 ms and load in
+  9 ms. Tests: `tests/stdlib/persist_test.coil` (round trip, a map with removed
+  entries, cut and padded bytes refused) and `tests/jit/env_values.coil` (two
+  edits of one base, save → load → save identical, a check against the loaded
+  state, a macro defined before the save used after the load, foreign and
+  damaged bytes refused).
 
 ### Step 5 — time proportional to the edit
 

@@ -56,7 +56,7 @@ GROUPS: dict[str, list[str]] = {
                     "const_generic_trait_method", "generic_replacement", "defalias_rebind",
                     "before_expand_const_replacement", "before_expand_sum_replacement",
                     "entry_compile_time_code"],
-    "environment": ["deep_source", "host_environment", "meta_pipeline", "meta_accepted_impl",
+    "environment": ["deep_source", "env_values", "host_environment", "meta_pipeline", "meta_accepted_impl",
                     "meta_generator_later", "frontend_policy", "llvm_backend",
                     "cimport_header_change"],
     # Run with the project below as the working directory.
