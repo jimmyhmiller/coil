@@ -385,7 +385,9 @@ page), the compiler state 14 KB.
   impl and returns the value: trait dispatch reads a `(ptr X)` argument as the
   `(ptr T)` impl, so an out-pointer cannot name its own type.
 - `jit-env-save` / `jit-env-load` (`env-save` / `env-load` in `env.coil`):
-  `coil saved compiler state 1`, the toolchain digest and the target, then the
+  `coil saved compiler state 2`, the toolchain digest, the target and the hash of
+  the bytes that follow (an Env is read by position through its indexes, so bytes
+  that parse but were altered are refused), then the
   `Env`. Its metaprogram entries are not saved: they name code the saving process
   loaded (the library's macros among them, in every state), and a compile on the
   loaded state stages each one it calls again from the definition the state

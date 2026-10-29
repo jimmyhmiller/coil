@@ -135,6 +135,18 @@ EOF
     bad "the REPL defines, calls and redefines a function" "exit $rc: $out"
   fi
 
+  # `:defs` lists the session's definitions in every module it was entered in,
+  # and a type that contains itself through an accepted one is reported (the
+  # check builds on the session's tables, so the cycle runs through the base).
+  out=$(printf '%s\n' '(defn f [] (-> i64) 1)' '(module other)' '(defn g [] (-> i64) 2)' ':defs' \
+          '(defstruct Node [(next (Option Node))])' ':q' | "$COIL" repl 2>&1); rc=$?
+  if [ "$rc" = 0 ] && grep -q "^\(coil> \)*replsession\.f$" <<<"$out" && grep -q "^\(coil> \)*other\.g$" <<<"$out" \
+     && grep -q "contains itself by value" <<<"$out"; then
+    ok "the REPL lists definitions of every module and reports a type containing itself"
+  else
+    bad "the REPL lists definitions of every module and reports a type containing itself" "exit $rc: $out"
+  fi
+
   # Every top-level definition, multi-line ones included, is compiled into the
   # session and answered `; ok`, not just the `(def…` heads.
   out=$(printf '%s\n' '(defstruct Pair [(left i64) (right i64)])' '(impl Pair' '  (new [] (-> Pair)' \

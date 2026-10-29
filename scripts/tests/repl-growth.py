@@ -105,6 +105,8 @@ def main() -> int:
         proc.wait()
 
     accounts = account_slopes(args)
+    if accounts is None:
+        return 1
 
     half = len(rss) // 2
     # The session's state lives in a pool that is compacted every few
@@ -142,9 +144,10 @@ def submission(i: int) -> str:
             else f"(grow{k} 1)")
 
 
-def account_slopes(args) -> dict[str, tuple[int, int, float]]:
+def account_slopes(args) -> dict[str, tuple[int, int, float]] | None:
     """Each memory.* count the session traces after an accept: first, last and
-    slope per submission over the second half."""
+    slope per submission over the second half. None when the traced session
+    went over the RSS cap (it is stopped there, like the first)."""
     env = dict(os.environ, COIL_TRACE="1")
     with tempfile.TemporaryFile() as trace:
         proc = subprocess.Popen([args.compiler, "repl"], cwd=ROOT, env=env,
@@ -155,6 +158,11 @@ def account_slopes(args) -> dict[str, tuple[int, int, float]]:
                 proc.stdin.write(submission(i).encode() + b"\n")
                 proc.stdin.flush()
                 read_until_prompt(proc.stdout)
+                resident = rss_kb(proc.pid)
+                if resident > args.rss_cap_mb * 1024:
+                    print(f"stopped the traced run at submission {i}: RSS {resident // 1024} MB "
+                          f"is over the {args.rss_cap_mb} MB cap")
+                    return None
         finally:
             proc.kill()
             proc.wait()
