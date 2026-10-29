@@ -566,6 +566,15 @@ JIT suites, `build full`, nollvm and x64, and a measured line count:
   `ls-copy-exports`, `env-loader-over`, `env-list-over`, `env-imports-over`,
   `env-exports-over`, `env-tail-onto!`. A one-line submission carves 41 KB of the
   pool (43 KB at stage B) and takes 6.8 ms.
+  Then the resolution registries (the type and value answers resolution records
+  by module and spelling): each is a list of what this compile recorded (what a
+  revision captures and a mark cuts back to) and an `AMap` of every answer,
+  which begins as the parent state's. A lookup is one `get`. Deleted: the
+  hand-built `ResIndex` over each list and the code that kept it in step, the
+  walk up `resolution_parent` for them, the Env's lists and their indexes, and
+  `env-refs-next!` with the `EnvKeyed` merge (`env-keyed-last`, `-upsert!`,
+  `-merge!`). A mark saves the maps' headers and retags the live ones; a
+  truncation puts the saved ones back.
 - E. Under the JIT gate, the pool's memory below its last compaction is
   `mprotect`ed read-only, so a store into accepted state faults at the store.
 
