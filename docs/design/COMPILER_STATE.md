@@ -574,7 +574,11 @@ JIT suites, `build full`, nollvm and x64, and a measured line count:
   walk up `resolution_parent` for them, the Env's lists and their indexes, and
   `env-refs-next!` with the `EnvKeyed` merge (`env-keyed-last`, `-upsert!`,
   `-merge!`). A mark saves the maps' headers and retags the live ones; a
-  truncation puts the saved ones back.
+  truncation puts the saved ones back. The source-module registry likewise: per source its first
+  module, the sources with several, and the modules declared, as `AMap`s begun
+  from the parent's. That deleted `ResIndex` outright, the module set's sync
+  tables, the Env's source-module list, index and merge, and the AST state's
+  `resolution_parent`.
 - E. Under the JIT gate, the pool's memory below its last compaction is
   `mprotect`ed read-only, so a store into accepted state faults at the store.
 
