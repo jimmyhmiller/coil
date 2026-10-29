@@ -508,6 +508,23 @@ JIT suites, `build full`, nollvm and x64, and a measured line count:
   checker's prefix tests deleted: a compile's program is the Env's, extended.
 - D. The loader's lists, declarations, imports/exports, registries and the native
   program; the rest of "What goes" deleted; accept is one sharing copy.
+  Done first, because a profile put it first: the declaration table. A REPL
+  submission over ~600 definitions spent ~70% of its time rebuilding it. The
+  parent's catalog came in as one pseudo-form per module and was merged into
+  fresh lists, every module was re-indexed, and every name was hashed to diff
+  against the last resolve. The table is now an `AVec` of entries whose name
+  lists are `AVec`s and whose index is an `AMap`. A compile's table is the
+  parent's under a fresh tag, with the compile's own declarations added and
+  indexed as they go. An entry is retagged the first time it is added to; a
+  submission's alias replaces an inherited pair in place. Two resolves of a view
+  compare the tables of their own forms. The whole tables are compared only when
+  names are retired or the last resolve was another view's (a metaprogram
+  context shares the compile's workspace). Accept stores the table as it is, and
+  the Env's copy shares the parent's nodes. Deleted: the pseudo-forms,
+  `TBox`/`table-getc`/`merge-defs!`, `defs-index-build!` and the scan fallback
+  (`built`), and `env-declarations-over` with its six helpers. 1,000 definitions
+  in one session: 26.5 s, down from 39.8 s. A small `AVec` now has a small tail
+  (4, doubling to 32), since per-form declaration lists hold a name or two.
 - E. Under the JIT gate, the pool's memory below its last compaction is
   `mprotect`ed read-only, so a store into accepted state faults at the store.
 
