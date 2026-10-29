@@ -287,6 +287,37 @@ compaction grows 33 KB per submission, and the rest is the JIT's code.
   added and 2.5–4k removed across the loader, resolver, checker, metaengine and
   driver.
 
+### Measuring memory
+
+Memory is named by whoever holds it, never inferred from resident size:
+
+- `coil.memory` accounts: an account is an allocator that counts what is live
+  through it (bytes, peak, blocks), in a tree under `account-root`. The compiler
+  gives each use of scratch its own (`large-pages/compiler-scratch-for NAME`:
+  `unit.revision`, `unit.command`, `env.pool`, `code.session`, `jit.metadata`, …),
+  and JIT pages are charged to `jit.images`. The report's `unaccounted` line is the
+  resident size less every account.
+- Sites: `COIL_MEMORY_SITES=NAME,…` (or `all`) charges each block to the stack
+  that allocated it; an arena observing an account (`ScratchArena::observe!`)
+  charges every allocation it carves, exactly, through mark rewinds and resets.
+- `persist-footprint`: what a value owns by field path, from the Persist derive.
+- `coil repl`'s `:memory` prints the tree and the compiler state's footprint;
+  under `COIL_TRACE` each accept counts every account (`memory.<name>`) and
+  `memory.env.owned`, and `repl-growth.py` reports the slope of each and bounds
+  the compiler state's with `--max-env-slope-kb`.
+
+What it found on the first pass, each a per-submission leak or copy:
+
+| Found | Per submission, before | Fix |
+|---|---|---|
+| the `<metashim>` source text registered again by every compile, kept in the `Env` | 19.5 KB kept | registered once (`ls-source-named`) |
+| arenas reset every transaction (Code session state), per JIT generation, per LLVM run, the reader cache and the project manifest took segments from the session's own arena, which keeps what is freed into it | 33 KB in `unit.command` | their segments come from accounted large pages |
+| every JIT image defined fresh storage, and an initializer, for every `def` the session had accepted (mono reused the accepted constant as a definition), so each image imported every `--impl` and `Var` | 79 KB in `jit.metadata`, plus code | the reused constant is a declaration |
+
+200-submission REPL session afterwards: resident slope 137 → 50 KB per
+submission (32 KB of it JIT pages: an image is at least one code and one data
+page), the compiler state 14 KB.
+
 ### Step 4 — save and load
 
 - `(derive Persist T)` also derives `Serialize` and `Deserialize` through

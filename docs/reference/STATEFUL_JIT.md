@@ -48,6 +48,7 @@ metaprogram, does this printing.
 | `:load NAMESPACE` | Import a module (from the project, when run in one) |
 | `:compile FORMS` | Submit arbitrary top-level forms, including metaprogram registrations |
 | `:defs` | List current definitions |
+| `:memory` | What holds the process's memory (an account per use), and what the compiler state owns, by field |
 | `:reset` | Throw away the environment and start fresh |
 | `:cancel` | Abandon a half-typed multi-line form |
 | `:help`, `:quit` | |

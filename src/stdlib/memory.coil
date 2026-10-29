@@ -1,0 +1,586 @@
+;;; Where a program's memory is: accounts.
+;;;
+;;;   (import "coil.memory" :use *)
+;;;   (let [cache (account-new "cache" (account-root) (malloc-allocator))
+;;;         a (account-allocator cache)]
+;;;     … allocate through a …
+;;;     (print-str (stdout) (account-report (malloc-allocator)))
+;;;     (account-free! cache))
+;;;
+;;; An account is an allocator that passes every request to the allocator it
+;;; wraps and counts what is live through it: bytes, the most bytes it ever held,
+;;; and blocks. Accounts form a tree under `account-root`, and a report prints the
+;;; tree with each account's bytes and those of everything under it, so memory is
+;;; named by whoever holds it rather than inferred. Wrap the allocator an arena
+;;; takes its segments from and its account holds what the arena reserved; wrap
+;;; the allocator a table grows in and it holds the table.
+;;;
+;;; The counts are exact: every Allocator request carries the size its free
+;;; repeats. They are updated atomically, so threads may share an account. Memory
+;;; an account holds that never passed through an allocator (pages a program maps
+;;; itself) is entered with `account-charge!` and `account-credit!`. What the
+;;; process holds that no account names is the report's `unaccounted` line: the
+;;; resident size the operating system reports, less every account's total.
+;;; Freeing an account that still holds memory is an error: something it handed
+;;; out outlived it, and the report would have lost it.
+;;;
+;;; SITES say which code holds an account's memory. `COIL_MEMORY_SITES` names the
+;;; accounts that record them (`unit.command,env.pool`, or `all`): each block they
+;;; hand out is charged to the call stack that asked for it, the report lists the
+;;; stacks that hold the most, and a free uncharges its stack. An arena given a
+;;; site table (`scratch/ScratchArena::record-sites!`) charges each allocation
+;;; carved from it, which is where an arena-built program's memory is decided.
+;;; Recording a stack per block is slow; it is for finding out, not for running.
+(module coil.memory)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.atomic" :as atomic)
+(import "coil.str" :use *)
+(import "coil.slice" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.mem" :as mem)
+(import "coil.control" :use *)
+(import "coil.panic" :use [panic])
+(import "coil.os" :use [os-pick-with-none])
+(import "coil.hashmap" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.cc" :as cc)
+
+(export Account Sites account-root account-new account-free! account-allocator
+        account-sites sites-wanted? sites-record! sites-release! sites-clear! sites-observer
+        account-charge! account-credit!
+        account-name account-children
+        account-live account-total account-peak account-blocks account-report
+        process-resident-bytes)
+
+(defstruct Account
+  [(name (slice u8))
+   (inner (dyn Allocator))
+   (parent (ptr Account))
+   (first-child (ptr Account))
+   (next-sibling (ptr Account))
+   (live i64)
+   (peak i64)
+   (blocks i64)
+   ; the stacks its blocks came from, when `COIL_MEMORY_SITES` names it; null otherwise
+   (sites (ptr Sites))])
+
+;;; The account every other one is under. It wraps nothing and allocates nothing.
+(defn account-root [] (-> (ptr Account))
+  (let [root (primitive/alloc-static Account)]
+    (when (= (len (.name root)) 0)
+      (set! (.name root) "process")
+      0)
+    root))
+
+;;; Held while the tree is linked or walked; accounts come and go far less often
+;;; than they allocate, so a spin is enough.
+(defn account--tree-lock [] (-> (ptr i64))
+  (primitive/alloc-static i64))
+
+(defn account--lock! [] (-> i64)
+  (loop (if (= (atomic/cas (account--tree-lock) 0 1) 0)
+            (break)
+            0))
+  0)
+
+(defn account--unlock! [] (-> i64)
+  (atomic/store (account--tree-lock) 0))
+
+;;; A new account named NAME under PARENT (the root when null), passing requests
+;;; to INNER. The account and its name live until `account-free!`.
+(defn account-new [(name (slice u8)) (parent (ptr Account)) (inner (dyn Allocator))] (-> (ptr Account))
+  (let [a (malloc-allocator)
+        under (if (= (primitive/cast i64 parent) 0) (account-root) parent)
+        acct (match (create [Account] a) (Some [p] p) (None [] (oom)))
+        (mut owned) (match (alloc [u8] a (len name)) (Some [s] s) (None [] (oom)))]
+    (unless (= (len name) 0)
+      (mem/copy (data owned) (data name) (len name))
+      0)
+    (store! acct (primitive/zeroed Account))
+    (set! (.name acct) owned)
+    (set! (.inner acct) inner)
+    (set! (.parent acct) under)
+    (when (sites-wanted? name)
+      (set! (.sites acct) (sites-new))
+      0)
+    (account--lock!)
+    (set! (.next-sibling acct) (.first-child under))
+    (set! (.first-child under) acct)
+    (account--unlock!)
+    acct))
+
+;;; Remove ACCT from the tree and free it. It must hold nothing, and have no
+;;; accounts under it.
+(defn account-free! [(acct (ptr Account))] (-> i64)
+  (unless (= (atomic/read (field acct live)) 0)
+    (panic "account '{}' freed while it holds {} bytes: memory it handed out outlived it"
+           (.name acct) (atomic/read (field acct live))))
+  (unless (= (primitive/cast i64 (.first-child acct)) 0)
+    (panic "account '{}' freed while account '{}' is under it" (.name acct) (.name (.first-child acct))))
+  (account--lock!)
+  (let [parent (.parent acct)]
+    (if (= (primitive/cast i64 (.first-child parent)) (primitive/cast i64 acct))
+        (set! (.first-child parent) (.next-sibling acct))
+        (let [(mut at) (.first-child parent)]
+          (loop (if (= (primitive/cast i64 (.next-sibling (load at))) (primitive/cast i64 acct))
+                    (do (set! (.next-sibling (load at)) (.next-sibling acct)) (break))
+                    (store! at (.next-sibling (load at))))))))
+  (account--unlock!)
+  (unless (= (primitive/cast i64 (.sites acct)) 0)
+    (sites-free! (.sites acct))
+    0)
+  (free [u8] (malloc-allocator) (.name acct))
+  (free [Account] (malloc-allocator) (slice::new acct 1))
+  0)
+
+;;; ACCT as an allocator: what is allocated through it is counted in it.
+(defn account-allocator [(acct (ptr Account))] (-> (dyn Allocator))
+  (primitive/make-dyn Allocator acct))
+
+(defn account--add! [(acct (ptr Account)) (bytes i64) (blocks i64)] (-> i64)
+  (let [now (+ (atomic/add (field acct live) bytes) bytes)]
+    (atomic/add (field acct blocks) blocks)
+    (loop (let [peak (atomic/read (field acct peak))]
+            (if (or (<= now peak) (= (atomic/cas (field acct peak) peak now) peak))
+                (break)
+                0)))
+    0))
+
+;;; Whether ACCT charges its own blocks to their sites: it records sites, and no
+;;; arena charges the allocations it carves from them instead.
+(defn account--sites-blocks? [(acct (ptr Account))] (-> bool)
+  (and (!= (primitive/cast i64 (.sites acct)) 0)
+       (= (atomic/read (field (.sites acct) arenas)) 0)))
+
+(impl Allocator Account
+  (allocate [(self (ptr Account)) (request (ref AllocRequest))] (-> (Option (ptr i8)))
+    (match (raw-alloc (.inner self) (load request))
+      (None [] (None [(ptr i8)]))
+      (Some [p] (do (account--add! self (.bytes request) 1)
+                    (when (account--sites-blocks? self)
+                      (sites-record! (.sites self) p (.bytes request))
+                      0)
+                    (Some p)))))
+  (resize [(self (ptr Account)) (memory (ptr i8)) (old (ref AllocRequest)) (new (ref AllocRequest))] (-> bool)
+    (if (raw-resize (.inner self) memory (load old) (load new))
+        (do (account--add! self (- (.bytes new) (.bytes old)) 0)
+            (when (account--sites-blocks? self)
+              (sites-release! (.sites self) memory (.bytes old))
+              (sites-record! (.sites self) memory (.bytes new))
+              0)
+            true)
+        false))
+  (remap [(self (ptr Account)) (memory (ptr i8)) (old (ref AllocRequest)) (new (ref AllocRequest))] (-> (Option (ptr i8)))
+    (match (raw-remap (.inner self) memory (load old) (load new))
+      (None [] (None [(ptr i8)]))
+      (Some [p] (do (account--add! self (- (.bytes new) (.bytes old)) 0)
+                    (when (account--sites-blocks? self)
+                      (sites-release! (.sites self) memory (.bytes old))
+                      (sites-record! (.sites self) p (.bytes new))
+                      0)
+                    (Some p)))))
+  (deallocate [(self (ptr Account)) (memory (ptr i8)) (request (ref AllocRequest))] (-> i64)
+    (raw-free (.inner self) memory (load request))
+    (when (account--sites-blocks? self)
+      (sites-release! (.sites self) memory (.bytes request))
+      0)
+    (account--add! self (- 0 (.bytes request)) -1)))
+
+;;; Count BYTES in BLOCKS that ACCT holds without having allocated them.
+(defn account-charge! [(acct (ptr Account)) (bytes i64) (blocks i64)] (-> i64)
+  (account--add! acct bytes blocks))
+
+;;; Uncount what `account-charge!` counted, once ACCT no longer holds it.
+(defn account-credit! [(acct (ptr Account)) (bytes i64) (blocks i64)] (-> i64)
+  (account--add! acct (- 0 bytes) (- 0 blocks)))
+
+;;; The stacks ACCT's blocks came from, or null when it does not record them.
+(defn account-sites [(acct (ptr Account))] (-> (ptr Sites))
+  (.sites acct))
+
+;;; ACCT's name.
+(defn account-name [(acct (ptr Account))] (-> (slice u8))
+  (.name acct))
+
+;;; The accounts directly under ACCT, newest first, in a list in A.
+(defn account-children [(acct (ptr Account)) (a (dyn Allocator))] (-> (ArrayList (ptr Account)))
+  (let [(mut out) (ArrayList::new [(ptr Account)] a)]
+    (account--lock!)
+    (let [(mut child) (.first-child acct)]
+      (loop (if (= (primitive/cast i64 (load child)) 0)
+                (break)
+                (do (push! (mut out) (load child))
+                    (store! child (.next-sibling (load child)))))))
+    (account--unlock!)
+    (load out)))
+
+;;; Bytes live through ACCT itself.
+(defn account-live [(acct (ptr Account))] (-> i64)
+  (atomic/read (field acct live)))
+
+;;; The most bytes ACCT itself ever held at once.
+(defn account-peak [(acct (ptr Account))] (-> i64)
+  (atomic/read (field acct peak)))
+
+;;; Blocks live through ACCT itself.
+(defn account-blocks [(acct (ptr Account))] (-> i64)
+  (atomic/read (field acct blocks)))
+
+;;; Bytes live through ACCT and every account under it.
+(defn account-total [(acct (ptr Account))] (-> i64)
+  (account--lock!)
+  (let [n (account--total acct)]
+    (account--unlock!)
+    n))
+
+(defn account--total [(acct (ptr Account))] (-> i64)
+  (let [(mut n) (atomic/read (field acct live))
+        (mut child) (.first-child acct)]
+    (loop (if (= (primitive/cast i64 (load child)) 0)
+              (break)
+              (do (store! n (+ (load n) (account--total (load child))))
+                  (store! child (.next-sibling (load child))))))
+    (load n)))
+
+;;; The tree under the root as text, allocated from A: one line per account,
+;;; indented under its parent, with what it and everything under it holds, what
+;;; it holds itself, its blocks and its peak.
+(defn account-report [(a (dyn Allocator))] (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)]
+    (account--lock!)
+    (account--report-into (mut out) (account-root) 0)
+    (match (process-resident-bytes)
+      (Some [resident]
+        (do (push-str! (mut out) "resident ")
+            (account--push-bytes! (mut out) resident)
+            (push-str! (mut out) "  unaccounted ")
+            (account--push-bytes! (mut out) (- resident (account--total (account-root))))
+            (push-str! (mut out) "\n")))
+      (None [] 0))
+    (account--unlock!)
+    (finish! (mut out))))
+
+(defn account--report-into [(out (mut StrBuf)) (acct (ptr Account)) (depth i64)] (-> i64)
+  (for [i 0 depth] (push-str! (mut out) "  "))
+  (push-str! (mut out) (.name acct))
+  (push-str! (mut out) "  total ")
+  (account--push-bytes! (mut out) (account--total acct))
+  (push-str! (mut out) "  own ")
+  (account--push-bytes! (mut out) (atomic/read (field acct live)))
+  (push-str! (mut out) " in ")
+  (push-i64! (mut out) (atomic/read (field acct blocks)))
+  (push-str! (mut out) " blocks  peak ")
+  (account--push-bytes! (mut out) (atomic/read (field acct peak)))
+  (push-str! (mut out) "\n")
+  (unless (= (primitive/cast i64 (.sites acct)) 0)
+    (sites--report-into (mut out) (.sites acct) (+ depth 1) 8)
+    0)
+  (let [(mut child) (.first-child acct)]
+    (loop (if (= (primitive/cast i64 (load child)) 0)
+              (break)
+              (do (account--report-into (mut out) (load child) (+ depth 1))
+                  (store! child (.next-sibling (load child)))))))
+  0)
+
+;;; N bytes, in the largest unit that keeps it at or over one.
+(defn account--push-bytes! [(out (mut StrBuf)) (n i64)] (-> i64)
+  (cond (< n 0) (do (push-str! (mut out) "-") (account--push-bytes! (mut out) (- 0 n)))
+        (>= n 1048576) (do (push-i64! (mut out) (/ n 1048576)) (push-str! (mut out) ".")
+                           (push-i64! (mut out) (/ (* (% n 1048576) 10) 1048576)) (push-str! (mut out) " MB"))
+        (>= n 1024) (do (push-i64! (mut out) (/ n 1024)) (push-str! (mut out) " KB"))
+        :else (do (push-i64! (mut out) n) (push-str! (mut out) " B")))
+  0)
+
+;; ---- the process's resident size ---------------------------------------------
+(extern getpagesize :cc (cc/C) [] (-> i32))
+; Declared on every system; a declaration no emitted code calls links nothing.
+(extern open :cc (cc/C) [(ptr i8) i32 ...] (-> i32))
+(extern read :cc (cc/C) [i32 (ptr i8) isize] (-> isize))
+(extern close :cc (cc/C) [i32] (-> i32))
+(extern task_self_trap :cc (cc/C) [] (-> u32))
+(extern task_info :cc (cc/C) [u32 i32 (ptr i32) (ptr u32)] (-> i32))
+
+;;; The definition of `process--resident` for the operating system compiled for:
+;;; each reads what only its own system has, so only one is ever emitted.
+(defn process--resident-defs [(name Code)] (-> Code)
+  ; hygiene: NAME is defined at the module's top level, where the caller names it.
+  (let [n (primitive/syntax->datum name)]
+  (os-pick-with-none
+    ; Linux: the second field of /proc/self/statm, in pages.
+    `(do
+       (defn ~n [] (-> (Option i64))
+         (let [fd (open c"/proc/self/statm" (: 0 i32))
+               buf (primitive/alloc-stack (array u8 128))]
+           (if (< fd (: 0 i32))
+               (None [i64])
+               (let [n (primitive/cast i64 (read fd (primitive/cast (ptr i8) buf) (primitive/cast isize 127)))
+                     (mut i) 0
+                     (mut pages) 0]
+                 (close fd)
+                 (loop (if (or (>= (load i) n) (= (load (primitive/index buf (load i))) (: 32 u8)))
+                           (break)
+                           (store! i (+ (load i) 1))))
+                 (store! i (+ (load i) 1))
+                 (loop (let [c (if (< (load i) n) (primitive/cast i64 (load (primitive/index buf (load i)))) 0)]
+                         (if (and (>= c 48) (<= c 57))
+                             (do (store! pages (+ (* (load pages) 10) (- c 48)))
+                                 (store! i (+ (load i) 1)))
+                             (break))))
+                 (Some (* (load pages) (primitive/cast i64 (getpagesize)))))))))
+    ; macOS: MACH_TASK_BASIC_INFO's resident_size, after virtual_size.
+    `(do
+       (defn ~n [] (-> (Option i64))
+         (let [info (primitive/alloc-stack (array i64 6))
+               count (primitive/alloc-stack u32)]
+           (store! count (: 12 u32))
+           (if (= (task_info (task_self_trap) (: 20 i32) (primitive/cast (ptr i32) info) count) (: 0 i32))
+               (Some (load (primitive/index info 1)))
+               (None [i64])))))
+    `(defn ~n [] (-> (Option i64))
+       (None [i64]))
+    `(defn ~n [] (-> (Option i64))
+       (None [i64])))))
+
+(process--resident-defs process--resident)
+
+;;; The bytes of the process's memory the operating system has resident, or None
+;;; where it has no such notion (wasm).
+(defn process-resident-bytes [] (-> (Option i64))
+  (process--resident))
+
+; ---- sites ---------------------------------------------------------------------
+(extern backtrace :cc (cc/C) [(ptr (ptr i8)) i32] (-> i32))
+(extern backtrace_symbols :cc (cc/C) [(ptr (ptr i8)) i32] (-> (ptr (ptr i8))))
+(extern getenv :cc (cc/C) [(ptr i8)] (-> (ptr i8)))
+(extern strlen :cc (cc/C) [(ptr i8)] (-> isize))
+
+;;; Frames kept per site, and the innermost ones skipped: the recording itself.
+(const SITE-FRAMES 14)
+(const SITE-SKIP 2)
+
+;;; One call stack, and what is live that it allocated.
+(defstruct Site [(frames (array (ptr i8) 14)) (n i64) (bytes i64) (blocks i64)])
+
+;;; A table of sites: each stack once, and, for blocks that may be freed one by
+;;; one, which site each live block was charged to.
+(defstruct Sites
+  [(lock i64)
+   (index (HashMap i64 i64))
+   (sites (ArrayList Site))
+   (live (HashMap i64 i64))
+   ; arenas charging their allocations here (`sites-observer`); while there are
+   ; any, the segments they take from the account are not charged as well
+   (arenas i64)])
+
+(defn memory--native [(code Code)] (-> Code)
+  (match (target-arch)
+    (Wasm32 [] `0)
+    (Wasm64 [] `0)
+    (_ code)))
+
+(defn sites-new [] (-> (ptr Sites))
+  (let [a (malloc-allocator)
+        s (match (create [Sites] a) (Some [p] p) (None [] (oom)))]
+    (store! s (Sites :lock 0 :index (HashMap::new [i64 i64] a (i64-keyops))
+                     :sites (ArrayList::new [Site] a)
+                     :live (HashMap::new [i64 i64] a (i64-keyops))
+                     :arenas 0))
+    s))
+
+(defn sites-free! [(s (ptr Sites))] (-> i64)
+  (free! (mut (.index s)))
+  (free! (mut (.sites s)))
+  (free! (mut (.live s)))
+  (free [Sites] (malloc-allocator) (slice::new s 1))
+  0)
+
+;;; Whether `COIL_MEMORY_SITES` names NAME (or is `all`).
+(defn sites-wanted? [(name (slice u8))] (-> bool)
+  (let [v (getenv c"COIL_MEMORY_SITES")]
+    (if (= (primitive/cast i64 v) 0)
+        false
+        (let [names (slice::new [u8] (primitive/cast (ptr u8) v) (primitive/cast i64 (strlen v)))
+              (mut at) 0
+              (mut found) false]
+          (for [i 0 (+ (len names) 1)]
+            (when (or (= i (len names)) (= (get names i) (: 44 u8)))
+              (let [one (subslice names (load at) i)]
+                (when (or (= one name) (= one "all")) (store! found true))
+                (store! at (+ i 1)))))
+          (load found)))))
+
+(defn sites--lock! [(s (ptr Sites))] (-> i64)
+  (loop (if (= (atomic/cas (field s lock) 0 1) 0) (break) 0))
+  0)
+
+;;; Charge BYTES of the block at P (null for a block freed only with its arena) to
+;;; the stack that is allocating it. Returns the site charged.
+(defn sites-record! [(s (ptr Sites)) (p (ptr i8)) (bytes i64)] (-> i64)
+  (let [site (primitive/alloc-stack Site)]
+    (store! site (primitive/zeroed Site))
+    (set! (.n site)
+          (memory--native (primitive/cast i64 (backtrace (primitive/cast (ptr (ptr i8)) (field site frames))
+                                                         (primitive/cast i32 SITE-FRAMES)))))
+    (let [(mut key) 1469598103934665603]
+      (for [i SITE-SKIP (.n site)]
+        (store! key (* (^ (load key) (primitive/cast i64 (load (primitive/index (field site frames) i))))
+                       1099511628211)))
+      (sites--lock! s)
+      (let [at (match (get (.index s) (load key))
+                 (Some [k] k)
+                 (None [] (let [k (len (.sites s))]
+                            (push! (mut (.sites s)) (load site))
+                            (set! (mut (.index s)) (load key) k)
+                            k)))
+            entry (elem (field s sites) at)]
+        (set! (.bytes entry) (+ (.bytes entry) bytes))
+        (set! (.blocks entry) (+ (.blocks entry) 1))
+        (unless (= (primitive/cast i64 p) 0)
+          (set! (mut (.live s)) (primitive/cast i64 p) at)
+          0)
+        (atomic/store (field s lock) 0)
+        at))))
+
+;;; Uncharge BYTES of the block at P from the stack it was charged to.
+(defn sites-release! [(s (ptr Sites)) (p (ptr i8)) (bytes i64)] (-> i64)
+  (sites--lock! s)
+  (match (get (.live s) (primitive/cast i64 p))
+    (Some [at] (let [entry (elem (field s sites) at)]
+                 (set! (.bytes entry) (- (.bytes entry) bytes))
+                 (set! (.blocks entry) (- (.blocks entry) 1))
+                 (remove! (mut (.live s)) (primitive/cast i64 p))
+                 0))
+    (None [] 0))
+  (atomic/store (field s lock) 0)
+  0)
+
+;;; Uncharge everything: what an arena handed out is gone when it resets.
+(defn sites-clear! [(s (ptr Sites))] (-> i64)
+  (sites--lock! s)
+  (clear! (mut (.index s)))
+  (clear! (mut (.sites s)))
+  (clear! (mut (.live s)))
+  (atomic/store (field s lock) 0)
+  0)
+
+;;; The TOP sites holding the most, each with its frames, indented DEPTH.
+(defn sites--report-into [(out (mut StrBuf)) (s (ptr Sites)) (depth i64) (top i64)] (-> i64)
+  (sites--lock! s)
+  (let [n (len (.sites s))
+        (mut order) (ArrayList::new [i64] (malloc-allocator))]
+    (for [i 0 n] (push! (mut order) i))
+    ; the TOP largest first
+    (for [i 0 (if (< top n) top n)]
+      (let [(mut best) i]
+        (for [j (+ i 1) n]
+          (when (> (.bytes (elem (field s sites) (get order j)))
+                   (.bytes (elem (field s sites) (get order (load best)))))
+            (store! best j)))
+        (let [t (get order i)]
+          (set! (mut order) i (get order (load best)))
+          (set! (mut order) (load best) t))
+        (let [site (elem (field s sites) (get order i))]
+          (when (> (.bytes site) 0)
+            (for [k 0 depth] (push-str! (mut out) "  "))
+            (account--push-bytes! (mut out) (.bytes site))
+            (push-str! (mut out) " in ")
+            (push-i64! (mut out) (.blocks site))
+            (push-str! (mut out) " blocks from\n")
+            (sites--frames-into (mut out) site (+ depth 1))
+            0))))
+    (free! (mut order)))
+  (atomic/store (field s lock) 0)
+  0)
+
+(defn sites--frames-into [(out (mut StrBuf)) (site (ptr Site)) (depth i64)] (-> i64)
+  (memory--native
+    (let [n (- (.n site) SITE-SKIP)
+          names (backtrace_symbols (primitive/index (primitive/cast (ptr (ptr i8)) (field site frames)) SITE-SKIP)
+                                   (primitive/cast i32 n))]
+      (unless (= (primitive/cast i64 names) 0)
+        (for [i 0 n]
+          (let [name (load (primitive/index names i))]
+            (for [k 0 depth] (push-str! (mut out) "  "))
+            (push-str! (mut out) (slice::new [u8] (primitive/cast (ptr u8) name) (primitive/cast i64 (strlen name))))
+            (push-str! (mut out) "\n")))
+        (primitive/free (primitive/cast (ptr i8) names))
+        0)
+      0))
+  0)
+
+;;; One arena's charges to a site table, in the order it allocated: a rewind
+;;; gives back the newest. `log` holds (site, bytes) pairs.
+(defstruct ArenaSites [(sites (ptr Sites)) (log (ArrayList i64)) (observer scratch/ScratchObserver)])
+
+;;; An observer for one arena (`scratch/ScratchArena::observe!`) that charges each
+;;; of its allocations to S, by stack, and uncharges what the arena gives back.
+(defn sites-observer [(s (ptr Sites))] (-> (ptr scratch/ScratchObserver))
+  (let [a (malloc-allocator)
+        o (match (create [ArenaSites] a) (Some [p] p) (None [] (oom)))]
+    (store! o (primitive/zeroed ArenaSites))
+    (set! (.sites o) s)
+    (set! (.log o) (ArrayList::new [i64] a))
+    (set! (.observer o)
+          (scratch/ScratchObserver :cx (primitive/cast (ptr i8) o)
+                                   :record (fnptr-of arena-sites--record)
+                                   :resize (fnptr-of arena-sites--resize)
+                                   :length (fnptr-of arena-sites--length)
+                                   :rewind (fnptr-of arena-sites--rewind)
+                                   :clear (fnptr-of arena-sites--clear)
+                                   :release (fnptr-of arena-sites--release)))
+    (atomic/add (field s arenas) 1)
+    (field o observer)))
+
+(defn arena-sites--record [(cx (ptr i8)) (p (ptr i8)) (bytes i64)] (-> i64)
+  (let [o (primitive/cast (ptr ArenaSites) cx)
+        s (.sites o)]
+    (push! (mut (.log o)) (sites-record! s (primitive/cast (ptr i8) 0) bytes))
+    (push! (mut (.log o)) bytes)
+    0))
+
+(defn arena-sites--uncharge! [(s (ptr Sites)) (at i64) (bytes i64)] (-> i64)
+  (sites--lock! s)
+  (let [entry (elem (field s sites) at)]
+    (set! (.bytes entry) (- (.bytes entry) bytes))
+    (set! (.blocks entry) (- (.blocks entry) 1)))
+  (atomic/store (field s lock) 0)
+  0)
+
+(defn arena-sites--resize [(cx (ptr i8)) (bytes i64)] (-> i64)
+  (let [o (primitive/cast (ptr ArenaSites) cx)
+        n (len (.log o))]
+    (when (>= n 2)
+      (let [at (get (.log o) (- n 2))
+            old (get (.log o) (- n 1))
+            s (.sites o)]
+        (sites--lock! s)
+        (set! (.bytes (elem (field s sites) at)) (+ (.bytes (elem (field s sites) at)) (- bytes old)))
+        (atomic/store (field s lock) 0)
+        (set! (mut (.log o)) (- n 1) bytes)
+        0))
+    0))
+
+(defn arena-sites--length [(cx (ptr i8))] (-> i64)
+  (/ (len (.log (primitive/cast (ptr ArenaSites) cx))) 2))
+
+(defn arena-sites--rewind [(cx (ptr i8)) (keep i64)] (-> i64)
+  (let [o (primitive/cast (ptr ArenaSites) cx)]
+    (loop (if (<= (len (.log o)) (* keep 2))
+              (break)
+              (let [n (len (.log o))]
+                (arena-sites--uncharge! (.sites o) (get (.log o) (- n 2)) (get (.log o) (- n 1)))
+                (pop! (mut (.log o)))
+                (pop! (mut (.log o))))))
+    0))
+
+(defn arena-sites--clear [(cx (ptr i8))] (-> i64)
+  (arena-sites--rewind cx 0))
+
+(defn arena-sites--release [(cx (ptr i8))] (-> i64)
+  (let [o (primitive/cast (ptr ArenaSites) cx)]
+    (arena-sites--rewind cx 0)
+    (atomic/sub (field (.sites o) arenas) 1)
+    (free! (mut (.log o)))
+    (free [ArenaSites] (malloc-allocator) (slice::new o 1))
+    0))
