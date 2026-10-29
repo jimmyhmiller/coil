@@ -316,6 +316,22 @@ Measured, 200 one-line `coil repl` submissions: median 12.3 → 8.2 ms with no
 slope over the session; accept copies ~135 KB a submission into the pool (was
 ~680 KB and growing with the session), flat.
 
+What the pool carves per accept, by site (`COIL_MEMORY_SITES=env.pool` over a
+window with no compaction; `memory.env.pool.carved` per accept), then went:
+
+| Copied whole every accept | Fix |
+|---|---|
+| the declaration table's spine, both layers | kept when the compile lists the prior modules first, in order |
+| the import and export tables: a compile copies every module's lists before adding to them | compared by records; an entry that only gained some is appended to |
+| the metaprogram entries and quasiquote registries | unchanged positions stay (`env-list-replacing`) |
+| mono's tables: it set up the runtime program, whose impl list lost the impls of compile-time types from the middle | set up over the checked program, which keeps the prefix |
+| the metaprogram environment: every round read the shim (`metashim.coil`) again, and its fresh records sat after the closure's, so the closure check could not build on the environment's tables and the layer was rebuilt | each shim import, struct, extern and function is added only when the program or the environment lacks it; a closure's filtered inherent impl matches the environment's by its methods (`setup-same-impl?`) |
+
+142 → 32 KB carved per accept (median), 200 submissions without a
+compaction; resident slope 142 → 72 KB per submission, 32 KB of it JIT pages
+(an image is at least a code and a data page). Under `COIL_TRACE`, a check that
+cannot build on its base says why (`check.base-miss.structs`, `…impls`, …).
+
 ### Measuring memory
 
 Memory is named by whoever holds it, never inferred from resident size:
