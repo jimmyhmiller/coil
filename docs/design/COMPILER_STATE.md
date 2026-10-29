@@ -506,6 +506,29 @@ JIT suites, `build full`, nollvm and x64, and a measured line count:
   carves 43 KB of the pool against 34 KB: each new record copies its path.
 - C. `Program`'s lists on `AVec`; `semantic-inherit-program!`'s copying and the
   checker's prefix tests deleted: a compile's program is the Env's, extended.
+  Re-planned from a profile of a session at 1,000+ definitions. The cost was
+  passes that walk everything accepted, so those went first; the copies they
+  walk mattered less:
+  - Declarations: see D below.
+  - The table diff between a compile's two views (the strict resolve and the
+    macro context): it now looks only past the leaves the lists share
+    (`avec-shared-prefix`). The metaprogram view no longer re-adds its shim
+    module's 38 names every compile.
+  - Compile-time units: their positions are renumbered only when their sources
+    moved.
+  - Constants: an accepted one is not ordered or validated again.
+  - Compile-time code (`code-phase-funcs`): the Env keeps the accepted
+    functions' classification, and a compile walks only the functions it adds.
+  - Export validation: no longer quadratic.
+  - Constant lengths: only records past the inherited prefix are walked.
+
+  1,000 definitions in one session: 39.8 s before, 20–22 s after (this machine is
+  shared, and runs vary by that much). What still grows per compile is hash
+  tables built over every name (`prog-fn-names`, the function index, the impl
+  check's `present` set, phase classification's `queued`) and the copies of the
+  inherited lists. Each would be a persistent index carried on the Env, as the
+  declaration table is. That is the rest of this stage, together with the list
+  conversion. Measured at 1,000 definitions: about 15% of a submission.
 - D. The loader's lists, declarations, imports/exports, registries and the native
   program; the rest of "What goes" deleted; accept is one sharing copy.
   Done first, because a profile put it first: the declaration table. A REPL
