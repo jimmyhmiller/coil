@@ -422,6 +422,72 @@ Pipeline differential against stage 1: 208 dumps, 0 differ. `coil repl`, 200
 submissions: 8.4 ms median, 33 KB carved and 12 KB kept per accept, as before.
 src/compiler net −100 lines.
 
+### Step 3c — persistent tables for everything the Env holds
+
+Stage 2 showed the mechanism works. A compile still reads the Env through
+hand-written two-level lookups everywhere but the checker (`LS.parent`,
+`resolution_parent`, the semantic maps' base), and the program and loader lists are
+copied into every compile and appended back by ~550 lines of `env.coil`. This step
+puts every table the Env holds on `coil.avec`/`coil.amap`, so a compile starts
+from the Env's tables as they are and accept is one sharing copy.
+
+**Evidence.**
+
+- *How others do it* (survey, sources in the session scratchpad): OCaml keeps every
+  table of its typing environment a persistent tree and swaps the toplevel's env
+  per phrase; Clojure's transients edit only the nodes carrying their edit token
+  (what `coil.avec`/`coil.amap` do); Lean 4's `SMap` paired a flat `HashMap` for a
+  very large imported set with a persistent map for local additions; Roslyn's
+  scripting walks the chain of previous submissions on every lookup, under a
+  "TODO: optimize lookup". The layered chain is the pattern to avoid; persistent
+  structures throughout are the plain answer, and Lean's staging is an
+  optimization for an imported set far bigger than ours.
+- *What persistent tables cost* (`tables_bench`, arena-backed): `coil.amap` is
+  built as Clojure's `PersistentHashMap` (bitmap nodes of up to 16 slots, full
+  nodes of 32 children past that, collision nodes; owned bitmap nodes grow in place
+  with room to spare). Against `HashMap`, at 10k entries: insert 24 vs 10 ns, get
+  5 vs 4 ns; string keys insert 56 vs 35 ns, get 23 vs 22 ns. At 1M: insert 60 vs
+  17 ns, get 45 vs 16 ns. Extending a shared 10k-entry map by 100: 19 µs and 71 KB,
+  against 883 µs and 1 MB to copy a `HashMap`. Vectors: push 7 vs 3 ns, random get
+  9 vs 4 ns at 1M.
+- *What the hot paths are* (`sample` of `coil check src/compiler/main.coil`, 723
+  active samples): semantic-map inserts and gets ~7%, the one table near a million
+  entries; a linear scan of trait methods (`methods-has`) ~6%, introduced by stage
+  2's conversion, which wants an index. At the measured ratios the semantic maps
+  cost a few percent of check, a small part of a build.
+- *What the Env is*: the first Env (the library a session starts with) owns
+  ~16 MB; each one-line submission adds ~12 KB.
+- *What goes*: in `env.coil`, 547 of 1,356 lines exist to append in place or copy
+  (the `env-*-over` family, imports/exports/declarations mergers, `env-keyed-*`,
+  `env-refs-next!`, `env-source-modules-next!`, the in-place half of
+  `env-native-next!`, `env-entry-modules`, `env-maps-over!`, `EnvTarget.extend`,
+  `env-exclusive?`); in the resolver, `semantic-inherit-program!` and the merge
+  copiers' inheritance use; in the loader, `ls-inherit!` and its list copiers; in
+  the checker, the prefix tests (`setup-base-miss`, `setup-impls-prefix?`,
+  `setup-same-impl?`); the registries' `resolution_parent` readers; the semantic
+  maps' over/under base.
+- *Conversion size*: `Program`'s lists are read at ~1,400 sites in 34 files, ~420 of
+  them on lines touching storage (`data`, `slice`, `box-al`, sorting). `AVec` gains
+  `ArrayList`'s surface (`elem`, `len`, `push!`, `get`, `set!`, iteration, carrying
+  its allocator as `ArrayList` does) so most sites compile as they are.
+
+**Stages**, each with a pipeline differential against the stage before, FAST, the
+JIT suites, `build full`, nollvm and x64, and a measured line count:
+
+- A. `coil.amap` as Clojure's hash trie (done here); `AVec` with `ArrayList`'s
+  surface and an allocator; a trait-method index in the checker.
+- B. The semantic maps on `AMap`; the over/under base deleted.
+- C. `Program`'s lists on `AVec`; `semantic-inherit-program!`'s copying and the
+  checker's prefix tests deleted: a compile's program is the Env's, extended.
+- D. The loader's lists, declarations, imports/exports, registries and the native
+  program; the rest of "What goes" deleted; accept is one sharing copy.
+- E. Under the JIT gate, the pool's memory below its last compaction is
+  `mprotect`ed read-only, so a store into accepted state faults at the store.
+
+Expected: −900 to −1,100 lines in `src/compiler`; ahead-of-time check a few
+percent slower (the semantic maps), measured at stage B; a REPL accept copies
+only what the submission made.
+
 ### Step 4 — save and load
 
 - `(derive Persist T)` also derives `Serialize` and `Deserialize` through

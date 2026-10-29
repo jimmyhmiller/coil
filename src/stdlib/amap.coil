@@ -1,60 +1,99 @@
-;;; A persistent hash map whose nodes live in arenas: `AMap[K V]`, a compressed
-;;; hash-array-mapped trie (CHAMP), like `coil.pmap`, without reference counts.
+;;; A persistent hash map whose nodes live in arenas: `AMap[K V]`, a hash array
+;;; mapped trie built as Clojure's `PersistentHashMap` is, with Clojure's
+;;; transient editing, and without reference counts.
 ;;;
-;;; EDITS follow `coil.avec`: a map carries an edit tag and a node the tag of the
-;;; map that made it; an edit changes a node in place only when the node carries
-;;; the map's tag, and copies any other, with the path above it, into the allocator
-;;; the edit is given. `amap-edit` gives a map a fresh tag, so a map made from
-;;; another by it can be edited and the other never changes. Nothing is counted
-;;; or freed.
+;;; NODES. A bitmap node holds up to 16 slots in hash-fragment order, each an
+;;; entry or a child, and a 32-bit bitmap saying which fragments are present. A
+;;; bitmap node that would take a 17th slot becomes a full node, 32 child
+;;; positions indexed by fragment, and a full node of 8 children that loses one
+;;; packs back into a bitmap node. Keys whose whole hashes are equal share a collision
+;;; node. Removal does not merge a child back into its parent, so the trie's
+;;; shape depends on how the map was built; the order it is walked in does not.
+;;;
+;;; EDITS. Every map carries an edit tag, and every node the tag of the map that
+;;; made it (Clojure's transient `edit`). An edit changes a node in place only
+;;; when the node carries the map's tag, and copies any other, with the path above
+;;; it, into the map's allocator; a bitmap node it owns grows with
+;;; room to spare (Clojure's `n + 4`), so building a map edits in place.
+;;; `amap-edit` gives a map a fresh tag, so a map made from another by it can be
+;;; edited and the other never changes. Nothing is counted or freed: a node lives
+;;; as long as its arena.
+;;;
+;;; SURFACE. A `HashMap`'s: `len`, `get` (an `Option`), `set!`, `remove!`,
+;;; `contains?`; `amap-entries` lists the entries. Edits allocate from the map's
+;;; allocator.
 ;;;
 ;;; KEYS are hashed and compared by a `coil.hashmap` `KeyOps` (`keyops`,
 ;;; `i64-keyops`, `scalar-keyops`): only its hash and equality are used. Keys and
 ;;; values are held by value; what they point to must live as long as the map.
 ;;;
-;;; SHAPE. Removing a key collapses a subtree left with one entry into its
-;;; parent, so a map's trie depends only on its keys. Iteration, and the bytes a
-;;; map is written as, are in trie order: two maps with the same entries write
-;;; the same bytes.
+;;; ORDER. A walk visits keys in the order of their hashes' 5-bit fragments, low
+;;; first, whatever the trie's shape: a bitmap node's slots and a full node's
+;;; children are both in fragment order. Keys with equal hashes keep the order
+;;; they were put in. A map is written in that order, so two maps holding the same
+;;; entries, put in the same order where hashes are equal, write the same bytes.
+;;;
+;;; PERSIST. `persist-clone-sharing` copies only the nodes the target memory does
+;;; not hold.
 (module coil.amap)
 (import "coil.primitive" :as primitive)
 (import "coil.alloc" :use *)
 (import "coil.hashmap" :use [KeyOps])
-(import "coil.panic" :use [panic])
 (import "coil.arraylist" :use *)
 (import "coil.persist" :use *)
 (import "coil.avec" :use [edit-tag-new])
 
-(export AMap AMNode AMEntry amap-new amap-edit amap-retag amap-get amap-put! amap-remove! amap-entries)
+(export AMap AMNode AMEntry AMKind amap-new amap-edit amap-retag amap-entries)
 
-(defstruct AMEntry [K V] [(hash i64) (key K) (val V)])
+;;; A slot of a bitmap or collision node: an entry (KEY, VAL, the key's HASH), or,
+;;; when CHILD is set, a child node in the entry's place.
+(defstruct AMEntry [K V] [(hash i64) (key K) (val V) (child (ptr (AMNode K V)))])
 
-;;; A node. `datamap` has a bit for each hash fragment held as an entry here,
-;;; `nodemap` for each held as a child; entries and children are in bit order. A
-;;; node below every hash bit (`amap--collision?`) holds entries of one hash in
-;;; any order, and no children.
+(defsum AMKind
+  ;;; Up to 16 slots, the fragments of which `bitmap` says.
+  (Bitmap)
+  ;;; 32 child positions, indexed by fragment.
+  (Full)
+  ;;; Entries whose hashes are all `hash`.
+  (Collision))
+
+;;; A node. A bitmap or collision node uses `slots` (`count` of them live, room
+;;; for `cap`); a full node uses `children` (32 positions, `count` of them set).
 (defstruct AMNode [K V]
   [(tag i64)
-   (datamap i64)
-   (nodemap i64)
-   (nentries i64)
-   (nchildren i64)
-   (entries (ptr (AMEntry K V)))
+   (kind AMKind)
+   (bitmap i64)
+   (hash i64)
+   (count i64)
+   (cap i64)
+   (slots (ptr (AMEntry K V)))
    (children (ptr (ptr (AMNode K V))))])
 
 (defstruct AMap [K V]
   [(root (ptr (AMNode K V)))
    (count i64)
    (tag i64)
-   (ops (ptr KeyOps))])
+   (ops (ptr KeyOps))
+   ; where its edits allocate, as a `HashMap`'s
+   (alc (dyn Allocator))])
 
-(defn amap--collision? [(shift i64)] (-> bool) (> shift 60))
+(defn amap--none [K V] [] (-> (ptr (AMNode K V)))
+  (primitive/cast (ptr (AMNode K V)) 0))
+
+(defn amap--no-entry [K V] [] (-> (ptr (AMEntry K V)))
+  (primitive/cast (ptr (AMEntry K V)) 0))
+
+;;; The 5 bits of HASH at SHIFT. The shift fills with the sign above bit 63, which
+;;; the mask keeps out of all but the last fragment, where it is the same for
+;;; every hash with that bit.
+(defn amap--fragment [(hash i64) (shift i64)] (-> i64)
+  (primitive/iand (primitive/ishr hash shift) 31))
 
 (defn amap--bit [(hash i64) (shift i64)] (-> i64)
-  (primitive/ishl 1 (primitive/iand (primitive/ishr hash shift) 31)))
+  (primitive/ishl 1 (amap--fragment hash shift)))
 
-(defn amap--rank [(map i64) (bit i64)] (-> i64)
-  (primitive/popcount (primitive/iand map (- bit 1))))
+(defn amap--rank [(bitmap i64) (bit i64)] (-> i64)
+  (primitive/popcount (primitive/iand bitmap (- bit 1))))
 
 (defn amap--hash [K] [(ops (ptr KeyOps)) (key (ptr K))] (-> i64)
   (call-ptr (.hash ops) (primitive/cast (ptr i8) key) (primitive/sizeof K)))
@@ -62,268 +101,358 @@
 (defn amap--eq? [K] [(ops (ptr KeyOps)) (a (ptr K)) (b (ptr K))] (-> bool)
   (call-ptr (.eq ops) (primitive/cast (ptr i8) a) (primitive/cast (ptr i8) b) (primitive/sizeof K)))
 
-;;; A node made with TAG in A, with room for NENTRIES entries and NCHILDREN
-;;; children, both counts set.
-(defn amap--node-new [K V] [(a (dyn Allocator)) (tag i64) (nentries i64) (nchildren i64)] (-> (ptr (AMNode K V)))
-  (let [entries (if (= nentries 0)
-                    (primitive/cast (ptr (AMEntry K V)) 0)
-                    (match (alloc [(AMEntry K V)] a nentries) (Some [s] (data s)) (None [] (oom))))
-        children (if (= nchildren 0)
-                     (primitive/cast (ptr (ptr (AMNode K V))) 0)
-                     (match (alloc [(ptr (AMNode K V))] a nchildren) (Some [s] (data s)) (None [] (oom))))]
+(defn amap--full? [K V] [(node (ptr (AMNode K V)))] (-> bool)
+  (match (.kind node) (Full [] true) (_ false)))
+
+(defn amap--slot [K V] [(node (ptr (AMNode K V))) (i i64)] (-> (ptr (AMEntry K V)))
+  (primitive/index (load (field node slots)) i))
+
+(defn amap--child-at [K V] [(node (ptr (AMNode K V))) (i i64)] (-> (ptr (AMNode K V)))
+  (load (primitive/index (load (field node children)) i)))
+
+(defn amap--set-child! [K V] [(node (ptr (AMNode K V))) (i i64) (child (ptr (AMNode K V)))] (-> i64)
+  (store! (primitive/index (load (field node children)) i) child)
+  0)
+
+;;; A node of KIND made with TAG in A, with room for CAP slots (a full node has
+;;; 32 child positions, all empty).
+(defn amap--node-new [K V] [(a (dyn Allocator)) (tag i64) (kind AMKind) (cap i64)] (-> (ptr (AMNode K V)))
+  (let [full (match kind (Full [] true) (_ false))
+        slots (if (or full (= cap 0))
+                  (amap--no-entry [K V])
+                  (match (alloc [(AMEntry K V)] a cap) (Some [s] (data s)) (None [] (oom))))
+        children (if full
+                     (match (alloc [(ptr (AMNode K V))] a 32)
+                       (Some [s] (do (for [i 0 32] (store! (primitive/index (data s) i) (amap--none [K V])))
+                                     (data s)))
+                       (None [] (oom)))
+                     (primitive/cast (ptr (ptr (AMNode K V))) 0))]
     (match (create [(AMNode K V)] a)
-      (Some [node] (do (store! node (AMNode :tag tag :datamap 0 :nodemap 0 :nentries nentries
-                                            :nchildren nchildren :entries entries :children children))
+      (Some [node] (do (store! node (AMNode :tag tag :kind kind :bitmap 0 :hash 0 :count 0
+                                            :cap (if full 32 cap) :slots slots :children children))
                        node))
       (None [] (oom)))))
 
-;;; NODE itself when TAG made it, else a copy of it made with TAG in A.
+;;; NODE's copy made with TAG in A, its slots given room for CAP (at least its count).
+(defn amap--copy [K V] [(a (dyn Allocator)) (tag i64) (node (ptr (AMNode K V))) (cap i64)] (-> (ptr (AMNode K V)))
+  (let [copy (amap--node-new [K V] a tag (.kind node) cap)]
+    (set! (.bitmap copy) (.bitmap node))
+    (set! (.hash copy) (.hash node))
+    (set! (.count copy) (.count node))
+    (if (amap--full? node)
+        (for [i 0 32] (amap--set-child! copy i (amap--child-at node i)))
+        (for [i 0 (.count node)] (store! (amap--slot copy i) (load (amap--slot node i)))))
+    copy))
+
+;;; NODE itself when TAG made it, else its copy made with TAG in A.
 (defn amap--editable [K V] [(a (dyn Allocator)) (tag i64) (node (ptr (AMNode K V)))] (-> (ptr (AMNode K V)))
-  (if (= (.tag node) tag)
+  (if (= (.tag node) tag) node (amap--copy a tag node (+ (.count node) 1))))
+
+;;; NODE, or its copy, editable under TAG with room for one more slot.
+(defn amap--with-room [K V] [(a (dyn Allocator)) (tag i64) (node (ptr (AMNode K V)))] (-> (ptr (AMNode K V)))
+  (if (and (= (.tag node) tag) (< (.count node) (.cap node)))
       node
-      (let [copy (amap--node-new [K V] a tag (.nentries node) (.nchildren node))]
-        (set! (.datamap copy) (.datamap node))
-        (set! (.nodemap copy) (.nodemap node))
-        (for [i 0 (.nentries node)]
-          (store! (primitive/index (load (field copy entries)) i)
-                  (load (primitive/index (load (field node entries)) i))))
-        (for [i 0 (.nchildren node)]
-          (store! (primitive/index (load (field copy children)) i)
-                  (load (primitive/index (load (field node children)) i))))
-        copy)))
+      (amap--copy a tag node (+ (.count node) 4))))
 
-(defn amap--entry [K V] [(node (ptr (AMNode K V))) (i i64)] (-> (ptr (AMEntry K V)))
-  (primitive/index (load (field node entries)) i))
+;;; Insert ENTRY at slot AT of TARGET, which has room for it.
+(defn amap--insert-slot! [K V] [(target (ptr (AMNode K V))) (at i64) (entry (AMEntry K V))] (-> i64)
+  (let [(mut i) (.count target)]
+    (while (> (load i) at)
+      (store! (amap--slot target (load i)) (load (amap--slot target (- (load i) 1))))
+      (store! i (- (load i) 1))))
+  (store! (amap--slot target at) entry)
+  (set! (.count target) (+ (.count target) 1))
+  0)
 
-(defn amap--child [K V] [(node (ptr (AMNode K V))) (i i64)] (-> (ptr (AMNode K V)))
-  (load (primitive/index (load (field node children)) i)))
+;;; Remove slot AT of TARGET.
+(defn amap--remove-slot! [K V] [(target (ptr (AMNode K V))) (at i64)] (-> i64)
+  (for [i (+ at 1) (.count target)]
+    (store! (amap--slot target (- i 1)) (load (amap--slot target i))))
+  (set! (.count target) (- (.count target) 1))
+  0)
 
-;;; A node made with TAG holding the two entries E1 and E2 (different keys), at SHIFT.
-(defn amap--pair [K V] [(a (dyn Allocator)) (tag i64) (shift i64)
+;;; NODE (or its copy) without slot AT, whose fragment is BIT.
+(defn amap--without-slot [K V] [(a (dyn Allocator)) (tag i64) (node (ptr (AMNode K V))) (at i64) (bit i64)] (-> (ptr (AMNode K V)))
+  (let [target (amap--editable a tag node)]
+    (amap--remove-slot! target at)
+    (set! (.bitmap target) (primitive/ixor (.bitmap target) bit))
+    target))
+
+;;; A slot holding CHILD.
+(defn amap--child-slot [K V] [(child (ptr (AMNode K V)))] (-> (AMEntry K V))
+  (let [e (primitive/alloc-stack (AMEntry K V))]
+    (store! e (primitive/zeroed (AMEntry K V)))
+    (set! (.child e) child)
+    (load e)))
+
+;;; A node holding the entries E1 and E2, whose keys differ, at SHIFT.
+(defn amap--pair [K V] [(a (dyn Allocator)) (tag i64) (ops (ptr KeyOps)) (shift i64)
                         (e1 (ptr (AMEntry K V))) (e2 (ptr (AMEntry K V)))] (-> (ptr (AMNode K V)))
-  (if (amap--collision? shift)
-      (let [node (amap--node-new [K V] a tag 2 0)]
-        (store! (amap--entry node 0) (load e1))
-        (store! (amap--entry node 1) (load e2))
+  (if (= (.hash e1) (.hash e2))
+      (let [node (amap--node-new [K V] a tag (Collision) 2)]
+        (set! (.hash node) (.hash e1))
+        (amap--insert-slot! node 0 (load e1))
+        (amap--insert-slot! node 1 (load e2))
         node)
-      (let [b1 (amap--bit (.hash e1) shift)
-            b2 (amap--bit (.hash e2) shift)]
-        (if (= b1 b2)
-            (let [node (amap--node-new [K V] a tag 0 1)]
-              (set! (.nodemap node) b1)
-              (store! (primitive/index (load (field node children)) 0)
-                      (amap--pair a tag (+ shift 5) e1 e2))
-              node)
-            (let [node (amap--node-new [K V] a tag 2 0)
-                  first-low (< (primitive/cast u64 b1) (primitive/cast u64 b2))]
-              (set! (.datamap node) (primitive/ior b1 b2))
-              (store! (amap--entry node 0) (if first-low (load e1) (load e2)))
-              (store! (amap--entry node 1) (if first-low (load e2) (load e1)))
-              node)))))
-
-(defn amap--find [K V] [(ops (ptr KeyOps)) (node (ptr (AMNode K V))) (shift i64) (hash i64)
-                        (key (ptr K))] (-> (ptr (AMEntry K V)))
-  (cond (= (primitive/cast i64 node) 0) (primitive/cast (ptr (AMEntry K V)) 0)
-        (amap--collision? shift)
-          (block :found
-            (for [i 0 (.nentries node)]
-              (let [e (amap--entry node i)]
-                (when (and (= (.hash e) hash) (amap--eq? ops (field e key) key)) (break :found e))))
-            (primitive/cast (ptr (AMEntry K V)) 0))
-        :else
-          (let [bit (amap--bit hash shift)]
-            (cond (!= (primitive/iand (.datamap node) bit) 0)
-                    (let [e (amap--entry node (amap--rank (.datamap node) bit))]
-                      (if (and (= (.hash e) hash) (amap--eq? ops (field e key) key))
-                          e
-                          (primitive/cast (ptr (AMEntry K V)) 0)))
-                  (!= (primitive/iand (.nodemap node) bit) 0)
-                    (amap--find ops (amap--child node (amap--rank (.nodemap node) bit)) (+ shift 5) hash key)
-                  :else (primitive/cast (ptr (AMEntry K V)) 0)))))
+      (let [added (primitive/alloc-stack bool)
+            one (amap--put a tag ops (amap--node-new [K V] a tag (Bitmap) 2) shift e1 added)]
+        (amap--put a tag ops one shift e2 added))))
 
 ;;; NODE (or its copy) with ENTRY put in at SHIFT; ADDED is set when its key was new.
 (defn amap--put [K V] [(a (dyn Allocator)) (tag i64) (ops (ptr KeyOps)) (node (ptr (AMNode K V)))
                        (shift i64) (entry (ptr (AMEntry K V))) (added (ptr bool))] (-> (ptr (AMNode K V)))
-  (if (amap--collision? shift)
-      (let [at (block :found
-                 (for [i 0 (.nentries node)]
-                   (when (amap--eq? ops (field (amap--entry node i) key) (field entry key)) (break :found i)))
-                 -1)]
-        (if (>= at 0)
-            (let [target (amap--editable a tag node)]
-              (store! (amap--entry target at) (load entry))
-              target)
-            (let [grown (amap--node-new [K V] a tag (+ (.nentries node) 1) 0)]
-              (for [i 0 (.nentries node)] (store! (amap--entry grown i) (load (amap--entry node i))))
-              (store! (amap--entry grown (.nentries node)) (load entry))
-              (store! added true)
-              grown)))
-      (let [bit (amap--bit (.hash entry) shift)]
-        (cond (!= (primitive/iand (.datamap node) bit) 0)
-                (let [at (amap--rank (.datamap node) bit)
-                      here (amap--entry node at)]
-                  (if (and (= (.hash here) (.hash entry)) (amap--eq? ops (field here key) (field entry key)))
-                      (let [target (amap--editable a tag node)]
-                        (store! (amap--entry target at) (load entry))
-                        target)
-                      ; two keys at this fragment: they move down into a child
-                      (let [child (amap--pair a tag (+ shift 5) here entry)
-                            cat (amap--rank (.nodemap node) bit)
-                            out (amap--node-new [K V] a tag (- (.nentries node) 1) (+ (.nchildren node) 1))]
-                        (set! (.datamap out) (primitive/ixor (.datamap node) bit))
-                        (set! (.nodemap out) (primitive/ior (.nodemap node) bit))
-                        (for [i 0 at] (store! (amap--entry out i) (load (amap--entry node i))))
-                        (for [i (+ at 1) (.nentries node)] (store! (amap--entry out (- i 1)) (load (amap--entry node i))))
-                        (for [i 0 cat] (store! (primitive/index (load (field out children)) i) (amap--child node i)))
-                        (store! (primitive/index (load (field out children)) cat) child)
-                        (for [i cat (.nchildren node)]
-                          (store! (primitive/index (load (field out children)) (+ i 1)) (amap--child node i)))
-                        (store! added true)
-                        out)))
-              (!= (primitive/iand (.nodemap node) bit) 0)
-                (let [at (amap--rank (.nodemap node) bit)
-                      child (amap--put a tag ops (amap--child node at) (+ shift 5) entry added)
-                      target (amap--editable a tag node)]
-                  (store! (primitive/index (load (field target children)) at) child)
-                  target)
+  (match (.kind node)
+    (Bitmap []
+      (let [bit (amap--bit (.hash entry) shift)
+            at (amap--rank (.bitmap node) bit)]
+        (cond (!= (primitive/iand (.bitmap node) bit) 0)
+                (let [here (amap--slot node at)]
+                  (cond (!= (primitive/cast i64 (.child here)) 0)
+                          (let [child (amap--put a tag ops (.child here) (+ shift 5) entry added)]
+                            (if (= child (.child here))
+                                node
+                                (let [target (amap--editable a tag node)]
+                                  (set! (.child (amap--slot target at)) child)
+                                  target)))
+                        (and (= (.hash here) (.hash entry)) (amap--eq? ops (field here key) (field entry key)))
+                          (let [target (amap--editable a tag node)]
+                            (set! (.val (amap--slot target at)) (.val entry))
+                            target)
+                        :else
+                          ; two keys at one fragment: they go down into a child
+                          (let [child (amap--pair a tag ops (+ shift 5) here entry)
+                                target (amap--editable a tag node)]
+                            (store! (amap--slot target at) (amap--child-slot child))
+                            (store! added true)
+                            target)))
+              (>= (.count node) 16)
+                ; a 17th slot: the node becomes a full one
+                (let [full (amap--node-new [K V] a tag (Full) 32)
+                      (mut j) 0]
+                  (for [f 0 32]
+                    (when (!= (primitive/iand (.bitmap node) (primitive/ishl 1 f)) 0)
+                      (let [s (amap--slot node (load j))
+                            moved (primitive/alloc-stack bool)]
+                        (amap--set-child! full f
+                                          (if (!= (primitive/cast i64 (.child s)) 0)
+                                              (.child s)
+                                              (amap--put a tag ops (amap--node-new [K V] a tag (Bitmap) 2)
+                                                         (+ shift 5) s moved)))
+                        (store! j (+ (load j) 1)))
+                      0))
+                  (set! (.count full) (.count node))
+                  (amap--put a tag ops full shift entry added))
               :else
-                (let [at (amap--rank (.datamap node) bit)
-                      out (amap--node-new [K V] a tag (+ (.nentries node) 1) (.nchildren node))]
-                  (set! (.datamap out) (primitive/ior (.datamap node) bit))
-                  (set! (.nodemap out) (.nodemap node))
-                  (for [i 0 at] (store! (amap--entry out i) (load (amap--entry node i))))
-                  (store! (amap--entry out at) (load entry))
-                  (for [i at (.nentries node)] (store! (amap--entry out (+ i 1)) (load (amap--entry node i))))
-                  (for [i 0 (.nchildren node)]
-                    (store! (primitive/index (load (field out children)) i) (amap--child node i)))
+                (let [target (amap--with-room a tag node)]
+                  (amap--insert-slot! target at (load entry))
+                  (set! (.bitmap target) (primitive/ior (.bitmap target) bit))
                   (store! added true)
-                  out)))))
+                  target))))
+    (Full []
+      (let [f (amap--fragment (.hash entry) shift)
+            child (amap--child-at node f)]
+        (if (= (primitive/cast i64 child) 0)
+            (let [fresh (amap--put a tag ops (amap--node-new [K V] a tag (Bitmap) 2) (+ shift 5) entry added)
+                  target (amap--editable a tag node)]
+              (amap--set-child! target f fresh)
+              (set! (.count target) (+ (.count target) 1))
+              target)
+            (let [updated (amap--put a tag ops child (+ shift 5) entry added)]
+              (if (= updated child)
+                  node
+                  (let [target (amap--editable a tag node)]
+                    (amap--set-child! target f updated)
+                    target))))))
+    (Collision []
+      (if (= (.hash entry) (.hash node))
+          (let [at (block :found
+                     (for [i 0 (.count node)]
+                       (when (amap--eq? ops (field (amap--slot node i) key) (field entry key)) (break :found i)))
+                     -1)]
+            (if (>= at 0)
+                (let [target (amap--editable a tag node)]
+                  (set! (.val (amap--slot target at)) (.val entry))
+                  target)
+                (let [target (amap--with-room a tag node)]
+                  (amap--insert-slot! target (.count target) (load entry))
+                  (store! added true)
+                  target)))
+          ; another hash: the collision node goes under a bitmap node
+          (let [wrapper (amap--node-new [K V] a tag (Bitmap) 2)]
+            (set! (.bitmap wrapper) (amap--bit (.hash node) shift))
+            (amap--insert-slot! wrapper 0 (amap--child-slot node))
+            (amap--put a tag ops wrapper shift entry added))))))
 
-;;; NODE (or its copy) without KEY at SHIFT; REMOVED is set when it held the key.
-;;; A child left with a single entry and no children is replaced by that entry.
+;;; NODE (or its copy) without KEY at SHIFT, or null when nothing is left;
+;;; REMOVED is set when it held the key.
 (defn amap--remove [K V] [(a (dyn Allocator)) (tag i64) (ops (ptr KeyOps)) (node (ptr (AMNode K V)))
                           (shift i64) (hash i64) (key (ptr K)) (removed (ptr bool))] (-> (ptr (AMNode K V)))
-  (if (amap--collision? shift)
-      (let [at (block :found
-                 (for [i 0 (.nentries node)]
-                   (when (amap--eq? ops (field (amap--entry node i) key) key) (break :found i)))
-                 -1)]
-        (if (< at 0)
+  (match (.kind node)
+    (Bitmap []
+      (let [bit (amap--bit hash shift)
+            at (amap--rank (.bitmap node) bit)]
+        (if (= (primitive/iand (.bitmap node) bit) 0)
             node
-            (let [out (amap--node-new [K V] a tag (- (.nentries node) 1) 0)]
-              (for [i 0 at] (store! (amap--entry out i) (load (amap--entry node i))))
-              (for [i (+ at 1) (.nentries node)] (store! (amap--entry out (- i 1)) (load (amap--entry node i))))
-              (store! removed true)
-              out)))
-      (let [bit (amap--bit hash shift)]
-        (cond (!= (primitive/iand (.datamap node) bit) 0)
-                (let [at (amap--rank (.datamap node) bit)
-                      here (amap--entry node at)]
-                  (if (not (and (= (.hash here) hash) (amap--eq? ops (field here key) key)))
-                      node
-                      (let [out (amap--node-new [K V] a tag (- (.nentries node) 1) (.nchildren node))]
-                        (set! (.datamap out) (primitive/ixor (.datamap node) bit))
-                        (set! (.nodemap out) (.nodemap node))
-                        (for [i 0 at] (store! (amap--entry out i) (load (amap--entry node i))))
-                        (for [i (+ at 1) (.nentries node)] (store! (amap--entry out (- i 1)) (load (amap--entry node i))))
-                        (for [i 0 (.nchildren node)]
-                          (store! (primitive/index (load (field out children)) i) (amap--child node i)))
-                        (store! removed true)
-                        out)))
-              (!= (primitive/iand (.nodemap node) bit) 0)
-                (let [at (amap--rank (.nodemap node) bit)
-                      child (amap--remove a tag ops (amap--child node at) (+ shift 5) hash key removed)]
-                  (cond (not (load removed)) node
-                        ; the child keeps one entry: it moves up into this node
-                        (and (= (.nchildren child) 0) (= (.nentries child) 1))
-                          (let [lifted (amap--entry child 0)
-                                dat (amap--rank (.datamap node) bit)
-                                out (amap--node-new [K V] a tag (+ (.nentries node) 1) (- (.nchildren node) 1))]
-                            (set! (.datamap out) (primitive/ior (.datamap node) bit))
-                            (set! (.nodemap out) (primitive/ixor (.nodemap node) bit))
-                            (for [i 0 dat] (store! (amap--entry out i) (load (amap--entry node i))))
-                            (store! (amap--entry out dat) (load lifted))
-                            (for [i dat (.nentries node)] (store! (amap--entry out (+ i 1)) (load (amap--entry node i))))
-                            (for [i 0 at] (store! (primitive/index (load (field out children)) i) (amap--child node i)))
-                            (for [i (+ at 1) (.nchildren node)]
-                              (store! (primitive/index (load (field out children)) (- i 1)) (amap--child node i)))
-                            out)
-                        :else
-                          (let [target (amap--editable a tag node)]
-                            (store! (primitive/index (load (field target children)) at) child)
-                            target)))
-              :else node))))
+            (let [here (amap--slot node at)]
+              (if (!= (primitive/cast i64 (.child here)) 0)
+                  (let [child (amap--remove a tag ops (.child here) (+ shift 5) hash key removed)]
+                    (cond (= child (.child here)) node
+                          (!= (primitive/cast i64 child) 0)
+                            (let [target (amap--editable a tag node)]
+                              (set! (.child (amap--slot target at)) child)
+                              target)
+                          (= (.bitmap node) bit) (amap--none [K V])
+                          :else (amap--without-slot a tag node at bit)))
+                  (if (and (= (.hash here) hash) (amap--eq? ops (field here key) key))
+                      (do (store! removed true)
+                          (if (= (.bitmap node) bit)
+                              (amap--none [K V])
+                              (amap--without-slot a tag node at bit)))
+                      node))))))
+    (Full []
+      (let [f (amap--fragment hash shift)
+            child (amap--child-at node f)]
+        (if (= (primitive/cast i64 child) 0)
+            node
+            (let [updated (amap--remove a tag ops child (+ shift 5) hash key removed)]
+              (cond (= updated child) node
+                    (!= (primitive/cast i64 updated) 0)
+                      (let [target (amap--editable a tag node)]
+                        (amap--set-child! target f updated)
+                        target)
+                    ; a full node left with 8 children packs into a bitmap node
+                    (<= (.count node) 8)
+                      (let [packed (amap--node-new [K V] a tag (Bitmap) (+ (.count node) 3))]
+                        (for [g 0 32]
+                          (let [c (amap--child-at node g)]
+                            (when (and (!= g f) (!= (primitive/cast i64 c) 0))
+                              (amap--insert-slot! packed (.count packed) (amap--child-slot c))
+                              (set! (.bitmap packed) (primitive/ior (.bitmap packed) (primitive/ishl 1 g)))
+                              0)))
+                        packed)
+                    :else
+                      (let [target (amap--editable a tag node)]
+                        (amap--set-child! target f (amap--none [K V]))
+                        (set! (.count target) (- (.count target) 1))
+                        target))))))
+    (Collision []
+      (let [at (block :found
+                 (for [i 0 (.count node)]
+                   (when (amap--eq? ops (field (amap--slot node i) key) key) (break :found i)))
+                 -1)]
+        (cond (< at 0) node
+              (= (.count node) 1) (do (store! removed true) (amap--none [K V]))
+              :else (let [target (amap--editable a tag node)]
+                      (amap--remove-slot! target at)
+                      (store! removed true)
+                      target))))))
 
-;;; An empty map hashing and comparing keys with OPS.
-(defn amap-new [K V] [(ops (ptr KeyOps))] (-> (AMap K V))
-  (AMap :root (primitive/cast (ptr (AMNode K V)) 0) :count 0 :tag (edit-tag-new) :ops ops))
+(defn amap--find [K V] [(ops (ptr KeyOps)) (node (ptr (AMNode K V))) (shift i64) (hash i64)
+                        (key (ptr K))] (-> (ptr (AMEntry K V)))
+  (if (= (primitive/cast i64 node) 0)
+      (amap--no-entry [K V])
+      (match (.kind node)
+        (Bitmap []
+          (let [bit (amap--bit hash shift)]
+            (if (= (primitive/iand (.bitmap node) bit) 0)
+                (amap--no-entry [K V])
+                (let [here (amap--slot node (amap--rank (.bitmap node) bit))]
+                  (cond (!= (primitive/cast i64 (.child here)) 0) (amap--find ops (.child here) (+ shift 5) hash key)
+                        (and (= (.hash here) hash) (amap--eq? ops (field here key) key)) here
+                        :else (amap--no-entry [K V]))))))
+        (Full [] (amap--find ops (amap--child-at node (amap--fragment hash shift)) (+ shift 5) hash key))
+        (Collision []
+          (if (!= hash (.hash node))
+              (amap--no-entry [K V])
+              (block :found
+                (for [i 0 (.count node)]
+                  (let [e (amap--slot node i)]
+                    (when (amap--eq? ops (field e key) key) (break :found e))))
+                (amap--no-entry [K V])))))))
 
-;;; M, to edit without changing M: the same nodes under a fresh tag.
-(defn amap-edit [K V] [(m (ref (AMap K V)))] (-> (AMap K V))
-  (amap-retag m (edit-tag-new)))
+;;; An empty map hashing and comparing keys with OPS, allocating from A.
+(defn amap-new [K V] [(ops (ptr KeyOps)) (a (dyn Allocator))] (-> (AMap K V))
+  (AMap :root (amap--none [K V]) :count 0 :tag (edit-tag-new) :ops ops :alc a))
 
-;;; M's nodes under TAG (from `edit-tag-new`), as `avec-retag`.
-(defn amap-retag [K V] [(m (ref (AMap K V))) (tag i64)] (-> (AMap K V))
+;;; M, to edit without changing M: the same nodes under a fresh tag, its edits
+;;; allocating from A.
+(defn amap-edit [K V] [(m (ref (AMap K V))) (a (dyn Allocator))] (-> (AMap K V))
+  (amap-retag m (edit-tag-new) a))
+
+;;; M's nodes under TAG (from `edit-tag-new`), its edits allocating from A, as
+;;; `avec-retag`.
+(defn amap-retag [K V] [(m (ref (AMap K V))) (tag i64) (a (dyn Allocator))] (-> (AMap K V))
   (let [(mut out) (load m)]
     (set! (.tag out) tag)
-    out))
-
-;;; The value of KEY, or None.
-(defn amap-get [K V] [(m (ref (AMap K V))) (key K)] (-> (Option V))
-  (let [k (primitive/alloc-stack K)]
-    (store! k key)
-    (let [e (amap--find (.ops m) (load (field m root)) 0 (amap--hash (.ops m) k) k)]
-      (if (= (primitive/cast i64 e) 0) (None [V]) (Some (.val e))))))
-
-;;; Make KEY's value VALUE, copying into A what M's tag did not make.
-(defn amap-put! [K V] [(m (mut (AMap K V))) (a (dyn Allocator)) (key K) (value V)] (-> i64)
-  (let [entry (primitive/alloc-stack (AMEntry K V))
-        added (primitive/alloc-stack bool)]
-    (store! (field entry key) key)
-    (store! (field entry val) value)
-    (set! (.hash entry) (amap--hash (.ops m) (field entry key)))
-    (store! added false)
-    (let [root (load (field m root))]
-      (if (= (primitive/cast i64 root) 0)
-          (let [node (amap--node-new [K V] a (.tag m) 1 0)]
-            (set! (.datamap node) (amap--bit (.hash entry) 0))
-            (store! (amap--entry node 0) (load entry))
-            (set! (.root m) node)
-            (set! (.count m) 1))
-          (do (set! (.root m) (amap--put a (.tag m) (.ops m) root 0 entry added))
-              (when (load added) (set! (.count m) (+ (.count m) 1)) 0))))
-    0))
-
-;;; Remove KEY, copying into A what M's tag did not make. Whether it was there.
-(defn amap-remove! [K V] [(m (mut (AMap K V))) (a (dyn Allocator)) (key K)] (-> bool)
-  (let [k (primitive/alloc-stack K)
-        removed (primitive/alloc-stack bool)
-        root (load (field m root))]
-    (store! k key)
-    (store! removed false)
-    (unless (= (primitive/cast i64 root) 0)
-      (let [out (amap--remove a (.tag m) (.ops m) root 0 (amap--hash (.ops m) k) k removed)]
-        (when (load removed)
-          (set! (.count m) (- (.count m) 1))
-          (set! (.root m) (if (= (.count m) 0) (primitive/cast (ptr (AMNode K V)) 0) out))
-          0))
-      0)
-    (load removed)))
-
-(defn amap--collect [K V] [(node (ptr (AMNode K V))) (out (mut (ArrayList (ptr (AMEntry K V)))))] (-> i64)
-  (unless (= (primitive/cast i64 node) 0)
-    (for [i 0 (.nentries node)] (push! (mut out) (amap--entry node i)))
-    (for [i 0 (.nchildren node)] (amap--collect (amap--child node i) (mut out))))
-  0)
-
-;;; M's entries in trie order, in a list allocated from A.
-(defn amap-entries [K V] [(m (ref (AMap K V))) (a (dyn Allocator))] (-> (ArrayList (ptr (AMEntry K V))))
-  (let [(mut out) (ArrayList::new [(ptr (AMEntry K V))] a)]
-    (amap--collect (load (field m root)) (mut out))
+    (set! (.alc out) a)
     out))
 
 (impl [K V] Len (AMap K V)
   (len [(m (ref (AMap K V)))] (-> i64) (.count m)))
+
+;;; The value of KEY, or None.
+(impl [K V] Get (AMap K V)
+  (get [(m (ref (AMap K V))) (key K)] (-> (Option V))
+    (let [k (primitive/alloc-stack K)]
+      (store! k key)
+      (let [e (amap--find (.ops m) (load (field m root)) 0 (amap--hash (.ops m) k) k)]
+        (if (= (primitive/cast i64 e) 0) (None [V]) (Some (.val e)))))))
+
+;;; Make KEY's value VALUE, copying what M's tag did not make.
+(impl [K V] Set (AMap K V)
+  (set! [(m (mut (AMap K V))) (key K) (value V)] (-> i64)
+    (let [a (.alc m)
+          entry (primitive/alloc-stack (AMEntry K V))
+          added (primitive/alloc-stack bool)
+          root (load (field m root))]
+      (store! entry (primitive/zeroed (AMEntry K V)))
+      (store! (field entry key) key)
+      (store! (field entry val) value)
+      (set! (.hash entry) (amap--hash (.ops m) (field entry key)))
+      (store! added false)
+      (set! (.root m)
+            (amap--put a (.tag m) (.ops m)
+                       (if (= (primitive/cast i64 root) 0) (amap--node-new [K V] a (.tag m) (Bitmap) 4) root)
+                       0 entry added))
+      (when (load added) (set! (.count m) (+ (.count m) 1)) 0)
+      0)))
+
+(impl [K V] (AMap K V)
+  ;;; Whether KEY has a value.
+  (contains? [(m (ref (AMap K V))) (key K)] (-> bool)
+    (match (get m key) (Some [_] true) (None [] false)))
+  ;;; Remove KEY, copying what M's tag did not make. Whether it was there.
+  (remove! [(m (mut (AMap K V))) (key K)] (-> bool)
+    (let [k (primitive/alloc-stack K)
+          removed (primitive/alloc-stack bool)
+          root (load (field m root))]
+      (store! k key)
+      (store! removed false)
+      (unless (= (primitive/cast i64 root) 0)
+        (let [out (amap--remove (.alc m) (.tag m) (.ops m) root 0 (amap--hash (.ops m) k) k removed)]
+          (when (load removed)
+            (set! (.count m) (- (.count m) 1))
+            (set! (.root m) out)
+            0))
+        0)
+      (load removed))))
+
+(defn amap--collect [K V] [(node (ptr (AMNode K V))) (out (mut (ArrayList (ptr (AMEntry K V)))))] (-> i64)
+  (unless (= (primitive/cast i64 node) 0)
+    (if (amap--full? node)
+        (for [i 0 32] (amap--collect (amap--child-at node i) (mut out)))
+        (for [i 0 (.count node)]
+          (let [s (amap--slot node i)]
+            (if (!= (primitive/cast i64 (.child s)) 0)
+                (amap--collect (.child s) (mut out))
+                (push! (mut out) s))))))
+  0)
+
+;;; M's entries in walk order (see ORDER), in a list allocated from A.
+(defn amap-entries [K V] [(m (ref (AMap K V))) (a (dyn Allocator))] (-> (ArrayList (ptr (AMEntry K V))))
+  (let [(mut out) (ArrayList::new [(ptr (AMEntry K V))] a)]
+    (amap--collect (load (field m root)) (mut out))
+    out))
 
 ; ---- persist ---------------------------------------------------------------------
 
@@ -337,39 +466,48 @@
   (if (or (= (primitive/cast i64 node) 0)
           (and (.sharing cx) (call-ptr (.shared? cx) (.shared-cx cx) (primitive/cast (ptr i8) node))))
       node
-      (let [copy (amap--node-new [K V] (.alc cx) (.tag node) (.nentries node) (.nchildren node))]
-        (set! (.datamap copy) (.datamap node))
-        (set! (.nodemap copy) (.nodemap node))
-        (for [i 0 (.nentries node)]
-          (let [e (amap--entry node i)]
-            (store! (amap--entry copy i)
-                    (AMEntry :hash (.hash e) :key (persist-pointee [K] (field e key) cx) :val (persist-pointee [V] (field e val) cx)))))
-        (for [i 0 (.nchildren node)]
-          (store! (primitive/index (load (field copy children)) i) (amap--persist-node (amap--child node i) cx)))
+      (let [copy (amap--node-new [K V] (.alc cx) (.tag node) (.kind node) (.count node))]
+        (set! (.bitmap copy) (.bitmap node))
+        (set! (.hash copy) (.hash node))
+        (set! (.count copy) (.count node))
+        (if (amap--full? node)
+            (for [i 0 32] (amap--set-child! copy i (amap--persist-node (amap--child-at node i) cx)))
+            (for [i 0 (.count node)]
+              (let [s (amap--slot node i)]
+                (store! (amap--slot copy i)
+                        (if (!= (primitive/cast i64 (.child s)) 0)
+                            (amap--child-slot (amap--persist-node (.child s) cx))
+                            (AMEntry :hash (.hash s) :key (persist-pointee [K] (field s key) cx)
+                                     :val (persist-pointee [V] (field s val) cx)
+                                     :child (amap--none [K V])))))))
         copy)))
 
 (defn amap--measure-node [(K Persist) (V Persist)] [(node (ptr (AMNode K V))) (m (ptr PersistMeter))] (-> i64)
   (unless (= (primitive/cast i64 node) 0)
-    (set! (.bytes (.at m)) (+ (.bytes (.at m))
-                              (+ (primitive/sizeof (AMNode K V))
-                                 (+ (* (.nentries node) (primitive/sizeof (AMEntry K V)))
-                                    (* (.nchildren node) (primitive/sizeof (ptr (AMNode K V))))))))
-    (for [i 0 (.nentries node)]
-      (amap--measure-at [K] (field (amap--entry node i) key) m)
-      (amap--measure-at [V] (field (amap--entry node i) val) m))
-    (for [i 0 (.nchildren node)] (amap--measure-node (amap--child node i) m)))
+    (set! (.bytes (.at m)) (+ (.bytes (.at m)) (primitive/sizeof (AMNode K V))))
+    (if (amap--full? node)
+        (do (set! (.bytes (.at m)) (+ (.bytes (.at m)) (* 32 (primitive/sizeof (ptr (AMNode K V))))))
+            (for [i 0 32] (amap--measure-node (amap--child-at node i) m)))
+        (do (set! (.bytes (.at m)) (+ (.bytes (.at m)) (* (.cap node) (primitive/sizeof (AMEntry K V)))))
+            (for [i 0 (.count node)]
+              (let [s (amap--slot node i)]
+                (if (!= (primitive/cast i64 (.child s)) 0)
+                    (amap--measure-node (.child s) m)
+                    (do (amap--measure-at [K] (field s key) m)
+                        (amap--measure-at [V] (field s val) m))))))))
   0)
 
 ;;; A map owns its keys and values; nodes the target memory already holds are
 ;;; shared. Written as its key operations (`persist-keyops-tag`), its count and
-;;; its entries in trie order; read back by putting each in.
+;;; its entries in walk order; read back by putting each in.
 (impl [(K Persist) (V Persist)] Persist (AMap K V)
   (persist-into [(self (ref (AMap K V))) (cx (ptr PersistCx))] (-> (AMap K V))
     (AMap :root (amap--persist-node (load (field self root)) cx)
           :count (.count self)
           ; the copy's own nodes are sealed where they went: an edit of it copies
           :tag (edit-tag-new)
-          :ops (.ops self)))
+          :ops (.ops self)
+          :alc (.alc cx)))
   (persist-write [(self (ref (AMap K V))) (w (ptr PersistWriter))] (-> i64)
     (let [(mut entries) (amap-entries self (malloc-allocator))]
       (amap--write-at [i64] (persist-keyops-tag [K] (.ops self)) w)
@@ -383,7 +521,7 @@
     (let [slot (primitive/alloc-stack i64)
           ops (persist-keyops-read [K] r (amap--read-at [i64] slot r))
           n (amap--read-at [i64] slot r)
-          (mut out) (amap-new [K V] ops)
+          (mut out) (amap-new [K V] ops (.alc r))
           k (primitive/alloc-stack K)
           v (primitive/alloc-stack V)]
       (if (or (< n 0) (> n (- (len (.bytes r)) (.at r))))
@@ -391,7 +529,7 @@
           (do (for [i 0 n]
                 (let [key (amap--read-at [K] k r)
                       value (amap--read-at [V] v r)]
-                  (amap-put! (mut out) (.alc r) key value)))
+                  (set! (mut out) key value)))
               (when (!= (len out) n) (set! (.failed r) true) 0)
               out))))
   (persist-measure [(self (ref (AMap K V))) (m (ptr PersistMeter))] (-> i64)
