@@ -1,0 +1,285 @@
+;;; A persistent vector whose nodes live in arenas: `AVec[T]`, a 32-way trie with
+;;; a separate tail, indexed by position, like `coil.pvec`, without reference
+;;; counts.
+;;;
+;;; EDITS. Every vector carries an edit tag, and every node the tag of the vector
+;;; that made it. An edit changes a node in place only when the node carries the
+;;; vector's own tag; any other node is copied, with the path above it, into the
+;;; allocator the edit is given. `avec-edit` gives a vector a fresh tag, so a
+;;; vector made from another by `avec-edit` can be edited freely and the other
+;;; never changes:
+;;;
+;;;   (let [(mut mine) (avec-edit shared)]   ; shares every node with `shared`
+;;;     (avec-push! (mut mine) a 7))          ; copies the tail into A; `shared` is as it was
+;;;
+;;; Nothing is counted or freed: a node lives as long as the arena it was made
+;;; in. That is what makes a vector cheap to share between owners whose memory is
+;;; arenas: holding one writes nothing into the nodes, so memory another owner
+;;; sealed is never touched. `T` is copied by value; what it points to is shared.
+;;;
+;;; PERSIST. `persist-clone-sharing` copies only the nodes the target memory does
+;;; not hold, so copying an extended vector back into the arena of the one it was
+;;; extended from copies what the edits made and shares the rest. Written bytes
+;;; are the elements in order, independent of the trie's shape.
+(module coil.avec)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.atomic" :as atomic)
+(import "coil.panic" :use [panic])
+(import "coil.persist" :use *)
+
+(export AVec AVNode avec-new avec-edit avec-at avec-push! avec-set! edit-tag-new)
+
+;;; A trie node. A LEAF has `items` (room for `cap` elements, `count` of them
+;;; live) and no `children`; an INTERNAL node has 32 `children` slots, `count` of
+;;; them live. Only the tail is a leaf with `cap` below 32. `tag` is the edit tag
+;;; of the vector that made it.
+(defstruct AVNode [T]
+  [(tag i64)
+   (count i64)
+   (cap i64)
+   (items (ptr T))
+   (children (ptr (ptr (AVNode T))))])
+
+;;; `shift` is the root's level: 5 when the root's children are leaves.
+(defstruct AVec [T]
+  [(root (ptr (AVNode T)))
+   (tail (ptr (AVNode T)))
+   (count i64)
+   (shift i64)
+   (tag i64)])
+
+;;; A tag no edit session has had: the source of `avec-edit` and `amap-edit`.
+(defn edit-tag-new [] (-> i64)
+  (let [cell (primitive/alloc-static i64)]
+    (+ (atomic/add cell 1) 1)))
+
+(defn avec--none [T] [] (-> (ptr (AVNode T)))
+  (primitive/cast (ptr (AVNode T)) 0))
+
+(defn avec--leaf-new [T] [(a (dyn Allocator)) (tag i64) (cap i64)] (-> (ptr (AVNode T)))
+  (let [items (match (alloc [T] a cap) (Some [s] (data s)) (None [] (oom)))]
+    (match (create [(AVNode T)] a)
+      (Some [node] (do (store! node (AVNode :tag tag :count 0 :cap cap :items items
+                                            :children (primitive/cast (ptr (ptr (AVNode T))) 0)))
+                       node))
+      (None [] (oom)))))
+
+(defn avec--internal-new [T] [(a (dyn Allocator)) (tag i64)] (-> (ptr (AVNode T)))
+  (let [children (match (alloc [(ptr (AVNode T))] a 32) (Some [s] (data s)) (None [] (oom)))]
+    (match (create [(AVNode T)] a)
+      (Some [node] (do (store! node (AVNode :tag tag :count 0 :cap 32
+                                            :items (primitive/cast (ptr T) 0) :children children))
+                       node))
+      (None [] (oom)))))
+
+(defn avec--leaf? [T] [(node (ptr (AVNode T)))] (-> bool)
+  (!= (primitive/cast i64 (load (field node items))) 0))
+
+;;; NODE itself when TAG made it and a leaf has room for CAP, else a copy made
+;;; with TAG, in A, a leaf with room for CAP.
+(defn avec--editable [T] [(a (dyn Allocator)) (tag i64) (node (ptr (AVNode T))) (cap i64)] (-> (ptr (AVNode T)))
+  (if (and (= (.tag node) tag) (<= cap (.cap node)))
+      node
+      (if (avec--leaf? node)
+          (let [copy (avec--leaf-new [T] a tag cap)]
+            (for [i 0 (.count node)]
+              (store! (primitive/index (load (field copy items)) i)
+                      (load (primitive/index (load (field node items)) i))))
+            (set! (.count copy) (.count node))
+            copy)
+          (let [copy (avec--internal-new [T] a tag)]
+            (for [i 0 (.count node)]
+              (store! (primitive/index (load (field copy children)) i)
+                      (load (primitive/index (load (field node children)) i))))
+            (set! (.count copy) (.count node))
+            copy))))
+
+(defn avec--set-child! [T] [(node (ptr (AVNode T))) (at i64) (child (ptr (AVNode T)))] (-> i64)
+  (store! (primitive/index (load (field node children)) at) child)
+  (when (>= at (.count node)) (set! (.count node) (+ at 1)) 0)
+  0)
+
+;;; A chain of single-child internal nodes from LEVEL down to LEAF.
+(defn avec--path [T] [(a (dyn Allocator)) (tag i64) (level i64) (leaf (ptr (AVNode T)))] (-> (ptr (AVNode T)))
+  (if (= level 0)
+      leaf
+      (let [node (avec--internal-new [T] a tag)]
+        (avec--set-child! node 0 (avec--path a tag (- level 5) leaf))
+        node)))
+
+;;; NODE (or its copy) with the full leaf TAIL hung as the rightmost leaf of a
+;;; vector of COUNT elements.
+(defn avec--push-tail [T] [(a (dyn Allocator)) (tag i64) (node (ptr (AVNode T))) (level i64)
+                           (count i64) (tail (ptr (AVNode T)))] (-> (ptr (AVNode T)))
+  (let [at (primitive/iand (primitive/ishr (- count 1) level) 31)
+        target (avec--editable a tag node 32)]
+    (avec--set-child! target at
+                      (cond (= level 5) tail
+                            (< at (.count node))
+                              (avec--push-tail a tag (load (primitive/index (load (field node children)) at))
+                                               (- level 5) count tail)
+                            :else (avec--path a tag (- level 5) tail)))
+    target))
+
+;;; NODE (or its copy) with element INDEX, under it at LEVEL, made VALUE.
+(defn avec--node-set [T] [(a (dyn Allocator)) (tag i64) (node (ptr (AVNode T))) (level i64)
+                          (index i64) (value T)] (-> (ptr (AVNode T)))
+  (let [target (avec--editable a tag node (.cap node))]
+    (if (= level 0)
+        (store! (primitive/index (load (field target items)) (primitive/iand index 31)) value)
+        (let [at (primitive/iand (primitive/ishr index level) 31)]
+          (avec--set-child! target at
+                            (avec--node-set a tag (load (primitive/index (load (field node children)) at))
+                                            (- level 5) index value))))
+    target))
+
+(defn avec--tail-offset [T] [(v (ref (AVec T)))] (-> i64)
+  (if (< (.count v) 32)
+      0
+      (primitive/ishl (primitive/ishr (- (.count v) 1) 5) 5)))
+
+(defn avec--leaf-for [T] [(v (ref (AVec T))) (index i64)] (-> (ptr (AVNode T)))
+  (if (>= index (avec--tail-offset v))
+      (load (field v tail))
+      (let [(mut node) (load (field v root))
+            (mut level) (.shift v)]
+        (while (> (load level) 0)
+          (set! node (load (primitive/index (load (field (load node) children))
+                                            (primitive/iand (primitive/ishr index (load level)) 31))))
+          (set! level (- (load level) 5)))
+        (load node))))
+
+;;; An empty vector.
+(defn avec-new [T] [] (-> (AVec T))
+  (AVec :root (avec--none [T]) :tail (avec--none [T]) :count 0 :shift 5 :tag (edit-tag-new)))
+
+;;; V, to edit without changing V: the same nodes under a fresh tag.
+(defn avec-edit [T] [(v (ref (AVec T)))] (-> (AVec T))
+  (let [(mut out) (load v)]
+    (set! (.tag out) (edit-tag-new))
+    out))
+
+;;; Element INDEX, which must be in range.
+(defn avec-at [T] [(v (ref (AVec T))) (index i64)] (-> (ptr T))
+  (when (or (< index 0) (>= index (.count v)))
+    (panic "avec: index {} of a vector of {}" index (.count v)))
+  (primitive/index (load (field (avec--leaf-for v index) items)) (primitive/iand index 31)))
+
+;;; Append VALUE, copying into A what V's tag did not make. Returns the length.
+(defn avec-push! [T] [(v (mut (AVec T))) (a (dyn Allocator)) (value T)] (-> i64)
+  (let [count (.count v)
+        tag (.tag v)
+        tail (load (field v tail))]
+    (when (and (!= (primitive/cast i64 tail) 0) (= (.count tail) 32))
+      ; the full tail becomes the trie's rightmost leaf
+      (let [root (load (field v root))
+            shift (.shift v)]
+        (cond (= (primitive/cast i64 root) 0)
+                (let [fresh (avec--internal-new [T] a tag)]
+                  (avec--set-child! fresh 0 tail)
+                  (set! (.root v) fresh)
+                  0)
+              ; the root is full at this height: grow a level
+              (> (primitive/ishr count 5) (primitive/ishl 1 shift))
+                (let [fresh (avec--internal-new [T] a tag)]
+                  (avec--set-child! fresh 0 root)
+                  (avec--set-child! fresh 1 (avec--path a tag shift tail))
+                  (set! (.root v) fresh)
+                  (set! (.shift v) (+ shift 5))
+                  0)
+              :else (do (set! (.root v) (avec--push-tail a tag root shift count tail)) 0))
+        (set! (.tail v) (avec--none [T]))
+        0)
+      0)
+    (let [tail (load (field v tail))
+          target (if (= (primitive/cast i64 tail) 0)
+                     (avec--leaf-new [T] a tag 4)
+                     (avec--editable a tag tail (if (< (.count tail) (.cap tail)) (.cap tail) (* (.cap tail) 2))))
+          at (.count target)]
+      (store! (primitive/index (load (field target items)) at) value)
+      (set! (.count target) (+ at 1))
+      (set! (.tail v) target)
+      (set! (.count v) (+ count 1))
+      (+ count 1))))
+
+;;; Make element INDEX, which must be in range, VALUE, copying into A what V's
+;;; tag did not make.
+(defn avec-set! [T] [(v (mut (AVec T))) (a (dyn Allocator)) (index i64) (value T)] (-> i64)
+  (when (or (< index 0) (>= index (.count v)))
+    (panic "avec: set of index {} of a vector of {}" index (.count v)))
+  (if (>= index (avec--tail-offset v))
+      (set! (.tail v) (avec--node-set a (.tag v) (load (field v tail)) 0 index value))
+      (set! (.root v) (avec--node-set a (.tag v) (load (field v root)) (.shift v) index value)))
+  0)
+
+(impl [T] Len (AVec T)
+  (len [(v (ref (AVec T)))] (-> i64) (.count v)))
+
+; ---- persist ---------------------------------------------------------------------
+
+;; Trait dispatch reads a `(ptr X)` argument as the `(ptr T)` impl's, so the
+;; element's own impl is reached through these, with T explicit.
+(defn avec--write-at [(T Persist)] [(x (ref T)) (w (ptr PersistWriter))] (-> i64) (persist-write x w))
+(defn avec--read-at [(T Persist)] [(x (ref T)) (r (ptr PersistReader))] (-> T) (persist-read x r))
+(defn avec--measure-at [(T Persist)] [(x (ref T)) (m (ptr PersistMeter))] (-> i64) (persist-measure x m))
+
+(defn avec--persist-node [(T Persist)] [(node (ptr (AVNode T))) (cx (ptr PersistCx))] (-> (ptr (AVNode T)))
+  (if (or (= (primitive/cast i64 node) 0)
+          (and (.sharing cx) (call-ptr (.shared? cx) (.shared-cx cx) (primitive/cast (ptr i8) node))))
+      node
+      (let [a (.alc cx)]
+        (if (avec--leaf? node)
+            (let [copy (avec--leaf-new [T] a (.tag node) (.cap node))]
+              (for [i 0 (.count node)]
+                (store! (primitive/index (load (field copy items)) i)
+                        (persist-pointee [T] (primitive/index (load (field node items)) i) cx)))
+              (set! (.count copy) (.count node))
+              copy)
+            (let [copy (avec--internal-new [T] a (.tag node))]
+              (for [i 0 (.count node)]
+                (store! (primitive/index (load (field copy children)) i)
+                        (avec--persist-node (load (primitive/index (load (field node children)) i)) cx)))
+              (set! (.count copy) (.count node))
+              copy)))))
+
+(defn avec--measure-node [(T Persist)] [(node (ptr (AVNode T))) (m (ptr PersistMeter))] (-> i64)
+  (unless (= (primitive/cast i64 node) 0)
+    (set! (.bytes (.at m)) (+ (.bytes (.at m)) (primitive/sizeof (AVNode T))))
+    (if (avec--leaf? node)
+        (do (set! (.bytes (.at m)) (+ (.bytes (.at m)) (* (.cap node) (primitive/sizeof T))))
+            (for [i 0 (.count node)]
+              (avec--measure-at [T] (primitive/index (load (field node items)) i) m)))
+        (do (set! (.bytes (.at m)) (+ (.bytes (.at m)) (* 32 (primitive/sizeof (ptr (AVNode T))))))
+            (for [i 0 (.count node)]
+              (avec--measure-node (load (primitive/index (load (field node children)) i)) m))))
+    0)
+  0)
+
+;;; A vector owns its elements; nodes the target memory already holds are shared.
+(impl [(T Persist)] Persist (AVec T)
+  (persist-into [(self (ref (AVec T))) (cx (ptr PersistCx))] (-> (AVec T))
+    (AVec :root (avec--persist-node (load (field self root)) cx)
+          :tail (avec--persist-node (load (field self tail)) cx)
+          :count (.count self)
+          :shift (.shift self)
+          ; the copy's own nodes are sealed where they went: an edit of it copies
+          :tag (edit-tag-new)))
+  (persist-write [(self (ref (AVec T))) (w (ptr PersistWriter))] (-> i64)
+    (avec--write-at [i64] (.count self) w)
+    (for [i 0 (.count self)]
+      (avec--write-at [T] (avec-at self i) w))
+    0)
+  (persist-read [(self (ref (AVec T))) (r (ptr PersistReader))] (-> (AVec T))
+    (let [slot (primitive/alloc-stack i64)
+          n (avec--read-at [i64] slot r)
+          (mut out) (avec-new [T])
+          item (primitive/alloc-stack T)]
+      (if (or (< n 0) (> n (- (len (.bytes r)) (.at r))))
+          (do (set! (.failed r) true) out)
+          (do (for [i 0 n]
+                (avec-push! (mut out) (.alc r) (avec--read-at [T] item r)))
+              out))))
+  (persist-measure [(self (ref (AVec T))) (m (ptr PersistMeter))] (-> i64)
+    (avec--measure-node (load (field self root)) m)
+    (avec--measure-node (load (field self tail)) m)))

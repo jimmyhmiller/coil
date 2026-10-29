@@ -363,6 +363,50 @@ What it found on the first pass, each a per-submission leak or copy:
 submission (32 KB of it JIT pages: an image is at least one code and one data
 page), the compiler state 14 KB.
 
+### Step 3b — a compile reads the Env in place
+
+The prefix design (above) reads the Env through fallbacks: a checker looks in its
+own tables, then in `prior_cx`'s; the loader walks `LS.parent`; the resolution
+registries fall back through `resolution_parent`; the semantic maps through a
+base. Each lookup had the fallback added by hand, so a consumer that enumerates a
+table directly sees only the compile's own records. That is how a self-containing
+type crashed the REPL (review of 2026-10-29). The fallbacks are also most of what
+step 3 was to delete. This step replaces them.
+
+**The mechanism: tables a compile extends without touching the Env's.** The Env's
+tables become persistent maps and vectors whose nodes live in the Env's pool. A
+compile's checker, loader and registries start as the Env's tables themselves (a
+header copy, O(1)) and register into them: an edit copies the path from the root
+to the changed node into the compile's arena and leaves the Env's nodes as they
+were. Lookups are one level. Accept is `persist-clone-sharing` of the compile's
+tables into the pool, which copies exactly the nodes the compile made and shares
+the rest. The per-table append and copy code in `env.coil` goes with the
+fallbacks.
+
+`coil.pmap`/`coil.pvec` do not fit as they are: their nodes are reference counted,
+so a compile sharing the Env's nodes would write their counts (an accepted Env is
+never written, and `COIL_JIT_PROTECT` seals it), and they free nodes one by one,
+where the Env's live in an arena. The tables use an arena form instead, as
+Clojure's transients do: each node carries the tag of the edit session that made
+it, and a session edits in place only the nodes it made; anything else is copied
+into its allocator. Nothing is counted or freed; a compile's arena goes with the
+compile, and the pool keeps what accept copied.
+
+Stages, each gated (FAST, the JIT suites, `build full`, x64) and pushed:
+
+1. `coil.amap` / `coil.avec` in the stdlib: arena persistent map and vector, with
+   session tags, `Persist` (sharing what the pool owns), and tests.
+2. The checker's tables (signatures, constants, structs, sums, variants, traits,
+   trait methods, impls and their three indexes) become them. Deleted: `prior_cx`,
+   `base_tables`, joined buckets, impl position offsets, `setup-base-miss`, the
+   `retained-impl?` path, and `env-tables-over` with its helpers. A retirement
+   removes from the tables, so it no longer sets the checker up whole.
+3. The loader's function index (`checked_functions`) and the `LS.parent` walks.
+4. The resolution registries (`resolution_parent`) and the semantic maps' base.
+5. Accept: the Env is the compile's tables, cloned with sharing. Deleted: the
+   `env-*-over` family, `env-list-replacing`, the declarations and imports
+   mergers, and the prefix test.
+
 ### Step 4 — save and load
 
 - `(derive Persist T)` also derives `Serialize` and `Deserialize` through
