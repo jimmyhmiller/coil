@@ -548,6 +548,24 @@ JIT suites, `build full`, nollvm and x64, and a measured line count:
   (`built`), and `env-declarations-over` with its six helpers. 1,000 definitions
   in one session: 26.5 s, down from 39.8 s. A small `AVec` now has a small tail
   (4, doubling to 32), since per-form declaration lists hold a name or two.
+  Then the loader's lists: `loaded`, `readpaths`, `readmods`, the primitive
+  tables, `sources`, `expansions`, `retained_forms`, the namespace lists,
+  `stage_excluded`, `core_declared_modules`, `indexed_paths`, `imports`,
+  `hygiene_imports` and `exports` are `AVec`s. A compile's are its parent's
+  edited (`ls-inherit!` copied all of them, the import and export tables deeply),
+  and the Env keeps them as they are (`env-loader-over` merged them back). An
+  import or export entry is made a compile's own (its lists copied) the first
+  time it is added to (`imp-entry`, `exp-entry`), not when it is only made sure
+  of (`imp-ensure!`). The retained forms are the inherited list extended unless
+  an inherited form died. The declaration table holds its entries by pointer:
+  by value, copying the leaf of the session's module copied 32 entries of ~500
+  bytes. Taking the transaction's entry out of the table moves the names after
+  it and pops (`AVec` has `pop!` now) instead of rebuilding the module's list.
+  A view's copy of a table it may add to is an `avec-edit`: a plain header copy
+  shares the tag, as two handles on one transient do. Deleted: `ls-copy-imports`,
+  `ls-copy-exports`, `env-loader-over`, `env-list-over`, `env-imports-over`,
+  `env-exports-over`, `env-tail-onto!`. A one-line submission carves 41 KB of the
+  pool (43 KB at stage B) and takes 6.8 ms.
 - E. Under the JIT gate, the pool's memory below its last compaction is
   `mprotect`ed read-only, so a store into accepted state faults at the store.
 
