@@ -385,7 +385,7 @@ fallbacks.
 
 `coil.pmap`/`coil.pvec` do not fit as they are: their nodes are reference counted,
 so a compile sharing the Env's nodes would write their counts (an accepted Env is
-never written, and `COIL_JIT_PROTECT` seals it), and they free nodes one by one,
+never written), and they free nodes one by one,
 where the Env's live in an arena. The tables use an arena form instead, as
 Clojure's transients do: each node carries the tag of the edit session that made
 it, and a session edits in place only the nodes it made; anything else is copied
@@ -406,6 +406,21 @@ Stages, each gated (FAST, the JIT suites, `build full`, x64) and pushed:
 5. Accept: the Env is the compile's tables, cloned with sharing. Deleted: the
    `env-*-over` family, `env-list-replacing`, the declarations and imports
    mergers, and the prefix test.
+
+Done so far: stage 1 (`dfca46a0`) and stage 2. A check's tables are `AVec`/`AMap`
+under its own edit tag; a check with a base starts from the base's signatures and
+constants always, and from its types, traits and impls when the program begins
+with the base's records (`setup-from-base!`); a retirement removes the names from
+the indexes it begins with (`setup-forget-retired!`). Lookups are one level, so a
+consumer that enumerates a table sees all of it. Deleted: `prior_cx`, the joined
+buckets, impl position offsets, retirement masking (`cx-base-visible?`,
+`cx-impl-retired?`), `env-tables-over` and its six helpers, the linear struct, sum,
+trait and variant scans (now indexed), and the write-only `static_consts`. A record
+a check changes through a lookup is copied into its own nodes first
+(`cx-sig-own!`). The accepted layer holds the checker's tables as they are.
+Pipeline differential against stage 1: 208 dumps, 0 differ. `coil repl`, 200
+submissions: 8.4 ms median, 33 KB carved and 12 KB kept per accept, as before.
+src/compiler net −100 lines.
 
 ### Step 4 — save and load
 

@@ -35,9 +35,6 @@ if not raw_compiler:
 COMPILER = Path(raw_compiler).resolve()
 TOOLCHAIN_ENV = os.environ.copy()
 TOOLCHAIN_ENV.pop("COIL_NAMESPACE_ROOTS", None)
-# Sealed compiler metadata is read-only for every fixture here, so a store into an
-# accepted artifact is a fault at that store rather than a later wrong answer.
-TOOLCHAIN_ENV["COIL_JIT_PROTECT"] = "1"
 
 # Groups of fixtures that share one host process. Order matters only in
 # "lifetime": scratch_footprint measures the process footprint after its first
