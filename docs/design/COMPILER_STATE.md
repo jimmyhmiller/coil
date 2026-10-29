@@ -450,6 +450,15 @@ from the Env's tables as they are and accept is one sharing copy.
   17 ns, get 45 vs 16 ns. Extending a shared 10k-entry map by 100: 19 µs and 71 KB,
   against 883 µs and 1 MB to copy a `HashMap`. Vectors: push 7 vs 3 ns, random get
   9 vs 4 ns at 1M.
+- *Node layout* (measured in stage B): with entries stored in the slots, a node's
+  size follows K and V, so a map of 574k node ids to `Type`-sized values took
+  195 MB against `HashMap`'s 95 MB. Most of it was the single-entry bitmap nodes
+  under full nodes and the slots that hold only a child. A slot is now one word,
+  as an element of Clojure's node arrays is one reference: an entry's address,
+  or a child's with the low bit set, and the slots follow the header in the
+  node's one allocation. Entries are never changed (a new value is a new entry),
+  so copied nodes share them. The same map takes 86 MB and inserts 30% faster.
+  Extending a shared 10k-entry map by 100 now copies 34 KB, down from 71 KB.
 - *What the hot paths are* (`sample` of `coil check src/compiler/main.coil`, 723
   active samples): semantic-map inserts and gets ~7%, the one table near a million
   entries; a linear scan of trait methods (`methods-has`) ~6%, introduced by stage
@@ -476,7 +485,25 @@ JIT suites, `build full`, nollvm and x64, and a measured line count:
 
 - A. `coil.amap` as Clojure's hash trie (done here); `AVec` with `ArrayList`'s
   surface and an allocator; a trait-method index in the checker.
-- B. The semantic maps on `AMap`; the over/under base deleted.
+- B. The semantic maps on `AMap`. Each map (types, bindings, resolutions) is an
+  `AMap` keyed by node id: a record is a `set!`, a lookup a `get`. A check's maps
+  begin as the maps of the state it builds on, under a fresh edit tag
+  (`sem-maps-begin!`), so they are complete and one level; the one other source
+  is the application's maps beneath a metaprogram environment viewed over it (the
+  environment's checks record only what the application's do not answer).
+  Saving and restoring (tower retries, context switches) copy three headers and
+  retag the live maps, so nothing saved is edited afterwards. The Env keeps a
+  compile's maps as they are, and accept's sharing copy copies the nodes the
+  compile made. Deleted: the history lists and the positions into them
+  (`sem-snapshot-entry-live?`, `snap-*-at`'s scans, the dead `type-map-mark`/
+  `type-map-reinstate!`), the `over` half of `SemBase`, `sem-bid-raise!`,
+  `env-live-maps` and its filtering, `env-maps-over!`, `env-maps-add!` and its
+  put helpers, `combine-sem-maps`' rebuild, and the reservation by function count.
+  Measured against stage A: `coil check src/compiler/main.coil` peaks at 2325 MB,
+  down from 2353 MB, and takes ~6% more user time (2.60 s vs 2.44 s, best of five
+  runs). The 606k type records are scattered trie inserts where they used to be
+  flat-table inserts. A one-line REPL submission takes the same time (7.7 ms) and
+  carves 43 KB of the pool against 34 KB: each new record copies its path.
 - C. `Program`'s lists on `AVec`; `semantic-inherit-program!`'s copying and the
   checker's prefix tests deleted: a compile's program is the Env's, extended.
 - D. The loader's lists, declarations, imports/exports, registries and the native
