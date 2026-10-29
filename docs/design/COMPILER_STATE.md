@@ -287,6 +287,35 @@ compaction grows 33 KB per submission, and the rest is the JIT's code.
   added and 2.5–4k removed across the loader, resolver, checker, metaengine and
   driver.
 
+**A compile builds on the Env by prefix** (built after the cut):
+
+- A compile's program is the Env's records followed by its own: the resolver
+  copies the accepted program's lists in front of the submission's in one bulk
+  copy each (`out-extend!`), with no per-record merging.
+- The checker reads the prefix from the Env's checker tables, not by registering
+  it again. An accepted layer keeps the structs, sums, variants, traits, trait
+  methods and impls its checker registered, with the three impl indexes; a check
+  whose program begins with the accepted program byte for byte
+  (`setup-base-prefix?`) sets `base_tables`, registers only what follows, and its
+  lookups (`struct-find`, `cx-impl-bucket`, `cx-method`, …) read its own tables,
+  then the base's. Impl positions are local to each table and offset at lookup,
+  so a layer's positions never move. A compile that retires or shadows an
+  accepted record changes the prefix and is set up whole, as before; so is a
+  metaprogram environment read over its application, whose program mixes the two.
+- Accept appends. When the Env built on is held only by the session and shares
+  nothing (`env-exclusive?`), each list the compile extended (program lists,
+  loader lists, checker tables and indexes, signatures and constants, the
+  declarations of a module that declared more, the resolution registries, the
+  native program) gets only what the compile added, copied into the Env's pool;
+  a list the compile changed otherwise is copied whole. The native program keeps
+  only what mono reads of it (functions as declarations, structs, sums, constants,
+  instance origins), indexed by name; a compile that retires rebuilds it, since
+  appending cannot remove.
+
+Measured, 200 one-line `coil repl` submissions: median 12.3 → 8.2 ms with no
+slope over the session; accept copies ~135 KB a submission into the pool (was
+~680 KB and growing with the session), flat.
+
 ### Measuring memory
 
 Memory is named by whoever holds it, never inferred from resident size:
