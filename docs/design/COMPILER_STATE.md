@@ -327,7 +327,7 @@ Memory is named by whoever holds it, never inferred from resident size:
   and JIT pages are charged to `jit.images`. The report's `unaccounted` line is the
   resident size less every account.
 - Sites: `COIL_MEMORY_SITES=NAME,…` (or `all`) charges each block to the stack
-  that allocated it; an arena observing an account (`ScratchArena::observe!`)
+  that allocated it, and the report lists the `COIL_MEMORY_SITES_TOP` (8) largest; an arena observing an account (`ScratchArena::observe!`)
   charges every allocation it carves, exactly, through mark rewinds and resets.
 - `persist-footprint`: what a value owns by field path, from the Persist derive.
 - `coil repl`'s `:memory` prints the tree and the compiler state's footprint;
