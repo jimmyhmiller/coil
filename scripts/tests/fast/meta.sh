@@ -193,4 +193,28 @@ case "$rc|$out|$raced" in
 $raced" ;;
 esac
 
+# ---- what a transform is handed on the library state ---------------------------
+# A compile builds on the toolchain's library state, which holds the standard
+# library compiled. A transform reading every module is still handed the library's:
+# the compile starts again from source, and sees what one without the state sees.
+# One registered `:modules (phase/OwnModules)` runs on the state, handed the
+# program's modules alone.
+mkdir -p "$WORK/count"
+count_transform() {
+  printf '(module count-sink)\n(import "coil.primitive" :as primitive)\n(import "coil.phase" :as phase)\n(defn count-modules [(modules Code)] (-> Code)\n  (eprintln "transform saw {} modules" (primitive/code-count modules))\n  `(do ~@modules))\n(transform count-modules%s)\n' "$1" \
+    > "$WORK/count/count_sink.coil"
+}
+printf '(module counted)\n(import "count-sink" :use *)\n(defn main [] (-> i64) 0)\n' > "$WORK/count/counted.coil"
+count_transform ""
+on=$("$COIL" check "$WORK/count/counted.coil" 2>&1 | grep -m1 "transform saw")
+off=$(COIL_LIBRARY_STATE=0 "$COIL" check "$WORK/count/counted.coil" 2>&1 | grep -m1 "transform saw")
+if [ -n "$on" ] && [ "$on" = "$off" ]; then ok "a transform reading every module is handed the library's on the library state too"
+else bad "a transform reading every module is handed the library's on the library state too" "with the state: $on; without: $off"; fi
+count_transform " :modules (phase/OwnModules)"
+own=$("$COIL" check "$WORK/count/counted.coil" 2>&1 | grep -m1 "transform saw")
+own_n=${own//[^0-9]/}; off_n=${off//[^0-9]/}
+if [ -n "$own_n" ] && [ -n "$off_n" ] && [ "$own_n" -lt "$off_n" ]; then
+  ok "a transform of the program's own modules runs on the library state"
+else bad "a transform of the program's own modules runs on the library state" "$own (without the state: $off)"; fi
+
 if [ "$fail" = 0 ]; then echo "meta: PASS"; else echo "meta: FAILED"; exit 1; fi

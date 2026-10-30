@@ -47,8 +47,7 @@ def build(args: argparse.Namespace) -> None:
                 *llvm_flags("dynamic"))
         toolchain_stamp.stamp_path(output).write_text(stamp)
         print(f"built compiler candidate -> {output}")
-        # Compile-time units are gone; nothing reads an older build's.
-        shutil.rmtree(output.with_name(output.name + ".ct-units"), ignore_errors=True)
+        build_library_state(output)
         return
 
     host = (sys.platform, platform.machine().lower())
@@ -155,8 +154,9 @@ def install_library(prefix: Path) -> Path:
 
     shutil.copy2(ROOT / "src" / "compiler" / "prelude.coil", libdir / "prelude.coil")
     # Nothing reads these any more: an older install's compile-time units, and
-    # the sealed coil.jit archive the per-backend units in units/ replaced.
-    for leftover in ("ct-units", "sealed"):
+    # the sealed coil.jit archive the per-backend units in units/ replaced. The
+    # library state belongs to the compiler being installed and is built for it.
+    for leftover in ("ct-units", "sealed", "library-state"):
         shutil.rmtree(libdir / leftover, ignore_errors=True)
     # `coil.jit` is an optional source-linked compiler SDK. Keep its implementation
     # out of stdlib/ so ordinary programs never discover or link compiler modules.
@@ -273,10 +273,22 @@ def install(args: argparse.Namespace) -> None:
         staged.unlink(missing_ok=True)
     toolchain_stamp.stamp_path(destination).write_text(stamp)
     print(f"installed {source} -> {destination}")
+    build_library_state(destination)
     if not args.no_warm_unit:
         warm_jit_unit(destination, libdir)
         warm_lint_profile(destination, libdir)
     report_installed(destination)
+
+
+def build_library_state(compiler: Path) -> None:
+    """Build COMPILER's library state: the compiler state of a program that
+    loads only the standard library, which every compile it runs then builds
+    on (`library-state-path` in driver.coil names where it goes: under
+    `<lib>/coil/library-state` for an installed compiler, beside any other).
+    A compile without one, or with one that is not current, starts from
+    nothing, so a state is never built on demand: this builds it."""
+    with tempfile.TemporaryDirectory(prefix="coil-library-state-") as cwd:
+        subprocess.run([str(compiler), "build-library-state"], cwd=cwd, check=True)
 
 
 def warm_jit_unit(compiler: Path, libdir: Path) -> None:

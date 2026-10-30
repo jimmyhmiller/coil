@@ -357,6 +357,16 @@ New API this project added (all shipped):
   again, so it must not rely on newly emitted macro calls. Semantic reflection is empty
   in both boundary phases, and registrations must be literal top-level forms rather
   than generated retroactively.
+- **Which modules it reads.** A checker or transform is handed every module of the
+  program, the standard library's among them. A compile normally builds on the
+  toolchain's library state, where the library is compiled already, and those
+  modules are not there to hand over: a registration that reads every module makes
+  the compile start again from source, so it sees them. One that reads and changes
+  only the program's own modules says so with `:modules (phase/OwnModules)`, a
+  `coil.phase.Modules` value (the default is `(phase/AllModules)`), and runs on the
+  state, handed the program's modules alone: `(transform tr-run :phase
+  (phase/AfterExpand) :modules (phase/OwnModules))`. The promise is the
+  registration's to keep; a transform that rewrites library code must not make it.
 - **`(primitive/binding-of NODE)` → the local-binding identity** a reference resolves to (an
   i64; 0 = a global const/function), recorded by the type-checker per reference.
   Two references with the same positive id name the SAME local, so a checker

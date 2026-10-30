@@ -126,6 +126,9 @@ mkdir -p "$(dirname "$DEST")"
 cp "$S2" "$DEST"
 printf '%s\n' "$TOOLCHAIN_STAMP" > "$DEST.toolchain"
 echo "=== VERIFIED self-host compiler installed -> $DEST ==="
+# The library state every compile of $DEST builds on (driver.coil,
+# library-state-path), as an installed toolchain has one.
+"$DEST" build-library-state || { echo "building the library state FAILED"; exit 1; }
 if [ "${COIL_SKIP_INSTALL:-0}" = 1 ]; then
   echo "=== user-level install skipped (COIL_SKIP_INSTALL=1) ==="
 else

@@ -87,3 +87,6 @@ DEST="${1:-build/bin/coil-nollvm}"
 mkdir -p "$(dirname "$DEST")"
 cp "$S2" "$DEST"
 echo "=== VERIFIED LLVM-free compiler installed -> $DEST ==="
+# The library state every compile of $DEST builds on (driver.coil,
+# library-state-path), as an installed toolchain has one.
+"$DEST" build-library-state || { echo "building the library state FAILED"; exit 1; }

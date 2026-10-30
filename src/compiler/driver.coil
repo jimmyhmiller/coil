@@ -5042,6 +5042,225 @@
                                               (wide-int-unsupported a backend (.func r))))
                     false))))))
 
+;; ---- the library state ----------------------------------------------------------
+;; Every program loads the prelude and what it imports, and expanding that library
+;; is most of what compiling a small program costs. The toolchain keeps the
+;; compiler state of a program that loads only the library -- an Env, saved by its
+;; Persist derive -- and a compile builds on it as a `coil.jit` submission builds on
+;; its session: the library's sources, declarations, checked bodies and facts are
+;; the state's, and only what the entry file adds is read, expanded and checked.
+;; The metaprograms the library's macros were compiled into are process state and
+;; are not kept; a compile builds again the few it calls.
+;;
+;; A state is used only when it is current: written by this toolchain for this
+;; target (`env-load`), and every library file it holds reads the same as the file
+;; beside this compiler now. Otherwise the compile starts from nothing, as one
+;; always could. Nothing builds a state on demand or writes into the toolchain:
+;; `coil build-library-state` does, run by install, the candidate build and the
+;; rebootstraps.
+
+;;; Where this compiler's library state is: beside an installed library,
+;;; `<prefix>/lib/coil/library-state/<target>.state`; for any other compiler -- a
+;;; candidate or stage binary of a checkout -- beside the binary,
+;;; `<binary>.library-state/<target>.state`.
+(defn library-state-path [(a (dyn Allocator))] (-> (slice u8))
+  (let [layout (stdlib-layout a)
+        dir (if (stdlib-installed? layout)
+                (path-join a (dirname (.libs layout)) "library-state")
+                (sconcat a (self-command-path a) ".library-state"))]
+    (path-join a dir (sconcat a (toolchain-target a) ".state"))))
+
+;;; The file a library source of the state names: the prelude, or a bundled module
+;;; (`<bundled NAME>`); None for a source no file is behind.
+(defn library-state-source-file [(a (dyn Allocator)) (name (slice u8))] (-> (Option (slice u8)))
+  (let [layout (stdlib-layout a)]
+    (cond (= name "<prelude>") (Some (.prelude layout))
+          (and (starts-with name "<bundled ") (= (get name (- (len name) 1)) (: 62 u8)))
+            (let [bn (subslice name 9 (- (len name) 1))]
+              (Some (if (starts-with bn "compiler/")
+                        (path-join a (.sdk layout) (subslice bn 9 (len bn)))
+                        (path-join a (.libs layout) bn))))
+          :else (None [(slice u8)]))))
+
+;;; Does every library file ENV holds read the same as the file this compiler
+;;; would load now?
+(defn library-state-current? [(a (dyn Allocator)) (env (ptr Env))] (-> bool)
+  (let [sources (field (field env loader) sources)]
+    (block :current
+      (for [i 0 (len (load sources))]
+        (let [source (elem sources i)]
+          (match (library-state-source-file a (.name source))
+            (None [] 0)
+            (Some [file]
+              (match (read-file-opt a (to-cstr a file))
+                (None [] (break :current false))
+                (Some [text] (unless (= text (.text source)) (break :current false))))))))
+      true)))
+
+;;; The library state, loaded once per process: null when there is none, it is
+;;; not this toolchain's, or it is not current.
+(defstruct LibraryStateCell [(tried bool) (holder (ptr EnvHolder))])
+
+(defn library-state [(a (dyn Allocator))] (-> (ptr EnvHolder))
+  (let [cell (primitive/alloc-static LibraryStateCell)]
+    (unless (.tried cell)
+      (set! (.tried cell) true)
+      (let [span (tr/span-begin "library-state.load")
+            work (malloc-allocator)]
+        (match (read-file-opt work (to-cstr work (library-state-path work)))
+          (None [] (tr/count "library-state.missing" 1))
+          (Some [bytes]
+            (match (env-load work bytes)
+              (Err [_] (tr/count "library-state.foreign" 1))
+              (Ok [holder]
+                (if (library-state-current? work (field holder env))
+                    (set! (.holder cell) holder)
+                    (do (tr/count "library-state.stale" 1)
+                        (env-release! holder)))))))
+        (tr/span-end span))
+      0)
+    (.holder cell)))
+
+;;; Does a compile of the entry file SRC start from the library state? Only one
+;;; whose starting point is the state's: the bundled library and its default
+;;; profile, no core providers of its own, no --debug-checks, a host compiler that
+;;; runs its metaprograms natively, no reader, no checker registered before the
+;;; compile that reads every module, and an entry that neither is a module of the
+;;; state nor provides core definitions. COIL_LIBRARY_STATE=0 turns it off.
+(defn library-state-applies? [(a (dyn Allocator)) (src (slice u8))] (-> bool)
+  (let [off (unit-getenv c"COIL_LIBRARY_STATE")
+        providers (unit-getenv c"COIL_CORE_PROVIDERS")
+        invocation (reader-invocation)]
+    (cond (and (!= (primitive/cast i64 off) 0) (= (from-cstr off) "0")) false
+          (not (bundled-stdlib-enabled? a)) false
+          (!= (stdlib-profile a) "full") false
+          (and (!= (primitive/cast i64 providers) 0) (> (len (from-cstr providers)) 0)) false
+          (not (lint-profile-native?)) false
+          (= (.isset (meta-build-box)) 0) false
+          ; the library's own macros expand differently under --debug-checks
+          ; (`(primitive/debug-checks?)`), and the state is the library expanded
+          ; without them
+          (debug-checks-on?) false
+          (.unit_pretransformed (driver-unit-state)) false
+          ; a checker the command registered already reads every module
+          (and (!= (.init (checker-reg-box)) 0) (.reads_library (.reg (checker-reg-box)))) false
+          (.active (generated-owner)) false
+          (> (len (.reader_artifact (driver-unit-state))) 0) false
+          (configured-readers?) false
+          (and (!= (.ready invocation) 0) (> (len (.paths invocation)) 1)) false
+          :else (match (find src "provide-core") (Some [_] false) (None [] true)))))
+
+;;; The library state to build the compile of the entry file PATH, SRC, on, or
+;;; null. S is the compile's fresh loader state: a `--use` namespace that is a
+;;; reader provider is found through its namespace index, and reads the entry
+;;; itself, which a compile on the state does not.
+(defn library-state-for [(a (dyn Allocator)) (s (mut LS)) (src (slice u8)) (path (slice u8))] (-> (ptr EnvHolder))
+  (let [none (primitive/cast (ptr EnvHolder) 0)]
+    (if (or (not (library-state-applies? a src))
+            (and (> (len (load (cli-uses))) 0)
+                 (do (namespace-index-build-from! (mut s) path)
+                     (match (discover-reader-provider a (mut s))
+                       (NoReaderProvider [] false)
+                       (_ true)))))
+        none
+        (let [holder (library-state a)]
+          (cond (= (primitive/cast i64 holder) 0) none
+                ; an entry that is one of the state's modules is compiled as itself
+                (match (namespace-declared-module src)
+                  (Some [m] (library-state-loads? holder m))
+                  (None [] false))
+                  (do (tr/count "library-state.entry-is-library" 1) none)
+                :else holder)))))
+
+;;; Has the library state HOLDER loaded MODULE?
+(defn library-state-loads? [(holder (ptr EnvHolder)) (module (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (for m (.loaded (field (field holder env) loader)) (when (= m module) (set! found true)))
+    found))
+
+;;; The later of identity counters X and Y.
+(defn library-state-later [(x i64) (y i64)] (-> i64) (if (> x y) x y))
+
+;;; Make S, a fresh compile's loader state, the library state HOLDER's, as a
+;;; session's revision builds on its base (`compiler-revision-enter!`): its loader
+;;; lists, core providers and declarations, and identity domains that continue
+;;; past the state's.
+(defn library-state-enter! [(a (dyn Allocator)) (s (mut LS)) (holder (ptr EnvHolder))] (-> i64)
+  (let [env (field holder env)
+        providers (field env core_providers)
+        declarations (field env core_declarations)]
+    (ls-inherit! (mut s) (env-view a env))
+    (when (!= (.init providers) 0)
+      (for [i 0 (len (load (.names providers)))]
+        (core-contribution-add! (get (load (.names providers)) i)
+                                (get (load (.modules providers)) i)
+                                (!= (get (load (.roots providers)) i) 0))))
+    (when (!= (.init declarations) 0)
+      (for [i 0 (len (load (.names declarations)))]
+        (core-decl-add! (get (load (.modules declarations)) i)
+                        (get (load (.names declarations)) i)
+                        (get (load (.los declarations)) i)
+                        (get (load (.his declarations)) i)
+                        (get (load (.srcs declarations)) i)
+                        (get (load (.ctxts declarations)) i))))
+    (set! (.n (node-id-cell)) (library-state-later (.n (node-id-cell)) (.next_node_id env)))
+    (set! (.form_id (loader-unit-state)) (library-state-later (.form_id (loader-unit-state)) (.next_form env)))
+    (set! (.n (gensym-cell)) (library-state-later (.n (gensym-cell)) (.n (field env next_gensym))))
+    (set! (.elaboration_id (expander-unit-state))
+          (library-state-later (.elaboration_id (expander-unit-state)) (.next_elaboration env)))
+    (let [parent (.parent s)]
+      (set-closure-parents! parent (.meta_environment parent)))
+    (tr/count "library-state.used" 1)
+    0))
+
+;;; `coil build-library-state [PATH]`: check a program that loads only the
+;;; library, in a session that never runs code, and save its compiler state at
+;;; PATH (by default `library-state-path`).
+(defn build-library-state-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (block :command
+    (when (> (primitive/cast i64 argc) 3)
+      (ps (stderr) "usage: coil build-library-state [PATH]\n")
+      (return-from :command 2))
+    ; a compile on such a compiler never uses one (`library-state-applies?`)
+    (when (or (not (lint-profile-native?)) (= (.isset (meta-build-box)) 0))
+      (ps (stderr) "note: this compiler does not run its metaprograms natively, so it keeps no library state\n")
+      (return-from :command 0))
+    (let [path (if (= (primitive/cast i64 argc) 3)
+                   (from-cstr (load (index argv 2)))
+                   (library-state-path a))
+          raw (repl-session-new-with-runner a
+                                            (fnptr-of repl-arm64-runner)
+                                            (fnptr-of repl-arm64-reclaim!)
+                                            (fnptr-of repl-arm64-generation-count)
+                                            (fnptr-of repl-arm64-retain-current!)
+                                            (fnptr-of repl-arm64-release-token!)
+                                            (fnptr-of repl-arm64-token-leases))
+          _checked (repl-session-checked-only! raw)
+          env (repl-session-env-check! raw (primitive/cast (ptr i8) 0) "(module coil.library-state)")]
+      (when (= (primitive/cast i64 env) 0)
+        (ps (stderr) (repl-session-diagnostic raw))
+        (return-from :command 1))
+      (let [bytes (repl-session-env-save raw env a)]
+        (when (= (len bytes) 0)
+          (ps (stderr) (repl-session-diagnostic raw))
+          (return-from :command 1))
+        (let [dir (dirname path)]
+          (unless (= (access (to-cstr a dir) 0) (: 0 i32))
+            (fs/make-dir (to-cstr a dir) 493)
+            0)
+          ; written beside the destination and renamed over it, so a compile
+          ; reading the state never sees half of one
+          (let [staged (temp-sibling-or-exit path)]
+            (match (fs/write-file a staged bytes)
+              (Err [_] (do (ps (stderr) (sconcat3 a "error: cannot write " staged "\n")) (return-from :command 1)))
+              (Ok [_] 0))
+            (unless (= (rename (to-cstr a staged) (to-cstr a path)) (: 0 i32))
+              (ps (stderr) (sconcat3 a "error: cannot write " path "\n"))
+              (return-from :command 1)))
+          (repl-session-env-release! raw env)
+          (repl-session-free! raw)
+          0)))))
+
 ;;; Load the entry file PATH's FORMS, as its reader produced them, with
 ;;; everything they import: the load step of every compile, and of every stage
 ;;; dump, so a dump sees the program `check` sees. A loader error is left in
@@ -5074,9 +5293,96 @@
     (tr/span-end load-span))
   0)
 
+;;; `frontend-load!` for a compile on the library state (`library-state-enter!`):
+;;; the library is loaded already, so only the entry's own forms, its `--use`
+;;; imports and test roots are, as `load-program` loads them after the prelude.
+;;; The entry's source is not the first, so the namespace index is told it.
+(defn frontend-load-on-library-state! [(a (dyn Allocator))
+                                       (s (mut LS))
+                                       (src (slice u8))
+                                       (path (slice u8))
+                                       (forms (ptr (ArrayList Sexp)))] (-> i64)
+  (loader-casefold-source! src forms)
+  (let [normalized (own-form-list a forms)
+        load-span (tr/span-begin "frontend.load")]
+    (namespace-index-build-from! (mut s) path)
+    ; The state's entry is not this compile's. An entry with no module form is
+    ; given one named for its file, as `prepend-uses` names it from the first
+    ; source of a compile from nothing -- here the state's.
+    (set! (.entry_module s)
+          (match (declared-module normalized)
+            (Some [module] module)
+            (None [] (entry-module-name a path))))
+    (let [program (prepend-uses a (mut s) normalized)]
+      (match (declared-module program)
+        (Some [module]
+          (do
+            (loaded-insert! (mut s) module)
+            (set! (.entry_module s) module)
+            (set! (.entry_module (semantic-workspace (mut s))) module)
+            0))
+        (None [] 0))
+      (ci/cimport-load-begin!)
+      (process-forms (mut s) program (dirname path) (None [(slice u8)])))
+    (ci/cimport-load-end!)
+    (load-test-roots! a (mut s))
+    (tr/span-end load-span))
+  0)
+
+;;; Read the entry file of a compile on the library state, at SID: the plain
+;;; read `initial-read` makes when no reader is involved, which is the only one a
+;;; compile on the state makes (`library-state-applies?`).
+(defn initial-read-on-library-state [(a (dyn Allocator))
+                                     (s (mut LS))
+                                     (src (slice u8))
+                                     (path (slice u8))
+                                     (sid i64)] (-> InitialRead)
+  (namespace-index-build-from! (mut s) path)
+  (match (read-all a src sid)
+    (Ok [forms]
+        (InitialForms
+          :forms forms
+          :reader_state (primitive/cast (ptr LS) 0)
+          :definition_module ""))
+    (Err [d] (InitialReadError d))))
+
 ;;; Expand the loaded program, as every compile does.
 (defn frontend-expand! [(a (dyn Allocator)) (s (mut LS))] (-> (Result i64 Diag))
   (expand-stage3-except (mut s) (box-al [(slice u8)] a (avec-to-list (field s stage_excluded) a))))
+
+;;; Set by a compile on the library state that registered a checker or transform
+;;; reading every module, the library's among them: the state holds those compiled
+;;; and cannot hand them over, so the compile starts again from nothing.
+(defstruct LibraryStateRestart [(wanted bool)])
+
+(defn library-state-restart [] (-> (ptr LibraryStateRestart))
+  (primitive/alloc-static LibraryStateRestart))
+
+;;; Whether S, a compile on the library state that has loaded its program, has to
+;;; start again from nothing (`LibraryStateRestart`): it loaded a checker or
+;;; transform that reads every module. A registration is a literal top-level form
+;;; of a loaded module, so every one is known before anything expands. One whose
+;;; `:modules` is not a coil.phase.Modules counts too: the compile from nothing
+;;; reports it.
+(defn library-state-must-restart? [(a (dyn Allocator)) (s (mut LS))] (-> bool)
+  (let [reads
+          (block :reads
+            (for [i 0 (len (.out s))]
+              (let [tf (elem (field s out) i)
+                    f (field tf form)]
+                (when (or (is-checker-form f) (is-transform-form f))
+                  (match (registration-own-modules? f (.module tf) (field s imports) (field s exports) a)
+                    (Ok [own] (unless own (break :reads true)))
+                    (Err [_] (break :reads true))))))
+            false)]
+    (when reads (set! (.wanted (library-state-restart)) true) 0)
+    reads))
+
+;;; A compile on the library state that registered, while expanding, a checker
+;;; or transform reading every module, which `library-state-must-restart?` found
+;;; none of before: a compiler bug, and the compile cannot go on.
+(defn library-state-registration-missed [] (-> Diag)
+  (derr "compiler bug: a compile on the library state registered a checker or transform that reads every module, which its loaded forms did not show"))
 
 (defn run-pipeline-with-code-session [(a (dyn Allocator))
                                       (src (slice u8))
@@ -5092,6 +5398,41 @@
                                       (reader-module (slice u8))
                                       (reader-maps (ptr SemMapsSnap))
                                       (reader-a (dyn Allocator))] (-> (Option (ptr Program)))
+  (let [; what the command registered before compiling (a lint profile's checkers)
+        registered (load (checker-reg-box))
+        first (run-pipeline-attempt a src cwd w path srcpaths srctexts code-session-state
+                                    reader-setup reader-program reader-name reader-module
+                                    reader-maps reader-a true)]
+    (if (not (.wanted (library-state-restart)))
+        first
+        (do
+          (set! (.wanted (library-state-restart)) false)
+          (tr/count "library-state.restarted" 1)
+          ; nothing of the attempt on the state, which stopped once it had loaded
+          ; the program, is this compile's
+          (store! (checker-reg-box) registered)
+          (set-closure-parents! (primitive/cast (ptr LS) 0) (primitive/cast (ptr LS) 0))
+          (run-pipeline-attempt a src cwd w path srcpaths srctexts code-session-state
+                                reader-setup reader-program reader-name reader-module
+                                reader-maps reader-a false)))))
+
+;;; One compile of the entry file PATH: on the library state when STATE-ALLOWED
+;;; and it applies, and otherwise from nothing.
+(defn run-pipeline-attempt [(a (dyn Allocator))
+                            (src (slice u8))
+                            (cwd (slice u8))
+                            (w (ptr Writer))
+                            (path (slice u8))
+                            (srcpaths (ptr (ArrayList (slice u8))))
+                            (srctexts (ptr (ArrayList (slice u8))))
+                            (code-session-state (ptr i8))
+                            (reader-setup (ptr LS))
+                            (reader-program (ptr Program))
+                            (reader-name (slice u8))
+                            (reader-module (slice u8))
+                            (reader-maps (ptr SemMapsSnap))
+                            (reader-a (dyn Allocator))
+                            (state-allowed bool)] (-> (Option (ptr Program)))
   (let [s (primitive/alloc-stack LS)]
     (ls-init! (mut s) a)
     ; `coil build-unit` compiles the entry module as a unit, not a program, so
@@ -5099,11 +5440,23 @@
     (set! (.unit_entry (semantic-workspace (mut s)))
           (.unit_pretransformed (driver-unit-state)))
     (set! (.code_session_state s) code-session-state)
-    (set! (.srccount s) 1)
-    (register-source! (mut s) path src)
-    (let [initial
+    (let [base (if (and state-allowed
+                        (and (= (primitive/cast i64 reader-setup) 0)
+                             (= (primitive/cast i64 code-session-state) 0)))
+                   (library-state-for a (mut s) src path)
+                   (primitive/cast (ptr EnvHolder) 0))
+          on-base (!= (primitive/cast i64 base) 0)
+          sid (if on-base
+                  (do (library-state-enter! a (mut s) base)
+                      (register-live-source! (mut s) path src))
+                  (do (set! (.srccount s) 1)
+                      (register-source! (mut s) path src)
+                      0))
+          initial
             (if (= (primitive/cast i64 reader-setup) 0)
-                (initial-read a (mut s) src path cwd)
+                (if on-base
+                    (initial-read-on-library-state a (mut s) src path sid)
+                    (initial-read a (mut s) src path cwd))
                 (let [(mut saved) (zeroed SemMapsSnap)]
                   (sem-maps-save (mut saved))
                   (sem-maps-restore reader-maps)
@@ -5136,11 +5489,16 @@
                       ; resolve against ITS directory, not the process CWD (nested imports already
                       ; use each imported file's incdir). `cwd` stays for DWARF comp_dir only.
                       (do
-                        (frontend-load! a (mut s) src path forms reader-state definition-module)
-                        (if (ls-err? (mut s))
+                        (if on-base
+                            (frontend-load-on-library-state! a (mut s) src path forms)
+                            (frontend-load! a (mut s) src path forms reader-state definition-module))
+                        (cond (ls-err? (mut s))
                             (do
                               (report-diag w (mut s) (.loaderr s))
                               (None [(ptr Program)]))
+                          (and on-base (library-state-must-restart? a (mut s)))
+                            (None [(ptr Program)])
+                          :else
                             (let [interface-snapshot
                                     (generated-interface-snapshot a (mut s))
                                   checker-source (checker-source-facts-begin! a (mut s))
@@ -5154,6 +5512,9 @@
                                        (report-diag w (mut s) d)
                                        (None [(ptr Program)])))
                                 (Ok [_]
+                                  (if (and on-base (.reads_library (.reg (checker-reg-box))))
+                                    (do (report-diag w (mut s) (library-state-registration-missed))
+                                        (None [(ptr Program)]))
                                     ; transforms (fixpoint) + authoritative resolve + typecheck, one step
                                     (let [check-span
                                             (tr/span-begin "frontend.transforms-and-check")
@@ -5234,7 +5595,10 @@
                                                                    (drop-code-funcs-unless-root a
                                                                                                 cp
                                                                                                 ""
-                                                                                                (primitive/cast (ptr (AMap (slice u8) (slice u8))) 0)
+                                                                                                ; the library's functions are classified already
+                                                                                                (if (and on-base (.compile_time_known (field base env)))
+                                                                                                    (field (field base env) compile_time)
+                                                                                                    (primitive/cast (ptr (AMap (slice u8) (slice u8))) 0))
                                                                                                 (primitive/cast (ptr (AMap (slice u8) (slice u8))) 0))]
                                                              (tr/span-end drop-span)
                                                              root)
@@ -5304,7 +5668,7 @@
                                                                                                              mp)
                                                                                  (wide-ints-lowerable? a w (mut s) mp))
                                                                             (Some mp)
-                                                                            (None [(ptr Program)])))))))))))))))))))))))))
+                                                                            (None [(ptr Program)]))))))))))))))))))))))))))
 
 (defn run-pipeline [(a (dyn Allocator))
                     (src (slice u8))
@@ -5580,6 +5944,8 @@
       :semtx-once (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
       :semtx (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
       :posttx (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+      ; the profile's checkers state no `:modules`: they read every module
+      :reads_library true
       :checked program
       :macros (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
       :comptime (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
@@ -26274,6 +26640,7 @@ Pipeline stage dumps (for debugging the compiler itself), each <file.coil>
                   (= sub "build-provider") (build-provider-cmd a argc argv)
                   (= sub "build-unit") (build-unit-cmd a argc argv)
                   (= sub "build-lint-profile") (build-lint-profile-cmd a argc argv)
+                  (= sub "build-library-state") (build-library-state-cmd a argc argv)
                   (= sub "namespaces") (do (ps (stdout) (stdlib-namespaces)) 0)
                   (= sub "doc")
                     (doc-cmd a

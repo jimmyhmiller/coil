@@ -1739,6 +1739,12 @@ that is how `inc` becomes valid. Checkers run afterwards, once.
 expansion; see [METAPROGRAMS.md](METAPROGRAMS.md) for phases, `transform-once`, and
 the full reflection API.
 
+A checker or transform is handed every module of the program, the standard
+library's among them. One that reads and changes only the program's own modules
+can say so with `:modules (phase/OwnModules)`, as `coil.test-runner` does; a
+compile then keeps building on the toolchain's prebuilt library instead of
+compiling the library from source again for it.
+
 The bundled lints are in `coil.lint.*`. Plain `coil lint` applies the default
 profile (`coil.lint.default`). Add opt-in lints with `--use`, for example
 `coil.lint.no-star-imports` and `coil.lint.allocator`.
