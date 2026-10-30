@@ -181,8 +181,12 @@ EOF
   # A toolchain copied elsewhere, as an application bundles one, keeps everything
   # install prebuilt: each records the library's files by their library-relative
   # names, so the copy finds them current and never rebuilds one into itself.
+  # Only the toolchain: the prefix may be shared, as ~/.cargo is with cargo's own.
   local copy="$T/copied" out written
-  cp -Rp "$PREFIX" "$copy"
+  mkdir -p "$copy/bin" "$copy/lib"
+  cp -p "$PREFIX/bin/coil" "$PREFIX/bin/coil.toolchain" "$copy/bin/"
+  [ -d "$PREFIX/bin/native" ] && cp -Rp "$PREFIX/bin/native" "$copy/bin/"
+  cp -Rp "$PREFIX/lib/coil" "$copy/lib/"
   [ "$HOST_OS" = Darwin ] && codesign -s - --force "$copy/bin/coil" >/dev/null 2>&1
   touch "$T/copied.stamp"
   out=$(cd "$T/sdk" && COIL_TRACE=1 "$copy/bin/coil" check plain.coil 2>&1)

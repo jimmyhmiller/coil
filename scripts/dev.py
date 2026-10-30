@@ -280,6 +280,29 @@ def install(args: argparse.Namespace) -> None:
     report_installed(destination)
 
 
+# The project configuration a `coil` command publishes to the commands it runs
+# (driver.coil's shipped-unit-isolated-vars). What install builds belongs to the
+# toolchain, not to whatever invoked the install -- a rebootstrap exports
+# COIL_NAMESPACE_ROOTS for the compiler's own build, which would otherwise have
+# the coil.jit unit read the compiler from the checkout instead of the installed
+# SDK, and depend on that checkout ever after.
+PROJECT_VARIABLES = (
+    "COIL_NAMESPACE_ROOTS", "COIL_NAMESPACE_EXCLUDES", "COIL_READERS", "COIL_MODULE_MAP",
+    "COIL_MANIFEST_PROVIDERS", "COIL_MANIFEST_PATH", "COIL_PACKAGE_NAME", "COIL_UNITS",
+    "COIL_WORKSPACE_PACKAGES", "COIL_STDLIB", "COIL_STDLIB_PROFILE", "COIL_PRELUDE",
+    "COIL_CORE_PROVIDERS",
+)
+
+
+def toolchain_build(compiler: Path, *args: str) -> subprocess.CompletedProcess:
+    """COMPILER ARGS, building part of the toolchain: from an empty directory, so
+    it indexes nobody's sources, and with no project's configuration."""
+    env = {k: v for k, v in os.environ.items() if k not in PROJECT_VARIABLES}
+    with tempfile.TemporaryDirectory(prefix="coil-toolchain-build-") as cwd:
+        return subprocess.run([str(compiler), *args], cwd=cwd, env=env,
+                              capture_output=True, text=True)
+
+
 def build_library_state(compiler: Path) -> None:
     """Build COMPILER's library state: the compiler state of a program that
     loads only the standard library, which every compile it runs then builds
@@ -287,8 +310,9 @@ def build_library_state(compiler: Path) -> None:
     `<lib>/coil/library-state` for an installed compiler, beside any other).
     A compile without one, or with one that is not current, starts from
     nothing, so a state is never built on demand: this builds it."""
-    with tempfile.TemporaryDirectory(prefix="coil-library-state-") as cwd:
-        subprocess.run([str(compiler), "build-library-state"], cwd=cwd, check=True)
+    result = toolchain_build(compiler, "build-library-state")
+    print(result.stdout + result.stderr, end="")
+    result.check_returncode()
 
 
 def warm_jit_unit(compiler: Path, libdir: Path) -> None:
@@ -315,10 +339,8 @@ def warm_jit_unit(compiler: Path, libdir: Path) -> None:
     shutil.rmtree(units / "coil.compiler.jit_api", ignore_errors=True)
     out = units / "llvm" / "coil.compiler.jit_api"
     out.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        [str(compiler), "build-unit", str(entry), "-o", str(out), "--backend", "llvm", "-O3", "--quiet"],
-        capture_output=True, text=True,
-    )
+    result = toolchain_build(compiler, "build-unit", str(entry), "-o", str(out),
+                             "--backend", "llvm", "-O3", "--quiet")
     if result.returncode == 0:
         print(f"warmed coil.jit unit -> {out}")
     else:
@@ -333,15 +355,10 @@ def warm_lint_profile(compiler: Path, libdir: Path) -> None:
     library they import was most of what a small lint cost. The compiler keeps
     them compiled as a native image at `<lib>/coil/lint-profile` (the directory
     `lint-profile-dir` in driver.coil names) and builds a missing or stale one on
-    the first lint. Installing builds it, so no lint pays for that. Run from an
-    empty directory: the build must not index the caller's sources. Best-effort.
+    the first lint. Installing builds it, so no lint pays for that. Best-effort.
     """
     out = libdir / "lint-profile"
-    with tempfile.TemporaryDirectory(prefix="coil-lint-profile-") as cwd:
-        result = subprocess.run(
-            [str(compiler), "build-lint-profile", str(out)],
-            cwd=cwd, capture_output=True, text=True,
-        )
+    result = toolchain_build(compiler, "build-lint-profile", str(out))
     if result.returncode == 0:
         print(f"warmed lint profile -> {out}")
     else:
