@@ -87,7 +87,7 @@ seed_source_stamp() {
 
 if native_selected full; then
   echo "=== [full] verifying before touching the seed ==="
-  COIL_SKIP_INSTALL=1 COIL_SKIP_UNITS=1 "$full_script" "$NEWSEED" || { echo "[full] VERIFY FAILED — seed NOT updated"; exit 1; }
+  COIL_SKIP_INSTALL=1 "$full_script" "$NEWSEED" || { echo "[full] VERIFY FAILED — seed NOT updated"; exit 1; }
   cp "$NEWSEED" "$full_seed"
   chmod +x "$full_seed"
   {
@@ -101,7 +101,7 @@ fi
 
 if native_selected nollvm; then
   echo "=== [nollvm] verifying before touching the seed ==="
-  COIL_SKIP_UNITS=1 "$nollvm_script" "$NEWSEED_NOLLVM" || { echo "[nollvm] VERIFY FAILED — seed NOT updated"; exit 1; }
+  "$nollvm_script" "$NEWSEED_NOLLVM" || { echo "[nollvm] VERIFY FAILED — seed NOT updated"; exit 1; }
   cp "$NEWSEED_NOLLVM" "$nollvm_seed"
   chmod +x "$nollvm_seed"
   {

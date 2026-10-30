@@ -109,8 +109,7 @@ proportional to what the submission declared, kilobytes and microseconds.
   replaces code (AGENTS.md "Live code").
 - **Copy a session:** `persist-clone` of the whole `Env`.
 - **Save and load:** derived `Serialize` / `Deserialize` of the whole `Env`. A save
-  is tied to the toolchain that wrote it, keyed like compile-time units (toolchain
-  digest).
+  is tied to the toolchain that wrote it, keyed by the toolchain digest.
 
 ### What reads the `Env`
 
@@ -127,7 +126,7 @@ through a parent link, because there is none.
   machine code means saving object bytes, separately.
 - **Metaprogram images.** Loaded images (`MEEntry.fp`, `registry`, `interpcx`) are
   process state. The `Env` keeps what identifies an image (name, symbol, module
-  bytes or compile-time unit key); the client keeps loaded handles keyed by that.
+  bytes or unit key); the client keeps loaded handles keyed by that.
 - **Checked bodies of ordinary functions.** Their code is emitted; nothing reads the
   body again.
 
@@ -686,7 +685,7 @@ the path it replaces in the same series; no step leaves both.
    as checked trees, or as source re-checked on use?** Recommendation: keep them
    as trees (deep-copied once at accept). That keeps instantiating an earlier generic
    as fast as today. Source-only costs a re-check per use.
-2. **Saved `Env` versus the compile-time unit format.** Units are a hand-built form
+2. **Saved `Env` versus the unit format.** Units are a hand-built form
    of saved compiler state (interface source plus objects). Recommendation: after
    step 4, make a unit an `Env` saved for that module, and retire the interface
    re-expansion. Decide then, with measurements.

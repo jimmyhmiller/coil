@@ -38,17 +38,12 @@ Self-host:
 ```
 coil-candidate build src/compiler/main.coil -o coil-selftpde-full --backend tpde \
     --link-flag -L$LLVM/lib --link-flag -lLLVM --link-flag -lm
-scripts/dev.py ct-units --compiler build/bin/coil-selftpde-full
 scripts/dev.py test fast --compiler build/bin/coil-selftpde-full      # PASS
 
 coil-candidate build src/compiler/main_a64.coil -o coil-selftpde --backend tpde
 coil-selftpde  build src/compiler/main_a64.coil -o coil-stage2 --backend tpde
 coil-stage2    build src/compiler/main_a64.coil -o coil-stage3 --backend tpde
 ```
-
-The ct-units step matters: without precompiled compile-time units a compiler
-counts macro expansions differently, and `diag/no-hang` checks the count (the
-LLVM-built compiler without its units fails the same way).
 
 `main_a64.coil` omits the LLVM backend, so the first full self-host found a
 miscompile the fixed point had not: see PLAN.md (tail calls in leaves).

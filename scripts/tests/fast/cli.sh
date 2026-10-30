@@ -534,10 +534,10 @@ EOF
   printf '(module model) (export Point) (defstruct Point [(x i64) (y i64)])\n(module lib) (export inspect) (defstruct Point [(wrong i64)])\n(import "coil.primitive" :as p)\n(defn inspect [(type Code)] (-> Code) (if (= (p/code-field-count type) 2) (quote 42) (quote 0)))\n(module app) (import "model" :as m) (import "lib" :use [inspect])\n(defn answer [] (-> i64) (inspect m/Point))\n' > "$T/refl-modules.coil"
   expect_rc 0 "reflection resolves a macro argument in the module of the form that wrote it" \
     "$COIL" build "$T/refl-modules.coil" --lib -o "$T/refl-modules.a"
-  # A file that declares the prelude's module is this compilation's prelude: with
-  # compile-time units off, nothing defines the core macros twice.
-  expect_rc 0 "check: the prelude's own source checks with compile-time units off" \
-    env COIL_CT_UNITS=0 "$COIL" check "$ROOT/src/compiler/prelude.coil"
+  # A file that declares the prelude's module is this compilation's prelude:
+  # nothing defines the core macros twice.
+  expect_rc 0 "check: the prelude's own source checks" \
+    "$COIL" check "$ROOT/src/compiler/prelude.coil"
   # A macro may generate an import of a module nothing had loaded yet.
   mkdir -p "$T/gen-import"
   printf '(module defs)\n(export answer)\n(defn answer [] (-> i64) 42)\n' > "$T/gen-import/defs.coil"
@@ -1324,26 +1324,6 @@ EOF
     bad "a tpde object imports each undefined symbol once" "emit-obj --backend tpde failed"
   fi
 
-  # An object imports only what it relocates against: a compile-time unit's
-  # helpers, which a library module declares when its unit is loaded, are not
-  # undefined symbols of a runtime object, on Mach-O or ELF.
-  local target units imports0 imports1
-  for target in "" "--target x86_64-unknown-linux-gnu"; do
-    for units in 0 1; do
-      # shellcheck disable=SC2086
-      COIL_CT_UNITS=$units "$COIL" emit-obj "$ROOT/src/examples/references.coil" --backend tpde $target \
-        -o "$T/imports$units.o" >/dev/null 2>&1
-    done
-    imports0=$(nm "$T/imports0.o" 2>/dev/null | awk '$1 == "U" { print $2 }' | sort)
-    imports1=$(nm "$T/imports1.o" 2>/dev/null | awk '$1 == "U" { print $2 }' | sort)
-    if [ -n "$imports0" ] && [ "$imports0" = "$imports1" ]; then
-      ok "compile-time units add no undefined symbols to a tpde object ${target:-(Mach-O)}"
-    else
-      bad "compile-time units add no undefined symbols to a tpde object ${target:-(Mach-O)}" \
-        "$(diff <(printf '%s\n' "$imports0") <(printf '%s\n' "$imports1") | head -8)"
-    fi
-  done
-
   local opt
   for opt in -O0 -O2; do
     expect_rc 87 "a literal wider than 128 bits keeps its value ($opt; 1111 mod 256)" \
@@ -1953,23 +1933,6 @@ section_debuginfo() {
   done
   "$COIL" build "$T/dbgv.coil" --backend tpde -g0 -o "$T/dbgv" >/dev/null 2>&1
   [ ! -d "$T/dbgv.dSYM" ] && ok "-g0 turns the default debug info off" || bad "-g0 turns the default debug info off" "$T/dbgv.dSYM exists"
-
-  # A library macro's output is located at its template whether the macro runs
-  # from a compile-time unit or from source: the line tables agree row for row.
-  local dwarfdump units lines0 lines1
-  dwarfdump=$("${LLVM_CONFIG:-llvm-config}" --bindir)/llvm-dwarfdump
-  for units in 0 1; do
-    COIL_CT_UNITS=$units "$COIL" emit-obj "$ROOT/src/examples/references.coil" --backend tpde -g \
-      -o "$T/units$units.o" >/dev/null 2>&1
-  done
-  lines0=$("$dwarfdump" --debug-line "$T/units0.o" 2>/dev/null | grep '^0x')
-  lines1=$("$dwarfdump" --debug-line "$T/units1.o" 2>/dev/null | grep '^0x')
-  if [ -n "$lines0" ] && [ "$lines0" = "$lines1" ]; then
-    ok "compile-time units keep a library macro's template lines"
-  else
-    bad "compile-time units keep a library macro's template lines" \
-      "$(diff <(printf '%s\n' "$lines0") <(printf '%s\n' "$lines1") | head -8)"
-  fi
 }
 
 # ---------------------------------------------------------------------------

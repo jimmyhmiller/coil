@@ -3,8 +3,8 @@
 All x86-64 code the compiler emits without LLVM comes from the **tpde backend**,
 the same one that writes arm64 code (`docs/reference/ARM64_BACKEND.md`): `--backend
 x64` (tpde for an x86-64 target; `--backend tpde` follows whatever the target is),
-the native default and `-g` on an x86-64 Linux host, compile-time units,
-metaprograms built in memory, and the LLVM-free Linux compiler
+the native default and `-g` on an x86-64 Linux host, metaprograms built in
+memory, and the LLVM-free Linux compiler
 (`src/compiler/main_x64.coil`). For Linux it writes an ELF object; for an x86-64
 Darwin target, a Mach-O one. It replaced a slot-per-value x86-64 emitter
 (`codegen_x64.coil`, deleted).

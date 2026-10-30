@@ -141,8 +141,9 @@ def pair_with_checkout(prefix, compiler):
     A compiler in another worktree otherwise discovers that worktree's stdlib
     beside its own binary, and the comparison would measure two libraries as
     well as two compilers. Each compiler gets a prefix of its own all the same:
-    the compile-time units a compiler builds and caches under its prefix belong
-    to that binary, and a second compiler loading them fails their digest check.
+    the lint profile and units a compiler builds and caches under its prefix
+    belong to that binary, and a second compiler loading them fails their digest
+    check.
     """
     bindir = prefix / "bin"
     library = prefix / "lib/coil"

@@ -47,9 +47,8 @@ def build(args: argparse.Namespace) -> None:
                 *llvm_flags("dynamic"))
         toolchain_stamp.stamp_path(output).write_text(stamp)
         print(f"built compiler candidate -> {output}")
-        units = output.with_name(output.name + ".ct-units")
-        shutil.rmtree(units, ignore_errors=True)
-        build_ct_units(output, units)
+        # Compile-time units are gone; nothing reads an older build's.
+        shutil.rmtree(output.with_name(output.name + ".ct-units"), ignore_errors=True)
         return
 
     host = (sys.platform, platform.machine().lower())
@@ -155,6 +154,10 @@ def install_library(prefix: Path) -> Path:
     shutil.rmtree(previous, ignore_errors=True)
 
     shutil.copy2(ROOT / "src" / "compiler" / "prelude.coil", libdir / "prelude.coil")
+    # Nothing reads these any more: an older install's compile-time units, and
+    # the sealed coil.jit archive the per-backend units in units/ replaced.
+    for leftover in ("ct-units", "sealed"):
+        shutil.rmtree(libdir / leftover, ignore_errors=True)
     # `coil.jit` is an optional source-linked compiler SDK. Keep its implementation
     # out of stdlib/ so ordinary programs never discover or link compiler modules.
     sdk_staged = libdir / "compiler.incoming"
@@ -271,10 +274,6 @@ def install(args: argparse.Namespace) -> None:
     toolchain_stamp.stamp_path(destination).write_text(stamp)
     print(f"installed {source} -> {destination}")
     if not args.no_warm_unit:
-        # Compile-time units first: every later build links them, and before
-        # they exist each one finds the previous compiler's and rebuilds them,
-        # one module at a time.
-        build_ct_units(destination, libdir / "ct-units")
         warm_jit_unit(destination, libdir)
         warm_lint_profile(destination, libdir)
     report_installed(destination)
@@ -313,45 +312,6 @@ def warm_jit_unit(compiler: Path, libdir: Path) -> None:
     else:
         print("note: could not warm the coil.jit unit; the first coil.jit build will build it")
         shutil.rmtree(out, ignore_errors=True)
-
-
-def build_ct_units(compiler: Path, root: Path, jobs: int = 4) -> None:
-    """Build the compile-time unit of every library module into ROOT.
-
-    A unit holds one library module's compile-time code -- its macros and the
-    functions only they call -- compiled once, so a program that loads the
-    module links it instead of compiling it (`ct-unit-root` in driver.coil
-    names where a compiler looks: `<lib>/coil/ct-units` for an installed one,
-    `<binary>.ct-units` beside any other). An installed compiler builds a
-    missing one on demand; a checkout's binaries rely on this. Run from an empty
-    directory, in parallel. A module that does not compile for this host (a
-    bare-metal architecture's) has no unit, and programs compile it from source.
-    """
-    names = subprocess.run([str(compiler), "namespaces"], capture_output=True, text=True, check=True)
-    modules = ["coil.core"] + [m for m in names.stdout.split() if m]
-    root.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, COIL_CT_UNITS="0")
-
-    def one(module: str) -> tuple[str, int]:
-        with tempfile.TemporaryDirectory(prefix="coil-ct-unit-") as cwd:
-            result = subprocess.run([str(compiler), "build-ct-unit", module, str(root / module)],
-                                    cwd=cwd, env=env, capture_output=True, text=True)
-        return module, result.returncode
-
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(jobs) as pool:
-        built = list(pool.map(one, modules))
-    missing = [m for m, rc in built if rc != 0]
-    print(f"built {len(built) - len(missing)} compile-time units -> {root}"
-          + (f" (none for {', '.join(missing)})" if missing else ""))
-
-
-def ct_units(args: argparse.Namespace) -> None:
-    """Build the units a checkout's compiler links (`<binary>.ct-units`)."""
-    compiler = Path(args.compiler).resolve()
-    units = compiler.with_name(compiler.name + ".ct-units")
-    shutil.rmtree(units, ignore_errors=True)
-    build_ct_units(compiler, units, args.jobs)
 
 
 def warm_lint_profile(compiler: Path, libdir: Path) -> None:
@@ -646,11 +606,6 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("variant", choices=("c", "wasm32"), nargs="?", default="c")
     command.add_argument("--wasm")
     command.set_defaults(func=bootstrap)
-
-    command = commands.add_parser("ct-units", help="build the compile-time units of a compiler's library")
-    command.add_argument("--compiler", default=str(ROOT / "build/bin/coil-candidate"))
-    command.add_argument("--jobs", type=int, default=4)
-    command.set_defaults(func=ct_units)
 
     command = commands.add_parser("benchmark", help="run benchmarks")
     command.add_argument("kind", choices=("runtime", "compile-scale", "frontend"), nargs="?", default="runtime")
