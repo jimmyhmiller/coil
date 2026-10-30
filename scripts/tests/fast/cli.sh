@@ -538,6 +538,23 @@ EOF
   # nothing defines the core macros twice.
   expect_rc 0 "check: the prelude's own source checks" \
     "$COIL" check "$ROOT/src/compiler/prelude.coil"
+  # The library state is the toolchain's whoever builds it: the namespace roots a
+  # rebootstrap exports must not reach it, or every program checked on it would
+  # carry an index of that tree.
+  mkdir -p "$T/state-roots"
+  printf '(module rooted.only)\n' > "$T/state-roots/only.coil"
+  out=$(COIL_NAMESPACE_ROOTS="$T/state-roots" "$COIL" build-library-state "$T/roots.state" 2>&1); rc=$?
+  if [ "$rc" != 0 ]; then bad "the library state holds none of its builder's namespace roots" "exit $rc: $out"
+  elif [ ! -f "$T/roots.state" ]; then
+    case "$out" in *"keeps no library state"*) ok "the library state holds none of its builder's namespace roots (this compiler keeps none)" ;;
+      *) bad "the library state holds none of its builder's namespace roots" "no state written: $out" ;; esac
+  else
+    contents=$(strings "$T/roots.state")
+    case "$contents" in
+      *state-roots*) bad "the library state holds none of its builder's namespace roots" "it names $T/state-roots" ;;
+      *) ok "the library state holds none of its builder's namespace roots" ;;
+    esac
+  fi
   # A macro may generate an import of a module nothing had loaded yet.
   mkdir -p "$T/gen-import"
   printf '(module defs)\n(export answer)\n(defn answer [] (-> i64) 42)\n' > "$T/gen-import/defs.coil"
