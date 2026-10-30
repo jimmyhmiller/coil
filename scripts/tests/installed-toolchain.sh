@@ -178,6 +178,28 @@ EOF
     *coil.compiler.jit_api/unit.*) bad "a build that does not import coil.jit leaves the unit alone" "it loaded the unit" ;;
     *) ok "a build that does not import coil.jit leaves the unit alone" ;;
   esac
+  # A toolchain copied elsewhere, as an application bundles one, keeps everything
+  # install prebuilt: each records the library's files by their library-relative
+  # names, so the copy finds them current and never rebuilds one into itself.
+  local copy="$T/copied" out written
+  cp -Rp "$PREFIX" "$copy"
+  [ "$HOST_OS" = Darwin ] && codesign -s - --force "$copy/bin/coil" >/dev/null 2>&1
+  touch "$T/copied.stamp"
+  out=$(cd "$T/sdk" && COIL_TRACE=1 "$copy/bin/coil" check plain.coil 2>&1)
+  case "$out" in
+    *"library-state.used"*) ok "a copied toolchain builds on its library state" ;;
+    *) bad "a copied toolchain builds on its library state" "$(printf '%s\n' "$out" | grep -v '^coil-profile' | tail -5)" ;;
+  esac
+  # (a rebuilt profile or unit would be written into the copy: checked below)
+  expect_rc 0 "a copied toolchain lints" bash -c 'cd "$1" && "$2" lint plain.coil' _ "$T/sdk" "$copy/bin/coil"
+  out=$(cd "$T/sdk" && "$copy/bin/coil" build interp-macro.coil -o interp-macro-copied 2>&1)
+  case "$out" in
+    *"first use"*) bad "a copied toolchain links coil.jit from its prebuilt unit" "$out" ;;
+    *) ok "a copied toolchain links coil.jit from its prebuilt unit" ;;
+  esac
+  written=$(find "$copy" -newer "$T/copied.stamp")
+  [ -z "$written" ] && ok "a copied toolchain writes nothing into itself" \
+    || bad "a copied toolchain writes nothing into itself" "$written"
 }
 
 repl_session() { printf '%s\n' "$@" ':q' | "$COIL" repl 2>&1; }
