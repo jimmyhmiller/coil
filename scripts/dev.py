@@ -322,7 +322,9 @@ def warm_jit_unit(compiler: Path, libdir: Path) -> None:
     source that is ~28s of LLVM per build; against a unit it is a fraction of a
     second. A unit's object follows the calling convention of the backend that
     emitted it, and Coil's backends do not share one for every aggregate, so
-    there is one unit per backend: `<lib>/coil/units/<backend>/coil.compiler.jit_api`
+    there is one unit per backend, and per coil.jit implementation (`--jit=llvm`
+    links LLVM's ORC JIT, `--jit=tpde` does not):
+    `<lib>/coil/units/<backend>/jit-<implementation>/coil.compiler.jit_api`
     (the layout `shipped-unit-dir` in driver.coil reads). A consumer links only
     the unit built by its own backend, and the compiler builds a missing one on
     the first build that imports coil.jit. Installing warms the unit for the
@@ -337,10 +339,13 @@ def warm_jit_unit(compiler: Path, libdir: Path) -> None:
     # The single-backend layout that preceded per-backend units. Nothing reads
     # it any more, and its arm64 object must never be linked into an LLVM build.
     shutil.rmtree(units / "coil.compiler.jit_api", ignore_errors=True)
-    out = units / "llvm" / "coil.compiler.jit_api"
+    # The per-backend layout that preceded per-implementation units.
+    for backend in units.iterdir() if units.is_dir() else ():
+        shutil.rmtree(backend / "coil.compiler.jit_api", ignore_errors=True)
+    out = units / "llvm" / "jit-llvm" / "coil.compiler.jit_api"
     out.parent.mkdir(parents=True, exist_ok=True)
     result = toolchain_build(compiler, "build-unit", str(entry), "-o", str(out),
-                             "--backend", "llvm", "-O3", "--quiet")
+                             "--backend", "llvm", "--jit=llvm", "-O3", "--quiet")
     if result.returncode == 0:
         print(f"warmed coil.jit unit -> {out}")
     else:

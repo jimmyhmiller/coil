@@ -79,7 +79,7 @@ def main() -> None:
         source = directory / 'probe.coil'
         executable = directory / 'probe'
         source.write_text(harness(args.definitions, args.edits))
-        installed_unit = (compiler_path.parent.parent / 'lib/coil/units/llvm'
+        installed_unit = (compiler_path.parent.parent / 'lib/coil/units/llvm/jit-llvm'
                           / 'coil.compiler.jit_api' / 'unit.o')
         unit_flags: list[str] = []
         if not installed_unit.is_file():

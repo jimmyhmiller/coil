@@ -104,7 +104,7 @@ def steps(x64: bool) -> list[Step]:
 
 def bind(steps: list[Step], compiler: str, prefix: Path | None) -> list[Step]:
     """Fill in the compiler path, and point the JIT scripts at the warmed unit."""
-    unit = prefix / "lib" / "coil" / "units" / "llvm" / "coil.compiler.jit_api" if prefix else None
+    unit = prefix / "lib" / "coil" / "units" / "llvm" / "jit-llvm" / "coil.compiler.jit_api" if prefix else None
     for step in steps:
         step.argv = [arg.replace("{compiler}", compiler) for arg in step.argv]
         if unit is not None and unit.is_dir():

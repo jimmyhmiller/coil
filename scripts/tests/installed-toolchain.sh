@@ -100,17 +100,17 @@ allns() {
 
 jit_sdk() {
   local units="$PREFIX/lib/coil/units"
-  [ -f "$units/llvm/coil.compiler.jit_api/unit.o" ] \
+  [ -f "$units/llvm/jit-llvm/coil.compiler.jit_api/unit.o" ] \
     && ok "install warmed the coil.jit unit for the default (LLVM) backend" \
-    || bad "install warmed the coil.jit unit" "no $units/llvm/coil.compiler.jit_api/unit.o"
-  local iface; iface=$(cat "$units/llvm/coil.compiler.jit_api/interface.coil" 2>/dev/null)
+    || bad "install warmed the coil.jit unit" "no $units/llvm/jit-llvm/coil.compiler.jit_api/unit.o"
+  local iface; iface=$(cat "$units/llvm/jit-llvm/coil.compiler.jit_api/interface.coil" 2>/dev/null)
   case "$iface" in
     *"(module coil.compiler.jit_api)"*)
       case "$iface" in
         *'(import "coil.compiler.driver"'*) bad "the coil.jit unit interface imports no compiler module" "it imports coil.compiler.driver" ;;
         *) ok "the coil.jit unit interface imports no compiler module" ;;
       esac ;;
-    *) bad "the coil.jit unit interface imports no compiler module" "no interface under $units/llvm" ;;
+    *) bad "the coil.jit unit interface imports no compiler module" "no interface under $units/llvm/jit-llvm" ;;
   esac
   mkdir -p "$T/sdk" "$T/no-cc"
   local link=()
