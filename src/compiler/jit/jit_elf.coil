@@ -115,6 +115,27 @@
 (defn ejit-cat [(a (dyn Allocator)) (x (slice u8)) (y (slice u8))] (-> (slice u8))
   (match (concat a x y) (Some [s] s) (None [] (oom-at c"jit text" (+ (len x) (len y))))))
 
+; ---- the int128 helpers ---------------------------------------------------------
+; tpde lowers 128-bit division and remainder to calls of __divti3, __modti3,
+; __udivti3 and __umodti3, as clang does. On macOS libSystem exports compiler-rt's,
+; so dlsym finds them; on Linux they come from libgcc, a static archive, and the
+; compiler process holds copies it does not export. The loader resolves the four
+; to these functions of the same SysV signature instead, the way
+; jit-process-symbol answers `atexit` itself.
+(defn ejit-divti3 :cc (cc/C) [(a i128) (b i128)] (-> i128) (/ a b))
+(defn ejit-modti3 :cc (cc/C) [(a i128) (b i128)] (-> i128) (% a b))
+(defn ejit-udivti3 :cc (cc/C) [(a u128) (b u128)] (-> u128) (/ a b))
+(defn ejit-umodti3 :cc (cc/C) [(a u128) (b u128)] (-> u128) (% a b))
+
+;;; The address the loader gives NAME, a symbol its object does not define: the
+;;; loader's own int128 helpers, else what the process exports.
+(defn ejit-runtime-symbol [(a (dyn Allocator)) (name (slice u8))] (-> (ptr i8))
+  (cond (= name "__divti3") (primitive/cast (ptr i8) (fnptr-of ejit-divti3))
+        (= name "__modti3") (primitive/cast (ptr i8) (fnptr-of ejit-modti3))
+        (= name "__udivti3") (primitive/cast (ptr i8) (fnptr-of ejit-udivti3))
+        (= name "__umodti3") (primitive/cast (ptr i8) (fnptr-of ejit-umodti3))
+        :else (jit-process-symbol (ejit-rtld-default) (ejit-sym-cstr a name))))
+
 ; ---- little-endian byte access ------------------------------------------------
 ; A byte at a time, in i64 throughout, so there is no width or alignment question
 ; at the patch sites.
@@ -231,9 +252,15 @@
                  "jit_elf: unhandled x86-64 relocation type in the in-memory loader"))))
 
 ; ---- the loader ----------------------------------------------------------------
+;;; Load O, resolving what it does not define against PRIOR (null: none) and then
+;;; the process, as jit-load-reusing does for Mach-O: PRIOR is a retained session's
+;;; namespace over its live generations, the session's own definitions answer
+;;; first, every resolved import is recorded with the image that owns it (so
+;;; reclamation follows image dependencies), and a `repl_static.` definition keeps
+;;; the storage an earlier generation gave it.
 (defn jit-elf-load-reusing [(a (dyn Allocator))
                             (o (mut EObj))
-                            (prior (ptr JitImage))] (-> (Result JitImage JitErr))
+                            (prior (ptr JitNamespace))] (-> (Result JitImage JitErr))
   (block :ejit
            (let [nsect (len (load (field o sects)))
                  nsym (len (load (field o syms)))
@@ -292,13 +319,35 @@
                                    (slice::new (primitive/cast (ptr i64)
                                                                0)
                                                0)))))
+                 ; per symbol: whether a relocation names it. An undefined
+                 ; declaration nothing relocates against is type context, not a
+                 ; native dependency, and is neither resolved nor carried on.
+                 used
+                   (data (match (alloc [u8]
+                                       a
+                                       (if (> nsym 0)
+                                           nsym
+                                           1))
+                           (Some [s] s)
+                           (None []
+                                 (do
+                                   (oom-at c"compiler jit_elf" -1)
+                                   (slice::new (primitive/cast (ptr u8)
+                                                               0)
+                                               0)))))
                  (mut ngot) 0
                  (mut gotoff) 0
                  (mut cur) 0
                  (mut i) 0]
 
              (for [k 0 nsym]
-               (store! (primitive/index gots k) -1))
+               (store! (primitive/index gots k) -1)
+               (store! (primitive/index used k) (: 0 u8)))
+             (for [k 0 nrel]
+               (let [sym (.sym (xal-at [EReloc] (field o relocs) k))]
+                 (when (and (>= sym 0) (< sym nsym))
+                   (store! (primitive/index used sym) (: 1 u8))
+                   0)))
              ; nothing placed yet
              (loop (if (>= (load i) nsect)
                        (break)
@@ -423,39 +472,59 @@
                                (let [sy (xal-at [ESym] (field o syms) (load i))
                                      sect (load (field sy sect))]
                                  (if (= sect 0)
-                                     ; undefined: it must already be somewhere in this process
-                                     (let [fp
-                                             (jit-process-symbol (ejit-rtld-default)
-                                                    (ejit-sym-cstr a
-                                                                   (load (field sy
-                                                                                name))))]
-                                       (when (= (primitive/cast i64 fp)
-                                                0)
-                                         (jit-image-unmap! base total)
-                                         (break :ejit
-                                                  (Err [JitImage JitErr]
-                                                       (jit-undef-err a
-                                                                      (load (field sy
-                                                                                   name))))))
-                                       (store! (primitive/index addrs (load i))
-                                               fp)
-                                       (let [stub (primitive/index base
-                                                                   (+ stubs-off
-                                                                      (* nstub (ejit-stub-size))))]
-                                         (ejit-write-stub! (primitive/cast (ptr u8) stub) fp)
-                                         (store! (primitive/index stubs (load i)) stub)
-                                         (set! nstub (+ nstub 1))))
+                                     (if (= (load (primitive/index used (load i)))
+                                            (: 0 u8))
+                                         (do
+                                           (store! (primitive/index addrs (load i))
+                                                   (primitive/cast (ptr i8) 0))
+                                           (store! (primitive/index stubs (load i))
+                                                   (primitive/cast (ptr i8) 0)))
+                                         ; undefined: in the session's namespace, else
+                                         ; somewhere in this process. The namespace is
+                                         ; asked first: it is a hash lookup, and dlsym
+                                         ; walks every loaded image.
+                                         (let [name (load (field sy name))
+                                               exact
+                                                 (if (= (primitive/cast i64 prior) 0)
+                                                     (primitive/cast (ptr i8) 0)
+                                                     (jit-namespace-lookup prior name))
+                                               fp
+                                                 (if (!= (primitive/cast i64 exact) 0)
+                                                     exact
+                                                     (ejit-runtime-symbol a name))]
+                                           (when (= (primitive/cast i64 fp)
+                                                    0)
+                                             (jit-image-unmap! base total)
+                                             (break :ejit
+                                                      (Err [JitImage JitErr]
+                                                           (jit-undef-err a name))))
+                                           (store! (primitive/index addrs (load i))
+                                                   fp)
+                                           (let [stub (primitive/index base
+                                                                       (+ stubs-off
+                                                                          (* nstub (ejit-stub-size))))]
+                                             (ejit-write-stub! (primitive/cast (ptr u8) stub) fp)
+                                             (store! (primitive/index stubs (load i)) stub)
+                                             (set! nstub (+ nstub 1)))
+                                           ; carry the import into this image's symbols,
+                                           ; with the image that owns it, so the next
+                                           ; generation links through this one
+                                           (push! [JitSym]
+                                                  (mut syms)
+                                                  (JitSym :name name
+                                                          :addr fp
+                                                          :owner (if (= (primitive/cast i64 exact) 0)
+                                                                     (primitive/cast (ptr i8) 0)
+                                                                     (jit-namespace-owner prior fp))))))
                                      (let [old
                                              (if (and (!= (primitive/cast i64
                                                                           prior)
                                                           0)
-                                                      (starts-with (load (field sy
-                                                                                name))
-                                                                   "repl_static."))
-                                                 (jit-syms-lookup (field prior
-                                                                         syms)
-                                                                  (load (field sy
-                                                                               name)))
+                                                      (jit-reload-static? (load (field sy
+                                                                                       name))))
+                                                 (jit-namespace-lookup prior
+                                                                       (load (field sy
+                                                                                    name)))
                                                  (primitive/cast (ptr i8) 0))
                                            off
                                              (load (primitive/index offs
@@ -488,7 +557,10 @@
                                            (store! (field js name)
                                                    (load (field sy name)))
                                            (store! (field js addr) ad)
-                                           (store! (field js owner) base)
+                                           (store! (field js owner)
+                                                   (if (!= (primitive/cast i64 old) 0)
+                                                       (jit-namespace-owner prior old)
+                                                       base))
                                            (push! [JitSym] (mut syms) (load js)))))))
                                (store! i (primitive/iadd (load i) 1)))))
 
@@ -579,4 +651,4 @@
 
 (defn jit-elf-load [(a (dyn Allocator)) (o (mut EObj))] (-> (Result JitImage
                                                                     JitErr))
-  (jit-elf-load-reusing a (mut o) (primitive/cast (ptr JitImage) 0)))
+  (jit-elf-load-reusing a (mut o) (primitive/cast (ptr JitNamespace) 0)))

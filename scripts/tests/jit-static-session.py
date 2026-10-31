@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The coil.jit session API: retained environments, lifetime, policy and projects.
 
-    jit-static-session.py [COMPILER]        (default: $COIL)
+    jit-static-session.py [COMPILER] [--jit=llvm|tpde]        (default: $COIL)
 
 Each fixture in tests/jit/ is an SDK host program whose `main` returns 0 on
 success. They are grouped into a few host programs, each of which imports its
@@ -12,6 +12,11 @@ to stderr before each fixture, so a crash names the fixture it happened in.
 The unit comes from COIL_TEST_JIT_UNIT (the comprehensive tier passes the
 installed toolchain's warmed one); without it this builds one, which compiles
 the whole compiler.
+
+`--jit=tpde` builds the unit and every host with coil.jit's tpde-only
+implementation: no LLVM is linked, every session publishes through tpde (as
+Mach-O on macOS, as ELF on Linux), and the fixture that exercises the LLVM
+backend is left out.
 """
 from __future__ import annotations
 
@@ -29,9 +34,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cleanup_on_signal  # noqa: E402
 cleanup_on_signal.install()
 
-raw_compiler = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("COIL")
+ARGS = [arg for arg in sys.argv[1:] if not arg.startswith("--jit=")]
+JIT = next((arg.split("=", 1)[1] for arg in sys.argv[1:] if arg.startswith("--jit=")), "llvm")
+if JIT not in ("llvm", "tpde"):
+    raise SystemExit(f"--jit must be llvm or tpde, not {JIT}")
+raw_compiler = ARGS[0] if ARGS else os.environ.get("COIL")
 if not raw_compiler:
-    raise SystemExit("usage: jit-static-session.py COMPILER (or set $COIL)")
+    raise SystemExit("usage: jit-static-session.py COMPILER [--jit=llvm|tpde] (or set $COIL)")
 COMPILER = Path(raw_compiler).resolve()
 TOOLCHAIN_ENV = os.environ.copy()
 TOOLCHAIN_ENV.pop("COIL_NAMESPACE_ROOTS", None)
@@ -211,10 +220,12 @@ def main() -> None:
         (toolbin / "coil").symlink_to(COMPILER)
         TOOLCHAIN_ENV["PATH"] = str(toolbin) + os.pathsep + os.environ["PATH"]
 
-        unit = Path(os.environ["COIL_TEST_JIT_UNIT"]) if os.environ.get("COIL_TEST_JIT_UNIT") else work / "sdk"
-        if not os.environ.get("COIL_TEST_JIT_UNIT"):
+        # the warmed unit is the default implementation's; another builds its own
+        given = os.environ.get("COIL_TEST_JIT_UNIT") if JIT == "llvm" else None
+        unit = Path(given) if given else work / "sdk"
+        if not given:
             run(COMPILER, "build-unit", ROOT / "src/compiler/jit_api.coil", "-o", unit,
-                "--backend", "llvm", "-O3", "--quiet", timeout=1200)
+                "--backend", "llvm", f"--jit={JIT}", "-O3", "--quiet", timeout=1200)
         # The unit depends on the compiler and library files it read, each recorded
         # by its library-relative name so a copied or moved toolchain keeps the unit.
         sources = (unit / "unit.sources").read_text()
@@ -223,8 +234,8 @@ def main() -> None:
             assert name in sources, (name, sources)
         # Hosts are a few lines around calls into the -O3 unit, which does all the
         # JIT work, so they are built at -O0.
-        flags = ["--unit", unit, "--backend", "llvm", "-O0"]
-        if sys.platform.startswith("linux"):
+        flags = ["--unit", unit, "--backend", "llvm", f"--jit={JIT}", "-O0"]
+        if sys.platform.startswith("linux") and JIT == "llvm":
             for flag in shlex.split(run(os.environ.get("LLVM_CONFIG", "llvm-config"),
                                        "--ldflags", "--libs", "--system-libs").stdout):
                 flags += ["--link-flag", flag]
@@ -245,6 +256,8 @@ def main() -> None:
         for group, fixtures in GROUPS.items():
             if sys.platform != "darwin":
                 fixtures = [f for f in fixtures if f != "scratch_footprint"]
+            if JIT == "tpde":
+                fixtures = [f for f in fixtures if f != "llvm_backend"]
             source = work / f"host_{group.replace('-', '_')}.coil"
             source.write_text(host_source(group, fixtures))
             binary = work / f"host-{group}"
