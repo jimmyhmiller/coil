@@ -141,6 +141,26 @@ prebuilt unit, so building against it is quick after the first time per
 backend. `jit-session-new` finds the matching toolchain through `coil` on
 `PATH`; `jit-session-new-with-toolchain` takes an explicit compiler command.
 
+### Choosing the implementation: `--jit=llvm|tpde`
+
+`coil.jit` has two implementations of the same interface, chosen per build:
+
+| `--jit=` | Backends | Links |
+|---|---|---|
+| `llvm` (the default) | `Native`, `Tpde` and `Llvm` | libLLVM, a shared library of about 170 MB |
+| `tpde` | `Native` and `Tpde` | no LLVM: only the system's own libraries |
+
+```sh
+coil build app.coil --jit=tpde      # or [build] jit = "tpde" in Coil.toml
+```
+
+The source does not change: a `--jit=tpde` program still imports `coil.jit`, and
+asking it for `(Llvm)` gets `(Err (UnsupportedBackend (Llvm)))`. The
+`src/examples/jit_sdk.coil` program is 3.3 MB at `-O3` either way; built
+`--jit=tpde` it depends on nothing else. Each implementation has its own prebuilt
+unit. tpde publishes runtime code on macOS arm64 only, so on Linux x86-64 a
+`--jit=tpde` build has no backend and `jit-supported?` is false.
+
 ### Session API
 
 | Call | Returns | Does |
@@ -553,7 +573,7 @@ sources.
 
 On macOS arm64 a session uses Coil's own arm64 backend unless you choose
 `Llvm`; Coil links the toolchain's libLLVM into a program that imports
-`coil.jit` automatically. On Linux x86-64 every session lowers through LLVM's
+`coil.jit` automatically, unless it is built `--jit=tpde`. On Linux x86-64 every session lowers through LLVM's
 ORC JIT (`jit-backend` reports `"llvm-orc"`), and a program embedding `coil.jit`
 there must link LLVM:
 

@@ -62,8 +62,8 @@ inputs and metaprograms as a bare `coil build`, and writes
 | `[workspace]` | `name`, `members` | A root that groups several packages (replaces `[package]`) |
 | `[project]` | `path` | Point this directory at a package or workspace in another one (the only section) |
 | `[dependencies]` | `NAME = { path … }` or `{ git … }` | Other Coil packages |
-| `[build]` | `out`, `optimization`, `target`, `debug` | Defaults for the package executable |
-| `[profile.NAME]` | `inherits`, `optimization`, `debug`, `debug-checks`, `use` | A named build configuration (`--profile NAME`) |
+| `[build]` | `out`, `optimization`, `target`, `debug`, `jit` | Defaults for the package executable |
+| `[profile.NAME]` | `inherits`, `optimization`, `debug`, `debug-checks`, `jit`, `use` | A named build configuration (`--profile NAME`) |
 | `[run]` | `args` | Arguments `coil run` passes to the program |
 | `[artifacts.NAME]` | `kind`, `entry`, `out`, `optimization`, link keys | Extra objects and executables |
 | `[link]` | `libs`, `frameworks`, `search-paths`, `objects`, `flags` | Native link inputs |
@@ -102,6 +102,7 @@ out = "build/app"          # the executable's path from Coil.toml, in every prof
 optimization = 2           # default -O level; an explicit -O flag wins
 target = "wasm32-unknown-unknown"
 debug = true               # same as passing --debug
+jit = "tpde"               # coil.jit without LLVM; same as --jit=tpde
 
 [run]
 args = ["--verbose"]
@@ -342,6 +343,7 @@ coil test --profile safe    # the tests, built under coil.safety
 - The output goes to `build/<NAME>/`.
 - `[build] optimization` is where every profile starts; a profile's own
   `optimization` replaces it. A flag on the command line (`-O2`) still wins.
+  `jit` works the same way, and `--jit=` wins over both.
 - A profile inherits everything its `inherits` names, and its own keys take
   precedence. A profile with no `inherits` starts from `release`.
 - Only the package's own profiles apply; a dependency's are ignored. Outside a
