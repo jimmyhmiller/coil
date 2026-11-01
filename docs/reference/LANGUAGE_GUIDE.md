@@ -1745,8 +1745,10 @@ can say so with `:modules (phase/OwnModules)`, as `coil.test-runner` does; a
 compile then keeps building on the toolchain's prebuilt library instead of
 compiling the library from source again for it.
 
-The bundled lints are in `coil.lint.*`. Plain `coil lint` applies the default
-profile (`coil.lint.default`). Add opt-in lints with `--use`, for example
+The bundled lints are in `coil.lint.*`. Checkers are ordinary metaprograms and
+`coil check` runs them: `--use` adds one, `--all-files` covers every source of the
+project, `--diff` prints what they suggest as a patch and `--fix` applies it, keeping
+only what compiles. `coil lint` is `coil check --all-files --use coil.lint.default`. Add opt-in lints with `--use`, for example
 `coil.lint.no-star-imports` and `coil.lint.allocator`.
 
 ## FFI

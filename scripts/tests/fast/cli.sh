@@ -871,7 +871,7 @@ open(sys.argv[1], "w").write(
   fix_out=$("$COIL" lint "$T/probe.coil" --fix --verbose 2>&1); rc=$?
   case "$fix_out" in
     *"building the lint profile"*) bad "lint loads the lint profile an earlier lint built" "$fix_out" ;;
-    *"lint: analysis 1"*)
+    *"analysis 1"*)
       if [ -f "$profile/metadata" ]; then
         ok "lint loads the lint profile an earlier lint built"
       else
@@ -956,6 +956,24 @@ open(sys.argv[1], "w").write(
         "$COIL" run "$T/literal-cast.coil" ;;
     *) bad "lint --fix drops the cast of a literal its type holds" "$(cat "$T/literal-cast.coil")" ;;
   esac
+  # Fixing is coil check's, for any metaprogram's suggestions; coil lint is that with
+  # the standard rules.
+  printf '(module fixing)\n(import "coil.primitive" :as primitive)\n(defn same [(x i64)] (-> bool) (primitive/icmp-eq x x))\n(defn main [] (-> i64) 0)\n' > "$T/fixing.coil"
+  cp "$T/fixing.coil" "$T/fixing.orig"
+  expect_rc 0 "check --fix with no checker changes nothing" "$COIL" check --fix "$T/fixing.coil"
+  cmp -s "$T/fixing.coil" "$T/fixing.orig" && ok "check --fix with no checker leaves the file" \
+    || bad "check --fix with no checker leaves the file" "$(cat "$T/fixing.coil")"
+  local linted checked
+  linted=$("$COIL" lint "$T/fixing.coil" 2>&1)
+  checked=$("$COIL" check --all-files --use coil.lint.default "$T/fixing.coil" 2>&1)
+  [ -n "$linted" ] && [ "$linted" = "$checked" ] && ok "coil lint is check --all-files --use coil.lint.default" \
+    || bad "coil lint is check --all-files --use coil.lint.default" "lint: $linted; check: $checked"
+  expect_rc 0 "check --fix applies a checker's suggestions" "$COIL" check --fix --use coil.lint.default "$T/fixing.coil"
+  case "$(cat "$T/fixing.coil")" in
+    *primitive/icmp-eq*) bad "check --fix rewrote the file" "$(cat "$T/fixing.coil")" ;;
+    *) ok "check --fix rewrote the file" ;;
+  esac
+
   # A fix that does not compile is rolled back byte for byte, across the project.
   mkdir -p "$T/broken-project/src"
   printf '[package]\nname = "broken-project"\nentry = "src/main.coil"\nsource-roots = ["src"]\n' > "$T/broken-project/Coil.toml"
