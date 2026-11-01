@@ -89,3 +89,7 @@ The pinned pipeline does not establish an automatic loop-vectorization pass.
 The stencil is useful for exposing the LLVM O3 gap, but closing it must not be
 claimed as an automatic consequence of completing upstream's scalar pipeline.
 The original benchmark samples remain the fixed baseline.
+
+The [persistent matching checkpoint](../benchmarks/STOGIR_MATCHING.md) records
+the next source snapshot and unchanged workload. Its ≥5× codegen target is met
+in the measured medians; the runtime-within-10% target remains unmet.
