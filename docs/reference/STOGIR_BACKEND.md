@@ -12,7 +12,7 @@ and module transport lets the engines consume the same native lowering while
 remaining distinct code generators. LLVM retains its existing lowering path.
 
 The library is a separately declared package, vendored under
-`src/compiler/stogir` at revision `dc90b58`. Its [README](../../src/compiler/stogir/README.md),
+`src/compiler/stogir` at revision `d5e69b1`. Its [README](../../src/compiler/stogir/README.md),
 [LICENSE](../../src/compiler/stogir/LICENSE), [NOTICE](../../src/compiler/stogir/NOTICE)
 and provenance preserve credit to coil-stogir and Dmitry Stogov's IR. No per-file
 license headers are added by the integration.
@@ -69,9 +69,10 @@ The reference is pinned upstream `ir.h:ir_jit_compile` and
 
 The Coil port preserves the compact Sea-of-Nodes graph and the independent
 relocatable-image boundary used by JIT and AOT. It does not yet implement every
-stage above. SCCP and mem2ssa are absent. Target validation/selection exists, but
-there is no complete persistent matched-rule/fusion plan consumed before
-liveness. Coalescing and upstream-equivalent block scheduling are incomplete.
+stage above. SCCP and mem2ssa are absent. Persistent AArch64 matching now precedes liveness and carries selected scalar
+rules and conservative single-use, same-block 64-bit compare/branch fusion.
+Its def/use metadata retains the original graph references. Full target fusion
+and reuse coverage remains incomplete. Coalescing and upstream-equivalent block scheduling are incomplete.
 The split-interval allocator also needs a detailed invariant audit against
 `ir_ra.c`; its current implementation must not be represented as established
 upstream parity.

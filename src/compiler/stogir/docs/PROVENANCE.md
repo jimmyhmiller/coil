@@ -50,6 +50,10 @@ line-for-line translation of each upstream pass or equivalent behavior.
 | Vector bitcasts | Shared BITCAST opcode and type geometry reference pinned IR. Independent Coil validation compares complete storage extents for explicit pointer widths; literal folding copies little-endian bytes and native D/Q casts reuse typed register transfers. Named addresses retain relocations. Coil byte oracles check JIT and linked objects. No external-language implementation is shipped. |
 | Atomic extension | Five new Coil opcodes follow the unchanged upstream 0–125 identifiers. Checked unsigned-storage operations and native acquire/release/LSE encodings are independent Coil implementations, checked against LLVM MC and raw-byte JIT/linked/thread-contention oracles. These operations are compiler integration requirements beyond pinned upstream IR. No TPDE or LLVM implementation is imported. |
 
+| Constant shift and copy selection | AArch64 `IR_SHIFT_CONST`, `IR_MUL_PWR2` and copy/reuse cases in pinned `ir_aarch64.dasc` are the reference. Coil selection avoids rematerializing constant shift registers; encoder words are checked against LLVM MC. Known canonical unsigned producer results and same-register integer bitcasts avoid redundant copies. This does not establish full matching/reuse/coalescing parity. |
+
+| Construction canonicalization and extension-chain folding | Operand ordering follows pinned `ir_fold.h`'s lower-reference-to-op2 convention, including checked ADD/MUL. `TRUNC(ZEXT/SEXT)` uses upstream's four width cases and restart semantics. Construction tests cover integer type combinations at both pointer widths; dynamic JIT checks preserve original operand liveness and malformed chains are rejected. |
+
 The current graph uses separate contiguous arrays for instructions and constants.
 The current allocator, fold rules, target coverage, verifier, and optimization
 pipeline remain incomplete. See [PLAN.md](PLAN.md) for the delivery gates.
@@ -73,3 +77,18 @@ vendor/import step must carry these files into Coil along with the source.
 Keep this map current as more upstream modules are ported or
 other source is reused. Attribute algorithm and design references separately from
 copied or translated source so their roles remain clear.
+
+### Persistent target matching
+
+`stogir.a64.match` follows the placement of `ir_match` before virtual-register
+assignment/liveness in pinned `ir.h:ir_jit_compile`. Its initial fusion rule is a
+conservative subset of `IR_CMP_AND_BRANCH_INT` in `ir_aarch64.dasc:ir_match_insn`
+(around line 1698). The virtual-register omission and consumer-position operand
+uses follow
+`ir_ra.c:ir_assign_virtual_registers_slow` and `ir_add_fusion_ranges`. The plan,
+machine def/use metadata, ownership and integration are independent Coil
+implementations over the original graph references.
+Unlike upstream's broader all-fusible-users support, the initial rule requires
+one scheduled use, the same scheduled block, 64-bit integer operands and no
+explicit root. Other values retain ordinary materialization. This does not
+claim full matcher, coalescing or register-reuse parity.
