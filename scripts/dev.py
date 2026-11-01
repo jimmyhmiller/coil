@@ -449,7 +449,10 @@ def test(args: argparse.Namespace) -> None:
         forwarded = ["--compiler", args.compiler, *forwarded]
     elif args.suite == "fast" and "--compiler" not in forwarded:
         forwarded = ["--compiler", "build/bin/coil", *forwarded]
-    execute(sys.executable, script, *forwarded)
+    # Tests own their fixture projects; a caller's exported namespace roots,
+    # manifest or prelude must not replace those fixtures' configuration.
+    env = {key: value for key, value in os.environ.items() if key not in PROJECT_VARIABLES}
+    execute(sys.executable, script, *forwarded, env=env)
 
 
 def llvm_flags(mode: str) -> list[str]:
