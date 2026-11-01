@@ -1,0 +1,191 @@
+;;; Bridge selected typed constraints and live ranges into allocation parts.
+(module stogir.a64.allocate)
+(import "stogir.live-ranges" :as ranges)
+(import "stogir.a64.constraints" :as constraints)
+(import "stogir.allocation" :as allocation)
+(import "stogir.allocation-check" :as check)
+(import "stogir.frame" :as frame)
+(import "stogir.graph" :as g)
+(import "stogir.calls" :as calls)
+(import "stogir.call-results" :as results)
+(import "stogir.node" :as n)
+(import "stogir.a64.registers" :as registers)
+(import "stogir.types" :as types)
+(import "stogir.locals" :as locals)
+(import "stogir.stack" :as stack)
+(import "stogir.a64.frame-address" :as address)
+(import "stogir.schedule" :as schedule)
+(import "stogir.a64.call-abi" :as call-abi)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+(defstruct Assigned
+  [(parts (ArrayList allocation/Part))
+   (frame frame/Frame)
+   (link-slot i64)
+   (base address/Base)
+   (outgoing-size i64)
+   (alignment i64)
+   (entry-slot i64)
+   (result results/Spec)
+   (result-slot i64)])
+
+(defn release! [(assigned (mut Assigned))] (-> void)
+  (let [(mut i) 0]
+    (while (< i (len (.parts assigned)))
+      (allocation/release! (elem (mut (.parts assigned)) i))
+      (set! i (+ i 1))))
+  (free! (mut (.parts assigned)))
+  (frame/release! (mut (.frame assigned))))
+
+;;; Explicit per-value GPR/SIMD masks; GPR-only graphs retain 16-register scans.
+;;; x16/x17 and v30/v31 are reserved for emission/resolution.
+;;; Calls reserve caller-saved registers and a link-register frame slot.
+(defn build [(intervals (ArrayList ranges/Value))
+             (requirements (ArrayList constraints/Value))
+             (graph g/Graph)
+             (scheduled schedule/Schedule)
+             (allocator (dyn Allocator))]
+  (-> (Result Assigned (slice u8)))
+  (let [(mut assigned)
+          (Assigned
+            :parts (ArrayList::new [allocation/Part] allocator)
+            :frame (frame/create allocator)
+            :link-slot -1
+            :base (address/stack-base)
+            :outgoing-size 0
+            :alignment 16
+            :entry-slot -1
+            :result (results/ordinary)
+            :result-slot -1)
+        (mut shapes) (ArrayList::new [allocation/SpillShape] allocator)
+        (mut i) 1
+        (mut frame-error) ""
+        (mut anchored?) false
+        (mut register-count) (: 16 i32)
+        (mut allowed) (registers/gpr-mask)]
+    (push! (mut shapes) (allocation/SpillShape :size 0 :alignment 0))
+    (while (< i (len intervals))
+      (let [interval (at intervals i)
+            uses (at requirements i)
+            (mut part) (allocation/create (cast i32 i) allocator)]
+        (let [ty (cast i32 (n/type-id (get (.instructions graph) i)))
+              width (types/size ty 8)
+              extent (if (> width 8) (cast i64 width) (: 8 i64))]
+          (when (and (> (len (.ranges interval)) 0)
+                     (or (<= width 0) (> width 16)))
+            (set! frame-error "unsupported allocated value extent"))
+          (push! (mut shapes)
+                 (allocation/SpillShape :size extent :alignment extent))
+          (set! (.allowed part) (registers/class-mask ty))
+          (when (and (registers/simd-type? ty) (> (len (.ranges interval)) 0))
+            (set! register-count 64)
+            (set! allowed (| (registers/gpr-mask) (registers/simd-mask)))))
+        (for range (.ranges interval) (push! (mut (.ranges part)) range))
+        (for use (.uses uses) (push! (mut (.uses part)) use))
+        (push! (mut (.parts assigned)) part))
+      (set! i (+ i 1)))
+    ; Incoming GPRs are already live at entry. Reserve each until its PARAM
+    ; definition so earlier stack-parameter loads cannot destroy that value.
+    (set! i 0)
+    (while (< i (len (.nodes scheduled)))
+      (let [reference (get (.nodes scheduled) i)
+            node (get (.instructions graph) (cast i64 reference))]
+        (when (= (n/opcode node) 71)
+          (let [parameter (.parameter (at requirements (cast i64 reference)))]
+            (when (or (= (.kind parameter) 0) (= (.kind parameter) 2))
+              (allocation/reserve! (mut (.parts assigned))
+                                   (+ (.register parameter)
+                                      (if (= (.kind parameter) 2) 32 0))
+                                   0
+                                   (+ (* i 2) 1)
+                                   allocator)))))
+      (set! i (+ i 1)))
+    (for reference (.nodes scheduled)
+      (let [node (get (.instructions graph) (cast i64 reference))
+            opcode (cast i32 (n/opcode node))]
+        (when (stack/operation? opcode) (set! anchored? true))
+        (when (or (= opcode 72) (= opcode 81) (= opcode 70))
+          (let [(mut requested) (cast i64 (.op3 node))]
+            ; VAR's zero alignment requests the type's natural alignment.
+            (when (= opcode 72)
+              (match (locals/shape graph reference 8)
+                (Err [message] (set! frame-error message))
+                (Ok [shape] (set! requested (.alignment shape)))))
+            (when (> requested (.alignment assigned))
+              (if (frame/valid-alignment? requested)
+                  (set! (.alignment assigned) requested)
+                  (set! frame-error "invalid frame object alignment")))))))
+    (when (> (.alignment assigned) 16) (set! anchored? true))
+    (match (call-abi/outgoing-size graph scheduled)
+      (Err [msg] (set! frame-error msg))
+      (Ok [size]
+          (set! (.size (.frame assigned)) size)
+          (match (frame/aligned-size (.frame assigned) (.alignment assigned))
+            (Err [message] (set! frame-error message))
+            (Ok [aligned]
+                (set! (.size (.frame assigned)) aligned)
+                (set! (.outgoing-size assigned) aligned)))))
+    (let [calls
+            (call-abi/reserve! (mut (.parts assigned))
+                               graph
+                               scheduled
+                               (= register-count 64)
+                               allocator)]
+      (when (or anchored? (> calls 0))
+        (match (frame/spill-slot! (mut (.frame assigned))
+                                  0
+                                  (if (> (.alignment assigned) 16) 32 16)
+                                  16)
+          (Err [msg] (set! frame-error msg))
+          (Ok [offset]
+              (set! (.link-slot assigned) (+ offset 8))
+              (when (> (.alignment assigned) 16)
+                (set! (.entry-slot assigned) (+ offset 16)))
+              (when anchored?
+                (set! (.base assigned) (address/Base :reg 29 :bias offset)))))))
+    (match (calls/function-result graph)
+      (Err [message] (set! frame-error message))
+      (Ok [result]
+          (set! (.result assigned) result)
+          (when (= (.kind result) 1)
+            ; The entry reference cannot also own a VAR slot. Keep this private
+            ; result buffer separate from all user objects and split-value spills.
+            (match (frame/local-slot! (mut (.frame assigned))
+                                      (get (.nodes scheduled) 0)
+                                      (results/size result)
+                                      (cast i64
+                                            (types/size (cast i32
+                                                              (.ty result))
+                                                        8)))
+              (Err [message] (set! frame-error message))
+              (Ok [offset] (set! (.result-slot assigned) offset))))))
+    (for reference (.nodes scheduled)
+      (let [node (get (.instructions graph) (cast i64 reference))]
+        (when (= (n/opcode node) 72)
+          (match (locals/shape graph reference 8)
+            (Err [message] (set! frame-error message))
+            (Ok [shape]
+                (match (frame/local-slot! (mut (.frame assigned))
+                                          reference
+                                          (.size shape)
+                                          (.alignment shape))
+                  (Err [message] (set! frame-error message))
+                  (Ok [_] 0)))))))
+    (if (!= frame-error "")
+        (do (free! (mut shapes)) (release! (mut assigned)) (Err frame-error))
+        (let [result
+                (allocation/run-shaped! (mut (.parts assigned))
+                                        (mut (.frame assigned))
+                                        register-count
+                                        allowed
+                                        (slice shapes)
+                                        allocator)]
+          (free! (mut shapes))
+          (match result
+            (Err [msg] (do (release! (mut assigned)) (Err msg)))
+            (Ok [_]
+                (match (check/verify (.parts assigned) register-count allowed)
+                  (Err [msg] (do (release! (mut assigned)) (Err msg)))
+                  (Ok [_] (Ok assigned)))))))))

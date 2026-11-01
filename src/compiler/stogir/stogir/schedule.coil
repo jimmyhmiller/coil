@@ -1,0 +1,176 @@
+;;; Local dependency ordering over finalized node placements.
+(module stogir.schedule)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.uses" :as uses)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn local-edge? [(opcode i32) (index i32)] (-> bool)
+  (and (not (op/block-start? opcode))
+       (not (and (= opcode 67) (>= index 2)))
+       (uses/edge-kind? (op/operand-kind opcode index))))
+
+;;; Returns an interleaved order; filtering by block gives that block's schedule.
+;;; Graph must be verified, placements finalized, and live mask dependency-closed.
+(defn order [(graph g/Graph)
+             (mapping (ArrayList i32))
+             (live (ArrayList bool))
+             (allocator (dyn Allocator))]
+  (-> (Result (ArrayList i32) (slice u8)))
+  (let [(mut pending) (ArrayList::new [i64] allocator)
+        (mut ends) (ArrayList::new [i32] allocator)
+        (mut bodies) (ArrayList::new [i64] allocator)
+        (mut work) (ArrayList::new [i32] allocator)
+        (mut users) (uses/build graph allocator)
+        (mut error) ""
+        (mut total) 0
+        (mut r) 0]
+    (while (< r (len (.instructions graph)))
+      (push! (mut pending) -1)
+      (push! (mut ends) 0)
+      (push! (mut bodies) 0)
+      (set! r (+ r 1)))
+    (set! r 1)
+    (while (and (= error "") (< r (len pending)))
+      (when (and (g/contains? graph (cast i32 r)) (get live r))
+        (let [block (get mapping r)
+              node (get (.instructions graph) r)
+              opcode (cast i32 (n/opcode node))
+              count (get (.arities graph) r)
+              (mut dependencies) 0
+              (mut i) (: 1 i32)]
+          (if (<= block 0)
+              (set! error "live node lacks placement")
+              (do
+                (set! total (+ total 1))
+                (if (op/block-end? opcode)
+                    (if (!= (get ends (cast i64 block)) 0)
+                        (set! error "multiple block ends")
+                        (set! (mut ends) (cast i64 block) (cast i32 r)))
+                    (set! (mut bodies)
+                          (cast i64 block)
+                          (+ (get bodies (cast i64 block)) 1)))
+                (while (<= i count)
+                  (when (local-edge? opcode i)
+                    (match (g/operand graph (cast i32 r) i)
+                      (None [] (set! error "missing scheduled operand"))
+                      (Some [source]
+                            (when (and (> source 0)
+                                       (= (get mapping (cast i64 source)) block))
+                              (set! dependencies (+ dependencies 1))))))
+                  (set! i (+ i 1)))
+                (set! (mut pending) r dependencies)))))
+      (set! r (+ r 1)))
+    (set! r 1)
+    (while (< r (len pending))
+      (when (>= (get pending r) 0)
+        (let [block (get mapping r)]
+          (when (= (get ends (cast i64 block)) (cast i32 r))
+            (set! (mut pending)
+                  r
+                  (+ (get pending r) (get bodies (cast i64 block)))))
+          (when (= (get pending r) 0) (push! (mut work) (cast i32 r)))))
+      (set! r (+ r 1)))
+    (let [(mut cursor) 0]
+      (while (and (= error "") (< cursor (len work)))
+        (let [ref (get work cursor)
+              block (get mapping (cast i64 ref))
+              range (get (.ranges users) (cast i64 ref))
+              (mut i) 0]
+          (while (< i (.count range))
+            (let [edge (get (.edges users) (+ (.offset range) i))
+                  user (cast i64 (.user edge))
+                  node (get (.instructions graph) user)]
+              (when (and (get live user)
+                         (= (get mapping user) block)
+                         (local-edge? (cast i32 (n/opcode node))
+                                      (.operand edge)))
+                (set! (mut pending) user (- (get pending user) 1))
+                (when (= (get pending user) 0) (push! (mut work) (.user edge)))))
+            (set! i (+ i 1)))
+          (let [end (get ends (cast i64 block))]
+            (when (and (> end 0) (!= end ref))
+              (set! (mut pending)
+                    (cast i64 end)
+                    (- (get pending (cast i64 end)) 1))
+              (when (= (get pending (cast i64 end)) 0) (push! (mut work) end)))))
+        (set! cursor (+ cursor 1))))
+    (free! (mut pending))
+    (free! (mut ends))
+    (free! (mut bodies))
+    (uses/release! (mut users))
+    (when (and (= error "") (!= (len work) total))
+      (set! error "local dependency cycle"))
+    (if (= error "")
+        (let [ordered (entry-prefix graph work allocator)]
+          (free! (mut work))
+          (Ok ordered))
+        (do (free! (mut work)) (Err error)))))
+
+;;; Region projections must capture incoming values before body instructions.
+;;; Starts have no local inputs; PARAM has only its region input. Moving these
+;;; two classes first preserves local dependencies and prevents calls from
+;;; clobbering an incoming register before its PARAM projection is scheduled.
+(defn entry-prefix [(graph g/Graph)
+                    (work (ArrayList i32))
+                    (allocator (dyn Allocator))] (-> (ArrayList i32))
+  (let [(mut result) (ArrayList::new [i32] allocator)
+        (mut phase) 0]
+    (while (< phase 3)
+      (for reference work
+        (let [opcode
+                (cast i32
+                      (n/opcode (get (.instructions graph) (cast i64 reference))))
+              category (if (op/block-start? opcode) 0 (if (= opcode 71) 1 2))]
+          (when (= category phase) (push! (mut result) reference))))
+      (set! phase (+ phase 1)))
+    result))
+
+(defstruct Range [(offset i64) (count i64)])
+
+(defstruct Schedule [(ranges (ArrayList Range)) (nodes (ArrayList i32))])
+
+;;; Stable grouping preserves each block's dependency order while laying blocks
+;;; out in caller-provided CFG order. All scheduled blocks must be in block-order.
+(defn pack [(local-order (ArrayList i32))
+            (mapping (ArrayList i32))
+            (block-order (ArrayList i32))
+            (allocator (dyn Allocator))] (-> Schedule)
+  (let [(mut result)
+          (Schedule
+            :ranges (ArrayList::new [Range] allocator)
+            :nodes (ArrayList::new [i32] allocator))
+        (mut cursor) (ArrayList::new [i64] allocator)
+        (mut i) 0]
+    (while (< i (len mapping))
+      (push! (mut (.ranges result)) (Range :offset 0 :count 0))
+      (push! (mut cursor) 0)
+      (set! i (+ i 1)))
+    (for node local-order
+      (let [block (cast i64 (get mapping (cast i64 node)))
+            (mut range) (get (.ranges result) block)]
+        (set! (.count range) (+ (.count range) 1))
+        (set! (mut (.ranges result)) block range)))
+    (let [(mut offset) 0]
+      (for block block-order
+        (let [idx (cast i64 block)
+              (mut range) (get (.ranges result) idx)]
+          (set! (.offset range) offset)
+          (set! (mut (.ranges result)) idx range)
+          (set! (mut cursor) idx offset)
+          (set! offset (+ offset (.count range))))))
+    (for node local-order (push! (mut (.nodes result)) 0))
+    (for node local-order
+      (let [block (cast i64 (get mapping (cast i64 node)))
+            slot (get cursor block)]
+        (set! (mut (.nodes result)) slot node)
+        (set! (mut cursor) block (+ slot 1))))
+    (free! (mut cursor))
+    result))
+
+(defn release! [(schedule (mut Schedule))] (-> void)
+  (free! (mut (.ranges schedule)))
+  (free! (mut (.nodes schedule))))

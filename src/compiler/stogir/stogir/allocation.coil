@@ -1,0 +1,522 @@
+;;; Owned split-interval state for linear-scan allocation.
+(module stogir.allocation)
+(import "stogir.interval" :as range)
+(import "stogir.constraints" :as c)
+(import "stogir.scan" :as scan)
+(import "stogir.interval-queue" :as queue)
+(import "stogir.frame" :as frame)
+(import "coil.result" :use [Result Ok Err])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+
+(defstruct Part
+  [(ranges (ArrayList range/Range))
+   (uses (ArrayList c/Use))
+   (parent i32)
+   (allowed u64)
+   (register i32)
+   (spill-slot i64)])
+
+(defn create [(parent i32) (allocator (dyn Allocator))] (-> Part)
+  (Part
+    :ranges (ArrayList::new [range/Range] allocator)
+    :uses (ArrayList::new [c/Use] allocator)
+    :parent parent
+    :allowed 0xFFFFFFFFFFFFFFFF
+    :register -1
+    :spill-slot -1))
+
+;;; Position must be a legal split point selected by the allocator. A split in a
+;;; lifetime hole is valid; constraints at the split belong to the suffix.
+(defn split! [(part (ptr Part)) (position i64) (allocator (dyn Allocator))]
+  (-> Part)
+  (let [(mut child)
+          (Part
+            :ranges (range/split! (mut (.ranges part)) position allocator)
+            :uses (ArrayList::new [c/Use] allocator)
+            :parent (.parent part)
+            :allowed (.allowed part)
+            :register -1
+            :spill-slot (.spill-slot part))
+        (mut kept) 0
+        (mut i) 0]
+    (while (< i (len (.uses part)))
+      (let [use (get (.uses part) i)]
+        (if (>= (.position use) position)
+            (push! (mut (.uses child)) use)
+            (do (set! (mut (.uses part)) kept use) (set! kept (+ kept 1)))))
+      (set! i (+ i 1)))
+    (while (> (len (.uses part)) kept) (pop! (mut (.uses part))))
+    child))
+
+(defn release! [(part (ptr Part))] (-> void)
+  (free! (mut (.ranges part)))
+  (free! (mut (.uses part))))
+
+;;; Find the split child owning a position, using lifetime ranges rather than
+;;; bounding spans. Multiple children of a parent may share its spill slot.
+(defn covers? [(part Part) (position i64)] (-> bool)
+  (range/covers? (.ranges part) position))
+
+;;; Cap register availability by future incompatible fixed uses, then choose the
+;;; longest legal assignment. A returned boundary requires splitting before use.
+(defn free-decision [(part Part)
+                     (availability (ArrayList i64))
+                     (position i64)
+                     (allowed u64)
+                     (allocator (dyn Allocator))]
+  (-> scan/Choice)
+  (let [(mut limits) (ArrayList::new [i64] allocator)
+        (mut i) 0]
+    (while (< i (len availability))
+      (let [free (get availability i)
+            fixed (c/register-limit (.uses part) position (cast i32 i))]
+        (push! (mut limits) (if (< free fixed) free fixed)))
+      (set! i (+ i 1)))
+    (let [choice
+            (scan/choose-free limits
+                              position
+                              (& allowed (.allowed part))
+                              (c/required-at (.uses part) position))]
+      (free! (mut limits))
+      choice)))
+
+;;; action: 0=spill current until its next required use, 1=evict register owners,
+;;; 2=unsatisfiable simultaneous register requirements. No mutation occurs here.
+(defstruct BlockedDecision [(action i32) (register i32) (next-use i64)])
+
+;;; owner-next[reg] is the earliest required use among evictable owners;
+;;; fixed-at[reg] is the next non-evictable interference position, or MAX_I64.
+(defn blocked-decision [(part Part)
+                        (owner-next (ArrayList i64))
+                        (fixed-at (ArrayList i64))
+                        (position i64)
+                        (allowed u64)]
+  (-> BlockedDecision)
+  (let [required (c/required-at (.uses part) position)
+        next (c/next-use (.uses part) position 1)
+        current-next (if (< next 0) (: 0x7FFFFFFFFFFFFFFF i64) next)
+        (mut best) (: -1 i32)
+        (mut farthest) position
+        (mut i) 0]
+    (while (and (< i (len owner-next)) (< i 64))
+      (when (and (!= (& (& allowed (.allowed part)) (<< (: 1 u64) (cast u64 i)))
+                     0)
+                 (or (< required 0) (= (cast i32 i) required))
+                 (> (get fixed-at i) position))
+        (let [use (get owner-next i)]
+          (when (> use farthest) (set! best (cast i32 i)) (set! farthest use))))
+      (set! i (+ i 1)))
+    (if (and (>= best 0) (< current-next farthest))
+        (BlockedDecision
+          :action 1
+          :register best
+          :next-use farthest)
+        (if (> current-next position)
+            (BlockedDecision
+              :action 0
+              :register -1
+              :next-use current-next)
+            (BlockedDecision
+              :action 2
+              :register -1
+              :next-use position)))))
+
+;;; Assign a free register to the current part, splitting/requeueing its suffix
+;;; when availability or a future fixed constraint ends before its final range.
+;;; Returns false when no free assignment exists; caller then runs blocked policy.
+(defn grant-free! [(parts (mut (ArrayList Part)))
+                   (unhandled (mut (ArrayList queue/Item)))
+                   (index i32)
+                   (availability (ArrayList i64))
+                   (allowed u64)
+                   (allocator (dyn Allocator))] (-> bool)
+  (let [part (elem (mut parts) (cast i64 index))]
+    (if (= (len (.ranges part)) 0)
+        false
+        (let [position (.start (get (.ranges part) 0))
+              end (.end (get (.ranges part) (- (len (.ranges part)) 1)))
+              choice
+                (free-decision (load part)
+                               availability
+                               position
+                               allowed
+                               allocator)]
+          (if (< (.register choice) 0)
+              false
+              (do
+                (set! (.register part) (.register choice))
+                (when (< (.until choice) end)
+                  (let [child (split! part (.until choice) allocator)
+                        child-index (cast i32 (len parts))]
+                    (push! (mut parts) child)
+                    (let [suffix (at parts (cast i64 child-index))]
+                      (when (> (len (.ranges suffix)) 0)
+                        (queue/insert! (mut unhandled)
+                                       (queue/Item
+                                         :position
+                                           (.start (get (.ranges suffix) 0))
+                                         :interval child-index))))))
+                true))))))
+
+;;; Spill only a prefix containing no register-required use. The suffix is queued
+;;; for reassignment at its next required position, preserving parent slot identity.
+(defn spill-prefix! [(parts (mut (ArrayList Part)))
+                     (unhandled (mut (ArrayList queue/Item)))
+                     (index i32)
+                     (frame (mut frame/Frame))
+                     (size i64)
+                     (alignment i64)
+                     (allocator (dyn Allocator))] (-> (Result i64 (slice u8)))
+  (let [part (elem (mut parts) (cast i64 index))]
+    (if (= (len (.ranges part)) 0)
+        (Err "cannot spill empty interval")
+        (let [start (.start (get (.ranges part) 0))
+              end (.end (get (.ranges part) (- (len (.ranges part)) 1)))
+              next (c/next-use (.uses part) start 1)]
+          (if (= next start)
+              (Err "cannot spill at required register use")
+              (match (frame/spill-slot! (mut frame)
+                                        (.parent part)
+                                        size
+                                        alignment)
+                (Err [msg] (Err msg))
+                (Ok [slot]
+                    (do
+                      (set! (.spill-slot part) slot)
+                      (set! (.register part) -1)
+                      (when (and (> next start) (< next end))
+                        (let [child (split! part next allocator)
+                              child-index (cast i32 (len parts))]
+                          (push! (mut parts) child)
+                          (let [suffix (at parts (cast i64 child-index))]
+                            (when (> (len (.ranges suffix)) 0)
+                              (queue/insert! (mut unhandled)
+                                             (queue/Item
+                                               :position
+                                                 (.start (get (.ranges suffix)
+                                                              0))
+                                               :interval child-index))))))
+                      (Ok slot)))))))))
+
+;;; Evict one assigned part at a legal position. Inactive intervals resume at
+;;; their next range start; active suffixes spill until their next required use.
+(defn evict! [(parts (mut (ArrayList Part)))
+              (unhandled (mut (ArrayList queue/Item)))
+              (index i32)
+              (position i64)
+              (frame (mut frame/Frame))
+              (size i64)
+              (alignment i64)
+              (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [part (elem (mut parts) (cast i64 index))]
+    (if (or (= (len (.ranges part)) 0) (< (.register part) 0))
+        (Err "eviction requires an assigned interval")
+        (let [start (.start (get (.ranges part) 0))
+              end (.end (get (.ranges part) (- (len (.ranges part)) 1)))
+              next (c/next-use (.uses part) position 1)]
+          (if (or (<= position start) (>= position end) (= next position))
+              (Err "illegal eviction point or simultaneous register use")
+              (match (frame/spill-slot! (mut frame)
+                                        (.parent part)
+                                        size
+                                        alignment)
+                (Err [msg] (Err msg))
+                (Ok [slot]
+                    (do
+                      (set! (.spill-slot part) slot)
+                      (let [child (split! part position allocator)
+                            child-index (cast i32 (len parts))]
+                        (push! (mut parts) child)
+                        (let [suffix (at parts (cast i64 child-index))
+                              first (.start (get (.ranges suffix) 0))]
+                          (if (> first position)
+                              (do
+                                (queue/insert! (mut unhandled)
+                                               (queue/Item
+                                                 :position first
+                                                 :interval child-index))
+                                (Ok child-index))
+                              (match (spill-prefix! (mut parts)
+                                                    (mut unhandled)
+                                                    child-index
+                                                    (mut frame)
+                                                    size
+                                                    alignment
+                                                    allocator)
+                                (Err [msg] (Err msg))
+                                (Ok [_] (Ok child-index))))))))))))))
+
+(defstruct Pressure
+  [(free (ArrayList i64))
+   (next-use (ArrayList i64))
+   (fixed-at (ArrayList i64))])
+
+;;; Include unhandled fixed constraints so early allocations cannot occupy a
+;;; register needed by a later ABI definition/use. Physical IDs may span classes;
+;;; per-part masks prevent assignment across classes.
+(defn pressure [(parts (ArrayList Part))
+                (index i32)
+                (register-count i32)
+                (allocator (dyn Allocator))] (-> Pressure)
+  (let [(mut result)
+          (Pressure
+            :free (ArrayList::new [i64] allocator)
+            :next-use (ArrayList::new [i64] allocator)
+            :fixed-at (ArrayList::new [i64] allocator))
+        current (at parts (cast i64 index))
+        position (.start (get (.ranges current) 0))
+        (mut i) (: 0 i32)]
+    (while (< i register-count)
+      (push! (mut (.free result)) 0x7FFFFFFFFFFFFFFF)
+      (push! (mut (.next-use result)) 0x7FFFFFFFFFFFFFFF)
+      (push! (mut (.fixed-at result)) 0x7FFFFFFFFFFFFFFF)
+      (set! i (+ i 1)))
+    (let [(mut j) 0]
+      (while (< j (len parts))
+        (when (!= j (cast i64 index))
+          (let [other (at parts j)
+                reg (.register other)]
+            (when (>= reg 0)
+              (let [hit
+                      (range/intersection (.ranges current)
+                                          (.ranges other)
+                                          position)
+                    next (c/next-use (.uses other) position 1)]
+                (when (>= hit 0)
+                  (when (< hit (get (.free result) (cast i64 reg)))
+                    (set! (mut (.free result)) (cast i64 reg) hit))
+                  (when (and (>= next 0)
+                             (< next (get (.next-use result) (cast i64 reg))))
+                    (set! (mut (.next-use result)) (cast i64 reg) next)))))
+            (for use (.uses other)
+              (when (and (= (.kind use) 2)
+                         (>= (.position use) position)
+                         (range/covers? (.ranges current) (.position use)))
+                (let [r (cast i64 (.register use))]
+                  (when (< (.position use) (get (.fixed-at result) r))
+                    (set! (mut (.fixed-at result)) r (.position use)))
+                  (when (< (.position use) (get (.free result) r))
+                    (set! (mut (.free result)) r (.position use))))))))
+        (set! j (+ j 1))))
+    result))
+
+(defn release-pressure! [(pressure (mut Pressure))] (-> void)
+  (free! (mut (.free pressure)))
+  (free! (mut (.next-use pressure)))
+  (free! (mut (.fixed-at pressure))))
+
+(defn register-allowed? [(register i32) (register-count i32) (allowed u64)]
+  (-> bool)
+  (and (>= register 0)
+       (< register register-count)
+       (< register 64)
+       (!= (& allowed (<< (: 1 u64) (cast u64 register))) 0)))
+
+;;; Validate register IDs before pressure indexes fixed/assigned locations.
+;;; Class masks are immutable for a value and copied into every split suffix.
+(defn validate-input [(parts (ArrayList Part))
+                      (register-count i32)
+                      (allowed u64)]
+  (-> (Result i32 (slice u8)))
+  (let [(mut error) ""
+        (mut count) (: 0 i32)]
+    (if (or (<= register-count 0) (> register-count 64))
+        (set! error "invalid physical register count")
+        (let [target-mask
+                (if (= register-count 64)
+                    (: 0xFFFFFFFFFFFFFFFF u64)
+                    (- (<< (: 1 u64) (cast u64 register-count)) 1))]
+          (for part parts
+            (when (> (len (.ranges part)) 0)
+              (let [mask (& (& allowed target-mask) (.allowed part))]
+                (when (= mask 0)
+                  (set! error "interval has no admissible target register"))
+                (when (and (>= (.register part) 0)
+                           (not (register-allowed? (.register part)
+                                                   register-count
+                                                   mask)))
+                  (set! error "preassigned register violates interval class"))
+                (for use (.uses part)
+                  (when (and (= (.kind use) 2)
+                             (not (register-allowed? (.register use)
+                                                     register-count
+                                                     mask)))
+                    (set! error "fixed register violates interval class"))))
+              (set! count (+ count 1))))))
+    (if (= error "") (Ok count) (Err error))))
+
+;;; Immutable spill geometry indexed by the virtual parent's identifier.
+;;; Physical reservations have negative parents and need no storage shape.
+(defstruct SpillShape [(size i64) (alignment i64)])
+
+(defn valid-shape? [(shape SpillShape)] (-> bool)
+  (and (> (.size shape) 0) (frame/valid-alignment? (.alignment shape))))
+
+(defn shape-of [(parent i32) (shapes (slice SpillShape)) (uniform SpillShape)]
+  (-> SpillShape)
+  (if (= (len shapes) 0)
+      uniform
+      (if (and (>= parent 0) (< (cast i64 parent) (len shapes)))
+          (get shapes (cast i64 parent))
+          (SpillShape :size 0 :alignment 0))))
+
+;;; Allocate physical registers restricted by each value's admissible class mask.
+;;; Input parts are unassigned except reservations. Shapes are immutable per
+;;; parent, so splitting and eviction always consult the owning value.
+(defn run-impl! [(parts (mut (ArrayList Part)))
+                 (frame (mut frame/Frame))
+                 (register-count i32)
+                 (allowed u64)
+                 (shapes (slice SpillShape))
+                 (uniform SpillShape)
+                 (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [(mut work) (ArrayList::new [queue/Item] allocator)
+        (mut error) ""
+        (mut i) 0
+        (mut processed) (: 0 i32)]
+    (match (validate-input parts register-count allowed)
+      (Err [message] (set! error message))
+      (Ok [_] 0))
+    (for part parts
+      (when (and (>= (.parent part) 0) (> (len (.ranges part)) 0))
+        (let [shape (shape-of (.parent part) shapes uniform)]
+          (when (not (valid-shape? shape))
+            (set! error "missing or invalid parent spill shape")))))
+    (while (and (= error "") (< i (len parts)))
+      (let [part (at parts i)]
+        (when (and (> (len (.ranges part)) 0) (< (.register part) 0))
+          (queue/insert! (mut work)
+                         (queue/Item
+                           :position (.start (get (.ranges part) 0))
+                           :interval (cast i32 i)))))
+      (set! i (+ i 1)))
+    (while (and (= error "") (> (len work) 0))
+      (match (queue/take! (mut work))
+        (None [] 0)
+        (Some [item]
+              (let [index (.interval item)
+                    position (.position item)
+                    (mut summary)
+                      (pressure parts index register-count allocator)]
+                (when (not (grant-free! (mut parts)
+                                        (mut work)
+                                        index
+                                        (.free summary)
+                                        allowed
+                                        allocator))
+                  (let [part (at parts (cast i64 index))
+                        shape (shape-of (.parent part) shapes uniform)
+                        decision
+                          (blocked-decision (load part)
+                                            (.next-use summary)
+                                            (.fixed-at summary)
+                                            position
+                                            allowed)]
+                    (if (= (.action decision) 0)
+                        (match (spill-prefix! (mut parts)
+                                              (mut work)
+                                              index
+                                              (mut frame)
+                                              (.size shape)
+                                              (.alignment shape)
+                                              allocator)
+                          (Err [msg] (set! error msg))
+                          (Ok [_] 0))
+                        (if (= (.action decision) 2)
+                            (set! error "unsatisfiable register pressure")
+                            (let [original-count (len parts)
+                                  (mut owner-index) 0]
+                              (while (and (= error "")
+                                          (< owner-index original-count))
+                                (let [owner (at parts owner-index)]
+                                  (when (and (!= owner-index (cast i64 index))
+                                             (= (.register owner)
+                                                (.register decision))
+                                             (range/covers? (.ranges owner)
+                                                            position))
+                                    (let [owner-shape
+                                            (shape-of (.parent owner)
+                                                      shapes
+                                                      uniform)]
+                                      (match (evict! (mut parts)
+                                                     (mut work)
+                                                     (cast i32 owner-index)
+                                                     position
+                                                     (mut frame)
+                                                     (.size owner-shape)
+                                                     (.alignment owner-shape)
+                                                     allocator)
+                                        (Err [msg] (set! error msg))
+                                        (Ok [_] 0)))))
+                                (set! owner-index (+ owner-index 1)))
+                              (when (= error "")
+                                (let [(mut revised)
+                                        (pressure parts
+                                                  index
+                                                  register-count
+                                                  allocator)]
+                                  (when (not (grant-free! (mut parts)
+                                                          (mut work)
+                                                          index
+                                                          (.free revised)
+                                                          allowed
+                                                          allocator))
+                                    (set! error
+                                          "eviction did not make a register available"))
+                                  (release-pressure! (mut revised)))))))))
+                (release-pressure! (mut summary))
+                (set! processed (+ processed 1))))))
+    (free! (mut work))
+    (if (= error "") (Ok processed) (Err error))))
+
+;;; Explicit per-parent shapes. Missing/out-of-range live parents are errors,
+;;; even when a particular run would happen not to spill them.
+(defn run-shaped! [(parts (mut (ArrayList Part)))
+                   (layout (mut frame/Frame))
+                   (register-count i32)
+                   (allowed u64)
+                   (shapes (slice SpillShape))
+                   (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (run-impl! (mut parts)
+             (mut layout)
+             register-count
+             allowed
+             shapes
+             (SpillShape :size 0 :alignment 0)
+             allocator))
+
+;;; Compatibility interface for targets whose values all share one spill shape.
+(defn run! [(parts (mut (ArrayList Part)))
+            (layout (mut frame/Frame))
+            (register-count i32)
+            (allowed u64)
+            (size i64)
+            (alignment i64)
+            (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [uniform (SpillShape :size size :alignment alignment)]
+    (if (not (valid-shape? uniform))
+        (Err "invalid uniform spill shape")
+        (run-impl! (mut parts)
+                   (mut layout)
+                   register-count
+                   allowed
+                   []
+                   uniform
+                   allocator))))
+
+;;; Non-evictable fixed interference interval; parent=-1 has no virtual value.
+;;; Preassigned parts are reservations and are excluded from the unhandled queue.
+(defn reserve! [(parts (mut (ArrayList Part)))
+                (register i32)
+                (start i64)
+                (end i64)
+                (allocator (dyn Allocator))] (-> bool)
+  (if (or (< register 0) (>= register 64) (< start 0) (<= end start))
+      false
+      (let [(mut reservation) (create -1 allocator)]
+        (range/add! (mut (.ranges reservation)) start end)
+        (c/add! (mut (.uses reservation)) start 2 register)
+        (set! (.register reservation) register)
+        (push! (mut parts) reservation)
+        true)))

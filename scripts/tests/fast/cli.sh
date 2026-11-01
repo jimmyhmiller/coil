@@ -605,8 +605,38 @@ EOF
     "check: a definition swallowed by a missing ) is reported as one" "$COIL" check "$T/swallowed.coil"
   # A backend name is one of the backends, never a typo that builds with LLVM.
   printf '(module backend-typo)\n(defn main [] (-> i64) 0)\n' > "$T/backend-typo.coil"
-  expect_rc_out 1 "unknown backend 'arm46': expected llvm, arm64, x64, wasm or tpde" \
+  expect_rc_out 1 "unknown backend 'arm46': expected llvm, arm64, x64, wasm, tpde or stogir" \
     "build: an unknown --backend is an error" "$COIL" build "$T/backend-typo.coil" -o "$T/backend-typo" --backend arm46
+  # A nested dependency owns its namespaces and its exclusions; the consumer
+  # excludes it from its own package, without making the dependency disappear.
+  mkdir -p "$T/nested-owner/src/compiler/nested"
+  cat > "$T/nested-owner/Coil.toml" <<'EOF'
+[workspace]
+name = "owner"
+members = ["src/compiler"]
+[dependencies]
+independent = { path = "src/compiler/nested" }
+EOF
+  cat > "$T/nested-owner/src/compiler/Coil.toml" <<'EOF'
+[package]
+name = "compiler"
+entry = "main.coil"
+source-roots = ["."]
+exclude = ["nested", "hidden.coil"]
+EOF
+  cat > "$T/nested-owner/src/compiler/nested/Coil.toml" <<'EOF'
+[package]
+name = "independent"
+source-roots = ["."]
+exclude = ["ignored.coil"]
+EOF
+  printf '(module independent.value)\n(defn answer [] (-> i64) 42)\n' > "$T/nested-owner/src/compiler/nested/value.coil"
+  printf '(module independent.value)\n(defn answer [] (-> i64) 1)\n' > "$T/nested-owner/src/compiler/nested/ignored.coil"
+  printf '(module owner.compiler.main)\n(import "independent.value" :as independent)\n(defn main [] (-> i64) (independent/answer))\n' > "$T/nested-owner/src/compiler/main.coil"
+  printf '(module owner.compiler.main)\n(defn main [] (-> i64) 1)\n' > "$T/nested-owner/src/compiler/hidden.coil"
+  (cd "$T/nested-owner" && "$COIL" check > "$T/nested-owner.log" 2>&1)
+  local nested_rc=$?
+  [ "$nested_rc" = 0 ] && ok "check: nested dependency owns source and exclusion rules" || bad "check: nested dependency owns source and exclusion rules" "$(cat "$T/nested-owner.log")"
   # `(make-dyn Trait p)` names a trait in scope, not any trait of that last name.
   mkdir -p "$T/dyn-scope"
   printf '(module dynshapes)\n(export Show show)\n(deftrait Show [Self] (show [(a (ptr Self))] (-> i64)))\n' > "$T/dyn-scope/dynshapes.coil"

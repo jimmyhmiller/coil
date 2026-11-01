@@ -1,0 +1,295 @@
+;;; Initial code-motion placement: control chains and region-pinned data.
+(module stogir.placement)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.cfg" :as cfg)
+(import "stogir.dominators" :as dom)
+(import "stogir.uses" :as uses)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; The CFG must belong to the current graph. Floating data remains zero.
+(defn pinned [(graph g/Graph) (blocks cfg/Blocks) (allocator (dyn Allocator))]
+  (-> (Result (ArrayList i32) (slice u8)))
+  (let [(mut placement) (ArrayList::new [i32] allocator)
+        (mut error) ""
+        (mut i) 0]
+    (while (< i (len (.membership blocks)))
+      (push! (mut placement) (get (.membership blocks) i))
+      (set! i (+ i 1)))
+    (set! i 1)
+    (while (and (= error "") (< i (len (.instructions graph))))
+      (let [node (get (.instructions graph) i)
+            count (get (.arities graph) i)
+            opcode (cast i32 (n/opcode node))
+            flags (op/shape opcode)]
+        (when (and (> (len flags) 0) (= (get flags 0) #\p))
+          (match (g/operand graph (cast i32 i) 1)
+            (None [] (set! error "pinned node has no region"))
+            (Some [region]
+                  (if (or (<= region 0) (not (g/contains? graph region)))
+                      (set! error "pinned region missing")
+                      (match (g/lookup graph region)
+                        (None [] (set! error "pinned region missing"))
+                        (Some [header]
+                              (if (not (op/block-start? (cast i32
+                                                              (n/opcode header))))
+                                  (set! error
+                                        "pinned region is not block start")
+                                  (set! (mut placement) i region))))))))
+        (set! i (+ i (/ (+ (cast i64 count) 4) 4)))))
+    (if (= error "")
+        (Ok placement)
+        (do (free! (mut placement)) (Err error)))))
+
+;;; Dependency-worklist early placement. Requires matching CFG/dominators and
+;;; pinned placements. Duplicate operand edges are counted independently.
+(defn early! [(graph g/Graph)
+              (mapping (mut (ArrayList i32)))
+              (idom (ArrayList i32))
+              (entry i32)
+              (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [(mut pending) (ArrayList::new [i32] allocator)
+        (mut work) (ArrayList::new [i32] allocator)
+        (mut users) (uses/build graph allocator)
+        (mut unresolved) (: 0 i32)
+        (mut placed) (: 0 i32)
+        (mut error) ""
+        (mut r) 0]
+    (while (< r (len (.instructions graph)))
+      (push! (mut pending) -1)
+      (set! r (+ r 1)))
+    (set! r 1)
+    (while (< r (len (.instructions graph)))
+      (let [node (get (.instructions graph) r)
+            count (get (.arities graph) r)
+            flags (op/shape (cast i32 (n/opcode node)))]
+        (when (and (= (get mapping r) 0)
+                   (> (len flags) 0)
+                   (= (get flags 0) #\d))
+          (let [(mut waiting) (: 0 i32)
+                (mut i) (: 1 i32)]
+            (while (<= i count)
+              (when (uses/edge-kind? (op/operand-kind (cast i32 (n/opcode node))
+                                                      i))
+                (match (g/operand graph (cast i32 r) i)
+                  (None [] (set! error "missing floating operand"))
+                  (Some [value]
+                        (when (and (> value 0)
+                                   (= (get mapping (cast i64 value)) 0))
+                          (set! waiting (+ waiting 1))))))
+              (set! i (+ i 1)))
+            (set! (mut pending) r waiting)
+            (set! unresolved (+ unresolved 1))
+            (when (= waiting 0) (push! (mut work) (cast i32 r)))))
+        (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+    (let [(mut cursor) 0]
+      (while (and (= error "") (< cursor (len work)))
+        (let [ref (get work cursor)
+              node (get (.instructions graph) (cast i64 ref))
+              count (get (.arities graph) (cast i64 ref))
+              (mut candidate) entry
+              (mut i) (: 1 i32)]
+          (while (and (= error "") (<= i count))
+            (when (uses/edge-kind? (op/operand-kind (cast i32 (n/opcode node))
+                                                    i))
+              (match (g/operand graph ref i)
+                (None [] (set! error "missing floating operand"))
+                (Some [value]
+                      (when (> value 0)
+                        (let [block (get mapping (cast i64 value))]
+                          (if (dom/dominates? idom candidate block)
+                              (set! candidate block)
+                              (when (not (dom/dominates? idom block candidate))
+                                (set! error
+                                      "operand regions do not dominate one another"))))))))
+            (set! i (+ i 1)))
+          (when (= error "")
+            (set! (mut mapping) (cast i64 ref) candidate)
+            (set! placed (+ placed 1))
+            (set! unresolved (- unresolved 1))
+            (let [range (get (.ranges users) (cast i64 ref))
+                  (mut j) 0]
+              (while (< j (.count range))
+                (let [edge (get (.edges users) (+ (.offset range) j))
+                      user (cast i64 (.user edge))
+                      waiting (get pending user)]
+                  (when (> waiting 0)
+                    (set! (mut pending) user (- waiting 1))
+                    (when (= waiting 1) (push! (mut work) (.user edge)))))
+                (set! j (+ j 1))))))
+        (set! cursor (+ cursor 1))))
+    (free! (mut pending))
+    (free! (mut work))
+    (uses/release! (mut users))
+    (if (!= error "")
+        (Err error)
+        (if (> unresolved 0)
+            (Err "unresolved floating dependency cycle or missing placement")
+            (Ok placed)))))
+
+;;; Location of a use for late scheduling. Phi value operand k belongs to
+;;; predecessor k-1 of its region, including loop backedges.
+(defn use-block [(graph g/Graph)
+                 (mapping (ArrayList i32))
+                 (user i32)
+                 (operand i32)] (-> (Result i32 (slice u8)))
+  (match (g/lookup graph user)
+    (None [] (Err "use refers to missing instruction"))
+    (Some [node]
+          (if (or (<= user 0)
+                  (< operand 1)
+                  (> operand (get (.arities graph) (cast i64 user))))
+              (Err "invalid use operand")
+              (if (and (= (n/opcode node) 67) (>= operand 2))
+                  (match (g/operand graph user 1)
+                    (None [] (Err "phi region missing"))
+                    (Some [region]
+                          (match (g/operand graph region (- operand 1))
+                            (None [] (Err "phi predecessor missing"))
+                            (Some [source]
+                                  (if (or (<= source 0)
+                                          (not (g/contains? graph source)))
+                                      (Err "phi predecessor is not an instruction")
+                                      (let [block
+                                              (get mapping (cast i64 source))]
+                                        (if (= block 0)
+                                            (Err "phi predecessor not placed")
+                                            (Ok block))))))))
+                  (let [block (get mapping (cast i64 user))]
+                    (if (= block 0) (Err "user not placed") (Ok block))))))))
+
+;;; Combine already-finalized user locations into a latest legal use bound.
+;;; Call in reverse dependency order; zero means no users.
+(defn use-bound [(graph g/Graph)
+                 (mapping (ArrayList i32))
+                 (idom (ArrayList i32))
+                 (users uses/Uses)
+                 (value i32)]
+  (-> (Result i32 (slice u8)))
+  (let [range (get (.ranges users) (cast i64 value))
+        (mut bound) (: 0 i32)
+        (mut error) ""
+        (mut i) 0]
+    (while (and (= error "") (< i (.count range)))
+      (let [edge (get (.edges users) (+ (.offset range) i))]
+        (match (use-block graph mapping (.user edge) (.operand edge))
+          (Err [msg] (set! error msg))
+          (Ok [block]
+              (do
+                (set! bound
+                      (if (= bound 0) block (dom/common idom bound block)))
+                (when (= bound 0)
+                  (set! error "use blocks have no common dominator"))))))
+      (set! i (+ i 1)))
+    (if (= error "") (Ok bound) (Err error))))
+
+;;; Choose the deepest minimum-loop-depth block on the legal dominator interval.
+(defn choose-block [(idom (ArrayList i32))
+                    (depth (ArrayList i32))
+                    (earliest i32)
+                    (latest i32)] (-> (Result i32 (slice u8)))
+  (if (not (dom/dominates? idom earliest latest))
+      (Err "earliest placement does not dominate uses")
+      (let [(mut current) latest
+            (mut best) latest]
+        (while (!= current earliest)
+          (set! current (get idom (cast i64 current)))
+          (when (< (get depth (cast i64 current)) (get depth (cast i64 best)))
+            (set! best current)))
+        (Ok best))))
+
+;;; Finalize live floating nodes after their users. Pinned users are already final.
+(defn late! [(graph g/Graph)
+             (mapping (mut (ArrayList i32)))
+             (idom (ArrayList i32))
+             (depth (ArrayList i32))
+             (live (ArrayList bool))
+             (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [(mut users) (uses/build graph allocator)
+        (mut waiting) (ArrayList::new [i32] allocator)
+        (mut work) (ArrayList::new [i32] allocator)
+        (mut unresolved) (: 0 i32)
+        (mut error) ""
+        (mut r) 0]
+    (while (< r (len (.instructions graph)))
+      (push! (mut waiting) -1)
+      (set! r (+ r 1)))
+    (set! r 1)
+    (while (< r (len (.instructions graph)))
+      (let [node (get (.instructions graph) r)
+            count (get (.arities graph) r)
+            flags (op/shape (cast i32 (n/opcode node)))]
+        (when (and (get live r) (> (len flags) 0) (= (get flags 0) #\d))
+          (set! (mut waiting) r 0)
+          (set! unresolved (+ unresolved 1)))
+        (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+    (set! r 1)
+    (while (< r (len waiting))
+      (when (= (get waiting r) 0)
+        (let [range (get (.ranges users) r)
+              (mut count) (: 0 i32)
+              (mut i) 0]
+          (while (< i (.count range))
+            (let [edge (get (.edges users) (+ (.offset range) i))]
+              (when (>= (get waiting (cast i64 (.user edge))) 0)
+                (set! count (+ count 1))))
+            (set! i (+ i 1)))
+          (set! (mut waiting) r count)
+          (when (= count 0) (push! (mut work) (cast i32 r)))))
+      (set! r (+ r 1)))
+    (let [(mut cursor) 0]
+      (while (and (= error "") (< cursor (len work)))
+        (let [value (get work cursor)
+              range (get (.ranges users) (cast i64 value))
+              (mut bound) (: 0 i32)
+              (mut i) 0]
+          (while (and (= error "") (< i (.count range)))
+            (let [edge (get (.edges users) (+ (.offset range) i))]
+              (when (get live (cast i64 (.user edge)))
+                (match (use-block graph mapping (.user edge) (.operand edge))
+                  (Err [msg] (set! error msg))
+                  (Ok [block]
+                      (set! bound
+                            (if (= bound 0) block (dom/common idom bound block)))))))
+            (set! i (+ i 1)))
+          (when (and (= error "") (!= bound 0))
+            (match (choose-block idom
+                                 depth
+                                 (get mapping (cast i64 value))
+                                 bound)
+              (Err [msg] (set! error msg))
+              (Ok [block] (set! (mut mapping) (cast i64 value) block))))
+          (when (= error "")
+            (set! unresolved (- unresolved 1))
+            (let [node (get (.instructions graph) (cast i64 value))
+                  count (get (.arities graph) (cast i64 value))
+                  (mut j) (: 1 i32)]
+              (while (<= j count)
+                (when (uses/edge-kind? (op/operand-kind (cast i32
+                                                              (n/opcode node))
+                                                        j))
+                  (match (g/operand graph value j)
+                    (None [] (set! error "missing late-placement operand"))
+                    (Some [source]
+                          (when (> source 0)
+                            (let [pending (get waiting (cast i64 source))]
+                              (when (> pending 0)
+                                (set! (mut waiting)
+                                      (cast i64 source)
+                                      (- pending 1))
+                                (when (= pending 1) (push! (mut work) source))))))))
+                (set! j (+ j 1))))))
+        (set! cursor (+ cursor 1))))
+    (free! (mut waiting))
+    (free! (mut work))
+    (uses/release! (mut users))
+    (if (!= error "")
+        (Err error)
+        (if (> unresolved 0)
+            (Err "cyclic floating uses in late placement")
+            (Ok 0)))))

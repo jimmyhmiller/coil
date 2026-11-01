@@ -1,0 +1,867 @@
+;;; Native CIR -> stogir adapter. Instruction selection/allocation is stogir's.
+;;; CIR and the module assembler are shared transport, not a TPDE codegen fallback.
+(module coil.compiler.codegen_stogir)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use *)
+(import "coil.cc" :as cc)
+
+(extern terminate :as "exit" :cc (cc/C) [i32] (-> never))
+
+(import "coil.compiler.parser" :use [sconcat i64->str])
+(import "coil.slice" :use [subslice])
+(import "tpde.cir" :as cir)
+(import "tpde.asm" :as asm)
+(import "tpde.buf" :as buf)
+(import "coil.compiler.macho" :use [MTextData])
+(import "stogir.graph" :as graph)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as node)
+(import "stogir.calls" :as calls)
+(import "stogir.call-groups" :as groups)
+(import "stogir.call-results" :as results)
+(import "stogir.symbols" :as symbols)
+(import "stogir.bulk" :as bulk)
+(import "stogir.image" :as image)
+(import "stogir.a64.compile" :as native)
+
+(defn fail [(name (slice u8)) (message (slice u8))] (-> never)
+  (eprintln "stogir: {}: {}" name message)
+  (terminate 1))
+
+(defstruct Adapter
+  [(a (dyn Allocator))
+   (f (ptr cir/Func))
+   (ta (ptr asm/Asm))
+   (text-data (ptr (ArrayList MTextData)))
+   (g graph/Graph)
+   (return-place i32)
+   (return-type i32)
+   (return-count i32)
+   (indirect-result bool)
+   (start i32)
+   (control i32)
+   (values (ArrayList i32))
+   (regions (ArrayList i32))
+   (order (ArrayList i64))
+   (from (ArrayList i64))
+   (to (ArrayList i64))
+   (ends (ArrayList i32))
+   (branches (ArrayList i32))
+   (exits (ArrayList i32))
+   (import-names (ArrayList (slice u8)))
+   (import-ids (ArrayList u32))])
+
+(defn require [(s (ptr Adapter)) (result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (fail (.name (.f s)) message))))
+
+(defn emit! [(s (ptr Adapter)) (op i32) (ty i32) (args (slice i32))] (-> i32)
+  (match (b/emit! (mut (.g s)) op ty args)
+    (Ok [r] r)
+    (Err [message]
+         (eprintln "stogir: {}: graph opcode {}, type {}, operand count {}"
+                   (.name (.f s))
+                   op
+                   ty
+                   (len args))
+         (fail (.name (.f s)) message))))
+
+;;; Unsealed control/PHI nodes temporarily hold forward references. All links
+;;; are patched before native/image runs the complete graph verifier.
+(defn reserve! [(s (ptr Adapter)) (op i32) (ty i32) (args (slice i32))] (-> i32)
+  (match (graph/append-inputs! (mut (.g s)) (cast u8 op) (cast u8 ty) args)
+    (None [] (fail (.name (.f s)) "graph reference space exhausted"))
+    (Some [r] r)))
+
+(defn constant! [(s (ptr Adapter)) (ty i32) (bits u64)] (-> i32)
+  (require s (b/scalar-constant! (mut (.g s)) ty bits 8)))
+
+(defn convert! [(s (ptr Adapter)) (op i32) (ty i32) (value i32)] (-> i32)
+  (require s (b/conversion! (mut (.g s)) op ty 8 value)))
+
+(defn type-id [(s (ptr Adapter)) (ty u8)] (-> i32)
+  (match (cast i64 ty)
+    (0 0)
+    (1 5)
+    (3 13)
+    (4 12)
+    (5 37)
+    (_ (fail (.name (.f s)) "CIR register type is not implemented"))))
+
+(defn value [(s (ptr Adapter)) (id u32)] (-> i32)
+  (let [r (get (.values s) (cast i64 (cir/resolve (.f s) id)))]
+    (when (= r 0)
+      (fail (.name (.f s))
+            "SSA operand has not been defined in dominance order"))
+    r))
+
+(defn operand [(s (ptr Adapter)) (x (ptr cir/Value)) (i u32)] (-> i32)
+  (value s (cir/operand (.f s) x i)))
+
+(defn address! [(s (ptr Adapter)) (value i32)] (-> i32)
+  (convert! s 36 6 value))
+
+(defn add-offset! [(s (ptr Adapter)) (base i32) (offset i64)] (-> i32)
+  (if (= offset 0)
+      base
+      (emit! s 26 5 [base (constant! s 5 (p/cast u64 offset))])))
+
+(defn symbol! [(s (ptr Adapter)) (id u32)] (-> i32)
+  (let [(mut found) (: -1 i64)]
+    (for [i 0 (len (.import-ids s))]
+      (when (= (get (.import-ids s) i) id) (set! found i)))
+    (when (< found 0)
+      (set! found (len (.import-ids s)))
+      (push! (mut (.import-ids s)) id)
+      (push! (mut (.import-names s))
+             (sconcat (.a s)
+                      "_coil_stogir_import_"
+                      (i64->str (.a s) (cast i64 id)))))
+    (require s (symbols/function! (mut (.g s)) (get (.import-names s) found) 0))))
+
+;;; CIR container values are normalized explicitly; memory and ABI widths remain typed.
+(defn integer-type [(bytes i64) (signed bool)] (-> i32)
+  (case bytes
+    1 (if signed 8 2)
+    2 (if signed 9 3)
+    4 (if signed 10 4)
+    8 (if signed 11 5)
+    -1))
+
+(defn argument-type [(s (ptr Adapter)) (ty u8) (flags u32)] (-> i32)
+  (when (!= (& flags (: 0x1800 u32)) 0)
+    (fail (.name (.f s))
+          "grouped, sret, variadic or by-value argument needs ABI adaptation"))
+  (let [size-code (& (>> flags (: 24 u32)) (: 7 u32))]
+    (if (= (cast i64 ty) cir/T-I64)
+        (if (= size-code 0)
+            5
+            (integer-type (<< (: 1 i64) (- (cast i64 size-code) 1))
+                          (!= (& flags (: 0x80 u32)) 0)))
+        (type-id s ty))))
+
+(defn container! [(s (ptr Adapter)) (ty i32) (v i32)] (-> i32)
+  (if (= ty 5)
+      v
+      (if (or (= ty 12) (= ty 13) (= ty 37))
+          v
+          (if (or (= ty 11) (= ty 6))
+              (convert! s 36 5 v)
+              (convert! s (if (>= ty 7) 33 34) 5 v)))))
+
+;;; Terminator successors occupy operands after the value operands.
+(defn successors [(s (ptr Adapter)) (block i64)] (-> i64)
+  (let [bb (cir/blk (.f s) (cast u32 block))]
+    (if (= (.term bb) (cir/none))
+        0
+        (let [x (cir/val (.f s) (.term bb))
+              op (cast i64 (.op x))]
+          (cond (= op cir/OP-BR) 1
+                (= op cir/OP-CONDBR) 2
+                (= op cir/OP-SWITCH) (cast i64 (- (.ntotal x) (.nops x)))
+                :else 0)))))
+
+(defn successor [(s (ptr Adapter)) (block i64) (index i64)] (-> i64)
+  (let [x (cir/val (.f s) (.term (cir/blk (.f s) (cast u32 block))))]
+    (cast i64 (cir/operand (.f s) x (+ (.nops x) (cast u32 index))))))
+
+(defn prepare-control! [(s (ptr Adapter))] (-> void)
+  (let [(mut seen) (ArrayList::new [bool] (.a s))
+        (mut work) (ArrayList::new [i64] (.a s))
+        nb (len (.blocks (.f s)))]
+    (for [i 0 nb]
+      (push! (mut seen) false)
+      (push! (mut (.regions s)) 0)
+      (push! (mut (.branches s)) 0))
+    (push! (mut work) 0)
+    (while (> (len work) 0)
+      (let [last (- (len work) 1)
+            item (get work last)]
+        (set! (.len work) last)
+        (if (< item 0)
+            (push! (mut (.order s)) (- (- 0 item) 1))
+            (unless (get seen item)
+              (set! (mut seen) item true)
+              (push! (mut work) (- 0 (+ item 1)))
+              (for [k 0 (successors s item)]
+                (push! (mut work) (successor s item k)))))))
+    (let [n (len (.order s))]
+      (for [i 0 (/ n 2)]
+        (let [j (- (- n 1) i)
+              x (get (.order s) i)]
+          (set! (mut (.order s)) i (get (.order s) j))
+          (set! (mut (.order s)) j x))))
+    (for block (.order s)
+      (let [n (successors s block)
+            term (cir/val (.f s) (.term (cir/blk (.f s) (cast u32 block))))
+            switch? (= (cast i64 (.op term)) cir/OP-SWITCH)
+            branch
+              (if switch?
+                  (reserve! s 117 0 [(: 0 i32) (constant! s 5 0)])
+                  (if (= n 2)
+                      (reserve! s 116 0 [(: 0 i32) (constant! s 1 0)])
+                      0))]
+        (set! (mut (.branches s)) block branch)
+        (for [k 0 n]
+          (let [prior
+                  (if switch?
+                      (if (= k 0)
+                          (emit! s 111 0 [branch (: 0 i32)])
+                          (emit! s
+                                 109
+                                 0
+                                 [branch
+                                  (constant! s
+                                             5
+                                             (get (.case-values (.f s))
+                                                  (+ (.imm term) (- k 1))))
+                                  (: 0 i32)]))
+                      (if (= n 2)
+                          (emit! s (if (= k 0) 107 108) 0 [branch (: 0 i32)])
+                          0))]
+            (push! (mut (.from s)) block)
+            (push! (mut (.to s)) (successor s block k))
+            (push! (mut (.ends s)) (reserve! s 114 0 [prior]))))))
+    (set! (mut (.regions s)) 0 (.start s))
+    (for block (.order s)
+      (unless (= block 0)
+        (let [(mut inputs) (ArrayList::new [i32] (.a s))]
+          (for [i 0 (len (.ends s))]
+            (when (= (get (.to s) i) block)
+              (push! (mut inputs) (get (.ends s) i))))
+          (set! (mut (.regions s)) block (emit! s 112 0 (slice inputs))))))
+    (for block (.order s)
+      (let [bb (cir/blk (.f s) (cast u32 block))]
+        (for [j 0 (cast i64 (.phi-count bb))]
+          (let [id (get (.phis (.f s)) (+ (cast i64 (.phi-begin bb)) j))
+                x (cir/val (.f s) id)
+                (mut inputs) (ArrayList::new [i32] (.a s))]
+            (push! (mut inputs) (get (.regions s) block))
+            (for [i 0 (len (.ends s))]
+              (when (= (get (.to s) i) block) (push! (mut inputs) 0)))
+            (set! (mut (.values s))
+                  (cast i64 id)
+                  (reserve! s 67 (type-id s (.ty x)) (slice inputs)))))))))
+
+(defn comparison-op [(predicate i64)] (-> i32)
+  (case predicate 0 14 1 15 2 16 3 18 4 19 5 17 6 20 7 22 8 23 9 21 -1))
+
+(defn basic-op [(op i64)] (-> i32)
+  (case op
+    10 26
+    11 27
+    12 28
+    13 47
+    14 46
+    15 48
+    16 49
+    17 50
+    18 51
+    19 29
+    20 29
+    21 30
+    22 30
+    23 52
+    24 53
+    25 31
+    26 45
+    34 56
+    35 57
+    36 55
+    37 54
+    50 26
+    51 27
+    52 28
+    53 29
+    54 31
+    55 32
+    -1))
+
+(defn piece-size [(ty i32)] (-> i64)
+  (case ty 13 4 37 16 8))
+
+(defn place-offset! [(s (ptr Adapter)) (place i32) (offset i64)] (-> i32)
+  (if (= offset 0)
+      place
+      (emit! s 26 6 [place (constant! s 5 (cast u64 offset))])))
+
+(defn append-group! [(s (ptr Adapter))
+                     (out (mut (ArrayList groups/Group)))
+                     (index i32)
+                     (flags u32)
+                     (ty i32)
+                     (end (mut i32))] (-> void)
+  (let [remaining (& (>> flags (: 16 u32)) (: 255 u32))]
+    (when (and (> remaining 0) (>= index end))
+      (let [count (+ (cast i32 remaining) 1)]
+        (push! (mut out)
+               (groups/Group
+                 :first index
+                 :count count
+                 :alignment (cast i32 (piece-size ty))))
+        (set! end (+ index count))))))
+
+(defn lower-call! [(s (ptr Adapter)) (id u32) (x (ptr cir/Value))] (-> i32)
+  (let [(mut args) (ArrayList::new [i32] (.a s))
+        (mut types) (ArrayList::new [u8] (.a s))
+        (mut descriptors) (ArrayList::new [groups/Group] (.a s))
+        (mut group-end) (: 0 i32)
+        (mut fixed) (: -1 i64)
+        (mut sret) false
+        nr (cast i32 (.aux x))
+        rt (type-id s (.ty x))
+        (mut place) (: 0 i32)
+        indirect (< (.imm x) 0)
+        first (if indirect (: 1 u32) (: 0 u32))
+        target
+          (if indirect
+              (address! s (operand s x 0))
+              (symbol! s (cast u32 (.imm x))))]
+    (when (> nr 1)
+      (for [i 1 (cast i64 nr)]
+        (unless (= rt (type-id s (.ty (cir/val (.f s) (+ id (cast u32 i))))))
+          (fail (.name (.f s))
+                "mixed aggregate result registers are unsupported")))
+      (let [size (* (piece-size rt) (cast i64 nr))]
+        (set! place
+              (require s
+                       (b/stack-allocate! (mut (.g s))
+                                          (.control s)
+                                          (constant! s 5 (cast u64 size))
+                                          16)))
+        (set! (.control s) place))
+      (push! (mut types) 6)
+      (push! (mut args) place))
+    (for [i (cast i64 first) (cast i64 (.nops x))]
+      (let [argid (cir/operand (.f s) x (cast u32 i))
+            flags (get (.argflags (.f s)) (+ (cast i64 (.opb x)) i))
+            result-arg (!= (& flags (: 0x100 u32)) 0)
+            ty
+              (if result-arg
+                  6
+                  (argument-type s (.ty (cir/val (.f s) argid)) flags))
+            v (value s argid)
+            index (cast i32 (len types))]
+        (when result-arg
+          (when (or (!= index 0) (> nr 1))
+            (fail (.name (.f s)) "invalid indirect result argument position"))
+          (set! sret true))
+        (when (and (!= (& flags (: 0x200 u32)) 0) (< fixed 0))
+          (set! fixed (len types)))
+        (append-group! s (mut descriptors) index flags ty (mut group-end))
+        (push! (mut types) (cast u8 ty))
+        (push! (mut args)
+               (if result-arg
+                   (address! s v)
+                   (if (and (>= ty 1) (<= ty 10) (!= ty 5) (!= ty 6))
+                       (convert! s 35 ty v)
+                       v)))))
+    (when (< fixed 0) (set! fixed (len types)))
+    (let [flags (if (< fixed (len types)) (: 25 u8) (: 9 u8))
+          parameters (subslice (slice types) 0 fixed)
+          prototype
+            (if (or sret (> nr 1))
+                (calls/create-result flags
+                                     parameters
+                                     (slice descriptors)
+                                     (if sret
+                                         (results/indirect)
+                                         (results/pieces (cast u8 rt) nr))
+                                     (.a s))
+                (calls/create-grouped flags
+                                      (cast u8 rt)
+                                      parameters
+                                      (slice descriptors)
+                                      (.a s)))]
+      (match prototype
+        (Err [message] (fail (.name (.f s)) message))
+        (Ok [proto]
+            (let [r
+                    (require s
+                             (calls/emit! (mut (.g s))
+                                          proto
+                                          (.control s)
+                                          target
+                                          (slice args)
+                                          (.a s)))]
+              (set! (.control s) r)
+              (if (> nr 1)
+                  (let [(mut first-result) (: 0 i32)]
+                    (for [i 0 (cast i64 nr)]
+                      (let [loaded
+                              (emit! s
+                                     91
+                                     rt
+                                     [(.control s)
+                                      (place-offset! s
+                                                     place
+                                                     (* i (piece-size rt)))])]
+                        (set! (.control s) loaded)
+                        (set! (mut (.values s))
+                              (cast i64 (+ id (cast u32 i)))
+                              loaded)
+                        (when (= i 0) (set! first-result loaded))))
+                    first-result)
+                  r)))))))
+
+(defn lower-instruction! [(s (ptr Adapter)) (id u32) (x (ptr cir/Value))]
+  (-> i32)
+  (let [op (cast i64 (.op x))
+        ty (type-id s (.ty x))
+        native-op (basic-op op)]
+    (when (and (or (= op cir/OP-ROTL) (= op cir/OP-ROTR) (= op cir/OP-BSWAP))
+               (!= (.imm x) 64))
+      (fail (.name (.f s))
+            "narrow rotate/byte-swap adaptation is not implemented"))
+    (cond (>= native-op 0)
+            (let [a (operand s x 0)
+                  signed (or (= op cir/OP-SDIV) (= op cir/OP-SREM))
+                  left (if signed (convert! s 36 11 a) a)
+                  right
+                    (if (> (.nops x) 1)
+                        (let [v (operand s x 1)]
+                          (if signed (convert! s 36 11 v) v))
+                        0)
+                  r
+                    (if (= right 0)
+                        (emit! s native-op ty [left])
+                        (if (or (= native-op 29) (= native-op 30))
+                            (emit! s
+                                   native-op
+                                   (if signed 11 ty)
+                                   [left right (: 0 i32)])
+                            (emit! s native-op (if signed 11 ty) [left right])))]
+              (if signed (convert! s 36 5 r) r))
+          (= op cir/OP-ICMP)
+            (container! s
+                        1
+                        (require s
+                                 (b/integer-compare! (mut (.g s))
+                                                     (comparison-op (.imm x))
+                                                     8
+                                                     (operand s x 0)
+                                                     (operand s x 1))))
+          (= op cir/OP-SELECT)
+            (require s
+                     (b/conditional! (mut (.g s))
+                                     ty
+                                     (operand s x 0)
+                                     (operand s x 1)
+                                     (operand s x 2)))
+          (or (= op cir/OP-COPY) (= op cir/OP-BITCAST))
+            (convert! s 36 ty (operand s x 0))
+          (or (= op cir/OP-SEXT) (= op cir/OP-ZEXT))
+            (let [bytes (/ (.imm x) 8)
+                  narrow (integer-type bytes (= op cir/OP-SEXT))
+                  a (operand s x 0)]
+              (when (< narrow 0)
+                (fail (.name (.f s)) "unsupported integer extension width"))
+              (if (= bytes 8)
+                  a
+                  (container! s narrow (convert! s 35 narrow a))))
+          (= op cir/OP-ADDI) (add-offset! s (operand s x 0) (.imm x))
+          (= op cir/OP-PTRADD)
+            (add-offset! s
+                         (emit! s
+                                26
+                                5
+                                [(operand s x 0)
+                                 (emit! s
+                                        28
+                                        5
+                                        [(operand s x 1)
+                                         (constant! s 5 (p/cast u64 (.imm x)))])])
+                         (.imm2 x))
+          (= op cir/OP-LOAD)
+            (let [bytes (& (.imm2 x) 255)
+                  memty
+                    (if (= ty 5)
+                        (integer-type bytes (!= (& (.imm2 x) 256) 0))
+                        ty)
+                  pointer (address! s (add-offset! s (operand s x 0) (.imm x)))
+                  r (emit! s 91 memty [(.control s) pointer])]
+              (set! (.control s) r)
+              (if (= ty 5) (container! s memty r) r))
+          (= op cir/OP-STORE)
+            (let [pointer (address! s (add-offset! s (operand s x 0) (.imm x)))
+                  input (operand s x 1)
+                  source (cir/val (.f s) (cir/operand (.f s) x 1))
+                  memty
+                    (if (= (.ty source) 1)
+                        (integer-type (.imm2 x) false)
+                        (type-id s (.ty source)))
+                  r
+                    (if (and (= (.ty source) 1) (< (.imm2 x) 8))
+                        (convert! s 35 memty input)
+                        input)
+                  stored (emit! s 93 0 [(.control s) pointer r])]
+              (set! (.control s) stored)
+              stored)
+          (or (= op cir/OP-CALL) (= op cir/OP-TAILCALL)) (lower-call! s id x)
+          (or (= op cir/OP-MEMCPY) (= op cir/OP-MEMZERO))
+            (let [dst (address! s (operand s x 0))
+                  count (constant! s 5 (p/cast u64 (.imm x)))
+                  r
+                    (require s
+                             (if (= op cir/OP-MEMZERO)
+                                 (bulk/zero! (mut (.g s))
+                                             (.control s)
+                                             dst
+                                             count)
+                                 (bulk/copy! (mut (.g s))
+                                             (.control s)
+                                             dst
+                                             (address! s (operand s x 1))
+                                             count)))]
+              (set! (.control s) r)
+              r)
+          (= op cir/OP-DYNALLOCA)
+            (let [r
+                    (require s
+                             (b/stack-allocate! (mut (.g s))
+                                                (.control s)
+                                                (operand s x 0)
+                                                (cast i32 (.imm x))))]
+              (set! (.control s) r)
+              (convert! s 36 5 r))
+          :else
+            (do
+              (eprintln "stogir: {}: unsupported CIR opcode {}"
+                        (.name (.f s))
+                        op)
+              (fail (.name (.f s)) "instruction adaptation is not implemented")))))
+
+(defn translate! [(s (ptr Adapter))] (-> void)
+  (let [f (.f s)
+        (mut argtypes) (ArrayList::new [u8] (.a s))
+        (mut ret-type) (: 0 i32)
+        (mut needed) (ArrayList::new [bool] (.a s))]
+    (for [i 0 (len (.values f))] (push! (mut (.values s)) 0))
+    (prepare-control! s)
+    (for [i 0 (len (.values f))] (push! (mut needed) false))
+    (for block (.order s)
+      (let [bb (cir/blk f (cast u32 block))]
+        (for [j (cast i64 (.ibegin bb)) (cast i64 (.iend bb))]
+          (let [x (cir/val f (get (.insts f) j))]
+            (for [k 0 (cast i64 (.nops x))]
+              (set! (mut needed) (cast i64 (cir/operand f x (cast u32 k))) true))))
+        (for [j 0 (cast i64 (.phi-count bb))]
+          (let [x (cir/val f (get (.phis f) (+ (cast i64 (.phi-begin bb)) j)))]
+            (for [k 0 (cast i64 (.nops x))]
+              (set! (mut needed) (cast i64 (cir/operand f x (cast u32 k))) true))))))
+    (set! (.return-count s) -1)
+    (for block (.order s)
+      (let [x (cir/val f (.term (cir/blk f (cast u32 block))))
+            op (cast i64 (.op x))]
+        (when (or (= op cir/OP-RET) (= op cir/OP-TAILCALL))
+          (let [count
+                  (if (= op cir/OP-RET)
+                      (cast i32 (.nops x))
+                      (cast i32 (.aux x)))
+                ty
+                  (if (= count 0)
+                      0
+                      (if (= op cir/OP-RET)
+                          (type-id s (.ty (cir/val f (cir/operand f x 0))))
+                          (type-id s (.ty x))))]
+            (when (and (>= (.return-count s) 0)
+                       (or (!= count (.return-count s))
+                           (!= ty (.return-type s))))
+              (fail (.name f) "inconsistent return register shapes"))
+            (when (= op cir/OP-RET)
+              (for [i 0 (cast i64 count)]
+                (unless (= ty
+                           (type-id s
+                                    (.ty (cir/val f
+                                                  (cir/operand f x (cast u32 i))))))
+                  (fail (.name f)
+                        "mixed aggregate return registers are unsupported"))))
+            (set! (.return-count s) count)
+            (set! (.return-type s) ty)))))
+    (when (> (.return-count s) 1)
+      (push! (mut argtypes) 6)
+      (set! (.return-place s) (emit! s 71 6 [(.start s) (: 0 i32) 0])))
+    (for [i 0 (len (.args f))]
+      (let [id (get (.args f) i)
+            x (cir/val f id)
+            ty
+              (if (get (.arg-sret f) i)
+                  6
+                  (argument-type s (.ty x) (get (.arg-flags f) i)))
+            r
+              (emit! s
+                     71
+                     ty
+                     [(.start s)
+                      (: 0 i32)
+                      (+ (cast i32 i) (if (> (.return-count s) 1) 1 0))])]
+        (when (get (.arg-sret f) i)
+          (when (or (!= i 0) (> (.return-count s) 0))
+            (fail (.name f) "invalid function indirect result shape"))
+          (set! (.indirect-result s) true))
+        (push! (mut argtypes) (cast u8 ty))
+        (set! (mut (.values s)) (cast i64 id) (container! s ty r))))
+    (for [i 0 (len (.values f))]
+      (let [x (cir/val f (cast u32 i))
+            op (cast i64 (.op x))]
+        (when (get needed i)
+          (cond (= op cir/OP-CONST)
+                  (set! (mut (.values s))
+                        i
+                        (constant! s (type-id s (.ty x)) (p/cast u64 (.imm x))))
+                (= op cir/OP-SYM)
+                  (set! (mut (.values s))
+                        i
+                        (add-offset! s
+                                     (convert! s
+                                               36
+                                               5
+                                               (symbol! s (cast u32 (.imm x))))
+                                     (.imm2 x)))
+                (= op cir/OP-ALLOCA)
+                  (let [r
+                          (require s
+                                   (b/stack-allocate! (mut (.g s))
+                                                      (.control s)
+                                                      (constant! s
+                                                                 5
+                                                                 (p/cast u64
+                                                                         (.imm x)))
+                                                      (cast i32 (.imm2 x))))]
+                    (set! (.control s) r)
+                    (set! (mut (.values s)) i (convert! s 36 5 r)))
+                :else 0))))
+    (for block (.order s)
+      (unless (= block 0) (set! (.control s) (get (.regions s) block)))
+      (let [bb (cir/blk f (cast u32 block))]
+        (for [j (cast i64 (.ibegin bb)) (cast i64 (.iend bb))]
+          (let [id (get (.insts f) j)
+                x (cir/val f id)
+                op (cast i64 (.op x))]
+            (unless (= id (.term bb))
+              (set! (mut (.values s)) (cast i64 id) (lower-instruction! s id x)))))
+        (let [x (cir/val f (.term bb))
+              op (cast i64 (.op x))]
+          (cond (= op cir/OP-CONDBR)
+                  (let [branch (get (.branches s) block)
+                        condition
+                          (require s
+                                   (b/integer-compare! (mut (.g s))
+                                                       15
+                                                       8
+                                                       (operand s x 0)
+                                                       (constant! s 5 0)))]
+                    (require s (b/patch! (mut (.g s)) branch 1 (.control s)))
+                    (require s (b/patch! (mut (.g s)) branch 2 condition)))
+                (= op cir/OP-SWITCH)
+                  (let [branch (get (.branches s) block)]
+                    (require s (b/patch! (mut (.g s)) branch 1 (.control s)))
+                    (require s (b/patch! (mut (.g s)) branch 2 (operand s x 0))))
+                (= op cir/OP-BR)
+                  (for [k 0 (len (.ends s))]
+                    (when (= (get (.from s) k) block)
+                      (require s
+                               (b/patch! (mut (.g s))
+                                         (get (.ends s) k)
+                                         1
+                                         (.control s)))))
+                (or (= op cir/OP-RET) (= op cir/OP-TAILCALL))
+                  (let [r
+                          (if (= op cir/OP-TAILCALL)
+                              (let [called (lower-call! s (.term bb) x)]
+                                (if (= (.return-count s) 0) 0 called))
+                              (if (= (.nops x) 0) 0 (operand s x 0)))
+                        count (.return-count s)]
+                    (if (> count 1)
+                        (do
+                          (for [i 0 (cast i64 count)]
+                            (let [piece
+                                    (if (= op cir/OP-TAILCALL)
+                                        (get (.values s)
+                                             (cast i64
+                                                   (+ (.term bb) (cast u32 i))))
+                                        (operand s x (cast u32 i)))
+                                  stored
+                                    (emit! s
+                                           93
+                                           0
+                                           [(.control s)
+                                            (place-offset! s
+                                                           (.return-place s)
+                                                           (* i
+                                                              (piece-size (.return-type s))))
+                                            piece])]
+                              (set! (.control s) stored)))
+                          (push! (mut (.exits s))
+                                 (emit! s 120 0 [(.control s) (: 0 i32) 0])))
+                        (push! (mut (.exits s))
+                               (emit! s
+                                      120
+                                      (.return-type s)
+                                      [(.control s) r (: 0 i32)]))))
+                (= op cir/OP-UNREACHABLE)
+                  (push! (mut (.exits s))
+                         (require s
+                                  (b/unreachable! (mut (.g s)) (.control s) 0)))
+                :else (fail (.name f) "unsupported terminator")))))
+    (for block (.order s)
+      (let [bb (cir/blk f (cast u32 block))]
+        (for [j 0 (cast i64 (.phi-count bb))]
+          (let [id (get (.phis f) (+ (cast i64 (.phi-begin bb)) j))
+                x (cir/val f id)
+                phi (get (.values s) (cast i64 id))
+                (mut slot) (: 2 i32)]
+            (for [k 0 (len (.ends s))]
+              (when (= (get (.to s) k) block)
+                (let [(mut found) false]
+                  (for [n 0 (cast i64 (.nops x))]
+                    (when (= (cast i64
+                                   (cir/operand f x (+ (.nops x) (cast u32 n))))
+                             (get (.from s) k))
+                      (require s
+                               (b/patch! (mut (.g s))
+                                         phi
+                                         slot
+                                         (operand s x (cast u32 n))))
+                      (set! found true)))
+                  (unless found (fail (.name f) "phi predecessor is missing")))
+                (set! slot (+ slot 1))))))))
+    (let [(mut descriptors) (ArrayList::new [groups/Group] (.a s))
+          (mut group-end) (: 0 i32)
+          offset (if (> (.return-count s) 1) (: 1 i32) 0)]
+      (for [i 0 (len (.args f))]
+        (append-group! s
+                       (mut descriptors)
+                       (+ (cast i32 i) offset)
+                       (get (.arg-flags f) i)
+                       (cast i32 (get argtypes (+ i (cast i64 offset))))
+                       (mut group-end)))
+      (match (if (or (.indirect-result s) (> (.return-count s) 1))
+                 (calls/create-result 9
+                                      (slice argtypes)
+                                      (slice descriptors)
+                                      (if (.indirect-result s)
+                                          (results/indirect)
+                                          (results/pieces (cast u8
+                                                                (.return-type s))
+                                                          (.return-count s)))
+                                      (.a s))
+                 (calls/create-grouped 9
+                                       (cast u8 (.return-type s))
+                                       (slice argtypes)
+                                       (slice descriptors)
+                                       (.a s)))
+        (Err [message] (fail (.name f) message))
+        (Ok [prototype]
+            (require s (calls/function! (mut (.g s)) prototype (.a s))))))))
+
+;;; Merge independent stogir bytes into the compiler's existing module transport.
+(defn merge! [(s (ptr Adapter)) (source image/Image) (symbol u32)] (-> void)
+  (unless (= (len (.text-data source)) 0)
+    (fail (.name (.f s)) "embedded text data needs module metadata adaptation"))
+  (let [ta (.ta s)
+        text-base
+          (asm/sect-append! ta
+                            asm/SEC-TEXT
+                            (.data (.text source))
+                            (len (.text source))
+                            (.text-alignment source))
+        data-base
+          (asm/sect-append! ta
+                            asm/SEC-DATA-CONST
+                            (.data (.data source))
+                            (len (.data source))
+                            (.data-alignment source))
+        (mut mapping) (ArrayList::new [u32] (.a s))]
+    (for range (.text-data source)
+      (push! (.text-data s)
+             (MTextData
+               :section 0
+               :offset (+ text-base (.offset range))
+               :length (.length range)
+               :kind (.kind range))))
+    (for [i 0 (len (.symbols source))]
+      (let [sy (get (.symbols source) i)
+            (mut mapped) (cir/none)]
+        (if (= (.section sy) 0)
+            (for [j 0 (len (.import-ids s))]
+              (when (image/same-name? source sy (get (.import-names s) j))
+                (set! mapped (get (.import-ids s) j))))
+            (if (image/same-name? source sy "_coil_stogir_body")
+                (set! mapped symbol)
+                (set! mapped
+                      (asm/sym-add-anon! ta
+                                         (if (= (.section sy) 1)
+                                             asm/SEC-TEXT
+                                             asm/SEC-DATA-CONST)
+                                         (+ (if (= (.section sy) 1)
+                                                text-base
+                                                data-base)
+                                            (.offset sy))
+                                         0))))
+        (when (= mapped (cir/none))
+          (fail (.name (.f s)) "unmapped image symbol"))
+        (push! (mut mapping) mapped)))
+    (for r (.relocations source)
+      (when (or (not (or (= (.section r) 1) (= (.section r) 2)))
+                (!= (.addend r) 0))
+        (eprintln "stogir relocation: section {}, kind {}, addend {}"
+                  (.section r)
+                  (.kind r)
+                  (.addend r))
+        (fail (.name (.f s)) "unsupported image relocation section or addend"))
+      (asm/reloc! ta
+                  (if (= (.section r) 1) asm/SEC-TEXT asm/SEC-DATA-CONST)
+                  (+ (if (= (.section r) 1) text-base data-base) (.offset r))
+                  (get mapping (cast i64 (.symbol r)))
+                  (case (.kind r)
+                    1 asm/R-ABS64
+                    2 asm/R-BRANCH26
+                    3 asm/R-PAGE21
+                    4 asm/R-PAGEOFF12
+                    (fail (.name (.f s)) "unsupported image relocation kind"))
+                  0))
+    (asm/sym-def! ta symbol asm/SEC-TEXT text-base (len (.text source)))))
+
+(defn compile! [(f (ptr cir/Func))
+                (ta (ptr asm/Asm))
+                (symbol u32)
+                (text-data (ptr (ArrayList MTextData)))] (-> void)
+  (let [work (p/alloc-stack scratch/ScratchArena)]
+    (scratch/ScratchArena::init-with-capacity work (malloc-allocator) 65536)
+    (let [a (allocator work)
+          (mut state) (zeroed Adapter)
+          s (cast (ptr Adapter) (mut state))]
+      (set! (.a s) a)
+      (set! (.f s) f)
+      (set! (.ta s) ta)
+      (set! (.text-data s) text-data)
+      (set! (.g s) (graph/create a))
+      (set! (.values s) (ArrayList::new [i32] a))
+      (set! (.regions s) (ArrayList::new [i32] a))
+      (set! (.order s) (ArrayList::new [i64] a))
+      (set! (.from s) (ArrayList::new [i64] a))
+      (set! (.to s) (ArrayList::new [i64] a))
+      (set! (.ends s) (ArrayList::new [i32] a))
+      (set! (.branches s) (ArrayList::new [i32] a))
+      (set! (.exits s) (ArrayList::new [i32] a))
+      (set! (.import-names s) (ArrayList::new [(slice u8)] a))
+      (set! (.import-ids s) (ArrayList::new [u32] a))
+      (set! (.start s) (emit! s 104 0 [(: 0 i32)]))
+      (set! (.control s) (.start s))
+      (translate! s)
+      ; Every reachable CIR terminator is observable control. A path that only
+      ; loops forever need not flow backward from a RETURN root.
+      (for ending (.ends s) (push! (mut (.exits s)) ending))
+      (for branch (.branches s)
+        (when (> branch 0) (push! (mut (.exits s)) branch)))
+      (match (native/image (.g s)
+                           (.start s)
+                           (slice (.exits s))
+                           "_coil_stogir_body"
+                           a)
+        (Err [message] (fail (.name f) message))
+        (Ok [result] (merge! s result symbol))))
+    (close! work)))
