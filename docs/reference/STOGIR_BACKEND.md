@@ -47,8 +47,9 @@ The target-program reachability pass is shared with TPDE and retains exported
 entries, direct and indirect function references, and native-data references.
 Host image APIs retain all requested functions for later private-name lookup.
 
-Comparative benchmarking is being brought up in `scripts/benchmarks` using the
+Comparative benchmarking is available in `scripts/benchmarks` using the
 same Coil source, inputs and `-O3 --no-debug`. Measurements separate compile,
 platform link and executable run, rotate backend order and compare full output.
-Early smoke samples establish output agreement only; they are not performance
-conclusions. Public stateful JIT selection and DWARF remain unfinished.
+The [initial comparison](../benchmarks/STOGIR_INITIAL.md) records five measured
+samples and full input hashes. Public stateful JIT selection and DWARF remain
+unfinished.
