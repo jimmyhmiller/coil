@@ -60,6 +60,9 @@ INTERNAL_NAMESPACES = {
     # Profile-selected implementation of the ambient assertion surface.
     "coil.assert.hermetic",
     "coil.http.parser.types",
+    # The formatter's internal tree and document algebra.
+    "coil.source.cst",
+    "coil.source.doc",
     "coil.http.parser.generated",
     "coil.meta-runtime",
     # coil.prop's engine room. Importable, but `coil.prop` re-exports everything a

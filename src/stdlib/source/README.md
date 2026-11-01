@@ -13,7 +13,7 @@ coil fmt --width 90 <file.coil> # preview a different target width
 ```
 
 `fmt` is a built-in subcommand of the `coil` compiler (the formatter lives in
-`src/compiler/formatter/rules.coil` and is compiled into the binary; `src/compiler/driver.coil` wires it
+`src/stdlib/source/format.coil` and is compiled into the binary; `src/compiler/driver.coil` wires it
 up). The standalone `coil run src/compiler/formatter/fmt.coil -- <file>` still works and is equivalent.
 
 Target width defaults to 80 columns (`fmt-default-width` in `rules.coil`, the one
@@ -81,10 +81,7 @@ line after a comment.
 | `doc.coil`  | a Wadler/Prettier **Doc** algebra + width-driven renderer (`DNest` relative indent, `DAlign` anchor-to-column, `DGroup` flat-if-fits) |
 | `rules.coil`| lowers the CST to a Doc, applying the layout conventions above |
 | `fmt.coil`  | the CLI |
-| `dump.coil` | debug: print the CST node tree |
-| `sample.coil` | a small fixture exercising comments, prefixes, strings, bindings |
 | `balance.coil` | `coil balance` — delimiter repair, plus the shared token scanner |
-| `formedit.coil` | `coil edit` — addressing and replacing whole forms |
 | `balance_cli.coil`, `edit_cli.coil` | standalone builds of each (seconds to compile, for iterating without rebuilding the compiler) |
 
 # coil balance — repairing source that will not read
@@ -167,36 +164,10 @@ repairs (historical logs may contain `typed-boundary` and `no-typecheck`);
 `surplus-ambiguous`, `mismatch`, `move-required`, `inside-line`, `no-place`,
 `over-fire`, `underflow`, `indent-disagree`, `unterminated-string` for refusals.
 
-# coil edit — editing a form instead of a range of text
-
-The other half. A text patch can straddle a delimiter, so applying one can make a file
-unreadable; naming a form and supplying a replacement form cannot, because the
-replacement is read and rejected unless it is complete and balanced, and the splice
-lands on the form's own byte boundaries.
-
-```
-coil edit f.coil --list
-coil edit f.coil --form 'defn parse-args' --show
-coil edit f.coil --form 'defn parse-args' --replace --write < new.coil
-coil edit f.coil --in 'impl Show Point' --form 'show' --replace --write < new.coil
-coil edit f.coil --form 'defn old' --delete --write
-```
-
-An address is a form's leading items, itself read as Coil and compared item by item —
-so `impl [T] Show (Box T)` is four items and whitespace inside one doesn't matter.
-Matching is a **prefix**: `defn` names every defn and reports them all, which is how you
-find the address you want. A miss lists the forms that do exist. Nesting uses `--in`
-rather than a path separator, because `/` is an ordinary character in a Coil symbol and
-`Point/show` is genuinely ambiguous.
-
-Replacement text is read from stdin. Its first line is spliced at the form's own
-indentation, so write it unindented and indent the rest to suit.
-
 ## Testing
 
-`coil balance` and `coil edit` have no automated tests. The scripts that exercised
-them (`scripts/tests/balance_fuzz.py`, `balance_cases.py`, `edit_roundtrip.py` and
-`edit_cases.py`) were run by no gate, and were deleted with the test-suite
+`coil balance` has few automated tests. The scripts that exercised it
+(`scripts/tests/balance_fuzz.py` and `balance_cases.py`) were run by no gate, and were deleted with the test-suite
 restructure on 2026-10-12; `git log --diff-filter=D -- scripts/tests/balance_fuzz.py`
 finds them. Restore and run them when changing these tools.
 

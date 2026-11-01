@@ -211,7 +211,7 @@ Use this format:
   `object/` (instruction encoders, Mach-O/ELF/DWARF/wasm writers), `jit/`,
   `retained/` (state kept between compiler revisions), `artifact/` (units and
   artifact identity), `migrate/` (API and syntax migrations), `cli/` (`cimport`,
-  `update`, the generated guide), `support/`, `formatter/` and `selftest/`.
+  `update`, the generated guide), `support/` and `selftest/`.
   Module names do not follow the folders: a module is found by its declared
   `(module coil.compiler.NAME)`, so moving a file changes no import.
 - `tests/` — what the two test tiers run: `corpus` (the runtime programs), `diag`
