@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -362,6 +364,31 @@ def splice(current: str, generated: str, target: Path = TARGET, begin: str = BEG
     return current[:start] + generated + current[stop + len(end) :]
 
 
+# A string, a comment, or layout. Only the last is removed.
+_LAYOUT = re.compile(r'"(?:\\.|[^"\\])*"|;[^\n]*|\s+')
+
+
+def same_tables(before: str, after: str) -> bool:
+    """Do these texts differ only in layout? `coil fmt` owns the tree's layout, so the
+    generator's own line breaks are not a fact about the library, and a table it would
+    only lay out differently is up to date."""
+    def strip(text: str) -> str:
+        return _LAYOUT.sub(lambda m: "" if m.group().isspace() else m.group(), text)
+    return strip(before) == strip(after)
+
+
+def write_formatted(path: Path, text: str) -> None:
+    """Write a regenerated file as the tree's formatter lays it out."""
+    coil = shutil.which("coil")
+    if coil is None:
+        sys.exit(f"error: regenerating {path.relative_to(ROOT)} needs `coil` on PATH to format it")
+    path.write_text(text)
+    result = subprocess.run([coil, "fmt", "--write", str(path)], capture_output=True, text=True)
+    if result.returncode != 0:
+        sys.exit(f"error: `coil fmt --write {path.relative_to(ROOT)}` failed:\n{result.stderr}")
+    print(f"wrote {path.relative_to(ROOT)}")
+
+
 def generated_names(text: str, table: str) -> set[str]:
     """The quoted names a generated `(= name "...")` cond table in TEXT lists."""
     start = text.find(f"(defn {table} ")
@@ -417,14 +444,17 @@ def main() -> int:
     renames_updated = splice(renames_current, render_reexports(collect_reexports(entries)),
                              RENAMES, REEXPORTS_BEGIN, REEXPORTS_END)
 
-    if current == updated and renames_current == renames_updated:
+    manifest_stale = not same_tables(current, updated)
+    renames_stale = not same_tables(renames_current, renames_updated)
+
+    if not manifest_stale and not renames_stale:
         if args.check:
             print(f"ok: {TARGET.relative_to(ROOT)} manifest is up to date")
             print(f"ok: {RENAMES.relative_to(ROOT)} API-REEXPORTS is up to date")
         return 0
 
     if args.check:
-        if current != updated:
+        if manifest_stale:
             rel = TARGET.relative_to(ROOT)
             print(f"error: {rel} is out of date", file=sys.stderr)
             # Say which tree changed: the region lists the standard library AND the
@@ -439,7 +469,7 @@ def main() -> int:
                 "      python3 scripts/compiler/gen-stdlib-manifest.py",
                 file=sys.stderr,
             )
-        if renames_current != renames_updated:
+        if renames_stale:
             rel = RENAMES.relative_to(ROOT)
             print(f"error: {rel}'s API-REEXPORTS is out of date with src/stdlib/", file=sys.stderr)
             print(
@@ -451,10 +481,10 @@ def main() -> int:
             )
         return 1
 
-    for path, before, after in ((TARGET, current, updated), (RENAMES, renames_current, renames_updated)):
-        if before != after:
-            path.write_text(after)
-            print(f"wrote {path.relative_to(ROOT)}")
+    if manifest_stale:
+        write_formatted(TARGET, updated)
+    if renames_stale:
+        write_formatted(RENAMES, renames_updated)
     return 0
 
 
