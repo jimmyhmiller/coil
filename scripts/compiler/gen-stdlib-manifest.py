@@ -63,6 +63,9 @@ INTERNAL_NAMESPACES = {
     # The formatter's internal tree and document algebra.
     "coil.source.cst",
     "coil.source.doc",
+    # Shared by the compiler and the source tools; their APIs are not settled.
+    "coil.path",
+    "coil.project",
     "coil.http.parser.generated",
     "coil.meta-runtime",
     # coil.prop's engine room. Importable, but `coil.prop` re-exports everything a
