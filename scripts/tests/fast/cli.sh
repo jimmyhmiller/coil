@@ -609,31 +609,31 @@ EOF
     "build: an unknown --backend is an error" "$COIL" build "$T/backend-typo.coil" -o "$T/backend-typo" --backend arm46
   # A nested dependency owns its namespaces and its exclusions; the consumer
   # excludes it from its own package, without making the dependency disappear.
-  mkdir -p "$T/nested-owner/src/compiler/nested"
+  mkdir -p "$T/nested-owner/src/app/nested"
   cat > "$T/nested-owner/Coil.toml" <<'EOF'
 [workspace]
 name = "owner"
-members = ["src/compiler"]
+members = ["src/app"]
 [dependencies]
-independent = { path = "src/compiler/nested" }
+independent = { path = "src/app/nested" }
 EOF
-  cat > "$T/nested-owner/src/compiler/Coil.toml" <<'EOF'
+  cat > "$T/nested-owner/src/app/Coil.toml" <<'EOF'
 [package]
-name = "compiler"
+name = "app"
 entry = "main.coil"
 source-roots = ["."]
 exclude = ["nested", "hidden.coil"]
 EOF
-  cat > "$T/nested-owner/src/compiler/nested/Coil.toml" <<'EOF'
+  cat > "$T/nested-owner/src/app/nested/Coil.toml" <<'EOF'
 [package]
 name = "independent"
 source-roots = ["."]
 exclude = ["ignored.coil"]
 EOF
-  printf '(module independent.value)\n(defn answer [] (-> i64) 42)\n' > "$T/nested-owner/src/compiler/nested/value.coil"
-  printf '(module independent.value)\n(defn answer [] (-> i64) 1)\n' > "$T/nested-owner/src/compiler/nested/ignored.coil"
-  printf '(module owner.compiler.main)\n(import "independent.value" :as independent)\n(defn main [] (-> i64) (independent/answer))\n' > "$T/nested-owner/src/compiler/main.coil"
-  printf '(module owner.compiler.main)\n(defn main [] (-> i64) 1)\n' > "$T/nested-owner/src/compiler/hidden.coil"
+  printf '(module independent.value)\n(defn answer [] (-> i64) 42)\n' > "$T/nested-owner/src/app/nested/value.coil"
+  printf '(module independent.value)\n(defn answer [] (-> i64) 1)\n' > "$T/nested-owner/src/app/nested/ignored.coil"
+  printf '(module owner.app.main)\n(import "independent.value" :as independent)\n(defn main [] (-> i64) (independent/answer))\n' > "$T/nested-owner/src/app/main.coil"
+  printf '(module owner.app.main)\n(defn main [] (-> i64) 1)\n' > "$T/nested-owner/src/app/hidden.coil"
   (cd "$T/nested-owner" && "$COIL" check > "$T/nested-owner.log" 2>&1)
   local nested_rc=$?
   [ "$nested_rc" = 0 ] && ok "check: nested dependency owns source and exclusion rules" || bad "check: nested dependency owns source and exclusion rules" "$(cat "$T/nested-owner.log")"
@@ -1280,6 +1280,20 @@ EOF
       bad "emit-obj ($backend) links into a C program" "emit-obj or cc failed"
     fi
   done
+  if [ "$HOST_OS" = Darwin ] && [ "$HOST_ARCH" = arm64 ]; then
+    for backend in llvm tpde stogir; do
+      expect_rc 42 "native ABI, control flow, memory and atomics ($backend)" \
+        "$COIL" run "$ROOT/tests/cli/native-backends.coil" --backend "$backend" -O3 --no-debug
+      if "$COIL" emit-obj "$T/lib.coil" --backend "$backend" --no-debug -o "$T/native-$backend.o" > "$T/native-$backend.log" 2>&1 \
+         && cc "$T/driver.c" "$T/native-$backend.o" -o "$T/native-$backend" 2>> "$T/native-$backend.log"; then
+        expect_rc 0 "native exported aggregate C ABI ($backend)" "$T/native-$backend"
+      else
+        bad "native exported aggregate C ABI ($backend)" "$(cat "$T/native-$backend.log")"
+      fi
+    done
+    expect_rc 0 "native Mach-O data-in-code serialization and JIT loader" \
+      "$COIL" run "$ROOT/src/compiler/selftest/jit_selftest.coil" --backend llvm
+  fi
   if "$COIL" build "$T/lib.coil" --lib -o "$T/libobj.a" >/dev/null 2>&1 \
      && cc "$T/driver.c" "$T/libobj.a" -o "$T/driver-lib" 2>/dev/null; then
     "$T/driver-lib"; rc=$?
@@ -1378,7 +1392,7 @@ EOF
 EOF
   # tpde names each symbol it imports once, however many modules declare it
   # (the library declares write, abort and others in several modules).
-  printf '%s\n' '(module objlib.plain)' '(defn answer [] (-> i64) 42)' > "$T/plain.coil"
+  printf '%s\n' '(module objlib.plain)' '(extern puts [(ptr i8)] (-> i32))' '(defn answer [] (-> i64) (puts c"answer") 42)' '(export-c [answer :as "answer"])' > "$T/plain.coil"
   local syms undefined dups
   if "$COIL" emit-obj "$T/plain.coil" --backend tpde -o "$T/plain.o" >/dev/null 2>&1; then
     syms=$(nm "$T/plain.o" 2>&1)

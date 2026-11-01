@@ -12,7 +12,7 @@ and module transport lets the engines consume the same native lowering while
 remaining distinct code generators. LLVM retains its existing lowering path.
 
 The library is a separately declared package, vendored under
-`src/compiler/stogir` at revision `7d35cb7`. Its [README](../../src/compiler/stogir/README.md),
+`src/compiler/stogir` at revision `ca8d754`. Its [README](../../src/compiler/stogir/README.md),
 [LICENSE](../../src/compiler/stogir/LICENSE), [NOTICE](../../src/compiler/stogir/NOTICE)
 and provenance preserve credit to coil-stogir and Dmitry Stogov's IR. No per-file
 license headers are added by the integration.
@@ -30,14 +30,25 @@ Unit identities distinguish `stogir` from LLVM and TPDE. Debug info is not enabl
 by default for this backend, and an explicit `-g` is diagnosed until implemented.
 The public stateful JIT API has not yet acquired a stogir backend choice.
 
-Evidence so far: a compiler candidate builds and checks the full compiler;
-a direct CIR-to-stogir native JIT probe computes 42; the CLI check suite passes
-72 checks, including a nested dependency/exclusion ownership regression. The
-ordinary loop/call program reaches runtime functions but currently stops at
-`coil.atomic.add` (CIR atomic RMW). There is no fallback. End-to-end executable
-and comparative benchmark validation remain required.
+The same combined fixture now executes successfully under LLVM, TPDE and stogir:
+loops, dense switches, grouped aggregate parameters, two-register and x8 indirect
+results, four-float HFA results, FP conversions/NaNs, stack memory, ArrayList heap
+allocation, function pointers and native atomics. Exported aggregate C ABI tests
+also pass all three engines. Mach-O serialization and the existing JIT loader
+selftest pass. The CLI objects section runs these checks on macOS arm64.
 
-Next work is native atomic adaptation, then the compiler corpus and identical
-Coil benchmark sources/inputs under LLVM, TPDE and stogir. Runtime and compile-time
-measurements must record compiler/source revisions, backend options, outputs,
-repeated samples and separate compile/link/run phases before performance claims.
+An initial full corpus run passes 6 of 9 programs. Remaining failures include
+pinned-register shim calls, narrow bit operations/i128, and deep tail recursion.
+The adapter currently demotes tail calls to ordinary calls and returns, so deep
+recursion exhausts the stack. This must be fixed before general backend use.
+Unsupported operations diagnose rather than fall back to another selector.
+
+The target-program reachability pass is shared with TPDE and retains exported
+entries, direct and indirect function references, and native-data references.
+Host image APIs retain all requested functions for later private-name lookup.
+
+Comparative benchmarking is being brought up in `scripts/benchmarks` using the
+same Coil source, inputs and `-O3 --no-debug`. Measurements separate compile,
+platform link and executable run, rotate backend order and compare full output.
+Early smoke samples establish output agreement only; they are not performance
+conclusions. Public stateful JIT selection and DWARF remain unfinished.

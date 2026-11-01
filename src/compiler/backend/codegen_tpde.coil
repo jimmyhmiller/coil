@@ -154,6 +154,11 @@
    (abi-known (ArrayList bool))
    (stogir-text-data (ArrayList MTextData))
    (stogir-data-section i64)
+   (reach-enabled bool)
+   (reach-pending (ArrayList i64))
+   (reach-seen (ArrayList bool))
+   (reach-by-symbol (ArrayList i64))
+   (reach-reloc i64)
    (stogir bool)  ; independent stogir selector over the same native CIR
    (x64 bool)  ; x86-64 (System V) rather than arm64 (AAPCS64)
    (elf bool)  ; the object becomes ELF (tl-elf-object), not Mach-O
@@ -3575,6 +3580,82 @@
     (al-at [GSig] (field g sigs) si)))
 
 ;;; Lower `fd` into the current CIR function, (.f tl).
+;;; Target programs retain public entries and every function referenced by
+;;; their CIR or native data. Host image APIs retain all requested functions:
+;;; their callers may look up a private entry by name after publication.
+(defn tl-reach-symbol! [(tl (ptr Tl)) (symbol i64)] (-> void)
+  (when (and (>= symbol 0) (< symbol (len (.reach-by-symbol tl))))
+    (let [index (get (.reach-by-symbol tl) symbol)]
+      (when (and (>= index 0) (not (get (.reach-seen tl) index)))
+        (set! (mut (.reach-seen tl)) index true)
+        (push! (mut (.reach-pending tl)) index)))))
+
+(defn tl-reach-data! [(tl (ptr Tl))] (-> void)
+  (let [relocations (.relocs (.obj (.g tl)))]
+    (for [i (.reach-reloc tl) (len relocations)]
+      (tl-reach-symbol! tl (.sym (get relocations i))))
+    (set! (.reach-reloc tl) (len relocations))))
+
+(defn tl-reach-cir! [(tl (ptr Tl))] (-> void)
+  (when (.reach-enabled tl)
+    (let [fp (.f tl)]
+      (for [i 0 (len (.values fp))]
+        (let [x (cir/val fp (cast u32 i))
+              op (cast i64 (.op x))
+              live-symbol
+                (and (= op cir/OP-SYM) (> (get (.scratch-uses fp) i) 0))
+              direct-call
+                (and (or (= op cir/OP-CALL)
+                         (= op cir/OP-TAILCALL)
+                         (= op cir/OP-SHIMCALL))
+                     (>= (.imm x) 0)
+                     (= (& (.flags x) (: 8 u8)) 0))]
+          (when (or live-symbol direct-call)
+            (when (or (< (.imm x) 0) (>= (.imm x) (len (.tsym-mobj tl))))
+              (tl-fail "native reachability: CIR symbol was not mirrored"))
+            (tl-reach-symbol! tl (get (.tsym-mobj tl) (.imm x)))))))))
+
+(defn tl-reach-setup! [(tl (ptr Tl))] (-> void)
+  (let [g (.g tl)
+        fs (.funcs (.program g))]
+    (for [i 0 (len (.syms (.obj g)))] (push! (mut (.reach-by-symbol tl)) -1))
+    (for [i 0 (len (load fs))] (push! (mut (.reach-seen tl)) false))
+    (for [i 0 (len (load fs))]
+      (let [fd (elem fs i)]
+        (unless (.declared fd)
+          (let [sig (tl-sig tl fd)]
+            (set! (mut (.reach-by-symbol tl)) (.symidx sig) i)
+            (when (.shim sig)
+              (set! (mut (.reach-by-symbol tl)) (.implsym sig) i))))))
+    (for [i 0 (len (load fs))]
+      (let [fd (elem fs i)]
+        (unless (.declared fd)
+          (let [sig (tl-sig tl fd)
+                sym (get (.syms (.obj g)) (.symidx sig))]
+            (when (or (not (.reach-enabled tl)) (.ext sym))
+              (tl-reach-symbol! tl (.symidx sig)))))))
+    (for alias (.export_aliases g) (tl-reach-symbol! tl (.target alias)))
+    (tl-reach-data! tl)))
+
+;;; Drop unreferenced declaration placeholders; a late reference is an error,
+;;; never a bogus definition at text offset zero.
+(defn tl-reach-finish! [(tl (ptr Tl))] (-> void)
+  (when (.reach-enabled tl)
+    (let [g (.g tl)
+          fs (.funcs (.program g))]
+      (for r (.relocs (.obj g))
+        (when (and (>= (.sym r) 0) (< (.sym r) (len (.reach-by-symbol tl))))
+          (let [index (get (.reach-by-symbol tl) (.sym r))]
+            (when (and (>= index 0) (not (get (.reach-seen tl) index)))
+              (tl-fail "native reachability: late reference to an uncompiled function")))))
+      (for [i 0 (len (load fs))]
+        (let [fd (elem fs i)]
+          (when (and (not (.declared fd)) (not (get (.reach-seen tl) i)))
+            (let [sig (tl-sig tl fd)]
+              (mobj-set-sym! (mut (.obj g)) (.symidx sig) 0 0)
+              (when (.shim sig)
+                (mobj-set-sym! (mut (.obj g)) (.implsym sig) 0 0)))))))))
+
 (defn tl-func-lower! [(tl (ptr Tl)) (fd (ptr Func))] (-> void)
   (let [fp (.f tl)
         stats (.stats tl)
@@ -3582,6 +3663,7 @@
     (for _ (range 0 (.prof-lower-repeat tl)) (tl-lower-func! tl fd))
     (tl-lower-func! tl fd)
     (cir/finish! fp)
+    (tl-reach-cir! tl)
     (when stats
       (set! (.t-lower tl) (+ (.t-lower tl) (- (ticks) t1)))
       (set! (.stat-funcs tl) (+ (.stat-funcs tl) 1))
@@ -4027,11 +4109,12 @@
         text (tasm/sect-buf ta tasm/SEC-TEXT)
         tconst (tasm/sect-buf ta tasm/SEC-CONST)
         textbuf (mobj-sect-buf (mut (.obj g)) (.text g))
-        ; x86-64: tpde aligns functions to 16 within its text
+        ; Preserve the selector's text alignment when appending to module text.
+        required (.align (tasm/sect-at ta tasm/SEC-TEXT))
         _
-          (when (.x64 tl)
-            (b-align! (mut textbuf) 16)
-            (mobj-sect-align-at-least! (mut (.obj g)) (.text g) 4))
+          (do
+            (b-align! (mut textbuf) (<< (: 1 i64) required))
+            (mobj-sect-align-at-least! (mut (.obj g)) (.text g) required))
         text-base (len (load textbuf))
         _ (set! (.text-base tl) text-base)]
     ; x86-64 Mach-O addends are implicit: in the relocated field
@@ -4275,6 +4358,11 @@
         (mut tl) (zeroed Tl)]
     (set! (.stogir-text-data tl)
           (ArrayList::new [MTextData] (malloc-allocator)))
+    (set! (.reach-enabled tl)
+          (match where (OnTarget [] true) (OnHost [] false)))
+    (set! (.reach-pending tl) (ArrayList::new [i64] a))
+    (set! (.reach-seen tl) (ArrayList::new [bool] a))
+    (set! (.reach-by-symbol tl) (ArrayList::new [i64] a))
     (set! (.stogir tl) stogir)
     (set! (.x64 tl) x64)
     (set! (.elf tl) (tl-elf-target? a where))
@@ -4339,6 +4427,7 @@
           pp (cast (ptr Pipe) (mut pipe))
           span (tr/span-begin "backend.tpde-functions")
           fs (load (field (.program g) funcs))]
+      (tl-reach-setup! tlp)
       (pipe-start! pp
                    tlp
                    (and (tl-threads?)
@@ -4347,14 +4436,16 @@
                            0)))
       (let [names?
               (!= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_NAMES")) 0)]
-        (for i (range 0 (len (load fs)))
-          (let [fd (al-at [Func] fs i)]
-            (unless (.declared fd)
-              (when names? (eprintln "tpde[{}] {}" i (.name fd)))
+        (let [(mut cursor) 0]
+          (while (< cursor (len (.reach-pending tlp)))
+            (let [i (get (.reach-pending tlp) cursor)
+                  fd (al-at [Func] fs i)]
+              (when names? (eprintln "native[{}] {}" i (.name fd)))
               (match (func-machine-code fd)
                 (Some [code] (tl-machine-code-func! tlp pp fd code))
                 (None [] (tl-func! tlp pp fd)))
-              0)))
+              (tl-reach-data! tlp))
+            (set! cursor (+ cursor 1))))
         (pipe-finish! pp))
       (tr/span-end span)
       (when (!= (primitive/cast i64 (cgtpde.getenv c"COIL_TPDE_STATS")) 0)
@@ -4372,6 +4463,7 @@
       (let [t-merge0 (ticks)]
         (tl-merge! tlp)
         (g-place-export-aliases! g)
+        (tl-reach-finish! tlp)
         (when (.dbg tlp)
           (let [span (tr/span-begin "backend.tpde-dwarf")]
             (tl-emit-dwarf! tlp paths)
@@ -4390,6 +4482,9 @@
 (defn tl-free! [(tl (ptr Tl)) (p (ptr Pipe))] (-> void)
   (tasm/asm-free! (.ta tl))
   (free! (mut (.stogir-text-data tl)))
+  (free! (mut (.reach-pending tl)))
+  (free! (mut (.reach-seen tl)))
+  (free! (mut (.reach-by-symbol tl)))
   (unless (.stogir tl) (tcore/compiler-free! (.c tl)))
   (for i (range 0 (len (.jobs p)))
     (let [j (pipe-slot p i)]
