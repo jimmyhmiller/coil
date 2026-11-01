@@ -5883,6 +5883,107 @@
     0)
   0)
 
+;;; ---- reference selects on wasm ----
+;;; LLVM's WebAssembly backend encodes a `select` over a reference value (externref,
+;;; funcref) with the untyped `select` opcode, 0x1b, and every engine rejects the
+;;; module: a reference select must be the typed form, 0x1c with its result type
+;;; (llvm-project issue 206650, unfixed in LLVM 23.1.4). Coil emits no select of
+;;; its own; the optimizer forms them from Coil's branches (an `if` choosing
+;;; between two externrefs), and the backend lowers a branch with a phi correctly.
+;;; So after optimization, just before a wasm object is emitted, each reference
+;;; select becomes a branch and a phi again.
+(defn llvm-branch-reference-selects! [(module (ptr i8)) (triple (slice u8))] (-> i64)
+  (when (starts-with triple "wasm")
+    (loop (let [s (llvm-find-reference-select module)]
+            (if (= (primitive/cast i64 s) 0)
+                (break)
+                (llvm-branch-select! module s)))))
+  0)
+
+;;; Whether T is a wasm reference type: LLVM 23 spells externref and funcref as
+;;; the target types `wasm.externref` and `wasm.funcref`, earlier versions as
+;;; pointers in address spaces 10 and 20 (see llvm-externref-type).
+(defn llvm-reference-type? [(t (ptr i8))] (-> bool)
+  (let [kind (LLVMGetTypeKind t)]
+    (cond (= kind (: 20 i32))  ; LLVMTargetExtTypeKind
+            (let [name (from-cstr (LLVMGetTargetExtTypeName t))]
+              (or (= name "wasm.externref") (= name "wasm.funcref")))
+          (= kind (: 12 i32))  ; LLVMPointerTypeKind
+            (let [space (LLVMGetPointerAddressSpace t)]
+              (or (= space (: 10 u32)) (= space (: 20 u32))))
+          :else false)))
+
+;;; The first `select` in MODULE whose value is a reference, or null.
+(defn llvm-find-reference-select [(module (ptr i8))] (-> (ptr i8))
+  (block :found
+    (let [(mut f) (LLVMGetFirstFunction module)]
+      (while (!= (primitive/cast i64 (load f)) 0)
+        (let [(mut b) (LLVMGetFirstBasicBlock (load f))]
+          (while (!= (primitive/cast i64 (load b)) 0)
+            (let [(mut i) (LLVMGetFirstInstruction (load b))]
+              (while (!= (primitive/cast i64 (load i)) 0)
+                (when (and (= (LLVMGetInstructionOpcode (load i)) (: 46 i32))  ; LLVMSelect
+                           (llvm-reference-type? (LLVMTypeOf (load i))))
+                  (break :found (load i)))
+                (set! i (LLVMGetNextInstruction (load i)))))
+            (set! b (LLVMGetNextBasicBlock (load b)))))
+        (set! f (LLVMGetNextFunction (load f)))))
+    (primitive/cast (ptr i8) 0)))
+
+;;; Replace `S = select C, A, B` in block BB with a branch: a new block HEAD takes
+;;; every instruction of BB before S, and every edge into BB, and ends `br C, TRUE,
+;;; BB`; TRUE branches to BB, where a phi of A from TRUE and B from HEAD stands for
+;;; S. BB keeps S's successors and its own terminator, so the phis of the blocks
+;;; it branches to still name the right predecessor.
+(defn llvm-branch-select! [(module (ptr i8)) (s (ptr i8))] (-> i64)
+  (let [ctx (LLVMGetModuleContext module)
+        bb (LLVMGetInstructionParent s)
+        f (LLVMGetBasicBlockParent bb)
+        condition (LLVMGetOperand s (: 0 i32))
+        if-true (LLVMGetOperand s (: 1 i32))
+        if-false (LLVMGetOperand s (: 2 i32))
+        head (LLVMInsertBasicBlockInContext ctx bb c"refsel.head")
+        taken (LLVMInsertBasicBlockInContext ctx bb c"refsel.true")
+        builder (LLVMCreateBuilderInContext ctx)]
+    ; Every edge into BB now enters HEAD, a self-loop's included, before the
+    ; two new edges into BB exist.
+    (let [(mut x) (LLVMGetFirstBasicBlock f)]
+      (while (!= (primitive/cast i64 (load x)) 0)
+        (let [term (LLVMGetBasicBlockTerminator (load x))]
+          (unless (= (primitive/cast i64 term) 0)
+            (for [k 0 (primitive/cast i64 (LLVMGetNumSuccessors term))]
+              (when (= (primitive/cast i64 (LLVMGetSuccessor term (primitive/cast u32 k)))
+                       (primitive/cast i64 bb))
+                (LLVMSetSuccessor term (primitive/cast u32 k) head)
+                0))
+            0))
+        (set! x (LLVMGetNextBasicBlock (load x)))))
+    ; BB's instructions before S, its phis first, move to HEAD in order. HEAD
+    ; is now where control enters, and it precedes BB, so an entry block's
+    ; replacement is the function's first block.
+    (LLVMPositionBuilderAtEnd builder head)
+    (let [(mut i) (LLVMGetFirstInstruction bb)]
+      (while (!= (primitive/cast i64 (load i)) (primitive/cast i64 s))
+        (let [next (LLVMGetNextInstruction (load i))]
+          (LLVMInstructionRemoveFromParent (load i))
+          (LLVMInsertIntoBuilder builder (load i))
+          (set! i next))))
+    (LLVMBuildCondBr builder condition taken bb)
+    (LLVMPositionBuilderAtEnd builder taken)
+    (LLVMBuildBr builder bb)
+    (LLVMPositionBuilderBefore builder s)
+    (let [phi (LLVMBuildPhi builder (LLVMTypeOf s) c"refsel")
+          (mut values) if-true
+          (mut blocks) taken]
+      (LLVMAddIncoming phi (mut values) (mut blocks) (: 1 i32))
+      (set! values if-false)
+      (set! blocks head)
+      (LLVMAddIncoming phi (mut values) (mut blocks) (: 1 i32))
+      (LLVMReplaceAllUsesWith s phi))
+    (LLVMInstructionEraseFromParent s)
+    (LLVMDisposeBuilder builder)
+    0))
+
 ; The four functions LLVM's lowering of its memory intrinsics calls, for a target
 ; with no C library, where nothing else would define them. They are `weak`, as
 ; Rust's compiler_builtins and Zig's compiler_rt make theirs: a definition the
