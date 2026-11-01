@@ -128,3 +128,8 @@ is preserved by conditional relaxation and carried through the code-buffer/image
 alignment fields into JIT, AOT and module merging. Each PAGE21, PAGEOFF12 or
 BRANCH26 relocation describes one instruction, so adjacent branches/calls remain
 valid while true overlaps are rejected.
+
+The [block-layout checkpoint](../benchmarks/STOGIR_BLOCK_LAYOUT.md) records
+compiler `60174544`: 4.85× faster codegen and 9.68× LLVM runtime on the unchanged
+workload. Both active criteria remain unmet. Its 59-case scheduler differential,
+212 standalone checks, 65 linked consumers and Coil FAST 49/49 pass.
