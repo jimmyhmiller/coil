@@ -799,6 +799,25 @@ EOF
              "$(diff -u "tests/cli/fmt/${base}_expected.coil" "$T/$base.got" | head -40)"
   done
   expect_rc 0 "the expected layout is a fixpoint" "$COIL" fmt --check tests/cli/fmt/layout_expected.coil
+  # Run over the tree, fmt turns this input into its expected output, and the check
+  # above then proves nothing.
+  expect_rc 1 "the layout input is not already formatted" "$COIL" fmt --check tests/cli/fmt/layout_input.coil
+
+  # Formatting moves whitespace. A file the reader refuses is reported and left alone:
+  # no closer is invented for it, and none is dropped.
+  local malformed name
+  for malformed in '(defn f [] (-> i64)|unclosed' '(defn f [] (-> i64) 1))|stray' '(defn f [] [1 2)|mismatched' '(def s "open|string'; do
+    name=${malformed##*|}
+    printf '%s\n' "${malformed%|*}" > "$T/refused-$name.coil"
+    cp "$T/refused-$name.coil" "$T/refused-$name.before"
+    expect_rc_out 2 "refused-$name.coil:1:" "fmt reports the $name form where the reader does" "$COIL" fmt "$T/refused-$name.coil"
+    expect_rc 2 "fmt --check calls the $name form an error, not unformatted" "$COIL" fmt --check "$T/refused-$name.coil"
+    expect_rc 2 "fmt --write refuses the $name form" "$COIL" fmt --write "$T/refused-$name.coil"
+    cmp -s "$T/refused-$name.before" "$T/refused-$name.coil" \
+      && ok "fmt --write leaves the $name form as it was" \
+      || bad "fmt --write leaves the $name form as it was" "$(cat "$T/refused-$name.coil")"
+    expect_rc 2 "fmt - refuses the $name form" sh -c '"$1" fmt - < "$2"' sh "$COIL" "$T/refused-$name.coil"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -2024,35 +2043,35 @@ section_safety_traps() {
   while IFS='|' read -r case_name regex; do
     expect_crash "$regex" "safety: $case_name traps and says where" "$T/safety" "$case_name"
   done <<'CASES'
-index|index out of bounds: index 4, len 3.*safety_checks.coil:19:
-add|integer overflow.*safety_checks.coil:20:
-sub|integer overflow.*safety_checks.coil:21:
-mul|integer overflow.*safety_checks.coil:22:
-neg|integer overflow.*safety_checks.coil:23:
-div|division by zero.*safety_checks.coil:24:
-min-div|integer overflow.*safety_checks.coil:25:
-shift|shift amount is greater than the type size.*safety_checks.coil:26:
-narrow|integer cast truncated bits.*safety_checks.coil:27:
-unsigned|cast negative value to unsigned integer.*safety_checks.coil:28:
-float|integer part of floating point value out of bounds.*safety_checks.coil:29:
-slice-get|index out of bounds: index 6, len 3.*safety_checks.coil:30:
-subslice|start index 3 is larger than end index 2.*safety_checks.coil:31:
-generic|integer overflow.*safety_checks.coil:14:.*in generic code
-null-next|null pointer dereference.*safety_checks.coil:103:
-null-volatile|null pointer dereference.*safety_checks.coil:104:
-bad-tag|invalid variant tag: 9, the type has 3 variants.*safety_checks.coil:105:
-bad-bool|invalid boolean value.*safety_checks.coil:109:
-ptr-index|pointer arithmetic overflow.*safety_checks.coil:110:
-memcpy-null|null pointer dereference.*safety_checks.coil:111:
-unreachable|entered unreachable code.*safety_checks.coil:112:
+index|index out of bounds: index 4, len 3.*safety_checks.coil:21:
+add|integer overflow.*safety_checks.coil:22:
+sub|integer overflow.*safety_checks.coil:23:
+mul|integer overflow.*safety_checks.coil:24:
+neg|integer overflow.*safety_checks.coil:25:
+div|division by zero.*safety_checks.coil:26:
+min-div|integer overflow.*safety_checks.coil:27:
+shift|shift amount is greater than the type size.*safety_checks.coil:28:
+narrow|integer cast truncated bits.*safety_checks.coil:29:
+unsigned|cast negative value to unsigned integer.*safety_checks.coil:30:
+float|integer part of floating point value out of bounds.*safety_checks.coil:31:
+slice-get|index out of bounds: index 6, len 3.*safety_checks.coil:32:
+subslice|start index 3 is larger than end index 2.*safety_checks.coil:33:
+generic|integer overflow.*safety_checks.coil:16:.*in generic code
+null-next|null pointer dereference.*safety_checks.coil:107:
+null-volatile|null pointer dereference.*safety_checks.coil:108:
+bad-tag|invalid variant tag: 9, the type has 3 variants.*safety_checks.coil:110:
+bad-bool|invalid boolean value.*safety_checks.coil:114:
+ptr-index|pointer arithmetic overflow.*safety_checks.coil:115:
+memcpy-null|null pointer dereference.*safety_checks.coil:117:
+unreachable|entered unreachable code.*safety_checks.coil:118:
 stack|diagnosis: stack-overflow guard fault
-slice-set|index out of bounds: index 5, len 4.*safety_checks.coil:114:
-slice-init|index out of bounds: index 6, len 4.*safety_checks.coil:115:
-slice-at|index out of bounds: index 7, len 4.*safety_checks.coil:116:
-align|misaligned pointer: address [0-9]+ is not a multiple of 8.*safety_checks.coil:45:
-null-load|null pointer dereference.*safety_checks.coil:48:
-null-field|null pointer dereference.*safety_checks.coil:51:
-memcpy|memcpy source and destination overlap.*safety_checks.coil:57:
+slice-set|index out of bounds: index 5, len 4.*safety_checks.coil:120:
+slice-init|index out of bounds: index 6, len 4.*safety_checks.coil:121:
+slice-at|index out of bounds: index 7, len 4.*safety_checks.coil:122:
+align|misaligned pointer: address [0-9]+ is not a multiple of 8.*safety_checks.coil:47:
+null-load|null pointer dereference.*safety_checks.coil:50:
+null-field|null pointer dereference.*safety_checks.coil:53:
+memcpy|memcpy source and destination overlap.*safety_checks.coil:59:
 CASES
   out=$("$T/safety" index 2>&1)
   case "$out" in *"stack trace:"*) ok "safety: a trap prints a stack trace" ;; *) bad "safety: a trap prints a stack trace" "$out" ;; esac
