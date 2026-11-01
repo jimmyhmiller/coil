@@ -122,6 +122,11 @@ Use this format:
   `tests/diag` file (`python3 scripts/oracle.py diag bless …`, then read the
   golden), a check in `scripts/tests/fast/cli.sh`, a deftest in a `tests/stdlib`
   suite. A step that builds the compiler belongs in COMPREHENSIVE.
+- **Never pin a line number of a file on disk in an expectation.** Reformatting
+  or editing that file must not break the test. Name the source text and derive
+  the line from it, as the `safety-traps` table in `cli.sh` and the `tests/diag`
+  goldens do. A file that must stay unformatted is not named `*.coil`
+  (`tests/cli/fmt/*_input.coil.in`).
 - ⚠ **`build full` peaks near 5.3 GB of memory, and that is expected.** Compiling
   the compiler once costs about 2.7 GB (measured: the largest single process), and
   the fixpoint step in `scripts/compiler/rebootstrap.sh` deliberately emits the

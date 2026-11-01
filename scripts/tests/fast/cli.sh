@@ -792,16 +792,16 @@ EOF
 
   local base
   for base in layout vertical_spacing; do
-    "$COIL" fmt "tests/cli/fmt/${base}_input.coil" > "$T/$base.got" 2>&1
+    "$COIL" fmt "tests/cli/fmt/${base}_input.coil.in" > "$T/$base.got" 2>&1
     cmp -s "tests/cli/fmt/${base}_expected.coil" "$T/$base.got" \
-      && ok "fmt lays out tests/cli/fmt/${base}_input.coil as expected" \
-      || bad "fmt lays out tests/cli/fmt/${base}_input.coil as expected" \
+      && ok "fmt lays out tests/cli/fmt/${base}_input.coil.in as expected" \
+      || bad "fmt lays out tests/cli/fmt/${base}_input.coil.in as expected" \
              "$(diff -u "tests/cli/fmt/${base}_expected.coil" "$T/$base.got" | head -40)"
   done
   expect_rc 0 "the expected layout is a fixpoint" "$COIL" fmt --check tests/cli/fmt/layout_expected.coil
-  # Run over the tree, fmt turns this input into its expected output, and the check
-  # above then proves nothing.
-  expect_rc 1 "the layout input is not already formatted" "$COIL" fmt --check tests/cli/fmt/layout_input.coil
+  # An input is not named *.coil so that formatting the tree leaves it alone: as its
+  # own expected output, it would make the check above prove nothing.
+  expect_rc 1 "the layout input is not already formatted" "$COIL" fmt --check tests/cli/fmt/layout_input.coil.in
 
   # Formatting moves whitespace. A file the reader refuses is reported and left alone:
   # no closer is invented for it, and none is dropped.
@@ -2039,39 +2039,50 @@ section_safety_traps() {
               "pointers: 14" "undefined: -6148914691236517206"; do
     case "$out" in *"$want"*) ok "safety: no trap — $want" ;; *) bad "safety: no trap — $want" "$out" ;; esac
   done
-  local case_name regex
-  while IFS='|' read -r case_name regex; do
+  # Each case names the source text that traps; @ stands for the line holding it, so
+  # the fixture can be reformatted or edited without touching this table.
+  local case_name regex expression found
+  while IFS='|' read -r case_name regex expression; do
+    if [ -n "$expression" ]; then
+      found=$(grep -nF -- "$expression" "$sc")
+      case "$found" in
+        ""|*$'\n'*)
+          bad "safety: $case_name names one line of the fixture" "'$expression' matched: $found"
+          continue ;;
+      esac
+      regex=${regex/@/${found%%:*}}
+    fi
     expect_crash "$regex" "safety: $case_name traps and says where" "$T/safety" "$case_name"
   done <<'CASES'
-index|index out of bounds: index 4, len 3.*safety_checks.coil:21:
-add|integer overflow.*safety_checks.coil:22:
-sub|integer overflow.*safety_checks.coil:23:
-mul|integer overflow.*safety_checks.coil:24:
-neg|integer overflow.*safety_checks.coil:25:
-div|division by zero.*safety_checks.coil:26:
-min-div|integer overflow.*safety_checks.coil:27:
-shift|shift amount is greater than the type size.*safety_checks.coil:28:
-narrow|integer cast truncated bits.*safety_checks.coil:29:
-unsigned|cast negative value to unsigned integer.*safety_checks.coil:30:
-float|integer part of floating point value out of bounds.*safety_checks.coil:31:
-slice-get|index out of bounds: index 6, len 3.*safety_checks.coil:32:
-subslice|start index 3 is larger than end index 2.*safety_checks.coil:33:
-generic|integer overflow.*safety_checks.coil:16:.*in generic code
-null-next|null pointer dereference.*safety_checks.coil:107:
-null-volatile|null pointer dereference.*safety_checks.coil:108:
-bad-tag|invalid variant tag: 9, the type has 3 variants.*safety_checks.coil:110:
-bad-bool|invalid boolean value.*safety_checks.coil:114:
-ptr-index|pointer arithmetic overflow.*safety_checks.coil:115:
-memcpy-null|null pointer dereference.*safety_checks.coil:117:
-unreachable|entered unreachable code.*safety_checks.coil:118:
+index|index out of bounds: index 4, len 3.*safety_checks.coil:@:|(get xs (+ n 3))
+add|integer overflow.*safety_checks.coil:@:|(+ big n)
+sub|integer overflow.*safety_checks.coil:@:|(- (- 0 big) (+ n 1))
+mul|integer overflow.*safety_checks.coil:@:|(* big (+ n 2))
+neg|integer overflow.*safety_checks.coil:@:|(- (- (- 0 big) n))
+div|division by zero.*safety_checks.coil:@:|(/ 7 (- n 1))
+min-div|integer overflow.*safety_checks.coil:@:|(/ (- (- 0 big) 1) (- 0 n))
+shift|shift amount is greater than the type size.*safety_checks.coil:@:|(<< 1 (+ n 64))
+narrow|integer cast truncated bits.*safety_checks.coil:@:|(cast u8 (+ n 300))
+unsigned|cast negative value to unsigned integer.*safety_checks.coil:@:|(cast u64 (- 0 n))
+float|integer part of floating point value out of bounds.*safety_checks.coil:@:|(* (cast f64 big) 4.0)
+slice-get|index out of bounds: index 6, len 3.*safety_checks.coil:@:|(get xs (+ n 5))
+subslice|start index 3 is larger than end index 2.*safety_checks.coil:@:|(subslice xs 3 (+ n 1))
+generic|integer overflow.*safety_checks.coil:@:.*in generic code|(+ x y)
+null-next|null pointer dereference.*safety_checks.coil:@:|(.v (.next lp))
+null-volatile|null pointer dereference.*safety_checks.coil:@:|(primitive/volatile-load i64 none)
+bad-tag|invalid variant tag: 9, the type has 3 variants.*safety_checks.coil:@:|(match (load (cast (ptr Shape) (mut words)))
+bad-bool|invalid boolean value.*safety_checks.coil:@:|(if (load (cast (ptr bool) (mut flag))) 1 0)
+ptr-index|pointer arithmetic overflow.*safety_checks.coil:@:|(primitive/index bp (<< 1 60))
+memcpy-null|null pointer dereference.*safety_checks.coil:@:|(memcpy (cast (ptr i8) 0)
+unreachable|entered unreachable code.*safety_checks.coil:@:|(unreachable)
 stack|diagnosis: stack-overflow guard fault
-slice-set|index out of bounds: index 5, len 4.*safety_checks.coil:120:
-slice-init|index out of bounds: index 6, len 4.*safety_checks.coil:121:
-slice-at|index out of bounds: index 7, len 4.*safety_checks.coil:122:
-align|misaligned pointer: address [0-9]+ is not a multiple of 8.*safety_checks.coil:47:
-null-load|null pointer dereference.*safety_checks.coil:50:
-null-field|null pointer dereference.*safety_checks.coil:53:
-memcpy|memcpy source and destination overlap.*safety_checks.coil:59:
+slice-set|index out of bounds: index 5, len 4.*safety_checks.coil:@:|(set! (mut buf) (+ n 4) 1)
+slice-init|index out of bounds: index 6, len 4.*safety_checks.coil:@:|(init! (mut buf) (+ n 5) 1)
+slice-at|index out of bounds: index 7, len 4.*safety_checks.coil:@:|(at (mut buf) (+ n 6))
+align|misaligned pointer: address [0-9]+ is not a multiple of 8.*safety_checks.coil:@:|(load (cast (ptr i64) (+ base n)))
+null-load|null pointer dereference.*safety_checks.coil:@:|(load (cast (ptr i64) (- n 1)))
+null-field|null pointer dereference.*safety_checks.coil:@:|(.a (cast (ptr Pair) (- n 1)))
+memcpy|memcpy source and destination overlap.*safety_checks.coil:@:|(memcpy p (primitive/index p (+ n 3)) 8)
 CASES
   out=$("$T/safety" index 2>&1)
   case "$out" in *"stack trace:"*) ok "safety: a trap prints a stack trace" ;; *) bad "safety: a trap prints a stack trace" "$out" ;; esac

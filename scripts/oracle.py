@@ -25,6 +25,11 @@ diag: tests/diag/{compile,link,no-hang}/*.coil and their goldens in reference/.
 the combined output, then `exit: N`. An input whose first line is `; args: …` uses
 those arguments instead of the default (`-o {out}` for link).
 
+A golden names the source a diagnostic points at, never its line or column, so
+reformatting an input or editing above a case changes no golden. The numbers are
+still tested: each run checks that the reported line and column land on that text
+in the file (see locate_frames).
+
     python3 scripts/oracle.py diag gate|bless [compile|link|no-hang|all]
 """
 
@@ -256,6 +261,93 @@ def normalize(output: bytes, scratch: Path) -> bytes:
     return text.encode()
 
 
+# One located frame as coil.compiler.frontend.diag renders it.
+FRAME = re.compile(rb"^ *(-->|:::) (\S[^\n]*?):(\d+):(\d+)\n *\|\n *\d+ \| ?([^\n]*)\n *\| ( *)(\^+)$", re.M)
+BAD_LOCATION = b"BAD LOCATION: "
+SPAN_TEXT_WIDTH = 72
+
+
+def span_text(source: bytes, start: int, end: int) -> bytes:
+    """The span's text, the same however the form is laid out. The renderer stops a
+    span at the end of its line, so one left open there runs on to its closer.
+    Comments go, and whitespace outside strings closes up."""
+    out = bytearray()
+    depth = 0
+    i = start
+    open_at_line_end = source[end:end + 1] in (b"\n", b"")
+    while i < len(source) and (i < end or (open_at_line_end and depth > 0)):
+        c = source[i:i + 1]
+        if c == b'"':
+            close = i + 1
+            while close < len(source) and source[close:close + 1] != b'"':
+                close += 2 if source[close:close + 1] == b"\\" else 1
+            out += source[i:close + 1]
+            i = close + 1
+        elif c == b";":
+            newline = source.find(b"\n", i)
+            i = len(source) if newline < 0 else newline
+        elif c == b"\\" or source[i:i + 2] == b"#\\":
+            width = 2 if c == b"\\" else 3
+            out += source[i:i + width]
+            i += width
+        elif c.isspace():
+            if out and out[-1:] not in (b" ", b"(", b"["):
+                out += b" "
+            i += 1
+        else:
+            if c in (b")", b"]"):
+                depth -= 1
+                if out[-1:] == b" ":
+                    del out[-1]
+            elif c in (b"(", b"["):
+                depth += 1
+            out += c
+            i += 1
+    text = bytes(out).rstrip()
+    return text if len(text) <= SPAN_TEXT_WIDTH else text[:SPAN_TEXT_WIDTH] + b"..."
+
+
+def frame_file(name: bytes, scratch: Path) -> Path | None:
+    text = name.decode(errors="replace")
+    if text.startswith("{tmp}/"):
+        path = scratch / text[len("{tmp}/"):]
+    elif text.startswith("<stdlib>/"):
+        path = ROOT / "src" / "stdlib" / text[len("<stdlib>/"):]
+    else:
+        path = ROOT / text
+    return path if path.is_file() else None
+
+
+def locate_frames(output: bytes, scratch: Path) -> bytes:
+    """Replace each frame's line, column and quoted line by the text it points at,
+    after checking the line and column do point there. A frame that does not is
+    reported in the output, so the gate fails on it and bless refuses it. A frame
+    in no file (generated source) is left as it is: nothing can move it."""
+
+    def located(frame: re.Match[bytes]) -> bytes:
+        arrow, name, line, column, shown, pad, carets = frame.groups()
+        path = frame_file(name, scratch)
+        if path is None:
+            return frame.group(0)
+        source = path.read_bytes()
+        lines = source.split(b"\n")
+        line_number, column_number = int(line), int(column)
+        where = name + b":" + line + b":" + column
+        if not 1 <= line_number <= len(lines):
+            return BAD_LOCATION + where + b" is past the end of the file"
+        text = lines[line_number - 1]
+        windowed = shown != text
+        body = shown.removeprefix(b"...").removesuffix(b"...") if windowed else shown
+        start = column_number - 1
+        pointed = shown[len(pad):len(pad) + len(carets)]
+        if body not in text or text[start:start + len(pointed)] != pointed:
+            return BAD_LOCATION + where + b" holds " + text[start:start + len(pointed)] + b", not " + pointed
+        at = sum(len(previous) + 1 for previous in lines[:line_number - 1]) + start
+        return b"  " + arrow + b" " + name + b"\n  at: " + span_text(source, at, at + len(pointed))
+
+    return FRAME.sub(located, output)
+
+
 def diag_inputs(which: str) -> list[Path]:
     sets = DIAG_SETS if which == "all" else (which,)
     inputs = []
@@ -285,7 +377,7 @@ def diag_output(compiler: str, source: Path, scratch: Path) -> bytes:
                                 stderr=subprocess.STDOUT, timeout=timeout)
     except subprocess.TimeoutExpired:
         return f"TIMEOUT: did not finish in {timeout}s\n".encode()
-    return normalize(result.stdout, scratch) + f"exit: {result.returncode}\n".encode()
+    return locate_frames(normalize(result.stdout, scratch), scratch) + f"exit: {result.returncode}\n".encode()
 
 
 def diag(compiler: str, action: str, which: str, only: list[str] | None) -> int:
@@ -299,6 +391,10 @@ def diag(compiler: str, action: str, which: str, only: list[str] | None) -> int:
             got = diag_output(compiler, source, scratch)
             golden = source.parent / "reference" / f"{source.stem}.diag"
             if action == "bless":
+                if BAD_LOCATION in got:
+                    failures += 1
+                    print(f"FAIL {source.relative_to(ROOT)}: not blessed\n{got.decode(errors='replace')}")
+                    continue
                 golden.parent.mkdir(exist_ok=True)
                 golden.write_bytes(got)
                 print(f"blessed {golden.relative_to(ROOT)}")

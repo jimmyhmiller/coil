@@ -122,6 +122,13 @@ python3 scripts/oracle.py diag gate all --compiler <coil>
 python3 scripts/oracle.py diag bless compile --compiler <coil>   # then read every changed golden
 ```
 
+A golden records each diagnostic's message and the source text it points at
+(`at: …`), not a line or column, so reformatting an input or editing above a case
+changes no golden. A span that runs past its line is read on to its closer, with
+comments dropped and whitespace closed up. The numbers are still tested: on every
+run the harness checks that the reported line and column land on that text in the
+file, and otherwise prints `BAD LOCATION`, which fails the gate and refuses a bless.
+
 ## COMPREHENSIVE
 
 Without `--compiler` it runs `dev.py build full --no-install`, installs that
