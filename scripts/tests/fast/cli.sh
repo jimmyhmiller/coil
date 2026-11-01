@@ -691,6 +691,13 @@ section_fmt() {
   [ $? = 1 ] && ok "fmt --check - reports unformatted standard input" || bad "fmt --check - on stdin" "wrong exit status"
   printf '(defn c [] (-> i64) 1)\n' | "$COIL" fmt --write - >/dev/null 2>&1
   [ $? = 2 ] && ok "fmt --write - is a usage error" || bad "fmt --write - is a usage error" "wrong exit status"
+  # `coil fmt` runs coil-fmt beside the compiler; run alone it does the same.
+  expect_rc 1 "coil-fmt, run on its own, reports an unformatted file" "$(dirname "$COIL")/coil-fmt" --check "$T/messy1.coil"
+  mkdir -p "$T/lone-tool"
+  cp "$COIL" "$T/lone-tool/coil"
+  out=$(cd "$T/lone-tool" && PATH=/usr/bin:/bin ./coil fmt messy.coil 2>&1)
+  case "$out" in *"no coil-fmt beside"*) ok "a compiler with no coil-fmt says where it looked" ;;
+    *) bad "a compiler with no coil-fmt says where it looked" "$out" ;; esac
 
   # Ruby's Open3 hands a child O_NONBLOCK pipe ends. A parent slow to feed the
   # input and slow to drain the output must still get all of it: EAGAIN is not

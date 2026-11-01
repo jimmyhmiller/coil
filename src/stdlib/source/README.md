@@ -12,11 +12,11 @@ coil fmt --write <file.coil>    # reformat the file in place
 coil fmt --width 90 <file.coil> # preview a different target width
 ```
 
-`fmt` is a built-in subcommand of the `coil` compiler (the formatter lives in
-`src/stdlib/source/format.coil` and is compiled into the binary; `src/compiler/driver.coil` wires it
-up). The standalone `coil run src/compiler/formatter/fmt.coil -- <file>` still works and is equivalent.
+`coil fmt` runs `coil-fmt`, a program of its own beside the compiler (`src/tools/fmt.coil`),
+the way `git NAME` runs `git-NAME`. The formatter itself is this library, `coil.source.format`,
+which imports only the standard library; `coil lint --fix` calls it in-process.
 
-Target width defaults to 80 columns (`fmt-default-width` in `rules.coil`, the one
+Target width defaults to 80 columns (`fmt-default-width` in `format.coil`, the one
 place that number lives) and can be selected per invocation with `--width N`.
 `let`/`loop` binding vectors with two or more pairs always break to one pair per
 line (aligned in a column), even when they would fit flat; a single-binding
@@ -79,10 +79,10 @@ line after a comment.
 |-------------|------|
 | `cst.coil`  | reader → a Concrete Syntax Tree that preserves comments, blank lines (`nl-before`), and verbatim token text |
 | `doc.coil`  | a Wadler/Prettier **Doc** algebra + width-driven renderer (`DNest` relative indent, `DAlign` anchor-to-column, `DGroup` flat-if-fits) |
-| `rules.coil`| lowers the CST to a Doc, applying the layout conventions above |
-| `fmt.coil`  | the CLI |
+| `format.coil`| lowers the CST to a Doc, applying the layout conventions above |
+| `diagnostic.coil` | writes a located error, for the compiler and the tools alike |
+| `cli.coil` | what the tools' command lines share |
 | `balance.coil` | `coil balance` — delimiter repair, plus the shared token scanner |
-| `balance_cli.coil`, `edit_cli.coil` | standalone builds of each (seconds to compile, for iterating without rebuilding the compiler) |
 
 # coil balance — repairing source that will not read
 

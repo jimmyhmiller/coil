@@ -196,6 +196,11 @@ Use this format:
   rule for a name you remove. Changing a library module's `:reexport` import
   means rerunning `python3 scripts/compiler/gen-stdlib-manifest.py`, which
   regenerates the table's `API-REEXPORTS` from the library's imports.
+- `src/tools/*.coil` — commands that are programs of their own. `coil NAME` runs the
+  `coil-NAME` beside the running compiler, then on `PATH`, the way `git NAME` does; dev.py
+  builds them beside every compiler it builds. They import only the standard library, so
+  the code they share lives there: `coil.source.*` (the formatter and delimiter repair),
+  `coil.project` (Coil.toml and a project's files) and `coil.path`.
 - `src/examples/*.coil` — one idea each (`sums`, `hashmap`, `references`, `lisp`, …).
 - Dialects (Scheme, Brainfuck), applications (clox, CHIP-8, Space Invaders, Wasm),
   and research transforms (GC dialects, httptap) live in the separate

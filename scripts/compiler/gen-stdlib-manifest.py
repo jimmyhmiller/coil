@@ -66,6 +66,8 @@ INTERNAL_NAMESPACES = {
     # Shared by the compiler and the source tools; their APIs are not settled.
     "coil.path",
     "coil.project",
+    "coil.source.cli",
+    "coil.source.diagnostic",
     "coil.http.parser.generated",
     "coil.meta-runtime",
     # coil.prop's engine room. Importable, but `coil.prop` re-exports everything a

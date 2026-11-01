@@ -82,15 +82,16 @@ def main() -> None:
         if args.signing_identity:
             if os.uname().sysname != "Darwin":
                 raise SystemExit("Developer ID signing is only supported on macOS")
-            subprocess.run(["codesign", "--force", "--options", "runtime", "--timestamp",
-                            "--sign", args.signing_identity, str(destination)], check=True)
-            subprocess.run(["codesign", "--verify", "--strict", "--verbose=2",
-                            str(destination)], check=True)
+            for binary in sorted((tree / "bin").glob("coil*")):
+                subprocess.run(["codesign", "--force", "--options", "runtime", "--timestamp",
+                                "--sign", args.signing_identity, str(binary)], check=True)
+                subprocess.run(["codesign", "--verify", "--strict", "--verbose=2",
+                                str(binary)], check=True)
         if args.notary_profile:
             if not args.signing_identity:
                 raise SystemExit("--notary-profile requires --signing-identity")
             submission = Path(temporary) / "notarization.zip"
-            subprocess.run(["ditto", "-c", "-k", "--keepParent", str(destination),
+            subprocess.run(["ditto", "-c", "-k", "--keepParent", str(tree / "bin"),
                             str(submission)], check=True)
             subprocess.run(["xcrun", "notarytool", "submit", str(submission), "--wait",
                             "--keychain-profile", args.notary_profile], check=True)

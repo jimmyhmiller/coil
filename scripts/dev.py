@@ -26,6 +26,26 @@ def execute(*command: str, env: dict[str, str] | None = None, cwd: Path = ROOT) 
     subprocess.run(command, cwd=cwd, env=env, check=True)
 
 
+TOOLS = ("fmt", "balance")
+
+
+def build_tools(compiler: Path) -> None:
+    """Build the coil-NAME tools beside COMPILER, with it.
+
+    `coil NAME` runs the binary beside the running compiler, so a toolchain's tools
+    are always that toolchain's. They import only the standard library, and take
+    well under a second each.
+    """
+    compiler = compiler.resolve()
+    for tool in TOOLS:
+        output = compiler.parent / f"coil-{tool}"
+        result = toolchain_build(compiler, "build", str(ROOT / "src" / "tools" / f"{tool}.coil"),
+                                 "-o", str(output))
+        if result.returncode != 0:
+            raise SystemExit(f"building coil-{tool} failed:\n{result.stdout}{result.stderr}")
+        print(f"built {output}")
+
+
 def build(args: argparse.Namespace) -> None:
     if args.variant == "candidate":
         compiler = shutil.which("coil")
@@ -48,6 +68,7 @@ def build(args: argparse.Namespace) -> None:
         toolchain_stamp.stamp_path(output).write_text(stamp)
         print(f"built compiler candidate -> {output}")
         build_library_state(output)
+        build_tools(output)
         return
 
     host = (sys.platform, platform.machine().lower())
@@ -79,6 +100,8 @@ def build(args: argparse.Namespace) -> None:
         env = os.environ.copy()
         env["COIL_SKIP_INSTALL"] = "1"
     execute(*command, env=env)
+    if variant in ("full", "linux"):
+        build_tools(Path(args.output) if args.output else ROOT / "build" / "bin" / "coil")
 
 
 def verify_toolchain_pair(binary: Path) -> str:
@@ -248,6 +271,7 @@ def install(args: argparse.Namespace) -> None:
         # The stamp beside it was verified above: the library just installed is
         # the one this binary was built from.
         print(f"already installed: {destination}")
+        build_tools(destination)
         report_installed(destination)
         return
 
@@ -274,6 +298,7 @@ def install(args: argparse.Namespace) -> None:
     toolchain_stamp.stamp_path(destination).write_text(stamp)
     print(f"installed {source} -> {destination}")
     build_library_state(destination)
+    build_tools(destination)
     if not args.no_warm_unit:
         warm_jit_unit(destination, libdir)
         warm_lint_profile(destination, libdir)
