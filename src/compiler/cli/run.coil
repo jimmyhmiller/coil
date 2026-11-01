@@ -1,0 +1,1325 @@
+;;; `coil run`.
+(module coil.compiler.cli_run)
+(import "coil.primitive" :as primitive)
+(import "coil.temp" :as temp)
+(import "coil.compiler.unit_state" :use *)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :as str :use * :exclude [parse-int])
+(import "coil.arraylist" :use *)
+(import "coil.avec" :use [AVec avec-at avec-edit avec-new avec-to-list])
+(import "coil.hashmap" :use *)
+(import "coil.pmap" :use *)
+(import "coil.io" :use *)
+(import "coil.os" :as os)
+(import "coil.control" :use *)
+(import "coil.try" :use *)
+(import "coil.compiler.env" :use *)
+(import "coil.compiler.ffi" :use *)
+(import "coil.compiler.guide" :use *)
+(import "coil.reader" :use *)
+(import "coil.project" :use *)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.astdump" :use *)
+(import "coil.compiler.parser" :use *)
+(import "coil.compiler.loader" :use *)
+(import "coil.compiler.stdlib_manifest" :use *)
+(import "coil.compiler.resolve" :use *)
+(import "coil.compiler.check" :use *)
+(import "coil.compiler.mono" :use *)
+(import "coil.compiler.phase_split" :use *)
+(import "coil.compiler.diag" :use *)
+(import "coil.compiler.comptime" :use *)
+(import "coil.compiler.closure" :use *)
+(import "coil.compiler.metaengine" :use *)
+(import "coil.compiler.expander" :use *)
+(import "coil.phase" :as phase)
+(import "coil.compiler.unit" :use *)
+(import "coil.compiler.native_module" :use *)
+(import "coil.compiler.jit" :use *)
+(import "coil.compiler.interp" :use *)
+(import "coil.compiler.wasm" :use *)
+(import "coil.compiler.codegen_wasm" :use *)
+(import "coil.compiler.cli_base" :use *)
+(import "coil.compiler.cli_project" :use *)
+(import "coil.compiler.pipeline" :use *)
+
+(defn argv-option-value [(argc i32) (argv (ptr (ptr i8))) (want (slice u8))]
+  (-> (slice u8))
+  (let [option-count (argv-option-count argc argv)
+        (mut i) 2
+        (mut value) ""]
+    (loop (if (>= (primitive/iadd (load i) 1) (primitive/cast i64 option-count))
+              (break)
+              (do
+                (when (= (from-cstr (load (index argv (load i))))
+                         want)
+                  (set! value
+                        (from-cstr (load (index argv
+                                                (primitive/iadd (load i) 1))))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (load value)))
+
+;;; `coil run FILE …`: a Code-signed `main`, or metaprogram registrations with no
+;;; main at all, is a code->code program, run in-process; anything else is built
+;;; and run. The target may be a module NAME (coil run some.reader.module …).
+(defn run-file-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))]
+  (-> i64)
+  (run-resolve-target! a argc argv)
+  (if (> (code-run-scan a argc argv) 0)
+      (run-code-main-cmd a argc argv)
+      (run-cmd a argc argv)))
+
+; The CLI entry, parameterized by the backend hooks the top file injects:
+;   build-fn     — LLVM `build` (mode 1); a64 build passes a hard-error stub
+;   emitir-fn    — `emit-ir` / `dump-ir` (mode 0); a64 build passes a hard-error stub
+;   normalize-fn — `__normalize` debug subcommand; a64 build passes a hard-error stub
+;   default-backend — 1 (LLVM) for the full build, 2 (arm64) for the LLVM-free build
+; The top file's `main` just forwards argc/argv here with its fn-ptrs.
+
+; `run <file> [--link-flag X]... [--backend arm64] [-- prog args...]` : build the
+; file to a temp executable, exec it with the forwarded args, propagate its exit
+; code. `coil run` is build then exec.
+; ── `coil run` on a code->code program (docs/design/RUN_METAPROGRAMS.md) ─────
+; A program whose `main` has a Code signature is a code->code program: `run`
+; feeds it the named input files (or stdin) read as Code and prints the Code
+; it returns. Decided SYNTACTICALLY from the raw entry file, so a normal `run`
+; pays one cheap read and is otherwise untouched; the two cases are disjoint
+; because a Code-signed main can never be linked (drop-code-funcs removes it).
+(defn code-main-form? [(f (ptr Sexp))] (-> bool)
+  (and (source-code-sig? f)
+       (let [it (sx-items (load f))]
+         (and (= (sx-tag (sx-at it 1)) 2)
+              (= (sx-sval (sx-at it 1)) "main")))))
+
+(defn code-main-box [] (-> (ptr CodeMainBox))
+  (field (driver-unit-state) code_main))
+
+; Raw-contract inputs must be registered BEFORE expansion runs: the code-file
+; op answers from the source list as exposed to metaprograms, and a dialect
+; that keys on the input's file name (the Scheme transform's `.scm` marker)
+; needs the input present in it. Reads and registers each named input once;
+; the invoke-time readers then reuse the stored text + source id.
+(defn code-preregister-inputs! [(a (dyn Allocator)) (s (mut LS))] (-> i64)
+  (let [b (code-main-box)
+        n (len (.inputs b))
+        (mut sids) (ArrayList::new [i64] a)
+        (mut texts) (ArrayList::new [(slice u8)] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [ipath (get (.inputs b) (load i))
+                      text (read-src a (to-cstr a ipath))
+                      sid (.srccount s)]
+                  (set! (.srccount s) (primitive/iadd sid 1))
+                  (register-source! (mut s) ipath text)
+                  (push! (mut sids) sid)
+                  (push! (mut texts) text))
+                (set! i (primitive/iadd (load i) 1)))))
+    (set! (.insids b) (load sids))
+    (set! (.intexts b) (load texts))
+    0))
+
+; Any `(defn main …)`, Code-signed or not.
+(defn any-main-form? [(f (ptr Sexp))] (-> bool)
+  (and (= (sx-tag (load f)) 6)
+       (let [it (sx-items (load f))]
+         (and (> (sx-len it) 2)
+              (and (= (sx-tag (sx-at it 0)) 2)
+                   (and (or (= (sx-sval (sx-at it 0)) "defn")
+                            (= (sx-sval (sx-at it 0)) "defn*"))
+                        (and (= (sx-tag (sx-at it 1)) 2)
+                             (= (sx-sval (sx-at it 1)) "main"))))))))
+
+; Decide how (and whether) `coil run FILE` is a metaprogram run, filling the
+; box: 1 = Code-signed main (np = its arity), 2 = registrations-as-entry,
+; 0 = neither (normal run). One cheap syntactic read of the entry file.
+(defn code-run-scan [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))]
+  (-> i64)
+  (if (< (primitive/cast i64 argc) 3)
+      0
+      (match (read-file-opt a (load (index argv 2)))
+        (None [] 0)
+        (Some [src]
+              (try (let [forms
+                           (try-or! (read-all a src -1)
+                                    0)]
+                     (let [b (code-main-box)
+                           n (len (load forms))
+                           (mut i) 0
+                           (mut codemain) false
+                           (mut anymain) false
+                           (mut np) -1
+                           (mut nrd) 0
+                           (mut regs) (ArrayList::new [(slice u8)] a)
+                           (mut kinds) (ArrayList::new [i64] a)]
+                       (loop (if (>= (load i) n)
+                                 (break)
+                                 (do
+                                   (let [fp (elem forms (load i))]
+                                     (when (any-main-form? fp)
+                                       (store! anymain true)
+                                       0)
+                                     (when (code-main-form? fp)
+                                       (store! codemain true)
+                                       (store! np
+                                               (let [it (sx-items (load fp))]
+                                                 (sx-len (sx-items (sx-at it
+                                                                          (defn-params-index it))))))
+                                       0)
+                                     ; every transform/checker registration, read
+                                     ; as text before the program is loaded; one
+                                     ; whose :phase names the reader is the --use
+                                     ; reader mechanism, and run-code-regs-invoke
+                                     ; leaves it out once its phase resolves
+                                     (when (or (is-transform-form fp)
+                                               (is-checker-form fp))
+                                       (push! (mut regs)
+                                              (sx-sval (sx-at (sx-items (load fp))
+                                                              1)))
+                                       (push! (mut kinds)
+                                              (if (is-checker-form fp) 1 0))
+                                       0)
+                                     ; one entry file, one reader: two would
+                                     ; silently run the last, where the --use
+                                     ; flow reports the same ambiguity
+                                     (when (and (= (sx-tag (load fp))
+                                                   6)
+                                                (let [it (sx-items (load fp))]
+                                                  (and (= (sx-len it)
+                                                          3)
+                                                       (and (= (sx-tag (sx-at it
+                                                                              0))
+                                                               2)
+                                                            (= (sx-sval (sx-at it
+                                                                               0))
+                                                               "reader-provider")))))
+                                       (store! nrd
+                                               (primitive/iadd (load nrd) 1))
+                                       0))
+                                   (store! i (primitive/iadd (load i) 1)))))
+                       ; a (reader-provider "MOD" FN) declaration is an entry
+                       ; registration too: the reader runs over the inputs'
+                       ; raw bytes ahead of any transform/checker chain.
+                       (let [rdp (provider-in-forms forms)
+                             hasreader
+                               (match rdp (Some [_] true) (None [] false))]
+                         (when (and hasreader
+                                    (> (load nrd) 1))
+                           (ps (stderr)
+                               "error: reader-provider: this file declares more than one reader provider\n")
+                           (exit 1)
+                           0)
+                         (if (load codemain)
+                             (do
+                               (store! (field b np) (load np))
+                               (store! (field b regmode) 1)
+                               1)
+                             (if (or (load anymain)
+                                     (and (= (len (load regs))
+                                             0)
+                                          (not hasreader)))
+                                 0
+                                 (do
+                                   (store! (field b np) 1)
+                                   (store! (field b regs) (load regs))
+                                   (store! (field b regkind) (load kinds))
+                                   (match rdp
+                                     (Some [p]
+                                           (let [(mut pp) p]
+                                             (store! (field b rdmod)
+                                                     (.module pp))
+                                             (store! (field b rdfn)
+                                                     (.function pp))
+                                             0))
+                                     (None [] 0))
+                                   (store! (field b regmode) 2)
+                                   2)))))))))))
+
+; The module name a raw input record gets: basename, extension stripped,
+; non-identifier characters folded to '_'.
+(defn code-mod-name [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
+  (let [n (len path)
+        (mut slash) -1
+        (mut dot) -1
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (when (= (primitive/cast i64 (get path (load i)))
+                         47)
+                  (set! slash (load i))
+                  0)
+                (when (= (primitive/cast i64 (get path (load i)))
+                         46)
+                  (set! dot (load i))
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (let [lo (primitive/iadd (load slash) 1)
+          hi (if (> (load dot) (load slash)) (load dot) n)
+          base (subslice path lo hi)
+          bn (len base)
+          (mut out) (ArrayList::new [u8] a)
+          (mut k) 0]
+      (loop (if (>= (load k) bn)
+                (break)
+                (do
+                  (let [c (primitive/cast i64 (get base (load k)))]
+                    (push! (mut out)
+                           (if (or (and (>= c 97) (<= c 122))
+                                   (and (>= c 65) (<= c 90))
+                                   (and (>= c 48) (<= c 57)))
+                               (primitive/cast u8 c)
+                               (: 95 u8))))
+                  (set! k (primitive/iadd (load k) 1)))))
+      (if (= bn 0) "stdinprog" (slice (mut out))))))
+
+; Fold one file's forms into the module-record shape ((NAME FORM…)): the
+; record name is the forms' own (module …) declaration when present — folded
+; away exactly as the loader folds it — else a name derived from the path.
+(defn code-forms-record [(a (dyn Allocator))
+                         (fl (ptr (ArrayList Sexp)))
+                         (ipath (slice u8))] (-> Sexp)
+  (let [(mut items) (ArrayList::new [Sexp] a)
+        nf (len (load fl))
+        declared (declared-module fl)
+        (mut j) 0]
+    (push! (mut items)
+           (sx-sym (match declared
+                     (Some [nm] nm)
+                     (None [] (code-mod-name a ipath)))))
+    (loop (if (>= (load j) nf)
+              (break)
+              (do
+                (let [fp2 (elem fl (load j))
+                      ismod
+                        (and (= (sx-tag (load fp2)) 6)
+                             (and (> (sx-len (sx-items (load fp2)))
+                                     0)
+                                  (and (= (sx-tag (sx-at (sx-items (load fp2))
+                                                         0))
+                                          2)
+                                       (= (sx-sval (sx-at (sx-items (load fp2))
+                                                          0))
+                                          "module"))))]
+                  (unless ismod
+                    (push! (mut items) (load fp2))
+                    0))
+                (set! j (primitive/iadd (load j) 1)))))
+    (mk-sexp (KList (box-al [Sexp] a (load items))) -1 -1)))
+
+;;; A reader or transform run directly returns syntax, and its entry prints that as
+;;; ordinary Coil source. Fresh identifiers are distinct in memory by identity even
+;;; when they share a display spelling; printing only the spelling would merge them
+;;; when the text is read again. Give every fresh identity a deterministic,
+;;; collision-free source name first. Author syntax and explicit context operations
+;;; keep their spelling.
+(defn source-scan-names! [(names (ptr (HashMap (slice u8) i64))) (node Sexp)]
+  (-> i64)
+  (let [tag (sx-tag node)]
+    (when (= tag 2) (set! names (sx-sval node) 1) 0)
+    (when (or (= tag 6) (= tag 7))
+      (let [items (sx-items node)]
+        (for [i 0 (sx-len items)] (source-scan-names! names (sx-at items i))))
+      0)
+    0))
+
+;;; A key no two identities can share: both strings are length-prefixed.
+(defn source-rename-key [(a (dyn Allocator))
+                         (spelling (slice u8))
+                         (hyg i64)
+                         (module (slice u8))] (-> (slice u8))
+  (sconcat3 a
+            (sconcat3 a (i64->str a (len spelling)) ":" spelling)
+            (sconcat3 a (i64->str a (len module)) ":" module)
+            (sconcat a ":" (i64->str a hyg))))
+
+(defn source-rename-mint [(a (dyn Allocator))
+                          (names (ptr (HashMap (slice u8) i64)))
+                          (spelling (slice u8))] (-> (slice u8))
+  (let [(mut serial) 1
+        (mut result) ""]
+    (loop (let [candidate (sconcat3 a spelling "__" (i64->str a (load serial)))]
+            (if (contains? (load names) candidate)
+                (set! serial (+ (load serial) 1))
+                (do
+                  (set! result candidate)
+                  (set! names candidate 1)
+                  (break)))))
+    (load result)))
+
+(defn source-rename-fresh! [(a (dyn Allocator))
+                            (names (ptr (HashMap (slice u8) i64)))
+                            (renames (ptr (HashMap (slice u8) (slice u8))))
+                            (node (ptr Sexp))] (-> i64)
+  (let [tag (sx-tag (load node))]
+    (if (= tag 2)
+        (when (= (sx-horigin (load node)) 2)
+          (let [spelling (sx-sval (load node))
+                key
+                  (source-rename-key a
+                                     spelling
+                                     (sx-hyg (load node))
+                                     (sx-hmod (load node)))
+                name
+                  (match (get (load renames) key)
+                    (Some [existing] existing)
+                    (None []
+                          (let [fresh (source-rename-mint a names spelling)]
+                            (set! renames key fresh)
+                            fresh)))]
+            (set! (.kind node) (KSym name))
+            (set! (.hyg node) 0)
+            (set! (.hmod node) (no-hmod))
+            (set! (.horigin node) 5)
+            0))
+        (when (or (= tag 6) (= tag 7))
+          (let [items (sx-items (load node))]
+            (for [i 0 (sx-len items)]
+              (source-rename-fresh! a names renames (elem items i))))
+          0))
+    0))
+
+(defn source-preserve-fresh-hygiene! [(a (dyn Allocator)) (modules (ptr Sexp))]
+  (-> i64)
+  (let [names
+          (box! a
+                (HashMap (slice u8) i64)
+                (HashMap::new [(slice u8) i64] a (keyops)))
+        renames
+          (box! a
+                (HashMap (slice u8) (slice u8))
+                (HashMap::new [(slice u8) (slice u8)] a (keyops)))]
+    (source-scan-names! names (load modules))
+    (source-rename-fresh! a names renames modules)))
+
+; Read the raw inputs (stdin when none) into the module-record shape the
+; registration contract hands a transform/checker: ((name FORM…) …), each
+; input registered as a real source so spans point into it.
+(defn code-raw-records [(a (dyn Allocator)) (s (mut LS))] (-> Sexp)
+  (let [b (code-main-box)
+        (mut paths) (ArrayList::new [(slice u8)] a)
+        nn (len (.inputs b))
+        (mut i) 0
+        (mut records) (ArrayList::new [Sexp] a)]
+    (loop (if (>= (load i) nn)
+              (break)
+              (do
+                (push! (mut paths) (get (.inputs b) (load i)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (when (= (len (load paths)) 0)
+      (push! (mut paths) "/dev/stdin")
+      0)
+    (let [np (len (load paths))
+          npre (len (.insids b))
+          (mut k) 0]
+      (loop (if (>= (load k) np)
+                (break)
+                (do
+                  (let [ipath (get (load paths) (load k))
+                        pre (< (load k) npre)
+                        text
+                          (if pre
+                              (get (.intexts b) (load k))
+                              (read-src a (to-cstr a ipath)))
+                        sid
+                          (if pre
+                              (get (.insids b) (load k))
+                              (.srccount s))]
+                    (unless pre
+                      (set! (.srccount s) (primitive/iadd sid 1))
+                      (register-source! (mut s) ipath text)
+                      0)
+                    (match (read-all a text sid)
+                      (Err [d] (do (report-diag (stderr) (mut s) d) 0))
+                      (Ok [fl]
+                          (do
+                            (push! (mut records) (code-forms-record a fl ipath))
+                            0))))
+                  (set! k (primitive/iadd (load k) 1))))))
+    (mk-sexp (KList (box-al [Sexp] a (load records))) -1 -1)))
+
+; A reader-provider entry: each raw input's BYTES go through the registered
+; reader metaprogram — the same (read-context PATH SRC entry) contract the
+; --use flow hands a provider — and each result (a complete file, usually a
+; (do …) of its forms) folds into one module record. Inputs are never parsed
+; as Coil: the whole point of a reader is that they are foreign syntax.
+; None = a reader invocation failed (its diagnostic is already reported).
+(defn code-reader-records [(a (dyn Allocator))
+                           (s (mut LS))
+                           (cp (ptr Program))
+                           (qual (slice u8))] (-> (Option Sexp))
+  (let [w (stderr)
+        b (code-main-box)
+        (mut paths) (ArrayList::new [(slice u8)] a)
+        nn (len (.inputs b))
+        (mut i) 0
+        (mut ok) true
+        (mut records) (ArrayList::new [Sexp] a)]
+    (loop (if (>= (load i) nn)
+              (break)
+              (do
+                (push! (mut paths) (get (.inputs b) (load i)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (when (= (len (load paths)) 0)
+      (push! (mut paths) "/dev/stdin")
+      0)
+    (let [np (len (load paths))
+          npre (len (.insids b))
+          (mut k) 0]
+      (loop (if (or (not (load ok)) (>= (load k) np))
+                (break)
+                (do
+                  (let [ipath (get (load paths) (load k))
+                        pre (< (load k) npre)
+                        text
+                          (if pre
+                              (get (.intexts b) (load k))
+                              (read-src a (to-cstr a ipath)))]
+                    (unless pre
+                      (let [sid (.srccount s)]
+                        (set! (.srccount s) (primitive/iadd sid 1))
+                        (register-source! (mut s) ipath text)
+                        0)
+                      0)
+                    (let [(mut margs) (ArrayList::new [Sexp] a)]
+                      (push! (mut margs)
+                             (read-context-code a ipath text "entry"))
+                      (match (run-code-main a
+                                            (mut s)
+                                            cp
+                                            qual
+                                            (box-al [Sexp] a (load margs)))
+                        (Err [d]
+                             (do (report-diag w (mut s) d) (set! ok false) 0))
+                        (Ok [sx]
+                            (let [(mut outs) (ArrayList::new [Sexp] a)]
+                              (splice-do-into! (mut outs) (box-sexp a sx))
+                              (push! (mut records)
+                                     (code-forms-record a
+                                                        (box-al [Sexp]
+                                                                a
+                                                                (load outs))
+                                                        ipath))
+                              0)))))
+                  (set! k (primitive/iadd (load k) 1))))))
+    (if (load ok)
+        (Some (mk-sexp (KList (box-al [Sexp] a (load records))) -1 -1))
+        (None [Sexp]))))
+
+; Resolve a registration's surface name (possibly alias-qualified, `sd/x`) to
+; the unique Code-signed function in the checked program with that leaf name.
+(defn code-reg-lookup [(cp (ptr Program)) (name (slice u8))] (-> (slice u8))
+  (let [n (len name)
+        (mut cut) 0
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (when (= (primitive/cast i64 (get name (load i)))
+                         47)
+                  (set! cut (primitive/iadd (load i) 1))
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (let [leaf (subslice name (load cut) n)
+          fs (load (field cp funcs))
+          nf (len (load fs))
+          (mut found) ""
+          (mut dup) false
+          (mut k) 0]
+      (loop (if (>= (load k) nf)
+                (break)
+                (do
+                  (let [fp (elem fs (load k))]
+                    (when (and (= (entry--leaf (.name fp)) leaf)
+                               (and (type-is-code (field fp ret))
+                                    (all-params-code (load (field fp params)))))
+                      (if (> (len (load found)) 0)
+                          (set! dup true)
+                          (set! found (.name fp)))
+                      0))
+                  (set! k (primitive/iadd (load k) 1)))))
+      (if (load dup) "" (load found)))))
+
+; The registrations-as-entry runner: a registered reader-provider runs first,
+; turning each raw input's bytes into a module record; then apply the file's
+; registered stack to the records, in registration order — transforms chain
+; (each one's (do …)-wrapped module list feeds the next), checkers report.
+; The final program prints one module record per line when any transform (the
+; reader included) ran.
+;;; Whether the entry file registers function NAME as its reader, `:phase
+;;; (phase/Read)`: such a registration is the --use reader mechanism, not a link
+;;; of the registered stack.
+(defn code-reg-reader? [(a (dyn Allocator)) (s (mut LS)) (name (slice u8))]
+  (-> bool)
+  (let [impb (box! a (AVec ImpEntry) (.imports s))
+        expb (box! a (AVec ExpEntry) (.exports s))]
+    (block :found
+      (for [i 0 (len (.out s))]
+        (let [tf (elem (field s out) i)
+              f (field tf form)]
+          (when (and (or (is-transform-form f) (is-checker-form f))
+                     (= (sx-sval (sx-at (sx-items (load f)) 1)) name)
+                     (registration-in-phase? f
+                                             (.module tf)
+                                             impb
+                                             expb
+                                             a
+                                             (phase/Read)))
+            (break :found true))))
+      false)))
+
+(defn run-code-regs-invoke [(a (dyn Allocator)) (s (mut LS)) (cp (ptr Program))]
+  (-> i64)
+  (let [w (stderr)
+        b (code-main-box)
+        hasreader (> (len (.rdmod b)) 0)
+        nr (len (.regs b))
+        (mut modules)
+          (mk-sexp (KList (box-al [Sexp] a (ArrayList::new [Sexp] a))) -1 -1)
+        (mut i) 0
+        (mut hastx) hasreader
+        (mut failed) false]
+    (if hasreader
+        (let [rqual (code-reg-lookup cp (.rdfn b))]
+          (if (= (len rqual) 0)
+              (do
+                (report-diag w
+                             (mut s)
+                             (derr (sconcat3 a
+                                             "reader provider '"
+                                             (.rdfn b)
+                                             "' was not found as a unique Code-signed function")))
+                (set! failed true)
+                0)
+              (match (code-reader-records a (mut s) cp rqual)
+                (None [] (do (set! failed true) 0))
+                (Some [m] (do (set! modules m) 0)))))
+        (do (set! modules (code-raw-records a (mut s))) 0))
+    (loop (if (or (load failed) (>= (load i) nr))
+              (break)
+              (do
+                (let [name (get (.regs b) (load i))
+                      kind (get (.regkind b) (load i))
+                      qual (code-reg-lookup cp name)]
+                  (if (code-reg-reader? a (mut s) name)
+                      0
+                      (if (= (len qual) 0)
+                          (do
+                            (report-diag w
+                                         (mut s)
+                                         (derr (sconcat3 a
+                                                         "registered metaprogram '"
+                                                         name
+                                                         "' was not found as a unique Code-signed function")))
+                            (set! failed true)
+                            0)
+                          (let [(mut margs) (ArrayList::new [Sexp] a)]
+                            (push! (mut margs) (load modules))
+                            (match (run-code-main a
+                                                  (mut s)
+                                                  cp
+                                                  qual
+                                                  (box-al [Sexp] a (load margs)))
+                              (Err [d]
+                                   (do
+                                     (report-diag w (mut s) d)
+                                     (set! failed true)
+                                     0))
+                              (Ok [sx]
+                                  (do
+                                    (when (= kind 0)
+                                      (set! hastx true)
+                                      (let [(mut outs) (ArrayList::new [Sexp] a)]
+                                        (splice-do-into! (mut outs)
+                                                         (box-sexp a sx))
+                                        (set! modules
+                                              (mk-sexp (KList (box-al [Sexp]
+                                                                      a
+                                                                      (load outs)))
+                                                       -1
+                                                       -1)))
+                                      0)
+                                    0)))))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (if (load failed)
+        0
+        (if (> (diag-errs) 0)
+            0
+            (do
+              (when (load hastx)
+                ; Print the module list as FILES: a module record and a source
+                ; file are the same thing (the loader's own bijection — a file
+                ; is `(module NAME)` plus top-level forms; build-modules folds
+                ; files into records), so printing inverts loading and the
+                ; output is directly consumable. One blank line between
+                ; modules when there are several.
+                (source-preserve-fresh-hygiene! a modules)
+                (let [it (sx-items (load modules))
+                      no (sx-len it)
+                      (mut k) 0]
+                  (loop (if (>= (load k) no)
+                            (break)
+                            (do
+                              (when (> (load k) 0)
+                                (wb (stdout) 10)
+                                0)
+                              (let [m (sx-at it (load k))]
+                                (if (and (= (sx-tag m) 6)
+                                         (and (> (sx-len (sx-items m))
+                                                 0)
+                                              (= (sx-tag (sx-at (sx-items m) 0))
+                                                 2)))
+                                    (do
+                                      (ps (stdout) "(module ")
+                                      (ps (stdout)
+                                          (sx-sval (sx-at (sx-items m) 0)))
+                                      (ps (stdout) ")")
+                                      (wb (stdout) 10)
+                                      (let [mi (sx-items m)
+                                            nf (sx-len mi)
+                                            (mut j) 1]
+                                        (loop (if (>= (load j) nf)
+                                                  (break)
+                                                  (do
+                                                    (print-sexp-source a
+                                                                       (stdout)
+                                                                       (sx-at mi
+                                                                              (load j)))
+                                                    (wb (stdout) 10)
+                                                    (set! j
+                                                          (primitive/iadd (load j)
+                                                                          1))))))
+                                      0)
+                                    (do
+                                      (print-sexp-source a (stdout) m)
+                                      (wb (stdout) 10)
+                                      0)))
+                              (set! k (primitive/iadd (load k) 1))))))
+                0)
+              1)))))
+
+; Load each input file as an ADDITIONAL ROOT of the current pipeline, exactly
+; as load-test-roots! loads extra roots: registered as a real source, read,
+; its declared module recorded, its forms processed with imports resolved
+; against its own directory.
+(defn code-main-load-roots! [(a (dyn Allocator)) (s (mut LS))] (-> i64)
+  (let [b (code-main-box)
+        n (len (.inputs b))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [ipath (get (.inputs b) (load i))
+                      text (read-src a (to-cstr a ipath))
+                      ; the source id is the srccount COUNTER, exactly as
+                      ; load-test-roots! assigns it — not the sources-array
+                      ; length, which can be offset from it
+                      sid (.srccount s)]
+                  (set! (.srccount s) (primitive/iadd sid 1))
+                  (register-source! (mut s) ipath text)
+                  (match (read-all a text sid)
+                    (Err [d] (do (ls-set-err! (mut s) d) 0))
+                    (Ok [raw]
+                        (let [forms (prepend-uses a (mut s) raw)]
+                          (match (declared-module forms)
+                            (Some [name] (do (loaded-insert! (mut s) name) 0))
+                            (None [] 0))
+                          (process-forms (mut s)
+                                         forms
+                                         (dirname ipath)
+                                         (None [(slice u8)]))
+                          0))))
+                (set! i (primitive/iadd (load i) 1))))))
+  0)
+
+; Invoke through run-code-main (one ordinary expand-macro) and print the
+; promoted result via the (do …) splice convention. Shared by both input
+; contracts.
+(defn run-code-main-finish [(a (dyn Allocator))
+                            (s (mut LS))
+                            (cp (ptr Program))
+                            (qual (slice u8))
+                            (margs (ptr (ArrayList Sexp)))] (-> i64)
+  (let [w (stderr)]
+    (match (run-code-main a (mut s) cp qual margs)
+      (Err [d] (do (report-diag w (mut s) d) 0))
+      (Ok [sx]
+          ; a located `report` from the metaprogram fails the run after
+          ; printing, exactly as it fails a build; stdout stays clean.
+          (if (> (diag-errs) 0)
+              0
+              (let [(mut outs) (ArrayList::new [Sexp] a)]
+                (splice-do-into! (mut outs) (box-sexp a sx))
+                ; Printed source keeps only spellings: give each fresh identifier
+                ; a spelling no other name in the output has, as a registered
+                ; transform's printed output does.
+                (source-preserve-fresh-hygiene! a
+                                                (box-sexp a
+                                                          (mk-sexp (KList (box-al [Sexp]
+                                                                                  a
+                                                                                  (load outs)))
+                                                                   -1
+                                                                   -1)))
+                (let [no (len (load outs))
+                      (mut k) 0]
+                  (loop (if (>= (load k) no)
+                            (break)
+                            (do
+                              (print-sexp-source a
+                                                 (stdout)
+                                                 (get (load outs) (load k)))
+                              (wb (stdout) 10)
+                              (set! k (primitive/iadd (load k) 1))))))
+                1))))))
+
+; Validate the checked signature, build the argument(s) — the loaded code
+; base as `((module-name FORM…) …)` for a one-param main given files, or raw
+; fragment lists read from files/stdin otherwise — then invoke and print.
+(defn run-code-main-invoke [(a (dyn Allocator))
+                            (s (mut LS))
+                            (cp (ptr Program))
+                            (qual (slice u8))] (-> i64)
+  (let [w (stderr)
+        f (prog-fn-find cp qual)]
+    (if (= (primitive/cast i64 f) 0)
+        (do
+          (report-diag w
+                       (mut s)
+                       (derr (sconcat3 a
+                                       "code->code run: '"
+                                       qual
+                                       "' was not found in the checked program (compiler bug)")))
+          0)
+        (if (not (and (type-is-code (field f ret))
+                      (all-params-code (load (field f params)))))
+            (do
+              (report-diag w
+                           (mut s)
+                           (derr (sconcat3 a
+                                           "code->code main '"
+                                           qual
+                                           "' must take only Code parameters and return Code")))
+              0)
+            (if (.macro_variadic f)
+                (do
+                  (report-diag w
+                               (mut s)
+                               (derr (sconcat3 a
+                                               "code->code main '"
+                                               qual
+                                               "' is variadic; not supported yet")))
+                  0)
+                (let [np (len (load (load (field f params))))
+                      b (code-main-box)]
+                  (if (= (.loaded b) 1)
+                      ; ── the code-base contract ──────────────────────────
+                      ; the input files were loaded as roots of THIS pipeline;
+                      ; hand main the settled program in the exact shape a
+                      ; registered checker/transform receives.
+                      (if (!= np 1)
+                          (do
+                            (report-diag w
+                                         (mut s)
+                                         (derr (sconcat3 a
+                                                         "code->code main '"
+                                                         qual
+                                                         "' must take exactly one Code parameter to receive a loaded code base")))
+                            0)
+                          (let [forms (box-al [TaggedForm] a (.out s))
+                                (mut margs) (ArrayList::new [Sexp] a)]
+                            ; `false`: a code->code main RETURNS a program, so it is
+                            ; transform-shaped, not checker-shaped. Handing it the
+                            ; import/export declarations would have it emit them a
+                            ; second time. This is also what it received before the
+                            ; declarations were retained at all.
+                            (push! (mut margs)
+                                   (build-modules a
+                                                  forms
+                                                  (box! a
+                                                        (AVec ImpEntry)
+                                                        (.imports s))
+                                                  (box! a
+                                                        (AVec ExpEntry)
+                                                        (.exports s))
+                                                  false))
+                            (run-code-main-finish a
+                                                  (mut s)
+                                                  cp
+                                                  qual
+                                                  (box-al [Sexp] a (load margs)))))
+                      ; ── the fragment contract ───────────────────────────
+                      (let [(mut inputs) (ArrayList::new [(slice u8)] a)]
+                        (let [nn (len (.inputs b))
+                              (mut i) 0]
+                          (loop (if (>= (load i) nn)
+                                    (break)
+                                    (do
+                                      (push! (mut inputs)
+                                             (get (.inputs b) (load i)))
+                                      (set! i (primitive/iadd (load i) 1))))))
+                        (if (!= np (len (load inputs)))
+                            (do
+                              (report-diag w
+                                           (mut s)
+                                           (derr (sconcat a
+                                                          (sconcat a
+                                                                   (sconcat3 a
+                                                                             "code->code main '"
+                                                                             qual
+                                                                             "' expects ")
+                                                                   (i64->str a
+                                                                             np))
+                                                          (sconcat a
+                                                                   (sconcat3 a
+                                                                             " Code input"
+                                                                             (if (= np
+                                                                                    1)
+                                                                                 ""
+                                                                                 "s")
+                                                                             ", got ")
+                                                                   (i64->str a
+                                                                             (len (load inputs)))))))
+                              0)
+                            (let [(mut margs) (ArrayList::new [Sexp] a)
+                                  (mut i) 0
+                                  (mut bad) false]
+                              (loop (if (or (load bad) (>= (load i) np))
+                                        (break)
+                                        (do
+                                          (let [ipath
+                                                  (get (load inputs) (load i))
+                                                pre
+                                                  (< (load i) (len (.insids b)))
+                                                text
+                                                  (if pre
+                                                      (get (.intexts b)
+                                                           (load i))
+                                                      (read-src a
+                                                                (to-cstr a
+                                                                         ipath)))
+                                                sid
+                                                  (if pre
+                                                      (get (.insids b) (load i))
+                                                      (.srccount s))]
+                                            (unless pre
+                                              (set! (.srccount s)
+                                                    (primitive/iadd sid 1))
+                                              (register-source! (mut s)
+                                                                ipath
+                                                                text)
+                                              0)
+                                            (match (read-all a text sid)
+                                              (Err [d]
+                                                   (do
+                                                     (report-diag w (mut s) d)
+                                                     (set! bad true)
+                                                     0))
+                                              (Ok [fl]
+                                                  (do
+                                                    (push! (mut margs)
+                                                           (mk-sexp (KList fl)
+                                                                    -1
+                                                                    -1))
+                                                    0))))
+                                          (set! i (primitive/iadd (load i) 1)))))
+                              (if (load bad)
+                                  0
+                                  (run-code-main-finish a
+                                                        (mut s)
+                                                        cp
+                                                        qual
+                                                        (box-al [Sexp]
+                                                                a
+                                                                (load margs))))))))))))))
+
+; The entry's `main` in the checked program. A Code-signed main is always
+; module-qualified (see the resolve.coil rule this feature added), so: the
+; declared-module spelling first, then the unique Code-signed function whose
+; LEAF name is `main` (covers the synthesized module a module-less entry file
+; gets). Never bare `main` — that can only be a NORMAL main (e.g. the
+; target's, when the loaded code base has its own entry point), and a normal
+; main is not ours to run. Empty slice = not found/ambiguous.
+(defn code-main-lookup [(a (dyn Allocator))
+                        (cp (ptr Program))
+                        (forms (ptr (ArrayList Sexp)))] (-> (slice u8))
+  (let [q (qualify-name a "main" (declared-module forms))]
+    (if (and (!= q "main")
+             (!= (primitive/cast i64 (prog-fn-find cp q))
+                 0))
+        q
+        (let [fs (load (field cp funcs))
+              n (len (load fs))
+              (mut found) ""
+              (mut dup) false
+              (mut i) 0]
+          (loop (if (>= (load i) n)
+                    (break)
+                    (do
+                      (let [fp (elem fs (load i))]
+                        (when (and (= (entry--leaf (.name fp))
+                                      "main")
+                                   (and (type-is-code (field fp ret))
+                                        (all-params-code (load (field fp params)))))
+                          (if (> (len (load found)) 0)
+                              (set! dup true)
+                              (set! found (.name fp)))
+                          0))
+                      (set! i (primitive/iadd (load i) 1)))))
+          (if (load dup) "" (load found))))))
+
+; The frontend prefix of run-pipeline — through run-registered-checkers, no
+; mono, no codegen — then one invocation. The metaprogram's own file compiles
+; exactly as a build would compile it (reader providers, casefold, dialects).
+(defn run-code-main-pipeline [(a (dyn Allocator))
+                              (src (slice u8))
+                              (cwd (slice u8))
+                              (path (slice u8))] (-> i64)
+  (let [w (stderr)
+        s (primitive/alloc-stack LS)]
+    (ls-init! (mut s) a)
+    (set! (.srccount s) 1)
+    (register-source! (mut s) path src)
+    ; raw-contract inputs join the source registry up front, so code-file
+    ; answers for them during the metaprogram's own compile (loaded-mode
+    ; roots register themselves in code-main-load-roots! instead)
+    (when (= (.loaded (code-main-box)) 0)
+      (code-preregister-inputs! a (mut s))
+      0)
+    (match (initial-read a (mut s) src path cwd)
+      (InitialReadError [d] (do (report-diag w (mut s) d) 0))
+      (InitialForms [forms reader-state definition-module]
+                    (do
+                      (loader-casefold-source! src forms)
+                      (let [normalized (own-form-list a forms)]
+                        (namespace-index-build! (mut s))
+                        ; a reader-provider entry: the provider's module joins the
+                        ; compile exactly as `--use MODULE` would import it, so the
+                        ; reader function is present in the checked program. (This runs
+                        ; after initial-read, so the entry file itself is never read
+                        ; through the provider it declares.)
+                        (when (> (len (.rdmod (code-main-box)))
+                                 0)
+                          (cli-use-add (.rdmod (code-main-box)))
+                          0)
+                        (load-program (mut s)
+                                      (prepend-uses a (mut s) normalized)
+                                      (dirname path))
+                        (install-reader-hygiene-context! (mut s)
+                                                         reader-state
+                                                         definition-module)
+                        ; code-base contract: the input files join THIS pipeline as
+                        ; additional load roots, so one expand and one check cover the
+                        ; metaprogram and its target together.
+                        (when (= (.loaded (code-main-box))
+                                 1)
+                          (code-main-load-roots! a (mut s))
+                          0)
+                        (if (ls-err? (mut s))
+                            (do (report-diag w (mut s) (.loaderr s)) 0)
+                            (match (expand-stage3-except (mut s)
+                                                         (box-al [(slice u8)]
+                                                                 a
+                                                                 (avec-to-list (field s
+                                                                                      stage_excluded)
+                                                                               a)))
+                              (Err [d] (do (report-diag w (mut s) d) 0))
+                              (Ok [_]
+                                  (match (run-transforms-and-check a (mut s))
+                                    (Err [d]
+                                         (do (report-check-diags w (mut s) d) 0))
+                                    (Ok [cp]
+                                        (match (run-registered-checkers a
+                                                                        (mut s)
+                                                                        cp)
+                                          (Err [d]
+                                               (do (report-diag w (mut s) d) 0))
+                                          (Ok [_]
+                                              (if (= (.regmode (code-main-box))
+                                                     2)
+                                                  (run-code-regs-invoke a
+                                                                        (mut s)
+                                                                        cp)
+                                                  (let [qual
+                                                          (code-main-lookup a
+                                                                            cp
+                                                                            normalized)]
+                                                    (if (= (len qual)
+                                                           0)
+                                                        (do
+                                                          (report-diag w
+                                                                       (mut s)
+                                                                       (derr "code->code run: could not find a unique Code-signed 'main' in the checked program"))
+                                                          0)
+                                                        (run-code-main-invoke a
+                                                                              (mut s)
+                                                                              cp
+                                                                              qual)))))))))))))))))
+
+; `coil run NAME …` may name a MODULE instead of a file: when argv[2] is not
+; a readable file, has no path separator, and resolves as a namespace — the
+; installed library manifest first, then the project's namespace index, the
+; loader's own resolution order — rewrite argv[2] to the resolved file, so a
+; metaprogram module runs as the entry with no wrapper file:
+;   coil run reader.fixture.brainfuck hello.bf
+; An argument that resolves nowhere is left alone and fails downstream with
+; the normal missing-file diagnostic.
+(defn run-resolve-target! [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))]
+  (-> i64)
+  (if (< (primitive/cast i64 argc) 3)
+      0
+      (let [arg (from-cstr (load (index argv 2)))]
+        (match (read-file-opt a (load (index argv 2)))
+          (Some [_] 0)
+          (None []
+                (if (or (= (len arg) 0)
+                        (>= (dep-slash arg) 0)
+                        (= (primitive/cast i64 (get arg 0))
+                           45))
+                    0
+                    (let [(mut path) ""
+                          bn (stdlib-file-for-namespace arg)]
+                      (when (> (len bn) 0)
+                        (let [l (stdlib-layout a)
+                              sdk? (starts-with bn "compiler/")
+                              base (if sdk? (.sdk l) (.libs l))]
+                          (when (> (len base) 0)
+                            (set! path
+                                  (path-join a
+                                             base
+                                             (if sdk?
+                                                 (subslice [u8] bn 9 (len bn))
+                                                 bn)))
+                            0))
+                        0)
+                      (when (= (len (load path)) 0)
+                        (let [sp (box! a LS (zeroed LS))]
+                          (ls-init! (mut sp) a)
+                          ; namespace-index-build! reads sources[0] for the entry
+                          ; directory, so the index needs a source registered the
+                          ; way every other call site has one — without it the
+                          ; empty sources array is indexed out of bounds.
+                          (set! (.srccount sp) 1)
+                          (register-source! (mut sp) arg "")
+                          (namespace-index-build! (mut sp))
+                          (set! path (indexed-namespace-path (mut sp) arg)))
+                        0)
+                      (if (= (len (load path)) 0)
+                          0
+                          (match (read-file-opt a (to-cstr a (load path)))
+                            (None [] 0)
+                            (Some [_]
+                                  (do
+                                    (set! (index argv 2)
+                                          (to-cstr a (load path)))
+                                    0)))))))))))
+
+(defn run-code-main-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))]
+  (-> i64)
+  (let [pathc (load (index argv 2))
+        path (from-cstr pathc)
+        src (read-src a pathc)
+        b (code-main-box)
+        (mut inputs) (ArrayList::new [(slice u8)] a)
+        ; A code main runs in this process, so `--run-in` cannot move it: its
+        ; input files are read from that directory instead.
+        run-in (argv-option-value argc argv "--run-in")
+        (mut i) 3]
+    (argv-apply-uses! argc argv)
+    (loop (if (>= (load i) (primitive/cast i64 argc))
+              (break)
+              (let [arg (from-cstr (load (index argv (load i))))]
+                (if (= arg "--")
+                    (do (set! i (primitive/iadd (load i) 1)) 0)
+                    (if (and (> (len arg) 1)
+                             (= (primitive/cast i64 (get arg 0))
+                                45))
+                        (set! i
+                              (primitive/iadd (load i)
+                                              (if (flag-takes-value? arg) 2 1)))
+                        (do
+                          (push! (mut inputs)
+                                 (cond (= arg "-") "/dev/stdin"
+                                       (or (= (len run-in) 0)
+                                           (= (get arg 0) #\/))
+                                         arg
+                                       :else (path-join a run-in arg)))
+                          (set! i (primitive/iadd (load i) 1))
+                          0))))))
+    ; np and regmode were filled by code-run-scan at dispatch time. A main with
+    ; exactly one Code parameter and no named inputs reads stdin, so pipes compose
+    ; like any program's. Decided here, with the named inputs, so stdin is
+    ; registered as a source before the pipeline runs, as `-` is: the code-file
+    ; op and every span answer for it alike.
+    (when (and (= (.regmode b) 1)
+               (and (= (.np b) 1) (= (len inputs) 0)))
+      (push! (mut inputs) "/dev/stdin")
+      0)
+    (set! (.inputs b) (load inputs))
+    ; One Code param + named FILE inputs = the loaded-code-base contract;
+    ; stdin (piped or named as `-`) stays a raw fragment stream. The
+    ; registrations-as-entry mode always takes raw records (the surface
+    ; syntax a before-expand transform sees).
+    (let [ni (len (.inputs b))
+          (mut hasstdin) false
+          (mut k) 0]
+      (loop (if (>= (load k) ni)
+                (break)
+                (do
+                  (when (= (get (.inputs b) (load k)) "/dev/stdin")
+                    (set! hasstdin true)
+                    0)
+                  (set! k (primitive/iadd (load k) 1)))))
+      (set! (.loaded b)
+            (if (and (= (.regmode b) 1)
+                     (and (= (.np b) 1)
+                          (and (> ni 0)
+                               (not (load hasstdin)))))
+                1
+                0)))
+    (set! (.init b) 1)
+    (if (= (run-dump-on-big-stack a
+                                  src
+                                  (cwd-slice a)
+                                  path
+                                  (fnptr-of run-code-main-pipeline))
+           1)
+        0
+        1)))
+
+;;; The name `coil run` gives the program it builds from `file`: the file's name
+;;; without its directory or `.coil` suffix.
+(defn run-program-name [(file (slice u8))] (-> (slice u8))
+  (let [base (basename file)
+        n (len base)]
+    (if (and (> n 5) (= (subslice [u8] base (- n 5) n) ".coil"))
+        (subslice [u8] base 0 (- n 5))
+        base)))
+
+(defn run-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  ; `run` reuses the working `build` subcommand as a subprocess (self = argv[0]):
+  ;   <self> build <file> -o <temp>/<n>-<name> <flags-before-'--'> then exec it with
+  ; the args after `--`. Robust — no duplication of the build/link pipeline. The
+  ; executable lives in this process's coil.temp directory, so it is removed however
+  ; `run` ends, and is named after the source file for `ps` and crash reports.
+  (let [self (from-cstr (load (index argv 0)))
+        file (from-cstr (load (index argv 2)))
+        ; `-o OUT` names where the executable goes, and it stays there: the
+        ; program runs from OUT. Without it the executable is a temporary file.
+        ; Handing the user's `-o` to the build after our own made the build write
+        ; OUT while `run` executed the temporary name it never wrote (exit 127).
+        user-out (argv-option-value argc argv "-o")
+        owned (= (len user-out) 0)
+        ; Run it by an absolute name: a bare `prog` would be looked up on PATH,
+        ; and `--run-in` changes the directory a relative one is read from.
+        runpath
+          (if owned
+              (temp-or-exit (run-program-name file))
+              (path-join a (cwd-slice a) user-out))
+        (mut buildargs) (ArrayList::new [(slice u8)] a)
+        (mut progargs) (ArrayList::new [(slice u8)] a)
+        ; `--run-in DIR`: the directory the program starts in. It is not a build
+        ; flag. A project command that entered the project's own directory passes
+        ; the one the user typed the command in (see enter-project!).
+        run-in (argv-option-value argc argv "--run-in")
+        (mut i) 3
+        (mut inargs) false]
+    ; Keep argv structured end-to-end. Reader flags and runtime arguments may
+    ; contain spaces, quotes, shell metacharacters, or empty strings; none of
+    ; those are shell syntax here.
+    (push! (mut buildargs) self)
+    (push! (mut buildargs) "build")
+    (push! (mut buildargs) file)
+    (push! (mut buildargs) "-o")
+    (push! (mut buildargs) runpath)
+    (push! (mut buildargs) "--quiet")
+    ; the program runs from a temporary directory: no .dSYM unless -g asks
+    (push! (mut buildargs) "--no-dsym")
+    (loop (if (>= (load i) (primitive/cast i64 argc))
+              (break)
+              (let [arg (from-cstr (load (index argv (load i))))]
+                (if (load inargs)
+                    (do
+                      (push! (mut progargs) arg)
+                      (set! i (primitive/iadd (load i) 1))
+                      0)
+                    (cond (= arg "--")
+                            (do
+                              (set! inargs true)
+                              (set! i (primitive/iadd (load i) 1))
+                              0)
+                          (or (= arg "--run-in") (= arg "-o"))
+                            (do (set! i (primitive/iadd (load i) 2)) 0)
+                          :else
+                            (do
+                              (push! (mut buildargs) arg)
+                              (set! i (primitive/iadd (load i) 1))
+                              0))))))
+    ; The reader contract exposes arguments after -- during source decoding as
+    ; well as to the resulting program. Preserve that vector in the build child;
+    ; it remains separated from compiler flags by its own delimiter.
+    (when (load inargs)
+      (push! (mut buildargs) "--")
+      (for [j 0 (len (load progargs))]
+        (push! (mut buildargs) (get (load progargs) j))
+        0)
+      0)
+    (let [brc (spawn-wait a (load buildargs))]
+      (if (!= brc 0)
+          ; the BUILD failed. A build that died by signal (a runaway comptime, a deep
+          ; macro expansion) also decoded to 0 here, so `run` reported success without
+          ; ever running anything.
+          (do
+            (wait-report brc "compiler")
+            ; A failed build still leaves whatever it managed to emit. Remove both
+            ; names on this path too -- `run` owns them and nothing downstream reads
+            ; them again.
+            (when owned (unlink (to-cstr a runpath)) 0)
+            (unlink (to-cstr a (obj-path a runpath)))
+            (let [c (wait-code brc)] (if (= c 0) 1 c)))
+          (do
+            (push! (mut progargs) "")
+            ; Insert argv[0] without shifting through shell text: grow by one,
+            ; move existing entries right, and place the executable at index zero.
+            (let [n (len (load progargs))
+                  (mut j) (primitive/isub n 1)]
+              (loop (if (<= (load j) 0)
+                        (break)
+                        (do
+                          (set! (mut progargs)
+                                (load j)
+                                (get (load progargs)
+                                     (primitive/isub (load j) 1)))
+                          (set! j (primitive/isub (load j) 1)))))
+              (set! (mut progargs) 0 runpath))
+            ; The program runs from our temporary directory: keep it for the
+            ; program, so a sweep after `run` is killed leaves it while it runs.
+            (let [here (cwd-slice a)
+                  _enter
+                    (when (> (len run-in) 0)
+                      (match (os/change-dir a run-in)
+                        (Ok [_] 0)
+                        (Err [_]
+                             (do
+                               (ps (stderr) "error: --run-in: cannot enter '")
+                               (ps (stderr) run-in)
+                               (ps (stderr) "'\n")
+                               (when owned (unlink (to-cstr a runpath)) 0)
+                               (unlink (to-cstr a (obj-path a runpath)))
+                               (exit 1)
+                               0))))
+                  pid (spawn-args a (load progargs))
+                  _leave
+                    (when (> (len run-in) 0)
+                      (match (os/change-dir a here) (_ 0)))
+                  _keep (when (>= pid 0) (temp/keep-for! pid) 0)
+                  rrc (wait-spawned pid)]
+              (wait-report rrc "program")
+              (when owned (unlink (to-cstr a runpath)) 0)
+              ; `build -o <runpath>` also writes <runpath>.o. That second name was
+              ; never removed, so every `coil run` left one behind -- 8,216 of them
+              ; in /tmp. obj-path is the same function the build used to name it.
+              (unlink (to-cstr a (obj-path a runpath)))
+              (wait-code rrc)))))))

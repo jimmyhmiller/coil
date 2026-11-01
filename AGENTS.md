@@ -200,14 +200,16 @@ Use this format:
   what stops them from being mistaken for the API surface. `src/examples/*.coil`
   is the exception: those are feature demos the language guide points at.
 - `src/compiler/` — the compiler itself. Entry points sit at its root (`main*.coil`,
-  `driver.coil`, `jit_api.coil` for `coil.jit`, `prelude.coil` for `coil.core`); the
-  rest is grouped by stage: `frontend/` (parser, loader, resolve, expander, check,
+  `driver.coil`, which dispatches commands, `jit_api.coil` for `coil.jit`, `prelude.coil`
+  for `coil.core`), with `pipeline.coil`, what compiling a program takes, shared by every
+  command; the rest is grouped by stage: `frontend/` (parser, loader, resolve, expander, check,
   mono), `comptime/` (compile-time evaluation, the bytecode interpreter), `meta/`
   (compiled metaprograms), `backend/` (LLVM, arm64, x64, wasm, tpde codegen),
-  `object/` (instruction encoders, Mach-O/ELF/DWARF/wasm writers), `jit/`,
-  `retained/` (state kept between compiler revisions), `artifact/` (units and
-  artifact identity), `cli/` (`cimport`,
-  `update`, the generated guide), `support/` and `selftest/`.
+  `object/` (instruction encoders, Mach-O/ELF/DWARF/wasm writers), `jit/` (with `session.coil`,
+  a live session, and `terminal.coil`, the terminal REPL over one), `artifact/` (units and
+  artifact identity), `cli/` (one module per command
+  family, with `project.coil` and `base.coil` beneath them; a command imports nothing above
+  it, and nothing imports a command but `driver.coil`), `support/` and `selftest/`.
   Module names do not follow the folders: a module is found by its declared
   `(module coil.compiler.NAME)`, so moving a file changes no import.
 - `tests/` — what the two test tiers run: `corpus` (the runtime programs), `diag`

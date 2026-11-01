@@ -1,0 +1,964 @@
+;;; `coil test` and `coil fuzz`.
+(module coil.compiler.cli_test)
+(import "coil.primitive" :as primitive)
+(import "coil.temp" :as temp)
+(import "coil.compiler.unit_state" :use *)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :as str :use * :exclude [parse-int])
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.pmap" :use *)
+(import "coil.io" :use *)
+(import "coil.fs" :as fs)
+(import "coil.control" :use *)
+(import "coil.try" :use *)
+(import "coil.compiler.env" :use *)
+(import "coil.compiler.ffi" :use *)
+(import "coil.compiler.guide" :use *)
+(import "coil.reader" :use *)
+(import "coil.project" :use *)
+(import "coil.source.cli"
+        :use
+        [d-write-file d-rewrite-file read-stdin-all write-stdout-all is-flag?
+         count-substr])
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.astdump" :use *)
+(import "coil.compiler.parser" :use *)
+(import "coil.compiler.loader" :use *)
+(import "coil.compiler.resolve" :use *)
+(import "coil.compiler.check" :use *)
+(import "coil.compiler.mono" :use *)
+(import "coil.compiler.phase_split" :use *)
+(import "coil.compiler.diag" :use *)
+(import "coil.compiler.comptime" :use *)
+(import "coil.compiler.closure" :use *)
+(import "coil.compiler.metaengine" :use *)
+(import "coil.compiler.expander" :use *)
+(import "coil.compiler.unit" :use *)
+(import "coil.compiler.native_module" :use *)
+(import "coil.compiler.jit" :use *)
+(import "coil.compiler.interp" :use *)
+(import "coil.compiler.wasm" :use *)
+(import "coil.compiler.codegen_wasm" :use *)
+(import "coil.cc" :as cc)
+(import "coil.compiler.cli_base" :use *)
+(import "coil.compiler.cli_project" :use *)
+(import "coil.compiler.pipeline" :use *)
+
+(defn test-file-idx [(argc i32) (argv (ptr (ptr i8))) (start i64)] (-> i64)
+  (let [(mut i) start
+        (mut r) 0]
+    (loop (if (>= (load i) (primitive/cast i64 argc))
+              (break)
+              (let [arg (from-cstr (load (index argv (load i))))]
+                (if (= arg "--")
+                    (break)
+                    (if (is-flag? arg)
+                        (do
+                          (set! i
+                                (primitive/iadd (load i)
+                                                (if (test-flag-takes-value? arg)
+                                                    2
+                                                    1)))
+                          0)
+                        (do (set! r (load i)) (break)))))))
+    (load r)))
+
+;;; The bare ones, which take no value.
+(defn test-runner-switch? [(arg (slice u8))] (-> bool)
+  (cond (= arg "--list") true
+        (= arg "--verbose") true
+        (= arg "--alloc-tracked") true
+        (= arg "--no-fork") true
+        :else false))
+
+;;; The runner flag ARG spells as `--name=VALUE`, or "" when it is not one. Every
+;;; value-taking runner flag may be written that way, and so may `--verbose`,
+;;; whose optional value is a level (`--verbose=1`).
+(defn test-runner-inline-flag [(arg (slice u8))] (-> (slice u8))
+  (let [eq (m-index arg (: 61 u8))]
+    (if (<= eq 0)
+        ""
+        (let [name (subslice arg 0 eq)]
+          (if (or (test-runner-flag? name) (= name "--verbose")) name "")))))
+
+;;; Is ARG one argument the test runner takes, in any spelling?
+(defn test-runner-arg? [(arg (slice u8))] (-> bool)
+  (or (test-runner-switch? arg)
+      (or (test-runner-flag? arg) (> (len (test-runner-inline-flag arg)) 0))))
+
+(defn test-runner-digits? [(s (slice u8))] (-> bool)
+  (and (> (len s) 0)
+       (block :digits
+         (for c s
+           (unless (and (>= c (: 48 u8)) (<= c (: 57 u8)))
+             (break :digits false)))
+         true)))
+
+;;; Append runner flag NAME with VALUE to the runner's command line `b`. A value
+;;; that would silently widen or misread the run is refused here: an empty
+;;; `--filter` selects every test, and `--verbose=` takes only a level.
+(defn test-runner-push-flag! [(b (mut StrBuf))
+                              (name (slice u8))
+                              (value (slice u8))] (-> i64)
+  (when (and (= name "--filter") (= (len value) 0))
+    (ps (stderr) "error: --filter needs a nonempty substring\n")
+    (exit 2))
+  (if (= name "--verbose")
+      (do
+        (unless (test-runner-digits? value)
+          (ps (stderr) "error: --verbose=N takes a level, a number; got '")
+          (ps (stderr) value)
+          (ps (stderr) "'\n")
+          (exit 2))
+        (push-str! (mut b) " --verbose=")
+        (push-str! (mut b) value))
+      (do
+        (push-str! (mut b) " ")
+        (push-str! (mut b) name)
+        (push-str! (mut b) " ")
+        (m-shell-quoted! (mut b) value)))
+  0)
+
+;;; Consume the runner argument at argv index `i` into `b`, returning how many argv
+;;; entries it took: 1 for a switch or a `--name=VALUE`, 2 for `--name VALUE`.
+(defn test-runner-take! [(b (mut StrBuf))
+                         (argc i32)
+                         (argv (ptr (ptr i8)))
+                         (i i64)] (-> i64)
+  (let [arg (from-cstr (load (primitive/index argv i)))
+        inline (test-runner-inline-flag arg)]
+    (cond (test-runner-switch? arg)
+            (do (push-str! (mut b) " ") (push-str! (mut b) arg) 1)
+          (> (len inline) 0)
+            (do
+              (test-runner-push-flag! (mut b)
+                                      inline
+                                      (subslice arg
+                                                (+ (len inline) 1)
+                                                (len arg)))
+              1)
+          :else
+            (do
+              (when (or (>= (+ i 1) (cast i64 argc))
+                        (is-flag? (from-cstr (load (primitive/index argv
+                                                                    (+ i 1))))))
+                (ps (stderr) "error: ")
+                (ps (stderr) arg)
+                (ps (stderr) " needs a value\n")
+                (exit 2))
+              (test-runner-push-flag! (mut b)
+                                      arg
+                                      (from-cstr (load (primitive/index argv
+                                                                        (+ i 1)))))
+              2))))
+
+(defn test-cleanup [(a (dyn Allocator)) (outdir (slice u8))] (-> i64)
+  ; A runner is an invocation-local executable, not a cache entry. Remove the whole
+  ; directory so partial objects from a failed build cannot accumulate either.
+  (temp/remove! outdir))
+
+;;; The instrumentation ignorelist. Written per invocation rather than kept in the
+;;; tree because it names implementation modules, and a stale copy would silently
+;;; stop excluding one of them.
+;;;
+;;; The coverage callbacks MUST be excluded or `cov-guard` is instrumented with a
+;;; call to itself. The rest of `coil.prop` is excluded for signal: the engine
+;;; executes far more branches and comparisons than the code under test, and
+;;; instrumenting it fills the edge map with the generator's own control flow and the
+;;; comparison table with loop counters. The test runner, argument parsing, `main`
+;;; and the `coil-test$` wrappers are harness too: instrumenting them only inflates
+;;; the edge total and fills the coverage report with code no input can reach.
+;;; `[*]` applies to every coverage kind rather than only the ones used today.
+(defn fuzz-write-ignorelist [(a (dyn Allocator)) (path (slice u8))] (-> i64)
+  (match (fs/write-file a
+                        path
+                        "[*]\nfun:coil.prop.*\nfun:coil.arraylist.*\nfun:coil.alloc.*\nfun:coil.test-runner.*\nfun:coil.args.*\nfun:main\nfun:*.coil-test$*\n")
+    (Ok [n] 0)
+    (Err [e] 1)))
+
+(defn fuzz-usage [] (-> i64)
+  (ps (stderr)
+      "usage: coil fuzz <file.coil> [--time SECS | -n ITERATIONS] [--jobs N] [--sanitize=address] [--filter NAME] [--minimize-corpus] …  (see coil fuzz --help)\n")
+  (exit 2)
+  2)
+
+;;; `coil fuzz <file.coil> [options]` — see `coil help fuzz`.
+(defn fuzz-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [self (from-cstr (load (index argv 0)))
+        (mut file) ""
+        (mut run-args) (StrBuf::new a)
+        (mut have-budget) false
+        (mut have-iters) false
+        (mut norun) false
+        (mut keep) false
+        (mut asan) false
+        (mut debug-checks) false
+        (mut i) 2]
+    ; Every option is either forwarded under the name the runner reads or handled
+    ; here, and anything else is an error: an ignored typo (`--itrations`) used to
+    ; run the default campaign and report it as if the option had applied.
+    (loop (if (>= (load i) (primitive/cast i64 argc))
+              (break)
+              (let [arg (from-cstr (load (index argv (load i))))
+                    fwd (fuzz-value-flag arg)]
+                (cond (> (len fwd) 0)
+                        (do
+                          (when (>= (primitive/iadd (load i) 1)
+                                    (primitive/cast i64 argc))
+                            (ps (stderr) "error: coil fuzz: ")
+                            (ps (stderr) arg)
+                            (ps (stderr) " needs a value\n")
+                            (exit 2)
+                            0)
+                          (when (or (= fwd "--fuzz") (= fwd "--fuzz-time"))
+                            (set! have-budget true)
+                            0)
+                          (when (= fwd "--fuzz") (set! have-iters true) 0)
+                          (push-str! (mut run-args) " ")
+                          (push-str! (mut run-args) fwd)
+                          (push-str! (mut run-args) " ")
+                          (m-shell-quoted! (mut run-args)
+                                           (from-cstr (load (index argv
+                                                                   (primitive/iadd (load i)
+                                                                                   1)))))
+                          (set! i (primitive/iadd (load i) 2))
+                          0)
+                      (= arg "--sanitize=address")
+                        (do
+                          (set! asan true)
+                          (set! i (primitive/iadd (load i) 1))
+                          0)
+                      (= arg "--debug-checks")
+                        (do
+                          (set! debug-checks true)
+                          (set! i (primitive/iadd (load i) 1))
+                          0)
+                      (= arg "--minimize-corpus")
+                        (do
+                          (push-str! (mut run-args) " --fuzz-minimize")
+                          (set! have-budget true)
+                          (set! i (primitive/iadd (load i) 1))
+                          0)
+                      (= arg "--no-run")
+                        (do
+                          (set! norun true)
+                          (set! i (primitive/iadd (load i) 1))
+                          0)
+                      (= arg "--keep")
+                        (do
+                          (set! keep true)
+                          (set! i (primitive/iadd (load i) 1))
+                          0)
+                      (and (> (len arg) 0)
+                           (!= (primitive/cast i64 (get arg 0))
+                               45))
+                        (if (> (len (load file)) 0)
+                            (do
+                              (ps (stderr)
+                                  "error: coil fuzz takes one file; got a second: ")
+                              (ps (stderr) arg)
+                              (ps (stderr) "\n")
+                              (exit 2)
+                              0)
+                            (do
+                              (set! file arg)
+                              (set! i (primitive/iadd (load i) 1))
+                              0))
+                      :else
+                        (do
+                          (ps (stderr) "error: coil fuzz: unknown option ")
+                          (ps (stderr) arg)
+                          (ps (stderr) "\n")
+                          (fuzz-usage)))
+                0)))
+    (when (= (len (load file)) 0) (fuzz-usage) 0)
+    ; No budget named: a minute per property. A campaign with no end is `--time 0`.
+    (unless (load have-budget)
+      (push-str! (mut run-args) " --fuzz-time 60")
+      0)
+    ; `--fuzz` is what puts the runner in campaign mode; its value is the
+    ; per-worker iteration budget, 0 for none.
+    (unless (load have-iters) (push-str! (mut run-args) " --fuzz 0") 0)
+    (fuzz-build-and-run a
+                        self
+                        (load file)
+                        (str (load run-args))
+                        (load asan)
+                        (load debug-checks)
+                        (load norun)
+                        (load keep))))
+
+(defn fuzz-build-and-run [(a (dyn Allocator))
+                          (self (slice u8))
+                          (file (slice u8))
+                          (run-args (slice u8))
+                          (asan bool)
+                          (debug-checks bool)
+                          (norun bool)
+                          (keep bool)] (-> i64)
+  (let [text (read-file a (to-cstr a "Coil.toml"))
+        project (> (len text) 0)
+        m (if project (parse-manifest a text) (primitive/cast (ptr Manifest) 0))
+        ; A runner the user asked to keep (`--keep`, or `--no-run`, which reports
+        ; its path) lives under .coil/build; any other is a temporary.
+        outdir
+          (if (or keep norun)
+              (cat3-d a
+                      ".coil/build/fuzz/"
+                      (i64->str a
+                                (^ (hash file)
+                                   (primitive/cast i64 (getpid)))))
+              (temp-or-exit "fuzz"))
+        ir (cat3-d a outdir "/program.ll")
+        ignore (cat3-d a outdir "/sancov-ignore.txt")
+        out (cat3-d a outdir "/fuzz-runner")]
+    (let [(mut mk) (StrBuf::new a)]
+      (push-str! (mut mk) "mkdir -p ")
+      (m-shell-quoted! (mut mk) outdir)
+      (when (!= (wait-code (primitive/cast i64
+                                           (system (to-cstr a
+                                                            (str (load mk))))))
+                0)
+        (exit 1)
+        0))
+    (when (!= (fuzz-write-ignorelist a ignore) 0)
+      (ps (stderr) "error: coil fuzz: cannot write ")
+      (ps (stderr) ignore)
+      (ps (stderr) "\n")
+      (exit 1)
+      0)
+    ; 1. IR for the whole program, with the test transform loaded so the
+    ;    `defprop`s get a `main` to run them.
+    (let [(mut b) (StrBuf::new a)]
+      (when project
+        (m-prepare-deps a m)
+        (m-prepare-native-deps a m)
+        (m-emit-dep-env a (mut b) m)
+        0)
+      (push-str! (mut b) self)
+      (push-str! (mut b) " emit-ir ")
+      (m-shell-quoted! (mut b) file)
+      (push-str! (mut b) " --use coil.test-runner")
+      (when asan (push-str! (mut b) " --sanitize=address") 0)
+      ; bounds checks on every index, allocation checks on every free: catches an
+      ; out-of-bounds read that stays inside a list's spare capacity, which ASan
+      ; cannot see
+      (when debug-checks (push-str! (mut b) " --debug-checks") 0)
+      ; the manifest's [metaprograms] are part of the program `coil test`
+      ; builds, so the fuzzed build has to be compiled under them too.
+      (when project (m-emit-uses a (mut b) m) 0)
+      (push-str! (mut b) " > ")
+      (m-shell-quoted! (mut b) ir)
+      (let [rc
+              (wait-code (primitive/cast i64
+                                         (system (to-cstr a (str (load b))))))]
+        (if (!= rc 0)
+            (do (unless keep (test-cleanup a outdir) 0) rc)
+            ; 2. Instrument and link. `llvm-config --bindir` names the clang
+            ;    matching the LLVM this compiler was built against; a mismatched
+            ;    clang is the usual cause of a sanitizer runtime that will not
+            ;    link. -O1 deliberately: at higher levels more branches become
+            ;    branchless selects, and a branch with no block of its own has
+            ;    no edge for the search to discover.
+            (let [(mut c) (StrBuf::new a)]
+              (push-str! (mut c)
+                         "c=\"${LLVM_CONFIG:-/opt/homebrew/opt/llvm/bin/llvm-config}\"; command -v \"$c\" >/dev/null 2>&1 || c=llvm-config; \"$(\"$c\" --bindir)/clang\"")
+              (push-found-clang-sysroot-str! a (mut c))
+              (push-str! (mut c)
+                         " -fsanitize-coverage=trace-pc-guard,trace-cmp,pc-table -fsanitize-coverage-ignorelist=")
+              (m-shell-quoted! (mut c) ignore)
+              (when asan (push-str! (mut c) " -fsanitize=address") 0)
+              (push-str! (mut c) " -O1 -Wno-override-module ")
+              (m-shell-quoted! (mut c) ir)
+              (push-str! (mut c) " -o ")
+              (m-shell-quoted! (mut c) out)
+              ; clang IS the linker here, so the manifest's link inputs go on
+              ; as plain arguments — the `--link-flag` spelling every other
+              ; caller wants is for a `<self> build` child, and clang rejects it.
+              (when project
+                (m-emit-link-as a (mut c) m true)
+                (m-cc-sources-as a (mut c) m true)
+                0)
+              (let [crc
+                      (wait-code (primitive/cast i64
+                                                 (system (to-cstr a
+                                                                  (str (load c))))))]
+                (if (!= crc 0)
+                    (do
+                      (ps (stderr)
+                          "error: instrumented build failed; see clang's error above")
+                      (ps (stderr)
+                          " (if clang itself was not found, check llvm-config --bindir)\n")
+                      (unless keep (test-cleanup a outdir) 0)
+                      crc)
+                    (if norun
+                        (let [w (stdout)]
+                          (ps w "wrote ")
+                          (ps w out)
+                          (wb w 10)
+                          0)
+                        ; 3. Run it, handing the runner its knobs as FLAGS — the
+                        ;    same ones `coil test` forwards, read from the
+                        ;    runner's own argv via coil.args. Under ASan every
+                        ;    generated value gets its own allocation, or a
+                        ;    one-byte overrun lands on the next value in the
+                        ;    arena and the sanitizer sees nothing.
+                        (let [(mut r) (StrBuf::new a)]
+                          (m-shell-quoted! (mut r) out)
+                          (push-str! (mut r) " --verbose")
+                          (push-str! (mut r) run-args)
+                          (when asan
+                            (push-str! (mut r) " --alloc-tracked")
+                            0)
+                          (let [rrc
+                                  (primitive/cast i64
+                                                  (system (to-cstr a
+                                                                   (str (load r)))))]
+                            (wait-report rrc "fuzz runner")
+                            (let [code (wait-code rrc)]
+                              (unless keep (test-cleanup a outdir) 0)
+                              code))))))))))))
+
+;;; Every `*_test.coil` file under DIR, recursively, in sorted order.
+(defn test-files-under! [(a (dyn Allocator))
+                         (dir (slice u8))
+                         (out (mut (ArrayList (slice u8))))] (-> void)
+  (try (let [(mut sorted) (try-or! (fs/Directory::list a dir) 0)]
+         (for i (range 1 (len sorted))
+           (let [(mut j) i]
+             (while (and (> j 0)
+                         (slice-lt? (get sorted j) (get sorted (- j 1))))
+               (let [t (get sorted j)]
+                 (set! (mut sorted) j (get sorted (- j 1)))
+                 (set! (mut sorted) (- j 1) t))
+               (set! j (- j 1)))))
+         (for name sorted
+           (unless (starts-with name ".")
+             (let [path (sconcat3 a dir "/" name)]
+               (if (dir? (to-cstr a path))
+                   (test-files-under! a path (mut out))
+                   (when (d-ends-with? name "_test.coil")
+                     (push! (mut out) path)))))))))
+
+;;; `coil test DIR` with no Coil.toml: there is no manifest to name test roots, so
+;;; the directory is the root. Each test file runs as `coil test FILE` with the
+;;; remaining arguments, and the results are summed.
+(defn test-directory-cmd [(a (dyn Allocator))
+                          (argc i32)
+                          (argv (ptr (ptr i8)))
+                          (fidx i64)] (-> i64)
+  (let [self (from-cstr (load (index argv 0)))
+        dir (from-cstr (load (index argv fidx)))
+        (mut files) (ArrayList::new [(slice u8)] a)
+        (mut failed) 0]
+    (test-files-under! a dir (mut files))
+    (if (= (len files) 0)
+        (do
+          (ps (stderr) "error: no *_test.coil files under ")
+          (ps (stderr) dir)
+          (wb (stderr) 10)
+          1)
+        (do
+          (for file files
+            (let [(mut args) (ArrayList::new [(slice u8)] a)]
+              (push! (mut args) self)
+              (push! (mut args) "test")
+              (push! (mut args) file)
+              (for k (range 2 (cast i64 argc))
+                (unless (= k fidx)
+                  (push! (mut args) (from-cstr (load (index argv k))))))
+              (when (!= (wait-code (spawn-wait a args)) 0)
+                (set! failed (+ failed 1)))))
+          (let [w (stdout)]
+            (ps w "\n")
+            (ps w (i64->str a (len files)))
+            (ps w " test files: ")
+            (ps w (i64->str a (- (len files) failed)))
+            (ps w " passed, ")
+            (ps w (i64->str a failed))
+            (ps w " failed\n"))
+          (if (= failed 0) 0 1)))))
+
+(defn test-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [fidx (test-file-idx argc argv 2)]
+    (if (and (> fidx 0)
+             (= (len (read-file a (to-cstr a "Coil.toml"))) 0)
+             (dir? (load (index argv fidx))))
+        (test-directory-cmd a argc argv fidx)
+        (test-file-cmd a argc argv))))
+
+(defn test-file-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))]
+  (-> i64)
+  (let [self (from-cstr (load (index argv 0)))
+        fidx (test-file-idx argc argv 2)]
+    (if (or (= fidx 0)
+            (and (> (len (read-file a (to-cstr a "Coil.toml")))
+                    0)
+                 (not (d-ends-with? (from-cstr (load (index argv fidx)))
+                                    ".coil"))))
+        (project-test-dispatch a argc argv)
+        (let [file (from-cstr (load (index argv fidx)))
+              text (read-file a (to-cstr a "Coil.toml"))
+              project (> (len text) 0)
+              m
+                (if project
+                    (parse-manifest a text)
+                    (primitive/cast (ptr Manifest) 0))
+              _profile (if project (m-select-profile! a argc argv m) 0)
+              (mut norun) false
+              (mut runner-args) (StrBuf::new a)
+              outdir (temp-or-exit "test")
+              out (cat3-d a outdir "/test-runner")
+              (mut b) (StrBuf::new a)]
+          (let [(mut mk) (StrBuf::new a)]
+            (push-str! (mut mk) "mkdir -p ")
+            (m-shell-quoted! (mut mk) outdir)
+            (let [rc
+                    (primitive/cast i64
+                                    (system (to-cstr a (str (load mk)))))]
+              (when (!= (wait-code rc) 0) (exit 1) 0)))
+          (when project
+            (m-prepare-deps a m)
+            (m-prepare-native-deps a m)
+            (m-emit-dep-env a (mut b) m)
+            0)
+          (push-str! (mut b) self)
+          (push-str! (mut b) " build ")
+          (push-str! (mut b) file)
+          (push-str! (mut b) " -o ")
+          (m-shell-quoted! (mut b) out)
+          (push-str! (mut b) " --use coil.test-runner --quiet")
+          (when project
+            (m-emit-uses a (mut b) m)
+            (m-emit-link a (mut b) m)
+            (m-cc-sources a (mut b) m)
+            (m-emit-dep-packages! a (mut b) m)
+            (when (.has-target m)
+              (push-str! (mut b) " --target ")
+              (push-str! (mut b) (.target m))
+              0)
+            0)
+          ; forward remaining flags (skip the file positional and stop at `--`).
+          (let [(mut i) 2]
+            (loop (if (>= (load i) (primitive/cast i64 argc))
+                      (break)
+                      (let [arg (from-cstr (load (index argv (load i))))]
+                        (if (= arg "--")
+                            (break)
+                            (if (= (load i) fidx)
+                                (do (set! i (primitive/iadd (load i) 1)) 0)
+                                (if (= arg "-o")
+                                    (do
+                                      (ps (stderr)
+                                          "error: coil test owns its output path; -o is not supported\n")
+                                      (exit 2)
+                                      0)
+                                    (if (= arg "--no-run")
+                                        (do
+                                          (set! norun true)
+                                          (set! i (primitive/iadd (load i) 1))
+                                          0)
+                                        (if (test-runner-arg? arg)
+                                            (do
+                                              (set! i
+                                                    (primitive/iadd (load i)
+                                                                    (test-runner-take! (mut runner-args)
+                                                                                       argc
+                                                                                       argv
+                                                                                       (load i))))
+                                              0)
+                                            (do
+                                              (push-str! (mut b) " ")
+                                              (m-shell-quoted! (mut b) arg)
+                                              (set! i
+                                                    (primitive/iadd (load i)
+                                                                    1))
+                                              0))))))))))
+          (let [brc (primitive/cast i64 (system (to-cstr a (str (load b)))))]
+            (if (!= brc 0)
+                ; the BUILD failed (compile error already on stderr, or a build signal death).
+                (do
+                  (wait-report brc "compiler")
+                  (let [c (wait-code brc)]
+                    (test-cleanup a outdir)
+                    (if (= c 0) 1 c)))
+                (if (load norun)
+                    (do (test-cleanup a outdir) 0)
+                    (let [(mut run) (StrBuf::new a)]
+                      (push-str! (mut run) "exec ")
+                      (m-shell-quoted! (mut run) out)
+                      ; The toolchain that built the runner, for a test that compiles
+                      ; code while it runs (coil.test.compile) against the same
+                      ; compiler and standard library.
+                      (push-str! (mut run) " --coil-toolchain ")
+                      (m-shell-quoted! (mut run) (resolve-command-path a self))
+                      (push-str! (mut run) (str (load runner-args)))
+                      (let [rrc
+                              (primitive/cast i64
+                                              (system (to-cstr a
+                                                               (str (load run)))))]
+                        (wait-report rrc "test runner")
+                        (let [rc (wait-code rrc)]
+                          (test-cleanup a outdir)
+                          rc))))))))))
+
+; True once the manifest declares a suite of its own. The synthesized "default" suite
+; does not count: a project that never wrote [test.suites.…] should not start seeing
+; suite headers in `coil test --list`.
+(defn test-has-named-suites? [(suites (ptr (ArrayList (ptr ManifestSuite))))]
+  (-> bool)
+  (let [(mut found) false
+        (mut i) 0]
+    (loop (if (>= (load i) (len (load suites)))
+              (break)
+              (if (= (.name (get (load suites) (load i))) "default")
+                  (set! i (primitive/iadd (load i) 1))
+                  (do (set! found true) (break)))))
+    (load found)))
+
+;;; `coil test` with no file: the project's own tests, or at a workspace root every
+;;; member's, each run in the member's directory as `coil check` and `coil build`
+;;; are.
+(defn project-test-dispatch [(a (dyn Allocator))
+                             (argc i32)
+                             (argv (ptr (ptr i8)))] (-> i64)
+  (let [text (read-file a (to-cstr a "Coil.toml"))
+        m
+          (cond (project-manifest?) (project-manifest)
+                (> (len text) 0) (parse-manifest a text)
+                :else (cast (ptr Manifest) 0))]
+    (if (and (!= (cast i64 m) 0) (m-workspace? m))
+        (workspace-fanout a
+                          "test"
+                          (resolve-command-path a
+                                                (from-cstr (load (primitive/index argv
+                                                                                  0))))
+                          m
+                          argc
+                          argv)
+        (project-test-cmd a argc argv))))
+
+; No-argument test mode discovers every selected root and compiles them together as
+; one test program. The generated harness still re-execs itself per deftest for crash
+; isolation. An explicit `coil test <file>` remains the direct one-file path above.
+(defn project-test-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))]
+  (-> i64)
+  (let [self (from-cstr (load (index argv 0)))
+        text (read-file a (to-cstr a "Coil.toml"))]
+    (if (= (len text) 0)
+        (do (ps (stderr) "error: no Coil.toml in the current directory\n") 1)
+        (let [m (parse-manifest a text)
+              _profile (m-select-profile! a argc argv m)
+              want
+                (box! a
+                      (ArrayList (slice u8))
+                      (zeroed (ArrayList (slice u8))))
+              (mut jobs) 1
+              (mut list) false
+              (mut norun) false
+              ; path selectors: a file runs when its path contains any of them
+              selectors
+                (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))
+              build-args
+                (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))
+              ; runner options (`--filter`, `--cases`, `--verbose=1`, …), already
+              ; shell-quoted, for the harness this command builds and runs
+              (mut runner-args) (StrBuf::new a)
+              (mut i) 2]
+          (set! want (ArrayList::new [(slice u8)] a))
+          (loop (if (>= (load i) (primitive/cast i64 argc))
+                    (break)
+                    (let [arg (from-cstr (load (index argv (load i))))]
+                      (cond (= arg "--suite")
+                              (do
+                                (when (>= (primitive/iadd (load i) 1)
+                                          (primitive/cast i64 argc))
+                                  (ps (stderr)
+                                      "error: --suite needs a suite name\n")
+                                  (exit 2)
+                                  0)
+                                (push! [(slice u8)]
+                                       want
+                                       (from-cstr (load (index argv
+                                                               (primitive/iadd (load i)
+                                                                               1)))))
+                                (set! i (primitive/iadd (load i) 2))
+                                0)
+                            (= arg "--list")
+                              (do
+                                (set! list true)
+                                (set! i (primitive/iadd (load i) 1))
+                                0)
+                            (= arg "--no-run")
+                              (do
+                                (set! norun true)
+                                (set! i (primitive/iadd (load i) 1))
+                                0)
+                            (= arg "--jobs")
+                              (do
+                                (when (>= (primitive/iadd (load i) 1)
+                                          (primitive/cast i64 argc))
+                                  (ps (stderr)
+                                      "error: --jobs needs a positive count\n")
+                                  (exit 2)
+                                  0)
+                                (match (parse-int (from-cstr (load (index argv
+                                                                          (primitive/iadd (load i)
+                                                                                          1)))))
+                                  (Some [n]
+                                        (if (> n 0)
+                                            (set! jobs n)
+                                            (do
+                                              (ps (stderr)
+                                                  "error: --jobs needs a positive count\n")
+                                              (exit 2)
+                                              0)))
+                                  (None []
+                                        (do
+                                          (ps (stderr)
+                                              "error: --jobs needs a positive count\n")
+                                          (exit 2)
+                                          0)))
+                                (set! i (primitive/iadd (load i) 2))
+                                0)
+                            (starts-with arg "--jobs=")
+                              (do
+                                (match (parse-int (subslice arg 7 (len arg)))
+                                  (Some [n]
+                                        (if (> n 0)
+                                            (store! jobs n)
+                                            (do
+                                              (ps (stderr)
+                                                  "error: --jobs needs a positive count\n")
+                                              (exit 2)
+                                              0)))
+                                  (None []
+                                        (do
+                                          (ps (stderr)
+                                              "error: --jobs needs a positive count\n")
+                                          (exit 2)
+                                          0)))
+                                (store! i (primitive/iadd (load i) 1))
+                                0)
+                            ; The runner's own options reach the harness it runs, the
+                            ; same as after a file name.
+                            (test-runner-arg? arg)
+                              (do
+                                (store! i
+                                        (primitive/iadd (load i)
+                                                        (test-runner-take! (mut runner-args)
+                                                                           argc
+                                                                           argv
+                                                                           (load i))))
+                                0)
+                            ; Project discovery owns --suite/--list/--no-run/--jobs,
+                            ; but the resulting one-file harness is still an ordinary
+                            ; test build. Preserve every build flag for that child
+                            ; invocation instead of rejecting flags the help promises.
+                            ; A caller-owned -o remains invalid: the project runner owns
+                            ; its invocation-local output and must never execute a stale
+                            ; binary at a user-selected path.
+                            (= arg "-o")
+                              (do
+                                (ps (stderr)
+                                    "error: coil test owns its output path; -o is not allowed\n")
+                                (exit 2)
+                                0)
+                            (flag-known? arg)
+                              (do
+                                (push! build-args arg)
+                                (if (flag-takes-value? arg)
+                                    (do
+                                      (when (>= (primitive/iadd (load i) 1)
+                                                (primitive/cast i64 argc))
+                                        (ps (stderr)
+                                            "error: flag needs a value: ")
+                                        (ps (stderr) arg)
+                                        (ps (stderr) "\n")
+                                        (exit 2)
+                                        0)
+                                      (push! build-args
+                                             (from-cstr (load (index argv
+                                                                     (primitive/iadd (load i)
+                                                                                     1)))))
+                                      (set! i (primitive/iadd (load i) 2))
+                                      0)
+                                    (do
+                                      (set! i (primitive/iadd (load i) 1))
+                                      0))
+                                0)
+                            (is-flag? arg)
+                              (do
+                                (ps (stderr)
+                                    "error: unknown project test flag '")
+                                (ps (stderr) arg)
+                                (ps (stderr) "'\n")
+                                (exit 2)
+                                0)
+                            :else
+                              (do
+                                (push! selectors arg)
+                                (set! i (primitive/iadd (load i) 1))
+                                0)))))
+          ; Discovery is a SIBLING of the argument loop, not part of its body. When it
+          ; sat inside, every flag past the first re-ran the whole discovery: `coil test
+          ; --list --jobs 2` listed once with the default job count and again with 2.
+          (let [chosen (test-select-suites a m want)
+                n-chosen (len (load chosen))
+                ; grouping only earns its weight once a manifest actually declares
+                ; suites; a project that never heard of them sees the flat list it
+                ; always saw.
+                grouped
+                  (and (load list)
+                       (test-has-named-suites? (load (field m suites))))
+                batchdir (temp-or-exit "test-batch")
+                batchroot (cat3-d a batchdir "/suite.coil")
+                batchlist (cat3-d a batchdir "/roots")
+                (mut cmd) (StrBuf::new a)
+                (mut emitted) 0
+                (mut k) 0]
+            (when (= n-chosen 0)
+              (ps (stdout) "no test suites selected\n")
+              (exit 0)
+              0)
+            ; Each suite contributes one `find`; the group feeds a single sort so the
+            ; whole run stays one sorted stream no matter how many suites are in play.
+            (unless (load list)
+              (push-str! (mut cmd) "mkdir -p ")
+              (m-shell-quoted! (mut cmd) batchdir)
+              (push-str! (mut cmd)
+                         " && printf '(module coil_project_test_harness)\\n' > ")
+              (m-shell-quoted! (mut cmd) batchroot)
+              (push-str! (mut cmd) " && ")
+              0)
+            (push-str! (mut cmd) "{ ")
+            (loop (if (>= (load k) n-chosen)
+                      (break)
+                      (let [s (get (load chosen) (load k))
+                            (mut one) (StrBuf::new a)]
+                        (when (= (test-emit-find! a (mut one) s selectors)
+                                 1)
+                          (when grouped
+                            (push-str! (mut cmd) "echo ")
+                            (m-shell-quoted! (mut cmd)
+                                             (cat3-d a
+                                                     (.name s)
+                                                     (if (.is-default s)
+                                                         ":"
+                                                         " [opt-in]:")))
+                            (push-str! (mut cmd) "; ")
+                            0)
+                          (push-str! (mut cmd) (str (load one)))
+                          (if (load list)
+                              (if grouped
+                                  (push-str! (mut cmd)
+                                             "-print | LC_ALL=C sort | sed 's/^/  /'; ")
+                                  (push-str! (mut cmd) "-print; "))
+                              (push-str! (mut cmd) "-print0; "))
+                          (set! emitted (primitive/iadd (load emitted) 1))
+                          0)
+                        (set! k (primitive/iadd (load k) 1)))))
+            (push-str! (mut cmd) "}")
+            (cond (load list)
+                    (if (= (load emitted) 0)
+                        0
+                        (do
+                          (unless grouped
+                            (push-str! (mut cmd) " | LC_ALL=C sort")
+                            0)
+                          (wait-code (primitive/cast i64
+                                                     (system (to-cstr a
+                                                                      (str (load cmd))))))))
+                  ; Every selected suite's roots are absent: nothing was configured
+                  ; wrongly (declared roots are checked above), there is just nothing
+                  ; to run, and the run says so instead of claiming a pass.
+                  (= (load emitted) 0) (test-found-nothing selectors)
+                  :else
+                    (do
+                      ; One sorted root list feeds ONE compiler invocation. The
+                      ; resulting executable owns every selected deftest; process
+                      ; isolation happens when that runner re-execs itself.
+                      (push-str! (mut cmd) " | LC_ALL=C sort -zu > ")
+                      (m-shell-quoted! (mut cmd) batchlist)
+                      (let [found-rc
+                              (wait-code (primitive/cast i64
+                                                         (system (to-cstr a
+                                                                          (str (load cmd))))))]
+                        (cond (!= found-rc 0)
+                                (do (test-cleanup a batchdir) found-rc)
+                              (= (len (read-file a (to-cstr a batchlist))) 0)
+                                (do
+                                  (test-cleanup a batchdir)
+                                  (test-found-nothing selectors))
+                              ; every selector must name something: with several, one
+                              ; that matched nothing would otherwise just drop out
+                              (test-unmatched-selector? (read-file a
+                                                                   (to-cstr a
+                                                                            batchlist))
+                                                        selectors)
+                                (do (test-cleanup a batchdir) 1)
+                              :else
+                                (let [(mut run) (StrBuf::new a)]
+                                  (m-shell-quoted! (mut run) self)
+                                  (push-str! (mut run) " test ")
+                                  (m-shell-quoted! (mut run) batchroot)
+                                  (for arg (load build-args)
+                                    (push-str! (mut run) " ")
+                                    (m-shell-quoted! (mut run) arg))
+                                  (push-str! (mut run) " --test-roots-file ")
+                                  (m-shell-quoted! (mut run) batchlist)
+                                  (push-str! (mut run) " --jobs ")
+                                  (push-str! (mut run) (i64->str a (load jobs)))
+                                  (when (load norun)
+                                    (push-str! (mut run) " --no-run")
+                                    0)
+                                  (push-str! (mut run) (str (load runner-args)))
+                                  (let [rc
+                                          (wait-code (primitive/cast i64
+                                                                     (system (to-cstr a
+                                                                                      (str (load run))))))]
+                                    (test-cleanup a batchdir)
+                                    (if (= rc 0)
+                                        (do
+                                          (ps (stdout)
+                                              "all test suites passed\n")
+                                          0)
+                                        (do
+                                          (ps (stderr)
+                                              "one or more test suites failed\n")
+                                          (if (= rc 123) 1 rc))))))))))))))
+
+;;; A project test run that found no test file. With path selectors that matched
+;;; nothing it is an error, like a `--filter` matching no test: a selector was
+;;; meant to pick something. A project with no test files at all is legitimate,
+;;; and says so rather than reporting suites that never ran as passed.
+(defn test-found-nothing [(selectors (ptr (ArrayList (slice u8))))] (-> i64)
+  (if (> (len (load selectors)) 0)
+      (do
+        (for selector (load selectors) (test-report-unmatched selector))
+        1)
+      (do
+        (ps (stdout) "no test files found; nothing to run\n")
+        0)))
+
+(defn test-report-unmatched [(selector (slice u8))] (-> void)
+  (ps (stderr) "error: no test file path contains '")
+  (ps (stderr) selector)
+  (ps (stderr) "'\n"))
+
+;;; Whether some selector matched none of the discovered files (`found` is the
+;;; NUL-separated list `find` wrote), reporting each such selector.
+(defn test-unmatched-selector? [(found (slice u8))
+                                (selectors (ptr (ArrayList (slice u8))))]
+  (-> bool)
+  (let [(mut missing) false]
+    (for selector (load selectors)
+      (when (none? (find found selector))
+        (test-report-unmatched selector)
+        (set! missing true)))
+    missing))
+
+(extern getpid :cc (cc/C) [] (-> i32))

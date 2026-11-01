@@ -1,0 +1,363 @@
+;;; Command-line scanning and the small process helpers every command shares.
+(module coil.compiler.cli_base)
+(import "coil.primitive" :as primitive)
+(import "coil.temp" :as temp)
+(import "coil.compiler.unit_state" :use *)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :as str :use * :exclude [parse-int])
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.pmap" :use *)
+(import "coil.io" :use *)
+(import "coil.os" :as os)
+(import "coil.control" :use *)
+(import "coil.try" :use *)
+(import "coil.compiler.env" :use *)
+(import "coil.compiler.ffi" :use *)
+(import "coil.compiler.guide" :use *)
+(import "coil.reader" :use *)
+(import "coil.project" :use *)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.parser" :use *)
+(import "coil.compiler.loader" :use *)
+(import "coil.compiler.resolve" :use *)
+(import "coil.compiler.check" :use *)
+(import "coil.compiler.mono" :use *)
+(import "coil.compiler.comptime" :use *)
+(import "coil.compiler.metaengine" :use *)
+(import "coil.compiler.expander" :use *)
+(import "coil.compiler.unit" :use *)
+(import "coil.compiler.jit" :use *)
+(import "coil.compiler.interp" :use *)
+(import "coil.compiler.wasm" :use *)
+(import "coil.compiler.codegen_wasm" :use *)
+(import "coil.cc" :as cc)
+
+; Child-process APIs return a raw wait(2) status, NOT an exit code. The low 7 bits hold the
+; terminating signal (0 when the child exited normally); the exit code sits in the
+; high byte. Reading only the high byte — (st/256)&255 — yields 0 for EVERY signal
+; death, so a child that segfaulted reported success. These two are the one place
+; that decodes a wait status; every call site goes through them.
+(defn wait-signal [(st i64)] (-> i64)
+  (unless (< st 0) (& st 127)))
+
+(defn wait-code [(st i64)] (-> i64)
+  (if (< st 0)
+      127  ; the spawn/wait itself failed
+      (let [sig (wait-signal st)]
+        (if (!= sig 0)
+            (primitive/iadd 128 sig)  ; killed by a signal: 128+signo, as a shell reports
+            (& (primitive/udiv st 256) 255)))))
+
+(defn signal-name [(sig i64)] (-> (slice u8))
+  (cond (= sig 2) "SIGINT"
+        (= sig 3) "SIGQUIT"
+        (= sig 4) "SIGILL"
+        (= sig 5) "SIGTRAP"
+        (= sig 6) "SIGABRT"
+        (= sig 8) "SIGFPE"
+        (= sig 9) "SIGKILL"
+        (= sig 10) "SIGBUS"
+        (= sig 11) "SIGSEGV"
+        (= sig 13) "SIGPIPE"
+        (= sig 15) "SIGTERM"
+        ""))
+
+; A signal death is otherwise invisible: the child prints nothing and the status is
+; just a number. Say it out loud, naming what died.
+(defn wait-report [(st i64) (what (slice u8))] (-> i64)
+  (let [sig (wait-signal st)]
+    (unless (= sig 0)
+      (let [w (stderr)
+            nm (signal-name sig)]
+        (ps w what)
+        (ps w " terminated by signal ")
+        (dump-dec w sig)
+        (unless (= (len nm) 0)
+          (ps w " (")
+          (ps w nm)
+          (ps w ")")
+          0)
+        (wb w 10)
+        0))))
+
+; Spawn one program with an already-separated argv and wait for it. Unlike
+; `system`, this never invokes a shell: spaces, quotes and metacharacters in paths
+; are ordinary argument bytes, and a link flag cannot become a shell program.
+(defn spawn-wait [(a (dyn Allocator)) (args (ArrayList (slice u8)))] (-> i64)
+  (wait-spawned (spawn-args a args)))
+
+;;; Start `args` (argv[0] looked up on PATH); its pid, or a negative value.
+(defn spawn-args [(a (dyn Allocator)) (args (ArrayList (slice u8)))] (-> i64)
+  (let [n (len args)
+        (mut ptrs) (ArrayList::new [(ptr i8)] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (push! (mut ptrs) (to-cstr a (get args (load i))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (push! (mut ptrs) (primitive/cast (ptr i8) 0))
+    (let [av (load (field ptrs data))]
+      (os/spawn (load av) av (os/spawn-envp)))))
+
+;;; The wait status of the process `pid` from `spawn-args`, or -1.
+(defn wait-spawned [(pid i64)] (-> i64)
+  (if (< pid 0)
+      -1
+      (let [(mut stp) (: 0 i32)]
+        (if (< (os/waitpid (primitive/cast i32 pid) (mut stp) 0)
+               (: 0 i32))
+            -1
+            (primitive/cast i64 stp)))))
+
+(defn sanitizer-flag? [(arg (slice u8))] (-> bool)
+  (or (= arg "--sanitize=address")
+      (= arg "--sanitize=thread")
+      (= arg "--sanitize=memory")
+      (= arg "--sanitize=undefined")))
+
+;;; `--jit=llvm` or `--jit=tpde`: which implementation of `coil.jit` the program
+;;; links. Any other `--jit=` value is reported by apply-jit-flag!.
+(defn jit-flag? [(arg (slice u8))] (-> bool)
+  (starts-with arg "--jit="))
+
+; `-O0`/`-O1`/`-O2`/`-O3` — the LLVM optimization level, default 3. The cell itself
+; lives in metaengine.coil (which the metaprogram dylib cache key needs and which
+; both this module and main.coil import); only the CLI spelling is here.
+(defn opt-flag? [(arg (slice u8))] (-> bool)
+  (or (= arg "-O0") (= arg "-O1") (= arg "-O2") (= arg "-O3")))
+
+; `--meta-opt=<0|1|2|3>` — the same knob for metaprogram objects only. Unset, they
+; follow -O. A bad level is a usage error, not a silent default.
+(defn meta-opt-flag? [(arg (slice u8))] (-> bool)
+  (starts-with arg "--meta-opt="))
+
+; Reader/runtime arguments remain in argv, but cannot configure the compiler.
+(defn argv-option-count [(argc i32) (argv (ptr (ptr i8)))] (-> i32)
+  (let [(mut i) 2]
+    (loop (if (>= (load i) (primitive/cast i64 argc)) (break) 0)
+      (let [arg (from-cstr (load (index argv (load i))))]
+        (when (= arg "--") (break))
+        (set! i (+ (load i) (if (flag-takes-value? arg) 2 1)))))
+    (primitive/cast i32
+                    (if (> (load i) (primitive/cast i64 argc))
+                        (primitive/cast i64 argc)
+                        (load i)))))
+
+(defn argv-has-flag? [(argc i32) (argv (ptr (ptr i8))) (want (slice u8))]
+  (-> bool)
+  (let [option-count (argv-option-count argc argv)
+        (mut i) 2
+        (mut found) false]
+    (loop (if (or (load found) (>= (load i) (primitive/cast i64 option-count)))
+              (break)
+              (do
+                (when (= (from-cstr (load (index argv (load i))))
+                         want)
+                  (set! found true)
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
+(defn dash-l? [(arg (slice u8))] (-> bool)  ; -l<lib>
+  (and (>= (len arg) 2)
+       (and (= (get arg 0) (: 45 u8))
+            (= (get arg 1) (: 108 u8)))))  ; 'l'
+
+; flags that consume the NEXT argv entry — the scanner must step over both.
+(defn flag-takes-value? [(arg (slice u8))] (-> bool)
+  (cond (= arg "-o") true
+        (= arg "--profile") true
+        (= arg "--link-flag") true
+        (= arg "--runtime-link-flag") true
+        (= arg "--dep-package") true
+        (= arg "--dep-name") true
+        (= arg "--dep-requires") true
+        (= arg "--dep-link") true
+        (= arg "--dep-native-pkg") true
+        (= arg "--dep-native-command") true
+        (= arg "--target") true
+        (= arg "--use") true
+        (= arg "--lint-param") true
+        (= arg "--reader-artifact") true
+        (= arg "--unit") true
+        (= arg "--emit-header") true
+        (= arg "--backend") true
+        (= arg "--test-roots-file") true
+        (= arg "--run-in") true
+        (= arg "--trace-macro") true
+        (= arg "--macro-expansion-limit") true
+        false))
+
+(defn flag-known? [(arg (slice u8))] (-> bool)
+  (cond (flag-takes-value? arg) true
+        (dash-l? arg) true
+        (= arg "--lib") true
+        (= arg "--shared") true
+        (= arg "--release") true
+        (= arg "-g") true
+        (= arg "--debug") true
+        (= arg "-g0") true
+        (= arg "--no-debug") true
+        (= arg "--no-dsym") true
+        (= arg "--debug-checks") true
+        (= arg "--debug-runtime") true
+        (sanitizer-flag? arg) true
+        (jit-flag? arg) true
+        (opt-flag? arg) true
+        (meta-opt-flag? arg) true
+        (= arg "--wasm-side-module") true
+        (= arg "--quiet") true
+        (= arg "--timings") true
+        (= arg "--trace-macros") true
+        (starts-with arg "--wasm-stack-size=") true
+        false))
+
+; ── temporary files ──────────────────────────────────────────────────────────
+; Every temporary the compiler makes comes from coil.temp: a name in this process's
+; directory, or a name beside a destination for writing whole and renaming into
+; place. Both are removed at exit, and a later compile sweeps any left by a process
+; that was killed, so a call site only removes early what it is finished with.
+
+;;; A fresh path in this process's temporary directory ending in `name`.
+(defn temp-or-exit [(name (slice u8))] (-> (slice u8))
+  (match (temp/path name)
+    (Ok [p] p)
+    (Err [e] (do (temp-fail e) ""))))
+
+;;; A fresh path beside `dest`, for writing it whole and renaming it to `dest`.
+(defn temp-sibling-or-exit [(dest (slice u8))] (-> (slice u8))
+  (match (temp/sibling dest)
+    (Ok [p] p)
+    (Err [e] (do (temp-fail e) ""))))
+
+(defn temp-fail [(e temp/TempError)] (-> i64)
+  (ps (stderr) "error: ")
+  (ps (stderr) (text e))
+  (match e
+    (temp/TempUnavailable [_ code]
+                          (when (> code 0)
+                            (ps (stderr) " (errno ")
+                            (ps (stderr) (i64->str (malloc-allocator) code))
+                            (ps (stderr) ")")
+                            0)))
+  (ps (stderr) "\n")
+  (exit 1)
+  0)
+
+; Apple ld can link the single self-contained Mach-O object emitted by the ARM
+; backend directly. Avoiding the clang driver saves a process and its toolchain
+; discovery, but only use this when a valid SDK is already discoverable without
+; spawning xcrun; all complex/library/cross links retain the driver path.
+(defn darwin-direct-sdk [(a (dyn Allocator))] (-> (slice u8))
+  (let [envp (unit-getenv c"SDKROOT")
+        env (if (= (primitive/cast i64 envp) 0) "" (from-cstr envp))
+        devp (unit-getenv c"DEVELOPER_DIR")
+        dev (if (= (primitive/cast i64 devp) 0) "" (from-cstr devp))
+        from-dev
+          (if (> (len dev) 0)
+              (sconcat a
+                       dev
+                       "/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
+              "")
+        xcode
+          "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+        clt "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"]
+    (cond (and (> (len env) 0) (= (access (to-cstr a env) 0) 0)) env
+          (and (> (len from-dev) 0) (= (access (to-cstr a from-dev) 0) 0))
+            from-dev
+          (= (access (to-cstr a xcode) 0) 0) xcode
+          (= (access (to-cstr a clt) 0) 0) clt
+          :else "")))
+
+;;; The macOS SDK for a clang this compiler located itself (a sanitizer link, `coil
+;;; fuzz`, a manifest's [cc] sources); "" off macOS or when there is none. It goes
+;;; ahead of the caller's own flags, so an `-isysroot` there still wins: clang keeps
+;;; the last one. Such a clang's own default cannot be relied on. Homebrew's LLVM
+;;; carries a config file per macOS release naming that release's CommandLineTools
+;;; SDK, and on a macOS newer than every installed SDK it names a directory that
+;;; does not exist. `cc` finds its SDK through xcrun and never had the problem.
+(defn found-clang-sysroot [(a (dyn Allocator))] (-> (slice u8))
+  (if (me-host-linux?) "" (darwin-direct-sdk a)))
+
+;;; Run a native provider's shell command CMD and split all it prints into
+;;; arguments, as an unquoted `$(CMD)` would. The whole command is captured -- a
+;;; `a; b` sequence or an `a && b` chain, not only its last command -- and a
+;;; provider that fails stops the build with `error: FAILURE`: inside `$(…)` on a
+;;; command line its exit status was lost and the build linked without it.
+(defn native-provider-output [(a (dyn Allocator))
+                              (cmd (slice u8))
+                              (failure (slice u8))]
+  (-> (ptr (ArrayList (slice u8))))
+  (let [tmp (temp-or-exit "native-provider")
+        (mut full) (StrBuf::new a)]
+    ; A subshell on lines of its own: the redirection covers every command, and a
+    ; trailing comment in CMD cannot swallow it.
+    (push-str! (mut full) "(\n")
+    (push-str! (mut full) cmd)
+    (push-str! (mut full) "\n) > ")
+    (m-shell-quoted! (mut full) tmp)
+    (let [rc
+            (wait-code (primitive/cast i64
+                                       (system (to-cstr a (str (load full))))))
+          text (read-file a (to-cstr a tmp))]
+      (unlink (to-cstr a tmp))
+      (when (!= rc 0)
+        (ps (stderr) "error: ")
+        (ps (stderr) failure)
+        (wb (stderr) 10)
+        (exit 1)
+        0)
+      (let [out (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+            n (len text)
+            (mut start) 0]
+        (for [i 0 (+ n 1)]
+          (let [space
+                  (or (= i n)
+                      (let [c (primitive/cast i64 (get text i))]
+                        (or (= c 32) (= c 9) (= c 10) (= c 13))))]
+            (when space
+              (when (> i (load start))
+                (push! out (subslice [u8] text (load start) i))
+                0)
+              (set! start (+ i 1))
+              0))
+          0)
+        out))))
+
+;;; The provider command for a pkg-config package's linker arguments: its
+;;; libraries, then its search paths and other flags.
+(defn pkg-config-libs-command [(a (dyn Allocator)) (package (slice u8))]
+  (-> (slice u8))
+  (let [(mut cmd) (StrBuf::new a)]
+    (push-str! (mut cmd) "pkg-config --libs-only-l ")
+    (m-shell-quoted! (mut cmd) package)
+    (push-str! (mut cmd) " && pkg-config --libs-only-L --libs-only-other ")
+    (m-shell-quoted! (mut cmd) package)
+    (str (load cmd))))
+
+;;; The name a build of source file `file` writes when no `-o` names one: its
+;;; basename, less the conventional `.coil` (other dotted names stay verbatim).
+(defn source-output-stem [(file (slice u8))] (-> (slice u8))
+  (let [base (basename file)
+        n (len base)]
+    (if (and (>= n 5) (= (subslice [u8] base (- n 5) n) ".coil"))
+        (subslice [u8] base 0 (- n 5))
+        base)))
+
+;;; Append S to a shell command as one single-quoted word. A `'` cannot occur
+;;; inside single quotes, so it closes the quote, adds an escaped quote and
+;;; reopens it.
+(defn m-shell-quoted! [(b (mut StrBuf)) (s (slice u8))] (-> i64)
+  (push-str! (mut b) "'")
+  (for c s
+    (if (= c (: 39 u8))
+        (push-str! (mut b) "'\\''")
+        (push! (mut b) c)))
+  (push-str! (mut b) "'")
+  0)
+
+(extern access :cc (cc/C) [(ptr i8) i32] (-> i32))

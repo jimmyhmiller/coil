@@ -1,0 +1,3086 @@
+;;; Applying a project's manifest: dependencies, workspace members, profiles and what a command forwards to its children.
+(module coil.compiler.cli_project)
+(import "coil.primitive" :as primitive)
+(import "coil.temp" :as temp)
+(import "coil.compiler.unit_state" :use *)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :as str :use * :exclude [parse-int])
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.pmap" :use *)
+(import "coil.io" :use *)
+(import "coil.fs" :as fs)
+(import "coil.control" :use *)
+(import "coil.try" :use *)
+(import "coil.compiler.env" :use *)
+(import "coil.compiler.ffi" :use *)
+(import "coil.compiler.guide" :use *)
+(import "coil.reader" :use *)
+(import "coil.project" :use *)
+(import "coil.source.cli"
+        :use
+        [d-write-file d-rewrite-file read-stdin-all write-stdout-all is-flag?
+         count-substr])
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.astdump" :use *)
+(import "coil.compiler.parser" :use *)
+(import "coil.compiler.loader" :use *)
+(import "coil.compiler.cimport" :as ci)
+(import "coil.compiler.resolve" :use *)
+(import "coil.compiler.check" :use *)
+(import "coil.compiler.mono" :use *)
+(import "coil.compiler.phase_split" :use *)
+(import "coil.compiler.diag" :use *)
+(import "coil.compiler.trace" :as tr)
+(import "coil.compiler.comptime" :use *)
+(import "coil.compiler.closure" :use *)
+(import "coil.compiler.metaengine" :use *)
+(import "coil.compiler.expander" :use *)
+(import "coil.compiler.unit" :use *)
+(import "coil.compiler.artifact_identity" :as artifact-id)
+(import "coil.compiler.native_module" :use *)
+(import "coil.compiler.jit" :use *)
+(import "coil.compiler.interp" :use *)
+(import "coil.compiler.wasm" :use *)
+(import "coil.compiler.codegen_wasm" :use *)
+(import "coil.cc" :as cc)
+(import "coil.compiler.cli_base" :use *)
+
+;;; Make the directory PATH and every missing ancestor. 0 when PATH exists
+;;; afterwards, 1 when it could not be made. The walk stops at the current
+;;; directory and the root, the only ancestors `dirname` ends at; a one-byte
+;;; name such as `z` is an ordinary directory to make.
+(defn unit-mkdirs! [(a (dyn Allocator)) (path (slice u8))] (-> i64)
+  (if (or (= (len path) 0)
+          (= path ".")
+          (= path "/")
+          (= (access (to-cstr a path) 0) (: 0 i32)))
+      0
+      (do
+        (unit-mkdirs! a (dirname path))
+        (fs/make-dir (to-cstr a path) 493)
+        (if (= (access (to-cstr a path) 0) (: 0 i32)) 0 1))))
+
+(extern setenv :cc (cc/C) [(ptr i8) (ptr i8) i32] (-> i32))
+
+; `coil test`'s own value-taking flags. Deliberately NOT folded into
+; flag-takes-value?: that table is the BUILD flag set, and teaching it --suite/--jobs
+; would make both silently legal on `coil build`. Without this, `coil test --suite
+; integration` would read `integration` as the file positional.
+(defn test-flag-takes-value? [(arg (slice u8))] (-> bool)
+  (or (= arg "--suite")
+      (= arg "--test-roots-file")
+      (test-runner-flag? arg)
+      (flag-takes-value? arg)))
+
+;;; push-found-clang-sysroot! for a clang command line built as shell text.
+(defn push-found-clang-sysroot-str! [(a (dyn Allocator)) (b (mut StrBuf))]
+  (-> i64)
+  (let [sdk (found-clang-sysroot a)]
+    (when (> (len sdk) 0)
+      (push-str! (mut b) " -isysroot ")
+      (m-shell-quoted! (mut b) sdk)
+      0)
+    0))
+
+;;; A manifest native dependency's linker arguments, from running its provider.
+(defn manifest-native-link-tokens [(a (dyn Allocator))
+                                   (d (ptr ManifestNativeDep))]
+  (-> (ptr (ArrayList (slice u8))))
+  (if (> (len (.pkg d)) 0)
+      (native-provider-output a
+                              (pkg-config-libs-command a (.pkg d))
+                              (sconcat3 a
+                                        "native dependency '"
+                                        (.name d)
+                                        "' was not found by pkg-config"))
+      (native-provider-output a
+                              (.flags-command d)
+                              (sconcat3 a
+                                        "native dependency '"
+                                        (.name d)
+                                        "' flags-command failed"))))
+
+;;; `--jit=NAME` for the manifest's choice; it has one (`(.jit m)` is not "").
+(defn m-jit-flag [(a (dyn Allocator)) (m (ptr Manifest))] (-> (slice u8))
+  (cat3-d a "--jit=" (.jit m)))
+
+;;; Append ` --jit=NAME` to a child compile's command line when the manifest chose.
+;;; A command line that forwards the user's flags puts them after this, so the
+;;; user's `--jit=` wins.
+(defn m-push-jit-flag! [(a (dyn Allocator)) (b (mut StrBuf)) (m (ptr Manifest))]
+  (-> i64)
+  (when (> (len (.jit m)) 0)
+    (push-str! (mut b) " ")
+    (push-str! (mut b) (m-jit-flag a m))
+    0)
+  0)
+
+;;; The profile a command selects: `--profile NAME`, else `debug` for `--debug` or
+;;; `-g`, else `release` for `--release`, else `debug` when [build] says `debug =
+;;; true`, else `release`.
+(defn m-profile-name [(a (dyn Allocator))
+                      (argc i32)
+                      (argv (ptr (ptr i8)))
+                      (m (ptr Manifest))] (-> (slice u8))
+  (let [(mut named) ""
+        (mut i) 2]
+    (while (< i (primitive/cast i64 argc))
+      (let [arg (from-cstr (load (index argv i)))]
+        (cond (= arg "--") (set! i (primitive/cast i64 argc))
+              (and (= arg "--profile") (< (+ i 1) (primitive/cast i64 argc)))
+                (do
+                  (set! named (from-cstr (load (index argv (+ i 1)))))
+                  (set! i (+ i 2)))
+              :else (set! i (+ i 1)))))
+    (cond (> (len named) 0) named
+          (or (argv-has-flag? argc argv "-g")
+              (argv-has-flag? argc argv "--debug"))
+            "debug"
+          (argv-has-flag? argc argv "--release") "release"
+          (.debug m) "debug"
+          :else "release")))
+
+;;; Apply the profile this command selects to `m`, once.
+(defn m-select-profile! [(a (dyn Allocator))
+                         (argc i32)
+                         (argv (ptr (ptr i8)))
+                         (m (ptr Manifest))] (-> i64)
+  (unless (.profile-applied m)
+    (m-apply-profile! a m (m-profile-name a argc argv m))
+    (set! (.profile-applied m) true)
+    0)
+  0)
+
+;;; Apply profile `name` to `m`: its inherited settings first, its own over them.
+;;; [build] optimization is where every profile starts.
+(defn m-apply-profile! [(a (dyn Allocator))
+                        (m (ptr Manifest))
+                        (name (slice u8))] (-> i64)
+  (let [chain (m-profile-chain a m name)
+        (mut debug) false
+        (mut checks) false
+        (mut jit) (.jit m)
+        (mut opt) (.optimization m)]
+    ; built-in roots: `debug` turns on DWARF, `release` sets nothing
+    (when (= (get (load chain) (- (len (load chain)) 1)) "debug")
+      (set! debug true))
+    (let [(mut k) (- (len (load chain)) 1)]
+      (while (>= k 0)
+        (let [p (m-find-profile m (get (load chain) k))]
+          (unless (= (primitive/cast i64 p) 0)
+            (when (> (len (.optimization p)) 0) (set! opt (.optimization p)))
+            (when (>= (.debug p) 0) (set! debug (= (.debug p) 1)))
+            (when (>= (.debug-checks p) 0)
+              (set! checks (= (.debug-checks p) 1)))
+            (when (> (len (.jit p)) 0) (set! jit (.jit p)))
+            (for [u 0 (len (load (.uses p)))]
+              (push! (load (field m metaprograms)) (get (load (.uses p)) u))
+              0)
+            0))
+        (set! k (- k 1))))
+    (set! (.optimization m) opt)
+    (set! (.debug m) debug)
+    (set! (.debug-checks m) checks)
+    (set! (.jit m) jit)
+    (set! (.profile m) name)
+    0))
+
+;;; `name` and the profiles it inherits from, leaf first, ending at the built-in
+;;; `release` or `debug` it starts from.
+(defn m-profile-chain [(a (dyn Allocator)) (m (ptr Manifest)) (name (slice u8))]
+  (-> (ptr (ArrayList (slice u8))))
+  (let [out (m-new-strings a)
+        (mut at) name]
+    (loop (when (> (len (load out)) (+ (len (load (field m profiles))) 2))
+            (m-err a
+                   (.line (m-find-profile m name))
+                   (cat3-d a
+                           "profile '"
+                           (cat3-d a name "' inherits from itself")))
+            (break))
+      (push! out at)
+      (let [p (m-find-profile m at)]
+        (cond (and (= (primitive/cast i64 p) 0)
+                   (or (= at "release") (= at "debug")))
+                (break)
+              (= (primitive/cast i64 p) 0)
+                (do (m-unknown-profile! a m at) (break))
+              (> (len (.inherits p)) 0) (set! at (.inherits p))
+              ; a profile that names no other starts from release, or is the
+              ; built-in it shares a name with
+              (or (= at "release") (= at "debug")) (break)
+              :else (do (push! out "release") (break)))))
+    out))
+
+(defn m-unknown-profile! [(a (dyn Allocator))
+                          (m (ptr Manifest))
+                          (name (slice u8))] (-> i64)
+  (let [(mut msg)
+          (cat3-d a
+                  "unknown profile '"
+                  (cat3-d a name "'; the profiles are release, debug"))]
+    (for [i 0 (len (load (field m profiles)))]
+      (let [n (.name (get (load (field m profiles)) i))]
+        (unless (or (= n "release") (= n "debug"))
+          (set! msg (cat3-d a (load msg) (cat3-d a ", " n)))
+          0))
+      0)
+    (m-error a (load msg))))
+
+; A newline-delimited environment encoding for namespace lists. Namespace names
+; cannot contain newlines, and unlike ':' this remains unambiguous on every host.
+(defn m-name-list-env [(a (dyn Allocator)) (xs (ptr (ArrayList (slice u8))))]
+  (-> (slice u8))
+  (let [(mut out) (StrBuf::new a)
+        n (len (load xs))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (when (> (load i) 0)
+                  (push! (mut out) (: 10 u8))
+                  0)
+                (push-str! (mut out) (get (load xs) (load i)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (str (load out))))
+
+(defn m-contained-path? [(a (dyn Allocator))
+                         (root (slice u8))
+                         (path (slice u8))] (-> bool)
+  (or (= root path) (starts-with path (sconcat a root "/"))))
+
+; Resolve a moving Git selector before choosing a cache directory. The checkout
+; is still immutable and shared by the concrete commit; a later invocation of a
+; branch may resolve to a different cache entry without mutating the old one.
+(defn m-resolve-git-selector! [(a (dyn Allocator)) (d (mut ManifestDep))]
+  (-> i64)
+  (when (= (len (.sha d)) 0)
+    (let [tmp
+            (cat3-d a
+                    ".coil/deps/.resolve-"
+                    (cat3-d a
+                            (i64->str a (hash (.git d)))
+                            (cat3-d a "-" (.name d))))
+          (mut cmd) (StrBuf::new a)]
+      (push-str! (mut cmd) "mkdir -p '.coil/deps' && git ls-remote ")
+      (m-shell-quoted! (mut cmd) (.git d))
+      (if (> (len (.tag d)) 0)
+          (do
+            (push-str! (mut cmd) " ")
+            (m-shell-quoted! (mut cmd) (cat3-d a "refs/tags/" (.tag d)))
+            (push-str! (mut cmd) " ")
+            (m-shell-quoted! (mut cmd)
+                             (cat3-d a "refs/tags/" (cat3-d a (.tag d) "^{}")))
+            (push-str! (mut cmd) " | tail -n 1 | awk '{print $1}' > "))
+          (do
+            (push-str! (mut cmd) " ")
+            (m-shell-quoted! (mut cmd) (cat3-d a "refs/heads/" (.branch d)))
+            (push-str! (mut cmd) " | awk '{print $1}' > ")))
+      (m-shell-quoted! (mut cmd) tmp)
+      (let [rc
+              (wait-code (primitive/cast i64
+                                         (system (to-cstr a
+                                                          (str (load cmd))))))
+            resolved (m-trim (read-file a (to-cstr a tmp)))]
+        (unlink (to-cstr a tmp))
+        (when (or (!= rc 0) (not (m-sha? resolved)))
+          (m-err a
+                 (.line d)
+                 (cat3-d a
+                         "could not resolve git dependency repository '"
+                         (cat3-d a
+                                 (.git d)
+                                 (if (> (len (.tag d)) 0)
+                                     (cat3-d a
+                                             "' tag '"
+                                             (cat3-d a (.tag d) "'"))
+                                     (cat3-d a
+                                             "' branch '"
+                                             (cat3-d a (.branch d) "'"))))))
+          0)
+        (set! (.sha d) resolved))))
+  0)
+
+; How a manifest error names a dependency: its Git repository and selected
+; subdirectory when it has one, otherwise its manifest-local name.
+(defn m-dep-desc [(a (dyn Allocator))
+                  (name (slice u8))
+                  (git (slice u8))
+                  (subdir (slice u8))] (-> (slice u8))
+  (if (> (len subdir) 0)
+      (cat3-d a
+              "git dependency repository '"
+              (cat3-d a
+                      git
+                      (cat3-d a
+                              "' selected subdirectory '"
+                              (cat3-d a subdir "'"))))
+      (cat3-d a "dependency '" (cat3-d a name "'"))))
+
+; Whether the package at RESOLVED is already part of this build: the project
+; itself, or a dependency before index I that resolved to the same directory.
+; A package reached twice -- a diamond, or a cycle back through a dependency --
+; is composed once, so its roots never enter the namespace index twice.
+(defn m-dep-composed? [(a (dyn Allocator))
+                       (deps (ptr (ArrayList ManifestDep)))
+                       (i i64)
+                       (resolved (slice u8))] (-> bool)
+  (let [(mut seen)
+          (match (m-realpath a ".")
+            (Some [p] (= p resolved))
+            (None [] false))]
+    (for [j 0 i]
+      (when (= (.resolved (elem deps j)) resolved)
+        (set! seen true)
+        0)
+      0)
+    (load seen)))
+
+; Append one dependency package's inputs to its own link record. A non-empty
+; `root` anchors each (relative) path at the dependency package.
+(defn m-compose-dep-inputs! [(a (dyn Allocator))
+                             (src (ptr (ArrayList (slice u8))))
+                             (dst (ptr (ArrayList (slice u8))))
+                             (root (slice u8))] (-> i64)
+  (for [i 0 (len (load src))]
+    (push! dst
+           (if (= (len root) 0)
+               (get (load src) i)
+               (path-join a root (get (load src) i))))
+    0)
+  0)
+
+; The dependency package composed from `root`, or 0 when none is. A package
+; reached twice -- a diamond, or a cycle -- keeps the id of its first composition.
+(defn m-dep-package-id [(m (ptr Manifest)) (root (slice u8))] (-> i64)
+  (let [pkgs (load (field m dep-packages))
+        (mut id) 0]
+    (for [i 0 (len pkgs)]
+      (let [p (get (load pkgs) i)]
+        (when (and (= (load id) 0) (= (.root p) root)) (set! id (.id p)) 0))
+      0)
+    (load id)))
+
+(defn m-new-dep-package! [(a (dyn Allocator))
+                          (m (ptr Manifest))
+                          (name (slice u8))
+                          (root (slice u8))
+                          (roots (ptr (ArrayList (slice u8))))]
+  (-> (ptr ManifestDepPackage))
+  (let [pkgs (load (field m dep-packages))
+        p (box! a ManifestDepPackage (zeroed ManifestDepPackage))]
+    (set! (.id p) (+ (len pkgs) 1))
+    (set! (.name p) name)
+    (set! (.root p) root)
+    (set! (.roots p) roots)
+    (set! (.link p) (m-new-link-set a))
+    (set! (.requires p) (box! a (ArrayList i64) (ArrayList::new [i64] a)))
+    (push! [(ptr ManifestDepPackage)] pkgs p)
+    p))
+
+; Record that package `owner` depends on package `id`. Root-declared dependencies
+; (owner 0), self-edges and repeats are not edges.
+(defn m-dep-package-requires! [(a (dyn Allocator))
+                               (m (ptr Manifest))
+                               (owner i64)
+                               (id i64)] (-> i64)
+  (when (and (> owner 0) (and (> id 0) (!= owner id)))
+    (let [pkgs (load (field m dep-packages))]
+      (for [i 0 (len pkgs)]
+        (let [p (get (load pkgs) i)]
+          (when (= (.id p) owner)
+            (let [(mut seen) false]
+              (for [j 0 (len (load (.requires p)))]
+                (when (= (get (load (.requires p)) j) id) (set! seen true) 0)
+                0)
+              (unless (load seen) (push! (.requires p) id) 0))
+            0))
+        0))
+    0)
+  0)
+
+; Read a dependency as a package, not as an accidental namespace directory: any
+; dependency whose directory holds a Coil.toml -- a path dependency, a Git
+; checkout, or a selected subdirectory. Its effective source roots and
+; exclusions are made absolute so the root project can consume them without
+; changing cwd, and its own dependencies, native requirements, C inputs and
+; link inputs compose into the root build.
+(defn m-load-dep-package! [(a (dyn Allocator))
+                           (m (ptr Manifest))
+                           (d (mut ManifestDep))] (-> i64)
+  (let [root (.resolved d)
+        manifest-path (path-join a root "Coil.toml")]
+    (when (!= (primitive/cast i64 (access (to-cstr a manifest-path) 0)) 0)
+      (m-err a
+             (.line d)
+             (cat3-d a
+                     (m-dep-desc a (.name d) (.git d) (.subdir d))
+                     " has no Coil.toml"))
+      0)
+    (let [dm (parse-manifest a (read-file a (to-cstr a manifest-path)))
+          _pointer
+            (when (> (len (.project-path dm)) 0)
+              (m-err a
+                     (.line d)
+                     (cat3-d a
+                             (m-dep-desc a (.name d) (.git d) (.subdir d))
+                             (cat3-d a
+                                     " is a [project] pointer, not a package: depend on '"
+                                     (cat3-d a
+                                             (path-join a
+                                                        root
+                                                        (.project-path dm))
+                                             "'"))))
+              0)
+          roots (m-effective-roots a dm root)]
+      (for [i 0 (len roots)]
+        (let [candidate (path-join a root (get roots i))]
+          (when (= (primitive/cast i64 (access (to-cstr a candidate) 0)) 0)
+            (match (m-realpath a candidate)
+              (Some [p]
+                    (if (m-contained-path? a root p)
+                        (push! (.roots d) p)
+                        (m-err a
+                               (.line d)
+                               (cat3-d a
+                                       (m-dep-desc a
+                                                   (.name d)
+                                                   (.git d)
+                                                   (.subdir d))
+                                       " declares a source root outside the package"))))
+              (None [] 0))
+            0))
+        0)
+      ; A package with no source-root directory (no src/ or tests/ and no declared
+      ; roots) keeps its modules at its top level: the package directory is its
+      ; root, exactly as for a dependency without a manifest.
+      (when (= (len (load (.roots d))) 0)
+        (push! (.roots d) root)
+        0)
+      (let [xs (load (field dm exclude))]
+        (for [i 0 (len xs)]
+          (push! (.excludes d) (path-join a root (get xs i)))
+          0))
+      ; Explicit module mappings are part of the dependency package boundary.
+      ; Reader mappings name namespaces rather than paths and are copied as-is.
+      (let [maps (load (field dm modules))]
+        (for [i 0 (len maps)]
+          (let [x (elem maps i)]
+            (m-add-mapping! a
+                            (load (field m modules))
+                            "modules"
+                            (.key x)
+                            (path-join a root (.value x))
+                            (.line x)))
+          0))
+      (let [maps (load (field dm readers))]
+        (for [i 0 (len maps)]
+          (let [x (elem maps i)]
+            (m-add-mapping! a
+                            (load (field m readers))
+                            "readers"
+                            (.key x)
+                            (.value x)
+                            (.line x)))
+          0))
+      ; This package's own link contribution, recorded under its own id. Inputs
+      ; whose meaning is filesystem-relative are anchored at the selected package.
+      (let [pkg (m-new-dep-package! a m (.name d) root (.roots d))
+            native (load (field dm native-deps))
+            link (.link pkg)]
+        (m-dep-package-requires! a m (.owner d) (.id pkg))
+        ; Compose transitive Coil dependencies. Relative path dependencies belong
+        ; to the selected package, so make them absolute before the root resolver
+        ; processes the newly appended records. Each one is owned by this package,
+        ; so loading this package's code also brings what it depends on.
+        (let [nested (load (field dm deps))]
+          (for [i 0 (len (load nested))]
+            (let [(mut nd) (get (load nested) i)]
+              (when (> (len (.path nd)) 0)
+                (set! (.path nd) (path-join a root (.path nd)))
+                0)
+              (set! (.owner nd) (.id pkg))
+              (push! (load (field m deps)) (load nd)))
+            0))
+        (for [i 0 (len (load native))]
+          (let [(mut x) (get (load native) i)]
+            (when (> (len (.flags-command x)) 0)
+              (set! (.flags-command x) (path-join a root (.flags-command x)))
+              0)
+            (push! (.native-deps link) (load x)))
+          0)
+        (m-compose-dep-inputs! a
+                               (load (field dm frameworks))
+                               (.frameworks link)
+                               "")
+        (m-compose-dep-inputs! a (load (field dm libs)) (.libs link) "")
+        (m-compose-dep-inputs! a (load (field dm flags)) (.flags link) "")
+        (m-compose-dep-inputs! a
+                               (load (field dm search-paths))
+                               (.search-paths link)
+                               root)
+        (m-compose-dep-inputs! a (load (field dm objects)) (.objects link) root)
+        (m-compose-dep-inputs! a (load (field dm sources)) (.sources link) root)
+        (m-compose-dep-inputs! a
+                               (load (field dm include-dirs))
+                               (.include-dirs link)
+                               root)
+        (m-compose-dep-inputs! a (load (field dm ccflags)) (.ccflags link) "")
+        0)
+      0)))
+
+; Resolve path dependencies and materialize immutable Git checkouts. Cache
+; identity is repository + SHA, independent of dependency alias and subdirectory.
+;;; A workspace member depends on what its workspace declares as well as on what
+;;; it declares itself, as it compiles inside the workspace. Add the enclosing
+;;; workspace's [dependencies] to a member's manifest, a path resolved from the
+;;; workspace root; a dependency the member names itself is the member's own.
+(defn m-absorb-workspace-deps! [(a (dyn Allocator)) (m (ptr Manifest))] (-> i64)
+  (unless (m-workspace? m)
+    (match (enclosing-workspace-root a)
+      (Some [root]
+            (let [ws
+                    (parse-manifest a
+                                    (read-file a
+                                               (to-cstr a
+                                                        (path-join a
+                                                                   root
+                                                                   "Coil.toml"))))
+                  wdeps (load (field ws deps))
+                  deps (load (field m deps))]
+              (for [i 0 (len (load wdeps))]
+                (let [(mut d) (get (load wdeps) i)]
+                  (unless (block :declared
+                            (for [j 0 (len (load deps))]
+                              (when (= (.name (get (load deps) j)) (.name d))
+                                (break :declared true)))
+                            false)
+                    (when (> (len (.path d)) 0)
+                      (set! (.path d) (path-join a root (.path d)))
+                      0)
+                    (push! deps (load d))
+                    0)))
+              0))
+      (None [] 0)))
+  0)
+
+(defn m-prepare-deps [(a (dyn Allocator)) (m (ptr Manifest))] (-> i64)
+  (m-absorb-workspace-deps! a m)
+  (let [deps (load (field m deps))
+        (mut i) 0]
+    (loop (if (or (>= (load i) (len (load deps))) (manifest-failed?))
+              (break)
+              (let [(mut d) (get (load deps) (load i))]
+                (when (> (len (.git d)) 0)
+                  (m-resolve-git-selector! a (mut d))
+                  0)
+                (when (manifest-failed?) (break))
+                (if (> (len (.path d)) 0)
+                    (match (m-realpath a (.path d))
+                      (Some [p]
+                            (do (set! (.checkout d) p) (set! (.resolved d) p) 0))
+                      (None []
+                            (m-err a
+                                   (.line d)
+                                   (cat3-d a
+                                           "dependency '"
+                                           (cat3-d a
+                                                   (.name d)
+                                                   "' path does not exist")))))
+                    (let [cache
+                            (cat3-d a
+                                    ".coil/deps/"
+                                    (cat3-d a
+                                            (i64->str a (hash (.git d)))
+                                            (cat3-d a "-" (.sha d))))
+                          (mut cmd) (StrBuf::new a)]
+                      (push-str! (mut cmd)
+                                 "mkdir -p '.coil/deps' && if [ -d ")
+                      (m-shell-quoted! (mut cmd) (cat3-d a cache "/.git"))
+                      (push-str! (mut cmd) " ]; then test \"$(git -C ")
+                      (m-shell-quoted! (mut cmd) cache)
+                      (push-str! (mut cmd) " remote get-url origin)\" = ")
+                      (m-shell-quoted! (mut cmd) (.git d))
+                      (push-str! (mut cmd) " && if [ \"$(git -C ")
+                      (m-shell-quoted! (mut cmd) cache)
+                      (push-str! (mut cmd) " rev-parse HEAD)\" != ")
+                      (m-shell-quoted! (mut cmd) (.sha d))
+                      (push-str! (mut cmd) " ]; then git -C ")
+                      (m-shell-quoted! (mut cmd) cache)
+                      (push-str! (mut cmd) " checkout --detach --force ")
+                      (m-shell-quoted! (mut cmd) (.sha d))
+                      (push-str! (mut cmd) "; fi")
+                      (push-str! (mut cmd) "; else git clone --no-checkout ")
+                      (m-shell-quoted! (mut cmd) (.git d))
+                      (push-str! (mut cmd) " ")
+                      (m-shell-quoted! (mut cmd) cache)
+                      (push-str! (mut cmd) " && git -C ")
+                      (m-shell-quoted! (mut cmd) cache)
+                      (push-str! (mut cmd) " checkout --detach ")
+                      (m-shell-quoted! (mut cmd) (.sha d))
+                      (push-str! (mut cmd) "; fi")
+                      (let [rc
+                              (primitive/cast i64
+                                              (system (to-cstr a
+                                                               (str (load cmd)))))]
+                        (unless (= (wait-code rc) 0)
+                          (m-err a
+                                 (.line d)
+                                 (cat3-d a
+                                         "could not fetch dependency '"
+                                         (cat3-d a
+                                                 (.name d)
+                                                 "' at requested sha")))))
+                      (match (m-realpath a cache)
+                        (Some [p]
+                              (do
+                                (set! (.checkout d) p)
+                                (if (> (len (.subdir d)) 0)
+                                    (let [selected (path-join a p (.subdir d))]
+                                      (match (m-realpath a selected)
+                                        (Some [sp]
+                                              (if (m-contained-path? a p sp)
+                                                  (set! (.resolved d) sp)
+                                                  (m-err a
+                                                         (.line d)
+                                                         (cat3-d a
+                                                                 "git dependency repository '"
+                                                                 (cat3-d a
+                                                                         (.git d)
+                                                                         (cat3-d a
+                                                                                 "' selected subdirectory '"
+                                                                                 (cat3-d a
+                                                                                         (.subdir d)
+                                                                                         "' escapes the checkout")))))))
+                                        (None []
+                                              (m-err a
+                                                     (.line d)
+                                                     (cat3-d a
+                                                             "git dependency repository '"
+                                                             (cat3-d a
+                                                                     (.git d)
+                                                                     (cat3-d a
+                                                                             "' selected subdirectory '"
+                                                                             (cat3-d a
+                                                                                     (.subdir d)
+                                                                                     "' does not exist"))))))))
+                                    (set! (.resolved d) p))
+                                0))
+                        (None []
+                              (m-err a
+                                     (.line d)
+                                     (cat3-d a
+                                             "dependency cache for '"
+                                             (cat3-d a
+                                                     (.name d)
+                                                     "' is unavailable")))))))
+                (cond ; already part of the build: composed once. Its link record
+                      ; exists, so only the new edge to it is recorded.
+                      (m-dep-composed? a deps (load i) (.resolved d))
+                        (m-dep-package-requires! a
+                                                 m
+                                                 (.owner d)
+                                                 (m-dep-package-id m
+                                                                   (.resolved d)))
+                      ; a package: its manifest is the dependency boundary
+                      (or (> (len (.subdir d)) 0)
+                          (= (primitive/cast i64
+                                             (access (to-cstr a
+                                                              (path-join a
+                                                                         (.resolved d)
+                                                                         "Coil.toml"))
+                                                     0))
+                             0))
+                        (m-load-dep-package! a m (mut d))
+                      ; a bare directory of modules
+                      :else (do (push! (.roots d) (.resolved d)) 0))
+                (set! deps (load i) (load d))
+                (set! i (primitive/iadd (load i) 1)))))
+    0))
+
+(defn m-namespace-roots [(a (dyn Allocator)) (m (ptr Manifest))] (-> (slice u8))
+  (let [deps (load (field m deps))
+        n (len (load deps))
+        configured (m-configured-roots a m)
+        (mut roots) (StrBuf::new a)
+        (mut emitted) 0
+        (mut i) 0]
+    (let [(mut r) 0]
+      (loop (if (>= (load r) (len configured))
+                (break)
+                (do
+                  (let [root (get configured (load r))]
+                    (when (= (primitive/cast i64 (access (to-cstr a root) 0))
+                             0)
+                      (when (> (load emitted) 0)
+                        (push-str! (mut roots) ":")
+                        0)
+                      ; Namespace roots are directories. m-effective-roots also
+                      ; carries an uncovered package entry as a file so fmt/lint
+                      ; discovery can name it directly; aggregate lint uses a
+                      ; synthetic /tmp entry, so its namespace index must receive
+                      ; the real entry's directory explicitly.
+                      (push-str! (mut roots)
+                                 (if (dir? (to-cstr a root))
+                                     root
+                                     (dirname root)))
+                      (set! emitted (primitive/iadd (load emitted) 1))
+                      0))
+                  (set! r (primitive/iadd (load r) 1))))))
+    (loop (if (>= (load i) n)
+              (break)
+              (let [d (elem deps (load i))
+                    dr (.roots d)]
+                (for [j 0 (len (load dr))]
+                  (when (> (load emitted) 0) (push-str! (mut roots) ":") 0)
+                  (let [root (get (load dr) j)]
+                    (push-str! (mut roots)
+                               (if (dir? (to-cstr a root))
+                                   root
+                                   (dirname root))))
+                  (set! emitted (primitive/iadd (load emitted) 1))
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    (str (load roots))))
+
+;;; `roots` (a COIL_NAMESPACE_ROOTS value) followed by every root of `m`'s prepared
+;;; dependencies it does not already hold: a member's own dependencies, beside the
+;;; workspace's roots it compiles within.
+(defn m-roots-with-deps [(a (dyn Allocator))
+                         (roots (slice u8))
+                         (m (ptr Manifest))] (-> (slice u8))
+  (let [deps (load (field m deps))
+        (mut have) (ArrayList::new [(slice u8)] a)
+        (mut out) (StrBuf::new a)]
+    (for part (split a roots ":")
+      (when (> (len part) 0) (push! (mut have) part) 0))
+    (push-str! (mut out) roots)
+    (for [i 0 (len (load deps))]
+      (let [dr (.roots (get (load deps) i))]
+        (for [j 0 (len (load dr))]
+          (let [root0 (get (load dr) j)
+                root (if (dir? (to-cstr a root0)) root0 (dirname root0))]
+            (unless (block :held
+                      (for [k 0 (len have)]
+                        (when (= (get have k) root) (break :held true)))
+                      false)
+              (when (> (len (str (load out))) 0) (push-str! (mut out) ":") 0)
+              (push-str! (mut out) root)
+              (push! (mut have) root)
+              0)))))
+    (str (load out))))
+
+(defn m-emit-dep-env [(a (dyn Allocator)) (b (mut StrBuf)) (m (ptr Manifest))]
+  (-> i64)
+  (let [deps (load (field m deps))
+        n (len (load deps))
+        (mut i) 0]
+    (push-str! (mut b) "env ")
+    ; An INHERITED COIL_NAMESPACE_ROOTS means a parent already configured this
+    ; compile -- the same signal apply-project-manifest! uses to make itself a no-op.
+    ; A workspace member must not replace it with its own directory, or the member
+    ; would resolve against itself alone and every cross-member import would fail
+    ; while the identical `check <file>` succeeded.
+    ; Its own dependencies' roots are still this package's to add.
+    (let [inherited (unit-getenv (to-cstr a "COIL_NAMESPACE_ROOTS"))]
+      (m-shell-quoted! (mut b)
+                       (cat3-d a
+                               "COIL_NAMESPACE_ROOTS="
+                               (if (= (primitive/cast i64 inherited)
+                                      0)
+                                   (m-namespace-roots a m)
+                                   (m-roots-with-deps a (from-cstr inherited) m)))))
+    (push-str! (mut b) " ")
+    (m-shell-quoted! (mut b)
+                     (cat3-d a
+                             "COIL_READERS="
+                             (m-mappings-env a (load (field m readers)))))
+    (push-str! (mut b) " ")
+    (m-shell-quoted! (mut b)
+                     (cat3-d a
+                             "COIL_MODULE_MAP="
+                             (m-mappings-env a (load (field m modules)))))
+    (push-str! (mut b) " ")
+    (m-shell-quoted! (mut b)
+                     (cat3-d a
+                             "COIL_MANIFEST_PROVIDERS="
+                             (m-mappings-env a
+                                             (load (field m manifest-providers)))))
+    (push-str! (mut b) " ")
+    (m-shell-quoted! (mut b) "COIL_MANIFEST_PATH=Coil.toml")
+    (push-str! (mut b) " ")
+    (m-shell-quoted! (mut b)
+                     (cat3-d a "COIL_NAMESPACE_EXCLUDES=" (m-excludes-env a m)))
+    (push-str! (mut b) " ")
+    (m-shell-quoted! (mut b) (cat3-d a "COIL_PACKAGE_NAME=" (.name m)))
+    (push-str! (mut b) " ")
+    (let [inherited (unit-getenv (to-cstr a "COIL_CORE_PROVIDERS"))]
+      (m-shell-quoted! (mut b)
+                       (cat3-d a
+                               "COIL_CORE_PROVIDERS="
+                               (if (= (primitive/cast i64 inherited)
+                                      0)
+                                   (m-name-list-env a
+                                                    (load (field m
+                                                                 language-core-providers)))
+                                   (from-cstr inherited)))))
+    (push-str! (mut b) " ")
+    ; The first project command owns the compilation universe. Recursive project
+    ; commands inherit it verbatim, so a member or dependency cannot re-enable the
+    ; bundled library beneath a no-stdlib root.
+    (let [inherited-stdlib (unit-getenv (to-cstr a "COIL_STDLIB"))
+          inherited-prelude (unit-getenv (to-cstr a "COIL_PRELUDE"))]
+      (m-shell-quoted! (mut b)
+                       (cat3-d a
+                               "COIL_STDLIB="
+                               (if (= (primitive/cast i64 inherited-stdlib)
+                                      0)
+                                   (if (.language-stdlib m) "1" "0")
+                                   (from-cstr inherited-stdlib))))
+      (push-str! (mut b) " ")
+      (m-shell-quoted! (mut b)
+                       (cat3-d a
+                               "COIL_PRELUDE="
+                               (if (= (primitive/cast i64 inherited-prelude)
+                                      0)
+                                   (.language-prelude m)
+                                   (from-cstr inherited-prelude))))
+      (push-str! (mut b) " ")
+      (let [inherited-profile (unit-getenv (to-cstr a "COIL_STDLIB_PROFILE"))]
+        (m-shell-quoted! (mut b)
+                         (cat3-d a
+                                 "COIL_STDLIB_PROFILE="
+                                 (if (= (primitive/cast i64 inherited-profile)
+                                        0)
+                                     (.language-stdlib-profile m)
+                                     (from-cstr inherited-profile))))
+        (push-str! (mut b) " "))
+      0)
+    ; Same for the workspace description: pass through what we were given, or
+    ; compute it when we ARE the workspace root.
+    (let [wsp (unit-getenv (to-cstr a "COIL_WORKSPACE_PACKAGES"))]
+      (when (or (!= (primitive/cast i64 wsp) 0)
+                (m-workspace? m))
+        (m-shell-quoted! (mut b)
+                         (cat3-d a
+                                 "COIL_WORKSPACE_PACKAGES="
+                                 (if (= (primitive/cast i64 wsp)
+                                        0)
+                                     (m-workspace-packages a m)
+                                     (from-cstr wsp))))
+        (push-str! (mut b) " ")
+        0))
+    (set! i 0)
+    (loop (if (>= (load i) n)
+              (break)
+              (let [d (get (load deps) (load i))]
+                (m-shell-quoted! (mut b)
+                                 (cat3-d a
+                                         "COIL_DEP_"
+                                         (cat3-d a
+                                                 (.name d)
+                                                 (cat3-d a "=" (.resolved d)))))
+                (push-str! (mut b) " ")
+                (set! i (primitive/iadd (load i) 1)))))
+    0))
+
+(defn m-emit-uses [(a (dyn Allocator)) (b (mut StrBuf)) (m (ptr Manifest))]
+  (-> i64)
+  (let [ns (load (field m metaprograms))
+        (mut i) 0
+        n (len ns)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (push-str! (mut b) " --use ")
+                (m-shell-quoted! (mut b) (get ns (load i)))
+                (set! i (primitive/iadd (load i) 1))))))
+  (let [rs (load (field m readers))]
+    (for [i 0 (len rs)]
+      (push-str! (mut b) " --use ")
+      (m-shell-quoted! (mut b) (.value (elem rs i)))
+      0))
+  0)
+
+(defn m-mappings-env [(a (dyn Allocator))
+                      (xs (ptr (ArrayList ManifestMapping)))] (-> (slice u8))
+  (let [(mut b) (StrBuf::new a)]
+    (for [i 0 (len (load xs))]
+      (let [x (elem xs i)]
+        (push-str! (mut b) (.key x))
+        (push! (mut b) (: 61 u8))
+        (push-str! (mut b) (.value x))
+        (push! (mut b) (: 10 u8)))
+      0)
+    (str (load b))))
+
+; Separator before one link token. Manifest link inputs go on two different kinds
+; of command line: a `<self> build …` child, where each token has to be introduced
+; by coil's own `--link-flag`, and the linker's own argv (`coil fuzz` drives clang
+; directly), where the token stands alone. `raw` picks which. A two-token flag like
+; `-framework Foo` calls this once per token, so the pair survives either spelling.
+(defn m-link-tok! [(b (mut StrBuf)) (raw bool)] (-> i64)
+  (push-str! (mut b) (if raw " " " --runtime-link-flag "))
+  0)
+
+; append the manifest's link flags to a command string builder (frameworks -> two
+; tokens, libs -> -lX, then raw flags), spelled per `raw` — see m-link-tok!.
+(defn m-emit-link-as [(a (dyn Allocator))
+                      (b (mut StrBuf))
+                      (m (ptr Manifest))
+                      (raw bool)] (-> i64)
+  (m-emit-link-parts a
+                     (mut b)
+                     (load (field m frameworks))
+                     (load (field m libs))
+                     (load (field m flags))
+                     (load (field m search-paths))
+                     (load (field m objects))
+                     (load (field m native-deps))
+                     raw)
+  ; `raw` drives a linker directly (coil fuzz) instead of a `build` child, so
+  ; there is no compilation to decide which dependency packages are loaded: it
+  ; takes every dependency's inputs, as every command did before the rule.
+  (when raw
+    (let [pkgs (load (field m dep-packages))]
+      (for [i 0 (len pkgs)]
+        (m-emit-link-set a (mut b) (.link (get (load pkgs) i)) raw)
+        0))
+    0)
+  0)
+
+; One link record's inputs, in the same spelling as the manifest's own.
+(defn m-emit-link-set [(a (dyn Allocator))
+                       (b (mut StrBuf))
+                       (s (ptr ManifestLinkSet))
+                       (raw bool)] (-> i64)
+  (m-emit-link-parts a
+                     (mut b)
+                     (.frameworks s)
+                     (.libs s)
+                     (.flags s)
+                     (.search-paths s)
+                     (.objects s)
+                     (.native-deps s)
+                     raw))
+
+(defn m-emit-link-parts [(a (dyn Allocator))
+                         (b (mut StrBuf))
+                         (fw (ptr (ArrayList (slice u8))))
+                         (lb (ptr (ArrayList (slice u8))))
+                         (fl (ptr (ArrayList (slice u8))))
+                         (sp (ptr (ArrayList (slice u8))))
+                         (ob (ptr (ArrayList (slice u8))))
+                         (nd (ptr (ArrayList ManifestNativeDep)))
+                         (raw bool)] (-> i64)
+  (let [(mut i) 0
+        nf (len fw)]
+    (loop (if (>= (load i) nf)
+              (break)
+              (do
+                (m-link-tok! (mut b) raw)
+                (push-str! (mut b) "-framework")
+                (m-link-tok! (mut b) raw)
+                (m-shell-quoted! (mut b) (get fw (load i)))
+                (set! i (primitive/iadd (load i) 1))))))
+  (let [(mut i) 0
+        nl (len lb)]
+    (loop (if (>= (load i) nl)
+              (break)
+              (do
+                (m-link-tok! (mut b) raw)
+                (push-str! (mut b) "-l")
+                (m-shell-quoted! (mut b) (get lb (load i)))
+                (set! i (primitive/iadd (load i) 1))))))
+  (let [(mut i) 0
+        nx (len fl)]
+    (loop (if (>= (load i) nx)
+              (break)
+              (do
+                (m-link-tok! (mut b) raw)
+                (m-shell-quoted! (mut b) (get fl (load i)))
+                (set! i (primitive/iadd (load i) 1))))))
+  (let [(mut i) 0
+        n (len sp)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (m-link-tok! (mut b) raw)
+                (push-str! (mut b) "-L")
+                (m-link-tok! (mut b) raw)
+                (m-shell-quoted! (mut b) (get sp (load i)))
+                (set! i (primitive/iadd (load i) 1))))))
+  (let [(mut i) 0
+        n (len ob)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (m-link-tok! (mut b) raw)
+                (m-shell-quoted! (mut b) (get ob (load i)))
+                (set! i (primitive/iadd (load i) 1))))))
+  ; A provider prints an unknown number of linker arguments. It runs here, while
+  ; the command is built, so each one gets the `--link-flag` spelling and a
+  ; provider that fails stops the build instead of linking without it.
+  (for [i 0 (len (load nd))]
+    (let [tokens (manifest-native-link-tokens a (elem nd i))]
+      (for [j 0 (len (load tokens))]
+        (m-link-tok! (mut b) raw)
+        (m-shell-quoted! (mut b) (get (load tokens) j)))))
+  0)
+
+(defn m-emit-link [(a (dyn Allocator)) (b (mut StrBuf)) (m (ptr Manifest))]
+  (-> i64)
+  (m-emit-link-as a (mut b) m false))
+
+; Explicit-file commands inside a project use the same namespace boundary as
+; project mode. Previously they ignored Coil.toml and recursively indexed the cwd,
+; so ignored scratch files could collide with real modules after import migration.
+; The project manifest THIS process is compiling under, or null when there is none
+; (no Coil.toml, or a parent project command already applied it). build-cmd and
+; run-cmd consult it to apply the same configuration a project command would.
+(defstruct ProjectManifestCell [(m (ptr Manifest))])
+
+(defn project-manifest-cell [] (-> (ptr ProjectManifestCell))
+  (primitive/alloc-static ProjectManifestCell))
+
+(defn project-manifest [] (-> (ptr Manifest))
+  (.m (project-manifest-cell)))
+
+(defn project-manifest? [] (-> bool)
+  (!= (primitive/cast i64 (project-manifest)) 0))
+
+(extern chdir :cc (cc/C) [(ptr i8)] (-> i32))
+
+;;; The workspace whose members include the current directory, as its root path:
+;;; the nearest ancestor directory holding a [workspace] Coil.toml that lists this
+;;; directory as a member. None when the current directory is not a member.
+(defn enclosing-workspace-root [(a (dyn Allocator))] (-> (Option (slice u8)))
+  (let [here (cwd-slice a)
+        (mut dir) (dirname here)
+        (mut found) (None [(slice u8)])]
+    (block
+      :search
+        (while (and (> (len dir) 1) (!= dir here))
+          (let [text (read-file a (to-cstr a (sconcat a dir "/Coil.toml")))]
+            (when (> (len text) 0)
+              (let [m (parse-manifest a text)]
+                (when (m-workspace? m)
+                  (when (= (chdir (to-cstr a dir)) 0)
+                    (let [packages (m-workspace-packages a m)
+                          (mut member) false]
+                      (for listed (iter (parse-workspace-members a packages))
+                        (let [d (.dir listed)]
+                          (when (and (> (len d) 0)
+                                     (match (m-realpath a d)
+                                       (Some [real] (= real here))
+                                       (None [] false)))
+                            (set! member true))))
+                      (chdir (to-cstr a here))
+                      (when member (set! found (Some dir)))))
+                  (return-from :search 0)))))
+          (set! dir (dirname dir))))
+    found))
+
+(defn m-prepare-native-deps [(a (dyn Allocator)) (m (ptr Manifest))] (-> i64)
+  (m-prepare-native-dep-list a (load (field m native-deps))))
+
+; The native dependencies only executable artifacts link. Prepared only by the
+; commands that build artifacts, before any compilation starts.
+(defn m-prepare-artifact-native-deps [(a (dyn Allocator)) (m (ptr Manifest))]
+  (-> i64)
+  (m-prepare-native-dep-list a (load (field m artifact-native-deps))))
+
+(defn m-prepare-native-dep-list [(a (dyn Allocator))
+                                 (nd (ptr (ArrayList ManifestNativeDep)))]
+  (-> i64)
+  (let [(mut i) 0
+        n (len (load nd))]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [d (elem nd (load i))
+                    (mut cmd) (StrBuf::new a)]
+                (if (> (len (.pkg d)) 0)
+                    (do
+                      (push-str! (mut cmd) "pkg-config --exists ")
+                      (m-shell-quoted! (mut cmd) (.pkg d)))
+                    (do
+                      (push-str! (mut cmd) (.flags-command d))
+                      (push-str! (mut cmd) " >/dev/null")))
+                (let [rc
+                        (wait-code (primitive/cast i64
+                                                   (system (to-cstr a
+                                                                    (str (load cmd))))))]
+                  (when (!= rc 0)
+                    (ps (stderr) "error: native dependency '")
+                    (ps (stderr) (.name d))
+                    (ps (stderr)
+                        (if (> (len (.pkg d)) 0)
+                            "' was not found by pkg-config\n"
+                            "' flags-command failed\n"))
+                    (exit 1)
+                    0))
+                (set! i (primitive/iadd (load i) 1)))))
+    0))
+
+; `coil build`/`coil run` with no file: read Coil.toml, build the equivalent
+; `<self> build|run <entry> …` command, and run it (propagating exit).
+; Native inputs are real build artifacts: never dirty the source tree, reuse an
+; object while its compiler-generated depfile remains current, and stop before the
+; Coil link when the C compiler fails.
+;;; Append one length-prefixed field to a cache key.
+(defn m-key-field! [(key (mut StrBuf))
+                    (a (dyn Allocator))
+                    (tag (slice u8))
+                    (text (slice u8))] (-> i64)
+  (push-str! (mut key) tag)
+  (push-str! (mut key) (i64->str a (len text)))
+  (push-str! (mut key) ":")
+  (push-str! (mut key) text)
+  0)
+
+(defn m-native-key [(a (dyn Allocator))
+                    (cf (ptr (ArrayList (slice u8))))
+                    (inc (ptr (ArrayList (slice u8))))
+                    (pkg-cflags (ptr (ArrayList (slice u8))))
+                    (has-target bool)
+                    (target (slice u8))
+                    (debug bool)
+                    (src (slice u8))] (-> i64)
+  ; One hash of every input in its order, each field length-prefixed so no two
+  ; lists spell the same text. Compiler flags and include directories are
+  ; ordered -- the last `-D` wins, the first `-I` is searched first -- and
+  ; folding their hashes with XOR made a reordering reuse the stale object.
+  (let [(mut key) (StrBuf::new a)]
+    (m-key-field! (mut key) a "src" src)
+    (for [i 0 (len cf)] (m-key-field! (mut key) a "flag" (get cf i)))
+    (for [i 0 (len inc)] (m-key-field! (mut key) a "include" (get inc i)))
+    ; What the pkg-config providers said this compile takes.
+    (for [i 0 (len (load pkg-cflags))]
+      (m-key-field! (mut key) a "pkg-cflag" (get (load pkg-cflags) i)))
+    (when has-target (m-key-field! (mut key) a "target" target) 0)
+    (when debug (m-key-field! (mut key) a "debug" "") 0)
+    (hash (str (load key)))))
+
+(defn m-cc-sources-as [(a (dyn Allocator))
+                       (b (mut StrBuf))
+                       (m (ptr Manifest))
+                       (raw bool)] (-> i64)
+  (m-cc-compile-sources! a
+                         (mut b)
+                         (load (field m sources))
+                         (load (field m include-dirs))
+                         (load (field m ccflags))
+                         (load (field m native-deps))
+                         (.has-target m)
+                         (.target m)
+                         (.debug m)
+                         raw)
+  ; See m-emit-link-as: the raw linker path has no compilation to consult, so it
+  ; takes every dependency package's C objects.
+  (when raw
+    (let [pkgs (load (field m dep-packages))]
+      (for [i 0 (len pkgs)]
+        (let [link (.link (get (load pkgs) i))]
+          (m-cc-compile-sources! a
+                                 (mut b)
+                                 (.sources link)
+                                 (.include-dirs link)
+                                 (.ccflags link)
+                                 (.native-deps link)
+                                 (.has-target m)
+                                 (.target m)
+                                 (.debug m)
+                                 raw))
+        0))
+    0)
+  0)
+
+(defstruct ManifestTaggedArg [(flag (slice u8)) (value (slice u8))])
+
+(defn m-tagged-arg! [(a (dyn Allocator))
+                     (out (ptr (ArrayList ManifestTaggedArg)))
+                     (flag (slice u8))
+                     (id i64)
+                     (value (slice u8))] (-> i64)
+  (let [(mut x) (zeroed ManifestTaggedArg)]
+    (set! (.flag x) flag)
+    (set! (.value x) (cat3-d a (i64->str a id) (cat3-d a ":" value)))
+    (push! [ManifestTaggedArg] out x))
+  0)
+
+; Describe every dependency package to the build that links: its source roots, the
+; packages it requires, and its link inputs, each tagged with the package's id. The
+; build keeps the inputs of the packages its own compilation loaded (see
+; link-package-register! in the loader) and drops the rest, so a dependency a
+; program never imports contributes nothing to its link and its native provider is
+; never run for that program.
+;
+; C translation units a dependency declares are compiled here, with that package's
+; own include dirs, flags and pkg-config providers; the objects are link inputs
+; like any other and are selected the same way. Compiling one is cached and has no
+; effect on a link that does not take it.
+(defn m-dep-package-args [(a (dyn Allocator))
+                          (m (ptr Manifest))]
+  (-> (ptr (ArrayList ManifestTaggedArg)))
+  (let [out
+          (box-al [ManifestTaggedArg] a (ArrayList::new [ManifestTaggedArg] a))
+        pkgs (load (field m dep-packages))]
+    (for [i 0 (len pkgs)]
+      (let [p (get (load pkgs) i)
+            id (.id p)
+            link (.link p)]
+        (m-tagged-arg! a out "--dep-name" id (.name p))
+        (for [j 0 (len (load (.roots p)))]
+          (m-tagged-arg! a out "--dep-package" id (get (load (.roots p)) j))
+          0)
+        (for [j 0 (len (load (.requires p)))]
+          (m-tagged-arg! a
+                         out
+                         "--dep-requires"
+                         id
+                         (i64->str a (get (load (.requires p)) j)))
+          0)
+        (for [j 0 (len (load (.frameworks link)))]
+          (m-tagged-arg! a out "--dep-link" id "-framework")
+          (m-tagged-arg! a
+                         out
+                         "--dep-link"
+                         id
+                         (get (load (.frameworks link)) j))
+          0)
+        (for [j 0 (len (load (.libs link)))]
+          (m-tagged-arg! a
+                         out
+                         "--dep-link"
+                         id
+                         (sconcat a "-l" (get (load (.libs link)) j)))
+          0)
+        (for [j 0 (len (load (.flags link)))]
+          (m-tagged-arg! a out "--dep-link" id (get (load (.flags link)) j))
+          0)
+        (for [j 0 (len (load (.search-paths link)))]
+          (m-tagged-arg! a out "--dep-link" id "-L")
+          (m-tagged-arg! a
+                         out
+                         "--dep-link"
+                         id
+                         (get (load (.search-paths link)) j))
+          0)
+        (for [j 0 (len (load (.objects link)))]
+          (m-tagged-arg! a out "--dep-link" id (get (load (.objects link)) j))
+          0)
+        (let [natives (.native-deps link)]
+          (for [j 0 (len (load natives))]
+            (let [d (elem natives j)]
+              (if (> (len (.pkg d)) 0)
+                  (m-tagged-arg! a out "--dep-native-pkg" id (.pkg d))
+                  (m-tagged-arg! a
+                                 out
+                                 "--dep-native-command"
+                                 id
+                                 (.flags-command d))))
+            0))
+        (let [objs
+                (m-cc-objects! a
+                               (.sources link)
+                               (.include-dirs link)
+                               (.ccflags link)
+                               (.native-deps link)
+                               (.has-target m)
+                               (.target m)
+                               (.debug m))]
+          (for [j 0 (len (load objs))]
+            (m-tagged-arg! a out "--dep-link" id (get (load objs) j))
+            0)))
+      0)
+    out))
+
+(defn m-emit-dep-packages! [(a (dyn Allocator))
+                            (b (mut StrBuf))
+                            (m (ptr Manifest))] (-> i64)
+  (let [args (m-dep-package-args a m)]
+    (for [i 0 (len (load args))]
+      (let [x (elem args i)]
+        (push-str! (mut b) " ")
+        (push-str! (mut b) (.flag x))
+        (push-str! (mut b) " ")
+        (m-shell-quoted! (mut b) (.value x)))
+      0))
+  0)
+
+; Compile C translation units and append each object to the command line.
+(defn m-cc-compile-sources! [(a (dyn Allocator))
+                             (b (mut StrBuf))
+                             (srcs (ptr (ArrayList (slice u8))))
+                             (incs (ptr (ArrayList (slice u8))))
+                             (cf (ptr (ArrayList (slice u8))))
+                             (nd (ptr (ArrayList ManifestNativeDep)))
+                             (has-target bool)
+                             (target (slice u8))
+                             (debug bool)
+                             (raw bool)] (-> i64)
+  (let [objs (m-cc-objects! a srcs incs cf nd has-target target debug)]
+    (for [i 0 (len (load objs))]
+      (m-link-tok! (mut b) raw)
+      (push-str! (mut b) (get (load objs) i))
+      0))
+  0)
+
+; Compile C translation units into content-keyed objects under .coil/build/native/
+; and return the object paths. A source is recompiled only when its inputs or the
+; toolchain change; the C compiler failing stops the build.
+;;; Write STAMP: one `digest path` line per prerequisite DEP names, so a later
+;;; build can tell whether any input changed without trusting timestamps or make.
+(defn m-cc-write-stamp! [(a (dyn Allocator))
+                         (dep (slice u8))
+                         (stamp (slice u8))] (-> bool)
+  (match (read-file-opt a (to-cstr a dep))
+    (None [] false)
+    (Some [text]
+          (let [prereqs (ci/depfile-prerequisites a text)
+                (mut body) (StrBuf::new a)
+                (mut ok) true]
+            (for p (load prereqs)
+              (match (artifact-id/artifact-file-digest a p)
+                (Ok [digest]
+                    (push-str! (mut body) digest)
+                    (push-str! (mut body) " ")
+                    (push-str! (mut body) p)
+                    (push-str! (mut body) "\n"))
+                (Err [_] (set! ok false))))
+            (and ok
+                 (try (let [_
+                              (try-or! (fs/write-file a stamp (str body))
+                                       false)]
+                        true)))))))
+
+;;; Whether OBJ is current: it exists and every input its stamp records still
+;;; has the recorded digest. A missing or unreadable stamp means rebuild.
+(defn m-cc-fresh? [(a (dyn Allocator)) (obj (slice u8)) (stamp (slice u8))]
+  (-> bool)
+  (match (read-file-opt a (to-cstr a obj))
+    (None [] false)
+    (Some [_]
+          (match (read-file-opt a (to-cstr a stamp))
+            (None [] false)
+            (Some [text]
+                  (let [(mut fresh) (> (len text) 0)]
+                    (for line (split a text "\n")
+                      (when (> (len line) 0)
+                        (match (find line " ")
+                          (None [] (set! fresh false))
+                          (Some [sp]
+                                (try (let [digest
+                                             (try-or! (artifact-id/artifact-file-digest a
+                                                                                        (subslice line
+                                                                                                  (+ sp
+                                                                                                     1)
+                                                                                                  (len line)))
+                                                      (set! fresh false))]
+                                       (when (!= digest (subslice line 0 sp))
+                                         (set! fresh false))))))))
+                    fresh))))))
+
+(defn m-cc-objects! [(a (dyn Allocator))
+                     (srcs (ptr (ArrayList (slice u8))))
+                     (incs (ptr (ArrayList (slice u8))))
+                     (cf (ptr (ArrayList (slice u8))))
+                     (nd (ptr (ArrayList ManifestNativeDep)))
+                     (has-target bool)
+                     (target (slice u8))
+                     (debug bool)] (-> (ptr (ArrayList (slice u8))))
+  (let [out (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+        ; Only a pkg-config provider describes compile flags; a flags-command
+        ; provider supplies linker arguments alone. They are asked once, before
+        ; any compile, and are part of each object's key: a package whose
+        ; flags change is a different compile.
+        pkg-cflags (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+        _pkg
+          (for [k 0 (len (load nd))]
+            (let [d (elem nd k)]
+              (when (> (len (.pkg d)) 0)
+                (let [(mut cmd) (StrBuf::new a)]
+                  (push-str! (mut cmd) "pkg-config --cflags ")
+                  (m-shell-quoted! (mut cmd) (.pkg d))
+                  (for flag (load (native-provider-output a
+                                                          (str (load cmd))
+                                                          (sconcat3 a
+                                                                    "native dependency '"
+                                                                    (.name d)
+                                                                    "' was not found by pkg-config")))
+                    (push! pkg-cflags flag))))))
+        (mut i) 0
+        ns (len srcs)]
+    (loop (if (>= (load i) ns)
+              (break)
+              (let [src (get srcs (load i))
+                    dir
+                      (cat3-d a
+                              ".coil/build/native/"
+                              (i64->str a
+                                        (m-native-key a
+                                                      cf
+                                                      incs
+                                                      pkg-cflags
+                                                      has-target
+                                                      target
+                                                      debug
+                                                      src)))
+                    obj (cat3-d a dir "/source.o")
+                    dep (cat3-d a dir "/source.d")
+                    ccv (cat3-d a dir "/compiler-version")
+                    stamp (cat3-d a dir "/source.stamp")
+                    tmpobj (temp-sibling-or-exit obj)
+                    tmpdep (temp-sibling-or-exit dep)
+                    (mut cc) (StrBuf::new a)]
+                (let [(mut mk) (StrBuf::new a)]
+                  (push-str! (mut mk) "mkdir -p ")
+                  (m-shell-quoted! (mut mk) dir)
+                  (let [mrc
+                          (primitive/cast i64
+                                          (system (to-cstr a
+                                                           (str (load mk)))))]
+                    (when (!= (wait-code mrc) 0)
+                      (ps (stderr)
+                          "error: cannot create native build directory\n")
+                      (exit 1)
+                      0)))
+                ; Staleness is decided here from content digests of every input
+                ; the last compile's depfile named; only the compiler-version
+                ; comparison is left to the shell.
+                (push-str! (mut cc)
+                           (if (m-cc-fresh? a obj stamp)
+                               "if false"
+                               "if true"))
+                (push-str! (mut cc)
+                           " || ! clang --version | head -1 | cmp -s - ")
+                (m-shell-quoted! (mut cc) ccv)
+                (push-str! (mut cc) "; then clang")
+                (push-found-clang-sysroot-str! a (mut cc))
+                (push-str! (mut cc) " -MMD -MF ")
+                (m-shell-quoted! (mut cc) tmpdep)
+                (push-str! (mut cc) " -MT ")
+                (m-shell-quoted! (mut cc) obj)
+                (push-str! (mut cc) " -c ")
+                (m-shell-quoted! (mut cc) src)
+                (push-str! (mut cc) " -o ")
+                (m-shell-quoted! (mut cc) tmpobj)
+                (let [(mut j) 0
+                      nj (len incs)]
+                  (loop (if (>= (load j) nj)
+                            (break)
+                            (do
+                              (push-str! (mut cc) " -I")
+                              (m-shell-quoted! (mut cc) (get incs (load j)))
+                              (set! j (primitive/iadd (load j) 1))))))
+                (let [(mut k) 0
+                      nk (len cf)]
+                  (loop (if (>= (load k) nk)
+                            (break)
+                            (do
+                              (push-str! (mut cc) " ")
+                              (push-str! (mut cc) (get cf (load k)))
+                              (set! k (primitive/iadd (load k) 1))))))
+                (for [k 0 (len (load pkg-cflags))]
+                  (push-str! (mut cc) " ")
+                  (m-shell-quoted! (mut cc) (get (load pkg-cflags) k)))
+                (push-str! (mut cc) " && mv ")
+                (m-shell-quoted! (mut cc) tmpobj)
+                (push-str! (mut cc) " ")
+                (m-shell-quoted! (mut cc) obj)
+                (push-str! (mut cc) " && mv ")
+                (m-shell-quoted! (mut cc) tmpdep)
+                (push-str! (mut cc) " ")
+                (m-shell-quoted! (mut cc) dep)
+                (push-str! (mut cc) " && clang --version | head -1 > ")
+                (m-shell-quoted! (mut cc) ccv)
+                (push-str! (mut cc) "; fi")
+                (let [crc
+                        (primitive/cast i64
+                                        (system (to-cstr a (str (load cc)))))]
+                  (when (!= (wait-code crc) 0)
+                    (wait-report crc "C compiler")
+                    (exit (primitive/cast i32
+                                          (if (= (wait-code crc)
+                                                 0)
+                                              1
+                                              (wait-code crc))))
+                    0))
+                (when (not (m-cc-write-stamp! a dep stamp))
+                  (ps (stderr) "error: cannot record native build inputs for ")
+                  (ps (stderr) src)
+                  (ps (stderr) "\n")
+                  (exit 1))
+                (push! out obj)
+                (set! i (primitive/iadd (load i) 1)))))
+    out))
+
+(defn m-cc-sources [(a (dyn Allocator)) (b (mut StrBuf)) (m (ptr Manifest))]
+  (-> i64)
+  (m-cc-sources-as a (mut b) m false))
+
+; Forward the user's own CLI flags into the sub-invocation. Project mode used to drop
+; every flag on the floor and report success: `coil build --target wasm32-unknown-unknown`
+; printed `wrote mp`, exited 0, and produced a native Mach-O. The manifest's own flags are
+; emitted first, so a flag the user typed lands later on the command line and wins
+; (build-cmd keeps the last -o/--target it sees).
+; `skip` is the index of the entry positional the caller already placed on the
+; command line (0 when there is none). Without it, `coil build src/main.coil`
+; inside a project would forward the file a second time and the child would reject
+; it as a stray argument.
+(defn m-forward-flags [(a (dyn Allocator))
+                       (b (mut StrBuf))
+                       (argc i32)
+                       (argv (ptr (ptr i8)))
+                       (skip i64)] (-> i64)
+  (let [(mut i) 2]
+    (loop (if (>= (load i) (primitive/cast i64 argc))
+              (break)
+              (let [arg (from-cstr (load (index argv (load i))))]
+                (if (= arg "--")
+                    (break)
+                    (if (= (load i) skip)
+                        (do (set! i (primitive/iadd (load i) 1)) 0)
+                        (do
+                          (push-str! (mut b) " ")
+                          (m-shell-quoted! (mut b) arg)
+                          ; The child this command line becomes does the compiling
+                          ; and owns the report; two tables would double-count.
+                          (when (= arg "--timings") (tr/timings-delegate!) 0)
+                          (set! i (primitive/iadd (load i) 1))
+                          0)))))))
+  0)
+
+;;; Where a project build writes the package executable: `[build] out` as written,
+;;; relative to the manifest like an artifact's `out`; otherwise the selected
+;;; profile's directory, under the entry's own name when the command named one.
+(defn m-exe-path [(a (dyn Allocator))
+                  (m (ptr Manifest))
+                  (explicit bool)
+                  (entry (slice u8))] (-> (slice u8))
+  (m-output-path a
+                 (cond explicit
+                         (cat3-d a
+                                 (cat3-d a "build/" (.profile m))
+                                 (cat3-d a "/" (source-output-stem entry)))
+                       (> (len (.out m)) 0) (.out m)
+                       :else
+                         (cat3-d a
+                                 (cat3-d a "build/" (.profile m))
+                                 (cat3-d a "/" (.name m))))))
+
+;;; Whether enter-project! moved this process into a project from the directory the
+;;; user typed the command in.
+(defstruct EnteredProjectCell [(entered bool)])
+
+(defn entered-project-cell [] (-> (ptr EnteredProjectCell))
+  (primitive/alloc-static EnteredProjectCell))
+
+;;; An output path relative to the project, as the build names it in "wrote …".
+;;; After enter-project!, relative would read as relative to where the user stands,
+;;; so it is made absolute.
+(defn m-output-path [(a (dyn Allocator)) (path (slice u8))] (-> (slice u8))
+  (if (.entered (entered-project-cell)) (path-join a (cwd-slice a) path) path))
+
+;;; The package's entry FILE: `[package] entry`, a path relative to Coil.toml, or
+;;; src/main.coil when none is declared. Every project command takes its entry from
+;;; here. The entry is handed to a child command as its file argument, and `coil run`
+;;; also reads an argument that is no file as a MODULE name, so a declared entry that
+;;; names no file used to run under `run` and fail under `build` and `check`. It is
+;;; refused here instead, the same way for every command.
+(defn m-entry-file [(a (dyn Allocator)) (m (ptr Manifest))] (-> (slice u8))
+  (let [entry (.entry m)]
+    (if (= (len entry) 0)
+        "src/main.coil"
+        (do
+          (when (or (!= (access (to-cstr a entry) 0) (: 0 i32))
+                    (dir? (to-cstr a entry)))
+            (let [w (stderr)]
+              (ps w "error: Coil.toml: [package] entry '")
+              (ps w entry)
+              (ps w
+                  "' is not a file; `entry` is a path relative to Coil.toml, such as \"src/main.coil\"")
+              (wb w 10)
+              (exit 1)
+              0))
+          entry))))
+
+; `fidx` is the argv index of a file the user named explicitly, or 0 for a plain
+; project command. Naming a file inside a project takes this same path — the project
+; configuration is identical, only the entry differs — so `coil build src/main.coil`
+; and `coil build` compile under the same dependencies, link inputs and metaprograms.
+; With an explicit entry the manifest's `[build] out` is not applied: the source stem
+; names the artifact unless the user supplies `-o`.
+; `<cmd>` at a workspace root, with no file named: run it once per member, in the
+; member's own directory, where its Coil.toml applies exactly as it would if you had
+; cd'd there yourself. Members run in listed order and every one runs even after a
+; failure -- one broken member should not hide the state of the rest. The exit code
+; is the count of members that failed, so 0 still means "all good".
+;;; The member directories of workspace M, in its order.
+(defn ws-member-dirs [(a (dyn Allocator)) (m (ptr Manifest))]
+  (-> (ptr (ArrayList (slice u8))))
+  (let [text (m-workspace-packages a m)
+        out (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))
+        (mut lo) 0]
+    (for i (range 0 (+ (len text) 1))
+      (when (or (= i (len text)) (= (primitive/cast i64 (get text i)) 10))
+        (when (> i lo)
+          (let [line (subslice [u8] text lo i)
+                eq (m-index line (: 61 u8))]
+            (when (>= eq 0)
+              (push! out (subslice [u8] line (+ eq 1) (len line)))
+              0)))
+        (set! lo (+ i 1))
+        0))
+    out))
+
+;;; The `--suite` names on a `coil test` command line, before any `--`.
+(defn ws-wanted-suites [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))]
+  (-> (ptr (ArrayList (slice u8))))
+  (let [out (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a))
+        n (primitive/cast i64 argc)
+        (mut i) 2]
+    (while (< i n)
+      (let [arg (from-cstr (load (index argv i)))]
+        (cond (= arg "--") (set! i n)
+              (and (= arg "--suite") (< (+ i 1) n))
+                (do
+                  (push! out (from-cstr (load (index argv (+ i 1)))))
+                  (set! i (+ i 2)))
+              :else (set! i (+ i 1)))))
+    out))
+
+;;; Does member manifest MM declare the suite NAME? `all` is every member's.
+(defn ws-member-has-suite? [(mm (ptr Manifest)) (name (slice u8))] (-> bool)
+  (or (= name "all")
+      (!= (primitive/cast i64 (m-find-suite (load (field mm suites)) name)) 0)))
+
+;;; Does member manifest MM declare any of the suites in WANTED?
+(defn ws-member-has-any-suite? [(mm (ptr Manifest))
+                                (wanted (ptr (ArrayList (slice u8))))] (-> bool)
+  (let [(mut found) false]
+    (for name (load wanted)
+      (when (ws-member-has-suite? mm name) (set! found true) 0))
+    found))
+
+(defn ws-member-manifest [(a (dyn Allocator)) (dir (slice u8))]
+  (-> (ptr Manifest))
+  (parse-manifest a (read-file a (to-cstr a (sconcat a dir "/Coil.toml")))))
+
+;;; `coil test --suite NAME` at a workspace root runs NAME in the members that
+;;; declare it. A name no member declares is the one error: before anything
+;;; runs, as the member command itself rejects an unknown suite.
+(defn ws-unknown-suite? [(a (dyn Allocator))
+                         (m (ptr Manifest))
+                         (wanted (ptr (ArrayList (slice u8))))] (-> bool)
+  (let [dirs (ws-member-dirs a m)
+        (mut unknown) false]
+    (for name (load wanted)
+      (let [(mut declared) false]
+        (for dir (load dirs)
+          (when (ws-member-has-suite? (ws-member-manifest a dir) name)
+            (set! declared true)
+            0))
+        (unless declared
+          (ps (stderr) "error: unknown test suite '")
+          (ps (stderr) name)
+          (ps (stderr) "': no member of this workspace declares it\n")
+          (set! unknown true)
+          0)))
+    unknown))
+
+;;; A workspace has no tests of its own: `coil test` at its root runs each
+;;; member's suites, in the member's directory and under its configuration, so a
+;;; suite or [test] the workspace manifest declares would never run. `coil test`
+;;; there says where it belongs. Only `test` asks: refusing the manifest outright
+;;; stopped every command in such a workspace, `emit-ir` and `build` included.
+(defn ws-test-config-error? [(a (dyn Allocator)) (m (ptr Manifest))] (-> bool)
+  (let [w (stderr)
+        (mut bad) false]
+    ; only what the manifest wrote: the default suite and roots have no line
+    (for s (load (load (field m suites)))
+      (when (> (.line s) 0)
+        (ps w "error: Coil.toml:")
+        (ps w (i64->str a (.line s)))
+        (ps w ": [test.suites.")
+        (ps w (.name s))
+        (ps w
+            "] is in a workspace manifest, and a workspace runs only its members' tests; declare the suite in the Coil.toml of the member whose files it names, with roots relative to that member\n")
+        (set! bad true)
+        0))
+    (when (> (.test-roots-line m) 0)
+      (ps w "error: Coil.toml:")
+      (ps w (i64->str a (.test-roots-line m)))
+      (ps w
+          ": [test] is in a workspace manifest, and a workspace runs only its members' tests; declare it in each member's Coil.toml\n")
+      (set! bad true))
+    (load bad)))
+
+(defn workspace-fanout [(a (dyn Allocator))
+                        (sub (slice u8))
+                        (self (slice u8))
+                        (m (ptr Manifest))
+                        (argc i32)
+                        (argv (ptr (ptr i8)))] (-> i64)
+  (let [here (cwd-slice a)
+        text (m-workspace-packages a m)
+        n (len text)
+        w (stderr)
+        wanted
+          (if (= sub "test")
+              (ws-wanted-suites a argc argv)
+              (box! a (ArrayList (slice u8)) (ArrayList::new [(slice u8)] a)))
+        _test-config
+          (when (and (= sub "test") (ws-test-config-error? a m)) (exit 1) 0)
+        _unknown (when (ws-unknown-suite? a m wanted) (exit 2) 0)
+        (mut failed) 0
+        (mut total) 0
+        (mut lo) 0
+        (mut i) 0]
+    (loop (if (> (load i) n)
+              (break)
+              (if (or (= (load i) n)
+                      (= (primitive/cast i64 (get text (load i)))
+                         10))
+                  (do
+                    (when (> (load i) (load lo))
+                      (let [line (subslice [u8] text (load lo) (load i))
+                            eq (m-index line (: 61 u8))]
+                        (when (>= eq 0)
+                          (let [dir
+                                  (subslice [u8]
+                                            line
+                                            (primitive/iadd eq 1)
+                                            (len line))
+                                mm
+                                  (parse-manifest a
+                                                  (read-file a
+                                                             (to-cstr a
+                                                                      (sconcat a
+                                                                               dir
+                                                                               "/Coil.toml"))))
+                                (mut c) (StrBuf::new a)]
+                            ; A member with no `entry` is a library: there is no program
+                            ; to build or run on its own, and its code is compiled by
+                            ; whichever member imports it. Skipping is the honest answer
+                            ; for those two, but say so rather than reporting a member
+                            ; that never ran. A library is still checked, linted,
+                            ; formatted and tested like any other member.
+                            (cond (and (= (len (.entry mm)) 0)
+                                       (or (= sub "build") (= sub "run")))
+                                    (do
+                                      (ps w "-- ")
+                                      (ps w dir)
+                                      (ps w
+                                          " (library: no [package] entry, compiled through its importers)\n")
+                                      0)
+                                  ; `--suite` reaches only the members that declare one of the
+                                  ; suites; the rest have nothing selected
+                                  (and (> (len (load wanted)) 0)
+                                       (not (ws-member-has-any-suite? mm wanted)))
+                                    (do
+                                      (ps w "-- ")
+                                      (ps w dir)
+                                      (ps w
+                                          " (declares none of the selected test suites)\n")
+                                      0)
+                                  :else
+                                    (do
+                                      (set! total
+                                            (primitive/iadd (load total) 1))
+                                      (ps w "== ")
+                                      (ps w sub)
+                                      (ps w " ")
+                                      (ps w dir)
+                                      (wb w 10)
+                                      (push-str! (mut c) "cd ")
+                                      (m-shell-quoted! (mut c) dir)
+                                      (push-str! (mut c) " && env ")
+                                      ; The member's own Coil.toml declares no workspace, so
+                                      ; without these the child would resolve against its own
+                                      ; directory alone and every cross-member import would
+                                      ; fail. Passing them is what makes a member compile
+                                      ; inside the workspace rather than beside it.
+                                      (m-shell-quoted! (mut c)
+                                                       (cat3-d a
+                                                               "COIL_NAMESPACE_ROOTS="
+                                                               (m-namespace-roots a
+                                                                                  m)))
+                                      (push-str! (mut c) " ")
+                                      (m-shell-quoted! (mut c)
+                                                       (cat3-d a
+                                                               "COIL_NAMESPACE_EXCLUDES="
+                                                               (m-workspace-excludes-env a
+                                                                                         m)))
+                                      (push-str! (mut c) " ")
+                                      (m-shell-quoted! (mut c)
+                                                       (cat3-d a
+                                                               "COIL_WORKSPACE_PACKAGES="
+                                                               (m-workspace-packages a
+                                                                                     m)))
+                                      (push-str! (mut c) " ")
+                                      (m-shell-quoted! (mut c)
+                                                       (cat3-d a
+                                                               "COIL_STDLIB="
+                                                               (if (.language-stdlib m)
+                                                                   "1"
+                                                                   "0")))
+                                      (push-str! (mut c) " ")
+                                      (m-shell-quoted! (mut c)
+                                                       (cat3-d a
+                                                               "COIL_STDLIB_PROFILE="
+                                                               (.language-stdlib-profile m)))
+                                      (push-str! (mut c) " ")
+                                      (m-shell-quoted! (mut c)
+                                                       (cat3-d a
+                                                               "COIL_PRELUDE="
+                                                               (.language-prelude m)))
+                                      (push-str! (mut c) " ")
+                                      (m-shell-quoted! (mut c)
+                                                       (cat3-d a
+                                                               "COIL_CORE_PROVIDERS="
+                                                               (m-name-list-env a
+                                                                                (load (field m
+                                                                                             language-core-providers)))))
+                                      (push-str! (mut c) " ")
+                                      (m-shell-quoted! (mut c) self)
+                                      (push-str! (mut c) " ")
+                                      (push-str! (mut c) sub)
+                                      ; A workspace command has the same flags as the
+                                      ; corresponding member command. This includes
+                                      ; mutating modes such as `lint --fix`, build
+                                      ; profiles/targets, selectors, and a `run`'s
+                                      ; program arguments; dropping them makes root and
+                                      ; member workflows disagree. The member runs in
+                                      ; its own directory, so it gets them as
+                                      ; invocation-argv reads them from this one.
+                                      (let [member-argv
+                                              (invocation-argv a
+                                                               sub
+                                                               argc
+                                                               argv
+                                                               0
+                                                               here)
+                                            (mut program) false
+                                            (mut dropping) false]
+                                        (for k (range 2
+                                                      (- (len (load member-argv))
+                                                         1))
+                                          (let [arg
+                                                  (from-cstr (get (load member-argv)
+                                                                  k))
+                                                ; a `--suite NAME` this member does not declare
+                                                drop
+                                                  (or (load dropping)
+                                                      (and (not (load program))
+                                                           (= arg "--suite")
+                                                           (< (+ k 1)
+                                                              (- (len (load member-argv))
+                                                                 1))
+                                                           (not (ws-member-has-suite? mm
+                                                                                      (from-cstr (get (load member-argv)
+                                                                                                      (+ k
+                                                                                                         1)))))))]
+                                            (set! dropping
+                                                  (and drop (= arg "--suite")))
+                                            (unless drop
+                                              (push-str! (mut c) " ")
+                                              (m-shell-quoted! (mut c) arg)
+                                              0)
+                                            (when (= arg "--")
+                                              (set! program true))
+                                            ; The child owns the report, as for
+                                            ; m-forward-flags.
+                                            (when (and (not (load program))
+                                                       (= arg "--timings"))
+                                              (tr/timings-delegate!))))
+                                        0)
+                                      (when (!= (wait-code (primitive/cast i64
+                                                                           (system (to-cstr a
+                                                                                            (str (load c))))))
+                                                0)
+                                        (set! failed
+                                              (primitive/iadd (load failed) 1))
+                                        0)
+                                      0))
+                            0))))
+                    (set! lo (primitive/iadd (load i) 1))
+                    (set! i (primitive/iadd (load i) 1))
+                    0)
+                  (set! i (primitive/iadd (load i) 1)))))
+    (ps w "workspace ")
+    (ps w sub)
+    (ps w ": ")
+    (ps w (i64->str a (primitive/isub (load total) (load failed))))
+    (ps w "/")
+    (ps w (i64->str a (load total)))
+    (ps w " members ok\n")
+    (load failed)))
+
+; A path as an absolute, lexically normalized string: relative paths are anchored
+; at `base`, and empty, `.` and `..` components are folded. Used to compare output
+; paths that are spelled differently.
+(defn m-lexical-path [(a (dyn Allocator)) (base (slice u8)) (path (slice u8))]
+  (-> (slice u8))
+  (let [full (path-join a base path)
+        n (len full)
+        (mut parts) (ArrayList::new [(slice u8)] a)
+        (mut start) 0]
+    (for [i 0 (+ n 1)]
+      (when (or (= i n) (= (get full i) (: 47 u8)))
+        (let [part (subslice [u8] full (load start) i)]
+          (cond (or (= (len part) 0) (= part ".")) 0
+                (= part "..") (match (pop! [(slice u8)] (mut parts)) (_ 0))
+                :else (do (push! (mut parts) part) 0)))
+        (set! start (+ i 1))
+        0)
+      0)
+    (let [(mut out) (StrBuf::new a)]
+      (for [i 0 (len (load parts))]
+        (push! (mut out) (: 47 u8))
+        (push-str! (mut out) (get (load parts) i))
+        0)
+      (if (= (len (load parts)) 0) "/" (str (load out))))))
+
+; Every artifact writes its own file. Two artifacts, or an artifact and the package
+; executable (in either build profile), that name the same path would overwrite
+; each other within one build.
+(defn m-check-artifact-outputs! [(a (dyn Allocator)) (m (ptr Manifest))]
+  (-> i64)
+  (let [items (load (field m artifacts))
+        base (cwd-slice a)
+        ; the package executable: `[build] out`, or build/<profile>/<name> for
+        ; every profile
+        package-outs (m-new-strings a)]
+    (if (> (len (.out m)) 0)
+        (push! package-outs (.out m))
+        (do
+          (push! package-outs (cat3-d a "build/release/" (.name m)))
+          (push! package-outs (cat3-d a "build/debug/" (.name m)))
+          (for [k 0 (len (load (field m profiles)))]
+            (push! package-outs
+                   (cat3-d a
+                           (cat3-d a
+                                   "build/"
+                                   (.name (get (load (field m profiles)) k)))
+                           (cat3-d a "/" (.name m))))
+            0)))
+    (for [i 0 (len items)]
+      (let [item (get (load items) i)
+            out (m-lexical-path a base (.out item))]
+        (for [k 0 (len (load package-outs))]
+          (let [package-out (get (load package-outs) k)]
+            (when (= out (m-lexical-path a base package-out))
+              (m-err a
+                     (.line item)
+                     (cat3-d a
+                             "artifact '"
+                             (cat3-d a
+                                     (.name item)
+                                     (cat3-d a
+                                             "' out '"
+                                             (cat3-d a
+                                                     (.out item)
+                                                     (cat3-d a
+                                                             "' is the package executable's output '"
+                                                             (cat3-d a
+                                                                     package-out
+                                                                     "'")))))))
+              0))
+          0)
+        (for [j 0 i]
+          (let [other (get (load items) j)]
+            (when (= (m-lexical-path a base (.out other)) out)
+              (m-err a
+                     (.line item)
+                     (cat3-d a
+                             "artifact '"
+                             (cat3-d a
+                                     (.name item)
+                                     (cat3-d a
+                                             "' out '"
+                                             (cat3-d a
+                                                     (.out item)
+                                                     (cat3-d a
+                                                             "' is also the output of artifact '"
+                                                             (cat3-d a
+                                                                     (.name other)
+                                                                     "'")))))))
+              0))
+          0))
+      0)
+    0))
+
+(defn m-append-strings! [(dst (ptr (ArrayList (slice u8))))
+                         (src (ptr (ArrayList (slice u8))))] (-> i64)
+  (for [i 0 (len (load src))] (push! dst (get (load src) i)) 0)
+  0)
+
+(defn m-append-native-deps! [(dst (ptr (ArrayList ManifestNativeDep)))
+                             (src (ptr (ArrayList ManifestNativeDep)))] (-> i64)
+  (for [i 0 (len (load src))]
+    (push! dst (load (elem src i)))
+    0)
+  0)
+
+; What an executable artifact links unconditionally: its own link keys and the
+; native dependencies it selected. The root package's own [link], [cc] and
+; unselected native dependencies describe the package executable and are absent;
+; dependency packages are offered to the link separately, and each one applies
+; only if the artifact's own compilation loads its code.
+(defn m-artifact-link-set [(a (dyn Allocator))
+                           (m (ptr Manifest))
+                           (item (ptr ManifestArtifact))]
+  (-> (ptr ManifestLinkSet))
+  (let [s (m-new-link-set a)
+        own (.link item)]
+    (m-append-strings! (.frameworks s) (.frameworks own))
+    (m-append-strings! (.libs s) (.libs own))
+    (m-append-strings! (.flags s) (.flags own))
+    (m-append-strings! (.search-paths s) (.search-paths own))
+    (m-append-strings! (.objects s) (.objects own))
+    (m-append-native-deps! (.native-deps s) (.native-deps item))
+    s))
+
+; The command-line settings an artifact shares with the package executable: the
+; target, backend, profile, optimization and instrumentation flags. The package's
+; `-o`, its link inputs, and program arguments after `--` are not forwarded.
+(defn m-forward-artifact-flags! [(b (mut StrBuf))
+                                 (argc i32)
+                                 (argv (ptr (ptr i8)))] (-> i64)
+  (let [(mut i) 2]
+    (loop (if (>= (load i) (primitive/cast i64 argc))
+              (break)
+              (let [arg (from-cstr (load (index argv (load i))))]
+                (cond (= arg "--") (break)
+                      (= arg "-o") (set! i (+ (load i) 2))
+                      (and (or (= arg "--target") (= arg "--backend"))
+                           (< (+ (load i) 1) (primitive/cast i64 argc)))
+                        (do
+                          (push-str! (mut b) " ")
+                          (m-shell-quoted! (mut b) arg)
+                          (push-str! (mut b) " ")
+                          (m-shell-quoted! (mut b)
+                                           (from-cstr (load (index argv
+                                                                   (+ (load i)
+                                                                      1)))))
+                          (set! i (+ (load i) 2))
+                          0)
+                      (or (= arg "-g")
+                          (= arg "--debug")
+                          (= arg "--release")
+                          (= arg "--quiet")
+                          (= arg "--debug-checks")
+                          (= arg "--debug-runtime")
+                          (starts-with arg "-O")
+                          (starts-with arg "--sanitize=")
+                          (starts-with arg "--jit="))
+                        (do
+                          (push-str! (mut b) " ")
+                          (m-shell-quoted! (mut b) arg)
+                          (set! i (+ (load i) 1))
+                          0)
+                      :else (set! i (+ (load i) 1)))))))
+  0)
+
+; Emit the secondary artifact build edges that precede the package executable's
+; build (or run). Only a bare manifest `build`/`run` reaches this helper; naming a
+; source file keeps the established single-artifact behavior. Each artifact
+; compiles under the package's namespace roots, dependencies, metaprograms and
+; readers; an executable is linked by the ordinary `build` command, which replaces
+; its output atomically.
+(defn m-build-artifacts! [(a (dyn Allocator))
+                          (b (mut StrBuf))
+                          (m (ptr Manifest))
+                          (self (slice u8))
+                          (argc i32)
+                          (argv (ptr (ptr i8)))] (-> i64)
+  (let [items (load (field m artifacts))]
+    (for [ai 0 (len items)]
+      (let [item (get (load items) ai)
+            executable (m-artifact-executable? item)
+            out (m-output-path a (.out item))
+            parent (dirname out)
+            optimization
+              (if (> (len (.optimization item)) 0)
+                  (.optimization item)
+                  (.optimization m))]
+        (push-str! (mut b) "mkdir -p ")
+        (m-shell-quoted! (mut b) parent)
+        (push-str! (mut b) " && ")
+        (m-emit-dep-env a (mut b) m)
+        (m-shell-quoted! (mut b) self)
+        (push-str! (mut b) (if executable " build " " emit-obj "))
+        (m-shell-quoted! (mut b) (.entry item))
+        (push-str! (mut b) " -o ")
+        (m-shell-quoted! (mut b) out)
+        (m-emit-uses a (mut b) m)
+        (when executable
+          (m-emit-link-set a (mut b) (m-artifact-link-set a m item) false)
+          (m-emit-dep-packages! a (mut b) m)
+          0)
+        (when (.has-target m)
+          (push-str! (mut b) " --target ")
+          (m-shell-quoted! (mut b) (.target m))
+          0)
+        (when (> (len optimization) 0)
+          (push-str! (mut b) " -O")
+          (push-str! (mut b) optimization)
+          0)
+        (when (.debug m) (push-str! (mut b) " -g") 0)
+        (when (.debug-checks m) (push-str! (mut b) " --debug-checks") 0)
+        (m-push-jit-flag! a (mut b) m)
+        (m-forward-artifact-flags! (mut b) argc argv)
+        (push-str! (mut b) " && "))
+      0)
+    0))
+
+; `extra` is appended verbatim to the child's command line, after the manifest's own
+; flags and before the user's. `check` is the only caller that passes anything: it
+; attaches the project's test corpus to the entry compile (see project-check-cmd), and
+; assembling that command by hand instead would be a second, drifting copy of this.
+(defn manifest-cmd [(a (dyn Allocator))
+                    (sub (slice u8))
+                    (argc i32)
+                    (argv (ptr (ptr i8)))
+                    (fidx i64)
+                    (extra (slice u8))] (-> i64)
+  (scope
+    :manifest-cmd
+      (let [self (from-cstr (load (index argv 0)))
+            text (read-file a (to-cstr a "Coil.toml"))]
+        (if (= (len text) 0)
+            (do
+              (ps (stderr)
+                  "error: no Coil.toml in the current directory (pass a <file> to build directly)\n")
+              1)
+            (let [m
+                    (if (project-manifest?)
+                        (project-manifest)
+                        (parse-manifest a text))
+                  explicit (!= fidx 0)
+                  ; A bare project `build` or `run` produces every declared
+                  ; artifact before the package executable.
+                  artifacts?
+                    (and (not explicit) (or (= sub "build") (= sub "run")))
+                  _profile (m-select-profile! a argc argv m)
+                  entry
+                    (if explicit
+                        (from-cstr (load (index argv fidx)))
+                        (m-entry-file a m))
+                  exe (m-exe-path a m explicit entry)
+                  (mut b) (StrBuf::new a)]
+              (when (and (not explicit)
+                         (m-library-package? a m)
+                         (or (= sub "build") (= sub "run")))
+                (ps (stderr) "error: ")
+                (ps (stderr) (.name m))
+                (ps (stderr)
+                    " is a library package (no [package] entry and no src/main.coil): there is no program to ")
+                (ps (stderr) sub)
+                (ps (stderr)
+                    "; `coil check` checks it and `coil test` runs its tests\n")
+                (return-from :manifest-cmd 1))
+              (when (and (m-workspace? m) (not explicit))
+                (return-from
+                  :manifest-cmd
+                    (workspace-fanout a
+                                      sub
+                                      (resolve-command-path a
+                                                            self)
+                                      m
+                                      argc
+                                      argv))
+                0)
+              (when (and artifacts? (> (len (load (field m artifacts))) 0))
+                (m-check-artifact-outputs! a m)
+                0)
+              (unless (project-manifest?) (m-prepare-deps a m) 0)
+              (m-prepare-native-deps a m)
+              (when artifacts?
+                (m-prepare-artifact-native-deps a m)
+                (m-build-artifacts! a (mut b) m self argc argv)
+                0)
+              ; mkdir first: `env A=… x && y` gives the environment to x alone,
+              ; and the compile is y.
+              (when (and (= sub "build") (not (argv-has-flag? argc argv "-o")))
+                (push-str! (mut b) "mkdir -p ")
+                (m-shell-quoted! (mut b) (dirname exe))
+                (push-str! (mut b) " && ")
+                0)
+              (m-emit-dep-env a (mut b) m)
+              (push-str! (mut b) self)
+              (push-str! (mut b) " ")
+              (push-str! (mut b) sub)
+              (push-str! (mut b) " ")
+              (m-shell-quoted! (mut b) entry)
+              ; without `-o`, where the manifest puts the package executable,
+              ; or a named file under its own name
+              (when (and (= sub "build") (not (argv-has-flag? argc argv "-o")))
+                (push-str! (mut b) " -o ")
+                (m-shell-quoted! (mut b) exe)
+                0)
+              (m-emit-uses a (mut b) m)
+              (m-emit-link a (mut b) m)
+              (m-cc-sources a (mut b) m)
+              (m-emit-dep-packages! a (mut b) m)
+              (when (.has-target m)
+                (push-str! (mut b) " --target ")
+                (push-str! (mut b) (.target m))
+                0)
+              (when (> (len (.optimization m))
+                       0)
+                (push-str! (mut b) " -O")
+                (push-str! (mut b) (.optimization m))
+                0)
+              (when (.debug m) (push-str! (mut b) " -g") 0)
+              (when (.debug-checks m)
+                (push-str! (mut b) " --debug-checks")
+                0)
+              (m-push-jit-flag! a (mut b) m)
+              (push-str! (mut b) extra)
+              (m-forward-flags a (mut b) argc argv fidx)
+              ; run: forward CLI args after `--`, else the manifest's [run] args.
+              ;
+              ; ONLY what follows `--` is a program argument. This loop used to append
+              ; every argv element that was not the literal `--`, so the build flags
+              ; before it were forwarded a SECOND time as program args: `coil run --use
+              ; httptap -- tui` handed the program `["--use" "httptap" "tui"]`, and a
+              ; program that dispatches on argv[1] saw `--use` instead of `tui`.
+              ; m-forward-flags above is what puts those flags on the build line; they
+              ; have no business past the `--`. (Single-file run-cmd always did this.)
+              (when (= sub "run")
+                (let [(mut i) 2
+                      (mut sawdd) false]
+                  (push-str! (mut b) " --")
+                  (loop (if (>= (load i) (primitive/cast i64 argc))
+                            (break)
+                            (do
+                              (if (load sawdd)
+                                  (do
+                                    ; One shell word per argument, exactly as the
+                                    ; user's shell passed it: unquoted, a second shell
+                                    ; split `two words` and ran `;`, `|` and `$(…)`.
+                                    (push-str! (mut b) " ")
+                                    (m-shell-quoted! (mut b)
+                                                     (from-cstr (load (index argv
+                                                                             (load i)))))
+                                    0)
+                                  (if (= (from-cstr (load (index argv
+                                                                 (load i))))
+                                         "--")
+                                      (do (set! sawdd true) 0)
+                                      0))
+                              (set! i (primitive/iadd (load i) 1)))))
+                  (when (not (load sawdd))
+                    (let [ra (load (field m rargs))
+                          (mut k) 0
+                          nr (len ra)]
+                      (loop (if (>= (load k) nr)
+                                (break)
+                                (do
+                                  (push-str! (mut b) " ")
+                                  (m-shell-quoted! (mut b) (get ra (load k)))
+                                  (set! k (primitive/iadd (load k) 1)))))))))
+              (let [rc
+                      (primitive/cast i64
+                                      (system (to-cstr a
+                                                       (str (load b)))))]
+                (wait-report rc "program")
+                (wait-code rc)))))))
+
+; Build the current package and install its executable into a user-wide prefix,
+; mirroring `cargo install --path .`. The package name is the command name; [build]
+; out remains the local `coil build` artifact name and does not leak into the public
+; installation interface.
+(defn install-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))]
+  (-> i64)
+  (let [text (read-file a (to-cstr a "Coil.toml"))]
+    (if (= (len text) 0)
+        (do (ps (stderr) "error: no Coil.toml in the current directory\n") 1)
+        (let [m (parse-manifest a text)
+              name (.name m)
+              homep (unit-getenv (to-cstr a "HOME"))
+              _profile (m-select-profile! a argc argv m)
+              envrootp (unit-getenv (to-cstr a "COIL_INSTALL_ROOT"))
+              (mut root)
+                (if (!= (primitive/cast i64 envrootp) 0)
+                    (from-cstr envrootp)
+                    (if (!= (primitive/cast i64 homep) 0)
+                        (cat3-d a (from-cstr homep) "/.local")
+                        ""))
+              (mut i) 2]
+          (unless (m-dep-name? name)
+            (do
+              (ps (stderr)
+                  "error: [package].name is required and may contain only letters, digits, '-' and '_'\n")
+              (exit 1)
+              0))
+          (loop (if (>= (load i) (primitive/cast i64 argc))
+                    (break)
+                    (let [arg (from-cstr (load (index argv (load i))))]
+                      (if (= arg "--root")
+                          (if (>= (primitive/iadd (load i) 1)
+                                  (primitive/cast i64 argc))
+                              (do
+                                (ps (stderr)
+                                    "error: --root requires a directory\n")
+                                (exit 1)
+                                0)
+                              (do
+                                (set! root
+                                      (from-cstr (load (index argv
+                                                              (primitive/iadd (load i)
+                                                                              1)))))
+                                (set! i (primitive/iadd (load i) 2))
+                                0))
+                          (do
+                            (ps (stderr) "error: unknown install option '")
+                            (ps (stderr) arg)
+                            (ps (stderr) "'\n")
+                            (exit 1)
+                            0)))))
+          (when (= (len (load root)) 0)
+            (do
+              (ps (stderr)
+                  "error: cannot choose an install root; set HOME, COIL_INSTALL_ROOT, or pass --root DIR\n")
+              (exit 1)
+              0))
+          (unless (m-shell-value? (load root))
+            (do
+              (ps (stderr)
+                  "error: install root cannot contain quotes or newlines\n")
+              (exit 1)
+              0))
+          (let [self (from-cstr (load (index argv 0)))
+                entry (m-entry-file a m)
+                artifact (cat3-d a ".coil/build/install/" name)
+                bindir (cat3-d a (load root) "/bin")
+                destination (cat3-d a bindir (cat3-d a "/" name))
+                (mut b) (StrBuf::new a)]
+            (m-prepare-deps a m)
+            (m-prepare-native-deps a m)
+            (push-str! (mut b) "mkdir -p '.coil/build/install' && ")
+            (m-emit-dep-env a (mut b) m)
+            (m-shell-quoted! (mut b) self)
+            (push-str! (mut b) " build ")
+            (m-shell-quoted! (mut b) entry)
+            (push-str! (mut b) " -o ")
+            (m-shell-quoted! (mut b) artifact)
+            (m-emit-uses a (mut b) m)
+            (m-emit-link a (mut b) m)
+            (m-cc-sources a (mut b) m)
+            (m-emit-dep-packages! a (mut b) m)
+            (when (.has-target m)
+              (push-str! (mut b) " --target ")
+              (m-shell-quoted! (mut b) (.target m))
+              0)
+            (when (> (len (.optimization m)) 0)
+              (push-str! (mut b) " -O")
+              (push-str! (mut b) (.optimization m))
+              0)
+            (when (.debug m) (push-str! (mut b) " -g") 0)
+            (when (.debug-checks m) (push-str! (mut b) " --debug-checks") 0)
+            (m-push-jit-flag! a (mut b) m)
+            (push-str! (mut b) " && mkdir -p ")
+            (m-shell-quoted! (mut b) bindir)
+            (push-str! (mut b) " && cp ")
+            (m-shell-quoted! (mut b) artifact)
+            (push-str! (mut b) " ")
+            (m-shell-quoted! (mut b) destination)
+            (push-str! (mut b) " && chmod 755 ")
+            (m-shell-quoted! (mut b) destination)
+            (let [rc
+                    (primitive/cast i64
+                                    (system (to-cstr a (str (load b)))))]
+              (wait-report rc "install")
+              (if (= (wait-code rc) 0)
+                  (do
+                    (ps (stdout) "installed ")
+                    (ps (stdout) name)
+                    (ps (stdout) " -> ")
+                    (ps (stdout) destination)
+                    (wb (stdout) 10)
+                    0)
+                  (wait-code rc))))))))
+
+; The files a package owns: every `.coil` (or configured guest-language) file
+; below its source roots, plus an entry outside them, minus its `exclude` list.
+; This is the namespace index's own walk over the package's roots — one
+; definition of "project source", shared by lint and fmt —
+; so the files a command visits and the modules the loader can resolve never
+; disagree. `src tests` is a convention, not a promise that both exist; a
+; missing root is simply not walked.
+(defn project-source-index [(a (dyn Allocator)) (m (ptr Manifest))]
+  (-> (ptr LS))
+  (let [s (box! a LS (zeroed LS))
+        ; A workspace root owns its members, not a `src`/`tests` pair of its own.
+        roots (m-configured-roots a m)
+        (mut joined) (StrBuf::new a)
+        (mut files) (ArrayList::new [(slice u8)] a)]
+    (ls-init! s a)
+    ; The manifest's exclusions, exactly as project mode installs them.
+    (when (= (primitive/cast i64
+                             (unit-getenv (to-cstr a
+                                                   "COIL_NAMESPACE_EXCLUDES")))
+             0)
+      (setenv (to-cstr a "COIL_NAMESPACE_EXCLUDES")
+              (to-cstr a (m-excludes-env a m))
+              1)
+      0)
+    (for [i 0 (len roots)]
+      (let [root (get roots i)]
+        (if (dir? (to-cstr a root))
+            (do
+              (when (> (len (str (load joined))) 0)
+                (push-str! (mut joined) ":")
+                0)
+              (push-str! (mut joined) root)
+              0)
+            (when (= (primitive/cast i64 (access (to-cstr a root) 0))
+                     0)
+              (push! (mut files) root)
+              0)))
+      0)
+    (when (> (len (str (load joined))) 0)
+      (namespace-index-roots! s (str (load joined)))
+      0)
+    ; An entry file outside every root is project source too.
+    (for [i 0 (len (load files))]
+      (match (m-realpath a (get (load files) i))
+        (Some [canonical] (namespace-index-file! s canonical))
+        (None [] 0))
+      0)
+    s))
+
+; The owned files, spelled relative to the working directory when they are
+; below it (as a user would name them), in a stable order so every command
+; visits them the same way.
+(defn project-source-files [(a (dyn Allocator)) (index (ptr LS))]
+  (-> (ptr (ArrayList (slice u8))))
+  (let [out (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+        paths (field index indexed_paths)
+        prefix (sconcat a (cwd-slice a) "/")
+        n (len (load paths))]
+    (for [i 0 n]
+      (let [full (get (load paths) i)
+            p
+              (if (starts-with full prefix)
+                  (subslice [u8] full (len prefix) (len full))
+                  full)
+            (mut j) (len (load out))]
+        (push! out p)
+        (loop (if (and (> (load j) 0)
+                       (slice-lt? p
+                                  (get (load out)
+                                       (primitive/isub (load j) 1))))
+                  (do
+                    (set! out
+                          (load j)
+                          (get (load out) (primitive/isub (load j) 1)))
+                    (set! j (primitive/isub (load j) 1)))
+                  (break)))
+        (set! out (load j) p))
+      0)
+    out))
+
+; `coil test <file> [flags]` — the project test runner (tool-12). Builds the file with
+; src/stdlib/assert.coil auto-loaded (`--use`, so `deftest`/`assert`/`assert-eq` need NO import),
+; then RUNS it. assert.coil's `(transform …)` discovers every `(deftest …)` and synthesizes
+; a `main` that runs each test in its own spawned process; the process exit is 0 iff all pass, 1 if
+; any test fails. Like `run`, it reuses the `build` subcommand as a subprocess so there is
+; no second copy of the build/link pipeline. Flags after the file (e.g. `--backend arm64`,
+; `-l<lib>`) are forwarded to the build.
+; Flags that belong to the TEST RUNNER, not to the build.
+;
+; `coil test` builds a program and then runs it, so a flag on the command line is
+; ambiguous between the two. These go to the program: they are `coil.prop`'s knobs
+; (`--cases`, `--seed`, …), read from the runner's own argv. Everything else is
+; still forwarded to `coil build`, which is where `--sanitize=address`,
+; `--debug-checks` and the rest belong.
+;
+; They are listed rather than pattern-matched so an unknown flag still reaches the
+; build and gets its existing "unknown flag" diagnostic, instead of being silently
+; passed to a program that will ignore it.
+(defn test-runner-flag? [(arg (slice u8))] (-> bool)
+  (cond (= arg "--cases") true
+        (= arg "--filter") true
+        (= arg "--jobs") true
+        (= arg "--seed") true
+        (= arg "--size") true
+        (= arg "--shrink") true
+        (= arg "--max-rejects") true
+        (= arg "--timeout") true
+        (= arg "--candidate-timeout") true
+        (= arg "--arena") true
+        (= arg "--fuzz") true
+        (= arg "--target-steps") true
+        :else false))
+
+;;; The runner flag a `coil fuzz` option that takes a value is forwarded as, or ""
+;;; if `arg` is not one. One table, so the parser and the forwarding cannot disagree
+;;; about which options exist.
+(defn fuzz-value-flag [(arg (slice u8))] (-> (slice u8))
+  (cond (or (= arg "-n") (= arg "--iterations")) "--fuzz"
+        (= arg "--time") "--fuzz-time"
+        (= arg "--jobs") "--fuzz-jobs"
+        (= arg "--input-timeout") "--input-timeout"
+        (= arg "--status-every") "--status-every"
+        (= arg "--cases") "--cases"
+        (= arg "--seed") "--seed"
+        (= arg "--size") "--size"
+        (= arg "--filter") "--filter"
+        (= arg "--corpus") "--corpus"
+        (= arg "--fuzz-dir") "--fuzz-dir"
+        (= arg "--arena") "--arena"
+        :else ""))
+
+(defn test-wanted? [(want (ptr (ArrayList (slice u8)))) (name (slice u8))]
+  (-> bool)
+  (let [(mut found) false
+        (mut i) 0]
+    (loop (if (>= (load i) (len (load want)))
+              (break)
+              (if (= (get (load want) (load i)) name)
+                  (do (set! found true) (break))
+                  (set! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
+(defn test-print-suite-names [(w (ptr Writer))
+                              (suites (ptr (ArrayList (ptr ManifestSuite))))]
+  (-> i64)
+  (let [(mut i) 0]
+    (loop (if (>= (load i) (len (load suites)))
+              (break)
+              (do
+                (when (> (load i) 0) (ps w ", ") 0)
+                (ps w (.name (get (load suites) (load i))))
+                (set! i (primitive/iadd (load i) 1))))))
+  0)
+
+; Which suites this invocation runs. No `--suite` means the default set — that is the
+; whole point of the feature: `coil test` runs what a contributor should run without
+; thinking, and an expensive suite waits to be asked for by name. `--suite all` takes
+; every declared suite regardless of its `default`.
+;
+; Unknown names are rejected before anything is discovered or built. A typo that
+; silently selected nothing would report success having run no tests, which is the one
+; failure mode a test runner must never have.
+(defn test-select-suites [(a (dyn Allocator))
+                          (m (ptr Manifest))
+                          (want (ptr (ArrayList (slice u8))))]
+  (-> (ptr (ArrayList (ptr ManifestSuite))))
+  (let [suites (load (field m suites))
+        out
+          (box! a
+                (ArrayList (ptr ManifestSuite))
+                (zeroed (ArrayList (ptr ManifestSuite))))
+        (mut want-all) false
+        (mut i) 0]
+    (set! out (ArrayList::new [(ptr ManifestSuite)] a))
+    (loop (if (>= (load i) (len (load want)))
+              (break)
+              (let [wname (get (load want) (load i))]
+                (if (= wname "all")
+                    (set! want-all true)
+                    (when (= (primitive/cast i64 (m-find-suite suites wname))
+                             0)
+                      (ps (stderr) "error: unknown test suite '")
+                      (ps (stderr) wname)
+                      (ps (stderr) "' (known: ")
+                      (test-print-suite-names (stderr) suites)
+                      (ps (stderr) ")\n")
+                      (exit 2)
+                      0))
+                (set! i (primitive/iadd (load i) 1)))))
+    (let [(mut k) 0]
+      (loop (if (>= (load k) (len (load suites)))
+                (break)
+                (let [s (get (load suites) (load k))]
+                  (when (if (= (len (load want)) 0)
+                            (.is-default s)
+                            (or (load want-all)
+                                (test-wanted? want (.name s))))
+                    (push! [(ptr ManifestSuite)] out s)
+                    0)
+                  (set! k (primitive/iadd (load k) 1))))))
+    out))
+
+; Append `find <roots> -type f '(' -name '*<suffix>' … ')' ['(' -path '*sel*' -o … ')']`
+; for one suite. Several path selectors select the files any of them names.
+; Returns 0 if the suite contributed nothing because every root is absent.
+;
+; A root the manifest NAMED must exist: a typo'd root would otherwise discover no files
+; and report a green run. A root the compiler GUESSED (the implicit `tests`) is allowed
+; to be missing, because a project with no tests directory is legitimate.
+(defn test-emit-find! [(a (dyn Allocator))
+                       (cmd (mut StrBuf))
+                       (s (ptr ManifestSuite))
+                       (selectors (ptr (ArrayList (slice u8))))] (-> i64)
+  (let [roots (load (field s roots))
+        suffixes (load (field s suffixes))
+        (mut live) 0
+        (mut r) 0]
+    (loop (if (>= (load r) (len (load roots)))
+              (break)
+              (let [root (get (load roots) (load r))]
+                (if (dir? (to-cstr a root))
+                    (set! live (primitive/iadd (load live) 1))
+                    (when (.roots-declared s)
+                      ; located like every other manifest error, so the fix is one jump away.
+                      (ps (stderr) "error: Coil.toml:")
+                      (ps (stderr) (i64->str a (.line s)))
+                      (ps (stderr) ": test suite '")
+                      (ps (stderr) (.name s))
+                      (ps (stderr) "': root '")
+                      (ps (stderr) root)
+                      (ps (stderr) "' does not exist\n")
+                      (exit 2)
+                      0))
+                (set! r (primitive/iadd (load r) 1)))))
+    (if (= (load live) 0)
+        0
+        (do
+          (push-str! (mut cmd) "find ")
+          (let [(mut i) 0
+                (mut emitted) 0]
+            (loop (if (>= (load i) (len (load roots)))
+                      (break)
+                      (let [root (get (load roots) (load i))]
+                        (when (dir? (to-cstr a root))
+                          (when (> (load emitted) 0)
+                            (push-str! (mut cmd) " ")
+                            0)
+                          (m-shell-quoted! (mut cmd) root)
+                          (set! emitted (primitive/iadd (load emitted) 1))
+                          0)
+                        (set! i (primitive/iadd (load i) 1))))))
+          (push-str! (mut cmd) " -type f '(' ")
+          (let [(mut j) 0]
+            (loop (if (>= (load j) (len (load suffixes)))
+                      (break)
+                      (do
+                        (when (> (load j) 0)
+                          (push-str! (mut cmd) " -o ")
+                          0)
+                        (push-str! (mut cmd) "-name ")
+                        (m-shell-quoted! (mut cmd)
+                                         (cat3-d a
+                                                 "*"
+                                                 (get (load suffixes) (load j))))
+                        (set! j (primitive/iadd (load j) 1))))))
+          (push-str! (mut cmd) " ')' ")
+          ; the filename selectors narrow whatever the suites already chose.
+          (when (> (len (load selectors)) 0)
+            (push-str! (mut cmd) "'(' ")
+            (let [(mut first) true]
+              (for selector (load selectors)
+                (unless first (push-str! (mut cmd) "-o ") 0)
+                (set! first false)
+                (push-str! (mut cmd) "-path ")
+                (m-shell-quoted! (mut cmd)
+                                 (cat3-d a "*" (cat3-d a selector "*")))
+                (push-str! (mut cmd) " ")))
+            (push-str! (mut cmd) "')' ")
+            0)
+          1))))
+
+; Discover the test corpus `coil test` would select — the same suites, the same roots
+; and suffixes — into ONE NUL-separated list file, and answer whether it found
+; anything. The caller owns `batchdir` and removes it.
+;
+; This is the only shell-out the project check makes, and it is `find`, not a compile.
+(defn project-check-roots! [(a (dyn Allocator))
+                            (m (ptr Manifest))
+                            (batchdir (slice u8))
+                            (batchlist (slice u8))] (-> bool)
+  (block
+    :project-check-roots
+      (let [want
+              (box! a
+                    (ArrayList (slice u8))
+                    (zeroed (ArrayList (slice u8))))
+            (mut cmd) (StrBuf::new a)
+            (mut emitted) 0
+            (mut k) 0]
+        (store! want (ArrayList::new [(slice u8)] a))
+        (let [chosen (test-select-suites a m want)
+              n-chosen (len (load chosen))]
+          ; No suite is selected at all, so there is no test source to check. That is
+          ; not a failure — a project may legitimately declare only opt-in suites.
+          (when (= n-chosen 0)
+            (return-from :project-check-roots false)
+            0)
+          (push-str! (mut cmd) "mkdir -p ")
+          (m-shell-quoted! (mut cmd) batchdir)
+          (push-str! (mut cmd) " && { ")
+          (loop (if (>= (load k) n-chosen)
+                    (break)
+                    (let [su (get (load chosen) (load k))
+                          (mut one) (StrBuf::new a)]
+                      (when (= (test-emit-find! a
+                                                (mut one)
+                                                su
+                                                (box-al a
+                                                        (ArrayList::new [(slice u8)]
+                                                                        a)))
+                               1)
+                        (push-str! (mut cmd) (str (load one)))
+                        (push-str! (mut cmd) "-print0; ")
+                        (store! emitted (primitive/iadd (load emitted) 1))
+                        0)
+                      (store! k (primitive/iadd (load k) 1)))))
+          (push-str! (mut cmd) "}")
+          ; Every selected suite's roots are absent. Nothing to check, and nothing
+          ; configured wrongly either: a declared root that does not exist is
+          ; already a manifest error.
+          (when (= (load emitted) 0)
+            (return-from :project-check-roots false)
+            0)
+          ; -u so overlapping suite roots cannot list one file twice.
+          (push-str! (mut cmd) " | LC_ALL=C sort -zu > ")
+          (m-shell-quoted! (mut cmd) batchlist)
+          (when (!= (wait-code (primitive/cast i64
+                                               (system (to-cstr a
+                                                                (str (load cmd))))))
+                    0)
+            (return-from :project-check-roots false)
+            0)
+          (> (len (read-file a (to-cstr a batchlist)))
+             0)))))
+
+; The command-line tail that attaches a discovered corpus to a compile: the roots
+; themselves, plus the metaprogram `deftest`/`assert` need in order to resolve, exactly
+; as the test BUILD passes it.
+(defn project-check-roots-flags [(a (dyn Allocator)) (batchlist (slice u8))]
+  (-> (slice u8))
+  (let [(mut b) (StrBuf::new a)]
+    (push-str! (mut b) " --test-roots-file ")
+    (m-shell-quoted! (mut b) batchlist)
+    (push-str! (mut b) " --use coil.test-runner")
+    (str (load b))))
+
+; `coil check --target tests`: the corpus with no entry graph in front of it. There is
+; no package entry to hang the test roots on, so the corpus needs an entry of its own —
+; the same empty `coil_project_test_harness` stub `coil test` builds its runner from.
+; Namespace roots and dependency paths reach the child through the environment
+; `apply-project-manifest!` already set; everything else has to be handed over on its
+; command line, because a child that inherits COIL_NAMESPACE_ROOTS treats the manifest
+; as already applied and will not re-read it.
+(defn project-check-tests-only [(a (dyn Allocator))
+                                (m (ptr Manifest))
+                                (self (slice u8))
+                                (batchroot (slice u8))
+                                (batchlist (slice u8))] (-> i64)
+  (let [(mut cmd) (StrBuf::new a)]
+    (push-str! (mut cmd) "printf '(module coil_project_test_harness)\\n' > ")
+    (m-shell-quoted! (mut cmd) batchroot)
+    (push-str! (mut cmd) " && ")
+    (m-shell-quoted! (mut cmd) self)
+    (push-str! (mut cmd) " check ")
+    (m-shell-quoted! (mut cmd) batchroot)
+    (push-str! (mut cmd) (project-check-roots-flags a batchlist))
+    ; The SAME configuration the test BUILD used. `check` does not link a program, but
+    ; a comptime expression that reaches native code still links a dylib with the
+    ; program's flags (metaengine::me-link-flags-str), so dropping [link]/[cc] here
+    ; would fail exactly the projects whose comptime calls a library.
+    (m-emit-uses a (mut cmd) m)
+    (m-emit-link a (mut cmd) m)
+    (m-cc-sources a (mut cmd) m)
+    (m-emit-dep-packages! a (mut cmd) m)
+    (when (.has-target m)
+      (push-str! (mut cmd) " --target ")
+      (m-shell-quoted! (mut cmd) (.target m))
+      0)
+    (wait-code (primitive/cast i64 (system (to-cstr a (str (load cmd))))))))
+
+; `coil check` in a project: the front end over everything the project would build —
+; the entry graph and every test file — and nothing downstream of it. No object is
+; emitted, nothing is linked, no test binary is produced, and no test is run. This is
+; the `cargo check` shape: it answers "does this project compile", not "does it link"
+; and not "does it pass".
+;
+; It used to run `build -o .coil/build/check/project && test --no-run`, which linked
+; the project executable and then ran codegen and a link for every test file. That
+; made `check` strictly slower than `build` on any project with tests, to answer a
+; question neither the codegen nor the link contributes to. Link-level validation of
+; [link]/[cc] is what `build` is for, and `coil verify` still chains all four stages.
+;;; A package with no [package] entry and no default src/main.coil: a library,
+;;; compiled through whoever imports it.
+(defn m-library-package? [(a (dyn Allocator)) (m (ptr Manifest))] (-> bool)
+  (and (not (m-workspace? m))
+       (= (len (.entry m)) 0)
+       (!= (access (to-cstr a "src/main.coil") 0) 0)))
+
+;;; Add every source file the package owns to the corpus roots list BATCHLIST (NUL
+;;; separated), so a library's modules are checked even when no test imports them.
+(defn project-check-library-roots! [(a (dyn Allocator))
+                                    (m (ptr Manifest))
+                                    (batchdir (slice u8))
+                                    (batchlist (slice u8))] (-> bool)
+  (let [index (project-source-index a m)
+        files (project-source-files a index)
+        existing (read-file a (to-cstr a batchlist))
+        (mut body) (StrBuf::new a)]
+    (unit-mkdirs! a batchdir)
+    (push-str! (mut body) existing)
+    (for i (range 0 (len (load files)))
+      (let [f (get (load files) i)
+            entry (sconcat a f "\0")]
+        (unless (match (find existing entry)
+                  (Some [_] true)
+                  (None [] false))
+          (push-str! (mut body) entry))))
+    (when (!= (d-write-file a batchlist (str body)) 0)
+      (exit 1))
+    (> (len (str body)) 0)))
+
+(defn project-check-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))]
+  (-> i64)
+  (let [self (from-cstr (load (index argv 0)))
+        text (read-file a (to-cstr a "Coil.toml"))]
+    (if (= (len text) 0)
+        (do (ps (stderr) "error: no Coil.toml in the current directory\n") 1)
+        (let [m (parse-manifest a text)
+              _profile (m-select-profile! a argc argv m)
+              tests-only
+                (and (>= (primitive/cast i64 argc) 4)
+                     (and (= (from-cstr (load (index argv 2)))
+                             "--target")
+                          (= (from-cstr (load (index argv 3)))
+                             "tests")))
+              batchdir (temp-or-exit "check-batch")
+              batchroot (cat3-d a batchdir "/suite.coil")
+              batchlist (cat3-d a batchdir "/roots")
+              (mut rc) 0]
+          (m-prepare-deps a m)
+          (m-prepare-native-deps a m)
+          (let [library (m-library-package? a m)
+                have-tests
+                  (let [tests (project-check-roots! a m batchdir batchlist)]
+                    (if library
+                        (project-check-library-roots! a m batchdir batchlist)
+                        tests))]
+            ; ONE front end over the whole project: the entry graph with the entire
+            ; selected test corpus loaded alongside it as extra roots (load-test-roots!).
+            ; Typechecking is not reachability-gated — an uncalled function is checked
+            ; like any other — so the tests do not need the runner's generated `main` to
+            ; be checked, and the entry keeps its own. Everything the two graphs share,
+            ; which on a real project is most of them, is read, expanded and checked
+            ; once.
+            ;
+            ; This was a front end PER TEST FILE, spawned through `xargs -n 1`. Every
+            ; child re-read the standard library, re-indexed the project's namespaces
+            ; and rebuilt its own metaprogram dylib, to check one file; a project with
+            ; 66 test files paid that fixed cost 66 times over — 70s warm, and over five
+            ; minutes cold. The same work is now ~4s in a single process.
+            ;
+            ; The entry goes through `manifest-cmd`, which is what `build` reaches from
+            ; here — same dependency roots, metaprograms, [link], [cc] and target, only
+            ; `check` in place of `build` and so no `-o` and no link.
+            (set! rc
+                  (if (or tests-only library)
+                      (if have-tests
+                          (project-check-tests-only a
+                                                    m
+                                                    self
+                                                    batchroot
+                                                    batchlist)
+                          0)
+                      (manifest-cmd a
+                                    "check"
+                                    argc
+                                    argv
+                                    0
+                                    (if have-tests
+                                        (project-check-roots-flags a batchlist)
+                                        "")))))
+          (temp/remove! batchdir)
+          (load rc)))))
+
+(defn verify-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (let [self (from-cstr (load (index argv 0)))
+        text (read-file a (to-cstr a "Coil.toml"))]
+    (if (= (len text) 0)
+        (do (ps (stderr) "error: no Coil.toml in the current directory\n") 1)
+        (do
+          ; Parsing first makes manifest validation a distinct, early verification phase.
+          (let [(mut cmd) (StrBuf::new a)
+                library (m-library-package? a (parse-manifest a text))]
+            (m-shell-quoted! (mut cmd) self)
+            (push-str! (mut cmd) " fmt --check && ")
+            (m-shell-quoted! (mut cmd) self)
+            (push-str! (mut cmd) " lint && ")
+            (m-shell-quoted! (mut cmd) self)
+            (push-str! (mut cmd) " check && ")
+            ; The project LINK belongs here, not in `check`. Nothing else in the
+            ; pipeline links the package: `check` deliberately stops before codegen and
+            ; `test` links only its own test binaries, so without this step a broken
+            ; [link] or [cc] entry would survive a green `verify` and surface on the
+            ; next `build`. The artifact is compiler-owned and never the package output
+            ; named by [build].
+            ; A library package has no program to link; check covered its modules.
+            (unless library
+              (push-str! (mut cmd) "mkdir -p '.coil/build/verify' && ")
+              (m-shell-quoted! (mut cmd) self)
+              (push-str! (mut cmd)
+                         " build -o '.coil/build/verify/project' --quiet && "))
+            (m-shell-quoted! (mut cmd) self)
+            (push-str! (mut cmd) " test")
+            (wait-code (primitive/cast i64
+                                       (system (to-cstr a (str (load cmd)))))))))))
+
+;;; The options lint-cmd reads a value after.
+(defn check-fix-flag-takes-value? [(arg (slice u8))] (-> bool)
+  (or (= arg "--max-analyses")
+      (= arg "--use")
+      (= arg "--target")
+      (= arg "--lint-param")
+      (= arg "--trace-macro")
+      (= arg "--macro-expansion-limit")))
+
+; `new <name>` — scaffold Coil.toml + src/main.coil.
+(defn new-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (if (< (primitive/cast i64 argc) 3)
+      (do (ps (stderr) "usage: coil new <name>\n") 1)
+      (let [name (from-cstr (load (index argv 2)))]
+        ; A scaffold never writes over something that is already there: running
+        ; `coil new` on an existing project replaced its src/main.coil and
+        ; reported success.
+        (when (= (access (to-cstr a name) 0) (: 0 i32))
+          (ps (stderr) "error: '")
+          (ps (stderr) name)
+          (ps (stderr)
+              "' already exists; `coil new` creates a new directory and will not write into an existing one\n")
+          (exit 1)
+          0)
+        ; Every piece must land before the scaffold is reported: a failed write
+        ; already said what it could not write, and `created` would be false.
+        (if (or (!= (unit-mkdirs! a (cat3-d a name "/src")) 0)
+                (!= (d-write-file a
+                                  (cat3-d a name "/Coil.toml")
+                                  (cat3-d a
+                                          "[package]\nname  = \""
+                                          (cat3-d a
+                                                  name
+                                                  "\"\nentry = \"src/main.coil\"\n")))
+                    0)
+                (!= (d-write-file a
+                                  (cat3-d a name "/.gitignore")
+                                  "/build\n/.coil\n")
+                    0)
+                (!= (d-write-file a
+                                  (cat3-d a name "/src/main.coil")
+                                  "(module app)\n\n; Structs are built from named fields and read with (.field value).\n(defstruct Pair [(left i64) (right i64)])\n\n; Traits describe behavior that types can implement.\n(deftrait Total [Self]\n  (total [(value Self)] (-> i64)))\n\n(impl Total Pair\n  (total [(pair Pair)] (-> i64)\n    (+ (.left pair) (.right pair))))\n\n; Trait bounds let generic functions use that behavior.\n(defn doubled-total [(T Total)] [(value T)] (-> i64)\n  (* (total value) 2))\n\n; main's result is the process exit status.\n(defn main [] (-> i64)\n  (let [pair (Pair :left 10 :right 11)]\n    (println \"doubled total: {}\" (doubled-total pair))\n    0))\n")
+                    0))
+            (do
+              (ps (stderr) "error: could not create the project '")
+              (ps (stderr) name)
+              (ps (stderr) "'\n")
+              1)
+            (let [w (stdout)]
+              (ps w "created ")
+              (ps w name)
+              (ps w "/ — cd in and `coil run`\n")
+              0)))))
+
+;;; Whether `sub`'s option `arg` takes the next argument as its value, so a scan of
+;;; its command line can tell a value from a positional. Each command's own parser
+;;; is the authority; these follow them.
+(defn command-flag-takes-value? [(sub (slice u8)) (arg (slice u8))] (-> bool)
+  (cond (= sub "test") (test-flag-takes-value? arg)
+        (= sub "fmt") (= arg "--width")
+        (or (= sub "lint") (= sub "check")) (check-fix-flag-takes-value? arg)
+        (= sub "fuzz")
+          (or (> (len (fuzz-value-flag arg)) 0) (flag-takes-value? arg))
+        (= sub "install") (or (= arg "--root") (flag-takes-value? arg))
+        (= sub "repl") (or (= arg "--app") (= arg "--backend"))
+        :else (flag-takes-value? arg)))
+
+;;; Whether the value of `sub`'s option `arg` is a path.
+(defn command-flag-value-is-path? [(sub (slice u8)) (arg (slice u8))] (-> bool)
+  (cond (= arg "-o") true
+        (= arg "--unit") true
+        (= arg "--emit-header") true
+        (= arg "--reader-artifact") true
+        (= arg "--test-roots-file") true
+        (= arg "--run-in") true
+        (= sub "install") (= arg "--root")
+        (= sub "fuzz") (or (= arg "--corpus") (= arg "--fuzz-dir"))
+        :else false))
+
+;;; Whether `sub`'s positional argument `arg` is a path. `test` takes a test file or
+;;; a selector, which it matches against the paths inside the project;
+;;; `build-provider` and `repl` take module names.
+(defn command-positional-is-path? [(sub (slice u8)) (arg (slice u8))] (-> bool)
+  (cond (= sub "test") (d-ends-with? arg ".coil")
+        (= sub "build-provider") false
+        (= sub "repl") false
+        :else true))
+
+(defn invocation-path [(a (dyn Allocator))
+                       (invocation (slice u8))
+                       (path (slice u8))] (-> (ptr i8))
+  (to-cstr a (if (= (len path) 0) path (path-join a invocation path))))
+
+;;; argv as `sub` reads it once it runs in another directory: each path in it, typed
+;;; in `invocation`, made absolute; argument `skip` (a DIR, or 0) left out; and for
+;;; `run`, `--run-in invocation` so the program starts where the user typed the
+;;; command, unless the command line already says where. The arguments after `--`
+;;; are the program's and pass unchanged. NULL-terminated, like argv.
+(defn invocation-argv [(a (dyn Allocator))
+                       (sub (slice u8))
+                       (argc i32)
+                       (argv (ptr (ptr i8)))
+                       (skip i64)
+                       (invocation (slice u8))] (-> (ptr (ArrayList (ptr i8))))
+  (let [out (box! a (ArrayList (ptr i8)) (ArrayList::new [(ptr i8)] a))
+        n (primitive/cast i64 argc)
+        run-in? (and (= sub "run") (not (argv-has-flag? argc argv "--run-in")))
+        (mut program) false
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (let [arg (from-cstr (load (index argv (load i))))]
+                (cond (or (< (load i) 2) (load program))
+                        (do
+                          (push! out (load (index argv (load i))))
+                          (set! i (+ (load i) 1)))
+                      (= (load i) skip) (set! i (+ (load i) 1))
+                      (= arg "--")
+                        (do
+                          (when run-in?
+                            (push! out c"--run-in")
+                            (push! out (to-cstr a invocation)))
+                          (push! out (load (index argv (load i))))
+                          (set! program true)
+                          (set! i (+ (load i) 1)))
+                      (is-flag? arg)
+                        (do
+                          (push! out (load (index argv (load i))))
+                          (when (and (command-flag-takes-value? sub arg)
+                                     (< (+ (load i) 1) n))
+                            (let [value
+                                    (from-cstr (load (index argv (+ (load i) 1))))]
+                              (push! out
+                                     (if (command-flag-value-is-path? sub arg)
+                                         (invocation-path a invocation value)
+                                         (load (index argv (+ (load i) 1)))))
+                              (set! i (+ (load i) 1))))
+                          (set! i (+ (load i) 1)))
+                      :else
+                        (do
+                          (push! out
+                                 (if (command-positional-is-path? sub arg)
+                                     (invocation-path a invocation arg)
+                                     (load (index argv (load i)))))
+                          (set! i (+ (load i) 1))))))
+      0)
+    (when (and run-in? (not (load program)))
+      (push! out c"--run-in")
+      (push! out (to-cstr a invocation)))
+    (push! out (primitive/cast (ptr i8) 0))
+    out))

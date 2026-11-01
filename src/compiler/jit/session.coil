@@ -1,0 +1,2832 @@
+;;; A live compiler session: revisions and the REPL's native generations. It knows nothing about a terminal.
+(module coil.compiler.session)
+(import "coil.compiler.large_pages" :as large-pages)
+(import "coil.primitive" :as primitive)
+(import "coil.compiler.unit_state" :use *)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :as str :use * :exclude [parse-int])
+(import "coil.arraylist" :use *)
+(import "coil.avec" :use [AVec avec-at avec-edit avec-new avec-to-list])
+(import "coil.amap" :use [AMap amap-new])
+(import "coil.hashmap" :use *)
+(import "coil.pmap" :use *)
+(import "coil.io" :use *)
+(import "coil.os" :as os)
+(import "coil.mem" :as mem)
+(import "coil.control" :use *)
+(import "coil.try" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.memory" :as memory)
+(import "coil.compiler.env" :use *)
+(import "coil.compiler.ffi" :use *)
+(import "coil.compiler.guide" :use *)
+(import "coil.reader" :use *)
+(import "coil.project" :use *)
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.astdump" :use *)
+(import "coil.compiler.parser" :use *)
+(import "coil.compiler.loader" :use *)
+(import "coil.compiler.resolve" :use *)
+(import "coil.compiler.check" :use *)
+(import "coil.compiler.mono" :use *)
+(import "coil.compiler.phase_split" :use *)
+(import "coil.compiler.name_sort" :use *)
+(import "coil.compiler.diag" :use *)
+(import "coil.compiler.trace" :as tr)
+(import "coil.compiler.comptime" :use *)
+(import "coil.compiler.closure" :use *)
+(import "coil.compiler.metaengine" :use *)
+(import "coil.compiler.metahost" :as mh)
+(import "coil.compiler.expander" :use *)
+(import "coil.compiler.unit" :use *)
+(import "coil.compiler.native_module" :use *)
+(import "coil.compiler.codegen_tpde"
+        :use
+        [cgtpde-build-object cgtpde-build-mobj cgtpde-build-eobj
+         set-tpde-debug-frames!])
+(import "coil.compiler.jit_elf" :use [jit-elf-load-reusing])
+(import "coil.compiler.jit" :use *)
+(import "coil.compiler.interp" :use *)
+(import "coil.compiler.wasm" :use *)
+(import "coil.compiler.codegen_wasm" :use *)
+(import "coil.cc" :as cc)
+(import "coil.compiler.cli_base" :use *)
+(import "coil.compiler.cli_project" :use *)
+(import "coil.compiler.pipeline" :use *)
+
+;;; Resume under the current caller, which need not be the original caller.
+(defn compilation-unit-resume! [(scope (ptr CompilationUnitSession))] (-> i64)
+  (if (.active scope)
+      -1
+      (do
+        (compilation-unit-exchange! scope)
+        (set! (.active scope) true)
+        0)))
+
+;;; Begin a checked parse, returning the mode it replaces for manifest-checked-end.
+(defn manifest-checked-begin [] (-> ManifestErrors)
+  (let [e (manifest-errors)
+        prior (load e)]
+    (store! e
+            (ManifestErrors
+              :checked true
+              :failed false
+              :message ""))
+    prior))
+
+;;; End it: the first error it recorded, if any.
+(defn manifest-checked-end [(prior ManifestErrors)] (-> (Option (slice u8)))
+  (let [e (manifest-errors)
+        failed (.failed e)
+        message (.message e)]
+    (store! e prior)
+    (if failed (Some message) (None [(slice u8)]))))
+
+;;; The manifest TEXT describes, or its first error.
+(defn parse-manifest-checked [(a (dyn Allocator)) (text (slice u8))]
+  (-> (Result (ptr Manifest) (slice u8)))
+  (let [prior (manifest-checked-begin)
+        m (parse-manifest a text)]
+    (match (manifest-checked-end prior)
+      (Some [message] (Err [(ptr Manifest) (slice u8)] message))
+      (None [] (Ok [(ptr Manifest) (slice u8)] m)))))
+
+;;; Locate and fetch M's dependencies, or the first error doing so.
+(defn m-prepare-deps-checked [(a (dyn Allocator)) (m (ptr Manifest))]
+  (-> (Result i64 (slice u8)))
+  (let [prior (manifest-checked-begin)]
+    (m-prepare-deps a m)
+    (match (manifest-checked-end prior)
+      (Some [message] (Err [i64 (slice u8)] message))
+      (None [] (Ok [i64 (slice u8)] 0)))))
+
+(defn m-unit-link-flags [(a (dyn Allocator)) (m (ptr Manifest))]
+  (-> (ptr (ArrayList (slice u8))))
+  (let [(mut out) (ArrayList::new [(slice u8)] a)]
+    (for [i 0 (len (load (field m frameworks)))]
+      (push! (mut out) "-framework")
+      (push! (mut out) (get (load (field m frameworks)) i))
+      0)
+    (for [i 0 (len (load (field m libs)))]
+      (push! (mut out) (sconcat a "-l" (get (load (field m libs)) i)))
+      0)
+    (for [i 0 (len (load (field m flags)))]
+      (push! (mut out) (get (load (field m flags)) i))
+      0)
+    (for [i 0 (len (load (field m search-paths)))]
+      (push! (mut out) "-L")
+      (push! (mut out) (get (load (field m search-paths)) i))
+      0)
+    (for [i 0 (len (load (field m objects)))]
+      (push! (mut out) (get (load (field m objects)) i))
+      0)
+    ; A metaprogram dylib is loaded into the compiler, not linked as the target
+    ; program, and it is built before the compilation that would say which
+    ; dependency packages the target loads. It takes them all.
+    (let [pkgs (load (field m dep-packages))]
+      (for [i 0 (len pkgs)]
+        (let [link (.link (get (load pkgs) i))]
+          (for [j 0 (len (load (.frameworks link)))]
+            (push! (mut out) "-framework")
+            (push! (mut out) (get (load (.frameworks link)) j))
+            0)
+          (for [j 0 (len (load (.libs link)))]
+            (push! (mut out) (sconcat a "-l" (get (load (.libs link)) j)))
+            0)
+          (for [j 0 (len (load (.flags link)))]
+            (push! (mut out) (get (load (.flags link)) j))
+            0)
+          (for [j 0 (len (load (.search-paths link)))]
+            (push! (mut out) "-L")
+            (push! (mut out) (get (load (.search-paths link)) j))
+            0)
+          (for [j 0 (len (load (.objects link)))]
+            (push! (mut out) (get (load (.objects link)) j))
+            0))
+        0))
+    (box-al [(slice u8)] a (load out))))
+
+; externs are global C symbols; these coincide harmlessly with cimport.coil's.
+(extern fopen :cc (cc/C) [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(extern fwrite :cc (cc/C) [(ptr i8) i64 i64 (ptr i8)] (-> i64))
+
+(extern fclose :cc (cc/C) [(ptr i8)] (-> i32))
+
+; JIT compilation is nested inside an already-running native program. Compiler
+; metaprogram registrations are process globals for ordinary one-shot builds,
+; so isolate each nested invocation: it must see only registrations introduced
+; by its own imports, and the host compilation's registry must be restored on
+; return. Without this boundary a test-runner transform, linter, or unrelated
+; dialect from the host can rewrite a live candidate or probe.
+; Development instrumentation: with COIL_DUMP_CANDIDATE set to a path, append
+; every candidate program a session compiles, exactly as the pipeline receives
+; it. This is how you find out what an edit actually costs to compile.
+(defn repl-dump-candidate! [(a (dyn Allocator)) (src (slice u8))] (-> i64)
+  (let [path (unit-getenv c"COIL_DUMP_CANDIDATE")]
+    (unless (= (primitive/cast i64 path) 0)
+      (let [f (fopen path c"ab")]
+        (unless (= (primitive/cast i64 f) 0)
+          (let [header
+                  (sconcat3 a
+                            "\n===== CANDIDATE bytes="
+                            (i64->str a (len src))
+                            " =====\n")]
+            (fwrite (primitive/cast (ptr i8) (to-cstr a header))
+                    1
+                    (len header)
+                    f)
+            (fwrite (primitive/cast (ptr i8) (to-cstr a src)) 1 (len src) f))
+          (fclose f)
+          0))
+      0))
+  0)
+
+(defstruct ReplSession
+  [(a (dyn Allocator))
+   (pending StrBuf)
+   (diagnostic StrBuf)
+   (status i64)
+   (epoch i64)
+   (prepared bool)
+   (checked-only bool)
+   (prepared-source StrBuf)
+   ; The last parameter is the C symbol the transaction entry was exported
+   ; under, unique to this transaction. It used to be the fixed name
+   ; "coil_repl_entry", which a submitted program could collide with.
+   (runner (fnptr (cc/C)
+                  [(ref (dyn Allocator))
+                   (ptr Program)
+                   (ptr (ArrayList (slice u8)))
+                   (ptr (ArrayList (slice u8)))
+                   (ptr (ptr i8))
+                   (slice u8)]
+                  i64))
+   ; Unmap the generations nothing still uses, or every one when the bool is set.
+   ; The map names the symbols the accepted program defines: a generation that
+   ; defines one stays.
+   (reclaimer (fnptr (cc/C)
+                     [(ptr (ptr i8)) bool (ptr (HashMap (slice u8) i64))]
+                     i64))
+   (generation-count (fnptr (cc/C) [(ptr (ptr i8))] i64))
+   (generation-retain-current (fnptr (cc/C) [(ptr (ptr i8))] i64))
+   (generation-release-token (fnptr (cc/C) [(ptr (ptr i8)) i64] i64))
+   (generation-token-leases (fnptr (cc/C) [(ptr (ptr i8))] i64))
+   (generation-leases i64)
+   (code-session-state (ptr CodeSessionState))
+   ; Optional compiled source provider. This is the same hygienic Code reader
+   ; boundary used by project readers, retained per session so unchanged
+   ; metaprogram definitions are not rebuilt for every candidate.
+   ; The unit the provider was compiled in, kept for as long as the provider is.
+   ; Boxed where it was entered: everything allocated in it holds an allocator
+   ; that points at its arena, so the unit never moves.
+   (source-provider-unit (ptr CompilationUnitSession))
+   (source-provider-unit-live bool)
+   ; When set, the state a compilation builds on in place of the current one.
+   (parent-override (ptr EnvHolder))
+   ; Handles given out and not yet released.
+   (env-handles i64)
+   (source-provider-enabled bool)
+   (source-provider-setup (ptr LS))
+   (source-provider-program (ptr Program))
+   (source-provider-name (slice u8))
+   (source-provider-module (slice u8))
+   (source-provider-abi-preamble (slice u8))
+   (source-provider-maps (ptr SemMapsSnap))
+   ; The provider's prepared engine, built by the first read and reused by
+   ; every later one (metaengine.coil ReaderEngineCache).
+   (source-provider-engine (ptr ReaderEngineCache))
+   (state (ptr i8))
+   ; The compiler state the session serves, null before the first.
+   (env (ptr EnvHolder))
+   (compiler-candidate (ptr CompilerRevision))
+   ; Accepted native code whose owned compiler arena awaits compaction.
+   (compiler-published (ptr CompilerRevision))
+   (compiler-config CompilationUnitConfig)
+   (client-tokens (ArrayList i64))
+   (terminal-mode i64)
+   (terminal-expression (slice u8))
+   ; The parsed Coil.toml and everything derived from it by `load-project!`.
+   ; The compilation configuration points into it, so it lives as long as the
+   ; session; `project-loaded` says whether it was initialized.
+   (manifest-arena scratch/ScratchArena)
+   (project-loaded bool)
+   ; Do not also write diagnostics to stderr: the client reads `diagnostic`.
+   (quiet bool)
+   ; The name submitted source has in diagnostics; "" is `<jit>`.
+   (source-name (slice u8))])
+
+; Compiler-SDK entry: the returned pointer is intentionally erased by coil.jit.
+(defn repl-session-new-with-runner [(a (dyn Allocator))
+                                    (runner (fnptr (cc/C)
+                                                   [(ref (dyn Allocator))
+                                                    (ptr Program)
+                                                    (ptr (ArrayList (slice u8)))
+                                                    (ptr (ArrayList (slice u8)))
+                                                    (ptr (ptr i8))
+                                                    (slice u8)]
+                                                   i64))
+                                    (reclaimer (fnptr (cc/C)
+                                                      [(ptr (ptr i8))
+                                                       bool
+                                                       (ptr (HashMap (slice u8)
+                                                                     i64))]
+                                                      i64))
+                                    (generation-count (fnptr (cc/C)
+                                                             [(ptr (ptr i8))]
+                                                             i64))
+                                    (generation-retain-current (fnptr (cc/C)
+                                                                      [(ptr (ptr i8))]
+                                                                      i64))
+                                    (generation-release-token (fnptr (cc/C)
+                                                                     [(ptr (ptr i8))
+                                                                      i64]
+                                                                     i64))
+                                    (generation-token-leases (fnptr (cc/C)
+                                                                    [(ptr (ptr i8))]
+                                                                    i64))]
+  (-> (ptr i8))
+  (let [s (box! a ReplSession (zeroed ReplSession))]
+    (set! (.a s) a)
+    (set! (.pending s) (StrBuf::new a))
+    (set! (.diagnostic s) (StrBuf::new a))
+    (set! (.prepared-source s) (StrBuf::new a))
+    (set! (.runner s) runner)
+    (set! (.reclaimer s) reclaimer)
+    (set! (.generation-count s) generation-count)
+    (set! (.generation-retain-current s) generation-retain-current)
+    (set! (.generation-release-token s) generation-release-token)
+    (set! (.generation-token-leases s) generation-token-leases)
+    (set! (.code-session-state s) (code-session-new a))
+    (set! (.source-provider-engine s) (reader-engine-cache-new a))
+    (set! (.compiler-config s) (compilation-unit-config a))
+    (set! (.client-tokens s) (ArrayList::new [i64] a))
+    (primitive/cast (ptr i8) s)))
+
+(defn repl-config-environment! [(a (dyn Allocator))
+                                (config (ptr CompilationUnitConfig))
+                                (key (ptr i8))
+                                (value (slice u8))] (-> i64)
+  (block :done
+    (for [i 0 (len (.environment config))]
+      (let [entry (elem (field config environment) i)]
+        (when (= (from-cstr (.key entry)) (from-cstr key))
+          (repl-config-free-value! a (.value entry))
+          (set! (.value entry) (to-cstr a value))
+          (break :done 0))))
+    (push! (field config environment)
+           (UnitEnvironment :key key :value (to-cstr a value)))
+    0))
+
+;;; An environment value the session copied with `to-cstr`, or null.
+(defn repl-config-free-value! [(a (dyn Allocator)) (value (ptr i8))] (-> i64)
+  (unless (= (primitive/cast i64 value) 0)
+    (free-bytes a
+                (slice::new (primitive/cast (ptr u8) value)
+                            (+ (len (from-cstr value)) 1))
+                1))
+  0)
+
+;;; The owner-uses list `compilation-unit-config` allocated. After `load-project!`
+;;; both uses lists belong to the parsed manifest instead, and are the same list.
+(defn repl-config-free-owner-uses! [(a (dyn Allocator))
+                                    (config (ptr CompilationUnitConfig))]
+  (-> i64)
+  (unless (= (primitive/cast i64 (.owner_uses config))
+             (primitive/cast i64 (.uses config)))
+    (free! (.owner_uses config))
+    (free [(ArrayList (slice u8))] a (slice::new (.owner_uses config) 1)))
+  0)
+
+;;; Release what `compilation-unit-config` allocated for a session: the copied
+;;; environment and the owner-uses list.
+(defn repl-config-free! [(a (dyn Allocator))
+                         (config (ptr CompilationUnitConfig))] (-> i64)
+  (for [i 0 (len (.environment config))]
+    (repl-config-free-value! a
+                             (.value (elem (field config environment)
+                                           i))))
+  (free! (mut (.environment config)))
+  (repl-config-free-owner-uses! a config)
+  0)
+
+;;;
+;;; `jit-session-set-environment!` gives a session, before its first submission,
+;;; an environment: the program it runs in, as source (coil.meta
+;;; `embed-environment` makes the function that builds it). It is a
+;;; `(toolchain …)` header, then ordinary source whose forwarding definitions
+;;; call the program's own functions and share its storage. The session checks
+;;; that the text was made by its own toolchain for its own target, and compiles
+;;; it as its first submission.
+;;; 0 accepted; -1 the session already started; -2 a missing or different
+;;; toolchain header; -4 the environment does not read or compile.
+;;; `jit-diagnostic` says which.
+(defn repl-session-set-environment! [(raw (ptr i8)) (text (slice u8))] (-> i64)
+  (let [s (repl-session raw)
+        a (.a s)]
+    (if (or (> (.epoch s) 0) (.prepared s))
+        -1
+        (do
+          (repl-clear-diagnostic! s)
+          (match (environment-body a text)
+            (Err [failure]
+                 (do
+                   (repl-owned-replace! (mut (.diagnostic s))
+                                        (.message failure))
+                   (.status failure)))
+            (Ok [body]
+                (if (= (repl-session-compile! raw body "0") 0) 0 -4)))))))
+
+(defstruct EnvironmentFailure [(status i64) (message (slice u8))])
+
+(defn environment-failure [(status i64) (message (slice u8))]
+  (-> (Result (slice u8) EnvironmentFailure))
+  (Err [(slice u8) EnvironmentFailure]
+       (EnvironmentFailure :status status :message message)))
+
+;;; The `:key` value of a `(toolchain …)` header, as text; "" when absent.
+(defn toolchain-field [(a (dyn Allocator)) (header Sexp) (key (slice u8))]
+  (-> (slice u8))
+  (let [items (sx-items header)
+        (mut found) ""]
+    (for [i 1 (- (sx-len items) 1)]
+      (when (and (= (sx-tag (sx-at items i)) 3)
+                 (= (sx-sval (sx-at items i)) key))
+        (set! found (sexp-display a (sx-at items (+ i 1))))
+        0))
+    found))
+
+;;; TEXT without its toolchain header, once the header says this session's own
+;;; toolchain made it.
+(defn environment-body [(a (dyn Allocator)) (text (slice u8))]
+  (-> (Result (slice u8) EnvironmentFailure))
+  (match (read-all a text -1)
+    (Err [d]
+         (environment-failure -4
+                              (sconcat3 a
+                                        "the environment does not read: "
+                                        (.msg d)
+                                        "\n")))
+    (Ok [forms]
+        (let [header
+                (if (> (len (load forms)) 0) (get (load forms) 0) (zeroed Sexp))]
+          (if (not (and (= (sx-tag header) 6)
+                        (and (> (sx-len (sx-items header)) 0)
+                             (= (sx-sval (sx-at (sx-items header) 0))
+                                "toolchain"))))
+              (environment-failure -2
+                                   "an environment begins with a (toolchain …) header, which coil.meta's embed-environment writes\n")
+              (let [mine (toolchain-form a)
+                    their-compiler (toolchain-field a header "compiler")
+                    their-target (toolchain-field a header "target")]
+                (cond (or (= their-compiler ":unknown")
+                          (= (toolchain-field a mine "compiler") ":unknown"))
+                        (environment-failure -2
+                                             "the environment or this session's toolchain is unstamped, so nothing vouches that their declarations agree\n")
+                      (!= their-compiler (toolchain-field a mine "compiler"))
+                        (environment-failure -2
+                                             (sconcat a
+                                                      (sconcat3 a
+                                                                "the environment was described by toolchain "
+                                                                their-compiler
+                                                                ", ")
+                                                      (sconcat3 a
+                                                                "and this session's is "
+                                                                (toolchain-field a
+                                                                                 mine
+                                                                                 "compiler")
+                                                                "\n")))
+                      (!= their-target (toolchain-field a mine "target"))
+                        (environment-failure -2
+                                             (sconcat a
+                                                      (sconcat3 a
+                                                                "the environment describes a "
+                                                                their-target
+                                                                " program, ")
+                                                      (sconcat3 a
+                                                                "and this session targets "
+                                                                (toolchain-field a
+                                                                                 mine
+                                                                                 "target")
+                                                                "\n")))
+                      :else
+                        (Ok [(slice u8) EnvironmentFailure]
+                            (subslice text (.hi header) (len text))))))))))
+
+(defn repl-session-load-project! [(raw (ptr i8))] (-> i64)
+  (let [s (repl-session raw)
+        config (field s compiler-config)]
+    (if (or (> (.epoch s) 0) (.prepared s))
+        -1
+        (let [; The manifest and its derived strings live in the manifest arena;
+              ; configured environment values are session-owned copies.
+              ma (repl-session-manifest-allocator! s)
+              a (.a s)
+              text (read-file ma c"Coil.toml")]
+          (if (= (len text) 0)
+              -2
+              (match (match (parse-manifest-checked ma text)
+                       (Err [message] (Err [(ptr Manifest) (slice u8)] message))
+                       (Ok [m]
+                           (match (m-prepare-deps-checked ma m)
+                             (Err [message]
+                                  (Err [(ptr Manifest) (slice u8)] message))
+                             (Ok [_] (Ok [(ptr Manifest) (slice u8)] m)))))
+                (Err [message]
+                     (let [w (stderr)]
+                       (ps w "error: ")
+                       (ps w message)
+                       (wb w 10)
+                       -3))
+                (Ok [m]
+                    (do
+                      (repl-config-environment! a
+                                                config
+                                                c"COIL_NAMESPACE_ROOTS"
+                                                (m-namespace-roots ma m))
+                      (repl-config-environment! a
+                                                config
+                                                c"COIL_NAMESPACE_EXCLUDES"
+                                                (m-excludes-env ma m))
+                      (repl-config-environment! a
+                                                config
+                                                c"COIL_WORKSPACE_PACKAGES"
+                                                (if (m-workspace? m)
+                                                    (m-workspace-packages ma m)
+                                                    ""))
+                      (repl-config-environment! a
+                                                config
+                                                c"COIL_READERS"
+                                                (m-mappings-env ma (.readers m)))
+                      (repl-config-environment! a
+                                                config
+                                                c"COIL_MODULE_MAP"
+                                                (m-mappings-env ma (.modules m)))
+                      (repl-config-environment! a
+                                                config
+                                                c"COIL_MANIFEST_PROVIDERS"
+                                                (m-mappings-env ma
+                                                                (.manifest-providers m)))
+                      (repl-config-environment! a
+                                                config
+                                                c"COIL_MANIFEST_PATH"
+                                                "Coil.toml")
+                      (repl-config-environment! a
+                                                config
+                                                c"COIL_PACKAGE_NAME"
+                                                (.name m))
+                      (repl-config-environment! a
+                                                config
+                                                c"COIL_STDLIB"
+                                                (if (.language-stdlib m)
+                                                    "1"
+                                                    "0"))
+                      (repl-config-environment! a
+                                                config
+                                                c"COIL_STDLIB_PROFILE"
+                                                (.language-stdlib-profile m))
+                      (repl-config-environment! a
+                                                config
+                                                c"COIL_PRELUDE"
+                                                (.language-prelude m))
+                      (repl-config-environment! a
+                                                config
+                                                c"COIL_CORE_PROVIDERS"
+                                                (m-name-list-env ma
+                                                                 (.language-core-providers m)))
+                      (set! (.links config)
+                            (MetaLinkBox
+                              :isset 1
+                              :flags (m-unit-link-flags ma m)))
+                      (set! (.uses config) (.metaprograms m))
+                      (repl-config-free-owner-uses! a config)
+                      (set! (.owner_uses config) (.metaprograms m))
+                      0))))))))
+
+;;; A fresh arena for the manifest `load-project!` is about to parse. Loading a
+;;; project again replaces the previous manifest: the configuration's copied
+;;; environment values do not point into it, and its lists are replaced below.
+(defn repl-session-manifest-allocator! [(s (ptr ReplSession))]
+  (-> (dyn Allocator))
+  (if (.project-loaded s)
+      (reset! (field s manifest-arena))
+      (do
+        (scratch/ScratchArena::init (field s manifest-arena)
+                                    (large-pages/compiler-scratch-for "repl.manifest"))
+        (set! (.project-loaded s) true)
+        0))
+  (allocator (field s manifest-arena)))
+
+(defn repl-session [(raw (ptr i8))] (-> (ptr ReplSession))
+  (primitive/cast (ptr ReplSession) raw))
+
+(defn repl-owned-replace! [(dst (mut StrBuf)) (value (slice u8))] (-> i64)
+  ; Retain the existing allocation across repeated edits. Replacing the
+  ; ArrayList header here leaked one buffer per candidate in long sessions.
+  (clear! (mut (.bytes dst)))
+  (push-str! (mut dst) value))
+
+(defn repl-owned-clear! [(dst (mut StrBuf))] (-> i64)
+  (clear! (mut (.bytes dst))))
+
+; Writer backend used by the SDK path so diagnostics are data owned by the
+; session. The terminal still receives the same bytes after a failed check.
+(defn repl-diagnostic-write [(ctx (ptr i8)) (buf (ptr i8)) (len i64)]
+  (-> (Result i64 IoError))
+  (let [session (primitive/cast (ptr ReplSession) ctx)
+        bytes (primitive/cast (ptr u8) buf)
+        (mut i) 0]
+    (loop (if (>= (load i) len)
+              (break)
+              (do
+                (push! (mut (.diagnostic session))
+                       (load (index bytes (load i))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (Ok len)))
+
+(defn repl-diagnostic-writer [(session (ptr ReplSession)) (writer (ptr Writer))]
+  (-> (ptr Writer))
+  (set! (.write-fn writer) (fnptr-of repl-diagnostic-write))
+  (set! (.ctx writer) (primitive/cast (ptr i8) session))
+  writer)
+
+(defn repl-clear-diagnostic! [(session (ptr ReplSession))] (-> i64)
+  (repl-owned-clear! (mut (.diagnostic session))))
+
+(defn repl-set-failure! [(session (ptr ReplSession))
+                         (candidate (slice u8))
+                         (fallback (slice u8))] (-> i64)
+  (repl-owned-replace! (mut (.pending session)) candidate)
+  (set! (.status session) 1)
+  (when (and (= (len (str (.diagnostic session))) 0)
+             (> (len fallback) 0))
+    (repl-owned-replace! (mut (.diagnostic session)) fallback))
+  (when (and (> (len (str (.diagnostic session))) 0) (not (.quiet session)))
+    (ps (stderr) (str (.diagnostic session))))
+  1)
+
+;;; Fail the submission CANDIDATE for a reason no compile reported: MESSAGE is
+;;; its whole diagnostic. repl-set-failure! keeps text a compile left in the
+;;; buffer, which here would be an earlier submission's failure.
+(defn repl-fail! [(session (ptr ReplSession))
+                  (candidate (slice u8))
+                  (message (slice u8))] (-> i64)
+  (repl-clear-diagnostic! session)
+  (repl-set-failure! session candidate message))
+
+;;; A candidate that checked: the warnings its compile drained into the session's
+;;; diagnostic text go to stderr (unless the session is quiet) and the text is
+;;; cleared, since it describes failures only.
+(defn repl-flush-warnings! [(session (ptr ReplSession))] (-> i64)
+  (when (and (> (len (str (.diagnostic session))) 0) (not (.quiet session)))
+    (ps (stderr) (str (.diagnostic session))))
+  (repl-clear-diagnostic! session))
+
+;;; Whether the session also writes its diagnostics to stderr (the default).
+(defn repl-session-set-quiet! [(raw (ptr i8)) (quiet bool)] (-> i64)
+  (set! (.quiet (repl-session raw)) quiet)
+  0)
+
+;;; Name submitted source NAME in diagnostics (`--> NAME:LINE:COL`) in place of
+;;; `<jit>`. The text is not read from NAME; it is only what locations say.
+(defn repl-session-set-source-name! [(raw (ptr i8)) (name (slice u8))] (-> i64)
+  (let [session (repl-session raw)]
+    (set! (.source-name session) (sconcat (.a session) name ""))
+    0))
+
+(defn repl-set-accepted! [(session (ptr ReplSession))] (-> i64)
+  (repl-owned-clear! (mut (.pending session)))
+  (set! (.status session) 0)
+  (set! (.epoch session) (primitive/iadd (.epoch session) 1))
+  0)
+
+(defn repl-jit-reset! [(s (ptr ReplSession))] (-> i64)
+  (if (> (.generation-leases s) 0)
+      -1
+      (do
+        (call-ptr (.reclaimer s)
+                  (field s state)
+                  true
+                  (primitive/cast (ptr (HashMap (slice u8) i64)) 0))
+        0)))
+
+; The original native ARM64/Mach-O runner. It remains the default for the LLVM-free
+; macOS compiler and is also selected by coil.jit on that host.
+(defstruct NativeJitGeneration
+  [(metadata (ptr scratch/ScratchArena))
+   (image (ptr JitImage))
+   (pinned bool)
+   (current bool)
+   (leases i64)
+   (marked bool)
+   (scanned bool)])
+
+;;; The object a native session's tpde code is emitted as and loaded from: Mach-O
+;;; on macOS arm64 (jit.coil), ELF on Linux x86-64 (jit_elf.coil).
+(defsum NativeImageFormat (MachO) (Elf))
+
+;;; `namespace` answers the link-time questions over every live generation. It is kept
+;;; between loads: a new generation is added to it, and freeing any generation drops it,
+;;; because it borrows its names from the generations' own storage.
+(defstruct NativeJitState
+  [(generations (ArrayList NativeJitGeneration))
+   (namespace JitNamespace)
+   (namespace-built bool)
+   (format NativeImageFormat)])
+
+(defn repl-native-state [(a (dyn Allocator))
+                         (slot (ptr (ptr i8)))
+                         (format NativeImageFormat)] (-> (ptr NativeJitState))
+  (if (= (primitive/cast i64 (load slot)) 0)
+      (let [state (box! a NativeJitState (zeroed NativeJitState))]
+        (set! (.generations state) (ArrayList::new [NativeJitGeneration] a))
+        (set! (.format state) format)
+        (set! slot (primitive/cast (ptr i8) state))
+        state)
+      (primitive/cast (ptr NativeJitState) (load slot))))
+
+; Build the linker namespace from every retained generation, newest first.  A
+; definition-sized generation deliberately contains only the code emitted for
+; that edit, so the immediately preceding image is not a complete symbol table.
+; The generation list is the session's native namespace; keeping this view in
+; the runner (rather than copying unrelated code into every edit) preserves
+; one-definition compilation while allowing later evaluations and edits to
+; reference any still-published definition.  `jit-load-reusing` copies only the
+; imports actually used by the new image and records their original owner, so
+; reclamation continues to follow precise image dependencies.
+(defn repl-native-link-namespace [(state (ptr NativeJitState))]
+  (-> (ptr JitNamespace))
+  (unless (.namespace-built state)
+    (set! (.namespace state) (jit-namespace-new (.alc (.generations state))))
+    (let [(mut generation-index) (primitive/isub (len (.generations state)) 1)]
+      (loop (if (< (load generation-index) 0)
+                (break)
+                (do
+                  (jit-namespace-add-image! (field state namespace)
+                                            (.image (elem (field state
+                                                                 generations)
+                                                          (load generation-index))))
+                  (set! generation-index
+                        (primitive/isub (load generation-index) 1))))))
+    (set! (.namespace-built state) true)
+    0)
+  (field state namespace))
+
+;;; Forget the namespace; the next load rebuilds it from the generations then alive.
+(defn repl-native-drop-namespace! [(state (ptr NativeJitState))] (-> i64)
+  (when (.namespace-built state)
+    (jit-namespace-free! (field state namespace))
+    (set! (.namespace-built state) false)
+    0)
+  0)
+
+(defn repl-native-symbol-address [(raw (ptr i8)) (name (slice u8))]
+  (-> (ptr i8))
+  (let [session (repl-session raw)]
+    (if (= (primitive/cast i64 (.state session)) 0)
+        (primitive/cast (ptr i8) 0)
+        (let [state (primitive/cast (ptr NativeJitState) (.state session))
+              (mut i) (- (len (.generations state)) 1)]
+          (block :found
+            (loop (if (< (load i) 0)
+                      (break)
+                      (let [address
+                              (jit-lookup (.image (elem (field state
+                                                               generations)
+                                                        (load i)))
+                                          name)]
+                        (unless (= (primitive/cast i64 address) 0)
+                          (break :found address))
+                        (set! i (- (load i) 1)))))
+            (primitive/cast (ptr i8) 0))))))
+
+(defn repl-session-native-state [(raw (ptr i8))] (-> (ptr i8))
+  (.state (repl-session raw)))
+
+(defn repl-native-image-pinned? [(image (ptr JitImage))] (-> bool)
+  (let [(mut i) 0
+        (mut pinned) false
+        base (primitive/cast i64 (.base image))]
+    (loop (if (or (load pinned) (>= (load i) (len (.syms image))))
+              (break)
+              (let [symbol (elem (field image syms) (load i))
+                    address (primitive/cast i64 (.addr symbol))]
+                (if (and (match (find (.name symbol) "repl_static.")
+                           (Some [_] true)
+                           (None [] false))
+                         (and (>= address base)
+                              (< address (+ base (.size image)))))
+                    (set! pinned true)
+                    (set! i (+ (load i) 1))))))
+    (load pinned)))
+
+(defn repl-native-image-required-by? [(owner (ptr JitImage))
+                                      (dependent (ptr JitImage))] (-> bool)
+  (let [base (.base owner)
+        (mut i) 0
+        (mut required) false]
+    (loop (if (or (load required)
+                  (>= (load i) (len (.syms dependent))))
+              (break)
+              (let [symbol (elem (field dependent syms) (load i))]
+                (if (= (primitive/cast i64 (.owner symbol))
+                       (primitive/cast i64 base))
+                    (set! required true)
+                    (set! i (+ (load i) 1))))))
+    (load required)))
+
+(defn repl-native-generation-count [(slot (ptr (ptr i8)))] (-> i64)
+  (if (= (primitive/cast i64 (load slot)) 0)
+      0
+      (len (.generations (primitive/cast (ptr NativeJitState) (load slot))))))
+
+(defn repl-native-retain-current! [(slot (ptr (ptr i8)))] (-> i64)
+  (if (= (primitive/cast i64 (load slot)) 0)
+      -1
+      (let [state (primitive/cast (ptr NativeJitState) (load slot))
+            (mut token) -1]
+        (for [i 0 (len (.generations state))]
+          (let [generation (elem (field state generations) i)]
+            (if (.current generation)
+                (do
+                  (set! (.leases generation) (+ (.leases generation) 1))
+                  (set! token (primitive/cast i64 (.image generation))))
+                0)))
+        (load token))))
+
+(defn repl-native-release-token! [(slot (ptr (ptr i8))) (token i64)] (-> i64)
+  (if (= (primitive/cast i64 (load slot)) 0)
+      -1
+      (let [state (primitive/cast (ptr NativeJitState) (load slot))
+            (mut result) -1]
+        (for [i 0 (len (.generations state))]
+          (let [generation (elem (field state generations) i)]
+            (if (= (primitive/cast i64 (.image generation)) token)
+                (if (> (.leases generation) 0)
+                    (do
+                      (set! (.leases generation) (- (.leases generation) 1))
+                      (set! result (.leases generation)))
+                    0)
+                0)))
+        (load result))))
+
+(defn repl-native-token-leases [(slot (ptr (ptr i8)))] (-> i64)
+  (if (= (primitive/cast i64 (load slot)) 0)
+      0
+      (let [state (primitive/cast (ptr NativeJitState) (load slot))
+            (mut total) 0]
+        (for [i 0 (len (.generations state))]
+          (set! total
+                (+ (load total)
+                   (.leases (elem (field state generations)
+                                  i)))))
+        (load total))))
+
+;;; Trace from explicit leases, persistent static storage, the images that define
+;;; a symbol in ACCEPTED, and the current image. Dependencies of an older leased
+;;; image are as live as dependencies of the newest image; unreachable cycles are
+;;; reclaimable.
+(defn repl-native-mark-images! [(state (ptr NativeJitState))
+                                (accepted (ptr (HashMap (slice u8) i64)))]
+  (-> i64)
+  (for [i 0 (len (.generations state))]
+    (let [g (elem (field state generations) i)]
+      (set! (.marked g)
+            (or (.current g)
+                (.pinned g)
+                (> (.leases g) 0)
+                (repl-native-image-defines-any? (.image g)
+                                                accepted
+                                                (.format state))))
+      (set! (.scanned g) false)))
+  (loop (let [(mut progress) false]
+          (for [i 0 (len (.generations state))]
+            (let [g (elem (field state generations) i)]
+              (when (and (.marked g) (not (.scanned g)))
+                (set! (.scanned g) true)
+                (set! progress true)
+                (for [j 0 (len (.generations state))]
+                  (let [dependency
+                          (elem (field state generations)
+                                j)]
+                    (when (and (not (.marked dependency))
+                               (repl-native-image-required-by? (.image dependency)
+                                                               (.image g)))
+                      (set! (.marked dependency) true)
+                      0)))
+                0)))
+          (unless (load progress) (break))))
+  0)
+
+;;; Does IMAGE itself define a symbol named in NAMES (null: none)?
+(defn repl-native-image-defines-any? [(image (ptr JitImage))
+                                      (names (ptr (HashMap (slice u8) i64)))
+                                      (format NativeImageFormat)] (-> bool)
+  (block :found
+    (unless (= (primitive/cast i64 names) 0)
+      (for [i 0 (len (.syms image))]
+        (let [symbol (elem (field image syms) i)
+              raw (.name symbol)
+              ; Mach-O symbols carry the C prefix the accepted names lack; ELF's do not.
+              name
+                (match format
+                  (MachO []
+                         (if (and (> (len raw) 0) (= (get raw 0) (: 95 u8)))
+                             (subslice raw 1 (len raw))
+                             raw))
+                  (Elf [] raw))]
+          (when (and (= (.owner symbol) (.base image))
+                     (contains? (load names) name))
+            (break :found true))))
+      0)
+    false))
+
+(defn repl-native-reclaim! [(slot (ptr (ptr i8)))
+                            (all bool)
+                            (accepted (ptr (HashMap (slice u8) i64)))] (-> i64)
+  (if (= (primitive/cast i64 (load slot)) 0)
+      0
+      (let [state (primitive/cast (ptr NativeJitState) (load slot))
+            (mut write) 0
+            (mut reclaimed) 0]
+        (unless all (repl-native-mark-images! state accepted) 0)
+        (for [i 0 (len (.generations state))]
+          (let [g (elem (field state generations) i)]
+            (if (or all (not (.marked g)))
+                ; Its names are about to be freed, and the namespace borrows them.
+                (do
+                  (repl-native-drop-namespace! state)
+                  (jit-free! (.image g))
+                  (close! (.metadata g))
+                  (free [scratch/ScratchArena]
+                        (.alc (.generations state))
+                        (slice::new (.metadata g) 1))
+                  (set! reclaimed (+ (load reclaimed) 1))
+                  0)
+                (do
+                  (set! (elem (field state generations)
+                              (load write))
+                        (load g))
+                  (set! write (+ (load write) 1))
+                  0))))
+        (set! (.len (field state generations)) (load write))
+        (when all
+          (let [a (.alc (.generations state))]
+            (free! (mut (.generations state)))
+            (free [NativeJitState] a (slice::new state 1)))
+          (set! slot (primitive/cast (ptr i8) 0)))
+        (load reclaimed))))
+
+;;; A source provider replaces the program it is given, so the session's own
+;;; transaction entry does not survive into the compiled image. A provider that
+;;; wants to own the entry -- because only it knows what this submission has to
+;;; commit -- defines a function with this name, and the session calls that
+;;; instead of its own. Module-qualified, so nothing lands in a shared namespace.
+(const SESSION-ENTRY-NAME "__coil_session_entry")
+
+(defn repl-designated-entry [(p (ptr Program))] (-> (Option (slice u8)))
+  (let [fs (load (field p funcs))
+        n (len (load fs))
+        (mut i) 0
+        (mut found) (None [(slice u8)])]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [f (elem fs (load i))]
+                  ; The provider gives each submission's entry a distinct
+                  ; identity, so match the prefix rather than the whole name.
+                  (when (starts-with (last-component (.name f))
+                                     SESSION-ENTRY-NAME)
+                    (set! found (Some (.name f)))
+                    (break)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (load found)))
+
+; A submission whose own source names its entry owns this revision's entry: the
+; live provider defines a distinct `__coil_session_entry_sN` per generation.
+; Adopting it here makes the rest of the revision — hiding it from the next
+; generation's namespace, pruning it once the generation commits — act on the
+; entry that actually ran rather than on the driver's unused generated name.
+; Without this each generation's entry stayed in the program and the next
+; generation's scan found the older one, whose code this image no longer holds.
+(defn repl-adopt-designated-entry! [(revision (ptr CompilerRevision))] (-> i64)
+  (match (repl-designated-entry (.native revision))
+    (Some [nm]
+          ; Copy: the name found lives in the Func this revision is about to
+          ; hide and prune, and the revision's entry name outlives it.
+          (let [owned (sconcat (.a (.loader revision)) nm "")]
+            (unless (= owned (.entry-name revision))
+              (set! (.discarded-entry revision) (.entry-name revision)))
+            (set! (.entry-name revision) owned)
+            (set! (.entry-symbol revision) owned)
+            0))
+    (None [] 0)))
+
+;;; Emit MP with tpde as FORMAT's object and load it, linking against PRIOR (null for
+;;; a session's first generation).
+(defn repl-native-load [(scratch-a (dyn Allocator))
+                        (mp (ptr Program))
+                        (paths (ptr (ArrayList (slice u8))))
+                        (texts (ptr (ArrayList (slice u8))))
+                        (format NativeImageFormat)
+                        (prior (ptr JitNamespace))]
+  (-> (Result JitImage JitErr))
+  (match format
+    (MachO []
+           (let [codegen-span (tr/span-begin "jit.publish.codegen")
+                 (mut obj)
+                   (cgtpde-build-mobj scratch-a
+                                      mp
+                                      "<repl>"
+                                      (cwd-slice scratch-a)
+                                      paths
+                                      texts
+                                      false)
+                 _codegen-done (tr/span-end codegen-span)
+                 link-span (tr/span-begin "jit.publish.link")
+                 loaded (jit-load-reusing scratch-a (mut obj) prior)]
+             (tr/span-end link-span)
+             loaded))
+    (Elf []
+         (let [codegen-span (tr/span-begin "jit.publish.codegen")
+               (mut obj)
+                 (cgtpde-build-eobj scratch-a
+                                    mp
+                                    "<repl>"
+                                    (cwd-slice scratch-a)
+                                    paths
+                                    texts
+                                    false)
+               _codegen-done (tr/span-end codegen-span)
+               link-span (tr/span-begin "jit.publish.link")
+               loaded (jit-elf-load-reusing scratch-a (mut obj) prior)]
+           (tr/span-end link-span)
+           loaded))))
+
+(defn repl-native-runner-scratch [(scratch-a (dyn Allocator))
+                                  (a (dyn Allocator))
+                                  (mp (ptr Program))
+                                  (paths (ptr (ArrayList (slice u8))))
+                                  (texts (ptr (ArrayList (slice u8))))
+                                  (state (ptr (ptr i8)))
+                                  (entry-symbol (slice u8))
+                                  (format NativeImageFormat)] (-> i64)
+  (let [native-state (repl-native-state a state format)
+        loaded
+          (repl-native-load scratch-a
+                            mp
+                            paths
+                            texts
+                            format
+                            (if (= (len (.generations native-state)) 0)
+                                (primitive/cast (ptr JitNamespace) 0)
+                                (repl-native-link-namespace native-state)))]
+    (match loaded
+      (Err [e0]
+           (let [(mut e) e0
+                 w (stderr)]
+             (ps w "error: REPL JIT: ")
+             (ps w (.msg e))
+             (wb w 10)
+             1))
+      (Ok [img0]
+          (let [img (box! scratch-a JitImage (zeroed JitImage))]
+            (set! img img0)
+            (let [raw (jit-lookup img entry-symbol)]
+              (if (= (primitive/cast i64 raw) 0)
+                  (do
+                    (ps (stderr) "error: REPL JIT entry '")
+                    (ps (stderr) entry-symbol)
+                    (ps (stderr) "' is missing from the image; it has:")
+                    (let [n (len (.syms img))
+                          (mut i) 0]
+                      (loop (if (>= (load i) n)
+                                (break)
+                                (do
+                                  (ps (stderr) " ")
+                                  (ps (stderr)
+                                      (.name (elem (field img syms)
+                                                   (load i))))
+                                  (set! i (primitive/iadd (load i) 1))))))
+                    (wb (stderr) 10)
+                    (ps (stderr) "note: this candidate's program defines:")
+                    (let [fs (load (field mp funcs))
+                          n (len (load fs))
+                          (mut i) 0]
+                      (loop (if (>= (load i) n)
+                                (break)
+                                (do
+                                  (let [f (elem fs (load i))]
+                                    (when (starts-with (last-component (.name f))
+                                                       SESSION-ENTRY-NAME)
+                                      (ps (stderr) " ")
+                                      (ps (stderr) (.name f))))
+                                  (set! i (primitive/iadd (load i) 1))))))
+                    (wb (stderr) 10)
+                    (jit-free! img)
+                    1)
+                  (let [entry-span (tr/span-begin "jit.publish.entry")
+                        _ran (set! (jit-entry-ran-cell) true)
+                        rc
+                          (call-ptr (primitive/cast (fnptr (cc/C) [] i64)
+                                                    raw))
+                        _entry-done (tr/span-end entry-span)]
+                    (if (= rc 0)
+                        (do
+                          (for [i 0 (len (.generations native-state))]
+                            (set! (.current (elem (field native-state
+                                                         generations)
+                                                  i))
+                                  false))
+                          (let [arena
+                                  (box! a
+                                        scratch/ScratchArena
+                                        (zeroed scratch/ScratchArena))]
+                            ; freed when the generation is reclaimed, so not from `a`,
+                            ; which keeps what it hands out for the session
+                            (scratch/ScratchArena::init-with-capacity arena
+                                                                      (large-pages/compiler-scratch-for "jit.metadata")
+                                                                      256)
+                            (when (tr/trace-env?)
+                              (let [(mut imports) 0]
+                                (for [i 0 (len (.syms img))]
+                                  (unless (= (primitive/cast i64
+                                                             (.owner (get (.syms img)
+                                                                          i)))
+                                             (primitive/cast i64 (.base img)))
+                                    (set! imports (+ (load imports) 1))
+                                    0))
+                                (tr/count "jit.image.symbols" (len (.syms img)))
+                                (tr/count "jit.image.imports" (load imports))))
+                            (let [owner (allocator arena)
+                                  image (box! owner JitImage (load img))
+                                  (mut symbols) (ArrayList::new [JitSym] owner)]
+                              (for [i 0 (len (.syms img))]
+                                (let [symbol (get (.syms img) i)]
+                                  (push! (mut symbols)
+                                         (JitSym
+                                           :name
+                                             (sconcat owner (.name symbol) "")
+                                           :addr (.addr symbol)
+                                           :owner (.owner symbol)))))
+                              (set! (.syms image) (load symbols))
+                              (when (.namespace-built native-state)
+                                (jit-namespace-shadow-image! (field native-state
+                                                                    namespace)
+                                                             image)
+                                0)
+                              (push! (mut (.generations native-state))
+                                     (NativeJitGeneration
+                                       :metadata arena
+                                       :image image
+                                       :pinned (repl-native-image-pinned? image)
+                                       :current true
+                                       :leases 0
+                                       :marked false
+                                       :scanned false))))
+                          0)
+                        (do
+                          ; A failed staged entry never becomes the reuse root.
+                          ; It has no published function pointers, so its image
+                          ; is immediately reclaimable.
+                          (jit-free! img)
+                          rc))))))))))
+
+; Stable compiler-SDK operations. `coil.jit` wraps the erased session pointer so
+; no Program/MObj/JitImage representation crosses the public boundary.
+; A compiler revision owns every frontend object and metaprogram image it lends
+; to later submissions. The public session owns the revision chain; a rejected
+; candidate closes its unit immediately and never enters that chain.
+(defstruct CompilerRevision
+  ; A state checked as a value (`jit-env-check`): it is checked and never
+  ; published, so it stops before native code even in a session that runs code.
+  [(check-only bool)
+   ; The state this compilation builds on, null for none.
+   (base (ptr EnvHolder))
+   (unit CompilationUnitSession)
+   (config CompilationUnitConfig)
+   (loader (ptr LS))
+   (native (ptr Program))
+   ; which accepted and new functions exist only while compiling (null until
+   ; the compile classifies them), for the Env it leaves
+   (compile-time (ptr (AMap (slice u8) (slice u8))))
+   (entry-name (slice u8))
+   ; The C symbol that entry was exported under, unique to this transaction.
+   (entry-symbol (slice u8))
+   (result-type Type)
+   ; The driver's generated entry when a source provider's designated entry
+   ; replaced it: never run, so it is hidden with the entry.
+   (discarded-entry (slice u8))])
+
+;;; The state the session currently serves, or null before the first one.
+(defn compiler-revision-current [(session (ptr ReplSession))]
+  (-> (ptr EnvHolder))
+  (.env session))
+
+;;; The state a compilation builds on. An Env is never written, so any held one
+;;; will do; the session's current state is only the default.
+(defn compiler-revision-base [(session (ptr ReplSession))] (-> (ptr EnvHolder))
+  (if (= (primitive/cast i64 (.parent-override session)) 0)
+      (.env session)
+      (.parent-override session)))
+
+;;; Accept REVISION, whose unit is active: copy what later compilations build on
+;;; into an Env of its own and leave the unit, freeing everything else it made.
+;;; The code its metaprograms were loaded as, and their interpreters, are kept by
+;;; the holders of the Env, whose metaprogram entries name them, and of every Env
+;;; built on it. INSTALL makes the Env the state the session serves. Returns the
+;;; Env, held once.
+(defn compiler-revision-accept! [(session (ptr ReplSession))
+                                 (revision (ptr CompilerRevision))
+                                 (install bool)] (-> (ptr EnvHolder))
+  (compiler-work! "end" "accepted")
+  (tr/count "jit.revision.arena-bytes"
+            (total (field (field revision unit) arena)))
+  (let [s (.loader revision)
+        base (.base revision)
+        span (tr/span-begin "jit.accept.env")
+        ; The state this replaces goes once this one is held; when nothing else
+        ; holds it or shares its memory, this accept appends to it in place.
+        target
+          (box! (.a s)
+                EnvTarget
+                (env-target base
+                            (and install
+                                 (!= (primitive/cast i64 base) 0)
+                                 (= (primitive/cast i64 base)
+                                    (primitive/cast i64 (.env session)))
+                                 (env-exclusive? base))))
+        shallow
+          (env-of (.a s)
+                  s
+                  (ast-unit-state)
+                  (meta-engine)
+                  (.native revision)
+                  (.compile-time revision)
+                  (if (= (primitive/cast i64 base) 0)
+                      (primitive/cast (ptr Env) 0)
+                      (field base env))
+                  target
+                  (.n (node-id-cell))
+                  (.form_id (loader-unit-state))
+                  (.gensym (comptime-unit-state))
+                  (.elaboration_id (expander-unit-state)))
+        ; what this compile's metaprograms were loaded as outlives the unit:
+        ; the Env's engine entries name it, so the holders of the Env keep it
+        own
+          (let [resources (field (.allocation (.unit revision)) resources)
+                (mut moved) (ArrayList::new [UnitResource] (.a s))
+                (mut kept) 0]
+            (for [i 0 (len (load resources))]
+              (let [r (get (load resources) i)]
+                (if (or (= (.kind r) UNIT-RESOURCE-EXECUTABLE)
+                        (= (.kind r) UNIT-RESOURCE-INTERPRETER))
+                    (do (push! (mut moved) r) 0)
+                    (do
+                      (set! (elem resources (load kept)) r)
+                      (set! kept (+ (load kept) 1))
+                      0))))
+            (set! (.len resources) (load kept))
+            (env-resources-new (mut moved)))
+        holder (env-hold shallow (meta-engine) base target own)]
+    (tr/span-end span)
+    (tr/count "jit.env.bytes" (env-bytes holder))
+    (tr/count "jit.env.resource-sets" (len (.resources holder)))
+    (compilation-unit-leave! (field revision unit))
+    (free [CompilerRevision] (malloc-allocator) (slice::new revision 1))
+    (when install
+      (let [previous (.env session)]
+        (set! (.env session) holder)
+        (unless (= (primitive/cast i64 previous) 0)
+          (env-release! previous)
+          0))
+      0)
+    (repl-trace-memory! session)
+    holder))
+
+(defn compiler-revision-enter! [(session (ptr ReplSession))
+                                (revision (ptr CompilerRevision))]
+  (-> (dyn Allocator))
+  (let [enter-span (tr/span-begin "jit.prepare.enter")]
+    (set! (.config revision) (.compiler-config session))
+    (let [a
+            (compilation-unit-enter! (field revision unit)
+                                     (field revision config)
+                                     (primitive/cast (ptr (ArrayList VirtualSource))
+                                                     0)
+                                     false
+                                     "unit.revision")
+          s (box! a LS (zeroed LS))
+          base (compiler-revision-base session)]
+      (ls-init! (mut s) a)
+      (set! (.loader revision) s)
+      (set! (.base revision) base)
+      (set! (.resolution_state s) (ast-unit-state))
+      (set! (.code_session_state s)
+            (primitive/cast (ptr i8) (.code-session-state session)))
+      (if (= (primitive/cast i64 base) 0)
+          (set! (.entry_module s) "jit.session")
+          (let [env (field base env)
+                providers (field env core_providers)
+                declarations (field env core_declarations)]
+            (ls-inherit! (mut s) (env-view a env))
+            (when (!= (.init providers) 0)
+              (for [i 0 (len (load (.names providers)))]
+                (core-contribution-add! (get (load (.names providers)) i)
+                                        (get (load (.modules providers)) i)
+                                        (!= (get (load (.roots providers)) i)
+                                            0))))
+            (when (!= (.init declarations) 0)
+              (for [i 0 (len (load (.names declarations)))]
+                (core-decl-add! (get (load (.modules declarations)) i)
+                                (get (load (.names declarations)) i)
+                                (get (load (.los declarations)) i)
+                                (get (load (.his declarations)) i)
+                                (get (load (.srcs declarations)) i)
+                                (get (load (.ctxts declarations)) i))))
+            ; These scalar identity domains continue even though phase scratch and
+            ; dynamic compiler state belong to the new candidate unit.
+            (set! (.n (node-id-cell)) (.next_node_id env))
+            (set! (.form_id (loader-unit-state)) (.next_form env))
+            (set! (.gensym (comptime-unit-state)) (.next_gensym env))
+            (set! (.elaboration_id (expander-unit-state))
+                  (.next_elaboration env))
+            (when (or (> (len (.engine env)) 0) (!= (.engine_active env) 0))
+              (set! (.active (meta-engine)) (.engine_active env))
+              (set! (.entries (meta-engine)) (env-engine-entries a base))
+              (set! (.inherited (meta-engine)) (len (.engine env)))
+              0)
+            0))
+      (tr/span-end enter-span)
+      a)))
+
+(defn compiler-revision-read [(session (ptr ReplSession))
+                              (s (mut LS))
+                              (text (slice u8))
+                              (sid i64)]
+  (-> (Result (ptr (ArrayList Sexp)) Diag))
+  (let [a (.a s)
+        initial
+          (if (not (.source-provider-enabled session))
+              (match (read-all a text sid)
+                (Err [d] (InitialReadError d))
+                (Ok [forms]
+                    (InitialForms
+                      :forms forms
+                      :reader_state (primitive/cast (ptr LS) 0)
+                      :definition_module "")))
+              (let [(mut saved) (zeroed SemMapsSnap)
+                    setup (.source-provider-setup session)]
+                (sem-maps-save (mut saved))
+                (sem-maps-restore (.source-provider-maps session))
+                (set! (.code_session_state setup)
+                      (primitive/cast (ptr i8) (.code-session-state session)))
+                (set! (reader-engine-cache-cell)
+                      (.source-provider-engine session))
+                (let [result
+                        (run-prepared-reader a
+                                             (PreparedReaderSetup
+                                               :state setup
+                                               :checked
+                                                 (.source-provider-program session))
+                                             (.source-provider-module session)
+                                             (.source-provider-name session)
+                                             ; The path carries this submission's number, so
+                                             ; a provider that regenerates helper functions
+                                             ; every submission can give them distinct
+                                             ; identities -- which a retained session
+                                             ; requires of any metaprogram. It also puts the
+                                             ; submission number in this source's
+                                             ; diagnostics.
+                                             (read-context-code a
+                                                                (sconcat3 a
+                                                                          "<jit:"
+                                                                          (i64->str a
+                                                                                    (primitive/iadd (.epoch session)
+                                                                                                    1))
+                                                                          ">")
+                                                                text
+                                                                "entry")
+                                             text)]
+                  (set! (reader-engine-cache-cell)
+                        (primitive/cast (ptr ReaderEngineCache) 0))
+                  (sem-maps-save (.source-provider-maps session))
+                  (sem-maps-restore (mut saved))
+                  result)))]
+    (match initial
+      (InitialReadError [d] (Err [(ptr (ArrayList Sexp)) Diag] d))
+      (InitialForms [forms setup module]
+                    (let [owned (own-form-list a forms)]
+                      (stamp-source-list owned sid)
+                      (install-reader-hygiene-context! (mut s) setup module)
+                      (Ok [(ptr (ArrayList Sexp)) Diag] owned))))))
+
+(defn compiler-revision-check [(session (ptr ReplSession))
+                               (revision (ptr CompilerRevision))
+                               (source (slice u8))
+                               (entry (slice u8))]
+  (-> (Result (ptr Program) Diag))
+  (try (let [s (.loader revision)
+             a (.a s)
+             text (sconcat a source "")
+             sid
+               (register-live-source! (mut s)
+                                      (cond (!= (.terminal-mode session) 0)
+                                              "<repl>"
+                                            (> (len (.source-name session)) 0)
+                                              (.source-name session)
+                                            :else "<jit>")
+                                      (if (= (.terminal-mode session) 0)
+                                          text
+                                          (sconcat a
+                                                   (.terminal-expression session)
+                                                   "")))
+             read-span (tr/span-begin "jit.prepare.read")
+             read (compiler-revision-read session (mut s) text sid)
+             _read-done (tr/span-end read-span)
+             forms (try! read)
+             module
+               (match (declared-module forms)
+                 (Some [name] name)
+                 (None [] (.entry_module s)))
+             base (compiler-revision-base session)]
+         (set! (.entry_module s) module)
+         ; This candidate re-checks only what it submits; a metaprogram it runs
+         ; reads accepted functions through the states it builds on.
+         (let [built-on (.parent s)]
+           (set-closure-parents! built-on
+                                 (if (= (primitive/cast i64 built-on) 0)
+                                     (primitive/cast (ptr LS) 0)
+                                     (.meta_environment built-on))))
+         ; Provider ABI declarations are ordinary Coil, outside the guest
+         ; reader. Load them once; later submissions inherit the checked ABI.
+         (when (and (= (primitive/cast i64 base) 0)
+                    (> (len (.source-provider-abi-preamble session)) 0))
+           (let [preamble (.source-provider-abi-preamble session)
+                 pid (.srccount s)
+                 declarations (try! (read-all a preamble pid))
+                 (mut combined) (ArrayList::new [Sexp] a)]
+             (set! (.srccount s) (+ pid 1))
+             (register-source! (mut s) "<jit provider ABI>" preamble)
+             (for [i 0 (len (load declarations))]
+               (push! (mut combined) (get (load declarations) i)))
+             (for [i 0 (len (load forms))]
+               (push! (mut combined) (get (load forms) i)))
+             (set! forms (load combined)))
+           0)
+         (let [load-span (tr/span-begin "jit.prepare.load")]
+           (if (= (primitive/cast i64 base) 0)
+               (do
+                 (namespace-index-build! (mut s))
+                 (load-program-in-module (mut s)
+                                         (prepend-uses a (mut s) forms)
+                                         (cwd-slice a)
+                                         (Some module)))
+               (process-forms (mut s) forms (cwd-slice a) (Some module)))
+           (tr/span-end load-span))
+         (when (ls-err? (mut s))
+           (break :try (Err [(ptr Program) Diag] (.loaderr s))))
+         ; The native runner's transaction entry is synthetic source owned by this
+         ; revision. It is omitted from the accepted semantic/native catalogs.
+         (let [entry-name (sconcat a "__coil_jit_entry_" (i64->str a sid))
+               entry-source
+                 (sconcat3 a
+                           "(defn* "
+                           entry-name
+                           (sconcat3 a
+                                     " [] (-> i64) "
+                                     entry
+                                     ; No `export-c`. The entry used to be
+                                     ; aliased to a fixed C symbol,
+                                     ; "coil_repl_entry", and found with a
+                                     ; symbol-table lookup of that string. That
+                                     ; put a magic name in the submitted
+                                     ; program's C namespace, so a program
+                                     ; exporting it -- a source provider
+                                     ; supplying its own entry, say -- collided
+                                     ; with the session's and failed to compile.
+                                     ; Compiled Coil functions already appear in
+                                     ; the image under their module-qualified
+                                     ; names, so the entry is found by the name
+                                     ; the compiler gave it.
+                                     ")\n"))
+               eid (register-live-source! (mut s) "<jit entry>" entry-source)]
+           (set! (.entry-name revision)
+                 (qualify-name a entry-name (Some module)))
+           (set! (.entry-symbol revision)
+                 (qualify-name a entry-name (Some module)))
+           (let [entry-forms (try! (read-all a entry-source eid))]
+             (when (!= (.terminal-mode session) 0)
+               (let [prefix
+                       (sconcat3 a
+                                 "(defn* "
+                                 entry-name
+                                 (if (= (.terminal-mode session) 1)
+                                     " [] (-> i64) (do (coil.repl/show) "
+                                     " [] (-> i64) (do "))]
+                 (for [i 0 (len (load entry-forms))]
+                   (repl-anchor-expression! (elem entry-forms i)
+                                            sid
+                                            (len prefix)
+                                            (len (.terminal-expression session)))))
+               0)
+             (process-forms (mut s) entry-forms "" (Some module))))
+         (when (ls-err? (mut s))
+           (break :try (Err [(ptr Program) Diag] (.loaderr s))))
+         (try! (expand-stage3-except (mut s)
+                                     (box-al [(slice u8)]
+                                             a
+                                             (avec-to-list (field s
+                                                                  stage_excluded)
+                                                           a))))
+         (let [checked (try! (run-transforms-and-check a (mut s)))]
+           (try! (run-registered-checkers a (mut s) checked))
+           (when (!= (.terminal-mode session) 0)
+             (try! (compiler-revision-terminal! session revision checked))
+             0)
+           (ls-retain-forms! (mut s))
+           (ls-accept-checked! (mut s) checked)
+           (let [maps (box! a SemMapsSnap (zeroed SemMapsSnap))
+                 runtime (box! a Program (load checked))]
+             (sem-maps-save maps)
+             (set! (.semantic_maps s) (primitive/cast (ptr i8) maps))
+             ; The transaction entry is the one runtime root the session must run.
+             ; Removing it with the compile-time code it reaches would leave only
+             ; a missing-symbol failure at publication, naming nothing.
+             (match (let [classified
+                            (box! a
+                                  (AMap (slice u8) (slice u8))
+                                  (amap-new [(slice u8) (slice u8)] (keyops) a))
+                          root
+                            (drop-code-funcs-unless-root a
+                                                         runtime
+                                                         (.entry-name revision)
+                                                         (if (and (!= (primitive/cast i64
+                                                                                      base)
+                                                                      0)
+                                                                  (.compile_time_known (field base
+                                                                                              env)))
+                                                             (field (field base
+                                                                           env)
+                                                                    compile_time)
+                                                             (primitive/cast (ptr (AMap (slice u8)
+                                                                                        (slice u8)))
+                                                                             0))
+                                                         classified)]
+                      (set! (.compile-time revision) classified)
+                      root)
+               (None [] 0)
+               (Some [root]
+                     (break
+                       :try
+                         (Err [(ptr Program) Diag]
+                              (compile-time-root-diag a root)))))
+             (when (or (.checked-only session) (.check-only revision))
+               (break :try (Ok [(ptr Program) Diag] runtime)))
+             (let [native
+                     (try! (monomorphize-reusing a
+                                                 runtime
+                                                 checked
+                                                 (if (= (primitive/cast i64
+                                                                        base)
+                                                        0)
+                                                     (primitive/cast (ptr Program)
+                                                                     0)
+                                                     (field (field base env)
+                                                            native))
+                                                 (.parent s)))]
+               ; Every definition is a possible import of a future submission:
+               ; its functions, and the storage of its runtime constants (a
+               ; Var's cell among them), which a unit object would otherwise
+               ; keep internal. Publish the Coil ABI without manufacturing C
+               ; export wrappers.
+               (let [(mut names) (ArrayList::new [(slice u8)] a)]
+                 (for [i 0 (len (load (.funcs native)))]
+                   (push! (mut names)
+                          (.name (elem (.funcs native) i))))
+                 (for [i 0 (len (load (.consts native)))]
+                   (let [c (elem (.consts native) i)]
+                     (when (.runtime c) (push! (mut names) (.name c)) 0)))
+                 (set! (.unit_exports native)
+                       (box-al [(slice u8)] a (load names)))
+                 ; A revision is a unit object the session links, never a
+                 ; program with a process entry of its own.
+                 (set! (.unit_build native) true))
+               (sort-mono-program a native)
+               (code-session-stage-monomorphs! (.code-session-state session)
+                                               native)
+               (Ok [(ptr Program) Diag] native)))))))
+
+(defn compiler-revision-hide-entry! [(a (dyn Allocator))
+                                     (program (ptr Program))
+                                     (name (slice u8))] (-> i64)
+  (let [(mut funcs) (ArrayList::new [Func] a)
+        (mut exports) (ArrayList::new [ExportC] a)]
+    (for [i 0 (len (load (.funcs program)))]
+      (let [f (elem (.funcs program) i)]
+        (unless (= (.name f) name)
+          (push! (mut funcs) (load f))
+          0)))
+    (for [i 0 (len (load (.exports program)))]
+      (let [e (elem (.exports program) i)]
+        (unless (= (.name e) name)
+          (push! (mut exports) (load e))
+          0)))
+    (set! (.funcs program) (box-al [Func] a (load funcs)))
+    (set! (.exports program) (box-al [ExportC] a (load exports)))
+    0))
+
+;;; Take REVISION's transaction entry out of its declaration table: an edited
+;;; copy, so the table it was built over is as it was.
+(defn compiler-revision-hide-declaration! [(revision (ptr CompilerRevision))]
+  (-> i64)
+  (let [s (.loader revision)
+        a (.a s)
+        ws (semantic-workspace (mut s))
+        entry-name (.entry-name revision)
+        table
+          (box! a
+                (AVec (ptr DefEntry))
+                (avec-edit (load (.declaration_table ws)) a))]
+    (for [i 0 (len (load table))]
+      (let [module (.module (deftable-at table i))
+            prefix (sconcat a module ".")]
+        (when (and (> (len entry-name) (len prefix))
+                   (= (subslice entry-name 0 (len prefix)) prefix)
+                   (defs-has? (deftable-at table i)
+                              0
+                              (subslice entry-name
+                                        (len prefix)
+                                        (len entry-name))))
+          (let [entry (deftable-entry-mut! a table module)
+                names (field (field entry defs) callables)
+                bare (subslice entry-name (len prefix) (len entry-name))]
+            ; the entry is among the last names added: from it on, each moves
+            ; down one, and what the module declared before it stays shared
+            (block
+              :gone
+                (let [(mut k) (len (load names))]
+                  (while (> (load k) 0)
+                    (set! k (- (load k) 1))
+                    (when (= (get (load names) (load k)) bare)
+                      (for [j (load k) (- (len (load names)) 1)]
+                        (set! names j (get (load names) (+ j 1))))
+                      (pop! names)
+                      (break :gone 0)))))
+            (defs-index-refresh-name! entry bare)
+            0)
+          0)))
+    (set! (.declaration_table ws) table)
+    0))
+
+;;; Compile ordinary static definitions against the session's accepted compiler
+;;; environment. Dynamic binding and redefinition are ordinary metaprogram policy.
+;;; The only compilation path: prepare a delta, then publish that candidate.
+(defn repl-session-compile! [(raw (ptr i8))
+                             (source (slice u8))
+                             (entry (slice u8))] (-> i64)
+  (let [status (repl-session-prepare! raw source entry)]
+    (if (!= status 0) status (repl-session-commit-prepared! raw))))
+
+;;; Whether a candidate over PARENT is the session's first state.
+;;; COIL_META_MAIN=1 wants metaprograms on the process main thread. A compile
+;;; wrapper services them on its caller's thread, so under that setting the caller
+;;; must BE the main thread, including after another session has initialized the
+;;; reusable service. True, with the session's failure set, when it is not.
+(defn repl-meta-main-refused! [(raw (ptr i8)) (source (slice u8))] (-> bool)
+  (if (and (meta-main?) (not (me-on-main-thread?)))
+      (let [session (repl-session raw)]
+        (repl-fail! session source (meta-main-unservable-message))
+        (wb (stderr) 10)
+        true)
+      false))
+
+;;; One piece of front-end work for `repl-on-worker-stack!`: `work` is called with
+;;; `arg` on the worker, and its status comes back in `status`.
+(defstruct ReplWorkerJob
+  [(work (fnptr (cc/C) [(ptr i8)] i64)) (arg (ptr i8)) (status i64)])
+
+(defn repl-worker-entry [(p (ptr i8))] (-> (ptr i8))
+  (let [job (primitive/cast (ptr ReplWorkerJob) p)]
+    (set! (.status job) (call-ptr (.work job) (.arg job)))
+    (main-svc-finish!)
+    (primitive/cast (ptr i8) 0)))
+
+;;; Run `work` on a worker thread with the compiler's stack and wait for it,
+;;; servicing metaprogram calls on this thread meanwhile. Every in-process entry
+;;; that reads, checks or compiles source goes through here: the front end recurses
+;;; once per level of source nesting, with frames of tens of KiB (the parser's list
+;;; case is ~34 KiB), which is why the driver runs its own pipeline on a
+;;; `worker-stack-size` stack. An embedding host's thread is typically 8 MiB — a few
+;;; hundred levels of generated code overflowed it with no diagnostic. Returns
+;;; `work`'s status, or 1 with the session's failure set when no worker started.
+(defn repl-on-worker-stack! [(raw (ptr i8))
+                             (source (slice u8))
+                             (work (fnptr (cc/C) [(ptr i8)] i64))
+                             (arg (ptr i8))] (-> i64)
+  (if (or (meta-wasm-active?) (wasm-sandbox?))
+      ; single-threaded; the module's reserved stack is already the whole stack
+      (call-ptr work arg)
+      (let [(mut job) (zeroed ReplWorkerJob)
+            (mut attr) (zeroed (array i8 64))
+            (mut tid) (zeroed (ptr i8))]
+        (block :run
+          (set! job
+                (ReplWorkerJob
+                  :work work
+                  :arg arg
+                  :status 1))
+          (when (!= (pthread_attr_init (primitive/cast (ptr i8) (mut attr)))
+                    0)
+            (repl-fail! (repl-session raw)
+                        source
+                        "error: cannot initialize JIT worker attributes\n")
+            (return-from :run 1))
+          (when (or (!= (pthread_attr_setstacksize (primitive/cast (ptr i8)
+                                                                   (mut attr))
+                                                   (worker-stack-size))
+                        0)
+                    (!= (pthread_attr_setguardsize (primitive/cast (ptr i8)
+                                                                   (mut attr))
+                                                   (worker-guard-size))
+                        0))
+            (pthread_attr_destroy (primitive/cast (ptr i8) (mut attr)))
+            (repl-fail! (repl-session raw)
+                        source
+                        "error: cannot size JIT worker stack\n")
+            (return-from :run 1))
+          (when (meta-main?) (main-svc-init!))
+          (let [started
+                  (pthread_create (primitive/cast (ptr i8) (mut tid))
+                                  (primitive/cast (ptr i8) (mut attr))
+                                  (fnptr-of repl-worker-entry)
+                                  (primitive/cast (ptr i8) (mut job)))]
+            (pthread_attr_destroy (primitive/cast (ptr i8) (mut attr)))
+            (when (!= started 0)
+              (repl-fail! (repl-session raw)
+                          source
+                          "error: cannot start JIT worker\n")
+              (return-from :run 1))
+            (main-svc-loop)
+            (pthread_join tid (primitive/cast (ptr i8) 0))
+            (.status job))))))
+
+(defstruct ReplPrepareCtx
+  [(raw (ptr i8)) (source (slice u8)) (entry (slice u8))])
+
+(defn repl-prepare-work [(arg (ptr i8))] (-> i64)
+  (let [ctx (primitive/cast (ptr ReplPrepareCtx) arg)]
+    (repl-session-prepare-checked! (.raw ctx) (.source ctx) (.entry ctx))))
+
+(defn repl-session-prepare! [(raw (ptr i8))
+                             (source (slice u8))
+                             (entry (slice u8))] (-> i64)
+  (if (repl-meta-main-refused! raw source)
+      1
+      (do
+        (let [(mut ctx)
+                (ReplPrepareCtx
+                  :raw raw
+                  :source source
+                  :entry entry)]
+          (repl-on-worker-stack! raw
+                                 source
+                                 (fnptr-of repl-prepare-work)
+                                 (primitive/cast (ptr i8) (mut ctx)))))))
+
+(defn repl-session-prepare-checked! [(raw (ptr i8))
+                                     (source (slice u8))
+                                     (entry (slice u8))] (-> i64)
+  (repl-session-finalize-published! raw)
+  (let [prepare-span (tr/span-begin "jit.prepare")
+        session (repl-session raw)]
+    (repl-session-abort-prepared! raw)
+    (let [revision
+            (if (= (primitive/cast i64 (.compiler-candidate session)) 0)
+                (let [next
+                        (box! (malloc-allocator)
+                              CompilerRevision
+                              (zeroed CompilerRevision))]
+                  (set! (.compiler-candidate session) next)
+                  next)
+                (.compiler-candidate session))
+          a (compiler-revision-enter! session revision)
+          s (.loader revision)
+          (mut writer) (zeroed Writer)]
+      (set! (.jit_work_trace (ast-unit-state))
+            (!= (primitive/cast i64 (unit-getenv c"COIL_JIT_TRACE")) 0))
+      (compiler-work! "begin" (i64->str a (+ (.epoch session) 1)))
+      (when (and (.jit_work_trace (ast-unit-state))
+                 (!= (primitive/cast i64 (.parent s)) 0))
+        (let [parent (.checked (.parent s))]
+          (for [i 0 (len (load (.funcs parent)))]
+            (compiler-work! "retained"
+                            (.name (elem (.funcs parent) i)))))
+        0)
+      (repl-dump-candidate! a source)
+      (repl-clear-diagnostic! session)
+      (code-session-begin! (.code-session-state session))
+      ; Every located diagnostic of this candidate — a macro's report, each checker
+      ; error — is the session's diagnostic text, not only the one that ended it.
+      (diag-sink-set! (repl-diagnostic-writer session (mut writer)))
+      (match (let [checked
+                     (compiler-revision-check session revision source entry)]
+               (tr/span-end prepare-span)
+               (diag-sink-set! (primitive/cast (ptr Writer) 0))
+               checked)
+        (Err [diagnostic]
+             (do
+               (code-session-record-check-repairs! (.code-session-state session)
+                                                   (mut s))
+               (report-check-diags (repl-diagnostic-writer session (mut writer))
+                                   (mut s)
+                                   diagnostic)
+               (code-session-abort! (.code-session-state session))
+               (compiler-work! "end" "rejected")
+               (compilation-unit-leave! (field revision unit))
+               (repl-set-failure! session
+                                  source
+                                  "error: compiler session candidate was rejected\n")))
+        (Ok [native]
+            (do
+              (set! (.native revision) native)
+              (set! (.prepared session) true)
+              (repl-owned-replace! (mut (.prepared-source session)) source)
+              (repl-owned-clear! (mut (.pending session)))
+              (repl-flush-warnings! session)
+              (set! (.status session) 0)
+              (compilation-unit-suspend! (field revision unit))
+              0))))))
+
+(defn repl-session-evaluate! [(raw (ptr i8)) (expression (slice u8))] (-> i64)
+  (let [(mut arena) (zeroed scratch/ScratchArena)
+        _init
+          (scratch/ScratchArena::init-with-capacity (mut arena)
+                                                    (large-pages/compiler-scratch-parent)
+                                                    4096)
+        a (allocator (mut arena))
+        status
+          (repl-session-compile! raw "" (sconcat3 a "(do " expression " 0)"))]
+    (close! (mut arena))
+    status))
+
+(defn repl-session-pending [(raw (ptr i8))] (-> (slice u8))
+  (str (.pending (repl-session raw))))
+
+(defn repl-session-diagnostic [(raw (ptr i8))] (-> (slice u8))
+  (str (.diagnostic (repl-session raw))))
+
+(defn repl-session-status [(raw (ptr i8))] (-> i64)
+  (.status (repl-session raw)))
+
+(defn repl-session-condition-kind [(raw (ptr i8))] (-> i64)
+  (code-session-condition-kind (.code-session-state (repl-session raw))))
+
+(defn repl-session-repair-count [(raw (ptr i8))] (-> i64)
+  (code-session-repair-count (.code-session-state (repl-session raw))))
+
+(defn repl-session-repair-function [(raw (ptr i8)) (index i64)] (-> (slice u8))
+  (code-session-repair-function (.code-session-state (repl-session raw)) index))
+
+(defn repl-session-repair-annotation-i64! [(raw (ptr i8))
+                                           (index i64)
+                                           (key (slice u8))
+                                           (value (ptr i64))] (-> bool)
+  (code-session-repair-annotation-i64! (.code-session-state (repl-session raw))
+                                       index
+                                       key
+                                       value))
+
+(defn repl-session-repair-diagnostic [(raw (ptr i8)) (index i64)]
+  (-> (slice u8))
+  (code-session-repair-diagnostic (.code-session-state (repl-session raw))
+                                  index))
+
+(defn repl-session-epoch [(raw (ptr i8))] (-> i64)
+  (.epoch (repl-session raw)))
+
+(defn repl-session-prepared? [(raw (ptr i8))] (-> bool)
+  (.prepared (repl-session raw)))
+
+; Select the frontend ownership policy before a session receives source. It is
+; intentionally immutable after the first accepted/pending/prepared operation:
+; changing transforms mid-session would mix incompatible generated artifacts.
+(defn repl-session-prepare-source-provider! [(a (dyn Allocator))
+                                             (raw (ptr i8))
+                                             (module (slice u8))
+                                             (function (slice u8))
+                                             (owned-modules (slice u8))
+                                             (abi-preamble (slice u8))] (-> i64)
+  (let [session (repl-session raw)]
+    (if (or (> (.epoch session) 0)
+            (> (len (str (.pending session))) 0)
+            (.prepared session))
+        -1
+        (let [qual (sconcat3 a module "." function)
+              setup-src
+                (sconcat3 a
+                          "(module coil-repl-source-provider)\n(import \"coil.phase\")\n(import \""
+                          module
+                          (sconcat3 a
+                                    "\" :use *)\n(transform "
+                                    function
+                                    " :phase (coil.phase.Read))\n(defn main [] (-> i64) 0)\n"))
+              (mut excluded) (ArrayList::new [(slice u8)] a)
+              outer-registry (checker-reg-save)]
+          (push! (mut excluded) qual)
+          ; Newline-separated ownership is deliberately module-granular. A
+          ; synthetic seed contributes its module to the phase reservation;
+          ; closure-module-funcs-pruned then selects the actual declarations.
+          (let [nowned (len owned-modules)
+                (mut lo) 0]
+            (for [i 0 (+ nowned 1)]
+              (when (or (= i nowned)
+                        (= (primitive/cast i64 (get owned-modules i)) 10))
+                (let [owner (subslice owned-modules (load lo) i)]
+                  (when (> (len owner) 0)
+                    (push! (mut excluded)
+                           (sconcat a owner ".__source_provider_owner__"))
+                    0))
+                (set! lo (+ i 1))
+                0)
+              0))
+          (checker-reg-clear!)
+          (let [excludedp (box-al [(slice u8)] a (load excluded))
+                ; A retained source provider is invocation-time by definition.
+                ; Reserve its transitive Code helper closure from definition-time
+                ; staging instead of probing it with arbitrary provider-body syntax.
+                result
+                  (prepare-reader-setup a
+                                        setup-src
+                                        (cwd-slice a)
+                                        excludedp
+                                        true)]
+            (checker-reg-restore! outer-registry)
+            (match result
+              (Err [d]
+                   (let [(mut dp) d]
+                     (repl-fail! session setup-src (.msg dp))))
+              (Ok [prepared]
+                  (let [pp (primitive/alloc-stack PreparedReaderSetup)
+                        maps (box! a SemMapsSnap (zeroed SemMapsSnap))]
+                    (set! pp prepared)
+                    (sem-maps-save maps)
+                    (set! (.source-provider-setup session)
+                          (load (field pp state)))
+                    (set! (.source-provider-program session)
+                          (load (field pp checked)))
+                    (set! (.source-provider-name session)
+                          (sconcat (.a session) qual ""))
+                    (set! (.source-provider-module session)
+                          (sconcat (.a session) module ""))
+                    (set! (.source-provider-abi-preamble session)
+                          (sconcat (.a session) abi-preamble ""))
+                    (set! (.source-provider-maps session) maps)
+                    ; A new provider: the engine the old one built is not it.
+                    (reader-engine-cache-release! (.source-provider-engine session))
+                    (set! (.source-provider-enabled session) true)
+                    0))))))))
+
+(defstruct ReplSourceProviderCtx
+  [(raw (ptr i8))
+   (module (slice u8))
+   (function (slice u8))
+   (owned-modules (slice u8))
+   (abi-preamble (slice u8))])
+
+(defn repl-source-provider-work [(arg (ptr i8))] (-> i64)
+  (let [ctx (primitive/cast (ptr ReplSourceProviderCtx) arg)]
+    (repl-session-set-source-provider-on-stack! (.raw ctx)
+                                                (.module ctx)
+                                                (.function ctx)
+                                                (.owned-modules ctx)
+                                                (.abi-preamble ctx))))
+
+;;; Load and check `module`'s reader transform `function` as this session's source
+;;; provider, on the compiler's stack (`repl-on-worker-stack!`).
+(defn repl-session-set-source-provider! [(raw (ptr i8))
+                                         (module (slice u8))
+                                         (function (slice u8))
+                                         (owned-modules (slice u8))
+                                         (abi-preamble (slice u8))] (-> i64)
+  (if (repl-meta-main-refused! raw module)
+      1
+      (let [(mut ctx)
+              (ReplSourceProviderCtx
+                :raw raw
+                :module module
+                :function function
+                :owned-modules owned-modules
+                :abi-preamble abi-preamble)]
+        (repl-on-worker-stack! raw
+                               module
+                               (fnptr-of repl-source-provider-work)
+                               (primitive/cast (ptr i8) (mut ctx))))))
+
+;;; Reader configuration owns its live checked environment, not the arenas used
+;;; to compile that environment. Invocation scratch belongs to each new revision.
+(defn repl-session-set-source-provider-on-stack! [(raw (ptr i8))
+                                                  (module (slice u8))
+                                                  (function (slice u8))
+                                                  (owned-modules (slice u8))
+                                                  (abi-preamble (slice u8))]
+  (-> i64)
+  (let [session (repl-session raw)
+        ; Entered where it stays: its allocator points at this arena.
+        scope
+          (box! (.a session)
+                CompilationUnitSession
+                (zeroed CompilationUnitSession))
+        a
+          (compilation-unit-enter! scope
+                                   (field session compiler-config)
+                                   (primitive/cast (ptr (ArrayList VirtualSource))
+                                                   0)
+                                   false
+                                   "unit.provider")
+        result
+          (repl-session-prepare-source-provider! a
+                                                 raw
+                                                 module
+                                                 function
+                                                 owned-modules
+                                                 abi-preamble)]
+    (if (= result 0)
+        (let [setup (.source-provider-setup session)]
+          (set! (.checked setup) (.source-provider-program session))
+          (set! (.resolution_state setup) (ast-unit-state))
+          (set! (.semantic_maps setup)
+                (primitive/cast (ptr i8) (.source-provider-maps session)))
+          ; The provider's state lives in this unit; keep it dormant beside the
+          ; session in place of any provider set before.
+          (compilation-unit-suspend! scope)
+          (repl-session-source-provider-unit-leave! session)
+          (set! (.source-provider-unit session) scope)
+          (set! (.source-provider-unit-live session) true)
+          0)
+        (do
+          (compilation-unit-leave! scope)
+          (free [CompilationUnitSession] (.a session) (slice::new scope 1))
+          0))
+    result))
+
+(defn repl-session-source-provider-unit-leave! [(session (ptr ReplSession))]
+  (-> i64)
+  (when (.source-provider-unit-live session)
+    (let [scope (.source-provider-unit session)]
+      (compilation-unit-resume! scope)
+      (compilation-unit-leave! scope)
+      (free [CompilationUnitSession] (.a session) (slice::new scope 1)))
+    (set! (.source-provider-unit-live session) false)
+    0)
+  0)
+
+(defn repl-session-generation-retain! [(raw (ptr i8))] (-> i64)
+  (let [session (repl-session raw)]
+    (set! (.generation-leases session) (+ (.generation-leases session) 1))
+    (.generation-leases session)))
+
+(defn repl-session-generation-release! [(raw (ptr i8))] (-> i64)
+  (let [session (repl-session raw)]
+    (if (<= (.generation-leases session) 0)
+        -1
+        (do
+          (set! (.generation-leases session) (- (.generation-leases session) 1))
+          (.generation-leases session)))))
+
+(defn repl-session-generation-leases [(raw (ptr i8))] (-> i64)
+  (.generation-leases (repl-session raw)))
+
+(defn repl-session-generation-count [(raw (ptr i8))] (-> i64)
+  (let [session (repl-session raw)]
+    (call-ptr (.generation-count session) (field session state))))
+
+;;; Reserve client-token bookkeeping before a host's irreversible publication
+;;; boundary. This does not acquire native ownership. Compiler mutation remains
+;;; serialized; no other client can consume capacity between reserve and retain.
+(defn repl-session-generation-reserve-tokens! [(raw (ptr i8)) (additional i64)]
+  (-> i64)
+  (let [tokens (field (repl-session raw) client-tokens)]
+    (if (or (< additional 0)
+            (> additional (- 9223372036854775807 (.len tokens))))
+        -1
+        (let [required (+ (.len tokens) additional)]
+          (if (<= required (.cap tokens))
+              0
+              (let [capacity
+                      (if (and (<= (.cap tokens) (/ 9223372036854775807 2))
+                               (> (* (.cap tokens) 2) required))
+                          (* (.cap tokens) 2)
+                          required)]
+                (if (> capacity (/ 9223372036854775807 (sizeof i64)))
+                    -1
+                    (match (alloc/reallocate [i64]
+                                             (.alc tokens)
+                                             (slice::new (.data tokens)
+                                                         (.cap tokens))
+                                             capacity)
+                      (None [] -2)
+                      (Some [memory]
+                            (set! (.data tokens) (data memory))
+                            (set! (.cap tokens) capacity)
+                            0)))))))))
+
+;;; Acquire from reserved bookkeeping only. Refuse before incrementing backend
+;;; ownership when the reservation is exhausted. No allocation occurs here.
+(defn repl-session-generation-retain-reserved! [(raw (ptr i8))] (-> i64)
+  (let [session (repl-session raw)
+        tokens (field session client-tokens)]
+    (if (>= (.len tokens) (.cap tokens))
+        -1
+        (let [token
+                (call-ptr (.generation-retain-current session)
+                          (field session state))]
+          (when (!= token -1) (push! (mut (.client-tokens session)) token) 0)
+          token))))
+
+(defn repl-session-generation-retain-current! [(raw (ptr i8))] (-> i64)
+  (if (= (repl-session-generation-reserve-tokens! raw 1) 0)
+      (repl-session-generation-retain-reserved! raw)
+      -1))
+
+(defn repl-session-generation-release-token! [(raw (ptr i8)) (token i64)]
+  (-> i64)
+  (let [session (repl-session raw)
+        tokens (field session client-tokens)]
+    (block :released
+      (for [i 0 (len (load tokens))]
+        (when (= (get (load tokens) i) token)
+          (set! (elem tokens i)
+                (get (load tokens) (- (len (load tokens)) 1)))
+          (set! (.len tokens) (- (.len tokens) 1))
+          (call-ptr (.generation-release-token session)
+                    (field session state)
+                    token)
+          (let [(mut remaining) 0]
+            (for [j 0 (len (load tokens))]
+              (when (= (get (load tokens) j) token)
+                (set! remaining (+ (load remaining) 1))))
+            (break :released (load remaining)))))
+      -1)))
+
+(defn repl-session-generation-token-leases [(raw (ptr i8))] (-> i64)
+  (len (.client-tokens (repl-session raw))))
+
+(defn repl-session-reclaim-retired! [(raw (ptr i8))] (-> i64)
+  (let [session (repl-session raw)]
+    (if (> (.generation-leases session) 0)
+        -1
+        (let [(mut arena) (zeroed scratch/ScratchArena)
+              _init (scratch/ScratchArena::init (mut arena) (malloc-allocator))
+              a (allocator (mut arena))
+              accepted
+                (box! a
+                      (HashMap (slice u8) i64)
+                      (repl-accepted-symbols a session))
+              reclaimed
+                (call-ptr (.reclaimer session)
+                          (field session state)
+                          false
+                          accepted)]
+          (close! (mut arena))
+          reclaimed))))
+
+;;; Every symbol the session's accepted program defines or imports: the functions,
+;;; the storage of runtime constants (`coil_def.NAME`, as both backends name it),
+;;; externs and exports of its accepted native program. Code that defines
+;;; one is still reachable by name, from a later submission or from the host, so a
+;;; generation that defines one is not reclaimed. A hidden transaction entry is not
+;;; among them.
+(defn repl-accepted-symbols [(a (dyn Allocator)) (session (ptr ReplSession))]
+  (-> (HashMap (slice u8) i64))
+  (let [(mut names) (HashMap::new [(slice u8) i64] a (keyops-borrowed))
+        current (compiler-revision-current session)]
+    (unless (= (primitive/cast i64 current) 0)
+      (let [program (field (field current env) native)]
+        (for [i 0 (len (load (.funcs program)))]
+          (set! (mut names) (.name (elem (.funcs program) i)) 0))
+        (for [i 0 (len (load (.consts program)))]
+          (let [c (elem (.consts program) i)]
+            (when (.runtime c)
+              (set! (mut names) (sconcat a "coil_def." (.name c)) 0))
+            0))
+        (for [i 0 (len (load (.externs program)))]
+          (set! (mut names) (extern-link-name (elem (.externs program) i)) 0))
+        (for [i 0 (len (load (.exports program)))]
+          (let [export (elem (.exports program) i)]
+            (set! (mut names)
+                  (match (.symbol export)
+                    (Some [name] name)
+                    (None [] (.name export)))
+                  0))))
+      0)
+    names))
+
+; Publish a prepared candidate through the native backend. Callers that also
+; migrate data hold their own quiescence gate around this operation and their
+; infallible root-pointer publication.
+(defn repl-session-publish-prepared! [(raw (ptr i8))] (-> i64)
+  (let [session (repl-session raw)]
+    (if (not (.prepared session))
+        1
+        (let [revision (.compiler-candidate session)
+              _resume (compilation-unit-resume! (field revision unit))
+              s (.loader revision)
+              a (.a s)
+              paths (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+              texts (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+              _adopted
+                (if (.source-provider-enabled session)
+                    (repl-adopt-designated-entry! revision)
+                    0)
+              native-span (tr/span-begin "jit.publish.native")
+              _reset (set! (jit-entry-ran-cell) false)
+              status
+                (if (.checked-only session)
+                    0
+                    (call-ptr (.runner session)
+                              (primitive/llvm-ir (ref (dyn Allocator))
+                                                 [(field session a)]
+                                                 "ret $ret $0")
+                              (.native revision)
+                              paths
+                              texts
+                              (field session state)
+                              (.entry-symbol revision)))
+              _native-done (tr/span-end native-span)]
+          (set! (.prepared session) false)
+          (if (!= status 0)
+              (do
+                (code-session-abort! (.code-session-state session))
+                (compiler-work! "end" "rejected")
+                (compilation-unit-leave! (field revision unit))
+                (repl-set-failure! session
+                                   (str (.prepared-source session))
+                                   (if (load (jit-entry-ran-cell))
+                                       (sconcat3 (.a session)
+                                                 "error: the transaction entry rejected the candidate (it returned "
+                                                 (i64->str (.a session) status)
+                                                 "); accepted state is unchanged\n")
+                                       "error: compiler session candidate failed during native publication\n"))
+                status)
+              (do
+                ; Logical acceptance precedes metadata maintenance. The revision
+                ; retains its complete compiler arena and native generation until
+                ; finalize; no pointer depends on an already-freed scratch scope.
+                (code-session-commit! (.code-session-state session))
+                (set! (.compiler-candidate session)
+                      (primitive/cast (ptr CompilerRevision) 0))
+                (set! (.compiler-published session) revision)
+                (repl-owned-clear! (mut (.prepared-source session)))
+                (compilation-unit-suspend! (field revision unit))
+                (repl-set-accepted! session)))))))
+
+;;; Hide the revision's entry, and a discarded generated entry, from the state
+;;; later submissions build on.
+(defn compiler-revision-hide-entries! [(a (dyn Allocator))
+                                       (revision (ptr CompilerRevision))]
+  (-> i64)
+  (let [s (.loader revision)]
+    (compiler-revision-hide-entry! a (.checked s) (.entry-name revision))
+    (compiler-revision-hide-entry! a (.native revision) (.entry-name revision))
+    (when (> (len (.discarded-entry revision)) 0)
+      (compiler-revision-hide-entry! a (.checked s) (.discarded-entry revision))
+      (compiler-revision-hide-entry! a
+                                     (.native revision)
+                                     (.discarded-entry revision)))
+    0))
+
+(defn repl-session-finalize-published! [(raw (ptr i8))] (-> i64)
+  (let [session (repl-session raw)
+        revision (.compiler-published session)]
+    (unless (= (primitive/cast i64 revision) 0)
+      (compilation-unit-resume! (field revision unit))
+      (compiler-revision-retain-accepted! revision)
+      (compiler-revision-accept! session revision true)
+      (set! (.compiler-published session)
+            (primitive/cast (ptr CompilerRevision) 0))
+      0))
+  0)
+
+;;; Hide the transaction entry from what REVISION accepted, and record its forms
+;;; and checked functions as the state later compilations build on.
+(defn compiler-revision-retain-accepted! [(revision (ptr CompilerRevision))]
+  (-> i64)
+  (let [s (.loader revision)
+        a (.a s)]
+    (compiler-revision-hide-entries! a revision)
+    (compiler-revision-hide-declaration! revision)
+    (ls-retain-forms! (mut s))
+    (ls-accept-checked! (mut s) (.checked s))
+    (ls-hide-function! (mut s) (.entry-name revision))
+    (when (> (len (.discarded-entry revision)) 0)
+      (ls-hide-function! (mut s) (.discarded-entry revision)))
+    0))
+
+(defn repl-session-finalization-pending? [(raw (ptr i8))] (-> bool)
+  (!= (primitive/cast i64 (.compiler-published (repl-session raw))) 0))
+
+;;; Compatibility operation: accept native code and complete all maintenance.
+(defn repl-session-commit-prepared! [(raw (ptr i8))] (-> i64)
+  (let [status (repl-session-publish-prepared! raw)]
+    (when (= status 0) (repl-session-finalize-published! raw))
+    status))
+
+(defn repl-session-abort-prepared! [(raw (ptr i8))] (-> i64)
+  (let [session (repl-session raw)]
+    (when (.prepared session)
+      (let [revision (.compiler-candidate session)]
+        (compilation-unit-resume! (field revision unit))
+        (code-session-abort! (.code-session-state session))
+        (compiler-work! "end" "aborted")
+        (compilation-unit-leave! (field revision unit)))
+      (set! (.prepared session) false)
+      (repl-owned-clear! (mut (.prepared-source session)))
+      0)
+    0))
+
+(defn repl-session-reset! [(raw (ptr i8))] (-> i64)
+  (let [s (repl-session raw)]
+    (if (or (> (.generation-leases s) 0)
+            (> (len (.client-tokens s)) 0)
+            ; A state someone still holds cannot be taken back.
+            (> (.env-handles s) 0))
+        -1
+        (do
+          (repl-session-finalize-published! raw)
+          (repl-session-abort-prepared! raw)
+          ; Native code must be gone before its borrowed compiler metadata.
+          (repl-jit-reset! s)
+          (reader-engine-cache-release! (.source-provider-engine s))
+          ; the last hold on the Env closes what its metaprograms were loaded as
+          (unless (= (primitive/cast i64 (.env s)) 0)
+            (env-release! (.env s))
+            (set! (.env s) (primitive/cast (ptr EnvHolder) 0))
+            0)
+          (repl-owned-clear! (mut (.pending s)))
+          (repl-owned-clear! (mut (.diagnostic s)))
+          (set! (.status s) 0)
+          (set! (.epoch s) 0)
+          (code-session-reset! (.code-session-state s))
+          0))))
+
+;;; Release a session and everything its constructor and later submissions
+;;; allocated. Like reset, it returns -1 and changes nothing while a generation
+;;; lease, client token, or environment handle is outstanding.
+(defn repl-session-free! [(raw (ptr i8))] (-> i64)
+  (if (!= (repl-session-reset! raw) 0)
+      -1
+      (let [s (repl-session raw)
+            a (.a s)
+            config (field s compiler-config)]
+        (repl-session-source-provider-unit-leave! s)
+        (when (> (len (.source-provider-name s)) 0)
+          (free [u8] a (.source-provider-name s))
+          0)
+        (when (> (len (.source-provider-module s)) 0)
+          (free [u8] a (.source-provider-module s))
+          0)
+        (when (> (len (.source-provider-abi-preamble s)) 0)
+          (free [u8] a (.source-provider-abi-preamble s))
+          0)
+        (code-session-free! (.code-session-state s))
+        (free! (mut (.bytes (.pending s))))
+        (free! (mut (.bytes (.diagnostic s))))
+        (free! (mut (.bytes (.prepared-source s))))
+        (reader-engine-cache-free! (.source-provider-engine s))
+        (free! (mut (.client-tokens s)))
+        (repl-config-free! a config)
+        (when (.project-loaded s)
+          (close! (field s manifest-arena))
+          0)
+        (free [ReplSession] a (slice::new s 1))
+        0)))
+
+;;; A mono'd metaprogram Program as a persistent interpreter context.
+(defn meta-build-interp [(a (dyn Allocator)) (mp (ptr Program))] (-> (ptr i8))
+  (primitive/cast (ptr i8) (interp-build-metaprogram a mp)))
+
+;;; Call one coil_mp_<k> entry of an interpreter context with boxed Sexp cells.
+(defn meta-run-interp [(cx (ptr i8)) (sym (ptr i8)) (argv (ptr i64)) (argc i64)]
+  (-> (ptr i8))
+  (primitive/cast (ptr i8)
+                  (interp-call-entry (primitive/cast (ptr Interp) cx)
+                                     (from-cstr sym)
+                                     argv
+                                     argc)))
+
+;;; Fold one comptime site: run coil.ct.thunk, then coil.ct.status when present, and
+;;; return the status. An aggregate (kind 0) is written through `cell` as a buffer;
+;;; a scalar's bits land in `cell` the way comptime_eval.coil::cte-cell->ctval reads
+;;; them, so an f32 (kind 4) is widened to f64 bits: the interpreter keeps an f32 as
+;;; its own 32 bits, which read as an f64 are a denormal that prints as 0.
+(defn meta-run-ct-interp [(cxp (ptr i8)) (kind i64) (cell (ptr i8))] (-> i64)
+  (let [icx (primitive/cast (ptr Interp) cxp)]
+    (if (= kind 0)
+        (let [(mut argbuf) (zeroed (array i64 1))]
+          (set! (index (primitive/cast (ptr i64) (mut argbuf)) 0)
+                (primitive/cast i64 cell))
+          (interp-call-entry icx
+                             "coil.ct.thunk"
+                             (primitive/cast (ptr i64) (mut argbuf))
+                             1)
+          0)
+        (let [r
+                (interp-call-entry icx
+                                   "coil.ct.thunk"
+                                   (primitive/cast (ptr i64) 0)
+                                   0)]
+          (set! (primitive/cast (ptr i64) cell)
+                (if (= kind 4)
+                    (mem/f64-bits (primitive/cast f64 (bits->f32 r)))
+                    r))
+          0))
+    (if (interp-has-entry? icx "coil.ct.status")
+        (interp-call-entry icx "coil.ct.status" (primitive/cast (ptr i64) 0) 0)
+        0)))
+
+;;; Make the interpreter the metaprogram and comptime engine of this process.
+(defn register-meta-interp-engine! [] (-> i64)
+  (set-meta-interp! (fnptr-of meta-build-interp)
+                    (fnptr-of meta-run-interp)
+                    (fnptr-of meta-run-ct-interp))
+  (set-interp-extern-hook! (fnptr-of mh/mh-interp-dispatch)
+                           (fnptr-of mh/mh-interp-owns?))
+  (set-interp-abort-check! (fnptr-of mh/mh-interp-halted?))
+  0)
+
+;;; Register the interpreter engine when COIL_META_INTERP=1 asks for it. Every
+;;; entry calls this; with it unset the native engines are byte-unchanged. A value
+;;; the engine selection would refuse stops the process here, before staging can
+;;; bury the refusal under the first macro it failed to build.
+(defn select-meta-interp-from-env! [] (-> i64)
+  (when (meta-interp-requested?)
+    (register-meta-interp-engine!))
+  (match (meta-interp-engine-selected)
+    (Ok [_] 0)
+    (Err [d]
+         (do
+           (ps (stderr) "error: ")
+           (ps (stderr) (.msg d))
+           (wb (stderr) 10)
+           (os/_exit (: 2 i32))))))
+
+; Printing consumes the checked expression from this candidate. The user's
+; source is neither reparsed nor expanded again to manufacture a printer.
+(defn compiler-revision-terminal! [(session (ptr ReplSession))
+                                   (revision (ptr CompilerRevision))
+                                   (program (ptr Program))]
+  (-> (Result i64 Diag))
+  (try (let [s (.loader revision)
+             a (.a s)
+             cx (primitive/cast (ptr Cx) (.checker_context s))]
+         (for [i 0 (len (load (.funcs program)))]
+           (let [f (elem (.funcs program) i)]
+             (when (= (.name f) (.entry-name revision))
+               (match (.kind (elem (.body f) 0))
+                 (EDo [body]
+                      (let [value (elem body 0)
+                            ty
+                              (try! (match (type-map-lookup (.node-id value))
+                                      (Some [t] (Ok [Type Diag] t))
+                                      (None []
+                                            (Err [Type Diag]
+                                                 (derr "cannot infer the submitted expression's type")))))
+                            tp
+                              (box! a
+                                    Type
+                                    (match ty
+                                      (TRef [_ inner] (load inner))
+                                      (_ ty)))]
+                        (set! (.result-type revision) ty)
+                        (when (and (= (.terminal-mode session) 1)
+                                   (and (!= (type-tag tp) 3)
+                                        (!= (type-tag tp) 12)))
+                          (let [method
+                                  (cond (impl-holds? a cx "coil.fmt.Debug" tp)
+                                          "coil.fmt.debug-fmt"
+                                        (impl-holds? a cx "coil.fmt.Display" tp)
+                                          "coil.fmt.display-fmt"
+                                        :else "")]
+                            (when (= method "")
+                              (break
+                                :try
+                                  (Err [i64 Diag]
+                                       (derr-at-src (.source value)
+                                                    (.lo value)
+                                                    (.hi value)
+                                                    (sconcat3 a
+                                                              "REPL value of type "
+                                                              (ty-str a tp)
+                                                              " implements neither Debug nor Display")))))
+                            (let [text
+                                    (sconcat3 a
+                                              "(defn* printer [] (-> i64) (let* [__repl_value 0 __repl_formatter 0] (coil.fmt.Formatter::init __repl_formatter (coil.io.stdout)) ("
+                                              method
+                                              " __repl_value __repl_formatter) (coil.fmt.print-nl (coil.io.stdout)) 0))")
+                                  parsed
+                                    (try! (parse-program a
+                                                         (try! (read-all a
+                                                                         text
+                                                                         -1))))
+                                  pp (box! a Program parsed)
+                                  printer (elem (.funcs pp) 0)]
+                              (set! (.name printer) (.name f))
+                              (match (.kind (elem (.body printer) 0))
+                                (ELet [binds rest]
+                                      (do
+                                        (set! (.value (elem binds 0))
+                                              (load value))
+                                        (set! (.value (elem binds 1))
+                                              (mk-expr (EAlloc
+                                                         :storage 0
+                                                         :ty
+                                                           (TStruct "coil.fmt.Formatter")
+                                                         :init
+                                                           (primitive/cast (ptr Expr)
+                                                                           0)
+                                                         :symbol
+                                                           (None [(slice u8)]))
+                                                       -1
+                                                       -1
+                                                       -1
+                                                       0))))
+                                (_ (break
+                                     :try
+                                       (Err [i64 Diag]
+                                            (derr "invalid terminal printer template")))))
+                              ; The submitted value was checked once already: an
+                              ; anonymous `fn` in it is now a reference to the lifted
+                              ; function. Checking the printer checks that reference,
+                              ; so the lifted functions need their signatures.
+                              (for [k 0 (len (.anon_funcs cx))]
+                                (let [lifted (elem (field cx anon_funcs) k)]
+                                  (when (= (primitive/cast i64
+                                                           (sig-find cx
+                                                                     (.name lifted)))
+                                           0)
+                                    (setup-one-sig a cx lifted))))
+                              (let [checked (try! (check-func a cx printer))]
+                                (set! f checked)
+                                (try! (ownership-check-func a cx f))
+                                0)))
+                          0)))
+                 (_ (break
+                      :try
+                        (Err [i64 Diag]
+                             (derr "invalid terminal expression entry")))))
+               0)))
+         (Ok [i64 Diag] 0))))
+
+;;; Under COIL_TRACE, what each account of compiler memory holds, the resident
+;;; size, and what the state the session serves owns.
+(defn repl-trace-memory! [(session (ptr ReplSession))] (-> i64)
+  (when (tr/trace-env?)
+    (let [(mut work) (zeroed scratch/ScratchArena)]
+      (scratch/ScratchArena::init (mut work) (malloc-allocator))
+      (let [a (scratch/ScratchArena::allocator (mut work))
+            accounts (memory/account-children (large-pages/compiler-account) a)]
+        (for [i 0 (len accounts)]
+          (let [acct (get accounts i)]
+            (tr/count (sconcat a "memory." (memory/account-name acct))
+                      (memory/account-total acct))))
+        (match (memory/process-resident-bytes)
+          (Some [n] (tr/count "memory.resident" n))
+          (None [] 0))
+        (unless (= (primitive/cast i64 (.env session)) 0)
+          (tr/count "memory.env.owned" (env-footprint-total a (.env session)))
+          ; what the pool has carved, which compaction is decided on; the
+          ; account counts the pool's segments
+          (tr/count "memory.env.pool.carved"
+                    (scratch/ScratchArena::total (field (.pool (.env session))
+                                                        arena)))
+          0))
+      (scratch/ScratchArena::close! (mut work)))
+    0)
+  0)
+
+;;; Attribute the submitted expression to its own source while retaining the
+;;; synthetic entry's distinct source identity for compiler-generated nodes.
+(defn repl-anchor-expression! [(node (ptr Sexp))
+                               (source i64)
+                               (base i64)
+                               (length i64)] (-> i64)
+  (let [tag (sx-tag (load node))]
+    (when (and (>= (.lo node) base) (<= (.hi node) (+ base length)))
+      (set! (.source node) source)
+      (set! (.lo node) (- (.lo node) base))
+      (set! (.hi node) (- (.hi node) base))
+      0)
+    (when (or (= tag 6) (= tag 7))
+      (let [items (sx-items (load node))]
+        (for [i 0 (len (load items))]
+          (repl-anchor-expression! (elem items i) source base length)))
+      0)
+    0))
+
+;;; The runner of a native session on macOS arm64: tpde code, loaded as Mach-O.
+(defn repl-native-runner [(a (dyn Allocator))
+                          (mp (ptr Program))
+                          (paths (ptr (ArrayList (slice u8))))
+                          (texts (ptr (ArrayList (slice u8))))
+                          (state (ptr (ptr i8)))
+                          (entry-symbol (slice u8))] (-> i64)
+  (repl-native-run a mp paths texts state entry-symbol (MachO)))
+
+;;; The runner of a native session on Linux x86-64: tpde code, loaded as ELF.
+(defn repl-elf-runner [(a (dyn Allocator))
+                       (mp (ptr Program))
+                       (paths (ptr (ArrayList (slice u8))))
+                       (texts (ptr (ArrayList (slice u8))))
+                       (state (ptr (ptr i8)))
+                       (entry-symbol (slice u8))] (-> i64)
+  (repl-native-run a mp paths texts state entry-symbol (Elf)))
+
+(defn repl-native-run [(a (dyn Allocator))
+                       (mp (ptr Program))
+                       (paths (ptr (ArrayList (slice u8))))
+                       (texts (ptr (ArrayList (slice u8))))
+                       (state (ptr (ptr i8)))
+                       (entry-symbol (slice u8))
+                       (format NativeImageFormat)] (-> i64)
+  ; Codegen scratch comes from the process, not from A: A is the session's
+  ; allocator, which may be an arena that never gives memory back, and this
+  ; scratch is freed after every submission.
+  (let [(mut arena) (zeroed scratch/ScratchArena)]
+    (scratch/ScratchArena::init-with-capacity (mut arena)
+                                              (large-pages/compiler-scratch-for "jit.runner")
+                                              65536)
+    (let [status
+            (repl-native-runner-scratch (allocator (mut arena))
+                                        a
+                                        mp
+                                        paths
+                                        texts
+                                        state
+                                        entry-symbol
+                                        format)]
+      (close! (mut arena))
+      status)))
+
+;;; A hold on the state the session currently serves, or null before the first one.
+(defn repl-session-env-current [(raw (ptr i8))] (-> (ptr i8))
+  (repl-session-finalize-published! raw)
+  (let [session (repl-session raw)
+        current (compiler-revision-current session)]
+    (unless (= (primitive/cast i64 current) 0)
+      (env-retain! current)
+      (set! (.env-handles session) (+ (.env-handles session) 1))
+      0)
+    (primitive/cast (ptr i8) current)))
+
+(defn repl-session-env-retain! [(raw (ptr i8)) (env (ptr i8))] (-> (ptr i8))
+  (let [session (repl-session raw)]
+    (env-retain! (primitive/cast (ptr EnvHolder) env))
+    (set! (.env-handles session) (+ (.env-handles session) 1))
+    env))
+
+(defn repl-session-env-release! [(raw (ptr i8)) (env (ptr i8))] (-> i64)
+  (let [session (repl-session raw)]
+    (unless (= (primitive/cast i64 env) 0)
+      (set! (.env-handles session) (- (.env-handles session) 1))
+      (env-release! (primitive/cast (ptr EnvHolder) env))
+      0)
+    0))
+
+;;; Check `source` against the state `env` (null: against nothing) and return a hold
+;;; on the resulting state, or null with the session's diagnostic set when it does
+;;; not check. `env` is not written, and neither is the state the session serves:
+;;; the result is simply another value, and whoever holds it decides what it is for.
+(defn repl-session-env-check! [(raw (ptr i8))
+                               (env (ptr i8))
+                               (source (slice u8))] (-> (ptr i8))
+  (let [span (tr/span-begin "jit.env.check")
+        result (repl-session-env-check-untimed! raw env source)]
+    (tr/span-end span)
+    result))
+
+(defstruct ReplEnvCheckCtx
+  [(raw (ptr i8)) (env (ptr i8)) (source (slice u8)) (result (ptr i8))])
+
+(defn repl-env-check-work [(arg (ptr i8))] (-> i64)
+  (let [ctx (primitive/cast (ptr ReplEnvCheckCtx) arg)]
+    (set! (.result ctx)
+          (repl-session-env-check-on-stack! (.raw ctx) (.env ctx) (.source ctx)))
+    0))
+
+;;; `repl-session-env-check!` without its trace span, on the compiler's stack
+;;; (`repl-on-worker-stack!`).
+(defn repl-session-env-check-untimed! [(raw (ptr i8))
+                                       (env (ptr i8))
+                                       (source (slice u8))] (-> (ptr i8))
+  (if (repl-meta-main-refused! raw source)
+      (primitive/cast (ptr i8) 0)
+      (let [(mut ctx)
+              (ReplEnvCheckCtx
+                :raw raw
+                :env env
+                :source source
+                :result (primitive/cast (ptr i8) 0))]
+        (repl-on-worker-stack! raw
+                               source
+                               (fnptr-of repl-env-check-work)
+                               (primitive/cast (ptr i8) (mut ctx)))
+        (.result ctx))))
+
+(defn repl-session-env-check-on-stack! [(raw (ptr i8))
+                                        (env (ptr i8))
+                                        (source (slice u8))] (-> (ptr i8))
+  (repl-session-finalize-published! raw)
+  (repl-session-abort-prepared! raw)
+  (let [session (repl-session raw)
+        none (primitive/cast (ptr i8) 0)]
+    ; A session that runs code checks a value state the same way: the revision
+    ; is check-only, so nothing of it becomes native code or is published.
+    (let [revision
+            (box! (malloc-allocator)
+                  CompilerRevision
+                  (zeroed CompilerRevision))
+          _check-only (set! (.check-only revision) true)
+          _base
+            (set! (.parent-override session)
+                  (primitive/cast (ptr EnvHolder) env))
+          a (compiler-revision-enter! session revision)
+          s (.loader revision)
+          (mut writer) (zeroed Writer)]
+      (set! (.jit_work_trace (ast-unit-state))
+            (!= (primitive/cast i64 (unit-getenv c"COIL_JIT_TRACE")) 0))
+      (repl-clear-diagnostic! session)
+      (code-session-begin! (.code-session-state session))
+      (let [checked (compiler-revision-check session revision source "0")
+            ; The session's Code state follows the state the session serves, so a
+            ; value built beside it must not have moved it.
+            staged
+              (or (.has_staged (.code-session-state session))
+                  (.has_staged_monomorphs (.code-session-state session)))]
+        (code-session-abort! (.code-session-state session))
+        (match checked
+          (Err [diagnostic]
+               (do
+                 (report-diag (repl-diagnostic-writer session
+                                                      (mut writer))
+                              (mut s)
+                              diagnostic)
+                 (compilation-unit-leave! (field revision unit))
+                 (free [CompilerRevision]
+                       (malloc-allocator)
+                       (slice::new revision 1))
+                 (set! (.parent-override session)
+                       (primitive/cast (ptr EnvHolder) 0))
+                 (repl-set-failure! session
+                                    source
+                                    "error: the source does not check against that compiler state\n")
+                 none))
+          (Ok [program]
+              (if staged
+                  (do
+                    (compilation-unit-leave! (field revision unit))
+                    (free [CompilerRevision]
+                          (malloc-allocator)
+                          (slice::new revision 1))
+                    (set! (.parent-override session)
+                          (primitive/cast (ptr EnvHolder) 0))
+                    (repl-set-failure! session
+                                       source
+                                       "error: the source stages session Code state, which a compiler state held as a value cannot carry yet\n")
+                    none)
+                  (do
+                    (set! (.native revision) program)
+                    (compiler-revision-retain-accepted! revision)
+                    (let [held
+                            (compiler-revision-accept! session revision false)]
+                      (set! (.parent-override session)
+                            (primitive/cast (ptr EnvHolder) 0))
+                      (set! (.env-handles session) (+ (.env-handles session) 1))
+                      (set! (.status session) 0)
+                      (primitive/cast (ptr i8) held))))))))))
+
+;;; The source text of the form that defines function `name` in `env`, or "" when
+;;; it has no authored form of its own (a function a macro produced, say). Valid
+;;; while `env` is held.
+(defn repl-session-env-definition-source [(raw (ptr i8))
+                                          (env (ptr i8))
+                                          (name (slice u8))] (-> (slice u8))
+  (let [holder (primitive/cast (ptr EnvHolder) env)]
+    (if (= (primitive/cast i64 holder) 0)
+        ""
+        (let [loader (field (field holder env) loader)]
+          (match (env-function (field holder env) name)
+            (None [] "")
+            (Some [f]
+                  (let [id (.source f)]
+                    (if (or (< id 0) (>= id (len (.sources loader))))
+                        ""
+                        (let [text (.text (elem (field loader sources) id))]
+                          (if (and (>= (.lo f) 0)
+                                   (and (< (.lo f) (.hi f))
+                                        (<= (.hi f) (len text))))
+                              (subslice text (.lo f) (.hi f))
+                              ""))))))))))
+
+;;; Whether the state `env` defines a function named `name`.
+(defn repl-session-env-defines? [(raw (ptr i8))
+                                 (env (ptr i8))
+                                 (name (slice u8))] (-> bool)
+  (let [holder (primitive/cast (ptr EnvHolder) env)]
+    (if (= (primitive/cast i64 holder) 0)
+        false
+        (match (env-function (field holder env) name)
+          (None [] false)
+          (Some [_] true)))))
+
+;;; The state `env` as bytes, allocated from `a`, for `repl-session-env-load!` to
+;;; read back in a process of the same toolchain; "" with the session's diagnostic
+;;; set when it cannot be saved.
+(defn repl-session-env-save [(raw (ptr i8)) (env (ptr i8)) (a (dyn Allocator))]
+  (-> (slice u8))
+  (let [session (repl-session raw)
+        holder (primitive/cast (ptr EnvHolder) env)]
+    (if (= (primitive/cast i64 holder) 0)
+        (do
+          (repl-fail! session
+                      ""
+                      "error: the empty compiler state has nothing to save\n")
+          "")
+        (match (env-save a holder)
+          (Ok [bytes] (do (repl-clear-diagnostic! session) bytes))
+          (Err [why]
+               (do (repl-fail! session "" (sconcat3 a "error: " why "\n")) ""))))))
+
+;;; A hold on the state `bytes` saved (`repl-session-env-save`), or null with the
+;;; session's diagnostic set when they are not one this toolchain wrote. The state
+;;; is a value like any other: check against it, keep it, release it.
+(defn repl-session-env-load! [(raw (ptr i8)) (bytes (slice u8))] (-> (ptr i8))
+  (let [session (repl-session raw)
+        (mut work) (zeroed scratch/ScratchArena)]
+    (scratch/ScratchArena::init (mut work) (malloc-allocator))
+    (let [a (scratch/ScratchArena::allocator (mut work))
+          result
+            (match (env-load a bytes)
+              (Ok [holder]
+                  (do
+                    (repl-clear-diagnostic! session)
+                    (set! (.env-handles session) (+ (.env-handles session) 1))
+                    (primitive/cast (ptr i8) holder)))
+              (Err [why]
+                   (do
+                     (repl-fail! session "" (sconcat3 a "error: " why "\n"))
+                     (primitive/cast (ptr i8) 0))))]
+      (scratch/ScratchArena::close! (mut work))
+      result)))
+
+;;; Select the frontend-only backend before the first preparation. A session
+;;; never mixes native physical artifacts with layout-independent execution.
+(defn repl-session-checked-only! [(raw (ptr i8))] (-> bool)
+  (let [session (repl-session raw)]
+    (if (or (.prepared session)
+            (> (.epoch session) 0)
+            (!= (primitive/cast i64 (.compiler-candidate session)) 0))
+        false
+        (do (set! (.checked-only session) true) true))))

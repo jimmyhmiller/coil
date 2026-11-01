@@ -1,0 +1,947 @@
+;;; `coil build-unit`, the prebuilt library state and the prebuilt lint profile.
+(module coil.compiler.cli_units)
+(import "coil.primitive" :as primitive)
+(import "coil.compiler.unit_state" :use *)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :as str :use * :exclude [parse-int])
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.pmap" :use *)
+(import "coil.io" :use *)
+(import "coil.fs" :as fs)
+(import "coil.control" :use *)
+(import "coil.try" :use *)
+(import "coil.compiler.env" :use *)
+(import "coil.compiler.ffi" :use *)
+(import "coil.compiler.guide" :use *)
+(import "coil.reader" :use *)
+(import "coil.project" :use *)
+(import "coil.source.cli"
+        :use
+        [d-write-file d-rewrite-file read-stdin-all write-stdout-all is-flag?
+         count-substr])
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.astdump" :use *)
+(import "coil.compiler.parser" :use *)
+(import "coil.compiler.loader" :use *)
+(import "coil.compiler.resolve" :use *)
+(import "coil.compiler.check" :use *)
+(import "coil.compiler.mono" :use *)
+(import "coil.compiler.phase_split" :use *)
+(import "coil.compiler.diag" :use *)
+(import "coil.compiler.comptime" :use *)
+(import "coil.compiler.closure" :use *)
+(import "coil.compiler.metaengine" :use *)
+(import "coil.compiler.expander" :use *)
+(import "coil.compiler.artifact_provider" :as artifact)
+(import "coil.compiler.unit" :use *)
+(import "coil.compiler.artifact_wire" :as artifact-wire)
+(import "coil.compiler.artifact_identity" :as artifact-id)
+(import "coil.compiler.native_module" :use *)
+(import "coil.compiler.codegen_tpde"
+        :use
+        [cgtpde-build-object cgtpde-build-mobj cgtpde-build-eobj
+         set-tpde-debug-frames!])
+(import "coil.compiler.jit" :use *)
+(import "coil.compiler.interp" :use *)
+(import "coil.compiler.wasm" :use *)
+(import "coil.compiler.codegen_wasm" :use *)
+(import "coil.cc" :as cc)
+(import "coil.compiler.cli_base" :use *)
+(import "coil.compiler.cli_project" :use *)
+(import "coil.compiler.pipeline" :use *)
+(import "coil.compiler.session" :use *)
+
+(defstruct ProviderBuildTask
+  [(a (dyn Allocator))
+   (module (slice u8))
+   (function (slice u8))
+   (root (slice u8))
+   (status i64)])
+
+(defn provider-build-thread [(raw (ptr i8))] (-> (ptr i8))
+  (let [task (primitive/cast (ptr ProviderBuildTask) raw)
+        a (.a task)
+        prior-inputs (.artifact_inputs (loader-unit-state))
+        _track-inputs
+          (set! (.artifact_inputs (loader-unit-state))
+                (box-al [LoaderArtifactInput]
+                        a
+                        (ArrayList::new [LoaderArtifactInput] a)))
+        qual (sconcat3 a (.module task) "." (.function task))
+        setup-src
+          (sconcat3 a
+                    "(module coil-provider-build)\n(import \"coil.phase\")\n(import \""
+                    (.module task)
+                    (sconcat3 a
+                              "\" :use *)\n(transform "
+                              (.function task)
+                              " :phase (coil.phase.Read))\n(defn main [] (-> i64) 0)\n"))
+        (mut excluded) (ArrayList::new [(slice u8)] a)]
+    (push! (mut excluded) qual)
+    (let [prepared-result
+            (match (prepare-reader-setup a
+                                         setup-src
+                                         (cwd-slice a)
+                                         (mut excluded)
+                                         false)
+              (Ok [prepared] (Ok [PreparedReaderSetup Diag] prepared))
+              (Err [d]
+                   (if (reader-phase-boundary-diag? d)
+                       (prepare-reader-setup a
+                                             setup-src
+                                             (cwd-slice a)
+                                             (mut excluded)
+                                             true)
+                       (Err [PreparedReaderSetup Diag] d))))]
+      (match prepared-result
+        (Err [d] (dump-error (stderr) (box! a Diag d)))
+        (Ok [prepared]
+            (let [entry prepared
+                  setup (.state entry)
+                  function (prog-fn-find (.checked entry) qual)]
+              (if (or (= (primitive/cast i64 function) 0)
+                      (!= (len (load (.params function))) 1))
+                  (ps (stderr)
+                      "error: provider artifact entry must take exactly one Code context\n")
+                  (match (artifact/provider-build a
+                                                  setup
+                                                  (.checked entry)
+                                                  (.module task)
+                                                  qual
+                                                  (reader-artifact-options a)
+                                                  (.root task))
+                    (Err [d] (report-diag (stderr) (mut setup) d))
+                    (Ok [directory]
+                        (ps (stdout) directory)
+                        (wb (stdout) 10)
+                        (set! (.status task) 0))))))))
+    (set! (.artifact_inputs (loader-unit-state)) prior-inputs)
+    (primitive/cast (ptr i8) 0)))
+
+(defn build-provider-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))]
+  (-> i64)
+  (block :command
+    (when (< (primitive/cast i64 argc) 6)
+      (ps (stderr)
+          "usage: coil build-provider MODULE FUNCTION -o EXISTING_DIRECTORY [build options]\n")
+      (return-from :command 1))
+    (when (or (meta-wasm-active?) (meta-interp-active?) (wasm-sandbox?))
+      (ps (stderr)
+          "error: provider artifacts require a native compiler host\n")
+      (return-from :command 1))
+    (let [(mut task) (zeroed ProviderBuildTask)
+          (mut attr) (zeroed (array i8 64))
+          (mut tid) (zeroed (ptr i8))
+          (mut output) ""
+          (mut i) 4]
+      (argv-apply-uses! argc argv)
+      (set-target-arch! (argv-triple argc argv))
+      (loop (if (>= (load i) (primitive/cast i64 argc)) (break) 0)
+        (let [arg (from-cstr (load (index argv (load i))))]
+          (when (and (flag-takes-value? arg)
+                     (>= (+ (load i) 1) (primitive/cast i64 argc)))
+            (ps (stderr) "error: provider build flag requires a value\n")
+            (return-from :command 1))
+          (cond (= arg "-o")
+                  (set! output
+                        (from-cstr (load (index argv (+ (load i) 1)))))
+                (opt-flag? arg) (apply-opt-flag! arg)
+                (meta-opt-flag? arg) (apply-meta-opt-flag! arg)
+                (sanitizer-flag? arg) (apply-sanitizer-flag! arg)
+                (jit-flag? arg) (apply-jit-flag! arg)
+                (= arg "--debug-checks") (enable-debug-checks!)
+                (or (= arg "--target")
+                    (= arg "--use")
+                    (= arg "--link-flag")
+                    (dash-l? arg))
+                  0
+                :else
+                  (do
+                    (ps (stderr)
+                        "error: unsupported provider build option\n")
+                    (return-from :command 1)))
+          (set! i (+ (load i) (if (flag-takes-value? arg) 2 1)))))
+      (when (= (load output) "")
+        (ps (stderr) "error: provider build requires -o DIRECTORY\n")
+        (return-from :command 1))
+      (set! task
+            (ProviderBuildTask
+              :a a
+              :module (from-cstr (load (index argv 2)))
+              :function (from-cstr (load (index argv 3)))
+              :root (load output)
+              :status 1))
+      (pthread_attr_init (primitive/cast (ptr i8) (mut attr)))
+      (pthread_attr_setstacksize (primitive/cast (ptr i8) (mut attr))
+                                 536870912)
+      (let [started
+              (pthread_create (primitive/cast (ptr i8) (mut tid))
+                              (primitive/cast (ptr i8) (mut attr))
+                              (fnptr-of provider-build-thread)
+                              (primitive/cast (ptr i8) (mut task)))]
+        (pthread_attr_destroy (primitive/cast (ptr i8) (mut attr)))
+        (if (!= started (: 0 i32))
+            (do
+              (ps (stderr) "error: cannot start provider compiler stack\n")
+              1)
+            (do
+              (pthread_join tid (primitive/cast (ptr i8) 0))
+              (.status task)))))))
+
+; The backend's "one mono'd Program -> one object" entry, registered by the
+; executable that links the backend (main.coil registers the LLVM one).
+(defstruct UnitBuildBox
+  [(isset i64)
+   (fp (fnptr (cc/C) [(ref (dyn Allocator)) (ptr Program) (ptr i8)] i64))])
+
+(defn unit-build-box [] (-> (ptr UnitBuildBox))
+  (primitive/alloc-static UnitBuildBox))
+
+; A unit's content key: the compiler binary, target and optimization level, then
+; every real source file the build read, each with its digest. Written beside the
+; object so a later build can ask whether anything changed without recompiling --
+; the whole point of a prebuilt unit is not to. A pseudo-source (the prelude, a
+; bundled module, generated text) has no file to compare and is skipped. Any
+; existing file counts, whatever its extension: a reader's entry (a C header the
+; C reader lowers) is as much the unit's source as a .coil file, and it is also
+; what ties the unit to its package for link selection.
+(defn unit-real-source? [(name (slice u8))] (-> bool)
+  (= (access (to-cstr (malloc-allocator) name) 0) (: 0 i32)))
+
+(defn unit-first-space [(s (slice u8))] (-> i64)
+  (let [(mut r) -1]
+    (for [i 0 (len s)]
+      (when (and (< (load r) 0)
+                 (= (primitive/cast i64 (get s i)) 32))
+        (set! r i)
+        0)
+      0)
+    (load r)))
+
+; The first lines of a unit's key: the compiler binary, target, optimization level
+; and backend. unit-write-key! records them and unit-fresh-for? compares them.
+(defn unit-key-header [(a (dyn Allocator)) (backend i64) (opt i64)]
+  (-> (slice u8))
+  (let [(mut key) (StrBuf::new a)]
+    (try (let [d
+                 (try-or! (artifact-id/compiler-identity a
+                                                         (self-command-path a))
+                          (push-str! (mut key) "?"))]
+           (push-str! (mut key) d)))
+    (push! (mut key) (: 10 u8))
+    (push-str! (mut key) (target-arch-str))
+    (push! (mut key) (: 45 u8))
+    (push-str! (mut key) (target-os-str))
+    (push! (mut key) (: 10 u8))
+    (push-str! (mut key) (i64->str a opt))
+    (push! (mut key) (: 10 u8))
+    (push-str! (mut key) "backend ")
+    (push-str! (mut key) (unit-backend-name backend))
+    (push! (mut key) (: 10 u8))
+    ; a module may expand differently for each (`primitive/jit-implementation`)
+    (push-str! (mut key) "jit ")
+    (push-str! (mut key) (jit-implementation-name (jit-implementation)))
+    (push! (mut key) (: 10 u8))
+    ; Sources are recorded by their library-relative names and checked by
+    ; content (unit.sources), so where the library sits is no part of the key:
+    ; a copied or moved toolchain keeps its unit.
+    (push-str! (mut key) "sources-v3\n")
+    (str (load key))))
+
+; Diagnostic source labels are not filesystem paths. Resolve bundled labels
+; through the same layout used by bundled-text before recording dependencies.
+; The C symbols a unit's object defines globally: every `export-c` with an
+; explicit C name, from any module the unit embeds. A consumer that also compiles
+; one of those modules from source must leave those symbols to the unit, which is
+; their one owner (drop-unit-owned-exports!).
+(defn unit-write-cexports! [(a (dyn Allocator))
+                            (dir (slice u8))
+                            (mp (ptr Program))] (-> i64)
+  (let [(mut out) (StrBuf::new a)]
+    (for [i 0 (len (load (.exports mp)))]
+      (match (.symbol (elem (.exports mp) i))
+        (Some [symbol]
+              (push-str! (mut out) symbol)
+              (push! (mut out) (: 10 u8))
+              0)
+        (None [] 0)))
+    (d-write-file a (path-join a dir "unit.cexports") (str (load out)))))
+
+(defn unit-write-key! [(a (dyn Allocator))
+                       (dir (slice u8))
+                       (path (slice u8))
+                       (srcpaths (ptr (ArrayList (slice u8))))
+                       (backend i64)
+                       (opt i64)] (-> i64)
+  ;; 0 when both files were written, 1 (d-write-file said which) when not: a unit
+  ;; without its key is never found fresh, so the build that made it failed.
+  (if (!= (d-write-file a
+                        (path-join a dir "unit.key")
+                        (unit-key-header a backend opt))
+          0)
+      1
+      (let [(mut src) (StrBuf::new a)
+            (mut seen) (ArrayList::new [(slice u8)] a)]
+        (for [i 0 (len (load srcpaths))]
+          ; a library source is recorded by its library-relative name, so the
+          ; unit stays current wherever the toolchain is copied or moved
+          (let [path (library-input-path a (get (load srcpaths) i))
+                name (library-input-name a path)]
+            (when (and (unit-real-source? path)
+                       (not (unit-has? (mut seen) name)))
+              (push! (mut seen) name)
+              (try (let [d (try-or! (artifact-id/artifact-file-digest a path) 0)]
+                     (do
+                       (push-str! (mut src) d)
+                       (push! (mut src) (: 32 u8))
+                       (push-str! (mut src) name)
+                       (push! (mut src) (: 10 u8))
+                       0)))
+              0))
+          0)
+        (d-write-file a (path-join a dir "unit.sources") (str (load src))))))
+
+;;; The files a unit is keyed on: the sources the build registered, then every
+;;; other input the loader recorded (include-str, depends-on).
+(defn unit-key-paths [(a (dyn Allocator)) (sources (ArrayList (slice u8)))]
+  (-> (ptr (ArrayList (slice u8))))
+  (let [(mut out) (ArrayList::new [(slice u8)] a)
+        extra (.artifact_inputs (loader-unit-state))]
+    (for [i 0 (len sources)] (push! (mut out) (get sources i)) 0)
+    (unless (= (primitive/cast i64 extra) 0)
+      (for [i 0 (len (load extra))]
+        (push! (mut out) (.path (elem extra i)))
+        0)
+      0)
+    (box-al [(slice u8)] a (load out))))
+
+(defn unit-has? [(names (mut (ArrayList (slice u8)))) (name (slice u8))]
+  (-> bool)
+  (let [(mut r) false]
+    (for [i 0 (len names)] (when (= (get names i) name) (set! r true) 0) 0)
+    (load r)))
+
+; True when the unit in `dir` was built by this compiler for this target,
+; optimization level and backend, and every source it recorded still hashes the
+; same. A unit whose key predates backends is never fresh, so it is rebuilt.
+(defn unit-fresh-for? [(a (dyn Allocator))
+                       (dir (slice u8))
+                       (backend i64)
+                       (opt i64)] (-> bool)
+  (let [keyp (path-join a dir "unit.key")
+        srcp (path-join a dir "unit.sources")]
+    (if (or (= (len dir) 0)
+            (!= (access (to-cstr a keyp) 0) (: 0 i32))
+            (!= (access (to-cstr a srcp) 0) (: 0 i32)))
+        false
+        (let [want (unit-key-header a backend opt)]
+          (if (!= (read-file a (to-cstr a keyp)) want)
+              false
+              ; re-hash every recorded source; a missing or changed one is stale.
+              (let [text (read-file a (to-cstr a srcp))
+                    lines (split a text "\n")
+                    (mut ok) true]
+                (for [i 0 (len (load lines))]
+                  (let [line (get (load lines) i)]
+                    (when (> (len line) 0)
+                      (let [sp (unit-first-space line)]
+                        (if (< sp 0)
+                            (set! ok false)
+                            (let [want-sha (subslice line 0 sp)
+                                  fpath (subslice line (+ sp 1) (len line))]
+                              (try (let [d
+                                           (try-or! (artifact-id/artifact-file-digest-once (library-input-path a
+                                                                                                               fpath))
+                                                    (set! ok false))]
+                                     (unless (= d want-sha) (set! ok false) 0))))))))
+                  0)
+                (load ok)))))))
+
+; The mode-3 dump-fn: runs on the big stack, like every other frontend run.
+; Files the unit is made from beyond its sources -- include-str embeds, a
+; reader's `depends-on` -- are collected while it builds and key it too.
+(defn build-unit-render [(a (dyn Allocator))
+                         (src (slice u8))
+                         (cwd (slice u8))
+                         (path (slice u8))] (-> i64)
+  (let [prior (.artifact_inputs (loader-unit-state))]
+    (set! (.artifact_inputs (loader-unit-state))
+          (box-al [LoaderArtifactInput]
+                  a
+                  (ArrayList::new [LoaderArtifactInput] a)))
+    (let [rc (build-unit-render-inner a src cwd path)]
+      (set! (.artifact_inputs (loader-unit-state)) prior)
+      rc)))
+
+(defn build-unit-render-inner [(a (dyn Allocator))
+                               (src (slice u8))
+                               (cwd (slice u8))
+                               (path (slice u8))] (-> i64)
+  (let [state (driver-unit-state)
+        dir (.unit_out state)
+        backend (.unit_backend state)
+        w (stderr)]
+    (let [entry-state (primitive/alloc-stack LS)]
+      (ls-init! (mut entry-state) a)
+      (set! (.srccount entry-state) 1)
+      (register-source! (mut entry-state) path src)
+      (match (initial-read a (mut entry-state) src path cwd)
+        (InitialReadError [d]
+                          (do (report-diag w (mut entry-state) d) 1))
+        (InitialForms [forms _ _]
+                      (let [(mut rendered) (StrBuf::new a)]
+                        (for [i 0 (len (load forms))]
+                          (push-str! (mut rendered)
+                                     (sexp-display a (get (load forms) i)))
+                          (push! (mut rendered) (: 10 u8))
+                          0)
+                        (let [unit-src (str (load rendered))]
+                          (match (read-all a unit-src 0)
+                            (Err [d] (do (report-diag w (mut entry-state) d) 1))
+                            (Ok [unit-forms]
+                                (match (declared-module unit-forms)
+                                  (None []
+                                        (do
+                                          (ps w
+                                              "error: build-unit: the entry file must declare a module; a unit is a module\n")
+                                          1))
+                                  (Some [ns]
+                                        (let [(mut sp0)
+                                                (ArrayList::new [(slice u8)] a)
+                                              (mut st0)
+                                                (ArrayList::new [(slice u8)] a)
+                                              (mut externals)
+                                                (ArrayList::new [(slice u8)] a)]
+                                          (set! (.unit_pretransformed state)
+                                                true)
+                                          (set! (.unit_expanded state)
+                                                (primitive/cast (ptr (ArrayList TaggedForm))
+                                                                0))
+                                          (set! (.unit_module state) ns)
+                                          (set! (.unit_reexported state)
+                                                (primitive/cast (ptr (ArrayList (slice u8)))
+                                                                0))
+                                          (set! (.unit_public state)
+                                                (primitive/cast (ptr (ArrayList (slice u8)))
+                                                                0))
+                                          (set! (.unit_externs state)
+                                                (primitive/cast (ptr (ArrayList Extern))
+                                                                0))
+                                          (let [first-pipeline
+                                                  (run-pipeline a
+                                                                unit-src
+                                                                cwd
+                                                                w
+                                                                path
+                                                                (mut sp0)
+                                                                (mut st0))
+                                                ; Impls the module's own metaprograms generated forward to
+                                                ; wrappers the unit compiles; see unit.coil. The wrappers
+                                                ; join the module's source and the module compiles again.
+                                                forwarding
+                                                  (match first-pipeline
+                                                    (None []
+                                                          (Err [(ArrayList UnitForward)
+                                                                (slice u8)]
+                                                               ""))
+                                                    (Some [mp0]
+                                                          (unit-generated-forwards a
+                                                                                   mp0
+                                                                                   (.unit_expanded state)
+                                                                                   unit-forms
+                                                                                   ns)))
+                                                pipeline
+                                                  (try (let [fws
+                                                               (try-or! forwarding
+                                                                        first-pipeline)]
+                                                         (if (= (len fws) 0)
+                                                             first-pipeline
+                                                             (let [(mut sp1)
+                                                                     (ArrayList::new [(slice u8)]
+                                                                                     a)
+                                                                   (mut st1)
+                                                                     (ArrayList::new [(slice u8)]
+                                                                                     a)
+                                                                   fwb
+                                                                     (box-al [UnitForward]
+                                                                             a
+                                                                             fws)
+                                                                   second
+                                                                     (run-pipeline a
+                                                                                   (sconcat a
+                                                                                            unit-src
+                                                                                            (unit-wrapper-source a
+                                                                                                                 fwb))
+                                                                                   cwd
+                                                                                   w
+                                                                                   path
+                                                                                   (mut sp1)
+                                                                                   (mut st1))]
+                                                               (set! sp0
+                                                                     (load sp1))
+                                                               (set! st0
+                                                                     (load st1))
+                                                               second))))
+                                                forwards
+                                                  (try (let [fws
+                                                               (try-or! forwarding
+                                                                        (box-al [UnitForward]
+                                                                                a
+                                                                                (ArrayList::new [UnitForward]
+                                                                                                a)))]
+                                                         (box-al [UnitForward]
+                                                                 a
+                                                                 fws)))]
+                                            (set! (.unit_pretransformed state)
+                                                  false)
+                                            (match (match forwarding
+                                                     (Err [e]
+                                                          (if (= (len e) 0)
+                                                              (None [(slice u8)])
+                                                              (Some e)))
+                                                     (Ok [_]
+                                                         (None [(slice u8)])))
+                                              (Some [e]
+                                                    (do
+                                                      (ps w "error: ")
+                                                      (ps w e)
+                                                      (wb w 10)
+                                                      1))
+                                              (None []
+                                                    (match pipeline
+                                                      (None [] 1)
+                                                      (Some [mp]
+                                                            (match (unit-interface-render a
+                                                                                          mp
+                                                                                          unit-forms
+                                                                                          unit-src
+                                                                                          ns
+                                                                                          forwards
+                                                                                          (.unit_reexported state)
+                                                                                          (.unit_public state)
+                                                                                          (.unit_listed state)
+                                                                                          (.unit_externs state)
+                                                                                          (.unit_expanded state)
+                                                                                          (mut externals))
+                                                              (Err [e]
+                                                                   (do
+                                                                     (ps w
+                                                                         "error: ")
+                                                                     (ps w e)
+                                                                     (wb w 10)
+                                                                     1))
+                                                              (Ok [iface]
+                                                                  (let [obj
+                                                                          (path-join a
+                                                                                     dir
+                                                                                     "unit.o")
+                                                                        obj-cstr
+                                                                          (to-cstr a
+                                                                                   obj)
+                                                                        dylib
+                                                                          (path-join a
+                                                                                     dir
+                                                                                     (sconcat a
+                                                                                              "unit"
+                                                                                              (me-dylib-ext)))]
+                                                                    ; The object exposes exactly what the interface
+                                                                    ; declared; every other function stays local, so a
+                                                                    ; consumer that also compiles a module this unit
+                                                                    ; embeds does not collide with it.
+                                                                    (set! (.unit_exports mp)
+                                                                          (box-al [(slice u8)]
+                                                                                  a
+                                                                                  (load externals)))
+                                                                    ; A unit, not a program: nothing in it is the
+                                                                    ; process entry, so every backend leaves `main`
+                                                                    ; to the program that links it.
+                                                                    (set! (.unit_build mp)
+                                                                          true)
+                                                                    (if (or (!= (d-write-file a
+                                                                                              (path-join a
+                                                                                                         dir
+                                                                                                         "interface.coil")
+                                                                                              iface)
+                                                                                0)
+                                                                            (!= (unit-write-cexports! a
+                                                                                                      dir
+                                                                                                      mp)
+                                                                                0))
+                                                                        1
+                                                                        (let [built
+                                                                                (cond (native-backend? backend)
+                                                                                        (do
+                                                                                          (cgtpde-build-object a
+                                                                                                               mp
+                                                                                                               obj-cstr
+                                                                                                               path
+                                                                                                               cwd
+                                                                                                               (box-al [(slice u8)]
+                                                                                                                       a
+                                                                                                                       (load sp0))
+                                                                                                               (box-al [(slice u8)]
+                                                                                                                       a
+                                                                                                                       (load st0))
+                                                                                                               (native-emit-dwarf?))
+                                                                                          1)
+                                                                                      (= (.isset (unit-build-box))
+                                                                                         0)
+                                                                                        (do
+                                                                                          (ps w
+                                                                                              "error: build-unit: this compiler has no LLVM backend; pass --backend arm64\n")
+                                                                                          0)
+                                                                                      :else
+                                                                                        (call-ptr (.fp (unit-build-box))
+                                                                                                  a
+                                                                                                  mp
+                                                                                                  obj-cstr))]
+                                                                          (if (!= built
+                                                                                  1)
+                                                                              1
+                                                                              ; The same code as a shared library, for metaprograms
+                                                                              ; compiled in this process: undefined references stay
+                                                                              ; undefined until it is loaded beside the compiler.
+                                                                              (let [(mut args)
+                                                                                      (ArrayList::new [(slice u8)]
+                                                                                                      a)]
+                                                                                (push! (mut args)
+                                                                                       "cc")
+                                                                                (push! (mut args)
+                                                                                       (if (me-host-linux?)
+                                                                                           "-shared"
+                                                                                           "-dynamiclib"))
+                                                                                (push! (mut args)
+                                                                                       obj)
+                                                                                (push! (mut args)
+                                                                                       "-o")
+                                                                                (push! (mut args)
+                                                                                       dylib)
+                                                                                (let [links
+                                                                                        (meta-link-box)]
+                                                                                  (when (!= (.isset links)
+                                                                                            0)
+                                                                                    (for [i
+                                                                                          0
+                                                                                          (len (load (.flags links)))]
+                                                                                      (push! (mut args)
+                                                                                             (get (load (.flags links))
+                                                                                                  i))
+                                                                                      0)
+                                                                                    0))
+                                                                                (unless (me-host-linux?)
+                                                                                  (push! (mut args)
+                                                                                         "-Wl,-undefined,dynamic_lookup")
+                                                                                  0)
+                                                                                (let [rc
+                                                                                        (spawn-wait a
+                                                                                                    (load args))]
+                                                                                  (if (!= rc
+                                                                                          0)
+                                                                                      (do
+                                                                                        (ps w
+                                                                                            "error: build-unit: linking ")
+                                                                                        (ps w
+                                                                                            dylib)
+                                                                                        (ps w
+                                                                                            " failed\n")
+                                                                                        1)
+                                                                                      (if (!= (unit-write-key! a
+                                                                                                               dir
+                                                                                                               path
+                                                                                                               (unit-key-paths a
+                                                                                                                               (load sp0))
+                                                                                                               backend
+                                                                                                               (opt-level))
+                                                                                              0)
+                                                                                          1
+                                                                                          (let [o
+                                                                                                  (stdout)]
+                                                                                            (unless (.unit_quiet state)
+                                                                                              (ps o
+                                                                                                  "wrote ")
+                                                                                              (ps o
+                                                                                                  (path-join a
+                                                                                                             dir
+                                                                                                             "interface.coil"))
+                                                                                              (ps o
+                                                                                                  ", ")
+                                                                                              (ps o
+                                                                                                  obj)
+                                                                                              (ps o
+                                                                                                  ", ")
+                                                                                              (ps o
+                                                                                                  dylib)
+                                                                                              (wb o
+                                                                                                  10)
+                                                                                              0)
+                                                                                            0))))))))))))))))))))))))))))
+
+(defn build-unit-cmd [(a (dyn Allocator)) (argc i32) (argv (ptr (ptr i8)))]
+  (-> i64)
+  (block :command
+    (when (< (primitive/cast i64 argc) 5)
+      (ps (stderr)
+          "usage: coil build-unit ENTRY.coil -o DIRECTORY [-O0..3] [--backend arm64] [build options]\n")
+      (return-from :command 1))
+    (when (or (meta-wasm-active?) (meta-interp-active?) (wasm-sandbox?))
+      (ps (stderr)
+          "error: prebuilt units require a native compiler host\n")
+      (return-from :command 1))
+    (let [file (load (index argv 2))
+          (mut output) ""
+          (mut backend) 1
+          (mut i) 3]
+      (argv-apply-uses! argc argv)
+      (set-target-arch! (argv-triple argc argv))
+      (loop (if (>= (load i) (primitive/cast i64 argc)) (break) 0)
+        (let [arg (from-cstr (load (index argv (load i))))]
+          (when (and (flag-takes-value? arg)
+                     (>= (+ (load i) 1) (primitive/cast i64 argc)))
+            (ps (stderr) "error: build-unit flag requires a value\n")
+            (return-from :command 1))
+          (cond (= arg "-o")
+                  (set! output
+                        (from-cstr (load (index argv (+ (load i) 1)))))
+                (= arg "--backend")
+                  (let [bn
+                          (from-cstr (load (index argv
+                                                  (+ (load i)
+                                                     1))))]
+                    (cond (= bn "arm64") (set! backend 2)
+                          (or (= bn "x64") (= bn "x86_64")) (set! backend 5)
+                          (= bn "tpde") (set! backend 7)
+                          (= bn "llvm") (set! backend 1)
+                          :else
+                            (do
+                              (ps (stderr)
+                                  "error: build-unit: a unit is a native object; --backend must be llvm, arm64, x64 or tpde\n")
+                              (return-from :command 1))))
+                (opt-flag? arg) (apply-opt-flag! arg)
+                (meta-opt-flag? arg) (apply-meta-opt-flag! arg)
+                (sanitizer-flag? arg) (apply-sanitizer-flag! arg)
+                (jit-flag? arg) (apply-jit-flag! arg)
+                (= arg "--debug-checks") (enable-debug-checks!)
+                (= arg "-g")
+                  (do
+                    (set-native-emit-dwarf! true)
+                    (set-tpde-debug-frames! true))
+                (= arg "--quiet") (set! (.unit_quiet (driver-unit-state)) true)
+                (or (= arg "--target")
+                    (= arg "--use")
+                    (= arg "--unit")
+                    (= arg "--link-flag")
+                    (dash-l? arg))
+                  0
+                :else
+                  (do
+                    (ps (stderr) "error: unsupported build-unit option '")
+                    (ps (stderr) arg)
+                    (ps (stderr) "'\n")
+                    (return-from :command 1)))
+          (set! i (+ (load i) (if (flag-takes-value? arg) 2 1)))))
+      (when (= (load output) "")
+        (ps (stderr) "error: build-unit requires -o DIRECTORY\n")
+        (return-from :command 1))
+      (unless (native-backend-target-ok? (load backend))
+        (return-from :command 1))
+      ; Create the output directory and its immediate parent (a units cache
+      ; dir like `.../units/NAME` whose `units` parent may not exist yet).
+      (fs/make-dir (to-cstr a (dirname (load output)))
+                   493)
+      (fs/make-dir (to-cstr a (load output)) 493)
+      (when (!= (access (to-cstr a (load output)) 0)
+                (: 0 i32))
+        (ps (stderr) "error: build-unit: cannot create ")
+        (ps (stderr) (load output))
+        (wb (stderr) 10)
+        (return-from :command 1))
+      ; Nothing changed since the last build for this compiler, target and
+      ; optimization level: the unit already on disk is the answer. Not
+      ; recompiling it is the entire point.
+      (when (unit-fresh-for? a (load output) (load backend) (opt-level))
+        (unless (.unit_quiet (driver-unit-state))
+          (let [o (stdout)]
+            (ps o "up to date: ")
+            (ps o (load output))
+            (wb o 10))
+          0)
+        (return-from :command 0))
+      (let [state (driver-unit-state)]
+        (set! (.unit_out state) (load output))
+        (set! (.unit_backend state) (load backend)))
+      (run-dump-on-big-stack a
+                             (read-src a file)
+                             (dirname (from-cstr file))
+                             (from-cstr file)
+                             (fnptr-of build-unit-render)))))
+
+;;; `coil build-library-state [PATH]`: check a program that loads only the
+;;; library, in a session that never runs code, and save its compiler state at
+;;; PATH (by default `library-state-path`).
+(defn build-library-state-cmd [(a (dyn Allocator))
+                               (argc i32)
+                               (argv (ptr (ptr i8)))] (-> i64)
+  (block :command
+    (when (> (primitive/cast i64 argc) 3)
+      (ps (stderr) "usage: coil build-library-state [PATH]\n")
+      (return-from :command 2))
+    ; a compile on such a compiler never uses one (`library-state-applies?`)
+    (when (or (not (lint-profile-native?)) (= (.isset (meta-build-box)) 0))
+      (ps (stderr)
+          "note: this compiler does not run its metaprograms natively, so it keeps no library state\n")
+      (return-from :command 0))
+    ; a state only this build may read is keyed by its toolchain digest
+    (when (= (len (match (toolchain-digest a) (Some [d] d) (None [] ""))) 0)
+      (ps (stderr)
+          "note: this compiler records no toolchain digest, so it keeps no library state\n")
+      (return-from :command 0))
+    ; The state is the toolchain's, the same whoever builds it: none of a
+    ; project's configuration (the namespace roots a rebootstrap exports, a
+    ; module map, core providers, a stdlib profile) reaches it.
+    (for name (iter (split a (shipped-unit-isolated-vars) " "))
+      (unsetenv (to-cstr a name)))
+    (let [path
+            (if (= (primitive/cast i64 argc) 3)
+                (from-cstr (load (index argv 2)))
+                (library-state-path a))
+          raw
+            (repl-session-new-with-runner a
+                                          (fnptr-of repl-native-runner)
+                                          (fnptr-of repl-native-reclaim!)
+                                          (fnptr-of repl-native-generation-count)
+                                          (fnptr-of repl-native-retain-current!)
+                                          (fnptr-of repl-native-release-token!)
+                                          (fnptr-of repl-native-token-leases))
+          _checked (repl-session-checked-only! raw)
+          env
+            (repl-session-env-check! raw
+                                     (primitive/cast (ptr i8) 0)
+                                     "(module coil.library-state)")]
+      (when (= (primitive/cast i64 env) 0)
+        (ps (stderr) (repl-session-diagnostic raw))
+        (return-from :command 1))
+      (let [bytes (repl-session-env-save raw env a)]
+        (when (= (len bytes) 0)
+          (ps (stderr) (repl-session-diagnostic raw))
+          (return-from :command 1))
+        (let [dir (dirname path)]
+          (unless (= (access (to-cstr a dir) 0) (: 0 i32))
+            (fs/make-dir (to-cstr a dir) 493)
+            0)
+          ; written beside the destination and renamed over it, so a compile
+          ; reading the state never sees half of one
+          (let [staged (temp-sibling-or-exit path)]
+            (match (fs/write-file a staged bytes)
+              (Err [_]
+                   (do
+                     (ps (stderr)
+                         (sconcat3 a "error: cannot write " staged "\n"))
+                     (return-from :command 1)))
+              (Ok [_] 0))
+            (unless (= (rename (to-cstr a staged) (to-cstr a path)) (: 0 i32))
+              (ps (stderr) (sconcat3 a "error: cannot write " path "\n"))
+              (return-from :command 1)))
+          (repl-session-env-release! raw env)
+          (repl-session-free! raw)
+          0)))))
+
+;;; `coil build-lint-profile DIR`: compile coil.lint.default and publish it as a
+;;; checker profile at DIR, replacing a stale one. What `coil lint` runs, in a
+;;; child, when its profile is missing or stale, and `dev.py install` to build an
+;;; installed toolchain's.
+(defn build-lint-profile-cmd [(a (dyn Allocator))
+                              (argc i32)
+                              (argv (ptr (ptr i8)))] (-> i64)
+  (block :command
+    (when (!= (primitive/cast i64 argc) 3)
+      (ps (stderr) "usage: coil build-lint-profile DIRECTORY\n")
+      (return-from :command 2))
+    (when (or (not (lint-profile-native?))
+              (= (.isset (meta-build-box)) 0))
+      (ps (stderr)
+          "error: a lint profile is a native image; this compiler cannot build one\n")
+      (return-from :command 1))
+    (cli-use-add "coil.lint.default")
+    (run-dump-on-big-stack a
+                           ""
+                           (cwd-slice a)
+                           (from-cstr (load (index argv 2)))
+                           (fnptr-of build-lint-profile-render))))
+
+; The mode-3 dump-fn of build-lint-profile: PATH is the profile's directory.
+(defn build-lint-profile-render [(a (dyn Allocator))
+                                 (src (slice u8))
+                                 (cwd (slice u8))
+                                 (path (slice u8))] (-> i64)
+  (let [prior (.artifact_inputs (loader-unit-state))
+        _track
+          (set! (.artifact_inputs (loader-unit-state))
+                (box-al [LoaderArtifactInput]
+                        a
+                        (ArrayList::new [LoaderArtifactInput] a)))
+        rules (primitive/alloc-stack LS)
+        rc
+          (match (lint-profile-compile a (mut rules) cwd)
+            (None [] 1)
+            (Some [cp]
+                  (let [reg (checker-reg-save)
+                        (mut entries)
+                          (ArrayList::new [artifact-wire/ProfileEntry] a)]
+                    (if (or (> (len (load (.semtx-once reg))) 0)
+                            (or (> (len (load (.semtx reg))) 0)
+                                (> (len (load (.posttx reg))) 0)))
+                        (do
+                          (ps (stderr)
+                              "error: the lint profile registers transforms; a checker profile holds only checkers\n")
+                          1)
+                        (do
+                          (for [i 0 (len (load (.precheckers reg)))]
+                            (push! (mut entries)
+                                   (artifact-wire/ProfileEntry
+                                     :name (get (load (.precheckers reg)) i)
+                                     :symbol ""
+                                     :phase 0))
+                            0)
+                          (for [i 0 (len (load (.checkers reg)))]
+                            (push! (mut entries)
+                                   (artifact-wire/ProfileEntry
+                                     :name (get (load (.checkers reg)) i)
+                                     :symbol ""
+                                     :phase 1))
+                            0)
+                          (match (artifact/profile-build a
+                                                         rules
+                                                         cp
+                                                         "coil.lint.default"
+                                                         (box-al [artifact-wire/ProfileEntry]
+                                                                 a
+                                                                 (load entries))
+                                                         (box-al [(slice u8)]
+                                                                 a
+                                                                 (.items (.allfns reg)))
+                                                         LINT-PROFILE-OPTIONS
+                                                         path)
+                            (Err [d]
+                                 (do (report-diag (stderr) (mut rules) d) 1))
+                            (Ok [_] 0)))))))]
+    (set! (.artifact_inputs (loader-unit-state)) prior)
+    rc))
+
+(defn argv-triple [(argc i32) (argv (ptr (ptr i8)))] (-> (ptr i8))
+  (let [(mut i) 2
+        (mut r) (primitive/cast (ptr i8) 0)]
+    (loop (if (>= (load i) (primitive/cast i64 argc))
+              (break)
+              (do
+                (when (and (= (from-cstr (load (index argv (load i))))
+                              "--target")
+                           (< (primitive/iadd (load i) 1)
+                              (primitive/cast i64 argc)))
+                  (set! r
+                        (load (index argv (primitive/iadd (load i) 1))))
+                  (break))
+                (set! i (primitive/iadd (load i) 1)))))
+    (load r)))

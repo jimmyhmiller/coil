@@ -1,0 +1,2365 @@
+;;; `coil check --fix`: applying what checkers suggest, keeping only what compiles.
+(module coil.compiler.cli_fix)
+(import "coil.compiler.large_pages" :as large-pages)
+(import "coil.primitive" :as primitive)
+(import "coil.temp" :as temp)
+(import "coil.compiler.unit_state" :use *)
+(import "coil.alloc" :as alloc :use *)
+(import "coil.result" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :as str :use * :exclude [parse-int])
+(import "coil.arraylist" :use *)
+(import "coil.hashmap" :use *)
+(import "coil.pmap" :use *)
+(import "coil.io" :use *)
+(import "coil.os" :as os)
+(import "coil.control" :use *)
+(import "coil.try" :use *)
+(import "coil.scratch" :as scratch)
+(import "coil.compiler.env" :use *)
+(import "coil.compiler.ffi" :use *)
+(import "coil.compiler.guide" :use *)
+(import "coil.reader" :use *)
+(import "coil.source.edit" :use *)
+(import "coil.project" :use *)
+(import "coil.source.cli"
+        :use
+        [d-write-file d-rewrite-file read-stdin-all write-stdout-all is-flag?
+         count-substr])
+(import "coil.compiler.ast" :use *)
+(import "coil.compiler.astdump" :use *)
+(import "coil.compiler.parser" :use *)
+(import "coil.compiler.loader" :use *)
+(import "coil.compiler.resolve" :use *)
+(import "coil.compiler.check" :use *)
+(import "coil.compiler.mono" :use *)
+(import "coil.compiler.phase_split" :use *)
+(import "coil.compiler.diag" :use *)
+(import "coil.compiler.trace" :as tr)
+(import "coil.compiler.mtrace" :as mtr)
+(import "coil.compiler.comptime" :use *)
+(import "coil.compiler.closure" :use *)
+(import "coil.compiler.metaengine" :use *)
+(import "coil.compiler.expander" :use *)
+(import "coil.compiler.artifact_provider" :as artifact)
+(import "coil.compiler.unit" :use *)
+(import "coil.compiler.native_module" :use *)
+(import "coil.compiler.jit" :use *)
+(import "coil.compiler.interp" :use *)
+(import "coil.compiler.wasm" :use *)
+(import "coil.compiler.codegen_wasm" :use *)
+(import "coil.source.format" :as fmtr)
+(import "coil.cc" :as cc)
+(import "coil.compiler.cli_base" :use *)
+(import "coil.compiler.cli_project" :use *)
+(import "coil.compiler.pipeline" :use *)
+
+;;; Is the prebuilt profile, coil.lint.default, among what this run was told to use?
+(defn lint-profile-requested? [] (-> bool)
+  (let [uses (cli-uses)]
+    (block :found
+      (for [i 0 (len (load uses))]
+        (when (lint-profile-use? (get (load uses) i)) (break :found true)))
+      false)))
+
+(defn lint-profile-reg-box [] (-> (ptr LintProfileRegBox))
+  (field (driver-unit-state) lint))
+
+(defn driver-release-scratch [(p (ptr i8))] (-> i64)
+  (close! (primitive/cast (ptr scratch/ScratchArena) p)))
+
+(defn lint-profile-reg [(cwd (slice u8))] (-> (Option CheckerReg))
+  (let [cache (lint-profile-reg-box)]
+    (if (!= (.init cache) 0)
+        (Some (.reg cache))
+        (let [; The command owns the cached registry and its backing arena across
+              ; lint passes. Teardown happens after the last pass, not each facade.
+              arena
+                (box! (unit-allocator)
+                      scratch/ScratchArena
+                      (zeroed scratch/ScratchArena))
+              _init
+                (scratch/ScratchArena::init-with-capacity arena
+                                                          (large-pages/compiler-scratch-parent)
+                                                          1048576)
+              _own
+                (unit-resource! (primitive/cast (ptr i8) arena)
+                                (fnptr-of driver-release-scratch))
+              ra (allocator arena)
+              found
+                (if (not (lint-profile-requested?))
+                    (Some (primitive/zeroed CheckerReg))
+                    (match (lint-profile-prebuilt ra)
+                      (Some [reg] (Some reg))
+                      (None []
+                            (let [rules (primitive/alloc-stack LS)]
+                              (match (lint-profile-compile ra (mut rules) cwd)
+                                (None [] (None [CheckerReg]))
+                                (Some [_] (Some (checker-reg-save))))))))]
+          (match found
+            (Some [reg]
+                  (do
+                    (set! (.reg cache) reg)
+                    (set! (.init cache) 1)
+                    0))
+            (None [] 0))
+          found))))
+
+;;; Where this compiler keeps its lint profile: beside an installed library,
+;;; `<prefix>/lib/coil/lint-profile` (`dev.py install` builds it there); for any
+;;; other compiler -- a candidate or stage binary of a checkout -- beside the
+;;; binary, `<binary>.lint-profile`, so compilers that share a checkout never
+;;; replace each other's.
+(defn lint-profile-dir [(a (dyn Allocator))] (-> (slice u8))
+  (let [layout (stdlib-layout a)]
+    (if (stdlib-installed? layout)
+        (path-join a (dirname (.libs layout)) "lint-profile")
+        (sconcat a (self-command-path a) ".lint-profile"))))
+
+;;; The prebuilt profile's registry, built first when it is missing or stale.
+;;; None when this compiler cannot keep one; the caller then compiles the profile.
+(defn lint-profile-prebuilt [(a (dyn Allocator))] (-> (Option CheckerReg))
+  (if (not (lint-profile-native?))
+      (None [CheckerReg])
+      (let [span (tr/span-begin "lint.profile-open")
+            dir (lint-profile-dir a)
+            ; The checkers run in this process, so the profile is the host's
+            ; whatever target `--target` names for the program they check.
+            prior (target-cell-swap! (zeroed TargetArchCell))
+            loaded
+              (match (artifact/profile-open a dir LINT-PROFILE-OPTIONS)
+                (Ok [p] (Some p))
+                (Err [_]
+                     (if (lint-profile-build! a dir)
+                         (match (artifact/profile-open a
+                                                       dir
+                                                       LINT-PROFILE-OPTIONS)
+                           (Ok [p] (Some p))
+                           (Err [d]
+                                (do
+                                  (ps (stderr)
+                                      "note: the lint profile just built does not load (")
+                                  (ps (stderr) (.msg d))
+                                  (ps (stderr)
+                                      "); compiling its checkers from source\n")
+                                  (None [artifact/LoadedProfile]))))
+                         (None [artifact/LoadedProfile]))))]
+        (target-cell-swap! prior)
+        (tr/span-end span)
+        (match loaded
+          (None [] (None [CheckerReg]))
+          (Some [p]
+                (Some (lint-profile-install! a
+                                             (box! a artifact/LoadedProfile p))))))))
+
+;;; Build the profile into DIR. False, with nothing printed, when there is nowhere
+;;; to keep one (DIR's directory is not writable) or this compiler cannot emit a
+;;; native image; false with a note when building it failed.
+(defn lint-profile-build! [(a (dyn Allocator)) (dir (slice u8))] (-> bool)
+  (if (or (= (.isset (meta-build-box)) 0)
+          (!= (access (to-cstr a (dirname dir)) 2) (: 0 i32)))
+      false
+      (do
+        (when (.on (lint-progress))
+          (ps (stderr) "lint: building the lint profile into ")
+          (ps (stderr) dir)
+          (wb (stderr) 10)
+          0)
+        (let [rc (spawn-lint-profile-build! a dir)]
+          (if (= rc 0)
+              true
+              (do
+                (ps (stderr)
+                    "note: could not build the lint profile (`coil build-lint-profile` exited ")
+                (ps (stderr) (i64->str a rc))
+                (ps (stderr) "); compiling its checkers from source\n")
+                false))))))
+
+;;; `coil build-lint-profile DIR` in a child, as if no project were involved: the
+;;; variables a project command publishes are unset for it, and it runs in this
+;;; process's temporary directory, so it indexes no sources of its own.
+(defn spawn-lint-profile-build! [(a (dyn Allocator)) (dir (slice u8))] (-> i64)
+  (let [prior-cwd (sconcat a (cwd-slice a) "")
+        names (split a (shipped-unit-isolated-vars) " ")
+        (mut saved) (ArrayList::new [(slice u8)] a)]
+    (for [i 0 (len (load names))]
+      (let [nm (to-cstr a (get (load names) i))]
+        (push! (mut saved) (unit-env-copy a nm))
+        (unsetenv nm)
+        0)
+      0)
+    (let [rc
+            (try (let [; Not DIR's directory: an installed library's holds the
+                       ; library's own sources.
+                       here (try-or! (temp/dir) 1)
+                       _ (try-or! (os/change-dir a here) 1)]
+                   (let [(mut args) (ArrayList::new [(slice u8)] a)]
+                     (push! (mut args) (self-command-path a))
+                     (push! (mut args) "build-lint-profile")
+                     (push! (mut args) dir)
+                     (wait-code (spawn-wait a (load args))))))]
+      (match (os/change-dir a prior-cwd) (_ 0))
+      (for [i 0 (len (load names))]
+        (unit-env-restore! a
+                           (to-cstr a (get (load names) i))
+                           (get (load saved) i))
+        0)
+      rc)))
+
+;;; A loaded profile as the checker registry a compiled one leaves: its entries
+;;; join the metaprogram engine, and the program the registry names them in
+;;; declares each one -- its body is in the image.
+(defn lint-profile-install! [(a (dyn Allocator))
+                             (p (ptr artifact/LoadedProfile))] (-> CheckerReg)
+  (let [m (.metadata p)
+        engine (meta-engine)
+        o (primitive/alloc-stack Out)
+        _out (init-out o a)
+        program (out->program o a)
+        (mut precheckers) (ArrayList::new [(slice u8)] a)
+        (mut checkers) (ArrayList::new [(slice u8)] a)
+        allfns (box! a SBox (zeroed SBox))
+        gs (box! a SBoxStruct (zeroed SBoxStruct))
+        gu (box! a SBoxSum (zeroed SBoxSum))]
+    (when (= (primitive/cast i64 (load (field engine entries))) 0)
+      (store! (field engine entries)
+              (box-al [MEEntry] a (ArrayList::new [MEEntry] a)))
+      0)
+    (for [i 0 (len (load (.entries m)))]
+      (let [entry (elem (.entries m) i)]
+        (if (= (.phase entry) 0)
+            (push! (mut precheckers) (.name entry))
+            (push! (mut checkers) (.name entry)))
+        (push! (mut (load (field program funcs)))
+               (lint-profile-entry-func a (.name entry)))
+        (push! (mut (load (field engine entries)))
+               (MEEntry
+                 :name (.name entry)
+                 :fp (get (load (.fps p)) i)
+                 :registry (.registry m)
+                 :symbol (.symbol entry)
+                 :modbytes ""
+                 :interpcx (primitive/cast (ptr i8) 0))))
+      0)
+    (set! (.active engine) 1)
+    (set! (.items allfns) (load (.names m)))
+    (set! (.items gs) (ArrayList::new [StructDef] a))
+    (set! (.items gu) (ArrayList::new [SumDef] a))
+    (CheckerReg :active
+                1
+                :precheckers
+                (box-al [(slice u8)] a (load precheckers))
+                :checkers
+                (box-al [(slice u8)] a (load checkers))
+                :semtx-once
+                (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+                :semtx
+                (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+                :posttx
+                (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+                ; the profile's checkers state no `:modules`: they read every module
+                :reads_library
+                true
+                :checked
+                program
+                :macros
+                (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+                :comptime
+                (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+                :expanded
+                (ArrayList::new [TaggedForm] a)
+                :allfns
+                allfns
+                :gs
+                gs
+                :gu
+                gu)))
+
+;;; A checker as the profile's program declares it: `(declare NAME [(modules Code)]
+;;; (-> Code))`.
+(defn lint-profile-entry-func [(a (dyn Allocator)) (name (slice u8))] (-> Func)
+  (let [(mut params) (ArrayList::new [Param] a)]
+    (push! (mut params)
+           (Param
+             :name "modules"
+             :ty (TCode)
+             :bid 0
+             :owned_type (primitive/cast (ptr Type) 0)
+             :positional_only false))
+    (Func
+      :name name
+      :type_params (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+      :bounds (box-al [Bound] a (ArrayList::new [Bound] a))
+      :cc (cc-c)
+      :annotations (box-al [Annotation] a (ArrayList::new [Annotation] a))
+      :params (box-al [Param] a (load params))
+      :ret (TCode)
+      :body (box-al [Expr] a (ArrayList::new [Expr] a))
+      :macro_variadic false
+      :lo -1
+      :hi -1
+      :source -1
+      :ctxt 0
+      :declared true
+      :lazy (primitive/cast (ptr i8) 0))))
+
+;;; One analysis's memory: everything it allocates goes when the analysis ends.
+;;; A segmented bump arena, as every compilation unit uses. It was a
+;;; `coil.region` over malloc, which keeps a node and a registry slot per live
+;;; allocation so that each can be freed on its own; an analysis makes millions of
+;;; small ones and frees almost none, so that paid two extra allocations and a hash
+;;; insert per allocation for nothing.
+(defn lint-target-arena-init! [(arena (ptr scratch/ScratchArena))] (-> i64)
+  (scratch/ScratchArena::init-with-capacity arena
+                                            (large-pages/compiler-scratch-parent)
+                                            1048576)
+  0)
+
+;;; Make ARENA the one COIL_TRACE's per-span memory figures (`coil-profile
+;;; arena.*`) describe, returning the one they described before. During an
+;;; analysis that is its own arena, where everything it allocates goes; the
+;;; command's arena barely moves.
+;;; A project's `[readers]` modules load through their providers, in lint as in
+;;; a build: without this, lint (and so `verify`) failed on every project with
+;;; readers, "requires a configured reader, but no reader setup is active". The
+;;; providers are compiled into the analysis arena, so they are switched off again
+;;; before that arena is released.
+(defn lint-activate-readers! [(a (dyn Allocator))
+                              (target (mut LS))
+                              (cwd (slice u8))] (-> (Result i64 Diag))
+  (if (configured-readers?)
+      (activate-configured-readers a (mut target) cwd)
+      (Ok [i64 Diag] 0)))
+
+(defn lint-deactivate-readers! [] (-> void)
+  (set! (.items (active-source-readers))
+        (primitive/cast (ptr (ArrayList (ptr ActiveSourceReader))) 0))
+  (set! (.isset (source-reader-hook)) 0))
+
+(defn lint-profile-arena! [(arena (ptr scratch/ScratchArena))]
+  (-> (ptr scratch/ScratchArena))
+  (let [t (mtr/mtrace-unit-state)
+        prior (.profile_arena t)]
+    (set! (.profile_arena t) arena)
+    prior))
+
+; Compile the complete application in an isolated arena, including its explicit
+; --use modules, expansion, transforms, typecheck, and own checkers. Then run the
+; cached built-in checkers over that authoritative model.
+(defn lint-profile-target [(src (slice u8))
+                           (cwd (slice u8))
+                           (path (slice u8))
+                           (profile-reg CheckerReg)] (-> i64)
+  (let [w (stderr)
+        (mut  ; Suggestions and the source table cross this arena's lifetime through
+             ; explicit owned copies. The remaining process-global semantic indexes are
+             ; cleared below, allowing every fixpoint round to release its full graph.
+             target-arena)
+          (zeroed scratch/ScratchArena)
+        _target-init (lint-target-arena-init! (mut target-arena))
+        prior-profile (lint-profile-arena! (mut target-arena))
+        ta (allocator (mut target-arena))
+        _tables (sem-maps-allocator-set! ta)
+        resource-mark (unit-resources-mark)
+        engine-mark (meta-engine-entry-count)
+        image-mark (meta-image-count)
+        prior-rule-sources (.protected_rule_sources (comptime-unit-state))
+        target (primitive/alloc-stack LS)
+        (mut result) 0]
+    (ls-init! (mut target) ta)
+    (set! (.srccount target) 1)
+    (register-source! (mut target) path src)
+    (match (read-all ta src 0)
+      (Err [d] (report-diag w (mut target) d))
+      (Ok [target-forms]
+          (do
+            (let [load-span (tr/span-begin "lint.target-load")]
+              (namespace-index-build! (mut target))
+              (match (lint-activate-readers! ta (mut target) cwd)
+                (Err [d] (report-diag w (mut target) d))
+                (Ok [_] 0))
+              (load-program (mut target)
+                            (prepend-selected-uses ta
+                                                   (mut target)
+                                                   target-forms
+                                                   2)
+                            (dirname path))
+              (tr/span-end load-span))
+            (set! result (lint-profile-analyze ta (mut target) profile-reg)))))
+    (lint-deactivate-readers!)
+    (lint-profile-arena! prior-profile)
+    (lint-profile-close! (mut target-arena)
+                         engine-mark
+                         image-mark
+                         resource-mark
+                         prior-rule-sources)
+    (load result)))
+
+; A fixpoint round's analysis is quiet: the reporting pass prints what still fails.
+(defn lint-report-diag [(w (ptr Writer)) (s (mut LS)) (d Diag)] (-> i64)
+  (unless (diag-quiet?) (report-diag w (mut s) d) 0)
+  0)
+
+; Everything after loading: expand, run the application's own checkers, check,
+; run the profile's. 1 when the target compiled and every checker ran.
+(defn lint-profile-analyze [(ta (dyn Allocator))
+                            (target (mut LS))
+                            (profile-reg CheckerReg)] (-> i64)
+  (let [w (stderr)
+        (mut result) 0]
+    (if (ls-err? (mut target))
+        (lint-report-diag w (mut target) (.loaderr target))
+        (let [_source-facts (source-facts-start!)
+              _source-scope (lint-source-facts-scope! ta (mut target))
+              _source-view (source-view-discard!)
+              authored
+                (tower-snapshot ta
+                                (box-al [TaggedForm] ta (.out target))
+                                (len (.out target)))
+              expand-span (tr/span-begin "lint.target-expand")
+              expanded (expand-stage3 (mut target))
+              _observe-end (set! (.observing (source-facts)) false)
+              _semantic-evidence (source-facts-semantic-reset!)
+              _expand-end (tr/span-end expand-span)]
+          (match expanded
+            (Err [d] (lint-report-diag w (mut target) d))
+            (Ok [_]
+                (let [target-reg (checker-reg-save)
+                      ; a rule the target registered itself (`--use` naming one the
+                      ; profile has) runs once, as the target's
+                      profile-only
+                        (checker-reg-without ta profile-reg target-reg)]
+                  (set! (.protected_rule_sources (comptime-unit-state))
+                        (checker-rule-source-ids ta target-reg authored))
+                  (match (if (= (.active profile-only) 0)
+                             (Ok [i64 Diag] 0)
+                             (run-external-precheckers ta
+                                                       (mut target)
+                                                       authored
+                                                       profile-only))
+                    (Err [d] (lint-report-diag w (mut target) d))
+                    (Ok [_]
+                        (do
+                          (checker-reg-restore! target-reg)
+                          (let [check-span (tr/span-begin "lint.target-check")
+                                checked
+                                  (run-transforms-and-check ta (mut target))
+                                _check-end (tr/span-end check-span)]
+                            (match checked
+                              (Err [d]
+                                   (unless (diag-quiet?)
+                                     (report-check-diags w (mut target) d)
+                                     0))
+                              (Ok [cp]
+                                  (let [_publish-source
+                                          (source-view-publish! ta
+                                                                (mut target)
+                                                                authored)]
+                                    (match (run-registered-checkers ta
+                                                                    (mut target)
+                                                                    cp)
+                                      (Err [d]
+                                           (lint-report-diag w (mut target) d))
+                                      (Ok [_]
+                                          (do
+                                            (if (= (.active profile-only) 0)
+                                                (checker-reg-clear!)
+                                                (checker-reg-restore! profile-only))
+                                            (match (if (= (.active profile-only)
+                                                          0)
+                                                       (Ok [i64 Diag] 0)
+                                                       (run-source-semantic-checkers ta
+                                                                                     (mut target)
+                                                                                     cp
+                                                                                     authored))
+                                              (Err [d]
+                                                   (lint-report-diag w
+                                                                     (mut target)
+                                                                     d))
+                                              (Ok [_] (set! result 1))))))))))))))))))
+    (load result)))
+
+;;; PROFILE's registrations without the checkers TARGET registered itself.
+(defn checker-reg-without [(a (dyn Allocator))
+                           (profile CheckerReg)
+                           (target CheckerReg)] (-> CheckerReg)
+  (let [(mut out) profile]
+    (unless (or (= (.active profile) 0) (= (.active target) 0))
+      (set! (.precheckers out)
+            (checker-names-without a
+                                   (.precheckers profile)
+                                   (.precheckers target)))
+      (set! (.checkers out)
+            (checker-names-without a (.checkers profile) (.checkers target)))
+      0)
+    out))
+
+(defn checker-names-without [(a (dyn Allocator))
+                             (names (ptr (ArrayList (slice u8))))
+                             (taken (ptr (ArrayList (slice u8))))]
+  (-> (ptr (ArrayList (slice u8))))
+  (if (or (= (primitive/cast i64 names) 0) (= (primitive/cast i64 taken) 0))
+      names
+      (let [(mut out) (ArrayList::new [(slice u8)] a)]
+        (for n (iter (load names))
+          (unless (block :found
+                    (for t (iter (load taken))
+                      (when (= t n) (break :found true)))
+                    false)
+            (push! (mut out) n)))
+        (box-al [(slice u8)] a (load out)))))
+
+; The next target must not inherit this semantic model even though its arena
+; is about to be released. Clear every global index that can contain a pointer
+; into the target graph before closing it.
+(defn lint-profile-close! [(target-arena (ptr scratch/ScratchArena))
+                           (engine-mark i64)
+                           (image-mark i64)
+                           (resource-mark i64)
+                           (prior-rule-sources (ptr (ArrayList i64)))] (-> i64)
+  (source-view-discard!)
+  (source-facts-stop!)
+  (clear-sem-model)
+  ; The analysis's semantic tables were kept in its arena; the empty ones that
+  ; replace them must not name it.
+  (sem-maps-allocator-clear!)
+  (type-map-reset)
+  (bind-map-reset)
+  (res-map-reset)
+  (macro-call-reset)
+  (macros-index-reset!)
+  (derive-reg-reset!)
+  ; Keep the cached profile entries but remove this target's appended native
+  ; entries and quasiquote registries before their arena disappears.
+  (meta-engine-truncate! engine-mark)
+  ; Then the arenas this target's expansion generations lent to those entries and
+  ; to the semantic model, both gone now. They are unit resources, so they stayed
+  ; until the command ended: every --fix round added its own.
+  (unit-resources-close-kind! (unit-resource-owner (load (unit-allocation-cell)))
+                              UNIT-RESOURCE-EXPANSION-ARENA
+                              resource-mark)
+  ; And the code this target's metaprograms -- a `(meta …)` form's generator
+  ; among them -- were compiled to, with the interpreter storage they used: the
+  ; engine entries that reached them were truncated above, and the dylib cache
+  ; forgets the ones instantiated since the mark. Every analysis of a program with
+  ; a meta form used to keep one more image.
+  (meta-images-truncate! image-mark)
+  (unit-resources-close-kind! (unit-resource-owner (load (unit-allocation-cell)))
+                              UNIT-RESOURCE-EXECUTABLE
+                              resource-mark)
+  (unit-resources-close-kind! (unit-resource-owner (load (unit-allocation-cell)))
+                              UNIT-RESOURCE-INTERPRETER
+                              resource-mark)
+  ; What the unit still holds after an analysis: the same after every one.
+  (tr/count "lint.unit-resources" (unit-resources-mark))
+  (set! (.protected_rule_sources (comptime-unit-state)) prior-rule-sources)
+  (close! target-arena)
+  0)
+
+(defn lint-profile-src-program [(a (dyn Allocator))
+                                (src (slice u8))
+                                (cwd (slice u8))
+                                (path (slice u8))] (-> i64)
+  (match (lint-profile-reg cwd)
+    (None [] 0)
+    (Some [reg] (lint-profile-target src cwd path reg))))
+
+; The `--use` inputs of a lint run as the program's own source: they are inputs
+; to the command, not project syntax, and the loader hides a source named
+; `<cli-use>` from checkers. Registered at id 0, where the SourceMap expects the
+; command's own input, so a module set needs no entry file in its place.
+(defn lint-use-forms! [(a (dyn Allocator))
+                       (s (mut LS))
+                       (mode i64)] (-> (ptr (ArrayList Sexp)))
+  (let [uses (cli-uses)
+        (mut src) (StrBuf::new a)]
+    (push-str! (mut src) "(module coil-lint-uses)\n")
+    (for [k 0 (len (load uses))]
+      (when (cli-use-selected? (get (load uses) k) mode)
+        (push-str! (mut src) "(import \"")
+        (push-str! (mut src) (get (load uses) k))
+        (push-str! (mut src) "\" :use *)\n")
+        0)
+      0)
+    (set! (.srccount s) 1)
+    (register-source! (mut s) "<cli-use>" (str (load src)))
+    (try (let [forms
+                 (try-or! (read-all a (str (load src)) 0)
+                          (box-al [Sexp] a (ArrayList::new [Sexp] a)))]
+           forms))))
+
+; Errors that belong to one module of a set (a namespace declared twice, a file
+; that does not parse). The set loader leaves that module out and the rest of
+; the program still loads, so these are counted here rather than through the
+; loader's fatal first-error slot; the command turns the count into its exit
+; status. Quiet fixpoint rounds count without printing.
+(defstruct LintSetErrorsCell [(count i64)])
+
+(defn lint-set-errors-cell [] (-> (ptr LintSetErrorsCell))
+  (primitive/alloc-static LintSetErrorsCell))
+
+(defn lint-set-errors-reset! [] (-> i64)
+  (set! (.count (lint-set-errors-cell)) 0)
+  0)
+
+(defn lint-set-errors [] (-> i64)
+  (.count (lint-set-errors-cell)))
+
+(defn lint-report-set-diags! [(w (ptr Writer))
+                              (s (mut LS))
+                              (diags (ptr (ArrayList Diag)))] (-> i64)
+  (for [i 0 (len (load diags))]
+    (set! (.count (lint-set-errors-cell))
+          (primitive/iadd (.count (lint-set-errors-cell)) 1))
+    (unless (diag-quiet?) (report-diag w (mut s) (get (load diags) i)) 0)
+    0)
+  0)
+
+; lint-profile-target over a module set instead of an entry file.
+;;; Every module reachable by import from the lint's requested uses (the synthetic
+;;; `coil-lint-uses` module), including each module's refer of coil.core. Only
+;;; these contribute metaprogram registrations to a lint analysis: exactly the
+;;; checkers report mode compiles in its separate rules program.
+(defn lint-requested-modules [(a (dyn Allocator)) (s (mut LS))]
+  (-> (ptr (ArrayList (slice u8))))
+  (let [out (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))]
+    (push! out "coil-lint-uses")
+    (let [(mut k) 0]
+      (while (< k (len (load out)))
+        (let [m (get (load out) k)
+              e (imports-find (field s imports) m)]
+          (unless (= (cast i64 e) 0)
+            (let [imp (field e imp)]
+              (for x (.aliases imp)
+                (let [al x]
+                  (unless (set-contains out (.target al))
+                    (push! out (.target al)))))
+              (for x (.uses imp)
+                (let [u x]
+                  (unless (set-contains out (.target u))
+                    (push! out (.target u)))))
+              (for x (.reexports imp)
+                (let [t (.target x)]
+                  (unless (set-contains out t) (push! out t))))
+              (let [core (.target (field imp core))]
+                (unless (or (= (len core) 0) (set-contains out core))
+                  (push! out core))))))
+        (set! k (+ k 1))))
+    out))
+
+(defn lint-profile-set-target [(modules (ptr (ArrayList (slice u8))))
+                               (cwd (slice u8))
+                               (profile-reg CheckerReg)] (-> i64)
+  (let [w (stderr)
+        (mut target-arena) (zeroed scratch/ScratchArena)
+        _target-init (lint-target-arena-init! (mut target-arena))
+        prior-profile (lint-profile-arena! (mut target-arena))
+        ta (allocator (mut target-arena))
+        _tables (sem-maps-allocator-set! ta)
+        resource-mark (unit-resources-mark)
+        engine-mark (meta-engine-entry-count)
+        image-mark (meta-image-count)
+        prior-rule-sources (.protected_rule_sources (comptime-unit-state))
+        target (primitive/alloc-stack LS)
+        diags (box-al [Diag] ta (ArrayList::new [Diag] ta))
+        (mut result) 0]
+    (ls-init! (mut target) ta)
+    (let [use-forms (lint-use-forms! ta (mut target) 2)
+          load-span (tr/span-begin "lint.target-load")]
+      (namespace-index-build! (mut target))
+      (match (lint-activate-readers! ta (mut target) cwd)
+        (Err [d] (push! diags d))
+        (Ok [_] 0))
+      (load-namespace-set! (mut target) use-forms modules cwd diags)
+      (set! (.registration_scope target)
+            (lint-requested-modules ta (mut target)))
+      (tr/span-end load-span))
+    (lint-report-set-diags! w (mut target) diags)
+    (set! result (lint-profile-analyze ta (mut target) profile-reg))
+    (lint-deactivate-readers!)
+    (lint-profile-arena! prior-profile)
+    (lint-profile-close! (mut target-arena)
+                         engine-mark
+                         image-mark
+                         resource-mark
+                         prior-rule-sources)
+    (load result)))
+
+(defn lint-profile-set-program [(a (dyn Allocator))
+                                (modules (ptr (ArrayList (slice u8))))
+                                (cwd (slice u8))] (-> i64)
+  (match (lint-profile-reg cwd)
+    (None [] 0)
+    (Some [reg] (lint-profile-set-target modules cwd reg))))
+
+; The module-set shape of run-dump-on-big-stack: analyse `modules` as one
+; program rooted in those namespaces, on the big stack.
+(defn run-set-on-big-stack [(a (dyn Allocator))
+                            (modules (ptr (ArrayList (slice u8))))
+                            (cwd (slice u8))
+                            (sfn (fnptr (cc/C)
+                                        [(ref (dyn Allocator))
+                                         (ptr (ArrayList (slice u8)))
+                                         (slice u8)]
+                                        i64))] (-> i64)
+  (let [(mut ctx) (zeroed DumpCtx)]
+    (set! (.a ctx) a)
+    (set! (.src ctx) "")
+    (set! (.cwd ctx) cwd)
+    (set! (.path ctx) "")
+    (set! (.mode ctx) 6)
+    (set! (.obj ctx) (primitive/cast (ptr i8) 0))
+    (set! (.triple ctx) (target-triple))
+    (set! (.self ctx) "")
+    (set! (.ok ctx) 0)
+    (set! (.modules ctx) modules)
+    (set! (.set-fn ctx) sfn)
+    (run-on-big-stack (mut ctx))))
+
+; Append the manifest's `[metaprograms] use` list as `--use <ns>` flags. Every
+; project command that reaches a compile emits these, so a declared transform runs
+; on `build`, `run`, `check` and `test` alike rather than only where someone
+; remembered to retype the flag. Order is manifest order: transforms compose, and
+; the one written first sees the original program.
+;
+; These go on the SUBPROCESS command line rather than into cli-uses directly
+; because project commands re-exec `<self> build …`; the child re-reads the same
+; manifest, so passing them explicitly keeps the child's view identical to what
+; the user could have typed by hand.
+; The in-process counterpart of m-emit-uses, for commands that run the pipeline
+; themselves (lint) instead of re-exec'ing `<self> build`.
+(defn m-add-manifest-uses [(m (ptr Manifest))] (-> i64)
+  (let [ns (load (field m metaprograms))
+        (mut i) 0
+        n (len ns)]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (cli-use-add (get ns (load i)))
+                (set! i (primitive/iadd (load i) 1))))))
+  (let [rs (load (field m readers))]
+    (for [i 0 (len rs)]
+      (cli-use-add (.value (elem rs i)))
+      0))
+  0)
+
+(defn unit-env-copy [(a (dyn Allocator)) (name (ptr i8))] (-> (slice u8))
+  (let [p (unit-getenv name)]
+    (if (= (primitive/cast i64 p) 0) "" (sconcat a (from-cstr p) ""))))
+
+(defn unit-env-restore! [(a (dyn Allocator))
+                         (name (ptr i8))
+                         (value (slice u8))] (-> i64)
+  (if (= (len value) 0)
+      (unsetenv name)
+      (setenv name (to-cstr a value) 1))
+  0)
+
+; The namespaces those files declare, in file order. A file with no module
+; declaration is project source (fmt visits it) but not
+; a module: nothing can import it and nothing is invented to try.
+(defn project-modules [(a (dyn Allocator))
+                       (index (ptr LS))
+                       (files (ptr (ArrayList (slice u8))))]
+  (-> (ptr (ArrayList (slice u8))))
+  (let [out (box-al [(slice u8)] a (ArrayList::new [(slice u8)] a))
+        names (field index namespace_names)
+        paths (field index namespace_paths)
+        n (len (load names))]
+    (for [f 0 (len (load files))]
+      (let [file (get (load files) f)
+            full
+              (if (starts-with file "/")
+                  file
+                  (path-join a (cwd-slice a) file))]
+        (for [i 0 n]
+          (when (= (get (load paths) i) full)
+            ; A namespace two files declare is one module of the set; the
+            ; loader reports the duplication once when it reaches it.
+            (let [name (get (load names) i)
+                  (mut seen) false]
+              (for [j 0 (len (load out))]
+                (when (= (get (load out) j) name) (set! seen true) 0)
+                0)
+              (unless (load seen) (push! out name) 0))
+            0)
+          0))
+      0)
+    out))
+
+; One file of a lint transaction: the bytes the run first read there (`text`), and
+; the text it now holds for the file (`preview`), which every analysis reads in
+; place of the file's through the loader's source overlay. `--diff` prints the
+; difference; `--fix` writes `preview` when the run is over, and only while the
+; file still holds `text`, so an editor racing the run never has its work
+; overwritten.
+(defstruct LintSaved
+  [(path (slice u8))
+   (key (slice u8))
+   (text (slice u8))
+   (preview (slice u8))])
+
+;;; The entry of SAVED for PATH, by its real path, or -1.
+(defn lint-saved-index [(a (dyn Allocator))
+                        (saved (ptr (ArrayList LintSaved)))
+                        (path (slice u8))] (-> i64)
+  (let [key
+          (match (m-realpath a path)
+            (Some [absolute] absolute)
+            (None [] path))
+        (mut at) -1]
+    (for [i 0 (len (load saved))]
+      (when (and (< at 0) (= (.key (elem saved i)) key)) (set! at i) 0)
+      0)
+    at))
+
+;;; Remember the bytes a file held when the transaction first read it, exactly once.
+;;; Later fixpoint rounds may propose its text repeatedly, but --diff compares the
+;;; final result with the true input, and --fix writes only over those bytes.
+(defn lint-save-once! [(a (dyn Allocator))
+                       (saved (mut (ArrayList LintSaved)))
+                       (path (slice u8))
+                       (text (slice u8))] (-> i64)
+  (when (< (lint-saved-index a saved path) 0)
+    (let [(mut sv) (zeroed LintSaved)
+          owned-text (sconcat a text "")]
+      (set! (.path sv) (sconcat a path ""))
+      (set! (.key sv)
+            (match (m-realpath a path)
+              (Some [absolute] absolute)
+              (None [] (sconcat a path ""))))
+      (set! (.text sv) owned-text)
+      (set! (.preview sv) owned-text)
+      (push! (mut saved) sv))
+    0)
+  0)
+
+;;; Hold TEXT as the transaction's text for PATH: what every later analysis reads
+;;; there, through the loader's source overlay, and what --fix writes once the run
+;;; is over. The file itself is not touched.
+(defn lint-note-write! [(a (dyn Allocator))
+                        (saved (mut (ArrayList LintSaved)))
+                        (path (slice u8))
+                        (text (slice u8))] (-> i64)
+  (let [i (lint-saved-index a saved path)]
+    (when (>= i 0)
+      (let [sp (elem (mut saved) i)
+            file (to-cstr a (.path sp))]
+        (set! (.preview sp) text)
+        (if (= text (.text sp))
+            (source-overlay-remove! file)
+            (source-overlay-set! file text)))
+      0))
+  0)
+
+;;; Propose TEXT for PATH, whose text the analysis that suggested it read as
+;;; EXPECTED. That is the text the transaction holds for the file, which the
+;;; analysis read through the overlay; any other means the overlay was bypassed,
+;;; and every rewrite built on it would be wrong.
+(defn lint-propose! [(a (dyn Allocator))
+                     (saved (mut (ArrayList LintSaved)))
+                     (path (slice u8))
+                     (expected (slice u8))
+                     (text (slice u8))] (-> i64)
+  (let [i (lint-saved-index a saved path)]
+    (when (and (>= i 0) (!= (.preview (elem (mut saved) i)) expected))
+      (panic "lint: the analysis of {} read text other than the transaction's"
+             path)))
+  (lint-save-once! a (mut saved) path expected)
+  (lint-note-write! a (mut saved) path text))
+
+;;; Take back every rewrite the transaction proposed: later analyses read the files
+;;; as they were first read, and nothing is written.
+(defn lint-discard! [(a (dyn Allocator)) (saved (mut (ArrayList LintSaved)))]
+  (-> i64)
+  (for [i 0 (len (load saved))]
+    (let [sp (elem (mut saved) i)]
+      (lint-note-write! a (mut saved) (.path sp) (.text sp)))
+    0)
+  0)
+
+;;; Does every file the transaction rewrites still hold the bytes it read there?
+;;; One that does not was edited by someone else meanwhile; that edit is theirs, and
+;;; the file is reported as left untouched.
+(defn lint-inputs-held? [(a (dyn Allocator))
+                         (saved (ptr (ArrayList LintSaved)))] (-> bool)
+  (let [(mut held) true]
+    (for sp (load saved)
+      (when (and (!= (.preview sp) (.text sp))
+                 (!= (read-file-disk a (to-cstr a (.path sp))) (.text sp)))
+        (let [w (stderr)]
+          (ps w "error: lint input changed during analysis; left untouched: ")
+          (ps w (.path sp))
+          (wb w 10))
+        (set! held false)))
+    held))
+
+;;; End a --fix transaction: write each file whose accepted text differs from the
+;;; bytes the run read there. This is the only write the run makes. All or none:
+;;; when a file no longer holds those bytes nothing is written (2); 1 when a write
+;;; failed (d-write-file says why).
+(defn lint-commit! [(a (dyn Allocator)) (saved (ptr (ArrayList LintSaved)))]
+  (-> i64)
+  (if (not (lint-inputs-held? a saved))
+      2
+      (let [(mut rc) 0]
+        (for sp (load saved)
+          (when (and (!= (.preview sp) (.text sp))
+                     (!= (d-write-file a (.path sp) (.preview sp)) 0))
+            (set! rc 1)))
+        rc)))
+
+; Render the net transaction, not each intermediate rewrite. A common byte prefix
+; and suffix keep the zero-context unified diff focused even after several rounds.
+(defn lint-print-saved-patches [(a (dyn Allocator))
+                                (saved (ptr (ArrayList LintSaved)))] (-> i64)
+  (let [n (len (load saved))
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [sp (elem saved (load i))
+                      old (.text sp)
+                      new (.preview sp)
+                      oldn (len old)
+                      newn (len new)
+                      (mut lo) 0
+                      (mut tail) 0]
+                  (unless (= old new)
+                    (loop (if (or (>= (load lo) oldn)
+                                  (>= (load lo) newn)
+                                  (!= (get old (load lo))
+                                      (get new (load lo))))
+                              (break)
+                              (set! lo (primitive/iadd (load lo) 1))))
+                    (loop (if (or (>= (load tail)
+                                      (primitive/isub oldn (load lo)))
+                                  (>= (load tail)
+                                      (primitive/isub newn (load lo)))
+                                  (!= (get old
+                                           (primitive/isub (primitive/isub oldn
+                                                                           1)
+                                                           (load tail)))
+                                      (get new
+                                           (primitive/isub (primitive/isub newn
+                                                                           1)
+                                                           (load tail)))))
+                              (break)
+                              (set! tail (primitive/iadd (load tail) 1))))
+                    (let [(mut e) (zeroed LintEdit)]
+                      (set! (.group e) 0)
+                      (set! (.source e) 0)
+                      (set! (.lo e) (load lo))
+                      (set! (.hi e) (primitive/isub oldn (load tail)))
+                      (set! (.text e)
+                            (subslice [u8]
+                                      new
+                                      (load lo)
+                                      (primitive/isub newn (load tail))))
+                      (lint-print-diff a (stdout) (.path sp) old (mut e))))
+                  0)
+                (set! i (primitive/iadd (load i) 1)))))
+    0))
+
+; Every suggestion the last analysis recorded, rendered and sorted so they can be
+; spliced back-to-front. Overlapping edits (an outer form and something inside it
+; both rewritten) cannot both be applied to the same text: the first wins and the
+; rest are dropped for THIS round — the next round finds them again on re-analysis.
+; Sort key: file ascending, then offset DESCENDING. Equal offsets keep discovery
+; order, which puts the OUTER form first — the walker reports a form before anything
+; inside it — so when two nested rewrites collide the wider one is the one that lands.
+(defn lint-edit-before? [(x LintEdit) (y LintEdit)] (-> bool)
+  (let [(mut xp) (: x LintEdit)
+        (mut yp) (: y LintEdit)]
+    (if (!= (.source xp) (.source yp))
+        (< (.source xp) (.source yp))
+        (> (.lo xp) (.lo yp)))))
+
+;;; Does `outer` strictly contain `inner`? Identical spans do not contain each other;
+;;; ties are broken by discovery order at the call site, which reports the wider form
+;;; first.
+(defn lint-edit-contains? [(outer LintEdit) (inner LintEdit)] (-> bool)
+  (let [(mut op) (: outer LintEdit)
+        (mut ip) (: inner LintEdit)]
+    (and (= (.source op) (.source ip))
+         (and (<= (.lo op) (.lo ip))
+              (and (>= (.hi op) (.hi ip))
+                   (or (< (.lo op) (.lo ip)) (> (.hi op) (.hi ip))))))))
+
+;;; EDITS in lint-apply's order (lint-edit-before?), equal edits latest first.
+(defn lint-sort-edits [(a (dyn Allocator)) (edits (ArrayList LintEdit))]
+  (-> (ArrayList LintEdit))
+  (let [n (len edits)
+        (mut order) (ArrayList::new [LintEdit] a)
+        (mut tmp) (ArrayList::new [LintEdit] a)
+        (mut width) 1]
+    (for e (iter edits) (push! (mut order) e) (push! (mut tmp) e))
+    (while (< width n)
+      (let [(mut lo) 0]
+        (while (< lo n)
+          (let [mid (if (< (+ lo width) n) (+ lo width) n)
+                hi (if (< (+ lo (* 2 width)) n) (+ lo (* 2 width)) n)
+                (mut x) lo
+                (mut y) mid
+                (mut k) lo]
+            (while (< k hi)
+              ; ties take the later edit first, as the insertion sort this
+              ; replaced did: equal-start inserts land in the order they always had
+              (if (and (< x mid)
+                       (or (>= y hi)
+                           (lint-edit-before? (get order x) (get order y))))
+                  (do (set! (mut tmp) k (get order x)) (set! x (+ x 1)))
+                  (do (set! (mut tmp) k (get order y)) (set! y (+ y 1))))
+              (set! k (+ k 1)))
+            (set! lo hi)))
+        (for i (range 0 n) (set! (mut order) i (get tmp i)))
+        (set! width (* width 2))))
+    order))
+
+;;; Does edit X come before edit Y in source-span order: by source, then start,
+;;; then wider first (so an enclosing edit precedes what it encloses), then index?
+(defn lint-span-before? [(edits (ptr (ArrayList LintEdit))) (x i64) (y i64)]
+  (-> bool)
+  (let [ex (get (load edits) x)
+        ey (get (load edits) y)]
+    (cond (!= (.source ex) (.source ey)) (< (.source ex) (.source ey))
+          (!= (.lo ex) (.lo ey)) (< (.lo ex) (.lo ey))
+          (!= (.hi ex) (.hi ey)) (> (.hi ex) (.hi ey))
+          :else (< x y))))
+
+;;; The indices of EDITS in source-span order: a stable merge sort, so a round with
+;;; thousands of findings (the compiler's own source has them) sorts in n log n.
+(defn lint-span-order [(a (dyn Allocator)) (edits (ptr (ArrayList LintEdit)))]
+  (-> (ArrayList i64))
+  (let [n (len (load edits))
+        (mut order) (ArrayList::new [i64] a)
+        (mut tmp) (ArrayList::new [i64] a)
+        (mut width) 1]
+    (for i (range 0 n) (push! (mut order) i) (push! (mut tmp) i))
+    (while (< width n)
+      (let [(mut lo) 0]
+        (while (< lo n)
+          (let [mid (if (< (+ lo width) n) (+ lo width) n)
+                hi (if (< (+ lo (* 2 width)) n) (+ lo (* 2 width)) n)
+                (mut x) lo
+                (mut y) mid
+                (mut k) lo]
+            (while (< k hi)
+              (if (and (< x mid)
+                       (or (>= y hi)
+                           (not (lint-span-before? edits
+                                                   (get order y)
+                                                   (get order x)))))
+                  (do (set! (mut tmp) k (get order x)) (set! x (+ x 1)))
+                  (do (set! (mut tmp) k (get order y)) (set! y (+ y 1))))
+              (set! k (+ k 1)))
+            (set! lo hi)))
+        (for i (range 0 n) (set! (mut order) i (get tmp i)))
+        (set! width (* width 2))))
+    order))
+
+;;; Every edit that no other edit strictly encloses, in their order. One sweep in
+;;; source-span order: an edit is enclosed when an earlier edit of its source either
+;;; starts before it and ends at or after it, or starts with it and ends after it.
+(defn lint-drop-nested [(a (dyn Allocator)) (edits (ArrayList LintEdit))]
+  (-> (ArrayList LintEdit))
+  (let [n (len edits)
+        (mut all) edits
+        order (lint-span-order a (mut all))
+        (mut nested) (ArrayList::new [bool] a)
+        (mut out) (ArrayList::new [LintEdit] a)
+        (mut source) -1
+        (mut reach) -1  ; the furthest end of an edit starting before `run-lo`
+        (mut run-lo) -1  ; the start shared by the current run of edits
+        (mut run-reach) -1  ; the furthest end within that run so far
+        (mut run-prior) -1]  ; `reach` as it stood when the run began
+    (for i (range 0 n) (push! (mut nested) false))
+    (for k (range 0 n)
+      (let [i (get order k)
+            e (get edits i)]
+        (when (!= (.source e) source)
+          (set! source (.source e))
+          (set! reach -1)
+          (set! run-lo -1)
+          (set! run-reach -1)
+          (set! run-prior -1))
+        (when (!= (.lo e) run-lo)
+          ; the run before this one now starts before every later edit
+          (when (> run-reach reach) (set! reach run-reach))
+          (set! run-lo (.lo e))
+          (set! run-reach -1)
+          (set! run-prior reach))
+        (when (or (>= run-prior (.hi e)) (> run-reach (.hi e)))
+          (set! (mut nested) i true))
+        (when (> (.hi e) run-reach) (set! run-reach (.hi e)))))
+    (for i (range 0 n)
+      (unless (get nested i) (push! (mut out) (get edits i))))
+    out))
+
+;;; A suggestion's group, with each ungrouped suggestion its own singleton group.
+(defn lint-sug-group [(s Suggestion) (index i64)] (-> i64)
+  (if (= (.group s) 0) (- 0 (+ index 1)) (.group s)))
+
+;;; Whether two edits of one source touch overlapping or nested text.
+(defn lint-edits-conflict? [(x LintEdit) (y LintEdit)] (-> bool)
+  (and (= (.source x) (.source y))
+       (or (and (< (.lo x) (.hi y)) (< (.lo y) (.hi x)))
+           (lint-edit-contains? x y)
+           (lint-edit-contains? y x))))
+
+;;; Keep only whole groups. A group loses when one of its edits was withheld
+;;; (BAD0) or loses a conflict: nested inside another edit (the outer one wins, as
+;;; in lint-drop-nested), or overlapping one that starts later (as lint-apply picks
+;;; in descending order). Losing groups are dropped until the rest is stable.
+;;;
+;;; Only edits whose spans meet can conflict, and after a sort by start those are
+;;; the edits starting within an edit's span: a sweep finds every conflicting pair
+;;; without comparing all of them. The pairs are then judged exactly as a pass over
+;;; every ordered pair (i, j) would meet them — in that order, both ways round,
+;;; until a pass changes nothing — so the groups that survive are the same.
+(defn lint-group-filter [(a (dyn Allocator))
+                         (edits (ArrayList LintEdit))
+                         (groups (ArrayList i64))
+                         (bad0 (ArrayList i64))] (-> (ArrayList LintEdit))
+  (let [n (len edits)
+        (mut all) edits
+        order (lint-span-order a (mut all))
+        (mut bad) (HashMap::new [i64 i64] a (i64-keyops))
+        (mut pairs) (ArrayList::new [i64] a)
+        (mut changed) true]
+    (for b bad0 (set! (mut bad) b 1))
+    ; every ordered conflicting pair, encoded i * n + j
+    (for k (range 0 n)
+      (let [i (get order k)
+            ei (get edits i)
+            (mut m) (+ k 1)]
+        (while (and (< m n)
+                    (let [ej (get edits (get order m))]
+                      (and (= (.source ej) (.source ei)) (<= (.lo ej) (.hi ei)))))
+          (let [j (get order m)]
+            (when (lint-edits-conflict? ei (get edits j))
+              (push! (mut pairs) (+ (* i n) j))
+              (push! (mut pairs) (+ (* j n) i))
+              0))
+          (set! m (+ m 1)))))
+    (let [(mut sorted) (lint-sort-i64 a pairs)]
+      (while changed
+        (set! changed false)
+        (for pair (iter sorted)
+          (let [i (/ pair n)
+                j (- pair (* (/ pair n) n))
+                gi (get groups i)
+                gj (get groups j)
+                ei (get edits i)
+                ej (get edits j)]
+            (when (and (not (contains? bad gi))
+                       (not (contains? bad gj))
+                       ; A checker may suggest both an outer rewrite and a
+                       ; rewrite inside it. The outer edit supersedes the inner
+                       ; this round; the next lint round sees the new source.
+                       (or (!= gi gj)
+                           (not (or (lint-edit-contains? ei ej)
+                                    (lint-edit-contains? ej ei)))))
+              (let [loser
+                      (cond (lint-edit-contains? ei ej) gj
+                            (lint-edit-contains? ej ei) gi
+                            (< (.lo ei) (.lo ej)) gi
+                            :else gj)]
+                (set! (mut bad) loser 1)
+                (set! changed true)))))))
+    (let [(mut out) (ArrayList::new [LintEdit] a)]
+      (for i (range 0 n)
+        (unless (contains? bad (get groups i))
+          (push! (mut out) (get edits i))))
+      out)))
+
+;;; XS sorted ascending: a merge sort.
+(defn lint-sort-i64 [(a (dyn Allocator)) (xs (ArrayList i64))]
+  (-> (ArrayList i64))
+  (let [n (len xs)
+        (mut order) (ArrayList::new [i64] a)
+        (mut tmp) (ArrayList::new [i64] a)
+        (mut width) 1]
+    (for x (iter xs) (push! (mut order) x) (push! (mut tmp) x))
+    (while (< width n)
+      (let [(mut lo) 0]
+        (while (< lo n)
+          (let [mid (if (< (+ lo width) n) (+ lo width) n)
+                hi (if (< (+ lo (* 2 width)) n) (+ lo (* 2 width)) n)
+                (mut x) lo
+                (mut y) mid
+                (mut k) lo]
+            (while (< k hi)
+              (if (and (< x mid)
+                       (or (>= y hi) (<= (get order x) (get order y))))
+                  (do (set! (mut tmp) k (get order x)) (set! x (+ x 1)))
+                  (do (set! (mut tmp) k (get order y)) (set! y (+ y 1))))
+              (set! k (+ k 1)))
+            (set! lo hi)))
+        (for i (range 0 n) (set! (mut order) i (get tmp i)))
+        (set! width (* width 2))))
+    order))
+
+;;; Whether suggestion I's composed rendering preempts another suggestion: one
+;;; outside it and its absorbed suggestions whose span touches one of theirs.
+(defn lint-composition-contested? [(i i64) (sp (ptr Suggestion))] (-> bool)
+  (let [absorbs (load (.absorbs sp))
+        n (sug-count)]
+    (block :contested
+      (for j absorbs
+        (let [inner (sug-at j)]
+          (for k (range 0 n)
+            (let [other (sug-at k)]
+              (when (and (!= k i)
+                         (not (block :absorbed
+                                (for x absorbs
+                                  (when (= x k)
+                                    (break :absorbed true)))
+                                false))
+                         (= (.source other) (.source inner))
+                         (or (and (< (.lo other) (.hi inner))
+                                  (< (.lo inner) (.hi other)))
+                             (and (<= (.lo other) (.lo inner))
+                                  (>= (.hi other) (.hi inner)))
+                             (and (<= (.lo inner) (.lo other))
+                                  (>= (.hi inner) (.hi other)))))
+                (break :contested true))))))
+      false)))
+
+;;; The text a round writes for suggestion I. Its composed rendering carries its
+;;; checker's rewrites of the nodes inside it, which saves a round per level of
+;;; nesting (SugBatch, src/compiler/comptime/comptime.coil); it is used unless another
+;;; suggestion also touches one of those nodes, which keeps its turn in a later
+;;; round as it had before composition.
+(defn lint-sug-text [(a (dyn Allocator)) (i i64) (sp (ptr Suggestion))]
+  (-> (slice u8))
+  (if (or (= (len (.composed sp)) 0)
+          (lint-composition-contested? i sp))
+      (sug-render a (load sp))
+      (.composed sp)))
+
+;;; This round's edits. A group holding a REJECTED fix (one that did not compile in
+;;; an earlier round) is withheld before conflicts are settled, so it cannot win a
+;;; conflict with an edit that would have landed.
+(defn lint-edits [(a (dyn Allocator))
+                  (verbose bool)
+                  (rejected (ptr (ArrayList LintRejected)))]
+  (-> (ptr (ArrayList LintEdit)))
+  (let [n (sug-count)
+        (mut out) (ArrayList::new [LintEdit] a)
+        (mut groups) (ArrayList::new [i64] a)
+        (mut withheld) (ArrayList::new [i64] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [(mut sp) (sug-at (load i))
+                      (mut e) (zeroed LintEdit)]
+                  (let [src (sug-file-text (.source sp))
+                        deleting
+                          (!= (.del sp)
+                              0)
+                        ; a deletion owns the comment block above the form and the line
+                        ; the form sat on; every other edit covers exactly its node
+                        lo
+                          (if deleting
+                              (lint-delete-lo src
+                                              (.lo sp))
+                              (.lo sp))
+                        hi
+                          (if deleting
+                              (lint-delete-hi src
+                                              lo
+                                              (.lo sp)
+                                              (.hi sp))
+                              (.hi sp))
+                        txt
+                          (if deleting
+                              ""
+                              (lint-sug-text a
+                                             (load i)
+                                             (mut sp)))]
+                    ; A fix that would delete one of the author's comments is downgraded
+                    ; to advice: the `help: try:` line still stands, but nothing is
+                    ; written. Said out loud, because a silently skipped fix reads as
+                    ; "there was nothing to do". A DELETION is exempt: dropping the
+                    ; comment that documents the removed form is the point of it, not
+                    ; collateral damage.
+                    (if (lint-rejected? rejected
+                                        (sug-file-name (.source sp))
+                                        (subslice [u8] src lo hi)
+                                        txt)
+                        (do
+                          (push! (mut withheld)
+                                 (lint-sug-group sp
+                                                 (load i)))
+                          0)
+                        (if (and (not deleting)
+                                 (sug-drops-comment? src lo hi txt))
+                            (let [w (stderr)]
+                              (when verbose
+                                (ps w "note: ")
+                                (ps w
+                                    (sug-file-name (.source sp)))
+                                (ps w ":")
+                                (ps w (i64->str a (lint-line-of src lo)))
+                                (ps w
+                                    ": not applying this fix — it would drop a comment; make the change by hand")
+                                (wb w 10)
+                                0)
+                              ; The rest of its group is withheld with it.
+                              (push! (mut withheld)
+                                     (lint-sug-group sp
+                                                     (load i)))
+                              0)
+                            (do
+                              (set! (.source e)
+                                    (.source sp))
+                              (set! (.group e)
+                                    (lint-sug-group sp
+                                                    (load i)))
+                              (set! (.lo e)
+                                    lo)
+                              (set! (.hi e)
+                                    hi)
+                              (set! (.text e)
+                                    txt)
+                              (push! (mut out)
+                                     e)
+                              (push! (mut groups)
+                                     (lint-sug-group sp
+                                                     (load i)))
+                              0)))))
+                (set! i (primitive/iadd (load i) 1)))))
+    (set! out (lint-group-filter a (load out) (load groups) (load withheld)))
+    ; Nested edits: the OUTER one wins, and the inner ones are dropped for this round.
+    ; `lint-apply` already refuses to apply both, but it decides by descending offset,
+    ; which picks the INNER one — and for deletion that is the wrong way round in a way
+    ; that breaks the file. A dead function containing a dead `let` binding produced an
+    ; edit for the binding (larger offset, applied first) and then skipped the edit that
+    ; removed the whole function, so the function survived, gutted, still calling the
+    ; `extern` that the same round had deleted. Containment is the real relation here,
+    ; and it is settled before sorting rather than left to the offset order to imply.
+    (set! out (lint-drop-nested a (load out)))
+    ; in the order lint-apply takes them, stably: a merge sort, since one round on a
+    ; large program can hold thousands of findings
+    (set! out (lint-sort-edits a (load out)))
+    (box-al [LintEdit] a (load out))))
+
+; The distinct source ids the pending edits touch, in first-seen order.
+(defn lint-edit-sources [(a (dyn Allocator)) (edits (ptr (ArrayList LintEdit)))]
+  (-> (ptr (ArrayList i64)))
+  (let [n (len (load edits))
+        (mut out) (ArrayList::new [i64] a)
+        (mut i) 0]
+    (loop (if (>= (load i) n)
+              (break)
+              (do
+                (let [sid (.source (elem edits (load i)))
+                      m (len (load out))
+                      (mut seen) false
+                      (mut j) 0]
+                  (loop (if (>= (load j) m)
+                            (break)
+                            (if (= (get (load out) (load j)) sid)
+                                (do (set! seen true) (break))
+                                (set! j (primitive/iadd (load j) 1)))))
+                  (unless (load seen) (push! (mut out) sid) 0))
+                (set! i (primitive/iadd (load i) 1)))))
+    (box-al [i64] a (load out))))
+
+; ── the span a DELETION covers ────────────────────────────────────────────────
+; Removing a form takes more source than the form's own node span, and this is the
+; only kind of edit for which that is true. Two extensions, in opposite directions:
+;
+;   * BACKWARD over the comment block written directly above it. A `;;;` doc block —
+;     or a plain `;` explanation — above a definition documents THAT definition.
+;     Leaving it behind orphans a paragraph of prose on top of whatever function
+;     happens to follow, which reads as documentation for the wrong thing. The scan
+;     stops at the first line that is not wholly a comment, so the previous form and
+;     any blank line separating the two stay out of the span.
+;   * FORWARD through the trailing newline, so the deletion removes a line rather
+;     than leaving an empty one behind.
+;
+; Everything here works in whole lines, and only when the form actually owns its
+; line: `(defn a …) (defn b …)` on one line widens to nothing, and the surviving
+; form keeps its text.
+
+;;; Is [lo,hi) nothing but spaces and tabs?
+(defn lint-blank-range? [(src (slice u8)) (lo i64) (hi i64)] (-> bool)
+  (let [(mut i) lo
+        (mut r) true]
+    (loop (if (>= (load i) hi)
+              (break)
+              (let [c (primitive/cast i64 (get src (load i)))]
+                (if (or (= c 32)
+                        (= c 9))
+                    (set! i (primitive/iadd (load i) 1))
+                    (do (set! r false) (break))))))
+    (load r)))
+
+;;; Does the line starting at `ls` consist of optional indentation and then a comment?
+(defn lint-comment-line? [(src (slice u8)) (ls i64) (le i64)] (-> bool)
+  (let [(mut i) ls]
+    (loop (if (>= (load i) le)
+              (break)
+              (let [c (primitive/cast i64 (get src (load i)))]
+                (if (or (= c 32)
+                        (= c 9))
+                    (set! i (primitive/iadd (load i) 1))
+                    (break)))))
+    (if (>= (load i) le)
+        false  ; a wholly blank line ends the block; it separates prose from prose
+        (= (primitive/cast i64 (get src (load i))) 59))))
+
+;;; A SECTION BANNER — `; ====== core data types ======`, `; ── the analysis ──` —
+;;; rather than prose about the form below it. A banner introduces everything that
+;;; follows, not one definition, so deleting the first definition under one must not
+;;; take it: `clox.coil` lost its `Value helpers` heading to the one dead function
+;;; that happened to sit directly beneath it, and the fifteen live ones underneath
+;;; were left with no heading at all.
+;;;
+;;; A run of six or more punctuation bytes is the test. Every rule character this
+;;; repo draws banners with qualifies (`=`, `-`, and the multi-byte `─`, whose bytes
+;;; are all non-alphanumeric), and no sentence reaches six — the longest run in
+;;; ordinary prose, an `--flag --flag` pair, is two. Erring toward "banner" leaves a
+;;; comment behind, which is the harmless direction.
+(defn lint-banner-comment? [(src (slice u8)) (ls i64) (le i64)] (-> bool)
+  (let [(mut i) ls
+        (mut run) 0
+        (mut best) 0]
+    (loop (if (>= (load i) le)
+              (break)
+              (do
+                (let [c (primitive/cast i64 (get src (load i)))]
+                  (if (or (= c 32)
+                          (= c 9)
+                          (and (>= c 48)
+                               (<= c 57))
+                          (and (>= c 65)
+                               (<= c 90))
+                          (and (>= c 97)
+                               (<= c 122)))
+                      (set! run 0)
+                      (do
+                        (set! run (primitive/iadd (load run) 1))
+                        (when (> (load run) (load best))
+                          (set! best (load run))
+                          0)
+                        0)))
+                (set! i (primitive/iadd (load i) 1)))))
+    (>= (load best) 6)))
+
+;;; Where a deletion of the node at `lo` starts: the top of its comment block.
+(defn lint-delete-lo [(src (slice u8)) (lo i64)] (-> i64)
+  (let [ls (lint-line-start src lo)]
+    (if (not (lint-blank-range? src ls lo))
+        lo  ; something else shares this line — take only the node itself
+        (let [(mut start) ls]
+          (loop (if (<= (load start) 0)
+                    (break)
+                    (let [ps
+                            (lint-line-start src
+                                             (primitive/isub (load start) 1))
+                          pe (primitive/isub (load start) 1)]
+                      (if (and (lint-comment-line? src ps pe)
+                               (not (lint-banner-comment? src ps pe)))
+                          (set! start ps)
+                          (break)))))
+          (load start)))))
+
+; How much to remove for a delete. Taking only the form and its newline leaves the
+; blank lines on BOTH sides of it, so a file spaced one-blank-line-per-form comes back
+; with two at the seam. When a blank line already sits above the form, the blank lines
+; below it come out too, and the seam is left exactly as the file had it elsewhere.
+(defn lint-extend-over-eol [(src (slice u8)) (hi i64)] (-> i64)
+  (let [n (len src)
+        (mut i) hi]
+    (loop (if (and (< (load i) n)
+                   (or (= (primitive/cast i64 (get src (load i))) #\space)
+                       (= (primitive/cast i64 (get src (load i))) #\tab)))
+              (set! i (primitive/iadd (load i) 1))
+              (break)))
+    (if (and (< (load i) n)
+             (= (primitive/cast i64 (get src (load i))) #\newline))
+        (primitive/iadd (load i) 1)
+        hi)))
+
+(defn lint-blank-line-at? [(src (slice u8)) (i i64)] (-> bool)
+  (let [n (len src)
+        (mut j) i]
+    (loop (if (and (< (load j) n)
+                   (or (= (primitive/cast i64 (get src (load j))) #\space)
+                       (= (primitive/cast i64 (get src (load j))) #\tab)))
+              (set! j (primitive/iadd (load j) 1))
+              (break)))
+    (and (< (load j) n) (= (primitive/cast i64 (get src (load j))) #\newline))))
+
+(defn lint-skip-line [(src (slice u8)) (i i64)] (-> i64)
+  (let [n (len src)
+        (mut j) i]
+    (loop (if (and (< (load j) n)
+                   (!= (primitive/cast i64 (get src (load j))) #\newline))
+              (set! j (primitive/iadd (load j) 1))
+              (break)))
+    (if (< (load j) n) (primitive/iadd (load j) 1) (load j))))
+
+(defn lint-blank-line-before? [(src (slice u8)) (lo i64)] (-> bool)
+  (and (>= lo 2)
+       (and (= (primitive/cast i64 (get src (primitive/isub lo 1))) #\newline)
+            (= (primitive/cast i64 (get src (primitive/isub lo 2))) #\newline))))
+
+(defn lint-delete-end [(src (slice u8)) (lo i64) (hi i64)] (-> i64)
+  (let [(mut e) (lint-extend-over-eol src hi)]
+    (when (lint-blank-line-before? src lo)
+      (loop (if (lint-blank-line-at? src (load e))
+                (store! e (lint-skip-line src (load e)))
+                (break)))
+      0)
+    (load e)))
+
+;;; Where it ends. Whole-line handling applies only when the node OWNS its line —
+;;; `lint-delete-lo` says so by having widened backward. Without that condition a
+;;; deletion of a node that merely ENDS a line takes the rest of it, and for a
+;;; sub-form node that is the next sibling: deleting the initializer in
+;;; `(let [x 5 y 6] …)` would swallow ` y 6]` and produce unbalanced source.
+;;; A node that owns its line also owns any trailing `; …` on it; from there
+;;; `lint-delete-end` takes over.
+(defn lint-delete-hi [(src (slice u8)) (start i64) (lo i64) (hi i64)] (-> i64)
+  ; `lint-delete-lo` returns the node's own `lo` when something shares its line, and
+  ; the start of its line (or of its comment block, above that) when nothing does.
+  (if (> start (lint-line-start src lo))
+      hi
+      (let [le (lint-line-end src hi)]
+        (lint-delete-end src start (if (lint-comment-line? src hi le) le hi)))))
+
+;;; Has `path` held `text` before in this --fix run?
+(defn lint-state-seen? [(seen (ptr (ArrayList LintSaved)))
+                        (path (slice u8))
+                        (text (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (len (load seen))]
+      (let [e (elem seen i)]
+        (when (and (= (.path e) path) (= (.text e) text)) (set! found true))))
+    found))
+
+(defn lint-usage [] (-> i64)
+  (ps (stderr)
+      "usage: coil lint [file.coil]... [--use <namespace>]... [--target <triple>] [--lint-param KEY=VALUE]... [--fix|--diff]\n")
+  2)
+
+;;; Every file named is linted, each as the whole program it is, one after another,
+;;; and the run fails if any of them does. Only the last one used to be: `coil lint
+;;; --fix a.coil b.coil` left a.coil as it was and said nothing about it.
+(defn check-fix-cmd [(a (dyn Allocator))
+                     (argc i32)
+                     (argv (ptr (ptr i8)))
+                     (standard-rules bool)] (-> i64)
+  (set! (.budget (lint-progress)) (lint-default-analysis-budget))
+  (set! (.on (lint-progress)) false)
+  (let [(mut fix) false
+        (mut diff) false
+        (mut paths) (ArrayList::new [(ptr i8)] a)
+        (mut i) 2]
+    (loop (if (>= (load i) (primitive/cast i64 argc))
+              (break)
+              (let [arg (from-cstr (load (index argv (load i))))]
+                (cond (= arg "--all-files")
+                        (do (set! i (primitive/iadd (load i) 1)) 0)
+                      (= arg "--fix")
+                        (do
+                          (set! fix true)
+                          (set! i (primitive/iadd (load i) 1))
+                          0)
+                      (= arg "--diff")
+                        (do
+                          (set! diff true)
+                          (set! i (primitive/iadd (load i) 1))
+                          0)
+                      (= arg "--verbose")
+                        (do
+                          (set! (.on (lint-progress)) true)
+                          (set! i (primitive/iadd (load i) 1))
+                          0)
+                      (= arg "--max-analyses")
+                        (let [value
+                                (if (< (primitive/iadd (load i) 1)
+                                       (primitive/cast i64 argc))
+                                    (str/parse-int (from-cstr (load (index argv
+                                                                           (primitive/iadd (load i)
+                                                                                           1)))))
+                                    (None [i64]))]
+                          (match value
+                            (Some [n]
+                                  (if (< n 1)
+                                      (do
+                                        (ps (stderr)
+                                            "error: --max-analyses needs a count of at least 1\n")
+                                        (exit 2)
+                                        0)
+                                      (set! (.budget (lint-progress)) n)))
+                            (None []
+                                  (do
+                                    (ps (stderr)
+                                        "error: --max-analyses needs a count\n")
+                                    (exit 2)
+                                    0)))
+                          (set! i (primitive/iadd (load i) 2))
+                          0)
+                      (= arg "--use")
+                        (do
+                          (when (>= (primitive/iadd (load i) 1)
+                                    (primitive/cast i64 argc))
+                            (ps (stderr) "error: --use needs a path\n")
+                            (exit 2)
+                            0)
+                          (cli-use-add (from-cstr (load (index argv
+                                                               (primitive/iadd (load i)
+                                                                               1)))))
+                          (set! i (primitive/iadd (load i) 2))
+                          0)
+                      ; The program is checked for this target, as `coil check`
+                      ; does: firmware using coil.arch.riscv is not the host's.
+                      (= arg "--target")
+                        (do
+                          (when (>= (primitive/iadd (load i) 1)
+                                    (primitive/cast i64 argc))
+                            (ps (stderr) "error: --target needs a triple\n")
+                            (exit 2)
+                            0)
+                          (set-target-arch! (load (index argv
+                                                         (primitive/iadd (load i)
+                                                                         1))))
+                          (set! i (primitive/iadd (load i) 2))
+                          0)
+                      (= arg "--lint-param")
+                        (do
+                          (when (>= (primitive/iadd (load i) 1)
+                                    (primitive/cast i64 argc))
+                            (ps (stderr)
+                                "error: --lint-param needs KEY=VALUE\n")
+                            (exit 2)
+                            0)
+                          (lint-param-cli-add (from-cstr (load (index argv
+                                                                      (primitive/iadd (load i)
+                                                                                      1)))))
+                          (set! i (primitive/iadd (load i) 2))
+                          0)
+                      ; Frontend-wide macro controls: apply-macro-debug-flags!
+                      ; already published them before dispatch.
+                      (= arg "--trace-macros")
+                        (do (set! i (primitive/iadd (load i) 1)) 0)
+                      (or (= arg "--trace-macro")
+                          (= arg "--macro-expansion-limit"))
+                        (do (set! i (primitive/iadd (load i) 2)) 0)
+                      (is-flag? arg)
+                        (do
+                          (ps (stderr) "error: unknown flag '")
+                          (ps (stderr) arg)
+                          (ps (stderr) "'")
+                          (wb (stderr) 10)
+                          (exit 2)
+                          0)
+                      :else
+                        (do
+                          (push! (mut paths) (load (index argv (load i))))
+                          (set! i (primitive/iadd (load i) 1))
+                          0)))))
+    ; `coil lint` is this with the standard rules; any other checkers come from --use.
+    (when standard-rules (cli-use-add "coil.lint.default") 0)
+    ; Each transaction's rewrites are read through the source overlay until it
+    ; ends; the next one starts from the files as they are.
+    (if (= (len paths) 0)
+        (let [rc (project-lint-cmd a argc argv (load fix) (load diff))]
+          (source-overlay-clear!)
+          rc)
+        (let [(mut rc) 0]
+          (for pathc paths
+            (let [r (lint-run a pathc (load fix) (load diff))]
+              (source-overlay-clear!)
+              (when (> r rc) (set! rc r))))
+          rc))))
+
+(defn project-lint-cmd [(a (dyn Allocator))
+                        (argc i32)
+                        (argv (ptr (ptr i8)))
+                        (fix bool)
+                        (diff bool)] (-> i64)
+  (block
+    :project-lint
+      (let [text (read-file a (to-cstr a "Coil.toml"))]
+        (if (= (len text) 0)
+            (lint-usage)
+            (let [m
+                    (if (project-manifest?)
+                        (project-manifest)
+                        (parse-manifest a text))
+                  _profile (m-select-profile! a argc argv m)
+                  rules (.lint-rules m)
+                  w (stderr)
+                  cwd (cwd-slice a)
+                  (mut originals) (ArrayList::new [LintSaved] a)
+                  (mut rc) 0
+                  discovery-span (tr/span-begin "lint.discovery")]
+              (unless (project-manifest?) (m-prepare-deps a m) 0)
+              ; The manifest's own lint rules join the standard profile.
+              (for [r 0 (len rules)] (cli-use-add (get rules r)) 0)
+              ; A project command that applied the manifest to this process
+              ; added its metaprograms already. A child of one (a workspace
+              ; member, or `coil verify`'s lint) inherits the manifest's
+              ; environment but not its uses, and gets them here: the
+              ; program is not the project's without its transforms. Uses
+              ; are added once each, so this never doubles one.
+              (unless (project-manifest?)
+                (m-add-manifest-uses m)
+                0)
+              ; Checkers execute through the in-memory metaprogram engine:
+              ; no compiler child, no object on disk, no dylib link.
+              (setenv (to-cstr a "COIL_META_JIT") (to-cstr a "1") 1)
+              (let [index (project-source-index a m)
+                    files (project-source-files a index)
+                    modules (project-modules a index files)
+                    _discovery-end (tr/span-end discovery-span)]
+                ; No source at all is success, not a failure to report.
+                (when (= (len (load files)) 0)
+                  (return-from :project-lint 0)
+                  0)
+                (when (or fix diff)
+                  (for [i 0 (len (load files))]
+                    (let [path (get (load files) i)]
+                      (lint-save-once! a
+                                       (mut originals)
+                                       path
+                                       (read-file a (to-cstr a path))))
+                    0)
+                  0)
+                ; Report, --diff and --fix share one typed analysis, so a
+                ; finding is reported exactly when --fix could act on it.
+                (lint-transaction-end a
+                                      (lint-transaction a
+                                                        (lint-target-set a
+                                                                         modules
+                                                                         cwd)
+                                                        fix
+                                                        diff
+                                                        (mut originals))
+                                      fix
+                                      fix
+                                      (box-al [LintSaved]
+                                              a
+                                              (load originals)))))))))
+
+;;; The end of a --fix transaction (FIX), which ended with status RC: write what it
+;;; accepted (lint-commit!) and, when ANNOUNCE, name each file it changed. A run
+;;; without --fix ends with nothing to write.
+(defn lint-transaction-end [(a (dyn Allocator))
+                            (rc i64)
+                            (fix bool)
+                            (announce bool)
+                            (saved (ptr (ArrayList LintSaved)))] (-> i64)
+  (if (not fix)
+      rc
+      (let [committed (lint-commit! a saved)]
+        (when (and announce (= committed 0))
+          (lint-announce-fixed a saved)
+          0)
+        (if (> committed rc) committed rc))))
+
+;;; Name every file the run wrote: `fixed PATH`, once each, after the one write
+;;; that ends it (lint-commit!).
+(defn lint-announce-fixed [(a (dyn Allocator))
+                           (saved (ptr (ArrayList LintSaved)))] (-> i64)
+  (let [w (stderr)]
+    (for sp (load saved)
+      (when (!= (.preview sp) (.text sp))
+        (ps w "fixed ")
+        (ps w (.path sp))
+        (wb w 10))))
+  0)
+
+; The apply loop: analyse, edit, re-analyse — a fixpoint with a fuel guard, the same
+; shape as macro expansion and the transform loop. Level-1 gate: after a round the
+; program must still read, resolve and typecheck; if it doesn't, the WHOLE round is
+; reverted, so the working tree is always at least as valid as it started.
+(defn lint-run [(a (dyn Allocator)) (pathc (ptr i8)) (fix bool) (diff bool)]
+  (-> i64)
+  (let [(mut originals) (ArrayList::new [LintSaved] a)]
+    (lint-run-with-saved a pathc fix diff fix (mut originals))))
+
+; What one lint transaction analyses: an entry file, or a project's module set.
+(defstruct LintTarget
+  [(path (slice u8))
+   (pathc (ptr i8))
+   (cwd (slice u8))
+   ; Null for an entry file.
+   (modules (ptr (ArrayList (slice u8))))])
+
+(defn lint-target-file [(a (dyn Allocator)) (pathc (ptr i8))]
+  (-> (ptr LintTarget))
+  (let [t (box! a LintTarget (zeroed LintTarget))]
+    (set! (.path t) (from-cstr pathc))
+    (set! (.pathc t) pathc)
+    (set! (.cwd t) (cwd-slice a))
+    (set! (.modules t) (primitive/cast (ptr (ArrayList (slice u8))) 0))
+    t))
+
+(defn lint-target-set [(a (dyn Allocator))
+                       (modules (ptr (ArrayList (slice u8))))
+                       (cwd (slice u8))] (-> (ptr LintTarget))
+  (let [t (box! a LintTarget (zeroed LintTarget))]
+    (set! (.path t) "")
+    (set! (.pathc t) (primitive/cast (ptr i8) 0))
+    (set! (.cwd t) cwd)
+    (set! (.modules t) modules)
+    t))
+
+; One authoritative analysis of the target as it stands on disk: 1 when it
+; compiled and every checker ran. Suggestions and diagnostics are left in
+; their collectors for the caller.
+(defn lint-analyze [(a (dyn Allocator)) (t (ptr LintTarget))] (-> i64)
+  (lint-set-errors-reset!)
+  (if (= (primitive/cast i64 (.modules t)) 0)
+      (run-dump-on-big-stack a
+                             (read-src a (.pathc t))
+                             (.cwd t)
+                             (.path t)
+                             (fnptr-of lint-profile-src-program))
+      (run-set-on-big-stack a
+                            (.modules t)
+                            (.cwd t)
+                            (fnptr-of lint-profile-set-program))))
+
+(defn lint-run-with-saved [(a (dyn Allocator))
+                           (pathc (ptr i8))
+                           (fix bool)
+                           (diff bool)
+                           (announce bool)
+                           (originals (mut (ArrayList LintSaved)))] (-> i64)
+  (block
+    :lint-done
+      (let [w (stderr)
+            path (from-cstr pathc)
+            original (read-file a pathc)
+            apply? (or fix diff)
+            (mut rc) 0]
+        (when apply?
+          (lint-save-once! a (mut originals) path original)
+          0)
+        (store! rc
+                (lint-transaction a
+                                  (lint-target-file a pathc)
+                                  fix
+                                  diff
+                                  (mut originals)))
+        (lint-transaction-end a
+                              (load rc)
+                              fix
+                              announce
+                              (box-al [LintSaved] a (load originals))))))
+
+; What a `--fix` transaction ended with, beyond its exit status: how many fixes
+; were rejected because they did not compile (the run fails, though everything
+; else was applied), and whether the files as left compile.
+(defstruct LintFixOutcome [(rejected i64) (compiles bool)])
+
+(defn lint-fix-outcome [] (-> (ptr LintFixOutcome))
+  (primitive/alloc-static LintFixOutcome))
+
+;;; `lint --fix` and `--diff` run one full analysis of the target per round, one per
+;;; trial while salvaging a round, and one more for the report. Each costs what a
+;;; compile does. With `--verbose` (`on`) every analysis is announced as it
+;;; finishes, with what it was for and how long it took.
+(defstruct LintProgress [(on bool) (count i64) (budget i64)])
+
+(defn lint-progress [] (-> (ptr LintProgress))
+  (primitive/alloc-static LintProgress))
+
+;;; N/DIVISOR with one decimal digit.
+(defn lint-progress-tenths! [(w (ptr Writer)) (n i64) (divisor i64)] (-> i64)
+  (let [tenths (/ (* n 10) divisor)]
+    (ps w (i64->str (malloc-allocator) (/ tenths 10)))
+    (ps w ".")
+    (ps w (i64->str (malloc-allocator) (% tenths 10))))
+  0)
+
+;;; The most analyses one `--fix` or `--diff` run spends applying fixes: its rounds
+;;; and the trials that salvage a round (the report that follows is one more). Each
+;;; costs about what `coil check` does, and nothing about the program bounds how
+;;; many there are: deep nesting takes a round per level, and a round whose fixes do
+;;; not compile is bisected one trial at a time. `--max-analyses N` sets it.
+(defn lint-default-analysis-budget [] (-> i64)
+  64)
+
+(defn lint-budget-spent? [] (-> bool)
+  (>= (.count (lint-progress)) (.budget (lint-progress))))
+
+;;; Report that the budget ran out, and WHAT that left undone.
+(defn lint-budget-stop! [(a (dyn Allocator)) (what (slice u8))] (-> i64)
+  (let [w (stderr)]
+    (ps w "error: --fix stopped after ")
+    (ps w (i64->str a (.count (lint-progress))))
+    (ps w " analyses, its --max-analyses budget; ")
+    (ps w what)
+    (ps w
+        ". Every file holds a state that compiled; run --fix again to continue.\n"))
+  0)
+
+;;; One analysis of T for PURPOSE, announced when it finishes (see LintProgress).
+(defn lint-analyze-for [(a (dyn Allocator))
+                        (t (ptr LintTarget))
+                        (purpose (slice u8))] (-> i64)
+  (let [progress (lint-progress)
+        started (tr/trace-now-ms)
+        ok (lint-analyze a t)]
+    (set! (.count progress) (+ (.count progress) 1))
+    (when (.on progress)
+      (let [w (stderr)]
+        (ps w "analysis ")
+        (ps w (i64->str a (.count progress)))
+        (ps w " (")
+        (ps w purpose)
+        (ps w ") ")
+        (lint-progress-tenths! w (- (tr/trace-now-ms) started) 1000)
+        (ps w "s\n"))
+      0)
+    ok))
+
+; The transactional part of `lint --fix` / `--diff`, and the report that follows.
+(defn lint-transaction [(a (dyn Allocator))
+                        (t (ptr LintTarget))
+                        (fix bool)
+                        (diff bool)
+                        (originals (mut (ArrayList LintSaved)))] (-> i64)
+  (let [w (stderr)
+        apply? (or fix diff)
+        (mut rc) 0]
+    ; PHASE 1 — apply to a fixpoint, quietly. Each round's analysis is also the
+    ; previous round's gate: if the program stopped compiling, WE broke it, and
+    ; the round keeps only what compiles (lint-salvage-round).
+    (set! (.rejected (lint-fix-outcome)) 0)
+    (set! (.compiles (lint-fix-outcome)) false)
+    (set! (.count (lint-progress)) 0)
+    (when apply?
+      (set! rc (lint-fix-loop a t (mut originals))))
+    ; PHASE 2 — one analysis with output. This is the report: what the checkers say
+    ; about the target as it now stands, with a `help: try:` line under anything still
+    ; fixable. `--diff` renders its patch from the same pass.
+    (if (= (load rc) 3)
+        ; Phase 1 already completed the full authoritative pipeline and
+        ; established that there are no diagnostics or edits. Do not retain
+        ; an identical second compiler graph merely to prove the same fact.
+        (do
+          (set! rc 0)
+          (set! (.compiles (lint-fix-outcome)) true)
+          (when diff
+            (if (lint-inputs-held? a (box-al [LintSaved] a (load originals)))
+                (lint-print-saved-patches a
+                                          (box-al [LintSaved]
+                                                  a
+                                                  (load originals)))
+                (set! rc 1))
+            0)
+          (load rc))
+        (do
+          (set-diag-quiet false)
+          (sug-reset)
+          (diag-reset)
+          (lint-set-errors-reset!)
+          (let [ok (lint-analyze-for a t "report")]
+            (set! (.compiles (lint-fix-outcome))
+                  (!= ok 0))
+            (if (= ok 0)
+                (set! rc 1)
+                ; Collect in every mode, not just --diff: `lint-edits` is what says a
+                ; fix cannot be applied, and a `help: try:` line with no such note
+                ; would read as "--fix will do this for you" when it will not.
+                (let [es
+                        (lint-edits a
+                                    true
+                                    (box-al [LintRejected]
+                                            a
+                                            (ArrayList::new [LintRejected]
+                                                            a)))]
+                  0))
+            ; A module left out of the set (declared twice, unreadable) was
+            ; reported in that analysis and is an error of the project, not of
+            ; the fixes that were applied around it.
+            (when (> (lint-set-errors) 0)
+              (set! rc 1)
+              0)
+            ; a fix that does not compile fails the run, even though every
+            ; other fix was applied; each was a warning, so say why it fails
+            (when (> (.rejected (lint-fix-outcome)) 0)
+              (ps w
+                  "error: the suggested fixes reported above did not compile and were not applied; every other fix was\n")
+              (set! rc 1)
+              0))
+          (when diff
+            (unless (lint-inputs-held? a
+                                       (box-al [LintSaved]
+                                               a
+                                               (load originals)))
+              (set! rc 1)
+              0)
+            (when (= (load rc) 0)
+              (lint-print-saved-patches a
+                                        (box-al [LintSaved]
+                                                a
+                                                (load originals)))
+              0)
+            (when (!= (load rc) 0)
+              (ps w
+                  "error: lint preview did not produce clean code — no patch emitted\n")
+              0)
+            0)
+          (load rc)))))
+
+; Rewrite until nothing changes: a fuel-guarded fixpoint, the same shape as macro
+; expansion and the transform loop. Return 3 only when the completed authoritative
+; pass had no diagnostics and no edits, allowing the caller to skip a duplicate
+; reporting pass. Other outcomes are 0 or 1 (including an initial program that did
+; not compile).
+;
+; Every round is proposed in memory (lint-propose!): its analysis reads the
+; proposed text through the loader's source overlay, and no file is written until
+; the transaction is over (lint-transaction-end).
+;
+; Each round's analysis is the previous round's gate. Files are announced (`fixed
+; PATH`) by the caller, once the whole run is over and written
+; (`lint-announce-fixed`). Nor is a failed round thrown
+; away whole: one bad suggestion used to discard every good one beside it, in
+; every file. `lint-salvage-round` keeps the part of the round that compiles and
+; reports the suggestions it had to drop, which are not offered again.
+
+;;; One file of a round: its text before the round, the round's edits to it, and
+;;; the text this transaction last proposed for it. Owned here, because a failed round
+;;; is bisected after later analyses have replaced the suggestion table and source
+;;; graph its edits came from.
+(defstruct LintRoundFile
+  [(path (slice u8))
+   (before (slice u8))
+   (edits (ArrayList LintEdit))
+   (current (slice u8))])
+
+;;; A fix that was tried and did not compile, recognized in later rounds by its
+;;; file, the text it replaced and the text it wrote.
+(defstruct LintRejected
+  [(path (slice u8)) (before (slice u8)) (after (slice u8))])
+
+(defn lint-has-group? [(groups (ArrayList i64)) (g i64)] (-> bool)
+  (block :found
+    (for x groups (when (= x g) (break :found true)))
+    false))
+
+(defn lint-rejected? [(rejected (ptr (ArrayList LintRejected)))
+                      (path (slice u8))
+                      (before (slice u8))
+                      (after (slice u8))] (-> bool)
+  (block :found
+    (for r (load rejected)
+      (when (and (= (.path r) path)
+                 (and (= (.before r) before) (= (.after r) after)))
+        (break :found true)))
+    false))
+
+;;; TEXT as `coil fmt` writes it, allocated in A. The formatter's tree is built in
+;;; an arena of its own: --fix formats every file a round edits, every round, and
+;;; in A each of those trees stayed until the command ended. An edit that leaves
+;;; TEXT unreadable comes back unformatted, so the round's compile gate rejects it.
+(defn lint-format [(a (dyn Allocator)) (text (slice u8))] (-> (slice u8))
+  (let [(mut work) (zeroed scratch/ScratchArena)
+        _init
+          (scratch/ScratchArena::init-with-capacity (mut work)
+                                                    (large-pages/compiler-scratch-parent)
+                                                    1048576)
+        out
+          (match (fmtr/format-src (allocator (mut work))
+                                  text
+                                  (fmtr/fmt-default-width))
+            (Ok [formatted] (sconcat a formatted ""))
+            (Err [_] text))]
+    (close! (mut work))
+    out))
+
+;;; RF's text with the edits of the groups in KEEP, formatted as a round writes it.
+(defn lint-round-text [(a (dyn Allocator))
+                       (rf (ptr LintRoundFile))
+                       (keep (ArrayList i64))] (-> (slice u8))
+  (let [(mut chosen) (ArrayList::new [LintEdit] a)]
+    (for e (.edits rf)
+      (when (lint-has-group? keep (.group e)) (push! (mut chosen) e)))
+    (if (= (len chosen) 0)
+        (.before rf)
+        (lint-format a
+                     (lint-apply a
+                                 (.before rf)
+                                 (mut chosen)
+                                 (.source (get chosen 0)))))))
+
+;;; Propose every round file's text for KEEP.
+(defn lint-propose-round! [(a (dyn Allocator))
+                           (files (ptr (ArrayList LintRoundFile)))
+                           (keep (ArrayList i64))
+                           (originals (mut (ArrayList LintSaved)))] (-> i64)
+  (for [i 0 (len (load files))]
+    (let [rf (elem files i)
+          text (lint-round-text a rf keep)]
+      (unless (= text (.current rf))
+        (lint-propose! a (mut originals) (.path rf) (.current rf) text)
+        (set! (.current rf) text))))
+  0)
+
+;;; Take back every file of a round that never reached its gate: the files are
+;;; held as the round found them, and the run fails (1).
+(defn lint-revert-round! [(a (dyn Allocator))
+                          (files (ptr (ArrayList LintRoundFile)))
+                          (originals (mut (ArrayList LintSaved)))] (-> i64)
+  (lint-propose-round! a files (ArrayList::new [i64] a) (mut originals))
+  1)
+
+;;; Does the target compile as the files now stand?
+(defn lint-compiles? [(a (dyn Allocator)) (t (ptr LintTarget))] (-> bool)
+  (sug-reset)
+  (diag-reset)
+  (!= (lint-analyze-for a t "salvaging a round") 0))
+
+;;; Report group G of the round as not applied, and remember its fixes.
+(defn lint-reject-group! [(a (dyn Allocator))
+                          (files (ptr (ArrayList LintRoundFile)))
+                          (g i64)
+                          (rejected (mut (ArrayList LintRejected)))] (-> i64)
+  (set! (.rejected (lint-fix-outcome)) (+ (.rejected (lint-fix-outcome)) 1))
+  (let [w (stderr)]
+    (for rf (load files)
+      (for e (.edits rf)
+        (when (= (.group e) g)
+          (let [before (subslice [u8] (.before rf) (.lo e) (.hi e))]
+            (push! (mut rejected)
+                   (LintRejected
+                     :path (.path rf)
+                     :before before
+                     :after (.text e)))
+            (ps w "warning: ")
+            (ps w (.path rf))
+            (ps w ":")
+            (ps w (i64->str a (lint-line-of (.before rf) (.lo e))))
+            (ps w
+                ": a suggested fix does not compile, so it was not applied\n  replacing: ")
+            (ps w before)
+            (ps w "\n  with:      ")
+            (ps w (.text e))
+            (wb w 10))))))
+  0)
+
+;;; Queue the two halves of [LO, HI) so the lower one is tried first.
+(defn lint-push-halves! [(pending (mut (ArrayList i64))) (lo i64) (hi i64)]
+  (-> i64)
+  (let [mid (+ lo (/ (- hi lo) 2))]
+    (push! (mut pending) mid)
+    (push! (mut pending) hi)
+    (push! (mut pending) lo)
+    (push! (mut pending) mid))
+  0)
+
+;;; A round whose gate failed: keep the most of it that compiles. Its suggestion
+;;; groups, in file order, are halved: a part that compiles together with what is
+;;; already kept is kept, a part that does not is halved again, and a single group
+;;; that does not is rejected. Each trial is a full analysis, paid only when a round
+;;; fails, and the trials stop when the run's analysis budget is spent. Leaves the
+;;; transaction holding the kept groups. Returns 4 when the budget ran out first, 0
+;;; otherwise.
+(defn lint-salvage-round [(a (dyn Allocator))
+                          (t (ptr LintTarget))
+                          (files (ptr (ArrayList LintRoundFile)))
+                          (originals (mut (ArrayList LintSaved)))
+                          (rejected (mut (ArrayList LintRejected)))] (-> i64)
+  (let [(mut order) (ArrayList::new [i64] a)
+        (mut keep) (ArrayList::new [i64] a)
+        (mut pending) (ArrayList::new [i64] a)]
+    (for rf (load files)
+      (for e (.edits rf)
+        (unless (lint-has-group? order (.group e))
+          (push! (mut order) (.group e)))))
+    ; the whole round is already known not to compile
+    (if (= (len order) 1)
+        (lint-reject-group! a files (get order 0) (mut rejected))
+        (lint-push-halves! (mut pending) 0 (len order)))
+    (while (and (> (len pending) 0) (not (lint-budget-spent?)))
+      (let [n (len pending)
+            lo (get pending (- n 2))
+            hi (get pending (- n 1))
+            (mut trial) (ArrayList::new [i64] a)]
+        (set! (.len pending) (- n 2))
+        (for g keep (push! (mut trial) g))
+        (for [k lo hi] (push! (mut trial) (get order k)))
+        (lint-propose-round! a files trial (mut originals))
+        (cond (lint-compiles? a t) (set! keep trial)
+              (= (- hi lo) 1)
+                (lint-reject-group! a files (get order lo) (mut rejected))
+              :else (lint-push-halves! (mut pending) lo hi))))
+    (lint-propose-round! a files keep (mut originals))
+    ; Out of budget with parts of the round untried: what was kept compiled,
+    ; and the untried fixes are neither applied nor reported as broken.
+    (if (= (len pending) 0)
+        0
+        (let [(mut untried) 0]
+          (for [k 0 (/ (len pending) 2)]
+            (set! untried
+                  (+ untried
+                     (- (get pending (+ (* k 2) 1)) (get pending (* k 2))))))
+          (lint-budget-stop! a
+                             (sconcat3 a
+                                       "the last round kept only the fixes it had confirmed, and left "
+                                       (i64->str a untried)
+                                       " unchecked and unapplied"))
+          4))))
+
+(defn lint-fix-loop [(a (dyn Allocator))
+                     (t (ptr LintTarget))
+                     (originals (mut (ArrayList LintSaved)))] (-> i64)
+  (let [w (stderr)
+        ; every text each file has had, to recognize two rules undoing each other
+        (mut seen) (ArrayList::new [LintSaved] a)
+        ; the files the last round proposed, until its gate passes
+        (mut round) (ArrayList::new [LintRoundFile] a)
+        (mut rejected) (ArrayList::new [LintRejected] a)
+        (mut cycled) false
+        (mut applied) false
+        (mut rounds) 0
+        (mut rc) 0]
+    (set-diag-quiet true)
+    (loop (do
+            (sug-reset)
+            (diag-reset)
+            (let [ok
+                    (lint-analyze-for a
+                                      t
+                                      (if (= (load rounds)
+                                             0)
+                                          "the starting tree"
+                                          (sconcat a
+                                                   "fix round "
+                                                   (i64->str a (load rounds)))))
+                  failed (= ok 0)]
+              ; The program does not compile. Before the first edit that is simply the
+              ; state of the file — phase 2 will say so. After one it means a fix we
+              ; applied is at fault, and the round is salvaged.
+              (when failed
+                (unless (load applied)
+                  (lint-discard! a (mut originals))
+                  (set! rc 1)
+                  (break))
+                (let [salvaged
+                        (lint-salvage-round a
+                                            t
+                                            (mut round)
+                                            (mut originals)
+                                            (mut rejected))]
+                  (when (= salvaged 4)
+                    (set! rc 1)
+                    (break)))
+                (set! round (ArrayList::new [LintRoundFile] a))
+                0)
+              (unless failed
+                ; this analysis is the gate the last round's files were waiting for
+                (set! round (ArrayList::new [LintRoundFile] a))
+                (let [edits
+                        (lint-edits a
+                                    (= (load rounds) 0)
+                                    (mut rejected))
+                      nedits (len (load edits))]
+                  (when (= nedits 0)
+                    (when (and (= (diag-errs) 0)
+                               (and (= (len (load (warn-list)))
+                                       0)
+                                    (and (= (lint-set-errors)
+                                            0)
+                                         (= (len rejected) 0))))
+                      (set! rc 3)
+                      0)
+                    (break))
+                  (let [srcs (lint-edit-sources a edits)
+                        ns (len (load srcs))
+                        (mut k) 0
+                        (mut wrote) false]
+                    (loop (if (>= (load k) ns)
+                              (break)
+                              (do
+                                (let [sid (get (load srcs) (load k))
+                                      fpath (sug-file-name sid)
+                                      ftext (sug-file-text sid)
+                                      edited (lint-apply a ftext edits sid)
+                                      ; `lint --fix` promises that what it writes is
+                                      ; already `coil fmt` output. Canonical top-level
+                                      ; spacing cannot be established by a local form
+                                      ; splice, so format the complete edited source
+                                      ; before the transactional write and re-check.
+                                      out (lint-format a edited)]
+                                  (unless (lint-state-seen? (mut seen)
+                                                            fpath
+                                                            ftext)
+                                    (push! (mut seen)
+                                           (LintSaved
+                                             :path (sconcat a fpath "")
+                                             :key ""
+                                             :text (sconcat a ftext "")
+                                             :preview "")))
+                                  (when (and (> (len fpath) 0)
+                                             (!= out ftext)
+                                             (lint-state-seen? (mut seen)
+                                                               fpath
+                                                               out))
+                                    (set! cycled true))
+                                  (unless (or (= (len fpath)
+                                                 0)
+                                              (= out ftext)
+                                              (load cycled))
+                                    (let [saved-path (sconcat a fpath "")
+                                          saved-text (sconcat a ftext "")
+                                          (mut file-edits)
+                                            (ArrayList::new [LintEdit] a)]
+                                      ; Suggestions point into the completed compiler graph.
+                                      ; A transaction must own its undo bytes independently:
+                                      ; the next validation pass may reclaim or reuse that graph.
+                                      (lint-propose! a
+                                                     (mut originals)
+                                                     saved-path
+                                                     saved-text
+                                                     out)
+                                      (for e (load edits)
+                                        (when (= (.source e) sid)
+                                          (push! (mut file-edits) e)))
+                                      (push! (mut round)
+                                             (LintRoundFile
+                                               :path saved-path
+                                               :before saved-text
+                                               :edits file-edits
+                                               :current out))
+                                      (set! wrote true)
+                                      0)))
+                                (set! k (primitive/iadd (load k) 1)))))
+                    ; A round that cannot finish never reached its gate. Take it back
+                    ; rather than keep edits nothing has compiled.
+                    (when (load cycled)
+                      (set! rc
+                            (lint-revert-round! a (mut round) (mut originals)))
+                      (ps w
+                          "error: --fix brought a file back to a text it already had — two rules are undoing each other; that round was reverted")
+                      (wb w 10)
+                      (break))
+                    (unless (load wrote) (break))
+                    (set! applied true)
+                    (set! rounds (primitive/iadd (load rounds) 1))
+                    ; Fuel exhaustion is a real outcome and is reported, not swallowed.
+                    ; The round just proposed needs one more analysis before it can be
+                    ; kept, so out of budget it is taken back. (Two rules undoing each
+                    ; other are caught sooner, by lint-state-seen?; a deeply nested
+                    ; rewrite legitimately takes a round per level.)
+                    (when (lint-budget-spent?)
+                      (set! rc
+                            (lint-revert-round! a (mut round) (mut originals)))
+                      (lint-budget-stop! a
+                                         "the round it had just proposed was not applied")
+                      (break))))))))
+    (set-diag-quiet false)
+    (load rc)))
