@@ -2,6 +2,7 @@
 (module stogir.a64.fixups)
 (import "stogir.a64.encode" :as e)
 (import "stogir.bytes" :as bytes)
+(import "stogir.a64.code" :as code)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.result" :use [Result Ok Err])
 
@@ -87,3 +88,198 @@
                                   (- (get labels (cast i64 (.label record)))
                                      (.base record)))))
           (Ok (cast i32 (len records)))))))
+
+;;; A direct B.cond has a smaller reach than B. Expand only distant predicates
+;;; into inverse B.cond +8 / B target. The common near case allocates nothing.
+;;; Far expansion is transactional: the original buffer and all offset metadata
+;;; survive any failure unchanged. Final application can safely be repeated.
+(defn relax! [(output (mut code/Buffer))
+              (labels (mut (ArrayList i64)))
+              (branches (mut (ArrayList Branch)))
+              (relatives (mut (ArrayList Relative)))]
+  (-> (Result i32 (slice u8)))
+  (let [(mut far) false
+        (mut error) ""
+        size (len (.text output))]
+    (for branch branches
+      (if (or (< (.offset branch) 0)
+              (> (.offset branch) (- size 4))
+              (!= (% (.offset branch) 4) 0)
+              (< (.label branch) 0)
+              (>= (cast i64 (.label branch)) (len labels))
+              (< (.condition branch) -1)
+              (> (.condition branch) 15)
+              (and (!= (.condition branch) -1) (.link branch)))
+          (set! error "invalid branch layout record")
+          (let [target (get labels (cast i64 (.label branch)))
+                delta (- target (.offset branch))]
+            (if (or (< target 0) (> target size) (!= (% target 4) 0))
+                (set! error "invalid branch layout target")
+                (when (and (>= (.condition branch) 0)
+                           (or (< delta -1048576) (> delta 1048572)))
+                  (if (> (.condition branch) 13)
+                      (set! error
+                            "cannot relax an unconditional condition code")
+                      (set! far true)))))))
+    (for label labels
+      (when (or (< label -1)
+                (> label size)
+                (and (>= label 0) (!= (% label 4) 0)))
+        (set! error "invalid branch layout label")))
+    (if (!= error "")
+        (Err error)
+        (if (not far)
+            (Ok 0)
+            (let [allocator (.alc (.text output))
+                  (mut expanded) (code/create allocator)
+                  (mut new-labels) (ArrayList::new [i64] (.alc labels))
+                  (mut new-branches) (ArrayList::new [Branch] (.alc branches))
+                  (mut new-relatives)
+                    (ArrayList::new [Relative] (.alc relatives))]
+              (for label labels (push! (mut new-labels) label))
+              (for branch branches (push! (mut new-branches) branch))
+              (for relative relatives (push! (mut new-relatives) relative))
+              (let [result
+                      (if (code/append! (mut expanded) output)
+                          (relax-copy! (mut expanded)
+                                       (mut new-labels)
+                                       (mut new-branches)
+                                       (mut new-relatives))
+                          (Err [i32 (slice u8)]
+                               "invalid code metadata during branch relaxation"))]
+                (match result
+                  (Err [_]
+                       (code/release! (mut expanded))
+                       (free! (mut new-labels))
+                       (free! (mut new-branches))
+                       (free! (mut new-relatives)))
+                  (Ok [_]
+                      (code/release! (mut output))
+                      (free! (mut labels))
+                      (free! (mut branches))
+                      (free! (mut relatives))
+                      (store! (mut output) expanded)
+                      (store! (mut labels) new-labels)
+                      (store! (mut branches) new-branches)
+                      (store! (mut relatives) new-relatives)))
+                result))))))
+
+;;; Compute a monotone layout to a fixed point, then copy bytes only once.
+;;; Branch records may be unordered. Prefix entries map original word boundaries
+;;; to their growth; no allocation position or graph reference is renumbered.
+(defn relax-copy! [(output (mut code/Buffer))
+                   (labels (mut (ArrayList i64)))
+                   (branches (mut (ArrayList Branch)))
+                   (relatives (mut (ArrayList Relative)))]
+  (-> (Result i32 (slice u8)))
+  (let [allocator (.alc (.text output))
+        size (len (.text output))
+        (mut branch-at) (ArrayList::new [i64] allocator)
+        (mut prefix) (ArrayList::new [i64] allocator)
+        (mut expanded) (ArrayList::new [bool] allocator)
+        (mut error) ""
+        (mut count) (: 0 i32)
+        (mut changed) true]
+    (for [i 0 (+ (/ size 4) 1)]
+      (push! (mut branch-at) -1)
+      (push! (mut prefix) 0))
+    (for [index 0 (len branches)]
+      (push! (mut expanded) false)
+      (let [slot (/ (.offset (get branches index)) 4)]
+        (when (>= (get branch-at slot) 0)
+          (set! error "overlapping branch layout records"))
+        (set! (mut branch-at) slot index)))
+    (for range (.text-data output)
+      (for [word
+            (/ (.offset range) 4)
+            (/ (+ (.offset range) (.length range) 3) 4)]
+        (when (>= (get branch-at word) 0)
+          (set! error "branch overlaps text data"))))
+    (for reference (.references output)
+      (for [word (/ (.offset reference) 4) (+ (/ (.offset reference) 4) 2)]
+        (when (and (< word (len branch-at)) (>= (get branch-at word) 0))
+          (set! error "branch overlaps a constant reference"))))
+    ; Validate table bounds before using any table offset as a prefix index.
+    (match (apply-relative! (mut (.text output)) labels relatives)
+      (Err [message] (set! error message))
+      (Ok [_]
+          (for relative relatives
+            (when (>= (get branch-at (/ (.offset relative) 4)) 0)
+              (set! error "branch overlaps a relative table word")))))
+    (while (and changed (= error ""))
+      (set! changed false)
+      (let [(mut growth) (: 0 i64)]
+        (for [word 1 (len prefix)]
+          (let [index (get branch-at (- word 1))]
+            (when (and (>= index 0) (get expanded index))
+              (set! growth (+ growth 4))))
+          (set! (mut prefix) word growth)))
+      (for [index 0 (len branches)]
+        (let [branch (get branches index)
+              old-target (get labels (cast i64 (.label branch)))
+              offset (+ (.offset branch) (get prefix (/ (.offset branch) 4)))
+              target (+ old-target (get prefix (/ old-target 4)))
+              delta (- target offset)]
+          (when (and (not (get expanded index))
+                     (>= (.condition branch) 0)
+                     (or (< delta -1048576) (> delta 1048572)))
+            (if (> (.condition branch) 13)
+                (set! error "cannot relax an unconditional condition code")
+                (do
+                  (set! (mut expanded) index true)
+                  (set! count (+ count 1))
+                  (set! changed true)))))))
+    (when (= error "")
+      (let [(mut text) (ArrayList::new [u8] allocator)]
+        (for [word 0 (/ size 4)]
+          (let [index (get branch-at word)]
+            (if (and (>= index 0) (get expanded index))
+                (do
+                  (match (e/conditional-branch (^ (.condition (get branches
+                                                                   index))
+                                                  1)
+                                               8)
+                    (Err [message] (set! error message))
+                    (Ok [instruction] (bytes/append32! (mut text) instruction)))
+                  (bytes/append32! (mut text) 0))
+                (for [byte (* word 4) (+ (* word 4) 4)]
+                  (push! (mut text) (get (.text output) byte))))))
+        (for [byte (* (/ size 4) 4) size]
+          (push! (mut text) (get (.text output) byte)))
+        (free! (mut (.text output)))
+        (store! (mut (.text output)) text))
+      (for [i 0 (len labels)]
+        (let [offset (get labels i)]
+          (when (>= offset 0)
+            (set! (mut labels) i (+ offset (get prefix (/ offset 4)))))))
+      (for [i 0 (len branches)]
+        (let [branch (elem (mut branches) i)
+              offset (.offset branch)]
+          (set! (.offset branch)
+                (+ offset (get prefix (/ offset 4)) (if (get expanded i) 4 0)))
+          (when (get expanded i) (set! (.condition branch) -1))))
+      (for [i 0 (len (.references output))]
+        (let [reference (elem (mut (.references output)) i)
+              offset (.offset reference)]
+          (set! (.offset reference) (+ offset (get prefix (/ offset 4))))))
+      (for [i 0 (len (.text-data output))]
+        (let [range (elem (mut (.text-data output)) i)
+              offset (.offset range)]
+          (set! (.offset range) (+ offset (get prefix (/ offset 4))))))
+      (for [i 0 (len relatives)]
+        (let [relative (elem (mut relatives) i)
+              offset (.offset relative)
+              base (.base relative)]
+          (set! (.offset relative) (+ offset (get prefix (/ offset 4))))
+          (set! (.base relative) (+ base (get prefix (/ base 4))))))
+      (match (apply! (mut (.text output)) labels branches)
+        (Err [message] (set! error message))
+        (Ok [_] 0))
+      (when (= error "")
+        (match (apply-relative! (mut (.text output)) labels relatives)
+          (Err [message] (set! error message))
+          (Ok [_] 0))))
+    (free! (mut expanded))
+    (free! (mut prefix))
+    (free! (mut branch-at))
+    (if (= error "") (Ok count) (Err error))))

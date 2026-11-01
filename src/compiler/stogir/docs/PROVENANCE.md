@@ -92,3 +92,13 @@ Unlike upstream's broader all-fusible-users support, the initial rule requires
 one scheduled use, the same scheduled block, 64-bit integer operands and no
 explicit root. Other values retain ordinary materialization. This does not
 claim full matcher, coalescing or register-reuse parity.
+
+### Fallthrough and branch layout
+
+Conditional inversion/fallthrough and END/LOOP_END jump omission follow pinned
+`ir_aarch64.dasc:ir_emit_jcc`, `ir_emit_jz` and the `ir_emit_code` END cases.
+Deferred edge-copy buffers and transactional conditional-branch relaxation are
+independent Coil implementations. The far-case prefix-layout computation
+preserves the existing relocation/image boundary and rebases all offset-bearing
+metadata. It does not import DynASM code or establish full veneer parity.
+The pinned bottom-up/top-down block scheduling algorithms remain unported.

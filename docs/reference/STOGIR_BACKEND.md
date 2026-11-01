@@ -12,7 +12,7 @@ and module transport lets the engines consume the same native lowering while
 remaining distinct code generators. LLVM retains its existing lowering path.
 
 The library is a separately declared package, vendored under
-`src/compiler/stogir` at revision `d5e69b1`. Its [README](../../src/compiler/stogir/README.md),
+`src/compiler/stogir` at revision `f29043e`. Its [README](../../src/compiler/stogir/README.md),
 [LICENSE](../../src/compiler/stogir/LICENSE), [NOTICE](../../src/compiler/stogir/NOTICE)
 and provenance preserve credit to coil-stogir and Dmitry Stogov's IR. No per-file
 license headers are added by the integration.
@@ -93,3 +93,11 @@ The original benchmark samples remain the fixed baseline.
 The [persistent matching checkpoint](../benchmarks/STOGIR_MATCHING.md) records
 the next source snapshot and unchanged workload. Its ≥5× codegen target is met
 in the measured medians; the runtime-within-10% target remains unmet.
+
+AArch64 emission now omits END/LOOP_END jumps to the next scheduled block and
+inverts conditional predicates for true fallthrough, following pinned target
+rules. Nonempty edge copies remain path-specific in deferred stubs. Direct
+conditional branches beyond their reach relax transactionally with all labels,
+relocations and table offsets rebased together. Allocation positions stay fixed.
+Physical bottom-up/top-down block-chain scheduling remains unported; this
+emitter change does not complete that separate pass.
