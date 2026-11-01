@@ -13,6 +13,7 @@
 #   - never `grep -q` at the end of a pipeline: capture into a variable, then match;
 #   - before concluding something is absent, prove the output it is absent from exists.
 set -uo pipefail
+. "$(dirname "$0")/../../compiler/clear-project-config.sh"
 cd "$(dirname "$0")/../../.."
 ROOT=$PWD
 
@@ -85,6 +86,13 @@ printf '(defn main [] (-> i64) (bad-fn 3))\n' > "$T/broken.coil"
 
 # ---------------------------------------------------------------------------
 section_run() {
+  # A program is not a compiler: it gets the environment coil was given, without the
+  # project configuration coil applied to itself.
+  mkdir -p "$T/run-env/src"
+  printf '[package]\nname = "runenv"\nentry = "src/main.coil"\n' > "$T/run-env/Coil.toml"
+  printf '(module runenv.main)\n(import "coil.os" :as os)\n(defn main [] (-> i64) (if (= (cast i64 (os/getenv c"COIL_PACKAGE_NAME")) 0) 0 3))\n' > "$T/run-env/src/main.coil"
+  expect_rc 0 "run does not hand a project's configuration to its program" bash -c 'cd "$1" && "$2" run' _ "$T/run-env" "$COIL"
+  expect_rc 3 "run hands its program what the user set" env COIL_PACKAGE_NAME=mine "$COIL" run "$T/run-env/src/main.coil"
   expect_rc 7 "run passes the program's exit status through" "$COIL" run "$T/seven.coil"
   expect_rc_out 134 'signal 6 \(SIGABRT\)' "run reports a signal death as 128+signo and names it" \
     "$COIL" run "$T/abort.coil"

@@ -17,6 +17,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts" / "compiler"))
 import toolchain_stamp  # noqa: E402
+from project_config import PROJECT_VARIABLES, clear as clear_project_config  # noqa: E402
+
+clear_project_config()
 sys.path.insert(0, str(ROOT / "scripts" / "tests"))
 import cleanup_on_signal  # noqa: E402
 
@@ -304,19 +307,6 @@ def install(args: argparse.Namespace) -> None:
         warm_lint_profile(destination, libdir)
     report_installed(destination)
 
-
-# The project configuration a `coil` command publishes to the commands it runs
-# (driver.coil's shipped-unit-isolated-vars). What install builds belongs to the
-# toolchain, not to whatever invoked the install -- a rebootstrap exports
-# COIL_NAMESPACE_ROOTS for the compiler's own build, which would otherwise have
-# the coil.jit unit read the compiler from the checkout instead of the installed
-# SDK, and depend on that checkout ever after.
-PROJECT_VARIABLES = (
-    "COIL_NAMESPACE_ROOTS", "COIL_NAMESPACE_EXCLUDES", "COIL_READERS", "COIL_MODULE_MAP",
-    "COIL_MANIFEST_PROVIDERS", "COIL_MANIFEST_PATH", "COIL_PACKAGE_NAME", "COIL_UNITS",
-    "COIL_WORKSPACE_PACKAGES", "COIL_STDLIB", "COIL_STDLIB_PROFILE", "COIL_PRELUDE",
-    "COIL_CORE_PROVIDERS",
-)
 
 
 def toolchain_build(compiler: Path, *args: str) -> subprocess.CompletedProcess:

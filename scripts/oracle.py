@@ -45,6 +45,11 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "compiler"))
+import project_config  # noqa: E402
+
+project_config.clear()
+
 ROOT = Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "tests" / "corpus"
 DIAG = ROOT / "tests" / "diag"

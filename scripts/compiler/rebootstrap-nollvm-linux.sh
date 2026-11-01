@@ -24,6 +24,7 @@
 # Usage: scripts/compiler/rebootstrap-nollvm-linux.sh [install-dest]  (default: build/bin/coil-nollvm)
 #        STAGE0=/path/to/coil scripts/compiler/rebootstrap-nollvm-linux.sh
 set -uo pipefail
+. "$(dirname "$0")/./clear-project-config.sh"
 cd "$(dirname "$0")/../.."
 # Stage compilers land in /tmp; give /tmp the toolchain library they resolve against.
 . scripts/compiler/stage-lib.sh

@@ -23,6 +23,7 @@
 # selected by `scripts/dev.py install`. Set COIL_SKIP_INSTALL=1 to keep the verified
 # artifact local to the checkout and leave the user-level toolchain untouched.
 set -uo pipefail
+. "$(dirname "$0")/./clear-project-config.sh"
 cd "$(dirname "$0")/../.."
 # The library sources this build starts from; recorded beside the result so an
 # install can never pair the compiler with different ones.

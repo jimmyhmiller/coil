@@ -10,6 +10,7 @@
 # <prefix>/lib/coil), with the coil.jit unit warmed by `dev.py install`; the
 # comprehensive harness installs one and passes it. Nothing here installs again.
 set -uo pipefail
+. "$(dirname "$0")/../compiler/clear-project-config.sh"
 cd "$(dirname "$0")/../.."
 SECTION=${1:?usage: installed-toolchain.sh layout|allns|jit-sdk|repl}
 COIL=${COIL:?COIL must name an installed compiler}

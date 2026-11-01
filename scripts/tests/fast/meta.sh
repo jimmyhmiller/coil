@@ -24,6 +24,7 @@
 #
 # Usage: scripts/tests/fast/meta.sh        (compiler from $COIL, else `coil`)
 set -uo pipefail
+. "$(dirname "$0")/../../compiler/clear-project-config.sh"
 cd "$(dirname "$0")/../../.."
 COIL=${COIL:-$(command -v coil)}
 [ -x "$COIL" ] || { echo "FAIL meta: no compiler (set COIL)"; exit 2; }

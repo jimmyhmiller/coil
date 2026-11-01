@@ -18,6 +18,7 @@
 # The compiler is $COIL (default: `coil` on PATH). Exit status 0 only if every
 # check passes.
 set -uo pipefail
+. "$(dirname "$0")/../../compiler/clear-project-config.sh"
 
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 COIL=${COIL:-coil}
