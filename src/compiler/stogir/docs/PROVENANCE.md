@@ -102,3 +102,27 @@ independent Coil implementations. The far-case prefix-layout computation
 preserves the existing relocation/image boundary and rebases all offset-bearing
 metadata. It does not import DynASM code or establish full veneer parity.
 The pinned bottom-up/top-down block scheduling algorithms remain unported.
+
+### Post-allocation block ordering
+
+`stogir.block-layout` ports/adapts pinned `ir_cfg.c:ir_schedule_blocks`,
+`ir_schedule_blocks_bottom_up` and `ir_schedule_blocks_top_down`: static edge
+frequencies, deterministic tie-breaking, early chain joins, loop rotation,
+loop alignment and final chain grouping. The ≤256/reducible policy and small
+function bypass follow upstream. Optional empty-entry merging remains disabled.
+Dense RPO keys are CFG metadata over the original references, not another
+instruction IR. Sparse CFG adjacency is reused through a packed edge-index API.
+
+Post-allocation empty-block checks follow `ir_emit.c:ir_match` start/END-only
+candidates and the `ir_ra.c` rule that real moves keep a block nonempty. An
+all-empty-cycle anchor protects unsimplified CFGs while SCCP remains absent.
+Loop alignment uses pinned AArch64's eight-byte requirement, carried through
+code buffers and shared images; conditional relaxation preserves it. The
+alignment-aware prefix machinery is independently implemented in Coil.
+
+A temporary native oracle linked the unmodified pinned C library and received
+identical post-allocation CFG facts. All 59 checked cases match its emitted
+block order and loop-alignment choices. This verifies this scheduling core;
+it does not establish parity for the still-incomplete surrounding optimizer,
+loop analysis, allocator or optional entry modes. No C wrapper is linked into
+or shipped with the Coil library/backend.

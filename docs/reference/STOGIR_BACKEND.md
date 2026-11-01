@@ -12,7 +12,7 @@ and module transport lets the engines consume the same native lowering while
 remaining distinct code generators. LLVM retains its existing lowering path.
 
 The library is a separately declared package, vendored under
-`src/compiler/stogir` at revision `f29043e`. Its [README](../../src/compiler/stogir/README.md),
+`src/compiler/stogir` at revision `8c0cab3`. Its [README](../../src/compiler/stogir/README.md),
 [LICENSE](../../src/compiler/stogir/LICENSE), [NOTICE](../../src/compiler/stogir/NOTICE)
 and provenance preserve credit to coil-stogir and Dmitry Stogov's IR. No per-file
 license headers are added by the integration.
@@ -72,7 +72,9 @@ relocatable-image boundary used by JIT and AOT. It does not yet implement every
 stage above. SCCP and mem2ssa are absent. Persistent AArch64 matching now precedes liveness and carries selected scalar
 rules and conservative single-use, same-block 64-bit compare/branch fusion.
 Its def/use metadata retains the original graph references. Full target fusion
-and reuse coverage remains incomplete. Coalescing and upstream-equivalent block scheduling are incomplete.
+and reuse coverage remains incomplete. Coalescing remains incomplete. The post-allocation block scheduling core now
+follows upstream bottom-up/top-down selection; optional empty-entry merging and
+surrounding CFG/loop metadata parity remain open.
 The split-interval allocator also needs a detailed invariant audit against
 `ir_ra.c`; its current implementation must not be represented as established
 upstream parity.
@@ -99,10 +101,30 @@ inverts conditional predicates for true fallthrough, following pinned target
 rules. Nonempty edge copies remain path-specific in deferred stubs. Direct
 conditional branches beyond their reach relax transactionally with all labels,
 relocations and table offsets rebased together. Allocation positions stay fixed.
-Physical bottom-up/top-down block-chain scheduling remains unported; this
-emitter change does not complete that separate pass.
+The subsequent post-allocation layout checkpoint now supplies the physical
+block-chain scheduling core; the earlier fallthrough checkpoint did not include it.
 
 The [fallthrough checkpoint](../benchmarks/STOGIR_FALLTHROUGH.md) preserves the
 next measured snapshot: stogir runtime 2959.625 ms, TPDE 3987.739 ms and LLVM O3
 308.410 ms, with stogir codegen 5.22× faster than LLVM. The combined runtime and
 codegen goal remains unachieved. Earlier reports and original baseline are unchanged.
+
+
+## Post-allocation block layout
+
+The standalone pass ports pinned `ir_cfg.c` bottom-up Pettis-Hansen for small
+reducible functions and top-down positioning for >256 blocks or irreducibility.
+It preserves static frequency estimation, tie-breaking, early joins, loop
+rotation and loop alignment. Shared post-allocation CFG facts produce identical
+orders/alignment decisions in 59 checked comparisons against the unmodified
+pinned C scheduler. This proves the scheduling core on those facts; surrounding
+optimizer/loop-analysis/allocator parity is still unproven. Optional empty-entry
+merging remains disabled.
+
+Allocation subpositions stay fixed. Physical emission follows original schedule
+indices and aliases proven-empty start/END blocks. Actual edge/split moves keep
+blocks nonempty, and all-empty cycles retain an anchor. Eight-byte loop alignment
+is preserved by conditional relaxation and carried through the code-buffer/image
+alignment fields into JIT, AOT and module merging. Each PAGE21, PAGEOFF12 or
+BRANCH26 relocation describes one instruction, so adjacent branches/calls remain
+valid while true overlaps are rejected.
