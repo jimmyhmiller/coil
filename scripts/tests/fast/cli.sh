@@ -1290,10 +1290,26 @@ EOF
       else
         bad "native exported aggregate C ABI ($backend)" "$(cat "$T/native-$backend.log")"
       fi
+      expect_rc 42 "IR timing preserves native program behavior ($backend)" \
+        env COIL_CODEGEN_TIMINGS=1 "$COIL" run "$ROOT/tests/cli/native-backends.coil" --backend "$backend" -O3 --no-debug
+      if env COIL_TPDE_SERIAL=1 COIL_CODEGEN_TIMINGS=0 "$COIL" emit-obj "$T/lib.coil" --backend "$backend" --no-debug -o "$T/serial-$backend.o" > "$T/serial-$backend.log" 2>&1 \
+         && env COIL_TPDE_SERIAL=1 COIL_CODEGEN_TIMINGS=1 "$COIL" emit-obj "$T/lib.coil" --backend "$backend" --no-debug -o "$T/measured-$backend.o" > "$T/measured-$backend.out" 2> "$T/measured-$backend.err" \
+         && cmp -s "$T/serial-$backend.o" "$T/measured-$backend.o"; then
+        local timing_output
+        timing_output=$(cat "$T/measured-$backend.err")
+        case "$timing_output" in
+          *"coil-codegen"*"$backend"*"ir-codegen"*) ok "IR timing produces identical serial object bytes ($backend)" ;;
+          *) bad "IR timing produces identical serial object bytes ($backend)" "missing timing records: $timing_output" ;;
+        esac
+      else
+        bad "IR timing produces identical serial object bytes ($backend)" "emit-obj failed or object bytes differ"
+      fi
     done
     expect_rc 0 "native Mach-O data-in-code serialization and JIT loader" \
       "$COIL" run "$ROOT/src/compiler/selftest/jit_selftest.coil" --backend llvm
   fi
+  expect_rc_out 1 'could not write object file' "LLVM measured emission reports an unwritable output" \
+    env COIL_CODEGEN_TIMINGS=1 "$COIL" emit-obj "$T/lib.coil" --backend llvm --no-debug -o "$T/no-such-parent/output.o"
   if "$COIL" build "$T/lib.coil" --lib -o "$T/libobj.a" >/dev/null 2>&1 \
      && cc "$T/driver.c" "$T/libobj.a" -o "$T/driver-lib" 2>/dev/null; then
     "$T/driver-lib"; rc=$?

@@ -12,7 +12,7 @@ and module transport lets the engines consume the same native lowering while
 remaining distinct code generators. LLVM retains its existing lowering path.
 
 The library is a separately declared package, vendored under
-`src/compiler/stogir` at revision `3a62f49`. Its [README](../../src/compiler/stogir/README.md),
+`src/compiler/stogir` at revision `dc90b58`. Its [README](../../src/compiler/stogir/README.md),
 [LICENSE](../../src/compiler/stogir/LICENSE), [NOTICE](../../src/compiler/stogir/NOTICE)
 and provenance preserve credit to coil-stogir and Dmitry Stogov's IR. No per-file
 license headers are added by the integration.

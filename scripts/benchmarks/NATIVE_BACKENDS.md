@@ -58,3 +58,36 @@ LLVM at `-O0`; the other three retain `-O3`. The harness compares all outputs
 against the LLVM `-O3` warmup. LLVM `-O0` uses `llvm-o0` and `llvm-o0.o` in the
 output directory. Keep this targeted optimization workload distinct from a
 representative application benchmark suite.
+
+## IR-to-machine-code timing
+
+Add `--codegen-timings` for the performance acceptance metric. The compiler reports
+high-resolution monotonic durations in nanoseconds; actual clock resolution is
+platform dependent. The harness records their sum as `ir-codegen` and preserves
+the individual records as CSV comments. Missing, malformed or unexpected
+compiler diagnostics fail the run.
+
+The inputs at this boundary are the constructed library graph for stogir,
+finished native CIR for TPDE, and lowered LLVM IR for LLVM. IR construction,
+frontend work and target-context setup are excluded. Validation performed by the
+code generator, optimization, selection/allocation, code emission, module merging
+and relocatable-object serialization are included. LLVM uses its memory-buffer
+emitter while measuring, then writes the temporary output outside the timer;
+the existing atomic rename/error handling is retained. Native output writes are
+also excluded. The native backend runs serially in this mode so summing
+per-function durations gives a serial backend cost, without overlapping jobs.
+These are measured operations of each implementation, not identical IR formats
+or identical optimizer coverage.
+
+The separate `compile` row remains whole-command wall time. With diagnostics
+and serial native generation enabled, it is not directly comparable to the old
+unprofiled whole-command baseline. Runtime still uses the same source and inputs;
+timing mode is unset before linking and running the executable. Caller project
+settings and backend profiling/repeat flags are cleared by the harness.
+
+The compiler's original and measured emitters produce byte-identical objects
+when compared under the same serial native configuration. The CLI objects gate
+checks this and executes the combined native fixture with measurement enabled.
+The goal is 10× faster IR-to-machine-code generation than LLVM O3 with runtime
+within 10%; whole-command compilation and baseline selection fixes alone do not
+establish that goal.
