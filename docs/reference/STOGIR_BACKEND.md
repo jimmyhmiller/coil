@@ -101,3 +101,8 @@ conditional branches beyond their reach relax transactionally with all labels,
 relocations and table offsets rebased together. Allocation positions stay fixed.
 Physical bottom-up/top-down block-chain scheduling remains unported; this
 emitter change does not complete that separate pass.
+
+The [fallthrough checkpoint](../benchmarks/STOGIR_FALLTHROUGH.md) preserves the
+next measured snapshot: stogir runtime 2959.625 ms, TPDE 3987.739 ms and LLVM O3
+308.410 ms, with stogir codegen 5.22× faster than LLVM. The combined runtime and
+codegen goal remains unachieved. Earlier reports and original baseline are unchanged.
