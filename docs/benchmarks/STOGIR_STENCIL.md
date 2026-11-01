@@ -44,3 +44,32 @@ and object emission 8 ms; the native whole-object phases report stogir 7 ms and
 TPDE 1 ms. These have different boundaries (native includes CIR lowering and
 module work), millisecond rounding and no repeated-sample summary, so they are
 **not** a validated IR-to-machine-code comparison or proof of the 10× target.
+
+## Why stogir loses to TPDE here
+
+The generated scalar hot path executes approximately 57 instructions per cell
+for stogir versus 29 for TPDE (static count along the taken inner-loop path,
+not a hardware instruction-counter measurement). Neither scalar loop uses the
+LLVM loop's automatic SIMD. The stogir-specific loss is visible before SIMD:
+
+- A u32 zero-extension frequently becomes `mov #32; lsl; mov #32; lsr`, while
+  TPDE emits one `ubfx`. Redundant `ubfx` after zero-extending `ldr wN` also remains.
+- Array indexing uses separately materialized constant 4, multiply, add and
+  address bitcast instructions; TPDE selects `add ..., index, lsl #2`.
+- A loop comparison is materialized as a Boolean, extended, compared with zero,
+  materialized again and then branched on. TPDE uses compare and conditional branch.
+- No-op moves and branches survive in the emitted block layout.
+
+The adapter routes much arithmetic through `builder.emit!`, which validates and
+appends graph nodes rather than calling the operation-specific folding builders.
+Some other construction paths, such as conversions, do use checked/folding APIs.
+The current graph preparation verifies, places and schedules nodes; this is not
+the complete upstream IR optimizer. Consequently these results measure this
+incomplete Coil port/integration, not the performance of Dmitry Stogov's original
+optimizing library. “Optimizing” does not yet describe all operations on this path.
+
+These are confirmed code-quality defects, but instruction counts alone do not
+assign an exact share of the 1.81× stogir/TPDE runtime difference to each defect.
+They provide concrete fixes to test before attributing the difference to register
+allocation or adding expensive optimization passes. Automatic vectorization is
+separately required to address this workload's much larger gap to LLVM O3.
