@@ -12,7 +12,7 @@ and module transport lets the engines consume the same native lowering while
 remaining distinct code generators. LLVM retains its existing lowering path.
 
 The library is a separately declared package, vendored under
-`src/compiler/stogir` at revision `ca8d754`. Its [README](../../src/compiler/stogir/README.md),
+`src/compiler/stogir` at revision `3a62f49`. Its [README](../../src/compiler/stogir/README.md),
 [LICENSE](../../src/compiler/stogir/LICENSE), [NOTICE](../../src/compiler/stogir/NOTICE)
 and provenance preserve credit to coil-stogir and Dmitry Stogov's IR. No per-file
 license headers are added by the integration.
@@ -53,3 +53,38 @@ platform link and executable run, rotate backend order and compare full output.
 The [initial comparison](../benchmarks/STOGIR_INITIAL.md) records five measured
 samples and full input hashes. Public stateful JIT selection and DWARF remain
 unfinished.
+
+## Architecture fidelity audit
+
+The reference is pinned upstream `ir.h:ir_jit_compile` and
+`ir_main.c:ir_compile_func`. Its optimized pipeline is:
+
+1. Construction folding/CSE and def-use lists.
+2. Optional mem2ssa with CFG/dominators, followed by CFG invalidation.
+3. SCCP at optimization levels above one.
+4. CFG/dominators/loops, global code motion and scheduling.
+5. Target matching, including fusion and register-reuse rules.
+6. Virtual-register assignment, live ranges, coalescing and allocation.
+7. Block scheduling and target emission.
+
+The Coil port preserves the compact Sea-of-Nodes graph and the independent
+relocatable-image boundary used by JIT and AOT. It does not yet implement every
+stage above. SCCP and mem2ssa are absent. Target validation/selection exists, but
+there is no complete persistent matched-rule/fusion plan consumed before
+liveness. Coalescing and upstream-equivalent block scheduling are incomplete.
+The split-interval allocator also needs a detailed invariant audit against
+`ir_ra.c`; its current implementation must not be represented as established
+upstream parity.
+
+The current local AArch64 changes correspond to upstream `IR_SHIFT_CONST` and
+`IR_MUL_PWR2` rules in `ir_aarch64.dasc`. Upstream also supplies copy/reuse flags
+that must be carried through matching and allocation. Efficient encodings alone
+cannot replace these missing stages. The next optimizer work belongs in the
+independent library, with the adapter limited to CIR-to-graph translation and
+construction APIs. No benchmark-specific loop rewrite or alternate backend is
+an acceptable substitute.
+
+The pinned pipeline does not establish an automatic loop-vectorization pass.
+The stencil is useful for exposing the LLVM O3 gap, but closing it must not be
+claimed as an automatic consequence of completing upstream's scalar pipeline.
+The original benchmark samples remain the fixed baseline.
