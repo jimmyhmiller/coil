@@ -15,6 +15,11 @@ Use an existing output directory dedicated to the run: the harness overwrites
 benchmarks concurrently. Preserve the compiler's matching SDK/stdlib and record
 its `.toolchain` sidecar and checkout revision with the results.
 
+The harness clears Coil project configuration inherited from its caller before
+starting child compilers (namespace roots, manifest, package, units, prelude,
+stdlib settings and metaprogram JIT override). Each source therefore uses its own
+project discovery.
+
 Each round compiles the identical source with `emit-obj -O3 --no-debug`, links it
 with the system `cc -lm`, then executes it with the same iteration count and seed.
 Order rotates LLVM/TPDE/stogir between rounds. Sample zero is warmup; exclude it
