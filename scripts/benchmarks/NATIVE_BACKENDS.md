@@ -38,3 +38,18 @@ including pinned calls, i128 and proper tail calls. Run its full corpus manually
 ```sh
 python3 scripts/oracle.py corpus stogir --all --compiler build/bin/coil-candidate
 ```
+
+## Optimization-sensitive stencil
+
+`native-stencil.coil` is a periodic three-point stencil over 16,384 u32 cells,
+using two buffers. Passes depend on the previous pass; cells within a pass are
+independent. Unsigned arithmetic wraps. A position-weighted checksum makes the
+final contents observable. This isolates an ordinary loop-vectorization
+opportunity that the dependent recurrences in `native-kernels.coil` lack.
+
+Use `--source "$PWD/scripts/benchmarks/native-stencil.coil" --iterations 200000`
+with the same harness. Add `--llvm-o0` to include a fourth executable compiled by
+LLVM at `-O0`; the other three retain `-O3`. The harness compares all outputs
+against the LLVM `-O3` warmup. LLVM `-O0` uses `llvm-o0` and `llvm-o0.o` in the
+output directory. Keep this targeted optimization workload distinct from a
+representative application benchmark suite.
