@@ -187,15 +187,6 @@ Use this format:
   it, and the build exports
   `COIL_STRICT_BUNDLE=1` so the in-repo fallback is a hard error instead of a silent
   success.
-- **Renaming a stdlib API?** Add rows to `API-RENAMES` in
-  `src/compiler/migrate/api_renames.coil`, one per removed public name (its header gives
-  the row format). That table is all there is to change: `coil lint --fix` then
-  rewrites code that uses the old names (the preflight in
-  `src/compiler/migrate/api_migration.coil`), `coil build` in such a project points at it,
-  and the resolver's errors name the replacement. Delete any `coil.lint.modernize`
-  rule for a name you remove. Changing a library module's `:reexport` import
-  means rerunning `python3 scripts/compiler/gen-stdlib-manifest.py`, which
-  regenerates the table's `API-REEXPORTS` from the library's imports.
 - `src/tools/*.coil` — commands that are programs of their own. `coil NAME` runs the
   `coil-NAME` beside the running compiler, then on `PATH`, the way `git NAME` does; dev.py
   builds them beside every compiler it builds. They import only the standard library, so
@@ -215,7 +206,7 @@ Use this format:
   (compiled metaprograms), `backend/` (LLVM, arm64, x64, wasm, tpde codegen),
   `object/` (instruction encoders, Mach-O/ELF/DWARF/wasm writers), `jit/`,
   `retained/` (state kept between compiler revisions), `artifact/` (units and
-  artifact identity), `migrate/` (API and syntax migrations), `cli/` (`cimport`,
+  artifact identity), `cli/` (`cimport`,
   `update`, the generated guide), `support/` and `selftest/`.
   Module names do not follow the folders: a module is found by its declared
   `(module coil.compiler.NAME)`, so moving a file changes no import.

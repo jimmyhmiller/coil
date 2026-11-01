@@ -12,12 +12,7 @@ coil.socket/sync/region/signals/cancellation went unreachable.
 So the tables are derived here from the directory itself, and a gate runs this
 with --check.
 
-The same goes for one fact the migration of removed standard-library names needs:
-which library modules re-export another's names (`(import "FROM" … :reexport)`),
-and which names they pass on. `coil lint --fix` works on read syntax, before any
-module loads, so it cannot ask the loader; the API-REEXPORTS table in
-src/compiler/migrate/api_renames.coil is generated here from the modules' own imports
-instead of being a hand-kept copy of their `:use` lists. Only the manifest is generated; the library TEXT is not in the
+Only the manifest is generated; the library TEXT is not in the
 compiler at all -- it is installed as files beside the binary and read from
 there (loader.coil), which is what keeps compiler and library one version.
 
@@ -44,12 +39,9 @@ STDLIB = ROOT / "src" / "stdlib"
 SDK = ROOT / "src" / "compiler"
 PRELUDE = ROOT / "src" / "compiler" / "prelude.coil"
 TARGET = ROOT / "src" / "compiler" / "frontend" / "stdlib_manifest.coil"
-RENAMES = ROOT / "src" / "compiler" / "migrate" / "api_renames.coil"
 
 BEGIN = ";; BEGIN GENERATED -- regenerate with scripts/compiler/gen-stdlib-manifest.py"
 END = ";; END GENERATED"
-REEXPORTS_BEGIN = ";; BEGIN GENERATED API-REEXPORTS -- regenerate with scripts/compiler/gen-stdlib-manifest.py"
-REEXPORTS_END = ";; END GENERATED API-REEXPORTS"
 
 # Namespaces that are part of the library and importable but deliberately NOT
 # advertised by `coil namespaces`: implementation detail modules of a public
@@ -68,6 +60,8 @@ INTERNAL_NAMESPACES = {
     "coil.project",
     "coil.source.cli",
     "coil.source.diagnostic",
+    "coil.source.edit",
+    "coil.text",
     "coil.http.parser.generated",
     "coil.meta-runtime",
     # coil.prop's engine room. Importable, but `coil.prop` re-exports everything a
@@ -286,80 +280,6 @@ def read_forms(text: str, where: str) -> list:
     return forms
 
 
-def collect_reexports(entries: list[tuple[str, str]]) -> list[tuple[str, str, list[str]]]:
-    """(module, from, names) for every `:reexport` import in the library.
-
-    `names` is the import's `:use` list, or empty for `:use *` or no `:use`, both
-    of which pass on every name of FROM. A module's own export list narrows what
-    it re-exports, so a `:use` list is cut down to the names the export list
-    gives. API-REEXPORTS cannot say `:exclude` or `:rename`, nor what an export
-    list leaves of a whole module, so a library module that writes either is
-    refused here rather than described wrongly.
-    """
-    out = []
-    for ns, relative in entries:
-        where = f"src/stdlib/{relative}"
-        forms = read_forms((STDLIB / relative).read_text(), where)
-        exported = any(isinstance(f, list) and f and f[0] == "export" for f in forms)
-        export_list = {x for f in forms if isinstance(f, list) and f and f[0] == "export"
-                       for x in f[1:] if isinstance(x, str)}
-        for f in forms:
-            if not (isinstance(f, list) and len(f) >= 2 and f[0] == "import" and ":reexport" in f):
-                continue
-            target = f[1]
-            if not (isinstance(target, tuple) and target[0] == "str"):
-                sys.exit(f"error: {where}: an import names its module with a string")
-            names: list[str] = []
-            for key in (":exclude", ":rename"):
-                if key in f:
-                    sys.exit(
-                        f"error: {where}: the re-export of {target[1]} has {key}, which API-REEXPORTS\n"
-                        "  (src/compiler/migrate/api_renames.coil) cannot describe; teach it first"
-                    )
-            if ":use" in f:
-                spec = f[f.index(":use") + 1]
-                if isinstance(spec, list):
-                    names = [x for x in spec if isinstance(x, str)]
-                elif spec != "*":
-                    sys.exit(f"error: {where}: unreadable :use of {target[1]}")
-            if exported:
-                if not names:
-                    sys.exit(
-                        f"error: {where}: {ns} re-exports all of {target[1]} and has an export list,\n"
-                        "  which narrows what it re-exports; API-REEXPORTS (src/compiler/migrate/api_renames.coil)\n"
-                        "  cannot describe that; teach it first"
-                    )
-                names = [x for x in names if x in export_list]
-                if not names:
-                    continue
-            out.append((ns, target[1], names))
-    return out
-
-
-def render_reexports(rows: list[tuple[str, str, list[str]]]) -> str:
-    if not rows:
-        sys.exit("error: no library module re-exports another; API-REEXPORTS would be empty")
-    lines = [REEXPORTS_BEGIN, "(def API-REEXPORTS"]
-    for k, (module, source, names) in enumerate(rows):
-        head = ("  [" if k == 0 else "   ") + f'(ApiReexport :module "{module}" :from "{source}"'
-        if not names:
-            lines.append(head + " :names [])")
-            continue
-        lines.append(head)
-        line = "                :names ["
-        for j, name in enumerate(names):
-            word = f'"{name}"'
-            if j > 0 and len(line) + 1 + len(word) > 94:
-                lines.append(line)
-                line = "                        " + word
-            else:
-                line = line + ("" if j == 0 else " ") + word
-        lines.append(line + "])")
-    lines[-1] = lines[-1] + "])"
-    lines.append(REEXPORTS_END)
-    return "\n".join(lines)
-
-
 def splice(current: str, generated: str, target: Path = TARGET, begin: str = BEGIN, end: str = END) -> str:
     start = current.find(begin)
     stop = current.find(end)
@@ -448,17 +368,12 @@ def main() -> int:
     entries = collect()
     current = TARGET.read_text()
     updated = splice(current, render(entries, collect_sdk()))
-    renames_current = RENAMES.read_text()
-    renames_updated = splice(renames_current, render_reexports(collect_reexports(entries)),
-                             RENAMES, REEXPORTS_BEGIN, REEXPORTS_END)
 
     manifest_stale = not same_tables(current, updated)
-    renames_stale = not same_tables(renames_current, renames_updated)
 
-    if not manifest_stale and not renames_stale:
+    if not manifest_stale:
         if args.check:
             print(f"ok: {TARGET.relative_to(ROOT)} manifest is up to date")
-            print(f"ok: {RENAMES.relative_to(ROOT)} API-REEXPORTS is up to date")
         return 0
 
     if args.check:
@@ -477,22 +392,10 @@ def main() -> int:
                 "      python3 scripts/compiler/gen-stdlib-manifest.py",
                 file=sys.stderr,
             )
-        if renames_stale:
-            rel = RENAMES.relative_to(ROOT)
-            print(f"error: {rel}'s API-REEXPORTS is out of date with src/stdlib/", file=sys.stderr)
-            print(
-                "  a library module's `:reexport` import changed without regenerating the table.\n"
-                "  Left unfixed, `coil lint --fix` and the build's migration note follow the old\n"
-                "  re-exports. Fix with:\n"
-                "      python3 scripts/compiler/gen-stdlib-manifest.py",
-                file=sys.stderr,
-            )
         return 1
 
     if manifest_stale:
         write_formatted(TARGET, updated)
-    if renames_stale:
-        write_formatted(RENAMES, renames_updated)
     return 0
 
 
