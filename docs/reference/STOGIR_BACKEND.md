@@ -12,7 +12,7 @@ and module transport lets the engines consume the same native lowering while
 remaining distinct code generators. LLVM retains its existing lowering path.
 
 The library is a separately declared package, vendored under
-`src/compiler/stogir` at revision `3463e54`. Its [README](../../src/compiler/stogir/README.md),
+`src/compiler/stogir` at revision `1dfee62`. Its [README](../../src/compiler/stogir/README.md),
 [LICENSE](../../src/compiler/stogir/LICENSE), [NOTICE](../../src/compiler/stogir/NOTICE)
 and provenance preserve credit to coil-stogir and Dmitry Stogov's IR. No per-file
 license headers are added by the integration.
@@ -152,3 +152,17 @@ must not be represented as upstream optimized-pipeline parity.
 The [SCCP-domain validation checkpoint](../validation/STOGIR_SCCP_DOMAIN.md)
 records source provenance, differential scope and delivery checks. New timings
 for the shared-bitset change remain pending an uncontended machine.
+
+## Graph rewrites and initial-owner pressure
+
+The graph now supports whole-node rewrites within existing cell allocations.
+Shrunk tails become cleared NOPs with valid arity metadata; later references
+stay fixed. Construction CSE is invalidated, while the owning optimizer must
+remap incoming edges/roots and rebuild use/analysis caches. These APIs do not
+yet connect SCCP to codegen.
+
+Blocked allocation now spills a whole owner prefix when eviction occurs at its
+start and no register-required use occurs there. This follows upstream's
+`child = other` case; it does not claim optimal-split or full allocator parity.
+It fixes a valid pressured graph-rewrite program rejected by the prior compiler.
+Immediate required uses remain protected.

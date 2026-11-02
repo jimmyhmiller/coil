@@ -149,3 +149,20 @@ sentinel (126 upstream, 131 here due to appended atomic operations) and inactive
 union fields. No C wrapper ships or participates in JIT/AOT. The SCCP analyzer,
 transformation, iterative optimizer and optimization-level policy are not yet
 implemented or connected by this checkpoint.
+
+### In-place rewrites and initial-owner spilling
+
+The graph rewrite API provides the reference-stable storage changes needed by
+pinned `ir_sccp.c`'s transformation and iterative optimizer. Unlike upstream's
+retained input-count NOP storage, a reduced Coil extent exposes the cleared
+released cells as standalone NOPs with explicit arity metadata. No preexisting
+valid reference moves. Use-list/analysis rebuilding remains the owning pass's
+responsibility; construction CSE is invalidated by the graph API.
+
+Blocked allocation now handles upstream `ir_ra.c:ir_allocate_blocked_reg`'s
+`child = other` case when an evictable owner has no earlier register assignment
+to retain. At the owner's starting position, its whole spillable prefix is
+spilled and its future required-use suffix is requeued. A register-required use
+at that position remains an error. The independent allocator still does not
+claim parity for optimal split positions, register reuse/coalescing or all
+upstream allocation policies.
