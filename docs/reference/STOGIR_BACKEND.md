@@ -141,7 +141,7 @@ compiler `60174544`: 4.85× faster codegen and 9.68× LLVM runtime on the unchan
 workload. Both active criteria remain unmet. Its 59-case scheduler differential,
 212 standalone checks, 65 linked consumers and Coil FAST 49/49 pass.
 
-## SCCP value-domain prerequisite
+## SCCP value-domain prerequisite (historical)
 
 The vendored library now includes the combined constant/copy lattice from
 pinned `ir_sccp.c`, using 16-byte cells and circular copy partitions. Its
@@ -187,6 +187,13 @@ evidence and installed checks. SCCP is still not enabled.
 The vendored executable source `799bba6` passes 228 standalone programs and
 69 linked AOT consumers with fresh objects and frozen-input checks. Public
 library mode tests compare JIT/AOT paths and verify constant-pool ownership
-through image finishing. The compiler-side option plumbing is being validated
-separately; no new performance acceptance claim is established by these library
-results. All optimization stays inside the existing `ir-codegen` timing span.
+through image finishing. Compiler executable source `3baa1650` passes full FAST (49/49, 343.1 seconds,
+with time and 1.60 GB memory warnings) and is installed with its matching SDK.
+Off-checkout object generation/link/run checks pass LLVM, TPDE and stogir;
+new SDK namespaces resolve and all 127 installed modules match standalone
+source. The stogir corpus remains 6/9 with the same known failures.
+All optimization stays inside the existing `ir-codegen` timing span.
+The [delivery report](../validation/stogir-sccp-pipeline-installed.json) records
+these checks. The [latest timing attempt](../benchmarks/STOGIR_SCCP_MODES.md) is
+provisional due competing compiler processes and does not meet the performance
+goal. Older prerequisite-only statements above describe historical checkpoints.
