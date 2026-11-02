@@ -282,3 +282,6 @@ Canonical pre-allocation block order follows pinned `ir_gcm.c` checks and
 `ir_fix_bb_order`. A successor heap preserves the original scanning priority
 without quadratic high-fanout rescans. Irreducible-side-entry ordering is not
 yet ported and retains the existing RPO. See LOOP_BLOCK_ORDER.md.
+
+Indexed opcode metadata follows pinned upstream `ir.h` opcode order and the
+numeric table approach. See OPCODE_METADATA.md for representation and oracle.
