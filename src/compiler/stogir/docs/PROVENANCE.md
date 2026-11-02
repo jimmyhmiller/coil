@@ -276,3 +276,9 @@ The base/constant memory address matching rule is ported/adapted from pinned
 existing compact graph plus target metadata. Individual encodable consumer edges
 may fuse while a shared/rooted address definition is retained. See
 [ADDRESS_MATCHING.md](ADDRESS_MATCHING.md) for coverage and validation.
+
+
+Canonical pre-allocation block order follows pinned `ir_gcm.c` checks and
+`ir_fix_bb_order`. A successor heap preserves the original scanning priority
+without quadratic high-fanout rescans. Irreducible-side-entry ordering is not
+yet ported and retains the existing RPO. See LOOP_BLOCK_ORDER.md.

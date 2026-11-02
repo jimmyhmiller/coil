@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`5296d0d`, on 2026-11-02. The independent library remains maintained in that
+`7801b60`, on 2026-11-02. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -25,3 +25,7 @@ See [address matching](docs/ADDRESS_MATCHING.md) for shared-address and COPY rul
 Allocation pressure indexes fixed constraints and omits inert initial records.
 Integer vector doubling is selected before liveness. See
 [pressure indexing](docs/PRESSURE_INDEX.md) and [vector doubling](docs/VECTOR_DOUBLING.md).
+
+Canonical block scheduling follows pinned upstream before allocation; pressure
+queries reuse per-register storage. See [block order](docs/LOOP_BLOCK_ORDER.md)
+and [pressure buffers](docs/PRESSURE_BUFFER.md) for coverage and limits.
