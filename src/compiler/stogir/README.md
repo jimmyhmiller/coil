@@ -1,7 +1,7 @@
 # Vendored coil-stogir
 
 Copied from [coil-stogir](https://github.com/jimmyhmiller/coil-stogir), revision
-`cd70444`, on 2026-11-02. The independent library remains maintained in that
+`5296d0d`, on 2026-11-02. The independent library remains maintained in that
 repository. This snapshot contains its Coil implementation, with no compiler
 adapter or test generators embedded in the library.
 
@@ -21,3 +21,7 @@ See [vectorization](docs/LOOP_VECTORIZATION.md) for legality and scalar fallback
 
 Memory base/constant offsets are selected before liveness and allocation.
 See [address matching](docs/ADDRESS_MATCHING.md) for shared-address and COPY rules.
+
+Allocation pressure indexes fixed constraints and omits inert initial records.
+Integer vector doubling is selected before liveness. See
+[pressure indexing](docs/PRESSURE_INDEX.md) and [vector doubling](docs/VECTOR_DOUBLING.md).
