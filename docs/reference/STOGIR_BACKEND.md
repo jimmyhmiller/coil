@@ -148,3 +148,7 @@ payloads, symbolic and long constants. This does not enable SCCP: its analyzer,
 graph transformation, follow-up iterative optimization, mutable compilation
 ownership and optimization-level policy remain pending. Current `-O3` behavior
 must not be represented as upstream optimized-pipeline parity.
+
+The [SCCP-domain validation checkpoint](../validation/STOGIR_SCCP_DOMAIN.md)
+records source provenance, differential scope and delivery checks. New timings
+for the shared-bitset change remain pending an uncontended machine.
