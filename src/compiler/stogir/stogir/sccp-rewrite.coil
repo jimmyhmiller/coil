@@ -1,0 +1,366 @@
+;;; Graph transformation adapted from pinned ir_sccp.c:ir_sccp_transform.
+;;; Stable references and explicit external roots are Coil API requirements.
+(module stogir.sccp-rewrite)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.sccp-analysis" :as analysis)
+(import "stogir.sccp-values" :as v)
+(import "stogir.sccp-phi" :as phi)
+(import "stogir.uses" :as uses)
+(import "stogir.bitset" :as bits)
+(import "stogir.bitqueue" :as q)
+(import "stogir.verify" :as verify)
+(import "stogir.terminal" :as terminal)
+(import "stogir.calls" :as calls)
+(import "stogir.switch" :as switch)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defstruct Rewritten
+  [(graph g/Graph) (roots (ArrayList i32)) (changes i32) (iteration q/Queue)])
+
+(defn release! [(result (mut Rewritten))] (-> void)
+  (g/release! (mut (.graph result)))
+  (free! (mut (.roots result)))
+  (q/release! (mut (.iteration result))))
+
+(defn data-edge? [(kind (slice u8))] (-> bool)
+  (or (= kind "def") (= kind "ref") (= kind "arg")))
+
+;;; Terminal-list references do not imply execution. Preserve their relative
+;;; order while unlinking provably unreachable members, including the head.
+(defn previous-live [(graph g/Graph) (removed bits/Bits) (reference i32)]
+  (-> i32)
+  (let [(mut current) reference]
+    (while (and (> current 0) (bits/contains? removed (cast i64 current)))
+      (set! current (terminal/previous graph current)))
+    current))
+
+(defn compress! [(source g/Graph)
+                 (graph (mut g/Graph))
+                 (domain v/Domain)
+                 (edges uses/Uses)
+                 (mapping (ArrayList i32))
+                 (reference i32)
+                 (a (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [(mut live) (ArrayList::new [i32] a)
+        (mut positions) (ArrayList::new [i32] a)
+        (mut inputs) (ArrayList::new [i32] a)
+        count (get (.arities source) (cast i64 reference))
+        (mut error) ""]
+    (for [i 1 (+ (cast i64 count) 1)]
+      (let [predecessor (phi/input source reference (cast i32 i))]
+        (when (v/reachable? domain predecessor)
+          (push! (mut live) predecessor)
+          (push! (mut positions) (cast i32 i)))))
+    (if (= (len live) 0)
+        (set! error "reachable SCCP region has no feasible predecessor")
+        (do
+          (if (= (len live) 1)
+              (when (not (g/rewrite-inputs! (mut graph)
+                                            reference
+                                            106
+                                            0
+                                            [(get live 0) (: 0 i32)]))
+                (set! error "SCCP single-predecessor region rewrite failed"))
+              (when (not (g/rewrite-inputs! (mut graph)
+                                            reference
+                                            (n/opcode (get (.instructions source)
+                                                           (cast i64 reference)))
+                                            0
+                                            (slice live)))
+                (set! error "SCCP region compression failed")))
+          (let [range (get (.ranges edges) (cast i64 reference))]
+            (for [i (.offset range) (+ (.offset range) (.count range))]
+              (let [user (.user (get (.edges edges) i))
+                    node (get (.instructions source) (cast i64 user))]
+                (when (and (= (n/opcode node) 67)
+                           (= (.op1 node) reference)
+                           (= (get mapping (cast i64 user)) user))
+                  (clear! (mut inputs))
+                  (if (= (len live) 1)
+                      (let [value
+                              (phi/input source user (+ (get positions 0) 1))]
+                        (if (= value user)
+                            (set! error
+                                  "SCCP single-predecessor Phi is self-referential")
+                            (when (not (g/rewrite-inputs! (mut graph)
+                                                          user
+                                                          68
+                                                          (n/type-id node)
+                                                          [value (: 0 i32)]))
+                              (set! error "SCCP Phi-to-COPY rewrite failed"))))
+                      (do
+                        (push! (mut inputs) reference)
+                        (for position positions
+                          (push! (mut inputs)
+                                 (phi/input source user (+ position 1))))
+                        (when (not (g/rewrite-inputs! (mut graph)
+                                                      user
+                                                      67
+                                                      (n/type-id node)
+                                                      (slice inputs)))
+                          (set! error "SCCP Phi compression failed"))))))))))
+    (free! (mut live))
+    (free! (mut positions))
+    (free! (mut inputs))
+    (if (= error "") (Ok 0) (Err error))))
+
+(defn validate [(graph g/Graph) (pointer-bytes i32) (a (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (match (verify/integer-operations-target graph pointer-bytes)
+    (Err [message] (Err message))
+    (Ok [_]
+        (match (verify/constants graph pointer-bytes)
+          (Err [message] (Err message))
+          (Ok [_]
+              (match (verify/phis graph)
+                (Err [message] (Err message))
+                (Ok [_]
+                    (match (terminal/verify-chains graph a)
+                      (Err [message] (Err message))
+                      (Ok [_]
+                          (match (calls/verify graph)
+                            (Err [message] (Err message))
+                            (Ok [_]
+                                (switch/verify graph a))))))))))))
+
+;;; Transport rewrite effects into the upstream-style iterative worklist.
+;;; Original users and former inputs remain relevant even when their defining
+;;; node became NOP. Compare every operand of variable-length instructions, not
+;;; just their first compact cell. A single linear scan completes this bulk
+;;; transformation; the subsequent iterative optimizer maintains uses in place.
+(defn seed-iteration! [(source g/Graph)
+                       (graph g/Graph)
+                       (edges uses/Uses)
+                       (facts analysis/Analysis)
+                       (queue (mut q/Queue))]
+  (-> void)
+  (let [(mut r) (: 1 i64)]
+    (while (< r (len (.instructions source)))
+      (let [before (get (.instructions source) r)
+            after (get (.instructions graph) r)
+            old-count (get (.arities source) r)
+            new-count (get (.arities graph) r)
+            (mut changed)
+              (or (!= (.header before) (.header after))
+                  (!= old-count new-count))]
+        (when (= old-count new-count)
+          (for [i 1 (+ (cast i64 old-count) 1)]
+            (when (!= (phi/input source (cast i32 r) (cast i32 i))
+                      (phi/input graph (cast i32 r) (cast i32 i)))
+              (set! changed true))))
+        (when (or changed (q/contains? (.iteration facts) r))
+          (q/add! (mut queue) r))
+        (when changed
+          (let [range (get (.ranges edges) r)]
+            (for [i (.offset range) (+ (.offset range) (.count range))]
+              (q/add! (mut queue) (cast i64 (.user (get (.edges edges) i))))))
+          (for [i 1 (+ (cast i64 old-count) 1)]
+            (when (uses/edge-kind? (op/operand-kind (cast i32 (n/opcode before))
+                                                    (cast i32 i)))
+              (let [input (phi/input source (cast i32 r) (cast i32 i))]
+                (when (> input 0) (q/add! (mut queue) (cast i64 input))))))
+          (for [i 1 (+ (cast i64 new-count) 1)]
+            (when (uses/edge-kind? (op/operand-kind (cast i32 (n/opcode after))
+                                                    (cast i32 i)))
+              (let [input (phi/input graph (cast i32 r) (cast i32 i))]
+                (when (> input 0) (q/add! (mut queue) (cast i64 input)))))))
+        (set! r (+ r (/ (+ (cast i64 old-count) 4) 4)))))))
+
+;;; Preconditions: analysis belongs to this exact immutable source graph and was
+;;; produced with these roots observed. Mutations occur only in an owned copy;
+;;; failed validation releases that copy and leaves all source storage untouched.
+;;; The caller must rebuild uses/CFG/dominance/scheduling/matching for the result.
+(defn rewrite [(source g/Graph)
+               (facts analysis/Analysis)
+               (roots (slice i32))
+               (a (dyn Allocator))] (-> (Result Rewritten (slice u8)))
+  (let [(mut error) ""
+        size (len (.instructions source))]
+    (when (= (len roots) 0)
+      (set! error "SCCP rewrite requires observable roots"))
+    (when (!= size (len (.values (.domain facts))))
+      (set! error "SCCP analysis/graph size mismatch"))
+    (for root roots
+      (when (or (<= root 0)
+                (not (g/contains? source root))
+                (not (bits/contains? (.observed facts) (cast i64 root))))
+        (set! error "SCCP rewrite requires the analyzed observable roots")))
+    (match (terminal/verify-chains source a)
+      (Err [message] (set! error message))
+      (Ok [_] 0))
+    (if (!= error "")
+        (Err error)
+        (let [(mut graph) (g/duplicate source a)
+              (mut mapping) (ArrayList::new [i32] a)
+              (mut removed) (bits/create size a)
+              (mut result-roots) (ArrayList::new [i32] a)
+              (mut iteration) (q/create size a)
+              (mut edges) (uses/build source a)
+              (mut changes) (: 0 i32)
+              (mut r) (: 1 i64)]
+          (for [i 0 size] (push! (mut mapping) (cast i32 i)))
+          ; Build replacement facts before editing any original instruction.
+          (while (and (< r size) (= error ""))
+            (let [reference (cast i32 r)
+                  node (get (.instructions source) r)
+                  opcode (cast i32 (n/opcode node))
+                  value (v/at (.domain facts) reference)
+                  kind (v/state-kind value)
+                  data (analysis/data? opcode)
+                  observed (bits/contains? (.observed facts) r)]
+              (cond (and (= kind 0) (!= opcode 0) (!= opcode 71))
+                      (if (and data observed)
+                          (set! error "observable SCCP data root is unresolved")
+                          (do
+                            (bits/add! (mut removed) r)
+                            (set! (mut mapping) r 0)))
+                    (or (and (>= kind 1) (<= kind 13))
+                        (and (>= kind 73) (<= kind 77)))
+                      (if (not data)
+                          (set! error
+                                "SCCP memory constant needs control bypass")
+                          (match (g/intern-constant! (mut graph)
+                                                     (n/opcode value)
+                                                     (n/type-id value)
+                                                     0
+                                                     (n/constant-bits value))
+                            (None []
+                                  (set! error
+                                        "SCCP constant reference space exhausted"))
+                            (Some [literal] (set! (mut mapping) r literal))))
+                    (= kind 78) (set! (mut mapping) r (.op2 value))
+                    (= kind 68)
+                      (set! (mut mapping)
+                            r
+                            (v/identity (.domain facts) reference))
+                    :else 0)
+              (when (and (!= (get mapping r) reference) (!= kind 0))
+                (when (not data)
+                  (set! error "SCCP non-data replacement needs control bypass")))
+              (set! r (+ r (/ (+ (cast i64 (get (.arities source) r)) 4) 4)))))
+          ; Retain the END/BEGIN form from upstream's protected-destination case.
+          (set! r 1)
+          (while (and (< r size) (= error ""))
+            (let [reference (cast i32 r)
+                  node (get (.instructions source) r)
+                  value (v/at (.domain facts) reference)
+                  kind (v/state-kind value)]
+              (cond (= kind 116)
+                      (let [target (.op1 value)]
+                        (when (or (not (g/rewrite-inputs! (mut graph)
+                                                          reference
+                                                          114
+                                                          0
+                                                          [(.op1 node)]))
+                                  (not (g/rewrite-inputs! (mut graph)
+                                                          target
+                                                          106
+                                                          0
+                                                          [reference (: 0 i32)])))
+                          (set! error "SCCP selected control rewrite failed"))
+                        (set! changes (+ changes 1)))
+                    (= kind 112)
+                      (match (compress! source
+                                        (mut graph)
+                                        (.domain facts)
+                                        edges
+                                        mapping
+                                        reference
+                                        a)
+                        (Err [message] (set! error message))
+                        (Ok [_] (set! changes (+ changes 1))))
+                    :else 0)
+              (set! r (+ r (/ (+ (cast i64 (get (.arities source) r)) 4) 4)))))
+          ; Data roots retain their positive reference via an observable COPY.
+          (set! r 1)
+          (while (and (< r size) (= error ""))
+            (let [reference (cast i32 r)
+                  replacement (get mapping r)
+                  node (get (.instructions source) r)]
+              (if (bits/contains? removed r)
+                  (do
+                    (when (not (g/make-nop! (mut graph) reference))
+                      (set! error "SCCP removal failed"))
+                    (set! changes (+ changes 1)))
+                  (when (!= replacement reference)
+                    (if (bits/contains? (.observed facts) r)
+                        (when (not (and (= (n/opcode node) 68)
+                                        (= (.op1 node) replacement)
+                                        (= (.op2 node) 0)))
+                          (when (not (g/rewrite-inputs-with-aux! (mut graph)
+                                                                 reference
+                                                                 68
+                                                                 (n/type-id node)
+                                                                 0
+                                                                 [replacement
+                                                                  (: 0 i32)]))
+                            (set! error "SCCP observable COPY rewrite failed"))
+                          (set! changes (+ changes 1)))
+                        (do
+                          (bits/add! (mut removed) r)
+                          (when (not (g/make-nop! (mut graph) reference))
+                            (set! error "SCCP replaced-node removal failed"))
+                          (set! changes (+ changes 1))))))
+              (set! r (+ r (/ (+ (cast i64 (get (.arities source) r)) 4) 4)))))
+          ; Patch original data references and unlink unreachable terminal members.
+          ; Walk the new arities: released continuation cells are standalone NOPs.
+          (set! r 1)
+          (while (and (< r size) (= error ""))
+            (let [reference (cast i32 r)
+                  node (get (.instructions graph) r)
+                  opcode (cast i32 (n/opcode node))
+                  count (get (.arities graph) r)]
+              (when (!= opcode 0)
+                (for [index 1 (+ (cast i64 count) 1)]
+                  (let [position (cast i32 index)
+                        kind (op/operand-kind opcode position)
+                        old (phi/input graph reference position)
+                        (mut replacement) old]
+                    (when (> old 0)
+                      (if (= kind "ret")
+                          (set! replacement (previous-live source removed old))
+                          (if (data-edge? kind)
+                              (set! replacement (get mapping (cast i64 old)))
+                              (when (and (uses/edge-kind? kind)
+                                         (bits/contains? removed (cast i64 old)))
+                                (set! error
+                                      "live SCCP control edge targets removed instruction")))))
+                    (when (!= replacement old)
+                      (when (and (= replacement 0) (not (= kind "ret")))
+                        (set! error
+                              "live SCCP data edge targets removed instruction"))
+                      (if (not (g/set-operand! (mut graph)
+                                               reference
+                                               position
+                                               replacement))
+                          (set! error "SCCP edge replacement failed")
+                          (set! changes (+ changes 1)))))))
+              (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+          (for root roots
+            (when (not (bits/contains? removed (cast i64 root)))
+              (push! (mut result-roots) root)))
+          (when (= error "")
+            (match (validate graph (.pointer-bytes facts) a)
+              (Err [message] (set! error message))
+              (Ok [_] 0)))
+          (when (= error "")
+            (seed-iteration! source graph edges facts (mut iteration)))
+          (free! (mut mapping))
+          (bits/release! (mut removed))
+          (uses/release! (mut edges))
+          (if (= error "")
+              (Ok (Rewritten
+                    :graph graph
+                    :roots result-roots
+                    :changes changes
+                    :iteration iteration))
+              (do
+                (g/release! (mut graph))
+                (free! (mut result-roots))
+                (q/release! (mut iteration))
+                (Err error)))))))

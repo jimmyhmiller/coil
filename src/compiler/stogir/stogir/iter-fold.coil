@@ -1,0 +1,248 @@
+;;; Incremental fold/CSE/DCE kernel adapted from pinned ir_sccp.c:ir_iter_fold,
+;;; ir_iter_replace_insn and ir_iter_find_cse. Control cleanup and promotion are
+;;; separate pending parts of ir_iter_opt; this module does not claim full parity.
+(module stogir.iter-fold)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.sccp-fold" :as fold)
+(import "stogir.sccp-values" :as v)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.verify" :as verify)
+(import "stogir.uses" :as uses)
+(import "stogir.bitqueue" :as q)
+(import "stogir.bitset" :as bits)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn foldable? [(opcode i32)] (-> bool)
+  (and (>= opcode 14) (<= opcode 68)))
+
+;;; Exact expression CSE searches the smallest positive input's bucket, as
+;;; upstream does. Earlier references win; later duplicates are put on the queue.
+;;; The full node words include guards and prototype/flag metadata.
+(defn find-cse! [(graph g/Graph)
+                 (lists uses/Uses)
+                 (queue (mut q/Queue))
+                 (reference i32)] (-> i32)
+  (let [node (get (.instructions graph) (cast i64 reference))
+        count (get (.arities graph) (cast i64 reference))
+        opcode (cast i32 (n/opcode node))
+        (mut selected) (: 0 i32)
+        (mut size) (: 0 i64)
+        (mut found) (: 0 i32)]
+    (for [i 1 (+ (cast i64 count) 1)]
+      (when (uses/edge-kind? (op/operand-kind opcode (cast i32 i)))
+        (match (g/operand graph reference (cast i32 i))
+          (Some [input]
+                (when (> input 0)
+                  (let [range (get (.ranges lists) (cast i64 input))]
+                    (when (or (= selected 0) (< (.count range) size))
+                      (set! selected input)
+                      (set! size (.count range))))))
+          (None [] 0))))
+    (when (> selected 0)
+      (let [range (get (.ranges lists) (cast i64 selected))]
+        (for [i (.offset range) (+ (.offset range) (.count range))]
+          (let [user (.user (get (.edges lists) i))
+                other (get (.instructions graph) (cast i64 user))]
+            (when (and (!= user reference)
+                       (= (& (.header node) 65535) (& (.header other) 65535))
+                       (= (.op1 node) (.op1 other))
+                       (= (.op2 node) (.op2 other))
+                       (= (.op3 node) (.op3 other)))
+              (if (< user reference)
+                  (when (or (= found 0) (< user found)) (set! found user))
+                  (q/add! (mut queue) (cast i64 user))))))))
+    found))
+
+;;; Detach all original inputs before changing the allocation. Removal can make
+;;; former inputs dead; processing those references is deduplicated by the queue.
+(defn detach! [(graph g/Graph)
+               (lists (mut uses/Uses))
+               (queue (mut q/Queue))
+               (reference i32)] (-> void)
+  (let [opcode
+          (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference))))
+        count (get (.arities graph) (cast i64 reference))]
+    (for [i 1 (+ (cast i64 count) 1)]
+      (when (uses/edge-kind? (op/operand-kind opcode (cast i32 i)))
+        (match (g/operand graph reference (cast i32 i))
+          (Some [input]
+                (when (> input 0)
+                  (when (not (uses/remove! (mut lists)
+                                           input
+                                           (uses/Use
+                                             :user reference
+                                             :operand (cast i32 i))))
+                    (panic "iterative input edge missing"))
+                  (q/add! (mut queue) (cast i64 input))))
+          (None [] (panic "iterative input operand missing")))))))
+
+;;; Redirect exact edges one at a time and re-read buckets after each add: adding
+;;; a use of the replacement may relocate/reallocate the shared edge buffer.
+(defn replace! [(graph (mut g/Graph))
+                (lists (mut uses/Uses))
+                (queue (mut q/Queue))
+                (protected bits/Bits)
+                (reference i32)
+                (replacement i32)] (-> bool)
+  (let [node (get (.instructions graph) (cast i64 reference))
+        rooted (bits/contains? protected (cast i64 reference))
+        canonical
+          (and rooted
+               (= (n/opcode node) 68)
+               (= (.op1 node) replacement)
+               (= (.op2 node) 0))]
+    (if (or (= reference replacement) canonical)
+        false
+        (do
+          (detach! graph (mut lists) (mut queue) reference)
+          (while (> (.count (get (.ranges lists) (cast i64 reference))) 0)
+            (let [range (get (.ranges lists) (cast i64 reference))
+                  edge (get (.edges lists) (.offset range))]
+              (when (= (.user edge) reference)
+                (panic "iterative self replacement"))
+              (when (not (g/set-operand! (mut graph)
+                                         (.user edge)
+                                         (.operand edge)
+                                         replacement))
+                (panic "iterative user operand missing"))
+              (uses/remove! (mut lists) reference edge)
+              (when (> replacement 0) (uses/add! (mut lists) replacement edge))
+              (q/add! (mut queue) (cast i64 (.user edge)))))
+          (if rooted
+              (do
+                (when (not (g/rewrite-inputs! (mut graph)
+                                              reference
+                                              68
+                                              (n/type-id node)
+                                              [replacement (: 0 i32)]))
+                  (panic "iterative root COPY allocation failed"))
+                (when (> replacement 0)
+                  (uses/add! (mut lists)
+                             replacement
+                             (uses/Use :user reference :operand 1))))
+              (when (not (g/make-nop! (mut graph) reference))
+                (panic "iterative NOP allocation failed")))
+          true))))
+
+;;; Caller owns graph/lists/queue. Only seeded nodes and users/inputs affected by
+;;; changes are visited. Bottom facts expose current graph values to the shared
+;;; fold rules; no second SCCP analysis or persistent alternative IR is built.
+(defn run! [(graph (mut g/Graph))
+            (lists (mut uses/Uses))
+            (queue (mut q/Queue))
+            (protected bits/Bits)
+            (pointer-bytes i32)
+            (a (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [(mut domain) (v/create (len (.instructions graph)) a)
+        (mut changes) (: 0 i32)
+        (mut error) ""
+        (mut next) (q/pop! (mut queue))]
+    (for [i 1 (len (.instructions graph))]
+      (v/kind! (mut domain) (cast i32 i) 131))
+    (while (and (>= next 0) (= error ""))
+      (let [reference (cast i32 next)
+            node (get (.instructions graph) next)
+            opcode (cast i32 (n/opcode node))]
+        (when (foldable? opcode)
+          (if (and (= (.count (get (.ranges lists) next)) 0)
+                   (not (bits/contains? protected next)))
+              (do
+                (detach! graph (mut lists) (mut queue) reference)
+                (g/make-nop! (mut graph) reference)
+                (set! changes (+ changes 1)))
+              (when (!= opcode 67)
+                (match (fold/evaluate graph domain reference pointer-bytes)
+                  (Err [message] (set! error message))
+                  (Ok [decision]
+                      (let [(mut replacement) (: 0 i32)]
+                        (match (.kind decision)
+                          (1 (let [value (.constant decision)]
+                               (match (g/intern-constant! (mut graph)
+                                                          (n/opcode value)
+                                                          (n/type-id value)
+                                                          0
+                                                          (n/constant-bits value))
+                                 (Some [r] (set! replacement r))
+                                 (None []
+                                       (set! error
+                                             "iterative constant reference space exhausted")))))
+                          (2 (set! replacement (.source decision)))
+                          (3 (set! replacement
+                                   (find-cse! graph lists (mut queue) reference)))
+                          (_ 0))
+                        (when (and (!= replacement 0) (= error ""))
+                          (when (replace! (mut graph)
+                                          (mut lists)
+                                          (mut queue)
+                                          protected
+                                          reference
+                                          replacement)
+                            (set! changes (+ changes 1)))))))))))
+      (set! next (q/pop! (mut queue))))
+    (v/release! (mut domain))
+    (if (= error "") (Ok changes) (Err error))))
+
+;;; Transactional public entry: validate first, transform an owned graph, validate
+;;; again, and discard failed output. Roots keep their positive references through
+;;; COPY nodes. All structural analyses must be rebuilt after successful edits.
+(defn optimize [(source g/Graph)
+                (pointer-bytes i32)
+                (roots (slice i32))
+                (seeds (slice i32))
+                (a (dyn Allocator))]
+  (-> (Result rewrite/Rewritten (slice u8)))
+  (let [(mut error) ""]
+    (when (not (or (= pointer-bytes 4) (= pointer-bytes 8)))
+      (set! error "iterative pointer width must be four or eight"))
+    (when (= error "")
+      (match (rewrite/validate source pointer-bytes a)
+        (Err [message] (set! error message))
+        (Ok [_] 0)))
+    (for r roots
+      (when (or (<= r 0) (not (g/contains? source r)))
+        (set! error "iterative root is not an instruction")))
+    (for r seeds
+      (when (or (<= r 0) (not (g/contains? source r)))
+        (set! error "iterative seed is not an instruction")))
+    (if (!= error "")
+        (Err error)
+        (let [(mut graph) (g/duplicate source a)
+              (mut lists) (uses/build graph a)
+              (mut queue) (q/create (len (.instructions graph)) a)
+              (mut protected) (bits/create (len (.instructions graph)) a)
+              (mut output-roots) (ArrayList::new [i32] a)
+              (mut changes) (: 0 i32)]
+          (for r roots
+            (bits/add! (mut protected) (cast i64 r))
+            (push! (mut output-roots) r))
+          (for r seeds (q/add! (mut queue) (cast i64 r)))
+          (match (run! (mut graph)
+                       (mut lists)
+                       (mut queue)
+                       protected
+                       pointer-bytes
+                       a)
+            (Err [message] (set! error message))
+            (Ok [count] (set! changes count)))
+          (when (= error "")
+            (match (rewrite/validate graph pointer-bytes a)
+              (Err [message] (set! error message))
+              (Ok [_] 0)))
+          (uses/release! (mut lists))
+          (bits/release! (mut protected))
+          (if (= error "")
+              (Ok (rewrite/Rewritten
+                    :graph graph
+                    :roots output-roots
+                    :changes changes
+                    :iteration queue))
+              (do
+                (g/release! (mut graph))
+                (free! (mut output-roots))
+                (q/release! (mut queue))
+                (Err error)))))))

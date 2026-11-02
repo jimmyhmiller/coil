@@ -1,0 +1,289 @@
+;;; Lattice-aware fold/meet bridge, following pinned ir_sccp.c:ir_sccp_fold.
+;;; Scalar evaluation is shared with construction; the original graph is read-only.
+(module stogir.sccp-fold)
+(import "stogir.graph" :as g)
+(import "stogir.copy" :as copies)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.types" :as types)
+(import "stogir.symbols" :as symbols)
+(import "stogir.fold" :as fold)
+(import "stogir.integer-binary" :as binary)
+(import "stogir.integer-unary" :as unary)
+(import "stogir.floating" :as floating)
+(import "stogir.conversion" :as conversion)
+(import "stogir.conditional" :as conditional)
+(import "stogir.checked" :as checked)
+(import "stogir.sccp-values" :as v)
+(import "stogir.sccp-phi" :as phi)
+(import "stogir.uses" :as uses)
+(import "stogir.bitqueue" :as q)
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+;;; Decisions distinguish upstream EMIT, CONST, COPY and CSE outcomes. They are
+;;; transient rule results, not an additional graph or expression representation.
+(defstruct Decision [(kind i32) (constant n/Node) (source i32)])
+
+(defn emit [] (-> Decision)
+  (Decision
+    :kind 0
+    :constant (n/make 0 0 0 0 0 0)
+    :source 0))
+
+(defn cse [] (-> Decision)
+  (Decision
+    :kind 3
+    :constant (n/make 0 0 0 0 0 0)
+    :source 0))
+
+(defn scalar [(ty i32) (bits u64)] (-> Decision)
+  (Decision
+    :kind 1
+    :constant (n/constant (cast u8 ty) (cast u8 ty) 0 bits)
+    :source 0))
+
+(defn copy [(source i32)] (-> Decision)
+  (Decision
+    :kind 2
+    :constant (n/make 0 0 0 0 0 0)
+    :source source))
+
+;;; Resolve copies/long constants through their original signed references.
+;;; A bottom value still exposes its original instruction for structural rules.
+(defn value [(graph g/Graph) (domain v/Domain) (reference i32)] (-> n/Node)
+  (let [identity (v/identity domain reference)]
+    (if (< identity 0)
+        (phi/constant graph identity)
+        (let [fact (v/at domain identity)
+              kind (v/state-kind fact)]
+          (if (or (and (>= kind 1) (<= kind 13))
+                  (and (>= kind 73) (<= kind 77)))
+              fact
+              (get (.instructions graph) (cast i64 identity)))))))
+
+(defn numeric? [(value n/Node)] (-> bool)
+  (and (symbols/numeric? value)
+       (> (n/type-id value) 0)
+       (types/valid-scalar? (cast i32 (n/type-id value)))))
+
+(defn integer-literal? [(value n/Node)] (-> bool)
+  (let [kind (cast i32 (n/opcode value))]
+    (or (and (>= kind 2) (<= kind 6)) (and (>= kind 8) (<= kind 11)))))
+
+(defn optional [(ty i32) (bits (Option u64))] (-> Decision)
+  (match bits (None [] (cse)) (Some [result] (scalar ty result))))
+
+(defn evaluate [(graph g/Graph)
+                (domain v/Domain)
+                (reference i32)
+                (pointer-bytes i32)]
+  (-> (Result Decision (slice u8)))
+  (let [node (get (.instructions graph) (cast i64 reference))
+        opcode (cast i32 (n/opcode node))
+        ty (cast i32 (n/type-id node))
+        left (v/identity domain (.op1 node))
+        first (value graph domain (.op1 node))
+        from (cast i32 (n/type-id first))]
+    (cond (= opcode 68) (Ok (if (copies/hard? node) (emit) (copy left)))
+          ;;; These families have no literal rule in pinned ir_fold.h. Its
+          ;;; default CSE outcome becomes Bottom in ir_sccp_fold, just as EMIT.
+          (or (= opcode 40) (= opcode 65) (= opcode 66)) (Ok (cse))
+          (= opcode 60)
+            (let [yes (v/identity domain (.op2 node))
+                  no (v/identity domain (.op3 node))]
+              (if (= yes no)
+                  (Ok (copy yes))
+                  (match (conditional/truth-value first)
+                    (None [] (Ok (cse)))
+                    (Some [truth] (Ok (copy (if truth yes no)))))))
+          (= opcode 44)
+            (Ok (if (checked/operation? (cast i32 (n/opcode first)))
+                    (cse)
+                    (scalar 1 0)))
+          (types/vector? ty) (Err "SCCP vector fold family is not implemented")
+          (and (= opcode 36) (= from ty) (not (numeric? first)))
+            (Ok (copy left))
+          (and (or (= opcode 31) (= opcode 45) (= opcode 54))
+               (= (cast i32 (n/opcode first)) opcode))
+            (Ok (copy (v/identity domain (.op1 first))))
+          (and (= opcode 32) (= (n/opcode first) 32)) (Ok (copy left))
+          (conversion/operation? opcode)
+            (Ok (if (numeric? first)
+                    (optional ty
+                              (conversion/evaluate opcode
+                                                   from
+                                                   ty
+                                                   pointer-bytes
+                                                   (n/constant-bits first)))
+                    (cse)))
+          (or (binary/operation? opcode)
+              (and (>= opcode 14) (<= opcode 25))
+              (checked/operation? opcode))
+            (let [right (v/identity domain (.op2 node))
+                  second (value graph domain (.op2 node))
+                  literals? (and (numeric? first) (numeric? second))]
+              ;;; Same-reference rules are generic in pinned ir_fold.h. Only
+              ;;; integer comparisons/subtraction may disregard NaN/signed zero.
+              (cond (and (not literals?)
+                         (= left right)
+                         (or (= opcode 46)
+                             (= opcode 47)
+                             (= opcode 58)
+                             (= opcode 59)))
+                      (Ok (copy left))
+                    (and (= left right)
+                         (types/integer? from)
+                         (or (= opcode 27) (= opcode 42) (= opcode 48)))
+                      (Ok (scalar ty 0))
+                    (and (= left right)
+                         (types/integer? from)
+                         (>= opcode 14)
+                         (<= opcode 23))
+                      (Ok (scalar 1
+                                  (if (or (= opcode 14)
+                                          (= opcode 17)
+                                          (= opcode 18)
+                                          (= opcode 21)
+                                          (= opcode 22))
+                                      1
+                                      0)))
+                    ;;; Literal identity families exclude BOOL/CHAR in upstream.
+                    ;;; Exact result-type checks avoid erasing required bitcasts
+                    ;;; in mixed address/integer arithmetic.
+                    (and (not literals?)
+                         (integer-literal? second)
+                         (= (n/constant-bits second) 0)
+                         (= from ty)
+                         (or (= opcode 26)
+                             (= opcode 27)
+                             (= opcode 41)
+                             (= opcode 42)))
+                      (Ok (copy left))
+                    (and (= opcode 26)
+                         (integer-literal? first)
+                         (= (n/constant-bits first) 0)
+                         (= (cast i32 (n/type-id second)) ty))
+                      (Ok (copy right))
+                    (and (= opcode 28)
+                         (integer-literal? second)
+                         (= (cast i32 (n/type-id second)) ty)
+                         (<= (n/constant-bits second) 1))
+                      (Ok (copy (if (= (n/constant-bits second) 0) right left)))
+                    (and (= opcode 28)
+                         (integer-literal? first)
+                         (= from ty)
+                         (<= (n/constant-bits first) 1))
+                      (Ok (copy (if (= (n/constant-bits first) 0) left right)))
+                    (not (and (numeric? first) (numeric? second)))
+                      (Ok (if (checked/operation? opcode) (emit) (cse)))
+                    (types/floating? from)
+                      (Ok (optional ty
+                                    (floating/evaluate opcode
+                                                       from
+                                                       (n/constant-bits first)
+                                                       (n/constant-bits second))))
+                    (checked/operation? opcode)
+                      (Ok (match (checked/evaluate opcode
+                                                   ty
+                                                   pointer-bytes
+                                                   (n/constant-bits first)
+                                                   (n/constant-bits second))
+                            (None [] (emit))
+                            (Some [result]
+                                  (if (.overflow? result)
+                                      (emit)
+                                      (scalar ty (.bits result))))))
+                    (and (>= opcode 14) (<= opcode 23))
+                      (Ok (optional 1
+                                    (fold/integer-compare opcode
+                                                          from
+                                                          pointer-bytes
+                                                          (n/constant-bits first)
+                                                          (n/constant-bits second))))
+                    :else
+                      (Ok (match (fold/integer-binary opcode
+                                                      ty
+                                                      pointer-bytes
+                                                      (n/constant-bits first)
+                                                      (n/constant-bits second))
+                            (Some [bits] (scalar ty bits))
+                            (None []
+                                  (if (or (= opcode 29) (= opcode 30))
+                                      (emit)
+                                      (cse)))))))
+          (unary/operation? opcode)
+            (Ok (if (numeric? first)
+                    (optional ty
+                              (if (types/floating? from)
+                                  (floating/evaluate opcode
+                                                     from
+                                                     (n/constant-bits first)
+                                                     0)
+                                  (fold/integer-unary opcode
+                                                      ty
+                                                      pointer-bytes
+                                                      (n/constant-bits first))))
+                    (cse)))
+          :else (Err "SCCP fold family is not implemented"))))
+
+(defn meet-reference! [(graph g/Graph)
+                       (domain (mut v/Domain))
+                       (edges uses/Uses)
+                       (reference i32)
+                       (source i32)] (-> bool)
+  (let [identity (v/identity domain source)
+        constant (value graph domain source)
+        kind (cast i32 (n/opcode constant))]
+    (if (= kind 78)
+        (v/meet-long! (mut domain) edges reference identity constant)
+        (if (or (and (>= kind 1) (<= kind 13)) (and (>= kind 73) (<= kind 77)))
+            (v/meet-constant! (mut domain) edges reference constant)
+            (v/meet-copy! (mut domain) edges reference identity)))))
+
+;;; Upstream only reevaluates a fold when direct lattice replacements can help
+;;; (or this instruction already had a fact). Construction handles initial
+;;; all-literal folds. DIV/MOD's guard and COPY's metadata are not data inputs.
+(defn transfer! [(graph g/Graph)
+                 (domain (mut v/Domain))
+                 (edges uses/Uses)
+                 (iteration (mut q/Queue))
+                 (reference i32)
+                 (pointer-bytes i32)]
+  (-> (Result bool (slice u8)))
+  (let [node (get (.instructions graph) (cast i64 reference))
+        opcode (cast i32 (n/opcode node))
+        count (if (or (= opcode 29) (= opcode 30)) 2 (op/input-count opcode))
+        (mut benefit) (or (not (v/top? domain reference)) (= opcode 68))
+        (mut top) false
+        (mut changed) false
+        (mut error) ""]
+    (for [index 1 (+ (cast i64 count) 1)]
+      (let [source (phi/input graph reference (cast i32 index))]
+        (when (> source 0)
+          (if (v/top? domain source)
+              (do (set! top true) (v/add-input! (mut domain) source))
+              (when (not (v/bottom? domain source)) (set! benefit true))))))
+    (when (not top)
+      (if (not benefit)
+          (do (v/make-bottom! (mut domain) edges reference) (set! changed true))
+          (match (evaluate graph domain reference pointer-bytes)
+            (Err [message] (set! error message))
+            (Ok [decision]
+                (set! changed
+                      (match (.kind decision)
+                        (0 (v/make-bottom! (mut domain) edges reference) true)
+                        (3 (v/make-bottom! (mut domain) edges reference) true)
+                        (1 (v/meet-constant! (mut domain)
+                                             edges
+                                             reference
+                                             (.constant decision)))
+                        (_ (meet-reference! graph
+                                            (mut domain)
+                                            edges
+                                            reference
+                                            (.source decision))))))))
+      (when (and changed
+                 (v/bottom? domain reference)
+                 (or (= opcode 35) (= opcode 38) (= opcode 39)))
+        (q/add! (mut iteration) (cast i64 reference))))
+    (if (= error "") (Ok changed) (Err error))))

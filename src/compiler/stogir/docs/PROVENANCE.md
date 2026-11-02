@@ -166,3 +166,96 @@ spilled and its future required-use suffix is requeued. A register-required use
 at that position remains an error. The independent allocator still does not
 claim parity for optimal split positions, register reuse/coalescing or all
 upstream allocation policies.
+
+### Feasible Phi analysis — development branch
+
+`stogir.sccp-phi` adapts pinned `ir_sccp.c:ir_sccp_analyze_phi`, meeting only
+feasible predecessor inputs, ignoring self identities, discovering top inputs
+backward and reusing the combined copy/constant lattice. This module is under
+development in the isolated analysis worktree and is not wired to codegen.
+The transition tests now compare 4,110 normalized observations with the
+unmodified pinned function, including long Phi operand retention, changing
+feasibility, discovery, copy-partition splitting and direct/propagated scalar,
+symbolic and long constants. See `validation/sccp-phi-oracle.json` for exact
+scope and source hashes. This component differential does not establish a
+complete SCCP analyzer, rewriting pass or optimized backend pipeline.
+
+### SCCP worklist/control analysis — development branch
+
+`stogir.sccp-analysis` and `stogir.sccp-control` adapt the worklist order,
+reachability facts, selected projections, merge counts, continuation retention
+and iterative-candidate discovery from pinned `ir_sccp.c:ir_sccp_analyze`.
+The original graph remains immutable; analysis owns the combined domain and
+queues. General folding returns an explicit development error rather than
+silently substituting overdefined results. MEM2SSA immediate-Phi policy and
+graph transformation are not implemented.
+
+Fifty-nine control-flow cases match 641 normalized final-state observations
+against that unmodified function, including loop-edge widening and switches.
+This differential covers those cases, not all control/call/load operations or
+the complete analyzer. Evidence: `validation/sccp-analysis-oracle.json`.
+
+SCCP reuses the constructor's numeric truth helper. Named symbol truth stays
+unknown because the shared image resolver permits address zero; this deliberately
+retains the library's existing contract instead of upstream's nonzero-symbol
+assumption. Signed narrow switch ranges use the graph's width-aware order keys;
+the differential switch cases use full-width signed/unsigned selectors.
+
+### Scalar lattice folding — development branch
+
+`stogir.sccp-fold` bridges the combined domain to the existing construction
+evaluators. Its discovery/benefit gate, constant/copy meets and conversion
+iteration candidates follow pinned `ir_sccp.c:ir_sccp_analyze` and
+`ir_sccp_fold`. Scalar arithmetic, comparisons, conversions, checked arithmetic,
+overflow projection and conditional selection reuse Coil's established scalar
+rules. Overflowing checked operations remain instructions. Analysis explicitly
+owns the target pointer width; constants are validated against that width.
+
+The scalar folding checkpoint covered 818 graphs and 4,973 observations: 4,941
+match exactly. The remaining 32 are recorded rule-coverage extensions, not
+discarded cases: the existing Coil evaluator folds literal bit counts and
+same-type signed extrema absent from the pinned matching rules. Those results
+also have independent known-answer assertions. Reference normalization preserves
+upstream's three reserved constant references and its sign-extended narrow
+constant representation. See `validation/sccp-fold-oracle.json`.
+
+This is not full upstream folding parity. Algebraic restart/structural rules,
+PROTO and remaining vector families are unfinished. Eligible unported families
+return explicit errors in this development runner. No graph transformation or
+production optimizer integration is enabled.
+
+### Rooted graph transformation and native COPY — development branch
+
+`stogir.sccp-rewrite` adapts `ir_sccp_transform`, region/Phi compression and
+terminal-list unlinking from the pinned `ir_sccp.c`. Selected IF/SWITCH paths use
+its retained END/BEGIN form. This port keeps that form to preserve protected
+references; redundant-block cleanup is still pending. A working graph duplicates
+the same compact representation and interning tables, with all original IDs
+unchanged. Failure releases the working copy, preserving the input and its caches.
+External data roots stay positive via COPY nodes; unreachable control roots are
+removed from the returned root list. New uses/CFG/schedule/matching are required.
+
+Typed native COPY covers GP, floating and 64/128-bit vector identities using
+existing capture/transfer emission. Operand/definition constraints precede
+allocation. The pinned target selects `IR_COPY_INT/FP | IR_MAY_REUSE`; full reuse
+hint/coalescing parity is not claimed. The pinned `IR_COPY_HARD` bit prevents
+folding, while still permitting native register reuse. Its new reproducer fails
+three assertions without the barrier check and passes with it.
+
+Native original/transformed execution, linked AOT payloads, wide Phi extents,
+terminal chains, source/cache ownership, no-change detection and rejected-rewrite
+cleanup are covered in `validation/sccp-rewrite-native.json`. This is a development
+component, not full SCCP iteration or an enabled optimized compiler backend.
+Its refreshed comparisons include 59 control-flow graphs and 820 folding graphs,
+including both hard-copy cases. The same 32 existing fold extensions remain
+explicit; no unexplained reference differences were found.
+
+### Mutable def-use lists — development branch
+
+`uses.add!`, `remove!` and `replace!` adapt pinned `ir.c`'s use-list mutation
+policy: reuse trailing zero slots, append at the pool end, relocate blocked
+buckets, preserve removal order and update one matching edge. Coil keeps the
+operand position alongside each user reference, so repeated operands remain
+distinguishable. Callers must re-read ranges after mutation. This extends the
+existing use-list representation for the iterative optimizer; it does not create
+another semantic IR. Validation: `validation/mutable-uses.json`.
