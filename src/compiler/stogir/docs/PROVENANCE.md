@@ -269,3 +269,10 @@ operand position alongside each user reference, so repeated operands remain
 distinguishable. Callers must re-read ranges after mutation. This extends the
 existing use-list representation for the iterative optimizer; it does not create
 another semantic IR. Validation: `validation/mutable-uses.json`.
+
+
+The base/constant memory address matching rule is ported/adapted from pinned
+`ir_aarch64.dasc:ir_match_fuse_addr`. Its machine-use representation remains the
+existing compact graph plus target metadata. Individual encodable consumer edges
+may fuse while a shared/rooted address definition is retained. See
+[ADDRESS_MATCHING.md](ADDRESS_MATCHING.md) for coverage and validation.
